@@ -187,6 +187,7 @@ type Result struct {
 	Stderr                       string
 	ParseStatus                  string
 	CompletionSignal             string
+	CompletionPayload            string
 	Artifacts                    []string
 	ChangedFiles                 []string
 	Commits                      []string
@@ -201,13 +202,14 @@ type Result struct {
 }
 
 type completionParse struct {
-	ParseStatus      string
-	CompletionSignal string
-	Summary          string
-	Artifacts        []string
-	ChangedFiles     []string
-	Commits          []string
-	Lifecycle        *lifecycle.State
+	ParseStatus       string
+	CompletionSignal  string
+	CompletionPayload string
+	Summary           string
+	Artifacts         []string
+	ChangedFiles      []string
+	Commits           []string
+	Lifecycle         *lifecycle.State
 }
 
 type Execution interface {
@@ -699,24 +701,35 @@ type execution struct {
 	lastOutputAt       time.Time
 	lastProgressAt     time.Time
 
-	mu                      sync.Mutex
-	persistMu               sync.Mutex // one ordered writer per execution (#578)
-	terminalPersisted       bool
-	hardPersistReported     bool
-	status                  string
-	stdout                  []byte
-	stderr                  []byte
-	stdoutLogPath           string
-	stderrLogPath           string
-	persistedLogWriteFailed bool
-	heartbeatCount          int64
-	nativeSessionID         string
-	nativeResumeMode        string
-	nativeResumeStatus      string
-	nativeResumeError       string
-	processBirth            processidentity.Birth
-	leaseReleased           bool
-	toolSandbox             *validationcmd.Sandbox
+	mu        sync.Mutex
+	persistMu sync.Mutex // one ordered writer per execution (#578)
+	// lastPersisted* (under persistMu) form the monotonic gate for live
+	// observations: stdout/stderr handlers snapshot under mu but persist under
+	// persistMu, so an older cumulative snapshot can arrive after a newer one
+	// persisted and must not overwrite it. Status is sampled at persist-call
+	// time — independent of the snapshot — so a stale-by-count observation can
+	// still carry the one-way running→cancelling transition, which is then
+	// written with the retained newer snapshot values.
+	lastPersistedHeartbeatCount int64
+	lastPersistedHeartbeatAt    string
+	lastPersistedOutputJSON     *string
+	lastPersistedStatus         string
+	terminalPersisted           bool
+	hardPersistReported         bool
+	status                      string
+	stdout                      []byte
+	stderr                      []byte
+	stdoutLogPath               string
+	stderrLogPath               string
+	persistedLogWriteFailed     bool
+	heartbeatCount              int64
+	nativeSessionID             string
+	nativeResumeMode            string
+	nativeResumeStatus          string
+	nativeResumeError           string
+	processBirth                processidentity.Birth
+	leaseReleased               bool
+	toolSandbox                 *validationcmd.Sandbox
 
 	killCh chan string
 	doneCh chan execOutcome
@@ -985,6 +998,7 @@ func (x *execution) run(ctx context.Context) {
 		Stderr:                       stderr,
 		ParseStatus:                  completion.ParseStatus,
 		CompletionSignal:             completion.CompletionSignal,
+		CompletionPayload:            completion.CompletionPayload,
 		Artifacts:                    append([]string(nil), completion.Artifacts...),
 		ChangedFiles:                 append([]string(nil), completion.ChangedFiles...),
 		Commits:                      append([]string(nil), completion.Commits...),
@@ -1373,6 +1387,7 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 		Stderr:                       stderr,
 		ParseStatus:                  completion.ParseStatus,
 		CompletionSignal:             completion.CompletionSignal,
+		CompletionPayload:            completion.CompletionPayload,
 		Artifacts:                    append([]string(nil), completion.Artifacts...),
 		ChangedFiles:                 append([]string(nil), completion.ChangedFiles...),
 		Commits:                      append([]string(nil), completion.Commits...),
@@ -1533,15 +1548,10 @@ func (x *execution) bumpRunHeartbeat(nowISO string) {
 	if x.input.RunID == "" || x.executor.repos == nil || x.executor.repos.Runs == nil {
 		return
 	}
-	ctx := context.Background()
-	run, err := x.executor.repos.Runs.GetByID(ctx, x.input.RunID)
-	if err != nil || run == nil {
-		return
-	}
-	updated := *run
-	updated.LastHeartbeatAt = &nowISO
-	updated.UpdatedAt = nowISO
-	_ = x.executor.repos.Runs.Upsert(ctx, updated)
+	// Targeted forward-only column update: a full-record read/modify/upsert
+	// here could resurrect stale run state captured before a concurrent writer,
+	// and an out-of-order heartbeat must not move liveness evidence backward.
+	_ = x.executor.repos.Runs.TouchHeartbeat(context.Background(), x.input.RunID, nowISO)
 }
 
 // persistStatus writes a live (or initial) observation. One ordered writer per
@@ -1552,6 +1562,30 @@ func (x *execution) persistStatus(ctx context.Context, status string, heartbeatC
 	defer x.persistMu.Unlock()
 	if x.terminalPersisted {
 		return nil
+	}
+	// Snapshots are cumulative (bounded output tails plus a heartbeat count
+	// that only grows under mu), so a snapshot older than the last persisted
+	// one carries strictly less information: drop it instead of moving durable
+	// heartbeat/output state backward. The exception is a fresher status
+	// sample: the heartbeat count orders output snapshots but is not the
+	// authority for the independently sampled lifecycle status, so a
+	// running→cancelling transition is written with the retained newer
+	// snapshot values instead of being lost for the rest of the drain.
+	if heartbeatCount != nil && *heartbeatCount < x.lastPersistedHeartbeatCount {
+		if status != "cancelling" || x.lastPersistedStatus == "cancelling" {
+			return nil
+		}
+		retainedCount := x.lastPersistedHeartbeatCount
+		retainedAt := x.lastPersistedHeartbeatAt
+		heartbeatCount = &retainedCount
+		heartbeatAt = &retainedAt
+		outputJSON = x.lastPersistedOutputJSON
+	}
+	// The live status is one-way regardless of snapshot order: a callback that
+	// sampled running before the kill can reach here after cancelling
+	// persisted (with an equal or newer count) and must not downgrade it.
+	if status == "running" && x.lastPersistedStatus == "cancelling" {
+		status = "cancelling"
 	}
 	if x.executor.repos == nil || x.executor.repos.AgentExecutions == nil {
 		return nil
@@ -1593,7 +1627,18 @@ func (x *execution) persistStatus(ctx context.Context, status string, heartbeatC
 	if outputJSON != nil {
 		record.OutputJSON = outputJSON
 	}
-	return x.upsertAgentExecutionWithRetry(ctx, record)
+	err := x.upsertAgentExecutionWithRetry(ctx, record)
+	if err == nil {
+		x.lastPersistedStatus = status
+		if heartbeatCount != nil {
+			x.lastPersistedHeartbeatCount = *heartbeatCount
+			x.lastPersistedHeartbeatAt = *heartbeatAt
+		}
+		if outputJSON != nil {
+			x.lastPersistedOutputJSON = outputJSON
+		}
+	}
+	return err
 }
 
 // persistFinal writes the terminal observation after containment is confirmed
@@ -2637,46 +2682,41 @@ func tickerChan(ticker *time.Ticker) <-chan time.Time {
 
 func parseCompletion(stdout, stderr string) completionParse {
 	raw := stdout + "\n" + stderr
-	lines := strings.Split(raw, "\n")
-	for i := len(lines) - 1; i >= 0; i-- {
-		line := strings.TrimSpace(lines[i])
-		if strings.HasPrefix(line, CompletionMarkerPrefix) {
-			payload := strings.TrimPrefix(line, CompletionMarkerPrefix)
-			var parsed map[string]any
-			if err := json.Unmarshal([]byte(payload), &parsed); err != nil {
-				return completionParse{ParseStatus: "invalid_json", CompletionSignal: CompletionMarkerPrefix}
-			}
-			result := completionParse{
-				ParseStatus:      "parsed",
-				CompletionSignal: CompletionMarkerPrefix,
-				Artifacts:        asStringSlice(parsed["artifacts"]),
-				ChangedFiles:     asStringSlice(parsed["changedFiles"]),
-				Commits:          asStringSlice(parsed["commits"]),
-			}
-			if state, err := lifecycle.FromMap(parsed["git_pr_lifecycle"]); err == nil {
-				result.Lifecycle = state
-			}
-			if summary, ok := parsed["summary"].(string); ok {
-				result.Summary = summary
-			}
-			if isTemplateCompletion(result, parsed) {
-				continue
-			}
-			return result
+	for _, payload := range CompletionMarkerPayloads(raw) {
+		var parsed map[string]any
+		if err := json.Unmarshal([]byte(payload), &parsed); err != nil {
+			return completionParse{ParseStatus: "invalid_json", CompletionSignal: CompletionMarkerPrefix}
 		}
+		result := completionParse{
+			ParseStatus:       "parsed",
+			CompletionSignal:  CompletionMarkerPrefix,
+			CompletionPayload: payload,
+			Artifacts:         asStringSlice(parsed["artifacts"]),
+			ChangedFiles:      asStringSlice(parsed["changedFiles"]),
+			Commits:           asStringSlice(parsed["commits"]),
+		}
+		if state, err := lifecycle.FromMap(parsed["git_pr_lifecycle"]); err == nil {
+			result.Lifecycle = state
+		}
+		if summary, ok := parsed["summary"].(string); ok {
+			result.Summary = summary
+		}
+		if isTemplateCompletion(result) {
+			continue
+		}
+		return result
 	}
 	return completionParse{ParseStatus: "missing"}
 }
 
-func isTemplateCompletion(result completionParse, parsed map[string]any) bool {
-	if strings.TrimSpace(result.Summary) != "<one-sentence summary>" {
-		return false
-	}
-	if len(parsed) != 1 {
-		return false
-	}
-	_, ok := parsed["summary"]
-	return ok
+// isTemplateCompletion rejects an echoed completion template. Every completion
+// template — the generic summary-only shape and the fixer's outcome/failure_kind
+// shapes — emits the literal "<one-sentence summary>" placeholder, and a real
+// agent never leaves the summary as that exact token. Keying on the placeholder
+// alone covers the fixer templates, which carry extra keys alongside the summary
+// and so slip past a single-key shape check.
+func isTemplateCompletion(result completionParse) bool {
+	return strings.TrimSpace(result.Summary) == "<one-sentence summary>"
 }
 
 func IsAgentSetupFailureMessage(message string) bool {

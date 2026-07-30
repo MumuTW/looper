@@ -577,12 +577,12 @@ func TestWebhookRuntimeReconcileLaunchesNewForwarderDespiteExistingForwarderDegr
 	}
 }
 
-func TestWebhookRuntimeReconcileUsesCapturedCatalogSnapshotWhenForgejoPublishes(t *testing.T) {
+func TestWebhookRuntimeReconcileUsesCapturedCatalogSnapshotWhenGHESPublishes(t *testing.T) {
 	t.Parallel()
 
 	repositories := openWebhookRuntimeTestRepositories(t)
 	initial := webhookRuntimeTestConfig("nexu-io/looper")
-	initial.Providers = []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: "https://code.example"}}
+	initial.Providers = []config.ProviderConfig{{ID: "ghes-main", Kind: config.ProviderKindGitHub, BaseURL: "https://code.example"}}
 	rt := &webhookRuntime{
 		cfg:                initial,
 		ghPath:             "/usr/bin/gh",
@@ -601,12 +601,12 @@ func TestWebhookRuntimeReconcileUsesCapturedCatalogSnapshotWhenForgejoPublishes(
 		t.Fatalf("Projects.Upsert(project_1) error = %v", err)
 	}
 	captured := rt.configSnapshot()
-	forgejoMetadata := `{"provider":"forgejo-main","repo":"acme/forgejo"}`
-	if err := repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_2", Name: "Forgejo", RepoPath: "/tmp/forgejo", MetadataJSON: &forgejoMetadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+	ghesMetadata := `{"provider":"ghes-main","repo":"acme/ghes"}`
+	if err := repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_2", Name: "GHES", RepoPath: "/tmp/ghes", MetadataJSON: &ghesMetadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Projects.Upsert(project_2) error = %v", err)
 	}
 	published := initial
-	published.Projects = append(published.Projects, config.ProjectRefConfig{ID: "project_2", Provider: "forgejo-main", Repo: "acme/forgejo"})
+	published.Projects = append(published.Projects, config.ProjectRefConfig{ID: "project_2", Provider: "ghes-main", Repo: "acme/ghes"})
 	rt.updateConfig(published)
 
 	if err := rt.reconcileSnapshot(repositories, captured); err != nil {

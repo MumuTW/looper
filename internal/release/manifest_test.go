@@ -34,9 +34,6 @@ func TestBuildManifestCollectsArtifactsAndDerivesDefaults(t *testing.T) {
 	if manifest.Channel != "beta" {
 		t.Fatalf("manifest.Channel = %q, want %q", manifest.Channel, "beta")
 	}
-	if manifest.MinCliForDaemon != "" || manifest.MinDaemonForCli != "" {
-		t.Fatalf("min versions = %q/%q, want empty (unenforced, not published)", manifest.MinCliForDaemon, manifest.MinDaemonForCli)
-	}
 	if manifest.Artifacts["looper-darwin-arm64"].SHA256 != "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" {
 		t.Fatalf("looper sha = %q, want %q", manifest.Artifacts["looper-darwin-arm64"].SHA256, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
 	}
@@ -103,7 +100,7 @@ func TestBuildManifestRejectsInvalidChecksum(t *testing.T) {
 }
 
 func TestCurrentSchemaVersionUsesLatestEmbeddedMigration(t *testing.T) {
-	if got, want := CurrentSchemaVersion(), "0019_run_agent_snapshot"; got != want {
+	if got, want := CurrentSchemaVersion(), "0020_run_seq"; got != want {
 		t.Fatalf("CurrentSchemaVersion() = %q, want %q", got, want)
 	}
 }
@@ -147,43 +144,6 @@ func TestEncodeManifestProducesStableJSONShape(t *testing.T) {
 	}
 	if _, ok := decoded["minDaemonForCli"]; ok {
 		t.Fatalf("minDaemonForCli present = %v, want omitted", decoded["minDaemonForCli"])
-	}
-}
-
-func TestEncodeManifestIncludesOptionalMinVersionsWhenSet(t *testing.T) {
-	manifest := Manifest{
-		ManifestVersion: 1,
-		Version:         "1.2.3",
-		Tag:             "v1.2.3",
-		Released:        "2026-04-22T12:00:00Z",
-		Channel:         "stable",
-		APIVersion:      "v1",
-		SchemaVersion:   "12",
-		MinCliForDaemon: "0.2.0",
-		MinDaemonForCli: "0.2.0",
-		Artifacts: map[string]Artifact{
-			"looper-darwin-arm64": {
-				URL:    "https://example.test/looper",
-				SHA256: "abc",
-				Size:   1,
-			},
-		},
-	}
-
-	encoded, err := EncodeManifest(manifest)
-	if err != nil {
-		t.Fatalf("EncodeManifest(...) error = %v", err)
-	}
-
-	decoded := map[string]any{}
-	if err := json.Unmarshal(encoded, &decoded); err != nil {
-		t.Fatalf("json.Unmarshal(...) error = %v", err)
-	}
-	if decoded["minCliForDaemon"] != "0.2.0" {
-		t.Fatalf("minCliForDaemon = %v, want 0.2.0", decoded["minCliForDaemon"])
-	}
-	if decoded["minDaemonForCli"] != "0.2.0" {
-		t.Fatalf("minDaemonForCli = %v, want 0.2.0", decoded["minDaemonForCli"])
 	}
 }
 

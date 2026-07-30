@@ -5,11 +5,8 @@ import (
 	"strings"
 
 	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/labels"
 	"github.com/nexu-io/looper/internal/network/protocol"
-)
-
-const (
-	workerReadyLabel = "looper:worker-ready"
 )
 
 type GitHubUser struct {
@@ -55,14 +52,14 @@ func IsRouted(policy ProjectPolicy) bool {
 	return normalizeMode(policy.Mode) == config.NetworkModeRouted
 }
 
-func EvaluateWorker(policy ProjectPolicy, labels []string, assignees []GitHubUser) ClaimDecision {
+func EvaluateWorker(policy ProjectPolicy, itemLabels []string, assignees []GitHubUser) ClaimDecision {
 	if !IsRouted(policy) {
 		return ClaimDecision{Allowed: true, MatchMode: MatchModeNone}
 	}
-	if !hasLabel(labels, workerReadyLabel) {
-		return ClaimDecision{Reason: "missing looper:worker-ready label", MatchMode: MatchModeNone}
+	if !hasLabel(itemLabels, labels.DefaultWorkerReadyTrigger) {
+		return ClaimDecision{Reason: "missing " + labels.DefaultWorkerReadyTrigger + " label", MatchMode: MatchModeNone}
 	}
-	decision := evaluateTarget(policy, labels)
+	decision := evaluateTarget(policy, itemLabels)
 	if !decision.Allowed {
 		return decision
 	}

@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -67,7 +68,7 @@ func TestEarlyRunFailuresParkAgainstDiscoveryState(t *testing.T) {
 	}
 }
 
-func TestResumeCheckpointFailureUsesBreaker(t *testing.T) {
+func TestResumeCheckpointFailureBypassesBreaker(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	repo := "acme/looper"
@@ -91,18 +92,56 @@ func TestResumeCheckpointFailureUsesBreaker(t *testing.T) {
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, RetryMaxAttempts: -1, Logger: fixture.logger, Now: fixture.now})
+	// Advance the clock so the replacement run createRunContext creates is
+	// unambiguously the latest run (GetLatestByLoopID orders by started_at DESC);
+	// the predecessor run was seeded at the fixture's base time.
+	fixture.advance(time.Minute)
 
 	result, err := runner.ProcessClaimedItem(context.Background(), queue)
 	if err != nil || result.Status != "failed" {
 		t.Fatalf("ProcessClaimedItem() = (%#v, %v), want failed result", result, err)
 	}
+	if result.FailureKind != FailureManualIntervention {
+		t.Fatalf("result.FailureKind = %v, want manual_intervention for missing repair result", result.FailureKind)
+	}
 	persisted, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
 	if err != nil || persisted == nil {
 		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", persisted, err)
 	}
+	// Manual-intervention completion failures bypass the breaker: they are
+	// already terminal and park the loop for human recovery. Recording them in
+	// the streak would trip the breaker, clean the preserved worktree, and
+	// enqueue a rediscovery handoff that destroys recovery evidence.
 	state, ok := parseFailureStreakState(parseJSONObject(persisted.MetadataJSON))
-	if !ok || state.ConsecutiveCount != 1 || state.FixItemsStateHash != stateHash || state.Step != string(stepReconcileCommits) {
-		t.Fatalf("failure streak = %#v, %v, want resume-checkpoint failure accounted", state, ok)
+	if ok && state.ConsecutiveCount > 0 {
+		t.Fatalf("failure streak = %#v, want no streak recorded for manual-intervention park", state)
+	}
+	if persisted.Status != "paused" {
+		t.Fatalf("loop.Status = %q, want paused for manual intervention", persisted.Status)
+	}
+	// The resume-validation manual-intervention failure must durably park the
+	// checkpoint as manual_intervention so operator retry can escape via
+	// MarkInvalidCompletionRunRestartFromDiscover. createRunContext sets the
+	// resumed checkpoint policy to advance_from_checkpoint; preserving that
+	// nonempty advance policy would leave the failed run ineligible for the
+	// retry escape and re-park on every retry.
+	parkedRun, err := fixture.repos.Runs.GetByID(context.Background(), result.RunID)
+	if err != nil || parkedRun == nil {
+		t.Fatalf("Runs.GetByID() = (%#v, %v)", parkedRun, err)
+	}
+	if got := parseCheckpoint(parkedRun.CheckpointJSON).ResumePolicy; got != loops.ResumePolicyManualIntervention {
+		t.Fatalf("parked checkpoint ResumePolicy = %q, want manual_intervention", got)
+	}
+	rewrote, err := MarkInvalidCompletionRunRestartFromDiscover(context.Background(), fixture.repos, loop.ID, fixture.nowISO())
+	if err != nil || !rewrote {
+		t.Fatalf("MarkInvalidCompletionRunRestartFromDiscover() = (%v, %v), want escape rewrite after durable manual park", rewrote, err)
+	}
+	escaped, err := fixture.repos.Runs.GetByID(context.Background(), result.RunID)
+	if err != nil || escaped == nil {
+		t.Fatalf("Runs.GetByID() escaped = (%#v, %v)", escaped, err)
+	}
+	if got := parseCheckpoint(escaped.CheckpointJSON).ResumePolicy; got != loops.ResumePolicyRestartFromDiscover {
+		t.Fatalf("escaped checkpoint ResumePolicy = %q, want restart_from_discover after operator retry", got)
 	}
 }
 

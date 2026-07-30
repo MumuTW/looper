@@ -25,8 +25,6 @@ type Manifest struct {
 	Channel         string              `json:"channel"`
 	APIVersion      string              `json:"apiVersion"`
 	SchemaVersion   string              `json:"schemaVersion"`
-	MinCliForDaemon string              `json:"minCliForDaemon,omitempty"`
-	MinDaemonForCli string              `json:"minDaemonForCli,omitempty"`
 	Artifacts       map[string]Artifact `json:"artifacts"`
 }
 
@@ -43,8 +41,6 @@ type BuildManifestInput struct {
 	Channel           string
 	APIVersion        string
 	SchemaVersion     string
-	MinCliForDaemon   string
-	MinDaemonForCli   string
 	Repo              string
 	AssetsDir         string
 	RequiredArtifacts []string
@@ -74,10 +70,6 @@ func BuildManifest(input BuildManifestInput) (Manifest, error) {
 	if schemaVersion == "" {
 		return Manifest{}, fmt.Errorf("schemaVersion is required")
 	}
-
-	// Optional and unenforced; omit from new manifests when empty (DC-003).
-	minCliForDaemon := strings.TrimSpace(input.MinCliForDaemon)
-	minDaemonForCli := strings.TrimSpace(input.MinDaemonForCli)
 
 	repo := strings.TrimSpace(input.Repo)
 	if repo == "" {
@@ -115,8 +107,6 @@ func BuildManifest(input BuildManifestInput) (Manifest, error) {
 		Channel:         channel,
 		APIVersion:      apiVersion,
 		SchemaVersion:   schemaVersion,
-		MinCliForDaemon: minCliForDaemon,
-		MinDaemonForCli: minDaemonForCli,
 		Artifacts:       assets,
 	}, nil
 }

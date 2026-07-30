@@ -14,6 +14,10 @@ import { StatusChip } from "@/components/StatusChip";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import {
+  formatDurableProgress,
+  formatPrimaryFailure,
+} from "@/lib/fixerOutcome";
+import {
   fetchLoop,
   openLoopLogsStream,
   type Loop,
@@ -408,6 +412,15 @@ export function LoopDetailPage() {
   const activeRunItems = activeRuns.data?.items;
   const forceRefreshActiveRuns = activeRuns.forceRefresh;
 
+  const primaryFailure = useMemo(
+    () => formatPrimaryFailure(data?.outcome),
+    [data?.outcome],
+  );
+  const durableProgress = useMemo(
+    () => formatDurableProgress(data?.outcome),
+    [data?.outcome],
+  );
+
   const hasActiveRun = useMemo(() => {
     if (!data) return false;
     const items = activeRunItems ?? [];
@@ -520,6 +533,34 @@ export function LoopDetailPage() {
                     "—"
                   )
                 }
+              />
+              {/*
+                The row above is the latest error from the queue. This one is the
+                first, causal failure from the run, which differs exactly when a
+                later problem piled on top of the real cause.
+              */}
+              <Kv
+                label="First failure"
+                value={
+                  primaryFailure ? (
+                    <span className="whitespace-pre-wrap break-words">
+                      {primaryFailure}
+                    </span>
+                  ) : (
+                    "—"
+                  )
+                }
+              />
+              {/*
+                What survived the run. Paired with "First failure" this is the
+                difference between "nothing shipped, retry freely" and "some of
+                this already landed".
+              */}
+              <Kv
+                label={
+                  data.outcome?.partialSuccess ? "Kept (partial)" : "Kept"
+                }
+                value={durableProgress ?? "—"}
               />
               <Kv label="Last run" value={formatTs(data.lastRunAt)} />
               <Kv label="Next run" value={formatTs(data.nextRunAt)} />

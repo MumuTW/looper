@@ -133,7 +133,12 @@ func MaterializeCatalog(global config.Config, records []storage.ProjectRecord) (
 			Repo:       metadataString(metadata, "repo"),
 		}
 		if project.Provider != "" && !configuredProviderExists(global, project.Provider) {
-			return nil, fmt.Errorf("project %q references unknown provider %q", project.ID, project.Provider)
+			// This is reachable on upgrade when a stored project was bound to a
+			// provider the config no longer declares — including a provider kind
+			// that was removed. The daemon cannot start, so its own DELETE
+			// endpoint cannot repair the record; name the manual repair instead
+			// of failing with a dead end.
+			return nil, fmt.Errorf("project %q references unknown provider %q: re-declare the provider under [[providers]], or remove the stored binding with `sqlite3 <dbPath> \"delete from projects where id = '%s';\"` if the project is obsolete", project.ID, project.Provider, project.ID)
 		}
 		if project.Repo != "" {
 			identity, resolved := config.ProjectRepositoryIdentity(global, project)
@@ -158,25 +163,6 @@ func MaterializeCatalog(global config.Config, records []storage.ProjectRecord) (
 		}
 		if err := decodeMetadataValue(metadata, "roles", &project.Roles); err != nil {
 			return nil, fmt.Errorf("decode project %q role policy: %w", project.ID, err)
-		}
-		providerKind := config.ResolvedProjectProviderKind(global, project)
-		if providerKind == config.ProviderKindForgejo {
-			config.ApplyForgejoProjectProfile(&project)
-		}
-		if providerKind == config.ProviderKindForgejo || providerKind == config.ProviderKindPlane {
-			effectiveConfig := global
-			effectiveConfig.Projects = append(append([]config.ProjectRefConfig(nil), projects...), project)
-			roles := config.ProjectRoleConfigs(effectiveConfig, project.ID)
-			prefix := fmt.Sprintf("projects[%q]", project.ID)
-			var err error
-			if providerKind == config.ProviderKindForgejo {
-				err = config.ValidateForgejoRoleCapabilities(roles, prefix)
-			} else {
-				err = config.ValidatePlaneRoleCapabilities(roles, prefix)
-			}
-			if err != nil {
-				return nil, err
-			}
 		}
 		projects = append(projects, project)
 	}

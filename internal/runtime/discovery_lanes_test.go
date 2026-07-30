@@ -23,17 +23,24 @@ func TestDiscoveryLanesRegisterTriagerAheadOfPlannerWithoutChangingFixerSupport(
 		t.Fatalf("lane positions = %#v, want triager before planner", positions)
 	}
 	githubCapabilities, _ := forge.StaticCapabilities(forge.ProviderKindGitHub)
-	forgejoCapabilities, _ := forge.StaticCapabilities(forge.ProviderKindForgejo)
-	planeCapabilities, _ := forge.StaticCapabilities(forge.ProviderKindPlane)
-	if byName["triager"].Supported(githubCapabilities) != true ||
-		byName["triager"].Supported(forgejoCapabilities) != false {
+	// A provider that does not serve issues through the GitHub gateway must not
+	// feed the GitHub-issue lanes. No such provider is configurable today, so
+	// synthesize one to keep the predicate honest.
+	nonGitHubIssueCapabilities := githubCapabilities
+	nonGitHubIssueCapabilities.GitHubIssues = false
+	if !byName["triager"].Supported(githubCapabilities) || byName["triager"].Supported(nonGitHubIssueCapabilities) {
 		t.Fatal("triager must accept GitHub issues only")
 	}
-	if !byName[config.CodingRoleFixer].Supported(forgejoCapabilities) {
-		t.Fatal("triager registration changed fixer Forgejo discovery support")
-	}
-	if !byName["coordinator"].Supported(githubCapabilities) || byName["coordinator"].Supported(forgejoCapabilities) || byName["coordinator"].Supported(planeCapabilities) {
+	if !byName["coordinator"].Supported(githubCapabilities) || byName["coordinator"].Supported(nonGitHubIssueCapabilities) {
 		t.Fatal("coordinator must run only where GitHub owns issue authority")
+	}
+	// triager and coordinator both discover GitHub issues through the GitHub
+	// gateway, so they must share one authority predicate and never drift apart
+	// (the per-lane predicates previously drifted to different wrong flags).
+	for _, capabilities := range []forge.Capabilities{githubCapabilities, nonGitHubIssueCapabilities} {
+		if byName["triager"].Supported(capabilities) != byName["coordinator"].Supported(capabilities) {
+			t.Fatalf("triager and coordinator must share GitHub issue authority, drifted on %#v", capabilities)
+		}
 	}
 }
 

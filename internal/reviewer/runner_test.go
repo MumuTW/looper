@@ -12,13 +12,11 @@ import (
 	"time"
 
 	"github.com/nexu-io/looper/internal/config"
-	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/eventlog"
-	"github.com/nexu-io/looper/internal/forge"
 	gitinfra "github.com/nexu-io/looper/internal/infra/git"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/shell"
-	"github.com/nexu-io/looper/internal/infra/specpr"
+	"github.com/nexu-io/looper/internal/labels"
 	"github.com/nexu-io/looper/internal/loops/failureclass"
 	"github.com/nexu-io/looper/internal/networkpolicy"
 	"github.com/nexu-io/looper/internal/reviewer/automerge"
@@ -62,7 +60,7 @@ func TestDiscoverPullRequestsCreatesLoopAndQueue(t *testing.T) {
 func TestDiscoverPullRequestsSkipsReviewerHoldLabel(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{labels: []string{domain.HoldLabelReviewer}}
+	github := &fakeGitHubGateway{labels: []string{labels.HoldReviewer}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
 
 	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
@@ -77,7 +75,7 @@ func TestDiscoverPullRequestsSkipsReviewerHoldLabel(t *testing.T) {
 func TestDiscoverPullRequestsAllowsManualReviewerFollowUpWhenHeld(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{reviewRequests: []string{"alice"}, currentLogin: "bob", labels: []string{domain.HoldLabelReviewer}}
+	github := &fakeGitHubGateway{reviewRequests: []string{"alice"}, currentLogin: "bob", labels: []string{labels.HoldReviewer}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
 	nowISO := fixture.nowISO()
 	repo := "acme/looper"
@@ -99,7 +97,7 @@ func TestDiscoverPullRequestsAllowsManualReviewerFollowUpWhenHeld(t *testing.T) 
 func TestRunPublishStepSkipsWhenReviewerHoldApplied(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{labels: []string{domain.HoldLabelReviewer}}
+	github := &fakeGitHubGateway{labels: []string{labels.HoldReviewer}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
 	checkpoint, err := runner.runPublishStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()}, Loop: storage.LoopRecord{}, Repo: "acme/looper", PRNumber: 42, Checkpoint: reviewerCheckpoint{PendingReview: &pendingReviewCheckpoint{HeadSHA: "abc123", Event: ReviewEventComment}}})
 	if err == nil || !strings.Contains(err.Error(), "currently held") {
@@ -126,7 +124,7 @@ func TestProcessClaimedItemSkipsHeldFreshAutomaticReviewerBeforeStepExecution(t 
 	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_reviewer_runtime_hold", ProjectID: &projectID, LoopID: &loopID, Type: "reviewer", TargetType: "pull_request", TargetID: loopTarget, Repo: &repo, PRNumber: &prNumber, DedupeKey: "reviewer:runtime-hold", Priority: storage.QueuePriorityReviewer, Status: "running", AvailableAt: nowISO, LockKey: &lockKey, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
-	github := &fakeGitHubGateway{labels: []string{domain.HoldLabelReviewer}}
+	github := &fakeGitHubGateway{labels: []string{labels.HoldReviewer}}
 	agent := &fakeAgentExecutor{}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now})
 
@@ -164,7 +162,7 @@ func TestProcessClaimedItemSkipsHeldRoutedReviewerBeforeRoutingDrift(t *testing.
 	}
 	autoDiscovery := true
 	cfg := &config.Config{Network: config.NetworkConfig{NodeName: "red", GitHubLogin: "reviewer", GitHubUserID: 42}, Projects: []config.ProjectRefConfig{{ID: "project_1", RepoPath: t.TempDir(), Network: config.ProjectNetworkConfig{Mode: config.NetworkModeRouted}, Roles: &config.PartialRoleConfigs{Reviewer: &config.PartialReviewerRoleConfig{Discovery: &config.PartialReviewerRoleDiscoveryConfig{AutoDiscovery: &autoDiscovery}}}}}}
-	github := &fakeGitHubGateway{currentLogin: "reviewer", author: "author", labels: []string{domain.HoldLabelReviewer}, reviewRequests: []string{}, reviewRequestUsers: []networkpolicy.GitHubUser{}}
+	github := &fakeGitHubGateway{currentLogin: "reviewer", author: "author", labels: []string{labels.HoldReviewer}, reviewRequests: []string{}, reviewRequestUsers: []networkpolicy.GitHubUser{}}
 	agent := &fakeAgentExecutor{}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true}, CustomInstructions: cfg})
 
@@ -197,7 +195,7 @@ func TestProcessClaimedItemSkipsHeldFreshAutomaticReviewerBeforeRoutedRevalidati
 	if err := fixture.repos.Queue.Upsert(context.Background(), queue); err != nil {
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
-	github := &fakeGitHubGateway{labels: []string{domain.HoldLabelReviewer}}
+	github := &fakeGitHubGateway{labels: []string{labels.HoldReviewer}}
 	agent := &fakeAgentExecutor{}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now})
 
@@ -585,7 +583,7 @@ func TestRevalidateRoutedReviewerClaimBypassesHoldForManualLoop(t *testing.T) {
 	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 7, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "completed", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
-	github := &fakeGitHubGateway{labels: []string{domain.HoldLabelReviewer}}
+	github := &fakeGitHubGateway{labels: []string{labels.HoldReviewer}}
 	autoDiscovery := true
 	cfg := config.Config{Network: config.NetworkConfig{NodeName: "red", GitHubLogin: "reviewer", GitHubUserID: 42}, Projects: []config.ProjectRefConfig{{ID: "project_1", RepoPath: "/tmp/repo", Network: config.ProjectNetworkConfig{Mode: config.NetworkModeRouted}, Roles: &config.PartialRoleConfigs{Reviewer: &config.PartialReviewerRoleConfig{Discovery: &config.PartialReviewerRoleDiscoveryConfig{AutoDiscovery: &autoDiscovery}}}}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, CustomInstructions: &cfg})
@@ -611,7 +609,7 @@ func TestProcessClaimedItemHeldManualRoutedReviewerLoopBypassesHoldAndRoutingGat
 	queue := storage.QueueItemRecord{ID: "queue_manual_routed_process_hold", ProjectID: &projectID, LoopID: &loopID, Type: "reviewer", TargetType: "pull_request", TargetID: loopTarget, Repo: &repo, PRNumber: &prNumber, DedupeKey: "reviewer:manual-routed-process-hold", Priority: storage.QueuePriorityReviewer, Status: "running", AvailableAt: nowISO, LockKey: &lockKey, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}
 	autoDiscovery := true
 	cfg := &config.Config{Network: config.NetworkConfig{NodeName: "red", GitHubLogin: "reviewer", GitHubUserID: 42}, Projects: []config.ProjectRefConfig{{ID: "project_1", RepoPath: t.TempDir(), Network: config.ProjectNetworkConfig{Mode: config.NetworkModeRouted}, Roles: &config.PartialRoleConfigs{Reviewer: &config.PartialReviewerRoleConfig{Discovery: &config.PartialReviewerRoleDiscoveryConfig{AutoDiscovery: &autoDiscovery}}}}}}
-	github := &fakeGitHubGateway{labels: []string{domain.HoldLabelReviewer}, hasConflicts: true}
+	github := &fakeGitHubGateway{labels: []string{labels.HoldReviewer}, hasConflicts: true}
 	agent := &fakeAgentExecutor{}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true}, CustomInstructions: cfg})
 
@@ -742,7 +740,7 @@ func TestReviewerFailedLoopRecoveryEligibilityWhitelist(t *testing.T) {
 		{name: "closed pr", seed: failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish"}, pr: PullRequestSummary{Number: 42, State: "CLOSED"}, want: false},
 		{name: "approved by current user on head", seed: failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish"}, pr: PullRequestSummary{Number: 42, State: "OPEN", ReviewDecision: "APPROVED", HeadSHA: "abc123", Reviews: []map[string]any{{"author": map[string]any{"login": "octocat"}, "state": "APPROVED", "commit": map[string]any{"oid": "abc123"}}}}, want: false},
 		{name: "approved by another user", seed: failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish"}, pr: PullRequestSummary{Number: 42, State: "OPEN", ReviewDecision: "APPROVED", HeadSHA: "abc123", Reviews: []map[string]any{{"author": map[string]any{"login": "other"}, "state": "APPROVED", "commit": map[string]any{"oid": "abc123"}}}}, want: true},
-		{name: "ready label", seed: failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish"}, pr: PullRequestSummary{Number: 42, State: "OPEN", Labels: []string{specpr.ReadyLabel}}, want: false},
+		{name: "ready label", seed: failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish"}, pr: PullRequestSummary{Number: 42, State: "OPEN", Labels: []string{labels.SpecReady}}, want: false},
 		{name: "follow updates disabled", seed: failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish", FollowUpdates: boolPtr(false)}, pr: PullRequestSummary{Number: 42, State: "OPEN"}, want: false},
 		{name: "loop disabled", seed: failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish", LoopEnabled: boolPtr(false)}, pr: PullRequestSummary{Number: 42, State: "OPEN"}, want: false},
 		{name: "legacy budget termination metadata", seed: failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish", TerminationReason: "max_wall_clock"}, pr: PullRequestSummary{Number: 42, State: "OPEN"}, want: true},
@@ -968,7 +966,7 @@ func TestReviewerFailedLoopRecoveryEligibilityHonorsStopOnConfig(t *testing.T) {
 		pr         PullRequestSummary
 	}{
 		{name: "approved allowed", loopConfig: config.ReviewerLoopConfig{EnabledByDefault: true, QuietPeriodSeconds: 120, MaxIterationsPerPR: 20, MaxIterationsPerHead: 1, MaxWallClockSeconds: 14400, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25, StopOnApproved: false, StopOnReadyLabel: true}, pr: PullRequestSummary{Number: 42, State: "OPEN", ReviewDecision: "APPROVED"}},
-		{name: "ready label allowed", loopConfig: config.ReviewerLoopConfig{EnabledByDefault: true, QuietPeriodSeconds: 120, MaxIterationsPerPR: 20, MaxIterationsPerHead: 1, MaxWallClockSeconds: 14400, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25, StopOnApproved: true, StopOnReadyLabel: false}, pr: PullRequestSummary{Number: 42, State: "OPEN", Labels: []string{specpr.ReadyLabel}}},
+		{name: "ready label allowed", loopConfig: config.ReviewerLoopConfig{EnabledByDefault: true, QuietPeriodSeconds: 120, MaxIterationsPerPR: 20, MaxIterationsPerHead: 1, MaxWallClockSeconds: 14400, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25, StopOnApproved: true, StopOnReadyLabel: false}, pr: PullRequestSummary{Number: 42, State: "OPEN", Labels: []string{labels.SpecReady}}},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -1347,7 +1345,7 @@ func TestDiscoverPullRequestsPreservesPausedLoop(t *testing.T) {
 func TestDiscoverPullRequestsSkipsSpecLabelWhenCurrentUserIsNotRequested(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{labels: []string{specpr.ReviewingLabel}, reviewRequests: []string{"alice"}, currentLogin: "bob"}
+	github := &fakeGitHubGateway{labels: []string{labels.SpecReviewing}, reviewRequests: []string{"alice"}, currentLogin: "bob"}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
 
 	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
@@ -1369,7 +1367,7 @@ func TestDiscoverPullRequestsSkipsSpecLabelWhenCurrentUserIsNotRequested(t *test
 func TestDiscoverPullRequestsAllowsSpecLabelWhenCurrentUserIsRequested(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{labels: []string{specpr.ReviewingLabel}, reviewRequests: []string{"bob"}, currentLogin: "bob"}
+	github := &fakeGitHubGateway{labels: []string{labels.SpecReviewing}, reviewRequests: []string{"bob"}, currentLogin: "bob"}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
 
 	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
@@ -1484,7 +1482,7 @@ func TestDiscoverPullRequestsAllowsAutomaticFollowUpWhenCurrentUserIsRequested(t
 func TestDiscoverPullRequestsSkipsFollowUpLoopWhenReviewerHoldAppliedLive(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{reviewRequests: []string{"bob"}, currentLogin: "bob", labels: []string{domain.HoldLabelReviewer}}
+	github := &fakeGitHubGateway{reviewRequests: []string{"bob"}, currentLogin: "bob", labels: []string{labels.HoldReviewer}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
 	nowISO := fixture.nowISO()
 	repo := "acme/looper"
@@ -1778,7 +1776,7 @@ func TestEnsureLoopMetadataJSONUsesProjectReviewEvents(t *testing.T) {
 			ReviewEvents: config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment},
 		}}},
 		Projects: []config.ProjectRefConfig{{
-			ID: "forgejo-native", Name: "Forgejo", Repo: "owner/forgejo", RepoPath: "/tmp/forgejo",
+			ID: "ghes-native", Name: "Second", Repo: "owner/second", RepoPath: "/tmp/second",
 			Roles: &config.PartialRoleConfigs{Reviewer: &config.PartialReviewerRoleConfig{
 				Behavior: &config.PartialReviewerConfig{ReviewEvents: &config.PartialReviewerReviewEventsConfig{
 					Clean:    reviewEventPtr(config.ReviewerReviewEventApprove),
@@ -1793,7 +1791,7 @@ func TestEnsureLoopMetadataJSONUsesProjectReviewEvents(t *testing.T) {
 		CustomInstructions: &projectCfg,
 	})
 
-	metadataJSON, err := runner.ensureLoopMetadataJSON(nil, "forgejo-native", "owner/forgejo", 7)
+	metadataJSON, err := runner.ensureLoopMetadataJSON(nil, "ghes-native", "owner/second", 7)
 	if err != nil {
 		t.Fatalf("ensureLoopMetadataJSON() error = %v", err)
 	}
@@ -1804,7 +1802,7 @@ func TestEnsureLoopMetadataJSONUsesProjectReviewEvents(t *testing.T) {
 	}
 	// effectiveReviewEvents without snapshotted metadata must also resolve project overrides
 	// so the trusted proxy policy is not stuck on the global COMMENT default.
-	effective := runner.effectiveReviewEvents("forgejo-native", nil)
+	effective := runner.effectiveReviewEvents("ghes-native", nil)
 	if effective.Clean != config.ReviewerReviewEventApprove || effective.Blocking != config.ReviewerReviewEventRequestChanges {
 		t.Fatalf("effectiveReviewEvents() = %#v, want project-level APPROVE/REQUEST_CHANGES", effective)
 	}
@@ -2219,7 +2217,7 @@ func TestRunFilterStepTerminatesReadyBeforeConflictSkip(t *testing.T) {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
 
-	checkpoint, err := runner.runFilterStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repos/looper"}, Loop: loop, Repo: repo, PRNumber: prNumber, Checkpoint: reviewerCheckpoint{Detail: &checkpointDetail{State: "OPEN", HeadSHA: "abc123", HasConflicts: true, Labels: []string{specpr.ReadyLabel}}}})
+	checkpoint, err := runner.runFilterStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repos/looper"}, Loop: loop, Repo: repo, PRNumber: prNumber, Checkpoint: reviewerCheckpoint{Detail: &checkpointDetail{State: "OPEN", HeadSHA: "abc123", HasConflicts: true, Labels: []string{labels.SpecReady}}}})
 	if err != nil {
 		t.Fatalf("runFilterStep() error = %v", err)
 	}
@@ -2248,7 +2246,7 @@ func TestRunFilterStepTerminatesReadyBeforeLoginLookup(t *testing.T) {
 	}
 	reviews := []map[string]any{{"author": map[string]any{"login": "octocat"}, "state": "APPROVED", "commit": map[string]any{"oid": "abc123"}}}
 
-	checkpoint, err := runner.runFilterStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repos/looper"}, Loop: loop, Repo: repo, PRNumber: prNumber, Checkpoint: reviewerCheckpoint{Detail: &checkpointDetail{State: "OPEN", HeadSHA: "abc123", Labels: []string{specpr.ReadyLabel}, Reviews: reviews}}})
+	checkpoint, err := runner.runFilterStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repos/looper"}, Loop: loop, Repo: repo, PRNumber: prNumber, Checkpoint: reviewerCheckpoint{Detail: &checkpointDetail{State: "OPEN", HeadSHA: "abc123", Labels: []string{labels.SpecReady}, Reviews: reviews}}})
 	if err != nil {
 		t.Fatalf("runFilterStep() error = %v", err)
 	}
@@ -2481,7 +2479,7 @@ func TestRunFilterStepTerminatesReadyBeforeAlreadyReviewedSkip(t *testing.T) {
 	}
 	reviews := []map[string]any{{"author": map[string]any{"login": "octocat"}, "state": "COMMENTED", "commit": map[string]any{"oid": "abc123"}}}
 
-	checkpoint, err := runner.runFilterStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repos/looper"}, Loop: loop, Repo: repo, PRNumber: prNumber, Checkpoint: reviewerCheckpoint{Detail: &checkpointDetail{State: "OPEN", HeadSHA: "abc123", Labels: []string{specpr.ReadyLabel}, Reviews: reviews}}})
+	checkpoint, err := runner.runFilterStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repos/looper"}, Loop: loop, Repo: repo, PRNumber: prNumber, Checkpoint: reviewerCheckpoint{Detail: &checkpointDetail{State: "OPEN", HeadSHA: "abc123", Labels: []string{labels.SpecReady}, Reviews: reviews}}})
 	if err != nil {
 		t.Fatalf("runFilterStep() error = %v", err)
 	}
@@ -2747,7 +2745,7 @@ func TestDiscoverPullRequestAllowsManualFollowUpAfterSkippedAutomaticLoopForSame
 func TestDiscoverPullRequestAllowsManualFollowUpAfterSkippingHeldAutomaticLoopForSamePR(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{reviewRequests: []string{"alice"}, currentLogin: "bob", labels: []string{domain.HoldLabelReviewer}}
+	github := &fakeGitHubGateway{reviewRequests: []string{"alice"}, currentLogin: "bob", labels: []string{labels.HoldReviewer}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
 	nowISO := fixture.nowISO()
 	repo := "acme/looper"
@@ -3344,7 +3342,7 @@ func TestDiscoverPullRequestsDoesNotRequeueApprovedReadyOrDraftNonActionablePRs(
 		config config.ReviewerLoopConfig
 	}{
 		{name: "approved", github: &fakeGitHubGateway{reviewDecision: "APPROVED", reviewRequests: []string{"octocat"}, reviews: []map[string]any{{"author": map[string]any{"login": "octocat"}, "state": "APPROVED", "commit": map[string]any{"oid": "abc123"}}}}, want: "approved", config: config.ReviewerLoopConfig{EnabledByDefault: true, QuietPeriodSeconds: 60, MinPublishIntervalSeconds: 300, MaxIterationsPerPR: 20, MaxIterationsPerHead: 1, MaxWallClockSeconds: 14400, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25, StopOnApproved: true, StopOnReadyLabel: true, StopOnIdenticalOutput: true}},
-		{name: "ready", github: &fakeGitHubGateway{labels: []string{specpr.ReadyLabel}, reviewRequests: []string{"octocat"}}, want: "ready", config: testReviewerLoopConfig()},
+		{name: "ready", github: &fakeGitHubGateway{labels: []string{labels.SpecReady}, reviewRequests: []string{"octocat"}}, want: "ready", config: testReviewerLoopConfig()},
 		{name: "draft", github: &fakeGitHubGateway{listOpenByLabel: map[string][]PullRequestSummary{"": {{Number: 42, Title: "Draft", State: "OPEN", IsDraft: true, HeadSHA: "draft123", ReviewRequests: []string{"octocat"}}}}}, want: "draft", config: testReviewerLoopConfig()},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -3552,7 +3550,7 @@ func TestProcessClaimedItemAllowsManualQueuedLoopWhenApproved(t *testing.T) {
 func TestProcessClaimedItemAllowsManualQueuedLoopWhenReadyLabel(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{labels: []string{specpr.ReadyLabel}, reviewRequests: []string{"alice"}, currentLogin: "bob"}
+	github := &fakeGitHubGateway{labels: []string{labels.SpecReady}, reviewRequests: []string{"alice"}, currentLogin: "bob"}
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "Manual review", Stdout: `__LOOPER_RESULT__={"summary":"posted review"}`}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now})
 	nowISO := fixture.nowISO()
@@ -4370,7 +4368,7 @@ func TestProcessClaimedItemMarksStaleWhenPullRequestStateDriftsBeforePublish(t *
 func TestProcessClaimedItemTransitionsSpecLabelsForCleanNoop(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{labels: []string{specpr.ReviewingLabel}, reviewRequests: []string{"octocat"}, reviewMarkerMissing: true}
+	github := &fakeGitHubGateway{labels: []string{labels.SpecReviewing}, reviewRequests: []string{"octocat"}, reviewMarkerMissing: true}
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "No actionable findings; added clean signal", Stdout: `__LOOPER_RESULT__={"summary":"No actionable findings; added clean signal"}`, ParseStatus: "parsed"}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoApprove: true, ReviewEvents: config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment}, LoopConfig: config.ReviewerLoopConfig{EnabledByDefault: true, QuietPeriodSeconds: 120, MaxIterationsPerPR: 20, MaxIterationsPerHead: 2, MaxWallClockSeconds: 14400, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25}})
 	ctx := context.Background()
@@ -4412,7 +4410,7 @@ func TestProcessClaimedItemTransitionsSpecLabelsForCleanNoop(t *testing.T) {
 func TestProcessClaimedItemDoesNotTreatCleanNoopAsApprovedTransitionForApprovePolicy(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{labels: []string{specpr.ReviewingLabel}, reviewRequests: []string{"octocat"}, reviewMarkerMissing: true}
+	github := &fakeGitHubGateway{labels: []string{labels.SpecReviewing}, reviewRequests: []string{"octocat"}, reviewMarkerMissing: true}
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "No actionable findings; added clean signal", Stdout: `__LOOPER_RESULT__={"summary":"No actionable findings; added clean signal"}`, ParseStatus: "parsed"}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoApprove: false, ReviewEvents: config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventApprove}, LoopConfig: config.ReviewerLoopConfig{EnabledByDefault: true, QuietPeriodSeconds: 120, MaxIterationsPerPR: 20, MaxIterationsPerHead: 2, MaxWallClockSeconds: 14400, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25}})
 	ctx := context.Background()
@@ -4451,7 +4449,7 @@ func TestProcessClaimedItemDoesNotTreatCleanNoopAsApprovedTransitionForApprovePo
 func TestProcessClaimedItemDoesNotTransitionSpecLabelsForCleanNoopCommentPolicy(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{labels: []string{specpr.ReviewingLabel}, reviewRequests: []string{"octocat"}, reviewMarkerMissing: true}
+	github := &fakeGitHubGateway{labels: []string{labels.SpecReviewing}, reviewRequests: []string{"octocat"}, reviewMarkerMissing: true}
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "No actionable findings; added clean signal", Stdout: `__LOOPER_RESULT__={"summary":"No actionable findings; added clean signal"}`, ParseStatus: "parsed"}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoApprove: true, ReviewEvents: config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment}, LoopConfig: config.ReviewerLoopConfig{EnabledByDefault: true, QuietPeriodSeconds: 120, MaxIterationsPerPR: 20, MaxIterationsPerHead: 2, MaxWallClockSeconds: 14400, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25}})
 	ctx := context.Background()
@@ -4695,7 +4693,7 @@ func TestProcessClaimedItemSkipsLinkedIssueLabelRemovalWhenReviewerHoldApplied(t
 		reviewRequests:      []string{"reviewer"},
 		viewBody:            "Implements feature.\n\nCloses #358",
 		viewDiff:            "diff --git a/app.go b/app.go\n@@ -1,1 +1,1 @@\n-old\n+new\n",
-		issueDetail:         githubinfra.IssueDetail{Number: 358, Body: "## Acceptance criteria\n- ship app change\n- add tests\n", Labels: []string{"triaged", domain.HoldLabelReviewer}},
+		issueDetail:         githubinfra.IssueDetail{Number: 358, Body: "## Acceptance criteria\n- ship app change\n- add tests\n", Labels: []string{"triaged", labels.HoldReviewer}},
 	}
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "No actionable findings", Stdout: `__LOOPER_RESULT__={"summary":"No actionable findings"}`, ParseStatus: "parsed"}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, ReviewEvents: config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventApprove}, LoopConfig: testReviewerLoopConfig(), CustomInstructions: reviewerAutoMergeTestConfig(t), CriteriaVerifier: stubCriteriaVerifier{responses: map[criteria.AcceptanceCriterion]criteria.CriterionAssessment{
@@ -5177,7 +5175,7 @@ func TestProcessClaimedItemRequiresActionableSideEffectsBeforeRecordingPublishSu
 func TestProcessClaimedItemAppliesCleanSpecSideEffectsBeforePublishSuccess(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{labels: []string{specpr.ReviewingLabel}, reviewRequests: []string{"octocat"}, reviewMarkerOutcome: "clean", reviewMarkerEvent: ReviewEventApprove}
+	github := &fakeGitHubGateway{labels: []string{labels.SpecReviewing}, reviewRequests: []string{"octocat"}, reviewMarkerOutcome: "clean", reviewMarkerEvent: ReviewEventApprove}
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "LGTM", Stdout: `__LOOPER_RESULT__={"summary":"posted review"}`}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoApprove: false, ReviewEvents: config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventApprove}})
 
@@ -5198,10 +5196,10 @@ func TestProcessClaimedItemAppliesCleanSpecSideEffectsBeforePublishSuccess(t *te
 	if len(github.addReactionCalls) != 1 || github.addReactionCalls[0].Content != "+1" {
 		t.Fatalf("addReactionCalls = %#v, want one +1 reaction", github.addReactionCalls)
 	}
-	if len(github.removeLabelCalls) != 1 || github.removeLabelCalls[0].Labels[0] != specpr.ReviewingLabel {
+	if len(github.removeLabelCalls) != 1 || github.removeLabelCalls[0].Labels[0] != labels.SpecReviewing {
 		t.Fatalf("removeLabelCalls = %#v, want spec-reviewing removal", github.removeLabelCalls)
 	}
-	if len(github.addLabelCalls) != 1 || github.addLabelCalls[0].Labels[0] != specpr.ReadyLabel {
+	if len(github.addLabelCalls) != 1 || github.addLabelCalls[0].Labels[0] != labels.SpecReady {
 		t.Fatalf("addLabelCalls = %#v, want spec-ready add", github.addLabelCalls)
 	}
 }
@@ -5231,7 +5229,7 @@ func TestProcessClaimedItemAppliesCleanSpecSideEffectsWithConfiguredReviewingLab
 	if len(github.removeLabelCalls) != 1 || github.removeLabelCalls[0].Labels[0] != reviewingLabel {
 		t.Fatalf("removeLabelCalls = %#v, want configured reviewing label removal", github.removeLabelCalls)
 	}
-	if len(github.addLabelCalls) != 1 || github.addLabelCalls[0].Labels[0] != specpr.ReadyLabel {
+	if len(github.addLabelCalls) != 1 || github.addLabelCalls[0].Labels[0] != labels.SpecReady {
 		t.Fatalf("addLabelCalls = %#v, want spec-ready add", github.addLabelCalls)
 	}
 }
@@ -5239,7 +5237,7 @@ func TestProcessClaimedItemAppliesCleanSpecSideEffectsWithConfiguredReviewingLab
 func TestProcessClaimedItemRefreshesReviewStateBeforeSpecReadyTransition(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{labels: []string{specpr.ReviewingLabel}, reviewRequests: []string{"octocat"}, reviewDecision: "CHANGES_REQUESTED", useReviewStateAfterFirstView: true, reviewMarkerOutcome: "clean", reviewMarkerEvent: ReviewEventApprove}
+	github := &fakeGitHubGateway{labels: []string{labels.SpecReviewing}, reviewRequests: []string{"octocat"}, reviewDecision: "CHANGES_REQUESTED", useReviewStateAfterFirstView: true, reviewMarkerOutcome: "clean", reviewMarkerEvent: ReviewEventApprove}
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "LGTM", Stdout: `__LOOPER_RESULT__={"summary":"posted review"}`}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoApprove: true})
 
@@ -5260,10 +5258,10 @@ func TestProcessClaimedItemRefreshesReviewStateBeforeSpecReadyTransition(t *test
 	if github.viewCalls < 2 {
 		t.Fatalf("viewCalls = %d, want publish detail refresh before spec-ready transition", github.viewCalls)
 	}
-	if len(github.removeLabelCalls) != 1 || github.removeLabelCalls[0].Labels[0] != specpr.ReviewingLabel {
+	if len(github.removeLabelCalls) != 1 || github.removeLabelCalls[0].Labels[0] != labels.SpecReviewing {
 		t.Fatalf("removeLabelCalls = %#v, want spec-reviewing removal after refresh", github.removeLabelCalls)
 	}
-	if len(github.addLabelCalls) != 1 || github.addLabelCalls[0].Labels[0] != specpr.ReadyLabel {
+	if len(github.addLabelCalls) != 1 || github.addLabelCalls[0].Labels[0] != labels.SpecReady {
 		t.Fatalf("addLabelCalls = %#v, want spec-ready add after refresh", github.addLabelCalls)
 	}
 }
@@ -5272,7 +5270,7 @@ func TestApplyVerifiedReviewSideEffectsPreservesCheckedHeadForSpecTransition(t *
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	github := &fakeGitHubGateway{
-		labels:                 []string{specpr.ReviewingLabel},
+		labels:                 []string{labels.SpecReviewing},
 		reviewDecision:         "APPROVED",
 		changeHeadOnSecondView: true,
 	}
@@ -5291,9 +5289,9 @@ func TestApplyVerifiedReviewSideEffectsPreservesCheckedHeadForSpecTransition(t *
 		PRNumber: 42,
 	}
 	checkpoint := reviewerCheckpoint{
-		Detail: &checkpointDetail{HeadSHA: "abc123", Labels: []string{specpr.ReviewingLabel}},
+		Detail: &checkpointDetail{HeadSHA: "abc123", Labels: []string{labels.SpecReviewing}},
 	}
-	detail := PullRequestDetail{HeadSHA: "abc123", Labels: []string{specpr.ReviewingLabel}}
+	detail := PullRequestDetail{HeadSHA: "abc123", Labels: []string{labels.SpecReviewing}}
 
 	err := runner.applyVerifiedReviewSideEffects(context.Background(), input, checkpoint, detail, ReviewMarkerResult{Found: true, Outcome: "clean", Event: ReviewEventApprove})
 	if err == nil || !contains(err.Error(), "PR head changed before spec-ready transition: expected abc123, got new-head") {
@@ -5308,7 +5306,7 @@ func TestApplyCleanNoopReviewSideEffectsPreservesCheckedHeadForSpecTransition(t 
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	github := &fakeGitHubGateway{
-		labels:                 []string{specpr.ReviewingLabel},
+		labels:                 []string{labels.SpecReviewing},
 		reviewDecision:         "APPROVED",
 		changeHeadOnSecondView: true,
 	}
@@ -5327,9 +5325,9 @@ func TestApplyCleanNoopReviewSideEffectsPreservesCheckedHeadForSpecTransition(t 
 		PRNumber: 42,
 	}
 	checkpoint := reviewerCheckpoint{
-		Detail: &checkpointDetail{HeadSHA: "abc123", Labels: []string{specpr.ReviewingLabel}},
+		Detail: &checkpointDetail{HeadSHA: "abc123", Labels: []string{labels.SpecReviewing}},
 	}
-	detail := PullRequestDetail{HeadSHA: "abc123", Labels: []string{specpr.ReviewingLabel}}
+	detail := PullRequestDetail{HeadSHA: "abc123", Labels: []string{labels.SpecReviewing}}
 
 	err := runner.applyCleanNoopReviewSideEffects(context.Background(), input, checkpoint, detail)
 	if err == nil || !contains(err.Error(), "PR head changed before spec-ready transition: expected abc123, got new-head") {
@@ -5343,7 +5341,7 @@ func TestApplyCleanNoopReviewSideEffectsPreservesCheckedHeadForSpecTransition(t 
 func TestProcessClaimedItemDoesNotTransitionSpecLabelsForCleanCommentReview(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{labels: []string{specpr.ReviewingLabel}, reviewRequests: []string{"octocat"}, reviewMarkerOutcome: "clean", reviewMarkerEvent: ReviewEventComment}
+	github := &fakeGitHubGateway{labels: []string{labels.SpecReviewing}, reviewRequests: []string{"octocat"}, reviewMarkerOutcome: "clean", reviewMarkerEvent: ReviewEventComment}
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "LGTM", Stdout: `__LOOPER_RESULT__={"summary":"posted review"}`}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoApprove: false, ReviewEvents: config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventApprove}})
 
@@ -5387,7 +5385,7 @@ func TestProcessClaimedItemDoesNotTransitionSpecLabelsWhenPRReviewStateIsNotClea
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			fixture := newRunnerFixture(t)
-			github := &fakeGitHubGateway{labels: []string{specpr.ReviewingLabel}, reviewRequests: []string{"octocat"}, reviewDecision: tt.reviewDecision, comments: tt.comments, reviewMarkerOutcome: "clean", reviewMarkerEvent: ReviewEventApprove}
+			github := &fakeGitHubGateway{labels: []string{labels.SpecReviewing}, reviewRequests: []string{"octocat"}, reviewDecision: tt.reviewDecision, comments: tt.comments, reviewMarkerOutcome: "clean", reviewMarkerEvent: ReviewEventApprove}
 			agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "LGTM", Stdout: `__LOOPER_RESULT__={"summary":"posted review"}`}}}
 			runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoApprove: true})
 
@@ -6659,7 +6657,7 @@ func TestRunReviewStepPersistsRepreparedWorktreeBeforeAgentStart(t *testing.T) {
 func TestRunReviewStepRechecksHoldBeforeAgentStart(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{labels: []string{domain.HoldLabelReviewer}}
+	github := &fakeGitHubGateway{labels: []string{labels.HoldReviewer}}
 	agent := &fakeAgentExecutor{}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now})
 
@@ -7391,37 +7389,6 @@ func TestDiscoverPullRequestsUsesReviewRequestedQueryWhenReviewRequestRequired(t
 	}
 }
 
-func TestListOpenPullRequestsForDiscoveryCombinesForgejoLabelsAndReviewRequests(t *testing.T) {
-	t.Parallel()
-	github := &fakeGitHubGateway{
-		currentLogin: "reviewer",
-		listOpenByLabel: map[string][]PullRequestSummary{
-			"needs-review": {
-				{Number: 42, State: "OPEN", Labels: []string{"needs-review"}},
-				{Number: 43, State: "OPEN", Labels: []string{"needs-review"}},
-			},
-		},
-		reviewRequestedPullRequests: []PullRequestSummary{
-			{Number: 43, State: "OPEN", ReviewRequests: []string{"reviewer"}},
-			{Number: 44, State: "OPEN", ReviewRequests: []string{"reviewer"}},
-		},
-	}
-	runner := New(Options{GitHub: github})
-	policy := DiscoveryPolicy{RequireReviewRequest: true, Labels: []string{"needs-review"}, LabelMode: config.LabelModeAll, MatchAnyTrigger: true}
-
-	pulls, err := runner.listOpenPullRequestsForDiscoveryWithPolicy(context.Background(), "acme/looper", "/tmp/repo", 30, policy, "reviewer")
-	if err != nil {
-		t.Fatalf("listOpenPullRequestsForDiscoveryWithPolicy() error = %v", err)
-	}
-	// Requested reviews are reserved first so label pages cannot starve them.
-	if len(pulls) != 3 || pulls[0].Number != 43 || pulls[1].Number != 44 || pulls[2].Number != 42 {
-		t.Fatalf("pulls = %#v, want requested-first union [43, 44, 42]", pulls)
-	}
-	if len(github.listCalls) != 1 || len(github.listReviewRequestedCalls) != 1 {
-		t.Fatalf("label calls = %#v, review-request calls = %#v, want one of each", github.listCalls, github.listReviewRequestedCalls)
-	}
-}
-
 func TestListOpenPullRequestsForDiscoveryDoesNotStarveRequestedReviewsWhenLabelsFillLimit(t *testing.T) {
 	t.Parallel()
 	github := &fakeGitHubGateway{
@@ -7858,7 +7825,7 @@ func TestNewDefaultsReviewerTimeoutToNinetyMinutes(t *testing.T) {
 func TestBuildReviewPromptIncludesActionableQualityContract(t *testing.T) {
 	t.Parallel()
 
-	prompt := buildReviewPrompt("acme/looper", 42, reviewerCheckpoint{Detail: &checkpointDetail{Labels: []string{specpr.ReviewingLabel}}, Snapshot: &checkpointSnapshot{Title: "Spec PR", HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventApprove, Blocking: config.ReviewerReviewEventComment}, false, config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper")
+	prompt := buildReviewPrompt("acme/looper", 42, reviewerCheckpoint{Detail: &checkpointDetail{Labels: []string{labels.SpecReviewing}}, Snapshot: &checkpointSnapshot{Title: "Spec PR", HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventApprove, Blocking: config.ReviewerReviewEventComment}, false, config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper")
 	for _, want := range []string{
 		"Every comment MUST include",
 		"Bad comment example",
@@ -8169,27 +8136,6 @@ func TestBuildThreadResolutionPromptRequiresPreparedWorktreeReuse(t *testing.T) 
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("prompt missing %q:\n%s", want, prompt)
 		}
-	}
-}
-
-func TestShouldRestartFromDiscoverForAgentNativePreflightFailures(t *testing.T) {
-	t.Parallel()
-
-	for _, summary := range []string{
-		"PR head changed before publish",
-		"review request removed before publish",
-	} {
-		if !shouldRestartFromDiscover("failed", stepReview, summary) {
-			t.Fatalf("shouldRestartFromDiscover(review, %q) = false, want true", summary)
-		}
-	}
-}
-
-func TestShouldRestartFromDiscoverForThreadResolutionHeadChange(t *testing.T) {
-	t.Parallel()
-
-	if !shouldRestartFromDiscover("failed", stepThreadResolution, "PR changed during thread reconciliation") {
-		t.Fatalf("shouldRestartFromDiscover(thread_resolution head change) = false, want true")
 	}
 }
 
@@ -8909,7 +8855,7 @@ func TestBuildReviewPromptUsesConfiguredDisclosure(t *testing.T) {
 func TestBuildReviewPromptDoesNotTransitionSpecLabelsWithoutApprove(t *testing.T) {
 	t.Parallel()
 
-	prompt := buildReviewPrompt("acme/looper", 42, reviewerCheckpoint{Detail: &checkpointDetail{Labels: []string{specpr.ReviewingLabel}}, Snapshot: &checkpointSnapshot{Title: "Spec PR", HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper")
+	prompt := buildReviewPrompt("acme/looper", 42, reviewerCheckpoint{Detail: &checkpointDetail{Labels: []string{labels.SpecReviewing}}, Snapshot: &checkpointSnapshot{Title: "Spec PR", HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper")
 	if !strings.Contains(prompt, "Do not transition spec-review labels") {
 		t.Fatalf("prompt missing no-transition instruction:\n%s", prompt)
 	}
@@ -8921,7 +8867,7 @@ func TestBuildReviewPromptDoesNotTransitionSpecLabelsWithoutApprove(t *testing.T
 func TestBuildReviewPromptOmitsReviewRequestGuardrailWhenDisabled(t *testing.T) {
 	t.Parallel()
 
-	prompt, _ := buildReviewPromptWithInstructions("", config.Config{}, "acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, false, "", config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper", false, false)
+	prompt, _ := buildReviewPromptWithInstructions("", config.Config{}, "acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, false, "", config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper", false)
 
 	if strings.Contains(prompt, "review request removed before publish") {
 		t.Fatalf("prompt retained review-request guardrail while disabled:\n%s", prompt)
@@ -8934,7 +8880,7 @@ func TestBuildReviewPromptOmitsReviewRequestGuardrailWhenDisabled(t *testing.T) 
 func TestBuildReviewPromptNamesFollowUpReviewRequestBypass(t *testing.T) {
 	t.Parallel()
 
-	prompt, _ := buildReviewPromptWithInstructions("", config.Config{}, "acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, false, "follow_up_new_head", config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper", false, false)
+	prompt, _ := buildReviewPromptWithInstructions("", config.Config{}, "acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, false, "follow_up_new_head", config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper", false)
 
 	if strings.Contains(prompt, "review request removed before publish") {
 		t.Fatalf("prompt retained review-request guardrail for follow-up bypass:\n%s", prompt)
@@ -8944,520 +8890,6 @@ func TestBuildReviewPromptNamesFollowUpReviewRequestBypass(t *testing.T) {
 	}
 	if !strings.Contains(prompt, "enabled reviewer follow-up loop") || !strings.Contains(prompt, "differs from the last published review head") {
 		t.Fatalf("prompt missing follow-up authority explanation:\n%s", prompt)
-	}
-}
-
-func TestBuildReviewPromptCommentOnlyOmitsGitHubPublishInstructions(t *testing.T) {
-	t.Parallel()
-
-	prompt, _ := buildReviewPromptWithInstructions("", config.Config{}, "acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, false, "", config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper", false, true)
-
-	for _, forbidden := range []string{"gh pr view", "gh pr diff", "gh api", "GitHub operation contract", "review request removed before publish", "trusted Looper CLI at", "review-thread resolution"} {
-		if strings.Contains(prompt, forbidden) {
-			t.Fatalf("prompt contains %q:\n%s", forbidden, prompt)
-		}
-	}
-	if !strings.Contains(prompt, "comment-only") || !strings.Contains(prompt, "Looper will post your final completion summary") {
-		t.Fatalf("prompt missing comment-only publish instructions:\n%s", prompt)
-	}
-	for _, required := range []string{"`findings`", "`review_item_id`", "`supersedes`"} {
-		if !strings.Contains(prompt, required) {
-			t.Fatalf("prompt missing %s contract:\n%s", required, prompt)
-		}
-	}
-}
-
-func TestBuildReviewPromptCommentOnlyIncludesExistingReviewerSummaryAuthority(t *testing.T) {
-	t.Parallel()
-
-	existing := forge.NewReviewerSummary(2, []forge.ReviewItem{{ReviewItemID: "R-007", Status: forge.ReviewItemStatusOpen, Title: "Keep ID", Body: "Still broken.", Files: []string{"internal/reviewer/runner.go"}, LastSeenRoundID: 2}})
-	existingBody, err := renderReviewerSummaryComment(existing, "Previous summary")
-	if err != nil {
-		t.Fatalf("renderReviewerSummaryComment() error = %v", err)
-	}
-	prompt, _ := buildReviewPromptWithInstructions("", config.Config{}, "acme/looper", 42, reviewerCheckpoint{Snapshot: &checkpointSnapshot{HeadSHA: "abc123"}, Detail: &checkpointDetail{IssueComments: []map[string]any{{"id": int64(91), "body": existingBody}}}}, "run_1", "reviewer:loop:abc123", config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment}, false, false, "", config.ReviewerScopeChangedRanges, config.DefaultDisclosureConfig(), "opencode", "", "/opt/looper/bin/looper", false, true)
-
-	if !strings.Contains(prompt, "Existing Reviewer Summary authority") {
-		t.Fatalf("prompt missing reviewer summary authority:\n%s", prompt)
-	}
-	for _, required := range []string{"\"review_round_id\": 2", "\"review_item_id\": \"R-007\"", "\"title\": \"Keep ID\""} {
-		if !strings.Contains(prompt, required) {
-			t.Fatalf("prompt missing %s in reviewer summary context:\n%s", required, prompt)
-		}
-	}
-}
-
-func TestProcessClaimedItemCommentOnlyPublishesOneCommentAndSkipsRediscoveryForSameHead(t *testing.T) {
-	t.Parallel()
-	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{labels: []string{"looper:review"}, reviewRequests: []string{}, currentLogin: "reviewer"}
-	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "internal/reviewer/runner.go: add a regression test for Forgejo comment-only publish", Stdout: `__LOOPER_RESULT__={"summary":"internal/reviewer/runner.go: add a regression test for Forgejo comment-only publish","outcome":"non_blocking","findings":[{"title":"Regression coverage missing for comment-only publish","body":"Add a focused reviewer test that proves Forgejo comment-only publish upserts the fixed Reviewer Summary comment instead of treating freeform markdown as authority.","files":["internal/reviewer/runner_test.go"]}]}`}}}
-	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, CommentOnlyPublish: true, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, IncludeDrafts: false, RequireReviewRequest: false, Labels: []string{"looper:review"}, LabelMode: config.LabelModeAll}, LoopConfig: testReviewerLoopConfig()})
-
-	discovery, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
-	if err != nil {
-		t.Fatalf("DiscoverPullRequests() error = %v", err)
-	}
-	if len(github.listReviewRequestedCalls) != 0 {
-		t.Fatalf("review-request calls = %#v, want none for comment-only label discovery", github.listReviewRequestedCalls)
-	}
-	if len(github.listCalls) != 1 || github.listCalls[0].Label != "looper:review" {
-		t.Fatalf("list calls = %#v, want label-based discovery", github.listCalls)
-	}
-	if len(discovery.QueueItems) != 1 {
-		t.Fatalf("queue items = %#v, want one queued PR", discovery.QueueItems)
-	}
-	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
-	if err != nil || claim == nil {
-		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed reviewer item", claim, err)
-	}
-	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
-	if err != nil {
-		t.Fatalf("ProcessClaimedItem() error = %v", err)
-	}
-	if result.Status != "success" {
-		t.Fatalf("result = %#v, want success", result)
-	}
-	if len(github.submitReviewCalls) != 0 {
-		t.Fatalf("submitReviewCalls = %#v, want no native review submissions", github.submitReviewCalls)
-	}
-	if len(github.issueCommentCalls) != 1 {
-		t.Fatalf("issueCommentCalls = %#v, want exactly one comment", github.issueCommentCalls)
-	}
-	if !strings.Contains(github.issueCommentCalls[0].Body, "Forgejo comment-only publish") || !strings.Contains(github.issueCommentCalls[0].Body, forge.ReviewerSummaryMarker) {
-		t.Fatalf("comment body = %q, want reviewer summary marker", github.issueCommentCalls[0].Body)
-	}
-	parsedSummary, err := forge.ParseReviewerSummary(github.issueCommentCalls[0].Body)
-	if err != nil {
-		t.Fatalf("ParseReviewerSummary() error = %v", err)
-	}
-	if len(parsedSummary.Items) != 1 || parsedSummary.Items[0].ReviewItemID != "R-001" || parsedSummary.Items[0].Status != forge.ReviewItemStatusOpen {
-		t.Fatalf("parsed summary = %#v, want single open item", parsedSummary)
-	}
-	loop, err := fixture.repos.Loops.GetByID(context.Background(), *claim.LoopID)
-	if err != nil || loop == nil {
-		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", loop, err)
-	}
-	meta := parseJSONObject(loop.MetadataJSON)
-	if got, _ := stringFromAny(meta["lastPublishedHeadSha"]); got != "abc123" {
-		t.Fatalf("lastPublishedHeadSha = %q, want abc123", got)
-	}
-	rediscovery, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
-	if err != nil {
-		t.Fatalf("second DiscoverPullRequests() error = %v", err)
-	}
-	if len(rediscovery.QueueItems) != 0 {
-		t.Fatalf("second discovery queue items = %#v, want none for already-published head", rediscovery.QueueItems)
-	}
-	if len(github.issueCommentCalls) != 1 {
-		t.Fatalf("issueCommentCalls after rediscovery = %#v, want still one comment", github.issueCommentCalls)
-	}
-}
-
-func TestProcessClaimedItemCommentOnlyPublishesCleanNoopWithoutReactionOrLabelRemoval(t *testing.T) {
-	t.Parallel()
-	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{labels: []string{specpr.ReviewingLabel}, reviewRequests: []string{}, currentLogin: "reviewer"}
-	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "No actionable findings", Stdout: `__LOOPER_RESULT__={"summary":"No actionable findings","outcome":"clean","findings":[]}`, ParseStatus: "parsed"}}}
-	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, CommentOnlyPublish: true, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, IncludeDrafts: false, RequireReviewRequest: false, Labels: []string{specpr.ReviewingLabel}, LabelMode: config.LabelModeAll}, LoopConfig: testReviewerLoopConfig()})
-
-	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
-		t.Fatalf("DiscoverPullRequests() error = %v", err)
-	}
-	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
-	if err != nil || claim == nil {
-		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed reviewer item", claim, err)
-	}
-	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
-	if err != nil {
-		t.Fatalf("ProcessClaimedItem() error = %v", err)
-	}
-	if result.Status != "success" {
-		t.Fatalf("result = %#v, want success", result)
-	}
-	if len(github.issueCommentCalls) != 1 {
-		t.Fatalf("issueCommentCalls = %#v, want exactly one comment", github.issueCommentCalls)
-	}
-	parsedSummary, err := forge.ParseReviewerSummary(github.issueCommentCalls[0].Body)
-	if err != nil {
-		t.Fatalf("ParseReviewerSummary() error = %v", err)
-	}
-	if len(parsedSummary.Items) != 0 {
-		t.Fatalf("parsed summary items = %#v, want none", parsedSummary.Items)
-	}
-	if len(github.addReactionCalls) != 0 {
-		t.Fatalf("addReactionCalls = %#v, want no GitHub reaction for comment-only clean noop", github.addReactionCalls)
-	}
-	if len(github.removeLabelCalls) != 0 {
-		t.Fatalf("removeLabelCalls = %#v, want no spec-reviewing label removal", github.removeLabelCalls)
-	}
-}
-
-func TestProcessClaimedItemForgejoProjectInfersCommentOnlyForCleanNoop(t *testing.T) {
-	t.Parallel()
-	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{labels: []string{"looper:review"}, reviewRequests: []string{}, currentLogin: "reviewer"}
-	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "No actionable findings", Stdout: `__LOOPER_RESULT__={"summary":"No actionable findings","outcome":"clean","findings":[]}`, ParseStatus: "parsed"}}}
-	cfg, err := config.DefaultConfig(t.TempDir())
-	if err != nil {
-		t.Fatalf("DefaultConfig() error = %v", err)
-	}
-	cfg.Providers = []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: "https://forgejo.example.test", TokenEnv: stringPtr("FORGEJO_TOKEN")}}
-	cfg.Projects = []config.ProjectRefConfig{{ID: "project_1", Provider: "forgejo-main", Repo: "acme/looper", RepoPath: "/tmp/repos/looper"}}
-	cfg.Roles.Reviewer.Discovery.Triggers.RequireReviewRequest = false
-	cfg.Roles.Reviewer.Discovery.Triggers.Labels = []string{"looper:review"}
-	cfg.Roles.Reviewer.Behavior.ReviewEvents.Clean = config.ReviewerReviewEventComment
-	cfg.Roles.Reviewer.Behavior.ReviewEvents.Blocking = config.ReviewerReviewEventComment
-	cfg.Roles.Reviewer.Behavior.PublishMode = config.ReviewerPublishModeSummaryComment
-	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, CustomInstructions: &cfg, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, IncludeDrafts: false, RequireReviewRequest: false, Labels: []string{"looper:review"}, LabelMode: config.LabelModeAll}, LoopConfig: testReviewerLoopConfig(), ReviewEvents: cfg.Roles.Reviewer.Behavior.ReviewEvents})
-
-	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
-		t.Fatalf("DiscoverPullRequests() error = %v", err)
-	}
-	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
-	if err != nil || claim == nil {
-		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed reviewer item", claim, err)
-	}
-	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
-	if err != nil {
-		t.Fatalf("ProcessClaimedItem() error = %v", err)
-	}
-	if result.Status != "success" {
-		t.Fatalf("result = %#v, want success", result)
-	}
-	if github.reviewMarkerCalls != 0 {
-		t.Fatalf("reviewMarkerCalls = %d, want none for inferred Forgejo comment-only clean noop", github.reviewMarkerCalls)
-	}
-	if len(github.issueCommentCalls) != 1 {
-		t.Fatalf("issueCommentCalls = %#v, want exactly one comment", github.issueCommentCalls)
-	}
-	parsedSummary, err := forge.ParseReviewerSummary(github.issueCommentCalls[0].Body)
-	if err != nil {
-		t.Fatalf("ParseReviewerSummary() error = %v", err)
-	}
-	if len(parsedSummary.Items) != 0 {
-		t.Fatalf("parsed summary items = %#v, want none", parsedSummary.Items)
-	}
-}
-
-func TestProcessClaimedItemCommentOnlyApprovePolicyPublishesCleanNoopWithoutMarker(t *testing.T) {
-	t.Parallel()
-	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{labels: []string{"looper:review"}, reviewRequests: []string{}, currentLogin: "reviewer"}
-	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "No actionable findings", Stdout: `__LOOPER_RESULT__={"summary":"No actionable findings","outcome":"clean","findings":[]}`, ParseStatus: "parsed"}}}
-	cfg, err := config.DefaultConfig(t.TempDir())
-	if err != nil {
-		t.Fatalf("DefaultConfig() error = %v", err)
-	}
-	cfg.Providers = []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: "https://forgejo.example.test", TokenEnv: stringPtr("FORGEJO_TOKEN")}}
-	cfg.Projects = []config.ProjectRefConfig{{ID: "project_1", Provider: "forgejo-main", Repo: "acme/looper", RepoPath: "/tmp/repos/looper"}}
-	cfg.Roles.Reviewer.Discovery.Triggers.RequireReviewRequest = false
-	cfg.Roles.Reviewer.Discovery.Triggers.Labels = []string{"looper:review"}
-	cfg.Roles.Reviewer.Behavior.ReviewEvents.Clean = config.ReviewerReviewEventApprove
-	cfg.Roles.Reviewer.Behavior.PublishMode = config.ReviewerPublishModeSummaryComment
-	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, CustomInstructions: &cfg, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, IncludeDrafts: false, RequireReviewRequest: false, Labels: []string{"looper:review"}, LabelMode: config.LabelModeAll}, LoopConfig: testReviewerLoopConfig(), ReviewEvents: cfg.Roles.Reviewer.Behavior.ReviewEvents})
-
-	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
-		t.Fatalf("DiscoverPullRequests() error = %v", err)
-	}
-	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
-	if err != nil || claim == nil {
-		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed reviewer item", claim, err)
-	}
-	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
-	if err != nil {
-		t.Fatalf("ProcessClaimedItem() error = %v", err)
-	}
-	if result.Status != "success" {
-		t.Fatalf("result = %#v, want success", result)
-	}
-	if len(github.issueCommentCalls) != 1 {
-		t.Fatalf("issueCommentCalls = %#v, want exactly one comment", github.issueCommentCalls)
-	}
-	if github.reviewMarkerCalls != 0 {
-		t.Fatalf("reviewMarkerCalls = %d, want no marker verification for comment-only Forgejo publish", github.reviewMarkerCalls)
-	}
-}
-
-func TestProcessClaimedItemGlobalCommentOnlyApprovePolicyRequiresCleanMarker(t *testing.T) {
-	t.Parallel()
-	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{labels: []string{"looper:review"}, reviewRequests: []string{}, currentLogin: "reviewer", reviewMarkerMissing: true}
-	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "No actionable findings", Stdout: `__LOOPER_RESULT__={"summary":"No actionable findings","outcome":"clean","findings":[]}`, ParseStatus: "parsed"}}}
-	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, LooperCLIPath: "/opt/looper/bin/looper", CommentOnlyPublish: true, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, IncludeDrafts: false, RequireReviewRequest: false, Labels: []string{"looper:review"}, LabelMode: config.LabelModeAll}, LoopConfig: testReviewerLoopConfig(), ReviewEvents: config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventApprove}})
-
-	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
-		t.Fatalf("DiscoverPullRequests() error = %v", err)
-	}
-	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
-	if err != nil || claim == nil {
-		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed reviewer item", claim, err)
-	}
-	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
-	if err != nil {
-		t.Fatalf("ProcessClaimedItem() error = %v", err)
-	}
-	if result.Status != "failed" || result.FailureKind != FailureRetryableAfterResume || !contains(result.Summary, "requires an APPROVED review marker") {
-		t.Fatalf("result = %#v, want retryable approve-marker-required failure", result)
-	}
-	if github.reviewMarkerCalls == 0 {
-		t.Fatalf("reviewMarkerCalls = %d, want marker verification before global comment-only publish", github.reviewMarkerCalls)
-	}
-	if len(github.issueCommentCalls) != 0 {
-		t.Fatalf("issueCommentCalls = %#v, want no comment before APPROVE marker verification succeeds", github.issueCommentCalls)
-	}
-	if len(agent.starts) != 1 {
-		t.Fatalf("agent starts = %d, want one review prompt", len(agent.starts))
-	}
-	prompt := agent.starts[0].Prompt
-	if strings.Contains(prompt, "Comment-only publish contract") || strings.Contains(prompt, "Looper will post your final completion summary") {
-		t.Fatalf("prompt = %q, want normal APPROVE review instructions instead of comment-only contract", prompt)
-	}
-	if !strings.Contains(prompt, "review submit acme/looper#42 --event APPROVE") {
-		t.Fatalf("prompt = %q, want clean APPROVE submit instructions", prompt)
-	}
-}
-
-func TestProcessClaimedItemGlobalCommentOnlyApprovePolicyVerifiesActionableNativeMarker(t *testing.T) {
-	t.Parallel()
-	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{labels: []string{"looper:review"}, reviewRequests: []string{}, currentLogin: "reviewer", reviewMarkerOutcome: "blocking", reviewMarkerEvent: ReviewEventRequestChanges}
-	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "internal/reviewer/runner.go: publish predicate must match review completion mode", Stdout: `__LOOPER_RESULT__={"summary":"internal/reviewer/runner.go: publish predicate must match review completion mode","outcome":"blocking"}`, ParseStatus: "parsed"}}}
-	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, LooperCLIPath: "/opt/looper/bin/looper", CommentOnlyPublish: true, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, IncludeDrafts: false, RequireReviewRequest: false, Labels: []string{"looper:review"}, LabelMode: config.LabelModeAll}, LoopConfig: testReviewerLoopConfig(), ReviewEvents: config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventApprove, Blocking: config.ReviewerReviewEventRequestChanges}})
-
-	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
-		t.Fatalf("DiscoverPullRequests() error = %v", err)
-	}
-	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
-	if err != nil || claim == nil {
-		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed reviewer item", claim, err)
-	}
-	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
-	if err != nil {
-		t.Fatalf("ProcessClaimedItem() error = %v", err)
-	}
-	if result.Status != "success" {
-		t.Fatalf("result = %#v, want success from verified native marker", result)
-	}
-	if github.reviewMarkerCalls == 0 {
-		t.Fatalf("reviewMarkerCalls = %d, want native marker verification", github.reviewMarkerCalls)
-	}
-	if len(github.issueCommentCalls) != 0 || len(github.updateIssueCommentCalls) != 0 {
-		t.Fatalf("issue comment mutations = (%#v, %#v), want no comment-only publish", github.issueCommentCalls, github.updateIssueCommentCalls)
-	}
-	if len(agent.starts) != 1 {
-		t.Fatalf("agent starts = %d, want one review prompt", len(agent.starts))
-	}
-	if strings.Contains(agent.starts[0].Prompt, "Comment-only publish contract") {
-		t.Fatalf("prompt = %q, want native review instructions", agent.starts[0].Prompt)
-	}
-}
-
-func TestProcessClaimedItemCommentOnlyPublishesBlockingOutcome(t *testing.T) {
-	t.Parallel()
-	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{labels: []string{"looper:review"}, reviewRequests: []string{}, currentLogin: "reviewer"}
-	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "internal/reviewer/runner.go: nil worktree cleanup can deadlock reviewer retries", Stdout: `__LOOPER_RESULT__={"summary":"internal/reviewer/runner.go: nil worktree cleanup can deadlock reviewer retries","outcome":"blocking","findings":[{"title":"Nil worktree cleanup can deadlock retries","body":"Guard the cleanup path so retry resume does not block forever when the worktree record is missing.","files":["internal/reviewer/runner.go"]}]}`, ParseStatus: "parsed"}}}
-	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, CommentOnlyPublish: true, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, IncludeDrafts: false, RequireReviewRequest: false, Labels: []string{"looper:review"}, LabelMode: config.LabelModeAll}, LoopConfig: testReviewerLoopConfig()})
-
-	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
-		t.Fatalf("DiscoverPullRequests() error = %v", err)
-	}
-	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
-	if err != nil || claim == nil {
-		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed reviewer item", claim, err)
-	}
-	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
-	if err != nil {
-		t.Fatalf("ProcessClaimedItem() error = %v", err)
-	}
-	if result.Status != "success" {
-		t.Fatalf("result = %#v, want success", result)
-	}
-	if len(github.issueCommentCalls) != 1 {
-		t.Fatalf("issueCommentCalls = %#v, want exactly one comment", github.issueCommentCalls)
-	}
-	parsedSummary, err := forge.ParseReviewerSummary(github.issueCommentCalls[0].Body)
-	if err != nil {
-		t.Fatalf("ParseReviewerSummary() error = %v", err)
-	}
-	if len(parsedSummary.Items) != 1 || parsedSummary.Items[0].Status != forge.ReviewItemStatusOpen {
-		t.Fatalf("parsed summary = %#v, want one open item", parsedSummary)
-	}
-}
-
-func TestProcessClaimedItemCommentOnlyUpdatesSingleReviewerSummaryCommentAndReusesIDs(t *testing.T) {
-	t.Parallel()
-	fixture := newRunnerFixture(t)
-	existing := forge.NewReviewerSummary(2, []forge.ReviewItem{
-		{ReviewItemID: "R-001", Status: forge.ReviewItemStatusOpen, Title: "Keep ID", Body: "Still broken.", Files: []string{"old.go"}, LastSeenRoundID: 2},
-		{ReviewItemID: "R-002", Status: forge.ReviewItemStatusOpen, Title: "Replace me", Body: "Old shape.", Files: []string{"old.go"}, LastSeenRoundID: 2},
-	})
-	existingBody, err := renderReviewerSummaryComment(existing, "Previous summary")
-	if err != nil {
-		t.Fatalf("renderReviewerSummaryComment() error = %v", err)
-	}
-	github := &fakeGitHubGateway{labels: []string{"looper:review"}, reviewRequests: []string{}, currentLogin: "reviewer", issueComments: []map[string]any{{"id": int64(91), "body": existingBody}}}
-	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "Updated findings", Stdout: `__LOOPER_RESULT__={"summary":"Updated findings","outcome":"blocking","findings":[{"review_item_id":"R-001","title":"Keep ID","body":"Still broken after the latest patch.","files":["internal/reviewer/runner.go"]},{"title":"Split replacement","body":"This issue replaces the old broad item with a narrower actionable finding.","files":["internal/reviewer/runner.go"],"supersedes":["R-002"]}]}`, ParseStatus: "parsed"}}}
-	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, CommentOnlyPublish: true, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, IncludeDrafts: false, RequireReviewRequest: false, Labels: []string{"looper:review"}, LabelMode: config.LabelModeAll}, LoopConfig: testReviewerLoopConfig()})
-
-	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
-		t.Fatalf("DiscoverPullRequests() error = %v", err)
-	}
-	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
-	if err != nil || claim == nil {
-		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed reviewer item", claim, err)
-	}
-	if _, err := runner.ProcessClaimedItem(context.Background(), *claim); err != nil {
-		t.Fatalf("ProcessClaimedItem() error = %v", err)
-	}
-	if len(github.issueCommentCalls) != 0 {
-		t.Fatalf("issueCommentCalls = %#v, want no new summary comment", github.issueCommentCalls)
-	}
-	if len(github.updateIssueCommentCalls) != 1 || github.updateIssueCommentCalls[0].CommentID != 91 {
-		t.Fatalf("updateIssueCommentCalls = %#v, want existing summary comment updated", github.updateIssueCommentCalls)
-	}
-	parsed, err := forge.ParseReviewerSummary(github.updateIssueCommentCalls[0].Body)
-	if err != nil {
-		t.Fatalf("ParseReviewerSummary() error = %v", err)
-	}
-	if parsed.ReviewRoundID != 3 {
-		t.Fatalf("review_round_id = %d, want 3", parsed.ReviewRoundID)
-	}
-	if len(parsed.Items) != 3 {
-		t.Fatalf("items = %#v, want 3", parsed.Items)
-	}
-	if parsed.Items[0].ReviewItemID != "R-001" || parsed.Items[0].Status != forge.ReviewItemStatusOpen {
-		t.Fatalf("item0 = %#v, want reused open R-001", parsed.Items[0])
-	}
-	if parsed.Items[1].Status != forge.ReviewItemStatusSuperseded || parsed.Items[1].SupersededBy != "R-003" {
-		t.Fatalf("item1 = %#v, want superseded by R-003", parsed.Items[1])
-	}
-	if parsed.Items[2].ReviewItemID != "R-003" || len(parsed.Items[2].Supersedes) != 1 || parsed.Items[2].Supersedes[0] != "R-002" {
-		t.Fatalf("item2 = %#v, want new R-003 superseding R-002", parsed.Items[2])
-	}
-}
-
-func TestBuildReviewerSummaryFromCompletionRejectsSupersededUpdatedReviewItemID(t *testing.T) {
-	t.Parallel()
-
-	existing := forge.NewReviewerSummary(2, []forge.ReviewItem{
-		{ReviewItemID: "R-001", Status: forge.ReviewItemStatusOpen, Title: "Keep ID", Body: "Still broken.", LastSeenRoundID: 2},
-		{ReviewItemID: "R-002", Status: forge.ReviewItemStatusOpen, Title: "Replace me", Body: "Old shape.", LastSeenRoundID: 2},
-	})
-	completion := reviewerCommentOnlyCompletion{
-		Summary: "Updated findings",
-		Outcome: "blocking",
-		Findings: []reviewerCommentOnlyFindingResult{
-			{ReviewItemID: "R-001", Title: "Keep ID", Body: "Still broken after the latest patch."},
-			{Title: "Replacement", Body: "This narrows the old broad issue.", Supersedes: []string{"R-001"}},
-		},
-	}
-
-	_, err := buildReviewerSummaryFromCompletion(existing, completion)
-	if err == nil || !strings.Contains(err.Error(), `supersedes updated review_item_id "R-001"`) {
-		t.Fatalf("buildReviewerSummaryFromCompletion() error = %v, want updated supersedes failure", err)
-	}
-}
-
-func TestProcessClaimedItemCommentOnlySkipsWhenReviewRequestRemovedBeforePublish(t *testing.T) {
-	t.Parallel()
-	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{
-		labels:                          []string{"looper:review"},
-		reviewRequests:                  []string{"reviewer"},
-		currentLogin:                    "reviewer",
-		removeReviewRequestOnSecondView: true,
-	}
-	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "Blocking issue remains", Stdout: `__LOOPER_RESULT__={"summary":"Blocking issue remains","outcome":"blocking","findings":[{"title":"Blocking issue remains","body":"Must not publish summary when request was removed.","files":["internal/reviewer/runner.go"]}]}`, ParseStatus: "parsed"}}}
-	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, CommentOnlyPublish: true, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, IncludeDrafts: false, RequireReviewRequest: true, Labels: []string{"looper:review"}, LabelMode: config.LabelModeAll}, LoopConfig: testReviewerLoopConfig()})
-
-	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
-		t.Fatalf("DiscoverPullRequests() error = %v", err)
-	}
-	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
-	if err != nil || claim == nil {
-		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed reviewer item", claim, err)
-	}
-	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
-	if err != nil {
-		t.Fatalf("ProcessClaimedItem() error = %v", err)
-	}
-	if result.Status != "skipped" || !contains(result.Summary, "not requested for review") {
-		t.Fatalf("result = %#v, want skipped not requested", result)
-	}
-	if len(github.issueCommentCalls) != 0 {
-		t.Fatalf("issueCommentCalls = %#v, want no summary_comment publish after request removal", github.issueCommentCalls)
-	}
-	updatedLoop, err := fixture.repos.Loops.GetByID(context.Background(), *claim.LoopID)
-	if err != nil || updatedLoop == nil || updatedLoop.MetadataJSON == nil {
-		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop metadata", updatedLoop, err)
-	}
-	if contains(*updatedLoop.MetadataJSON, `"lastPublishedHeadSha":"abc123"`) {
-		t.Fatalf("loop metadata = %s, want no comment-only publish progress", *updatedLoop.MetadataJSON)
-	}
-}
-
-func TestProcessClaimedItemCommentOnlyDoesNotMarkActionableNoActionSummaryAsCleanNoop(t *testing.T) {
-	t.Parallel()
-
-	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{labels: []string{"looper:review"}, reviewRequests: []string{}, currentLogin: "reviewer"}
-	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "No actionable findings, but this still has a blocking issue", Stdout: `__LOOPER_RESULT__={"summary":"No actionable findings, but this still has a blocking issue","outcome":"blocking","findings":[{"title":"Blocking issue remains","body":"The structured outcome is still blocking and must publish an open reviewer item.","files":["internal/reviewer/runner.go"]}]}`, ParseStatus: "parsed"}}}
-	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, CommentOnlyPublish: true, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, IncludeDrafts: false, RequireReviewRequest: false, Labels: []string{"looper:review"}, LabelMode: config.LabelModeAll}, LoopConfig: testReviewerLoopConfig()})
-
-	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
-		t.Fatalf("DiscoverPullRequests() error = %v", err)
-	}
-	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
-	if err != nil || claim == nil {
-		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed reviewer item", claim, err)
-	}
-	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
-	if err != nil {
-		t.Fatalf("ProcessClaimedItem() error = %v", err)
-	}
-	if result.Status != "success" {
-		t.Fatalf("result = %#v, want success", result)
-	}
-	if len(github.issueCommentCalls) != 1 {
-		t.Fatalf("issueCommentCalls = %#v, want exactly one comment", github.issueCommentCalls)
-	}
-	parsedSummary, err := forge.ParseReviewerSummary(github.issueCommentCalls[0].Body)
-	if err != nil {
-		t.Fatalf("ParseReviewerSummary() error = %v", err)
-	}
-	if len(parsedSummary.Items) != 1 || parsedSummary.Items[0].Status != forge.ReviewItemStatusOpen {
-		t.Fatalf("parsed summary = %#v, want one open item", parsedSummary)
-	}
-	if len(github.addReactionCalls) != 0 {
-		t.Fatalf("addReactionCalls = %#v, want no clean reaction side effects", github.addReactionCalls)
-	}
-	if len(github.removeLabelCalls) != 0 {
-		t.Fatalf("removeLabelCalls = %#v, want no clean noop label removal", github.removeLabelCalls)
-	}
-	loop, err := fixture.repos.Loops.GetByID(context.Background(), *claim.LoopID)
-	if err != nil || loop == nil {
-		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", loop, err)
-	}
-	if !contains(*loop.MetadataJSON, `"lastOutputFingerprint":"`) {
-		t.Fatalf("loop metadata = %s, want actionable output fingerprint recorded", *loop.MetadataJSON)
-	}
-}
-
-func TestPublishCommentOnlyReviewFailsOnDuplicateReviewerSummaryComments(t *testing.T) {
-	t.Parallel()
-	existing := forge.NewReviewerSummary(1, []forge.ReviewItem{{ReviewItemID: "R-001", Status: forge.ReviewItemStatusOpen, Title: "Old", Body: "Body", LastSeenRoundID: 1}})
-	body, err := renderReviewerSummaryComment(existing, "Existing")
-	if err != nil {
-		t.Fatalf("renderReviewerSummaryComment() error = %v", err)
-	}
-	github := &fakeGitHubGateway{labels: []string{"looper:review"}, reviewRequests: []string{}, currentLogin: "reviewer", issueComments: []map[string]any{{"id": int64(1), "body": body}, {"id": int64(2), "body": body}}}
-	runner := New(Options{GitHub: github, CommentOnlyPublish: true})
-	pending := pendingReviewCheckpoint{HeadSHA: "abc123", Summary: "No actionable findings", Outcome: "clean", ReviewerSummaryJSON: `{"summary":"No actionable findings","outcome":"clean","findings":[]}`}
-	input := stepInput{Repo: "acme/looper", PRNumber: 42, Project: storage.ProjectRecord{RepoPath: "/tmp/repo"}}
-	if err := runner.publishCommentOnlyReview(context.Background(), input, pending, PullRequestDetail{}); err == nil || !strings.Contains(err.Error(), "duplicated") {
-		t.Fatalf("publishCommentOnlyReview() error = %v, want duplicate summary failure", err)
 	}
 }
 

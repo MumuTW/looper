@@ -1,50 +1,37 @@
 package loops
 
-import "strings"
+import "github.com/nexu-io/looper/internal/loops/policy"
 
+// The failure-kind and resume-policy vocabulary lives in the leaf package
+// internal/loops/policy so that decision-only packages can depend on it
+// without pulling in this package's storage and eventlog dependencies. These
+// aliases keep every existing loops.* call site working.
 const (
-	FailureKindRetryableAfterResume = "retryable_after_resume"
-	FailureKindManualIntervention   = "manual_intervention"
+	FailureKindRetryableAfterResume = policy.FailureKindRetryableAfterResume
+	FailureKindManualIntervention   = policy.FailureKindManualIntervention
 
-	ResumePolicyAdvanceFromCheckpoint = "advance_from_checkpoint"
-	ResumePolicyManualIntervention    = "manual_intervention"
-	ResumePolicyReplayStep            = "replay_step"
-	ResumePolicyRestartFromDiscover   = "restart_from_discover"
+	ResumePolicyAdvanceFromCheckpoint = policy.ResumePolicyAdvanceFromCheckpoint
+	ResumePolicyManualIntervention    = policy.ResumePolicyManualIntervention
+	ResumePolicyReplayStep            = policy.ResumePolicyReplayStep
+	ResumePolicyRestartFromDiscover   = policy.ResumePolicyRestartFromDiscover
 )
 
 func NormalizeResumePolicy(failureKind, resumePolicy string) string {
-	policy := strings.TrimSpace(resumePolicy)
-	if policy != "" {
-		return policy
-	}
-	switch strings.TrimSpace(failureKind) {
-	case FailureKindRetryableAfterResume:
-		return ResumePolicyAdvanceFromCheckpoint
-	case FailureKindManualIntervention:
-		return ResumePolicyManualIntervention
-	default:
-		return ResumePolicyReplayStep
-	}
+	return policy.NormalizeResumePolicy(failureKind, resumePolicy)
 }
 
 func IsManualHoldResumePolicy(resumePolicy string) bool {
-	return strings.TrimSpace(resumePolicy) == ResumePolicyManualIntervention
+	return policy.IsManualHoldResumePolicy(resumePolicy)
 }
 
 func IsHardHold(failureKind, resumePolicy string) bool {
-	if IsManualHoldResumePolicy(resumePolicy) {
-		return true
-	}
-	return strings.TrimSpace(failureKind) == FailureKindManualIntervention
+	return policy.IsHardHold(failureKind, resumePolicy)
 }
 
 func SuppressesAutonomousRecovery(failureKind, resumePolicy string) bool {
-	return IsHardHold(failureKind, resumePolicy)
+	return policy.SuppressesAutonomousRecovery(failureKind, resumePolicy)
 }
 
 func ShouldRestartFromDiscover(status, resumePolicy string) bool {
-	if status != "failed" && status != "interrupted" {
-		return false
-	}
-	return strings.TrimSpace(resumePolicy) == ResumePolicyRestartFromDiscover
+	return policy.ShouldRestartFromDiscover(status, resumePolicy)
 }

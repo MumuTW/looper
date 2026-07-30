@@ -95,7 +95,7 @@ The act of putting an Issue into a state where Planner or Worker will discover i
 _Avoid_: handoff (overloaded — see below), route, promote, enqueue.
 
 **Trigger label**:
-The label a reactive Role watches for to claim an Issue or Pull Request. Configured per Role (e.g. Planner's trigger label is set in `roles.planner.triggers.labels`). In a Routed project, Worker still uses the generic `looper:worker-ready` Trigger label as work intent; exact Node targeting is expressed separately by `looper:target:<node_name>`.
+The label a reactive Role watches for to claim an Issue or Pull Request. Configured per Role under `roles.<role>.triggers.labels`; the defaults are `labels.DefaultPlanTrigger` and `labels.DefaultWorkerReadyTrigger` in `internal/labels`, the single definition point for role trigger defaults, spec PR lifecycle labels, and holds. Target labels live in `internal/network/protocol` because forming one requires validating a Node name, and comment markers are a separate mechanism kept with the protocol that emits them. Runtime discovery must read the configured value, not the default.
 _Avoid_: queue label, pickup label, routed label, dispatched label, target label.
 
 **Veto signal**:
@@ -145,30 +145,6 @@ The standard `<!-- looper:stamp v=1 -->` HTML comment plus visible footer applie
 **Self-dedup marker**:
 A Role-specific HTML comment marker (e.g. `<!-- looper:coordinator:triage -->`) used by a stateless Role to recognise its own prior comments and avoid duplicate posts.
 
-**Reviewer Summary**:
-The Looper-maintained top-level PR comment where a Reviewer publishes the complete current-state snapshot of review items for a Pull Request, for a Provider that cannot support review-thread resolution.
-_Avoid_: review thread, inline comment state.
-
-**Fixer Summary**:
-The Looper-maintained top-level PR comment where a Fixer records a complete current-state snapshot of which Reviewer Summary items it attempted, the observed or produced branch state, and the per-item handling result.
-_Avoid_: resolve marker, thread reply.
-
-**Review Round**:
-One Reviewer pass over a Pull Request that produces a Reviewer Summary. A later Review Round may mark earlier items resolved or superseded after re-evaluating the then-current branch state.
-_Avoid_: review thread lifecycle, resolve cycle.
-
-**Review Item ID**:
-A Reviewer-assigned stable identifier for one semantic review issue in a Reviewer Summary, unique within a single Pull Request's summary history. Reviewer reuses the same Review Item ID while the semantic issue remains the same; it creates a new ID only when the issue is split, merged, or materially redefined. Fixer cites Review Item IDs when reporting attempted fixes; it does not infer item identity from files, line numbers, or text similarity.
-_Avoid_: item id, comment id, line id.
-
-**Review Item Status**:
-The Reviewer's current judgment for a Review Item in a Reviewer Summary: `open`, `resolved`, or `superseded`. This is separate from Fixer's per-item handling result.
-_Avoid_: fixer result, resolve marker.
-
-**Fixer Item Result**:
-The Fixer's per-item handling result in a Fixer Summary: `fixed`, `declined`, or `deferred`. This is not the final review status.
-_Avoid_: review item status, resolved state.
-
 ### Network
 
 **Network**:
@@ -186,7 +162,7 @@ _Avoid_: router, dispatcher, scheduler, balancer.
 A project whose `network.mode` is `routed`. Coordinator admission/assignment is performed by the current Network Lease holder. Worker/Reviewer claim only when the exact target label matches the local Node and the role-specific GitHub-native coarse target is present. The complement is a *local-only project*, whose Roles keep existing single-machine behaviour and ignore `looper:target:*` labels.
 
 **Target label**:
-A Network-only exact Node target label of the form `looper:target:<node_name>`. Exactly one valid target label must be present before a Routed Worker/Reviewer may claim. Target labels are ignored in local-only projects.
+Constructed and parsed by `TargetLabelForNode`/`ParseTargetLabel` in `internal/network/protocol`, which is where they live because forming one requires validating a Node name. Exactly one valid target label must be present before a Routed Worker/Reviewer may claim; target labels are ignored in local-only projects.
 _Avoid_: trigger label, routed label, worker-ready suffix.
 
 **Lease**:

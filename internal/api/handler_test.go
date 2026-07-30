@@ -23,6 +23,7 @@ import (
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/domain"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
+	"github.com/nexu-io/looper/internal/labels"
 	"github.com/nexu-io/looper/internal/projects"
 	"github.com/nexu-io/looper/internal/reviewer"
 	looperdruntime "github.com/nexu-io/looper/internal/runtime"
@@ -197,6 +198,50 @@ func TestHandlerLoopRetryResetsFixerFailureStreak(t *testing.T) {
 	}
 	if got["unrelated"] != "preserved" {
 		t.Fatalf("unrelated metadata = %#v, want preserved", got["unrelated"])
+	}
+}
+
+func TestHandlerLoopRetryEscapesManualInterventionFixerCheckpoint(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+	projectID := "project_retry_escape_manual"
+	loopID := "loop_retry_escape_manual"
+	repo := "acme/looper"
+	prNumber := int64(42)
+	targetID := "pr:acme/looper:42"
+
+	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Looper", RepoPath: "/tmp/repos/looper", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 47, ProjectID: projectID, Type: "fixer", TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber, Status: "paused", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	checkpoint := `{"resumePolicy":"manual_intervention","worktree":{"path":"/tmp/wt-42","branch":"feature/fix-42","preparedAt":"2026-04-11T12:00:00.000Z"},"repair":{"summary":"upstream server_error","parseStatus":"","completedAt":"2026-04-11T12:00:00.000Z"}}`
+	if err := services.Repositories.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_parked", LoopID: loopID, Status: "failed", CurrentStep: stringPtr("resolve_comments"), LastCompletedStep: stringPtr("push"), CheckpointJSON: &checkpoint, StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	lastErrorKind := "manual_intervention"
+	if err := services.Repositories.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_escape_manual", ProjectID: &projectID, LoopID: &loopID, Type: "fixer", TargetType: "pull_request", TargetID: targetID, Repo: &repo, PRNumber: &prNumber, DedupeKey: "fixer:escape_manual", Priority: storage.QueuePriorityFixer, Status: "manual_intervention", AvailableAt: nowISO, Attempts: 1, MaxAttempts: -1, LastErrorKind: &lastErrorKind, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/47/retry", strings.NewReader(`{"mode":"auto","resetAttempts":true}`))
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	run, err := services.Repositories.Runs.GetByID(context.Background(), "run_parked")
+	if err != nil || run == nil {
+		t.Fatalf("Runs.GetByID() = (%#v, %v)", run, err)
+	}
+	if !strings.Contains(*run.CheckpointJSON, `"restart_from_discover"`) {
+		t.Fatalf("checkpoint = %s, want resumePolicy restart_from_discover after operator retry", *run.CheckpointJSON)
+	}
+	if strings.Contains(*run.CheckpointJSON, `"manual_intervention"`) {
+		t.Fatalf("checkpoint = %s, want manual_intervention resumePolicy replaced", *run.CheckpointJSON)
 	}
 }
 
@@ -1097,15 +1142,28 @@ func TestStatusDegradedReasonsIncludesKnownDisabledPublishWithoutLooperPath(t *t
 	reasons := statusDegradedReasons(looperdruntime.ReviewPublishReadiness{
 		Known:              true,
 		PublishingDisabled: true,
-	}, looperdruntime.OutstandingQuarantineDebt{}, nil)
+	}, looperdruntime.ForgeCredentialReadiness{}, looperdruntime.OutstandingQuarantineDebt{}, nil)
 	if got := strings.Join(reasons, ","); got != "review_publish_disabled" {
 		t.Fatalf("statusDegradedReasons() = %q, want review_publish_disabled", got)
+	}
+}
+
+func TestStatusDegradedReasonsIncludesMissingForgeCredential(t *testing.T) {
+	reasons := statusDegradedReasons(
+		looperdruntime.ReviewPublishReadiness{},
+		looperdruntime.ForgeCredentialReadiness{GitHubProjects: true},
+		looperdruntime.OutstandingQuarantineDebt{},
+		nil,
+	)
+	if got := strings.Join(reasons, ","); got != looperdruntime.ForgeCredentialDegradedReason {
+		t.Fatalf("statusDegradedReasons() = %q, want %q", got, looperdruntime.ForgeCredentialDegradedReason)
 	}
 }
 
 func TestStatusDegradedReasonsIncludesUnavailableQuarantineDebt(t *testing.T) {
 	reasons := statusDegradedReasons(
 		looperdruntime.ReviewPublishReadiness{},
+		looperdruntime.ForgeCredentialReadiness{},
 		looperdruntime.OutstandingQuarantineDebt{},
 		errors.New("sqlite temporarily unavailable"),
 	)
@@ -1162,55 +1220,25 @@ func TestHandlerStatusReportsDebtAfterStaleRunReconcile(t *testing.T) {
 	// Quarantine deliberately leaves uncertain execution/run evidence active;
 	// this counter exists to surface the resulting active-runs inflation.
 	assertEqual(t, outstanding["quarantinedRunningRuns"], float64(1))
+	// The counters name the loops they are about, from the same evidence pass.
+	roster, ok := outstanding["loops"].([]any)
+	if !ok || len(roster) != 1 {
+		t.Fatalf("outstanding[loops] = %#v, want one quarantined loop", outstanding["loops"])
+	}
+	quarantinedLoop := roster[0].(map[string]any)
+	assertEqual(t, quarantinedLoop["loopId"], loopID)
+	assertEqual(t, quarantinedLoop["seq"], float64(1))
+	assertEqual(t, quarantinedLoop["type"], "worker")
+	assertEqual(t, quarantinedLoop["status"], "paused")
+	if fmt.Sprintf("%v", quarantinedLoop["quarantinedAt"]) == "" {
+		t.Fatalf("quarantined loop = %#v, want the durable quarantine timestamp", quarantinedLoop)
+	}
 	if !strings.Contains(fmt.Sprintf("%v", service["degradedReasons"]), "quarantine_orphan_debt") {
 		t.Fatalf("degradedReasons = %#v, want quarantine debt", service["degradedReasons"])
 	}
 	if run, err := repos.Runs.GetByID(context.Background(), runID); err != nil || run == nil || run.Status != "running" {
 		t.Fatalf("run after reconcile = %#v, %v; want running quarantine evidence", run, err)
 	}
-}
-
-func TestHandlerStatusIncludesRedactedForgejoProviderHealth(t *testing.T) {
-	t.Setenv("FORGEJO_STATUS_TOKEN", "status-secret")
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/api/v1/version":
-			_, _ = w.Write([]byte(`{"version":"15.0.4"}`))
-		case "/swagger.v1.json":
-			_, _ = w.Write([]byte(`{"paths":{"/repos/{owner}/{repo}/pulls/comments/{id}/resolve":{"post":{}}}}`))
-		case "/api/v1/user":
-			_, _ = w.Write([]byte(`{"id":7,"login":"forge-bot"}`))
-		case "/api/v1/repos/acme/looper":
-			_, _ = w.Write([]byte(`{"permissions":{"pull":true,"push":true}}`))
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer server.Close()
-
-	rt, cfg := startTestRuntime(t)
-	tokenEnv := "FORGEJO_STATUS_TOKEN"
-	cfg.Providers = []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: server.URL, TokenEnv: &tokenEnv}}
-	cfg.Projects = []config.ProjectRefConfig{{ID: "project-forgejo", Provider: "forgejo-main", Repo: "acme/looper", RepoPath: t.TempDir()}}
-	recorder := httptest.NewRecorder()
-	NewHandler(Context{Config: cfg, Runtime: runtimeWithConfig(rt, cfg)}).ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/v1/status", nil))
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200", recorder.Code)
-	}
-	body := recorder.Body.String()
-	if strings.Contains(body, "status-secret") || strings.Contains(body, server.URL) || strings.Contains(body, tokenEnv) {
-		t.Fatalf("status body leaked provider configuration: %s", body)
-	}
-	data := parseJSONMap(t, recorder.Body.Bytes())["data"].(map[string]any)
-	providers := data["providers"].([]any)
-	if len(providers) != 1 {
-		t.Fatalf("providers = %#v", providers)
-	}
-	provider := providers[0].(map[string]any)
-	assertEqual(t, provider["providerId"], "forgejo-main")
-	assertEqual(t, provider["authentication"], "valid")
-	projects := provider["projects"].([]any)
-	assertEqual(t, projects[0].(map[string]any)["access"], "writable")
 }
 
 func TestHandlerVersionSuccessContainsExpectedFields(t *testing.T) {
@@ -1699,7 +1727,7 @@ func TestHandlerPullRequestRouteReturnsInternalErrorWhenLoopLookupFails(t *testi
 func TestHandlerPullRequestRouteRequiresProjectForDuplicateRepoIdentity(t *testing.T) {
 	fixture := newTestFixture(t)
 	nowISO := fixture.now.UTC().Format(javaScriptISOString)
-	for _, projectID := range []string{"github", "forgejo"} {
+	for _, projectID := range []string{"github", "ghes"} {
 		metadata := `{"repo":"acme/app"}`
 		if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: projectID, RepoPath: "/tmp/" + projectID, MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 			t.Fatalf("Projects.Upsert(%s) error = %v", projectID, err)
@@ -1707,7 +1735,7 @@ func TestHandlerPullRequestRouteRequiresProjectForDuplicateRepoIdentity(t *testi
 	}
 	for _, snapshot := range []storage.PullRequestSnapshotRecord{
 		{ID: "snapshot_github", ProjectID: "github", Repo: "acme/app", PRNumber: 42, HeadSHA: "github-head", CapturedAt: nowISO, CreatedAt: nowISO},
-		{ID: "snapshot_forgejo", ProjectID: "forgejo", Repo: "acme/app", PRNumber: 42, HeadSHA: "forgejo-head", CapturedAt: nowISO, CreatedAt: nowISO},
+		{ID: "snapshot_ghes", ProjectID: "ghes", Repo: "acme/app", PRNumber: 42, HeadSHA: "ghes-head", CapturedAt: nowISO, CreatedAt: nowISO},
 	} {
 		if err := fixture.runtime.Services().Repositories.PullRequestSnapshots.Upsert(context.Background(), snapshot); err != nil {
 			t.Fatalf("PullRequestSnapshots.Upsert(%s) error = %v", snapshot.ProjectID, err)
@@ -1717,7 +1745,7 @@ func TestHandlerPullRequestRouteRequiresProjectForDuplicateRepoIdentity(t *testi
 	prNumber := int64(42)
 	for index, loop := range []storage.LoopRecord{
 		{ID: "github_reviewer", ProjectID: "github", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "completed"},
-		{ID: "forgejo_reviewer", ProjectID: "forgejo", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running"},
+		{ID: "ghes_reviewer", ProjectID: "ghes", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running"},
 	} {
 		loop.Seq = int64(index + 1)
 		loop.CreatedAt = nowISO
@@ -1735,17 +1763,17 @@ func TestHandlerPullRequestRouteRequiresProjectForDuplicateRepoIdentity(t *testi
 	}
 
 	qualified := httptest.NewRecorder()
-	handler.ServeHTTP(qualified, httptest.NewRequest(http.MethodGet, "/api/v1/pull-requests/AcMe%2FApp/42?projectId=forgejo", nil))
+	handler.ServeHTTP(qualified, httptest.NewRequest(http.MethodGet, "/api/v1/pull-requests/AcMe%2FApp/42?projectId=ghes", nil))
 	if qualified.Code != http.StatusOK {
 		t.Fatalf("qualified status = %d, want 200; body=%s", qualified.Code, qualified.Body.String())
 	}
 	body := parseJSONMap(t, qualified.Body.Bytes())
 	data := body["data"].(map[string]any)
-	if data["projectId"] != "forgejo" || data["headSha"] != "forgejo-head" {
-		t.Fatalf("qualified data = %#v, want Forgejo snapshot", data)
+	if data["projectId"] != "ghes" || data["headSha"] != "ghes-head" {
+		t.Fatalf("qualified data = %#v, want GHES snapshot", data)
 	}
 	if data["reviewer"] != "running" {
-		t.Fatalf("qualified reviewer = %#v, want only Forgejo loop state", data["reviewer"])
+		t.Fatalf("qualified reviewer = %#v, want only GHES loop state", data["reviewer"])
 	}
 }
 
@@ -1753,7 +1781,7 @@ func TestHandlerPullRequestRouteCountsLoopOnlyProjectAsAmbiguous(t *testing.T) {
 	fixture := newTestFixture(t)
 	nowISO := fixture.now.UTC().Format(javaScriptISOString)
 	metadata := `{"repo":"acme/app"}`
-	for _, projectID := range []string{"github", "forgejo"} {
+	for _, projectID := range []string{"github", "ghes"} {
 		if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: projectID, RepoPath: "/tmp/" + projectID, MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 			t.Fatalf("Projects.Upsert(%s) error = %v", projectID, err)
 		}
@@ -1763,7 +1791,7 @@ func TestHandlerPullRequestRouteCountsLoopOnlyProjectAsAmbiguous(t *testing.T) {
 	}
 	repo := "ACME/APP"
 	prNumber := int64(42)
-	if err := fixture.runtime.Services().Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "forgejo_loop_only", Seq: 1, ProjectID: "forgejo", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+	if err := fixture.runtime.Services().Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "ghes_loop_only", Seq: 1, ProjectID: "ghes", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
 
@@ -2200,21 +2228,21 @@ func TestHandlerProjectsListRouteSuccess(t *testing.T) {
 func TestResolveProjectProviderKind(t *testing.T) {
 	t.Parallel()
 
-	tokenEnv := "FORGEJO_TOKEN"
+	tokenEnv := "GHES_TOKEN"
 	cfg := config.Config{
 		Providers: []config.ProviderConfig{
-			{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: "https://code.example.com", TokenEnv: &tokenEnv},
+			{ID: "ghes-main", Kind: config.ProviderKindGitHub, BaseURL: "https://code.example.com", TokenEnv: &tokenEnv},
 		},
 		Projects: []config.ProjectRefConfig{
-			{ID: "configured-forgejo", Name: "Configured", Provider: "forgejo-main", Repo: "acme/fj", RepoPath: "/tmp/fj"},
+			{ID: "configured-ghes", Name: "Configured", Provider: "ghes-main", Repo: "acme/app", RepoPath: "/tmp/app"},
 		},
 	}
 
-	if got := resolveProjectProviderKind(cfg, "configured-forgejo", map[string]any{}); got != "forgejo" {
-		t.Fatalf("configured forgejo = %q, want forgejo", got)
+	if got := resolveProjectProviderKind(cfg, "configured-ghes", map[string]any{}); got != "github" {
+		t.Fatalf("configured provider binding = %q, want github", got)
 	}
-	if got := resolveProjectProviderKind(cfg, "api-forgejo", map[string]any{"provider": "forgejo-main", "repo": "core/odcrew"}); got != "forgejo" {
-		t.Fatalf("metadata forgejo = %q, want forgejo", got)
+	if got := resolveProjectProviderKind(cfg, "api-ghes", map[string]any{"provider": "ghes-main", "repo": "core/odcrew"}); got != "github" {
+		t.Fatalf("metadata provider binding = %q, want github", got)
 	}
 	if got := resolveProjectProviderKind(cfg, "legacy-github", map[string]any{"repo": "acme/looper"}); got != "github" {
 		t.Fatalf("legacy github = %q, want github", got)
@@ -4078,7 +4106,7 @@ func TestHandlerCreateManualLoopsRejectHeldTargetsWithoutForce(t *testing.T) {
 	if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), project); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
-	fixture.config.Tools.GHPath = stringPtr(writeFakeGHHoldValidationScript(t, []string{domain.HoldLabelGlobal}))
+	fixture.config.Tools.GHPath = stringPtr(writeFakeGHHoldValidationScript(t, []string{labels.HoldGlobal}))
 	h := NewHandler(Context{Config: fixture.config, Runtime: runtimeWithConfig(fixture.runtime, fixture.config), Now: func() time.Time { return fixture.now.Add(time.Minute) }})
 	for _, tc := range []struct{ name, path, body string }{
 		{name: "planner", path: "/api/v1/planners", body: `{"projectId":"project_1","issueNumber":77}`},
@@ -4113,7 +4141,7 @@ func TestHandlerPlannerCreateForceBypassesHold(t *testing.T) {
 	if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: repoPath, MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
-	fixture.config.Tools.GHPath = stringPtr(writeFakeGHHoldValidationScript(t, []string{domain.HoldLabelGlobal}))
+	fixture.config.Tools.GHPath = stringPtr(writeFakeGHHoldValidationScript(t, []string{labels.HoldGlobal}))
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/planners", bytes.NewReader([]byte(`{"projectId":"project_1","issueNumber":77,"force":true}`)))
 	req.Header.Set("content-type", "application/json")
 	rec := httptest.NewRecorder()
@@ -4134,7 +4162,7 @@ func TestHandlerWorkerCreateRejectsHeldRequestedIssueEvenWhenPlannerPRExists(t *
 	if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: repoPath, MetadataJSON: &metadata, CreatedAt: fixture.now.UTC().Format(javaScriptISOString), UpdatedAt: fixture.now.UTC().Format(javaScriptISOString)}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
-	fixture.config.Tools.GHPath = stringPtr(writeFakeGHHoldValidationScript(t, []string{domain.HoldLabelWorker}))
+	fixture.config.Tools.GHPath = stringPtr(writeFakeGHHoldValidationScript(t, []string{labels.HoldWorker}))
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/workers", bytes.NewReader([]byte(`{"projectId":"project_1","repo":"acme/looper","issueNumber":77,"baseBranch":"main"}`)))
 	req.Header.Set("content-type", "application/json")
 	rec := httptest.NewRecorder()
@@ -4158,7 +4186,7 @@ func TestHandlerCreateManualLoopForceBypassesHoldButStillConflicts(t *testing.T)
 	if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: repoPath, MetadataJSON: &metadata, CreatedAt: fixture.now.UTC().Format(javaScriptISOString), UpdatedAt: fixture.now.UTC().Format(javaScriptISOString)}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
-	fixture.config.Tools.GHPath = stringPtr(writeFakeGHHoldValidationScript(t, []string{domain.HoldLabelGlobal}))
+	fixture.config.Tools.GHPath = stringPtr(writeFakeGHHoldValidationScript(t, []string{labels.HoldGlobal}))
 	nowISO := fixture.now.UTC().Format(javaScriptISOString)
 	if err := fixture.runtime.Services().Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_existing_conflict", Seq: 100, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", TargetID: stringPtr("pr:acme/looper:42"), Repo: stringPtr("acme/looper"), PRNumber: int64Ptr(42), Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
@@ -4184,7 +4212,7 @@ func TestHandlerCreateReviewerLoopForcePersistsManualMetadata(t *testing.T) {
 	if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: repoPath, MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
-	fixture.config.Tools.GHPath = stringPtr(writeFakeGHHoldValidationScript(t, []string{domain.HoldLabelGlobal}))
+	fixture.config.Tools.GHPath = stringPtr(writeFakeGHHoldValidationScript(t, []string{labels.HoldGlobal}))
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops", bytes.NewReader([]byte(`{"projectId":"project_1","type":"reviewer","targetType":"pull_request","repo":"acme/looper","prNumber":42,"force":true}`)))
 	req.Header.Set("content-type", "application/json")
@@ -5909,18 +5937,15 @@ func TestHandlerLoopLogsFollowStreamsSnapshotAndChunk(t *testing.T) {
 	}
 	defer response.Body.Close()
 
+	// Append the agent output before marking the run terminal. A poll that
+	// landed between the two writes would see a terminal run with no new
+	// output, emit end, and close the stream without ever sending the chunk.
+	// Writing the output first means any poll that observes the terminal run
+	// has necessarily observed the appended output too, so the chunk is
+	// flushed in the same iteration (see shouldTerminateLoopLogsFollowBeforeChunk).
 	go func() {
 		time.Sleep(250 * time.Millisecond)
-		updatedRun, getRunErr := fixture.runtime.Services().Repositories.Runs.GetByID(context.Background(), "run_1")
-		if getRunErr != nil || updatedRun == nil {
-			return
-		}
-		run := *updatedRun
 		completedAt := fixture.now.Add(time.Minute).UTC().Format(javaScriptISOString)
-		run.Status = "success"
-		run.EndedAt = &completedAt
-		run.UpdatedAt = completedAt
-		_ = fixture.runtime.Services().Repositories.Runs.Upsert(context.Background(), run)
 
 		updatedExec, getExecErr := fixture.runtime.Services().Repositories.AgentExecutions.GetLatestByRunID(context.Background(), "run_1")
 		if getExecErr != nil || updatedExec == nil {
@@ -5932,6 +5957,16 @@ func TestHandlerLoopLogsFollowStreamsSnapshotAndChunk(t *testing.T) {
 		exec.OutputJSON = stringPtr(`{"stdout":"line1\nline2\n","stderr":""}`)
 		exec.UpdatedAt = completedAt
 		_ = fixture.runtime.Services().Repositories.AgentExecutions.Upsert(context.Background(), exec)
+
+		updatedRun, getRunErr := fixture.runtime.Services().Repositories.Runs.GetByID(context.Background(), "run_1")
+		if getRunErr != nil || updatedRun == nil {
+			return
+		}
+		run := *updatedRun
+		run.Status = "success"
+		run.EndedAt = &completedAt
+		run.UpdatedAt = completedAt
+		_ = fixture.runtime.Services().Repositories.Runs.Upsert(context.Background(), run)
 	}()
 
 	bodyCh := make(chan []byte, 1)
@@ -8261,4 +8296,60 @@ type requestArtifactRoute struct {
 	Request struct {
 		Body any `json:"body"`
 	} `json:"request"`
+}
+
+func TestHandlerPullRequestStatusUsesLatestRunOrderingForTiedTimestamps(t *testing.T) {
+	fixture := newTestFixture(t)
+	ctx := context.Background()
+	repos := fixture.runtime.Services().Repositories
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+
+	if err := repos.Projects.Upsert(ctx, storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: "/tmp/repos/looper", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := repos.PullRequestSnapshots.Upsert(ctx, storage.PullRequestSnapshotRecord{
+		ID:         "prs_tied_runs",
+		ProjectID:  "project_1",
+		Repo:       "acme/looper",
+		PRNumber:   42,
+		HeadSHA:    "abc123",
+		CapturedAt: nowISO,
+		CreatedAt:  nowISO,
+	}); err != nil {
+		t.Fatalf("PullRequestSnapshots.Upsert() error = %v", err)
+	}
+	repo := "acme/looper"
+	prNumber := int64(42)
+	if err := repos.Loops.Upsert(ctx, storage.LoopRecord{ID: "loop_pr_42", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	// Three attempts inside one millisecond; IDs descend lexically so an
+	// ID-based tie-break would report the first insert instead of the newest.
+	for _, run := range []storage.RunRecord{
+		{ID: "z_attempt_1", LoopID: "loop_pr_42", Status: "failed", StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO},
+		{ID: "m_attempt_2", LoopID: "loop_pr_42", Status: "failed", StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO},
+		{ID: "a_attempt_3", LoopID: "loop_pr_42", Status: "running", StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO},
+	} {
+		if err := repos.Runs.Upsert(ctx, run); err != nil {
+			t.Fatalf("Runs.Upsert(%s) error = %v", run.ID, err)
+		}
+	}
+	// Touching an older attempt later must not make it the latest run.
+	laterISO := fixture.now.Add(time.Minute).UTC().Format(javaScriptISOString)
+	if err := repos.Runs.Upsert(ctx, storage.RunRecord{ID: "z_attempt_1", LoopID: "loop_pr_42", Status: "interrupted", StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: laterISO}); err != nil {
+		t.Fatalf("Runs.Upsert(z_attempt_1 update) error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/pull-requests/acme%2Flooper/42/status", nil)
+	recorder := httptest.NewRecorder()
+	NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime}).ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", recorder.Code, recorder.Body.String())
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	data := body["data"].(map[string]any)
+	loopStatus := data["loopStatus"].(map[string]any)
+	assertEqual(t, loopStatus["latestRunStatus"], "running")
 }

@@ -6,7 +6,7 @@ import (
 	"time"
 
 	"github.com/nexu-io/looper/internal/coordinator/depgraph"
-	"github.com/nexu-io/looper/internal/domain"
+	"github.com/nexu-io/looper/internal/labels"
 )
 
 const (
@@ -300,26 +300,25 @@ func commandDispatchLabel(command string) string {
 	}
 }
 
-func hasLabel(labels []string, want string) bool {
-	want = strings.TrimSpace(want)
-	if want == "" {
+// hasLabel matches a forge label, keeping the empty-want guard that lets an
+// unconfigured legacy hold label mean "no legacy hold" rather than "held by a
+// blank label". Comparison is normalized: it already trimmed the wanted label,
+// and folding case too closes the gap where a hold spelled "Looper:Hold" let
+// autonomous dispatch proceed despite a human veto.
+func hasLabel(itemLabels []string, want string) bool {
+	if strings.TrimSpace(want) == "" {
 		return false
 	}
-	for _, label := range labels {
-		if label == want {
-			return true
-		}
-	}
-	return false
+	return labels.Has(itemLabels, want)
 }
 
-func autonomousDispatchHeld(labels []string, legacyHoldLabel string) bool {
+func autonomousDispatchHeld(issueLabels []string, legacyHoldLabel string) bool {
 	// Coordinator autonomous dispatch is only blocked by the official global hold.
 	// Lane-specific official holds apply later in each lane's own discovery gate.
-	if hasLabel(labels, domain.HoldLabelGlobal) {
+	if hasLabel(issueLabels, labels.HoldGlobal) {
 		return true
 	}
-	return hasLabel(labels, strings.TrimSpace(legacyHoldLabel))
+	return hasLabel(issueLabels, strings.TrimSpace(legacyHoldLabel))
 }
 
 func dependencyFailureBody(blockers []depgraph.Blocker) string {

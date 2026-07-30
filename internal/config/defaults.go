@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+
+	"github.com/nexu-io/looper/internal/labels"
 )
 
 const DefaultServerPort = 17310
@@ -151,11 +153,18 @@ func DefaultConfig(cwd string) (Config, error) {
 			WorkingDirectory:       cwd,
 			Environment:            map[string]string{},
 			WorktreeCleanup: WorktreeCleanupConfig{
-				Enabled:        true,
-				Interval:       "24h",
-				RetentionDays:  7,
-				MaxPerTick:     10,
-				IncludeOrphans: false,
+				Enabled:       true,
+				Interval:      "24h",
+				RetentionDays: 7,
+				MaxPerTick:    10,
+				// Orphans -- records no loop, run, or queue item references -- are
+				// included because the retention window already gates them: Plan
+				// notes every candidate's own CreatedAt/UpdatedAt, so an orphan
+				// ages like any other worktree. Excluding them made the sweeper
+				// inert: the reference graph drops old worktrees as loops move on,
+				// so nearly everything eligible by age is an orphan, and the pass
+				// skipped it regardless of age.
+				IncludeOrphans: true,
 				DryRun:         false,
 			},
 		},
@@ -199,7 +208,7 @@ func DefaultConfig(cwd string) (Config, error) {
 					},
 					Autonomous: CoordinatorDispatchAutonomousConfig{
 						DelayMinutes: 30,
-						HoldLabel:    "looper:hold",
+						HoldLabel:    labels.HoldGlobal,
 					},
 					AssignTo: "",
 				},
@@ -216,7 +225,7 @@ func DefaultConfig(cwd string) (Config, error) {
 			Planner: PlannerRoleConfig{
 				AutoDiscovery: true,
 				Triggers: IssueRoleTriggersConfig{
-					Labels:                     []string{"looper:plan"},
+					Labels:                     []string{labels.DefaultPlanTrigger},
 					LabelMode:                  LabelModeAll,
 					RequireAssigneeCurrentUser: true,
 				},
@@ -241,7 +250,7 @@ func DefaultConfig(cwd string) (Config, error) {
 					},
 					SpecReview: ReviewerSpecReviewConfig{
 						IncludeReviewingLabel: true,
-						ReviewingLabel:        "looper:spec-reviewing",
+						ReviewingLabel:        labels.SpecReviewing,
 					},
 				},
 				Behavior: ReviewerConfig{
@@ -295,7 +304,7 @@ func DefaultConfig(cwd string) (Config, error) {
 			Worker: WorkerRoleConfig{
 				AutoDiscovery: true,
 				Triggers: IssueRoleTriggersConfig{
-					Labels:                     []string{"looper:worker-ready"},
+					Labels:                     []string{labels.DefaultWorkerReadyTrigger},
 					LabelMode:                  LabelModeAll,
 					RequireAssigneeCurrentUser: true,
 				},

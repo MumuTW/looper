@@ -26,6 +26,7 @@ import (
 	"github.com/nexu-io/looper/internal/forge"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/specpr"
+	"github.com/nexu-io/looper/internal/labels"
 	"github.com/nexu-io/looper/internal/lifecycle"
 	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/loops/failureclass"
@@ -61,7 +62,6 @@ const (
 	workerBranchSlugMaxWords         = 5
 	workerBranchHashLength           = 16
 	workerPRDedupeLookupLimit        = 1000
-	issueDiscoveryLabel              = "looper:worker-ready"
 	maxPublicIssueClaimSummaryLength = 240
 )
 
@@ -544,10 +544,6 @@ type DiscoveryPolicy struct {
 	LabelMode                  config.LabelMode
 	RequireAssigneeCurrentUser bool
 	RoutedClaimPolicy          networkpolicy.ProjectPolicy
-	// IsPlane marks a Plane task-source project; PlaneAssigneeID, when set,
-	// scopes discovery to work-items assigned to that Plane member UUID.
-	IsPlane         bool
-	PlaneAssigneeID string
 }
 
 type Runner struct {
@@ -818,7 +814,7 @@ func New(options Options) *Runner {
 	}
 	policy := options.DiscoveryPolicy
 	if policy.LabelMode == "" {
-		policy = DiscoveryPolicy{AutoDiscovery: true, Labels: []string{issueDiscoveryLabel}, LabelMode: config.LabelModeAll, RequireAssigneeCurrentUser: true}
+		policy = DiscoveryPolicy{AutoDiscovery: true, Labels: []string{labels.DefaultWorkerReadyTrigger}, LabelMode: config.LabelModeAll, RequireAssigneeCurrentUser: true}
 	}
 	return &Runner{
 		db:                      options.DB,
@@ -901,12 +897,7 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 		return DiscoveryResult{Skipped: 1}, nil
 	}
 	assigneeFilter := ""
-	if policy.IsPlane {
-		// Plane assignees are UUIDs, so the GitHub-login assignee gate can't
-		// route them. Scope to the owner's configured Plane member UUID when set
-		// (empty = label-only discovery); never fall back to the GitHub login.
-		assigneeFilter = policy.PlaneAssigneeID
-	} else if !networkpolicy.IsRouted(policy.RoutedClaimPolicy) && policy.RequireAssigneeCurrentUser {
+	if !networkpolicy.IsRouted(policy.RoutedClaimPolicy) && policy.RequireAssigneeCurrentUser {
 		assigneeFilter = login
 	}
 	requiredTargetLabel, err := r.requiredTargetLabel(ctx, project.ID)
@@ -960,8 +951,7 @@ func (r *Runner) discoveryPolicyForProject(projectID string) DiscoveryPolicy {
 	if !ok {
 		return r.discoveryPolicy
 	}
-	isPlane := r.providerSelectionForProject(projectID).UsesExternalTaskSource()
-	return DiscoveryPolicy{AutoDiscovery: role.Discovery.Enabled, Labels: append([]string(nil), role.Discovery.Labels...), LabelMode: role.Discovery.LabelMode, RequireAssigneeCurrentUser: role.Discovery.RequireAssigneeCurrentUser, RoutedClaimPolicy: networkpolicy.ProjectPolicyForProject(*r.projectRoleConfig, projectID), IsPlane: isPlane, PlaneAssigneeID: strings.TrimSpace(role.Discovery.PlaneAssigneeID)}
+	return DiscoveryPolicy{AutoDiscovery: role.Discovery.Enabled, Labels: append([]string(nil), role.Discovery.Labels...), LabelMode: role.Discovery.LabelMode, RequireAssigneeCurrentUser: role.Discovery.RequireAssigneeCurrentUser, RoutedClaimPolicy: networkpolicy.ProjectPolicyForProject(*r.projectRoleConfig, projectID)}
 }
 
 func (r *Runner) requiredTargetLabel(ctx context.Context, projectID string) (string, error) {
@@ -1464,30 +1454,14 @@ func (r *Runner) runPrepareWorkStep(ctx context.Context, input stepInput) (worke
 		return checkpoint, &loopError{message: fmt.Sprintf("Worker lock is already held for %s", lockKey), kind: FailureRetryableTransient}
 	}
 	policy := r.discoveryPolicyForProject(input.Project.ID)
-	provider := r.providerSelectionForProject(input.Project.ID)
-	if provider.UsesNativePullRequestAPI() && work.IssueNumber > 0 && r.github != nil {
-		stillAssigned, err := r.workerIssueAssignedToCurrentUser(ctx, work, input.Project.RepoPath)
-		if err != nil {
-			_ = r.repos.Locks.Release(context.Background(), lockKey)
-			return checkpoint, err
-		}
-		if !stillAssigned {
-			checkpoint.Work = &work
-			checkpoint.ClaimedLockKey = lockKey
-			checkpoint.ResumePolicy = loops.ResumePolicyAdvanceFromCheckpoint
-			checkpoint.SkipReason = fmt.Sprintf("Worker stopped because %s is not currently assigned to the configured user", formatIssueReference(issueLookupRepo(work), work.IssueNumber))
-			_ = r.repos.Locks.Release(context.Background(), lockKey)
-			checkpoint.ClaimedLockKey = ""
-			return checkpoint, nil
-		}
-	} else if work.IssueNumber > 0 && r.github != nil && (!work.AutoDiscovered || policy.RequireAssigneeCurrentUser) {
+	if work.IssueNumber > 0 && r.github != nil && (!work.AutoDiscovered || policy.RequireAssigneeCurrentUser) {
 		if err := r.selfAssignIssue(ctx, work, input.Project.RepoPath); err != nil {
 			_ = r.repos.Locks.Release(context.Background(), lockKey)
 			return checkpoint, err
 		}
 	}
 	if input.Loop.TargetType == "pull_request" && work.Repo != "" && work.PRNumber > 0 && r.github != nil {
-		_ = r.github.RemovePullRequestLabels(ctx, PullRequestLabelsInput{Repo: work.Repo, PRNumber: work.PRNumber, Labels: []string{specpr.ReadyLabel}, CWD: input.Project.RepoPath})
+		_ = r.github.RemovePullRequestLabels(ctx, PullRequestLabelsInput{Repo: work.Repo, PRNumber: work.PRNumber, Labels: []string{labels.SpecReady}, CWD: input.Project.RepoPath})
 	}
 	checkpoint.Work = &work
 	checkpoint.ClaimedLockKey = lockKey
@@ -1517,34 +1491,6 @@ func (r *Runner) selfAssignIssue(ctx context.Context, work workerInput, cwd stri
 		return &loopError{message: fmt.Sprintf("Unable to assign issue %s#%d to %s: %v", repo, work.IssueNumber, login, err), kind: FailureRetryableAfterResume}
 	}
 	return nil
-}
-
-func (r *Runner) workerIssueAssignedToCurrentUser(ctx context.Context, work workerInput, cwd string) (bool, error) {
-	if r.github == nil || work.IssueNumber <= 0 {
-		return false, nil
-	}
-	repo := issueLookupRepo(work)
-	if repo == "" {
-		return false, nil
-	}
-	login, err := r.github.GetCurrentUserLogin(ctx, cwd)
-	if err != nil {
-		return false, &loopError{message: fmt.Sprintf("Unable to resolve provider login for worker issue assignment on %s#%d: %v", repo, work.IssueNumber, err), kind: FailureRetryableAfterResume}
-	}
-	login = normalizeLogin(login)
-	if login == "" {
-		return false, &loopError{message: fmt.Sprintf("Unable to resolve provider login for worker issue assignment on %s#%d", repo, work.IssueNumber), kind: FailureRetryableAfterResume}
-	}
-	issue, err := r.github.ViewIssue(ctx, ViewIssueInput{Repo: repo, IssueNumber: work.IssueNumber, CWD: cwd})
-	if err != nil {
-		return false, err
-	}
-	for _, assignee := range issue.AssigneeUsers {
-		if normalizeLogin(assignee.Login) == login {
-			return true, nil
-		}
-	}
-	return false, nil
 }
 
 func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (workerCheckpoint, error) {
@@ -2529,8 +2475,13 @@ func (r *Runner) resolveWorkerInput(ctx context.Context, project storage.Project
 		work.ExecutionMode = "push-existing"
 		work.SpecPath = firstNonEmpty(work.SpecPath, specpr.ParseSpecPathFromPullRequestBody(detail.Body))
 		work.Reviewers = append([]string(nil), detail.ReviewRequests...)
-		if work.SpecPath == "" {
-			return workerInput{}, &loopError{message: fmt.Sprintf("No explicit spec path found for %s#%d", repo, prNumber), kind: FailureManualIntervention}
+		// A spec path is the usual input for a PR-target worker, but an
+		// operator-supplied prompt is also a complete instruction: the API
+		// accepts prNumber+prompt, and buildWorkerPromptWithInstructions reads
+		// the prompt directly when no spec path is present. Stop for manual
+		// intervention only when neither is available.
+		if work.SpecPath == "" && strings.TrimSpace(work.Prompt) == "" {
+			return workerInput{}, &loopError{message: fmt.Sprintf("No explicit spec path or prompt found for %s#%d", repo, prNumber), kind: FailureManualIntervention}
 		}
 	}
 	return work, nil

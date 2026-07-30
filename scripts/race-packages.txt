@@ -1,0 +1,15 @@
+# Packages run under the race detector, one per line.
+#
+# Single source of truth: both CI's `race` job (.github/workflows/ci.yml) and
+# scripts/verify.sh read this file, so the focused race set cannot drift
+# between them. Lines starting with # are ignored.
+#
+# The set is focused rather than ./... because -race is slow; these are the
+# packages with real concurrency (background schedulers, shared stores,
+# HTTP handlers, subprocess supervision).
+./internal/storage
+./internal/api
+./internal/forge
+./internal/infra/shell
+./internal/runtime
+./internal/agent

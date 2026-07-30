@@ -215,6 +215,35 @@ export type ActiveRunsList = {
   items: ActiveRun[];
 };
 
+/** One recorded fixer failure. `retryable` is absent on runs that predate the field. */
+export type FixerOutcomeFailure = {
+  step?: string | null;
+  message?: string | null;
+  retryable?: boolean | null;
+  kind?: string | null;
+};
+
+/**
+ * Read-time projection of what a finished fixer run actually did. `primaryFailure`
+ * is the first, causal failure, which can differ from the loop's `lastFailureReason`
+ * when a later problem piled on top of it.
+ */
+/** Effects that outlived the run, attributed to the run that produced them. */
+export type FixerDurableProgress = {
+  commitProduced?: boolean | null;
+  pushed?: boolean | null;
+  repliesSent?: number | null;
+  threadsResolved?: number | null;
+};
+
+export type FixerRunOutcome = {
+  primaryFailure?: FixerOutcomeFailure | null;
+  secondaryIssues?: FixerOutcomeFailure[] | null;
+  progress?: FixerDurableProgress | null;
+  /** A failed run that still left durable effects behind. */
+  partialSuccess?: boolean | null;
+};
+
 export type Loop = {
   id: string;
   seq: number;
@@ -237,6 +266,8 @@ export type Loop = {
   maxAttempts?: number | null;
   lastFailureKind?: string | null;
   lastFailureReason?: string | null;
+  /** Latest run's derived outcome, when that run was a fixer run. */
+  outcome?: FixerRunOutcome | null;
 };
 
 export type LoopsList = {

@@ -43,13 +43,15 @@
 
 ### New concepts require an explicit trade-off
 
-Introducing a new concept (evidence record, content hash, lock, ledger, status field, intermediate state) must be justified in the PR description with:
+Introducing a new concept (evidence record, content hash, lock, ledger, status field, intermediate state) must answer two questions in the PR description:
 
-- the concrete failure it prevents
-- what it costs: new edge cases, new persisted state, new failure modes, new code paths to keep in sync
-- why a simpler alternative (delete a layer, trust agent output, fail loud) is insufficient
+> Delete this six months from now — what breaks?
 
-If the cost section is empty or hand-waved, the concept is not ready to merge. Validation and gates are not free — each one expands the surface where reality and the model can disagree.
+> What does it still not catch?
+
+Answer the first with the concrete failure it prevents and why a simpler move — delete a layer, trust agent output, fail loud — does not. "Nothing anyone would notice" means do not build it. If it adds persisted state, the diff must also contain the test that fails when that state goes stale; the cost of keeping it in sync is a guess until something checks it.
+
+Validation and gates are not free — each expands the surface where reality and the model can disagree. Neither is prose: a weak answer stays weak at any length, so two sentences that answer both questions are done.
 
 ### Name the authority before enforcing it
 
@@ -69,4 +71,11 @@ Before adding durability, recovery, persistence, confirmation, or a new gate, fi
 
 ### Test-file growth is a design smell
 
-A single PR that adds more than 300 lines to one `*_test.go` file for a runner or subsystem is a design smell. Explosive test growth usually means an internal state machine is being propped up rather than simplified.
+Test growth that is large *relative to the production change it covers* is a design smell. Explosive test growth usually means an internal state machine is being propped up rather than simplified.
+
+This is a prompt to look, not a threshold to clear. There is deliberately no line count here: a fixed number invites the two useless outcomes — splitting a file to get under it, and arguing about whether a diff qualifies — while saying nothing about whether the design is actually wrong. What matters is which of these the growth reflects:
+
+- **Propping up.** Each new state, flag, or output field multiplies the cases the table has to enumerate. The fix is to remove states, not rows. A wide matrix over many boolean outputs is the signal.
+- **Covering.** Logic that already shipped untested is getting its first assertions, or a pure function was extracted out of a runner and is now testable at all. Production files shrinking in the same diff is the tell. Cutting these tests makes the codebase worse.
+
+Say which one it is in the PR description when the growth is conspicuous, and name what you tried to remove. "The surface shrank by N states and the remaining rows are the surviving behavior" is a complete answer; "it is under the limit" is not.

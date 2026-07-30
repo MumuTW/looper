@@ -68,12 +68,12 @@ Hot-safe fields are deliberately curated:
 - every current `disclosure.*` field
 - `defaults.allowAutoCommit`, `defaults.allowAutoPush`, `defaults.allowRiskyFixes`, `defaults.openPrStrategy`, and `defaults.addSnapshotMode`; `defaults.baseBranch` is restart-bound because configured project records materialize it
 - `instructions.enabled` only
-- the current Planner `autoDiscovery`, `instructions`, and trigger fields except `roles.planner.triggers.planeAssigneeId`; all current Worker `autoDiscovery`, `triggers.*`, and `instructions` fields; the equivalent current Fixer fields; current Reviewer `discovery.*`, most `behavior.*`, and `instructions`; and current Coordinator `pollInterval`, `triage.*`, `dispatch.*`, and merge-watch policy except `mergeWatch.transientRetries`
+- the current Planner `autoDiscovery`, `instructions`, and trigger fields; all current Worker `autoDiscovery`, `triggers.*`, and `instructions` fields; the equivalent current Fixer fields; current Reviewer `discovery.*`, most `behavior.*`, and `instructions`; and current Coordinator `pollInterval`, `triage.*`, `dispatch.*`, and merge-watch policy except `mergeWatch.transientRetries`
 - `tools.looperPath` and `tools.osascriptPath`
 
 `agent.vendor` can switch from one configured vendor to another when `agent.params` is empty and an explicit `agent.model` is changed or unset in the same edit instead of being silently carried across vendors. Clearing a configured vendor uses the same guard, preventing a retained profile from passing through an intermediate `null`. Configuring the first vendor may use an already prepared model/params profile. Cross-vendor continuations keep their checkpoint, worktree, HITL answer, and human instructions but start a fresh native session.
 
-Everything else is restart-bound. Important exclusions are `agent.nativeResume.*`, arbitrary `agent.params`, `roles.planner.triggers.planeAssigneeId`, `roles.coordinator.enabled`, `notifications.webhook.*` (including its Feishu transport), all `hitl.*`, `instructions.maxBytes`, `roles.reviewer.autoMerge.*`, `roles.reviewer.behavior.loop.quietPeriodSeconds`, `roles.reviewer.behavior.loop.minPublishIntervalSeconds`, `roles.reviewer.behavior.retry.maxDelayMs`, `roles.coordinator.mergeWatch.transientRetries`, and `roles.coordinator.dependencies.*`. The Planner Plane-assignee field is file-only; Worker `roles.worker.triggers.planeAssigneeId` remains a supported hot-safe control. The scheduler retry budget/base delay and these Reviewer timing fields are durable queue-scheduling inputs; Coordinator transient retries are persisted as a remaining budget. The Reviewer-specific `roles.reviewer.behavior.nativeResume.*` fields are part of the curated Reviewer behavior surface; the global `agent.nativeResume.*` field is not. Listener/storage/runtime ownership, polling/cache topology, logger ownership, providers, projects, `tools.gitPath`, and `tools.ghPath` also require restart. New fields default to restart-bound until explicitly classified. Mixed hot-safe and restart-bound edits are rejected as one candidate; Looper never applies only the convenient half.
+Everything else is restart-bound. Important exclusions are `agent.nativeResume.*`, arbitrary `agent.params`, `roles.coordinator.enabled`, `notifications.webhook.*` (including its Feishu transport), all `hitl.*`, `instructions.maxBytes`, `roles.reviewer.autoMerge.*`, `roles.reviewer.behavior.loop.quietPeriodSeconds`, `roles.reviewer.behavior.loop.minPublishIntervalSeconds`, `roles.reviewer.behavior.retry.maxDelayMs`, `roles.coordinator.mergeWatch.transientRetries`, and `roles.coordinator.dependencies.*`. The scheduler retry budget/base delay and these Reviewer timing fields are durable queue-scheduling inputs; Coordinator transient retries are persisted as a remaining budget. The Reviewer-specific `roles.reviewer.behavior.nativeResume.*` fields are part of the curated Reviewer behavior surface; the global `agent.nativeResume.*` field is not. Listener/storage/runtime ownership, polling/cache topology, logger ownership, providers, projects, `tools.gitPath`, and `tools.ghPath` also require restart. New fields default to restart-bound until explicitly classified. Mixed hot-safe and restart-bound edits are rejected as one candidate; Looper never applies only the convenient half.
 
 Deprecated file-only aliases for `agent.timeouts.{planner,worker,reviewer,fixer}Seconds`, `defaults.allowAutoApprove`, and `defaults.fixAllPullRequests` are watcher-hot compatibility representations of canonical fields. They are never dashboard controls. A canonical dashboard edit retires the matching alias leaf so unsetting the canonical value later cannot reveal stale compatibility policy.
 
@@ -135,52 +135,36 @@ repoPath = "/absolute/path/to/repo"
 
 ## Provider config
 
-Provider kinds:
+GitHub is the only supported provider kind.
 
-- `github` — legacy default, backed by `gh`. Projects without `provider` keep GitHub autodetection/metadata behavior.
-- `forgejo` — REST-backed MVP. Forgejo-only configs do not require `gh` when `git` and the provider auth are valid (`token-env` or `tea`).
+- `github` — backed by `gh`. Projects without `provider` keep GitHub autodetection/metadata behavior.
 
-Minimal Forgejo project (token-env):
+Minimal project bound to an explicit provider:
 
 ```toml
 [agent]
 vendor = "opencode"
 
 [[providers]]
-id = "forgejo-main"
-kind = "forgejo"
-baseUrl = "https://code.example.com"
-auth = "token-env"
-tokenEnv = "LOOPER_FORGEJO_TOKEN"
-
-# Or reuse an explicit tea login (no tokenEnv):
-# auth = "tea"
-# teaLogin = "powerformer-code"
+id = "acme"
+kind = "github"
 
 [[projects]]
 id = "example"
 name = "Example"
 repoPath = "/absolute/path/to/example"
-provider = "forgejo-main"
+provider = "acme"
 repo = "acme/example"
 ```
 
-Forgejo validation notes:
+Provider validation notes:
 
-- `baseUrl` must be an absolute `http(s)` URL.
-- Choose `auth = "token-env"` with `tokenEnv`, or `auth = "tea"` with explicit `teaLogin` matching `baseUrl`. Never rely on tea's default login when multiple identities exist. Do not write token values into config.
-- Forgejo projects require a `provider` and repo. Configure the provider and the complete project together in the config file's `providers` + `[[projects]]` (or projects table), then restart `looperd`. Do not pre-register the path with `looper project add`, the dashboard, or `POST /api/v1/projects`: those create an API-managed record, and a later config entry with the same id conflicts with it and prevents daemon startup.
-- Duplicate `repo` values are rejected case-insensitively, even across providers.
-- Forgejo uses polling only; omit project `webhook.mode` and keep `network.mode` off.
-- The provider profile disables unsupported GitHub-shaped defaults. Explicit opt-ins to Forgejo-unsupported behavior fail fast.
-
-Forgejo MVP role limits:
-
-- planner and worker are supported
-- worker only processes issues already assigned to the current Forgejo user; it does not self-assign
-- reviewer discovers by labels and publishes a top-level Reviewer Summary PR comment; default normal-review label is `looper:review`, while spec PRs use `looper:spec-reviewing`
-- fixer consumes open items from the Reviewer Summary and publishes a top-level Fixer Summary PR comment; it does not resolve native review threads
-- coordinator, auto-merge, native reviews, review requests, thread resolution, routed network mode, and webhooks are unsupported for Forgejo
+- `providers[].kind` must be `github`. `forgejo` and `plane` were removed and are rejected with an explicit unsupported-provider error; they are never reinterpreted as a supported provider.
+- `baseUrl`, when set, must be an absolute `http(s)` URL. It feeds repository identity only and does not point Looper at that host. GHES is not supported: review-submit and webhook tunnel routing both mishandle a host-qualified repo.
+- `tokenEnv` names an env var copied into trusted `looper review submit` children only. Normal GitHub calls use ambient `gh` auth.
+- A project with an explicit `provider` must also set `repo`; a binding without one is rejected.
+- A project bound to a provider requires a `provider` and repo. Configure the provider and the complete project together in the config file's `providers` + `[[projects]]` (or projects table), then restart `looperd`. Do not pre-register the path with `looper project add`, the dashboard, or `POST /api/v1/projects`: those create an API-managed record, and a later config entry with the same id conflicts with it and prevents daemon startup.
+- Two projects whose provider-qualified repository identities collide are rejected case-insensitively. The same `owner/name` on two different hosts is fine; two provider ids normalizing to one endpoint are not.
 
 ## Role model guidance
 
@@ -334,10 +318,8 @@ ghPath = "/opt/homebrew/bin/gh"
 osascriptPath = "/usr/bin/osascript"
 
 [[providers]]
-id = "forgejo-main"
-kind = "forgejo"
-baseUrl = "https://code.example.com"
-tokenEnv = "LOOPER_FORGEJO_TOKEN"
+id = "acme"
+kind = "github"
 
 [defaults]
 baseBranch = "main"
@@ -391,11 +373,11 @@ name = "Looper"
 repoPath = "/absolute/path/to/looper"
 
 [[projects]]
-id = "forgejo-example"
-name = "Forgejo Example"
-repoPath = "/absolute/path/to/forgejo-example"
-provider = "forgejo-main"
-repo = "acme/forgejo-example"
+id = "second-example"
+name = "Second Example"
+repoPath = "/absolute/path/to/second-example"
+provider = "acme"
+repo = "acme/second-example"
 
 [projects.roles.reviewer.discovery.triggers]
 labels = ["needs-review"]
@@ -429,8 +411,11 @@ Default runtime artifacts live under `~/.looper/`:
 - `logs/`
 - `worktrees/`
 - `bin/looperd`
-- `looperd.pid`
-- `looperd.state.json`
+
+`looperd.pid` and `looperd.state.json` were written by the `looper daemon`
+supervision CLI, which was removed along with `internal/cliapp`. Nothing reads
+them today; existing installs may still carry stale copies, which are safe to
+delete.
 
 Default storage paths:
 
@@ -513,8 +498,7 @@ looperd \
 - `projects[].id` must be valid and unique
 - storage, log, working-directory, and worktree paths must be writable
 - required tool paths must resolve
-- `gh` must resolve for GitHub projects; Forgejo-only configs do not require `gh`
-- Forgejo providers require `baseUrl` and either `tokenEnv` (`token-env` auth) or `teaLogin` (`tea` auth); token-env needs the named env var at runtime, tea needs a matching login for the daemon user
+- `gh` must resolve for GitHub projects
 - `notifications.osascript.enabled=true` requires `tools.osascriptPath` to resolve
 
 ## Safety notes

@@ -993,3 +993,38 @@ func TestProjectRejectsBadSubcommands(t *testing.T) {
 		})
 	}
 }
+
+// Contract: the counter line keeps its exact shape, and each outstanding
+// quarantined loop is named underneath with the one command that clears it.
+func TestStatusListsOutstandingQuarantinedLoops(t *testing.T) {
+	var stdout bytes.Buffer
+	writeStatusOpsLines(&stdout, daemonStatusResponse{Service: statusServiceView{
+		DegradedReasons: []string{"quarantine_orphan_debt"},
+		Recovery: statusRecoveryView{Outstanding: statusOutstandingView{
+			QuarantinedActiveExecutions: 7,
+			QuarantinedRunningRuns:      3,
+			Loops: []statusQuarantinedLoopView{
+				{Seq: 35, Type: "fixer", Target: "MumuTW/looper#126", Status: "paused", QuarantinedAt: "2026-07-30T08:18:12Z"},
+				{Seq: 36, Type: "fixer", Target: "MumuTW/looper#125", Status: "paused", QuarantinedAt: "2026-07-30T08:18:12Z"},
+			},
+		}},
+	}})
+	want := "orphans:  quarantinedActiveExecutions=7 quarantinedRunningRuns=3\n" +
+		"  - loop 35  fixer  MumuTW/looper#126  paused  quarantined 2026-07-30T08:18:12Z  ->  looper retry 35\n" +
+		"  - loop 36  fixer  MumuTW/looper#125  paused  quarantined 2026-07-30T08:18:12Z  ->  looper retry 36\n" +
+		"degraded: quarantine_orphan_debt\n"
+	if got := stdout.String(); got != want {
+		t.Fatalf("status output =\n%q\nwant\n%q", got, want)
+	}
+}
+
+// Contract: an empty roster prints nothing extra under the counter line.
+func TestStatusOmitsQuarantineRosterWhenEmpty(t *testing.T) {
+	var stdout bytes.Buffer
+	writeStatusOpsLines(&stdout, daemonStatusResponse{Service: statusServiceView{
+		Recovery: statusRecoveryView{Outstanding: statusOutstandingView{QuarantinedActiveExecutions: 1}},
+	}})
+	if got := stdout.String(); got != "orphans:  quarantinedActiveExecutions=1 quarantinedRunningRuns=0\n" {
+		t.Fatalf("status output = %q, want the counter line alone", got)
+	}
+}

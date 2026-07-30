@@ -63,8 +63,8 @@ comments, take the first comment by a non-bot author (`author.login !=
 CurrentUser().Login`) created after the ask → that body is the answer →
 `deliverHumanAnswer` → drop the label.
 
-Keyed on **loop state**, not provider discovery, so **Plane-sourced** loops are
-followed too (sidesteps the fixer/coordinator plane-skip in `scheduler.go`).
+Keyed on **loop state**, not provider discovery, so loops from any provider are
+followed too.
 
 Primitives all exist: `CreateIssueComment`, `ListIssueComments`,
 `CurrentUserIdentity`, label ops. No new dependency, no inbound infra, works
@@ -139,7 +139,7 @@ for nearly free.
     "github": {
       "awaitingLabel": "looper:awaiting-human",
       "mentionLogins": ["lefarcen"],
-      "answerAuthors": []           // empty = any non-bot; else allowlist
+      "answerAuthors": []           // empty = repository writer; else allowlist
     },
     "feishu": {                      // optional; secrets via env only
       "inbound": "cf-inbox",        // "long-connection" | "cf-inbox"
@@ -169,12 +169,12 @@ for nearly free.
 
 - **Phase 1 (OSS default, ship upstream first):** GitHub PR-comment transport
   (ask + `awaiting-human` label + answer-poll lane) → `deliverHumanAnswer`. Reuses
-  all resume machinery. Clean, universal, infra-free. Plane loops included.
+  all resume machinery. Clean, universal, infra-free.
 - **Phase 2 (nexu):** Feishu answer via **C2 (CF inbox)** — the dumb CF Worker +
   the looper poll lane + `feishu_threads` self-select. Plus the §6 audit mirror.
   (C1 long-connection remains an alternative for anyone who prefers no relay.)
 - **Phase 3:** unify the answer-poll lane with the fixer for CI/conflict/review
-  follow-up ("一路解决到底") and un-gate Plane PRs there. Independent value; not a
+  follow-up ("一路解决到底"). Independent value; not a
   prerequisite for HITL.
 
 ## 10. Blind spots this version corrects
@@ -196,6 +196,7 @@ for nearly free.
 ## Open questions
 
 1. First vs latest human comment as the GitHub answer (default: first).
-2. GitHub answerers: any non-bot vs allowlist (default: any non-bot).
+2. GitHub answerers: explicit allowlist or, by default, a current repository
+   collaborator with write, maintain, or admin permission.
 3. Ship Phase 1 (GitHub) upstream before building Phase 2 (nexu Feishu/CF), or run
    them in parallel since this team wants Feishu sooner?

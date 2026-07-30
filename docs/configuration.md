@@ -100,14 +100,14 @@ The hot-safe surface is an explicit allowlist (see [ADR-0014](adr/0014-config-fi
 - the current `disclosure.*` fields
 - `defaults.allowAutoCommit`, `defaults.allowAutoPush`, `defaults.allowRiskyFixes`, `defaults.openPrStrategy`, and `defaults.addSnapshotMode`; `defaults.baseBranch` is restart-bound because configured project records materialize it
 - `instructions.enabled` only
-- the current Planner discovery/trigger/instruction fields except `roles.planner.triggers.planeAssigneeId`; all current Worker and Fixer discovery/trigger/instruction fields; Reviewer discovery, most behavior, and instructions; and Coordinator polling, triage, dispatch, and merge-watch policy except `mergeWatch.transientRetries`
+- the current Planner discovery/trigger/instruction fields; all current Worker and Fixer discovery/trigger/instruction fields; Reviewer discovery, most behavior, and instructions; and Coordinator polling, triage, dispatch, and merge-watch policy except `mergeWatch.transientRetries`
 - `tools.looperPath` and `tools.osascriptPath`
 
 Profile and role agent vendor/model fields are hot-safe curated identity fields: a claim made after publication resolves against the new config; an already active run keeps the frozen agent snapshot it started with (resume/retry lineages copy that predecessor snapshot rather than re-resolving live config).
 
 `agent.vendor` can switch from one configured vendor to another when `agent.params` is empty and no explicit model is being silently carried across vendors. If `agent.model` is set, change or unset it in the same candidate; an unchanged explicit model blocks that vendor-to-vendor switch. Clearing a configured vendor uses the same guard, so a retained profile cannot be laundered through an intermediate `null`. The same leave/switch guards apply to each coding role's *resolved* vendor after global → profile → role overlay. Configuring the first vendor may use an already prepared model/params profile. Continuations of failed or interrupted runs copy the predecessor's durable `agent_snapshot_json` (sticky identity across the retry lineage) while retaining checkpoint, worktree, HITL answer, and queued human instructions. Only legacy predecessors with a null snapshot adopt the runner's current resolved identity. Looper never sends an old vendor's native session ID to a different CLI.
 
-Notably, `agent.nativeResume`, `agent.params`, `roles.planner.triggers.planeAssigneeId`, `roles.coordinator.enabled`, `instructions.maxBytes`, all `hitl.*`, all `notifications.webhook.*`, `roles.reviewer.autoMerge.*`, `roles.reviewer.behavior.loop.quietPeriodSeconds`, `roles.reviewer.behavior.loop.minPublishIntervalSeconds`, `roles.reviewer.behavior.retry.maxDelayMs`, `roles.coordinator.mergeWatch.transientRetries`, and `roles.coordinator.dependencies.*` require restart. The Planner Plane-assignee field is file-only; the supported Worker `roles.worker.triggers.planeAssigneeId` field remains hot-safe. `agent.params` stay global, file-only, and restart-bound; the dashboard does not edit params. The scheduler retry budget/base delay and these Reviewer timing fields are durable queue-scheduling inputs; Coordinator transient retries are persisted as a remaining budget, so they are also restart-bound. Listener, storage, daemon, logging, webhook/network topology, providers/projects, scheduler polling/cache, and `tools.gitPath`/`tools.ghPath` also require restart. New fields are restart-bound until explicitly classified.
+Notably, `agent.nativeResume`, `agent.params`, `roles.coordinator.enabled`, `instructions.maxBytes`, all `hitl.*`, all `notifications.webhook.*`, `roles.reviewer.autoMerge.*`, `roles.reviewer.behavior.loop.quietPeriodSeconds`, `roles.reviewer.behavior.loop.minPublishIntervalSeconds`, `roles.reviewer.behavior.retry.maxDelayMs`, `roles.coordinator.mergeWatch.transientRetries`, and `roles.coordinator.dependencies.*` require restart. `agent.params` stay global, file-only, and restart-bound; the dashboard does not edit params. The scheduler retry budget/base delay and these Reviewer timing fields are durable queue-scheduling inputs; Coordinator transient retries are persisted as a remaining budget, so they are also restart-bound. Listener, storage, daemon, logging, webhook/network topology, providers/projects, scheduler polling/cache, and `tools.gitPath`/`tools.ghPath` also require restart. New fields are restart-bound until explicitly classified.
 
 Deprecated file-layer aliases for `agent.timeouts.{planner,worker,reviewer,fixer}Seconds`, `defaults.allowAutoApprove`, and `defaults.fixAllPullRequests` are normalized into their canonical hot-safe fields so existing files can still reload without a restart. They remain file-only compatibility syntax: the dashboard exposes and writes only canonical paths, and a canonical dashboard edit removes the corresponding alias leaf so a later unset cannot resurrect the old value.
 
@@ -189,7 +189,7 @@ Looper's frozen canonical top-level config roots are:
 | `defaults` | user-facing default policy that does not belong to a narrower domain |
 | `instructions` | global instruction-system settings that are not role-specific instruction content |
 | `roles` | role-specific config grouped by role name, for example `roles.<role>` |
-| `providers` | forge provider definitions such as GitHub or Forgejo hosts and credentials |
+| `providers` | Optional GitHub provider definitions used as repository-identity discriminators |
 | `projects` | per-project metadata and supported project-scoped overrides |
 
 ### Project authority and import
@@ -404,107 +404,46 @@ worktree with a fresh Devin session.
 
 ## Provider support
 
-Looper supports three provider kinds:
+GitHub is the only supported provider kind, and github.com is the only host Looper drives end to end.
 
-- `github` — existing default behavior, backed by `gh`. Projects without `provider` keep the legacy GitHub autodetection/metadata path.
-- `forgejo` — REST-backed planner, worker, native reviewer-request/review flows, summary-comment compatibility, and manual/direct native-review-comment fixer runs. Forgejo projects are config-driven and do not require `gh` in Forgejo-only installs.
-- `plane` — a **task-source** provider: issues (work-items) are read from a [Plane](https://plane.so) project, while pull requests, diffs, and reviews stay on the project's GitHub code repo. Use this to let Looper consume Plane work-items directly as its issue source without creating a redundant GitHub issue. See [Plane provider + Feishu HITL setup](plane-provider.md) for the full guide (config-file only; there is no bootstrap CLI).
+- `github` — backed by `gh`. Projects without `provider` keep the legacy GitHub autodetection/metadata path.
 
-Forgejo provider example:
-
-For a new installation, bootstrap validates the origin, current Forgejo identity, and repository access before writing the provider and project binding:
-
-Token-env bootstrap (headless / CI):
-
-```bash
-export FORGEJO_TOKEN=<forgejo-token>
-# # config-file providers block (looper bootstrap removed)  # removed — write providers/projects in the config file
-```
-
-Tea-backed bootstrap (reuse an existing `tea` login; no second token env):
-
-```bash
-tea login list
-# # config-file providers block (looper bootstrap removed)  # removed — write providers/projects in the config file
-```
-
-Providers are managed in the config file (and imported at daemon startup). There is no `looper provider` CLI. Looper never reads tea's config file for tokens and never stores raw tokens.
+A `providers` entry is optional and does very little today. Read the field notes before adding one.
 
 ```toml
 [agent]
 vendor = "opencode"
 
-# Headless: token from environment
 [[providers]]
-id = "forgejo-main"
-kind = "forgejo"
-baseUrl = "https://code.example.com"
-auth = "token-env"
-tokenEnv = "LOOPER_FORGEJO_TOKEN"
-
-# Interactive workstation: explicit tea login (must match baseUrl)
-# [[providers]]
-# id = "forgejo-main"
-# kind = "forgejo"
-# baseUrl = "https://code.example.com"
-# auth = "tea"
-# teaLogin = "powerformer-code"
+id = "acme"
+kind = "github"
 
 [[projects]]
 id = "example"
 name = "Example"
 repoPath = "/absolute/path/to/example"
-provider = "forgejo-main"
+provider = "acme"
 repo = "acme/example"
 ```
 
-Forgejo rules:
+Provider rules:
 
 - `providers[].id` must be unique.
-- `providers[].kind` must be `github`, `forgejo`, or `plane`; `gitea` is not a supported provider kind yet.
-- Forgejo providers require an absolute `http(s)` `baseUrl` and an authentication strategy:
-  - `auth = "token-env"` with non-empty `tokenEnv` (token value from the daemon environment; never stored in config)
-  - `auth = "tea"` with an explicit `teaLogin` whose tea login URL matches `baseUrl` (never inferred from tea's default login when multiple identities exist)
-- When `auth` is omitted, a lone `tokenEnv` implies `token-env` and a lone `teaLogin` implies `tea`. Setting both without `auth` is a validation error.
-- Tea-backed API calls use `tea api --login <teaLogin>`; Looper never parses tea credential storage or copies the token into config, logs, argv, event payloads, or environment variables.
-- Actionable tea auth failures surface as `tea_missing`, `tea_login_missing`, `tea_login_host_mismatch`, or `tea_auth_failed` (and never fall through to GitHub).
-- Forgejo projects require a `provider` and repo (`owner/name`) in the config file. The project HTTP API can register a local `repoPath` against a running daemon, but provider bindings themselves are file-managed. Already-started work retains its previous catalog snapshot.
-- Config validation rejects duplicate configured `repo` values case-insensitively, even across different providers, because current runtime records are still keyed by bare repo.
-- Forgejo uses polling only. Omit `projects[].webhook.mode` and keep `projects[].network.mode` unset or `off`.
-- Forgejo projects get a provider profile that makes minimal config safe: planner and worker stay enabled, worker only processes issues already assigned to the current provider user, reviewer uses native review-request discovery and native review publication, fixer supports the manual native-comment + summary protocol described below, and coordinator/auto-merge/thread resolution stay disabled.
-- Explicitly re-enabling unsupported Forgejo behavior fails config validation instead of silently downgrading behavior.
-- Provider capability probes run inside the daemon and are exposed on status endpoints / the dashboard (`looper status` reports config, daemon reachability, and projects, not per-provider capability). Capability output separates Looper's configured support from the server-observed contract; missing or disabled OpenAPI is `unknown`.
+- `providers[].kind` must be `github`. A configured `forgejo` or `plane` kind is rejected with an explicit unsupported-provider error — both were removed and are never reinterpreted as a supported provider.
+- **Upgrading from a config that used a removed provider:** delete the `[[providers]]` entry and any `[[projects]]` bound to it before starting the new daemon. A project registered through the dashboard or `POST /api/v1/projects` (`source = "api"`) survives in SQLite independently of the config file, and startup fails while it references a provider the config no longer declares. Because the daemon is down, its own DELETE endpoint cannot repair it; the startup error names the `sqlite3` statement that removes the stored row.
+- `providers[].baseUrl` is optional; when set it must be an absolute `http(s)` URL. **It does not point Looper at that host.** Its only consumer is repository identity, which is what lets two projects carry the same `owner/name` slug without colliding. Every GitHub call still goes to whatever host `gh` resolves.
+- `providers[].tokenEnv` names an environment variable, **not the credential the GitHub gateway uses.** Planner, worker, reviewer, fixer, webhook, and discovery calls all authenticate through ambient `gh` auth (`gh auth login`). The named variable is copied unchanged from the daemon environment into trusted `looper review submit` child processes and nowhere else.
+- A project bound to a provider requires both `provider` and a repo (`owner/name`); a binding without a repo is rejected. The project HTTP API can register a local `repoPath` against a running daemon, but provider bindings themselves are file-managed. Already-started work retains its previous catalog snapshot.
+- Config validation rejects two projects whose repository *identities* collide, matched case-insensitively. Identity is provider-qualified (kind + normalized `baseUrl` + repo), so the same `owner/name` under two provider ids with different `baseUrl` values is allowed, while two ids that normalize to the same endpoint are a duplicate.
 
-Forgejo reviewer discovery defaults to native review requests. Configured reviewer labels remain an optional source; when labels and review requests are both enabled, Forgejo uses their union with deterministic PR-number dedupe. Native clean and blocking outcomes follow `reviewEvents` (`APPROVE`, `REQUEST_CHANGES`, or `COMMENT`). Set `roles.reviewer.behavior.publishMode = "summary_comment"` and configure reviewer labels to retain the legacy top-level Reviewer Summary compatibility flow. Native operations require the corresponding endpoint in the Forgejo OpenAPI contract; older instances fail with a provider capability error instead of silently switching modes.
+### GitHub Enterprise Server
 
-### Plane task-source provider
+GHES is **not supported**. Some read paths would follow a host-qualified `projects[].repo` (`host/owner/name`) because the gateway derives `gh --hostname` from it, but that shape breaks other paths in ways that fail at publish time rather than at startup:
 
-`plane` splits the task source from the code forge: Planner/Worker read work-items from Plane (filtered by a trigger label), while pull requests are opened and reviewed on the project's GitHub `repo`. Plane rules:
+- trusted `looper review submit` takes a REST branch that embeds the repo verbatim into `repos/{repo}/pulls/{n}/reviews`, producing `repos/host/owner/name/pulls/...` against the ambient host
+- webhook tunnel routing accepts only `/webhook/{owner}/{repo}`, so a host-qualified repo 404s every delivery, and the payload's `repository.full_name` would not match the configured key anyway
 
-- `providers[].kind = "plane"` requires a non-empty `tokenEnv` (the env var holding the Plane API key), `workspace` (the Plane workspace slug), and `projectId` (the Plane project UUID). `baseUrl` is optional and defaults to the public Plane API base.
-- The project bound to a plane provider requires explicit `provider` and `repo`, where `repo` is the **GitHub code repo** (`owner/name`) where PRs are opened, and `repoPath` is its local checkout.
-- Discovery keys on the trigger label only; because Plane assignees are UUIDs (not GitHub logins), set `roles.*.triggers.requireAssigneeCurrentUser = false`.
-- Scaffold this by editing the config file (see [Plane provider + Feishu HITL setup](plane-provider.md)); there is no bootstrap CLI.
-
-### Forgejo live sandbox e2e
-
-Forgejo live sandbox e2e is a local/manual developer check, not a normal CI job. It is skipped unless explicitly enabled:
-
-```bash
-LOOPER_E2E_FORGEJO=1 \
-LOOPER_E2E_FORGEJO_BASE_URL=https://code.example.com \
-LOOPER_E2E_FORGEJO_SANDBOX_REPO=owner/repo \
-LOOPER_E2E_FORGEJO_TOKEN=$TOKEN \
-go test ./internal/e2e -run '^TestForgejoSandbox' -count=1
-```
-
-Rules:
-
-- `LOOPER_E2E_FORGEJO_BASE_URL` must be an absolute `http(s)` Forgejo base URL.
-- `LOOPER_E2E_FORGEJO_SANDBOX_REPO` must be `owner/repo` for an existing dedicated sandbox repository.
-- `LOOPER_E2E_FORGEJO_TOKEN` must authenticate against `/api/v1/user` and have access to the sandbox repository.
-- Missing, invalid, or inaccessible live prerequisites fail the enabled test run rather than falling back to mocks.
-- The tests derive the HTTPS clone/push URL from the base URL, repo, and token; there is no clone URL override.
+Do not configure it. Wiring the host through the gateway, review-submit, and tunnel routing consistently is the work that would make GHES real.
 
 GitHub live sandbox tests now prefer `LOOPER_E2E_GITHUB_SANDBOX_REPO`. The older `LOOPER_E2E_SANDBOX_REPO` name remains a compatibility alias, but setting both names to different repos fails fast.
 
@@ -759,6 +698,11 @@ host = "127.0.0.1"
 port = 17310
 authMode = "local-token"
 localToken = "replace-me"
+# Optional; set when a reverse proxy, tunnel, or TLS terminator sits in front
+# of the daemon. Must be a canonical absolute http(s) URL with a host — no
+# path prefix, credentials, query, or fragment — and any trailing slash is
+# normalized away.
+# baseUrl = "https://looper.example.com"
 
 [daemon]
 mode = "foreground"
@@ -855,10 +799,8 @@ ghPath = "/opt/homebrew/bin/gh"
 osascriptPath = "/usr/bin/osascript"
 
 [[providers]]
-id = "forgejo-main"
-kind = "forgejo"
-baseUrl = "https://code.example.com"
-tokenEnv = "LOOPER_FORGEJO_TOKEN"
+id = "acme"
+kind = "github"
 
 [package]
 distribution = "github-release"
@@ -978,11 +920,11 @@ baseBranch = "main"
 worktreeRoot = "/Users/you/.looper/worktrees/looper"
 
 [[projects]]
-id = "forgejo-example"
-name = "Forgejo Example"
-repoPath = "/absolute/path/to/forgejo-example"
-provider = "forgejo-main"
-repo = "acme/forgejo-example"
+id = "second-example"
+name = "Second Example"
+repoPath = "/absolute/path/to/second-example"
+provider = "acme"
+repo = "acme/second-example"
 
 [projects.roles.worker.discovery]
 autoDiscovery = false
@@ -1177,14 +1119,6 @@ Defaults preserve Looper's historical behavior:
 - reviewer discovers open non-draft PRs where the current user is requested for review, skips self-authored PRs by default, and includes the `looper:spec-reviewing` follow-up path
 - fixer discovers open non-draft PRs authored by the current user that have actionable review items
 
-Forgejo provider profile differences:
-
-- planner discovers labeled issues through the Forgejo REST provider
-- worker discovers only issues already assigned to the current Forgejo user and does not claim work by adding itself as assignee
-- reviewer defaults to native review requests and native PR review events; configured labels can be used alone or combined, and `publishMode = "summary_comment"` retains the legacy summary flow
-- fixer auto-discovery still follows Reviewer Summary items only, while manual/direct Forgejo fixer runs also consume unresolved native Forgejo review comments and may resolve those native comments after validation + push + post-push verification
-- coordinator, auto-merge, review-thread resolution, routed network mode, and webhook modes are unsupported for Forgejo in the MVP and fail fast if explicitly enabled
-
 Common fields:
 
 - `roles.<role>.autoDiscovery`: when `false`, the scheduler skips new discovery for that role only
@@ -1221,9 +1155,9 @@ onAdrConflict = true
 onUnauthorizedDecision = true
 ```
 
-Trigger fields are combined with logical AND except Forgejo reviewer labels plus native review requests, which are independent discovery sources and combine as a deduplicated union. Label lists use `labelMode=all` or `labelMode=any`; an empty labels list means no label constraint.
+Trigger fields are combined with logical AND. Label lists use `labelMode=all` or `labelMode=any`; an empty labels list means no label constraint.
 
-When reviewer `triggers.requireReviewRequest=true` and no reviewer label filter is configured, discovery queries the forge for PRs review-requested from the current user. This avoids missing requested reviews that fall outside the generic open-PR discovery window. On Forgejo, label filters can instead be selected alone or combined with review-request discovery.
+When reviewer `triggers.requireReviewRequest=true` and no reviewer label filter is configured, discovery queries the forge for PRs review-requested from the current user. This avoids missing requested reviews that fall outside the generic open-PR discovery window.
 
 For reviewer discovery, `triggers.enableSelfReview` defaults to `false`. When omitted or falsy, non-manual reviewer loops skip pull requests whose normalized PR author login matches the current authenticated GitHub login. Set it to `true` to allow those loops to review self-authored PRs.
 
@@ -1312,7 +1246,7 @@ Defaults:
 - `daemon.worktreeCleanup.interval = "24h"`
 - `daemon.worktreeCleanup.retentionDays = 7`
 - `daemon.worktreeCleanup.maxPerTick = 10`
-- `daemon.worktreeCleanup.includeOrphans = false`
+- `daemon.worktreeCleanup.includeOrphans = true` — a worktree record that no loop, run, or queue item references is still gated by `retentionDays`, because the planner ages every candidate by its own `createdAt`/`updatedAt`. Set this to `false` only to keep unreferenced worktrees indefinitely; the sweeper then reclaims almost nothing, since the reference graph drops old worktrees as loops move on.
 - `daemon.worktreeCleanup.dryRun = false`
 
 To disable automatic cleanup:

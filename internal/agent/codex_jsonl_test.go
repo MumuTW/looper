@@ -46,6 +46,17 @@ func TestCodexJSONLTranslator(t *testing.T) {
 	}
 }
 
+func TestCodexJSONLTranslatorPreservesCompletionPayload(t *testing.T) {
+	t.Parallel()
+
+	tr := newCodexJSONLTranslator()
+	tr.ingestLine(`{"type":"item.completed","item":{"type":"agent_message","text":"__LOOPER_RESULT__={\"outcome\":\"completed\",\"summary\":\"done\"}"}}`)
+	completion := parseCompletion(tr.combinedText(), "")
+	if completion.ParseStatus != "parsed" || completion.CompletionPayload != `{"outcome":"completed","summary":"done"}` {
+		t.Fatalf("completion = %#v, want translated structured payload", completion)
+	}
+}
+
 func TestFinalMessageExtractsCodexJSONLAndPreservesPlainText(t *testing.T) {
 	jsonl := "{\"type\":\"thread.started\",\"thread_id\":\"th_1\"}\n" +
 		"{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"{\\\"action\\\":\\\"route\\\"}\"}}\n" +

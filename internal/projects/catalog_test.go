@@ -17,7 +17,7 @@ func TestCatalogPublishesFullConfigAtomically(t *testing.T) {
 	vendor := config.AgentVendorCodex
 	global := config.Config{
 		Agent:     config.AgentConfig{Vendor: &vendor, Params: map[string]any{"nested": map[string]any{"value": "original"}}},
-		Providers: []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo}},
+		Providers: []config.ProviderConfig{{ID: "ghes-main", Kind: config.ProviderKindGitHub, BaseURL: "https://ghe.example.test"}},
 		Projects:  []config.ProjectRefConfig{{ID: "import-input"}},
 	}
 	catalog := NewCatalog(global)
@@ -27,7 +27,7 @@ func TestCatalogPublishesFullConfigAtomically(t *testing.T) {
 	if len(got.Projects) != 1 || got.Projects[0].ID != "database" {
 		t.Fatalf("Snapshot().Projects = %#v, want published database project", got.Projects)
 	}
-	if len(got.Providers) != 1 || got.Providers[0].ID != "forgejo-main" || got.Agent.Vendor == nil || *got.Agent.Vendor != vendor {
+	if len(got.Providers) != 1 || got.Providers[0].ID != "ghes-main" || got.Agent.Vendor == nil || *got.Agent.Vendor != vendor {
 		t.Fatalf("Snapshot() lost global config: %#v", got)
 	}
 }
@@ -121,7 +121,7 @@ func TestCatalogDoesNotRetainOrReturnMutableAliases(t *testing.T) {
 	projects := []config.ProjectRefConfig{{ID: "database", Repo: "core/database", Roles: roles}}
 	global := config.Config{
 		Agent:     config.AgentConfig{Params: map[string]any{"nested": map[string]any{"value": "original"}}, Env: map[string]string{"TOKEN": "env"}},
-		Providers: []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo}},
+		Providers: []config.ProviderConfig{{ID: "ghes-main", Kind: config.ProviderKindGitHub, BaseURL: "https://ghe.example.test"}},
 	}
 	catalog := NewCatalog(global)
 	catalog.Publish(projects)
@@ -142,7 +142,7 @@ func TestCatalogDoesNotRetainOrReturnMutableAliases(t *testing.T) {
 	if got.Projects[0].ID != "database" || got.Projects[0].Roles == nil {
 		t.Fatalf("published projects were mutated through an alias: %#v", got.Projects)
 	}
-	if got.Providers[0].ID != "forgejo-main" || got.Agent.Env["TOKEN"] != "env" {
+	if got.Providers[0].ID != "ghes-main" || got.Agent.Env["TOKEN"] != "env" {
 		t.Fatalf("published globals were mutated through an alias: %#v", got)
 	}
 	nested := got.Agent.Params["nested"].(map[string]any)
@@ -239,9 +239,9 @@ func TestMaterializeCatalogUsesRecordsAsProjectAuthority(t *testing.T) {
 	t.Parallel()
 
 	baseBranch := "main"
-	metadata := `{"network":{"mode":"routed"},"provider":"forgejo-main","repo":"core/odcrew","source":"config","worktreeRoot":"/tmp/worktrees"}`
+	metadata := `{"network":{"mode":"routed"},"provider":"ghes-main","repo":"core/odcrew","source":"config","worktreeRoot":"/tmp/worktrees"}`
 	archivedMetadata := `{"repo":"acme/removed","source":"config"}`
-	imported := config.Config{Providers: []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo}}, Projects: []config.ProjectRefConfig{
+	imported := config.Config{Providers: []config.ProviderConfig{{ID: "ghes-main", Kind: config.ProviderKindGitHub, BaseURL: "https://ghe.example.test"}}, Projects: []config.ProjectRefConfig{
 		{ID: "odcrew", Name: "stale name", RepoPath: "/stale", Provider: "stale-provider", Repo: "stale/repo"},
 		{ID: "config-only", Name: "must not appear", RepoPath: "/config-only"},
 	}}
@@ -260,7 +260,7 @@ func TestMaterializeCatalogUsesRecordsAsProjectAuthority(t *testing.T) {
 	if project.ID != "odcrew" || project.Name != "ODCrew" || project.RepoPath != "/repos/odcrew" {
 		t.Fatalf("project identity = %#v, want database record", project)
 	}
-	if project.Provider != "forgejo-main" || project.Repo != "core/odcrew" {
+	if project.Provider != "ghes-main" || project.Repo != "core/odcrew" {
 		t.Fatalf("project binding = (%q, %q), want stored binding", project.Provider, project.Repo)
 	}
 	if project.Network.Mode != config.NetworkModeRouted {
@@ -298,12 +298,12 @@ func TestMaterializeCatalogAllowsDuplicateReposAcrossProviders(t *testing.T) {
 	t.Parallel()
 
 	githubMetadata := `{"repo":"nexu-io/looper","source":"config"}`
-	forgejoMetadata := `{"provider":"forgejo-main","repo":"NEXU-IO/LOOPER","source":"api"}`
-	global := config.Config{Providers: []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo}}}
+	ghesMetadata := `{"provider":"ghes-main","repo":"NEXU-IO/LOOPER","source":"api"}`
+	global := config.Config{Providers: []config.ProviderConfig{{ID: "ghes-main", Kind: config.ProviderKindGitHub, BaseURL: "https://ghe.example.test"}}}
 
 	got, err := MaterializeCatalog(global, []storage.ProjectRecord{
 		{ID: "github", MetadataJSON: &githubMetadata},
-		{ID: "forgejo", MetadataJSON: &forgejoMetadata},
+		{ID: "ghes", MetadataJSON: &ghesMetadata},
 	})
 	if err != nil {
 		t.Fatalf("MaterializeCatalog() error = %v", err)
@@ -316,44 +316,12 @@ func TestMaterializeCatalogAllowsDuplicateReposAcrossProviders(t *testing.T) {
 func TestMaterializeCatalogRejectsDuplicateRepoWithinProvider(t *testing.T) {
 	t.Parallel()
 
-	first := `{"provider":"forgejo-main","repo":"nexu-io/looper"}`
-	second := `{"provider":"forgejo-main","repo":"NEXU-IO/LOOPER"}`
-	global := config.Config{Providers: []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: "https://code.example.test"}}}
+	first := `{"provider":"ghes-main","repo":"nexu-io/looper"}`
+	second := `{"provider":"ghes-main","repo":"NEXU-IO/LOOPER"}`
+	global := config.Config{Providers: []config.ProviderConfig{{ID: "ghes-main", Kind: config.ProviderKindGitHub, BaseURL: "https://code.example.test"}}}
 	_, err := MaterializeCatalog(global, []storage.ProjectRecord{{ID: "one", MetadataJSON: &first}, {ID: "two", MetadataJSON: &second}})
 	if err == nil || !strings.Contains(err.Error(), `duplicates active project "one"`) {
 		t.Fatalf("MaterializeCatalog() error = %v, want same-provider duplicate rejection", err)
-	}
-}
-
-func TestMaterializeCatalogAppliesAndValidatesForgejoRoleProfile(t *testing.T) {
-	t.Parallel()
-
-	global, err := config.DefaultConfig(t.TempDir())
-	if err != nil {
-		t.Fatalf("DefaultConfig() error = %v", err)
-	}
-	global.Providers = []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo}}
-	global.Roles.Coordinator.Enabled = true
-	global.Roles.Coordinator.Dependencies.Enabled = true
-	metadata := `{"provider":"forgejo-main","repo":"core/odcrew","source":"api"}`
-	got, err := MaterializeCatalog(global, []storage.ProjectRecord{{ID: "odcrew", MetadataJSON: &metadata}})
-	if err != nil {
-		t.Fatalf("MaterializeCatalog() error = %v", err)
-	}
-	global.Projects = got
-	triggers := config.ProjectRoleConfigs(global, "odcrew").Reviewer.Discovery.Triggers
-	if !triggers.RequireReviewRequest || len(triggers.Labels) != 0 {
-		t.Fatalf("materialized reviewer triggers = %#v, want native Forgejo review-request profile", triggers)
-	}
-	coordinator := config.ProjectRoleConfigs(global, "odcrew").Coordinator
-	if coordinator.Enabled || coordinator.Dependencies.Enabled {
-		t.Fatalf("materialized coordinator = %#v, want Forgejo coordinator and dependency gates disabled", coordinator)
-	}
-
-	incompatibleMetadata := `{"provider":"forgejo-main","repo":"core/odcrew","roles":{"reviewer":{"autoMerge":{"enabled":true}}},"source":"api"}`
-	_, err = MaterializeCatalog(global, []storage.ProjectRecord{{ID: "odcrew", MetadataJSON: &incompatibleMetadata}})
-	if err == nil || !strings.Contains(err.Error(), "autoMerge.enabled") {
-		t.Fatalf("MaterializeCatalog() error = %v, want incompatible Forgejo role rejection", err)
 	}
 }
 
@@ -363,7 +331,7 @@ func TestConfiguredProjectMetadataRoundTripsRuntimePolicy(t *testing.T) {
 	project := config.ProjectRefConfig{
 		ID:       "odcrew",
 		Name:     "ODCrew",
-		Provider: "forgejo-main",
+		Provider: "ghes-main",
 		Repo:     "core/odcrew",
 		RepoPath: "/repos/odcrew",
 		Path:     "nested/path",
@@ -376,7 +344,7 @@ func TestConfiguredProjectMetadataRoundTripsRuntimePolicy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildProjectMetadataJSON() error = %v", err)
 	}
-	global := config.Config{Providers: []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo}}}
+	global := config.Config{Providers: []config.ProviderConfig{{ID: "ghes-main", Kind: config.ProviderKindGitHub, BaseURL: "https://ghe.example.test"}}}
 	got, err := MaterializeCatalog(global, []storage.ProjectRecord{{
 		ID: project.ID, Name: project.Name, RepoPath: project.RepoPath, MetadataJSON: &metadata,
 	}})
@@ -401,11 +369,11 @@ func TestCatalogViewCapturesCoherentGeneration(t *testing.T) {
 	vendor := config.AgentVendorCodex
 	cfg := config.Config{
 		Agent:     config.AgentConfig{Vendor: &vendor, Params: map[string]any{"nested": map[string]any{"value": "original"}}},
-		Providers: []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo}},
+		Providers: []config.ProviderConfig{{ID: "ghes-main", Kind: config.ProviderKindGitHub, BaseURL: "https://ghe.example.test"}},
 		Projects:  []config.ProjectRefConfig{{ID: "import-input"}},
 	}
 	catalog := NewCatalog(cfg)
-	catalog.Publish([]config.ProjectRefConfig{{ID: "database", Repo: "core/database", Provider: "forgejo-main", Roles: &config.PartialRoleConfigs{}}})
+	catalog.Publish([]config.ProjectRefConfig{{ID: "database", Repo: "core/database", Provider: "ghes-main", Roles: &config.PartialRoleConfigs{}}})
 
 	view := catalog.View()
 
@@ -417,8 +385,8 @@ func TestCatalogViewCapturesCoherentGeneration(t *testing.T) {
 	if !ok || project.Project.ID != "database" {
 		t.Fatalf("view.Project(\"database\") = (%#v, %v), want database project", project, ok)
 	}
-	if project.Provider.ID != "forgejo-main" {
-		t.Fatalf("view.Project(\"database\").Provider = %#v, want forgejo-main", project.Provider)
+	if project.Provider.ID != "ghes-main" {
+		t.Fatalf("view.Project(\"database\").Provider = %#v, want ghes-main", project.Provider)
 	}
 
 	rolePolicy := view.RolePolicy("database")
@@ -525,10 +493,10 @@ func TestCatalogViewProviderPolicy(t *testing.T) {
 
 	cfg := config.Config{
 		Providers: []config.ProviderConfig{{
-			ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: "https://code.example.test",
+			ID: "ghes-main", Kind: config.ProviderKindGitHub, BaseURL: "https://code.example.test",
 		}},
 		Projects: []config.ProjectRefConfig{{
-			ID: "demo", Repo: "NEXU-IO/LOOPER", Provider: "forgejo-main",
+			ID: "demo", Repo: "NEXU-IO/LOOPER", Provider: "ghes-main",
 		}},
 	}
 	catalog := NewCatalog(cfg)
@@ -538,8 +506,8 @@ func TestCatalogViewProviderPolicy(t *testing.T) {
 	if !ok {
 		t.Fatal("view.ProviderPolicy(\"demo\") not found")
 	}
-	if policy.Provider.ID != "forgejo-main" || policy.ProviderKind != config.ProviderKindForgejo {
-		t.Fatalf("view.ProviderPolicy(\"demo\") = %#v, want forgejo-main", policy)
+	if policy.Provider.ID != "ghes-main" || policy.ProviderKind != config.ProviderKindGitHub {
+		t.Fatalf("view.ProviderPolicy(\"demo\") = %#v, want ghes-main", policy)
 	}
 	if policy.Provider.BaseURL != "https://code.example.test" {
 		t.Fatalf("provider base url was not preserved")
@@ -556,26 +524,6 @@ func TestCatalogViewProviderPolicyRequiresRepositoryBinding(t *testing.T) {
 	policy, ok := catalog.View().ProviderPolicy("demo")
 	if ok || policy != (ProviderPolicyView{}) {
 		t.Fatalf("view.ProviderPolicy(\"demo\") = (%#v, %v), want empty policy, false", policy, ok)
-	}
-}
-
-func TestCatalogViewProviderByRemoteHost(t *testing.T) {
-	t.Parallel()
-
-	cfg := config.Config{
-		Providers: []config.ProviderConfig{{
-			ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: "https://code.example.test",
-		}},
-	}
-	catalog := NewCatalog(cfg)
-
-	view := catalog.View()
-	policy, ok := view.ProviderByRemoteHost("ssh.code.example.test")
-	if !ok {
-		t.Fatal("view.ProviderByRemoteHost(\"ssh.code.example.test\") not found")
-	}
-	if policy.Provider.ID != "forgejo-main" || policy.ProviderKind != config.ProviderKindForgejo {
-		t.Fatalf("view.ProviderByRemoteHost = %#v, want forgejo-main", policy)
 	}
 }
 
