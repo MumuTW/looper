@@ -366,6 +366,8 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 	}
 	report.ObservedHeadSHA = strings.TrimSpace(detail.HeadSHA)
 	report.Evidence.PullRequestState = strings.ToUpper(strings.TrimSpace(detail.State))
+	report.Evidence.ClosedAt = strings.TrimSpace(detail.ClosedAt)
+	report.Evidence.MergedAt = strings.TrimSpace(detail.MergedAt)
 	report.Evidence.Draft = detail.IsDraft
 	report.Evidence.BaseRefName = strings.TrimSpace(detail.BaseRefName)
 	report.Evidence.ReviewDecision = strings.ToUpper(strings.TrimSpace(detail.ReviewDecision))
@@ -678,11 +680,16 @@ func (r *Runner) persist(ctx context.Context, report Report) (Report, error) {
 	entityType := "pull_request"
 	entityID := fmt.Sprintf("%s#%d", report.Repo, report.PRNumber)
 	projectID := report.ProjectID
+	reportEventID := eventlog.NewEventID("event")
 	if err := eventlog.Append(ctx, r.repos, eventlog.AppendInput{
+		ID:        reportEventID,
 		EventType: GateReportEventType, ProjectID: &projectID, EntityType: &entityType, EntityID: &entityID,
 		Payload: report, CreatedAt: r.now(),
 	}); err != nil {
 		return Report{}, fmt.Errorf("persist gate report: %w", err)
+	}
+	if err := r.recordTerminalAdviceOutcomes(ctx, report, reportEventID); err != nil {
+		return Report{}, err
 	}
 	// The owned comment is reconciled after the durable report: the report is the
 	// record, the comment is a convenience for whoever is deciding. A forge that
