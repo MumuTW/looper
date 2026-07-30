@@ -14,6 +14,7 @@ import (
 	"github.com/nexu-io/looper/internal/labels"
 	"github.com/nexu-io/looper/internal/reviewer/criteria"
 	"github.com/nexu-io/looper/internal/reviewer/publish"
+	"github.com/nexu-io/looper/internal/reviewer/resolution"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -33,7 +34,7 @@ func TestThreadResolutionReplyPassesStampedGitHubPublicationBoundary(t *testing.
 	}})
 
 	policy := config.ReviewerThreadResolutionConfig{Mode: config.ReviewerThreadResolutionModeResolveObjective}
-	body := (&Runner{}).buildThreadResolutionReply(threadID, headSHA, threadResolutionAgentDecision{
+	body := resolution.Reply(threadID, headSHA, threadResolutionAgentDecision{
 		Decision: "objectively_fixed", Evidence: "the nil check is present", Confidence: "high",
 	}, policy)
 	stamper := disclosure.Stamper{Config: config.DisclosureConfig{

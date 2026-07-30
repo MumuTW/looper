@@ -23,6 +23,7 @@ import (
 	"github.com/nexu-io/looper/internal/reviewer/automerge"
 	"github.com/nexu-io/looper/internal/reviewer/criteria"
 	"github.com/nexu-io/looper/internal/reviewer/publish"
+	"github.com/nexu-io/looper/internal/reviewer/resolution"
 	"github.com/nexu-io/looper/internal/storage"
 	"github.com/nexu-io/looper/internal/worktreesafety"
 )
@@ -8149,7 +8150,7 @@ func TestBuildReviewPromptFullPRScopeUsesAgentSideFetchContract(t *testing.T) {
 func TestBuildThreadResolutionPromptRequiresPreparedWorktreeReuse(t *testing.T) {
 	t.Parallel()
 
-	prompt := buildThreadResolutionPrompt("acme/looper", 42, "abc123", nil)
+	prompt := resolution.Prompt("acme/looper", 42, "abc123", nil)
 	for _, want := range []string{
 		"canonical local checkout",
 		"Do not run gh repo clone, git clone, or create any additional checkout for this PR's base or head repository unless the provided worktree is missing or unusable.",
