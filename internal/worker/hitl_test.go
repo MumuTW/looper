@@ -623,3 +623,148 @@ func TestMergeLoopMetadataJSONRejectsMalformedCurrentValue(t *testing.T) {
 		t.Fatalf("mergeLoopMetadataJSON(valid) = %q, want existing keys preserved and update applied", out)
 	}
 }
+
+// corruptingAgentExecutor writes the ask sentinel into the worktree and
+// corrupts the loop's stored metadata mid-run, simulating concurrent
+// corruption that lands between claim time and suspension.
+type corruptingAgentExecutor struct {
+	inner   fakeAgentExecutor
+	repos   *storage.Repositories
+	loopID  string
+	corrupt string
+}
+
+func (c *corruptingAgentExecutor) Start(ctx context.Context, input AgentRunInput) (AgentExecution, error) {
+	askPath := filepath.Join(input.WorkingDirectory, hitlSentinelRelPath)
+	if err := os.MkdirAll(filepath.Dir(askPath), 0o755); err != nil {
+		return nil, err
+	}
+	if err := os.WriteFile(askPath, []byte(`{"question":"Which datastore?"}`), 0o644); err != nil {
+		return nil, err
+	}
+	loop, err := c.repos.Loops.GetByID(ctx, c.loopID)
+	if err != nil || loop == nil {
+		return nil, err
+	}
+	corrupted := c.corrupt
+	loop.MetadataJSON = &corrupted
+	if err := c.repos.Loops.Upsert(ctx, *loop); err != nil {
+		return nil, err
+	}
+	return c.inner.Start(ctx, input)
+}
+
+// The aborted-suspension contract through the outer lifecycle: queue recovery
+// must run and the run must end failed, so the NEXT claim resumes it instead
+// of creating a second run while the first stays active.
+func TestProcessClaimedQueueItemRecoversWhenSuspensionAborts(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	ctx := context.Background()
+
+	worktreePath := filepath.Join(t.TempDir(), "wt")
+	git := &fakeGitGateway{
+		createResult: CreateWorktreeResult{WorktreePath: worktreePath, Branch: "looper/feature", BaseBranch: "main", HeadSHA: "base-head", WorktreeID: "worktree_1"},
+	}
+	agent := &corruptingAgentExecutor{
+		repos:   fixture.repos,
+		loopID:  "loop_worker_1",
+		corrupt: `{"worktreeId":"wt-1","hitl":{`,
+	}
+	runner := New(Options{
+		DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: git, AgentExecutor: agent,
+		Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true,
+		HITLEnabled: true, HITLAnswerTransport: "feishu",
+		HITLNotify: func(context.Context, HITLAskNotification) error { return nil },
+	})
+
+	claim, err := fixture.repos.Queue.ClaimNextOfType(ctx, fixture.nowISO(), "worker-1", "worker")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v)", claim, err)
+	}
+	result, err := runner.ProcessClaimedQueueItem(ctx, *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedQueueItem() error = %v, want recovered failure result", err)
+	}
+	if result == nil || result.Status != "failed" {
+		t.Fatalf("result = %#v, want failed after aborted suspension", result)
+	}
+
+	// The loop must not be parked awaiting a nonexistent ask.
+	loop, err := fixture.repos.Loops.GetByID(ctx, "loop_worker_1")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v)", loop, err)
+	}
+	if loop.Status == "awaiting_human" {
+		t.Fatal("loop parked awaiting_human with no stored ask")
+	}
+
+	// Exactly one run exists and it is failed (resumable), and the queue item
+	// was reconciled by recovery rather than left running.
+	runs, err := fixture.repos.Runs.ListByLoop(ctx, "loop_worker_1")
+	if err != nil {
+		t.Fatalf("Runs.ListByLoop() error = %v", err)
+	}
+	if len(runs) != 1 || runs[0].Status != "failed" {
+		t.Fatalf("runs = %#v, want exactly one failed (resumable) run", runs)
+	}
+	queueItem, err := fixture.repos.Queue.GetByID(ctx, claim.ID)
+	if err != nil || queueItem == nil {
+		t.Fatalf("Queue.GetByID() = (%#v, %v)", queueItem, err)
+	}
+	if queueItem.Status == "running" {
+		t.Fatalf("queue item status = running, want reconciled by recovery (got %#v)", queueItem)
+	}
+
+	// Repair the metadata and reprocess: the failed run must be RESUMED, not
+	// duplicated.
+	repaired := `{"worktreeId":"wt-1"}`
+	loop.MetadataJSON = &repaired
+	if err := fixture.repos.Loops.Upsert(ctx, *loop); err != nil {
+		t.Fatalf("Loops.Upsert(repaired) error = %v", err)
+	}
+	agent.corrupt = repaired // second pass leaves metadata valid
+	loop.Status = "queued"
+	if err := fixture.repos.Loops.Upsert(ctx, *loop); err != nil {
+		t.Fatalf("Loops.Upsert(requeue loop) error = %v", err)
+	}
+	queueItem.Status = "queued"
+	queueItem.AvailableAt = fixture.nowISO()
+	queueItem.Attempts = 0
+	if err := fixture.repos.Queue.Upsert(ctx, *queueItem); err != nil {
+		t.Fatalf("Queue.Upsert(requeue) error = %v", err)
+	}
+	claim2, err := fixture.repos.Queue.ClaimNextOfType(ctx, fixture.nowISO(), "worker-1", "worker")
+	if err != nil || claim2 == nil {
+		t.Fatalf("second ClaimNextOfType() = (%#v, %v)", claim2, err)
+	}
+	result2, err := runner.ProcessClaimedQueueItem(ctx, *claim2)
+	if err != nil {
+		t.Fatalf("second ProcessClaimedQueueItem() error = %v", err)
+	}
+	if result2 == nil || result2.Status != "awaiting_human" {
+		t.Fatalf("second result = %#v, want awaiting_human once metadata is repaired", result2)
+	}
+	runs, err = fixture.repos.Runs.ListByLoop(ctx, "loop_worker_1")
+	if err != nil {
+		t.Fatalf("Runs.ListByLoop() error = %v", err)
+	}
+	if len(runs) != 2 {
+		t.Fatalf("runs after reprocess = %d, want the failed run plus its continuation", len(runs))
+	}
+	// No zombie: every run is terminal-or-resumable, none left running.
+	for _, run := range runs {
+		if run.Status == "running" {
+			t.Fatalf("run %s left running after reprocess: %#v", run.ID, run)
+		}
+	}
+	loop, err = fixture.repos.Loops.GetByID(ctx, "loop_worker_1")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v)", loop, err)
+	}
+	if loop.Status != "awaiting_human" {
+		t.Fatalf("loop status after repaired suspension = %q, want awaiting_human", loop.Status)
+	}
+	if _, ok := loops.ReadHITLAsk(loop.MetadataJSON); !ok {
+		t.Fatal("no HITL ask stored after repaired suspension")
+	}
+}

@@ -4775,7 +4775,13 @@ func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.P
 		}
 		updated := *existing
 		metadataJSONSource := updated.MetadataJSON
-		meta := parseJSONObject(updated.MetadataJSON)
+		// Strict-decode the ORIGINAL value before any re-encoding: building the
+		// normalized source from a lenient parse would hand ensureLoopMetadataJSON
+		// valid replacement JSON and overwrite a malformed stored value.
+		meta, err := loops.DecodeMetadataObjectForWrite(updated.MetadataJSON)
+		if err != nil {
+			return loopUpsertResult{}, err
+		}
 		if loopEnabledMetadataMissing(meta) {
 			meta["followUpdates"] = false
 			encoded, err := json.Marshal(meta)
