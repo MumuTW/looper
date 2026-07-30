@@ -34,7 +34,7 @@ type feishuHITLPollDeps struct {
 	loopBySeq      func(ctx contextType, seq int64) string
 	deliverAnswer  func(ctx contextType, loopID, answer string) error
 	enqueueMessage func(ctx contextType, loopID, text string) error
-	logWarn        func(msg string, fields map[string]any)
+	logWarn       func(msg string, fields map[string]any)
 }
 
 // pollFeishuHITLInboxOnce delivers answers among a batch of inbox events.
@@ -97,7 +97,6 @@ func maxFeishuInboxCursor(current, eventID int64) int64 {
 	}
 	return current
 }
-
 // feishuInboxCursor tracks the last inbox event id this daemon has consumed.
 var feishuInboxCursor struct {
 	mu sync.Mutex

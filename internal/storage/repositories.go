@@ -49,6 +49,7 @@ type sqliteQuerier interface {
 }
 
 type Repositories struct {
+	q                    sqliteQuerier
 	Projects             *ProjectsRepository
 	Loops                *LoopsRepository
 	Runs                 *RunsRepository
@@ -66,6 +67,7 @@ type Repositories struct {
 
 func NewRepositories(q sqliteQuerier) *Repositories {
 	return &Repositories{
+		q:                    q,
 		Projects:             &ProjectsRepository{q: q},
 		Loops:                &LoopsRepository{q: q},
 		Runs:                 &RunsRepository{q: q},
@@ -80,6 +82,23 @@ func NewRepositories(q sqliteQuerier) *Repositories {
 		WebhookTunnelHooks:   &WebhookTunnelHooksRepository{q: q},
 		FeishuThreads:        &FeishuThreadsRepository{q: q},
 	}
+}
+
+// WithTransaction runs fn against repositories bound to one SQLite transaction.
+func (r *Repositories) WithTransaction(ctx context.Context, fn func(*Repositories) error) error {
+	if r == nil {
+		return fmt.Errorf("repositories are not initialized")
+	}
+	if fn == nil {
+		return fmt.Errorf("transaction callback is nil")
+	}
+	beginner, ok := r.q.(txBeginner)
+	if !ok {
+		return fmt.Errorf("repositories do not support transactions")
+	}
+	return WithTransaction(ctx, beginner, nil, func(tx *sql.Tx) error {
+		return fn(NewRepositories(tx))
+	})
 }
 
 type ProjectRecord struct {

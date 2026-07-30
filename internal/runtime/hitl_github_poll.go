@@ -216,7 +216,20 @@ func enqueueHumanMessageToLoop(ctx context.Context, repos *storage.Repositories,
 	// per-loop mutex and wipes the shared worktree before the retry TX.
 	unlockTarget := LockLoopTarget(LoopTargetGuardKeyFromRecord(*loop))
 	defer unlockTarget()
+	return repos.WithTransaction(ctx, func(txRepos *storage.Repositories) error {
+		return enqueueHumanMessageToLoopTransaction(ctx, txRepos, nowISO, loopID, text)
+	})
+}
 
+func enqueueHumanMessageToLoopTransaction(ctx context.Context, repos *storage.Repositories, nowISO, loopID, text string) error {
+	loop, err := repos.Loops.GetByID(ctx, loopID)
+	if err != nil || loop == nil {
+		return err
+	}
+	switch loop.Status {
+	case "completed", "failed", "stopped", "terminated", "human_takeover":
+		return nil
+	}
 	meta, werr := loops.AppendHumanMessage(loop.MetadataJSON, loops.HumanMessage{At: nowISO, Text: text})
 	if werr != nil {
 		return werr
@@ -254,6 +267,19 @@ func deliverHITLAnswerToLoop(ctx context.Context, repos *storage.Repositories, n
 	}
 	unlockTarget := LockLoopTarget(LoopTargetGuardKeyFromRecord(*loop))
 	defer unlockTarget()
+	return repos.WithTransaction(ctx, func(txRepos *storage.Repositories) error {
+		return deliverHITLAnswerToLoopTransaction(ctx, txRepos, nowISO, loopID, answer)
+	})
+}
+
+func deliverHITLAnswerToLoopTransaction(ctx context.Context, repos *storage.Repositories, nowISO, loopID, answer string) error {
+	loop, err := repos.Loops.GetByID(ctx, loopID)
+	if err != nil || loop == nil {
+		return err
+	}
+	if loop.Status != "awaiting_human" {
+		return nil
+	}
 	ask, ok := loops.ReadHITLAsk(loop.MetadataJSON)
 	if !ok {
 		return nil
