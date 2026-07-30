@@ -26,14 +26,14 @@ func CandidatesFromMergeOutcomes(events []storage.EventLogRecord) ([]MergeCandid
 		if !outcome.Merged {
 			continue
 		}
-		if outcome.PRNumber <= 0 || strings.TrimSpace(outcome.HeadSHA) == "" {
+		if strings.TrimSpace(outcome.ProjectID) == "" || strings.TrimSpace(outcome.Repo) == "" || outcome.PRNumber <= 0 || strings.TrimSpace(outcome.HeadSHA) == "" {
 			return nil, fmt.Errorf("merge outcome event %s is missing merged pull request identity", event.ID)
 		}
 		mergedAt, err := time.Parse(time.RFC3339Nano, event.CreatedAt)
 		if err != nil {
 			return nil, fmt.Errorf("parse merge outcome event %s timestamp: %w", event.ID, err)
 		}
-		candidates = append(candidates, MergeCandidate{PRNumber: outcome.PRNumber, HeadSHA: outcome.HeadSHA, MergedAt: mergedAt.UTC()})
+		candidates = append(candidates, MergeCandidate{ProjectID: outcome.ProjectID, Repo: outcome.Repo, PRNumber: outcome.PRNumber, HeadSHA: outcome.HeadSHA, MergedAt: mergedAt.UTC()})
 	}
 	return candidates, nil
 }
