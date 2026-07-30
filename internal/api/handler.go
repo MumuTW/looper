@@ -922,8 +922,6 @@ func (h *Handler) buildHealthResponse(ctx context.Context) (healthResponse, erro
 	startedAt := h.startedAtISO()
 
 	return healthResponse{
-		// /healthz is the liveness/storage contract. Admission readiness is
-		// projected by /status and must not cause a live daemon to be evicted.
 		Healthy:   state.OK,
 		StartedAt: startedAt,
 		Storage: storageHealth{
@@ -1431,9 +1429,6 @@ func (h *Handler) buildStatusResponse(ctx context.Context) (statusResponse, erro
 	if githubHealth.AuthenticationDegraded() {
 		degradedReasons = append(degradedReasons, looperdruntime.ForgeAuthenticationDegradedReason)
 	}
-	// Snapshot admission once so service and scheduler cannot disagree if the
-	// runtime transitions while this response is being assembled.
-	admissionState := h.admissionStateString()
 
 	return statusResponse{
 		Service: statusService{
@@ -1441,7 +1436,7 @@ func (h *Handler) buildStatusResponse(ctx context.Context) (statusResponse, erro
 			Version:         version.Current().Version,
 			Build:           version.Current().Metadata,
 			DaemonMode:      h.context.Config.Daemon.Mode,
-			AdmissionState:  admissionState,
+			AdmissionState:  h.admissionStateString(),
 			StartedAt:       h.startedAtISO(),
 			Recovery:        recovery,
 			Triage:          statusTriage{AwaitingConfirmation: awaitingConfirmation},
@@ -1464,7 +1459,7 @@ func (h *Handler) buildStatusResponse(ctx context.Context) (statusResponse, erro
 			Healthy:           storageState.OK,
 		},
 		Scheduler: statusScheduler{
-			Healthy:        admissionState == string(looperdruntime.AdmissionReady),
+			Healthy:        true,
 			QueuedItems:    int(queueCounts["queued"]),
 			RunningItems:   int(queueCounts["running"]),
 			CompletedItems: int(queueCounts["completed"]),
