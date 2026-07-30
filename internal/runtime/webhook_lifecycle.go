@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/processidentity"
 	"github.com/nexu-io/looper/internal/storage"
 )
@@ -137,10 +138,27 @@ func webhookForwarderLockPath(cfgStorageDBPath string) string {
 // remains the authority for the downgrade direction (old binary vs. newer
 // schema); this lock is the authority for new-daemon-vs-new-daemon attachment.
 //
-// The lock filename is derived from a canonical identity of the database path
-// (see attachLockFileName) so two independent daemons using different databases
-// in the same directory — e.g. /srv/a.sqlite and /srv/b.sqlite — get distinct
-// lock files instead of colliding on a single parent-directory lock.
+// Identity. The lock filename is keyed by the database file's filesystem
+// identity (device + inode), not by its path spelling. Two daemons reach the
+// same physical file through any of the spellings OpenSQLiteDB supports — a
+// bare path, a file: URI, a symlink, a hard link, or a differently cased name
+// on a case-insensitive volume — and the inode is the same for all of them, so
+// they collapse to one lock. Two daemons on different databases get distinct
+// inodes and therefore distinct lock files. The database file is created if it
+// does not yet exist (first boot) so the inode is stable before and after
+// SQLite opens it; an empty file is a valid empty SQLite database, so creating
+// it ahead of SQLite changes nothing about what SQLite subsequently opens.
+//
+// Location. The lock lives in a private, daemon-owned directory (~/.looper/locks,
+// mode 0700) rather than beside the database file. A database directory such
+// as /tmp or a shared volume may be writable by another user, who could
+// pre-create a deterministic lock pathname beside the database as a symlink to
+// a file the daemon can write; the previous beside-database derivation followed
+// that symlink and truncated the target. A private 0700 directory denies any
+// other user the ability to create entries in it, so no symlink can be planted
+// for the daemon to follow. acquireDaemonLock additionally opens the lock with
+// O_NOFOLLOW and verifies the open file is a regular file owned by the daemon
+// user before truncating, as defense in depth.
 //
 // Trade-off analysis (AGENTS.md "New concepts require an explicit trade-off"):
 //
@@ -172,6 +190,11 @@ func webhookForwarderLockPath(cfgStorageDBPath string) string {
 //     daemons that take it are coordinated. The cost is a documented boundary,
 //     not a silent overclaim.
 //
+//   - The database file is created on first boot before the lock is taken. If
+//     lock acquisition then fails the empty file remains behind; this is
+//     harmless because SQLite would have created it on the next attempt
+//     anyway, and an empty file is a valid empty database.
+//
 //   - The looper CLI does not open the storage database, so this lock never
 //     blocks CLI commands run against a live daemon.
 //
@@ -186,54 +209,63 @@ func webhookForwarderLockPath(cfgStorageDBPath string) string {
 //     semantics of an existing, named lock. A dedicated attach lock keeps the
 //     two concerns separate and the webhook lock's behavior intact.
 //
+//   - "Key by resolved path spelling" (the prior design) was replaced because
+//     filepath.EvalSymlinks only replaces symlinks: hard links and
+//     case-insensitive aliases of one file resolve to different strings and
+//     took different locks. Filesystem identity (inode) collapses all
+//     spellings of one file and removes the separate dangling-symlink
+//     resolution layer that the spelling approach required.
+//
 // The authority for refusing a second attach is the running daemon's
 // database-lifetime hold on this lock, not agent output or schema inference.
-func databaseAttachLockPath(cfgStorageDBPath string) string {
-	return daemonLockPath(cfgStorageDBPath, attachLockFileName(cfgStorageDBPath))
-}
-
-// attachLockFileName derives the attach-lock filename from a canonical identity
-// of the database path so two independent daemons using different databases in
-// the same directory (e.g. /srv/a.sqlite and /srv/b.sqlite) get distinct lock
-// files. Keying only by the parent directory — as a fixed "looperd.attach.lock"
-// name would — collides both daemons into one lock and rejects the second even
-// though it cannot race the first daemon's schema. The identity is a short hash
-// of the absolute, slash-normalized database path; the lock file content still
-// records pid/daemon_id/started for operability.
-func attachLockFileName(cfgStorageDBPath string) string {
-	return "looperd.attach." + canonicalDatabaseIdentity(cfgStorageDBPath) + ".lock"
-}
-
-// resolvedDatabasePath returns the effective physical path of the configured
-// database. It is the single source of truth for both the attach lock's
-// directory and its identity hash: deriving those separately let the two
-// disagree about which database a lock guards, which defeats the lock in two
-// ways. A lexical identity hashes an alias (a symlinked file or parent
-// directory) differently from its real path, so two daemons on one physical
-// database take different locks and both migrate it. And an identity that
-// resolves an empty DBPath differently from the lock directory produces
-// different lock filenames in the same directory, with the same result.
-//
-// Resolution order: empty means the conventional ~/.looper/looper.sqlite;
-// SQLite file: URIs (explicitly supported by OpenSQLiteDB) are parsed so that
-// /tmp/shared.sqlite and file:/tmp/shared.sqlite — which open the same database
-// — collapse to one path instead of producing unrelated lock directories and
-// hashes (query variants that reference the same file likewise collapse); any
-// path is made absolute, then symlinks are resolved.
-func resolvedDatabasePath(cfgStorageDBPath string) string {
-	dbPath := strings.TrimSpace(cfgStorageDBPath)
-	if dbPath == "" {
-		dbPath = "looper.sqlite"
-		if home, err := os.UserHomeDir(); err == nil {
-			dbPath = filepath.Join(home, ".looper", "looper.sqlite")
-		}
+func databaseAttachLockPath(cfgStorageDBPath string) (string, error) {
+	identity, err := databaseFilesystemIdentity(cfgStorageDBPath)
+	if err != nil {
+		return "", err
 	}
-	// SQLite file: URIs open the same database as the bare path but would hash
-	// to a different identity and lock directory if treated as an ordinary
-	// filename. Strip the URI scheme and query so both spellings, and query
-	// variants of one file, derive one identity. Both URI forms are handled:
-	// "file:/abs/path" carries the path in Path, while "file:relative.sqlite"
-	// and "file::memory:" carry it in Opaque.
+	lockDir := attachLockDir()
+	if err := os.MkdirAll(lockDir, 0o700); err != nil {
+		return "", err
+	}
+	return filepath.Join(lockDir, "looperd.attach."+identity+".lock"), nil
+}
+
+// attachLockDir returns the private, daemon-owned directory that holds every
+// attach lock. It lives under the daemon's state directory (the same
+// ~/.looper that holds looper.sqlite, backups/, and logs/, resolved via
+// config.DefaultLooperHome so LOOPER_HOME overrides it for tests and second
+// instances) and is created with mode 0700 so only the daemon user can place
+// entries in it. A database directory such as /tmp or a shared volume may be
+// writable by another user, who could pre-create a deterministic lock pathname
+// beside the database as a symlink; placing the lock in a private 0700
+// directory under the daemon's own state directory denies any other user the
+// ability to create entries there, so no symlink can be planted for the daemon
+// to follow and truncate.
+func attachLockDir() string {
+	looperHome, err := config.DefaultLooperHome()
+	if err != nil || strings.TrimSpace(looperHome) == "" {
+		return "looperd.locks"
+	}
+	return filepath.Join(looperHome, "locks")
+}
+
+// databaseFilesystemPath returns the filesystem path SQLite will open for the
+// configured dbPath: the conventional ~/.looper/looper.sqlite default for an
+// empty value, and the path component of a file: URI (both path and opaque
+// forms) for the file: form OpenSQLiteDB supports. It does not resolve
+// symlinks or make the path absolute — os.Stat follows symlinks, and the
+// filesystem identity (inode) is what disambiguates databases, not the
+// spelling. The value is not trimmed, matching OpenSQLiteDB/sqliteDSN: a
+// value like "  :memory:  " is not the exact ":memory:" SQLite recognizes, so
+// it is treated as a disk filename here and by SQLite alike.
+func databaseFilesystemPath(cfgStorageDBPath string) string {
+	dbPath := cfgStorageDBPath
+	if strings.TrimSpace(dbPath) == "" {
+		if looperHome, err := config.DefaultLooperHome(); err == nil && strings.TrimSpace(looperHome) != "" {
+			return filepath.Join(looperHome, "looper.sqlite")
+		}
+		return "looper.sqlite"
+	}
 	if strings.HasPrefix(dbPath, "file:") {
 		if parsed, err := url.Parse(dbPath); err == nil {
 			switch {
@@ -244,99 +276,60 @@ func resolvedDatabasePath(cfgStorageDBPath string) string {
 			}
 		}
 	}
-	if absPath, err := filepath.Abs(dbPath); err == nil {
-		dbPath = absPath
-	}
-	return resolvePathSymlinks(dbPath)
+	return dbPath
 }
 
-// resolvePathSymlinks resolves symlinks in path, including dangling symlinks
-// whose target does not exist yet. filepath.EvalSymlinks fails outright when
-// the leaf does not exist, which is the normal case on a first boot — the
-// database file is created after the lock is taken — so resolving the existing
-// prefix is what makes aliased spellings collapse before the file exists.
-//
-// When the unresolved component is itself a symlink (a dangling symlink whose
-// target SQLite will create), the link is followed via Readlink so the identity
-// matches the physical target that will exist once the database is created.
-// Without this, the first daemon (target missing) would hash the symlink
-// spelling while a second daemon (target now present) would hash the resolved
-// target, giving the two different locks against one database and restoring the
-// concurrent-migration race the lock prevents.
-func resolvePathSymlinks(path string) string {
-	return resolvePathSymlinksDepth(path, 0)
-}
-
-const maxSymlinkResolveDepth = 40
-
-func resolvePathSymlinksDepth(path string, depth int) string {
-	var trailing []string
-	current := path
-	for {
-		if resolved, err := filepath.EvalSymlinks(current); err == nil {
-			return filepath.Join(append([]string{resolved}, trailing...)...)
-		}
-		// EvalSymlinks failed, usually because the leaf does not exist yet. If
-		// the leaf is itself a dangling symlink, follow it so the identity
-		// matches the physical target SQLite will create rather than the alias
-		// spelling, which a later daemon (target now present) would not use.
-		if depth < maxSymlinkResolveDepth {
-			if fi, err := os.Lstat(current); err == nil && fi.Mode()&os.ModeSymlink != 0 {
-				if target, err := os.Readlink(current); err == nil {
-					if !filepath.IsAbs(target) {
-						target = filepath.Join(filepath.Dir(current), target)
-					}
-					return filepath.Join(append([]string{resolvePathSymlinksDepth(target, depth+1)}, trailing...)...)
-				}
-			}
-		}
-		parent := filepath.Dir(current)
-		if parent == current {
-			return filepath.Join(append([]string{current}, trailing...)...)
-		}
-		trailing = append([]string{filepath.Base(current)}, trailing...)
-		current = parent
+// databaseFilesystemIdentity returns a stable short identifier for the physical
+// database a config points at, keyed by the file's device and inode. Any
+// spelling of one physical file — bare path, file: URI, symlink, hard link, or
+// a differently cased name on a case-insensitive volume — yields the same
+// identity, because os.Stat follows symlinks and reports the target's inode.
+// The database file is created if it does not yet exist so the identity is
+// stable across the first-boot boundary (before and after SQLite creates it).
+func databaseFilesystemIdentity(cfgStorageDBPath string) (string, error) {
+	path := databaseFilesystemPath(cfgStorageDBPath)
+	if err := ensureDatabaseFileExists(path); err != nil {
+		return "", err
 	}
-}
-
-// isInMemoryDatabase reports whether dbPath describes a private in-memory
-// SQLite database rather than a file on disk. Each daemon that opens such a
-// database owns an independent schema that no other process can reach or
-// migrate, so a filesystem attach lock would only falsely serialize independent
-// daemons (every :memory: daemon launched from the same working directory maps
-// to one lock and the second is rejected). The attach lock is therefore skipped
-// for these DSNs.
-func isInMemoryDatabase(dbPath string) bool {
-	dbPath = strings.TrimSpace(dbPath)
-	if dbPath == ":memory:" {
-		return true
-	}
-	if !strings.HasPrefix(dbPath, "file:") {
-		return false
-	}
-	parsed, err := url.Parse(dbPath)
+	info, err := os.Stat(path)
 	if err != nil {
-		return false
+		return "", err
 	}
-	// "file::memory:" carries :memory: in Opaque (Path is empty), while a
-	// path-form URI would carry it in Path; accept either. The mode=memory
-	// query also marks a URI as in-memory regardless of its name.
-	if parsed.Path == ":memory:" || parsed.Opaque == ":memory:" {
-		return true
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		// Non-Unix fallback: hash the absolute path. This build already
+		// requires syscall.Flock (Unix), so this branch is unreachable in
+		// supported deployments but keeps the function total.
+		abs, _ := filepath.Abs(path)
+		sum := sha256.Sum256([]byte(filepath.ToSlash(abs)))
+		return hex.EncodeToString(sum[:8]), nil
 	}
-	return strings.EqualFold(parsed.Query().Get("mode"), "memory")
+	h := sha256.New()
+	fmt.Fprintf(h, "%d:%d", stat.Dev, stat.Ino)
+	return hex.EncodeToString(h.Sum(nil)[:8]), nil
 }
 
-// canonicalDatabaseIdentity returns a stable short identifier for the physical
-// database a config points at. Aliased spellings of one database resolve to the
-// same identity.
-func canonicalDatabaseIdentity(cfgStorageDBPath string) string {
-	sum := sha256.Sum256([]byte(filepath.ToSlash(resolvedDatabasePath(cfgStorageDBPath))))
-	return hex.EncodeToString(sum[:8])
-}
-
-func daemonLockPath(cfgStorageDBPath, name string) string {
-	return filepath.Join(filepath.Dir(resolvedDatabasePath(cfgStorageDBPath)), name)
+// ensureDatabaseFileExists creates the database file at path if it does not
+// already exist, including its parent directory. The file is created the same
+// way SQLite would create it — following a symlink at the leaf to its target —
+// so the inode os.Stat reports is the inode SQLite will subsequently open. An
+// empty file is a valid empty SQLite database, so creating it ahead of SQLite
+// does not change what SQLite opens.
+func ensureDatabaseFileExists(path string) error {
+	if _, err := os.Stat(path); err == nil {
+		return nil
+	}
+	parent := filepath.Dir(path)
+	if parent != "." && parent != "" {
+		if err := os.MkdirAll(parent, 0o755); err != nil {
+			return err
+		}
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	return file.Close()
 }
 
 type daemonLock struct {
@@ -344,12 +337,24 @@ type daemonLock struct {
 	file *os.File
 }
 
+// acquireDaemonLock opens the lock file at path, takes an exclusive flock, and
+// writes holder metadata. The lock directory is private (0700, daemon-owned,
+// see databaseAttachLockPath) so another user cannot plant a symlink at the
+// lock pathname. As defense in depth the file is opened with O_NOFOLLOW so a
+// symlink leaf is rejected rather than followed, and after opening the file is
+// verified to be a regular file owned by the daemon user before it is
+// truncated — refusing to truncate a file the daemon does not own or that is
+// not a regular file.
 func acquireDaemonLock(path, daemonID string, now time.Time) (*daemonLock, error) {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, err
 	}
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW, 0o644)
 	if err != nil {
+		return nil, err
+	}
+	if err := verifyLockFile(file); err != nil {
+		_ = file.Close()
 		return nil, err
 	}
 	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
@@ -370,6 +375,30 @@ func acquireDaemonLock(path, daemonID string, now time.Time) (*daemonLock, error
 		return nil, err
 	}
 	return &daemonLock{path: path, file: file}, nil
+}
+
+// verifyLockFile confirms the open lock file is a regular file owned by the
+// daemon user, so a planted symlink or a file owned by another user is never
+// truncated. O_NOFOLLOW already rejects a symlink leaf at open time; this also
+// covers the case where the lock file was replaced between open and use, and
+// the case of a non-regular file (e.g. a device node) a 0700 directory does
+// not by itself rule out for the daemon user.
+func verifyLockFile(file *os.File) error {
+	info, err := file.Stat()
+	if err != nil {
+		return err
+	}
+	if info.Mode().Type() != 0 {
+		return fmt.Errorf("lock file %s is not a regular file (mode %s)", file.Name(), info.Mode().String())
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return nil
+	}
+	if stat.Uid != uint32(os.Getuid()) {
+		return fmt.Errorf("lock file %s is owned by uid %d, not the daemon uid %d", file.Name(), stat.Uid, os.Getuid())
+	}
+	return nil
 }
 
 func (l *daemonLock) Release() error {

@@ -540,3 +540,54 @@ func readIntPragmaFromConnForTest(t *testing.T, conn *sql.Conn, query string) in
 
 	return value
 }
+
+// TestIsInMemoryDatabase covers the DSN classification that gates the runtime's
+// attach-lock skip. It is derived from the exact DSN sqliteDSN hands to SQLite,
+// so the runtime's skip decision and SQLite itself can never disagree:
+//
+//   - The untrimmed dbPath is used. "  :memory:  " is not the exact ":memory:"
+//     sqliteDSN recognizes, so SQLite opens a disk file with those spaces and
+//     IsInMemoryDatabase returns false — matching SQLite. Trimming would make
+//     the runtime skip the attach lock for a shared disk database.
+//
+//   - Duplicate query parameters use SQLite's last-value precedence, not
+//     url.Values.Get's first-value selection. "file:db?mode=memory&mode=rwc"
+//     is a disk database because SQLite applies the final mode=rwc.
+//
+// Each in-memory database is private to its daemon: no other process can reach
+// or migrate its schema, so a filesystem attach lock would only falsely
+// serialize independent daemons.
+func TestIsInMemoryDatabase(t *testing.T) {
+	t.Parallel()
+
+	truthy := []string{
+		":memory:",
+		"file::memory:",
+		"file::memory:?mode=memory",
+		"file::memory:?mode=memory&cache=shared",
+		"file:some-name?mode=memory",
+	}
+	for _, dbPath := range truthy {
+		if !IsInMemoryDatabase(dbPath) {
+			t.Errorf("IsInMemoryDatabase(%q) = false, want true", dbPath)
+		}
+	}
+
+	falsy := []string{
+		"",
+		"  :memory:  ",
+		"looper.sqlite",
+		"/tmp/shared.sqlite",
+		"file:/tmp/shared.sqlite",
+		"file:/tmp/shared.sqlite?cache=shared",
+		"file:shared.sqlite?mode=rwc",
+		// Duplicate mode: SQLite applies the last value (rwc), so this is a disk
+		// database even though the first mode is memory.
+		"file:dup.sqlite?mode=memory&mode=rwc",
+	}
+	for _, dbPath := range falsy {
+		if IsInMemoryDatabase(dbPath) {
+			t.Errorf("IsInMemoryDatabase(%q) = true, want false", dbPath)
+		}
+	}
+}

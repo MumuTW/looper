@@ -880,13 +880,23 @@ func (r *Runtime) start(ctx context.Context) error {
 	// migrate one daemon's schema, so a filesystem attach lock would only falsely
 	// serialize independent daemons (every :memory: daemon launched from the same
 	// working directory maps to one lock and the second is rejected). Skip it.
+	// The classification comes from storage.IsInMemoryDatabase so it matches the
+	// exact DSN OpenSQLiteDB hands to SQLite (no trimming; last-value query
+	// precedence), and the runtime can never skip the lock for a shared disk
+	// database that SQLite treats as a file.
 	var attachLock *daemonLock
-	if isInMemoryDatabase(r.config.Storage.DBPath) {
+	if storage.IsInMemoryDatabase(r.config.Storage.DBPath) {
 		if r.logger != nil {
 			r.logger.Info("database.attach.lock_skipped_in_memory", map[string]any{"dbPath": r.config.Storage.DBPath})
 		}
 	} else {
-		attachLockPath := databaseAttachLockPath(r.config.Storage.DBPath)
+		attachLockPath, err := databaseAttachLockPath(r.config.Storage.DBPath)
+		if err != nil {
+			if r.logger != nil {
+				r.logger.Warn("database.attach.lock_path_failed", map[string]any{"dbPath": r.config.Storage.DBPath, "error": err.Error()})
+			}
+			return err
+		}
 		attachLock, err = acquireDaemonLock(attachLockPath, r.webhook.daemonID, r.now())
 		if err != nil {
 			if r.logger != nil {
@@ -931,12 +941,20 @@ func (r *Runtime) start(ctx context.Context) error {
 	resourcesPublished := false
 	defer func() {
 		if !started && !resourcesPublished {
+			// Close the SQLite connection before releasing the attach lock. The
+			// attach lock guards the database lifetime: releasing it first would
+			// let a concurrent startup retry acquire the lock and begin
+			// migration while this failed instance still owns its SQLite
+			// connection, violating the invariant the lock exists to enforce.
+			// The webhook forwarder lock tracks forwarder ownership, not storage
+			// lifetime, so it is released alongside the attach lock after the
+			// connection is closed.
 			r.stopProjectDiscovery()
+			_ = coordinator.Close()
 			_ = attachLock.Release()
 			if lock != nil {
 				_ = lock.Release()
 			}
-			_ = coordinator.Close()
 		}
 	}()
 

@@ -159,6 +159,52 @@ func WithTransactionValue[T any](ctx context.Context, db txBeginner, options *sq
 	return result, err
 }
 
+// IsInMemoryDatabase reports whether dbPath opens a private in-memory SQLite
+// database rather than a file on disk. The classification is derived from the
+// exact DSN OpenSQLiteDB hands to SQLite (see sqliteDSN), not from a separate
+// interpretation of dbPath, so the runtime's attach-lock skip decision and
+// SQLite itself can never disagree:
+//
+//   - The untrimmed dbPath is used. A value like "  :memory:  " is not the
+//     exact ":memory:" sqliteDSN recognizes, so sqliteDSN turns it into a disk
+//     filename (with the spaces) and IsInMemoryDatabase returns false — matching
+//     SQLite. Trimming here would make the runtime skip the attach lock for a
+//     shared disk database.
+//
+//   - Duplicate query parameters use SQLite's last-value precedence, not
+//     url.Query().Get's first-value selection. "file:db?mode=memory&mode=rwc"
+//     is a disk database because SQLite applies the final mode=rwc; reading the
+//     first value would falsely classify it as in-memory.
+//
+// Each in-memory database is private to its daemon: no other process can reach
+// or migrate its schema, so a filesystem attach lock would only falsely
+// serialize independent daemons. Callers skip the attach lock when this returns
+// true.
+func IsInMemoryDatabase(dbPath string) bool {
+	dsn := sqliteDSN(dbPath)
+	// sqliteDSN maps ":memory:" to "file::memory:?mode=memory&..."; a URI whose
+	// path/opaque is :memory: likewise opens an in-memory database.
+	if strings.HasPrefix(dsn, "file::memory:") {
+		return true
+	}
+	parsed, err := url.Parse(dsn)
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(lastQueryValue(parsed.Query(), "mode"), "memory")
+}
+
+// lastQueryValue returns the last value for key in values, matching SQLite's
+// last-value precedence for duplicate query parameters. url.Values is a
+// map[string][]string preserving insertion order within a key.
+func lastQueryValue(values url.Values, key string) string {
+	vs := values[key]
+	if len(vs) == 0 {
+		return ""
+	}
+	return vs[len(vs)-1]
+}
+
 func ensureSQLiteParentDir(dbPath string) error {
 	if dbPath == "" || dbPath == ":memory:" || strings.HasPrefix(dbPath, "file:") {
 		return nil
