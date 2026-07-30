@@ -790,6 +790,70 @@ conditions — notably **not** unresolved review threads or requested changes.
 ladder and retires `roles.reviewer.autoMerge`; until `auto` exists, Reviewer's
 setting remains the only way Looper merges anything.
 
+## Deploy on merge (`roles.deployer`)
+
+When a project's base branch moves, the deployer runs one configured command
+**against a checkout of that exact commit** and reports the result. It is
+agent-free: Looper does not interpret the command, judge success beyond its exit
+status, or roll anything back.
+
+| Path | Purpose | Default |
+| --- | --- | --- |
+| `roles.deployer.enabled` | Enables the lane | `false` |
+| `roles.deployer.command` | Run with `/bin/sh -c` from the materialized checkout | — (required when enabled) |
+| `roles.deployer.timeoutSeconds` | Bounds one deploy, and how long an unfinished one holds its commit | `900` |
+| `roles.deployer.environment` | Extra environment for the command | none |
+
+Project overrides use `projects[].roles.deployer.*`, which is the common case: a
+deploy command differs per repository. Configuration is validated at startup —
+enabling deploys with no command fails immediately rather than on the first merge.
+
+### Exact-commit materialization
+
+The command does **not** run in the project's own checkout. That directory holds
+whatever it happens to hold — another branch, stale contents, uncommitted edits —
+so running there and then recording the remote commit as deployed would make the
+deployment record untrue.
+
+Instead Looper fetches the exact commit, creates a detached worktree at it,
+verifies `HEAD` really is that commit, runs the command there, and removes the
+worktree afterwards. The checkout path is derived from the commit, so a retry
+after an interruption repairs the same directory rather than accumulating new
+ones.
+
+### What counts as already deployed
+
+**GitHub Deployments are the authority**, under the `looper` environment — the
+same preference for forge-native state as the dependency gate (ADR-0004) and
+auto-merge (ADR-0005).
+
+| State | Action |
+| --- | --- |
+| No deployment | Deploy |
+| `success` | Nothing |
+| `failure` | **Nothing.** A deploy that fails tends to keep failing; retrying every tick turns one broken deploy into a stream. Re-running is your call |
+| `in_progress`, within the window | Nothing — a deploy is running |
+| `in_progress`, past twice the timeout | Deploy. The daemon that claimed it is gone, and refusing forever would strand the commit |
+
+The deployment is created and immediately marked `in_progress` **before** the
+command runs. Without that claim an interrupted deploy is indistinguishable from
+one that never started. The abandonment window is the one case where Looper acts
+on a record it did not finish writing, so it is bounded explicitly.
+
+Because the unit of work is a commit rather than a pull request, several PRs
+merging together produce **one** deploy of the resulting head.
+
+### Output handling
+
+A deploy command's output is the most credential-dense text this daemon handles:
+tokens, signed URLs, connection strings. It is therefore written to a `0600` file
+under `daemon.logDir/deploys/` and **never** placed in the notification body or
+the deployment status description, both of which are published. The notification
+carries the exit code, a compare link, and the log path.
+
+Compare links use the repository's own host, so an enterprise install links to its
+own domain rather than github.com.
+
 ## Project override rules
 
 Project entries stay in `projects[]`, but any override-bearing config must mirror the same local shape it uses globally.

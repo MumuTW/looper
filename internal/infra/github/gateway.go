@@ -3629,6 +3629,12 @@ func hostQualifiedRepo(nameWithOwner string, repoURL string) string {
 	return parsed.Hostname() + "/" + repo
 }
 
+// SplitRepoHostname exposes the enterprise-host split so callers building URLs
+// for a repository do not have to assume github.com.
+func SplitRepoHostname(repo string) (hostname, slug string) {
+	return splitRepoHostname(repo)
+}
+
 func splitRepoHostname(repo string) (string, string) {
 	parts := strings.Split(strings.TrimSpace(repo), "/")
 	if len(parts) == 3 && strings.TrimSpace(parts[0]) != "" {
