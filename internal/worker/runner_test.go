@@ -20,6 +20,13 @@ import (
 	"github.com/nexu-io/looper/internal/storage"
 )
 
+func buildWorkerPrompt(repoRootPath string, work workerInput, plan *checkpointPlan, allowAgentPRCreation bool, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string) (string, error) {
+	cfg, _ := config.Normalize("")
+	cfg.Instructions.Enabled = false
+	prompt, _, err := buildWorkerPromptWithInstructions(repoRootPath, "", cfg, work, plan, allowAgentPRCreation, disclosureCfg, agentRuntime, agentModel)
+	return prompt, err
+}
+
 func TestProcessNextIgnoresOtherQueueTypes(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

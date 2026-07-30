@@ -577,40 +577,6 @@ func worktreePathMatchesPR(worktreePath string, prNumber int64) bool {
 	return base == fmt.Sprintf("pr-%d", prNumber)
 }
 
-func worktreePathHasPRMarker(worktreePath string) bool {
-	_, ok := worktreePathEmbeddedPR(worktreePath)
-	return ok
-}
-
-// worktreePathEmbeddedPR extracts pr-<N> from a CreateWorktree directory base name.
-func worktreePathEmbeddedPR(worktreePath string) (int64, bool) {
-	base := filepath.Base(strings.TrimSpace(worktreePath))
-	if base == "" || base == "." {
-		return 0, false
-	}
-	// Bare pr-<N>
-	var bare int64
-	if _, err := fmt.Sscanf(base, "pr-%d", &bare); err == nil && bare > 0 && base == fmt.Sprintf("pr-%d", bare) {
-		return bare, true
-	}
-	// …-pr-<N> or …-pr-<N>-detached
-	const marker = "-pr-"
-	idx := strings.LastIndex(base, marker)
-	if idx < 0 {
-		return 0, false
-	}
-	rest := base[idx+len(marker):]
-	rest = strings.TrimSuffix(rest, "-detached")
-	var n int64
-	if _, err := fmt.Sscanf(rest, "%d", &n); err != nil || n <= 0 {
-		return 0, false
-	}
-	if rest != fmt.Sprintf("%d", n) {
-		return 0, false
-	}
-	return n, true
-}
-
 func pickUniqueActiveWorktree(matches []storage.WorktreeRecord) *storage.WorktreeRecord {
 	switch len(matches) {
 	case 0:

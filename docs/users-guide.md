@@ -542,14 +542,25 @@ Today:
 
 Looper uses `gh` for GitHub access, so `gh auth status` should succeed before planner / reviewer / fixer / worker workflows run under `looperd`.
 
-If the daemon is configured with `server.authMode=local-token`, CLI control verbs need a matching token (`server.localToken` / `LOOPER_TOKEN` depending on how you invoke the client).
+If the daemon is configured with `server.authMode=local-token`, CLI requests need a matching token. `LOOPER_TOKEN` overrides `server.localToken` through normal environment precedence for whichever Looper process receives it; it is never written back to the config file.
 
 Example:
 
 ```bash
 export LOOPER_TOKEN=replace-me
-curl -sS "http://127.0.0.1:17310/api/v1/status"
+looper dashboard
+# Open the one-shot /dashboard/?code=… URL printed above.
 ```
+
+For a copy/paste-only flow without the helper, mint the same one-shot code explicitly (the response is a JSON envelope), then append its `data.code` value to `/dashboard/?code=`:
+
+```bash
+curl -sS -X POST \
+  -H "Authorization: Bearer $LOOPER_TOKEN" \
+  "http://127.0.0.1:17310/api/v1/dashboard/bootstrap/code"
+```
+
+Codes are short-lived and single-use. The browser exchanges the code for a token kept in session storage; the long-lived token is never placed in the URL.
 
 This is separate from GitHub authentication.
 

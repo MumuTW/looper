@@ -201,11 +201,6 @@ func stopAllLoopsForRequest(ctx context.Context, services looperdruntime.Service
 	return stopAllLoops(context.WithoutCancel(ctx), services, reason, now, signal, executionMatchesProcess)
 }
 
-func runtimeConfigMetadata(rt *looperdruntime.Runtime) looperdapi.ConfigMetadata {
-	_, status := rt.ConfigSnapshot()
-	return runtimeConfigMetadataFromStatus(status)
-}
-
 func runtimeConfigMetadataFromStatus(status looperdruntime.ConfigReloadStatus) looperdapi.ConfigMetadata {
 	rejectedPaths := publicConfigRejectedPaths(status.RejectedPaths)
 	lastError := sanitizeConfigDiagnostic(status.LastError, status.RejectedPaths)

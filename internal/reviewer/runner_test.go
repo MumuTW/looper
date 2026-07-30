@@ -26,6 +26,25 @@ import (
 	"github.com/nexu-io/looper/internal/worktreesafety"
 )
 
+func (r *Runner) listOpenPullRequestsForDiscovery(ctx context.Context, repo, cwd string, limit int) ([]PullRequestSummary, error) {
+	currentLogin := ""
+	if r.discoveryPolicy.RequireReviewRequest {
+		login, err := r.github.GetCurrentUserLogin(ctx, repo, cwd)
+		if err != nil {
+			return nil, err
+		}
+		currentLogin = normalizeLogin(login)
+	}
+	return r.listOpenPullRequestsForDiscoveryWithPolicy(ctx, repo, cwd, limit, r.discoveryPolicy, currentLogin)
+}
+
+func buildReviewPrompt(repo string, prNumber int64, checkpoint reviewerCheckpoint, runID string, idempotencyKey string, reviewEvents config.ReviewerReviewEventsConfig, manual bool, scope config.ReviewerScope, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string, looperCLIPath string) string {
+	cfg, _ := config.Normalize("")
+	cfg.Instructions.Enabled = false
+	prompt, _ := buildReviewPromptWithInstructions("", cfg, repo, prNumber, checkpoint, runID, idempotencyKey, reviewEvents, manual, true, "", scope, disclosureCfg, agentRuntime, agentModel, looperCLIPath, false)
+	return prompt
+}
+
 func TestDiscoverPullRequestsCreatesLoopAndQueue(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -7051,8 +7070,8 @@ func TestExecuteStepPreservesFinalTransientFailureAfterRetryExhaustion(t *testin
 func TestIsTransientExternalFailureDetectsWrappedGitHubStatus(t *testing.T) {
 	runner := New(Options{})
 	err := &loopError{message: "GraphQL request failed with HTTP 504", kind: FailureRetryableTransient}
-	if !runner.isTransientExternalFailure(err) {
-		t.Fatal("isTransientExternalFailure(wrapped HTTP 504) = false, want true")
+	if !runner.isTransientExternalFailureForProject("", err) {
+		t.Fatal("isTransientExternalFailureForProject(wrapped HTTP 504) = false, want true")
 	}
 }
 
@@ -7060,24 +7079,24 @@ func TestUnknownBoundaryDoesNotRetryExternalLookingCommandError(t *testing.T) {
 	err := &shell.CommandExecutionError{Message: "Command exited with code 1", Result: shell.Result{Stderr: `Post "https://api.github.com/graphql": EOF`}}
 
 	defaultRunner := New(Options{})
-	if got := defaultRunner.classifyFailure(err); got.kind != FailureNonRetryable {
-		t.Fatalf("default classifyFailure() kind = %s, want %s", got.kind, FailureNonRetryable)
+	if got := defaultRunner.classifyFailureForProject("", err); got.kind != FailureNonRetryable {
+		t.Fatalf("default classifyFailureForProject() kind = %s, want %s", got.kind, FailureNonRetryable)
 	}
-	if defaultRunner.isTransientExternalFailure(err) {
-		t.Fatal("default isTransientExternalFailure() = true, want false")
+	if defaultRunner.isTransientExternalFailureForProject("", err) {
+		t.Fatal("default isTransientExternalFailureForProject() = true, want false")
 	}
 
 	boundaryErr := failureclass.WithBoundary(err, failureclass.BoundaryGitHubAPI)
-	if got := defaultRunner.classifyFailure(boundaryErr); got.kind != FailureRetryableTransient {
-		t.Fatalf("boundary classifyFailure() kind = %s, want %s", got.kind, FailureRetryableTransient)
+	if got := defaultRunner.classifyFailureForProject("", boundaryErr); got.kind != FailureRetryableTransient {
+		t.Fatalf("boundary classifyFailureForProject() kind = %s, want %s", got.kind, FailureRetryableTransient)
 	}
 
 	enabledRunner := New(Options{RetryPolicy: config.ReviewerRetryConfig{EnhancedTransientClassification: true}})
-	if got := enabledRunner.classifyFailure(err); got.kind != FailureRetryableTransient {
-		t.Fatalf("enabled classifyFailure() kind = %s, want %s", got.kind, FailureRetryableTransient)
+	if got := enabledRunner.classifyFailureForProject("", err); got.kind != FailureRetryableTransient {
+		t.Fatalf("enabled classifyFailureForProject() kind = %s, want %s", got.kind, FailureRetryableTransient)
 	}
-	if !enabledRunner.isTransientExternalFailure(err) {
-		t.Fatal("enabled isTransientExternalFailure() = false, want true")
+	if !enabledRunner.isTransientExternalFailureForProject("", err) {
+		t.Fatal("enabled isTransientExternalFailureForProject() = false, want true")
 	}
 }
 
@@ -7087,8 +7106,8 @@ func TestEnhancedTransientClassificationHonorsExtraPatterns(t *testing.T) {
 		EnhancedTransientClassification: true,
 		ExtraTransientErrorPatterns:     []string{"temporarily unavailable"},
 	}})
-	if got := runner.classifyFailure(err); got.kind != FailureRetryableTransient {
-		t.Fatalf("classifyFailure() kind = %s, want %s", got.kind, FailureRetryableTransient)
+	if got := runner.classifyFailureForProject("", err); got.kind != FailureRetryableTransient {
+		t.Fatalf("classifyFailureForProject() kind = %s, want %s", got.kind, FailureRetryableTransient)
 	}
 }
 
@@ -7102,8 +7121,8 @@ func TestIsTransientExternalFailureDetectsModelProviderHTTPAndNetworkFailures(t 
 		"anthropic request failed with HTTP 529",
 		"anthropic request failed with status code: 429",
 	} {
-		if !runner.isTransientExternalFailure(fmt.Errorf("%s", message)) {
-			t.Fatalf("isTransientExternalFailure(%q) = false, want true", message)
+		if !runner.isTransientExternalFailureForProject("", fmt.Errorf("%s", message)) {
+			t.Fatalf("isTransientExternalFailureForProject(%q) = false, want true", message)
 		}
 	}
 }

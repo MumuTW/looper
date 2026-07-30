@@ -1623,10 +1623,6 @@ func (g *Gateway) ViewPullRequestForGatekeeper(ctx context.Context, input ViewPu
 	return g.viewPullRequestWithFields(ctx, input, prViewGatekeeperJSONFields, false, false)
 }
 
-func (g *Gateway) viewPullRequestRaw(ctx context.Context, input ViewPullRequestInput) (PullRequestDetail, error) {
-	return g.viewPullRequestWithFields(ctx, input, prViewMetadataJSONFields, false, false)
-}
-
 func (g *Gateway) viewPullRequestWithFields(ctx context.Context, input ViewPullRequestInput, fields []string, includeReviewThreads bool, includeIssueComments bool) (PullRequestDetail, error) {
 	row, err := g.viewPullRequestRow(ctx, input, fields)
 	if err != nil && IsInaccessibleReviewRequestReviewerError(err) {
@@ -2537,10 +2533,6 @@ func (g *Gateway) fetchReviewCommentBodies(ctx context.Context, repo string, prN
 	return bodies, nil
 }
 
-func jsonBodiesContainAllowedReviewMarker(raw string, marker string, allowedReviewEvents []string) bool {
-	return findAllowedReviewMarker(raw, marker, allowedReviewEvents, "", false).Found
-}
-
 func findAllowedReviewMarker(raw string, marker string, allowedReviewEvents []string, authorLogin string, allowCleanComment bool) ReviewMarkerResult {
 	expectedAuthorLogin := normalizeReviewMarkerLogin(authorLogin)
 	var rows []map[string]any
@@ -2629,13 +2621,6 @@ func normalizeReviewMarkerLogin(login string) string {
 	return strings.ToLower(strings.TrimSpace(login))
 }
 
-func reviewMarkerOutcome(body string, marker string) string {
-	if parsedMarker, ok := findReviewIdempotencyMarker(body, marker); ok {
-		return parsedMarker.Outcome
-	}
-	return ""
-}
-
 type reviewIdempotencyMarker struct {
 	ID      string
 	Head    string
@@ -2707,11 +2692,6 @@ func (m reviewIdempotencyMarker) matches(marker string) bool {
 		return false
 	}
 	return strings.HasPrefix(marker, "looper:review") || strings.Contains(marker, "id=") || strings.Contains(marker, "head=") || strings.Contains(marker, "outcome=")
-}
-
-func reviewStateAllowed(raw any, allowedReviewEvents []string) bool {
-	event := reviewEventFromStateString(raw)
-	return reviewEventAllowed(event, allowedReviewEvents)
 }
 
 func reviewEventFromStateString(raw any) string {
@@ -3024,13 +3004,6 @@ func (g *Gateway) IsAuthenticated(ctx context.Context, cwd, hostname string) (bo
 	return false, err
 }
 
-func (g *Gateway) GetCurrentUserLogin(ctx context.Context, cwd string) (string, error) {
-	if snapshot := discoverySnapshotFromContext(ctx); snapshot != nil {
-		return snapshot.getCurrentUserLogin(ctx, cwd)
-	}
-	return g.getCurrentUserLoginRaw(ctx, cwd)
-}
-
 func (g *Gateway) GetCurrentUserIdentity(ctx context.Context, cwd string) (CurrentUserIdentity, error) {
 	result, err := g.runGh(ctx, cwd, "", "api", "user", "--jq", `{login: .login, id: .id}`)
 	if err != nil {
@@ -3048,17 +3021,6 @@ func (g *Gateway) GetCurrentUserIdentity(ctx context.Context, cwd string) (Curre
 		return CurrentUserIdentity{}, err
 	}
 	return CurrentUserIdentity{Login: strings.TrimSpace(asString(row["login"])), NumericID: asInt64(row["id"])}, nil
-}
-
-func (g *Gateway) getCurrentUserLoginRaw(ctx context.Context, cwd string) (string, error) {
-	result, err := g.runGh(ctx, cwd, "", "api", "user", "--jq", ".login")
-	if err != nil {
-		if isUserLoginUnsupportedForCurrentToken(err) {
-			return "", nil
-		}
-		return "", err
-	}
-	return strings.TrimSpace(result.Stdout), nil
 }
 
 func (g *Gateway) GetCurrentUserLoginForRepo(ctx context.Context, repo string, cwd string) (string, error) {
@@ -4171,14 +4133,6 @@ func extractLabelNamesFromConnection(value any) []string {
 		return []string{}
 	}
 	return extractLabelNames(row["nodes"])
-}
-
-func extractReviewNodesFromConnection(value any) []map[string]any {
-	row, _ := value.(map[string]any)
-	if row == nil {
-		return []map[string]any{}
-	}
-	return toObjectSlice(row["nodes"])
 }
 
 func normalizeGitHubLogin(login string) string {

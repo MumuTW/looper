@@ -32,11 +32,12 @@ function bootstrapRouteAbsent(): Response {
 
 function stubDaemon(
   exchange: () => Response,
+  health: () => Response = () => response({ healthy: true }),
 ): ReturnType<typeof vi.fn> {
   const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
     const path = String(input);
     if (path === "/api/v1/dashboard/bootstrap/exchange") return exchange();
-    if (path === "/api/v1/healthz") return response({ healthy: true });
+    if (path === "/api/v1/healthz") return health();
     if (path === "/api/v1/runs/active") return response({ items: [] });
     if (path === "/api/v1/projects") return response({ items: [] });
     if (path.startsWith("/api/v1/loops")) return response({ items: [] });
@@ -65,24 +66,101 @@ describe("bootstrap code exchange", () => {
     render(<App />);
 
     expect(await screen.findByRole("navigation")).toBeTruthy();
-    expect(screen.queryByText("Bootstrap failed")).toBeNull();
+    expect(screen.queryByText("Dashboard login required")).toBeNull();
     expect(sessionStorage.getItem("looper.dashboard.token")).toBeNull();
   });
 
   it("reports a rejected code when the daemon does serve the route", async () => {
     window.history.replaceState({}, "", "/dashboard/?code=expired");
-    stubDaemon(() =>
-      response({ code: "UNAUTHORIZED", message: "Invalid bootstrap code" }, 401),
+    stubDaemon(
+      () => response({ code: "UNAUTHORIZED", message: "Invalid bootstrap code" }, 401),
+      () =>
+        response(
+          { code: "UNAUTHORIZED", message: "Authorization token is required" },
+          401,
+        ),
     );
 
     render(<App />);
 
     expect(
-      await screen.findByRole("heading", { name: "Bootstrap failed" }),
+      await screen.findByRole("heading", { name: "Dashboard login required" }),
     ).toBeTruthy();
     expect(screen.getByText(/Invalid bootstrap code/)).toBeTruthy();
-		expect(screen.getByText(/may indicate an expired code/)).toBeTruthy();
-		expect(screen.queryByText(/It answered, so/)).toBeNull();
+    expect(screen.getByText(/missing or expired code/)).toBeTruthy();
+    expect(screen.getByText("looper dashboard")).toBeTruthy();
+    expect(screen.getByText("LOOPER_TOKEN")).toBeTruthy();
+  });
+
+  it("points an unauthenticated local-token browser to the CLI login flow", async () => {
+    window.history.replaceState({}, "", "/dashboard/");
+    stubDaemon(
+      () => response({ token: "unused" }),
+      () =>
+        response(
+          { code: "UNAUTHORIZED", message: "Authorization token is required" },
+          401,
+        ),
+    );
+
+    render(<App />);
+
+    expect(
+      await screen.findByRole("heading", { name: "Dashboard login required" }),
+    ).toBeTruthy();
+    expect(screen.getByText(/Authorization token is required/)).toBeTruthy();
+    expect(screen.getByText("looper dashboard")).toBeTruthy();
+    expect(screen.queryByRole("navigation")).toBeNull();
+  });
+
+  it("keeps a valid restored token when a stale bootstrap code is rejected", async () => {
+    window.history.replaceState({}, "", "/dashboard/?code=expired");
+    sessionStorage.setItem("looper.dashboard.token", "still-valid");
+    stubDaemon(
+      () => response({ code: "UNAUTHORIZED", message: "Invalid bootstrap code" }, 401),
+      () => response({ healthy: true }),
+    );
+
+    render(<App />);
+
+    expect(await screen.findByRole("navigation")).toBeTruthy();
+    expect(sessionStorage.getItem("looper.dashboard.token")).toBe("still-valid");
+    expect(screen.queryByText("Dashboard login required")).toBeNull();
+  });
+
+  it("leaves transient health failures to the dashboard retry surface", async () => {
+    window.history.replaceState({}, "", "/dashboard/?code=fresh");
+    stubDaemon(
+      () => response({ token: "tok_local" }),
+      () => response({ code: "INTERNAL", message: "temporarily unavailable" }, 503),
+    );
+
+    render(<App />);
+
+    expect(await screen.findByRole("navigation")).toBeTruthy();
+    expect(screen.queryByText("Dashboard login required")).toBeNull();
+  });
+
+  it("clears a rejected restored token and points back to the login flow", async () => {
+    window.history.replaceState({}, "", "/dashboard/");
+    sessionStorage.setItem("looper.dashboard.token", "stale-token");
+    stubDaemon(
+      () => response({ token: "unused" }),
+      () =>
+        response(
+          { code: "UNAUTHORIZED", message: "Authorization token is required" },
+          401,
+        ),
+    );
+
+    render(<App />);
+
+    expect(
+      await screen.findByRole("heading", { name: "Dashboard login required" }),
+    ).toBeTruthy();
+    expect(sessionStorage.getItem("looper.dashboard.token")).toBeNull();
+    expect(screen.getByText("looper dashboard")).toBeTruthy();
+    expect(screen.queryByRole("navigation")).toBeNull();
   });
 
   it("stores the session token when the exchange succeeds", async () => {
@@ -110,8 +188,8 @@ describe("triage confirmation status", () => {
               awaitingConfirmation: {
                 count: 2,
                 sources: [
-                  { repo: "acme/looper", issueNumber: 42, createdAt: "2026-07-30T10:30:00Z", ageSeconds: 5400 },
-                  { repo: "acme/looper", issueNumber: 43, createdAt: "2026-07-30T11:45:00Z", ageSeconds: 900 },
+                  { repo: "acme/looper", issueNumber: 42, createdAt: "2026-07-30T10:30:00Z", ageSeconds: 5400, command: "/plan triage-confirm-a1" },
+                  { repo: "acme/looper", issueNumber: 43, createdAt: "2026-07-30T11:45:00Z", ageSeconds: 900, command: "/plan triage-confirm-b2" },
                 ],
               },
             },
@@ -135,5 +213,9 @@ describe("triage confirmation status", () => {
     expect(screen.getByText(/acme\/looper#43/)).toBeTruthy();
     expect(screen.getByText(/waiting 1h/)).toBeTruthy();
     expect(screen.getByText(/waiting 15m/)).toBeTruthy();
+    // Without the token an operator can see the wait but cannot end it (#255).
+    expect(screen.getByText("/plan triage-confirm-a1")).toBeTruthy();
+    expect(screen.getByText("/plan triage-confirm-b2")).toBeTruthy();
+    expect(screen.getAllByRole("button", { name: /copy/i })).toHaveLength(2);
   });
 });

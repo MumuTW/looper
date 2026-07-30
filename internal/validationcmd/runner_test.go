@@ -12,6 +12,8 @@ import (
 	"github.com/nexu-io/looper/internal/processsandbox"
 )
 
+const permissionProfile = "looper-validation"
+
 func TestBuildPermissionProfileDeniesNetworkAndLimitsWrites(t *testing.T) {
 	t.Setenv("PATH", "/usr/bin:/opt/tools/bin")
 	t.Setenv("GOMODCACHE", "/cache/go-mod")

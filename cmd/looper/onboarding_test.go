@@ -234,7 +234,7 @@ func TestUsageListsEveryImplementedVerb(t *testing.T) {
 	buffer := &bytes.Buffer{}
 	usage(buffer)
 	for _, verb := range []string{
-		"looper init", "looper status", "looper project add", "looper project list",
+		"looper init", "looper status", "looper dashboard", "looper project add", "looper project list",
 		"looper stop", "looper close", "looper takeover", "looper handback",
 		"looper retry", "looper start", "looper pause", "looper respond",
 		"looper version",
@@ -1043,13 +1043,15 @@ func TestStatusListsSourcesAwaitingTriageConfirmation(t *testing.T) {
 		Triage: statusTriageView{AwaitingConfirmation: statusAwaitingConfirmationView{
 			Count: 2,
 			Sources: []statusAwaitingConfirmationSourceView{
-				{Repo: "MumuTW/looper", IssueNumber: 255, AgeSeconds: 26 * 60},
+				{Repo: "MumuTW/looper", IssueNumber: 255, AgeSeconds: 26 * 60, Command: "/plan triage-confirm-a1"},
+				// A source the daemon reported without a token keeps its line but
+				// drops the command clause: nobody could confirm it anyway.
 				{Repo: "MumuTW/looper", IssueNumber: 254, AgeSeconds: 3 * 60 * 60},
 			},
 		}},
 	}})
 	want := "triage:  awaitingHumanConfirmation=2\n" +
-		"  - MumuTW/looper#255  waiting 26m\n" +
+		"  - MumuTW/looper#255  waiting 26m  ->  comment \"/plan triage-confirm-a1\" on the issue\n" +
 		"  - MumuTW/looper#254  waiting 3h\n"
 	if got := stdout.String(); got != want {
 		t.Fatalf("status output =\n%q\nwant\n%q", got, want)

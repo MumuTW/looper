@@ -33,10 +33,10 @@ func TestClassifyStartupProbeEvidenceNeverConfirmedDeadFromPID(t *testing.T) {
 			if got.Class != tc.want || got.Reason != tc.reason {
 				t.Fatalf("classify = %#v, want class=%s reason=%s", got, tc.want, tc.reason)
 			}
-			if classificationAllowsTerminalOrRequeue(got.Class) {
+			if got.Class == ContainmentConfirmedDead {
 				t.Fatalf("probe class %s must not allow terminal/requeue", got.Class)
 			}
-			if got.Class != ContainmentObservedLive && !classificationRequiresQuarantine(got.Class) {
+			if got.Class != ContainmentObservedLive && got.Class != ContainmentUncertain {
 				t.Fatalf("non-live class %s must require quarantine", got.Class)
 			}
 		})
@@ -51,7 +51,7 @@ func TestClassifyConfirmedDeadOnlyFromDurableTerminalOrCurrentHandle(t *testing.
 	if !ok || class.Class != ContainmentConfirmedDead || class.Reason != "durable_terminal_finalization" {
 		t.Fatalf("terminal classification = %#v ok=%v", class, ok)
 	}
-	if !classificationAllowsTerminalOrRequeue(class.Class) {
+	if class.Class != ContainmentConfirmedDead {
 		t.Fatal("confirmed_dead must allow terminal authority path")
 	}
 

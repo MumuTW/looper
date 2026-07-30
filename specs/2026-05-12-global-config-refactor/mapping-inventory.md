@@ -93,7 +93,6 @@ Status meanings:
 | `LOOPER_WORKING_DIRECTORY` | `daemon.workingDirectory` | unchanged | |
 | `LOOPER_IN_APP_NOTIFICATIONS` | `notifications.inApp` | unchanged | |
 | `LOOPER_OSASCRIPT_ENABLED` | `notifications.osascript.enabled` | unchanged | |
-| `LOOPER_AUTO_UPGRADE_ENABLED` | `package.autoUpgradeEnabled` | unchanged | |
 | `LOOPER_AGENT_NATIVE_RESUME_ENABLED` | `agent.nativeResume.enabled` | unchanged | |
 | `LOOPER_AGENT_TIMEOUTS_PLANNER_SECONDS` | `agent.timeouts.plannerSeconds` | unchanged | |
 | `LOOPER_AGENT_TIMEOUTS_WORKER_SECONDS` | `agent.timeouts.workerSeconds` | unchanged | |
@@ -181,7 +180,6 @@ Status meanings:
 | `--reviewer-min-publish-interval-seconds` | `roles.reviewer.behavior.loop.minPublishIntervalSeconds` | normalized-only | Legacy reviewer top-level name targeting canonical reviewer behavior. |
 | `--reviewer-max-iterations-per-pr` | `roles.reviewer.behavior.loop.maxIterationsPerPR` | deprecated | Reviewer filter ignores this legacy loop budget knob. |
 | `--reviewer-max-iterations-per-head` | `roles.reviewer.behavior.loop.maxIterationsPerHead` | deprecated | Reviewer filter ignores this legacy loop budget knob. |
-| `--no-auto-upgrade` | `package.autoUpgradeEnabled=false` | normalized-only | Inverted compatibility flag targeting the canonical package setting. |
 | `--no-custom-instructions` | `instructions.enabled=false` | normalized-only | Inverted compatibility flag targeting the canonical instruction-system setting. |
 
 ## Representative parity coverage

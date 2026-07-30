@@ -371,10 +371,12 @@ type WorktreeCleanupConfig struct {
 }
 
 type PackageConfig struct {
-	Distribution               string `json:"distribution"`
-	AutoUpgradeEnabled         bool   `json:"autoUpgradeEnabled"`
-	AutoMigrateOnStartup       bool   `json:"autoMigrateOnStartup"`
-	RequireBackupBeforeMigrate bool   `json:"requireBackupBeforeMigrate"`
+	Distribution string `json:"distribution"`
+	// DeprecatedAutoUpgradeEnabled only preserves daemon-to-CLI snapshot
+	// decoding across short-lived binary skew. Runtime never reads it.
+	DeprecatedAutoUpgradeEnabled bool `json:"autoUpgradeEnabled,omitempty"`
+	AutoMigrateOnStartup         bool `json:"autoMigrateOnStartup"`
+	RequireBackupBeforeMigrate   bool `json:"requireBackupBeforeMigrate"`
 }
 
 type NetworkMode string
@@ -901,10 +903,12 @@ type PartialWorktreeCleanupConfig struct {
 }
 
 type PartialPackageConfig struct {
-	Distribution               *string `json:"distribution,omitempty"`
-	AutoUpgradeEnabled         *bool   `json:"autoUpgradeEnabled,omitempty"`
-	AutoMigrateOnStartup       *bool   `json:"autoMigrateOnStartup,omitempty"`
-	RequireBackupBeforeMigrate *bool   `json:"requireBackupBeforeMigrate,omitempty"`
+	Distribution *string `json:"distribution,omitempty"`
+	// DeprecatedAutoUpgradeEnabled accepts legacy config files but Normalize
+	// intentionally ignores it, so it cannot reintroduce auto-upgrade behavior.
+	DeprecatedAutoUpgradeEnabled *bool `json:"autoUpgradeEnabled,omitempty"`
+	AutoMigrateOnStartup         *bool `json:"autoMigrateOnStartup,omitempty"`
+	RequireBackupBeforeMigrate   *bool `json:"requireBackupBeforeMigrate,omitempty"`
 }
 
 type PartialNetworkConfig struct {

@@ -399,7 +399,3 @@ func trimTargetPrefix(targetID string) string {
 	}
 	return normalized
 }
-
-func stringPointer(value string) *string {
-	return &value
-}
