@@ -108,24 +108,23 @@ type CodexReviewEvidence struct {
 }
 
 type Evidence struct {
-	PullRequestState             string                       `json:"pullRequestState,omitempty"`
-	Draft                        bool                         `json:"draft"`
-	BaseRefName                  string                       `json:"baseRefName,omitempty"`
-	Mergeable                    *bool                        `json:"mergeable,omitempty"`
-	MergeableState               string                       `json:"mergeableState,omitempty"`
-	RequiredChecks               []string                     `json:"requiredChecks"`
-	Checks                       []CheckEvidence              `json:"checks"`
-	RequiredApprovingReviewCount int                          `json:"requiredApprovingReviewCount"`
-	ReviewDecision               string                       `json:"reviewDecision,omitempty"`
-	CodexReview                  *CodexReviewEvidence         `json:"codexReview,omitempty"`
-	UnresolvedReviewThreadIDs    []string                     `json:"unresolvedReviewThreadIds"`
-	HoldLabels                   []string                     `json:"holdLabels"`
-	DiffBudget                   *DiffBudgetEvidence          `json:"diffBudget,omitempty"`
-	ReviewerConvergence          *ReviewerConvergenceEvidence `json:"reviewerConvergence,omitempty"`
-	ProjectPolicyPermitsTarget   bool                         `json:"projectPolicyPermitsTarget"`
-	FinalObservedHeadSHA         string                       `json:"finalObservedHeadSha,omitempty"`
-	CodexReviewOutcome           string                       `json:"codexReviewOutcome,omitempty"`
-	ReviewProvenance             ReviewProvenance             `json:"reviewProvenance,omitempty"`
+	PullRequestState             string               `json:"pullRequestState,omitempty"`
+	ClosedAt                     string               `json:"closedAt,omitempty"`
+	MergedAt                     string               `json:"mergedAt,omitempty"`
+	Draft                        bool                 `json:"draft"`
+	BaseRefName                  string               `json:"baseRefName,omitempty"`
+	Mergeable                    *bool                `json:"mergeable,omitempty"`
+	MergeableState               string               `json:"mergeableState,omitempty"`
+	RequiredChecks               []string             `json:"requiredChecks"`
+	Checks                       []CheckEvidence      `json:"checks"`
+	RequiredApprovingReviewCount int                  `json:"requiredApprovingReviewCount"`
+	ReviewDecision               string               `json:"reviewDecision,omitempty"`
+	CodexReview                  *CodexReviewEvidence `json:"codexReview,omitempty"`
+	UnresolvedReviewThreadIDs    []string             `json:"unresolvedReviewThreadIds"`
+	HoldLabels                   []string             `json:"holdLabels"`
+	DiffBudget                   *DiffBudgetEvidence  `json:"diffBudget,omitempty"`
+	ProjectPolicyPermitsTarget   bool                 `json:"projectPolicyPermitsTarget"`
+	FinalObservedHeadSHA         string               `json:"finalObservedHeadSha,omitempty"`
 }
 
 type Report struct {
@@ -481,6 +480,8 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 	}
 	report.ObservedHeadSHA = strings.TrimSpace(detail.HeadSHA)
 	report.Evidence.PullRequestState = strings.ToUpper(strings.TrimSpace(detail.State))
+	report.Evidence.ClosedAt = strings.TrimSpace(detail.ClosedAt)
+	report.Evidence.MergedAt = strings.TrimSpace(detail.MergedAt)
 	report.Evidence.Draft = detail.IsDraft
 	report.Evidence.BaseRefName = strings.TrimSpace(detail.BaseRefName)
 	report.Evidence.ReviewDecision = strings.ToUpper(strings.TrimSpace(detail.ReviewDecision))
@@ -1109,11 +1110,16 @@ func (r *Runner) persist(ctx context.Context, report Report) (Report, error) {
 	entityType := "pull_request"
 	entityID := fmt.Sprintf("%s#%d", report.Repo, report.PRNumber)
 	projectID := report.ProjectID
+	reportEventID := eventlog.NewEventID("event")
 	if err := eventlog.Append(ctx, r.repos, eventlog.AppendInput{
+		ID:        reportEventID,
 		EventType: GateReportEventType, ProjectID: &projectID, EntityType: &entityType, EntityID: &entityID,
 		Payload: report, CreatedAt: r.now(),
 	}); err != nil {
 		return Report{}, fmt.Errorf("persist gate report: %w", err)
+	}
+	if err := r.recordTerminalAdviceOutcomes(ctx, report, reportEventID); err != nil {
+		return Report{}, err
 	}
 	// The owned comment is reconciled after the durable report: the report is the
 	// record, the comment is a convenience for whoever is deciding. A forge that
