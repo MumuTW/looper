@@ -93,6 +93,9 @@ export function statusColor(status: string | null | undefined): string {
     s === "queued" ||
     s === "backing_off" ||
     s === "manual_intervention" ||
+    // A loop parked on a human decision is blocked, not broken: it reads as
+    // waiting everywhere, including the decision card that offers the answer.
+    s === "awaiting_human" ||
     s.includes("manual") ||
     s.includes("backoff")
   ) {

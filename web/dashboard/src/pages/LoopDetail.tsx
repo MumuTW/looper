@@ -7,6 +7,7 @@ import {
   type ReactNode,
 } from "react";
 import { Link, useParams } from "react-router-dom";
+import { HumanDecisionCard } from "@/components/HumanDecisionCard";
 import { LoopActionBar } from "@/components/LoopActionBar";
 import { PanelError } from "@/components/PanelError";
 import { StatusChip } from "@/components/StatusChip";
@@ -443,6 +444,16 @@ export function LoopDetailPage() {
           Refresh
         </Button>
       </div>
+
+      {/* The only blocking thing on this page — above every other panel. */}
+      {data ? (
+        <HumanDecisionCard
+          selector={String(data.seq)}
+          loopId={data.id}
+          metadataJson={data.metadataJson}
+          onResponded={onMutated}
+        />
+      ) : null}
 
       {data ? (
         <Card title="Actions">

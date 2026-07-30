@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatAttempts, truncateReason } from "./format";
+import { formatAttempts, statusColor, truncateReason } from "./format";
 
 describe("formatAttempts", () => {
   it("formats current/max including unlimited -1", () => {
@@ -38,5 +38,17 @@ describe("truncateReason", () => {
 
   it("does not truncate short text", () => {
     expect(truncateReason("dirty worktree", 64)).toBe("dirty worktree");
+  });
+});
+
+describe("statusColor", () => {
+  // awaiting_human is blocked on a person, not broken: it must not read the
+  // same as a failed loop anywhere, including the decision card.
+  it("colors awaiting_human as waiting, never as danger", () => {
+    expect(statusColor("awaiting_human")).toBe("var(--warn)");
+    expect(statusColor("AWAITING_HUMAN")).toBe("var(--warn)");
+    expect(statusColor("paused")).toBe("var(--warn)");
+    expect(statusColor("failed")).toBe("var(--danger)");
+    expect(statusColor("running")).toBe("var(--ok)");
   });
 });

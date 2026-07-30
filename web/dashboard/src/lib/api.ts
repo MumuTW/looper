@@ -246,6 +246,27 @@ export type LoopsList = {
   offset?: number;
 };
 
+export type LoopEvent = {
+  id: string;
+  eventType: string;
+  projectId?: string | null;
+  loopId?: string | null;
+  runId?: string | null;
+  entityType?: string | null;
+  entityId?: string | null;
+  /** Raw stored payload; authoritative when `payload` failed to parse. */
+  payloadJson: string;
+  createdAt: string;
+  /** Payload pre-parsed by the daemon; the raw string when it was not JSON. */
+  payload?: unknown;
+};
+
+export type EntityEventsList = {
+  entityType: string;
+  entityId: string;
+  items: LoopEvent[];
+};
+
 export type Project = {
   id: string;
   name: string;
@@ -445,6 +466,17 @@ export function fetchLoop(
   });
 }
 
+/** Event log for one loop, oldest first. Keyed by loop id, not seq. */
+export function fetchLoopEvents(
+  loopId: string,
+  signal?: AbortSignal,
+): Promise<EntityEventsList> {
+  return apiFetch<EntityEventsList>(
+    `/api/v1/events/loop/${encodeURIComponent(loopId)}`,
+    { signal },
+  );
+}
+
 export function fetchProjects(signal?: AbortSignal): Promise<ProjectsList> {
   return apiFetch<ProjectsList>("/api/v1/projects", { signal });
 }
@@ -581,6 +613,31 @@ export function takeoverLoop(
   return apiFetch<TakeoverResult>(
     `/api/v1/loops/${encodeURIComponent(selector)}/takeover`,
     { method: "POST", signal },
+  );
+}
+
+export type RespondLoopBody = {
+  answer: string;
+};
+
+/**
+ * Deliver a human answer to a loop suspended mid-run as awaiting_human. The
+ * daemon stores it on the loop's HITL metadata and transitions the loop back to
+ * running, so the caller should refetch the loop afterwards.
+ */
+export function respondToLoop(
+  selector: string,
+  answer: string,
+  signal?: AbortSignal,
+): Promise<Loop> {
+  const body: RespondLoopBody = { answer };
+  return apiFetch<Loop>(
+    `/api/v1/loops/${encodeURIComponent(selector)}/respond`,
+    {
+      method: "POST",
+      body: JSON.stringify(body),
+      signal,
+    },
   );
 }
 
