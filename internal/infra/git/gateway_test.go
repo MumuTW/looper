@@ -183,6 +183,31 @@ func TestGatewayCreatesRestoresAndCleansWorktreesWithBranchProtection(t *testing
 	}
 }
 
+func TestGatewayDetachedPRWorktreeReusesRecordAcrossBranches(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	fixture.createRemoteRepo(t, "feature/fixer")
+	runGit(t, fixture.repoPath, "checkout", "-b", "reviewer/pr-42-head")
+	runGit(t, fixture.repoPath, "push", "-u", "origin", "reviewer/pr-42-head")
+	runGit(t, fixture.repoPath, "checkout", "main")
+	gateway := fixture.gateway()
+	first, err := gateway.CreateWorktree(ctx, CreateWorktreeInput{ProjectID: fixture.projectID, RepoPath: fixture.repoPath, WorktreeRoot: fixture.worktreeRoot, Branch: "feature/fixer", BaseBranch: "main", PRNumber: 42, CheckoutMode: CheckoutModeDetached})
+	if err != nil {
+		t.Fatalf("first CreateWorktree() error = %v", err)
+	}
+	second, err := gateway.CreateWorktree(ctx, CreateWorktreeInput{ProjectID: fixture.projectID, RepoPath: fixture.repoPath, WorktreeRoot: fixture.worktreeRoot, Branch: "reviewer/pr-42-head", BaseBranch: "main", PRNumber: 42, CheckoutMode: CheckoutModeDetached})
+	if err != nil {
+		t.Fatalf("second CreateWorktree() error = %v", err)
+	}
+	if second.ID != first.ID || second.WorktreePath != first.WorktreePath {
+		t.Fatalf("records = %#v / %#v, want one detached checkout record", first, second)
+	}
+	items, err := fixture.repos.Worktrees.ListByProject(ctx, fixture.projectID)
+	if err != nil || len(items) != 1 {
+		t.Fatalf("Worktrees.ListByProject() = %#v, %v; want one row", items, err)
+	}
+}
+
 func TestGatewayWorktreeCleanIgnoresIgnoredFiles(t *testing.T) {
 	ctx := context.Background()
 	fixture := newFixture(t)
