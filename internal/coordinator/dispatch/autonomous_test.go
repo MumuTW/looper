@@ -65,6 +65,26 @@ func TestAutonomousHoldLabelVetoesDispatch(t *testing.T) {
 	}
 }
 
+func TestAutonomousHoldLabelVetoesDispatchDespiteCase(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, time.May, 15, 12, 0, 0, 0, time.UTC)
+	action := Decide(Issue{Number: 1, Labels: []string{"triaged", DispatchPlan, "Looper:Hold"}, TriagedAt: now.Add(-31 * time.Minute)}, autonomousConfig(), now, nil)
+	if !action.NoOp {
+		t.Fatalf("action = %#v, want no-op for a differently-cased hold", action)
+	}
+}
+
+func TestAutonomousLegacyHoldLabelVetoesDispatchDespiteCase(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, time.May, 15, 12, 0, 0, 0, time.UTC)
+	cfg := autonomousConfig()
+	cfg.HoldLabel = "legacy:hold"
+	action := Decide(Issue{Number: 1, Labels: []string{"triaged", DispatchPlan, "Legacy:Hold"}, TriagedAt: now.Add(-31 * time.Minute)}, cfg, now, nil)
+	if !action.NoOp {
+		t.Fatalf("action = %#v, want no-op for a differently-cased legacy hold", action)
+	}
+}
+
 func TestAutonomousLegacyHoldLabelStillVetoesDispatch(t *testing.T) {
 	t.Parallel()
 	now := time.Date(2026, time.May, 15, 12, 0, 0, 0, time.UTC)
