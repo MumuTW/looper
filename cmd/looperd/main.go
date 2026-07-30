@@ -484,6 +484,24 @@ func haltLoop(ctx context.Context, services looperdruntime.Services, loopID, rea
 		return result, nil
 	}
 
+	// Preflight: do fallible lookups BEFORE any lifecycle mutation so a
+	// lookup error cannot leave a loop paused mid-transition (#190).
+	var latestRun *storage.RunRecord
+	var latestExecution *storage.AgentExecutionRecord
+	if services.Repositories != nil && services.Repositories.Runs != nil {
+		var err error
+		latestRun, err = services.Repositories.Runs.GetLatestByLoopID(ctx, loopID)
+		if err != nil {
+			return nil, err
+		}
+		if latestRun != nil && latestRun.Status == "running" && services.Repositories.AgentExecutions != nil {
+			latestExecution, err = services.Repositories.AgentExecutions.GetLatestByRunID(ctx, latestRun.ID)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+
 	// Durable pause must succeed before lease cancel. BeginLoopStop cancels
 	// lease contexts wired into execution.run and cannot be undone; doing it
 	// before Pause would half-kill agents when a transient Pause error leaves
@@ -558,11 +576,6 @@ func haltLoop(ctx context.Context, services looperdruntime.Services, loopID, rea
 		return finish()
 	}
 
-	// Abortable preflight for terminal close: do not BeginLoopStop yet.
-	latestRun, err := services.Repositories.Runs.GetLatestByLoopID(ctx, loopID)
-	if err != nil {
-		return nil, err
-	}
 	if latestRun == nil || latestRun.Status != "running" {
 		result.Outcome = stopOutcomeAlreadyFinished
 		result.ProcessSkipReason = processSkipNoRuns
@@ -571,15 +584,6 @@ func haltLoop(ctx context.Context, services looperdruntime.Services, loopID, rea
 	result.RunID = latestRun.ID
 
 	if services.Repositories.AgentExecutions == nil {
-		result.ProcessSkipReason = processSkipNoExecution
-		return finish()
-	}
-
-	latestExecution, err := services.Repositories.AgentExecutions.GetLatestByRunID(ctx, latestRun.ID)
-	if err != nil {
-		return nil, err
-	}
-	if latestExecution == nil {
 		result.ProcessSkipReason = processSkipNoExecution
 		return finish()
 	}
@@ -667,6 +671,7 @@ func haltLoop(ctx context.Context, services looperdruntime.Services, loopID, rea
 
 	return finish()
 }
+
 
 type stopAllResult string
 
