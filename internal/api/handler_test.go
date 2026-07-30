@@ -5909,18 +5909,15 @@ func TestHandlerLoopLogsFollowStreamsSnapshotAndChunk(t *testing.T) {
 	}
 	defer response.Body.Close()
 
+	// Append the agent output before marking the run terminal. A poll that
+	// landed between the two writes would see a terminal run with no new
+	// output, emit end, and close the stream without ever sending the chunk.
+	// Writing the output first means any poll that observes the terminal run
+	// has necessarily observed the appended output too, so the chunk is
+	// flushed in the same iteration (see shouldTerminateLoopLogsFollowBeforeChunk).
 	go func() {
 		time.Sleep(250 * time.Millisecond)
-		updatedRun, getRunErr := fixture.runtime.Services().Repositories.Runs.GetByID(context.Background(), "run_1")
-		if getRunErr != nil || updatedRun == nil {
-			return
-		}
-		run := *updatedRun
 		completedAt := fixture.now.Add(time.Minute).UTC().Format(javaScriptISOString)
-		run.Status = "success"
-		run.EndedAt = &completedAt
-		run.UpdatedAt = completedAt
-		_ = fixture.runtime.Services().Repositories.Runs.Upsert(context.Background(), run)
 
 		updatedExec, getExecErr := fixture.runtime.Services().Repositories.AgentExecutions.GetLatestByRunID(context.Background(), "run_1")
 		if getExecErr != nil || updatedExec == nil {
@@ -5932,6 +5929,16 @@ func TestHandlerLoopLogsFollowStreamsSnapshotAndChunk(t *testing.T) {
 		exec.OutputJSON = stringPtr(`{"stdout":"line1\nline2\n","stderr":""}`)
 		exec.UpdatedAt = completedAt
 		_ = fixture.runtime.Services().Repositories.AgentExecutions.Upsert(context.Background(), exec)
+
+		updatedRun, getRunErr := fixture.runtime.Services().Repositories.Runs.GetByID(context.Background(), "run_1")
+		if getRunErr != nil || updatedRun == nil {
+			return
+		}
+		run := *updatedRun
+		run.Status = "success"
+		run.EndedAt = &completedAt
+		run.UpdatedAt = completedAt
+		_ = fixture.runtime.Services().Repositories.Runs.Upsert(context.Background(), run)
 	}()
 
 	bodyCh := make(chan []byte, 1)
