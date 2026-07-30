@@ -25,14 +25,13 @@ func TestCountOutstandingQuarantineDebtCountsRecoveryQuarantineEvidence(t *testi
 	cfg.Storage.BackupDir = &backupDir
 	nowISO := formatJavaScriptISOString(time.Date(2026, time.July, 30, 3, 0, 0, 0, time.UTC))
 
-	rt := New(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time {
-		return time.Date(2026, time.July, 30, 3, 0, 0, 0, time.UTC)
-	}})
-	if err := rt.Start(context.Background()); err != nil {
-		t.Fatalf("Start() error = %v", err)
-	}
-	t.Cleanup(func() { rt.Stop("test cleanup") })
-	repos := rt.Services().Repositories
+	// Deliberately no live Runtime: this exercises the counting function, and a
+	// started runtime's recovery pass would settle the orphaned run below out
+	// from under the assertion — correctly, since that is what this change makes
+	// it do. Counting and settling are separate contracts and separate tests.
+	coordinator := openMigratedCoordinator(t, cfg.Storage.DBPath, backupDir)
+	t.Cleanup(func() { _ = coordinator.Close() })
+	repos := storage.NewRepositories(coordinator.DB())
 
 	projectID := "project_debt"
 	loopID := "loop_debt"
