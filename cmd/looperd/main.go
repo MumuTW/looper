@@ -41,6 +41,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 }
 
 func runWithDeps(args []string, stdout, stderr io.Writer, deps runDeps) int {
+	if hasCheckConfigArg(args) {
+		return runConfigCheck(args, stdout, stderr, deps)
+	}
 	if hasVersionJSONArg(args) {
 		if err := json.NewEncoder(stdout).Encode(version.Current()); err != nil {
 			_, _ = fmt.Fprintf(stderr, "looperd: encode build identity: %v\n", err)
@@ -98,6 +101,41 @@ func runWithDeps(args []string, stdout, stderr io.Writer, deps runDeps) int {
 
 	_, _ = fmt.Fprintf(stderr, "looperd: %v\n", err)
 	return 1
+}
+
+// runConfigCheck loads and semantically validates configuration without
+// starting bootstrap. In particular it does not create runtime paths, open the
+// production database, construct a logger, or start a daemon.
+func runConfigCheck(args []string, stdout, stderr io.Writer, deps runDeps) int {
+	cwd, err := os.Getwd()
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "looperd: determine working directory: %v\n", err)
+		return 1
+	}
+	lookupEnv := os.LookupEnv
+	if deps.env != nil {
+		lookupEnv = func(key string) (string, bool) { value, ok := deps.env[key]; return value, ok }
+	}
+	filtered := make([]string, 0, len(args)-1)
+	for _, arg := range args {
+		if arg != "--check-config" {
+			filtered = append(filtered, arg)
+		}
+	}
+	if _, err := config.LoadFile(config.LoadFileOptions{CWD: cwd, Args: filtered, LookupEnv: lookupEnv}); err != nil {
+		var validationErr *config.ConfigValidationError
+		if errors.As(err, &validationErr) {
+			_, _ = fmt.Fprintln(stderr, "looperd configuration is incompatible:")
+			for _, issue := range validationErr.Issues {
+				_, _ = fmt.Fprintf(stderr, "- %s: %s\n", issue.Path, issue.Message)
+			}
+			return 1
+		}
+		_, _ = fmt.Fprintf(stderr, "looperd: validate configuration: %v\n", err)
+		return 1
+	}
+	_, _ = fmt.Fprintln(stdout, "configuration is compatible")
+	return 0
 }
 
 type daemonRuntime struct {
@@ -1276,6 +1314,10 @@ func hasVersionJSONArg(args []string) bool {
 	return slices.Contains(args, "--version-json")
 }
 
+func hasCheckConfigArg(args []string) bool {
+	return slices.Contains(args, "--check-config")
+}
+
 func hasHelpArg(args []string) bool {
 	return slices.ContainsFunc(args, isHelpArg)
 }
@@ -1290,6 +1332,7 @@ func writeUsage(w io.Writer) {
 Usage:
 	looperd [flags]
 	looperd --version-json
+	looperd --check-config
 	looperd service <install|print|uninstall|status>
 	looperd help
 
