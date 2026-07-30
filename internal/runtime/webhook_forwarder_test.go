@@ -212,7 +212,13 @@ func TestWebhookForwarderManagerPassesDaemonCredentialEnv(t *testing.T) {
 	}})
 	m.Sync(context.Background(), []storage.ProjectRecord{{ID: "p", MetadataJSON: stringPtr(`{"repo":"acme/repo"}`)}})
 	t.Cleanup(m.Stop)
-	if command := <-got; !containsEnv(command.Process.Env, "GH_TOKEN=token") {
+	var command webhookForwarderCommand
+	select {
+	case command = <-got:
+	case <-time.After(time.Second):
+		t.Fatal("forwarder did not start")
+	}
+	if !containsEnv(command.Process.Env, "GH_TOKEN=token") {
 		t.Fatalf("child env = %q, want GH_TOKEN", command.Process.Env)
 	}
 	// Do not leave the supervisor blocked in Wait when this focused assertion
