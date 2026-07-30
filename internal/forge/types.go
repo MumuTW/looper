@@ -5,8 +5,7 @@ import "github.com/nexu-io/looper/internal/config"
 type ProviderKind = config.ProviderKind
 
 const (
-	ProviderKindGitHub  = config.ProviderKindGitHub
-	ProviderKindForgejo = config.ProviderKindForgejo
+	ProviderKindGitHub = config.ProviderKindGitHub
 )
 
 type RepositoryRef struct {
@@ -80,8 +79,6 @@ func StaticCapabilities(kind ProviderKind) (Capabilities, bool) {
 	switch kind {
 	case ProviderKindGitHub:
 		return Capabilities{Issues: true, PullRequests: true, Labels: true, Assignees: true, Comments: true, Identity: true, Diffs: true, NativeReviews: true, ReviewRequests: true, AutoMerge: true, Webhooks: true, ReviewCommentResolution: ReviewCommentResolutionNative, ReviewDiscovery: ReviewDiscoveryReviewRequest, ReviewPublish: ReviewPublishNative, ThreadResolution: ThreadResolutionNative, WorkerClaim: WorkerClaimAssignSelf, Webhook: WebhookNative, GitHubPullRequests: true, GitHubIssues: true, GitHubCLIPullRequestCreation: true}, true
-	case ProviderKindForgejo:
-		return Capabilities{Issues: true, PullRequests: true, Labels: true, Assignees: true, Comments: true, Identity: true, Diffs: true, NativeReviews: true, ReviewRequests: true, AutoMerge: false, Webhooks: false, ReviewCommentResolution: ReviewCommentResolutionManualOnly, Dependencies: false, ReviewDiscovery: ReviewDiscoveryReviewRequest, ReviewPublish: ReviewPublishNative, ThreadResolution: ThreadResolutionDisabled, WorkerClaim: WorkerClaimPreAssigned, Webhook: WebhookPolling}, true
 	default:
 		return Capabilities{}, false
 	}

@@ -208,7 +208,6 @@
             "inAppEnabled": true,
             "osascriptEnabled": true
           },
-          "providers": [],
           "tools": {
             "git": true,
             "gh": true,
@@ -337,7 +336,7 @@
               "interval": "24h",
               "retentionDays": 7,
               "maxPerTick": 10,
-              "includeOrphans": false,
+              "includeOrphans": true,
               "dryRun": false
             }
           },

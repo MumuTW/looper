@@ -90,6 +90,10 @@ type Report struct {
 	Reasons                   []Reason `json:"reasons"`
 	Evidence                  Evidence `json:"evidence"`
 	EvaluatedAt               string   `json:"evaluatedAt"`
+	// SourceFingerprint is everything the shared discovery list page could observe
+	// about the pull request when this report was produced. The next tick compares
+	// it to decide whether re-evaluating would reach the same conclusion.
+	SourceFingerprint string `json:"sourceFingerprint,omitempty"`
 }
 
 type EvaluationInput struct {
@@ -98,6 +102,9 @@ type EvaluationInput struct {
 	PRNumber        int64
 	CWD             string
 	ExpectedHeadSHA string
+	// SourceFingerprint is recorded on the resulting report. Empty means the caller
+	// had no list-page observation, in which case the report can never be skipped.
+	SourceFingerprint string
 }
 
 type DiscoveryInput struct {
@@ -110,7 +117,10 @@ type DiscoveryInput struct {
 
 type DiscoveryResult struct {
 	Evaluated int
-	Reports   []Report
+	// Skipped counts pull requests that reused their previous report because
+	// nothing the list page can observe had changed.
+	Skipped int
+	Reports []Report
 }
 
 type GitHubGateway interface {
@@ -170,11 +180,27 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 	if err != nil {
 		return DiscoveryResult{}, fmt.Errorf("list gatekeeper pull requests: %w", err)
 	}
+	// Evaluating a pull request costs branch protection, check runs, head SHA, and a
+	// review-thread query each — so this lane was O(open PRs) in forge round trips
+	// every tick, and grew with the repo. Most of those pull requests are unchanged
+	// since their last evaluation, and the list call already made above can prove it.
+	previousReports, err := latestGateReports(ctx, r.repos, input.ProjectID)
+	if err != nil {
+		return DiscoveryResult{}, err
+	}
 	result := DiscoveryResult{Reports: make([]Report, 0, len(pullRequests))}
 	for _, pullRequest := range pullRequests {
+		fingerprint := sourceFingerprint(pullRequest)
+		entityID := fmt.Sprintf("%s#%d", input.Repo, pullRequest.Number)
+		previous, hasPrevious := previousReports[entityID]
+		if reused, ok := skipUnchanged(previous, hasPrevious, fingerprint, r.now()); ok {
+			result.Skipped++
+			result.Reports = append(result.Reports, reused)
+			continue
+		}
 		report, err := r.EvaluatePullRequest(ctx, EvaluationInput{
 			ProjectID: input.ProjectID, Repo: input.Repo, PRNumber: pullRequest.Number,
-			CWD: input.CWD, ExpectedHeadSHA: pullRequest.HeadSHA,
+			CWD: input.CWD, ExpectedHeadSHA: pullRequest.HeadSHA, SourceFingerprint: fingerprint,
 		})
 		if err != nil {
 			return result, err
@@ -207,7 +233,8 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 		ProjectID: input.ProjectID, Repo: input.Repo, PRNumber: input.PRNumber,
 		ExpectedHeadSHA: input.ExpectedHeadSHA, RequiresFreshRevalidation: true,
 		Reasons: []Reason{}, Evidence: Evidence{RequiredChecks: []string{}, Checks: []CheckEvidence{}, UnresolvedReviewThreadIDs: []string{}, HoldLabels: []string{}},
-		EvaluatedAt: r.now().UTC().Format(time.RFC3339Nano),
+		EvaluatedAt:       r.now().UTC().Format(time.RFC3339Nano),
+		SourceFingerprint: input.SourceFingerprint,
 	}
 	viewInput := githubinfra.ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD}
 	detail, err := r.github.ViewPullRequestForGatekeeper(ctx, viewInput)
@@ -233,11 +260,12 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 	if detail.IsDraft {
 		report.Reasons = append(report.Reasons, Reason{Code: ReasonPullRequestDraft})
 	}
-	for _, label := range detail.Labels {
-		if strings.TrimSpace(label) == labels.HoldGlobal {
-			report.Evidence.HoldLabels = append(report.Evidence.HoldLabels, labels.HoldGlobal)
-			report.Reasons = append(report.Reasons, Reason{Code: ReasonHold, Subject: labels.HoldGlobal})
-		}
+	// Normalized, like the other hold gates: a Gate report that omits a hold
+	// spelled "Looper:Hold" would record the Pull Request as eligible while a
+	// human veto is in force.
+	if labels.Has(detail.Labels, labels.HoldGlobal) {
+		report.Evidence.HoldLabels = append(report.Evidence.HoldLabels, labels.HoldGlobal)
+		report.Reasons = append(report.Reasons, Reason{Code: ReasonHold, Subject: labels.HoldGlobal})
 	}
 	report.Evidence.ProjectPolicyPermitsTarget = r.policyPermitsTarget(input.ProjectID, input.Repo, report.Evidence.BaseRefName)
 	if !report.Evidence.ProjectPolicyPermitsTarget {

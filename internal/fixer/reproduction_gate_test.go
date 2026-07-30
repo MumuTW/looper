@@ -183,7 +183,9 @@ func TestFixerGateReadsThePinWrittenEarlierInTheSameRun(t *testing.T) {
 	if err == nil {
 		t.Fatalf("enforceReproductionGate() error = nil, want deleting the reproduction to fail the gate")
 	}
-	if loopErr, ok := err.(*loopError); !ok || !strings.Contains(loopErr.message, string(reproduction.ReasonTestMissing)) {
-		t.Fatalf("enforceReproductionGate() error = %#v, want the missing-test tamper reason", err)
+	if loopErr, ok := err.(*loopError); !ok ||
+		!strings.Contains(loopErr.message, string(reproduction.ReasonTestModified)) ||
+		!strings.Contains(loopErr.message, "manifest") {
+		t.Fatalf("enforceReproductionGate() error = %#v, want the deleted-manifest tamper reason", err)
 	}
 }

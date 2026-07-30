@@ -461,11 +461,12 @@ func (r *EventsRepository) ListByEntity(ctx context.Context, entityType, entityI
 	return scanEventLogs(rows)
 }
 
-// ListEntityIDsByType returns the supplied entity IDs that have an event of
-// eventType. It is deliberately a set because callers only need durable
-// evidence, not every historical occurrence of that evidence.
-func (r *EventsRepository) ListEntityIDsByType(ctx context.Context, eventType, entityType string, entityIDs []string) (map[string]struct{}, error) {
-	matched := make(map[string]struct{})
+// ListFirstEventTimestampsByType returns, for each supplied entity ID that has
+// an event of eventType, the created_at of its earliest such event. Callers
+// need both the durable evidence and when it was first written, so one pass
+// yields both rather than letting a second query disagree with the first.
+func (r *EventsRepository) ListFirstEventTimestampsByType(ctx context.Context, eventType, entityType string, entityIDs []string) (map[string]string, error) {
+	matched := make(map[string]string)
 	if len(entityIDs) == 0 {
 		return matched, nil
 	}
@@ -476,21 +477,23 @@ func (r *EventsRepository) ListEntityIDsByType(ctx context.Context, eventType, e
 			args = append(args, entityID)
 		}
 		rows, err := r.q.QueryContext(ctx, `
-			SELECT DISTINCT entity_id
+			SELECT entity_id, MIN(created_at)
 			FROM event_logs
 			WHERE event_type = ? AND entity_type = ?
 			AND entity_id IN (`+sqlPlaceholders(len(chunk))+`)
+			GROUP BY entity_id
 		`, args...)
 		if err != nil {
 			return nil, fmt.Errorf("list entity ids by event type: %w", err)
 		}
 		for rows.Next() {
 			var entityID string
-			if err := rows.Scan(&entityID); err != nil {
+			var firstAt sql.NullString
+			if err := rows.Scan(&entityID, &firstAt); err != nil {
 				_ = rows.Close()
 				return nil, fmt.Errorf("scan entity id by event type: %w", err)
 			}
-			matched[entityID] = struct{}{}
+			matched[entityID] = firstAt.String
 		}
 		if err := rows.Err(); err != nil {
 			_ = rows.Close()
@@ -881,6 +884,93 @@ func (r *RunsRepository) Upsert(ctx context.Context, record RunRecord) error {
 	return nil
 }
 
+// MergeRunResumePolicy rewrites only the checkpoint's resume policy.
+//
+// The retry-policy writers read a run, change this one field, and would otherwise
+// write the whole row back. That loses any checkpoint field a concurrent terminal
+// cleanup persisted in between -- the mirror of the race
+// MergeWorktreeCleanupTimestamps exists to avoid, since the two writers can
+// interleave in either order.
+//
+// The CASE guard normalizes a non-object checkpoint_json to an empty object. Without
+// it, failure-streak recovery on a run with malformed legacy content aborted the
+// transaction, and a run whose checkpoint was null/an array/a scalar reported success
+// without writing the policy -- leaving the loop paused after an apparently
+// successful handoff.
+func (r *RunsRepository) MergeRunResumePolicy(ctx context.Context, id, resumePolicy, updatedAt string) error {
+	result, err := r.q.ExecContext(ctx, `
+		UPDATE runs
+		SET checkpoint_json = json_set(
+				CASE
+					WHEN json_valid(checkpoint_json) AND json_type(checkpoint_json) = 'object'
+						THEN checkpoint_json
+					ELSE '{}'
+				END,
+				'$.resumePolicy', ?
+			),
+			updated_at = ?
+		WHERE id = ?
+	`, resumePolicy, updatedAt, id)
+	if err != nil {
+		return fmt.Errorf("merge run resume policy: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read merged run resume policy rows: %w", err)
+	}
+	if affected == 0 {
+		return fmt.Errorf("merge run resume policy: run not found: %s", id)
+	}
+	return nil
+}
+
+// MergeWorktreeCleanupTimestamps records a terminal worktree cleanup attempt on a
+// run without disturbing anything else about it.
+//
+// Cleanup runs after the run reached a terminal status and starts from a checkpoint
+// captured earlier, so it must not write that stale copy back. Replacing the whole
+// checkpoint_json would erase a concurrent checkpoint transition — an operator
+// retry rewriting resumePolicy to restart_from_discover between completion and
+// cleanup, for instance, which would leave the requeued run resuming the invalid
+// downstream checkpoint it was retried to escape. Scalar columns being untouched
+// is not enough; the merge has to be inside the JSON too.
+//
+// json_set writes only the two cleanup fields, creating $.worktree if the stored
+// checkpoint has none and preserving its other fields when it does.
+//
+// The CASE guard replaces a non-object checkpoint_json with an empty object first.
+// The column is arbitrary text: malformed content makes json_set abort the statement,
+// and valid-but-non-object content (null, an array, a scalar) makes it return the
+// input unchanged while the UPDATE still reports a row affected -- a silent no-op.
+// Normalizing matches what the previous read-modify-write path did in Go.
+func (r *RunsRepository) MergeWorktreeCleanupTimestamps(ctx context.Context, id, cleanupAttemptedAt, cleanedAt, updatedAt string) error {
+	result, err := r.q.ExecContext(ctx, `
+		UPDATE runs
+		SET checkpoint_json = json_set(
+				CASE
+					WHEN json_valid(checkpoint_json) AND json_type(checkpoint_json) = 'object'
+						THEN checkpoint_json
+					ELSE '{}'
+				END,
+				'$.worktree.cleanupAttemptedAt', ?,
+				'$.worktree.cleanedAt', ?
+			),
+			updated_at = ?
+		WHERE id = ?
+	`, cleanupAttemptedAt, cleanedAt, updatedAt, id)
+	if err != nil {
+		return fmt.Errorf("merge run worktree cleanup timestamps: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read merged run worktree cleanup rows: %w", err)
+	}
+	if affected == 0 {
+		return fmt.Errorf("merge run worktree cleanup timestamps: run not found: %s", id)
+	}
+	return nil
+}
+
 func (r *RunsRepository) GetByID(ctx context.Context, id string) (*RunRecord, error) {
 	row := r.q.QueryRowContext(ctx, `SELECT * FROM runs WHERE id = ?`, id)
 	record, err := scanRun(row)
@@ -946,6 +1036,22 @@ func SortRunsLatestFirst(runs []RunRecord) {
 	sort.SliceStable(runs, func(i, j int) bool {
 		return RunNewer(runs[i], runs[j])
 	})
+}
+
+// TouchHeartbeat advances a run's last_heartbeat_at without rewriting the
+// record, and only forward: the fixed-precision ISO-8601 format compares
+// lexicographically in chronological order, so a stale writer cannot move
+// liveness evidence backward and no other column is disturbed.
+func (r *RunsRepository) TouchHeartbeat(ctx context.Context, id, heartbeatAtISO string) error {
+	_, err := r.q.ExecContext(ctx, `
+		UPDATE runs
+		SET last_heartbeat_at = ?, updated_at = ?
+		WHERE id = ? AND (last_heartbeat_at IS NULL OR last_heartbeat_at < ?)
+	`, heartbeatAtISO, heartbeatAtISO, id, heartbeatAtISO)
+	if err != nil {
+		return fmt.Errorf("touch run heartbeat: %w", err)
+	}
+	return nil
 }
 
 func (r *RunsRepository) GetLatestByLoopID(ctx context.Context, loopID string) (*RunRecord, error) {

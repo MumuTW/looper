@@ -167,19 +167,6 @@ func (v OperationView) ProviderPolicy(projectID string) (ProviderPolicyView, boo
 	}, true
 }
 
-// ProviderByRemoteHost returns the Forgejo provider, if any, whose configured
-// base URL is compatible with the given git remote host.
-func (v OperationView) ProviderByRemoteHost(remoteHost string) (ProviderPolicyView, bool) {
-	provider, ok := config.MatchForgejoProviderByRemoteHost(v.generation, remoteHost)
-	if !ok {
-		return ProviderPolicyView{}, false
-	}
-	return ProviderPolicyView{
-		Provider:     cloneProviderConfig(provider),
-		ProviderKind: provider.Kind,
-	}, true
-}
-
 func providerByID(cfg config.Config, providerID string) (config.ProviderConfig, bool) {
 	providerID = strings.TrimSpace(providerID)
 	for _, provider := range cfg.Providers {

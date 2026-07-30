@@ -1455,23 +1455,7 @@ func (r *Runner) runPrepareWorkStep(ctx context.Context, input stepInput) (worke
 		return checkpoint, &loopError{message: fmt.Sprintf("Worker lock is already held for %s", lockKey), kind: FailureRetryableTransient}
 	}
 	policy := r.discoveryPolicyForProject(input.Project.ID)
-	provider := r.providerSelectionForProject(input.Project.ID)
-	if provider.UsesNativePullRequestAPI() && work.IssueNumber > 0 && r.github != nil {
-		stillAssigned, err := r.workerIssueAssignedToCurrentUser(ctx, work, input.Project.RepoPath)
-		if err != nil {
-			_ = r.repos.Locks.Release(context.Background(), lockKey)
-			return checkpoint, err
-		}
-		if !stillAssigned {
-			checkpoint.Work = &work
-			checkpoint.ClaimedLockKey = lockKey
-			checkpoint.ResumePolicy = loops.ResumePolicyAdvanceFromCheckpoint
-			checkpoint.SkipReason = fmt.Sprintf("Worker stopped because %s is not currently assigned to the configured user", formatIssueReference(issueLookupRepo(work), work.IssueNumber))
-			_ = r.repos.Locks.Release(context.Background(), lockKey)
-			checkpoint.ClaimedLockKey = ""
-			return checkpoint, nil
-		}
-	} else if work.IssueNumber > 0 && r.github != nil && (!work.AutoDiscovered || policy.RequireAssigneeCurrentUser) {
+	if work.IssueNumber > 0 && r.github != nil && (!work.AutoDiscovered || policy.RequireAssigneeCurrentUser) {
 		if err := r.selfAssignIssue(ctx, work, input.Project.RepoPath); err != nil {
 			_ = r.repos.Locks.Release(context.Background(), lockKey)
 			return checkpoint, err
@@ -1508,34 +1492,6 @@ func (r *Runner) selfAssignIssue(ctx context.Context, work workerInput, cwd stri
 		return &loopError{message: fmt.Sprintf("Unable to assign issue %s#%d to %s: %v", repo, work.IssueNumber, login, err), kind: FailureRetryableAfterResume}
 	}
 	return nil
-}
-
-func (r *Runner) workerIssueAssignedToCurrentUser(ctx context.Context, work workerInput, cwd string) (bool, error) {
-	if r.github == nil || work.IssueNumber <= 0 {
-		return false, nil
-	}
-	repo := issueLookupRepo(work)
-	if repo == "" {
-		return false, nil
-	}
-	login, err := r.github.GetCurrentUserLogin(ctx, cwd)
-	if err != nil {
-		return false, &loopError{message: fmt.Sprintf("Unable to resolve provider login for worker issue assignment on %s#%d: %v", repo, work.IssueNumber, err), kind: FailureRetryableAfterResume}
-	}
-	login = normalizeLogin(login)
-	if login == "" {
-		return false, &loopError{message: fmt.Sprintf("Unable to resolve provider login for worker issue assignment on %s#%d", repo, work.IssueNumber), kind: FailureRetryableAfterResume}
-	}
-	issue, err := r.github.ViewIssue(ctx, ViewIssueInput{Repo: repo, IssueNumber: work.IssueNumber, CWD: cwd})
-	if err != nil {
-		return false, err
-	}
-	for _, assignee := range issue.AssigneeUsers {
-		if normalizeLogin(assignee.Login) == login {
-			return true, nil
-		}
-	}
-	return false, nil
 }
 
 func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (workerCheckpoint, error) {
@@ -2529,8 +2485,13 @@ func (r *Runner) resolveWorkerInput(ctx context.Context, project storage.Project
 		work.ExecutionMode = "push-existing"
 		work.SpecPath = firstNonEmpty(work.SpecPath, specpr.ParseSpecPathFromPullRequestBody(detail.Body))
 		work.Reviewers = append([]string(nil), detail.ReviewRequests...)
-		if work.SpecPath == "" {
-			return workerInput{}, &loopError{message: fmt.Sprintf("No explicit spec path found for %s#%d", repo, prNumber), kind: FailureManualIntervention}
+		// A spec path is the usual input for a PR-target worker, but an
+		// operator-supplied prompt is also a complete instruction: the API
+		// accepts prNumber+prompt, and buildWorkerPromptWithInstructions reads
+		// the prompt directly when no spec path is present. Stop for manual
+		// intervention only when neither is available.
+		if work.SpecPath == "" && strings.TrimSpace(work.Prompt) == "" {
+			return workerInput{}, &loopError{message: fmt.Sprintf("No explicit spec path or prompt found for %s#%d", repo, prNumber), kind: FailureManualIntervention}
 		}
 	}
 	return work, nil

@@ -26,7 +26,6 @@ import (
 	"github.com/nexu-io/looper/internal/disclosure"
 	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/eventlog"
-	"github.com/nexu-io/looper/internal/forge"
 	gitinfra "github.com/nexu-io/looper/internal/infra/git"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/specpr"
@@ -489,7 +488,6 @@ type Options struct {
 	RetryMaxAttempts        int64
 	RetryPolicy             config.ReviewerRetryConfig
 	HeadChangePollInterval  time.Duration
-	CommentOnlyPublish      bool
 	OnAgentExecutionStarted AgentExecutionStartedFunc
 	OnQueueItemEnqueued     func()
 }
@@ -539,7 +537,6 @@ type Runner struct {
 	retryPolicy             config.ReviewerRetryConfig
 	retryMaxDelay           time.Duration
 	headChangePollInterval  time.Duration
-	commentOnlyPublish      bool
 	onAgentExecutionStarted AgentExecutionStartedFunc
 	onQueueItemEnqueued     func()
 }
@@ -636,29 +633,9 @@ type pendingReviewCheckpoint struct {
 	Event                    ReviewEvent `json:"event,omitempty"`
 	Summary                  string      `json:"summary,omitempty"`
 	Outcome                  string      `json:"outcome,omitempty"`
-	ReviewerSummaryJSON      string      `json:"reviewerSummaryJson,omitempty"`
 	ContentFingerprint       string      `json:"contentFingerprint,omitempty"`
 	CleanNoop                bool        `json:"cleanNoop,omitempty"`
 	MarkerVerificationMisses int         `json:"markerVerificationMisses,omitempty"`
-}
-
-type reviewerCommentOnlyCompletion struct {
-	Summary  string                             `json:"summary"`
-	Outcome  string                             `json:"outcome"`
-	Findings []reviewerCommentOnlyFindingResult `json:"findings"`
-}
-
-// reviewerCommentOnlyFindingResult is one finding as the review agent reported
-// it. ReviewItemID is empty when the agent is reporting a new issue and set
-// when it claims the issue is the same one an existing Reviewer Summary item
-// already names; buildReviewerSummaryFromCompletion mints IDs for the former
-// and verifies the claim for the latter.
-type reviewerCommentOnlyFindingResult struct {
-	ReviewItemID forge.ReviewItemID   `json:"review_item_id,omitempty"`
-	Title        string               `json:"title"`
-	Body         string               `json:"body"`
-	Files        []string             `json:"files,omitempty"`
-	Supersedes   []forge.ReviewItemID `json:"supersedes,omitempty"`
 }
 
 type threadResolutionCheckpoint struct {
@@ -784,7 +761,6 @@ func New(options Options) *Runner {
 		retryPolicy:             retryPolicy,
 		retryMaxDelay:           retryMaxDelay,
 		headChangePollInterval:  headChangePollInterval,
-		commentOnlyPublish:      options.CommentOnlyPublish,
 		onAgentExecutionStarted: options.OnAgentExecutionStarted,
 		onQueueItemEnqueued:     options.OnQueueItemEnqueued,
 	}
@@ -1338,12 +1314,7 @@ func (r *Runner) discoveryPolicyForProject(projectID string) DiscoveryPolicy {
 		return r.discoveryPolicy
 	}
 	labels := append([]string(nil), role.Discovery.Labels...)
-	matchAnyTrigger := r.forgejoProject(projectID) && role.Discovery.RequireReviewRequest && len(prQueryLabels(labels)) > 0
-	return DiscoveryPolicy{AutoDiscovery: role.Discovery.Enabled, IncludeDrafts: role.Discovery.IncludeDrafts, RequireReviewRequest: role.Discovery.RequireReviewRequest, EnableSelfReview: role.Discovery.EnableSelfReview, Labels: labels, LabelMode: role.Discovery.LabelMode, IncludeSpecReviewingLabel: roles.Reviewer.Discovery.SpecReview.IncludeReviewingLabel, SpecReviewingLabel: roles.Reviewer.Discovery.SpecReview.ReviewingLabel, MatchAnyTrigger: matchAnyTrigger, RoutedClaimPolicy: networkpolicy.ProjectPolicyForProject(*r.projectRoleConfig, projectID)}
-}
-
-func (r *Runner) forgejoProject(projectID string) bool {
-	return r.projectRoleConfig != nil && forge.NewResolver(*r.projectRoleConfig).ForProject(projectID).UsesNativePullRequestAPI()
+	return DiscoveryPolicy{AutoDiscovery: role.Discovery.Enabled, IncludeDrafts: role.Discovery.IncludeDrafts, RequireReviewRequest: role.Discovery.RequireReviewRequest, EnableSelfReview: role.Discovery.EnableSelfReview, Labels: labels, LabelMode: role.Discovery.LabelMode, IncludeSpecReviewingLabel: roles.Reviewer.Discovery.SpecReview.IncludeReviewingLabel, SpecReviewingLabel: roles.Reviewer.Discovery.SpecReview.ReviewingLabel, RoutedClaimPolicy: networkpolicy.ProjectPolicyForProject(*r.projectRoleConfig, projectID)}
 }
 
 func reviewRequestRequiredForCandidate(policy DiscoveryPolicy, labels []string) bool {
@@ -1408,25 +1379,6 @@ func (r *Runner) retryMaxDelayForProject(projectID string) time.Duration {
 		return maxRetryDelay
 	}
 	return delay
-}
-
-func (r *Runner) commentOnlyPublishForProject(projectID string) bool {
-	if r.commentOnlyPublish {
-		return true
-	}
-	return r.forgejoCommentOnlyPublishForProject(projectID)
-}
-
-func (r *Runner) commentOnlyCompletionForProject(projectID string, reviewEvents config.ReviewerReviewEventsConfig) bool {
-	return r.forgejoCommentOnlyPublishForProject(projectID) || (r.commentOnlyPublishForProject(projectID) && reviewEvents.Clean != config.ReviewerReviewEventApprove)
-}
-
-func (r *Runner) forgejoCommentOnlyPublishForProject(projectID string) bool {
-	if r.projectRoleConfig == nil {
-		return false
-	}
-	selection := forge.NewResolver(*r.projectRoleConfig).ForProject(projectID)
-	return selection.UsesNativePullRequestAPI() && config.ProjectRoleConfigs(*r.projectRoleConfig, projectID).Reviewer.Behavior.PublishMode == config.ReviewerPublishModeSummaryComment
 }
 
 func isSelfAuthoredPR(author string, currentLogin string, policy DiscoveryPolicy) bool {
@@ -2902,12 +2854,11 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		reviewRequestBypassReason = "follow_up_new_head"
 	}
 	reviewEvents := r.effectiveReviewEvents(input.Project.ID, input.Loop.MetadataJSON)
-	commentOnlyCompletion := r.commentOnlyCompletionForProject(input.Project.ID, reviewEvents)
 	agentVendor, agentModel, _, useSnapshot, err := r.identityFromRun(input.Run)
 	if err != nil {
 		return checkpoint, fmt.Errorf("resolve run agent identity: %w", err)
 	}
-	prompt, instructionBlock := buildReviewPromptWithInstructions(input.Project.ID, r.customInstructions, input.Repo, input.PRNumber, checkpoint, input.Run.ID, idempotencyKey, reviewEvents, isManualReviewerLoop(input.Loop), requireReviewRequest, reviewRequestBypassReason, r.scope, r.disclosure, agentVendor, derefString(agentModel), r.looperCLIPath, r.reviewerAutoMergeConfigForProject(input.Project.ID).Enabled, commentOnlyCompletion)
+	prompt, instructionBlock := buildReviewPromptWithInstructions(input.Project.ID, r.customInstructions, input.Repo, input.PRNumber, checkpoint, input.Run.ID, idempotencyKey, reviewEvents, isManualReviewerLoop(input.Loop), requireReviewRequest, reviewRequestBypassReason, r.scope, r.disclosure, agentVendor, derefString(agentModel), r.looperCLIPath, r.reviewerAutoMergeConfigForProject(input.Project.ID).Enabled)
 	nativeResumePrompt := r.nativeResumePromptForReview(ctx, input, checkpoint.Snapshot.HeadSHA, idempotencyKey)
 	metadata := map[string]any{
 		"loopType":            "reviewer",
@@ -3019,19 +2970,6 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		return checkpoint, &loopError{message: "Reviewer agent did not report a valid completion marker after publishing review", kind: FailureRetryableAfterResume}
 	}
 	if cleanReviewNoopSummary(result.Summary) {
-		if commentOnlyCompletion {
-			completion, err := parseReviewerCommentOnlyCompletion(result)
-			if err != nil {
-				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
-			}
-			payload, err := json.Marshal(completion)
-			if err != nil {
-				return checkpoint, &loopError{message: fmt.Sprintf("marshal reviewer comment-only completion: %v", err), kind: FailureRetryableAfterResume}
-			}
-			checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: completion.Summary, Outcome: completion.Outcome, ReviewerSummaryJSON: string(payload), CleanNoop: completion.Outcome == "clean"}
-			checkpoint.ResumePolicy = loops.ResumePolicyAdvanceFromCheckpoint
-			return checkpoint, nil
-		}
 		if reviewEvents.Clean == config.ReviewerReviewEventApprove && r.reviewerAutoMergeConfigForProject(input.Project.ID).Enabled && resolvePullRequestPhase(detailLabels(checkpoint.Detail)) != "spec" {
 			checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, Outcome: "clean", CleanNoop: true}
 			checkpoint.ResumePolicy = loops.ResumePolicyAdvanceFromCheckpoint
@@ -3051,19 +2989,6 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 			return checkpoint, &loopError{message: "Reviewer agent reported a clean summary-only result, but clean review policy requires an APPROVED review marker; submit the APPROVE review through the trusted wrapper or exit non-zero", kind: FailureRetryableAfterResume}
 		}
 		checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, Outcome: "clean", CleanNoop: true}
-		checkpoint.ResumePolicy = loops.ResumePolicyAdvanceFromCheckpoint
-		return checkpoint, nil
-	}
-	if commentOnlyCompletion {
-		completion, err := parseReviewerCommentOnlyCompletion(result)
-		if err != nil {
-			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
-		}
-		payload, err := json.Marshal(completion)
-		if err != nil {
-			return checkpoint, &loopError{message: fmt.Sprintf("marshal reviewer comment-only completion: %v", err), kind: FailureRetryableAfterResume}
-		}
-		checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: completion.Summary, Outcome: completion.Outcome, ReviewerSummaryJSON: string(payload)}
 		checkpoint.ResumePolicy = loops.ResumePolicyAdvanceFromCheckpoint
 		return checkpoint, nil
 	}
@@ -3127,15 +3052,6 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 			return checkpoint, nil
 		}
 		reviewEvents := r.effectiveReviewEvents(input.Project.ID, input.Loop.MetadataJSON)
-		if r.commentOnlyCompletionForProject(input.Project.ID, reviewEvents) {
-			if err := r.publishCommentOnlyReview(ctx, input, pending, detail); err != nil {
-				return checkpoint, err
-			}
-			if err := r.recordPublishedReviewProgress(ctx, input, pending, ReviewEventComment); err != nil {
-				return checkpoint, err
-			}
-			return checkpoint, nil
-		}
 		if reviewEvents.Clean == config.ReviewerReviewEventApprove {
 			found, err := r.verifyAgentNativeReviewMarker(ctx, input, pending.HeadSHA, pending.IdempotencyKey, cleanReviewAuthorLogin(checkpoint, detail))
 			if err != nil {
@@ -3193,31 +3109,6 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 	}
 	if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeld(domain.LoopTypeReviewer, detail.Labels) {
 		return checkpoint, &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
-	}
-	reviewEvents := r.effectiveReviewEvents(input.Project.ID, input.Loop.MetadataJSON)
-	if r.commentOnlyCompletionForProject(input.Project.ID, reviewEvents) {
-		// Mirror the clean-noop path: recheck review request before publishing
-		// a summary_comment review so a request removed mid-run cannot still
-		// create/update the top-level Reviewer Summary.
-		policy := r.discoveryPolicyForProject(input.Project.ID)
-		requireReviewRequest := requireReviewRequestForLoop(input.Loop, reviewRequestRequiredForCandidate(policy, detail.Labels), pending.HeadSHA)
-		if requireReviewRequest {
-			currentLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
-			if err != nil {
-				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
-			}
-			if reviewRequestsKnownAbsent(detail.ReviewRequests, normalizeLogin(currentLogin)) {
-				checkpoint.SkipReason = fmt.Sprintf("Skipped pull request %s#%d because current user is not requested for review", repo, prNumber)
-				return checkpoint, nil
-			}
-		}
-		if err := r.publishCommentOnlyReview(ctx, input, pending, detail); err != nil {
-			return checkpoint, err
-		}
-		if err := r.recordPublishedReviewProgress(ctx, input, pending, ReviewEventComment); err != nil {
-			return checkpoint, err
-		}
-		return checkpoint, nil
 	}
 	markerResult := ReviewMarkerResult{}
 	if pending.Event == reviewEventAgentNative {
@@ -3900,52 +3791,6 @@ func (r *Runner) postStampedPRCommentIfMissing(ctx context.Context, input stepIn
 	return nil
 }
 
-func (r *Runner) publishCommentOnlyReview(ctx context.Context, input stepInput, pending pendingReviewCheckpoint, detail PullRequestDetail) error {
-	_ = detail
-	completion, err := pendingReviewerCommentOnlyCompletion(pending)
-	if err != nil {
-		return &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
-	}
-	comments, err := r.github.ListIssueComments(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
-	if err != nil {
-		return &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
-	}
-	forgeComments := make([]forge.Comment, 0, len(comments))
-	for _, comment := range comments {
-		forgeComments = append(forgeComments, forge.Comment{ID: comment.ID, Body: comment.Body})
-	}
-	existingComment, existingSummary, err := forge.ParseUniqueReviewerSummaryComment(forgeComments)
-	if err != nil && !strings.Contains(err.Error(), "missing") {
-		return &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
-	}
-	summary, err := buildReviewerSummaryFromCompletion(existingSummary, completion)
-	if err != nil {
-		return &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
-	}
-	body, err := renderReviewerSummaryComment(summary, completion.Summary)
-	if err != nil {
-		return &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
-	}
-	body = stampIssueComment(r.disclosure, body, "reviewer")
-	disclosureAgent, disclosureModel := r.disclosureIdentity(input.Run)
-	if existingComment.ID != 0 {
-		if _, err := r.reviewerPublishFreshDetailForMutation(ctx, input, "updating comment-only review"); err != nil {
-			return err
-		}
-		if err := r.github.UpdateIssueComment(ctx, UpdateIssueCommentInput{Repo: input.Repo, CommentID: existingComment.ID, Body: body, CWD: input.Project.RepoPath, DisclosureAgent: disclosureAgent, DisclosureModel: disclosureModel}); err != nil {
-			return &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
-		}
-		return nil
-	}
-	if _, err := r.reviewerPublishFreshDetailForMutation(ctx, input, "creating comment-only review"); err != nil {
-		return err
-	}
-	if _, err := r.github.CreateIssueComment(ctx, IssueCommentInput{Repo: input.Repo, IssueNumber: input.PRNumber, Body: body, CWD: input.Project.RepoPath, DisclosureAgent: disclosureAgent, DisclosureModel: disclosureModel}); err != nil {
-		return &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
-	}
-	return nil
-}
-
 func stampedCommentAlreadyPosted(comments []map[string]any, marker string) bool {
 	if marker == "" {
 		return false
@@ -4187,255 +4032,6 @@ func reviewCompletionOutcome(result AgentResult) string {
 		return outcome
 	}
 	return ""
-}
-
-func parseReviewerCommentOnlyCompletion(result AgentResult) (reviewerCommentOnlyCompletion, error) {
-	var completion reviewerCommentOnlyCompletion
-	raw := result.Stdout
-	if strings.TrimSpace(result.Stderr) != "" {
-		raw += "\n" + result.Stderr
-	}
-	for _, payload := range agent.CompletionMarkerPayloads(raw) {
-		if err := json.Unmarshal([]byte(payload), &completion); err != nil {
-			return reviewerCommentOnlyCompletion{}, fmt.Errorf("parse reviewer comment-only completion: %w", err)
-		}
-		return validateReviewerCommentOnlyCompletion(completion)
-	}
-	return reviewerCommentOnlyCompletion{}, fmt.Errorf("reviewer comment-only completion marker is required")
-}
-
-func validateReviewerCommentOnlyCompletion(completion reviewerCommentOnlyCompletion) (reviewerCommentOnlyCompletion, error) {
-	completion.Summary = strings.TrimSpace(completion.Summary)
-	completion.Outcome = normalizeCommentOnlyOutcome(completion.Outcome)
-	if completion.Summary == "" {
-		return reviewerCommentOnlyCompletion{}, fmt.Errorf("reviewer comment-only completion summary is required")
-	}
-	if completion.Outcome == "" {
-		return reviewerCommentOnlyCompletion{}, fmt.Errorf("reviewer comment-only completion outcome must be clean, non_blocking, or blocking")
-	}
-	if completion.Outcome == "clean" {
-		if len(completion.Findings) != 0 {
-			return reviewerCommentOnlyCompletion{}, fmt.Errorf("reviewer comment-only clean completion must not include findings")
-		}
-		if !cleanReviewNoopSummary(completion.Summary) {
-			return reviewerCommentOnlyCompletion{}, fmt.Errorf("reviewer comment-only clean completion summary must start with \"No actionable findings\"")
-		}
-		return completion, nil
-	}
-	if len(completion.Findings) == 0 {
-		return reviewerCommentOnlyCompletion{}, fmt.Errorf("reviewer comment-only actionable completion must include at least one finding")
-	}
-	seenFindingIDs := map[forge.ReviewItemID]struct{}{}
-	for i := range completion.Findings {
-		finding := &completion.Findings[i]
-		finding.ReviewItemID = finding.ReviewItemID.Normalized()
-		finding.Title = strings.TrimSpace(finding.Title)
-		finding.Body = strings.TrimSpace(finding.Body)
-		if finding.Title == "" || finding.Body == "" {
-			return reviewerCommentOnlyCompletion{}, fmt.Errorf("reviewer comment-only finding %d requires title and body", i)
-		}
-		if finding.ReviewItemID != "" {
-			if _, exists := seenFindingIDs[finding.ReviewItemID]; exists {
-				return reviewerCommentOnlyCompletion{}, fmt.Errorf("reviewer comment-only completion duplicates review_item_id %q", finding.ReviewItemID)
-			}
-			seenFindingIDs[finding.ReviewItemID] = struct{}{}
-		}
-		seenSupersedes := map[forge.ReviewItemID]struct{}{}
-		files := finding.Files[:0]
-		for _, file := range finding.Files {
-			file = strings.TrimSpace(file)
-			if file != "" {
-				files = append(files, file)
-			}
-		}
-		finding.Files = files
-		supersedes := finding.Supersedes[:0]
-		for _, id := range finding.Supersedes {
-			id = id.Normalized()
-			if id == "" {
-				return reviewerCommentOnlyCompletion{}, fmt.Errorf("reviewer comment-only finding %q supersedes contains empty review_item_id", finding.Title)
-			}
-			if _, exists := seenSupersedes[id]; exists {
-				return reviewerCommentOnlyCompletion{}, fmt.Errorf("reviewer comment-only finding %q duplicates supersedes review_item_id %q", finding.Title, id)
-			}
-			seenSupersedes[id] = struct{}{}
-			supersedes = append(supersedes, id)
-		}
-		finding.Supersedes = supersedes
-	}
-	return completion, nil
-}
-
-func pendingReviewerCommentOnlyCompletion(pending pendingReviewCheckpoint) (reviewerCommentOnlyCompletion, error) {
-	if strings.TrimSpace(pending.ReviewerSummaryJSON) == "" {
-		return reviewerCommentOnlyCompletion{}, fmt.Errorf("reviewer comment-only structured completion is required for publish")
-	}
-	var completion reviewerCommentOnlyCompletion
-	if err := json.Unmarshal([]byte(pending.ReviewerSummaryJSON), &completion); err != nil {
-		return reviewerCommentOnlyCompletion{}, fmt.Errorf("parse pending reviewer comment-only completion: %w", err)
-	}
-	return validateReviewerCommentOnlyCompletion(completion)
-}
-
-func reviewerSummaryPromptContext(issueComments []map[string]any) string {
-	comments := make([]forge.Comment, 0, len(issueComments))
-	for _, comment := range issueComments {
-		body, _ := stringFromAny(comment["body"])
-		comments = append(comments, forge.Comment{Body: body})
-	}
-	_, summary, err := forge.ParseUniqueReviewerSummaryComment(comments)
-	if err != nil {
-		return ""
-	}
-	payload, err := json.MarshalIndent(summary, "", "  ")
-	if err != nil {
-		return ""
-	}
-	return "Existing Reviewer Summary authority: when a semantic issue is unchanged, reuse its `review_item_id` exactly. If a new issue materially replaces older items, include those prior IDs in `supersedes`. If an old issue is truly gone, omit it from `findings` so Looper can mark it resolved. Existing summary JSON:\n```json\n" + string(payload) + "\n```"
-}
-
-func buildReviewerSummaryFromCompletion(existing forge.ReviewerSummary, completion reviewerCommentOnlyCompletion) (forge.ReviewerSummary, error) {
-	reviewRoundID := 1
-	if existing.ReviewRoundID > 0 {
-		reviewRoundID = existing.ReviewRoundID + 1
-	}
-	itemsByID := map[forge.ReviewItemID]forge.ReviewItem{}
-	maxID := 0
-	for _, item := range existing.Items {
-		itemsByID[item.ReviewItemID] = item
-		if n, ok := parseReviewItemOrdinal(item.ReviewItemID); ok && n > maxID {
-			maxID = n
-		}
-	}
-	updatedExistingIDs := map[forge.ReviewItemID]struct{}{}
-	for _, finding := range completion.Findings {
-		if finding.ReviewItemID != "" {
-			updatedExistingIDs[finding.ReviewItemID] = struct{}{}
-		}
-	}
-	assigned := map[forge.ReviewItemID]struct{}{}
-	supersededTargets := map[forge.ReviewItemID]forge.ReviewItemID{}
-	updated := make([]forge.ReviewItem, 0, len(existing.Items)+len(completion.Findings))
-	for _, finding := range completion.Findings {
-		id := finding.ReviewItemID
-		if id != "" {
-			if _, ok := itemsByID[id]; !ok {
-				return forge.ReviewerSummary{}, fmt.Errorf("reviewer comment-only completion references unknown review_item_id %q", id)
-			}
-		} else {
-			// Sole mint point for a Review Item ID: a finding the agent
-			// reported without claiming continuity with an existing item.
-			maxID++
-			id = forge.ReviewItemID(fmt.Sprintf("R-%03d", maxID))
-		}
-		if _, exists := assigned[id]; exists {
-			return forge.ReviewerSummary{}, fmt.Errorf("reviewer comment-only completion assigns review_item_id %q more than once", id)
-		}
-		assigned[id] = struct{}{}
-		for _, supersededID := range finding.Supersedes {
-			old, ok := itemsByID[supersededID]
-			if !ok {
-				return forge.ReviewerSummary{}, fmt.Errorf("reviewer comment-only completion supersedes unknown review_item_id %q", supersededID)
-			}
-			if _, exists := updatedExistingIDs[supersededID]; exists {
-				return forge.ReviewerSummary{}, fmt.Errorf("reviewer comment-only completion supersedes updated review_item_id %q", supersededID)
-			}
-			if old.Status == forge.ReviewItemStatusSuperseded && old.SupersededBy != id {
-				return forge.ReviewerSummary{}, fmt.Errorf("reviewer comment-only completion cannot supersede already-superseded review_item_id %q", supersededID)
-			}
-			if prior, exists := supersededTargets[supersededID]; exists && prior != id {
-				return forge.ReviewerSummary{}, fmt.Errorf("reviewer comment-only completion supersedes review_item_id %q more than once", supersededID)
-			}
-			supersededTargets[supersededID] = id
-		}
-		updated = append(updated, forge.ReviewItem{ReviewItemID: id, Status: forge.ReviewItemStatusOpen, Title: finding.Title, Body: finding.Body, Files: append([]string(nil), finding.Files...), Supersedes: append([]forge.ReviewItemID(nil), finding.Supersedes...), LastSeenRoundID: reviewRoundID})
-	}
-	seenUpdated := map[forge.ReviewItemID]forge.ReviewItem{}
-	for _, item := range updated {
-		seenUpdated[item.ReviewItemID] = item
-	}
-	finalItems := make([]forge.ReviewItem, 0, len(existing.Items)+len(updated))
-	for _, item := range existing.Items {
-		if replacementID, superseded := supersededTargets[item.ReviewItemID]; superseded {
-			item.Status = forge.ReviewItemStatusSuperseded
-			item.SupersededBy = replacementID
-			item.LastSeenRoundID = reviewRoundID
-			finalItems = append(finalItems, item)
-			continue
-		}
-		if replacement, ok := seenUpdated[item.ReviewItemID]; ok {
-			finalItems = append(finalItems, replacement)
-			delete(seenUpdated, item.ReviewItemID)
-			continue
-		}
-		if item.Status == forge.ReviewItemStatusOpen {
-			item.Status = forge.ReviewItemStatusResolved
-			item.SupersededBy = ""
-			item.LastSeenRoundID = reviewRoundID
-		}
-		finalItems = append(finalItems, item)
-	}
-	for _, item := range updated {
-		if _, exists := itemsByID[item.ReviewItemID]; exists {
-			continue
-		}
-		finalItems = append(finalItems, item)
-	}
-	summary := forge.NewReviewerSummary(reviewRoundID, finalItems)
-	summary.LatestFixerRoundID = existing.LatestFixerRoundID
-	return summary, forge.ValidateReviewerSummary(summary)
-}
-
-func parseReviewItemOrdinal(id forge.ReviewItemID) (int, bool) {
-	raw := string(id)
-	if !strings.HasPrefix(raw, "R-") {
-		return 0, false
-	}
-	n, err := strconv.Atoi(strings.TrimPrefix(raw, "R-"))
-	if err != nil || n <= 0 {
-		return 0, false
-	}
-	return n, true
-}
-
-func renderReviewerSummaryComment(summary forge.ReviewerSummary, visibleSummary string) (string, error) {
-	marker, err := forge.RenderReviewerSummary(summary)
-	if err != nil {
-		return "", err
-	}
-	visibleSummary = strings.TrimSpace(visibleSummary)
-	open := 0
-	resolved := 0
-	superseded := 0
-	lines := []string{"## Reviewer Summary", fmt.Sprintf("Review round: %d", summary.ReviewRoundID)}
-	if visibleSummary != "" {
-		lines = append(lines, "", visibleSummary)
-	}
-	for _, item := range summary.Items {
-		switch item.Status {
-		case forge.ReviewItemStatusOpen:
-			open++
-		case forge.ReviewItemStatusResolved:
-			resolved++
-		case forge.ReviewItemStatusSuperseded:
-			superseded++
-		}
-	}
-	lines = append(lines, "", fmt.Sprintf("Open: %d · Resolved: %d · Superseded: %d", open, resolved, superseded))
-	if open > 0 {
-		lines = append(lines, "", "### Open items")
-		for _, item := range summary.Items {
-			if item.Status != forge.ReviewItemStatusOpen {
-				continue
-			}
-			line := fmt.Sprintf("- **%s** `%s`", item.ReviewItemID, item.Title)
-			if len(item.Files) > 0 {
-				line += fmt.Sprintf(" (%s)", strings.Join(item.Files, ", "))
-			}
-			lines = append(lines, line, "  "+item.Body)
-		}
-	}
-	return strings.Join(lines, "\n") + "\n\n" + marker, nil
 }
 
 func cleanApprovedReviewMarker(found ReviewMarkerResult) bool {
@@ -6018,7 +5614,7 @@ func (r *Runner) ensureLoopMetadataJSON(current *string, projectID, repo string,
 		reviewEventsMeta = map[string]any{}
 	}
 	// Snapshot the per-project policy (not only the runner-wide global default)
-	// so Forgejo projects with clean=APPROVE / blocking=REQUEST_CHANGES keep
+	// so a project overriding clean=APPROVE / blocking=REQUEST_CHANGES keeps
 	// those outcomes in loop metadata and the trusted proxy policy.
 	projectReviewEvents := r.reviewEventsForProject(projectID)
 	if cleanRaw, present := reviewEventsMeta["clean"]; present {
@@ -6415,7 +6011,7 @@ func buildPullRequestLockKey(item storage.QueueItemRecord) string {
 func buildReviewPrompt(repo string, prNumber int64, checkpoint reviewerCheckpoint, runID string, idempotencyKey string, reviewEvents config.ReviewerReviewEventsConfig, manual bool, scope config.ReviewerScope, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string, looperCLIPath string) string {
 	cfg, _ := config.Normalize("")
 	cfg.Instructions.Enabled = false
-	prompt, _ := buildReviewPromptWithInstructions("", cfg, repo, prNumber, checkpoint, runID, idempotencyKey, reviewEvents, manual, true, "", scope, disclosureCfg, agentRuntime, agentModel, looperCLIPath, false, false)
+	prompt, _ := buildReviewPromptWithInstructions("", cfg, repo, prNumber, checkpoint, runID, idempotencyKey, reviewEvents, manual, true, "", scope, disclosureCfg, agentRuntime, agentModel, looperCLIPath, false)
 	return prompt
 }
 
@@ -6487,7 +6083,7 @@ func reviewerAgentSideGitHubFetchContract() string {
 	}, "\n")
 }
 
-func buildReviewPromptWithInstructions(projectID string, instructionConfig config.Config, repo string, prNumber int64, checkpoint reviewerCheckpoint, runID string, idempotencyKey string, reviewEvents config.ReviewerReviewEventsConfig, manual bool, requireReviewRequest bool, reviewRequestBypassReason string, scope config.ReviewerScope, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string, looperCLIPath string, autoMergeEnabled bool, commentOnlyPublish bool) (string, config.CustomInstructionBlock) {
+func buildReviewPromptWithInstructions(projectID string, instructionConfig config.Config, repo string, prNumber int64, checkpoint reviewerCheckpoint, runID string, idempotencyKey string, reviewEvents config.ReviewerReviewEventsConfig, manual bool, requireReviewRequest bool, reviewRequestBypassReason string, scope config.ReviewerScope, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string, looperCLIPath string, autoMergeEnabled bool) (string, config.CustomInstructionBlock) {
 	looperCLIPath = normalizeLooperCLIPath(looperCLIPath)
 	looperCLICommand := shellQuote(looperCLIPath)
 	phase := resolvePullRequestPhase(detailLabels(checkpoint.Detail))
@@ -6495,11 +6091,7 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 	if phase == "spec" {
 		phaseInstruction = "This is a spec review. Focus on scope, correctness, feasibility, risks, and validation. Do not review implementation details beyond whether the spec is actionable."
 	}
-	forgejoNative := forge.NewResolver(instructionConfig).ForProject(projectID).UsesNativePullRequestAPI() && !commentOnlyPublish
-	forgeName := "GitHub"
-	if forgejoNative {
-		forgeName = "Forgejo"
-	}
+	const forgeName = "GitHub"
 	publishInstruction := fmt.Sprintf("For actionable findings, you must publish the %s review yourself by calling looper's enforced review-submit wrapper from the shell. For no-actionable-finding results, follow the clean-result publishing instructions for this run. Do not return review JSON for looper to parse; looper will not parse review content or post forge comments for you after the agent exits.", forgeName)
 	if looperCLIPath == "" {
 		publishInstruction = "A trusted Looper CLI review-submit wrapper is unavailable for this run, so fail closed: do not publish any GitHub review, do not add or remove any GitHub reaction, and exit non-zero with the exact message `trusted looper review submit wrapper unavailable`."
@@ -6511,15 +6103,6 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 		cleanResultCompletionInstruction = "Prefer 3 deeply specific comments over 10 shallow comments. Group related findings by file, subsystem, function, or rule in a single review round instead of splitting adjacent concerns across multiple small reviews. If there is no concrete actionable feedback, do not finish successfully or add a clean signal because the trusted wrapper is unavailable; exit non-zero with the exact message `trusted looper review submit wrapper unavailable`. Do not invent feedback."
 	}
 	fetchContract := reviewerAgentSideGitHubFetchContract()
-	if forgejoNative {
-		fetchContract = "Provider-supplied Forgejo review context: Looper fetched the native PR metadata, review decision/history, requested reviewers, and diff before invoking you. Use the prepared local worktree plus this supplied context; Forgejo-only runs do not require `gh`. Publish only through the trusted Looper review-submit wrapper."
-	}
-	if commentOnlyPublish {
-		publishInstruction = "This provider is comment-only. Looper supplied the PR metadata and diff in this prompt/context and will publish exactly one top-level PR comment from your final completion summary after re-checking local idempotency. Do not publish anything yourself or attempt native review features."
-		outcomeInstruction = "If there are actionable findings, finish successfully with a concise markdown summary and set the final `__LOOPER_RESULT__` JSON fields to include: `summary` (same human summary), `outcome` (`non_blocking` or `blocking`), and `findings` (an array of actionable issues only). Each finding object MUST contain `title`, `body`, and optional `files`; include `review_item_id` when the issue matches an existing Reviewer Summary item unchanged, and include `supersedes` with prior `review_item_id` values only when this finding materially replaces older items. If there are no actionable findings, set `outcome` to `clean`, keep `findings` empty, and start `summary` with `No actionable findings`. Do not include terminal logs, extra JSON payloads, or publishing commands."
-		cleanResultCompletionInstruction = "Prefer a concise, specific final summary over many shallow notes. If there is no concrete actionable feedback, start the final summary with `No actionable findings`. Do not invent feedback."
-		fetchContract = "Provider-supplied Forgejo review context: Looper fetched PR metadata and diff before invoking you. Use the prepared local worktree plus the supplied metadata/diff as the review context; do not use GitHub CLI/API commands or native review/thread features."
-	}
 	parts := []string{fmt.Sprintf("Review pull request %s#%d.", repo, prNumber), buildReviewerMinimalPRSeed(repo, prNumber, checkpoint, scope), fetchContract, "Phase: " + phase, phaseInstruction, reviewerScopeInstruction(scope), publishInstruction, fmt.Sprintf("Review idempotency marker prefix: <!-- looper:review id=%s head=%s outcome=clean|non_blocking|blocking -->", idempotencyKey, snapshotHeadSHA(checkpoint)), outcomeInstruction, "Run ID for logging only, not for idempotency: " + runID}
 	if checkpoint.Detail != nil && len(checkpoint.Detail.Labels) > 0 {
 		parts = append(parts, "Current labels: "+strings.Join(checkpoint.Detail.Labels, ", "))
@@ -6534,11 +6117,6 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 		}
 		if checkpoint.Snapshot.UnresolvedThreadCount != nil {
 			parts = append(parts, fmt.Sprintf("Unresolved threads: %d", *checkpoint.Snapshot.UnresolvedThreadCount))
-		}
-	}
-	if commentOnlyPublish && checkpoint.Detail != nil {
-		if summaryContext := reviewerSummaryPromptContext(checkpoint.Detail.IssueComments); summaryContext != "" {
-			parts = append(parts, summaryContext)
 		}
 	}
 	instructionBlock := config.BuildCustomInstructionBlock(instructionConfig, projectID, "reviewer")
@@ -6579,31 +6157,11 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 	} else if !requireReviewRequest {
 		reviewRequestInstruction = "This reviewer configuration does not require a current-user review request before posting."
 	}
-	if commentOnlyPublish {
-		parts = append(parts,
-			"Comment-only publish contract: Looper will post your final completion summary as one top-level PR comment after it verifies the PR is still open, the head SHA still matches, and this head has not already been published locally. Do not publish anything yourself.",
-			"Review pass contract: complete one full review pass before finalizing. Use the supplied PR metadata, supplied diff, and local worktree to inspect every changed file/range in scope. Do not stop after the first issue. If a blocking issue is visible in the current PR head and review context, include it in this review rather than deferring it to a later pass.",
-			"Finding accumulator contract: accumulate candidate findings internally before finalizing. For each candidate, track location, severity, evidence, why it matters, and a suggested fix. Deduplicate, merge same-root-cause findings, and prefer fewer deep comments over many shallow ones.",
-			"Severity rubric: mark a finding as BLOCKING only when it can realistically cause incorrect behavior, data loss/corruption, security exposure, broken public API/protocol/config/migration/backward compatibility, failing existing or necessary tests, race/deadlock/resource leak, transaction/lifecycle inconsistency, clear production risk, or failure to satisfy the PR's stated goal. Mark actionable but merge-safe improvements as NON_BLOCKING. Mark tiny style, naming, wording, formatting, or subjective preferences as NIT; NITs must not block merge.",
-			"Finalization gate before completion: verify that the scoped changed files/ranges were reviewed, all observed blocking findings are included, repeated patterns are consolidated, non-blocking/nit feedback is not escalated, every finding has concrete evidence and a suggested fix, and the summary outcome matches the highest severity.",
-			cleanResultCompletionInstruction,
-			"Every finding MUST include: (1) an exact file/section/symbol reference, (2) the concrete problem, (3) why it matters, (4) evidence from the changed lines or spec section, and (5) a specific suggested change.",
-			"Implementation review rubric: check correctness, error handling, tests, concurrency, config compatibility, security, resource lifecycle, observability, migrations, and backward compatibility. Only report issues that are concrete and actionable.",
-		)
-		return agent.AppendCompletionInstruction(strings.Join(parts, "\n\n")), instructionBlock
-	}
 	githubOperationContract := fmt.Sprintf("GitHub operation contract: when there are actionable findings, submit exactly one PR review for this run through the trusted Looper CLI at %s, with the review JSON on stdin. The wrapper validates inline anchors against the live PR diff before it calls GitHub; do not use PATH-based `looper`, repository-local `go run ./cmd/looper`, `gh api repos/%s/pulls/%d/reviews`, or `gh pr review` directly for the review submission.", actionableReviewSubmitCommand, repo, prNumber)
 	submitPayloadInstruction := fmt.Sprintf("When submitting through `%s review submit`, pass stdin JSON with `body` and optional `comments` entries using GitHub's review comment fields: `path`, `line`, `side` (`RIGHT` for new diff lines, `LEFT` for old diff lines), optional `start_line` and `start_side` for multiline ranges, and `body` for the actionable feedback.", looperCLICommand)
 	idempotencyInstruction := "Idempotency requirement: before posting anything, use `gh api` to list existing PR reviews for this PR. Only treat an existing marker as satisfying this run when the review body contains the exact idempotency id and expected head SHA, and the review state matches the required outcome-specific policy for this run. If such a matching review already exists, do not post another review. Instead, rely on Looper to validate that marker after the agent exits and to reconcile clean-signal reactions/spec label transitions as needed. If the marker exists but the outcome/review-state combination does not satisfy this run, ignore it and publish the correct review for this run instead."
 	freshnessInstruction := "Before posting, use `gh` to confirm the PR is still open and the head SHA still matches the expected head SHA. If it changed, do not post a review and exit non-zero with the exact message `PR head changed before publish`."
 	anchorInstruction := "Before posting, validate every inline review comment's `path`, `line`, `side`, `start_line`, and `start_side` against the live PR diff fetched with `gh pr diff`. Preserve exact anchors that fit the live diff. If an otherwise useful comment is outside the live diff's anchorable locations, safely downgrade it to top-level review body feedback that starts with clear fallback location text instead of submitting an invalid inline anchor."
-	if forgejoNative {
-		githubOperationContract = fmt.Sprintf("Forgejo operation contract: submit exactly one native PR review for this run through the trusted Looper CLI at %s, with review JSON on stdin. The wrapper validates the expected head, current review request, content safety, provider capability, and idempotency marker before it calls Forgejo. Do not call the Forgejo review API directly.", actionableReviewSubmitCommand)
-		submitPayloadInstruction = fmt.Sprintf("When submitting through `%s review submit`, pass stdin JSON with `body` and optional `comments` entries using `path`, `line`, `side` (`RIGHT` for new lines, `LEFT` for old lines), and `body`; the wrapper maps validated anchors to Forgejo positions.", looperCLICommand)
-		idempotencyInstruction = "Idempotency requirement: submit only through the trusted Looper wrapper. The wrapper lists existing native Forgejo reviews and reuses an exact id/head/outcome/state marker match; after the agent exits, the runner verifies the same marker before recording publication. Never call the Forgejo review endpoint directly."
-		freshnessInstruction = "Before posting, rely on the trusted Looper wrapper to confirm the Forgejo PR is still open and the head SHA still matches. If it reports drift, exit non-zero with the exact message `PR head changed before publish`."
-		anchorInstruction = "Before posting, validate every inline review comment against the supplied Forgejo diff and local worktree. Preserve exact changed-file anchors; downgrade unanchorable feedback to a top-level review-body item with an exact file/section/symbol reference."
-	}
 	if looperCLIPath == "" {
 		githubOperationContract = "GitHub operation contract: a trusted Looper CLI path was not detected for this reviewer run, so you cannot safely publish a GitHub review. Do not call PATH-based `looper`, repository-local `go run ./cmd/looper`, `gh api repos/.../pulls/.../reviews`, or `gh pr review` directly; exit non-zero with the exact message `trusted looper review submit wrapper unavailable`."
 		submitPayloadInstruction = ""

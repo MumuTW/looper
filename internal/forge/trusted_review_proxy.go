@@ -107,9 +107,9 @@ type TrustedReviewProxyPolicy struct {
 // TrustedReviewSockEnv), never a secret-bearing wrapper path, config snapshot
 // path, or LOOPER_TRUSTED_ENV_FILE.
 //
-// trustedEnv may be empty for tea-backed Forgejo providers that have no
-// tokenEnv. The proxy still binds PR/CWD/policy/config so agents cannot retarget
-// review submit; tea credentials resolve from the daemon process environment.
+// trustedEnv may be empty for providers that have no tokenEnv, which is the
+// normal case: `gh` resolves its own ambient credentials in the child. The proxy
+// still binds PR/CWD/policy/config so agents cannot retarget review submit.
 //
 // allowedPRRef must be the daemon-selected pull request in owner/repo#N form.
 // The proxy rejects any review-submit argv that targets a different PR so a

@@ -16,8 +16,8 @@ import (
 // review-phase run here is one that would normally receive a proxy socket.
 func nativeReviewAdapterConfig(workDir string) *config.Config {
 	return &config.Config{
-		Providers: []config.ProviderConfig{{ID: "fj", Kind: config.ProviderKindForgejo, BaseURL: "https://forgejo.example.test", TokenEnv: stringPtr("FORGEJO_TOKEN")}},
-		Projects:  []config.ProjectRefConfig{{ID: "forgejo-native", Name: "Forgejo", Provider: "fj", Repo: "acme/looper", RepoPath: workDir}},
+		Providers: []config.ProviderConfig{{ID: "fj", Kind: config.ProviderKindGitHub, BaseURL: "https://ghe.example.test", TokenEnv: stringPtr("GHES_TOKEN")}},
+		Projects:  []config.ProjectRefConfig{{ID: "ghes-native", Name: "GHES", Provider: "fj", Repo: "acme/looper", RepoPath: workDir}},
 		Roles:     config.RoleConfigs{Reviewer: config.ReviewerRoleConfig{Behavior: config.ReviewerConfig{PublishMode: config.ReviewerPublishModeSingleReview}}},
 	}
 }
@@ -25,7 +25,7 @@ func nativeReviewAdapterConfig(workDir string) *config.Config {
 func nativeReviewAdapterInput(workDir string) reviewer.AgentRunInput {
 	return reviewer.AgentRunInput{
 		ExecutionID:      "reviewer_wrapper_unavailable",
-		ProjectID:        "forgejo-native",
+		ProjectID:        "ghes-native",
 		RunID:            "run_reviewer",
 		WorkingDirectory: workDir,
 		Prompt:           "review",
@@ -63,7 +63,7 @@ func TestReviewerAgentStartRefusesWithThePromptsWordingWhenWrapperUnavailable(t 
 		// Empty because the capability probe rejected the binary, or none was
 		// configured at all — the same value the prompt was built from.
 		realLooper: "",
-		trustedEnv: map[string]string{"FORGEJO_TOKEN": "test-token"},
+		trustedEnv: map[string]string{"PROVIDER_TOKEN": "test-token"},
 		config:     nativeReviewAdapterConfig(workDir),
 	}
 

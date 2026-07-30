@@ -54,7 +54,7 @@ func TestFailureStreakHandoffRejectsOperatorRepeatedPauseBeforeInitialRead(t *te
 	checkpoint := fixerCheckpoint{Detail: &checkpointDetail{HeadSHA: "head-a"}}
 	var wakes int
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now, OnQueueItemEnqueued: func() { wakes++ }})
-	resumed, err := runner.finishFailureStreakBreaker(ctx, storage.ProjectRecord{ID: projectID}, breakerPause, queue, &checkpoint)
+	resumed, err := runner.finishFailureStreakBreaker(ctx, storage.ProjectRecord{ID: projectID}, breakerPause, queue, "", &checkpoint)
 	if err != nil {
 		t.Fatalf("finishFailureStreakBreaker() error = %v", err)
 	}
@@ -116,7 +116,7 @@ func TestFailureStreakHandoffRejectsOperatorTerminateBeforeInitialRead(t *testin
 	checkpoint := fixerCheckpoint{Detail: &checkpointDetail{HeadSHA: "head-a"}}
 	var wakes int
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now, OnQueueItemEnqueued: func() { wakes++ }})
-	resumed, err := runner.finishFailureStreakBreaker(ctx, storage.ProjectRecord{ID: projectID}, breakerPause, queue, &checkpoint)
+	resumed, err := runner.finishFailureStreakBreaker(ctx, storage.ProjectRecord{ID: projectID}, breakerPause, queue, "", &checkpoint)
 	if err != nil {
 		t.Fatalf("finishFailureStreakBreaker() error = %v", err)
 	}

@@ -74,8 +74,8 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 	if !isValidReviewerScope(config.Roles.Reviewer.Behavior.Scope) {
 		issues = append(issues, ValidationIssue{Path: "roles.reviewer.behavior.scope", Message: fmt.Sprintf("must be one of: %s, %s, %s", ReviewerScopeFullPR, ReviewerScopeChangedFiles, ReviewerScopeChangedRanges)})
 	}
-	if config.Roles.Reviewer.Behavior.PublishMode != ReviewerPublishModeSingleReview && config.Roles.Reviewer.Behavior.PublishMode != ReviewerPublishModeSummaryComment {
-		issues = append(issues, ValidationIssue{Path: "roles.reviewer.behavior.publishMode", Message: fmt.Sprintf("must be %s or %s", ReviewerPublishModeSingleReview, ReviewerPublishModeSummaryComment)})
+	if config.Roles.Reviewer.Behavior.PublishMode != ReviewerPublishModeSingleReview {
+		issues = append(issues, ValidationIssue{Path: "roles.reviewer.behavior.publishMode", Message: fmt.Sprintf("must be %s", ReviewerPublishModeSingleReview)})
 	}
 	if !isValidReviewerThreadResolutionMode(config.Roles.Reviewer.Behavior.ThreadResolution.Mode) {
 		issues = append(issues, ValidationIssue{Path: "roles.reviewer.behavior.threadResolution.mode", Message: fmt.Sprintf("must be one of: %s, %s, %s, %s", ReviewerThreadResolutionModeReportOnly, ReviewerThreadResolutionModeCommentOnly, ReviewerThreadResolutionModeSuggestResolution, ReviewerThreadResolutionModeResolveObjective)})
@@ -130,39 +130,11 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 		if reason, removed := removedProviderKinds[provider.Kind]; removed {
 			issues = append(issues, ValidationIssue{Path: prefix + ".kind", Message: fmt.Sprintf("provider kind %q is no longer supported: %s", provider.Kind, reason)})
 		} else if !isValidProviderKind(provider.Kind) {
-			issues = append(issues, ValidationIssue{Path: prefix + ".kind", Message: fmt.Sprintf("must be one of: %s, %s", ProviderKindGitHub, ProviderKindForgejo)})
-		}
-		if provider.Kind == ProviderKindForgejo {
-			if !isAbsoluteHTTPURL(provider.BaseURL) {
-				issues = append(issues, ValidationIssue{Path: prefix + ".baseUrl", Message: "must be an absolute http(s) URL for forgejo providers"})
-			}
-			auth := EffectiveProviderAuth(provider)
-			switch auth {
-			case ProviderAuthTea:
-				if isNilOrEmptyString(provider.TeaLogin) {
-					issues = append(issues, ValidationIssue{Path: prefix + ".teaLogin", Message: "is required when auth is tea"})
-				}
-				if !isNilOrEmptyString(provider.TokenEnv) {
-					issues = append(issues, ValidationIssue{Path: prefix + ".tokenEnv", Message: "must be omitted when auth is tea"})
-				}
-			case ProviderAuthTokenEnv:
-				if isNilOrEmptyString(provider.TokenEnv) {
-					issues = append(issues, ValidationIssue{Path: prefix + ".tokenEnv", Message: "is required when auth is token-env"})
-				}
-				if !isNilOrEmptyString(provider.TeaLogin) {
-					issues = append(issues, ValidationIssue{Path: prefix + ".teaLogin", Message: "must be omitted when auth is token-env"})
-				}
-			case "":
-				if provider.Auth != "" {
-					issues = append(issues, ValidationIssue{Path: prefix + ".auth", Message: fmt.Sprintf("must be one of: %s, %s", ProviderAuthTokenEnv, ProviderAuthTea)})
-				} else if !isNilOrEmptyString(provider.TokenEnv) && !isNilOrEmptyString(provider.TeaLogin) {
-					issues = append(issues, ValidationIssue{Path: prefix + ".auth", Message: "must be set explicitly when both tokenEnv and teaLogin are present"})
-				} else {
-					issues = append(issues, ValidationIssue{Path: prefix + ".auth", Message: fmt.Sprintf("must be %s (with tokenEnv) or %s (with teaLogin)", ProviderAuthTokenEnv, ProviderAuthTea)})
-				}
-			default:
-				issues = append(issues, ValidationIssue{Path: prefix + ".auth", Message: fmt.Sprintf("must be one of: %s, %s", ProviderAuthTokenEnv, ProviderAuthTea)})
-			}
+			issues = append(issues, ValidationIssue{Path: prefix + ".kind", Message: fmt.Sprintf("must be: %s", ProviderKindGitHub)})
+		} else if strings.TrimSpace(provider.BaseURL) != "" && !isAbsoluteHTTPURL(provider.BaseURL) {
+			// baseUrl is optional and is only a repository-identity discriminator
+			// (it never routes gh); when set it must be an absolute http(s) URL.
+			issues = append(issues, ValidationIssue{Path: prefix + ".baseUrl", Message: "must be an absolute http(s) URL"})
 		}
 	}
 
@@ -170,13 +142,9 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 	projectRepos := make(map[string]int, len(config.Projects))
 	for index, project := range config.Projects {
 		prefix := fmt.Sprintf("projects[%d]", index)
-		providerKind := ProviderKindGitHub
 		if strings.TrimSpace(project.Provider) != "" {
-			kind, exists := providerIDs[project.Provider]
-			if !exists {
+			if _, exists := providerIDs[project.Provider]; !exists {
 				issues = append(issues, ValidationIssue{Path: prefix + ".provider", Message: fmt.Sprintf("references unknown provider id: %s", project.Provider)})
-			} else {
-				providerKind = kind
 			}
 		}
 
@@ -199,13 +167,11 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 		if project.RepoPath == "" {
 			issues = append(issues, ValidationIssue{Path: prefix + ".repoPath", Message: "must be a non-empty path"})
 		}
-		if providerKind == ProviderKindForgejo {
-			if strings.TrimSpace(project.Provider) == "" {
-				issues = append(issues, ValidationIssue{Path: prefix + ".provider", Message: "is required for forgejo projects"})
-			}
-			if strings.TrimSpace(project.Repo) == "" {
-				issues = append(issues, ValidationIssue{Path: prefix + ".repo", Message: "is required for forgejo projects"})
-			}
+		if strings.TrimSpace(project.Provider) != "" && strings.TrimSpace(project.Repo) == "" {
+			// A provider binding names the remote a project's automation targets.
+			// Without repo the project materializes with no remote and every lane
+			// silently skips it, so reject it here instead of starting inert.
+			issues = append(issues, ValidationIssue{Path: prefix + ".repo", Message: "is required for a project bound to an explicit provider"})
 		}
 		if strings.TrimSpace(project.Repo) != "" {
 			identity, resolved := ProjectRepositoryIdentity(config, project)
@@ -217,12 +183,6 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 		}
 		if project.Path != "" && project.RepoPath != "" && project.Path != project.RepoPath {
 			issues = append(issues, ValidationIssue{Path: prefix + ".path", Message: "must match repoPath when both path and repoPath are set"})
-		}
-		if providerKind == ProviderKindForgejo && project.Webhook.Mode != "" {
-			issues = append(issues, ValidationIssue{Path: prefix + ".webhook.mode", Message: "must be omitted for forgejo projects; forgejo MVP uses polling only"})
-		}
-		if providerKind == ProviderKindForgejo && normalizeNetworkMode(project.Network.Mode) == NetworkModeRouted {
-			issues = append(issues, ValidationIssue{Path: prefix + ".network.mode", Message: "must be off for forgejo projects; routed network mode is not supported"})
 		}
 		if !isValidWebhookModeOrEmpty(project.Webhook.Mode) {
 			issues = append(issues, ValidationIssue{Path: prefix + ".webhook.mode", Message: fmt.Sprintf("must be one of: %s, %s", WebhookModeGHForward, WebhookModeTunnel)})
@@ -250,10 +210,11 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 		if project.Roles != nil && project.Roles.Coordinator != nil {
 			validateCoordinatorRoleConfig(effectiveProjectRoles.Coordinator, prefix+".roles.coordinator", &issues)
 		}
-		if providerKind == ProviderKindForgejo {
-			validateForgejoRoleCapabilities(effectiveProjectRoles, prefix, &issues)
-		} else if effectiveProjectRoles.Reviewer.Behavior.PublishMode == ReviewerPublishModeSummaryComment {
-			issues = append(issues, ValidationIssue{Path: prefix + ".roles.reviewer.behavior.publishMode", Message: "summary_comment is supported only for forgejo projects"})
+		// The effective per-project mode needs its own check: the global check
+		// above cannot see a project override, and the removed summary_comment
+		// implementation would otherwise fall through to single_review silently.
+		if effectiveProjectRoles.Reviewer.Behavior.PublishMode != ReviewerPublishModeSingleReview {
+			issues = append(issues, ValidationIssue{Path: prefix + ".roles.reviewer.behavior.publishMode", Message: fmt.Sprintf("must be %s", ReviewerPublishModeSingleReview)})
 		}
 		if normalizeNetworkMode(project.Network.Mode) == NetworkModeRouted {
 			validateRoutedProjectPrerequisites(config, effectiveProjectRoles, prefix, &issues)
@@ -317,6 +278,32 @@ func validateServerConfig(server ServerConfig, issues *[]ValidationIssue) {
 	}
 	if server.AuthMode == AuthModeLocalToken && isNilOrEmptyString(server.LocalToken) {
 		*issues = append(*issues, ValidationIssue{Path: "server.localToken", Message: "is required when authMode is local-token"})
+	}
+	if server.BaseURL != nil && strings.TrimSpace(*server.BaseURL) != "" {
+		canonical, err := CanonicalizeServerBaseURL(*server.BaseURL)
+		if err != nil {
+			*issues = append(*issues, ValidationIssue{Path: "server.baseUrl", Message: err.Error()})
+		} else {
+			// The canonical form is the single authority consumers (CLI dialing,
+			// browser Host/Origin allowlisting) read. The load pipeline stores
+			// it via Normalize, but configs constructed directly bypass that
+			// step and Validate only computes canonical without storing it, so
+			// a raw spelling like "https://daemon.example:0443" would pass here
+			// while allowedAuthorities records port "0443" and the browser omits
+			// the default :443. Require the stored value to already be canonical
+			// at this boundary so direct-config paths cannot diverge.
+			if *server.BaseURL != canonical {
+				*issues = append(*issues, ValidationIssue{Path: "server.baseUrl", Message: "must be in canonical form; the load pipeline canonicalizes server.baseUrl, but configs constructed directly must set the canonical value (lowercase scheme/host, no trailing slash, default ports omitted) themselves"})
+			} else if server.AuthMode == AuthModeNone {
+				// A non-loopback advertised authority means a proxy or tunnel
+				// fronts the daemon; the token-less loopback trust model does not
+				// survive that hop (a local proxy can deliver remote requests with
+				// a loopback peer address and the configured public Host/Origin).
+				if parsed, parseErr := url.Parse(canonical); parseErr == nil && !isLoopbackBindHost(parsed.Hostname()) {
+					*issues = append(*issues, ValidationIssue{Path: "server.authMode", Message: "none is allowed only when server.baseUrl advertises a loopback authority; use local-token when a proxy, tunnel, or public hostname fronts the daemon"})
+				}
+			}
+		}
 	}
 }
 
@@ -516,7 +503,146 @@ func isValidNetworkMode(mode NetworkMode) bool {
 }
 
 func isValidProviderKind(kind ProviderKind) bool {
-	return kind == ProviderKindGitHub || kind == ProviderKindForgejo
+	return kind == ProviderKindGitHub
+}
+
+// CanonicalizeServerBaseURL validates value as the daemon's advertised base
+// URL and returns its canonical form: lowercase http(s) scheme and host, a
+// required host, no userinfo, query, or fragment, and an absolute path with
+// no trailing slash and no empty, ".", or ".." segments. Every consumer of
+// server.baseUrl (CLI dialing, browser Host/Origin allowlisting, webhook
+// endpoint display) reads the canonical form the load pipeline stores, so
+// path concatenation and origin comparison cannot diverge.
+func CanonicalizeServerBaseURL(value string) (string, error) {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return "", errors.New("must be an absolute http(s) URL")
+	}
+
+	parsed, err := url.Parse(trimmed)
+	if err != nil {
+		return "", errors.New("must be a parseable absolute http(s) URL")
+	}
+
+	scheme := strings.ToLower(parsed.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return "", errors.New("must use the http or https scheme")
+	}
+	if parsed.Host == "" || parsed.Hostname() == "" {
+		return "", errors.New("must include a host")
+	}
+	// An unbracketed colon in the host is malformed: url.Parse splits the
+	// authority on the final colon, so "localhost:80:90" yields host
+	// "localhost:80" port "90" and "::1" yields host ":" port "1". Go's
+	// transport would then dial invalid targets like "[localhost:80]:90" or
+	// "[:]:1", while the stored authority preserves the misparse. Only
+	// bracketed IPv6 literals may carry colons.
+	if hostname := parsed.Hostname(); strings.Contains(hostname, ":") && !strings.HasPrefix(parsed.Host, "[") {
+		return "", errors.New("must not use a colon-bearing host; bracket IPv6 literals as in http://[::1]")
+	}
+	// Go's transport and browsers send the IDNA/Punycode authority on the
+	// wire, so a stored Unicode host would never match Host/Origin checks.
+	for _, r := range parsed.Hostname() {
+		if r > 127 {
+			return "", errors.New("must use an ASCII host; write internationalized domains in their IDNA/punycode form")
+		}
+	}
+	// A wildcard advertised address is not dialable; the CLI's wildcard-to-
+	// loopback mapping applies only to the bind host, never to baseUrl.
+	if ip := net.ParseIP(parsed.Hostname()); ip != nil && ip.IsUnspecified() {
+		return "", errors.New("must not use an unspecified (wildcard) host such as 0.0.0.0 or ::")
+	}
+	// Numeric spellings like 0, 00, 0x0, or 0.0.0 are IPv4 integers to a
+	// browser (which canonicalizes them, 0 included, to dotted-quad) but plain
+	// hostnames to Go, so the two sides would disagree about the authority.
+	if isNumericIPv4Spelling(parsed.Hostname()) && net.ParseIP(parsed.Hostname()) == nil {
+		return "", errors.New("must spell IPv4 hosts in canonical dotted-quad form")
+	}
+	portNumber := 0
+	if port := parsed.Port(); port != "" {
+		number, err := strconv.Atoi(port)
+		if err != nil || number < 1 || number > 65535 {
+			return "", errors.New("must use a port between 1 and 65535")
+		}
+		portNumber = number
+	}
+	if parsed.User != nil {
+		return "", errors.New("must not include userinfo credentials")
+	}
+	if parsed.RawQuery != "" || parsed.ForceQuery {
+		return "", errors.New("must not include a query string")
+	}
+	if parsed.Fragment != "" {
+		return "", errors.New("must not include a fragment")
+	}
+
+	// The dashboard requests API routes and assets by absolute path, so a
+	// path-prefixed advertised URL would work for the CLI but break the
+	// browser surface. Reject the prefix until the dashboard is prefix-aware.
+	if path := parsed.EscapedPath(); path != "" && path != "/" {
+		return "", errors.New("must not include a path; serving the daemon under a path prefix is not supported")
+	}
+
+	// Lowercase the host but not an IPv6 zone identifier, which is
+	// case-sensitive; url.URL.String restores the zone's %25 escaping that
+	// url.Parse decoded out of Host.
+	host := parsed.Host
+	if zone := strings.Index(host, "%"); zone >= 0 {
+		host = strings.ToLower(host[:zone]) + host[zone:]
+	} else {
+		host = strings.ToLower(host)
+	}
+	// Rewrite the port from its parsed integer and drop scheme defaults, the
+	// way browsers serialize Host and Origin: a spelling like :0443 or an
+	// explicit :443 on https would otherwise never match those headers.
+	if port := parsed.Port(); port != "" {
+		host = strings.TrimSuffix(host, ":"+port)
+		isDefault := (scheme == "http" && portNumber == 80) || (scheme == "https" && portNumber == 443)
+		if !isDefault {
+			host = host + ":" + strconv.Itoa(portNumber)
+		}
+	}
+
+	return (&url.URL{Scheme: scheme, Host: host}).String(), nil
+}
+
+// isNumericIPv4Spelling reports whether every dot-separated label of host is a
+// decimal or 0x-prefixed hexadecimal number — the shapes browsers parse as an
+// IPv4 integer rather than a DNS name.
+func isNumericIPv4Spelling(host string) bool {
+	if host == "" {
+		return false
+	}
+	// Browsers strip a trailing dot while canonicalizing numeric hosts, but
+	// Go's net.ParseIP rejects the dotted spelling, so "127.0.0.1." would
+	// otherwise produce an empty final label here, slip past as a non-numeric
+	// DNS name, and diverge from the dial target. Trim the terminal dot(s)
+	// before applying the numeric-host check so these spellings are rejected
+	// as noncanonical by the caller.
+	host = strings.TrimRight(host, ".")
+	if host == "" {
+		return false
+	}
+	for _, label := range strings.Split(host, ".") {
+		if label == "" {
+			return false
+		}
+		digits := strings.ToLower(label)
+		isHex := strings.HasPrefix(digits, "0x")
+		if isHex {
+			digits = strings.TrimPrefix(digits, "0x")
+		}
+		for _, r := range digits {
+			if r >= '0' && r <= '9' {
+				continue
+			}
+			if isHex && r >= 'a' && r <= 'f' {
+				continue
+			}
+			return false
+		}
+	}
+	return true
 }
 
 func isAbsoluteHTTPURL(value string) bool {
@@ -525,30 +651,6 @@ func isAbsoluteHTTPURL(value string) bool {
 		return false
 	}
 	return (parsed.Scheme == "http" || parsed.Scheme == "https") && parsed.Host != ""
-}
-
-func validateForgejoRoleCapabilities(roles RoleConfigs, prefix string, issues *[]ValidationIssue) {
-	if roles.Reviewer.AutoMerge.Enabled {
-		*issues = append(*issues, ValidationIssue{Path: prefix + ".roles.reviewer.autoMerge.enabled", Message: "must be false for forgejo projects"})
-	}
-	if roles.Reviewer.Behavior.ThreadResolution.Enabled {
-		*issues = append(*issues, ValidationIssue{Path: prefix + ".roles.reviewer.behavior.threadResolution.enabled", Message: "must be false for forgejo projects"})
-	}
-	if roles.Coordinator.Enabled {
-		*issues = append(*issues, ValidationIssue{Path: prefix + ".roles.coordinator.enabled", Message: "must be false for forgejo projects"})
-	}
-}
-
-// ValidateForgejoRoleCapabilities rejects role settings that require GitHub-only
-// APIs. Callers should apply the Forgejo project profile before validating so
-// omitted project settings receive provider-compatible defaults.
-func ValidateForgejoRoleCapabilities(roles RoleConfigs, prefix string) error {
-	issues := make([]ValidationIssue, 0)
-	validateForgejoRoleCapabilities(roles, prefix, &issues)
-	if len(issues) == 0 {
-		return nil
-	}
-	return &ConfigValidationError{Issues: issues}
 }
 
 func normalizeNetworkMode(mode NetworkMode) NetworkMode {

@@ -27,8 +27,7 @@ func TestReproducerLaneRunsBetweenTriagerAndPlanner(t *testing.T) {
 		t.Fatalf("PriorityReproducer = %d, want it strictly between %d and %d", config.PriorityReproducer, config.PriorityTriager, config.PriorityPlanner)
 	}
 	githubCapabilities, _ := forge.StaticCapabilities(forge.ProviderKindGitHub)
-	forgejoCapabilities, _ := forge.StaticCapabilities(forge.ProviderKindForgejo)
-	if !byName["reproducer"].Supported(githubCapabilities) || byName["reproducer"].Supported(forgejoCapabilities) {
+	if !byName["reproducer"].Supported(githubCapabilities) || byName["reproducer"].Supported(forge.Capabilities{}) {
 		t.Fatal("reproducer must share the GitHub-issue authority predicate with triager")
 	}
 }

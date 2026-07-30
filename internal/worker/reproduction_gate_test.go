@@ -39,6 +39,13 @@ func newReproductionGateFixture(t *testing.T, record reproduction.Record) *repro
 	if err := reproduction.AppendRecord(context.Background(), base.repos, record); err != nil {
 		t.Fatalf("AppendRecord() error = %v", err)
 	}
+	if err := reproduction.WriteManifest(worktree, reproduction.Manifest{
+		Version: reproduction.ManifestVersion, Repo: record.Repo, IssueNumber: record.IssueNumber,
+		Command: record.Command, Files: hashes, ExpectedFailure: record.ExpectedFailure,
+		IdempotencyKey: record.IdempotencyKey,
+	}); err != nil {
+		t.Fatalf("WriteManifest() error = %v", err)
+	}
 	work := workerInput{Repo: "acme/looper", IssueNumber: 41}
 	return &reproductionGateFixture{
 		repos:    base.repos,
@@ -66,7 +73,10 @@ func TestWorkerReproductionGateIsInertWithoutARecord(t *testing.T) {
 // reproduction was weakened.
 func TestWorkerReproductionGateFailsOnATamperedReproduction(t *testing.T) {
 	t.Parallel()
-	fixture := newReproductionGateFixture(t, reproduction.Record{Command: "run-reproduction", CommitSHA: "abc"})
+	fixture := newReproductionGateFixture(t, reproduction.Record{
+		Command: "run-reproduction", CommitSHA: "abc",
+		ExpectedFailure: reproduction.ExpectedFailure{Test: "original reproduction", Message: "want 1 got 0"},
+	})
 	if err := os.WriteFile(filepath.Join(fixture.worktree, "bug_test.go"), []byte("t.Skip()"), 0o644); err != nil {
 		t.Fatalf("WriteFile() error = %v", err)
 	}
