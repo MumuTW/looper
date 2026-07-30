@@ -1,0 +1,135 @@
+--- a/agent/copilot_acp_client.py
++++ b/agent/copilot_acp_client.py
+@@ -14,6 +14,7 @@
+ import re
+ import shlex
+ import subprocess
++import sys
+ import threading
+ import time
+ from collections import deque
+@@ -129,6 +130,115 @@
+         "result": {
+             "outcome": {
+                 "outcome": "cancelled",
++            }
++        },
++    }
++
++
++# --- carried patch: selective MCP tool-call permission approval -------------
++# Stock Hermes denies every session/request_permission. This opts specific MCP
++# tools into approval, and nothing else: deny stays the default, the allow-list
++# is empty unless the operator sets HERMES_ACP_ALLOWED_MCP_TOOLS, and only
++# single-call approval options are ever selected.
++_ACP_ALLOWED_TOOLS_ENV = "HERMES_ACP_ALLOWED_MCP_TOOLS"
++
++# Narrowest first. Everything broader is deliberately absent: standing grants
++# (allow_always, allow_server_always) outlive the session, switch_bypass drops
++# the gate entirely, and the allow_server_* options approve every tool on that
++# server — including ones the operator never allow-listed, which would defeat
++# the per-tool list this patch exists to enforce.
++_ACP_APPROVAL_OPTION_IDS = ("allow_once", "allow_session")
++
++
++def _acp_allowed_tools() -> set[str]:
++    raw = os.environ.get(_ACP_ALLOWED_TOOLS_ENV) or ""
++    return {name.strip() for name in raw.split(",") if name.strip()}
++
++
++def _acp_permission_tool_names(params: Any) -> list[str]:
++    """Best-effort tool-name candidates from a permission request.
++
++    The request shape is not contractual across ACP servers, so probe the
++    fields that have been observed to carry a tool identity and treat anything
++    unparseable as "no name" (which denies). Matching is exact against an
++    operator-supplied list, so including loose fields like title/kind cannot
++    approve a name the operator did not write out in full.
++    """
++    if not isinstance(params, dict):
++        return []
++    candidates: list[Any] = [params.get("toolName"), params.get("tool_name")]
++    for key in ("toolCall", "tool_call", "toolUse", "tool_use", "tool"):
++        block = params.get(key)
++        if isinstance(block, dict):
++            candidates.extend(
++                block.get(field)
++                for field in ("toolName", "tool_name", "name", "rawName", "title", "kind")
++            )
++    names: list[str] = []
++    for value in candidates:
++        if isinstance(value, str) and value.strip() and value.strip() not in names:
++            names.append(value.strip())
++    return names
++
++
++def _acp_offered_option_ids(params: Any) -> list[str]:
++    if not isinstance(params, dict):
++        return []
++    options = params.get("options")
++    if not isinstance(options, list):
++        return []
++    offered: list[str] = []
++    for option in options:
++        if isinstance(option, dict):
++            option_id = option.get("optionId") or option.get("id")
++            if isinstance(option_id, str) and option_id.strip():
++                offered.append(option_id.strip())
++    return offered
++
++
++def _acp_permission_response(message_id: Any, params: Any) -> dict[str, Any]:
++    allowed = _acp_allowed_tools()
++    if not allowed:
++        return _permission_denied(message_id)
++
++    names = _acp_permission_tool_names(params)
++    if not names:
++        return _permission_denied(message_id)
++
++    matched = next((name for name in names if name in allowed), None)
++    if matched is None:
++        # Deliberately log the near miss: the operator opted something in, so a
++        # denial here is a configuration signal worth auditing.
++        print(
++            f"[acp-permission] denied: tool {names[0]!r} is not in ${_ACP_ALLOWED_TOOLS_ENV}",
++            file=sys.stderr,
++            flush=True,
++        )
++        return _permission_denied(message_id)
++
++    offered = _acp_offered_option_ids(params)
++    selected = next((opt for opt in _ACP_APPROVAL_OPTION_IDS if opt in offered), None)
++    if selected is None:
++        print(
++            f"[acp-permission] denied: tool {matched!r} is allow-listed but offered no "
++            f"single-call approval option (offered: {', '.join(offered) or 'none'})",
++            file=sys.stderr,
++            flush=True,
++        )
++        return _permission_denied(message_id)
++
++    print(
++        f"[acp-permission] approved: tool {matched!r} via {selected}",
++        file=sys.stderr,
++        flush=True,
++    )
++    return {
++        "jsonrpc": "2.0",
++        "id": message_id,
++        "result": {
++            "outcome": {
++                "outcome": "selected",
++                "optionId": selected,
+             }
+         },
+     }
+@@ -700,7 +810,7 @@
+         params = msg.get("params") or {}
+ 
+         if method == "session/request_permission":
+-            response = _permission_denied(message_id)
++            response = _acp_permission_response(message_id, params)
+         elif method == "fs/read_text_file":
+             try:
+                 path = _ensure_path_within_cwd(str(params.get("path") or ""), cwd)

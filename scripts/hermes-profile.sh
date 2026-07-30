@@ -34,6 +34,9 @@ HERMES_ROOT="${HERMES_ROOT:-$HOME/.hermes}"
 LOOPER_HERMES_PROFILE="${LOOPER_HERMES_PROFILE:-looper}"
 LOOPER_HERMES_HOME="$HERMES_ROOT/profiles/$LOOPER_HERMES_PROFILE"
 LOOPER_DEVIN_MODEL="${LOOPER_DEVIN_MODEL:-glm-5-2}"
+# Deliberately narrow: the memory writers only. Widening this grants the ACP
+# backend unattended use of whatever you add.
+LOOPER_ALLOWED_TOOLS="${LOOPER_ALLOWED_TOOLS:-hermes_memory_add,hermes_memory_replace,hermes_memory_remove,hermes_memory_read}"
 
 bootstrap() {
   if [ ! -d "$LOOPER_HERMES_HOME" ]; then
@@ -57,11 +60,23 @@ YAML
 # generic ACP v1; these two vars repoint it at \`devin acp\` with no patch.
 HERMES_COPILOT_ACP_COMMAND=devin
 HERMES_COPILOT_ACP_ARGS=acp --model $LOOPER_DEVIN_MODEL
+
+# Tools the ACP permission gate may approve, one call at a time. Only takes
+# effect with tools/hermes-devin/apply-hermes-patch.sh applied; stock Hermes
+# denies everything regardless. Keep this list minimal — each name here is a
+# tool the backend can invoke without a human in the loop.
+HERMES_ACP_ALLOWED_MCP_TOOLS=$LOOPER_ALLOWED_TOOLS
 ENV
 
   echo "Bootstrapped Hermes profile '$LOOPER_HERMES_PROFILE' at $LOOPER_HERMES_HOME"
   echo "Model backend: devin acp --model $LOOPER_DEVIN_MODEL"
   echo "Memory lives in $LOOPER_HERMES_HOME/memories/ (separate from your default profile)"
+  echo
+  echo "Memory WRITES additionally need, once each:"
+  echo "  tools/hermes-devin/apply-hermes-patch.sh          # carried Hermes patch"
+  echo "  devin mcp add hermes-memory -- \\"
+  echo "    $PWD/tools/hermes-devin/memory_mcp_server.py    # run from your repo root"
+  echo "Without both, recall still works and writes silently no-op."
 }
 
 case "${1:-}" in
