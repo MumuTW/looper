@@ -15,6 +15,20 @@ import (
 	"github.com/nexu-io/looper/internal/processcontainment"
 )
 
+// cleanupRetainedRuntime closes the storage and releases the attach lock that
+// Stop deliberately retains after a drain failure. Retention is the behavior
+// under test, but neither resource should escape the test that asserted it.
+// Closing storage first preserves the production release-order invariant.
+func cleanupRetainedRuntime(t *testing.T, rt *Runtime) {
+	t.Helper()
+	t.Cleanup(func() {
+		if coordinator := rt.Services().Coordinator; coordinator != nil {
+			_ = coordinator.Close()
+		}
+		rt.releaseDatabaseAttachLock()
+	})
+}
+
 // Contract (#577): shutdown order is admission → cancel/drain producers →
 // handles, then SQLite close. On drain failure, retain storage and never
 // report graceful success (StorageRetained).
@@ -34,6 +48,7 @@ func TestShutdownRetainsStorageWhenContainmentDrainFails(t *testing.T) {
 	if err := rt.Start(context.Background()); err != nil {
 		t.Fatalf("Start() error = %v", err)
 	}
+	cleanupRetainedRuntime(t, rt)
 	if rt.AdmissionState() != AdmissionReady {
 		t.Fatalf("AdmissionState() = %q, want ready", rt.AdmissionState())
 	}
@@ -169,6 +184,7 @@ func TestShutdownRetainsStorageWhenNonAgentDrainFailureReported(t *testing.T) {
 	if err := rt.Start(context.Background()); err != nil {
 		t.Fatalf("Start() error = %v", err)
 	}
+	cleanupRetainedRuntime(t, rt)
 
 	// Simulate validation/trusted-review reporting ErrNotConfirmedDead outside
 	// ActiveExecutionRegistry agent leases (the gap fixed for #590 review).
@@ -345,16 +361,9 @@ func TestStopRetainsDatabaseAttachLockWhenStorageRetained(t *testing.T) {
 	if err := daemonA.Start(context.Background()); err != nil {
 		t.Fatalf("daemonA.Start() error = %v", err)
 	}
-	// Stop is guarded by shutdownOnce, so this is safe alongside the explicit
-	// Stop below and covers every t.Fatalf between here and it. The retained
-	// coordinator is closed after the assertions have run — the retention
-	// itself is what the test asserts, so it cannot be released earlier.
-	t.Cleanup(func() {
-		daemonA.Stop("test cleanup")
-		if coordinator := daemonA.Services().Coordinator; coordinator != nil {
-			_ = coordinator.Close()
-		}
-	})
+	// Register cleanup before the assertions. It closes retained resources only
+	// after the test has observed them, while covering every earlier t.Fatalf.
+	cleanupRetainedRuntime(t, daemonA)
 
 	// Force a containment drain failure so Stop retains storage.
 	lease, err := daemonA.activeExecutions.AdmitSpawn(context.Background(), agent.SpawnMeta{
