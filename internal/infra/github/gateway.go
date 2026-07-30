@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -66,9 +67,15 @@ const (
 )
 
 type Options struct {
-	GHPath                 string
-	GitPath                string
-	CWD                    string
+	GHPath  string
+	GitPath string
+	CWD     string
+	// Env carries the credential variables (see config.DaemonGitHubCredentialEnv)
+	// that every `gh` child of this gateway must receive. Entries are merged over
+	// the parent process environment, so the child keeps PATH/HOME and only the
+	// named keys are overridden. Nil means inherit the parent environment
+	// unchanged — which, in a detached daemon, means anonymous GitHub calls.
+	Env                    map[string]string
 	Now                    func() time.Time
 	DiscoveryCacheTTL      time.Duration
 	GHRun                  func(context.Context, shell.Options) (shell.Result, error)
@@ -77,9 +84,12 @@ type Options struct {
 }
 
 type Gateway struct {
-	ghPath                 string
-	gitPath                string
-	cwd                    string
+	ghPath  string
+	gitPath string
+	cwd     string
+	// ghEnv is the fully materialized child environment for gh invocations
+	// (parent environment plus Options.Env), or nil to inherit unchanged.
+	ghEnv                  map[string]string
 	now                    func() time.Time
 	discoveryCacheTTL      time.Duration
 	discoveryCacheMu       sync.Mutex
@@ -717,6 +727,7 @@ func New(options Options) *Gateway {
 		ghPath:                 ghPath,
 		gitPath:                gitPath,
 		cwd:                    options.CWD,
+		ghEnv:                  mergeIntoProcessEnv(options.Env),
 		now:                    now,
 		discoveryCacheTTL:      options.DiscoveryCacheTTL,
 		discoveryPRCache:       map[string]discoveryPullRequestListCacheEntry{},
@@ -3411,8 +3422,34 @@ func (g *Gateway) runGh(ctx context.Context, cwd, stdin string, args ...string) 
 	return g.runGhWithTimeout(ctx, cwd, stdin, defaultGhCommandTimeout, args...)
 }
 
+// mergeIntoProcessEnv materializes a full child environment from the parent
+// process environment plus overrides. shell.Options.Env replaces the child
+// environment wholesale, so a partial map would strip PATH/HOME from gh.
+// Returns nil when there is nothing to override, which keeps inheritance.
+func mergeIntoProcessEnv(overrides map[string]string) map[string]string {
+	if len(overrides) == 0 {
+		return nil
+	}
+	merged := map[string]string{}
+	for _, entry := range os.Environ() {
+		key, value, ok := strings.Cut(entry, "=")
+		if !ok || key == "" {
+			continue
+		}
+		merged[key] = value
+	}
+	for key, value := range overrides {
+		key = strings.TrimSpace(key)
+		if key == "" {
+			continue
+		}
+		merged[key] = value
+	}
+	return merged
+}
+
 func (g *Gateway) runGhWithTimeout(ctx context.Context, cwd, stdin string, timeout time.Duration, args ...string) (shell.Result, error) {
-	result, err := g.ghRun(ctx, shell.Options{Command: g.ghPath, Args: args, CWD: valueOr(strings.TrimSpace(cwd), g.cwd), Stdin: stdin, Timeout: timeout})
+	result, err := g.ghRun(ctx, shell.Options{Command: g.ghPath, Args: args, CWD: valueOr(strings.TrimSpace(cwd), g.cwd), Env: g.ghEnv, Stdin: stdin, Timeout: timeout})
 	if result.StdoutTruncated || result.StderrTruncated {
 		streams := make([]string, 0, 2)
 		if result.StdoutTruncated {

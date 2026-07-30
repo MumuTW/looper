@@ -888,7 +888,7 @@ func (r *Runtime) start(ctx context.Context) error {
 	gitGateway := gitinfra.New(gitinfra.Options{GitPath: derefString(r.config.Tools.GitPath), Repos: repositories, Now: r.now})
 	var githubGateway *githubinfra.Gateway
 	if strings.TrimSpace(derefString(r.config.Tools.GHPath)) != "" || runtimeConfigHasGitHubProjects(r.config) {
-		githubGateway = githubinfra.New(githubinfra.Options{GHPath: derefString(r.config.Tools.GHPath), Now: r.now, DiscoveryCacheTTL: time.Duration(r.config.Scheduler.DiscoveryCacheTTLSeconds) * time.Second})
+		githubGateway = githubinfra.New(githubinfra.Options{GHPath: derefString(r.config.Tools.GHPath), Env: config.DaemonGitHubCredentialEnv(r.config), Now: r.now, DiscoveryCacheTTL: time.Duration(r.config.Scheduler.DiscoveryCacheTTLSeconds) * time.Second})
 	}
 	projectService := &projects.Service{
 		DB:             coordinator.DB(),
@@ -967,10 +967,19 @@ func (r *Runtime) start(ctx context.Context) error {
 	r.config = r.projectCatalog.Snapshot()
 	if strings.TrimSpace(derefString(r.config.Tools.GHPath)) != "" || runtimeConfigHasGitHubProjects(r.config) {
 		if githubGateway == nil {
-			githubGateway = githubinfra.New(githubinfra.Options{GHPath: derefString(r.config.Tools.GHPath), Now: r.now, DiscoveryCacheTTL: time.Duration(r.config.Scheduler.DiscoveryCacheTTLSeconds) * time.Second})
+			githubGateway = githubinfra.New(githubinfra.Options{GHPath: derefString(r.config.Tools.GHPath), Env: config.DaemonGitHubCredentialEnv(r.config), Now: r.now, DiscoveryCacheTTL: time.Duration(r.config.Scheduler.DiscoveryCacheTTLSeconds) * time.Second})
 		}
 	} else {
 		githubGateway = nil
+	}
+	// Fail loud, not silent: without a credential the daemon's own gh children
+	// fall back to anonymous requests that GitHub rate-limits per IP, which
+	// surfaces later as unexplained transient forge failures.
+	if readiness := ForgeCredentialReadinessFor(r.config); readiness.Degraded() && r.logger != nil {
+		r.logger.Warn("daemon-internal GitHub calls have no credential", map[string]any{
+			"reason":         readiness.Reason,
+			"degradedReason": ForgeCredentialDegradedReason,
+		})
 	}
 	r.mu.Lock()
 	if r.stopped {

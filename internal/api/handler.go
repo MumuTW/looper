@@ -1394,9 +1394,10 @@ func (h *Handler) buildStatusResponse(ctx context.Context) (statusResponse, erro
 	artifactName := looperdArtifactName(currentTarget)
 
 	reviewPublish := looperdruntime.ReviewPublishReadinessFor(h.effectiveConfig())
+	forgeCredential := looperdruntime.ForgeCredentialReadinessFor(h.effectiveConfig())
 	outstanding, debtErr := looperdruntime.CountOutstandingQuarantineDebt(ctx, services.Repositories)
 	recovery := h.recoveryWithOutstanding(outstanding)
-	degradedReasons := statusDegradedReasons(reviewPublish, outstanding, debtErr)
+	degradedReasons := statusDegradedReasons(reviewPublish, forgeCredential, outstanding, debtErr)
 
 	return statusResponse{
 		Service: statusService{
@@ -1694,10 +1695,13 @@ func (h *Handler) recoveryWithOutstanding(outstanding looperdruntime.Outstanding
 	return normalized
 }
 
-func statusDegradedReasons(reviewPublish looperdruntime.ReviewPublishReadiness, outstanding looperdruntime.OutstandingQuarantineDebt, debtErr error) []string {
+func statusDegradedReasons(reviewPublish looperdruntime.ReviewPublishReadiness, forgeCredential looperdruntime.ForgeCredentialReadiness, outstanding looperdruntime.OutstandingQuarantineDebt, debtErr error) []string {
 	var reasons []string
 	if reviewPublish.Known && reviewPublish.PublishingDisabled {
 		reasons = append(reasons, "review_publish_disabled")
+	}
+	if forgeCredential.Degraded() {
+		reasons = append(reasons, looperdruntime.ForgeCredentialDegradedReason)
 	}
 	if outstanding.QuarantinedActiveExecutions > 0 || outstanding.QuarantinedRunningRuns > 0 {
 		reasons = append(reasons, "quarantine_orphan_debt")
@@ -4624,7 +4628,7 @@ func (h *Handler) validateManualHoldBypassForLoopTarget(ctx context.Context, pro
 	if ghPath == "" {
 		return nil
 	}
-	gh := githubinfra.New(githubinfra.Options{GHPath: ghPath, CWD: project.RepoPath, GHRun: shell.Run})
+	gh := githubinfra.New(githubinfra.Options{GHPath: ghPath, CWD: project.RepoPath, Env: config.DaemonGitHubCredentialEnv(h.context.Config), GHRun: shell.Run})
 	labels := []string(nil)
 	switch target.TargetType {
 	case domain.LoopTargetTypeIssue:
