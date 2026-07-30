@@ -52,7 +52,10 @@ func AppendMilestone(metadataJSON *string, m Milestone) (string, error) {
 }
 
 func marshalWithMilestones(metadataJSON *string, milestones []Milestone) (string, error) {
-	meta := parseMetadataObject(metadataJSON)
+	meta, err := parseMetadataObjectForWrite(metadataJSON)
+	if err != nil {
+		return "", err
+	}
 	encoded, err := json.Marshal(milestones)
 	if err != nil {
 		return "", err
