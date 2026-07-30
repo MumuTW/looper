@@ -4075,17 +4075,24 @@ func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.P
 		}
 		return loopUpsertResult{record: updated, created: false}, nil
 	}
-	seq, err := r.repos.Loops.AllocateSeq(ctx)
-	if err != nil {
-		return loopUpsertResult{}, err
-	}
 	targetID := fmt.Sprintf("pr:%s:%d", repo, prNumber)
 	metadataJSON, err := r.ensureLoopMetadataJSON(nil, project.ID, repo, prNumber)
 	if err != nil {
 		return loopUpsertResult{}, err
 	}
-	loop := storage.LoopRecord{ID: eventlog.NewEventID("loop"), Seq: seq, ProjectID: project.ID, Type: "reviewer", TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber, Status: "queued", NextRunAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO, MetadataJSON: &metadataJSON}
-	if err := r.repos.Loops.Upsert(ctx, loop); err != nil {
+	var loop storage.LoopRecord
+	if err := storage.WithTransaction(ctx, r.db, nil, func(tx *sql.Tx) error {
+		repos := storage.NewRepositories(tx)
+		seq, err := repos.Loops.AllocateSeq(ctx)
+		if err != nil {
+			return err
+		}
+		loop = storage.LoopRecord{ID: eventlog.NewEventID("loop"), Seq: seq, ProjectID: project.ID, Type: "reviewer", TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber, Status: "queued", NextRunAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO, MetadataJSON: &metadataJSON}
+		if err := repos.Loops.AssertIssueClaimAdmission(ctx, loop, false); err != nil {
+			return err
+		}
+		return repos.Loops.Upsert(ctx, loop)
+	}); err != nil {
 		return loopUpsertResult{}, err
 	}
 	r.appendEvent(ctx, eventInput{eventType: "loop.created", projectID: project.ID, loopID: loop.ID, entityType: "loop", entityID: loop.ID, payload: map[string]any{"type": "reviewer", "repo": repo, "prNumber": prNumber}})

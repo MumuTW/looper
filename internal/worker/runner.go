@@ -2948,6 +2948,9 @@ func (r *Runner) persistPullRequestReference(ctx context.Context, loop storage.L
 		updatedLoop.PRNumber = int64Ptr(pr.Number)
 		updatedLoop.MetadataJSON = stringPtr(metadataJSON)
 		updatedLoop.UpdatedAt = nowISO
+		if err := repos.Loops.AssertIssueClaimAdmission(ctx, updatedLoop, false); err != nil {
+			return err
+		}
 		if err := repos.Loops.Upsert(ctx, updatedLoop); err != nil {
 			return err
 		}

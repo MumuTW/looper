@@ -35,6 +35,15 @@ func assertQueuedIssueWorker(t *testing.T, fixture testFixture) {
 	}
 }
 
+func insertRetargetedIssueWorker(t *testing.T, repos *storage.Repositories, now time.Time, id string, prNumber int64) {
+	t.Helper()
+	prTarget := fmt.Sprintf("pr:acme/looper:%d", prNumber)
+	metadata := `{"worker":{"repo":"acme/looper","issueNumber":77}}`
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: id, Seq: prNumber, ProjectID: "project_1", Type: string(domain.LoopTypeWorker), TargetType: string(domain.LoopTargetTypePullRequest), TargetID: &prTarget, Repo: strPtr("acme/looper"), PRNumber: &prNumber, Status: string(domain.LoopStatusCompleted), MetadataJSON: &metadata, CreatedAt: now.UTC().Format(javaScriptISOString), UpdatedAt: now.UTC().Format(javaScriptISOString)}); err != nil {
+		t.Fatalf("insert retargeted worker: %v", err)
+	}
+}
+
 // Verifies that when an active fixer loop already targets an issue,
 // POST /api/v1/workers returns 409 StatusConflict with loop ID.
 func TestHandlerWorkerCreateRefusesCollisionWithActiveFixerLoop(t *testing.T) {
@@ -49,22 +58,21 @@ func TestHandlerWorkerCreateRefusesCollisionWithActiveFixerLoop(t *testing.T) {
 	}
 
 	repos := fixture.runtime.Services().Repositories
-	prTarget := "pr:acme/looper:177"
 	prNumber := int64(177)
-	workerMetadata := `{"worker":{"repo":"acme/looper","issueNumber":77}}`
+	insertRetargetedIssueWorker(t, repos, fixture.now, "loop_worker_source_77", prNumber)
+	prTarget := "pr:acme/looper:177"
 	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{
-		ID:           "loop_fixer_77",
-		Seq:          1,
-		ProjectID:    "project_1",
-		Type:         string(domain.LoopTypeFixer),
-		TargetType:   string(domain.LoopTargetTypePullRequest),
-		TargetID:     &prTarget,
-		Repo:         strPtr("acme/looper"),
-		PRNumber:     &prNumber,
-		Status:       string(domain.LoopStatusRunning),
-		MetadataJSON: &workerMetadata,
-		CreatedAt:    fixture.now.UTC().Format(javaScriptISOString),
-		UpdatedAt:    fixture.now.UTC().Format(javaScriptISOString),
+		ID:         "loop_fixer_77",
+		Seq:        1,
+		ProjectID:  "project_1",
+		Type:       string(domain.LoopTypeFixer),
+		TargetType: string(domain.LoopTargetTypePullRequest),
+		TargetID:   &prTarget,
+		Repo:       strPtr("acme/looper"),
+		PRNumber:   &prNumber,
+		Status:     string(domain.LoopStatusRunning),
+		CreatedAt:  fixture.now.UTC().Format(javaScriptISOString),
+		UpdatedAt:  fixture.now.UTC().Format(javaScriptISOString),
 	}); err != nil {
 		t.Fatalf("Loops.Upsert() error: %v", err)
 	}
@@ -100,22 +108,21 @@ func TestHandlerWorkerCreateRefusesCollisionWithActiveReviewerLoop(t *testing.T)
 	}
 
 	repos := fixture.runtime.Services().Repositories
-	prTarget := "pr:acme/looper:88"
 	prNumber := int64(88)
-	workerMetadata := `{"worker":{"repo":"acme/looper","issueNumber":77}}`
+	insertRetargetedIssueWorker(t, repos, fixture.now, "loop_worker_source_77", prNumber)
+	prTarget := "pr:acme/looper:88"
 	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{
-		ID:           "loop_reviewer_77",
-		Seq:          1,
-		ProjectID:    "project_1",
-		Type:         string(domain.LoopTypeReviewer),
-		TargetType:   string(domain.LoopTargetTypePullRequest),
-		TargetID:     &prTarget,
-		Repo:         strPtr("acme/looper"),
-		PRNumber:     &prNumber,
-		Status:       string(domain.LoopStatusRunning),
-		MetadataJSON: &workerMetadata,
-		CreatedAt:    fixture.now.UTC().Format(javaScriptISOString),
-		UpdatedAt:    fixture.now.UTC().Format(javaScriptISOString),
+		ID:         "loop_reviewer_77",
+		Seq:        1,
+		ProjectID:  "project_1",
+		Type:       string(domain.LoopTypeReviewer),
+		TargetType: string(domain.LoopTargetTypePullRequest),
+		TargetID:   &prTarget,
+		Repo:       strPtr("acme/looper"),
+		PRNumber:   &prNumber,
+		Status:     string(domain.LoopStatusRunning),
+		CreatedAt:  fixture.now.UTC().Format(javaScriptISOString),
+		UpdatedAt:  fixture.now.UTC().Format(javaScriptISOString),
 	}); err != nil {
 		t.Fatalf("Loops.Upsert() error: %v", err)
 	}
@@ -182,6 +189,30 @@ func TestHandlerWorkerCreateForceOverridesCollision(t *testing.T) {
 
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("force=true dispatch status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	assertQueuedIssueWorker(t, fixture)
+}
+
+func TestHandlerWorkerCreateIgnoresUnrelatedMalformedLoopMetadata(t *testing.T) {
+	fixture := newTestFixture(t)
+	repoPath := filepath.Join(fixture.rootDir, "repo-malformed-unrelated-claim")
+	projectMetadata := `{"repo":"acme/looper"}`
+	if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: repoPath, MetadataJSON: &projectMetadata, CreatedAt: fixture.now.UTC().Format(javaScriptISOString), UpdatedAt: fixture.now.UTC().Format(javaScriptISOString)}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	prTarget := "pr:acme/looper:999"
+	prNumber := int64(999)
+	malformed := `{"incomplete":`
+	if err := fixture.runtime.Services().Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_unrelated_malformed", Seq: 1, ProjectID: "project_1", Type: string(domain.LoopTypeFixer), TargetType: string(domain.LoopTargetTypePullRequest), TargetID: &prTarget, Repo: strPtr("acme/looper"), PRNumber: &prNumber, Status: string(domain.LoopStatusRunning), MetadataJSON: &malformed, CreatedAt: fixture.now.UTC().Format(javaScriptISOString), UpdatedAt: fixture.now.UTC().Format(javaScriptISOString)}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/workers", strings.NewReader(`{"projectId":"project_1","repo":"acme/looper","issueNumber":77,"baseBranch":"main"}`))
+	req.Header.Set("content-type", "application/json")
+	recorder := httptest.NewRecorder()
+	NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now }}).ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
 	}
 	assertQueuedIssueWorker(t, fixture)
 }

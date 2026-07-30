@@ -4255,11 +4255,19 @@ func (h *Handler) buildCreateLoopResponse(r *http.Request) (loopResponse, error)
 			return storage.LoopRecord{}, err
 		}
 
+		candidateStatus := domain.LoopStatus(status)
+		if (domain.LoopType(loopType) == domain.LoopTypeReviewer || domain.LoopType(loopType) == domain.LoopTypeFixer || domain.LoopType(loopType) == domain.LoopTypeWorker) && candidateStatus == domain.LoopStatusRunning {
+			candidateStatus = domain.LoopStatusQueued
+		}
+		candidate := storage.LoopRecord{ProjectID: projectID, Type: loopType, TargetType: targetType, TargetID: loopTargetIDCompat(target), Repo: repoFromTargetCompat(target), PRNumber: prNumberFromTargetCompat(target), Status: string(candidateStatus), MetadataJSON: metadataJSON}
+		if err := assertIssueClaimAdmission(r.Context(), transactionRepos, candidate, derefBool(body.Force)); err != nil {
+			return storage.LoopRecord{}, err
+		}
+
 		existing, err := transactionRepos.Loops.List(r.Context())
 		if err != nil {
 			return storage.LoopRecord{}, err
 		}
-		candidateStatus := domain.LoopStatus(status)
 		if err := assertUniqueActiveLoopCompat(existing, "", projectID, domain.LoopType(loopType), target, candidateStatus); err != nil {
 			return storage.LoopRecord{}, err
 		}
@@ -4284,10 +4292,7 @@ func (h *Handler) buildCreateLoopResponse(r *http.Request) (loopResponse, error)
 			CreatedAt:    nowISO,
 			UpdatedAt:    nowISO,
 		}
-		if (domain.LoopType(loopType) == domain.LoopTypeReviewer || domain.LoopType(loopType) == domain.LoopTypeFixer || domain.LoopType(loopType) == domain.LoopTypeWorker) && candidateStatus == domain.LoopStatusRunning {
-			record.Status = string(domain.LoopStatusQueued)
-			candidateStatus = domain.LoopStatusQueued
-		}
+		record.Status = string(candidateStatus)
 		if candidateStatus == domain.LoopStatusRunning {
 			record.NextRunAt = &nowISO
 		} else if candidateStatus == domain.LoopStatusQueued {
@@ -4338,29 +4343,20 @@ func (h *Handler) buildCreateLoopResponse(r *http.Request) (loopResponse, error)
 	return serializeLoop(record), nil
 }
 
-func (h *Handler) findIssueCollisionLoop(ctx context.Context, repos *storage.Repositories, projectID string, target domain.LoopTarget) (*collisionInfo, error) {
-	loops, err := repos.Loops.ListConflictingIssueClaimLoops(ctx, projectID, target.Repo, target.IssueNumber, domain.ConflictingActiveLoopStatuses())
-	if err != nil {
-		return nil, err
+func assertIssueClaimAdmission(ctx context.Context, repos *storage.Repositories, candidate storage.LoopRecord, force bool) error {
+	err := repos.Loops.AssertIssueClaimAdmission(ctx, candidate, force)
+	if conflict, ok := storage.IsIssueClaimConflictError(err); ok {
+		return issueCollisionError(conflict.IssueNumber, conflict.LoopID, conflict.LoopType)
 	}
-	for _, loop := range loops {
-		return &collisionInfo{ID: loop.ID, Type: loop.Type}, nil
-	}
-
-	return nil, nil
+	return err
 }
 
-type collisionInfo struct {
-	ID   string
-	Type string
-}
-
-func issueCollisionError(issueNumber int64, collision collisionInfo) apiError {
+func issueCollisionError(issueNumber int64, loopID, loopType string) apiError {
 	return apiError{
 		code:    pkgapi.ErrorCodeLoopConflict,
 		status:  http.StatusConflict,
-		message: fmt.Sprintf("Issue #%d is occupied by active %s loop %s", issueNumber, collision.Type, collision.ID),
-		details: map[string]any{"occupiedBy": map[string]any{"loopId": collision.ID, "loopType": collision.Type}},
+		message: fmt.Sprintf("Issue #%d is occupied by active %s loop %s", issueNumber, loopType, loopID),
+		details: map[string]any{"occupiedBy": map[string]any{"loopId": loopID, "loopType": loopType}},
 	}
 }
 
@@ -4431,15 +4427,16 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 	if issueNumber != nil {
 		requestedIssueTarget = &domain.LoopTarget{TargetType: domain.LoopTargetTypeIssue, Repo: *repo, IssueNumber: *issueNumber}
 	}
-
-	// Issue 319: refuse dispatch when a fixer/reviewer loop already holds
-	// the issue. Must run BEFORE requirePullRequestTarget so 409 wins over
-	// the gh-dependent "refresh target" 400.
+	// Preserve the early 409 before any PR target refresh, but use the same
+	// storage authority as publication. The transaction below remains the
+	// atomic decision; this is only an eager, user-facing check.
 	if requestedIssueTarget != nil && !derefBool(body.Force) {
-		if collision, checkErr := h.findIssueCollisionLoop(r.Context(), services.Repositories, projectID, *requestedIssueTarget); checkErr != nil {
-			return workerCreateResponse{}, checkErr
-		} else if collision != nil {
-			return workerCreateResponse{}, issueCollisionError(*issueNumber, *collision)
+		issueTargetID := fmt.Sprintf("issue:%s:%d", *repo, *issueNumber)
+		candidate := storage.LoopRecord{ProjectID: projectID, Type: string(domain.LoopTypeWorker), TargetType: string(domain.LoopTargetTypeIssue), TargetID: &issueTargetID, Repo: repo, Status: string(domain.LoopStatusQueued)}
+		if preflightErr := storage.WithTransaction(r.Context(), services.Coordinator.DB(), nil, func(tx *sql.Tx) error {
+			return assertIssueClaimAdmission(r.Context(), storage.NewRepositories(tx), candidate, false)
+		}); preflightErr != nil {
+			return workerCreateResponse{}, preflightErr
 		}
 	}
 
@@ -4597,18 +4594,10 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 
 	record, err := storage.WithTransactionValue(r.Context(), services.Coordinator.DB(), nil, func(tx *sql.Tx) (storage.LoopRecord, error) {
 		repos := storage.NewRepositories(tx)
-		// The initial check above gives callers a conflict before any forge
-		// refresh. Recheck in the same immediate SQLite transaction that
-		// publishes the worker so a claim that arrives during preflight cannot
-		// be committed alongside it. PR-target creation shares the existing
-		// target guard with fixer/reviewer publication.
-		if requestedIssueTarget != nil && !derefBool(body.Force) {
-			collision, collisionErr := h.findIssueCollisionLoop(r.Context(), repos, projectID, *requestedIssueTarget)
-			if collisionErr != nil {
-				return storage.LoopRecord{}, collisionErr
-			}
-			if collision != nil {
-				return storage.LoopRecord{}, issueCollisionError(*issueNumber, *collision)
+		if requestedIssueTarget != nil {
+			candidate := storage.LoopRecord{ProjectID: projectID, Type: string(domain.LoopTypeWorker), TargetType: targetType, TargetID: &targetID, Repo: repo, PRNumber: effectivePRNumber, Status: string(domain.LoopStatusQueued), MetadataJSON: &metadataJSON}
+			if admissionErr := assertIssueClaimAdmission(r.Context(), repos, candidate, derefBool(body.Force)); admissionErr != nil {
+				return storage.LoopRecord{}, admissionErr
 			}
 		}
 

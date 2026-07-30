@@ -4981,13 +4981,20 @@ func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.P
 		}
 		return loopUpsertResult{record: updatedLoop, created: false, availableAt: availableAt}, nil
 	}
-	seq, err := r.repos.Loops.AllocateSeq(ctx)
-	if err != nil {
-		return loopUpsertResult{}, err
-	}
 	targetID := buildPullRequestTargetID(repo, prNumber)
-	loop := storage.LoopRecord{ID: eventlog.NewEventID("loop"), Seq: seq, ProjectID: project.ID, Type: "fixer", TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber, Status: "queued", NextRunAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
-	if err := r.repos.Loops.Upsert(ctx, loop); err != nil {
+	var loop storage.LoopRecord
+	if err := storage.WithTransaction(ctx, r.db, nil, func(tx *sql.Tx) error {
+		repos := storage.NewRepositories(tx)
+		seq, err := repos.Loops.AllocateSeq(ctx)
+		if err != nil {
+			return err
+		}
+		loop = storage.LoopRecord{ID: eventlog.NewEventID("loop"), Seq: seq, ProjectID: project.ID, Type: "fixer", TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber, Status: "queued", NextRunAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
+		if err := repos.Loops.AssertIssueClaimAdmission(ctx, loop, false); err != nil {
+			return err
+		}
+		return repos.Loops.Upsert(ctx, loop)
+	}); err != nil {
 		return loopUpsertResult{}, err
 	}
 	return loopUpsertResult{record: loop, created: true, availableAt: now}, nil

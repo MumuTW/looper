@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -852,48 +853,198 @@ func (r *LoopsRepository) ListByRepoAndPR(ctx context.Context, repo string, prNu
 	return scanLoops(rows)
 }
 
-// ListConflictingIssueClaimLoops returns the live fixer or reviewer loops that
-// declare an issue. A retargeted loop keeps its source issue in worker
-// metadata, so matching cannot rely on the current pull-request target alone.
-func (r *LoopsRepository) ListConflictingIssueClaimLoops(ctx context.Context, projectID, repo string, issueNumber int64, statuses []domain.LoopStatus) ([]LoopRecord, error) {
-	if strings.TrimSpace(projectID) == "" || strings.TrimSpace(repo) == "" || issueNumber <= 0 || len(statuses) == 0 {
-		return []LoopRecord{}, nil
+// IssueClaimConflictError identifies the existing live loop that prevents a
+// source-issue claim from being published. It is derived from loops, rather
+// than persisted separately, so callers must use it inside their publication
+// transaction.
+type IssueClaimConflictError struct {
+	IssueNumber int64
+	LoopID      string
+	LoopType    string
+}
+
+func (e *IssueClaimConflictError) Error() string {
+	return fmt.Sprintf("source issue #%d is occupied by active %s loop %s", e.IssueNumber, e.LoopType, e.LoopID)
+}
+
+func IsIssueClaimConflictError(err error) (*IssueClaimConflictError, bool) {
+	var conflict *IssueClaimConflictError
+	return conflict, errors.As(err, &conflict)
+}
+
+type issueClaim struct {
+	repo         string
+	issueNumber  int64
+	sourceWorker string
+}
+
+// AssertIssueClaimAdmission enforces the source-issue admission invariant for
+// a loop publication. It deliberately decodes metadata in Go: malformed
+// metadata remains available to its owning recovery path, but an unrelated row
+// cannot make SQLite JSON extraction fail an otherwise independent dispatch.
+//
+// The caller must invoke this in the same immediate SQLite transaction as the
+// subsequent Upsert. force is the explicit operator bypass.
+func (r *LoopsRepository) AssertIssueClaimAdmission(ctx context.Context, candidate LoopRecord, force bool) error {
+	if force || !domain.IsConflictingActiveLoopStatus(domain.LoopStatus(candidate.Status)) {
+		return nil
+	}
+	claim, ok, err := r.issueClaimForLoop(ctx, candidate)
+	if err != nil || !ok {
+		return err
 	}
 
-	statusPlaceholders := sqlPlaceholders(len(statuses))
-	issueTargetID := fmt.Sprintf("issue:%s:%d", repo, issueNumber)
-	query := `
-		SELECT * FROM loops
-		WHERE project_id = ?
-		  AND type IN (?, ?)
-		  AND status IN (` + statusPlaceholders + `)
-		  AND (
-			(target_type = ? AND target_id = ? COLLATE NOCASE)
-			OR (
-				metadata_json IS NOT NULL
-				AND JSON_EXTRACT(metadata_json, '$.worker.issueNumber') = ?
-				AND COALESCE(
-					JSON_EXTRACT(metadata_json, '$.worker.issueRepo'),
-					JSON_EXTRACT(metadata_json, '$.worker.repo'),
-					repo
-				) = ? COLLATE NOCASE
-			)
-		  )
-		ORDER BY updated_at DESC, seq DESC
-	`
-	args := make([]any, 0, len(statuses)+7)
-	args = append(args, projectID, string(domain.LoopTypeFixer), string(domain.LoopTypeReviewer))
+	statuses := domain.ConflictingActiveLoopStatuses()
+	args := make([]any, 0, len(statuses)+5)
+	args = append(args, candidate.ProjectID, string(domain.LoopTypeWorker), string(domain.LoopTypeFixer), string(domain.LoopTypeReviewer))
 	for _, status := range statuses {
 		args = append(args, string(status))
 	}
-	args = append(args, string(domain.LoopTargetTypeIssue), issueTargetID, issueNumber, repo)
-
-	rows, err := r.q.QueryContext(ctx, query, args...)
+	rows, err := r.q.QueryContext(ctx, `SELECT * FROM loops
+		WHERE project_id = ?
+		  AND type IN (?, ?, ?)
+		  AND status IN (`+sqlPlaceholders(len(statuses))+`)
+		  AND target_type IN (?, ?)
+		ORDER BY updated_at DESC, seq DESC`, append(args, string(domain.LoopTargetTypeIssue), string(domain.LoopTargetTypePullRequest))...)
 	if err != nil {
-		return nil, fmt.Errorf("list conflicting issue claim loops: %w", err)
+		return fmt.Errorf("list active source issue claims: %w", err)
 	}
 	defer rows.Close()
-	return scanLoops(rows)
+
+	for rows.Next() {
+		loop, scanErr := scanLoop(rows)
+		if scanErr != nil {
+			return scanErr
+		}
+		if candidate.ID != "" && loop.ID == candidate.ID {
+			continue
+		}
+		existingClaim, exists, claimErr := r.issueClaimForLoop(ctx, loop)
+		if claimErr != nil {
+			return claimErr
+		}
+		if !exists || existingClaim.issueNumber != claim.issueNumber || !strings.EqualFold(existingClaim.repo, claim.repo) {
+			continue
+		}
+		// A source worker and its PR descendants are one lifecycle, not
+		// competing claims. Different workers (or an issue worker with no PR
+		// source) are competing source-issue publications.
+		if claim.sourceWorker != "" && existingClaim.sourceWorker == claim.sourceWorker {
+			continue
+		}
+		if candidate.Type == string(domain.LoopTypeWorker) && candidate.TargetType == string(domain.LoopTargetTypeIssue) && loop.Type == string(domain.LoopTypeWorker) {
+			continue // normal worker reuse owns this case.
+		}
+		return &IssueClaimConflictError{IssueNumber: claim.issueNumber, LoopID: loop.ID, LoopType: loop.Type}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate active source issue claims: %w", err)
+	}
+	return nil
+}
+
+func (r *LoopsRepository) issueClaimForLoop(ctx context.Context, loop LoopRecord) (issueClaim, bool, error) {
+	if loop.TargetType == string(domain.LoopTargetTypeIssue) && loop.Type == string(domain.LoopTypeWorker) {
+		repo, number, ok := parseIssueTargetID(loopString(loop.TargetID))
+		return issueClaim{repo: repo, issueNumber: number}, ok, nil
+	}
+	if loop.TargetType != string(domain.LoopTargetTypePullRequest) || (loop.Type != string(domain.LoopTypeWorker) && loop.Type != string(domain.LoopTypeFixer) && loop.Type != string(domain.LoopTypeReviewer)) {
+		return issueClaim{}, false, nil
+	}
+	if loop.Type == string(domain.LoopTypeWorker) {
+		repo, number, ok := workerIssueFromMetadata(loop.MetadataJSON, loopString(loop.Repo))
+		if !ok {
+			return issueClaim{}, false, nil
+		}
+		return issueClaim{repo: repo, issueNumber: number, sourceWorker: loop.ID}, true, nil
+	}
+
+	repo := loopString(loop.Repo)
+	prNumber := loopInt64(loop.PRNumber)
+	if repo == "" || prNumber <= 0 {
+		issueRepo, issueNumber, ok := workerIssueFromMetadata(loop.MetadataJSON, repo)
+		return issueClaim{repo: issueRepo, issueNumber: issueNumber}, ok, nil
+	}
+	rows, err := r.q.QueryContext(ctx, `SELECT * FROM loops
+		WHERE project_id = ? AND type = ? AND target_type = ?
+		  AND repo = ? COLLATE NOCASE AND pr_number = ?
+		ORDER BY updated_at DESC, seq DESC`, loop.ProjectID, string(domain.LoopTypeWorker), string(domain.LoopTargetTypePullRequest), repo, prNumber)
+	if err != nil {
+		return issueClaim{}, false, fmt.Errorf("find source worker for pull request: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		worker, scanErr := scanLoop(rows)
+		if scanErr != nil {
+			return issueClaim{}, false, scanErr
+		}
+		issueRepo, issueNumber, ok := workerIssueFromMetadata(worker.MetadataJSON, loopString(worker.Repo))
+		if ok {
+			return issueClaim{repo: issueRepo, issueNumber: issueNumber, sourceWorker: worker.ID}, true, nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return issueClaim{}, false, fmt.Errorf("iterate source workers for pull request: %w", err)
+	}
+	// Legacy fixer/reviewer records kept worker metadata on the PR loop itself.
+	// Keep those records admissible without making fresh lifecycle links depend
+	// on that metadata shape.
+	issueRepo, issueNumber, ok := workerIssueFromMetadata(loop.MetadataJSON, repo)
+	return issueClaim{repo: issueRepo, issueNumber: issueNumber}, ok, nil
+}
+
+func parseIssueTargetID(targetID string) (string, int64, bool) {
+	parts := strings.Split(strings.TrimPrefix(strings.TrimSpace(targetID), "issue:"), ":")
+	if len(parts) < 2 || !strings.HasPrefix(targetID, "issue:") {
+		return "", 0, false
+	}
+	var number int64
+	if _, err := fmt.Sscan(parts[len(parts)-1], &number); err != nil || number <= 0 {
+		return "", 0, false
+	}
+	repo := strings.Join(parts[:len(parts)-1], ":")
+	return repo, number, strings.TrimSpace(repo) != ""
+}
+
+func workerIssueFromMetadata(metadataJSON *string, fallbackRepo string) (string, int64, bool) {
+	if metadataJSON == nil || strings.TrimSpace(*metadataJSON) == "" {
+		return "", 0, false
+	}
+	var metadata struct {
+		Worker struct {
+			IssueNumber int64  `json:"issueNumber"`
+			IssueRepo   string `json:"issueRepo"`
+			Repo        string `json:"repo"`
+		} `json:"worker"`
+	}
+	if err := json.Unmarshal([]byte(*metadataJSON), &metadata); err != nil || metadata.Worker.IssueNumber <= 0 {
+		return "", 0, false
+	}
+	repo := firstNonEmptyString(metadata.Worker.IssueRepo, metadata.Worker.Repo, fallbackRepo)
+	return repo, metadata.Worker.IssueNumber, repo != ""
+}
+
+func firstNonEmptyString(values ...string) string {
+	for _, value := range values {
+		if value = strings.TrimSpace(value); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func loopString(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
+}
+
+func loopInt64(value *int64) int64 {
+	if value == nil {
+		return 0
+	}
+	return *value
 }
 
 func (r *LoopsRepository) ListByStatuses(ctx context.Context, statuses []string) ([]LoopRecord, error) {

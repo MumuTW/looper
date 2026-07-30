@@ -14,6 +14,123 @@ import (
 	"time"
 )
 
+func TestIssueClaimAdmissionSerializesWorkerAndPRLoopPublication(t *testing.T) {
+	t.Parallel()
+
+	for _, first := range []string{"worker", "reviewer"} {
+		t.Run(first+"-first", func(t *testing.T) {
+			coordinator := openMigratedCoordinatorForRepositories(t)
+			ctx := context.Background()
+			startedAt := "2026-07-31T00:00:00.000Z"
+			repo := "acme/looper"
+			if err := NewRepositories(coordinator.DB()).Projects.Upsert(ctx, ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: t.TempDir(), CreatedAt: startedAt, UpdatedAt: startedAt}); err != nil {
+				t.Fatalf("Projects.Upsert() error = %v", err)
+			}
+			prNumber := int64(77)
+			prTarget := "pr:acme/looper:77"
+			metadata := `{"worker":{"repo":"acme/looper","issueNumber":19}}`
+			if err := NewRepositories(coordinator.DB()).Loops.Upsert(ctx, LoopRecord{ID: "source_worker", Seq: 1, ProjectID: "project_1", Type: "worker", TargetType: "pull_request", TargetID: &prTarget, Repo: &repo, PRNumber: &prNumber, Status: "completed", MetadataJSON: &metadata, CreatedAt: startedAt, UpdatedAt: startedAt}); err != nil {
+				t.Fatalf("insert source worker: %v", err)
+			}
+
+			issueTarget := "issue:acme/looper:19"
+			worker := LoopRecord{ID: "new_worker", ProjectID: "project_1", Type: "worker", TargetType: "issue", TargetID: &issueTarget, Repo: &repo, Status: "queued", CreatedAt: startedAt, UpdatedAt: startedAt}
+			reviewer := LoopRecord{ID: "new_reviewer", ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", TargetID: &prTarget, Repo: &repo, PRNumber: &prNumber, Status: "queued", CreatedAt: startedAt, UpdatedAt: startedAt}
+			publish := func(record LoopRecord) error {
+				return WithTransaction(ctx, coordinator.DB(), nil, func(tx *sql.Tx) error {
+					repos := NewRepositories(tx)
+					if err := repos.Loops.AssertIssueClaimAdmission(ctx, record, false); err != nil {
+						return err
+					}
+					seq, err := repos.Loops.AllocateSeq(ctx)
+					if err != nil {
+						return err
+					}
+					record.Seq = seq
+					return repos.Loops.Upsert(ctx, record)
+				})
+			}
+
+			var second LoopRecord
+			if first == "worker" {
+				if err := publish(worker); err != nil {
+					t.Fatalf("publish worker first: %v", err)
+				}
+				second = reviewer
+			} else {
+				if err := publish(reviewer); err != nil {
+					t.Fatalf("publish reviewer first: %v", err)
+				}
+				second = worker
+			}
+			secondErr := publish(second)
+			if _, ok := IsIssueClaimConflictError(secondErr); !ok {
+				err := secondErr
+				t.Fatalf("second publication error = %v, want source-issue conflict", err)
+			}
+		})
+	}
+}
+
+func TestIssueClaimAdmissionConcurrentWritersPublishOnlyOne(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	ctx := context.Background()
+	startedAt := "2026-07-31T00:00:00.000Z"
+	repo := "acme/looper"
+	if err := NewRepositories(coordinator.DB()).Projects.Upsert(ctx, ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: t.TempDir(), CreatedAt: startedAt, UpdatedAt: startedAt}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	prNumber := int64(77)
+	prTarget := "pr:acme/looper:77"
+	metadata := `{"worker":{"repo":"acme/looper","issueNumber":19}}`
+	if err := NewRepositories(coordinator.DB()).Loops.Upsert(ctx, LoopRecord{ID: "source_worker", Seq: 1, ProjectID: "project_1", Type: "worker", TargetType: "pull_request", TargetID: &prTarget, Repo: &repo, PRNumber: &prNumber, Status: "completed", MetadataJSON: &metadata, CreatedAt: startedAt, UpdatedAt: startedAt}); err != nil {
+		t.Fatalf("insert source worker: %v", err)
+	}
+	issueTarget := "issue:acme/looper:19"
+	workers := []LoopRecord{
+		{ID: "new_worker", ProjectID: "project_1", Type: "worker", TargetType: "issue", TargetID: &issueTarget, Repo: &repo, Status: "queued", CreatedAt: startedAt, UpdatedAt: startedAt},
+		{ID: "new_reviewer", ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", TargetID: &prTarget, Repo: &repo, PRNumber: &prNumber, Status: "queued", CreatedAt: startedAt, UpdatedAt: startedAt},
+	}
+	start := make(chan struct{})
+	errs := make(chan error, len(workers))
+	for _, candidate := range workers {
+		go func(record LoopRecord) {
+			<-start
+			errs <- WithTransaction(ctx, coordinator.DB(), nil, func(tx *sql.Tx) error {
+				repos := NewRepositories(tx)
+				if err := repos.Loops.AssertIssueClaimAdmission(ctx, record, false); err != nil {
+					return err
+				}
+				seq, err := repos.Loops.AllocateSeq(ctx)
+				if err != nil {
+					return err
+				}
+				record.Seq = seq
+				return repos.Loops.Upsert(ctx, record)
+			})
+		}(candidate)
+	}
+	close(start)
+
+	successes := 0
+	conflicts := 0
+	for range workers {
+		err := <-errs
+		if err == nil {
+			successes++
+		} else if _, ok := IsIssueClaimConflictError(err); ok {
+			conflicts++
+		} else {
+			t.Fatalf("concurrent publication error = %v", err)
+		}
+	}
+	if successes != 1 || conflicts != 1 {
+		t.Fatalf("concurrent publications = %d successes, %d conflicts; want one of each", successes, conflicts)
+	}
+}
+
 func TestAgentExecutionTerminalObservationCannotRegressToActive(t *testing.T) {
 	t.Parallel()
 
