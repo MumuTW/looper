@@ -298,6 +298,19 @@ func handleLabelCreate(st *state, args []string) error {
 			continue
 		}
 		if !force {
+			// The wording matters: isLabelAlreadyExistsError in the gateway
+			// matches on "already exists", and a lost create race is tolerated
+			// only when it does. Changing this string here silently turns a
+			// benign race back into a hard failure in production.
+			//
+			// This model is asserted against Looper, not against GitHub.
+			// Nothing here proves real `gh label create` still rejects a
+			// duplicate, or that it words the rejection this way — GitHub's
+			// API reports the condition as the error code "already_exists",
+			// and gh's rendering of it is not pinned anywhere. If the two ever
+			// disagree, every test here keeps passing while the gateway stops
+			// tolerating the race it was built to tolerate. Deciding that is
+			// acceptable is a scope call, not an oversight; see #223.
 			return fmt.Errorf("label %q already exists", name)
 		}
 		st.RepositoryLabels[repo][index].Color = strings.TrimSpace(flagValue(args, "--color"))
