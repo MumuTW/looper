@@ -3505,6 +3505,26 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 	// Returning false means admission closed mid-flight, which stops the fan-out
 	// from starting any further project — the same guarantee the serial `break`
 	// used to give.
+	// Admission coordination across the fan-out. The serial loop enforced "no
+	// later discovery after admission closes" with a `break`; concurrently that
+	// has to be a shared latch every worker consults, and it has to be consulted
+	// at lane granularity rather than only at project entry — otherwise a worker
+	// that entered while admission was open keeps enqueueing through all its
+	// lanes after another worker already saw the close.
+	var (
+		stopMu   sync.Mutex
+		stopTick bool
+	)
+	discoveryHalted := func() bool {
+		stopMu.Lock()
+		defer stopMu.Unlock()
+		return stopTick
+	}
+	haltDiscovery := func() {
+		stopMu.Lock()
+		stopTick = true
+		stopMu.Unlock()
+	}
 	discoverProject := func(project storage.ProjectRecord) bool {
 		// Recheck before each project's work-producing lanes so BeginShutdown
 		// during HTTP drain cannot leave a tick that passed the entry gate free
@@ -3556,7 +3576,14 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 				}
 				continue
 			}
+			// Consult the shared latch before this lane's own admission recheck:
+			// another worker may already have observed the close, and this lane must
+			// not start merely because its own recheck has not raced yet.
+			if discoveryHalted() {
+				return false
+			}
 			if err := admissionRefuseWork(input); err != nil {
+				haltDiscovery()
 				return false
 			}
 			label := lane.laneLabel()
@@ -3594,16 +3621,7 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 	// Behaviour deltas, both accepted: when slots are scarce, which project's
 	// items win is now completion-ordered rather than catalog-ordered; and joined
 	// tick errors are no longer in catalog order.
-	var (
-		discoveryWG sync.WaitGroup
-		stopMu      sync.Mutex
-		stopTick    bool
-	)
-	tickStopped := func() bool {
-		stopMu.Lock()
-		defer stopMu.Unlock()
-		return stopTick
-	}
+	var discoveryWG sync.WaitGroup
 	slots := make(chan struct{}, schedulerDiscoveryConcurrency(len(projectsList)))
 	ctxCancelled := false
 	for _, project := range projectsList {
@@ -3612,7 +3630,7 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 			ctxCancelled = true
 			break
 		}
-		if tickStopped() {
+		if discoveryHalted() {
 			break
 		}
 		slots <- struct{}{}
@@ -3621,9 +3639,7 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 			defer discoveryWG.Done()
 			defer func() { <-slots }()
 			if !discoverProject(project) {
-				stopMu.Lock()
-				stopTick = true
-				stopMu.Unlock()
+				haltDiscovery()
 			}
 		}(project)
 	}

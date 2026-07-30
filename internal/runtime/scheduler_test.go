@@ -1637,11 +1637,12 @@ func (s *stubPlannerScheduler) DiscoverIssues(_ context.Context, input planner.D
 	s.mu.Lock()
 	s.discoverCalls = append(s.discoverCalls, input)
 	hook := s.onDiscover
+	discoverErr := s.discoverErr
 	s.mu.Unlock()
 	if hook != nil {
 		hook(input)
 	}
-	return planner.DiscoveryResult{}, s.discoverErr
+	return planner.DiscoveryResult{}, discoverErr
 }
 
 func (s *stubPlannerScheduler) ProcessNext(_ context.Context, claimedBy string) (*planner.ProcessResult, error) {

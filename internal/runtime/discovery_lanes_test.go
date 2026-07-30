@@ -2,6 +2,8 @@ package runtime
 
 import (
 	"context"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/nexu-io/looper/internal/config"
@@ -59,6 +61,33 @@ func TestTriagerLaneSharesOneDecisionBudgetAcrossProjects(t *testing.T) {
 	}
 }
 
+// Projects are discovered concurrently through one lane, so every project shares
+// the tick-wide budget. This asserts the lane still hands the same budget to each
+// caller under concurrency; the reservation invariant itself is proven under real
+// contention by TestDecisionBudgetReserveNeverExceedsLimitUnderContention.
+func TestTriagerLaneDecisionBudgetIsSharedAcrossConcurrentProjects(t *testing.T) {
+	t.Parallel()
+	const projects = 4
+	runner := &budgetTriager{}
+	lane := triagerLane(defaultSchedulerTickInput{Triager: runner})
+
+	var wg sync.WaitGroup
+	wg.Add(projects)
+	for i := 0; i < projects; i++ {
+		go func() {
+			defer wg.Done()
+			if _, err := lane.Discover(context.Background(), "project", "acme/repo", nil); err != nil {
+				t.Errorf("Discover() error = %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if got := int(runner.reserved.Load()); got != triager.DefaultDecisionLimit {
+		t.Fatalf("successful reservations = %d, want %d (lane handed out more than one tick-wide budget)", got, triager.DefaultDecisionLimit)
+	}
+}
+
 func TestDiscoveryLanesOrderFromCanonicalRegistryPriority(t *testing.T) {
 	t.Parallel()
 	priority := 1
@@ -80,16 +109,29 @@ func TestDiscoveryLanesOrderFromCanonicalRegistryPriority(t *testing.T) {
 	t.Fatal("worker discovery lane missing")
 }
 
-type budgetTriager struct{ budgets []int }
+type budgetTriager struct {
+	mu       sync.Mutex
+	budgets  []int
+	reserved atomic.Int64
+	onCall   func()
+}
 
 func (f *budgetTriager) DiscoverIssues(_ context.Context, input triager.DiscoveryInput) (triager.DiscoveryResult, error) {
+	if f.onCall != nil {
+		f.onCall()
+	}
 	if input.DecisionBudget == nil {
+		f.mu.Lock()
 		f.budgets = append(f.budgets, -1)
+		f.mu.Unlock()
 		return triager.DiscoveryResult{}, nil
 	}
-	f.budgets = append(f.budgets, *input.DecisionBudget)
-	if *input.DecisionBudget > 0 {
-		*input.DecisionBudget--
+	remaining := input.DecisionBudget.Remaining()
+	if input.DecisionBudget.Reserve() {
+		f.reserved.Add(1)
 	}
+	f.mu.Lock()
+	f.budgets = append(f.budgets, remaining)
+	f.mu.Unlock()
 	return triager.DiscoveryResult{}, nil
 }
