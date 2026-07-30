@@ -87,6 +87,42 @@ const (
 // CollectTargetLabels, and CollectTargetLikeLabels. Use those rather than
 // matching the prefix by hand.
 
+// Definition is a label together with the presentation a repository should
+// carry for it. Identity and presentation live together so that adding a label
+// forces a decision about how it reads in the forge UI, rather than leaving it
+// to a default that says nothing.
+type Definition struct {
+	Name        string `json:"name"`
+	Color       string `json:"color"`
+	Description string `json:"description"`
+}
+
+// Standard returns every label Looper provisions into a managed repository.
+//
+// Provisioning creates what is missing and never edits what is already there.
+// Colors and descriptions here therefore describe the intended default for a
+// fresh repository, not an authority over an existing one: a maintainer who
+// has reworded a label in the forge keeps their wording.
+//
+// Where a label already existed in a repository Looper manages, that live
+// value is recorded here rather than a fresh invention, so that the two agree
+// from the start instead of the table quietly describing a different label
+// than the one in use.
+func Standard() []Definition {
+	return []Definition{
+		{Name: DefaultPlanTrigger, Color: "5319e7", Description: "Picked up automatically by planner"},
+		{Name: DefaultWorkerReadyTrigger, Color: "0e8a16", Description: "Ready for Looper worker implementation"},
+		{Name: SpecReviewing, Color: "1d76db", Description: "Spec PR is under review"},
+		{Name: SpecReady, Color: "0e8a16", Description: "Spec PR is ready for implementation"},
+		{Name: NeedsHuman, Color: "d93f0b", Description: "Looper requires manual intervention"},
+		{Name: AwaitingHuman, Color: "fbca04", Description: "Waiting on a human response before Looper continues"},
+		{Name: HoldGlobal, Color: "b60205", Description: "Pause all automatic Looper work"},
+		{Name: HoldWorker, Color: "b60205", Description: "Pause automatic worker work"},
+		{Name: HoldFixer, Color: "b60205", Description: "Pause automatic fixer work"},
+		{Name: HoldReviewer, Color: "b60205", Description: "Pause automatic reviewer work"},
+	}
+}
+
 // Normalize puts a label into the form comparisons use. Forge labels are
 // case-insensitive and arrive with incidental whitespace from CLI output and
 // config files, so every comparison in Looper goes through this.
