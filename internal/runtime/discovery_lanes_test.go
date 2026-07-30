@@ -24,22 +24,20 @@ func TestDiscoveryLanesRegisterTriagerAheadOfPlannerWithoutChangingFixerSupport(
 	}
 	githubCapabilities, _ := forge.StaticCapabilities(forge.ProviderKindGitHub)
 	forgejoCapabilities, _ := forge.StaticCapabilities(forge.ProviderKindForgejo)
-	planeCapabilities, _ := forge.StaticCapabilities(forge.ProviderKindPlane)
 	if byName["triager"].Supported(githubCapabilities) != true ||
-		byName["triager"].Supported(forgejoCapabilities) != false ||
-		byName["triager"].Supported(planeCapabilities) != false {
+		byName["triager"].Supported(forgejoCapabilities) != false {
 		t.Fatal("triager must accept GitHub issues only")
 	}
 	if !byName[config.CodingRoleFixer].Supported(forgejoCapabilities) {
 		t.Fatal("triager registration changed fixer Forgejo discovery support")
 	}
-	if !byName["coordinator"].Supported(githubCapabilities) || byName["coordinator"].Supported(forgejoCapabilities) || byName["coordinator"].Supported(planeCapabilities) {
+	if !byName["coordinator"].Supported(githubCapabilities) || byName["coordinator"].Supported(forgejoCapabilities) {
 		t.Fatal("coordinator must run only where GitHub owns issue authority")
 	}
 	// triager and coordinator both discover GitHub issues through the GitHub
 	// gateway, so they must share one authority predicate and never drift apart
 	// (the per-lane predicates previously drifted to different wrong flags).
-	for _, capabilities := range []forge.Capabilities{githubCapabilities, forgejoCapabilities, planeCapabilities} {
+	for _, capabilities := range []forge.Capabilities{githubCapabilities, forgejoCapabilities} {
 		if byName["triager"].Supported(capabilities) != byName["coordinator"].Supported(capabilities) {
 			t.Fatalf("triager and coordinator must share GitHub issue authority, drifted on %#v", capabilities)
 		}

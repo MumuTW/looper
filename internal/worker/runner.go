@@ -544,10 +544,6 @@ type DiscoveryPolicy struct {
 	LabelMode                  config.LabelMode
 	RequireAssigneeCurrentUser bool
 	RoutedClaimPolicy          networkpolicy.ProjectPolicy
-	// IsPlane marks a Plane task-source project; PlaneAssigneeID, when set,
-	// scopes discovery to work-items assigned to that Plane member UUID.
-	IsPlane         bool
-	PlaneAssigneeID string
 }
 
 type Runner struct {
@@ -901,12 +897,7 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 		return DiscoveryResult{Skipped: 1}, nil
 	}
 	assigneeFilter := ""
-	if policy.IsPlane {
-		// Plane assignees are UUIDs, so the GitHub-login assignee gate can't
-		// route them. Scope to the owner's configured Plane member UUID when set
-		// (empty = label-only discovery); never fall back to the GitHub login.
-		assigneeFilter = policy.PlaneAssigneeID
-	} else if !networkpolicy.IsRouted(policy.RoutedClaimPolicy) && policy.RequireAssigneeCurrentUser {
+	if !networkpolicy.IsRouted(policy.RoutedClaimPolicy) && policy.RequireAssigneeCurrentUser {
 		assigneeFilter = login
 	}
 	requiredTargetLabel, err := r.requiredTargetLabel(ctx, project.ID)
@@ -960,8 +951,7 @@ func (r *Runner) discoveryPolicyForProject(projectID string) DiscoveryPolicy {
 	if !ok {
 		return r.discoveryPolicy
 	}
-	isPlane := r.providerSelectionForProject(projectID).UsesExternalTaskSource()
-	return DiscoveryPolicy{AutoDiscovery: role.Discovery.Enabled, Labels: append([]string(nil), role.Discovery.Labels...), LabelMode: role.Discovery.LabelMode, RequireAssigneeCurrentUser: role.Discovery.RequireAssigneeCurrentUser, RoutedClaimPolicy: networkpolicy.ProjectPolicyForProject(*r.projectRoleConfig, projectID), IsPlane: isPlane, PlaneAssigneeID: strings.TrimSpace(role.Discovery.PlaneAssigneeID)}
+	return DiscoveryPolicy{AutoDiscovery: role.Discovery.Enabled, Labels: append([]string(nil), role.Discovery.Labels...), LabelMode: role.Discovery.LabelMode, RequireAssigneeCurrentUser: role.Discovery.RequireAssigneeCurrentUser, RoutedClaimPolicy: networkpolicy.ProjectPolicyForProject(*r.projectRoleConfig, projectID)}
 }
 
 func (r *Runner) requiredTargetLabel(ctx context.Context, projectID string) (string, error) {

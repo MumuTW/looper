@@ -345,88 +345,6 @@ func TestMinimalForgejoProviderConfigAppliesSafeProjectProfile(t *testing.T) {
 	}
 }
 
-func TestPlaneProviderConfigLoadsWorkspaceAndProjectID(t *testing.T) {
-	cwd := t.TempDir()
-	configPath := filepath.Join(cwd, "config.json")
-	contents := `{
-		"notifications": {"osascript": {"enabled": false}},
-		"providers": [{"id":"plane-od","kind":"plane","baseUrl":"https://plane.powerformer.net/api/v1","tokenEnv":"PLANE_API_KEY","workspace":"open-design","projectId":"proj-uuid-123"}],
-		"projects": [{"id":"demo","name":"Demo","provider":"plane-od","repo":"OWNER/repo","repoPath":"/tmp/repo"}]
-	}`
-	if err := os.WriteFile(configPath, []byte(contents), 0o644); err != nil {
-		t.Fatalf("os.WriteFile() error = %v", err)
-	}
-
-	loaded, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: configPath, LookupEnv: emptyEnvLookup, LookPath: fakeLookPath(map[string]string{"git": "/git", "gh": "/gh"})})
-	if err != nil {
-		t.Fatalf("LoadFile() error = %v", err)
-	}
-	if len(loaded.Config.Providers) != 1 {
-		t.Fatalf("LoadFile().Config.Providers len = %d, want 1", len(loaded.Config.Providers))
-	}
-	provider := loaded.Config.Providers[0]
-	if provider.Kind != ProviderKindPlane {
-		t.Fatalf("provider kind = %q, want %q", provider.Kind, ProviderKindPlane)
-	}
-	if provider.Workspace == nil || *provider.Workspace != "open-design" {
-		t.Fatalf("provider workspace = %#v, want open-design", provider.Workspace)
-	}
-	if provider.ProjectID == nil || *provider.ProjectID != "proj-uuid-123" {
-		t.Fatalf("provider projectId = %#v, want proj-uuid-123", provider.ProjectID)
-	}
-	if ResolvedProjectProviderKind(loaded.Config, loaded.Config.Projects[0]) != ProviderKindPlane {
-		t.Fatalf("project provider kind = %q, want plane", ResolvedProjectProviderKind(loaded.Config, loaded.Config.Projects[0]))
-	}
-}
-
-func TestPlaneProjectRejectsCoordinatorWithoutPlaneIssueAdapter(t *testing.T) {
-	t.Parallel()
-	tokenEnv := "PLANE_TOKEN"
-	workspace := "acme"
-	planeProjectID := "plane-project"
-	enabled := true
-	cfg, err := Normalize(t.TempDir(), PartialConfig{
-		Providers: &[]PartialProviderConfig{{ID: "plane", Kind: providerKindPtr(ProviderKindPlane), TokenEnv: &tokenEnv, Workspace: &workspace, ProjectID: &planeProjectID}},
-		Projects: &[]PartialProjectRefConfig{{
-			ID: "plane", Name: "Plane", Provider: stringPtr("plane"), Repo: stringPtr("acme/code"), RepoPath: "/tmp/plane",
-			Roles: &PartialRoleConfigs{Coordinator: &PartialCoordinatorRoleConfig{Enabled: &enabled}},
-		}},
-	})
-	if err != nil {
-		t.Fatalf("Normalize() error = %v", err)
-	}
-	err = ValidateWithOptions(cfg, ValidateOptions{DefaultWorktreeRoot: t.TempDir()})
-	var validationErr *ConfigValidationError
-	if !errors.As(err, &validationErr) {
-		t.Fatalf("ValidateWithOptions() error = %v, want *ConfigValidationError", err)
-	}
-	assertValidationIssue(t, validationErr, "projects[0].roles.coordinator.enabled", "must be false for plane projects; coordinator requires GitHub issue authority")
-}
-
-func TestPlaneProjectRejectsForgejoSummaryCommentPublishMode(t *testing.T) {
-	t.Parallel()
-	tokenEnv := "PLANE_TOKEN"
-	workspace := "acme"
-	planeProjectID := "plane-project"
-	publishMode := ReviewerPublishModeSummaryComment
-	cfg, err := Normalize(t.TempDir(), PartialConfig{
-		Providers: &[]PartialProviderConfig{{ID: "plane", Kind: providerKindPtr(ProviderKindPlane), TokenEnv: &tokenEnv, Workspace: &workspace, ProjectID: &planeProjectID}},
-		Projects: &[]PartialProjectRefConfig{{
-			ID: "plane", Name: "Plane", Provider: stringPtr("plane"), Repo: stringPtr("acme/code"), RepoPath: "/tmp/plane",
-			Roles: &PartialRoleConfigs{Reviewer: &PartialReviewerRoleConfig{Behavior: &PartialReviewerConfig{PublishMode: &publishMode}}},
-		}},
-	})
-	if err != nil {
-		t.Fatalf("Normalize() error = %v", err)
-	}
-	err = ValidateWithOptions(cfg, ValidateOptions{DefaultWorktreeRoot: t.TempDir()})
-	var validationErr *ConfigValidationError
-	if !errors.As(err, &validationErr) {
-		t.Fatalf("ValidateWithOptions() error = %v, want *ConfigValidationError", err)
-	}
-	assertValidationIssue(t, validationErr, "projects[0].roles.reviewer.behavior.publishMode", "summary_comment is supported only for forgejo projects")
-}
-
 func TestForgejoExplicitReviewRequestOptInLoads(t *testing.T) {
 	cwd := t.TempDir()
 	configPath := filepath.Join(cwd, "config.json")
@@ -660,27 +578,6 @@ func TestValidateRejectsSameRepoThroughProviderAliases(t *testing.T) {
 	}
 	if err := ValidateWithOptions(cfg, ValidateOptions{DefaultWorktreeRoot: t.TempDir()}); err == nil || !strings.Contains(err.Error(), "duplicates") {
 		t.Fatalf("ValidateWithOptions() error = %v, want physical endpoint duplicate rejection", err)
-	}
-}
-
-func TestValidateTreatsPlaneCodeRepoAsGitHubIdentity(t *testing.T) {
-	t.Parallel()
-
-	tokenEnv := "PLANE_TOKEN"
-	workspace := "acme"
-	planeProjectID := "plane-project"
-	cfg, err := Normalize(t.TempDir(), PartialConfig{
-		Providers: &[]PartialProviderConfig{{ID: "plane", Kind: providerKindPtr(ProviderKindPlane), TokenEnv: &tokenEnv, Workspace: &workspace, ProjectID: &planeProjectID}},
-		Projects: &[]PartialProjectRefConfig{
-			{ID: "github", Name: "GitHub", Repo: stringPtr("acme/app"), RepoPath: "/tmp/github"},
-			{ID: "plane", Name: "Plane", Provider: stringPtr("plane"), Repo: stringPtr("ACME/APP"), RepoPath: "/tmp/plane"},
-		},
-	})
-	if err != nil {
-		t.Fatalf("Normalize() error = %v", err)
-	}
-	if err := ValidateWithOptions(cfg, ValidateOptions{DefaultWorktreeRoot: t.TempDir()}); err == nil || !strings.Contains(err.Error(), "duplicates") {
-		t.Fatalf("ValidateWithOptions() error = %v, want Plane/GitHub code repo duplicate rejection", err)
 	}
 }
 
@@ -4184,4 +4081,128 @@ func validationIssuesContainPath(issues []ValidationIssue, path string) bool {
 		}
 	}
 	return false
+}
+
+func TestRemovedPlaneProviderKindIsRejectedNotTreatedAsGitHub(t *testing.T) {
+	t.Parallel()
+
+	removed := ProviderKind("plane")
+	cfg, err := Normalize(t.TempDir(), PartialConfig{
+		Providers: &[]PartialProviderConfig{{ID: "plane-od", Kind: &removed, TokenEnv: stringPtr("PLANE_API_KEY")}},
+		Projects: &[]PartialProjectRefConfig{{
+			ID: "demo", Name: "Demo", Provider: stringPtr("plane-od"), Repo: stringPtr("acme/code"), RepoPath: "/tmp/demo",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("Normalize() error = %v", err)
+	}
+
+	err = ValidateWithOptions(cfg, ValidateOptions{DefaultWorktreeRoot: t.TempDir()})
+	var validationErr *ConfigValidationError
+	if !errors.As(err, &validationErr) {
+		t.Fatalf("ValidateWithOptions() error = %v, want *ConfigValidationError", err)
+	}
+	assertValidationIssue(t, validationErr, "providers[0].kind", `provider kind "plane" is no longer supported: Plane support was removed; looper reads work-items from GitHub issues only`)
+
+	// A removed provider must never be reinterpreted as GitHub.
+	if kind := ResolvedProjectProviderKind(cfg, cfg.Projects[0]); kind == ProviderKindGitHub {
+		t.Fatalf("project provider kind = %q, want the removed kind to stay distinct from GitHub", kind)
+	}
+}
+
+// TestLoadFileLegacyPlaneSchemaRejectedBeforeStrictDecode guards the
+// pre-decode detection for configs that still use the removed Plane schema.
+// A config with kind = "plane" plus legacy fields (providers[].workspace,
+// providers[].projectId, roles.*.triggers.planeAssigneeId,
+// roles.coding.<name>.discovery.planeAssigneeId) must receive the explicit
+// "plane is no longer supported" validation error before DisallowUnknownFields
+// aborts on the removed fields, instead of a misleading unknown-field decode
+// failure that surfaces one field at a time.
+func TestLoadFileLegacyPlaneSchemaRejectedBeforeStrictDecode(t *testing.T) {
+	t.Parallel()
+
+	cwd := t.TempDir()
+	configPath := filepath.Join(cwd, "config.toml")
+	contents := `
+[[providers]]
+id = "plane-od"
+kind = "plane"
+workspace = "acme"
+projectId = "abc123"
+tokenEnv = "PLANE_API_KEY"
+
+[[projects]]
+id = "demo"
+name = "Demo"
+provider = "plane-od"
+repo = "acme/code"
+repoPath = "/tmp/demo"
+
+[roles.planner.triggers]
+planeAssigneeId = "11111111-1111-1111-1111-111111111111"
+
+[roles.coding.worker.discovery]
+planeAssigneeId = "22222222-2222-2222-2222-222222222222"
+`
+	if err := os.WriteFile(configPath, []byte(contents), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+
+	_, err := LoadFile(LoadFileOptions{
+		CWD:        cwd,
+		ConfigPath: configPath,
+		LookupEnv:  emptyEnvLookup,
+		LookPath:   fakeLookPath(map[string]string{"git": "/detected/git", "gh": "/detected/gh", "osascript": "/detected/osascript"}),
+	})
+	if err == nil {
+		t.Fatal("LoadFile() error = nil, want removed-plane-kind validation error")
+	}
+	var validationErr *ConfigValidationError
+	if !errors.As(err, &validationErr) {
+		t.Fatalf("LoadFile() error = %T (%v), want *ConfigValidationError from removed-plane-kind validation", err, err)
+	}
+	assertValidationIssue(t, validationErr, "providers[0].kind", `provider kind "plane" is no longer supported: Plane support was removed; looper reads work-items from GitHub issues only`)
+}
+
+// TestLoadFileRemovedPlaneFieldsRejectedForSupportedProviders verifies the
+// removed Plane decode fields are not silently accepted for supported
+// providers. A github provider with a stray workspace field must surface a
+// decode error (the field is gone from the schema), proving no compatibility
+// shim keeps obsolete fields alive.
+func TestLoadFileRemovedPlaneFieldsRejectedForSupportedProviders(t *testing.T) {
+	t.Parallel()
+
+	cwd := t.TempDir()
+	configPath := filepath.Join(cwd, "config.toml")
+	contents := `
+[[providers]]
+id = "gh"
+kind = "github"
+workspace = "acme"
+tokenEnv = "GH_TOKEN"
+
+[[projects]]
+id = "demo"
+name = "Demo"
+provider = "gh"
+repo = "acme/code"
+repoPath = "/tmp/demo"`
+	if err := os.WriteFile(configPath, []byte(contents), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+
+	_, err := LoadFile(LoadFileOptions{
+		CWD:        cwd,
+		ConfigPath: configPath,
+		LookupEnv:  emptyEnvLookup,
+		LookPath:   fakeLookPath(map[string]string{"git": "/detected/git", "gh": "/detected/gh", "osascript": "/detected/osascript"}),
+	})
+	if err == nil {
+		t.Fatal("LoadFile() error = nil, want unknown-field decode error for removed workspace field")
+	}
+	// The error must be a decode failure, not a validation error or nil.
+	var validationErr *ConfigValidationError
+	if errors.As(err, &validationErr) {
+		t.Fatalf("LoadFile() returned *ConfigValidationError (%v), want a decode error that rejects the removed field", err)
+	}
 }

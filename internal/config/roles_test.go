@@ -14,7 +14,6 @@ func TestCodingRolesFromLegacyProjectsSourceAndFields(t *testing.T) {
 				Labels:                     []string{"looper:plan"},
 				LabelMode:                  LabelModeAll,
 				RequireAssigneeCurrentUser: true,
-				PlaneAssigneeID:            "uuid-1",
 			},
 		},
 		Fixer: FixerRoleConfig{
@@ -39,9 +38,6 @@ func TestCodingRolesFromLegacyProjectsSourceAndFields(t *testing.T) {
 	}
 	if !planner.Discovery.RequireAssigneeCurrentUser {
 		t.Errorf("planner requireAssigneeCurrentUser was not carried over")
-	}
-	if planner.Discovery.PlaneAssigneeID != "uuid-1" {
-		t.Errorf("planner planeAssigneeId = %q, want uuid-1", planner.Discovery.PlaneAssigneeID)
 	}
 	if planner.Instructions != "plan carefully" {
 		t.Errorf("planner instructions = %q", planner.Instructions)
@@ -113,9 +109,8 @@ func TestValidateRoleDiscoveryRejectsCrossSourceFields(t *testing.T) {
 			discovery: RoleDiscoveryConfig{
 				Source:                     WorkSourcePullRequest,
 				RequireAssigneeCurrentUser: true,
-				PlaneAssigneeID:            "uuid-1",
 			},
-			wantCount: 2,
+			wantCount: 1,
 		},
 		{
 			name:      "unknown source is rejected",
