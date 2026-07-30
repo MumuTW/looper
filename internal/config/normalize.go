@@ -506,8 +506,6 @@ func normalizeBaseURL(value string) string {
 	return parsed.String()
 }
 
-func reviewerReviewEventPtr(value ReviewerReviewEvent) *ReviewerReviewEvent { return &value }
-
 func mergeServerConfig(config *ServerConfig, partial PartialServerConfig) {
 	if partial.Host != nil {
 		config.Host = *partial.Host
@@ -1436,15 +1434,6 @@ func mergeIssueRoleTriggersConfig(config *IssueRoleTriggersConfig, partial Parti
 	}
 }
 
-func mergePullRequestRoleTriggersConfig(config *PullRequestRoleTriggersConfig, partial PartialPullRequestRoleTriggersConfig) {
-	if partial.IncludeDrafts != nil {
-		config.IncludeDrafts = *partial.IncludeDrafts
-	}
-	if partial.RequireReviewRequest != nil {
-		config.RequireReviewRequest = *partial.RequireReviewRequest
-	}
-}
-
 func mergeReviewerRoleTriggersConfig(config *ReviewerRoleTriggersConfig, partial PartialReviewerRoleTriggersConfig) {
 	if partial.IncludeDrafts != nil {
 		config.IncludeDrafts = *partial.IncludeDrafts
@@ -1770,14 +1759,6 @@ func cloneProviderConfigs(providers []PartialProviderConfig) []ProviderConfig {
 		normalizeProviderConfig(&cloned[index])
 	}
 	return cloned
-}
-
-func cloneProjectNetworkConfig(config *ProjectNetworkConfig) *ProjectNetworkConfig {
-	if config == nil {
-		return nil
-	}
-	cloned := *config
-	return &cloned
 }
 
 func mergeLegacyProjectInstructionsIntoRoles(roles *PartialRoleConfigs, instructions map[string]string) *PartialRoleConfigs {

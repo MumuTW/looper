@@ -9,6 +9,12 @@ import (
 	"github.com/nexu-io/looper/internal/storage"
 )
 
+func (r *guardRegistry) size() int {
+	r.registryMu.Lock()
+	defer r.registryMu.Unlock()
+	return len(r.entries)
+}
+
 func TestPullRequestTargetGuardKeyMatchesLoopRecordKey(t *testing.T) {
 	t.Parallel()
 	repo := "acme/looper"

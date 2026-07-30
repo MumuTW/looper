@@ -2069,56 +2069,6 @@ func TestRuntimeRecoveryPreservesRunWithUncertainActiveAgentExecution(t *testing
 	}
 }
 
-func TestCommandPrefixMatchesRejectsTruncatedPromptTail(t *testing.T) {
-	t.Parallel()
-
-	if commandPrefixMatches(
-		[]string{"codex", "exec", "very long reviewer prompt that may be truncated by ps output"},
-		[]string{"codex", "exec", "very long reviewer prompt"},
-	) {
-		t.Fatal("commandPrefixMatches() = true, want false for truncated prompt tail")
-	}
-}
-
-func TestCommandPrefixMatchesRejectsMissingTail(t *testing.T) {
-	t.Parallel()
-
-	if commandPrefixMatches(
-		[]string{"codex", "exec", "very long reviewer prompt that may be truncated by ps output"},
-		[]string{"codex", "exec"},
-	) {
-		t.Fatal("commandPrefixMatches() = true, want false when actual command is missing the trailing token")
-	}
-}
-
-func TestCommandPrefixMatchesRejectsPSEscapedNewlinesAsAmbiguous(t *testing.T) {
-	t.Parallel()
-
-	if commandPrefixMatches(
-		[]string{"codex", "exec", "Fix pull request nexu-io/vela#594.\n\nMinimal PR seed"},
-		splitProcessCommand(`codex exec Fix pull request nexu-io/vela#594.\012\012Minimal PR seed`),
-	) {
-		t.Fatal("commandPrefixMatches() = true, want false for ambiguous ps-escaped newline prompt")
-	}
-}
-
-func TestCommandPrefixMatchesPreservesLiteralOctalBackslashes(t *testing.T) {
-	t.Parallel()
-
-	if !commandPrefixMatches(
-		[]string{"codex", "exec", `Review code block containing \012 literally`},
-		splitProcessCommand(`codex exec Review code block containing \012 literally`),
-	) {
-		t.Fatal("commandPrefixMatches() = false, want true for literal octal-looking backslashes")
-	}
-	if commandPrefixMatches(
-		[]string{"codex", "exec", `Review code block containing \012 literally`},
-		splitProcessCommand(`codex exec Review code block containing \012 changed`),
-	) {
-		t.Fatal("commandPrefixMatches() = true, want false for changed literal octal-looking backslash tail")
-	}
-}
-
 func TestRuntimeRecoveryPreservesLoopWithActiveAgentExecution(t *testing.T) {
 	t.Parallel()
 

@@ -34,6 +34,11 @@ import (
 	pkgapi "github.com/nexu-io/looper/pkg/api"
 )
 
+type stopLoopResponse struct {
+	Stopped bool   `json:"stopped"`
+	LoopID  string `json:"loopId"`
+}
+
 func TestHandlerHealthzSuccessAndRequestIDEcho(t *testing.T) {
 	rt, cfg := startTestRuntime(t)
 	h := NewHandler(Context{Config: cfg, Runtime: rt})
@@ -5492,52 +5497,6 @@ func TestSerializePullRequestListItemIncludesMergeabilityBlocker(t *testing.T) {
 	}
 	if item.HasConflicts == nil || !*item.HasConflicts {
 		t.Fatalf("HasConflicts = %v, want true", item.HasConflicts)
-	}
-}
-
-func TestIsPlannerPullRequestOpenReadsStructMarshaledStateKey(t *testing.T) {
-	fixture := newTestFixture(t)
-	nowISO := fixture.now.UTC().Format(javaScriptISOString)
-
-	if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{
-		ID:        "project_1",
-		Name:      "Looper",
-		RepoPath:  "/tmp/repos/looper",
-		Archived:  false,
-		CreatedAt: nowISO,
-		UpdatedAt: nowISO,
-	}); err != nil {
-		t.Fatalf("Projects.Upsert() error = %v", err)
-	}
-
-	payloadBytes, err := json.Marshal(map[string]any{
-		"detail": struct {
-			State string
-		}{
-			State: "OPEN",
-		},
-	})
-	if err != nil {
-		t.Fatalf("json.Marshal() error = %v", err)
-	}
-	payloadJSON := string(payloadBytes)
-
-	if err := fixture.runtime.Services().Repositories.PullRequestSnapshots.Upsert(context.Background(), storage.PullRequestSnapshotRecord{
-		ID:          "prs_planner_open",
-		ProjectID:   "project_1",
-		Repo:        "acme/looper",
-		PRNumber:    42,
-		HeadSHA:     "abc123",
-		PayloadJSON: &payloadJSON,
-		CapturedAt:  nowISO,
-		CreatedAt:   nowISO,
-	}); err != nil {
-		t.Fatalf("PullRequestSnapshots.Upsert() error = %v", err)
-	}
-
-	h := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now }})
-	if !h.isPlannerPullRequestOpen(context.Background(), "project_1", "acme/looper", 42) {
-		t.Fatal("isPlannerPullRequestOpen() = false, want true")
 	}
 }
 

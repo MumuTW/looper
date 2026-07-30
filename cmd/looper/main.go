@@ -1278,13 +1278,6 @@ func stopAllResultCounts(payload []byte) (failed, pausedOnly int, err error) {
 	return 0, 0, fmt.Errorf("decode stop-all response: missing summary")
 }
 
-// apiErrorMessage pulls the daemon's own message out of an error envelope so
-// the operator sees "loop not found", not a raw JSON blob.
-func apiErrorMessage(payload []byte) string {
-	_, message := apiErrorEnvelope(payload)
-	return message
-}
-
 // apiErrorEnvelope returns the daemon's typed error code alongside its message.
 // The code is what callers must branch on: the message is prose that varies by
 // cause, and the status alone cannot distinguish "this route does not exist on

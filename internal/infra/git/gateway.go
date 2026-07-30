@@ -1406,14 +1406,6 @@ func DetachedPRWorktreePath(worktreeRoot, projectID string, prNumber int64) stri
 	}))
 }
 
-func parseGitHubRepoFromRemoteURL(remoteURL string) string {
-	host, repo := parseRemoteRepoFromURL(remoteURL)
-	if !isGitHubRemoteHost(host) {
-		return ""
-	}
-	return repo
-}
-
 // parseRemoteRepoFromURL extracts host and owner/name from common git remote URL forms:
 //   - user@host:owner/repo.git
 //   - user@[ipv6]:owner/repo.git
@@ -1474,12 +1466,6 @@ func sanitizeBranchName(branch string) string {
 		builder.WriteRune('-')
 	}
 	return builder.String()
-}
-
-func isWithinRoot(path, root string) bool {
-	resolvedPath := normalizeComparablePath(path)
-	resolvedRoot := normalizeComparablePath(root)
-	return resolvedPath == resolvedRoot || strings.HasPrefix(resolvedPath, resolvedRoot+"/")
 }
 
 func normalizeComparablePath(path string) string {

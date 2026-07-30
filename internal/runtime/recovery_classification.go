@@ -203,15 +203,3 @@ func (r *Runtime) assessExecutionLiveness(ctx context.Context, execution storage
 	// PID reuse, or argv drift cannot prove that background descendants drained.
 	return assessment, nil
 }
-
-// classificationAllowsTerminalOrRequeue is true only for confirmed-dead.
-// Observed live and uncertain must not mark terminal, requeue, signal, or overlap.
-func classificationAllowsTerminalOrRequeue(class ContainmentClass) bool {
-	return class == ContainmentConfirmedDead
-}
-
-// classificationRequiresQuarantine is true when recovery must park work via
-// existing manual_intervention / paused states without PID action.
-func classificationRequiresQuarantine(class ContainmentClass) bool {
-	return class == ContainmentObservedLive || class == ContainmentUncertain
-}

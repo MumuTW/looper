@@ -50,12 +50,6 @@ type IssueSummary struct {
 	Labels []string
 }
 
-type loadedCoordinatorIssue struct {
-	summary       githubinfra.IssueSummary
-	issue         triage.Issue
-	dispatchIssue dispatch.Issue
-}
-
 type GitHubGateway interface {
 	ListOpenIssues(context.Context, githubinfra.ListOpenIssuesInput) ([]githubinfra.IssueSummary, error)
 	ListOpenPullRequests(context.Context, githubinfra.ListOpenPullRequestsInput) ([]githubinfra.PullRequestSummary, error)
@@ -309,75 +303,6 @@ func filterLoadedIssues(loaded []loadedIssue, skipped map[int64]struct{}) []load
 		filtered = append(filtered, item)
 	}
 	return filtered
-}
-
-func (r *Runner) buildDispatchDependencyGraph(ctx context.Context, repo, cwd string, depsCfg config.CoordinatorDependenciesConfig, dispatchCfg dispatch.Config, loaded []loadedCoordinatorIssue, now time.Time) (*depgraph.DependencyGraph, error) {
-	if !depsCfg.Enabled {
-		return nil, nil
-	}
-	candidates := dispatchDependencyCandidates(loaded, dispatchCfg, now)
-	if len(candidates) == 0 {
-		graph := depgraph.Build(nil, depgraph.Snapshot{})
-		return &graph, nil
-	}
-	tracked := make([]depgraph.IssueRef, 0, len(candidates))
-	snapshot := depgraph.Snapshot{
-		BlockedBy:   make(map[depgraph.IssueRef][]depgraph.IssueRef, len(candidates)),
-		Issues:      map[depgraph.IssueRef]depgraph.IssueState{},
-		Unreachable: []depgraph.IssueRef{},
-	}
-	for _, issueNumber := range candidates {
-		issueRef := depgraph.IssueRef{Repo: repo, Number: issueNumber}
-		tracked = append(tracked, issueRef)
-		blockedBy, err := r.listIssueBlockedByWithRetry(ctx, repo, cwd, issueNumber, depsCfg)
-		if err != nil {
-			return nil, err
-		}
-		for _, blocker := range blockedBy {
-			blockerRef, blockerState, reachable := r.loadBlockerState(ctx, cwd, blocker, depsCfg)
-			snapshot.BlockedBy[issueRef] = append(snapshot.BlockedBy[issueRef], blockerRef)
-			if reachable {
-				snapshot.Issues[blockerRef] = blockerState
-				continue
-			}
-			snapshot.Unreachable = append(snapshot.Unreachable, blockerRef)
-		}
-	}
-	graph := depgraph.Build(tracked, snapshot)
-	return &graph, nil
-}
-
-func dispatchDependencyCandidates(loaded []loadedCoordinatorIssue, cfg dispatch.Config, now time.Time) []int64 {
-	set := map[int64]struct{}{}
-	for _, loadedIssue := range loaded {
-		if !dispatch.NeedsDependencyGate(loadedIssue.dispatchIssue, cfg, now) {
-			continue
-		}
-		set[loadedIssue.issue.Number] = struct{}{}
-	}
-	out := make([]int64, 0, len(set))
-	for issueNumber := range set {
-		out = append(out, issueNumber)
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
-	return out
-}
-func (r *Runner) listIssueBlockedByWithRetry(ctx context.Context, repo, cwd string, issueNumber int64, depsCfg config.CoordinatorDependenciesConfig) ([]githubinfra.IssueDependency, error) {
-	var lastErr error
-	attempts := maxDependencyAttempts(depsCfg.APIRetryAttempts)
-	for attempt := 0; attempt < attempts; attempt++ {
-		callCtx, cancel := context.WithTimeout(ctx, dependencyTimeout(depsCfg.APITimeoutSeconds))
-		blockedBy, err := r.github.ListIssueBlockedBy(callCtx, githubinfra.ListIssueBlockedByInput{Repo: repo, IssueNumber: issueNumber, CWD: cwd})
-		cancel()
-		if err == nil {
-			return blockedBy, nil
-		}
-		lastErr = err
-		if !shouldRetryDependencyError(err) {
-			return nil, err
-		}
-	}
-	return nil, lastErr
 }
 
 func (r *Runner) listBlockedByIssuesWithRetry(ctx context.Context, repo, cwd string, issueNumber int64, depsCfg config.CoordinatorDependenciesConfig) ([]githubinfra.DependencyIssue, error) {
@@ -1696,10 +1621,6 @@ func roleConfigToDispatchConfig(roleCfg config.CoordinatorRoleConfig, roles conf
 		PlannerTriggerLabels: requiredDiscoveryLabels(planner.Discovery.Labels, planner.Discovery.LabelMode),
 		WorkerTriggerLabels:  requiredDiscoveryLabels(worker.Discovery.Labels, worker.Discovery.LabelMode),
 	}
-}
-
-func requiredTriggerLabels(cfg config.IssueRoleTriggersConfig) []string {
-	return requiredDiscoveryLabels(cfg.Labels, cfg.LabelMode)
 }
 
 func requiredDiscoveryLabels(labels []string, labelMode config.LabelMode) []string {
