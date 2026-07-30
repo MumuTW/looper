@@ -302,10 +302,20 @@ devin mcp add hermes-memory \
   -- "$PWD/tools/hermes-devin/memory_mcp_server.py"
 ```
 
-`devin mcp add` writes a cwd-keyed local project config, so run it from the
-directory your Hermes sessions will use. `scripts/hermes-profile.sh
---bootstrap` writes the matching allow-list into the profile's `.env` and
-prints both steps.
+**Register once per repo, from the repo root.** `devin mcp add` writes
+`.devin/mcp_config.local.json` into the current directory, and Devin walks
+*up* from a session's cwd to find it — so a root-level registration covers
+every subdirectory (verified: a session run from `internal/` wrote memory
+through the root registration). There is no global fallback; a directory
+outside any tree containing `.devin/` sees no servers at all, which is the
+failure mode to recognise — memory writes silently no-op while recall keeps
+working.
+
+That file is gitignored on purpose: it holds absolute paths and the
+`HERMES_HOME` of whoever ran the command, so it is per-clone state, not
+shared config. `scripts/hermes-profile.sh --bootstrap` writes the matching
+allow-list into the profile's `.env` and prints the exact command for this
+checkout.
 
 ## Per-repo profile
 

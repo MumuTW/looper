@@ -140,9 +140,11 @@ ENV
   echo "  devin mcp add $LOOPER_MCP_SERVER \\"
   echo "    -e HERMES_HOME=$LOOPER_HERMES_HOME \\"
   echo "    -- $REPO_ROOT/tools/hermes-devin/memory_mcp_server.py"
-  echo "Run the devin command from the directory your sessions will use as cwd;"
-  echo "it writes a cwd-keyed local project config. Without both, recall still"
-  echo "works and writes silently no-op."
+  echo "Run the devin command once from this repo root: it writes"
+  echo ".devin/mcp_config.local.json there (gitignored — it holds absolute"
+  echo "paths), and Devin walks up from a session's cwd to find it, so"
+  echo "subdirectories are covered. Sessions outside this tree are not."
+  echo "Without both steps, recall still works and writes silently no-op."
 }
 
 # When sourced, $@ is the CALLER's argument list unless the caller passed
