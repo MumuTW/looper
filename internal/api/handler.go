@@ -7399,6 +7399,14 @@ func (h *Handler) buildCreateProjectResponse(r *http.Request, service projectSer
 		return createProjectResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "repoPath is required"}
 	}
 
+	if normalizeOptionalString(body.Provider) != nil {
+		return createProjectResponse{}, apiError{
+			code:    pkgapi.ErrorCodeValidationFailed,
+			status:  http.StatusBadRequest,
+			message: "provider binding cannot be set through the API; define the project under [[projects]] in the config file to bind a provider",
+		}
+	}
+
 	providedID := strings.TrimSpace(derefString(body.ID))
 	idSource := "derived"
 	projectID := providedID
@@ -7417,6 +7425,7 @@ func (h *Handler) buildCreateProjectResponse(r *http.Request, service projectSer
 	if baseBranch == "" {
 		baseBranch = h.context.Config.Defaults.BaseBranch
 	}
+
 	snapshotMode := projects.SnapshotMode(strings.TrimSpace(derefString(body.SnapshotMode)))
 	if snapshotMode == "" {
 		snapshotMode = projects.SnapshotMode(h.context.Config.Defaults.AddSnapshotMode)
@@ -7433,7 +7442,6 @@ func (h *Handler) buildCreateProjectResponse(r *http.Request, service projectSer
 		IDSource:     idSource,
 		WorktreeRoot: normalizeOptionalString(body.WorktreeRoot),
 		Repo:         normalizeOptionalString(body.Repo),
-		Provider:     normalizeOptionalString(body.Provider),
 		SnapshotMode: snapshotMode,
 	})
 	if err != nil {

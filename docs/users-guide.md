@@ -24,7 +24,7 @@ If the project is not registered yet:
 looper project add /absolute/path/to/repo
 ```
 
-That path must be the repository root — the directory containing `.git`. For advanced registration, `POST /api/v1/projects` accepts the same `repoPath` plus optional `id`, `baseBranch`, and `provider` fields. The dashboard only lists registered projects; it does not create them.
+That path must be the repository root — the directory containing `.git`. For advanced registration, `POST /api/v1/projects` accepts the same `repoPath` plus optional `id`, `baseBranch`, and `worktreeRoot` fields. The dashboard only lists registered projects; it does not create them. A `provider` binding cannot be set through the API or the dashboard — it is file-managed, so declare it in `[[projects]]` and restart the daemon.
 
 Webhook mode is configured in the config file (`webhook.mode` and per-project overrides). Observe health with `GET /api/v1/webhook/status` or the dashboard. Clearing stale GitHub CLI forwarder hooks is a manual `gh api` operation after you confirm the dry-run payload — there is no `looper webhook cleanup`.
 
