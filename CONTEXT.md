@@ -146,7 +146,7 @@ the committed manifest.
 _Avoid_: observed failure, error message, output.
 
 **Reproduction manifest**:
-The `.looper/reproduction.json` file committed in the reproduction commit. It
+The reproduction.json file under the branch's .looper directory, committed in the reproduction commit. It
 carries the Reproduction Record with the branch so Planner, Worker, and Fixer
 receive the reproduction's identity as explicit input rather than re-deriving it
 from the diff. The reproduction commit's changed-file set is exactly the declared
