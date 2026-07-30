@@ -628,6 +628,24 @@ type RoleConfigs struct {
 	Worker      WorkerRoleConfig      `json:"worker"`
 	Coordinator CoordinatorRoleConfig `json:"coordinator"`
 	Gatekeeper  GatekeeperRoleConfig  `json:"gatekeeper"`
+	Deployer    DeployerRoleConfig    `json:"deployer"`
+}
+
+// DeployerRoleConfig configures the agent-free Role that runs a project's deploy
+// command against the exact commit it reports as deployed.
+type DeployerRoleConfig struct {
+	Enabled bool `json:"enabled"`
+	// Command is run with /bin/sh -c from a checkout of the deployed commit. It is
+	// arbitrary local execution by design — the same trust the daemon already
+	// extends to the agent CLIs it runs — and only a commit reaching the base
+	// branch triggers it.
+	Command string `json:"command,omitempty"`
+	// TimeoutSeconds bounds one deploy. Empty defaults to 900. It also bounds how
+	// long an unfinished deploy holds its commit before being treated as abandoned.
+	TimeoutSeconds int `json:"timeoutSeconds,omitempty"`
+	// Environment is added to the deploy command's environment. Values, not names:
+	// a deploy usually needs credentials the daemon itself has no use for.
+	Environment map[string]string `json:"environment,omitempty"`
 }
 
 // GatekeeperTrustLevel is how much merge authority Merge Gatekeeper holds for a
@@ -1206,6 +1224,13 @@ type PartialCoordinatorRoleConfig struct {
 	MergeWatch   *PartialCoordinatorMergeWatchConfig   `json:"mergeWatch,omitempty"`
 }
 
+type PartialDeployerRoleConfig struct {
+	Enabled        *bool              `json:"enabled,omitempty"`
+	Command        *string            `json:"command,omitempty"`
+	TimeoutSeconds *int               `json:"timeoutSeconds,omitempty"`
+	Environment    *map[string]string `json:"environment,omitempty"`
+}
+
 type PartialGatekeeperRoleConfig struct {
 	Trust *GatekeeperTrustLevel `json:"trust,omitempty"`
 }
@@ -1223,6 +1248,7 @@ type PartialRoleConfigs struct {
 	Worker      *PartialWorkerRoleConfig           `json:"worker,omitempty"`
 	Coordinator *PartialCoordinatorRoleConfig      `json:"coordinator,omitempty"`
 	Gatekeeper  *PartialGatekeeperRoleConfig       `json:"gatekeeper,omitempty"`
+	Deployer    *PartialDeployerRoleConfig         `json:"deployer,omitempty"`
 	// Deprecated: sweeper was retired and is ignored when present in older configs.
 	Sweeper *map[string]any `json:"sweeper,omitempty"`
 }

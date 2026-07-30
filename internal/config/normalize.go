@@ -1218,6 +1218,9 @@ func mergeRoleConfigs(config *RoleConfigs, partial PartialRoleConfigs) {
 	if partial.Worker != nil {
 		mergeWorkerRoleConfig(&config.Worker, *partial.Worker)
 	}
+	if partial.Deployer != nil {
+		mergeDeployerRoleConfig(&config.Deployer, *partial.Deployer)
+	}
 	if partial.Gatekeeper != nil && partial.Gatekeeper.Trust != nil {
 		config.Gatekeeper.Trust = GatekeeperTrustLevel(strings.TrimSpace(string(*partial.Gatekeeper.Trust)))
 	}
@@ -1846,6 +1849,31 @@ func cloneAgentProfiles(profiles map[string]AgentBindingConfig) map[string]Agent
 	return cloned
 }
 
+// MergeDeployerRoleConfig applies a project's deployer overrides onto a copy of
+// the global role, so a caller needing only this role avoids cloning every other.
+func MergeDeployerRoleConfig(config *DeployerRoleConfig, partial PartialDeployerRoleConfig) {
+	mergeDeployerRoleConfig(config, partial)
+}
+
+func mergeDeployerRoleConfig(config *DeployerRoleConfig, partial PartialDeployerRoleConfig) {
+	if partial.Enabled != nil {
+		config.Enabled = *partial.Enabled
+	}
+	if partial.Command != nil {
+		config.Command = strings.TrimSpace(*partial.Command)
+	}
+	if partial.TimeoutSeconds != nil {
+		config.TimeoutSeconds = *partial.TimeoutSeconds
+	}
+	if partial.Environment != nil {
+		environment := make(map[string]string, len(*partial.Environment))
+		for key, value := range *partial.Environment {
+			environment[key] = value
+		}
+		config.Environment = environment
+	}
+}
+
 func clonePartialRoleConfigs(configs *PartialRoleConfigs) *PartialRoleConfigs {
 	if configs == nil {
 		return nil
@@ -1890,6 +1918,29 @@ func clonePartialRoleConfigs(configs *PartialRoleConfigs) *PartialRoleConfigs {
 		}
 		worker.Agent = cloneRoleAgentConfig(configs.Worker.Agent)
 		cloned.Worker = &worker
+	}
+	if configs.Deployer != nil {
+		deployerRole := *configs.Deployer
+		if configs.Deployer.Enabled != nil {
+			enabled := *configs.Deployer.Enabled
+			deployerRole.Enabled = &enabled
+		}
+		if configs.Deployer.Command != nil {
+			command := *configs.Deployer.Command
+			deployerRole.Command = &command
+		}
+		if configs.Deployer.TimeoutSeconds != nil {
+			timeout := *configs.Deployer.TimeoutSeconds
+			deployerRole.TimeoutSeconds = &timeout
+		}
+		if configs.Deployer.Environment != nil {
+			environment := make(map[string]string, len(*configs.Deployer.Environment))
+			for key, value := range *configs.Deployer.Environment {
+				environment[key] = value
+			}
+			deployerRole.Environment = &environment
+		}
+		cloned.Deployer = &deployerRole
 	}
 	if configs.Gatekeeper != nil {
 		gatekeeper := *configs.Gatekeeper
