@@ -1,9 +1,14 @@
 name: sandbox-cleanup
 
-# Dispatch-only while sandbox-e2e is dormant: with nothing creating sandbox
-# residue, the hourly cron only produced a failing run every hour. Restore the
-# schedule together with the sandbox-e2e push trigger.
+# Scheduled cleanup stays enabled so release preflights (release.yml's
+# sandbox-preflight job) and manual sandbox-e2e dispatches cannot leave stale
+# issues/PRs behind when they fail or time out — TestGitHubSandbox* only
+# reaches its per-test cleanup on success. While the sandbox App credentials
+# are absent, the job no-ops instead of failing every hour: the guard below
+# skips the token-mint and cleanup steps when LOOPER_E2E_GITHUB_APP_ID is unset.
 on:
+  schedule:
+    - cron: '17 * * * *'
   workflow_dispatch:
 
 permissions:
@@ -18,7 +23,21 @@ jobs:
       SANDBOX_REPO: ${{ vars.LOOPER_E2E_SANDBOX_REPO != '' && vars.LOOPER_E2E_SANDBOX_REPO || 'mumutw/looper-sandbox' }}
 
     steps:
+      - name: Skip when sandbox credentials are absent
+        id: guard-credentials
+        shell: bash
+        env:
+          APP_ID: ${{ vars.LOOPER_E2E_GITHUB_APP_ID }}
+        run: |
+          if [ -z "${APP_ID}" ]; then
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "LOOPER_E2E_GITHUB_APP_ID is unset; no sandbox credentials to clean up with."
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Resolve sandbox repository target
+        if: steps.guard-credentials.outputs.enabled == 'true'
         id: sandbox-repo
         shell: bash
         run: |
@@ -33,6 +52,7 @@ jobs:
           printf 'repo=%s\n' "$name" >> "$GITHUB_OUTPUT"
 
       - name: Mint sandbox GitHub App token
+        if: steps.guard-credentials.outputs.enabled == 'true'
         id: app-token
         uses: actions/create-github-app-token@v3
         with:
@@ -43,6 +63,7 @@ jobs:
             ${{ steps.sandbox-repo.outputs.repo }}
 
       - name: Close stale sandbox issues and pull requests
+        if: steps.guard-credentials.outputs.enabled == 'true'
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           GH_PROMPT_DISABLED: '1'
