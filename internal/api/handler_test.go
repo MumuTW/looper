@@ -2459,6 +2459,33 @@ func TestHandlerProjectsCreateRouteReturnsDiscoveryDetails(t *testing.T) {
 	}
 }
 
+// TestHandlerProjectsPatchLegacyProjectWithoutValidationStance pins the
+// CURRENT interaction of #329's validation enforcement with the PATCH
+// repair path: an API project registered before the enforcement (no
+// validation key in its metadata) fails ANY patch with 400, even one that
+// touches only repo. Whether that is the intended migration posture or a
+// regression is #402's open policy question — this test is the tripwire
+// keeping the behavior visible until it is decided, not an endorsement.
+func TestHandlerProjectsPatchLegacyProjectWithoutValidationStance(t *testing.T) {
+	fixture := newTestFixture(t)
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+	baseBranch := "develop"
+	metadata := `{"repo":null,"worktreeRoot":"/tmp/worktrees","source":"api","registrationDiscovery":{"status":"succeeded","snapshotMode":"off"}}`
+	if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "legacy", Name: "Legacy", RepoPath: "/tmp/legacy", BaseBranch: &baseBranch, MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPatch, "/api/v1/projects/legacy", bytes.NewReader([]byte(`{"repo":"acme/app"}`)))
+	NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime}).ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 while #402 is undecided body=%s", recorder.Code, recorder.Body.String())
+	}
+	if body := recorder.Body.String(); !strings.Contains(body, "validation") {
+		t.Fatalf("error body should name the validation stance: %s", body)
+	}
+}
+
 func TestHandlerProjectsPatchRepairsRepoWithoutResettingProjectState(t *testing.T) {
 	fixture := newTestFixture(t)
 	// This test asserts the committed transition to pending. Discovery is a
