@@ -239,7 +239,6 @@ func TestSuspendForHumanAcknowledgesOnlyPromptInboxSnapshot(t *testing.T) {
 	if err := fixture.repos.Loops.Upsert(ctx, *loop); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
-	drained := loops.ReadHumanInbox(&meta)
 	appendHumanMessageForWorkerTest(t, ctx, fixture.repos, nowISO, loop.ID, "late message")
 
 	queue, err := fixture.repos.Queue.GetByID(ctx, "queue_worker_1")
@@ -259,7 +258,7 @@ func TestSuspendForHumanAcknowledgesOnlyPromptInboxSnapshot(t *testing.T) {
 		t.Fatalf("Projects.GetByID() = (%#v, %v)", project, err)
 	}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now, HITLEnabled: true, HITLAnswerTransport: "feishu"})
-	if _, err := runner.suspendForHuman(ctx, stepInput{Project: *project, Loop: *loop, Run: run, QueueItem: *queue}, run, workerCheckpoint{}, &awaitingHumanError{question: "Continue?", drainedInbox: drained}); err != nil {
+	if _, err := runner.suspendForHuman(ctx, stepInput{Project: *project, Loop: *loop, Run: run, QueueItem: *queue}, run, workerCheckpoint{}, &awaitingHumanError{question: "Continue?"}); err != nil {
 		t.Fatalf("suspendForHuman() error = %v", err)
 	}
 	updated, err := fixture.repos.Loops.GetByID(ctx, loop.ID)
