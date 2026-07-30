@@ -767,7 +767,7 @@ func (a reviewerGitHubAdapter) SubmitReview(ctx context.Context, input githubinf
 	if a.gateway == nil {
 		return fmt.Errorf("github gateway is not configured")
 	}
-	// Stamp with run snapshot identity before GitHub submit (Forgejo path stamps above).
+	// Stamp with run snapshot identity before GitHub submit.
 	input.Body = stamper.Markdown(input.Body, "reviewer", disclosure.ChannelReviewComment)
 	if len(input.Comments) > 0 {
 		comments := make([]githubinfra.ReviewComment, len(input.Comments))
@@ -934,8 +934,7 @@ func reviewerAllowsTrustedReviewProxy(cfg *config.Config, projectID string, meta
 }
 
 // reviewerProjectNeedsTrustedProxy reports whether the selected project
-// publishes native reviews (not summary_comment). This includes GitHub and
-// native Forgejo projects.
+// publishes native reviews.
 func reviewerProjectNeedsTrustedProxy(cfg *config.Config, projectID string) bool {
 	if cfg == nil {
 		return false

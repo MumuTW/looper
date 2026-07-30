@@ -113,8 +113,8 @@ func roleDiscoverers(input defaultSchedulerTickInput) map[string]discoveryLane {
 }
 
 // supportsGitHubIssueDiscovery is the single authority for lanes that discover
-// GitHub issues through the GitHub gateway (triager and coordinator). Forgejo
-// owns its own issues, so it must not feed these lanes.
+// GitHub issues through the GitHub gateway (triager and coordinator). A
+// provider that does not serve issues through that gateway must not feed them.
 //
 // Both lanes used to hand-write this predicate independently, and each picked a
 // different wrong flag (coordinator: GitHubPullRequests; triager:

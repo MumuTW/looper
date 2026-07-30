@@ -10,12 +10,12 @@ func TestForgeLockKeysAreProjectScoped(t *testing.T) {
 	t.Parallel()
 
 	firstIssue := IssueLockKey("github", "Acme/App", 42)
-	secondIssue := IssueLockKey("forgejo", "acme/app", 42)
+	secondIssue := IssueLockKey("second", "acme/app", 42)
 	if firstIssue == secondIssue {
 		t.Fatalf("issue lock keys collide: %q", firstIssue)
 	}
-	firstPR := PullRequestLockKey("forgejo-one", "acme/app", 7)
-	secondPR := PullRequestLockKey("forgejo-two", "ACME/APP", 7)
+	firstPR := PullRequestLockKey("provider-one", "acme/app", 7)
+	secondPR := PullRequestLockKey("provider-two", "ACME/APP", 7)
 	if firstPR == secondPR {
 		t.Fatalf("pull request lock keys collide: %q", firstPR)
 	}
@@ -37,7 +37,7 @@ func TestForgeLockAcquirePreservesLegacyTransitionExclusion(t *testing.T) {
 	}
 	legacy := "pr:Acme/App:42"
 	github := PullRequestLockKey("github", "acme/app", 42)
-	forgejo := PullRequestLockKey("forgejo", "acme/app", 42)
+	second := PullRequestLockKey("second", "acme/app", 42)
 
 	if acquired, err := repos.Locks.Acquire(ctx, record(legacy, "legacy")); err != nil || !acquired {
 		t.Fatalf("Acquire(legacy) = %v, %v", acquired, err)
@@ -54,7 +54,7 @@ func TestForgeLockAcquirePreservesLegacyTransitionExclusion(t *testing.T) {
 	if acquired, err := repos.Locks.Acquire(ctx, record(legacy, "old")); err != nil || acquired {
 		t.Fatalf("Acquire(legacy after scoped) = %v, %v; want blocked", acquired, err)
 	}
-	if acquired, err := repos.Locks.Acquire(ctx, record(forgejo, "other-provider")); err != nil || !acquired {
+	if acquired, err := repos.Locks.Acquire(ctx, record(second, "other-provider")); err != nil || !acquired {
 		t.Fatalf("Acquire(other scoped project) = %v, %v; want independent lock", acquired, err)
 	}
 }
@@ -68,7 +68,7 @@ func TestForgeLockTransitionSupportsColonProjectID(t *testing.T) {
 	now := time.Date(2026, time.July, 13, 12, 0, 0, 0, time.UTC)
 	repos.Locks.SetNow(func() time.Time { return now })
 	legacy := "issue:acme/app:42"
-	scoped := IssueLockKey("team:forgejo", "acme/app", 42)
+	scoped := IssueLockKey("team:second", "acme/app", 42)
 	legacyKey, suffix, kind, isScoped, ok := lockTransitionAlias(scoped)
 	if !ok || !isScoped || legacyKey != legacy || suffix != ":acme/app:42" || kind != "issue" {
 		t.Fatalf("lockTransitionAlias(%q) = %q, %q, %q, %v, %v", scoped, legacyKey, suffix, kind, isScoped, ok)
@@ -136,7 +136,7 @@ func TestReviewerFixerDependencyIsProjectScoped(t *testing.T) {
 	coordinator := openMigratedCoordinatorForRepositories(t)
 	repos := NewRepositories(coordinator.DB())
 	now := "2026-07-13T12:00:00.000Z"
-	for index, projectID := range []string{"github", "forgejo"} {
+	for index, projectID := range []string{"github", "second"} {
 		if err := repos.Projects.Upsert(ctx, ProjectRecord{ID: projectID, Name: projectID, RepoPath: "/tmp/" + projectID, CreatedAt: now, UpdatedAt: now}); err != nil {
 			t.Fatalf("Projects.Upsert(%s) error = %v", projectID, err)
 		}
@@ -147,11 +147,11 @@ func TestReviewerFixerDependencyIsProjectScoped(t *testing.T) {
 	}
 	repo := "acme/app"
 	prNumber := int64(42)
-	github, forgejo := "github", "forgejo"
-	githubLoop, forgejoLoop := "loop_github", "loop_forgejo"
+	github, second := "github", "second"
+	githubLoop, secondLoop := "loop_github", "loop_second"
 	items := []QueueItemRecord{
 		{ID: "github_reviewer", ProjectID: &github, LoopID: &githubLoop, Type: "reviewer", TargetType: "pull_request", TargetID: "pr:acme/app:42", Repo: &repo, PRNumber: &prNumber, DedupeKey: "reviewer:github", Priority: 1, Status: "queued", AvailableAt: now, MaxAttempts: 3, CreatedAt: now, UpdatedAt: now},
-		{ID: "forgejo_fixer", ProjectID: &forgejo, LoopID: &forgejoLoop, Type: "fixer", TargetType: "pull_request", TargetID: "pr:acme/app:42", Repo: &repo, PRNumber: &prNumber, DedupeKey: "fixer:forgejo", Priority: 2, Status: "queued", AvailableAt: now, MaxAttempts: 3, CreatedAt: now, UpdatedAt: now},
+		{ID: "second_fixer", ProjectID: &second, LoopID: &secondLoop, Type: "fixer", TargetType: "pull_request", TargetID: "pr:acme/app:42", Repo: &repo, PRNumber: &prNumber, DedupeKey: "fixer:second", Priority: 2, Status: "queued", AvailableAt: now, MaxAttempts: 3, CreatedAt: now, UpdatedAt: now},
 	}
 	for _, item := range items {
 		if err := repos.Queue.Upsert(ctx, item); err != nil {

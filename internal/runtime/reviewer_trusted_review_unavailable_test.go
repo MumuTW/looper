@@ -63,7 +63,7 @@ func TestReviewerAgentStartRefusesWithThePromptsWordingWhenWrapperUnavailable(t 
 		// Empty because the capability probe rejected the binary, or none was
 		// configured at all — the same value the prompt was built from.
 		realLooper: "",
-		trustedEnv: map[string]string{"FORGEJO_TOKEN": "test-token"},
+		trustedEnv: map[string]string{"PROVIDER_TOKEN": "test-token"},
 		config:     nativeReviewAdapterConfig(workDir),
 	}
 

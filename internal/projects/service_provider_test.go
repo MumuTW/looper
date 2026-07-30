@@ -10,7 +10,7 @@ import (
 	"github.com/nexu-io/looper/internal/storage"
 )
 
-func TestServiceSyncConfiguredIgnoresForgejoDetectionForGitHubDefault(t *testing.T) {
+func TestServiceSyncConfiguredIgnoresProviderDetectionForGitHubDefault(t *testing.T) {
 	t.Parallel()
 
 	coordinator := openCoordinator(t)
@@ -22,7 +22,7 @@ func TestServiceSyncConfiguredIgnoresForgejoDetectionForGitHubDefault(t *testing
 		Repos: repos,
 		Now:   func() time.Time { return now },
 		DetectRepo: func(context.Context, string) (DetectedRepo, error) {
-			return DetectedRepo{Repo: "core/odcrew", Provider: "forgejo-main"}, nil
+			return DetectedRepo{Repo: "core/odcrew", Provider: "ghes-main"}, nil
 		},
 	}
 	cfg, err := config.DefaultConfig(t.TempDir())
@@ -39,11 +39,11 @@ func TestServiceSyncConfiguredIgnoresForgejoDetectionForGitHubDefault(t *testing
 		t.Fatalf("Projects.GetByID() error = %v", err)
 	}
 	if project == nil || metadataString(parseMetadata(project.MetadataJSON), "repo") != "" {
-		t.Fatalf("stored project = %#v, want no GitHub repo inferred from Forgejo origin", project)
+		t.Fatalf("stored project = %#v, want no GitHub repo inferred from a non-default provider origin", project)
 	}
 }
 
-func TestServiceAddProjectAllowsExplicitGitHubRepoOnDetectedForgejoOrigin(t *testing.T) {
+func TestServiceAddProjectAllowsExplicitGitHubRepoOnDetectedProviderOrigin(t *testing.T) {
 	t.Parallel()
 
 	coordinator := openCoordinator(t)
@@ -52,15 +52,15 @@ func TestServiceAddProjectAllowsExplicitGitHubRepoOnDetectedForgejoOrigin(t *tes
 	if err != nil {
 		t.Fatalf("DefaultConfig() error = %v", err)
 	}
-	tokenEnv := "LOOPER_FORGEJO_TOKEN"
-	cfg.Providers = []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindGitHub, BaseURL: "https://code.example.com", TokenEnv: &tokenEnv}}
+	tokenEnv := "LOOPER_GHES_TOKEN"
+	cfg.Providers = []config.ProviderConfig{{ID: "ghes-main", Kind: config.ProviderKindGitHub, BaseURL: "https://code.example.com", TokenEnv: &tokenEnv}}
 	service := &Service{
 		DB:     coordinator.DB(),
 		Repos:  repos,
 		Config: cfg,
 		Now:    time.Now,
 		DetectRepo: func(context.Context, string) (DetectedRepo, error) {
-			return DetectedRepo{Repo: "forgejo/checkout", Provider: "forgejo-main"}, nil
+			return DetectedRepo{Repo: "other/checkout", Provider: "ghes-main"}, nil
 		},
 	}
 	repo := "github-org/repo"
@@ -89,7 +89,7 @@ func TestServiceAddProjectRejectsDetectedRepoFromMismatchedProvider(t *testing.T
 		wantMessage      string
 	}{
 		{name: "GitHub origin", detectedProvider: "", wantMessage: "belongs to the GitHub default"},
-		{name: "different Forgejo provider", detectedProvider: "forgejo-other", wantMessage: "belongs to forgejo-other"},
+		{name: "different provider", detectedProvider: "ghes-other", wantMessage: "belongs to ghes-other"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -101,10 +101,10 @@ func TestServiceAddProjectRejectsDetectedRepoFromMismatchedProvider(t *testing.T
 			if err != nil {
 				t.Fatalf("DefaultConfig() error = %v", err)
 			}
-			tokenEnv := "LOOPER_FORGEJO_TOKEN"
+			tokenEnv := "LOOPER_GHES_TOKEN"
 			cfg.Providers = []config.ProviderConfig{
-				{ID: "forgejo-main", Kind: config.ProviderKindGitHub, BaseURL: "https://code.example.com", TokenEnv: &tokenEnv},
-				{ID: "forgejo-other", Kind: config.ProviderKindGitHub, BaseURL: "https://other.example.com", TokenEnv: &tokenEnv},
+				{ID: "ghes-main", Kind: config.ProviderKindGitHub, BaseURL: "https://code.example.com", TokenEnv: &tokenEnv},
+				{ID: "ghes-other", Kind: config.ProviderKindGitHub, BaseURL: "https://other.example.com", TokenEnv: &tokenEnv},
 			}
 			published := false
 			service := &Service{
@@ -117,7 +117,7 @@ func TestServiceAddProjectRejectsDetectedRepoFromMismatchedProvider(t *testing.T
 				},
 				PublishProjects: func([]config.ProjectRefConfig) { published = true },
 			}
-			provider := "forgejo-main"
+			provider := "ghes-main"
 
 			_, err = service.AddProject(context.Background(), AddInput{
 				ID: "project", Name: "Project", RepoPath: "/tmp/project", Provider: &provider,

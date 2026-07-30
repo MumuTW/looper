@@ -54,7 +54,7 @@ func TestForgeCredentialReadinessIgnoresProjectlessConfigs(t *testing.T) {
 
 	readiness := ForgeCredentialReadinessFor(config.Config{})
 	if readiness.GitHubProjects {
-		t.Fatal("GitHubProjects = true for a project-less config, want false")
+		t.Fatalf("GitHubProjects = true for a project-less config, want false")
 	}
 	if readiness.Degraded() {
 		t.Fatal("Degraded() = true for a project-less config, want false")

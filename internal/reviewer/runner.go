@@ -5614,7 +5614,7 @@ func (r *Runner) ensureLoopMetadataJSON(current *string, projectID, repo string,
 		reviewEventsMeta = map[string]any{}
 	}
 	// Snapshot the per-project policy (not only the runner-wide global default)
-	// so Forgejo projects with clean=APPROVE / blocking=REQUEST_CHANGES keep
+	// so a project overriding clean=APPROVE / blocking=REQUEST_CHANGES keeps
 	// those outcomes in loop metadata and the trusted proxy policy.
 	projectReviewEvents := r.reviewEventsForProject(projectID)
 	if cleanRaw, present := reviewEventsMeta["clean"]; present {

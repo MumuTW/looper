@@ -1776,7 +1776,7 @@ func TestEnsureLoopMetadataJSONUsesProjectReviewEvents(t *testing.T) {
 			ReviewEvents: config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventComment, Blocking: config.ReviewerReviewEventComment},
 		}}},
 		Projects: []config.ProjectRefConfig{{
-			ID: "forgejo-native", Name: "Forgejo", Repo: "owner/forgejo", RepoPath: "/tmp/forgejo",
+			ID: "ghes-native", Name: "Second", Repo: "owner/second", RepoPath: "/tmp/second",
 			Roles: &config.PartialRoleConfigs{Reviewer: &config.PartialReviewerRoleConfig{
 				Behavior: &config.PartialReviewerConfig{ReviewEvents: &config.PartialReviewerReviewEventsConfig{
 					Clean:    reviewEventPtr(config.ReviewerReviewEventApprove),
@@ -1791,7 +1791,7 @@ func TestEnsureLoopMetadataJSONUsesProjectReviewEvents(t *testing.T) {
 		CustomInstructions: &projectCfg,
 	})
 
-	metadataJSON, err := runner.ensureLoopMetadataJSON(nil, "forgejo-native", "owner/forgejo", 7)
+	metadataJSON, err := runner.ensureLoopMetadataJSON(nil, "ghes-native", "owner/second", 7)
 	if err != nil {
 		t.Fatalf("ensureLoopMetadataJSON() error = %v", err)
 	}
@@ -1802,7 +1802,7 @@ func TestEnsureLoopMetadataJSONUsesProjectReviewEvents(t *testing.T) {
 	}
 	// effectiveReviewEvents without snapshotted metadata must also resolve project overrides
 	// so the trusted proxy policy is not stuck on the global COMMENT default.
-	effective := runner.effectiveReviewEvents("forgejo-native", nil)
+	effective := runner.effectiveReviewEvents("ghes-native", nil)
 	if effective.Clean != config.ReviewerReviewEventApprove || effective.Blocking != config.ReviewerReviewEventRequestChanges {
 		t.Fatalf("effectiveReviewEvents() = %#v, want project-level APPROVE/REQUEST_CHANGES", effective)
 	}
