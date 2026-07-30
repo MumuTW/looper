@@ -1,12 +1,13 @@
 /** Backoff delays for unexpected SSE disconnects (ms). */
 export const RECONNECT_BACKOFF_MS = [1000, 2000, 5000] as const;
 
-export type LogsStreamPhase = "idle" | "connecting" | "live";
+export type LogsStreamPhase = "idle" | "connecting" | "live" | "degraded";
 
 export type LogsStreamStatus =
   | "idle"
   | "connecting"
   | "live"
+  | "degraded"
   | "ended"
   | "error";
 
@@ -23,6 +24,7 @@ export function resolveLogsStreamStatus(opts: {
   if (opts.error) return "error";
   if (opts.ended) return "ended";
   if (opts.phase === "connecting") return "connecting";
+  if (opts.phase === "degraded") return "degraded";
   if (opts.phase === "live") return "live";
   return "idle";
 }

@@ -46,8 +46,20 @@ const (
 	webhookForwardPath         = "/webhook/forward"
 	javaScriptISOString        = "2006-01-02T15:04:05.000Z"
 	loopLogsFollowPollInterval = 200 * time.Millisecond
-	activeRunHeartbeatTTL      = 30 * time.Minute
-	webhookListenerPath        = "/webhook/forward"
+)
+
+// loopLogsFollowMaxFailureStreak bounds mid-stream read retries: after this
+// many consecutive failures (with backoff, ~15s total) the stream ends with a
+// typed reason so the client reconnects instead of watching a frozen "live"
+// pane. Vars so tests can shrink the schedule.
+var (
+	loopLogsFollowMaxFailureStreak = 8
+	loopLogsFollowMaxBackoff       = 5 * time.Second
+)
+
+const (
+	activeRunHeartbeatTTL = 30 * time.Minute
+	webhookListenerPath   = "/webhook/forward"
 )
 
 var nonProjectIDPattern = regexp.MustCompile(`[^a-z0-9]+`)
@@ -3893,6 +3905,7 @@ func (h *Handler) streamLoopLogs(w http.ResponseWriter, r *http.Request, request
 
 	ticker := time.NewTicker(loopLogsFollowPollInterval)
 	defer ticker.Stop()
+	failureStreak := 0
 
 	for {
 		select {
@@ -3903,7 +3916,24 @@ func (h *Handler) streamLoopLogs(w http.ResponseWriter, r *http.Request, request
 
 		current, err = h.buildLoopLogsResponse(r.Context(), loop)
 		if err != nil {
+			// Mid-stream failure: surface it once, back off boundedly, and end
+			// the stream when persistent — a silent 200ms spin left the
+			// dashboard showing "live" over a frozen log.
+			failureStreak++
+			if failureStreak == 1 {
+				_ = writeSSEEvent(w, flusher, "error", map[string]any{"reason": "backend_read_failed", "message": err.Error(), "retrying": true})
+			}
+			if failureStreak >= loopLogsFollowMaxFailureStreak {
+				_ = writeSSEEvent(w, flusher, "end", map[string]string{"reason": "backend_read_failed"})
+				return nil
+			}
+			ticker.Reset(loopLogsFollowBackoff(failureStreak))
 			continue
+		}
+		if failureStreak > 0 {
+			failureStreak = 0
+			ticker.Reset(loopLogsFollowPollInterval)
+			_ = writeSSEEvent(w, flusher, "recovered", map[string]string{"reason": "backend_read_recovered"})
 		}
 		if observedRunID == "" && current.Run != nil {
 			observedRunID = current.Run.RunID
@@ -3938,6 +3968,16 @@ func (h *Handler) streamLoopLogs(w http.ResponseWriter, r *http.Request, request
 			return nil
 		}
 	}
+}
+
+// loopLogsFollowBackoff doubles the poll interval per consecutive failure,
+// capped, so persistent backend errors do not spin at 200ms.
+func loopLogsFollowBackoff(failureStreak int) time.Duration {
+	backoff := loopLogsFollowPollInterval << max(failureStreak-1, 0)
+	if backoff > loopLogsFollowMaxBackoff || backoff <= 0 {
+		return loopLogsFollowMaxBackoff
+	}
+	return backoff
 }
 
 func queryBool(values url.Values, key string) bool {

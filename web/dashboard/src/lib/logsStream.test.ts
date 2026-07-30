@@ -110,3 +110,20 @@ describe("stderrGapFromSecondarySnapshot", () => {
     expect(stderrGapFromSecondarySnapshot("old\n", "new\n")).toBe("new\n");
   });
 });
+
+describe("degraded stream status (#80)", () => {
+  it("degraded phase resolves to degraded status", () => {
+    expect(
+      resolveLogsStreamStatus({ phase: "degraded", ended: false, error: null }),
+    ).toBe("degraded");
+  });
+
+  it("explicit error and ended still outrank degraded", () => {
+    expect(
+      resolveLogsStreamStatus({ phase: "degraded", ended: false, error: "x" }),
+    ).toBe("error");
+    expect(
+      resolveLogsStreamStatus({ phase: "degraded", ended: true, error: null }),
+    ).toBe("ended");
+  });
+});

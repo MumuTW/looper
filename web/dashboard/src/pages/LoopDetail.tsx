@@ -275,7 +275,31 @@ function LogsPane({ selector }: { selector: string }) {
                 }
                 return;
               }
+              if (event === "error") {
+                // Typed mid-stream backend failure: the server is retrying
+                // with backoff. Show degraded instead of a frozen "live";
+                // keep the buffer.
+                setPhase("degraded");
+                return;
+              }
+              if (event === "recovered") {
+                setPhase("live");
+                return;
+              }
               if (event === "end") {
+                let reason = "";
+                try {
+                  reason = (JSON.parse(rawData) as { reason?: string }).reason ?? "";
+                } catch {
+                  // Fall through: treat unparseable end as explicit.
+                }
+                if (reason === "backend_read_failed") {
+                  // The server gave up after bounded retries; reconnect from
+                  // the client instead of parking on a dead stream.
+                  setPhase("degraded");
+                  scheduleReconnect();
+                  return;
+                }
                 explicitEndRef.current = true;
                 setEnded(true);
                 setPhase("idle");

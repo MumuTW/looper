@@ -16,6 +16,7 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -8198,6 +8199,13 @@ func (q errorInjectingQuerier) QueryContext(ctx context.Context, query string, a
 }
 
 func (q errorInjectingQuerier) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
+	if q.queryError != nil {
+		if err := q.queryError(query); err != nil {
+			// sql.Row carries no injectable error; a deliberately invalid
+			// query surfaces one through Scan instead.
+			return q.db.QueryRowContext(ctx, "SELECT injected_error FROM nonexistent_error_injection_table")
+		}
+	}
 	return q.db.QueryRowContext(ctx, query, args...)
 }
 
@@ -8352,4 +8360,152 @@ func TestHandlerPullRequestStatusUsesLatestRunOrderingForTiedTimestamps(t *testi
 	data := body["data"].(map[string]any)
 	loopStatus := data["loopStatus"].(map[string]any)
 	assertEqual(t, loopStatus["latestRunStatus"], "running")
+}
+
+func seedFollowStreamLoop(t *testing.T, fixture testFixture) {
+	t.Helper()
+	ctx := context.Background()
+	repos := fixture.runtime.Services().Repositories
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+	if err := repos.Projects.Upsert(ctx, storage.ProjectRecord{ID: "project_sse", Name: "Looper", RepoPath: "/tmp/looper", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := repos.Loops.Upsert(ctx, storage.LoopRecord{ID: "loop_sse", Seq: 71, ProjectID: "project_sse", Type: "worker", TargetType: "project", Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	if err := repos.Runs.Upsert(ctx, storage.RunRecord{ID: "run_sse", LoopID: "loop_sse", Status: "running", StartedAt: nowISO, LastHeartbeatAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	if err := repos.AgentExecutions.Upsert(ctx, storage.AgentExecutionRecord{
+		ID: "agent_exec_sse", ProjectID: stringPtr("project_sse"), LoopID: stringPtr("loop_sse"), RunID: stringPtr("run_sse"),
+		Vendor: "codex", Status: "running", PID: int64Ptr(4321), HeartbeatCount: 1, LastHeartbeatAt: stringPtr(nowISO),
+		StartedAt: nowISO, OutputJSON: stringPtr(`{"stdout":"line1\n","stderr":""}`), CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
+	}
+}
+
+// #80: after a 200 snapshot, persistent read failures must emit a typed error
+// event, back off boundedly, and end the stream instead of spinning silently
+// while the dashboard shows a frozen "live".
+func TestHandlerLoopLogsFollowSurfacesMidStreamFailures(t *testing.T) {
+	fixture := newTestFixture(t)
+	seedFollowStreamLoop(t, fixture)
+
+	prevStreak, prevBackoff := loopLogsFollowMaxFailureStreak, loopLogsFollowMaxBackoff
+	loopLogsFollowMaxFailureStreak, loopLogsFollowMaxBackoff = 3, loopLogsFollowPollInterval
+	t.Cleanup(func() { loopLogsFollowMaxFailureStreak, loopLogsFollowMaxBackoff = prevStreak, prevBackoff })
+
+	var loopReads atomic.Int64
+	services := fixture.runtime.Services()
+	services.Repositories = storage.NewRepositories(errorInjectingQuerier{db: services.Coordinator.DB(), queryError: func(query string) error {
+		// Calls 1-2 are route resolution + the successful snapshot; every
+		// later poll fails persistently.
+		if strings.Contains(query, "FROM loops WHERE id = ?") && loopReads.Add(1) > 2 {
+			return errors.New("database is locked")
+		}
+		return nil
+	}})
+
+	server := httptest.NewServer(NewHandler(Context{Config: fixture.config, Runtime: fixedRuntimeState{services: services}}))
+	defer server.Close()
+
+	response, err := http.Get(server.URL + "/api/v1/loops/loop_sse/logs?follow=1")
+	if err != nil {
+		t.Fatalf("http.Get() error = %v", err)
+	}
+	defer response.Body.Close()
+
+	bodyCh := make(chan []byte, 1)
+	go func() {
+		body, _ := io.ReadAll(response.Body)
+		bodyCh <- body
+	}()
+	var body []byte
+	select {
+	case body = <-bodyCh:
+	case <-time.After(5 * time.Second):
+		_ = response.Body.Close()
+		t.Fatal("timed out waiting for the stream to end after persistent failures")
+	}
+	text := string(body)
+	if !strings.Contains(text, "event: snapshot") {
+		t.Fatalf("stream body = %q, want snapshot before the injected failures", text)
+	}
+	if !strings.Contains(text, "event: error") || !strings.Contains(text, `"reason":"backend_read_failed"`) || !strings.Contains(text, `"retrying":true`) {
+		t.Fatalf("stream body = %q, want typed mid-stream error event", text)
+	}
+	if !strings.Contains(text, "event: end") || strings.Count(text, `"reason":"backend_read_failed"`) < 2 {
+		t.Fatalf("stream body = %q, want terminal end with backend_read_failed after bounded retries", text)
+	}
+}
+
+// A transient failure recovers: the stream emits recovered and keeps going.
+func TestHandlerLoopLogsFollowRecoversFromTransientFailure(t *testing.T) {
+	fixture := newTestFixture(t)
+	seedFollowStreamLoop(t, fixture)
+
+	var loopReads atomic.Int64
+	services := fixture.runtime.Services()
+	services.Repositories = storage.NewRepositories(errorInjectingQuerier{db: services.Coordinator.DB(), queryError: func(query string) error {
+		// Call 3 is the first poll after the successful snapshot: one
+		// transient failure, then recovery.
+		if strings.Contains(query, "FROM loops WHERE id = ?") && loopReads.Add(1) == 3 {
+			return errors.New("database is locked")
+		}
+		return nil
+	}})
+
+	// Mark the run terminal shortly after, so the stream ends normally.
+	go func() {
+		time.Sleep(700 * time.Millisecond)
+		completedAt := fixture.now.Add(time.Minute).UTC().Format(javaScriptISOString)
+		for attempt := 0; attempt < 5; attempt++ {
+			run, err := services.Repositories.Runs.GetByID(context.Background(), "run_sse")
+			if err != nil || run == nil {
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
+			updated := *run
+			updated.Status = "success"
+			updated.EndedAt = &completedAt
+			updated.UpdatedAt = completedAt
+			if err := services.Repositories.Runs.Upsert(context.Background(), updated); err == nil {
+				return
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+	}()
+
+	server := httptest.NewServer(NewHandler(Context{Config: fixture.config, Runtime: fixedRuntimeState{services: services}}))
+	defer server.Close()
+
+	response, err := http.Get(server.URL + "/api/v1/loops/loop_sse/logs?follow=1")
+	if err != nil {
+		t.Fatalf("http.Get() error = %v", err)
+	}
+	defer response.Body.Close()
+
+	bodyCh := make(chan []byte, 1)
+	go func() {
+		body, _ := io.ReadAll(response.Body)
+		bodyCh <- body
+	}()
+	var body []byte
+	select {
+	case body = <-bodyCh:
+	case <-time.After(5 * time.Second):
+		_ = response.Body.Close()
+		t.Fatal("timed out waiting for the stream to end after recovery")
+	}
+	text := string(body)
+	if !strings.Contains(text, "event: error") {
+		t.Fatalf("stream body = %q, want the transient failure surfaced", text)
+	}
+	if !strings.Contains(text, "event: recovered") {
+		t.Fatalf("stream body = %q, want recovered event after the transient failure", text)
+	}
+	if !strings.Contains(text, `"reason":"run_completed"`) {
+		t.Fatalf("stream body = %q, want a normal run_completed end", text)
+	}
 }
