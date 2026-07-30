@@ -44,6 +44,7 @@ type backlogLane struct {
 type backlogTarget struct {
 	lane         int
 	triggerLabel string
+	recovery     bool
 }
 
 type DiscoveryInput struct {
@@ -267,7 +268,7 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 			loaded = append(loaded, issue)
 		}
 	}
-	mergeWatchRetriggers, err := r.applyMergeWatch(ctx, input.Repo, project.RepoPath, loaded, config.ProjectRoleConfigs(*r.config, input.ProjectID))
+	mergeWatchRetriggers, err := r.applyMergeWatch(ctx, input.Repo, project.RepoPath, loaded, projectRoles)
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
@@ -330,15 +331,21 @@ func (r *Runner) listCoordinatorBacklog(ctx context.Context, projectID, repo, cw
 		{dispatchLabel: dispatch.DispatchPlan, triggerLabels: dispatchCfg.PlannerTriggerLabels},
 		{dispatchLabel: dispatch.DispatchImplement, triggerLabels: dispatchCfg.WorkerTriggerLabels},
 	}
-	targets := backlogScanTargets(backlogLanes)
+	targets := backlogScanTargets(backlogLanes, r.projectNetworkMode(projectID) == config.ProjectNetworkModeRouted)
 	if len(targets) == 0 {
 		return issues, nil
 	}
-	targetStart, page := r.backlogScanPosition(projectID, len(targets))
+	targetStart, page, candidateStart := r.backlogScanPosition(projectID, len(targets))
 	for offset := 0; offset < len(targets) && len(issues) < limit; offset++ {
 		target := targets[(targetStart+offset)%len(targets)]
 		lane := backlogLanes[target.lane]
-		search := fmt.Sprintf("-label:%q sort:created-asc", target.triggerLabel)
+		search := "sort:created-asc"
+		queryLabels := []string{triageCfg.TriagedLabel, lane.dispatchLabel}
+		if target.recovery {
+			queryLabels = append(queryLabels, target.triggerLabel)
+		} else {
+			search = fmt.Sprintf("-label:%q %s", target.triggerLabel, search)
+		}
 		if dispatchCfg.Mode == dispatch.ModeAutonomous {
 			search = autonomousBacklogSearch(search, dispatchCfg.HoldLabel)
 		}
@@ -346,7 +353,7 @@ func (r *Runner) listCoordinatorBacklog(ctx context.Context, projectID, repo, cw
 			Repo:   repo,
 			CWD:    cwd,
 			Limit:  (page + 1) * backlogPageSize,
-			Labels: []string{triageCfg.TriagedLabel, lane.dispatchLabel},
+			Labels: queryLabels,
 			Search: search,
 		})
 		if err != nil {
@@ -359,7 +366,12 @@ func (r *Runner) listCoordinatorBacklog(ctx context.Context, projectID, repo, cw
 			pageStart = 0
 		}
 		pageEnd := min(pageStart+backlogPageSize, len(backlog))
-		for _, issue := range backlog[pageStart:pageEnd] {
+		pageIssues := backlog[pageStart:pageEnd]
+		for index := range pageIssues {
+			issue := pageIssues[(candidateStart+index)%len(pageIssues)]
+			if target.recovery && len(protocol.CollectTargetLabels(issue.Labels)) == 1 {
+				continue
+			}
 			if _, ok := seen[issue.Number]; ok {
 				continue
 			}
@@ -385,19 +397,22 @@ func (r *Runner) backlogHydrationBudget(ctx context.Context, triageCfg triage.Co
 	return min(limit, max(r.config.Scheduler.MaxConcurrentRuns-running, 0)), nil
 }
 
-func backlogScanTargets(lanes []backlogLane) []backlogTarget {
+func backlogScanTargets(lanes []backlogLane, includeWorkerRecovery bool) []backlogTarget {
 	targets := make([]backlogTarget, 0)
 	for laneIndex, lane := range lanes {
 		for _, triggerLabel := range lane.triggerLabels {
 			if triggerLabel = strings.TrimSpace(triggerLabel); triggerLabel != "" {
 				targets = append(targets, backlogTarget{lane: laneIndex, triggerLabel: triggerLabel})
+				if includeWorkerRecovery && lane.dispatchLabel == dispatch.DispatchImplement {
+					targets = append(targets, backlogTarget{lane: laneIndex, triggerLabel: triggerLabel, recovery: true})
+				}
 			}
 		}
 	}
 	return targets
 }
 
-func (r *Runner) backlogScanPosition(projectID string, targetCount int) (int, int) {
+func (r *Runner) backlogScanPosition(projectID string, targetCount int) (int, int, int) {
 	interval := r.pollInterval(projectID)
 	if interval <= 0 {
 		interval = 5 * time.Minute
@@ -408,7 +423,9 @@ func (r *Runner) backlogScanPosition(projectID string, targetCount int) (int, in
 	}
 	phase := int(r.now().UTC().Unix() / intervalSeconds)
 	page := phase % backlogPageCount
-	return (phase / backlogPageCount) % targetCount, page
+	targetStart := (phase / backlogPageCount) % targetCount
+	candidateStart := (phase / (backlogPageCount * targetCount)) % backlogPageSize
+	return targetStart, page, candidateStart
 }
 
 func autonomousBacklogSearch(search, legacyHoldLabel string) string {
