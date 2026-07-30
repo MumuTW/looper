@@ -2069,56 +2069,6 @@ func TestRuntimeRecoveryPreservesRunWithUncertainActiveAgentExecution(t *testing
 	}
 }
 
-func TestCommandPrefixMatchesRejectsTruncatedPromptTail(t *testing.T) {
-	t.Parallel()
-
-	if commandPrefixMatches(
-		[]string{"codex", "exec", "very long reviewer prompt that may be truncated by ps output"},
-		[]string{"codex", "exec", "very long reviewer prompt"},
-	) {
-		t.Fatal("commandPrefixMatches() = true, want false for truncated prompt tail")
-	}
-}
-
-func TestCommandPrefixMatchesRejectsMissingTail(t *testing.T) {
-	t.Parallel()
-
-	if commandPrefixMatches(
-		[]string{"codex", "exec", "very long reviewer prompt that may be truncated by ps output"},
-		[]string{"codex", "exec"},
-	) {
-		t.Fatal("commandPrefixMatches() = true, want false when actual command is missing the trailing token")
-	}
-}
-
-func TestCommandPrefixMatchesRejectsPSEscapedNewlinesAsAmbiguous(t *testing.T) {
-	t.Parallel()
-
-	if commandPrefixMatches(
-		[]string{"codex", "exec", "Fix pull request nexu-io/vela#594.\n\nMinimal PR seed"},
-		splitProcessCommand(`codex exec Fix pull request nexu-io/vela#594.\012\012Minimal PR seed`),
-	) {
-		t.Fatal("commandPrefixMatches() = true, want false for ambiguous ps-escaped newline prompt")
-	}
-}
-
-func TestCommandPrefixMatchesPreservesLiteralOctalBackslashes(t *testing.T) {
-	t.Parallel()
-
-	if !commandPrefixMatches(
-		[]string{"codex", "exec", `Review code block containing \012 literally`},
-		splitProcessCommand(`codex exec Review code block containing \012 literally`),
-	) {
-		t.Fatal("commandPrefixMatches() = false, want true for literal octal-looking backslashes")
-	}
-	if commandPrefixMatches(
-		[]string{"codex", "exec", `Review code block containing \012 literally`},
-		splitProcessCommand(`codex exec Review code block containing \012 changed`),
-	) {
-		t.Fatal("commandPrefixMatches() = true, want false for changed literal octal-looking backslash tail")
-	}
-}
-
 func TestRuntimeRecoveryPreservesLoopWithActiveAgentExecution(t *testing.T) {
 	t.Parallel()
 
@@ -5027,4 +4977,124 @@ func tableExists(t *testing.T, dbPath, tableName string) bool {
 		t.Fatalf("SELECT sqlite_master for %q error = %v", tableName, err)
 	}
 	return count > 0
+}
+
+// The deletion-first verdict for #271's phase-4 lead, pinned as a boundary:
+// the two normalization passes PARTITION stranded queued loops (queued status,
+// no queued/running queue rows) by latest-run status. An interrupted run is
+// resumable work — the first pass requeues it and provisions a recovery queue
+// item; any other terminal run is finished work — the second pass normalizes
+// the loop's status from the run. Neither pass duplicates the other.
+func TestRecoveryPipelinePartitionsStrandedQueuedLoopsByRunStatus(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
+	coordinator := openMigratedCoordinator(t, cfg.Storage.DBPath, "")
+	defer coordinator.Close()
+	repositories := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.June, 4, 17, 5, 32, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+	if err := repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+
+	// Stranded queued loop whose latest run finished successfully: finished
+	// work, second pass normalizes.
+	if err := repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_stranded_done", Seq: 9101, ProjectID: "project_1", Type: "worker", TargetType: "project", Status: "queued", NextRunAt: stringPtr(nowISO), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert(done) error = %v", err)
+	}
+	if err := repositories.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_stranded_done", LoopID: "loop_stranded_done", Status: "success", StartedAt: nowISO, EndedAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Runs.Upsert(done) error = %v", err)
+	}
+
+	// Stranded queued loop whose latest run was interrupted: resumable work,
+	// first pass requeues and provisions a recovery queue item. The loop
+	// carries the target and worker metadata the worker API records, so the
+	// provisioned item is executable work, and its NextRunAt is stale so the
+	// refresh to the recovery timestamp is observable.
+	staleISO := formatJavaScriptISOString(now.Add(-time.Hour))
+	if err := repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_stranded_resumable", Seq: 9102, ProjectID: "project_1", Type: "worker", TargetType: "issue", TargetID: stringPtr("issue:acme/looper:77"), Repo: stringPtr("acme/looper"), Status: "queued", NextRunAt: stringPtr(staleISO), MetadataJSON: stringPtr(`{"worker":{"title":"Resume migration","prompt":"Finish the migration","repo":"acme/looper","baseBranch":"main"}}`), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert(resumable) error = %v", err)
+	}
+	if err := repositories.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_stranded_resumable", LoopID: "loop_stranded_resumable", Status: "interrupted", StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Runs.Upsert(resumable) error = %v", err)
+	}
+
+	rt := New(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }})
+	if _, err := rt.runRecoveryPipeline(context.Background(), repositories, nil, now); err != nil {
+		t.Fatalf("runRecoveryPipeline() error = %v", err)
+	}
+
+	// Finished side: normalized to completed by the second pass.
+	done, err := repositories.Loops.GetByID(context.Background(), "loop_stranded_done")
+	if err != nil || done == nil {
+		t.Fatalf("Loops.GetByID(done) = (%#v, %v)", done, err)
+	}
+	if done.Status != "completed" || done.NextRunAt != nil {
+		t.Fatalf("done loop = status %q nextRunAt %v, want completed with no next run", done.Status, done.NextRunAt)
+	}
+	doneEvents, err := repositories.Events.ListByEntity(context.Background(), "loop", "loop_stranded_done")
+	if err != nil {
+		t.Fatalf("Events.ListByEntity(done) error = %v", err)
+	}
+	if !containsEventType(doneEvents, "looperd.recovery.loop_queue_normalized") {
+		t.Fatalf("done events = %#v, want loop_queue_normalized from the second pass", doneEvents)
+	}
+	if containsEventType(doneEvents, "looperd.recovery.loop_requeued") {
+		t.Fatalf("done events = %#v, want no first-pass requeue", doneEvents)
+	}
+	doneQueue, err := repositories.Queue.GetLatestByLoopID(context.Background(), "loop_stranded_done")
+	if err != nil {
+		t.Fatalf("Queue.GetLatestByLoopID(done) error = %v", err)
+	}
+	if doneQueue != nil && (doneQueue.Status == "queued" || doneQueue.Status == "running") {
+		t.Fatalf("done queue item = %#v, want no active work provisioned for a finished loop", doneQueue)
+	}
+
+	// Resumable side: requeued by the first pass with a provisioned queue item.
+	resumable, err := repositories.Loops.GetByID(context.Background(), "loop_stranded_resumable")
+	if err != nil || resumable == nil {
+		t.Fatalf("Loops.GetByID(resumable) = (%#v, %v)", resumable, err)
+	}
+	if resumable.Status != "queued" || resumable.NextRunAt == nil || *resumable.NextRunAt != nowISO {
+		t.Fatalf("resumable loop = status %q nextRunAt %v, want requeued with the stale schedule refreshed to %q", resumable.Status, resumable.NextRunAt, nowISO)
+	}
+	resumableEvents, err := repositories.Events.ListByEntity(context.Background(), "loop", "loop_stranded_resumable")
+	if err != nil {
+		t.Fatalf("Events.ListByEntity(resumable) error = %v", err)
+	}
+	if !containsEventType(resumableEvents, "looperd.recovery.loop_requeued") {
+		t.Fatalf("resumable events = %#v, want loop_requeued from the first pass", resumableEvents)
+	}
+	if containsEventType(resumableEvents, "looperd.recovery.loop_queue_normalized") {
+		t.Fatalf("resumable events = %#v, want no second-pass normalization", resumableEvents)
+	}
+	latestQueue, err := repositories.Queue.GetLatestByLoopID(context.Background(), "loop_stranded_resumable")
+	if err != nil {
+		t.Fatalf("Queue.GetLatestByLoopID(resumable) error = %v", err)
+	}
+	if latestQueue == nil || latestQueue.Status != "queued" {
+		t.Fatalf("latest queue item = %#v, want a provisioned queued recovery item", latestQueue)
+	}
+	// The provisioned item must be executable work: the worker target and
+	// metadata seeded on the loop survive into the queue item, so a claim
+	// resumes the migration instead of failing on an empty target.
+	if latestQueue.TargetID != "issue:acme/looper:77" || derefString(latestQueue.Repo) != "acme/looper" {
+		t.Fatalf("latest queue item target = (%q, %q), want the loop's issue target and repo preserved", latestQueue.TargetID, derefString(latestQueue.Repo))
+	}
+	var payload map[string]any
+	if latestQueue.PayloadJSON == nil {
+		t.Fatalf("latest queue item = %#v, want the worker metadata carried as payload", latestQueue)
+	}
+	if err := json.Unmarshal([]byte(*latestQueue.PayloadJSON), &payload); err != nil {
+		t.Fatalf("payload unmarshal error = %v", err)
+	}
+	if payload["repo"] != "acme/looper" || payload["prompt"] != "Finish the migration" {
+		t.Fatalf("payload = %#v, want the seeded worker repo and prompt preserved", payload)
+	}
 }

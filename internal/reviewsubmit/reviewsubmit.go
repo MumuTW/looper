@@ -524,19 +524,6 @@ func validateReviewerReviewSubmitHold(ctx context.Context, cfg config.Config, re
 	return fmt.Errorf("reviewer review submit blocked because %s#%d is currently held", repo, prNumber)
 }
 
-func validateLatestReviewerReviewSubmitHold(ctx context.Context, gh reviewSubmitPullRequestViewer, cfg config.Config, repo string, prNumber int64, manual bool, runID string, cwd string) ([]string, error) {
-	detail, err := gh.ViewPullRequest(ctx, githubinfra.ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
-	if err != nil {
-		return nil, fmt.Errorf("refresh pull request hold labels before review submit: %w", err)
-	}
-	if err := validateReviewerReviewSubmitHold(ctx, cfg, repo, prNumber, manual, runID, detail.Labels); err != nil {
-		return nil, err
-	}
-	// Return the refreshed labels so publish authority does not reuse the first
-	// PR snapshot (which can still list a trigger label removed mid-run).
-	return detail.Labels, nil
-}
-
 // validateLatestReviewerReviewSubmitPublication re-reads the PR before mutation
 // and fails closed on head/base drift plus hold labels. Refreshed labels are
 // returned so publish authority uses the latest snapshot.
@@ -582,52 +569,6 @@ func trustedManualReviewerRun(ctx context.Context, repos *storage.Repositories, 
 	return manualValue, nil
 }
 
-// trustedFollowUpNewHeadReviewerRun reports whether --reviewer-run-id is the
-// current running reviewer run for an enabled follow-up loop whose last
-// published head differs from the head being submitted.
-func trustedFollowUpNewHeadReviewerRun(ctx context.Context, repos *storage.Repositories, repo string, prNumber int64, runID string, headSHA string) (bool, error) {
-	loop, err := trustedCurrentReviewerLoopForRun(ctx, repos, repo, prNumber, runID)
-	if err != nil {
-		return false, err
-	}
-	if loop == nil {
-		return false, nil
-	}
-	return reviewSubmitFollowUpHasNewHead(loop.MetadataJSON, headSHA), nil
-}
-
-// trustedCurrentFollowUpNewHeadReviewerBypass honors the runner's
-// follow_up_new_head requireReviewRequest bypass when agents submit without
-// --reviewer-run-id (automatic reviewer prompts only pass that flag for manual
-// runs). Authority is the current running reviewer loop for the PR.
-func trustedCurrentFollowUpNewHeadReviewerBypass(ctx context.Context, repos *storage.Repositories, repo string, prNumber int64, headSHA string) (bool, error) {
-	if repos == nil || repos.Runs == nil || repos.Loops == nil {
-		return false, fmt.Errorf("validate follow-up review request bypass: storage is not configured")
-	}
-	currentRun, err := currentRunningReviewerRun(ctx, repos, repo, prNumber)
-	if err != nil {
-		return false, err
-	}
-	if currentRun == nil {
-		return false, nil
-	}
-	loop, err := repos.Loops.GetByID(ctx, currentRun.LoopID)
-	if err != nil {
-		return false, fmt.Errorf("validate follow-up review request bypass: %w", err)
-	}
-	if loop == nil || loop.Type != string(domain.LoopTypeReviewer) || loop.Status != string(domain.LoopStatusRunning) {
-		return false, nil
-	}
-	loopRepo := ""
-	if loop.Repo != nil {
-		loopRepo = *loop.Repo
-	}
-	if !strings.EqualFold(strings.TrimSpace(loopRepo), strings.TrimSpace(repo)) || loop.PRNumber == nil || *loop.PRNumber != prNumber {
-		return false, nil
-	}
-	return reviewSubmitFollowUpHasNewHead(loop.MetadataJSON, headSHA), nil
-}
-
 // trustedCurrentReviewerLoopForRun returns the loop for runID only when that
 // run is the current running reviewer run for the given repo/PR.
 func trustedCurrentReviewerLoopForRun(ctx context.Context, repos *storage.Repositories, repo string, prNumber int64, runID string) (*storage.LoopRecord, error) {
@@ -670,28 +611,6 @@ func trustedCurrentReviewerLoopForRun(ctx context.Context, repos *storage.Reposi
 		return nil, nil
 	}
 	return loop, nil
-}
-
-// reviewSubmitFollowUpHasNewHead mirrors reviewer.reviewerFollowUpHasNewHead:
-// enabled follow-up loops may publish without a fresh review request when the
-// head being submitted differs from the last published review head.
-func reviewSubmitFollowUpHasNewHead(metadataJSON *string, headSHA string) bool {
-	headSHA = strings.TrimSpace(headSHA)
-	if headSHA == "" {
-		return false
-	}
-	meta := parseReviewSubmitJSONObject(metadataJSON)
-	if enabled, ok := meta["followUpdates"].(bool); !ok || !enabled {
-		return false
-	}
-	if loopMeta, ok := meta["loop"].(map[string]any); ok {
-		if enabled, ok := loopMeta["enabled"].(bool); ok && !enabled {
-			return false
-		}
-	}
-	lastPublished, _ := meta["lastPublishedHeadSha"].(string)
-	lastPublished = strings.TrimSpace(lastPublished)
-	return lastPublished != "" && lastPublished != headSHA
 }
 
 func currentRunningReviewerRun(ctx context.Context, repos *storage.Repositories, repo string, prNumber int64) (*storage.RunRecord, error) {

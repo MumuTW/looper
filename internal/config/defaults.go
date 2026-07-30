@@ -170,7 +170,6 @@ func DefaultConfig(cwd string) (Config, error) {
 		},
 		Package: PackageConfig{
 			Distribution:               "github-release",
-			AutoUpgradeEnabled:         true,
 			AutoMigrateOnStartup:       true,
 			RequireBackupBeforeMigrate: false,
 		},

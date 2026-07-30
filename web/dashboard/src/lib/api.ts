@@ -145,6 +145,12 @@ export type StatusData = {
           issueNumber?: number;
           createdAt?: string;
           ageSeconds?: number;
+          /**
+           * The comment that confirms this source, e.g. "/plan triage-confirm-…".
+           * The token is minted per report and appears nowhere else an operator
+           * reads, so the roster is only actionable with it (#255).
+           */
+          command?: string;
         }>;
       };
     };

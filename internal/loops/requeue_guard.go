@@ -57,12 +57,6 @@ func (r *guardRegistry) lock(key string) func() {
 	}
 }
 
-func (r *guardRegistry) size() int {
-	r.registryMu.Lock()
-	defer r.registryMu.Unlock()
-	return len(r.entries)
-}
-
 // loopRequeueGuards serializes per-loop queue rearm across the API discard/retry
 // path and runtime free-text / HITL / recovery / discovery requeues. Without a
 // process-wide mutex, concurrent requeue can land after API preflight and

@@ -16,7 +16,7 @@ Options considered:
 
 Ship a **local operator dashboard** as a **React + Vite + TypeScript SPA** (Tailwind CSS v4 + shadcn/ui), built assets **`//go:embed`’d into looperd**, served under **`/dashboard/`**, consuming the **existing `/api/v1/*` API**.
 
-`looper dashboard` ensures the daemon is healthy and opens the browser. Domain authority remains forge + SQLite via looperd; the UI is presentation and control only.
+`looper dashboard` prints the dashboard URL. With `local-token` authentication it first asks looperd, using the CLI's configured token or `LOOPER_TOKEN`, for a short-lived one-shot bootstrap code and places only that code in the URL. The operator opens the printed URL; the CLI does not control a browser or persist a browser session. Domain authority remains forge + SQLite via looperd; the UI is presentation and control only.
 
 This is **not** the Hub Admin UI and must not become a second control plane or shared Hub codebase in v1.
 
@@ -41,5 +41,6 @@ Authority for dashboard-visible runtime state and control actions is **looperd**
 
 - New tree: `web/dashboard/`; CI builds frontend before Go release artifacts.
 - looperd gains static/SPA routes and minimal auth bootstrap endpoints; no parallel domain API.
+- `looper dashboard` is the supported bridge from CLI credentials to an unauthenticated browser session.
 - Product docs and naming use **dashboard**, never Hub, for this surface.
 - Full CLI parity is north star; v1 is observe + control only (see `specs/2026-07-15-local-dashboard-v1/spec.md`).

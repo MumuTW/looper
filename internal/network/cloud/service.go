@@ -615,13 +615,6 @@ func nullableString(value string) any {
 	return value
 }
 
-func ttlDuration(ttlSeconds int) time.Duration {
-	if ttlSeconds <= 0 {
-		ttlSeconds = int(protocol.DefaultLeaseTTL / time.Second)
-	}
-	return time.Duration(ttlSeconds) * time.Second
-}
-
 func targetLabelsForJoin(nodeName string, requested []string) []string {
 	if len(requested) == 0 {
 		return []string{protocol.TargetLabelForNode(nodeName)}

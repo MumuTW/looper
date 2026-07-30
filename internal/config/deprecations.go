@@ -20,10 +20,6 @@ func deprecationWarning(kind deprecatedSurfaceKind, legacy string, replacement s
 	return fmt.Sprintf("deprecated %s %q is accepted for now; use %q instead", kind, legacy, replacement)
 }
 
-func removedLegacySurfaceError(kind deprecatedSurfaceKind, legacy string, replacement string) string {
-	return fmt.Sprintf("legacy %s %q is no longer supported; use %q instead", kind, legacy, replacement)
-}
-
 func legacyDefaultConfigMigrationNote(legacyPath string, canonicalPath string) string {
 	return fmt.Sprintf("legacy default config file %q is still supported for now. TOML is now the preferred default format/path; move this config to %q, keep only one default config file in place, and update any legacy keys to the canonical taxonomy described in docs/configuration.md", legacyPath, canonicalPath)
 }

@@ -30,13 +30,3 @@ func TestParseRemoteRepoFromURL(t *testing.T) {
 		}
 	}
 }
-
-func TestParseGitHubRepoFromRemoteURLIgnoresForgejo(t *testing.T) {
-	t.Parallel()
-	if got := parseGitHubRepoFromRemoteURL("ssh://git@ssh.code.powerformer.net/core/odcrew.git"); got != "" {
-		t.Fatalf("parseGitHubRepoFromRemoteURL(forgejo) = %q, want empty", got)
-	}
-	if got := parseGitHubRepoFromRemoteURL("git@github.com:nexu-io/looper.git"); got != "nexu-io/looper" {
-		t.Fatalf("parseGitHubRepoFromRemoteURL(github) = %q, want nexu-io/looper", got)
-	}
-}

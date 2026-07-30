@@ -298,27 +298,6 @@ func (s *DiscoverySnapshot) shouldFallbackToFilteredIssueQuery(input ListOpenIss
 	return truncated
 }
 
-func (s *DiscoverySnapshot) getCurrentUserLogin(ctx context.Context, cwd string) (string, error) {
-	if s.tick == nil {
-		return s.gateway.getCurrentUserLoginRaw(ctx, cwd)
-	}
-	cacheKey := strings.TrimSpace(cwd)
-	s.tick.mu.Lock()
-	if login, ok := s.tick.userLogins[cacheKey]; ok {
-		s.tick.mu.Unlock()
-		return login, nil
-	}
-	s.tick.mu.Unlock()
-	login, err := s.gateway.getCurrentUserLoginRaw(ctx, cwd)
-	if err != nil {
-		return "", err
-	}
-	s.tick.mu.Lock()
-	s.tick.userLogins[cacheKey] = login
-	s.tick.mu.Unlock()
-	return login, nil
-}
-
 func (s *DiscoverySnapshot) getCurrentUserLoginForRepo(ctx context.Context, repo, cwd string) (string, error) {
 	if s.tick == nil {
 		return s.gateway.getCurrentUserLoginForRepoRaw(ctx, repo, cwd)

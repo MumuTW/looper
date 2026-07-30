@@ -1411,12 +1411,6 @@ func (s *stubCoordinatorGitHub) ListIssueBlockedBy(_ context.Context, input gith
 	}
 	return out, nil
 }
-func (s *stubCoordinatorGitHub) GetCurrentUserLogin(context.Context, string) (string, error) {
-	if s.currentLogin != "" {
-		return s.currentLogin, nil
-	}
-	return "looper", nil
-}
 func (s *stubCoordinatorGitHub) GetCurrentUserLoginForRepo(context.Context, string, string) (string, error) {
 	s.currentLoginForRepoCalls++
 	if s.currentLoginErr != nil {

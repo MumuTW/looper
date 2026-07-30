@@ -46,6 +46,9 @@ func newQuarantineSettlementFixture(t *testing.T, loopStatus string, processAliv
 		Config: cfg,
 		Logger: &testLogger{},
 		Now:    func() time.Time { return now },
+		RunSchedulerTick: func(context.Context, Services) error {
+			return nil
+		},
 		ReadProcessCommand: func(_ context.Context, pid int) (string, error) {
 			if !processAlive || pid != int(quarantinedPID) {
 				return "", nil
