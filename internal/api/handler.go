@@ -24,10 +24,10 @@ import (
 
 	"github.com/nexu-io/looper/internal/agent"
 	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/daemonbinary"
 	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/eventlog"
 	"github.com/nexu-io/looper/internal/fixer"
-	"github.com/nexu-io/looper/internal/forge"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/nexu-io/looper/internal/loops"
@@ -47,6 +47,7 @@ const (
 	webhookForwardPath         = "/webhook/forward"
 	javaScriptISOString        = "2006-01-02T15:04:05.000Z"
 	loopLogsFollowPollInterval = 200 * time.Millisecond
+	loopLogsFollowRetryAfter   = time.Second
 	activeRunHeartbeatTTL      = 30 * time.Minute
 	webhookListenerPath        = "/webhook/forward"
 )
@@ -86,15 +87,19 @@ type ConfigMetadata struct {
 }
 
 type Context struct {
-	Config             config.Config
-	ConfigMetadata     func() ConfigMetadata
-	ConfigSnapshot     func() (config.Config, ConfigMetadata)
-	PatchConfig        func(context.Context, ConfigPatchRequest) error
-	Runtime            RuntimeState
-	WebhookForwarder   webhookforward.Forwarder
-	ProjectsService    projectService
-	Now                func() time.Time
-	RecoverySummary    func() any
+	Config           config.Config
+	ConfigMetadata   func() ConfigMetadata
+	ConfigSnapshot   func() (config.Config, ConfigMetadata)
+	PatchConfig      func(context.Context, ConfigPatchRequest) error
+	Runtime          RuntimeState
+	WebhookForwarder webhookforward.Forwarder
+	ProjectsService  projectService
+	Now              func() time.Time
+	RecoverySummary  func() any
+	// DaemonBinaryStatus reports whether the daemon's own executable file still
+	// holds the image it is running. Optional: when nil, /status reports the
+	// binary identity as unknown rather than as unchanged.
+	DaemonBinaryStatus func() daemonbinary.Status
 	ReconcileStaleRuns func(context.Context) (looperdruntime.StaleRunReconcileSummary, error)
 	StopLoop           func(context.Context, string, string) (any, error)
 	CloseLoop          func(context.Context, string, string) (any, error)
@@ -687,6 +692,13 @@ type loopLogsFollowChunkEvent struct {
 	Content     string  `json:"content"`
 }
 
+type loopLogsFollowErrorEvent struct {
+	Code         pkgapi.ErrorCode `json:"code"`
+	Message      string           `json:"message"`
+	Retryable    bool             `json:"retryable"`
+	RetryAfterMS int64            `json:"retryAfterMs,omitempty"`
+}
+
 func (e apiError) Error() string {
 	return e.message
 }
@@ -953,18 +965,17 @@ func (h *Handler) buildHealthResponse(ctx context.Context) (healthResponse, erro
 }
 
 type statusResponse struct {
-	Service         statusService                 `json:"service"`
-	Storage         statusStorage                 `json:"storage"`
-	Scheduler       statusScheduler               `json:"scheduler"`
-	Agent           statusAgent                   `json:"agent"`
-	WorktreeCleanup any                           `json:"worktreeCleanup"`
-	Webhook         statusWebhook                 `json:"webhook"`
-	Loops           statusLoops                   `json:"loops"`
-	Network         any                           `json:"network,omitempty"`
-	Safety          statusSafety                  `json:"safety"`
-	Notifications   statusNotifications           `json:"notifications"`
-	Tools           statusTools                   `json:"tools"`
-	Providers       []forge.ForgejoProviderHealth `json:"providers"`
+	Service         statusService       `json:"service"`
+	Storage         statusStorage       `json:"storage"`
+	Scheduler       statusScheduler     `json:"scheduler"`
+	Agent           statusAgent         `json:"agent"`
+	WorktreeCleanup any                 `json:"worktreeCleanup"`
+	Webhook         statusWebhook       `json:"webhook"`
+	Loops           statusLoops         `json:"loops"`
+	Network         any                 `json:"network,omitempty"`
+	Safety          statusSafety        `json:"safety"`
+	Notifications   statusNotifications `json:"notifications"`
+	Tools           statusTools         `json:"tools"`
 }
 
 type statusService struct {
@@ -992,6 +1003,11 @@ type statusBinary struct {
 	CurrentTarget    string   `json:"currentTarget"`
 	ArtifactName     *string  `json:"artifactName"`
 	SupportedTargets []string `json:"supportedTargets"`
+	// Identity answers "is the file at Path still the build I am executing?".
+	// A running daemon whose binary was replaced keeps working on the old image
+	// and switches builds at the next restart, so the divergence is only
+	// visible here (#154).
+	Identity daemonbinary.Status `json:"identity"`
 }
 
 type versionResponse struct {
@@ -1003,6 +1019,17 @@ type versionResponse struct {
 type versionBinaryResponse struct {
 	Name string `json:"name"`
 	Path string `json:"path,omitempty"`
+}
+
+// daemonBinaryStatus reports the running-image-versus-on-disk comparison. With
+// no reporter wired the answer is "unknown", never "unchanged": a status that
+// cannot see a swap must not claim there was none.
+func (h *Handler) daemonBinaryStatus() daemonbinary.Status {
+	if h.context.DaemonBinaryStatus == nil {
+		return daemonbinary.Verify(daemonbinary.Identity{})
+	}
+
+	return h.context.DaemonBinaryStatus()
 }
 
 func daemonExecutablePath() string {
@@ -1409,7 +1436,8 @@ func (h *Handler) buildStatusResponse(ctx context.Context) (statusResponse, erro
 	forgeCredential := looperdruntime.ForgeCredentialReadinessFor(h.effectiveConfig())
 	outstanding, debtErr := looperdruntime.CountOutstandingQuarantineDebt(ctx, services.Repositories)
 	recovery := h.recoveryWithOutstanding(outstanding)
-	degradedReasons := statusDegradedReasons(reviewPublish, forgeCredential, outstanding, debtErr)
+	binaryIdentity := h.daemonBinaryStatus()
+	degradedReasons := statusDegradedReasons(reviewPublish, forgeCredential, outstanding, debtErr, binaryIdentity)
 
 	return statusResponse{
 		Service: statusService{
@@ -1428,6 +1456,7 @@ func (h *Handler) buildStatusResponse(ctx context.Context) (statusResponse, erro
 				CurrentTarget:    currentTarget,
 				ArtifactName:     artifactName,
 				SupportedTargets: []string{"darwin-arm64", "linux-amd64"},
+				Identity:         binaryIdentity,
 			},
 		},
 		Storage: statusStorage{
@@ -1480,25 +1509,7 @@ func (h *Handler) buildStatusResponse(ctx context.Context) (statusResponse, erro
 			LooperPath:    reviewPublish.LooperPath,
 			ReviewPublish: reviewPublish,
 		},
-		Providers: h.buildProviderHealth(ctx),
 	}, nil
-}
-
-func (h *Handler) buildProviderHealth(ctx context.Context) []forge.ForgejoProviderHealth {
-	providers := make([]forge.ForgejoProviderHealth, 0)
-	for _, provider := range h.context.Config.Providers {
-		if provider.Kind != config.ProviderKindForgejo {
-			continue
-		}
-		projects := make([]forge.ForgejoProbeProject, 0)
-		for _, project := range h.context.Config.Projects {
-			if project.Provider == provider.ID {
-				projects = append(projects, forge.ForgejoProbeProject{ID: project.ID, Repo: project.Repo})
-			}
-		}
-		providers = append(providers, forge.ProbeForgejoProvider(ctx, provider, projects))
-	}
-	return providers
 }
 
 func (h *Handler) buildWorktreeCleanupStatusResponse() any {
@@ -1707,8 +1718,11 @@ func (h *Handler) recoveryWithOutstanding(outstanding looperdruntime.Outstanding
 	return normalized
 }
 
-func statusDegradedReasons(reviewPublish looperdruntime.ReviewPublishReadiness, forgeCredential looperdruntime.ForgeCredentialReadiness, outstanding looperdruntime.OutstandingQuarantineDebt, debtErr error) []string {
+func statusDegradedReasons(reviewPublish looperdruntime.ReviewPublishReadiness, forgeCredential looperdruntime.ForgeCredentialReadiness, outstanding looperdruntime.OutstandingQuarantineDebt, debtErr error, binaryIdentity daemonbinary.Status) []string {
 	var reasons []string
+	if binaryIdentity.Swapped {
+		reasons = append(reasons, daemonbinary.SwappedDegradedReason)
+	}
 	if reviewPublish.Known && reviewPublish.PublishingDisabled {
 		reasons = append(reasons, "review_publish_disabled")
 	}
@@ -1876,7 +1890,7 @@ type projectResponse struct {
 	RepoPath   string `json:"repoPath"`
 	BaseBranch string `json:"baseBranch"`
 	Archived   bool   `json:"archived"`
-	// Provider is the resolved provider kind for display (github, forgejo).
+	// Provider is the resolved provider kind for display.
 	Provider     string  `json:"provider"`
 	Repo         *string `json:"repo"`
 	WorktreeRoot *string `json:"worktreeRoot"`
@@ -3923,7 +3937,8 @@ func (h *Handler) streamLoopLogs(w http.ResponseWriter, r *http.Request, request
 
 		current, err = h.buildLoopLogsResponse(r.Context(), loop)
 		if err != nil {
-			continue
+			_ = writeSSEEvent(w, flusher, "error", newLoopLogsFollowErrorEvent(err))
+			return nil
 		}
 		if observedRunID == "" && current.Run != nil {
 			observedRunID = current.Run.RunID
@@ -3957,6 +3972,24 @@ func (h *Handler) streamLoopLogs(w http.ResponseWriter, r *http.Request, request
 			_ = writeSSEEvent(w, flusher, "end", map[string]string{"reason": "run_completed"})
 			return nil
 		}
+	}
+}
+
+func newLoopLogsFollowErrorEvent(err error) loopLogsFollowErrorEvent {
+	var typed apiError
+	if !asAPIError(err, &typed) {
+		typed = internalServerError(err)
+	}
+	retryable := typed.status >= http.StatusInternalServerError
+	retryAfterMS := int64(0)
+	if retryable {
+		retryAfterMS = loopLogsFollowRetryAfter.Milliseconds()
+	}
+	return loopLogsFollowErrorEvent{
+		Code:         typed.code,
+		Message:      typed.message,
+		Retryable:    retryable,
+		RetryAfterMS: retryAfterMS,
 	}
 }
 
@@ -4096,8 +4129,8 @@ func (h *Handler) buildCreateLoopResponse(r *http.Request) (loopResponse, error)
 	}
 
 	var body createLoopRequest
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		return loopResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "Request body must be valid JSON"}
+	if aerr := decodeJSONMutationBody(r, &body, true); aerr != nil {
+		return loopResponse{}, *aerr
 	}
 
 	projectID := strings.TrimSpace(derefString(body.ProjectID))
@@ -4289,8 +4322,8 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 	}
 
 	body := createWorkerRequest{}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		return workerCreateResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "Request body must be valid JSON"}
+	if aerr := decodeJSONMutationBody(r, &body, true); aerr != nil {
+		return workerCreateResponse{}, *aerr
 	}
 
 	prompt := normalizeOptionalString(body.Prompt)
@@ -4939,8 +4972,8 @@ func (h *Handler) buildPlannersCreateResponse(r *http.Request) (plannerCreateRes
 	}
 
 	body := createPlannerRequest{}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		return plannerCreateResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "Request body must be valid JSON"}
+	if aerr := decodeJSONMutationBody(r, &body, true); aerr != nil {
+		return plannerCreateResponse{}, *aerr
 	}
 
 	projectID := strings.TrimSpace(derefString(body.ProjectID))
@@ -5621,12 +5654,16 @@ func (h *Handler) handbackLoop(ctx context.Context, r *http.Request, loopID stri
 		}
 		if execution, err := repos.AgentExecutions.GetLatestByLoopID(ctx, loopID); err == nil && execution != nil && execution.NativeSessionID != nil && strings.TrimSpace(*execution.NativeSessionID) != "" {
 			meta, werr := loops.WriteTakeoverResume(loop.MetadataJSON, loops.TakeoverResume{SessionID: strings.TrimSpace(*execution.NativeSessionID)})
-			if werr == nil {
-				loop.MetadataJSON = &meta
-				loop.UpdatedAt = nowISO
-				if err := repos.Loops.Upsert(ctx, *loop); err != nil {
-					return struct{}{}, err
-				}
+			if werr != nil {
+				// Without the resume marker the next worker run cannot attach
+				// to the human-driven session; leave the loop parked instead of
+				// pretending the handback succeeded.
+				return struct{}{}, fmt.Errorf("persist takeover resume marker: %w", werr)
+			}
+			loop.MetadataJSON = &meta
+			loop.UpdatedAt = nowISO
+			if err := repos.Loops.Upsert(ctx, *loop); err != nil {
+				return struct{}{}, err
 			}
 		}
 		reason := "Cleared for takeover handback"
@@ -5649,18 +5686,22 @@ func retryRequestRequestsDiscard(r *http.Request) (bool, error) {
 	if r == nil || r.Body == nil {
 		return false, nil
 	}
-	raw, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	raw, err := io.ReadAll(http.MaxBytesReader(nil, r.Body, maxJSONMutationBodyBytes))
 	_ = r.Body.Close()
 	r.Body = io.NopCloser(strings.NewReader(string(raw)))
 	if err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			return false, apiError{code: pkgapi.ErrorCodeRequestTooLarge, status: http.StatusRequestEntityTooLarge, message: fmt.Sprintf("Request body exceeds %d bytes", maxJSONMutationBodyBytes)}
+		}
 		return false, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Invalid retry request: %v", err)}
 	}
 	if len(strings.TrimSpace(string(raw))) == 0 {
 		return false, nil
 	}
 	var body retryLoopRequest
-	if err := json.Unmarshal(raw, &body); err != nil {
-		return false, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Invalid retry request: %v", err)}
+	if aerr := decodeStrictJSONValue(raw, &body); aerr != nil {
+		return false, *aerr
 	}
 	return body.DiscardWorktreeChanges != nil && *body.DiscardWorktreeChanges, nil
 }
@@ -5676,12 +5717,8 @@ type respondLoopRequest struct {
 // agent session with the answer. This is the testable core of the HITL bridge.
 func (h *Handler) respondToLoop(ctx context.Context, r *http.Request, loopID string) (loopResponse, error) {
 	var body respondLoopRequest
-	if r.Body != nil {
-		defer r.Body.Close()
-		decoder := json.NewDecoder(r.Body)
-		if err := decoder.Decode(&body); err != nil && !errors.Is(err, io.EOF) {
-			return loopResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Invalid respond request: %v", err)}
-		}
+	if aerr := decodeJSONMutationBody(r, &body, false); aerr != nil {
+		return loopResponse{}, *aerr
 	}
 	return h.deliverHumanAnswer(ctx, loopID, body.Answer)
 }
@@ -5944,12 +5981,8 @@ func (h *Handler) handleFeishuThreadReply(w http.ResponseWriter, r *http.Request
 // path preserves human interactive edits in the worktree for the resumed session.
 func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string, fromHandback bool) (retryLoopResponse, error) {
 	var body retryLoopRequest
-	if r.Body != nil {
-		defer r.Body.Close()
-		decoder := json.NewDecoder(r.Body)
-		if err := decoder.Decode(&body); err != nil && !errors.Is(err, io.EOF) {
-			return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Invalid retry request: %v", err)}
-		}
+	if aerr := decodeJSONMutationBody(r, &body, false); aerr != nil {
+		return retryLoopResponse{}, *aerr
 	}
 	mode := strings.TrimSpace(body.Mode)
 	if mode == "" {
@@ -6077,6 +6110,11 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string,
 			return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 		}
 		preflightLoop = freshLoop
+		if preflightLoop.Type == "fixer" {
+			if _, err := loops.DecodeMetadataObjectForWrite(preflightLoop.MetadataJSON); err != nil {
+				return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Cannot discard worktree changes while loop metadata is malformed: %v", err)}
+			}
+		}
 
 		discardResult, discardErr := h.discardLoopWorktreeChanges(ctx, services, *preflightLoop)
 		if discardErr != nil {
@@ -6857,7 +6895,10 @@ func resetFixerLoopRetryMetadata(current *string) (*string, error) {
 	if current == nil || strings.TrimSpace(*current) == "" {
 		return current, nil
 	}
-	metadata := parseJSONObject(current)
+	metadata, err := loops.DecodeMetadataObjectForWrite(current)
+	if err != nil {
+		return nil, err
+	}
 	delete(metadata, "fixerFailureStreak")
 	if pauseReason, _ := metadata["pauseReason"].(string); pauseReason == "agent_failure_streak" {
 		delete(metadata, "pauseReason")
@@ -7358,8 +7399,8 @@ type createProjectRequest struct {
 
 func (h *Handler) buildCreateProjectResponse(r *http.Request, service projectService) (createProjectResponse, error) {
 	body := createProjectRequest{}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		return createProjectResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "Request body must be valid JSON"}
+	if aerr := decodeJSONMutationBody(r, &body, true); aerr != nil {
+		return createProjectResponse{}, *aerr
 	}
 
 	repoPath := strings.TrimSpace(derefString(body.RepoPath))

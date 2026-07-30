@@ -7,7 +7,6 @@ import (
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/coordinator"
 	"github.com/nexu-io/looper/internal/fixer"
-	"github.com/nexu-io/looper/internal/forge"
 	"github.com/nexu-io/looper/internal/gatekeeper"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/planner"
@@ -39,11 +38,6 @@ type discoveryLane struct {
 	// Enabled is evaluated per project, because coordinator admission is
 	// per-project while the other roles use a single daemon-wide flag.
 	Enabled func(projectID string) bool
-
-	// Supported guards providers that cannot serve this lane (a task source
-	// without pull requests cannot feed a PR-source role). Nil means the
-	// lane runs on every provider.
-	Supported func(capabilities forge.Capabilities) bool
 
 	// LogWhenDisabled keeps the per-role "auto-discovery disabled" debug
 	// line. Coordinator opts out: it is disabled per project rather than
@@ -84,11 +78,18 @@ func roleDiscoverers(input defaultSchedulerTickInput) map[string]discoveryLane {
 		config.CodingRoleFixer: {
 			Enabled: func(string) bool { return discoveryEnabled(input.FixerDiscoveryEnabled) },
 			Present: input.Fixer != nil,
-			Supported: func(capabilities forge.Capabilities) bool {
-				return capabilities.PullRequests || capabilities.GitHubPullRequests
-			},
 			Discover: func(ctx context.Context, projectID, repo string, snapshot *githubinfra.DiscoverySnapshot) ([]storage.QueueItemRecord, error) {
 				result, err := input.Fixer.DiscoverPullRequests(ctx, fixer.DiscoveryInput{ProjectID: projectID, Repo: repo, Snapshot: snapshot})
+				// Examined is the per-PR forge work this lane performs; skipped is what the
+				// cheap local checks avoided before any call. Logging both is what decides
+				// whether a fingerprint-based skip has headroom here at all.
+				if input.Logger != nil {
+					input.Logger.Info("fixer discovery examined pull requests", map[string]any{
+						"projectId": projectID, "repo": repo,
+						"examined": result.Examined, "skipped": result.Skipped,
+						"skippedClean": result.SkippedClean, "enqueued": len(result.QueueItems),
+					})
+				}
 				return result.QueueItems, err
 			},
 		},
@@ -101,39 +102,34 @@ func roleDiscoverers(input defaultSchedulerTickInput) map[string]discoveryLane {
 			},
 		},
 		config.RoleGatekeeper: {
-			Enabled:   func(string) bool { return true },
-			Present:   input.Gatekeeper != nil,
-			Supported: func(capabilities forge.Capabilities) bool { return capabilities.GitHubPullRequests },
+			Enabled: func(string) bool { return true },
+			Present: input.Gatekeeper != nil,
 			Discover: func(ctx context.Context, projectID, repo string, snapshot *githubinfra.DiscoverySnapshot) ([]storage.QueueItemRecord, error) {
-				_, err := input.Gatekeeper.DiscoverPullRequests(ctx, gatekeeper.DiscoveryInput{ProjectID: projectID, Repo: repo, Snapshot: snapshot})
+				result, err := input.Gatekeeper.DiscoverPullRequests(ctx, gatekeeper.DiscoveryInput{ProjectID: projectID, Repo: repo, Snapshot: snapshot})
+				// An optimisation that skips work is only verifiable if the skipping is
+				// visible. Logging both counts also means a fingerprint that silently
+				// stops matching shows up as skipped falling to zero, rather than as the
+				// lane quietly costing what it used to.
+				if input.Logger != nil {
+					input.Logger.Info("gatekeeper discovery evaluated pull requests", map[string]any{
+						"projectId": projectID, "repo": repo,
+						"evaluated": result.Evaluated, "skipped": result.Skipped,
+					})
+				}
 				return nil, err
 			},
 		},
 	}
 }
 
-// supportsGitHubIssueDiscovery is the single authority for lanes that discover
-// GitHub issues through the GitHub gateway (triager and coordinator). Forgejo
-// owns its own issues, so it must not feed these lanes.
-//
-// Both lanes used to hand-write this predicate independently, and each picked a
-// different wrong flag (coordinator: GitHubPullRequests; triager:
-// GitHubCLIPullRequestCreation), which is the repeated one-line fix this
-// centralization replaces. The GitHub-issue authority now lives in one place so
-// the lanes cannot drift apart again.
-func supportsGitHubIssueDiscovery(capabilities forge.Capabilities) bool {
-	return capabilities.GitHubIssues
-}
-
 // coordinatorLane is built separately because coordination is not a coding
 // role: it has no agent, no discovery config, and is enabled per project.
 func coordinatorLane(input defaultSchedulerTickInput) discoveryLane {
 	return discoveryLane{
-		Name:      "coordinator",
-		Priority:  config.PriorityCoordinator,
-		Present:   input.Coordinator != nil,
-		Enabled:   func(projectID string) bool { return coordinatorEnabledForProject(input, projectID) },
-		Supported: supportsGitHubIssueDiscovery,
+		Name:     "coordinator",
+		Priority: config.PriorityCoordinator,
+		Present:  input.Coordinator != nil,
+		Enabled:  func(projectID string) bool { return coordinatorEnabledForProject(input, projectID) },
 		Discover: func(ctx context.Context, projectID, repo string, snapshot *githubinfra.DiscoverySnapshot) ([]storage.QueueItemRecord, error) {
 			_, err := input.Coordinator.DiscoverIssues(ctx, coordinator.DiscoveryInput{ProjectID: projectID, Repo: repo, Snapshot: snapshot})
 			return nil, err
@@ -144,7 +140,9 @@ func coordinatorLane(input defaultSchedulerTickInput) discoveryLane {
 // triagerLane is an internal issue-source role. Its persisted report is the
 // routing authority; the lane does not need a label-gated CodingRoleConfig.
 func triagerLane(input defaultSchedulerTickInput) discoveryLane {
-	decisionBudget := triager.DefaultDecisionLimit
+	// One budget per tick, shared by every project this lane discovers. Projects
+	// are discovered concurrently, so the budget synchronizes its own reservation.
+	decisionBudget := triager.NewDecisionBudget(triager.DefaultDecisionLimit)
 	return discoveryLane{
 		Name:     "triager",
 		Priority: config.PriorityTriager,
@@ -152,9 +150,8 @@ func triagerLane(input defaultSchedulerTickInput) discoveryLane {
 		Enabled: func(projectID string) bool {
 			return input.TriagerEnabled != nil && input.TriagerEnabled(projectID)
 		},
-		Supported: supportsGitHubIssueDiscovery,
 		Discover: func(ctx context.Context, projectID, repo string, snapshot *githubinfra.DiscoverySnapshot) ([]storage.QueueItemRecord, error) {
-			result, err := input.Triager.DiscoverIssues(ctx, triager.DiscoveryInput{ProjectID: projectID, Repo: repo, Snapshot: snapshot, DecisionBudget: &decisionBudget})
+			result, err := input.Triager.DiscoverIssues(ctx, triager.DiscoveryInput{ProjectID: projectID, Repo: repo, Snapshot: snapshot, DecisionBudget: decisionBudget})
 			return result.QueueItems, err
 		},
 	}

@@ -213,6 +213,7 @@ type fakeGitHub struct {
 	viewSequence []githubinfra.IssueDetail
 	viewCalls    int
 	timeline     []map[string]any
+	onTimeline   func()
 	listInput    githubinfra.ListOpenIssuesInput
 	listEmpty    bool
 	permission   string
@@ -252,6 +253,10 @@ func (f *fakeGitHub) ViewIssue(_ context.Context, input githubinfra.ViewIssueInp
 }
 
 func (f *fakeGitHub) ListIssueTimeline(context.Context, githubinfra.IssueTimelineInput) ([]map[string]any, error) {
+	if f.onTimeline != nil {
+		f.onTimeline()
+		f.onTimeline = nil
+	}
 	return f.timeline, nil
 }
 
@@ -260,12 +265,17 @@ func (f *fakeGitHub) GetRepositoryPermission(context.Context, githubinfra.Reposi
 }
 
 type fakeLLM struct {
-	responses []string
-	errors    []error
-	calls     int
+	responses  []string
+	errors     []error
+	calls      int
+	onComplete func()
 }
 
 func (f *fakeLLM) Complete(context.Context, Request) (string, error) {
+	if f.onComplete != nil {
+		f.onComplete()
+		f.onComplete = nil
+	}
 	if f.calls < len(f.errors) && f.errors[f.calls] != nil {
 		err := f.errors[f.calls]
 		f.calls++

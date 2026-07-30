@@ -8,6 +8,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
+import { createPortal } from "react-dom";
 import { Button } from "@/components/ui/button";
 
 export type ToastKind = "ok" | "err" | "info";
@@ -93,28 +94,35 @@ export function ToastProvider({ children }: { children: ReactNode }) {
   return (
     <ToastContext.Provider value={value}>
       {children}
-      <div
-        className="pointer-events-none fixed bottom-3 right-3 z-50 flex w-[min(360px,calc(100vw-1.5rem))] flex-col gap-1.5"
-        aria-live="polite"
-      >
-        {items.map((t) => (
-          <div
-            key={t.id}
-            className={`pointer-events-auto flex items-start gap-2 rounded border bg-[var(--bg-elevated)] px-2.5 py-1.5 text-[12px] shadow-sm ${KIND_STYLE[t.kind]}`}
-          >
-            <span className="min-w-0 flex-1 break-words">{t.message}</span>
-            <Button
-              variant="ghost"
-              size="sm"
-              className="shrink-0 px-1 py-0 text-[10px]"
-              onClick={() => dismiss(t.id)}
-              aria-label="Dismiss"
+      {typeof document !== "undefined"
+        ? createPortal(
+            <div
+              data-toast-container
+              className="pointer-events-none fixed bottom-3 right-3 z-50 flex w-[min(360px,calc(100vw-1.5rem))] flex-col gap-1.5"
+              aria-live="polite"
             >
-              ×
-            </Button>
-          </div>
-        ))}
-      </div>
+              {items.map((t) => (
+                <div
+                  key={t.id}
+                  className={`pointer-events-auto flex items-center justify-between gap-2 rounded border bg-[var(--bg-elevated)] p-2.5 text-[12px] shadow-lg ${KIND_STYLE[t.kind]}`}
+                >
+                  <span className="break-words">{t.message}</span>
+                  <Button
+                    data-toast-dismiss
+                    variant="ghost"
+                    size="sm"
+                    className="h-6 px-1.5 text-[11px]"
+                    onClick={() => dismiss(t.id)}
+                    aria-label="Dismiss"
+                  >
+                    Dismiss
+                  </Button>
+                </div>
+              ))}
+            </div>,
+            document.body,
+          )
+        : null}
     </ToastContext.Provider>
   );
 }

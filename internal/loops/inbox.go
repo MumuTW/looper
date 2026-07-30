@@ -53,7 +53,10 @@ func ClearHumanInbox(metadataJSON *string) (string, error) {
 }
 
 func marshalWithHumanInbox(metadataJSON *string, msgs []HumanMessage) (string, error) {
-	meta := parseMetadataObject(metadataJSON)
+	meta, err := DecodeMetadataObjectForWrite(metadataJSON)
+	if err != nil {
+		return "", err
+	}
 	if len(msgs) == 0 {
 		delete(meta, humanInboxMetadataKey)
 	} else {

@@ -23,7 +23,7 @@ Webhook mode is configured in the config file and observed at `GET /api/v1/webho
 
 ## Looper in one paragraph
 
-Looper is a local daemon (`looperd`) that polls GitHub/Forgejo and runs agent loops in their own git worktrees, gated by forge labels:
+Looper is a local daemon (`looperd`) that polls GitHub and runs agent loops in their own git worktrees, gated by forge labels:
 
 | Role | Default discovery | Hands off via |
 | --- | --- | --- |
@@ -75,6 +75,8 @@ That only places `looper`. Also install `looperd` from the same release's `loope
 go build -o ~/.local/bin/looperd ./cmd/looperd
 ```
 
+Never build or install over the binary a running `looperd` was launched from — that silently replaces the build an operator chose and the next restart kills every in-flight run. To upgrade an existing daemon use `scripts/update-daemon.sh`, which stages the build and refuses to promote it while the target is executing.
+
 ### Step 3 — Write config
 
 Canonical path: `~/.looper/config.toml`. `looper init` writes a commented starter file there and refuses to overwrite an existing one, so it is safe to run first and read the path it prints. Never overwrite an existing file without the user's OK.
@@ -112,7 +114,7 @@ looper status
 
 **First decide which of the two registration paths this project uses — they do not mix.**
 
-**Forgejo projects: do NOT run `looper project add`.** Define the project entirely in the config file under `[[projects]]`, alongside its provider, and restart the daemon. `looper project add` has no way to express the provider binding those projects require, and the record it creates is marked `source = "api"`. Adding the same project to the config afterwards does not convert it: on the next start `SyncConfigured` sees a configured project whose id already belongs to an API record, fails with `configured project <id> conflicts with an API-managed project`, and **`looperd` refuses to start**. Recovering means removing the API record before the daemon will come back up. See [docs/configuration.md](../../docs/configuration.md).
+**Projects that need an explicit provider binding: do NOT run `looper project add`.** Define the project entirely in the config file under `[[projects]]`, alongside its provider, and restart the daemon. `looper project add` has no way to express a provider binding, and the record it creates is marked `source = "api"`. Adding the same project to the config afterwards does not convert it: on the next start `SyncConfigured` sees a configured project whose id already belongs to an API record, fails with `configured project <id> conflicts with an API-managed project`, and **`looperd` refuses to start**. Recovering means removing the API record before the daemon will come back up. See [docs/configuration.md](../../docs/configuration.md).
 
 **GitHub projects, with the daemon up:**
 
@@ -123,7 +125,7 @@ looper project list
 
 The path must be a git repository **root** — `looper project add` asks the client machine's `git` (`rev-parse --show-toplevel`) and refuses a subdirectory, a directory with a broken or empty `.git`, or a bare repository, naming the real root when it finds one. It also refuses a checkout already registered. The daemon normalizes and checks a path-only request's derived id atomically, so a directory name that would reuse an active project id (`/work/acme/api` after `/work/other/api`) is rejected even when adds race. Always pass an absolute path, and confirm it with the user rather than guessing.
 
-The dashboard at `http://127.0.0.1:17310/dashboard/` and `POST /api/v1/projects` register the same way, and are where the fields the CLI does not expose (explicit id, name, base branch, worktree root, provider) live — use them when you need an explicit id to sidestep a derived-id collision.
+The dashboard at `http://127.0.0.1:17310/dashboard/` and `POST /api/v1/projects` register the same way, and are where the fields the CLI does not expose (explicit id, name, base branch, worktree root) live — use them when you need an explicit id to sidestep a derived-id collision. `provider` is not one of those fields: an explicit binding is rejected there and belongs in `[[projects]]`.
 
 `project add` returns as soon as the project is validated, committed, and published — even on a repository with many open pull requests. Worktree/PR discovery runs as post-commit work in the daemon and is reported as pending; its status lives on the project record, and a failed discovery is retried with `looper project discover <id>` (or `POST /api/v1/projects/{id}/discover`), never by re-registering.
 
@@ -170,7 +172,7 @@ Inspect loops in the dashboard or via `GET /api/v1/loops`. Worktree path for a d
 
 - Reaching for `looper bootstrap`, `daemon start`, `ps`, `logs`, `plan`, `review`, `work`, `jump`
 - Passing `looper project add` a subdirectory instead of the repository root, or expecting it to take an id / base branch / provider — those are API and dashboard fields
-- Running `looper project add` for a Forgejo project, then adding it to the config file — that combination stops `looperd` from starting
+- Running `looper project add` for a project with an explicit provider binding, then adding it to the config file — that combination stops `looperd` from starting
 - Telling a user to run `looper review submit`
 - Using a PR URL as a selector
 - Force-pushing or inventing flags the strip CLI does not have

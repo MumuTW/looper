@@ -164,7 +164,8 @@ func startRuntimeWithAPI(ctx context.Context, deps bootstrap.RuntimeDependencies
 		TriggerSchedulerTick: func() {
 			rt.TriggerSchedulerTick()
 		},
-		LookupPullRequest: looperdapi.NewGatewayPullRequestLookup(deps.Config, time.Now),
+		DaemonBinaryStatus: rt.DaemonBinaryStatus,
+		LookupPullRequest:  looperdapi.NewGatewayPullRequestLookup(deps.Config, time.Now),
 	})
 	root := looperdapi.NewRootHandler(apiHandler, dashboard.Handler())
 	server := looperdapi.NewServer(deps.Config, root, deps.Logger)
@@ -436,7 +437,16 @@ func takeoverLoop(ctx context.Context, services looperdruntime.Services, loopID,
 		return result, fmt.Errorf("loops service is not configured")
 	}
 	if services.Repositories != nil && services.Repositories.AgentExecutions != nil {
-		if execution, err := services.Repositories.AgentExecutions.GetLatestByLoopID(ctx, loopID); err == nil && execution != nil {
+		execution, err := services.Repositories.AgentExecutions.GetLatestByLoopID(ctx, loopID)
+		if err != nil {
+			// A failed lookup is not "no execution": stopping now would park
+			// the loop without the session id, vendor, and worktree a human
+			// needs to resume the exact session. Abort before any lifecycle
+			// mutation; a genuinely absent execution (nil, no error) still
+			// takes over with empty ownership fields.
+			return result, fmt.Errorf("load latest agent execution before takeover: %w", err)
+		}
+		if execution != nil {
 			result.Vendor = execution.Vendor
 			if execution.NativeSessionID != nil {
 				result.SessionID = strings.TrimSpace(*execution.NativeSessionID)

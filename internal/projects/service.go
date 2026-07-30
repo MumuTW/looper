@@ -365,10 +365,8 @@ func (s *Service) addProjectLocked(ctx context.Context, input AddInput) (AddResu
 		return AddResult{}, nil, ProjectValidationError{Message: "provider is set but repo is missing; pass --repo owner/name or use a checkout with a detectable origin remote"}
 	}
 
-	if !isForgejoProvider(cfg, provider) {
-		if err := s.validateReviewerAutoMergeForProject(ctx, projectID, repo, input.BaseBranch, cfg); err != nil {
-			return AddResult{}, nil, err
-		}
+	if err := s.validateReviewerAutoMergeForProject(ctx, projectID, repo, input.BaseBranch, cfg); err != nil {
+		return AddResult{}, nil, err
 	}
 
 	nowISO := currentISO(s.Now)
@@ -393,13 +391,7 @@ func (s *Service) addProjectLocked(ctx context.Context, input AddInput) (AddResu
 	} else {
 		delete(metadata, "provider")
 	}
-	if isForgejoProvider(cfg, provider) {
-		profile := config.ProjectRefConfig{}
-		config.ApplyForgejoProjectProfile(&profile)
-		metadata["roles"] = profile.Roles
-	} else {
-		delete(metadata, "roles")
-	}
+	delete(metadata, "roles")
 	if input.WorktreeRoot != nil {
 		metadata["worktreeRoot"] = *input.WorktreeRoot
 	} else if _, ok := metadata["worktreeRoot"]; !ok {
@@ -517,12 +509,8 @@ func (s *Service) DiscoverProject(ctx context.Context, input DiscoverInput) (Dis
 	discoveredWorktrees, worktreeErr := s.discoverWorktrees(ctx, *project, nowISO, &warnings)
 	var discoveredPullRequests, pendingSnapshots, capturedSnapshots int
 	var pullRequestErr error
-	cfg := s.currentConfig()
-	provider := stringMetadataPtr(project.MetadataJSON, "provider")
 	repo := stringMetadataPtr(project.MetadataJSON, "repo")
-	if !isForgejoProvider(cfg, provider) {
-		discoveredPullRequests, pendingSnapshots, capturedSnapshots, pullRequestErr = s.discoverPullRequests(ctx, *project, repo, snapshotMode, &warnings)
-	}
+	discoveredPullRequests, pendingSnapshots, capturedSnapshots, pullRequestErr = s.discoverPullRequests(ctx, *project, repo, snapshotMode, &warnings)
 
 	discovery := DiscoveryState{
 		Status:                 DiscoveryStatusSucceeded,
@@ -1113,6 +1101,9 @@ func normalizeOptionalProvider(value *string) *string {
 	return &trimmed
 }
 
+// validateExplicitProvider rejects provider bindings on `project add`. The only
+// remaining provider kind is GitHub, which projects get by default, so an
+// explicit binding has nothing left to express; it belongs in [[projects]].
 func validateExplicitProvider(cfg config.Config, provider *string) error {
 	if provider == nil {
 		return nil
@@ -1120,26 +1111,10 @@ func validateExplicitProvider(cfg config.Config, provider *string) error {
 	providerID := strings.TrimSpace(*provider)
 	for _, configured := range cfg.Providers {
 		if configured.ID == providerID {
-			if configured.Kind != config.ProviderKindForgejo {
-				return ProjectValidationError{Message: fmt.Sprintf("provider %q has kind %q; project add currently supports provider bindings only for Forgejo", providerID, configured.Kind)}
-			}
-			return nil
+			return ProjectValidationError{Message: fmt.Sprintf("provider %q cannot be bound by project add; define the project under [[projects]] instead", providerID)}
 		}
 	}
 	return ProjectValidationError{Message: fmt.Sprintf("unknown provider id %q; configure it under [[providers]] first", providerID)}
-}
-
-func isForgejoProvider(cfg config.Config, provider *string) bool {
-	if provider == nil {
-		return false
-	}
-	providerID := strings.TrimSpace(*provider)
-	for _, configured := range cfg.Providers {
-		if configured.ID == providerID {
-			return configured.Kind == config.ProviderKindForgejo
-		}
-	}
-	return false
 }
 
 type orderedJSONEntry struct {

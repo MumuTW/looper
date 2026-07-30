@@ -926,6 +926,144 @@ func (r *RunsRepository) Upsert(ctx context.Context, record RunRecord) error {
 	return nil
 }
 
+// AppendCheckpointSecondaryIssue appends one issue to $.outcome.secondaryIssues.
+//
+// Append rather than read-modify-write for the same reason the other merges exist:
+// terminal cleanup runs after the run is written, so writing back a whole outcome
+// would erase whatever a concurrent transition stored. json_insert with '$[#]'
+// appends to the existing array, and the outcome/array are created when absent.
+//
+// The CASE guard normalizes a non-object checkpoint_json to an empty object; see
+// MergeRunResumePolicy for why the column cannot be trusted to hold one.
+func (r *RunsRepository) AppendCheckpointSecondaryIssue(ctx context.Context, id, issueJSON, updatedAt string) error {
+	result, err := r.q.ExecContext(ctx, `
+		WITH base(doc) AS (
+			SELECT CASE
+				WHEN json_valid(checkpoint_json) AND json_type(checkpoint_json) = 'object'
+					THEN checkpoint_json
+				ELSE '{}'
+			END
+			FROM runs WHERE id = ?
+		)
+		UPDATE runs
+		SET checkpoint_json = (
+				SELECT json_set(
+					doc,
+					'$.outcome.secondaryIssues',
+					json_insert(
+						CASE
+							WHEN json_type(doc, '$.outcome.secondaryIssues') = 'array'
+								THEN json_extract(doc, '$.outcome.secondaryIssues')
+							ELSE json('[]')
+						END,
+						'$[#]', json(?)
+					)
+				)
+				FROM base
+			),
+			updated_at = ?
+		WHERE id = ?
+	`, id, issueJSON, updatedAt, id)
+	if err != nil {
+		return fmt.Errorf("append run checkpoint secondary issue: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read appended run checkpoint secondary issue rows: %w", err)
+	}
+	if affected == 0 {
+		return fmt.Errorf("append run checkpoint secondary issue: run not found: %s", id)
+	}
+	return nil
+}
+
+// MergeRunResumePolicy rewrites only the checkpoint's resume policy.
+//
+// The retry-policy writers read a run, change this one field, and would otherwise
+// write the whole row back. That loses any checkpoint field a concurrent terminal
+// cleanup persisted in between -- the mirror of the race
+// MergeWorktreeCleanupTimestamps exists to avoid, since the two writers can
+// interleave in either order.
+//
+// The CASE guard normalizes a non-object checkpoint_json to an empty object. Without
+// it, failure-streak recovery on a run with malformed legacy content aborted the
+// transaction, and a run whose checkpoint was null/an array/a scalar reported success
+// without writing the policy -- leaving the loop paused after an apparently
+// successful handoff.
+func (r *RunsRepository) MergeRunResumePolicy(ctx context.Context, id, resumePolicy, updatedAt string) error {
+	result, err := r.q.ExecContext(ctx, `
+		UPDATE runs
+		SET checkpoint_json = json_set(
+				CASE
+					WHEN json_valid(checkpoint_json) AND json_type(checkpoint_json) = 'object'
+						THEN checkpoint_json
+					ELSE '{}'
+				END,
+				'$.resumePolicy', ?
+			),
+			updated_at = ?
+		WHERE id = ?
+	`, resumePolicy, updatedAt, id)
+	if err != nil {
+		return fmt.Errorf("merge run resume policy: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read merged run resume policy rows: %w", err)
+	}
+	if affected == 0 {
+		return fmt.Errorf("merge run resume policy: run not found: %s", id)
+	}
+	return nil
+}
+
+// MergeWorktreeCleanupTimestamps records a terminal worktree cleanup attempt on a
+// run without disturbing anything else about it.
+//
+// Cleanup runs after the run reached a terminal status and starts from a checkpoint
+// captured earlier, so it must not write that stale copy back. Replacing the whole
+// checkpoint_json would erase a concurrent checkpoint transition — an operator
+// retry rewriting resumePolicy to restart_from_discover between completion and
+// cleanup, for instance, which would leave the requeued run resuming the invalid
+// downstream checkpoint it was retried to escape. Scalar columns being untouched
+// is not enough; the merge has to be inside the JSON too.
+//
+// json_set writes only the two cleanup fields, creating $.worktree if the stored
+// checkpoint has none and preserving its other fields when it does.
+//
+// The CASE guard replaces a non-object checkpoint_json with an empty object first.
+// The column is arbitrary text: malformed content makes json_set abort the statement,
+// and valid-but-non-object content (null, an array, a scalar) makes it return the
+// input unchanged while the UPDATE still reports a row affected -- a silent no-op.
+// Normalizing matches what the previous read-modify-write path did in Go.
+func (r *RunsRepository) MergeWorktreeCleanupTimestamps(ctx context.Context, id, cleanupAttemptedAt, cleanedAt, updatedAt string) error {
+	result, err := r.q.ExecContext(ctx, `
+		UPDATE runs
+		SET checkpoint_json = json_set(
+				CASE
+					WHEN json_valid(checkpoint_json) AND json_type(checkpoint_json) = 'object'
+						THEN checkpoint_json
+					ELSE '{}'
+				END,
+				'$.worktree.cleanupAttemptedAt', ?,
+				'$.worktree.cleanedAt', ?
+			),
+			updated_at = ?
+		WHERE id = ?
+	`, cleanupAttemptedAt, cleanedAt, updatedAt, id)
+	if err != nil {
+		return fmt.Errorf("merge run worktree cleanup timestamps: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read merged run worktree cleanup rows: %w", err)
+	}
+	if affected == 0 {
+		return fmt.Errorf("merge run worktree cleanup timestamps: run not found: %s", id)
+	}
+	return nil
+}
+
 func (r *RunsRepository) GetByID(ctx context.Context, id string) (*RunRecord, error) {
 	row := r.q.QueryRowContext(ctx, `SELECT * FROM runs WHERE id = ?`, id)
 	record, err := scanRun(row)

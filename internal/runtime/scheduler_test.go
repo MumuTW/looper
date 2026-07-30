@@ -133,25 +133,25 @@ func TestRunDefaultSchedulerTickDefersStaleCatalogBeforeClaimAndDiscovery(t *tes
 	now := time.Date(2026, time.July, 13, 8, 0, 0, 0, time.UTC)
 	nowISO := formatJavaScriptISOString(now)
 	baseBranch := "main"
-	forgejoMetadata := `{"provider":"forgejo-main","repo":"forgejo/new"}`
+	ghesMetadata := `{"provider":"ghes-main","repo":"ghes/new"}`
 	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{
-		ID: "rebound", Name: "Rebound", RepoPath: filepath.Join(workingDir, "rebound"), BaseBranch: &baseBranch, MetadataJSON: &forgejoMetadata, CreatedAt: nowISO, UpdatedAt: nowISO,
+		ID: "rebound", Name: "Rebound", RepoPath: filepath.Join(workingDir, "rebound"), BaseBranch: &baseBranch, MetadataJSON: &ghesMetadata, CreatedAt: nowISO, UpdatedAt: nowISO,
 	}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
 	projectTarget := "project:rebound"
-	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_rebound", Seq: 1, ProjectID: "rebound", Type: "worker", TargetType: "project", TargetID: &projectTarget, Repo: stringPtr("forgejo/new"), Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_rebound", Seq: 1, ProjectID: "rebound", Type: "worker", TargetType: "project", TargetID: &projectTarget, Repo: stringPtr("ghes/new"), Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
 	projectID := "rebound"
 	loopID := "loop_rebound"
-	if err := repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_rebound", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: projectTarget, Repo: stringPtr("forgejo/new"), DedupeKey: "worker:loop_rebound", Priority: 1, Status: "queued", AvailableAt: nowISO, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+	if err := repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_rebound", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: projectTarget, Repo: stringPtr("ghes/new"), DedupeKey: "worker:loop_rebound", Priority: 1, Status: "queued", AvailableAt: nowISO, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
 
 	captured := config.Config{
 		Projects:  []config.ProjectRefConfig{{ID: "rebound", Repo: "github/old"}},
-		Providers: []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo}},
+		Providers: []config.ProviderConfig{{ID: "ghes-main", Kind: config.ProviderKindGitHub, BaseURL: "https://ghe.example.test"}},
 	}
 	plannerRunner := &stubPlannerScheduler{}
 	coordinatorRunner := &stubCoordinatorScheduler{}

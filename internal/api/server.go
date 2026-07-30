@@ -28,6 +28,18 @@ func NewServer(cfg config.Config, handler http.Handler, logger bootstrap.Logger)
 	return &Server{config: cfg, handler: handler, logger: logger}
 }
 
+// newHTTPServer builds the daemon HTTP server with its request-read bounds:
+// headers within 30s, the whole request (including body) within 2 minutes, so
+// a slow or stalled body cannot hold a goroutine indefinitely. Responses (SSE
+// streams) are unaffected — these bound reads, not writes.
+func (s *Server) newHTTPServer() *http.Server {
+	return &http.Server{
+		Handler:           s.handler,
+		ReadHeaderTimeout: 30 * time.Second,
+		ReadTimeout:       2 * time.Minute,
+	}
+}
+
 func (s *Server) Start() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -42,10 +54,7 @@ func (s *Server) Start() error {
 	}
 
 	done := make(chan struct{})
-	server := &http.Server{
-		Handler:           s.handler,
-		ReadHeaderTimeout: 30 * time.Second,
-	}
+	server := s.newHTTPServer()
 
 	s.listener = listener
 	s.server = server

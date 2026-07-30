@@ -107,6 +107,8 @@ func TestGatewayListsSnapshotsAndReviewsThroughGH(t *testing.T) {
 			return shell.Result{Stdout: `[{"id":7,"content":"eyes","user":{"login":"reviewer"}}]`}, nil
 		case args == "api repos/acme/looper/issues/42/reactions/7 --method DELETE -H Accept: application/vnd.github+json":
 			return shell.Result{Stdout: "{}"}, nil
+		case args == "label list --repo acme/looper --limit 1000 --json name,color,description":
+			return shell.Result{Stdout: `[{"name":"ready","color":"ededed","description":"Hand-written wording"}]`}, nil
 		case args == "pr create --repo acme/looper --head feature --base main --title Add support --body Body":
 			return shell.Result{Stdout: "https://example.test/pull/88\n"}, nil
 		case args == "pr edit 42 --repo acme/looper --title Implement support":
@@ -313,8 +315,8 @@ func TestGatewayListsSnapshotsAndReviewsThroughGH(t *testing.T) {
 		"api repos/acme/looper/issues/8/comments --method POST -f body=Looper started",
 		"api repos/acme/looper/issues/comments/91 --method PATCH -f body=Looper finished",
 		"api repos/acme/looper/issues/8/assignees --method POST -f assignees[]=reviewer",
-		"label create phase-1 --repo acme/looper --color 5319e7 --description Managed by looper --force",
-		"label create ready --repo acme/looper --color 5319e7 --description Managed by looper --force",
+		"label list --repo acme/looper --limit 1000 --json name,color,description",
+		"label create phase-1 --repo acme/looper --color 5319e7 --description Managed by looper",
 		"api repos/acme/looper/issues/42/labels --method POST -f labels[]=phase-1 -f labels[]=ready",
 		"api repos/acme/looper/issues/42/labels/needs-work --method DELETE",
 		"api repos/acme/looper/pulls/42/requested_reviewers --method POST -f reviewers[]=reviewer",
@@ -499,7 +501,7 @@ func TestGatewayFixerDiscoveryProjectsPaginatedCommentsAboveShellCap(t *testing.
 			if strings.Contains(args, "--slurp") {
 				t.Fatalf("comment command = %q, want page-wise projection without --slurp", args)
 			}
-			for _, required := range []string{"looper:forgejo-reviewer-summary", "looper:fixer-round", "looper:conflict-notice", "looper:reviewer:automerge-refused", "looper:forgejo-fixer-summary", "{id,body,html_url,updated_at,user:{login:.user.login}}"} {
+			for _, required := range []string{"looper:fixer-round", "looper:conflict-notice", "looper:reviewer:automerge-refused", "{id,body,html_url,updated_at,user:{login:.user.login}}"} {
 				if !strings.Contains(args, required) {
 					t.Fatalf("comment command = %q, want projection %q", args, required)
 				}
@@ -510,11 +512,9 @@ func TestGatewayFixerDiscoveryProjectsPaginatedCommentsAboveShellCap(t *testing.
 			if options.MaxCapturedBytes != 0 {
 				t.Fatalf("MaxCapturedBytes = %d, want unchanged generic default", options.MaxCapturedBytes)
 			}
-			return shell.Result{Stdout: "{\"id\":101,\"body\":\"<!-- looper:forgejo-reviewer-summary payload -->\",\"user\":{\"login\":\"reviewer\"}}\n" +
-				"{\"id\":202,\"body\":\"<!-- looper:fixer-round head=head-42 -->\",\"html_url\":\"https://example.test/pull/42#issuecomment-202\",\"user\":{\"login\":\"looper\"}}\n" +
+			return shell.Result{Stdout: "{\"id\":202,\"body\":\"<!-- looper:fixer-round head=head-42 -->\",\"html_url\":\"https://example.test/pull/42#issuecomment-202\",\"user\":{\"login\":\"looper\"}}\n" +
 				"{\"id\":303,\"body\":\"<!-- looper:conflict-notice id=notice-1 -->\",\"user\":{\"login\":\"looper\"}}\n" +
-				"{\"id\":404,\"body\":\"<!-- looper:reviewer:automerge-refused -->\",\"user\":{\"login\":\"looper\"}}\n" +
-				"{\"id\":505,\"body\":\"<!-- looper:forgejo-fixer-summary payload -->\",\"user\":{\"login\":\"looper\"}}\n"}, nil
+				"{\"id\":404,\"body\":\"<!-- looper:reviewer:automerge-refused -->\",\"user\":{\"login\":\"looper\"}}\n"}, nil
 		default:
 			t.Fatalf("unexpected gh args: %q", args)
 			return shell.Result{}, nil
@@ -526,7 +526,7 @@ func TestGatewayFixerDiscoveryProjectsPaginatedCommentsAboveShellCap(t *testing.
 	if err != nil {
 		t.Fatalf("ViewPullRequestForFixer() error = %v", err)
 	}
-	if len(detail.IssueComments) != 5 || detail.IssueComments[4].ID != 505 {
+	if len(detail.IssueComments) != 3 || detail.IssueComments[2].ID != 404 {
 		t.Fatalf("IssueComments = %#v, want all projected Looper marker comments", detail.IssueComments)
 	}
 }

@@ -3,7 +3,9 @@ import {
   RECONNECT_BACKOFF_MS,
   formatLiveStderrChunk,
   needsSeparateStderrFollow,
+  nextReconnectDelayAfterErrorMs,
   nextReconnectDelayMs,
+  parseLogsStreamError,
   resolveLogsStreamStatus,
   stderrGapFromSecondarySnapshot,
 } from "./logsStream";
@@ -29,14 +31,14 @@ describe("resolveLogsStreamStatus", () => {
     ).toBe("live");
   });
 
-  it("prefers error and ended over phase", () => {
+  it("prefers degraded and ended over phase", () => {
     expect(
       resolveLogsStreamStatus({
         phase: "connecting",
         ended: false,
         error: "boom",
       }),
-    ).toBe("error");
+    ).toBe("degraded");
     expect(
       resolveLogsStreamStatus({
         phase: "live",
@@ -54,6 +56,42 @@ describe("nextReconnectDelayMs", () => {
     expect(nextReconnectDelayMs(2)).toBe(5000);
     expect(nextReconnectDelayMs(10)).toBe(5000);
     expect(RECONNECT_BACKOFF_MS).toEqual([1000, 2000, 5000]);
+  });
+
+  it("honors a typed server retry floor without exceeding the client cap", () => {
+    expect(nextReconnectDelayAfterErrorMs(0, 3000)).toBe(3000);
+    expect(nextReconnectDelayAfterErrorMs(1, 10_000)).toBe(5000);
+    expect(nextReconnectDelayAfterErrorMs(10, 1000)).toBe(5000);
+    expect(nextReconnectDelayAfterErrorMs(0, -1)).toBe(1000);
+  });
+});
+
+describe("parseLogsStreamError", () => {
+  it("decodes the typed mid-stream failure contract", () => {
+    expect(
+      parseLogsStreamError(
+        JSON.stringify({
+          code: "INTERNAL_ERROR",
+          message: "database is locked",
+          retryable: true,
+          retryAfterMs: 1000,
+        }),
+      ),
+    ).toEqual({
+      code: "INTERNAL_ERROR",
+      message: "database is locked",
+      retryable: true,
+      retryAfterMs: 1000,
+    });
+  });
+
+  it("rejects malformed or incomplete error events", () => {
+    expect(() => parseLogsStreamError("not-json")).toThrow();
+    expect(() =>
+      parseLogsStreamError(
+        JSON.stringify({ code: "INTERNAL_ERROR", message: "boom" }),
+      ),
+    ).toThrow(/retryable/);
   });
 });
 

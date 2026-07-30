@@ -456,7 +456,7 @@ func TestPullRequestLookupsStayScopedAndReturnLatestSnapshotPerProject(t *testin
 	const repo = "acme/looper"
 	const prNumber int64 = 42
 
-	for _, projectID := range []string{"github", "forgejo", "unrelated"} {
+	for _, projectID := range []string{"github", "second", "unrelated"} {
 		if err := repos.Projects.Upsert(ctx, ProjectRecord{
 			ID:        projectID,
 			Name:      projectID,
@@ -471,7 +471,7 @@ func TestPullRequestLookupsStayScopedAndReturnLatestSnapshotPerProject(t *testin
 	snapshots := []PullRequestSnapshotRecord{
 		{ID: "github-old", ProjectID: "github", Repo: repo, PRNumber: prNumber, HeadSHA: "github-old", CapturedAt: "2026-07-13T09:00:00.000Z", CreatedAt: "2026-07-13T09:00:00.000Z"},
 		{ID: "github-new", ProjectID: "github", Repo: repo, PRNumber: prNumber, HeadSHA: "github-new", CapturedAt: "2026-07-13T10:00:00.000Z", CreatedAt: "2026-07-13T10:00:00.000Z"},
-		{ID: "forgejo-new", ProjectID: "forgejo", Repo: repo, PRNumber: prNumber, HeadSHA: "forgejo-new", CapturedAt: "2026-07-13T11:00:00.000Z", CreatedAt: "2026-07-13T11:00:00.000Z"},
+		{ID: "second-new", ProjectID: "second", Repo: repo, PRNumber: prNumber, HeadSHA: "second-new", CapturedAt: "2026-07-13T11:00:00.000Z", CreatedAt: "2026-07-13T11:00:00.000Z"},
 		{ID: "other-pr", ProjectID: "unrelated", Repo: repo, PRNumber: 99, HeadSHA: "other-pr", CapturedAt: "2026-07-13T12:00:00.000Z", CreatedAt: "2026-07-13T12:00:00.000Z"},
 		{ID: "other-repo", ProjectID: "unrelated", Repo: "acme/other", PRNumber: prNumber, HeadSHA: "other-repo", CapturedAt: "2026-07-13T13:00:00.000Z", CreatedAt: "2026-07-13T13:00:00.000Z"},
 	}
@@ -485,8 +485,8 @@ func TestPullRequestLookupsStayScopedAndReturnLatestSnapshotPerProject(t *testin
 	if err != nil {
 		t.Fatalf("PullRequestSnapshots.ListLatestByRepoAndPR() error = %v", err)
 	}
-	if got := snapshotIDs(gotSnapshots); !reflect.DeepEqual(got, []string{"forgejo-new", "github-new"}) {
-		t.Fatalf("PullRequestSnapshots.ListLatestByRepoAndPR() IDs = %v, want [forgejo-new github-new]", got)
+	if got := snapshotIDs(gotSnapshots); !reflect.DeepEqual(got, []string{"second-new", "github-new"}) {
+		t.Fatalf("PullRequestSnapshots.ListLatestByRepoAndPR() IDs = %v, want [second-new github-new]", got)
 	}
 
 	matchingRepo := "Acme/Looper"

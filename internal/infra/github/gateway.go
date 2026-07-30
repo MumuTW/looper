@@ -1198,7 +1198,7 @@ func (g *Gateway) ListIssueComments(ctx context.Context, input ViewIssueInput) (
 // fixer/reviewer protocols cross that bounded boundary.
 func (g *Gateway) listPullRequestAutomationComments(ctx context.Context, input ViewIssueInput) ([]CommentInfo, error) {
 	hostname, repo := splitRepoHostname(input.Repo)
-	filter := `.[] | select((.body // "") | (contains("looper:forgejo-reviewer-summary") or contains("looper:fixer-round") or contains("looper:conflict-notice") or contains("looper:reviewer:automerge-refused") or contains("looper:forgejo-fixer-summary"))) | {id,body,html_url,updated_at,user:{login:.user.login}}`
+	filter := `.[] | select((.body // "") | (contains("looper:fixer-round") or contains("looper:conflict-notice") or contains("looper:reviewer:automerge-refused"))) | {id,body,html_url,updated_at,user:{login:.user.login}}`
 	args := []string{"api", "--paginate", fmt.Sprintf("repos/%s/issues/%d/comments", repo, input.IssueNumber), "--jq", filter}
 	if hostname != "" {
 		args = append(args, "--hostname", hostname)
@@ -3020,41 +3020,91 @@ func (g *Gateway) InitializeLabels(ctx context.Context, input InitializeLabelsIn
 	if err := validateGitHubRepoSlug(repo); err != nil {
 		return LabelInitResult{}, err
 	}
+	return g.ensureLabels(ctx, repo, input.CWD, labels.Standard(), ensureLabelsOptions{
+		dryRun: input.DryRun,
+		// Provisioning reports a per-label plan, so it keeps going and records
+		// every outcome rather than stopping at the first failure.
+		requireListing: input.DryRun,
+	})
+}
 
-	existing, err := g.listRepositoryLabels(ctx, repo, input.CWD)
-	if err != nil {
-		return LabelInitResult{}, err
+// ensureLabels creates every definition the repository does not already have,
+// and reports what it did.
+//
+// This is the single label-creating path. There used to be two — bulk
+// provisioning and the per-apply check — and each grew the same overwrite
+// defect independently, which is why the same fix had to be written twice.
+// One implementation cannot diverge from itself.
+//
+// Create-only, always. Looper needs a label to exist; it has no claim on how a
+// maintainer has worded one that already does.
+//
+// The requested definitions are the authority. Listing is drift detection —
+// it exists only to skip creates that would fail anyway — so a failed list
+// must not block the caller: nothing is then known to exist, every create is
+// attempted, and one that loses to an existing label is tolerated exactly as a
+// lost race is.
+type ensureLabelsOptions struct {
+	dryRun bool
+	// requireListing makes a failed listing fatal. Tolerating one is only safe
+	// when creates follow: an attempted create corrects a wrong guess about
+	// what exists. A dry run performs none, so its entire output would be that
+	// guess presented as a plan.
+	requireListing bool
+	// stopOnFirstFailure abandons the remaining definitions once the caller's
+	// action is already known to fail. The apply paths want this: continuing
+	// to create labels that will never be applied leaves the repository
+	// changed for an action that did not happen.
+	stopOnFirstFailure bool
+}
+
+func (g *Gateway) ensureLabels(ctx context.Context, repo, cwd string, definitions []labels.Definition, opts ensureLabelsOptions) (LabelInitResult, error) {
+	result := LabelInitResult{Repo: repo, DryRun: opts.dryRun, Labels: make([]LabelInitItem, 0, len(definitions))}
+	if len(definitions) == 0 {
+		return result, nil
 	}
 
-	standard := labels.Standard()
-	result := LabelInitResult{Repo: repo, DryRun: input.DryRun, Labels: make([]LabelInitItem, 0, len(standard))}
-	for _, definition := range standard {
+	existing, listErr := g.listRepositoryLabels(ctx, repo, cwd)
+	if listErr != nil {
+		if opts.requireListing {
+			return LabelInitResult{}, listErr
+		}
+		existing = nil
+	}
+
+	var firstFailure error
+	for _, definition := range definitions {
 		item := LabelInitItem{Name: definition.Name, Color: definition.Color, Description: definition.Description}
-		// Create-only. A label already in the repository is left exactly as it
-		// is, including its color and description: provisioning exists so a
-		// managed repository has the vocabulary Looper needs, not so Looper
-		// owns how a maintainer has worded it. Editing here would silently
-		// rewrite curated labels on every registered project.
-		if _, exists := existing[strings.ToLower(definition.Name)]; exists {
+		if _, exists := existing[labels.Normalize(definition.Name)]; exists {
 			item.Status = "skipped"
 		} else {
 			item.Status = "created"
-			if !input.DryRun {
-				_, err = g.runGh(ctx, input.CWD, "", "label", "create", definition.Name, "--repo", repo, "--color", definition.Color, "--description", definition.Description)
+			if !opts.dryRun {
+				if _, createErr := g.runGh(ctx, cwd, "", "label", "create", definition.Name, "--repo", repo, "--color", definition.Color, "--description", definition.Description); createErr != nil {
+					if isLabelAlreadyExistsError(createErr) {
+						item.Status = "skipped"
+					} else {
+						item.Status = "failed"
+						item.Error = createErr.Error()
+						if firstFailure == nil {
+							firstFailure = fmt.Errorf("create label %s: %w", definition.Name, createErr)
+						}
+					}
+				}
 			}
-		}
-
-		if err != nil {
-			item.Status = "failed"
-			item.Error = err.Error()
-			err = nil
 		}
 		result.Labels = append(result.Labels, item)
 		incrementLabelSummary(&result.Summary, item.Status)
+		if firstFailure != nil && opts.stopOnFirstFailure {
+			break
+		}
 	}
 
-	if result.Summary.Failed > 0 {
-		return result, fmt.Errorf("%d label mutation(s) failed", result.Summary.Failed)
+	// Return the underlying failure rather than a count. A caller applying a
+	// label needs to know it hit a 403, not that one mutation failed; the
+	// per-item errors on the result still carry the rest.
+	if firstFailure != nil {
+		return result, firstFailure
 	}
 	return result, nil
 }
@@ -3384,18 +3434,32 @@ func (g *Gateway) getReviewThread(ctx context.Context, threadID, cwd string) (*r
 // and falls back to a neutral default for anything else — a project may
 // configure its own trigger labels, and those have no entry in the table.
 func (g *Gateway) ensureLabelsExist(ctx context.Context, repo string, wanted []string, cwd string) error {
+	definitions := make([]labels.Definition, 0, len(wanted))
 	seen := map[string]struct{}{}
 	for _, label := range wanted {
-		if _, ok := seen[label]; ok {
+		normalized := labels.Normalize(label)
+		if normalized == "" {
 			continue
 		}
-		seen[label] = struct{}{}
-		definition := labelPresentation(label)
-		if _, err := g.runGh(ctx, cwd, "", "label", "create", label, "--repo", repo, "--color", definition.Color, "--description", definition.Description, "--force"); err != nil {
-			return err
+		if _, duplicate := seen[normalized]; duplicate {
+			continue
 		}
+		seen[normalized] = struct{}{}
+		definitions = append(definitions, labelPresentation(label))
 	}
-	return nil
+	_, err := g.ensureLabels(ctx, repo, cwd, definitions, ensureLabelsOptions{stopOnFirstFailure: true})
+	return err
+}
+
+// isLabelAlreadyExistsError reports whether a `gh label create` failure is the
+// duplicate-label outcome real gh produces without --force. The label already
+// exists, so the caller can treat it as success rather than aborting a label
+// application that lost a create race.
+func isLabelAlreadyExistsError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "already exists")
 }
 
 // labelPresentation resolves the color and description to create a label with.

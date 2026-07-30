@@ -298,9 +298,14 @@ func (g *Gateway) CreateWorktree(ctx context.Context, input CreateWorktreeInput)
 		}
 	}
 
-	// Keep common build artifacts (e.g. .pnpm-store/, node_modules/) out of every
-	// loop commit via the worktree-local git exclude file. Best-effort.
-	g.applyWorktreeArtifactExcludes(ctx, worktreePath)
+	// Protect agent-authored git commands (agents run their own `git add -A`
+	// per the repo prompts) with a WORKTREE-SCOPED excludes file: the file and
+	// the config live in the worktree's private git dir, so the main checkout
+	// and sibling worktrees are untouched. Best-effort. Also removes the
+	// legacy managed block an earlier looper wrote into the shared
+	// .git/info/exclude.
+	g.applyWorktreeScopedArtifactExcludes(ctx, worktreePath)
+	g.removeLegacySharedArtifactExcludes(ctx, worktreePath)
 	// Any CreateWorktree claim invalidates prior fixer ownership so path equality
 	// alone cannot authorize dirty adopt after another runner used this directory.
 	// Fail the claim if the marker cannot be revoked — stale authority is worse
@@ -443,7 +448,6 @@ func (g *Gateway) RestoreWorktree(ctx context.Context, input RestoreWorktreeInpu
 					if err := g.repos.Worktrees.Upsert(ctx, restored); err != nil {
 						return nil, fmt.Errorf("upsert restored worktree record: %w", err)
 					}
-					g.applyWorktreeArtifactExcludes(ctx, restored.WorktreePath)
 					// Restoring for a new CreateWorktree claim drops prior fixer ownership.
 					if err := worktreesafety.ClearFixerOwnerToken(restored.WorktreePath); err != nil {
 						return nil, err
@@ -558,7 +562,6 @@ func (g *Gateway) RestoreWorktree(ctx context.Context, input RestoreWorktreeInpu
 		}
 	}
 
-	g.applyWorktreeArtifactExcludes(ctx, record.WorktreePath)
 	if err := worktreesafety.ClearFixerOwnerToken(record.WorktreePath); err != nil {
 		return nil, err
 	}
@@ -919,6 +922,12 @@ func (g *Gateway) Commit(ctx context.Context, input CommitInput) (CommitResult, 
 	if err := g.validateMutationWorktree(input.WorktreePath, input.RepoPath, input.WorktreeRoot); err != nil {
 		return CommitResult{}, err
 	}
+	// Ensure the worktree-scoped artifact excludes exist before staging
+	// (idempotent): worktrees created before this mechanism landed would
+	// otherwise stage untracked artifacts. The ignore layer has exactly
+	// gitignore semantics — tracked files, including intentionally tracked
+	// dist/ etc., always stage.
+	g.applyWorktreeScopedArtifactExcludes(ctx, input.WorktreePath)
 	if err := g.runGit(ctx, input.WorktreePath, nil, "add", "-A"); err != nil {
 		return CommitResult{}, err
 	}
@@ -1240,67 +1249,103 @@ var worktreeArtifactExcludePatterns = []string{
 
 const worktreeExcludeManagedHeader = "# looper: build-artifact excludes (managed; safe to remove)"
 
-// applyWorktreeArtifactExcludes appends looper's build-artifact ignore patterns
-// to the worktree's git exclude file (info/exclude). That file is local to this
-// clone and is never committed, so it cannot alter the repo's tracked files or
-// its .gitignore. The write is idempotent (patterns already present are skipped)
-// and best-effort: any failure is swallowed so it never blocks a loop worktree.
-func (g *Gateway) applyWorktreeArtifactExcludes(ctx context.Context, worktreePath string) {
+// applyWorktreeScopedArtifactExcludes writes looper's artifact patterns into
+// the worktree's PRIVATE git dir ($GIT_DIR/info/looper-exclude — per-worktree
+// for linked worktrees) and points worktree-scoped configuration at it via
+// extensions.worktreeConfig. Any git invocation inside this worktree — the
+// agent's own `git add -A` included — then ignores untracked artifacts, while
+// the main checkout and sibling worktrees see none of it.
+func (g *Gateway) applyWorktreeScopedArtifactExcludes(ctx context.Context, worktreePath string) {
 	if strings.TrimSpace(worktreePath) == "" {
 		return
 	}
-	result, err := g.runGitResult(ctx, worktreePath, nil, "rev-parse", "--git-path", "info/exclude")
+	result, err := g.runGitResult(ctx, worktreePath, nil, "rev-parse", "--git-dir")
 	if err != nil {
 		return
 	}
-	excludePath := strings.TrimSpace(result.Stdout)
-	if excludePath == "" {
+	gitDir := strings.TrimSpace(result.Stdout)
+	if gitDir == "" {
 		return
 	}
-	if !filepath.IsAbs(excludePath) {
-		excludePath = filepath.Join(worktreePath, excludePath)
+	if !filepath.IsAbs(gitDir) {
+		gitDir = filepath.Join(worktreePath, gitDir)
 	}
-
-	existing, err := os.ReadFile(excludePath)
-	if err != nil && !os.IsNotExist(err) {
-		return
-	}
-	existingText := string(existing)
-
-	missing := make([]string, 0, len(worktreeArtifactExcludePatterns))
-	for _, pattern := range worktreeArtifactExcludePatterns {
-		if !worktreeExcludeContainsPattern(existingText, pattern) {
-			missing = append(missing, pattern)
-		}
-	}
-	if len(missing) == 0 {
-		return
-	}
-
+	excludePath := filepath.Join(gitDir, "info", "looper-exclude")
 	if err := os.MkdirAll(filepath.Dir(excludePath), 0o755); err != nil {
 		return
 	}
 	var builder strings.Builder
-	builder.WriteString(existingText)
-	if existingText != "" && !strings.HasSuffix(existingText, "\n") {
-		builder.WriteByte('\n')
-	}
-	if !strings.Contains(existingText, worktreeExcludeManagedHeader) {
-		builder.WriteString(worktreeExcludeManagedHeader)
-		builder.WriteByte('\n')
-	}
-	for _, pattern := range missing {
+	builder.WriteString(worktreeExcludeManagedHeader)
+	builder.WriteByte('\n')
+	for _, pattern := range worktreeArtifactExcludePatterns {
 		builder.WriteString(pattern)
 		builder.WriteByte('\n')
 	}
-	_ = os.WriteFile(excludePath, []byte(builder.String()), 0o644)
+	if err := os.WriteFile(excludePath, []byte(builder.String()), 0o644); err != nil {
+		return
+	}
+	// extensions.worktreeConfig is additive and standard; without it,
+	// --worktree config would land in the shared config file.
+	if err := g.runGit(ctx, worktreePath, nil, "config", "extensions.worktreeConfig", "true"); err != nil {
+		return
+	}
+	_ = g.runGit(ctx, worktreePath, nil, "config", "--worktree", "core.excludesFile", excludePath)
 }
 
-// worktreeExcludeContainsPattern reports whether pattern already appears as its
-// own line in the exclude file (ignoring surrounding whitespace).
-func worktreeExcludeContainsPattern(content, pattern string) bool {
-	for _, line := range strings.Split(content, "\n") {
-		if strings.TrimSpace(line) == pattern {
+// removeLegacySharedArtifactExcludes strips the managed block an earlier
+// looper version appended to the repository's COMMON .git/info/exclude, which
+// leaked ignore policy to the main checkout and every sibling worktree (#71).
+// Only the managed header and looper's own patterns are removed; all other
+// content is preserved byte-for-byte. Best-effort.
+func (g *Gateway) removeLegacySharedArtifactExcludes(ctx context.Context, worktreePath string) {
+	result, err := g.runGitResult(ctx, worktreePath, nil, "rev-parse", "--git-common-dir")
+	if err != nil {
+		return
+	}
+	commonDir := strings.TrimSpace(result.Stdout)
+	if commonDir == "" {
+		return
+	}
+	if !filepath.IsAbs(commonDir) {
+		commonDir = filepath.Join(worktreePath, commonDir)
+	}
+	excludePath := filepath.Join(commonDir, "info", "exclude")
+	raw, err := os.ReadFile(excludePath)
+	if err != nil {
+		return
+	}
+	if !strings.Contains(string(raw), worktreeExcludeManagedHeader) {
+		return
+	}
+	managed := map[string]struct{}{worktreeExcludeManagedHeader: {}}
+	for _, pattern := range worktreeArtifactExcludePatterns {
+		managed[pattern] = struct{}{}
+	}
+	kept := make([]string, 0)
+	for _, line := range strings.Split(string(raw), "\n") {
+		if _, drop := managed[strings.TrimSpace(line)]; drop {
+			continue
+		}
+		kept = append(kept, line)
+	}
+	_ = os.WriteFile(excludePath, []byte(strings.Join(kept, "\n")), 0o644)
+}
+
+// isArtifactExcludedUntrackedPath reports whether an UNTRACKED status path
+// matches looper's artifact patterns. Only untracked entries are filtered —
+// tracked files under these paths keep appearing in status, exactly like a
+// gitignore would behave.
+func isArtifactExcludedUntrackedPath(path string) bool {
+	normalized := strings.TrimPrefix(filepath.ToSlash(strings.TrimSpace(path)), "./")
+	for _, pattern := range worktreeArtifactExcludePatterns {
+		if strings.HasSuffix(pattern, "/") {
+			name := strings.TrimSuffix(pattern, "/")
+			if normalized == name || strings.HasPrefix(normalized, name+"/") || strings.Contains(normalized, "/"+name+"/") {
+				return true
+			}
+			continue
+		}
+		if matched, _ := filepath.Match(pattern, filepath.Base(normalized)); matched {
 			return true
 		}
 	}
@@ -1368,7 +1413,13 @@ func (g *Gateway) readStatus(ctx context.Context, repoPath string) ([]statusEntr
 		if line[:2] == "!!" {
 			continue
 		}
-		entries = append(entries, statusEntry{Code: line[:2], Path: strings.TrimSpace(line[3:])})
+		code, path := line[:2], strings.TrimSpace(line[3:])
+		if code == "??" && isArtifactExcludedUntrackedPath(path) {
+			// Untracked build artifacts are invisible to looper's dirt
+			// decisions, mirroring the staging exclusion in Commit.
+			continue
+		}
+		entries = append(entries, statusEntry{Code: code, Path: path})
 	}
 	return entries, nil
 }

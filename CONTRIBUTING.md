@@ -107,22 +107,14 @@ func TestMain(m *testing.M) {
 
 Tests that assert `HOME`-derived default paths should clear `LOOPER_HOME` (`t.Setenv("LOOPER_HOME", "")`), the same way they clear `LOOPER_CONFIG`.
 
-Provider e2e coverage has two layers:
+Provider e2e coverage:
 
 ```bash
-go test ./internal/e2e/forgejocontract -count=1
-go test ./internal/e2e -run 'Forgejo|Smoke|FailsFast|GitHubSandboxRepoEnv' -count=1
+go test ./internal/e2e/githubcontract -count=1
+go test ./internal/e2e -run 'Smoke|FailsFast|GitHubSandboxRepoEnv' -count=1
 ```
 
-Live sandbox e2e is opt-in only and should use dedicated sandbox repositories. Forgejo live sandbox tests are local/manual for now:
-
-```bash
-LOOPER_E2E_FORGEJO=1 \
-LOOPER_E2E_FORGEJO_BASE_URL=https://code.example.com \
-LOOPER_E2E_FORGEJO_SANDBOX_REPO=owner/repo \
-LOOPER_E2E_FORGEJO_TOKEN=$TOKEN \
-go test ./internal/e2e -run '^TestForgejoSandbox' -count=1
-```
+Live sandbox e2e is opt-in only and should use dedicated sandbox repositories.
 
 For GitHub live sandbox tests, prefer `LOOPER_E2E_GITHUB_SANDBOX_REPO`; `LOOPER_E2E_SANDBOX_REPO` is still accepted as a legacy alias. Setting both to different repos is a test configuration error.
 

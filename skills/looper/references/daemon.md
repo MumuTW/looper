@@ -16,6 +16,14 @@ Foreground, unsupervised. Surviving logout/reboot is the operator's `launchd` / 
 
 Managed path `~/.looper/bin/looperd` may still exist from older installs; new installs place `looperd` wherever you put it on `PATH`.
 
+## Upgrading a running daemon
+
+Never build or copy over the binary a running `looperd` was launched from. The daemon keeps executing the image it already loaded, so nothing fails at that moment — but the build an operator chose has been replaced, and the next restart drops every in-flight agent run onto a binary nobody selected.
+
+`scripts/update-daemon.sh` is the supported path: it builds from a git ref and **stages** the result next to the installed binary. `--promote` installs it, and refuses while any process is executing the target. Stop the daemon first; restarting is always the operator's call because it interrupts in-flight runs.
+
+A daemon that detects the swap after the fact reports it: `looper status` prints a `binary:` line and the `daemon_binary_swapped` degraded reason, and the daemon logs `daemon executable changed underneath the running daemon`.
+
 ## Health
 
 ```bash
