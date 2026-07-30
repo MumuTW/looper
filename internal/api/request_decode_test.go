@@ -1,10 +1,11 @@
 package api
 
 import (
-	"bytes"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -133,6 +134,37 @@ func TestDecodeJSONMutationBodyContract(t *testing.T) {
 		}
 	})
 
+	t.Run("free-form metadata retains its key semantics", func(t *testing.T) {
+		var dst createLoopRequest
+		payload := `{"metadata":{"id":1,"ID":2,"":1,"":2}}`
+		if aerr := decodeJSONMutationBody(newRequest(payload), &dst, true); aerr != nil {
+			t.Fatalf("decode error = %v, want free-form metadata accepted", aerr)
+		}
+		if string(dst.Metadata) != `{"id":1,"ID":2,"":1,"":2}` {
+			t.Fatalf("metadata = %s, want original free-form object", dst.Metadata)
+		}
+	})
+
+	t.Run("large free-form metadata is accepted without field-by-field comparison", func(t *testing.T) {
+		const members = 40000
+		var body strings.Builder
+		body.Grow(members * 16)
+		body.WriteString(`{"metadata":{`)
+		for i := 0; i < members; i++ {
+			if i > 0 {
+				body.WriteByte(',')
+			}
+			body.WriteString(`"key`)
+			body.WriteString(strconv.Itoa(i))
+			body.WriteString(`":true`)
+		}
+		body.WriteString(`}}`)
+		var dst createLoopRequest
+		if aerr := decodeJSONMutationBody(newRequest(body.String()), &dst, true); aerr != nil {
+			t.Fatalf("decode error = %v, want large free-form metadata accepted", aerr)
+		}
+	})
+
 	t.Run("empty body required", func(t *testing.T) {
 		var dst decodeProbe
 		aerr := decodeJSONMutationBody(newRequest(""), &dst, true)
@@ -161,8 +193,6 @@ func TestDecodeJSONMutationBodyContract(t *testing.T) {
 }
 
 func TestServerBoundsRequestReadTime(t *testing.T) {
-	t.Parallel()
-
 	// The shared boundary bounds body size per request; the server bounds body
 	// read TIME. This pins the configuration so a stalled body cannot hold a
 	// goroutine indefinitely.
@@ -175,39 +205,31 @@ func TestServerBoundsRequestReadTime(t *testing.T) {
 		t.Fatalf("ReadHeaderTimeout = %v, want a positive bound", httpServer.ReadHeaderTimeout)
 	}
 
-	// Slow-body stall regression: a client that sends headers and a partial
-	// body then stalls must be terminated by the server's ReadTimeout.
-	httpServer.ReadTimeout = 100 * time.Millisecond
-	httpServer.ReadHeaderTimeout = 100 * time.Millisecond
+	bodyRead := make(chan error, 1)
+	timeoutServer := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, err := io.Copy(io.Discard, r.Body)
+		bodyRead <- err
+	}))
+	timeoutServer.Config = (&Server{handler: timeoutServer.Config.Handler}).newHTTPServer()
+	timeoutServer.Config.ReadTimeout = 100 * time.Millisecond
+	timeoutServer.Start()
+	defer timeoutServer.Close()
 
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	conn, err := net.Dial("tcp", timeoutServer.Listener.Addr().String())
 	if err != nil {
-		t.Fatalf("Listen error = %v", err)
-	}
-	defer listener.Close()
-
-	go func() { _ = httpServer.Serve(listener) }()
-	defer func() { _ = httpServer.Close() }()
-
-	conn, err := net.Dial("tcp", listener.Addr().String())
-	if err != nil {
-		t.Fatalf("Dial error = %v", err)
+		t.Fatalf("dial slow-body test server: %v", err)
 	}
 	defer conn.Close()
+	if _, err := io.WriteString(conn, "POST / HTTP/1.1\r\nHost: test\r\nContent-Length: 10\r\n\r\n{"); err != nil {
+		t.Fatalf("write partial request: %v", err)
+	}
 
-	// Write headers and partial body, then stall
-	_, _ = conn.Write([]byte("POST /api/v1/loops/retry HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 100\r\n\r\n{\"partial\":"))
-
-	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	buf := make([]byte, 1024)
-	n, readErr := conn.Read(buf)
-
-	// The server should terminate the stalled read. It may respond with
-	// 408/400/404 or simply close the connection (readErr != nil).
-	if readErr == nil && n > 0 &&
-		!bytes.Contains(buf[:n], []byte("408")) &&
-		!bytes.Contains(buf[:n], []byte("400")) &&
-		!bytes.Contains(buf[:n], []byte("404")) {
-		t.Fatalf("expected server to terminate stalled read, got output: %q", string(buf[:n]))
+	select {
+	case err := <-bodyRead:
+		if err == nil {
+			t.Fatal("slow body read completed without a timeout")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("server did not terminate a stalled body within the read timeout window")
 	}
 }
