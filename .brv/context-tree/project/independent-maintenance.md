@@ -9,7 +9,7 @@ As of 2026-07-29, `MumuTW/looper` is independently maintained. GitHub Releases u
 - `looper bootstrap`, `looper daemon install`, and `looper upgrade` must resolve artifacts from `MumuTW/looper`.
 - Install/takeover scripts, release manifests, feedback, disclosure links, skills, documentation, and GHCR examples default to `MumuTW`.
 - The Git `upstream` remote may remain for reference or selective cherry-picks; it does not control runtime artifact downloads.
-- Keep the Go module/import path `github.com/MumuTW/looper` until a separate, deliberate module-rename migration.
+- The deliberate Go module/import-path migration to `github.com/MumuTW/looper` completed in PR `MumuTW/looper#374`; historical external references remain historical evidence rather than current runtime defaults.
 - Continue recognizing and removing legacy `nexu-io` and `powerformer` disclosure stamps so existing PR content remains normalized.
 
 ## Implementation

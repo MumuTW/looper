@@ -517,16 +517,16 @@ without that process close-out.
 
 | Order | Issue | Title |
 |------:|-------|-------|
-| R1 | [#575](https://github.com/MumuTW/looper/issues/575) | Safety floor: one admission state + stop unsafe recovery PID action |
-| R2 | [#574](https://github.com/MumuTW/looper/issues/574) | Process containment handle with confirmed drain |
-| R3 | [#576](https://github.com/MumuTW/looper/issues/576) | Own all agent spawns at common executor boundary (stop-kill) |
-| R4 | [#577](https://github.com/MumuTW/looper/issues/577) | Migrate remaining daemon subprocesses onto containment |
-| R5 | [#578](https://github.com/MumuTW/looper/issues/578) | Execution persistence Authority + degrade on mid-life failure |
-| R6 | [#579](https://github.com/MumuTW/looper/issues/579) | Operation lease owns queue claims until durable finalize |
-| R7 | [#580](https://github.com/MumuTW/looper/issues/580) | Full non-mutating coverage when not-ready or degraded |
-| R8 | [#581](https://github.com/MumuTW/looper/issues/581) | Conservative startup recovery classification without PID Authority |
+| R1 | [#575](https://github.com/nexu-io/looper/issues/575) | Safety floor: one admission state + stop unsafe recovery PID action |
+| R2 | [#574](https://github.com/nexu-io/looper/issues/574) | Process containment handle with confirmed drain |
+| R3 | [#576](https://github.com/nexu-io/looper/issues/576) | Own all agent spawns at common executor boundary (stop-kill) |
+| R4 | [#577](https://github.com/nexu-io/looper/issues/577) | Migrate remaining daemon subprocesses onto containment |
+| R5 | [#578](https://github.com/nexu-io/looper/issues/578) | Execution persistence Authority + degrade on mid-life failure |
+| R6 | [#579](https://github.com/nexu-io/looper/issues/579) | Operation lease owns queue claims until durable finalize |
+| R7 | [#580](https://github.com/nexu-io/looper/issues/580) | Full non-mutating coverage when not-ready or degraded |
+| R8 | [#581](https://github.com/nexu-io/looper/issues/581) | Conservative startup recovery classification without PID Authority |
 
-Related: [#572](https://github.com/MumuTW/looper/issues/572) (retargeted by #576; keep draft).
+Related: [#572](https://github.com/nexu-io/looper/issues/572) (retargeted by #576; keep draft).
 
 ## Non-regression for this ADR
 
