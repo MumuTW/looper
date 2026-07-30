@@ -190,6 +190,14 @@ it just wrote. Verify externally.
 - `glm-5-2` free tier is an observation at capture time, not a durable
   promise (see `devin-cli-3000.3.22.md`); rerun
   `devin models list --format json` before relying on it.
+- **The free tier rate-limits by message count, on a rolling window.**
+  Observed as `Reached overall message rate limit ... resets in N minutes`
+  surfaced through the shim as a `session/prompt` permission error. Two
+  consequences worth knowing before you rely on this: Hermes's stock 3-retry
+  policy turns one rate-limited call into three, each burning another unit of
+  the same quota (the profile therefore sets `agent.api_max_retries: 1`), and
+  because the window is rolling, retrying while limited keeps renewing it —
+  back off and leave it alone rather than polling.
 - **This is not a supported integration.** Hermes's official provider docs
   define `HERMES_COPILOT_ACP_COMMAND`/`_ARGS` only as overrides pointing at
   the *Copilot CLI* binary and its arguments
