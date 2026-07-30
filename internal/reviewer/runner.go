@@ -35,6 +35,7 @@ import (
 	"github.com/nexu-io/looper/internal/reviewer/automerge"
 	"github.com/nexu-io/looper/internal/reviewer/criteria"
 	"github.com/nexu-io/looper/internal/reviewer/publish"
+	"github.com/nexu-io/looper/internal/reviewer/resolution"
 	"github.com/nexu-io/looper/internal/reviewer/workflow"
 	"github.com/nexu-io/looper/internal/storage"
 	"github.com/nexu-io/looper/internal/version"
@@ -294,27 +295,12 @@ type ListReviewThreadsInput struct {
 	Limit    int
 }
 
-type ReviewThread struct {
-	ID         string
-	IsResolved bool
-	Path       string
-	Line       int64
-	URL        string
-	Comments   []ReviewThreadComment
-}
+// ReviewThread and ReviewThreadComment alias the extracted resolution
+// authority's types; the thread-resolution decisions live in
+// internal/reviewer/resolution.
+type ReviewThread = resolution.Thread
 
-type ReviewThreadComment struct {
-	ID                string
-	Body              string
-	Author            string
-	CreatedAt         string
-	UpdatedAt         string
-	Path              string
-	Line              int64
-	OriginalCommitOID string
-	CommitOID         string
-	URL               string
-}
+type ReviewThreadComment = resolution.Comment
 
 type AddReviewThreadReplyInput struct {
 	Repo            string
@@ -2254,16 +2240,7 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (r
 	return checkpoint, nil
 }
 
-type threadResolutionAgentDecision struct {
-	ThreadID   string `json:"threadId"`
-	Decision   string `json:"decision"`
-	Evidence   string `json:"evidence"`
-	Confidence string `json:"confidence"`
-}
-
-type threadResolutionAgentOutput struct {
-	Decisions []threadResolutionAgentDecision `json:"decisions"`
-}
+type threadResolutionAgentDecision = resolution.Decision
 
 func (r *Runner) runThreadResolutionStep(ctx context.Context, input stepInput) (reviewerCheckpoint, error) {
 	checkpoint := input.Checkpoint
@@ -2305,7 +2282,7 @@ func (r *Runner) runThreadResolutionStep(ctx context.Context, input stepInput) (
 		if len(candidates) >= limit {
 			break
 		}
-		if r.threadResolutionCandidate(thread, checkpoint.Snapshot.HeadSHA, currentLogin, policy) {
+		if resolution.Candidate(thread, checkpoint.Snapshot.HeadSHA, currentLogin, policy) {
 			candidates = append(candidates, thread)
 		}
 	}
@@ -2328,11 +2305,11 @@ func (r *Runner) runThreadResolutionStep(ctx context.Context, input stepInput) (
 			decision = threadResolutionAgentDecision{ThreadID: thread.ID, Decision: "needs_human", Evidence: "no classifier decision returned", Confidence: "low"}
 		}
 		result.Processed++
-		auditedForHead := hasSufficientThreadResolutionAuditForDecision(policy, thread, checkpoint.Snapshot.HeadSHA, decision)
+		auditedForHead := resolution.HasSufficientAuditForDecision(policy, thread, checkpoint.Snapshot.HeadSHA, decision)
 		commented := false
 		resolved := false
 		skippedReason := ""
-		if !auditedForHead && r.threadResolutionShouldComment(policy, decision) {
+		if !auditedForHead && resolution.ShouldComment(policy, decision) {
 			latestThread, refreshedDetail, err := r.refreshThreadResolutionCandidate(ctx, input, checkpoint.Snapshot.HeadSHA, currentLogin, policy, thread.ID, fetchLimit)
 			if err != nil {
 				checkpoint = markThreadResolutionRediscoveryOnRefreshError(checkpoint, err)
@@ -2347,7 +2324,7 @@ func (r *Runner) runThreadResolutionStep(ctx context.Context, input stepInput) (
 				return checkpoint, &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
 			}
 			checkpoint.Detail.ReviewRequests = cloneStrings(refreshedDetail.ReviewRequests)
-			body := r.buildThreadResolutionReply(thread.ID, checkpoint.Snapshot.HeadSHA, decision, policy)
+			body := resolution.Reply(thread.ID, checkpoint.Snapshot.HeadSHA, decision, policy)
 			disclosureAgent, disclosureModel := r.disclosureIdentity(input.Run)
 			if err := r.github.AddReviewThreadReply(ctx, AddReviewThreadReplyInput{Repo: input.Repo, ThreadID: thread.ID, Body: body, CWD: input.Project.RepoPath, DisclosureAgent: disclosureAgent, DisclosureModel: disclosureModel}); err != nil {
 				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableTransient}
@@ -2355,7 +2332,7 @@ func (r *Runner) runThreadResolutionStep(ctx context.Context, input stepInput) (
 			result.Commented++
 			commented = true
 		}
-		if r.threadResolutionShouldResolve(policy, decision) {
+		if resolution.ShouldResolve(policy, decision) {
 			latestThread, refreshedDetail, err := r.refreshThreadResolutionCandidate(ctx, input, checkpoint.Snapshot.HeadSHA, currentLogin, policy, thread.ID, fetchLimit)
 			if err != nil {
 				checkpoint = markThreadResolutionRediscoveryOnRefreshError(checkpoint, err)
@@ -2369,7 +2346,7 @@ func (r *Runner) runThreadResolutionStep(ctx context.Context, input stepInput) (
 				return checkpoint, &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
 			}
 			checkpoint.Detail.ReviewRequests = cloneStrings(refreshedDetail.ReviewRequests)
-			if !hasObjectiveThreadResolutionAuditForHead(*latestThread, thread.ID, checkpoint.Snapshot.HeadSHA) && !commented {
+			if !resolution.HasObjectiveAuditForHead(*latestThread, thread.ID, checkpoint.Snapshot.HeadSHA) && !commented {
 				skippedReason = "missing_objective_audit_comment"
 				continue
 			}
@@ -2421,34 +2398,11 @@ func (r *Runner) hasThreadResolutionFollowUpCandidate(ctx context.Context, cwd, 
 		return false
 	}
 	for _, thread := range threads {
-		if r.threadResolutionCandidate(thread, headSHA, currentLogin, policy) {
+		if resolution.Candidate(thread, headSHA, currentLogin, policy) {
 			return true
 		}
 	}
 	return false
-}
-
-func (r *Runner) threadResolutionCandidate(thread ReviewThread, headSHA, currentLogin string, policy config.ReviewerThreadResolutionConfig) bool {
-	if thread.IsResolved || thread.ID == "" || len(thread.Comments) == 0 {
-		return false
-	}
-	first := thread.Comments[0]
-	if policy.Scope == config.ReviewerThreadResolutionScopeLooperAuthoredOnly && normalizeLogin(first.Author) != currentLogin {
-		return false
-	}
-	if policy.Scope == config.ReviewerThreadResolutionScopeLooperAuthoredOnly && !isLooperAuthoredThread(thread) {
-		return false
-	}
-	if policy.RequireNewHeadSinceThread && headSHA != "" {
-		threadSHA := latestThreadFeedbackCommitOID(thread)
-		if threadSHA == "" || threadSHA == headSHA {
-			return false
-		}
-	}
-	if policy.Mode != config.ReviewerThreadResolutionModeResolveObjective && hasThreadResolutionAuditForHead(thread, headSHA) {
-		return false
-	}
-	return true
 }
 
 func (r *Runner) refreshThreadResolutionCandidate(ctx context.Context, input stepInput, headSHA, currentLogin string, policy config.ReviewerThreadResolutionConfig, threadID string, limit int) (*ReviewThread, PullRequestDetail, error) {
@@ -2468,7 +2422,7 @@ func (r *Runner) refreshThreadResolutionCandidate(ctx context.Context, input ste
 	}
 	for i := range latest {
 		if latest[i].ID == threadID {
-			if !r.threadResolutionCandidate(latest[i], headSHA, currentLogin, policy) {
+			if !resolution.Candidate(latest[i], headSHA, currentLogin, policy) {
 				return nil, detail, nil
 			}
 			return &latest[i], detail, nil
@@ -2492,7 +2446,7 @@ func (r *Runner) classifyReviewThreads(ctx context.Context, input stepInput, che
 	}
 	slices.Sort(candidateIDs)
 	idempotencyKey := fmt.Sprintf("reviewer-thread-resolution:%s:%d:%s:%s", input.Repo, input.PRNumber, checkpoint.Snapshot.HeadSHA, strings.Join(candidateIDs, ","))
-	prompt := buildThreadResolutionPrompt(input.Repo, input.PRNumber, checkpoint.Snapshot.HeadSHA, threads)
+	prompt := resolution.Prompt(input.Repo, input.PRNumber, checkpoint.Snapshot.HeadSHA, threads)
 	if r.hasPendingNativeResume(ctx, input.Loop.ID) {
 		prompt = nativeResumeContinuationPrompt("thread-resolution", input.Repo, input.PRNumber, checkpoint.Snapshot.HeadSHA, idempotencyKey)
 	}
@@ -2527,7 +2481,7 @@ func (r *Runner) classifyReviewThreads(ctx context.Context, input stepInput, che
 		r.markAgentExecutionNativeResumePendingForTransientProvider(ctx, executionID, message)
 		return nil, &loopError{message: message, kind: FailureRetryableTransient}
 	}
-	parsed, err := parseThreadResolutionOutput(result.Stdout)
+	parsed, err := resolution.ParseOutput(result.Stdout)
 	if err == nil {
 		return parsed.Decisions, nil
 	}
@@ -2536,130 +2490,6 @@ func (r *Runner) classifyReviewThreads(ctx context.Context, input stepInput, che
 		return nil, &loopError{message: message, kind: FailureRetryableTransient}
 	}
 	return nil, &loopError{message: err.Error(), kind: FailureNonRetryable}
-}
-
-func buildThreadResolutionPrompt(repo string, prNumber int64, headSHA string, threads []ReviewThread) string {
-	payload, _ := json.MarshalIndent(map[string]any{"repo": repo, "prNumber": prNumber, "headSHA": headSHA, "threads": threads}, "", "  ")
-	return strings.TrimSpace(`You are running Looper's reviewer thread reconciliation phase.
-
-Inspect the current worktree and the unresolved pull request review threads in the JSON payload below. Classify whether each requested change is objectively addressed at the current head.
-
-Safety rules:
-- The current working directory is Looper's prepared reviewer worktree for this PR and is the canonical local checkout. Reuse it for git fetch, git checkout, diff inspection, and local verification. Do not run gh repo clone, git clone, or create any additional checkout for this PR's base or head repository unless the provided worktree is missing or unusable.
-- Return objectively_fixed only for concrete, verifiable code or documentation changes that are present in the worktree.
-- Return needs_human for subjective, product, design, security-sensitive, ambiguous, or partially addressed feedback.
-- Do not treat an author reply like "fixed" as evidence by itself.
-- Do not call GitHub APIs and do not post comments.
-
-Output only valid JSON in this exact shape:
-{"decisions":[{"threadId":"<id>","decision":"objectively_fixed|needs_human|not_fixed","evidence":"brief concrete evidence","confidence":"high|medium|low"}]}
-
-Payload:
-` + string(payload))
-}
-
-func parseThreadResolutionOutput(stdout string) (threadResolutionAgentOutput, error) {
-	trimmed := strings.TrimSpace(stdout)
-	start := strings.Index(trimmed, "{")
-	end := strings.LastIndex(trimmed, "}")
-	if start < 0 || end < start {
-		return threadResolutionAgentOutput{}, fmt.Errorf("thread resolution classifier did not return JSON")
-	}
-	var parsed threadResolutionAgentOutput
-	if err := json.Unmarshal([]byte(trimmed[start:end+1]), &parsed); err != nil {
-		return threadResolutionAgentOutput{}, fmt.Errorf("parse thread resolution classifier output: %w", err)
-	}
-	return parsed, nil
-}
-
-func (r *Runner) threadResolutionShouldComment(policy config.ReviewerThreadResolutionConfig, decision threadResolutionAgentDecision) bool {
-	switch policy.Mode {
-	case config.ReviewerThreadResolutionModeCommentOnly, config.ReviewerThreadResolutionModeSuggestResolution:
-		return true
-	case config.ReviewerThreadResolutionModeResolveObjective:
-		return policy.RequireAuditComment && isObjectiveThreadResolutionDecision(decision)
-	default:
-		return false
-	}
-}
-
-func (r *Runner) threadResolutionShouldResolve(policy config.ReviewerThreadResolutionConfig, decision threadResolutionAgentDecision) bool {
-	return policy.Mode == config.ReviewerThreadResolutionModeResolveObjective && policy.AutoResolve == config.ReviewerThreadResolutionAutoResolveObjectiveOnly && policy.RequireAuditComment && isObjectiveThreadResolutionDecision(decision)
-}
-
-func isObjectiveThreadResolutionDecision(decision threadResolutionAgentDecision) bool {
-	return strings.EqualFold(strings.TrimSpace(decision.Decision), "objectively_fixed") && strings.EqualFold(strings.TrimSpace(decision.Confidence), "high")
-}
-
-func (r *Runner) buildThreadResolutionReply(threadID, headSHA string, decision threadResolutionAgentDecision, policy config.ReviewerThreadResolutionConfig) string {
-	evidence := strings.TrimSpace(decision.Evidence)
-	if evidence == "" {
-		evidence = "the current head"
-	}
-	decisionValue := strings.ToLower(strings.TrimSpace(decision.Decision))
-	if decisionValue == "" {
-		decisionValue = "needs_human"
-	}
-	marker := fmt.Sprintf("<!-- looper:thread-resolution thread=%s head=%s decision=%s -->", threadID, headSHA, decisionValue)
-	if isObjectiveThreadResolutionDecision(decision) {
-		if policy.Mode == config.ReviewerThreadResolutionModeSuggestResolution {
-			return fmt.Sprintf("Looper checked this thread against head `%s`. The requested change appears objectively addressed by %s. Please resolve this thread if you agree.\n%s", headSHA, evidence, marker)
-		}
-		if policy.Mode == config.ReviewerThreadResolutionModeResolveObjective {
-			return fmt.Sprintf("Looper checked this thread against head `%s`. The requested change appears objectively addressed by %s, so I’m resolving this thread. Reopen if this still needs discussion.\n%s", headSHA, evidence, marker)
-		}
-		return fmt.Sprintf("Looper checked this thread against head `%s`. The requested change appears objectively addressed by %s.\n%s", headSHA, evidence, marker)
-	}
-	return fmt.Sprintf("Looper checked this thread against head `%s`. I could not verify that this thread is objectively resolved: %s.\n%s", headSHA, evidence, marker)
-}
-
-func hasThreadResolutionAuditForHead(thread ReviewThread, headSHA string) bool {
-	needle := "looper:thread-resolution"
-	headNeedle := "head=" + headSHA
-	for _, comment := range thread.Comments {
-		if strings.Contains(comment.Body, needle) && (headSHA == "" || strings.Contains(comment.Body, headNeedle)) {
-			return true
-		}
-	}
-	return false
-}
-
-func hasSufficientThreadResolutionAuditForDecision(policy config.ReviewerThreadResolutionConfig, thread ReviewThread, headSHA string, decision threadResolutionAgentDecision) bool {
-	if policy.Mode == config.ReviewerThreadResolutionModeResolveObjective && isObjectiveThreadResolutionDecision(decision) {
-		return hasObjectiveThreadResolutionAuditForHead(thread, thread.ID, headSHA)
-	}
-	return hasThreadResolutionAuditForHead(thread, headSHA)
-}
-
-func hasObjectiveThreadResolutionAuditForHead(thread ReviewThread, threadID, headSHA string) bool {
-	for _, comment := range thread.Comments {
-		body := comment.Body
-		if strings.Contains(body, "looper:thread-resolution") && strings.Contains(body, "thread="+threadID) && strings.Contains(body, "head="+headSHA) && strings.Contains(body, "decision=objectively_fixed") {
-			return true
-		}
-	}
-	return false
-}
-
-func isLooperAuthoredThread(thread ReviewThread) bool {
-	if len(thread.Comments) == 0 {
-		return false
-	}
-	body := thread.Comments[0].Body
-	return strings.Contains(body, "looper:stamp") || strings.Contains(body, "looper:review")
-}
-
-func latestThreadFeedbackCommitOID(thread ReviewThread) string {
-	for i := len(thread.Comments) - 1; i >= 0; i-- {
-		comment := thread.Comments[i]
-		if strings.Contains(comment.Body, "looper:thread-resolution") {
-			continue
-		}
-		if oid := firstNonEmpty(comment.CommitOID, comment.OriginalCommitOID); oid != "" {
-			return oid
-		}
-	}
-	return ""
 }
 
 type reviewerHeadChangeMonitor struct {
