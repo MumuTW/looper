@@ -570,6 +570,9 @@ func validatePlaneRoleCapabilities(roles RoleConfigs, prefix string, issues *[]V
 	if roles.Coordinator.Enabled {
 		*issues = append(*issues, ValidationIssue{Path: prefix + ".roles.coordinator.enabled", Message: "must be false for plane projects; coordinator requires GitHub issue authority"})
 	}
+	if roles.Reviewer.Behavior.PublishMode == ReviewerPublishModeSummaryComment {
+		*issues = append(*issues, ValidationIssue{Path: prefix + ".roles.reviewer.behavior.publishMode", Message: "summary_comment is supported only for forgejo projects"})
+	}
 }
 
 // ValidateForgejoRoleCapabilities rejects role settings that require GitHub-only

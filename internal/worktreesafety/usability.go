@@ -328,9 +328,9 @@ func ClearUnusableFixerWorktreePath(path string) error {
 	return fmt.Errorf("fixer worktree path %s is unusable and not empty; manual intervention required: %w", path, ErrUnusableFixerWorktreePreserved)
 }
 
-// onlyUnusableLocalGitMetadata is true when path holds nothing but a non-usable
-// .git file/dir (and optional nested empties under an ordinary .git dir). Any
-// other entry is treated as possible agent dirt and must be preserved.
+// onlyUnusableLocalGitMetadata is true when path's single entry is a non-usable
+// .git file/dir. Any additional entry is treated as possible agent dirt and
+// must be preserved.
 func onlyUnusableLocalGitMetadata(path string, entries []os.DirEntry) bool {
 	if len(entries) != 1 || entries[0].Name() != ".git" {
 		return false

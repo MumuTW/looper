@@ -575,8 +575,8 @@ func (s *Service) List(ctx context.Context) ([]storage.ProjectRecord, error) {
 	return active, nil
 }
 
-// ResumeRunningDiscoveries reschedules work whose persisted running state
-// outlived its process. The runtime calls this once after startup has
+// ResumeRunningDiscoveries reschedules work whose persisted pending or running
+// state outlived its process. The runtime calls this once after startup has
 // materialized the project catalog and installed its discovery lifecycle.
 func (s *Service) ResumeRunningDiscoveries(ctx context.Context) error {
 	if s == nil || s.Repos == nil || s.Repos.Projects == nil {
@@ -591,7 +591,7 @@ func (s *Service) ResumeRunningDiscoveries(ctx context.Context) error {
 			continue
 		}
 		discovery := DiscoveryStateFromRecord(record)
-		if discovery.Status == DiscoveryStatusRunning {
+		if discovery.Status == DiscoveryStatusRunning || discovery.Status == DiscoveryStatusPending {
 			s.scheduleDiscovery(DiscoverInput{ProjectID: record.ID, SnapshotMode: discovery.SnapshotMode})
 		}
 	}
@@ -1483,7 +1483,18 @@ func (s *Service) writeDiscoveryState(ctx context.Context, project *storage.Proj
 	if project == nil || s.Repos == nil || s.Repos.Projects == nil {
 		return fmt.Errorf("projects repository is not configured")
 	}
-	metadata := parseMetadata(project.MetadataJSON)
+	// DiscoverProject holds the keyed project-operation lock. Re-read the
+	// authoritative row before each whole-record upsert so metadata committed
+	// before the lock was acquired is not replaced by the caller's stale copy.
+	current, err := s.Repos.Projects.GetByID(context.Background(), project.ID)
+	if err != nil {
+		return err
+	}
+	if current == nil {
+		return ProjectNotFoundError{Identifier: project.ID}
+	}
+	*project = *current
+	metadata := parseMetadata(current.MetadataJSON)
 	metadata[registrationDiscoveryMetadataKey] = discoveryStateMap(discovery)
 	metadataJSON, err := buildAddProjectMetadataJSON(metadata)
 	if err != nil {

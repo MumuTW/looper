@@ -99,6 +99,28 @@ func TestResolverCWDSelectionIsAuthoritative(t *testing.T) {
 	}
 }
 
+func TestResolverForProjectFallsBackToExplicitGitHubKindWhenProviderIsInvalid(t *testing.T) {
+	t.Parallel()
+	cfg := config.Config{
+		Projects: []config.ProjectRefConfig{{ID: "project", Provider: "missing", Repo: "acme/repo"}},
+	}
+
+	selection := NewResolver(cfg).ForProject("project")
+	if !selection.Bound() || !selection.Capabilities().GitHubPullRequests || selection.UsesNativePullRequestAPI() {
+		t.Fatalf("selection = %#v, want bound explicit GitHub fallback", selection)
+	}
+}
+
+func TestResolverForLocationDoesNotMatchBlankRepository(t *testing.T) {
+	t.Parallel()
+	cfg := config.Config{Projects: []config.ProjectRefConfig{{ID: "unbound"}}}
+
+	selection, matched, err := NewResolver(cfg).ForLocation(" ", "")
+	if err != nil || matched || selection.Bound() {
+		t.Fatalf("ForLocation(blank) = (%#v, %v, %v), want no match", selection, matched, err)
+	}
+}
+
 func TestResolverDetachesCapturedConfig(t *testing.T) {
 	t.Parallel()
 

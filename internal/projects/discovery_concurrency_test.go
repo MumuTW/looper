@@ -150,6 +150,37 @@ func TestServiceSyncConfiguredKeepsDiscoveryStateWrittenWhileWaitingForProjectLo
 	}
 }
 
+func TestWriteDiscoveryStatePreservesCurrentProjectMetadata(t *testing.T) {
+	coordinator := openCoordinator(t)
+	repos := storage.NewRepositories(coordinator.DB())
+	oldMetadata := `{"source":"old"}`
+	currentMetadata := `{"source":"current","concurrent":"preserved"}`
+	nowISO := "2026-07-30T00:00:00.000Z"
+	project := storage.ProjectRecord{ID: "looper", MetadataJSON: &oldMetadata, CreatedAt: nowISO, UpdatedAt: nowISO}
+	current := project
+	current.MetadataJSON = &currentMetadata
+	current.UpdatedAt = "2026-07-30T01:00:00.000Z"
+	if err := repos.Projects.Upsert(context.Background(), current); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	service := &Service{Repos: repos}
+
+	if err := service.writeDiscoveryState(context.Background(), &project, DiscoveryState{Status: DiscoveryStatusSucceeded, UpdatedAt: "2026-07-30T02:00:00.000Z"}); err != nil {
+		t.Fatalf("writeDiscoveryState() error = %v", err)
+	}
+	stored, err := repos.Projects.GetByID(context.Background(), "looper")
+	if err != nil || stored == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v)", stored, err)
+	}
+	metadata := parseMetadata(stored.MetadataJSON)
+	if metadata["source"] != "current" || metadata["concurrent"] != "preserved" {
+		t.Fatalf("metadata = %#v, want current non-discovery fields preserved", metadata)
+	}
+	if got := DiscoveryStateFromRecord(*stored).Status; got != DiscoveryStatusSucceeded {
+		t.Fatalf("discovery status = %q, want succeeded", got)
+	}
+}
+
 type failSecondWorktreeUpsertQuerier struct {
 	db       *sql.DB
 	mu       sync.Mutex

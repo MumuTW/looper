@@ -104,7 +104,7 @@ func (resolver Resolver) ForProject(projectID string) Selection {
 			if err == nil {
 				return selection
 			}
-			return Selection{project: project, bound: true}
+			return Selection{project: project, kind: ProviderKindGitHub, bound: true}
 		}
 	}
 	return Selection{kind: ProviderKindGitHub}
@@ -158,6 +158,9 @@ func (resolver Resolver) ForLocation(repo, cwd string) (Selection, bool, error) 
 	}
 
 	repo = strings.TrimSpace(repo)
+	if repo == "" {
+		return Selection{}, false, nil
+	}
 	var matched *projectBinding
 	for _, project := range resolver.projects {
 		if !strings.EqualFold(strings.TrimSpace(project.repo), repo) {

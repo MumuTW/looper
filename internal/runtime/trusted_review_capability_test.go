@@ -212,6 +212,9 @@ func TestTrustedReviewCapabilityBacksOffTransientProbeFailure(t *testing.T) {
 	if count := logger.countMessage("reviewer publishing disabled: configured looper binary cannot serve `looper review submit`"); count != 1 {
 		t.Fatalf("verdict log count = %d, want 1 during the transient retry cooldown", count)
 	}
+	if _, _, known := trustedReviewCapabilityCached(looperPath); known {
+		t.Fatal("transient cached probe failure reported a known capability verdict")
+	}
 
 	time.Sleep(2 * trustedReviewCapabilityRetryDelay)
 	if got := resolveTrustedLooperCLIPath(cfg, logger); got != "" {

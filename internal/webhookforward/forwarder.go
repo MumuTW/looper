@@ -467,27 +467,25 @@ func (f *forwarder) enqueueLocked(projects []storage.ProjectRecord, routed route
 	candidates := make([]candidate, 0, len(projects))
 	newQueueEntries := 0
 	matched := 0
-	view := projectcatalog.OperationViewFromConfig(f.cfg)
+	var view projectcatalog.OperationView
 	if f.configSource != nil {
 		view = f.configSource.View()
+	} else {
+		view = projectcatalog.OperationViewFromConfig(f.cfg)
 	}
 	for _, project := range projects {
 		if project.Archived {
 			continue
 		}
-		projectView, configured := view.Project(project.ID)
-		if configured {
-			providerConfig := config.Config{Projects: []config.ProjectRefConfig{projectView.Project}}
-			if strings.TrimSpace(projectView.Project.Provider) != "" {
-				providerConfig.Providers = []config.ProviderConfig{projectView.Provider}
-			}
-			if forge.NewResolver(providerConfig).ForProject(project.ID).UsesNativePullRequestAPI() {
-				continue
-			}
-		}
 		repo := repoFromProjectMetadata(project.MetadataJSON)
 		if !strings.EqualFold(repo, routed.repo) {
 			continue
+		}
+		projectView, configured := view.Project(project.ID)
+		if configured {
+			if capabilities, ok := forge.StaticCapabilities(projectView.ProviderKind); ok && !capabilities.GitHubPullRequests {
+				continue
+			}
 		}
 		rolePolicy := view.RolePolicy(project.ID)
 		lanes := enabledLanesForProject(rolePolicy, routed.lanes)

@@ -1377,12 +1377,9 @@ func (h *Handler) buildStatusResponse(ctx context.Context) (statusResponse, erro
 	artifactName := looperdArtifactName(currentTarget)
 
 	reviewPublish := looperdruntime.ReviewPublishReadinessFor(h.context.Config)
-	outstanding, err := looperdruntime.CountOutstandingQuarantineDebt(ctx, services.Repositories)
-	if err != nil {
-		return statusResponse{}, err
-	}
+	outstanding, debtErr := looperdruntime.CountOutstandingQuarantineDebt(ctx, services.Repositories)
 	recovery := h.recoveryWithOutstanding(outstanding)
-	degradedReasons := statusDegradedReasons(reviewPublish, outstanding)
+	degradedReasons := statusDegradedReasons(reviewPublish, outstanding, debtErr)
 
 	return statusResponse{
 		Service: statusService{
@@ -1680,13 +1677,16 @@ func (h *Handler) recoveryWithOutstanding(outstanding looperdruntime.Outstanding
 	return normalized
 }
 
-func statusDegradedReasons(reviewPublish looperdruntime.ReviewPublishReadiness, outstanding looperdruntime.OutstandingQuarantineDebt) []string {
+func statusDegradedReasons(reviewPublish looperdruntime.ReviewPublishReadiness, outstanding looperdruntime.OutstandingQuarantineDebt, debtErr error) []string {
 	var reasons []string
 	if reviewPublish.Known && reviewPublish.PublishingDisabled {
 		reasons = append(reasons, "review_publish_disabled")
 	}
 	if outstanding.QuarantinedActiveExecutions > 0 || outstanding.QuarantinedRunningRuns > 0 {
 		reasons = append(reasons, "quarantine_orphan_debt")
+	}
+	if debtErr != nil {
+		reasons = append(reasons, "quarantine_debt_unavailable")
 	}
 	return reasons
 }

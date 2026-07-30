@@ -1052,9 +1052,20 @@ func TestStatusDegradedReasonsIncludesKnownDisabledPublishWithoutLooperPath(t *t
 	reasons := statusDegradedReasons(looperdruntime.ReviewPublishReadiness{
 		Known:              true,
 		PublishingDisabled: true,
-	}, looperdruntime.OutstandingQuarantineDebt{})
+	}, looperdruntime.OutstandingQuarantineDebt{}, nil)
 	if got := strings.Join(reasons, ","); got != "review_publish_disabled" {
 		t.Fatalf("statusDegradedReasons() = %q, want review_publish_disabled", got)
+	}
+}
+
+func TestStatusDegradedReasonsIncludesUnavailableQuarantineDebt(t *testing.T) {
+	reasons := statusDegradedReasons(
+		looperdruntime.ReviewPublishReadiness{},
+		looperdruntime.OutstandingQuarantineDebt{},
+		errors.New("sqlite temporarily unavailable"),
+	)
+	if got := strings.Join(reasons, ","); got != "quarantine_debt_unavailable" {
+		t.Fatalf("statusDegradedReasons() = %q, want quarantine_debt_unavailable", got)
 	}
 }
 

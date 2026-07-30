@@ -952,6 +952,12 @@ func writeStatusOpsLines(stdout io.Writer, status daemonStatusResponse) {
 				token = "ok"
 			}
 			_, _ = fmt.Fprintf(stdout, "review:   publish ready (%s)\n", token)
+		default:
+			reason := strings.TrimSpace(review.Reason)
+			if reason == "" {
+				reason = "capability reported not capable"
+			}
+			_, _ = fmt.Fprintf(stdout, "review:   publish not ready (%s)\n", singleLine(reason))
 		}
 	}
 

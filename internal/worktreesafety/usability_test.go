@@ -347,6 +347,10 @@ func TestLocalGitRepositoryMetadataUsable(t *testing.T) {
 func TestLocalGitRefNameUsableMatchesGitCheckRefFormat(t *testing.T) {
 	t.Parallel()
 
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available; differential check-ref-format test requires git")
+	}
+
 	refs := []string{
 		"refs/heads/main",
 		"refs/heads/feature/one",

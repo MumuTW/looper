@@ -279,6 +279,22 @@ func TestTeaTransportReportsBinaryMissingAfterStartup(t *testing.T) {
 	}
 }
 
+func TestTeaTransportDoesNotClassifyCommandOutputAsMissingBinary(t *testing.T) {
+	t.Parallel()
+	runner := &recordingTeaRunner{defaultAPI: &teaAPIResponse{Err: &shell.CommandExecutionError{
+		Message: "command failed: remote API says no such file",
+		Result:  shell.Result{ExitCode: 1, Stderr: "remote API says no such file"},
+		Err:     errors.New("exit status 1"),
+	}}}
+	transport := newTeaTransport("/usr/bin/fake-tea", "selected-login", nil, 5*time.Second, runner)
+
+	_, err := transport.doRaw(context.Background(), "GET", "/api/v1/version", nil, nil)
+	var teaErr *TeaAuthError
+	if errors.As(err, &teaErr) && teaErr.Code == TeaErrorMissing {
+		t.Fatalf("error = %v, command output must not be classified as a missing binary", err)
+	}
+}
+
 func TestListTeaLoginsAcceptsStringDefaultFromTea014(t *testing.T) {
 	// Homebrew tea 0.14.x emits "default":"true" (string), not a JSON bool.
 	// Regression: unmarshaling that form used to fail as tea_auth_failed.

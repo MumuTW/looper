@@ -514,6 +514,16 @@ func TestStatusReportsUnknownReviewPublishReadiness(t *testing.T) {
 	}
 }
 
+func TestStatusReportsKnownIncapableReviewPublishReadiness(t *testing.T) {
+	var stdout bytes.Buffer
+	writeStatusOpsLines(&stdout, daemonStatusResponse{Tools: statusToolsView{
+		ReviewPublish: &statusReviewPublishView{Known: true, Reason: "unsupported capability"},
+	}})
+	if got := stdout.String(); got != "review:   publish not ready (unsupported capability)\n" {
+		t.Fatalf("status output = %q, want known-incapable readiness line", got)
+	}
+}
+
 func TestStatusFailsWhenDaemonIsUnreachable(t *testing.T) {
 	daemon := newFakeDaemon(t)
 	address := daemon.server.URL

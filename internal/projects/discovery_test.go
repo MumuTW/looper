@@ -202,9 +202,11 @@ func TestServiceResumeRunningDiscoveriesReschedulesPersistedWork(t *testing.T) {
 	repos := storage.NewRepositories(coordinator.DB())
 	nowISO := "2026-07-30T00:00:00.000Z"
 	runningMetadata := `{"registrationDiscovery":{"status":"running","snapshotMode":"full"}}`
+	pendingMetadata := `{"registrationDiscovery":{"status":"pending","snapshotMode":"off"}}`
 	succeededMetadata := `{"registrationDiscovery":{"status":"succeeded","snapshotMode":"off"}}`
 	for _, record := range []storage.ProjectRecord{
 		{ID: "running", MetadataJSON: &runningMetadata, CreatedAt: nowISO, UpdatedAt: nowISO},
+		{ID: "pending", MetadataJSON: &pendingMetadata, CreatedAt: nowISO, UpdatedAt: nowISO},
 		{ID: "succeeded", MetadataJSON: &succeededMetadata, CreatedAt: nowISO, UpdatedAt: nowISO},
 		{ID: "archived", Archived: true, MetadataJSON: &runningMetadata, CreatedAt: nowISO, UpdatedAt: nowISO},
 	} {
@@ -224,8 +226,8 @@ func TestServiceResumeRunningDiscoveriesReschedulesPersistedWork(t *testing.T) {
 	if err := service.ResumeRunningDiscoveries(context.Background()); err != nil {
 		t.Fatalf("ResumeRunningDiscoveries() error = %v", err)
 	}
-	if scheduled != 1 {
-		t.Fatalf("scheduled = %d, want only persisted running discovery", scheduled)
+	if scheduled != 2 {
+		t.Fatalf("scheduled = %d, want persisted pending and running discoveries", scheduled)
 	}
 	stored, err := repos.Projects.GetByID(context.Background(), "running")
 	if err != nil || stored == nil {

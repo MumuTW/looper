@@ -289,16 +289,19 @@ func (t *teaTransport) doRaw(ctx context.Context, method string, path string, qu
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return rawResponse{}, err
 		}
-		if isCommandNotFound(err) {
-			return rawResponse{}, &TeaAuthError{Code: TeaErrorMissing, Message: "tea CLI not found"}
-		}
 		var execErr *shell.CommandExecutionError
 		if errors.As(err, &execErr) {
+			if isCommandNotFound(errors.Unwrap(execErr)) {
+				return rawResponse{}, &TeaAuthError{Code: TeaErrorMissing, Message: "tea CLI not found"}
+			}
 			if strings.Contains(strings.ToLower(execErr.Message), "timed out") {
 				return rawResponse{}, fmt.Errorf("forgejo tea API %s %s timed out", method, path)
 			}
 			result = execErr.Result
 		} else {
+			if isCommandNotFound(err) {
+				return rawResponse{}, &TeaAuthError{Code: TeaErrorMissing, Message: "tea CLI not found"}
+			}
 			return rawResponse{}, fmt.Errorf("forgejo tea API %s %s failed: %w", method, path, err)
 		}
 	}
