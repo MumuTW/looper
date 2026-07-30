@@ -38,13 +38,32 @@ func TestUpgradePreflightReadsCurrentDaemonAndTargetPair(t *testing.T) {
 			if err := json.Unmarshal(stdout.Bytes(), &report); err != nil {
 				t.Fatalf("decode report: %v\n%s", err, stdout.String())
 			}
-			if !report.CurrentPairMatches || report.TargetPairMatches != test.wantPairMatches || !report.TargetIdentityValid || report.Relationship != test.wantRelation {
+			if !report.CurrentPairMatches || report.TargetPairMatches != test.wantPairMatches || !report.TargetIdentityValid || !report.TargetConfigCompatible || report.Relationship != test.wantRelation {
 				t.Fatalf("report = %#v", report)
 			}
 			if report.Current.Status.Storage.SchemaVersion != "0021" || report.Current.Status.Scheduler.ActiveRuns != 2 || report.Current.Status.Service.Recovery.Outstanding.QuarantinedActiveExecutions != 1 {
 				t.Fatalf("current status missing from report: %#v", report.Current.Status)
 			}
 		})
+	}
+}
+
+func TestUpgradePreflightReportsTargetConfigFailure(t *testing.T) {
+	current := version.Current()
+	server := upgradeTestDaemon(t, current)
+	configForDaemon(t, server.URL)
+	looper := writeIdentityProgram(t, current)
+	looperd := writeConfigRejectingIdentityProgram(t, current)
+	stdout := &bytes.Buffer{}
+	if err := runUpgrade(context.Background(), nil, []string{"preflight", "--target-looper", looper, "--target-looperd", looperd, "--json"}, stdout); err != nil {
+		t.Fatalf("runUpgrade() error = %v", err)
+	}
+	var report upgradePreflight
+	if err := json.Unmarshal(stdout.Bytes(), &report); err != nil {
+		t.Fatal(err)
+	}
+	if report.TargetConfigCompatible || report.TargetConfigError != "configuration schema rejected" {
+		t.Fatalf("config result = (%v, %q)", report.TargetConfigCompatible, report.TargetConfigError)
 	}
 }
 
@@ -80,6 +99,20 @@ func writeIdentityProgram(t *testing.T, identity version.Info) string {
 	}
 	path := filepath.Join(t.TempDir(), "identity")
 	if err := os.WriteFile(path, append([]byte("#!/bin/sh\nprintf '%s\\n' '"), append(encoded, []byte("'\n")...)...), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func writeConfigRejectingIdentityProgram(t *testing.T, identity version.Info) string {
+	t.Helper()
+	encoded, err := json.Marshal(identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "identity")
+	body := "#!/bin/sh\nif [ \"$1\" = \"--check-config\" ]; then echo configuration schema rejected >&2; exit 1; fi\nprintf '%s\\n' '" + string(encoded) + "'\n"
+	if err := os.WriteFile(path, []byte(body), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	return path
