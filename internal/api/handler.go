@@ -26,6 +26,7 @@ import (
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/eventlog"
+	"github.com/nexu-io/looper/internal/fixer"
 	"github.com/nexu-io/looper/internal/forge"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/shell"
@@ -1881,19 +1882,20 @@ type runsListResponse struct {
 }
 
 type runResponse struct {
-	ID                string  `json:"id"`
-	LoopID            string  `json:"loopId"`
-	Status            string  `json:"status"`
-	CurrentStep       *string `json:"currentStep"`
-	LastCompletedStep *string `json:"lastCompletedStep"`
-	CheckpointJSON    *string `json:"checkpointJson"`
-	Summary           *string `json:"summary"`
-	ErrorMessage      *string `json:"errorMessage"`
-	StartedAt         string  `json:"startedAt"`
-	LastHeartbeatAt   *string `json:"lastHeartbeatAt"`
-	EndedAt           *string `json:"endedAt"`
-	CreatedAt         string  `json:"createdAt"`
-	UpdatedAt         string  `json:"updatedAt"`
+	ID                string                 `json:"id"`
+	LoopID            string                 `json:"loopId"`
+	Status            string                 `json:"status"`
+	CurrentStep       *string                `json:"currentStep"`
+	LastCompletedStep *string                `json:"lastCompletedStep"`
+	CheckpointJSON    *string                `json:"checkpointJson"`
+	Outcome           *fixer.FixerRunOutcome `json:"outcome,omitempty"`
+	Summary           *string                `json:"summary"`
+	ErrorMessage      *string                `json:"errorMessage"`
+	StartedAt         string                 `json:"startedAt"`
+	LastHeartbeatAt   *string                `json:"lastHeartbeatAt"`
+	EndedAt           *string                `json:"endedAt"`
+	CreatedAt         string                 `json:"createdAt"`
+	UpdatedAt         string                 `json:"updatedAt"`
 }
 
 type activeRunsListResponse struct {
@@ -6283,6 +6285,7 @@ func serializeRun(run storage.RunRecord) runResponse {
 		CurrentStep:       run.CurrentStep,
 		LastCompletedStep: run.LastCompletedStep,
 		CheckpointJSON:    run.CheckpointJSON,
+		Outcome:           fixer.DeriveRunOutcome(run),
 		Summary:           run.Summary,
 		ErrorMessage:      run.ErrorMessage,
 		StartedAt:         run.StartedAt,

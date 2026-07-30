@@ -48,6 +48,7 @@ const (
 	stepPush                  FixerStep = "push"
 	stepResolveComments       FixerStep = "resolve-comments"
 	stepRecheck               FixerStep = "recheck"
+	stepCleanupWorktree       FixerStep = "cleanup-worktree"
 	NativeReviewCommentSource           = "forgejo_review_comment"
 )
 
@@ -648,29 +649,29 @@ type ProcessResult struct {
 	Status      string
 	Summary     string
 	FailureKind QueueFailureKind
-	Outcome     *fixerRunOutcome
+	Outcome     *FixerRunOutcome
 }
 
-// fixerRunOutcome is checkpoint-only presentation data.  It deliberately
-// derives from existing checkpoints, so old raw run records stay untouched.
+// FixerRunOutcome is read-time presentation data derived from durable fixer
+// checkpoints. Old raw run records stay untouched.
 // The first failure is the authority for a failed run; later cleanup failures
 // are retained as secondary issues instead of replacing it.
-type fixerRunOutcome struct {
-	PrimaryFailure    *fixerOutcomeFailure  `json:"primaryFailure,omitempty"`
-	SecondaryIssues   []fixerOutcomeFailure `json:"secondaryIssues,omitempty"`
-	Progress          fixerDurableProgress  `json:"progress,omitempty"`
+type FixerRunOutcome struct {
+	PrimaryFailure    *FixerOutcomeFailure  `json:"primaryFailure,omitempty"`
+	SecondaryIssues   []FixerOutcomeFailure `json:"secondaryIssues,omitempty"`
+	Progress          FixerDurableProgress  `json:"progress"`
 	FollowUpThreadIDs []string              `json:"followUpThreadIds,omitempty"`
 	PartialSuccess    bool                  `json:"partialSuccess,omitempty"`
 }
 
-type fixerOutcomeFailure struct {
+type FixerOutcomeFailure struct {
 	Step      string           `json:"step,omitempty"`
 	Message   string           `json:"message,omitempty"`
 	Retryable bool             `json:"retryable"`
 	Kind      QueueFailureKind `json:"kind,omitempty"`
 }
 
-type fixerDurableProgress struct {
+type FixerDurableProgress struct {
 	CommitProduced  bool `json:"commitProduced,omitempty"`
 	Pushed          bool `json:"pushed,omitempty"`
 	RepliesSent     int  `json:"repliesSent,omitempty"`
@@ -682,6 +683,7 @@ type replyAction string
 const (
 	replyActionFixed    replyAction = "fixed"
 	replyActionDeclined replyAction = "declined"
+	replyActionDeferred replyAction = "deferred"
 )
 
 type fixerFollowupReason string
@@ -775,7 +777,7 @@ type fixerCheckpoint struct {
 	ResolvedComments *checkpointResolvedComments `json:"resolvedComments,omitempty"`
 	SummaryComment   *checkpointSummaryComment   `json:"summaryComment,omitempty"`
 	Recheck          *checkpointRecheck          `json:"recheck,omitempty"`
-	Outcome          *fixerRunOutcome            `json:"outcome,omitempty"`
+	Outcome          *FixerRunOutcome            `json:"outcome,omitempty"`
 	SkipReason       string                      `json:"skipReason,omitempty"`
 }
 
@@ -1021,46 +1023,43 @@ func validateCompletedRepairCheckpoint(repair *checkpointRepair) error {
 }
 
 // fixerRepairTaskBlocked distinguishes a process that exited normally from a
-// repair that could not be attempted. Older agents only supplied a summary,
-// so keep that narrowly-scoped compatibility path while new agents use the
-// structured outcome.
+// repair that could not be attempted. Only the agent's structured completion
+// payload is authoritative; free-form summaries and stderr are diagnostic text.
 func fixerRepairTaskBlocked(result AgentResult) (bool, string, QueueFailureKind) {
 	payload := extractCompletionMarkerPayload(result.Stdout + "\n" + result.Stderr)
-	if payload != "" {
-		var parsed struct {
-			Outcome string `json:"outcome"`
-			Summary string `json:"summary"`
-		}
-		if json.Unmarshal([]byte(payload), &parsed) == nil {
-			switch strings.ToLower(strings.TrimSpace(parsed.Outcome)) {
-			case "blocked", "blocking", "failed", "failure":
-				message := firstNonEmpty(strings.TrimSpace(parsed.Summary), result.Summary, "fixer repair task was blocked")
-				return true, message, fixerBlockedFailureKind(message)
-			}
-		}
+	if payload == "" {
+		return false, "", ""
 	}
-	message := strings.ToLower(strings.TrimSpace(firstNonEmpty(result.Summary, result.Stderr)))
-	if strings.Contains(message, "blocked before editing") ||
-		(strings.Contains(message, "could not") && (strings.Contains(message, "github") || strings.Contains(message, "gh ") || strings.Contains(message, "auth") || strings.Contains(message, "rate limit") || strings.Contains(message, "usage limit"))) {
-		blockedMessage := firstNonEmpty(result.Summary, result.Stderr, "fixer repair task was blocked")
-		return true, blockedMessage, fixerBlockedFailureKind(blockedMessage)
+	var parsed struct {
+		Outcome     string `json:"outcome"`
+		Summary     string `json:"summary"`
+		FailureKind string `json:"failure_kind"`
 	}
-	return false, "", ""
+	if json.Unmarshal([]byte(payload), &parsed) != nil || strings.ToLower(strings.TrimSpace(parsed.Outcome)) != "blocked" {
+		return false, "", ""
+	}
+	message := firstNonEmpty(strings.TrimSpace(parsed.Summary), result.Summary, "fixer repair task was blocked")
+	return true, message, fixerBlockedFailureKind(parsed.FailureKind)
 }
 
-func fixerBlockedFailureKind(message string) QueueFailureKind {
-	message = strings.ToLower(message)
-	if strings.Contains(message, "authentication") || strings.Contains(message, "unauthorized") || strings.Contains(message, "forbidden") || strings.Contains(message, "token") || strings.Contains(message, "usage limit") {
+func fixerBlockedFailureKind(raw string) QueueFailureKind {
+	switch QueueFailureKind(strings.ToLower(strings.TrimSpace(raw))) {
+	case FailureManualIntervention:
 		return FailureManualIntervention
+	case FailureRetryableAfterResume:
+		return FailureRetryableAfterResume
+	case FailureRetryableTransient:
+		return FailureRetryableTransient
+	default:
+		return FailureRetryableTransient
 	}
-	return FailureRetryableTransient
 }
 
 func (checkpoint *fixerCheckpoint) recordFailure(step FixerStep, failure *loopError) {
 	if checkpoint.Outcome == nil {
-		checkpoint.Outcome = &fixerRunOutcome{}
+		checkpoint.Outcome = &FixerRunOutcome{}
 	}
-	next := fixerOutcomeFailure{Step: string(step), Message: failure.message, Kind: failure.kind, Retryable: isQueueRetryEligible(failure.kind)}
+	next := FixerOutcomeFailure{Step: string(step), Message: failure.message, Kind: failure.kind, Retryable: isQueueRetryEligible(failure.kind)}
 	if checkpoint.Outcome.PrimaryFailure == nil {
 		checkpoint.Outcome.PrimaryFailure = &next
 		return
@@ -1070,9 +1069,9 @@ func (checkpoint *fixerCheckpoint) recordFailure(step FixerStep, failure *loopEr
 
 func (checkpoint *fixerCheckpoint) refreshOutcomeProgress() {
 	if checkpoint.Outcome == nil {
-		checkpoint.Outcome = &fixerRunOutcome{}
+		checkpoint.Outcome = &FixerRunOutcome{}
 	}
-	progress := fixerDurableProgress{}
+	progress := FixerDurableProgress{}
 	if checkpoint.ReconcileCommits != nil {
 		progress.CommitProduced = len(checkpoint.ReconcileCommits.NewCommitSHAs) > 0
 	}
@@ -1084,13 +1083,61 @@ func (checkpoint *fixerCheckpoint) refreshOutcomeProgress() {
 			if item.ReplyState == "sent" {
 				progress.RepliesSent++
 			}
-			if item.Status == "resolved" || item.Status == "already_resolved" || item.Status == "agent_declined" {
+			if item.Status == "resolved" || item.Status == "agent_declined" {
 				progress.ThreadsResolved++
 			}
 		}
 	}
 	checkpoint.Outcome.Progress = progress
 	checkpoint.Outcome.PartialSuccess = checkpoint.Outcome.PrimaryFailure != nil && (progress.CommitProduced || progress.Pushed || progress.RepliesSent > 0 || progress.ThreadsResolved > 0)
+}
+
+// DeriveRunOutcome projects both current and pre-outcome fixer checkpoints into
+// the API presentation contract without rewriting durable run history.
+func DeriveRunOutcome(run storage.RunRecord) *FixerRunOutcome {
+	if run.CheckpointJSON == nil || strings.TrimSpace(*run.CheckpointJSON) == "" {
+		return nil
+	}
+	var raw map[string]json.RawMessage
+	if json.Unmarshal([]byte(*run.CheckpointJSON), &raw) != nil || !looksLikeFixerCheckpoint(raw) {
+		return nil
+	}
+	var checkpoint fixerCheckpoint
+	if json.Unmarshal([]byte(*run.CheckpointJSON), &checkpoint) != nil {
+		return nil
+	}
+	if checkpoint.Outcome == nil && runStatusIsFailure(run.Status) {
+		step := asFixerStep(derefString(run.CurrentStep))
+		if step == "" {
+			step = asFixerStep(derefString(run.LastCompletedStep))
+		}
+		kind := FailureRetryableTransient
+		if checkpoint.ResumePolicy == loops.ResumePolicyManualIntervention {
+			kind = FailureManualIntervention
+		}
+		message := firstNonEmpty(derefString(run.ErrorMessage), derefString(run.Summary), "fixer run failed")
+		checkpoint.recordFailure(step, &loopError{message: message, kind: kind})
+	}
+	checkpoint.refreshOutcomeProgress()
+	return checkpoint.Outcome
+}
+
+func looksLikeFixerCheckpoint(raw map[string]json.RawMessage) bool {
+	for _, key := range []string{"fixItems", "repair", "reconcileCommits", "resolvedComments", "summaryComment"} {
+		if _, ok := raw[key]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func runStatusIsFailure(status string) bool {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "failed", "interrupted", "parse_failed":
+		return true
+	default:
+		return false
+	}
 }
 
 func newFollowupThreadIDs(snapshot, live []FixItem) []string {
@@ -1239,6 +1286,8 @@ func normalizeReplyAction(raw string) string {
 		return string(replyActionFixed)
 	case replyActionDeclined:
 		return string(replyActionDeclined)
+	case replyActionDeferred:
+		return string(replyActionDeferred)
 	default:
 		return ""
 	}
@@ -2069,6 +2118,10 @@ func (r *Runner) recoverClaimedItem(ctx context.Context, queueItem storage.Queue
 		}
 	}
 	recoveredRunTerminal := runFailure != nil && failedQueue != nil && failedQueue.Status == "manual_intervention"
+	var outcome *FixerRunOutcome
+	if runFailure != nil {
+		outcome = runFailure.checkpoint.Outcome
+	}
 	if queueItem.LoopID != nil && queueItem.Repo != nil && queueItem.PRNumber != nil && (queueResultIsTerminalForCleanup(failedQueue) || recoveredRunTerminal) {
 		loop, err := r.repos.Loops.GetByID(ctx, *queueItem.LoopID)
 		if err != nil {
@@ -2082,15 +2135,15 @@ func (r *Runner) recoverClaimedItem(ctx context.Context, queueItem storage.Queue
 				}
 				if project != nil {
 					if breakerStreak > 0 && breakerPause != nil {
-						resumed, resumeErr := r.finishFailureStreakBreaker(ctx, *project, *breakerPause, queueItem, &runFailure.checkpoint)
+						resumed, resumeErr := r.finishFailureStreakBreakerForRun(ctx, *project, *breakerPause, queueItem, runFailure.runID, &runFailure.checkpoint)
 						if resumeErr != nil {
 							return nil, resumeErr
 						}
 						if resumed {
-							return &ProcessResult{LoopID: derefString(queueItem.LoopID), QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
+							return &ProcessResult{LoopID: derefString(queueItem.LoopID), QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind, Outcome: outcome}, nil
 						}
 					} else {
-						r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &runFailure.checkpoint)
+						r.recordFailedRunCleanup(context.Background(), *project, runFailure.runID, &runFailure.checkpoint)
 					}
 				}
 			}
@@ -2099,7 +2152,7 @@ func (r *Runner) recoverClaimedItem(ctx context.Context, queueItem storage.Queue
 			}
 		}
 	}
-	return &ProcessResult{LoopID: derefString(queueItem.LoopID), QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
+	return &ProcessResult{LoopID: derefString(queueItem.LoopID), QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind, Outcome: outcome}, nil
 }
 
 func (r *Runner) reconcileRecoveredLoop(ctx context.Context, queueItem storage.QueueItemRecord, failedQueue *storage.QueueItemRecord) (*storage.LoopRecord, error) {
@@ -2211,6 +2264,11 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		}
 		failure := r.classifyFailure(retErr)
 		latest := r.getLatestCheckpoint(context.Background(), run, checkpoint)
+		failedStep := asFixerStep(derefString(persisted.CurrentStep))
+		if failedStep == "" {
+			failedStep = resumedRun.StartStep
+		}
+		latest.recordFailure(failedStep, failure)
 		latest.ResumePolicy = loops.NormalizeResumePolicy(string(failure.kind), latest.ResumePolicy)
 		completed, err := r.completeRun(context.Background(), *persisted, "failed", failure.message, failure.message, latest)
 		if err != nil {
@@ -2218,10 +2276,6 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			return
 		}
 		run = completed
-		failedStep := asFixerStep(derefString(completed.CurrentStep))
-		if failedStep == "" {
-			failedStep = resumedRun.StartStep
-		}
 		retErr = &claimedRunFailureError{cause: retErr, runID: completed.ID, checkpoint: latest, step: failedStep}
 	}()
 	claimedLockKey := ""
@@ -2264,6 +2318,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	if err := validateFixerResumeCheckpoint(resumedRun.StartStep, checkpoint); err != nil {
 		failure := r.classifyFailure(err)
 		latest := r.getLatestCheckpoint(ctx, run, checkpoint)
+		latest.recordFailure(resumedRun.StartStep, failure)
 		latest.ResumePolicy = loops.NormalizeResumePolicy(string(failure.kind), latest.ResumePolicy)
 		if _, err := r.completeRun(ctx, run, "failed", failure.message, failure.message, latest); err != nil {
 			return ProcessResult{}, err
@@ -2288,23 +2343,23 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		}
 		if breakerStreak > 0 {
 			r.appendFailureStreakPausedEvent(ctx, pausedLoop, run.ID, latest, breakerStreak)
-			if _, err := r.finishFailureStreakBreaker(ctx, *project, pausedLoop, queueItem, &latest); err != nil {
+			if _, err := r.finishFailureStreakBreakerForRun(ctx, *project, pausedLoop, queueItem, run.ID, &latest); err != nil {
 				return ProcessResult{}, err
 			}
-			return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
+			return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind, Outcome: latest.Outcome}, nil
 		}
 		if queueResultIsTerminalForCleanup(failedQueue) {
 			if scheduled, err := r.schedulePendingRediscoveryAfterRun(ctx, *loop, *queueItem.Repo, *queueItem.PRNumber); err != nil {
 				return ProcessResult{}, err
 			} else if scheduled {
-				r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &latest)
+				r.recordFailedRunCleanup(context.Background(), *project, run.ID, &latest)
 				return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind, Outcome: latest.Outcome}, nil
 			}
 		}
 		if queueResultIsTerminalForCleanup(failedQueue) {
-			r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &latest)
+			r.recordFailedRunCleanup(context.Background(), *project, run.ID, &latest)
 		}
-		return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
+		return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind, Outcome: latest.Outcome}, nil
 	}
 	checkpoint.RunPreStartAt = r.nowISO()
 	checkpoint.RunPreStartRunID = run.ID
@@ -2379,10 +2434,11 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	r.logInfo("fixer loop started", map[string]any{"projectId": project.ID, "loopId": loop.ID, "runId": run.ID, "queueItemId": queueItem.ID, "currentStep": string(resumedRun.StartStep), "resumed": resumedRun.Resumed})
 	r.logInfo("fixer run started", map[string]any{"projectId": project.ID, "loopId": loop.ID, "runId": run.ID, "queueItemId": queueItem.ID, "currentStep": string(resumedRun.StartStep)})
 	for _, step := range stepsFrom(resumedRun.StartStep) {
-		run, err = r.persistStepStarted(ctx, run, step, checkpoint)
+		startedRun, err := r.persistStepStarted(ctx, run, step, checkpoint)
 		if err != nil {
 			return ProcessResult{}, err
 		}
+		run = startedRun
 		r.appendEvent(ctx, eventInput{eventType: "loop.step.started", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"step": string(step)}})
 		r.logInfo("fixer step started", map[string]any{"projectId": project.ID, "loopId": loop.ID, "runId": run.ID, "queueItemId": queueItem.ID, "currentStep": string(step)})
 		checkpoint, err = r.executeStep(ctx, step, stepInput{Project: *project, Loop: *loop, Run: run, QueueItem: queueItem, Repo: *queueItem.Repo, PRNumber: *queueItem.PRNumber, Checkpoint: checkpoint})
@@ -2429,21 +2485,21 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			}
 			if breakerStreak > 0 {
 				r.appendFailureStreakPausedEvent(ctx, pausedLoop, run.ID, latest, breakerStreak)
-				if _, err := r.finishFailureStreakBreaker(ctx, *project, pausedLoop, queueItem, &latest); err != nil {
+				if _, err := r.finishFailureStreakBreakerForRun(ctx, *project, pausedLoop, queueItem, run.ID, &latest); err != nil {
 					return ProcessResult{}, err
 				}
-				return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
+				return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind, Outcome: latest.Outcome}, nil
 			}
 			if queueResultIsTerminalForCleanup(failedQueue) {
 				if scheduled, err := r.schedulePendingRediscoveryAfterRun(ctx, *loop, *queueItem.Repo, *queueItem.PRNumber); err != nil {
 					return ProcessResult{}, err
 				} else if scheduled {
-					r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &latest)
+					r.recordFailedRunCleanup(context.Background(), *project, run.ID, &latest)
 					return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind, Outcome: latest.Outcome}, nil
 				}
 			}
 			if queueResultIsTerminalForCleanup(failedQueue) {
-				r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &latest)
+				r.recordFailedRunCleanup(context.Background(), *project, run.ID, &latest)
 			}
 			return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind, Outcome: latest.Outcome}, nil
 		}
@@ -2451,10 +2507,11 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			claimedLockKey = checkpoint.ClaimedLockKey
 			acquiredClaimedLock = claimedLockKey != ""
 		}
-		run, err = r.persistStepCompleted(ctx, run, step, checkpoint)
+		completedStepRun, err := r.persistStepCompleted(ctx, run, step, checkpoint)
 		if err != nil {
 			return ProcessResult{}, err
 		}
+		run = completedStepRun
 		r.appendEvent(ctx, eventInput{eventType: "loop.step.completed", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"step": string(step)}})
 		r.logInfo("fixer step completed", map[string]any{"projectId": project.ID, "loopId": loop.ID, "runId": run.ID, "queueItemId": queueItem.ID, "currentStep": string(step)})
 		if checkpoint.SkipReason != "" {
@@ -3294,12 +3351,11 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 	// two-field copy: validation and the persisted checkpoint then rest on the
 	// same evidence, including the transcript scan that only the live result
 	// carries.
-	repair := checkpointRepairFromAgentResult(executionID, detailHeadSHA(checkpoint.Detail), result, r.nowISO())
 	if blocked, message, kind := fixerRepairTaskBlocked(result); blocked {
-		checkpoint.Repair = repair
 		checkpoint.ResumePolicy = loops.NormalizeResumePolicy(string(kind), loops.ResumePolicyReplayStep)
 		return checkpoint, &loopError{message: message, kind: kind}
 	}
+	repair := checkpointRepairFromAgentResult(executionID, detailHeadSHA(checkpoint.Detail), result, r.nowISO())
 	if err := validateCompletedRepairCheckpoint(repair); err != nil {
 		return checkpoint, err
 	}
@@ -3755,14 +3811,17 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 		fixItems = append([]FixItem(nil), checkpoint.FixItems...)
 	}
 	if useRepairSnapshot {
-		if followUp := newFollowupThreadIDs(fixItems, liveFixItems); len(followUp) > 0 {
-			if checkpoint.Outcome == nil {
-				checkpoint.Outcome = &fixerRunOutcome{}
-			}
-			checkpoint.Outcome.FollowUpThreadIDs = canonicalizeStringSlice(followUp)
+		followUp := newFollowupThreadIDs(fixItems, liveFixItems)
+		if checkpoint.Outcome == nil {
+			checkpoint.Outcome = &FixerRunOutcome{}
+		}
+		checkpoint.Outcome.FollowUpThreadIDs = canonicalizeStringSlice(followUp)
+		if len(followUp) > 0 {
 			if _, err := r.recordPendingFixerRediscovery(ctx, input.Loop, liveDetail.HeadSHA, hashFixItemsState(liveFixItems), unresolvedThreadIDs(liveFixItems)); err != nil {
 				return checkpoint, err
 			}
+		} else if _, err := r.clearPendingFixerRediscovery(ctx, input.Loop); err != nil {
+			return checkpoint, err
 		}
 	} else {
 		checkpoint.FixItems = liveFixItems
@@ -3835,7 +3894,7 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 			continue
 		}
 		if useRepairSnapshot && !fixItemPresentInLiveReview(item, liveFixItems) {
-			upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Status: "already_resolved", UpdatedAt: r.nowISO()})
+			upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Status: "stale_missing_from_review", UpdatedAt: r.nowISO()})
 			continue
 		}
 		decision, ok := repliesByItemID[item.ID]
@@ -3870,6 +3929,10 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 		if decisionIssueStatus != "" {
 			contractViolationCount++
 			upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Status: decisionIssueStatus, Message: decisionIssueMessage, UpdatedAt: r.nowISO()})
+			continue
+		}
+		if normalizeReplyAction(decision.Action) == string(replyActionDeferred) {
+			upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Action: string(replyActionDeferred), Status: "deferred", Message: decision.Explanation, UpdatedAt: r.nowISO()})
 			continue
 		}
 		if fixedDecisionMissingThreadSnapshot(decision) || threadCommentsObservedDrifted(decision, thread) {
@@ -5083,6 +5146,7 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 		initialCheckpoint.Worktree = resumedCheckpoint.Worktree
 	}
 	initialCheckpoint.Pause = nil
+	initialCheckpoint.Outcome = nil
 	initialCheckpoint.RunStartedAt = ""
 	initialCheckpoint.RunStartedRunID = ""
 	nowISO := r.nowISO()
@@ -5936,7 +6000,15 @@ func (r *Runner) wakeSchedulerAfterEnqueue() {
 // the failing run was active. The new queue state is exposed only after the
 // failed checkpoint is forced back to discover.
 func (r *Runner) finishFailureStreakBreaker(ctx context.Context, project storage.ProjectRecord, loop storage.LoopRecord, queueItem storage.QueueItemRecord, checkpoint *fixerCheckpoint) (bool, error) {
-	r.cleanupFixerWorktreeIfTerminal(context.Background(), project, checkpoint)
+	runID := ""
+	if checkpoint != nil {
+		runID = checkpoint.RunStartedRunID
+	}
+	return r.finishFailureStreakBreakerForRun(ctx, project, loop, queueItem, runID, checkpoint)
+}
+
+func (r *Runner) finishFailureStreakBreakerForRun(ctx context.Context, project storage.ProjectRecord, loop storage.LoopRecord, queueItem storage.QueueItemRecord, runID string, checkpoint *fixerCheckpoint) (bool, error) {
+	r.recordFailedRunCleanup(context.Background(), project, runID, checkpoint)
 	if r.db == nil || r.repos == nil || r.repos.Loops == nil || r.repos.Queue == nil || r.repos.Runs == nil || queueItem.Repo == nil || queueItem.PRNumber == nil {
 		return false, nil
 	}
@@ -6793,7 +6865,7 @@ func hasProgressed(checkpoint fixerCheckpoint) bool {
 		return false
 	}
 	for _, item := range checkpoint.ResolvedComments.Items {
-		if item.Status == "resolved" || item.Status == "already_resolved" || item.Status == "agent_declined" || item.Action == string(replyActionFixed) {
+		if item.Status == "resolved" || item.Status == "agent_declined" || item.ReplyState == "sent" {
 			return true
 		}
 	}
@@ -6901,29 +6973,59 @@ func (r *Runner) reconcileCommits(ctx context.Context, project storage.ProjectRe
 	return checkpoint, nil
 }
 
-func (r *Runner) cleanupFixerWorktreeIfTerminal(ctx context.Context, project storage.ProjectRecord, checkpoint *fixerCheckpoint) {
+func (r *Runner) cleanupFixerWorktreeIfTerminal(ctx context.Context, project storage.ProjectRecord, checkpoint *fixerCheckpoint) error {
 	if checkpoint == nil || checkpoint.Worktree == nil || checkpoint.Worktree.Path == "" || checkpoint.Worktree.Branch == "" || checkpoint.Worktree.CleanedAt != "" {
-		return
+		return nil
 	}
 	// Unprepared rewind paths (PreparedAt cleared, path kept) may still hold
 	// interrupted-repair dirt that prepare never evaluated. Terminal queue
 	// parking / success cleanup must not force-remove that evidence.
 	if strings.TrimSpace(checkpoint.Worktree.PreparedAt) == "" {
-		return
+		return nil
 	}
 	checkpoint.Worktree.CleanupAttemptedAt = r.nowISO()
 	worktreeRoot, rootErr := fixerWorktreeRoot(project)
 	if rootErr != nil {
 		r.logError("fixer worktree cleanup skipped", map[string]any{"projectId": project.ID, "worktreePath": checkpoint.Worktree.Path, "branch": checkpoint.Worktree.Branch, "message": rootErr.Error()})
-		return
+		return rootErr
 	}
 	if err := r.git.CleanupWorktree(ctx, CleanupWorktreeInput{ProjectID: project.ID, RepoPath: project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: checkpoint.Worktree.Path, Branch: checkpoint.Worktree.Branch, ProtectedBranches: compactStrings([]string{derefString(project.BaseBranch)})}); err != nil {
 		r.appendEvent(ctx, eventInput{eventType: "fixer.worktree.cleanup_failed", projectID: project.ID, entityType: "pull_request", entityID: project.ID, payload: map[string]any{"path": checkpoint.Worktree.Path, "branch": checkpoint.Worktree.Branch, "message": err.Error()}})
 		r.logError("fixer worktree cleanup failed", map[string]any{"projectId": project.ID, "worktreePath": checkpoint.Worktree.Path, "branch": checkpoint.Worktree.Branch, "message": err.Error()})
-		return
+		return err
 	}
 	checkpoint.Worktree.CleanedAt = r.nowISO()
 	r.appendEvent(ctx, eventInput{eventType: "fixer.worktree.cleaned", projectID: project.ID, entityType: "pull_request", entityID: project.ID, payload: map[string]any{"path": checkpoint.Worktree.Path, "branch": checkpoint.Worktree.Branch}})
+	return nil
+}
+
+// recordFailedRunCleanup preserves a terminal run's primary failure while
+// making a later cleanup failure visible in the same durable outcome.
+func (r *Runner) recordFailedRunCleanup(ctx context.Context, project storage.ProjectRecord, runID string, checkpoint *fixerCheckpoint) {
+	cleanupErr := r.cleanupFixerWorktreeIfTerminal(ctx, project, checkpoint)
+	if cleanupErr == nil || checkpoint == nil || checkpoint.Outcome == nil || checkpoint.Outcome.PrimaryFailure == nil {
+		return
+	}
+	checkpoint.recordFailure(stepCleanupWorktree, &loopError{message: cleanupErr.Error(), kind: FailureRetryableTransient})
+	checkpoint.refreshOutcomeProgress()
+	if r.repos == nil || r.repos.Runs == nil || strings.TrimSpace(runID) == "" {
+		return
+	}
+	run, err := r.repos.Runs.GetByID(ctx, runID)
+	if err != nil || run == nil {
+		message := "run not found"
+		if err != nil {
+			message = err.Error()
+		}
+		r.logError("fixer cleanup outcome load failed", map[string]any{"runId": runID, "message": message})
+		return
+	}
+	encoded := mustMarshalJSON(*checkpoint)
+	run.CheckpointJSON = &encoded
+	run.UpdatedAt = r.nowISO()
+	if err := r.repos.Runs.Upsert(ctx, *run); err != nil {
+		r.logError("fixer cleanup outcome persistence failed", map[string]any{"runId": runID, "message": err.Error()})
+	}
 }
 
 // isMissingOrUnusableFixerWorktree reports whether a checkpoint worktree path
@@ -7987,7 +8089,10 @@ func buildFixerPrompt(projectID string, instructionConfig config.Config, repo st
 		parts = append(parts, "Do not push the branch or update remote pull request state; leave repository publishing for Looper/manual follow-up after your edits.")
 		parts = append(parts, noRemoteLifecyclePromptInstruction("fixer", "", "", disclosureCfg, agentRuntime, agentModel))
 	}
-	parts = append(parts, "For fixer commits, prefer a fresh commit subject that precisely summarizes the repair changes from this round. Do not mechanically reuse the PR title or a previous fixer subject when this round's edits are narrower or different.")
+	parts = append(parts,
+		"For fixer commits, prefer a fresh commit subject that precisely summarizes the repair changes from this round. Do not mechanically reuse the PR title or a previous fixer subject when this round's edits are narrower or different.",
+		"The final "+agent.CompletionMarker+" JSON MUST include a top-level `outcome`: use `completed` when the repair task ran to completion, or `blocked` only when it could not be attempted. For `blocked`, also include `failure_kind` as `retryable_transient`, `retryable_after_resume`, or `manual_intervention`; authentication, authorization, usage-limit, and credential failures require `manual_intervention`. Free-form summary text is diagnostic and never controls this classification.",
+	)
 	return agent.AppendCompletionInstruction(strings.Join(parts, "\n\n")), instructionBlock
 }
 
@@ -8041,11 +8146,11 @@ func buildFixerReplyExplanationInstruction(fixItems []FixItem) string {
 			"Each entry must be an object with these fields:",
 			`  - "fixItemId": the exact "id" of the fix item`,
 			`  - "threadId": the exact "threadId" of the same fix item`,
-			`  - "action": "fixed" or "declined"`,
-			`  - "explanation": one or two sentences (max ~500 chars). If action is "fixed", say what you changed and where. If action is "declined", give a concrete reason why you are not acting. No greetings, no @mentions, no markdown headings, no HTML, no disclosure markers.`,
+			`  - "action": "fixed", "declined", or "deferred"`,
+			`  - "explanation": one or two sentences (max ~500 chars). If action is "fixed", say what you changed and where. If action is "declined", give a concrete reason why you are not acting. If action is "deferred", state why this thread must remain open for a later run and make no remote mutation. No greetings, no @mentions, no markdown headings, no HTML, no disclosure markers.`,
 			`  - "threadCommentsObserved": sha256 of the JSON array of review-thread comments you observed in thread order, where each element is {"id","updatedAt"}. The "id" MUST be the GraphQL PullRequestReviewComment node ID. If you fetched comments with REST pulls/{number}/comments, map REST "node_id" to "id" and REST "updated_at" to "updatedAt"; do not use the REST numeric "id". Include target reviewer comments even when they contain a Looper stamp. Exclude only prior Looper fixer replies/round comments.`,
 			"Before including an entry, re-read the relevant review thread/comment context.",
-			"Use \"fixed\" only when you can confidently confirm the current branch state actually addresses the thread; in other words, only include items you can confidently confirm are actually addressed by the current branch state. Use \"declined\" if you deliberately are not acting, including cases such as: already implemented on this branch, out of scope for this PR, reviewer request is incorrect, or you cannot safely complete it.",
+			"Use \"fixed\" only when you can confidently confirm the current branch state actually addresses the thread; in other words, only include items you can confidently confirm are actually addressed by the current branch state. Use \"declined\" only for a final decision not to act, including already implemented, out of scope, or incorrect requests. Use \"deferred\" when the thread remains valid but cannot be safely completed in this run; Looper will leave it open without replying or resolving.",
 			"Do not omit any non-native comment-type fix item. Do not use vague explanations like \"looks fine\" or \"no change needed\".",
 			"Create structured `review_thread_replies` entries only for listed comment fix items, never for collateral-only changes. Briefly mention material collateral in the explanation for the listed item it supports.",
 			"Read-only GitHub fetches are allowed for that verification. Do not post replies, resolve threads, submit reviews, edit PR metadata, or perform any other mutating GitHub API action; Looper owns those remote review-state changes after validation and push. Do not invent URLs.",

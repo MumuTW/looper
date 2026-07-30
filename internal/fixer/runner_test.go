@@ -1439,7 +1439,7 @@ func TestProcessClaimedItemCompletesSuccessfulFlow(t *testing.T) {
 	}
 }
 
-func TestProcessClaimedItemDoesNotResolveCommentsWhenRepairProducesNoCommits(t *testing.T) {
+func TestProcessClaimedItemReplaysBlockedRepairWithoutPersistingCompletion(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	github := &fakeGitHubGateway{
@@ -1458,7 +1458,8 @@ func TestProcessClaimedItemDoesNotResolveCommentsWhenRepairProducesNoCommits(t *
 			{HeadSHA: "base-head"},
 		},
 	}
-	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "blocked before editing because gh could not validate PR metadata", ParseStatus: "parsed"}}}
+	blocked := AgentResult{Status: "completed", Summary: "GitHub auth failed before editing", ParseStatus: "parsed", Stdout: `__LOOPER_RESULT__={"outcome":"blocked","failure_kind":"retryable_transient","summary":"GitHub auth failed before editing"}`}
+	agent := &fakeAgentExecutor{results: []AgentResult{blocked, blocked}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, ValidationRunner: passValidation, AllowAutoCommit: true, AllowAutoPush: true, AllowRiskyFixes: true, Logger: fixture.logger, Now: fixture.now})
 
 	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
@@ -1490,6 +1491,9 @@ func TestProcessClaimedItemDoesNotResolveCommentsWhenRepairProducesNoCommits(t *
 	if checkpoint.Outcome == nil || checkpoint.Outcome.PrimaryFailure == nil || checkpoint.Outcome.PrimaryFailure.Step != string(stepRepair) {
 		t.Fatalf("checkpoint.Outcome = %#v, want primary repair failure", checkpoint.Outcome)
 	}
+	if checkpoint.Repair != nil {
+		t.Fatalf("checkpoint.Repair = %#v, want blocked attempt left replayable", checkpoint.Repair)
+	}
 	if len(github.replyCalls) != 0 {
 		t.Fatalf("reply calls = %#v, want none for missing agent decision", github.replyCalls)
 	}
@@ -1513,6 +1517,18 @@ func TestProcessClaimedItemDoesNotResolveCommentsWhenRepairProducesNoCommits(t *
 	}
 	if activeFollowup == nil {
 		t.Fatalf("active follow-up queue item = %#v, want scheduled retry", activeFollowup)
+	}
+	fixture.advance(6 * time.Second)
+	retry, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "fixer-worker-2", "fixer")
+	if err != nil || retry == nil {
+		t.Fatalf("retry ClaimNextOfType() = (%#v, %v), want claimed retry", retry, err)
+	}
+	second, err := runner.ProcessClaimedItem(context.Background(), *retry)
+	if err != nil {
+		t.Fatalf("second ProcessClaimedItem() error = %v", err)
+	}
+	if second.Status != "failed" || len(agent.starts) != 2 {
+		t.Fatalf("second result = %#v agent starts = %d, want repair agent replayed", second, len(agent.starts))
 	}
 }
 
@@ -3411,6 +3427,18 @@ func TestRunResolveCommentsStepTreatsNewThreadAfterRepairAsFollowupWithoutSkippi
 	}
 	if updated.ResumePolicy != "advance_from_checkpoint" {
 		t.Fatalf("updated.ResumePolicy = %q, want advance_from_checkpoint", updated.ResumePolicy)
+	}
+	persistedLoop, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil || persistedLoop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v)", persistedLoop, err)
+	}
+	pending, ok := parsePendingFixerRediscoveryState(parseJSONObject(persistedLoop.MetadataJSON))
+	foundT2 := false
+	for _, threadID := range pending.UnresolvedThreadIDs {
+		foundT2 = foundT2 || threadID == "t2"
+	}
+	if !ok || !foundT2 {
+		t.Fatalf("pending rediscovery = %#v, want durable t2 handoff", pending)
 	}
 }
 
@@ -6395,6 +6423,7 @@ type fakeGitGateway struct {
 	mergeBaseResult MergeBaseResult
 	mergeBaseErr    error
 	cleanupCalls    []CleanupWorktreeInput
+	cleanupErr      error
 }
 
 func (f *fakeGitGateway) CreateWorktree(_ context.Context, input CreateWorktreeInput) (CreateWorktreeResult, error) {
@@ -6494,7 +6523,7 @@ func (f *fakeGitGateway) IsAncestor(_ context.Context, _ string, ancestor, desce
 
 func (f *fakeGitGateway) CleanupWorktree(_ context.Context, input CleanupWorktreeInput) error {
 	f.cleanupCalls = append(f.cleanupCalls, input)
-	return nil
+	return f.cleanupErr
 }
 
 type fakeAgentExecutor struct {
@@ -7586,15 +7615,15 @@ func TestPublishRoundSummaryCommentUpdatesExistingSummaryFromGraphQLID(t *testin
 	}
 }
 
-func TestHasProgressedCountsAlreadyResolvedComment(t *testing.T) {
+func TestHasProgressedExcludesAlreadyResolvedComment(t *testing.T) {
 	t.Parallel()
 
 	checkpoint := fixerCheckpoint{
 		ResolvedComments: &checkpointResolvedComments{Items: []checkpointResolvedComment{{Status: "already_resolved"}}},
 	}
 
-	if !hasProgressed(checkpoint) {
-		t.Fatalf("hasProgressed() = false, want already_resolved to count as progress")
+	if hasProgressed(checkpoint) {
+		t.Fatalf("hasProgressed() = true, want external resolution excluded from current-run progress")
 	}
 }
 
