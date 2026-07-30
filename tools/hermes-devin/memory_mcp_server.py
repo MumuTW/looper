@@ -17,7 +17,7 @@ interpreter environment here and it does not carry that dependency.
 
 Usage:
   HERMES_HOME=~/.hermes/profiles/looper ./memory_mcp_server.py
-  ./memory_mcp_server.py --selftest
+  HERMES_HOME=~/.hermes/profiles/looper ./memory_mcp_server.py --selftest
 """
 from __future__ import annotations
 

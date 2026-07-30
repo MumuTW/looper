@@ -45,6 +45,7 @@ else
 fi
 
 FORCE=0
+PROFILE_CREATED=0
 # Absolute, so the printed commands stay valid after the reader cd's into the
 # disposable directory the safety note tells them to use.
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -64,8 +65,11 @@ LOOPER_DEVIN_MODEL="${LOOPER_DEVIN_MODEL:-glm-5-2}"
 # Pinning the server too means another server exposing a same-named tool does
 # not inherit the grant.
 LOOPER_MCP_SERVER="${LOOPER_MCP_SERVER:-hermes-memory}"
-LOOPER_ALLOWED_TOOLS="${LOOPER_ALLOWED_TOOLS:-}"
-if [ -z "$LOOPER_ALLOWED_TOOLS" ]; then
+# Unset means use the deliberate, narrow default. An explicitly empty value
+# means the operator selected no unattended approvals; preserve it as an empty
+# HERMES_ACP_ALLOWED_MCP_TOOLS value rather than silently broadening authority.
+if [ "${LOOPER_ALLOWED_TOOLS+x}" != x ]; then
+  LOOPER_ALLOWED_TOOLS=""
   for _t in hermes_memory_add hermes_memory_replace hermes_memory_remove hermes_memory_read; do
     LOOPER_ALLOWED_TOOLS="${LOOPER_ALLOWED_TOOLS:+$LOOPER_ALLOWED_TOOLS,}mcp__${LOOPER_MCP_SERVER}__${_t}"
   done
@@ -101,6 +105,16 @@ write_profile_file() {
     return 0
   fi
 
+  if [ "$PROFILE_CREATED" -eq 1 ]; then
+    # `hermes profile create` seeds a brand-new profile with its own defaults.
+    # They cannot be user state in this invocation, so replace them with this
+    # repo's template. Existing profiles still take the preserve-or---force
+    # path above.
+    printf '%s' "$content" > "$path"
+    echo "  replaced newly created profile's default $label"
+    return 0
+  fi
+
   echo "  SKIPPED $label — it already exists and differs from the template." >&2
   echo "    Left untouched; it may hold your own credentials or settings." >&2
   echo "    Merge by hand, or re-run with --force to replace it after a backup." >&2
@@ -116,6 +130,7 @@ bootstrap() {
     # script then writes to nonexistent.
     HERMES_HOME="$HERMES_ROOT" hermes profile create "$LOOPER_HERMES_PROFILE" --no-alias \
       --description "Looper repo profile: Devin ACP backend, repo-scoped memory"
+    PROFILE_CREATED=1
   fi
 
   write_profile_file "$LOOPER_HERMES_HOME/config.yaml" "config.yaml" <<YAML

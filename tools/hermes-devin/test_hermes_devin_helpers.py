@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import tempfile
 import unittest
 
 
@@ -72,6 +73,44 @@ class HermesDevinHelperTests(unittest.TestCase):
         self.assertIn("must be sourced from Bash", result.stderr)
         self.assertIn("--print", result.stderr)
         self.assertNotIn("Bad substitution", result.stderr)
+
+    def test_fresh_bootstrap_replaces_seed_defaults_and_preserves_empty_allowlist(self):
+        with tempfile.TemporaryDirectory() as temp:
+            temp_root = Path(temp)
+            fake_bin = temp_root / "bin"
+            fake_bin.mkdir()
+            fake_hermes = fake_bin / "hermes"
+            fake_hermes.write_text(
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                "profile=\"$3\"\n"
+                "profile_dir=\"$HERMES_HOME/profiles/$profile\"\n"
+                "mkdir -p \"$profile_dir\"\n"
+                "printf 'stock-config\\n' > \"$profile_dir/config.yaml\"\n"
+                "printf 'stock-env\\n' > \"$profile_dir/.env\"\n",
+                encoding="utf-8",
+            )
+            fake_hermes.chmod(0o755)
+            env = {
+                **os.environ,
+                "HOME": str(temp_root / "home"),
+                "HERMES_ROOT": str(temp_root / "hermes-root"),
+                "LOOPER_ALLOWED_TOOLS": "",
+                "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+            }
+            result = subprocess.run(
+                [str(REPO_ROOT / "scripts" / "hermes-profile.sh"), "--bootstrap"],
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            profile = Path(env["HERMES_ROOT"]) / "profiles" / "looper"
+            self.assertIn("provider: copilot-acp", (profile / "config.yaml").read_text(encoding="utf-8"))
+            profile_env = (profile / ".env").read_text(encoding="utf-8")
+            self.assertTrue(profile_env.endswith("HERMES_ACP_ALLOWED_MCP_TOOLS="))
+            self.assertNotIn("mcp__hermes-memory__hermes_memory_add", profile_env)
 
 
 if __name__ == "__main__":

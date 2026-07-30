@@ -311,6 +311,17 @@ Two components, plus profile wiring:
   script pins both stock and patched checksums and refuses to touch a Hermes
   that has moved underneath it.
 
+  **Checksum-gate trade-off:** delete the hashes and `patch` can still apply
+  its small hunks to a changed shim when their local context happens to match,
+  while leaving all unexamined surrounding behavior from an unsupported Hermes
+  release in place. The concrete failure prevented is an operator believing
+  that the reviewed `allow_once` gate was installed when only a textual hunk
+  applied to an incompatible implementation; `patch` succeeding is not
+  authority that the whole target is the version the capture exercised. The
+  hashes still do not catch a runtime or protocol change outside that file,
+  nor prove that the pinned file is safe against a hostile backend — live
+  replay and the disposable-workspace boundary remain necessary.
+
   **Authority:** the action authority is the operator's exact
   `HERMES_ACP_ALLOWED_MCP_TOOLS` configuration, not the ACP backend's
   `_meta`. The backend's earlier `_meta` tool name only correlates its later
