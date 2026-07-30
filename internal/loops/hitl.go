@@ -36,6 +36,28 @@ type HITLAsk struct {
 	RecommendedOption string            `json:"recommendedOption,omitempty"`
 	Consequences      map[string]string `json:"consequences,omitempty"`
 	Confidence        string            `json:"confidence,omitempty"`
+
+	// NonResumingOptions are answers that settle the ask without restarting the
+	// loop. The default respond path exists to resume a suspended agent turn, so
+	// it transitions the loop to running and requeues it; an ask whose whole
+	// purpose is to offer "stop here" as an option cannot express that outcome
+	// through it. Naming those options on the ask keeps the decision with the
+	// Role that authored the question instead of teaching the respond path about
+	// individual Roles.
+	NonResumingOptions []string `json:"nonResumingOptions,omitempty"`
+}
+
+// AnswerResumes reports whether the given answer should resume the loop. An
+// answer that matches no option resumes, which preserves the free-text reply
+// path every other ask relies on.
+func (a HITLAsk) AnswerResumes(answer string) bool {
+	answer = strings.TrimSpace(answer)
+	for _, option := range a.NonResumingOptions {
+		if strings.EqualFold(strings.TrimSpace(option), answer) {
+			return false
+		}
+	}
+	return true
 }
 
 // ReadHITLAsk extracts the HITL ask state from a loop's metadata JSON. The

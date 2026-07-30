@@ -25,13 +25,14 @@ func seedFixerReproduction(t *testing.T, repos *storage.Repositories, worktree, 
 	record := reproduction.Record{
 		ProjectID: "project_1", Repo: "acme/looper", IssueNumber: 41, Command: command,
 		Files: hashes, CommitSHA: "abc", RecordedAt: time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC).Format(time.RFC3339Nano),
+		ExpectedFailure: reproduction.ExpectedFailure{Test: "TestBug", Message: "want 1 got 0"},
 	}
 	if err := reproduction.AppendRecord(context.Background(), repos, record); err != nil {
 		t.Fatalf("AppendRecord() error = %v", err)
 	}
 	if err := reproduction.WriteManifest(worktree, reproduction.Manifest{
 		Version: reproduction.ManifestVersion, Repo: record.Repo, IssueNumber: record.IssueNumber,
-		Command: command, Files: hashes,
+		Command: command, Files: hashes, ExpectedFailure: record.ExpectedFailure,
 	}); err != nil {
 		t.Fatalf("WriteManifest() error = %v", err)
 	}
@@ -123,9 +124,12 @@ func TestFixerPinsTheGovernedIssueSoManifestDeletionCannotEscapeTheGate(t *testi
 	loop := fixerGateLoop(t, repos)
 	input := stepInput{Project: storage.ProjectRecord{ID: "project_1"}, Repo: "acme/looper", Loop: loop}
 
-	// First pass fails on the tampered reproduction, and pins the Issue.
-	if err := runner.enforceReproductionGate(context.Background(), input, worktree); err == nil {
-		t.Fatalf("enforceReproductionGate() error = nil, want the tampered reproduction to fail")
+	// The repair step pins the governing Issue before the agent runs, which is
+	// what this asserts: pinning at validation time would be too late, because an
+	// agent that deleted the manifest during its turn would leave the gate with
+	// nothing to resolve.
+	if err := runner.pinReproductionIssue(context.Background(), loop, worktree); err != nil {
+		t.Fatalf("pinReproductionIssue() error = %v", err)
 	}
 	stored, err := repos.Loops.GetByID(context.Background(), loop.ID)
 	if err != nil || stored == nil {
@@ -141,12 +145,45 @@ func TestFixerPinsTheGovernedIssueSoManifestDeletionCannotEscapeTheGate(t *testi
 		t.Fatalf("loop metadata = %#v, want the governing Issue pinned", metadata)
 	}
 
-	// Second pass with the manifest removed still gates, via the pin.
+	// The agent then deletes the manifest during its turn. The gate still applies,
+	// because the Issue was resolved before the agent ever ran.
 	if err := os.Remove(reproduction.ManifestPath(worktree)); err != nil {
 		t.Fatalf("Remove() error = %v", err)
 	}
 	input.Loop = *stored
 	if err := runner.enforceReproductionGate(context.Background(), input, worktree); err == nil {
 		t.Fatalf("enforceReproductionGate() error = nil after manifest deletion, want the gate to still apply")
+	}
+}
+
+// The regression: on a first pass the gate must read the Issue pinned earlier in
+// the same run, not the loop record the step started with. Passing the stale
+// record through would make deletion look like "no reproduction here".
+func TestFixerGateReadsThePinWrittenEarlierInTheSameRun(t *testing.T) {
+	t.Parallel()
+	repos := newFixerGateRepos(t)
+	worktree := t.TempDir()
+	seedFixerReproduction(t, repos, worktree, "run-reproduction")
+	runner := New(Options{Repos: repos})
+	loop := fixerGateLoop(t, repos)
+
+	if err := runner.pinReproductionIssue(context.Background(), loop, worktree); err != nil {
+		t.Fatalf("pinReproductionIssue() error = %v", err)
+	}
+	if err := os.Remove(reproduction.ManifestPath(worktree)); err != nil {
+		t.Fatalf("Remove() error = %v", err)
+	}
+	if err := os.Remove(filepath.Join(worktree, "bug_test.go")); err != nil {
+		t.Fatalf("Remove() error = %v", err)
+	}
+
+	// input.Loop is the pre-pin record, exactly as the step captured it.
+	input := stepInput{Project: storage.ProjectRecord{ID: "project_1"}, Repo: "acme/looper", Loop: loop}
+	err := runner.enforceReproductionGate(context.Background(), input, worktree)
+	if err == nil {
+		t.Fatalf("enforceReproductionGate() error = nil, want deleting the reproduction to fail the gate")
+	}
+	if loopErr, ok := err.(*loopError); !ok || !strings.Contains(loopErr.message, string(reproduction.ReasonTestMissing)) {
+		t.Fatalf("enforceReproductionGate() error = %#v, want the missing-test tamper reason", err)
 	}
 }

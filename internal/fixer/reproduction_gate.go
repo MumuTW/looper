@@ -25,7 +25,10 @@ func (r *Runner) enforceReproductionGate(ctx context.Context, input stepInput, w
 	if r.repos == nil {
 		return nil
 	}
-	pinned := reproduction.GovernedIssueNumber(parseJSONObject(input.Loop.MetadataJSON))
+	// The loop record is re-read rather than trusted from stepInput: the
+	// governing Issue is pinned before the agent starts, and that write happened
+	// after this step's input was captured.
+	pinned := reproduction.GovernedIssueNumber(parseJSONObject(r.currentLoopMetadata(ctx, input.Loop)))
 	repo := strings.TrimSpace(input.Repo)
 	result, applies, err := reproduction.GateForLoop(ctx, reproduction.LoopGateInput{
 		Repos:        r.repos,
@@ -43,11 +46,6 @@ func (r *Runner) enforceReproductionGate(ctx context.Context, input stepInput, w
 	if !applies {
 		return nil
 	}
-	if pinned <= 0 {
-		if err := r.pinReproductionIssue(ctx, input.Loop, worktreePath); err != nil {
-			return &loopError{message: "Reproduction gate could not be pinned to its Issue: " + err.Error(), kind: FailureRetryableTransient}
-		}
-	}
 	if result.Passed {
 		return nil
 	}
@@ -57,7 +55,23 @@ func (r *Runner) enforceReproductionGate(ctx context.Context, input stepInput, w
 	}
 }
 
+// pinReproductionIssue records which Issue's Reproduction Record governs this
+// loop, and is called *before* the Fixer agent runs.
+//
+// Pinning at validation time was too late to be a gate at all. On a loop's first
+// pass the Issue is unknown until the manifest is read, so an agent that deleted
+// `.looper/reproduction.json` during its turn left GateForLoop with nothing to
+// discover: `applies` came back false and both the integrity check and the
+// command check were skipped — the precise tampering the gate exists to catch.
+// Resolving the Issue before the agent starts means deletion is detected as
+// tampering rather than being the way out.
 func (r *Runner) pinReproductionIssue(ctx context.Context, loop storage.LoopRecord, worktreePath string) error {
+	if r.repos == nil || r.repos.Loops == nil {
+		return nil
+	}
+	if reproduction.GovernedIssueNumber(parseJSONObject(loop.MetadataJSON)) > 0 {
+		return nil
+	}
 	manifest, present, err := reproduction.ReadManifest(worktreePath)
 	if err != nil || !present || manifest.IssueNumber <= 0 {
 		return nil
@@ -71,4 +85,17 @@ func (r *Runner) pinReproductionIssue(ctx context.Context, loop storage.LoopReco
 		}
 	})
 	return err
+}
+
+// currentLoopMetadata re-reads the loop so metadata written earlier in this run
+// — the pinned Issue in particular — is visible to the gate.
+func (r *Runner) currentLoopMetadata(ctx context.Context, loop storage.LoopRecord) *string {
+	if r.repos == nil || r.repos.Loops == nil {
+		return loop.MetadataJSON
+	}
+	current, err := r.repos.Loops.GetByID(ctx, loop.ID)
+	if err != nil || current == nil {
+		return loop.MetadataJSON
+	}
+	return current.MetadataJSON
 }

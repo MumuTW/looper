@@ -28,7 +28,7 @@ func recordFor(t *testing.T, root string) Record {
 	if err != nil {
 		t.Fatalf("HashFiles() error = %v", err)
 	}
-	return Record{Repo: "acme/looper", IssueNumber: 7, Command: "run-reproduction", Files: hashes}
+	return Record{Repo: "acme/looper", IssueNumber: 7, Command: "run-reproduction", Files: hashes, ExpectedFailure: ExpectedFailure{Test: "TestBugRepro", Message: "bug still present"}}
 }
 
 func passing(context.Context, validationcmd.Options) (shell.Result, error) {
@@ -36,14 +36,19 @@ func passing(context.Context, validationcmd.Options) (shell.Result, error) {
 }
 
 func failing(context.Context, validationcmd.Options) (shell.Result, error) {
-	result := shell.Result{Stdout: "FAIL: bug still present", ExitCode: 1}
+	result := shell.Result{Stdout: "FAIL: TestBugRepro\nbug still present", ExitCode: 1}
 	return result, &shell.CommandExecutionError{Message: "exit 1", Category: shell.FailureNonZeroExit, Result: result}
+}
+
+func timingOut(context.Context, validationcmd.Options) (shell.Result, error) {
+	result := shell.Result{Stdout: "still running..."}
+	return result, &shell.CommandExecutionError{Message: "Command timed out", Category: shell.FailureSupervisorTimeout, Result: result}
 }
 
 func TestVerifyPassesWhenReproductionIsIntactAndGreen(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
-	writeFile(t, root, "pkg/bug_test.go", "original reproduction")
+	writeFile(t, root, "pkg/bug_test.go", "func TestBugRepro(t *testing.T) {}")
 	result, err := Verify(context.Background(), Input{WorktreePath: root, Record: recordFor(t, root), Run: passing})
 	if err != nil {
 		t.Fatalf("Verify() error = %v", err)
@@ -56,7 +61,7 @@ func TestVerifyPassesWhenReproductionIsIntactAndGreen(t *testing.T) {
 func TestVerifyFailsWhenReproductionStillFails(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
-	writeFile(t, root, "pkg/bug_test.go", "original reproduction")
+	writeFile(t, root, "pkg/bug_test.go", "func TestBugRepro(t *testing.T) {}")
 	result, err := Verify(context.Background(), Input{WorktreePath: root, Record: recordFor(t, root), Run: failing})
 	if err != nil {
 		t.Fatalf("Verify() error = %v", err)
@@ -66,13 +71,29 @@ func TestVerifyFailsWhenReproductionStillFails(t *testing.T) {
 	}
 }
 
+// A timeout, cancellation, or infrastructure failure is a transient execution
+// problem, not a reproduction verdict. Mislabelling it as "still failing" would
+// force manual intervention for a condition that retries on its own.
+func TestVerifyTreatsNonZeroExitOnlyAsCommandFailed(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	writeFile(t, root, "pkg/bug_test.go", "func TestBugRepro(t *testing.T) {}")
+	result, err := Verify(context.Background(), Input{WorktreePath: root, Record: recordFor(t, root), Run: timingOut})
+	if err != nil {
+		t.Fatalf("Verify() error = %v", err)
+	}
+	if result.Passed || result.Reason != ReasonCommandError {
+		t.Fatalf("Verify() = %#v, want %s for a timeout", result, ReasonCommandError)
+	}
+}
+
 // The tamper cases are the reason the Role exists: the suite would still be
 // green after weakening the test, so the gate must see it from the hash rather
 // than from the suite.
 func TestVerifyDetectsModifiedReproductionWithoutRunningTheCommand(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
-	writeFile(t, root, "pkg/bug_test.go", "original reproduction")
+	writeFile(t, root, "pkg/bug_test.go", "func TestBugRepro(t *testing.T) {}")
 	record := recordFor(t, root)
 	writeFile(t, root, "pkg/bug_test.go", "t.Skip(\"flaky\")")
 
@@ -98,7 +119,7 @@ func TestVerifyDetectsModifiedReproductionWithoutRunningTheCommand(t *testing.T)
 func TestVerifyDetectsDeletedReproduction(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
-	writeFile(t, root, "pkg/bug_test.go", "original reproduction")
+	writeFile(t, root, "pkg/bug_test.go", "func TestBugRepro(t *testing.T) {}")
 	record := recordFor(t, root)
 	if err := os.Remove(filepath.Join(root, "pkg", "bug_test.go")); err != nil {
 		t.Fatalf("Remove() error = %v", err)
@@ -118,7 +139,7 @@ func TestVerifyDetectsDeletedReproduction(t *testing.T) {
 func TestProveFailingAcceptsOnlyACommandThatFails(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
-	writeFile(t, root, "pkg/bug_test.go", "candidate reproduction")
+	writeFile(t, root, "pkg/bug_test.go", "func TestBugRepro(t *testing.T) {}")
 	record := recordFor(t, root)
 
 	proof, err := ProveFailing(context.Background(), Input{WorktreePath: root, Record: record, Run: failing})
@@ -135,6 +156,29 @@ func TestProveFailingAcceptsOnlyACommandThatFails(t *testing.T) {
 	}
 	if rejected.Passed || rejected.Reason != ReasonCommandPassedOnBase {
 		t.Fatalf("ProveFailing() = %#v, want %s", rejected, ReasonCommandPassedOnBase)
+	}
+}
+
+// A nonzero exit caused by a syntax error, a setup failure, or an unrelated
+// already-failing test is not proof of the reported bug. The expected failure
+// signature must appear in the observed output before the failure is accepted.
+func TestProveFailingRejectsAnUnrelatedNonZeroExit(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	writeFile(t, root, "pkg/bug_test.go", "func TestBugRepro(t *testing.T) {}")
+	record := recordFor(t, root)
+	// The command fails, but with a failure that has nothing to do with the
+	// expected signature the reproduction claims.
+	unrelated := func(context.Context, validationcmd.Options) (shell.Result, error) {
+		result := shell.Result{Stderr: "syntax error: unexpected token", ExitCode: 2}
+		return result, &shell.CommandExecutionError{Message: "exit 2", Category: shell.FailureNonZeroExit, Result: result}
+	}
+	proof, err := ProveFailing(context.Background(), Input{WorktreePath: root, Record: record, Run: unrelated})
+	if err != nil {
+		t.Fatalf("ProveFailing() error = %v", err)
+	}
+	if proof.Passed || proof.Reason != ReasonUnexpectedFailure {
+		t.Fatalf("ProveFailing() = %#v, want %s for an unrelated failure", proof, ReasonUnexpectedFailure)
 	}
 }
 

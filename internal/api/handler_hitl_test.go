@@ -412,3 +412,59 @@ func TestHandlerRespondRequiresAnswer(t *testing.T) {
 		t.Fatalf("status = %d, want 400 for empty answer; body=%s", recorder.Code, recorder.Body.String())
 	}
 }
+
+// An ask may offer "stop here" as an option. The shared respond path exists to
+// resume a suspended agent turn, so it transitions the loop to running and
+// requeues it — which would create the very work the human just declined, in the
+// same request that records the refusal. An option the ask declared
+// non-resuming must settle the question without restarting anything.
+func TestHandlerRespondDoesNotRequeueANonResumingAnswer(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+	projectID := "project_hitl_stop"
+	loopID := "loop_hitl_stop"
+	targetID := projectID
+	metadata := `{"hitl":{"question":"Cannot reproduce; what now?",` +
+		`"options":["plan without a reproduction","leave this Issue for a human"],` +
+		`"nonResumingOptions":["leave this Issue for a human"],` +
+		`"status":"awaiting","askedAt":"2026-04-11T11:59:00.000Z"}}`
+
+	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Looper", RepoPath: "/tmp/repos/looper", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 73, ProjectID: projectID, Type: "planner", TargetType: "project", TargetID: &targetID, Status: "awaiting_human", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/73/respond", strings.NewReader(`{"answer":"leave this Issue for a human"}`))
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+
+	loop, err := services.Repositories.Loops.GetByID(context.Background(), loopID)
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = %#v, %v", loop, err)
+	}
+	if loop.Status != "paused" {
+		t.Fatalf("loop.Status = %q, want the loop left stopped rather than resumed", loop.Status)
+	}
+	// The answer is still recorded: the decision was delivered, only the resume
+	// was withheld.
+	ask, ok := loops.ReadHITLAsk(loop.MetadataJSON)
+	if !ok || ask.Answer != "leave this Issue for a human" || ask.Status != "answered" {
+		t.Fatalf("ask = %#v, want the human's decision recorded", ask)
+	}
+	items, err := services.Repositories.Queue.List(context.Background())
+	if err != nil {
+		t.Fatalf("Queue.List() error = %v", err)
+	}
+	for _, item := range items {
+		if item.LoopID != nil && *item.LoopID == loopID && item.Status == "queued" {
+			t.Fatalf("queue item = %#v, want no work queued for a declined ask", item)
+		}
+	}
+}

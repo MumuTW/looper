@@ -100,6 +100,10 @@ type CommitInput struct {
 	WorktreeRoot string
 	WorktreePath string
 	Message      string
+	// Paths, when non-empty, restricts the commit to exactly these worktree-
+	// relative paths instead of `git add -A`. Empty preserves the historical
+	// "stage everything" behaviour.
+	Paths []string
 }
 
 type CommitResult struct {
@@ -797,7 +801,15 @@ func (g *Gateway) Commit(ctx context.Context, input CommitInput) (CommitResult, 
 	if err := g.validateMutationWorktree(input.WorktreePath, input.RepoPath, input.WorktreeRoot); err != nil {
 		return CommitResult{}, err
 	}
-	if err := g.runGit(ctx, input.WorktreePath, nil, "add", "-A"); err != nil {
+	if len(input.Paths) > 0 {
+		// Stage exactly the declared paths so exploratory or undeclared changes
+		// are not swept into a commit that is supposed to carry only the
+		// declared artifacts. `--` keeps paths literal (no pathspec options).
+		addArgs := append([]string{"add", "--"}, input.Paths...)
+		if err := g.runGit(ctx, input.WorktreePath, nil, addArgs...); err != nil {
+			return CommitResult{}, err
+		}
+	} else if err := g.runGit(ctx, input.WorktreePath, nil, "add", "-A"); err != nil {
 		return CommitResult{}, err
 	}
 	if err := g.runGit(ctx, input.WorktreePath, nil, "commit", "-m", input.Message); err != nil {
@@ -1204,6 +1216,26 @@ func (g *Gateway) getRevision(ctx context.Context, repoPath, ref string) (string
 		return "", err
 	}
 	return strings.TrimSpace(result.Stdout), nil
+}
+
+// HeadCommitFiles returns the worktree-relative paths changed in the head
+// commit relative to its parent. It is the post-commit counterpart to staging
+// a specific path set: a caller that staged only declared artifacts can verify
+// the committed change set is exactly those artifacts (no undeclared files
+// swept in, no declared file silently omitted by an ignore rule).
+func (g *Gateway) HeadCommitFiles(ctx context.Context, worktreePath string) ([]string, error) {
+	result, err := g.runGitResult(ctx, worktreePath, nil, "show", "--name-only", "--pretty=format:", "HEAD")
+	if err != nil {
+		return nil, err
+	}
+	files := make([]string, 0)
+	for _, line := range strings.Split(result.Stdout, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed != "" {
+			files = append(files, trimmed)
+		}
+	}
+	return files, nil
 }
 
 func (g *Gateway) listCommitsSince(ctx context.Context, repoPath, baseRef string) ([]string, error) {

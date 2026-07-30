@@ -827,7 +827,7 @@ func (a plannerGitAdapter) InspectHead(ctx context.Context, input planner.Inspec
 
 func (a plannerGitAdapter) Commit(ctx context.Context, input planner.CommitInput) (planner.CommitResult, error) {
 	message := a.stamper.WithIdentity(input.DisclosureAgent, input.DisclosureModel).CommitMessage(input.Message, "planner")
-	result, err := a.gateway.Commit(ctx, gitinfra.CommitInput{RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, Message: message})
+	result, err := a.gateway.Commit(ctx, gitinfra.CommitInput{RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, Message: message, Paths: append([]string(nil), input.Paths...)})
 	if err != nil {
 		return planner.CommitResult{}, err
 	}
@@ -836,6 +836,17 @@ func (a plannerGitAdapter) Commit(ctx context.Context, input planner.CommitInput
 
 func (a plannerGitAdapter) Push(ctx context.Context, input planner.PushInput) error {
 	return a.gateway.Push(ctx, gitinfra.PushInput{RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, Branch: input.Branch, Remote: input.Remote, ProtectedBranches: input.ProtectedBranches})
+}
+
+func (a plannerGitAdapter) HeadCommitFiles(ctx context.Context, worktreePath string) ([]string, error) {
+	return a.gateway.HeadCommitFiles(ctx, worktreePath)
+}
+
+func (a plannerGitAdapter) DiscardChanges(ctx context.Context, input planner.DiscardChangesInput) error {
+	_, err := a.gateway.DiscardWorktreeChanges(ctx, gitinfra.DiscardWorktreeChangesInput{
+		RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath,
+	})
+	return err
 }
 
 type plannerAgentExecutorAdapter struct{ executor *agent.ConfiguredExecutor }
@@ -2962,6 +2973,18 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		}
 	}
 
+	// The Reproducer gate is built before Planner because both of Planner's doors
+	// need it: Triager's explicit route and Planner's own label/assignee lane. A
+	// nil gate is the pre-Reproducer path for both.
+	var reproductionGate *reproducer.Gate
+	var triagerReproductionGate triager.ReproductionGate
+	var plannerReproductionGate planner.ReproductionGate
+	if cfg.Reproducer.Enabled {
+		reproductionGate = reproducer.NewGate(repos)
+		triagerReproductionGate = reproductionGate
+		plannerReproductionGate = reproductionGate
+	}
+
 	// Construct even when live config no longer resolves so sticky snapshot retries remain claimable.
 	resolvedPlanner, plannerConfigured := config.ResolveAgent(cfg, "", config.CodingRolePlanner)
 	var plannerExecutor *agent.ConfiguredExecutor
@@ -2981,6 +3004,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		plannerRoleRunner = planner.New(planner.Options{
 			DB:                 coordinator.DB(),
 			Repos:              repos,
+			ReproductionGate:   plannerReproductionGate,
 			GitHub:             plannerGitHubAdapter{gateway: githubGateway, stamper: plannerStamper, config: &cfg},
 			Git:                plannerGitAdapter{gateway: gitGateway, stamper: plannerStamper},
 			AgentExecutor:      plannerAgentExecutorAdapter{executor: plannerExecutor},
@@ -3009,18 +3033,12 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		})
 		plannerRunner = plannerRoleRunner
 	}
-	// The Reproducer gate is built even when the Role is disabled-by-absence so
-	// the wiring has one shape; a nil gate is Triager's pre-Reproducer path.
-	var reproductionGate triager.ReproductionGate
-	if cfg.Reproducer.Enabled {
-		reproductionGate = reproducer.NewGate(repos)
-	}
 	if plannerConfigured && githubGateway != nil {
 		triagerRunner = triager.New(triager.Options{
 			Repos:            repos,
 			GitHub:           githubGateway,
 			Planner:          plannerRoleRunner,
-			ReproductionGate: reproductionGate,
+			ReproductionGate: triagerReproductionGate,
 			LLM: triager.NewAgentLLM(
 				plannerExecutor,
 				time.Duration(cfg.Agent.Timeouts.PlannerMaxRuntimeSeconds)*time.Second,

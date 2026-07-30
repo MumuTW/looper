@@ -228,9 +228,40 @@ type CommitInput struct {
 	Message         string
 	DisclosureAgent string
 	DisclosureModel string
+	// Paths, when non-empty, restricts the commit to exactly these worktree-
+	// relative paths instead of `git add -A`. Callers that must not commit
+	// exploratory or undeclared changes (the Reproducer commit) set this so the
+	// committed tree carries only the declared artifacts. Empty preserves the
+	// historical "stage everything" behaviour every other caller relies on.
+	Paths []string
 }
 
 type CommitResult struct{ CommitSHA string }
+
+// DiscardChangesInput asks for a managed worktree to be returned to its
+// committed state: tracked edits reset, untracked files removed.
+//
+// A Role that hands its branch to another Role uses it so exploratory work that
+// was not adopted cannot be swept into the next Role's fallback commit.
+type DiscardChangesInput struct {
+	RepoPath     string
+	WorktreeRoot string
+	WorktreePath string
+}
+
+// ReproductionGate lets a Role scheduled before Planner withhold an Issue from
+// Planner's own label/assignee discovery lane.
+//
+// Triager's explicit route is already gated, but that only covers Issues that
+// arrive *through* Triager. An Issue that also carries Planner's labels is
+// discovered directly, and without this it would bypass a reproduction that has
+// not settled yet. Nil keeps the pre-Reproducer path.
+type ReproductionGate interface {
+	// IssueAllowed reports whether this Issue may be planned now. It must return
+	// true for an Issue with no governing report, so discovery is unchanged for
+	// every repository that does not run the Role.
+	IssueAllowed(ctx context.Context, projectID, repo string, issueNumber int64) (bool, error)
+}
 
 type GitGateway interface {
 	CreateWorktree(context.Context, CreateWorktreeInput) (CreateWorktreeResult, error)
@@ -313,6 +344,9 @@ type Options struct {
 	OnAgentExecutionStarted AgentExecutionStartedFunc
 	OnQueueItemEnqueued     func()
 	DiscoveryPolicy         DiscoveryPolicy
+
+	// ReproductionGate is optional. Nil keeps the pre-Reproducer discovery path.
+	ReproductionGate ReproductionGate
 }
 
 type DiscoveryPolicy struct {
@@ -345,6 +379,7 @@ type Runner struct {
 	onAgentExecutionStarted AgentExecutionStartedFunc
 	onQueueItemEnqueued     func()
 	discoveryPolicy         DiscoveryPolicy
+	reproductionGate        ReproductionGate
 }
 
 type DiscoveryInput struct {
@@ -517,7 +552,7 @@ func New(options Options) *Runner {
 	if policy.LabelMode == "" {
 		policy = DiscoveryPolicy{AutoDiscovery: true, Labels: []string{labels.DefaultPlanTrigger}, LabelMode: config.LabelModeAll, RequireAssigneeCurrentUser: true}
 	}
-	return &Runner{db: options.DB, repos: options.Repos, github: options.GitHub, git: options.Git, agentExecutor: options.AgentExecutor, logger: options.Logger, now: now, agentTimeout: agentTimeout, agentIdleTimeout: agentIdleTimeout, claimTTL: claimTTL, allowAutoPush: allowAutoPush, disclosure: disclosureCfg, agentRuntime: strings.TrimSpace(options.AgentRuntime), agentProfileID: strings.TrimSpace(options.AgentProfileID), customInstructions: customInstructionConfig(options.CustomInstructions), projectRoleConfig: options.CustomInstructions, agentModel: cloneStringPtr(options.AgentModel), retryBaseDelay: retryBaseDelay, retryMaxAttempts: retryMax, onAgentExecutionStarted: options.OnAgentExecutionStarted, onQueueItemEnqueued: options.OnQueueItemEnqueued, discoveryPolicy: policy}
+	return &Runner{db: options.DB, repos: options.Repos, github: options.GitHub, git: options.Git, agentExecutor: options.AgentExecutor, logger: options.Logger, now: now, agentTimeout: agentTimeout, agentIdleTimeout: agentIdleTimeout, claimTTL: claimTTL, allowAutoPush: allowAutoPush, disclosure: disclosureCfg, agentRuntime: strings.TrimSpace(options.AgentRuntime), agentProfileID: strings.TrimSpace(options.AgentProfileID), customInstructions: customInstructionConfig(options.CustomInstructions), projectRoleConfig: options.CustomInstructions, agentModel: cloneStringPtr(options.AgentModel), retryBaseDelay: retryBaseDelay, retryMaxAttempts: retryMax, onAgentExecutionStarted: options.OnAgentExecutionStarted, onQueueItemEnqueued: options.OnQueueItemEnqueued, discoveryPolicy: policy, reproductionGate: options.ReproductionGate}
 }
 
 func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (DiscoveryResult, error) {
@@ -569,6 +604,18 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 			result.Skipped++
 			continue
 		}
+		// A bug whose reproduction has not settled is withheld here as well as on
+		// Triager's explicit route. Without this, an Issue that also carries
+		// Planner's labels is planned directly whenever Reproducer has not caught
+		// up — an exhausted per-tick decision budget is enough — and the
+		// "reproduce before planning" guarantee would hold only when nothing else
+		// was busy.
+		if allowed, err := r.reproductionAllows(ctx, project.ID, input.Repo, issue.Number); err != nil {
+			return DiscoveryResult{}, err
+		} else if !allowed {
+			result.Skipped++
+			continue
+		}
 		fingerprint := buildPlannerDiscoveryFingerprint(input.Repo, r.now(), issue)
 		materialized, err := r.materializeIssue(ctx, *project, input.Repo, issue, login, fingerprint, "")
 		if err != nil {
@@ -579,6 +626,15 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 		result.Skipped += materialized.Skipped
 	}
 	return result, nil
+}
+
+// reproductionAllows asks the configured gate whether this Issue may be planned
+// now. No gate means the Role is not running, and every Issue is allowed.
+func (r *Runner) reproductionAllows(ctx context.Context, projectID, repo string, issueNumber int64) (bool, error) {
+	if r.reproductionGate == nil {
+		return true, nil
+	}
+	return r.reproductionGate.IssueAllowed(ctx, projectID, repo, issueNumber)
 }
 
 // RouteIssue projects a persisted routing authority into Planner's durable

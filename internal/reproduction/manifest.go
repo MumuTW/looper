@@ -19,11 +19,19 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 )
+
+// maxReproductionFileBytes bounds how much of an agent-named reproduction file
+// is read into memory. The paths are untrusted agent input, so a symlink to
+// /dev/zero must not let the daemon consume memory until it is killed. The cap
+// is generous for a real test file and enforced through a streaming reader
+// rather than an unbounded os.ReadFile.
+const maxReproductionFileBytes = 16 << 20 // 16 MiB
 
 // ManifestRelPath is where the Reproduction Record lives inside a worktree. It
 // is committed, not a scratch sentinel: a reviewer reading the pull request can
@@ -54,9 +62,10 @@ type Manifest struct {
 	Command string `json:"command"`
 	// Files are the reproduction test files, hashed at commit time.
 	Files []FileHash `json:"files"`
-	// ObservedFailure is the failure mode the Reproducer actually saw, quoted
-	// from the command output, so a human can check it against the Issue report.
-	ObservedFailure string `json:"observedFailure,omitempty"`
+	// ExpectedFailure is the structured, verified signature of the failure this
+	// reproduction claims. It is a narrow validated field rather than the raw
+	// command output: the manifest is committed and pushed with the pull request.
+	ExpectedFailure ExpectedFailure `json:"expectedFailure"`
 	// BaseSHA is the commit the command was proven to fail on.
 	BaseSHA string `json:"baseSha,omitempty"`
 	// IdempotencyKey identifies the reproduction attempt that produced this
@@ -73,10 +82,10 @@ type Manifest struct {
 // authenticate nothing, since the same agent could supply a hash of whatever it
 // wanted the file to look like.
 type Draft struct {
-	Version         int      `json:"version"`
-	Command         string   `json:"command"`
-	Files           []string `json:"files"`
-	ObservedFailure string   `json:"observedFailure,omitempty"`
+	Version         int             `json:"version"`
+	Command         string          `json:"command"`
+	Files           []string        `json:"files"`
+	ExpectedFailure ExpectedFailure `json:"expectedFailure"`
 }
 
 // ManifestPath returns the absolute manifest path inside a worktree.
@@ -122,6 +131,10 @@ func DecodeManifest(raw []byte) (Manifest, error) {
 	if len(manifest.Files) == 0 {
 		return Manifest{}, fmt.Errorf("decode reproduction manifest: at least one reproduction file is required")
 	}
+	if err := manifest.ExpectedFailure.Validate(); err != nil {
+		return Manifest{}, fmt.Errorf("decode reproduction manifest: %w", err)
+	}
+	manifest.ExpectedFailure = manifest.ExpectedFailure.Normalize()
 	return manifest, nil
 }
 
@@ -143,6 +156,13 @@ func DecodeDraft(raw []byte) (Draft, error) {
 	if len(draft.Files) == 0 {
 		return Draft{}, fmt.Errorf("decode reproduction draft: at least one reproduction file is required")
 	}
+	// expectedFailure is required: a bare non-zero exit is not proof of the
+	// reported bug, and this structured signature is what the proof checks the
+	// declared files and the observed output against.
+	if err := draft.ExpectedFailure.Validate(); err != nil {
+		return Draft{}, fmt.Errorf("decode reproduction draft: %w", err)
+	}
+	draft.ExpectedFailure = draft.ExpectedFailure.Normalize()
 	return draft, nil
 }
 
@@ -179,29 +199,87 @@ func HashFiles(worktreePath string, paths []string) ([]FileHash, error) {
 }
 
 func hashFile(absolute string) (string, error) {
-	contents, err := os.ReadFile(absolute)
+	file, err := os.Open(absolute)
 	if err != nil {
 		return "", fmt.Errorf("hash reproduction file: %w", err)
 	}
-	sum := sha256.Sum256(contents)
-	return hex.EncodeToString(sum[:]), nil
+	defer file.Close()
+	hasher := sha256.New()
+	if err := copyBounded(hasher, file, absolute); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(hasher.Sum(nil)), nil
 }
 
-// resolveInsideWorktree rejects absolute paths and traversal. The manifest is
-// agent-authored, so a path it names is untrusted input.
+// readBoundedFile reads a reproduction file under the same size bound as
+// hashing. Callers get os.IsNotExist errors unwrapped so a missing file stays
+// distinguishable from a containment or size rejection.
+func readBoundedFile(absolute string) (string, error) {
+	file, err := os.Open(absolute)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	var builder strings.Builder
+	if err := copyBounded(&builder, file, absolute); err != nil {
+		return "", err
+	}
+	return builder.String(), nil
+}
+
+// copyBounded streams at most maxReproductionFileBytes from an agent-named file.
+// Reading one byte past the cap is what lets an over-large file be *detected*
+// rather than silently truncated, and streaming is what keeps a symlink to
+// /dev/zero from exhausting memory before the cap is noticed.
+func copyBounded(dst io.Writer, src io.Reader, absolute string) error {
+	written, err := io.Copy(dst, io.LimitReader(src, maxReproductionFileBytes+1))
+	if err != nil {
+		return fmt.Errorf("read reproduction file: %w", err)
+	}
+	if written > maxReproductionFileBytes {
+		return fmt.Errorf("reproduction file %s exceeds the %d-byte limit", absolute, maxReproductionFileBytes)
+	}
+	return nil
+}
+
+// resolveInsideWorktree rejects absolute paths, traversal, and symlinks that
+// escape the worktree. The manifest is agent-authored, so a path it names is
+// untrusted input: a lexical prefix check alone is defeated by an in-worktree
+// symlink whose target is outside the tree (or a device file such as
+// /dev/zero). The real target is resolved and verified to stay inside the
+// worktree before any caller reads it.
 func resolveInsideWorktree(worktreePath, rel string) (string, error) {
 	if filepath.IsAbs(rel) {
 		return "", fmt.Errorf("reproduction file path must be worktree-relative: %s", rel)
 	}
-	root, err := filepath.Abs(worktreePath)
+	root, err := resolvedWorktreeRoot(worktreePath)
 	if err != nil {
 		return "", err
 	}
 	joined := filepath.Join(root, filepath.FromSlash(rel))
-	if joined != root && !strings.HasPrefix(joined, root+string(os.PathSeparator)) {
+	// Resolve symlinks in the named path (and any intermediate directories) so
+	// the containment check measures the real target, not the lexical link.
+	resolved, err := filepath.EvalSymlinks(joined)
+	if err != nil {
+		// The path may not exist yet. Fall back to a lexical check on the joined
+		// path so traversal is still rejected; a later Stat/Open surfaces a
+		// dangling or missing link as a normal missing-file error.
+		resolved = joined
+	}
+	if resolved != root && !strings.HasPrefix(resolved, root+string(os.PathSeparator)) {
 		return "", fmt.Errorf("reproduction file path escapes the worktree: %s", rel)
 	}
-	return joined, nil
+	return resolved, nil
+}
+
+// resolvedWorktreeRoot is the worktree root with its own symlinks resolved, so a
+// worktree reached through a symlinked root is still compared against the real
+// target of an agent-named file.
+func resolvedWorktreeRoot(worktreePath string) (string, error) {
+	if root, err := filepath.EvalSymlinks(worktreePath); err == nil {
+		return root, nil
+	}
+	return filepath.Abs(worktreePath)
 }
 
 func normalizePaths(values []string) []string {
@@ -241,8 +319,9 @@ func PromptBlock(manifest Manifest) string {
 	for _, file := range manifest.Files {
 		fmt.Fprintf(&builder, "- Reproduction test file: %s\n", file.Path)
 	}
-	if observed := strings.TrimSpace(manifest.ObservedFailure); observed != "" {
-		fmt.Fprintf(&builder, "\nObserved failure before the fix:\n\n```\n%s\n```\n", observed)
+	if expected := manifest.ExpectedFailure.Normalize(); !expected.IsZero() {
+		fmt.Fprintf(&builder, "- Failing test: %s\n", expected.Test)
+		fmt.Fprintf(&builder, "- Observed failure before the fix: %s\n", expected.Message)
 	}
 	builder.WriteString("\nThe change is complete only when that command passes and the repository's own validation suite still passes.\n")
 	builder.WriteString("Do not edit, weaken, skip, or delete the reproduction files or `" + ManifestRelPath +

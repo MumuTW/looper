@@ -5619,6 +5619,9 @@ func (h *Handler) deliverHumanAnswer(ctx context.Context, loopID string, rawAnsw
 
 	services := h.context.Runtime.Services()
 	nowISO := eventlog.FormatJavaScriptISOString(h.now().UTC())
+	// resumes is decided inside the transaction from the ask the human actually
+	// answered, and applied after it.
+	resumes := true
 	_, err := storage.WithTransactionValue(ctx, services.Coordinator.DB(), nil, func(tx *sql.Tx) (storage.LoopRecord, error) {
 		repos := storage.NewRepositories(tx)
 		loop, err := repos.Loops.GetByID(ctx, loopID)
@@ -5632,6 +5635,7 @@ func (h *Handler) deliverHumanAnswer(ctx context.Context, loopID string, rawAnsw
 			return storage.LoopRecord{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Loop %s is not awaiting a human (status: %s)", loopID, loop.Status)}
 		}
 		ask, _ := loops.ReadHITLAsk(loop.MetadataJSON)
+		resumes = ask.AnswerResumes(answer)
 		ask.Answer = answer
 		ask.Status = "answered"
 		ask.AnsweredAt = nowISO
@@ -5655,6 +5659,13 @@ func (h *Handler) deliverHumanAnswer(ctx context.Context, loopID string, rawAnsw
 		return loopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 	}
 
+	// An answer the ask declared non-resuming settles the question without
+	// restarting the loop. Transitioning to running would requeue it and create
+	// the very work the human just declined — the answer would be recorded and
+	// then contradicted in the same request.
+	if !resumes {
+		return h.mutateLoopStatus(ctx, loopID, domain.LoopStatusPaused)
+	}
 	// Transition awaiting_human -> running (requeues + triggers a scheduler tick)
 	// so the next claim resumes the run with the stored answer.
 	return h.mutateLoopStatus(ctx, loopID, domain.LoopStatusRunning)

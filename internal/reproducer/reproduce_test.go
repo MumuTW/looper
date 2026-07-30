@@ -29,8 +29,8 @@ func TestReproducerCommitsAndRecordsAProvenFailure(t *testing.T) {
 	if len(record.Files) != 1 || record.Files[0].Path != "pkg/crash_test.go" || record.Files[0].SHA256 == "" {
 		t.Fatalf("record files = %#v, want the reproduction file hashed at commit time", record.Files)
 	}
-	if !status.PlannerAllowed() {
-		t.Fatalf("status.PlannerAllowed() = false, want Planner unblocked after a reproduction")
+	if !status.PlannerAllowed(testCandidateKey()) {
+		t.Fatalf("status.PlannerAllowed(testCandidateKey()) = false, want Planner unblocked after a reproduction")
 	}
 	if len(fixture.git.commits) != 1 || !strings.Contains(fixture.git.commits[0].Message, reproduction.CommitMarker(record.IdempotencyKey)) {
 		t.Fatalf("commits = %#v, want a single marked reproduction commit", fixture.git.commits)
@@ -67,8 +67,8 @@ func TestReproducerRejectsACandidateThatPassesImmediately(t *testing.T) {
 	if status.Unreproducible == nil || status.Unreproducible.Reason != reproduction.ReasonCommandPassedOnBase {
 		t.Fatalf("status.Unreproducible = %#v, want %s", status.Unreproducible, reproduction.ReasonCommandPassedOnBase)
 	}
-	if status.PlannerAllowed() {
-		t.Fatalf("status.PlannerAllowed() = true, want Planner still blocked")
+	if status.PlannerAllowed(testCandidateKey()) {
+		t.Fatalf("status.PlannerAllowed(testCandidateKey()) = true, want Planner still blocked")
 	}
 	if len(fixture.git.commits) != 0 {
 		t.Fatalf("commits = %#v, want nothing committed for a non-reproduction", fixture.git.commits)
@@ -94,10 +94,12 @@ func TestReproducerAdoptsItsOwnCommittedWorkAfterACrash(t *testing.T) {
 	if err := reproduction.WriteManifest(fixture.worktree, reproduction.Manifest{
 		Version: reproduction.ManifestVersion, Repo: testRepo, IssueNumber: testIssue,
 		Command: "go test ./pkg -run TestCrash", Files: hashes, IdempotencyKey: key, BaseSHA: "base000",
+		ExpectedFailure: reproduction.ExpectedFailure{Test: testSignatureTest, Message: testSignatureMessage},
 	}); err != nil {
 		t.Fatalf("WriteManifest() error = %v", err)
 	}
 	fixture.git.headSHA = "recovered1"
+	fixture.git.headFiles = []string{"pkg/crash_test.go", reproduction.ManifestRelPath}
 
 	result := fixture.discover()
 	if result.Reproduced != 1 {
@@ -145,7 +147,7 @@ func TestReproducerLeavesAnIncompleteAgentTurnOpen(t *testing.T) {
 		t.Fatalf("DiscoverIssues() = %#v, want the attempt left open", result)
 	}
 	status := fixture.status()
-	if status.Settled() {
+	if status.Settled(testCandidateKey()) {
 		t.Fatalf("status = %#v, want nothing settled by an incomplete agent turn", status)
 	}
 	if !status.Attempted {
@@ -168,5 +170,48 @@ func TestReproducerPromptRefusesToInventAPassingTest(t *testing.T) {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("prompt missing %q", want)
 		}
+	}
+}
+
+// The reproduction commit must carry exactly the declared reproduction files
+// plus the manifest. An undeclared file swept into the commit is rejected
+// rather than recorded as the authority, so reverting it later cannot make the
+// command pass without fixing the bug.
+func TestReproducerRejectsACommitWithUndeclaredFiles(t *testing.T) {
+	t.Parallel()
+	fixture := newFixture(t)
+	fixture.seedTriageReport(triager.ClassificationBug)
+	fixture.writeAgentDraft("go test ./pkg -run TestCrash", map[string]string{"pkg/crash_test.go": "func TestCrash(t *testing.T) { panic(1) }"})
+	// Simulate `git add -A` having swept an undeclared source edit into the
+	// head commit alongside the declared artifacts.
+	fixture.git.headFiles = []string{"pkg/crash_test.go", reproduction.ManifestRelPath, "src/exploratory.go"}
+
+	result := fixture.discover()
+	if result.Reproduced != 0 || result.Unreproducible != 1 {
+		t.Fatalf("DiscoverIssues() = %#v, want the undeclared commit rejected", result)
+	}
+	status := fixture.status()
+	if status.Record != nil {
+		t.Fatalf("status.Record = %#v, want no authority recorded for an undeclared commit", status.Record)
+	}
+}
+
+// A proof command that could not be executed (timeout, cancellation,
+// infrastructure) is a transient condition. The Issue must be left open for the
+// next tick rather than permanently parked for a human.
+func TestReproducerRetriesAProofCommandErrorInsteadOfParking(t *testing.T) {
+	t.Parallel()
+	fixture := newFixture(t)
+	fixture.seedTriageReport(triager.ClassificationBug)
+	fixture.writeAgentDraft("go test ./pkg -run TestCrash", map[string]string{"pkg/crash_test.go": "func TestCrash(t *testing.T) { panic(1) }"})
+	fixture.proofResult = &reproduction.Result{Reason: reproduction.ReasonCommandError, Summary: "command timed out"}
+
+	result := fixture.discover()
+	if result.Reproduced != 0 || result.Unreproducible != 0 || result.Skipped != 1 {
+		t.Fatalf("DiscoverIssues() = %#v, want the attempt left open (skipped), not parked", result)
+	}
+	status := fixture.status()
+	if status.Settled(testCandidateKey()) {
+		t.Fatalf("status = %#v, want nothing settled by a transient command error", status)
 	}
 }

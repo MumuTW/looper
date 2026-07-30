@@ -34,6 +34,7 @@ import (
 	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/loops/failureclass"
 	"github.com/nexu-io/looper/internal/processcontainment"
+	"github.com/nexu-io/looper/internal/reproduction"
 	"github.com/nexu-io/looper/internal/storage"
 	"github.com/nexu-io/looper/internal/validation"
 	"github.com/nexu-io/looper/internal/worktreesafety"
@@ -3256,6 +3257,23 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 	// the content that passed.
 	agentMayPush := fixerAgentMayPush(r.allowAutoPush, r.validationCommands)
 	prompt, instructionBlock := buildFixerPrompt(input.Project.ID, r.customInstructions, input.Repo, input.PRNumber, checkpoint.Detail, checkpoint.FixItems, agentMayPush, r.disclosure, agentVendor, derefString(agentModel))
+	// A reproduction committed on this branch governs Fixer's repair too, and
+	// Fixer is the Role most likely to trip over it unannounced: without the
+	// contract it is not told which files are immutable or which command must stay
+	// green, so it can pass the repository's own validation and only discover the
+	// reproduction failure after its turn has ended — a manual intervention that
+	// one informed turn would have avoided.
+	//
+	// Pinning happens here, before the agent runs, rather than at validation time.
+	// On a first pass the governing Issue is knowable only from the manifest, so an
+	// agent that deleted it left the gate with nothing to discover and both checks
+	// were skipped — exactly the tampering the gate exists to prevent.
+	if manifest, present, manifestErr := reproduction.ReadManifest(worktree.Path); manifestErr == nil && present {
+		prompt += reproduction.PromptBlock(manifest)
+		if pinErr := r.pinReproductionIssue(ctx, input.Loop, worktree.Path); pinErr != nil {
+			return checkpoint, &loopError{message: "Reproduction gate could not be pinned to its Issue: " + pinErr.Error(), kind: FailureRetryableTransient}
+		}
+	}
 	if len(r.validationCommands) > 0 {
 		prompt += validationGatedLocalOnlyPrompt
 	}

@@ -70,13 +70,18 @@ type Unreproducible struct {
 
 // Waiver is a human's authorization to proceed without a reproduction.
 type Waiver struct {
-	Version     int    `json:"version"`
-	ProjectID   string `json:"projectId"`
-	Repo        string `json:"repo"`
-	IssueNumber int64  `json:"issueNumber"`
-	Answer      string `json:"answer"`
-	LoopID      string `json:"loopId,omitempty"`
-	WaivedAt    string `json:"waivedAt"`
+	Version int `json:"version"`
+	// IdempotencyKey names the reproduction attempt — and through it the triage
+	// report — this waiver answers. A waiver is a decision about one report's
+	// evidence, so it must not silently authorize a later report minted from a
+	// superseding comment or edit.
+	IdempotencyKey string `json:"idempotencyKey,omitempty"`
+	ProjectID      string `json:"projectId"`
+	Repo           string `json:"repo"`
+	IssueNumber    int64  `json:"issueNumber"`
+	Answer         string `json:"answer"`
+	LoopID         string `json:"loopId,omitempty"`
+	WaivedAt       string `json:"waivedAt"`
 }
 
 // Status is one Issue's reproduction state as reconstructed from the log.
@@ -88,18 +93,58 @@ type Status struct {
 	Waived         *Waiver
 }
 
-// Settled reports whether the Issue needs no further Reproducer work. An
-// unreproducible Issue is settled from Reproducer's point of view even though a
-// human may later waive it.
-func (s Status) Settled() bool {
-	return s.Record != nil || s.Unreproducible != nil || s.Waived != nil
+// Settled reports whether the Issue needs no further Reproducer work for the
+// reproduction attempt identified by key. An unreproducible Issue is settled
+// from Reproducer's point of view even though a human may later waive it.
+//
+// Scoping by key is what keeps supersession honest. When a new comment or edit
+// supersedes the triage source, Triager mints a new report and Reproducer
+// derives a new key from it; the previous attempt's record, cannot-reproduce, or
+// waiver was a decision about the *previous* evidence and settles nothing about
+// the new one. Keyless callers (a record written before keys were scoped) are
+// treated as belonging to no attempt rather than to every attempt.
+func (s Status) Settled(key string) bool {
+	return s.recordFor(key) != nil || s.unreproducibleFor(key) != nil || s.waiverFor(key) != nil
 }
 
-// PlannerAllowed reports whether Planner may be reached for this Issue. This is
-// the gate that makes "cannot reproduce" stop the Issue before planning cost is
-// paid rather than after.
-func (s Status) PlannerAllowed() bool {
-	return s.Record != nil || s.Waived != nil
+// PlannerAllowed reports whether Planner may be reached for the attempt
+// identified by key. This is the gate that makes "cannot reproduce" stop the
+// Issue before planning cost is paid rather than after.
+func (s Status) PlannerAllowed(key string) bool {
+	return s.recordFor(key) != nil || s.waiverFor(key) != nil
+}
+
+func (s Status) recordFor(key string) *Record {
+	if s.Record != nil && keyMatches(s.Record.IdempotencyKey, key) {
+		return s.Record
+	}
+	return nil
+}
+
+// UnreproducibleFor and WaiverFor expose the key-scoped lookups to the lane, so
+// "is this Issue parked?" is always asked about a specific attempt.
+func (s Status) UnreproducibleFor(key string) *Unreproducible { return s.unreproducibleFor(key) }
+
+// WaiverFor returns the waiver recorded against this attempt, if any.
+func (s Status) WaiverFor(key string) *Waiver { return s.waiverFor(key) }
+
+func (s Status) unreproducibleFor(key string) *Unreproducible {
+	if s.Unreproducible != nil && keyMatches(s.Unreproducible.IdempotencyKey, key) {
+		return s.Unreproducible
+	}
+	return nil
+}
+
+func (s Status) waiverFor(key string) *Waiver {
+	if s.Waived != nil && keyMatches(s.Waived.IdempotencyKey, key) {
+		return s.Waived
+	}
+	return nil
+}
+
+func keyMatches(recorded, want string) bool {
+	recorded, want = strings.TrimSpace(recorded), strings.TrimSpace(want)
+	return recorded != "" && recorded == want
 }
 
 // EntityID matches Triager's entity identifier exactly so both Roles' records

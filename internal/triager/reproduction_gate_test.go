@@ -90,3 +90,31 @@ func TestLoadAcceptedReportsExposesOnlyAuthorizedReports(t *testing.T) {
 		t.Fatalf("LoadAcceptedReports() = %#v, want a policy-held report excluded until confirmed", reports)
 	}
 }
+
+// Enabling Reproducer in a repository with in-flight bug reports must not hand
+// it work Planner has already started. A pre-Planner Role can only act before
+// Planner; running afterwards would restore the same branch and worktree and
+// could commit a reproduction into active work.
+func TestLoadAcceptedReportsExcludesReportsPlannerAlreadyTook(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	fixture.llm.responses = []string{eligibleDecisionJSON()}
+
+	// A tick with no gate: the report is minted and routed to Planner, exactly
+	// the state a repository is in when the flag is turned on mid-flight.
+	routed, err := fixture.runner().DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	if routed.Routed != 1 {
+		t.Fatalf("DiscoverIssues() = %#v, want the report routed to Planner", routed)
+	}
+
+	reports, err := LoadAcceptedReports(context.Background(), fixture.repos, "project_1", "acme/looper")
+	if err != nil {
+		t.Fatalf("LoadAcceptedReports() error = %v", err)
+	}
+	if len(reports) != 0 {
+		t.Fatalf("LoadAcceptedReports() = %#v, want an already-projected report withheld from the pre-Planner lane", reports)
+	}
+}

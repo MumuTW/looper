@@ -202,6 +202,8 @@ func discoveryLanes(input defaultSchedulerTickInput) []discoveryLane {
 	roles := config.EffectiveCodingRoles(roleConfigs)
 	names := config.CodingRoleNames(roleConfigs)
 
+	repro := reproducerLane(input)
+
 	lanes := make([]discoveryLane, 0, len(names)+3)
 	for _, name := range names {
 		role := roles[name]
@@ -210,14 +212,34 @@ func discoveryLanes(input defaultSchedulerTickInput) []discoveryLane {
 			continue
 		}
 		lane.Name = name
-		lane.Priority = role.Priority
+		lane.Priority = orderAfterInternalLanes(role.Priority, repro.Present)
 		lane.LogWhenDisabled = true
 		lanes = append(lanes, lane)
 	}
 
-	lanes = append(lanes, triagerLane(input), reproducerLane(input), coordinatorLane(input))
+	lanes = append(lanes, triagerLane(input), repro, coordinatorLane(input))
 	sort.SliceStable(lanes, func(i, j int) bool { return lanes[i].Priority < lanes[j].Priority })
 	return lanes
+}
+
+// orderAfterInternalLanes keeps a configurable coding role behind the internal
+// lanes whenever Reproducer is compiled in.
+//
+// `roles.coding.<name>.priority` is a supported authoring surface, and a value
+// below PriorityReproducer would run Planner before Triager and Reproducer.
+// Planner would then legitimately find no triage report and take the documented
+// no-report path, permanently defeating the pre-Planning reproduction guarantee
+// — a correctness property silently disabled by an ordinary configuration
+// value. The ordering is therefore imposed rather than validated: failing the
+// daemon over a priority that was previously legal is a worse trade than
+// quietly honouring the invariant the role exists to provide. Relative order
+// among the coding roles themselves is preserved, because the sort is stable
+// and this only raises priorities that were already below the floor.
+func orderAfterInternalLanes(priority int, reproducerPresent bool) int {
+	if !reproducerPresent || priority > config.PriorityReproducer {
+		return priority
+	}
+	return config.PriorityReproducer + 1
 }
 
 // laneLabel is the lane name used in logs and wrapped errors. Preserved

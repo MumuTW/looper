@@ -9,6 +9,7 @@ import (
 	"time"
 
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
+	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/planner"
 	"github.com/nexu-io/looper/internal/reproduction"
 	"github.com/nexu-io/looper/internal/storage"
@@ -19,19 +20,33 @@ const (
 	testProjectID = "project_1"
 	testRepo      = "acme/looper"
 	testIssue     = int64(41)
+
+	// The signature the fixture's agent draft claims. The daemon checks it
+	// against the declared file's content and the command output; the fixture's
+	// proof seam stands in for the latter.
+	testSignatureTest    = "TestCrashOnEmptyInput"
+	testSignatureMessage = "panic: index out of range"
 )
 
+// testCandidateKey is the reproduction key the fixture's seeded triage report
+// produces. Records are scoped to it, so tests that assert on settlement have to
+// name the same attempt the lane does.
+func testCandidateKey() string {
+	return reproduction.IdempotencyKey(testProjectID, testRepo, testIssue, "triage:seed")
+}
+
 type fixture struct {
-	t         *testing.T
-	now       time.Time
-	repos     *storage.Repositories
-	project   storage.ProjectRecord
-	github    *fakeGitHub
-	git       *fakeGit
-	agent     *fakeAgent
-	planner   *fakePlanner
-	worktree  string
-	proofPass bool
+	t           *testing.T
+	now         time.Time
+	repos       *storage.Repositories
+	project     storage.ProjectRecord
+	github      *fakeGitHub
+	git         *fakeGit
+	agent       *fakeAgent
+	planner     *fakePlanner
+	worktree    string
+	proofPass   bool
+	proofResult *reproduction.Result
 }
 
 func newFixture(t *testing.T) *fixture {
@@ -74,6 +89,9 @@ func (f *fixture) runner() *Runner {
 		Repos: f.repos, GitHub: f.github, Git: f.git, AgentExecutor: f.agent, Planner: f.planner,
 		Now: func() time.Time { return f.now },
 		proveFailing: func(_ context.Context, input reproduction.Input) (reproduction.Result, error) {
+			if f.proofResult != nil {
+				return *f.proofResult, nil
+			}
 			if f.proofPass {
 				return reproduction.Result{Reason: reproduction.ReasonCommandPassedOnBase, Summary: "passed on base"}, nil
 			}
@@ -117,6 +135,24 @@ func (f *fixture) seedTriageReport(classification triager.Classification) triage
 	return report
 }
 
+// answerParkedLoop stands in for a human answering the HITL ask on the loop the
+// park created, which is the only way a parked Issue proceeds.
+func (f *fixture) answerParkedLoop(answer string) {
+	f.t.Helper()
+	stamp := f.now.Format(time.RFC3339Nano)
+	metadata, err := loops.WriteHITLAsk(nil, loops.HITLAsk{Status: "answered", Answer: answer})
+	if err != nil {
+		f.t.Fatalf("WriteHITLAsk() error = %v", err)
+	}
+	f.planner.loop = storage.LoopRecord{
+		ID: "loop_parked", ProjectID: testProjectID, Type: "planner", TargetType: "issue",
+		Status: "queued", MetadataJSON: &metadata, CreatedAt: stamp, UpdatedAt: stamp,
+	}
+	if err := f.repos.Loops.Upsert(context.Background(), f.planner.loop); err != nil {
+		f.t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+}
+
 func (f *fixture) status() reproduction.Status {
 	f.t.Helper()
 	status, err := reproduction.LoadStatus(context.Background(), f.repos, testProjectID, testRepo, testIssue)
@@ -139,7 +175,10 @@ func (f *fixture) writeAgentDraft(command string, files map[string]string) {
 		}
 		paths = append(paths, rel)
 	}
-	draft := map[string]any{"version": reproduction.ManifestVersion, "command": command, "files": paths, "observedFailure": "panic: index out of range"}
+	draft := map[string]any{
+		"version": reproduction.ManifestVersion, "command": command, "files": paths,
+		"expectedFailure": map[string]any{"test": testSignatureTest, "message": testSignatureMessage},
+	}
 	f.writeWorktreeJSON(reproduction.ManifestRelPath, draft)
 }
 
@@ -180,6 +219,13 @@ type fakeGit struct {
 	dirty        bool
 	commits      []planner.CommitInput
 	createCalls  int
+	// headFiles is the set of paths HeadCommitFiles reports for the head commit.
+	// When nil it defaults to the paths of the most recent Commit, so a clean
+	// reproduction commit verifies by default.
+	headFiles []string
+	// discarded records every worktree cleanup, so a handoff that leaves the
+	// branch dirty is visible to a test rather than only to Planner's next commit.
+	discarded []planner.DiscardChangesInput
 }
 
 func (f *fakeGit) CreateWorktree(context.Context, planner.CreateWorktreeInput) (planner.CreateWorktreeResult, error) {
@@ -194,7 +240,19 @@ func (f *fakeGit) InspectHead(context.Context, planner.InspectHeadInput) (planne
 func (f *fakeGit) Commit(_ context.Context, input planner.CommitInput) (planner.CommitResult, error) {
 	f.commits = append(f.commits, input)
 	f.headSHA = "repro111"
+	if f.headFiles == nil {
+		f.headFiles = append([]string(nil), input.Paths...)
+	}
 	return planner.CommitResult{CommitSHA: f.headSHA}, nil
+}
+
+func (f *fakeGit) HeadCommitFiles(context.Context, string) ([]string, error) {
+	return append([]string(nil), f.headFiles...), nil
+}
+
+func (f *fakeGit) DiscardChanges(_ context.Context, input planner.DiscardChangesInput) error {
+	f.discarded = append(f.discarded, input)
+	return nil
 }
 
 type fakeAgent struct {

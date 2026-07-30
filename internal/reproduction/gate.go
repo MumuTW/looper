@@ -18,18 +18,18 @@ import (
 // reached, and it — not the worktree copy, and not any agent's claim to have
 // written a test — is what Worker's and Fixer's gate is checked against.
 type Record struct {
-	Version         int        `json:"version"`
-	ProjectID       string     `json:"projectId"`
-	Repo            string     `json:"repo"`
-	IssueNumber     int64      `json:"issueNumber"`
-	Branch          string     `json:"branch"`
-	Command         string     `json:"command"`
-	Files           []FileHash `json:"files"`
-	CommitSHA       string     `json:"commitSha"`
-	BaseSHA         string     `json:"baseSha,omitempty"`
-	ObservedFailure string     `json:"observedFailure,omitempty"`
-	IdempotencyKey  string     `json:"idempotencyKey"`
-	RecordedAt      string     `json:"recordedAt"`
+	Version         int             `json:"version"`
+	ProjectID       string          `json:"projectId"`
+	Repo            string          `json:"repo"`
+	IssueNumber     int64           `json:"issueNumber"`
+	Branch          string          `json:"branch"`
+	Command         string          `json:"command"`
+	Files           []FileHash      `json:"files"`
+	CommitSHA       string          `json:"commitSha"`
+	BaseSHA         string          `json:"baseSha,omitempty"`
+	ExpectedFailure ExpectedFailure `json:"expectedFailure"`
+	IdempotencyKey  string          `json:"idempotencyKey"`
+	RecordedAt      string          `json:"recordedAt"`
 }
 
 // Reason is a stable, non-generic identifier for why a reproduction check
@@ -50,6 +50,12 @@ const (
 	// ReasonCommandPassedOnBase means a candidate reproduction passed immediately.
 	// A command that passes before any fix is not a reproduction.
 	ReasonCommandPassedOnBase Reason = "reproduction_command_passed_on_base"
+	// ReasonUnexpectedFailure means the command failed, but the failure did not
+	// match the expected failure signature recorded for this reproduction. A
+	// nonzero exit caused by a syntax error, a setup failure, or an unrelated
+	// already-failing test is not proof of the reported bug, so it is rejected
+	// rather than elevated into the reproduction authority.
+	ReasonUnexpectedFailure Reason = "reproduction_unexpected_failure"
 )
 
 // Result is the outcome of one reproduction check.
@@ -87,9 +93,21 @@ func Verify(ctx context.Context, input Input) (Result, error) {
 	if err != nil {
 		var commandErr *shell.CommandExecutionError
 		if errors.As(err, &commandErr) {
+			// Only an ordinary nonzero exit means the bug is still failing. A
+			// timeout, cancellation, or infrastructure failure is a transient
+			// execution problem, not a reproduction verdict: mislabelling it as
+			// "still failing" would force manual intervention for a condition
+			// that retries on its own.
+			if commandErr.Category == shell.FailureNonZeroExit {
+				return Result{
+					Reason:  ReasonCommandFailed,
+					Summary: fmt.Sprintf("Reproduction still fails: %s", input.Record.Command),
+					Output:  output,
+				}, nil
+			}
 			return Result{
-				Reason:  ReasonCommandFailed,
-				Summary: fmt.Sprintf("Reproduction still fails: %s", input.Record.Command),
+				Reason:  ReasonCommandError,
+				Summary: fmt.Sprintf("Reproduction command did not complete: %s", input.Record.Command),
 				Output:  output,
 			}, nil
 		}
@@ -121,11 +139,12 @@ func ProveFailing(ctx context.Context, input Input) (Result, error) {
 					Output:  output,
 				}, nil
 			}
-			return Result{
-				Passed:  true,
-				Summary: fmt.Sprintf("Reproduction observed failing: %s", input.Record.Command),
-				Output:  output,
-			}, nil
+			// A non-zero exit alone is not proof of the reported bug: a syntax
+			// error, a setup failure, or an unrelated already-failing test all
+			// exit non-zero, and repairing any of those would turn the command
+			// green without fixing anything. The recorded signature must hold
+			// against both the declared files and the observed output.
+			return proveSignature(input, output), nil
 		}
 		return Result{
 			Reason:  ReasonCommandError,
@@ -138,6 +157,57 @@ func ProveFailing(ctx context.Context, input Input) (Result, error) {
 		Summary: fmt.Sprintf("Candidate reproduction passed on the current base, so it does not reproduce the bug: %s", input.Record.Command),
 		Output:  output,
 	}, nil
+}
+
+// proveSignature decides whether an observed non-zero exit is proof of *this*
+// bug rather than of some other breakage.
+//
+// The two checks are deliberately against different artifacts. The declared
+// reproduction files are hashed into the record, so requiring the test
+// identifier to appear in one of them binds the signature to content that
+// cannot later change without failing the integrity check. Requiring both
+// halves in the command output then proves the command actually reached that
+// test and failed there.
+func proveSignature(input Input, output string) Result {
+	expected := input.Record.ExpectedFailure.Normalize()
+	if err := expected.Validate(); err != nil {
+		return Result{
+			Reason:  ReasonUnexpectedFailure,
+			Summary: fmt.Sprintf("Reproduction command failed with no usable expected failure signature (%v): %s", err, input.Record.Command),
+			Output:  output,
+		}
+	}
+	declared, err := expected.declaredByFiles(input.WorktreePath, input.Record.Files)
+	if err != nil {
+		return Result{
+			Reason:  ReasonCommandError,
+			Summary: fmt.Sprintf("The declared reproduction files could not be read to confirm the expected failure signature: %v", err),
+			Output:  output,
+		}
+	}
+	if !declared {
+		return Result{
+			Reason: ReasonUnexpectedFailure,
+			Summary: fmt.Sprintf(
+				"The expected failure signature names test %q, which no declared reproduction file contains: %s",
+				expected.Test, input.Record.Command),
+			Output: output,
+		}
+	}
+	if !expected.matchesOutput(output) {
+		return Result{
+			Reason: ReasonUnexpectedFailure,
+			Summary: fmt.Sprintf(
+				"Reproduction command failed, but not with the expected failure of test %q: %s",
+				expected.Test, input.Record.Command),
+			Output: output,
+		}
+	}
+	return Result{
+		Passed:  true,
+		Summary: fmt.Sprintf("Reproduction observed failing in test %q: %s", expected.Test, input.Record.Command),
+		Output:  output,
+	}
 }
 
 // checkIntegrity re-checks the recorded files against their recorded hashes.

@@ -123,26 +123,48 @@ The subset of tracked Issues whose **Dependency gate** is currently released —
 **Reproduction Record**:
 Reproducer's durable structured record containing the reproduction command, the
 reproduction test file paths with their content hashes, the reproduction commit
-SHA, the base SHA the command was observed failing on, the observed failure, and
-the idempotency key. It is stored as a `reproduction.recorded` event and is the
-Authority for "this bug is reproduced". A copy travels with the branch as the
-committed **Reproduction manifest**; the record, not the copy, is what the
-completion gate is checked against.
+SHA, the base SHA the command was observed failing on, the **Expected failure
+signature**, and the idempotency key. It is stored as a `reproduction.recorded`
+event and is the Authority for "this bug is reproduced". A copy travels with the
+branch as the committed **Reproduction manifest**; the record, not the copy, is
+what the completion gate is checked against. The record is scoped to the Triage
+Report that authorized it through the idempotency key: a record, **Cannot
+reproduce**, or waiver settles only its own report, so a report minted from a
+superseding comment or edit is attempted afresh.
 _Avoid_: failing test, red test, repro.
+
+**Expected failure signature**:
+The structured pair — a test identifier and a single-line failure message — that
+names *which* failure the reproduction claims. A non-zero exit alone is not
+proof: a syntax error, a failed setup step, or an unrelated already-failing test
+all exit non-zero, and repairing any of those would turn the command green
+without fixing the bug. Reproducer accepts a candidate only when the test
+identifier appears in a declared reproduction file's content *and* both halves
+appear in the observed command output. Both halves are bounded and single-line,
+because the signature is the only part of the command's output persisted into
+the committed manifest.
+_Avoid_: observed failure, error message, output.
 
 **Reproduction manifest**:
 The `.looper/reproduction.json` file committed in the reproduction commit. It
 carries the Reproduction Record with the branch so Planner, Worker, and Fixer
 receive the reproduction's identity as explicit input rather than re-deriving it
-from the diff.
+from the diff. The reproduction commit's changed-file set is exactly the declared
+reproduction files plus the manifest; a commit that swept in undeclared work, or
+that omitted a declared file, is not recorded as the Authority. It carries the
+**Expected failure signature**, never raw command output.
 _Avoid_: sentinel, ask file.
 
 **Reproduction gate**:
 The completion precondition, additional to repository validation, that the
 recorded reproduction command passes and every recorded reproduction file still
-hashes to its recorded content. Worker and Fixer both enforce it. A hash
-mismatch or a missing file fails the run with a distinct, non-generic reason
-rather than as an ordinary validation failure.
+hashes to its recorded content. Worker and Fixer both enforce it, and Fixer
+resolves the governing Issue onto its loop before its agent runs, so deleting the
+manifest is detected as tampering rather than being a way out. A hash mismatch or
+a missing file fails the run with a distinct, non-generic reason rather than as
+an ordinary validation failure. Only a genuine non-zero exit is a verdict:
+timeouts, cancellations, and containment failures are retryable command errors,
+matching the existing validation failure policy.
 _Avoid_: validation gate, suite gate.
 
 **Cannot reproduce**:
@@ -150,8 +172,15 @@ Reproducer's decision that the reported bug could not be made to fail, recorded
 as a `reproduction.unreproducible` event with what was attempted, what was
 observed instead, and what information is missing. It is a decision, not a
 failure: it increments no attempts, trips no retry, and parks the Planner loop
-in `awaiting_human` with a HITL ask. A human answer either waives the
-reproduction (`reproduction.waived`) or leaves the Issue stopped.
+in `awaiting_human` with a HITL ask, on a worktree first returned to its
+committed state so a later waiver cannot publish the sentinel or the agent's
+unadopted experiments. A human answer either waives the reproduction
+(`reproduction.waived`) or leaves the Issue stopped — the latter is a
+non-resuming answer, so it settles the ask without requeueing Planner. A record
+the agent wrote with an unsupported version or no actionable detail still
+escalates, but says so instead of parking the Issue with nothing to act on. It
+is a verdict only when the command genuinely ran: a timed-out, cancelled, or
+contained proof leaves the attempt open for the next tick.
 _Avoid_: reproduction failure, crash.
 
 **Acceptance criterion**:
@@ -250,8 +279,10 @@ _Avoid_: local sandbox, mock sandbox.
 
 - A **Triager** performs **Triage** on a new or reopened GitHub **Issue**, producing a persisted **Triage Report**
 - An accepted low-risk **Triage Report** authorizes **Triage routing** directly to **Planner**
-- A bug-classified **Triage Report** authorizes **Reproducer**, and **Triage routing** to **Planner** is withheld until a **Reproduction Record** or a `reproduction.waived` record exists
-- A **Reproducer** produces either a **Reproduction Record** plus a reproduction commit on the branch **Planner** will adopt, or a **Cannot reproduce** decision that parks the Planner loop for a human
+- A bug-classified **Triage Report** authorizes **Reproducer**, and **Triage routing** to **Planner** is withheld until a **Reproduction Record** or a `reproduction.waived` record scoped to *that report* exists
+- Both of **Planner**'s doors consult the same report-aware gate: **Triage routing** and **Planner**'s own label/assignee discovery. An Issue with no accepted bug report is unaffected by either
+- The **Reproducer** lane runs after **Triager** and before **Planner** regardless of authored `roles.coding.*.priority` values, since the ordering is what makes "reproduce before planning" true rather than incidental
+- A **Reproducer** produces either a **Reproduction Record** plus a reproduction commit on the branch **Planner** will adopt, or a **Cannot reproduce** decision that parks the Planner loop for a human on a worktree returned to its committed state
 - **Planner**, **Worker**, and **Fixer** read the **Reproduction manifest** from their worktree as explicit input; **Worker** and **Fixer** additionally enforce the **Reproduction gate** on top of unchanged repository validation
 - A **Coordinator** performs label-mediated **Triage** on a fresh **Issue**, producing a **Disposition** plus classification labels
 - A **Coordinator** performs **Dispatch** on a Triaged Issue, producing a **Trigger label** that a **Planner** or **Worker** observes

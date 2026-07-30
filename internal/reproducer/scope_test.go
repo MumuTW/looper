@@ -50,7 +50,7 @@ func TestIssuesWithNoTriageReportAreOutOfScope(t *testing.T) {
 	if fixture.agent.starts != 0 || fixture.github.calls != 0 {
 		t.Fatalf("agent starts / issue lookups = %d / %d, want no work", fixture.agent.starts, fixture.github.calls)
 	}
-	if fixture.status().Settled() {
+	if fixture.status().Settled(testCandidateKey()) {
 		t.Fatalf("status = %#v, want no reproduction state for an unreported Issue", fixture.status())
 	}
 }

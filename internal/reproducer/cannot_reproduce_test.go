@@ -47,7 +47,7 @@ func TestCannotReproduceParksForAHumanInsteadOfRoutingToPlanner(t *testing.T) {
 	}
 
 	status := fixture.status()
-	if status.Unreproducible == nil || status.PlannerAllowed() {
+	if status.Unreproducible == nil || status.PlannerAllowed(testCandidateKey()) {
 		t.Fatalf("status = %#v, want a recorded cannot-reproduce that blocks Planner", status)
 	}
 	if status.Unreproducible.ObservedInstead != "the function returned the expected value" {
@@ -62,7 +62,7 @@ func TestCannotReproduceIsNotRetriedOnTheNextTick(t *testing.T) {
 	t.Parallel()
 	fixture := newFixture(t)
 	fixture.seedTriageReport(triager.ClassificationBug)
-	fixture.writeCannotReproduce(CannotReproduce{ObservedInstead: "no failure"})
+	fixture.writeCannotReproduce(CannotReproduce{Attempted: []string{"ran the reported command"}, ObservedInstead: "no failure"})
 
 	fixture.discover()
 	second := fixture.discover()
@@ -84,7 +84,7 @@ func TestHumanResumingTheParkedLoopWaivesTheReproduction(t *testing.T) {
 	t.Parallel()
 	fixture := newFixture(t)
 	fixture.seedTriageReport(triager.ClassificationBug)
-	fixture.writeCannotReproduce(CannotReproduce{ObservedInstead: "no failure"})
+	fixture.writeCannotReproduce(CannotReproduce{Attempted: []string{"ran the reported command"}, ObservedInstead: "no failure"})
 
 	stamp := fixture.now.Format(time.RFC3339Nano)
 	answered, err := loops.WriteHITLAsk(nil, loops.HITLAsk{Status: "answered", Answer: AnswerProceed})
@@ -105,7 +105,7 @@ func TestHumanResumingTheParkedLoopWaivesTheReproduction(t *testing.T) {
 		t.Fatalf("second DiscoverIssues() = %#v, want the human's authorization recorded", second)
 	}
 	status := fixture.status()
-	if status.Waived == nil || !status.PlannerAllowed() {
+	if status.Waived == nil || !status.PlannerAllowed(testCandidateKey()) {
 		t.Fatalf("status = %#v, want Planner unblocked by the waiver", status)
 	}
 

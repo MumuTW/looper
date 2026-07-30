@@ -75,6 +75,13 @@ type GitGateway interface {
 	CreateWorktree(context.Context, planner.CreateWorktreeInput) (planner.CreateWorktreeResult, error)
 	InspectHead(context.Context, planner.InspectHeadInput) (planner.InspectHeadResult, error)
 	Commit(context.Context, planner.CommitInput) (planner.CommitResult, error)
+	// HeadCommitFiles returns the paths changed in the head commit, used to
+	// verify a reproduction commit carries exactly the declared artifacts.
+	HeadCommitFiles(context.Context, string) ([]string, error)
+	// DiscardChanges returns the worktree to its committed state. Reproducer
+	// hands this branch to Planner, so an attempt that records nothing must not
+	// leave exploratory edits for Planner's fallback commit to sweep into the PR.
+	DiscardChanges(context.Context, planner.DiscardChangesInput) error
 }
 
 // AgentExecutor starts the reproduction agent session.
@@ -198,8 +205,12 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 	result := DiscoveryResult{}
 	for _, candidate := range candidates {
 		status := statuses[candidate.IssueNumber]
-		if status.Unreproducible != nil && status.Waived == nil {
-			waived, err := r.settleParkedIssue(ctx, *status.Unreproducible)
+		// Every decision below is scoped to this candidate's key, so a record,
+		// waiver, or cannot-reproduce belonging to a superseded triage report
+		// neither authorizes nor skips the current one.
+		parked := status.UnreproducibleFor(candidate.IdempotencyKey)
+		if parked != nil && status.WaiverFor(candidate.IdempotencyKey) == nil {
+			waived, err := r.settleParkedIssue(ctx, *parked)
 			if err != nil {
 				return result, err
 			}
@@ -210,7 +221,7 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 			}
 			continue
 		}
-		if status.Settled() {
+		if status.Settled(candidate.IdempotencyKey) {
 			result.Skipped++
 			continue
 		}
@@ -325,7 +336,7 @@ func (r *Runner) reproduce(ctx context.Context, project storage.ProjectRecord, r
 	if declined, ok, err := readCannotReproduce(worktree.Path); err != nil {
 		return err
 	} else if ok {
-		return r.recordUnreproducible(ctx, project, repo, detail, target, unreproducibleFrom(declined), result)
+		return r.recordUnreproducible(ctx, project, repo, detail, worktree, target, unreproducibleFrom(declined), result)
 	}
 
 	draft, ok, err := readDraft(worktree.Path)
@@ -333,7 +344,7 @@ func (r *Runner) reproduce(ctx context.Context, project storage.ProjectRecord, r
 		return err
 	}
 	if !ok {
-		return r.recordUnreproducible(ctx, project, repo, detail, target, reproduction.Unreproducible{
+		return r.recordUnreproducible(ctx, project, repo, detail, worktree, target, reproduction.Unreproducible{
 			Summary:         "The reproduction agent produced neither a reproduction manifest nor a cannot-reproduce record.",
 			ObservedInstead: strings.TrimSpace(agentResult.Summary),
 		}, result)
@@ -341,7 +352,7 @@ func (r *Runner) reproduce(ctx context.Context, project storage.ProjectRecord, r
 
 	hashes, err := reproduction.HashFiles(worktree.Path, draft.Files)
 	if err != nil {
-		return r.recordUnreproducible(ctx, project, repo, detail, target, reproduction.Unreproducible{
+		return r.recordUnreproducible(ctx, project, repo, detail, worktree, target, reproduction.Unreproducible{
 			Summary:         fmt.Sprintf("The reproduction manifest names files that cannot be hashed: %v", err),
 			ObservedInstead: strings.TrimSpace(agentResult.Summary),
 		}, result)
@@ -356,10 +367,12 @@ func (r *Runner) reproduce(ctx context.Context, project storage.ProjectRecord, r
 
 	// The proof: the command must be observed failing on the current base. A
 	// command that passes immediately is not a reproduction, no matter what the
-	// agent says it wrote.
+	// agent says it wrote. The agent's structured expectedFailure travels with
+	// the proof so an unrelated non-zero exit — a syntax error, a setup failure,
+	// an already-failing unrelated test — is not elevated into the authority.
 	proof, err := r.prove(ctx, reproduction.Input{
 		WorktreePath: worktree.Path,
-		Record:       reproduction.Record{Command: draft.Command, Files: hashes},
+		Record:       reproduction.Record{Command: draft.Command, Files: hashes, ExpectedFailure: draft.ExpectedFailure},
 		Timeout:      r.commandTimeout,
 		CodexCommand: r.validationCodexCommand,
 		Tracker:      r.containmentTracker,
@@ -368,16 +381,43 @@ func (r *Runner) reproduce(ctx context.Context, project storage.ProjectRecord, r
 		return err
 	}
 	if !proof.Passed {
-		return r.recordUnreproducible(ctx, project, repo, detail, target, reproduction.Unreproducible{
+		// A command that could not be executed (timeout, cancellation,
+		// infrastructure failure, or a missing expected failure signature) is a
+		// transient condition, not a verdict that the bug cannot be reproduced.
+		// Parking the Issue here would permanently stop it for a daemon or
+		// containment failure; leave the attempt open so the next tick retries.
+		if proof.Reason == reproduction.ReasonCommandError {
+			result.Skipped++
+			return nil
+		}
+		return r.recordUnreproducible(ctx, project, repo, detail, worktree, target, reproduction.Unreproducible{
 			Reason:          proof.Reason,
 			Summary:         proof.Summary,
-			ObservedInstead: proof.Output,
+			ObservedInstead: truncate(proof.Output),
 		}, result)
 	}
 
+	// Re-hash the reproduction files after the proof command ran. A command
+	// that rewrites a listed file while failing (a test runner updating a
+	// snapshot, for example) leaves the pre-command hashes stale; recording
+	// those would make the first downstream gate report tampering even though
+	// no later Role touched anything. The final hashes are the authority.
+	hashes, err = reproduction.HashFiles(worktree.Path, draft.Files)
+	if err != nil {
+		return r.recordUnreproducible(ctx, project, repo, detail, worktree, target, reproduction.Unreproducible{
+			Summary:         fmt.Sprintf("The reproduction files could not be re-hashed after the proof: %v", err),
+			ObservedInstead: truncate(proof.Output),
+		}, result)
+	}
+
+	// The manifest carries the verified expected-failure signature, never the raw
+	// command output: the manifest is committed and pushed with the PR, and the
+	// sandbox has read access to the linked Git common directory, tool paths and
+	// module caches, so an injected command must not be able to exfiltrate
+	// readable secrets through its failure output.
 	manifest := reproduction.Manifest{
 		Version: reproduction.ManifestVersion, Repo: repo, IssueNumber: detail.Number,
-		Command: draft.Command, Files: hashes, ObservedFailure: truncate(proof.Output),
+		Command: draft.Command, Files: hashes, ExpectedFailure: draft.ExpectedFailure,
 		BaseSHA: head.HeadSHA, IdempotencyKey: target.IdempotencyKey, RecordedAt: r.nowISO(),
 	}
 	if err := reproduction.WriteManifest(worktree.Path, manifest); err != nil {
@@ -386,19 +426,38 @@ func (r *Runner) reproduce(ctx context.Context, project storage.ProjectRecord, r
 	if err := os.Remove(filepath.Join(worktree.Path, filepath.FromSlash(CannotReproduceRelPath))); err != nil && !os.IsNotExist(err) {
 		return err
 	}
+	// Commit exactly the declared reproduction files plus the manifest. `git
+	// add -A` would sweep exploratory source edits or undeclared files into the
+	// reproduction commit; reverting an undeclared production edit could then
+	// make the command pass without fixing the bug. Restricting the stage and
+	// verifying the committed change set catches both.
+	commitPaths := append(append([]string(nil), draft.Files...), reproduction.ManifestRelPath)
 	commit, err := r.git.Commit(ctx, planner.CommitInput{
 		RepoPath: project.RepoPath, WorktreeRoot: worktree.Root, WorktreePath: worktree.Path,
 		Message: fmt.Sprintf("test(reproduce): failing reproduction for %s#%d\n\n%s",
 			repo, detail.Number, reproduction.CommitMarker(target.IdempotencyKey)),
+		Paths: commitPaths,
 	})
 	if err != nil {
 		return err
+	}
+	committedFiles, err := r.git.HeadCommitFiles(ctx, worktree.Path)
+	if err != nil {
+		return err
+	}
+	if extra, missing, ok := reproductionChangedFilesMatch(committedFiles, commitPaths); !ok {
+		return r.recordUnreproducible(ctx, project, repo, detail, worktree, target, reproduction.Unreproducible{
+			Summary: fmt.Sprintf(
+				"The reproduction commit changed files that do not match the declared reproduction artifacts (extra: %s, missing: %s); the reproduction is not recorded.",
+				strings.Join(extra, ", "), strings.Join(missing, ", ")),
+			ObservedInstead: truncate(proof.Output),
+		}, result)
 	}
 
 	record := reproduction.Record{
 		ProjectID: project.ID, Repo: repo, IssueNumber: detail.Number, Branch: branch,
 		Command: manifest.Command, Files: hashes, CommitSHA: commit.CommitSHA, BaseSHA: head.HeadSHA,
-		ObservedFailure: manifest.ObservedFailure, IdempotencyKey: target.IdempotencyKey,
+		ExpectedFailure: manifest.ExpectedFailure, IdempotencyKey: target.IdempotencyKey,
 		RecordedAt: r.nowISO(),
 	}
 	if err := reproduction.AppendRecord(ctx, r.repos, record); err != nil {
@@ -406,6 +465,35 @@ func (r *Runner) reproduce(ctx context.Context, project storage.ProjectRecord, r
 	}
 	result.Reproduced++
 	return nil
+}
+
+// reproductionChangedFilesMatch reports whether the committed change set is
+// exactly the declared reproduction files plus the manifest. extra and missing
+// are populated for a descriptive error when the sets differ.
+func reproductionChangedFilesMatch(changed, declared []string) (extra, missing []string, ok bool) {
+	changedSet := map[string]struct{}{}
+	for _, path := range changed {
+		path = filepath.ToSlash(filepath.Clean(path))
+		changedSet[path] = struct{}{}
+	}
+	declaredSet := map[string]struct{}{}
+	for _, path := range declared {
+		path = filepath.ToSlash(filepath.Clean(path))
+		declaredSet[path] = struct{}{}
+	}
+	for path := range changedSet {
+		if _, want := declaredSet[path]; !want {
+			extra = append(extra, path)
+		}
+	}
+	for path := range declaredSet {
+		if _, got := changedSet[path]; !got {
+			missing = append(missing, path)
+		}
+	}
+	sort.Strings(extra)
+	sort.Strings(missing)
+	return extra, missing, len(extra) == 0 && len(missing) == 0
 }
 
 func (r *Runner) prove(ctx context.Context, input reproduction.Input) (reproduction.Result, error) {
@@ -497,8 +585,12 @@ func (r *Runner) settleParkedIssue(ctx context.Context, record reproduction.Unre
 	if !strings.EqualFold(strings.TrimSpace(ask.Answer), AnswerProceed) {
 		return false, nil
 	}
+	// The waiver inherits the parked record's key: it authorizes planning for the
+	// evidence the human was actually shown, not for whatever report is current
+	// the next time this Issue is looked at.
 	return true, reproduction.AppendWaiver(ctx, r.repos, reproduction.Waiver{
-		ProjectID: record.ProjectID, Repo: record.Repo, IssueNumber: record.IssueNumber,
+		IdempotencyKey: record.IdempotencyKey,
+		ProjectID:      record.ProjectID, Repo: record.Repo, IssueNumber: record.IssueNumber,
 		Answer: ask.Answer, LoopID: record.LoopID, WaivedAt: r.nowISO(),
 	})
 }

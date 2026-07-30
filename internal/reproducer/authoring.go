@@ -60,10 +60,26 @@ func (r *Runner) adoptCommittedReproduction(ctx context.Context, project storage
 	if head.HasUncommittedChanges {
 		return reproduction.Record{}, false, nil
 	}
+	// A committed reproduction must carry exactly its declared files plus the
+	// manifest. A head commit that swept in undeclared work is not adopted: the
+	// attempt re-authors instead of recording an authority that could leak
+	// exploratory edits into the PR.
+	declared := make([]string, 0, len(manifest.Files)+1)
+	for _, file := range manifest.Files {
+		declared = append(declared, file.Path)
+	}
+	declared = append(declared, reproduction.ManifestRelPath)
+	committed, err := r.git.HeadCommitFiles(ctx, worktree.Path)
+	if err != nil {
+		return reproduction.Record{}, false, err
+	}
+	if _, _, ok := reproductionChangedFilesMatch(committed, declared); !ok {
+		return reproduction.Record{}, false, nil
+	}
 	return reproduction.Record{
 		ProjectID: project.ID, Repo: repo, IssueNumber: issue.Number, Branch: worktree.Branch,
 		Command: manifest.Command, Files: manifest.Files, CommitSHA: head.HeadSHA,
-		BaseSHA: manifest.BaseSHA, ObservedFailure: manifest.ObservedFailure,
+		BaseSHA: manifest.BaseSHA, ExpectedFailure: manifest.ExpectedFailure,
 		IdempotencyKey: target.IdempotencyKey, RecordedAt: r.nowISO(),
 	}, true, nil
 }
@@ -74,7 +90,16 @@ func (r *Runner) adoptCommittedReproduction(ctx context.Context, project storage
 // It is deliberately not a failure: no attempt counter moves, no retry is
 // scheduled, and nothing reads as a crash. The Issue stops before Planner is
 // reached, which is the whole reason the Role runs first.
-func (r *Runner) recordUnreproducible(ctx context.Context, project storage.ProjectRecord, repo string, issue githubinfra.IssueDetail, target candidate, record reproduction.Unreproducible, result *DiscoveryResult) error {
+func (r *Runner) recordUnreproducible(ctx context.Context, project storage.ProjectRecord, repo string, issue githubinfra.IssueDetail, worktree worktreeContext, target candidate, record reproduction.Unreproducible, result *DiscoveryResult) error {
+	// Clean before the waiver becomes reachable. The human's other option is
+	// "plan without a reproduction", and Planner restores *this* worktree and
+	// commits whatever it finds: leaving the cannot-reproduce sentinel and the
+	// agent's unadopted experiments in place would publish both into the PR. The
+	// record below carries everything the escalation needs, so nothing on disk
+	// is still load-bearing at this point.
+	if err := r.cleanWorktreeForHandoff(ctx, project, worktree); err != nil {
+		return err
+	}
 	loop, err := r.planner.ParkIssueForHuman(ctx, planner.ParkIssueInput{
 		Project: project, Repo: repo, Authority: target.IdempotencyKey,
 		Issue: planner.IssueSummary{
@@ -85,7 +110,14 @@ func (r *Runner) recordUnreproducible(ctx context.Context, project storage.Proje
 			Question:          buildCannotReproduceQuestion(repo, issue, record),
 			Options:           []string{AnswerProceed, AnswerReject},
 			RecommendedOption: AnswerReject,
-			Recommendation:    "Reproducer could not make this bug fail on the current base, so planning would be against a description rather than a demonstrated failure.",
+			// Rejection must not travel the resuming respond path. That path
+			// transitions every awaiting_human loop to running and creates a
+			// Planner queue item before Reproducer ever sees the answer, so the
+			// option documented as leaving the Issue stopped would start planning
+			// instead — and declining to append a waiver on the next discovery
+			// pass cannot retract work that is already claimable.
+			NonResumingOptions: []string{AnswerReject},
+			Recommendation:     "Reproducer could not make this bug fail on the current base, so planning would be against a description rather than a demonstrated failure.",
 			Consequences: map[string]string{
 				AnswerProceed: "Planner proceeds with no reproduction; completion falls back to the repository suite plus review judgement.",
 				AnswerReject:  "The Issue stays stopped until someone supplies the missing information.",
@@ -107,6 +139,25 @@ func (r *Runner) recordUnreproducible(ctx context.Context, project storage.Proje
 	}
 	result.Unreproducible++
 	return nil
+}
+
+// cleanWorktreeForHandoff returns the branch to its committed state before it
+// is handed on.
+//
+// The sentinel is removed explicitly rather than relied on `git clean`: a
+// repository that gitignores `.looper/` would otherwise keep it, and the
+// sentinel is exactly the file whose survival turns a waiver into a polluted
+// pull request.
+func (r *Runner) cleanWorktreeForHandoff(ctx context.Context, project storage.ProjectRecord, worktree worktreeContext) error {
+	if strings.TrimSpace(worktree.Path) == "" {
+		return nil
+	}
+	if err := os.Remove(filepath.Join(worktree.Path, filepath.FromSlash(CannotReproduceRelPath))); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return r.git.DiscardChanges(ctx, planner.DiscardChangesInput{
+		RepoPath: project.RepoPath, WorktreeRoot: worktree.Root, WorktreePath: worktree.Path,
+	})
 }
 
 func buildCannotReproduceQuestion(repo string, issue githubinfra.IssueDetail, record reproduction.Unreproducible) string {
@@ -136,7 +187,7 @@ func buildCannotReproduceQuestion(repo string, issue githubinfra.IssueDetail, re
 
 func unreproducibleFrom(declined CannotReproduce) reproduction.Unreproducible {
 	return reproduction.Unreproducible{
-		Attempted:          declined.Attempted,
+		Attempted:          normalizeNonEmpty(declined.Attempted),
 		ObservedInstead:    strings.TrimSpace(declined.ObservedInstead),
 		MissingInformation: declined.MissingInformation,
 		Summary:            strings.TrimSpace(declined.Summary),
@@ -174,12 +225,54 @@ func readCannotReproduce(worktreePath string) (CannotReproduce, bool, error) {
 	decoder.DisallowUnknownFields()
 	var declined CannotReproduce
 	if err := decoder.Decode(&declined); err != nil {
-		return CannotReproduce{
-			Summary:         "The reproduction agent wrote an undecodable cannot-reproduce record.",
-			ObservedInstead: strings.TrimSpace(string(raw)),
-		}, true, nil
+		return unusableCannotReproduce("undecodable", err), true, nil
+	}
+	// A decodable but empty or wrong-version shape is not a usable escalation.
+	// The Issue is about to be parked permanently for a human, and `attempted`
+	// plus `observedInstead` are the whole reason this path exists rather than a
+	// bare "failed" status; accepting a blank record parks the Issue with nothing
+	// to act on, and accepting an unknown version silently half-honours a schema
+	// this daemon does not implement.
+	if err := declined.validate(); err != nil {
+		return unusableCannotReproduce("unusable", err), true, nil
 	}
 	return declined, true, nil
+}
+
+// validate enforces the shape the human escalation depends on.
+func (c CannotReproduce) validate() error {
+	if c.Version != reproduction.ManifestVersion {
+		return fmt.Errorf("unsupported version %d", c.Version)
+	}
+	if len(normalizeNonEmpty(c.Attempted)) == 0 {
+		return fmt.Errorf("attempted must name at least one thing that was tried")
+	}
+	if strings.TrimSpace(c.ObservedInstead) == "" {
+		return fmt.Errorf("observedInstead is required")
+	}
+	return nil
+}
+
+// unusableCannotReproduce still escalates: the agent declined to reproduce, and
+// that decision stands. Only the agent's explanation is replaced, so the human
+// is told the record was unusable instead of being shown a blank one.
+func unusableCannotReproduce(kind string, cause error) CannotReproduce {
+	return CannotReproduce{
+		Version:         reproduction.ManifestVersion,
+		Summary:         fmt.Sprintf("The reproduction agent wrote an %s cannot-reproduce record (%v), so no reproduction detail is available.", kind, cause),
+		Attempted:       []string{"The agent reported that it could not reproduce the bug, but did not record what it tried."},
+		ObservedInstead: "unavailable",
+	}
+}
+
+func normalizeNonEmpty(values []string) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	return out
 }
 
 func parseJSONObject(value *string) map[string]any {
