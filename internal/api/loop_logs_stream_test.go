@@ -261,6 +261,62 @@ func TestLoopLogsFileCursorKeepsInlineFallbackWhenPathIsMissing(t *testing.T) {
 	}
 }
 
+func TestLogContentAfterKnownRequiresCumulativePrefix(t *testing.T) {
+	if got := logContentAfterKnown("BOOK", "OK"); got != "BOOK" {
+		t.Fatalf("gap = %q, want recreated-file content without arbitrary suffix match", got)
+	}
+	if got := logContentAfterKnown("OK next", "OK"); got != " next" {
+		t.Fatalf("gap = %q, want cumulative suffix", got)
+	}
+}
+
+func TestLoopLogsCursorDrainsOldExecutionBeforeSwitch(t *testing.T) {
+	dir := t.TempDir()
+	oldPath := filepath.Join(dir, "old.stdout.log")
+	oldOutput := strings.Repeat("old ", loopLogsFollowMaxChunkBytes/2)
+	if err := os.WriteFile(oldPath, []byte(oldOutput), 0o644); err != nil {
+		t.Fatalf("write old output: %v", err)
+	}
+	previous := loopLogsResponse{Agent: &loopLogsAgentPayload{ExecutionID: "old_exec", Vendor: "codex", Status: "completed"}}
+	next := loopLogsCombinedState{
+		response: loopLogsResponse{Agent: &loopLogsAgentPayload{ExecutionID: "new_exec", Vendor: "codex", Status: "running"}},
+		output:   agentOutputPayload{Stdout: "new output\n"},
+	}
+	cursor := loopLogsCombinedCursor{
+		executionID: "old_exec",
+		stdout:      loopLogsFileCursor{path: oldPath},
+	}
+	handler := NewHandler(Context{Config: newTestFixture(t).config})
+	recorder := httptest.NewRecorder()
+	if err := handler.updateLoopLogsCombinedCursor(recorder, recorder, previous, next, &cursor); err != nil {
+		t.Fatalf("switch cursor: %v", err)
+	}
+	var oldJoined strings.Builder
+	var newJoined strings.Builder
+	for _, event := range strings.Split(recorder.Body.String(), "\n\n") {
+		if !strings.HasPrefix(event, "event: chunk\n") {
+			continue
+		}
+		data := strings.TrimPrefix(strings.SplitN(event, "\n", 2)[1], "data: ")
+		var chunk loopLogsFollowChunkEvent
+		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			t.Fatalf("decode chunk: %v", err)
+		}
+		switch {
+		case chunk.ExecutionID != nil && *chunk.ExecutionID == "old_exec":
+			oldJoined.WriteString(chunk.Content)
+		case chunk.ExecutionID != nil && *chunk.ExecutionID == "new_exec":
+			newJoined.WriteString(chunk.Content)
+		}
+	}
+	if oldJoined.String() != oldOutput {
+		t.Fatalf("old execution bytes = %d, want %d", oldJoined.Len(), len(oldOutput))
+	}
+	if newJoined.String() != "new output\n" {
+		t.Fatalf("new execution output = %q", newJoined.String())
+	}
+}
+
 func TestLoopLogsFileCursorResetsForReplaceRotation(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "stdout.log")

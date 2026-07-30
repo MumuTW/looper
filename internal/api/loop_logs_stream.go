@@ -108,7 +108,7 @@ func (h *Handler) streamLoopLogsCombined(w http.ResponseWriter, r *http.Request,
 				return nil
 			}
 
-			if err := h.updateLoopLogsCombinedCursor(w, flusher, next, &cursor); err != nil {
+			if err := h.updateLoopLogsCombinedCursor(w, flusher, current.response, next, &cursor); err != nil {
 				if errors.Is(err, errLoopLogsClientWrite) {
 					return nil
 				}
@@ -204,12 +204,15 @@ func (cursor loopLogsFileCursor) snapshotContent() string {
 	return cursor.lastInline
 }
 
-func (h *Handler) updateLoopLogsCombinedCursor(w io.Writer, flusher http.Flusher, state loopLogsCombinedState, cursor *loopLogsCombinedCursor) error {
+func (h *Handler) updateLoopLogsCombinedCursor(w io.Writer, flusher http.Flusher, previous loopLogsResponse, state loopLogsCombinedState, cursor *loopLogsCombinedCursor) error {
 	nextExecutionID := ""
 	if state.response.Agent != nil {
 		nextExecutionID = state.response.Agent.ExecutionID
 	}
 	if nextExecutionID != cursor.executionID {
+		if err := h.emitLoopLogsFileChunks(w, flusher, previous, cursor, true); err != nil {
+			return err
+		}
 		next, err := h.newLoopLogsCombinedCursor(state)
 		if err != nil {
 			return err
@@ -457,8 +460,8 @@ func logContentAfterKnown(content, known string) string {
 	if content == known {
 		return ""
 	}
-	if index := strings.LastIndex(content, known); index >= 0 {
-		return content[index+len(known):]
+	if strings.HasPrefix(content, known) {
+		return content[len(known):]
 	}
 	return content
 }
