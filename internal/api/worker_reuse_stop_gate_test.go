@@ -174,8 +174,11 @@ func TestHandlerWorkersCreateReuseRestoresStopGateOnIssueClaimCollision(t *testi
 		prTarget := "pr:acme/looper:197"
 		prNumber := int64(197)
 		claimMeta := `{"worker":{"repo":"acme/looper","issueNumber":97}}`
-		if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_fixer_claim_collision", Seq: 3131, ProjectID: projectID, Type: "fixer", TargetType: "pull_request", TargetID: &prTarget, Repo: &repo, PRNumber: &prNumber, Status: "running", MetadataJSON: &claimMeta, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
-			t.Errorf("Loops.Upsert(fixer collision) error = %v", err)
+		// The regular publication path now atomically rejects this competing
+		// source-issue claim. Use the explicit override to model a claim that
+		// was already admitted elsewhere while reuse had its stop gate open.
+		if err := services.Repositories.Loops.UpsertForcingIssueClaimAdmission(context.Background(), storage.LoopRecord{ID: "loop_fixer_claim_collision", Seq: 3131, ProjectID: projectID, Type: "fixer", TargetType: "pull_request", TargetID: &prTarget, Repo: &repo, PRNumber: &prNumber, Status: "running", MetadataJSON: &claimMeta, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+			t.Errorf("Loops.UpsertForcingIssueClaimAdmission(fixer collision) error = %v", err)
 		}
 	}
 
