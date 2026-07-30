@@ -50,6 +50,19 @@ function sumLoopCounts(loops: StatusData["loops"]): Record<string, number> {
   return totals;
 }
 
+function admissionColor(state: string): string {
+  switch (state) {
+    case "ready":
+      return "var(--ok)";
+    case "degraded":
+      return "var(--warning)";
+    case "stopping":
+      return "var(--danger)";
+    default:
+      return "var(--text-muted)";
+  }
+}
+
 function FullPageError({ message }: { message: string }) {
   return (
     <div className="mx-auto flex max-w-lg flex-col gap-3 py-10">
@@ -343,6 +356,7 @@ export function OverviewPage({
 
   const healthData = health.data;
   const loopTotals = sumLoopCounts(status?.loops);
+  const admissionState = status?.service?.admissionState;
   const storageHealthy = (() => {
     if (healthData?.storage?.ok === false || status?.storage?.healthy === false) {
       return false;
@@ -374,18 +388,9 @@ export function OverviewPage({
             <Kv
               label="Admission"
               value={
-                status?.service?.admissionState ? (
-                  <span
-                    style={{
-                      color:
-                        status.service.admissionState === "ready"
-                          ? "var(--ok)"
-                          : status.service.admissionState === "degraded"
-                            ? "var(--warning)"
-                            : "var(--text-muted)",
-                    }}
-                  >
-                    {status.service.admissionState}
+                admissionState ? (
+                  <span style={{ color: admissionColor(admissionState) }}>
+                    {admissionState}
                   </span>
                 ) : (
                   "—"
@@ -428,14 +433,10 @@ export function OverviewPage({
               <Kv
                 label="Status"
                 value={
-                  status?.service?.admissionState === "ready" ? (
-                    <span style={{ color: "var(--ok)" }}>yes</span>
-                  ) : status?.service?.admissionState === "degraded" ? (
-                    <span style={{ color: "var(--warning)" }}>degraded</span>
-                  ) : status?.service?.admissionState === "stopping" ? (
-                    <span style={{ color: "var(--danger)" }}>stopping</span>
-                  ) : status?.service?.admissionState === "starting" ? (
-                    <span style={{ color: "var(--text-muted)" }}>starting</span>
+                  admissionState ? (
+                    <span style={{ color: admissionColor(admissionState) }}>
+                      {admissionState}
+                    </span>
                   ) : (
                     "—"
                   )
