@@ -3,11 +3,12 @@ package escalator
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
-	notifyinfra "github.com/nexu-io/looper/internal/infra/notify"
-	"github.com/nexu-io/looper/internal/storage"
+	notifyinfra "github.com/MumuTW/looper/internal/infra/notify"
+	"github.com/MumuTW/looper/internal/storage"
 )
 
 type fakeCollector struct {
@@ -111,5 +112,18 @@ func TestRunnerRejectsUnboundedBaseline(t *testing.T) {
 	runner := NewRunner(collector, &fakeNotifier{status: "success"}, openCollectorRepositories(t), RunnerOptions{MaxItems: 1})
 	if _, err := runner.Run(context.Background()); err == nil {
 		t.Fatal("oversized baseline was accepted")
+	}
+}
+
+func TestBuildNotificationGroupsReasonsAndRendersBacklogDelta(t *testing.T) {
+	snapshot := Snapshot{Items: []Item{
+		{Reason: ReasonHITLQuestion, Title: "Choose database", Link: "https://example.test/one", AgeSeconds: 7200},
+		{Reason: ReasonQueueRetries, Title: "Worker retried", Link: "https://example.test/two", AgeSeconds: 3600},
+	}, Backlog: []StageBacklog{{ProjectID: "demo", Stage: "worker", Depth: 3, OldestAgeSeconds: 86400}}}
+	payload := buildNotification(snapshot, Delta{Added: []Item{{ID: "new"}}, Resolved: []Item{{Title: "Old stall"}}})
+	for _, want := range []string{"1 new, 0 changed, 1 resolved", "### hitl_question", "### queue_retries", "### resolved", "Old stall", "demo/worker: 3 item(s), oldest 1d"} {
+		if !strings.Contains(payload.Body, want) {
+			t.Fatalf("body missing %q:\n%s", want, payload.Body)
+		}
 	}
 }

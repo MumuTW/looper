@@ -21,6 +21,7 @@ import (
 	"github.com/MumuTW/looper/internal/config"
 	coordinatorrole "github.com/MumuTW/looper/internal/coordinator"
 	"github.com/MumuTW/looper/internal/disclosure"
+	"github.com/MumuTW/looper/internal/escalator"
 	"github.com/MumuTW/looper/internal/fixer"
 	"github.com/MumuTW/looper/internal/forge"
 	"github.com/MumuTW/looper/internal/gatekeeper"
@@ -50,6 +51,35 @@ type plannerScheduler interface {
 
 type triagerScheduler interface {
 	DiscoverIssues(context.Context, triager.DiscoveryInput) (triager.DiscoveryResult, error)
+}
+
+type escalatorScheduler interface {
+	Run(context.Context) (escalator.RunResult, error)
+}
+
+type schedulerEscalatorCadence struct {
+	mu      sync.Mutex
+	lastRun time.Time
+	running bool
+}
+
+func (s *schedulerEscalatorCadence) start(now time.Time, cadence time.Duration) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.running || (!s.lastRun.IsZero() && now.Before(s.lastRun.Add(cadence))) {
+		return false
+	}
+	s.running = true
+	return true
+}
+
+func (s *schedulerEscalatorCadence) finish(now time.Time, succeeded bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.running = false
+	if succeeded {
+		s.lastRun = now
+	}
 }
 
 type coordinatorScheduler interface {
@@ -123,6 +153,8 @@ type defaultSchedulerTickInput struct {
 	AsyncRunner              schedulerAsyncRunner
 	RequestSchedulerWake     func()
 	Triager                  triagerScheduler
+	Escalator                escalatorScheduler
+	EscalatorCadence         *schedulerEscalatorCadence
 	Planner                  plannerScheduler
 	Coordinator              coordinatorScheduler
 	Reviewer                 reviewerScheduler
@@ -1709,6 +1741,7 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *
 	claimMu := &sync.Mutex{}
 	notificationGateways := newSchedulerNotificationGatewayFactory()
 	coordinatorState := coordinatorrole.NewRuntimeState()
+	escalatorCadence := &schedulerEscalatorCadence{}
 	initialConfig := source.Snapshot()
 	if logger != nil {
 		if len(initialConfig.Projects) == 0 && !config.HasEffectiveValidationCommands(initialConfig) {
@@ -1728,7 +1761,7 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *
 	// transport continuity while retaining config-specific policy.
 	buildSnapshot := func() defaultSchedulerHandlers {
 		cfg := source.Snapshot()
-		return buildDefaultSchedulerHandlersWithOptions(cfg, configPath, logger, coordinator, repos, gitGateway, githubGateway, activeExecutions, asyncRunner, requestWake, now, reconcileStaleRuns, false, claimMu, nil, notificationGateways, coordinatorState, hostGate)
+		return buildDefaultSchedulerHandlersWithOptions(cfg, configPath, logger, coordinator, repos, gitGateway, githubGateway, activeExecutions, asyncRunner, requestWake, now, reconcileStaleRuns, false, claimMu, nil, notificationGateways, coordinatorState, hostGate, escalatorCadence)
 	}
 	handlers := defaultSchedulerHandlers{
 		snapshot:             buildSnapshot,
@@ -1812,7 +1845,7 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *
 	return handlers
 }
 
-func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath string, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error), includeWebhook bool, claimMu *sync.Mutex, configSource projects.ConfigSource, notificationGateways *schedulerNotificationGatewayFactory, coordinatorState *coordinatorrole.RuntimeState, hostGate *hostAdmissionGate) defaultSchedulerHandlers {
+func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath string, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error), includeWebhook bool, claimMu *sync.Mutex, configSource projects.ConfigSource, notificationGateways *schedulerNotificationGatewayFactory, coordinatorState *coordinatorrole.RuntimeState, hostGate *hostAdmissionGate, escalatorCadence *schedulerEscalatorCadence) defaultSchedulerHandlers {
 	if now == nil {
 		now = time.Now
 	}
@@ -1838,6 +1871,20 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		Repositories:  repos,
 		Now:           now,
 	})
+	var escalatorRunner escalatorScheduler
+	if cfg.Roles.Escalator.Enabled {
+		escalatorRunner = escalator.NewRunner(
+			escalator.NewCollector(repos, newRuntimeEscalatorLinker(cfg), escalator.CollectorOptions{
+				Now:                   now,
+				RetryAttemptThreshold: cfg.Roles.Escalator.RetryAttemptThreshold,
+				UnroutedAfter:         time.Duration(cfg.Roles.Escalator.UnroutedAfterSeconds) * time.Second,
+				StaleHeadAfter:        time.Duration(cfg.Roles.Escalator.StaleHeadAfterSeconds) * time.Second,
+			}),
+			notificationGateway,
+			repos,
+			escalator.RunnerOptions{Now: now, MaxItems: cfg.Roles.Escalator.MaxItems},
+		)
+	}
 	var gatekeeperRunner gatekeeperScheduler
 	if githubGateway != nil {
 		gatekeeperRunner = gatekeeper.New(gatekeeper.Options{
@@ -2367,6 +2414,8 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			AsyncRunner:          runner,
 			RequestSchedulerWake: requestWake,
 			Triager:              triagerRunner,
+			Escalator:            escalatorRunner,
+			EscalatorCadence:     escalatorCadence,
 			Planner:              plannerRunner,
 			Coordinator:          coordinatorRunner,
 			Reviewer:             reviewerRunner,
@@ -2712,6 +2761,11 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 		runTelegramIntakePoll(ctx, input)
 	}
 
+	// Escalator is one global, read-only census across all active projects. It
+	// runs after per-project discovery so the digest sees this tick's durable
+	// state, but never claims or mutates workflow work.
+	appendErr(runEscalatorIfDue(ctx, input, now()))
+
 	claimedCount, availableSlots, err = executeClaimPhase(ctx, "post_discovery", input, discoveredRunnableIDs, true)
 	recordClaim(claimedCount, availableSlots, err)
 
@@ -2720,6 +2774,20 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 	}
 	retErr = errors.Join(errs...)
 	return retErr
+}
+
+func runEscalatorIfDue(ctx context.Context, input defaultSchedulerTickInput, runAt time.Time) error {
+	if input.Escalator == nil || input.EscalatorCadence == nil || input.Config == nil || !input.Config.Roles.Escalator.Enabled {
+		return nil
+	}
+	cadence := time.Duration(input.Config.Roles.Escalator.CadenceSeconds) * time.Second
+	runAt = runAt.UTC()
+	if !input.EscalatorCadence.start(runAt, cadence) {
+		return nil
+	}
+	_, err := input.Escalator.Run(ctx)
+	input.EscalatorCadence.finish(runAt, err == nil)
+	return err
 }
 
 // admissionRefuseWork rechecks the admission projection mid-tick. Nil AllowClaim

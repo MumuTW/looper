@@ -697,6 +697,18 @@ type RoleConfigs struct {
 	Gatekeeper  GatekeeperRoleConfig  `json:"gatekeeper"`
 	Auditor     AuditorRoleConfig     `json:"auditor"`
 	Deployer    DeployerRoleConfig    `json:"deployer"`
+	Escalator   EscalatorRoleConfig   `json:"escalator"`
+}
+
+// EscalatorRoleConfig configures the agent-free, global pipeline digest. It
+// reads durable state across all active projects and never claims queue work.
+type EscalatorRoleConfig struct {
+	Enabled               bool  `json:"enabled"`
+	CadenceSeconds        int   `json:"cadenceSeconds"`
+	RetryAttemptThreshold int64 `json:"retryAttemptThreshold"`
+	UnroutedAfterSeconds  int   `json:"unroutedAfterSeconds"`
+	StaleHeadAfterSeconds int   `json:"staleHeadAfterSeconds"`
+	MaxItems              int   `json:"maxItems"`
 }
 
 // DeployerRoleConfig configures the agent-free Role that runs a project's deploy
@@ -1388,6 +1400,15 @@ type PartialGatekeeperDiffBudget struct {
 	MaxDeletions    *int `json:"maxDeletions,omitempty"`
 }
 
+type PartialEscalatorRoleConfig struct {
+	Enabled               *bool  `json:"enabled,omitempty"`
+	CadenceSeconds        *int   `json:"cadenceSeconds,omitempty"`
+	RetryAttemptThreshold *int64 `json:"retryAttemptThreshold,omitempty"`
+	UnroutedAfterSeconds  *int   `json:"unroutedAfterSeconds,omitempty"`
+	StaleHeadAfterSeconds *int   `json:"staleHeadAfterSeconds,omitempty"`
+	MaxItems              *int   `json:"maxItems,omitempty"`
+}
+
 type PartialAuditorRoleConfig struct {
 	Enabled       *bool `json:"enabled,omitempty"`
 	WindowMinutes *int  `json:"windowMinutes,omitempty"`
@@ -1408,6 +1429,7 @@ type PartialRoleConfigs struct {
 	Gatekeeper  *PartialGatekeeperRoleConfig       `json:"gatekeeper,omitempty"`
 	Auditor     *PartialAuditorRoleConfig          `json:"auditor,omitempty"`
 	Deployer    *PartialDeployerRoleConfig         `json:"deployer,omitempty"`
+	Escalator   *PartialEscalatorRoleConfig        `json:"escalator,omitempty"`
 	// Deprecated: sweeper was retired and is ignored when present in older configs.
 	Sweeper *map[string]any `json:"sweeper,omitempty"`
 }

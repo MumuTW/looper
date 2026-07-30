@@ -7,9 +7,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/nexu-io/looper/internal/eventlog"
-	notifyinfra "github.com/nexu-io/looper/internal/infra/notify"
-	"github.com/nexu-io/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/eventlog"
+	notifyinfra "github.com/MumuTW/looper/internal/infra/notify"
+	"github.com/MumuTW/looper/internal/storage"
 )
 
 const (
@@ -155,9 +155,26 @@ func (r *Runner) persistBaseline(ctx context.Context, snapshot Snapshot) error {
 }
 
 func buildNotification(snapshot Snapshot, delta Delta) notifyinfra.SystemNotificationPayload {
-	lines := make([]string, 0, len(snapshot.Items)+1)
+	lines := []string{fmt.Sprintf("Since previous digest: %d new, %d changed, %d resolved", len(delta.Added), len(delta.Changed), len(delta.Resolved))}
+	lastReason := Reason("")
 	for _, item := range snapshot.Items {
+		if item.Reason != lastReason {
+			lines = append(lines, "", "### "+string(item.Reason))
+			lastReason = item.Reason
+		}
 		lines = append(lines, fmt.Sprintf("- [%s] %s (%s) — %s", item.Reason, item.Title, formatAge(item.AgeSeconds), item.Link))
+	}
+	if len(delta.Resolved) > 0 {
+		lines = append(lines, "", "### resolved")
+		for _, item := range delta.Resolved {
+			lines = append(lines, "- "+item.Title)
+		}
+	}
+	if len(snapshot.Backlog) > 0 {
+		lines = append(lines, "", "### stage backlog")
+		for _, backlog := range snapshot.Backlog {
+			lines = append(lines, fmt.Sprintf("- %s/%s: %d item(s), oldest %s", backlog.ProjectID, backlog.Stage, backlog.Depth, formatAge(backlog.OldestAgeSeconds)))
+		}
 	}
 	return notifyinfra.SystemNotificationPayload{
 		Level: "warning", Title: fmt.Sprintf("Looper needs attention on %d item(s)", len(snapshot.Items)),

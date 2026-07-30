@@ -10,12 +10,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/nexu-io/looper/internal/domain"
-	"github.com/nexu-io/looper/internal/eventlog"
-	"github.com/nexu-io/looper/internal/gatekeeper"
-	"github.com/nexu-io/looper/internal/loops"
-	"github.com/nexu-io/looper/internal/storage"
-	"github.com/nexu-io/looper/internal/triager"
+	"github.com/MumuTW/looper/internal/domain"
+	"github.com/MumuTW/looper/internal/eventlog"
+	"github.com/MumuTW/looper/internal/gatekeeper"
+	"github.com/MumuTW/looper/internal/loops"
+	"github.com/MumuTW/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/triager"
 )
 
 type Linker interface {
@@ -220,8 +220,9 @@ func (c *Collector) collectUnroutedTriage(ctx context.Context, now time.Time, ac
 		return fmt.Errorf("list triage routing lifecycle: %w", err)
 	}
 	type state struct {
-		enrollment                   *triager.Enrollment
-		reported, projected, retired bool
+		enrollment         *triager.Enrollment
+		report             *triager.Report
+		projected, retired bool
 	}
 	states := map[string]*state{}
 	stateFor := func(key string) *state {
@@ -244,7 +245,8 @@ func (c *Collector) collectUnroutedTriage(ctx context.Context, now time.Time, ac
 			if err := json.Unmarshal([]byte(event.PayloadJSON), &report); err != nil {
 				return fmt.Errorf("decode triage report for escalator: %w", err)
 			}
-			stateFor(report.IdempotencyKey).reported = true
+			copy := report
+			stateFor(report.IdempotencyKey).report = &copy
 		case triager.ProjectionEventType:
 			var projection triager.Projection
 			if err := json.Unmarshal([]byte(event.PayloadJSON), &projection); err != nil {
@@ -260,7 +262,12 @@ func (c *Collector) collectUnroutedTriage(ctx context.Context, now time.Time, ac
 		}
 	}
 	for key, state := range states {
-		if state.enrollment == nil || state.reported || state.projected || state.retired {
+		if state.enrollment == nil || state.projected || state.retired {
+			continue
+		}
+		// Human-confirmation reports are already represented by the dedicated
+		// waiting item above. This category is specifically work that has no ask.
+		if state.report != nil && state.report.Policy.Action == triager.ActionAwaitHuman {
 			continue
 		}
 		enrollment := state.enrollment
@@ -278,7 +285,11 @@ func (c *Collector) collectUnroutedTriage(ctx context.Context, now time.Time, ac
 		if err != nil {
 			return fmt.Errorf("triage enrollment %s: %w", key, err)
 		}
-		snapshot.Items = append(snapshot.Items, newItem(itemID(ReasonTriageNotRouted, enrollment.ProjectID, key), KindStuck, ReasonTriageNotRouted, enrollment.ProjectID, "triager", fmt.Sprintf("%s#%d was enrolled but never routed", enrollment.Repo, enrollment.IssueNumber), "No Triage report or route was persisted", link, age, 1, enrollment.EnrolledAt))
+		detail := "No Triage report or route was persisted"
+		if state.report != nil {
+			detail = "A Triage report exists, but no Planner route was persisted"
+		}
+		snapshot.Items = append(snapshot.Items, newItem(itemID(ReasonTriageNotRouted, enrollment.ProjectID, key), KindStuck, ReasonTriageNotRouted, enrollment.ProjectID, "triager", fmt.Sprintf("%s#%d was enrolled but never routed", enrollment.Repo, enrollment.IssueNumber), detail, link, age, 1, enrollment.EnrolledAt, detail))
 	}
 	return nil
 }

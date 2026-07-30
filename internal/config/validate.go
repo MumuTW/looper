@@ -270,6 +270,7 @@ func validateCoreConfig(config Config, issues *[]ValidationIssue) {
 	validateGatekeeperRoleConfig(config.Roles.Gatekeeper, "roles.gatekeeper", config.Roles.Reviewer.AutoMerge.Enabled, issues)
 	validateAuditorRoleConfig(config.Roles.Auditor, "roles.auditor", issues)
 	validateDeployerRoleConfig(config.Roles.Deployer, "roles.deployer", issues)
+	validateEscalatorRoleConfig(config.Roles.Escalator, "roles.escalator", issues)
 	for i, project := range config.Projects {
 		if project.Roles == nil || project.Roles.Deployer == nil {
 			continue
@@ -311,6 +312,24 @@ func validateCoreConfig(config Config, issues *[]ValidationIssue) {
 	validateIntakeConfig(config, issues)
 	validateDaemonConfig(config.Daemon, issues)
 	validatePackageAndDefaultsConfig(config, issues)
+}
+
+func validateEscalatorRoleConfig(role EscalatorRoleConfig, path string, issues *[]ValidationIssue) {
+	if role.CadenceSeconds < 60 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".cadenceSeconds", Message: "must be an integer >= 60"})
+	}
+	if role.RetryAttemptThreshold < 1 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".retryAttemptThreshold", Message: "must be an integer >= 1"})
+	}
+	if role.UnroutedAfterSeconds < 60 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".unroutedAfterSeconds", Message: "must be an integer >= 60"})
+	}
+	if role.StaleHeadAfterSeconds < 60 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".staleHeadAfterSeconds", Message: "must be an integer >= 60"})
+	}
+	if role.MaxItems < 1 || role.MaxItems > 5000 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".maxItems", Message: "must be an integer between 1 and 5000"})
+	}
 }
 
 func validateAuditorRoleConfig(auditor AuditorRoleConfig, path string, issues *[]ValidationIssue) {

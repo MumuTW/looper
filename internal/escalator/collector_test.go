@@ -5,13 +5,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
-	"github.com/nexu-io/looper/internal/eventlog"
-	"github.com/nexu-io/looper/internal/gatekeeper"
-	"github.com/nexu-io/looper/internal/storage"
-	"github.com/nexu-io/looper/internal/triager"
+	"github.com/MumuTW/looper/internal/eventlog"
+	"github.com/MumuTW/looper/internal/gatekeeper"
+	"github.com/MumuTW/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/triager"
 )
 
 type testLinks struct{}
@@ -69,6 +70,13 @@ func TestCollectorDerivesWaitingStuckAndBacklogFromDurableState(t *testing.T) {
 	appendEvent(t, repos, "triage-unrouted", triager.EnrollmentEventType, "github_issue", triager.Enrollment{
 		IdempotencyKey: "triage-unrouted", ProjectID: projectID, Repo: repo, IssueNumber: 13, EnrolledAt: old,
 	}, projectID, old)
+	appendEvent(t, repos, "triage-reported-enrollment", triager.EnrollmentEventType, "github_issue", triager.Enrollment{
+		IdempotencyKey: "triage-reported", ProjectID: projectID, Repo: repo, IssueNumber: 14, EnrolledAt: old,
+	}, projectID, old)
+	appendEvent(t, repos, "triage-reported", triager.ReportEventType, "github_issue", triager.Report{
+		IdempotencyKey: "triage-reported", ProjectID: projectID, Repo: repo, IssueNumber: 14,
+		Policy: triager.PolicyDecision{Action: triager.ActionRoutePlanner}, CreatedAt: old,
+	}, projectID, old)
 	appendEvent(t, repos, "gate-eligible", gatekeeper.GateReportEventType, "pull_request", gatekeeper.Report{
 		Version: 2, Mode: "advise", Status: gatekeeper.StatusEligible, Eligible: true, ProjectID: projectID,
 		Repo: repo, PRNumber: prNumber, ObservedHeadSHA: "head-44", EvaluatedAt: old,
@@ -96,6 +104,15 @@ func TestCollectorDerivesWaitingStuckAndBacklogFromDurableState(t *testing.T) {
 		if item.Link == "" || item.AgeSeconds < 0 || item.Fingerprint == "" {
 			t.Fatalf("incomplete item = %#v", item)
 		}
+	}
+	var reportedWithoutRoute bool
+	for _, item := range snapshot.Items {
+		if item.Reason == ReasonTriageNotRouted && strings.Contains(item.Detail, "Triage report exists") {
+			reportedWithoutRoute = true
+		}
+	}
+	if !reportedWithoutRoute {
+		t.Fatalf("unprojected Triage report missing from digest: %#v", snapshot.Items)
 	}
 	for reason, found := range wantReasons {
 		if !found {
@@ -132,6 +149,38 @@ func TestCollectorExcludesArchivedAndCurrentOrResolvedSources(t *testing.T) {
 	}
 	if len(snapshot.Items) != 0 || len(snapshot.Backlog) != 0 {
 		t.Fatalf("archived project leaked into digest: %#v", snapshot)
+	}
+}
+
+func TestCollectorAggregatesBacklogAcrossActiveProjects(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	now := time.Date(2026, 7, 31, 12, 0, 0, 0, time.UTC)
+	old := eventlog.FormatJavaScriptISOString(now.Add(-2 * time.Hour))
+	repos := openCollectorRepositories(t)
+	for index, projectID := range []string{"alpha", "beta"} {
+		if err := repos.Projects.Upsert(ctx, storage.ProjectRecord{ID: projectID, Name: projectID, RepoPath: "/tmp/" + projectID, CreatedAt: old, UpdatedAt: old}); err != nil {
+			t.Fatal(err)
+		}
+		target := fmt.Sprintf("%d", index+1)
+		if err := repos.Loops.Upsert(ctx, storage.LoopRecord{
+			ID: projectID + "-loop", Seq: int64(index + 1), ProjectID: projectID, Type: "worker",
+			TargetType: "issue", TargetID: &target, Status: "queued", CreatedAt: old, UpdatedAt: old,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	snapshot, err := NewCollector(repos, testLinks{}, CollectorOptions{Now: func() time.Time { return now }}).Collect(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.Backlog) != 2 || snapshot.Backlog[0].ProjectID != "alpha" || snapshot.Backlog[1].ProjectID != "beta" {
+		t.Fatalf("backlog = %#v, want both active projects in stable order", snapshot.Backlog)
+	}
+	for _, backlog := range snapshot.Backlog {
+		if backlog.Depth != 1 || backlog.OldestAgeSeconds != int64((2*time.Hour)/time.Second) {
+			t.Fatalf("backlog entry = %#v", backlog)
+		}
 	}
 }
 

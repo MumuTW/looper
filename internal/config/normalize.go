@@ -78,13 +78,21 @@ func validateProjectCodingRoleSections(partial PartialConfig) []ValidationIssue 
 }
 
 func validateProjectCodingRoleOverrides(roles *PartialRoleConfigs, prefix string, issues *[]ValidationIssue) {
-	if roles == nil || len(roles.Coding) == 0 {
+	if roles == nil {
 		return
 	}
-	*issues = append(*issues, ValidationIssue{
-		Path:    prefix + ".coding",
-		Message: "coding roles are global-only; author roles.coding.* at the top level",
-	})
+	if len(roles.Coding) > 0 {
+		*issues = append(*issues, ValidationIssue{
+			Path:    prefix + ".coding",
+			Message: "coding roles are global-only; author roles.coding.* at the top level",
+		})
+	}
+	if roles.Escalator != nil {
+		*issues = append(*issues, ValidationIssue{
+			Path:    prefix + ".escalator",
+			Message: "escalator is global-only because one digest aggregates all active projects; author roles.escalator at the top level",
+		})
+	}
 }
 
 func CanonicalizePartialForMigration(partial PartialConfig) PartialConfig {
@@ -1290,6 +1298,30 @@ func mergeRoleConfigs(config *RoleConfigs, partial PartialRoleConfigs) {
 			config.Gatekeeper.DiffBudget = budget
 		}
 	}
+	if partial.Escalator != nil {
+		mergeEscalatorRoleConfig(&config.Escalator, *partial.Escalator)
+	}
+}
+
+func mergeEscalatorRoleConfig(config *EscalatorRoleConfig, partial PartialEscalatorRoleConfig) {
+	if partial.Enabled != nil {
+		config.Enabled = *partial.Enabled
+	}
+	if partial.CadenceSeconds != nil {
+		config.CadenceSeconds = *partial.CadenceSeconds
+	}
+	if partial.RetryAttemptThreshold != nil {
+		config.RetryAttemptThreshold = *partial.RetryAttemptThreshold
+	}
+	if partial.UnroutedAfterSeconds != nil {
+		config.UnroutedAfterSeconds = *partial.UnroutedAfterSeconds
+	}
+	if partial.StaleHeadAfterSeconds != nil {
+		config.StaleHeadAfterSeconds = *partial.StaleHeadAfterSeconds
+	}
+	if partial.MaxItems != nil {
+		config.MaxItems = *partial.MaxItems
+	}
 }
 
 func mergeCoordinatorRoleConfig(config *CoordinatorRoleConfig, partial PartialCoordinatorRoleConfig) {
@@ -2095,6 +2127,34 @@ func clonePartialRoleConfigs(configs *PartialRoleConfigs) *PartialRoleConfigs {
 			auditor.WindowMinutes = &window
 		}
 		cloned.Auditor = &auditor
+	}
+	if configs.Escalator != nil {
+		escalator := *configs.Escalator
+		if configs.Escalator.Enabled != nil {
+			value := *configs.Escalator.Enabled
+			escalator.Enabled = &value
+		}
+		if configs.Escalator.CadenceSeconds != nil {
+			value := *configs.Escalator.CadenceSeconds
+			escalator.CadenceSeconds = &value
+		}
+		if configs.Escalator.RetryAttemptThreshold != nil {
+			value := *configs.Escalator.RetryAttemptThreshold
+			escalator.RetryAttemptThreshold = &value
+		}
+		if configs.Escalator.UnroutedAfterSeconds != nil {
+			value := *configs.Escalator.UnroutedAfterSeconds
+			escalator.UnroutedAfterSeconds = &value
+		}
+		if configs.Escalator.StaleHeadAfterSeconds != nil {
+			value := *configs.Escalator.StaleHeadAfterSeconds
+			escalator.StaleHeadAfterSeconds = &value
+		}
+		if configs.Escalator.MaxItems != nil {
+			value := *configs.Escalator.MaxItems
+			escalator.MaxItems = &value
+		}
+		cloned.Escalator = &escalator
 	}
 	if configs.Coordinator != nil {
 		coordinator := *configs.Coordinator
