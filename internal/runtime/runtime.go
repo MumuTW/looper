@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -22,6 +23,7 @@ import (
 	"github.com/nexu-io/looper/internal/forge"
 	gitinfra "github.com/nexu-io/looper/internal/infra/git"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
+	"github.com/nexu-io/looper/internal/infra/notify"
 	"github.com/nexu-io/looper/internal/labels"
 	"github.com/nexu-io/looper/internal/loops"
 	networkclient "github.com/nexu-io/looper/internal/network/client"
@@ -73,6 +75,9 @@ type StaleRunReconcileSummary struct {
 	RunIDs                []string `json:"runIds,omitempty"`
 	LoopIDs               []string `json:"loopIds,omitempty"`
 	ExecutionIDs          []string `json:"executionIds,omitempty"`
+	// QuarantinedLoopIDs names the loops parked by this pass, so a caller can
+	// report them without re-deriving the set from event_logs.
+	QuarantinedLoopIDs []string `json:"quarantinedLoopIds,omitempty"`
 }
 
 type staleRunReconcileMode string
@@ -202,6 +207,7 @@ type Runtime struct {
 	webhook                     *webhookRuntime
 	webhookDaemonLock           *daemonLock
 	webhookForwarder            WebhookForwarder
+	notificationGateways        *schedulerNotificationGatewayFactory
 	networkManager              runtimeNetworkManager
 	schedulerDisabled           bool
 	startupReadyOnce            sync.Once
@@ -888,7 +894,7 @@ func (r *Runtime) start(ctx context.Context) error {
 	gitGateway := gitinfra.New(gitinfra.Options{GitPath: derefString(r.config.Tools.GitPath), Repos: repositories, Now: r.now})
 	var githubGateway *githubinfra.Gateway
 	if strings.TrimSpace(derefString(r.config.Tools.GHPath)) != "" || runtimeConfigHasGitHubProjects(r.config) {
-		githubGateway = githubinfra.New(githubinfra.Options{GHPath: derefString(r.config.Tools.GHPath), Now: r.now, DiscoveryCacheTTL: time.Duration(r.config.Scheduler.DiscoveryCacheTTLSeconds) * time.Second})
+		githubGateway = githubinfra.New(githubinfra.Options{GHPath: derefString(r.config.Tools.GHPath), Env: config.DaemonGitHubCredentialEnv(r.config), Now: r.now, DiscoveryCacheTTL: time.Duration(r.config.Scheduler.DiscoveryCacheTTLSeconds) * time.Second})
 	}
 	projectService := &projects.Service{
 		DB:             coordinator.DB(),
@@ -967,10 +973,19 @@ func (r *Runtime) start(ctx context.Context) error {
 	r.config = r.projectCatalog.Snapshot()
 	if strings.TrimSpace(derefString(r.config.Tools.GHPath)) != "" || runtimeConfigHasGitHubProjects(r.config) {
 		if githubGateway == nil {
-			githubGateway = githubinfra.New(githubinfra.Options{GHPath: derefString(r.config.Tools.GHPath), Now: r.now, DiscoveryCacheTTL: time.Duration(r.config.Scheduler.DiscoveryCacheTTLSeconds) * time.Second})
+			githubGateway = githubinfra.New(githubinfra.Options{GHPath: derefString(r.config.Tools.GHPath), Env: config.DaemonGitHubCredentialEnv(r.config), Now: r.now, DiscoveryCacheTTL: time.Duration(r.config.Scheduler.DiscoveryCacheTTLSeconds) * time.Second})
 		}
 	} else {
 		githubGateway = nil
+	}
+	// Fail loud, not silent: without a credential the daemon's own gh children
+	// fall back to anonymous requests that GitHub rate-limits per IP, which
+	// surfaces later as unexplained transient forge failures.
+	if readiness := ForgeCredentialReadinessFor(r.config); readiness.Degraded() && r.logger != nil {
+		r.logger.Warn("daemon-internal GitHub calls have no credential", map[string]any{
+			"reason":         readiness.Reason,
+			"degradedReason": ForgeCredentialDegradedReason,
+		})
 	}
 	r.mu.Lock()
 	if r.stopped {
@@ -995,6 +1010,7 @@ func (r *Runtime) start(ctx context.Context) error {
 		r.defaultSchedulerTick = handlers.tick
 		r.defaultSchedulerClaim = handlers.claim
 		r.webhookForwarder = handlers.webhook
+		r.notificationGateways = handlers.notificationGateways
 		schedulerDisabled = !defaultSchedulerAgentsConfigured(r.config)
 	}
 	r.githubGateway = githubGateway
@@ -1772,6 +1788,11 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 	summary.InterruptedRunsMarked += staleSummary.InterruptedRuns
 	summary.LoopsRequeued += staleSummary.LoopsRequeued
 	eventsWritten += staleSummary.EventsWritten
+	// The stale-run pass can park work the execution sweep above did not, and
+	// one recovery pass is one operator event regardless of which step parked it.
+	for _, loopID := range staleSummary.QuarantinedLoopIDs {
+		quarantinedLoopIDs[loopID] = struct{}{}
+	}
 	loops, err := repositories.Loops.List(ctx)
 	if err != nil {
 		return RecoverySummary{}, err
@@ -2041,7 +2062,107 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 	eventsWritten += 1
 	summary.EventsWritten = eventsWritten
 
+	// One operator event per recovery pass, after the pass has already
+	// succeeded: the notification reports parked work, it does not gate it.
+	r.notifyRecoveryQuarantine(ctx, repositories, quarantinedRecoveryRoster(quarantinedLoopIDs, loopsByID, nowISO), nowISO)
+
 	return summary, nil
+}
+
+// quarantinedRecoveryRoster names the loops this recovery pass parked, in loop
+// seq order. Loops whose record vanished mid-pass are reported by id alone.
+func quarantinedRecoveryRoster(quarantinedLoopIDs map[string]struct{}, loopsByID map[string]storage.LoopRecord, nowISO string) []OutstandingQuarantinedLoop {
+	if len(quarantinedLoopIDs) == 0 {
+		return nil
+	}
+	roster := make([]OutstandingQuarantinedLoop, 0, len(quarantinedLoopIDs))
+	for loopID := range quarantinedLoopIDs {
+		entry := OutstandingQuarantinedLoop{LoopID: loopID, QuarantinedAt: nowISO}
+		if loop, ok := loopsByID[loopID]; ok {
+			entry.Seq = loop.Seq
+			entry.Type = loop.Type
+			entry.Target = loopForgeTarget(loop)
+			entry.Status = loop.Status
+		}
+		roster = append(roster, entry)
+	}
+	sort.Slice(roster, func(i, j int) bool {
+		if roster[i].Seq != roster[j].Seq {
+			return roster[i].Seq < roster[j].Seq
+		}
+		return roster[i].LoopID < roster[j].LoopID
+	})
+	return roster
+}
+
+// notifyRecoveryQuarantine emits exactly one warn-level notification naming
+// every loop this recovery pass parked. Delivery failures are logged: recovery
+// already committed, and a report of it must not undo it.
+func (r *Runtime) notifyRecoveryQuarantine(ctx context.Context, repositories *storage.Repositories, roster []OutstandingQuarantinedLoop, nowISO string) {
+	if len(roster) == 0 || repositories == nil {
+		return
+	}
+	r.mu.RLock()
+	gateways := r.notificationGateways
+	r.mu.RUnlock()
+	if gateways == nil {
+		// Recovery can run before/without the scheduler handlers (deferred
+		// recovery, tests). Notification transport continuity is per-pass here.
+		gateways = newSchedulerNotificationGatewayFactory()
+	}
+	cfg := r.Config()
+	gateway := gateways.New(notify.Options{
+		Config:        cfg.Notifications,
+		OsascriptPath: derefString(cfg.Tools.OsascriptPath),
+		LogFilePath:   filepath.Join(cfg.Daemon.LogDir, "looperd.log"),
+		Repositories:  repositories,
+		Now:           r.now,
+	})
+	records := gateway.Notify(ctx, notify.SystemNotificationPayload{
+		Level:      "warn",
+		Title:      "Looper Recovery Quarantined Work",
+		Subtitle:   fmt.Sprintf("%s parked by startup recovery", pluralizeLoops(len(roster))),
+		Body:       recoveryQuarantineNotificationBody(roster),
+		EntityType: "recovery",
+		EntityID:   "looperd-recovery",
+		DedupeKey:  "runtime.recovery.quarantined:" + nowISO,
+	})
+	if len(records) == 0 && r.logger != nil {
+		r.logger.Warn("looperd recovery quarantine notification was not delivered", map[string]any{
+			"quarantinedLoops": len(roster),
+		})
+	}
+}
+
+func recoveryQuarantineNotificationBody(roster []OutstandingQuarantinedLoop) string {
+	entries := make([]string, 0, len(roster))
+	for _, loop := range roster {
+		entries = append(entries, strings.Join(compactStrings([]string{
+			fmt.Sprintf("loop %d", loop.Seq),
+			loop.Type,
+			loop.Target,
+			"-> looper retry " + fmt.Sprintf("%d", loop.Seq),
+		}), " "))
+	}
+	return fmt.Sprintf("Startup recovery quarantined %s without confirmed containment; they will not resume on their own. %s",
+		pluralizeLoops(len(roster)), strings.Join(entries, "; "))
+}
+
+func pluralizeLoops(count int) string {
+	if count == 1 {
+		return "1 loop"
+	}
+	return fmt.Sprintf("%d loops", count)
+}
+
+func compactStrings(values []string) []string {
+	compacted := make([]string, 0, len(values))
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			compacted = append(compacted, value)
+		}
+	}
+	return compacted
 }
 
 func runtimeNativeResumeSupported(vendor string) bool {
@@ -2267,7 +2388,10 @@ func (r *Runtime) reconcileStaleRunningRunsWithMode(ctx context.Context, reposit
 				if quarantined {
 					summary.QuarantinedExecutions += 1
 					summary.ExecutionIDs = append(summary.ExecutionIDs, execution.ID)
-					quarantinedLoopIDs[run.LoopID] = struct{}{}
+					if _, seen := quarantinedLoopIDs[run.LoopID]; !seen {
+						quarantinedLoopIDs[run.LoopID] = struct{}{}
+						summary.QuarantinedLoopIDs = append(summary.QuarantinedLoopIDs, run.LoopID)
+					}
 				}
 				if wrote {
 					summary.EventsWritten += 1

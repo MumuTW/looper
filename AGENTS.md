@@ -43,13 +43,15 @@
 
 ### New concepts require an explicit trade-off
 
-Introducing a new concept (evidence record, content hash, lock, ledger, status field, intermediate state) must be justified in the PR description with:
+Introducing a new concept (evidence record, content hash, lock, ledger, status field, intermediate state) must answer two questions in the PR description:
 
-- the concrete failure it prevents
-- what it costs: new edge cases, new persisted state, new failure modes, new code paths to keep in sync
-- why a simpler alternative (delete a layer, trust agent output, fail loud) is insufficient
+> Delete this six months from now — what breaks?
 
-If the cost section is empty or hand-waved, the concept is not ready to merge. Validation and gates are not free — each one expands the surface where reality and the model can disagree.
+> What does it still not catch?
+
+Answer the first with the concrete failure it prevents and why a simpler move — delete a layer, trust agent output, fail loud — does not. "Nothing anyone would notice" means do not build it. If it adds persisted state, the diff must also contain the test that fails when that state goes stale; the cost of keeping it in sync is a guess until something checks it.
+
+Validation and gates are not free — each expands the surface where reality and the model can disagree. Neither is prose: a weak answer stays weak at any length, so two sentences that answer both questions are done.
 
 ### Name the authority before enforcing it
 

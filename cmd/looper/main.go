@@ -910,8 +910,17 @@ type statusRecoveryView struct {
 }
 
 type statusOutstandingView struct {
-	QuarantinedActiveExecutions int `json:"quarantinedActiveExecutions"`
-	QuarantinedRunningRuns      int `json:"quarantinedRunningRuns"`
+	QuarantinedActiveExecutions int                         `json:"quarantinedActiveExecutions"`
+	QuarantinedRunningRuns      int                         `json:"quarantinedRunningRuns"`
+	Loops                       []statusQuarantinedLoopView `json:"loops"`
+}
+
+type statusQuarantinedLoopView struct {
+	Seq           int64  `json:"seq"`
+	Type          string `json:"type"`
+	Target        string `json:"target"`
+	Status        string `json:"status"`
+	QuarantinedAt string `json:"quarantinedAt"`
 }
 
 type statusToolsView struct {
@@ -972,10 +981,30 @@ func writeStatusOpsLines(stdout io.Writer, status daemonStatusResponse) {
 	if outstanding.QuarantinedActiveExecutions > 0 || outstanding.QuarantinedRunningRuns > 0 {
 		_, _ = fmt.Fprintf(stdout, "orphans:  quarantinedActiveExecutions=%d quarantinedRunningRuns=%d\n",
 			outstanding.QuarantinedActiveExecutions, outstanding.QuarantinedRunningRuns)
+		for _, loop := range outstanding.Loops {
+			_, _ = fmt.Fprintf(stdout, "  - %s\n", quarantinedLoopLine(loop))
+		}
 	}
 	if len(status.Service.DegradedReasons) > 0 {
 		_, _ = fmt.Fprintf(stdout, "degraded: %s\n", strings.Join(status.Service.DegradedReasons, ", "))
 	}
+}
+
+// quarantinedLoopLine renders one outstanding quarantined loop and the single
+// command that clears it. Columns the daemon did not report are dropped rather
+// than printed empty.
+func quarantinedLoopLine(loop statusQuarantinedLoopView) string {
+	columns := []string{fmt.Sprintf("loop %d", loop.Seq)}
+	for _, column := range []string{loop.Type, loop.Target, loop.Status} {
+		if strings.TrimSpace(column) != "" {
+			columns = append(columns, column)
+		}
+	}
+	if strings.TrimSpace(loop.QuarantinedAt) != "" {
+		columns = append(columns, "quarantined "+loop.QuarantinedAt)
+	}
+	columns = append(columns, "->", fmt.Sprintf("looper retry %d", loop.Seq))
+	return strings.Join(columns, "  ")
 }
 
 type projectResponse struct {

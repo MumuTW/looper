@@ -89,7 +89,12 @@ func TestCountOutstandingQuarantineDebtUsesConstantQueryShape(t *testing.T) {
 	if debt.QuarantinedActiveExecutions != scale || debt.QuarantinedRunningRuns != scale {
 		t.Fatalf("debt = %#v, want %d executions and runs", debt, scale)
 	}
-	if queryCounter.queryCalls != 3 || queryCounter.queryRowCalls != 0 {
-		t.Fatalf("query shape = %d QueryContext + %d QueryRowContext, want 3 bulk queries and no per-row queries", queryCounter.queryCalls, queryCounter.queryRowCalls)
+	if len(debt.Loops) != scale {
+		t.Fatalf("debt.Loops = %d entries, want %d from the same pass as the counters", len(debt.Loops), scale)
+	}
+	// Executions, quarantine evidence, loops, runs — one bulk query each. The
+	// roster costs one more bulk query, never one per loop.
+	if queryCounter.queryCalls != 4 || queryCounter.queryRowCalls != 0 {
+		t.Fatalf("query shape = %d QueryContext + %d QueryRowContext, want 4 bulk queries and no per-row queries", queryCounter.queryCalls, queryCounter.queryRowCalls)
 	}
 }

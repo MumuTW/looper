@@ -1142,15 +1142,28 @@ func TestStatusDegradedReasonsIncludesKnownDisabledPublishWithoutLooperPath(t *t
 	reasons := statusDegradedReasons(looperdruntime.ReviewPublishReadiness{
 		Known:              true,
 		PublishingDisabled: true,
-	}, looperdruntime.OutstandingQuarantineDebt{}, nil)
+	}, looperdruntime.ForgeCredentialReadiness{}, looperdruntime.OutstandingQuarantineDebt{}, nil)
 	if got := strings.Join(reasons, ","); got != "review_publish_disabled" {
 		t.Fatalf("statusDegradedReasons() = %q, want review_publish_disabled", got)
+	}
+}
+
+func TestStatusDegradedReasonsIncludesMissingForgeCredential(t *testing.T) {
+	reasons := statusDegradedReasons(
+		looperdruntime.ReviewPublishReadiness{},
+		looperdruntime.ForgeCredentialReadiness{GitHubProjects: true},
+		looperdruntime.OutstandingQuarantineDebt{},
+		nil,
+	)
+	if got := strings.Join(reasons, ","); got != looperdruntime.ForgeCredentialDegradedReason {
+		t.Fatalf("statusDegradedReasons() = %q, want %q", got, looperdruntime.ForgeCredentialDegradedReason)
 	}
 }
 
 func TestStatusDegradedReasonsIncludesUnavailableQuarantineDebt(t *testing.T) {
 	reasons := statusDegradedReasons(
 		looperdruntime.ReviewPublishReadiness{},
+		looperdruntime.ForgeCredentialReadiness{},
 		looperdruntime.OutstandingQuarantineDebt{},
 		errors.New("sqlite temporarily unavailable"),
 	)
@@ -1207,6 +1220,19 @@ func TestHandlerStatusReportsDebtAfterStaleRunReconcile(t *testing.T) {
 	// Quarantine deliberately leaves uncertain execution/run evidence active;
 	// this counter exists to surface the resulting active-runs inflation.
 	assertEqual(t, outstanding["quarantinedRunningRuns"], float64(1))
+	// The counters name the loops they are about, from the same evidence pass.
+	roster, ok := outstanding["loops"].([]any)
+	if !ok || len(roster) != 1 {
+		t.Fatalf("outstanding[loops] = %#v, want one quarantined loop", outstanding["loops"])
+	}
+	quarantinedLoop := roster[0].(map[string]any)
+	assertEqual(t, quarantinedLoop["loopId"], loopID)
+	assertEqual(t, quarantinedLoop["seq"], float64(1))
+	assertEqual(t, quarantinedLoop["type"], "worker")
+	assertEqual(t, quarantinedLoop["status"], "paused")
+	if fmt.Sprintf("%v", quarantinedLoop["quarantinedAt"]) == "" {
+		t.Fatalf("quarantined loop = %#v, want the durable quarantine timestamp", quarantinedLoop)
+	}
 	if !strings.Contains(fmt.Sprintf("%v", service["degradedReasons"]), "quarantine_orphan_debt") {
 		t.Fatalf("degradedReasons = %#v, want quarantine debt", service["degradedReasons"])
 	}

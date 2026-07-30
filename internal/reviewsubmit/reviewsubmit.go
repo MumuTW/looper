@@ -231,6 +231,7 @@ func reviewSubmitGatewayForConfig(cfg config.Config, repo, cwd string, diagnosti
 	}
 	return githubinfra.New(githubinfra.Options{
 		GHPath:                 *cfg.Tools.GHPath,
+		Env:                    config.DaemonGitHubCredentialEnv(cfg),
 		GitPath:                gitPath,
 		CWD:                    cwd,
 		GHRun:                  shell.Run,
