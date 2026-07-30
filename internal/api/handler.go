@@ -46,6 +46,7 @@ const (
 	webhookForwardPath         = "/webhook/forward"
 	javaScriptISOString        = "2006-01-02T15:04:05.000Z"
 	loopLogsFollowPollInterval = 200 * time.Millisecond
+	loopLogsFollowRetryAfter   = time.Second
 	activeRunHeartbeatTTL      = 30 * time.Minute
 	webhookListenerPath        = "/webhook/forward"
 )
@@ -684,6 +685,13 @@ type loopLogsFollowChunkEvent struct {
 	PID         *int64  `json:"pid,omitempty"`
 	Status      *string `json:"status,omitempty"`
 	Content     string  `json:"content"`
+}
+
+type loopLogsFollowErrorEvent struct {
+	Code         pkgapi.ErrorCode `json:"code"`
+	Message      string           `json:"message"`
+	Retryable    bool             `json:"retryable"`
+	RetryAfterMS int64            `json:"retryAfterMs,omitempty"`
 }
 
 func (e apiError) Error() string {
@@ -3903,7 +3911,8 @@ func (h *Handler) streamLoopLogs(w http.ResponseWriter, r *http.Request, request
 
 		current, err = h.buildLoopLogsResponse(r.Context(), loop)
 		if err != nil {
-			continue
+			_ = writeSSEEvent(w, flusher, "error", newLoopLogsFollowErrorEvent(err))
+			return nil
 		}
 		if observedRunID == "" && current.Run != nil {
 			observedRunID = current.Run.RunID
@@ -3937,6 +3946,24 @@ func (h *Handler) streamLoopLogs(w http.ResponseWriter, r *http.Request, request
 			_ = writeSSEEvent(w, flusher, "end", map[string]string{"reason": "run_completed"})
 			return nil
 		}
+	}
+}
+
+func newLoopLogsFollowErrorEvent(err error) loopLogsFollowErrorEvent {
+	var typed apiError
+	if !asAPIError(err, &typed) {
+		typed = internalServerError(err)
+	}
+	retryable := typed.status >= http.StatusInternalServerError
+	retryAfterMS := int64(0)
+	if retryable {
+		retryAfterMS = loopLogsFollowRetryAfter.Milliseconds()
+	}
+	return loopLogsFollowErrorEvent{
+		Code:         typed.code,
+		Message:      typed.message,
+		Retryable:    retryable,
+		RetryAfterMS: retryAfterMS,
 	}
 }
 
