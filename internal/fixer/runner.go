@@ -18,28 +18,28 @@ import (
 	"strings"
 	"time"
 
-	"github.com/MumuTW/looper/internal/agent"
-	"github.com/MumuTW/looper/internal/bootstrap"
-	"github.com/MumuTW/looper/internal/config"
-	"github.com/MumuTW/looper/internal/disclosure"
-	"github.com/MumuTW/looper/internal/domain"
-	"github.com/MumuTW/looper/internal/eventlog"
-	"github.com/MumuTW/looper/internal/fixer/adopt"
-	"github.com/MumuTW/looper/internal/fixer/discovery"
-	"github.com/MumuTW/looper/internal/fixer/failurepolicy"
-	"github.com/MumuTW/looper/internal/fixer/publish"
-	"github.com/MumuTW/looper/internal/fixer/reconcile"
-	"github.com/MumuTW/looper/internal/fixer/workflow"
-	githubinfra "github.com/MumuTW/looper/internal/infra/github"
-	"github.com/MumuTW/looper/internal/infra/specpr"
-	"github.com/MumuTW/looper/internal/labels"
-	"github.com/MumuTW/looper/internal/lifecycle"
-	"github.com/MumuTW/looper/internal/loops"
-	"github.com/MumuTW/looper/internal/loops/failureclass"
-	"github.com/MumuTW/looper/internal/processcontainment"
-	"github.com/MumuTW/looper/internal/storage"
-	"github.com/MumuTW/looper/internal/validation"
-	"github.com/MumuTW/looper/internal/worktreesafety"
+	"github.com/nexu-io/looper/internal/agent"
+	"github.com/nexu-io/looper/internal/bootstrap"
+	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/disclosure"
+	"github.com/nexu-io/looper/internal/domain"
+	"github.com/nexu-io/looper/internal/eventlog"
+	"github.com/nexu-io/looper/internal/fixer/discovery"
+	"github.com/nexu-io/looper/internal/fixer/failurepolicy"
+	"github.com/nexu-io/looper/internal/fixer/publish"
+	"github.com/nexu-io/looper/internal/fixer/reconcile"
+	"github.com/nexu-io/looper/internal/fixer/workflow"
+	githubinfra "github.com/nexu-io/looper/internal/infra/github"
+	"github.com/nexu-io/looper/internal/infra/specpr"
+	"github.com/nexu-io/looper/internal/labels"
+	"github.com/nexu-io/looper/internal/lifecycle"
+	"github.com/nexu-io/looper/internal/loops"
+	"github.com/nexu-io/looper/internal/loops/failureclass"
+	"github.com/nexu-io/looper/internal/processcontainment"
+	"github.com/nexu-io/looper/internal/reviewitem"
+	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/validation"
+	"github.com/nexu-io/looper/internal/worktreesafety"
 )
 
 // FixerStep aliases the extracted workflow authority's step type; the
@@ -87,21 +87,22 @@ type FixItem struct {
 	Source string `json:"source,omitempty"`
 	// ID identifies the item within its Source; only Source tells you which
 	// identity space an ID belongs to.
-	ID                  string   `json:"id,omitempty"`
-	ThreadID            string   `json:"threadId,omitempty"`
-	ThreadFingerprint   string   `json:"threadFingerprint,omitempty"`
-	ProviderCommentID   int64    `json:"providerCommentId,omitempty"`
-	ObservedFingerprint string   `json:"observedFingerprint,omitempty"`
-	ResolverPresent     bool     `json:"resolverPresent,omitempty"`
-	Name                string   `json:"name,omitempty"`
-	Summary             string   `json:"summary,omitempty"`
-	Body                string   `json:"body,omitempty"`
-	DiffHunk            string   `json:"diffHunk,omitempty"`
-	Files               []string `json:"files,omitempty"`
-	Author              string   `json:"author,omitempty"`
-	URL                 string   `json:"url,omitempty"`
-	Path                string   `json:"path,omitempty"`
-	Line                int64    `json:"line,omitempty"`
+	ID                  string              `json:"id,omitempty"`
+	ThreadID            string              `json:"threadId,omitempty"`
+	ThreadFingerprint   string              `json:"threadFingerprint,omitempty"`
+	ProviderCommentID   int64               `json:"providerCommentId,omitempty"`
+	ObservedFingerprint string              `json:"observedFingerprint,omitempty"`
+	ResolverPresent     bool                `json:"resolverPresent,omitempty"`
+	Name                string              `json:"name,omitempty"`
+	Summary             string              `json:"summary,omitempty"`
+	Body                string              `json:"body,omitempty"`
+	DiffHunk            string              `json:"diffHunk,omitempty"`
+	Files               []string            `json:"files,omitempty"`
+	Author              string              `json:"author,omitempty"`
+	URL                 string              `json:"url,omitempty"`
+	Path                string              `json:"path,omitempty"`
+	Line                int64               `json:"line,omitempty"`
+	Severity            reviewitem.Severity `json:"severity,omitempty"`
 }
 
 type PullRequestSummary struct {
@@ -7032,7 +7033,8 @@ func normalizeFixItems(comments []map[string]any, checks []map[string]any, hasCo
 		case int:
 			line = int64(v)
 		}
-		result = append(result, FixItem{Type: "comment", Source: source, ID: id, ThreadID: threadID, ThreadFingerprint: threadFingerprint, ProviderCommentID: providerCommentID, ObservedFingerprint: observedFingerprint, ResolverPresent: resolverPresent, Summary: summary, Body: body, DiffHunk: diffHunk, Author: author, URL: url, Path: path, Line: line})
+		severity, _ := reviewitem.SeverityFromBody(body)
+		result = append(result, FixItem{Type: "comment", Source: source, ID: id, ThreadID: threadID, ThreadFingerprint: threadFingerprint, ProviderCommentID: providerCommentID, ObservedFingerprint: observedFingerprint, ResolverPresent: resolverPresent, Summary: summary, Body: body, DiffHunk: diffHunk, Author: author, URL: url, Path: path, Line: line, Severity: severity})
 	}
 	for _, check := range checks {
 		if !isFailingCheck(check) {

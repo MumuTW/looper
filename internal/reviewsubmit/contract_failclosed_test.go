@@ -20,7 +20,7 @@ func TestReviewSubmitOrchestrationFailsClosedOnBaseHeadMismatch(t *testing.T) {
 	payload := map[string]any{
 		"body": "Actionable review\n<!-- looper:review id=review-mismatch head=" + strings.Repeat("a", 40) + " outcome=actionable -->",
 		"comments": []map[string]any{
-			{"body": "late change", "path": "target/late.go", "line": targetLine, "side": "RIGHT"},
+			{"body": "late change", "severity": "blocking", "path": "target/late.go", "line": targetLine, "side": "RIGHT"},
 		},
 	}
 	raw, _ := json.Marshal(payload)
@@ -61,7 +61,7 @@ func TestReviewSubmitOrchestrationFailsClosedWhenRemoteOversizedAndLocalUnavaila
 	payload := map[string]any{
 		"body": "Actionable review\n<!-- looper:review id=review-oversized head=" + headSHA + " outcome=actionable -->",
 		"comments": []map[string]any{
-			{"body": "needs fix", "path": secretPath, "line": 1, "side": "RIGHT"},
+			{"body": "needs fix", "severity": "blocking", "path": secretPath, "line": 1, "side": "RIGHT"},
 		},
 	}
 	raw, _ := json.Marshal(payload)
@@ -111,7 +111,7 @@ func TestReviewSubmitOrchestrationRetryDoesNotDuplicateAfterAuthorityRecovery(t 
 	payload := map[string]any{
 		"body": "Actionable review\n<!-- looper:review id=review-retry head=" + headSHA + " outcome=actionable -->",
 		"comments": []map[string]any{
-			{"body": "late change needs attention", "path": "target/late.go", "line": targetLine, "side": "RIGHT"},
+			{"body": "late change needs attention", "severity": "blocking", "path": "target/late.go", "line": targetLine, "side": "RIGHT"},
 		},
 	}
 	raw, _ := json.Marshal(payload)

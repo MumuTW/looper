@@ -8024,6 +8024,8 @@ func TestBuildReviewPromptIncludesActionableQualityContract(t *testing.T) {
 		"NITs must not block merge",
 		"Finalization gate before submit",
 		"review outcome matches the highest published severity",
+		"required `severity` of `blocking`, `non_blocking`, or `nit`",
+		"persists the validated value as review-item evidence",
 		"do not use PATH-based `looper`",
 		"repository-local `go run ./cmd/looper`",
 		"`gh api repos/acme/looper/pulls/42/reviews`, or `gh pr review` directly",
