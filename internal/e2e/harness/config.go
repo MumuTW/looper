@@ -56,6 +56,12 @@ func DefaultConfig(tb testing.TB, home TempHome, options ConfigOptions) config.C
 	}
 	if options.ToolPaths.GH != "" {
 		cfg.Tools.GHPath = stringPtr(options.ToolPaths.GH)
+		if cfg.Agent.Env == nil {
+			cfg.Agent.Env = map[string]string{}
+		}
+		// Fake gh is an authenticated forge authority in harness scenarios. Make
+		// that explicit now that daemon gateways fail before anonymous calls.
+		cfg.Agent.Env["GH_TOKEN"] = "looper-e2e-fake-token"
 	}
 	if options.ToolPaths.Looper != "" {
 		cfg.Tools.LooperPath = stringPtr(options.ToolPaths.Looper)

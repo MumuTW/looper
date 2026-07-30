@@ -532,6 +532,22 @@ func TestStatusReportsKnownIncapableReviewPublishReadiness(t *testing.T) {
 	}
 }
 
+func TestStatusReportsDaemonGitHubIdentityAndCoreRate(t *testing.T) {
+	var stdout bytes.Buffer
+	writeStatusOpsLines(&stdout, daemonStatusResponse{GitHub: statusGitHubView{Hosts: []statusGitHubHostView{{
+		Hostname:          "github.com",
+		Authenticated:     true,
+		Login:             "MumuTW",
+		CoreRateLimit:     5000,
+		CoreRateRemaining: 4182,
+		CheckedAt:         "2026-07-30T12:00:00Z",
+	}}}})
+	want := "github:   github.com as MumuTW; core 4182/5000 remaining; checked 2026-07-30T12:00:00Z\n"
+	if got := stdout.String(); got != want {
+		t.Fatalf("status output = %q, want %q", got, want)
+	}
+}
+
 func TestStatusFailsWhenDaemonIsUnreachable(t *testing.T) {
 	daemon := newFakeDaemon(t)
 	address := daemon.server.URL

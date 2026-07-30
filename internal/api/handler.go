@@ -99,7 +99,9 @@ type Context struct {
 	// DaemonBinaryStatus reports whether the daemon's own executable file still
 	// holds the image it is running. Optional: when nil, /status reports the
 	// binary identity as unknown rather than as unchanged.
-	DaemonBinaryStatus func() daemonbinary.Status
+	DaemonBinaryStatus  func() daemonbinary.Status
+	GitHubHealth        func(context.Context) looperdruntime.GitHubHealth
+	ReconcileStaleRuns  func(context.Context) (looperdruntime.StaleRunReconcileSummary, error)
 	StopLoop           func(context.Context, string, string) (any, error)
 	CloseLoop          func(context.Context, string, string) (any, error)
 	StopAll            func(context.Context, string) (any, error)
@@ -940,17 +942,18 @@ func (h *Handler) buildHealthResponse(ctx context.Context) (healthResponse, erro
 }
 
 type statusResponse struct {
-	Service         statusService       `json:"service"`
-	Storage         statusStorage       `json:"storage"`
-	Scheduler       statusScheduler     `json:"scheduler"`
-	Agent           statusAgent         `json:"agent"`
-	WorktreeCleanup any                 `json:"worktreeCleanup"`
-	Webhook         statusWebhook       `json:"webhook"`
-	Loops           statusLoops         `json:"loops"`
-	Network         any                 `json:"network,omitempty"`
-	Safety          statusSafety        `json:"safety"`
-	Notifications   statusNotifications `json:"notifications"`
-	Tools           statusTools         `json:"tools"`
+	Service         statusService               `json:"service"`
+	Storage         statusStorage               `json:"storage"`
+	Scheduler       statusScheduler             `json:"scheduler"`
+	Agent           statusAgent                 `json:"agent"`
+	WorktreeCleanup any                         `json:"worktreeCleanup"`
+	Webhook         statusWebhook               `json:"webhook"`
+	Loops           statusLoops                 `json:"loops"`
+	Network         any                         `json:"network,omitempty"`
+	Safety          statusSafety                `json:"safety"`
+	Notifications   statusNotifications         `json:"notifications"`
+	Tools           statusTools                 `json:"tools"`
+	GitHub          looperdruntime.GitHubHealth `json:"github"`
 }
 
 type statusService struct {
@@ -1423,7 +1426,11 @@ func (h *Handler) buildStatusResponse(ctx context.Context) (statusResponse, erro
 	}
 	recovery := h.recoveryWithOutstanding(outstanding)
 	binaryIdentity := h.daemonBinaryStatus()
+	githubHealth := h.buildGitHubHealth(ctx)
 	degradedReasons := statusDegradedReasons(reviewPublish, forgeCredential, outstanding, debtErr, binaryIdentity)
+	if githubHealth.AuthenticationDegraded() {
+		degradedReasons = append(degradedReasons, looperdruntime.ForgeAuthenticationDegradedReason)
+	}
 	// Snapshot admission once so service and scheduler cannot disagree if the
 	// runtime transitions while this response is being assembled.
 	admissionState := h.admissionStateString()
@@ -1499,7 +1506,15 @@ func (h *Handler) buildStatusResponse(ctx context.Context) (statusResponse, erro
 			LooperPath:    reviewPublish.LooperPath,
 			ReviewPublish: reviewPublish,
 		},
+		GitHub: githubHealth,
 	}, nil
+}
+
+func (h *Handler) buildGitHubHealth(ctx context.Context) looperdruntime.GitHubHealth {
+	if h.context.GitHubHealth != nil {
+		return h.context.GitHubHealth(ctx)
+	}
+	return looperdruntime.GitHubHealth{}
 }
 
 func (h *Handler) buildWorktreeCleanupStatusResponse() any {

@@ -133,6 +133,13 @@
               }
             }
           },
+          "github": {
+            "credential": {
+              "githubProjects": false,
+              "resolved": false
+            },
+            "hosts": []
+          },
           "worktreeCleanup": {
             "enabled": true,
             "dryRun": false,

@@ -166,6 +166,23 @@ export type StatusData = {
   agent?: {
     vendor?: string;
   };
+  github?: {
+    credential?: {
+      githubProjects?: boolean;
+      resolved?: boolean;
+      reason?: string;
+    };
+    hosts?: Array<{
+      hostname?: string;
+      authenticated?: boolean;
+      login?: string;
+      coreRateLimit?: number;
+      coreRateRemaining?: number;
+      coreRateResetAt?: string;
+      checkedAt?: string;
+      error?: string;
+    }>;
+  };
 };
 
 export type BootstrapExchangeData = {

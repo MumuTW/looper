@@ -532,6 +532,51 @@ export function OverviewPage({
             </>
           )}
         </Card>
+
+        <Card title="GitHub">
+          <dl className="m-0">
+            <Kv
+              label="Credential"
+              value={
+                status?.github?.credential?.githubProjects === false
+                  ? "not required"
+                  : status?.github?.credential?.resolved === true
+                    ? "configured"
+                    : status?.github?.credential?.resolved === false
+                      ? "missing"
+                      : "—"
+              }
+            />
+            {(status?.github?.hosts ?? []).length === 0 ? (
+              <Kv label="Identity" value="—" />
+            ) : (
+              (status?.github?.hosts ?? []).map((host) => {
+                const identity = host.authenticated
+                  ? `${host.login || "authenticated"} · ${host.coreRateRemaining ?? "—"} / ${host.coreRateLimit ?? "—"} remaining`
+                  : host.error || "authentication unavailable";
+                return (
+                  <div key={host.hostname || identity}>
+                    <Kv
+                      label={host.hostname || "GitHub"}
+                      value={
+                        <span
+                          style={{
+                            color: host.authenticated
+                              ? "var(--ok)"
+                              : "var(--danger)",
+                          }}
+                        >
+                          {identity}
+                        </span>
+                      }
+                    />
+                    <Kv label="Checked" value={host.checkedAt ?? "—"} />
+                  </div>
+                );
+              })
+            )}
+          </dl>
+        </Card>
       </div>
 
       <Card

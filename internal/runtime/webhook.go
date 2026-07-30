@@ -807,7 +807,16 @@ func (w *webhookRuntime) runForwarder(repo string) {
 			return
 		}
 
+		env := config.DaemonGitHubCredentialEnv(w.cfg)
+		if len(env) == 0 {
+			w.recordForwarderError(repo, stopCh, "daemon has no configured GitHub credential", true)
+			return
+		}
 		cmd := execCommand(state.Command[0], state.Command[1:]...)
+		cmd.Env = os.Environ()
+		for key, value := range env {
+			cmd.Env = append(cmd.Env, key+"="+value)
+		}
 		stdout, err := cmd.StdoutPipe()
 		if err != nil {
 			w.recordForwarderError(repo, stopCh, fmt.Sprintf("attach stdout: %v", err), true)

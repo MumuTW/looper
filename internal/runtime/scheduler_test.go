@@ -1298,10 +1298,10 @@ esac
 	authenticatedGateway := githubinfra.New(githubinfra.Options{GHPath: authenticatedPath, CWD: rootDir})
 	unauthenticatedGateway := githubinfra.New(githubinfra.Options{GHPath: unauthenticatedPath, CWD: rootDir})
 
-	if !githubCLIAutoPROpeningAvailable(context.Background(), config.Config{Tools: config.ToolPathsConfig{GHPath: &authenticatedPath}}, authenticatedGateway, logger, "nexu-io/looper", rootDir) {
+	if !githubCLIAutoPROpeningAvailable(context.Background(), config.Config{Agent: config.AgentConfig{Env: map[string]string{"GH_TOKEN": "fake-test-token"}}, Tools: config.ToolPathsConfig{GHPath: &authenticatedPath}}, authenticatedGateway, logger, "nexu-io/looper", rootDir) {
 		t.Fatal("githubCLIAutoPROpeningAvailable() = false, want true for authenticated gh cli")
 	}
-	if githubCLIAutoPROpeningAvailable(context.Background(), config.Config{Tools: config.ToolPathsConfig{GHPath: &unauthenticatedPath}}, unauthenticatedGateway, logger, "nexu-io/looper", rootDir) {
+	if githubCLIAutoPROpeningAvailable(context.Background(), config.Config{Agent: config.AgentConfig{Env: map[string]string{"GH_TOKEN": "fake-test-token"}}, Tools: config.ToolPathsConfig{GHPath: &unauthenticatedPath}}, unauthenticatedGateway, logger, "nexu-io/looper", rootDir) {
 		t.Fatal("githubCLIAutoPROpeningAvailable() = true, want false for unauthenticated gh cli")
 	}
 	if !githubCLIAutoPROpeningAvailable(context.Background(), config.Config{}, authenticatedGateway, logger, "nexu-io/looper", rootDir) {
@@ -1329,7 +1329,7 @@ esac
 
 	logger := &testLogger{}
 	gateway := githubinfra.New(githubinfra.Options{GHPath: scriptPath, CWD: rootDir})
-	if !githubCLIAutoPROpeningAvailable(context.Background(), config.Config{Tools: config.ToolPathsConfig{GHPath: &scriptPath}}, gateway, logger, "github.example.com/nexu-io/looper", rootDir) {
+	if !githubCLIAutoPROpeningAvailable(context.Background(), config.Config{Agent: config.AgentConfig{Env: map[string]string{"GH_ENTERPRISE_TOKEN": "fake-test-token"}}, Tools: config.ToolPathsConfig{GHPath: &scriptPath}}, gateway, logger, "github.example.com/nexu-io/looper", rootDir) {
 		t.Fatal("githubCLIAutoPROpeningAvailable() = false, want true for repo host auth")
 	}
 	logBytes, err := os.ReadFile(logPath)

@@ -2343,7 +2343,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 
 func githubCLIAutoPROpeningAvailable(ctx context.Context, cfg config.Config, githubGateway *githubinfra.Gateway, logger bootstrap.Logger, repo, cwd string) bool {
 	if configuredPath := strings.TrimSpace(derefString(cfg.Tools.GHPath)); configuredPath != "" {
-		githubGateway = githubinfra.New(githubinfra.Options{GHPath: configuredPath, CWD: cwd, Env: config.DaemonGitHubCredentialEnv(cfg)})
+		githubGateway = githubinfra.New(githubinfra.Options{GHPath: configuredPath, CWD: cwd, Env: config.DaemonGitHubCredentialEnv(cfg), RequireCredential: true})
 	}
 	if githubGateway == nil {
 		return false

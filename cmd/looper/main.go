@@ -898,6 +898,22 @@ type healthResponse struct {
 type daemonStatusResponse struct {
 	Service statusServiceView `json:"service"`
 	Tools   statusToolsView   `json:"tools"`
+	GitHub  statusGitHubView  `json:"github"`
+}
+
+type statusGitHubView struct {
+	Hosts []statusGitHubHostView `json:"hosts"`
+}
+
+type statusGitHubHostView struct {
+	Hostname          string `json:"hostname"`
+	Authenticated     bool   `json:"authenticated"`
+	Login             string `json:"login"`
+	CoreRateLimit     int    `json:"coreRateLimit"`
+	CoreRateRemaining int    `json:"coreRateRemaining"`
+	CoreRateResetAt   string `json:"coreRateResetAt"`
+	CheckedAt         string `json:"checkedAt"`
+	Error             string `json:"error"`
 }
 
 type statusServiceView struct {
@@ -1001,6 +1017,30 @@ func writeStatusOpsLines(stdout io.Writer, status daemonStatusResponse) {
 			}
 			_, _ = fmt.Fprintf(stdout, "review:   publish not ready (%s)\n", singleLine(reason))
 		}
+	}
+	for _, host := range status.GitHub.Hosts {
+		hostname := strings.TrimSpace(host.Hostname)
+		if hostname == "" {
+			hostname = "github.com"
+		}
+		if host.Authenticated {
+			login := strings.TrimSpace(host.Login)
+			if login == "" {
+				login = "authenticated"
+			}
+			checkedAt := strings.TrimSpace(host.CheckedAt)
+			if checkedAt == "" {
+				checkedAt = "unknown"
+			}
+			_, _ = fmt.Fprintf(stdout, "github:   %s as %s; core %d/%d remaining; checked %s\n",
+				hostname, login, host.CoreRateRemaining, host.CoreRateLimit, checkedAt)
+			continue
+		}
+		reason := strings.TrimSpace(host.Error)
+		if reason == "" {
+			reason = "authenticated identity unavailable"
+		}
+		_, _ = fmt.Fprintf(stdout, "github:   %s unavailable (%s)\n", hostname, singleLine(reason))
 	}
 
 	// A replaced binary is invisible in every other line: the daemon is healthy,

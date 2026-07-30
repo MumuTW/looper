@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/url"
+	"os"
 	"os/exec"
 	"sort"
 	"strings"
@@ -71,6 +72,7 @@ type webhookForwarderCommand struct {
 	Repo   string
 	URL    string
 	Events []string
+	Env    map[string]string
 }
 
 type webhookForwarderManagerOptions struct {
@@ -302,11 +304,17 @@ func (m *webhookForwarderManager) superviseForwarder(ctx context.Context, forwar
 		if m.endpoint != nil {
 			endpoint = *m.endpoint
 		}
+		env := config.DaemonGitHubCredentialEnv(m.config)
+		if len(env) == 0 {
+			m.markForwarderError(forwarder, "start failed: daemon has no configured GitHub credential", true)
+			return
+		}
 		startResult, err := m.startProcess(ctx, webhookForwarderCommand{
 			Path:   strings.TrimSpace(derefString(m.config.Tools.GHPath)),
 			Repo:   forwarder.repo,
 			URL:    endpoint,
 			Events: webhookForwarderEvents,
+			Env:    env,
 		})
 		if err != nil {
 			m.markForwarderError(forwarder, fmt.Sprintf("start failed: %s", err.Error()), false)
@@ -669,6 +677,9 @@ func (f *managedWebhookForwarder) setProcess(process webhookForwarderProcess) {
 }
 
 func startWebhookForwarderProcess(ctx context.Context, command webhookForwarderCommand) (webhookForwarderStartResult, error) {
+	if len(command.Env) == 0 {
+		return webhookForwarderStartResult{}, fmt.Errorf("daemon has no configured GitHub credential")
+	}
 	args := []string{
 		"webhook",
 		"forward",
@@ -677,6 +688,10 @@ func startWebhookForwarderProcess(ctx context.Context, command webhookForwarderC
 		"--url=" + command.URL,
 	}
 	cmd := exec.CommandContext(ctx, command.Path, args...)
+	cmd.Env = os.Environ()
+	for key, value := range command.Env {
+		cmd.Env = append(cmd.Env, key+"="+value)
+	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return webhookForwarderStartResult{}, err

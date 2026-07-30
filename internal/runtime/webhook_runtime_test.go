@@ -199,6 +199,49 @@ func TestWebhookRuntimeRunForwarderClearsRecoveredForwarderReason(t *testing.T) 
 	}
 }
 
+func TestWebhookRuntimeForwarderRequiresCredentialBeforeExec(t *testing.T) {
+	called := 0
+	original := execCommand
+	execCommand = func(name string, args ...string) *exec.Cmd { called++; return exec.Command(name, args...) }
+	t.Cleanup(func() { execCommand = original })
+	rt := &webhookRuntime{cfg: config.Config{}, status: WebhookStatus{Forwarders: []WebhookForwarderState{{Repo: "acme/repo", Command: []string{"gh", "webhook"}}}}, stopCh: make(chan struct{}), forwarderStopCh: map[string]chan struct{}{"acme/repo": make(chan struct{})}, now: time.Now}
+	rt.runForwarder("acme/repo")
+	if called != 0 {
+		t.Fatalf("execCommand calls = %d, want 0", called)
+	}
+}
+
+func TestWebhookRuntimeForwarderOverlaysCredentialEnv(t *testing.T) {
+	t.Setenv("PATH", "/test-path")
+	t.Setenv("HOME", "/test-home")
+	seen := make(chan *exec.Cmd, 1)
+	original := execCommand
+	execCommand = func(name string, args ...string) *exec.Cmd {
+		cmd := exec.Command("sleep", "1")
+		seen <- cmd
+		return cmd
+	}
+	t.Cleanup(func() { execCommand = original })
+	rt := &webhookRuntime{cfg: config.Config{Agent: config.AgentConfig{Env: map[string]string{"GH_TOKEN": "token"}}}, status: WebhookStatus{Forwarders: []WebhookForwarderState{{Repo: "acme/repo", Command: []string{"gh", "webhook"}}}}, stopCh: make(chan struct{}), forwarderStopCh: map[string]chan struct{}{"acme/repo": make(chan struct{})}, now: time.Now}
+	go rt.runForwarder("acme/repo")
+	command := <-seen
+	time.Sleep(time.Millisecond)
+	env := command.Env
+	rt.Stop()
+	if !containsEnv(env, "GH_TOKEN=token") || !containsEnv(env, "PATH=/test-path") || !containsEnv(env, "HOME=/test-home") {
+		t.Fatalf("child env = %#v", env)
+	}
+}
+
+func containsEnv(env []string, want string) bool {
+	for _, value := range env {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
 func TestWebhookRuntimeLaunchForwarderClearsStaleTailsOnRestart(t *testing.T) {
 	testBin, err := os.Executable()
 	if err != nil {

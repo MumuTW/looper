@@ -32,6 +32,7 @@ function bootstrapRouteAbsent(): Response {
 
 function stubDaemon(
   exchange: () => Response,
+  status: unknown = {},
 ): ReturnType<typeof vi.fn> {
   const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
     const path = String(input);
@@ -39,6 +40,7 @@ function stubDaemon(
     if (path === "/api/v1/healthz") return response({ healthy: true });
     if (path === "/api/v1/runs/active") return response({ items: [] });
     if (path === "/api/v1/projects") return response({ items: [] });
+    if (path === "/api/v1/status") return response(status);
     if (path.startsWith("/api/v1/loops")) return response({ items: [] });
     return response({ items: [] });
   });
@@ -135,5 +137,31 @@ describe("triage confirmation status", () => {
     expect(screen.getByText(/acme\/looper#43/)).toBeTruthy();
     expect(screen.getByText(/waiting 1h/)).toBeTruthy();
     expect(screen.getByText(/waiting 15m/)).toBeTruthy();
+  });
+});
+
+describe("operator GitHub health", () => {
+  it("shows the daemon identity and remaining core rate budget", async () => {
+    window.history.replaceState({}, "", "/dashboard/");
+    stubDaemon(bootstrapRouteAbsent, {
+      github: {
+        credential: { githubProjects: true, resolved: true },
+        hosts: [
+          {
+            hostname: "github.com",
+            authenticated: true,
+            login: "MumuTW",
+            coreRateLimit: 5000,
+            coreRateRemaining: 4182,
+            checkedAt: "2026-07-30T12:00:00Z",
+          },
+        ],
+      },
+    });
+
+    render(<App />);
+
+    expect(await screen.findByText("GitHub")).toBeTruthy();
+    expect(screen.getByText("MumuTW · 4182 / 5000 remaining")).toBeTruthy();
   });
 });

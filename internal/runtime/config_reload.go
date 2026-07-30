@@ -225,6 +225,14 @@ func (r *Runtime) applyLoadedConfigBoundaryLocked(loaded config.LoadedFileConfig
 		r.projectCatalog.PublishGlobals(loaded.Config)
 		r.publishCatalogConsumers(r.projectCatalog.Snapshot())
 	}
+	// Scheduler handlers retain this gateway pointer, so replace its credential
+	// material in place while configBoundary excludes a half-published reload.
+	r.mu.RLock()
+	gateway := r.githubGateway
+	r.mu.RUnlock()
+	if gateway != nil {
+		gateway.UpdateCredentialEnv(config.DaemonGitHubCredentialEnv(runtimeCandidate))
+	}
 	r.configReloadStatus.LastAppliedAt = timePointer(now)
 	if r.logger != nil {
 		r.logger.Info("looperd configuration reloaded", map[string]any{

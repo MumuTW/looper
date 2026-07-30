@@ -176,6 +176,44 @@ func TestWebhookForwarderManagerStartsUniqueReposAndRetainsTail(t *testing.T) {
 	}
 }
 
+func TestWebhookForwarderManagerRequiresDaemonCredentialBeforeStart(t *testing.T) {
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Webhook.Enabled = true
+	starts := 0
+	m := newWebhookForwarderManager(webhookForwarderManagerOptions{Config: cfg, StartProcess: func(context.Context, webhookForwarderCommand) (webhookForwarderStartResult, error) {
+		starts++
+		return webhookForwarderStartResult{}, nil
+	}})
+	m.Sync(context.Background(), []storage.ProjectRecord{{ID: "p", MetadataJSON: stringPtr(`{"repo":"acme/repo"}`)}})
+	t.Cleanup(m.Stop)
+	time.Sleep(10 * time.Millisecond)
+	if starts != 0 {
+		t.Fatalf("starts = %d, want 0 without credential", starts)
+	}
+}
+
+func TestWebhookForwarderManagerPassesDaemonCredentialEnv(t *testing.T) {
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Webhook.Enabled = true
+	cfg.Agent.Env = map[string]string{"GH_TOKEN": "token"}
+	got := make(chan webhookForwarderCommand, 1)
+	m := newWebhookForwarderManager(webhookForwarderManagerOptions{Config: cfg, StartProcess: func(_ context.Context, command webhookForwarderCommand) (webhookForwarderStartResult, error) {
+		got <- command
+		return newTestStartedForwarder(command).result(), nil
+	}})
+	m.Sync(context.Background(), []storage.ProjectRecord{{ID: "p", MetadataJSON: stringPtr(`{"repo":"acme/repo"}`)}})
+	t.Cleanup(m.Stop)
+	if command := <-got; command.Env["GH_TOKEN"] != "token" {
+		t.Fatalf("GH_TOKEN = %q", command.Env["GH_TOKEN"])
+	}
+}
+
 func TestWebhookForwarderEventsIncludePushAndCheckRun(t *testing.T) {
 	t.Parallel()
 	if !slices.Contains(webhookForwarderEvents, "push") {

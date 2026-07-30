@@ -30,6 +30,8 @@ const (
 	defaultGhCommandTimeout = 60 * time.Second
 	prListGhCommandTimeout  = 15 * time.Second
 	prDiffGhCommandTimeout  = 180 * time.Second
+	defaultAuthHealthTTL    = 5 * time.Minute
+	failedAuthHealthTTL     = 30 * time.Second
 )
 
 var (
@@ -56,6 +58,9 @@ var (
 	// ErrReviewBaseHeadMismatch is returned when local git objects do not match the
 	// refreshed PR base/head SHAs required for path-targeted anchor authority.
 	ErrReviewBaseHeadMismatch = errors.New("local repository base/head does not match refreshed PR metadata")
+	// ErrCredentialUnavailable prevents daemon-owned gh calls from silently
+	// falling back to GitHub's anonymous per-IP rate limit.
+	ErrCredentialUnavailable = errors.New("daemon has no configured GitHub credential")
 )
 
 // Diagnostic / snapshot reason codes for diff capture and anchor authority.
@@ -75,7 +80,14 @@ type Options struct {
 	// the parent process environment, so the child keeps PATH/HOME and only the
 	// named keys are overridden. Nil means inherit the parent environment
 	// unchanged — which, in a detached daemon, means anonymous GitHub calls.
-	Env                    map[string]string
+	Env map[string]string
+	// RequireCredential fails before starting gh when Env contains no resolved
+	// credential. Daemon gateways enable this; library/test callers retain the
+	// historical ambient-auth behavior unless they opt in.
+	RequireCredential bool
+	// AuthHealthCacheTTL bounds how often operator health spends one authenticated
+	// core request to obtain the actual login and response rate-limit headers.
+	AuthHealthCacheTTL     time.Duration
 	Now                    func() time.Time
 	DiscoveryCacheTTL      time.Duration
 	GHRun                  func(context.Context, shell.Options) (shell.Result, error)
@@ -89,7 +101,12 @@ type Gateway struct {
 	cwd     string
 	// ghEnv is the fully materialized child environment for gh invocations
 	// (parent environment plus Options.Env), or nil to inherit unchanged.
-	ghEnv                  map[string]string
+	credentialEnv          map[string]string
+	requireCredential      bool
+	credentialConfigured   bool
+	authHealthCacheTTL     time.Duration
+	authHealthMu           sync.Mutex
+	authHealthCache        map[string]authHealthCacheEntry
 	now                    func() time.Time
 	discoveryCacheTTL      time.Duration
 	discoveryCacheMu       sync.Mutex
@@ -99,6 +116,24 @@ type Gateway struct {
 	ghRun                  func(context.Context, shell.Options) (shell.Result, error)
 	gitRun                 func(context.Context, shell.Options) (shell.Result, error)
 	reviewSubmitDiagnostic func(event string, fields map[string]any)
+}
+
+type authHealthCacheEntry struct {
+	expiresAt time.Time
+	health    AuthHealth
+}
+
+// AuthHealth is the operator-facing identity and core REST rate snapshot from
+// the exact environment used by daemon-owned gh children.
+type AuthHealth struct {
+	Hostname          string `json:"hostname"`
+	Authenticated     bool   `json:"authenticated"`
+	Login             string `json:"login,omitempty"`
+	CoreRateLimit     int    `json:"coreRateLimit"`
+	CoreRateRemaining int    `json:"coreRateRemaining"`
+	CoreRateResetAt   string `json:"coreRateResetAt,omitempty"`
+	CheckedAt         string `json:"checkedAt"`
+	Error             string `json:"error,omitempty"`
 }
 
 type discoveryPullRequestListCacheEntry struct {
@@ -702,11 +737,19 @@ func New(options Options) *Gateway {
 	if gitRun == nil {
 		gitRun = shell.Run
 	}
+	authHealthCacheTTL := options.AuthHealthCacheTTL
+	if authHealthCacheTTL <= 0 {
+		authHealthCacheTTL = defaultAuthHealthTTL
+	}
 	return &Gateway{
 		ghPath:                 ghPath,
 		gitPath:                gitPath,
 		cwd:                    options.CWD,
-		ghEnv:                  mergeIntoProcessEnv(options.Env),
+		credentialEnv:          options.Env,
+		requireCredential:      options.RequireCredential,
+		credentialConfigured:   hasGitHubCredential(options.Env),
+		authHealthCacheTTL:     authHealthCacheTTL,
+		authHealthCache:        map[string]authHealthCacheEntry{},
 		now:                    now,
 		discoveryCacheTTL:      options.DiscoveryCacheTTL,
 		discoveryPRCache:       map[string]discoveryPullRequestListCacheEntry{},
@@ -3024,6 +3067,149 @@ func (g *Gateway) IsAuthenticated(ctx context.Context, cwd, hostname string) (bo
 	return false, err
 }
 
+// AuthHealth returns a cached, authenticated identity and core REST rate-limit
+// snapshot for hostname. The probe deliberately uses one `gh api user --include`
+// call: its body is the actual login and its response headers are the core rate
+// authority. Caching prevents dashboard polling from becoming a material rate
+// consumer itself.
+func (g *Gateway) AuthHealth(ctx context.Context, cwd, hostname string) AuthHealth {
+	hostname = strings.TrimSpace(hostname)
+	if hostname == "" {
+		hostname = "github.com"
+	}
+
+	g.authHealthMu.Lock()
+	defer g.authHealthMu.Unlock()
+	if cached, ok := g.authHealthCache[hostname]; ok && g.now().Before(cached.expiresAt) {
+		return cached.health
+	}
+
+	health := g.probeAuthHealth(ctx, cwd, hostname)
+	if ctx.Err() != nil {
+		return health
+	}
+	ttl := g.authHealthCacheTTL
+	if g.credentialConfigured && !health.Authenticated && failedAuthHealthTTL < ttl {
+		ttl = failedAuthHealthTTL
+	}
+	g.authHealthCache[hostname] = authHealthCacheEntry{
+		expiresAt: g.now().Add(ttl),
+		health:    health,
+	}
+	return health
+}
+
+// UpdateCredentialEnv atomically replaces daemon credential material and drops
+// snapshots obtained under the previous identity.
+func (g *Gateway) UpdateCredentialEnv(env map[string]string) {
+	g.authHealthMu.Lock()
+	defer g.authHealthMu.Unlock()
+	g.credentialEnv = env
+	g.credentialConfigured = hasGitHubCredential(env)
+	g.authHealthCache = map[string]authHealthCacheEntry{}
+}
+
+func hasGitHubCredential(env map[string]string) bool {
+	for _, key := range config.GitHubTokenEnvKeys {
+		if strings.TrimSpace(env[key]) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func githubCredentialForHost(env map[string]string, hostname string) map[string]string {
+	enterprise := strings.TrimSpace(hostname) != "" && !strings.EqualFold(strings.TrimSpace(hostname), "github.com")
+	keys := []string{"GH_TOKEN", "GITHUB_TOKEN"}
+	if enterprise {
+		keys = []string{"GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"}
+	}
+	for _, key := range keys {
+		if value := strings.TrimSpace(env[key]); value != "" {
+			return map[string]string{key: value}
+		}
+	}
+	return nil
+}
+
+func hostnameFromGHArgs(args []string) string {
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == "--hostname" {
+			return args[i+1]
+		}
+	}
+	return "github.com"
+}
+
+func (g *Gateway) probeAuthHealth(ctx context.Context, cwd, hostname string) AuthHealth {
+	checkedAt := g.now().UTC()
+	health := AuthHealth{
+		Hostname:  hostname,
+		CheckedAt: checkedAt.Format(time.RFC3339),
+	}
+	result, err := g.runGhWithTimeout(ctx, cwd, "", prListGhCommandTimeout,
+		"api", "user", "--include", "--jq", ".login", "--hostname", hostname,
+	)
+	if err != nil {
+		health.Error = err.Error()
+		return health
+	}
+
+	login, headers, err := parseAuthHealthResponse(result.Stdout)
+	if err != nil {
+		health.Error = err.Error()
+		return health
+	}
+	health.Authenticated = true
+	health.Login = login
+	health.CoreRateLimit = headers.limit
+	health.CoreRateRemaining = headers.remaining
+	health.CoreRateResetAt = time.Unix(headers.reset, 0).UTC().Format(time.RFC3339)
+	return health
+}
+
+type authHealthHeaders struct {
+	limit     int
+	remaining int
+	reset     int64
+}
+
+func parseAuthHealthResponse(stdout string) (string, authHealthHeaders, error) {
+	normalized := strings.ReplaceAll(stdout, "\r\n", "\n")
+	parts := strings.Split(normalized, "\n\n")
+	if len(parts) < 2 {
+		return "", authHealthHeaders{}, fmt.Errorf("github auth health response omitted HTTP headers")
+	}
+	login := strings.TrimSpace(parts[len(parts)-1])
+	if login == "" || strings.Contains(login, "\n") {
+		return "", authHealthHeaders{}, fmt.Errorf("github auth health response omitted a single login")
+	}
+
+	values := map[string]string{}
+	for _, block := range parts[:len(parts)-1] {
+		for _, line := range strings.Split(block, "\n") {
+			name, value, ok := strings.Cut(line, ":")
+			if !ok {
+				continue
+			}
+			values[strings.ToLower(strings.TrimSpace(name))] = strings.TrimSpace(value)
+		}
+	}
+	limit, err := strconv.Atoi(values["x-ratelimit-limit"])
+	if err != nil || limit < 0 {
+		return "", authHealthHeaders{}, fmt.Errorf("github auth health response omitted a valid X-RateLimit-Limit")
+	}
+	remaining, err := strconv.Atoi(values["x-ratelimit-remaining"])
+	if err != nil || remaining < 0 {
+		return "", authHealthHeaders{}, fmt.Errorf("github auth health response omitted a valid X-RateLimit-Remaining")
+	}
+	reset, err := strconv.ParseInt(values["x-ratelimit-reset"], 10, 64)
+	if err != nil || reset < 0 {
+		return "", authHealthHeaders{}, fmt.Errorf("github auth health response omitted a valid X-RateLimit-Reset")
+	}
+	return login, authHealthHeaders{limit: limit, remaining: remaining, reset: reset}, nil
+}
+
 func (g *Gateway) GetCurrentUserLogin(ctx context.Context, cwd string) (string, error) {
 	if snapshot := discoverySnapshotFromContext(ctx); snapshot != nil {
 		return snapshot.getCurrentUserLogin(ctx, cwd)
@@ -3573,7 +3759,13 @@ func mergeIntoProcessEnv(overrides map[string]string) map[string]string {
 }
 
 func (g *Gateway) runGhWithTimeout(ctx context.Context, cwd, stdin string, timeout time.Duration, args ...string) (shell.Result, error) {
-	result, err := g.ghRun(ctx, shell.Options{Command: g.ghPath, Args: args, CWD: valueOr(strings.TrimSpace(cwd), g.cwd), Env: g.ghEnv, Stdin: stdin, Timeout: timeout})
+	g.authHealthMu.Lock()
+	credential := githubCredentialForHost(g.credentialEnv, hostnameFromGHArgs(args))
+	g.authHealthMu.Unlock()
+	if g.requireCredential && len(credential) == 0 {
+		return shell.Result{}, fmt.Errorf("%w; set agent.env.GH_TOKEN or export GH_TOKEN for looperd", ErrCredentialUnavailable)
+	}
+	result, err := g.ghRun(ctx, shell.Options{Command: g.ghPath, Args: args, CWD: valueOr(strings.TrimSpace(cwd), g.cwd), Env: mergeIntoProcessEnv(credential), Stdin: stdin, Timeout: timeout})
 	if result.StdoutTruncated || result.StderrTruncated {
 		streams := make([]string, 0, 2)
 		if result.StdoutTruncated {

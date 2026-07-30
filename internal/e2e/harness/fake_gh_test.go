@@ -52,6 +52,23 @@ func TestFakeGHPaginatedAPIDefaultsToEmptyArray(t *testing.T) {
 	}
 }
 
+func TestFakeGHSupportsAuthenticatedHealthHeaders(t *testing.T) {
+	bins := MustBinaries(t)
+	gh := NewFakeGH(t, bins, GHSchema{JSONFieldAllowlist: map[string][]string{}})
+	gh.WriteState(t, GHState{CurrentUserLogin: "operator"})
+	cmd := exec.Command(gh.Path, "api", "user", "--include", "--jq", ".login", "--hostname", "github.com")
+	cmd.Env = append(os.Environ(), flattenEnv(gh.EnvMap())...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("fake gh auth-health probe: %v\n%s", err, output)
+	}
+	for _, want := range []string{"X-Ratelimit-Limit: 5000", "X-Ratelimit-Remaining: 4999", "operator"} {
+		if !strings.Contains(string(output), want) {
+			t.Fatalf("auth-health output missing %q: %s", want, output)
+		}
+	}
+}
+
 func TestFakeGHPRViewSupportsCreatedAtAndClosedAt(t *testing.T) {
 	bins := MustBinaries(t)
 	gh := NewFakeGH(t, bins, GHSchema{JSONFieldAllowlist: map[string][]string{"pr view": {"number", "createdAt", "closedAt"}}})

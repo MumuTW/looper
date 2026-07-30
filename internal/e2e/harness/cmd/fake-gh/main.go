@@ -398,6 +398,11 @@ func normalizeRouteRepoPath(repo string) string {
 func handleAPI(mode string, st state, stdin string) error {
 	args := os.Args[1:]
 	route := firstNonFlag(args[1:])
+	if route == "user" && slices.Contains(args, "--include") {
+		login := firstNonEmpty(strings.TrimSpace(st.CurrentUserLogin), "looper")
+		_, _ = fmt.Fprintf(os.Stdout, "HTTP/2.0 200 OK\nX-Ratelimit-Limit: 5000\nX-Ratelimit-Remaining: 4999\nX-Ratelimit-Reset: 1785414807\n\n%s\n", login)
+		return nil
+	}
 	if route == "user" {
 		login := firstNonEmpty(strings.TrimSpace(st.CurrentUserLogin), "looper")
 		if hasArg(args, "--jq", ".login") {

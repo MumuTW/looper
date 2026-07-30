@@ -1,0 +1,156 @@
+package github
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/nexu-io/looper/internal/infra/shell"
+)
+
+func TestGatewayRequireCredentialFailsBeforeStartingGH(t *testing.T) {
+	for _, key := range []string{"GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"} {
+		t.Setenv(key, "")
+	}
+	calls := 0
+	gateway := New(Options{
+		GHPath:            "gh",
+		RequireCredential: true,
+		GHRun: func(context.Context, shell.Options) (shell.Result, error) {
+			calls++
+			return shell.Result{}, nil
+		},
+	})
+
+	_, err := gateway.GetCurrentUserLogin(context.Background(), t.TempDir())
+	if !errors.Is(err, ErrCredentialUnavailable) {
+		t.Fatalf("GetCurrentUserLogin() error = %v, want ErrCredentialUnavailable", err)
+	}
+	if calls != 0 {
+		t.Fatalf("gh calls = %d, want zero anonymous child processes", calls)
+	}
+}
+
+func TestGatewayRequireCredentialRejectsWrongHostTokenFamily(t *testing.T) {
+	for _, tc := range []struct{ name, token, host string }{
+		{"public token on GHES", "GH_TOKEN", "ghe.example.test"},
+		{"enterprise token on github.com", "GH_ENTERPRISE_TOKEN", "github.com"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			g := New(Options{Env: map[string]string{tc.token: "token"}, RequireCredential: true, GHRun: func(context.Context, shell.Options) (shell.Result, error) { calls++; return shell.Result{}, nil }})
+			err := func() error {
+				_, err := g.runGhWithTimeout(context.Background(), "", "", time.Second, "api", "user", "--hostname", tc.host)
+				return err
+			}()
+			if !errors.Is(err, ErrCredentialUnavailable) || calls != 0 {
+				t.Fatalf("err=%v calls=%d", err, calls)
+			}
+		})
+	}
+}
+
+func TestGatewayAuthHealthReportsActualLoginAndCoreRateFromOneCall(t *testing.T) {
+	now := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
+	calls := 0
+	gateway := New(Options{
+		GHPath:             "gh",
+		Env:                map[string]string{"GH_TOKEN": "configured-token"},
+		RequireCredential:  true,
+		AuthHealthCacheTTL: 5 * time.Minute,
+		Now:                func() time.Time { return now },
+		GHRun: func(_ context.Context, options shell.Options) (shell.Result, error) {
+			calls++
+			if got := strings.Join(options.Args, " "); got != "api user --include --jq .login --hostname github.com" {
+				t.Fatalf("gh args = %q", got)
+			}
+			return shell.Result{Stdout: "HTTP/2.0 200 OK\r\nX-Ratelimit-Limit: 5000\r\nX-Ratelimit-Remaining: 4182\r\nX-Ratelimit-Reset: 1785414807\r\n\r\nMumuTW\n"}, nil
+		},
+	})
+
+	first := gateway.AuthHealth(context.Background(), "", "github.com")
+	second := gateway.AuthHealth(context.Background(), "", "github.com")
+
+	if !first.Authenticated || first.Login != "MumuTW" {
+		t.Fatalf("AuthHealth() = %#v, want authenticated MumuTW", first)
+	}
+	if first.CoreRateLimit != 5000 || first.CoreRateRemaining != 4182 {
+		t.Fatalf("core rate = %d/%d, want 4182/5000", first.CoreRateRemaining, first.CoreRateLimit)
+	}
+	if first.CoreRateResetAt != "2026-07-30T12:33:27Z" || first.CheckedAt != "2026-07-30T12:00:00Z" {
+		t.Fatalf("health timestamps = reset %q checked %q", first.CoreRateResetAt, first.CheckedAt)
+	}
+	if second != first {
+		t.Fatalf("cached AuthHealth() = %#v, want %#v", second, first)
+	}
+	if calls != 1 {
+		t.Fatalf("gh calls = %d, want one cached probe", calls)
+	}
+}
+
+func TestGatewayAuthHealthRefreshesAfterCacheTTL(t *testing.T) {
+	now := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
+	calls := 0
+	gateway := New(Options{
+		Env:                map[string]string{"GH_TOKEN": "configured-token"},
+		RequireCredential:  true,
+		AuthHealthCacheTTL: time.Minute,
+		Now:                func() time.Time { return now },
+		GHRun: func(context.Context, shell.Options) (shell.Result, error) {
+			calls++
+			return shell.Result{Stdout: "HTTP/2.0 200 OK\nX-Ratelimit-Limit: 5000\nX-Ratelimit-Remaining: 4000\nX-Ratelimit-Reset: 1785414807\n\nMumuTW\n"}, nil
+		},
+	})
+
+	_ = gateway.AuthHealth(context.Background(), "", "github.com")
+	now = now.Add(time.Minute + time.Second)
+	_ = gateway.AuthHealth(context.Background(), "", "github.com")
+	if calls != 2 {
+		t.Fatalf("gh calls = %d, want refresh after TTL", calls)
+	}
+}
+
+func TestGatewayAuthHealthDoesNotCacheCanceledProbe(t *testing.T) {
+	calls := 0
+	gateway := New(Options{
+		Env:               map[string]string{"GH_TOKEN": "configured-token"},
+		RequireCredential: true,
+		GHRun: func(ctx context.Context, _ shell.Options) (shell.Result, error) {
+			calls++
+			if err := ctx.Err(); err != nil {
+				return shell.Result{}, err
+			}
+			return shell.Result{Stdout: "HTTP/2.0 200 OK\nX-Ratelimit-Limit: 5000\nX-Ratelimit-Remaining: 4000\nX-Ratelimit-Reset: 1785414807\n\nMumuTW\n"}, nil
+		},
+	})
+
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	first := gateway.AuthHealth(canceled, "", "github.com")
+	second := gateway.AuthHealth(context.Background(), "", "github.com")
+	if first.Error == "" {
+		t.Fatalf("canceled AuthHealth() = %#v, want explicit error", first)
+	}
+	if !second.Authenticated || calls != 2 {
+		t.Fatalf("second AuthHealth() = %#v calls=%d, want fresh successful probe", second, calls)
+	}
+}
+
+func TestGatewayCredentialUpdateClearsHealthCacheAndReplacesChildEnv(t *testing.T) {
+	calls := 0
+	g := New(Options{Env: map[string]string{"GH_TOKEN": "old"}, RequireCredential: true, GHRun: func(_ context.Context, o shell.Options) (shell.Result, error) {
+		calls++
+		if o.Env["GH_TOKEN"] != "new" && calls > 1 {
+			t.Fatalf("env=%q", o.Env["GH_TOKEN"])
+		}
+		return shell.Result{Stdout: "HTTP/2 200\nX-Ratelimit-Limit: 1\nX-Ratelimit-Remaining: 1\nX-Ratelimit-Reset: 1\n\nuser\n"}, nil
+	}})
+	_ = g.AuthHealth(context.Background(), "", "github.com")
+	g.UpdateCredentialEnv(map[string]string{"GH_TOKEN": "new"})
+	_ = g.AuthHealth(context.Background(), "", "github.com")
+	if calls != 2 {
+		t.Fatalf("calls=%d, want cache cleared", calls)
+	}
+}
