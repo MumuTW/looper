@@ -6,8 +6,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/nexu-io/looper/internal/bootstrap"
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/deployer"
 	gitinfra "github.com/nexu-io/looper/internal/infra/git"
@@ -15,6 +17,11 @@ import (
 	"github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/nexu-io/looper/internal/storage"
 )
+
+// deployCleanupTimeout bounds releasing a deploy checkout. Cleanup runs on a
+// context detached from the deploy so cancellation still frees the worktree, and
+// that detachment is exactly why it needs its own deadline.
+const deployCleanupTimeout = 2 * time.Minute
 
 // deployLogCaptureBytes bounds what is written to a deploy's log file.
 const deployLogCaptureBytes = 1 << 20
@@ -87,7 +94,12 @@ func runDeployLane(ctx context.Context, input defaultSchedulerTickInput, project
 				return "", func() {}, err
 			}
 			return checkout.Path, func() {
-				if err := input.GitGateway.RemoveDeployCheckout(context.WithoutCancel(ctx), checkout, project.RepoPath); err != nil && input.Logger != nil {
+				// Detached from the deploy's context so a cancelled deploy still
+				// releases its checkout, but bounded: an unbounded cleanup can hold
+				// shutdown open indefinitely.
+				releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), deployCleanupTimeout)
+				defer cancel()
+				if err := input.GitGateway.RemoveDeployCheckout(releaseCtx, checkout, project.RepoPath); err != nil && input.Logger != nil {
 					input.Logger.Warn("deployer: could not release the deploy checkout", map[string]any{
 						"path": checkout.Path, "error": err.Error(),
 					})
@@ -95,7 +107,7 @@ func runDeployLane(ctx context.Context, input defaultSchedulerTickInput, project
 			}, nil
 		},
 		RunCommand: func(ctx context.Context, dir string) (int, string, error) {
-			return runDeployCommand(ctx, dir, logDir, role, timeout)
+			return runDeployCommand(ctx, dir, logDir, role, timeout, input.Logger)
 		},
 	}
 	if input.Logger != nil {
@@ -140,23 +152,58 @@ func runDeployLane(ctx context.Context, input defaultSchedulerTickInput, project
 //
 // Unlike validation commands this runs with network access: a deploy that cannot
 // reach anything is not a deploy.
-func runDeployCommand(ctx context.Context, dir, logDir string, role config.DeployerRoleConfig, timeout time.Duration) (int, string, error) {
+func runDeployCommand(ctx context.Context, dir, logDir string, role config.DeployerRoleConfig, timeout time.Duration, logger bootstrap.Logger) (int, string, error) {
 	result, runErr := shell.Run(ctx, shell.Options{
 		Command:          "/bin/sh",
 		Args:             []string{"-c", role.Command},
 		CWD:              dir,
-		Env:              role.Environment,
+		Env:              deployEnvironment(role.Environment),
 		Timeout:          timeout,
 		MaxCapturedBytes: deployLogCaptureBytes,
 	})
 
+	if runErr != nil && result.ExitCode == 0 {
+		// shell.Run reports a non-zero exit through ExitCode. An error with no exit
+		// code means the process never ran, which is not a deploy that failed.
+		runErr = fmt.Errorf("%w: %v", deployer.ErrCommandNotStarted, runErr)
+	}
+
 	logPath, writeErr := writeDeployLog(logDir, result)
 	if writeErr != nil {
-		// The deploy itself is what matters; losing the log must not change its
-		// outcome, only what can be read afterwards.
+		// The deploy itself is what matters, so a lost log does not change its
+		// outcome — but silence would leave someone hunting for a file that was
+		// never written.
 		logPath = ""
+		if logger != nil {
+			logger.Warn("deployer: could not capture the deploy log", map[string]any{"logDir": logDir, "error": writeErr.Error()})
+		}
 	}
 	return result.ExitCode, logPath, runErr
+}
+
+// deployEnvironment merges the configured values over the daemon's own.
+//
+// shell.Run replaces the child environment outright when Env is non-empty, so
+// passing only the configured values would strip PATH, HOME, and everything else
+// a deploy command needs — one entry in roles.deployer.environment was enough to
+// stop /bin/sh finding the program it was asked to run.
+func deployEnvironment(overrides map[string]string) map[string]string {
+	if len(overrides) == 0 {
+		// Empty means "inherit", which is what shell.Run already does for a nil map.
+		return nil
+	}
+	merged := make(map[string]string, len(os.Environ())+len(overrides))
+	for _, entry := range os.Environ() {
+		key, value, ok := strings.Cut(entry, "=")
+		if !ok {
+			continue
+		}
+		merged[key] = value
+	}
+	for key, value := range overrides {
+		merged[key] = value
+	}
+	return merged
 }
 
 func writeDeployLog(logDir string, result shell.Result) (string, error) {
@@ -267,4 +314,40 @@ func shortSHA(sha string) string {
 		return sha
 	}
 	return sha[:7]
+}
+
+// deployInFlight tracks which projects have a deploy running, so the tick that
+// starts one does not start another before it finishes.
+var deployInFlight sync.Map
+
+// startDeployLane runs the deploy off the scheduler tick.
+//
+// A deploy executes an operator command for up to roles.deployer.timeoutSeconds
+// — fifteen minutes by default — and the tick is serial. Running it inline would
+// stall discovery for every project behind it, which is the same mistake the
+// Telegram intake lane avoids by not long-polling.
+//
+// One deploy per project at a time: a second would race the first over the same
+// checkout path and the same deployment record.
+func startDeployLane(ctx context.Context, input defaultSchedulerTickInput, project storage.ProjectRecord, repo string) {
+	if input.Config == nil {
+		return
+	}
+	role := deployerRoleForProject(*input.Config, project.ID)
+	if !role.Enabled || strings.TrimSpace(role.Command) == "" {
+		return
+	}
+	if _, running := deployInFlight.LoadOrStore(project.ID, struct{}{}); running {
+		if input.Logger != nil {
+			input.Logger.Debug("deployer: a deploy is already running for this project", map[string]any{"projectId": project.ID})
+		}
+		return
+	}
+	// Detached from the tick's context so a finished tick does not cancel a deploy
+	// mid-flight; the command's own timeout is what bounds it.
+	deployCtx := context.WithoutCancel(ctx)
+	go func() {
+		defer deployInFlight.Delete(project.ID)
+		runDeployLane(deployCtx, input, project, repo)
+	}()
 }
