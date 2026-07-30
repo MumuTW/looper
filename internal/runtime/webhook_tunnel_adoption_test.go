@@ -227,7 +227,7 @@ func TestReconcileTunnelHookTreatsDesiredURLAsManagedInsteadOfOrphaning(t *testi
 	}
 }
 
-func TestReconcileTunnelHooksHostQualifiedRepoReturnsLastErrorWithoutGitHubCall(t *testing.T) {
+func TestReconcileTunnelHooksAcceptsHostQualifiedRepo(t *testing.T) {
 	t.Parallel()
 
 	ctx, repos, cfg := setupWebhookTunnelTestRepos(t)
@@ -236,14 +236,15 @@ func TestReconcileTunnelHooksHostQualifiedRepoReturnsLastErrorWithoutGitHubCall(
 	rt.ghPath = "/usr/bin/gh"
 	rt.tunnelClient = client
 
-	rt.reconcileTunnelHooks(ctx, repos, map[string]struct{}{"github.example.com/acme/looper": {}})
+	const repo = "github/acme/looper"
+	rt.reconcileTunnelHooks(ctx, repos, map[string]struct{}{repo: {}})
 	defer rt.stopTunnelServer()
 
 	status := rt.Status()
-	if len(status.TunnelHooks) != 1 || status.TunnelHooks[0].LastError != "tunnel mode does not support host-qualified repo names" {
-		t.Fatalf("status.TunnelHooks = %#v, want host-qualified LastError", status.TunnelHooks)
+	if len(status.TunnelHooks) != 1 || status.TunnelHooks[0].LastError != "" {
+		t.Fatalf("status.TunnelHooks = %#v, want healthy host-qualified hook", status.TunnelHooks)
 	}
-	if client.getCalls != 0 || client.createCalls != 0 || client.updateCalls != 0 || client.deleteCalls != 0 {
-		t.Fatalf("client calls = %#v, want none", client)
+	if client.createCalls != 1 || client.lastCreate.repo != repo || client.lastCreate.url != "/webhook/host/github/acme/looper" {
+		t.Fatalf("CreateHook = %#v calls=%d, want qualified repo and managed URL", client.lastCreate, client.createCalls)
 	}
 }
