@@ -105,6 +105,58 @@ func TestRuntimeStartOpensSQLiteAndSyncsConfiguredProjects(t *testing.T) {
 	}
 }
 
+// TestRuntimeStartRejectsPreexistingProjectWithoutValidationStance covers the
+// upgrade path for projects persisted before validation policy enforcement.
+// The runtime catalog is the authority boundary: it must reject the legacy
+// record before startup can make a PATCH handler available for it.
+func TestRuntimeStartRejectsPreexistingProjectWithoutValidationStance(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	backupDir := filepath.Join(workingDir, "backups")
+	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
+	cfg.Storage.BackupDir = &backupDir
+	cfg.Defaults.ValidationCommands = nil
+	vendor := config.AgentVendorOpenCode
+	cfg.Agent.Vendor = &vendor
+
+	startedAt := time.Date(2026, time.April, 17, 12, 34, 56, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(startedAt)
+	seedCoordinator := openMigratedCoordinator(t, cfg.Storage.DBPath, backupDir)
+	seedRepos := storage.NewRepositories(seedCoordinator.DB())
+	baseBranch := "develop"
+	metadata := `{"repo":null,"worktreeRoot":"/tmp/worktrees","source":"api","registrationDiscovery":{"status":"succeeded","snapshotMode":"off"}}`
+	if err := seedRepos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "legacy", Name: "Legacy", RepoPath: filepath.Join(workingDir, "legacy"), BaseBranch: &baseBranch, MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := seedCoordinator.Close(); err != nil {
+		t.Fatalf("seed coordinator Close() error = %v", err)
+	}
+
+	rt := New(Options{
+		Config: cfg,
+		Logger: &testLogger{},
+		Now:    func() time.Time { return startedAt },
+		RunSchedulerTick: func(context.Context, Services) error {
+			return nil
+		},
+	})
+	err = rt.Start(context.Background())
+	if err == nil {
+		t.Fatal("Start() error = nil, want legacy project validation failure")
+	}
+	if !strings.Contains(err.Error(), "projects[0].validation") {
+		t.Fatalf("Start() error = %v, want projects[0].validation", err)
+	}
+	if services := rt.Services(); services != (Services{}) {
+		t.Fatalf("Services() = %#v, want no published services after failed startup", services)
+	}
+}
+
 func TestRuntimeStartExclusivelyOwnsDatabaseForItsLifetime(t *testing.T) {
 	workingDir := t.TempDir()
 	cfg, err := config.DefaultConfig(workingDir)
