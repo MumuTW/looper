@@ -38,11 +38,22 @@ func (r *Runner) enforceReproductionGate(ctx context.Context, input stepInput, w
 	if !applies || result.Passed {
 		return nil
 	}
-	// Every reproduction-gate failure needs a human: a tampered reproduction
-	// will not un-tamper on retry, and a still-failing reproduction means the
-	// bug is not fixed. Neither is a transient condition.
 	return &loopError{
 		message: reproduction.FailureSummary(repo, work.IssueNumber, result),
-		kind:    FailureManualIntervention,
+		kind:    reproductionGateFailureKind(result),
 	}
+}
+
+// reproductionGateFailureKind separates a verdict from an execution problem.
+//
+// A tampered reproduction will not un-tamper on retry, and a still-failing
+// reproduction means the bug is not fixed: both need a human. A command that
+// could not be executed at all is neither — it is a timeout, cancellation, or
+// containment failure, and the repository's own validation policy already
+// retries those categories rather than demanding manual intervention.
+func reproductionGateFailureKind(result reproduction.Result) QueueFailureKind {
+	if result.Reason == reproduction.ReasonCommandError {
+		return FailureRetryableTransient
+	}
+	return FailureManualIntervention
 }

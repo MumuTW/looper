@@ -88,3 +88,23 @@ func TestWorkerReproductionGateFailsOnATamperedReproduction(t *testing.T) {
 		}
 	}
 }
+
+// Timeouts, cancellations, and containment failures all arrive as the same
+// command-execution error. Reading them as "the bug still fails" converts a
+// transient condition into a demand for a human, unlike the repository's own
+// validation policy, which retries those categories.
+func TestWorkerGateRetriesExecutionErrorsAndEscalatesVerdicts(t *testing.T) {
+	t.Parallel()
+	cases := map[reproduction.Reason]QueueFailureKind{
+		reproduction.ReasonCommandError:      FailureRetryableTransient,
+		reproduction.ReasonCommandFailed:     FailureManualIntervention,
+		reproduction.ReasonTestModified:      FailureManualIntervention,
+		reproduction.ReasonTestMissing:       FailureManualIntervention,
+		reproduction.ReasonUnexpectedFailure: FailureManualIntervention,
+	}
+	for reason, want := range cases {
+		if got := reproductionGateFailureKind(reproduction.Result{Reason: reason}); got != want {
+			t.Fatalf("reproductionGateFailureKind(%s) = %q, want %q", reason, got, want)
+		}
+	}
+}
