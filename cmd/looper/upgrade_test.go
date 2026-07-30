@@ -74,6 +74,28 @@ func TestTargetBuildIdentityRejectsIncompleteJSON(t *testing.T) {
 	}
 }
 
+func TestUpgradeBackupRequestsDaemonOwnedBundle(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/v1/upgrade/backup" {
+			t.Fatalf("request = %s %s, want POST /api/v1/upgrade/backup", r.Method, r.URL.Path)
+		}
+		writeEnvelope(w, http.StatusOK, map[string]any{"directory": "/backups/upgrade-1", "manifest": map[string]any{"version": 1}})
+	}))
+	t.Cleanup(server.Close)
+	configForDaemon(t, server.URL)
+	stdout := &bytes.Buffer{}
+	if err := runUpgrade(context.Background(), nil, []string{"backup"}, stdout); err != nil {
+		t.Fatal(err)
+	}
+	var result upgradeBackupResult
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Directory != "/backups/upgrade-1" {
+		t.Fatalf("backup result = %#v", result)
+	}
+}
+
 func upgradeTestDaemon(t *testing.T, identity version.Info) *httptest.Server {
 	t.Helper()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

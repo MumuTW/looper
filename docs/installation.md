@@ -155,6 +155,7 @@ Manual: replace the binaries. Download the newer `looper-<target>.tar.gz` and `l
 - `looper version --json` and `looperd --version-json` print the complete build identity; `dirty` is `null` when a source-tree probe was unavailable rather than claiming the tree was clean
 - `looper version --check-daemon` compares the CLI identity with `GET /api/v1/version` and exits nonzero unless every build field matches; add `--json` for a machine-readable report
 - `looper upgrade preflight --target-looper <path> --target-looperd <path> --json` reads the running daemon's version/status and the candidate binaries' embedded identities without opening or mutating the production database; it also runs the candidate daemon's read-only config validation and reports identity pairing, config compatibility, schema/pending migrations, active work, and quarantine debt before a later cutover step
+- `looper upgrade backup` explicitly asks the running daemon to create a rollback bundle. It uses SQLite's online backup operation rather than copying a live WAL database file, then records the copied config, CLI, daemon, and database snapshot with SHA-256 checksums in `manifest.json`.
 - release builds are tag-driven (`vX.Y.Z` / `vX.Y.Z-rc.N`); local default builds use `0.0.0-dev`
 
 ## Uninstall

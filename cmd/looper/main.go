@@ -1347,6 +1347,7 @@ Usage:
                                Compare local and running-daemon build identity
   looper upgrade preflight --target-looper <path> --target-looperd <path>
                                Report upgrade compatibility without changing the daemon
+  looper upgrade backup       Create a daemon-owned rollback backup bundle
 
 Global flags, accepted before or after the verb:
   --config <path>              Config file to load
