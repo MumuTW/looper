@@ -334,26 +334,22 @@ func (m *webhookForwarderManager) superviseForwarder(ctx context.Context, forwar
 			resetBackoffAfterStart = true
 			continue
 		}
+		stopStartedProcess := func() {
+			_ = startResult.process.Kill()
+			if startResult.stdout != nil {
+				_ = startResult.stdout.Close()
+			}
+			if startResult.stderr != nil {
+				_ = startResult.stderr.Close()
+			}
+			_ = startResult.process.Wait()
+		}
 		select {
 		case <-ctx.Done():
-			_ = startResult.process.Kill()
-			if startResult.stdout != nil {
-				_ = startResult.stdout.Close()
-			}
-			if startResult.stderr != nil {
-				_ = startResult.stderr.Close()
-			}
-			_ = startResult.process.Wait()
+			stopStartedProcess()
 			return
 		case <-forwarder.stopCh:
-			_ = startResult.process.Kill()
-			if startResult.stdout != nil {
-				_ = startResult.stdout.Close()
-			}
-			if startResult.stderr != nil {
-				_ = startResult.stderr.Close()
-			}
-			_ = startResult.process.Wait()
+			stopStartedProcess()
 			return
 		default:
 		}
@@ -367,6 +363,18 @@ func (m *webhookForwarderManager) superviseForwarder(ctx context.Context, forwar
 		m.mu.Unlock()
 		if m.logger != nil {
 			m.logger.Info("gh webhook forwarder started", map[string]any{"repo": forwarder.repo, "endpoint": endpoint})
+		}
+		// Stop may have closed stopCh after the pre-start check but before the
+		// process was registered above. Recheck once registration makes the
+		// child visible to Stop, otherwise shutdown waits its full timeout.
+		select {
+		case <-ctx.Done():
+			stopStartedProcess()
+			return
+		case <-forwarder.stopCh:
+			stopStartedProcess()
+			return
+		default:
 		}
 		if resetBackoffAfterStart {
 			backoff = m.backoffBase
