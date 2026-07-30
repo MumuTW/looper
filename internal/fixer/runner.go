@@ -24,6 +24,7 @@ import (
 	"github.com/nexu-io/looper/internal/disclosure"
 	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/eventlog"
+	"github.com/nexu-io/looper/internal/fixer/adopt"
 	"github.com/nexu-io/looper/internal/fixer/discovery"
 	"github.com/nexu-io/looper/internal/fixer/failurepolicy"
 	"github.com/nexu-io/looper/internal/fixer/publish"
@@ -3016,7 +3017,7 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (f
 // prepared while later dirty adopt can never satisfy hasFixerWorktreeProvenance.
 func (r *Runner) finishPreparedWorktree(ctx context.Context, input stepInput, checkpoint fixerCheckpoint, branch, worktreeRoot, worktreePath, headSHA string) (fixerCheckpoint, error) {
 	preparedAt := r.nowISO()
-	ownerToken := newFixerWorktreeOwnerToken(input.Loop.ID, input.Run.ID, preparedAt)
+	ownerToken := adopt.OwnerToken(input.Loop.ID, input.Run.ID, preparedAt)
 	if err := worktreesafety.WriteFixerOwnerToken(worktreePath, ownerToken); err != nil {
 		return checkpoint, fmt.Errorf("stamp fixer ownership for %s: %w", worktreePath, err)
 	}
@@ -3046,19 +3047,16 @@ func (r *Runner) tryAdoptDirtyFixerWorktree(ctx context.Context, input stepInput
 	if !hasFixerWorktreeProvenance(checkpoint, created.WorktreePath) {
 		return false, checkpoint, nil
 	}
-	switch input.Loop.Status {
-	case string(domain.LoopStatusHumanTakeover), string(domain.LoopStatusAwaitingHuman):
-		return false, checkpoint, nil
-	}
-	if _, ok := loops.ReadTakeoverResume(input.Loop.MetadataJSON); ok {
-		return false, checkpoint, nil
-	}
+	_, hasTakeoverResume := loops.ReadTakeoverResume(input.Loop.MetadataJSON)
+	loopParked := input.Loop.Status == string(domain.LoopStatusHumanTakeover) || input.Loop.Status == string(domain.LoopStatusAwaitingHuman)
 	expectedHead := strings.TrimSpace(detailHeadSHA(checkpoint.Detail))
-	if expectedHead == "" {
-		return false, checkpoint, nil
-	}
-	// prepared.HeadSHA is remote when dirty; require it still matches expected.
-	if remoteHead := strings.TrimSpace(prepared.HeadSHA); remoteHead != "" && remoteHead != expectedHead {
+	if !adopt.EligiblePreflight(adopt.Preflight{
+		LoopParked:     loopParked,
+		TakeoverResume: hasTakeoverResume,
+		ExpectedHead:   expectedHead,
+		// prepared.HeadSHA is remote when dirty.
+		RemoteHead: prepared.HeadSHA,
+	}) {
 		return false, checkpoint, nil
 	}
 	local, err := r.git.InspectHead(ctx, InspectHeadInput{
@@ -3069,7 +3067,7 @@ func (r *Runner) tryAdoptDirtyFixerWorktree(ctx context.Context, input stepInput
 	if err != nil {
 		return false, checkpoint, err
 	}
-	if strings.TrimSpace(local.HeadSHA) != expectedHead {
+	if !adopt.ConfirmLocalHead(local.HeadSHA, expectedHead) {
 		return false, checkpoint, nil
 	}
 	preparedAt := r.nowISO()
@@ -3125,22 +3123,6 @@ func hasFixerWorktreeProvenance(checkpoint fixerCheckpoint, worktreePath string)
 		return false
 	}
 	return diskToken == token
-}
-
-func newFixerWorktreeOwnerToken(loopID, runID, preparedAt string) string {
-	loopID = strings.TrimSpace(loopID)
-	runID = strings.TrimSpace(runID)
-	preparedAt = strings.TrimSpace(preparedAt)
-	if loopID == "" {
-		loopID = "unknown-loop"
-	}
-	if runID == "" {
-		runID = "unknown-run"
-	}
-	if preparedAt == "" {
-		preparedAt = "unknown-time"
-	}
-	return "fixer:" + loopID + ":" + runID + ":" + preparedAt
 }
 
 func sameManagedWorktreePath(a, b string) bool {
