@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/storage"
 )
 
 // Contract: BeginShutdown cancels the scheduler context so in-flight ticks can
