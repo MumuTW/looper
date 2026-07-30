@@ -28,3 +28,52 @@ func TestParseCLIArgsDispatchesInterleavedFlagFamilies(t *testing.T) {
 		t.Fatalf("reviewer loop enabled override = %#v, want canonical false", loop)
 	}
 }
+
+func TestParseCLIArgsCompatibilityPrecedenceAcrossInterleavedFamilies(t *testing.T) {
+	canonical := []string{
+		"--roles-reviewer-behavior-review-events-clean=COMMENT",
+		"--roles-fixer-triggers-author-filter=current_user",
+		"--roles-reviewer-behavior-loop-enabled-by-default=false",
+		"--roles-reviewer-discovery-triggers-enable-self-review=false",
+		"--roles-reviewer-behavior-review-events-blocking=COMMENT",
+	}
+	legacy := []string{
+		"--allow-auto-approve=true",
+		"--fix-all-pull-requests=true",
+		"--reviewer-loop-enabled=true",
+		"--reviewer-enable-self-review=true",
+		"--reviewer-blocking-review-event=REQUEST_CHANGES",
+	}
+
+	for _, test := range []struct {
+		name string
+		args []string
+	}{
+		{name: "canonical before legacy", args: append(append([]string{}, canonical...), legacy...)},
+		{name: "legacy before canonical", args: append(append([]string{}, legacy...), canonical...)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			parsed, err := parseCLIArgs(test.args)
+			if err != nil {
+				t.Fatalf("parseCLIArgs() error = %v", err)
+			}
+
+			reviewer := parsed.overrides.Roles.Reviewer
+			if got := *reviewer.Behavior.ReviewEvents.Clean; got != ReviewerReviewEventComment {
+				t.Fatalf("clean review event = %q, want %q", got, ReviewerReviewEventComment)
+			}
+			if got := *reviewer.Behavior.ReviewEvents.Blocking; got != ReviewerReviewEventComment {
+				t.Fatalf("blocking review event = %q, want %q", got, ReviewerReviewEventComment)
+			}
+			if got := *reviewer.Behavior.Loop.EnabledByDefault; got {
+				t.Fatalf("reviewer loop enabled = %v, want false", got)
+			}
+			if got := *reviewer.Triggers.EnableSelfReview; got {
+				t.Fatalf("reviewer self review = %v, want false", got)
+			}
+			if got := *parsed.overrides.Roles.Fixer.Triggers.AuthorFilter; got != FixerAuthorFilterCurrentUser {
+				t.Fatalf("fixer author filter = %q, want %q", got, FixerAuthorFilterCurrentUser)
+			}
+		})
+	}
+}

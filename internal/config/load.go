@@ -553,11 +553,7 @@ func parseCLIArgs(args []string) (parsedCLIArgs, error) {
 	parsed := parsedCLIArgs{}
 	canonicalInstructionsEnabledOverrideSet := false
 	canonicalPackageAutoUpgradeOverrideSet := false
-	canonicalReviewerCleanOverrideSet := false
-	canonicalReviewerBlockingOverrideSet := false
-	canonicalReviewerLoopEnabledOverrideSet := false
-	canonicalReviewerEnableSelfReviewOverrideSet := false
-	canonicalFixerAuthorFilterOverrideSet := false
+	canonicalFlags := cliCanonicalFlagState{}
 
 	takeValue := func(index int, flag string) (string, int, error) {
 		current := args[index]
@@ -599,131 +595,22 @@ func parseCLIArgs(args []string) (parsedCLIArgs, error) {
 			continue
 		}
 
+		handled, nextIndex, err = parseCompatibilityPrecedenceCLIArg(
+			args,
+			index,
+			&parsed,
+			&canonicalFlags,
+			takeValue,
+		)
+		if err != nil {
+			return parsedCLIArgs{}, err
+		}
+		if handled {
+			index = nextIndex
+			continue
+		}
+
 		switch {
-		case matchesAnyFlag(arg, "--roles-reviewer-behavior-review-events-clean", "--reviewer-clean-review-event"):
-			value, nextIndex, err := takeValue(index, "--roles-reviewer-behavior-review-events-clean")
-			if err != nil {
-				return parsedCLIArgs{}, err
-			}
-			event := ReviewerReviewEvent(strings.ToUpper(strings.TrimSpace(value)))
-			if matchesFlag(arg, "--roles-reviewer-behavior-review-events-clean") {
-				ensureReviewerReviewEventsConfig(&parsed.overrides).Clean = &event
-				canonicalReviewerCleanOverrideSet = true
-			} else if !canonicalReviewerCleanOverrideSet {
-				ensureReviewerReviewEventsConfig(&parsed.overrides).Clean = &event
-			}
-			index = nextIndex
-		case matchesFlag(arg, "--allow-auto-approve"):
-			value, nextIndex, err := takeValue(index, "--allow-auto-approve")
-			if err != nil {
-				return parsedCLIArgs{}, err
-			}
-			parsedValue, err := parseBoolean(value)
-			if err != nil {
-				return parsedCLIArgs{}, fmt.Errorf("invalid value for --allow-auto-approve: %q is not a boolean", value)
-			}
-			ensureDefaultsConfig(&parsed.overrides).AllowAutoApprove = parsedValue
-			if !canonicalReviewerCleanOverrideSet {
-				event := ReviewerReviewEventComment
-				if *parsedValue {
-					event = ReviewerReviewEventApprove
-				}
-				ensureReviewerReviewEventsConfig(&parsed.overrides).Clean = &event
-			}
-			index = nextIndex
-		case matchesFlag(arg, "--roles-fixer-triggers-author-filter"):
-			value, nextIndex, err := takeValue(index, "--roles-fixer-triggers-author-filter")
-			if err != nil {
-				return parsedCLIArgs{}, err
-			}
-			parsedValue, err := parseFixerAuthorFilter(value)
-			if err != nil {
-				return parsedCLIArgs{}, fmt.Errorf("invalid value for --roles-fixer-triggers-author-filter: must be one of: %s, %s", FixerAuthorFilterCurrentUser, FixerAuthorFilterAny)
-			}
-			ensureFixerRoleTriggersConfig(&parsed.overrides).AuthorFilter = parsedValue
-			canonicalFixerAuthorFilterOverrideSet = true
-			index = nextIndex
-		case matchesFlag(arg, "--fix-all-pull-requests"):
-			value, nextIndex, err := takeValue(index, "--fix-all-pull-requests")
-			if err != nil {
-				return parsedCLIArgs{}, err
-			}
-			parsedValue, err := parseBoolean(value)
-			if err != nil {
-				return parsedCLIArgs{}, fmt.Errorf("invalid value for --fix-all-pull-requests: %q is not a boolean", value)
-			}
-			ensureDefaultsConfig(&parsed.overrides).FixAllPullRequests = parsedValue
-			if !canonicalFixerAuthorFilterOverrideSet {
-				authorFilter := FixerAuthorFilterCurrentUser
-				if *parsedValue {
-					authorFilter = FixerAuthorFilterAny
-				}
-				ensureFixerRoleTriggersConfig(&parsed.overrides).AuthorFilter = &authorFilter
-			}
-			index = nextIndex
-		case matchesFlag(arg, "--roles-reviewer-behavior-loop-enabled-by-default"):
-			value, nextIndex, err := takeValue(index, "--roles-reviewer-behavior-loop-enabled-by-default")
-			if err != nil {
-				return parsedCLIArgs{}, err
-			}
-			parsedValue, err := parseBoolean(value)
-			if err != nil {
-				return parsedCLIArgs{}, fmt.Errorf("invalid value for --roles-reviewer-behavior-loop-enabled-by-default: %q is not a boolean", value)
-			}
-			ensureReviewerLoopConfig(&parsed.overrides).EnabledByDefault = parsedValue
-			canonicalReviewerLoopEnabledOverrideSet = true
-			index = nextIndex
-		case matchesFlag(arg, "--reviewer-loop-enabled"):
-			value, nextIndex, err := takeValue(index, "--reviewer-loop-enabled")
-			if err != nil {
-				return parsedCLIArgs{}, err
-			}
-			parsedValue, err := parseBoolean(value)
-			if err != nil {
-				return parsedCLIArgs{}, fmt.Errorf("invalid value for --reviewer-loop-enabled: %q is not a boolean", value)
-			}
-			if !canonicalReviewerLoopEnabledOverrideSet {
-				ensureReviewerLoopConfig(&parsed.overrides).EnabledByDefault = parsedValue
-			}
-			index = nextIndex
-		case matchesFlag(arg, "--roles-reviewer-discovery-triggers-enable-self-review"):
-			value, nextIndex, err := takeValue(index, "--roles-reviewer-discovery-triggers-enable-self-review")
-			if err != nil {
-				return parsedCLIArgs{}, err
-			}
-			parsedValue, err := parseBoolean(value)
-			if err != nil {
-				return parsedCLIArgs{}, fmt.Errorf("invalid value for --roles-reviewer-discovery-triggers-enable-self-review: %q is not a boolean", value)
-			}
-			ensureReviewerRoleTriggersConfig(&parsed.overrides).EnableSelfReview = parsedValue
-			canonicalReviewerEnableSelfReviewOverrideSet = true
-			index = nextIndex
-		case matchesFlag(arg, "--reviewer-enable-self-review"):
-			value, nextIndex, err := takeValue(index, "--reviewer-enable-self-review")
-			if err != nil {
-				return parsedCLIArgs{}, err
-			}
-			parsedValue, err := parseBoolean(value)
-			if err != nil {
-				return parsedCLIArgs{}, fmt.Errorf("invalid value for --reviewer-enable-self-review: %q is not a boolean", value)
-			}
-			if !canonicalReviewerEnableSelfReviewOverrideSet {
-				ensureReviewerRoleTriggersConfig(&parsed.overrides).EnableSelfReview = parsedValue
-			}
-			index = nextIndex
-		case matchesAnyFlag(arg, "--roles-reviewer-behavior-review-events-blocking", "--reviewer-blocking-review-event"):
-			value, nextIndex, err := takeValue(index, "--roles-reviewer-behavior-review-events-blocking")
-			if err != nil {
-				return parsedCLIArgs{}, err
-			}
-			event := ReviewerReviewEvent(strings.ToUpper(strings.TrimSpace(value)))
-			if matchesFlag(arg, "--roles-reviewer-behavior-review-events-blocking") {
-				ensureReviewerReviewEventsConfig(&parsed.overrides).Blocking = &event
-				canonicalReviewerBlockingOverrideSet = true
-			} else if !canonicalReviewerBlockingOverrideSet {
-				ensureReviewerReviewEventsConfig(&parsed.overrides).Blocking = &event
-			}
-			index = nextIndex
 		case matchesAnyFlag(arg, "--roles-reviewer-behavior-loop-quiet-period-seconds", "--reviewer-quiet-period-seconds"):
 			value, nextIndex, err := takeValue(index, "--roles-reviewer-behavior-loop-quiet-period-seconds")
 			if err != nil {
@@ -783,11 +670,161 @@ func parseCLIArgs(args []string) (parsedCLIArgs, error) {
 	return parsed, nil
 }
 
+type cliCanonicalFlagState struct {
+	reviewerCleanSeen            bool
+	reviewerBlockingSeen         bool
+	reviewerLoopEnabledSeen      bool
+	reviewerEnableSelfReviewSeen bool
+	fixerAuthorFilterSeen        bool
+}
+
+// parseCompatibilityPrecedenceCLIArg owns canonical-over-legacy precedence
+// for reviewer and fixer flags. The state is operation-local and records only
+// whether the canonical authority for each compatibility pair has appeared.
+func parseCompatibilityPrecedenceCLIArg(
+	args []string,
+	index int,
+	parsed *parsedCLIArgs,
+	canonical *cliCanonicalFlagState,
+	takeValue cliValueTaker,
+) (bool, int, error) {
+	arg := args[index]
+
+	switch {
+	case matchesAnyFlag(arg, "--roles-reviewer-behavior-review-events-clean", "--reviewer-clean-review-event"):
+		value, nextIndex, err := takeValue(index, "--roles-reviewer-behavior-review-events-clean")
+		if err != nil {
+			return true, index, err
+		}
+		event := ReviewerReviewEvent(strings.ToUpper(strings.TrimSpace(value)))
+		if matchesFlag(arg, "--roles-reviewer-behavior-review-events-clean") {
+			ensureReviewerReviewEventsConfig(&parsed.overrides).Clean = &event
+			canonical.reviewerCleanSeen = true
+		} else if !canonical.reviewerCleanSeen {
+			ensureReviewerReviewEventsConfig(&parsed.overrides).Clean = &event
+		}
+		return true, nextIndex, nil
+	case matchesFlag(arg, "--allow-auto-approve"):
+		value, nextIndex, err := takeValue(index, "--allow-auto-approve")
+		if err != nil {
+			return true, index, err
+		}
+		parsedValue, err := parseBoolean(value)
+		if err != nil {
+			return true, index, fmt.Errorf("invalid value for --allow-auto-approve: %q is not a boolean", value)
+		}
+		ensureDefaultsConfig(&parsed.overrides).AllowAutoApprove = parsedValue
+		if !canonical.reviewerCleanSeen {
+			event := ReviewerReviewEventComment
+			if *parsedValue {
+				event = ReviewerReviewEventApprove
+			}
+			ensureReviewerReviewEventsConfig(&parsed.overrides).Clean = &event
+		}
+		return true, nextIndex, nil
+	case matchesFlag(arg, "--roles-fixer-triggers-author-filter"):
+		value, nextIndex, err := takeValue(index, "--roles-fixer-triggers-author-filter")
+		if err != nil {
+			return true, index, err
+		}
+		parsedValue, err := parseFixerAuthorFilter(value)
+		if err != nil {
+			return true, index, fmt.Errorf("invalid value for --roles-fixer-triggers-author-filter: must be one of: %s, %s", FixerAuthorFilterCurrentUser, FixerAuthorFilterAny)
+		}
+		ensureFixerRoleTriggersConfig(&parsed.overrides).AuthorFilter = parsedValue
+		canonical.fixerAuthorFilterSeen = true
+		return true, nextIndex, nil
+	case matchesFlag(arg, "--fix-all-pull-requests"):
+		value, nextIndex, err := takeValue(index, "--fix-all-pull-requests")
+		if err != nil {
+			return true, index, err
+		}
+		parsedValue, err := parseBoolean(value)
+		if err != nil {
+			return true, index, fmt.Errorf("invalid value for --fix-all-pull-requests: %q is not a boolean", value)
+		}
+		ensureDefaultsConfig(&parsed.overrides).FixAllPullRequests = parsedValue
+		if !canonical.fixerAuthorFilterSeen {
+			authorFilter := FixerAuthorFilterCurrentUser
+			if *parsedValue {
+				authorFilter = FixerAuthorFilterAny
+			}
+			ensureFixerRoleTriggersConfig(&parsed.overrides).AuthorFilter = &authorFilter
+		}
+		return true, nextIndex, nil
+	case matchesFlag(arg, "--roles-reviewer-behavior-loop-enabled-by-default"):
+		value, nextIndex, err := takeValue(index, "--roles-reviewer-behavior-loop-enabled-by-default")
+		if err != nil {
+			return true, index, err
+		}
+		parsedValue, err := parseBoolean(value)
+		if err != nil {
+			return true, index, fmt.Errorf("invalid value for --roles-reviewer-behavior-loop-enabled-by-default: %q is not a boolean", value)
+		}
+		ensureReviewerLoopConfig(&parsed.overrides).EnabledByDefault = parsedValue
+		canonical.reviewerLoopEnabledSeen = true
+		return true, nextIndex, nil
+	case matchesFlag(arg, "--reviewer-loop-enabled"):
+		value, nextIndex, err := takeValue(index, "--reviewer-loop-enabled")
+		if err != nil {
+			return true, index, err
+		}
+		parsedValue, err := parseBoolean(value)
+		if err != nil {
+			return true, index, fmt.Errorf("invalid value for --reviewer-loop-enabled: %q is not a boolean", value)
+		}
+		if !canonical.reviewerLoopEnabledSeen {
+			ensureReviewerLoopConfig(&parsed.overrides).EnabledByDefault = parsedValue
+		}
+		return true, nextIndex, nil
+	case matchesFlag(arg, "--roles-reviewer-discovery-triggers-enable-self-review"):
+		value, nextIndex, err := takeValue(index, "--roles-reviewer-discovery-triggers-enable-self-review")
+		if err != nil {
+			return true, index, err
+		}
+		parsedValue, err := parseBoolean(value)
+		if err != nil {
+			return true, index, fmt.Errorf("invalid value for --roles-reviewer-discovery-triggers-enable-self-review: %q is not a boolean", value)
+		}
+		ensureReviewerRoleTriggersConfig(&parsed.overrides).EnableSelfReview = parsedValue
+		canonical.reviewerEnableSelfReviewSeen = true
+		return true, nextIndex, nil
+	case matchesFlag(arg, "--reviewer-enable-self-review"):
+		value, nextIndex, err := takeValue(index, "--reviewer-enable-self-review")
+		if err != nil {
+			return true, index, err
+		}
+		parsedValue, err := parseBoolean(value)
+		if err != nil {
+			return true, index, fmt.Errorf("invalid value for --reviewer-enable-self-review: %q is not a boolean", value)
+		}
+		if !canonical.reviewerEnableSelfReviewSeen {
+			ensureReviewerRoleTriggersConfig(&parsed.overrides).EnableSelfReview = parsedValue
+		}
+		return true, nextIndex, nil
+	case matchesAnyFlag(arg, "--roles-reviewer-behavior-review-events-blocking", "--reviewer-blocking-review-event"):
+		value, nextIndex, err := takeValue(index, "--roles-reviewer-behavior-review-events-blocking")
+		if err != nil {
+			return true, index, err
+		}
+		event := ReviewerReviewEvent(strings.ToUpper(strings.TrimSpace(value)))
+		if matchesFlag(arg, "--roles-reviewer-behavior-review-events-blocking") {
+			ensureReviewerReviewEventsConfig(&parsed.overrides).Blocking = &event
+			canonical.reviewerBlockingSeen = true
+		} else if !canonical.reviewerBlockingSeen {
+			ensureReviewerReviewEventsConfig(&parsed.overrides).Blocking = &event
+		}
+		return true, nextIndex, nil
+	default:
+		return false, index, nil
+	}
+}
+
 type cliValueTaker func(index int, flag string) (string, int, error)
 
 // parseOperationalCLIArg owns daemon/runtime flags whose values map directly
-// into one configuration section. Compatibility-heavy reviewer and fixer
-// flags remain in parseCLIArgs, where their cross-flag precedence is visible.
+// into one configuration section. Compatibility precedence is handled by
+// parseCompatibilityPrecedenceCLIArg.
 func parseOperationalCLIArg(
 	args []string,
 	index int,
