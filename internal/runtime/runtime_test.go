@@ -2692,7 +2692,7 @@ func TestRuntimeReconcileStaleRunningRunsWithMultipleActiveExecutions(t *testing
 			default:
 				return "", nil
 			}
-		}, RunSchedulerTick: func(context.Context, Services) error { return nil }})
+		}})
 		if err := rt.Start(context.Background()); err != nil {
 			t.Fatalf("Start() error = %v", err)
 		}
