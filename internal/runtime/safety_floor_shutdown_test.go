@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/nexu-io/looper/internal/config"
-	"github.com/nexu-io/looper/internal/storage"
 )
 
 // Contract: BeginShutdown cancels the scheduler context so in-flight ticks can
@@ -32,6 +31,14 @@ func TestSafetyFloorBeginShutdownCancelsSchedulerContext(t *testing.T) {
 		Config:        cfg,
 		Logger:        &testLogger{},
 		DeferRecovery: true,
+		RunSchedulerTick: func(ctx context.Context, _ Services) error {
+			select {
+			case ctxSeen <- ctx:
+			default:
+			}
+			<-block
+			return ctx.Err()
+		},
 	})
 	if err := rt.Start(context.Background()); err != nil {
 		t.Fatalf("Start() error = %v", err)
@@ -40,18 +47,6 @@ func TestSafetyFloorBeginShutdownCancelsSchedulerContext(t *testing.T) {
 		close(block)
 		rt.Stop("test cleanup")
 	})
-
-	rt.mu.Lock()
-	rt.runSchedulerTick = func(ctx context.Context, _ Services) error {
-		select {
-		case ctxSeen <- ctx:
-		default:
-		}
-		<-block
-		return ctx.Err()
-	}
-	rt.services = Services{Repositories: &storage.Repositories{}}
-	rt.mu.Unlock()
 
 	rt.startSchedulerLoop()
 	var tickCtx context.Context
@@ -97,6 +92,14 @@ func TestSafetyFloorMarkDegradedCancelsSchedulerContext(t *testing.T) {
 		Config:        cfg,
 		Logger:        &testLogger{},
 		DeferRecovery: true,
+		RunSchedulerTick: func(ctx context.Context, _ Services) error {
+			select {
+			case ctxSeen <- ctx:
+			default:
+			}
+			<-block
+			return ctx.Err()
+		},
 	})
 	if err := rt.Start(context.Background()); err != nil {
 		t.Fatalf("Start() error = %v", err)
@@ -107,19 +110,7 @@ func TestSafetyFloorMarkDegradedCancelsSchedulerContext(t *testing.T) {
 	})
 
 	// DeferRecovery leaves admission starting and does not arm the scheduler;
-	// install a blocking tick then start the loop so we can observe cancel.
-	rt.mu.Lock()
-	rt.runSchedulerTick = func(ctx context.Context, _ Services) error {
-		select {
-		case ctxSeen <- ctx:
-		default:
-		}
-		<-block
-		return ctx.Err()
-	}
-	rt.services = Services{Repositories: &storage.Repositories{}}
-	rt.mu.Unlock()
-
+	// the tick injected at construction observes cancel once the loop starts.
 	rt.startSchedulerLoop()
 	var tickCtx context.Context
 	select {
@@ -302,19 +293,15 @@ func TestSafetyFloorCompleteStartupWakesSchedulerAfterMarkReady(t *testing.T) {
 		Config:        cfg,
 		Logger:        &testLogger{},
 		DeferRecovery: true,
+		RunSchedulerTick: func(context.Context, Services) error {
+			tickCount.Add(1)
+			return nil
+		},
 	})
 	if err := rt.Start(context.Background()); err != nil {
 		t.Fatalf("Start() error = %v", err)
 	}
 	t.Cleanup(func() { rt.Stop("test cleanup") })
-
-	rt.mu.Lock()
-	rt.runSchedulerTick = func(context.Context, Services) error {
-		tickCount.Add(1)
-		return nil
-	}
-	rt.defaultSchedulerClaim = func(context.Context, Services) error { return nil }
-	rt.mu.Unlock()
 
 	if err := rt.CompleteStartup(context.Background()); err != nil {
 		t.Fatalf("CompleteStartup() error = %v", err)

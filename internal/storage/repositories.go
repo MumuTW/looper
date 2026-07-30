@@ -58,6 +58,7 @@ type sqliteQuerier interface {
 }
 
 type Repositories struct {
+	q                    sqliteQuerier
 	Projects             *ProjectsRepository
 	Loops                *LoopsRepository
 	Runs                 *RunsRepository
@@ -75,6 +76,7 @@ type Repositories struct {
 
 func NewRepositories(q sqliteQuerier) *Repositories {
 	return &Repositories{
+		q:                    q,
 		Projects:             &ProjectsRepository{q: q},
 		Loops:                &LoopsRepository{q: q},
 		Runs:                 &RunsRepository{q: q},
@@ -89,6 +91,52 @@ func NewRepositories(q sqliteQuerier) *Repositories {
 		WebhookTunnelHooks:   &WebhookTunnelHooksRepository{q: q},
 		FeishuThreads:        &FeishuThreadsRepository{q: q},
 	}
+}
+
+// RetireQueuedLoop pauses a queued loop and cancels its selected queued item
+// in one transaction. It returns false when either record stopped being queued
+// before the transaction established its status guard.
+func (r *Repositories) RetireQueuedLoop(ctx context.Context, loopID, queueID, updatedAt string, reason *string) (bool, error) {
+	db, ok := r.q.(txBeginner)
+	if !ok {
+		return false, fmt.Errorf("queue retirement requires transactional storage")
+	}
+	return WithTransactionValue(ctx, db, nil, func(tx *sql.Tx) (bool, error) {
+		repos := NewRepositories(tx)
+		loop, err := repos.Loops.GetByID(ctx, loopID)
+		if err != nil {
+			return false, err
+		}
+		item, err := repos.Queue.GetByID(ctx, queueID)
+		if err != nil {
+			return false, err
+		}
+		if loop == nil || item == nil || item.LoopID == nil || loop.Status != "queued" || item.Status != "queued" || *item.LoopID != loopID {
+			return false, nil
+		}
+		loop.Status = "paused"
+		loop.NextRunAt = nil
+		loop.UpdatedAt = updatedAt
+		if err := repos.Loops.Upsert(ctx, *loop); err != nil {
+			return false, err
+		}
+		result, err := tx.ExecContext(ctx, `
+			UPDATE queue_items
+			SET status = 'cancelled', finished_at = ?, last_error = COALESCE(?, last_error), updated_at = ?
+			WHERE id = ? AND loop_id = ? AND status = 'queued'
+		`, updatedAt, reason, updatedAt, queueID, loopID)
+		if err != nil {
+			return false, fmt.Errorf("retire queued queue item: %w", err)
+		}
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return false, fmt.Errorf("read retired queue item rows affected: %w", err)
+		}
+		if affected != 1 {
+			return false, fmt.Errorf("retire queued queue item %s: status changed during retirement", queueID)
+		}
+		return true, nil
+	})
 }
 
 // ProjectRecord is the Project: a durable local registration binding one

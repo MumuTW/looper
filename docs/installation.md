@@ -85,7 +85,24 @@ Every field and validation rule lives in [configuration.md](configuration.md). `
 looperd
 ```
 
-Keep it running — every `looper` control verb talks to it. Nothing restarts it after a crash, logout, or reboot; if you want supervision, wrap it in `launchd`, `systemd`, `tmux`, or whatever your machine already uses. `looperd --config <path>` selects a non-default config.
+Keep it running — every `looper` control verb talks to it. In the foreground nothing restarts it after a crash or a reboot. `looperd --config <path>` selects a non-default config.
+
+To have the machine supervise it instead, set `daemon.mode` (`launchd` on macOS, `systemd` on Linux) and pin `tools.gitPath` and `tools.ghPath` in your config, then:
+
+```bash
+looperd service install
+```
+
+`looperd service print` shows the exact unit first without writing anything. `status` reports whether it is installed, and `uninstall` removes it — both address the canonical location and read no configuration, so they work even when the config does not load.
+
+Installing refuses rather than guessing:
+
+- **`daemon.environment` is refused.** The unit carries no environment, so anything the daemon needs belongs in the configuration file.
+- **`daemon.plistPath` is refused.** The unit always goes to the canonical per-user location, so activation, status, and uninstall address the same thing.
+- **Auto-detected tool paths are refused.** A supervisor starts the daemon with a minimal `PATH`, so a `git` or `gh` found through your shell would be searched for again and may resolve differently.
+- **An existing unit is refused.** Replacing one is `uninstall` then `install`, so no active service is silently left on an old definition.
+
+**A per-user service is not the same as always-on.** On macOS a LaunchAgent runs only while the user is logged in, so an unattended machine also needs automatic login. On Linux a systemd user unit behaves the same unless you run `loginctl enable-linger $USER`; automatic login is not required there.
 
 ### 5. Register projects
 

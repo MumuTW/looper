@@ -45,6 +45,13 @@ func runWithDeps(args []string, stdout, stderr io.Writer, deps runDeps) int {
 		return 0
 	}
 
+	// "service" must be the first argument. Accepting it after global flags means
+	// deciding how two flag blocks combine, and the previous attempt reversed their
+	// order — a config flag before the subcommand silently lost to one after it.
+	if len(args) > 0 && args[0] == "service" {
+		return runServiceCommand(context.Background(), args[1:], stdout, stderr, defaultServiceDeps())
+	}
+
 	if hasHelpArg(args) || (len(args) > 0 && args[0] == "help") {
 		writeUsage(stdout)
 		return 0
@@ -160,8 +167,9 @@ func startRuntimeWithAPI(ctx context.Context, deps bootstrap.RuntimeDependencies
 		TriggerSchedulerTick: func() {
 			rt.TriggerSchedulerTick()
 		},
-		DaemonBinaryStatus: rt.DaemonBinaryStatus,
-		LookupPullRequest:  looperdapi.NewGatewayPullRequestLookup(deps.Config, time.Now),
+		DaemonBinaryStatus:   rt.DaemonBinaryStatus,
+		LookupPullRequest:    looperdapi.NewGatewayPullRequestLookup(deps.Config, time.Now),
+		LookupIssueOccupancy: looperdapi.NewGatewayIssueOccupancyLookup(deps.Config, time.Now),
 	})
 	root := looperdapi.NewRootHandler(apiHandler, dashboard.Handler())
 	server := looperdapi.NewServer(deps.Config, root, deps.Logger)
@@ -1266,6 +1274,7 @@ func writeUsage(w io.Writer) {
 
 Usage:
 	looperd [flags]
+	looperd service <install|print|uninstall|status>
 	looperd help
 
 Daemon and HTTP API server for Looper.

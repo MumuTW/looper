@@ -257,6 +257,8 @@ type IssueReaction struct {
 type LinkedPullRequest struct {
 	Number         int64
 	State          string
+	Repo           string
+	URL            string
 	Merged         bool
 	MergedAt       string
 	MergeCommitSHA string
@@ -1787,7 +1789,8 @@ func (g *Gateway) ListLinkedPullRequests(ctx context.Context, input LinkedPullRe
 		}
 		for _, node := range nodes {
 			mergeCommit, _ := node["mergeCommit"].(map[string]any)
-			out = append(out, LinkedPullRequest{Number: asInt64(node["number"]), State: asString(node["state"]), Merged: asString(node["state"]) == "MERGED" || asString(node["mergedAt"]) != "", MergedAt: asString(node["mergedAt"]), MergeCommitSHA: asString(mergeCommit["oid"])})
+			repository, _ := node["repository"].(map[string]any)
+			out = append(out, LinkedPullRequest{Number: asInt64(node["number"]), State: asString(node["state"]), Repo: asString(repository["nameWithOwner"]), URL: asString(node["url"]), Merged: asString(node["state"]) == "MERGED" || asString(node["mergedAt"]) != "", MergedAt: asString(node["mergedAt"]), MergeCommitSHA: asString(mergeCommit["oid"])})
 		}
 		if !hasNextPage || nextCursor == "" {
 			break
@@ -3352,6 +3355,8 @@ func (g *Gateway) fetchLinkedPullRequestsPage(ctx context.Context, cwd, hostname
 		"        nodes {",
 		"          number",
 		"          state",
+		"          url",
+		"          repository { nameWithOwner }",
 		"          mergedAt",
 		"          mergeCommit { oid }",
 		"        }",
