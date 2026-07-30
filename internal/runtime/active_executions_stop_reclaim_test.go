@@ -43,7 +43,7 @@ func TestStaleReleaseCannotClearRestoredGateAcrossReclaim(t *testing.T) {
 	registry := NewActiveExecutionRegistry()
 	const loopID = "loop_restore_guarded"
 
-	// Temporary stop window captures epoch zero.
+	// Temporary stop window captures the initial generation's gate.
 	release, err := registry.BeginLoopStop(loopID, "temporary window")
 	if err != nil {
 		t.Fatalf("BeginLoopStop() error = %v", err)
@@ -58,7 +58,7 @@ func TestStaleReleaseCannotClearRestoredGateAcrossReclaim(t *testing.T) {
 	}
 
 	// The outdated temporary release must not reopen the restored gate, and
-	// its epoch entry must not have been reclaimed while it was outstanding.
+	// its generation entry must not have been reclaimed while it was outstanding.
 	release()
 	if !registry.LoopStopActive(loopID) {
 		t.Fatal("LoopStopActive() = false after stale release, want restored gate still closed")

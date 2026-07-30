@@ -769,10 +769,12 @@ func (r *ActiveExecutionRegistry) incLoopStopLocked(loopID string) *loopStopGate
 // failed start/retry/reuse TX would skip RestoreLoopStop.
 //
 // Outstanding BeginLoopStop release closures captured before this clear are
-// invalidated via the stop gate epoch: deleting the refcount alone is not enough;
-// a temporary release (stopCandidateExecution) can still run after a failed
-// reactivation's RestoreLoopStop and would otherwise drop the restored sticky
-// gate when it sees count <= 1.
+// invalidated via generation retirement: deleting the entry drops the live gate
+// pointer they captured, so a later release sees a different (or missing) entry
+// and owns nothing. Deleting the refcount alone is not enough; a temporary
+// release (stopCandidateExecution) can still run after a failed reactivation's
+// RestoreLoopStop and would otherwise drop the restored sticky gate when it
+// sees count <= 1.
 func (r *ActiveExecutionRegistry) ClearLoopStop(loopID string) (wasActive bool) {
 	if r == nil || loopID == "" {
 		return false
