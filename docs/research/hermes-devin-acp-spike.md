@@ -5,6 +5,29 @@ Goal: use Hermes Agent as the harness (sessions, memory, tool loop) with
 Devin CLI's free `glm-5-2` as the model backend, without OmniRoute or a
 custom OpenAI-compat shim.
 
+## Safety precondition: this configuration reads and writes your workspace
+
+**Run every command in this document from a disposable worktree or scratch
+directory.** Denying `session/request_permission` is NOT a containment
+boundary, and nothing here demonstrates a sandbox or network boundary:
+
+- Hermes's shim answers `fs/write_text_file` by writing directly inside the
+  session cwd, with no `session/request_permission` round-trip. It enforces
+  only "inside cwd" plus Hermes's own write-deny list
+  ([v2026.7.20 copilot_acp_client.py#L732-L746](https://github.com/NousResearch/hermes-agent/blob/v2026.7.20/agent/copilot_acp_client.py#L732-L746);
+  the permission denial is [#L137-L147](https://github.com/NousResearch/hermes-agent/blob/v2026.7.20/agent/copilot_acp_client.py#L137-L147)).
+- The shim's own prompt instructs the ACP backend to "use ACP capabilities
+  to complete tasks", so the backend is actively encouraged to act.
+- In the default agent type, Devin additionally runs its own native tools
+  inside its own loop (see the tool-loop finding below) — those are not
+  mediated by Hermes at all.
+- `devin acp` is a plain subprocess JSON-RPC server; Devin documents
+  sandboxing only when `--sandbox` is explicitly enabled
+  ([devin acp](https://docs.devin.ai/cli/reference/commands#devin-acp),
+  [sandbox](https://docs.devin.ai/cli/sandbox)). No recipe here enables it.
+
+The evidence below was captured in throwaway `mktemp -d` directories.
+
 ## Verified surface
 
 - Hermes: `v0.19.0 (2026.7.20)`, install dir `~/.hermes/hermes-agent`
@@ -12,9 +35,11 @@ custom OpenAI-compat shim.
 - Bridge: Hermes's `copilot-acp` provider (`agent/copilot_acp_client.py`).
   Despite the name, the shim speaks generic ACP protocol v1
   (`initialize` → `session/new` → `session/prompt`), collects
-  `agent_message_chunk`/`agent_thought_chunk` updates, and denies
-  `session/request_permission`. The only Copilot-specific parts are the
-  default command and a gh-copilot deprecation check — neither blocks Devin.
+  `agent_message_chunk`/`agent_thought_chunk` updates, denies
+  `session/request_permission`, and services `fs/read_text_file` /
+  `fs/write_text_file` itself (see the safety note above). The only
+  Copilot-specific parts are the default command and a gh-copilot
+  deprecation check — neither blocks Devin.
 - Override hooks (no Hermes patch needed):
   - `HERMES_COPILOT_ACP_COMMAND=devin`
   - `HERMES_COPILOT_ACP_ARGS="acp --model glm-5-2"`
@@ -23,8 +48,22 @@ custom OpenAI-compat shim.
 
 ## Test evidence
 
-1. **Raw handshake replay** (script mirroring the Hermes shim's exact
-   JSON-RPC sequence): `initialize` returned protocol v1 with
+Versioned artifacts live in `testdata/hermes-devin-acp/`:
+
+- `replay_acp.py` — the probe itself, mirroring the Hermes shim's JSON-RPC
+  sequence. Requires `--cwd`; point it at a disposable directory.
+- `replay-default-agent.txt` — captured output for claim 1 below.
+- `replay-toolcall-probe.txt` + the two `prompt-toolcall-*.txt` inputs —
+  captured output for the tool-loop finding.
+
+Session ids and message uuids in the captures are replaced with
+`<REDACTED-*>`; no credentials, tokens, account identity, or repository
+content appear in them, and each capture was reread before check-in to
+confirm that. Everything else is verbatim. Re-run the script to reproduce
+(token counts and cache hit rates will differ run to run).
+
+1. **Raw handshake replay** (`replay-default-agent.txt`):
+   `initialize` returned protocol v1 with
    `cognition.ai/*` meta capabilities; `session/new` returned a session with
    modes (`accept-edits` default); `session/prompt` returned the exact
    requested constant with `stopReason: end_turn` and real token usage
@@ -35,12 +74,18 @@ custom OpenAI-compat shim.
 2. **Hermes one-shot end-to-end**:
    `hermes --provider copilot-acp -m copilot-acp -z "<constant prompt>"`
    with the two env overrides returned the exact requested constant.
+   Not separately captured — trivially re-runnable from the recipe below.
 3. **Hermes tool loop**: a `--yolo` one-shot asking Hermes to create and
-   read back a file completed correctly (file written with exact content,
-   read back, verified). The loop took several rounds: `glm-5-2` behind
-   Devin intermittently produced tool-call JSON that Hermes's `write` tool
-   path reported as "Parse error" before the model recovered via alternate
-   tools. Functional, with visible friction.
+   read back a file, run in a throwaway directory, completed correctly
+   (file written with exact content, read back, verified externally). The
+   loop took several rounds: `glm-5-2` behind Devin intermittently produced
+   tool-call JSON that Hermes's `write` tool path reported as "Parse error"
+   before the model recovered via alternate tools. Functional, with visible
+   friction. This is Devin's own tool loop doing the work, not Hermes's —
+   see the memory section for why that distinction matters. Transcript not
+   captured (it contains scratch paths); the tool-loop *ownership* claim is
+   backed by `replay-toolcall-probe.txt` instead, which isolates the
+   mechanism directly.
 
 ## Memory verification (2026-07-31)
 
@@ -63,8 +108,9 @@ works; tool-driven writes do not.**
   and `summarizer` agent types and both `glm-5-2` and `swe-1-7`. Nothing was
   ever written to `memories/MEMORY.md`.
 
-Root cause, isolated with a raw ACP probe: **Devin's ACP server owns the tool
-loop.** Hermes's shim can only describe tools in prompt text and parse
+Root cause, isolated with a raw ACP probe
+(`testdata/hermes-devin-acp/replay-toolcall-probe.txt`): **Devin's ACP server
+owns the tool loop.** Hermes's shim can only describe tools in prompt text and parse
 `<tool_call>` blocks back out of the *message* channel, but Devin's model
 resolves tool intent natively inside its own agent. With the default agent
 type it calls Devin's own tools (which is why file edits land); with
@@ -102,10 +148,17 @@ it just wrote. Verify externally.
 - `glm-5-2` free tier is an observation at capture time, not a durable
   promise (see `devin-cli-3000.3.22.md`); rerun
   `devin models list --format json` before relying on it.
-- Upstream Hermes closed the "generalize ACP harnesses" request as not
-  planned (NousResearch/hermes-agent#16282), so the env-var override is the
-  supported-in-practice path; a named `devin-acp` provider would require
-  carrying a Hermes patch.
+- **This is not a supported integration.** Hermes's official provider docs
+  define `HERMES_COPILOT_ACP_COMMAND`/`_ARGS` only as overrides pointing at
+  the *Copilot CLI* binary and its arguments
+  ([v2026.7.20 providers.md](https://github.com/NousResearch/hermes-agent/blob/v2026.7.20/website/docs/integrations/providers.md#L195-L211)),
+  and upstream closed the request to generalize ACP harnesses as **not
+  planned** ([#16282](https://github.com/NousResearch/hermes-agent/issues/16282)),
+  explicitly declining to support non-Copilot ACP backends. Treat what this
+  document describes as an observed, version-pinned (Hermes v2026.7.20 /
+  devin 3000.3.22), unpatched compatibility workaround with no contract
+  behind it: any Hermes or Devin release may break it without notice. A
+  named `devin-acp` provider would require carrying a Hermes patch.
 
 ## Go/no-go
 
@@ -146,8 +199,20 @@ looper profile's memory stays separate from the default profile's.
 
 ## Reproduce (without the profile script)
 
+Precondition: run this from a disposable worktree or scratch directory. The
+session can read and write that directory (see the safety section), and
+neither Hermes nor `devin acp` is configured here with a sandbox or network
+boundary.
+
 ```bash
+cd "$(mktemp -d)"
 export HERMES_COPILOT_ACP_COMMAND=devin
 export HERMES_COPILOT_ACP_ARGS="acp --model glm-5-2"
 hermes --provider copilot-acp -m copilot-acp
+```
+
+To re-derive the protocol claims without running Hermes at all:
+
+```bash
+docs/research/testdata/hermes-devin-acp/replay_acp.py --cwd "$(mktemp -d)"
 ```
