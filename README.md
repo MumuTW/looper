@@ -237,6 +237,10 @@ go test ./...
 Provider e2e checks:
 
 ```bash
+go test ./internal/e2e/githubcontract -count=1
+```
+
+```bash
 go test ./internal/e2e -run 'Smoke|FailsFast|GitHubSandboxRepoEnv' -count=1
 ```
 
