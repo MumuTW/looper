@@ -1276,3 +1276,51 @@ func TestRunForwardsWholeArgvToTheProxy(t *testing.T) {
 		t.Fatalf("proxy cwd = %q, want /work/repo", got.Cwd)
 	}
 }
+
+func TestTrustedManualReviewerRunPrefersHighestSeqOnTiedTimestamps(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	coordinator, err := storage.OpenSQLiteCoordinator(context.Background(), filepath.Join(root, "looper.sqlite"), storage.SQLiteCoordinatorOptions{Migrations: storage.EmbeddedMigrations, BackupDir: filepath.Join(root, "backups")})
+	if err != nil {
+		t.Fatalf("OpenSQLiteCoordinator() error = %v", err)
+	}
+	t.Cleanup(func() { _ = coordinator.Close() })
+	if _, err := coordinator.MigrationRunner().RunPending(context.Background()); err != nil {
+		t.Fatalf("MigrationRunner.RunPending() error = %v", err)
+	}
+	repos := storage.NewRepositories(coordinator.DB())
+	now := "2026-04-11T12:00:00.000Z"
+	repo := "acme/looper"
+	prNumber := int64(42)
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_tied", Name: "Project", RepoPath: "/tmp/project", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	manualMetadata := `{"manual":true}`
+	autoMetadata := `{"manual":false}`
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_tied_auto", Seq: 1, ProjectID: "project_tied", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", MetadataJSON: &autoMetadata, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Loops.Upsert(loop_tied_auto) error = %v", err)
+	}
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_tied_manual", Seq: 2, ProjectID: "project_tied", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", MetadataJSON: &manualMetadata, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Loops.Upsert(loop_tied_manual) error = %v", err)
+	}
+
+	// Both attempts share one millisecond and the IDs invert lexical order:
+	// the stale first insert has the larger ID, so an ID-ordering regression
+	// would select it as current instead of the higher-seq manual run.
+	if err := repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "z_stale_auto", LoopID: "loop_tied_auto", Status: "running", StartedAt: now, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Runs.Upsert(z_stale_auto) error = %v", err)
+	}
+	if err := repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "a_current_manual", LoopID: "loop_tied_manual", Status: "running", StartedAt: now, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Runs.Upsert(a_current_manual) error = %v", err)
+	}
+
+	trusted, err := trustedManualReviewerRun(context.Background(), repos, repo, prNumber, "a_current_manual")
+	if err != nil || !trusted {
+		t.Fatalf("trustedManualReviewerRun(higher-seq manual) = %v, %v; want true, nil", trusted, err)
+	}
+	trusted, err = trustedManualReviewerRun(context.Background(), repos, repo, prNumber, "z_stale_auto")
+	if err != nil || trusted {
+		t.Fatalf("trustedManualReviewerRun(stale tied) = %v, %v; want false, nil", trusted, err)
+	}
+}
