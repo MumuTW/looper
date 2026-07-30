@@ -1118,6 +1118,12 @@ var worktreeArtifactExcludePatterns = []string{
 
 const worktreeExcludeManagedHeader = "# looper: build-artifact excludes (managed; safe to remove)"
 
+// worktreeExcludeInheritedHeader marks the section of the looper-exclude file
+// that snapshots the user's pre-existing system/global/local core.excludesfile
+// content, so that pointing core.excludesfile at the looper-exclude file does
+// not shadow the user's effective ignore policy.
+const worktreeExcludeInheritedHeader = "# looper: inherited excludes (preserved from system/global/local core.excludesfile)"
+
 // applyWorktreeArtifactExcludes writes looper's build-artifact ignore patterns
 // to a worktree-local file and points the worktree's core.excludesfile at it.
 //
@@ -1139,13 +1145,23 @@ const worktreeExcludeManagedHeader = "# looper: build-artifact excludes (managed
 // (patterns already present are skipped) and best-effort: any failure is
 // swallowed so it never blocks a loop worktree.
 //
+// Inherited excludes are preserved: core.excludesfile is single-valued, so
+// pointing it at the looper-exclude file at worktree scope would shadow any
+// pre-existing system/global/local core.excludesfile. Files the user explicitly
+// ignored (editor artifacts, secrets) would then become untracked and get
+// staged by `git add -A`. To avoid that, the contents of the inherited
+// system/global/local excludes files are snapshotted into the looper-exclude
+// file (under worktreeExcludeInheritedHeader) so the effective ignore policy
+// is preserved within the worktree.
+//
 // Persisted-state trade-off (AGENTS.md "New concepts require an explicit
 // trade-off"):
 //
 //   - New state: a looper-exclude file plus a core.excludesfile pointer in each
 //     worktree's per-worktree config, and a one-time extensions.worktreeConfig
 //     flag in the shared .git/config that enables the per-worktree config
-//     mechanism.
+//     mechanism. The looper-exclude file may also carry a snapshotted copy of
+//     the user's inherited excludes (see above).
 //   - Lifecycle/cleanup: both the looper-exclude file and config.worktree live
 //     inside the worktree's private git dir, so `git worktree remove` deletes
 //     them atomically with the worktree. The only stale-state failure mode is a
@@ -1153,8 +1169,18 @@ const worktreeExcludeManagedHeader = "# looper: build-artifact excludes (managed
 //     remove`): the private git dir is then orphaned, but no live worktree
 //     references it, so the dangling pointer is inert (git ignores a missing
 //     excludesfile). `git worktree prune` reclaims the orphaned dir.
-//   - Failure mode: if extensions.worktreeConfig cannot be enabled (very old git
-//     or a read-only common dir), setWorktreeExcludesFile falls back to --local
+//   - Inherited-excludes snapshot staleness: the inherited content is copied
+//     once when the looper-exclude file is first built, so later changes to the
+//     user's system/global/local excludes file are not auto-propagated to an
+//     existing worktree. This is the unavoidable cost of git's single-valued
+//     core.excludesfile (git ignore files have no include directive); re-running
+//     on a fresh worktree picks up the latest inherited excludes. Rejected
+//     alternative: re-copying on every call — rejected because it would need to
+//     diff and reconcile mutating external content on each invocation, adding a
+//     state-sync layer for a snapshot that only matters at worktree-setup time.
+//   - Failure mode: if the --worktree write itself fails (very old git without
+//     --worktree support, or extensions.worktreeConfig cannot be enabled because
+//     the common dir is read-only), setWorktreeExcludesFile falls back to --local
 //     so the worktree still honors the excludes; the fallback is best-effort and
 //     the shared-config leak is the lesser evil versus no excludes at all.
 //   - Rejected simpler alternatives:
@@ -1200,13 +1226,31 @@ func (g *Gateway) applyWorktreeArtifactExcludes(ctx context.Context, worktreePat
 		}
 	}
 
-	if len(missing) > 0 {
+	// Preserve the user's pre-existing exclude policy. core.excludesfile is
+	// single-valued, so pointing it at the looper-exclude file at worktree
+	// scope would shadow any system/global/local core.excludesfile and cause
+	// files the user explicitly ignored to become untracked. Snapshot the
+	// inherited excludes content into the looper-exclude file once (marked with
+	// worktreeExcludeInheritedHeader); see the function doc for the staleness
+	// trade-off.
+	inherited := g.readInheritedExcludesContent(ctx, worktreePath)
+	needInherited := inherited != "" && !strings.Contains(existingText, worktreeExcludeInheritedHeader)
+
+	if len(missing) > 0 || needInherited {
 		var builder strings.Builder
 		builder.WriteString(existingText)
 		if existingText != "" && !strings.HasSuffix(existingText, "\n") {
 			builder.WriteByte('\n')
 		}
-		if !strings.Contains(existingText, worktreeExcludeManagedHeader) {
+		if needInherited {
+			builder.WriteString(worktreeExcludeInheritedHeader)
+			builder.WriteByte('\n')
+			builder.WriteString(inherited)
+			if !strings.HasSuffix(inherited, "\n") {
+				builder.WriteByte('\n')
+			}
+		}
+		if !strings.Contains(builder.String(), worktreeExcludeManagedHeader) {
 			builder.WriteString(worktreeExcludeManagedHeader)
 			builder.WriteByte('\n')
 		}
@@ -1234,10 +1278,12 @@ func (g *Gateway) applyWorktreeArtifactExcludes(ctx context.Context, worktreePat
 // a single worktree.
 //
 // --worktree requires the extensions.worktreeConfig flag, which is enabled
-// idempotently first (a one-time, additive shared-config change). If that
-// cannot be enabled (very old git or read-only common dir), fall back to --local
-// so the worktree still honors the excludes — the shared-config leak is the
-// lesser evil versus no excludes. Best-effort.
+// idempotently first (a one-time, additive shared-config change). The real
+// capability check is the --worktree write itself: if it fails (very old git
+// without --worktree support, or extensions.worktreeConfig could not be
+// enabled because the common dir is read-only), fall back to --local so the
+// worktree still honors the excludes — the shared-config leak is the lesser
+// evil versus no excludes. Best-effort.
 func (g *Gateway) setWorktreeExcludesFile(ctx context.Context, worktreePath, excludePath string) {
 	absPath, err := filepath.Abs(excludePath)
 	if err != nil {
@@ -1245,14 +1291,78 @@ func (g *Gateway) setWorktreeExcludesFile(ctx context.Context, worktreePath, exc
 	}
 	// Enable per-worktree config support (idempotent; one-time shared-config
 	// flag). Without this, `git config --worktree` fails on linked worktrees.
-	if g.runGit(ctx, worktreePath, nil, "config", "extensions.worktreeConfig", "true") != nil {
-		// Fallback: very old git or read-only common dir. Use --local so the
-		// worktree at least honors the excludes, accepting the shared-config
-		// leak as the lesser evil.
-		g.runGit(ctx, worktreePath, nil, "config", "--local", "core.excludesfile", absPath)
+	// This write is best-effort and NOT a capability check: `git config` accepts
+	// unknown well-formed keys, so succeeding here does not prove the git
+	// version supports --worktree. The real capability check is whether the
+	// --worktree write below succeeds.
+	g.runGit(ctx, worktreePath, nil, "config", "extensions.worktreeConfig", "true")
+	// Attempt the per-worktree write. Its success is the real capability check:
+	// if --worktree is unsupported (very old git) or extensions.worktreeConfig
+	// could not be enabled (read-only common dir), this fails and we fall back
+	// to --local so the worktree still honors the excludes, accepting the
+	// shared-config leak as the lesser evil versus no excludes at all.
+	if g.runGit(ctx, worktreePath, nil, "config", "--worktree", "core.excludesfile", absPath) == nil {
 		return
 	}
-	g.runGit(ctx, worktreePath, nil, "config", "--worktree", "core.excludesfile", absPath)
+	g.runGit(ctx, worktreePath, nil, "config", "--local", "core.excludesfile", absPath)
+}
+
+// readInheritedExcludesContent returns the concatenated contents of the
+// system, global, and shared-local core.excludesfile values that would apply
+// to the worktree without looper's per-worktree override. Setting
+// core.excludesfile at worktree scope shadows these single-valued settings, so
+// their patterns are snapshotted into the looper-exclude file to preserve the
+// user's effective ignore policy. The --worktree level is intentionally
+// excluded (that is looper's own pointer). Best-effort: unreadable or missing
+// files are skipped.
+func (g *Gateway) readInheritedExcludesContent(ctx context.Context, worktreePath string) string {
+	var b strings.Builder
+	for _, scope := range []string{"--system", "--global", "--local"} {
+		res, err := g.runGitResult(ctx, worktreePath, nil, "config", scope, "--get", "core.excludesfile")
+		if err != nil {
+			continue
+		}
+		raw := strings.TrimSpace(res.Stdout)
+		if raw == "" {
+			continue
+		}
+		path := expandExcludesfilePath(raw, worktreePath)
+		data, err := os.ReadFile(path)
+		if err != nil || len(data) == 0 {
+			continue
+		}
+		b.Write(data)
+		if data[len(data)-1] != '\n' {
+			b.WriteByte('\n')
+		}
+	}
+	return b.String()
+}
+
+// expandExcludesfilePath expands a leading ~ and resolves relative paths
+// against the worktree root, matching how git interprets core.excludesfile.
+func expandExcludesfilePath(raw, worktreePath string) string {
+	switch {
+	case raw == "~":
+		if home, err := os.UserHomeDir(); err == nil {
+			return home
+		}
+		return raw
+	case strings.HasPrefix(raw, "~/"):
+		if home, err := os.UserHomeDir(); err == nil {
+			return filepath.Join(home, raw[2:])
+		}
+		return raw
+	case strings.HasPrefix(raw, "~"+string(filepath.Separator)):
+		if home, err := os.UserHomeDir(); err == nil {
+			return filepath.Join(home, raw[2:])
+		}
+		return raw
+	case !filepath.IsAbs(raw):
+		return filepath.Join(worktreePath, raw)
+	default:
+		return raw
+	}
 }
 
 // worktreeExcludeContainsPattern reports whether pattern already appears as its

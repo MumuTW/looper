@@ -1647,3 +1647,90 @@ func TestApplyWorktreeArtifactExcludesDoesNotPolluteSharedExclude(t *testing.T) 
 
 	_ = before
 }
+
+// TestApplyWorktreeArtifactExcludesPreservesInheritedExcludes verifies that
+// pointing core.excludesfile at the looper-exclude file at worktree scope does
+// not shadow a pre-existing global core.excludesfile. A file matched only by
+// the user's global exclude must remain ignored in the worktree after looper
+// applies its artifact excludes — otherwise `git add -A` could stage editor
+// artifacts or secrets the user explicitly excluded.
+//
+// This test is intentionally non-parallel: it scopes the global and system
+// git config to temp files via GIT_CONFIG_GLOBAL/GIT_CONFIG_SYSTEM so the real
+// machine config is never mutated, and env vars are process-global.
+func TestApplyWorktreeArtifactExcludesPreservesInheritedExcludes(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	fixture.createMainOnlyRepo(t)
+	gateway := fixture.gateway()
+
+	// Scope global/system config to temp files so the test is hermetic and
+	// never mutates the developer's real global git config.
+	globalConfigPath := filepath.Join(fixture.rootDir, "global-config")
+	writeFile(t, globalConfigPath, "")
+	t.Setenv("GIT_CONFIG_GLOBAL", globalConfigPath)
+	t.Setenv("GIT_CONFIG_SYSTEM", os.DevNull)
+
+	// Preconfigure a global core.excludesfile matching *.secret.
+	globalExcludePath := filepath.Join(fixture.rootDir, "global-exclude")
+	writeFile(t, globalExcludePath, "*.secret\n")
+	runGit(t, fixture.repoPath, "config", "--global", "core.excludesfile", globalExcludePath)
+
+	// Create a real linked worktree.
+	linkedPath := filepath.Join(fixture.rootDir, "linked-worktree")
+	runGit(t, fixture.repoPath, "worktree", "add", "-b", "feature/inherit-test", linkedPath)
+
+	// A file matched only by the global exclude.
+	secretPath := filepath.Join(linkedPath, "passwords.secret")
+	writeFile(t, secretPath, "shh\n")
+
+	// Before looper applies its excludes, the global exclude is in effect and
+	// the secret must be ignored.
+	if status := runGit(t, linkedPath, "status", "--porcelain"); strings.Contains(status, "passwords.secret") {
+		t.Fatalf("pre-apply: passwords.secret should be ignored by global exclude; status = %q", status)
+	}
+
+	gateway.applyWorktreeArtifactExcludes(ctx, linkedPath)
+
+	// After looper points core.excludesfile at the worktree-local file, the
+	// inherited *.secret pattern must still be honored — the looper-exclude
+	// file must preserve it rather than shadow it.
+	if status := runGit(t, linkedPath, "status", "--porcelain"); strings.Contains(status, "passwords.secret") {
+		t.Fatalf("post-apply: passwords.secret must remain ignored (inherited exclude preserved); status = %q", status)
+	}
+
+	// The looper-exclude file must carry the inherited pattern and the
+	// per-worktree core.excludesfile pointer must point at it.
+	gitDir := stringsTrimSpace(runGit(t, linkedPath, "rev-parse", "--git-dir"))
+	localExclude := filepath.Join(gitDir, "looper-exclude")
+	if !filepath.IsAbs(localExclude) {
+		localExclude = filepath.Join(linkedPath, localExclude)
+	}
+	contents := readFile(t, localExclude)
+	if !strings.Contains(contents, "*.secret") {
+		t.Fatalf("looper-exclude missing inherited pattern *.secret: %q", contents)
+	}
+	if !strings.Contains(contents, worktreeExcludeInheritedHeader) {
+		t.Fatalf("looper-exclude missing inherited header: %q", contents)
+	}
+
+	coreExcludes := stringsTrimSpace(runGit(t, linkedPath, "config", "--worktree", "core.excludesfile"))
+	absExpected, _ := filepath.Abs(localExclude)
+	if !strings.Contains(coreExcludes, absExpected) {
+		t.Fatalf("worktree --worktree core.excludesfile = %q, want containing %q", coreExcludes, absExpected)
+	}
+
+	// Idempotent: re-applying must not duplicate the inherited section or drop
+	// the pattern.
+	gateway.applyWorktreeArtifactExcludes(ctx, linkedPath)
+	contents2 := readFile(t, localExclude)
+	if strings.Count(contents2, worktreeExcludeInheritedHeader) != 1 {
+		t.Fatalf("looper-exclude duplicated inherited header on re-apply: %q", contents2)
+	}
+	if !strings.Contains(contents2, "*.secret") {
+		t.Fatalf("looper-exclude lost inherited pattern after re-apply: %q", contents2)
+	}
+	if status := runGit(t, linkedPath, "status", "--porcelain"); strings.Contains(status, "passwords.secret") {
+		t.Fatalf("post-reapply: passwords.secret must remain ignored; status = %q", status)
+	}
+}
