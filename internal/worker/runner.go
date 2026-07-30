@@ -34,16 +34,17 @@ import (
 	"github.com/nexu-io/looper/internal/processcontainment"
 	"github.com/nexu-io/looper/internal/storage"
 	"github.com/nexu-io/looper/internal/validation"
+	"github.com/nexu-io/looper/internal/worker/workflow"
 	"github.com/nexu-io/looper/internal/worktreesafety"
 )
 
 const (
-	stepPrepareWork     WorkerStep = "prepare-work"
-	stepPrepareWorktree WorkerStep = "prepare-worktree"
-	stepPlan            WorkerStep = "plan"
-	stepExecute         WorkerStep = "execute"
-	stepValidate        WorkerStep = "validate"
-	stepOpenPR          WorkerStep = "open-pr"
+	stepPrepareWork     = workflow.StepPrepareWork
+	stepPrepareWorktree = workflow.StepPrepareWorktree
+	stepPlan            = workflow.StepPlan
+	stepExecute         = workflow.StepExecute
+	stepValidate        = workflow.StepValidate
+	stepOpenPR          = workflow.StepOpenPR
 
 	FailureRetryableTransient   QueueFailureKind = "retryable_transient"
 	FailureRetryableAfterResume QueueFailureKind = "retryable_after_resume"
@@ -72,16 +73,9 @@ var (
 	ErrSuccessfulClaimFinalization = errors.New("worker successful claim finalization failed")
 )
 
-var workerStepSequence = []WorkerStep{
-	stepPrepareWork,
-	stepPrepareWorktree,
-	stepPlan,
-	stepExecute,
-	stepValidate,
-	stepOpenPR,
-}
-
-type WorkerStep string
+// WorkerStep aliases the extracted workflow authority's step type; the
+// pipeline order and resume decisions live in internal/worker/workflow.
+type WorkerStep = workflow.Step
 
 type QueueFailureKind string
 
@@ -1167,7 +1161,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
 	}
 
-	for _, step := range stepsFrom(resumedRun.StartStep) {
+	for _, step := range workflow.From(resumedRun.StartStep) {
 		run, err = r.persistStepStarted(ctx, run, step, checkpoint)
 		if err != nil {
 			return ProcessResult{}, err
@@ -2500,14 +2494,23 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 		if err != nil {
 			return resumedRunContext{}, err
 		}
-		lastCompletedStep = asWorkerStep(derefString(latestRun.LastCompletedStep))
+		lastCompletedStep = workflow.Parse(derefString(latestRun.LastCompletedStep))
 		if derefString(latestRun.LastCompletedStep) != "" && lastCompletedStep == "" {
 			return resumedRunContext{}, fmt.Errorf("unknown worker last completed step %q", derefString(latestRun.LastCompletedStep))
 		}
-		failedStep = asWorkerStep(derefString(latestRun.CurrentStep))
+		failedStep = workflow.Parse(derefString(latestRun.CurrentStep))
 		restartFromDiscover = loops.ShouldRestartFromDiscover(latestRun.Status, checkpoint.ResumePolicy)
 	}
-	startStep := stepPrepareWork
+	status := ""
+	replayExecute := false
+	if latestRun != nil {
+		status = latestRun.Status
+		replayExecute = shouldReplayExecuteOnResume(latestRun.Status, failedStep, checkpoint)
+	}
+	decision := workflow.DecideResume(status, lastCompletedStep, loops.IsManualHoldResumePolicy(checkpoint.ResumePolicy), restartFromDiscover, replayExecute)
+	startStep := decision.StartStep
+	resumed := decision.Resumed
+	stickySnapshot := decision.StickyAgentSnapshot
 	resumedCheckpoint := checkpoint
 	// A successful worker normally has no follow-up turn. A survivor in the
 	// human inbox is the exception: keep its work/session context but clear the
@@ -2516,20 +2519,12 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 		resumedCheckpoint.Execution = nil
 		resumedCheckpoint.Validation = nil
 	}
-	if latestRun != nil && (latestRun.Status == "failed" || latestRun.Status == "interrupted") && !loops.IsManualHoldResumePolicy(checkpoint.ResumePolicy) && lastCompletedStep != "" {
-		if restartFromDiscover {
-			startStep = stepPrepareWork
-			resumedCheckpoint = workerCheckpoint{ResumePolicy: loops.ResumePolicyReplayStep}
-		} else if shouldReplayExecuteOnResume(latestRun.Status, failedStep, checkpoint) {
-			startStep = stepExecute
-			resumedCheckpoint = rewindCheckpointForExecuteRetry(checkpoint)
-		} else if next := nextWorkerStep(lastCompletedStep); next != "" {
-			startStep = next
-		}
+	switch decision.Mode {
+	case workflow.ResumeModeRestart:
+		resumedCheckpoint = workerCheckpoint{ResumePolicy: loops.ResumePolicyReplayStep}
+	case workflow.ResumeModeReplayExecute:
+		resumedCheckpoint = rewindCheckpointForExecuteRetry(checkpoint)
 	}
-	resumed := latestRun != nil && (latestRun.Status == "failed" || latestRun.Status == "interrupted") && startStep != stepPrepareWork
-	// stickySnapshot: any continuation of a failed/interrupted predecessor, including first-step retries.
-	stickySnapshot := latestRun != nil && (latestRun.Status == "failed" || latestRun.Status == "interrupted")
 	nowISO := r.nowISO()
 	encoded := mustMarshalJSON(workerCheckpoint{ResumePolicy: ternary(resumed, "advance_from_checkpoint", "replay_step"), Work: resumedCheckpoint.Work, ClaimedLockKey: resumedCheckpoint.ClaimedLockKey, Worktree: resumedCheckpoint.Worktree, Plan: resumedCheckpoint.Plan, Execution: resumedCheckpoint.Execution, Lifecycle: resumedCheckpoint.Lifecycle, Validation: resumedCheckpoint.Validation, PullRequest: resumedCheckpoint.PullRequest, SkipReason: resumedCheckpoint.SkipReason})
 	run := storage.RunRecord{ID: eventlog.NewEventID("run"), LoopID: loop.ID, Status: "running", CurrentStep: stringPtr(string(startStep)), LastCompletedStep: nil, CheckpointJSON: &encoded, StartedAt: nowISO, LastHeartbeatAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
@@ -2541,18 +2536,9 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 		return resumedRunContext{}, fmt.Errorf("agent snapshot required for vendor %q but was not produced", r.agentRuntime)
 	}
 	run.AgentSnapshotJSON = snapshotJSON
-	if resumed {
-		if restartFromDiscover {
-			run.LastCompletedStep = nil
-		} else if shouldReplayExecuteOnResume(latestRun.Status, failedStep, checkpoint) {
-			if prev := previousWorkerStep(startStep); prev != "" {
-				value := string(prev)
-				run.LastCompletedStep = &value
-			}
-		} else if lastCompletedStep != "" {
-			value := string(lastCompletedStep)
-			run.LastCompletedStep = &value
-		}
+	if decision.LastCompletedStep != "" {
+		value := string(decision.LastCompletedStep)
+		run.LastCompletedStep = &value
 	}
 	if err := r.repos.Runs.Upsert(ctx, run); err != nil {
 		return resumedRunContext{}, err
@@ -2581,7 +2567,7 @@ func (r *Runner) persistStepStarted(ctx context.Context, run storage.RunRecord, 
 func (r *Runner) persistStepCompleted(ctx context.Context, run storage.RunRecord, step WorkerStep, checkpoint workerCheckpoint) (storage.RunRecord, error) {
 	updated := run
 	nowISO := r.nowISO()
-	if next := nextWorkerStep(step); next != "" {
+	if next := workflow.Next(step); next != "" {
 		updated.CurrentStep = stringPtr(string(next))
 	} else {
 		updated.CurrentStep = nil
@@ -3380,35 +3366,6 @@ func workerFailureKind(kind failureclass.Kind) QueueFailureKind {
 
 func (r *Runner) nowISO() string { return eventlog.FormatJavaScriptISOString(r.now()) }
 
-func stepsFrom(start WorkerStep) []WorkerStep {
-	startIndex := 0
-	for i, step := range workerStepSequence {
-		if step == start {
-			startIndex = i
-			break
-		}
-	}
-	return workerStepSequence[startIndex:]
-}
-
-func nextWorkerStep(step WorkerStep) WorkerStep {
-	for i, candidate := range workerStepSequence {
-		if candidate == step && i+1 < len(workerStepSequence) {
-			return workerStepSequence[i+1]
-		}
-	}
-	return ""
-}
-
-func previousWorkerStep(step WorkerStep) WorkerStep {
-	for i, candidate := range workerStepSequence {
-		if candidate == step && i > 0 {
-			return workerStepSequence[i-1]
-		}
-	}
-	return ""
-}
-
 func validateWorkerResumeCheckpoint(startStep WorkerStep, checkpoint workerCheckpoint) error {
 	switch startStep {
 	case stepValidate, stepOpenPR:
@@ -3416,15 +3373,6 @@ func validateWorkerResumeCheckpoint(startStep WorkerStep, checkpoint workerCheck
 	default:
 		return nil
 	}
-}
-
-func asWorkerStep(value string) WorkerStep {
-	for _, candidate := range workerStepSequence {
-		if string(candidate) == value {
-			return candidate
-		}
-	}
-	return ""
 }
 
 func parseCheckpoint(value *string) (workerCheckpoint, error) {
