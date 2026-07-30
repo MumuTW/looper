@@ -22,6 +22,7 @@ import (
 	"github.com/nexu-io/looper/internal/networkpolicy"
 	"github.com/nexu-io/looper/internal/reviewer/automerge"
 	"github.com/nexu-io/looper/internal/reviewer/criteria"
+	"github.com/nexu-io/looper/internal/reviewer/publish"
 	"github.com/nexu-io/looper/internal/storage"
 	"github.com/nexu-io/looper/internal/worktreesafety"
 )
@@ -4559,7 +4560,7 @@ func TestProcessClaimedItemAutoMergeApprovesAndEnablesAutoMergeWhenCriteriaPass(
 	if github.enableAutoMergeCalls[0].HeadSHA != "abc123" {
 		t.Fatalf("enableAutoMergeCalls[0].HeadSHA = %q, want abc123", github.enableAutoMergeCalls[0].HeadSHA)
 	}
-	if !strings.Contains(github.submitReviewCalls[0].Body, criteriaVerificationHeading) || !strings.Contains(github.submitReviewCalls[0].Body, "app.go:1-2") {
+	if !strings.Contains(github.submitReviewCalls[0].Body, publish.CriteriaVerificationHeading) || !strings.Contains(github.submitReviewCalls[0].Body, "app.go:1-2") {
 		t.Fatalf("review body = %q, want acceptance criteria evidence", github.submitReviewCalls[0].Body)
 	}
 	if len(github.removeIssueLabelCalls) != 0 {
@@ -4605,7 +4606,7 @@ func TestProcessClaimedItemAutoMergeApprovesAndCommentsWhenAutoMergeRefused(t *t
 	if len(github.enableAutoMergeCalls) != 0 {
 		t.Fatalf("enableAutoMergeCalls = %#v, want none", github.enableAutoMergeCalls)
 	}
-	if len(github.issueCommentCalls) != 1 || !strings.Contains(github.issueCommentCalls[0].Body, autoMergeRefusedCommentMarker) {
+	if len(github.issueCommentCalls) != 1 || !strings.Contains(github.issueCommentCalls[0].Body, publish.AutoMergeRefusedMarker) {
 		t.Fatalf("issueCommentCalls = %#v, want stamped refusal comment", github.issueCommentCalls)
 	}
 }
@@ -4649,7 +4650,7 @@ func TestProcessClaimedItemAutoMergeApprovesWithoutRemoteProbeWhenOutOfScope(t *
 	if len(github.enableAutoMergeCalls) != 0 {
 		t.Fatalf("enableAutoMergeCalls = %#v, want none", github.enableAutoMergeCalls)
 	}
-	if len(github.issueCommentCalls) != 1 || !strings.Contains(github.issueCommentCalls[0].Body, autoMergeRefusedCommentMarker) {
+	if len(github.issueCommentCalls) != 1 || !strings.Contains(github.issueCommentCalls[0].Body, publish.AutoMergeRefusedMarker) {
 		t.Fatalf("issueCommentCalls = %#v, want stamped refusal comment", github.issueCommentCalls)
 	}
 	if !strings.Contains(github.issueCommentCalls[0].Body, string(automerge.RefusalReasonScope)) {
@@ -4688,7 +4689,7 @@ func TestProcessClaimedItemAutoMergeCommentsAndRetriagesWhenCriteriaFail(t *test
 	if len(github.submitReviewCalls) != 1 || github.submitReviewCalls[0].Event != string(ReviewEventComment) {
 		t.Fatalf("submitReviewCalls = %#v, want one COMMENT review", github.submitReviewCalls)
 	}
-	if !strings.Contains(github.submitReviewCalls[0].Body, criteriaFailCommentMarker) {
+	if !strings.Contains(github.submitReviewCalls[0].Body, publish.CriteriaFailMarker) {
 		t.Fatalf("review body = %q, want criteria fail marker", github.submitReviewCalls[0].Body)
 	}
 	if len(github.removeIssueLabelCalls) != 1 {
