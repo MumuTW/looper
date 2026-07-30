@@ -82,6 +82,14 @@ func DefaultConfig(tb testing.TB, home TempHome, options ConfigOptions) config.C
 	}
 	if options.Projects != nil {
 		cfg.Projects = append([]config.ProjectRefConfig{}, options.Projects...)
+		for index := range cfg.Projects {
+			if cfg.Projects[index].Validation == nil {
+				// Existing E2E scenarios exercise unrelated daemon contracts and
+				// intentionally skip repository validation. Keep that choice explicit
+				// in every generated production config.
+				cfg.Projects[index].Validation = &config.ProjectValidationConfig{OptOut: true}
+			}
+		}
 	}
 	return cfg
 }

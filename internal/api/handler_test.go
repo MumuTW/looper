@@ -1469,7 +1469,7 @@ func TestHandlerConfigProjectsComeFromRuntimeCatalog(t *testing.T) {
 	projectService.ListWorktrees = nil
 	repo := "acme/catalog"
 	if _, err := projectService.AddProject(context.Background(), projects.AddInput{
-		ID: "catalog", Name: "Catalog", RepoPath: t.TempDir(), Repo: &repo, SnapshotMode: projects.SnapshotModeOff,
+		ID: "catalog", Name: "Catalog", RepoPath: t.TempDir(), Repo: &repo, Validation: &config.ProjectValidationConfig{OptOut: true}, SnapshotMode: projects.SnapshotModeOff,
 	}); err != nil {
 		t.Fatalf("AddProject() error = %v", err)
 	}

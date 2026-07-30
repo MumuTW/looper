@@ -206,6 +206,9 @@ func (r *Runtime) applyLoadedConfigBoundaryLocked(loaded config.LoadedFileConfig
 	if err := config.Validate(runtimeCandidate); err != nil {
 		return r.rejectConfigReloadLocked("invalid", nil, err)
 	}
+	if err := config.ValidateProjectValidationPolicies(runtimeCandidate); err != nil {
+		return r.rejectConfigReloadLocked("invalid", configValidationPaths(err), err)
+	}
 
 	changed := !reflect.DeepEqual(r.loadedConfig.Config, loaded.Config)
 	cleanupChanged := r.loadedConfig.Config.Daemon.WorktreeCleanup != loaded.Config.Daemon.WorktreeCleanup

@@ -1566,8 +1566,19 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *
 	claimMu := &sync.Mutex{}
 	notificationGateways := newSchedulerNotificationGatewayFactory()
 	coordinatorState := coordinatorrole.NewRuntimeState()
-	if len(config.ResolveValidationCommands(source.Snapshot())) == 0 && logger != nil {
-		logger.Warn("worker/fixer validation gate disabled: defaults.validationCommands is empty; the validate step passes without running anything", nil)
+	initialConfig := source.Snapshot()
+	if logger != nil {
+		if len(initialConfig.Projects) == 0 && !config.HasEffectiveValidationCommands(initialConfig) {
+			logger.Warn("worker/fixer validation gate disabled: defaults.validationCommands is empty; the validate step passes without running anything", nil)
+		}
+		for _, project := range initialConfig.Projects {
+			switch {
+			case config.ProjectValidationOptedOut(initialConfig, project.ID):
+				logger.Warn("project explicitly opted out of worker/fixer validation", map[string]any{"projectId": project.ID})
+			case config.ProjectValidationUsesLegacyDefaults(initialConfig, project.ID):
+				logger.Warn("project uses deprecated defaults.validationCommands fallback; migrate to projects[].validation.commands", map[string]any{"projectId": project.ID})
+			}
+		}
 	}
 	// Trusted review proxies are minted per reviewer agent run (bound to that
 	// run's PR). Catalog snapshots reuse claim serialization and notification
@@ -2052,6 +2063,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		})
 	}
 	validationCommands := config.ResolveValidationCommands(cfg)
+	validationCommandsByProject := config.ResolveProjectValidationCommandsByID(cfg)
 	resolvedFixer, fixerConfigured := config.ResolveAgent(cfg, "", config.CodingRoleFixer)
 	{
 		resolved := resolvedFixer
@@ -2067,18 +2079,19 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			fixerAutoDiscovery = false
 		}
 		fixerRunner = fixer.New(fixer.Options{
-			DB:                 coordinator.DB(),
-			Repos:              repos,
-			GitHub:             fixerGitHubAdapter{gateway: githubGateway, stamper: fixerStamper, config: &cfg},
-			Git:                fixerGitAdapter{gateway: gitGateway, stamper: fixerStamper},
-			AgentExecutor:      fixerAgentExecutorAdapter{executor: fixerExecutor},
-			Logger:             logger,
-			Now:                now,
-			AllowAutoCommit:    cfg.Defaults.AllowAutoCommit,
-			AllowAutoPush:      cfg.Defaults.AllowAutoPush,
-			AllowRiskyFixes:    cfg.Defaults.AllowRiskyFixes,
-			FixAllPullRequests: cfg.Defaults.FixAllPullRequests,
-			ValidationCommands: validationCommands,
+			DB:                          coordinator.DB(),
+			Repos:                       repos,
+			GitHub:                      fixerGitHubAdapter{gateway: githubGateway, stamper: fixerStamper, config: &cfg},
+			Git:                         fixerGitAdapter{gateway: gitGateway, stamper: fixerStamper},
+			AgentExecutor:               fixerAgentExecutorAdapter{executor: fixerExecutor},
+			Logger:                      logger,
+			Now:                         now,
+			AllowAutoCommit:             cfg.Defaults.AllowAutoCommit,
+			AllowAutoPush:               cfg.Defaults.AllowAutoPush,
+			AllowRiskyFixes:             cfg.Defaults.AllowRiskyFixes,
+			FixAllPullRequests:          cfg.Defaults.FixAllPullRequests,
+			ValidationCommands:          validationCommands,
+			ValidationCommandsByProject: validationCommandsByProject,
 			// Validation shell is Supervisor-owned (#577): track handles for retain-storage.
 			ContainmentTracker: activeExecutions,
 			DiscoveryPolicy: fixer.DiscoveryPolicy{
@@ -2137,14 +2150,15 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			GitHubCLIAutoPROpeningAvailable: func(ctx context.Context, repo, cwd string) bool {
 				return githubCLIAutoPROpeningAvailable(ctx, cfg, githubGateway, logger, repo, cwd)
 			},
-			Git:                workerGitAdapter{gateway: gitGateway, stamper: workerStamper},
-			AgentExecutor:      workerAgentExecutorAdapter{executor: workerExecutor},
-			Logger:             logger,
-			Now:                now,
-			AllowAutoCommit:    cfg.Defaults.AllowAutoCommit,
-			AllowAutoPush:      cfg.Defaults.AllowAutoPush,
-			OpenPRStrategy:     cfg.Defaults.OpenPRStrategy,
-			ValidationCommands: validationCommands,
+			Git:                         workerGitAdapter{gateway: gitGateway, stamper: workerStamper},
+			AgentExecutor:               workerAgentExecutorAdapter{executor: workerExecutor},
+			Logger:                      logger,
+			Now:                         now,
+			AllowAutoCommit:             cfg.Defaults.AllowAutoCommit,
+			AllowAutoPush:               cfg.Defaults.AllowAutoPush,
+			OpenPRStrategy:              cfg.Defaults.OpenPRStrategy,
+			ValidationCommands:          validationCommands,
+			ValidationCommandsByProject: validationCommandsByProject,
 			// Validation shell is Supervisor-owned (#577): track handles for retain-storage.
 			ContainmentTracker: activeExecutions,
 			DiscoveryPolicy: worker.DiscoveryPolicy{

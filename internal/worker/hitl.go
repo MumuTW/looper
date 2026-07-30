@@ -574,7 +574,8 @@ func (r *Runner) ensureDraftPRForAsk(ctx context.Context, input stepInput, check
 	if err != nil {
 		return 0, err
 	}
-	if len(r.validationCommands) > 0 {
+	validationCommands := r.validationCommandsForProject(input.Project.ID)
+	if len(validationCommands) > 0 {
 		validateInput := input
 		validateInput.Checkpoint = *checkpoint
 		validated, err := r.runValidateStep(ctx, validateInput)
@@ -583,7 +584,7 @@ func (r *Runner) ensureDraftPRForAsk(ctx context.Context, input stepInput, check
 		}
 		*checkpoint = validated
 	}
-	if err := r.git.Push(ctx, PushInput{RepoPath: cwd, WorktreeRoot: worktreeRoot, WorktreePath: checkpoint.Worktree.Path, Branch: checkpoint.Worktree.Branch, LocalHeadSHA: workerValidatedHeadSHA(*checkpoint, r.validationCommands), ProtectedBranches: compactStrings([]string{base})}); err != nil {
+	if err := r.git.Push(ctx, PushInput{RepoPath: cwd, WorktreeRoot: worktreeRoot, WorktreePath: checkpoint.Worktree.Path, Branch: checkpoint.Worktree.Branch, LocalHeadSHA: workerValidatedHeadSHA(*checkpoint, validationCommands), ProtectedBranches: compactStrings([]string{base})}); err != nil {
 		return 0, err
 	}
 	disclosureAgent, disclosureModel := r.disclosureIdentity(input.Run)

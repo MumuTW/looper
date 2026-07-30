@@ -191,6 +191,7 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 		if config.Webhook.Enabled && webhookModeRequiresTunnelConfig(config, &project) {
 			validateWebhookTunnelConfig(config.Webhook, "webhook", &issues)
 		}
+		validateProjectValidationConfig(config, project, prefix, false, &issues)
 
 		validateProjectRoleOverrides(project.Roles, prefix+".roles", config.Instructions.MaxBytes, &issues)
 		validateProjectRoleAgentBindings(project.Roles, prefix+".roles", &issues)
@@ -507,6 +508,53 @@ func validateDaemonConfig(daemon DaemonConfig, issues *[]ValidationIssue) {
 		*issues = append(*issues, ValidationIssue{Path: "daemon.workingDirectory", Message: "must be a non-empty path"})
 	}
 	validateWorktreeCleanupConfig(daemon.WorktreeCleanup, "daemon.worktreeCleanup", issues)
+}
+
+// ValidateProjectValidationPolicies is the startup/catalog/reload gate. Generic
+// config parsing validates any authored policy, but only an authority boundary
+// has enough context to require every materialized project to choose commands
+// or an explicit opt-out.
+func ValidateProjectValidationPolicies(config Config) error {
+	if !CodingRoleAgentConfigured(config, CodingRoleWorker) && !CodingRoleAgentConfigured(config, CodingRoleFixer) {
+		return nil
+	}
+	issues := []ValidationIssue{}
+	for index, project := range config.Projects {
+		validateProjectValidationConfig(config, project, fmt.Sprintf("projects[%d]", index), true, &issues)
+	}
+	if len(issues) > 0 {
+		return &ConfigValidationError{Issues: issues}
+	}
+	return nil
+}
+
+func validateProjectValidationConfig(config Config, project ProjectRefConfig, prefix string, requirePresence bool, issues *[]ValidationIssue) {
+	validation := project.Validation
+	if validation == nil {
+		if requirePresence && len(ResolveValidationCommands(config)) == 0 {
+			*issues = append(*issues, ValidationIssue{
+				Path:    prefix + ".validation",
+				Message: "must configure commands or set optOut=true; defaults.validationCommands is only a legacy migration fallback",
+			})
+		}
+		return
+	}
+
+	if validation.OptOut {
+		if len(validation.Commands) > 0 {
+			*issues = append(*issues, ValidationIssue{Path: prefix + ".validation", Message: "cannot set commands when optOut=true"})
+		}
+		return
+	}
+	if len(validation.Commands) == 0 {
+		*issues = append(*issues, ValidationIssue{Path: prefix + ".validation.commands", Message: "must contain at least one command or set optOut=true"})
+		return
+	}
+	for index, command := range validation.Commands {
+		if strings.TrimSpace(command) == "" {
+			*issues = append(*issues, ValidationIssue{Path: fmt.Sprintf("%s.validation.commands[%d]", prefix, index), Message: "must be a non-empty string"})
+		}
+	}
 }
 
 func validatePackageAndDefaultsConfig(config Config, issues *[]ValidationIssue) {

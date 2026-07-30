@@ -24,6 +24,7 @@
 - Tool paths (`git`, `gh`, `osascript`) are auto-detected unless explicitly configured.
 - When `notifications.osascript.enabled` is true, `osascript` must resolve or startup fails.
 - Default runtime artifacts: `~/.looper/` (`looper.sqlite`, `backups/`, `logs/`).
+- Worker/Fixer validation is project-owned: configure `projects[].validation.commands`, explicitly set `projects[].validation.optOut = true`, or temporarily inherit deprecated `defaults.validationCommands` during migration. Missing project policy fails closed when those coding roles are configured.
 
 ## Conventions
 

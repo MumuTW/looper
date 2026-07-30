@@ -3573,7 +3573,7 @@ func TestRuntimeStartDoesNotStartSchedulerWhenWebhookStartupFails(t *testing.T) 
 	cfg.Agent.Vendor = &vendor
 	cfg.Webhook.Enabled = true
 	cfg.Webhook.Mode = config.WebhookModeTunnel
-	cfg.Projects = []config.ProjectRefConfig{{ID: "project_1", Name: "Looper", RepoPath: repoPath}}
+	cfg.Projects = []config.ProjectRefConfig{{ID: "project_1", Name: "Looper", RepoPath: repoPath, Validation: &config.ProjectValidationConfig{OptOut: true}}}
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -3591,7 +3591,7 @@ func TestRuntimeStartDoesNotStartSchedulerWhenWebhookStartupFails(t *testing.T) 
 		t.Fatalf("RunPending() error = %v", err)
 	}
 	repositories := storage.NewRepositories(coordinator.DB())
-	metadata := `{"repo":"acme/looper","source":"config"}`
+	metadata := `{"repo":"acme/looper","source":"config","validation":{"optOut":true}}`
 	nowISO := "2026-05-19T12:00:00.000Z"
 	if err := repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: repoPath, MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		_ = coordinator.Close()

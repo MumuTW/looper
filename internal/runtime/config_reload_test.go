@@ -35,7 +35,7 @@ func TestReloadConfigPublishesHotSnapshotAndKeepsMaterializedProjects(t *testing
 	if err != nil {
 		t.Fatalf("DefaultConfig() error = %v", err)
 	}
-	cfg.Projects = []config.ProjectRefConfig{{ID: "import-input"}}
+	cfg.Projects = []config.ProjectRefConfig{{ID: "import-input", Validation: &config.ProjectValidationConfig{OptOut: true}}}
 	cfg.Roles.Coding = config.CodingRolesFromLegacy(cfg.Roles)
 	worker := cfg.Roles.Coding[config.CodingRoleWorker]
 	worker.Instructions = "canonical worker guidance"
@@ -55,7 +55,7 @@ func TestReloadConfigPublishesHotSnapshotAndKeepsMaterializedProjects(t *testing
 	next.Config.Roles.Worker.AutoDiscovery = !cfg.Roles.Worker.AutoDiscovery
 	newVendor := config.AgentVendorOpenCode
 	next.Config.Agent.Vendor = &newVendor
-	next.Config.Projects = []config.ProjectRefConfig{{ID: "import-input"}}
+	next.Config.Projects = []config.ProjectRefConfig{{ID: "import-input", Validation: &config.ProjectValidationConfig{OptOut: true}}}
 
 	rt := New(Options{
 		Config:        cfg,
@@ -66,7 +66,7 @@ func TestReloadConfigPublishesHotSnapshotAndKeepsMaterializedProjects(t *testing
 	})
 	networkManager := &recordingNetworkManager{}
 	rt.networkManager = networkManager
-	rt.projectCatalog.Publish([]config.ProjectRefConfig{{ID: "database-project", Name: "Database project", RepoPath: t.TempDir()}})
+	rt.projectCatalog.Publish([]config.ProjectRefConfig{{ID: "database-project", Name: "Database project", RepoPath: t.TempDir(), Validation: &config.ProjectValidationConfig{OptOut: true}}})
 	operationSnapshot := rt.Config()
 
 	if err := rt.ReloadConfig(context.Background()); err != nil {

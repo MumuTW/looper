@@ -1293,6 +1293,11 @@ func (r *Runtime) reloadProjectCatalog(ctx context.Context, repos *storage.Repos
 	if err != nil {
 		return fmt.Errorf("materialize runtime project catalog: %w", err)
 	}
+	candidate := config.CloneConfig(global)
+	candidate.Projects = materialized
+	if err := config.ValidateProjectValidationPolicies(candidate); err != nil {
+		return fmt.Errorf("validate runtime project catalog: %w", err)
+	}
 	r.publishProjects(materialized)
 	return nil
 }
