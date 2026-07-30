@@ -53,6 +53,8 @@ func TestAutoMergesAnEligiblePullRequest(t *testing.T) {
 	t.Parallel()
 	fixture := newGatekeeperFixture(t)
 	fixture.github.files = []string{"internal/runtime/auditor.go"}
+	fixture.github.detail.ClosingIssues = []githubinfra.IssueReference{{Number: 118, Repo: "acme/looper", URL: "https://example.test/acme/looper/issues/118"}}
+	fixture.github.mergeable.MergeCommitSHA = "merge-commit-1"
 	runner := autoRunner(t, fixture)
 
 	report, err := runner.EvaluatePullRequest(context.Background(), EvaluationInput{
@@ -73,8 +75,22 @@ func TestAutoMergesAnEligiblePullRequest(t *testing.T) {
 		t.Fatalf("merge head = %q", fixture.github.merges[0].HeadSHA)
 	}
 	outcomes := mergeOutcomes(t, fixture.repos)
-	if len(outcomes) != 1 || !outcomes[0].Merged || len(outcomes[0].TouchedFiles) != 1 || outcomes[0].TouchedFiles[0] != "internal/runtime/auditor.go" {
+	if len(outcomes) != 1 || !outcomes[0].Merged || outcomes[0].MergeCommitSHA != "merge-commit-1" || outcomes[0].SourceIssue == nil || outcomes[0].SourceIssue.Number != 118 || len(outcomes[0].TouchedFiles) != 1 || outcomes[0].TouchedFiles[0] != "internal/runtime/auditor.go" {
 		t.Fatalf("outcomes = %+v", outcomes)
+	}
+}
+
+func TestSameRepositorySourceIssueRequiresOneUnambiguousRelationship(t *testing.T) {
+	issues := []githubinfra.IssueReference{
+		{Number: 1, Repo: "other/project"},
+		{Number: 2, Repo: "acme/looper"},
+	}
+	if got := sameRepositorySourceIssue(issues, "acme/looper"); got == nil || got.Number != 2 {
+		t.Fatalf("sameRepositorySourceIssue() = %#v, want source issue #2", got)
+	}
+	issues = append(issues, githubinfra.IssueReference{Number: 3, Repo: "acme/looper"})
+	if got := sameRepositorySourceIssue(issues, "acme/looper"); got != nil {
+		t.Fatalf("sameRepositorySourceIssue() = %#v, want ambiguous source rejected", got)
 	}
 }
 

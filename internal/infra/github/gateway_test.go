@@ -774,6 +774,38 @@ func TestListAttributionPathsUsesPaginatedGitHubEvidence(t *testing.T) {
 	}
 }
 
+func TestPullRequestDetailReadsNativeClosingIssueAndMergeCommit(t *testing.T) {
+	detail := pullRequestDetailFromViewRow(map[string]any{
+		"number":      float64(42),
+		"mergeCommit": map[string]any{"oid": "merge-commit-1"},
+		"closingIssuesReferences": []any{map[string]any{
+			"number": float64(118), "url": "https://example.test/acme/looper/issues/118",
+			"repository": map[string]any{"name": "looper", "owner": map[string]any{"login": "acme"}},
+		}},
+	}, nil, nil)
+	if detail.MergeCommitSHA != "merge-commit-1" || len(detail.ClosingIssues) != 1 || detail.ClosingIssues[0].Number != 118 || detail.ClosingIssues[0].Repo != "acme/looper" {
+		t.Fatalf("pullRequestDetailFromViewRow() = %#v, want native merge and closing-issue identity", detail)
+	}
+}
+
+func TestViewPullRequestMergeWatchReadsDefaultBranchMergeCommit(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		if got, want := strings.Join(options.Args, " "), "api repos/acme/looper/pulls/42 -H Accept: application/vnd.github+json"; got != want {
+			t.Fatalf("gh args = %q, want %q", got, want)
+		}
+		return shell.Result{Stdout: `{"number":42,"state":"closed","merged_at":"2026-07-31T12:01:00Z","merge_commit_sha":"merge-commit-1"}`}, nil
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	detail, err := gateway.ViewPullRequestMergeWatch(context.Background(), ViewPullRequestInput{Repo: "acme/looper", PRNumber: 42})
+	if err != nil || detail.MergeCommitSHA != "merge-commit-1" || detail.MergedAt == "" {
+		t.Fatalf("ViewPullRequestMergeWatch() = %#v, %v", detail, err)
+	}
+}
+
+
 func TestRerequestCheckSuiteUsesExplicitSuiteIdentityAndHostname(t *testing.T) {
 	t.Parallel()
 	runner := &fakeGHRunner{t: t}
