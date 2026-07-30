@@ -1581,6 +1581,12 @@ func (x *execution) persistStatus(ctx context.Context, status string, heartbeatC
 		heartbeatAt = &retainedAt
 		outputJSON = x.lastPersistedOutputJSON
 	}
+	// The live status is one-way regardless of snapshot order: a callback that
+	// sampled running before the kill can reach here after cancelling
+	// persisted (with an equal or newer count) and must not downgrade it.
+	if status == "running" && x.lastPersistedStatus == "cancelling" {
+		status = "cancelling"
+	}
 	if x.executor.repos == nil || x.executor.repos.AgentExecutions == nil {
 		return nil
 	}

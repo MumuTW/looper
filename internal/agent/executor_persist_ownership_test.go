@@ -340,4 +340,24 @@ func TestPersistStatusStaleSnapshotStillCarriesCancellingTransition(t *testing.T
 	if record.Status != "cancelling" {
 		t.Fatalf("Status after stale running sample = %q, want cancelling retained", record.Status)
 	}
+
+	// A NEWER-count callback that sampled running before the kill (preempted
+	// between snapshot and persist) must not downgrade cancelling either; its
+	// fresher output still lands.
+	newestAt := "2026-07-18T00:00:03.000Z"
+	newestOut := `{"stdout":"chunk-1chunk-2chunk-3","stderr":""}`
+	newestCount := int64(3)
+	if err := x.persistStatus(context.Background(), "running", &newestCount, &newestAt, &newestOut); err != nil {
+		t.Fatalf("persistStatus(newer running after cancelling) error = %v", err)
+	}
+	record, err = repos.AgentExecutions.GetByID(context.Background(), "agent_stale_cancelling")
+	if err != nil || record == nil {
+		t.Fatalf("AgentExecutions.GetByID() error = %v", err)
+	}
+	if record.Status != "cancelling" {
+		t.Fatalf("Status after newer running sample = %q, want cancelling retained: one-way transition", record.Status)
+	}
+	if record.HeartbeatCount != 3 || record.OutputJSON == nil || *record.OutputJSON != newestOut {
+		t.Fatalf("heartbeat/output = (%d, %v), want the newest snapshot retained under cancelling", record.HeartbeatCount, record.OutputJSON)
+	}
 }
