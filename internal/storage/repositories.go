@@ -1752,6 +1752,29 @@ func (r *TargetLeasesRepository) Get(ctx context.Context, targetKey string) (*Ta
 	return &record, nil
 }
 
+// List returns current target leases in a deterministic order for startup
+// settlement. Callers decide liveness; this repository never treats age as a
+// reason to reclaim checkout authority.
+func (r *TargetLeasesRepository) List(ctx context.Context) ([]TargetLeaseRecord, error) {
+	rows, err := r.q.QueryContext(ctx, `SELECT * FROM target_leases ORDER BY target_key ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("list target leases: %w", err)
+	}
+	defer rows.Close()
+	records := make([]TargetLeaseRecord, 0)
+	for rows.Next() {
+		record, scanErr := scanTargetLease(rows)
+		if scanErr != nil {
+			return nil, fmt.Errorf("scan target lease: %w", scanErr)
+		}
+		records = append(records, record)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate target leases: %w", err)
+	}
+	return records, nil
+}
+
 type WorktreesRepository struct{ q sqliteQuerier }
 
 type QueueRepository struct{ q sqliteQuerier }
@@ -2280,12 +2303,12 @@ func (r *QueueRepository) ClaimNextLongTermRetryAmongTypeSets(ctx context.Contex
 // item running. Call it with a transaction-backed repository: selecting and
 // leasing are one durable commit, so a scheduler never obtains a running claim
 // before it has checkout authority.
-func (r *QueueRepository) ClaimNextNonLongTermRetryAmongTypeSetsWithTargetLease(ctx context.Context, nowISO, claimedBy, ownerToken string, unrestrictedTypes, stickySnapshotTypes []string) (*QueueItemRecord, string, error) {
+func (r *QueueRepository) ClaimNextNonLongTermRetryAmongTypeSetsWithTargetLease(ctx context.Context, nowISO, claimedBy, ownerToken string, processPID, processStartTime *int64, processBootID *string, unrestrictedTypes, stickySnapshotTypes []string) (*QueueItemRecord, string, error) {
 	typePred, typeArgs := queueClaimTypePredicate(unrestrictedTypes, stickySnapshotTypes)
 	if typePred == "" {
 		return nil, "", nil
 	}
-	return r.claimNextMatchingWithTargetLease(ctx, nowISO, claimedBy, ownerToken, `
+	return r.claimNextMatchingWithTargetLease(ctx, nowISO, claimedBy, ownerToken, processPID, processStartTime, processBootID, `
 		AND NOT (`+longTermRetryPredicateParam+`)
 		`+typePred+`
 	`, append([]any{QueueLongTermRetryAttemptThreshold}, typeArgs...))
@@ -2293,12 +2316,12 @@ func (r *QueueRepository) ClaimNextNonLongTermRetryAmongTypeSetsWithTargetLease(
 
 // ClaimNextLongTermRetryAmongTypeSetsWithTargetLease is the long-term retry
 // counterpart of ClaimNextNonLongTermRetryAmongTypeSetsWithTargetLease.
-func (r *QueueRepository) ClaimNextLongTermRetryAmongTypeSetsWithTargetLease(ctx context.Context, nowISO, claimedBy, ownerToken string, unrestrictedTypes, stickySnapshotTypes []string) (*QueueItemRecord, string, error) {
+func (r *QueueRepository) ClaimNextLongTermRetryAmongTypeSetsWithTargetLease(ctx context.Context, nowISO, claimedBy, ownerToken string, processPID, processStartTime *int64, processBootID *string, unrestrictedTypes, stickySnapshotTypes []string) (*QueueItemRecord, string, error) {
 	typePred, typeArgs := queueClaimTypePredicate(unrestrictedTypes, stickySnapshotTypes)
 	if typePred == "" {
 		return nil, "", nil
 	}
-	return r.claimNextMatchingWithTargetLease(ctx, nowISO, claimedBy, ownerToken, `
+	return r.claimNextMatchingWithTargetLease(ctx, nowISO, claimedBy, ownerToken, processPID, processStartTime, processBootID, `
 		AND (`+longTermRetryPredicateParam+`)
 		`+typePred+`
 	`, append([]any{QueueLongTermRetryAttemptThreshold}, typeArgs...))
@@ -2386,7 +2409,7 @@ func (r *QueueRepository) claimNextMatching(ctx context.Context, nowISO, claimed
 	return &record, nil
 }
 
-func (r *QueueRepository) claimNextMatchingWithTargetLease(ctx context.Context, nowISO, claimedBy, ownerToken, extraPredicate string, extraArgs []any) (*QueueItemRecord, string, error) {
+func (r *QueueRepository) claimNextMatchingWithTargetLease(ctx context.Context, nowISO, claimedBy, ownerToken string, processPID, processStartTime *int64, processBootID *string, extraPredicate string, extraArgs []any) (*QueueItemRecord, string, error) {
 	claimCtx, cancel, err := claimCtxForDurableClaim(ctx)
 	if err != nil {
 		return nil, "", err
@@ -2427,7 +2450,7 @@ func (r *QueueRepository) claimNextMatchingWithTargetLease(ctx context.Context, 
 		}
 		if leaseKey != "" {
 			acquired, acquireErr := (&TargetLeasesRepository{q: r.q}).Acquire(claimCtx, TargetLeaseRecord{
-				TargetKey: leaseKey, OwnerToken: ownerToken, OwnerKind: "automation", OwnerID: candidate.ID, Purpose: "claim", AcquiredAt: nowISO, UpdatedAt: nowISO,
+				TargetKey: leaseKey, OwnerToken: ownerToken, OwnerKind: "automation", OwnerID: candidate.ID, Purpose: "claim", ProcessPID: processPID, ProcessStartTime: processStartTime, ProcessBootID: processBootID, AcquiredAt: nowISO, UpdatedAt: nowISO,
 			})
 			if acquireErr != nil {
 				return nil, "", acquireErr

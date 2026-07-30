@@ -52,6 +52,7 @@ type RecoverySummary struct {
 	CompletedAt           string                     `json:"completedAt,omitempty"`
 	OrphanAgentCleanup    RecoveryOrphanAgentCleanup `json:"orphanAgentCleanup"`
 	ExpiredLocksReleased  int64                      `json:"expiredLocksReleased"`
+	TargetLeasesReclaimed int64                      `json:"targetLeasesReclaimed"`
 	InterruptedRunsMarked int64                      `json:"interruptedRunsMarked"`
 	LoopsRequeued         int64                      `json:"loopsRequeued"`
 	EventsWritten         int64                      `json:"eventsWritten"`
@@ -1785,6 +1786,11 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 		}
 		eventsWritten += 1
 	}
+	reclaimedLeases, err := r.reclaimVerifiablyGoneTargetLeases(ctx, repositories)
+	if err != nil {
+		return RecoverySummary{}, err
+	}
+	summary.TargetLeasesReclaimed = reclaimedLeases
 
 	staleSummary, err := r.reconcileStaleRunningRunsWithMode(ctx, repositories, now, staleRunReconcileModeStartup)
 	if err != nil {
@@ -2056,6 +2062,7 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 		EntityID:   stringPtr("looperd-recovery"),
 		PayloadJSON: mustMarshalJSON(map[string]any{
 			"expiredLocksReleased":  summary.ExpiredLocksReleased,
+			"targetLeasesReclaimed": summary.TargetLeasesReclaimed,
 			"interruptedRunsMarked": summary.InterruptedRunsMarked,
 			"loopsRequeued":         summary.LoopsRequeued,
 			"orphanAgentCleanup":    summary.OrphanAgentCleanup,
@@ -3440,6 +3447,7 @@ func createEmptyRecoverySummary() RecoverySummary {
 			CleanedCount: 0,
 		},
 		ExpiredLocksReleased:  0,
+		TargetLeasesReclaimed: 0,
 		InterruptedRunsMarked: 0,
 		LoopsRequeued:         0,
 		EventsWritten:         0,

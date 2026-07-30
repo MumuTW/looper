@@ -32,6 +32,7 @@ import (
 	"github.com/nexu-io/looper/internal/networkpolicy"
 	"github.com/nexu-io/looper/internal/planner"
 	"github.com/nexu-io/looper/internal/processcontainment"
+	"github.com/nexu-io/looper/internal/processidentity"
 	"github.com/nexu-io/looper/internal/projects"
 	"github.com/nexu-io/looper/internal/reviewer"
 	"github.com/nexu-io/looper/internal/storage"
@@ -2790,6 +2791,17 @@ func claimNextWithTargetLease(ctx context.Context, input defaultSchedulerTickInp
 	if err != nil {
 		return nil, "", "", err
 	}
+	pid := int64(os.Getpid())
+	birth, err := processidentity.Read(int(pid))
+	if err != nil {
+		return nil, "", "", fmt.Errorf("read scheduler process identity for target lease: %w", err)
+	}
+	startTime := birth.StartTime
+	bootID := strings.TrimSpace(birth.BootID)
+	var bootIDPtr *string
+	if bootID != "" {
+		bootIDPtr = &bootID
+	}
 	type result struct {
 		item *storage.QueueItemRecord
 		key  string
@@ -2797,10 +2809,10 @@ func claimNextWithTargetLease(ctx context.Context, input defaultSchedulerTickInp
 	claimed, err := storage.WithTransactionValue(ctx, input.StorageCoordinator.DB(), nil, func(tx *sql.Tx) (result, error) {
 		repos := storage.NewRepositories(tx)
 		if longTerm {
-			item, key, claimErr := repos.Queue.ClaimNextLongTermRetryAmongTypeSetsWithTargetLease(ctx, nowISO, claimedBy, ownerToken, unrestrictedTypes, stickySnapshotTypes)
+			item, key, claimErr := repos.Queue.ClaimNextLongTermRetryAmongTypeSetsWithTargetLease(ctx, nowISO, claimedBy, ownerToken, &pid, &startTime, bootIDPtr, unrestrictedTypes, stickySnapshotTypes)
 			return result{item: item, key: key}, claimErr
 		}
-		item, key, claimErr := repos.Queue.ClaimNextNonLongTermRetryAmongTypeSetsWithTargetLease(ctx, nowISO, claimedBy, ownerToken, unrestrictedTypes, stickySnapshotTypes)
+		item, key, claimErr := repos.Queue.ClaimNextNonLongTermRetryAmongTypeSetsWithTargetLease(ctx, nowISO, claimedBy, ownerToken, &pid, &startTime, bootIDPtr, unrestrictedTypes, stickySnapshotTypes)
 		return result{item: item, key: key}, claimErr
 	})
 	if err != nil {
