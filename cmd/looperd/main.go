@@ -78,9 +78,25 @@ func runWithDeps(args []string, stdout, stderr io.Writer, deps runDeps) int {
 		return 1
 	}
 
+	// A schema the binary cannot understand will not become understandable by
+	// restarting: the daemon has to be replaced or the database restored. A
+	// supervisor that retries on failure (launchd KeepAlive.SuccessfulExit)
+	// otherwise turns that permanent condition into a crash loop that reads as
+	// flakiness — 28 identical fatal exits in nine minutes in #188. The distinct
+	// code is what lets a supervisor, or an operator reading `launchctl list`,
+	// tell "will never succeed" from "try again".
+	if errors.Is(err, storage.ErrSchemaIncompatible) {
+		_, _ = fmt.Fprintf(stderr, "looperd: %v\n", err)
+		return exitCodeSchemaIncompatible
+	}
+
 	_, _ = fmt.Fprintf(stderr, "looperd: %v\n", err)
 	return 1
 }
+
+// exitCodeSchemaIncompatible is EX_CONFIG from sysexits(3): the daemon started
+// correctly but its environment — here, the database — is one it cannot serve.
+const exitCodeSchemaIncompatible = 78
 
 type daemonRuntime struct {
 	runtime         *looperdruntime.Runtime

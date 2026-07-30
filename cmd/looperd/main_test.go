@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -1509,3 +1510,44 @@ func stopAllItemTypes(items []stopAllItem) []string {
 }
 
 func stringPtr(value string) *string { return &value }
+
+// Contract: a database this build cannot understand exits 78, not 1.
+//
+// A supervisor configured to restart on failure cannot distinguish the two
+// today, so a permanent condition is retried forever: #188 recorded 28
+// identical fatal exits in nine minutes, which read as flakiness rather than as
+// "this binary will never serve this database".
+func TestRunExitsWithADistinctCodeWhenTheSchemaIsIncompatible(t *testing.T) {
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+
+	exitCode := runWithDeps([]string{}, stdout, stderr, runDeps{
+		bootstrapImpl: func(context.Context, bootstrap.Options) (bootstrap.Result, error) {
+			return bootstrap.Result{}, fmt.Errorf("%w: runs has unknown column(s) future_field", storage.ErrSchemaIncompatible)
+		},
+	})
+
+	if exitCode != 78 {
+		t.Fatalf("exit code = %d, want 78 (EX_CONFIG)", exitCode)
+	}
+	if got := stderr.String(); !strings.Contains(got, "future_field") {
+		t.Fatalf("stderr = %q, want it to name the offending column", got)
+	}
+}
+
+// Contract: every other start failure keeps exit code 1, so the distinct code
+// stays a reliable signal rather than a second way to say "something failed".
+func TestRunExitsWithOneForOrdinaryStartFailures(t *testing.T) {
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+
+	exitCode := runWithDeps([]string{}, stdout, stderr, runDeps{
+		bootstrapImpl: func(context.Context, bootstrap.Options) (bootstrap.Result, error) {
+			return bootstrap.Result{}, errors.New("port 17310 is already in use")
+		},
+	})
+
+	if exitCode != 1 {
+		t.Fatalf("exit code = %d, want 1", exitCode)
+	}
+}

@@ -294,7 +294,8 @@ func schemaMigrationsTableExists(ctx context.Context, conn *sql.Conn) (bool, err
 func assertAppliedMigrationsKnown(applied []AppliedMigration, migrations []EmbeddedMigration) error {
 	if unknown := unknownAppliedMigrationIDs(applied, migrations); len(unknown) > 0 {
 		return fmt.Errorf(
-			"database has applied migrations unknown to this binary: %s; the database was likely created or migrated by a newer looper version (downgrade or mixed-version deployment) — run a looper binary that includes these migrations or restore a backup matching this version",
+			"%w: database has applied migrations unknown to this binary: %s; the database was likely created or migrated by a newer looper version (downgrade or mixed-version deployment) — run a looper binary that includes these migrations or restore a backup matching this version",
+			ErrSchemaIncompatible,
 			strings.Join(unknown, ", "),
 		)
 	}

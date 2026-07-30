@@ -913,6 +913,16 @@ func (r *Runtime) start(ctx context.Context) error {
 		}
 	}
 
+	// The migration ledger can agree while the tables do not: a column added
+	// outside the migration framework leaves every id known and still breaks
+	// the first positional scan, which is how #188 produced 28 fatal exits with
+	// nothing in the message naming a schema. Reading the tables themselves,
+	// after any pending migration has run, refuses that database at boot with
+	// the table and column named instead.
+	if err := storage.ValidateSchemaShape(ctx, coordinator.DB()); err != nil {
+		return err
+	}
+
 	repositories := storage.NewRepositories(coordinator.DB())
 	gitGateway := gitinfra.New(gitinfra.Options{GitPath: derefString(r.config.Tools.GitPath), Repos: repositories, Now: r.now})
 	// Every project is GitHub, so the gateway is always needed. GHPath may be
