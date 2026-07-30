@@ -107,7 +107,7 @@ Profile and role agent vendor/model fields are hot-safe curated identity fields:
 
 `agent.vendor` can switch from one configured vendor to another when `agent.params` is empty and no explicit model is being silently carried across vendors. If `agent.model` is set, change or unset it in the same candidate; an unchanged explicit model blocks that vendor-to-vendor switch. Clearing a configured vendor uses the same guard, so a retained profile cannot be laundered through an intermediate `null`. The same leave/switch guards apply to each coding role's *resolved* vendor after global → profile → role overlay. Configuring the first vendor may use an already prepared model/params profile. Continuations of failed or interrupted runs copy the predecessor's durable `agent_snapshot_json` (sticky identity across the retry lineage) while retaining checkpoint, worktree, HITL answer, and queued human instructions. Only legacy predecessors with a null snapshot adopt the runner's current resolved identity. Looper never sends an old vendor's native session ID to a different CLI.
 
-Notably, `agent.nativeResume`, `agent.params`, `roles.coordinator.enabled`, `instructions.maxBytes`, all `hitl.*`, all `notifications.webhook.*`, `roles.reviewer.autoMerge.*`, `roles.reviewer.behavior.loop.quietPeriodSeconds`, `roles.reviewer.behavior.loop.minPublishIntervalSeconds`, `roles.reviewer.behavior.retry.maxDelayMs`, `roles.coordinator.mergeWatch.transientRetries`, and `roles.coordinator.dependencies.*` require restart. `agent.params` stay global, file-only, and restart-bound; the dashboard does not edit params. The scheduler retry budget/base delay and these Reviewer timing fields are durable queue-scheduling inputs; Coordinator transient retries are persisted as a remaining budget, so they are also restart-bound. Listener, storage, daemon, logging, webhook/network topology, providers/projects, scheduler polling/cache, and `tools.gitPath`/`tools.ghPath` also require restart. New fields are restart-bound until explicitly classified.
+Notably, `agent.nativeResume`, `agent.params`, `roles.coordinator.enabled`, `instructions.maxBytes`, all `hitl.*`, all `intake.*`, all `notifications.webhook.*`, `roles.reviewer.autoMerge.*`, `roles.reviewer.behavior.loop.quietPeriodSeconds`, `roles.reviewer.behavior.loop.minPublishIntervalSeconds`, `roles.reviewer.behavior.retry.maxDelayMs`, `roles.coordinator.mergeWatch.transientRetries`, and `roles.coordinator.dependencies.*` require restart. `agent.params` stay global, file-only, and restart-bound; the dashboard does not edit params. The scheduler retry budget/base delay and these Reviewer timing fields are durable queue-scheduling inputs; Coordinator transient retries are persisted as a remaining budget, so they are also restart-bound. Listener, storage, daemon, logging, webhook/network topology, providers/projects, scheduler polling/cache, and `tools.gitPath`/`tools.ghPath` also require restart. New fields are restart-bound until explicitly classified.
 
 Deprecated file-layer aliases for `agent.timeouts.{planner,worker,reviewer,fixer}Seconds`, `defaults.allowAutoApprove`, and `defaults.fixAllPullRequests` are normalized into their canonical hot-safe fields so existing files can still reload without a restart. They remain file-only compatibility syntax: the dashboard exposes and writes only canonical paths, and a canonical dashboard edit removes the corresponding alias leaf so a later unset cannot resurrect the old value.
 
@@ -654,6 +654,79 @@ Project-level overrides use the same shape under `projects[].roles.reviewer.auto
 
 When `roles.reviewer.autoMerge.enabled = true`, Looper performs a repo-aware startup validation pass: the project must have a known GitHub repo, GitHub auto-merge must be enabled for that repo, the configured strategy must be allowed, and — if `requireBranchProtection=true` — the effective base branch must exist with required checks enabled.
 
+## Telegram intake
+
+Telegram intake lets you open work from a chat instead of the forge UI. A message
+becomes a GitHub Issue; Triager and Planner then handle it exactly as they would
+an Issue you filed by hand.
+
+**Intake does not start a loop by itself.** Without Triager enabled for the
+project, the Issue sits there until you label and assign it the usual way.
+
+**Intake does not think about the request.** The message text goes into the Issue
+body verbatim, with only the first line lifted as a title. Judging whether a
+request is specific enough is Triager's job, and paraphrasing here would hide the
+original wording from that judgement.
+
+| Path | Purpose | Default | Validation |
+| --- | --- | --- | --- |
+| `intake.telegram.enabled` | Enables the intake poll lane | `false` | When `true`, the fields below are required |
+| `intake.telegram.botTokenEnv` | Env var **name** holding the @BotFather token | — | A pasted token value is rejected: it is not a valid env name |
+| `intake.telegram.allowedUserIds` | Telegram user ids permitted to open work | — | Must be non-empty and positive; a negative value is a chat id, not a user id |
+| `intake.telegram.defaultProjectId` | Project a message with no `#` prefix goes to | — | Must name a project in `projects[]`, checked at startup |
+
+There is deliberately no "allow all users" switch. An unrestricted intake bot
+lets anyone who finds the bot handle queue agent runs against your repositories.
+
+### Routing a message to a project
+
+A message goes to `defaultProjectId` unless it starts with `#<projectId>`. The
+token ends at any whitespace, so a newline works as well as a space:
+
+```
+sweeper 沒有回收任何 worktree     → defaultProjectId
+#novel 第三章的段落間距壞了       → project "novel"
+```
+
+An unknown project id is **rejected with a reply**, not silently redirected to
+the default — a typo must not file work against the wrong repository.
+
+### Duplicates, and the trade-off behind them
+
+Every Issue intake opens carries a stamp identifying the chat message that
+created it, and intake searches for that stamp before creating anything. Telegram
+redelivers any update it has not been told was handled, so this stamp — not a
+local cursor — is what keeps a redelivered message from opening a second Issue.
+
+GitHub has no idempotency key for issue creation and its search index is
+eventually consistent, so this check is best-effort: a crash in the seconds
+between creating an Issue and acknowledging the message can still produce a
+duplicate. That is the deliberate direction of the trade-off. A duplicate Issue
+is visible, carries the same stamp as its twin, and can be closed; a dropped
+request is invisible, and the person who typed it has no way to know. Intake
+therefore also stops acknowledging at the first failed message rather than
+skipping past it.
+
+Intake latency is at most one `scheduler.pollIntervalSeconds` (30s by default).
+The lane runs inside the serial scheduler tick, so it does not long-poll — waiting
+on Telegram would hold every discovery lane hostage for the duration.
+
+### Setup
+
+1. Create a bot with [@BotFather](https://t.me/BotFather) and copy the token.
+2. Export it under the name you configured, and make sure the daemon's
+   environment has it.
+3. Find your numeric user id (message [@userinfobot](https://t.me/userinfobot)).
+4. Configure and restart `looperd` — all `intake.*` fields are restart-bound.
+
+```toml
+[intake.telegram]
+enabled = true
+botTokenEnv = "TELEGRAM_BOT_TOKEN"
+allowedUserIds = [123456789]
+defaultProjectId = "looper"
+```
+
 ## Project override rules
 
 Project entries stay in `projects[]`, but any override-bearing config must mirror the same local shape it uses globally.
@@ -1104,11 +1177,11 @@ To restore it by default for all project additions:
 validationCommands = ["test -z \"$(gofmt -l .)\"", "go vet ./...", "go test ./...", "go build ./..."]
 ```
 
-The list is global and applies to every project; there is no `projects[].validationCommands` override, so a multi-language setup needs commands that work in every configured repository (for example a `make check` target each repo provides). The command strings come from daemon configuration, but commands such as `make check` and `go test ./...` intentionally execute repository-controlled code. Looper therefore launches each command through `codex sandbox` with a custom permission profile: network access is disabled, `HOME`/XDG/Go write caches are disposable, daemon credentials (`SSH_AUTH_SOCK`, `LOOPER_CONFIG`, forge/API keys) are omitted, and writes are limited to the worktree plus that disposable root. Tool directories on `PATH` and the existing Go module cache are read-only. If native sandbox support is missing or rejects the profile, validation fails closed rather than falling back to an unsandboxed shell.
+The list is global and applies to every project; there is no `projects[].validationCommands` override, so a multi-language setup needs commands that work in every configured repository (for example a `make check` target each repo provides). The command strings come from daemon configuration, but commands such as `make check` and `go test ./...` intentionally execute repository-controlled code. Looper therefore launches each command through the vendor-neutral [Sandbox Runtime](https://github.com/anthropic-experimental/sandbox-runtime) (`srt`) process boundary: network access is disabled, `HOME`/XDG/Go write caches are disposable, daemon credentials (`SSH_AUTH_SOCK`, `LOOPER_CONFIG`, forge/API keys) are omitted, and writes are limited to the worktree plus that disposable root. Tool directories on `PATH` and the existing Go module cache are read-only. Exactly `@anthropic-ai/sandbox-runtime@0.0.67` and its platform support tools are required when validation commands are enabled. Install the runtime and its complete `node_modules` dependency tree in a dedicated administrator-owned prefix, and install Node, `ripgrep`, and (on Linux) `bubblewrap`/`socat` in paths whose files and ancestor directories the daemon user cannot modify. User-writable npm/Homebrew installs are intentionally rejected so an authorized coding agent cannot replace the next restricted runner, and sandboxed execution is rejected when `looperd` runs as root. Ubuntu 24.04+ also needs SRT's documented AppArmor `userns` allowance (or `kernel.apparmor_restrict_unprivileged_userns=0`). If the runtime is missing or rejects the profile, validation fails closed rather than falling back to an unsandboxed shell.
 
 When this gate is configured, Looper is the fetch-and-publish authority. The daemon prepares the worktree before execution, then launches the Codex agent with a read-isolated permission profile and a disposable, allowlisted tool environment. The Codex parent can still authenticate to its model provider, but model-invoked tools cannot read daemon `HOME`/`CODEX_HOME`, SSH agents, forge credentials, or unrelated host files; they can edit and commit only inside the prepared worktree and cannot use the network. Looper then pushes the exact commit SHA that passed validation. A later local `HEAD` change is not included in that push. This mode currently supports only the Codex executor; other coding vendors fail closed because Looper cannot yet enforce the same tool-level network boundary for them.
 
-The trade-off is deliberate: the gated agent and repository-controlled validation cannot fetch new remote state, query the forge, or download dependencies while they run. Required tools must be on the daemon's `PATH`; dependencies must already exist in the worktree or approved read-only caches. Linked-worktree Git metadata and the discovered Go toolchain/GOROOT are mounted read-only so normal local Git and Go validation still work. Remote context must be present in the daemon-supplied prompt and prepared checkout. If a task needs fresh remote information, let the daemon rediscover/restart it rather than weakening the gate. The agent receives a non-secret local Git identity so local commits still work; remote credentials remain daemon-side authority. If `agent.params.command` selects a custom Codex executable, the same executable is used for the validation sandbox instead of silently falling back to `codex` on `PATH`.
+The trade-off is deliberate: the gated agent and repository-controlled validation cannot fetch new remote state, query the forge, or download dependencies while they run. Required tools must be on the daemon's `PATH`; dependencies must already exist in the worktree or approved read-only caches. Linked-worktree Git metadata and the discovered Go toolchain/GOROOT are mounted read-only so normal local Git and Go validation still work. Remote context must be present in the daemon-supplied prompt and prepared checkout. If a task needs fresh remote information, let the daemon rediscover/restart it rather than weakening the gate. The agent receives a non-secret local Git identity so local commits still work; remote credentials remain daemon-side authority. Validation uses the same internal sandbox boundary for every configured agent provider; sandbox implementation details are not exposed through provider configuration.
 
 The default is empty, which keeps the historical behavior: the validate step passes without running anything and "done" is only the agent's own self-assessment. `looperd` logs a startup warning while the list is empty so the no-op is visible. The field is restart-bound.
 

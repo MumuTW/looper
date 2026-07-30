@@ -38,9 +38,8 @@ type Input struct {
 }
 
 type Options struct {
-	CWD          string
-	CodexCommand string
-	Tracker      processcontainment.LiveTracker
+	CWD     string
+	Tracker processcontainment.LiveTracker
 	// runValidation is an in-package test seam. Production callers always use
 	// validationcmd.Run so repository-controlled commands remain sandboxed.
 	runValidation func(context.Context, validationcmd.Options) (shell.Result, error)
@@ -68,11 +67,10 @@ func RunCommands(ctx context.Context, input Input, options *Options) (Result, er
 			runValidation = validationcmd.Run
 		}
 		shellResult, err := runValidation(ctx, validationcmd.Options{
-			CWD:          options.CWD,
-			Command:      command,
-			Timeout:      input.CommandTimeout,
-			CodexCommand: options.CodexCommand,
-			Tracker:      options.Tracker,
+			CWD:     options.CWD,
+			Command: command,
+			Timeout: input.CommandTimeout,
+			Tracker: options.Tracker,
 		})
 
 		output := strings.TrimSpace(shellResult.Stdout)

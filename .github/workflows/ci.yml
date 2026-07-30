@@ -64,7 +64,20 @@ jobs:
       - name: Reject committed binaries
         run: go run ./tools/check-binaries
 
+      - name: Install process sandbox runtime
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends bubblewrap socat ripgrep
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          sudo npm install --global --prefix /usr/local/lib/looper-srt-runtime @anthropic-ai/sandbox-runtime@0.0.67
+          sudo install -d -m 0555 /usr/local/lib/looper-srt-tools
+          sudo install -m 0555 "$(command -v node)" /usr/local/lib/looper-srt-tools/node
+          sudo ln -s ../looper-srt-runtime/bin/srt /usr/local/lib/looper-srt-tools/srt
+          echo /usr/local/lib/looper-srt-tools >> "$GITHUB_PATH"
+
       - name: Test
+        env:
+          LOOPER_REQUIRE_TRUSTED_SRT: "1"
         run: go test ./...
 
       - name: Build

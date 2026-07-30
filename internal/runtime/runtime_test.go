@@ -2220,7 +2220,7 @@ func TestRuntimeRecoveryPreservesLoopWithActiveAgentExecution(t *testing.T) {
 	}
 }
 
-func newManualReconcileRuntime(options Options) *Runtime {
+func newStaleReconcileRuntime(options Options) *Runtime {
 	options.RunSchedulerTick = func(context.Context, Services) error { return nil }
 	return New(options)
 }
@@ -2240,7 +2240,7 @@ func TestRuntimeReconcileLiveStaleRunningRunsInterruptsAgentBackedRunWithoutExec
 	nowISO := formatJavaScriptISOString(now)
 	oldISO := formatJavaScriptISOString(now.Add(-2 * time.Hour))
 
-	rt := newManualReconcileRuntime(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }})
+	rt := newStaleReconcileRuntime(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }})
 	if err := rt.Start(context.Background()); err != nil {
 		t.Fatalf("Start() error = %v", err)
 	}
@@ -2297,7 +2297,7 @@ func TestRuntimeReconcileLiveStaleRunningRunsSkipsNonAgentRunWithoutExecution(t 
 	nowISO := formatJavaScriptISOString(now)
 	oldISO := formatJavaScriptISOString(now.Add(-2 * time.Hour))
 
-	rt := newManualReconcileRuntime(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }})
+	rt := newStaleReconcileRuntime(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }})
 	if err := rt.Start(context.Background()); err != nil {
 		t.Fatalf("Start() error = %v", err)
 	}
@@ -2337,7 +2337,7 @@ func TestRuntimeReconcileLiveStaleRunningRunsInterruptsWorkerExecuteRunWithoutEx
 	nowISO := formatJavaScriptISOString(now)
 	oldISO := formatJavaScriptISOString(now.Add(-2 * time.Hour))
 
-	rt := newManualReconcileRuntime(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }})
+	rt := newStaleReconcileRuntime(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }})
 	if err := rt.Start(context.Background()); err != nil {
 		t.Fatalf("Start() error = %v", err)
 	}
@@ -2372,9 +2372,6 @@ func TestRuntimeReconcileStaleRunningRunsSkipsVerifiedLiveExecution(t *testing.T
 		{name: "live", reconcile: func(rt *Runtime, ctx context.Context) (StaleRunReconcileSummary, error) {
 			return rt.reconcileLiveStaleRunningRuns(ctx)
 		}},
-		{name: "manual", reconcile: func(rt *Runtime, ctx context.Context) (StaleRunReconcileSummary, error) {
-			return rt.ReconcileStaleRunningRuns(ctx)
-		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			workingDir := t.TempDir()
@@ -2390,7 +2387,7 @@ func TestRuntimeReconcileStaleRunningRunsSkipsVerifiedLiveExecution(t *testing.T
 			oldISO := formatJavaScriptISOString(now.Add(-2 * time.Hour))
 			pid := int64(5151)
 
-			rt := newManualReconcileRuntime(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }, ReadProcessCommand: func(context.Context, int) (string, error) { return "codex exec", nil }, ReadProcessStart: func(context.Context, int) (int64, error) { return 515100, nil }, ReadProcessBootID: func(context.Context, int) (string, error) { return "boot-test", nil }})
+			rt := newStaleReconcileRuntime(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }, ReadProcessCommand: func(context.Context, int) (string, error) { return "codex exec", nil }, ReadProcessStart: func(context.Context, int) (int64, error) { return 515100, nil }, ReadProcessBootID: func(context.Context, int) (string, error) { return "boot-test", nil }})
 			if err := rt.Start(context.Background()); err != nil {
 				t.Fatalf("Start() error = %v", err)
 			}
@@ -2440,9 +2437,6 @@ func TestRuntimeReconcileStaleRunningRunsSkipsQueueRepairAfterQuarantine(t *test
 		{name: "live", reconcile: func(rt *Runtime, ctx context.Context) (StaleRunReconcileSummary, error) {
 			return rt.reconcileLiveStaleRunningRuns(ctx)
 		}},
-		{name: "manual", reconcile: func(rt *Runtime, ctx context.Context) (StaleRunReconcileSummary, error) {
-			return rt.ReconcileStaleRunningRuns(ctx)
-		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			workingDir := t.TempDir()
@@ -2459,7 +2453,7 @@ func TestRuntimeReconcileStaleRunningRunsSkipsQueueRepairAfterQuarantine(t *test
 			// PID gone: empty process command probes as dead (not uncertain).
 			deadPID := int64(6161)
 
-			rt := newManualReconcileRuntime(Options{
+			rt := newStaleReconcileRuntime(Options{
 				Config:             cfg,
 				Logger:             &testLogger{},
 				Now:                func() time.Time { return now },
@@ -2572,9 +2566,6 @@ func TestRuntimeReconcileStaleRunningRunsKeepsSupersededRunWithVerifiedLiveExecu
 		{name: "live", reconcile: func(rt *Runtime, ctx context.Context) (StaleRunReconcileSummary, error) {
 			return rt.reconcileLiveStaleRunningRuns(ctx)
 		}},
-		{name: "manual", reconcile: func(rt *Runtime, ctx context.Context) (StaleRunReconcileSummary, error) {
-			return rt.ReconcileStaleRunningRuns(ctx)
-		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			workingDir := t.TempDir()
@@ -2591,7 +2582,7 @@ func TestRuntimeReconcileStaleRunningRunsKeepsSupersededRunWithVerifiedLiveExecu
 			completedISO := formatJavaScriptISOString(now.Add(-10 * time.Minute))
 			pid := int64(5252)
 
-			rt := newManualReconcileRuntime(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }, ReadProcessCommand: func(context.Context, int) (string, error) { return "codex exec", nil }, ReadProcessStart: func(context.Context, int) (int64, error) { return 525200, nil }, ReadProcessBootID: func(context.Context, int) (string, error) { return "boot-test", nil }})
+			rt := newStaleReconcileRuntime(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }, ReadProcessCommand: func(context.Context, int) (string, error) { return "codex exec", nil }, ReadProcessStart: func(context.Context, int) (int64, error) { return 525200, nil }, ReadProcessBootID: func(context.Context, int) (string, error) { return "boot-test", nil }})
 			if err := rt.Start(context.Background()); err != nil {
 				t.Fatalf("Start() error = %v", err)
 			}
@@ -2646,7 +2637,7 @@ func TestRepairStaleRunQueueStateDoesNotRequeueLoopWhileNewerRunIsLive(t *testin
 	nowISO := formatJavaScriptISOString(now)
 	oldISO := formatJavaScriptISOString(now.Add(-2 * time.Hour))
 
-	rt := newManualReconcileRuntime(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }})
+	rt := newStaleReconcileRuntime(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }})
 	if err := rt.Start(context.Background()); err != nil {
 		t.Fatalf("Start() error = %v", err)
 	}
@@ -2710,7 +2701,7 @@ func TestRuntimeReconcileStaleRunningRunsWithMultipleActiveExecutions(t *testing
 		livePID := int64(5353)
 		deadPID := int64(5354)
 
-		rt := newManualReconcileRuntime(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }, ReadProcessCommand: func(_ context.Context, pid int) (string, error) {
+		rt := newStaleReconcileRuntime(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }, ReadProcessCommand: func(_ context.Context, pid int) (string, error) {
 			switch pid {
 			case int(livePID):
 				return "codex exec", nil
@@ -2743,9 +2734,9 @@ func TestRuntimeReconcileStaleRunningRunsWithMultipleActiveExecutions(t *testing
 			}
 		}
 
-		summary, err := rt.ReconcileStaleRunningRuns(context.Background())
+		summary, err := rt.reconcileLiveStaleRunningRuns(context.Background())
 		if err != nil {
-			t.Fatalf("ReconcileStaleRunningRuns() error = %v", err)
+			t.Fatalf("reconcileLiveStaleRunningRuns() error = %v", err)
 		}
 		if summary.CandidateRuns != 0 || summary.InterruptedRuns != 0 || summary.SkippedUncertainRuns != 0 {
 			t.Fatalf("summary = %#v, want live execution to keep run active", summary)
@@ -2767,7 +2758,7 @@ func TestRuntimeReconcileStaleRunningRunsWithMultipleActiveExecutions(t *testing
 		ambiguousPID := int64(5453)
 		deadPID := int64(5454)
 
-		rt := newManualReconcileRuntime(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }, ReadProcessCommand: func(_ context.Context, pid int) (string, error) {
+		rt := newStaleReconcileRuntime(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }, ReadProcessCommand: func(_ context.Context, pid int) (string, error) {
 			switch pid {
 			case int(ambiguousPID):
 				return "python unrelated.py", nil
@@ -2800,9 +2791,9 @@ func TestRuntimeReconcileStaleRunningRunsWithMultipleActiveExecutions(t *testing
 			}
 		}
 
-		summary, err := rt.ReconcileStaleRunningRuns(context.Background())
+		summary, err := rt.reconcileLiveStaleRunningRuns(context.Background())
 		if err != nil {
-			t.Fatalf("ReconcileStaleRunningRuns() error = %v", err)
+			t.Fatalf("reconcileLiveStaleRunningRuns() error = %v", err)
 		}
 		if summary.CandidateRuns != 1 || summary.SkippedUncertainRuns != 1 || summary.InterruptedRuns != 0 {
 			t.Fatalf("summary = %#v, want uncertain candidate preserved", summary)
@@ -2825,7 +2816,7 @@ func TestRuntimeReconcileStaleRunningRunsCancelsDuplicateActiveQueueItems(t *tes
 	nowISO := formatJavaScriptISOString(now)
 	oldISO := formatJavaScriptISOString(now.Add(-2 * time.Hour))
 
-	rt := newManualReconcileRuntime(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }})
+	rt := newStaleReconcileRuntime(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }})
 	if err := rt.Start(context.Background()); err != nil {
 		t.Fatalf("Start() error = %v", err)
 	}
@@ -2850,9 +2841,9 @@ func TestRuntimeReconcileStaleRunningRunsCancelsDuplicateActiveQueueItems(t *tes
 		}
 	}
 
-	summary, err := rt.ReconcileStaleRunningRuns(context.Background())
+	summary, err := rt.reconcileLiveStaleRunningRuns(context.Background())
 	if err != nil {
-		t.Fatalf("ReconcileStaleRunningRuns() error = %v", err)
+		t.Fatalf("reconcileLiveStaleRunningRuns() error = %v", err)
 	}
 	if summary.InterruptedRuns != 1 || summary.LoopsRequeued != 1 {
 		t.Fatalf("summary = %#v, want stale run reconciled", summary)
@@ -2876,9 +2867,6 @@ func TestRuntimeReconcileStaleRunningRunsIsIdempotent(t *testing.T) {
 		{name: "live", reconcile: func(rt *Runtime, ctx context.Context) (StaleRunReconcileSummary, error) {
 			return rt.reconcileLiveStaleRunningRuns(ctx)
 		}},
-		{name: "manual", reconcile: func(rt *Runtime, ctx context.Context) (StaleRunReconcileSummary, error) {
-			return rt.ReconcileStaleRunningRuns(ctx)
-		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			workingDir := t.TempDir()
@@ -2893,7 +2881,7 @@ func TestRuntimeReconcileStaleRunningRunsIsIdempotent(t *testing.T) {
 			nowISO := formatJavaScriptISOString(now)
 			oldISO := formatJavaScriptISOString(now.Add(-2 * time.Hour))
 
-			rt := newManualReconcileRuntime(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }})
+			rt := newStaleReconcileRuntime(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }})
 			if err := rt.Start(context.Background()); err != nil {
 				t.Fatalf("Start() error = %v", err)
 			}
@@ -2947,7 +2935,7 @@ func TestRuntimeReconcileStaleRunningRunsDedupesUncertainIdentityEvents(t *testi
 	oldISO := formatJavaScriptISOString(now.Add(-2 * time.Hour))
 	ambiguousPID := int64(5651)
 
-	rt := newManualReconcileRuntime(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }, ReadProcessCommand: func(context.Context, int) (string, error) { return "python unrelated.py", nil }})
+	rt := newStaleReconcileRuntime(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }, ReadProcessCommand: func(context.Context, int) (string, error) { return "python unrelated.py", nil }})
 	if err := rt.Start(context.Background()); err != nil {
 		t.Fatalf("Start() error = %v", err)
 	}
@@ -3023,7 +3011,7 @@ func TestRuntimeReconcileStaleRunningRunsRepairsInterruptedLoopQueueOnLaterPass(
 	nowISO := formatJavaScriptISOString(now)
 	oldISO := formatJavaScriptISOString(now.Add(-2 * time.Hour))
 
-	rt := newManualReconcileRuntime(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }})
+	rt := newStaleReconcileRuntime(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }})
 	if err := rt.Start(context.Background()); err != nil {
 		t.Fatalf("Start() error = %v", err)
 	}
@@ -3047,9 +3035,9 @@ func TestRuntimeReconcileStaleRunningRunsRepairsInterruptedLoopQueueOnLaterPass(
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
 
-	summary, err := rt.ReconcileStaleRunningRuns(context.Background())
+	summary, err := rt.reconcileLiveStaleRunningRuns(context.Background())
 	if err != nil {
-		t.Fatalf("ReconcileStaleRunningRuns() error = %v", err)
+		t.Fatalf("reconcileLiveStaleRunningRuns() error = %v", err)
 	}
 	if summary.LoopsRequeued != 1 || summary.QueueItemsRequeued != 1 {
 		t.Fatalf("summary = %#v, want later pass to repair interrupted loop queue", summary)
@@ -3079,7 +3067,7 @@ func TestRuntimeReconcileStaleRunningRunsRecreatesQueuedItemForInterruptedQueued
 	nowISO := formatJavaScriptISOString(now)
 	oldISO := formatJavaScriptISOString(now.Add(-2 * time.Hour))
 
-	rt := newManualReconcileRuntime(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }})
+	rt := newStaleReconcileRuntime(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }})
 	if err := rt.Start(context.Background()); err != nil {
 		t.Fatalf("Start() error = %v", err)
 	}
@@ -3099,9 +3087,9 @@ func TestRuntimeReconcileStaleRunningRunsRecreatesQueuedItemForInterruptedQueued
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
 
-	summary, err := rt.ReconcileStaleRunningRuns(context.Background())
+	summary, err := rt.reconcileLiveStaleRunningRuns(context.Background())
 	if err != nil {
-		t.Fatalf("ReconcileStaleRunningRuns() error = %v", err)
+		t.Fatalf("reconcileLiveStaleRunningRuns() error = %v", err)
 	}
 	if summary.LoopsRequeued != 1 || summary.QueueItemsRequeued != 1 {
 		t.Fatalf("summary = %#v, want one queued item recreated", summary)

@@ -33,7 +33,6 @@ import (
 	"github.com/nexu-io/looper/internal/loops"
 	networkclient "github.com/nexu-io/looper/internal/network/client"
 	"github.com/nexu-io/looper/internal/projects"
-	"github.com/nexu-io/looper/internal/reviewer"
 	looperdruntime "github.com/nexu-io/looper/internal/runtime"
 	"github.com/nexu-io/looper/internal/storage"
 	"github.com/nexu-io/looper/internal/triager"
@@ -101,7 +100,6 @@ type Context struct {
 	// holds the image it is running. Optional: when nil, /status reports the
 	// binary identity as unknown rather than as unchanged.
 	DaemonBinaryStatus func() daemonbinary.Status
-	ReconcileStaleRuns func(context.Context) (looperdruntime.StaleRunReconcileSummary, error)
 	StopLoop           func(context.Context, string, string) (any, error)
 	CloseLoop          func(context.Context, string, string) (any, error)
 	StopAll            func(context.Context, string) (any, error)
@@ -109,7 +107,6 @@ type Context struct {
 	// in-flight run (session id preserved on disk) and transitions the loop to
 	// human_takeover, returning what a human needs to resume the exact session.
 	TakeoverLoop         func(context.Context, string, string) (TakeoverResult, error)
-	RepairReviewer       func(context.Context, reviewer.RepairInput) (reviewer.RepairResult, error)
 	TriggerSchedulerTick func()
 	// LookupPullRequest reads a pull request straight from the forge for the
 	// paths that must accept a pull request Looper has never snapshotted. Optional:
@@ -438,19 +435,6 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request) {
 
 		h.writeSuccess(w, requestID, payload)
 		return
-	case apiBasePath + "/runs/reconcile-stale":
-		payload, err := h.buildReconcileStaleRunsResponse(r)
-		if err != nil {
-			var typed apiError
-			if !asAPIError(err, &typed) {
-				typed = internalServerError(err)
-			}
-			h.writeError(w, requestID, typed)
-			return
-		}
-
-		h.writeSuccess(w, requestID, payload)
-		return
 	case apiBasePath + "/runs/active":
 		payload, err := h.buildActiveRunsResponse(r)
 		if err != nil {
@@ -462,18 +446,6 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		h.writeSuccess(w, requestID, payload)
-		return
-	case apiBasePath + "/reviewer/repair":
-		payload, err := h.buildReviewerRepairRouteResponse(r)
-		if err != nil {
-			var typed apiError
-			if !asAPIError(err, &typed) {
-				typed = internalServerError(err)
-			}
-			h.writeError(w, requestID, typed)
-			return
-		}
 		h.writeSuccess(w, requestID, payload)
 		return
 	}
@@ -2333,23 +2305,6 @@ func (h *Handler) buildRunsRouteResponse(r *http.Request) (runsListResponse, err
 	}
 
 	return runsListResponse{Items: items}, nil
-}
-
-func (h *Handler) buildReconcileStaleRunsResponse(r *http.Request) (looperdruntime.StaleRunReconcileSummary, error) {
-	if r.Method != http.MethodPost {
-		return looperdruntime.StaleRunReconcileSummary{}, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: fmt.Sprintf("Unsupported method for %s", apiBasePath+"/runs/reconcile-stale")}
-	}
-	if h.context.ReconcileStaleRuns == nil {
-		return looperdruntime.StaleRunReconcileSummary{}, apiError{code: pkgapi.ErrorCodeRuntimeControlUnavailable, status: http.StatusNotImplemented, message: "Runtime control is not available in this process"}
-	}
-	summary, err := h.context.ReconcileStaleRuns(r.Context())
-	if err != nil {
-		return looperdruntime.StaleRunReconcileSummary{}, err
-	}
-	if h.context.TriggerSchedulerTick != nil && summary.LoopsRequeued > 0 {
-		h.context.TriggerSchedulerTick()
-	}
-	return summary, nil
 }
 
 func (h *Handler) buildEventsRouteResponse(r *http.Request) (eventsListResponse, error) {
@@ -5680,7 +5635,7 @@ func (h *Handler) handbackLoop(ctx context.Context, r *http.Request, loopID stri
 			}
 			loop.MetadataJSON = &meta
 			loop.UpdatedAt = nowISO
-			if err := repos.Loops.Upsert(ctx, *loop); err != nil {
+			if err := repos.Loops.UpsertChangingHumanHold(ctx, *loop); err != nil {
 				return struct{}{}, err
 			}
 		}
@@ -6280,7 +6235,11 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string,
 		}
 
 		updated := queueLoop
-		if err := repos.Loops.Upsert(ctx, updated); err != nil {
+		writeLoop := repos.Loops.Upsert
+		if loop.Status == string(domain.LoopStatusHumanTakeover) {
+			writeLoop = repos.Loops.UpsertChangingHumanHold
+		}
+		if err := writeLoop(ctx, updated); err != nil {
 			return retryResult{}, err
 		}
 		persisted, _, err := repos.Queue.UpsertActiveByDedupeOrGetExisting(ctx, queueRecord)

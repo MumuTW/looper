@@ -35,7 +35,6 @@ func TestNonMutatingHTTPCoverageUnderStartingAndDegraded(t *testing.T) {
 		{method: http.MethodPost, path: "/api/v1/workers", body: `{}`},
 		{method: http.MethodPost, path: "/api/v1/planners", body: `{}`},
 		{method: http.MethodPatch, path: "/api/v1/config", body: `{"revision":"x","set":{},"unset":[]}`},
-		{method: http.MethodPost, path: "/api/v1/runs/reconcile-stale", body: `{}`},
 		{method: http.MethodPost, path: "/webhook/forward", body: `{}`},
 		{method: http.MethodDelete, path: "/api/v1/projects/some-id", body: ``},
 	}
