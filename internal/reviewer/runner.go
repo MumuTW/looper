@@ -4115,25 +4115,21 @@ func (r *Runner) recoverFailedReviewerLoop(ctx context.Context, loop storage.Loo
 		r.appendEvent(ctx, eventInput{eventType: "reviewer.auto_recovery.skipped", projectID: loop.ProjectID, loopID: loop.ID, entityType: "loop", entityID: loop.ID, payload: map[string]any{"reason": reason}})
 		return nil, nil
 	}
+	if r.db == nil {
+		return nil, fmt.Errorf("reviewer runner database is not configured")
+	}
 	nowISO := r.nowISO()
-	latestQueue, err := r.repos.Queue.GetByID(ctx, queueID)
-	if err != nil {
-		return nil, err
-	}
-	requeued, err := r.requeueFailedReviewerQueueItem(ctx, loop.ID, queueID, nowISO, latestQueue, reason)
-	if err != nil {
-		return nil, err
-	}
-	if requeued == 0 {
-		active, activeErr := r.repos.Queue.FindActiveByLoopID(ctx, loop.ID)
-		if activeErr != nil {
-			return nil, activeErr
+	updated, err := storage.WithTransactionValue(ctx, r.db, nil, func(tx *sql.Tx) (*storage.LoopRecord, error) {
+		repos := storage.NewRepositories(tx)
+		current, err := repos.Loops.GetByID(ctx, loop.ID)
+		if err != nil {
+			return nil, err
 		}
-		if active == nil {
-			return nil, fmt.Errorf("reviewer auto-recovery did not requeue failed queue item %s for loop %s", queueID, loop.ID)
+		if current == nil || current.Status != "failed" {
+			return nil, nil
 		}
-	}
-	updated, err := r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
+
+		updated := *current
 		updated.Status = "queued"
 		updated.NextRunAt = stringPtr(nowISO)
 		meta := parseJSONObject(updated.MetadataJSON)
@@ -4149,20 +4145,54 @@ func (r *Runner) recoverFailedReviewerLoop(ctx context.Context, loop storage.Loo
 			text := string(encoded)
 			updated.MetadataJSON = &text
 		}
+		// Check before mutating the failed queue item. The same immediate
+		// transaction then publishes the loop, so an occupied source issue is a
+		// skipped recovery candidate rather than an escaped active queue item.
+		if err := repos.Loops.AssertIssueClaimAdmission(ctx, updated, false); err != nil {
+			return nil, err
+		}
+
+		latestQueue, err := repos.Queue.GetByID(ctx, queueID)
+		if err != nil {
+			return nil, err
+		}
+		var requeued int64
+		if latestQueue != nil && (isRetryableTransientWithRemainingAttempts(*latestQueue) || reason == "enhanced_transient_match_attempts_remaining") {
+			requeued, err = repos.Queue.RequeueFailedByIDWithAttempts(ctx, updated.ID, queueID, nowISO, latestQueue.Attempts)
+		} else {
+			requeued, err = repos.Queue.RequeueFailedByID(ctx, updated.ID, queueID, nowISO)
+		}
+		if err != nil {
+			return nil, err
+		}
+		if requeued == 0 {
+			active, activeErr := repos.Queue.FindActiveByLoopID(ctx, updated.ID)
+			if activeErr != nil {
+				return nil, activeErr
+			}
+			if active == nil {
+				return nil, fmt.Errorf("reviewer auto-recovery did not requeue failed queue item %s for loop %s", queueID, updated.ID)
+			}
+		}
+		if err := repos.Loops.Upsert(ctx, updated); err != nil {
+			return nil, err
+		}
+		return &updated, nil
 	})
 	if err != nil {
+		if _, occupied := storage.IsIssueClaimConflictError(err); occupied {
+			r.logInfo("reviewer auto-recovery skipped", map[string]any{"loopId": loop.ID, "reason": "source_issue_occupied"})
+			r.appendEvent(ctx, eventInput{eventType: "reviewer.auto_recovery.skipped", projectID: loop.ProjectID, loopID: loop.ID, entityType: "loop", entityID: loop.ID, payload: map[string]any{"reason": "source_issue_occupied"}})
+			return nil, nil
+		}
 		return nil, err
+	}
+	if updated == nil {
+		return nil, nil
 	}
 	r.logInfo("reviewer auto-recovered failed loop", map[string]any{"loopId": loop.ID, "reason": reason})
 	r.appendEvent(ctx, eventInput{eventType: "reviewer.auto_recovery.requeued", projectID: loop.ProjectID, loopID: loop.ID, entityType: "loop", entityID: loop.ID, payload: map[string]any{"reason": reason, "attempt": intFromAny(reviewerLoopMetadata(parseJSONObject(updated.MetadataJSON))["autoRecoveryAttempts"])}})
-	return &updated, nil
-}
-
-func (r *Runner) requeueFailedReviewerQueueItem(ctx context.Context, loopID, queueID, queuedAt string, queue *storage.QueueItemRecord, reason string) (int64, error) {
-	if queue != nil && (isRetryableTransientWithRemainingAttempts(*queue) || reason == "enhanced_transient_match_attempts_remaining") {
-		return r.repos.Queue.RequeueFailedByIDWithAttempts(ctx, loopID, queueID, queuedAt, queue.Attempts)
-	}
-	return r.repos.Queue.RequeueFailedByID(ctx, loopID, queueID, queuedAt)
+	return updated, nil
 }
 
 func (r *Runner) failedReviewerLoopRecoveryEligibility(ctx context.Context, loop storage.LoopRecord, pr PullRequestSummary) (bool, string, string, error) {

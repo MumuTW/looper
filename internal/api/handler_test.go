@@ -3848,6 +3848,43 @@ func TestHandlerLoopStartRejectsConflictingActiveLoop(t *testing.T) {
 	}
 }
 
+func TestHandlerLoopStartMapsSourceIssueClaimConflict(t *testing.T) {
+	fixture := newTestFixture(t)
+	services := fixture.runtime.Services()
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+	projectID := "project_source_issue_reactivation"
+	repo := "acme/looper"
+	prNumber := int64(77)
+	prTarget := "pr:acme/looper:77"
+	issueTarget := "issue:acme/looper:19"
+	sourceMetadata := `{"worker":{"repo":"acme/looper","issueNumber":19}}`
+	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Looper", RepoPath: t.TempDir(), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("seed project: %v", err)
+	}
+	for _, loop := range []storage.LoopRecord{
+		{ID: "source_worker", Seq: 1, ProjectID: projectID, Type: "worker", TargetType: "pull_request", TargetID: &prTarget, Repo: &repo, PRNumber: &prNumber, Status: "completed", MetadataJSON: &sourceMetadata, CreatedAt: nowISO, UpdatedAt: nowISO},
+		{ID: "paused_reviewer", Seq: 2, ProjectID: projectID, Type: "reviewer", TargetType: "pull_request", TargetID: &prTarget, Repo: &repo, PRNumber: &prNumber, Status: "interrupted", CreatedAt: nowISO, UpdatedAt: nowISO},
+		{ID: "active_issue_worker", Seq: 3, ProjectID: projectID, Type: "worker", TargetType: "issue", TargetID: &issueTarget, Repo: &repo, Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO},
+	} {
+		if err := services.Repositories.Loops.Upsert(context.Background(), loop); err != nil {
+			t.Fatalf("seed %s: %v", loop.ID, err)
+		}
+	}
+	h := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now.Add(time.Minute) }})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/paused_reviewer/start", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409; body=%s", rec.Code, rec.Body.String())
+	}
+	errBody := parseJSONMap(t, rec.Body.Bytes())["error"].(map[string]any)
+	assertEqual(t, errBody["code"], "LOOP_CONFLICT")
+	paused, err := services.Repositories.Loops.GetByID(context.Background(), "paused_reviewer")
+	if err != nil || paused == nil || paused.Status != "interrupted" {
+		t.Fatalf("reviewer after rejected start = %#v, %v; want interrupted", paused, err)
+	}
+}
+
 func TestHandlerWorkerRouteErrorsMatchArtifactCases(t *testing.T) {
 	fixture := newTestFixture(t)
 	seedLoopRouteData(t, fixture.runtime)
@@ -4478,6 +4515,75 @@ func TestHandlerCreateManualHoldValidationSkipsWhenRepoPathOrGHPathMissing(t *te
 				t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
 			}
 		})
+	}
+}
+
+func TestHandlerCreateManualHoldValidationUsesInjectedRefresherWithoutLocalPrerequisites(t *testing.T) {
+	fixture := newTestFixture(t)
+	seedWorkerPlannerArtifactsData(t, fixture.runtime, fixture.now)
+	metadata := `{"repo":"acme/looper"}`
+	missingRepoPath := filepath.Join(t.TempDir(), "missing")
+	if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: missingRepoPath, MetadataJSON: &metadata, CreatedAt: fixture.now.UTC().Format(javaScriptISOString), UpdatedAt: fixture.now.UTC().Format(javaScriptISOString)}); err != nil {
+		t.Fatalf("seed project: %v", err)
+	}
+	fixture.config.Tools.GHPath = nil
+	refreshCalls := 0
+	h := NewHandler(Context{
+		Config:  fixture.config,
+		Runtime: runtimeWithConfig(fixture.runtime, fixture.config),
+		Now:     func() time.Time { return fixture.now.Add(time.Minute) },
+		RefreshTargetLabels: func(_ context.Context, target domain.LoopTarget, cwd string) ([]string, error) {
+			refreshCalls++
+			if target.TargetType != domain.LoopTargetTypePullRequest || target.Repo != "acme/looper" || target.PRNumber != 42 || cwd != missingRepoPath {
+				t.Fatalf("refresh target = %#v cwd=%q, want PR target and injected project path", target, cwd)
+			}
+			return []string{labels.HoldReviewer}, nil
+		},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops", bytes.NewReader([]byte(`{"projectId":"project_1","type":"reviewer","targetType":"pull_request","repo":"acme/looper","prNumber":42}`)))
+	req.Header.Set("content-type", "application/json")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+	if refreshCalls != 1 {
+		t.Fatalf("refresh calls = %d, want 1", refreshCalls)
+	}
+}
+
+func TestHandlerCreateLoopForcedIssueWorkerPersistsClaimOverride(t *testing.T) {
+	fixture := newTestFixture(t)
+	seedWorkerPlannerArtifactsData(t, fixture.runtime, fixture.now)
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+	prNumber := int64(177)
+	prTarget := "pr:acme/looper:177"
+	claimMetadata := `{"worker":{"repo":"acme/looper","issueNumber":77}}`
+	if err := fixture.runtime.Services().Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_fixer_claim", Seq: 177, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &prTarget, Repo: stringPtr("acme/looper"), PRNumber: &prNumber, Status: "queued", MetadataJSON: &claimMetadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("seed conflicting fixer: %v", err)
+	}
+	h := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now.Add(time.Minute) }})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops", bytes.NewReader([]byte(`{"projectId":"project_1","type":"worker","targetType":"issue","repo":"acme/looper","issueNumber":77,"force":true,"metadata":{"worker":{"title":"Implement","prompt":"Do the thing","baseBranch":"main"}}}`)))
+	req.Header.Set("content-type", "application/json")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	loopID := parseJSONMap(t, rec.Body.Bytes())["data"].(map[string]any)["id"].(string)
+	loop, err := fixture.runtime.Services().Repositories.Loops.GetByID(context.Background(), loopID)
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want forced worker", loop, err)
+	}
+	if !storage.LoopForcesIssueClaimAdmission(*loop) {
+		t.Fatalf("forced generic worker loop = %#v, want durable claim override", loop)
+	}
+	queue, err := fixture.runtime.Services().Repositories.Queue.FindActiveByLoopID(context.Background(), loopID)
+	if err != nil || queue == nil {
+		t.Fatalf("Queue.FindActiveByLoopID() = (%#v, %v), want worker queue", queue, err)
+	}
+	if payload := parseJSONObject(queue.PayloadJSON); payload["issueClaimOverride"] != true || payload["issueNumber"] != float64(77) {
+		t.Fatalf("forced generic worker queue payload = %#v, want retained override and source issue", payload)
 	}
 }
 

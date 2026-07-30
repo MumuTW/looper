@@ -199,6 +199,83 @@ func TestLoopUpsertGuardsReactivationAndRetargetedWorkerIssueClaims(t *testing.T
 			t.Fatalf("new issue worker error = %v, want retargeted worker conflict", err)
 		}
 	})
+
+	t.Run("active loop changes source issue", func(t *testing.T) {
+		coordinator := openMigratedCoordinatorForRepositories(t)
+		repos := NewRepositories(coordinator.DB())
+		ctx := context.Background()
+		startedAt := "2026-07-31T00:00:00.000Z"
+		repo := "acme/looper"
+		claimPRNumber := int64(77)
+		claimPRTarget := "pr:acme/looper:77"
+		movingIssueTarget := "issue:acme/looper:19"
+		movingPRNumber := int64(99)
+		movingPRTarget := "pr:acme/looper:99"
+		claimMetadata := `{"worker":{"repo":"acme/looper","issueNumber":20}}`
+		movingMetadata := `{"worker":{"repo":"acme/looper","issueNumber":19}}`
+		if err := repos.Projects.Upsert(ctx, ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: t.TempDir(), CreatedAt: startedAt, UpdatedAt: startedAt}); err != nil {
+			t.Fatalf("seed project: %v", err)
+		}
+		for _, record := range []LoopRecord{
+			{ID: "claim_source", Seq: 1, ProjectID: "project_1", Type: "worker", TargetType: "pull_request", TargetID: &claimPRTarget, Repo: &repo, PRNumber: &claimPRNumber, Status: "completed", MetadataJSON: &claimMetadata, CreatedAt: startedAt, UpdatedAt: startedAt},
+			{ID: "claim_fixer", Seq: 2, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &claimPRTarget, Repo: &repo, PRNumber: &claimPRNumber, Status: "queued", CreatedAt: startedAt, UpdatedAt: startedAt},
+			{ID: "moving_worker", Seq: 3, ProjectID: "project_1", Type: "worker", TargetType: "issue", TargetID: &movingIssueTarget, Repo: &repo, Status: "queued", MetadataJSON: &movingMetadata, CreatedAt: startedAt, UpdatedAt: startedAt},
+		} {
+			if err := repos.Loops.Upsert(ctx, record); err != nil {
+				t.Fatalf("seed %s: %v", record.ID, err)
+			}
+		}
+
+		moving, err := repos.Loops.GetByID(ctx, "moving_worker")
+		if err != nil || moving == nil {
+			t.Fatalf("load moving worker: %v, %#v", err, moving)
+		}
+		moving.TargetType = "pull_request"
+		moving.TargetID = &movingPRTarget
+		moving.PRNumber = &movingPRNumber
+		moving.MetadataJSON = &claimMetadata
+		moving.UpdatedAt = "2026-07-31T00:01:00.000Z"
+		if err := repos.Loops.Upsert(ctx, *moving); err == nil {
+			t.Fatal("retarget active worker error = nil, want source-issue conflict")
+		} else if conflict, ok := IsIssueClaimConflictError(err); !ok || conflict.LoopID != "claim_fixer" {
+			t.Fatalf("retarget active worker error = %v, want claim_fixer conflict", err)
+		}
+		persisted, err := repos.Loops.GetByID(ctx, "moving_worker")
+		if err != nil || persisted == nil || persisted.TargetType != "issue" || loopString(persisted.TargetID) != movingIssueTarget {
+			t.Fatalf("moving worker after rejected retarget = %#v, %v; want original issue target", persisted, err)
+		}
+	})
+
+	t.Run("forced worker authorizes PR descendants", func(t *testing.T) {
+		coordinator := openMigratedCoordinatorForRepositories(t)
+		repos := NewRepositories(coordinator.DB())
+		ctx := context.Background()
+		startedAt := "2026-07-31T00:00:00.000Z"
+		repo := "acme/looper"
+		firstPRNumber := int64(77)
+		firstPRTarget := "pr:acme/looper:77"
+		secondPRNumber := int64(78)
+		secondPRTarget := "pr:acme/looper:78"
+		claimMetadata := `{"worker":{"repo":"acme/looper","issueNumber":19}}`
+		forcedMetadata := `{"worker":{"repo":"acme/looper","issueNumber":19,"issueClaimOverride":true}}`
+		if err := repos.Projects.Upsert(ctx, ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: t.TempDir(), CreatedAt: startedAt, UpdatedAt: startedAt}); err != nil {
+			t.Fatalf("seed project: %v", err)
+		}
+		for _, record := range []LoopRecord{
+			{ID: "first_source", Seq: 1, ProjectID: "project_1", Type: "worker", TargetType: "pull_request", TargetID: &firstPRTarget, Repo: &repo, PRNumber: &firstPRNumber, Status: "completed", MetadataJSON: &claimMetadata, CreatedAt: startedAt, UpdatedAt: startedAt},
+			{ID: "first_fixer", Seq: 2, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &firstPRTarget, Repo: &repo, PRNumber: &firstPRNumber, Status: "queued", CreatedAt: startedAt, UpdatedAt: startedAt},
+		} {
+			if err := repos.Loops.Upsert(ctx, record); err != nil {
+				t.Fatalf("seed %s: %v", record.ID, err)
+			}
+		}
+		if err := repos.Loops.UpsertForcingIssueClaimAdmission(ctx, LoopRecord{ID: "forced_source", Seq: 3, ProjectID: "project_1", Type: "worker", TargetType: "pull_request", TargetID: &secondPRTarget, Repo: &repo, PRNumber: &secondPRNumber, Status: "queued", MetadataJSON: &forcedMetadata, CreatedAt: startedAt, UpdatedAt: startedAt}); err != nil {
+			t.Fatalf("seed forced source worker: %v", err)
+		}
+		if err := repos.Loops.Upsert(ctx, LoopRecord{ID: "forced_reviewer", Seq: 4, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", TargetID: &secondPRTarget, Repo: &repo, PRNumber: &secondPRNumber, Status: "queued", CreatedAt: startedAt, UpdatedAt: startedAt}); err != nil {
+			t.Fatalf("publish forced worker descendant: %v", err)
+		}
+	})
 }
 
 func TestAgentExecutionTerminalObservationCannotRegressToActive(t *testing.T) {

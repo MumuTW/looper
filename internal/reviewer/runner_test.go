@@ -1013,6 +1013,47 @@ func TestReviewerFailedLoopRecoveryUsesProjectRetryOverride(t *testing.T) {
 	}
 }
 
+func TestReviewerFailedLoopRecoverySkipsOccupiedSourceIssueAtomically(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	loopID, queueID := seedFailedReviewerRecoveryLoop(t, fixture, failedReviewerRecoverySeed{
+		ResumePolicy:   "restart_from_discover",
+		QueueErrorKind: string(FailureRetryableAfterResume),
+		ErrorMessage:   "PR head changed before publish: expected old, got new",
+	})
+	repo := "acme/looper"
+	prNumber := int64(42)
+	prTarget := "pr:acme/looper:42"
+	issueTarget := "issue:acme/looper:77"
+	sourceMetadata := `{"worker":{"repo":"acme/looper","issueNumber":77}}`
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "source_worker", Seq: 166, ProjectID: "project_1", Type: "worker", TargetType: "pull_request", TargetID: &prTarget, Repo: &repo, PRNumber: &prNumber, Status: "completed", MetadataJSON: &sourceMetadata, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("seed source worker: %v", err)
+	}
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "active_issue_worker", Seq: 167, ProjectID: "project_1", Type: "worker", TargetType: "issue", TargetID: &issueTarget, Repo: &repo, Status: "queued", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("seed active issue worker: %v", err)
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, LoopConfig: config.ReviewerLoopConfig{EnabledByDefault: true, QuietPeriodSeconds: 120, MaxIterationsPerPR: 20, MaxIterationsPerHead: 1, MaxWallClockSeconds: 14400, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25}})
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), loopID)
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want failed reviewer", loop, err)
+	}
+	recovered, err := runner.recoverFailedReviewerLoop(context.Background(), *loop, PullRequestSummary{Number: 42, State: "OPEN"})
+	if err != nil {
+		t.Fatalf("recoverFailedReviewerLoop() error = %v, want occupied candidate skipped", err)
+	}
+	if recovered != nil {
+		t.Fatalf("recoverFailedReviewerLoop() = %#v, want no recovery", recovered)
+	}
+	persistedLoop, err := fixture.repos.Loops.GetByID(context.Background(), loopID)
+	if err != nil || persistedLoop == nil || persistedLoop.Status != "failed" {
+		t.Fatalf("reviewer after occupied recovery = %#v, %v; want failed", persistedLoop, err)
+	}
+	persistedQueue, err := fixture.repos.Queue.GetByID(context.Background(), queueID)
+	if err != nil || persistedQueue == nil || persistedQueue.Status != "failed" {
+		t.Fatalf("queue after occupied recovery = %#v, %v; want failed", persistedQueue, err)
+	}
+}
+
 func TestReviewerFailedLoopRecoveryEligibilityHonorsStopOnConfig(t *testing.T) {
 	t.Parallel()
 	tests := []struct {

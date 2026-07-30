@@ -680,9 +680,10 @@ func (r *LoopsRepository) UpsertForcingIssueClaimAdmission(ctx context.Context, 
 }
 
 // upsertWithIssueClaimAdmission makes source-issue admission part of loop
-// publication itself. Any inactive-to-conflicting-active transition is checked
-// in the same SQLite transaction as its write, covering create, rediscovery,
-// recovery, and resume without relying on individual callers to remember it.
+// publication itself. Any new or changed conflicting-active source issue claim
+// is checked in the same SQLite transaction as its write, covering create,
+// rediscovery, recovery, resume, and retargeting without relying on individual
+// callers to remember it.
 func (r *LoopsRepository) upsertWithIssueClaimAdmission(ctx context.Context, record LoopRecord, changeHumanHold, forceIssueClaim bool) error {
 	if db, ok := r.q.(txBeginner); ok {
 		return WithTransaction(ctx, db, nil, func(tx *sql.Tx) error {
@@ -693,7 +694,15 @@ func (r *LoopsRepository) upsertWithIssueClaimAdmission(ctx context.Context, rec
 	if err != nil {
 		return err
 	}
-	if !forceIssueClaim && !LoopForcesIssueClaimAdmission(record) && issueClaimAdmissionRequired(current, record) {
+	requiresAdmission, err := r.issueClaimAdmissionRequired(ctx, current, record)
+	if err != nil {
+		return err
+	}
+	forced, err := r.issueClaimAdmissionIsForced(ctx, record)
+	if err != nil {
+		return err
+	}
+	if !forceIssueClaim && !forced && requiresAdmission {
 		if err := r.AssertIssueClaimAdmission(ctx, record, false); err != nil {
 			return err
 		}
@@ -717,9 +726,48 @@ func LoopForcesIssueClaimAdmission(record LoopRecord) bool {
 	return json.Unmarshal([]byte(*record.MetadataJSON), &metadata) == nil && metadata.Worker.IssueClaimOverride
 }
 
-func issueClaimAdmissionRequired(current *LoopRecord, candidate LoopRecord) bool {
-	return domain.IsConflictingActiveLoopStatus(domain.LoopStatus(candidate.Status)) &&
-		(current == nil || !domain.IsConflictingActiveLoopStatus(domain.LoopStatus(current.Status)))
+// issueClaimAdmissionIsForced resolves the operator authority for a candidate
+// loop. A forced worker retains the override in its metadata; its reviewer and
+// fixer descendants inherit that authority through the persisted worker which
+// originated their pull request. The source worker is the authority, not the
+// descendant agent's output.
+func (r *LoopsRepository) issueClaimAdmissionIsForced(ctx context.Context, record LoopRecord) (bool, error) {
+	if LoopForcesIssueClaimAdmission(record) {
+		return true, nil
+	}
+	if record.Type != string(domain.LoopTypeFixer) && record.Type != string(domain.LoopTypeReviewer) {
+		return false, nil
+	}
+	worker, err := r.sourceWorkerForPullRequest(ctx, record)
+	if err != nil || worker == nil {
+		return false, err
+	}
+	return LoopForcesIssueClaimAdmission(*worker), nil
+}
+
+func (r *LoopsRepository) issueClaimAdmissionRequired(ctx context.Context, current *LoopRecord, candidate LoopRecord) (bool, error) {
+	if !domain.IsConflictingActiveLoopStatus(domain.LoopStatus(candidate.Status)) {
+		return false, nil
+	}
+	if current == nil || !domain.IsConflictingActiveLoopStatus(domain.LoopStatus(current.Status)) {
+		return true, nil
+	}
+
+	currentClaim, currentClaimsIssue, err := r.issueClaimForLoop(ctx, *current)
+	if err != nil {
+		return false, err
+	}
+	candidateClaim, candidateClaimsIssue, err := r.issueClaimForLoop(ctx, candidate)
+	if err != nil {
+		return false, err
+	}
+	if !candidateClaimsIssue {
+		return false, nil
+	}
+	if !currentClaimsIssue {
+		return true, nil
+	}
+	return currentClaim.issueNumber != candidateClaim.issueNumber || !strings.EqualFold(currentClaim.repo, candidateClaim.repo), nil
 }
 
 func (r *LoopsRepository) upsert(ctx context.Context, record LoopRecord, changeHumanHold bool) error {
@@ -939,6 +987,13 @@ func (r *LoopsRepository) AssertIssueClaimAdmission(ctx context.Context, candida
 	if force || !domain.IsConflictingActiveLoopStatus(domain.LoopStatus(candidate.Status)) {
 		return nil
 	}
+	forced, err := r.issueClaimAdmissionIsForced(ctx, candidate)
+	if err != nil {
+		return err
+	}
+	if forced {
+		return nil
+	}
 	claim, ok, err := r.issueClaimForLoop(ctx, candidate)
 	if err != nil || !ok {
 		return err
@@ -959,13 +1014,19 @@ func (r *LoopsRepository) AssertIssueClaimAdmission(ctx context.Context, candida
 	if err != nil {
 		return fmt.Errorf("list active source issue claims: %w", err)
 	}
-	defer rows.Close()
+	// Resolve PR descendants only after closing this cursor. Those resolutions
+	// query loops again through the same SQLite transaction, which must not run
+	// while this cursor retains the transaction connection.
+	candidates, scanErr := scanLoops(rows)
+	closeErr := rows.Close()
+	if scanErr != nil {
+		return scanErr
+	}
+	if closeErr != nil {
+		return fmt.Errorf("close active source issue claims: %w", closeErr)
+	}
 
-	for rows.Next() {
-		loop, scanErr := scanLoop(rows)
-		if scanErr != nil {
-			return scanErr
-		}
+	for _, loop := range candidates {
 		if candidate.ID != "" && loop.ID == candidate.ID {
 			continue
 		}
@@ -983,9 +1044,6 @@ func (r *LoopsRepository) AssertIssueClaimAdmission(ctx context.Context, candida
 			continue
 		}
 		return &IssueClaimConflictError{IssueNumber: claim.issueNumber, LoopID: loop.ID, LoopType: loop.Type}
-	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("iterate active source issue claims: %w", err)
 	}
 	return nil
 }
@@ -1007,37 +1065,54 @@ func (r *LoopsRepository) issueClaimForLoop(ctx context.Context, loop LoopRecord
 	}
 
 	repo := loopString(loop.Repo)
-	prNumber := loopInt64(loop.PRNumber)
-	if repo == "" || prNumber <= 0 {
+	if repo == "" || loopInt64(loop.PRNumber) <= 0 {
 		issueRepo, issueNumber, ok := workerIssueFromMetadata(loop.MetadataJSON, repo)
 		return issueClaim{repo: issueRepo, issueNumber: issueNumber}, ok, nil
 	}
-	rows, err := r.q.QueryContext(ctx, `SELECT * FROM loops
-		WHERE project_id = ? AND type = ? AND target_type = ?
-		  AND repo = ? COLLATE NOCASE AND pr_number = ?
-		ORDER BY updated_at DESC, seq DESC`, loop.ProjectID, string(domain.LoopTypeWorker), string(domain.LoopTargetTypePullRequest), repo, prNumber)
+	worker, err := r.sourceWorkerForPullRequest(ctx, loop)
 	if err != nil {
-		return issueClaim{}, false, fmt.Errorf("find source worker for pull request: %w", err)
+		return issueClaim{}, false, err
 	}
-	defer rows.Close()
-	for rows.Next() {
-		worker, scanErr := scanLoop(rows)
-		if scanErr != nil {
-			return issueClaim{}, false, scanErr
-		}
+	if worker != nil {
 		issueRepo, issueNumber, ok := workerIssueFromMetadata(worker.MetadataJSON, loopString(worker.Repo))
 		if ok {
 			return issueClaim{repo: issueRepo, issueNumber: issueNumber, sourceWorker: worker.ID}, true, nil
 		}
-	}
-	if err := rows.Err(); err != nil {
-		return issueClaim{}, false, fmt.Errorf("iterate source workers for pull request: %w", err)
 	}
 	// Legacy fixer/reviewer records kept worker metadata on the PR loop itself.
 	// Keep those records admissible without making fresh lifecycle links depend
 	// on that metadata shape.
 	issueRepo, issueNumber, ok := workerIssueFromMetadata(loop.MetadataJSON, repo)
 	return issueClaim{repo: issueRepo, issueNumber: issueNumber}, ok, nil
+}
+
+func (r *LoopsRepository) sourceWorkerForPullRequest(ctx context.Context, loop LoopRecord) (*LoopRecord, error) {
+	repo := loopString(loop.Repo)
+	prNumber := loopInt64(loop.PRNumber)
+	if loop.TargetType != string(domain.LoopTargetTypePullRequest) || repo == "" || prNumber <= 0 {
+		return nil, nil
+	}
+	rows, err := r.q.QueryContext(ctx, `SELECT * FROM loops
+		WHERE project_id = ? AND type = ? AND target_type = ?
+		  AND repo = ? COLLATE NOCASE AND pr_number = ?
+		ORDER BY updated_at DESC, seq DESC`, loop.ProjectID, string(domain.LoopTypeWorker), string(domain.LoopTargetTypePullRequest), repo, prNumber)
+	if err != nil {
+		return nil, fmt.Errorf("find source worker for pull request: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		worker, scanErr := scanLoop(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		if _, _, ok := workerIssueFromMetadata(worker.MetadataJSON, loopString(worker.Repo)); ok {
+			return &worker, nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate source workers for pull request: %w", err)
+	}
+	return nil, nil
 }
 
 func parseIssueTargetID(targetID string) (string, int64, bool) {

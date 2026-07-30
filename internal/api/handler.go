@@ -4209,6 +4209,12 @@ func (h *Handler) buildCreateLoopResponse(r *http.Request) (loopResponse, error)
 	if err != nil {
 		return loopResponse{}, err
 	}
+	if domain.LoopType(loopType) == domain.LoopTypeWorker && target.TargetType == domain.LoopTargetTypeIssue && derefBool(body.Force) {
+		metadataJSON, err = forcedIssueWorkerMetadataJSON(metadataJSON, target)
+		if err != nil {
+			return loopResponse{}, err
+		}
+	}
 	if domain.LoopType(loopType) == domain.LoopTypePlanner {
 		metadataJSON, err = manualPlannerMetadataJSON(metadataJSON, target.IssueNumber)
 		if err != nil {
@@ -4356,10 +4362,13 @@ func assertIssueClaimAdmission(ctx context.Context, repos *storage.Repositories,
 }
 
 func upsertLoopAfterIssueClaimAdmission(ctx context.Context, loops *storage.LoopsRepository, record storage.LoopRecord, force bool) error {
+	var err error
 	if force {
-		return loops.UpsertForcingIssueClaimAdmission(ctx, record)
+		err = loops.UpsertForcingIssueClaimAdmission(ctx, record)
+	} else {
+		err = loops.Upsert(ctx, record)
 	}
-	return loops.Upsert(ctx, record)
+	return mapIssueClaimAdmissionError(err)
 }
 
 func issueCollisionError(issueNumber int64, loopID, loopType string) apiError {
@@ -4369,6 +4378,13 @@ func issueCollisionError(issueNumber int64, loopID, loopType string) apiError {
 		message: fmt.Sprintf("Issue #%d is occupied by active %s loop %s", issueNumber, loopType, loopID),
 		details: map[string]any{"occupiedBy": map[string]any{"loopId": loopID, "loopType": loopType}},
 	}
+}
+
+func mapIssueClaimAdmissionError(err error) error {
+	if conflict, ok := storage.IsIssueClaimConflictError(err); ok {
+		return issueCollisionError(conflict.IssueNumber, conflict.LoopID, conflict.LoopType)
+	}
+	return err
 }
 
 func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateResponse, error) {
@@ -4753,6 +4769,7 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 			}
 			return workerCreateResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: errors.Join(err, restoreErr).Error()}
 		}
+		err = mapIssueClaimAdmissionError(err)
 		var typed apiError
 		if asAPIError(err, &typed) {
 			return workerCreateResponse{}, typed
@@ -4799,6 +4816,19 @@ func (h *Handler) validateManualHoldBypassForLoopTarget(ctx context.Context, pro
 	project, err := requireActiveProjectRecord(ctx, services.Repositories.Projects, projectID)
 	if err != nil {
 		return err
+	}
+	// An injected refresher is already the caller's explicit freshness authority;
+	// unlike the default GitHub gateway, it does not require a local checkout or
+	// a configured gh binary.
+	if h.context.RefreshTargetLabels != nil {
+		labels, refreshErr := h.refreshTargetLabels(ctx, target, project.RepoPath, "")
+		if refreshErr != nil {
+			return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("refresh target before manual loop create: %v", refreshErr)}
+		}
+		if domain.IsAutoLaneHeld(loopType, labels) {
+			return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("target is currently held for %s; rerun with --force to bypass hold", loopType)}
+		}
+		return nil
 	}
 	// Hold preflight is best-effort at create time: when we cannot reliably talk to
 	// GitHub from this handler context (missing repo path, missing gh path, etc.) we
@@ -5074,6 +5104,31 @@ func forcedManualWorkerMetadataJSONCompat(metadataJSON *string) *string {
 	}
 	text := string(encoded)
 	return &text
+}
+
+// forcedIssueWorkerMetadataJSON records the operator's explicit override in
+// the same durable worker shape consumed during PR adoption. The issue target
+// supplies the source identity even when a generic manual-loop request omitted
+// optional worker metadata.
+func forcedIssueWorkerMetadataJSON(metadataJSON *string, target domain.LoopTarget) (*string, error) {
+	metadata := parseJSONObject(metadataJSON)
+	if metadata == nil {
+		metadata = map[string]any{}
+	}
+	worker, _ := metadata["worker"].(map[string]any)
+	if worker == nil {
+		worker = map[string]any{}
+	}
+	worker["issueClaimOverride"] = true
+	worker["repo"] = target.Repo
+	worker["issueNumber"] = target.IssueNumber
+	metadata["worker"] = worker
+	encoded, err := json.Marshal(metadata)
+	if err != nil {
+		return nil, err
+	}
+	text := string(encoded)
+	return &text, nil
 }
 
 func forcedManualWorkerCheckpointJSONCompat(checkpointJSON *string) *string {
@@ -5725,6 +5780,7 @@ func (h *Handler) mutateLoopStatus(ctx context.Context, loopID string, status do
 		return updated, nil
 	})
 	if err != nil {
+		err = mapIssueClaimAdmissionError(err)
 		if restoreErr := restoreStopGate(); restoreErr != nil {
 			var typed apiError
 			if asAPIError(err, &typed) {
@@ -6442,6 +6498,7 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string,
 		return retryResult{loop: updated, queueItemID: &persisted.ID}, nil
 	})
 	if err != nil {
+		err = mapIssueClaimAdmissionError(err)
 		if restoreErr := restoreStopGate(); restoreErr != nil {
 			var typed apiError
 			if asAPIError(err, &typed) {
@@ -7363,6 +7420,9 @@ func parseIssueNumber(targetID string) (int64, error) {
 }
 
 func mapLoopCreateError(err error) error {
+	if conflict, ok := storage.IsIssueClaimConflictError(err); ok {
+		return issueCollisionError(conflict.IssueNumber, conflict.LoopID, conflict.LoopType)
+	}
 	message := err.Error()
 	switch {
 	case strings.Contains(message, "project not found:"):
