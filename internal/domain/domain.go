@@ -192,6 +192,17 @@ func IsConflictingActiveLoopStatus(status LoopStatus) bool {
 	return ok
 }
 
+// ConflictingActiveLoopStatuses returns the set of loop statuses that represent
+// an active claim on a target. Used by queries that need to find "live" loops
+// working an issue without duplicating the status vocabulary.
+func ConflictingActiveLoopStatuses() []LoopStatus {
+	statuses := make([]LoopStatus, 0, len(conflictingActiveLoopStatuses))
+	for status := range conflictingActiveLoopStatuses {
+		statuses = append(statuses, status)
+	}
+	return statuses
+}
+
 func IsTerminalRunStatus(status RunStatus) bool {
 	_, ok := terminalRunStatuses[status]
 	return ok

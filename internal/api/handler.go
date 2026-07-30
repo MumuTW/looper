@@ -4377,6 +4377,27 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 		effectiveSpecPath = planner.SpecPath
 	}
 
+	// Issue-claim collision check: if a fixer or reviewer is already working this issue,
+	// refuse the new worker with 409 naming the occupying loop (issue #319).
+	// Planner and worker loops are excluded: planner is the upstream handoff, and
+	// a second worker is already prevented by loop reuse upstream.
+	if issueNumber != nil && requestedIssueTarget != nil && !derefBool(body.Force) {
+		liveStatuses := domain.ConflictingActiveLoopStatuses()
+		liveLoops, liveErr := services.Repositories.Loops.ListLiveLoopsForIssue(r.Context(), projectID, *repo, *issueNumber, liveStatuses)
+		if liveErr != nil {
+			return workerCreateResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: liveErr.Error()}
+		}
+		for _, loop := range liveLoops {
+			if loop.Type == string(domain.LoopTypeFixer) || loop.Type == string(domain.LoopTypeReviewer) {
+				return workerCreateResponse{}, apiError{
+					code:    pkgapi.ErrorCodeLoopConflict,
+					status:  http.StatusConflict,
+					message: fmt.Sprintf("Issue %s#%d is already being worked by %s (loop %s)", *repo, *issueNumber, loop.Type, loop.ID),
+				}
+			}
+		}
+	}
+
 	title := strings.TrimSpace(derefString(body.Title))
 	if title == "" {
 		title = deriveWorkerTitle(prompt, effectiveSpecPath, repo, effectivePRNumber, issueNumber)

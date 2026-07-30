@@ -803,6 +803,44 @@ func (r *LoopsRepository) ListByRepoAndPR(ctx context.Context, repo string, prNu
 	return scanLoops(rows)
 }
 
+// ListLiveLoopsForIssue returns loops that are actively working a given issue.
+// A loop is "live" when its status is in domain.IsConflictingActiveLoopStatus.
+// The match is either a direct issue target (target_type='issue' and target_id='issue:repo:number')
+// or a worker whose metadata records the issue it was dispatched for (so retargeted workers
+// that moved onto their PR are still matched).
+func (r *LoopsRepository) ListLiveLoopsForIssue(ctx context.Context, projectID, repo string, issueNumber int64, liveStatuses []domain.LoopStatus) ([]LoopRecord, error) {
+	if len(liveStatuses) == 0 {
+		return []LoopRecord{}, nil
+	}
+	targetID := fmt.Sprintf("issue:%s:%d", repo, issueNumber)
+	statusPlaceholders := sqlPlaceholders(len(liveStatuses))
+	query := fmt.Sprintf(`
+		SELECT * FROM loops
+		WHERE project_id = ?
+		  AND status IN (%s)
+		  AND (
+		    (target_type = 'issue' AND target_id = ?)
+		    OR (type = 'worker' AND metadata_json IS NOT NULL AND (
+		      JSON_EXTRACT(metadata_json, '$.worker.issueNumber') = ?
+		      AND COALESCE(JSON_EXTRACT(metadata_json, '$.worker.issueRepo'), JSON_EXTRACT(metadata_json, '$.worker.repo'), repo) = ?
+		    ))
+		  )
+		ORDER BY updated_at DESC, seq DESC
+	`, statusPlaceholders)
+	args := make([]any, 0, len(liveStatuses)+4)
+	args = append(args, projectID)
+	for _, s := range liveStatuses {
+		args = append(args, string(s))
+	}
+	args = append(args, targetID, issueNumber, repo)
+	rows, err := r.q.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list live loops for issue: %w", err)
+	}
+	defer rows.Close()
+	return scanLoops(rows)
+}
+
 func (r *LoopsRepository) ListByStatuses(ctx context.Context, statuses []string) ([]LoopRecord, error) {
 	if len(statuses) == 0 {
 		return []LoopRecord{}, nil
