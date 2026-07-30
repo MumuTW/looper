@@ -59,7 +59,7 @@ func TestProxyArgvReachesReviewSubmit(t *testing.T) {
 		err = forge.ProxyReviewSubmit(agentReviewSubmitArgv, []byte(`{"body":"x"}`), dir)
 	})
 
-	// The child cannot publish: the snapshot has no gh binary and no Forgejo
+	// The child cannot publish: the snapshot has no gh binary and no provider
 	// provider, so it stops at gateway construction. That it got there at all is
 	// the contract — argv routed, flags parsed, snapshot loaded and validated,
 	// and the daemon-bound review-event policy accepted.

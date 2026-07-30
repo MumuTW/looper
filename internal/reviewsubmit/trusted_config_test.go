@@ -31,7 +31,7 @@ func TestTrustedReviewConfigIgnoresChildPrecedenceLayers(t *testing.T) {
 	// ordinary child env because the selected transport still needs them.
 	t.Setenv("LOOPER_TRUSTED_REVIEW_PROXY_CHILD", "1")
 	t.Setenv("LOOPER_GH_PATH", filepath.Join(t.TempDir(), "agent-env-gh"))
-	t.Setenv("FORGEJO_TOKEN", "provider-credential")
+	t.Setenv("PROVIDER_TOKEN", "provider-credential")
 	installTrustedReviewConfigFD(t, raw)
 	// The child's own CLI args must lose to the snapshot: the daemon already
 	// resolved precedence, and re-applying it here is how an agent-controlled
@@ -44,8 +44,8 @@ func TestTrustedReviewConfigIgnoresChildPrecedenceLayers(t *testing.T) {
 	if loaded.Config.Tools.GHPath == nil || *loaded.Config.Tools.GHPath != capturedGHPath {
 		t.Fatalf("loadConfig().Tools.GHPath = %v, want captured daemon CLI winner %q", loaded.Config.Tools.GHPath, capturedGHPath)
 	}
-	if got := os.Getenv("FORGEJO_TOKEN"); got != "provider-credential" {
-		t.Fatalf("FORGEJO_TOKEN after loadConfig() = %q, want provider credential preserved", got)
+	if got := os.Getenv("PROVIDER_TOKEN"); got != "provider-credential" {
+		t.Fatalf("PROVIDER_TOKEN after loadConfig() = %q, want provider credential preserved", got)
 	}
 }
 

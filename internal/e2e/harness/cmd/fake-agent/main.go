@@ -87,22 +87,6 @@ func main() {
 		printCompletion(marker, map[string]any{"outcome": "completed", "summary": "fake agent wrote file", "changedFiles": []string{path}})
 	case "success-no-diff":
 		printCompletion(marker, map[string]any{"outcome": "completed", "summary": "fake agent no diff"})
-	case "forgejo-reviewer-open":
-		printCompletion(marker, map[string]any{
-			"summary": "Found actionable Forgejo review items",
-			"outcome": "non_blocking",
-			"findings": []map[string]any{{
-				"title": "Repair sandbox target file",
-				"body":  "The sandbox target file still needs the fake-agent repair applied.",
-				"files": []string{"sandbox/forgejo-summary-protocol.txt"},
-			}},
-		})
-	case "forgejo-reviewer-clean":
-		printCompletion(marker, map[string]any{
-			"summary":  "No actionable findings remain after the Forgejo fixer round",
-			"outcome":  "clean",
-			"findings": []map[string]any{},
-		})
 	case "modify-file":
 		path := envOr(envFakeAgentModifyFile, "README.md")
 		mustAppendFile(path, []byte("modified by fake agent\n"))

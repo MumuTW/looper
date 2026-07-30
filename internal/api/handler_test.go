@@ -1241,49 +1241,6 @@ func TestHandlerStatusReportsDebtAfterStaleRunReconcile(t *testing.T) {
 	}
 }
 
-func TestHandlerStatusIncludesRedactedForgejoProviderHealth(t *testing.T) {
-	t.Setenv("FORGEJO_STATUS_TOKEN", "status-secret")
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/api/v1/version":
-			_, _ = w.Write([]byte(`{"version":"15.0.4"}`))
-		case "/swagger.v1.json":
-			_, _ = w.Write([]byte(`{"paths":{"/repos/{owner}/{repo}/pulls/comments/{id}/resolve":{"post":{}}}}`))
-		case "/api/v1/user":
-			_, _ = w.Write([]byte(`{"id":7,"login":"forge-bot"}`))
-		case "/api/v1/repos/acme/looper":
-			_, _ = w.Write([]byte(`{"permissions":{"pull":true,"push":true}}`))
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer server.Close()
-
-	rt, cfg := startTestRuntime(t)
-	tokenEnv := "FORGEJO_STATUS_TOKEN"
-	cfg.Providers = []config.ProviderConfig{{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: server.URL, TokenEnv: &tokenEnv}}
-	cfg.Projects = []config.ProjectRefConfig{{ID: "project-forgejo", Provider: "forgejo-main", Repo: "acme/looper", RepoPath: t.TempDir()}}
-	recorder := httptest.NewRecorder()
-	NewHandler(Context{Config: cfg, Runtime: runtimeWithConfig(rt, cfg)}).ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/v1/status", nil))
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200", recorder.Code)
-	}
-	body := recorder.Body.String()
-	if strings.Contains(body, "status-secret") || strings.Contains(body, server.URL) || strings.Contains(body, tokenEnv) {
-		t.Fatalf("status body leaked provider configuration: %s", body)
-	}
-	data := parseJSONMap(t, recorder.Body.Bytes())["data"].(map[string]any)
-	providers := data["providers"].([]any)
-	if len(providers) != 1 {
-		t.Fatalf("providers = %#v", providers)
-	}
-	provider := providers[0].(map[string]any)
-	assertEqual(t, provider["providerId"], "forgejo-main")
-	assertEqual(t, provider["authentication"], "valid")
-	projects := provider["projects"].([]any)
-	assertEqual(t, projects[0].(map[string]any)["access"], "writable")
-}
-
 func TestHandlerVersionSuccessContainsExpectedFields(t *testing.T) {
 	rt, cfg := startTestRuntime(t)
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/version", nil)
@@ -1770,7 +1727,7 @@ func TestHandlerPullRequestRouteReturnsInternalErrorWhenLoopLookupFails(t *testi
 func TestHandlerPullRequestRouteRequiresProjectForDuplicateRepoIdentity(t *testing.T) {
 	fixture := newTestFixture(t)
 	nowISO := fixture.now.UTC().Format(javaScriptISOString)
-	for _, projectID := range []string{"github", "forgejo"} {
+	for _, projectID := range []string{"github", "ghes"} {
 		metadata := `{"repo":"acme/app"}`
 		if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: projectID, RepoPath: "/tmp/" + projectID, MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 			t.Fatalf("Projects.Upsert(%s) error = %v", projectID, err)
@@ -1778,7 +1735,7 @@ func TestHandlerPullRequestRouteRequiresProjectForDuplicateRepoIdentity(t *testi
 	}
 	for _, snapshot := range []storage.PullRequestSnapshotRecord{
 		{ID: "snapshot_github", ProjectID: "github", Repo: "acme/app", PRNumber: 42, HeadSHA: "github-head", CapturedAt: nowISO, CreatedAt: nowISO},
-		{ID: "snapshot_forgejo", ProjectID: "forgejo", Repo: "acme/app", PRNumber: 42, HeadSHA: "forgejo-head", CapturedAt: nowISO, CreatedAt: nowISO},
+		{ID: "snapshot_ghes", ProjectID: "ghes", Repo: "acme/app", PRNumber: 42, HeadSHA: "ghes-head", CapturedAt: nowISO, CreatedAt: nowISO},
 	} {
 		if err := fixture.runtime.Services().Repositories.PullRequestSnapshots.Upsert(context.Background(), snapshot); err != nil {
 			t.Fatalf("PullRequestSnapshots.Upsert(%s) error = %v", snapshot.ProjectID, err)
@@ -1788,7 +1745,7 @@ func TestHandlerPullRequestRouteRequiresProjectForDuplicateRepoIdentity(t *testi
 	prNumber := int64(42)
 	for index, loop := range []storage.LoopRecord{
 		{ID: "github_reviewer", ProjectID: "github", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "completed"},
-		{ID: "forgejo_reviewer", ProjectID: "forgejo", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running"},
+		{ID: "ghes_reviewer", ProjectID: "ghes", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running"},
 	} {
 		loop.Seq = int64(index + 1)
 		loop.CreatedAt = nowISO
@@ -1806,17 +1763,17 @@ func TestHandlerPullRequestRouteRequiresProjectForDuplicateRepoIdentity(t *testi
 	}
 
 	qualified := httptest.NewRecorder()
-	handler.ServeHTTP(qualified, httptest.NewRequest(http.MethodGet, "/api/v1/pull-requests/AcMe%2FApp/42?projectId=forgejo", nil))
+	handler.ServeHTTP(qualified, httptest.NewRequest(http.MethodGet, "/api/v1/pull-requests/AcMe%2FApp/42?projectId=ghes", nil))
 	if qualified.Code != http.StatusOK {
 		t.Fatalf("qualified status = %d, want 200; body=%s", qualified.Code, qualified.Body.String())
 	}
 	body := parseJSONMap(t, qualified.Body.Bytes())
 	data := body["data"].(map[string]any)
-	if data["projectId"] != "forgejo" || data["headSha"] != "forgejo-head" {
-		t.Fatalf("qualified data = %#v, want Forgejo snapshot", data)
+	if data["projectId"] != "ghes" || data["headSha"] != "ghes-head" {
+		t.Fatalf("qualified data = %#v, want GHES snapshot", data)
 	}
 	if data["reviewer"] != "running" {
-		t.Fatalf("qualified reviewer = %#v, want only Forgejo loop state", data["reviewer"])
+		t.Fatalf("qualified reviewer = %#v, want only GHES loop state", data["reviewer"])
 	}
 }
 
@@ -1824,7 +1781,7 @@ func TestHandlerPullRequestRouteCountsLoopOnlyProjectAsAmbiguous(t *testing.T) {
 	fixture := newTestFixture(t)
 	nowISO := fixture.now.UTC().Format(javaScriptISOString)
 	metadata := `{"repo":"acme/app"}`
-	for _, projectID := range []string{"github", "forgejo"} {
+	for _, projectID := range []string{"github", "ghes"} {
 		if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: projectID, RepoPath: "/tmp/" + projectID, MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 			t.Fatalf("Projects.Upsert(%s) error = %v", projectID, err)
 		}
@@ -1834,7 +1791,7 @@ func TestHandlerPullRequestRouteCountsLoopOnlyProjectAsAmbiguous(t *testing.T) {
 	}
 	repo := "ACME/APP"
 	prNumber := int64(42)
-	if err := fixture.runtime.Services().Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "forgejo_loop_only", Seq: 1, ProjectID: "forgejo", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+	if err := fixture.runtime.Services().Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "ghes_loop_only", Seq: 1, ProjectID: "ghes", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
 
@@ -2271,21 +2228,21 @@ func TestHandlerProjectsListRouteSuccess(t *testing.T) {
 func TestResolveProjectProviderKind(t *testing.T) {
 	t.Parallel()
 
-	tokenEnv := "FORGEJO_TOKEN"
+	tokenEnv := "GHES_TOKEN"
 	cfg := config.Config{
 		Providers: []config.ProviderConfig{
-			{ID: "forgejo-main", Kind: config.ProviderKindForgejo, BaseURL: "https://code.example.com", TokenEnv: &tokenEnv},
+			{ID: "ghes-main", Kind: config.ProviderKindGitHub, BaseURL: "https://code.example.com", TokenEnv: &tokenEnv},
 		},
 		Projects: []config.ProjectRefConfig{
-			{ID: "configured-forgejo", Name: "Configured", Provider: "forgejo-main", Repo: "acme/fj", RepoPath: "/tmp/fj"},
+			{ID: "configured-ghes", Name: "Configured", Provider: "ghes-main", Repo: "acme/app", RepoPath: "/tmp/app"},
 		},
 	}
 
-	if got := resolveProjectProviderKind(cfg, "configured-forgejo", map[string]any{}); got != "forgejo" {
-		t.Fatalf("configured forgejo = %q, want forgejo", got)
+	if got := resolveProjectProviderKind(cfg, "configured-ghes", map[string]any{}); got != "github" {
+		t.Fatalf("configured provider binding = %q, want github", got)
 	}
-	if got := resolveProjectProviderKind(cfg, "api-forgejo", map[string]any{"provider": "forgejo-main", "repo": "core/odcrew"}); got != "forgejo" {
-		t.Fatalf("metadata forgejo = %q, want forgejo", got)
+	if got := resolveProjectProviderKind(cfg, "api-ghes", map[string]any{"provider": "ghes-main", "repo": "core/odcrew"}); got != "github" {
+		t.Fatalf("metadata provider binding = %q, want github", got)
 	}
 	if got := resolveProjectProviderKind(cfg, "legacy-github", map[string]any{"repo": "acme/looper"}); got != "github" {
 		t.Fatalf("legacy github = %q, want github", got)

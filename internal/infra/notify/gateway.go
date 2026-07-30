@@ -564,7 +564,7 @@ type HITLAskCard struct {
 
 	// Source identifies where the task came from so the human knows what they are
 	// deciding about. SourceType is a human label ("GitHub Issue", "GitHub PR",
-	// "Forgejo"), SourceRef the short id ("#132"), SourceURL the clickable link.
+	// "GitHub"), SourceRef the short id ("#132"), SourceURL the clickable link.
 	SourceType string
 	SourceRef  string
 	SourceURL  string

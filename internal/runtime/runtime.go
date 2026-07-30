@@ -1272,9 +1272,6 @@ func detectProjectRepo(ctx context.Context, gitGateway *gitinfra.Gateway, view p
 	if strings.TrimSpace(remote.Repo) == "" {
 		return projects.DetectedRepo{}, nil
 	}
-	if provider, ok := view.ProviderByRemoteHost(remote.Host); ok {
-		return projects.DetectedRepo{Repo: remote.Repo, Provider: provider.Provider.ID}, nil
-	}
 	if remote.Host == "github.com" || strings.HasSuffix(remote.Host, ".github.com") {
 		return projects.DetectedRepo{Repo: remote.Repo}, nil
 	}

@@ -16,7 +16,6 @@ import (
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/disclosure"
 	"github.com/nexu-io/looper/internal/eventlog"
-	"github.com/nexu-io/looper/internal/forge"
 	"github.com/nexu-io/looper/internal/labels"
 	"github.com/nexu-io/looper/internal/lifecycle"
 	"github.com/nexu-io/looper/internal/loops"
@@ -258,71 +257,6 @@ func TestBuildFixerPromptPrefersRoundSpecificCommitSubject(t *testing.T) {
 	}
 	if strings.Contains(prompt, "For commits, keep commit subjects unchanged and add a commit body trailer") {
 		t.Fatalf("prompt still contains old conflicting commit-subject guidance:\n%s", prompt)
-	}
-}
-
-func TestCollectFixItemsFromForgejoReviewerSummaryOpenItemsOnly(t *testing.T) {
-	t.Parallel()
-
-	summary := forge.NewReviewerSummary(3, []forge.ReviewItem{
-		{ReviewItemID: "R-001", Status: forge.ReviewItemStatusOpen, Title: "Fix parsing", Body: "Parser must fail fast.", Files: []string{"internal/forge/summary_protocol.go"}, LastSeenRoundID: 3},
-		{ReviewItemID: "R-002", Status: forge.ReviewItemStatusResolved, Title: "Old issue", Body: "Already fixed.", LastSeenRoundID: 2},
-	})
-	marker, err := forge.RenderReviewerSummary(summary)
-	if err != nil {
-		t.Fatalf("RenderReviewerSummary() error = %v", err)
-	}
-
-	items, err := collectFixItemsFromCheckpointForStep(fixerCheckpoint{Detail: &checkpointDetail{IssueComments: []map[string]any{{"id": int64(101), "body": "visible\n" + marker, "url": "https://forgejo.test/comment/101"}}}})
-	if err != nil {
-		t.Fatalf("collectFixItemsFromCheckpointForStep() error = %v", err)
-	}
-	if len(items) != 1 || items[0].ID != "R-001" || items[0].ThreadID != "R-001" || items[0].Path != "internal/forge/summary_protocol.go" {
-		t.Fatalf("items = %#v, want one open Reviewer Summary item", items)
-	}
-	if items[0].Source != "forgejo-reviewer-summary" {
-		t.Fatalf("item = %#v, want forgejo reviewer summary metadata", items[0])
-	}
-}
-
-func TestBuildForgejoFixerSummaryValidatesOneResultPerOpenItem(t *testing.T) {
-	t.Parallel()
-
-	reviewer := forge.NewReviewerSummary(4, []forge.ReviewItem{
-		{ReviewItemID: "R-001", Status: forge.ReviewItemStatusOpen, Title: "Fix parsing", Body: "Parser must fail fast.", LastSeenRoundID: 4},
-	})
-	checkpoint := fixerCheckpoint{
-		Detail:       &checkpointDetail{HeadSHA: "head-1"},
-		FixItems:     []FixItem{{Type: "comment", ID: "R-001", ThreadID: "R-001", Summary: "Fix parsing"}},
-		FixItemsHash: "hash-1",
-		Repair:       &checkpointRepair{ReplyExplanations: []replyExplanationEntry{{FixItemID: "R-001", ThreadID: "R-001", Action: "fixed", Explanation: "Added strict parsing."}}},
-		ReconcileCommits: &checkpointReconcileCommits{
-			FinalHeadSHA:     "head-2",
-			WorkingTreeClean: true,
-		},
-	}
-
-	summary, err := buildForgejoFixerSummary(checkpoint, reviewer, lookupReplyExplanations(checkpoint))
-	if err != nil {
-		t.Fatalf("buildForgejoFixerSummary() error = %v", err)
-	}
-	if err := forge.ValidateFixerResultsForReviewerSummary(reviewer, summary); err != nil {
-		t.Fatalf("ValidateFixerResultsForReviewerSummary() error = %v", err)
-	}
-	if summary.ConsumedReviewRoundID != 4 || len(summary.Results) != 1 || summary.Results[0].ReviewItemID != "R-001" || summary.Results[0].Result != forge.FixerItemResultFixed {
-		t.Fatalf("summary = %#v", summary)
-	}
-}
-
-func TestBuildForgejoFixerSummaryFailsWhenAgentOmitsOpenItemResult(t *testing.T) {
-	t.Parallel()
-
-	reviewer := forge.NewReviewerSummary(4, []forge.ReviewItem{{ReviewItemID: "R-001", Status: forge.ReviewItemStatusOpen, Title: "Fix parsing", Body: "Parser must fail fast.", LastSeenRoundID: 4}})
-	checkpoint := fixerCheckpoint{Detail: &checkpointDetail{HeadSHA: "head-1"}, FixItems: []FixItem{{Type: "comment", ID: "R-001", ThreadID: "R-001", Summary: "Fix parsing"}}, Repair: &checkpointRepair{}}
-
-	_, err := buildForgejoFixerSummary(checkpoint, reviewer, lookupReplyExplanations(checkpoint))
-	if err == nil || !strings.Contains(err.Error(), "missing result explanation") {
-		t.Fatalf("buildForgejoFixerSummary() error = %v, want missing result explanation", err)
 	}
 }
 
@@ -4481,7 +4415,7 @@ func TestRunDiscoverPRStepAcceptsProjectedAutomationCommentsWithoutRetry(t *test
 		BaseRefName: "main",
 		BaseSHA:     "base-42",
 		IssueComments: []map[string]any{
-			{"id": float64(101), "body": "<!-- looper:forgejo-reviewer-summary payload -->"},
+			{"id": float64(101), "body": "<!-- looper:fixer-round payload -->"},
 			{"id": float64(202), "body": "<!-- looper:fixer-round head=head-42 -->"},
 		},
 	}}}
@@ -6454,12 +6388,6 @@ type fakeGitHubGateway struct {
 	compareCalls          []CompareCommitsInput
 	compareStatus         string
 	compareErr            error
-	nativeComments        []NativeReviewComment
-	nativeCommentBatches  [][]NativeReviewComment
-	listNativeContextErr  error
-	listNativeErr         error
-	resolveNativeCalls    []ResolveNativeReviewCommentInput
-	resolveNativeErr      error
 }
 
 func (f *fakeGitHubGateway) ListOpenPullRequests(_ context.Context, input ListOpenPullRequestsInput) ([]PullRequestSummary, error) {
@@ -6577,30 +6505,6 @@ func (f *fakeGitHubGateway) AddReviewThreadReply(_ context.Context, input AddRev
 		}
 	}
 	return f.replyErr
-}
-
-func (f *fakeGitHubGateway) ListNativeReviewComments(ctx context.Context, _ ListNativeReviewCommentsInput) ([]NativeReviewComment, error) {
-	f.listNativeContextErr = ctx.Err()
-	if f.listNativeErr != nil {
-		return nil, f.listNativeErr
-	}
-	if len(f.nativeCommentBatches) > 0 {
-		batch := append([]NativeReviewComment(nil), f.nativeCommentBatches[0]...)
-		if len(f.nativeCommentBatches) > 1 {
-			f.nativeCommentBatches = f.nativeCommentBatches[1:]
-		}
-		return batch, nil
-	}
-	return append([]NativeReviewComment(nil), f.nativeComments...), nil
-}
-
-func (f *fakeGitHubGateway) ProbeNativeReviewCommentResolution(context.Context, ListNativeReviewCommentsInput) (forge.ProbeState, error) {
-	return forge.ProbeStateSupported, nil
-}
-
-func (f *fakeGitHubGateway) ResolveNativeReviewComment(_ context.Context, input ResolveNativeReviewCommentInput) error {
-	f.resolveNativeCalls = append(f.resolveNativeCalls, input)
-	return f.resolveNativeErr
 }
 
 func (f *fakeGitHubGateway) CreateIssueComment(_ context.Context, input IssueCommentInput) (IssueCommentResult, error) {
@@ -6989,21 +6893,6 @@ func TestParseReplyExplanationsDropsUnknownAndMismatchedThread(t *testing.T) {
 	got := parseReplyExplanations(stdout, "", []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1"}})
 	if len(got) != 1 || got[0].Explanation != "good" {
 		t.Fatalf("parseReplyExplanations() = %#v, want only the first valid entry", got)
-	}
-}
-
-func TestParseReplyExplanationsIgnoresNativeReviewComments(t *testing.T) {
-	t.Parallel()
-	stdout := `__LOOPER_RESULT__={"review_thread_replies":[` +
-		`{"fixItemId":"native-101","threadId":"101","action":"fixed","explanation":"generic native reply must not win"},` +
-		`{"fixItemId":"c1","threadId":"t1","action":"fixed","explanation":"regular comment reply"}` +
-		`]}`
-	got := parseReplyExplanations(stdout, "", []FixItem{
-		{Type: "comment", ID: "native-101", ThreadID: "101", Source: NativeReviewCommentSource, ProviderCommentID: 101},
-		{Type: "comment", ID: "c1", ThreadID: "t1"},
-	})
-	if len(got) != 1 || got[0].FixItemID != "c1" || got[0].Explanation != "regular comment reply" {
-		t.Fatalf("parseReplyExplanations() = %#v, want only non-native reply", got)
 	}
 }
 
@@ -8181,234 +8070,6 @@ func TestPublishRoundSummaryCommentPostsForAgentEvidenceWithoutLocalNewCommits(t
 	}
 	if !strings.Contains(github.createIssueComments[0].Body, fixerRoundSummaryMarker("agent-head")) {
 		t.Fatalf("summary body = %q, want adopted evidence head marker", github.createIssueComments[0].Body)
-	}
-}
-
-func TestRunForgejoFixerSummaryStepRefreshesLiveSummaryComment(t *testing.T) {
-	t.Parallel()
-	fixture := newRunnerFixture(t)
-	reviewerSummary := forge.NewReviewerSummary(2, []forge.ReviewItem{{
-		ReviewItemID:    "R-001",
-		Status:          forge.ReviewItemStatusOpen,
-		Title:           "Keep fixer summary idempotent",
-		Body:            "Refresh live comments before choosing create vs update.",
-		LastSeenRoundID: 2,
-	}})
-	reviewerMarker, err := forge.RenderReviewerSummary(reviewerSummary)
-	if err != nil {
-		t.Fatalf("RenderReviewerSummary() error = %v", err)
-	}
-	existingFixerBody, err := renderForgejoFixerSummaryComment(forge.NewFixerSummary(3, reviewerSummary.ReviewRoundID, []forge.FixerResult{{
-		ReviewItemID: "R-001",
-		Result:       forge.FixerItemResultFixed,
-		Explanation:  "Earlier fixer run result.",
-	}}))
-	if err != nil {
-		t.Fatalf("renderForgejoFixerSummaryComment() error = %v", err)
-	}
-	staleDetail := &checkpointDetail{
-		HeadSHA:       "head-sha",
-		HeadRefName:   "reviewer-fixer",
-		BaseRefName:   "main",
-		IssueComments: []map[string]any{{"id": int64(101), "body": reviewerMarker, "url": "https://example.test/comments/101", "author": map[string]any{"login": "looper"}}},
-	}
-	liveDetail := PullRequestDetail{
-		Number:      42,
-		State:       "OPEN",
-		HeadSHA:     "head-sha",
-		HeadRefName: "reviewer-fixer",
-		BaseRefName: "main",
-		IssueComments: []map[string]any{
-			{"id": int64(101), "body": reviewerMarker, "url": "https://example.test/comments/101", "author": map[string]any{"login": "looper"}},
-			{"id": int64(201), "body": existingFixerBody, "url": "https://example.test/comments/201", "author": map[string]any{"login": "mallory"}},
-			{"id": int64(202), "body": existingFixerBody, "url": "https://example.test/comments/202", "author": map[string]any{"login": "looper"}},
-		},
-	}
-	github := &fakeGitHubGateway{currentUser: "looper", viewResponses: []PullRequestDetail{liveDetail}}
-	cfg := forgejoFixerDiscoveryConfig(t, fixture)
-	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Now: fixture.now, Logger: fixture.logger, CustomInstructions: cfg})
-	checkpoint := fixerCheckpoint{
-		Detail:       staleDetail,
-		FixItemsHash: "fix-items-hash",
-		FixItems:     []FixItem{{ID: "R-001", Type: "comment"}},
-		Validation:   &ValidationResult{Passed: true},
-		Push:         &checkpointPush{Pushed: true, HeadSHA: "head-sha"},
-		Repair:       &checkpointRepair{ReplyExplanations: []replyExplanationEntry{{FixItemID: "R-001", Action: "fixed", Explanation: "Refetched live PR comments before upserting the Forgejo fixer summary."}}},
-	}
-
-	got, err := runner.runForgejoFixerSummaryStep(context.Background(), stepInput{
-		Repo:       "acme/looper",
-		PRNumber:   42,
-		Project:    storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()},
-		Checkpoint: checkpoint,
-	})
-	if err != nil {
-		t.Fatalf("runForgejoFixerSummaryStep() error = %v", err)
-	}
-	if len(github.createIssueComments) != 0 {
-		t.Fatalf("createIssueComments calls = %d, want 0 when live summary already exists", len(github.createIssueComments))
-	}
-	if len(github.updateIssueComments) != 1 {
-		t.Fatalf("updateIssueComments calls = %d, want 1", len(github.updateIssueComments))
-	}
-	if github.updateIssueComments[0].CommentID != 202 {
-		t.Fatalf("updateIssueComments[0].CommentID = %d, want 202", github.updateIssueComments[0].CommentID)
-	}
-	parsedFixer, err := forge.ParseFixerSummary(github.updateIssueComments[0].Body)
-	if err != nil {
-		t.Fatalf("ParseFixerSummary(updated body) error = %v", err)
-	}
-	if parsedFixer.FixRoundID != 4 {
-		t.Fatalf("updated fixer summary round = %d, want 4 from live existing summary", parsedFixer.FixRoundID)
-	}
-	if got.SummaryComment == nil || got.SummaryComment.CommentID != 202 || got.SummaryComment.State != "updated" {
-		t.Fatalf("SummaryComment = %#v, want updated live comment 202", got.SummaryComment)
-	}
-}
-
-func TestRunResolveCommentsStepForgejoSummaryOnlySkipsNativeThreadLogicAndPostsSummary(t *testing.T) {
-	t.Parallel()
-
-	fixture := newRunnerFixture(t)
-	reviewerSummary := forge.NewReviewerSummary(2, []forge.ReviewItem{{
-		ReviewItemID:    "R-001",
-		Status:          forge.ReviewItemStatusOpen,
-		Title:           "Fix parsing",
-		Body:            "Parser must fail fast.",
-		LastSeenRoundID: 2,
-	}})
-	reviewerMarker, err := forge.RenderReviewerSummary(reviewerSummary)
-	if err != nil {
-		t.Fatalf("RenderReviewerSummary() error = %v", err)
-	}
-	liveDetail := PullRequestDetail{
-		Number:      42,
-		State:       "OPEN",
-		HeadSHA:     "head-sha",
-		HeadRefName: "reviewer-fixer",
-		BaseRefName: "main",
-		IssueComments: []map[string]any{{
-			"id":     int64(101),
-			"body":   reviewerMarker,
-			"url":    "https://example.test/comments/101",
-			"author": map[string]any{"login": "looper"},
-		}, {
-			"id":     int64(102),
-			"body":   reviewerMarker,
-			"url":    "https://example.test/comments/102",
-			"author": map[string]any{"login": "mallory"},
-		}},
-	}
-	github := &fakeGitHubGateway{currentUser: "looper", viewResponses: []PullRequestDetail{liveDetail, liveDetail}}
-	cfg := forgejoFixerDiscoveryConfig(t, fixture)
-	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Now: fixture.now, Logger: fixture.logger, CustomInstructions: cfg})
-	fixItems := []FixItem{{ID: "R-001", Type: "comment", Source: "forgejo-reviewer-summary", ThreadID: "R-001", Summary: "Fix parsing"}}
-
-	updated, err := runner.runResolveCommentsStep(context.Background(), stepInput{
-		Project:  storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()},
-		Repo:     "acme/looper",
-		PRNumber: 42,
-		Checkpoint: fixerCheckpoint{
-			Detail:       &checkpointDetail{HeadSHA: "head-sha", HeadRefName: "reviewer-fixer", BaseRefName: "main", IssueComments: cloneObjectSlice(liveDetail.IssueComments)},
-			FixItems:     fixItems,
-			FixItemsHash: hashFixItems(fixItems),
-			Validation:   &ValidationResult{Passed: true, HeadSHA: "head-sha"},
-			Push:         &checkpointPush{Pushed: true, HeadSHA: "head-sha"},
-			Repair:       &checkpointRepair{ReplyExplanations: []replyExplanationEntry{{FixItemID: "R-001", Action: "fixed", Explanation: "Applied the requested fix."}}},
-		},
-	})
-	if err != nil {
-		t.Fatalf("runResolveCommentsStep() error = %v", err)
-	}
-	if len(github.viewThreadCalls) != 0 {
-		t.Fatalf("ViewReviewThread calls = %#v, want none for forgejo summary items", github.viewThreadCalls)
-	}
-	if len(github.resolveCalls) != 0 {
-		t.Fatalf("ResolveReviewThread calls = %#v, want none for forgejo summary items", github.resolveCalls)
-	}
-	if len(github.createIssueComments) != 1 {
-		t.Fatalf("createIssueComments calls = %d, want 1", len(github.createIssueComments))
-	}
-	if updated.SummaryComment == nil || updated.SummaryComment.State != "created" {
-		t.Fatalf("SummaryComment = %#v, want created summary comment", updated.SummaryComment)
-	}
-	if len(updated.FixItems) != 1 || updated.FixItems[0].Source != "forgejo-reviewer-summary" {
-		t.Fatalf("FixItems = %#v, want forgejo summary item preserved", updated.FixItems)
-	}
-}
-
-func TestRunResolveCommentsStepNativeAndSummaryCoexistWithoutRoutingSummaryThroughThreadLogic(t *testing.T) {
-	t.Parallel()
-
-	fixture := newRunnerFixture(t)
-	reviewerSummary := forge.NewReviewerSummary(2, []forge.ReviewItem{{
-		ReviewItemID:    "R-001",
-		Status:          forge.ReviewItemStatusOpen,
-		Title:           "Fix parsing",
-		Body:            "Parser must fail fast.",
-		LastSeenRoundID: 2,
-	}})
-	reviewerMarker, err := forge.RenderReviewerSummary(reviewerSummary)
-	if err != nil {
-		t.Fatalf("RenderReviewerSummary() error = %v", err)
-	}
-	liveDetail := PullRequestDetail{
-		Number:      42,
-		State:       "OPEN",
-		HeadSHA:     "head-sha",
-		HeadRefName: "reviewer-fixer",
-		BaseRefName: "main",
-		IssueComments: []map[string]any{{
-			"id":   int64(101),
-			"body": reviewerMarker,
-			"url":  "https://example.test/comments/101",
-		}},
-		Comments: []map[string]any{{
-			"id":       "c1",
-			"threadId": "t1",
-			"body":     "please fix",
-		}},
-	}
-	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{liveDetail, liveDetail}, threads: []ReviewThread{{ID: "t1", Comments: []ReviewThreadComment{{ID: "c1", Body: "please fix"}}}}}
-	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Now: fixture.now, Logger: fixture.logger})
-	observed := hashReviewThreadComments(ReviewThread{Comments: []ReviewThreadComment{{ID: "c1"}}})
-	fixItems := []FixItem{{ID: "c1", Type: "comment", ThreadID: "t1", Summary: "please fix"}, {ID: "R-001", Type: "comment", Source: "forgejo-reviewer-summary", ThreadID: "R-001", Summary: "Fix parsing"}}
-
-	updated, err := runner.runResolveCommentsStep(context.Background(), stepInput{
-		Project:  storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()},
-		Repo:     "acme/looper",
-		PRNumber: 42,
-		Checkpoint: fixerCheckpoint{
-			Detail:       &checkpointDetail{HeadSHA: "head-sha", HeadRefName: "reviewer-fixer", BaseRefName: "main", Comments: liveDetail.Comments, IssueComments: liveDetail.IssueComments},
-			FixItems:     fixItems,
-			FixItemsHash: hashFixItems(fixItems),
-			Validation:   &ValidationResult{Passed: true, HeadSHA: "head-sha"},
-			Push:         &checkpointPush{Pushed: true, HeadSHA: "head-sha"},
-			Repair: &checkpointRepair{ReplyExplanations: []replyExplanationEntry{
-				{FixItemID: "c1", ThreadID: "t1", Action: string(replyActionFixed), Explanation: "Applied the requested fix.", ThreadCommentsObserved: observed},
-				{FixItemID: "R-001", Action: "fixed", Explanation: "Applied the requested fix."},
-			}},
-		},
-	})
-	if err != nil {
-		t.Fatalf("runResolveCommentsStep() error = %v", err)
-	}
-	if len(github.viewThreadCalls) == 0 {
-		t.Fatalf("ViewReviewThread calls = %#v, want calls only for native thread t1", github.viewThreadCalls)
-	}
-	for _, call := range github.viewThreadCalls {
-		if call.ThreadID != "t1" {
-			t.Fatalf("ViewReviewThread calls = %#v, want no forgejo summary thread lookups", github.viewThreadCalls)
-		}
-	}
-	if len(github.resolveCalls) != 1 || github.resolveCalls[0].ThreadID != "t1" {
-		t.Fatalf("ResolveReviewThread calls = %#v, want only native thread t1", github.resolveCalls)
-	}
-	if len(github.createIssueComments) != 1 {
-		t.Fatalf("createIssueComments calls = %d, want 1", len(github.createIssueComments))
-	}
-	if updated.SummaryComment == nil || updated.SummaryComment.State != "created" {
-		t.Fatalf("SummaryComment = %#v, want created forgejo summary comment", updated.SummaryComment)
 	}
 }
 
