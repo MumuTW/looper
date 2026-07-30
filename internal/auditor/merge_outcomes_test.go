@@ -9,11 +9,11 @@ import (
 )
 
 func TestCandidatesFromMergeOutcomesUsesOnlySuccessfulGatekeeperEvents(t *testing.T) {
-	payload, err := json.Marshal(gatekeeper.MergeOutcome{Version: 1, ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, HeadSHA: "abc", Merged: true})
+	payload, err := json.Marshal(gatekeeper.MergeOutcome{Version: 1, PRNumber: 42, HeadSHA: "abc", Merged: true})
 	if err != nil {
 		t.Fatal(err)
 	}
-	notMerged, err := json.Marshal(gatekeeper.MergeOutcome{Version: 1, ProjectID: "project_1", Repo: "acme/looper", PRNumber: 43, HeadSHA: "def", Merged: false})
+	notMerged, err := json.Marshal(gatekeeper.MergeOutcome{Version: 1, PRNumber: 43, HeadSHA: "def", Merged: false})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -22,7 +22,7 @@ func TestCandidatesFromMergeOutcomesUsesOnlySuccessfulGatekeeperEvents(t *testin
 		{ID: "refused", EventType: gatekeeper.MergeOutcomeEventType, PayloadJSON: string(notMerged), CreatedAt: "2026-07-31T10:01:00.000Z"},
 		{ID: "merged", EventType: gatekeeper.MergeOutcomeEventType, PayloadJSON: string(payload), CreatedAt: "2026-07-31T10:02:00.000Z"},
 	})
-	if err != nil || len(candidates) != 1 || candidates[0].ProjectID != "project_1" || candidates[0].Repo != "acme/looper" || candidates[0].PRNumber != 42 || candidates[0].HeadSHA != "abc" || candidates[0].MergedAt.Format("2006-01-02T15:04:05.000Z") != "2026-07-31T10:02:00.000Z" {
+	if err != nil || len(candidates) != 1 || candidates[0].PRNumber != 42 || candidates[0].HeadSHA != "abc" || candidates[0].MergedAt.Format("2006-01-02T15:04:05.000Z") != "2026-07-31T10:02:00.000Z" {
 		t.Fatalf("CandidatesFromMergeOutcomes() = %#v, %v", candidates, err)
 	}
 }
