@@ -203,6 +203,29 @@ def main() -> int:
             f" | permission reqs: {permission_requests}"
             f" | unknown client methods: {unknown_methods}"
         )
+
+        # In default mode this probe is an evidence check, not just a demo:
+        # a session/prompt that completes but returns the wrong constant, a
+        # non-end_turn stop reason, or no usage data means the recorded
+        # contract in hermes-devin-acp-spike.md has drifted, and the probe
+        # must fail loud rather than report success. Custom-prompt mode
+        # (--prompt-file) is for open-ended probing and only reports what came
+        # back, so its expectations are defined by the caller, not here.
+        if args.prompt_file is None:
+            failures = []
+            collected = "".join(text_parts).strip()
+            if collected != "HERMES_DEVIN_ACP_OK":
+                failures.append(f"collected text != HERMES_DEVIN_ACP_OK (got {collected!r})")
+            stop = result.get("stopReason") if isinstance(result, dict) else None
+            if stop != "end_turn":
+                failures.append(f"stopReason != end_turn (got {stop!r})")
+            usage = result.get("usage") if isinstance(result, dict) else None
+            if not (isinstance(usage, dict) and usage.get("totalTokens")):
+                failures.append(f"missing/empty usage.totalTokens (got {usage!r})")
+            if failures:
+                for f in failures:
+                    print(f"FAIL: {f}", file=sys.stderr)
+                return 1
         return 0
     finally:
         try:
