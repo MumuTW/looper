@@ -416,7 +416,7 @@ func (s *webhookTunnelServer) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	payloadRepo := githubPayloadRepo(body)
-	if payloadRepo != "" && !strings.EqualFold(payloadRepo, repo) {
+	if payloadRepo != "" && !strings.EqualFold(payloadRepo, webhookTunnelPayloadRepo(repo)) {
 		http.Error(w, "repository mismatch", http.StatusBadRequest)
 		return
 	}
@@ -647,10 +647,37 @@ func webhookTunnelRequestPath(cfg config.Config, requestPath string) (string, bo
 func repoFromWebhookTunnelPath(path string) (string, bool) {
 	path = strings.Trim(strings.TrimSpace(path), "/")
 	parts := strings.Split(path, "/")
-	if len(parts) != 3 || parts[0] != "webhook" || parts[1] == "" || parts[2] == "" {
+	if parts[0] != "webhook" {
 		return "", false
 	}
-	return parts[1] + "/" + parts[2], true
+	switch len(parts) {
+	case 3:
+		if parts[1] == "" || parts[2] == "" {
+			return "", false
+		}
+		return parts[1] + "/" + parts[2], true
+	case 4:
+		// The three-segment route has always rejected a trailing path segment.
+		// A GHES hostname is distinguishable from that legacy shape because a
+		// configured HTTP(S) hostname contains a domain separator.
+		if parts[1] == "" || !strings.Contains(parts[1], ".") || parts[2] == "" || parts[3] == "" {
+			return "", false
+		}
+		return parts[1] + "/" + parts[2] + "/" + parts[3], true
+	default:
+		return "", false
+	}
+}
+
+// webhookTunnelPayloadRepo removes the optional hostname from a tunnel key.
+// GitHub webhook payloads always use repository.full_name (owner/name), even
+// when the hook URL selects a GitHub Enterprise hostname.
+func webhookTunnelPayloadRepo(repo string) string {
+	parts := strings.Split(strings.Trim(strings.TrimSpace(repo), "/"), "/")
+	if len(parts) == 3 {
+		return parts[1] + "/" + parts[2]
+	}
+	return strings.Join(parts, "/")
 }
 
 func githubPayloadRepo(payload []byte) string {

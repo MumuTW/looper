@@ -40,11 +40,25 @@ func TestRepoFromWebhookTunnelPath(t *testing.T) {
 	if got, ok := repoFromWebhookTunnelPath("/webhook/acme/looper"); !ok || got != "acme/looper" {
 		t.Fatalf("repoFromWebhookTunnelPath() = (%q, %v), want (%q, true)", got, ok, "acme/looper")
 	}
+	if got, ok := repoFromWebhookTunnelPath("/webhook/code.example.test/acme/looper"); !ok || got != "code.example.test/acme/looper" {
+		t.Fatalf("repoFromWebhookTunnelPath() = (%q, %v), want (%q, true)", got, ok, "code.example.test/acme/looper")
+	}
 
 	for _, path := range []string{"", "/webhook", "/webhook/acme", "/hook/acme/looper", "/webhook//looper", "/webhook/acme/", "/webhook/acme/looper/extra"} {
 		if got, ok := repoFromWebhookTunnelPath(path); ok || got != "" {
 			t.Fatalf("repoFromWebhookTunnelPath(%q) = (%q, %v), want (\"\", false)", path, got, ok)
 		}
+	}
+}
+
+func TestWebhookTunnelPayloadRepo(t *testing.T) {
+	t.Parallel()
+
+	if got := webhookTunnelPayloadRepo("code.example.test/acme/looper"); got != "acme/looper" {
+		t.Fatalf("webhookTunnelPayloadRepo() = %q, want acme/looper", got)
+	}
+	if got := webhookTunnelPayloadRepo("acme/looper"); got != "acme/looper" {
+		t.Fatalf("webhookTunnelPayloadRepo() = %q, want acme/looper", got)
 	}
 }
 

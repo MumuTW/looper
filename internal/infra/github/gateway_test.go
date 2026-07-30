@@ -1001,6 +1001,22 @@ func TestSubmitReviewUsesAPIForTopLevelReviewWithCommitID(t *testing.T) {
 	}
 }
 
+func TestSubmitReviewUsesQualifiedHostnameForTopLevelReview(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		if args != "api repos/acme/looper/pulls/42/reviews --method POST --input - --include --hostname code.example.test" {
+			t.Fatalf("unexpected gh args: %q", args)
+		}
+		return shell.Result{Stdout: "{}"}, nil
+	}
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	if err := gateway.SubmitReview(context.Background(), SubmitReviewInput{Repo: "code.example.test/acme/looper", PRNumber: 42, Event: "COMMENT", Body: "app.go: Looks good", CommitID: "abc123"}); err != nil {
+		t.Fatalf("SubmitReview() error = %v", err)
+	}
+}
+
 func TestSubmitReviewNormalizesAnchorsBeforePublishing(t *testing.T) {
 	t.Parallel()
 	runner := &fakeGHRunner{t: t}
@@ -1678,6 +1694,106 @@ func TestGatewayRemovePullRequestReactionReadsSlurpedPaginatedReactions(t *testi
 	}
 	if !strings.Contains(strings.Join(runner.calls, "\n"), "reactions/7 --method DELETE") {
 		t.Fatalf("gh calls = %#v, want deletion of paginated current-user reaction", runner.calls)
+	}
+}
+
+func TestGatewayUsesQualifiedHostnameForRepoScopedAPICommands(t *testing.T) {
+	t.Parallel()
+	const repo = "code.example.test/acme/looper"
+
+	tests := []struct {
+		name string
+		run  func(*Gateway) error
+		want []string
+	}{
+		{
+			name: "compare commits",
+			run: func(gateway *Gateway) error {
+				_, err := gateway.CompareCommits(context.Background(), CompareCommitsInput{Repo: repo, Base: "base", Head: "head"})
+				return err
+			},
+			want: []string{"api repos/acme/looper/compare/base...head --hostname code.example.test"},
+		},
+		{
+			name: "add pull request reaction",
+			run: func(gateway *Gateway) error {
+				return gateway.AddPullRequestReaction(context.Background(), PullRequestReactionInput{Repo: repo, PRNumber: 42, Content: "eyes"})
+			},
+			want: []string{"api repos/acme/looper/issues/42/reactions --method POST -H Accept: application/vnd.github+json -f content=eyes --hostname code.example.test"},
+		},
+		{
+			name: "remove pull request reaction",
+			run: func(gateway *Gateway) error {
+				return gateway.RemovePullRequestReaction(context.Background(), PullRequestReactionInput{Repo: repo, PRNumber: 42, Content: "eyes"})
+			},
+			want: []string{
+				"api user --jq .login",
+				"api --paginate --slurp repos/acme/looper/issues/42/reactions -H Accept: application/vnd.github+json --hostname code.example.test",
+				"api repos/acme/looper/issues/42/reactions/7 --method DELETE -H Accept: application/vnd.github+json --hostname code.example.test",
+			},
+		},
+		{
+			name: "add pull request labels",
+			run: func(gateway *Gateway) error {
+				return gateway.AddPullRequestLabels(context.Background(), PullRequestLabelsInput{Repo: repo, PRNumber: 42, Labels: []string{"ready"}})
+			},
+			want: []string{
+				"label list --repo code.example.test/acme/looper --limit 1000 --json name,color,description",
+				"api repos/acme/looper/issues/42/labels --method POST -f labels[]=ready --hostname code.example.test",
+			},
+		},
+		{
+			name: "remove pull request labels",
+			run: func(gateway *Gateway) error {
+				return gateway.RemovePullRequestLabels(context.Background(), PullRequestLabelsInput{Repo: repo, PRNumber: 42, Labels: []string{"needs-work"}})
+			},
+			want: []string{"api repos/acme/looper/issues/42/labels/needs-work --method DELETE --hostname code.example.test"},
+		},
+		{
+			name: "add pull request reviewers",
+			run: func(gateway *Gateway) error {
+				return gateway.AddPullRequestReviewers(context.Background(), PullRequestReviewersInput{Repo: repo, PRNumber: 42, Reviewers: []string{"reviewer"}})
+			},
+			want: []string{"api repos/acme/looper/pulls/42/requested_reviewers --method POST -f reviewers[]=reviewer --hostname code.example.test"},
+		},
+		{
+			name: "view issue state",
+			run: func(gateway *Gateway) error {
+				_, err := gateway.viewIssueState(context.Background(), repo, 42, "")
+				return err
+			},
+			want: []string{"api repos/acme/looper/issues/42 --jq .state --hostname code.example.test"},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			runner := &fakeGHRunner{t: t}
+			runner.respond = func(options shell.Options) (shell.Result, error) {
+				switch strings.Join(options.Args, " ") {
+				case "api user --jq .login":
+					return shell.Result{Stdout: "reviewer\n"}, nil
+				case "api --paginate --slurp repos/acme/looper/issues/42/reactions -H Accept: application/vnd.github+json --hostname code.example.test":
+					return shell.Result{Stdout: `[{"id":7,"content":"eyes","user":{"login":"reviewer"}}]`}, nil
+				case "label list --repo code.example.test/acme/looper --limit 1000 --json name,color,description":
+					return shell.Result{Stdout: `[{"name":"ready","color":"ededed","description":""}]`}, nil
+				case "api repos/acme/looper/compare/base...head --hostname code.example.test":
+					return shell.Result{Stdout: `{"status":"identical"}`}, nil
+				case "api repos/acme/looper/issues/42 --jq .state --hostname code.example.test":
+					return shell.Result{Stdout: "open\n"}, nil
+				default:
+					return shell.Result{Stdout: "{}"}, nil
+				}
+			}
+
+			gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+			if err := test.run(gateway); err != nil {
+				t.Fatalf("operation error = %v", err)
+			}
+			if !slices.Equal(runner.calls, test.want) {
+				t.Fatalf("gh calls = %#v, want %#v", runner.calls, test.want)
+			}
+		})
 	}
 }
 
