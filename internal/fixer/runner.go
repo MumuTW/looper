@@ -2299,7 +2299,7 @@ func (r *Runner) recoverClaimedItem(ctx context.Context, queueItem storage.Queue
 				}
 				if project != nil {
 					if breakerStreak > 0 && breakerPause != nil {
-						resumed, resumeErr := r.finishFailureStreakBreaker(ctx, *project, *breakerPause, queueItem, &runFailure.checkpoint)
+						resumed, resumeErr := r.finishFailureStreakBreaker(ctx, *project, *breakerPause, queueItem, runFailure.runID, &runFailure.checkpoint)
 						if resumeErr != nil {
 							return nil, resumeErr
 						}
@@ -2307,7 +2307,7 @@ func (r *Runner) recoverClaimedItem(ctx context.Context, queueItem storage.Queue
 							return &ProcessResult{LoopID: derefString(queueItem.LoopID), QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
 						}
 					} else {
-						r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &runFailure.checkpoint)
+						r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, runFailure.runID, &runFailure.checkpoint)
 					}
 				}
 			}
@@ -2523,7 +2523,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		}
 		if breakerStreak > 0 {
 			r.appendFailureStreakPausedEvent(ctx, pausedLoop, run.ID, latest, breakerStreak)
-			if _, err := r.finishFailureStreakBreaker(ctx, *project, pausedLoop, queueItem, &latest); err != nil {
+			if _, err := r.finishFailureStreakBreaker(ctx, *project, pausedLoop, queueItem, run.ID, &latest); err != nil {
 				return ProcessResult{}, err
 			}
 			return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
@@ -2532,12 +2532,12 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			if scheduled, err := r.schedulePendingRediscoveryAfterRun(ctx, *loop, *queueItem.Repo, *queueItem.PRNumber); err != nil {
 				return ProcessResult{}, err
 			} else if scheduled {
-				r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &latest)
+				r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, run.ID, &latest)
 				return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
 			}
 		}
 		if queueResultIsTerminalForCleanup(failedQueue) {
-			r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &latest)
+			r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, run.ID, &latest)
 		}
 		return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
 	}
@@ -2571,7 +2571,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		if scheduled, err := r.schedulePendingRediscoveryAfterRun(ctx, *loop, *queueItem.Repo, *queueItem.PRNumber); err != nil {
 			return ProcessResult{}, err
 		} else if scheduled {
-			r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &checkpoint)
+			r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, run.ID, &checkpoint)
 			return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "skipped", Summary: reason}, nil
 		}
 		if _, err := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
@@ -2581,7 +2581,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		}); err != nil {
 			return ProcessResult{}, err
 		}
-		r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &checkpoint)
+		r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, run.ID, &checkpoint)
 		return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "skipped", Summary: reason}, nil
 	}
 	if resumedRun.Resumed && resumedRun.StartStep != stepDiscoverPR || (!resumedRun.Resumed && resumedRun.StartStep == stepDiscoverPR && len(prQueryLabels(r.discoveryPolicyForProject(project.ID).Labels)) > 0) {
@@ -2664,7 +2664,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			}
 			if breakerStreak > 0 {
 				r.appendFailureStreakPausedEvent(ctx, pausedLoop, run.ID, latest, breakerStreak)
-				if _, err := r.finishFailureStreakBreaker(ctx, *project, pausedLoop, queueItem, &latest); err != nil {
+				if _, err := r.finishFailureStreakBreaker(ctx, *project, pausedLoop, queueItem, run.ID, &latest); err != nil {
 					return ProcessResult{}, err
 				}
 				return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
@@ -2673,12 +2673,12 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 				if scheduled, err := r.schedulePendingRediscoveryAfterRun(ctx, *loop, *queueItem.Repo, *queueItem.PRNumber); err != nil {
 					return ProcessResult{}, err
 				} else if scheduled {
-					r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &latest)
+					r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, run.ID, &latest)
 					return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
 				}
 			}
 			if queueResultIsTerminalForCleanup(failedQueue) {
-				r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &latest)
+				r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, run.ID, &latest)
 			}
 			return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
 		}
@@ -2711,7 +2711,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	r.appendEvent(ctx, eventInput{eventType: "run.completed", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"summary": summary}})
 	if err := r.repos.Queue.Complete(ctx, queueItem.ID, r.nowISO()); err != nil {
 		if errors.Is(err, storage.ErrQueueItemNotActive) {
-			r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &checkpoint)
+			r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, run.ID, &checkpoint)
 			return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: statusForSkip(checkpoint.SkipReason), Summary: summary}, nil
 		}
 		return ProcessResult{}, err
@@ -2724,7 +2724,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		if scheduled, err := r.schedulePendingRediscoveryAfterRun(ctx, *loop, *queueItem.Repo, *queueItem.PRNumber); err != nil {
 			return ProcessResult{}, err
 		} else if scheduled {
-			r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &checkpoint)
+			r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, run.ID, &checkpoint)
 			status := statusForSkip(checkpoint.SkipReason)
 			return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: status, Summary: summary}, nil
 		}
@@ -2733,14 +2733,14 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			return ProcessResult{}, err
 		}
 		if paused {
-			r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &checkpoint)
+			r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, run.ID, &checkpoint)
 			return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: statusForSkip(checkpoint.SkipReason), Summary: summary}, nil
 		}
 	}
 	if scheduled, err := r.schedulePendingRediscoveryAfterRun(ctx, *loop, *queueItem.Repo, *queueItem.PRNumber); err != nil {
 		return ProcessResult{}, err
 	} else if scheduled {
-		r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &checkpoint)
+		r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, run.ID, &checkpoint)
 		status := statusForSkip(checkpoint.SkipReason)
 		return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: status, Summary: summary}, nil
 	}
@@ -2755,7 +2755,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			return ProcessResult{}, err
 		}
 	}
-	r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &checkpoint)
+	r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, run.ID, &checkpoint)
 	status := statusForSkip(checkpoint.SkipReason)
 	return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: status, Summary: summary}, nil
 }
@@ -3036,7 +3036,7 @@ func (r *Runner) finishLabelMismatchFixerQueueItem(ctx context.Context, project 
 	}); err != nil {
 		return ProcessResult{}, err
 	}
-	r.cleanupFixerWorktreeIfTerminal(context.Background(), project, &checkpoint)
+	r.cleanupFixerWorktreeIfTerminal(context.Background(), project, derefRunRecordID(run), &checkpoint)
 	result := ProcessResult{LoopID: loop.ID, QueueItemID: queueItem.ID, Status: "skipped", Summary: summary}
 	if run != nil {
 		result.RunID = run.ID
@@ -5818,13 +5818,9 @@ func restartLatestRunFromDiscover(ctx context.Context, repos *storage.Repositori
 	if latestRun.Status != "failed" && latestRun.Status != "interrupted" {
 		return fmt.Errorf("cannot restart failure-streak loop %s without a failed or interrupted run", loopID)
 	}
-	checkpoint := parseCheckpoint(latestRun.CheckpointJSON)
-	checkpoint.ResumePolicy = loops.ResumePolicyRestartFromDiscover
-	updated := *latestRun
-	encoded := mustMarshalJSON(checkpoint)
-	updated.CheckpointJSON = &encoded
-	updated.UpdatedAt = updatedAt
-	return repos.Runs.Upsert(ctx, updated)
+	// Field-level so a concurrent terminal cleanup's timestamps are not lost; the
+	// two writers can interleave in either order.
+	return repos.Runs.MergeRunResumePolicy(ctx, latestRun.ID, loops.ResumePolicyRestartFromDiscover, updatedAt)
 }
 
 // fixerRunParkedOnInvalidCompletion reports whether a manual-intervention park was
@@ -5884,12 +5880,9 @@ func MarkInvalidCompletionRunRestartFromDiscover(ctx context.Context, repos *sto
 	if !fixerRunParkedOnInvalidCompletion(*latestRun, checkpoint) {
 		return false, nil
 	}
-	checkpoint.ResumePolicy = loops.ResumePolicyRestartFromDiscover
-	updated := *latestRun
-	encoded := mustMarshalJSON(checkpoint)
-	updated.CheckpointJSON = &encoded
-	updated.UpdatedAt = updatedAt
-	if err := repos.Runs.Upsert(ctx, updated); err != nil {
+	// Field-level so a concurrent terminal cleanup's timestamps are not lost; the
+	// two writers can interleave in either order.
+	if err := repos.Runs.MergeRunResumePolicy(ctx, latestRun.ID, loops.ResumePolicyRestartFromDiscover, updatedAt); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -6267,8 +6260,8 @@ func (r *Runner) wakeSchedulerAfterEnqueue() {
 // and immediately hands off to feedback that discovery durably observed while
 // the failing run was active. The new queue state is exposed only after the
 // failed checkpoint is forced back to discover.
-func (r *Runner) finishFailureStreakBreaker(ctx context.Context, project storage.ProjectRecord, loop storage.LoopRecord, queueItem storage.QueueItemRecord, checkpoint *fixerCheckpoint) (bool, error) {
-	r.cleanupFixerWorktreeIfTerminal(context.Background(), project, checkpoint)
+func (r *Runner) finishFailureStreakBreaker(ctx context.Context, project storage.ProjectRecord, loop storage.LoopRecord, queueItem storage.QueueItemRecord, runID string, checkpoint *fixerCheckpoint) (bool, error) {
+	r.cleanupFixerWorktreeIfTerminal(context.Background(), project, runID, checkpoint)
 	if r.db == nil || r.repos == nil || r.repos.Loops == nil || r.repos.Queue == nil || r.repos.Runs == nil || queueItem.Repo == nil || queueItem.PRNumber == nil {
 		return false, nil
 	}
@@ -7201,7 +7194,27 @@ func (r *Runner) reconcileCommits(ctx context.Context, project storage.ProjectRe
 	return checkpoint, nil
 }
 
-func (r *Runner) cleanupFixerWorktreeIfTerminal(ctx context.Context, project storage.ProjectRecord, checkpoint *fixerCheckpoint) {
+// cleanupFixerWorktreeIfTerminal removes the run's worktree once the run has
+// reached a terminal state, and records the attempt durably.
+//
+// The cleanup timestamps it sets are the only record of what happened. Read them as
+// three states: neither set means cleanup never ran; both set means the worktree was
+// removed; CleanupAttemptedAt without CleanedAt means the outcome is *unverified* --
+// removal was started and not confirmed. It deliberately does not mean "failed": the
+// attempt is written before the filesystem mutation, so a daemon exit mid-removal
+// lands in the same state as a refused removal, and the worktree may be absent,
+// partially removed, or intact. Only inspecting the path can tell them apart, so
+// nothing here infers failure from the pair. Callers reach
+// this after completeRun has already written the run, so a full-row Upsert of the
+// in-memory record could revert a concurrent transition (discovery persisting
+// restart_from_discover while cleanup runs, say). The narrow timestamp merge
+// touches only the cleanup projection. The attempt is persisted before the
+// filesystem mutation so a daemon exit after removal cannot erase the only
+// durable evidence that cleanup started.
+//
+// runID may be empty when no durable run owns the cleanup; the timestamps then
+// stay in-memory for the returned ProcessResult, as before.
+func (r *Runner) cleanupFixerWorktreeIfTerminal(ctx context.Context, project storage.ProjectRecord, runID string, checkpoint *fixerCheckpoint) {
 	if checkpoint == nil || checkpoint.Worktree == nil || checkpoint.Worktree.Path == "" || checkpoint.Worktree.Branch == "" || checkpoint.Worktree.CleanedAt != "" {
 		return
 	}
@@ -7212,6 +7225,12 @@ func (r *Runner) cleanupFixerWorktreeIfTerminal(ctx context.Context, project sto
 		return
 	}
 	checkpoint.Worktree.CleanupAttemptedAt = r.nowISO()
+	if err := r.persistTerminalCleanupCheckpoint(ctx, runID, checkpoint); err != nil {
+		r.logError("fixer terminal cleanup attempt persist failed", map[string]any{
+			"runId": runID, "worktreePath": checkpoint.Worktree.Path, "message": err.Error(),
+		})
+		return
+	}
 	worktreeRoot, rootErr := fixerWorktreeRoot(project)
 	if rootErr != nil {
 		r.logError("fixer worktree cleanup skipped", map[string]any{"projectId": project.ID, "worktreePath": checkpoint.Worktree.Path, "branch": checkpoint.Worktree.Branch, "message": rootErr.Error()})
@@ -7223,7 +7242,33 @@ func (r *Runner) cleanupFixerWorktreeIfTerminal(ctx context.Context, project sto
 		return
 	}
 	checkpoint.Worktree.CleanedAt = r.nowISO()
+	if err := r.persistTerminalCleanupCheckpoint(ctx, runID, checkpoint); err != nil {
+		r.logError("fixer terminal cleanup completion persist failed", map[string]any{
+			"runId": runID, "worktreePath": checkpoint.Worktree.Path, "message": err.Error(),
+		})
+	}
 	r.appendEvent(ctx, eventInput{eventType: "fixer.worktree.cleaned", projectID: project.ID, entityType: "pull_request", entityID: project.ID, payload: map[string]any{"path": checkpoint.Worktree.Path, "branch": checkpoint.Worktree.Branch}})
+}
+
+// derefRunRecordID returns the run's ID, or "" when no durable run exists.
+func derefRunRecordID(run *storage.RunRecord) string {
+	if run == nil {
+		return ""
+	}
+	return run.ID
+}
+
+// persistTerminalCleanupCheckpoint stores the cleanup timestamps without
+// disturbing the rest of the run row. Callers decide whether the write is a
+// precondition for the filesystem mutation or a secondary completion error.
+func (r *Runner) persistTerminalCleanupCheckpoint(ctx context.Context, runID string, checkpoint *fixerCheckpoint) error {
+	if checkpoint == nil || checkpoint.Worktree == nil || r.repos == nil || r.repos.Runs == nil || strings.TrimSpace(runID) == "" {
+		return nil
+	}
+	if err := r.repos.Runs.MergeWorktreeCleanupTimestamps(ctx, runID, checkpoint.Worktree.CleanupAttemptedAt, checkpoint.Worktree.CleanedAt, r.nowISO()); err != nil {
+		return err
+	}
+	return nil
 }
 
 // isMissingOrUnusableFixerWorktree reports whether a checkpoint worktree path
@@ -8552,6 +8597,7 @@ func rewindCheckpointForPrepareRetry(checkpoint fixerCheckpoint) fixerCheckpoint
 		worktree.HeadSHA = ""
 		worktree.BaseHeadSHA = ""
 		worktree.PreparedAt = ""
+		worktree.CleanupAttemptedAt = ""
 		worktree.CleanedAt = ""
 		checkpoint.Worktree = &worktree
 	}
