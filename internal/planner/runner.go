@@ -12,19 +12,20 @@ import (
 	"strings"
 	"time"
 
-	"github.com/MumuTW/looper/internal/agent"
-	"github.com/MumuTW/looper/internal/bootstrap"
-	"github.com/MumuTW/looper/internal/config"
-	"github.com/MumuTW/looper/internal/disclosure"
-	"github.com/MumuTW/looper/internal/domain"
-	"github.com/MumuTW/looper/internal/eventlog"
-	githubinfra "github.com/MumuTW/looper/internal/infra/github"
-	"github.com/MumuTW/looper/internal/labels"
-	"github.com/MumuTW/looper/internal/lifecycle"
-	"github.com/MumuTW/looper/internal/loops"
-	"github.com/MumuTW/looper/internal/loops/failureclass"
-	"github.com/MumuTW/looper/internal/storage"
-	"github.com/MumuTW/looper/internal/worktreesafety"
+	"github.com/nexu-io/looper/internal/agent"
+	"github.com/nexu-io/looper/internal/bootstrap"
+	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/disclosure"
+	"github.com/nexu-io/looper/internal/domain"
+	"github.com/nexu-io/looper/internal/eventlog"
+	githubinfra "github.com/nexu-io/looper/internal/infra/github"
+	"github.com/nexu-io/looper/internal/labels"
+	"github.com/nexu-io/looper/internal/lifecycle"
+	"github.com/nexu-io/looper/internal/loops"
+	"github.com/nexu-io/looper/internal/loops/failureclass"
+	"github.com/nexu-io/looper/internal/roles"
+	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/worktreesafety"
 )
 
 const (
@@ -49,14 +50,14 @@ var plannerStepSequence = []PlannerStep{stepDiscoverIssues, stepPrepareWorktree,
 
 type PlannerStep string
 
-type QueueFailureKind string
-
 const (
-	FailureRetryableTransient   QueueFailureKind = "retryable_transient"
-	FailureRetryableAfterResume QueueFailureKind = "retryable_after_resume"
-	FailureNonRetryable         QueueFailureKind = "non_retryable"
-	FailureManualIntervention   QueueFailureKind = "manual_intervention"
+	FailureRetryableTransient   = roles.FailureRetryableTransient
+	FailureRetryableAfterResume = roles.FailureRetryableAfterResume
+	FailureNonRetryable         = roles.FailureNonRetryable
+	FailureManualIntervention   = roles.FailureManualIntervention
 )
+
+type QueueFailureKind = roles.QueueFailureKind
 
 type IssueSummary struct {
 	Number    int64

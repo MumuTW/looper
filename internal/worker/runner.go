@@ -17,25 +17,26 @@ import (
 	"strings"
 	"time"
 
-	"github.com/MumuTW/looper/internal/agent"
-	"github.com/MumuTW/looper/internal/bootstrap"
-	"github.com/MumuTW/looper/internal/config"
-	"github.com/MumuTW/looper/internal/disclosure"
-	"github.com/MumuTW/looper/internal/domain"
-	"github.com/MumuTW/looper/internal/eventlog"
-	githubinfra "github.com/MumuTW/looper/internal/infra/github"
-	"github.com/MumuTW/looper/internal/infra/specpr"
-	"github.com/MumuTW/looper/internal/labels"
-	"github.com/MumuTW/looper/internal/lifecycle"
-	"github.com/MumuTW/looper/internal/loops"
-	"github.com/MumuTW/looper/internal/loops/failureclass"
-	"github.com/MumuTW/looper/internal/network/protocol"
-	"github.com/MumuTW/looper/internal/networkpolicy"
-	"github.com/MumuTW/looper/internal/processcontainment"
-	"github.com/MumuTW/looper/internal/storage"
-	"github.com/MumuTW/looper/internal/validation"
-	"github.com/MumuTW/looper/internal/worker/workflow"
-	"github.com/MumuTW/looper/internal/worktreesafety"
+	"github.com/nexu-io/looper/internal/agent"
+	"github.com/nexu-io/looper/internal/bootstrap"
+	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/disclosure"
+	"github.com/nexu-io/looper/internal/domain"
+	"github.com/nexu-io/looper/internal/eventlog"
+	githubinfra "github.com/nexu-io/looper/internal/infra/github"
+	"github.com/nexu-io/looper/internal/infra/specpr"
+	"github.com/nexu-io/looper/internal/labels"
+	"github.com/nexu-io/looper/internal/lifecycle"
+	"github.com/nexu-io/looper/internal/loops"
+	"github.com/nexu-io/looper/internal/loops/failureclass"
+	"github.com/nexu-io/looper/internal/network/protocol"
+	"github.com/nexu-io/looper/internal/networkpolicy"
+	"github.com/nexu-io/looper/internal/processcontainment"
+	"github.com/nexu-io/looper/internal/roles"
+	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/validation"
+	"github.com/nexu-io/looper/internal/worker/workflow"
+	"github.com/nexu-io/looper/internal/worktreesafety"
 )
 
 const (
@@ -46,10 +47,10 @@ const (
 	stepValidate        = workflow.StepValidate
 	stepOpenPR          = workflow.StepOpenPR
 
-	FailureRetryableTransient   QueueFailureKind = "retryable_transient"
-	FailureRetryableAfterResume QueueFailureKind = "retryable_after_resume"
-	FailureNonRetryable         QueueFailureKind = "non_retryable"
-	FailureManualIntervention   QueueFailureKind = "manual_intervention"
+	FailureRetryableTransient   = roles.FailureRetryableTransient
+	FailureRetryableAfterResume = roles.FailureRetryableAfterResume
+	FailureNonRetryable         = roles.FailureNonRetryable
+	FailureManualIntervention   = roles.FailureManualIntervention
 
 	defaultAgentTimeout = time.Hour
 	defaultClaimTTL     = 10 * time.Minute
@@ -77,7 +78,7 @@ var (
 // pipeline order and resume decisions live in internal/worker/workflow.
 type WorkerStep = workflow.Step
 
-type QueueFailureKind string
+type QueueFailureKind = roles.QueueFailureKind
 
 type PullRequestSummary struct {
 	Number      int64

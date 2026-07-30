@@ -19,27 +19,28 @@ import (
 	"strings"
 	"time"
 
-	"github.com/MumuTW/looper/internal/agent"
-	"github.com/MumuTW/looper/internal/bootstrap"
-	"github.com/MumuTW/looper/internal/config"
-	"github.com/MumuTW/looper/internal/disclosure"
-	"github.com/MumuTW/looper/internal/domain"
-	"github.com/MumuTW/looper/internal/eventlog"
-	gitinfra "github.com/MumuTW/looper/internal/infra/git"
-	githubinfra "github.com/MumuTW/looper/internal/infra/github"
-	"github.com/MumuTW/looper/internal/infra/specpr"
-	"github.com/MumuTW/looper/internal/labels"
-	"github.com/MumuTW/looper/internal/loops"
-	"github.com/MumuTW/looper/internal/loops/failureclass"
-	"github.com/MumuTW/looper/internal/networkpolicy"
-	"github.com/MumuTW/looper/internal/reviewer/automerge"
-	"github.com/MumuTW/looper/internal/reviewer/criteria"
-	"github.com/MumuTW/looper/internal/reviewer/publish"
-	"github.com/MumuTW/looper/internal/reviewer/resolution"
-	"github.com/MumuTW/looper/internal/reviewer/workflow"
-	"github.com/MumuTW/looper/internal/storage"
-	"github.com/MumuTW/looper/internal/version"
-	"github.com/MumuTW/looper/internal/worktreesafety"
+	"github.com/nexu-io/looper/internal/agent"
+	"github.com/nexu-io/looper/internal/bootstrap"
+	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/disclosure"
+	"github.com/nexu-io/looper/internal/domain"
+	"github.com/nexu-io/looper/internal/eventlog"
+	gitinfra "github.com/nexu-io/looper/internal/infra/git"
+	githubinfra "github.com/nexu-io/looper/internal/infra/github"
+	"github.com/nexu-io/looper/internal/infra/specpr"
+	"github.com/nexu-io/looper/internal/labels"
+	"github.com/nexu-io/looper/internal/loops"
+	"github.com/nexu-io/looper/internal/loops/failureclass"
+	"github.com/nexu-io/looper/internal/networkpolicy"
+	"github.com/nexu-io/looper/internal/reviewer/automerge"
+	"github.com/nexu-io/looper/internal/reviewer/criteria"
+	"github.com/nexu-io/looper/internal/reviewer/publish"
+	"github.com/nexu-io/looper/internal/reviewer/resolution"
+	"github.com/nexu-io/looper/internal/reviewer/workflow"
+	"github.com/nexu-io/looper/internal/roles"
+	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/version"
+	"github.com/nexu-io/looper/internal/worktreesafety"
 )
 
 // ReviewerStep and the stepXxx constants are a compatibility surface over
@@ -88,14 +89,14 @@ const (
 	reviewEventAgentNative    ReviewEvent = "AGENT_NATIVE"
 )
 
-type QueueFailureKind string
-
 const (
-	FailureRetryableTransient   QueueFailureKind = "retryable_transient"
-	FailureRetryableAfterResume QueueFailureKind = "retryable_after_resume"
-	FailureNonRetryable         QueueFailureKind = "non_retryable"
-	FailureManualIntervention   QueueFailureKind = "manual_intervention"
+	FailureRetryableTransient   = roles.FailureRetryableTransient
+	FailureRetryableAfterResume = roles.FailureRetryableAfterResume
+	FailureNonRetryable         = roles.FailureNonRetryable
+	FailureManualIntervention   = roles.FailureManualIntervention
 )
+
+type QueueFailureKind = roles.QueueFailureKind
 
 const (
 	defaultAgentTimeout = 90 * time.Minute
