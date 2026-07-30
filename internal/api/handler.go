@@ -4443,6 +4443,20 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 	metadataJSON := string(payloadJSONBytes)
 	reusedWorkerLoop := false
 
+	// Refuse to start a second run against an issue Looper is already working.
+	// Same-role reuse below is a different case: that resumes the existing worker
+	// rather than adding one. This catches the cross-role collision — a fixer
+	// repairing the issue's pull request, or a planner still specifying it.
+	if issueNumber != nil && !derefBool(body.Force) {
+		existing, listErr := services.Repositories.Loops.List(r.Context())
+		if listErr != nil {
+			return workerCreateResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: listErr.Error()}
+		}
+		if occupant := findIssueOccupant(existing, projectID, *repo, *issueNumber, ""); occupant != nil {
+			return workerCreateResponse{}, issueOccupiedError(*repo, *issueNumber, *occupant)
+		}
+	}
+
 	// Issue-worker reuse enqueues the existing loop (same as start requeue).
 	// Take the shared per-loop retry lock before the TX so discard+retry cannot
 	// wipe the managed worktree after reuse preflight/enqueue races in.
