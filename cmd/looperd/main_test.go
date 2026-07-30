@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os/exec"
 	"path/filepath"
@@ -115,6 +116,29 @@ func TestRunBootstrapsLooperdByDefault(t *testing.T) {
 	}
 	if got := stderr.String(); got != "" {
 		t.Fatalf("runWithDeps([]) stderr = %q, want empty string", got)
+	}
+}
+
+func TestRunDispatchesServiceAfterGlobalFlags(t *testing.T) {
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	var received []string
+
+	exitCode := runWithDeps([]string{"--config", "/tmp/looperd.toml", "service", "install"}, stdout, stderr, runDeps{
+		serviceImpl: func(args []string, _, _ io.Writer) int {
+			received = args
+			return 0
+		},
+		bootstrapImpl: func(context.Context, bootstrap.Options) (bootstrap.Result, error) {
+			return bootstrap.Result{}, errors.New("bootstrap should not be called")
+		},
+	})
+
+	if exitCode != 0 {
+		t.Fatalf("runWithDeps() exit code = %d", exitCode)
+	}
+	if want := []string{"install", "--config", "/tmp/looperd.toml"}; !slices.Equal(received, want) {
+		t.Fatalf("service args = %v, want %v", received, want)
 	}
 }
 

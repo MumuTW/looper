@@ -29,9 +29,11 @@ func main() {
 }
 
 type bootstrapFunc func(context.Context, bootstrap.Options) (bootstrap.Result, error)
+type serviceCommandFunc func([]string, io.Writer, io.Writer) int
 
 type runDeps struct {
 	bootstrapImpl bootstrapFunc
+	serviceImpl   serviceCommandFunc
 	env           map[string]string
 }
 
@@ -45,10 +47,16 @@ func runWithDeps(args []string, stdout, stderr io.Writer, deps runDeps) int {
 		return 0
 	}
 
-	if len(args) > 0 && args[0] == "service" {
+	if serviceArgs, ok := serviceCommandArgs(args); ok {
 		// Handled before bootstrap: this manages the daemon's lifecycle rather than
 		// starting one, so it must not fall through into starting a runtime.
-		return runServiceCommand(context.Background(), args[1:], stdout, stderr, defaultServiceDeps())
+		serviceImpl := deps.serviceImpl
+		if serviceImpl == nil {
+			serviceImpl = func(args []string, stdout, stderr io.Writer) int {
+				return runServiceCommand(context.Background(), args, stdout, stderr, defaultServiceDeps())
+			}
+		}
+		return serviceImpl(serviceArgs, stdout, stderr)
 	}
 
 	if hasHelpArg(args) || (len(args) > 0 && args[0] == "help") {
@@ -86,6 +94,21 @@ func runWithDeps(args []string, stdout, stderr io.Writer, deps runDeps) int {
 
 	_, _ = fmt.Fprintf(stderr, "looperd: %v\n", err)
 	return 1
+}
+
+func serviceCommandArgs(args []string) ([]string, bool) {
+	for index := 0; index+1 < len(args); index++ {
+		if args[index] != "service" {
+			continue
+		}
+		// A service subcommand is an unambiguous boundary, so global configuration
+		// flags before it can be forwarded without accidentally starting a daemon.
+		switch args[index+1] {
+		case "install", "uninstall", "status", "print", "help", "-h", "--help":
+			return append(append([]string{}, args[index+1:]...), args[:index]...), true
+		}
+	}
+	return nil, false
 }
 
 type daemonRuntime struct {

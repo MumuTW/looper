@@ -67,7 +67,25 @@ func runServiceCommand(ctx context.Context, args []string, stdout, stderr io.Wri
 		return 2
 	}
 
-	plan, configPath, err := buildServicePlan(rest, deps, subcommand == "install")
+	var (
+		plan       daemonservice.Plan
+		configPath string
+		err        error
+	)
+	if subcommand == "uninstall" && len(rest) > 0 && rest[0] == "--default" {
+		if len(rest) != 1 {
+			_, _ = fmt.Fprintln(stderr, "looperd service: uninstall --default does not accept configuration flags")
+			return 2
+		}
+		plan, err = buildDefaultUninstallPlan(deps)
+	} else {
+		if len(rest) > 0 && !strings.HasPrefix(rest[0], "--") {
+			_, _ = fmt.Fprintf(stderr, "looperd service: unexpected positional argument %q\n", rest[0])
+			writeServiceUsage(stderr)
+			return 2
+		}
+		plan, configPath, err = buildServicePlan(rest, deps, subcommand == "install")
+	}
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "looperd service: %v\n", err)
 		return 1
@@ -98,6 +116,18 @@ func runServiceCommand(ctx context.Context, args []string, stdout, stderr io.Wri
 		_, _ = fmt.Fprintf(stdout, "removed %s service\n  unit: %s\n", result.Manager, result.UnitPath)
 		return 0
 	}
+}
+
+func buildDefaultUninstallPlan(deps serviceDeps) (daemonservice.Plan, error) {
+	homeDir, err := deps.homeDir()
+	if err != nil {
+		return daemonservice.Plan{}, fmt.Errorf("resolve home directory: %w", err)
+	}
+	return daemonservice.BuildDefaultUninstallPlan(daemonservice.DefaultUninstallInput{
+		HomeDir: homeDir,
+		UID:     deps.uid(),
+		GOOS:    deps.goos,
+	})
 }
 
 // buildServicePlan resolves the configuration and turns it into a plan.
@@ -236,6 +266,8 @@ looperd service
 Usage:
 	looperd service install     Write the service unit and load it
 	looperd service uninstall   Unload the service and remove its unit
+	looperd service uninstall --default
+	                            Remove the canonical unit without reading config
 	looperd service status      Report whether the unit is installed
 	looperd service print       Print the unit that would be installed
 

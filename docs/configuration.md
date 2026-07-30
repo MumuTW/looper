@@ -761,6 +761,8 @@ looperd service print       # show the unit without writing anything
 looperd service install     # write it and load it
 looperd service status      # is the unit installed?
 looperd service uninstall   # unload and remove it
+# if config validation is broken, remove only the canonical default unit:
+looperd service uninstall --default
 ```
 
 `install` creates a previously absent unit; it deliberately refuses to overwrite
@@ -771,9 +773,10 @@ claiming the daemon is gone.
 
 **A per-user service is not always-on.** A LaunchAgent runs only while the user is
 logged in; a systemd user unit does the same unless you run
-`loginctl enable-linger $USER`. For a machine that must keep working with nobody
-signed in, enable automatic login too — otherwise a reboot leaves the daemon
-stopped until someone logs in.
+`loginctl enable-linger $USER`. For a Linux machine that must keep working with
+nobody signed in, lingering is sufficient. A macOS LaunchAgent instead requires
+an active user session, so unattended use needs automatic login or another
+supervisor.
 
 ## Project override rules
 

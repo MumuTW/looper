@@ -66,6 +66,16 @@ type Input struct {
 	GOOS string
 }
 
+// DefaultUninstallInput identifies the one service location that Looper owns
+// without consulting a daemon configuration. It is deliberately limited to the
+// canonical path: a config-selected launchd override remains authoritative for
+// itself and cannot be guessed safely after that config is invalid.
+type DefaultUninstallInput struct {
+	HomeDir string
+	UID     int
+	GOOS    string
+}
+
 // ForGOOS reports the manager a platform uses, or false when Looper has no
 // supervised-service support there.
 func ForGOOS(goos string) (Manager, bool) {
@@ -77,6 +87,36 @@ func ForGOOS(goos string) (Manager, bool) {
 	default:
 		return "", false
 	}
+}
+
+// BuildDefaultUninstallPlan produces a config-independent teardown plan for
+// Looper's canonical per-user unit. It is used only after the caller explicitly
+// asks for the default unit, for example when a malformed daemon config prevents
+// normal plan construction.
+func BuildDefaultUninstallPlan(input DefaultUninstallInput) (Plan, error) {
+	manager, ok := ForGOOS(input.GOOS)
+	if !ok {
+		return Plan{}, fmt.Errorf("looper has no supervised-service support on %s; run looperd in the foreground under your own supervisor", input.GOOS)
+	}
+	if strings.TrimSpace(input.HomeDir) == "" {
+		return Plan{}, fmt.Errorf("home directory is required")
+	}
+	if input.UID <= 0 {
+		return Plan{}, fmt.Errorf("supervised service installation is user-scoped; refusing uid %d", input.UID)
+	}
+	if manager == ManagerSystemd {
+		return Plan{
+			Manager:    ManagerSystemd,
+			UnitPath:   filepath.Join(input.HomeDir, ".config", "systemd", "user", "looperd.service"),
+			Deactivate: [][]string{{"systemctl", "--user", "disable", "--now", "looperd.service"}},
+		}, nil
+	}
+	domain := fmt.Sprintf("gui/%d", input.UID)
+	return Plan{
+		Manager:    ManagerLaunchd,
+		UnitPath:   filepath.Join(input.HomeDir, "Library", "LaunchAgents", Label+".plist"),
+		Deactivate: [][]string{{"launchctl", "bootout", domain + "/" + Label}},
+	}, nil
 }
 
 // Build produces the plan for the given configuration.

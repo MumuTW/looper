@@ -225,6 +225,41 @@ func TestServiceUninstallRemovesTheUnit(t *testing.T) {
 	}
 }
 
+func TestServiceUninstallDefaultWorksWithInvalidConfig(t *testing.T) {
+	t.Parallel()
+	fs := &serviceTestFS{files: map[string][]byte{filepath.Join("/home/dev", "Library", "LaunchAgents", daemonservice.Label+".plist"): []byte("unit")}}
+	var commands []string
+	deps := testServiceDeps(config.DaemonModeLaunchd, fs, &commands)
+	deps.loadConfig = func([]string) (config.LoadedFileConfig, error) {
+		return config.LoadedFileConfig{}, os.ErrInvalid
+	}
+	var stdout, stderr bytes.Buffer
+
+	if code := runServiceCommand(context.Background(), []string{"uninstall", "--default"}, &stdout, &stderr, deps); code != 0 {
+		t.Fatalf("default uninstall exit = %d, stderr = %s", code, stderr.String())
+	}
+	if len(fs.files) != 0 {
+		t.Fatalf("default uninstall left files: %v", fs.files)
+	}
+	if len(commands) != 1 || !strings.HasPrefix(commands[0], "launchctl bootout") {
+		t.Fatalf("default uninstall commands = %v", commands)
+	}
+}
+
+func TestServiceRejectsPositionalArgument(t *testing.T) {
+	t.Parallel()
+	fs := &serviceTestFS{files: map[string][]byte{}}
+	var commands []string
+	var stdout, stderr bytes.Buffer
+
+	if code := runServiceCommand(context.Background(), []string{"uninstall", "status"}, &stdout, &stderr, testServiceDeps(config.DaemonModeLaunchd, fs, &commands)); code != 2 {
+		t.Fatalf("uninstall with positional argument exit = %d, want 2", code)
+	}
+	if len(fs.files) != 0 || len(commands) != 0 {
+		t.Fatalf("invalid invocation touched service state: files=%v commands=%v", fs.files, commands)
+	}
+}
+
 func TestServiceRejectsUnknownSubcommand(t *testing.T) {
 	t.Parallel()
 	fs := &serviceTestFS{files: map[string][]byte{}}

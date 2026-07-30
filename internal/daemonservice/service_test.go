@@ -1,6 +1,7 @@
 package daemonservice
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 
@@ -319,5 +320,20 @@ func TestBuildRejectsLaunchdUnitPathOutsideLaunchAgents(t *testing.T) {
 				t.Fatalf("Build() accepted unsafe plist path %q", path)
 			}
 		})
+	}
+}
+
+func TestBuildDefaultUninstallPlanDoesNotNeedDaemonConfig(t *testing.T) {
+	t.Parallel()
+
+	plan, err := BuildDefaultUninstallPlan(DefaultUninstallInput{HomeDir: "/home/dev", UID: 501, GOOS: "linux"})
+	if err != nil {
+		t.Fatalf("BuildDefaultUninstallPlan() error = %v", err)
+	}
+	if got, want := plan.UnitPath, "/home/dev/.config/systemd/user/looperd.service"; got != want {
+		t.Fatalf("UnitPath = %q, want %q", got, want)
+	}
+	if got, want := plan.Deactivate, [][]string{{"systemctl", "--user", "disable", "--now", "looperd.service"}}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("Deactivate = %v, want %v", got, want)
 	}
 }
