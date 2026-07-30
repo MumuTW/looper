@@ -13,7 +13,6 @@ import (
 	"regexp"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/nexu-io/looper/internal/agent"
@@ -3464,16 +3463,11 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 	claimedCount, availableSlots, err := executeClaimPhase(ctx, "pre_discovery", input, discoveredRunnableIDs, true)
 	recordClaim(claimedCount, availableSlots, err)
 	tickDiscoveryState := githubinfra.NewDiscoveryTickState()
-	// snapshotMu guards the snapshot map: prefetchProjectSnapshots warms several
-	// projects concurrently and each warm allocates its project's snapshot here.
-	var snapshotMu sync.Mutex
 	projectSnapshots := map[string]*githubinfra.DiscoverySnapshot{}
 	projectSnapshot := func(projectID string) *githubinfra.DiscoverySnapshot {
 		if input.GitHubGateway == nil {
 			return nil
 		}
-		snapshotMu.Lock()
-		defer snapshotMu.Unlock()
 		if snapshot, ok := projectSnapshots[projectID]; ok {
 			return snapshot
 		}
@@ -3486,27 +3480,7 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 	if input.Config != nil {
 		providers = forge.NewResolver(*input.Config)
 	}
-	// Warm later projects' snapshot pages in the background while the serial walk
-	// below proceeds. A tick used to pay each project's forge latency end to end,
-	// one after another, so a multi-repo daemon spent minutes per tick and could not
-	// honour its own poll interval.
-	//
-	// Only the reads overlap. The lane walk, its enqueues, and every admission
-	// recheck stay exactly as serial as before, because admission's "no later
-	// discovery after close" guarantee comes from the total ordering of that walk —
-	// fanning the walk out breaks it, and no latch can restore it once two projects'
-	// lanes have already started (see #147).
-	//
-	// walkedUpTo lets a warm skip a project the walk already reached, so the warm
-	// never races the walk's own just-in-time fetch.
-	var walkedUpTo atomic.Int64
-	walkedUpTo.Store(-1)
-	waitForPrefetch := prefetchProjectSnapshots(ctx, input, projectsList, providers, lanes, projectSnapshot, &walkedUpTo)
-	defer waitForPrefetch()
-	for projectIndex, project := range projectsList {
-		// Publish walk progress so a background warm for this project stands down
-		// rather than racing the just-in-time fetch its lanes are about to make.
-		walkedUpTo.Store(int64(projectIndex))
+	for _, project := range projectsList {
 		if err := ctx.Err(); err != nil {
 			retErr = errors.Join(append(errs, err)...)
 			return retErr
@@ -3622,9 +3596,8 @@ func coordinatorEnabledForProject(input defaultSchedulerTickInput, projectID str
 
 // schedulerProjectRepo resolves the repo a project's discovery reads, with the
 // same precedence the lane walk uses: the captured catalog binding when a config
-// is present, otherwise the project's stored metadata. Shared with the snapshot
-// prefetch so a warm can never key on a different repo than the walk consuming it.
-// inCatalog is false when a config is present but the project is absent from it.
+// is present, otherwise the project's stored metadata. inCatalog is false when a
+// config is present but the project is absent from it.
 func schedulerProjectRepo(input defaultSchedulerTickInput, project storage.ProjectRecord) (repo string, inCatalog bool) {
 	repo = repoFromProjectMetadata(project.MetadataJSON)
 	if input.Config != nil {
@@ -3635,143 +3608,6 @@ func schedulerProjectRepo(input defaultSchedulerTickInput, project storage.Proje
 		repo = strings.TrimSpace(binding.Repo)
 	}
 	return repo, true
-}
-
-// maxSchedulerSnapshotPrefetchConcurrency bounds how many projects a tick warms at
-// once. Warming is forge-API bound, so the cap protects the shared `gh` rate limit
-// and subprocess budget rather than matching core count.
-const maxSchedulerSnapshotPrefetchConcurrency = 4
-
-func schedulerSnapshotPrefetchConcurrency(targets int) int {
-	if targets < 1 {
-		return 1
-	}
-	if targets > maxSchedulerSnapshotPrefetchConcurrency {
-		return maxSchedulerSnapshotPrefetchConcurrency
-	}
-	return targets
-}
-
-// prefetchProjectSnapshots warms every eligible project's discovery snapshot
-// concurrently, so the serial lane walk that follows reads warm pages instead of
-// paying each project's forge latency in sequence.
-//
-// This is deliberately reads-only. Nothing here enqueues, claims, or decides
-// admission, so concurrency cannot affect the shutdown contract the serial walk
-// enforces. Failures are benign and logged, never returned: a cold snapshot just
-// means the lane fetches it itself.
-// snapshotPagesForProject reports which shared snapshot pages some enabled,
-// supported lane will actually read for this project. Warming a page with no
-// consumer costs a `gh` call per project per tick and hides no latency.
-func snapshotPagesForProject(lanes []discoveryLane, projectID string, capabilities forge.Capabilities) (pullRequests, issues bool) {
-	for _, lane := range lanes {
-		if !lane.Present || lane.Enabled == nil || !lane.Enabled(projectID) {
-			continue
-		}
-		if lane.Supported != nil && !lane.Supported(capabilities) {
-			continue
-		}
-		pullRequests = pullRequests || lane.ReadsPullRequests
-		issues = issues || lane.ReadsIssues
-	}
-	return pullRequests, issues
-}
-
-// prefetchProjectSnapshots starts a background warm of each project's snapshot
-// pages and returns a function that waits for those warms to finish.
-//
-// It deliberately does not wait itself. Warming is benign — a cold page just
-// means the lane fetches it — so blocking the walk on it would let one slow or
-// unreachable repo stall every healthy project's discovery, HITL poll, and claim
-// phases behind two sequential `gh` timeouts. The walk therefore starts
-// immediately and the returned waiter is called at the end of the tick so no
-// goroutine outlives it.
-//
-// Warms also yield to the walk: a project the walk has already reached is skipped,
-// because the walk's own just-in-time fetch is already in flight or done, and
-// racing it would duplicate the call this change exists to eliminate.
-func prefetchProjectSnapshots(ctx context.Context, input defaultSchedulerTickInput, projects []storage.ProjectRecord, providers forge.Resolver, lanes []discoveryLane, snapshotFor func(string) *githubinfra.DiscoverySnapshot, walkedUpTo *atomic.Int64) func() {
-	noop := func() {}
-	if input.GitHubGateway == nil || snapshotFor == nil || walkedUpTo == nil || len(projects) < 2 {
-		return noop
-	}
-	if err := admissionRefuseWork(input); err != nil {
-		return noop
-	}
-	type prefetchTarget struct {
-		index        int
-		projectID    string
-		repo         string
-		cwd          string
-		pullRequests bool
-		issues       bool
-	}
-	targets := make([]prefetchTarget, 0, len(projects))
-	for index, project := range projects {
-		// Index 0 is skipped: the walk reaches it immediately, so warming it can only
-		// duplicate that fetch.
-		if index == 0 || project.Archived {
-			continue
-		}
-		capabilities := providers.ForProject(project.ID).Capabilities()
-		if !capabilities.GitHubCLIPullRequestCreation {
-			continue
-		}
-		repo, inCatalog := schedulerProjectRepo(input, project)
-		if !inCatalog || strings.TrimSpace(repo) == "" {
-			continue
-		}
-		pullRequests, issues := snapshotPagesForProject(lanes, project.ID, capabilities)
-		if !pullRequests && !issues {
-			continue
-		}
-		targets = append(targets, prefetchTarget{index: index, projectID: project.ID, repo: repo, cwd: project.RepoPath, pullRequests: pullRequests, issues: issues})
-	}
-	if len(targets) == 0 {
-		return noop
-	}
-	// The bounded dispatch itself runs off the caller's path. Acquiring a slot
-	// blocks once the cap is reached, so dispatching inline would put the caller
-	// back behind a slow repo as soon as there are more projects than slots —
-	// reintroducing the stall this function exists to avoid, just at the Nth
-	// project instead of the first.
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		var warms sync.WaitGroup
-		defer warms.Wait()
-		slots := make(chan struct{}, schedulerSnapshotPrefetchConcurrency(len(targets)))
-		for _, target := range targets {
-			slots <- struct{}{}
-			warms.Add(1)
-			go func(target prefetchTarget) {
-				defer warms.Done()
-				defer func() { <-slots }()
-				if ctx.Err() != nil {
-					return
-				}
-				if walkedUpTo.Load() >= int64(target.index) {
-					return
-				}
-				startedAt := time.Now()
-				err := snapshotFor(target.projectID).Prefetch(ctx, target.repo, target.cwd, target.pullRequests, target.issues)
-				if input.Logger == nil {
-					return
-				}
-				fields := map[string]any{"projectId": target.projectID, "repo": target.repo, "pullRequests": target.pullRequests, "issues": target.issues, "durationMs": time.Since(startedAt).Milliseconds()}
-				if err != nil {
-					// Logged so a systematically failing warm is visible rather than
-					// silently costing every lane its own round trip.
-					fields["error"] = err.Error()
-					input.Logger.Debug("scheduler snapshot prefetch failed", fields)
-					return
-				}
-				input.Logger.Debug("scheduler snapshot prefetch completed", fields)
-			}(target)
-		}
-	}()
-	return wg.Wait
 }
 
 func projectDiscoverySnapshotOptions(input defaultSchedulerTickInput, projectID string) githubinfra.DiscoverySnapshotOptions {

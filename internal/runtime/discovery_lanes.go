@@ -51,14 +51,6 @@ type discoveryLane struct {
 	// every tick in the common case where coordination is simply off.
 	LogWhenDisabled bool
 
-	// ReadsPullRequests and ReadsIssues declare which shared snapshot pages this
-	// lane consumes, so the tick can prewarm a page only when some enabled lane
-	// will actually read it. They live next to Discover deliberately: the closure
-	// below is the only place that knows which page it touches, and a lane added
-	// without setting them simply gets no prewarm rather than a wrong one.
-	ReadsPullRequests bool
-	ReadsIssues       bool
-
 	// Discover runs the pass. Returning the queue items lets the tick track
 	// runnable discoveries uniformly; a lane that enqueues nothing directly
 	// (coordinator) returns nil.
@@ -74,27 +66,24 @@ func roleDiscoverers(input defaultSchedulerTickInput) map[string]discoveryLane {
 
 	return map[string]discoveryLane{
 		config.CodingRolePlanner: {
-			ReadsIssues: true,
-			Enabled:     func(string) bool { return discoveryEnabled(input.PlannerDiscoveryEnabled) },
-			Present:     input.Planner != nil,
+			Enabled: func(string) bool { return discoveryEnabled(input.PlannerDiscoveryEnabled) },
+			Present: input.Planner != nil,
 			Discover: func(ctx context.Context, projectID, repo string, snapshot *githubinfra.DiscoverySnapshot) ([]storage.QueueItemRecord, error) {
 				result, err := input.Planner.DiscoverIssues(ctx, planner.DiscoveryInput{ProjectID: projectID, Repo: repo, Snapshot: snapshot})
 				return result.QueueItems, err
 			},
 		},
 		config.CodingRoleReviewer: {
-			ReadsPullRequests: true,
-			Enabled:           func(string) bool { return discoveryEnabled(input.ReviewerDiscoveryEnabled) },
-			Present:           input.Reviewer != nil,
+			Enabled: func(string) bool { return discoveryEnabled(input.ReviewerDiscoveryEnabled) },
+			Present: input.Reviewer != nil,
 			Discover: func(ctx context.Context, projectID, repo string, snapshot *githubinfra.DiscoverySnapshot) ([]storage.QueueItemRecord, error) {
 				result, err := input.Reviewer.DiscoverPullRequests(ctx, reviewer.DiscoveryInput{ProjectID: projectID, Repo: repo, Snapshot: snapshot})
 				return result.QueueItems, err
 			},
 		},
 		config.CodingRoleFixer: {
-			ReadsPullRequests: true,
-			Enabled:           func(string) bool { return discoveryEnabled(input.FixerDiscoveryEnabled) },
-			Present:           input.Fixer != nil,
+			Enabled: func(string) bool { return discoveryEnabled(input.FixerDiscoveryEnabled) },
+			Present: input.Fixer != nil,
 			Supported: func(capabilities forge.Capabilities) bool {
 				return capabilities.PullRequests || capabilities.GitHubPullRequests
 			},
@@ -104,19 +93,17 @@ func roleDiscoverers(input defaultSchedulerTickInput) map[string]discoveryLane {
 			},
 		},
 		config.CodingRoleWorker: {
-			ReadsIssues: true,
-			Enabled:     func(string) bool { return discoveryEnabled(input.WorkerDiscoveryEnabled) },
-			Present:     input.Worker != nil && workerCanDiscover,
+			Enabled: func(string) bool { return discoveryEnabled(input.WorkerDiscoveryEnabled) },
+			Present: input.Worker != nil && workerCanDiscover,
 			Discover: func(ctx context.Context, projectID, repo string, snapshot *githubinfra.DiscoverySnapshot) ([]storage.QueueItemRecord, error) {
 				result, err := workerDiscoverer.DiscoverIssues(ctx, worker.DiscoveryInput{ProjectID: projectID, Repo: repo, Snapshot: snapshot})
 				return result.QueueItems, err
 			},
 		},
 		config.RoleGatekeeper: {
-			ReadsPullRequests: true,
-			Enabled:           func(string) bool { return true },
-			Present:           input.Gatekeeper != nil,
-			Supported:         func(capabilities forge.Capabilities) bool { return capabilities.GitHubPullRequests },
+			Enabled:   func(string) bool { return true },
+			Present:   input.Gatekeeper != nil,
+			Supported: func(capabilities forge.Capabilities) bool { return capabilities.GitHubPullRequests },
 			Discover: func(ctx context.Context, projectID, repo string, snapshot *githubinfra.DiscoverySnapshot) ([]storage.QueueItemRecord, error) {
 				_, err := input.Gatekeeper.DiscoverPullRequests(ctx, gatekeeper.DiscoveryInput{ProjectID: projectID, Repo: repo, Snapshot: snapshot})
 				return nil, err
@@ -142,12 +129,11 @@ func supportsGitHubIssueDiscovery(capabilities forge.Capabilities) bool {
 // role: it has no agent, no discovery config, and is enabled per project.
 func coordinatorLane(input defaultSchedulerTickInput) discoveryLane {
 	return discoveryLane{
-		Name:        "coordinator",
-		Priority:    config.PriorityCoordinator,
-		ReadsIssues: true,
-		Present:     input.Coordinator != nil,
-		Enabled:     func(projectID string) bool { return coordinatorEnabledForProject(input, projectID) },
-		Supported:   supportsGitHubIssueDiscovery,
+		Name:      "coordinator",
+		Priority:  config.PriorityCoordinator,
+		Present:   input.Coordinator != nil,
+		Enabled:   func(projectID string) bool { return coordinatorEnabledForProject(input, projectID) },
+		Supported: supportsGitHubIssueDiscovery,
 		Discover: func(ctx context.Context, projectID, repo string, snapshot *githubinfra.DiscoverySnapshot) ([]storage.QueueItemRecord, error) {
 			_, err := input.Coordinator.DiscoverIssues(ctx, coordinator.DiscoveryInput{ProjectID: projectID, Repo: repo, Snapshot: snapshot})
 			return nil, err
@@ -162,10 +148,9 @@ func triagerLane(input defaultSchedulerTickInput) discoveryLane {
 	// are discovered concurrently, so the budget synchronizes its own reservation.
 	decisionBudget := triager.NewDecisionBudget(triager.DefaultDecisionLimit)
 	return discoveryLane{
-		Name:        "triager",
-		ReadsIssues: true,
-		Priority:    config.PriorityTriager,
-		Present:     input.Triager != nil,
+		Name:     "triager",
+		Priority: config.PriorityTriager,
+		Present:  input.Triager != nil,
 		Enabled: func(projectID string) bool {
 			return input.TriagerEnabled != nil && input.TriagerEnabled(projectID)
 		},

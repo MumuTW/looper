@@ -2,12 +2,10 @@ package github
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"slices"
 	"strings"
 	"sync"
-	"time"
 )
 
 type DiscoverySnapshotOptions struct {
@@ -31,7 +29,6 @@ type DiscoverySnapshot struct {
 	mu               sync.Mutex
 	openPRs          []PullRequestSummary
 	openPRsFetched   bool
-	openPRsFetchedAt time.Time
 	openPRsFetchRepo string
 	openPRsFetchCWD  string
 	openPRsLimit     int
@@ -40,7 +37,6 @@ type DiscoverySnapshot struct {
 
 	openIssues          []IssueSummary
 	openIssuesFetched   bool
-	openIssuesFetchedAt time.Time
 	openIssuesFetchRepo string
 	openIssuesFetchCWD  string
 	openIssuesLimit     int
@@ -109,65 +105,9 @@ func (s *DiscoverySnapshot) listReviewRequestedPullRequests(ctx context.Context,
 	return limitPullRequests(clonePullRequestSummaries(prs), input.Limit), nil
 }
 
-// Prefetch warms this snapshot's open pull request and open issue pages for one
-// repo, so discovery lanes read them from the snapshot instead of each blocking
-// on its own forge round trip.
-//
-// It is a pure read: it enqueues nothing, claims nothing, and takes no admission
-// decision, which is what makes warming several projects concurrently safe with
-// respect to the scheduler's shutdown contract — unlike running the lanes
-// themselves concurrently.
-//
-// The returned error is for logging only. A failed warm simply leaves the
-// snapshot cold and the lane performs its own fetch, so no behaviour depends on
-// prefetch succeeding.
-//
-// pullRequests and issues select which pages to warm. Warming a page no enabled
-// lane reads is pure cost — an extra `gh` call per project per tick that hides no
-// latency — so the caller passes what its lanes actually consume.
-func (s *DiscoverySnapshot) Prefetch(ctx context.Context, repo, cwd string, pullRequests, issues bool) error {
-	if s == nil {
-		return nil
-	}
-	// Keyed on (repo, cwd) exactly as the ensure* helpers are, so a lane calling
-	// with the same pair hits the warm entry rather than refetching.
-	var errs []error
-	if pullRequests {
-		errs = append(errs, s.ensureOpenPullRequests(ctx, ListOpenPullRequestsInput{Repo: repo, CWD: cwd}))
-	}
-	if issues {
-		errs = append(errs, s.ensureOpenIssues(ctx, ListOpenIssuesInput{Repo: repo, CWD: cwd}))
-	}
-	return errors.Join(errs...)
-}
-
-// pageExpiredLocked reports whether a warmed page has outlived the gateway's
-// discovery freshness window. Callers hold s.mu.
-//
-// Prewarming captures pages before the serial project walk begins, so on a long
-// tick a later project would otherwise consume a page as old as the tick itself —
-// an issue opened while an earlier project was being processed would be invisible
-// until the next tick. Bounding reuse by discoveryCacheTTL puts that staleness
-// back under the operator's discoveryCacheTtlSeconds knob rather than under tick
-// duration. A non-positive TTL means caching is off, in which case the page is
-// still reused for the tick exactly as before.
-func (s *DiscoverySnapshot) pageExpiredLocked(fetchedAt time.Time) bool {
-	if s.gateway == nil || s.gateway.discoveryCacheTTL <= 0 || fetchedAt.IsZero() {
-		return false
-	}
-	return s.fetchTimestamp().After(fetchedAt.Add(s.gateway.discoveryCacheTTL))
-}
-
-func (s *DiscoverySnapshot) fetchTimestamp() time.Time {
-	if s.gateway == nil || s.gateway.now == nil {
-		return time.Now().UTC()
-	}
-	return s.gateway.now().UTC()
-}
-
 func (s *DiscoverySnapshot) ensureOpenPullRequests(ctx context.Context, input ListOpenPullRequestsInput) error {
 	s.mu.Lock()
-	ready := s.openPRsFetched && s.openPRsFetchRepo == input.Repo && s.openPRsFetchCWD == input.CWD && !s.pageExpiredLocked(s.openPRsFetchedAt)
+	ready := s.openPRsFetched && s.openPRsFetchRepo == input.Repo && s.openPRsFetchCWD == input.CWD
 	s.mu.Unlock()
 	if ready {
 		return nil
@@ -180,7 +120,6 @@ func (s *DiscoverySnapshot) ensureOpenPullRequests(ctx context.Context, input Li
 	s.mu.Lock()
 	s.openPRs = clonePullRequestSummaries(prs)
 	s.openPRsFetched = true
-	s.openPRsFetchedAt = s.fetchTimestamp()
 	s.openPRsFetchRepo = input.Repo
 	s.openPRsFetchCWD = input.CWD
 	s.openPRsLimit = requiredLimit
@@ -206,7 +145,7 @@ func (s *DiscoverySnapshot) listOpenIssues(ctx context.Context, input ListOpenIs
 
 func (s *DiscoverySnapshot) ensureOpenIssues(ctx context.Context, input ListOpenIssuesInput) error {
 	s.mu.Lock()
-	ready := s.openIssuesFetched && s.openIssuesFetchRepo == input.Repo && s.openIssuesFetchCWD == input.CWD && !s.pageExpiredLocked(s.openIssuesFetchedAt)
+	ready := s.openIssuesFetched && s.openIssuesFetchRepo == input.Repo && s.openIssuesFetchCWD == input.CWD
 	s.mu.Unlock()
 	if ready {
 		return nil
@@ -219,7 +158,6 @@ func (s *DiscoverySnapshot) ensureOpenIssues(ctx context.Context, input ListOpen
 	s.mu.Lock()
 	s.openIssues = cloneIssueSummaries(issues)
 	s.openIssuesFetched = true
-	s.openIssuesFetchedAt = s.fetchTimestamp()
 	s.openIssuesFetchRepo = input.Repo
 	s.openIssuesFetchCWD = input.CWD
 	s.openIssuesLimit = requiredLimit
