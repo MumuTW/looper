@@ -167,6 +167,12 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 		if project.RepoPath == "" {
 			issues = append(issues, ValidationIssue{Path: prefix + ".repoPath", Message: "must be a non-empty path"})
 		}
+		if strings.TrimSpace(project.Provider) != "" && strings.TrimSpace(project.Repo) == "" {
+			// A provider binding names the remote a project's automation targets.
+			// Without repo the project materializes with no remote and every lane
+			// silently skips it, so reject it here instead of starting inert.
+			issues = append(issues, ValidationIssue{Path: prefix + ".repo", Message: "is required for a project bound to an explicit provider"})
+		}
 		if strings.TrimSpace(project.Repo) != "" {
 			identity, resolved := ProjectRepositoryIdentity(config, project)
 			if previousIndex, exists := projectRepos[identity.Key()]; resolved && exists {
@@ -203,6 +209,12 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 		}
 		if project.Roles != nil && project.Roles.Coordinator != nil {
 			validateCoordinatorRoleConfig(effectiveProjectRoles.Coordinator, prefix+".roles.coordinator", &issues)
+		}
+		// The effective per-project mode needs its own check: the global check
+		// above cannot see a project override, and the removed summary_comment
+		// implementation would otherwise fall through to single_review silently.
+		if effectiveProjectRoles.Reviewer.Behavior.PublishMode != ReviewerPublishModeSingleReview {
+			issues = append(issues, ValidationIssue{Path: prefix + ".roles.reviewer.behavior.publishMode", Message: fmt.Sprintf("must be %s", ReviewerPublishModeSingleReview)})
 		}
 		if normalizeNetworkMode(project.Network.Mode) == NetworkModeRouted {
 			validateRoutedProjectPrerequisites(config, effectiveProjectRoles, prefix, &issues)

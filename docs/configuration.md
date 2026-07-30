@@ -404,39 +404,45 @@ worktree with a fresh Devin session.
 
 ## Provider support
 
-GitHub is the only supported provider kind.
+GitHub is the only supported provider kind, and github.com is the only host Looper drives end to end.
 
 - `github` — backed by `gh`. Projects without `provider` keep the legacy GitHub autodetection/metadata path.
 
-A `providers` entry is optional. Its practical uses today are narrow, so read the field notes below before adding one.
+A `providers` entry is optional and does very little today. Read the field notes before adding one.
 
 ```toml
 [agent]
 vendor = "opencode"
 
 [[providers]]
-id = "ghes-main"
+id = "acme"
 kind = "github"
-baseUrl = "https://code.example.com"
 
 [[projects]]
 id = "example"
 name = "Example"
 repoPath = "/absolute/path/to/example"
-provider = "ghes-main"
-# Three segments: the host prefix is what routes gh at the GHES instance.
-# A bare "acme/example" would use ambient gh configuration instead.
-repo = "code.example.com/acme/example"
+provider = "acme"
+repo = "acme/example"
 ```
 
 Provider rules:
 
 - `providers[].id` must be unique.
 - `providers[].kind` must be `github`. A configured `forgejo` or `plane` kind is rejected with an explicit unsupported-provider error — both were removed and are never reinterpreted as a supported provider.
-- `providers[].baseUrl` is optional; when set it must be an absolute `http(s)` URL. **It does not route GitHub operations.** Its only production consumer is repository identity, which is what lets two projects share an `owner/name` slug across different hosts without colliding. The `gh` gateway receives whatever `projects[].repo` holds and derives the host from that string, not from the provider: a three-segment `host/owner/name` value becomes `gh --hostname host`, while a bare `owner/name` uses ambient `gh` configuration. To target GitHub Enterprise Server, qualify `projects[].repo` with the host; setting `baseUrl` alone does not do it.
+- `providers[].baseUrl` is optional; when set it must be an absolute `http(s)` URL. **It does not point Looper at that host.** Its only consumer is repository identity, which is what lets two projects carry the same `owner/name` slug without colliding. Every GitHub call still goes to whatever host `gh` resolves.
 - `providers[].tokenEnv` names an environment variable, **not the credential the GitHub gateway uses.** Planner, worker, reviewer, fixer, webhook, and discovery calls all authenticate through ambient `gh` auth (`gh auth login`). The named variable is copied unchanged from the daemon environment into trusted `looper review submit` child processes and nowhere else.
-- A project bound to a provider names it with `provider` plus a repo (`owner/name`) in the config file. The project HTTP API can register a local `repoPath` against a running daemon, but provider bindings themselves are file-managed. Already-started work retains its previous catalog snapshot.
-- Config validation rejects two projects whose repository *identities* collide, matched case-insensitively. Identity is provider-qualified (kind + normalized `baseUrl` + repo), so the same `owner/name` slug on two different hosts is allowed, while two provider ids that normalize to the same endpoint are a duplicate.
+- A project bound to a provider requires both `provider` and a repo (`owner/name`); a binding without a repo is rejected. The project HTTP API can register a local `repoPath` against a running daemon, but provider bindings themselves are file-managed. Already-started work retains its previous catalog snapshot.
+- Config validation rejects two projects whose repository *identities* collide, matched case-insensitively. Identity is provider-qualified (kind + normalized `baseUrl` + repo), so the same `owner/name` under two provider ids with different `baseUrl` values is allowed, while two ids that normalize to the same endpoint are a duplicate.
+
+### GitHub Enterprise Server
+
+GHES is **not supported**. Some read paths would follow a host-qualified `projects[].repo` (`host/owner/name`) because the gateway derives `gh --hostname` from it, but that shape breaks other paths in ways that fail at publish time rather than at startup:
+
+- trusted `looper review submit` takes a REST branch that embeds the repo verbatim into `repos/{repo}/pulls/{n}/reviews`, producing `repos/host/owner/name/pulls/...` against the ambient host
+- webhook tunnel routing accepts only `/webhook/{owner}/{repo}`, so a host-qualified repo 404s every delivery, and the payload's `repository.full_name` would not match the configured key anyway
+
+Do not configure it. Wiring the host through the gateway, review-submit, and tunnel routing consistently is the work that would make GHES real.
 
 GitHub live sandbox tests now prefer `LOOPER_E2E_GITHUB_SANDBOX_REPO`. The older `LOOPER_E2E_SANDBOX_REPO` name remains a compatibility alias, but setting both names to different repos fails fast.
 
@@ -914,11 +920,11 @@ baseBranch = "main"
 worktreeRoot = "/Users/you/.looper/worktrees/looper"
 
 [[projects]]
-id = "ghes-example"
-name = "GHES Example"
-repoPath = "/absolute/path/to/ghes-example"
+id = "second-example"
+name = "Second Example"
+repoPath = "/absolute/path/to/second-example"
 provider = "ghes-main"
-repo = "code.example.com/acme/ghes-example"
+repo = "acme/ghes-example"
 
 [projects.roles.worker.discovery]
 autoDiscovery = false

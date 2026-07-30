@@ -4037,3 +4037,42 @@ repoPath = "/tmp/demo"
 	}
 	assertValidationIssue(t, validationErr, "providers[0].kind", `provider kind "forgejo" is no longer supported: Forgejo support was removed; looper is a GitHub-only product`)
 }
+
+func TestProjectBoundToProviderRequiresRepo(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := Normalize(t.TempDir(), PartialConfig{
+		Providers: &[]PartialProviderConfig{{ID: "ghes", Kind: providerKindPtr(ProviderKindGitHub), BaseURL: stringPtr("https://code.example.test")}},
+		Projects:  &[]PartialProjectRefConfig{{ID: "demo", Name: "Demo", Provider: stringPtr("ghes"), RepoPath: "/tmp/demo"}},
+	})
+	if err != nil {
+		t.Fatalf("Normalize() error = %v", err)
+	}
+	err = ValidateWithOptions(cfg, ValidateOptions{DefaultWorktreeRoot: t.TempDir()})
+	var validationErr *ConfigValidationError
+	if !errors.As(err, &validationErr) {
+		t.Fatalf("ValidateWithOptions() error = %v, want *ConfigValidationError", err)
+	}
+	assertValidationIssue(t, validationErr, "projects[0].repo", "is required for a project bound to an explicit provider")
+}
+
+func TestProjectOverrideCannotSelectRemovedSummaryCommentPublishMode(t *testing.T) {
+	t.Parallel()
+
+	publishMode := ReviewerPublishMode("summary_comment")
+	cfg, err := Normalize(t.TempDir(), PartialConfig{
+		Projects: &[]PartialProjectRefConfig{{
+			ID: "demo", Name: "Demo", Repo: stringPtr("acme/app"), RepoPath: "/tmp/demo",
+			Roles: &PartialRoleConfigs{Reviewer: &PartialReviewerRoleConfig{Behavior: &PartialReviewerConfig{PublishMode: &publishMode}}},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("Normalize() error = %v", err)
+	}
+	err = ValidateWithOptions(cfg, ValidateOptions{DefaultWorktreeRoot: t.TempDir()})
+	var validationErr *ConfigValidationError
+	if !errors.As(err, &validationErr) {
+		t.Fatalf("ValidateWithOptions() error = %v, want the project override rejected", err)
+	}
+	assertValidationIssue(t, validationErr, "projects[0].roles.reviewer.behavior.publishMode", "must be single_review")
+}
