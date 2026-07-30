@@ -1207,6 +1207,19 @@ func TestHandlerStatusReportsDebtAfterStaleRunReconcile(t *testing.T) {
 	// Quarantine deliberately leaves uncertain execution/run evidence active;
 	// this counter exists to surface the resulting active-runs inflation.
 	assertEqual(t, outstanding["quarantinedRunningRuns"], float64(1))
+	// The counters name the loops they are about, from the same evidence pass.
+	roster, ok := outstanding["loops"].([]any)
+	if !ok || len(roster) != 1 {
+		t.Fatalf("outstanding[loops] = %#v, want one quarantined loop", outstanding["loops"])
+	}
+	quarantinedLoop := roster[0].(map[string]any)
+	assertEqual(t, quarantinedLoop["loopId"], loopID)
+	assertEqual(t, quarantinedLoop["seq"], float64(1))
+	assertEqual(t, quarantinedLoop["type"], "worker")
+	assertEqual(t, quarantinedLoop["status"], "paused")
+	if fmt.Sprintf("%v", quarantinedLoop["quarantinedAt"]) == "" {
+		t.Fatalf("quarantined loop = %#v, want the durable quarantine timestamp", quarantinedLoop)
+	}
 	if !strings.Contains(fmt.Sprintf("%v", service["degradedReasons"]), "quarantine_orphan_debt") {
 		t.Fatalf("degradedReasons = %#v, want quarantine debt", service["degradedReasons"])
 	}
