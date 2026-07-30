@@ -1429,6 +1429,7 @@ func (h *Handler) buildStatusResponse(ctx context.Context) (statusResponse, erro
 	if githubHealth.AuthenticationDegraded() {
 		degradedReasons = append(degradedReasons, looperdruntime.ForgeAuthenticationDegradedReason)
 	}
+	admissionState := h.admissionStateString()
 
 	return statusResponse{
 		Service: statusService{
@@ -1436,7 +1437,7 @@ func (h *Handler) buildStatusResponse(ctx context.Context) (statusResponse, erro
 			Version:         version.Current().Version,
 			Build:           version.Current().Metadata,
 			DaemonMode:      h.context.Config.Daemon.Mode,
-			AdmissionState:  h.admissionStateString(),
+			AdmissionState:  admissionState,
 			StartedAt:       h.startedAtISO(),
 			Recovery:        recovery,
 			Triage:          statusTriage{AwaitingConfirmation: awaitingConfirmation},
@@ -1459,7 +1460,7 @@ func (h *Handler) buildStatusResponse(ctx context.Context) (statusResponse, erro
 			Healthy:           storageState.OK,
 		},
 		Scheduler: statusScheduler{
-			Healthy:        true,
+			Healthy:        admissionState == string(looperdruntime.AdmissionReady),
 			QueuedItems:    int(queueCounts["queued"]),
 			RunningItems:   int(queueCounts["running"]),
 			CompletedItems: int(queueCounts["completed"]),
