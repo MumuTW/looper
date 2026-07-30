@@ -2,12 +2,10 @@ import { describe, expect, it } from "vitest";
 import {
   RECONNECT_BACKOFF_MS,
   formatLiveStderrChunk,
-  needsSeparateStderrFollow,
   nextReconnectDelayAfterErrorMs,
   nextReconnectDelayMs,
   parseLogsStreamError,
   resolveLogsStreamStatus,
-  stderrGapFromSecondarySnapshot,
 } from "./logsStream";
 
 describe("resolveLogsStreamStatus", () => {
@@ -95,30 +93,6 @@ describe("parseLogsStreamError", () => {
   });
 });
 
-describe("needsSeparateStderrFollow", () => {
-  it("is always true so stderr is not dropped after default locks onto stdout", () => {
-    expect(
-      needsSeparateStderrFollow({ stdout: "out\n", stderr: "err\n" }),
-    ).toBe(true);
-    expect(needsSeparateStderrFollow({ stdout: "out\n", stderr: "" })).toBe(
-      true,
-    );
-    expect(needsSeparateStderrFollow({ stdout: "", stderr: "" })).toBe(true);
-    expect(needsSeparateStderrFollow({ stdout: "  ", stderr: "  " })).toBe(
-      true,
-    );
-    expect(needsSeparateStderrFollow(null)).toBe(true);
-    expect(needsSeparateStderrFollow(undefined)).toBe(true);
-    // stderr-only: default may later switch to stdout; keep secondary follow.
-    expect(needsSeparateStderrFollow({ stdout: "", stderr: "err\n" })).toBe(
-      true,
-    );
-    expect(needsSeparateStderrFollow({ stdout: "  ", stderr: "err\n" })).toBe(
-      true,
-    );
-  });
-});
-
 describe("formatLiveStderrChunk", () => {
   it("adds a stderr section header only for the first live chunk", () => {
     expect(formatLiveStderrChunk("boom\n", false)).toBe(
@@ -126,25 +100,5 @@ describe("formatLiveStderrChunk", () => {
     );
     expect(formatLiveStderrChunk("more\n", true)).toBe("more\n");
     expect(formatLiveStderrChunk("", false)).toBe("");
-  });
-});
-
-describe("stderrGapFromSecondarySnapshot", () => {
-  it("returns empty when secondary has no new stderr", () => {
-    expect(stderrGapFromSecondarySnapshot("err\n", "err\n")).toBe("");
-    expect(stderrGapFromSecondarySnapshot("err\n", "")).toBe("");
-    expect(stderrGapFromSecondarySnapshot("", "")).toBe("");
-  });
-
-  it("returns full secondary when primary had none", () => {
-    expect(stderrGapFromSecondarySnapshot("", "late\n")).toBe("late\n");
-  });
-
-  it("returns only the append suffix when secondary extends primary", () => {
-    expect(stderrGapFromSecondarySnapshot("a\n", "a\nb\n")).toBe("b\n");
-  });
-
-  it("returns full secondary on non-prefix rewrite", () => {
-    expect(stderrGapFromSecondarySnapshot("old\n", "new\n")).toBe("new\n");
   });
 });

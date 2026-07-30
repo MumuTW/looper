@@ -25,6 +25,15 @@ This document defines Looper's representative performance budgets: what each bud
 - **Budget: ≤ 10ms** to list the newest 100 events from a 10,000-row log.
 - Rationale: 10k rows approximates a busy daemon's recent history; the `/events` endpoint serves exactly this query. Measured baseline: ~1.2ms.
 
+### Live loop-log streaming (8 visible tabs)
+
+- **Concurrency budget: 8 SSE connections**, one combined stdout/stderr connection per visible Logs pane. Hidden tabs close their connection.
+- **State budget: one refresh per connection per second**. A refresh is exactly one Loop, latest Run, and latest AgentExecution read, so 8 tabs produce at most 24 repository reads/s rather than the previous dual-stream ~80 full refreshes/s.
+- **File-read budget: 5 offset reads/s per stream**, at most 80 ordinary read attempts/s across 8 tabs. Reads return only bytes appended since that connection's cursor; persisted history is not reread during state refresh.
+- **Memory/backpressure budget:** the initial snapshot retains at most 200 KiB per stream, and each incremental read/event is at most 64 KiB. A blocked client blocks its own read loop instead of accumulating an unbounded queue; terminal drain keeps the same 64 KiB chunk bound.
+- **Fallback:** executions without persisted log paths refresh inline bounded output at 1 Hz. Typed SSE `error` and `end` events plus the dashboard's 1s/2s/5s reconnect backoff keep disconnect, terminal, and error behavior visible.
+- Rationale: log bytes are filesystem state, while loop/run/execution records are lifecycle state. They need different polling rates. One connection per pane removes duplicate stdout/stderr lifecycle reads, and offset cursors make cost depend on new output rather than total log size.
+
 ## How to measure
 
 The API load test is opt-in (skipped in normal `go test ./...` runs so CI stays fast):
@@ -40,6 +49,12 @@ go test ./internal/storage -run '^$' -bench BenchmarkEvents -benchtime 200x -v
 ```
 
 Both enforce the 10x ceilings (`internal/api/perf_budget_test.go`, `internal/storage/perf_budget_test.go`) and log the measured p95/throughput/ns-per-op so results can be compared against the budgets above.
+
+The always-on combined-stream contract test opens four concurrent tabs over 1 MiB stdout/stderr histories, enforces state/file-read counters and 64 KiB chunks, and verifies exact incremental delivery. Run it directly with:
+
+```sh
+go test ./internal/api -run TestCombinedLoopLogsStream -count=1
+```
 
 ## Measured baseline (2026-07-29, Apple M5, darwin/arm64)
 

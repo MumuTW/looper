@@ -192,7 +192,8 @@
         "format": "Server-Sent Events (not a JSON success envelope)",
         "query": {
           "follow": "1 or true enables SSE follow mode",
-          "stderr": "optional; 1 or true streams stderr instead of stdout when applicable"
+		  "streams": "optional; both emits typed stdout and stderr chunks on one connection",
+		  "stderr": "legacy compatibility; 1 or true streams stderr instead of stdout when streams=both is absent"
         },
         "events": [
           {
@@ -201,7 +202,7 @@
           },
           {
             "event": "chunk",
-            "data": "JSON object with content (string) and optional runId, currentStep, executionId, vendor, pid, status"
+			"data": "JSON object with content (string), stream (stdout or stderr for streams=both), and optional runId, currentStep, executionId, vendor, pid, status"
           },
           {
             "event": "end",
@@ -211,6 +212,7 @@
       },
       "notes": [
         "follow=1 (or true) switches Content-Type to text/event-stream.",
+		"streams=both uses one state refresh for stdout and stderr and reads persisted log files incrementally by offset.",
         "Clients must not parse the body as a JSON envelope when follow is enabled.",
         "Non-follow GET /api/v1/loops/{id}/logs remains application/json (route id loop.logs)."
       ]
