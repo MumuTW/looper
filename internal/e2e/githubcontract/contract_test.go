@@ -3,11 +3,13 @@ package githubcontract
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/nexu-io/looper/internal/e2e/harness"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
@@ -357,6 +359,51 @@ func TestRealGHReadOnlySmoke(t *testing.T) {
 	gateway := githubinfra.New(githubinfra.Options{GHPath: ghPath, CWD: root})
 	if _, err := gateway.ListOpenPullRequests(context.Background(), githubinfra.ListOpenPullRequestsInput{Repo: "nexu-io/looper", CWD: root, Limit: 1}); err != nil {
 		t.Fatalf("real-gh pr list smoke failed; fixture may be stale: %v", err)
+	}
+}
+
+// TestRealGHLabelCreateModelsDuplicateSemantics pins the fake-gh label model
+// against real `gh` behavior. Issue #223: nothing validates the fake-gh label
+// model against real `gh`. This test runs only with LOOPER_E2E_REAL_GH=1 against
+// a sandbox repo (LOOPER_E2E_SANDBOX_REPO) and asserts:
+//   - creating a label succeeds
+//   - creating it again without --force fails with "already exists"
+//   - creating it again with --force updates the label
+// If real `gh` behavior drifts from the fake-gh model, this test fails and
+// signals that handleLabelCreate must be updated to match.
+func TestRealGHLabelCreateModelsDuplicateSemantics(t *testing.T) {
+	if os.Getenv("LOOPER_E2E_REAL_GH") == "" {
+		t.Skip("set LOOPER_E2E_REAL_GH=1 to run real-gh label contract")
+	}
+	sandboxRepo := os.Getenv("LOOPER_E2E_SANDBOX_REPO")
+	if sandboxRepo == "" {
+		t.Skip("set LOOPER_E2E_SANDBOX_REPO (e.g. user/looper-sandbox) to run real-gh label contract")
+	}
+	ghPath, err := exec.LookPath("gh")
+	if err != nil {
+		t.Skipf("gh not available: %v", err)
+	}
+
+	uniqueLabel := fmt.Sprintf("looper-test-%d", time.Now().UnixNano())
+	createArgs := []string{"label", "create", uniqueLabel, "--repo", sandboxRepo, "--color", "5319e7", "--description", "Looper E2E contract test"}
+	cmd := exec.Command(ghPath, createArgs...)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("real-gh label create failed: %v\n%s", err, string(out))
+	}
+	t.Cleanup(func() {
+		exec.Command(ghPath, "label", "delete", uniqueLabel, "--repo", sandboxRepo, "--yes").CombinedOutput()
+	})
+
+	dupCmd := exec.Command(ghPath, "label", "create", uniqueLabel, "--repo", sandboxRepo, "--color", "5319e7", "--description", "rewritten wording")
+	if out, err := dupCmd.CombinedOutput(); err == nil {
+		t.Fatalf("expected real-gh duplicate label create to fail without --force\n%s", string(out))
+	} else if !strings.Contains(string(out), "already exists") {
+		t.Fatalf("expected real-gh \"already exists\" error, got: %v\n%s", err, string(out))
+	}
+
+	forceCmd := exec.Command(ghPath, "label", "create", uniqueLabel, "--repo", sandboxRepo, "--color", "000000", "--description", "rewritten wording", "--force")
+	if out, err := forceCmd.CombinedOutput(); err != nil {
+		t.Fatalf("real-gh label create --force failed: %v\n%s", err, string(out))
 	}
 }
 

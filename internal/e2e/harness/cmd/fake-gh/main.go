@@ -69,6 +69,14 @@ type state struct {
 	//   create round trip. The stateful model makes the round trip observable:
 	//   a test seeds a hand-worded label, runs the gateway, and confirms the
 	//   stored description is unchanged after the create path executes.
+	//
+	//   Known gap (issue #223): nothing validates this model against real `gh`.
+	//   If GitHub's duplicate-create semantics drift, this model silently masks
+	//   the regression. The contract test pins fake-gh behavior, not real-gh
+	//   behavior. A sandbox E2E check (create, re-create without --force, recreate
+	//   with --force against a real repo) would close this gap but requires the
+	//   LOOPER_E2E_REAL_GH flag and a provisioned sandbox. Until that lands, treat
+	//   this comment as the authoritative statement that the model is unvalidated.
 	RepositoryLabels map[string][]labelState `json:"repositoryLabels,omitempty"`
 }
 
