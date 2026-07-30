@@ -53,6 +53,7 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 	issues := make([]ValidationIssue, 0)
 
 	validateCoreConfig(config, &issues)
+	validatePlannerEscalation(config.Roles.Planner.Escalation, "roles.planner.escalation", &issues)
 
 	if config.Roles.Reviewer.Behavior.Loop.QuietPeriodSeconds < 0 {
 		issues = append(issues, ValidationIssue{Path: "roles.reviewer.behavior.loop.quietPeriodSeconds", Message: "must be an integer >= 0"})
@@ -884,6 +885,11 @@ func validateProjectRoleOverrides(roles *PartialRoleConfigs, prefix string, maxI
 		if roles.Planner.Triggers != nil {
 			validateIssueRoleTriggers(partialIssueRoleTriggers(*roles.Planner.Triggers), prefix+".planner.triggers", issues)
 		}
+		if roles.Planner.Escalation != nil {
+			candidate := PlannerEscalationConfig{}
+			mergePlannerEscalationConfig(&candidate, *roles.Planner.Escalation)
+			validatePlannerEscalation(&candidate, prefix+".planner.escalation", issues)
+		}
 	}
 	if roles.Worker != nil {
 		validateProjectRoleInstruction(prefix+".worker.instructions", "worker", roles.Worker.Instructions, maxInstructionBytes, issues)
@@ -927,6 +933,18 @@ func validateProjectRoleOverrides(roles *PartialRoleConfigs, prefix string, maxI
 		if roles.Coordinator.PollInterval != nil && strings.TrimSpace(*roles.Coordinator.PollInterval) == "" {
 			*issues = append(*issues, ValidationIssue{Path: prefix + ".coordinator.pollInterval", Message: "must be a non-empty duration string"})
 		}
+	}
+}
+
+func validatePlannerEscalation(escalation *PlannerEscalationConfig, path string, issues *[]ValidationIssue) {
+	if escalation == nil {
+		return
+	}
+	if escalation.MaxEstimatedFiles < 0 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".maxEstimatedFiles", Message: "must be an integer >= 0"})
+	}
+	if escalation.MaxEstimatedPackages < 0 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".maxEstimatedPackages", Message: "must be an integer >= 0"})
 	}
 }
 

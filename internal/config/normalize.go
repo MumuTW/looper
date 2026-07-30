@@ -1335,11 +1335,47 @@ func mergePlannerRoleConfig(config *PlannerRoleConfig, partial PartialPlannerRol
 	if partial.Triggers != nil {
 		mergeIssueRoleTriggersConfig(&config.Triggers, *partial.Triggers)
 	}
+	if partial.Escalation != nil {
+		if config.Escalation == nil {
+			config.Escalation = &PlannerEscalationConfig{}
+		}
+		mergePlannerEscalationConfig(config.Escalation, *partial.Escalation)
+	}
 	if partial.Instructions != nil {
 		config.Instructions = *partial.Instructions
 	}
 	if partial.Agent != nil {
 		mergeRoleAgentConfig(&config.Agent, partial.Agent)
+	}
+}
+
+func mergePlannerEscalationConfig(config *PlannerEscalationConfig, partial PartialPlannerEscalationConfig) {
+	if partial.MaxEstimatedFiles != nil {
+		config.MaxEstimatedFiles = *partial.MaxEstimatedFiles
+	}
+	if partial.MaxEstimatedPackages != nil {
+		config.MaxEstimatedPackages = *partial.MaxEstimatedPackages
+	}
+	if partial.PublicAPI != nil {
+		config.PublicAPI = *partial.PublicAPI
+	}
+	if partial.Config != nil {
+		config.Config = *partial.Config
+	}
+	if partial.CLI != nil {
+		config.CLI = *partial.CLI
+	}
+	if partial.Storage != nil {
+		config.Storage = *partial.Storage
+	}
+	if partial.WireFormat != nil {
+		config.WireFormat = *partial.WireFormat
+	}
+	if partial.ADRConflict != nil {
+		config.ADRConflict = *partial.ADRConflict
+	}
+	if partial.AuthorityDecision != nil {
+		config.AuthorityDecision = *partial.AuthorityDecision
 	}
 }
 

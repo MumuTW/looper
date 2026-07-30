@@ -230,12 +230,35 @@ Planner will:
 
 - add the current GitHub user as an issue assignee when the issue is claimed, preserving any existing assignees
 - create a worktree
+- when a project configures Planner escalation criteria, explore the repository and persist a structured suitability assessment before authoring the spec
 - write the spec file
 - push a spec PR
 - add the `looper:spec-reviewing` label to that PR
 - request reviewers when appropriate
 
 If planner cannot assign the issue in GitHub, it reports a retryable failure rather than continuing with ambiguous ownership.
+
+### Planner escalation to a human
+
+Projects can opt into explicit Planner escalation criteria under `projects[].roles.planner.escalation` (or set global defaults under `roles.planner.escalation`). The policy, rather than the model, is the authority that stops a run. Planner's repository assessment is persisted in the run checkpoint with every fired criterion, its evidence, and the specific decision requested.
+
+```toml
+[[projects]]
+id = "demo"
+
+[projects.roles.planner.escalation]
+maxEstimatedFiles = 12
+maxEstimatedPackages = 3
+publicApi = true
+config = true
+cli = true
+storage = true
+wireFormat = true
+adrConflict = true
+authorityDecision = true
+```
+
+When a configured criterion fires, the loop becomes `awaiting_human`; the run is interrupted without recording a failure or scheduling a retry. Both `looper status` and the dashboard show that state separately from running and failed work. Answer with `looper respond <loop> "authorize proceed"` to continue from the persisted assessment without rediscovery, or `looper respond <loop> "close without a spec"` to complete the Planner loop without writing or publishing a spec. Omitted criteria are disabled, so existing Planner behavior is unchanged by default.
 
 ## 7. Reviewer: review a spec PR or a normal PR
 
