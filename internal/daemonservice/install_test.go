@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/nexu-io/looper/internal/config"
 )
 
 type fakeFS struct {
@@ -238,6 +240,24 @@ func TestUninstallIsIdempotent(t *testing.T) {
 
 	if _, err := Uninstall(context.Background(), plan, newFakeFS(), (&recordingRunner{}).run); err != nil {
 		t.Fatalf("Uninstall() on a missing unit error = %v, want success", err)
+	}
+}
+
+func TestUninstallReloadsSystemdAfterRemovingUnit(t *testing.T) {
+	t.Parallel()
+	plan, err := Build(testInput("linux", func(d *config.DaemonConfig) { d.Mode = config.DaemonModeSystemd }))
+	if err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+	fs := newFakeFS()
+	fs.files[plan.UnitPath] = []byte(plan.Unit)
+	runner := &recordingRunner{}
+
+	if _, err := Uninstall(context.Background(), plan, fs, runner.run); err != nil {
+		t.Fatalf("Uninstall() error = %v", err)
+	}
+	if len(runner.commands) < 2 || runner.commands[len(runner.commands)-1] != "systemctl --user daemon-reload" {
+		t.Fatalf("systemd reload did not follow removal: %v", runner.commands)
 	}
 }
 

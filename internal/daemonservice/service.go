@@ -103,6 +103,12 @@ func Build(input Input) (Plan, error) {
 	if logDir == "" {
 		return Plan{}, fmt.Errorf("daemon.logDir is required to install a service")
 	}
+	if !filepath.IsAbs(logDir) {
+		return Plan{}, fmt.Errorf("daemon.logDir must be absolute for a supervised service, got %q", logDir)
+	}
+	if !filepath.IsAbs(input.Config.WorkingDirectory) {
+		return Plan{}, fmt.Errorf("daemon.workingDirectory must be absolute for a supervised service, got %q", input.Config.WorkingDirectory)
+	}
 
 	switch manager {
 	case ManagerLaunchd:
@@ -164,7 +170,6 @@ func buildSystemd(input Input, logDir string) (Plan, error) {
 		},
 		Deactivate: [][]string{
 			{"systemctl", "--user", "disable", "--now", "looperd.service"},
-			{"systemctl", "--user", "daemon-reload"},
 		},
 	}, nil
 }
@@ -271,6 +276,7 @@ func systemdQuote(value string) string {
 	escaped := strings.NewReplacer(
 		`\`, `\\`,
 		`"`, `\"`,
+		"%", "%%",
 		"\n", `\n`,
 		"\r", `\r`,
 		"\t", `\t`,

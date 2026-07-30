@@ -138,6 +138,19 @@ func TestBuildRejectsRelativeExecutablePath(t *testing.T) {
 	}
 }
 
+func TestBuildRejectsRelativeServicePaths(t *testing.T) {
+	t.Parallel()
+
+	for _, mutate := range []func(*config.DaemonConfig){
+		func(d *config.DaemonConfig) { d.LogDir = "logs" },
+		func(d *config.DaemonConfig) { d.WorkingDirectory = "." },
+	} {
+		if _, err := Build(testInput("linux", mutate)); err == nil {
+			t.Fatal("Build() accepted a relative supervised-service path")
+		}
+	}
+}
+
 func TestBuildRejectsRootServiceDomain(t *testing.T) {
 	t.Parallel()
 
@@ -253,6 +266,21 @@ func TestBuildEscapesSystemdDirectiveValues(t *testing.T) {
 	}
 	if !strings.Contains(plan.Unit, `Environment="TOKEN=safe\nExecStart=/bin/attacker"`) {
 		t.Fatalf("environment value was not systemd-escaped:\n%s", plan.Unit)
+	}
+}
+
+func TestBuildEscapesSystemdSpecifiers(t *testing.T) {
+	t.Parallel()
+
+	input := testInput("linux", nil)
+	input.ExecutablePath = "/home/dev/looperd%n"
+	input.ConfigPath = "/home/dev/config%i.toml"
+	plan, err := Build(input)
+	if err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+	if !strings.Contains(plan.Unit, `"/home/dev/looperd%%n"`) || !strings.Contains(plan.Unit, `"/home/dev/config%%i.toml"`) {
+		t.Fatalf("systemd specifiers were not escaped:\n%s", plan.Unit)
 	}
 }
 

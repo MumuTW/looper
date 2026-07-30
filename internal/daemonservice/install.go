@@ -135,6 +135,14 @@ func Uninstall(ctx context.Context, plan Plan, fs FS, run Runner) (Result, error
 	if err := fs.Remove(plan.UnitPath); err != nil && !os.IsNotExist(err) {
 		return result, fmt.Errorf("remove %s: %w", plan.UnitPath, err)
 	}
+	if plan.Manager == ManagerSystemd {
+		command := []string{"systemctl", "--user", "daemon-reload"}
+		_, err := run(ctx, command[0], command[1:]...)
+		result.Commands = append(result.Commands, strings.Join(command, " "))
+		if err != nil {
+			return result, fmt.Errorf("%s: %w", strings.Join(command, " "), err)
+		}
+	}
 	return result, nil
 }
 

@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 
@@ -107,6 +108,11 @@ func buildServicePlan(args []string, deps serviceDeps, requireServiceMode bool) 
 	if err != nil {
 		return daemonservice.Plan{}, "", err
 	}
+	if requireServiceMode {
+		if source, ok := nonPersistentServiceOverride(loaded.Metadata.FieldSources); ok {
+			return daemonservice.Plan{}, "", fmt.Errorf("refuse to install with %s override for %s; write the effective value to %s so the supervised daemon receives the same configuration", source, sourcePath(loaded.Metadata.FieldSources, source), loaded.Metadata.ConfigPath)
+		}
+	}
 	manager, supported := daemonservice.ForGOOS(deps.goos)
 	if !supported {
 		return daemonservice.Plan{}, "", fmt.Errorf("looper has no supervised-service support on %s; run looperd in the foreground under your own supervisor", deps.goos)
@@ -123,6 +129,9 @@ func buildServicePlan(args []string, deps serviceDeps, requireServiceMode bool) 
 	executablePath, err := deps.executable()
 	if err != nil {
 		return daemonservice.Plan{}, "", fmt.Errorf("resolve looperd path: %w", err)
+	}
+	if executableIsTemporary(executablePath) {
+		return daemonservice.Plan{}, "", fmt.Errorf("refuse to install transient executable %s; build and install a durable looperd binary first", executablePath)
 	}
 	homeDir, err := deps.homeDir()
 	if err != nil {
@@ -143,13 +152,13 @@ func buildServicePlan(args []string, deps serviceDeps, requireServiceMode bool) 
 	return plan, loaded.Metadata.ConfigPath, nil
 }
 
-func reportServiceStatus(plan daemonservice.Plan, configPath string, stdout io.Writer, deps serviceDeps) int {
+func reportServiceStatus(plan daemonservice.Plan, _ string, stdout io.Writer, deps serviceDeps) int {
 	installed := daemonservice.Installed(plan, deps.fs)
 	state := "not installed"
 	if installed {
 		state = "installed"
 	}
-	_, _ = fmt.Fprintf(stdout, "%s service: %s\n  unit:   %s\n  config: %s\n", plan.Manager, state, plan.UnitPath, configPath)
+	_, _ = fmt.Fprintf(stdout, "%s service: %s\n  unit:   %s\n", plan.Manager, state, plan.UnitPath)
 	if !installed {
 		return 1
 	}
@@ -157,6 +166,45 @@ func reportServiceStatus(plan daemonservice.Plan, configPath string, stdout io.W
 	// reports only whether a supervisor has been told to run it.
 	_, _ = fmt.Fprintln(stdout, "  (run `looper status` for daemon health)")
 	return 0
+}
+
+func nonPersistentServiceOverride(sources map[string]config.ValueSource) (config.ValueSource, bool) {
+	for _, source := range sources {
+		if source == config.ValueSourceCLI || source == config.ValueSourceEnv {
+			return source, true
+		}
+	}
+	return "", false
+}
+
+func sourcePath(sources map[string]config.ValueSource, want config.ValueSource) string {
+	for path, source := range sources {
+		if source == want {
+			return path
+		}
+	}
+	return "configuration"
+}
+
+func executableIsTemporary(path string) bool {
+	path = filepath.Clean(path)
+	temp := filepath.Clean(os.TempDir())
+	if pathWithin(temp, path) {
+		return true
+	}
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		path = resolved
+	}
+	if resolved, err := filepath.EvalSymlinks(temp); err == nil {
+		temp = resolved
+	}
+	rel, err := filepath.Rel(temp, path)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+func pathWithin(root, path string) bool {
+	rel, err := filepath.Rel(root, path)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 // writeLoginCaveat states the limit of what a per-user service buys, because

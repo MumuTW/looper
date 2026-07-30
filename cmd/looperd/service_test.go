@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -160,6 +161,49 @@ func TestServiceStatusReportsInstalledState(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), "installed") {
 		t.Fatalf("status output = %s", stdout.String())
+	}
+	if strings.Contains(stdout.String(), "config:") {
+		t.Fatalf("status presented the current config as the installed service config: %s", stdout.String())
+	}
+}
+
+func TestServiceInstallRejectsTransientExecutable(t *testing.T) {
+	t.Parallel()
+	fs := &serviceTestFS{files: map[string][]byte{}}
+	var commands []string
+	deps := testServiceDeps(config.DaemonModeLaunchd, fs, &commands)
+	deps.executable = func() (string, error) { return filepath.Join(os.TempDir(), "go-build-test", "looperd"), nil }
+	var stdout, stderr bytes.Buffer
+
+	if code := runServiceCommand(context.Background(), []string{"install"}, &stdout, &stderr, deps); code == 0 {
+		t.Fatal("install accepted a transient executable")
+	}
+	if len(fs.files) != 0 || len(commands) != 0 {
+		t.Fatalf("transient install touched service state: files=%v commands=%v", fs.files, commands)
+	}
+}
+
+func TestServiceInstallRejectsNonPersistentOverrides(t *testing.T) {
+	t.Parallel()
+	fs := &serviceTestFS{files: map[string][]byte{}}
+	var commands []string
+	deps := testServiceDeps(config.DaemonModeLaunchd, fs, &commands)
+	baseLoad := deps.loadConfig
+	deps.loadConfig = func(args []string) (config.LoadedFileConfig, error) {
+		loaded, err := baseLoad(args)
+		if err != nil {
+			return config.LoadedFileConfig{}, err
+		}
+		loaded.Metadata.FieldSources = map[string]config.ValueSource{"daemon.logDir": config.ValueSourceCLI}
+		return loaded, nil
+	}
+	var stdout, stderr bytes.Buffer
+
+	if code := runServiceCommand(context.Background(), []string{"install"}, &stdout, &stderr, deps); code == 0 {
+		t.Fatal("install accepted a non-persistent override")
+	}
+	if len(fs.files) != 0 || len(commands) != 0 {
+		t.Fatalf("override install touched service state: files=%v commands=%v", fs.files, commands)
 	}
 }
 
