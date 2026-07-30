@@ -103,3 +103,41 @@ Feishu anchor:  💻 本地接管 → looper resume 153
    so the human and the daemon never drive the same session concurrently.
 4. **Vendor gating.** Only codex/claude offer takeover until opencode/cursor pass
    the same 3-turn resume check.
+
+## What the hold actually covers
+
+`human_takeover` is a status on one loop. "A human owns this target" is a claim
+about a shared filesystem resource — the detached worktree — enforced through
+that one loop's status, and the two are not the same thing. State the difference
+rather than letting the wording imply the stronger one.
+
+Guaranteed from the moment takeover commits, until `looper handback`:
+
+- **No new claim** is granted on the held loop, or on any other loop sharing its
+  checkout — same project + repo + PR number for a PR target, same project +
+  target_id for an issue target. A project target is *not* a shared checkout
+  (project workers run concurrently by design, each on its own branch), so a
+  project-target hold fences only the held loop.
+- **The selected loop's in-flight run is stopped**, and spawn admission for it
+  stays closed.
+- **Its worktree is kept out of cleanup**: worktree cleanup skips it, and the
+  fixer's terminal-cleanup paths re-read the durable hold before removing a
+  checkout.
+- **No blind write may take or release the hold.** Only `looper takeover` creates
+  one and only `looper handback` (or an explicit stop/terminate) releases it;
+  every other write to a held loop is refused inside the writing statement.
+
+Not guaranteed:
+
+- **A sibling loop already claimed and running on the same checkout keeps
+  running.** The claim boundary refuses new claims; it cannot revoke one already
+  granted, and takeover stops only the loop it was given.
+- **`looper retry --discard-worktree-changes` can still reset the checkout.** It
+  does not share takeover's target mutex, so it can reach the filesystem before
+  the guard refuses its status write — and a filesystem mutation cannot be
+  undone by refusing a database write afterwards.
+
+Both gaps need a target/worktree-level lease rather than a per-loop status, which
+is the redesign this section exists to scope. Until then the takeover response
+names them, because the incident that produced all of this was a control
+reporting more than it did.

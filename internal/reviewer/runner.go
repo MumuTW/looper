@@ -1763,7 +1763,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 				failedQueue.Status = "failed"
 			}
 			if queueResultIsTerminalForCleanup(failedQueue) {
-				r.cleanupReviewerWorktreeIfTerminal(context.Background(), *project, &latest)
+				r.cleanupReviewerWorktreeIfTerminal(context.Background(), *project, loop.ID, &latest)
 			}
 			return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: runStatus, Summary: failure.message, FailureKind: failure.kind}, nil
 		}
@@ -1817,7 +1817,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			return ProcessResult{}, err
 		}
 	}
-	r.cleanupReviewerWorktreeIfTerminal(context.Background(), *project, &checkpoint)
+	r.cleanupReviewerWorktreeIfTerminal(context.Background(), *project, loop.ID, &checkpoint)
 	return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: status, Summary: summary}, nil
 }
 
@@ -1955,7 +1955,7 @@ func (r *Runner) skipMissingPullRequest(ctx context.Context, input stepInput, ch
 	checkpoint.SkipReason = fmt.Sprintf("Skipped missing pull request %s#%d: %s", input.Repo, input.PRNumber, githubinfra.ErrorMessage(err))
 	checkpoint.SkipKind = "pr_not_found"
 	checkpoint.ResumePolicy = ""
-	r.cleanupReviewerWorktreeIfTerminal(context.Background(), input.Project, &checkpoint)
+	r.cleanupReviewerWorktreeIfTerminal(context.Background(), input.Project, input.Loop.ID, &checkpoint)
 	if terminateErr := r.terminateLoop(ctx, input.Loop, "pr_not_found"); terminateErr != nil {
 		return checkpoint, true, terminateErr
 	}
@@ -6786,7 +6786,13 @@ func agentNativeLoopReviewMarker(loopID string, headSHA string) string {
 	return fmt.Sprintf("looper:review id_prefix=reviewer:%s: head=%s", loopID, headSHA)
 }
 
-func (r *Runner) cleanupReviewerWorktreeIfTerminal(ctx context.Context, project storage.ProjectRecord, checkpoint *reviewerCheckpoint) {
+// cleanupReviewerWorktreeIfTerminal force-removes the reviewer checkout on a
+// terminal path. loopID names the loop that produced the checkpoint and its
+// *durable* status is re-read here, for the same reason the fixer's equivalent
+// does: takeover cancels the loop's queue item, the run fails at its next step,
+// and this is where every terminal reviewer path ends — so takeover succeeding
+// is what would delete the checkout it just handed to the human (#162).
+func (r *Runner) cleanupReviewerWorktreeIfTerminal(ctx context.Context, project storage.ProjectRecord, loopID string, checkpoint *reviewerCheckpoint) {
 	if r.git == nil || checkpoint == nil || checkpoint.Worktree == nil || checkpoint.Worktree.Path == "" || checkpoint.Worktree.Branch == "" || checkpoint.Worktree.CleanedAt != "" {
 		return
 	}
@@ -6794,6 +6800,10 @@ func (r *Runner) cleanupReviewerWorktreeIfTerminal(ctx context.Context, project 
 	// fixer dirt that prepare never evaluated (remote-head drift / fetch fail
 	// before status). Terminal success/failure cleanup must not force-remove it.
 	if strings.TrimSpace(checkpoint.Worktree.PreparedAt) == "" {
+		return
+	}
+	if r.reviewerWorktreeHumanHeld(ctx, loopID) {
+		r.logInfo("reviewer worktree cleanup skipped for human takeover", map[string]any{"projectId": project.ID, "loopId": loopID, "worktreePath": checkpoint.Worktree.Path, "branch": checkpoint.Worktree.Branch})
 		return
 	}
 	// An active fixer owner stamp means the path is still fixer-owned evidence;
@@ -6878,6 +6888,21 @@ func restoreFixerOwnerToken(worktreePath, token string) error {
 		return nil
 	}
 	return worktreesafety.WriteFixerOwnerToken(worktreePath, token)
+}
+
+// reviewerWorktreeHumanHeld reports whether the durable loop row is held by
+// `looper takeover`. A read error preserves the checkout: cleanup is
+// irreversible and the loop is unavailable to prove it is safe.
+func (r *Runner) reviewerWorktreeHumanHeld(ctx context.Context, loopID string) bool {
+	if strings.TrimSpace(loopID) == "" || r.repos == nil || r.repos.Loops == nil {
+		return false
+	}
+	loop, err := r.repos.Loops.GetByID(ctx, loopID)
+	if err != nil {
+		r.logError("reviewer worktree cleanup could not read loop hold; preserving worktree", map[string]any{"loopId": loopID, "message": err.Error()})
+		return true
+	}
+	return loop != nil && domain.LoopIsHumanHeld(loop.Status)
 }
 
 func queueResultIsTerminalForCleanup(queue *storage.QueueItemRecord) bool {

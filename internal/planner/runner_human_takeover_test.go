@@ -17,7 +17,7 @@ func newHeldPlannerLoopFixture(t *testing.T) (*runnerFixture, *Runner) {
 	repo := "acme/looper"
 	targetID := buildIssueTargetID(repo, 42)
 	metadata := `{"issueNumber":42,"issueTitle":"Plan this"}`
-	if err := base.repos.Loops.Upsert(ctx, storage.LoopRecord{
+	if err := base.repos.Loops.UpsertChangingHumanHold(ctx, storage.LoopRecord{
 		ID: "loop_held", Seq: 42, ProjectID: "project_1", Type: "planner",
 		TargetType: "issue", TargetID: &targetID, Repo: &repo,
 		Status: "human_takeover", MetadataJSON: &metadata,

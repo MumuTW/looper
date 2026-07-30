@@ -238,7 +238,7 @@ func TestCleanupReviewerWorktreeIfTerminalSkipsUnpreparedAndFixerOwned(t *testin
 	checkpoint := &reviewerCheckpoint{
 		Worktree: &checkpointWorktree{Path: wtPath, Branch: "pr-42-head"},
 	}
-	runner.cleanupReviewerWorktreeIfTerminal(context.Background(), project, checkpoint)
+	runner.cleanupReviewerWorktreeIfTerminal(context.Background(), project, "", checkpoint)
 	if len(git.cleanupCalls) != 0 {
 		t.Fatalf("cleanupCalls = %d, want 0 for unprepared worktree", len(git.cleanupCalls))
 	}
@@ -249,7 +249,7 @@ func TestCleanupReviewerWorktreeIfTerminalSkipsUnpreparedAndFixerOwned(t *testin
 		t.Fatalf("WriteFixerOwnerToken: %v", err)
 	}
 	checkpoint.Worktree.PreparedAt = "2026-04-11T12:00:00.000Z"
-	runner.cleanupReviewerWorktreeIfTerminal(context.Background(), project, checkpoint)
+	runner.cleanupReviewerWorktreeIfTerminal(context.Background(), project, "", checkpoint)
 	if len(git.cleanupCalls) != 0 {
 		t.Fatalf("cleanupCalls = %d, want 0 for fixer-owned prepared worktree", len(git.cleanupCalls))
 	}
@@ -258,7 +258,7 @@ func TestCleanupReviewerWorktreeIfTerminalSkipsUnpreparedAndFixerOwned(t *testin
 	if err := worktreesafety.ClearFixerOwnerToken(wtPath); err != nil {
 		t.Fatalf("ClearFixerOwnerToken: %v", err)
 	}
-	runner.cleanupReviewerWorktreeIfTerminal(context.Background(), project, checkpoint)
+	runner.cleanupReviewerWorktreeIfTerminal(context.Background(), project, "", checkpoint)
 	if len(git.cleanupCalls) != 1 {
 		t.Fatalf("cleanupCalls = %d, want 1 for prepared reviewer-owned worktree", len(git.cleanupCalls))
 	}

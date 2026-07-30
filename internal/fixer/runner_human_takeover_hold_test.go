@@ -55,8 +55,8 @@ func newTakeoverHoldFixture(t *testing.T, withQueuedItem bool, runStatus string)
 		Status: "human_takeover", MetadataJSON: &loopMetadataJSON,
 		CreatedAt: nowISO, UpdatedAt: nowISO,
 	}
-	if err := base.repos.Loops.Upsert(ctx, loop); err != nil {
-		t.Fatalf("Loops.Upsert() error = %v", err)
+	if err := base.repos.Loops.UpsertChangingHumanHold(ctx, loop); err != nil {
+		t.Fatalf("Loops.UpsertChangingHumanHold() error = %v", err)
 	}
 
 	// The takeover happened while this run was active. runStatus is how far the

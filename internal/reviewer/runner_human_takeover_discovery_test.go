@@ -31,7 +31,7 @@ func TestDiscoverPullRequestsSkipsHumanHeldReviewerLoop(t *testing.T) {
 	prNumber := int64(42)
 	metadata := `{"followUpdates":true}`
 	held := storage.LoopRecord{ID: "loop_reviewer_held", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: string(domain.LoopStatusHumanTakeover), MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
-	if err := fixture.repos.Loops.Upsert(ctx, held); err != nil {
+	if err := fixture.repos.Loops.UpsertChangingHumanHold(ctx, held); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
 
@@ -83,7 +83,7 @@ func TestDiscoverPullRequestsHeldLoopDoesNotAbortPass(t *testing.T) {
 	prNumber := int64(42)
 	metadata := `{"followUpdates":true}`
 	held := storage.LoopRecord{ID: "loop_reviewer_held_batch", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: string(domain.LoopStatusHumanTakeover), MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
-	if err := fixture.repos.Loops.Upsert(ctx, held); err != nil {
+	if err := fixture.repos.Loops.UpsertChangingHumanHold(ctx, held); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
 
@@ -125,7 +125,7 @@ func TestMarkLoopQueuedForReviewLeavesHumanHeldLoopAlone(t *testing.T) {
 	prNumber := int64(42)
 	metadata := `{"followUpdates":true}`
 	held := storage.LoopRecord{ID: "loop_reviewer_held_update", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: string(domain.LoopStatusHumanTakeover), MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
-	if err := fixture.repos.Loops.Upsert(ctx, held); err != nil {
+	if err := fixture.repos.Loops.UpsertChangingHumanHold(ctx, held); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
 

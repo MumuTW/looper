@@ -636,13 +636,26 @@ func (r *LoopsRepository) upsert(ctx context.Context, record LoopRecord, changeH
 		humanHoldGuard = `
 		WHERE (loops.status = ?) = (excluded.status = ?)`
 	}
+	// The DO UPDATE guard only sees rows that already exist, so on its own it
+	// leaves the insert branch open: `POST /loops` with status human_takeover
+	// would mint the target-wide fence with no `looper takeover`, no queue
+	// cancellation and no stop. An unsanctioned write that *names* the held
+	// status must therefore also prove a row is already there; `looper takeover`
+	// (UpsertChangingHumanHold) is the only way to create a hold. The existence
+	// test is part of the writing statement for the same reason the update guard
+	// is: a read-then-write here would be a race, not a guard.
+	insertSource := `VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 	args := []any{record.ID, record.Seq, record.ProjectID, record.Type, record.TargetType, record.TargetID, record.Repo, record.PRNumber, record.Status, record.ConfigJSON, record.MetadataJSON, record.LastRunAt, record.NextRunAt, record.CreatedAt, record.UpdatedAt}
+	if !changeHumanHold && domain.LoopIsHumanHeld(record.Status) {
+		insertSource = `SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM loops WHERE id = ?)`
+		args = append(args, record.ID)
+	}
 	if !changeHumanHold {
 		args = append(args, string(domain.LoopStatusHumanTakeover), string(domain.LoopStatusHumanTakeover))
 	}
 	result, err := r.q.ExecContext(ctx, `
 		INSERT INTO loops (id, seq, project_id, type, target_type, target_id, repo, pr_number, status, config_json, metadata_json, last_run_at, next_run_at, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`+insertSource+`
 		ON CONFLICT(id) DO UPDATE SET
 			seq=excluded.seq,
 			project_id=excluded.project_id,
@@ -662,11 +675,18 @@ func (r *LoopsRepository) upsert(ctx context.Context, record LoopRecord, changeH
 		return fmt.Errorf("upsert loop: %w", err)
 	}
 	if !changeHumanHold {
-		// Zero rows can only mean the guard rejected the write: an insert always
+		// Zero rows can only mean a guard rejected the write: an insert always
 		// counts one, and SQLite counts a DO UPDATE even when values are identical.
 		affected, affectedErr := result.RowsAffected()
-		if affectedErr == nil && affected == 0 {
-			return r.humanHoldRejection(record)
+		// Fail closed. A driver that cannot report the count leaves us unable to
+		// tell an applied write from a refused one, and this is the one guard
+		// whose entire job is to refuse — reporting success here would be the
+		// silent hold change it exists to stop.
+		if affectedErr != nil {
+			return fmt.Errorf("upsert loop: read rows affected: %w", affectedErr)
+		}
+		if affected == 0 {
+			return r.humanHoldRejection(ctx, record)
 		}
 	}
 
@@ -686,9 +706,16 @@ func (r *LoopsRepository) upsert(ctx context.Context, record LoopRecord, changeH
 // humanHoldRejection names which side of the hold the refused write was on, so
 // the operator-facing conflict says what actually happened instead of always
 // claiming the loop is held. Only runs on the rejection path.
-func (r *LoopsRepository) humanHoldRejection(record LoopRecord) error {
+func (r *LoopsRepository) humanHoldRejection(ctx context.Context, record LoopRecord) error {
 	held := string(domain.LoopStatusHumanTakeover)
 	if record.Status == held {
+		// Two different refusals name the same status. Distinguish them from the
+		// durable row rather than guessing: no row at all means the write tried to
+		// *create* a hold, an existing row means it tried to restore one handback
+		// already released.
+		if existing, err := r.GetByID(ctx, record.ID); err == nil && existing == nil {
+			return fmt.Errorf("%w: refusing to create loop %s directly in human_takeover; `looper takeover` is the only way to take a hold", ErrLoopHumanHeld, record.ID)
+		}
 		return fmt.Errorf("%w: loop %s is no longer held by human takeover; refusing to restore the hold from a stale write", ErrLoopHumanHeld, record.ID)
 	}
 	return fmt.Errorf("%w: loop %s (wanted status %q); run `looper handback` to release it", ErrLoopHumanHeld, record.ID, record.Status)
@@ -2766,8 +2793,21 @@ const queueLockConflictPredicate = `(
 // sibling could prepare or clean the human's checkout seconds after takeover
 // reported success (#162, whose PR carried loops of more than one role).
 //
-// Same project + same PR number is exactly the shared-worktree key; issue and
-// project targets are matched on target_id for the same reason.
+// The key is whatever identifies the *checkout*, and that differs by target
+// type:
+//
+//   - pull_request: project + repo + PR number. `repo` is part of the key, not
+//     decoration — the checkout is looper-fix-<project>-pr-<N>-detached in that
+//     repo, so without it a hold on repoA#41 would fence repoB#41 in a project
+//     that spans repos. The reviewer/fixer blocker predicate below already
+//     compares both; the two must define the key identically.
+//   - issue: project + target_id. Planner/worker-on-issue share that checkout.
+//   - project: the held loop alone. A project target is *not* a shared-worktree
+//     key: assertUniqueActiveLoopCompat deliberately permits concurrent project
+//     workers, their queue lock is worker:<loopID>, and their worktree branch is
+//     derived per loop. Fencing every project worker off one takeover was an
+//     over-block, not a hold. They fall through to the `held.id = qi.loop_id`
+//     arm, which is per-loop.
 const humanHoldClaimPredicate = `NOT EXISTS (
 			SELECT 1
 			FROM loops held
@@ -2778,10 +2818,13 @@ const humanHoldClaimPredicate = `NOT EXISTS (
 						held.target_type = 'pull_request'
 						AND held.pr_number IS NOT NULL
 						AND held.pr_number = COALESCE(l.pr_number, qi.pr_number)
+						AND held.repo IS NOT NULL
+						AND held.repo = COALESCE(l.repo, qi.repo)
 					)
 					OR (
 						held.target_id IS NOT NULL
 						AND held.target_type = COALESCE(l.target_type, qi.target_type)
+						AND held.target_type != 'project'
 						AND held.target_id = COALESCE(l.target_id, qi.target_id)
 					)
 					OR held.id = qi.loop_id

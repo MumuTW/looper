@@ -5541,11 +5541,15 @@ func (h *Handler) takeoverLoop(ctx context.Context, loopID string) (takeoverLoop
 	if ok {
 		resp.ResumeCommand = cmdLine
 	}
-	// State what was actually fenced. The daemon's in-flight run is stopped and no
-	// lane can re-claim the loop while it stays in human_takeover, but that hold is
-	// separate from whether the human can *resume* the vendor session interactively.
-	// Conflating the two is what made the old message over-promise (#162).
-	hold := fmt.Sprintf("%s; the loop is parked in human_takeover and no role lane will claim it until you run `looper handback`", takeoverRunClause(result.RunID, result.RunStopOutcome))
+	// State what was actually fenced, and name what was not. "No role lane will
+	// claim it" was a promise the hold cannot keep: the claim boundary refuses
+	// *new* claims, it cannot revoke one already granted, and it is not a lock on
+	// the checkout. Two gaps survive and the operator has to know about them —
+	// a sibling loop already running on the same checkout, and `looper retry
+	// --discard-worktree-changes`, which resets the checkout on the filesystem
+	// before the guard refuses its status write. This PR exists because a control
+	// misreported what it did; naming the residue is the whole point.
+	hold := fmt.Sprintf("%s; the loop is parked in human_takeover, so no new claim is granted on its target and its worktree is kept out of cleanup until you run `looper handback`. A loop already running on the same checkout is not stopped, and `looper retry --discard-worktree-changes` can still reset it", takeoverRunClause(result.RunID, result.RunStopOutcome))
 	if ok {
 		resp.Message = hold + "."
 	} else {
@@ -6660,16 +6664,6 @@ func isTerminalReviewerLoopRecord(loop storage.LoopRecord) bool {
 	return status == "terminated" || status == "stopped" || status == "failed"
 }
 
-// rejectReactivationWhileHumanHeld refuses an API reactivation of a loop a human
-// holds via `looper takeover`. /start, /pause and a direct /retry all rewrite the
-// loop status through a blind upsert; once the status is no longer
-// human_takeover the claim boundary stops applying and a lane can reach the
-// human's worktree before handback (#162).
-//
-// Only /handback releases the hold. The storage write guard
-// (storage.ErrLoopHumanHeld) is the backstop that closes the read-to-write race;
-// this exists so the operator gets the reason and the next command instead of a
-// generic conflict, and so the sticky stop gate is never cleared for a held loop.
 // loopStatusMutationVerb names the operator-facing route behind a
 // mutateLoopStatus call so a refusal reads as the command that was run.
 func loopStatusMutationVerb(status domain.LoopStatus) string {
@@ -6683,6 +6677,16 @@ func loopStatusMutationVerb(status domain.LoopStatus) string {
 	}
 }
 
+// rejectReactivationWhileHumanHeld refuses an API reactivation of a loop a human
+// holds via `looper takeover`. /start, /pause and a direct /retry all rewrite the
+// loop status through a blind upsert; once the status is no longer
+// human_takeover the claim boundary stops applying and a lane can reach the
+// human's worktree before handback (#162).
+//
+// Only /handback releases the hold. The storage write guard
+// (storage.ErrLoopHumanHeld) is the backstop that closes the read-to-write race;
+// this exists so the operator gets the reason and the next command instead of a
+// generic conflict, and so the sticky stop gate is never cleared for a held loop.
 func rejectReactivationWhileHumanHeld(status, loopID, action string) error {
 	if !domain.LoopIsHumanHeld(status) {
 		return nil

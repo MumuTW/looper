@@ -803,12 +803,18 @@ func TestHandlerLoopRetryDiscardRejectsActiveSiblingPRLoop(t *testing.T) {
 			repo := "acme/looper"
 			prNumber := int64(42)
 			prTarget := "pr:acme/looper:42"
-			if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{
+			// Only `looper takeover` may create a hold, so a held sibling fixture
+			// has to be seeded the way takeover takes one.
+			seedSibling := services.Repositories.Loops.Upsert
+			if tc.siblingStatus == "human_takeover" {
+				seedSibling = services.Repositories.Loops.UpsertChangingHumanHold
+			}
+			if err := seedSibling(context.Background(), storage.LoopRecord{
 				ID: "loop_sibling_" + tc.name, Seq: 3141, ProjectID: projectID,
 				Type: tc.siblingType, TargetType: "pull_request", TargetID: &prTarget, Repo: &repo, PRNumber: &prNumber,
 				Status: tc.siblingStatus, CreatedAt: nowISO, UpdatedAt: nowISO,
 			}); err != nil {
-				t.Fatalf("Loops.Upsert(sibling) error = %v", err)
+				t.Fatalf("seed sibling loop error = %v", err)
 			}
 
 			req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/"+fixture.LoopID+"/retry", strings.NewReader(`{"mode":"auto","discardWorktreeChanges":true}`))

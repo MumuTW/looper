@@ -26,7 +26,7 @@ func TestDiscoverIssuesSkipsHumanHeldWorkerLoop(t *testing.T) {
 	loopTarget := buildIssueTargetID(repo, 46)
 	metadataJSON := `{"worker":{"title":"Implement worker-ready","repo":"acme/looper","baseBranch":"main","executionMode":"create-pr","issueNumber":46,"autoDiscovered":true}}`
 	held := storage.LoopRecord{ID: "loop_worker_held", Seq: 90, ProjectID: "project_1", Type: "worker", TargetType: "issue", TargetID: &loopTarget, Repo: &repo, Status: string(domain.LoopStatusHumanTakeover), MetadataJSON: &metadataJSON, CreatedAt: nowISO, UpdatedAt: nowISO}
-	if err := fixture.repos.Loops.Upsert(ctx, held); err != nil {
+	if err := fixture.repos.Loops.UpsertChangingHumanHold(ctx, held); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
 	github := &fakeGitHubGateway{currentLogin: "octocat", issues: []IssueSummary{{Number: 46, Title: "Implement worker-ready", URL: "https://github.com/acme/looper/issues/46", Assignees: []string{"octocat"}, Labels: []string{"looper:worker-ready"}}}}
@@ -66,7 +66,7 @@ func TestDiscoverIssuesHeldLoopDoesNotAbortBatch(t *testing.T) {
 	loopTarget := buildIssueTargetID(repo, 46)
 	metadataJSON := `{"worker":{"title":"Implement worker-ready","repo":"acme/looper","baseBranch":"main","executionMode":"create-pr","issueNumber":46,"autoDiscovered":true}}`
 	held := storage.LoopRecord{ID: "loop_worker_held_batch", Seq: 91, ProjectID: "project_1", Type: "worker", TargetType: "issue", TargetID: &loopTarget, Repo: &repo, Status: string(domain.LoopStatusHumanTakeover), MetadataJSON: &metadataJSON, CreatedAt: nowISO, UpdatedAt: nowISO}
-	if err := fixture.repos.Loops.Upsert(ctx, held); err != nil {
+	if err := fixture.repos.Loops.UpsertChangingHumanHold(ctx, held); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
 	github := &fakeGitHubGateway{currentLogin: "octocat", issues: []IssueSummary{
@@ -104,8 +104,8 @@ func TestDiscoverIssuesHandbackDirection(t *testing.T) {
 	metadataJSON := `{"worker":{"title":"Stale title","repo":"acme/looper","baseBranch":"main","executionMode":"create-pr","issueNumber":46,"autoDiscovered":true}}`
 	loopID := "loop_worker_handback"
 	seeded := storage.LoopRecord{ID: loopID, Seq: 92, ProjectID: "project_1", Type: "worker", TargetType: "issue", TargetID: &loopTarget, Repo: &repo, Status: string(domain.LoopStatusHumanTakeover), MetadataJSON: &metadataJSON, CreatedAt: nowISO, UpdatedAt: nowISO}
-	if err := fixture.repos.Loops.Upsert(ctx, seeded); err != nil {
-		t.Fatalf("Loops.Upsert() error = %v", err)
+	if err := fixture.repos.Loops.UpsertChangingHumanHold(ctx, seeded); err != nil {
+		t.Fatalf("Loops.UpsertChangingHumanHold() error = %v", err)
 	}
 	github := &fakeGitHubGateway{currentLogin: "octocat", issues: []IssueSummary{{Number: 46, Title: "Fresh title from GitHub", Assignees: []string{"octocat"}, Labels: []string{"looper:worker-ready"}}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})

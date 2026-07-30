@@ -41,10 +41,22 @@ func (f *humanHoldFixture) seedPRLoop(t *testing.T, id, loopType, status string,
 		TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber,
 		Status: status, CreatedAt: humanHoldNow, UpdatedAt: humanHoldNow,
 	}
-	if err := f.repos.Loops.Upsert(f.ctx, loop); err != nil {
-		t.Fatalf("Loops.Upsert(%s) error = %v", id, err)
-	}
+	f.seedLoop(t, loop)
 	return loop
+}
+
+// seedLoop writes a fixture loop through whichever write is sanctioned for its
+// status: only `looper takeover` may create a hold, so a held fixture has to be
+// seeded the way takeover takes one.
+func (f *humanHoldFixture) seedLoop(t *testing.T, loop LoopRecord) {
+	t.Helper()
+	write := f.repos.Loops.Upsert
+	if loop.Status == "human_takeover" {
+		write = f.repos.Loops.UpsertChangingHumanHold
+	}
+	if err := write(f.ctx, loop); err != nil {
+		t.Fatalf("seed loop %s (status %s) error = %v", loop.ID, loop.Status, err)
+	}
 }
 
 func (f *humanHoldFixture) seedQueueItem(t *testing.T, id, loopID, itemType string) {
@@ -140,13 +152,11 @@ func TestHumanTakeoverHoldsSiblingIssueTarget(t *testing.T) {
 		{"loop_held_planner", "planner", "human_takeover"},
 		{"loop_sibling_worker", "worker", "queued"},
 	} {
-		if err := f.repos.Loops.Upsert(f.ctx, LoopRecord{
+		f.seedLoop(t, LoopRecord{
 			ID: seed.id, Seq: int64(len(seed.id)), ProjectID: "project_1", Type: seed.loopType,
 			TargetType: "issue", TargetID: &targetID, Repo: &repo, Status: seed.status,
 			CreatedAt: humanHoldNow, UpdatedAt: humanHoldNow,
-		}); err != nil {
-			t.Fatalf("Loops.Upsert(%s) error = %v", seed.id, err)
-		}
+		})
 	}
 	projectID := "project_1"
 	loopID := "loop_sibling_worker"

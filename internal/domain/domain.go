@@ -127,7 +127,11 @@ var loopStatusTransitions = map[LoopStatus][]LoopStatus{
 	LoopStatusTerminated:    {},
 	LoopStatusCompleted:     {},
 	LoopStatusFailed:        {},
-	LoopStatusInterrupted:   {LoopStatusQueued, LoopStatusFailed},
+	// interrupted is non-terminal — it still requeues — and an interrupted loop
+	// is exactly the case a human reaches for: the run died mid-flight and left
+	// agent dirt in the worktree. It was missed when takeover reachability was
+	// widened to every non-terminal status (#177).
+	LoopStatusInterrupted: {LoopStatusQueued, LoopStatusFailed, LoopStatusHumanTakeover},
 }
 
 var runStatusTransitions = map[RunStatus][]RunStatus{

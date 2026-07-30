@@ -115,7 +115,7 @@ func TestAssertStatusTransitions(t *testing.T) {
 	}
 	// Takeover commits the hold as its first write, before it stops the run, so
 	// every non-terminal status must be able to enter human_takeover (#177).
-	for _, from := range []LoopStatus{LoopStatusIdle, LoopStatusQueued, LoopStatusRunning, LoopStatusWaiting, LoopStatusPaused, LoopStatusAwaitingHuman} {
+	for _, from := range []LoopStatus{LoopStatusIdle, LoopStatusQueued, LoopStatusRunning, LoopStatusWaiting, LoopStatusPaused, LoopStatusAwaitingHuman, LoopStatusInterrupted} {
 		if err := AssertLoopStatusTransition(from, LoopStatusHumanTakeover); err != nil {
 			t.Fatalf("AssertLoopStatusTransition(%s, human_takeover) error = %v", from, err)
 		}
