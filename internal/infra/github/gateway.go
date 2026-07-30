@@ -39,7 +39,7 @@ var (
 	prViewMetadataJSONFields   = []string{"number", "title", "body", "url", "state", "createdAt", "updatedAt", "closedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "mergeStateStatus"}
 	prViewFixerJSONFields      = []string{"number", "title", "body", "url", "state", "createdAt", "updatedAt", "closedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "statusCheckRollup", "mergeStateStatus"}
 	prViewReviewerJSONFields   = []string{"number", "title", "body", "url", "state", "createdAt", "updatedAt", "closedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "reviews", "statusCheckRollup", "mergeStateStatus"}
-	prViewGatekeeperJSONFields = []string{"number", "state", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "mergeStateStatus", "changedFiles", "deletions"}
+	prViewGatekeeperJSONFields = []string{"number", "state", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "mergeStateStatus", "changedFiles", "deletions", "closingIssuesReferences"}
 )
 
 var prNumberURLPattern = regexp.MustCompile(`/pull/(\d+)(?:/|$)`)
@@ -173,6 +173,8 @@ type PullRequestDetail struct {
 	Mergeable          *bool
 	MergeableState     MergeabilityState
 	MergedAt           string
+	MergeCommitSHA     string
+	ClosingIssues      []IssueReference
 	AutoMerge          *PullRequestAutoMerge
 }
 
@@ -183,6 +185,13 @@ type PullRequestDiffStats struct {
 	Deletions    int `json:"deletions"`
 }
 
+// IssueReference is GitHub's explicit pull-request-to-issue relationship.
+// It is deliberately not derived from PR title or body text.
+type IssueReference struct {
+	Number int64
+	Repo   string
+	URL    string
+}
 type PullRequestAutoMerge struct {
 	EnabledBy   string
 	MergeMethod string
@@ -1866,6 +1875,8 @@ func pullRequestDetailFromViewRow(row map[string]any, threads []map[string]any, 
 		Mergeable:          boolPtrFromValue(row["mergeable"]),
 		MergeableState:     ParseMergeabilityState(firstNonEmpty(asString(row["mergeable_state"]), asString(row["mergeStateStatus"]))),
 		MergedAt:           asString(row["merged_at"]),
+		MergeCommitSHA:     nestedString(row, "mergeCommit", "oid"),
+		ClosingIssues:      extractIssueReferences(row["closingIssuesReferences"]),
 		AutoMerge:          extractAutoMerge(row["auto_merge"]),
 	}
 }
@@ -1926,6 +1937,7 @@ func (g *Gateway) ViewPullRequestMergeWatch(ctx context.Context, input ViewPullR
 		IsDraft:        asBool(row["draft"]),
 		Author:         extractAuthor(row["user"]),
 		MergedAt:       firstNonEmpty(asString(row["merged_at"]), asString(row["mergedAt"])),
+		MergeCommitSHA: firstNonEmpty(asString(row["merge_commit_sha"]), nestedString(row, "mergeCommit", "oid")),
 		Labels:         extractLabelNames(row["labels"]),
 		HeadRefName:    nestedString(row, "head", "ref"),
 		BaseRefName:    nestedString(row, "base", "ref"),
@@ -1936,6 +1948,25 @@ func (g *Gateway) ViewPullRequestMergeWatch(ctx context.Context, input ViewPullR
 		MergeableState: ParseMergeabilityState(firstNonEmpty(asString(row["mergeable_state"]), asString(row["mergeStateStatus"]))),
 		AutoMerge:      extractAutoMerge(row["auto_merge"]),
 	}, nil
+}
+
+func extractIssueReferences(value any) []IssueReference {
+	references := make([]IssueReference, 0)
+	for _, issue := range toObjectSlice(value) {
+		owner := nestedString(issue, "repository", "owner", "login")
+		name := nestedString(issue, "repository", "name")
+		repo := strings.Trim(strings.TrimSpace(owner)+"/"+strings.TrimSpace(name), "/")
+		if number := asInt64(issue["number"]); number > 0 && repo != "" {
+			references = append(references, IssueReference{Number: number, Repo: repo, URL: asString(issue["url"])})
+		}
+	}
+	sort.Slice(references, func(i, j int) bool {
+		if !strings.EqualFold(references[i].Repo, references[j].Repo) {
+			return strings.ToLower(references[i].Repo) < strings.ToLower(references[j].Repo)
+		}
+		return references[i].Number < references[j].Number
+	})
+	return references
 }
 
 func (g *Gateway) ListPullRequestCheckRuns(ctx context.Context, input PullRequestCheckRunsInput) (PullRequestCheckRuns, error) {

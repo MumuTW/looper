@@ -126,6 +126,7 @@ type Evidence struct {
 	FinalObservedHeadSHA         string                       `json:"finalObservedHeadSha,omitempty"`
 	CodexReviewOutcome           string                       `json:"codexReviewOutcome,omitempty"`
 	ReviewProvenance             ReviewProvenance             `json:"reviewProvenance,omitempty"`
+	ClosingIssues                []githubinfra.IssueReference `json:"closingIssues,omitempty"`
 }
 
 type Report struct {
@@ -471,6 +472,7 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 		Reasons: []Reason{}, Evidence: Evidence{
 			RequiredChecks: []string{}, Checks: []CheckEvidence{}, UnresolvedReviewThreadIDs: []string{}, HoldLabels: []string{},
 			ReviewProvenance: ReviewProvenance{Reviewers: []ReviewerObservation{}, Refusals: []ReviewRefusal{}},
+			ClosingIssues: []githubinfra.IssueReference{},
 		},
 		EvaluatedAt:       r.now().UTC().Format(time.RFC3339Nano),
 		SourceFingerprint: input.SourceFingerprint,
@@ -480,6 +482,7 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 	if err != nil {
 		return r.persistProviderBlock(ctx, report, ReasonProviderStateUnavailable, "pull_request")
 	}
+	report.Evidence.ClosingIssues = append([]githubinfra.IssueReference(nil), detail.ClosingIssues...)
 	report.ObservedHeadSHA = strings.TrimSpace(detail.HeadSHA)
 	report.Evidence.PullRequestState = strings.ToUpper(strings.TrimSpace(detail.State))
 	report.Evidence.Draft = detail.IsDraft

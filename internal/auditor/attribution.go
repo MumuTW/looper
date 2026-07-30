@@ -6,6 +6,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	githubinfra "github.com/MumuTW/looper/internal/infra/github"
 )
 
 type Confidence string
@@ -24,6 +26,8 @@ type MergeCandidate struct {
 	Repo                   string
 	PRNumber               int64
 	HeadSHA                string
+	MergeCommitSHA         string
+	SourceIssue            *githubinfra.IssueReference
 	MergedAt               time.Time
 	TouchedFiles           []string
 	IntroducedReproduction bool
