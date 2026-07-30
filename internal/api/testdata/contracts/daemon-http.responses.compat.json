@@ -72,6 +72,12 @@
                 "quarantinedRunningRuns": 0
               }
             },
+            "triage": {
+              "awaitingConfirmation": {
+                "count": 0,
+                "sources": []
+              }
+            },
             "binary": {
               "name": "looperd",
               "path": "<daemon-executable-path>",
