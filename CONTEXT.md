@@ -37,6 +37,22 @@ the semantics: the internal proactive Role that persists Triage Reports and
 projects accepted low-risk reports into Planner work.
 _Avoid_: coordinator (a separate label/network control-plane role).
 
+**Intake**:
+Defined at `telegram.Dispatch` in `internal/intake/telegram`, whose doc comments
+carry the semantics: a chat message becomes an Issue and nothing more. Intake
+performs no Triage, applies no routing label, and starts no loop; the Issue it
+creates is discovered by the same lanes that find a hand-filed one.
+_Avoid_: Role (Intake runs no agent), Dispatch, triage.
+
+**Source stamp**:
+The marker Intake writes into an Issue body identifying the chat message that
+created it. It is the Authority for whether a redelivered message already has an
+Issue, replacing a local cursor. Because the forge offers no idempotency key for
+Issue creation and its search index is eventually consistent, the check is
+best-effort: Intake prefers a duplicate Issue, which is visible and carries the
+same stamp as its twin, over a silently dropped request.
+_Avoid_: cursor, offset, dedupe key.
+
 **Worker**:
 Defined at `worker.Runner` in `internal/worker`, whose doc comment carries the
 semantics: a reactive Role implementing a Spec or an Issue into a Pull Request.

@@ -391,6 +391,19 @@ type IssueCommentResult struct {
 	URL string
 }
 
+type CreateIssueInput struct {
+	Repo   string
+	Title  string
+	Body   string
+	Labels []string
+	CWD    string
+}
+
+type CreateIssueResult struct {
+	Number int64
+	URL    string
+}
+
 type UpdateIssueCommentInput struct {
 	Repo      string
 	CommentID int64
@@ -1263,6 +1276,77 @@ func (g *Gateway) CreateIssueComment(ctx context.Context, input IssueCommentInpu
 		return IssueCommentResult{}, err
 	}
 	return IssueCommentResult{ID: asInt64(row["id"]), URL: asString(row["html_url"])}, nil
+}
+
+// FindIssueBySourceStamp returns the number of an Issue whose body carries the
+// given intake stamp, or 0 when none is indexed. Both open and closed Issues are
+// searched, because a request replayed after a long outage may target one that
+// has since been closed.
+//
+// This is a best-effort duplicate check, not a lock: GitHub's search index is
+// eventually consistent, so an Issue created seconds ago may not be found yet.
+// See the intake lane for the trade-off that depends on it.
+func (g *Gateway) FindIssueBySourceStamp(ctx context.Context, repo, stamp, cwd string) (int64, error) {
+	stamp = strings.TrimSpace(stamp)
+	if stamp == "" {
+		return 0, fmt.Errorf("intake stamp is required")
+	}
+	hostname, repoSlug := splitRepoHostname(repo)
+	args := []string{"issue", "list", "--repo", repoSlug, "--state", "all", "--limit", "10", "--search", stamp, "--json", "number"}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGh(ctx, cwd, "", args...)
+	if err != nil {
+		return 0, err
+	}
+	rows, err := decodeJSONArray(result.Stdout)
+	if err != nil {
+		return 0, err
+	}
+	for _, row := range rows {
+		if number := asInt64(row["number"]); number > 0 {
+			return number, nil
+		}
+	}
+	return 0, nil
+}
+
+// CreateIssue opens a new Issue. Intake uses it to turn a chat message into the
+// forge record that the existing Triager and Planner lanes discover; nothing
+// here classifies or routes the Issue.
+func (g *Gateway) CreateIssue(ctx context.Context, input CreateIssueInput) (CreateIssueResult, error) {
+	title := strings.TrimSpace(input.Title)
+	if title == "" {
+		return CreateIssueResult{}, fmt.Errorf("issue title is required")
+	}
+	if err := outboundguard.Validate(
+		outboundguard.Field{Name: "issue title", Text: title},
+		outboundguard.Field{Name: "issue body", Text: input.Body},
+	); err != nil {
+		return CreateIssueResult{}, err
+	}
+	hostname, repo := splitRepoHostname(input.Repo)
+	args := []string{"api", fmt.Sprintf("repos/%s/issues", repo), "--method", "POST", "-f", "title=" + title, "-f", "body=" + input.Body}
+	for _, label := range input.Labels {
+		label = strings.TrimSpace(label)
+		if label == "" {
+			continue
+		}
+		args = append(args, "-f", "labels[]="+label)
+	}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGh(ctx, input.CWD, "", args...)
+	if err != nil {
+		return CreateIssueResult{}, err
+	}
+	row, err := decodeJSONObject(result.Stdout)
+	if err != nil {
+		return CreateIssueResult{}, err
+	}
+	return CreateIssueResult{Number: asInt64(row["number"]), URL: asString(row["html_url"])}, nil
 }
 
 func (g *Gateway) UpdateIssueComment(ctx context.Context, input UpdateIssueCommentInput) error {
