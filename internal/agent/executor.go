@@ -701,24 +701,35 @@ type execution struct {
 	lastOutputAt       time.Time
 	lastProgressAt     time.Time
 
-	mu                      sync.Mutex
-	persistMu               sync.Mutex // one ordered writer per execution (#578)
-	terminalPersisted       bool
-	hardPersistReported     bool
-	status                  string
-	stdout                  []byte
-	stderr                  []byte
-	stdoutLogPath           string
-	stderrLogPath           string
-	persistedLogWriteFailed bool
-	heartbeatCount          int64
-	nativeSessionID         string
-	nativeResumeMode        string
-	nativeResumeStatus      string
-	nativeResumeError       string
-	processBirth            processidentity.Birth
-	leaseReleased           bool
-	toolSandbox             *validationcmd.Sandbox
+	mu        sync.Mutex
+	persistMu sync.Mutex // one ordered writer per execution (#578)
+	// lastPersisted* (under persistMu) form the monotonic gate for live
+	// observations: stdout/stderr handlers snapshot under mu but persist under
+	// persistMu, so an older cumulative snapshot can arrive after a newer one
+	// persisted and must not overwrite it. Status is sampled at persist-call
+	// time — independent of the snapshot — so a stale-by-count observation can
+	// still carry the one-way running→cancelling transition, which is then
+	// written with the retained newer snapshot values.
+	lastPersistedHeartbeatCount int64
+	lastPersistedHeartbeatAt    string
+	lastPersistedOutputJSON     *string
+	lastPersistedStatus         string
+	terminalPersisted           bool
+	hardPersistReported         bool
+	status                      string
+	stdout                      []byte
+	stderr                      []byte
+	stdoutLogPath               string
+	stderrLogPath               string
+	persistedLogWriteFailed     bool
+	heartbeatCount              int64
+	nativeSessionID             string
+	nativeResumeMode            string
+	nativeResumeStatus          string
+	nativeResumeError           string
+	processBirth                processidentity.Birth
+	leaseReleased               bool
+	toolSandbox                 *validationcmd.Sandbox
 
 	killCh chan string
 	doneCh chan execOutcome
@@ -1538,14 +1549,10 @@ func (x *execution) bumpRunHeartbeat(nowISO string) {
 		return
 	}
 	ctx := context.Background()
-	run, err := x.executor.repos.Runs.GetByID(ctx, x.input.RunID)
-	if err != nil || run == nil {
-		return
-	}
-	updated := *run
-	updated.LastHeartbeatAt = &nowISO
-	updated.UpdatedAt = nowISO
-	_ = x.executor.repos.Runs.Upsert(ctx, updated)
+	// Targeted forward-only column update: a full-record read/modify/upsert
+	// here could resurrect stale run state captured before a concurrent writer,
+	// and an out-of-order heartbeat must not move liveness evidence backward.
+	_ = x.executor.repos.Runs.TouchHeartbeat(ctx, x.input.RunID, nowISO)
 	// The heartbeat and the claim lease are the same fact, so they are written
 	// together. Without this the lease expires mid-run and "expired lease"
 	// carries no information about whether the claim is still being worked.
@@ -1561,6 +1568,30 @@ func (x *execution) persistStatus(ctx context.Context, status string, heartbeatC
 	defer x.persistMu.Unlock()
 	if x.terminalPersisted {
 		return nil
+	}
+	// Snapshots are cumulative (bounded output tails plus a heartbeat count
+	// that only grows under mu), so a snapshot older than the last persisted
+	// one carries strictly less information: drop it instead of moving durable
+	// heartbeat/output state backward. The exception is a fresher status
+	// sample: the heartbeat count orders output snapshots but is not the
+	// authority for the independently sampled lifecycle status, so a
+	// running→cancelling transition is written with the retained newer
+	// snapshot values instead of being lost for the rest of the drain.
+	if heartbeatCount != nil && *heartbeatCount < x.lastPersistedHeartbeatCount {
+		if status != "cancelling" || x.lastPersistedStatus == "cancelling" {
+			return nil
+		}
+		retainedCount := x.lastPersistedHeartbeatCount
+		retainedAt := x.lastPersistedHeartbeatAt
+		heartbeatCount = &retainedCount
+		heartbeatAt = &retainedAt
+		outputJSON = x.lastPersistedOutputJSON
+	}
+	// The live status is one-way regardless of snapshot order: a callback that
+	// sampled running before the kill can reach here after cancelling
+	// persisted (with an equal or newer count) and must not downgrade it.
+	if status == "running" && x.lastPersistedStatus == "cancelling" {
+		status = "cancelling"
 	}
 	if x.executor.repos == nil || x.executor.repos.AgentExecutions == nil {
 		return nil
@@ -1602,7 +1633,18 @@ func (x *execution) persistStatus(ctx context.Context, status string, heartbeatC
 	if outputJSON != nil {
 		record.OutputJSON = outputJSON
 	}
-	return x.upsertAgentExecutionWithRetry(ctx, record)
+	err := x.upsertAgentExecutionWithRetry(ctx, record)
+	if err == nil {
+		x.lastPersistedStatus = status
+		if heartbeatCount != nil {
+			x.lastPersistedHeartbeatCount = *heartbeatCount
+			x.lastPersistedHeartbeatAt = *heartbeatAt
+		}
+		if outputJSON != nil {
+			x.lastPersistedOutputJSON = outputJSON
+		}
+	}
+	return err
 }
 
 // persistFinal writes the terminal observation after containment is confirmed

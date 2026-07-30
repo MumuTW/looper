@@ -153,11 +153,18 @@ func DefaultConfig(cwd string) (Config, error) {
 			WorkingDirectory:       cwd,
 			Environment:            map[string]string{},
 			WorktreeCleanup: WorktreeCleanupConfig{
-				Enabled:        true,
-				Interval:       "24h",
-				RetentionDays:  7,
-				MaxPerTick:     10,
-				IncludeOrphans: false,
+				Enabled:       true,
+				Interval:      "24h",
+				RetentionDays: 7,
+				MaxPerTick:    10,
+				// Orphans -- records no loop, run, or queue item references -- are
+				// included because the retention window already gates them: Plan
+				// notes every candidate's own CreatedAt/UpdatedAt, so an orphan
+				// ages like any other worktree. Excluding them made the sweeper
+				// inert: the reference graph drops old worktrees as loops move on,
+				// so nearly everything eligible by age is an orphan, and the pass
+				// skipped it regardless of age.
+				IncludeOrphans: true,
 				DryRun:         false,
 			},
 		},

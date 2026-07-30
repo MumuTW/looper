@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/reviewer"
 	pkgapi "github.com/nexu-io/looper/pkg/api"
@@ -73,7 +74,7 @@ func (h *Handler) defaultReviewerRepair(ctx context.Context, input reviewer.Repa
 	if h.context.Config.Tools.GHPath != nil {
 		ghPath = strings.TrimSpace(*h.context.Config.Tools.GHPath)
 	}
-	gateway := github.New(github.Options{GHPath: ghPath, Now: h.now})
+	gateway := github.New(github.Options{GHPath: ghPath, Env: config.DaemonGitHubCredentialEnv(h.context.Config), Now: h.now})
 	repairer := reviewer.NewRepairer(reviewer.RepairOptions{
 		DB:           services.Coordinator.DB(),
 		Repos:        services.Repositories,
