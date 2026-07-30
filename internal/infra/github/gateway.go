@@ -656,12 +656,6 @@ type InitializeLabelsInput struct {
 	DryRun bool
 }
 
-type LabelDefinition struct {
-	Name        string `json:"name"`
-	Color       string `json:"color"`
-	Description string `json:"description"`
-}
-
 type LabelInitResult struct {
 	Repo    string           `json:"repo"`
 	DryRun  bool             `json:"dryRun"`
@@ -679,7 +673,6 @@ type LabelInitItem struct {
 
 type LabelInitSummary struct {
 	Created int `json:"created"`
-	Updated int `json:"updated"`
 	Skipped int `json:"skipped"`
 	Failed  int `json:"failed"`
 }
@@ -3022,22 +3015,21 @@ func (g *Gateway) InitializeLabels(ctx context.Context, input InitializeLabelsIn
 		return LabelInitResult{}, err
 	}
 
-	result := LabelInitResult{Repo: repo, DryRun: input.DryRun, Labels: make([]LabelInitItem, 0, len(StandardLooperLabels()))}
-	for _, definition := range StandardLooperLabels() {
+	standard := labels.Standard()
+	result := LabelInitResult{Repo: repo, DryRun: input.DryRun, Labels: make([]LabelInitItem, 0, len(standard))}
+	for _, definition := range standard {
 		item := LabelInitItem{Name: definition.Name, Color: definition.Color, Description: definition.Description}
-		current, ok := existing[strings.ToLower(definition.Name)]
-		switch {
-		case !ok:
+		// Create-only. A label already in the repository is left exactly as it
+		// is, including its color and description: provisioning exists so a
+		// managed repository has the vocabulary Looper needs, not so Looper
+		// owns how a maintainer has worded it. Editing here would silently
+		// rewrite curated labels on every registered project.
+		if _, exists := existing[strings.ToLower(definition.Name)]; exists {
+			item.Status = "skipped"
+		} else {
 			item.Status = "created"
 			if !input.DryRun {
 				_, err = g.runGh(ctx, input.CWD, "", "label", "create", definition.Name, "--repo", repo, "--color", definition.Color, "--description", definition.Description)
-			}
-		case normalizeLabelColor(current.Color) == normalizeLabelColor(definition.Color) && strings.TrimSpace(current.Description) == definition.Description:
-			item.Status = "skipped"
-		default:
-			item.Status = "updated"
-			if !input.DryRun {
-				_, err = g.runGh(ctx, input.CWD, "", "label", "edit", current.Name, "--repo", repo, "--color", definition.Color, "--description", definition.Description)
 			}
 		}
 
@@ -3373,21 +3365,40 @@ func (g *Gateway) getReviewThread(ctx context.Context, threadID, cwd string) (*r
 	return &reviewThreadNode{ID: id, IsResolved: asBool(node["isResolved"])}, nil
 }
 
-func (g *Gateway) ensureLabelsExist(ctx context.Context, repo string, labels []string, cwd string) error {
+// ensureLabelsExist creates any label about to be applied that the repository
+// does not have yet, so that applying a label to a fresh repository does not
+// fail on a missing label.
+//
+// Presentation comes from labels.Standard when the label is one Looper owns,
+// and falls back to a neutral default for anything else — a project may
+// configure its own trigger labels, and those have no entry in the table.
+func (g *Gateway) ensureLabelsExist(ctx context.Context, repo string, wanted []string, cwd string) error {
 	seen := map[string]struct{}{}
-	for _, label := range labels {
+	for _, label := range wanted {
 		if _, ok := seen[label]; ok {
 			continue
 		}
 		seen[label] = struct{}{}
-		if _, err := g.runGh(ctx, cwd, "", "label", "create", label, "--repo", repo, "--color", resolveLabelColor(label), "--description", resolveLabelDescription(label), "--force"); err != nil {
+		definition := labelPresentation(label)
+		if _, err := g.runGh(ctx, cwd, "", "label", "create", label, "--repo", repo, "--color", definition.Color, "--description", definition.Description, "--force"); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (g *Gateway) listRepositoryLabels(ctx context.Context, repo string, cwd string) (map[string]LabelDefinition, error) {
+// labelPresentation resolves the color and description to create a label with.
+func labelPresentation(label string) labels.Definition {
+	normalized := labels.Normalize(label)
+	for _, definition := range labels.Standard() {
+		if labels.Normalize(definition.Name) == normalized {
+			return definition
+		}
+	}
+	return labels.Definition{Name: label, Color: "5319e7", Description: "Managed by looper"}
+}
+
+func (g *Gateway) listRepositoryLabels(ctx context.Context, repo string, cwd string) (map[string]labels.Definition, error) {
 	result, err := g.runGh(ctx, cwd, "", "label", "list", "--repo", repo, "--limit", "1000", "--json", "name,color,description")
 	if err != nil {
 		return nil, err
@@ -3396,13 +3407,13 @@ func (g *Gateway) listRepositoryLabels(ctx context.Context, repo string, cwd str
 	if err != nil {
 		return nil, err
 	}
-	out := make(map[string]LabelDefinition, len(rows))
+	out := make(map[string]labels.Definition, len(rows))
 	for _, row := range rows {
 		name := strings.TrimSpace(asString(row["name"]))
 		if name == "" {
 			continue
 		}
-		out[strings.ToLower(name)] = LabelDefinition{Name: name, Color: normalizeLabelColor(asString(row["color"])), Description: strings.TrimSpace(asString(row["description"]))}
+		out[strings.ToLower(name)] = labels.Definition{Name: name, Color: normalizeLabelColor(asString(row["color"])), Description: strings.TrimSpace(asString(row["description"]))}
 	}
 	return out, nil
 }
@@ -3732,59 +3743,6 @@ func extractIssueRepository(value any) IssueRepository {
 	}
 }
 
-func resolveLabelColor(label string) string {
-	switch strings.ToLower(strings.TrimSpace(label)) {
-	case labels.DefaultPlanTrigger:
-		return "5319e7"
-	case labels.SpecReviewing:
-		return "1d76db"
-	case labels.SpecReady:
-		return "0e8a16"
-	case labels.NeedsHuman:
-		return "d93f0b"
-	case labels.HoldGlobal, labels.HoldWorker, labels.HoldFixer, labels.HoldReviewer:
-		return "b60205"
-	default:
-		return "5319e7"
-	}
-}
-
-func resolveLabelDescription(label string) string {
-	switch strings.ToLower(strings.TrimSpace(label)) {
-	case labels.DefaultPlanTrigger:
-		return "Picked up automatically by planner"
-	case labels.SpecReviewing:
-		return "Spec PR is under review"
-	case labels.SpecReady:
-		return "Spec PR is ready for implementation"
-	case labels.NeedsHuman:
-		return "Looper requires manual intervention"
-	case labels.HoldGlobal:
-		return "Block all automatic Looper activity for this issue or PR"
-	case labels.HoldWorker:
-		return "Block automatic worker activity for this issue or PR"
-	case labels.HoldFixer:
-		return "Block automatic fixer activity for this issue or PR"
-	case labels.HoldReviewer:
-		return "Block automatic reviewer activity for this issue or PR"
-	default:
-		return "Managed by looper"
-	}
-}
-
-func StandardLooperLabels() []LabelDefinition {
-	return []LabelDefinition{
-		{Name: labels.DefaultPlanTrigger, Color: resolveLabelColor(labels.DefaultPlanTrigger), Description: resolveLabelDescription(labels.DefaultPlanTrigger)},
-		{Name: labels.SpecReviewing, Color: resolveLabelColor(labels.SpecReviewing), Description: resolveLabelDescription(labels.SpecReviewing)},
-		{Name: labels.SpecReady, Color: resolveLabelColor(labels.SpecReady), Description: resolveLabelDescription(labels.SpecReady)},
-		{Name: labels.NeedsHuman, Color: resolveLabelColor(labels.NeedsHuman), Description: resolveLabelDescription(labels.NeedsHuman)},
-		{Name: labels.HoldGlobal, Color: resolveLabelColor(labels.HoldGlobal), Description: resolveLabelDescription(labels.HoldGlobal)},
-		{Name: labels.HoldWorker, Color: resolveLabelColor(labels.HoldWorker), Description: resolveLabelDescription(labels.HoldWorker)},
-		{Name: labels.HoldFixer, Color: resolveLabelColor(labels.HoldFixer), Description: resolveLabelDescription(labels.HoldFixer)},
-		{Name: labels.HoldReviewer, Color: resolveLabelColor(labels.HoldReviewer), Description: resolveLabelDescription(labels.HoldReviewer)},
-	}
-}
-
 func normalizeLabelColor(value string) string {
 	return strings.TrimPrefix(strings.ToLower(strings.TrimSpace(value)), "#")
 }
@@ -3793,8 +3751,6 @@ func incrementLabelSummary(summary *LabelInitSummary, status string) {
 	switch status {
 	case "created":
 		summary.Created++
-	case "updated":
-		summary.Updated++
 	case "skipped":
 		summary.Skipped++
 	case "failed":
