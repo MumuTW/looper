@@ -116,7 +116,7 @@ looper status
 
 **First decide which of the two registration paths this project uses — they do not mix.**
 
-**Projects that need an explicit provider binding: do NOT run `looper project add`.** Define the project entirely in the config file under `[[projects]]`, alongside its provider, and restart the daemon. `looper project add` has no way to express a provider binding, and the record it creates is marked `source = "api"`. Adding the same project to the config afterwards does not convert it: on the next start `SyncConfigured` sees a configured project whose id already belongs to an API record, fails with `configured project <id> conflicts with an API-managed project`, and **`looperd` refuses to start**. Recovering means removing the API record before the daemon will come back up: `looper project remove <id>` (or `DELETE /api/v1/projects/<id>`). See [docs/configuration.md](../../docs/configuration.md).
+**Projects that need an explicit provider binding: do NOT run `looper project add`.** Define the project entirely in the config file under `[[projects]]`, alongside its provider, and restart the daemon. `looper project add` has no way to express a provider binding, and the record it creates is marked `source = "api"`. Adding the same project to the config afterwards does not convert it: on the next start `SyncConfigured` sees a configured project whose id already belongs to an API record, fails with `configured project <id> conflicts with an API-managed project`, and **`looperd` refuses to start**. Recovering means removing the API record before the daemon will come back up. See [docs/configuration.md](../../docs/configuration.md).
 
 **GitHub projects, with the daemon up:**
 
