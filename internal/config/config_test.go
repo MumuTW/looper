@@ -4110,14 +4110,15 @@ func TestRemovedPlaneProviderKindIsRejectedNotTreatedAsGitHub(t *testing.T) {
 	}
 }
 
-// TestLoadFileLegacyPlaneSchemaDecodesBeforeValidation guards the
-// compatibility shim for configs that still use the removed Plane schema.
-// The deprecated decode-only fields (providers[].workspace, providers[].projectId,
-// roles.*.triggers.planeAssigneeId, roles.coding.<name>.discovery.planeAssigneeId)
-// must be tolerated by DisallowUnknownFields so LoadFile reaches validation and
-// emits the explicit "plane is no longer supported" error instead of a
-// misleading unknown-field decode failure.
-func TestLoadFileLegacyPlaneSchemaDecodesBeforeValidation(t *testing.T) {
+// TestLoadFileLegacyPlaneSchemaRejectedBeforeStrictDecode guards the
+// pre-decode detection for configs that still use the removed Plane schema.
+// A config with kind = "plane" plus legacy fields (providers[].workspace,
+// providers[].projectId, roles.*.triggers.planeAssigneeId,
+// roles.coding.<name>.discovery.planeAssigneeId) must receive the explicit
+// "plane is no longer supported" validation error before DisallowUnknownFields
+// aborts on the removed fields, instead of a misleading unknown-field decode
+// failure that surfaces one field at a time.
+func TestLoadFileLegacyPlaneSchemaRejectedBeforeStrictDecode(t *testing.T) {
 	t.Parallel()
 
 	cwd := t.TempDir()
@@ -4161,4 +4162,47 @@ planeAssigneeId = "22222222-2222-2222-2222-222222222222"
 		t.Fatalf("LoadFile() error = %T (%v), want *ConfigValidationError from removed-plane-kind validation", err, err)
 	}
 	assertValidationIssue(t, validationErr, "providers[0].kind", `provider kind "plane" is no longer supported: Plane support was removed; looper reads work-items from GitHub issues only`)
+}
+
+// TestLoadFileRemovedPlaneFieldsRejectedForSupportedProviders verifies the
+// removed Plane decode fields are not silently accepted for supported
+// providers. A github provider with a stray workspace field must surface a
+// decode error (the field is gone from the schema), proving no compatibility
+// shim keeps obsolete fields alive.
+func TestLoadFileRemovedPlaneFieldsRejectedForSupportedProviders(t *testing.T) {
+	t.Parallel()
+
+	cwd := t.TempDir()
+	configPath := filepath.Join(cwd, "config.toml")
+	contents := `
+[[providers]]
+id = "gh"
+kind = "github"
+workspace = "acme"
+tokenEnv = "GH_TOKEN"
+
+[[projects]]
+id = "demo"
+name = "Demo"
+provider = "gh"
+repo = "acme/code"
+repoPath = "/tmp/demo"`
+	if err := os.WriteFile(configPath, []byte(contents), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+
+	_, err := LoadFile(LoadFileOptions{
+		CWD:        cwd,
+		ConfigPath: configPath,
+		LookupEnv:  emptyEnvLookup,
+		LookPath:   fakeLookPath(map[string]string{"git": "/detected/git", "gh": "/detected/gh", "osascript": "/detected/osascript"}),
+	})
+	if err == nil {
+		t.Fatal("LoadFile() error = nil, want unknown-field decode error for removed workspace field")
+	}
+	// The error must be a decode failure, not a validation error or nil.
+	var validationErr *ConfigValidationError
+	if errors.As(err, &validationErr) {
+		t.Fatalf("LoadFile() returned *ConfigValidationError (%v), want a decode error that rejects the removed field", err)
+	}
 }
