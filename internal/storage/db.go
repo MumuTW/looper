@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -79,6 +80,27 @@ func OpenSQLiteDB(ctx context.Context, dbPath string) (*sql.DB, error) {
 	return db, nil
 }
 
+// CompatibleSQLiteDB keeps the shared migration fence until its caller has
+// finished all compatibility-dependent authority reads.
+type CompatibleSQLiteDB struct {
+	DB   *sql.DB
+	lock *DatabaseLock
+}
+
+func (db *CompatibleSQLiteDB) Close() error {
+	if db == nil {
+		return nil
+	}
+	var closeErr error
+	if db.DB != nil {
+		closeErr = db.DB.Close()
+	}
+	if lockErr := db.lock.Release(); lockErr != nil {
+		return errors.Join(closeErr, lockErr)
+	}
+	return closeErr
+}
+
 // OpenSQLiteDBWithCompatibilityCheck opens the SQLite database at dbPath and
 // validates that its schema_migrations ledger contains no migration IDs
 // unknown to this binary's manifest. It is the shared database boundary for
@@ -95,16 +117,22 @@ func OpenSQLiteDB(ctx context.Context, dbPath string) (*sql.DB, error) {
 // caller never receives a connection to a database it cannot prove it
 // understands. The authority is the running binary's EmbeddedMigrations
 // manifest, not agent output or infra inference.
-func OpenSQLiteDBWithCompatibilityCheck(ctx context.Context, dbPath string) (*sql.DB, error) {
+func OpenSQLiteDBWithCompatibilityCheck(ctx context.Context, dbPath string) (*CompatibleSQLiteDB, error) {
+	lock, err := AcquireDatabaseLock(dbPath, DatabaseLockShared)
+	if err != nil {
+		return nil, err
+	}
 	db, err := OpenSQLiteDB(ctx, dbPath)
 	if err != nil {
+		_ = lock.Release()
 		return nil, err
 	}
 	if err := NewMigrationRunner(db, MigrationRunnerOptions{}).ValidateCompatibility(ctx); err != nil {
 		_ = db.Close()
+		_ = lock.Release()
 		return nil, err
 	}
-	return db, nil
+	return &CompatibleSQLiteDB{DB: db, lock: lock}, nil
 }
 
 func (c *SQLiteCoordinator) DB() *sql.DB {

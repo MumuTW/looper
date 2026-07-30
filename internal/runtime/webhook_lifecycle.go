@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"runtime"
 	"sort"
 	"strconv"
@@ -87,69 +86,6 @@ func newDaemonID() string {
 		return fmt.Sprintf("pid-%d-%d", os.Getpid(), time.Now().UnixNano())
 	}
 	return hex.EncodeToString(buf[:])
-}
-
-// runtimeDatabaseLockPath returns the single-daemon lock path for the SQLite
-// database. The runtime holds this advisory lock from before compatibility
-// validation until the coordinator is closed, so one binary cannot validate an
-// older schema while another binary migrates the same database underneath it.
-func runtimeDatabaseLockPath(cfgStorageDBPath string) string {
-	dbPath := strings.TrimSpace(cfgStorageDBPath)
-	if dbPath != "" {
-		if absPath, err := filepath.Abs(dbPath); err == nil {
-			dbPath = absPath
-		}
-	}
-	dir := filepath.Dir(dbPath)
-	if dir == "." || dir == "" {
-		if home, err := os.UserHomeDir(); err == nil {
-			dir = filepath.Join(home, ".looper")
-		}
-	}
-	return filepath.Join(dir, "looperd.lock")
-}
-
-type daemonLock struct {
-	path string
-	file *os.File
-}
-
-func acquireDaemonLock(path, daemonID string, now time.Time) (*daemonLock, error) {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return nil, err
-	}
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
-	if err != nil {
-		return nil, err
-	}
-	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		holder, _ := os.ReadFile(path)
-		_ = file.Close()
-		return nil, fmt.Errorf("another looperd already holds %s (%s): %w", path, strings.TrimSpace(string(holder)), err)
-	}
-	if err := file.Truncate(0); err != nil {
-		_ = file.Close()
-		return nil, err
-	}
-	if _, err := file.Seek(0, 0); err != nil {
-		_ = file.Close()
-		return nil, err
-	}
-	if _, err := fmt.Fprintf(file, "pid=%d daemon_id=%s started=%s\n", os.Getpid(), daemonID, now.UTC().Format(time.RFC3339)); err != nil {
-		_ = file.Close()
-		return nil, err
-	}
-	return &daemonLock{path: path, file: file}, nil
-}
-
-func (l *daemonLock) Release() error {
-	if l == nil || l.file == nil {
-		return nil
-	}
-	_ = syscall.Flock(int(l.file.Fd()), syscall.LOCK_UN)
-	err := l.file.Close()
-	l.file = nil
-	return err
 }
 
 type processProbe interface {

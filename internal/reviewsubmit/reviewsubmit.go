@@ -507,7 +507,7 @@ func validateReviewerReviewSubmitHold(ctx context.Context, cfg config.Config, re
 			return fmt.Errorf("validate held manual reviewer run: %w", err)
 		}
 		defer func() { _ = db.Close() }()
-		trusted, err := trustedManualReviewerRun(ctx, storage.NewRepositories(db), repo, prNumber, runID)
+		trusted, err := trustedManualReviewerRun(ctx, storage.NewRepositories(db.DB), repo, prNumber, runID)
 		if err != nil {
 			return err
 		}

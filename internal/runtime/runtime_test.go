@@ -118,7 +118,7 @@ func TestRuntimeStartExclusivelyOwnsDatabaseForItsLifetime(t *testing.T) {
 	defer first.Stop("test cleanup")
 
 	second := New(Options{Config: cfg, Logger: &testLogger{}})
-	if err := second.Start(context.Background()); err == nil || !strings.Contains(err.Error(), "another looperd already holds") {
+	if err := second.Start(context.Background()); err == nil || !strings.Contains(err.Error(), "database compatibility lock is held") {
 		t.Fatalf("second Start() error = %v, want exclusive database ownership failure", err)
 	}
 
@@ -384,9 +384,9 @@ func TestRuntimeStartStopBeforeResourcePublicationCleansLocalResources(t *testin
 		t.Fatal("coordinator remained open after Stop raced pre-publication Start")
 	}
 
-	lock, err := acquireDaemonLock(runtimeDatabaseLockPath(cfg.Storage.DBPath), "replacement", time.Now())
+	lock, err := storage.AcquireDatabaseLock(cfg.Storage.DBPath, storage.DatabaseLockExclusive)
 	if err != nil {
-		t.Fatalf("daemon lock remained held after Stop raced pre-publication Start: %v", err)
+		t.Fatalf("database lock remained held after Stop raced pre-publication Start: %v", err)
 	}
 	if err := lock.Release(); err != nil {
 		t.Fatalf("replacement daemon lock Release() error = %v", err)

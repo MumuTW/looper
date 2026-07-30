@@ -205,7 +205,7 @@ type Runtime struct {
 	projectCatalog              *projects.Catalog
 	githubGateway               *githubinfra.Gateway
 	webhook                     *webhookRuntime
-	databaseDaemonLock          *daemonLock
+	databaseDaemonLock          *storage.DatabaseLock
 	webhookForwarder            WebhookForwarder
 	notificationGateways        *schedulerNotificationGatewayFactory
 	networkManager              runtimeNetworkManager
@@ -847,17 +847,19 @@ func (r *Runtime) start(ctx context.Context) error {
 		backupDir = *r.config.Storage.BackupDir
 	}
 
-	lockPath := runtimeDatabaseLockPath(r.config.Storage.DBPath)
-	lock, err := acquireDaemonLock(lockPath, r.webhook.daemonID, r.now())
+	lockMode := storage.DatabaseLockShared
+	if r.config.Package.AutoMigrateOnStartup {
+		lockMode = storage.DatabaseLockExclusive
+	}
+	lock, err := storage.AcquireDatabaseLock(r.config.Storage.DBPath, lockMode)
 	if err != nil {
 		if r.logger != nil {
-			holder, _ := os.ReadFile(lockPath)
-			r.logger.Warn("runtime.database.lock_failed", map[string]any{"path": lockPath, "existing_holder": strings.TrimSpace(string(holder)), "error": err.Error()})
+			r.logger.Warn("runtime.database.lock_failed", map[string]any{"error": err.Error()})
 		}
 		return err
 	}
 	if r.logger != nil {
-		r.logger.Info("runtime.database.lock_acquired", map[string]any{"path": lockPath})
+		r.logger.Info("runtime.database.lock_acquired", map[string]any{"mode": lockMode})
 	}
 
 	coordinator, err := r.openSQLiteCoordinator(ctx, r.config.Storage.DBPath, storage.SQLiteCoordinatorOptions{
@@ -897,6 +899,13 @@ func (r *Runtime) start(ctx context.Context) error {
 		})
 		if err != nil {
 			return err
+		}
+		if err := lock.Release(); err != nil {
+			return fmt.Errorf("release exclusive database migration lock: %w", err)
+		}
+		lock, err = storage.AcquireDatabaseLock(r.config.Storage.DBPath, storage.DatabaseLockShared)
+		if err != nil {
+			return fmt.Errorf("acquire shared database runtime lock: %w", err)
 		}
 	}
 

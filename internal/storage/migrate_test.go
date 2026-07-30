@@ -1291,7 +1291,7 @@ func TestOpenSQLiteDBWithCompatibilityCheckAcceptsFreshDatabase(t *testing.T) {
 	t.Cleanup(func() { _ = db.Close() })
 
 	var name string
-	err = db.QueryRow(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations' LIMIT 1`).Scan(&name)
+	err = db.DB.QueryRow(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations' LIMIT 1`).Scan(&name)
 	if err != sql.ErrNoRows {
 		t.Fatalf("schema_migrations lookup error = %v, want sql.ErrNoRows (validation must not create the ledger)", err)
 	}
