@@ -259,7 +259,7 @@
             "assignTo": ""
           }
         },
-        "gatekeeper": {},
+
         "deployer": {
           "enabled": false
         },

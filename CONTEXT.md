@@ -53,27 +53,6 @@ best-effort: Intake prefers a duplicate Issue, which is visible and carries the
 same stamp as its twin, over a silently dropped request.
 _Avoid_: cursor, offset, dedupe key.
 
-**Gatekeeper trust level**:
-The per-project merge authority Merge Gatekeeper holds, defined at
-`config.GatekeeperTrustLevel` in `internal/config`. `observe` writes a Gate
-report and nothing else; `advise` additionally publishes the verdict and its
-reasons on the pull request so a human can act without redoing the judgement;
-`auto` publishes the required `Looper Gatekeeper` commit status for the current
-pull request head and never merges itself — GitHub branch protection (or
-Mergify queue injection of that protection) remains the merge authority. A level
-is reached only by explicit operator promotion.
-_Avoid_: mode, autonomy, permission.
-
-**Owned verdict comment**:
-The single comment Merge Gatekeeper maintains on a pull request at the `advise`
-trust level, defined at `gatekeeper.BuildVerdictComment` in
-`internal/gatekeeper`. Its identity is the marker plus Looper's own authorship.
-It has a full lifecycle — created, updated in place, retired on demotion to
-`observe`, and reconciled to the oldest copy when concurrent evaluators produce
-duplicates. Whether it needs touching at all is decided from the previous Gate
-report, so an unchanged verdict costs no forge reads.
-_Avoid_: status comment, bot comment.
-
 **Worker**:
 Defined at `worker.Runner` in `internal/worker`, whose doc comment carries the
 semantics: a reactive Role implementing a Spec or an Issue into a Pull Request.
