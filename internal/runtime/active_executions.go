@@ -65,6 +65,13 @@ type ActiveExecutionRegistry struct {
 	// could still decrement a later RestoreLoopStop sticky ref and reopen
 	// AdmitSpawn for pre-stop runners.
 	stopEpoch map[string]uint64
+	// stopReleases counts outstanding BeginLoopStop release closures per loop,
+	// including invalidated ones that have not run yet. A stopEpoch entry may
+	// only be reclaimed once no closure that could still compare against it
+	// exists (stopReleases zero) and no stop gate is active; deleting earlier
+	// would reset the epoch to zero and revive a stale closure that captured
+	// epoch zero before a ClearLoopStop/RestoreLoopStop cycle.
+	stopReleases map[string]int
 	// stopDrained records execution keys confirmed-drained by BeginLoopStop
 	// (or Kill) while a loop stop gate is active. haltLoop looks up Kill by
 	// durable id after BeginLoopStop; concurrent releaseLease can delete the
@@ -117,6 +124,7 @@ func NewActiveExecutionRegistry() *ActiveExecutionRegistry {
 		active:           make(map[uint64]*spawnLease),
 		stoppingLoops:    make(map[string]int),
 		stopEpoch:        make(map[string]uint64),
+		stopReleases:     make(map[string]int),
 		stopDrained:      make(map[string]struct{}),
 		pendingOps:       make(map[uint64]*operationLease),
 		boundOps:         make(map[uint64]*operationLease),
@@ -709,8 +717,10 @@ func (r *ActiveExecutionRegistry) BeginLoopStop(loopID, reason string) (release 
 	r.mu.Lock()
 	r.stoppingLoops[loopID]++
 	// Capture epoch so a later ClearLoopStop can invalidate this release without
-	// needing to track each closure. Epoch is never reset; only bumped on clear.
+	// needing to track each closure. Epoch is only bumped on clear; the entry is
+	// reclaimed once no closure remains that could compare against it.
 	epoch := r.stopEpoch[loopID]
+	r.stopReleases[loopID]++
 	targets := r.collectLoopStopTargetsLocked(loopID)
 	r.mu.Unlock()
 	drainErr := r.cancelAndDrainLoop(loopID, reason, targets)
@@ -718,9 +728,11 @@ func (r *ActiveExecutionRegistry) BeginLoopStop(loopID, reason string) (release 
 	return func() {
 		once.Do(func() {
 			r.mu.Lock()
+			defer r.mu.Unlock()
+			r.decStopReleasesLocked(loopID)
 			// ClearLoopStop bumped the epoch: this release no longer owns a ref.
 			if r.stopEpoch[loopID] != epoch {
-				r.mu.Unlock()
+				r.maybeReclaimStopStateLocked(loopID)
 				return
 			}
 			if r.stoppingLoops[loopID] <= 1 {
@@ -729,9 +741,32 @@ func (r *ActiveExecutionRegistry) BeginLoopStop(loopID, reason string) (release 
 			} else {
 				r.stoppingLoops[loopID]--
 			}
-			r.mu.Unlock()
+			r.maybeReclaimStopStateLocked(loopID)
 		})
 	}, drainErr
+}
+
+func (r *ActiveExecutionRegistry) decStopReleasesLocked(loopID string) {
+	if r.stopReleases[loopID] <= 1 {
+		delete(r.stopReleases, loopID)
+	} else {
+		r.stopReleases[loopID]--
+	}
+}
+
+// maybeReclaimStopStateLocked drops the loop's stop-epoch entry once nothing
+// can observe it: no active stop gate and no outstanding release closure. At
+// that point every un-run closure has a stale epoch by construction, and a
+// fresh BeginLoopStop starting again from epoch zero is indistinguishable from
+// a loop never stopped.
+func (r *ActiveExecutionRegistry) maybeReclaimStopStateLocked(loopID string) {
+	if _, active := r.stoppingLoops[loopID]; active {
+		return
+	}
+	if _, outstanding := r.stopReleases[loopID]; outstanding {
+		return
+	}
+	delete(r.stopEpoch, loopID)
 }
 
 // ClearLoopStop reopens spawn admission for a loop after intentional re-activation
@@ -759,6 +794,7 @@ func (r *ActiveExecutionRegistry) ClearLoopStop(loopID string) (wasActive bool) 
 	// the race to this delete cannot leave a live release that still matches.
 	r.stopEpoch[loopID]++
 	r.clearStopDrainedForLoopLocked(loopID)
+	r.maybeReclaimStopStateLocked(loopID)
 	r.mu.Unlock()
 	return wasActive
 }
