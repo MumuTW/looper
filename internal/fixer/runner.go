@@ -26,6 +26,7 @@ import (
 	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/eventlog"
 	"github.com/nexu-io/looper/internal/fixer/failurepolicy"
+	"github.com/nexu-io/looper/internal/fixer/workflow"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/specpr"
 	"github.com/nexu-io/looper/internal/labels"
@@ -38,33 +39,22 @@ import (
 	"github.com/nexu-io/looper/internal/worktreesafety"
 )
 
+// FixerStep aliases the extracted workflow authority's step type; the
+// pipeline order and resume decisions live in internal/fixer/workflow.
+type FixerStep = workflow.Step
+
 const (
-	stepDiscoverPR       FixerStep = "discover-pr"
-	stepClaimPR          FixerStep = "claim-pr"
-	stepCollectFixes     FixerStep = "collect-fixes"
-	stepPrepareWorktree  FixerStep = "prepare-worktree"
-	stepRepair           FixerStep = "repair"
-	stepReconcileCommits FixerStep = "reconcile-commits"
-	stepValidate         FixerStep = "validate"
-	stepPush             FixerStep = "push"
-	stepResolveComments  FixerStep = "resolve-comments"
-	stepRecheck          FixerStep = "recheck"
+	stepDiscoverPR       = workflow.StepDiscoverPR
+	stepClaimPR          = workflow.StepClaimPR
+	stepCollectFixes     = workflow.StepCollectFixes
+	stepPrepareWorktree  = workflow.StepPrepareWorktree
+	stepRepair           = workflow.StepRepair
+	stepReconcileCommits = workflow.StepReconcileCommits
+	stepValidate         = workflow.StepValidate
+	stepPush             = workflow.StepPush
+	stepResolveComments  = workflow.StepResolveComments
+	stepRecheck          = workflow.StepRecheck
 )
-
-var fixerStepSequence = []FixerStep{
-	stepDiscoverPR,
-	stepClaimPR,
-	stepCollectFixes,
-	stepPrepareWorktree,
-	stepRepair,
-	stepReconcileCommits,
-	stepValidate,
-	stepPush,
-	stepResolveComments,
-	stepRecheck,
-}
-
-type FixerStep string
 
 type QueueFailureKind string
 
@@ -1210,9 +1200,9 @@ func DeriveRunOutcome(run storage.RunRecord) *FixerRunOutcome {
 // that carry no recorded one. The step comes from the run's own position rather than
 // a guess, and the message from stored text -- nothing is synthesized.
 func backfilledPrimaryFailure(run storage.RunRecord, checkpoint fixerCheckpoint) *FixerOutcomeFailure {
-	step := asFixerStep(derefString(run.CurrentStep))
+	step := workflow.Parse(derefString(run.CurrentStep))
 	if step == "" {
-		step = asFixerStep(derefString(run.LastCompletedStep))
+		step = workflow.Parse(derefString(run.LastCompletedStep))
 	}
 	failure := FixerOutcomeFailure{
 		Step:    string(step),
@@ -1233,7 +1223,7 @@ func looksLikeFixerCheckpoint(run storage.RunRecord, checkpoint fixerCheckpoint)
 		return true
 	}
 	for _, step := range []string{derefString(run.CurrentStep), derefString(run.LastCompletedStep)} {
-		switch asFixerStep(step) {
+		switch workflow.Parse(step) {
 		case stepDiscoverPR, stepClaimPR, stepCollectFixes, stepRepair, stepResolveComments, stepRecheck:
 			return true
 		}
@@ -2277,7 +2267,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		latest := r.getLatestCheckpoint(context.Background(), run, checkpoint)
 		// The reloaded checkpoint can be older than what this run achieved in memory.
 		latest.mergeProgressFrom(checkpoint)
-		latest.recordFailure(asFixerStep(derefString(persisted.CurrentStep)), failure)
+		latest.recordFailure(workflow.Parse(derefString(persisted.CurrentStep)), failure)
 		latest.refreshOutcomeProgress()
 		latest.ResumePolicy = loops.NormalizeResumePolicy(string(failure.kind), latest.ResumePolicy)
 		completed, err := r.completeRun(context.Background(), *persisted, "failed", failure.message, failure.message, latest)
@@ -2286,7 +2276,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			return
 		}
 		run = completed
-		failedStep := asFixerStep(derefString(completed.CurrentStep))
+		failedStep := workflow.Parse(derefString(completed.CurrentStep))
 		if failedStep == "" {
 			failedStep = resumedRun.StartStep
 		}
@@ -2460,7 +2450,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	r.appendEvent(ctx, eventInput{eventType: "run.started", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"queueItemId": queueItem.ID, "currentStep": string(resumedRun.StartStep)}})
 	r.logInfo("fixer loop started", map[string]any{"projectId": project.ID, "loopId": loop.ID, "runId": run.ID, "queueItemId": queueItem.ID, "currentStep": string(resumedRun.StartStep), "resumed": resumedRun.Resumed})
 	r.logInfo("fixer run started", map[string]any{"projectId": project.ID, "loopId": loop.ID, "runId": run.ID, "queueItemId": queueItem.ID, "currentStep": string(resumedRun.StartStep)})
-	for _, step := range stepsFrom(resumedRun.StartStep) {
+	for _, step := range workflow.From(resumedRun.StartStep) {
 		run, err = r.persistStepStarted(ctx, run, step, checkpoint)
 		if err != nil {
 			return ProcessResult{}, err
@@ -4849,51 +4839,37 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 	}
 	if latestRun != nil {
 		checkpoint = parseCheckpoint(latestRun.CheckpointJSON)
-		lastCompleted = asFixerStep(derefString(latestRun.LastCompletedStep))
-		failedStep = asFixerStep(derefString(latestRun.CurrentStep))
+		lastCompleted = workflow.Parse(derefString(latestRun.LastCompletedStep))
+		failedStep = workflow.Parse(derefString(latestRun.CurrentStep))
 	}
 	restartFromDiscover := false
 	resumeFromPrepare := false
+	status := ""
 	if latestRun != nil {
+		status = latestRun.Status
 		failureSummary := firstNonEmpty(derefString(latestRun.Summary), derefString(latestRun.ErrorMessage))
 		pause, _ := classifyFixerPause(latestRun, checkpoint, loop.MetadataJSON)
 		restartFromDiscover = shouldRestartFromDiscover(latestRun.Status, failedStep, pause, failureSummary) || loops.ShouldRestartFromDiscover(latestRun.Status, checkpoint.ResumePolicy)
 		resumeFromPrepare = shouldResumeFromPrepare(latestRun.Status, failedStep, checkpoint)
 	}
-	startStep := stepDiscoverPR
-	resumedCheckpoint := checkpoint
-	if latestRun != nil && (latestRun.Status == "failed" || latestRun.Status == "interrupted") {
-		switch {
-		case restartFromDiscover:
-			startStep = stepDiscoverPR
-			// prepare-worktree failures restart discover, but an unprepared path
-			// may still hold interrupted-repair dirt and on-disk ownership. Carry
-			// Path/Branch/OwnerToken so the next prepare can same-head adopt
-			// instead of CreateWorktree-clearing the marker and falling to MI.
-			resumedCheckpoint = fixerCheckpoint{
-				ResumePolicy: "replay_step",
-				Worktree:     preservedWorktreeOwnershipForRediscovery(checkpoint, failedStep),
-			}
-		case resumeFromPrepare:
-			startStep = stepPrepareWorktree
-			resumedCheckpoint = rewindCheckpointForPrepareRetry(checkpoint)
-		case lastCompleted != "":
-			if next := nextFixerStep(lastCompleted); next != "" {
-				startStep = next
-			}
-		}
-	}
-	resumed := latestRun != nil && (latestRun.Status == "failed" || latestRun.Status == "interrupted") && startStep != stepDiscoverPR
-	// stickySnapshot: any continuation of a failed/interrupted predecessor, including first-step retries.
-	stickySnapshot := latestRun != nil && (latestRun.Status == "failed" || latestRun.Status == "interrupted")
+	decision := workflow.DecideResume(status, lastCompleted, restartFromDiscover, resumeFromPrepare)
+	startStep := decision.StartStep
+	resumed := decision.Resumed
+	stickySnapshot := decision.StickyAgentSnapshot
 	initialCheckpoint := fixerCheckpoint{ResumePolicy: "replay_step"}
-	if resumed {
-		initialCheckpoint = resumedCheckpoint
+	switch decision.Mode {
+	case workflow.ResumeModeRestartDiscover:
+		// Discover restart is not a mid-pipeline "resume", but an unprepared
+		// path may still hold interrupted-repair dirt and on-disk ownership.
+		// Carry Path/Branch/OwnerToken so the next prepare can same-head adopt
+		// instead of CreateWorktree-clearing the marker and falling to MI.
+		initialCheckpoint.Worktree = preservedWorktreeOwnershipForRediscovery(checkpoint, failedStep)
+	case workflow.ResumeModeResumePrepare:
+		initialCheckpoint = rewindCheckpointForPrepareRetry(checkpoint)
 		initialCheckpoint.ResumePolicy = "advance_from_checkpoint"
-	} else if restartFromDiscover && resumedCheckpoint.Worktree != nil {
-		// Discover restart is not a mid-pipeline "resume", but prepare-probe
-		// failures still need Path+OwnerToken on the next run's checkpoint.
-		initialCheckpoint.Worktree = resumedCheckpoint.Worktree
+	case workflow.ResumeModeAdvance:
+		initialCheckpoint = checkpoint
+		initialCheckpoint.ResumePolicy = "advance_from_checkpoint"
 	}
 	initialCheckpoint.Pause = nil
 	initialCheckpoint.RunStartedAt = ""
@@ -4910,17 +4886,8 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 	run.AgentSnapshotJSON = snapshotJSON
 	initialCheckpoint.RunPreStartAt = nowISO
 	initialCheckpoint.RunPreStartRunID = run.ID
-	if resumed {
-		switch {
-		case restartFromDiscover:
-			run.LastCompletedStep = nil
-		case resumeFromPrepare:
-			if prev := previousFixerStep(startStep); prev != "" {
-				run.LastCompletedStep = stringPtr(string(prev))
-			}
-		case lastCompleted != "":
-			run.LastCompletedStep = stringPtr(string(lastCompleted))
-		}
+	if decision.LastCompletedStep != "" {
+		run.LastCompletedStep = stringPtr(string(decision.LastCompletedStep))
 	}
 	encoded := mustMarshalJSON(initialCheckpoint)
 	run.CheckpointJSON = &encoded
@@ -5082,7 +5049,7 @@ func (r *Runner) persistStepCompleted(ctx context.Context, run storage.RunRecord
 		endedAt := nowISO
 		updated.EndedAt = &endedAt
 	}
-	if next := nextFixerStep(step); next != "" {
+	if next := workflow.Next(step); next != "" {
 		updated.CurrentStep = stringPtr(string(next))
 	} else {
 		updated.CurrentStep = nil
@@ -5389,7 +5356,7 @@ func fixerRunParkedOnInvalidCompletion(run storage.RunRecord, checkpoint fixerCh
 		// A wholly absent record only proves a missing contract when the run parked
 		// at a step that requires the structured result; before repair, a nil record
 		// is simply work that had not started.
-		return validateFixerResumeCheckpoint(asFixerStep(derefString(run.CurrentStep)), checkpoint) != nil
+		return validateFixerResumeCheckpoint(workflow.Parse(derefString(run.CurrentStep)), checkpoint) != nil
 	}
 	return validateCompletedRepairCheckpoint(checkpoint.Repair, checkpoint.Worktree) != nil
 }
@@ -7033,35 +7000,6 @@ func (r *Runner) logError(message string, context map[string]any) {
 	}
 }
 
-func stepsFrom(start FixerStep) []FixerStep {
-	startIndex := 0
-	for i, step := range fixerStepSequence {
-		if step == start {
-			startIndex = i
-			break
-		}
-	}
-	return fixerStepSequence[startIndex:]
-}
-
-func nextFixerStep(step FixerStep) FixerStep {
-	for i, candidate := range fixerStepSequence {
-		if candidate == step && i+1 < len(fixerStepSequence) {
-			return fixerStepSequence[i+1]
-		}
-	}
-	return ""
-}
-
-func previousFixerStep(step FixerStep) FixerStep {
-	for i, candidate := range fixerStepSequence {
-		if candidate == step && i > 0 {
-			return fixerStepSequence[i-1]
-		}
-	}
-	return ""
-}
-
 func validateFixerResumeCheckpoint(startStep FixerStep, checkpoint fixerCheckpoint) error {
 	switch startStep {
 	case stepReconcileCommits, stepValidate, stepPush, stepResolveComments, stepRecheck:
@@ -7090,15 +7028,6 @@ func validateFixerResumeCheckpoint(startStep FixerStep, checkpoint fixerCheckpoi
 	default:
 		return nil
 	}
-}
-
-func asFixerStep(value string) FixerStep {
-	for _, candidate := range fixerStepSequence {
-		if string(candidate) == value {
-			return candidate
-		}
-	}
-	return ""
 }
 
 func parseCheckpoint(value *string) fixerCheckpoint {
@@ -8865,7 +8794,7 @@ func classifyFixerPause(run *storage.RunRecord, checkpoint fixerCheckpoint, loop
 	if run.Status != "failed" {
 		return nil, false
 	}
-	failedStep := asFixerStep(derefString(run.CurrentStep))
+	failedStep := workflow.Parse(derefString(run.CurrentStep))
 	summary := firstNonEmpty(derefString(run.Summary), derefString(run.ErrorMessage))
 	switch failedStep {
 	case stepRepair:
