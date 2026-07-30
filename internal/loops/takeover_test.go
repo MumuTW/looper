@@ -1,6 +1,46 @@
 package loops
 
-import "testing"
+import (
+	"context"
+	"database/sql"
+	"testing"
+
+	"github.com/MumuTW/looper/internal/domain"
+	"github.com/MumuTW/looper/internal/storage"
+)
+
+func TestPrepareHandbackCapturesSessionAndCancelsQueueTogether(t *testing.T) {
+	ctx, db, repos, loop, nowISO := reactivationFixture(t)
+	loop.Status = string(domain.LoopStatusHumanTakeover)
+	if err := repos.Loops.UpsertChangingHumanHold(ctx, loop); err != nil {
+		t.Fatalf("Loops.UpsertChangingHumanHold() error = %v", err)
+	}
+	projectID, loopID := loop.ProjectID, loop.ID
+	if err := repos.Queue.Upsert(ctx, storage.QueueItemRecord{ID: "queue_handback", ProjectID: &projectID, LoopID: &loopID, Type: "reviewer", TargetType: "pull_request", TargetID: "pr:acme/looper:42", DedupeKey: "reviewer:handback", Priority: storage.QueuePriorityReviewer, Status: "queued", AvailableAt: nowISO, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	sessionID := "human-session-42"
+	if err := repos.AgentExecutions.Upsert(ctx, storage.AgentExecutionRecord{ID: "execution_handback", LoopID: &loopID, Vendor: "codex", Status: "completed", NativeSessionID: &sessionID, StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
+	}
+	result, err := storage.WithTransactionValue(ctx, db, nil, func(tx *sql.Tx) (HandbackPreparationResult, error) {
+		return PrepareHandback(ctx, storage.NewRepositories(tx), HandbackPreparationInput{LoopID: loop.ID, NowISO: nowISO})
+	})
+	if err != nil {
+		t.Fatalf("PrepareHandback() error = %v", err)
+	}
+	if result.CancelledQueueItems != 1 || result.Loop.MetadataJSON == nil {
+		t.Fatalf("PrepareHandback() = %#v, want one cancelled queue and persisted metadata", result)
+	}
+	resume, ok := ReadTakeoverResume(result.Loop.MetadataJSON)
+	if !ok || resume.SessionID != sessionID {
+		t.Fatalf("ReadTakeoverResume() = %#v, %v; want session %q", resume, ok, sessionID)
+	}
+	queue, err := repos.Queue.GetByID(context.Background(), "queue_handback")
+	if err != nil || queue == nil || queue.Status != "cancelled" {
+		t.Fatalf("Queue.GetByID() = %#v, %v; want cancelled", queue, err)
+	}
+}
 
 func TestTakeoverResumeRoundTrip(t *testing.T) {
 	if _, ok := ReadTakeoverResume(nil); ok {

@@ -1,6 +1,13 @@
 package loops
 
-import "encoding/json"
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
+
+	"github.com/MumuTW/looper/internal/storage"
+)
 
 const takeoverResumeMetadataKey = "takeoverResume"
 
@@ -11,6 +18,57 @@ const takeoverResumeMetadataKey = "takeoverResume"
 type TakeoverResume struct {
 	SessionID string `json:"sessionId,omitempty"`
 	Prompt    string `json:"prompt,omitempty"`
+}
+
+type HandbackPreparationInput struct {
+	LoopID string
+	NowISO string
+}
+
+type HandbackPreparationResult struct {
+	Loop                storage.LoopRecord
+	CancelledQueueItems int64
+}
+
+// PrepareHandback captures the human-driven native session and cancels queue
+// work that survived the takeover race. It is transaction-local so a caller can
+// re-arm the loop only after both durable changes commit.
+func PrepareHandback(ctx context.Context, repos *storage.Repositories, input HandbackPreparationInput) (HandbackPreparationResult, error) {
+	if repos == nil || repos.Loops == nil || repos.Queue == nil || repos.AgentExecutions == nil {
+		return HandbackPreparationResult{}, fmt.Errorf("handback preparation is not configured")
+	}
+	if strings.TrimSpace(input.LoopID) == "" || strings.TrimSpace(input.NowISO) == "" {
+		return HandbackPreparationResult{}, fmt.Errorf("handback preparation requires loop id and time")
+	}
+	loop, err := repos.Loops.GetByID(ctx, input.LoopID)
+	if err != nil {
+		return HandbackPreparationResult{}, err
+	}
+	if loop == nil {
+		return HandbackPreparationResult{}, fmt.Errorf("%w: %s", ErrLoopNotFound, input.LoopID)
+	}
+	updated := *loop
+	execution, err := repos.AgentExecutions.GetLatestByLoopID(ctx, input.LoopID)
+	if err != nil {
+		return HandbackPreparationResult{}, err
+	}
+	if execution != nil && execution.NativeSessionID != nil && strings.TrimSpace(*execution.NativeSessionID) != "" {
+		metadata, err := WriteTakeoverResume(updated.MetadataJSON, TakeoverResume{SessionID: strings.TrimSpace(*execution.NativeSessionID)})
+		if err != nil {
+			return HandbackPreparationResult{}, fmt.Errorf("persist takeover resume marker: %w", err)
+		}
+		updated.MetadataJSON = &metadata
+		updated.UpdatedAt = input.NowISO
+		if err := repos.Loops.UpsertChangingHumanHold(ctx, updated); err != nil {
+			return HandbackPreparationResult{}, err
+		}
+	}
+	reason := "Cleared for takeover handback"
+	cancelled, err := repos.Queue.CancelByLoop(ctx, input.LoopID, input.NowISO, &reason)
+	if err != nil {
+		return HandbackPreparationResult{}, err
+	}
+	return HandbackPreparationResult{Loop: updated, CancelledQueueItems: cancelled}, nil
 }
 
 // ReadTakeoverResume returns the pending takeover-resume marker, if any.
