@@ -90,3 +90,38 @@ describe("LoopDetail first-failure row", () => {
     expect(row?.textContent).toContain("—");
   });
 });
+
+describe("LoopDetail durable progress row", () => {
+  it("labels a failed run that still shipped something as partial", async () => {
+    renderLoopDetail(
+      loopFixture({
+        outcome: {
+          primaryFailure: { step: "resolve_comments", message: "resolve failed" },
+          progress: { pushed: true, repliesSent: 2 },
+          partialSuccess: true,
+        },
+      }),
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText("Kept (partial)")).toBeTruthy();
+    });
+    expect(screen.getByText("pushed · 2 replies")).toBeTruthy();
+  });
+
+  it("shows a dash and no partial label when the run achieved nothing", async () => {
+    renderLoopDetail(
+      loopFixture({
+        outcome: {
+          primaryFailure: { step: "repair", message: "agent timed out" },
+          progress: {},
+        },
+      }),
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText("Kept")).toBeTruthy();
+    });
+    expect(screen.queryByText("Kept (partial)")).toBeNull();
+  });
+});

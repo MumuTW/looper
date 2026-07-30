@@ -228,9 +228,20 @@ export type FixerOutcomeFailure = {
  * is the first, causal failure, which can differ from the loop's `lastFailureReason`
  * when a later problem piled on top of it.
  */
+/** Effects that outlived the run, attributed to the run that produced them. */
+export type FixerDurableProgress = {
+  commitProduced?: boolean | null;
+  pushed?: boolean | null;
+  repliesSent?: number | null;
+  threadsResolved?: number | null;
+};
+
 export type FixerRunOutcome = {
   primaryFailure?: FixerOutcomeFailure | null;
   secondaryIssues?: FixerOutcomeFailure[] | null;
+  progress?: FixerDurableProgress | null;
+  /** A failed run that still left durable effects behind. */
+  partialSuccess?: boolean | null;
 };
 
 export type Loop = {

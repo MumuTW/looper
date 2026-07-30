@@ -12,7 +12,10 @@ import { PanelError } from "@/components/PanelError";
 import { StatusChip } from "@/components/StatusChip";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
-import { formatPrimaryFailure } from "@/lib/fixerOutcome";
+import {
+  formatDurableProgress,
+  formatPrimaryFailure,
+} from "@/lib/fixerOutcome";
 import {
   fetchLoop,
   openLoopLogsStream,
@@ -412,6 +415,10 @@ export function LoopDetailPage() {
     () => formatPrimaryFailure(data?.outcome),
     [data?.outcome],
   );
+  const durableProgress = useMemo(
+    () => formatDurableProgress(data?.outcome),
+    [data?.outcome],
+  );
 
   const hasActiveRun = useMemo(() => {
     if (!data) return false;
@@ -531,6 +538,17 @@ export function LoopDetailPage() {
                     "—"
                   )
                 }
+              />
+              {/*
+                What survived the run. Paired with "First failure" this is the
+                difference between "nothing shipped, retry freely" and "some of
+                this already landed".
+              */}
+              <Kv
+                label={
+                  data.outcome?.partialSuccess ? "Kept (partial)" : "Kept"
+                }
+                value={durableProgress ?? "—"}
               />
               <Kv label="Last run" value={formatTs(data.lastRunAt)} />
               <Kv label="Next run" value={formatTs(data.nextRunAt)} />

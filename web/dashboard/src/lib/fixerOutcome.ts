@@ -24,3 +24,30 @@ export function formatPrimaryFailure(
   if (later < 1) return head;
   return `${head} (+${later} later ${later === 1 ? "issue" : "issues"})`;
 }
+
+/**
+ * Summarises what a run actually left behind, e.g. "pushed · 2 replies · 1 thread".
+ * Returns null when nothing durable happened, so callers show a dash rather than an
+ * empty or falsely reassuring string.
+ *
+ * Only non-zero effects appear: a list of zeroes reads as detail while saying
+ * nothing, and the absence of an effect is already carried by its absence.
+ */
+export function formatDurableProgress(
+  outcome: FixerRunOutcome | null | undefined,
+): string | null {
+  const progress = outcome?.progress;
+  if (!progress) return null;
+
+  const parts: string[] = [];
+  if (progress.commitProduced) parts.push("committed");
+  if (progress.pushed) parts.push("pushed");
+
+  const replies = progress.repliesSent ?? 0;
+  if (replies > 0) parts.push(`${replies} ${replies === 1 ? "reply" : "replies"}`);
+
+  const threads = progress.threadsResolved ?? 0;
+  if (threads > 0) parts.push(`${threads} ${threads === 1 ? "thread" : "threads"}`);
+
+  return parts.length > 0 ? parts.join(" · ") : null;
+}
