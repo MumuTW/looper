@@ -140,7 +140,9 @@ Manual: replace the binaries. Download the newer `looper-<target>.tar.gz` and `l
 curl -fsSL https://raw.githubusercontent.com/mumutw/looper/main/scripts/uninstall.sh | sh
 ```
 
-The uninstall script removes the CLI binary, any daemon binary under `~/.looper/bin/`, and updater state. It asks before deleting config, the SQLite DB, backups, logs, and worktrees. A `looperd` you installed elsewhere on your `PATH` has to be removed by hand.
+The uninstall script removes the installer-owned CLI binary, any daemon binary under `$LOOPER_HOME/bin/` (default `~/.looper/bin/`), updater state, and the exact PATH stanza added by the installer to `.zprofile`, `.bash_profile`, or `.profile`. Unrelated profile content is preserved.
+
+Before removing user data, it lists every existing path in scope and asks for approval. That optional scope is `config.toml`, `config.json`, `config.yaml`, `config.yml`, `looper.sqlite` plus its `-wal`/`-shm` sidecars, `backups/`, `logs/`, and `worktrees/` under `$LOOPER_HOME`. Declining leaves all of those paths untouched. For an explicitly authorized non-interactive uninstall, set `LOOPER_UNINSTALL_YES=1`; other values do not grant deletion authority. A `looperd` installed elsewhere on `PATH` still has to be removed by hand.
 
 ## From source
 
