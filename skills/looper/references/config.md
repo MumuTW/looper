@@ -163,7 +163,7 @@ Provider validation notes:
 - `baseUrl`, when set, must be a `github.com` URL. It feeds repository identity only and does not point Looper at a host, so a GHES URL is rejected at startup rather than accepted and failed at publish time.
 - `tokenEnv` names an env var copied into trusted `looper review submit` children only. Normal GitHub calls use ambient `gh` auth.
 - A project with an explicit `provider` must also set `repo`; a binding without one is rejected.
-- A project bound to a provider requires a `provider` and repo. Configure the provider and the complete project together in the config file's `providers` + `[[projects]]` (or projects table), then restart `looperd`. Do not pre-register the path with `looper project add` or `POST /api/v1/projects`: those create an API-managed record, and a later config entry with the same id conflicts with it and prevents daemon startup. The dashboard lists projects but does not create them.
+- A project bound to a provider requires a `provider` and repo. Configure the provider and the complete project together in the config file's `providers` + `[[projects]]` (or projects table), then restart `looperd`. Neither `looper project add` nor `POST /api/v1/projects` accepts a provider field. If either already created the same ID, temporarily remove the config entry, restart, `DELETE /api/v1/projects/<id>`, stop, restore the config entry, and restart; only the archived API record may be claimed by config. The dashboard lists projects but does not create them.
 - Two projects whose repository identities collide are rejected case-insensitively. Every provider resolves to github.com, so the same `owner/name` is a duplicate however many provider ids it is split across.
 
 ## Role model guidance

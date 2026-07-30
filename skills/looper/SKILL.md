@@ -116,7 +116,7 @@ looper status
 
 **First decide which of the two registration paths this project uses — they do not mix.**
 
-**Projects that need an explicit provider binding: do NOT run `looper project add`.** Define the project entirely in the config file under `[[projects]]`, alongside its provider, and restart the daemon. `looper project add` has no way to express a provider binding, and the record it creates is marked `source = "api"`. Adding the same project to the config afterwards does not convert it: on the next start `SyncConfigured` sees a configured project whose id already belongs to an API record, fails with `configured project <id> conflicts with an API-managed project`, and **`looperd` refuses to start**. Recovering means removing the API record before the daemon will come back up. See [docs/configuration.md](../../docs/configuration.md).
+**Projects that need an explicit provider binding: do NOT run `looper project add`.** Define the project entirely in the config file under `[[projects]]`, alongside its provider, and restart the daemon. Neither `looper project add` nor `POST /api/v1/projects` has a provider field, and the record either creates is marked `source = "api"`. Adding the same project to the config afterwards does not convert it: on the next start `SyncConfigured` sees a configured project whose id already belongs to an active API record and **`looperd` refuses to start**. See [docs/configuration.md](../../docs/configuration.md) for the archive-then-import handoff.
 
 **GitHub projects, with the daemon up:**
 
@@ -167,7 +167,7 @@ Inspect loops in the dashboard or via `GET /api/v1/loops`. Worktree path for a d
 | PR URL rejected as selector | Expected — use loop seq or loop id only |
 | Reviewer can't publish | Daemon must spawn the trusted `looper review submit` wrapper; never run it by hand without the proxy |
 | Daemon fails on startup | Config validation, missing `git`/`gh`, or unwritable `~/.looper` |
-| `configured project X conflicts with an API-managed project` | X was registered with `looper project add` and then added to `[[projects]]`. Pick one: drop it from the config, or remove the API record. Config-managed projects must never be `project add`ed |
+| `configured project X conflicts with an active API-managed project` | Temporarily remove X from `[[projects]]`, restart, send `DELETE /api/v1/projects/X`, stop, restore the complete config entry, and restart. DELETE archives the API record; config import can then claim that ID. This terminates the old project's loops |
 | Want daemon across reboot | User's `launchd`/`systemd`/`tmux` — not a Looper feature |
 
 ## Anti-patterns

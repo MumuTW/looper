@@ -115,7 +115,9 @@ With the daemon up, register a local git repository root either:
 
 Registration completes as soon as the project is validated, committed, and published. Worktree and pull request discovery then runs as post-commit work in the daemon — even on a repository with many open pull requests `looper project add` returns immediately, reporting discovery as pending. Discovery status is stored on the project record; if it fails, retry it with `looper project discover <id>` (or `POST /api/v1/projects/{id}/discover`) without re-registering the project.
 
-Do not use `looper project add` for a project that needs an explicit provider binding; the CLI cannot express one, so those belong in `[[projects]]` in the config file. Registering one through the API first and adding it to the config afterwards makes `looperd` fail to start, because a configured project cannot take over an id an API-managed record already holds.
+Do not use `looper project add` for a project that needs an explicit provider binding; the CLI and API schemas cannot express one, so those belong in `[[projects]]` in the config file. Registering one through the API first and adding it to the config afterwards makes `looperd` fail to start while the API record remains active.
+
+To recover that mixed-ownership state without editing SQLite, temporarily remove the conflicting `[[projects]]` entry, restart `looperd`, send `DELETE /api/v1/projects/<id>`, and stop the daemon. Restore the complete config entry and restart once more. DELETE archives the API-owned record; config import is allowed to claim only that explicitly archived ID. The old project's loops are terminated as part of removal, so confirm the target ID before sending DELETE.
 
 Projects registered through the API take effect immediately. Projects listed under `[[projects]]` in the config file are imported at daemon startup instead.
 
