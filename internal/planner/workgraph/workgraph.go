@@ -5,6 +5,7 @@
 package workgraph
 
 import (
+	"encoding/json"
 	"fmt"
 	"regexp"
 	"sort"
@@ -17,11 +18,41 @@ var keyPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]*$`)
 // Key is stable within a graph revision and dependencies name other keys in
 // that revision.
 type Node struct {
-	Key                string
-	Goal               string
-	AcceptanceCriteria []string
-	Dependencies       []string
-	ExpectedPRScope    string
+	Key                string   `json:"key"`
+	Goal               string   `json:"goal"`
+	AcceptanceCriteria []string `json:"acceptanceCriteria"`
+	Dependencies       []string `json:"dependencies,omitempty"`
+	ExpectedPRScope    string   `json:"expectedPrScope"`
+}
+
+// Result is the optional structured decomposition embedded in a Planner
+// __LOOPER_RESULT__ payload. Omitting workGraph deliberately preserves the
+// established single-worker handoff.
+type Result struct {
+	WorkGraph *Document `json:"workGraph,omitempty"`
+}
+
+// Document is the persisted Planner-owned graph authority. The caller must
+// still bind it to a concrete parent issue and project before it can run.
+type Document struct {
+	Nodes []Node `json:"nodes"`
+}
+
+// ParseResult extracts the optional workGraph from the Planner's structured
+// completion payload and validates it before any persistence can occur.
+func ParseResult(payload []byte) (*Graph, error) {
+	var result Result
+	if err := json.Unmarshal(payload, &result); err != nil {
+		return nil, fmt.Errorf("decode planner result: %w", err)
+	}
+	if result.WorkGraph == nil {
+		return nil, nil
+	}
+	graph, err := Build(result.WorkGraph.Nodes)
+	if err != nil {
+		return nil, err
+	}
+	return &graph, nil
 }
 
 type State string

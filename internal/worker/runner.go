@@ -38,6 +38,7 @@ import (
 	"github.com/MumuTW/looper/internal/storage"
 	"github.com/MumuTW/looper/internal/validation"
 	"github.com/MumuTW/looper/internal/worker/workflow"
+	"github.com/MumuTW/looper/internal/workgraphdispatch"
 	"github.com/MumuTW/looper/internal/worktreesafety"
 )
 
@@ -583,6 +584,7 @@ type Runner struct {
 	hitlNotify                  HITLNotifyFunc
 	hitlAnswerTransport         string
 	hitlGitHub                  HITLGitHubSettings
+	workGraphs                  *workgraphdispatch.Service
 }
 
 type DiscoveryInput struct {
@@ -1123,7 +1125,7 @@ func New(options Options) *Runner {
 	if policy.LabelMode == "" {
 		policy = DiscoveryPolicy{AutoDiscovery: true, Labels: []string{labels.DefaultWorkerReadyTrigger}, LabelMode: config.LabelModeAll, RequireAssigneeCurrentUser: true}
 	}
-	return &Runner{
+	runner := &Runner{
 		db:                          options.DB,
 		repos:                       options.Repos,
 		github:                      options.GitHub,
@@ -1161,6 +1163,8 @@ func New(options Options) *Runner {
 		hitlAnswerTransport:         options.HITLAnswerTransport,
 		hitlGitHub:                  options.HITLGitHub,
 	}
+	runner.workGraphs = workgraphdispatch.New(workgraphdispatch.Options{DB: options.DB, Repositories: options.Repos, Now: now, RetryMaxAttempts: retryMaxAttempts, OnEnqueued: options.OnQueueItemEnqueued})
+	return runner
 }
 
 func cloneValidationCommandsByProject(source map[string][]string) map[string][]string {
@@ -1521,6 +1525,15 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	}
 	if result, finalized, err := r.finalizePriorSuccessfulClaim(ctx, *loop, queueItem); err != nil || finalized {
 		return result, err
+	}
+	if graphQueueItem(queueItem) {
+		claimed, err := r.workGraphs.ClaimWorkerNode(ctx, loop.ID)
+		if err != nil {
+			return runpipe.ProcessResult{}, err
+		}
+		if !claimed {
+			return r.finishDuplicateGraphQueueItem(ctx, *loop, queueItem)
+		}
 	}
 	if err := r.revalidateRoutedWorkerClaim(ctx, *project, *loop, queueItem); err != nil {
 		return runpipe.ProcessResult{}, err
@@ -3336,10 +3349,24 @@ func (r *Runner) finalizeSuccessfulClaim(ctx context.Context, run storage.RunRec
 	}
 	finishedAt := r.nowISO()
 	completed := completedRunRecord(run, "success", summary, "", checkpoint, finishedAt)
-	if err := storage.FinalizeWorkerSuccess(ctx, r.db, storage.WorkerSuccessFinalizationInput{Run: completed, QueueItemID: queueItem.ID, LoopID: loop.ID, LoopStatus: "completed", FinishedAt: finishedAt, RequeueForHumanInbox: requeueForHumanInbox}); err != nil {
+	unlocked := false
+	if err := storage.FinalizeWorkerSuccess(ctx, r.db, storage.WorkerSuccessFinalizationInput{Run: completed, QueueItemID: queueItem.ID, LoopID: loop.ID, LoopStatus: "completed", FinishedAt: finishedAt, RequeueForHumanInbox: requeueForHumanInbox, AfterFinalize: r.workGraphFinalizationHook(loop.ID, &unlocked)}); err != nil {
 		return storage.RunRecord{}, errors.Join(ErrSuccessfulClaimFinalization, err)
 	}
+	if unlocked {
+		r.workGraphs.Wake()
+	}
 	return completed, nil
+}
+
+func (r *Runner) workGraphFinalizationHook(loopID string, unlocked *bool) func(context.Context, *storage.Repositories) error {
+	return func(ctx context.Context, repos *storage.Repositories) error {
+		queued, err := r.workGraphs.CompleteWorkerNodeInTransaction(ctx, repos, loopID)
+		if err == nil && unlocked != nil && len(queued) > 0 {
+			*unlocked = true
+		}
+		return err
+	}
 }
 
 func (r *Runner) finalizePriorSuccessfulClaim(ctx context.Context, loop storage.LoopRecord, queueItem storage.QueueItemRecord) (runpipe.ProcessResult, bool, error) {
@@ -3361,6 +3388,27 @@ func (r *Runner) finalizePriorSuccessfulClaim(ctx context.Context, loop storage.
 	}
 	status := statusForCheckpoint(checkpoint)
 	return runpipe.ProcessResult{LoopID: loop.ID, RunID: completed.ID, QueueItemID: queueItem.ID, Status: status, Summary: summary, PullRequestNumber: pullRequestNumber(checkpoint.PullRequest)}, true, nil
+}
+
+func (r *Runner) finishDuplicateGraphQueueItem(ctx context.Context, loop storage.LoopRecord, queueItem storage.QueueItemRecord) (runpipe.ProcessResult, error) {
+	finishedAt := r.nowISO()
+	if err := r.repos.Queue.Complete(ctx, queueItem.ID, finishedAt); err != nil && !errors.Is(err, storage.ErrQueueItemNotActive) {
+		return runpipe.ProcessResult{}, err
+	}
+	if _, err := r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
+		updated.Status = "completed"
+		updated.LastRunAt = &finishedAt
+		updated.NextRunAt = nil
+	}); err != nil {
+		return runpipe.ProcessResult{}, err
+	}
+	return runpipe.ProcessResult{LoopID: loop.ID, QueueItemID: queueItem.ID, Status: "skipped", Summary: "Work graph node already claimed or settled"}, nil
+}
+
+func graphQueueItem(queueItem storage.QueueItemRecord) bool {
+	payload := parseJSONObject(queueItem.PayloadJSON)
+	_, ok := payload["workGraphID"].(string)
+	return ok
 }
 
 // CanFinalizeSuccessfulClaim prevents a later queue generation from being
@@ -3773,6 +3821,11 @@ func (r *Runner) failQueueItem(ctx context.Context, queueItem storage.QueueItemR
 			}
 			return nil, err
 		}
+		if graphQueueItem(queueItem) && queueItem.LoopID != nil {
+			if _, err := r.workGraphs.FailWorkerNode(ctx, *queueItem.LoopID, message); err != nil {
+				return nil, err
+			}
+		}
 		return r.repos.Queue.GetByID(ctx, queueItem.ID)
 	}
 	retryAt := eventlog.FormatJavaScriptISOString(r.now().Add(runpipe.BackoffDelayLinear(r.retryBaseDelay, runpipe.CappedRetryDelayAttempt(nextAttempts, queueItem.MaxAttempts))))
@@ -3782,7 +3835,16 @@ func (r *Runner) failQueueItem(ctx context.Context, queueItem storage.QueueItemR
 		}
 		return nil, err
 	}
-	return r.repos.Queue.GetByID(ctx, queueItem.ID)
+	persisted, err := r.repos.Queue.GetByID(ctx, queueItem.ID)
+	if err != nil {
+		return nil, err
+	}
+	if persisted != nil && persisted.Status == "queued" && graphQueueItem(queueItem) && queueItem.LoopID != nil {
+		if err := r.workGraphs.ReleaseWorkerNode(ctx, *queueItem.LoopID); err != nil {
+			return nil, err
+		}
+	}
+	return persisted, nil
 }
 
 func (r *Runner) updateLoop(ctx context.Context, loop storage.LoopRecord, mutate func(*storage.LoopRecord)) (storage.LoopRecord, error) {

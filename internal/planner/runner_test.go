@@ -794,6 +794,59 @@ func TestRunWriteSpecStepRechecksPlannerHoldBeforeStartingAgent(t *testing.T) {
 	}
 }
 
+func TestRunWriteSpecStepPersistsStructuredWorkGraphAndQueuesOnlyRoot(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	worktreeRoot := t.TempDir()
+	worktreePath := filepath.Join(worktreeRoot, "wt")
+	if err := os.MkdirAll(worktreePath, 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	metadata := fmt.Sprintf(`{"worktreeRoot":%q}`, worktreeRoot)
+	issue := &checkpointIssue{Repo: "acme/looper", IssueNumber: 339, Title: "Stack work", SpecPath: "specs/339.md"}
+	loopResult, err := (&Runner{repos: fixture.repos, now: fixture.now}).ensureLoopForIssue(context.Background(), storage.ProjectRecord{ID: "project_1"}, issue.Repo, IssueSummary{Number: issue.IssueNumber, Title: issue.Title}, buildPlannerDiscoveryFingerprint(issue.Repo, fixture.now(), IssueSummary{Number: issue.IssueNumber, Title: issue.Title}))
+	if err != nil {
+		t.Fatalf("ensureLoopForIssue() error = %v", err)
+	}
+	runID := "run_write_spec_graph"
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: runID, LoopID: loopResult.record.ID, Status: "running", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	payload := `{"summary":"decomposed","workGraph":{"nodes":[{"key":"storage","goal":"Persist graph","acceptanceCriteria":["migration"],"expectedPrScope":"storage"},{"key":"api","goal":"Expose graph","acceptanceCriteria":["route"],"dependencies":["storage"],"expectedPrScope":"api"}]}}`
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "decomposed", CompletionPayload: payload}}}, Logger: fixture.logger, Now: fixture.now})
+
+	checkpoint, err := runner.runWriteSpecStep(context.Background(), stepInput{
+		Project: storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir(), MetadataJSON: &metadata},
+		Loop:    loopResult.record,
+		Run:     storage.RunRecord{ID: runID, LoopID: loopResult.record.ID},
+		Checkpoint: plannerCheckpoint{
+			Issue: issue, Worktree: &checkpointWorktree{Path: worktreePath, Branch: "looper/planner/339-stack", BaseBranch: "main"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("runWriteSpecStep() error = %v", err)
+	}
+	if checkpoint.WriteSpec == nil || checkpoint.WriteSpec.WorkGraphID == "" {
+		t.Fatalf("checkpoint.WriteSpec = %#v, want persisted graph id", checkpoint.WriteSpec)
+	}
+	nodes, err := fixture.repos.PlannerWorkGraphs.ListNodes(context.Background(), checkpoint.WriteSpec.WorkGraphID)
+	if err != nil {
+		t.Fatalf("ListNodes() error = %v", err)
+	}
+	if len(nodes) != 2 || nodeState(nodes, "storage") != "queued" || nodeState(nodes, "api") != "pending" {
+		t.Fatalf("nodes = %#v, want only root queued", nodes)
+	}
+}
+
+func nodeState(nodes []storage.PlannerWorkGraphNodeRecord, key string) string {
+	for _, node := range nodes {
+		if node.NodeKey == key {
+			return node.State
+		}
+	}
+	return ""
+}
+
 func TestRunWriteSpecStepRechecksPlannerHoldAfterAgentCompletion(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

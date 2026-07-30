@@ -24,7 +24,9 @@ import (
 	"github.com/MumuTW/looper/internal/loops"
 	"github.com/MumuTW/looper/internal/loops/failureclass"
 	"github.com/MumuTW/looper/internal/loops/runpipe"
+	"github.com/MumuTW/looper/internal/planner/workgraph"
 	"github.com/MumuTW/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/workgraphdispatch"
 	"github.com/MumuTW/looper/internal/worktreesafety"
 )
 
@@ -264,6 +266,7 @@ type AgentResult struct {
 	Summary                      string
 	Stdout                       string
 	Stderr                       string
+	CompletionPayload            string
 	Commits                      []string
 	Lifecycle                    *lifecycle.State
 	TimeoutType                  string
@@ -349,6 +352,7 @@ type Runner struct {
 	onAgentExecutionStarted AgentExecutionStartedFunc
 	onQueueItemEnqueued     func()
 	discoveryPolicy         DiscoveryPolicy
+	workGraphs              *workgraphdispatch.Service
 }
 
 type DiscoveryInput struct {
@@ -417,6 +421,7 @@ type checkpointWriteSpec struct {
 	Status                       string           `json:"status,omitempty"`
 	Summary                      string           `json:"summary,omitempty"`
 	Stdout                       string           `json:"stdout,omitempty"`
+	WorkGraphID                  string           `json:"workGraphId,omitempty"`
 	Commits                      []string         `json:"commits,omitempty"`
 	Lifecycle                    *lifecycle.State `json:"gitPrLifecycle,omitempty"`
 	GitReconciled                bool             `json:"gitReconciled,omitempty"`
@@ -503,7 +508,9 @@ func New(options Options) *Runner {
 	if policy.LabelMode == "" {
 		policy = DiscoveryPolicy{AutoDiscovery: true, Labels: []string{labels.DefaultPlanTrigger}, LabelMode: config.LabelModeAll, RequireAssigneeCurrentUser: true}
 	}
-	return &Runner{db: options.DB, repos: options.Repos, github: options.GitHub, git: options.Git, agentExecutor: options.AgentExecutor, logger: options.Logger, now: now, agentTimeout: agentTimeout, agentIdleTimeout: agentIdleTimeout, claimTTL: claimTTL, allowAutoPush: allowAutoPush, disclosure: disclosureCfg, agentRuntime: strings.TrimSpace(options.AgentRuntime), agentProfileID: strings.TrimSpace(options.AgentProfileID), customInstructions: customInstructionConfig(options.CustomInstructions), projectRoleConfig: options.CustomInstructions, agentModel: cloneStringPtr(options.AgentModel), retryBaseDelay: retryBaseDelay, retryMaxAttempts: retryMax, onAgentExecutionStarted: options.OnAgentExecutionStarted, onQueueItemEnqueued: options.OnQueueItemEnqueued, discoveryPolicy: policy}
+	runner := &Runner{db: options.DB, repos: options.Repos, github: options.GitHub, git: options.Git, agentExecutor: options.AgentExecutor, logger: options.Logger, now: now, agentTimeout: agentTimeout, agentIdleTimeout: agentIdleTimeout, claimTTL: claimTTL, allowAutoPush: allowAutoPush, disclosure: disclosureCfg, agentRuntime: strings.TrimSpace(options.AgentRuntime), agentProfileID: strings.TrimSpace(options.AgentProfileID), customInstructions: customInstructionConfig(options.CustomInstructions), projectRoleConfig: options.CustomInstructions, agentModel: cloneStringPtr(options.AgentModel), retryBaseDelay: retryBaseDelay, retryMaxAttempts: retryMax, onAgentExecutionStarted: options.OnAgentExecutionStarted, onQueueItemEnqueued: options.OnQueueItemEnqueued, discoveryPolicy: policy}
+	runner.workGraphs = workgraphdispatch.New(workgraphdispatch.Options{DB: options.DB, Repositories: options.Repos, Now: now, RetryMaxAttempts: retryMax, OnEnqueued: options.OnQueueItemEnqueued})
+	return runner
 }
 
 func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (DiscoveryResult, error) {
@@ -1286,6 +1293,19 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 			}
 		}
 		checkpoint.WriteSpec = checkpointWriteSpecFromAgentResult(result)
+		if result.CompletionPayload != "" {
+			graph, graphErr := workgraph.ParseResult([]byte(result.CompletionPayload))
+			if graphErr != nil {
+				return checkpoint, &runpipe.LoopError{Message: "planner work graph: " + graphErr.Error(), Kind: runpipe.FailureNonRetryable}
+			}
+			if graph != nil {
+				created, createErr := r.workGraphs.Create(ctx, workgraphdispatch.CreateInput{ProjectID: input.Project.ID, ParentRepo: issue.Repo, ParentIssueNumber: issue.IssueNumber, PlannerLoopID: input.Loop.ID, BaseBranch: worktree.BaseBranch, Graph: *graph})
+				if createErr != nil {
+					return checkpoint, &runpipe.LoopError{Message: "persist planner work graph: " + createErr.Error(), Kind: runpipe.FailureRetryableAfterResume}
+				}
+				checkpoint.WriteSpec.WorkGraphID = created.GraphID
+			}
+		}
 		checkpoint.ensureLifecycle("planner", worktree.Branch, worktree.BaseBranch, true)
 		if result.Lifecycle != nil {
 			checkpoint.Lifecycle.MergeAgent(result.Lifecycle, r.nowISO())
@@ -2185,6 +2205,7 @@ func buildPlannerPrompt(project storage.ProjectRecord, instructionConfig config.
 		"- Create or update the spec at " + issue.SpecPath,
 		"- Use Markdown with clear problem, goals, approach, risks, and validation sections",
 		"- Keep the implementation scope aligned to the issue",
+		"- For work that benefits from dependency-ordered child pull requests, include workGraph in the final __LOOPER_RESULT__ JSON: {\"nodes\":[{\"key\":\"stable-key\",\"goal\":\"...\",\"acceptanceCriteria\":[\"...\"],\"dependencies\":[\"prerequisite-key\"],\"expectedPrScope\":\"...\"}]}; omit workGraph for one cohesive implementation",
 	}
 	if allowAutoPush {
 		requirements = append(requirements, "- Commit the spec changes on the current branch so the PR can be opened")

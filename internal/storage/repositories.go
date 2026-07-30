@@ -75,6 +75,7 @@ type Repositories struct {
 	WebhookForwarders    *WebhookForwardersRepository
 	WebhookTunnelHooks   *WebhookTunnelHooksRepository
 	FeishuThreads        *FeishuThreadsRepository
+	PlannerWorkGraphs    *PlannerWorkGraphsRepository
 }
 
 func NewRepositories(q sqliteQuerier) *Repositories {
@@ -93,7 +94,38 @@ func NewRepositories(q sqliteQuerier) *Repositories {
 		WebhookForwarders:    &WebhookForwardersRepository{q: q},
 		WebhookTunnelHooks:   &WebhookTunnelHooksRepository{q: q},
 		FeishuThreads:        &FeishuThreadsRepository{q: q},
+		PlannerWorkGraphs:    &PlannerWorkGraphsRepository{q: q},
 	}
+}
+
+// PlannerWorkGraphRecord binds one Planner decomposition to its source issue.
+// The planner's structured output is the authority for its content; storage
+// owns only durable state transitions and queue idempotency.
+type PlannerWorkGraphRecord struct {
+	ID                string
+	ProjectID         string
+	ParentRepo        string
+	ParentIssueNumber int64
+	PlannerLoopID     string
+	BaseBranch        string
+	Status            string
+	ReplanReason      *string
+	CreatedAt         string
+	UpdatedAt         string
+}
+
+type PlannerWorkGraphNodeRecord struct {
+	GraphID                string
+	NodeKey                string
+	Goal                   string
+	AcceptanceCriteriaJSON string
+	ExpectedPRScope        string
+	WorkerLoopID           string
+	Branch                 string
+	State                  string
+	BlockedReason          *string
+	CreatedAt              string
+	UpdatedAt              string
 }
 
 // RetireQueuedLoop pauses a queued loop and cancels its selected queued item
@@ -836,6 +868,138 @@ func scanTriageSourceStates(rows *sql.Rows) ([]TriageSourceStateRecord, error) {
 }
 
 type ProjectsRepository struct{ q sqliteQuerier }
+
+type PlannerWorkGraphsRepository struct{ q sqliteQuerier }
+
+func (r *PlannerWorkGraphsRepository) Create(ctx context.Context, record PlannerWorkGraphRecord) error {
+	_, err := r.q.ExecContext(ctx, `
+		INSERT INTO planner_work_graphs (
+			id, project_id, parent_repo, parent_issue_number, planner_loop_id,
+			base_branch, status, replan_reason, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, record.ID, record.ProjectID, record.ParentRepo, record.ParentIssueNumber,
+		record.PlannerLoopID, record.BaseBranch, record.Status, record.ReplanReason,
+		record.CreatedAt, record.UpdatedAt)
+	if err != nil {
+		return fmt.Errorf("create planner work graph: %w", err)
+	}
+	return nil
+}
+
+func (r *PlannerWorkGraphsRepository) GetByPlannerLoopID(ctx context.Context, plannerLoopID string) (*PlannerWorkGraphRecord, error) {
+	row := r.q.QueryRowContext(ctx, `SELECT * FROM planner_work_graphs WHERE planner_loop_id = ?`, plannerLoopID)
+	record, err := scanPlannerWorkGraph(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get planner work graph by planner loop: %w", err)
+	}
+	return &record, nil
+}
+
+func (r *PlannerWorkGraphsRepository) GetByID(ctx context.Context, graphID string) (*PlannerWorkGraphRecord, error) {
+	row := r.q.QueryRowContext(ctx, `SELECT * FROM planner_work_graphs WHERE id = ?`, graphID)
+	record, err := scanPlannerWorkGraph(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get planner work graph: %w", err)
+	}
+	return &record, nil
+}
+
+func (r *PlannerWorkGraphsRepository) UpdateStatus(ctx context.Context, graphID, status string, replanReason *string, updatedAt string) error {
+	_, err := r.q.ExecContext(ctx, `UPDATE planner_work_graphs SET status = ?, replan_reason = ?, updated_at = ? WHERE id = ?`, status, replanReason, updatedAt, graphID)
+	if err != nil {
+		return fmt.Errorf("update planner work graph status: %w", err)
+	}
+	return nil
+}
+
+func (r *PlannerWorkGraphsRepository) CreateNode(ctx context.Context, record PlannerWorkGraphNodeRecord) error {
+	_, err := r.q.ExecContext(ctx, `
+		INSERT INTO planner_work_graph_nodes (
+			graph_id, node_key, goal, acceptance_criteria_json, expected_pr_scope,
+			worker_loop_id, branch, state, blocked_reason, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, record.GraphID, record.NodeKey, record.Goal, record.AcceptanceCriteriaJSON,
+		record.ExpectedPRScope, record.WorkerLoopID, record.Branch, record.State,
+		record.BlockedReason, record.CreatedAt, record.UpdatedAt)
+	if err != nil {
+		return fmt.Errorf("create planner work graph node: %w", err)
+	}
+	return nil
+}
+
+func (r *PlannerWorkGraphsRepository) CreateDependency(ctx context.Context, graphID, nodeKey, dependsOnKey string) error {
+	_, err := r.q.ExecContext(ctx, `INSERT INTO planner_work_graph_dependencies (graph_id, node_key, depends_on_key) VALUES (?, ?, ?)`, graphID, nodeKey, dependsOnKey)
+	if err != nil {
+		return fmt.Errorf("create planner work graph dependency: %w", err)
+	}
+	return nil
+}
+
+func (r *PlannerWorkGraphsRepository) ListNodes(ctx context.Context, graphID string) ([]PlannerWorkGraphNodeRecord, error) {
+	rows, err := r.q.QueryContext(ctx, `SELECT * FROM planner_work_graph_nodes WHERE graph_id = ? ORDER BY node_key ASC`, graphID)
+	if err != nil {
+		return nil, fmt.Errorf("list planner work graph nodes: %w", err)
+	}
+	defer rows.Close()
+	return scanPlannerWorkGraphNodes(rows)
+}
+
+func (r *PlannerWorkGraphsRepository) ListDependencies(ctx context.Context, graphID, nodeKey string) ([]string, error) {
+	rows, err := r.q.QueryContext(ctx, `SELECT depends_on_key FROM planner_work_graph_dependencies WHERE graph_id = ? AND node_key = ? ORDER BY depends_on_key ASC`, graphID, nodeKey)
+	if err != nil {
+		return nil, fmt.Errorf("list planner work graph dependencies: %w", err)
+	}
+	defer rows.Close()
+	keys := make([]string, 0)
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			return nil, fmt.Errorf("scan planner work graph dependency: %w", err)
+		}
+		keys = append(keys, key)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate planner work graph dependencies: %w", err)
+	}
+	return keys, nil
+}
+
+func (r *PlannerWorkGraphsRepository) GetNodeByWorkerLoopID(ctx context.Context, workerLoopID string) (*PlannerWorkGraphNodeRecord, error) {
+	row := r.q.QueryRowContext(ctx, `SELECT * FROM planner_work_graph_nodes WHERE worker_loop_id = ?`, workerLoopID)
+	record, err := scanPlannerWorkGraphNode(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get planner work graph node by worker loop: %w", err)
+	}
+	return &record, nil
+}
+
+// TransitionNode atomically claims or settles a node from exactly one expected
+// state. A false result is a normal duplicate delivery, not a successful
+// transition.
+func (r *PlannerWorkGraphsRepository) TransitionNode(ctx context.Context, graphID, nodeKey, from, to string, blockedReason *string, updatedAt string) (bool, error) {
+	result, err := r.q.ExecContext(ctx, `
+		UPDATE planner_work_graph_nodes
+		SET state = ?, blocked_reason = ?, updated_at = ?
+		WHERE graph_id = ? AND node_key = ? AND state = ?
+	`, to, blockedReason, updatedAt, graphID, nodeKey, from)
+	if err != nil {
+		return false, fmt.Errorf("transition planner work graph node: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("read planner work graph node transition rows: %w", err)
+	}
+	return affected == 1, nil
+}
 
 func (r *ProjectsRepository) Upsert(ctx context.Context, record ProjectRecord) error {
 	_, err := r.q.ExecContext(ctx, `
@@ -4299,6 +4463,70 @@ func scanQueueItems(rows *sql.Rows) ([]QueueItemRecord, error) {
 	}
 
 	return records, nil
+}
+
+func scanPlannerWorkGraph(row interface{ Scan(...any) error }) (PlannerWorkGraphRecord, error) {
+	var (
+		record       PlannerWorkGraphRecord
+		replanReason sql.NullString
+	)
+	err := row.Scan(
+		&record.ID,
+		&record.ProjectID,
+		&record.ParentRepo,
+		&record.ParentIssueNumber,
+		&record.PlannerLoopID,
+		&record.BaseBranch,
+		&record.Status,
+		&replanReason,
+		&record.CreatedAt,
+		&record.UpdatedAt,
+	)
+	if err != nil {
+		return PlannerWorkGraphRecord{}, err
+	}
+	record.ReplanReason = nullableString(replanReason)
+	return record, nil
+}
+
+func scanPlannerWorkGraphNodes(rows *sql.Rows) ([]PlannerWorkGraphNodeRecord, error) {
+	records := make([]PlannerWorkGraphNodeRecord, 0)
+	for rows.Next() {
+		record, err := scanPlannerWorkGraphNode(rows)
+		if err != nil {
+			return nil, err
+		}
+		records = append(records, record)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate planner work graph nodes: %w", err)
+	}
+	return records, nil
+}
+
+func scanPlannerWorkGraphNode(row interface{ Scan(...any) error }) (PlannerWorkGraphNodeRecord, error) {
+	var (
+		record        PlannerWorkGraphNodeRecord
+		blockedReason sql.NullString
+	)
+	err := row.Scan(
+		&record.GraphID,
+		&record.NodeKey,
+		&record.Goal,
+		&record.AcceptanceCriteriaJSON,
+		&record.ExpectedPRScope,
+		&record.WorkerLoopID,
+		&record.Branch,
+		&record.State,
+		&blockedReason,
+		&record.CreatedAt,
+		&record.UpdatedAt,
+	)
+	if err != nil {
+		return PlannerWorkGraphNodeRecord{}, err
+	}
+	record.BlockedReason = nullableString(blockedReason)
+	return record, nil
 }
 
 func scanQueueItem(row interface{ Scan(...any) error }) (QueueItemRecord, error) {

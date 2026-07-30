@@ -43,8 +43,8 @@
             "dbPath": "<tmp-root>/state/looper.sqlite",
             "lastUpdatedAt": "<generated-timestamp>",
             "migration": {
-              "latestAvailableId": "0022_triage_source_key_index",
-              "latestAppliedId": "0022_triage_source_key_index",
+              "latestAvailableId": "0023_planner_work_graph",
+              "latestAppliedId": "0023_planner_work_graph",
               "pendingCount": 0
             }
           }
@@ -108,7 +108,7 @@
           "storage": {
             "mode": "sqlite",
             "dbPath": "<tmp-root>/state/looper.sqlite",
-            "schemaVersion": "0022_triage_source_key_index",
+            "schemaVersion": "0023_planner_work_graph",
             "pendingMigrations": [],
             "healthy": true
           },
