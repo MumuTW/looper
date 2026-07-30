@@ -1854,6 +1854,29 @@ func (g *Gateway) EnableAutoMerge(ctx context.Context, input EnableAutoMergeInpu
 	return err
 }
 
+// MergePullRequest merges now, refusing if the head has moved.
+//
+// --match-head-commit is what closes the gap between deciding a pull request is
+// eligible and acting on it: the forge rejects the merge if anything was pushed
+// in between, so the decision cannot be applied to a different commit than the
+// one it was made about.
+//
+// This deliberately does not pass --auto. Auto-merge hands the decision to
+// GitHub to apply later, by which time the evaluation behind it is stale — the
+// opposite of the guarantee an immediate merge makes.
+func (g *Gateway) MergePullRequest(ctx context.Context, input EnableAutoMergeInput) error {
+	strategy := strings.TrimSpace(string(input.Strategy))
+	if strategy == "" {
+		return fmt.Errorf("merge strategy is required")
+	}
+	headSHA := strings.TrimSpace(input.HeadSHA)
+	if headSHA == "" {
+		return fmt.Errorf("merge head SHA is required")
+	}
+	_, err := g.runGh(ctx, input.CWD, "", "pr", "merge", strconv.FormatInt(input.PRNumber, 10), "--repo", input.Repo, "--"+strategy, "--match-head-commit", headSHA)
+	return err
+}
+
 func (g *Gateway) GetPullRequestHeadSHA(ctx context.Context, input ViewPullRequestInput) (string, error) {
 	result, err := g.runGh(ctx, input.CWD, "", "pr", "view", fmt.Sprintf("%d", input.PRNumber), "--repo", input.Repo, "--json", "headRefOid")
 	if err != nil {

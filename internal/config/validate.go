@@ -255,7 +255,7 @@ func validateCoreConfig(config Config, issues *[]ValidationIssue) {
 	validateAgentConfig(config, issues)
 	validateLoggingAndNotificationConfig(config, issues)
 	validateHITLConfig(config.HITL, issues)
-	validateGatekeeperRoleConfig(config.Roles.Gatekeeper, "roles.gatekeeper", issues)
+	validateGatekeeperRoleConfig(config.Roles.Gatekeeper, "roles.gatekeeper", config.Roles.Reviewer.AutoMerge.Enabled, issues)
 	validateDeployerRoleConfig(config.Roles.Deployer, "roles.deployer", issues)
 	for i, project := range config.Projects {
 		if project.Roles == nil || project.Roles.Deployer == nil {
@@ -269,9 +269,13 @@ func validateCoreConfig(config Config, issues *[]ValidationIssue) {
 		if project.Roles == nil || project.Roles.Gatekeeper == nil || project.Roles.Gatekeeper.Trust == nil {
 			continue
 		}
+		reviewerAutoMerge := config.Roles.Reviewer.AutoMerge.Enabled
+		if project.Roles.Reviewer != nil && project.Roles.Reviewer.AutoMerge != nil && project.Roles.Reviewer.AutoMerge.Enabled != nil {
+			reviewerAutoMerge = *project.Roles.Reviewer.AutoMerge.Enabled
+		}
 		validateGatekeeperRoleConfig(
 			GatekeeperRoleConfig{Trust: *project.Roles.Gatekeeper.Trust},
-			fmt.Sprintf("projects[%d].roles.gatekeeper", i), issues)
+			fmt.Sprintf("projects[%d].roles.gatekeeper", i), reviewerAutoMerge, issues)
 	}
 	validateIntakeConfig(config, issues)
 	validateDaemonConfig(config.Daemon, issues)
@@ -473,18 +477,23 @@ func validateDeployerRoleConfig(deployerRole DeployerRoleConfig, path string, is
 	validateEnvironmentNames(deployerRole.Environment, path+".environment", issues)
 }
 
-func validateGatekeeperRoleConfig(gatekeeper GatekeeperRoleConfig, path string, issues *[]ValidationIssue) {
+func validateGatekeeperRoleConfig(gatekeeper GatekeeperRoleConfig, path string, reviewerAutoMerge bool, issues *[]ValidationIssue) {
 	switch GatekeeperTrustLevel(strings.ToLower(strings.TrimSpace(string(gatekeeper.Trust)))) {
 	case "", GatekeeperTrustObserve, GatekeeperTrustAdvise:
 	case GatekeeperTrustAuto:
-		*issues = append(*issues, ValidationIssue{
-			Path:    path + ".trust",
-			Message: fmt.Sprintf("%q is not implemented yet; Gatekeeper cannot merge. Use %q, and enable roles.reviewer.autoMerge if you want merges today", GatekeeperTrustAuto, GatekeeperTrustAdvise),
-		})
+		// Two merge authorities acting on the same pull request is not a
+		// configuration anyone can reason about: whichever wins the race decides,
+		// and Reviewer's path checks a strictly narrower set of gates.
+		if reviewerAutoMerge {
+			*issues = append(*issues, ValidationIssue{
+				Path:    path + ".trust",
+				Message: fmt.Sprintf("%q cannot be combined with roles.reviewer.autoMerge.enabled: disable one, and prefer Gatekeeper because it also gates on unresolved review threads and requested changes", GatekeeperTrustAuto),
+			})
+		}
 	default:
 		*issues = append(*issues, ValidationIssue{
 			Path:    path + ".trust",
-			Message: fmt.Sprintf("must be one of: %s, %s", GatekeeperTrustObserve, GatekeeperTrustAdvise),
+			Message: fmt.Sprintf("must be one of: %s, %s, %s", GatekeeperTrustObserve, GatekeeperTrustAdvise, GatekeeperTrustAuto),
 		})
 	}
 }
