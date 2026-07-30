@@ -773,9 +773,9 @@ func TestGatewayIgnoresStoredWorktreesFromDifferentRepoPath(t *testing.T) {
 	if worktree.WorktreePath == strayWorktreePath {
 		t.Fatalf("CreateWorktree().WorktreePath = stray path %q, want new worktree", strayWorktreePath)
 	}
-	stored, err := fixture.repos.Worktrees.GetByBranch(ctx, fixture.projectID, "feature/fixer")
+	stored, err := fixture.repos.Worktrees.GetLiveByCheckout(ctx, fixture.projectID, worktree.CheckoutKey)
 	if err != nil {
-		t.Fatalf("GetByBranch() error = %v", err)
+		t.Fatalf("GetLiveByCheckout() error = %v", err)
 	}
 	if stored == nil || normalizeComparablePath(stored.RepoPath) != normalizeComparablePath(fixture.repoPath) {
 		t.Fatalf("stored repo path = %#v, want %q", stored, fixture.repoPath)
@@ -808,7 +808,11 @@ func TestGatewayDoesNotTreatPrimaryCheckoutAsRestorableWorktree(t *testing.T) {
 	}
 }
 
-func TestGatewayReusesExistingBranchWorktreeRecordWhenRecreatingWorktree(t *testing.T) {
+// Re-creating the SAME checkout keeps its row. Identity is the checkout, not
+// the branch: an attached planner checkout and a detached PR checkout of one
+// branch are two rows, and collapsing them was what lost the path a crash
+// recovery has to retire.
+func TestGatewayReusesExistingCheckoutWorktreeRecordWhenRecreatingWorktree(t *testing.T) {
 	ctx := context.Background()
 	fixture := newFixture(t)
 	fixture.createMainOnlyRepo(t)
@@ -816,7 +820,8 @@ func TestGatewayReusesExistingBranchWorktreeRecordWhenRecreatingWorktree(t *test
 
 	metadata := `{"recovered":false}`
 	baseBranch := "main"
-	if err := fixture.repos.Worktrees.Upsert(ctx, storage.WorktreeRecord{ID: "existing-record", ProjectID: fixture.projectID, RepoPath: fixture.repoPath, WorktreePath: fixture.repoPath, Branch: "feature/fixer", BaseBranch: &baseBranch, Status: "active", MetadataJSON: &metadata, CreatedAt: fixture.now().UTC().Format(javaScriptISOStringLayout), UpdatedAt: fixture.now().UTC().Format(javaScriptISOStringLayout)}); err != nil {
+	checkoutKey := "looper-fix-" + sanitizeBranchName(fixture.projectID) + "-pr-42"
+	if err := fixture.repos.Worktrees.Upsert(ctx, storage.WorktreeRecord{ID: "existing-record", ProjectID: fixture.projectID, RepoPath: fixture.repoPath, WorktreePath: filepath.Join(fixture.worktreeRoot, checkoutKey), Branch: "feature/fixer", BaseBranch: &baseBranch, Status: "active", MetadataJSON: &metadata, CreatedAt: fixture.now().UTC().Format(javaScriptISOStringLayout), UpdatedAt: fixture.now().UTC().Format(javaScriptISOStringLayout)}); err != nil {
 		t.Fatalf("Worktrees.Upsert() error = %v", err)
 	}
 
@@ -830,9 +835,9 @@ func TestGatewayReusesExistingBranchWorktreeRecordWhenRecreatingWorktree(t *test
 	if worktree.WorktreePath == fixture.repoPath {
 		t.Fatalf("CreateWorktree().WorktreePath = repo path %q, want separate worktree", fixture.repoPath)
 	}
-	stored, err := fixture.repos.Worktrees.GetByBranch(ctx, fixture.projectID, "feature/fixer")
+	stored, err := fixture.repos.Worktrees.GetLiveByCheckout(ctx, fixture.projectID, checkoutKey)
 	if err != nil {
-		t.Fatalf("GetByBranch() error = %v", err)
+		t.Fatalf("GetLiveByCheckout() error = %v", err)
 	}
 	if stored == nil || stored.ID != "existing-record" {
 		t.Fatalf("stored worktree = %#v, want ID existing-record", stored)

@@ -5,7 +5,9 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -291,13 +293,19 @@ type WorktreeRecord struct {
 	CreatedAt    string
 	UpdatedAt    string
 	CleanedAt    *string
+	// CheckoutKey identifies WHICH managed checkout this row is, independently
+	// of its generation: the generation-1 directory name. Branch is not that
+	// identity — one project can hold an attached planner checkout and a
+	// detached PR checkout of the same branch at the same time, so keying rows
+	// by branch collapses two distinct checkouts into one row.
+	CheckoutKey string
 	// Generation identifies one daemon's claim on this checkout. It is carried
 	// in the directory name (see git.BuildWorktreeDirectoryName) so that a
 	// retired generation and its successor cannot address the same files.
 	Generation int64
 	// RetiredAt is set when the daemon gives up on this generation without
 	// being able to prove the previous writer is gone. A retired row is
-	// history: it is never restored, pushed from, or matched by GetByBranch.
+	// history: it is never restored, pushed from, or matched by a live lookup.
 	RetiredAt *string
 }
 
@@ -2604,8 +2612,8 @@ func (r *QueueRepository) CancelActiveByLoopExcept(ctx context.Context, loopID, 
 
 func (r *WorktreesRepository) Upsert(ctx context.Context, record WorktreeRecord) error {
 	_, err := r.q.ExecContext(ctx, `
-		INSERT INTO worktrees (id, project_id, repo_path, worktree_path, branch, base_branch, status, head_sha, metadata_json, created_at, updated_at, cleaned_at, generation, retired_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO worktrees (id, project_id, repo_path, worktree_path, branch, base_branch, status, head_sha, metadata_json, created_at, updated_at, cleaned_at, generation, retired_at, checkout_key)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			project_id=excluded.project_id,
 			repo_path=excluded.repo_path,
@@ -2618,8 +2626,9 @@ func (r *WorktreesRepository) Upsert(ctx context.Context, record WorktreeRecord)
 			updated_at=excluded.updated_at,
 			cleaned_at=excluded.cleaned_at,
 			generation=excluded.generation,
-			retired_at=excluded.retired_at
-	`, record.ID, record.ProjectID, record.RepoPath, record.WorktreePath, record.Branch, record.BaseBranch, record.Status, record.HeadSHA, record.MetadataJSON, record.CreatedAt, record.UpdatedAt, record.CleanedAt, normalizeWorktreeGeneration(record.Generation), record.RetiredAt)
+			retired_at=excluded.retired_at,
+			checkout_key=excluded.checkout_key
+	`, record.ID, record.ProjectID, record.RepoPath, record.WorktreePath, record.Branch, record.BaseBranch, record.Status, record.HeadSHA, record.MetadataJSON, record.CreatedAt, record.UpdatedAt, record.CleanedAt, normalizeWorktreeGeneration(record.Generation), record.RetiredAt, normalizeCheckoutKey(record))
 	if err != nil {
 		return fmt.Errorf("upsert worktree: %w", err)
 	}
@@ -2656,14 +2665,35 @@ func (r *WorktreesRepository) GetByBranch(ctx context.Context, projectID, branch
 	return &record, nil
 }
 
-// NextGenerationForBranch returns the generation the next claim of this branch's
-// checkout must use: one past the highest generation ever recorded, live or
-// retired. Never returns less than 1.
-func (r *WorktreesRepository) NextGenerationForBranch(ctx context.Context, projectID, branch string) (int64, error) {
+// GetLiveByCheckout returns the live generation of one managed checkout.
+// Retired generations are deliberately invisible: recovery retires a row
+// precisely so that no later claim can restore, push from, or clean it.
+func (r *WorktreesRepository) GetLiveByCheckout(ctx context.Context, projectID, checkoutKey string) (*WorktreeRecord, error) {
+	if strings.TrimSpace(checkoutKey) == "" {
+		return nil, nil
+	}
+	row := r.q.QueryRowContext(ctx, `SELECT * FROM worktrees WHERE project_id = ? AND checkout_key = ? AND retired_at IS NULL LIMIT 1`, projectID, checkoutKey)
+	record, err := scanWorktree(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get live worktree by checkout: %w", err)
+	}
+	return &record, nil
+}
+
+// NextGenerationForCheckout returns the generation the next claim of this
+// checkout must use: one past the highest generation ever recorded for it, live
+// or retired. Never returns less than 1.
+func (r *WorktreesRepository) NextGenerationForCheckout(ctx context.Context, projectID, checkoutKey string) (int64, error) {
+	if strings.TrimSpace(checkoutKey) == "" {
+		return 1, nil
+	}
 	var highest sql.NullInt64
-	err := r.q.QueryRowContext(ctx, `SELECT MAX(generation) FROM worktrees WHERE project_id = ? AND branch = ?`, projectID, branch).Scan(&highest)
+	err := r.q.QueryRowContext(ctx, `SELECT MAX(generation) FROM worktrees WHERE project_id = ? AND checkout_key = ?`, projectID, checkoutKey).Scan(&highest)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return 0, fmt.Errorf("read highest worktree generation for branch: %w", err)
+		return 0, fmt.Errorf("read highest worktree generation for checkout: %w", err)
 	}
 	if !highest.Valid || highest.Int64 < 1 {
 		return 1, nil
@@ -2707,6 +2737,41 @@ func normalizeWorktreeGeneration(generation int64) int64 {
 		return 1
 	}
 	return generation
+}
+
+// WorktreeGenerationSuffix separates a checkout's identity from the generation
+// in its directory name: `<checkout key>+g<N>`, with generation 1 written
+// without a suffix so no existing checkout moves on disk.
+//
+// The separator is '+' on purpose. Directory names are produced by sanitizing a
+// branch or project id down to [A-Za-z0-9._-], so no generation-1 name can ever
+// contain a '+'. That makes the split below total: `feature+g2` is generation 2
+// of `feature` and nothing else, where a `-g2` suffix would also be a legal
+// generation-1 name for the branch `feature-g2`.
+const WorktreeGenerationSuffix = "+g"
+
+// CheckoutKeyFromPath recovers the generation-independent checkout identity from
+// a managed worktree directory.
+func CheckoutKeyFromPath(worktreePath string) string {
+	base := filepath.Base(strings.TrimSpace(worktreePath))
+	if base == "." || base == string(filepath.Separator) || base == "" {
+		return ""
+	}
+	index := strings.LastIndex(base, WorktreeGenerationSuffix)
+	if index <= 0 {
+		return base
+	}
+	if _, err := strconv.ParseInt(base[index+len(WorktreeGenerationSuffix):], 10, 64); err != nil {
+		return base
+	}
+	return base[:index]
+}
+
+func normalizeCheckoutKey(record WorktreeRecord) string {
+	if key := strings.TrimSpace(record.CheckoutKey); key != "" {
+		return key
+	}
+	return CheckoutKeyFromPath(record.WorktreePath)
 }
 
 func (r *WorktreesRepository) ListByProject(ctx context.Context, projectID string) ([]WorktreeRecord, error) {
@@ -3423,18 +3488,23 @@ func scanWorktree(row interface{ Scan(...any) error }) (WorktreeRecord, error) {
 		cleanedAt    sql.NullString
 		generation   sql.NullInt64
 		retiredAt    sql.NullString
+		checkoutKey  sql.NullString
 	)
 
-	err := row.Scan(&record.ID, &record.ProjectID, &record.RepoPath, &record.WorktreePath, &record.Branch, &baseBranch, &record.Status, &headSHA, &metadataJSON, &record.CreatedAt, &record.UpdatedAt, &cleanedAt, &generation, &retiredAt)
+	err := row.Scan(&record.ID, &record.ProjectID, &record.RepoPath, &record.WorktreePath, &record.Branch, &baseBranch, &record.Status, &headSHA, &metadataJSON, &record.CreatedAt, &record.UpdatedAt, &cleanedAt, &generation, &retiredAt, &checkoutKey)
 	if err != nil {
 		return WorktreeRecord{}, err
 	}
+	record.CheckoutKey = strings.TrimSpace(checkoutKey.String)
 	record.BaseBranch = nullableString(baseBranch)
 	record.HeadSHA = nullableString(headSHA)
 	record.MetadataJSON = nullableString(metadataJSON)
 	record.CleanedAt = nullableString(cleanedAt)
 	record.Generation = normalizeWorktreeGeneration(generation.Int64)
 	record.RetiredAt = nullableString(retiredAt)
+	if record.CheckoutKey == "" {
+		record.CheckoutKey = CheckoutKeyFromPath(record.WorktreePath)
+	}
 
 	return record, nil
 }

@@ -69,6 +69,9 @@ type RestoreWorktreeInput struct {
 	// Generation is the claim generation the caller already resolved. Zero
 	// means "resolve it from storage" (direct RestoreWorktree callers).
 	Generation int64
+	// CheckoutKey is the checkout identity the caller already resolved. Empty
+	// means "derive it from ExpectedWorktreePath".
+	CheckoutKey string
 }
 
 type PrepareWorktreeInput struct {
@@ -112,6 +115,10 @@ type CommitResult struct {
 }
 
 type CleanupWorktreeInput struct {
+	// WorktreeID names the exact generation being reclaimed. Callers that read
+	// a row to decide on cleanup must set it: branch is ambiguous once a
+	// retired generation and its live successor share one.
+	WorktreeID        string
 	ProjectID         string
 	RepoPath          string
 	WorktreeRoot      string
@@ -229,9 +236,10 @@ func (g *Gateway) CreateWorktree(ctx context.Context, input CreateWorktreeInput)
 	}
 
 	// Generation is resolved before the path is formed: a retired generation is
-	// invisible to GetByBranch, so this claim allocates the next one and lands
-	// in a directory the previous writer cannot reach.
-	generation, err := g.LiveGenerationForBranch(ctx, input.ProjectID, input.Branch)
+	// invisible to the live-checkout lookup, so this claim allocates the next
+	// one and lands in a directory the previous writer cannot reach.
+	checkoutKey := checkoutKeyForInput(input)
+	generation, err := g.LiveGenerationForCheckout(ctx, input.ProjectID, checkoutKey)
 	if err != nil {
 		return storage.WorktreeRecord{}, err
 	}
@@ -249,6 +257,7 @@ func (g *Gateway) CreateWorktree(ctx context.Context, input CreateWorktreeInput)
 		CheckoutMode:         checkoutMode,
 		ExpectedWorktreePath: worktreePath,
 		Generation:           generation,
+		CheckoutKey:          checkoutKey,
 	})
 	if err != nil {
 		return storage.WorktreeRecord{}, err
@@ -266,19 +275,23 @@ func (g *Gateway) CreateWorktree(ctx context.Context, input CreateWorktreeInput)
 			return storage.WorktreeRecord{}, err
 		}
 	} else {
-		branchExists, err := g.branchExists(ctx, input.RepoPath, input.Branch)
+		// A generation past the first checks out its own ref, so a retired
+		// generation that is still committing cannot advance the ref this one
+		// resolves HEAD through.
+		localBranch := attachedBranchRefForGeneration(input.Branch, generation)
+		branchExists, err := g.branchExists(ctx, input.RepoPath, localBranch)
 		if err != nil {
 			return storage.WorktreeRecord{}, err
 		}
 		args := []string{"worktree", "add", "--force"}
 		if branchExists {
-			args = append(args, worktreePath, input.Branch)
+			args = append(args, worktreePath, localBranch)
 		} else {
 			startPoint, err := g.resolveAttachedStartPoint(ctx, input.RepoPath, input.Branch, input.BaseBranch)
 			if err != nil {
 				return storage.WorktreeRecord{}, err
 			}
-			args = append(args, "-b", input.Branch, worktreePath, startPoint)
+			args = append(args, "-b", localBranch, worktreePath, startPoint)
 		}
 		if err := g.runGit(ctx, input.RepoPath, nil, args...); err != nil {
 			return storage.WorktreeRecord{}, err
@@ -304,9 +317,9 @@ func (g *Gateway) CreateWorktree(ctx context.Context, input CreateWorktreeInput)
 	nowISO := g.now().UTC().Format(javaScriptISOStringLayout)
 	var existingRecord *storage.WorktreeRecord
 	if g.repos != nil {
-		existingRecord, err = g.repos.Worktrees.GetByBranch(ctx, input.ProjectID, input.Branch)
+		existingRecord, err = g.repos.Worktrees.GetLiveByCheckout(ctx, input.ProjectID, checkoutKey)
 		if err != nil {
-			return storage.WorktreeRecord{}, fmt.Errorf("get existing worktree by branch: %w", err)
+			return storage.WorktreeRecord{}, fmt.Errorf("get existing worktree by checkout: %w", err)
 		}
 	}
 
@@ -325,6 +338,7 @@ func (g *Gateway) CreateWorktree(ctx context.Context, input CreateWorktreeInput)
 		UpdatedAt:    nowISO,
 		CleanedAt:    nil,
 		Generation:   generation,
+		CheckoutKey:  checkoutKey,
 	}
 
 	if g.repos != nil {
@@ -378,26 +392,31 @@ func (g *Gateway) DetectOriginRemote(ctx context.Context, repoPath string) (Orig
 func (g *Gateway) RestoreWorktree(ctx context.Context, input RestoreWorktreeInput) (*storage.WorktreeRecord, error) {
 	checkoutMode := normalizeCheckoutMode(input.CheckoutMode)
 
+	checkoutKey := strings.TrimSpace(input.CheckoutKey)
+	if checkoutKey == "" {
+		checkoutKey = storage.CheckoutKeyFromPath(input.ExpectedWorktreePath)
+	}
 	generation := input.Generation
 	if generation < 1 {
-		resolved, err := g.LiveGenerationForBranch(ctx, input.ProjectID, input.Branch)
+		resolved, err := g.LiveGenerationForCheckout(ctx, input.ProjectID, checkoutKey)
 		if err != nil {
 			return nil, err
 		}
 		generation = resolved
 	}
+	attachedBranch := attachedBranchRefForGeneration(input.Branch, generation)
 	// Directories belonging to retired generations are never adopted. Path
 	// equality is exactly what retirement revokes, so `git worktree list`
 	// discovery must not walk back into one.
-	retiredPaths, err := g.retiredWorktreePaths(ctx, input.ProjectID)
+	retiredPaths, err := g.retiredWorktreePaths(ctx)
 	if err != nil {
 		return nil, err
 	}
 
 	if g.repos != nil {
-		stored, err := g.repos.Worktrees.GetByBranch(ctx, input.ProjectID, input.Branch)
+		stored, err := g.liveWorktreeRecord(ctx, input.ProjectID, checkoutKey, input.Branch)
 		if err != nil {
-			return nil, fmt.Errorf("get stored worktree by branch: %w", err)
+			return nil, err
 		}
 		if stored != nil && stored.Status != "cleaned" && normalizeComparablePath(stored.RepoPath) == normalizeComparablePath(input.RepoPath) && worktreesafety.IsSafe(worktreesafety.CheckInput{WorktreePath: stored.WorktreePath, RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot}) {
 			storedHealthy, err := g.isHealthyWorktree(ctx, stored.WorktreePath)
@@ -407,7 +426,7 @@ func (g *Gateway) RestoreWorktree(ctx context.Context, input RestoreWorktreeInpu
 			if !storedHealthy {
 				g.tryRemoveWorktree(ctx, input.RepoPath, stored.WorktreePath)
 			} else {
-				storedCheckoutMatches, err := g.matchesRestoreCheckoutMode(ctx, stored.WorktreePath, checkoutMode, input.Branch)
+				storedCheckoutMatches, err := g.matchesRestoreCheckoutMode(ctx, stored.WorktreePath, checkoutMode, attachedBranchRefForGeneration(input.Branch, stored.Generation))
 				if err != nil {
 					return nil, err
 				}
@@ -431,7 +450,7 @@ func (g *Gateway) RestoreWorktree(ctx context.Context, input RestoreWorktreeInpu
 					}
 					return &restored, nil
 				}
-				shouldReplace, err := g.shouldReplaceStoredWorktreeOnRestoreMismatch(ctx, stored.WorktreePath, checkoutMode, input.Branch, input.ExpectedWorktreePath)
+				shouldReplace, err := g.shouldReplaceStoredWorktreeOnRestoreMismatch(ctx, stored.WorktreePath, checkoutMode, attachedBranchRefForGeneration(input.Branch, stored.Generation), input.ExpectedWorktreePath)
 				if err != nil {
 					return nil, err
 				}
@@ -461,7 +480,7 @@ func (g *Gateway) RestoreWorktree(ctx context.Context, input RestoreWorktreeInpu
 			if normalizeComparablePath(candidate.Path) != normalizeComparablePath(expectedPath) {
 				continue
 			}
-		} else if candidate.Branch != input.Branch {
+		} else if candidate.Branch != attachedBranch {
 			continue
 		}
 		if !worktreesafety.IsSafe(worktreesafety.CheckInput{WorktreePath: candidate.Path, RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot}) {
@@ -484,7 +503,7 @@ func (g *Gateway) RestoreWorktree(ctx context.Context, input RestoreWorktreeInpu
 		return nil, nil
 	}
 
-	checkoutMatches, err := g.matchesRestoreCheckoutMode(ctx, match.Path, checkoutMode, input.Branch)
+	checkoutMatches, err := g.matchesRestoreCheckoutMode(ctx, match.Path, checkoutMode, attachedBranch)
 	if err != nil {
 		return nil, err
 	}
@@ -508,11 +527,12 @@ func (g *Gateway) RestoreWorktree(ctx context.Context, input RestoreWorktreeInpu
 		UpdatedAt:    nowISO,
 		CleanedAt:    nil,
 		Generation:   generation,
+		CheckoutKey:  checkoutKey,
 	}
 	if g.repos != nil {
-		existing, err := g.repos.Worktrees.GetByBranch(ctx, input.ProjectID, input.Branch)
+		existing, err := g.liveWorktreeRecord(ctx, input.ProjectID, checkoutKey, input.Branch)
 		if err != nil {
-			return nil, fmt.Errorf("get existing restored worktree by branch: %w", err)
+			return nil, err
 		}
 		if existing != nil {
 			record = *existing
@@ -529,6 +549,9 @@ func (g *Gateway) RestoreWorktree(ctx context.Context, input RestoreWorktreeInpu
 		}
 		if record.Branch == "" {
 			record.Branch = input.Branch
+		}
+		if record.CheckoutKey == "" {
+			record.CheckoutKey = storage.CheckoutKeyFromPath(match.Path)
 		}
 		if err := g.repos.Worktrees.Upsert(ctx, record); err != nil {
 			return nil, fmt.Errorf("upsert discovered worktree record: %w", err)
@@ -566,9 +589,14 @@ func (g *Gateway) CleanupWorktree(ctx context.Context, input CleanupWorktreeInpu
 		return nil
 	}
 
-	existing, err := g.repos.Worktrees.GetByBranch(ctx, input.ProjectID, input.Branch)
+	// The row to mark cleaned is the row whose directory we just removed, which
+	// is not resolvable from the branch: a retired generation shares its branch
+	// with the live successor, and a live lookup deliberately returns the
+	// successor. Callers that know the row carry its ID; otherwise fall back to
+	// the checkout the path itself names.
+	existing, err := g.cleanupTargetRecord(ctx, input)
 	if err != nil {
-		return fmt.Errorf("get worktree before cleanup update: %w", err)
+		return err
 	}
 	if existing == nil {
 		return nil
@@ -584,6 +612,21 @@ func (g *Gateway) CleanupWorktree(ctx context.Context, input CleanupWorktreeInpu
 	}
 
 	return nil
+}
+
+func (g *Gateway) cleanupTargetRecord(ctx context.Context, input CleanupWorktreeInput) (*storage.WorktreeRecord, error) {
+	if id := strings.TrimSpace(input.WorktreeID); id != "" {
+		record, err := g.repos.Worktrees.GetByID(ctx, id)
+		if err != nil {
+			return nil, fmt.Errorf("get worktree by id before cleanup update: %w", err)
+		}
+		return record, nil
+	}
+	record, err := g.liveWorktreeRecord(ctx, input.ProjectID, storage.CheckoutKeyFromPath(input.WorktreePath), input.Branch)
+	if err != nil {
+		return nil, fmt.Errorf("get worktree before cleanup update: %w", err)
+	}
+	return record, nil
 }
 
 func (g *Gateway) WorktreeClean(ctx context.Context, worktreePath string) (bool, error) {
@@ -687,18 +730,16 @@ func (g *Gateway) Push(ctx context.Context, input PushInput) error {
 	expectedRemoteHeadSHA := strings.TrimSpace(input.ExpectedRemoteHeadSHA)
 	derivedLease := false
 	if expectedRemoteHeadSHA == "" {
-		branchExistsRemotely, err := g.remoteBranchExists(ctx, input.WorktreePath, remote, input.Branch)
+		// Asked of the remote, not of the local tracking refs: a branch another
+		// actor created since our last fetch has no refs/remotes/ entry here,
+		// and treating that as "does not exist remotely" is what would drop us
+		// onto the unleased creation path against a branch that does exist.
+		// An empty answer means the branch is genuinely absent.
+		resolved, err := g.getRemoteHeadSHA(ctx, input.WorktreePath, remote, input.Branch)
 		if err != nil {
 			return err
 		}
-		if branchExistsRemotely {
-			resolved, err := g.getRemoteHeadSHA(ctx, input.WorktreePath, remote, input.Branch)
-			if err != nil {
-				return err
-			}
-			if strings.TrimSpace(resolved) == "" {
-				return fmt.Errorf("refusing unleased push to existing remote branch %s: remote head could not be resolved", input.Branch)
-			}
+		if strings.TrimSpace(resolved) != "" {
 			expectedRemoteHeadSHA = strings.TrimSpace(resolved)
 			derivedLease = true
 			// A remote head we do not even have locally is a commit we cannot
@@ -1404,18 +1445,46 @@ func isRetryableFetchRefLockRace(args []string, err error) bool {
 //
 // Generation 1 keeps the historical name so no existing checkout moves on disk.
 func buildWorktreeDirectoryName(input CreateWorktreeInput, generation int64) string {
-	base := sanitizeBranchName(input.Branch)
-	if input.PRNumber != 0 {
-		if normalizeCheckoutMode(input.CheckoutMode) == CheckoutModeDetached {
-			base = fmt.Sprintf("looper-fix-%s-pr-%d-detached", sanitizeBranchName(input.ProjectID), input.PRNumber)
-		} else {
-			base = fmt.Sprintf("looper-fix-%s-pr-%d", sanitizeBranchName(input.ProjectID), input.PRNumber)
-		}
-	}
+	base := checkoutKeyForInput(input)
 	if generation > 1 {
-		return fmt.Sprintf("%s-g%d", base, generation)
+		return base + storage.WorktreeGenerationSuffix + strconv.FormatInt(generation, 10)
 	}
 	return base
+}
+
+// checkoutKeyForInput is the generation-1 directory name: the identity of the
+// managed checkout itself, independent of which generation currently owns it.
+// It is what generations are allocated against and what the live-row unique
+// index is keyed by, because a branch is not a checkout — one project can hold
+// an attached planner checkout and a detached PR checkout of the same branch.
+func checkoutKeyForInput(input CreateWorktreeInput) string {
+	if input.PRNumber != 0 {
+		if normalizeCheckoutMode(input.CheckoutMode) == CheckoutModeDetached {
+			return fmt.Sprintf("looper-fix-%s-pr-%d-detached", sanitizeBranchName(input.ProjectID), input.PRNumber)
+		}
+		return fmt.Sprintf("looper-fix-%s-pr-%d", sanitizeBranchName(input.ProjectID), input.PRNumber)
+	}
+	return sanitizeBranchName(input.Branch)
+}
+
+// attachedBranchRefForGeneration is the local branch an attached checkout of
+// this generation is on.
+//
+// Distinct directories are not enough for an attached checkout. `git worktree
+// add --force` lets two worktrees hold the same branch, so a retired generation
+// that is still alive keeps committing to the SHARED ref — and the live
+// generation, whose HEAD is a symref to that same ref, would silently resolve to
+// the stale commit and could publish it. Path divergence contains the files; ref
+// divergence is what contains the history.
+//
+// Generation 1 stays on the branch itself, so nothing about today's checkouts
+// changes. The stored record's Branch is always the logical branch: this ref is
+// local plumbing, and Push still writes to refs/heads/<branch> on the remote.
+func attachedBranchRefForGeneration(branch string, generation int64) string {
+	if generation <= 1 {
+		return branch
+	}
+	return fmt.Sprintf("looper-gen/%d/%s", generation, branch)
 }
 
 // DetachedPRWorktreePath returns the managed shared detached worktree path that
@@ -1438,7 +1507,13 @@ func DetachedPRWorktreePath(worktreeRoot, projectID string, prNumber int64, gene
 
 // retiredWorktreePaths indexes the directories of retired generations so that
 // discovery and cleanup can refuse to touch them.
-func (g *Gateway) retiredWorktreePaths(ctx context.Context, projectID string) (map[string]struct{}, error) {
+//
+// Deliberately not filtered by project. Retirement revokes the filesystem path
+// itself, and `git worktree list` is repository-wide: two projects can share a
+// repo or a worktree root, and an attached checkout without a PR is named from
+// the branch alone. Whichever project row recorded the retirement, the stale
+// writer is in that directory.
+func (g *Gateway) retiredWorktreePaths(ctx context.Context) (map[string]struct{}, error) {
 	if g.repos == nil || g.repos.Worktrees == nil {
 		return nil, nil
 	}
@@ -1448,12 +1523,31 @@ func (g *Gateway) retiredWorktreePaths(ctx context.Context, projectID string) (m
 	}
 	paths := make(map[string]struct{}, len(retired))
 	for _, record := range retired {
-		if projectID != "" && record.ProjectID != projectID {
-			continue
-		}
 		paths[normalizeComparablePath(record.WorktreePath)] = struct{}{}
 	}
 	return paths, nil
+}
+
+// liveWorktreeRecord resolves the live row for one managed checkout. It falls
+// back to the branch when the caller could not name a checkout — direct
+// RestoreWorktree callers that pass no expected path — which is the historical
+// behaviour for the single-checkout case.
+func (g *Gateway) liveWorktreeRecord(ctx context.Context, projectID, checkoutKey, branch string) (*storage.WorktreeRecord, error) {
+	if g.repos == nil || g.repos.Worktrees == nil {
+		return nil, nil
+	}
+	if strings.TrimSpace(checkoutKey) != "" {
+		record, err := g.repos.Worktrees.GetLiveByCheckout(ctx, projectID, checkoutKey)
+		if err != nil {
+			return nil, fmt.Errorf("get live worktree by checkout: %w", err)
+		}
+		return record, nil
+	}
+	record, err := g.repos.Worktrees.GetByBranch(ctx, projectID, branch)
+	if err != nil {
+		return nil, fmt.Errorf("get live worktree by branch: %w", err)
+	}
+	return record, nil
 }
 
 // DetachedPRWorktreePathCandidates returns every generation directory that
@@ -1466,7 +1560,7 @@ func DetachedPRWorktreePathCandidates(worktreeRoot, projectID string, prNumber i
 	if base == "" {
 		return nil
 	}
-	prefix := filepath.Base(base) + "-g"
+	prefix := filepath.Base(base) + storage.WorktreeGenerationSuffix
 	type candidate struct {
 		path       string
 		generation int64
@@ -1494,16 +1588,16 @@ func DetachedPRWorktreePathCandidates(worktreeRoot, projectID string, prNumber i
 	return paths
 }
 
-// LiveGenerationForBranch resolves the generation the next claim of this
-// branch's checkout must use. A live (non-retired) row keeps its own
-// generation; otherwise the next claim allocates one past the highest
-// generation ever recorded for the branch. Gateways without storage always
-// report generation 1, which is the historical path.
-func (g *Gateway) LiveGenerationForBranch(ctx context.Context, projectID, branch string) (int64, error) {
-	if g.repos == nil || g.repos.Worktrees == nil {
+// LiveGenerationForCheckout resolves the generation the next claim of this
+// checkout must use. A live (non-retired) row keeps its own generation;
+// otherwise the next claim allocates one past the highest generation ever
+// recorded for that checkout. Gateways without storage always report generation
+// 1, which is the historical path.
+func (g *Gateway) LiveGenerationForCheckout(ctx context.Context, projectID, checkoutKey string) (int64, error) {
+	if g.repos == nil || g.repos.Worktrees == nil || strings.TrimSpace(checkoutKey) == "" {
 		return 1, nil
 	}
-	live, err := g.repos.Worktrees.GetByBranch(ctx, projectID, branch)
+	live, err := g.repos.Worktrees.GetLiveByCheckout(ctx, projectID, checkoutKey)
 	if err != nil {
 		return 0, err
 	}
@@ -1513,7 +1607,7 @@ func (g *Gateway) LiveGenerationForBranch(ctx context.Context, projectID, branch
 		}
 		return live.Generation, nil
 	}
-	return g.repos.Worktrees.NextGenerationForBranch(ctx, projectID, branch)
+	return g.repos.Worktrees.NextGenerationForCheckout(ctx, projectID, checkoutKey)
 }
 
 func parseGitHubRepoFromRemoteURL(remoteURL string) string {

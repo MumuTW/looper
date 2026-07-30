@@ -108,6 +108,9 @@ func Run(ctx context.Context, options Options) (Result, error) {
 			result.Summary.Eligible++
 			if !options.DryRun {
 				if err := options.Git.CleanupWorktree(ctx, gitinfra.CleanupWorktreeInput{
+					// The exact generation being reclaimed. Its branch resolves
+					// to the live successor, which must not be marked cleaned.
+					WorktreeID:        decision.Worktree.ID,
 					ProjectID:         decision.Worktree.ProjectID,
 					RepoPath:          decision.Worktree.RepoPath,
 					WorktreeRoot:      worktreeRoot,

@@ -885,12 +885,18 @@ func (x *execution) run(ctx context.Context) {
 		inactivityTimer = time.NewTicker(interval)
 		defer inactivityTimer.Stop()
 	}
+	// The claim lease is renewed from here, not from output: this loop runs for
+	// exactly as long as the agent process does, which is what the lease means.
+	leaseTicker := time.NewTicker(claimLeaseRenewalInterval)
+	defer leaseTicker.Stop()
 
 	waiting := true
 	for waiting {
 		select {
 		case waitErr = <-waitCh:
 			waiting = false
+		case <-leaseTicker.C:
+			x.renewClaimLease()
 		case <-timeoutTimer:
 			timeoutTimer = nil
 			select {
@@ -1270,6 +1276,10 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 		idleTicker     *time.Ticker
 		termDelivered  bool
 	)
+	// The claim lease is renewed from here, not from output: this loop runs for
+	// exactly as long as the agent process does, which is what the lease means.
+	leaseTicker := time.NewTicker(claimLeaseRenewalInterval)
+	defer leaseTicker.Stop()
 	if x.timeout > 0 {
 		timeoutTimer = time.After(x.timeout)
 	}
@@ -1309,6 +1319,8 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 				killReason = fmt.Sprintf("agent max runtime timed out after %s", x.timeout)
 			}
 			terminate()
+		case <-leaseTicker.C:
+			x.renewClaimLease()
 		case <-tickerChan(idleTicker):
 			if timedOut || killed || x.timeSinceLastOutput() < x.heartbeatTimeout {
 				continue
@@ -1553,11 +1565,31 @@ func (x *execution) bumpRunHeartbeat(nowISO string) {
 	// here could resurrect stale run state captured before a concurrent writer,
 	// and an out-of-order heartbeat must not move liveness evidence backward.
 	_ = x.executor.repos.Runs.TouchHeartbeat(ctx, x.input.RunID, nowISO)
-	// The heartbeat and the claim lease are the same fact, so they are written
-	// together. Without this the lease expires mid-run and "expired lease"
-	// carries no information about whether the claim is still being worked.
-	expiresAt := eventlog.FormatJavaScriptISOString(x.executor.now().UTC().Add(storage.ClaimLeaseRenewalTTL))
-	_, _ = x.executor.repos.RefreshClaimLeaseForRun(ctx, x.input.RunID, expiresAt, nowISO)
+	x.renewClaimLease()
+}
+
+// claimLeaseRenewalInterval keeps a comfortable margin inside the lease TTL, so
+// a single slow or failed write does not expire a live claim. It is a var only
+// so a test can watch a silent execution renew without waiting minutes.
+var claimLeaseRenewalInterval = storage.ClaimLeaseRenewalTTL / 3
+
+// renewClaimLease extends the queue claim lease that authorizes this run.
+//
+// Output is not the liveness signal. An agent that is legitimately silent — the
+// configured role idle timeout can exceed the lease TTL — is still working, and
+// losing its claim would let another owner acquire the same target and overlap
+// with it. The supervisor loop in Start renews on a timer for exactly as long as
+// the process it is waiting on exists, which is the fact the lease should carry;
+// a silent agent that has actually stopped making progress is still killed by
+// its own idle timeout, not by lease expiry.
+func (x *execution) renewClaimLease() {
+	if x == nil || x.input.RunID == "" || x.executor == nil || x.executor.repos == nil {
+		return
+	}
+	now := x.executor.now().UTC()
+	nowISO := eventlog.FormatJavaScriptISOString(now)
+	expiresAt := eventlog.FormatJavaScriptISOString(now.Add(storage.ClaimLeaseRenewalTTL))
+	_, _ = x.executor.repos.RefreshClaimLeaseForRun(context.Background(), x.input.RunID, expiresAt, nowISO)
 }
 
 // persistStatus writes a live (or initial) observation. One ordered writer per

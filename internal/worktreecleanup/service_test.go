@@ -279,6 +279,70 @@ func (f *cleanupFixture) queue(id, loopID, status string, updatedAt time.Time) {
 	}
 }
 
+// Reclaiming a retired generation while its successor is live is the lifecycle
+// the fence creates and the one that can leak. Two things have to hold:
+//
+//   - the retired row is not held hostage by the live loop. Loop metadata often
+//     names only a branch, which both generations share; treating that as a
+//     protected reference keeps the retired directory forever.
+//   - the row marked cleaned is the retired one. Its branch resolves to the live
+//     successor, so a branch-keyed write would retire nothing and mark the
+//     generation currently being worked on as cleaned.
+func TestRunReclaimsARetiredGenerationWhileItsSuccessorIsLive(t *testing.T) {
+	t.Parallel()
+
+	fixture := newFixture(t)
+	old := fixture.now.Add(-10 * 24 * time.Hour)
+	quiet := fixture.now.Add(-24 * time.Hour)
+
+	fixture.worktree("wt_retired", "feature/worker", old)
+	fixture.retire("wt_retired", old)
+	fixture.worktree("wt_live", "feature/worker", fixture.now)
+	// A planner-shaped loop: its metadata names the branch only, so it matches
+	// both generations.
+	fixture.loopWithMetadata("project_1", "loop_live", "running", `{"branch":"feature/worker"}`, fixture.now)
+	fixture.mkdirWorktrees("wt_retired", "wt_live")
+	fixture.setModTime("wt_retired", quiet)
+
+	git := &fakeCleanupGit{clean: true}
+	result, err := Run(context.Background(), Options{
+		Config: fixture.config(),
+		Repos:  fixture.repos,
+		Git:    git,
+		DryRun: false,
+		Now:    func() time.Time { return fixture.now },
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	assertCandidate(t, result, "wt_retired", "clean", "terminal_clean")
+	assertCandidate(t, result, "wt_live", "skip", "referenced by protected loop status running")
+	if len(git.cleaned) != 1 {
+		t.Fatalf("cleaned = %#v, want exactly the retired generation", git.cleaned)
+	}
+	if git.cleaned[0].WorktreeID != "wt_retired" {
+		t.Fatalf("cleaned[0].WorktreeID = %q, want wt_retired so the live successor is not marked cleaned", git.cleaned[0].WorktreeID)
+	}
+}
+
+// A retired generation whose directory still looks active is held, not deleted.
+func TestPlanHoldsARetiredGenerationThatStillLooksActive(t *testing.T) {
+	t.Parallel()
+
+	fixture := newFixture(t)
+	fixture.worktree("wt_retired", "feature/worker", fixture.now.Add(-10*24*time.Hour))
+	fixture.retire("wt_retired", fixture.now.Add(-10*24*time.Hour))
+	fixture.mkdirWorktrees("wt_retired")
+	fixture.setModTime("wt_retired", fixture.now.Add(-time.Minute))
+
+	result, err := fixture.service().Plan(context.Background())
+	if err != nil {
+		t.Fatalf("Plan() error = %v", err)
+	}
+	assertDecision(t, result, "wt_retired", ActionSkipped, "retired generation still being written to")
+}
+
 func assertDecision(t *testing.T, result PlanResult, worktreeID, action, reason string) {
 	t.Helper()
 	for _, decision := range result.Decisions {
@@ -303,6 +367,21 @@ func assertCandidate(t *testing.T, result Result, worktreeID, action, reason str
 		}
 	}
 	t.Fatalf("missing candidate for %s: %#v", worktreeID, result.Candidates)
+}
+
+func (f *cleanupFixture) retire(id string, retiredAt time.Time) {
+	f.t.Helper()
+	if err := f.repos.Worktrees.Retire(context.Background(), id, iso(retiredAt)); err != nil {
+		f.t.Fatalf("Worktrees.Retire() error = %v", err)
+	}
+}
+
+func (f *cleanupFixture) setModTime(id string, modTime time.Time) {
+	f.t.Helper()
+	path := filepath.Join(f.worktreeRoot, id)
+	if err := os.Chtimes(path, modTime, modTime); err != nil {
+		f.t.Fatalf("Chtimes(%s) error = %v", id, err)
+	}
 }
 
 func (f *cleanupFixture) mkdirWorktrees(ids ...string) {

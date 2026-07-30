@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -62,6 +63,10 @@ type candidateState struct {
 	parseFailed   bool
 	lastUsedAt    time.Time
 	hasLastUsedAt bool
+	// retired marks a generation no daemon owns. Live loops, runs, and queue
+	// items are never about it — they belong to its successor — so it does not
+	// take references from them.
+	retired bool
 }
 
 const (
@@ -69,23 +74,44 @@ const (
 	ActionSkipped    = "skipped"
 
 	// retiredWorktreeQuietPeriod is how long a retired generation's directory
-	// must sit untouched before its disk is reclaimed. If it never goes quiet,
-	// the directory stays and shows up as a skipped decision — noisy, bounded,
-	// and harmless, which is the right failure mode for a disk decision.
+	// must look untouched before its disk is reclaimed. If it never looks
+	// quiet, the directory stays and shows up as a skipped decision — noisy,
+	// bounded, and harmless, which is the right failure mode for a disk
+	// decision.
 	retiredWorktreeQuietPeriod = 6 * time.Hour
 )
 
-// recentlyModified reports whether the directory itself was written to within
-// quietPeriod. An unreadable path counts as quiet: it is already gone.
-func recentlyModified(path string, now time.Time, quietPeriod time.Duration) bool {
+// looksRecentlyModified is drift evidence, not authority.
+//
+// It reads the worktree root and the checkout's git directory. That catches a
+// stale writer creating or removing top-level entries, and any git command it
+// runs (add/commit/status all touch the index). It does NOT catch a writer that
+// only rewrites existing files below a subdirectory, and a full walk is not
+// affordable here — a retired worktree can hold node_modules.
+//
+// That gap is deliberate, and its cost is bounded: reclaiming a directory a
+// stale writer is still using does not weaken containment, it completes it. The
+// live generation is at a different path on a different ref and is unaffected;
+// the only thing lost is the stale writer's own already-abandoned work. The
+// quiet period exists to avoid deleting under an active process for no reason,
+// not to prove one is absent — nothing here proves that, which is the entire
+// premise of #149.
+//
+// An unreadable path counts as quiet: it is already gone.
+func looksRecentlyModified(path string, now time.Time, quietPeriod time.Duration) bool {
 	if strings.TrimSpace(path) == "" {
 		return false
 	}
-	info, err := os.Stat(path)
-	if err != nil {
-		return false
+	for _, candidate := range []string{path, filepath.Join(path, ".git")} {
+		info, err := os.Stat(candidate)
+		if err != nil {
+			continue
+		}
+		if now.Sub(info.ModTime().UTC()) < quietPeriod {
+			return true
+		}
 	}
-	return now.Sub(info.ModTime().UTC()) < quietPeriod
+	return false
 }
 
 func (s *Service) Plan(ctx context.Context) (PlanResult, error) {
@@ -121,12 +147,14 @@ func (s *Service) Plan(ctx context.Context) (PlanResult, error) {
 		state.noteTime(worktree.UpdatedAt)
 		state.noteTime(worktree.CreatedAt)
 		// A retired generation is disk debt, never blocked work: no loop can be
-		// scheduled onto it. Reclaiming it is still a judgment call, because a
-		// writer from the previous daemon may still be there. Recent directory
-		// activity is the observable that says so — deliberately not a PID
-		// probe, which is what #149 removed from the scheduling path and must
-		// not reappear here.
-		if worktree.RetiredAt != nil && recentlyModified(worktree.WorktreePath, now().UTC(), retiredWorktreeQuietPeriod) {
+		// scheduled onto it, and the loops, runs, and queue items that name its
+		// branch are about the live successor. Letting those references block it
+		// would keep it forever, so retirement bypasses them entirely and the
+		// only question left is whether a previous daemon's writer still seems
+		// to be there — deliberately not a PID probe, which is what #149 removed
+		// from the scheduling path and must not reappear here.
+		state.retired = worktree.RetiredAt != nil
+		if state.retired && looksRecentlyModified(worktree.WorktreePath, now().UTC(), retiredWorktreeQuietPeriod) {
 			state.block("retired generation still being written to")
 		}
 		states = append(states, state)
@@ -142,7 +170,7 @@ func (s *Service) Plan(ctx context.Context) (PlanResult, error) {
 		}
 		ref = fillRefFromLoop(ref, loop)
 		for index := range states {
-			if !matchesRef(states[index].worktree, ref) {
+			if states[index].retired || !matchesRef(states[index].worktree, ref) {
 				continue
 			}
 			states[index].references = append(states[index].references, Reference{Kind: "loop", ID: loop.ID, Status: loop.Status})
@@ -177,7 +205,7 @@ func (s *Service) Plan(ctx context.Context) (PlanResult, error) {
 			ref = fillRefFromLoop(ref, loop)
 		}
 		for index := range states {
-			if !matchesRef(states[index].worktree, ref) {
+			if states[index].retired || !matchesRef(states[index].worktree, ref) {
 				continue
 			}
 			states[index].references = append(states[index].references, Reference{Kind: "run", ID: run.ID, Status: run.Status})
@@ -208,7 +236,7 @@ func (s *Service) Plan(ctx context.Context) (PlanResult, error) {
 			ref.ProjectID = *item.ProjectID
 		}
 		for index := range states {
-			if !matchesRef(states[index].worktree, ref) {
+			if states[index].retired || !matchesRef(states[index].worktree, ref) {
 				continue
 			}
 			states[index].references = append(states[index].references, Reference{Kind: "queue", ID: item.ID, Status: item.Status})
@@ -225,7 +253,11 @@ func (s *Service) Plan(ctx context.Context) (PlanResult, error) {
 			lastUsedAt := state.lastUsedAt
 			decision.LastUsedAt = &lastUsedAt
 		}
-		if len(state.references) == 0 {
+		// A retired generation having no references is the expected shape, not a
+		// suspicious one: retirement is itself the record of who owned it. It
+		// must not fall into the orphan opt-in, or bypassing live references
+		// above would trade one permanent leak for another.
+		if len(state.references) == 0 && !state.retired {
 			decision.Orphan = true
 			result.Summary.Orphans++
 			if !s.Config.IncludeOrphans {
@@ -393,6 +425,9 @@ func markProjectParseFailure(states []candidateState, projectID string, referenc
 
 func markParseFailure(states []candidateState, projectID string, ref worktreeRef, reference Reference) {
 	for index := range states {
+		if states[index].retired {
+			continue
+		}
 		if projectID != "" && states[index].worktree.ProjectID != projectID {
 			continue
 		}

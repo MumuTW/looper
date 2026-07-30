@@ -9,6 +9,75 @@ import (
 	"testing"
 )
 
+// Attached checkouts — planner and worker loops — are the production case, and
+// a different path is NOT enough for them on its own. `git worktree add --force`
+// lets two worktrees hold one branch, so a retired generation that is still
+// alive keeps committing to the shared ref, and the live generation's HEAD is a
+// symref to that same ref: it would resolve to the stale commit and could
+// publish it. The fence therefore has to divide the ref as well as the path.
+func TestGatewayRetiredAttachedGenerationCannotMoveTheLiveGenerationsRef(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	fixture.createRemoteRepo(t, "feature/worker")
+	gateway := fixture.gateway()
+
+	first, err := gateway.CreateWorktree(ctx, CreateWorktreeInput{
+		ProjectID:    fixture.projectID,
+		RepoPath:     fixture.repoPath,
+		WorktreeRoot: fixture.worktreeRoot,
+		Branch:       "feature/worker",
+		BaseBranch:   "main",
+	})
+	if err != nil {
+		t.Fatalf("CreateWorktree(first) error = %v", err)
+	}
+	if got := stringsTrimSpace(runGit(t, first.WorktreePath, "rev-parse", "--abbrev-ref", "HEAD")); got != "feature/worker" {
+		t.Fatalf("generation 1 branch = %q, want the branch itself so nothing moves on disk today", got)
+	}
+
+	if err := fixture.repos.Worktrees.Retire(ctx, first.ID, "2026-07-30T12:00:00.000Z"); err != nil {
+		t.Fatalf("Retire() error = %v", err)
+	}
+
+	second, err := gateway.CreateWorktree(ctx, CreateWorktreeInput{
+		ProjectID:    fixture.projectID,
+		RepoPath:     fixture.repoPath,
+		WorktreeRoot: fixture.worktreeRoot,
+		Branch:       "feature/worker",
+		BaseBranch:   "main",
+	})
+	if err != nil {
+		t.Fatalf("CreateWorktree(second) error = %v", err)
+	}
+	if second.Generation != 2 || second.WorktreePath == first.WorktreePath {
+		t.Fatalf("second = %#v, want generation 2 on its own path", second)
+	}
+	// The stored branch stays the logical branch: the generation ref is local
+	// plumbing, and Push still writes refs/heads/feature/worker on the remote.
+	if second.Branch != "feature/worker" {
+		t.Fatalf("second.Branch = %q, want the logical branch", second.Branch)
+	}
+	liveRef := stringsTrimSpace(runGit(t, second.WorktreePath, "rev-parse", "--abbrev-ref", "HEAD"))
+	if liveRef == "feature/worker" {
+		t.Fatal("generation 2 is attached to the same ref as the retired generation; a stale commit there would move it")
+	}
+	liveHeadBefore := stringsTrimSpace(runGit(t, second.WorktreePath, "rev-parse", "HEAD"))
+
+	// The stale generation-1 writer keeps working and commits.
+	writeFile(t, filepath.Join(first.WorktreePath, "stale.txt"), "written after retirement\n")
+	runGit(t, first.WorktreePath, "add", "-A")
+	runGit(t, first.WorktreePath, "-c", "user.email=stale@example.com", "-c", "user.name=stale", "commit", "-m", "stale agent commit")
+	staleCommit := stringsTrimSpace(runGit(t, first.WorktreePath, "rev-parse", "HEAD"))
+
+	// It advanced its own ref and nothing the live generation reads.
+	if got := stringsTrimSpace(runGit(t, second.WorktreePath, "rev-parse", "HEAD")); got != liveHeadBefore {
+		t.Fatalf("live generation HEAD = %q, want it unmoved at %q after the stale commit %q", got, liveHeadBefore, staleCommit)
+	}
+	if clean, err := gateway.WorktreeClean(ctx, second.WorktreePath); err != nil || !clean {
+		t.Fatalf("WorktreeClean(live) = %v, %v, want a clean live generation", clean, err)
+	}
+}
+
 // Retiring a generation is the whole fence: the next claim lands on a different
 // path, so the previous writer's open handles cannot reach it. This is the one
 // assertion that proves containment does not depend on knowing whether the old
@@ -34,7 +103,7 @@ func TestGatewayRetiredGenerationDivergesFromNextClaimPath(t *testing.T) {
 	if first.Generation != 1 {
 		t.Fatalf("first.Generation = %d, want 1", first.Generation)
 	}
-	if strings.Contains(filepath.Base(first.WorktreePath), "-g") {
+	if strings.Contains(filepath.Base(first.WorktreePath), "+g") {
 		t.Fatalf("first.WorktreePath = %q, want generation 1 to keep the historical name", first.WorktreePath)
 	}
 
@@ -67,7 +136,7 @@ func TestGatewayRetiredGenerationDivergesFromNextClaimPath(t *testing.T) {
 	if second.WorktreePath == first.WorktreePath {
 		t.Fatalf("second.WorktreePath = %q, want a path the retired generation cannot reach", second.WorktreePath)
 	}
-	if !strings.HasSuffix(second.WorktreePath, "-g2") {
+	if !strings.HasSuffix(second.WorktreePath, "+g2") {
 		t.Fatalf("second.WorktreePath = %q, want the generation in the directory name", second.WorktreePath)
 	}
 	if _, err := os.Stat(first.WorktreePath); err != nil {

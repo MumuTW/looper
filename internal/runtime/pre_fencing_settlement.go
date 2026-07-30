@@ -134,14 +134,36 @@ func (r *Runtime) settlePreFencingParks(ctx context.Context, repositories *stora
 	return 1, nil
 }
 
-// quarantineParkIsReleasable is true only for a loop this function itself could
-// have parked: paused, with its latest queue item failed by the old quarantine
-// path's own message. Human takeovers, terminal loops, and loops paused for a
-// domain reason all fail at least one of those checks.
+// quarantineParkIsReleasable is true only for a loop this settlement itself
+// could have parked, or has already half-released. Human takeovers, terminal
+// loops, and loops paused for a domain reason all fail at least one check.
 func quarantineParkIsReleasable(loop storage.LoopRecord, latestQueue *storage.QueueItemRecord) bool {
-	if loop.Status != "paused" || latestQueue == nil {
+	if latestQueue == nil || !isQuarantineParkFailure(latestQueue) {
 		return false
 	}
+	switch loop.Status {
+	case "paused":
+		// A decision recorded AFTER the park is someone else's, and it wins.
+		// The old quarantine wrote the loop and failed the queue item at the
+		// same instant, so a loop touched later than its own park carries a
+		// newer intent. An operator /pause is exactly that shape and is
+		// otherwise invisible here: CancelByLoop only rewrites queued/running
+		// items, so it leaves the manual_intervention item and its text
+		// untouched, and the loop reads `paused` either way.
+		return loop.UpdatedAt <= latestQueue.UpdatedAt
+	case "queued":
+		// A partial release: an earlier pass flipped the loop and died before
+		// replacing the queue item. Finishing it is idempotent, and it has to be
+		// finished here — the later recovery pass normalizes a queued loop with
+		// a manual_intervention item straight back out of queued, by which time
+		// this one-shot has already written its durable marker.
+		return true
+	default:
+		return false
+	}
+}
+
+func isQuarantineParkFailure(latestQueue *storage.QueueItemRecord) bool {
 	if strings.TrimSpace(derefString(latestQueue.LastErrorKind)) != "manual_intervention" {
 		return false
 	}

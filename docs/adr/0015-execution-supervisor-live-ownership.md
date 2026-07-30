@@ -295,10 +295,15 @@ it is enforceable without knowing anything about a process.
 time with a 5–10 minute TTL against agent timeouts of up to 7200s, so it expired
 mid-run on every long agent step: `created_at == updated_at` on every held lock.
 It was decorative, and `status='running'` was doing the real double-claim
-prevention. The lease is now renewed from the run's own heartbeat
-(`storage.RefreshClaimLeaseForRun`, called wherever `agent_executions` heartbeats
-are persisted), so “this claim heartbeated recently” is a fact the system can
-act on. Expiry still does not authorize confirmed-dead on its own.
+prevention. The lease is now renewed by `storage.RefreshClaimLeaseForRun` on a
+timer inside the executor's supervisor loop, so it is held for exactly as long
+as the agent process exists and not one tick longer. Renewing on **output**
+instead would tie the lease to chatter: a role whose configured idle timeout
+exceeds the lease TTL can be legitimately silent and working, and losing its lock
+would let `Locks.Acquire` hand the same target to a second owner. A silent agent
+that has actually stalled is still killed by its own idle timeout. “This claim is
+still being worked” is now a fact the system can act on; expiry still does not
+authorize confirmed-dead on its own.
 
 **Birth identity (amended by #149).** The operating-system birth identity the
 common executor records after `cmd.Start` — absolute process start time on
@@ -324,13 +329,38 @@ therefore remains authoritative over the older quarantine reason.
 | **The execution's worktree generation has been durably retired** (containment by path divergence, not process proof) | Leader exit alone, taken as evidence that descendants drained |
 
 **The third row is the amendment (#149).** Worktree generation lives on the
-`worktrees` table (`generation`, `retired_at`; migration 0021) because the
-contended thing is the checkout, not the process. Retiring a generation is a
-durable, daemon-written, locally-provable fact. The generation is carried in the
-directory name (`looper-fix-<project>-pr-<N>[-g<G>]`), so the next claim of that
-branch lands on a different path: a surviving writer from the previous daemon
-keeps writing into a directory no daemon will read, push from, or clean. Its
-writes still succeed — we do not claim otherwise — they are simply invisible.
+`worktrees` table (`generation`, `retired_at`, `checkout_key`; migration 0021)
+because the contended thing is the checkout, not the process. Retiring a
+generation is a durable, daemon-written, locally-provable fact. The generation is
+carried in the directory name (`<checkout>[+g<G>]`, e.g.
+`looper-fix-<project>-pr-<N>-detached+g2`), so the next claim of that checkout
+lands on a different path: a surviving writer from the previous daemon keeps
+writing into a directory no daemon will read, push from, or clean. Its writes
+still succeed — we do not claim otherwise — they are simply invisible.
+
+Two things the naive form of this gets wrong, and how each is closed:
+
+- **A checkout is not a branch.** One project can hold an attached planner
+  checkout and a detached PR checkout of the same branch at the same time, and
+  two PRs can share a head branch. Generations are therefore allocated against
+  `checkout_key` — the generation-1 directory name — and the live-row unique
+  index is `(project_id, checkout_key) WHERE retired_at IS NULL`. Keying by
+  branch collapsed two checkouts into one row, which lost the very path
+  `retireExecutionWorktreeGeneration` needs to match against an execution's CWD.
+- **A path is not a ref.** For an *attached* checkout — planner and worker loops
+  — `git worktree add --force` permits two worktrees on one branch. A retired
+  generation that is still alive keeps committing to that shared ref, and the
+  live generation's HEAD is a symref to it: it would silently resolve to the
+  stale commit and could publish it. Generations past the first therefore check
+  out their own local ref (`looper-gen/<G>/<branch>`); the stored record's
+  `branch` remains the logical branch, and `Push` still writes
+  `refs/heads/<branch>` on the remote. Generation 1 keeps both the historical
+  path and the branch itself, so no existing checkout moves.
+
+The generation separator is `+`, which the branch/project sanitizer
+(`[A-Za-z0-9._-]`) can never emit — so `feature+g2` is unambiguously generation 2
+of `feature`, where a `-g2` suffix would also be a legal generation-1 name for a
+branch called `feature-g2`.
 
 Generation retirement is paired with mandatory leased pushes
 (`internal/infra/git.Gateway.Push`): every push that updates an existing remote

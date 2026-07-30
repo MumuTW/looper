@@ -1208,7 +1208,12 @@ func (s *Service) discoverWorktrees(ctx context.Context, project storage.Project
 			continue
 		}
 
-		existing, err := s.Repos.Worktrees.GetByBranch(ctx, project.ID, worktree.Branch)
+		// Keyed by the checkout that was actually discovered, not by its
+		// branch: two managed checkouts can share a branch (attached planner
+		// plus detached PR), and a branch lookup would make the second
+		// discovery overwrite the first one's row.
+		checkoutKey := storage.CheckoutKeyFromPath(worktree.Path)
+		existing, err := s.Repos.Worktrees.GetLiveByCheckout(ctx, project.ID, checkoutKey)
 		if err != nil {
 			return discovered, err
 		}
@@ -1240,6 +1245,8 @@ func (s *Service) discoverWorktrees(ctx context.Context, project storage.Project
 			CreatedAt:    worktreeCreatedAt(existing, nowISO),
 			UpdatedAt:    nowISO,
 			CleanedAt:    nil,
+			CheckoutKey:  checkoutKey,
+			Generation:   existingGeneration(existing),
 		}
 		if err := s.Repos.Worktrees.Upsert(ctx, record); err != nil {
 			return discovered, err
@@ -1451,6 +1458,16 @@ func existingHeadSHA(existing *storage.WorktreeRecord) *string {
 		return nil
 	}
 	return existing.HeadSHA
+}
+
+// existingGeneration keeps a discovered checkout on the generation it already
+// holds. Discovery never allocates one: a generation is claimed by
+// CreateWorktree and retired by recovery, and a filesystem scan is neither.
+func existingGeneration(existing *storage.WorktreeRecord) int64 {
+	if existing != nil && existing.Generation > 0 {
+		return existing.Generation
+	}
+	return 1
 }
 
 func worktreeCreatedAt(existing *storage.WorktreeRecord, nowISO string) string {
