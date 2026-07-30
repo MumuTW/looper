@@ -144,7 +144,6 @@ type awaitingHumanError struct {
 	recommendedOption string
 	consequences      map[string]string
 	confidence        string
-	drainedInbox      []loops.HumanMessage
 }
 
 func (e *awaitingHumanError) Error() string { return "worker paused awaiting human decision" }
@@ -213,31 +212,22 @@ func (r *Runner) latestNativeSessionID(ctx context.Context, loopID, agentVendor 
 	return strings.TrimSpace(*execution.NativeSessionID)
 }
 
-// acknowledgeHumanInbox records a completed turn's answer and removes exactly
-// the inbox snapshot it received. It shares the enqueue lock so neither update
-// can overwrite a concurrent message append.
-func (r *Runner) acknowledgeHumanInbox(ctx context.Context, loop *storage.LoopRecord, drained []loops.HumanMessage) {
-	unlock := loops.LockLoopRequeue(loop.ID)
-	defer unlock()
-	r.markHumanAnswerConsumed(ctx, loop)
-	r.clearHumanInbox(ctx, loop, drained)
-}
-
-// clearHumanInbox drops only the loop's drained human-message snapshot after a
-// successful turn, leaving any later appends for the next turn. Caller holds
-// loops.LockLoopRequeue(loop.ID).
-func (r *Runner) clearHumanInbox(ctx context.Context, loop *storage.LoopRecord, drained []loops.HumanMessage) {
-	if r.repos == nil || r.repos.Loops == nil {
+// acknowledgeHumanInbox removes exactly the drained messages after a successful
+// turn so they are not re-injected on a later run, while messages that arrived
+// mid-run — never seen by the agent — stay queued. No-op when nothing was
+// included in the turn or the inbox is empty.
+func (r *Runner) acknowledgeHumanInbox(ctx context.Context, loop *storage.LoopRecord, consumed []loops.HumanMessage) {
+	if r.repos == nil || r.repos.Loops == nil || len(consumed) == 0 {
 		return
 	}
 	fresh, err := r.repos.Loops.GetByID(ctx, loop.ID)
 	if err != nil || fresh == nil {
 		return
 	}
-	if len(drained) == 0 || len(loops.ReadHumanInbox(fresh.MetadataJSON)) == 0 {
+	if len(loops.ReadHumanInbox(fresh.MetadataJSON)) == 0 {
 		return
 	}
-	meta, werr := loops.ClearHumanInboxMessages(fresh.MetadataJSON, drained)
+	meta, werr := loops.AcknowledgeHumanMessages(fresh.MetadataJSON, consumed)
 	if werr != nil {
 		return
 	}
@@ -424,8 +414,6 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 		}
 	}
 	var askWriteErr error
-	unlock := loops.LockLoopRequeue(input.Loop.ID)
-	defer unlock()
 	if _, err := r.updateLoop(ctx, input.Loop, func(updated *storage.LoopRecord) {
 		meta, werr := loops.WriteHITLAsk(updated.MetadataJSON, ask)
 		if werr != nil {
@@ -434,10 +422,11 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 			askWriteErr = werr
 			return
 		}
-		updated.MetadataJSON = &meta
-		// The agent re-asked after reading this snapshot. A message delivered while
-		// the ask was published did not reach that turn and must stay queued.
-		if meta, werr := loops.ClearHumanInboxMessages(updated.MetadataJSON, awaiting.drainedInbox); werr == nil {
+		// The agent re-asked after reading the queued human messages, so the
+		// ones it actually saw are consumed — but a message that arrived while
+		// it was running was never observed and stays queued for the resumed
+		// turn.
+		if meta, werr := loops.AcknowledgeHumanMessages(&meta, loops.ReadHumanInbox(input.Loop.MetadataJSON)); werr == nil {
 			updated.MetadataJSON = &meta
 		}
 		updated.Status = "awaiting_human"
