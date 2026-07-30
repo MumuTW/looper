@@ -105,6 +105,29 @@ func TestRuntimeStartOpensSQLiteAndSyncsConfiguredProjects(t *testing.T) {
 	}
 }
 
+func TestRuntimeHandleIssueDiscoveryWebhookWakesOnlyEligibilityChanges(t *testing.T) {
+	rt := &Runtime{schedulerWake: make(chan struct{}, 1), githubGateway: githubinfra.New(githubinfra.Options{})}
+	accepted := webhookforward.ForwardResult{Status: "ignored", Reason: "unsupported_event"}
+	rt.HandleIssueDiscoveryWebhook("issues", []byte(`{"action":"labeled","repository":{"full_name":"acme/looper"},"issue":{"number":42}}`), accepted)
+	select {
+	case <-rt.schedulerWake:
+	case <-time.After(time.Second):
+		t.Fatal("eligible issue event did not wake scheduler")
+	}
+	for _, payload := range [][]byte{
+		[]byte(`{"action":"edited","repository":{"full_name":"acme/looper"},"issue":{"number":42}}`),
+		[]byte(`{"action":"unlabeled","repository":{"full_name":"acme/looper"},"issue":{"number":42,"pull_request":{}}}`),
+	} {
+		rt.HandleIssueDiscoveryWebhook("issues", payload, accepted)
+	}
+	rt.HandleIssueDiscoveryWebhook("issues", []byte(`{"action":"assigned","repository":{"full_name":"acme/looper"},"issue":{"number":42}}`), webhookforward.ForwardResult{Status: "duplicate"})
+	select {
+	case <-rt.schedulerWake:
+		t.Fatal("ineligible or duplicate event woke scheduler")
+	default:
+	}
+}
+
 func TestRuntimeStartExclusivelyOwnsDatabaseForItsLifetime(t *testing.T) {
 	workingDir := t.TempDir()
 	cfg, err := config.DefaultConfig(workingDir)
