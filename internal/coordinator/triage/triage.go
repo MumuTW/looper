@@ -8,6 +8,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/nexu-io/looper/internal/labels"
 )
 
 const jsISOStringLayout = "2006-01-02T15:04:05.000Z"
@@ -179,7 +181,7 @@ func BuildPrompt(input Input) string {
 	b.WriteString("\nAllowed dispatch labels: ")
 	b.WriteString(strings.Join(AllowedDispatches(), ", "))
 	b.WriteString("\nOutput schema:\n")
-	b.WriteString(`{"disposition":"valid|out-of-scope|unclear","comment":"string","labels":{"kind":["kind/..."],"area":["area/..."],"complexity":["complexity/..."],"dispatch":["dispatch/..."]}}`)
+	b.WriteString(fmt.Sprintf(`{"disposition":"valid|out-of-scope|unclear","comment":"string","labels":{"kind":["kind/..."],"area":["area/..."],"complexity":["complexity/..."],"dispatch":["%s|%s"]}}`, labels.DispatchPlan, labels.DispatchImplement))
 	b.WriteString("\n\nIssue:\n")
 	b.WriteString(input.Issue.Title)
 	b.WriteString("\n\n")
@@ -230,7 +232,7 @@ func AllowedComplexities() []string {
 }
 
 func AllowedDispatches() []string {
-	return []string{"dispatch/plan", "dispatch/implement"}
+	return labels.DispatchLabels()
 }
 
 func parseDecision(raw string, cfg Config) (Decision, error) {
@@ -242,7 +244,7 @@ func parseDecision(raw string, cfg Config) (Decision, error) {
 	if comment == "" {
 		return Decision{}, fmt.Errorf("comment is required")
 	}
-	clear := []string{"kind/*", "area/*", "complexity/*", "dispatch/*", cfg.OutOfScopeLabel, cfg.UnclearLabel}
+	clear := append([]string{"kind/*", "area/*", "complexity/*", cfg.OutOfScopeLabel, cfg.UnclearLabel}, labels.DispatchLabels()...)
 	switch Disposition(strings.TrimSpace(output.Disposition)) {
 	case DispositionValid:
 		kind, err := requireExactlyOne(output.Labels.Kind, AllowedKinds())

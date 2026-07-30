@@ -4841,7 +4841,7 @@ func TestProcessClaimedItemAutoMergeApprovesAndEnablesAutoMergeWhenCriteriaPass(
 		reviewRequests:      []string{"reviewer"},
 		viewBody:            "Implements feature.\n\nCloses #358",
 		viewDiff:            "diff --git a/app.go b/app.go\n@@ -1,1 +1,2 @@\n-old\n+new\n+more\n",
-		issueDetail:         githubinfra.IssueDetail{Number: 358, Body: "## Acceptance criteria\n- ship app change\n- add more\n", Labels: []string{"triaged", "dispatch/plan"}},
+		issueDetail:         githubinfra.IssueDetail{Number: 358, Body: "## Acceptance criteria\n- ship app change\n- add more\n", Labels: []string{"triaged", "looper:dispatch:plan"}},
 	}
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "No actionable findings", Stdout: `__LOOPER_RESULT__={"summary":"No actionable findings"}`, ParseStatus: "parsed"}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, ReviewEvents: config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventApprove}, LoopConfig: testReviewerLoopConfig(), CustomInstructions: reviewerAutoMergeTestConfig(t), CriteriaVerifier: stubCriteriaVerifier{responses: map[criteria.AcceptanceCriterion]criteria.CriterionAssessment{
@@ -4904,7 +4904,7 @@ func TestProcessClaimedItemAutoMergeApprovesAndCommentsWhenAutoMergeRefused(t *t
 		reviewRequests:      []string{"reviewer"},
 		viewBody:            "Implements feature.\n\nCloses #358",
 		viewDiff:            "diff --git a/app.go b/app.go\n@@ -1,1 +1,1 @@\n-old\n+new\n",
-		issueDetail:         githubinfra.IssueDetail{Number: 358, Body: "## Acceptance criteria\n- ship app change\n", Labels: []string{"triaged", "dispatch/plan"}},
+		issueDetail:         githubinfra.IssueDetail{Number: 358, Body: "## Acceptance criteria\n- ship app change\n", Labels: []string{"triaged", "looper:dispatch:plan"}},
 		repositorySettings:  githubinfra.RepositorySettings{AllowSquashMerge: true, AllowMergeCommit: true, AllowRebaseMerge: true, AllowAutoMerge: false},
 	}
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "No actionable findings", Stdout: `__LOOPER_RESULT__={"summary":"No actionable findings"}`, ParseStatus: "parsed"}}}
@@ -4943,7 +4943,7 @@ func TestProcessClaimedItemAutoMergeApprovesWithoutRemoteProbeWhenOutOfScope(t *
 		reviewRequests:      []string{"reviewer"},
 		viewBody:            "Implements feature.\n\nCloses #358",
 		viewDiff:            "diff --git a/app.go b/app.go\n@@ -1,1 +1,1 @@\n-old\n+new\n",
-		issueDetail:         githubinfra.IssueDetail{Number: 358, Body: "## Acceptance criteria\n- ship app change\n", Labels: []string{"triaged", "dispatch/plan"}},
+		issueDetail:         githubinfra.IssueDetail{Number: 358, Body: "## Acceptance criteria\n- ship app change\n", Labels: []string{"triaged", "looper:dispatch:plan"}},
 	}
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "No actionable findings", Stdout: `__LOOPER_RESULT__={"summary":"No actionable findings"}`, ParseStatus: "parsed"}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, ReviewEvents: config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventApprove}, LoopConfig: testReviewerLoopConfig(), CustomInstructions: reviewerAutoMergeTestConfig(t), CriteriaVerifier: stubCriteriaVerifier{responses: map[criteria.AcceptanceCriterion]criteria.CriterionAssessment{
@@ -4990,7 +4990,7 @@ func TestProcessClaimedItemAutoMergeCommentsAndRetriagesWhenCriteriaFail(t *test
 		reviewRequests:      []string{"reviewer"},
 		viewBody:            "Implements feature.\n\nCloses #358",
 		viewDiff:            "diff --git a/app.go b/app.go\n@@ -1,1 +1,1 @@\n-old\n+new\n",
-		issueDetail:         githubinfra.IssueDetail{Number: 358, Body: "## Acceptance criteria\n- ship app change\n- add tests\n", Labels: []string{"triaged", "dispatch/plan", "other"}},
+		issueDetail:         githubinfra.IssueDetail{Number: 358, Body: "## Acceptance criteria\n- ship app change\n- add tests\n", Labels: []string{"triaged", "looper:dispatch:plan", "other"}},
 	}
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "No actionable findings", Stdout: `__LOOPER_RESULT__={"summary":"No actionable findings"}`, ParseStatus: "parsed"}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, ReviewEvents: config.ReviewerReviewEventsConfig{Clean: config.ReviewerReviewEventApprove}, LoopConfig: testReviewerLoopConfig(), CustomInstructions: reviewerAutoMergeTestConfig(t), CriteriaVerifier: stubCriteriaVerifier{responses: map[criteria.AcceptanceCriterion]criteria.CriterionAssessment{
@@ -5016,8 +5016,8 @@ func TestProcessClaimedItemAutoMergeCommentsAndRetriagesWhenCriteriaFail(t *test
 	if len(github.removeIssueLabelCalls) != 1 {
 		t.Fatalf("removeIssueLabelCalls = %#v, want one issue label removal", github.removeIssueLabelCalls)
 	}
-	if got := github.removeIssueLabelCalls[0].Labels; len(got) != 2 || got[0] != "triaged" || got[1] != "dispatch/plan" {
-		t.Fatalf("removed labels = %#v, want triaged + dispatch/plan", got)
+	if got := github.removeIssueLabelCalls[0].Labels; len(got) != 2 || got[0] != "triaged" || got[1] != "looper:dispatch:plan" {
+		t.Fatalf("removed labels = %#v, want triaged + looper:dispatch:plan", got)
 	}
 	if len(github.enableAutoMergeCalls) != 0 {
 		t.Fatalf("enableAutoMergeCalls = %#v, want none", github.enableAutoMergeCalls)
@@ -9814,7 +9814,7 @@ func (g *fakeGitHubGateway) ViewIssue(_ context.Context, input githubinfra.ViewI
 	if g.issueDetail.Number != 0 {
 		return g.issueDetail, nil
 	}
-	return githubinfra.IssueDetail{Number: input.IssueNumber, Title: "Issue", Body: "", State: "open", Labels: []string{"triaged", "dispatch/plan"}}, nil
+	return githubinfra.IssueDetail{Number: input.IssueNumber, Title: "Issue", Body: "", State: "open", Labels: []string{"triaged", "looper:dispatch:plan"}}, nil
 }
 
 func (g *fakeGitHubGateway) GetRepositorySettings(context.Context, githubinfra.RepositorySettingsInput) (githubinfra.RepositorySettings, error) {

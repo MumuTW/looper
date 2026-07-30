@@ -3640,21 +3640,21 @@ func parseInt64(raw string) (int64, error) {
 	return strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
 }
 
-func criteriaFailureLabels(labels []string) []string {
+func criteriaFailureLabels(issueLabels []string) []string {
 	toRemove := []string{}
-	for _, label := range labels {
+	for _, label := range issueLabels {
 		normalized := strings.ToLower(strings.TrimSpace(label))
-		if normalized == "triaged" || strings.HasPrefix(normalized, "dispatch/") {
+		if normalized == "triaged" || labels.IsDispatch(label) {
 			toRemove = append(toRemove, label)
 		}
 	}
 	return toRemove
 }
 
-func issueHasCoordinatorTracking(labels []string) bool {
-	for _, label := range labels {
+func issueHasCoordinatorTracking(issueLabels []string) bool {
+	for _, label := range issueLabels {
 		normalized := strings.ToLower(strings.TrimSpace(label))
-		if normalized == "triaged" || strings.HasPrefix(normalized, "dispatch/") {
+		if normalized == "triaged" || labels.IsDispatch(label) {
 			return true
 		}
 	}
