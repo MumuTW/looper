@@ -897,6 +897,28 @@ func (r *RunsRepository) UpdateCheckpoint(ctx context.Context, id, checkpointJSO
 	return nil
 }
 
+// UpdateCheckpointOutcome atomically replaces only the outcome projection,
+// preserving concurrent resume-policy and step-specific checkpoint updates.
+func (r *RunsRepository) UpdateCheckpointOutcome(ctx context.Context, id, outcomeJSON, updatedAt string) error {
+	result, err := r.q.ExecContext(ctx, `
+		UPDATE runs
+		SET checkpoint_json = json_set(COALESCE(NULLIF(checkpoint_json, ''), '{}'), '$.outcome', json(?)),
+			updated_at = ?
+		WHERE id = ?
+	`, outcomeJSON, updatedAt, id)
+	if err != nil {
+		return fmt.Errorf("update run checkpoint outcome: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read updated run checkpoint outcome rows: %w", err)
+	}
+	if affected == 0 {
+		return fmt.Errorf("update run checkpoint outcome: run not found: %s", id)
+	}
+	return nil
+}
+
 func (r *RunsRepository) GetByID(ctx context.Context, id string) (*RunRecord, error) {
 	row := r.q.QueryRowContext(ctx, `SELECT * FROM runs WHERE id = ?`, id)
 	record, err := scanRun(row)

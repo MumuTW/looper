@@ -27,6 +27,10 @@ func TestFixerRepairTaskOutcomeUsesStructuredAuthority(t *testing.T) {
 			},
 		},
 		{
+			name:   "translated JSON event payload remains authoritative",
+			result: AgentResult{Stdout: `{"type":"item.completed","item":{"text":"embedded marker"}}`, CompletionPayload: `{"outcome":"completed","summary":"done"}`},
+		},
+		{
 			name:      "unstructured auth prose is diagnostic only",
 			result:    AgentResult{Summary: "GitHub auth failed before editing"},
 			wantError: true,

@@ -21,3 +21,12 @@ func TestAppendCompletionInstruction(t *testing.T) {
 		}
 	}
 }
+
+func TestAppendCompletionInstructionWithExampleUsesCallerContract(t *testing.T) {
+	t.Parallel()
+
+	prompt := AppendCompletionInstructionWithExample("fix the PR", `{"outcome":"completed","summary":"<one-sentence summary>"}`)
+	if !strings.Contains(prompt, `__LOOPER_RESULT__={"outcome":"completed","summary":"<one-sentence summary>"}`) {
+		t.Fatalf("prompt = %q, want fixer completion contract", prompt)
+	}
+}

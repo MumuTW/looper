@@ -29,6 +29,9 @@ func TestBuildFixerPromptUsesConcreteDisclosureMetadata(t *testing.T) {
 
 	detail := &checkpointDetail{State: "OPEN", HeadSHA: "abc123", BaseRefName: "main", HeadRefName: "feature"}
 	prompt, _ := buildFixerPrompt("project_1", customInstructionConfig(nil), "acme/looper", 42, detail, []FixItem{{ID: "fix-1", Summary: "repair disclosure"}}, true, config.DefaultDisclosureConfig(), "opencode", "openai/gpt-5.5")
+	if !strings.Contains(prompt, `__LOOPER_RESULT__={"outcome":"completed","summary":"<one-sentence summary>"}`) {
+		t.Fatalf("prompt missing authoritative completion example:\n%s", prompt)
+	}
 	for _, want := range []string{"agent=opencode"} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("prompt missing %q:\n%s", want, prompt)

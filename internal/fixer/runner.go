@@ -489,6 +489,7 @@ type AgentResult struct {
 	Stdout                       string
 	Stderr                       string
 	ParseStatus                  string
+	CompletionPayload            string
 	Lifecycle                    *lifecycle.State
 	TimeoutType                  string
 	ConfiguredIdleTimeoutSeconds int64
@@ -1026,7 +1027,10 @@ func validateCompletedRepairCheckpoint(repair *checkpointRepair) error {
 // agent completion marker. Process completion and parse success alone do not
 // authorize the repair pipeline to advance.
 func fixerRepairTaskOutcome(result AgentResult) (bool, string, QueueFailureKind, *loopError) {
-	payload := extractCompletionMarkerPayload(result.Stdout + "\n" + result.Stderr)
+	payload := strings.TrimSpace(result.CompletionPayload)
+	if payload == "" {
+		payload = extractCompletionMarkerPayload(result.Stdout + "\n" + result.Stderr)
+	}
 	if payload == "" {
 		return false, "", "", &loopError{message: "Fixer agent completed without required structured outcome", kind: FailureRetryableTransient}
 	}
@@ -1196,12 +1200,27 @@ func newFollowupThreadIDs(snapshot, live []FixItem) []string {
 	return canonicalizeStringSlice(ids)
 }
 
+func hasNewFollowupFixItems(snapshot, live []FixItem) bool {
+	for _, item := range live {
+		if !fixItemPresentInLiveReview(item, snapshot) {
+			return true
+		}
+	}
+	return false
+}
+
 func fixItemPresentInLiveReview(item FixItem, live []FixItem) bool {
 	for _, current := range live {
 		if item.ThreadID != "" && item.ThreadID == current.ThreadID {
 			return true
 		}
 		if item.ID != "" && item.ID == current.ID {
+			return true
+		}
+		if item.Type == "check" && current.Type == "check" && strings.TrimSpace(item.Name) != "" && item.Name == current.Name {
+			return true
+		}
+		if item.Type == "conflict" && current.Type == "conflict" {
 			return true
 		}
 	}
@@ -3412,8 +3431,12 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 	// wrote a dismiss sentinel — dismiss those reviews (best-effort).
 	r.applyReviewDismissals(ctx, input, worktree.Path)
 	checkpoint.Repair = repair
-	checkpoint.Repair.ReplyExplanations = normalizeReplyExplanationActions(parseReplyExplanations(result.Stdout, result.Stderr, checkpoint.FixItems))
-	checkpoint.Repair.ReplyExplanations = append(checkpoint.Repair.ReplyExplanations, parseNativeRepairResults(result.Stdout, result.Stderr, checkpoint.FixItems)...)
+	structuredStderr := result.Stderr
+	if strings.TrimSpace(result.CompletionPayload) != "" {
+		structuredStderr += "\n" + agent.CompletionMarkerPrefix + result.CompletionPayload
+	}
+	checkpoint.Repair.ReplyExplanations = normalizeReplyExplanationActions(parseReplyExplanations(result.Stdout, structuredStderr, checkpoint.FixItems))
+	checkpoint.Repair.ReplyExplanations = append(checkpoint.Repair.ReplyExplanations, parseNativeRepairResults(result.Stdout, structuredStderr, checkpoint.FixItems)...)
 	checkpoint.ensureLifecycle("fixer", worktree.Branch, detailBaseRefName(checkpoint.Detail), false)
 	if result.Lifecycle != nil {
 		checkpoint.Lifecycle.MergeAgent(result.Lifecycle, r.nowISO())
@@ -3860,7 +3883,7 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 			checkpoint.Outcome = &FixerRunOutcome{}
 		}
 		checkpoint.Outcome.FollowUpThreadIDs = canonicalizeStringSlice(followUp)
-		if len(followUp) > 0 {
+		if hasNewFollowupFixItems(fixItems, liveFixItems) {
 			if _, err := r.recordPendingFixerRediscovery(ctx, input.Loop, liveDetail.HeadSHA, hashFixItemsState(liveFixItems), unresolvedThreadIDs(liveFixItems)); err != nil {
 				return checkpoint, err
 			}
@@ -7099,8 +7122,8 @@ func (r *Runner) recordTerminalCleanup(ctx context.Context, project storage.Proj
 	if r.repos == nil || r.repos.Runs == nil || strings.TrimSpace(runID) == "" {
 		return
 	}
-	encoded := mustMarshalJSON(*checkpoint)
-	if err := r.repos.Runs.UpdateCheckpoint(ctx, runID, encoded, r.nowISO()); err != nil {
+	encoded := mustMarshalJSON(checkpoint.Outcome)
+	if err := r.repos.Runs.UpdateCheckpointOutcome(ctx, runID, encoded, r.nowISO()); err != nil {
 		r.logError("fixer cleanup outcome persistence failed", map[string]any{"runId": runID, "message": err.Error()})
 	}
 }
@@ -8170,7 +8193,7 @@ func buildFixerPrompt(projectID string, instructionConfig config.Config, repo st
 		"For fixer commits, prefer a fresh commit subject that precisely summarizes the repair changes from this round. Do not mechanically reuse the PR title or a previous fixer subject when this round's edits are narrower or different.",
 		"The final "+agent.CompletionMarker+" JSON MUST include a top-level `outcome`: use `completed` when the repair task ran to completion, or `blocked` only when it could not be attempted. For `blocked`, also include `failure_kind` as `retryable_transient`, `retryable_after_resume`, or `manual_intervention`; authentication, authorization, usage-limit, and credential failures require `manual_intervention`. Free-form summary text is diagnostic and never controls this classification.",
 	)
-	return agent.AppendCompletionInstruction(strings.Join(parts, "\n\n")), instructionBlock
+	return agent.AppendCompletionInstructionWithExample(strings.Join(parts, "\n\n"), `{"outcome":"completed","summary":"<one-sentence summary>"}`), instructionBlock
 }
 
 func customInstructionConfig(value *config.Config) config.Config {
