@@ -158,6 +158,9 @@ func startRuntimeWithAPI(ctx context.Context, deps bootstrap.RuntimeDependencies
 		CloseLoop: func(ctx context.Context, loopID, reason string) (any, error) {
 			return closeLoop(ctx, rt.Services(), loopID, reason, time.Now, syscall.Kill, rt.ExecutionMatchesProcess)
 		},
+		TerminateLoop: func(ctx context.Context, loopID, reason string) (any, error) {
+			return terminateLoop(ctx, rt.Services(), loopID, reason, time.Now)
+		},
 		StopAll: func(ctx context.Context, reason string) (any, error) {
 			return stopAllLoopsForRequest(ctx, rt.Services(), reason, time.Now, syscall.Kill, rt.ExecutionMatchesProcess)
 		},
@@ -422,6 +425,25 @@ func stopLoop(ctx context.Context, services looperdruntime.Services, loopID, rea
 
 func closeLoop(ctx context.Context, services looperdruntime.Services, loopID, reason string, now func() time.Time, signal signalProcessFunc, executionMatchesProcess executionMatchesProcessFunc) (any, error) {
 	return haltLoop(ctx, services, loopID, reason, now, signal, executionMatchesProcess, true)
+}
+
+// terminateLoop retires a loop permanently. Unlike stop/pause (which preserve
+// resume semantics) or close (which is a graceful stop), terminate moves the
+// loop to terminal state. It does NOT kill any running agent process — the
+// operator is expected to stop/close first if the loop is active. Terminate is
+// the operator's final tool for stuck loops in human_takeover, awaiting_human,
+// paused, failed, or wedged states where the daemon needs the loop retired but
+// the normal stop path did not succeed.
+func terminateLoop(ctx context.Context, services looperdruntime.Services, loopID, reason string, now func() time.Time) (any, error) {
+	if services.Loops == nil {
+		return nil, fmt.Errorf("loops service is not configured")
+	}
+	reasonCopy := reason
+	result, err := services.Loops.Terminate(ctx, loopID, &reasonCopy)
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 // takeoverLoop parks a loop for interactive human takeover: it captures the loop's

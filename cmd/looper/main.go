@@ -328,7 +328,7 @@ func routeForVerb(verb string, args []string) (apiRequest, error) {
 	// function is reached, because it needs a GET preflight and flags of its
 	// own. Leaving a case here would be a branch no invocation can take, and a
 	// test covering it would report success for a path the CLI never walks.
-	case "takeover", "start", "pause", "handback":
+	case "takeover", "start", "pause", "handback", "terminate":
 		if len(args) != 1 || strings.TrimSpace(args[0]) == "" {
 			return apiRequest{}, fmt.Errorf("%s requires exactly one loop id", verb)
 		}
@@ -1337,6 +1337,7 @@ Usage:
                                --discard-worktree-changes --confirm)
   looper start <selector>      Start a loop now
   looper pause <selector>      Pause a loop
+  looper terminate <selector>  Terminate a loop permanently (retires it)
   looper respond <selector> "<answer>"
                                Answer a loop waiting on a human and resume it
   looper version               Print the looper version

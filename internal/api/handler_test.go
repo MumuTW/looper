@@ -3197,6 +3197,10 @@ func TestHandlerLoopRoutesMatchFrozenSuccessArtifacts(t *testing.T) {
 			t.Helper()
 			prepareLoopRouteForRetry(t, rt, "human_takeover")
 		}},
+		{routeID: "loop.terminate", method: http.MethodPost, path: "/api/v1/loops/loop_1/terminate", prepare: func(t *testing.T, _ *Handler, rt *looperdruntime.Runtime) {
+			t.Helper()
+			prepareLoopRouteForRetry(t, rt, "paused")
+		}},
 		{routeID: "loops.create", method: http.MethodPost, path: "/api/v1/loops", body: marshalArtifactRequestBody(t, requestArtifact, "loops.create")},
 	}
 
@@ -3208,6 +3212,27 @@ func TestHandlerLoopRoutesMatchFrozenSuccessArtifacts(t *testing.T) {
 				Config:  fixture.config,
 				Runtime: fixture.runtime,
 				Now:     func() time.Time { return fixture.now.Add(time.Minute) },
+				StopLoop: func(_ context.Context, loopID, _ string) (any, error) {
+					return map[string]any{"stopped": loopID}, nil
+				},
+				CloseLoop: func(_ context.Context, loopID, _ string) (any, error) {
+					return map[string]any{"closed": loopID}, nil
+				},
+				TerminateLoop: func(_ context.Context, loopID, _ string) (any, error) {
+					// Mirror the production TerminateLoop: transition the loop to terminated
+					// so the re-read in terminateLoop returns the updated status.
+					repos := fixture.runtime.Services().Repositories
+					loop, err := repos.Loops.GetByID(context.Background(), loopID)
+					if err != nil {
+						return nil, err
+					}
+					loop.Status = "terminated"
+					loop.NextRunAt = nil
+					if err := repos.Loops.Upsert(context.Background(), *loop); err != nil {
+						return nil, err
+					}
+					return map[string]any{"terminated": loopID}, nil
+				},
 				TakeoverLoop: func(_ context.Context, loopID, _ string) (TakeoverResult, error) {
 					return TakeoverResult{
 						LoopID:       loopID,
