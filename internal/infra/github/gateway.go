@@ -3009,7 +3009,12 @@ func (g *Gateway) InitializeLabels(ctx context.Context, input InitializeLabelsIn
 	if err := validateGitHubRepoSlug(repo); err != nil {
 		return LabelInitResult{}, err
 	}
-	return g.ensureLabels(ctx, repo, input.CWD, labels.Standard(), input.DryRun)
+	return g.ensureLabels(ctx, repo, input.CWD, labels.Standard(), ensureLabelsOptions{
+		dryRun: input.DryRun,
+		// Provisioning reports a per-label plan, so it keeps going and records
+		// every outcome rather than stopping at the first failure.
+		requireListing: input.DryRun,
+	})
 }
 
 // ensureLabels creates every definition the repository does not already have,
@@ -3028,14 +3033,31 @@ func (g *Gateway) InitializeLabels(ctx context.Context, input InitializeLabelsIn
 // must not block the caller: nothing is then known to exist, every create is
 // attempted, and one that loses to an existing label is tolerated exactly as a
 // lost race is.
-func (g *Gateway) ensureLabels(ctx context.Context, repo, cwd string, definitions []labels.Definition, dryRun bool) (LabelInitResult, error) {
-	result := LabelInitResult{Repo: repo, DryRun: dryRun, Labels: make([]LabelInitItem, 0, len(definitions))}
+type ensureLabelsOptions struct {
+	dryRun bool
+	// requireListing makes a failed listing fatal. Tolerating one is only safe
+	// when creates follow: an attempted create corrects a wrong guess about
+	// what exists. A dry run performs none, so its entire output would be that
+	// guess presented as a plan.
+	requireListing bool
+	// stopOnFirstFailure abandons the remaining definitions once the caller's
+	// action is already known to fail. The apply paths want this: continuing
+	// to create labels that will never be applied leaves the repository
+	// changed for an action that did not happen.
+	stopOnFirstFailure bool
+}
+
+func (g *Gateway) ensureLabels(ctx context.Context, repo, cwd string, definitions []labels.Definition, opts ensureLabelsOptions) (LabelInitResult, error) {
+	result := LabelInitResult{Repo: repo, DryRun: opts.dryRun, Labels: make([]LabelInitItem, 0, len(definitions))}
 	if len(definitions) == 0 {
 		return result, nil
 	}
 
 	existing, listErr := g.listRepositoryLabels(ctx, repo, cwd)
 	if listErr != nil {
+		if opts.requireListing {
+			return LabelInitResult{}, listErr
+		}
 		existing = nil
 	}
 
@@ -3046,7 +3068,7 @@ func (g *Gateway) ensureLabels(ctx context.Context, repo, cwd string, definition
 			item.Status = "skipped"
 		} else {
 			item.Status = "created"
-			if !dryRun {
+			if !opts.dryRun {
 				if _, createErr := g.runGh(ctx, cwd, "", "label", "create", definition.Name, "--repo", repo, "--color", definition.Color, "--description", definition.Description); createErr != nil {
 					if isLabelAlreadyExistsError(createErr) {
 						item.Status = "skipped"
@@ -3062,6 +3084,9 @@ func (g *Gateway) ensureLabels(ctx context.Context, repo, cwd string, definition
 		}
 		result.Labels = append(result.Labels, item)
 		incrementLabelSummary(&result.Summary, item.Status)
+		if firstFailure != nil && opts.stopOnFirstFailure {
+			break
+		}
 	}
 
 	// Return the underlying failure rather than a count. A caller applying a
@@ -3411,7 +3436,7 @@ func (g *Gateway) ensureLabelsExist(ctx context.Context, repo string, wanted []s
 		seen[normalized] = struct{}{}
 		definitions = append(definitions, labelPresentation(label))
 	}
-	_, err := g.ensureLabels(ctx, repo, cwd, definitions, false)
+	_, err := g.ensureLabels(ctx, repo, cwd, definitions, ensureLabelsOptions{stopOnFirstFailure: true})
 	return err
 }
 

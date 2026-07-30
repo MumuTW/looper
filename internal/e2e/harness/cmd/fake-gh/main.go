@@ -1079,6 +1079,19 @@ func appendThreadReply(st *state, threadID, body string) (string, error) {
 	return "", fmt.Errorf("review thread not found: %s", threadID)
 }
 
+// saveState replaces the state file atomically.
+//
+// Every mutating handler here reads the whole state, edits it, and writes it
+// back. A direct os.WriteFile leaves a window where a concurrent reader sees a
+// half-written file and fails to parse it, which surfaces as an unexplained
+// harness error rather than a test failure. Writing to a temporary file and
+// renaming closes that window for all of them.
+//
+// It does not make the read-modify-write itself atomic: two fake-gh processes
+// editing state at the same moment can still lose one another's update. No
+// test runs them concurrently today, so cross-process locking would be
+// machinery with nothing to hold it honest; if one ever does, that is the
+// point to add it.
 func saveState(path string, st state) error {
 	if path == "" {
 		return nil
@@ -1087,7 +1100,25 @@ func saveState(path string, st state) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, payload, 0o644)
+	temp, err := os.CreateTemp(filepath.Dir(path), ".fake-gh-state-*")
+	if err != nil {
+		return err
+	}
+	name := temp.Name()
+	if _, err := temp.Write(payload); err != nil {
+		temp.Close()
+		os.Remove(name)
+		return err
+	}
+	if err := temp.Close(); err != nil {
+		os.Remove(name)
+		return err
+	}
+	if err := os.Chmod(name, 0o644); err != nil {
+		os.Remove(name)
+		return err
+	}
+	return os.Rename(name, path)
 }
 
 func fieldValue(args []string, key string) string {
