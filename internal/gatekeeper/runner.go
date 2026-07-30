@@ -59,7 +59,6 @@ const (
 	ReasonReviewChangesRequested   ReasonCode = "review_changes_requested"
 	ReasonCodexReviewMissing       ReasonCode = "codex_review_missing"
 	ReasonUnresolvedReviewThread   ReasonCode = "unresolved_review_thread"
-	ReasonReviewerConvergence      ReasonCode = "reviewer_convergence_blocked"
 	ReasonCodexReviewRequired      ReasonCode = "codex_review_required"
 	ReasonCodexReviewBlocked       ReasonCode = "codex_review_blocked"
 	ReasonGatekeeperCheckRequired  ReasonCode = "gatekeeper_check_not_required"
@@ -650,16 +649,9 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 		if !containsRequiredCheck(report.Evidence.RequiredChecks, RequiredStatusContext) {
 			report.Reasons = append(report.Reasons, Reason{Code: ReasonGatekeeperCheckRequired, Subject: RequiredStatusContext})
 		}
-		for _, rule := range requiredCheckRules {
-			if strings.EqualFold(strings.TrimSpace(rule.Context), RequiredStatusContext) && rule.AppID != 0 {
-				report.Reasons = append(report.Reasons, Reason{Code: ReasonGatekeeperCheckRequired, Subject: requiredCheckSubject(rule.Context, rule.AppID)})
-			}
-		}
 		// The Gatekeeper status is this evaluation's output, not an input. Reading
 		// its prior value would turn the first run on a new SHA into a permanent
-		// self-failure instead of letting this run publish the replacement. Only
-		// strip the unscoped name match; app-bound rules remain so misconfigured
-		// protection fails closed instead of being silently ignored.
+		// self-failure instead of letting this run publish the replacement.
 		requiredCheckRules = withoutRequiredCheck(requiredCheckRules, RequiredStatusContext)
 	}
 	checkReasons, checkEvidence := evaluateRequiredChecks(requiredCheckRules, checks)
@@ -692,17 +684,6 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 	}
 	sort.Strings(report.Evidence.UnresolvedReviewThreadIDs)
 
-	convergenceEvidence, hasConvergence, err := latestReviewerConvergence(ctx, r.repos, input.ProjectID, input.Repo, input.PRNumber, report.ObservedHeadSHA)
-	if err != nil {
-		return r.persistProviderBlock(ctx, report, ReasonProviderStateUnavailable, "reviewer_convergence")
-	}
-	if hasConvergence {
-		report.Evidence.ReviewerConvergence = &convergenceEvidence
-		if reviewerConvergenceBlocks(convergenceEvidence) {
-			report.Reasons = append(report.Reasons, Reason{Code: ReasonReviewerConvergence, Subject: reviewerConvergenceReasonSubject(convergenceEvidence)})
-		}
-	}
-
 	if r.trustFor(input.ProjectID) == config.GatekeeperTrustAuto {
 		login, loginErr := r.github.GetCurrentUserLoginForRepo(ctx, input.Repo, input.CWD)
 		if loginErr != nil || strings.TrimSpace(login) == "" {
@@ -712,27 +693,20 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 			Repo: input.Repo, PRNumber: input.PRNumber,
 			Marker:              "looper:review id_prefix=reviewer: head=" + report.ObservedHeadSHA,
 			AllowedReviewEvents: []string{"COMMENT", "APPROVE", "REQUEST_CHANGES"},
-			AuthorLogin:         login, AllowCleanComment: true, SkipInlineComments: true, CWD: input.CWD,
+			AuthorLogin:         login, AllowCleanComment: true, CWD: input.CWD,
 		})
 		if markerErr != nil {
 			return r.persistProviderBlock(ctx, report, ReasonProviderStateUnavailable, "codex_review")
 		}
-		if marker.Found {
-			report.Reasons = withoutReasonCodes(report.Reasons, ReasonCodexReviewMissing)
-			report.Evidence.CodexReviewOutcome = strings.ToLower(strings.TrimSpace(marker.Outcome))
-			if report.Evidence.CodexReviewOutcome == "blocking" || report.Evidence.CodexReviewOutcome == "actionable" {
-				report.Reasons = append(report.Reasons, Reason{Code: ReasonCodexReviewBlocked, Subject: report.Evidence.CodexReviewOutcome})
-			}
-		} else if report.Evidence.CodexReview != nil && report.Evidence.CodexReview.CurrentHeadValid && report.Evidence.CodexReview.Event == "COMMENT" {
-			// Markerless clean COMMENT policy records pr.review.posted with
-			// markerVerified=true but leaves no forge marker for FindReviewMarker.
-			report.Evidence.CodexReviewOutcome = "clean"
-		} else {
+		report.Evidence.CodexReviewOutcome = strings.ToLower(strings.TrimSpace(marker.Outcome))
+		if !marker.Found {
 			report.Reasons = append(report.Reasons, Reason{Code: ReasonCodexReviewRequired, Subject: "current_head"})
+		} else if report.Evidence.CodexReviewOutcome == "blocking" || report.Evidence.CodexReviewOutcome == "actionable" {
+			report.Reasons = append(report.Reasons, Reason{Code: ReasonCodexReviewBlocked, Subject: report.Evidence.CodexReviewOutcome})
 		}
 	}
 
-	finalHead, finalBase, err := r.github.GetPullRequestHeadAndBaseSHA(ctx, viewInput)
+	finalHead, err := r.github.GetPullRequestHeadSHA(ctx, viewInput)
 	if err != nil {
 		return r.persistProviderBlock(ctx, report, ReasonProviderStateUnavailable, "head_revalidation")
 	}
@@ -1179,21 +1153,22 @@ func (r *Runner) persist(ctx context.Context, report Report) (Report, error) {
 			"repo": report.Repo, "pr": report.PRNumber, "action": string(action), "error": err.Error(),
 		})
 	}
+	if r.trustFor(report.ProjectID) == config.GatekeeperTrustAuto && strings.TrimSpace(report.ObservedHeadSHA) != "" {
+		state, description := gatekeeperCommitStatus(report)
+		if err := r.github.SetCommitStatus(ctx, githubinfra.CommitStatusInput{
+			Repo: report.Repo, SHA: report.ObservedHeadSHA, Context: RequiredStatusContext,
+			State: state, Description: description, CWD: r.projectCWD(ctx, report.ProjectID),
+		}); err != nil {
+			return Report{}, fmt.Errorf("publish gatekeeper commit status: %w", err)
+		}
+	}
 	return report, nil
 }
 
 func gatekeeperCommitStatus(report Report) (string, string) {
 	for _, reason := range report.Reasons {
-		if reason.Code == ReasonGatekeeperCheckRequired {
-			return "error", "Looper Gatekeeper is not configured as a required status on the target branch"
-		}
-	}
-	for _, reason := range report.Reasons {
 		if reason.Code == ReasonCodexReviewRequired {
 			return "pending", "Waiting for Codex review of this commit"
-		}
-		if reason.Code == ReasonHeadStale {
-			return "pending", "Waiting for Gatekeeper evaluation of the current head"
 		}
 	}
 	if report.Eligible {
@@ -1219,7 +1194,7 @@ func containsRequiredCheck(checks []string, want string) bool {
 func withoutRequiredCheck(rules []githubinfra.RequiredCheckRule, name string) []githubinfra.RequiredCheckRule {
 	out := make([]githubinfra.RequiredCheckRule, 0, len(rules))
 	for _, rule := range rules {
-		if strings.EqualFold(strings.TrimSpace(rule.Context), strings.TrimSpace(name)) && rule.AppID == 0 {
+		if strings.EqualFold(strings.TrimSpace(rule.Context), strings.TrimSpace(name)) {
 			continue
 		}
 		out = append(out, rule)
