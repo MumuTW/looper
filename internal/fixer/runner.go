@@ -489,6 +489,7 @@ type AgentResult struct {
 	Stdout                       string
 	Stderr                       string
 	ParseStatus                  string
+	CompletionPayload            string
 	Lifecycle                    *lifecycle.State
 	TimeoutType                  string
 	ConfiguredIdleTimeoutSeconds int64
@@ -1242,10 +1243,96 @@ func parseNativeRepairResults(stdout, stderr string, fixItems []FixItem) []reply
 	return out
 }
 
+// fixerRepairTaskOutcome reads the agent's declared outcome from its structured
+// completion payload. The declared outcome is the authority for whether the repair
+// completed or was blocked; commits, pushes, and heartbeats are progress evidence
+// only and never synthesize success here.
+//
+// Reports (blocked, message, failureKind, err). A nil err with blocked=false means
+// the agent declared completion. err is returned when the payload is absent,
+// unparseable, or declares no recognized outcome — the fixer must not advance to
+// validate/push/resolve on an unauthorized completion.
+func fixerRepairTaskOutcome(result AgentResult) (bool, string, QueueFailureKind, *loopError) {
+	payload := strings.TrimSpace(result.CompletionPayload)
+	if payload == "" {
+		// Older adapters and the checkpoint fallback path do not carry the parsed
+		// payload; recover it from the transcript.
+		payload = extractCompletionMarkerPayload(result.Stdout + "\n" + result.Stderr)
+	}
+	if payload == "" {
+		return false, "", "", &loopError{message: "Fixer agent completed without required structured outcome", kind: FailureRetryableTransient}
+	}
+	var parsed struct {
+		Outcome     string `json:"outcome"`
+		Summary     string `json:"summary"`
+		FailureKind string `json:"failure_kind"`
+	}
+	if err := json.Unmarshal([]byte(payload), &parsed); err != nil {
+		return false, "", "", &loopError{message: "Fixer agent completed with invalid structured outcome", kind: FailureRetryableTransient}
+	}
+	switch strings.ToLower(strings.TrimSpace(parsed.Outcome)) {
+	case "completed":
+		return false, "", "", nil
+	case "blocked":
+		kind, ok := parseFixerBlockedFailureKind(parsed.FailureKind)
+		if !ok {
+			return false, "", "", &loopError{message: "Fixer blocked outcome requires a valid failure_kind", kind: FailureRetryableTransient}
+		}
+		message := firstNonEmpty(strings.TrimSpace(parsed.Summary), result.Summary, "fixer repair task was blocked")
+		return true, message, kind, nil
+	default:
+		return false, "", "", &loopError{message: "Fixer agent completed with missing or unrecognized structured outcome", kind: FailureRetryableTransient}
+	}
+}
+
+// parseFixerBlockedFailureKind bounds a blocked repair to the classifications
+// Looper actually acts on, so it cannot smuggle in an arbitrary one.
+//
+// The prompt advertises only retryable_transient and manual_intervention.
+// retryable_after_resume stays accepted rather than rejected: it is a valid kind
+// elsewhere in the runner, and an agent that reports it should not have its block
+// downgraded to a contract failure. It is not advertised because a repair-step
+// block resumes identically to retryable_transient — NormalizeResumePolicy only
+// applies a kind-derived policy when none is set, and a resumed checkpoint always
+// carries advance_from_checkpoint — so offering it would promise a re-prepared
+// environment that this path does not deliver.
+func parseFixerBlockedFailureKind(raw string) (QueueFailureKind, bool) {
+	switch QueueFailureKind(strings.ToLower(strings.TrimSpace(raw))) {
+	case FailureManualIntervention:
+		return FailureManualIntervention, true
+	case FailureRetryableAfterResume:
+		return FailureRetryableAfterResume, true
+	case FailureRetryableTransient:
+		return FailureRetryableTransient, true
+	default:
+		return "", false
+	}
+}
+
 // extractCompletionMarkerPayload mirrors the agent core's last-line scan but
 // without coupling fixer code to internal/agent's parser. It returns the JSON
 // payload after the final __LOOPER_RESULT__= line, or "" if absent.
 func extractCompletionMarkerPayload(combined string) string {
+	raw := scanCompletionMarkerPayloads(combined)
+	if json.Valid([]byte(raw)) {
+		return raw
+	}
+	// Codex --json embeds the marker inside a JSON event (an agent_message or a
+	// command output) rather than printing it on a stdout line. Scanning the raw
+	// stream then yields the marker's JSON-escaped tail, which is not valid JSON --
+	// so translate the JSONL stream into the text the agent actually produced and
+	// scan that instead.
+	if translated := agent.CombinedTextFromJSONL(combined); translated != "" {
+		if payload := scanCompletionMarkerPayloads(translated); json.Valid([]byte(payload)) {
+			return payload
+		}
+	}
+	// Nothing parseable anywhere. Return the raw find so an unparseable marker is
+	// reported as invalid rather than as no marker at all.
+	return raw
+}
+
+func scanCompletionMarkerPayloads(combined string) string {
 	for _, payload := range agent.CompletionMarkerPayloads(combined) {
 		if isTemplateCompletionPayload(payload) {
 			continue
@@ -1260,15 +1347,13 @@ func isTemplateCompletionPayload(payload string) bool {
 	if err := json.Unmarshal([]byte(payload), &parsed); err != nil {
 		return false
 	}
+	// "<one-sentence summary>" is the literal placeholder every completion
+	// template emits, and a real agent never leaves the summary as that exact
+	// token. Keying on it alone also covers the fixer template, which carries
+	// outcome/failure_kind placeholders alongside the summary and so would slip
+	// past a single-key shape check.
 	summary, _ := parsed["summary"].(string)
-	if strings.TrimSpace(summary) != "<one-sentence summary>" {
-		return false
-	}
-	if len(parsed) != 1 {
-		return false
-	}
-	_, ok := parsed["summary"]
-	return ok
+	return strings.TrimSpace(summary) == "<one-sentence summary>"
 }
 
 func sanitizeReplyExplanation(raw string) string {
@@ -3236,6 +3321,34 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 			})
 		}
 		return checkpoint, err
+	}
+	// The parse gate above only proves a structured result arrived. The declared
+	// outcome is what authorizes Looper advancing to reconcile/validate/push, so
+	// read it before any downstream step can act on this run.
+	//
+	// Scope: this governs Looper's publish steps, not the agent's own. When
+	// allowAutoPush is set and no validation commands are configured, the repair
+	// prompt still asks the agent to push its commits directly, so partial work can
+	// reach the PR before this outcome exists. That is a pre-existing property of
+	// that configuration -- configuring validation commands makes the repair
+	// local-only via RestrictToolNetwork -- and closing it means changing the
+	// fixer's push model, tracked separately rather than folded into this gate.
+	//
+	// Neither rejection path records checkpoint.Repair. A stored repair record with
+	// ParseStatus "parsed" is what the replay guard at the top of this function
+	// treats as a finished repair, so recording one here would let the next
+	// automatic retry of a retryable block skip the agent entirely and publish
+	// whatever the blocked attempt left behind. The agent's own reason survives as
+	// the run's failure summary and in the event log; leaving the repair unrecorded
+	// keeps the step replayable, which is what a retryable classification means.
+	blocked, blockedMessage, blockedKind, outcomeErr := fixerRepairTaskOutcome(result)
+	if outcomeErr != nil {
+		return checkpoint, outcomeErr
+	}
+	if blocked {
+		// A declared block is the agent reporting it could not do the work, not a
+		// Looper failure, so it fails with the kind the agent declared.
+		return checkpoint, &loopError{message: blockedMessage, kind: blockedKind}
 	}
 	if held, summary, err := r.fixerHoldSummary(ctx, input.Project, input.Loop, input.Repo, input.PRNumber); err != nil {
 		return checkpoint, err
@@ -7746,7 +7859,7 @@ func buildFixerPrompt(projectID string, instructionConfig config.Config, repo st
 		parts = append(parts, noRemoteLifecyclePromptInstruction("fixer", "", "", disclosureCfg, agentRuntime, agentModel))
 	}
 	parts = append(parts, "For fixer commits, prefer a fresh commit subject that precisely summarizes the repair changes from this round. Do not mechanically reuse the PR title or a previous fixer subject when this round's edits are narrower or different.")
-	return agent.AppendCompletionInstruction(strings.Join(parts, "\n\n")), instructionBlock
+	return agent.AppendFixerCompletionInstruction(strings.Join(parts, "\n\n")), instructionBlock
 }
 
 func customInstructionConfig(value *config.Config) config.Config {

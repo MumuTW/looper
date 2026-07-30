@@ -187,6 +187,7 @@ type Result struct {
 	Stderr                       string
 	ParseStatus                  string
 	CompletionSignal             string
+	CompletionPayload            string
 	Artifacts                    []string
 	ChangedFiles                 []string
 	Commits                      []string
@@ -201,13 +202,14 @@ type Result struct {
 }
 
 type completionParse struct {
-	ParseStatus      string
-	CompletionSignal string
-	Summary          string
-	Artifacts        []string
-	ChangedFiles     []string
-	Commits          []string
-	Lifecycle        *lifecycle.State
+	ParseStatus       string
+	CompletionSignal  string
+	CompletionPayload string
+	Summary           string
+	Artifacts         []string
+	ChangedFiles      []string
+	Commits           []string
+	Lifecycle         *lifecycle.State
 }
 
 type Execution interface {
@@ -985,6 +987,7 @@ func (x *execution) run(ctx context.Context) {
 		Stderr:                       stderr,
 		ParseStatus:                  completion.ParseStatus,
 		CompletionSignal:             completion.CompletionSignal,
+		CompletionPayload:            completion.CompletionPayload,
 		Artifacts:                    append([]string(nil), completion.Artifacts...),
 		ChangedFiles:                 append([]string(nil), completion.ChangedFiles...),
 		Commits:                      append([]string(nil), completion.Commits...),
@@ -1373,6 +1376,7 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 		Stderr:                       stderr,
 		ParseStatus:                  completion.ParseStatus,
 		CompletionSignal:             completion.CompletionSignal,
+		CompletionPayload:            completion.CompletionPayload,
 		Artifacts:                    append([]string(nil), completion.Artifacts...),
 		ChangedFiles:                 append([]string(nil), completion.ChangedFiles...),
 		Commits:                      append([]string(nil), completion.Commits...),
@@ -2643,11 +2647,12 @@ func parseCompletion(stdout, stderr string) completionParse {
 			return completionParse{ParseStatus: "invalid_json", CompletionSignal: CompletionMarkerPrefix}
 		}
 		result := completionParse{
-			ParseStatus:      "parsed",
-			CompletionSignal: CompletionMarkerPrefix,
-			Artifacts:        asStringSlice(parsed["artifacts"]),
-			ChangedFiles:     asStringSlice(parsed["changedFiles"]),
-			Commits:          asStringSlice(parsed["commits"]),
+			ParseStatus:       "parsed",
+			CompletionSignal:  CompletionMarkerPrefix,
+			CompletionPayload: payload,
+			Artifacts:         asStringSlice(parsed["artifacts"]),
+			ChangedFiles:      asStringSlice(parsed["changedFiles"]),
+			Commits:           asStringSlice(parsed["commits"]),
 		}
 		if state, err := lifecycle.FromMap(parsed["git_pr_lifecycle"]); err == nil {
 			result.Lifecycle = state
@@ -2655,7 +2660,7 @@ func parseCompletion(stdout, stderr string) completionParse {
 		if summary, ok := parsed["summary"].(string); ok {
 			result.Summary = summary
 		}
-		if isTemplateCompletion(result, parsed) {
+		if isTemplateCompletion(result) {
 			continue
 		}
 		return result
@@ -2663,15 +2668,14 @@ func parseCompletion(stdout, stderr string) completionParse {
 	return completionParse{ParseStatus: "missing"}
 }
 
-func isTemplateCompletion(result completionParse, parsed map[string]any) bool {
-	if strings.TrimSpace(result.Summary) != "<one-sentence summary>" {
-		return false
-	}
-	if len(parsed) != 1 {
-		return false
-	}
-	_, ok := parsed["summary"]
-	return ok
+// isTemplateCompletion rejects an echoed completion template. Every completion
+// template — the generic summary-only shape and the fixer's outcome/failure_kind
+// shapes — emits the literal "<one-sentence summary>" placeholder, and a real
+// agent never leaves the summary as that exact token. Keying on the placeholder
+// alone covers the fixer templates, which carry extra keys alongside the summary
+// and so slip past a single-key shape check.
+func isTemplateCompletion(result completionParse) bool {
+	return strings.TrimSpace(result.Summary) == "<one-sentence summary>"
 }
 
 func IsAgentSetupFailureMessage(message string) bool {

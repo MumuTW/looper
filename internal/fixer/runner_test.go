@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nexu-io/looper/internal/agent"
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/disclosure"
 	"github.com/nexu-io/looper/internal/domain"
@@ -6797,6 +6798,26 @@ func (f *fakeAgentExecutor) Start(_ context.Context, input AgentRunInput) (Agent
 	}
 	result := f.results[0]
 	f.results = f.results[1:]
+	// The fixer completion contract requires a declared `outcome`. Tests that only
+	// care about a successful repair set ParseStatus "parsed" without spelling out
+	// a marker, so default the outcome for them; a result that already declares one
+	// (a blocked repair, say) is left exactly as written.
+	if result.ParseStatus == "parsed" {
+		payload := extractCompletionMarkerPayload(result.Stdout + "\n" + result.Stderr)
+		completion := map[string]any{}
+		if payload == "" {
+			completion["summary"] = result.Summary
+		} else if json.Unmarshal([]byte(payload), &completion) != nil {
+			completion = nil
+		}
+		if completion != nil {
+			if _, ok := completion["outcome"]; !ok {
+				completion["outcome"] = "completed"
+				encoded, _ := json.Marshal(completion)
+				result.Stderr += "\n" + agent.CompletionMarkerPrefix + string(encoded)
+			}
+		}
+	}
 	return fakeAgentExecution{result: result}, nil
 }
 
