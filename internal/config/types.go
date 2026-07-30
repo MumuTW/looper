@@ -685,6 +685,13 @@ type PartialProviderConfig struct {
 	TokenEnv *string           `json:"tokenEnv,omitempty"`
 	TeaLogin *string           `json:"teaLogin,omitempty"`
 	TeaPath  *string           `json:"teaPath,omitempty"`
+	// Workspace and ProjectID are deprecated decode-only fields retained so a
+	// config file that still uses the removed Plane schema decodes under
+	// DisallowUnknownFields. They are dropped during normalization and ignored
+	// for github/forgejo providers; validation rejects a "plane" kind
+	// explicitly instead of surfacing a misleading unknown-field error.
+	Workspace *string `json:"workspace,omitempty"`
+	ProjectID *string `json:"projectId,omitempty"`
 }
 
 type Config struct {
@@ -1007,6 +1014,12 @@ type PartialIssueRoleTriggersConfig struct {
 	Labels                     *[]string  `json:"labels,omitempty"`
 	LabelMode                  *LabelMode `json:"labelMode,omitempty"`
 	RequireAssigneeCurrentUser *bool      `json:"requireAssigneeCurrentUser,omitempty"`
+	// PlaneAssigneeID is a deprecated decode-only field retained so a config
+	// file that still uses the removed Plane schema decodes under
+	// DisallowUnknownFields. It is dropped during normalization; validation
+	// rejects a "plane" provider kind explicitly rather than surfacing a
+	// misleading unknown-field error.
+	PlaneAssigneeID *string `json:"planeAssigneeId,omitempty"`
 }
 
 type PartialPullRequestRoleTriggersConfig struct {
@@ -1084,6 +1097,12 @@ type PartialRoleDiscoveryConfig struct {
 
 	// Issue-source only.
 	RequireAssigneeCurrentUser *bool `json:"requireAssigneeCurrentUser,omitempty"`
+	// PlaneAssigneeID is a deprecated decode-only field retained so a config
+	// file that still uses the removed Plane schema decodes under
+	// DisallowUnknownFields. It is dropped during normalization; validation
+	// rejects a "plane" provider kind explicitly rather than surfacing a
+	// misleading unknown-field error.
+	PlaneAssigneeID *string `json:"planeAssigneeId,omitempty"`
 
 	// Pull-request-source only.
 	IncludeDrafts        *bool         `json:"includeDrafts,omitempty"`

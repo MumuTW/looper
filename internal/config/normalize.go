@@ -2130,6 +2130,10 @@ func clonePartialRoleDiscoveryConfig(config *PartialRoleDiscoveryConfig) *Partia
 		value := *config.RequireAssigneeCurrentUser
 		cloned.RequireAssigneeCurrentUser = &value
 	}
+	if config.PlaneAssigneeID != nil {
+		value := *config.PlaneAssigneeID
+		cloned.PlaneAssigneeID = &value
+	}
 	if config.IncludeDrafts != nil {
 		value := *config.IncludeDrafts
 		cloned.IncludeDrafts = &value
