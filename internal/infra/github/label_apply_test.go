@@ -2,6 +2,7 @@ package github
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -129,5 +130,48 @@ func TestApplyingLabelsSurfacesNonDuplicateCreateFailure(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "403") {
 		t.Fatalf("AddIssueLabels() error = %v, want the original 403 failure propagated", err)
+	}
+}
+
+// The requested labels are the authority: a caller asking for a label has
+// already decided it belongs. Listing is drift detection — it only skips
+// creates that would fail anyway — so a transient list failure must not block
+// the mutation the caller asked for. Before the read-before-write change there
+// was no list to fail; turning it into a gate would have been a new way for
+// label application to stop working.
+func TestApplyingLabelsSurvivesAFailedLabelList(t *testing.T) {
+	t.Parallel()
+
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		switch {
+		case strings.HasPrefix(args, "label list "):
+			return shell.Result{}, errors.New("HTTP 502: Bad Gateway")
+		case strings.HasPrefix(args, "label create "+labels.DefaultPlanTrigger):
+			return shell.Result{Stdout: "{}"}, nil
+		case strings.HasPrefix(args, "api repos/acme/looper/issues/11/labels"):
+			return shell.Result{Stdout: "[]"}, nil
+		default:
+			t.Fatalf("unexpected gh args: %q", args)
+			return shell.Result{}, nil
+		}
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	if err := gateway.AddIssueLabels(context.Background(), IssueLabelsInput{
+		Repo:        "acme/looper",
+		IssueNumber: 11,
+		Labels:      []string{labels.DefaultPlanTrigger},
+	}); err != nil {
+		t.Fatalf("AddIssueLabels() error = %v, want a failed list to be survivable", err)
+	}
+
+	log := strings.Join(runner.calls, "\n")
+	if !strings.Contains(log, "api repos/acme/looper/issues/11/labels") {
+		t.Errorf("a failed label list blocked the label application:\n%s", log)
+	}
+	if strings.Contains(log, "--force") {
+		t.Errorf("recovered with --force, which is the rewrite this path avoids:\n%s", log)
 	}
 }
