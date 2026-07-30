@@ -17,8 +17,6 @@ import (
 	"github.com/nexu-io/looper/internal/processsandbox"
 )
 
-const permissionProfile = "looper-validation"
-
 // Sandbox is the legacy Codex-specific disposable tool environment used by
 // validation-gated Codex agents. Repository commands use processsandbox.Run.
 type Sandbox struct {

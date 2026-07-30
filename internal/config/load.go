@@ -1664,14 +1664,6 @@ func ensureDaemonConfig(partial *PartialConfig) *PartialDaemonConfig {
 	return partial.Daemon
 }
 
-func ensurePackageConfig(partial *PartialConfig) *PartialPackageConfig {
-	if partial.Package == nil {
-		partial.Package = &PartialPackageConfig{}
-	}
-
-	return partial.Package
-}
-
 func ensureDefaultsConfig(partial *PartialConfig) *PartialDefaultsConfig {
 	if partial.Defaults == nil {
 		partial.Defaults = &PartialDefaultsConfig{}
