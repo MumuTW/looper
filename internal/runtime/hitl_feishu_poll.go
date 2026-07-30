@@ -30,11 +30,11 @@ type feishuInboxEvent struct {
 }
 
 type feishuHITLPollDeps struct {
-	loopByRoot    func(ctx contextType, rootID string) string
-	loopBySeq     func(ctx contextType, seq int64) string
-	deliverAnswer func(ctx contextType, loopID, answer string) error
+	loopByRoot     func(ctx contextType, rootID string) string
+	loopBySeq      func(ctx contextType, seq int64) string
+	deliverAnswer  func(ctx contextType, loopID, answer string) error
 	enqueueMessage func(ctx contextType, loopID, text string) error
-	logWarn       func(msg string, fields map[string]any)
+	logWarn        func(msg string, fields map[string]any)
 }
 
 // pollFeishuHITLInboxOnce delivers answers among a batch of inbox events.
