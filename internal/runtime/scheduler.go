@@ -2483,16 +2483,12 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 			continue
 		}
 		provider := providers.ForProject(project.ID)
-		repo := repoFromProjectMetadata(project.MetadataJSON)
-		if input.Config != nil {
-			binding, ok := runtimeProjectBinding(*input.Config, project.ID)
-			if !ok {
-				if input.Logger != nil {
-					input.Logger.Debug("scheduler skipped project missing from captured catalog", map[string]any{"projectId": project.ID})
-				}
-				continue
+		repo, inCatalog := schedulerProjectRepo(input, project)
+		if !inCatalog {
+			if input.Logger != nil {
+				input.Logger.Debug("scheduler skipped project missing from captured catalog", map[string]any{"projectId": project.ID})
 			}
-			repo = strings.TrimSpace(binding.Repo)
+			continue
 		}
 		var snapshot *githubinfra.DiscoverySnapshot
 		if provider.Capabilities().GitHubCLIPullRequestCreation {
@@ -2583,11 +2579,36 @@ func coordinatorEnabledForProject(input defaultSchedulerTickInput, projectID str
 	return input.CoordinatorEnabled(projectID)
 }
 
+// schedulerProjectRepo resolves the repo a project's discovery reads, with the
+// same precedence the lane walk uses: the captured catalog binding when a config
+// is present, otherwise the project's stored metadata. inCatalog is false when a
+// config is present but the project is absent from it.
+func schedulerProjectRepo(input defaultSchedulerTickInput, project storage.ProjectRecord) (repo string, inCatalog bool) {
+	repo = repoFromProjectMetadata(project.MetadataJSON)
+	if input.Config != nil {
+		binding, ok := runtimeProjectBinding(*input.Config, project.ID)
+		if !ok {
+			return "", false
+		}
+		repo = strings.TrimSpace(binding.Repo)
+	}
+	return repo, true
+}
+
 func projectDiscoverySnapshotOptions(input defaultSchedulerTickInput, projectID string) githubinfra.DiscoverySnapshotOptions {
 	prLimit := 30
 	issueLimit := 30
 	if input.Coordinator != nil && coordinatorEnabledForProject(input, projectID) {
 		issueLimit = maxInt(issueLimit, 100)
+	}
+	// Size the page to the largest limit a lane actually asks for. Gatekeeper lists
+	// 100 open PRs with no filters, so against a 30-PR page
+	// shouldFallbackToFilteredPullRequestQuery is unconditionally true: every
+	// gatekeeper tick discarded the page it was handed and paid a second raw
+	// 100-PR query. Matching the limit makes the shared page usable and removes
+	// that duplicate query whether or not anything prewarms it.
+	if input.Gatekeeper != nil {
+		prLimit = maxInt(prLimit, gatekeeper.DefaultDiscoveryPullRequestLimit)
 	}
 	return githubinfra.DiscoverySnapshotOptions{PullRequestLimit: prLimit, IssueLimit: issueLimit}
 }

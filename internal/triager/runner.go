@@ -174,10 +174,12 @@ type Runner struct {
 }
 
 type DiscoveryInput struct {
-	ProjectID      string
-	Repo           string
-	Snapshot       *githubinfra.DiscoverySnapshot
-	DecisionBudget *int
+	ProjectID string
+	Repo      string
+	Snapshot  *githubinfra.DiscoverySnapshot
+	// DecisionBudget is the tick-wide decision cap shared by every project in the
+	// tick. Nil means uncapped.
+	DecisionBudget *DecisionBudget
 }
 
 type DiscoveryResult struct {
@@ -389,7 +391,7 @@ func pendingSourceStates(states map[string]*sourceState) []*sourceState {
 	return pending
 }
 
-func (r *Runner) processSourceState(ctx context.Context, project storage.ProjectRecord, repo string, state *sourceState, decisionBudget *int, result *DiscoveryResult) error {
+func (r *Runner) processSourceState(ctx context.Context, project storage.ProjectRecord, repo string, state *sourceState, decisionBudget *DecisionBudget, result *DiscoveryResult) error {
 	enrollment := state.enrollment
 	detail, err := r.github.ViewIssue(ctx, githubinfra.ViewIssueInput{Repo: repo, IssueNumber: enrollment.IssueNumber, CWD: project.RepoPath})
 	if err != nil {
@@ -412,13 +414,17 @@ func (r *Runner) processSourceState(ctx context.Context, project storage.Project
 	detailSource := currentSource
 	report := state.report
 	if report == nil {
-		if result.DecisionsAttempted >= r.decisionLimit || (decisionBudget != nil && *decisionBudget <= 0) {
+		// The per-runner limit is checked first because it is this project's own
+		// count and must not consume a shared reservation. Reserve is the atomic
+		// check-and-claim against the tick-wide budget: concurrent projects can no
+		// longer each observe the same remaining count and all proceed.
+		if result.DecisionsAttempted >= r.decisionLimit {
+			return nil
+		}
+		if !decisionBudget.Reserve() {
 			return nil
 		}
 		result.DecisionsAttempted++
-		if decisionBudget != nil {
-			*decisionBudget--
-		}
 		decision, err := r.decide(ctx, project, repo, detail)
 		if err != nil {
 			return err
