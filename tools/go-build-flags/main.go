@@ -35,11 +35,11 @@ func applyDirtySuffix(value string, dirty bool) string {
 //
 // internal/dashboard/assets is excluded because the build itself writes there
 // before this probe runs: ci.yml and release.yml both run `pnpm run build`
-// first, and vite's emptyOutDir wipes the directory — deleting the tracked
-// .gitkeep and emitting untracked bundles. Without the exclusion every release
-// artifact would carry -dirty, which is exactly the false stamp this tool
-// exists to prevent. Hand edits under a generated output directory are not a
-// signal worth protecting.
+// first, and vite's emptyOutDir wipes the directory. The generated bundles are
+// already gitignored, but .gitkeep is tracked, so the wipe registers as a
+// deletion and every release artifact would carry -dirty — exactly the false
+// stamp this tool exists to prevent. Hand edits under a generated output
+// directory are not a signal worth protecting.
 //
 // Uncertainty resolves to clean. A tarball build has no git at all, so
 // suffixing on a failed probe would corrupt artifact versions to avoid a stamp
