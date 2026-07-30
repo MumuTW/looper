@@ -6735,7 +6735,10 @@ func (r *Runner) completeQueuedFixerItemsForLoop(ctx context.Context, loopID str
 
 func (r *Runner) clearFixerFollowupMetadata(ctx context.Context, loop storage.LoopRecord) (storage.LoopRecord, error) {
 	apply := func(updated *storage.LoopRecord) error {
-		meta := parseJSONObject(updated.MetadataJSON)
+		meta, err := loops.DecodeMetadataObjectForWrite(updated.MetadataJSON)
+		if err != nil {
+			return err
+		}
 		delete(meta, "fixerFollowup")
 		delete(meta, "lastNoopResolveHeadSha")
 		delete(meta, "lastNoopResolveFixItemsHash")

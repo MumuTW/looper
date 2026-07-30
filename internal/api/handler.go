@@ -6861,7 +6861,10 @@ func resetFixerLoopRetryMetadata(current *string) (*string, error) {
 	if current == nil || strings.TrimSpace(*current) == "" {
 		return current, nil
 	}
-	metadata := parseJSONObject(current)
+	metadata, err := loops.DecodeMetadataObjectForWrite(current)
+	if err != nil {
+		return nil, err
+	}
 	delete(metadata, "fixerFailureStreak")
 	if pauseReason, _ := metadata["pauseReason"].(string); pauseReason == "agent_failure_streak" {
 		delete(metadata, "pauseReason")

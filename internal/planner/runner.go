@@ -1755,9 +1755,12 @@ func (r *Runner) ensureLoopForIssueWithAuthority(ctx context.Context, project st
 				updated.NextRunAt = &nowISO
 			}
 			metadataJSON, err := mergeLoopMetadataJSON(existing.MetadataJSON, map[string]any{"issueTitle": issue.Title, "issueURL": issue.URL, "issueNumber": issue.Number, "specPath": buildSpecPath(r.now(), issue.Number, issue.Title)})
-			if err == nil {
-				updated.MetadataJSON = stringPtr(metadataJSON)
+			if err != nil {
+				// Discovery must not report success and enqueue work without
+				// the refreshed issue metadata.
+				return loopUpsertResult{}, fmt.Errorf("merge planner discovery metadata: %w", err)
 			}
+			updated.MetadataJSON = stringPtr(metadataJSON)
 			updated.UpdatedAt = nowISO
 			if err := r.repos.Loops.Upsert(ctx, updated); err != nil {
 				return loopUpsertResult{}, err
@@ -1796,9 +1799,10 @@ func (r *Runner) refreshIssueLoop(ctx context.Context, existing storage.LoopReco
 		metadata[plannerQueueRoutingAuthorityKey] = authority
 	}
 	metadataJSON, err := mergeLoopMetadataJSON(existing.MetadataJSON, metadata)
-	if err == nil {
-		updated.MetadataJSON = stringPtr(metadataJSON)
+	if err != nil {
+		return storage.LoopRecord{}, fmt.Errorf("merge planner issue-refresh metadata: %w", err)
 	}
+	updated.MetadataJSON = stringPtr(metadataJSON)
 	updated.UpdatedAt = nowISO
 	if err := r.repos.Loops.Upsert(ctx, updated); err != nil {
 		return storage.LoopRecord{}, err

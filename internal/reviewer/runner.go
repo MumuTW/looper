@@ -4577,13 +4577,22 @@ func isValidBlockingReviewEvent(value string) bool {
 }
 
 func (r *Runner) recordPublishedReviewProgress(ctx context.Context, input stepInput, pending pendingReviewCheckpoint, reviewEvent ReviewEvent) error {
+	var mergeErr error
 	if _, err := r.updateLoop(ctx, input.Loop, func(updated *storage.LoopRecord) {
 		metadataJSON, err := mergeLoopMetadataJSON(updated.MetadataJSON, map[string]any{"lastPublishedHeadSha": pending.HeadSHA, "lastReviewEvent": string(reviewEvent), "lastReviewSummary": pending.Summary, "lastPublishedAt": r.nowISO()})
-		if err == nil {
-			updated.MetadataJSON = stringPtr(metadataJSON)
+		if err != nil {
+			mergeErr = err
+			return
 		}
+		updated.MetadataJSON = stringPtr(metadataJSON)
 	}); err != nil {
 		return err
+	}
+	if mergeErr != nil {
+		// The review was already published externally; failing here keeps the
+		// idempotency fields' absence loud so the operator sees why a later
+		// discovery may re-run this head instead of silently double-publishing.
+		return fmt.Errorf("record published review progress: %w", mergeErr)
 	}
 	r.appendEvent(ctx, eventInput{eventType: "pr.review.posted", projectID: input.Project.ID, loopID: input.Loop.ID, runID: input.Run.ID, entityType: "pull_request", entityID: fmt.Sprintf("%s#%d", input.Repo, input.PRNumber), payload: map[string]any{"repo": input.Repo, "prNumber": input.PRNumber, "event": string(reviewEvent), "headSha": pending.HeadSHA}})
 	return nil
@@ -5987,7 +5996,10 @@ func loopEnabledMetadataMissing(meta map[string]any) bool {
 }
 
 func (r *Runner) ensureLoopMetadataJSON(current *string, projectID, repo string, prNumber int64) (string, error) {
-	meta := parseJSONObject(current)
+	meta, err := loops.DecodeMetadataObjectForWrite(current)
+	if err != nil {
+		return "", err
+	}
 	loopMeta, _ := meta["loop"].(map[string]any)
 	if loopMeta == nil {
 		loopMeta = map[string]any{}
