@@ -36,6 +36,14 @@ func TestDiscoveryLanesRegisterTriagerAheadOfPlannerWithoutChangingFixerSupport(
 	if !byName["coordinator"].Supported(githubCapabilities) || byName["coordinator"].Supported(forgejoCapabilities) || byName["coordinator"].Supported(planeCapabilities) {
 		t.Fatal("coordinator must run only where GitHub owns issue authority")
 	}
+	// triager and coordinator both discover GitHub issues through the GitHub
+	// gateway, so they must share one authority predicate and never drift apart
+	// (the per-lane predicates previously drifted to different wrong flags).
+	for _, capabilities := range []forge.Capabilities{githubCapabilities, forgejoCapabilities, planeCapabilities} {
+		if byName["triager"].Supported(capabilities) != byName["coordinator"].Supported(capabilities) {
+			t.Fatalf("triager and coordinator must share GitHub issue authority, drifted on %#v", capabilities)
+		}
+	}
 }
 
 func TestTriagerLaneSharesOneDecisionBudgetAcrossProjects(t *testing.T) {
