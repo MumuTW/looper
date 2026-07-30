@@ -227,6 +227,14 @@ write-authorized confirmation is the Authority.
 stated on its Runner doc.)
 A Role whose memory lives entirely in GitHub (labels, comments with markers, event timeline). It owns no private database tables. Coordinator is stateless. Worker, Planner, Reviewer, and Fixer are not — they persist runs in the local SQLite database.
 
+**Coding-agent runtime contract**:
+Defined at `agent.RuntimeContract` in `internal/agent`, whose doc comment carries
+the semantics: the behavior-oriented adapter declaration that is the Authority
+for capability policy. It records versioned evidence and distinguishes native
+CLI behavior from Looper translation/enforcement and unsupported behavior.
+ConfiguredExecutor remains the owner of common process-supervision guarantees.
+_Avoid_: vendor feature flags, provider capabilities, inferred CLI support.
+
 ### Comment markers
 
 **Stamp**:

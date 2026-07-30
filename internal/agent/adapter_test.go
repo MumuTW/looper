@@ -15,7 +15,7 @@ func TestRuntimeAdapterRegistryCoversEveryConfigurableVendor(t *testing.T) {
 			t.Errorf("vendor %q has no runtime adapter", vendor)
 			continue
 		}
-		if adapter.command == "" {
+		if adapter.contract.DefaultCommand == "" {
 			t.Errorf("vendor %q adapter has no command", vendor)
 		}
 		if adapter.resolveStartArgs == nil {

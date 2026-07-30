@@ -433,7 +433,7 @@ func (e *ConfiguredExecutor) markNativeResumeFailed(ctx context.Context, executi
 
 func nativeResumeSupported(vendor config.AgentVendor) bool {
 	adapter, ok := runtimeAdapterFor(vendor)
-	return ok && adapter.resolveNativeResumeArgs != nil
+	return ok && adapter.contract.Supports(CapabilityHeadlessResume) && adapter.resolveNativeResumeArgs != nil
 }
 
 func isRecoverableNativeResumeSource(status string, resumeStatus *string) bool {
@@ -463,7 +463,7 @@ func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Executi
 	startedAt := e.now().UTC()
 	startedAtISO := eventlog.FormatJavaScriptISOString(startedAt)
 	cfg := e.effectiveConfig(input)
-	if input.RestrictToolNetwork && cfg.Vendor != config.AgentVendorCodex {
+	if input.RestrictToolNetwork && !runtimeCapabilitySupported(cfg.Vendor, CapabilityToolNetworkRestriction) {
 		return nil, fmt.Errorf("tool-network restriction is supported only for codex; refusing validation-gated %s execution", cfg.Vendor)
 	}
 	if input.RestrictToolNetwork {
@@ -1494,7 +1494,7 @@ func (x *execution) jsonMode() bool {
 		return false
 	}
 	cfg := x.executor.effectiveConfig(x.input)
-	return cfg.LiveToolEvents && cfg.Vendor == config.AgentVendorCodex
+	return cfg.LiveToolEvents && runtimeCapabilitySupported(cfg.Vendor, CapabilityStructuredLiveEvents)
 }
 
 // codexToolTail renders the last n command executions from a codex JSONL blob.
@@ -2045,7 +2045,7 @@ func ResolveSpawnWithNativeResume(cfg ExecutorConfig, workingDirectory string, p
 // opencode/cursor stay disabled until the same 3-turn check passes for them.
 func InteractiveTakeoverSupported(vendor config.AgentVendor) bool {
 	adapter, ok := runtimeAdapterFor(vendor)
-	return ok && adapter.resolveInteractiveResume != nil
+	return ok && adapter.contract.Supports(CapabilityInteractiveTakeover) && adapter.resolveInteractiveResume != nil
 }
 
 // InteractiveResumeCommandLine renders the shell command a human runs to take
@@ -2089,8 +2089,8 @@ func resolveCommand(cfg ExecutorConfig) string {
 	if override, ok := cfg.Params["command"].(string); ok && strings.TrimSpace(override) != "" {
 		return override
 	}
-	if adapter, ok := runtimeAdapterFor(cfg.Vendor); ok && adapter.command != "" {
-		return adapter.command
+	if adapter, ok := runtimeAdapterFor(cfg.Vendor); ok && adapter.contract.DefaultCommand != "" {
+		return adapter.contract.DefaultCommand
 	}
 	return string(cfg.Vendor)
 }
