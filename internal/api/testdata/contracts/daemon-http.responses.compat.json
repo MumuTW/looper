@@ -1055,10 +1055,15 @@
           "worktreeRoot": null,
           "createdAt": "2026-04-11T12:00:00.000Z",
           "updatedAt": "2026-04-11T12:00:00.000Z",
-          "discoveredPullRequests": 1,
-          "discoveredWorktrees": 2,
+          "discovery": {
+            "status": "pending",
+            "snapshotMode": "async",
+            "updatedAt": "2026-04-11T12:00:00.000Z"
+          },
+          "discoveredPullRequests": 0,
+          "discoveredWorktrees": 0,
           "pendingSnapshots": 0,
-          "capturedSnapshots": 1,
+          "capturedSnapshots": 0,
           "warnings": []
         },
         "requestId": "fixture-request-id"
