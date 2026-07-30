@@ -1888,6 +1888,93 @@ func TestResolveWorkerInputFallsBackToWorkerRepoForIssueHydration(t *testing.T) 
 	}
 }
 
+// A PR-target worker whose body carries no spec marker is still dispatchable
+// when the operator supplies a prompt: the prompt is a complete instruction,
+// so resolveWorkerInput must not stop for manual intervention just because no
+// spec path was parsed. Only the absence of both spec path and prompt stops it.
+func TestResolveWorkerInputAcceptsPromptForPullRequestWithoutSpecPath(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{prDetail: PullRequestDetail{Number: 42, State: "open", Title: "Existing PR", BaseRefName: "main", HeadRefName: "feature/pr-42", HeadSHA: "abc123"}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil {
+		t.Fatalf("Projects.GetByID() error = %v", err)
+	}
+	prNumber := int64(42)
+	loopTarget := "pr:acme/looper:42"
+	loopMeta := `{"worker":{"repo":"acme/looper","baseBranch":"main"}}`
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_worker_pr_prompt", Seq: 3, ProjectID: "project_1", Type: "worker", TargetType: "pull_request", TargetID: &loopTarget, Repo: stringPtr("acme/looper"), PRNumber: &prNumber, Status: "queued", MetadataJSON: &loopMeta, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	projectID := "project_1"
+	payload := `{"repo":"acme/looper","baseBranch":"main","prompt":"Fix the failing tests on this PR"}`
+	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_worker_pr_prompt", ProjectID: &projectID, LoopID: stringPtr("loop_worker_pr_prompt"), Type: "worker", TargetType: "pull_request", TargetID: loopTarget, Repo: stringPtr("acme/looper"), PRNumber: &prNumber, DedupeKey: "worker:acme/looper:42:prompt", Priority: 1, Status: "queued", AvailableAt: fixture.nowISO(), MaxAttempts: 3, PayloadJSON: &payload, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_pr_prompt")
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	queueItem, err := fixture.repos.Queue.GetByID(context.Background(), "queue_worker_pr_prompt")
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+
+	work, err := runner.resolveWorkerInput(context.Background(), *project, *loop, *queueItem, workerCheckpoint{})
+	if err != nil {
+		t.Fatalf("resolveWorkerInput() error = %v", err)
+	}
+	if work.SpecPath != "" {
+		t.Fatalf("work.SpecPath = %q, want empty (no spec marker on PR body)", work.SpecPath)
+	}
+	if work.Prompt != "Fix the failing tests on this PR" {
+		t.Fatalf("work.Prompt = %q, want the operator-supplied prompt preserved", work.Prompt)
+	}
+	if work.ExecutionMode != "push-existing" {
+		t.Fatalf("work.ExecutionMode = %q, want push-existing", work.ExecutionMode)
+	}
+	if work.PRNumber != 42 {
+		t.Fatalf("work.PRNumber = %d, want 42", work.PRNumber)
+	}
+}
+
+func TestResolveWorkerInputRejectsPullRequestWithoutSpecPathOrPrompt(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{prDetail: PullRequestDetail{Number: 42, State: "open", Title: "Existing PR", BaseRefName: "main", HeadRefName: "feature/pr-42", HeadSHA: "abc123"}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil {
+		t.Fatalf("Projects.GetByID() error = %v", err)
+	}
+	prNumber := int64(42)
+	loopTarget := "pr:acme/looper:42"
+	loopMeta := `{"worker":{"repo":"acme/looper","baseBranch":"main"}}`
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_worker_pr_none", Seq: 4, ProjectID: "project_1", Type: "worker", TargetType: "pull_request", TargetID: &loopTarget, Repo: stringPtr("acme/looper"), PRNumber: &prNumber, Status: "queued", MetadataJSON: &loopMeta, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	projectID := "project_1"
+	payload := `{"repo":"acme/looper","baseBranch":"main"}`
+	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_worker_pr_none", ProjectID: &projectID, LoopID: stringPtr("loop_worker_pr_none"), Type: "worker", TargetType: "pull_request", TargetID: loopTarget, Repo: stringPtr("acme/looper"), PRNumber: &prNumber, DedupeKey: "worker:acme/looper:42:none", Priority: 1, Status: "queued", AvailableAt: fixture.nowISO(), MaxAttempts: 3, PayloadJSON: &payload, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_pr_none")
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	queueItem, err := fixture.repos.Queue.GetByID(context.Background(), "queue_worker_pr_none")
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+
+	if _, err := runner.resolveWorkerInput(context.Background(), *project, *loop, *queueItem, workerCheckpoint{}); err == nil {
+		t.Fatalf("resolveWorkerInput() error = nil, want manual intervention")
+	}
+}
+
 func TestResolveWorkerInputUsesIssueURLRepoForIssueHydrationLookup(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -3227,7 +3314,7 @@ func TestProcessClaimedItemRechecksGitHubCLIAvailabilityAtRunTime(t *testing.T) 
 	}
 }
 
-func TestProcessClaimedItemPullRequestLoopRequiresSpecPath(t *testing.T) {
+func TestProcessClaimedItemPullRequestLoopRequiresSpecPathOrPrompt(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	nowISO := fixture.nowISO()
@@ -3239,7 +3326,7 @@ func TestProcessClaimedItemPullRequestLoopRequiresSpecPath(t *testing.T) {
 	}
 	projectID := "project_1"
 	loopID := "loop_worker_pr"
-	payload := `{"repo":"acme/looper","baseBranch":"main","prompt":"do not use prompt for PR loops"}`
+	payload := `{"repo":"acme/looper","baseBranch":"main"}`
 	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_worker_pr", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "pull_request", TargetID: loopTarget, Repo: stringPtr("acme/looper"), PRNumber: &prNumber, DedupeKey: "worker:acme/looper:42", Priority: 1, Status: "queued", AvailableAt: nowISO, MaxAttempts: 3, PayloadJSON: &payload, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
@@ -3252,8 +3339,8 @@ func TestProcessClaimedItemPullRequestLoopRequiresSpecPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
-	if result.FailureKind != FailureManualIntervention || !strings.Contains(result.Summary, "No explicit spec path found") {
-		t.Fatalf("result = %#v, want manual_intervention spec-path failure", result)
+	if result.FailureKind != FailureManualIntervention || !strings.Contains(result.Summary, "No explicit spec path or prompt found") {
+		t.Fatalf("result = %#v, want manual_intervention spec-path-or-prompt failure", result)
 	}
 }
 

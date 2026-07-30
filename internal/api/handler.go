@@ -5146,6 +5146,17 @@ func (h *Handler) requirePullRequestTarget(ctx context.Context, input requirePul
 	if snapshot.ProjectID != input.ProjectID {
 		return 0, apiError{code: pkgapi.ErrorCodePullRequestProjectMismatch, status: http.StatusConflict, message: fmt.Sprintf("Pull request %s#%d does not belong to project %s", input.Repo, input.PRNumber, input.ProjectID)}
 	}
+	// A snapshot captured while open does not prove the pull request is still
+	// open: project discovery only writes open PRs and never refreshes a
+	// snapshot after closure, so a stale-open snapshot would otherwise queue an
+	// expensive Worker run that pushes commits onto a closed or merged PR. The
+	// forge is the authority for current state; refresh it before accepting.
+	// When no lookup is configured, fall back to the snapshot's recorded state
+	// so a process without forge access keeps its previous behavior.
+	if h.context.LookupPullRequest != nil {
+		target, lookupErr := h.context.LookupPullRequest(ctx, input.Repo, input.PRNumber, project.RepoPath)
+		return h.acceptFreshPullRequestTarget(input, target, lookupErr)
+	}
 	if isOpen, known, stateErr := h.getPlannerPullRequestOpenState(ctx, input.ProjectID, input.Repo, input.PRNumber); stateErr == nil && known && !isOpen {
 		return 0, closedPullRequestTargetError(input.Repo, input.PRNumber)
 	}
@@ -5161,8 +5172,20 @@ func (h *Handler) resolveUnsnapshottedPullRequestTarget(ctx context.Context, pro
 		return 0, apiError{code: pkgapi.ErrorCodePullRequestNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Pull request not found: %s#%d", input.Repo, input.PRNumber)}
 	}
 	target, err := h.context.LookupPullRequest(ctx, input.Repo, input.PRNumber, project.RepoPath)
+	return h.acceptFreshPullRequestTarget(input, target, err)
+}
+
+// acceptFreshPullRequestTarget turns a fresh forge lookup into the resolved PR
+// number or an API error. Only a classified "does not exist" result is a 404;
+// any other lookup failure is a retryable server error so a transient forge
+// outage is not reported as a permanently missing target. A PR the forge
+// confirms closed or merged is rejected before work is queued.
+func (h *Handler) acceptFreshPullRequestTarget(input requirePullRequestTargetInput, target PullRequestTarget, err error) (int64, error) {
 	if err != nil {
-		return 0, apiError{code: pkgapi.ErrorCodePullRequestNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Pull request not found: %s#%d (%s)", input.Repo, input.PRNumber, err.Error())}
+		if IsPullRequestLookupNotFound(err) {
+			return 0, apiError{code: pkgapi.ErrorCodePullRequestNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Pull request not found: %s#%d (%s)", input.Repo, input.PRNumber, err.Error())}
+		}
+		return 0, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: fmt.Sprintf("Pull request lookup failed: %s#%d (%s)", input.Repo, input.PRNumber, err.Error())}
 	}
 	if target.Number <= 0 {
 		return 0, apiError{code: pkgapi.ErrorCodePullRequestNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Pull request not found: %s#%d", input.Repo, input.PRNumber)}

@@ -2529,8 +2529,13 @@ func (r *Runner) resolveWorkerInput(ctx context.Context, project storage.Project
 		work.ExecutionMode = "push-existing"
 		work.SpecPath = firstNonEmpty(work.SpecPath, specpr.ParseSpecPathFromPullRequestBody(detail.Body))
 		work.Reviewers = append([]string(nil), detail.ReviewRequests...)
-		if work.SpecPath == "" {
-			return workerInput{}, &loopError{message: fmt.Sprintf("No explicit spec path found for %s#%d", repo, prNumber), kind: FailureManualIntervention}
+		// A spec path is the usual input for a PR-target worker, but an
+		// operator-supplied prompt is also a complete instruction: the API
+		// accepts prNumber+prompt, and buildWorkerPromptWithInstructions reads
+		// the prompt directly when no spec path is present. Stop for manual
+		// intervention only when neither is available.
+		if work.SpecPath == "" && strings.TrimSpace(work.Prompt) == "" {
+			return workerInput{}, &loopError{message: fmt.Sprintf("No explicit spec path or prompt found for %s#%d", repo, prNumber), kind: FailureManualIntervention}
 		}
 	}
 	return work, nil

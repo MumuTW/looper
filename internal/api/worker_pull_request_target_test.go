@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -126,13 +127,36 @@ func TestHandlerWorkerCreateRejectsPullRequestTheForgeCannotFind(t *testing.T) {
 	seedWorkerPlannerArtifactsData(t, fixture.runtime, fixture.now)
 
 	handler := newWorkerTargetHandler(fixture, func(context.Context, string, int64, string) (PullRequestTarget, error) {
-		return PullRequestTarget{}, errors.New("no pull requests found for branch")
+		// The production lookup classifies a forge "does not exist" result with
+		// errPullRequestNotFound; only that becomes a 404.
+		return PullRequestTarget{}, fmt.Errorf("%w: no pull requests found for branch", errPullRequestNotFound)
 	})
 
 	recorder := postWorker(t, handler, `{"projectId":"project_1","repo":"acme/looper","prNumber":77,"baseBranch":"main"}`)
 	if recorder.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404; body=%s", recorder.Code, recorder.Body.String())
 	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	assertEqual(t, body["error"].(map[string]any)["code"], "PULL_REQUEST_NOT_FOUND")
+	assertNoQueuedWork(t, fixture)
+}
+
+func TestHandlerWorkerCreateSurfacesForgeLookupFailuresAsServerError(t *testing.T) {
+	fixture := newTestFixture(t)
+	seedWorkerPlannerArtifactsData(t, fixture.runtime, fixture.now)
+
+	handler := newWorkerTargetHandler(fixture, func(context.Context, string, int64, string) (PullRequestTarget, error) {
+		// An operational failure (timeout, unavailable executable) is not a
+		// missing PR and must stay a retryable server error, not a 404.
+		return PullRequestTarget{}, errors.New("context deadline exceeded")
+	})
+
+	recorder := postWorker(t, handler, `{"projectId":"project_1","repo":"acme/looper","prNumber":77,"baseBranch":"main"}`)
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500; body=%s", recorder.Code, recorder.Body.String())
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	assertEqual(t, body["error"].(map[string]any)["code"], "INTERNAL_ERROR")
 	assertNoQueuedWork(t, fixture)
 }
 
@@ -162,6 +186,57 @@ func TestHandlerWorkerCreateRejectsClosedSnapshottedPullRequest(t *testing.T) {
 		t.Fatalf("status = %d, want 400; body=%s", recorder.Code, recorder.Body.String())
 	}
 	assertNoQueuedWork(t, fixture)
+}
+
+// A snapshot captured while open does not prove the PR is still open. The forge
+// is the authority for current state, so a stale-open snapshot must be refreshed
+// before the PR is accepted: a PR the forge now reports closed is rejected even
+// though the snapshot still says open.
+func TestHandlerWorkerCreateRefreshesStaleOpenSnapshotBeforeAccepting(t *testing.T) {
+	fixture := newTestFixture(t)
+	seedWorkerPlannerArtifactsData(t, fixture.runtime, fixture.now)
+	openPayload := `{"detail":{"state":"OPEN"}}`
+	seedPullRequestSnapshot(t, fixture, "prs_stale_open", 42, &openPayload)
+
+	handler := newWorkerTargetHandler(fixture, func(_ context.Context, _ string, prNumber int64, _ string) (PullRequestTarget, error) {
+		return PullRequestTarget{Number: prNumber, State: "closed"}, nil
+	})
+
+	recorder := postWorker(t, handler, `{"projectId":"project_1","repo":"acme/looper","prNumber":42,"baseBranch":"main"}`)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", recorder.Code, recorder.Body.String())
+	}
+	assertNoQueuedWork(t, fixture)
+}
+
+// When the forge refresh confirms a snapshotted PR is still open, the dispatch
+// proceeds and the snapshot's PR number is the one queued.
+func TestHandlerWorkerCreateAcceptsSnapshottedPullRequestFreshlyConfirmedOpen(t *testing.T) {
+	fixture := newTestFixture(t)
+	seedWorkerPlannerArtifactsData(t, fixture.runtime, fixture.now)
+	openPayload := `{"detail":{"state":"OPEN"}}`
+	seedPullRequestSnapshot(t, fixture, "prs_open_confirmed", 42, &openPayload)
+
+	lookedUp := 0
+	handler := newWorkerTargetHandler(fixture, func(_ context.Context, _ string, prNumber int64, _ string) (PullRequestTarget, error) {
+		lookedUp++
+		return PullRequestTarget{Number: prNumber, State: "open"}, nil
+	})
+
+	recorder := postWorker(t, handler, `{"projectId":"project_1","repo":"acme/looper","prNumber":42,"specPath":"specs/thing.md","baseBranch":"main"}`)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if lookedUp != 1 {
+		t.Fatalf("LookupPullRequest called %d times, want 1", lookedUp)
+	}
+	queueItems, err := fixture.runtime.Services().Repositories.Queue.List(context.Background())
+	if err != nil {
+		t.Fatalf("Queue.List() error = %v", err)
+	}
+	if len(queueItems) != 1 || queueItems[0].PRNumber == nil || *queueItems[0].PRNumber != 42 {
+		t.Fatalf("Queue.List() = %#v, want one worker item for PR 42", queueItems)
+	}
 }
 
 func TestHandlerWorkerCreateStillRejectsConflictingTargets(t *testing.T) {
