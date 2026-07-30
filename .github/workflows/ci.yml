@@ -87,11 +87,14 @@ jobs:
       # default ACL: pin the ancestor chain root-owned, 0755, and strip
       # both access and default ACL entries (-b alone leaves default
       # entries in place on some acl builds; -k removes them explicitly).
+      # The chain runs all the way to / because the probe walks every
+      # ancestor and image variance has been observed as high as /usr
+      # (PR #318's verify run failed on "/usr is writable").
       - name: Harden sandbox runtime ancestors
         run: |
-          sudo chown root:root /usr/local /usr/local/lib
-          sudo chmod 0755 /usr/local /usr/local/lib
-          sudo setfacl -b -k /usr/local /usr/local/lib
+          sudo chown root:root / /usr /usr/local /usr/local/lib
+          sudo chmod 0755 / /usr /usr/local /usr/local/lib
+          sudo setfacl -b -k / /usr /usr/local /usr/local/lib
 
       - name: Install process sandbox runtime
         run: |
@@ -114,7 +117,7 @@ jobs:
         run: |
           sudo chmod -R go-w /usr/local/lib/looper-srt-runtime /usr/local/lib/looper-srt-tools
           sudo setfacl -R -b -k /usr/local/lib/looper-srt-runtime
-          writable="$(find /usr/local /usr/local/lib /usr/local/lib/looper-srt-runtime /usr/local/lib/looper-srt-tools -maxdepth 0 -writable; find /usr/local/lib/looper-srt-runtime /usr/local/lib/looper-srt-tools -writable)"
+          writable="$(find / /usr /usr/local /usr/local/lib -maxdepth 0 -writable; find /usr/local/lib/looper-srt-runtime /usr/local/lib/looper-srt-tools -writable)"
           if [ -n "$writable" ]; then
             printf 'srt paths still writable by the daemon user:\n%s\n' "$writable"
             exit 1
