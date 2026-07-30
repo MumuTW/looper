@@ -30,8 +30,8 @@ func TestReviewerAutoMergeWaitsForMergeBeforeUnblockingDependentDispatchWithFake
 	for key, value := range fakeGH.EnvMap() {
 		t.Setenv(key, value)
 	}
-	issueListAllOpen := json.RawMessage(`[{"number":1,"title":"Parent","body":"## Acceptance criteria\n- ship app change\n- add more\n","url":"https://example.test/issues/1","state":"open","updatedAt":"2026-04-11T12:00:00Z","author":{"login":"octo"},"assignees":[],"labels":[{"name":"triaged"}]},{"number":2,"title":"Dependent","body":"dispatch me later","url":"https://example.test/issues/2","state":"open","updatedAt":"2026-04-11T12:00:00Z","author":{"login":"octo"},"assignees":[],"labels":[{"name":"triaged"},{"name":"dispatch/plan"}]}]`)
-	issueListDependentOnly := json.RawMessage(`[{"number":2,"title":"Dependent","body":"dispatch me later","url":"https://example.test/issues/2","state":"open","updatedAt":"2026-04-11T12:00:00Z","author":{"login":"octo"},"assignees":[],"labels":[{"name":"triaged"},{"name":"dispatch/plan"}]}]`)
+	issueListAllOpen := json.RawMessage(`[{"number":1,"title":"Parent","body":"## Acceptance criteria\n- ship app change\n- add more\n","url":"https://example.test/issues/1","state":"open","updatedAt":"2026-04-11T12:00:00Z","author":{"login":"octo"},"assignees":[],"labels":[{"name":"triaged"}]},{"number":2,"title":"Dependent","body":"dispatch me later","url":"https://example.test/issues/2","state":"open","updatedAt":"2026-04-11T12:00:00Z","author":{"login":"octo"},"assignees":[],"labels":[{"name":"triaged"},{"name":"looper:dispatch:plan"}]}]`)
+	issueListDependentOnly := json.RawMessage(`[{"number":2,"title":"Dependent","body":"dispatch me later","url":"https://example.test/issues/2","state":"open","updatedAt":"2026-04-11T12:00:00Z","author":{"login":"octo"},"assignees":[],"labels":[{"name":"triaged"},{"name":"looper:dispatch:plan"}]}]`)
 	fakeGH.WriteState(t, harness.GHState{
 		Commands: map[string]any{
 			"issue list":   map[string]any{"stdout": issueListAllOpen},
@@ -42,7 +42,7 @@ func TestReviewerAutoMergeWaitsForMergeBeforeUnblockingDependentDispatchWithFake
 			"repos/acme/looper":                                  json.RawMessage(`{"allow_squash_merge":true,"allow_merge_commit":true,"allow_rebase_merge":true,"allow_auto_merge":true}`),
 			"repos/acme/looper/branches/main/protection":         json.RawMessage(`{"required_status_checks":{"contexts":["ci"]}}`),
 			"repos/acme/looper/issues/1":                         json.RawMessage(`{"number":1,"title":"Parent","body":"## Acceptance criteria\n- ship app change\n- add more\n","html_url":"https://example.test/issues/1","state":"open","created_at":"2026-04-11T10:00:00Z","updated_at":"2026-04-11T12:00:00Z","user":{"login":"octo"},"labels":[{"name":"triaged"}]}`),
-			"repos/acme/looper/issues/2":                         json.RawMessage(`{"number":2,"title":"Dependent","body":"dispatch me later","html_url":"https://example.test/issues/2","state":"open","created_at":"2026-04-11T10:00:00Z","updated_at":"2026-04-11T12:00:00Z","user":{"login":"octo"},"labels":[{"name":"triaged"},{"name":"dispatch/plan"}]}`),
+			"repos/acme/looper/issues/2":                         json.RawMessage(`{"number":2,"title":"Dependent","body":"dispatch me later","html_url":"https://example.test/issues/2","state":"open","created_at":"2026-04-11T10:00:00Z","updated_at":"2026-04-11T12:00:00Z","user":{"login":"octo"},"labels":[{"name":"triaged"},{"name":"looper:dispatch:plan"}]}`),
 			"repos/acme/looper/issues/1/comments":                json.RawMessage(`[[]]`),
 			"repos/acme/looper/issues/2/comments":                json.RawMessage(`[[]]`),
 			"repos/acme/looper/issues/1/timeline":                json.RawMessage(`[[]]`),
@@ -192,7 +192,7 @@ func TestReviewerAutoMergeWaitsForMergeBeforeUnblockingDependentDispatchWithFake
 type coordStubLLM struct{}
 
 func (coordStubLLM) Complete(context.Context, coordtriage.Request) (string, error) {
-	return `{"disposition":"valid","comment":"Looks actionable.","labels":{"kind":["kind/bug"],"area":["area/coordinator"],"complexity":["complexity/m"],"dispatch":["dispatch/plan"]}}`, nil
+	return `{"disposition":"valid","comment":"Looks actionable.","labels":{"kind":["kind/bug"],"area":["area/coordinator"],"complexity":["complexity/m"],"dispatch":["looper:dispatch:plan"]}}`, nil
 }
 
 type coordStubInspector struct{}

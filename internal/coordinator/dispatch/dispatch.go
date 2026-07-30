@@ -13,8 +13,8 @@ const (
 	ModeHumanGated = "human-gated"
 	ModeAutonomous = "autonomous"
 
-	DispatchPlan      = "dispatch/plan"
-	DispatchImplement = "dispatch/implement"
+	DispatchPlan      = labels.DispatchPlan
+	DispatchImplement = labels.DispatchImplement
 
 	ReactionSuccess = "+1"
 	ReactionFailure = "confused"
@@ -243,10 +243,10 @@ func isAllowedUser(comment Comment, allowedUsers []string) bool {
 	return comment.HasWriteAccess
 }
 
-func singleDispatchLabel(labels []string) (string, bool) {
+func singleDispatchLabel(issueLabels []string) (string, bool) {
 	match := ""
-	for _, label := range labels {
-		if !strings.HasPrefix(label, "dispatch/") {
+	for _, label := range issueLabels {
+		if !labels.IsDispatch(label) {
 			continue
 		}
 		if match != "" {

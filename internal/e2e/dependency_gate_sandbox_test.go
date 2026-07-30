@@ -48,7 +48,7 @@ func TestGitHubSandboxDependencyGateScenarios(t *testing.T) {
 	t.Setenv("GH_PROMPT_DISABLED", "1")
 	repo := ensureSandboxProjectRepo(t, sb)
 	ensureSandboxCoordinatorLabel(t, sb, "triaged", "0e8a16")
-	ensureSandboxCoordinatorLabel(t, sb, "dispatch/plan", "1d76db")
+	ensureSandboxCoordinatorLabel(t, sb, "looper:dispatch:plan", "1d76db")
 
 	t.Run("looperd startup validation succeeds against real dependency API", func(t *testing.T) {
 		home := harness.NewTempHome(t)
@@ -71,7 +71,7 @@ func TestGitHubSandboxDependencyGateScenarios(t *testing.T) {
 		dependent := createDependencyGateIssue(t, sb, "dependency dependent")
 		defer closeSandboxIssueIfOpen(t, sb, blocker.Number, "not_planned")
 		defer closeSandboxIssueIfOpen(t, sb, dependent.Number, "not_planned")
-		addSandboxIssueLabels(t, sb, dependent.Number, "triaged", "dispatch/plan")
+		addSandboxIssueLabels(t, sb, dependent.Number, "triaged", "looper:dispatch:plan")
 		linkSandboxBlockedBy(t, sb, dependent.Number, blocker.ID)
 		postSandboxIssueComment(t, sb, dependent.Number, "/plan")
 
@@ -114,7 +114,7 @@ func TestGitHubSandboxDependencyGateScenarios(t *testing.T) {
 		dependent := createDependencyGateIssue(t, sb, "not planned dependent")
 		defer closeSandboxIssueIfOpen(t, sb, blocker.Number, "not_planned")
 		defer closeSandboxIssueIfOpen(t, sb, dependent.Number, "not_planned")
-		addSandboxIssueLabels(t, sb, dependent.Number, "triaged", "dispatch/plan")
+		addSandboxIssueLabels(t, sb, dependent.Number, "triaged", "looper:dispatch:plan")
 		linkSandboxBlockedBy(t, sb, dependent.Number, blocker.ID)
 		setSandboxIssueState(t, sb, blocker.Number, "closed", "not_planned")
 
@@ -123,7 +123,7 @@ func TestGitHubSandboxDependencyGateScenarios(t *testing.T) {
 			t.Fatalf("DiscoverIssues not_planned path: %v", err)
 		}
 
-		waitForSandboxIssueLabelsAbsent(t, sb, dependent.Number, "triaged", "dispatch/plan")
+		waitForSandboxIssueLabelsAbsent(t, sb, dependent.Number, "triaged", "looper:dispatch:plan")
 		comments := listSandboxIssueComments(t, sb, dependent.Number)
 		for _, comment := range comments {
 			if strings.Contains(comment.Body, depGateCycleMarker) {

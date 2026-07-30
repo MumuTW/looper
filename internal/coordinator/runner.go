@@ -784,7 +784,8 @@ func (r *Runner) applyDependencyActions(ctx context.Context, repo, cwd string, t
 		if _, ok := deps.retriageIssueNumbers[ref.Number]; !ok {
 			continue
 		}
-		if err := r.removeIssueLabels(ctx, repo, cwd, item.issue.Number, item.issue.Labels, []string{triageCfg.TriagedLabel, "dispatch/*"}); err != nil {
+		patterns := append([]string{triageCfg.TriagedLabel}, labels.DispatchLabels()...)
+		if err := r.removeIssueLabels(ctx, repo, cwd, item.issue.Number, item.issue.Labels, patterns); err != nil {
 			return err
 		}
 		if commentBody, ok := deps.cycleCommentByIssue[item.issue.Number]; ok {
@@ -1483,10 +1484,10 @@ func dependencyTrackedIssue(issue triage.Issue, triagedLabel string, dispatchCfg
 	return len(removeExistingLabels(triggerLabels, issue.Labels)) > 0
 }
 
-func issueDispatchLabel(labels []string) (string, bool) {
+func issueDispatchLabel(issueLabels []string) (string, bool) {
 	match := ""
-	for _, label := range labels {
-		if !strings.HasPrefix(label, "dispatch/") {
+	for _, label := range issueLabels {
+		if !labels.IsDispatch(label) {
 			continue
 		}
 		if match != "" {

@@ -270,7 +270,7 @@ func markerState(marker *mergeWatchComment) *mergewatch.PriorWatchMarker {
 }
 
 func retriageCleanupPatterns(roles config.RoleConfigs, triagedLabel string) []string {
-	patterns := []string{triagedLabel, "dispatch/*"}
+	patterns := append([]string{triagedLabel}, labels.DispatchLabels()...)
 	registry := config.EffectiveCodingRoles(roles)
 	planner := registry[config.CodingRolePlanner]
 	worker := registry[config.CodingRoleWorker]
@@ -466,10 +466,10 @@ func requiredCheck(required map[string]struct{}, name string) bool {
 	return ok
 }
 
-func issueHasCoordinatorTracking(labels []string, triagedLabel string) bool {
-	for _, label := range labels {
+func issueHasCoordinatorTracking(issueLabels []string, triagedLabel string) bool {
+	for _, label := range issueLabels {
 		normalized := strings.ToLower(strings.TrimSpace(label))
-		if normalized == strings.ToLower(strings.TrimSpace(triagedLabel)) || strings.HasPrefix(normalized, "dispatch/") {
+		if normalized == strings.ToLower(strings.TrimSpace(triagedLabel)) || labels.IsDispatch(normalized) {
 			return true
 		}
 	}

@@ -56,7 +56,23 @@ func AnyLooperOwned(labels []string) bool {
 const (
 	DefaultPlanTrigger        = "looper:plan"
 	DefaultWorkerReadyTrigger = "looper:worker-ready"
+	DispatchPlan              = Prefix + "dispatch:plan"
+	DispatchImplement         = Prefix + "dispatch:implement"
 )
+
+// DispatchLabels returns the complete set of Coordinator-owned dispatch
+// labels. It is deliberately exact, rather than a prefix pattern: a host
+// repository's `dispatch/*` taxonomy is foreign state and must never be read
+// as authority or removed by Looper.
+func DispatchLabels() []string {
+	return []string{DispatchPlan, DispatchImplement}
+}
+
+// IsDispatch reports whether label is one of the Coordinator's exact dispatch
+// labels. It does not accept legacy bare `dispatch/*` labels.
+func IsDispatch(label string) bool {
+	return Has([]string{label}, DispatchPlan) || Has([]string{label}, DispatchImplement)
+}
 
 // Spec PR lifecycle. Looper-owned and not configurable: the Planner publishes
 // a spec PR under SpecReviewing, a human promotes it to SpecReady, and the
@@ -112,6 +128,8 @@ func Standard() []Definition {
 	return []Definition{
 		{Name: DefaultPlanTrigger, Color: "5319e7", Description: "Picked up automatically by planner"},
 		{Name: DefaultWorkerReadyTrigger, Color: "0e8a16", Description: "Ready for Looper worker implementation"},
+		{Name: DispatchPlan, Color: "5319e7", Description: "Coordinator dispatches this issue to the planner"},
+		{Name: DispatchImplement, Color: "0e8a16", Description: "Coordinator dispatches this issue to the worker"},
 		{Name: SpecReviewing, Color: "1d76db", Description: "Spec PR is under review"},
 		{Name: SpecReady, Color: "0e8a16", Description: "Spec PR is ready for implementation"},
 		{Name: NeedsHuman, Color: "d93f0b", Description: "Looper requires manual intervention"},
