@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -89,8 +90,30 @@ func newDaemonID() string {
 	return hex.EncodeToString(buf[:])
 }
 
+// webhookForwarderLockPath derives the singleton webhook forwarder lock path.
+// It is deliberately rollout-stable and lexical: it resolves the configured
+// DBPath only with filepath.Abs (no symlink resolution) and places looperd.lock
+// beside that spelling. A pre-change webhook-enabled daemon derives the very
+// same path, so during a rolling upgrade the old and new daemons contend on one
+// lock file instead of each acquiring their own (the old daemon beside the
+// configured symlink, a canonicalizing new daemon beside the resolved target)
+// and running competing forwarders. Canonical symlink resolution is reserved
+// for the new database attach lock (databaseAttachLockPath), which has no
+// pre-change holder to stay consistent with.
 func webhookForwarderLockPath(cfgStorageDBPath string) string {
-	return daemonLockPath(cfgStorageDBPath, "looperd.lock")
+	dbPath := strings.TrimSpace(cfgStorageDBPath)
+	if dbPath != "" {
+		if absPath, err := filepath.Abs(dbPath); err == nil {
+			dbPath = absPath
+		}
+	}
+	dir := filepath.Dir(dbPath)
+	if dir == "." || dir == "" {
+		if home, err := os.UserHomeDir(); err == nil {
+			dir = filepath.Join(home, ".looper")
+		}
+	}
+	return filepath.Join(dir, "looperd.lock")
 }
 
 // databaseAttachLockPath returns the path of the database-lifetime attach lock
@@ -191,7 +214,11 @@ func attachLockFileName(cfgStorageDBPath string) string {
 // resolves an empty DBPath differently from the lock directory produces
 // different lock filenames in the same directory, with the same result.
 //
-// Resolution order: empty means the conventional ~/.looper/looper.sqlite, any
+// Resolution order: empty means the conventional ~/.looper/looper.sqlite;
+// SQLite file: URIs (explicitly supported by OpenSQLiteDB) are parsed so that
+// /tmp/shared.sqlite and file:/tmp/shared.sqlite — which open the same database
+// — collapse to one path instead of producing unrelated lock directories and
+// hashes (query variants that reference the same file likewise collapse); any
 // path is made absolute, then symlinks are resolved.
 func resolvedDatabasePath(cfgStorageDBPath string) string {
 	dbPath := strings.TrimSpace(cfgStorageDBPath)
@@ -201,31 +228,103 @@ func resolvedDatabasePath(cfgStorageDBPath string) string {
 			dbPath = filepath.Join(home, ".looper", "looper.sqlite")
 		}
 	}
+	// SQLite file: URIs open the same database as the bare path but would hash
+	// to a different identity and lock directory if treated as an ordinary
+	// filename. Strip the URI scheme and query so both spellings, and query
+	// variants of one file, derive one identity. Both URI forms are handled:
+	// "file:/abs/path" carries the path in Path, while "file:relative.sqlite"
+	// and "file::memory:" carry it in Opaque.
+	if strings.HasPrefix(dbPath, "file:") {
+		if parsed, err := url.Parse(dbPath); err == nil {
+			switch {
+			case parsed.Path != "":
+				dbPath = parsed.Path
+			case parsed.Opaque != "":
+				dbPath = parsed.Opaque
+			}
+		}
+	}
 	if absPath, err := filepath.Abs(dbPath); err == nil {
 		dbPath = absPath
 	}
 	return resolvePathSymlinks(dbPath)
 }
 
-// resolvePathSymlinks resolves the deepest existing ancestor of path and
-// rejoins the components below it. filepath.EvalSymlinks fails outright when
+// resolvePathSymlinks resolves symlinks in path, including dangling symlinks
+// whose target does not exist yet. filepath.EvalSymlinks fails outright when
 // the leaf does not exist, which is the normal case on a first boot — the
 // database file is created after the lock is taken — so resolving the existing
 // prefix is what makes aliased spellings collapse before the file exists.
+//
+// When the unresolved component is itself a symlink (a dangling symlink whose
+// target SQLite will create), the link is followed via Readlink so the identity
+// matches the physical target that will exist once the database is created.
+// Without this, the first daemon (target missing) would hash the symlink
+// spelling while a second daemon (target now present) would hash the resolved
+// target, giving the two different locks against one database and restoring the
+// concurrent-migration race the lock prevents.
 func resolvePathSymlinks(path string) string {
+	return resolvePathSymlinksDepth(path, 0)
+}
+
+const maxSymlinkResolveDepth = 40
+
+func resolvePathSymlinksDepth(path string, depth int) string {
 	var trailing []string
 	current := path
 	for {
 		if resolved, err := filepath.EvalSymlinks(current); err == nil {
 			return filepath.Join(append([]string{resolved}, trailing...)...)
 		}
+		// EvalSymlinks failed, usually because the leaf does not exist yet. If
+		// the leaf is itself a dangling symlink, follow it so the identity
+		// matches the physical target SQLite will create rather than the alias
+		// spelling, which a later daemon (target now present) would not use.
+		if depth < maxSymlinkResolveDepth {
+			if fi, err := os.Lstat(current); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+				if target, err := os.Readlink(current); err == nil {
+					if !filepath.IsAbs(target) {
+						target = filepath.Join(filepath.Dir(current), target)
+					}
+					return filepath.Join(append([]string{resolvePathSymlinksDepth(target, depth+1)}, trailing...)...)
+				}
+			}
+		}
 		parent := filepath.Dir(current)
 		if parent == current {
-			return path
+			return filepath.Join(append([]string{current}, trailing...)...)
 		}
 		trailing = append([]string{filepath.Base(current)}, trailing...)
 		current = parent
 	}
+}
+
+// isInMemoryDatabase reports whether dbPath describes a private in-memory
+// SQLite database rather than a file on disk. Each daemon that opens such a
+// database owns an independent schema that no other process can reach or
+// migrate, so a filesystem attach lock would only falsely serialize independent
+// daemons (every :memory: daemon launched from the same working directory maps
+// to one lock and the second is rejected). The attach lock is therefore skipped
+// for these DSNs.
+func isInMemoryDatabase(dbPath string) bool {
+	dbPath = strings.TrimSpace(dbPath)
+	if dbPath == ":memory:" {
+		return true
+	}
+	if !strings.HasPrefix(dbPath, "file:") {
+		return false
+	}
+	parsed, err := url.Parse(dbPath)
+	if err != nil {
+		return false
+	}
+	// "file::memory:" carries :memory: in Opaque (Path is empty), while a
+	// path-form URI would carry it in Path; accept either. The mode=memory
+	// query also marks a URI as in-memory regardless of its name.
+	if parsed.Path == ":memory:" || parsed.Opaque == ":memory:" {
+		return true
+	}
+	return strings.EqualFold(parsed.Query().Get("mode"), "memory")
 }
 
 // canonicalDatabaseIdentity returns a stable short identifier for the physical

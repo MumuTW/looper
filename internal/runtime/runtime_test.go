@@ -5065,6 +5065,208 @@ func TestDatabaseAttachLockPathCollapsesAliases(t *testing.T) {
 	})
 }
 
+// TestDatabaseAttachLockPathStableAcrossDanglingSymlinkFirstBoot covers the
+// dangling-symlink first-boot race: when storage.dbPath is a symlink whose
+// target does not exist yet, the first daemon cannot resolve the leaf, so a
+// naive resolver hashes the symlink spelling. Once SQLite creates the target,
+// a second daemon with the same config resolves the symlink to its target and
+// hashes a different path, acquiring a different lock while the first daemon
+// remains attached — restoring the concurrent-migration race the lock prevents.
+// resolvePathSymlinks follows the dangling link via Readlink so both daemons
+// derive the physical target's identity.
+func TestDatabaseAttachLockPathStableAcrossDanglingSymlinkFirstBoot(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	realDir := filepath.Join(root, "real")
+	if err := os.MkdirAll(realDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(%q) error = %v", realDir, err)
+	}
+	realDB := filepath.Join(realDir, "created-later.sqlite")
+	linkDB := filepath.Join(root, "link.sqlite")
+	// The target deliberately does NOT exist yet: this is the first-boot case
+	// where the lock is taken before SQLite creates the database file.
+	if err := os.Symlink(realDB, linkDB); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	beforeTargetExists := databaseAttachLockPath(linkDB)
+
+	// Now SQLite creates the target, as a second daemon would observe.
+	if err := os.WriteFile(realDB, []byte("x"), 0o600); err != nil {
+		t.Fatalf("WriteFile(%q) error = %v", realDB, err)
+	}
+	afterTargetExists := databaseAttachLockPath(linkDB)
+
+	if beforeTargetExists != afterTargetExists {
+		t.Fatalf("dangling-symlink lock identity changed once the target appeared:\n before: %q\n after:  %q", beforeTargetExists, afterTargetExists)
+	}
+	// And it must equal the lock derived from the real path directly, proving
+	// the identity is the physical target rather than the alias spelling.
+	if got, want := beforeTargetExists, databaseAttachLockPath(realDB); got != want {
+		t.Fatalf("dangling-symlink lock %q != real-path lock %q", got, want)
+	}
+}
+
+// TestWebhookForwarderLockPathStaysBesideConfiguredSymlink covers the
+// rollout-stability requirement for the legacy webhook forwarder lock: when the
+// configured database is a symlink whose target lives in another directory, a
+// pre-change webhook-enabled daemon opens looperd.lock beside the configured
+// symlink spelling. The new daemon must derive the very same path (lexical
+// filepath.Abs only, no symlink canonicalization) so the two contend on one
+// lock during a rolling upgrade instead of each acquiring their own and
+// running competing forwarders. Canonical resolution is reserved for the new
+// attach lock, which has no pre-change holder to stay consistent with.
+func TestWebhookForwarderLockPathStaysBesideConfiguredSymlink(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	realDir := filepath.Join(root, "real")
+	if err := os.MkdirAll(realDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(%q) error = %v", realDir, err)
+	}
+	// On macOS t.TempDir() sits under /var, a symlink to /private/var; the
+	// attach lock canonicalizes to the resolved spelling, so compare against it.
+	resolvedRealDir, err := filepath.EvalSymlinks(realDir)
+	if err != nil {
+		t.Fatalf("EvalSymlinks(%q) error = %v", realDir, err)
+	}
+	realDB := filepath.Join(resolvedRealDir, "looper.sqlite")
+	if err := os.WriteFile(realDB, []byte("x"), 0o600); err != nil {
+		t.Fatalf("WriteFile(%q) error = %v", realDB, err)
+	}
+	linkDir := filepath.Join(root, "link-dir")
+	if err := os.Symlink(resolvedRealDir, linkDir); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	configuredDB := filepath.Join(linkDir, "looper.sqlite")
+
+	// The webhook lock stays beside the configured (symlinked) spelling.
+	webhookLock := webhookForwarderLockPath(configuredDB)
+	if filepath.Dir(webhookLock) != linkDir {
+		t.Fatalf("webhook lock lives beside resolved target %q, want beside configured symlink %q", filepath.Dir(webhookLock), linkDir)
+	}
+	// It must NOT migrate to the resolved target's directory, which is what a
+	// canonicalizing derivation would do and what breaks the rolling upgrade.
+	if filepath.Dir(webhookLock) == resolvedRealDir {
+		t.Fatalf("webhook lock migrated to resolved target dir %q; it must stay rollout-stable beside the configured spelling", resolvedRealDir)
+	}
+	// The attach lock, by contrast, canonicalizes and lives beside the target —
+	// confirming the two derivations are deliberately different.
+	attachLock := databaseAttachLockPath(configuredDB)
+	if filepath.Dir(attachLock) != resolvedRealDir {
+		t.Fatalf("attach lock dir %q, want resolved target dir %q", filepath.Dir(attachLock), resolvedRealDir)
+	}
+}
+
+// TestDatabaseAttachLockPathCollapsesFileURIVariants covers file: URI handling:
+// OpenSQLiteDB explicitly supports the file: form, but treating the URI as an
+// ordinary filesystem name makes /tmp/shared.sqlite and file:/tmp/shared.sqlite
+// (which open the same database) produce unrelated lock directories and hashes,
+// so two new daemons both acquire attach locks and migrate the shared schema.
+// Query variants that reference the same file must likewise collapse.
+func TestDatabaseAttachLockPathCollapsesFileURIVariants(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	resolvedDir, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		t.Fatalf("EvalSymlinks(%q) error = %v", dir, err)
+	}
+	bare := filepath.Join(dir, "shared.sqlite")
+	uri := "file:" + bare
+	uriQuery := "file:" + bare + "?cache=shared"
+
+	bareLock := databaseAttachLockPath(bare)
+	uriLock := databaseAttachLockPath(uri)
+	uriQueryLock := databaseAttachLockPath(uriQuery)
+
+	if bareLock != uriLock {
+		t.Fatalf("bare path and file: URI produced different attach locks:\n bare: %q\n uri:  %q", bareLock, uriLock)
+	}
+	if bareLock != uriQueryLock {
+		t.Fatalf("bare path and file: URI with query produced different attach locks:\n bare: %q\n uriq: %q", bareLock, uriQueryLock)
+	}
+	if filepath.Dir(bareLock) != resolvedDir {
+		t.Fatalf("attach lock dir %q, want %q", filepath.Dir(bareLock), resolvedDir)
+	}
+}
+
+// TestIsInMemoryDatabase covers the DSN classification that gates the attach
+// lock skip. Each :memory: daemon owns an independent in-memory schema no other
+// process can reach or migrate, so a filesystem attach lock would only falsely
+// serialize independent daemons (every :memory: daemon launched from the same
+// working directory maps to one lock and the second is rejected).
+func TestIsInMemoryDatabase(t *testing.T) {
+	t.Parallel()
+
+	truthy := []string{
+		":memory:",
+		"  :memory:  ",
+		"file::memory:",
+		"file::memory:?mode=memory",
+		"file::memory:?mode=memory&cache=shared",
+		"file:some-name?mode=memory",
+	}
+	for _, dbPath := range truthy {
+		if !isInMemoryDatabase(dbPath) {
+			t.Errorf("isInMemoryDatabase(%q) = false, want true", dbPath)
+		}
+	}
+
+	falsy := []string{
+		"",
+		"looper.sqlite",
+		"/tmp/shared.sqlite",
+		"file:/tmp/shared.sqlite",
+		"file:/tmp/shared.sqlite?cache=shared",
+		"file:shared.sqlite?mode=rwc",
+	}
+	for _, dbPath := range falsy {
+		if isInMemoryDatabase(dbPath) {
+			t.Errorf("isInMemoryDatabase(%q) = true, want false", dbPath)
+		}
+	}
+}
+
+// TestRuntimeSkipsAttachLockForInMemoryDatabase covers the wiring of the
+// in-memory skip: a daemon configured with :memory: must boot without acquiring
+// a filesystem attach lock (logging the skip), so a second independent
+// :memory: daemon is not falsely rejected. Two such daemons booting concurrently
+// is the direct proof that no shared filesystem lock serializes them.
+func TestRuntimeSkipsAttachLockForInMemoryDatabase(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	mkDaemon := func(t *testing.T, name string) *Runtime {
+		cfg, err := config.DefaultConfig(workingDir)
+		if err != nil {
+			t.Fatalf("DefaultConfig() error = %v", err)
+		}
+		cfg.Storage.DBPath = ":memory:"
+		cfg.Package.AutoMigrateOnStartup = true
+		logger := &testLogger{}
+		daemon := New(Options{
+			Config:           cfg,
+			Logger:           logger,
+			RunSchedulerTick: func(context.Context, Services) error { return nil },
+		})
+		if err := daemon.Start(context.Background()); err != nil {
+			t.Fatalf("daemon %q Start() error = %v", name, err)
+		}
+		t.Cleanup(func() { daemon.Stop("test cleanup") })
+		if !logger.containsMessage("database.attach.lock_skipped_in_memory") {
+			t.Errorf("daemon %q did not log database.attach.lock_skipped_in_memory; messages: %v", name, logger.messages())
+		}
+		return daemon
+	}
+
+	first := mkDaemon(t, "first")
+	second := mkDaemon(t, "second")
+	_ = first
+	_ = second
+}
+
 // TestRuntimeAttachLockDoesNotBlockPreLockAttachment covers the documented
 // cross-version boundary of the attach lock: a release predating this lock
 // never acquires it, so an attachment that does not take the lock (simulated

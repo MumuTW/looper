@@ -876,17 +876,28 @@ func (r *Runtime) start(ctx context.Context) error {
 
 	var lock *daemonLock
 	var err error
-	attachLockPath := databaseAttachLockPath(r.config.Storage.DBPath)
-	attachLock, err := acquireDaemonLock(attachLockPath, r.webhook.daemonID, r.now())
-	if err != nil {
+	// In-memory databases are private per daemon: no other process can reach or
+	// migrate one daemon's schema, so a filesystem attach lock would only falsely
+	// serialize independent daemons (every :memory: daemon launched from the same
+	// working directory maps to one lock and the second is rejected). Skip it.
+	var attachLock *daemonLock
+	if isInMemoryDatabase(r.config.Storage.DBPath) {
 		if r.logger != nil {
-			holder, _ := os.ReadFile(attachLockPath)
-			r.logger.Warn("database.attach.lock_failed", map[string]any{"path": attachLockPath, "existing_holder": strings.TrimSpace(string(holder)), "error": err.Error()})
+			r.logger.Info("database.attach.lock_skipped_in_memory", map[string]any{"dbPath": r.config.Storage.DBPath})
 		}
-		return err
-	}
-	if r.logger != nil {
-		r.logger.Info("database.attach.lock_acquired", map[string]any{"path": attachLockPath})
+	} else {
+		attachLockPath := databaseAttachLockPath(r.config.Storage.DBPath)
+		attachLock, err = acquireDaemonLock(attachLockPath, r.webhook.daemonID, r.now())
+		if err != nil {
+			if r.logger != nil {
+				holder, _ := os.ReadFile(attachLockPath)
+				r.logger.Warn("database.attach.lock_failed", map[string]any{"path": attachLockPath, "existing_holder": strings.TrimSpace(string(holder)), "error": err.Error()})
+			}
+			return err
+		}
+		if r.logger != nil {
+			r.logger.Info("database.attach.lock_acquired", map[string]any{"path": attachLockPath})
+		}
 	}
 	if r.config.Webhook.Enabled {
 		lockPath := webhookForwarderLockPath(r.config.Storage.DBPath)
