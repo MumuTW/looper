@@ -25,6 +25,7 @@ import (
 	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/eventlog"
 	"github.com/nexu-io/looper/internal/fixer/failurepolicy"
+	"github.com/nexu-io/looper/internal/fixer/publish"
 	"github.com/nexu-io/looper/internal/fixer/reconcile"
 	"github.com/nexu-io/looper/internal/fixer/workflow"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
@@ -4216,7 +4217,7 @@ func buildFixerReplyBody(item FixItem, commitSHA, explanation string) string {
 		b.WriteString(" ")
 	}
 	b.WriteString("This has been fixed")
-	if shortSHA := shortCommitSHA(commitSHA); shortSHA != "" {
+	if shortSHA := publish.ShortSHA(commitSHA); shortSHA != "" {
 		b.WriteString(" in ")
 		b.WriteString(shortSHA)
 	}
@@ -4302,27 +4303,6 @@ func summarizeFixItem(item FixItem) string {
 	return strings.Join(lines, "\n")
 }
 
-func shortCommitSHA(value string) string {
-	value = strings.TrimSpace(value)
-	if len(value) <= 7 {
-		return value
-	}
-	return value[:7]
-}
-
-const fixerSummaryMarkerPrefix = "<!-- looper:fixer-round head="
-
-// fixerRoundSummaryMarker returns a hidden marker keyed by head SHA. The marker
-// lets future fixer runs find and edit the existing summary instead of posting
-// a duplicate when the same round retries (resume after transient failure,
-// scheduler re-claim, etc.).
-func fixerRoundSummaryMarker(headSHA string) string {
-	if headSHA == "" {
-		return ""
-	}
-	return fixerSummaryMarkerPrefix + headSHA + " -->"
-}
-
 // publishRoundSummaryComment posts (or edits) a single PR conversation comment
 // summarizing this fixer round: the commit, every fix item with its outcome,
 // agent explanations when present, and links to each thread. The summary is
@@ -4350,7 +4330,7 @@ func (r *Runner) publishRoundSummaryComment(ctx context.Context, input stepInput
 	if len(commentItems) == 0 {
 		return
 	}
-	body := buildFixerSummaryCommentBody(input.Repo, input.PRNumber, headSHA, commitSHA, commentItems)
+	body := publish.Body(headSHA, commitSHA, commentItems)
 	disclosureAgent, disclosureModel := r.disclosureIdentity(input.Run)
 	if checkpoint.SummaryComment != nil && checkpoint.SummaryComment.HeadSHA == headSHA && checkpoint.SummaryComment.CommentID != 0 {
 		if err := r.github.UpdateIssueComment(ctx, UpdateIssueCommentInput{Repo: input.Repo, CommentID: checkpoint.SummaryComment.CommentID, Body: body, CWD: input.Project.RepoPath, DisclosureAgent: disclosureAgent, DisclosureModel: disclosureModel}); err != nil {
@@ -4399,18 +4379,7 @@ func toReconcileInspection(result InspectHeadResult) reconcile.Inspection {
 	return reconcile.Inspection{HeadSHA: result.HeadSHA, NewCommitSHAs: result.NewCommitSHAs, ChangedFiles: result.ChangedFiles, HasUncommittedChanges: result.HasUncommittedChanges}
 }
 
-// fixerSummaryItem is the per-fix-item view rendered into the summary body.
-// Resolved (or already-resolved) comments display as ✅; failed/conflict/check
-// items keep their outcome visible so reviewers can see what's still open.
-type fixerSummaryItem struct {
-	FixItem     FixItem
-	Status      string
-	Explanation string
-	ThreadURL   string
-	ReplyState  string
-}
-
-func summaryCommentItems(fixItems []FixItem, checkpoint *fixerCheckpoint, explanationByID map[string]string) []fixerSummaryItem {
+func summaryCommentItems(fixItems []FixItem, checkpoint *fixerCheckpoint, explanationByID map[string]string) []publish.Item {
 	resolvedByID := map[string]checkpointResolvedComment{}
 	resolvedByThread := map[string]checkpointResolvedComment{}
 	if checkpoint.ResolvedComments != nil {
@@ -4423,9 +4392,9 @@ func summaryCommentItems(fixItems []FixItem, checkpoint *fixerCheckpoint, explan
 			}
 		}
 	}
-	out := make([]fixerSummaryItem, 0, len(fixItems))
+	out := make([]publish.Item, 0, len(fixItems))
 	for _, item := range fixItems {
-		entry := fixerSummaryItem{FixItem: item, ThreadURL: item.URL, Status: item.Type}
+		entry := publish.Item{Kind: item.Type, Path: item.Path, Line: item.Line, Name: item.Name, Author: item.Author, ThreadURL: item.URL, Status: item.Type}
 		if item.Type == "comment" {
 			entry.Explanation = explanationByID[item.ID]
 			resolved, ok := resolvedByID[item.ID]
@@ -4441,121 +4410,20 @@ func summaryCommentItems(fixItems []FixItem, checkpoint *fixerCheckpoint, explan
 			} else {
 				entry.Status = "pending"
 			}
+			if entry.Explanation == "" {
+				// summarizeFixItem quotes with "> " for reply bodies; the summary
+				// bullet wants a plain single-line nested detail instead.
+				if summary := summarizeFixItem(item); summary != "" {
+					plain := strings.TrimSpace(strings.ReplaceAll(summary, "> ", ""))
+					if plain != "" {
+						entry.Explanation = strings.ReplaceAll(plain, "\n", " ")
+					}
+				}
+			}
 		}
 		out = append(out, entry)
 	}
 	return out
-}
-
-// buildFixerSummaryCommentBody renders the round summary body. The hidden
-// `<!-- looper:fixer-round head=… -->` marker on the first line is what
-// findExistingFixerSummaryCommentID looks up for edit-on-retry behavior; the
-// adapter still appends the disclosure stamp/footer on top.
-func buildFixerSummaryCommentBody(repo string, prNumber int64, headSHA, commitSHA string, items []fixerSummaryItem) string {
-	var b strings.Builder
-	if marker := fixerRoundSummaryMarker(headSHA); marker != "" {
-		b.WriteString(marker)
-		b.WriteString("\n")
-	}
-	b.WriteString("**Looper fixer round complete**")
-	if shortSHA := shortCommitSHA(commitSHA); shortSHA != "" {
-		b.WriteString(" — ")
-		b.WriteString(shortSHA)
-	}
-	b.WriteString("\n\n")
-	for _, item := range items {
-		b.WriteString(formatFixerSummaryBullet(item))
-		b.WriteString("\n")
-	}
-	return strings.TrimRight(b.String(), "\n")
-}
-
-func formatFixerSummaryBullet(item fixerSummaryItem) string {
-	icon := summaryStatusIcon(item.Status)
-	label := summaryItemLabel(item.FixItem)
-	threadURL := item.ThreadURL
-	if threadURL == "" {
-		threadURL = item.FixItem.URL
-	}
-	var b strings.Builder
-	b.WriteString("- ")
-	b.WriteString(icon)
-	b.WriteString(" ")
-	b.WriteString(label)
-	if item.FixItem.Author != "" && item.FixItem.Type == "comment" {
-		b.WriteString(" (@")
-		b.WriteString(item.FixItem.Author)
-		b.WriteString(")")
-	}
-	if threadURL != "" && item.FixItem.Type == "comment" {
-		b.WriteString(" — [thread](")
-		b.WriteString(threadURL)
-		b.WriteString(")")
-	}
-	if explanation := strings.TrimSpace(item.Explanation); explanation != "" {
-		b.WriteString("\n  - ")
-		b.WriteString(strings.ReplaceAll(explanation, "\n", "\n    "))
-	} else if item.FixItem.Type == "comment" {
-		if summary := summarizeFixItem(item.FixItem); summary != "" {
-			// summarizeFixItem already prefixes lines with "> "; in the bullet
-			// context we want a plain nested bullet for readability.
-			plain := strings.ReplaceAll(summary, "> ", "")
-			plain = strings.TrimSpace(plain)
-			if plain != "" {
-				b.WriteString("\n  - ")
-				b.WriteString(strings.ReplaceAll(plain, "\n", " "))
-			}
-		}
-	}
-	if item.ReplyState != "" && item.ReplyState != "sent" {
-		b.WriteString("\n  - reply: ")
-		b.WriteString(item.ReplyState)
-	}
-	return b.String()
-}
-
-func summaryItemLabel(item FixItem) string {
-	switch item.Type {
-	case "comment":
-		if item.Path != "" {
-			if item.Line > 0 {
-				return fmt.Sprintf("Review comment on `%s:%d`", item.Path, item.Line)
-			}
-			return fmt.Sprintf("Review comment on `%s`", item.Path)
-		}
-		return "Review comment"
-	case "check":
-		if item.Name != "" {
-			return "Failing check `" + item.Name + "`"
-		}
-		return "Failing check"
-	case "conflict":
-		return "Merge conflict"
-	default:
-		if item.Name != "" {
-			return item.Name
-		}
-		return strings.TrimSpace(item.Type)
-	}
-}
-
-func summaryStatusIcon(status string) string {
-	switch strings.ToLower(strings.TrimSpace(status)) {
-	case "resolved", "already_resolved":
-		return "✅"
-	case "agent_declined":
-		return "⏸️"
-	case "failed":
-		return "⚠️"
-	case "pending":
-		return "🟡"
-	case "conflict":
-		return "🔀"
-	case "check":
-		return "🧪"
-	default:
-		return "•"
-	}
 }
 
 // findExistingFixerSummaryCommentID scans the PR's issue comments for a prior
@@ -4565,7 +4433,7 @@ func findExistingFixerSummaryCommentID(detail *checkpointDetail, headSHA, truste
 	if detail == nil || headSHA == "" {
 		return 0, ""
 	}
-	marker := fixerRoundSummaryMarker(headSHA)
+	marker := publish.Marker(headSHA)
 	if marker == "" {
 		return 0, ""
 	}
