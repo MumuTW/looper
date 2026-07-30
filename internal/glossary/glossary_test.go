@@ -143,7 +143,10 @@ func adrHeadingNumber(path string) (string, bool) {
 	if err != nil {
 		return "", false
 	}
-	headingRe := regexp.MustCompile(`ADR[- ](\d{4})`)
+	// Capture the whole token rather than the first four digits. "ADR-00160"
+	// would otherwise report 0016 and match a file named 0016-…, leaving a
+	// misnumbered heading to agree with its filename by truncation.
+	headingRe := regexp.MustCompile(`ADR[- ]([0-9A-Za-z]+)`)
 	for _, line := range strings.Split(string(body), "\n") {
 		if strings.HasPrefix(line, "#") {
 			if m := headingRe.FindStringSubmatch(line); m != nil {
