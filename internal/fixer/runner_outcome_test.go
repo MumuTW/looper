@@ -2,6 +2,7 @@ package fixer
 
 import (
 	"context"
+	"encoding/json"
 	"path/filepath"
 	"testing"
 
@@ -284,5 +285,70 @@ func TestRunResolveCommentsDeferredClearsStaleFollowupWithoutMutation(t *testing
 	queued, err := fixture.repos.Queue.FindActiveByLoopID(context.Background(), loop.ID)
 	if err != nil || queued == nil || !parseRFC3339OrZero(queued.AvailableAt).After(fixture.now()) {
 		t.Fatalf("queued follow-up = (%#v, %v), want future availability", queued, err)
+	}
+}
+
+func TestExtractCompletionMarkerPayloadReadsCodexJSONL(t *testing.T) {
+	t.Parallel()
+
+	// Codex --json embeds the completion marker inside an agent_message event
+	// rather than on a raw stdout line. The raw stdout scan must translate the
+	// JSONL stream and recover the structured outcome payload.
+	message := `__LOOPER_RESULT__={"outcome":"completed","summary":"applied the fix"}`
+	event := map[string]any{
+		"type": "item.completed",
+		"item": map[string]any{"type": "agent_message", "text": message},
+	}
+	encoded, err := json.Marshal(event)
+	if err != nil {
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
+	payload := extractCompletionMarkerPayload(string(encoded))
+	if payload == "" {
+		t.Fatalf("extractCompletionMarkerPayload() = %q, want decoded JSONL payload", payload)
+	}
+	blocked, _, _, outcomeErr := fixerRepairTaskOutcome(AgentResult{Status: "completed", Stdout: string(encoded)})
+	if outcomeErr != nil || blocked {
+		t.Fatalf("fixerRepairTaskOutcome() = (%t, %v), want completed outcome from JSONL marker", blocked, outcomeErr)
+	}
+}
+
+func TestDeriveRunOutcomeBackfillsPrimaryFailureForEmptyInterruptedOutcome(t *testing.T) {
+	t.Parallel()
+
+	// An orphaned pre-start run is completed as interrupted without
+	// recordFailure, so completeRun persists a non-nil but empty Outcome.
+	emptyOutcome := mustMarshalJSON(fixerCheckpoint{Outcome: &FixerRunOutcome{}, ResumePolicy: loops.ResumePolicyReplayStep})
+	step := string(stepDiscoverPR)
+	run := storage.RunRecord{Status: "interrupted", CurrentStep: &step, CheckpointJSON: &emptyOutcome, ErrorMessage: stringPtr("Interrupted orphaned fixer run before start")}
+
+	outcome := DeriveRunOutcome(run)
+	if outcome == nil || outcome.PrimaryFailure == nil || outcome.PrimaryFailure.Step != step || outcome.PrimaryFailure.Message != "Interrupted orphaned fixer run before start" {
+		t.Fatalf("DeriveRunOutcome() = %#v, want backfilled primary failure for empty interrupted outcome", outcome)
+	}
+	if outcome.PartialSuccess {
+		t.Fatalf("DeriveRunOutcome() = %#v, want no partial success for orphaned run", outcome)
+	}
+}
+
+func TestNewFollowupFixItemsDetectsNewFailingCheckAndConflict(t *testing.T) {
+	t.Parallel()
+
+	snapshot := []FixItem{
+		{Type: "comment", ID: "c1", ThreadID: "t1"},
+		{Type: "check", Name: "ci"},
+	}
+	live := []FixItem{
+		{Type: "comment", ID: "c1", ThreadID: "t1"},
+		{Type: "check", Name: "ci"},
+		{Type: "check", Name: "lint"},
+		{Type: "conflict"},
+	}
+	if !hasNewFollowupFixItems(snapshot, live) {
+		t.Fatalf("hasNewFollowupFixItems() = false, want true for new lint check and conflict")
+	}
+	// A live snapshot with no new items returns false.
+	if hasNewFollowupFixItems(snapshot, snapshot) {
+		t.Fatalf("hasNewFollowupFixItems() = true, want false for matching snapshots")
 	}
 }

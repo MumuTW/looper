@@ -1141,8 +1141,29 @@ func DeriveRunOutcome(run storage.RunRecord) *FixerRunOutcome {
 		return nil
 	}
 	if checkpoint.Outcome != nil {
+		// A persisted outcome is authoritative for progress; only backfill a
+		// missing primary failure for failure statuses (e.g. orphaned pre-start
+		// runs completed as interrupted with an empty outcome) without
+		// recomputing progress, so stored durable progress is preserved.
+		if runStatusIsFailure(run.Status) && checkpoint.Outcome.PrimaryFailure == nil {
+			step := asFixerStep(derefString(run.CurrentStep))
+			if step == "" {
+				step = asFixerStep(derefString(run.LastCompletedStep))
+			}
+			failure := FixerOutcomeFailure{Step: string(step), Message: firstNonEmpty(derefString(run.ErrorMessage), derefString(run.Summary), "fixer run failed")}
+			if checkpoint.ResumePolicy == loops.ResumePolicyManualIntervention {
+				retryable := false
+				failure.Kind = FailureManualIntervention
+				failure.Retryable = &retryable
+			}
+			checkpoint.Outcome.PrimaryFailure = &failure
+			checkpoint.Outcome.PartialSuccess = outcomeHasDurableProgress(checkpoint.Outcome.Progress)
+		}
 		return checkpoint.Outcome
 	}
+	// No persisted outcome: derive progress from the checkpoint fields and
+	// backfill a primary failure for failure statuses.
+	checkpoint.Outcome = &FixerRunOutcome{}
 	if runStatusIsFailure(run.Status) {
 		step := asFixerStep(derefString(run.CurrentStep))
 		if step == "" {
@@ -1154,10 +1175,14 @@ func DeriveRunOutcome(run storage.RunRecord) *FixerRunOutcome {
 			failure.Kind = FailureManualIntervention
 			failure.Retryable = &retryable
 		}
-		checkpoint.Outcome = &FixerRunOutcome{PrimaryFailure: &failure}
+		checkpoint.Outcome.PrimaryFailure = &failure
 	}
 	checkpoint.refreshOutcomeProgress()
 	return checkpoint.Outcome
+}
+
+func outcomeHasDurableProgress(progress FixerDurableProgress) bool {
+	return progress.CommitProduced || progress.Pushed || progress.RepliesSent > 0 || progress.ThreadsResolved > 0
 }
 
 func looksLikeFixerCheckpoint(run storage.RunRecord, checkpoint fixerCheckpoint) bool {
@@ -1459,6 +1484,19 @@ func parseNativeRepairResults(stdout, stderr string, fixItems []FixItem) []reply
 // without coupling fixer code to internal/agent's parser. It returns the JSON
 // payload after the final __LOOPER_RESULT__= line, or "" if absent.
 func extractCompletionMarkerPayload(combined string) string {
+	if payload := scanCompletionMarkerLines(combined); payload != "" {
+		return payload
+	}
+	// Codex --json embeds the marker inside a JSON event (agent_message or a
+	// command output) rather than on a raw stdout line. Translate the JSONL
+	// stream into the human-readable text the agent produced and scan that.
+	if translated := agent.CombinedTextFromJSONL(combined); translated != "" {
+		return scanCompletionMarkerLines(translated)
+	}
+	return ""
+}
+
+func scanCompletionMarkerLines(combined string) string {
 	prefix := agent.CompletionMarkerPrefix
 	lines := strings.Split(combined, "\n")
 	for i := len(lines) - 1; i >= 0; i-- {
@@ -1480,14 +1518,11 @@ func isTemplateCompletionPayload(payload string) bool {
 		return false
 	}
 	summary, _ := parsed["summary"].(string)
-	if strings.TrimSpace(summary) != "<one-sentence summary>" {
-		return false
-	}
-	if len(parsed) != 1 {
-		return false
-	}
-	_, ok := parsed["summary"]
-	return ok
+	// "<one-sentence summary>" is the literal placeholder both the generic and
+	// fixer completion templates emit. A real agent never leaves the summary as
+	// this exact token, so skip any payload that still carries it — including
+	// the fixer template form that also holds outcome/failure_kind placeholders.
+	return strings.TrimSpace(summary) == "<one-sentence summary>"
 }
 
 func sanitizeReplyExplanation(raw string) string {
@@ -7128,19 +7163,24 @@ func (r *Runner) cleanupFixerWorktreeIfTerminal(ctx context.Context, project sto
 }
 
 // recordTerminalCleanup preserves the completed run result while making a
-// later cleanup failure visible in the same durable outcome.
+// later cleanup failure visible in the same durable outcome. It appends the
+// cleanup secondary issue atomically via AppendCheckpointSecondaryIssue, so a
+// concurrent checkpoint transition (e.g. discovery persisting
+// restart_from_discover while cleanup runs) is preserved rather than
+// overwritten by the stale in-memory checkpoint.
 func (r *Runner) recordTerminalCleanup(ctx context.Context, project storage.ProjectRecord, runID string, checkpoint *fixerCheckpoint) {
 	cleanupErr := r.cleanupFixerWorktreeIfTerminal(ctx, project, checkpoint)
 	if cleanupErr == nil || checkpoint == nil {
 		return
 	}
+	retryable := true
+	issue := FixerOutcomeFailure{Step: string(stepCleanupWorktree), Message: cleanupErr.Error(), Kind: FailureRetryableTransient, Retryable: &retryable}
+	// Keep the in-memory checkpoint consistent so the returned ProcessResult
+	// reflects the cleanup failure.
 	if checkpoint.Outcome == nil {
 		checkpoint.refreshOutcomeProgress()
 	}
-	retryable := true
-	issue := FixerOutcomeFailure{Step: string(stepCleanupWorktree), Message: cleanupErr.Error(), Kind: FailureRetryableTransient, Retryable: &retryable}
 	checkpoint.Outcome.SecondaryIssues = append(checkpoint.Outcome.SecondaryIssues, issue)
-	checkpoint.refreshOutcomeProgress()
 	if r.repos == nil || r.repos.Runs == nil || strings.TrimSpace(runID) == "" {
 		return
 	}
@@ -8216,7 +8256,7 @@ func buildFixerPrompt(projectID string, instructionConfig config.Config, repo st
 		"For fixer commits, prefer a fresh commit subject that precisely summarizes the repair changes from this round. Do not mechanically reuse the PR title or a previous fixer subject when this round's edits are narrower or different.",
 		"The final "+agent.CompletionMarker+" JSON MUST include a top-level `outcome`: use `completed` when the repair task ran to completion, or `blocked` only when it could not be attempted. For `blocked`, also include `failure_kind` as `retryable_transient`, `retryable_after_resume`, or `manual_intervention`; authentication, authorization, usage-limit, and credential failures require `manual_intervention`. Free-form summary text is diagnostic and never controls this classification.",
 	)
-	return agent.AppendCompletionInstructionWithExample(strings.Join(parts, "\n\n"), `{"outcome":"completed","summary":"<one-sentence summary>"}`), instructionBlock
+	return agent.AppendFixerCompletionInstruction(strings.Join(parts, "\n\n")), instructionBlock
 }
 
 func customInstructionConfig(value *config.Config) config.Config {

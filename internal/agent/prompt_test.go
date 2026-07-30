@@ -30,3 +30,19 @@ func TestAppendCompletionInstructionWithExampleUsesCallerContract(t *testing.T) 
 		t.Fatalf("prompt = %q, want fixer completion contract", prompt)
 	}
 }
+
+func TestAppendFixerCompletionInstructionIncludesOutcomeContract(t *testing.T) {
+	t.Parallel()
+
+	prompt := AppendFixerCompletionInstruction("repair the pr")
+	for _, needle := range []string{
+		"repair the pr",
+		`__LOOPER_RESULT__={"outcome":"completed","summary":"<one-sentence summary>"}`,
+		`__LOOPER_RESULT__={"outcome":"blocked","failure_kind":"manual_intervention","summary":"<one-sentence summary>"}`,
+		"Do not wrap that line in markdown.",
+	} {
+		if !strings.Contains(prompt, needle) {
+			t.Fatalf("fixer prompt = %q, want %q", prompt, needle)
+		}
+	}
+}

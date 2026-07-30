@@ -3456,6 +3456,72 @@ func TestRunResolveCommentsStepTreatsNewThreadAfterRepairAsFollowupWithoutSkippi
 	}
 }
 
+func TestRunResolveCommentsStepSchedulesRediscoveryForNewFailingCheck(t *testing.T) {
+	t.Parallel()
+
+	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{{
+		Number:      42,
+		State:       "OPEN",
+		HeadSHA:     "new-head",
+		HeadRefName: "feature/fix-42",
+		BaseRefName: "main",
+		BaseSHA:     "base-1",
+		Comments:    []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}},
+		Checks: []map[string]any{
+			{"name": "ci", "conclusion": "FAILURE"},
+			{"name": "lint", "conclusion": "FAILURE"},
+		},
+	}}, threads: []ReviewThread{{ID: "t1", Comments: []ReviewThreadComment{{ID: "c1", Body: "please fix"}}}}}
+	// Snapshot the agent repaired: comment c1 and the original failing ci check.
+	// A new lint check appeared after the repair snapshot.
+	fixItems := []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", Summary: "please fix"}, {Type: "check", Name: "ci", Summary: "FAILURE"}}
+	checkpoint := fixerCheckpoint{
+		FixItems:         fixItems,
+		FixItemsHash:     hashFixItems(fixItems),
+		Validation:       &ValidationResult{Passed: true, Summary: "ok", HeadSHA: "new-head"},
+		Push:             &checkpointPush{Pushed: false, Branch: "feature/fix-42", Remote: "origin", SkippedReason: "No new commits to push"},
+		Repair:           &checkpointRepair{CompletedAt: "2026-04-11T12:00:00Z", ReplyExplanations: []replyExplanationEntry{{FixItemID: "c1", ThreadID: "t1", Explanation: "Applied the requested fix.", ThreadCommentsObserved: hashReviewThreadComments(ReviewThread{Comments: []ReviewThreadComment{{ID: "c1"}}})}}},
+		ReconcileCommits: &checkpointReconcileCommits{BaseHeadSHA: "base-head", FinalHeadSHA: "base-head", WorkingTreeClean: true},
+	}
+
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	loopTarget := buildPullRequestTargetID(repo, prNumber)
+	loop := storage.LoopRecord{ID: "loop_new_check_followup", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "queued", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Logger: fixture.logger, Now: fixture.now})
+
+	updated, err := runner.runResolveCommentsStep(context.Background(), stepInput{
+		Project:    storage.ProjectRecord{RepoPath: t.TempDir()},
+		Repo:       repo,
+		PRNumber:   prNumber,
+		Loop:       loop,
+		Checkpoint: checkpoint,
+	})
+	if err != nil {
+		t.Fatalf("runResolveCommentsStep() error = %v", err)
+	}
+	if len(github.resolveCalls) != 1 || github.resolveCalls[0].ThreadID != "t1" {
+		t.Fatalf("resolve calls = %#v, want exactly 1 resolve for t1", github.resolveCalls)
+	}
+	// No new comment thread, so FollowUpThreadIDs is empty; the new failing
+	// check is still follow-up work and must schedule rediscovery.
+	if updated.Outcome != nil && len(updated.Outcome.FollowUpThreadIDs) != 0 {
+		t.Fatalf("FollowUpThreadIDs = %#v, want empty (no new comment threads)", updated.Outcome.FollowUpThreadIDs)
+	}
+	persistedLoop, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil || persistedLoop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v)", persistedLoop, err)
+	}
+	pending, ok := parsePendingFixerRediscoveryState(parseJSONObject(persistedLoop.MetadataJSON))
+	if !ok || pending.HeadSHA != "new-head" {
+		t.Fatalf("pending rediscovery = %#v, want durable handoff for the new failing check", pending)
+	}
+}
+
 func TestRunResolveCommentsStepRejectsDeclinedReplyWithoutReason(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

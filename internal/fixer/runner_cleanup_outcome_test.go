@@ -107,3 +107,49 @@ func TestRecordSuccessfulRunCleanupPersistsSecondaryIssue(t *testing.T) {
 		t.Fatalf("durable Outcome = %#v, want successful progress plus cleanup issue", durable.Outcome)
 	}
 }
+
+func TestRecordTerminalCleanupPreservesConcurrentResumePolicy(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	git := &fakeGitGateway{cleanupErr: errors.New("worktree remove failed")}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, Logger: fixture.logger, Now: fixture.now})
+	loop := storage.LoopRecord{ID: "loop_concurrent_cleanup", ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", Status: "running", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	// Stale in-memory checkpoint the failure path still holds: replay_step.
+	stale := fixerCheckpoint{
+		RunStartedRunID: "run_concurrent_cleanup",
+		ResumePolicy:    "replay_step",
+		Worktree:        &checkpointWorktree{Path: filepath.Join(t.TempDir(), "worktree"), Branch: "feature/fix-42", PreparedAt: fixture.nowISO()},
+	}
+	stale.recordFailure(stepRepair, &loopError{message: "repair failed", kind: FailureRetryableTransient})
+	staleJSON := mustMarshalJSON(stale)
+	run := storage.RunRecord{ID: "run_concurrent_cleanup", LoopID: loop.ID, Status: "failed", CheckpointJSON: &staleJSON, StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Runs.Upsert(context.Background(), run); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	// Concurrent discovery persisted restart_from_discover after completeRun
+	// but before terminal cleanup reached this point.
+	concurrent := stale
+	concurrent.ResumePolicy = "restart_from_discover"
+	concurrentJSON := mustMarshalJSON(concurrent)
+	if err := fixture.repos.Runs.UpdateCheckpoint(context.Background(), run.ID, concurrentJSON, fixture.nowISO()); err != nil {
+		t.Fatalf("UpdateCheckpoint(concurrent) error = %v", err)
+	}
+
+	runner.recordTerminalCleanup(context.Background(), storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()}, run.ID, &stale)
+
+	persisted, err := fixture.repos.Runs.GetByID(context.Background(), run.ID)
+	if err != nil || persisted == nil {
+		t.Fatalf("Runs.GetByID() = (%#v, %v)", persisted, err)
+	}
+	durable := parseCheckpoint(persisted.CheckpointJSON)
+	if durable.ResumePolicy != "restart_from_discover" {
+		t.Fatalf("durable ResumePolicy = %q, want concurrent restart_from_discover preserved", durable.ResumePolicy)
+	}
+	if durable.Outcome == nil || durable.Outcome.PrimaryFailure == nil || len(durable.Outcome.SecondaryIssues) != 1 || durable.Outcome.SecondaryIssues[0].Step != string(stepCleanupWorktree) {
+		t.Fatalf("durable Outcome = %#v, want merged cleanup secondary alongside primary", durable.Outcome)
+	}
+}
