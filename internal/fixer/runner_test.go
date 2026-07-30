@@ -15,6 +15,7 @@ import (
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/disclosure"
 	"github.com/nexu-io/looper/internal/eventlog"
+	"github.com/nexu-io/looper/internal/fixer/workflow"
 	"github.com/nexu-io/looper/internal/labels"
 	"github.com/nexu-io/looper/internal/lifecycle"
 	"github.com/nexu-io/looper/internal/loops"
@@ -5391,7 +5392,7 @@ func TestOperatorRetryEscapeReachesDiscoverAfterReplacementClaim(t *testing.T) {
 	if loops.ShouldRestartFromDiscover("failed", parkedCheckpoint.ResumePolicy) {
 		t.Fatalf("pre-retry ShouldRestartFromDiscover = true, want false for manual_intervention policy")
 	}
-	if err := validateFixerResumeCheckpoint(nextFixerStep(stepPush), parkedCheckpoint); err == nil {
+	if err := validateFixerResumeCheckpoint(workflow.Next(stepPush), parkedCheckpoint); err == nil {
 		t.Fatalf("pre-retry validateFixerResumeCheckpoint(resolve_comments) = nil, want re-park on invalid repair")
 	}
 
