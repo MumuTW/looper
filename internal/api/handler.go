@@ -42,14 +42,17 @@ import (
 )
 
 const (
-	requestIDHeaderName        = "x-request-id"
-	apiBasePath                = "/api/v1"
-	webhookForwardPath         = "/webhook/forward"
-	javaScriptISOString        = "2006-01-02T15:04:05.000Z"
-	loopLogsFollowPollInterval = 200 * time.Millisecond
-	loopLogsFollowRetryAfter   = time.Second
-	activeRunHeartbeatTTL      = 30 * time.Minute
-	webhookListenerPath        = "/webhook/forward"
+	requestIDHeaderName             = "x-request-id"
+	apiBasePath                     = "/api/v1"
+	webhookForwardPath              = "/webhook/forward"
+	javaScriptISOString             = "2006-01-02T15:04:05.000Z"
+	loopLogsFollowPollInterval      = 200 * time.Millisecond
+	loopLogsFollowStatePollInterval = time.Second
+	loopLogsFollowRetryAfter        = time.Second
+	loopLogsFollowMaxChunkBytes     = 64 * 1024
+	loopLogsFollowSnapshotBytes     = 200 * 1024
+	activeRunHeartbeatTTL           = 30 * time.Minute
+	webhookListenerPath             = "/webhook/forward"
 )
 
 var nonProjectIDPattern = regexp.MustCompile(`[^a-z0-9]+`)
@@ -146,6 +149,9 @@ type Handler struct {
 	// before the requeue transaction so tests can inject a TX-time conflict
 	// after the sticky stop gate was already cleared.
 	retryAfterClearStopGateHook func(loopID string)
+	// loopLogsFollowObserve is test-only instrumentation for enforcing the
+	// stream's query/read budgets without coupling tests to SQLite internals.
+	loopLogsFollowObserve func(loopLogsFollowObservation)
 }
 
 // effectiveConfig returns the live config when ConfigSnapshot is wired, else
@@ -656,6 +662,7 @@ type apiError struct {
 }
 
 type loopLogsFollowChunkEvent struct {
+	Stream      string  `json:"stream,omitempty"`
 	RunID       *string `json:"runId,omitempty"`
 	CurrentStep *string `json:"currentStep,omitempty"`
 	ExecutionID *string `json:"executionId,omitempty"`
@@ -3869,6 +3876,9 @@ func (h *Handler) streamLoopLogsRoute(w http.ResponseWriter, r *http.Request, pa
 		return err
 	}
 
+	if strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("streams")), "both") {
+		return h.streamLoopLogsCombined(w, r, requestID, loop)
+	}
 	return h.streamLoopLogs(w, r, requestID, loop, queryBool(r.URL.Query(), "stderr"))
 }
 
@@ -6319,9 +6329,19 @@ func (h *Handler) buildRunLogsResponse(ctx context.Context, runID string) (loopL
 }
 
 func (h *Handler) buildLogsResponseForRun(ctx context.Context, loop storage.LoopRecord, run *storage.RunRecord) (loopLogsResponse, error) {
+	response, _, err := h.buildLogsStateForRun(ctx, loop, run, true)
+	return response, err
+}
+
+// buildLogsStateForRun is the single query/projection path for log snapshots
+// and incremental follow metadata. Followers pass readPersisted=false so a
+// state refresh never rereads the bounded log history; their file cursors own
+// incremental bytes instead.
+func (h *Handler) buildLogsStateForRun(ctx context.Context, loop storage.LoopRecord, run *storage.RunRecord, readPersisted bool) (loopLogsResponse, agentOutputPayload, error) {
 	services := h.context.Runtime.Services()
 	var runPayload *loopLogsRunResponse
 	var agentPayload *loopLogsAgentPayload
+	var output agentOutputPayload
 	if run != nil {
 		runPayload = &loopLogsRunResponse{
 			RunID:        run.ID,
@@ -6335,10 +6355,14 @@ func (h *Handler) buildLogsResponseForRun(ctx context.Context, loop storage.Loop
 
 		latestAgent, agentErr := services.Repositories.AgentExecutions.GetLatestByRunID(ctx, run.ID)
 		if agentErr != nil {
-			return loopLogsResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: agentErr.Error()}
+			return loopLogsResponse{}, agentOutputPayload{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: agentErr.Error()}
 		}
 		if latestAgent != nil {
-			stdout, stderr := parseAgentOutput(h.context.Config.Daemon.LogDir, latestAgent.OutputJSON)
+			output = decodeAgentOutput(latestAgent.OutputJSON)
+			stdout, stderr := output.Stdout, output.Stderr
+			if readPersisted {
+				stdout, stderr = materializeAgentOutput(h.context.Config.Daemon.LogDir, output)
+			}
 			agentPayload = &loopLogsAgentPayload{
 				ExecutionID:     latestAgent.ID,
 				Vendor:          latestAgent.Vendor,
@@ -6357,7 +6381,7 @@ func (h *Handler) buildLogsResponseForRun(ctx context.Context, loop storage.Loop
 		}
 	}
 
-	return loopLogsResponse{Seq: loop.Seq, LoopID: loop.ID, LoopType: loop.Type, LoopStatus: loop.Status, Run: runPayload, Agent: agentPayload}, nil
+	return loopLogsResponse{Seq: loop.Seq, LoopID: loop.ID, LoopType: loop.Type, LoopStatus: loop.Status, Run: runPayload, Agent: agentPayload}, output, nil
 }
 
 func serializeLoop(loop storage.LoopRecord) loopResponse {
@@ -7170,19 +7194,29 @@ func mapLoopCreateError(err error) error {
 
 const maxPersistedAgentLogReadBytes = 16 * 1024 * 1024
 
+type agentOutputPayload struct {
+	Stdout        string `json:"stdout"`
+	Stderr        string `json:"stderr"`
+	StdoutLogPath string `json:"stdoutLogPath"`
+	StderrLogPath string `json:"stderrLogPath"`
+}
+
 func parseAgentOutput(logDir string, outputJSON *string) (string, string) {
+	return materializeAgentOutput(logDir, decodeAgentOutput(outputJSON))
+}
+
+func decodeAgentOutput(outputJSON *string) agentOutputPayload {
 	if outputJSON == nil || strings.TrimSpace(*outputJSON) == "" {
-		return "", ""
+		return agentOutputPayload{}
 	}
-	var payload struct {
-		Stdout        string `json:"stdout"`
-		Stderr        string `json:"stderr"`
-		StdoutLogPath string `json:"stdoutLogPath"`
-		StderrLogPath string `json:"stderrLogPath"`
-	}
+	var payload agentOutputPayload
 	if err := json.Unmarshal([]byte(*outputJSON), &payload); err != nil {
-		return "", ""
+		return agentOutputPayload{}
 	}
+	return payload
+}
+
+func materializeAgentOutput(logDir string, payload agentOutputPayload) (string, string) {
 	if content, ok := readAgentOutputLog(logDir, payload.StdoutLogPath); ok {
 		payload.Stdout = content
 	}

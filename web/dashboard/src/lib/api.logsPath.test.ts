@@ -2,9 +2,9 @@ import { describe, expect, it } from "vitest";
 import { loopLogsFollowPath } from "./api";
 
 describe("loopLogsFollowPath", () => {
-  it("opens default follow without stderr flag", () => {
+  it("opens one combined stdout/stderr follow by default", () => {
     expect(loopLogsFollowPath("loop_1")).toBe(
-      "/api/v1/loops/loop_1/logs?follow=1",
+      "/api/v1/loops/loop_1/logs?follow=1&streams=both",
     );
   });
 
@@ -16,7 +16,7 @@ describe("loopLogsFollowPath", () => {
 
   it("encodes selector path segments", () => {
     expect(loopLogsFollowPath("a/b")).toBe(
-      "/api/v1/loops/a%2Fb/logs?follow=1",
+      "/api/v1/loops/a%2Fb/logs?follow=1&streams=both",
     );
   });
 });
