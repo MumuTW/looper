@@ -23,10 +23,12 @@ type upgradePreflight struct {
 		CLI    version.Info `json:"cli"`
 		Daemon version.Info `json:"daemon"`
 	} `json:"target"`
-	CurrentPairMatches  bool   `json:"currentPairMatches"`
-	TargetPairMatches   bool   `json:"targetPairMatches"`
-	TargetIdentityValid bool   `json:"targetIdentityValid"`
-	Relationship        string `json:"relationship"`
+	CurrentPairMatches     bool   `json:"currentPairMatches"`
+	TargetPairMatches      bool   `json:"targetPairMatches"`
+	TargetIdentityValid    bool   `json:"targetIdentityValid"`
+	TargetConfigCompatible bool   `json:"targetConfigCompatible"`
+	TargetConfigError      string `json:"targetConfigError,omitempty"`
+	Relationship           string `json:"relationship"`
 }
 
 type upgradeStatus struct {
@@ -86,7 +88,8 @@ func runUpgrade(ctx context.Context, global, operands []string, stdout interface
 	if err != nil {
 		return err
 	}
-	report := upgradePreflight{CurrentPairMatches: version.Current().SameBuild(currentDaemon), TargetPairMatches: targetCLI.SameBuild(targetDaemon), TargetIdentityValid: validBuildIdentity(targetCLI) && validBuildIdentity(targetDaemon)}
+	configCompatible, configErr := targetConfigCompatibility(ctx, targetLooperd, global)
+	report := upgradePreflight{CurrentPairMatches: version.Current().SameBuild(currentDaemon), TargetPairMatches: targetCLI.SameBuild(targetDaemon), TargetIdentityValid: validBuildIdentity(targetCLI) && validBuildIdentity(targetDaemon), TargetConfigCompatible: configCompatible, TargetConfigError: configErr}
 	report.Current.CLI, report.Current.Daemon, report.Current.Status = version.Current(), currentDaemon, status
 	report.Target.CLI, report.Target.Daemon = targetCLI, targetDaemon
 	report.Relationship = buildRelationship(currentDaemon, targetDaemon)
@@ -99,6 +102,19 @@ func runUpgrade(ctx context.Context, global, operands []string, stdout interface
 	}
 	_, _ = fmt.Fprintln(stdout, string(encoded))
 	return nil
+}
+
+func targetConfigCompatibility(ctx context.Context, binary string, global []string) (bool, string) {
+	args := append([]string{"--check-config"}, global...)
+	out, err := exec.CommandContext(ctx, binary, args...).CombinedOutput()
+	if err == nil {
+		return true, ""
+	}
+	message := strings.TrimSpace(string(out))
+	if message == "" {
+		message = err.Error()
+	}
+	return false, message
 }
 
 func parseUpgradePreflightArgs(args []string) (string, string, bool, error) {
