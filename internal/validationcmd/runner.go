@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -13,12 +14,13 @@ import (
 
 	"github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/nexu-io/looper/internal/processcontainment"
+	"github.com/nexu-io/looper/internal/processsandbox"
 )
 
 const permissionProfile = "looper-validation"
 
-// Sandbox is a disposable, credential-free tool environment shared by
-// daemon-owned validation commands and validation-gated Codex agents.
+// Sandbox is the legacy Codex-specific disposable tool environment used by
+// validation-gated Codex agents. Repository commands use processsandbox.Run.
 type Sandbox struct {
 	CWD         string
 	ProfileName string
@@ -85,19 +87,18 @@ func (s *Sandbox) ShellEnvironmentConfig() string {
 }
 
 // Options describes one daemon-owned validation command. The repository may
-// control Command, so it must execute inside Codex's native OS sandbox rather
+// control Command, so it must execute behind Looper's process boundary rather
 // than in the daemon's credential-bearing environment.
 type Options struct {
-	CWD          string
-	Command      string
-	Timeout      time.Duration
-	Tracker      processcontainment.LiveTracker
-	CodexCommand string
+	CWD     string
+	Command string
+	Timeout time.Duration
+	Tracker processcontainment.LiveTracker
 }
 
 // Run executes one validation command with no network, an isolated HOME/XDG
 // tree, and write access only to the worktree and a disposable temporary root.
-// Missing or unsupported Codex sandbox support fails closed.
+// Missing or unsupported sandbox runtime support fails closed.
 func Run(ctx context.Context, options Options) (shell.Result, error) {
 	cwd := strings.TrimSpace(options.CWD)
 	if cwd == "" {
@@ -107,34 +108,75 @@ func Run(ctx context.Context, options Options) (shell.Result, error) {
 	if command == "" {
 		return shell.Result{}, fmt.Errorf("validation sandbox: command is required")
 	}
-	codexCommand := strings.TrimSpace(options.CodexCommand)
-	if codexCommand == "" {
-		codexCommand = "codex"
+	denyRead := []string{"/", filepath.Dir(cwd)}
+	if home, homeErr := os.UserHomeDir(); homeErr == nil {
+		denyRead = append(denyRead, home)
 	}
-
-	sandbox, err := NewSandbox(cwd, permissionProfile, "looper-validation-")
-	if err != nil {
-		return shell.Result{}, err
-	}
-	defer sandbox.Cleanup()
-	args := []string{
-		"sandbox",
-		"-c", sandbox.PermissionConfig(),
-		"-P", permissionProfile,
-		"--sandbox-state-disable-network",
-		"-C", cwd,
-		"/usr/bin/env", "-i",
-	}
-	args = append(args, sandbox.Environment()...)
-	args = append(args, "/bin/sh", "-c", command)
-
-	return shell.Run(ctx, shell.Options{
-		Command: codexCommand,
-		Args:    args,
-		CWD:     cwd,
-		Timeout: options.Timeout,
-		Tracker: options.Tracker,
+	allowRead := validationReadRoots(cwd)
+	environment, platformReadRoots := validationToolEnvironment()
+	allowRead = append(allowRead, platformReadRoots...)
+	return processsandbox.Run(ctx, processsandbox.Options{
+		CWD:         cwd,
+		Command:     "/bin/sh",
+		Args:        []string{"-c", command},
+		Environment: environment,
+		Timeout:     options.Timeout,
+		Tracker:     options.Tracker,
+		Profile:     processsandbox.WritableWorkspaceProfile(allowRead, denyRead),
 	})
+}
+
+func validationToolEnvironment() (processsandbox.ToolEnvironment, []string) {
+	environment := processsandbox.ToolEnvironment{
+		GoRoot:        resolvedGoRoot(),
+		GoModuleCache: resolvedModuleCache(),
+	}
+	if runtime.GOOS != "darwin" {
+		return environment, nil
+	}
+	output, err := exec.Command("xcode-select", "-p").Output()
+	if err != nil {
+		return environment, nil
+	}
+	developerDir := strings.TrimSpace(string(output))
+	if developerDir == "" {
+		return environment, nil
+	}
+	environment.PrependPath = []string{filepath.Join(developerDir, "usr", "bin")}
+	return environment, []string{filepath.Dir(developerDir)}
+}
+
+func validationReadRoots(cwd string) []string {
+	roots := map[string]struct{}{filepath.Clean(cwd): {}}
+	for _, entry := range filepath.SplitList(os.Getenv("PATH")) {
+		if entry = strings.TrimSpace(entry); entry != "" {
+			roots[filepath.Clean(entry)] = struct{}{}
+		}
+	}
+	if moduleCache := resolvedModuleCache(); moduleCache != "" {
+		roots[filepath.Clean(moduleCache)] = struct{}{}
+	}
+	if goRoot := resolvedGoRoot(); goRoot != "" {
+		roots[goRoot] = struct{}{}
+	}
+	for _, root := range linkedWorktreeReadRoots(cwd) {
+		roots[root] = struct{}{}
+	}
+	result := make([]string, 0, len(roots))
+	for root := range roots {
+		result = append(result, root)
+	}
+	sort.Strings(result)
+	return result
+}
+
+func resolvedModuleCache() string {
+	if moduleCache := strings.TrimSpace(os.Getenv("GOMODCACHE")); moduleCache != "" {
+		return moduleCache
+	} else if home, err := os.UserHomeDir(); err == nil && strings.TrimSpace(home) != "" {
+		return filepath.Join(home, "go", "pkg", "mod")
+	}
+	return ""
 }
 
 func buildPermissionProfile(cwd, tempRoot, profileName string) string {
