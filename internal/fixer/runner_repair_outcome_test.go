@@ -175,11 +175,13 @@ func TestRunRepairStepReplaysAfterRejectedOutcome(t *testing.T) {
 				createResult:  CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt-42"), Branch: "feature/fix-42", HeadSHA: "base-head"},
 				prepareResult: PrepareWorktreeResult{HeadSHA: "base-head", Clean: true},
 			}
-			agent := &fakeAgentExecutor{results: []AgentResult{{
-				Status: "completed", ParseStatus: "parsed", Summary: "attempted",
-				CompletionPayload: testCase.payload,
-			}}}
-			runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, AllowAutoCommit: true, AllowAutoPush: true, AllowRiskyFixes: true, Logger: fixture.logger, Now: fixture.now})
+			// Two results: the rejected attempt, then a valid completion for the
+			// replay so a second agent start can be asserted as a real repair.
+			agentExec := &fakeAgentExecutor{results: []AgentResult{
+				{Status: "completed", ParseStatus: "parsed", Summary: "attempted", CompletionPayload: testCase.payload},
+				{Status: "completed", ParseStatus: "parsed", Summary: "fixed on replay", CompletionPayload: `{"outcome":"completed","summary":"fixed on replay"}`},
+			}}
+			runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agentExec, AllowAutoCommit: true, AllowAutoPush: true, AllowRiskyFixes: true, Logger: fixture.logger, Now: fixture.now})
 
 			if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
 				t.Fatalf("DiscoverPullRequests() error = %v", err)
@@ -201,15 +203,30 @@ func TestRunRepairStepReplaysAfterRejectedOutcome(t *testing.T) {
 				t.Fatalf("Runs.GetByID() = (%#v, %v)", run, err)
 			}
 			stored := parseCheckpoint(run.CheckpointJSON)
+			// Errorf, not Fatalf: the replay assertions below are the behavioral half
+			// of this guard and must still run when the record leaks through.
 			if stored.Repair != nil {
-				t.Fatalf("stored checkpoint.Repair = %#v, want no repair record so the step stays replayable", stored.Repair)
+				t.Errorf("stored checkpoint.Repair = %#v, want no repair record so the step stays replayable", stored.Repair)
 			}
-			// The replay guard must not treat this checkpoint as a finished repair.
-			if replayed, replayErr := runner.runRepairStep(context.Background(), stepInput{
-				Project: storage.ProjectRecord{ID: "project_1"}, Loop: storage.LoopRecord{ID: result.LoopID},
+			// The replay guard must not treat this checkpoint as a finished repair:
+			// re-running the step has to start the agent again, not return early.
+			project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+			if err != nil || project == nil {
+				t.Fatalf("Projects.GetByID() = (%#v, %v)", project, err)
+			}
+			startsBefore := len(agentExec.starts)
+			replayed, replayErr := runner.runRepairStep(context.Background(), stepInput{
+				Project: *project, Loop: storage.LoopRecord{ID: result.LoopID},
 				Run: *run, Repo: "acme/looper", PRNumber: 42, Checkpoint: stored,
-			}); replayErr == nil && replayed.Repair != nil && replayed.Repair.ParseStatus == "parsed" {
-				t.Fatal("runRepairStep advanced on the stored checkpoint, want the repair replayed")
+			})
+			if replayErr != nil {
+				t.Fatalf("replayed runRepairStep() error = %v, want the repair to run again", replayErr)
+			}
+			if len(agentExec.starts) != startsBefore+1 {
+				t.Fatalf("agent starts = %d, want %d: the stored checkpoint short-circuited the replay", len(agentExec.starts), startsBefore+1)
+			}
+			if replayed.Repair == nil || replayed.Repair.Summary != "fixed on replay" {
+				t.Fatalf("replayed.Repair = %#v, want the second attempt's repair record", replayed.Repair)
 			}
 		})
 	}

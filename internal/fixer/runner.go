@@ -3323,8 +3323,16 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 		return checkpoint, err
 	}
 	// The parse gate above only proves a structured result arrived. The declared
-	// outcome is what authorizes advancing to reconcile/validate/push, so read it
-	// before any downstream step can act on this run.
+	// outcome is what authorizes Looper advancing to reconcile/validate/push, so
+	// read it before any downstream step can act on this run.
+	//
+	// Scope: this governs Looper's publish steps, not the agent's own. When
+	// allowAutoPush is set and no validation commands are configured, the repair
+	// prompt still asks the agent to push its commits directly, so partial work can
+	// reach the PR before this outcome exists. That is a pre-existing property of
+	// that configuration -- configuring validation commands makes the repair
+	// local-only via RestrictToolNetwork -- and closing it means changing the
+	// fixer's push model, tracked separately rather than folded into this gate.
 	//
 	// Neither rejection path records checkpoint.Repair. A stored repair record with
 	// ParseStatus "parsed" is what the replay guard at the top of this function
