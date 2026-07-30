@@ -188,6 +188,93 @@ func TestGatewayAuthHealthConcurrentSameHostReadsCachedResultSafely(t *testing.T
 	}
 }
 
+func TestGatewayAuthHealthCoalescesConcurrentColdProbes(t *testing.T) {
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	var mu sync.Mutex
+	calls := 0
+	gateway := New(Options{
+		Env:               map[string]string{"GH_TOKEN": "configured-token"},
+		RequireCredential: true,
+		GHRun: func(context.Context, shell.Options) (shell.Result, error) {
+			mu.Lock()
+			calls++
+			mu.Unlock()
+			started <- struct{}{}
+			<-release
+			return shell.Result{Stdout: "HTTP/2 200\nX-Ratelimit-Limit: 5000\nX-Ratelimit-Remaining: 4000\nX-Ratelimit-Reset: 1785414807\n\nMumuTW\n"}, nil
+		},
+	})
+
+	ownerDone := make(chan AuthHealth, 1)
+	go func() { ownerDone <- gateway.AuthHealth(context.Background(), "", "github.com") }()
+	<-started
+
+	var wg sync.WaitGroup
+	for range 16 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if health := gateway.AuthHealth(context.Background(), "", "github.com"); !health.Authenticated || health.Login != "MumuTW" {
+				t.Errorf("AuthHealth() = %#v, want authenticated MumuTW", health)
+			}
+		}()
+	}
+	close(release)
+	if health := <-ownerDone; !health.Authenticated {
+		t.Fatalf("owner AuthHealth() = %#v, want authenticated", health)
+	}
+	wg.Wait()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if calls != 1 {
+		t.Fatalf("gh calls = %d, want one shared cold probe", calls)
+	}
+}
+
+func TestGatewayAuthHealthDoesNotCacheProbeFromPreviousCredentialGeneration(t *testing.T) {
+	oldStarted := make(chan struct{}, 1)
+	releaseOld := make(chan struct{})
+	var mu sync.Mutex
+	calls := 0
+	gateway := New(Options{
+		Env:               map[string]string{"GH_TOKEN": "old"},
+		RequireCredential: true,
+		GHRun: func(_ context.Context, options shell.Options) (shell.Result, error) {
+			mu.Lock()
+			calls++
+			mu.Unlock()
+			if options.Env["GH_TOKEN"] == "old" {
+				oldStarted <- struct{}{}
+				<-releaseOld
+				return shell.Result{Stdout: "HTTP/2 200\nX-Ratelimit-Limit: 5000\nX-Ratelimit-Remaining: 4000\nX-Ratelimit-Reset: 1785414807\n\nold-user\n"}, nil
+			}
+			return shell.Result{Stdout: "HTTP/2 200\nX-Ratelimit-Limit: 5000\nX-Ratelimit-Remaining: 4000\nX-Ratelimit-Reset: 1785414807\n\nnew-user\n"}, nil
+		},
+	})
+
+	oldDone := make(chan AuthHealth, 1)
+	go func() { oldDone <- gateway.AuthHealth(context.Background(), "", "github.com") }()
+	<-oldStarted
+	gateway.UpdateCredentialEnv(map[string]string{"GH_TOKEN": "new"})
+	close(releaseOld)
+	if health := <-oldDone; health.Login != "old-user" {
+		t.Fatalf("in-flight AuthHealth() = %#v, want old probe result", health)
+	}
+
+	fresh := gateway.AuthHealth(context.Background(), "", "github.com")
+	cached := gateway.AuthHealth(context.Background(), "", "github.com")
+	if fresh.Login != "new-user" || cached.Login != "new-user" {
+		t.Fatalf("fresh=%#v cached=%#v, want new credential identity", fresh, cached)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if calls != 2 {
+		t.Fatalf("gh calls = %d, want old probe plus one fresh probe", calls)
+	}
+}
+
 func TestGatewayAuthHealthDoesNotCacheCanceledProbe(t *testing.T) {
 	calls := 0
 	gateway := New(Options{

@@ -190,9 +190,18 @@ func (r *Runtime) applyLoadedConfigLocked(loaded config.LoadedFileConfig, now ti
 		sort.Strings(restartRequired)
 		return r.rejectConfigReloadLocked("restart_required", restartRequired, nil)
 	}
+	credentialChanged := !reflect.DeepEqual(config.DaemonGitHubCredentialEnv(r.loadedConfig.Config), config.DaemonGitHubCredentialEnv(loaded.Config))
+	applied := false
 	r.configBoundary.Lock()
-	defer r.configBoundary.Unlock()
-	return r.applyLoadedConfigBoundaryLocked(loaded, now)
+	defer func() {
+		r.configBoundary.Unlock()
+		if applied && credentialChanged {
+			go r.ReconcileWebhookForwarders()
+		}
+	}()
+	err := r.applyLoadedConfigBoundaryLocked(loaded, now)
+	applied = err == nil
+	return err
 }
 
 // applyLoadedConfigBoundaryLocked requires configBoundary's write lock. It is
@@ -367,8 +376,15 @@ func (r *Runtime) PatchConfig(ctx context.Context, patch ConfigPatch) error {
 		kind, message := configRestartRejection(rejected)
 		return &ConfigPatchError{Kind: kind, Message: message, Paths: rejected}
 	}
+	credentialChanged := !reflect.DeepEqual(config.DaemonGitHubCredentialEnv(r.loadedConfig.Config), config.DaemonGitHubCredentialEnv(candidate.Config))
+	applied := false
 	r.configBoundary.Lock()
-	defer r.configBoundary.Unlock()
+	defer func() {
+		r.configBoundary.Unlock()
+		if applied && credentialChanged {
+			go r.ReconcileWebhookForwarders()
+		}
+	}()
 	runtimeCandidate := candidate.Config
 	if r.projectCatalog != nil {
 		runtimeCandidate.Projects = r.projectCatalog.Snapshot().Projects
@@ -416,6 +432,7 @@ func (r *Runtime) PatchConfig(ctx context.Context, patch ConfigPatch) error {
 	if err := r.applyLoadedConfigBoundaryLocked(candidate, now); err != nil {
 		return &ConfigPatchError{Kind: "validation", Message: err.Error(), Err: err}
 	}
+	applied = true
 	return nil
 }
 

@@ -471,6 +471,7 @@ func (w *webhookRuntime) forwarderState(repo string) *WebhookForwarderState {
 
 func (w *webhookRuntime) reconcileForwarders(repoSet map[string]struct{}) []string {
 	launchRepos := []string{}
+	gateway := w.daemonGitHubGateway()
 	type stopRequest struct {
 		repo   string
 		pid    *int
@@ -487,6 +488,17 @@ func (w *webhookRuntime) reconcileForwarders(repoSet map[string]struct{}) []stri
 	for _, state := range w.status.Forwarders {
 		if _, ok := repoSet[state.Repo]; ok {
 			wantFingerprint, _ := commandFingerprint(w.ghPath, state.Repo, webhookForwardEvents, w.status.EndpointURL)
+			if !state.Running && state.PID == nil && forwarderCredentialUnavailable(state.LastError) && gateway != nil {
+				hostname, _ := splitTunnelRepoHostname(state.Repo)
+				if gateway.HasDaemonCredentialForHost(hostname) {
+					stops = append(stops, stopRequest{repo: state.Repo, stopCh: w.forwarderStopCh[state.Repo]})
+					launchRepos = append(launchRepos, state.Repo)
+					kept = append(kept, WebhookForwarderState{Repo: state.Repo, Command: []string{w.ghPath, "webhook", "forward", "--repo", state.Repo, "--events", strings.Join(webhookForwardEvents, ","), "--url", w.status.EndpointURL}, Fingerprint: wantFingerprint})
+					w.forwarderStopCh[state.Repo] = make(chan struct{})
+					existing[state.Repo] = struct{}{}
+					continue
+				}
+			}
 			if state.Latched && state.Fingerprint != "" && state.Fingerprint != wantFingerprint {
 				stops = append(stops, stopRequest{repo: state.Repo, pid: state.PID, stopCh: w.forwarderStopCh[state.Repo]})
 				delete(w.forwarderStopCh, state.Repo)
@@ -544,6 +556,10 @@ func (w *webhookRuntime) reconcileForwarders(repoSet map[string]struct{}) []stri
 	}
 	w.status.Degraded = len(w.status.DegradedReasons) > 0
 	return launchRepos
+}
+
+func forwarderCredentialUnavailable(message string) bool {
+	return strings.Contains(message, githubinfra.ErrCredentialUnavailable.Error())
 }
 
 func (w *webhookRuntime) adoptionGate(record storage.WebhookForwarderRecord, command []string) string {

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/nexu-io/looper/internal/config"
+	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -252,6 +253,40 @@ func TestWebhookRuntimeSharesRotatedGatewayWithTunnelChildren(t *testing.T) {
 	}
 	if !containsEnv(command.Env, "GH_TOKEN=rotated") || containsEnv(command.Env, "GH_TOKEN=old") {
 		t.Fatalf("child env = %#v, want rotated gateway credential", command.Env)
+	}
+}
+
+func TestWebhookRuntimeReconcileRelaunchesCredentialUnavailableForwarderAfterGatewayReload(t *testing.T) {
+	oldStop := make(chan struct{})
+	gateway := githubinfra.New(githubinfra.Options{Env: map[string]string{}, RequireCredential: true})
+	rt := &webhookRuntime{
+		ghPath:        "gh",
+		githubGateway: gateway,
+		status: WebhookStatus{
+			Enabled:     true,
+			EndpointURL: "http://127.0.0.1:17310/webhook/forward",
+			Forwarders: []WebhookForwarderState{{
+				Repo:      "acme/repo",
+				LastError: githubinfra.ErrCredentialUnavailable.Error(),
+			}},
+		},
+		stopCh:          make(chan struct{}),
+		forwarderStopCh: map[string]chan struct{}{"acme/repo": oldStop},
+	}
+
+	gateway.UpdateCredentialEnv(map[string]string{"GH_TOKEN": "rotated"})
+	launches := rt.reconcileForwarders(map[string]struct{}{"acme/repo": {}})
+	if len(launches) != 1 || launches[0] != "acme/repo" {
+		t.Fatalf("reconcile launches = %v, want acme/repo after credential reload", launches)
+	}
+	select {
+	case <-oldStop:
+	default:
+		t.Fatal("credential-unavailable forwarder stop channel was not replaced")
+	}
+	status := rt.Status()
+	if len(status.Forwarders) != 1 || status.Forwarders[0].LastError != "" {
+		t.Fatalf("forwarder status = %#v, want cleared credential failure", status.Forwarders)
 	}
 }
 

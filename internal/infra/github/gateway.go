@@ -112,6 +112,8 @@ type Gateway struct {
 	authHealthCacheTTL     time.Duration
 	authHealthMu           sync.Mutex
 	authHealthCache        map[string]authHealthCacheEntry
+	authHealthGeneration   uint64
+	authHealthProbes       map[string]*authHealthProbe
 	now                    func() time.Time
 	discoveryCacheTTL      time.Duration
 	discoveryCacheMu       sync.Mutex
@@ -127,6 +129,11 @@ type Gateway struct {
 type authHealthCacheEntry struct {
 	expiresAt time.Time
 	health    AuthHealth
+}
+
+type authHealthProbe struct {
+	generation uint64
+	done       chan struct{}
 }
 
 // AuthHealth is the operator-facing identity and core REST rate snapshot from
@@ -760,6 +767,7 @@ func New(options Options) *Gateway {
 		credentialConfigured:   hasGitHubCredential(options.Env),
 		authHealthCacheTTL:     authHealthCacheTTL,
 		authHealthCache:        map[string]authHealthCacheEntry{},
+		authHealthProbes:       map[string]*authHealthProbe{},
 		now:                    now,
 		discoveryCacheTTL:      options.DiscoveryCacheTTL,
 		discoveryPRCache:       map[string]discoveryPullRequestListCacheEntry{},
@@ -3089,29 +3097,49 @@ func (g *Gateway) AuthHealth(ctx context.Context, cwd, hostname string) AuthHeal
 		hostname = "github.com"
 	}
 
-	g.authHealthMu.Lock()
-	if cached, ok := g.authHealthCache[hostname]; ok && g.now().Before(cached.expiresAt) {
+	for {
+		g.authHealthMu.Lock()
+		if cached, ok := g.authHealthCache[hostname]; ok && g.now().Before(cached.expiresAt) {
+			g.authHealthMu.Unlock()
+			return cached.health
+		}
+		generation := g.authHealthGeneration
+		if probe := g.authHealthProbes[hostname]; probe != nil && probe.generation == generation {
+			done := probe.done
+			g.authHealthMu.Unlock()
+			select {
+			case <-done:
+				// The completed probe either populated the matching-generation
+				// cache or was invalidated by a credential rotation; recheck both.
+				continue
+			case <-ctx.Done():
+				return AuthHealth{Hostname: hostname, CheckedAt: g.now().UTC().Format(time.RFC3339), Error: ctx.Err().Error()}
+			}
+		}
+		probe := &authHealthProbe{generation: generation, done: make(chan struct{})}
+		g.authHealthProbes[hostname] = probe
+		credentialConfigured := g.credentialConfigured
 		g.authHealthMu.Unlock()
-		return cached.health
-	}
-	credentialConfigured := g.credentialConfigured
-	g.authHealthMu.Unlock()
 
-	health := g.probeAuthHealth(ctx, cwd, hostname)
-	if ctx.Err() != nil {
+		health := g.probeAuthHealth(ctx, cwd, hostname)
+		g.authHealthMu.Lock()
+		if g.authHealthProbes[hostname] == probe {
+			delete(g.authHealthProbes, hostname)
+		}
+		if ctx.Err() == nil && g.authHealthGeneration == generation {
+			ttl := g.authHealthCacheTTL
+			if credentialConfigured && !health.Authenticated && failedAuthHealthTTL < ttl {
+				ttl = failedAuthHealthTTL
+			}
+			g.authHealthCache[hostname] = authHealthCacheEntry{
+				expiresAt: g.now().Add(ttl),
+				health:    health,
+			}
+		}
+		close(probe.done)
+		g.authHealthMu.Unlock()
 		return health
 	}
-	ttl := g.authHealthCacheTTL
-	if credentialConfigured && !health.Authenticated && failedAuthHealthTTL < ttl {
-		ttl = failedAuthHealthTTL
-	}
-	g.authHealthMu.Lock()
-	g.authHealthCache[hostname] = authHealthCacheEntry{
-		expiresAt: g.now().Add(ttl),
-		health:    health,
-	}
-	g.authHealthMu.Unlock()
-	return health
 }
 
 // UpdateCredentialEnv atomically replaces daemon credential material and drops
@@ -3121,6 +3149,7 @@ func (g *Gateway) UpdateCredentialEnv(env map[string]string) {
 	defer g.authHealthMu.Unlock()
 	g.credentialEnv = env
 	g.credentialConfigured = hasGitHubCredential(env)
+	g.authHealthGeneration++
 	g.authHealthCache = map[string]authHealthCacheEntry{}
 }
 
