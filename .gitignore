@@ -1,13 +1,22 @@
 .ralph/
 .task/
+# Agent tooling checks out git worktrees here. Left untracked, they make every
+# local build probe dirty (tools/go-build-flags).
+.worktrees/
 .DS_Store
 node_modules/
 dist/
 internal/dashboard/assets/**
 !internal/dashboard/assets/.gitkeep
 *.test
+# Bare executables `go build` drops at the repo root (issue #236): one of
+# these was committed once; never again. Build output belongs in dist/.
 /looper
 /looperd
+/loopernet
+/fake-agent
+/fake-gh
+/fake-osascript
 specs/change/active
 task.md
 e2e/.env*

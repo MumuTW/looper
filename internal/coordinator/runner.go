@@ -1058,7 +1058,7 @@ func reviewerWorkPending(detail githubinfra.PullRequestDetail, currentLogin stri
 	if trigger.RequireReviewRequest && !isCurrentUserRequested(detail.ReviewRequests, currentLogin) {
 		return false
 	}
-	return labelsMatch(detail.Labels, requiredLabels, labelMode)
+	return config.LabelsMatch(detail.Labels, requiredLabels, labelMode)
 }
 
 func fixerWorkPending(detail githubinfra.PullRequestDetail, currentLogin string, trigger config.RoleDiscoveryConfig, requiredLabels []string, labelMode config.LabelMode) bool {
@@ -1068,7 +1068,7 @@ func fixerWorkPending(detail githubinfra.PullRequestDetail, currentLogin string,
 	if trigger.AuthorFilter != config.AuthorFilterAny && normalizeLogin(detail.Author) != "" && normalizeLogin(detail.Author) != normalizeLogin(currentLogin) {
 		return false
 	}
-	if !labelsMatch(detail.Labels, requiredLabels, labelMode) {
+	if !config.LabelsMatch(detail.Labels, requiredLabels, labelMode) {
 		return false
 	}
 	if detail.HasConflicts {
@@ -1117,26 +1117,6 @@ func queuePullRequestKey(repo string, prNumber int64) string {
 
 func isWorkerDispatch(issue triage.Issue) bool {
 	return labels.Has(issue.Labels, dispatch.DispatchImplement)
-}
-
-func labelsMatch(itemLabels, expected []string, mode config.LabelMode) bool {
-	if len(expected) == 0 {
-		return true
-	}
-	if mode == config.LabelModeAny {
-		for _, label := range expected {
-			if labels.Has(itemLabels, label) {
-				return true
-			}
-		}
-		return false
-	}
-	for _, label := range expected {
-		if !labels.Has(itemLabels, label) {
-			return false
-		}
-	}
-	return true
 }
 
 func normalizeLogin(login string) string {
@@ -1379,7 +1359,7 @@ func reviewAssignmentMatchesTrigger(detail githubinfra.PullRequestDetail, trigge
 	if trigger.RequireReviewRequest && !hasRequestedReviewerAuthority(detail) {
 		return false
 	}
-	if !labelsMatch(detail.Labels, trigger.Labels, trigger.LabelMode) {
+	if !config.LabelsMatch(detail.Labels, trigger.Labels, trigger.LabelMode) {
 		return false
 	}
 	return true

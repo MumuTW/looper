@@ -18,7 +18,6 @@ import (
 	"github.com/nexu-io/looper/internal/disclosure"
 	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/eventlog"
-	"github.com/nexu-io/looper/internal/forge"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/labels"
 	"github.com/nexu-io/looper/internal/lifecycle"
@@ -997,7 +996,7 @@ func (r *Runner) runDiscoverIssueStep(ctx context.Context, input stepInput) (pla
 			return input.Checkpoint, &loopError{message: fmt.Sprintf("Unable to resolve GitHub login for planner issue %s#%d", repo, issueNumber), kind: FailureRetryableAfterResume}
 		}
 	}
-	if !manual && !reportAuthorized && !labelsMatch(detail.Labels, policy.Labels, policy.LabelMode) {
+	if !manual && !reportAuthorized && !config.LabelsMatch(detail.Labels, policy.Labels, policy.LabelMode) {
 		checkpoint := input.Checkpoint
 		checkpoint.Issue = &checkpointIssue{Repo: repo, IssueNumber: issueNumber, Title: detail.Title, Body: detail.Body, URL: detail.URL, Assignees: cloneStrings(detail.Assignees), Labels: cloneStrings(detail.Labels), CurrentUserLogin: currentLogin, SpecPath: buildSpecPath(r.now(), issueNumber, detail.Title), RequestedReviewers: resolveRequestedReviewers(input.Project, input.Loop, detail.Assignees, currentLogin)}
 		checkpoint.ClaimedLockKey = lockKey
@@ -2201,9 +2200,12 @@ func (r *Runner) ensureLoopForIssueWithAuthority(ctx context.Context, project st
 				updated.NextRunAt = &nowISO
 			}
 			metadataJSON, err := mergeLoopMetadataJSON(existing.MetadataJSON, map[string]any{"issueTitle": issue.Title, "issueURL": issue.URL, "issueNumber": issue.Number, "specPath": buildSpecPath(r.now(), issue.Number, issue.Title)})
-			if err == nil {
-				updated.MetadataJSON = stringPtr(metadataJSON)
+			if err != nil {
+				// Discovery must not report success and enqueue work without
+				// the refreshed issue metadata.
+				return loopUpsertResult{}, fmt.Errorf("merge planner discovery metadata: %w", err)
 			}
+			updated.MetadataJSON = stringPtr(metadataJSON)
 			updated.UpdatedAt = nowISO
 			if err := r.repos.Loops.Upsert(ctx, updated); err != nil {
 				return loopUpsertResult{}, err
@@ -2242,9 +2244,10 @@ func (r *Runner) refreshIssueLoop(ctx context.Context, existing storage.LoopReco
 		metadata[plannerQueueRoutingAuthorityKey] = authority
 	}
 	metadataJSON, err := mergeLoopMetadataJSON(existing.MetadataJSON, metadata)
-	if err == nil {
-		updated.MetadataJSON = stringPtr(metadataJSON)
+	if err != nil {
+		return storage.LoopRecord{}, fmt.Errorf("merge planner issue-refresh metadata: %w", err)
 	}
+	updated.MetadataJSON = stringPtr(metadataJSON)
 	updated.UpdatedAt = nowISO
 	if err := r.repos.Loops.Upsert(ctx, updated); err != nil {
 		return storage.LoopRecord{}, err
@@ -2443,7 +2446,12 @@ func parseJSONObject(value *string) map[string]any {
 }
 
 func mergeLoopMetadataJSON(current *string, updates map[string]any) (string, error) {
-	parsed := parseJSONObject(current)
+	// Loop metadata mutations share the strict decoder: a malformed stored
+	// value blocks the merge instead of being replaced with only the updates.
+	parsed, err := loops.DecodeMetadataObjectForWrite(current)
+	if err != nil {
+		return "", err
+	}
 	for key, value := range updates {
 		parsed[key] = value
 	}
@@ -2483,9 +2491,8 @@ func (c *plannerCheckpoint) ensureLifecycle(runner, branch, baseBranch string, e
 }
 
 func buildPlannerPrompt(project storage.ProjectRecord, instructionConfig config.Config, issue *checkpointIssue, worktree *checkpointWorktree, allowAutoPush bool, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string) (string, config.CustomInstructionBlock) {
-	providerLabel := forge.NewResolver(instructionConfig).ForProject(project.ID).PullRequestProviderName()
 	parts := []string{
-		fmt.Sprintf("Write a planning spec for %s issue %s#%d.", providerLabel, issue.Repo, issue.IssueNumber),
+		fmt.Sprintf("Write a planning spec for GitHub issue %s#%d.", issue.Repo, issue.IssueNumber),
 		"Repository: " + issue.Repo,
 		"Base branch: " + worktree.BaseBranch,
 		"Spec path: " + issue.SpecPath,
@@ -2597,7 +2604,7 @@ func shouldClaimIssue(issue IssueSummary, login string, policy DiscoveryPolicy) 
 	if policy.RequireAssigneeCurrentUser && !includesLogin(issue.Assignees, login) {
 		return false
 	}
-	return labelsMatch(issue.Labels, policy.Labels, policy.LabelMode)
+	return config.LabelsMatch(issue.Labels, policy.Labels, policy.LabelMode)
 }
 
 func safeIssueQueryLabel(labels []string) string {
@@ -2682,26 +2689,6 @@ func uniqueNonEmptyLabels(labels []string) []string {
 		result = append(result, label)
 	}
 	return result
-}
-
-func labelsMatch(itemLabels []string, required []string, mode config.LabelMode) bool {
-	if len(required) == 0 {
-		return true
-	}
-	if mode == config.LabelModeAny {
-		for _, label := range required {
-			if labels.Has(itemLabels, label) {
-				return true
-			}
-		}
-		return false
-	}
-	for _, label := range required {
-		if !labels.Has(itemLabels, label) {
-			return false
-		}
-	}
-	return true
 }
 
 func resolveRequestedReviewers(project storage.ProjectRecord, loop storage.LoopRecord, assignees []string, currentLogin string) []string {

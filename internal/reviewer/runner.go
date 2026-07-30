@@ -1117,7 +1117,7 @@ func (r *Runner) discoverExistingReviewerLoop(ctx context.Context, project stora
 			return nil
 		}
 	}
-	if !isManualReviewerLoop(loop) && !policy.MatchAnyTrigger && !labelsMatch(detail.Labels, policy.Labels, policy.LabelMode) {
+	if !isManualReviewerLoop(loop) && !policy.MatchAnyTrigger && !config.LabelsMatch(detail.Labels, policy.Labels, policy.LabelMode) {
 		result.Skipped++
 		return nil
 	}
@@ -1298,7 +1298,7 @@ func prEligibleForDiscoveryPreclaim(pr PullRequestSummary, currentLogin string, 
 	if !networkpolicy.IsRouted(policy.RoutedClaimPolicy) && reviewRequestRequiredForCandidate(policy, pr.Labels) && reviewRequestsKnownAbsent(pr.ReviewRequests, currentLogin) {
 		return false
 	}
-	if !policy.MatchAnyTrigger && !labelsMatch(pr.Labels, policy.Labels, policy.LabelMode) {
+	if !policy.MatchAnyTrigger && !config.LabelsMatch(pr.Labels, policy.Labels, policy.LabelMode) {
 		return false
 	}
 	return true
@@ -1321,7 +1321,7 @@ func reviewRequestRequiredForCandidate(policy DiscoveryPolicy, labels []string) 
 	if !policy.RequireReviewRequest {
 		return false
 	}
-	return !(policy.MatchAnyTrigger && len(prQueryLabels(policy.Labels)) > 0 && labelsMatch(labels, policy.Labels, policy.LabelMode))
+	return !(policy.MatchAnyTrigger && len(prQueryLabels(policy.Labels)) > 0 && config.LabelsMatch(labels, policy.Labels, policy.LabelMode))
 }
 
 func (r *Runner) reviewerAutoMergeConfigForProject(projectID string) config.ReviewerAutoMergeConfig {
@@ -1446,26 +1446,6 @@ func prQueryLabels(labels []string) []string {
 		result = append(result, label)
 	}
 	return result
-}
-
-func labelsMatch(itemLabels []string, required []string, mode config.LabelMode) bool {
-	if len(required) == 0 {
-		return true
-	}
-	if mode == config.LabelModeAny {
-		for _, label := range required {
-			if labels.Has(itemLabels, label) {
-				return true
-			}
-		}
-		return false
-	}
-	for _, label := range required {
-		if !labels.Has(itemLabels, label) {
-			return false
-		}
-	}
-	return true
 }
 
 func (r *Runner) ProcessNext(ctx context.Context, claimedBy string) (*ProcessResult, error) {
@@ -1614,14 +1594,15 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			startStep = stepWorktree
 		}
 	}
+	metadataJSON, err := r.recordLoopRunStartMetadata(loop.MetadataJSON, project.ID)
+	if err != nil {
+		return ProcessResult{}, err
+	}
 	updatedLoop, err := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
 		updated.Status = "running"
 		updated.LastRunAt = stringPtr(run.StartedAt)
 		updated.NextRunAt = nil
-		metadataJSON, metaErr := r.recordLoopRunStartMetadata(updated.MetadataJSON, project.ID)
-		if metaErr == nil {
-			updated.MetadataJSON = &metadataJSON
-		}
+		updated.MetadataJSON = &metadataJSON
 	})
 	if err != nil {
 		return ProcessResult{}, err
@@ -4173,13 +4154,22 @@ func isValidBlockingReviewEvent(value string) bool {
 }
 
 func (r *Runner) recordPublishedReviewProgress(ctx context.Context, input stepInput, pending pendingReviewCheckpoint, reviewEvent ReviewEvent) error {
+	var mergeErr error
 	if _, err := r.updateLoop(ctx, input.Loop, func(updated *storage.LoopRecord) {
 		metadataJSON, err := mergeLoopMetadataJSON(updated.MetadataJSON, map[string]any{"lastPublishedHeadSha": pending.HeadSHA, "lastReviewEvent": string(reviewEvent), "lastReviewSummary": pending.Summary, "lastPublishedAt": r.nowISO()})
-		if err == nil {
-			updated.MetadataJSON = stringPtr(metadataJSON)
+		if err != nil {
+			mergeErr = err
+			return
 		}
+		updated.MetadataJSON = stringPtr(metadataJSON)
 	}); err != nil {
 		return err
+	}
+	if mergeErr != nil {
+		// The review was already published externally; failing here keeps the
+		// idempotency fields' absence loud so the operator sees why a later
+		// discovery may re-run this head instead of silently double-publishing.
+		return fmt.Errorf("record published review progress: %w", mergeErr)
 	}
 	r.appendEvent(ctx, eventInput{eventType: "pr.review.posted", projectID: input.Project.ID, loopID: input.Loop.ID, runID: input.Run.ID, entityType: "pull_request", entityID: fmt.Sprintf("%s#%d", input.Repo, input.PRNumber), payload: map[string]any{"repo": input.Repo, "prNumber": input.PRNumber, "event": string(reviewEvent), "headSha": pending.HeadSHA}})
 	return nil
@@ -4362,7 +4352,13 @@ func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.P
 		}
 		updated := *existing
 		metadataJSONSource := updated.MetadataJSON
-		meta := parseJSONObject(updated.MetadataJSON)
+		// Strict-decode the ORIGINAL value before any re-encoding: building the
+		// normalized source from a lenient parse would hand ensureLoopMetadataJSON
+		// valid replacement JSON and overwrite a malformed stored value.
+		meta, err := loops.DecodeMetadataObjectForWrite(updated.MetadataJSON)
+		if err != nil {
+			return loopUpsertResult{}, err
+		}
 		if loopEnabledMetadataMissing(meta) {
 			meta["followUpdates"] = false
 			encoded, err := json.Marshal(meta)
@@ -4828,7 +4824,13 @@ func (r *Runner) updateLoop(ctx context.Context, loop storage.LoopRecord, mutate
 	if current != nil {
 		updated = *current
 	}
+	metadataBefore := updated.MetadataJSON
 	mutate(&updated)
+	if derefString(metadataBefore) != derefString(updated.MetadataJSON) {
+		if _, err := loops.DecodeMetadataObjectForWrite(metadataBefore); err != nil {
+			return storage.LoopRecord{}, err
+		}
+	}
 	updated.UpdatedAt = r.nowISO()
 	if err := r.repos.Loops.Upsert(ctx, updated); err != nil {
 		return storage.LoopRecord{}, err
@@ -5435,7 +5437,12 @@ func parseJSONObject(value *string) map[string]any {
 }
 
 func mergeLoopMetadataJSON(current *string, updates map[string]any) (string, error) {
-	parsed := parseJSONObject(current)
+	// Loop metadata mutations share the strict decoder: a malformed stored
+	// value blocks the merge instead of being replaced with only the updates.
+	parsed, err := loops.DecodeMetadataObjectForWrite(current)
+	if err != nil {
+		return "", err
+	}
 	for key, value := range updates {
 		parsed[key] = value
 	}
@@ -5578,7 +5585,10 @@ func loopEnabledMetadataMissing(meta map[string]any) bool {
 }
 
 func (r *Runner) ensureLoopMetadataJSON(current *string, projectID, repo string, prNumber int64) (string, error) {
-	meta := parseJSONObject(current)
+	meta, err := loops.DecodeMetadataObjectForWrite(current)
+	if err != nil {
+		return "", err
+	}
 	loopMeta, _ := meta["loop"].(map[string]any)
 	if loopMeta == nil {
 		loopMeta = map[string]any{}
@@ -5646,7 +5656,10 @@ func (r *Runner) ensureLoopMetadataJSON(current *string, projectID, repo string,
 }
 
 func (r *Runner) recordLoopRunStartMetadata(current *string, projectID string) (string, error) {
-	meta := parseJSONObject(current)
+	meta, err := loops.DecodeMetadataObjectForWrite(current)
+	if err != nil {
+		return "", err
+	}
 	loopMeta := reviewerLoopMetadata(meta)
 	loopMeta["status"] = "active"
 	loopMeta["lastStatus"] = "running"

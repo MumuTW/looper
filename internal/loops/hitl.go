@@ -2,7 +2,10 @@ package loops
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"strings"
+	"unicode/utf8"
 )
 
 // hitlMetadataKey is where the mid-run HITL ask/answer state lives inside a
@@ -60,7 +63,10 @@ func ReadHITLAsk(metadataJSON *string) (HITLAsk, bool) {
 // WriteHITLAsk merges the HITL ask state into a loop's metadata JSON, preserving
 // all other keys, and returns the updated JSON string.
 func WriteHITLAsk(metadataJSON *string, ask HITLAsk) (string, error) {
-	meta := parseMetadataObject(metadataJSON)
+	meta, err := DecodeMetadataObjectForWrite(metadataJSON)
+	if err != nil {
+		return "", err
+	}
 	encoded, err := json.Marshal(ask)
 	if err != nil {
 		return "", err
@@ -79,7 +85,10 @@ func WriteHITLAsk(metadataJSON *string, ask HITLAsk) (string, error) {
 
 // ClearHITLAsk removes the HITL ask state from a loop's metadata JSON.
 func ClearHITLAsk(metadataJSON *string) (string, error) {
-	meta := parseMetadataObject(metadataJSON)
+	meta, err := DecodeMetadataObjectForWrite(metadataJSON)
+	if err != nil {
+		return "", err
+	}
 	delete(meta, hitlMetadataKey)
 	out, err := json.Marshal(meta)
 	if err != nil {
@@ -88,6 +97,16 @@ func ClearHITLAsk(metadataJSON *string) (string, error) {
 	return string(out), nil
 }
 
+// ErrMalformedLoopMetadata marks a stored loop metadata value that no longer
+// decodes as a JSON object. Writers refuse to touch such a value: replacing it
+// with a fresh map would silently discard worktree, routing, worker, and HITL
+// state, so mutation is blocked and the stored value stays intact for
+// diagnosis and recovery.
+var ErrMalformedLoopMetadata = errors.New("loop metadata is not a valid JSON object")
+
+// parseMetadataObject decodes metadata for read-only accessors. Reads stay
+// lenient — malformed metadata simply reads as "no state present", which never
+// destroys anything. Writers must use parseMetadataObjectForWrite.
 func parseMetadataObject(metadataJSON *string) map[string]any {
 	if metadataJSON == nil || strings.TrimSpace(*metadataJSON) == "" {
 		return map[string]any{}
@@ -97,4 +116,36 @@ func parseMetadataObject(metadataJSON *string) map[string]any {
 		return map[string]any{}
 	}
 	return meta
+}
+
+// DecodeMetadataObjectForWrite decodes the current metadata ahead of a
+// mutation. Existing persisted metadata is part of the loop's durable workflow
+// state: a writer must successfully decode the current version before it may
+// replace it, so malformed metadata fails the mutation loudly instead of being
+// overwritten with an empty object. Every loop-metadata writer — inside this
+// package and out (e.g. the worker's PR/worktree merges) — must decode through
+// this function.
+func DecodeMetadataObjectForWrite(metadataJSON *string) (map[string]any, error) {
+	if metadataJSON == nil || strings.TrimSpace(*metadataJSON) == "" {
+		return map[string]any{}, nil
+	}
+	if !utf8.ValidString(*metadataJSON) {
+		return nil, fmt.Errorf("%w: invalid UTF-8; stored value left untouched: %s", ErrMalformedLoopMetadata, truncateMetadataForDiagnosis(*metadataJSON))
+	}
+	var meta map[string]any
+	if err := json.Unmarshal([]byte(*metadataJSON), &meta); err != nil {
+		return nil, fmt.Errorf("%w: %v; stored value left untouched: %s", ErrMalformedLoopMetadata, err, truncateMetadataForDiagnosis(*metadataJSON))
+	}
+	if meta == nil {
+		return nil, fmt.Errorf("%w: JSON null; stored value left untouched: %s", ErrMalformedLoopMetadata, truncateMetadataForDiagnosis(*metadataJSON))
+	}
+	return meta, nil
+}
+
+func truncateMetadataForDiagnosis(value string) string {
+	const limit = 200
+	if len(value) <= limit {
+		return value
+	}
+	return value[:limit] + "…"
 }

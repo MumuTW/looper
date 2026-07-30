@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -77,6 +78,61 @@ func OpenSQLiteDB(ctx context.Context, dbPath string) (*sql.DB, error) {
 	}
 
 	return db, nil
+}
+
+// CompatibleSQLiteDB keeps the shared migration fence until its caller has
+// finished all compatibility-dependent authority reads.
+type CompatibleSQLiteDB struct {
+	DB   *sql.DB
+	lock *DatabaseLock
+}
+
+func (db *CompatibleSQLiteDB) Close() error {
+	if db == nil {
+		return nil
+	}
+	var closeErr error
+	if db.DB != nil {
+		closeErr = db.DB.Close()
+	}
+	if lockErr := db.lock.Release(); lockErr != nil {
+		return errors.Join(closeErr, lockErr)
+	}
+	return closeErr
+}
+
+// OpenSQLiteDBWithCompatibilityCheck opens the SQLite database at dbPath and
+// validates that its schema_migrations ledger contains no migration IDs
+// unknown to this binary's manifest. It is the shared database boundary for
+// supported CLI consumers — `looper review submit` and its authority lookups —
+// that open the daemon's database directly without a coordinator, so a
+// mixed-version CLI cannot read migration-sensitive authority state or publish
+// a review against a schema created or migrated by a newer looper binary.
+//
+// The validation reuses MigrationRunner.ValidateCompatibility and is read-only:
+// a database without a schema_migrations table (a freshly created file, or one
+// that has never been migrated) is treated as compatible, so this never
+// performs DDL and never blocks a CLI probing an empty or optional database.
+// The handle is closed before returning on a compatibility failure so the
+// caller never receives a connection to a database it cannot prove it
+// understands. The authority is the running binary's EmbeddedMigrations
+// manifest, not agent output or infra inference.
+func OpenSQLiteDBWithCompatibilityCheck(ctx context.Context, dbPath string) (*CompatibleSQLiteDB, error) {
+	lock, err := AcquireDatabaseLock(dbPath, DatabaseLockShared)
+	if err != nil {
+		return nil, err
+	}
+	db, err := OpenSQLiteDB(ctx, dbPath)
+	if err != nil {
+		_ = lock.Release()
+		return nil, err
+	}
+	if err := NewMigrationRunner(db, MigrationRunnerOptions{}).ValidateCompatibility(ctx); err != nil {
+		_ = db.Close()
+		_ = lock.Release()
+		return nil, err
+	}
+	return &CompatibleSQLiteDB{DB: db, lock: lock}, nil
 }
 
 func (c *SQLiteCoordinator) DB() *sql.DB {

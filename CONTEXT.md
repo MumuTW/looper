@@ -120,7 +120,7 @@ The Looper-only constraint identifying which PRs Looper may opt into auto-merge:
 The GitHub-native state of a Pull Request after `gh pr merge --auto` has been called and before GitHub merges or a **Veto signal** arrives. The PR's `auto_merge` field is non-null in this state. Coordinator's merge-watch classifies merge-pending PRs into WatchActions.
 
 **Watch marker**:
-The `<!-- looper:coordinator:merge-watch retries=N -->` HTML-comment marker Coordinator places on the linked Issue (not the PR — preserves ADR-0003 Issue-rooted scope) to carry merge-watch retry-counter state across ticks. Public, durable, idempotent — preserves ADR-0001's stateless property.
+The `<!-- looper:coordinator:merge-watch retries=N -->` HTML-comment marker Coordinator places on the linked Issue rather than the PR, keeping Coordinator's state rooted on the Issue, to carry merge-watch retry-counter state across ticks. Public, durable, idempotent — preserves ADR-0001's stateless property.
 
 **Gate report**:
 The durable `pull_request.merge_gate.evaluated` event written by Merge Gatekeeper. It records `eligible` or `blocked`, stable reasons and evidence, and the observed head SHA. It is audit evidence, not merge authority: a future merge path must rerun every gate immediately before merging because holds, reviews, threads, and Project policy can change without moving the head.
@@ -162,7 +162,7 @@ _Avoid_: router, dispatcher, scheduler, balancer.
 A project whose `network.mode` is `routed`. Coordinator admission/assignment is performed by the current Network Lease holder. Worker/Reviewer claim only when the exact target label matches the local Node and the role-specific GitHub-native coarse target is present. The complement is a *local-only project*, whose Roles keep existing single-machine behaviour and ignore `looper:target:*` labels.
 
 **Target label**:
-Constructed and parsed by `TargetLabelForNode`/`ParseTargetLabel` in `internal/network/protocol`, which is where they live because forming one requires validating a Node name. Exactly one valid target label must be present before a Routed Worker/Reviewer may claim; target labels are ignored in local-only projects.
+Constructed and parsed by `protocol.TargetLabelForNode` and `protocol.ParseTargetLabel` in `internal/network/protocol`, which is where they live because forming one requires validating a Node name. Exactly one valid target label must be present before a Routed Worker/Reviewer may claim; target labels are ignored in local-only projects.
 _Avoid_: trigger label, routed label, worker-ready suffix.
 
 **Lease**:

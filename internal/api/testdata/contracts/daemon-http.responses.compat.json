@@ -81,7 +81,12 @@
               "supportedTargets": [
                 "darwin-arm64",
                 "linux-amd64"
-              ]
+              ],
+              "identity": {
+                "known": false,
+                "swapped": false,
+                "reason": "daemon executable identity was not recorded at startup; a binary swap cannot be detected"
+              }
             }
           },
           "storage": {

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -41,6 +42,117 @@ func TestOpenSQLiteCoordinatorCreatesParentDirAndAppliesPragmas(t *testing.T) {
 	if got := readForeignKeysPragmaForTest(t, coordinator.DB()); !got {
 		t.Fatal("PRAGMA foreign_keys = false, want true")
 	}
+}
+
+func TestDatabaseLockAllowsSharedAuthorityReadsButExcludesMigration(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "looper.sqlite")
+	first, err := AcquireDatabaseLock(dbPath, DatabaseLockShared)
+	if err != nil {
+		t.Fatalf("AcquireDatabaseLock(shared) error = %v", err)
+	}
+	defer first.Release()
+	second, err := AcquireDatabaseLock(dbPath, DatabaseLockShared)
+	if err != nil {
+		t.Fatalf("second AcquireDatabaseLock(shared) error = %v", err)
+	}
+	defer second.Release()
+	writer, err := AcquireDatabaseLock(dbPath, DatabaseLockExclusive)
+	if err == nil {
+		_ = writer.Release()
+		t.Fatal("AcquireDatabaseLock(exclusive) error = nil, want shared-reader fence")
+	}
+}
+
+func TestDatabaseLockDowngradeKeepsFenceWithoutReleaseGap(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "looper.sqlite")
+	lock, err := AcquireDatabaseLock(dbPath, DatabaseLockExclusive)
+	if err != nil {
+		t.Fatalf("AcquireDatabaseLock(exclusive) error = %v", err)
+	}
+	defer lock.Release()
+	if err := lock.Downgrade(); err != nil {
+		t.Fatalf("DatabaseLock.Downgrade() error = %v", err)
+	}
+	reader, err := AcquireDatabaseLock(dbPath, DatabaseLockShared)
+	if err != nil {
+		t.Fatalf("AcquireDatabaseLock(shared) after downgrade error = %v", err)
+	}
+	defer reader.Release()
+	writer, err := AcquireDatabaseLock(dbPath, DatabaseLockExclusive)
+	if err == nil {
+		_ = writer.Release()
+		t.Fatal("AcquireDatabaseLock(exclusive) error = nil, want shared fence after downgrade")
+	}
+}
+
+func TestDatabaseLockUsesCanonicalPerDatabasePath(t *testing.T) {
+	root := t.TempDir()
+	firstPath := filepath.Join(root, "first.sqlite")
+	secondPath := filepath.Join(root, "second.sqlite")
+	first, err := AcquireDatabaseLock(firstPath, DatabaseLockExclusive)
+	if err != nil {
+		t.Fatalf("AcquireDatabaseLock(first) error = %v", err)
+	}
+	defer first.Release()
+	second, err := AcquireDatabaseLock(secondPath, DatabaseLockExclusive)
+	if err != nil {
+		t.Fatalf("AcquireDatabaseLock(second) error = %v, want distinct files not to contend", err)
+	}
+	defer second.Release()
+
+	if err := os.WriteFile(firstPath, nil, 0o600); err != nil {
+		t.Fatalf("WriteFile(first database) error = %v", err)
+	}
+	alias := filepath.Join(root, "first-alias.sqlite")
+	if err := os.Symlink(firstPath, alias); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	aliased, err := AcquireDatabaseLock(alias, DatabaseLockExclusive)
+	if err == nil {
+		_ = aliased.Release()
+		t.Fatal("AcquireDatabaseLock(alias) error = nil, want canonical-path contention")
+	}
+}
+
+func TestSQLiteFilesystemPathParsesFileURI(t *testing.T) {
+	path, isFile, err := SQLiteFilesystemPath("file:/var/lib/looper/looper.sqlite?cache=shared")
+	if err != nil {
+		t.Fatalf("SQLiteFilesystemPath(file URI) error = %v", err)
+	}
+	if !isFile || path != "/var/lib/looper/looper.sqlite" {
+		t.Fatalf("SQLiteFilesystemPath(file URI) = (%q, %t), want (/var/lib/looper/looper.sqlite, true)", path, isFile)
+	}
+}
+
+func TestSQLiteFilesystemPathParsesOpaqueFileURI(t *testing.T) {
+	path, isFile, err := SQLiteFilesystemPath("file:looper.sqlite?_busy_timeout=5000")
+	if err != nil {
+		t.Fatalf("SQLiteFilesystemPath(opaque file URI) error = %v", err)
+	}
+	if !isFile || path != "looper.sqlite" {
+		t.Fatalf("SQLiteFilesystemPath(opaque file URI) = (%q, %t), want (looper.sqlite, true)", path, isFile)
+	}
+}
+
+func TestOpenSQLiteDBWithCompatibilityCheckHoldsMigrationFenceUntilClose(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "looper.sqlite")
+	db, err := OpenSQLiteDBWithCompatibilityCheck(context.Background(), dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLiteDBWithCompatibilityCheck() error = %v", err)
+	}
+	writer, err := AcquireDatabaseLock(dbPath, DatabaseLockExclusive)
+	if err == nil {
+		_ = writer.Release()
+		t.Fatal("AcquireDatabaseLock(exclusive) error = nil, want compatibility fence")
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("CompatibleSQLiteDB.Close() error = %v", err)
+	}
+	writer, err = AcquireDatabaseLock(dbPath, DatabaseLockExclusive)
+	if err != nil {
+		t.Fatalf("AcquireDatabaseLock(exclusive) after compatibility read closed error = %v", err)
+	}
+	_ = writer.Release()
 }
 
 func TestOpenSQLiteDBAppliesPragmasToMultipleConnections(t *testing.T) {

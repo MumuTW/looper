@@ -103,6 +103,64 @@ func TestRuntimeStartOpensSQLiteAndSyncsConfiguredProjects(t *testing.T) {
 	}
 }
 
+func TestRuntimeStartExclusivelyOwnsDatabaseForItsLifetime(t *testing.T) {
+	workingDir := t.TempDir()
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
+
+	first := New(Options{Config: cfg, Logger: &testLogger{}})
+	if err := first.Start(context.Background()); err != nil {
+		t.Fatalf("first Start() error = %v", err)
+	}
+	defer first.Stop("test cleanup")
+
+	second := New(Options{Config: cfg, Logger: &testLogger{}})
+	if err := second.Start(context.Background()); err == nil || !strings.Contains(err.Error(), "database compatibility lock is held") {
+		t.Fatalf("second Start() error = %v, want exclusive database ownership failure", err)
+	}
+
+	first.Stop("release database lock")
+	third := New(Options{Config: cfg, Logger: &testLogger{}})
+	if err := third.Start(context.Background()); err != nil {
+		t.Fatalf("Start() after prior runtime stopped error = %v", err)
+	}
+	third.Stop("test cleanup")
+}
+
+func TestRuntimeStartWithoutAutoMigrateExclusivelyOwnsDatabaseForItsLifetime(t *testing.T) {
+	workingDir := t.TempDir()
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
+	cfg.Package.AutoMigrateOnStartup = false
+	seed, err := storage.OpenSQLiteCoordinator(context.Background(), cfg.Storage.DBPath, storage.SQLiteCoordinatorOptions{Migrations: storage.EmbeddedMigrations})
+	if err != nil {
+		t.Fatalf("OpenSQLiteCoordinator() seed error = %v", err)
+	}
+	if _, err := seed.MigrationRunner().RunPending(context.Background()); err != nil {
+		_ = seed.Close()
+		t.Fatalf("seed RunPending() error = %v", err)
+	}
+	if err := seed.Close(); err != nil {
+		t.Fatalf("seed Close() error = %v", err)
+	}
+
+	first := New(Options{Config: cfg, Logger: &testLogger{}})
+	if err := first.Start(context.Background()); err != nil {
+		t.Fatalf("first Start() error = %v", err)
+	}
+	defer first.Stop("test cleanup")
+	second := New(Options{Config: cfg, Logger: &testLogger{}})
+	if err := second.Start(context.Background()); err == nil || !strings.Contains(err.Error(), "database compatibility lock is held") {
+		t.Fatalf("second Start() error = %v, want exclusive database ownership failure", err)
+	}
+}
+
 func TestRuntimeStartMaterializesProjectCatalogFromDatabase(t *testing.T) {
 	t.Parallel()
 
@@ -357,9 +415,9 @@ func TestRuntimeStartStopBeforeResourcePublicationCleansLocalResources(t *testin
 		t.Fatal("coordinator remained open after Stop raced pre-publication Start")
 	}
 
-	lock, err := acquireDaemonLock(webhookForwarderLockPath(cfg.Storage.DBPath), "replacement", time.Now())
+	lock, err := storage.AcquireDatabaseLock(cfg.Storage.DBPath, storage.DatabaseLockExclusive)
 	if err != nil {
-		t.Fatalf("daemon lock remained held after Stop raced pre-publication Start: %v", err)
+		t.Fatalf("database lock remained held after Stop raced pre-publication Start: %v", err)
 	}
 	if err := lock.Release(); err != nil {
 		t.Fatalf("replacement daemon lock Release() error = %v", err)
@@ -4903,4 +4961,80 @@ func waitForCondition(t *testing.T, timeout time.Duration, condition func() bool
 		time.Sleep(25 * time.Millisecond)
 	}
 	t.Fatal("condition not satisfied before timeout")
+}
+
+// TestRuntimeStartValidatesSchemaCompatibilityWhenAutoMigrationDisabled
+// covers the boot path where package.autoMigrateOnStartup=false: previously
+// Runtime.start never called RunPending, so the unknown-applied-migration
+// check was bypassed and a downgraded daemon could run against a newer schema.
+// ValidateCompatibility now runs on every boot, so this downgraded boot fails
+// loudly even though migration application is disabled.
+func TestRuntimeStartValidatesSchemaCompatibilityWhenAutoMigrationDisabled(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	dbPath := filepath.Join(workingDir, "runtime.sqlite")
+	backupDir := filepath.Join(workingDir, "backups")
+
+	// Seed the database with a "newer" manifest that records an extra migration.
+	newerManifest := append(append([]storage.EmbeddedMigration{}, storage.EmbeddedMigrations...), storage.EmbeddedMigration{
+		ID:       "9999_compat_marker",
+		FileName: "9999_compat_marker.sql",
+		SQL:      "CREATE TABLE compat_marker (id TEXT PRIMARY KEY);",
+	})
+	seedCoordinator, err := storage.OpenSQLiteCoordinator(context.Background(), dbPath, storage.SQLiteCoordinatorOptions{
+		BackupDir:  backupDir,
+		Migrations: newerManifest,
+	})
+	if err != nil {
+		t.Fatalf("OpenSQLiteCoordinator() seed error = %v", err)
+	}
+	if _, err := seedCoordinator.MigrationRunner().RunPending(context.Background()); err != nil {
+		t.Fatalf("seed RunPending() error = %v", err)
+	}
+	if err := seedCoordinator.Close(); err != nil {
+		t.Fatalf("seed coordinator Close() error = %v", err)
+	}
+
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Storage.DBPath = dbPath
+	cfg.Storage.BackupDir = &backupDir
+	cfg.Package.AutoMigrateOnStartup = false
+
+	rt := New(Options{
+		Config: cfg,
+		Logger: &testLogger{},
+		// The running binary only knows the current manifest, not the extra
+		// 9999_compat_marker migration the newer daemon applied.
+		OpenSQLiteCoordinator: func(ctx context.Context, dbPath string, options storage.SQLiteCoordinatorOptions) (*storage.SQLiteCoordinator, error) {
+			return storage.OpenSQLiteCoordinator(ctx, dbPath, options)
+		},
+	})
+
+	startErr := rt.Start(context.Background())
+	if startErr == nil {
+		rt.Stop("test cleanup")
+		t.Fatal("Start() error = nil, want unknown-applied-migration error")
+	}
+	if !strings.Contains(startErr.Error(), "9999_compat_marker") || !strings.Contains(startErr.Error(), "newer looper version") {
+		t.Fatalf("Start() error = %q, want it to name 9999_compat_marker and diagnose a downgrade", startErr)
+	}
+}
+
+// tableExists reports whether a table exists in the SQLite database at dbPath.
+func tableExists(t *testing.T, dbPath, tableName string) bool {
+	t.Helper()
+	db, err := storage.OpenSQLiteDB(context.Background(), dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLiteDB(%q) error = %v", dbPath, err)
+	}
+	defer db.Close()
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?`, tableName).Scan(&count); err != nil {
+		t.Fatalf("SELECT sqlite_master for %q error = %v", tableName, err)
+	}
+	return count > 0
 }

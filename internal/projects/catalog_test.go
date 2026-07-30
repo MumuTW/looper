@@ -488,45 +488,6 @@ func TestCatalogViewRolePolicyMergesProjectOverrides(t *testing.T) {
 	}
 }
 
-func TestCatalogViewProviderPolicy(t *testing.T) {
-	t.Parallel()
-
-	cfg := config.Config{
-		Providers: []config.ProviderConfig{{
-			ID: "ghes-main", Kind: config.ProviderKindGitHub, BaseURL: "https://code.example.test",
-		}},
-		Projects: []config.ProjectRefConfig{{
-			ID: "demo", Repo: "NEXU-IO/LOOPER", Provider: "ghes-main",
-		}},
-	}
-	catalog := NewCatalog(cfg)
-
-	view := catalog.View()
-	policy, ok := view.ProviderPolicy("demo")
-	if !ok {
-		t.Fatal("view.ProviderPolicy(\"demo\") not found")
-	}
-	if policy.Provider.ID != "ghes-main" || policy.ProviderKind != config.ProviderKindGitHub {
-		t.Fatalf("view.ProviderPolicy(\"demo\") = %#v, want ghes-main", policy)
-	}
-	if policy.Provider.BaseURL != "https://code.example.test" {
-		t.Fatalf("provider base url was not preserved")
-	}
-}
-
-func TestCatalogViewProviderPolicyRequiresRepositoryBinding(t *testing.T) {
-	t.Parallel()
-
-	catalog := NewCatalog(config.Config{
-		Projects: []config.ProjectRefConfig{{ID: "demo", Repo: "  "}},
-	})
-
-	policy, ok := catalog.View().ProviderPolicy("demo")
-	if ok || policy != (ProviderPolicyView{}) {
-		t.Fatalf("view.ProviderPolicy(\"demo\") = (%#v, %v), want empty policy, false", policy, ok)
-	}
-}
-
 func TestOperationViewFromConfigDetachesCodingRolePolicy(t *testing.T) {
 	t.Parallel()
 

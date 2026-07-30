@@ -1155,7 +1155,7 @@ func (a fixerGitHubAdapter) ListOpenPullRequests(ctx context.Context, input fixe
 	}
 	result := make([]fixer.PullRequestSummary, 0, len(pullRequests))
 	for _, pr := range pullRequests {
-		result = append(result, fixer.PullRequestSummary{Number: pr.Number, State: pr.State, IsDraft: pr.IsDraft, Labels: pr.Labels, BaseRefName: pr.BaseRefName, HeadSHA: pr.HeadSHA, Author: pr.Author})
+		result = append(result, fixer.PullRequestSummary{Number: pr.Number, State: pr.State, IsDraft: pr.IsDraft, Labels: pr.Labels, BaseRefName: pr.BaseRefName, HeadSHA: pr.HeadSHA, Author: pr.Author, UpdatedAt: pr.UpdatedAt})
 	}
 	return result, nil
 }
@@ -1763,14 +1763,13 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 	})
 	var gatekeeperRunner gatekeeperScheduler
 	if githubGateway != nil {
-		providers := forge.NewResolver(cfg)
 		gatekeeperRunner = gatekeeper.New(gatekeeper.Options{
 			Repos:  repos,
 			GitHub: githubGateway,
 			Now:    now,
 			PolicyPermitsTarget: func(projectID, repo, baseRefName string) bool {
 				project, ok := runtimeProjectBinding(cfg, projectID)
-				if !ok || !providers.ForProject(projectID).Capabilities().GitHubPullRequests {
+				if !ok {
 					return false
 				}
 				if !strings.EqualFold(strings.TrimSpace(project.Repo), strings.TrimSpace(repo)) {
@@ -2475,10 +2474,6 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 		return snapshot
 	}
 	lanes := discoveryLanes(input)
-	providers := forge.NewResolver(config.Config{})
-	if input.Config != nil {
-		providers = forge.NewResolver(*input.Config)
-	}
 	for _, project := range projectsList {
 		if err := ctx.Err(); err != nil {
 			retErr = errors.Join(append(errs, err)...)
@@ -2496,7 +2491,6 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 		if project.Archived {
 			continue
 		}
-		provider := providers.ForProject(project.ID)
 		repo, inCatalog := schedulerProjectRepo(input, project)
 		if !inCatalog {
 			if input.Logger != nil {
@@ -2504,10 +2498,7 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 			}
 			continue
 		}
-		var snapshot *githubinfra.DiscoverySnapshot
-		if provider.Capabilities().GitHubCLIPullRequestCreation {
-			snapshot = projectSnapshot(project.ID)
-		}
+		snapshot := projectSnapshot(project.ID)
 		if repo == "" {
 			if input.Logger != nil {
 				input.Logger.Warn("scheduler skipped project without repo metadata", map[string]any{"projectId": project.ID})
@@ -2522,12 +2513,6 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 			if !lane.Enabled(project.ID) {
 				if lane.LogWhenDisabled && input.Logger != nil {
 					input.Logger.Debug(lane.Name+" auto-discovery disabled", map[string]any{"projectId": project.ID, "repo": repo})
-				}
-				continue
-			}
-			if lane.Supported != nil && !lane.Supported(provider.Capabilities()) {
-				if input.Logger != nil {
-					input.Logger.Debug("scheduler skipped unsupported provider lane", map[string]any{"lane": lane.laneLabel(), "projectId": project.ID, "repo": repo, "provider": provider.TaskSourceName()})
 				}
 				continue
 			}
