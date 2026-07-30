@@ -1535,18 +1535,18 @@ func (r *Runner) persistPlannerPullRequestReference(ctx context.Context, input s
 	if pr.Number == 0 {
 		return nil
 	}
-	if _, err := r.updateLoop(ctx, input.Loop, func(updated *storage.LoopRecord) {
-		updated.Repo = stringPtr(issue.Repo)
-		updated.PRNumber = &pr.Number
-	}); err != nil {
-		return err
-	}
 	metadataJSON, err := mergeLoopMetadataJSON(input.Loop.MetadataJSON, map[string]any{"issueNumber": issue.IssueNumber, "issueUrl": issue.URL, "issueTitle": issue.Title, "specPath": issue.SpecPath, "branch": worktree.Branch, "prUrl": pr.URL, "prNumber": pr.Number, "requestedReviewers": issue.RequestedReviewers})
 	if err != nil {
 		return err
 	}
-	_, err = r.updateLoop(ctx, input.Loop, func(updated *storage.LoopRecord) { updated.MetadataJSON = stringPtr(metadataJSON) })
-	return err
+	if _, err := r.updateLoop(ctx, input.Loop, func(updated *storage.LoopRecord) {
+		updated.Repo = stringPtr(issue.Repo)
+		updated.PRNumber = &pr.Number
+		updated.MetadataJSON = stringPtr(metadataJSON)
+	}); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (r *Runner) runNotifyStep(input stepInput) (plannerCheckpoint, error) {

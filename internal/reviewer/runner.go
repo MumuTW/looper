@@ -1662,14 +1662,15 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			startStep = stepWorktree
 		}
 	}
+	metadataJSON, err := r.recordLoopRunStartMetadata(loop.MetadataJSON, project.ID)
+	if err != nil {
+		return ProcessResult{}, err
+	}
 	updatedLoop, err := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
 		updated.Status = "running"
 		updated.LastRunAt = stringPtr(run.StartedAt)
 		updated.NextRunAt = nil
-		metadataJSON, metaErr := r.recordLoopRunStartMetadata(updated.MetadataJSON, project.ID)
-		if metaErr == nil {
-			updated.MetadataJSON = &metadataJSON
-		}
+		updated.MetadataJSON = &metadataJSON
 	})
 	if err != nil {
 		return ProcessResult{}, err
@@ -5247,7 +5248,13 @@ func (r *Runner) updateLoop(ctx context.Context, loop storage.LoopRecord, mutate
 	if current != nil {
 		updated = *current
 	}
+	metadataBefore := updated.MetadataJSON
 	mutate(&updated)
+	if derefString(metadataBefore) != derefString(updated.MetadataJSON) {
+		if _, err := loops.DecodeMetadataObjectForWrite(metadataBefore); err != nil {
+			return storage.LoopRecord{}, err
+		}
+	}
 	updated.UpdatedAt = r.nowISO()
 	if err := r.repos.Loops.Upsert(ctx, updated); err != nil {
 		return storage.LoopRecord{}, err
@@ -6073,7 +6080,10 @@ func (r *Runner) ensureLoopMetadataJSON(current *string, projectID, repo string,
 }
 
 func (r *Runner) recordLoopRunStartMetadata(current *string, projectID string) (string, error) {
-	meta := parseJSONObject(current)
+	meta, err := loops.DecodeMetadataObjectForWrite(current)
+	if err != nil {
+		return "", err
+	}
 	loopMeta := reviewerLoopMetadata(meta)
 	loopMeta["status"] = "active"
 	loopMeta["lastStatus"] = "running"

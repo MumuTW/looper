@@ -32,3 +32,13 @@ func TestMergeLoopMetadataJSONRejectsMalformedCurrentValue(t *testing.T) {
 		t.Fatalf("mergeLoopMetadataJSON(valid) = %q, want existing keys preserved and update applied", out)
 	}
 }
+
+func TestRecordLoopRunStartMetadataRejectsMalformedCurrentValue(t *testing.T) {
+	t.Parallel()
+	runner := New(Options{})
+	malformed := `{"reviewer":`
+	_, err := runner.recordLoopRunStartMetadata(&malformed, "project_1")
+	if !errors.Is(err, loops.ErrMalformedLoopMetadata) {
+		t.Fatalf("recordLoopRunStartMetadata() error = %v, want ErrMalformedLoopMetadata", err)
+	}
+}

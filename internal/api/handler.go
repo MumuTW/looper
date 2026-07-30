@@ -6081,6 +6081,11 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string,
 			return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 		}
 		preflightLoop = freshLoop
+		if preflightLoop.Type == "fixer" {
+			if _, err := loops.DecodeMetadataObjectForWrite(preflightLoop.MetadataJSON); err != nil {
+				return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Cannot discard worktree changes while loop metadata is malformed: %v", err)}
+			}
+		}
 
 		discardResult, discardErr := h.discardLoopWorktreeChanges(ctx, services, *preflightLoop)
 		if discardErr != nil {

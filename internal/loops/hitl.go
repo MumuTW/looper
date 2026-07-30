@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"unicode/utf8"
 )
 
 // hitlMetadataKey is where the mid-run HITL ask/answer state lives inside a
@@ -127,6 +128,9 @@ func parseMetadataObject(metadataJSON *string) map[string]any {
 func DecodeMetadataObjectForWrite(metadataJSON *string) (map[string]any, error) {
 	if metadataJSON == nil || strings.TrimSpace(*metadataJSON) == "" {
 		return map[string]any{}, nil
+	}
+	if !utf8.ValidString(*metadataJSON) {
+		return nil, fmt.Errorf("%w: invalid UTF-8; stored value left untouched: %s", ErrMalformedLoopMetadata, truncateMetadataForDiagnosis(*metadataJSON))
 	}
 	var meta map[string]any
 	if err := json.Unmarshal([]byte(*metadataJSON), &meta); err != nil {

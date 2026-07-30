@@ -1571,6 +1571,9 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (w
 			branch = buildWorkerBranchName(work, input.Loop.ID)
 		}
 	}
+	if _, err := loops.DecodeMetadataObjectForWrite(input.Loop.MetadataJSON); err != nil {
+		return checkpoint, fmt.Errorf("validate worktree metadata before create: %w", err)
+	}
 	created, err := r.git.CreateWorktree(ctx, CreateWorktreeInput{
 		ProjectID:         input.Project.ID,
 		RepoPath:          input.Project.RepoPath,

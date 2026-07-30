@@ -3720,6 +3720,9 @@ func (r *Runner) runPushStep(ctx context.Context, input stepInput) (fixerCheckpo
 	if checkpoint.Push != nil && checkpoint.Push.Pushed {
 		return checkpoint, nil
 	}
+	if _, err := loops.DecodeMetadataObjectForWrite(input.Loop.MetadataJSON); err != nil {
+		return checkpoint, fmt.Errorf("validate loop metadata before push: %w", err)
+	}
 	worktree, err := requireWorktree(checkpoint)
 	if err != nil {
 		return checkpoint, err
@@ -6438,7 +6441,13 @@ func (r *Runner) updateLoop(ctx context.Context, loop storage.LoopRecord, mutate
 	if current != nil {
 		updated = *current
 	}
+	metadataBefore := updated.MetadataJSON
 	mutate(&updated)
+	if derefString(metadataBefore) != derefString(updated.MetadataJSON) {
+		if _, err := loops.DecodeMetadataObjectForWrite(metadataBefore); err != nil {
+			return storage.LoopRecord{}, err
+		}
+	}
 	updated.UpdatedAt = eventlog.NextJavaScriptISOString(r.now(), updated.UpdatedAt)
 	if err := r.repos.Loops.Upsert(ctx, updated); err != nil {
 		return storage.LoopRecord{}, err

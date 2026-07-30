@@ -38,6 +38,7 @@ func TestMetadataWritersFailLoudOnMalformedMetadata(t *testing.T) {
 		{name: "not an object", value: `["worktree"]`},
 		{name: "json null", value: `null`},
 		{name: "plain text", value: `corrupted`},
+		{name: "invalid UTF-8", value: string([]byte{'{', '"', 'x', '"', ':', '"', 0xff, '"', '}'})},
 	}
 
 	for _, w := range writers {
