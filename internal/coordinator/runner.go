@@ -268,6 +268,17 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 			loaded = append(loaded, issue)
 		}
 	}
+
+	// Personal project auto-assignment: if project is opted in and an issue
+	// has no assignee and is authored by the local user, auto-assign it.
+	if r.isPersonalProject(input.ProjectID) {
+		for _, li := range loaded {
+			if err := r.applyPersonalProjectAutoAssign(ctx, input.Repo, project.RepoPath, input.ProjectID, li.issue, li.detail); err != nil {
+				return DiscoveryResult{}, err
+			}
+		}
+	}
+
 	mergeWatchRetriggers, err := r.applyMergeWatch(ctx, input.Repo, project.RepoPath, loaded, projectRoles)
 	if err != nil {
 		return DiscoveryResult{}, err
@@ -452,6 +463,46 @@ func autonomousBacklogSearch(search, legacyHoldLabel string) string {
 		search = fmt.Sprintf("-label:%q %s", holdLabel, search)
 	}
 	return search
+}
+
+func (r *Runner) isPersonalProject(projectID string) bool {
+	if r == nil || r.config == nil {
+		return false
+	}
+	for _, project := range r.config.Projects {
+		if project.ID == projectID {
+			return project.PersonalProject
+		}
+	}
+	return false
+}
+
+func (r *Runner) applyPersonalProjectAutoAssign(ctx context.Context, repo, cwd string, projectID string, issue triage.Issue, detail githubinfra.IssueDetail) error {
+	if r == nil || r.github == nil {
+		return nil
+	}
+	if !r.isPersonalProject(projectID) {
+		return nil
+	}
+	if issue.Author == "" {
+		return nil
+	}
+	if len(detail.Assignees) > 0 {
+		return nil
+	}
+	currentLogin, err := r.github.GetCurrentUserLoginForRepo(ctx, repo, cwd)
+	if err != nil || currentLogin == "" {
+		return nil
+	}
+	if !strings.EqualFold(issue.Author, currentLogin) {
+		return nil
+	}
+	return r.github.AddIssueAssignees(ctx, githubinfra.IssueAssigneesInput{
+		Repo:        repo,
+		IssueNumber: issue.Number,
+		Assignees:   []string{currentLogin},
+		CWD:         cwd,
+	})
 }
 
 func filterLoadedIssues(loaded []loadedIssue, skipped map[int64]struct{}) []loadedIssue {
