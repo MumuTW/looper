@@ -601,6 +601,11 @@ type DiscoveryResult struct {
 	QueueItems     []storage.QueueItemRecord
 	CreatedLoopIDs []string
 	Skipped        int
+	// Examined counts pull requests that passed the cheap local eligibility checks
+	// and therefore cost a ViewPullRequest round trip. It is the per-PR forge work
+	// this lane actually performs, as distinct from Skipped, which is work avoided
+	// for free before any call.
+	Examined int
 }
 
 type ProcessResult struct {
@@ -1624,6 +1629,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 			result.Skipped++
 			continue
 		}
+		result.Examined++
 		detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: pr.Number, CWD: project.RepoPath})
 		if err != nil {
 			return DiscoveryResult{}, err

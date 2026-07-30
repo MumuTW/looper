@@ -89,6 +89,15 @@ func roleDiscoverers(input defaultSchedulerTickInput) map[string]discoveryLane {
 			},
 			Discover: func(ctx context.Context, projectID, repo string, snapshot *githubinfra.DiscoverySnapshot) ([]storage.QueueItemRecord, error) {
 				result, err := input.Fixer.DiscoverPullRequests(ctx, fixer.DiscoveryInput{ProjectID: projectID, Repo: repo, Snapshot: snapshot})
+				// Examined is the per-PR forge work this lane performs; skipped is what the
+				// cheap local checks avoided before any call. Logging both is what decides
+				// whether a fingerprint-based skip has headroom here at all.
+				if input.Logger != nil {
+					input.Logger.Info("fixer discovery examined pull requests", map[string]any{
+						"projectId": projectID, "repo": repo,
+						"examined": result.Examined, "skipped": result.Skipped, "enqueued": len(result.QueueItems),
+					})
+				}
 				return result.QueueItems, err
 			},
 		},
