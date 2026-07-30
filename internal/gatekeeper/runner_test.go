@@ -296,14 +296,27 @@ type fakeGatekeeperGitHub struct {
 	// makes, so a test can prove a pull request was skipped rather than evaluated.
 	perPullRequestCalls int
 
-	currentLogin  string
-	commentErr    error
-	deletedIDs    []int64
+	currentLogin string
+	commentErr   error
+	deletedIDs   []int64
+	merges       []githubinfra.EnableAutoMergeInput
+	mergeErr     error
+	// beforeView, when set, runs before each pull-request read, so a test can
+	// change forge state between the primary and confirming evaluations.
+	beforeView    func(*fakeGatekeeperGitHub)
 	listCalls     int
 	loginCalls    int
 	comments      []githubinfra.CommentInfo
 	createdBodies []string
 	updatedBodies []string
+}
+
+func (f *fakeGatekeeperGitHub) MergePullRequest(_ context.Context, input githubinfra.EnableAutoMergeInput) error {
+	if f.mergeErr != nil {
+		return f.mergeErr
+	}
+	f.merges = append(f.merges, input)
+	return nil
 }
 
 func (f *fakeGatekeeperGitHub) GetCurrentUserLoginForRepo(context.Context, string, string) (string, error) {
@@ -355,6 +368,9 @@ func (f *fakeGatekeeperGitHub) ListOpenPullRequests(context.Context, githubinfra
 }
 func (f *fakeGatekeeperGitHub) ViewPullRequestForGatekeeper(context.Context, githubinfra.ViewPullRequestInput) (githubinfra.PullRequestDetail, error) {
 	f.perPullRequestCalls++
+	if f.beforeView != nil {
+		f.beforeView(f)
+	}
 	return f.detail, nil
 }
 func (f *fakeGatekeeperGitHub) ViewPullRequestMergeWatch(context.Context, githubinfra.ViewPullRequestInput) (githubinfra.PullRequestDetail, error) {

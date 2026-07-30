@@ -1697,6 +1697,9 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			TrustForProject: func(projectID string) config.GatekeeperTrustLevel {
 				return gatekeeperTrustForProject(cfg, projectID)
 			},
+			MergeStrategyForProject: func(projectID string) config.ReviewerAutoMergeStrategy {
+				return config.ProjectRoleConfigs(cfg, projectID).Reviewer.AutoMerge.Strategy
+			},
 			LogWarn: func(msg string, fields map[string]any) {
 				if logger != nil {
 					logger.Warn(msg, fields)

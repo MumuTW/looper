@@ -738,11 +738,30 @@ decides what it may do with that judgement.
 | --- | --- |
 | `observe` (default) | Gate report only. Nothing is published, nothing is merged. |
 | `advise` | Additionally publishes the verdict and every blocking reason on the pull request, so the decision costs one read instead of a re-investigation. The human still merges. |
-| `auto` | Would let Gatekeeper merge. **Not implemented** — configuration rejects it. |
+| `auto` | Gatekeeper merges what it judges eligible, after re-establishing that judgement immediately beforehand. |
 
-`auto` is rejected rather than accepted and ignored on purpose: a merge authority
-that silently behaves one level below what was configured is the worst possible
-failure for this setting.
+### What `auto` does before merging
+
+An eligible verdict is not a licence. Holds, reviews, threads, and project policy
+can all change without moving the head, so a Gate report is only ever a statement
+about the moment it was made.
+
+At `auto`, Gatekeeper therefore **re-runs the complete evaluation** immediately
+before merging and proceeds only if it still passes against the same head. A
+cheaper head comparison would miss exactly the changes that invariant names. The
+merge itself passes `--match-head-commit`, so the forge refuses if anything was
+pushed in between — the decision cannot be applied to a commit it was not made
+about.
+
+Every attempt is recorded, refusals included, with the gates that blocked the
+confirming pass. The merge is immediate rather than handed to GitHub's
+auto-merge: auto-merge applies the decision later, by which time the evaluation
+behind it is stale.
+
+`auto` cannot be combined with `roles.reviewer.autoMerge.enabled`. Two merge
+authorities on one pull request is not a configuration anyone can reason about —
+whichever wins the race decides, and Reviewer's path checks a strictly narrower
+set of gates.
 
 ```toml
 [roles.gatekeeper]

@@ -7,7 +7,7 @@ import (
 
 func gatekeeperIssues(cfg Config) []ValidationIssue {
 	var issues []ValidationIssue
-	validateGatekeeperRoleConfig(cfg.Roles.Gatekeeper, "roles.gatekeeper", &issues)
+	validateGatekeeperRoleConfig(cfg.Roles.Gatekeeper, "roles.gatekeeper", cfg.Roles.Reviewer.AutoMerge.Enabled, &issues)
 	return issues
 }
 
@@ -37,19 +37,30 @@ func TestGatekeeperTrustAcceptsObserveAndAdvise(t *testing.T) {
 	}
 }
 
-// "auto" is rejected rather than accepted-and-ignored. A merge authority that
-// silently behaves one level below what the operator configured is the worst
-// possible failure for this setting.
-func TestGatekeeperTrustRejectsUnimplementedAuto(t *testing.T) {
+func TestGatekeeperTrustAcceptsAuto(t *testing.T) {
 	t.Parallel()
 
 	issues := gatekeeperIssues(Config{Roles: RoleConfigs{Gatekeeper: GatekeeperRoleConfig{Trust: GatekeeperTrustAuto}}})
 
-	if len(issues) != 1 || issues[0].Path != "roles.gatekeeper.trust" {
-		t.Fatalf("issues = %+v, want one rejecting auto", issues)
+	if len(issues) != 0 {
+		t.Fatalf("issues = %+v, want auto accepted", issues)
 	}
-	if !strings.Contains(issues[0].Message, "not implemented") {
-		t.Fatalf("message = %q, want it to say auto is not implemented", issues[0].Message)
+}
+
+// Two merge authorities acting on the same pull request is not a configuration
+// anyone can reason about: whichever wins the race decides, and Reviewer's path
+// checks a strictly narrower set of gates.
+func TestGatekeeperAutoRejectsReviewerAutoMerge(t *testing.T) {
+	t.Parallel()
+	cfg := Config{Roles: RoleConfigs{
+		Gatekeeper: GatekeeperRoleConfig{Trust: GatekeeperTrustAuto},
+		Reviewer:   ReviewerRoleConfig{AutoMerge: ReviewerAutoMergeConfig{Enabled: true}},
+	}}
+
+	issues := gatekeeperIssues(cfg)
+
+	if len(issues) != 1 || !strings.Contains(issues[0].Message, "roles.reviewer.autoMerge") {
+		t.Fatalf("issues = %+v, want the two merge authorities refused", issues)
 	}
 }
 
@@ -63,15 +74,18 @@ func TestGatekeeperTrustRejectsUnknownLevel(t *testing.T) {
 	}
 }
 
-// A project override is validated too: rejecting only the global value would let
-// an unimplemented level in through the per-project door.
-func TestGatekeeperTrustValidatesProjectOverrides(t *testing.T) {
+// A project override is validated too: checking only the global value leaves the
+// per-project door open to a combination nobody can reason about.
+func TestGatekeeperAutoRejectsReviewerAutoMergePerProject(t *testing.T) {
 	t.Parallel()
 	auto := GatekeeperTrustAuto
-	cfg := Config{Projects: []ProjectRefConfig{{
-		ID:    "looper",
-		Roles: &PartialRoleConfigs{Gatekeeper: &PartialGatekeeperRoleConfig{Trust: &auto}},
-	}}}
+	cfg := Config{
+		Roles: RoleConfigs{Reviewer: ReviewerRoleConfig{AutoMerge: ReviewerAutoMergeConfig{Enabled: true}}},
+		Projects: []ProjectRefConfig{{
+			ID:    "looper",
+			Roles: &PartialRoleConfigs{Gatekeeper: &PartialGatekeeperRoleConfig{Trust: &auto}},
+		}},
+	}
 
 	var issues []ValidationIssue
 	validateCoreConfig(cfg, &issues)
@@ -83,7 +97,34 @@ func TestGatekeeperTrustValidatesProjectOverrides(t *testing.T) {
 		}
 	}
 	if !found {
-		t.Fatalf("project override of auto passed validation; issues = %+v", issues)
+		t.Fatal("a project running both merge authorities passed validation")
+	}
+}
+
+// A project that turns Reviewer's auto-merge off may run Gatekeeper at auto even
+// when the global setting has it on, because only one authority is then active.
+func TestGatekeeperAutoAllowedWhenTheProjectDisablesReviewerAutoMerge(t *testing.T) {
+	t.Parallel()
+	auto := GatekeeperTrustAuto
+	disabled := false
+	cfg := Config{
+		Roles: RoleConfigs{Reviewer: ReviewerRoleConfig{AutoMerge: ReviewerAutoMergeConfig{Enabled: true}}},
+		Projects: []ProjectRefConfig{{
+			ID: "looper",
+			Roles: &PartialRoleConfigs{
+				Gatekeeper: &PartialGatekeeperRoleConfig{Trust: &auto},
+				Reviewer:   &PartialReviewerRoleConfig{AutoMerge: &PartialReviewerAutoMergeConfig{Enabled: &disabled}},
+			},
+		}},
+	}
+
+	var issues []ValidationIssue
+	validateCoreConfig(cfg, &issues)
+
+	for _, issue := range issues {
+		if issue.Path == "projects[0].roles.gatekeeper.trust" {
+			t.Fatalf("rejected a project with only one merge authority: %s", issue.Message)
+		}
 	}
 }
 

@@ -124,6 +124,10 @@ type EvaluationInput struct {
 	// SourceFingerprint is recorded on the resulting report. Empty means the caller
 	// had no list-page observation, in which case the report can never be skipped.
 	SourceFingerprint string
+	// Confirming marks the second evaluation performed immediately before a merge.
+	// It publishes no verdict and triggers no merge of its own: it exists only to
+	// re-establish that the gates still pass.
+	Confirming bool
 }
 
 type DiscoveryInput struct {
@@ -155,6 +159,7 @@ type GitHubGateway interface {
 	UpdateIssueComment(context.Context, githubinfra.UpdateIssueCommentInput) error
 	GetCurrentUserLoginForRepo(context.Context, string, string) (string, error)
 	DeleteIssueComment(context.Context, githubinfra.DeleteIssueCommentInput) error
+	MergePullRequest(context.Context, githubinfra.EnableAutoMergeInput) error
 }
 
 type Options struct {
@@ -165,7 +170,9 @@ type Options struct {
 	// TrustForProject reports a project's merge-authority level. Nil means every
 	// project stays at observe, which is also the configured default.
 	TrustForProject func(projectID string) config.GatekeeperTrustLevel
-	LogWarn         func(msg string, fields map[string]any)
+	// MergeStrategyForProject selects the strategy used at the auto trust level.
+	MergeStrategyForProject func(projectID string) config.ReviewerAutoMergeStrategy
+	LogWarn                 func(msg string, fields map[string]any)
 }
 
 // Runner is the Merge Gatekeeper: a reactive, agent-free policy Role that
@@ -175,12 +182,13 @@ type Options struct {
 // Stateful: agent-free but not database-free — it persists Gate reports in
 // the local SQLite event log.
 type Runner struct {
-	repos               *storage.Repositories
-	github              GitHubGateway
-	now                 func() time.Time
-	policyPermitsTarget func(projectID, repo, baseRefName string) bool
-	trustForProject     func(projectID string) config.GatekeeperTrustLevel
-	logWarn             func(msg string, fields map[string]any)
+	repos                   *storage.Repositories
+	github                  GitHubGateway
+	now                     func() time.Time
+	policyPermitsTarget     func(projectID, repo, baseRefName string) bool
+	trustForProject         func(projectID string) config.GatekeeperTrustLevel
+	mergeStrategyForProject func(projectID string) config.ReviewerAutoMergeStrategy
+	logWarn                 func(msg string, fields map[string]any)
 }
 
 func New(options Options) *Runner {
@@ -194,7 +202,8 @@ func New(options Options) *Runner {
 	}
 	return &Runner{
 		repos: options.Repos, github: options.GitHub, now: now, policyPermitsTarget: policy,
-		trustForProject: options.TrustForProject, logWarn: options.LogWarn,
+		trustForProject: options.TrustForProject, mergeStrategyForProject: options.MergeStrategyForProject,
+		logWarn: options.LogWarn,
 	}
 }
 
@@ -265,6 +274,10 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 	}
 	if strings.TrimSpace(input.CWD) == "" {
 		input.CWD = r.projectCWD(ctx, input.ProjectID)
+	}
+
+	if input.Confirming {
+		ctx = withConfirming(ctx)
 	}
 
 	report := Report{
@@ -395,7 +408,18 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 	if report.Evidence.FinalObservedHeadSHA != report.ObservedHeadSHA {
 		report.Reasons = append(report.Reasons, Reason{Code: ReasonHeadStale})
 	}
-	return r.persist(ctx, report)
+	persisted, err := r.persist(ctx, report)
+	if err != nil {
+		return Report{}, err
+	}
+	// Merging is the last thing, and only on the primary pass: the confirming
+	// evaluation exists to serve this decision, not to make another one.
+	if !input.Confirming && persisted.Eligible && r.trustFor(persisted.ProjectID) == config.GatekeeperTrustAuto {
+		if err := r.confirmAndMerge(ctx, input, persisted); err != nil {
+			return persisted, err
+		}
+	}
+	return persisted, nil
 }
 
 func (r *Runner) projectCWD(ctx context.Context, projectID string) string {
@@ -429,7 +453,26 @@ func (r *Runner) trustFor(projectID string) config.GatekeeperTrustLevel {
 	}
 }
 
+// confirmingKey marks an evaluation as the pass performed immediately before a
+// merge. It travels on the context because it is a property of the whole
+// evaluation rather than of any one step, and every persist path would otherwise
+// need the same extra parameter.
+type confirmingKey struct{}
+
+func withConfirming(ctx context.Context) context.Context {
+	return context.WithValue(ctx, confirmingKey{}, true)
+}
+
+func isConfirming(ctx context.Context) bool {
+	confirming, _ := ctx.Value(confirmingKey{}).(bool)
+	return confirming
+}
+
+// persist records a report. The confirming pass writes its report — the evidence
+// behind a merge has to be durable — but publishes no verdict, because it
+// describes the same head as the verdict already on the pull request.
 func (r *Runner) persist(ctx context.Context, report Report) (Report, error) {
+	confirming := isConfirming(ctx)
 	sortReasons(report.Reasons)
 	report.Eligible = len(report.Reasons) == 0
 	if report.Eligible {
@@ -451,7 +494,9 @@ func (r *Runner) persist(ctx context.Context, report Report) (Report, error) {
 		// is stranded, so fail rather than guess.
 		return Report{}, err
 	}
-	action = decideVerdictAction(r.trustFor(report.ProjectID), previous, report)
+	if !confirming {
+		action = decideVerdictAction(r.trustFor(report.ProjectID), previous, report)
+	}
 
 	entityType := "pull_request"
 	entityID := fmt.Sprintf("%s#%d", report.Repo, report.PRNumber)
