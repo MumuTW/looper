@@ -1,0 +1,99 @@
+# Path-based area labels for PRs, applied by .github/workflows/labeler.yml.
+#
+# These are descriptive labels only. Control-plane labels (looper:*, dispatch/*)
+# are owned by the looper daemon and humans; no workflow may write them.
+#
+# The area vocabulary follows the role boundaries in CONTEXT.md and extends the
+# set Coordinator already uses for issues (internal/coordinator/triage/triage.go).
+# Coordinator writes area/* on issues; this workflow writes area/* on PRs — same
+# taxonomy, disjoint objects.
+area/triager:
+  - changed-files:
+      - any-glob-to-any-file: "internal/triager/**"
+
+area/coordinator:
+  - changed-files:
+      - any-glob-to-any-file: "internal/coordinator/**"
+
+area/planner:
+  - changed-files:
+      - any-glob-to-any-file: "internal/planner/**"
+
+area/worker:
+  - changed-files:
+      - any-glob-to-any-file: "internal/worker/**"
+
+area/reviewer:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "internal/reviewer/**"
+          - "internal/reviewsubmit/**"
+
+area/fixer:
+  - changed-files:
+      - any-glob-to-any-file: "internal/fixer/**"
+
+area/gatekeeper:
+  - changed-files:
+      - any-glob-to-any-file: "internal/gatekeeper/**"
+
+area/agent:
+  - changed-files:
+      - any-glob-to-any-file: "internal/agent/**"
+
+area/storage:
+  - changed-files:
+      - any-glob-to-any-file: "internal/storage/**"
+
+area/config:
+  - changed-files:
+      - any-glob-to-any-file: "internal/config/**"
+
+area/api:
+  - changed-files:
+      - any-glob-to-any-file: "internal/api/**"
+
+area/github:
+  - changed-files:
+      - any-glob-to-any-file: "internal/infra/**"
+
+area/forge:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "internal/forge/**"
+          - "internal/network/**"
+          - "internal/networkpolicy/**"
+          - "internal/webhookforward/**"
+
+area/runtime:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "internal/runtime/**"
+          - "internal/loops/**"
+          - "internal/lifecycle/**"
+
+area/dashboard:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "web/**"
+          - "internal/dashboard/**"
+
+area/testing:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "e2e/**"
+          - "internal/e2e/**"
+          - "internal/testenv/**"
+
+area/ci:
+  - changed-files:
+      - any-glob-to-any-file:
+          - ".github/**"
+          - "scripts/**"
+
+area/docs:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "docs/**"
+          - "specs/**"
+          - "**/*.md"

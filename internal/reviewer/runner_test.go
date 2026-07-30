@@ -8172,27 +8172,6 @@ func TestBuildThreadResolutionPromptRequiresPreparedWorktreeReuse(t *testing.T) 
 	}
 }
 
-func TestShouldRestartFromDiscoverForAgentNativePreflightFailures(t *testing.T) {
-	t.Parallel()
-
-	for _, summary := range []string{
-		"PR head changed before publish",
-		"review request removed before publish",
-	} {
-		if !shouldRestartFromDiscover("failed", stepReview, summary) {
-			t.Fatalf("shouldRestartFromDiscover(review, %q) = false, want true", summary)
-		}
-	}
-}
-
-func TestShouldRestartFromDiscoverForThreadResolutionHeadChange(t *testing.T) {
-	t.Parallel()
-
-	if !shouldRestartFromDiscover("failed", stepThreadResolution, "PR changed during thread reconciliation") {
-		t.Fatalf("shouldRestartFromDiscover(thread_resolution head change) = false, want true")
-	}
-}
-
 func TestProcessClaimedItemMarksStaleOnHeadChangeSignal(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

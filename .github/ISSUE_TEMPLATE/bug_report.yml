@@ -1,0 +1,38 @@
+name: Bug Report
+description: Report something that isn't working
+title: "fix: "
+labels:
+  - bug
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did you observe, and what did you expect instead?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: How to reproduce
+      description: Exact steps, commands, or configuration that trigger the bug.
+      placeholder: |
+        1. Run `looperd` with ...
+        2. Open an issue labeled ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: looper version or commit, OS, and any relevant configuration.
+    validations:
+      required: false
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Logs or evidence
+      description: Relevant log excerpts, run IDs, or links to runs/PRs.
+    validations:
+      required: false
