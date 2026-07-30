@@ -369,11 +369,12 @@ func (s *Service) addProjectLocked(ctx context.Context, input AddInput) (AddResu
 		// no role can act on: every discovery lane skips a project whose repo
 		// metadata is empty. Say so at registration instead of leaving the
 		// operator to infer it from a daemon log line on every tick.
-		// The repair path is named precisely because the obvious ones do not
-		// exist: the dashboard Projects page is read-only, /api/v1/projects/{id}
-		// accepts only DELETE, and `looper project add` has no repo flag. That
-		// leaves DELETE followed by a create carrying "repo".
-		warnings = append(warnings, `No repository is set for this project, so no automation will run for it. To repair it: DELETE /api/v1/projects/`+projectID+` then POST /api/v1/projects with {"repoPath":"...","repo":"owner/name"}. The CLI cannot set a repository.`)
+		// PATCH is the repair, not remove-and-recreate: RemoveProject terminates
+		// every loop and cancels every queue item, and "terminated" has no
+		// outbound transition, so the destructive path would take the automation
+		// state with it. Registration cannot be reused as an update either — its
+		// omitted fields take creation defaults.
+		warnings = append(warnings, fmt.Sprintf(`No repository is set for this project, so no automation will run for it. Set one with PATCH /api/v1/projects/%s and body {"repo":"owner/name"}; omitted fields are left unchanged and existing loops are preserved. The CLI cannot set a repository.`, projectID))
 	}
 
 	if err := s.validateReviewerAutoMergeForProject(ctx, projectID, repo, input.BaseBranch, cfg); err != nil {
@@ -604,6 +605,98 @@ func (s *Service) ResumeIncompleteDiscoveries(ctx context.Context) error {
 	// queue; newly registered projects retain their existing async behavior.
 	s.scheduleDiscoveries(inputs)
 	return nil
+}
+
+// UpdateInput is a partial project mutation: a nil field is left unchanged.
+// This is deliberately not AddInput. Registration applies creation defaults to
+// omitted fields, which is correct when creating and destructive when
+// repairing — reusing it as an update silently resets name, base branch, and
+// snapshot mode.
+type UpdateInput struct {
+	Repo         *string
+	Name         *string
+	BaseBranch   *string
+	WorktreeRoot *string
+}
+
+// UpdateProject applies a partial mutation to an existing project. It preserves
+// every field the caller omitted, keeps the project's id, and leaves its loops
+// and queue items untouched — unlike remove-and-recreate, which terminates
+// them irrecoverably.
+func (s *Service) UpdateProject(ctx context.Context, identifier string, input UpdateInput) (storage.ProjectRecord, error) {
+	if s.Repos == nil || s.Repos.Projects == nil {
+		return storage.ProjectRecord{}, fmt.Errorf("projects repository is not configured")
+	}
+	s.mutationMu.Lock()
+	defer s.mutationMu.Unlock()
+
+	trimmed := strings.TrimSpace(identifier)
+	if trimmed == "" {
+		return storage.ProjectRecord{}, ProjectValidationError{Message: "project identifier is required"}
+	}
+	project, err := s.resolveActiveProjectForRemoval(ctx, trimmed)
+	if err != nil {
+		return storage.ProjectRecord{}, err
+	}
+	if project == nil {
+		return storage.ProjectRecord{}, ProjectNotFoundError{Identifier: trimmed}
+	}
+	metadata := parseMetadata(project.MetadataJSON)
+	if metadataString(metadata, "source") == "config" {
+		return storage.ProjectRecord{}, ProjectValidationError{Message: fmt.Sprintf("project %s is managed by config and cannot be changed through the project API", project.ID)}
+	}
+
+	unlockProject, lockErr := s.lockProjectOperations(ctx, project.ID)
+	if lockErr != nil {
+		return storage.ProjectRecord{}, lockErr
+	}
+	defer unlockProject()
+
+	updated := *project
+	if input.Name != nil {
+		name := strings.TrimSpace(*input.Name)
+		if name == "" {
+			return storage.ProjectRecord{}, ProjectValidationError{Message: "name must not be empty when provided"}
+		}
+		updated.Name = name
+	}
+	if input.BaseBranch != nil {
+		baseBranch := strings.TrimSpace(*input.BaseBranch)
+		if baseBranch == "" {
+			return storage.ProjectRecord{}, ProjectValidationError{Message: "baseBranch must not be empty when provided"}
+		}
+		updated.BaseBranch = &baseBranch
+	}
+	if input.Repo != nil {
+		repo := strings.TrimSpace(*input.Repo)
+		if repo == "" {
+			return storage.ProjectRecord{}, ProjectValidationError{Message: "repo must not be empty when provided"}
+		}
+		if len(strings.Split(repo, "/")) != 2 {
+			return storage.ProjectRecord{}, ProjectValidationError{Message: "repo must be owner/name"}
+		}
+		metadata["repo"] = repo
+	}
+	if input.WorktreeRoot != nil {
+		worktreeRoot := strings.TrimSpace(*input.WorktreeRoot)
+		if worktreeRoot == "" {
+			metadata["worktreeRoot"] = nil
+		} else {
+			metadata["worktreeRoot"] = worktreeRoot
+		}
+	}
+
+	metadataJSON, err := buildAddProjectMetadataJSON(metadata)
+	if err != nil {
+		return storage.ProjectRecord{}, fmt.Errorf("marshal project metadata: %w", err)
+	}
+	updated.MetadataJSON = stringPointer(metadataJSON)
+	updated.UpdatedAt = currentISO(s.Now)
+
+	if err := s.Repos.Projects.Upsert(ctx, updated); err != nil {
+		return storage.ProjectRecord{}, err
+	}
+	return updated, nil
 }
 
 func (s *Service) RemoveProject(ctx context.Context, identifier string) (storage.ProjectRecord, error) {

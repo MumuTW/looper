@@ -8340,6 +8340,7 @@ type fakeProjectService struct {
 	addProject      func(context.Context, projects.AddInput) (projects.AddResult, error)
 	removeProject   func(context.Context, string) (storage.ProjectRecord, error)
 	discoverProject func(context.Context, projects.DiscoverInput) (projects.DiscoverResult, error)
+	updateProject   func(context.Context, string, projects.UpdateInput) (storage.ProjectRecord, error)
 }
 
 func (f fakeProjectService) List(ctx context.Context) ([]storage.ProjectRecord, error) {
@@ -8354,6 +8355,13 @@ func (f fakeProjectService) AddProject(ctx context.Context, input projects.AddIn
 		return f.addProject(ctx, input)
 	}
 	return projects.AddResult{}, nil
+}
+
+func (f fakeProjectService) UpdateProject(ctx context.Context, identifier string, input projects.UpdateInput) (storage.ProjectRecord, error) {
+	if f.updateProject != nil {
+		return f.updateProject(ctx, identifier, input)
+	}
+	return storage.ProjectRecord{}, nil
 }
 
 func (f fakeProjectService) RemoveProject(ctx context.Context, identifier string) (storage.ProjectRecord, error) {
@@ -8450,4 +8458,66 @@ func TestHandlerPullRequestStatusUsesLatestRunOrderingForTiedTimestamps(t *testi
 	data := body["data"].(map[string]any)
 	loopStatus := data["loopStatus"].(map[string]any)
 	assertEqual(t, loopStatus["latestRunStatus"], "running")
+}
+
+// The inert-project warning advertises PATCH as the repair. This drives that
+// advertised HTTP contract end to end, because the failure it guards against is
+// exactly what a service-level test cannot see: registration applies creation
+// defaults to omitted fields, so reusing it as an update silently resets a
+// project's name, base branch, and snapshot mode, while remove-and-recreate
+// additionally terminates every loop irrecoverably.
+func TestHandlerProjectsPatchRepairsRepositoryWithoutResettingOtherFields(t *testing.T) {
+	fixture := newTestFixture(t)
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+	baseBranch := "develop"
+	metadata := `{"repo":null,"worktreeRoot":"/tmp/wt","source":"api","snapshotMode":"off"}`
+	if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{
+		ID: "inert", Name: "Custom Name", RepoPath: "/tmp/inert", BaseBranch: &baseBranch,
+		MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	targetID := "pr:acme/app:1"
+	if err := fixture.runtime.Services().Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{
+		ID: "loop_inert", Seq: 1, ProjectID: "inert", Type: "reviewer", TargetType: "pull_request",
+		TargetID: &targetID, Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPatch, "/api/v1/projects/inert", bytes.NewReader([]byte(`{"repo":"acme/app"}`)))
+	NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime}).ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 body=%s", recorder.Code, recorder.Body.String())
+	}
+
+	data := parseJSONMap(t, recorder.Body.Bytes())["data"].(map[string]any)
+	assertEqual(t, data["id"], "inert")
+	assertEqual(t, data["repo"], "acme/app")
+	assertEqual(t, data["archived"], false)
+	assertEqual(t, data["name"], "Custom Name")
+	assertEqual(t, data["baseBranch"], "develop")
+
+	stored, err := fixture.runtime.Services().Repositories.Projects.GetByID(context.Background(), "inert")
+	if err != nil {
+		t.Fatalf("Projects.GetByID() error = %v", err)
+	}
+	if stored == nil || stored.MetadataJSON == nil {
+		t.Fatal("stored project or its metadata is missing")
+	}
+	if !strings.Contains(*stored.MetadataJSON, `"snapshotMode":"off"`) {
+		t.Fatalf("metadata = %s, want the existing snapshotMode preserved", *stored.MetadataJSON)
+	}
+	if !strings.Contains(*stored.MetadataJSON, `"worktreeRoot":"/tmp/wt"`) {
+		t.Fatalf("metadata = %s, want the existing worktreeRoot preserved", *stored.MetadataJSON)
+	}
+
+	loop, err := fixture.runtime.Services().Repositories.Loops.GetByID(context.Background(), "loop_inert")
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if loop == nil || loop.Status == "terminated" {
+		t.Fatalf("loop = %#v, want the existing loop preserved and not terminated", loop)
+	}
 }
