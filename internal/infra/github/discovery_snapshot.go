@@ -326,6 +326,27 @@ func (g *Gateway) listOpenIssuesForDiscovery(ctx context.Context, input ListOpen
 	return cloneIssueSummaries(issues), nil
 }
 
+// InvalidateOpenIssueDiscovery removes cached open-issue pages for one forge
+// repository. Webhook issue eligibility changes call this before waking the
+// scheduler; polling remains the recovery path when a delivery is lost.
+func (g *Gateway) InvalidateOpenIssueDiscovery(repo string) {
+	if g == nil {
+		return
+	}
+	repo = strings.TrimSpace(repo)
+	if repo == "" {
+		return
+	}
+	g.discoveryCacheMu.Lock()
+	defer g.discoveryCacheMu.Unlock()
+	for key := range g.discoveryIssueCache {
+		parts := strings.SplitN(key, "|", 3)
+		if len(parts) == 3 && parts[0] == "issue" && strings.EqualFold(parts[1], repo) {
+			delete(g.discoveryIssueCache, key)
+		}
+	}
+}
+
 func (s *DiscoverySnapshot) shouldFallbackToFilteredPullRequestQuery(input ListOpenPullRequestsInput, filteredCount int) bool {
 	if !hasPullRequestFilters(input) {
 		return defaultLimit(input.Limit) > s.prLimit

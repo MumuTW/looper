@@ -276,6 +276,38 @@ func TestDiscoverySnapshotUsesGatewayDiscoveryTTLCacheAcrossTicks(t *testing.T) 
 	}
 }
 
+func TestInvalidateOpenIssueDiscoveryClearsMatchingRepoCacheCaseInsensitively(t *testing.T) {
+	now := time.Date(2026, 7, 31, 10, 0, 0, 0, time.UTC)
+	calls := 0
+	gateway := New(Options{Now: func() time.Time { return now }, DiscoveryCacheTTL: time.Hour, GHRun: func(_ context.Context, options shell.Options) (shell.Result, error) {
+		if !strings.Contains(strings.Join(options.Args, " "), "issue list") {
+			return shell.Result{}, errors.New("unexpected command")
+		}
+		calls++
+		return shell.Result{Stdout: `[{"number":42,"title":"Wake","state":"OPEN","labels":[],"assignees":[]}]`}, nil
+	}})
+	input := ListOpenIssuesInput{Repo: "Acme/Looper", CWD: "/repo", Limit: 10}
+	firstCtx := ContextWithDiscoverySnapshot(context.Background(), NewDiscoverySnapshot(gateway, NewDiscoveryTickState(), DiscoverySnapshotOptions{IssueLimit: 100}))
+	if _, err := gateway.ListOpenIssues(firstCtx, input); err != nil {
+		t.Fatalf("ListOpenIssues(first) error = %v", err)
+	}
+	secondCtx := ContextWithDiscoverySnapshot(context.Background(), NewDiscoverySnapshot(gateway, NewDiscoveryTickState(), DiscoverySnapshotOptions{IssueLimit: 100}))
+	if _, err := gateway.ListOpenIssues(secondCtx, input); err != nil {
+		t.Fatalf("ListOpenIssues(cached) error = %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("calls before invalidation = %d, want 1", calls)
+	}
+	gateway.InvalidateOpenIssueDiscovery("acme/looper")
+	thirdCtx := ContextWithDiscoverySnapshot(context.Background(), NewDiscoverySnapshot(gateway, NewDiscoveryTickState(), DiscoverySnapshotOptions{IssueLimit: 100}))
+	if _, err := gateway.ListOpenIssues(thirdCtx, input); err != nil {
+		t.Fatalf("ListOpenIssues(after invalidation) error = %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("calls after invalidation = %d, want 2", calls)
+	}
+}
+
 func TestDiscoverySnapshotCachesReviewRequestedPullRequestsPerTickAndTTL(t *testing.T) {
 	t.Parallel()
 

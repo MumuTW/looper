@@ -17,6 +17,7 @@ import (
 	"github.com/nexu-io/looper/internal/bootstrap"
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/webhookforward"
 )
 
 const webhookListenerPath = "/webhook/forward"
@@ -25,7 +26,7 @@ const noConfiguredWebhookReposReason = "no configured GitHub repos are available
 
 var webhookReconcileRetryDelay = 5 * time.Second
 
-var webhookForwardEvents = []string{"pull_request", "issue_comment", "pull_request_review", "pull_request_review_comment", "push", "check_run"}
+var webhookForwardEvents = []string{"pull_request", "issues", "issue_comment", "pull_request_review", "pull_request_review_comment", "push", "check_run"}
 
 const (
 	webhookForwarderStdoutTailLines = 20
@@ -120,6 +121,7 @@ type webhookRuntime struct {
 	allowedTunnelRepos map[string]struct{}
 	tunnelClient       webhookTunnelGitHubClient
 	forwarder          func() WebhookForwarder
+	afterForward       func(string, []byte, webhookforward.ForwardResult)
 	// allowForward is the admission projection for work-producing tunnel
 	// deliveries (Forward). Nil means open, matching unit tests that construct
 	// webhookRuntime without a Runtime admission Authority.

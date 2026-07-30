@@ -455,6 +455,9 @@ func (s *webhookTunnelServer) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 	if strings.EqualFold(result.Status, "accepted") || result.WorkItems > 0 {
 		s.runtime.RecordDelivery(r.Header.Get("X-GitHub-Event"), r.Header.Get("X-GitHub-Delivery"))
 	}
+	if s.runtime.afterForward != nil {
+		s.runtime.afterForward(r.Header.Get("X-GitHub-Event"), forwardPayload, result)
+	}
 	w.WriteHeader(http.StatusAccepted)
 	_ = json.NewEncoder(w).Encode(result)
 }

@@ -1599,6 +1599,36 @@ func TestHandlerWebhookForwardAcceptsLoopbackWithoutDoubleScheduling(t *testing.
 	assertEqual(t, recorded, 1)
 }
 
+func TestHandlerWebhookForwardWakesIssueDiscoveryOncePerDelivery(t *testing.T) {
+	fixture := newTestFixture(t)
+	fixture.config.Webhook.Enabled = true
+	wakes := []string{}
+	forwarder := &fakeWebhookForwarder{result: webhookforward.ForwardResult{Status: "ignored", Reason: "unsupported_event"}}
+	runtime := webhookForwardRuntime{Runtime: fixture.runtime, config: &fixture.config, status: func() looperdruntime.WebhookStatus { return looperdruntime.WebhookStatus{Enabled: true} }, wake: func(repo string) { wakes = append(wakes, repo) }}
+	h := NewHandler(Context{Config: fixture.config, Runtime: runtime, WebhookForwarder: forwarder})
+	payload := []byte(`{"action":"labeled","repository":{"full_name":"acme/looper"},"issue":{"number":42}}`)
+	for index, deliveryID := range []string{"issue-wake", "issue-wake"} {
+		if index == 1 {
+			forwarder.result = webhookforward.ForwardResult{Status: "duplicate", Reason: "delivery_deduped"}
+		}
+		req := httptest.NewRequest(http.MethodPost, "/webhook/forward", bytes.NewReader(payload))
+		req.RemoteAddr = "127.0.0.1:1234"
+		req.Header.Set("X-GitHub-Delivery", deliveryID)
+		req.Header.Set("X-GitHub-Event", "issues")
+		recorder := httptest.NewRecorder()
+		h.ServeHTTP(recorder, req)
+		if recorder.Code != http.StatusAccepted {
+			t.Fatalf("delivery %q status = %d, want 202 body=%s", deliveryID, recorder.Code, recorder.Body.String())
+		}
+	}
+	if len(wakes) != 1 || wakes[0] != "acme/looper" {
+		t.Fatalf("wakes = %#v, want one wake for the first delivery only", wakes)
+	}
+	if repo, ok := issueEligibilityWebhookRepo("issues", []byte(`{"action":"labeled","repository":{"full_name":"acme/looper"},"issue":{"number":42,"pull_request":{}}}`)); ok || repo != "" {
+		t.Fatalf("pull-request issue route = %q, %v; want ignored", repo, ok)
+	}
+}
+
 func TestHandlerWebhookForwardProcessesDeliveryWhenRuntimeIsDegraded(t *testing.T) {
 	fixture := newTestFixture(t)
 	fixture.config.Webhook.Enabled = true
@@ -7613,6 +7643,7 @@ type webhookForwardRuntime struct {
 	config *config.Config
 	status func() looperdruntime.WebhookStatus
 	record func(string, string)
+	wake   func(string)
 }
 
 type executionVerifierRuntime struct {
@@ -7640,6 +7671,14 @@ func (r webhookForwardRuntime) RecordWebhookDelivery(eventType, deliveryID strin
 		return
 	}
 	r.Runtime.RecordWebhookDelivery(eventType, deliveryID)
+}
+
+func (r webhookForwardRuntime) WakeIssueDiscovery(repo string) {
+	if r.wake != nil {
+		r.wake(repo)
+		return
+	}
+	r.Runtime.WakeIssueDiscovery(repo)
 }
 
 func (r executionVerifierRuntime) ExecutionMatchesProcess(ctx context.Context, execution storage.AgentExecutionRecord, pid int) (bool, bool, error) {

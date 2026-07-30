@@ -627,6 +627,13 @@ func (h *Handler) buildWebhookForwardResponse(r *http.Request) (webhookforward.F
 		}
 		return webhookforward.ForwardResult{}, apiError{code: code, status: status, message: message}
 	}
+	if strings.EqualFold(result.Status, "ignored") {
+		if repo, ok := issueEligibilityWebhookRepo(eventType, body); ok {
+			if runtimeWithIssueWake, ok := any(h.context.Runtime).(interface{ WakeIssueDiscovery(string) }); ok {
+				runtimeWithIssueWake.WakeIssueDiscovery(repo)
+			}
+		}
+	}
 	if (strings.EqualFold(result.Status, "accepted") || result.WorkItems > 0) && any(h.context.Runtime) != nil {
 		runtimeWithWebhook, ok := any(h.context.Runtime).(interface{ RecordWebhookDelivery(string, string) })
 		if ok {
@@ -634,6 +641,32 @@ func (h *Handler) buildWebhookForwardResponse(r *http.Request) (webhookforward.F
 		}
 	}
 	return result, nil
+}
+
+func issueEligibilityWebhookRepo(eventType string, payload []byte) (string, bool) {
+	if !strings.EqualFold(strings.TrimSpace(eventType), "issues") {
+		return "", false
+	}
+	var envelope struct {
+		Action     string `json:"action"`
+		Repository struct {
+			FullName string `json:"full_name"`
+		} `json:"repository"`
+		Issue struct {
+			Number      int64 `json:"number"`
+			PullRequest any   `json:"pull_request"`
+		} `json:"issue"`
+	}
+	if err := json.Unmarshal(payload, &envelope); err != nil || envelope.Issue.Number <= 0 || envelope.Issue.PullRequest != nil {
+		return "", false
+	}
+	switch strings.TrimSpace(envelope.Action) {
+	case "labeled", "unlabeled", "assigned", "unassigned":
+		repo := strings.TrimSpace(envelope.Repository.FullName)
+		return repo, repo != ""
+	default:
+		return "", false
+	}
 }
 
 func isLoopbackRequest(r *http.Request) bool {

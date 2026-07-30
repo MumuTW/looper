@@ -245,7 +245,6 @@ func New(options Options) *Runtime {
 	if now == nil {
 		now = time.Now
 	}
-
 	openSQLiteCoordinator := options.OpenSQLiteCoordinator
 	if openSQLiteCoordinator == nil {
 		openSQLiteCoordinator = storage.OpenSQLiteCoordinator
@@ -324,6 +323,7 @@ func New(options Options) *Runtime {
 		admission:                   NewAdmission(),
 		daemonBinary:                newDaemonBinaryWatcher(options.Logger),
 	}
+	rt.webhook.afterForward = rt.HandleIssueDiscoveryWebhook
 	// Project daemon Admission onto agent spawn leases so cmd.Start is refused
 	// while starting/stopping/degraded (#576 + #575).
 	rt.activeExecutions.SetAllowSpawn(rt.AllowClaim)
@@ -753,6 +753,48 @@ func (r *Runtime) RecordWebhookDelivery(eventType, deliveryID string) {
 	if webhook != nil {
 		webhook.RecordDelivery(eventType, deliveryID)
 		r.TriggerSchedulerTick()
+	}
+}
+
+// WakeIssueDiscovery invalidates only the open-issue cache for a repository
+// then requests the normal scheduler pass. It never creates work directly:
+// planner/worker discovery remains the authority for eligibility, ordering,
+// durable queue publication, and idempotency.
+func (r *Runtime) WakeIssueDiscovery(repo string) {
+	r.mu.RLock()
+	gateway := r.githubGateway
+	stopped := r.stopped
+	r.mu.RUnlock()
+	if stopped || gateway == nil {
+		return
+	}
+	gateway.InvalidateOpenIssueDiscovery(repo)
+	r.TriggerSchedulerTick()
+}
+
+// HandleIssueDiscoveryWebhook runs after either webhook transport has passed a
+// delivery through the forwarder's delivery-id dedupe. It wakes normal issue
+// discovery only for label or assignee changes; it never creates a loop itself.
+func (r *Runtime) HandleIssueDiscoveryWebhook(eventType string, payload []byte, result webhookforward.ForwardResult) {
+	if !strings.EqualFold(result.Status, "ignored") || !strings.EqualFold(strings.TrimSpace(eventType), "issues") {
+		return
+	}
+	var envelope struct {
+		Action     string `json:"action"`
+		Repository struct {
+			FullName string `json:"full_name"`
+		} `json:"repository"`
+		Issue struct {
+			Number      int64 `json:"number"`
+			PullRequest any   `json:"pull_request"`
+		} `json:"issue"`
+	}
+	if err := json.Unmarshal(payload, &envelope); err != nil || envelope.Issue.Number <= 0 || envelope.Issue.PullRequest != nil {
+		return
+	}
+	switch strings.TrimSpace(envelope.Action) {
+	case "labeled", "unlabeled", "assigned", "unassigned":
+		r.WakeIssueDiscovery(strings.TrimSpace(envelope.Repository.FullName))
 	}
 }
 
