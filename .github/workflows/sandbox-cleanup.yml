@@ -5,7 +5,10 @@ name: sandbox-cleanup
 # issues/PRs behind when they fail or time out — TestGitHubSandbox* only
 # reaches its per-test cleanup on success. While the sandbox App credentials
 # are absent, the job no-ops instead of failing every hour: the guard below
-# skips the token-mint and cleanup steps when LOOPER_E2E_GITHUB_APP_ID is unset.
+# skips the token-mint and cleanup steps unless BOTH halves of the App
+# credential are present. Gating on LOOPER_E2E_GITHUB_APP_ID alone would let a
+# half-configured repo (variable set, secret not yet added) enable the job and
+# resume failing hourly at the token-mint step.
 on:
   schedule:
     - cron: '17 * * * *'
@@ -28,10 +31,14 @@ jobs:
         shell: bash
         env:
           APP_ID: ${{ vars.LOOPER_E2E_GITHUB_APP_ID }}
+          APP_PRIVATE_KEY: ${{ secrets.LOOPER_E2E_GITHUB_APP_PRIVATE_KEY }}
         run: |
-          if [ -z "${APP_ID}" ]; then
+          missing=()
+          [ -n "${APP_ID}" ] || missing+=("LOOPER_E2E_GITHUB_APP_ID")
+          [ -n "${APP_PRIVATE_KEY}" ] || missing+=("LOOPER_E2E_GITHUB_APP_PRIVATE_KEY")
+          if [ "${#missing[@]}" -gt 0 ]; then
             echo "enabled=false" >> "$GITHUB_OUTPUT"
-            echo "LOOPER_E2E_GITHUB_APP_ID is unset; no sandbox credentials to clean up with."
+            printf '%s is unset; no sandbox credentials to clean up with.\n' "${missing[*]}"
           else
             echo "enabled=true" >> "$GITHUB_OUTPUT"
           fi
