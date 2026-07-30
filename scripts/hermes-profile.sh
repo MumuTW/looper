@@ -39,6 +39,11 @@ FORCE=0
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 HERMES_ROOT="${HERMES_ROOT:-$HOME/.hermes}"
+# Baked into the printed MCP registration: Devin spawns that server in a future
+# session with only the env recorded at registration time, so an install dir
+# that is only set in this shell would be lost and the server would fall back
+# to the default path and fail every call with an import error.
+HERMES_INSTALL_DIR="${HERMES_INSTALL_DIR:-$HOME/.hermes/hermes-agent}"
 LOOPER_HERMES_PROFILE="${LOOPER_HERMES_PROFILE:-looper}"
 LOOPER_HERMES_HOME="$HERMES_ROOT/profiles/$LOOPER_HERMES_PROFILE"
 LOOPER_DEVIN_MODEL="${LOOPER_DEVIN_MODEL:-glm-5-2}"
@@ -139,6 +144,7 @@ ENV
   echo "  $REPO_ROOT/tools/hermes-devin/apply-hermes-patch.sh"
   echo "  devin mcp add $LOOPER_MCP_SERVER \\"
   echo "    -e HERMES_HOME=$LOOPER_HERMES_HOME \\"
+  echo "    -e HERMES_INSTALL_DIR=$HERMES_INSTALL_DIR \\"
   echo "    -- $REPO_ROOT/tools/hermes-devin/memory_mcp_server.py"
   echo "Run the devin command once from this repo root: it writes"
   echo ".devin/mcp_config.local.json there (gitignored — it holds absolute"
