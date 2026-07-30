@@ -193,6 +193,7 @@ type Runtime struct {
 	worktreeCleanupInitialDelay time.Duration
 	worktreeCleanupStatus       WorktreeCleanupStatus
 	projectDiscovery            *projectDiscoveryRunner
+	resumeProjectDiscoveries    func(context.Context, *projects.Service) error
 	recoveryCancel              context.CancelFunc
 	recoveryDone                chan struct{}
 	activeExecutions            *ActiveExecutionRegistry
@@ -863,18 +864,12 @@ func (r *Runtime) start(ctx context.Context) error {
 	}
 
 	started := false
+	resourcesPublished := false
 	defer func() {
-		if !started {
+		if !started && !resourcesPublished {
 			r.stopProjectDiscovery()
 			if lock != nil {
 				_ = lock.Release()
-			}
-			r.mu.Lock()
-			forwarder := r.webhookForwarder
-			r.webhookForwarder = nil
-			r.mu.Unlock()
-			if forwarder != nil {
-				forwarder.Close()
 			}
 			_ = coordinator.Close()
 		}
@@ -1007,6 +1002,7 @@ func (r *Runtime) start(ctx context.Context) error {
 	r.webhookDaemonLock = lock
 	r.schedulerDisabled = schedulerDisabled
 	r.mu.Unlock()
+	resourcesPublished = true
 
 	if r.deferRecovery {
 		if r.networkManager != nil {
@@ -1099,7 +1095,13 @@ func (r *Runtime) CompleteStartup(ctx context.Context) error {
 		// dependency validation, recovery, ownership, producer assembly, and
 		// admission readiness have all succeeded.
 		if projectService != nil {
-			if err := projectService.ResumeIncompleteDiscoveries(ctx); err != nil {
+			resume := r.resumeProjectDiscoveries
+			if resume == nil {
+				resume = func(ctx context.Context, service *projects.Service) error {
+					return service.ResumeIncompleteDiscoveries(ctx)
+				}
+			}
+			if err := resume(ctx, projectService); err != nil {
 				_ = r.MarkDegraded("resume incomplete project discovery: " + err.Error())
 				r.startupReadyErr = err
 				return
@@ -1130,6 +1132,12 @@ func (r *Runtime) CompleteStartup(ctx context.Context) error {
 		}
 	})
 
+	if r.startupReadyErr != nil {
+		// CompleteStartup owns every producer it starts. Roll back through the
+		// normal shutdown path so callers never receive an error while scheduler,
+		// cleanup, reload, webhook, or network resources remain live.
+		r.Stop("runtime startup failed: " + r.startupReadyErr.Error())
+	}
 	return r.startupReadyErr
 }
 

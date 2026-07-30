@@ -8,8 +8,10 @@ import (
 	"time"
 
 	"github.com/nexu-io/looper/internal/config"
+	networkclient "github.com/nexu-io/looper/internal/network/client"
 	"github.com/nexu-io/looper/internal/projects"
 	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/webhookforward"
 )
 
 func TestRuntimeResumesIncompleteDiscoveryOnlyAfterStartupReady(t *testing.T) {
@@ -58,6 +60,58 @@ func TestRuntimeFailedStartupDoesNotResumeIncompleteDiscovery(t *testing.T) {
 	case <-discoveryStarted:
 		t.Fatal("incomplete discovery resumed despite failed startup")
 	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func TestRuntimeDiscoveryResumeFailureStopsStartedResources(t *testing.T) {
+	t.Parallel()
+
+	rt, _ := startRuntimeWithPendingDiscovery(t, "rollback")
+	network := &startupRollbackNetworkManager{started: make(chan struct{}), stopped: make(chan struct{})}
+	forwarder := &startupRollbackWebhookForwarder{canceled: make(chan struct{}), closed: make(chan struct{})}
+	rt.mu.Lock()
+	previousNetwork := rt.networkManager
+	rt.networkManager = network
+	rt.webhookForwarder = forwarder
+	rt.mu.Unlock()
+	previousNetwork.Stop()
+
+	startupErr := errors.New("resume discovery failed")
+	var schedulerDone, cleanupDone <-chan struct{}
+	rt.resumeProjectDiscoveries = func(context.Context, *projects.Service) error {
+		rt.mu.RLock()
+		schedulerDone = rt.schedulerDone
+		cleanupDone = rt.worktreeCleanupDone
+		rt.mu.RUnlock()
+		return startupErr
+	}
+
+	if err := rt.CompleteStartup(context.Background()); !errors.Is(err, startupErr) {
+		t.Fatalf("CompleteStartup() error = %v, want %v", err, startupErr)
+	}
+	for name, done := range map[string]<-chan struct{}{
+		"network start":  network.started,
+		"network stop":   network.stopped,
+		"scheduler stop": schedulerDone,
+		"cleanup stop":   cleanupDone,
+		"webhook cancel": forwarder.canceled,
+		"webhook close":  forwarder.closed,
+		"runtime stop":   rt.shutdownCh,
+	} {
+		if done == nil {
+			t.Fatalf("%s channel = nil, want resource assembled before resume failure", name)
+		}
+		select {
+		case <-done:
+		default:
+			t.Fatalf("%s was not completed before CompleteStartup returned", name)
+		}
+	}
+	if services := rt.Services(); services != (Services{}) {
+		t.Fatalf("Services() = %#v, want released services after startup rollback", services)
+	}
+	if state := rt.AdmissionState(); state != AdmissionStopping {
+		t.Fatalf("AdmissionState() = %q, want stopping", state)
 	}
 }
 
@@ -191,3 +245,30 @@ func startRuntimeWithPendingDiscovery(t *testing.T, projectID string) (*Runtime,
 	}
 	return rt, services.Projects
 }
+
+type startupRollbackNetworkManager struct {
+	started chan struct{}
+	stopped chan struct{}
+}
+
+func (m *startupRollbackNetworkManager) Start(context.Context) error {
+	close(m.started)
+	return nil
+}
+func (m *startupRollbackNetworkManager) Stop() { close(m.stopped) }
+func (*startupRollbackNetworkManager) Status() networkclient.Status {
+	return networkclient.Status{}
+}
+func (*startupRollbackNetworkManager) UpdateConfig(config.Config) {}
+
+type startupRollbackWebhookForwarder struct {
+	canceled chan struct{}
+	closed   chan struct{}
+}
+
+func (*startupRollbackWebhookForwarder) Forward(context.Context, webhookforward.DeliveryRequest) (webhookforward.ForwardResult, error) {
+	return webhookforward.ForwardResult{}, nil
+}
+func (*startupRollbackWebhookForwarder) Stats() webhookforward.Stats { return webhookforward.Stats{} }
+func (f *startupRollbackWebhookForwarder) CancelExecute()            { close(f.canceled) }
+func (f *startupRollbackWebhookForwarder) Close()                    { close(f.closed) }

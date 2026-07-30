@@ -292,9 +292,15 @@ func TestRuntimeStartClosesCoordinatorWhenCompleteStartupFails(t *testing.T) {
 	cfg.Storage.BackupDir = &backupDir
 
 	startCtx, cancel := context.WithCancel(context.Background())
+	var openedCoordinator *storage.SQLiteCoordinator
 	rt := New(Options{
 		Config: cfg,
 		Logger: &testLogger{},
+		OpenSQLiteCoordinator: func(ctx context.Context, dbPath string, options storage.SQLiteCoordinatorOptions) (*storage.SQLiteCoordinator, error) {
+			coordinator, err := storage.OpenSQLiteCoordinator(ctx, dbPath, options)
+			openedCoordinator = coordinator
+			return coordinator, err
+		},
 		SyncConfiguredProjects: func(ctx context.Context, service *projects.Service, cfg config.Config, now time.Time) error {
 			cancel()
 			return nil
@@ -306,11 +312,13 @@ func TestRuntimeStartClosesCoordinatorWhenCompleteStartupFails(t *testing.T) {
 		t.Fatalf("Start() error = %v, want %v", err, context.Canceled)
 	}
 
-	services := rt.Services()
-	if services.Coordinator == nil {
-		t.Fatal("Services().Coordinator = nil, want closed coordinator for failed startup")
+	if services := rt.Services(); services != (Services{}) {
+		t.Fatalf("Services() = %#v, want released services after failed startup", services)
 	}
-	if err := services.Coordinator.DB().PingContext(context.Background()); err == nil {
+	if openedCoordinator == nil {
+		t.Fatal("opened coordinator = nil")
+	}
+	if err := openedCoordinator.DB().PingContext(context.Background()); err == nil {
 		t.Fatal("Services().Coordinator.DB().PingContext() error = nil, want closed database after startup failure")
 	}
 	if _, ok := rt.StartedAt(); !ok {
@@ -344,6 +352,59 @@ func TestRuntimeStartClosesCoordinatorWhenCompleteStartupFails(t *testing.T) {
 	}
 
 	rt.Stop("cleanup after failed startup")
+}
+
+func TestRuntimeStartStopBeforeResourcePublicationCleansLocalResources(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
+	cfg.Webhook.Enabled = true
+
+	syncEntered := make(chan struct{})
+	releaseSync := make(chan struct{})
+	var openedCoordinator *storage.SQLiteCoordinator
+	rt := New(Options{
+		Config: cfg,
+		Logger: &testLogger{},
+		OpenSQLiteCoordinator: func(ctx context.Context, dbPath string, options storage.SQLiteCoordinatorOptions) (*storage.SQLiteCoordinator, error) {
+			coordinator, err := storage.OpenSQLiteCoordinator(ctx, dbPath, options)
+			openedCoordinator = coordinator
+			return coordinator, err
+		},
+		SyncConfiguredProjects: func(context.Context, *projects.Service, config.Config, time.Time) error {
+			close(syncEntered)
+			<-releaseSync
+			return nil
+		},
+	})
+	startDone := make(chan error, 1)
+	go func() { startDone <- rt.Start(context.Background()) }()
+	<-syncEntered
+
+	rt.Stop("stop during startup")
+	close(releaseSync)
+	if err := <-startDone; err == nil || !strings.Contains(err.Error(), "runtime already stopped") {
+		t.Fatalf("Start() error = %v, want runtime already stopped", err)
+	}
+	if openedCoordinator == nil {
+		t.Fatal("opened coordinator = nil")
+	}
+	if err := openedCoordinator.DB().PingContext(context.Background()); err == nil {
+		t.Fatal("coordinator remained open after Stop raced pre-publication Start")
+	}
+
+	lock, err := acquireDaemonLock(webhookForwarderLockPath(cfg.Storage.DBPath), "replacement", time.Now())
+	if err != nil {
+		t.Fatalf("daemon lock remained held after Stop raced pre-publication Start: %v", err)
+	}
+	if err := lock.Release(); err != nil {
+		t.Fatalf("replacement daemon lock Release() error = %v", err)
+	}
 }
 
 func TestRuntimeCompleteStartupDoesNotStartSchedulerWhenNetworkManagerStartFails(t *testing.T) {
@@ -390,6 +451,10 @@ func TestRuntimeCompleteStartupDoesNotStartSchedulerWhenNetworkManagerStartFails
 		services:         Services{Coordinator: coordinator, Repositories: repositories},
 		networkManager:   networkclient.NewManager(statePath, cfg, repositories, nil),
 		startupReadyOnce: sync.Once{},
+		shutdownCh:       make(chan struct{}),
+		projectDiscovery: newProjectDiscoveryRunner(),
+		activeExecutions: NewActiveExecutionRegistry(),
+		admission:        NewAdmission(),
 	}
 
 	err = rt.CompleteStartup(context.Background())
