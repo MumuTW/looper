@@ -96,7 +96,7 @@ With the daemon up, register a local git repository root either:
 
 `looper project add` is the API call with the mistakes checked first. It asks the client machine's `git` for the repository root and refuses anything that is not one — a subdirectory, a broken or empty `.git`, a bare repository — and it refuses both a checkout that is already registered and a directory name that would derive an existing project's id (`/work/acme/api` after `/work/other/api`). The daemon normalizes and checks the derived id atomically, so concurrent adds cannot rebind the first project. Setting an explicit id, name, base branch, worktree root, or provider is available on the API and the dashboard, not on the CLI; an explicit id is the way past a derived-id collision.
 
-On a repository with many open pull requests the call can take minutes: the daemon records the project and then discovers its worktrees and pull requests. If it times out anyway, run `looper project list` before retrying — the project is recorded before discovery starts.
+Registration completes as soon as the project is validated, committed, and published. Worktree and pull request discovery then runs as post-commit work in the daemon — even on a repository with many open pull requests `looper project add` returns immediately, reporting discovery as pending. Discovery status is stored on the project record; if it fails, retry it with `looper project discover <id>` (or `POST /api/v1/projects/{id}/discover`) without re-registering the project.
 
 Do not use `looper project add` for Forgejo or Plane projects. Those need a provider binding the CLI cannot express, so they belong in `[[projects]]` in the config file. Registering one through the API first and adding it to the config afterwards makes `looperd` fail to start, because a configured project cannot take over an id an API-managed record already holds.
 
@@ -107,9 +107,12 @@ Projects registered through the API take effect immediately. Projects listed und
 In another shell, confirm the daemon answers:
 
 ```bash
-curl -sS "http://127.0.0.1:17310/api/v1/healthz"
+curl -sS "http://127.0.0.1:17310/api/v1/healthz"   # liveness (storage up)
+curl -sS "http://127.0.0.1:17310/api/v1/status"    # ops readiness (admission, review publish, quarantine debt)
 # or open the dashboard URL printed in the looperd logs / your browser on that host:port
 ```
+
+`healthz` only means the process and storage are up. Use `/status` (or `looper status`) when you care whether reviewer publishing is enabled and whether quarantined orphan runs are still outstanding.
 
 Then exercise a control verb against a known loop once one exists:
 
