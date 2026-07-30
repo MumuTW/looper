@@ -90,19 +90,154 @@ func newDaemonID() string {
 }
 
 func webhookForwarderLockPath(cfgStorageDBPath string) string {
+	return daemonLockPath(cfgStorageDBPath, "looperd.lock")
+}
+
+// databaseAttachLockPath returns the path of the database-lifetime attach lock
+// held by every daemon while it is attached to a SQLite database. Unlike the
+// webhook forwarder lock, this lock is acquired unconditionally on boot so that
+// only one daemon at a time can be attached to a given database. That prevents
+// two daemons that both implement this lock from racing the same schema: a
+// second daemon cannot acquire this lock (and therefore cannot boot or migrate)
+// until the first stops and releases it.
+//
+// Cross-version scope (this lock is new in this change): it coordinates only
+// daemons that both acquire it. A release predating this lock never opens it,
+// so acquiring it proves nothing about whether such a release is still
+// attached — the lock cannot prevent a pre-lock release from remaining active
+// while a newer daemon migrates. There is no database-lifetime lifecycle
+// signal that preceding releases already honor (they open SQLite in WAL mode,
+// which permits concurrent readers, and only take the webhook forwarder lock
+// when webhooks are enabled). The cross-version contract for a rollout from a
+// pre-lock release is therefore operational, not lock-enforced: stop the old
+// daemon completely before starting the new one (no overlap). ValidateCompatibility
+// remains the authority for the downgrade direction (old binary vs. newer
+// schema); this lock is the authority for new-daemon-vs-new-daemon attachment.
+//
+// The lock filename is derived from a canonical identity of the database path
+// (see attachLockFileName) so two independent daemons using different databases
+// in the same directory — e.g. /srv/a.sqlite and /srv/b.sqlite — get distinct
+// lock files instead of colliding on a single parent-directory lock.
+//
+// Trade-off analysis (AGENTS.md "New concepts require an explicit trade-off"):
+//
+//   - Concrete failure prevented: two daemons that both implement this lock and
+//     share one database can no longer run at the same time. Without it, a
+//     daemon that passes the point-in-time ValidateCompatibility check can have
+//     a concurrent daemon apply an additional migration while it remains active
+//     against the changing schema. The attach lock makes that new-vs-new
+//     interleaving impossible — the second daemon cannot attach (and so cannot
+//     migrate) until the first detaches.
+//
+//   - Costs / new failure modes:
+//
+//   - Concurrent daemons sharing one database can no longer run at the same
+//     time. Previously only webhook-enabled daemons were serialized (via the
+//     webhook lock); non-webhook daemons could overlap. SQLite is a
+//     single-writer database not designed for two daemons to manage the same
+//     schema concurrently, so this serializes an already-hazardous setup, but
+//     it is a behavior change for deployments that relied on it.
+//
+//   - Boot now fails if another daemon holds the attach lock. flock is
+//     kernel-managed and auto-released when the holder process exits, so a
+//     crashed daemon never leaves a stale lock; a rolling update must wait for
+//     the previous daemon to stop before the new one can start (no overlap).
+//
+//   - The lock cannot see pre-lock releases (see "Cross-version scope" above),
+//     so it does not by itself make a mixed-version rollout with a pre-lock
+//     binary safe. That is an inherent limit of introducing a new lock: only
+//     daemons that take it are coordinated. The cost is a documented boundary,
+//     not a silent overclaim.
+//
+//   - The looper CLI does not open the storage database, so this lock never
+//     blocks CLI commands run against a live daemon.
+//
+//   - Why simpler alternatives are insufficient:
+//
+//   - "Rely on ValidateCompatibility alone" is a point-in-time check; it
+//     cannot see a migration applied by a concurrent daemon after the check
+//     passes.
+//
+//   - "Make the existing webhook lock unconditional" conflates webhook
+//     forwarder ownership with database attachment and would change the
+//     semantics of an existing, named lock. A dedicated attach lock keeps the
+//     two concerns separate and the webhook lock's behavior intact.
+//
+// The authority for refusing a second attach is the running daemon's
+// database-lifetime hold on this lock, not agent output or schema inference.
+func databaseAttachLockPath(cfgStorageDBPath string) string {
+	return daemonLockPath(cfgStorageDBPath, attachLockFileName(cfgStorageDBPath))
+}
+
+// attachLockFileName derives the attach-lock filename from a canonical identity
+// of the database path so two independent daemons using different databases in
+// the same directory (e.g. /srv/a.sqlite and /srv/b.sqlite) get distinct lock
+// files. Keying only by the parent directory — as a fixed "looperd.attach.lock"
+// name would — collides both daemons into one lock and rejects the second even
+// though it cannot race the first daemon's schema. The identity is a short hash
+// of the absolute, slash-normalized database path; the lock file content still
+// records pid/daemon_id/started for operability.
+func attachLockFileName(cfgStorageDBPath string) string {
+	return "looperd.attach." + canonicalDatabaseIdentity(cfgStorageDBPath) + ".lock"
+}
+
+// resolvedDatabasePath returns the effective physical path of the configured
+// database. It is the single source of truth for both the attach lock's
+// directory and its identity hash: deriving those separately let the two
+// disagree about which database a lock guards, which defeats the lock in two
+// ways. A lexical identity hashes an alias (a symlinked file or parent
+// directory) differently from its real path, so two daemons on one physical
+// database take different locks and both migrate it. And an identity that
+// resolves an empty DBPath differently from the lock directory produces
+// different lock filenames in the same directory, with the same result.
+//
+// Resolution order: empty means the conventional ~/.looper/looper.sqlite, any
+// path is made absolute, then symlinks are resolved.
+func resolvedDatabasePath(cfgStorageDBPath string) string {
 	dbPath := strings.TrimSpace(cfgStorageDBPath)
-	if dbPath != "" {
-		if absPath, err := filepath.Abs(dbPath); err == nil {
-			dbPath = absPath
-		}
-	}
-	dir := filepath.Dir(dbPath)
-	if dir == "." || dir == "" {
+	if dbPath == "" {
+		dbPath = "looper.sqlite"
 		if home, err := os.UserHomeDir(); err == nil {
-			dir = filepath.Join(home, ".looper")
+			dbPath = filepath.Join(home, ".looper", "looper.sqlite")
 		}
 	}
-	return filepath.Join(dir, "looperd.lock")
+	if absPath, err := filepath.Abs(dbPath); err == nil {
+		dbPath = absPath
+	}
+	return resolvePathSymlinks(dbPath)
+}
+
+// resolvePathSymlinks resolves the deepest existing ancestor of path and
+// rejoins the components below it. filepath.EvalSymlinks fails outright when
+// the leaf does not exist, which is the normal case on a first boot — the
+// database file is created after the lock is taken — so resolving the existing
+// prefix is what makes aliased spellings collapse before the file exists.
+func resolvePathSymlinks(path string) string {
+	var trailing []string
+	current := path
+	for {
+		if resolved, err := filepath.EvalSymlinks(current); err == nil {
+			return filepath.Join(append([]string{resolved}, trailing...)...)
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return path
+		}
+		trailing = append([]string{filepath.Base(current)}, trailing...)
+		current = parent
+	}
+}
+
+// canonicalDatabaseIdentity returns a stable short identifier for the physical
+// database a config points at. Aliased spellings of one database resolve to the
+// same identity.
+func canonicalDatabaseIdentity(cfgStorageDBPath string) string {
+	sum := sha256.Sum256([]byte(filepath.ToSlash(resolvedDatabasePath(cfgStorageDBPath))))
+	return hex.EncodeToString(sum[:8])
+}
+
+func daemonLockPath(cfgStorageDBPath, name string) string {
+	return filepath.Join(filepath.Dir(resolvedDatabasePath(cfgStorageDBPath)), name)
 }
 
 type daemonLock struct {

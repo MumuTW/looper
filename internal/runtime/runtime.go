@@ -201,6 +201,7 @@ type Runtime struct {
 	githubGateway               *githubinfra.Gateway
 	webhook                     *webhookRuntime
 	webhookDaemonLock           *daemonLock
+	databaseAttachLock          *daemonLock
 	webhookForwarder            WebhookForwarder
 	networkManager              runtimeNetworkManager
 	schedulerDisabled           bool
@@ -427,7 +428,12 @@ func (r *Runtime) Stop(reason string) {
 		}
 
 		// #577: retain SQLite when containment drain failed. Never report
-		// graceful success with undrained ownership under a closed DB.
+		// graceful success with undrained ownership under a closed DB. The
+		// database attach lock is retained alongside storage: undrained handles
+		// still own the SQLite connection, so a new daemon must not attach and
+		// migrate until this process actually exits (flock auto-releases on
+		// exit). Releasing the lock here would re-open the mixed-version race
+		// the lock exists to prevent.
 		if drainErr != nil {
 			r.mu.Lock()
 			r.storageRetained = true
@@ -451,6 +457,12 @@ func (r *Runtime) Stop(reason string) {
 				r.logger.Warn("looperd runtime close failed", map[string]any{"error": err.Error()})
 			}
 		}
+
+		// Storage is now actually closed, so the database-lifetime attach lock
+		// can be released. This must follow coordinator.Close (and the
+		// stopped-event write above) so there is no window where a new daemon
+		// can attach while this process still owns the SQLite connection.
+		r.releaseDatabaseAttachLock()
 
 		close(r.shutdownCh)
 
@@ -812,6 +824,12 @@ func (r *Runtime) stopWebhookRuntime() {
 	if webhook != nil {
 		webhook.Stop()
 	}
+	// The webhook forwarder lock tracks forwarder ownership, which ends here.
+	// The database attach lock is NOT released here: it tracks SQLite storage
+	// lifetime and must stay held until storage is actually closed (or retained
+	// on the drain-failure path). Releasing it before coordinator.Close would
+	// let a new daemon attach and migrate while undrained old handles still own
+	// the retained SQLite connection. See releaseDatabaseAttachLock / Stop.
 	if lock != nil {
 		_ = lock.Release()
 		r.mu.Lock()
@@ -820,6 +838,27 @@ func (r *Runtime) stopWebhookRuntime() {
 		}
 		r.mu.Unlock()
 	}
+}
+
+// releaseDatabaseAttachLock releases the database-lifetime attach lock. It is
+// called from Stop only after storage has actually been closed on the normal
+// drain-success path, so the lock is never dropped while a SQLite connection is
+// still held. On the drain-failure (retain-storage) path Stop intentionally
+// does NOT call this, keeping the lock held alongside the retained storage so a
+// new daemon cannot attach and migrate against undrained ownership.
+func (r *Runtime) releaseDatabaseAttachLock() {
+	r.mu.RLock()
+	attachLock := r.databaseAttachLock
+	r.mu.RUnlock()
+	if attachLock == nil {
+		return
+	}
+	_ = attachLock.Release()
+	r.mu.Lock()
+	if r.databaseAttachLock == attachLock {
+		r.databaseAttachLock = nil
+	}
+	r.mu.Unlock()
 }
 
 func (r *Runtime) start(ctx context.Context) error {
@@ -837,10 +876,23 @@ func (r *Runtime) start(ctx context.Context) error {
 
 	var lock *daemonLock
 	var err error
+	attachLockPath := databaseAttachLockPath(r.config.Storage.DBPath)
+	attachLock, err := acquireDaemonLock(attachLockPath, r.webhook.daemonID, r.now())
+	if err != nil {
+		if r.logger != nil {
+			holder, _ := os.ReadFile(attachLockPath)
+			r.logger.Warn("database.attach.lock_failed", map[string]any{"path": attachLockPath, "existing_holder": strings.TrimSpace(string(holder)), "error": err.Error()})
+		}
+		return err
+	}
+	if r.logger != nil {
+		r.logger.Info("database.attach.lock_acquired", map[string]any{"path": attachLockPath})
+	}
 	if r.config.Webhook.Enabled {
 		lockPath := webhookForwarderLockPath(r.config.Storage.DBPath)
 		lock, err = acquireDaemonLock(lockPath, r.webhook.daemonID, r.now())
 		if err != nil {
+			_ = attachLock.Release()
 			if r.logger != nil {
 				holder, _ := os.ReadFile(lockPath)
 				r.logger.Warn("webhook.daemon.lock_failed", map[string]any{"path": lockPath, "existing_holder": strings.TrimSpace(string(holder)), "error": err.Error()})
@@ -857,6 +909,7 @@ func (r *Runtime) start(ctx context.Context) error {
 		Now:       r.now,
 	})
 	if err != nil {
+		_ = attachLock.Release()
 		if lock != nil {
 			_ = lock.Release()
 		}
@@ -868,6 +921,7 @@ func (r *Runtime) start(ctx context.Context) error {
 	defer func() {
 		if !started && !resourcesPublished {
 			r.stopProjectDiscovery()
+			_ = attachLock.Release()
 			if lock != nil {
 				_ = lock.Release()
 			}
@@ -1008,6 +1062,7 @@ func (r *Runtime) start(ctx context.Context) error {
 	r.githubGateway = githubGateway
 	r.networkManager = networkclient.NewManager(filepath.Join(runtimeHomeDirOrEmpty(), ".looper", "network.json"), r.config, repositories, githubGateway)
 	r.webhookDaemonLock = lock
+	r.databaseAttachLock = attachLock
 	r.schedulerDisabled = schedulerDisabled
 	r.mu.Unlock()
 	resourcesPublished = true

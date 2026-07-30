@@ -319,3 +319,128 @@ func TestActiveExecutionRegistryBeginShutdownReturnsDrainFailure(t *testing.T) {
 		t.Fatalf("BeginShutdown() = %v, want wrapped drain failure", err)
 	}
 }
+
+// Contract (PR #123 review): the database-lifetime attach lock must stay held
+// while storage is retained on the drain-failure path. Stop deliberately leaves
+// the coordinator open when containment drain fails; if the attach lock were
+// released before that, a new daemon could attach and migrate while undrained
+// old handles still own the retained SQLite connection. A second daemon booting
+// against the same database must therefore be rejected while the first retains
+// storage.
+func TestStopRetainsDatabaseAttachLockWhenStorageRetained(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	dbPath := filepath.Join(workingDir, "runtime.sqlite")
+	cfg.Storage.DBPath = dbPath
+	backupDir := filepath.Join(workingDir, "backups")
+	cfg.Storage.BackupDir = &backupDir
+
+	noopSchedulerTick := func(context.Context, Services) error { return nil }
+	daemonA := New(Options{Config: cfg, Logger: &testLogger{}, RunSchedulerTick: noopSchedulerTick})
+	if err := daemonA.Start(context.Background()); err != nil {
+		t.Fatalf("daemonA.Start() error = %v", err)
+	}
+	// Stop is guarded by shutdownOnce, so this is safe alongside the explicit
+	// Stop below and covers every t.Fatalf between here and it. The retained
+	// coordinator is closed after the assertions have run — the retention
+	// itself is what the test asserts, so it cannot be released earlier.
+	t.Cleanup(func() {
+		daemonA.Stop("test cleanup")
+		if coordinator := daemonA.Services().Coordinator; coordinator != nil {
+			_ = coordinator.Close()
+		}
+	})
+
+	// Force a containment drain failure so Stop retains storage.
+	lease, err := daemonA.activeExecutions.AdmitSpawn(context.Background(), agent.SpawnMeta{
+		LoopID: "loop-retain-lock", RunID: "run-retain-lock", ExecutionID: "exec-retain-lock",
+	})
+	if err != nil {
+		t.Fatalf("AdmitSpawn: %v", err)
+	}
+	cmd := exec.Command("sleep", "60")
+	processcontainment.Configure(cmd)
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("cmd.Start: %v", err)
+	}
+	// Registered immediately: a failure in Bind or BindHandle below would
+	// otherwise leave this child running for the lifetime of the test binary.
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+	})
+	handle, err := processcontainment.Bind(cmd, processcontainment.Options{
+		GracePeriod:  20 * time.Millisecond,
+		DrainTimeout: 2 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	forceDrainFail := errors.New("forced soft-kill failure for attach-lock retain contract")
+	if err := lease.BindHandle(handle, func(string) error { return forceDrainFail }); err != nil {
+		t.Fatalf("BindHandle: %v", err)
+	}
+
+	daemonA.Stop("test drain fail")
+	if !daemonA.StorageRetained() {
+		t.Fatal("StorageRetained() = false, want true after drain failure")
+	}
+	if services := daemonA.Services(); services.Coordinator == nil {
+		t.Fatal("Services().Coordinator = nil after drain-failure Stop, want retained storage")
+	}
+
+	// A second daemon against the same database must NOT be able to boot while A
+	// retains storage and the attach lock alongside it.
+	daemonB := New(Options{Config: cfg, Logger: &testLogger{}, RunSchedulerTick: noopSchedulerTick})
+	bErr := daemonB.Start(context.Background())
+	if bErr == nil {
+		daemonB.Stop("test cleanup")
+		t.Fatal("daemonB.Start() while daemonA retains storage = nil, want attach-lock error")
+	}
+	if !strings.Contains(bErr.Error(), "looperd.attach.") || !strings.Contains(bErr.Error(), ".lock") {
+		t.Fatalf("daemonB.Start() error = %q, want it to reference the retained attach lock", bErr)
+	}
+}
+
+// Contract (PR #123 review): on a normal (drain-success) shutdown the attach
+// lock is released only after storage is actually closed, so a new daemon can
+// boot against the same database once the previous one has stopped cleanly.
+func TestStopReleasesDatabaseAttachLockAfterStorageClosed(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	dbPath := filepath.Join(workingDir, "runtime.sqlite")
+	cfg.Storage.DBPath = dbPath
+	backupDir := filepath.Join(workingDir, "backups")
+	cfg.Storage.BackupDir = &backupDir
+
+	noopSchedulerTick := func(context.Context, Services) error { return nil }
+	daemonA := New(Options{Config: cfg, Logger: &testLogger{}, RunSchedulerTick: noopSchedulerTick})
+	if err := daemonA.Start(context.Background()); err != nil {
+		t.Fatalf("daemonA.Start() error = %v", err)
+	}
+
+	daemonA.Stop("clean shutdown")
+	if daemonA.StorageRetained() {
+		t.Fatal("StorageRetained() = true after clean Stop, want false")
+	}
+	if services := daemonA.Services(); services.Coordinator != nil {
+		t.Fatal("Services().Coordinator still set after clean Stop, want closed")
+	}
+
+	// A second daemon must boot against the now-released lock and closed storage.
+	daemonB := New(Options{Config: cfg, Logger: &testLogger{}, RunSchedulerTick: noopSchedulerTick})
+	if err := daemonB.Start(context.Background()); err != nil {
+		t.Fatalf("daemonB.Start() after clean daemonA.Stop() = %v, want boot to succeed once the attach lock was released", err)
+	}
+	t.Cleanup(func() { daemonB.Stop("test cleanup") })
+}
