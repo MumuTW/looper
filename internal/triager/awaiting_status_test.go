@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/nexu-io/looper/internal/planner"
+	"github.com/nexu-io/looper/internal/projects"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -73,6 +74,36 @@ func TestAwaitingConfirmationStatusProjectsOnlyUnresolvedReports(t *testing.T) {
 	}
 	if source.CreatedAt != pending.CreatedAt || source.AgeSeconds != int64((3*time.Hour).Seconds()) {
 		t.Fatalf("source = %#v, want createdAt=%q ageSeconds=%d", source, pending.CreatedAt, int64((3 * time.Hour).Seconds()))
+	}
+}
+
+// RemoveProject archives its record but retains lifecycle events. The status
+// projection must therefore omit an unresolved report as soon as the project
+// is removed, without adding a separate triage retirement event.
+func TestAwaitingConfirmationStatusExcludesRemovedProject(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	ctx := context.Background()
+	report := statusAwaitingReport("removed", 47, fixture.now.Add(-time.Hour))
+	if err := fixture.runner().persistReport(ctx, report); err != nil {
+		t.Fatalf("persist report: %v", err)
+	}
+
+	service := &projects.Service{
+		DB:    fixture.coordinator.DB(),
+		Repos: fixture.repos,
+		Now:   func() time.Time { return fixture.now },
+	}
+	if _, err := service.RemoveProject(ctx, report.ProjectID); err != nil {
+		t.Fatalf("RemoveProject() error = %v", err)
+	}
+
+	summary, err := AwaitingConfirmationStatus(ctx, fixture.repos, fixture.now)
+	if err != nil {
+		t.Fatalf("AwaitingConfirmationStatus() error = %v", err)
+	}
+	if summary.Count != 0 || len(summary.Sources) != 0 {
+		t.Fatalf("summary = %#v, want no sources after project removal", summary)
 	}
 }
 
