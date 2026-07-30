@@ -11,8 +11,9 @@
 //	  | go run ./tools/review-audit -large 300
 //
 // Authority: every verdict derives from GitHub's own records — submitted
-// review objects (PENDING drafts do not count) bound to the reviewed
-// commit, and the refusal notice posted by the trusted reviewer account.
+// review objects (PENDING drafts and DISMISSED reviews do not count) bound
+// to the reviewed commit; missing commit provenance does not count, and the
+// refusal notice posted by the trusted reviewer account.
 // The tool never infers review quality from discussion content; it only
 // distinguishes recorded scrutiny from recorded refusal from silence.
 //

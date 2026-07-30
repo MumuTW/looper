@@ -45,8 +45,8 @@ type Author struct {
 type Verdict string
 
 const (
-	// VerdictReviewed: at least one submitted review exists for the merged
-	// head (or head binding is unavailable in the input; see Classify).
+	// VerdictReviewed: at least one submitted review with commit provenance
+	// exists for the merged head.
 	VerdictReviewed Verdict = "reviewed"
 	// VerdictStaleReviewed: reviews were submitted, but none for the head
 	// that merged — later commits landed unreviewed.
@@ -60,12 +60,12 @@ const (
 )
 
 // submittedReviewStates are the review states that represent scrutiny that
-// actually happened. PENDING drafts were never submitted and do not count.
+// actually happened. PENDING drafts were never submitted, and DISMISSED
+// reviews were explicitly invalidated, so neither counts.
 var submittedReviewStates = map[string]bool{
 	"APPROVED":          true,
 	"CHANGES_REQUESTED": true,
 	"COMMENTED":         true,
-	"DISMISSED":         true,
 }
 
 // refusalMarkers identify reviewer refusals posted as ordinary comments.
@@ -94,11 +94,10 @@ func (f Finding) ChangedLines() int64 {
 	return f.PR.Additions + f.PR.Deletions
 }
 
-// Classify audits one merged PR. When the input carries head and review
-// commit OIDs, a review counts for the merged head only if it reviewed
-// that exact commit; inputs without those fields degrade to counting any
-// submitted review, which the report cannot distinguish — request
-// headRefOid and reviews in the gh query to keep head binding active.
+// Classify audits one merged PR. A review counts only when GitHub recorded
+// both the merged head OID and the review's commit OID and they match. Missing
+// provenance cannot demonstrate coverage, so it never degrades to reviewed;
+// request headRefOid and reviews in the gh query to keep the audit sound.
 func Classify(pr PullRequest) Finding {
 	headReviewers := map[string]bool{}
 	staleReviewers := map[string]bool{}
@@ -110,9 +109,9 @@ func Classify(pr PullRequest) Finding {
 		if login == "" {
 			login = "(unknown)"
 		}
-		if pr.HeadRefOID == "" || review.Commit.OID == "" || review.Commit.OID == pr.HeadRefOID {
+		if pr.HeadRefOID != "" && review.Commit.OID != "" && review.Commit.OID == pr.HeadRefOID {
 			headReviewers[login] = true
-		} else {
+		} else if pr.HeadRefOID != "" && review.Commit.OID != "" {
 			staleReviewers[login] = true
 		}
 	}
@@ -145,9 +144,9 @@ func sortedNames(set map[string]bool) []string {
 }
 
 // Audit classifies every PR and renders the report. largeThreshold flags
-// unreviewed or refused merges at or above that many changed lines; 0
-// disables the flag. It returns the report text and whether any
-// unreviewed-or-refused merge met the threshold.
+// every merge without a verified head review at or above that many changed
+// lines; 0 disables the flag. It returns the report text and whether any
+// merge met the threshold.
 func Audit(input []byte, largeThreshold int64) (string, bool, error) {
 	if largeThreshold < 0 {
 		return "", false, fmt.Errorf("-large must be >= 0, got %d: a negative threshold would silently disable the gate", largeThreshold)

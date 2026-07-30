@@ -7,8 +7,12 @@ import (
 
 func TestClassify(t *testing.T) {
 	reviewed := Classify(PullRequest{
-		Number:  1,
-		Reviews: []Review{{Author: Author{Login: "codex"}, State: "COMMENTED"}, {Author: Author{Login: "codex"}, State: "APPROVED"}},
+		Number:     1,
+		HeadRefOID: "head1",
+		Reviews: []Review{
+			{Author: Author{Login: "codex"}, State: "COMMENTED", Commit: Commit{OID: "head1"}},
+			{Author: Author{Login: "codex"}, State: "APPROVED", Commit: Commit{OID: "head1"}},
+		},
 	})
 	if reviewed.Verdict != VerdictReviewed || len(reviewed.Reviewers) != 1 || reviewed.Reviewers[0] != "codex" {
 		t.Fatalf("Classify(reviewed) = %+v, want reviewed by codex deduplicated", reviewed)
@@ -23,10 +27,40 @@ func TestClassify(t *testing.T) {
 		t.Fatalf("Classify(pending-only) = %+v, want unreviewed", pending)
 	}
 
+	// A dismissed review was explicitly invalidated and cannot prove scrutiny.
+	dismissed := Classify(PullRequest{
+		Number:     3,
+		HeadRefOID: "head1",
+		Reviews:    []Review{{Author: Author{Login: "codex"}, State: "DISMISSED", Commit: Commit{OID: "head1"}}},
+	})
+	if dismissed.Verdict != VerdictUnreviewed {
+		t.Fatalf("Classify(dismissed-only) = %+v, want unreviewed", dismissed)
+	}
+
+	// A submitted review without its commit provenance cannot be bound to the
+	// merged head and must fail closed.
+	missingCommit := Classify(PullRequest{
+		Number:     4,
+		HeadRefOID: "head1",
+		Reviews:    []Review{{Author: Author{Login: "codex"}, State: "APPROVED"}},
+	})
+	if missingCommit.Verdict != VerdictUnreviewed {
+		t.Fatalf("Classify(missing review commit) = %+v, want unreviewed", missingCommit)
+	}
+
+	// The same is true if the input lacks the merged head provenance.
+	missingHead := Classify(PullRequest{
+		Number:  5,
+		Reviews: []Review{{Author: Author{Login: "codex"}, State: "APPROVED", Commit: Commit{OID: "head1"}}},
+	})
+	if missingHead.Verdict != VerdictUnreviewed {
+		t.Fatalf("Classify(missing merged head) = %+v, want unreviewed", missingHead)
+	}
+
 	// Head binding: a review of an earlier commit does not cover the head
 	// that merged.
 	stale := Classify(PullRequest{
-		Number:     3,
+		Number:     6,
 		HeadRefOID: "head2",
 		Reviews:    []Review{{Author: Author{Login: "codex"}, State: "APPROVED", Commit: Commit{OID: "head1"}}},
 	})
@@ -34,7 +68,7 @@ func TestClassify(t *testing.T) {
 		t.Fatalf("Classify(stale) = %+v, want stale-reviewed", stale)
 	}
 	current := Classify(PullRequest{
-		Number:     4,
+		Number:     7,
 		HeadRefOID: "head2",
 		Reviews: []Review{
 			{Author: Author{Login: "codex"}, State: "APPROVED", Commit: Commit{OID: "head1"}},
@@ -46,7 +80,7 @@ func TestClassify(t *testing.T) {
 	}
 
 	refused := Classify(PullRequest{
-		Number:   5,
+		Number:   8,
 		Comments: []Comment{{Author: Author{Login: "coderabbitai"}, Body: "> ## Review limit reached\n> wait 30 minutes"}},
 	})
 	if refused.Verdict != VerdictRefused {
@@ -55,7 +89,7 @@ func TestClassify(t *testing.T) {
 
 	// A participant quoting the phrase is not the reviewer refusing.
 	quoted := Classify(PullRequest{
-		Number:   6,
+		Number:   9,
 		Comments: []Comment{{Author: Author{Login: "somedev"}, Body: "we keep hitting 'Review limit reached' lately"}},
 	})
 	if quoted.Verdict != VerdictUnreviewed {
@@ -64,15 +98,16 @@ func TestClassify(t *testing.T) {
 
 	// A refusal notice does not downgrade a PR that also got a real review.
 	both := Classify(PullRequest{
-		Number:   7,
-		Reviews:  []Review{{Author: Author{Login: "codex"}, State: "APPROVED"}},
-		Comments: []Comment{{Author: Author{Login: "coderabbitai"}, Body: "Review limit reached"}},
+		Number:     10,
+		HeadRefOID: "head1",
+		Reviews:    []Review{{Author: Author{Login: "codex"}, State: "APPROVED", Commit: Commit{OID: "head1"}}},
+		Comments:   []Comment{{Author: Author{Login: "coderabbitai"}, Body: "Review limit reached"}},
 	})
 	if both.Verdict != VerdictReviewed {
 		t.Fatalf("Classify(review+refusal) = %+v, want reviewed", both)
 	}
 
-	bare := Classify(PullRequest{Number: 8, Comments: []Comment{{Author: Author{Login: "somedev"}, Body: "ordinary discussion"}}})
+	bare := Classify(PullRequest{Number: 11, Comments: []Comment{{Author: Author{Login: "somedev"}, Body: "ordinary discussion"}}})
 	if bare.Verdict != VerdictUnreviewed {
 		t.Fatalf("Classify(bare) = %+v, want unreviewed", bare)
 	}
@@ -81,13 +116,17 @@ func TestClassify(t *testing.T) {
 func TestAuditReportAndThreshold(t *testing.T) {
 	input := []byte(`[
 		{"number": 10, "title": "reviewed change", "additions": 500, "deletions": 100,
-		 "reviews": [{"author": {"login": "codex"}, "state": "APPROVED"}]},
+		 "headRefOid": "h1", "reviews": [{"author": {"login": "codex"}, "state": "APPROVED", "commit": {"oid": "h1"}}]},
 		{"number": 11, "title": "big silent change", "additions": 900, "deletions": 141,
 		 "comments": [{"author": {"login": "coderabbitai"}, "body": "Review limit reached"}]},
 		{"number": 12, "title": "small silent change", "additions": 3, "deletions": 1},
 		{"number": 13, "title": "big stale-reviewed rewrite", "additions": 800, "deletions": 10,
 		 "headRefOid": "h2",
-		 "reviews": [{"author": {"login": "codex"}, "state": "APPROVED", "commit": {"oid": "h1"}}]}
+		 "reviews": [{"author": {"login": "codex"}, "state": "APPROVED", "commit": {"oid": "h1"}}]},
+		{"number": 14, "title": "big review without provenance", "additions": 700, "deletions": 1,
+		 "headRefOid": "h1", "reviews": [{"author": {"login": "codex"}, "state": "APPROVED"}]},
+		{"number": 15, "title": "big dismissed review", "additions": 650, "deletions": 1,
+		 "headRefOid": "h1", "reviews": [{"author": {"login": "codex"}, "state": "DISMISSED", "commit": {"oid": "h1"}}]}
 	]`)
 
 	report, flagged, err := Audit(input, 300)
@@ -102,7 +141,9 @@ func TestAuditReportAndThreshold(t *testing.T) {
 		"#11\trate-limit-refused\t+900/-141\tLARGE-UNREVIEWED\tbig silent change",
 		"#12\tunreviewed\t+3/-1\tsmall silent change",
 		"#13\tstale-reviewed\t+800/-10\t[codex]\tLARGE-UNREVIEWED\tbig stale-reviewed rewrite",
-		"total=4 reviewed=1 stale-reviewed=1 rate-limit-refused=1 unreviewed=1",
+		"#14\tunreviewed\t+700/-1\tLARGE-UNREVIEWED\tbig review without provenance",
+		"#15\tunreviewed\t+650/-1\tLARGE-UNREVIEWED\tbig dismissed review",
+		"total=6 reviewed=1 stale-reviewed=1 rate-limit-refused=1 unreviewed=3",
 	} {
 		if !strings.Contains(report, want) {
 			t.Fatalf("report missing %q:\n%s", want, report)
