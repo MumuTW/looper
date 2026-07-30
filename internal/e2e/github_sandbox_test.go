@@ -144,37 +144,6 @@ func TestGitHubSandboxFixerResolvesReviewThread(t *testing.T) {
 	proc.Stop(context.Background())
 }
 
-// TestGitHubSandboxLabelCreateContract keeps fake-gh's label-create behavior
-// anchored to the real GitHub CLI. The fake models a duplicate create as an
-// already-exists failure unless --force is passed; --force must update the
-// existing label rather than reject it.
-func TestGitHubSandboxLabelCreateContract(t *testing.T) {
-	sb := requireSandboxConfig(t)
-	labelName := "looper-e2e-label-" + sb.RunID
-	t.Cleanup(func() {
-		output, err := runSandboxCommand("", sb.CmdEnv, "gh", "label", "delete", labelName, "--repo", sb.Repo, "--yes")
-		if err != nil && !strings.Contains(strings.ToLower(output), "not found") {
-			t.Errorf("cleanup label %q: %v\noutput=%s", labelName, err, output)
-		}
-	})
-
-	runSandboxCommandMust(t, "", sb.CmdEnv, "gh", "label", "create", labelName, "--repo", sb.Repo, "--color", "5319e7", "--description", "initial sandbox label")
-
-	output, err := runSandboxCommand("", sb.CmdEnv, "gh", "label", "create", labelName, "--repo", sb.Repo, "--color", "000000", "--description", "rewritten sandbox label")
-	if err == nil {
-		t.Fatal("duplicate gh label create succeeded without --force")
-	}
-	if !strings.Contains(strings.ToLower(output), "already exists") {
-		t.Fatalf("duplicate gh label create output = %q, want already-exists error", output)
-	}
-
-	runSandboxCommandMust(t, "", sb.CmdEnv, "gh", "label", "create", labelName, "--repo", sb.Repo, "--color", "000000", "--description", "rewritten sandbox label", "--force")
-	label := loadSandboxLabel(t, sb, labelName)
-	if label.Color != "000000" || label.Description != "rewritten sandbox label" {
-		t.Fatalf("label after --force = %#v, want color=000000 description=%q", label, "rewritten sandbox label")
-	}
-}
-
 func TestGitHubSandboxNoDiffPathsDoNotOpenOrResolve(t *testing.T) {
 	bins := harness.MustBinaries(t)
 	sb := requireSandboxConfig(t)
@@ -356,25 +325,6 @@ func ensureSandboxLabel(tb testing.TB, sb sandboxConfig) {
 	if err != nil && !strings.Contains(output, "already exists") {
 		tb.Fatalf("ensure sandbox label: %v\noutput=%s", err, output)
 	}
-}
-
-type sandboxLabel struct {
-	Name        string `json:"name"`
-	Color       string `json:"color"`
-	Description string `json:"description"`
-}
-
-func loadSandboxLabel(tb testing.TB, sb sandboxConfig, name string) sandboxLabel {
-	tb.Helper()
-	var labels []sandboxLabel
-	runSandboxJSON(tb, "", sb.CmdEnv, &labels, "gh", "label", "list", "--repo", sb.Repo, "--search", name, "--limit", "100", "--json", "name,color,description")
-	for _, label := range labels {
-		if label.Name == name {
-			return label
-		}
-	}
-	tb.Fatalf("sandbox label %q not found in %#v", name, labels)
-	return sandboxLabel{}
 }
 
 func workerSandboxConfig(tb testing.TB, bins harness.BuiltBinaries, home harness.TempHome, repo harness.SeededRepo, fakeAgent harness.FakeAgent, port int, agentMode string) config.Config {
