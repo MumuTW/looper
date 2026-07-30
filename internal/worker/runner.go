@@ -1230,11 +1230,24 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		}
 		return ProcessResult{}, err
 	}
-	if _, err := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
-		updated.Status = "completed"
+	unlockRequeue := loops.LockLoopRequeue(loop.ID)
+	_, err = r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
+		// A free-text message that arrived during this turn was preserved by
+		// acknowledgement, but nothing else will deliver it: the enqueue path
+		// saw the loop running and deliberately did not wake it. Requeue
+		// instead of completing so the next turn drains the survivors.
+		if len(loops.ReadHumanInbox(updated.MetadataJSON)) > 0 {
+			updated.Status = "queued"
+			nextRunAt := r.nowISO()
+			updated.NextRunAt = &nextRunAt
+		} else {
+			updated.Status = "completed"
+			updated.NextRunAt = nil
+		}
 		updated.LastRunAt = stringPtr(r.nowISO())
-		updated.NextRunAt = nil
-	}); err != nil {
+	})
+	unlockRequeue()
+	if err != nil {
 		return ProcessResult{}, err
 	}
 	finalIssueClaimStatus := issueClaimStatusSuccess
@@ -1348,11 +1361,23 @@ func (r *Runner) stopObsoleteResumedIssueRun(ctx context.Context, project storag
 			}
 			return ProcessResult{}, true, err
 		}
-		if _, err := r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
-			updated.Status = "completed"
+		unlockRequeue := loops.LockLoopRequeue(loop.ID)
+		_, err = r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
+			// Same survivor rule as the main completion transition: preserved
+			// but undelivered inbox messages requeue the loop instead of
+			// completing it.
+			if len(loops.ReadHumanInbox(updated.MetadataJSON)) > 0 {
+				updated.Status = "queued"
+				nextRunAt := r.nowISO()
+				updated.NextRunAt = &nextRunAt
+			} else {
+				updated.Status = "completed"
+				updated.NextRunAt = nil
+			}
 			updated.LastRunAt = stringPtr(r.nowISO())
-			updated.NextRunAt = nil
-		}); err != nil {
+		})
+		unlockRequeue()
+		if err != nil {
 			return ProcessResult{}, true, err
 		}
 		r.syncIssueClaim(ctx, stepInput{Project: project, Loop: loop, Run: completedRun, QueueItem: queueItem}, checkpoint, issueClaimStatusPaused, summary)

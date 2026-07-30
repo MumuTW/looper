@@ -220,6 +220,11 @@ func (r *Runner) acknowledgeHumanInbox(ctx context.Context, loop *storage.LoopRe
 	if r.repos == nil || r.repos.Loops == nil || len(consumed) == 0 {
 		return
 	}
+	// The enqueue path appends under the process-wide per-loop requeue mutex;
+	// holding it across this read-modify-write means a message persisted
+	// between our fresh read and upsert cannot be overwritten.
+	unlock := loops.LockLoopRequeue(loop.ID)
+	defer unlock()
 	fresh, err := r.repos.Loops.GetByID(ctx, loop.ID)
 	if err != nil || fresh == nil {
 		return
@@ -414,7 +419,11 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 		}
 	}
 	var askWriteErr error
-	if _, err := r.updateLoop(ctx, input.Loop, func(updated *storage.LoopRecord) {
+	// Hold the per-loop requeue mutex across the suspension's read-modify-write
+	// for the same reason as post-turn acknowledgement: a message appended
+	// concurrently by the enqueue path must not be overwritten by this upsert.
+	unlockRequeue := loops.LockLoopRequeue(input.Loop.ID)
+	_, updateErr := r.updateLoop(ctx, input.Loop, func(updated *storage.LoopRecord) {
 		meta, werr := loops.WriteHITLAsk(updated.MetadataJSON, ask)
 		if werr != nil {
 			// Without a stored ask the response paths can never resume this
@@ -432,8 +441,10 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 		updated.Status = "awaiting_human"
 		updated.LastRunAt = stringPtr(nowISO)
 		updated.NextRunAt = nil
-	}); err != nil {
-		return ProcessResult{}, err
+	})
+	unlockRequeue()
+	if updateErr != nil {
+		return ProcessResult{}, updateErr
 	}
 	if askWriteErr != nil {
 		return r.abortSuspension(ctx, run, checkpoint, askWriteErr)
