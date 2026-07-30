@@ -115,6 +115,12 @@ describe("HumanDecisionCard", () => {
     expect(fetchLoopEvents).not.toHaveBeenCalled();
   });
 
+  it("hides unusable response controls after human takeover", () => {
+    const { view } = renderCard({ loopStatus: "human_takeover" });
+    expect(view.container.textContent).toBe("");
+    expect(fetchLoopEvents).not.toHaveBeenCalled();
+  });
+
   it("renders nothing when metadata is absent or malformed", () => {
     const { view } = renderCard({ metadataJson: "{not json" });
     expect(view.container.textContent).toBe("");

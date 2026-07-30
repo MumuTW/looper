@@ -200,7 +200,7 @@ export function HumanDecisionCard({
 }: HumanDecisionCardProps) {
   const toast = useToast();
   const ask = useMemo(() => parseHITLAsk(metadataJson), [metadataJson]);
-  const awaiting = isAwaitingHuman(ask);
+  const awaiting = isAwaitingHuman(ask, loopStatus);
   const stalled = isResumeStalled(ask, loopStatus);
 
   const [detail, setDetail] = useState<DetailState>({ status: "loading" });
@@ -231,7 +231,9 @@ export function HumanDecisionCard({
     })();
 
     return () => controller.abort();
-  }, [awaiting, loopId]);
+  // askedAt identifies an ask even if the loop is re-escalated before polling
+  // observes the intervening running state.
+  }, [awaiting, loopId, ask?.askedAt]);
 
   const respond = useCallback(
     async (answer: string, marker: Pending, delivered: string) => {

@@ -46,13 +46,15 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 
 	question := record.DecisionRequested
 	ask := loops.HITLAsk{
-		Question:       question,
-		Options:        cloneStrings(record.Options),
-		Status:         "awaiting",
-		AskedAt:        nowISO,
-		Recommendation: record.Assessment.Rationale,
-		Consequences:   escalationConsequences(),
-		Transport:      "respond",
+		Question: question,
+		Options:  cloneStrings(record.Options),
+		Status:   "awaiting",
+		AskedAt:  nowISO,
+		// The assessor reports observations. The configured policy, not the
+		// assessor, decided that a human is needed, so do not present its
+		// rationale as an agent recommendation in the dashboard.
+		Consequences: escalationConsequences(),
+		Transport:    "respond",
 	}
 
 	// The planner.escalation record is the authority for this suspension: it is

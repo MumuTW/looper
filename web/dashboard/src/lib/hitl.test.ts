@@ -103,6 +103,12 @@ describe("parseHITLAsk", () => {
     );
     expect(isAwaitingHuman(null)).toBe(false);
   });
+
+  it("does not expose an awaiting ask after the loop enters takeover", () => {
+    const ask = parseHITLAsk(metadata({ status: "awaiting" }));
+    expect(isAwaitingHuman(ask, "human_takeover")).toBe(false);
+    expect(isAwaitingHuman(ask, "awaiting_human")).toBe(true);
+  });
 });
 
 describe("isResumeStalled", () => {

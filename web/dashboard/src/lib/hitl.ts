@@ -116,8 +116,17 @@ export function parseHITLAsk(
 const AWAITING_HUMAN_LOOP_STATUS = "awaiting_human";
 
 /** True only while the loop is blocked on this ask. */
-export function isAwaitingHuman(ask: HITLAsk | null): boolean {
-  return ask?.status === "awaiting";
+export function isAwaitingHuman(
+  ask: HITLAsk | null,
+  loopStatus?: string | null,
+): boolean {
+  // An ask can outlive the state that made it answerable: for example, the
+  // operator may take the loop over. Never render a /respond control unless
+  // the loop is still parked at the state the endpoint accepts.
+  return (
+    ask?.status === "awaiting" &&
+    (!loopStatus || asString(loopStatus).toLowerCase() === AWAITING_HUMAN_LOOP_STATUS)
+  );
 }
 
 /**
