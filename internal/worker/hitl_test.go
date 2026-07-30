@@ -590,6 +590,16 @@ func TestSuspendForHumanAbortsOnMalformedMetadataInsteadOfStranding(t *testing.T
 	if q.Status != "running" {
 		t.Fatalf("queue item status = %q, want running (not cancelled)", q.Status)
 	}
+
+	// The run must be closed as failed so the retried claim resumes it instead
+	// of starting a duplicate while this one stays active forever.
+	gotRun, err := fixture.repos.Runs.GetByID(ctx, "run_worker_1")
+	if err != nil || gotRun == nil {
+		t.Fatalf("Runs.GetByID error = %v", err)
+	}
+	if gotRun.Status != "failed" {
+		t.Fatalf("run status = %q, want failed after aborted suspension", gotRun.Status)
+	}
 }
 
 func TestMergeLoopMetadataJSONRejectsMalformedCurrentValue(t *testing.T) {

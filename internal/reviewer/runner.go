@@ -5839,7 +5839,12 @@ func parseJSONObject(value *string) map[string]any {
 }
 
 func mergeLoopMetadataJSON(current *string, updates map[string]any) (string, error) {
-	parsed := parseJSONObject(current)
+	// Loop metadata mutations share the strict decoder: a malformed stored
+	// value blocks the merge instead of being replaced with only the updates.
+	parsed, err := loops.DecodeMetadataObjectForWrite(current)
+	if err != nil {
+		return "", err
+	}
 	for key, value := range updates {
 		parsed[key] = value
 	}
