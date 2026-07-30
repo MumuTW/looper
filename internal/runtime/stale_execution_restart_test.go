@@ -173,8 +173,12 @@ func TestRuntimeStartupPreFencingSettlementLeavesHumanAndDomainParks(t *testing.
 		"needs confirmation: startup liveness evidence is not authoritative (pid_absent)")
 	takeover, _ := repos.Loops.GetByID(context.Background(), takeoverLoop)
 	takeover.Status = "human_takeover"
-	if err := repos.Loops.Upsert(context.Background(), *takeover); err != nil {
-		t.Fatalf("Loops.Upsert(human_takeover) error = %v", err)
+	// Establishing the hold is a lifecycle operation, so it needs the authority
+	// entry point (#273). Plain Upsert is fenced — which is the second guarantee
+	// under the one this test asserts: even if the settlement's predicate were
+	// wrong, the repository would refuse the write.
+	if err := repos.Loops.UpsertChangingHumanHold(context.Background(), *takeover); err != nil {
+		t.Fatalf("Loops.UpsertChangingHumanHold(human_takeover) error = %v", err)
 	}
 
 	domainLoop, domainRun, domainQueue := seedStaleExecutionLeaseRun(t, repos, now, "domain_hold")
