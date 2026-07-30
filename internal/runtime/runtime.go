@@ -1636,7 +1636,10 @@ func (r *Runtime) executeSchedulerTick(ctx context.Context) {
 	services := r.services
 	tick := r.runSchedulerTick
 	r.mu.RUnlock()
-	if services.Repositories == nil {
+	// The repositories guard protects the default tick, which cannot claim
+	// without storage. An injected tick declares its own dependencies and
+	// runs even before deferred recovery has populated services.
+	if services.Repositories == nil && !r.customSchedulerTick {
 		return
 	}
 	if tick == nil {
