@@ -215,17 +215,23 @@ func TestWebhookRuntimeForwarderOverlaysCredentialEnv(t *testing.T) {
 	t.Setenv("PATH", "/test-path")
 	t.Setenv("HOME", "/test-home")
 	seen := make(chan *exec.Cmd, 1)
+	started := make(chan struct{})
 	original := execCommand
+	originalStartedHook := webhookForwarderStartedHook
 	execCommand = func(name string, args ...string) *exec.Cmd {
 		cmd := exec.Command("sleep", "1")
 		seen <- cmd
 		return cmd
 	}
-	t.Cleanup(func() { execCommand = original })
+	webhookForwarderStartedHook = func() { close(started) }
+	t.Cleanup(func() {
+		execCommand = original
+		webhookForwarderStartedHook = originalStartedHook
+	})
 	rt := &webhookRuntime{cfg: config.Config{Agent: config.AgentConfig{Env: map[string]string{"GH_TOKEN": "token"}}}, status: WebhookStatus{Forwarders: []WebhookForwarderState{{Repo: "acme/repo", Command: []string{"gh", "webhook"}}}}, stopCh: make(chan struct{}), forwarderStopCh: map[string]chan struct{}{"acme/repo": make(chan struct{})}, now: time.Now}
 	go rt.runForwarder("acme/repo")
+	<-started
 	command := <-seen
-	time.Sleep(time.Millisecond)
 	env := command.Env
 	rt.Stop()
 	if !containsEnv(env, "GH_TOKEN=token") || !containsEnv(env, "PATH=/test-path") || !containsEnv(env, "HOME=/test-home") {

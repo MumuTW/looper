@@ -1509,7 +1509,7 @@ func (h *Handler) buildGitHubHealth(ctx context.Context) looperdruntime.GitHubHe
 	if h.context.GitHubHealth != nil {
 		return h.context.GitHubHealth(ctx)
 	}
-	return looperdruntime.GitHubHealth{}
+	return looperdruntime.GitHubHealth{Hosts: []githubinfra.AuthHealth{}}
 }
 
 func (h *Handler) buildWorktreeCleanupStatusResponse() any {

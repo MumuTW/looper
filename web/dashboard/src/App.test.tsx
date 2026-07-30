@@ -153,6 +153,7 @@ describe("operator GitHub health", () => {
             login: "MumuTW",
             coreRateLimit: 5000,
             coreRateRemaining: 4182,
+			coreRateResetAt: "2026-07-30T12:33:27Z",
             checkedAt: "2026-07-30T12:00:00Z",
           },
         ],
@@ -162,6 +163,25 @@ describe("operator GitHub health", () => {
     render(<App />);
 
     expect(await screen.findByText("GitHub")).toBeTruthy();
-    expect(screen.getByText("MumuTW · 4182 / 5000 remaining")).toBeTruthy();
+    expect(await screen.findByText("MumuTW · 4182 / 5000 remaining")).toBeTruthy();
+    expect(screen.getByText("2026-07-30T12:33:27Z")).toBeTruthy();
+  });
+
+  it("shows the credential failure reason", async () => {
+    window.history.replaceState({}, "", "/dashboard/");
+    stubDaemon(bootstrapRouteAbsent, {
+      github: {
+        credential: {
+          githubProjects: true,
+          resolved: false,
+          reason: "set agent.env.GH_TOKEN",
+        },
+        hosts: [],
+      },
+    });
+
+    render(<App />);
+
+    expect(await screen.findByText("missing (set agent.env.GH_TOKEN)")).toBeTruthy();
   });
 });

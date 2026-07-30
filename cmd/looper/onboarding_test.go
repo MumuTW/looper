@@ -534,15 +534,16 @@ func TestStatusReportsKnownIncapableReviewPublishReadiness(t *testing.T) {
 
 func TestStatusReportsDaemonGitHubIdentityAndCoreRate(t *testing.T) {
 	var stdout bytes.Buffer
-	writeStatusOpsLines(&stdout, daemonStatusResponse{GitHub: statusGitHubView{Hosts: []statusGitHubHostView{{
+	writeStatusOpsLines(&stdout, daemonStatusResponse{GitHub: statusGitHubView{Credential: &statusGitHubCredentialView{GitHubProjects: true, Resolved: true}, Hosts: []statusGitHubHostView{{
 		Hostname:          "github.com",
 		Authenticated:     true,
 		Login:             "MumuTW",
 		CoreRateLimit:     5000,
 		CoreRateRemaining: 4182,
+		CoreRateResetAt:   "2026-07-30T12:33:27Z",
 		CheckedAt:         "2026-07-30T12:00:00Z",
 	}}}})
-	want := "github:   github.com as MumuTW; core 4182/5000 remaining; checked 2026-07-30T12:00:00Z\n"
+	want := "github:   credential configured\ngithub:   github.com as MumuTW; core 4182/5000 remaining; resets 2026-07-30T12:33:27Z; checked 2026-07-30T12:00:00Z\n"
 	if got := stdout.String(); got != want {
 		t.Fatalf("status output = %q, want %q", got, want)
 	}

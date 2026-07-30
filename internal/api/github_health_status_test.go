@@ -44,3 +44,21 @@ func TestHandlerStatusExposesDaemonGitHubIdentityAndCoreRate(t *testing.T) {
 	assertEqual(t, host["login"], "MumuTW")
 	assertEqual(t, host["coreRateRemaining"], float64(4182))
 }
+
+func TestHandlerStatusUsesEmptyGitHubHostsWithoutHealthCallback(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	recorder := httptest.NewRecorder()
+
+	NewHandler(Context{Config: cfg, Runtime: rt}).ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/v1/status", nil))
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", recorder.Code, recorder.Body.String())
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	data := body["data"].(map[string]any)
+	github := data["github"].(map[string]any)
+	hosts, ok := github["hosts"].([]any)
+	if !ok || len(hosts) != 0 {
+		t.Fatalf("github hosts = %#v, want empty array", github["hosts"])
+	}
+}

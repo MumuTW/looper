@@ -543,7 +543,7 @@ export function OverviewPage({
                   : status?.github?.credential?.resolved === true
                     ? "configured"
                     : status?.github?.credential?.resolved === false
-                      ? "missing"
+                      ? `missing${status.github.credential.reason ? ` (${status.github.credential.reason})` : ""}`
                       : "—"
               }
             />
@@ -570,6 +570,7 @@ export function OverviewPage({
                         </span>
                       }
                     />
+                    <Kv label="Rate reset" value={host.coreRateResetAt ?? "—"} />
                     <Kv label="Checked" value={host.checkedAt ?? "—"} />
                   </div>
                 );

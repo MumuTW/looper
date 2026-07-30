@@ -3090,23 +3090,27 @@ func (g *Gateway) AuthHealth(ctx context.Context, cwd, hostname string) AuthHeal
 	}
 
 	g.authHealthMu.Lock()
-	defer g.authHealthMu.Unlock()
 	if cached, ok := g.authHealthCache[hostname]; ok && g.now().Before(cached.expiresAt) {
+		g.authHealthMu.Unlock()
 		return cached.health
 	}
+	credentialConfigured := g.credentialConfigured
+	g.authHealthMu.Unlock()
 
 	health := g.probeAuthHealth(ctx, cwd, hostname)
 	if ctx.Err() != nil {
 		return health
 	}
 	ttl := g.authHealthCacheTTL
-	if g.credentialConfigured && !health.Authenticated && failedAuthHealthTTL < ttl {
+	if credentialConfigured && !health.Authenticated && failedAuthHealthTTL < ttl {
 		ttl = failedAuthHealthTTL
 	}
+	g.authHealthMu.Lock()
 	g.authHealthCache[hostname] = authHealthCacheEntry{
 		expiresAt: g.now().Add(ttl),
 		health:    health,
 	}
+	g.authHealthMu.Unlock()
 	return health
 }
 

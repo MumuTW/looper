@@ -5,6 +5,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/nexu-io/looper/internal/config"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
@@ -29,8 +30,17 @@ func TestRuntimeGitHubHealthProbesHostsConcurrentlyWithoutMixingResults(t *testi
 	}})
 	r := New(Options{Config: cfg})
 	r.githubGateway = g
-	h := r.GitHubHealth(context.Background())
-	if len(h.Hosts) != 2 || h.Hosts[0].Login != h.Hosts[0].Hostname || h.Hosts[1].Login != h.Hosts[1].Hostname {
+	result := make(chan GitHubHealth, 1)
+	go func() { result <- r.GitHubHealth(context.Background()) }()
+	var h GitHubHealth
+	select {
+	case h = <-result:
+	case <-time.After(5 * time.Second):
+		t.Fatal("GitHubHealth did not probe hosts concurrently")
+	}
+	if len(h.Hosts) != 2 ||
+		h.Hosts[0].Hostname != "a.example" || h.Hosts[0].Login != "a.example" ||
+		h.Hosts[1].Hostname != "b.example" || h.Hosts[1].Login != "b.example" {
 		t.Fatalf("hosts=%#v", h.Hosts)
 	}
 }

@@ -902,7 +902,14 @@ type daemonStatusResponse struct {
 }
 
 type statusGitHubView struct {
-	Hosts []statusGitHubHostView `json:"hosts"`
+	Credential *statusGitHubCredentialView `json:"credential"`
+	Hosts      []statusGitHubHostView      `json:"hosts"`
+}
+
+type statusGitHubCredentialView struct {
+	GitHubProjects bool   `json:"githubProjects"`
+	Resolved       bool   `json:"resolved"`
+	Reason         string `json:"reason"`
 }
 
 type statusGitHubHostView struct {
@@ -1018,6 +1025,20 @@ func writeStatusOpsLines(stdout io.Writer, status daemonStatusResponse) {
 			_, _ = fmt.Fprintf(stdout, "review:   publish not ready (%s)\n", singleLine(reason))
 		}
 	}
+	if credential := status.GitHub.Credential; credential != nil {
+		switch {
+		case !credential.GitHubProjects:
+			_, _ = fmt.Fprintln(stdout, "github:   credential not required")
+		case credential.Resolved:
+			_, _ = fmt.Fprintln(stdout, "github:   credential configured")
+		default:
+			reason := strings.TrimSpace(credential.Reason)
+			if reason == "" {
+				reason = "no daemon GitHub credential is configured"
+			}
+			_, _ = fmt.Fprintf(stdout, "github:   credential missing (%s)\n", singleLine(reason))
+		}
+	}
 	for _, host := range status.GitHub.Hosts {
 		hostname := strings.TrimSpace(host.Hostname)
 		if hostname == "" {
@@ -1032,8 +1053,14 @@ func writeStatusOpsLines(stdout io.Writer, status daemonStatusResponse) {
 			if checkedAt == "" {
 				checkedAt = "unknown"
 			}
-			_, _ = fmt.Fprintf(stdout, "github:   %s as %s; core %d/%d remaining; checked %s\n",
-				hostname, login, host.CoreRateRemaining, host.CoreRateLimit, checkedAt)
+			resetAt := strings.TrimSpace(host.CoreRateResetAt)
+			if resetAt != "" {
+				_, _ = fmt.Fprintf(stdout, "github:   %s as %s; core %d/%d remaining; resets %s; checked %s\n",
+					hostname, login, host.CoreRateRemaining, host.CoreRateLimit, resetAt, checkedAt)
+			} else {
+				_, _ = fmt.Fprintf(stdout, "github:   %s as %s; core %d/%d remaining; checked %s\n",
+					hostname, login, host.CoreRateRemaining, host.CoreRateLimit, checkedAt)
+			}
 			continue
 		}
 		reason := strings.TrimSpace(host.Error)
