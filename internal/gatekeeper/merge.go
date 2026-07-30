@@ -29,7 +29,15 @@ type MergeOutcome struct {
 	// after a successful merge. Auditor may use it as attribution evidence; it
 	// is not merge authority and therefore a read failure never undoes a merge.
 	TouchedFiles []string `json:"touchedFiles,omitempty"`
-	Merged       bool     `json:"merged"`
+	// MergeCommitSHA is the default-branch commit GitHub created for the merge.
+	// It is distinct from the PR head for squash/rebase merges and is the only
+	// commit an Auditor may later revert.
+	MergeCommitSHA string `json:"mergeCommitSha,omitempty"`
+	// SourceIssue is GitHub's explicit closing-issue relationship captured
+	// during confirming evaluation. Empty means Auditor cannot safely reopen an
+	// issue as part of a future revert proposal.
+	SourceIssue *githubinfra.IssueReference `json:"sourceIssue,omitempty"`
+	Merged      bool                        `json:"merged"`
 	// Reason explains a refusal. Empty on success.
 	Reason string `json:"reason,omitempty"`
 	// ConfirmingReasons are the gates that blocked the confirming evaluation, when
@@ -87,6 +95,7 @@ func (r *Runner) confirmAndMerge(ctx context.Context, input EvaluationInput, rep
 	if outcome.Reason != "" {
 		return r.persistMergeOutcome(ctx, outcome)
 	}
+	outcome.SourceIssue = sameRepositorySourceIssue(confirmation.Evidence.ClosingIssues, report.Repo)
 
 	if err := r.github.MergePullRequest(ctx, githubinfra.EnableAutoMergeInput{
 		Repo: report.Repo, PRNumber: report.PRNumber,
@@ -108,6 +117,14 @@ func (r *Runner) confirmAndMerge(ctx context.Context, input EvaluationInput, rep
 	}
 
 	outcome.Merged = true
+	mergedDetail, detailErr := r.github.ViewPullRequestMergeWatch(ctx, githubinfra.ViewPullRequestInput{Repo: report.Repo, PRNumber: report.PRNumber, CWD: r.projectCWD(ctx, report.ProjectID)})
+	if detailErr != nil {
+		if r.logWarn != nil {
+			r.logWarn("gatekeeper: could not capture merged commit identity", map[string]any{"repo": report.Repo, "pr": report.PRNumber, "error": detailErr.Error()})
+		}
+	} else {
+		outcome.MergeCommitSHA = strings.TrimSpace(mergedDetail.MergeCommitSHA)
+	}
 	files, filesErr := r.github.ListPullRequestFiles(ctx, githubinfra.ViewPullRequestInput{Repo: report.Repo, PRNumber: report.PRNumber, CWD: r.projectCWD(ctx, report.ProjectID)})
 	if filesErr != nil {
 		if r.logWarn != nil {
@@ -117,6 +134,21 @@ func (r *Runner) confirmAndMerge(ctx context.Context, input EvaluationInput, rep
 		outcome.TouchedFiles = files
 	}
 	return r.persistMergeOutcome(ctx, outcome)
+}
+
+func sameRepositorySourceIssue(issues []githubinfra.IssueReference, repo string) *githubinfra.IssueReference {
+	var source *githubinfra.IssueReference
+	for _, issue := range issues {
+		if issue.Number <= 0 || !strings.EqualFold(strings.TrimSpace(issue.Repo), strings.TrimSpace(repo)) {
+			continue
+		}
+		if source != nil {
+			return nil
+		}
+		copied := issue
+		source = &copied
+	}
+	return source
 }
 
 func (r *Runner) mergeStrategy(projectID string) config.ReviewerAutoMergeStrategy {

@@ -103,21 +103,22 @@ type CodexReviewEvidence struct {
 }
 
 type Evidence struct {
-	PullRequestState             string               `json:"pullRequestState,omitempty"`
-	Draft                        bool                 `json:"draft"`
-	BaseRefName                  string               `json:"baseRefName,omitempty"`
-	Mergeable                    *bool                `json:"mergeable,omitempty"`
-	MergeableState               string               `json:"mergeableState,omitempty"`
-	RequiredChecks               []string             `json:"requiredChecks"`
-	Checks                       []CheckEvidence      `json:"checks"`
-	RequiredApprovingReviewCount int                  `json:"requiredApprovingReviewCount"`
-	ReviewDecision               string               `json:"reviewDecision,omitempty"`
-	CodexReview                  *CodexReviewEvidence `json:"codexReview,omitempty"`
-	UnresolvedReviewThreadIDs    []string             `json:"unresolvedReviewThreadIds"`
-	HoldLabels                   []string             `json:"holdLabels"`
-	DiffBudget                   *DiffBudgetEvidence  `json:"diffBudget,omitempty"`
-	ProjectPolicyPermitsTarget   bool                 `json:"projectPolicyPermitsTarget"`
-	FinalObservedHeadSHA         string               `json:"finalObservedHeadSha,omitempty"`
+	PullRequestState             string                       `json:"pullRequestState,omitempty"`
+	Draft                        bool                         `json:"draft"`
+	BaseRefName                  string                       `json:"baseRefName,omitempty"`
+	Mergeable                    *bool                        `json:"mergeable,omitempty"`
+	MergeableState               string                       `json:"mergeableState,omitempty"`
+	RequiredChecks               []string                     `json:"requiredChecks"`
+	Checks                       []CheckEvidence              `json:"checks"`
+	RequiredApprovingReviewCount int                          `json:"requiredApprovingReviewCount"`
+	ReviewDecision               string                       `json:"reviewDecision,omitempty"`
+	CodexReview                  *CodexReviewEvidence         `json:"codexReview,omitempty"`
+	UnresolvedReviewThreadIDs    []string                     `json:"unresolvedReviewThreadIds"`
+	HoldLabels                   []string                     `json:"holdLabels"`
+	DiffBudget                   *DiffBudgetEvidence          `json:"diffBudget,omitempty"`
+	ProjectPolicyPermitsTarget   bool                         `json:"projectPolicyPermitsTarget"`
+	FinalObservedHeadSHA         string                       `json:"finalObservedHeadSha,omitempty"`
+	ClosingIssues                []githubinfra.IssueReference `json:"closingIssues,omitempty"`
 }
 
 type Report struct {
@@ -345,7 +346,7 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 		Version: reportVersion, Status: StatusBlocked,
 		ProjectID: input.ProjectID, Repo: input.Repo, PRNumber: input.PRNumber,
 		ExpectedHeadSHA: input.ExpectedHeadSHA, RequiresFreshRevalidation: true,
-		Reasons: []Reason{}, Evidence: Evidence{RequiredChecks: []string{}, Checks: []CheckEvidence{}, UnresolvedReviewThreadIDs: []string{}, HoldLabels: []string{}},
+		Reasons: []Reason{}, Evidence: Evidence{RequiredChecks: []string{}, Checks: []CheckEvidence{}, UnresolvedReviewThreadIDs: []string{}, HoldLabels: []string{}, ClosingIssues: []githubinfra.IssueReference{}},
 		EvaluatedAt:       r.now().UTC().Format(time.RFC3339Nano),
 		SourceFingerprint: input.SourceFingerprint,
 	}
@@ -354,6 +355,7 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 	if err != nil {
 		return r.persistProviderBlock(ctx, report, ReasonProviderStateUnavailable, "pull_request")
 	}
+	report.Evidence.ClosingIssues = append([]githubinfra.IssueReference(nil), detail.ClosingIssues...)
 	report.ObservedHeadSHA = strings.TrimSpace(detail.HeadSHA)
 	report.Evidence.PullRequestState = strings.ToUpper(strings.TrimSpace(detail.State))
 	report.Evidence.Draft = detail.IsDraft
