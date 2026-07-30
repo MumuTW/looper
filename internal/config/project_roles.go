@@ -154,16 +154,6 @@ func stripRoleAgentBindings(partial PartialRoleConfigs) PartialRoleConfigs {
 	return stripped
 }
 
-// ProjectProviderKind resolves the task-source provider kind for a project by
-// id. Unknown ids fall back to the GitHub default.
-func ProjectProviderKind(cfg Config, projectID string) ProviderKind {
-	project := findConfiguredProject(cfg.Projects, projectID)
-	if project == nil {
-		return ProviderKindGitHub
-	}
-	return resolvedProjectProviderKind(cfg, *project)
-}
-
 // ProjectCodingRoleConfig returns the effective canonical registry entry for a
 // project, including compatible project-level legacy overrides.
 func ProjectCodingRoleConfig(cfg Config, projectID, role string) (CodingRoleConfig, bool) {

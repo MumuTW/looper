@@ -23,7 +23,6 @@ import (
 	"github.com/nexu-io/looper/internal/disclosure"
 	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/eventlog"
-	"github.com/nexu-io/looper/internal/forge"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/specpr"
 	"github.com/nexu-io/looper/internal/labels"
@@ -583,13 +582,6 @@ type Runner struct {
 	hitlNotify              HITLNotifyFunc
 	hitlAnswerTransport     string
 	hitlGitHub              HITLGitHubSettings
-}
-
-func (r *Runner) providerSelectionForProject(projectID string) forge.Selection {
-	if r == nil || r.projectRoleConfig == nil {
-		return forge.NewResolver(config.Config{}).ForProject(projectID)
-	}
-	return forge.NewResolver(*r.projectRoleConfig).ForProject(projectID)
 }
 
 type ProcessResult struct {
@@ -2174,7 +2166,7 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 		checkpoint.ResumePolicy = loops.ResumePolicyAdvanceFromCheckpoint
 		return checkpoint, nil
 	}
-	if r.providerSelectionForProject(input.Project.ID).Capabilities().GitHubCLIPullRequestCreation && !r.githubCLIAutoPROpeningAvailable(ctx, work.Repo, input.Project.RepoPath) {
+	if !r.githubCLIAutoPROpeningAvailable(ctx, work.Repo, input.Project.RepoPath) {
 		message := fmt.Sprintf("GitHub CLI unavailable; PR opening is manual for worker %s", input.Loop.ID)
 		checkpoint.SkipReason = message
 		checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
@@ -3637,7 +3629,6 @@ func buildWorkerPrompt(repoRootPath string, work workerInput, plan *checkpointPl
 }
 
 func buildWorkerPromptWithInstructions(repoRootPath string, projectID string, instructionConfig config.Config, work workerInput, plan *checkpointPlan, allowAgentPRCreation bool, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string) (string, config.CustomInstructionBlock, error) {
-	providerCapabilities := forge.NewResolver(instructionConfig).ForProject(projectID).Capabilities()
 	parts := []string{}
 	if work.ExecutionMode == "push-existing" {
 		parts = append(parts, fmt.Sprintf("Continue implementing on existing pull request %s#%d.", work.Repo, work.PRNumber))
@@ -3670,7 +3661,7 @@ func buildWorkerPromptWithInstructions(repoRootPath string, projectID string, in
 		parts = append(parts, instructionBlock.Text)
 	}
 	if allowAgentPRCreation {
-		parts = append(parts, buildAgentPullRequestInstruction(work, providerCapabilities.GitHubCLIPullRequestCreation))
+		parts = append(parts, buildAgentPullRequestInstruction(work))
 		parts = append(parts, "Make the necessary code changes, validate them, and ensure the branch and pull request are left in a consistent state.")
 		parts = append(parts, lifecycle.PromptInstruction("worker", work.Branch, work.BaseBranch, true, true, disclosureCfg, agentRuntime, agentModel))
 	} else {
@@ -3700,15 +3691,12 @@ func noRemoteLifecyclePromptInstruction(runner, branch, baseBranch string, discl
 	}, "\n")
 }
 
-func buildAgentPullRequestInstruction(work workerInput, githubCLIRequired bool) string {
+func buildAgentPullRequestInstruction(work workerInput) string {
 	parts := []string{
-		"When the implementation is ready and validation passes, create the pull request yourself using the configured provider tooling.",
+		"When the implementation is ready and validation passes, use the GitHub CLI (`gh`) to create the pull request yourself.",
 		"Before creating a PR, check whether one already exists for the current branch and avoid duplicates.",
 		"Write a concise, accurate PR title and a structured body that explains the actual changes and why they were made.",
 		fmt.Sprintf("Target base branch: %s.", work.BaseBranch),
-	}
-	if githubCLIRequired {
-		parts[0] = "When the implementation is ready and validation passes, use the GitHub CLI (`gh`) to create the pull request yourself."
 	}
 	if work.IssueNumber > 0 {
 		parts = append(parts, fmt.Sprintf("Include `Closes %s` in the PR body.", formatIssueClosingReference(work.Repo, work.IssueRepo, work.IssueNumber)))
