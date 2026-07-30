@@ -6783,6 +6783,31 @@ func TestBuildFixerReplyBodyHandlesMissingAuthorAndCommit(t *testing.T) {
 	}
 }
 
+func TestShouldBlockResolveWithoutFixUsesReconcileProgress(t *testing.T) {
+	t.Parallel()
+
+	comment := []FixItem{{Type: "comment"}}
+	cases := []struct {
+		name      string
+		reconcile *checkpointReconcileCommits
+		want      bool
+	}{
+		{name: "unknown base cannot prove progress", reconcile: &checkpointReconcileCommits{FinalHeadSHA: "head"}, want: true},
+		{name: "equal heads are a no-op", reconcile: &checkpointReconcileCommits{BaseHeadSHA: "head", FinalHeadSHA: "head"}, want: true},
+		{name: "moved head is progress", reconcile: &checkpointReconcileCommits{BaseHeadSHA: "base", FinalHeadSHA: "head"}, want: false},
+		{name: "explicit commit evidence is progress", reconcile: &checkpointReconcileCommits{NewCommitSHAs: []string{"head"}}, want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			checkpoint := fixerCheckpoint{Push: &checkpointPush{}, ReconcileCommits: tc.reconcile}
+			if got := shouldBlockResolveWithoutFix(checkpoint, comment, false); got != tc.want {
+				t.Fatalf("shouldBlockResolveWithoutFix(%#v) = %t, want %t", tc.reconcile, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestBuildFixerReplyBodyPrefersAgentExplanationOverGenericQuote(t *testing.T) {
 	t.Parallel()
 	got := buildFixerReplyBody(FixItem{Type: "comment", ID: "c1", ThreadID: "t1", Author: "alice", Summary: "Original review comment that should be hidden"}, "abcdef1", "Replaced strings.Title with cases.Title and added empty-string coverage in foo_test.go.")

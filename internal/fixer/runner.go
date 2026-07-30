@@ -3417,17 +3417,10 @@ func (r *Runner) refreshReconcileMetadata(checkpoint *fixerCheckpoint, worktree 
 	if checkpoint == nil || worktree == nil || checkpoint.ReconcileCommits == nil || checkpoint.ReconcileCommits.FinalHeadSHA == inspect.HeadSHA {
 		return
 	}
-	checkpoint.ReconcileCommits.FinalHeadSHA = inspect.HeadSHA
-	checkpoint.ReconcileCommits.NewCommitSHAs = append([]string(nil), inspect.NewCommitSHAs...)
-	checkpoint.ReconcileCommits.CommittedByAgent = len(inspect.NewCommitSHAs) > 0
-	checkpoint.ReconcileCommits.WorkingTreeClean = true
-	checkpoint.ReconcileCommits.ChangedFiles = append([]string(nil), inspect.ChangedFiles...)
-	checkpoint.ReconcileCommits.CompletedAt = r.nowISO()
+	checkpoint.ReconcileCommits = reconcile.Refresh(checkpoint.ReconcileCommits, toReconcileInspection(inspect), r.nowISO())
 	checkpoint.ensureLifecycle("fixer", worktree.Branch, detailBaseRefName(checkpoint.Detail), false)
 	checkpoint.Lifecycle.CommitSHAs = appendUniqueStrings(checkpoint.Lifecycle.CommitSHAs, inspect.NewCommitSHAs...)
-	if len(inspect.NewCommitSHAs) > 0 && checkpoint.Lifecycle.Actions.Commit == lifecycle.ActionSourceNone {
-		checkpoint.Lifecycle.Actions.Commit = lifecycle.ActionSourceAgent
-	}
+	checkpoint.Lifecycle.Actions.Commit = reconcile.CommitAttribution(len(inspect.NewCommitSHAs) > 0, false, checkpoint.Lifecycle.Actions.Commit)
 }
 
 func (r *Runner) runPushStep(ctx context.Context, input stepInput) (fixerCheckpoint, error) {
@@ -7555,10 +7548,7 @@ func shouldBlockResolveWithoutFix(checkpoint fixerCheckpoint, fixItems []FixItem
 	if checkpoint.ReconcileCommits == nil {
 		return false
 	}
-	if len(checkpoint.ReconcileCommits.NewCommitSHAs) > 0 {
-		return false
-	}
-	if checkpoint.ReconcileCommits.FinalHeadSHA != "" && checkpoint.ReconcileCommits.BaseHeadSHA != "" && checkpoint.ReconcileCommits.FinalHeadSHA != checkpoint.ReconcileCommits.BaseHeadSHA {
+	if reconcile.ProducedNewCommits(checkpoint.ReconcileCommits) {
 		return false
 	}
 	for _, item := range fixItems {

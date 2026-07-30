@@ -82,6 +82,27 @@ func Complete(baseHeadSHA string, initial, final Inspection, committedByLoop boo
 	}
 }
 
+// Refresh records a later clean inspection of an already reconciled worktree,
+// such as validation creating a commit. It preserves the original base and
+// whether the loop committed, while replacing the head-derived classification.
+// A matching head is already current and is returned unchanged. Slices are
+// copied so the durable State never aliases a git inspection.
+func Refresh(state *State, final Inspection, completedAt string) *State {
+	if state == nil || state.FinalHeadSHA == final.HeadSHA {
+		return state
+	}
+	return &State{
+		BaseHeadSHA:      state.BaseHeadSHA,
+		FinalHeadSHA:     final.HeadSHA,
+		NewCommitSHAs:    append([]string(nil), final.NewCommitSHAs...),
+		CommittedByAgent: len(final.NewCommitSHAs) > 0,
+		CommittedByLoop:  state.CommittedByLoop,
+		WorkingTreeClean: !final.HasUncommittedChanges,
+		ChangedFiles:     append([]string(nil), final.ChangedFiles...),
+		CompletedAt:      completedAt,
+	}
+}
+
 // CommitAttribution decides how the lifecycle record attributes this
 // round's commits: a loop-authored commit is always the fallback source; a
 // round where only the agent committed claims agent attribution only if

@@ -131,6 +131,39 @@ func TestCompleteCopiesInspectionSlices(t *testing.T) {
 	}
 }
 
+func TestRefreshReclassifiesLaterInspectionAndPreservesPassAuthority(t *testing.T) {
+	t.Parallel()
+
+	previous := &State{
+		BaseHeadSHA:      "base",
+		FinalHeadSHA:     "repair",
+		NewCommitSHAs:    []string{"repair"},
+		CommittedByAgent: true,
+		CommittedByLoop:  true,
+		WorkingTreeClean: true,
+		ChangedFiles:     []string{"repair.go"},
+		CompletedAt:      "before",
+	}
+	shas := []string{"repair", "validation"}
+	refreshed := Refresh(previous, Inspection{HeadSHA: "validation", NewCommitSHAs: shas, ChangedFiles: []string{"generated.go"}}, "after")
+	if refreshed == previous {
+		t.Fatal("Refresh() returned the prior State after the head changed")
+	}
+	if refreshed.BaseHeadSHA != "base" || refreshed.FinalHeadSHA != "validation" || !refreshed.CommittedByAgent || !refreshed.CommittedByLoop || !refreshed.WorkingTreeClean || refreshed.CompletedAt != "after" {
+		t.Fatalf("Refresh() = %+v, want refreshed head-derived state with preserved base and loop attribution", refreshed)
+	}
+	if !slices.Equal(refreshed.NewCommitSHAs, shas) || !slices.Equal(refreshed.ChangedFiles, []string{"generated.go"}) {
+		t.Fatalf("Refresh() = %+v, want refreshed commit and changed-file evidence", refreshed)
+	}
+	shas[1] = "tampered"
+	if refreshed.NewCommitSHAs[1] != "validation" {
+		t.Fatalf("Refresh() aliases the inspection slice: %v", refreshed.NewCommitSHAs)
+	}
+	if got := Refresh(refreshed, Inspection{HeadSHA: "validation"}, "later"); got != refreshed {
+		t.Fatalf("Refresh(same head) = %#v, want the existing State %#v", got, refreshed)
+	}
+}
+
 func TestCommitAttribution(t *testing.T) {
 	t.Parallel()
 
