@@ -364,7 +364,8 @@
       },
       "hitl": {
         "enabled": false
-      }
+      },
+      "intake": {}
     },
     "metadata": {
       "configPath": "__TMP__/configs/priority.json",
