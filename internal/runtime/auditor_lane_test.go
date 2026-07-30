@@ -28,6 +28,10 @@ func (f fakeAuditorGateway) ListPullRequestCheckRuns(context.Context, githubinfr
 	return f.checks, nil
 }
 
+func (f fakeAuditorGateway) RerequestCheckSuite(context.Context, githubinfra.RerequestCheckSuiteInput) error {
+	return nil
+}
+
 func TestObservePostMergeFailureRecordsOneOptInDefaultBranchObservation(t *testing.T) {
 	ctx := context.Background()
 	workdir := t.TempDir()
