@@ -1,9 +1,10 @@
-package fixer
+package worktreesafety
 
 import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 )
@@ -49,6 +50,25 @@ func TestIsMissingOrUnusableFixerWorktree(t *testing.T) {
 		t.Fatalf("WriteFile usable .git: %v", err)
 	}
 
+	// Linked private gitdir whose HEAD is a regular file but not valid Git HEAD
+	// syntax. Presence-only checks preserve it even though Git rejects it.
+	malformedHeadLinked := t.TempDir()
+	malformedHeadGitdir := filepath.Join(t.TempDir(), "malformed-head-gitdir")
+	malformedHeadCommon := filepath.Join(t.TempDir(), "malformed-head-common")
+	if err := os.MkdirAll(malformedHeadGitdir, 0o755); err != nil {
+		t.Fatalf("MkdirAll malformedHeadGitdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(malformedHeadGitdir, "HEAD"), []byte("not-a-valid-head\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile malformedHeadGitdir HEAD: %v", err)
+	}
+	writeMinimalGitRepoMetadata(t, malformedHeadCommon)
+	if err := os.WriteFile(filepath.Join(malformedHeadGitdir, "commondir"), []byte(malformedHeadCommon+"\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile malformedHeadGitdir commondir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(malformedHeadLinked, ".git"), []byte("gitdir: "+malformedHeadGitdir+"\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile malformedHeadLinked .git: %v", err)
+	}
+
 	// Linked gitfile to an existing but empty/corrupt private gitdir (no HEAD).
 	// Real git reports "not a git repository"; probe must treat as unusable.
 	corruptLinked := t.TempDir()
@@ -58,6 +78,23 @@ func TestIsMissingOrUnusableFixerWorktree(t *testing.T) {
 	}
 	if err := os.WriteFile(filepath.Join(corruptLinked, ".git"), []byte("gitdir: "+emptyGitdir+"\n"), 0o644); err != nil {
 		t.Fatalf("WriteFile corruptLinked .git: %v", err)
+	}
+
+	// A private gitdir whose HEAD is a directory is corrupt too. Stat-only
+	// presence checks would preserve it and repeatedly retry prepare instead
+	// of recreating the checkout.
+	directoryHeadLinked := t.TempDir()
+	directoryHeadGitdir := filepath.Join(t.TempDir(), "directory-head-gitdir")
+	directoryHeadCommon := filepath.Join(t.TempDir(), "directory-head-common")
+	if err := os.MkdirAll(filepath.Join(directoryHeadGitdir, "HEAD"), 0o755); err != nil {
+		t.Fatalf("MkdirAll directoryHeadGitdir HEAD: %v", err)
+	}
+	writeMinimalGitRepoMetadata(t, directoryHeadCommon)
+	if err := os.WriteFile(filepath.Join(directoryHeadGitdir, "commondir"), []byte(directoryHeadCommon+"\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile directoryHeadGitdir commondir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(directoryHeadLinked, ".git"), []byte("gitdir: "+directoryHeadGitdir+"\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile directoryHeadLinked .git: %v", err)
 	}
 
 	// Linked private gitdir has HEAD but lost commondir (or it no longer
@@ -126,6 +163,13 @@ func TestIsMissingOrUnusableFixerWorktree(t *testing.T) {
 	usableDir := t.TempDir()
 	writeMinimalGitRepoMetadata(t, filepath.Join(usableDir, ".git"))
 
+	// Ordinary checkout with a regular but malformed HEAD must also recreate.
+	malformedHeadDir := t.TempDir()
+	writeMinimalGitRepoMetadata(t, filepath.Join(malformedHeadDir, ".git"))
+	if err := os.WriteFile(filepath.Join(malformedHeadDir, ".git", "HEAD"), []byte("not-a-valid-head\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile malformedHeadDir HEAD: %v", err)
+	}
+
 	// Ordinary checkout with only HEAD (missing objects/refs) is unusable.
 	headOnlyDir := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(headOnlyDir, ".git"), 0o755); err != nil {
@@ -133,6 +177,18 @@ func TestIsMissingOrUnusableFixerWorktree(t *testing.T) {
 	}
 	if err := os.WriteFile(filepath.Join(headOnlyDir, ".git", "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
 		t.Fatalf("WriteFile headOnlyDir HEAD: %v", err)
+	}
+
+	// An ordinary checkout whose HEAD is a directory must also be recreated.
+	directoryHeadDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(directoryHeadDir, ".git", "objects"), 0o755); err != nil {
+		t.Fatalf("MkdirAll directoryHeadDir objects: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(directoryHeadDir, ".git", "refs"), 0o755); err != nil {
+		t.Fatalf("MkdirAll directoryHeadDir refs: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(directoryHeadDir, ".git", "HEAD"), 0o755); err != nil {
+		t.Fatalf("MkdirAll directoryHeadDir HEAD: %v", err)
 	}
 
 	remoteIntegrityText := errors.New("fatal: not a git repository (or any of the parent directories): .git")
@@ -153,15 +209,19 @@ func TestIsMissingOrUnusableFixerWorktree(t *testing.T) {
 		// Same remote/helper wording must NOT force cleanup when local checkout is valid.
 		{name: "not_a_git_repository_usable_gitfile", path: usable, prepErr: remoteIntegrityText, want: false},
 		{name: "not_a_git_repository_usable_gitdir", path: usableDir, prepErr: remoteIntegrityText, want: false},
+		{name: "not_a_git_repository_linked_gitdir_malformed_head", path: malformedHeadLinked, prepErr: remoteIntegrityText, want: true},
 		{name: "not_a_working_tree_usable", path: usable, prepErr: fmt.Errorf("fatal: %s is not a working tree", usable), want: false},
 		// Existing but empty/corrupt linked gitdir must recreate (not preserve forever).
 		{name: "not_a_git_repository_corrupt_linked_gitdir", path: corruptLinked, prepErr: remoteIntegrityText, want: true},
+		{name: "not_a_git_repository_linked_gitdir_head_is_directory", path: directoryHeadLinked, prepErr: remoteIntegrityText, want: true},
 		// HEAD present but missing/dangling/corrupt common must recreate (not preserve forever).
 		{name: "not_a_git_repository_missing_commondir", path: missingCommondir, prepErr: remoteIntegrityText, want: true},
 		{name: "not_a_git_repository_dangling_commondir", path: danglingCommondir, prepErr: remoteIntegrityText, want: true},
 		{name: "not_a_git_repository_corrupt_common_objects", path: corruptCommon, prepErr: remoteIntegrityText, want: true},
 		// Ordinary checkout with only HEAD (no objects/refs) must recreate.
 		{name: "not_a_git_repository_head_only_gitdir", path: headOnlyDir, prepErr: remoteIntegrityText, want: true},
+		{name: "not_a_git_repository_gitdir_head_is_directory", path: directoryHeadDir, prepErr: remoteIntegrityText, want: true},
+		{name: "not_a_git_repository_gitdir_malformed_head", path: malformedHeadDir, prepErr: remoteIntegrityText, want: true},
 		// Malformed gitfile + Git's distinct error must recreate (not retry forever).
 		{name: "invalid_gitfile_format_malformed", path: malformedGitfile, prepErr: invalidGitfileText, want: true},
 		// Usable checkout must not be force-cleaned even if error text mentions gitfile.
@@ -177,8 +237,8 @@ func TestIsMissingOrUnusableFixerWorktree(t *testing.T) {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			if got := isMissingOrUnusableFixerWorktree(tc.path, tc.prepErr); got != tc.want {
-				t.Fatalf("isMissingOrUnusableFixerWorktree(%q, %v) = %v, want %v", tc.path, tc.prepErr, got, tc.want)
+			if got := IsMissingOrUnusableFixerWorktree(tc.path, tc.prepErr); got != tc.want {
+				t.Fatalf("IsMissingOrUnusableFixerWorktree(%q, %v) = %v, want %v", tc.path, tc.prepErr, got, tc.want)
 			}
 		})
 	}
@@ -189,8 +249,8 @@ func TestClearUnusableFixerWorktreePath(t *testing.T) {
 
 	t.Run("missing_ok", func(t *testing.T) {
 		t.Parallel()
-		if err := clearUnusableFixerWorktreePath(filepath.Join(t.TempDir(), "gone")); err != nil {
-			t.Fatalf("clearUnusableFixerWorktreePath() error = %v", err)
+		if err := ClearUnusableFixerWorktreePath(filepath.Join(t.TempDir(), "gone")); err != nil {
+			t.Fatalf("ClearUnusableFixerWorktreePath() error = %v", err)
 		}
 	})
 
@@ -200,8 +260,8 @@ func TestClearUnusableFixerWorktreePath(t *testing.T) {
 		if err := os.MkdirAll(path, 0o755); err != nil {
 			t.Fatalf("MkdirAll: %v", err)
 		}
-		if err := clearUnusableFixerWorktreePath(path); err != nil {
-			t.Fatalf("clearUnusableFixerWorktreePath() error = %v", err)
+		if err := ClearUnusableFixerWorktreePath(path); err != nil {
+			t.Fatalf("ClearUnusableFixerWorktreePath() error = %v", err)
 		}
 		if _, err := os.Stat(path); !os.IsNotExist(err) {
 			t.Fatalf("path still exists after clear, err=%v", err)
@@ -218,9 +278,9 @@ func TestClearUnusableFixerWorktreePath(t *testing.T) {
 		if err := os.WriteFile(marker, []byte("x\n"), 0o644); err != nil {
 			t.Fatalf("WriteFile: %v", err)
 		}
-		err := clearUnusableFixerWorktreePath(path)
-		if !errors.Is(err, errUnusableFixerWorktreePreserved) {
-			t.Fatalf("error = %v, want errUnusableFixerWorktreePreserved", err)
+		err := ClearUnusableFixerWorktreePath(path)
+		if !errors.Is(err, ErrUnusableFixerWorktreePreserved) {
+			t.Fatalf("error = %v, want ErrUnusableFixerWorktreePreserved", err)
 		}
 		if _, err := os.Stat(marker); err != nil {
 			t.Fatalf("populated marker missing: %v", err)
@@ -240,8 +300,8 @@ func TestClearUnusableFixerWorktreePath(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(path, ".git"), []byte("gitdir: "+emptyGitdir+"\n"), 0o644); err != nil {
 			t.Fatalf("WriteFile .git: %v", err)
 		}
-		if err := clearUnusableFixerWorktreePath(path); err != nil {
-			t.Fatalf("clearUnusableFixerWorktreePath() error = %v", err)
+		if err := ClearUnusableFixerWorktreePath(path); err != nil {
+			t.Fatalf("ClearUnusableFixerWorktreePath() error = %v", err)
 		}
 		if _, err := os.Stat(path); !os.IsNotExist(err) {
 			t.Fatalf("corrupt-only path still exists after clear, err=%v", err)
@@ -257,11 +317,61 @@ func TestClearUnusableFixerWorktreePath(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(path, ".git"), []byte("garbage-not-gitdir\n"), 0o644); err != nil {
 			t.Fatalf("WriteFile .git: %v", err)
 		}
-		if err := clearUnusableFixerWorktreePath(path); err != nil {
-			t.Fatalf("clearUnusableFixerWorktreePath() error = %v", err)
+		if err := ClearUnusableFixerWorktreePath(path); err != nil {
+			t.Fatalf("ClearUnusableFixerWorktreePath() error = %v", err)
 		}
 		if _, err := os.Stat(path); !os.IsNotExist(err) {
 			t.Fatalf("malformed-only path still exists after clear, err=%v", err)
 		}
 	})
+}
+
+func TestLocalGitRepositoryMetadataUsable(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	writeMinimalGitRepoMetadata(t, dir)
+	if !LocalGitRepositoryMetadataUsable(dir) {
+		t.Fatalf("LocalGitRepositoryMetadataUsable(%q) = false, want true", dir)
+	}
+
+	headOnly := t.TempDir()
+	if err := os.WriteFile(filepath.Join(headOnly, "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile HEAD: %v", err)
+	}
+	if LocalGitRepositoryMetadataUsable(headOnly) {
+		t.Fatalf("LocalGitRepositoryMetadataUsable(%q) = true, want false", headOnly)
+	}
+}
+
+func TestLocalGitRefNameUsableMatchesGitCheckRefFormat(t *testing.T) {
+	t.Parallel()
+
+	refs := []string{
+		"refs/heads/main",
+		"refs/heads/feature/one",
+		"refs/tags/v1.0.0",
+		"refs/heads/@",
+		"refs/heads/feature-ñ",
+		"refs/heads/fix.lock",
+		"refs/heads/.hidden",
+		"refs/heads/fix.",
+		"refs/heads/fix..again",
+		"refs/heads/fix@{old}",
+		"refs//heads/main",
+		"refs/heads/white space",
+		"refs/heads/a?b",
+		"refs/heads/a\\b",
+		"refs/heads/a:b",
+	}
+	for _, ref := range refs {
+		ref := ref
+		t.Run(ref, func(t *testing.T) {
+			t.Parallel()
+			want := exec.Command("git", "check-ref-format", ref).Run() == nil
+			if got := localGitRefNameUsable(ref); got != want {
+				t.Fatalf("localGitRefNameUsable(%q) = %v, git check-ref-format = %v", ref, got, want)
+			}
+		})
+	}
 }

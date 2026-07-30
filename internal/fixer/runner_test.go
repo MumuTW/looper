@@ -21,6 +21,7 @@ import (
 	"github.com/nexu-io/looper/internal/lifecycle"
 	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/validation"
 )
 
 func TestBuildFixerPromptUsesConcreteDisclosureMetadata(t *testing.T) {
@@ -5673,7 +5674,7 @@ func TestProcessClaimedItemResumeReacquiresPullRequestLock(t *testing.T) {
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowRiskyFixes: true, ValidationRunner: func(context.Context, ValidationInput) (ValidationResult, error) {
 		validationCalls++
 		if validationCalls == 1 {
-			return ValidationResult{Passed: false, Summary: "Validation failed: connection refused"}, nil
+			return ValidationResult{Passed: false, Summary: "Validation failed: connection refused", FailureCategory: validation.FailureInfrastructure}, nil
 		}
 		return ValidationResult{Passed: true, Summary: "ok"}, nil
 	}})
