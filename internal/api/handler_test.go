@@ -4229,6 +4229,7 @@ exit 1
 
 func TestHandlerCreateManualLoopsRejectHeldTargetsWithoutForce(t *testing.T) {
 	fixture := newTestFixture(t)
+	fixture.config.Agent.Env = map[string]string{"GH_TOKEN": "test-token"}
 	seedWorkerPlannerArtifactsData(t, fixture.runtime, fixture.now)
 	repoPath := filepath.Join(fixture.rootDir, "repo-hold")
 	if err := os.MkdirAll(repoPath, 0o755); err != nil {
@@ -4286,6 +4287,7 @@ func TestHandlerPlannerCreateForceBypassesHold(t *testing.T) {
 
 func TestHandlerWorkerCreateRejectsHeldRequestedIssueEvenWhenPlannerPRExists(t *testing.T) {
 	fixture := newTestFixture(t)
+	fixture.config.Agent.Env = map[string]string{"GH_TOKEN": "test-token"}
 	seedWorkerPlannerArtifactsData(t, fixture.runtime, fixture.now)
 	repoPath := filepath.Join(fixture.rootDir, "repo-worker-held-issue")
 	if err := os.MkdirAll(repoPath, 0o755); err != nil {

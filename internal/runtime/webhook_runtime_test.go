@@ -161,6 +161,7 @@ func TestWebhookRuntimeRunForwarderClearsRecoveredForwarderReason(t *testing.T) 
 	})
 
 	rt := &webhookRuntime{
+		cfg: config.Config{Agent: config.AgentConfig{Env: map[string]string{"GH_TOKEN": "test-token"}}},
 		status: WebhookStatus{
 			Enabled:  true,
 			Degraded: true,
