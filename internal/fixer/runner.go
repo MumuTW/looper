@@ -38,6 +38,7 @@ import (
 	"github.com/MumuTW/looper/internal/loops/failureclass"
 	"github.com/MumuTW/looper/internal/processcontainment"
 	"github.com/MumuTW/looper/internal/reproducer"
+	"github.com/MumuTW/looper/internal/reviewitem"
 	"github.com/MumuTW/looper/internal/storage"
 	"github.com/MumuTW/looper/internal/validation"
 	"github.com/MumuTW/looper/internal/worktreesafety"
@@ -88,21 +89,22 @@ type FixItem struct {
 	Source string `json:"source,omitempty"`
 	// ID identifies the item within its Source; only Source tells you which
 	// identity space an ID belongs to.
-	ID                  string   `json:"id,omitempty"`
-	ThreadID            string   `json:"threadId,omitempty"`
-	ThreadFingerprint   string   `json:"threadFingerprint,omitempty"`
-	ProviderCommentID   int64    `json:"providerCommentId,omitempty"`
-	ObservedFingerprint string   `json:"observedFingerprint,omitempty"`
-	ResolverPresent     bool     `json:"resolverPresent,omitempty"`
-	Name                string   `json:"name,omitempty"`
-	Summary             string   `json:"summary,omitempty"`
-	Body                string   `json:"body,omitempty"`
-	DiffHunk            string   `json:"diffHunk,omitempty"`
-	Files               []string `json:"files,omitempty"`
-	Author              string   `json:"author,omitempty"`
-	URL                 string   `json:"url,omitempty"`
-	Path                string   `json:"path,omitempty"`
-	Line                int64    `json:"line,omitempty"`
+	ID                  string              `json:"id,omitempty"`
+	ThreadID            string              `json:"threadId,omitempty"`
+	ThreadFingerprint   string              `json:"threadFingerprint,omitempty"`
+	ProviderCommentID   int64               `json:"providerCommentId,omitempty"`
+	ObservedFingerprint string              `json:"observedFingerprint,omitempty"`
+	ResolverPresent     bool                `json:"resolverPresent,omitempty"`
+	Name                string              `json:"name,omitempty"`
+	Summary             string              `json:"summary,omitempty"`
+	Body                string              `json:"body,omitempty"`
+	DiffHunk            string              `json:"diffHunk,omitempty"`
+	Files               []string            `json:"files,omitempty"`
+	Author              string              `json:"author,omitempty"`
+	URL                 string              `json:"url,omitempty"`
+	Path                string              `json:"path,omitempty"`
+	Line                int64               `json:"line,omitempty"`
+	Severity            reviewitem.Severity `json:"severity,omitempty"`
 }
 
 type PullRequestSummary struct {
@@ -7375,7 +7377,8 @@ func normalizeFixItems(comments []map[string]any, checks []map[string]any, hasCo
 		case int:
 			line = int64(v)
 		}
-		result = append(result, FixItem{Type: "comment", Source: source, ID: id, ThreadID: threadID, ThreadFingerprint: threadFingerprint, ProviderCommentID: providerCommentID, ObservedFingerprint: observedFingerprint, ResolverPresent: resolverPresent, Summary: summary, Body: body, DiffHunk: diffHunk, Author: author, URL: url, Path: path, Line: line})
+		severity, _ := reviewitem.SeverityFromBody(body)
+		result = append(result, FixItem{Type: "comment", Source: source, ID: id, ThreadID: threadID, ThreadFingerprint: threadFingerprint, ProviderCommentID: providerCommentID, ObservedFingerprint: observedFingerprint, ResolverPresent: resolverPresent, Summary: summary, Body: body, DiffHunk: diffHunk, Author: author, URL: url, Path: path, Line: line, Severity: severity})
 	}
 	for _, check := range checks {
 		if !isFailingCheck(check) {
