@@ -8,6 +8,7 @@ import (
 
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/forge"
+	"github.com/nexu-io/looper/internal/gatekeeper"
 	"github.com/nexu-io/looper/internal/triager"
 )
 
@@ -134,4 +135,24 @@ func (f *budgetTriager) DiscoverIssues(_ context.Context, input triager.Discover
 	f.budgets = append(f.budgets, remaining)
 	f.mu.Unlock()
 	return triager.DiscoveryResult{}, nil
+}
+
+// Gatekeeper lists DefaultDiscoveryPullRequestLimit open PRs with no filters, so a
+// smaller shared page always fails the snapshot's truncation check: the lane
+// discards the page it was handed and pays a second raw query. Sizing the page to
+// the largest limit a lane requests is what makes the shared page usable.
+func TestProjectDiscoverySnapshotOptionsCoversGatekeeperPullRequestLimit(t *testing.T) {
+	t.Parallel()
+
+	withoutGatekeeper := projectDiscoverySnapshotOptions(defaultSchedulerTickInput{}, "looper")
+	if withoutGatekeeper.PullRequestLimit >= gatekeeper.DefaultDiscoveryPullRequestLimit {
+		t.Fatalf("PullRequestLimit without gatekeeper = %d, want below the gatekeeper limit %d",
+			withoutGatekeeper.PullRequestLimit, gatekeeper.DefaultDiscoveryPullRequestLimit)
+	}
+
+	withGatekeeper := projectDiscoverySnapshotOptions(defaultSchedulerTickInput{Gatekeeper: &fakeGatekeeperScheduler{}}, "looper")
+	if withGatekeeper.PullRequestLimit < gatekeeper.DefaultDiscoveryPullRequestLimit {
+		t.Fatalf("PullRequestLimit with gatekeeper = %d, want at least %d so the page is not discarded",
+			withGatekeeper.PullRequestLimit, gatekeeper.DefaultDiscoveryPullRequestLimit)
+	}
 }

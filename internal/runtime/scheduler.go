@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/nexu-io/looper/internal/agent"
@@ -3485,19 +3486,27 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 	if input.Config != nil {
 		providers = forge.NewResolver(*input.Config)
 	}
-	// Warm every project's snapshot before the serial walk below. A tick used to
-	// pay each project's forge latency end to end, one after another, so a
-	// multi-repo daemon spent minutes per tick and could not honour its own poll
-	// interval. Overlapping the reads collapses that to roughly the slowest single
-	// fetch.
+	// Warm later projects' snapshot pages in the background while the serial walk
+	// below proceeds. A tick used to pay each project's forge latency end to end,
+	// one after another, so a multi-repo daemon spent minutes per tick and could not
+	// honour its own poll interval.
 	//
-	// Only the reads are concurrent. The lane walk, its enqueues, and every
-	// admission recheck stay exactly as serial as before, because admission's
-	// "no later discovery after close" guarantee comes from the total ordering of
-	// that walk — fanning the walk out breaks it, and no latch can restore it once
-	// two projects' lanes have already started (see #147).
-	prefetchProjectSnapshots(ctx, input, projectsList, providers, projectSnapshot)
-	for _, project := range projectsList {
+	// Only the reads overlap. The lane walk, its enqueues, and every admission
+	// recheck stay exactly as serial as before, because admission's "no later
+	// discovery after close" guarantee comes from the total ordering of that walk —
+	// fanning the walk out breaks it, and no latch can restore it once two projects'
+	// lanes have already started (see #147).
+	//
+	// walkedUpTo lets a warm skip a project the walk already reached, so the warm
+	// never races the walk's own just-in-time fetch.
+	var walkedUpTo atomic.Int64
+	walkedUpTo.Store(-1)
+	waitForPrefetch := prefetchProjectSnapshots(ctx, input, projectsList, providers, lanes, projectSnapshot, &walkedUpTo)
+	defer waitForPrefetch()
+	for projectIndex, project := range projectsList {
+		// Publish walk progress so a background warm for this project stands down
+		// rather than racing the just-in-time fetch its lanes are about to make.
+		walkedUpTo.Store(int64(projectIndex))
 		if err := ctx.Err(); err != nil {
 			retErr = errors.Join(append(errs, err)...)
 			return retErr
@@ -3651,65 +3660,118 @@ func schedulerSnapshotPrefetchConcurrency(targets int) int {
 // admission, so concurrency cannot affect the shutdown contract the serial walk
 // enforces. Failures are benign and logged, never returned: a cold snapshot just
 // means the lane fetches it itself.
-func prefetchProjectSnapshots(ctx context.Context, input defaultSchedulerTickInput, projects []storage.ProjectRecord, providers forge.Resolver, snapshotFor func(string) *githubinfra.DiscoverySnapshot) {
-	if input.GitHubGateway == nil || snapshotFor == nil || len(projects) < 2 {
-		return
-	}
-	if err := admissionRefuseWork(input); err != nil {
-		return
-	}
-	type prefetchTarget struct {
-		projectID string
-		repo      string
-		cwd       string
-	}
-	targets := make([]prefetchTarget, 0, len(projects))
-	for _, project := range projects {
-		if project.Archived {
+// snapshotPagesForProject reports which shared snapshot pages some enabled,
+// supported lane will actually read for this project. Warming a page with no
+// consumer costs a `gh` call per project per tick and hides no latency.
+func snapshotPagesForProject(lanes []discoveryLane, projectID string, capabilities forge.Capabilities) (pullRequests, issues bool) {
+	for _, lane := range lanes {
+		if !lane.Present || lane.Enabled == nil || !lane.Enabled(projectID) {
 			continue
 		}
-		if !providers.ForProject(project.ID).Capabilities().GitHubCLIPullRequestCreation {
+		if lane.Supported != nil && !lane.Supported(capabilities) {
+			continue
+		}
+		pullRequests = pullRequests || lane.ReadsPullRequests
+		issues = issues || lane.ReadsIssues
+	}
+	return pullRequests, issues
+}
+
+// prefetchProjectSnapshots starts a background warm of each project's snapshot
+// pages and returns a function that waits for those warms to finish.
+//
+// It deliberately does not wait itself. Warming is benign — a cold page just
+// means the lane fetches it — so blocking the walk on it would let one slow or
+// unreachable repo stall every healthy project's discovery, HITL poll, and claim
+// phases behind two sequential `gh` timeouts. The walk therefore starts
+// immediately and the returned waiter is called at the end of the tick so no
+// goroutine outlives it.
+//
+// Warms also yield to the walk: a project the walk has already reached is skipped,
+// because the walk's own just-in-time fetch is already in flight or done, and
+// racing it would duplicate the call this change exists to eliminate.
+func prefetchProjectSnapshots(ctx context.Context, input defaultSchedulerTickInput, projects []storage.ProjectRecord, providers forge.Resolver, lanes []discoveryLane, snapshotFor func(string) *githubinfra.DiscoverySnapshot, walkedUpTo *atomic.Int64) func() {
+	noop := func() {}
+	if input.GitHubGateway == nil || snapshotFor == nil || walkedUpTo == nil || len(projects) < 2 {
+		return noop
+	}
+	if err := admissionRefuseWork(input); err != nil {
+		return noop
+	}
+	type prefetchTarget struct {
+		index        int
+		projectID    string
+		repo         string
+		cwd          string
+		pullRequests bool
+		issues       bool
+	}
+	targets := make([]prefetchTarget, 0, len(projects))
+	for index, project := range projects {
+		// Index 0 is skipped: the walk reaches it immediately, so warming it can only
+		// duplicate that fetch.
+		if index == 0 || project.Archived {
+			continue
+		}
+		capabilities := providers.ForProject(project.ID).Capabilities()
+		if !capabilities.GitHubCLIPullRequestCreation {
 			continue
 		}
 		repo, inCatalog := schedulerProjectRepo(input, project)
 		if !inCatalog || strings.TrimSpace(repo) == "" {
 			continue
 		}
-		targets = append(targets, prefetchTarget{projectID: project.ID, repo: repo, cwd: project.RepoPath})
-	}
-	// With one target there is no latency to hide: it would warm itself on first
-	// use anyway, and spawning for it only adds a code path.
-	if len(targets) < 2 {
-		return
-	}
-	var wg sync.WaitGroup
-	slots := make(chan struct{}, schedulerSnapshotPrefetchConcurrency(len(targets)))
-	for _, target := range targets {
-		if ctx.Err() != nil {
-			break
+		pullRequests, issues := snapshotPagesForProject(lanes, project.ID, capabilities)
+		if !pullRequests && !issues {
+			continue
 		}
-		slots <- struct{}{}
-		wg.Add(1)
-		go func(target prefetchTarget) {
-			defer wg.Done()
-			defer func() { <-slots }()
-			startedAt := time.Now()
-			err := snapshotFor(target.projectID).Prefetch(ctx, target.repo, target.cwd)
-			if input.Logger == nil {
-				return
-			}
-			fields := map[string]any{"projectId": target.projectID, "repo": target.repo, "durationMs": time.Since(startedAt).Milliseconds()}
-			if err != nil {
-				// Logged so a systematically failing warm is visible rather than
-				// silently costing every lane its own round trip.
-				fields["error"] = err.Error()
-				input.Logger.Debug("scheduler snapshot prefetch failed", fields)
-				return
-			}
-			input.Logger.Debug("scheduler snapshot prefetch completed", fields)
-		}(target)
+		targets = append(targets, prefetchTarget{index: index, projectID: project.ID, repo: repo, cwd: project.RepoPath, pullRequests: pullRequests, issues: issues})
 	}
-	wg.Wait()
+	if len(targets) == 0 {
+		return noop
+	}
+	// The bounded dispatch itself runs off the caller's path. Acquiring a slot
+	// blocks once the cap is reached, so dispatching inline would put the caller
+	// back behind a slow repo as soon as there are more projects than slots —
+	// reintroducing the stall this function exists to avoid, just at the Nth
+	// project instead of the first.
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		var warms sync.WaitGroup
+		defer warms.Wait()
+		slots := make(chan struct{}, schedulerSnapshotPrefetchConcurrency(len(targets)))
+		for _, target := range targets {
+			slots <- struct{}{}
+			warms.Add(1)
+			go func(target prefetchTarget) {
+				defer warms.Done()
+				defer func() { <-slots }()
+				if ctx.Err() != nil {
+					return
+				}
+				if walkedUpTo.Load() >= int64(target.index) {
+					return
+				}
+				startedAt := time.Now()
+				err := snapshotFor(target.projectID).Prefetch(ctx, target.repo, target.cwd, target.pullRequests, target.issues)
+				if input.Logger == nil {
+					return
+				}
+				fields := map[string]any{"projectId": target.projectID, "repo": target.repo, "pullRequests": target.pullRequests, "issues": target.issues, "durationMs": time.Since(startedAt).Milliseconds()}
+				if err != nil {
+					// Logged so a systematically failing warm is visible rather than
+					// silently costing every lane its own round trip.
+					fields["error"] = err.Error()
+					input.Logger.Debug("scheduler snapshot prefetch failed", fields)
+					return
+				}
+				input.Logger.Debug("scheduler snapshot prefetch completed", fields)
+			}(target)
+		}
+	}()
+	return wg.Wait
 }
 
 func projectDiscoverySnapshotOptions(input defaultSchedulerTickInput, projectID string) githubinfra.DiscoverySnapshotOptions {
@@ -3717,6 +3779,15 @@ func projectDiscoverySnapshotOptions(input defaultSchedulerTickInput, projectID 
 	issueLimit := 30
 	if input.Coordinator != nil && coordinatorEnabledForProject(input, projectID) {
 		issueLimit = maxInt(issueLimit, 100)
+	}
+	// Size the page to the largest limit a lane actually asks for. Gatekeeper lists
+	// 100 open PRs with no filters, so against a 30-PR page
+	// shouldFallbackToFilteredPullRequestQuery is unconditionally true: every
+	// gatekeeper tick discarded the page it was handed and paid a second raw
+	// 100-PR query. Matching the limit makes the shared page usable and removes
+	// that duplicate query whether or not anything prewarms it.
+	if input.Gatekeeper != nil {
+		prLimit = maxInt(prLimit, gatekeeper.DefaultDiscoveryPullRequestLimit)
 	}
 	return githubinfra.DiscoverySnapshotOptions{PullRequestLimit: prLimit, IssueLimit: issueLimit}
 }
