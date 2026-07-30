@@ -59,6 +59,12 @@ var runtimeAdapters = map[config.AgentVendor]runtimeAdapter{
 			return resolveDevinArgs(cfg, args, prompt)
 		},
 	},
+	config.AgentVendorHermes: {
+		command: "hermes",
+		resolveStartArgs: func(cfg ExecutorConfig, args []string, _ string, prompt string) []string {
+			return resolveHermesArgs(cfg, args, prompt)
+		},
+	},
 }
 
 func runtimeAdapterFor(vendor config.AgentVendor) (runtimeAdapter, bool) {

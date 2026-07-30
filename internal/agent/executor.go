@@ -2320,6 +2320,19 @@ func resolveDevinArgs(cfg ExecutorConfig, args []string, prompt string) []string
 	return append(resolved, prompt)
 }
 
+// resolveHermesArgs uses Hermes's documented scripted one-shot entry point.
+// Unlike `hermes` and `hermes chat`, `-z` is non-interactive and writes only
+// the final answer, which makes it suitable for a daemon-owned process. Model
+// selection is a per-run CLI override; this never reads or writes Hermes's
+// config, plugin, or credential stores.
+func resolveHermesArgs(cfg ExecutorConfig, args []string, prompt string) []string {
+	resolved := prependModelFlag(args, cfg.Model, "--model", []string{"-m", "--model"})
+	if hasAnyFlag(resolved, []string{"-z", "--zen", "-q", "--query"}) {
+		return resolved
+	}
+	return append(resolved, "-z", prompt)
+}
+
 func resolveNativeResumeArgs(cfg ExecutorConfig, workingDirectory string, args []string, sessionID string, prompt string) []string {
 	if adapter, ok := runtimeAdapterFor(cfg.Vendor); ok && adapter.resolveNativeResumeArgs != nil {
 		return adapter.resolveNativeResumeArgs(cfg, args, workingDirectory, sessionID, prompt)

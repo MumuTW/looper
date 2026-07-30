@@ -30,6 +30,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -114,6 +115,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return reportError(stderr, runStatus(ctx, parsed.Global, parsed.Operands, stdout))
 	case "project":
 		return reportError(stderr, runProject(ctx, parsed.Global, parsed.Operands, stdout))
+	case "doctor":
+		return reportError(stderr, runDoctor(ctx, parsed.Global, parsed.Operands, stdout))
 	}
 
 	request, err := routeForVerb(parsed.Verb, parsed.Operands)
@@ -274,7 +277,7 @@ func splitGlobalFlags(args []string) (parsedArgs, error) {
 			parsed.Verb = arg
 			continue
 		}
-		if strings.HasPrefix(arg, "-") && arg != "-" && parsed.Verb != "review" && parsed.Verb != "retry" {
+		if strings.HasPrefix(arg, "-") && arg != "-" && parsed.Verb != "review" && parsed.Verb != "retry" && parsed.Verb != "doctor" {
 			return parsedArgs{}, fmt.Errorf("unknown flag %q", name)
 		}
 		if parsed.Verb == "" {
@@ -472,7 +475,7 @@ port = 17310
 
 [agent]
 # The coding agent looperd drives. One of:
-#   claude-code, codex, opencode, cursor-cli, grok-build, devin-experimental
+#   claude-code, codex, opencode, cursor-cli, grok-build, devin-experimental, hermes
 # devin-experimental is fresh-run only.
 vendor = "claude-code"
 # model = "opus"
@@ -556,6 +559,216 @@ func writeNewConfigFile(path string, contents io.Reader) error {
 		return fmt.Errorf("write %s: %w", path, err)
 	}
 	return nil
+}
+
+// --- doctor ---------------------------------------------------------------
+
+const providerProbeTimeout = 2 * time.Second
+
+type providerCandidate struct {
+	Vendor               config.AgentVendor
+	ExecutablePath       string
+	Version              string
+	ProbeDiagnostic      string
+	CredentialKeyPresent []string
+}
+
+// runDoctor is deliberately read-only. Provider discovery is evidence for a
+// proposal, never authority to alter a configuration, import a credential, or
+// activate an assessment transport profile.
+func runDoctor(ctx context.Context, global, operands []string, stdout io.Writer) error {
+	apply := len(operands) == 1 && operands[0] == "--apply"
+	if len(operands) != 0 && !apply {
+		return badUsage("doctor takes no arguments, or exactly --apply")
+	}
+	options, err := loadOptions(global)
+	if err != nil {
+		return err
+	}
+	loaded, err := config.LoadFile(options)
+	if err != nil {
+		return err
+	}
+	candidates := discoverProviderCandidates(ctx, config.AgentProviderDescriptors(), exec.LookPath, os.LookupEnv, probeProviderVersion)
+	for _, candidate := range candidates {
+		if candidate.ExecutablePath == "" && candidate.ProbeDiagnostic == "" {
+			continue
+		}
+		_, _ = fmt.Fprintf(stdout, "%s: ", candidate.Vendor)
+		if candidate.ExecutablePath == "" {
+			_, _ = fmt.Fprintf(stdout, "unavailable (%s)\n", candidate.ProbeDiagnostic)
+			continue
+		}
+		_, _ = fmt.Fprintf(stdout, "installed at %s", candidate.ExecutablePath)
+		if candidate.Version != "" {
+			_, _ = fmt.Fprintf(stdout, " (%s)", candidate.Version)
+		}
+		if candidate.ProbeDiagnostic != "" {
+			_, _ = fmt.Fprintf(stdout, "; version probe: %s", candidate.ProbeDiagnostic)
+		}
+		if len(candidate.CredentialKeyPresent) > 0 {
+			_, _ = fmt.Fprintf(stdout, "; credential keys present: %s", strings.Join(candidate.CredentialKeyPresent, ", "))
+		}
+		_, _ = fmt.Fprintln(stdout)
+	}
+	if !hermesProposalAvailable(loaded, candidates) {
+		return nil
+	}
+	const patch = "agent.vendor = \"hermes\""
+	_, _ = fmt.Fprintf(stdout, "proposed config patch: %s\n", patch)
+	if !apply {
+		_, _ = fmt.Fprintln(stdout, "no configuration changed; rerun `looper doctor --apply` to accept this exact patch")
+		return nil
+	}
+	if !loaded.Metadata.ConfigFilePresent {
+		return fmt.Errorf("cannot apply provider proposal without a config file; run `looper init` first")
+	}
+	if err := applyHermesVendorPatch(loaded.Metadata.ConfigPath, loaded.Metadata.ConfigFileRevision); err != nil {
+		return err
+	}
+	_, _ = fmt.Fprintln(stdout, "applied config patch: agent.vendor = \"hermes\"")
+	return nil
+}
+
+func hermesProposalAvailable(loaded config.LoadedFileConfig, candidates []providerCandidate) bool {
+	hermesInstalled := false
+	for _, candidate := range candidates {
+		if candidate.Vendor == config.AgentVendorHermes && candidate.ExecutablePath != "" {
+			hermesInstalled = true
+			break
+		}
+	}
+	if !hermesInstalled || loaded.Metadata.FieldSources["agent.vendor"] != config.ValueSourceDefault {
+		return false
+	}
+	for _, profile := range loaded.Config.Agent.Profiles {
+		if profile.Vendor != nil {
+			return false
+		}
+	}
+	for _, role := range config.EffectiveCodingRoles(loaded.Config.Roles) {
+		if role.Agent != nil && (role.Agent.Vendor != nil || role.Agent.Profile != nil) {
+			return false
+		}
+	}
+	return true
+}
+
+// applyHermesVendorPatch writes only the canonical proposal that doctor
+// rendered. The field-source checks in hermesProposalAvailable keep explicit
+// global/profile/role choices authoritative; this final revision check keeps a
+// concurrently edited file from being overwritten by a stale preview.
+func applyHermesVendorPatch(path, expectedRevision string) error {
+	if !strings.EqualFold(filepath.Ext(path), ".toml") {
+		return fmt.Errorf("doctor can apply provider proposals only to TOML config; update %s manually with agent.vendor = \"hermes\"", path)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read config for provider proposal: %w", err)
+	}
+	if config.ConfigFileRevision(raw, true) != expectedRevision {
+		return fmt.Errorf("configuration changed since provider discovery; rerun `looper doctor`")
+	}
+	patched, err := patchTOMLAgentVendor(raw)
+	if err != nil {
+		return err
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("stat config for provider proposal: %w", err)
+	}
+	temporary, err := os.CreateTemp(filepath.Dir(path), ".looper-doctor-*")
+	if err != nil {
+		return fmt.Errorf("create provider proposal file: %w", err)
+	}
+	temporaryPath := temporary.Name()
+	defer os.Remove(temporaryPath)
+	if err := temporary.Chmod(info.Mode().Perm()); err != nil {
+		_ = temporary.Close()
+		return fmt.Errorf("set provider proposal file permissions: %w", err)
+	}
+	if _, err := temporary.Write(patched); err != nil {
+		_ = temporary.Close()
+		return fmt.Errorf("write provider proposal file: %w", err)
+	}
+	if err := temporary.Close(); err != nil {
+		return fmt.Errorf("close provider proposal file: %w", err)
+	}
+	if err := os.Rename(temporaryPath, path); err != nil {
+		return fmt.Errorf("replace config with provider proposal: %w", err)
+	}
+	return nil
+}
+
+func patchTOMLAgentVendor(raw []byte) ([]byte, error) {
+	text := string(raw)
+	lines := strings.SplitAfter(text, "\n")
+	for index, line := range lines {
+		if strings.TrimSpace(line) != "[agent]" {
+			continue
+		}
+		for _, next := range lines[index+1:] {
+			trimmed := strings.TrimSpace(next)
+			if strings.HasPrefix(trimmed, "[") {
+				break
+			}
+			if strings.HasPrefix(trimmed, "vendor") && strings.Contains(trimmed, "=") {
+				return nil, fmt.Errorf("agent.vendor is already configured; doctor will not overwrite it")
+			}
+		}
+		inserted := append([]string{}, lines[:index+1]...)
+		inserted = append(inserted, "vendor = \"hermes\"\n")
+		return []byte(strings.Join(append(inserted, lines[index+1:]...), "")), nil
+	}
+	if text != "" && !strings.HasSuffix(text, "\n") {
+		text += "\n"
+	}
+	return []byte("[agent]\nvendor = \"hermes\"\n" + text), nil
+}
+
+func discoverProviderCandidates(ctx context.Context, descriptors []config.AgentProviderDescriptor, lookPath func(string) (string, error), lookupEnv config.EnvLookupFunc, probe func(context.Context, string, []string) (string, error)) []providerCandidate {
+	candidates := make([]providerCandidate, 0, len(descriptors))
+	for _, descriptor := range descriptors {
+		candidate := providerCandidate{Vendor: descriptor.Vendor}
+		for _, executable := range descriptor.ExecutableCandidates {
+			path, err := lookPath(executable)
+			if err == nil {
+				candidate.ExecutablePath = path
+				break
+			}
+		}
+		if candidate.ExecutablePath == "" {
+			candidate.ProbeDiagnostic = "executable not found"
+		} else {
+			probeContext, cancel := context.WithTimeout(ctx, providerProbeTimeout)
+			version, err := probe(probeContext, candidate.ExecutablePath, descriptor.VersionArgs)
+			cancel()
+			if err != nil {
+				candidate.ProbeDiagnostic = strings.TrimSpace(err.Error())
+			} else {
+				candidate.Version = strings.TrimSpace(version)
+			}
+		}
+		for _, key := range descriptor.CredentialEnvKeys {
+			if _, present := lookupEnv(key); present {
+				candidate.CredentialKeyPresent = append(candidate.CredentialKeyPresent, key)
+			}
+		}
+		sort.Strings(candidate.CredentialKeyPresent)
+		candidates = append(candidates, candidate)
+	}
+	return candidates
+}
+
+func probeProviderVersion(ctx context.Context, executable string, args []string) (string, error) {
+	output, err := exec.CommandContext(ctx, executable, args...).CombinedOutput()
+	if ctx.Err() != nil {
+		return "", fmt.Errorf("timed out after %s", providerProbeTimeout)
+	}
+	if err != nil {
+		return "", fmt.Errorf("%w: %s", err, strings.TrimSpace(string(output)))
+	}
+	return string(output), nil
 }
 
 // --- status ----------------------------------------------------------------
@@ -1328,6 +1541,7 @@ func usage(w io.Writer) {
 
 Usage:
   looper init                  Write a starter config file (never overwrites)
+  looper doctor [--apply]      Discover providers; apply the shown proposal only with --apply
   looper status                Report config, daemon reachability, and projects
   looper project add <path>    Register a git repository root with the daemon
   looper project list          List registered projects
@@ -1364,7 +1578,7 @@ There is one more command, which is not for operators:
 A selector is a loop sequence number (looper stop 12) or a loop id
 (looper stop loop_1cf3); those are what the daemon resolves.
 The respond answer is a single argument, so quote anything with spaces.
-Every verb except init and version talks to looperd over HTTP and needs it
+Every verb except init, doctor, and version talks to looperd over HTTP and needs it
 running.
 `)
 }
