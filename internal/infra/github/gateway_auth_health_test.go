@@ -53,6 +53,42 @@ func TestGatewayRequireCredentialRejectsWrongHostTokenFamily(t *testing.T) {
 	}
 }
 
+func TestGatewayRequireCredentialDerivesHostFromRepoArgument(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		args      []string
+		env       map[string]string
+		wantToken string
+		wantCalls int
+	}{
+		{name: "separate repo argument", args: []string{"pr", "view", "1", "--repo", "ghe.example.test/acme/repo"}, env: map[string]string{"GH_ENTERPRISE_TOKEN": "enterprise"}, wantToken: "enterprise", wantCalls: 1},
+		{name: "equals repo argument", args: []string{"pr", "view", "1", "--repo=ghe.example.test/acme/repo"}, env: map[string]string{"GH_ENTERPRISE_TOKEN": "enterprise"}, wantToken: "enterprise", wantCalls: 1},
+		{name: "public token cannot serve GHES repo", args: []string{"pr", "view", "1", "--repo", "ghe.example.test/acme/repo"}, env: map[string]string{"GH_TOKEN": "public"}, wantCalls: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			g := New(Options{Env: tc.env, RequireCredential: true, GHRun: func(_ context.Context, options shell.Options) (shell.Result, error) {
+				calls++
+				if tc.wantToken != "" && options.Env["GH_ENTERPRISE_TOKEN"] != tc.wantToken {
+					t.Fatalf("gh env = %#v, want enterprise token", options.Env)
+				}
+				return shell.Result{}, nil
+			}})
+			_, err := g.runGhWithTimeout(context.Background(), "", "", time.Second, tc.args...)
+			if tc.wantCalls == 0 {
+				if !errors.Is(err, ErrCredentialUnavailable) {
+					t.Fatalf("runGhWithTimeout() error = %v, want ErrCredentialUnavailable", err)
+				}
+			} else if err != nil {
+				t.Fatalf("runGhWithTimeout() error = %v", err)
+			}
+			if calls != tc.wantCalls {
+				t.Fatalf("gh calls = %d, want %d", calls, tc.wantCalls)
+			}
+		})
+	}
+}
+
 func TestGatewayDaemonCommandUsesOnlyTheTargetHostCredential(t *testing.T) {
 	t.Setenv("GH_TOKEN", "ambient-public")
 	t.Setenv("GH_ENTERPRISE_TOKEN", "ambient-enterprise")

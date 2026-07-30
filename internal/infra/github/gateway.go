@@ -3195,6 +3195,17 @@ func hostnameFromGHArgs(args []string) string {
 			return args[i+1]
 		}
 	}
+	for i, arg := range args {
+		repo := ""
+		if arg == "--repo" && i+1 < len(args) {
+			repo = args[i+1]
+		} else if strings.HasPrefix(arg, "--repo=") {
+			repo = strings.TrimPrefix(arg, "--repo=")
+		}
+		if hostname, _ := splitRepoHostname(repo); hostname != "" {
+			return hostname
+		}
+	}
 	return "github.com"
 }
 
