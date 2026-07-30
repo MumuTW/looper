@@ -186,6 +186,8 @@ type Options struct {
 // Triage Report, and projects accepted low-risk reports directly into Planner
 // work. It has no configurable trigger labels and does not replace Fixer's
 // review-feedback source.
+// Stateful: it persists enrollment, report, confirmation, and projection
+// events in the local SQLite event log.
 type Runner struct {
 	repos          *storage.Repositories
 	github         GitHubGateway
