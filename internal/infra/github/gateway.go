@@ -3736,6 +3736,8 @@ func resolveLabelColor(label string) string {
 	switch strings.ToLower(strings.TrimSpace(label)) {
 	case labels.DefaultPlanTrigger:
 		return "5319e7"
+	case labels.DefaultWorkerReadyTrigger:
+		return "0052cc"
 	case labels.SpecReviewing:
 		return "1d76db"
 	case labels.SpecReady:
@@ -3753,6 +3755,8 @@ func resolveLabelDescription(label string) string {
 	switch strings.ToLower(strings.TrimSpace(label)) {
 	case labels.DefaultPlanTrigger:
 		return "Picked up automatically by planner"
+	case labels.DefaultWorkerReadyTrigger:
+		return "Picked up automatically by worker"
 	case labels.SpecReviewing:
 		return "Spec PR is under review"
 	case labels.SpecReady:
@@ -3775,6 +3779,7 @@ func resolveLabelDescription(label string) string {
 func StandardLooperLabels() []LabelDefinition {
 	return []LabelDefinition{
 		{Name: labels.DefaultPlanTrigger, Color: resolveLabelColor(labels.DefaultPlanTrigger), Description: resolveLabelDescription(labels.DefaultPlanTrigger)},
+		{Name: labels.DefaultWorkerReadyTrigger, Color: resolveLabelColor(labels.DefaultWorkerReadyTrigger), Description: resolveLabelDescription(labels.DefaultWorkerReadyTrigger)},
 		{Name: labels.SpecReviewing, Color: resolveLabelColor(labels.SpecReviewing), Description: resolveLabelDescription(labels.SpecReviewing)},
 		{Name: labels.SpecReady, Color: resolveLabelColor(labels.SpecReady), Description: resolveLabelDescription(labels.SpecReady)},
 		{Name: labels.NeedsHuman, Color: resolveLabelColor(labels.NeedsHuman), Description: resolveLabelDescription(labels.NeedsHuman)},
