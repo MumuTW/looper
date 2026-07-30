@@ -15,7 +15,7 @@ func TestRuntimeReconcileStaleRunningRunsQuarantinesSameCommandPIDReuse(t *testi
 	t.Parallel()
 
 	now := time.Date(2026, time.July, 30, 12, 0, 0, 0, time.UTC)
-	rt, repos := newStaleExecutionLeaseRuntime(t, now, func(context.Context, int) (string, error) {
+	rt, repos := newStaleExecutionLeaseRuntime(t, func() time.Time { return now }, func(context.Context, int) (string, error) {
 		return "codex exec", nil
 	})
 	loopID, runID, _ := seedStaleExecutionLeaseRun(t, repos, now, "same_command_pid_reuse")
@@ -80,7 +80,7 @@ func TestRuntimeReconcileNeverOverridesCurrentSupervisorOwner(t *testing.T) {
 	t.Parallel()
 
 	now := time.Date(2026, time.July, 30, 12, 0, 0, 0, time.UTC)
-	rt, repos := newStaleExecutionLeaseRuntime(t, now, nil)
+	rt, repos := newStaleExecutionLeaseRuntime(t, func() time.Time { return now }, nil)
 	loopID, runID, _ := seedStaleExecutionLeaseRun(t, repos, now, "supervisor_owned")
 	oldISO := formatJavaScriptISOString(now.Add(-2 * time.Hour))
 	executionID := "execution_supervisor_owned"
