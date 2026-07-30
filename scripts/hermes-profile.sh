@@ -59,6 +59,9 @@ model:
   provider: copilot-acp
 agent:
   max_turns: 60
+  # 1 = single attempt. Devin's free tier rate-limits aggressively and each
+  # retry burns another unit of the same quota, so retrying deepens the hole.
+  api_max_retries: 1
 memory:
   memory_enabled: true
   user_profile_enabled: true
