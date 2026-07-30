@@ -1548,7 +1548,10 @@ func stringsTrimSpace(value string) string {
 
 // TestApplyWorktreeArtifactExcludesDoesNotPolluteSharedExclude verifies that
 // the worktree-local exclude file does not leak into the main checkout's
-// shared .git/info/exclude when called on a linked worktree.
+// shared .git/info/exclude when called on a linked worktree, and — critically
+// — that the core.excludesfile pointer is stored in per-worktree config
+// (git config --worktree) rather than the shared --local config, so the
+// primary checkout and sibling worktrees never inherit looper's excludes.
 func TestApplyWorktreeArtifactExcludesDoesNotPolluteSharedExclude(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -1594,14 +1597,45 @@ func TestApplyWorktreeArtifactExcludesDoesNotPolluteSharedExclude(t *testing.T) 
 		}
 	}
 
-	// And the worktree's local config must point core.excludesfile at it.
-	coreExcludes := runGit(t, linkedPath, "config", "--local", "core.excludesfile")
+	// The core.excludesfile pointer must be in per-worktree config (--worktree),
+	// NOT the shared --local config. `git config --local` in a linked worktree
+	// writes the repository-wide .git/config, which would leak the pointer to
+	// the primary checkout and every sibling.
+	coreExcludes := runGit(t, linkedPath, "config", "--worktree", "core.excludesfile")
 	absExpected, _ := filepath.Abs(localExclude)
 	if !strings.Contains(coreExcludes, absExpected) {
-		t.Fatalf("worktree core.excludesfile = %q, want containing %q", coreExcludes, absExpected)
+		t.Fatalf("worktree --worktree core.excludesfile = %q, want containing %q", coreExcludes, absExpected)
 	}
 
-	// Idempotent: calling again does not pollute the shared file.
+	// The shared --local config must NOT carry core.excludesfile: that is the
+	// regression this test guards against (--local writes the shared .git/config
+	// in a linked worktree).
+	if sharedLocal := runGitMaybe(t, fixture.repoPath, "config", "--local", "core.excludesfile"); sharedLocal != "" {
+		t.Fatalf("shared --local core.excludesfile leaked = %q, want empty (per-worktree config must be used)", sharedLocal)
+	}
+
+	// Primary checkout must not honor looper's excludes: an artifact placed in
+	// the primary checkout must remain visible to `git status`.
+	primaryArtifactDir := filepath.Join(fixture.repoPath, ".pnpm-store", "v3")
+	mustMkdirAll(t, primaryArtifactDir)
+	writeFile(t, filepath.Join(primaryArtifactDir, "primary.bin"), "x\n")
+	statusOut := runGit(t, fixture.repoPath, "status", "--porcelain")
+	if !strings.Contains(statusOut, ".pnpm-store") {
+		t.Fatalf("primary checkout hides .pnpm-store via leaked excludes; status = %q", statusOut)
+	}
+
+	// A sibling worktree must also not inherit looper's excludes.
+	siblingPath := filepath.Join(fixture.rootDir, "sibling-worktree")
+	runGit(t, fixture.repoPath, "worktree", "add", "-b", "feature/sibling-test", siblingPath)
+	siblingArtifactDir := filepath.Join(siblingPath, "node_modules")
+	mustMkdirAll(t, siblingArtifactDir)
+	writeFile(t, filepath.Join(siblingArtifactDir, "dep.js"), "x\n")
+	siblingStatus := runGit(t, siblingPath, "status", "--porcelain")
+	if !strings.Contains(siblingStatus, "node_modules") {
+		t.Fatalf("sibling worktree hides node_modules via leaked excludes; status = %q", siblingStatus)
+	}
+
+	// Idempotent: calling again does not pollute the shared file or config.
 	gateway.applyWorktreeArtifactExcludes(ctx, linkedPath)
 	after2 := ""
 	if data, err := os.ReadFile(sharedExclude); err == nil {

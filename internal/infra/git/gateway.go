@@ -1130,9 +1130,44 @@ const worktreeExcludeManagedHeader = "# looper: build-artifact excludes (managed
 //
 // The exclude file lives in the worktree's private git directory (resolved via
 // `git rev-parse --git-dir`), so it is scoped to this worktree, never appears
-// in `git status`, and cannot collide with the shared info/exclude. The write
-// is idempotent (patterns already present are skipped) and best-effort: any
-// failure is swallowed so it never blocks a loop worktree.
+// in `git status`, and cannot collide with the shared info/exclude. The
+// core.excludesfile pointer is stored in the worktree's *per-worktree* config
+// (git config --worktree, which lives in the private git dir as
+// config.worktree), NOT the shared --local config — `git config --local` in a
+// linked worktree writes the repository-wide .git/config, which would leak the
+// pointer to the primary checkout and every sibling. The write is idempotent
+// (patterns already present are skipped) and best-effort: any failure is
+// swallowed so it never blocks a loop worktree.
+//
+// Persisted-state trade-off (AGENTS.md "New concepts require an explicit
+// trade-off"):
+//
+//   - New state: a looper-exclude file plus a core.excludesfile pointer in each
+//     worktree's per-worktree config, and a one-time extensions.worktreeConfig
+//     flag in the shared .git/config that enables the per-worktree config
+//     mechanism.
+//   - Lifecycle/cleanup: both the looper-exclude file and config.worktree live
+//     inside the worktree's private git dir, so `git worktree remove` deletes
+//     them atomically with the worktree. The only stale-state failure mode is a
+//     worktree directory deleted out-of-band (rm -rf without `git worktree
+//     remove`): the private git dir is then orphaned, but no live worktree
+//     references it, so the dangling pointer is inert (git ignores a missing
+//     excludesfile). `git worktree prune` reclaims the orphaned dir.
+//   - Failure mode: if extensions.worktreeConfig cannot be enabled (very old git
+//     or a read-only common dir), setWorktreeExcludesFile falls back to --local
+//     so the worktree still honors the excludes; the fallback is best-effort and
+//     the shared-config leak is the lesser evil versus no excludes at all.
+//   - Rejected simpler alternatives:
+//   - Delete the exclude layer entirely and filter artifacts at looper's
+//     staging boundary instead — rejected because git status / git add -A run
+//     by the agent and by users outside looper would still see and stage the
+//     artifacts; the ignore must be honored by git itself, not only by looper.
+//   - Use the shared info/exclude — rejected: that is the original bug; it is
+//     shared across all worktrees.
+//   - Pass --exclude-from on every git invocation — rejected: far more
+//     invasive, every call site must be updated, and any missed call site
+//     silently stages artifacts; core.excludesfile is the single git-native
+//     hook.
 func (g *Gateway) applyWorktreeArtifactExcludes(ctx context.Context, worktreePath string) {
 	if strings.TrimSpace(worktreePath) == "" {
 		return
@@ -1189,13 +1224,35 @@ func (g *Gateway) applyWorktreeArtifactExcludes(ctx context.Context, worktreePat
 
 // setWorktreeExcludesFile points the worktree's core.excludesfile at the
 // given worktree-local path so git honors the patterns without touching the
-// shared info/exclude. Best-effort.
+// shared info/exclude or the shared --local config.
+//
+// The pointer is written with `git config --worktree`, which stores it in the
+// worktree's private git dir (config.worktree) rather than the repository-wide
+// .git/config that `--local` targets. In a linked worktree `--local` writes the
+// shared config, so it would leak core.excludesfile to the primary checkout and
+// every sibling; --worktree is the only git-native way to scope the setting to
+// a single worktree.
+//
+// --worktree requires the extensions.worktreeConfig flag, which is enabled
+// idempotently first (a one-time, additive shared-config change). If that
+// cannot be enabled (very old git or read-only common dir), fall back to --local
+// so the worktree still honors the excludes — the shared-config leak is the
+// lesser evil versus no excludes. Best-effort.
 func (g *Gateway) setWorktreeExcludesFile(ctx context.Context, worktreePath, excludePath string) {
 	absPath, err := filepath.Abs(excludePath)
 	if err != nil {
 		absPath = excludePath
 	}
-	g.runGit(ctx, worktreePath, nil, "config", "--local", "core.excludesfile", absPath)
+	// Enable per-worktree config support (idempotent; one-time shared-config
+	// flag). Without this, `git config --worktree` fails on linked worktrees.
+	if g.runGit(ctx, worktreePath, nil, "config", "extensions.worktreeConfig", "true") != nil {
+		// Fallback: very old git or read-only common dir. Use --local so the
+		// worktree at least honors the excludes, accepting the shared-config
+		// leak as the lesser evil.
+		g.runGit(ctx, worktreePath, nil, "config", "--local", "core.excludesfile", absPath)
+		return
+	}
+	g.runGit(ctx, worktreePath, nil, "config", "--worktree", "core.excludesfile", absPath)
 }
 
 // worktreeExcludeContainsPattern reports whether pattern already appears as its
