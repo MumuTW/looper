@@ -425,11 +425,10 @@ func closeLoop(ctx context.Context, services looperdruntime.Services, loopID, re
 }
 
 // takeoverLoop parks a loop for interactive human takeover: it captures the loop's
-// latest agent session id + worktree + vendor, stops the daemon's in-flight run
-// (reusing stopLoop — pause + kill + cancel queue, so the scheduler leaves it
-// alone), then transitions the loop to human_takeover. The session id lives on
-// disk, so a human resumes the exact session and a later handback (retry) lets the
-// daemon native-resume it and see the human's turns.
+// latest agent session id + worktree + vendor, atomically parks the loop and
+// cancels queued work, then stops the daemon's in-flight run. The session id
+// lives on disk, so a human resumes the exact session and a later handback
+// (retry) lets the daemon native-resume it and see the human's turns.
 func takeoverLoop(ctx context.Context, services looperdruntime.Services, loopID, reason string, now func() time.Time, signal signalProcessFunc, executionMatchesProcess executionMatchesProcessFunc) (looperdapi.TakeoverResult, error) {
 	result := looperdapi.TakeoverResult{LoopID: loopID}
 	if services.Loops == nil {

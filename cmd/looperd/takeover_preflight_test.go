@@ -82,7 +82,7 @@ func TestTakeoverLoopAbortsWhenExecutionLookupFails(t *testing.T) {
 // no process to stop. In particular, each scheduler-visible active state must
 // end in human_takeover with its stale queue work cancelled.
 func TestTakeoverLoopHoldsActiveStatesBeforeHalting(t *testing.T) {
-	for _, initialStatus := range []string{"queued", "running", "paused", "awaiting_human"} {
+	for _, initialStatus := range []string{"idle", "queued", "running", "paused", "waiting", "awaiting_human"} {
 		t.Run(initialStatus, func(t *testing.T) {
 			ctx := context.Background()
 			services, repos, now := newStopAllTestServices(t)

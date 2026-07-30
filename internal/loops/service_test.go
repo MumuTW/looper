@@ -183,7 +183,7 @@ func TestServicePauseWaitingLoopCancelsQueuedWork(t *testing.T) {
 func TestServiceHoldMovesClaimableLoopToHumanTakeoverAndCancelsQueue(t *testing.T) {
 	t.Parallel()
 
-	for _, initialStatus := range []domain.LoopStatus{domain.LoopStatusQueued, domain.LoopStatusRunning} {
+	for _, initialStatus := range []domain.LoopStatus{domain.LoopStatusIdle, domain.LoopStatusQueued, domain.LoopStatusRunning, domain.LoopStatusWaiting} {
 		t.Run(string(initialStatus), func(t *testing.T) {
 			coordinator := openCoordinator(t)
 			ctx := context.Background()
