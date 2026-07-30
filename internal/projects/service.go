@@ -388,17 +388,10 @@ func (s *Service) addProjectLocked(ctx context.Context, input AddInput) (AddResu
 		// no role can act on: every discovery lane skips a project whose repo
 		// metadata is empty. Say so at registration instead of leaving the
 		// operator to infer it from a daemon log line on every tick.
-		// Deliberately silent about DELETE. RemoveProject terminates every loop
-		// and cancels every queue item for the project, and "terminated" has no
-		// outbound transition, so advising it here would destroy automation state
-		// to fix a missing field. Re-registration touches no loops.
-		//
-		// This warning fires during registration, so the operator is already
-		// holding the request that needs the field. It does not claim to be a
-		// general repair: re-registration applies creation defaults to omitted
-		// fields, which is why the reset is stated rather than glossed. A proper
-		// partial update belongs behind its own operation.
-		warnings = append(warnings, fmt.Sprintf(`No repository is set for this project, so no automation will run for it. Register %s again with the same repoPath and an explicit "repo":"owner/name"; this keeps any existing loops, but resends the whole record, so include the current name, baseBranch, and snapshotMode or they return to defaults. The CLI cannot set a repository.`, projectID))
+		// PATCH is the repair, not remove-and-recreate or re-registration:
+		// RemoveProject terminates every loop, while AddProject applies creation
+		// defaults to omitted fields. The update contract preserves omitted state.
+		warnings = append(warnings, fmt.Sprintf(`No repository is set for this project, so no automation will run for it. Set one with PATCH /api/v1/projects/%s and body {"repo":"owner/name"}; unlike creation defaults, omitted name, baseBranch, and snapshotMode are preserved, as are existing loops. The CLI cannot set a repository.`, projectID))
 	}
 
 	if err := s.validateReviewerAutoMergeForProject(ctx, projectID, repo, input.BaseBranch, cfg); err != nil {
