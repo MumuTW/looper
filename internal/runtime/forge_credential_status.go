@@ -2,7 +2,6 @@ package runtime
 
 import (
 	"github.com/nexu-io/looper/internal/config"
-	"github.com/nexu-io/looper/internal/forge"
 )
 
 // ForgeCredentialDegradedReason is the /status degraded reason emitted when the
@@ -48,16 +47,10 @@ func ForgeCredentialReadinessFor(cfg config.Config) ForgeCredentialReadiness {
 	return out
 }
 
-// configHasGitHubProviderProject reports whether any configured Project is
-// bound to a GitHub-pull-request provider. Unlike
-// runtimeConfigHasGitHubProjects, an empty project list is not GitHub: a fresh
-// install must not be reported as missing a credential it does not yet need.
+// configHasGitHubProviderProject reports whether any Project is configured.
+// Every project is GitHub, so any project means a GitHub credential is needed.
+// Unlike runtimeConfigHasGitHubProjects, an empty project list is not GitHub: a
+// fresh install must not be reported as missing a credential it does not need.
 func configHasGitHubProviderProject(cfg config.Config) bool {
-	providers := forge.NewResolver(cfg)
-	for _, project := range cfg.Projects {
-		if providers.ForProject(project.ID).Capabilities().GitHubPullRequests {
-			return true
-		}
-	}
-	return false
+	return len(cfg.Projects) > 0
 }

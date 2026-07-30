@@ -7,12 +7,11 @@ import (
 	"testing"
 
 	"github.com/nexu-io/looper/internal/config"
-	"github.com/nexu-io/looper/internal/forge"
 	"github.com/nexu-io/looper/internal/gatekeeper"
 	"github.com/nexu-io/looper/internal/triager"
 )
 
-func TestDiscoveryLanesRegisterTriagerAheadOfPlannerWithoutChangingFixerSupport(t *testing.T) {
+func TestDiscoveryLanesRegisterTriagerAheadOfPlanner(t *testing.T) {
 	t.Parallel()
 	lanes := discoveryLanes(defaultSchedulerTickInput{})
 	byName := make(map[string]discoveryLane, len(lanes))
@@ -25,24 +24,12 @@ func TestDiscoveryLanesRegisterTriagerAheadOfPlannerWithoutChangingFixerSupport(
 	if positions["triager"] >= positions[config.CodingRolePlanner] {
 		t.Fatalf("lane positions = %#v, want triager before planner", positions)
 	}
-	githubCapabilities, _ := forge.StaticCapabilities(forge.ProviderKindGitHub)
-	// A provider that does not serve issues through the GitHub gateway must not
-	// feed the GitHub-issue lanes. No such provider is configurable today, so
-	// synthesize one to keep the predicate honest.
-	nonGitHubIssueCapabilities := githubCapabilities
-	nonGitHubIssueCapabilities.GitHubIssues = false
-	if !byName["triager"].Supported(githubCapabilities) || byName["triager"].Supported(nonGitHubIssueCapabilities) {
-		t.Fatal("triager must accept GitHub issues only")
-	}
-	if !byName["coordinator"].Supported(githubCapabilities) || byName["coordinator"].Supported(nonGitHubIssueCapabilities) {
-		t.Fatal("coordinator must run only where GitHub owns issue authority")
-	}
-	// triager and coordinator both discover GitHub issues through the GitHub
-	// gateway, so they must share one authority predicate and never drift apart
-	// (the per-lane predicates previously drifted to different wrong flags).
-	for _, capabilities := range []forge.Capabilities{githubCapabilities, nonGitHubIssueCapabilities} {
-		if byName["triager"].Supported(capabilities) != byName["coordinator"].Supported(capabilities) {
-			t.Fatalf("triager and coordinator must share GitHub issue authority, drifted on %#v", capabilities)
+	// Every lane runs on every project: one provider kind means no lane can be
+	// unsupported. The per-lane capability predicate that used to encode this
+	// is gone, so the registration itself is the whole contract.
+	for _, name := range []string{"triager", "coordinator", config.CodingRoleFixer, config.RoleGatekeeper} {
+		if _, ok := byName[name]; !ok {
+			t.Fatalf("lane %q missing from registration: %#v", name, positions)
 		}
 	}
 }
