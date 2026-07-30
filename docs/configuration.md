@@ -727,6 +727,69 @@ allowedUserIds = [123456789]
 defaultProjectId = "looper"
 ```
 
+## Merge Gatekeeper trust level (`roles.gatekeeper.trust`)
+
+Merge Gatekeeper evaluates every open pull request against merge policy —
+required checks, review state, **unresolved review threads**, hold labels,
+mergeability, project policy — and writes a durable Gate report. The trust level
+decides what it may do with that judgement.
+
+| Level | Behaviour |
+| --- | --- |
+| `observe` (default) | Gate report only. Nothing is published, nothing is merged. |
+| `advise` | Additionally publishes the verdict and every blocking reason on the pull request, so the decision costs one read instead of a re-investigation. The human still merges. |
+| `auto` | Would let Gatekeeper merge. **Not implemented** — configuration rejects it. |
+
+`auto` is rejected rather than accepted and ignored on purpose: a merge authority
+that silently behaves one level below what was configured is the worst possible
+failure for this setting.
+
+```toml
+[roles.gatekeeper]
+trust = "advise"
+```
+
+Project overrides use `projects[].roles.gatekeeper.trust`.
+
+### The owned comment and its lifecycle
+
+At `advise` Looper owns exactly one comment on each pull request, identified by
+its marker **and** its author, so a human quoting the marker is never rewritten.
+
+| Transition | What happens |
+| --- | --- |
+| First verdict | The comment is created |
+| Verdict changed | The comment is updated in place |
+| Verdict unchanged | **Nothing at all** — no write, and no read either |
+| Demoted to `observe` | The comment is retired: its body is replaced with a withdrawal notice, once |
+| Duplicates found | The oldest survives and is updated; the rest are deleted |
+
+"Unchanged means no read" is the part that matters on a busy repository. Whether
+a verdict changed is decided from the previous Gate report in the local event log,
+so a quiet pull request costs no forge calls — scanning the discussion to discover
+there is nothing to do would cost a comment page per pull request per tick.
+
+Retirement keeps the marker, so promoting back to `advise` reuses the same comment
+instead of leaving a withdrawn one and adding a second. Duplicate reconciliation
+picks the oldest comment id, which every evaluator computes identically — two
+Looper instances racing therefore converge instead of leaving two contradictory
+verdicts.
+
+The verdict states the head it was evaluated at and says plainly that anything
+changing afterwards invalidates it. That is not decoration: holds, reviews,
+threads, and policy can all change without moving the head, which is why the Gate
+report is audit evidence rather than merge authority.
+
+### Relationship to `roles.reviewer.autoMerge`
+
+These are two different merge stories, and today they coexist: Reviewer's
+auto-merge opts a PR into GitHub's native auto-merge on its own approval, while
+Gatekeeper only observes or advises. Reviewer's path checks a narrower set of
+conditions — notably **not** unresolved review threads or requested changes.
+[#116](https://github.com/MumuTW/looper/issues/116) consolidates both behind this
+ladder and retires `roles.reviewer.autoMerge`; until `auto` exists, Reviewer's
+setting remains the only way Looper merges anything.
+
 ## Project override rules
 
 Project entries stay in `projects[]`, but any override-bearing config must mirror the same local shape it uses globally.
