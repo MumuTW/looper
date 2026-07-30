@@ -2542,6 +2542,38 @@ func (r *QueueRepository) RequeueLatestCancelledByLoop(ctx context.Context, loop
 	return affected, nil
 }
 
+// RequeueCompletedByID re-arms the just-completed queue item for a new human
+// inbox turn. A completed worker turn is distinct from a retry, so attempts
+// restart at zero. It never replaces another active item for the same loop.
+func (r *QueueRepository) RequeueCompletedByID(ctx context.Context, loopID, queueID, queuedAt string) (int64, error) {
+	result, err := r.q.ExecContext(ctx, `
+		UPDATE queue_items
+		SET status = 'queued',
+			available_at = ?,
+			attempts = 0,
+			claimed_by = NULL,
+			claimed_at = NULL,
+			started_at = NULL,
+			finished_at = NULL,
+			last_error = NULL,
+			last_error_kind = NULL,
+			updated_at = ?
+		WHERE id = ? AND loop_id = ? AND status = 'completed'
+			AND NOT EXISTS (
+				SELECT 1 FROM queue_items
+				WHERE loop_id = ? AND status IN ('queued', 'running') AND id != ?
+			)
+	`, queuedAt, queuedAt, queueID, loopID, loopID, queueID)
+	if err != nil {
+		return 0, fmt.Errorf("requeue completed queue item: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("read requeue completed queue item rows affected: %w", err)
+	}
+	return affected, nil
+}
+
 func (r *QueueRepository) RequeueLatestFailedByLoop(ctx context.Context, loopID, queuedAt string) (int64, error) {
 	queueID, err := r.findLatestQueueIDByLoopStatuses(ctx, loopID, []string{"manual_intervention", "failed"})
 	if err != nil {
