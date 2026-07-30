@@ -250,6 +250,41 @@ func TestPlannerReassessesWhenIssueChangedWhileAwaitingHuman(t *testing.T) {
 	}
 }
 
+// TestPlannerHonorsRejectionWhenIssueChangedWhileAwaitingHuman keeps a stop
+// decision from being treated like a stale authorization.  A later assessment
+// may find the edited Issue safe to automate, but it must not override the
+// human who declined this escalation.
+func TestPlannerHonorsRejectionWhenIssueChangedWhileAwaitingHuman(t *testing.T) {
+	t.Parallel()
+	harness := newEscalationHarness(t, true,
+		AgentResult{Status: "completed", Stdout: escalatingAssessmentJSON},
+		AgentResult{Status: "completed", Stdout: benignAssessmentJSON},
+		AgentResult{Status: "completed", Summary: "wrote spec"},
+	)
+	if processed := harness.process(t); processed.Status != "awaiting_human" {
+		t.Fatalf("first process = %#v", processed)
+	}
+	harness.answerEscalation(t, "stop — this needs a design discussion first")
+
+	// The Issue has changed to a scope that would otherwise pass reassessment.
+	harness.github.issueDetail.Title = "Planner needs-human exit (rescoped)"
+	harness.github.issueDetail.Body = "scope cut to internal/planner only"
+
+	processed := harness.process(t)
+	if processed.Status != "skipped" {
+		t.Fatalf("resumed process = %#v, want the human rejection settled", processed)
+	}
+	if len(harness.executor.starts) != 1 {
+		t.Fatalf("agent turns = %d, want no reassessment or spec after a rejection", len(harness.executor.starts))
+	}
+	if len(harness.github.createPRCalls) != 0 || len(harness.git.pushCalls) != 0 {
+		t.Fatal("a stale rejection was overridden and published a spec PR")
+	}
+	if !rejectionResolutionRecorded(t, harness) {
+		t.Fatal("no planner.escalation.resolved event records the human rejection")
+	}
+}
+
 // TestPlannerReassessesWhenBaseChangesWhileAwaitingHuman ensures the human is
 // never asked to authorize an assessment made against an older repository.
 func TestPlannerReassessesWhenBaseChangesWhileAwaitingHuman(t *testing.T) {
@@ -292,6 +327,31 @@ func supersededResolutionRecorded(t *testing.T, harness *escalationHarness) bool
 			t.Fatalf("unmarshal resolution payload error = %v", err)
 		}
 		if superseded, _ := payload["superseded"].(bool); superseded {
+			return true
+		}
+	}
+	return false
+}
+
+func rejectionResolutionRecorded(t *testing.T, harness *escalationHarness) bool {
+	t.Helper()
+	events, err := harness.fixture.repos.Events.ListByEntity(context.Background(), "loop", harness.loopID)
+	if err != nil {
+		t.Fatalf("Events.ListByEntity() error = %v", err)
+	}
+	for _, event := range events {
+		if event.EventType != EscalationResolutionEventType {
+			continue
+		}
+		var payload struct {
+			Authorized bool   `json:"authorized"`
+			Superseded bool   `json:"superseded"`
+			Answer     string `json:"answer"`
+		}
+		if err := json.Unmarshal([]byte(event.PayloadJSON), &payload); err != nil {
+			t.Fatalf("unmarshal resolution payload: %v", err)
+		}
+		if !payload.Authorized && !payload.Superseded && strings.Contains(payload.Answer, "stop") {
 			return true
 		}
 	}

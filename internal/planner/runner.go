@@ -1234,6 +1234,31 @@ func (r *Runner) applyEscalationAnswer(ctx context.Context, input stepInput, che
 	if checkpoint.Issue != nil {
 		repo, issueNumber = checkpoint.Issue.Repo, checkpoint.Issue.IssueNumber
 	}
+	answer := strings.TrimSpace(ask.Answer)
+	authorized := classifyEscalationAnswer(answer)
+	// A rejection is a human decision to stop this attempt, rather than an
+	// authorization derived from a particular Issue revision.  Honour it before
+	// checking for drift: retiring a stop because the Issue changed could make a
+	// later reassessment write a spec the human explicitly declined.
+	if !authorized {
+		if checkpoint.Scope == nil {
+			checkpoint.Scope = &checkpointScope{}
+		}
+		checkpoint.Scope.HumanDecision = answer
+		checkpoint.Scope.HumanAuthorized = false
+		checkpoint.Scope.HumanDecidedAt = ask.AnsweredAt
+		checkpoint.Scope.Assessed = true
+		checkpoint.SkipReason = fmt.Sprintf("Planner escalation settled by human for %s#%d: %s", repo, issueNumber, answer)
+		checkpoint.ResumePolicy = "advance_from_checkpoint"
+		checkpoint.Scope.Resolution = &checkpointEscalationResolution{
+			Authorized: false, Answer: answer, AnsweredAt: ask.AnsweredAt,
+		}
+		if err := r.persistCheckpoint(ctx, input.Run.ID, stepAssessScope, checkpoint); err != nil {
+			return checkpoint, false, wrapRetryableAfterResume(err)
+		}
+		updated, err := r.flushEscalationResolution(ctx, input, checkpoint)
+		return updated, true, err
+	}
 	// A human may answer days later. Honouring the answer against the
 	// checkpointed Issue would author a spec from a title/body nobody has read
 	// since the escalation was raised.
@@ -1297,20 +1322,15 @@ func (r *Runner) applyEscalationAnswer(ctx context.Context, input stepInput, che
 		return updated, false, nil
 	}
 
-	authorized := classifyEscalationAnswer(ask.Answer)
 	if checkpoint.Scope == nil {
 		checkpoint.Scope = &checkpointScope{}
 	}
-	checkpoint.Scope.HumanDecision = strings.TrimSpace(ask.Answer)
+	checkpoint.Scope.HumanDecision = answer
 	checkpoint.Scope.HumanAuthorized = authorized
 	checkpoint.Scope.HumanDecidedAt = ask.AnsweredAt
 	checkpoint.Scope.Assessed = true
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
-	if authorized {
-		checkpoint.Scope.AuthorizedGuidance = checkpoint.Scope.HumanDecision
-	} else {
-		checkpoint.SkipReason = fmt.Sprintf("Planner escalation settled by human for %s#%d: %s", repo, issueNumber, checkpoint.Scope.HumanDecision)
-	}
+	checkpoint.Scope.AuthorizedGuidance = checkpoint.Scope.HumanDecision
 	// Durability before consumption. The resolution audit event is represented
 	// in the same checkpoint as the decision, then drained by the next pass; a
 	// transient event-store failure therefore cannot make an authorized run
