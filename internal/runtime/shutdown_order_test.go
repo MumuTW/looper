@@ -345,6 +345,16 @@ func TestStopRetainsDatabaseAttachLockWhenStorageRetained(t *testing.T) {
 	if err := daemonA.Start(context.Background()); err != nil {
 		t.Fatalf("daemonA.Start() error = %v", err)
 	}
+	// Stop is guarded by shutdownOnce, so this is safe alongside the explicit
+	// Stop below and covers every t.Fatalf between here and it. The retained
+	// coordinator is closed after the assertions have run — the retention
+	// itself is what the test asserts, so it cannot be released earlier.
+	t.Cleanup(func() {
+		daemonA.Stop("test cleanup")
+		if coordinator := daemonA.Services().Coordinator; coordinator != nil {
+			_ = coordinator.Close()
+		}
+	})
 
 	// Force a containment drain failure so Stop retains storage.
 	lease, err := daemonA.activeExecutions.AdmitSpawn(context.Background(), agent.SpawnMeta{
@@ -358,12 +368,17 @@ func TestStopRetainsDatabaseAttachLockWhenStorageRetained(t *testing.T) {
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("cmd.Start: %v", err)
 	}
+	// Registered immediately: a failure in Bind or BindHandle below would
+	// otherwise leave this child running for the lifetime of the test binary.
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+	})
 	handle, err := processcontainment.Bind(cmd, processcontainment.Options{
 		GracePeriod:  20 * time.Millisecond,
 		DrainTimeout: 2 * time.Second,
 	})
 	if err != nil {
-		_ = cmd.Process.Kill()
 		t.Fatalf("Bind: %v", err)
 	}
 	forceDrainFail := errors.New("forced soft-kill failure for attach-lock retain contract")

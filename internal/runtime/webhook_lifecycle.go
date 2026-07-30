@@ -181,35 +181,63 @@ func attachLockFileName(cfgStorageDBPath string) string {
 	return "looperd.attach." + canonicalDatabaseIdentity(cfgStorageDBPath) + ".lock"
 }
 
-// canonicalDatabaseIdentity returns a stable short identifier for a database
-// path. Empty paths default to the conventional looper.sqlite so a daemon with
-// no explicit DBPath still gets a deterministic, distinct lock.
-func canonicalDatabaseIdentity(cfgStorageDBPath string) string {
+// resolvedDatabasePath returns the effective physical path of the configured
+// database. It is the single source of truth for both the attach lock's
+// directory and its identity hash: deriving those separately let the two
+// disagree about which database a lock guards, which defeats the lock in two
+// ways. A lexical identity hashes an alias (a symlinked file or parent
+// directory) differently from its real path, so two daemons on one physical
+// database take different locks and both migrate it. And an identity that
+// resolves an empty DBPath differently from the lock directory produces
+// different lock filenames in the same directory, with the same result.
+//
+// Resolution order: empty means the conventional ~/.looper/looper.sqlite, any
+// path is made absolute, then symlinks are resolved.
+func resolvedDatabasePath(cfgStorageDBPath string) string {
 	dbPath := strings.TrimSpace(cfgStorageDBPath)
 	if dbPath == "" {
 		dbPath = "looper.sqlite"
+		if home, err := os.UserHomeDir(); err == nil {
+			dbPath = filepath.Join(home, ".looper", "looper.sqlite")
+		}
 	}
 	if absPath, err := filepath.Abs(dbPath); err == nil {
 		dbPath = absPath
 	}
-	sum := sha256.Sum256([]byte(filepath.ToSlash(dbPath)))
+	return resolvePathSymlinks(dbPath)
+}
+
+// resolvePathSymlinks resolves the deepest existing ancestor of path and
+// rejoins the components below it. filepath.EvalSymlinks fails outright when
+// the leaf does not exist, which is the normal case on a first boot — the
+// database file is created after the lock is taken — so resolving the existing
+// prefix is what makes aliased spellings collapse before the file exists.
+func resolvePathSymlinks(path string) string {
+	var trailing []string
+	current := path
+	for {
+		if resolved, err := filepath.EvalSymlinks(current); err == nil {
+			return filepath.Join(append([]string{resolved}, trailing...)...)
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return path
+		}
+		trailing = append([]string{filepath.Base(current)}, trailing...)
+		current = parent
+	}
+}
+
+// canonicalDatabaseIdentity returns a stable short identifier for the physical
+// database a config points at. Aliased spellings of one database resolve to the
+// same identity.
+func canonicalDatabaseIdentity(cfgStorageDBPath string) string {
+	sum := sha256.Sum256([]byte(filepath.ToSlash(resolvedDatabasePath(cfgStorageDBPath))))
 	return hex.EncodeToString(sum[:8])
 }
 
 func daemonLockPath(cfgStorageDBPath, name string) string {
-	dbPath := strings.TrimSpace(cfgStorageDBPath)
-	if dbPath != "" {
-		if absPath, err := filepath.Abs(dbPath); err == nil {
-			dbPath = absPath
-		}
-	}
-	dir := filepath.Dir(dbPath)
-	if dir == "." || dir == "" {
-		if home, err := os.UserHomeDir(); err == nil {
-			dir = filepath.Join(home, ".looper")
-		}
-	}
-	return filepath.Join(dir, name)
+	return filepath.Join(filepath.Dir(resolvedDatabasePath(cfgStorageDBPath)), name)
 }
 
 type daemonLock struct {

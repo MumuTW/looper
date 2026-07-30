@@ -4971,16 +4971,23 @@ func TestDatabaseAttachLockPathDerivedPerDatabase(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
+	// The lock path is symlink-resolved, and on macOS t.TempDir() sits under
+	// /var, itself a symlink to /private/var. Compare against the resolved
+	// directory rather than the spelling the test was handed.
+	resolvedDir, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		t.Fatalf("EvalSymlinks(%q) error = %v", dir, err)
+	}
 	pathA := databaseAttachLockPath(filepath.Join(dir, "a.sqlite"))
 	pathB := databaseAttachLockPath(filepath.Join(dir, "b.sqlite"))
 	if pathA == pathB {
 		t.Fatalf("attach lock paths for different databases collide: %q == %q", pathA, pathB)
 	}
-	if filepath.Dir(pathA) != dir {
-		t.Fatalf("attach lock for %q lives in %q, want %q", "a.sqlite", filepath.Dir(pathA), dir)
+	if filepath.Dir(pathA) != resolvedDir {
+		t.Fatalf("attach lock for %q lives in %q, want %q", "a.sqlite", filepath.Dir(pathA), resolvedDir)
 	}
-	if filepath.Dir(pathB) != dir {
-		t.Fatalf("attach lock for %q lives in %q, want %q", "b.sqlite", filepath.Dir(pathB), dir)
+	if filepath.Dir(pathB) != resolvedDir {
+		t.Fatalf("attach lock for %q lives in %q, want %q", "b.sqlite", filepath.Dir(pathB), resolvedDir)
 	}
 	// Same database must resolve to the same lock path deterministically.
 	if databaseAttachLockPath(filepath.Join(dir, "a.sqlite")) != pathA {
@@ -4992,6 +4999,70 @@ func TestDatabaseAttachLockPathDerivedPerDatabase(t *testing.T) {
 	if webhookForwarderLockPath(filepath.Join(dir, "a.sqlite")) != webhookForwarderLockPath(filepath.Join(dir, "b.sqlite")) {
 		t.Fatal("webhook forwarder lock path diverged for different databases; it is intentionally directory-keyed")
 	}
+}
+
+// TestDatabaseAttachLockPathCollapsesAliases covers the other half of the
+// naming contract: two spellings of one physical database must produce one lock
+// path. A lexical identity fails this — filepath.Abs preserves the alias — and
+// two daemons would then take different locks against the same file and both
+// migrate it.
+func TestDatabaseAttachLockPathCollapsesAliases(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	realDir := filepath.Join(root, "real")
+	if err := os.MkdirAll(realDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(%q) error = %v", realDir, err)
+	}
+
+	t.Run("symlinked parent directory", func(t *testing.T) {
+		t.Parallel()
+		linkDir := filepath.Join(root, "link-dir")
+		if err := os.Symlink(realDir, linkDir); err != nil {
+			t.Skipf("symlinks unavailable: %v", err)
+		}
+		// The database file deliberately does not exist yet: the attach lock is
+		// taken before the database is created on a first boot, so resolution
+		// must work from the existing parent.
+		viaReal := databaseAttachLockPath(filepath.Join(realDir, "looper.sqlite"))
+		viaLink := databaseAttachLockPath(filepath.Join(linkDir, "looper.sqlite"))
+		if viaReal != viaLink {
+			t.Fatalf("aliased parent directories produced different attach locks:\n real: %q\n link: %q", viaReal, viaLink)
+		}
+	})
+
+	t.Run("symlinked database file", func(t *testing.T) {
+		t.Parallel()
+		realDB := filepath.Join(realDir, "existing.sqlite")
+		if err := os.WriteFile(realDB, []byte("x"), 0o600); err != nil {
+			t.Fatalf("WriteFile(%q) error = %v", realDB, err)
+		}
+		linkDB := filepath.Join(root, "link-db.sqlite")
+		if err := os.Symlink(realDB, linkDB); err != nil {
+			t.Skipf("symlinks unavailable: %v", err)
+		}
+		viaReal := databaseAttachLockPath(realDB)
+		viaLink := databaseAttachLockPath(linkDB)
+		if viaReal != viaLink {
+			t.Fatalf("aliased database files produced different attach locks:\n real: %q\n link: %q", viaReal, viaLink)
+		}
+	})
+
+	t.Run("identity and lock directory agree for an empty DBPath", func(t *testing.T) {
+		t.Parallel()
+		// canonicalDatabaseIdentity and daemonLockPath used to resolve an empty
+		// DBPath differently ($CWD/looper.sqlite vs ~/.looper), so two daemons
+		// started from different working directories hashed to different lock
+		// filenames inside the same directory and both acquired the lock.
+		// Sharing one resolver makes that impossible; assert they agree.
+		lockPath := databaseAttachLockPath("")
+		if got, want := filepath.Dir(lockPath), filepath.Dir(resolvedDatabasePath("")); got != want {
+			t.Fatalf("attach lock directory %q disagrees with the resolved database directory %q", got, want)
+		}
+		if !strings.Contains(filepath.Base(lockPath), canonicalDatabaseIdentity("")) {
+			t.Fatalf("attach lock name %q does not carry the canonical identity", filepath.Base(lockPath))
+		}
+	})
 }
 
 // TestRuntimeAttachLockDoesNotBlockPreLockAttachment covers the documented
