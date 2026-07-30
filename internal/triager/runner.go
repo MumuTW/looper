@@ -50,6 +50,7 @@ const (
 	defaultIssueLimit                     = 100
 	defaultDecisionLimit                  = 1
 	defaultSourceLookback                 = 5 * time.Minute
+	defaultMaxPendingReadsPerTick         = 25
 	autoRouteConfidence                   = 0.8
 	reportEntityType                      = "github_issue"
 	sourceEventNew        SourceEventKind = "new"
@@ -161,6 +162,7 @@ type Options struct {
 	Now            func() time.Time
 	SourceLookback time.Duration
 	DecisionLimit  int
+	MaxPendingReadsPerTick int
 }
 
 type Runner struct {
@@ -171,6 +173,10 @@ type Runner struct {
 	now            func() time.Time
 	sourceLookback time.Duration
 	decisionLimit  int
+	// maxPendingReadsPerTick bounds GitHub reads for pending-source
+	// confirmation scans per tick so a large awaiting-confirmation
+	// backlog cannot consume the entire rate limit.
+	maxPendingReadsPerTick int
 }
 
 type DiscoveryInput struct {
@@ -189,7 +195,10 @@ type DiscoveryResult struct {
 	Confirmed            int
 	Skipped              int
 	Retired              int
-	QueueItems           []storage.QueueItemRecord
+	// PendingReadsExhausted counts pending sources skipped because the
+	// per-tick GitHub read budget was exhausted.
+	PendingReadsExhausted int
+	QueueItems            []storage.QueueItemRecord
 }
 
 func New(options Options) *Runner {
@@ -205,9 +214,14 @@ func New(options Options) *Runner {
 	if decisionLimit <= 0 {
 		decisionLimit = defaultDecisionLimit
 	}
+	readsBudget := options.MaxPendingReadsPerTick
+	if readsBudget <= 0 {
+		readsBudget = defaultMaxPendingReadsPerTick
+	}
 	return &Runner{
 		repos: options.Repos, github: options.GitHub, llm: options.LLM,
 		planner: options.Planner, now: now, sourceLookback: sourceLookback, decisionLimit: decisionLimit,
+		maxPendingReadsPerTick: readsBudget,
 	}
 }
 
@@ -281,8 +295,13 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 	}
 
 	pending := pendingSourceStates(states)
+	readsBudget := r.maxPendingReadsPerTick
 	for _, state := range pending {
-		if err := r.processSourceState(ctx, *project, input.Repo, state, input.DecisionBudget, &result); err != nil {
+		if readsBudget <= 0 {
+			result.PendingReadsExhausted++
+			break
+		}
+		if err := r.processSourceState(ctx, *project, input.Repo, state, input.DecisionBudget, &result, &readsBudget); err != nil {
 			return result, err
 		}
 	}
@@ -389,8 +408,14 @@ func pendingSourceStates(states map[string]*sourceState) []*sourceState {
 	return pending
 }
 
-func (r *Runner) processSourceState(ctx context.Context, project storage.ProjectRecord, repo string, state *sourceState, decisionBudget *int, result *DiscoveryResult) error {
+func (r *Runner) processSourceState(ctx context.Context, project storage.ProjectRecord, repo string, state *sourceState, decisionBudget *int, result *DiscoveryResult, readsBudget *int) error {
 	enrollment := state.enrollment
+	if readsBudget != nil {
+		*readsBudget--
+		if *readsBudget < 0 {
+			return nil
+		}
+	}
 	detail, err := r.github.ViewIssue(ctx, githubinfra.ViewIssueInput{Repo: repo, IssueNumber: enrollment.IssueNumber, CWD: project.RepoPath})
 	if err != nil {
 		return err
