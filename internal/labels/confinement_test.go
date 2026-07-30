@@ -39,7 +39,7 @@ var ownerDirs = []string{
 func TestLabelLiteralsAreConfinedToTheirOwningPackage(t *testing.T) {
 	t.Parallel()
 
-	forbidden := protectedLabelValues(t)
+	forbidden, authority := protectedLabelValues(t)
 	if len(forbidden) == 0 {
 		t.Fatal("found no label constants to protect; the derivation is broken")
 	}
@@ -74,7 +74,7 @@ func TestLabelLiteralsAreConfinedToTheirOwningPackage(t *testing.T) {
 					return nil
 				}
 			}
-			for _, found := range stringLiterals(path) {
+			for _, found := range stringExpressions(path, authority) {
 				// Compare normalized: forge labels are case-insensitive and
 				// this package's own comparisons fold case, so "LOOPER:PLAN"
 				// is the same protocol label and the same bypass.
@@ -92,19 +92,26 @@ func TestLabelLiteralsAreConfinedToTheirOwningPackage(t *testing.T) {
 }
 
 // protectedLabelValues maps each normalized protected value to the qualified
-// constant that holds it.
+// constant that holds it, and returns an authority table (qualified constant
+// name → value) for folding assembled expressions such as `labels.Prefix +
+// "plan"`.
 //
-// Prefix is excluded: it is a namespace test rather than a label, and code
-// legitimately matches on it through IsLooperOwned.
+// Prefix is excluded from the protected set: it is a namespace marker rather
+// than a label, and code legitimately matches on it through IsLooperOwned. It
+// remains in the authority table so a concatenation that assembles a full label
+// from it folds to the label value and is caught.
 //
-// Not detected: a value assembled from fragments, such as `Prefix + "plan"`.
-// Catching that needs constant folding over arbitrary expressions, which is a
-// large amount of machinery for a bypass nobody has written; the confinement
-// rule targets the copy-paste that has actually happened twice.
-func protectedLabelValues(t *testing.T) map[string]string {
+// Assembled values are detected when they are constant: literal concatenation
+// (`"looper:" + "plan"`) and references to label-authority constants
+// (`labels.Prefix + "plan"`). Arbitrary runtime expressions such as
+// fmt.Sprintf are not folded; the confinement rule targets the copy-paste and
+// constant-reassembly that has actually happened, not every conceivable
+// construction.
+func protectedLabelValues(t *testing.T) (map[string]string, map[string]string) {
 	t.Helper()
 
-	out := map[string]string{}
+	forbidden := map[string]string{}
+	authority := map[string]string{}
 	collect := func(dir, qualifier string) {
 		entries, err := os.ReadDir(dir)
 		if err != nil {
@@ -115,10 +122,11 @@ func protectedLabelValues(t *testing.T) map[string]string {
 				continue
 			}
 			for name, value := range stringConsts(t, filepath.Join(dir, entry.Name())) {
+				authority[qualifier+"."+name] = value
 				if name == "Prefix" || !strings.HasPrefix(strings.ToLower(value), Prefix) {
 					continue
 				}
-				out[Normalize(value)] = qualifier + "." + name
+				forbidden[Normalize(value)] = qualifier + "." + name
 			}
 		}
 	}
@@ -126,7 +134,7 @@ func protectedLabelValues(t *testing.T) map[string]string {
 	// protected without anyone remembering to extend a list.
 	collect(filepath.Join(repoRoot, "internal", "labels"), "labels")
 	collect(filepath.Join(repoRoot, "internal", "network", "protocol"), "protocol")
-	return out
+	return forbidden, authority
 }
 
 func stringConsts(t *testing.T, path string) map[string]string {
@@ -166,22 +174,112 @@ type literal struct {
 	line  int
 }
 
-func stringLiterals(path string) []literal {
+// stringExpressions returns the compile-time constant string expressions in a
+// file: bare string literals and assembled values such as "looper:" + "plan"
+// or labels.Prefix + "plan". A bare reference to a label constant
+// (labels.DefaultPlanTrigger) is the intended usage and is not reported; only
+// literal or assembled expressions restate a value, so only those are
+// collected. Each top-level constant expression is reported once rather than
+// re-reporting its fragments.
+func stringExpressions(path string, authority map[string]string) []literal {
 	fset := token.NewFileSet()
 	file, err := parser.ParseFile(fset, path, nil, parser.SkipObjectResolution)
 	if err != nil {
 		return nil
 	}
+	local := fileStringConstants(file)
 	out := []literal{}
 	ast.Inspect(file, func(node ast.Node) bool {
-		lit, ok := node.(*ast.BasicLit)
-		if !ok || lit.Kind != token.STRING {
+		expr, ok := node.(ast.Expr)
+		if !ok {
 			return true
 		}
-		if unquoted, err := strconv.Unquote(lit.Value); err == nil {
-			out = append(out, literal{value: unquoted, line: fset.Position(lit.Pos()).Line})
+		// Only literal or assembled expressions can restate a value; a bare
+		// reference to the constant is the intended usage.
+		switch expr.(type) {
+		case *ast.BasicLit, *ast.BinaryExpr:
+		default:
+			return true
 		}
-		return true
+		value, ok := foldString(expr, local, authority)
+		if !ok {
+			return true
+		}
+		out = append(out, literal{value: value, line: fset.Position(expr.Pos()).Line})
+		return false // handled this expression; do not re-report its fragments
 	})
 	return out
+}
+
+// fileStringConstants returns this file's own top-level string constants
+// (local name → value) so a concatenation using a local constant folds.
+func fileStringConstants(file *ast.File) map[string]string {
+	consts := map[string]string{}
+	for _, decl := range file.Decls {
+		gen, ok := decl.(*ast.GenDecl)
+		if !ok || gen.Tok != token.CONST {
+			continue
+		}
+		for _, spec := range gen.Specs {
+			value, ok := spec.(*ast.ValueSpec)
+			if !ok || len(value.Names) != len(value.Values) {
+				continue
+			}
+			for i, name := range value.Names {
+				lit, ok := value.Values[i].(*ast.BasicLit)
+				if !ok || lit.Kind != token.STRING {
+					continue
+				}
+				if unquoted, err := strconv.Unquote(lit.Value); err == nil {
+					consts[name.Name] = unquoted
+				}
+			}
+		}
+	}
+	return consts
+}
+
+// foldString evaluates expr as a compile-time constant string, resolving
+// references to label-authority constants (labels.Prefix,
+// protocol.TargetLabelPrefix) and local file constants. It returns the folded
+// value and true when expr is a constant string expression.
+func foldString(expr ast.Expr, local, authority map[string]string) (string, bool) {
+	switch e := expr.(type) {
+	case *ast.BasicLit:
+		if e.Kind != token.STRING {
+			return "", false
+		}
+		v, err := strconv.Unquote(e.Value)
+		if err != nil {
+			return "", false
+		}
+		return v, true
+	case *ast.BinaryExpr:
+		if e.Op != token.ADD {
+			return "", false
+		}
+		left, ok := foldString(e.X, local, authority)
+		if !ok {
+			return "", false
+		}
+		right, ok := foldString(e.Y, local, authority)
+		if !ok {
+			return "", false
+		}
+		return left + right, true
+	case *ast.ParenExpr:
+		return foldString(e.X, local, authority)
+	case *ast.Ident:
+		v, ok := local[e.Name]
+		return v, ok
+	case *ast.SelectorExpr:
+		pkg, ok := e.X.(*ast.Ident)
+		if !ok {
+			return "", false
+		}
+		v, ok := authority[pkg.Name+"."+e.Sel.Name]
+		return v, ok
+	default:
+		return "", false
+	}
 }
