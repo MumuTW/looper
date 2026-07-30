@@ -95,7 +95,7 @@ The act of putting an Issue into a state where Planner or Worker will discover i
 _Avoid_: handoff (overloaded — see below), route, promote, enqueue.
 
 **Trigger label**:
-The label a reactive Role watches for to claim an Issue or Pull Request. Configured per Role under `roles.<role>.triggers.labels`; the defaults are `labels.DefaultPlanTrigger` and `labels.DefaultWorkerReadyTrigger` in `internal/labels`, which is the single definition point for every label Looper reads or writes. Runtime discovery must read the configured value, not the default.
+The label a reactive Role watches for to claim an Issue or Pull Request. Configured per Role under `roles.<role>.triggers.labels`; the defaults are `labels.DefaultPlanTrigger` and `labels.DefaultWorkerReadyTrigger` in `internal/labels`, the single definition point for role trigger defaults, spec PR lifecycle labels, and holds. Target labels live in `internal/network/protocol` because forming one requires validating a Node name, and comment markers are a separate mechanism kept with the protocol that emits them. Runtime discovery must read the configured value, not the default.
 _Avoid_: queue label, pickup label, routed label, dispatched label, target label.
 
 **Veto signal**:

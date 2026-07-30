@@ -1,5 +1,6 @@
 // Package labels is the single definition point for the forge labels Looper
-// reads and writes.
+// reads and writes, with two documented exceptions below: Network target
+// labels and comment markers.
 //
 // Labels are not decoration. Per ADR-0010 the label on an Issue or Pull
 // Request is the durable Authority for work eligibility: a Role claims work
