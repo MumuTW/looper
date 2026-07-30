@@ -3454,6 +3454,9 @@ func (r *Runner) runPushStep(ctx context.Context, input stepInput) (fixerCheckpo
 	if checkpoint.Push != nil && checkpoint.Push.Pushed {
 		return checkpoint, nil
 	}
+	if _, err := loops.DecodeMetadataObjectForWrite(input.Loop.MetadataJSON); err != nil {
+		return checkpoint, fmt.Errorf("validate loop metadata before push: %w", err)
+	}
 	worktree, err := requireWorktree(checkpoint)
 	if err != nil {
 		return checkpoint, err
@@ -5835,7 +5838,13 @@ func (r *Runner) updateLoop(ctx context.Context, loop storage.LoopRecord, mutate
 	if current != nil {
 		updated = *current
 	}
+	metadataBefore := updated.MetadataJSON
 	mutate(&updated)
+	if derefString(metadataBefore) != derefString(updated.MetadataJSON) {
+		if _, err := loops.DecodeMetadataObjectForWrite(metadataBefore); err != nil {
+			return storage.LoopRecord{}, err
+		}
+	}
 	updated.UpdatedAt = eventlog.NextJavaScriptISOString(r.now(), updated.UpdatedAt)
 	if err := r.repos.Loops.Upsert(ctx, updated); err != nil {
 		return storage.LoopRecord{}, err
@@ -6132,7 +6141,10 @@ func (r *Runner) completeQueuedFixerItemsForLoop(ctx context.Context, loopID str
 
 func (r *Runner) clearFixerFollowupMetadata(ctx context.Context, loop storage.LoopRecord) (storage.LoopRecord, error) {
 	apply := func(updated *storage.LoopRecord) error {
-		meta := parseJSONObject(updated.MetadataJSON)
+		meta, err := loops.DecodeMetadataObjectForWrite(updated.MetadataJSON)
+		if err != nil {
+			return err
+		}
 		delete(meta, "fixerFollowup")
 		delete(meta, "lastNoopResolveHeadSha")
 		delete(meta, "lastNoopResolveFixItemsHash")
@@ -6165,7 +6177,10 @@ func (r *Runner) clearFixerFollowupMetadata(ctx context.Context, loop storage.Lo
 
 func (r *Runner) clearZeroProgressMetadata(ctx context.Context, loop storage.LoopRecord) (storage.LoopRecord, error) {
 	apply := func(updated *storage.LoopRecord) error {
-		meta := parseJSONObject(updated.MetadataJSON)
+		meta, err := loops.DecodeMetadataObjectForWrite(updated.MetadataJSON)
+		if err != nil {
+			return err
+		}
 		delete(meta, "fixerZeroProgress")
 		delete(meta, "pauseReason")
 		encoded, err := json.Marshal(meta)
@@ -6188,7 +6203,10 @@ func (r *Runner) clearZeroProgressMetadata(ctx context.Context, loop storage.Loo
 
 func (r *Runner) clearFixerFailureStreakMetadata(ctx context.Context, loop storage.LoopRecord) (storage.LoopRecord, error) {
 	apply := func(updated *storage.LoopRecord) error {
-		meta := parseJSONObject(updated.MetadataJSON)
+		meta, err := loops.DecodeMetadataObjectForWrite(updated.MetadataJSON)
+		if err != nil {
+			return err
+		}
 		delete(meta, "fixerFailureStreak")
 		if pauseReason, _ := stringFromAny(meta["pauseReason"]); pauseReason == failureStreakPauseReason {
 			delete(meta, "pauseReason")
@@ -6213,7 +6231,10 @@ func (r *Runner) clearFixerFailureStreakMetadata(ctx context.Context, loop stora
 
 func (r *Runner) clearPauseReasonMetadata(ctx context.Context, loop storage.LoopRecord) (storage.LoopRecord, error) {
 	apply := func(updated *storage.LoopRecord) error {
-		meta := parseJSONObject(updated.MetadataJSON)
+		meta, err := loops.DecodeMetadataObjectForWrite(updated.MetadataJSON)
+		if err != nil {
+			return err
+		}
 		delete(meta, "pauseReason")
 		encoded, err := json.Marshal(meta)
 		if err != nil {
@@ -6242,7 +6263,10 @@ func (r *Runner) clearPauseReasonMetadata(ctx context.Context, loop storage.Loop
 
 func (r *Runner) persistFixerFollowupState(ctx context.Context, loop storage.LoopRecord, state fixerFollowupState) (storage.LoopRecord, error) {
 	apply := func(updated *storage.LoopRecord) error {
-		meta := parseJSONObject(updated.MetadataJSON)
+		meta, err := loops.DecodeMetadataObjectForWrite(updated.MetadataJSON)
+		if err != nil {
+			return err
+		}
 		state.UnresolvedThreadIDs = canonicalizeStringSlice(state.UnresolvedThreadIDs)
 		meta["fixerFollowup"] = state
 		meta["lastNoopResolveHeadSha"] = state.HeadSHA
@@ -6324,7 +6348,10 @@ func (r *Runner) clearPendingFixerRediscovery(ctx context.Context, loop storage.
 
 func (r *Runner) clearPendingFixerRediscoveryIfMatch(ctx context.Context, loop storage.LoopRecord, expected pendingFixerRediscoveryState) (storage.LoopRecord, error) {
 	apply := func(updated *storage.LoopRecord) error {
-		meta := parseJSONObject(updated.MetadataJSON)
+		meta, err := loops.DecodeMetadataObjectForWrite(updated.MetadataJSON)
+		if err != nil {
+			return err
+		}
 		if expected.HeadSHA != "" || expected.FixItemsStateHash != "" || len(expected.UnresolvedThreadIDs) > 0 {
 			current, ok := parsePendingFixerRediscoveryState(meta)
 			if !ok || current.HeadSHA != expected.HeadSHA || current.FixItemsStateHash != expected.FixItemsStateHash || !sameStringSlices(current.UnresolvedThreadIDs, expected.UnresolvedThreadIDs) {
@@ -6957,7 +6984,12 @@ func parseJSONObject(value *string) map[string]any {
 }
 
 func mergeLoopMetadataJSON(current *string, updates map[string]any) (string, error) {
-	parsed := parseJSONObject(current)
+	// Loop metadata mutations share the strict decoder: a malformed stored
+	// value blocks the merge instead of being replaced with only the updates.
+	parsed, err := loops.DecodeMetadataObjectForWrite(current)
+	if err != nil {
+		return "", err
+	}
 	for key, value := range updates {
 		parsed[key] = value
 	}

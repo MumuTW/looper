@@ -663,6 +663,28 @@ func TestRunPrepareWorktreeStepRecreatesUnsafeCheckpointAtRepoPath(t *testing.T)
 	}
 }
 
+func TestRunPrepareWorktreeRejectsMalformedMetadataBeforeCreatingWorktree(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	git := &fakeGitGateway{}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, Logger: fixture.logger, Now: fixture.now})
+	malformed := `{"worktree":`
+
+	_, err := runner.runPrepareWorktreeStep(context.Background(), stepInput{
+		Project: storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()},
+		Loop:    storage.LoopRecord{ID: "loop_worker_1", MetadataJSON: &malformed},
+		Checkpoint: workerCheckpoint{Work: &workerInput{
+			Repo: "acme/looper", IssueNumber: 42, BaseBranch: "main",
+		}},
+	})
+	if !errors.Is(err, loops.ErrMalformedLoopMetadata) {
+		t.Fatalf("runPrepareWorktreeStep() error = %v, want ErrMalformedLoopMetadata", err)
+	}
+	if len(git.createCalls) != 0 {
+		t.Fatalf("CreateWorktree calls = %#v, want none before metadata preflight", git.createCalls)
+	}
+}
+
 func TestRunPrepareWorktreeStepRecreatesCheckpointOutsideWorktreeRoot(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

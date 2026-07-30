@@ -367,6 +367,18 @@ func (r *Runner) latestAgentSession(ctx context.Context, loopID string) (string,
 // queue item (so /respond can requeue it), ends the run as interrupted
 // (resumable from the checkpoint), and sends the ask-card. Only reached when
 // hitl.enabled is true.
+// abortSuspension unwinds a suspension that could not persist its ask: the
+// run is ended as failed (createRunContext resumes failed/interrupted runs;
+// a run left running would make the retried claim start a duplicate from
+// prepare-work while the stale run stays active) and the cause is surfaced.
+func (r *Runner) abortSuspension(ctx context.Context, run storage.RunRecord, checkpoint workerCheckpoint, cause error) (ProcessResult, error) {
+	wrapped := fmt.Errorf("persist HITL ask before suspension: %w", cause)
+	if _, err := r.completeRun(ctx, run, "failed", "", wrapped.Error(), checkpoint); err != nil {
+		return ProcessResult{}, errors.Join(wrapped, err)
+	}
+	return ProcessResult{}, wrapped
+}
+
 func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run storage.RunRecord, checkpoint workerCheckpoint, awaiting *awaitingHumanError) (ProcessResult, error) {
 	nowISO := r.nowISO()
 	ask := loops.HITLAsk{
@@ -382,6 +394,13 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 		Consequences:      awaiting.consequences,
 		Confidence:        awaiting.confidence,
 	}
+	// Preflight the strict metadata decode before ANY GitHub side effects: a
+	// malformed value would otherwise let deliverAskToGitHub publish a branch,
+	// draft PR, question comment, and label whose ask can never be stored —
+	// and queue retries would keep publishing unanswerable comments.
+	if _, err := loops.DecodeMetadataObjectForWrite(input.Loop.MetadataJSON); err != nil {
+		return r.abortSuspension(ctx, run, checkpoint, err)
+	}
 	// GitHub transport (default): post the question on a (draft) PR before parking,
 	// so the ask metadata carries the PR + comment id the answer-poll lane needs.
 	// Best-effort — the loop still parks awaiting_human if delivery fails.
@@ -392,10 +411,16 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 			})
 		}
 	}
+	var askWriteErr error
 	if _, err := r.updateLoop(ctx, input.Loop, func(updated *storage.LoopRecord) {
-		if meta, werr := loops.WriteHITLAsk(updated.MetadataJSON, ask); werr == nil {
-			updated.MetadataJSON = &meta
+		meta, werr := loops.WriteHITLAsk(updated.MetadataJSON, ask)
+		if werr != nil {
+			// Without a stored ask the response paths can never resume this
+			// loop; abort the whole suspension instead of parking it stranded.
+			askWriteErr = werr
+			return
 		}
+		updated.MetadataJSON = &meta
 		// The agent re-asked after reading the queued human messages, so they're
 		// consumed — clear the inbox so they aren't re-injected on the next resume.
 		if meta, werr := loops.ClearHumanInbox(updated.MetadataJSON); werr == nil {
@@ -406,6 +431,9 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 		updated.NextRunAt = nil
 	}); err != nil {
 		return ProcessResult{}, err
+	}
+	if askWriteErr != nil {
+		return r.abortSuspension(ctx, run, checkpoint, askWriteErr)
 	}
 	reason := "worker suspended awaiting human decision"
 	if _, err := r.repos.Queue.CancelByLoop(ctx, input.Loop.ID, nowISO, &reason); err != nil {
