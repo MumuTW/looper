@@ -202,9 +202,15 @@ func TestGatewayDetachedPRWorktreeReusesRecordAcrossBranches(t *testing.T) {
 	if second.ID != first.ID || second.WorktreePath != first.WorktreePath {
 		t.Fatalf("records = %#v / %#v, want one detached checkout record", first, second)
 	}
+	if second.Branch != "reviewer/pr-42-head" {
+		t.Fatalf("second.Branch = %q, want reviewer/pr-42-head after path reuse", second.Branch)
+	}
 	items, err := fixture.repos.Worktrees.ListByProject(ctx, fixture.projectID)
 	if err != nil || len(items) != 1 {
 		t.Fatalf("Worktrees.ListByProject() = %#v, %v; want one row", items, err)
+	}
+	if items[0].Branch != "reviewer/pr-42-head" {
+		t.Fatalf("stored branch = %q, want reviewer/pr-42-head", items[0].Branch)
 	}
 	if err := gateway.CleanupWorktree(ctx, CleanupWorktreeInput{ProjectID: fixture.projectID, RepoPath: fixture.repoPath, WorktreeRoot: fixture.worktreeRoot, WorktreePath: second.WorktreePath, Branch: "reviewer/pr-42-head"}); err != nil {
 		t.Fatalf("CleanupWorktree() error = %v", err)
@@ -212,6 +218,96 @@ func TestGatewayDetachedPRWorktreeReusesRecordAcrossBranches(t *testing.T) {
 	cleaned, err := fixture.repos.Worktrees.GetByPath(ctx, second.WorktreePath)
 	if err != nil || cleaned == nil || cleaned.Status != "cleaned" {
 		t.Fatalf("Worktrees.GetByPath() after CleanupWorktree() = %#v, %v; want cleaned record", cleaned, err)
+	}
+}
+
+func TestGatewayCreateWorktreeRejectsPathOwnedByOtherProject(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	fixture.createLocalFeatureRepo(t)
+	gateway := fixture.gateway()
+
+	// Directory names embed project id, so force a collision by planting another
+	// project's durable row on the path this project is about to claim.
+	input := CreateWorktreeInput{
+		ProjectID: fixture.projectID, RepoPath: fixture.repoPath, WorktreeRoot: fixture.worktreeRoot,
+		Branch: "feature/fixer", BaseBranch: "main", PRNumber: 42, CheckoutMode: CheckoutModeDetached,
+	}
+	worktreePath := filepath.Join(fixture.worktreeRoot, buildWorktreeDirectoryName(input))
+	nowISO := fixture.now().UTC().Format("2006-01-02T15:04:05.000Z")
+	if err := fixture.repos.Projects.Upsert(ctx, storage.ProjectRecord{
+		ID: "other-project", Name: "Other", RepoPath: fixture.repoPath, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Projects.Upsert(other) error = %v", err)
+	}
+	if err := fixture.repos.Worktrees.Upsert(ctx, storage.WorktreeRecord{
+		ID: "wt-other", ProjectID: "other-project", RepoPath: fixture.repoPath, WorktreePath: worktreePath,
+		Branch: "feature/other", Status: "active", CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Worktrees.Upsert(other path) error = %v", err)
+	}
+
+	_, err := gateway.CreateWorktree(ctx, input)
+	if err == nil {
+		t.Fatal("CreateWorktree() error = nil, want project ownership refusal")
+	}
+	if !strings.Contains(err.Error(), "belongs to project") {
+		t.Fatalf("CreateWorktree() error = %v, want project ownership refusal", err)
+	}
+	stored, err := fixture.repos.Worktrees.GetByPath(ctx, worktreePath)
+	if err != nil || stored == nil || stored.ProjectID != "other-project" {
+		t.Fatalf("path ownership changed after refusal: %#v, %v", stored, err)
+	}
+}
+
+func TestGatewayCreateWorktreeReconcilesBranchCollisionBeforePathReuse(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	fixture.createLocalFeatureRepo(t)
+	gateway := fixture.gateway()
+
+	attached, err := gateway.CreateWorktree(ctx, CreateWorktreeInput{
+		ProjectID: fixture.projectID, RepoPath: fixture.repoPath, WorktreeRoot: fixture.worktreeRoot,
+		Branch: "feature/fixer", BaseBranch: "main", PRNumber: 42,
+	})
+	if err != nil {
+		t.Fatalf("CreateWorktree(attached) error = %v", err)
+	}
+	reviewer, err := gateway.CreateWorktree(ctx, CreateWorktreeInput{
+		ProjectID: fixture.projectID, RepoPath: fixture.repoPath, WorktreeRoot: fixture.worktreeRoot,
+		Branch: "reviewer/pr-42-head", BaseBranch: "main", PRNumber: 42, CheckoutMode: CheckoutModeDetached,
+	})
+	if err != nil {
+		t.Fatalf("CreateWorktree(reviewer detached) error = %v", err)
+	}
+	if reviewer.WorktreePath == attached.WorktreePath {
+		t.Fatalf("reviewer path = attached path %q; want separate detached path", reviewer.WorktreePath)
+	}
+
+	// Detached fixer claims the shared PR path under the same logical branch the
+	// attached row still holds. Path wins; the attached branch label must be freed.
+	fixer, err := gateway.CreateWorktree(ctx, CreateWorktreeInput{
+		ProjectID: fixture.projectID, RepoPath: fixture.repoPath, WorktreeRoot: fixture.worktreeRoot,
+		Branch: "feature/fixer", BaseBranch: "main", PRNumber: 42, CheckoutMode: CheckoutModeDetached,
+	})
+	if err != nil {
+		t.Fatalf("CreateWorktree(fixer detached) error = %v", err)
+	}
+	if fixer.ID != reviewer.ID || fixer.WorktreePath != reviewer.WorktreePath {
+		t.Fatalf("fixer = %#v, want reuse of reviewer path identity %#v", fixer, reviewer)
+	}
+	if fixer.Branch != "feature/fixer" {
+		t.Fatalf("fixer.Branch = %q, want feature/fixer", fixer.Branch)
+	}
+	attachedStored, err := fixture.repos.Worktrees.GetByID(ctx, attached.ID)
+	if err != nil || attachedStored == nil {
+		t.Fatalf("GetByID(attached) = %#v, %v", attachedStored, err)
+	}
+	if attachedStored.Branch == "feature/fixer" {
+		t.Fatalf("attached branch still %q after collision reconcile", attachedStored.Branch)
+	}
+	if _, err := os.Stat(attached.WorktreePath); err != nil {
+		t.Fatalf("attached checkout removed during branch reconcile: %v", err)
 	}
 }
 

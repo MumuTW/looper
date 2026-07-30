@@ -2777,6 +2777,16 @@ func (r *WorktreesRepository) Upsert(ctx context.Context, record WorktreeRecord)
 	return nil
 }
 
+// Delete removes a worktree identity row. Callers use this when two durable
+// identities must collapse onto one physical path (or one branch label) and the
+// discarded row no longer describes a checkout Looper should manage.
+func (r *WorktreesRepository) Delete(ctx context.Context, id string) error {
+	if _, err := r.q.ExecContext(ctx, `DELETE FROM worktrees WHERE id = ?`, id); err != nil {
+		return fmt.Errorf("delete worktree: %w", err)
+	}
+	return nil
+}
+
 func (r *WorktreesRepository) GetByID(ctx context.Context, id string) (*WorktreeRecord, error) {
 	row := r.q.QueryRowContext(ctx, `SELECT * FROM worktrees WHERE id = ?`, id)
 	record, err := scanWorktree(row)

@@ -296,15 +296,9 @@ func (g *Gateway) CreateWorktree(ctx context.Context, input CreateWorktreeInput)
 	nowISO := g.now().UTC().Format(javaScriptISOStringLayout)
 	var existingRecord *storage.WorktreeRecord
 	if g.repos != nil {
-		existingRecord, err = g.repos.Worktrees.GetByPath(ctx, worktreePath)
+		existingRecord, err = g.resolveWorktreeIdentity(ctx, input.ProjectID, input.Branch, worktreePath, nowISO)
 		if err != nil {
-			return storage.WorktreeRecord{}, fmt.Errorf("get existing worktree by path: %w", err)
-		}
-		if existingRecord == nil {
-			existingRecord, err = g.repos.Worktrees.GetByBranch(ctx, input.ProjectID, input.Branch)
-		}
-		if err != nil {
-			return storage.WorktreeRecord{}, fmt.Errorf("get existing worktree by branch: %w", err)
+			return storage.WorktreeRecord{}, err
 		}
 	}
 
@@ -378,14 +372,15 @@ func (g *Gateway) RestoreWorktree(ctx context.Context, input RestoreWorktreeInpu
 	if g.repos != nil {
 		var stored *storage.WorktreeRecord
 		var err error
+		nowISO := g.now().UTC().Format(javaScriptISOStringLayout)
 		if input.ExpectedWorktreePath != "" {
-			stored, err = g.repos.Worktrees.GetByPath(ctx, input.ExpectedWorktreePath)
+			stored, err = g.resolveWorktreeIdentity(ctx, input.ProjectID, input.Branch, input.ExpectedWorktreePath, nowISO)
 		}
 		if stored == nil && err == nil {
-			stored, err = g.repos.Worktrees.GetByBranch(ctx, input.ProjectID, input.Branch)
+			stored, err = g.resolveWorktreeIdentity(ctx, input.ProjectID, input.Branch, "", nowISO)
 		}
 		if err != nil {
-			return nil, fmt.Errorf("get stored worktree by branch: %w", err)
+			return nil, err
 		}
 		if stored != nil && stored.Status != "cleaned" && normalizeComparablePath(stored.RepoPath) == normalizeComparablePath(input.RepoPath) && worktreesafety.IsSafe(worktreesafety.CheckInput{WorktreePath: stored.WorktreePath, RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot}) {
 			storedHealthy, err := g.isHealthyWorktree(ctx, stored.WorktreePath)
@@ -404,11 +399,13 @@ func (g *Gateway) RestoreWorktree(ctx context.Context, input RestoreWorktreeInpu
 					if err != nil {
 						return nil, err
 					}
-					nowISO := g.now().UTC().Format(javaScriptISOStringLayout)
 					restored := *stored
+					restored.ProjectID = input.ProjectID
+					restored.Branch = input.Branch
 					restored.HeadSHA = stringPtrIfNotEmpty(headSHA)
 					restored.Status = "active"
 					restored.UpdatedAt = nowISO
+					restored.CleanedAt = nil
 					if err := g.repos.Worktrees.Upsert(ctx, restored); err != nil {
 						return nil, fmt.Errorf("upsert restored worktree record: %w", err)
 					}
@@ -493,28 +490,23 @@ func (g *Gateway) RestoreWorktree(ctx context.Context, input RestoreWorktreeInpu
 		CleanedAt:    nil,
 	}
 	if g.repos != nil {
-		existing, err := g.repos.Worktrees.GetByPath(ctx, match.Path)
-		if existing == nil && err == nil {
-			existing, err = g.repos.Worktrees.GetByBranch(ctx, input.ProjectID, input.Branch)
-		}
+		existing, err := g.resolveWorktreeIdentity(ctx, input.ProjectID, input.Branch, match.Path, nowISO)
 		if err != nil {
-			return nil, fmt.Errorf("get existing restored worktree by branch: %w", err)
+			return nil, err
 		}
 		if existing != nil {
 			record = *existing
 		}
+		record.ProjectID = input.ProjectID
+		record.RepoPath = input.RepoPath
 		record.WorktreePath = match.Path
+		record.Branch = input.Branch
 		record.HeadSHA = stringPtrIfNotEmpty(match.HeadSHA)
 		record.Status = "active"
 		record.UpdatedAt = nowISO
-		if record.RepoPath == "" {
-			record.RepoPath = input.RepoPath
-		}
-		if record.ProjectID == "" {
-			record.ProjectID = input.ProjectID
-		}
-		if record.Branch == "" {
-			record.Branch = input.Branch
+		record.CleanedAt = nil
+		if record.CreatedAt == "" {
+			record.CreatedAt = nowISO
 		}
 		if err := g.repos.Worktrees.Upsert(ctx, record); err != nil {
 			return nil, fmt.Errorf("upsert discovered worktree record: %w", err)
@@ -1117,6 +1109,78 @@ func (g *Gateway) matchesRestoreCheckoutMode(ctx context.Context, worktreePath s
 		return false, err
 	}
 	return currentBranch == branch, nil
+}
+
+// resolveWorktreeIdentity picks the durable worktree row that Create/Restore
+// should reuse, enforcing path ownership and collapsing branch collisions.
+//
+// Path is the filesystem authority: a row already on this path is preferred so
+// reviewer/fixer can share one detached checkout under different logical
+// branch labels. When a different row already holds (project_id, branch), it is
+// retired first so the later upsert cannot violate idx_worktrees_project_branch
+// after git has already mutated the checkout.
+func (g *Gateway) resolveWorktreeIdentity(ctx context.Context, projectID, branch, worktreePath, nowISO string) (*storage.WorktreeRecord, error) {
+	if g.repos == nil {
+		return nil, nil
+	}
+
+	var (
+		pathRecord   *storage.WorktreeRecord
+		branchRecord *storage.WorktreeRecord
+		err          error
+	)
+	if worktreePath != "" {
+		pathRecord, err = g.repos.Worktrees.GetByPath(ctx, worktreePath)
+		if err != nil {
+			return nil, fmt.Errorf("get existing worktree by path: %w", err)
+		}
+		if pathRecord != nil && pathRecord.ProjectID != "" && pathRecord.ProjectID != projectID {
+			return nil, fmt.Errorf("refusing worktree path %q: looper record belongs to project %q, not %q", worktreePath, pathRecord.ProjectID, projectID)
+		}
+	}
+	if projectID != "" && branch != "" {
+		branchRecord, err = g.repos.Worktrees.GetByBranch(ctx, projectID, branch)
+		if err != nil {
+			return nil, fmt.Errorf("get existing worktree by branch: %w", err)
+		}
+	}
+
+	// Prefer the physical path identity. If another row already owns this
+	// branch label at a different path, retire it so the path row can take the
+	// requested provenance without a unique-index collision mid-flight.
+	if pathRecord != nil {
+		if branchRecord != nil && branchRecord.ID != pathRecord.ID {
+			if err := g.retireWorktreeBranchCollision(ctx, branchRecord, pathRecord.ID, nowISO); err != nil {
+				return nil, err
+			}
+		}
+		return pathRecord, nil
+	}
+	return branchRecord, nil
+}
+
+// retireWorktreeBranchCollision frees (project_id, branch) held by other so the
+// path identity can adopt that branch label. Active checkouts kept on a different
+// path are re-labeled rather than deleted so cleanup provenance survives.
+func (g *Gateway) retireWorktreeBranchCollision(ctx context.Context, other *storage.WorktreeRecord, keepID, nowISO string) error {
+	if other == nil || other.ID == "" || other.ID == keepID {
+		return nil
+	}
+	if other.Status == "cleaned" || other.CleanedAt != nil {
+		if err := g.repos.Worktrees.Delete(ctx, other.ID); err != nil {
+			return fmt.Errorf("delete colliding cleaned worktree %q: %w", other.ID, err)
+		}
+		return nil
+	}
+	// Keep the other checkout's durable identity, but free the branch label by
+	// pointing it at a synthetic retired name unique to this row.
+	retired := *other
+	retired.Branch = fmt.Sprintf("retired/%s/%s", other.ID, strings.ReplaceAll(other.Branch, "/", "-"))
+	retired.UpdatedAt = nowISO
+	if err := g.repos.Worktrees.Upsert(ctx, retired); err != nil {
+		return fmt.Errorf("retire colliding worktree branch %q: %w", other.ID, err)
+	}
+	return nil
 }
 
 func (g *Gateway) shouldReplaceStoredWorktreeOnRestoreMismatch(ctx context.Context, worktreePath string, checkoutMode CheckoutMode, branch, expectedWorktreePath string) (bool, error) {
