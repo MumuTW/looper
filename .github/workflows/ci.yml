@@ -61,6 +61,9 @@ jobs:
       - name: Lint
         run: go vet ./...
 
+      - name: Reject production-unreachable code
+        run: go run honnef.co/go/tools/cmd/staticcheck@v0.6.1 -tests=false -checks='U1000,SA1006,SA4004,SA4006' ./...
+
       - name: Reject committed binaries
         run: go run ./tools/check-binaries
 

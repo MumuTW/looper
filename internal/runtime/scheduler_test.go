@@ -24,6 +24,19 @@ import (
 	"github.com/nexu-io/looper/internal/worker"
 )
 
+func runScheduledQueueItems(ctx context.Context, queueItems []storage.QueueItemRecord, input defaultSchedulerTickInput) error {
+	owned := make([]ownedQueueClaim, 0, len(queueItems))
+	for _, item := range queueItems {
+		owned = append(owned, ownedQueueClaim{item: item})
+	}
+	return runOwnedQueueClaims(ctx, owned, input)
+}
+
+func allowedQueueTypesFromRunners(input defaultSchedulerTickInput) []string {
+	unrestricted, stickySnapshotOnly := claimTypeSetsFromInput(input)
+	return append(unrestricted, stickySnapshotOnly...)
+}
+
 func TestWorkerAgentExecutionAdapterPropagatesParseStatus(t *testing.T) {
 	t.Parallel()
 

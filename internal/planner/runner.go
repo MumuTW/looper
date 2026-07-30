@@ -1722,10 +1722,6 @@ type loopUpsertResult struct {
 	blocked        bool
 }
 
-func (r *Runner) ensureLoopForIssue(ctx context.Context, project storage.ProjectRecord, repo string, issue IssueSummary, currentFingerprint string) (loopUpsertResult, error) {
-	return r.ensureLoopForIssueWithAuthority(ctx, project, repo, issue, currentFingerprint, "")
-}
-
 func (r *Runner) ensureLoopForIssueWithAuthority(ctx context.Context, project storage.ProjectRecord, repo string, issue IssueSummary, currentFingerprint, authority string) (loopUpsertResult, error) {
 	nowISO := r.nowISO()
 	targetID := buildIssueTargetID(repo, issue.Number)
@@ -1755,7 +1751,8 @@ func (r *Runner) ensureLoopForIssueWithAuthority(ctx context.Context, project st
 			}
 		}
 	} else {
-		for _, existing := range matching {
+		if len(matching) > 0 {
+			existing := matching[0]
 			pausedOrCompleted := existing.Status == "paused" || existing.Status == "completed" || existing.Status == "awaiting_human"
 			updated := existing
 			updated.Repo = stringPtr(repo)

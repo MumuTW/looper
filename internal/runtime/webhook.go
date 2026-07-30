@@ -1012,17 +1012,6 @@ func (w *webhookRuntime) deleteForwarderRecord(repo string) {
 	}
 }
 
-func (w *webhookRuntime) stderrTail(repo string, stopCh chan struct{}) []string {
-	w.mu.RLock()
-	defer w.mu.RUnlock()
-	for _, state := range w.status.Forwarders {
-		if state.Repo == repo && sameStopChannel(w.forwarderStopCh[repo], stopCh) {
-			return append([]string{}, state.StderrTail...)
-		}
-	}
-	return nil
-}
-
 func forwarderLatchReason(pattern string) string {
 	pattern = strings.TrimSpace(pattern)
 	if pattern == "" {

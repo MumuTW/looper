@@ -2637,10 +2637,6 @@ func (r *QueueRepository) RequeueFailedByIDWithAttempts(ctx context.Context, loo
 	return affected, nil
 }
 
-func (r *QueueRepository) findLatestQueueIDByLoopStatus(ctx context.Context, loopID, status string) (string, error) {
-	return r.findLatestQueueIDByLoopStatuses(ctx, loopID, []string{status})
-}
-
 func (r *QueueRepository) findLatestQueueIDByLoopStatuses(ctx context.Context, loopID string, statuses []string) (string, error) {
 	if len(statuses) == 0 {
 		return "", nil

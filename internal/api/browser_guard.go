@@ -19,7 +19,7 @@ import (
 // Production binaries leave this false so real values are never rewritten.
 var rewriteHTTPtestDefaultHost bool
 
-// validateBrowserRequest enforces Host allowlisting and Origin matching for
+// validateBrowserRequestForPath enforces Host allowlisting and Origin matching for
 // browser requests, including safe methods (GET/HEAD) that expose dashboard
 // state.
 //
@@ -39,9 +39,6 @@ var rewriteHTTPtestDefaultHost bool
 // When Origin is absent, Host allowlisting is skipped for those paths so a
 // public Host on server.host=0.0.0.0 without server.baseUrl still reaches the
 // token-verified handler.
-func validateBrowserRequest(r *http.Request, cfg config.Config) error {
-	return validateBrowserRequestForPath(r, cfg, r.URL.Path)
-}
 
 func validateBrowserRequestForPath(r *http.Request, cfg config.Config, path string) error {
 	host := effectiveRequestHost(r, cfg)

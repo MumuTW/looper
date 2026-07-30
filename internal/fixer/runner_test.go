@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -22,6 +21,10 @@ import (
 	"github.com/nexu-io/looper/internal/storage"
 	"github.com/nexu-io/looper/internal/validation"
 )
+
+func (r *Runner) listOpenPullRequestsForDiscovery(ctx context.Context, repo, cwd string, limit int, author string) ([]PullRequestSummary, error) {
+	return r.listOpenPullRequestsForDiscoveryWithPolicy(ctx, repo, cwd, limit, author, r.discoveryPolicy, "")
+}
 
 func TestBuildFixerPromptUsesConcreteDisclosureMetadata(t *testing.T) {
 	t.Parallel()
@@ -8070,26 +8073,6 @@ func TestPublishRoundSummaryCommentPostsForAgentEvidenceWithoutLocalNewCommits(t
 	}
 	if !strings.Contains(github.createIssueComments[0].Body, fixerRoundSummaryMarker("agent-head")) {
 		t.Fatalf("summary body = %q, want adopted evidence head marker", github.createIssueComments[0].Body)
-	}
-}
-
-func TestSkippedNoEvidenceThreadIDs(t *testing.T) {
-	t.Parallel()
-	fixItems := []FixItem{
-		{ID: "c1", Type: "comment", ThreadID: "t1"},
-		{ID: "c2", Type: "comment", ThreadID: "t2"},
-		{ID: "c3", Type: "task", ThreadID: "t3"},
-		{ID: "c4", Type: "comment", ThreadID: "t1"},
-	}
-	resolved := []checkpointResolvedComment{
-		{FixItemID: "c1", ThreadID: "t1", Status: "skipped_no_evidence"},
-		{FixItemID: "c2", ThreadID: "t2", Status: "resolved"},
-		{FixItemID: "c4", ThreadID: "t1", Status: "skipped_no_evidence"},
-	}
-	got := skippedNoEvidenceThreadIDs(fixItems, resolved)
-	want := []string{"t1"}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("skippedNoEvidenceThreadIDs() = %v, want %v", got, want)
 	}
 }
 

@@ -3703,13 +3703,6 @@ func (r *Runner) disclosureIdentity(run storage.RunRecord) (agent, model string)
 	return vendor, derefString(modelPtr)
 }
 
-func buildWorkerPrompt(repoRootPath string, work workerInput, plan *checkpointPlan, allowAgentPRCreation bool, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string) (string, error) {
-	cfg, _ := config.Normalize("")
-	cfg.Instructions.Enabled = false
-	prompt, _, err := buildWorkerPromptWithInstructions(repoRootPath, "", cfg, work, plan, allowAgentPRCreation, disclosureCfg, agentRuntime, agentModel)
-	return prompt, err
-}
-
 func buildWorkerPromptWithInstructions(repoRootPath string, projectID string, instructionConfig config.Config, work workerInput, plan *checkpointPlan, allowAgentPRCreation bool, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string) (string, config.CustomInstructionBlock, error) {
 	parts := []string{}
 	if work.ExecutionMode == "push-existing" {
