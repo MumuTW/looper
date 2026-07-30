@@ -1022,36 +1022,47 @@ func validateCompletedRepairCheckpoint(repair *checkpointRepair) error {
 	}
 }
 
-// fixerRepairTaskBlocked distinguishes a process that exited normally from a
-// repair that could not be attempted. Only the agent's structured completion
-// payload is authoritative; free-form summaries and stderr are diagnostic text.
-func fixerRepairTaskBlocked(result AgentResult) (bool, string, QueueFailureKind) {
+// fixerRepairTaskOutcome validates the task-level authority carried by the
+// agent completion marker. Process completion and parse success alone do not
+// authorize the repair pipeline to advance.
+func fixerRepairTaskOutcome(result AgentResult) (bool, string, QueueFailureKind, *loopError) {
 	payload := extractCompletionMarkerPayload(result.Stdout + "\n" + result.Stderr)
 	if payload == "" {
-		return false, "", ""
+		return false, "", "", &loopError{message: "Fixer agent completed without required structured outcome", kind: FailureRetryableTransient}
 	}
 	var parsed struct {
 		Outcome     string `json:"outcome"`
 		Summary     string `json:"summary"`
 		FailureKind string `json:"failure_kind"`
 	}
-	if json.Unmarshal([]byte(payload), &parsed) != nil || strings.ToLower(strings.TrimSpace(parsed.Outcome)) != "blocked" {
-		return false, "", ""
+	if err := json.Unmarshal([]byte(payload), &parsed); err != nil {
+		return false, "", "", &loopError{message: "Fixer agent completed with invalid structured outcome", kind: FailureRetryableTransient}
 	}
-	message := firstNonEmpty(strings.TrimSpace(parsed.Summary), result.Summary, "fixer repair task was blocked")
-	return true, message, fixerBlockedFailureKind(parsed.FailureKind)
+	switch strings.ToLower(strings.TrimSpace(parsed.Outcome)) {
+	case "completed":
+		return false, "", "", nil
+	case "blocked":
+		kind, ok := parseFixerBlockedFailureKind(parsed.FailureKind)
+		if !ok {
+			return false, "", "", &loopError{message: "Fixer blocked outcome requires a valid failure_kind", kind: FailureRetryableTransient}
+		}
+		message := firstNonEmpty(strings.TrimSpace(parsed.Summary), result.Summary, "fixer repair task was blocked")
+		return true, message, kind, nil
+	default:
+		return false, "", "", &loopError{message: "Fixer agent completed with missing or unrecognized structured outcome", kind: FailureRetryableTransient}
+	}
 }
 
-func fixerBlockedFailureKind(raw string) QueueFailureKind {
+func parseFixerBlockedFailureKind(raw string) (QueueFailureKind, bool) {
 	switch QueueFailureKind(strings.ToLower(strings.TrimSpace(raw))) {
 	case FailureManualIntervention:
-		return FailureManualIntervention
+		return FailureManualIntervention, true
 	case FailureRetryableAfterResume:
-		return FailureRetryableAfterResume
+		return FailureRetryableAfterResume, true
 	case FailureRetryableTransient:
-		return FailureRetryableTransient
+		return FailureRetryableTransient, true
 	default:
-		return FailureRetryableTransient
+		return "", false
 	}
 }
 
@@ -1059,7 +1070,7 @@ func (checkpoint *fixerCheckpoint) recordFailure(step FixerStep, failure *loopEr
 	if checkpoint.Outcome == nil {
 		checkpoint.Outcome = &FixerRunOutcome{}
 	}
-	next := FixerOutcomeFailure{Step: string(step), Message: failure.message, Kind: failure.kind, Retryable: isQueueRetryEligible(failure.kind)}
+	next := FixerOutcomeFailure{Step: string(step), Message: failure.message, Kind: failure.kind, Retryable: failure.kind == FailureRetryableTransient || failure.kind == FailureRetryableAfterResume}
 	if checkpoint.Outcome.PrimaryFailure == nil {
 		checkpoint.Outcome.PrimaryFailure = &next
 		return
@@ -1072,14 +1083,17 @@ func (checkpoint *fixerCheckpoint) refreshOutcomeProgress() {
 		checkpoint.Outcome = &FixerRunOutcome{}
 	}
 	progress := FixerDurableProgress{}
-	if checkpoint.ReconcileCommits != nil {
+	if checkpoint.ReconcileCommits != nil && checkpoint.outcomeEvidenceInCurrentRun(checkpoint.ReconcileCommits.CompletedAt) {
 		progress.CommitProduced = len(checkpoint.ReconcileCommits.NewCommitSHAs) > 0
 	}
-	if checkpoint.Push != nil {
+	if checkpoint.Push != nil && checkpoint.outcomeEvidenceInCurrentRun(checkpoint.Push.PushedAt) {
 		progress.Pushed = checkpoint.Push.Pushed
 	}
 	if checkpoint.ResolvedComments != nil {
 		for _, item := range checkpoint.ResolvedComments.Items {
+			if !checkpoint.outcomeEvidenceInCurrentRun(item.UpdatedAt) {
+				continue
+			}
 			if item.ReplyState == "sent" {
 				progress.RepliesSent++
 			}
@@ -1090,6 +1104,22 @@ func (checkpoint *fixerCheckpoint) refreshOutcomeProgress() {
 	}
 	checkpoint.Outcome.Progress = progress
 	checkpoint.Outcome.PartialSuccess = checkpoint.Outcome.PrimaryFailure != nil && (progress.CommitProduced || progress.Pushed || progress.RepliesSent > 0 || progress.ThreadsResolved > 0)
+}
+
+func (checkpoint fixerCheckpoint) outcomeEvidenceInCurrentRun(observedAt string) bool {
+	baseline := firstNonEmpty(checkpoint.RunStartedAt, checkpoint.RunPreStartAt)
+	if baseline == "" {
+		return true
+	}
+	if strings.TrimSpace(observedAt) == "" {
+		return false
+	}
+	observed, observedErr := time.Parse(time.RFC3339Nano, observedAt)
+	started, startedErr := time.Parse(time.RFC3339Nano, baseline)
+	if observedErr == nil && startedErr == nil {
+		return !observed.Before(started)
+	}
+	return observedAt >= baseline
 }
 
 // DeriveRunOutcome projects both current and pre-outcome fixer checkpoints into
@@ -2149,7 +2179,7 @@ func (r *Runner) recoverClaimedItem(ctx context.Context, queueItem storage.Queue
 							return &ProcessResult{LoopID: derefString(queueItem.LoopID), QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind, Outcome: outcome}, nil
 						}
 					} else {
-						r.recordFailedRunCleanup(context.Background(), *project, runFailure.runID, &runFailure.checkpoint)
+						r.recordTerminalCleanup(context.Background(), *project, runFailure.runID, &runFailure.checkpoint)
 					}
 				}
 			}
@@ -2359,7 +2389,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			if err != nil {
 				return ProcessResult{}, err
 			}
-			r.recordFailedRunCleanup(context.Background(), *project, run.ID, &latest)
+			r.recordTerminalCleanup(context.Background(), *project, run.ID, &latest)
 			if scheduled {
 				return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind, Outcome: latest.Outcome}, nil
 			}
@@ -2396,7 +2426,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		if scheduled, err := r.schedulePendingRediscoveryAfterRun(ctx, *loop, *queueItem.Repo, *queueItem.PRNumber); err != nil {
 			return ProcessResult{}, err
 		} else if scheduled {
-			r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &checkpoint)
+			r.recordTerminalCleanup(context.Background(), *project, run.ID, &checkpoint)
 			return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "skipped", Summary: reason}, nil
 		}
 		if _, err := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
@@ -2406,7 +2436,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		}); err != nil {
 			return ProcessResult{}, err
 		}
-		r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &checkpoint)
+		r.recordTerminalCleanup(context.Background(), *project, run.ID, &checkpoint)
 		return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "skipped", Summary: reason}, nil
 	}
 	if resumedRun.Resumed && resumedRun.StartStep != stepDiscoverPR || (!resumedRun.Resumed && resumedRun.StartStep == stepDiscoverPR && len(prQueryLabels(r.discoveryPolicyForProject(project.ID).Labels)) > 0) {
@@ -2500,7 +2530,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 				if err != nil {
 					return ProcessResult{}, err
 				}
-				r.recordFailedRunCleanup(context.Background(), *project, run.ID, &latest)
+				r.recordTerminalCleanup(context.Background(), *project, run.ID, &latest)
 				if scheduled {
 					return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind, Outcome: latest.Outcome}, nil
 				}
@@ -2537,7 +2567,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	r.appendEvent(ctx, eventInput{eventType: "run.completed", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"summary": summary}})
 	if err := r.repos.Queue.Complete(ctx, queueItem.ID, r.nowISO()); err != nil {
 		if errors.Is(err, storage.ErrQueueItemNotActive) {
-			r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &checkpoint)
+			r.recordTerminalCleanup(context.Background(), *project, run.ID, &checkpoint)
 			return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: statusForSkip(checkpoint.SkipReason), Summary: summary}, nil
 		}
 		return ProcessResult{}, err
@@ -2550,7 +2580,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		if scheduled, err := r.schedulePendingRediscoveryAfterRun(ctx, *loop, *queueItem.Repo, *queueItem.PRNumber); err != nil {
 			return ProcessResult{}, err
 		} else if scheduled {
-			r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &checkpoint)
+			r.recordTerminalCleanup(context.Background(), *project, run.ID, &checkpoint)
 			status := statusForSkip(checkpoint.SkipReason)
 			return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: status, Summary: summary}, nil
 		}
@@ -2559,14 +2589,14 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			return ProcessResult{}, err
 		}
 		if paused {
-			r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &checkpoint)
+			r.recordTerminalCleanup(context.Background(), *project, run.ID, &checkpoint)
 			return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: statusForSkip(checkpoint.SkipReason), Summary: summary}, nil
 		}
 	}
 	if scheduled, err := r.schedulePendingRediscoveryAfterRun(ctx, *loop, *queueItem.Repo, *queueItem.PRNumber); err != nil {
 		return ProcessResult{}, err
 	} else if scheduled {
-		r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &checkpoint)
+		r.recordTerminalCleanup(context.Background(), *project, run.ID, &checkpoint)
 		status := statusForSkip(checkpoint.SkipReason)
 		return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: status, Summary: summary}, nil
 	}
@@ -2581,7 +2611,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			return ProcessResult{}, err
 		}
 	}
-	r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &checkpoint)
+	r.recordTerminalCleanup(context.Background(), *project, run.ID, &checkpoint)
 	status := statusForSkip(checkpoint.SkipReason)
 	return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: status, Summary: summary}, nil
 }
@@ -2846,7 +2876,11 @@ func (r *Runner) finishLabelMismatchFixerQueueItem(ctx context.Context, project 
 	}); err != nil {
 		return ProcessResult{}, err
 	}
-	r.cleanupFixerWorktreeIfTerminal(context.Background(), project, &checkpoint)
+	runID := ""
+	if run != nil {
+		runID = run.ID
+	}
+	r.recordTerminalCleanup(context.Background(), project, runID, &checkpoint)
 	result := ProcessResult{LoopID: loop.ID, QueueItemID: queueItem.ID, Status: "skipped", Summary: summary}
 	if run != nil {
 		result.RunID = run.ID
@@ -3355,13 +3389,17 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 	// two-field copy: validation and the persisted checkpoint then rest on the
 	// same evidence, including the transcript scan that only the live result
 	// carries.
-	if blocked, message, kind := fixerRepairTaskBlocked(result); blocked {
-		checkpoint.ResumePolicy = loops.NormalizeResumePolicy(string(kind), loops.ResumePolicyReplayStep)
-		return checkpoint, &loopError{message: message, kind: kind}
-	}
 	repair := checkpointRepairFromAgentResult(executionID, detailHeadSHA(checkpoint.Detail), result, r.nowISO())
 	if err := validateCompletedRepairCheckpoint(repair); err != nil {
 		return checkpoint, err
+	}
+	blocked, message, kind, outcomeErr := fixerRepairTaskOutcome(result)
+	if outcomeErr != nil {
+		return checkpoint, outcomeErr
+	}
+	if blocked {
+		checkpoint.ResumePolicy = loops.NormalizeResumePolicy(string(kind), loops.ResumePolicyReplayStep)
+		return checkpoint, &loopError{message: message, kind: kind}
 	}
 	if held, summary, err := r.fixerHoldSummary(ctx, input.Project, input.Loop, input.Repo, input.PRNumber); err != nil {
 		return checkpoint, err
@@ -3937,6 +3975,13 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 		}
 		if normalizeReplyAction(decision.Action) == string(replyActionDeferred) {
 			upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Action: string(replyActionDeferred), Status: "deferred", Message: decision.Explanation, UpdatedAt: r.nowISO()})
+			if checkpoint.Outcome == nil {
+				checkpoint.Outcome = &FixerRunOutcome{}
+			}
+			checkpoint.Outcome.FollowUpThreadIDs = canonicalizeStringSlice(append(checkpoint.Outcome.FollowUpThreadIDs, item.ThreadID))
+			if _, err := r.recordPendingFixerRediscovery(ctx, input.Loop, liveDetail.HeadSHA, hashFixItemsState(liveFixItems), unresolvedThreadIDs(liveFixItems)); err != nil {
+				return checkpoint, err
+			}
 			continue
 		}
 		if fixedDecisionMissingThreadSnapshot(decision) || threadCommentsObservedDrifted(decision, thread) {
@@ -5071,15 +5116,43 @@ func (r *Runner) runRecheckStep(ctx context.Context, input stepInput) (fixerChec
 		}
 	}
 	checkpoint.Recheck = &checkpointRecheck{RemainingFixItems: collectFixItems(detail)}
+	blockingFixItems := excludeDeferredFixItems(checkpoint.Recheck.RemainingFixItems, checkpoint.ResolvedComments)
 	verifiedNoPushHead := resolveCommentsVerifiedNoPushHeadSHA(checkpoint.Push, input.Loop.MetadataJSON, checkpoint.FixItemsHash)
 	hasVerifiedNoPushHead := verifiedNoPushHead != "" && strings.TrimSpace(detail.HeadSHA) == verifiedNoPushHead
-	if shouldBlockResolveWithoutFix(checkpoint, checkpoint.Recheck.RemainingFixItems, hasVerifiedNoPushHead) {
+	if shouldBlockResolveWithoutFix(checkpoint, blockingFixItems, hasVerifiedNoPushHead) {
 		checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
 		checkpoint.Pause = newCheckpointPause(checkpointPauseReasonNoopResolveNoNewCommits, true, strings.TrimSpace(detail.HeadSHA), currentRecheckFixItemsStateHash(checkpoint), unresolvedThreadIDs(suppressDeclinedFixItems(input.Loop.MetadataJSON, strings.TrimSpace(detail.HeadSHA), checkpoint.Recheck.RemainingFixItems)))
 		return checkpoint, &loopError{message: "resolve-comments left review threads unresolved because fixer produced no new commits to push", kind: FailureManualIntervention}
 	}
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	return checkpoint, nil
+}
+
+func excludeDeferredFixItems(fixItems []FixItem, resolved *checkpointResolvedComments) []FixItem {
+	if resolved == nil || len(resolved.Items) == 0 {
+		return fixItems
+	}
+	deferred := make(map[string]struct{})
+	for _, item := range resolved.Items {
+		if item.Status != "deferred" {
+			continue
+		}
+		if item.FixItemID != "" {
+			deferred["id:"+item.FixItemID] = struct{}{}
+		}
+		if item.ThreadID != "" {
+			deferred["thread:"+item.ThreadID] = struct{}{}
+		}
+	}
+	out := make([]FixItem, 0, len(fixItems))
+	for _, item := range fixItems {
+		_, byID := deferred["id:"+item.ID]
+		_, byThread := deferred["thread:"+item.ThreadID]
+		if !byID && !byThread {
+			out = append(out, item)
+		}
+	}
+	return out
 }
 
 func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) (resumedRunContext, error) {
@@ -6012,7 +6085,7 @@ func (r *Runner) finishFailureStreakBreaker(ctx context.Context, project storage
 }
 
 func (r *Runner) finishFailureStreakBreakerForRun(ctx context.Context, project storage.ProjectRecord, loop storage.LoopRecord, queueItem storage.QueueItemRecord, runID string, checkpoint *fixerCheckpoint) (bool, error) {
-	r.recordFailedRunCleanup(context.Background(), project, runID, checkpoint)
+	r.recordTerminalCleanup(context.Background(), project, runID, checkpoint)
 	if r.db == nil || r.repos == nil || r.repos.Loops == nil || r.repos.Queue == nil || r.repos.Runs == nil || queueItem.Repo == nil || queueItem.PRNumber == nil {
 		return false, nil
 	}
@@ -7003,14 +7076,18 @@ func (r *Runner) cleanupFixerWorktreeIfTerminal(ctx context.Context, project sto
 	return nil
 }
 
-// recordFailedRunCleanup preserves a terminal run's primary failure while
-// making a later cleanup failure visible in the same durable outcome.
-func (r *Runner) recordFailedRunCleanup(ctx context.Context, project storage.ProjectRecord, runID string, checkpoint *fixerCheckpoint) {
+// recordTerminalCleanup preserves the completed run result while making a
+// later cleanup failure visible in the same durable outcome.
+func (r *Runner) recordTerminalCleanup(ctx context.Context, project storage.ProjectRecord, runID string, checkpoint *fixerCheckpoint) {
 	cleanupErr := r.cleanupFixerWorktreeIfTerminal(ctx, project, checkpoint)
-	if cleanupErr == nil || checkpoint == nil || checkpoint.Outcome == nil || checkpoint.Outcome.PrimaryFailure == nil {
+	if cleanupErr == nil || checkpoint == nil {
 		return
 	}
-	checkpoint.recordFailure(stepCleanupWorktree, &loopError{message: cleanupErr.Error(), kind: FailureRetryableTransient})
+	if checkpoint.Outcome == nil {
+		checkpoint.refreshOutcomeProgress()
+	}
+	issue := FixerOutcomeFailure{Step: string(stepCleanupWorktree), Message: cleanupErr.Error(), Kind: FailureRetryableTransient, Retryable: true}
+	checkpoint.Outcome.SecondaryIssues = append(checkpoint.Outcome.SecondaryIssues, issue)
 	checkpoint.refreshOutcomeProgress()
 	if r.repos == nil || r.repos.Runs == nil || strings.TrimSpace(runID) == "" {
 		return

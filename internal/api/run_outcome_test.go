@@ -37,3 +37,19 @@ func TestSerializeRunDerivesHistoricalFixerOutcome(t *testing.T) {
 		t.Fatalf("wire progress = %#v, want pushed outcome", outcome["progress"])
 	}
 }
+
+func TestDecorateLoopDiagnosticsSurfacesHistoricalFixerOutcome(t *testing.T) {
+	t.Parallel()
+
+	checkpoint := `{"fixItems":[{"id":"c1","type":"comment","threadId":"t1"}],"reconcileCommits":{"newCommitShas":["commit-1"]},"push":{"pushed":true}}`
+	currentStep := "recheck"
+	errorMessage := "recheck failed"
+	run := storage.RunRecord{Status: "failed", CurrentStep: &currentStep, CheckpointJSON: &checkpoint, ErrorMessage: &errorMessage}
+	view := loopResponse{}
+
+	decorateLoopDiagnostics(&view, nil, &run)
+
+	if view.Outcome == nil || view.Outcome.PrimaryFailure == nil || !view.Outcome.PartialSuccess {
+		t.Fatalf("loop Outcome = %#v, want dashboard-facing historical partial success", view.Outcome)
+	}
+}

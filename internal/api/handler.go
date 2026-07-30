@@ -1794,10 +1794,11 @@ type loopResponse struct {
 	CreatedAt    string  `json:"createdAt"`
 	UpdatedAt    string  `json:"updatedAt"`
 	// Queue-derived diagnostics (latest queue item / run), matching looper describe / ps.
-	Attempts          *int64  `json:"attempts,omitempty"`
-	MaxAttempts       *int64  `json:"maxAttempts,omitempty"`
-	LastFailureKind   *string `json:"lastFailureKind,omitempty"`
-	LastFailureReason *string `json:"lastFailureReason,omitempty"`
+	Attempts          *int64                 `json:"attempts,omitempty"`
+	MaxAttempts       *int64                 `json:"maxAttempts,omitempty"`
+	LastFailureKind   *string                `json:"lastFailureKind,omitempty"`
+	LastFailureReason *string                `json:"lastFailureReason,omitempty"`
+	Outcome           *fixer.FixerRunOutcome `json:"outcome,omitempty"`
 }
 
 type loopLogsResponse struct {
@@ -3404,6 +3405,9 @@ func decorateLoopDiagnostics(view *loopResponse, latestQueue *storage.QueueItemR
 				view.LastFailureReason = latestRun.Summary
 			}
 		}
+	}
+	if latestRun != nil {
+		view.Outcome = fixer.DeriveRunOutcome(*latestRun)
 	}
 }
 

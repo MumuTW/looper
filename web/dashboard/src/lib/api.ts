@@ -215,6 +215,26 @@ export type ActiveRunsList = {
   items: ActiveRun[];
 };
 
+export type FixerOutcomeFailure = {
+  step?: string;
+  message?: string;
+  retryable: boolean;
+  kind?: string;
+};
+
+export type FixerRunOutcome = {
+  primaryFailure?: FixerOutcomeFailure | null;
+  secondaryIssues?: FixerOutcomeFailure[];
+  progress: {
+    commitProduced?: boolean;
+    pushed?: boolean;
+    repliesSent?: number;
+    threadsResolved?: number;
+  };
+  followUpThreadIds?: string[];
+  partialSuccess?: boolean;
+};
+
 export type Loop = {
   id: string;
   seq: number;
@@ -237,6 +257,7 @@ export type Loop = {
   maxAttempts?: number | null;
   lastFailureKind?: string | null;
   lastFailureReason?: string | null;
+  outcome?: FixerRunOutcome | null;
 };
 
 export type LoopsList = {

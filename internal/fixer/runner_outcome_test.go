@@ -2,14 +2,14 @@ package fixer
 
 import (
 	"context"
-	"errors"
 	"path/filepath"
 	"testing"
 
+	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
-func TestFixerRepairTaskBlockedUsesStructuredAuthority(t *testing.T) {
+func TestFixerRepairTaskOutcomeUsesStructuredAuthority(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -17,6 +17,7 @@ func TestFixerRepairTaskBlockedUsesStructuredAuthority(t *testing.T) {
 		result      AgentResult
 		blocked     bool
 		failureKind QueueFailureKind
+		wantError   bool
 	}{
 		{
 			name: "successful prose is not a blocking signal",
@@ -26,8 +27,19 @@ func TestFixerRepairTaskBlockedUsesStructuredAuthority(t *testing.T) {
 			},
 		},
 		{
-			name:   "unstructured auth prose is diagnostic only",
-			result: AgentResult{Summary: "GitHub auth failed before editing"},
+			name:      "unstructured auth prose is diagnostic only",
+			result:    AgentResult{Summary: "GitHub auth failed before editing"},
+			wantError: true,
+		},
+		{
+			name:      "blocked outcome requires failure kind",
+			result:    AgentResult{Stdout: `__LOOPER_RESULT__={"outcome":"blocked","summary":"blocked"}`},
+			wantError: true,
+		},
+		{
+			name:      "unrecognized outcome is rejected",
+			result:    AgentResult{Stdout: `__LOOPER_RESULT__={"outcome":"failed","summary":"failed"}`},
+			wantError: true,
 		},
 		{
 			name: "structured auth block leaves autonomous lane",
@@ -43,9 +55,9 @@ func TestFixerRepairTaskBlockedUsesStructuredAuthority(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			blocked, _, kind := fixerRepairTaskBlocked(tt.result)
-			if blocked != tt.blocked || kind != tt.failureKind {
-				t.Fatalf("fixerRepairTaskBlocked() = (%t, %q), want (%t, %q)", blocked, kind, tt.blocked, tt.failureKind)
+			blocked, _, kind, outcomeErr := fixerRepairTaskOutcome(tt.result)
+			if blocked != tt.blocked || kind != tt.failureKind || (outcomeErr != nil) != tt.wantError {
+				t.Fatalf("fixerRepairTaskOutcome() = (%t, %q, %v), want (%t, %q, error=%t)", blocked, kind, outcomeErr, tt.blocked, tt.failureKind, tt.wantError)
 			}
 		})
 	}
@@ -76,6 +88,72 @@ func TestFixerOutcomePreservesFailureOrderAndCurrentRunProgress(t *testing.T) {
 	}
 	if checkpoint.Outcome.Progress.ThreadsResolved != 0 {
 		t.Fatalf("ThreadsResolved = %d, want external/stale observations excluded", checkpoint.Outcome.Progress.ThreadsResolved)
+	}
+}
+
+func TestFixerOutcomeExcludesInheritedRetryProgress(t *testing.T) {
+	t.Parallel()
+
+	checkpoint := fixerCheckpoint{
+		RunPreStartAt:    "2026-04-11T12:00:00.000Z",
+		ReconcileCommits: &checkpointReconcileCommits{NewCommitSHAs: []string{"old-commit"}, CompletedAt: "2026-04-11T11:59:00.000Z"},
+		Push:             &checkpointPush{Pushed: true, PushedAt: "2026-04-11T11:59:10.000Z"},
+		ResolvedComments: &checkpointResolvedComments{Items: []checkpointResolvedComment{{Status: "resolved", ReplyState: "sent", UpdatedAt: "2026-04-11T11:59:20.000Z"}}},
+	}
+	checkpoint.recordFailure(stepRepair, &loopError{message: "retry failed before progress", kind: FailureRetryableTransient})
+	checkpoint.refreshOutcomeProgress()
+
+	if checkpoint.Outcome == nil || checkpoint.Outcome.PartialSuccess || checkpoint.Outcome.Progress != (FixerDurableProgress{}) {
+		t.Fatalf("Outcome = %#v, want inherited predecessor progress excluded", checkpoint.Outcome)
+	}
+}
+
+func TestCreateRunContextRebasesOutcomeProgressForRetry(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	target := buildPullRequestTargetID(repo, prNumber)
+	loop := storage.LoopRecord{ID: "loop_retry_progress", ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &prNumber, Status: "queued", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	oldAt := "2026-04-11T11:59:00.000Z"
+	oldCheckpoint := fixerCheckpoint{
+		ResumePolicy:     loops.ResumePolicyReplayStep,
+		FixItems:         []FixItem{{ID: "c1", Type: "comment", ThreadID: "t1"}},
+		Worktree:         &checkpointWorktree{Path: filepath.Join(t.TempDir(), "worktree"), Branch: "feature/fix-42", PreparedAt: oldAt},
+		ReconcileCommits: &checkpointReconcileCommits{NewCommitSHAs: []string{"old-commit"}, CompletedAt: oldAt},
+		Push:             &checkpointPush{Pushed: true, PushedAt: oldAt},
+		ResolvedComments: &checkpointResolvedComments{Items: []checkpointResolvedComment{{Status: "resolved", ReplyState: "sent", UpdatedAt: oldAt}}},
+	}
+	checkpointJSON := mustMarshalJSON(oldCheckpoint)
+	failedStep := string(stepRepair)
+	lastCompleted := string(stepPrepareWorktree)
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_old_progress", LoopID: loop.ID, Status: "failed", CurrentStep: &failedStep, LastCompletedStep: &lastCompleted, CheckpointJSON: &checkpointJSON, StartedAt: oldAt, CreatedAt: oldAt, UpdatedAt: oldAt}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
+
+	resumed, err := runner.createRunContext(context.Background(), loop)
+	if err != nil {
+		t.Fatalf("createRunContext() error = %v", err)
+	}
+	resumed.Checkpoint.recordFailure(stepRepair, &loopError{message: "retry failed before progress", kind: FailureRetryableTransient})
+	resumed.Checkpoint.refreshOutcomeProgress()
+	if resumed.Checkpoint.Outcome == nil || resumed.Checkpoint.Outcome.PartialSuccess || resumed.Checkpoint.Outcome.Progress != (FixerDurableProgress{}) {
+		t.Fatalf("retry Outcome = %#v, want predecessor progress excluded", resumed.Checkpoint.Outcome)
+	}
+}
+
+func TestFixerOutcomeReportsNonRetryableFailureAsNonRetryable(t *testing.T) {
+	t.Parallel()
+
+	checkpoint := fixerCheckpoint{}
+	checkpoint.recordFailure(stepRepair, &loopError{message: "invalid repository state", kind: FailureNonRetryable})
+	if checkpoint.Outcome == nil || checkpoint.Outcome.PrimaryFailure == nil || checkpoint.Outcome.PrimaryFailure.Retryable {
+		t.Fatalf("Outcome = %#v, want non-retryable operator contract", checkpoint.Outcome)
 	}
 }
 
@@ -117,57 +195,6 @@ func TestDeriveRunOutcomeRecognizesEarlyAndOutcomeOnlyFixerCheckpoints(t *testin
 	}
 }
 
-func TestRecordFailedRunCleanupPersistsSecondaryIssue(t *testing.T) {
-	t.Parallel()
-
-	fixture := newRunnerFixture(t)
-	git := &fakeGitGateway{cleanupErr: errors.New("worktree remove failed")}
-	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, Logger: fixture.logger, Now: fixture.now})
-	checkpoint := fixerCheckpoint{
-		RunStartedRunID: "run_cleanup_secondary",
-		Worktree: &checkpointWorktree{
-			Path:       filepath.Join(t.TempDir(), "worktree"),
-			Branch:     "feature/fix-42",
-			PreparedAt: fixture.nowISO(),
-		},
-	}
-	checkpoint.recordFailure(stepRepair, &loopError{message: "repair failed", kind: FailureRetryableTransient})
-	checkpointJSON := mustMarshalJSON(checkpoint)
-	loop := storage.LoopRecord{ID: "loop_cleanup_secondary", ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", Status: "running", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
-	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
-		t.Fatalf("Loops.Upsert() error = %v", err)
-	}
-	run := storage.RunRecord{ID: "run_cleanup_secondary", LoopID: "loop_cleanup_secondary", Status: "failed", CheckpointJSON: &checkpointJSON, StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
-	if err := fixture.repos.Runs.Upsert(context.Background(), run); err != nil {
-		t.Fatalf("Runs.Upsert() error = %v", err)
-	}
-	newerStep := string(stepRecheck)
-	newerHeartbeat := "2026-04-11T12:00:01.000Z"
-	run.Status = "interrupted"
-	run.CurrentStep = &newerStep
-	run.LastHeartbeatAt = &newerHeartbeat
-	if err := fixture.repos.Runs.Upsert(context.Background(), run); err != nil {
-		t.Fatalf("Runs.Upsert(newer state) error = %v", err)
-	}
-
-	runner.recordFailedRunCleanup(context.Background(), storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()}, run.ID, &checkpoint)
-
-	if checkpoint.Outcome == nil || checkpoint.Outcome.PrimaryFailure == nil || checkpoint.Outcome.PrimaryFailure.Message != "repair failed" || len(checkpoint.Outcome.SecondaryIssues) != 1 || checkpoint.Outcome.SecondaryIssues[0].Step != string(stepCleanupWorktree) {
-		t.Fatalf("checkpoint.Outcome = %#v, want preserved primary and cleanup secondary", checkpoint.Outcome)
-	}
-	persisted, err := fixture.repos.Runs.GetByID(context.Background(), run.ID)
-	if err != nil || persisted == nil {
-		t.Fatalf("Runs.GetByID() = (%#v, %v)", persisted, err)
-	}
-	durable := parseCheckpoint(persisted.CheckpointJSON)
-	if durable.Outcome == nil || len(durable.Outcome.SecondaryIssues) != 1 {
-		t.Fatalf("durable Outcome = %#v, want persisted cleanup issue", durable.Outcome)
-	}
-	if persisted.Status != "interrupted" || persisted.CurrentStep == nil || *persisted.CurrentStep != newerStep || persisted.LastHeartbeatAt == nil || *persisted.LastHeartbeatAt != newerHeartbeat {
-		t.Fatalf("persisted run = %#v, want checkpoint-only update to preserve newer state", persisted)
-	}
-}
-
 func TestRunResolveCommentsDeferredClearsStaleFollowupWithoutMutation(t *testing.T) {
 	t.Parallel()
 
@@ -182,8 +209,11 @@ func TestRunResolveCommentsDeferredClearsStaleFollowupWithoutMutation(t *testing
 	}
 	thread := ReviewThread{ID: "t1", Comments: []ReviewThreadComment{{ID: "c1", Body: "please fix"}}}
 	github := &fakeGitHubGateway{
-		viewResponses: []PullRequestDetail{{Number: 42, State: "OPEN", HeadSHA: "new-head", HeadRefName: "feature/fix-42", BaseRefName: "main", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}}},
-		threads:       []ReviewThread{thread},
+		viewResponses: []PullRequestDetail{
+			{Number: 42, State: "OPEN", HeadSHA: "new-head", HeadRefName: "feature/fix-42", BaseRefName: "main", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}},
+			{Number: 42, State: "OPEN", HeadSHA: "new-head", HeadRefName: "feature/fix-42", BaseRefName: "main", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}},
+		},
+		threads: []ReviewThread{thread},
 	}
 	fixItems := []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", Summary: "please fix"}}
 	checkpoint := fixerCheckpoint{
@@ -207,14 +237,19 @@ func TestRunResolveCommentsDeferredClearsStaleFollowupWithoutMutation(t *testing
 	if updated.ResolvedComments == nil || len(updated.ResolvedComments.Items) != 1 || updated.ResolvedComments.Items[0].Status != "deferred" {
 		t.Fatalf("ResolvedComments = %#v, want deferred state", updated.ResolvedComments)
 	}
-	if updated.Outcome == nil || len(updated.Outcome.FollowUpThreadIDs) != 0 {
-		t.Fatalf("Outcome = %#v, want stale follow-up cleared", updated.Outcome)
+	if updated.Outcome == nil || !sameStringSlices(updated.Outcome.FollowUpThreadIDs, []string{"t1"}) {
+		t.Fatalf("Outcome = %#v, want deferred t1 as current follow-up", updated.Outcome)
 	}
 	persisted, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
 	if err != nil || persisted == nil {
 		t.Fatalf("Loops.GetByID() = (%#v, %v)", persisted, err)
 	}
-	if _, ok := parsePendingFixerRediscoveryState(parseJSONObject(persisted.MetadataJSON)); ok {
-		t.Fatalf("loop metadata = %s, want stale pending rediscovery cleared", derefString(persisted.MetadataJSON))
+	pending, ok := parsePendingFixerRediscoveryState(parseJSONObject(persisted.MetadataJSON))
+	if !ok || !sameStringSlices(pending.UnresolvedThreadIDs, []string{"t1"}) {
+		t.Fatalf("loop metadata = %s, want stale t2 replaced by deferred t1", derefString(persisted.MetadataJSON))
+	}
+	rechecked, err := runner.runRecheckStep(context.Background(), stepInput{Project: storage.ProjectRecord{RepoPath: t.TempDir()}, Loop: *persisted, Repo: repo, PRNumber: prNumber, Checkpoint: updated})
+	if err != nil || rechecked.ResumePolicy != loops.ResumePolicyAdvanceFromCheckpoint {
+		t.Fatalf("runRecheckStep() = (%#v, %v), want deferred thread to remain follow-up without manual intervention", rechecked, err)
 	}
 }

@@ -20,6 +20,7 @@ import {
   type LoopLogsSnapshot,
 } from "@/lib/api";
 import { useDashboardData } from "@/lib/DashboardDataContext";
+import { fixerOutcomeLabel, fixerOutcomeProgress } from "@/lib/fixerOutcome";
 import { formatAttempts, formatTs } from "@/lib/format";
 import { capLogChunk, capLogSeed, trimLogBuffer } from "@/lib/logBuffer";
 import {
@@ -509,6 +510,29 @@ export function LoopDetailPage() {
                   )
                 }
               />
+              {data.outcome ? (
+                <>
+                  <Kv label="Fixer outcome" value={fixerOutcomeLabel(data.outcome)} />
+                  <Kv label="Fixer progress" value={fixerOutcomeProgress(data.outcome)} />
+                  <Kv
+                    label="Primary failure"
+                    value={data.outcome.primaryFailure?.message?.trim() || "—"}
+                  />
+                  <Kv
+                    label="Follow-up threads"
+                    value={data.outcome.followUpThreadIds?.join(", ") || "—"}
+                  />
+                  <Kv
+                    label="Secondary issues"
+                    value={
+                      data.outcome.secondaryIssues
+                        ?.map((issue) => issue.message?.trim())
+                        .filter(Boolean)
+                        .join(" · ") || "—"
+                    }
+                  />
+                </>
+              ) : null}
               <Kv label="Last run" value={formatTs(data.lastRunAt)} />
               <Kv label="Next run" value={formatTs(data.nextRunAt)} />
               <Kv label="Created" value={formatTs(data.createdAt)} />
