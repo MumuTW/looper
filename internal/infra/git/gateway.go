@@ -48,6 +48,7 @@ type Gateway struct {
 
 type CreateWorktreeInput struct {
 	ProjectID         string
+	TargetLeaseKey    string
 	RepoPath          string
 	WorktreeRoot      string
 	Branch            string
@@ -312,7 +313,7 @@ func (g *Gateway) CreateWorktree(ctx context.Context, input CreateWorktreeInput)
 		BaseBranch:   stringPtr(baseBranch),
 		Status:       "active",
 		HeadSHA:      stringPtrIfNotEmpty(headSHA),
-		MetadataJSON: stringPtr(`{"recovered":false}`),
+		MetadataJSON: stringPtr(worktreeMetadataJSON(input.TargetLeaseKey)),
 		CreatedAt:    valueOr(existingRecordCreatedAt(existingRecord), nowISO),
 		UpdatedAt:    nowISO,
 		CleanedAt:    nil,
@@ -326,6 +327,14 @@ func (g *Gateway) CreateWorktree(ctx context.Context, input CreateWorktreeInput)
 
 	return record, nil
 
+}
+
+func worktreeMetadataJSON(targetLeaseKey string) string {
+	targetLeaseKey = strings.TrimSpace(targetLeaseKey)
+	if targetLeaseKey == "" {
+		return `{"recovered":false}`
+	}
+	return fmt.Sprintf(`{"recovered":false,"targetLeaseKey":%q}`, targetLeaseKey)
 }
 
 func (g *Gateway) ListWorktrees(ctx context.Context, repoPath string) ([]WorktreeListEntry, error) {

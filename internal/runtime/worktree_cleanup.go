@@ -10,6 +10,8 @@ import (
 
 	"github.com/nexu-io/looper/internal/config"
 	gitinfra "github.com/nexu-io/looper/internal/infra/git"
+	"github.com/nexu-io/looper/internal/loops"
+	"github.com/nexu-io/looper/internal/processidentity"
 	"github.com/nexu-io/looper/internal/storage"
 	"github.com/nexu-io/looper/internal/worktreecleanup"
 	"github.com/nexu-io/looper/internal/worktreesafety"
@@ -432,6 +434,11 @@ func (r *Runtime) cleanWorktreeCandidate(ctx context.Context, repos *storage.Rep
 	if cfg.Daemon.WorktreeCleanup.DryRun {
 		return r.recordWorktreeCleanupSkip(ctx, repos, candidate, "dry_run")
 	}
+	releaseLease, leaseReason := r.acquireWorktreeCleanupTargetLease(ctx, repos, candidate)
+	if leaseReason != "" {
+		return r.recordWorktreeCleanupSkip(ctx, repos, candidate, leaseReason)
+	}
+	defer releaseLease()
 	// Do NOT hold admission.mu across the full CleanupWorktree Wait: BeginShutdown/
 	// MarkDegraded take that mutex for the closed transition + cancelWorkProducers;
 	// holding it for a stalled `git worktree remove` deadlocks degrade/shutdown.
@@ -468,6 +475,59 @@ func (r *Runtime) cleanWorktreeCandidate(ctx context.Context, repos *storage.Rep
 		return worktreeCleanupCandidateResult{status: "cleaned", message: err.Error()}
 	}
 	return result
+}
+
+func (r *Runtime) acquireWorktreeCleanupTargetLease(ctx context.Context, repos *storage.Repositories, candidate storage.WorktreeRecord) (func(), string) {
+	leaseKey := worktreeTargetLeaseKey(candidate)
+	if leaseKey == "" {
+		// Historical records predate target leases and have no durable mapping
+		// from this checkout to a target key. Keep their established cleanup
+		// behaviour rather than inventing a branch/path-derived key; all newly
+		// created scheduler worktrees persist targetLeaseKey above.
+		return func() {}, ""
+	}
+	if repos == nil || repos.TargetLeases == nil {
+		return func() {}, "target_lease_storage_unavailable"
+	}
+	token, err := loops.NewTargetLeaseOwnerToken()
+	if err != nil {
+		return func() {}, "target_lease_token_error"
+	}
+	pid := int64(os.Getpid())
+	birth, err := processidentity.Read(int(pid))
+	if err != nil {
+		return func() {}, "target_lease_process_identity_unavailable"
+	}
+	startTime := birth.StartTime
+	bootID := strings.TrimSpace(birth.BootID)
+	var bootIDPtr *string
+	if bootID != "" {
+		bootIDPtr = &bootID
+	}
+	nowISO := formatJavaScriptISOString(r.now().UTC())
+	acquired, err := repos.TargetLeases.Acquire(ctx, storage.TargetLeaseRecord{TargetKey: leaseKey, OwnerToken: token, OwnerKind: "automation", OwnerID: candidate.ID, Purpose: "cleanup", ProcessPID: &pid, ProcessStartTime: &startTime, ProcessBootID: bootIDPtr, AcquiredAt: nowISO, UpdatedAt: nowISO})
+	if err != nil {
+		return func() {}, "target_lease_acquire_failed"
+	}
+	if !acquired {
+		return func() {}, "target_lease_held"
+	}
+	return func() {
+		_, _ = repos.TargetLeases.Release(context.Background(), leaseKey, token)
+	}, ""
+}
+
+func worktreeTargetLeaseKey(candidate storage.WorktreeRecord) string {
+	if candidate.MetadataJSON == nil || strings.TrimSpace(*candidate.MetadataJSON) == "" {
+		return ""
+	}
+	var metadata struct {
+		TargetLeaseKey string `json:"targetLeaseKey"`
+	}
+	if err := json.Unmarshal([]byte(*candidate.MetadataJSON), &metadata); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(metadata.TargetLeaseKey)
 }
 
 // admitWorktreeCleanupStart returns a StartGate that holds claim admission across
