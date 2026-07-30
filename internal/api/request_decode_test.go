@@ -5,6 +5,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	pkgapi "github.com/nexu-io/looper/pkg/api"
 )
 
 type decodeProbe struct {
@@ -61,12 +63,20 @@ func TestDecodeJSONMutationBodyContract(t *testing.T) {
 		}
 	})
 
-	t.Run("oversized body is rejected with 413", func(t *testing.T) {
+	t.Run("oversized body is rejected with 413 and its canonical code", func(t *testing.T) {
 		var dst decodeProbe
 		huge := `{"name":"` + strings.Repeat("x", maxJSONMutationBodyBytes) + `"}`
 		aerr := decodeJSONMutationBody(newRequest(huge), &dst, true)
-		if aerr == nil || aerr.status != http.StatusRequestEntityTooLarge {
-			t.Fatalf("decode error = %#v, want 413 too-large rejection", aerr)
+		if aerr == nil || aerr.status != http.StatusRequestEntityTooLarge || aerr.code != pkgapi.ErrorCodeRequestTooLarge {
+			t.Fatalf("decode error = %#v, want 413 REQUEST_TOO_LARGE", aerr)
+		}
+	})
+
+	t.Run("duplicate member names are rejected", func(t *testing.T) {
+		var dst decodeProbe
+		aerr := decodeJSONMutationBody(newRequest(`{"force":true,"force":false}`), &dst, true)
+		if aerr == nil || !strings.Contains(aerr.message, "duplicate field") {
+			t.Fatalf("decode error = %#v, want duplicate-field rejection", aerr)
 		}
 	})
 

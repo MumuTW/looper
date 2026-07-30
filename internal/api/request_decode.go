@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/nexu-io/looper/internal/config"
 	pkgapi "github.com/nexu-io/looper/pkg/api"
 )
 
@@ -38,7 +39,7 @@ func decodeJSONMutationBody(r *http.Request, dst any, requireBody bool) *apiErro
 	if err != nil {
 		var maxBytesErr *http.MaxBytesError
 		if errors.As(err, &maxBytesErr) {
-			return &apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusRequestEntityTooLarge, message: fmt.Sprintf("Request body exceeds %d bytes", maxJSONMutationBodyBytes)}
+			return &apiError{code: pkgapi.ErrorCodeRequestTooLarge, status: http.StatusRequestEntityTooLarge, message: fmt.Sprintf("Request body exceeds %d bytes", maxJSONMutationBodyBytes)}
 		}
 		return &apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Request body could not be read: %v", err)}
 	}
@@ -67,6 +68,12 @@ func decodeStrictJSONValue(raw []byte, dst any) *apiError {
 	var trailing json.RawMessage
 	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
 		return &apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "Request body must contain exactly one JSON value"}
+	}
+	// raw is valid single-value JSON at this point, so a failure here is a
+	// genuine duplicate: encoding/json silently keeps the last member,
+	// letting {"force":true,"force":false} change an operation's meaning.
+	if err := config.ValidateUniqueJSONNames(raw); err != nil {
+		return &apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Request body has a duplicate field: %v", err)}
 	}
 	return nil
 }
