@@ -76,6 +76,7 @@ func buildValidationCommandHandlers(t *testing.T, cfg config.Config, logger *cap
 		nil,
 		newSchedulerNotificationGatewayFactory(),
 		coordinatorrole.NewRuntimeState(),
+		newDeployScheduler(),
 	)
 }
 

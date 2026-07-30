@@ -214,6 +214,12 @@ func TestConfigResponseNeverReturnsSecretValues(t *testing.T) {
 	cfg.Agent.Env = map[string]string{"OPENAI_API_KEY": "agent-secret-value"}
 	cfg.Agent.Params = map[string]any{"apiKey": "agent-param-secret"}
 	cfg.Daemon.Environment = map[string]string{"PRIVATE_TOKEN": "daemon-secret-value"}
+	cfg.Projects = []config.ProjectRefConfig{{
+		ID: "deploy-project",
+		Roles: &config.PartialRoleConfigs{Deployer: &config.PartialDeployerRoleConfig{
+			Environment: &map[string]string{"DEPLOY_TOKEN": "project-deploy-secret"},
+		}},
+	}}
 
 	handler := NewHandler(Context{
 		Config: cfg,
@@ -230,7 +236,7 @@ func TestConfigResponseNeverReturnsSecretValues(t *testing.T) {
 		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
 	}
 	body := recorder.Body.String()
-	for _, secret := range []string{localToken, "agent-secret-value", "agent-param-secret", "daemon-secret-value"} {
+	for _, secret := range []string{localToken, "agent-secret-value", "agent-param-secret", "daemon-secret-value", "project-deploy-secret"} {
 		if strings.Contains(body, secret) {
 			t.Fatalf("config response exposed secret %q: %s", secret, body)
 		}
@@ -242,6 +248,10 @@ func TestConfigResponseNeverReturnsSecretValues(t *testing.T) {
 	assertStringArray(t, data["agent"].(map[string]any)["envKeys"], []string{"OPENAI_API_KEY"})
 	assertEqual(t, len(data["agent"].(map[string]any)["params"].(map[string]any)), 0)
 	assertEqual(t, len(data["daemon"].(map[string]any)["environment"].(map[string]any)), 0)
+	projectRoles := data["projects"].([]any)[0].(map[string]any)["roles"].(map[string]any)
+	if _, exists := projectRoles["deployer"].(map[string]any)["environment"]; exists {
+		t.Fatalf("project deploy environment must not leave the daemon: %#v", projectRoles)
+	}
 }
 
 func assertStringArray(t *testing.T, value any, want []string) {

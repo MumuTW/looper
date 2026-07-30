@@ -1,12 +1,18 @@
 package runtime
 
 import (
+	"context"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/deployer"
+	githubinfra "github.com/nexu-io/looper/internal/infra/github"
+	"github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -102,4 +108,90 @@ func TestDeployerRoleReadsProjectOverrides(t *testing.T) {
 	if global := deployerRoleForProject(cfg, "other"); global.Enabled || global.Command != "make deploy" {
 		t.Fatalf("global role = %+v, want the override confined to its project", global)
 	}
+}
+
+func TestDeploySchedulerSingleFlightsOneProject(t *testing.T) {
+	t.Parallel()
+
+	scheduler := newDeployScheduler()
+	runner := &schedulerTaskTracker{}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	if !scheduler.Schedule("project", runner, func() {
+		once.Do(func() { close(started) })
+		<-release
+	}) {
+		t.Fatal("first Schedule() = false, want admitted")
+	}
+	<-started
+	if scheduler.Schedule("project", runner, func() { t.Error("duplicate deploy ran") }) {
+		t.Fatal("second Schedule() = true, want per-project single-flight refusal")
+	}
+	close(release)
+	runner.Wait()
+}
+
+// A blocked deployment must be a scheduler-owned background task: the next
+// project still reaches its integration lane in the same tick.
+func TestSchedulerTickDoesNotBlockOtherProjectOnDeploy(t *testing.T) {
+	workingDir := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "scheduler.sqlite"), t.TempDir())
+	defer coordinator.Close()
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.July, 31, 8, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+	baseBranch := "main"
+	for _, project := range []struct{ id, repo string }{{"a-deploying", "acme/a"}, {"b-integrates", "acme/b"}} {
+		metadata := `{"repo":"` + project.repo + `"}`
+		if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: project.id, Name: project.id, RepoPath: workingDir, BaseBranch: &baseBranch, MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+			t.Fatalf("Projects.Upsert(%s): %v", project.id, err)
+		}
+	}
+
+	deployStarted := make(chan struct{})
+	var startOnce sync.Once
+	github := githubinfra.New(githubinfra.Options{GHRun: func(_ context.Context, options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		switch {
+		case strings.Contains(args, "commits/main"):
+			return shell.Result{Stdout: "new-head"}, nil
+		case strings.Contains(args, "deployments") && strings.Contains(args, "--method POST"):
+			startOnce.Do(func() { close(deployStarted) })
+			return shell.Result{Stdout: `{"id": 7}`}, nil
+		case strings.Contains(args, "deployments"):
+			return shell.Result{Stdout: "[]"}, nil
+		default:
+			return shell.Result{Stdout: "{}"}, nil
+		}
+	}})
+	blockFile := filepath.Join(workingDir, "release-deploy")
+	command := "until [ -f " + blockFile + " ]; do sleep 0.01; done"
+	cfg := config.Config{
+		Roles:    config.RoleConfigs{Deployer: config.DeployerRoleConfig{Enabled: true, Command: command}},
+		Projects: []config.ProjectRefConfig{{ID: "a-deploying"}, {ID: "b-integrates"}},
+	}
+	coordinatorRunner := &stubCoordinatorScheduler{}
+	tasks := &schedulerTaskTracker{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := runDefaultSchedulerTick(ctx, defaultSchedulerTickInput{
+		Repos: repos, GitHubGateway: github, Config: &cfg, Now: func() time.Time { return now },
+		AsyncRunner: tasks, Deploys: newDeployScheduler(), Coordinator: coordinatorRunner,
+		CoordinatorEnabled: func(string) bool { return true },
+	}); err != nil {
+		t.Fatalf("runDefaultSchedulerTick() error = %v", err)
+	}
+	<-deployStarted
+	coordinatorRunner.mu.Lock()
+	calls := coordinatorRunner.discoverCalls
+	coordinatorRunner.mu.Unlock()
+	if len(calls) != 2 || calls[1].ProjectID != "b-integrates" {
+		t.Fatalf("coordinator discovery calls = %#v, want second project despite blocked deploy", calls)
+	}
+	if err := os.WriteFile(blockFile, []byte("release"), 0o600); err != nil {
+		t.Fatalf("release blocked deploy: %v", err)
+	}
+	tasks.Wait()
 }

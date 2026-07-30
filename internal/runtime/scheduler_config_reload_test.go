@@ -207,6 +207,7 @@ func TestBuildDefaultSchedulerHandlers_PerRoleAgentVendors(t *testing.T) {
 		nil,
 		newSchedulerNotificationGatewayFactory(),
 		coordinatorrole.NewRuntimeState(),
+		newDeployScheduler(),
 	)
 	if handlers.input == nil {
 		t.Fatal("handlers.input = nil")

@@ -17,6 +17,30 @@ import (
 // deploy can print megabytes; what a human needs in a notification is the end.
 const deployOutputTailBytes = 4000
 
+// scheduleDeployLane hands a project's deploy to the scheduler lifecycle. A
+// scheduler tick never waits for the command: the scheduler task tracker owns
+// the accepted goroutine, BeginShutdown cancels ctx, and stop waits for it.
+func scheduleDeployLane(ctx context.Context, input defaultSchedulerTickInput, project storage.ProjectRecord, repo string) {
+	if input.Config == nil || input.Deploys == nil {
+		return
+	}
+	role := deployerRoleForProject(*input.Config, project.ID)
+	if !role.Enabled || strings.TrimSpace(role.Command) == "" {
+		return
+	}
+	if !input.Deploys.Schedule(project.ID, input.AsyncRunner, func() {
+		// Admission can close after the tick queued this task. Do not start a
+		// networked deploy after BeginShutdown/MarkDegraded; ctx additionally
+		// cancels an already-running command during shutdown.
+		if err := admissionRefuseWork(input); err != nil {
+			return
+		}
+		runDeployLane(ctx, input, project, repo)
+	}) && input.Logger != nil {
+		input.Logger.Debug("deployer: deploy already running or scheduler is stopping", map[string]any{"projectId": project.ID})
+	}
+}
+
 // runDeployLane deploys a project's base branch when it carries a commit Looper
 // has not acted on yet.
 //

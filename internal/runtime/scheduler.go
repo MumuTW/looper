@@ -106,9 +106,13 @@ type defaultSchedulerTickInput struct {
 	// OperationOwner, when set, admits a Supervisor operation lease before each
 	// durable ClaimNext* and holds it until durable complete/cancel/requeue
 	// (ADR-0015 R6 / #579). Nil means ungated claim ownership (unit tests).
-	OperationOwner           *ActiveExecutionRegistry
-	ReconcileStaleRuns       func(context.Context) (StaleRunReconcileSummary, error)
-	AsyncRunner              schedulerAsyncRunner
+	OperationOwner     *ActiveExecutionRegistry
+	ReconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error)
+	AsyncRunner        schedulerAsyncRunner
+	// Deploys admits one asynchronous deploy per project. Its lifetime is the
+	// scheduler lifecycle: AsyncRunner owns every accepted goroutine and its
+	// context is canceled by BeginShutdown.
+	Deploys                  *deployScheduler
 	RequestSchedulerWake     func()
 	Triager                  triagerScheduler
 	Planner                  plannerScheduler
@@ -1567,6 +1571,7 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *
 		return defaultSchedulerHandlers{tick: fail, claim: fail}
 	}
 	claimMu := &sync.Mutex{}
+	deploys := newDeployScheduler()
 	notificationGateways := newSchedulerNotificationGatewayFactory()
 	coordinatorState := coordinatorrole.NewRuntimeState()
 	if len(config.ResolveValidationCommands(source.Snapshot())) == 0 && logger != nil {
@@ -1577,7 +1582,7 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *
 	// transport continuity while retaining config-specific policy.
 	buildSnapshot := func() defaultSchedulerHandlers {
 		cfg := source.Snapshot()
-		return buildDefaultSchedulerHandlersWithOptions(cfg, configPath, logger, coordinator, repos, gitGateway, githubGateway, activeExecutions, asyncRunner, requestWake, now, reconcileStaleRuns, false, claimMu, nil, notificationGateways, coordinatorState)
+		return buildDefaultSchedulerHandlersWithOptions(cfg, configPath, logger, coordinator, repos, gitGateway, githubGateway, activeExecutions, asyncRunner, requestWake, now, reconcileStaleRuns, false, claimMu, nil, notificationGateways, coordinatorState, deploys)
 	}
 	handlers := defaultSchedulerHandlers{
 		snapshot:             buildSnapshot,
@@ -1661,7 +1666,7 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *
 	return handlers
 }
 
-func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath string, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error), includeWebhook bool, claimMu *sync.Mutex, configSource projects.ConfigSource, notificationGateways *schedulerNotificationGatewayFactory, coordinatorState *coordinatorrole.RuntimeState) defaultSchedulerHandlers {
+func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath string, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error), includeWebhook bool, claimMu *sync.Mutex, configSource projects.ConfigSource, notificationGateways *schedulerNotificationGatewayFactory, coordinatorState *coordinatorrole.RuntimeState, deploys *deployScheduler) defaultSchedulerHandlers {
 	if now == nil {
 		now = time.Now
 	}
@@ -2192,6 +2197,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			ClaimMu:              claimMu,
 			ReconcileStaleRuns:   reconcileStaleRuns,
 			AsyncRunner:          runner,
+			Deploys:              deploys,
 			RequestSchedulerWake: requestWake,
 			Triager:              triagerRunner,
 			Planner:              plannerRunner,
@@ -2478,7 +2484,7 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 		if err := admissionRefuseWork(input); err != nil {
 			break
 		}
-		runDeployLane(ctx, input, project, repo)
+		scheduleDeployLane(ctx, input, project, repo)
 	}
 
 	// HITL (feishu transport): poll the shared Cloudflare inbox once per tick and

@@ -1295,9 +1295,27 @@ func (h *Handler) buildConfigResponse() configResponse {
 			Coordinator: cfg.Roles.Coordinator,
 		},
 		Providers: append([]config.ProviderConfig{}, cfg.Providers...),
-		Projects:  append([]config.ProjectRefConfig{}, cfg.Projects...),
+		Projects:  projectConfigResponse(cfg.Projects),
 		Metadata:  h.buildConfigMetadata(),
 	}
+}
+
+// projectConfigResponse removes deploy environment values before project
+// overrides cross the daemon boundary. The command still receives the original
+// map; config HTTP is a dashboard projection, not an execution config export.
+func projectConfigResponse(projects []config.ProjectRefConfig) []config.ProjectRefConfig {
+	result := append([]config.ProjectRefConfig{}, projects...)
+	for index := range result {
+		if result[index].Roles == nil || result[index].Roles.Deployer == nil {
+			continue
+		}
+		roles := *result[index].Roles
+		deployer := *roles.Deployer
+		deployer.Environment = nil
+		roles.Deployer = &deployer
+		result[index].Roles = &roles
+	}
+	return result
 }
 
 func (h *Handler) buildConfigMetadata() ConfigMetadata {

@@ -638,8 +638,8 @@ type DeployerRoleConfig struct {
 	Enabled bool `json:"enabled"`
 	// Command is run with /bin/sh -c from the project's repository root. It is
 	// arbitrary local execution by design — the same trust the daemon already
-	// extends to the agent CLIs it runs — and only a merge into the project's
-	// base branch triggers it.
+	// extends to the agent CLIs it runs. Every movement of the project's base
+	// branch is trusted deployment authority, including a direct or force push.
 	Command string `json:"command,omitempty"`
 	// TimeoutSeconds bounds one deploy. Empty defaults to 900.
 	TimeoutSeconds int `json:"timeoutSeconds,omitempty"`

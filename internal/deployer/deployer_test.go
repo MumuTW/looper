@@ -199,6 +199,17 @@ func TestRunDoesNothingWhenTheHeadIsAlreadyDeployed(t *testing.T) {
 	}
 }
 
+// The deployer's authority is a base-ref movement, not a reconstructed merge
+// decision. A direct, administrator, or force push therefore deploys exactly
+// like a checked merge when it moves the configured base ref to a new SHA.
+func TestDecideDeploysAnUnverifiedDirectBaseRefUpdate(t *testing.T) {
+	t.Parallel()
+
+	if got := Decide(true, "./deploy.sh", HeadState{SHA: "direct-push-sha"}); got != DecisionDeploy {
+		t.Fatalf("Decide() = %q, want %q for an unseen direct base-ref update", got, DecisionDeploy)
+	}
+}
+
 // Two deploys of different commits running at once is the failure this guards
 // against; a stalled lane is visible and recoverable, that is not.
 func TestRunDeclinesWhileADeployIsInProgress(t *testing.T) {

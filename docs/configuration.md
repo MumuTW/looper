@@ -733,6 +733,12 @@ When a project's base branch moves, the deployer runs one configured command and
 tells you the result. It is agent-free: Looper does not interpret the command,
 judge success beyond its exit status, or roll anything back.
 
+The deployment authority is **any movement of the configured base ref**. That
+includes a merged PR, a direct push, an administrator bypass, and a force-push;
+Looper intentionally does not infer or verify a separate "accepted merge"
+authority from GitHub state. Enable this only where every writer of that ref is
+trusted to run the configured deploy command with the daemon's credentials.
+
 | Path | Purpose | Default |
 | --- | --- | --- |
 | `roles.deployer.enabled` | Enables the lane for this project | `false` |
@@ -772,6 +778,15 @@ therefore leaves an `in_progress` record rather than an untracked side effect,
 and the next tick declines to start a second copy of a deploy that may still be
 going. A stalled lane is visible and a human can clear it; two concurrent deploys
 of different commits are not something you can undo.
+
+Deploy commands run asynchronously under looperd's scheduler lifecycle: a slow
+deploy never blocks discovery or claims for another project, and shutdown
+cancels and waits for it. Looper supports one running looperd owning a configured
+project. Its per-project single-flight is in-process, so two independently
+configured daemons pointing at the same repository are unsupported and can each
+deploy the same head. The GitHub Deployment record is durable history, not an
+atomic cross-daemon claim; use one daemon or make the deploy command externally
+idempotent.
 
 Because the unit of work is a commit rather than a pull request, several PRs
 merging together produce **one** deploy of the resulting head, not one per PR.
