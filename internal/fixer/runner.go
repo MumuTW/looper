@@ -648,6 +648,33 @@ type ProcessResult struct {
 	Status      string
 	Summary     string
 	FailureKind QueueFailureKind
+	Outcome     *fixerRunOutcome
+}
+
+// fixerRunOutcome is checkpoint-only presentation data.  It deliberately
+// derives from existing checkpoints, so old raw run records stay untouched.
+// The first failure is the authority for a failed run; later cleanup failures
+// are retained as secondary issues instead of replacing it.
+type fixerRunOutcome struct {
+	PrimaryFailure    *fixerOutcomeFailure  `json:"primaryFailure,omitempty"`
+	SecondaryIssues   []fixerOutcomeFailure `json:"secondaryIssues,omitempty"`
+	Progress          fixerDurableProgress  `json:"progress,omitempty"`
+	FollowUpThreadIDs []string              `json:"followUpThreadIds,omitempty"`
+	PartialSuccess    bool                  `json:"partialSuccess,omitempty"`
+}
+
+type fixerOutcomeFailure struct {
+	Step      string           `json:"step,omitempty"`
+	Message   string           `json:"message,omitempty"`
+	Retryable bool             `json:"retryable"`
+	Kind      QueueFailureKind `json:"kind,omitempty"`
+}
+
+type fixerDurableProgress struct {
+	CommitProduced  bool `json:"commitProduced,omitempty"`
+	Pushed          bool `json:"pushed,omitempty"`
+	RepliesSent     int  `json:"repliesSent,omitempty"`
+	ThreadsResolved int  `json:"threadsResolved,omitempty"`
 }
 
 type replyAction string
@@ -748,6 +775,7 @@ type fixerCheckpoint struct {
 	ResolvedComments *checkpointResolvedComments `json:"resolvedComments,omitempty"`
 	SummaryComment   *checkpointSummaryComment   `json:"summaryComment,omitempty"`
 	Recheck          *checkpointRecheck          `json:"recheck,omitempty"`
+	Outcome          *fixerRunOutcome            `json:"outcome,omitempty"`
 	SkipReason       string                      `json:"skipReason,omitempty"`
 }
 
@@ -990,6 +1018,109 @@ func validateCompletedRepairCheckpoint(repair *checkpointRepair) error {
 		message: firstNonEmpty(repair.Summary, fmt.Sprintf("Fixer agent completed without valid structured result (parse status: %s)", firstNonEmpty(repair.ParseStatus, "missing"))),
 		kind:    FailureRetryableTransient,
 	}
+}
+
+// fixerRepairTaskBlocked distinguishes a process that exited normally from a
+// repair that could not be attempted. Older agents only supplied a summary,
+// so keep that narrowly-scoped compatibility path while new agents use the
+// structured outcome.
+func fixerRepairTaskBlocked(result AgentResult) (bool, string, QueueFailureKind) {
+	payload := extractCompletionMarkerPayload(result.Stdout + "\n" + result.Stderr)
+	if payload != "" {
+		var parsed struct {
+			Outcome string `json:"outcome"`
+			Summary string `json:"summary"`
+		}
+		if json.Unmarshal([]byte(payload), &parsed) == nil {
+			switch strings.ToLower(strings.TrimSpace(parsed.Outcome)) {
+			case "blocked", "blocking", "failed", "failure":
+				message := firstNonEmpty(strings.TrimSpace(parsed.Summary), result.Summary, "fixer repair task was blocked")
+				return true, message, fixerBlockedFailureKind(message)
+			}
+		}
+	}
+	message := strings.ToLower(strings.TrimSpace(firstNonEmpty(result.Summary, result.Stderr)))
+	if strings.Contains(message, "blocked before editing") ||
+		(strings.Contains(message, "could not") && (strings.Contains(message, "github") || strings.Contains(message, "gh ") || strings.Contains(message, "auth") || strings.Contains(message, "rate limit") || strings.Contains(message, "usage limit"))) {
+		blockedMessage := firstNonEmpty(result.Summary, result.Stderr, "fixer repair task was blocked")
+		return true, blockedMessage, fixerBlockedFailureKind(blockedMessage)
+	}
+	return false, "", ""
+}
+
+func fixerBlockedFailureKind(message string) QueueFailureKind {
+	message = strings.ToLower(message)
+	if strings.Contains(message, "authentication") || strings.Contains(message, "unauthorized") || strings.Contains(message, "forbidden") || strings.Contains(message, "token") || strings.Contains(message, "usage limit") {
+		return FailureManualIntervention
+	}
+	return FailureRetryableTransient
+}
+
+func (checkpoint *fixerCheckpoint) recordFailure(step FixerStep, failure *loopError) {
+	if checkpoint.Outcome == nil {
+		checkpoint.Outcome = &fixerRunOutcome{}
+	}
+	next := fixerOutcomeFailure{Step: string(step), Message: failure.message, Kind: failure.kind, Retryable: isQueueRetryEligible(failure.kind)}
+	if checkpoint.Outcome.PrimaryFailure == nil {
+		checkpoint.Outcome.PrimaryFailure = &next
+		return
+	}
+	checkpoint.Outcome.SecondaryIssues = append(checkpoint.Outcome.SecondaryIssues, next)
+}
+
+func (checkpoint *fixerCheckpoint) refreshOutcomeProgress() {
+	if checkpoint.Outcome == nil {
+		checkpoint.Outcome = &fixerRunOutcome{}
+	}
+	progress := fixerDurableProgress{}
+	if checkpoint.ReconcileCommits != nil {
+		progress.CommitProduced = len(checkpoint.ReconcileCommits.NewCommitSHAs) > 0
+	}
+	if checkpoint.Push != nil {
+		progress.Pushed = checkpoint.Push.Pushed
+	}
+	if checkpoint.ResolvedComments != nil {
+		for _, item := range checkpoint.ResolvedComments.Items {
+			if item.ReplyState == "sent" {
+				progress.RepliesSent++
+			}
+			if item.Status == "resolved" || item.Status == "already_resolved" || item.Status == "agent_declined" {
+				progress.ThreadsResolved++
+			}
+		}
+	}
+	checkpoint.Outcome.Progress = progress
+	checkpoint.Outcome.PartialSuccess = checkpoint.Outcome.PrimaryFailure != nil && (progress.CommitProduced || progress.Pushed || progress.RepliesSent > 0 || progress.ThreadsResolved > 0)
+}
+
+func newFollowupThreadIDs(snapshot, live []FixItem) []string {
+	known := make(map[string]struct{}, len(snapshot))
+	for _, item := range snapshot {
+		if item.ThreadID != "" {
+			known[item.ThreadID] = struct{}{}
+		}
+	}
+	var ids []string
+	for _, item := range live {
+		if item.Type == "comment" && item.ThreadID != "" {
+			if _, ok := known[item.ThreadID]; !ok {
+				ids = append(ids, item.ThreadID)
+			}
+		}
+	}
+	return canonicalizeStringSlice(ids)
+}
+
+func fixItemPresentInLiveReview(item FixItem, live []FixItem) bool {
+	for _, current := range live {
+		if item.ThreadID != "" && item.ThreadID == current.ThreadID {
+			return true
+		}
+		if item.ID != "" && item.ID == current.ID {
+			return true
+		}
+	}
+	return false
 }
 
 func checkpointRepairFromAgentResult(executionID, headSHA string, result AgentResult, nowISO string) *checkpointRepair {
@@ -2167,7 +2298,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 				return ProcessResult{}, err
 			} else if scheduled {
 				r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &latest)
-				return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
+				return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind, Outcome: latest.Outcome}, nil
 			}
 		}
 		if queueResultIsTerminalForCleanup(failedQueue) {
@@ -2266,6 +2397,8 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			}
 			failure := r.classifyFailureWithBoundary(err, fixerFailureBoundaryForStep(step))
 			latest := checkpoint
+			latest.recordFailure(step, failure)
+			latest.refreshOutcomeProgress()
 			latest.ResumePolicy = loops.NormalizeResumePolicy(string(failure.kind), latest.ResumePolicy)
 			if _, err := r.completeRun(ctx, run, "failed", failure.message, failure.message, latest); err != nil {
 				return ProcessResult{}, err
@@ -2306,13 +2439,13 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 					return ProcessResult{}, err
 				} else if scheduled {
 					r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &latest)
-					return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
+					return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind, Outcome: latest.Outcome}, nil
 				}
 			}
 			if queueResultIsTerminalForCleanup(failedQueue) {
 				r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, &latest)
 			}
-			return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
+			return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind, Outcome: latest.Outcome}, nil
 		}
 		if step == stepClaimPR {
 			claimedLockKey = checkpoint.ClaimedLockKey
@@ -3162,6 +3295,11 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 	// same evidence, including the transcript scan that only the live result
 	// carries.
 	repair := checkpointRepairFromAgentResult(executionID, detailHeadSHA(checkpoint.Detail), result, r.nowISO())
+	if blocked, message, kind := fixerRepairTaskBlocked(result); blocked {
+		checkpoint.Repair = repair
+		checkpoint.ResumePolicy = loops.NormalizeResumePolicy(string(kind), loops.ResumePolicyReplayStep)
+		return checkpoint, &loopError{message: message, kind: kind}
+	}
 	if err := validateCompletedRepairCheckpoint(repair); err != nil {
 		return checkpoint, err
 	}
@@ -3607,9 +3745,29 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 		}
 	}
 	checkpoint.Detail = mergeCheckpointDetailPreservingLabels(checkpoint.Detail, liveDetail)
-	fixItems := collectFixItems(liveDetail)
-	checkpoint.FixItems = fixItems
-	checkpoint.FixItemsHash = hashFixItems(fixItems)
+	// FixItems is the snapshot the agent repaired.  A fresh review collection is
+	// only follow-up work: it must never turn a completed snapshot into a
+	// missing-decision contract violation.
+	liveFixItems := collectFixItems(liveDetail)
+	useRepairSnapshot := checkpoint.Repair != nil && strings.TrimSpace(checkpoint.Repair.CompletedAt) != ""
+	fixItems := liveFixItems
+	if useRepairSnapshot {
+		fixItems = append([]FixItem(nil), checkpoint.FixItems...)
+	}
+	if useRepairSnapshot {
+		if followUp := newFollowupThreadIDs(fixItems, liveFixItems); len(followUp) > 0 {
+			if checkpoint.Outcome == nil {
+				checkpoint.Outcome = &fixerRunOutcome{}
+			}
+			checkpoint.Outcome.FollowUpThreadIDs = canonicalizeStringSlice(followUp)
+			if _, err := r.recordPendingFixerRediscovery(ctx, input.Loop, liveDetail.HeadSHA, hashFixItemsState(liveFixItems), unresolvedThreadIDs(liveFixItems)); err != nil {
+				return checkpoint, err
+			}
+		}
+	} else {
+		checkpoint.FixItems = liveFixItems
+		checkpoint.FixItemsHash = hashFixItems(liveFixItems)
+	}
 	if checkpoint.ResolvedComments == nil {
 		checkpoint.ResolvedComments = &checkpointResolvedComments{Items: []checkpointResolvedComment{}}
 	}
@@ -3674,6 +3832,10 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 	// unbreakable drift loop.
 	for _, item := range commentItems {
 		if alreadyResolved(checkpoint.ResolvedComments.Items, item) {
+			continue
+		}
+		if useRepairSnapshot && !fixItemPresentInLiveReview(item, liveFixItems) {
+			upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Status: "already_resolved", UpdatedAt: r.nowISO()})
 			continue
 		}
 		decision, ok := repliesByItemID[item.ID]
@@ -5124,6 +5286,7 @@ func (r *Runner) persistStepCompleted(ctx context.Context, run storage.RunRecord
 }
 
 func (r *Runner) completeRun(ctx context.Context, run storage.RunRecord, status, summary, errorMessage string, checkpoint fixerCheckpoint) (storage.RunRecord, error) {
+	checkpoint.refreshOutcomeProgress()
 	updated := run
 	endedAt := r.nowISO()
 	updated.Status = status

@@ -1473,8 +1473,8 @@ func TestProcessClaimedItemDoesNotResolveCommentsWhenRepairProducesNoCommits(t *
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
-	if result.Status != "failed" || result.FailureKind != FailureRetryableAfterResume {
-		t.Fatalf("result = %#v, want failed retryable-after-resume completion", result)
+	if result.Status != "failed" || result.FailureKind != FailureRetryableTransient {
+		t.Fatalf("result = %#v, want blocked repair failure", result)
 	}
 	if len(git.commitCalls) != 0 || len(git.pushCalls) != 0 || len(github.resolveCalls) != 0 {
 		t.Fatalf("commit calls=%d push calls=%d resolve calls=%d, want 0/0/0 after no-op repair", len(git.commitCalls), len(git.pushCalls), len(github.resolveCalls))
@@ -1487,14 +1487,8 @@ func TestProcessClaimedItemDoesNotResolveCommentsWhenRepairProducesNoCommits(t *
 		t.Fatalf("run = %#v, want failed run", run)
 	}
 	checkpoint := parseCheckpoint(run.CheckpointJSON)
-	if checkpoint.Push == nil || checkpoint.Push.Pushed || checkpoint.Push.SkippedReason == "" {
-		t.Fatalf("checkpoint.Push = %#v, want recorded no-op push", checkpoint.Push)
-	}
-	if checkpoint.ResumePolicy != loops.ResumePolicyRestartFromDiscover {
-		t.Fatalf("checkpoint.ResumePolicy = %q, want restart_from_discover", checkpoint.ResumePolicy)
-	}
-	if checkpoint.ResolvedComments == nil || len(checkpoint.ResolvedComments.Items) == 0 || checkpoint.ResolvedComments.Items[0].Status != "skipped_missing_agent_decision" {
-		t.Fatalf("checkpoint.ResolvedComments = %#v, want missing-decision marker", checkpoint.ResolvedComments)
+	if checkpoint.Outcome == nil || checkpoint.Outcome.PrimaryFailure == nil || checkpoint.Outcome.PrimaryFailure.Step != string(stepRepair) {
+		t.Fatalf("checkpoint.Outcome = %#v, want primary repair failure", checkpoint.Outcome)
 	}
 	if len(github.replyCalls) != 0 {
 		t.Fatalf("reply calls = %#v, want none for missing agent decision", github.replyCalls)
@@ -1503,7 +1497,7 @@ func TestProcessClaimedItemDoesNotResolveCommentsWhenRepairProducesNoCommits(t *
 	if err != nil {
 		t.Fatalf("Queue.GetByID() error = %v", err)
 	}
-	if queue == nil || queue.Status != "queued" || queue.LastErrorKind == nil || *queue.LastErrorKind != string(FailureRetryableAfterResume) {
+	if queue == nil || queue.Status != "queued" || queue.LastErrorKind == nil || *queue.LastErrorKind != string(FailureRetryableTransient) {
 		t.Fatalf("queue = %#v, want queued retryable queue item", queue)
 	}
 	loop, err := fixture.repos.Loops.GetByID(context.Background(), result.LoopID)
@@ -3330,7 +3324,7 @@ func TestRunResolveCommentsStepTreatsUnknownActionAsContractViolation(t *testing
 	}
 }
 
-func TestRunResolveCommentsStepHandlesNewThreadAsContractViolationWithoutSkippingExisting(t *testing.T) {
+func TestRunResolveCommentsStepTreatsNewThreadAfterRepairAsFollowupWithoutSkippingExisting(t *testing.T) {
 	t.Parallel()
 
 	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{{
@@ -3354,14 +3348,13 @@ func TestRunResolveCommentsStepHandlesNewThreadAsContractViolationWithoutSkippin
 	fixItems := []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", Summary: "please fix"}}
 	// Live PR has gained thread t2/c2 since the agent ran. The agent's
 	// existing decision for c1 must still be honoured (reply + resolve);
-	// the unknown thread t2 falls through to the contract-violation path
-	// without a synthetic decline reply or resolution.
+	// t2 is follow-up work, not a missing decision for the completed snapshot.
 	checkpoint := fixerCheckpoint{
 		FixItems:         fixItems,
 		FixItemsHash:     hashFixItems(fixItems),
 		Validation:       &ValidationResult{Passed: true, Summary: "ok", HeadSHA: "new-head"},
 		Push:             &checkpointPush{Pushed: false, Branch: "feature/fix-42", Remote: "origin", SkippedReason: "No new commits to push"},
-		Repair:           &checkpointRepair{ReplyExplanations: []replyExplanationEntry{{FixItemID: "c1", ThreadID: "t1", Explanation: "Applied the requested fix.", ThreadCommentsObserved: hashReviewThreadComments(ReviewThread{Comments: []ReviewThreadComment{{ID: "c1"}}})}}},
+		Repair:           &checkpointRepair{CompletedAt: "2026-04-11T12:00:00Z", ReplyExplanations: []replyExplanationEntry{{FixItemID: "c1", ThreadID: "t1", Explanation: "Applied the requested fix.", ThreadCommentsObserved: hashReviewThreadComments(ReviewThread{Comments: []ReviewThreadComment{{ID: "c1"}}})}}},
 		ReconcileCommits: &checkpointReconcileCommits{BaseHeadSHA: "base-head", FinalHeadSHA: "base-head", WorkingTreeClean: true},
 	}
 
@@ -3382,14 +3375,17 @@ func TestRunResolveCommentsStepHandlesNewThreadAsContractViolationWithoutSkippin
 		Loop:       loop,
 		Checkpoint: checkpoint,
 	})
-	if err == nil || !strings.Contains(err.Error(), "omitted or invalidated thread decisions") {
-		t.Fatalf("runResolveCommentsStep() error = %v, want contract-violation retry", err)
+	if err != nil {
+		t.Fatalf("runResolveCommentsStep() error = %v, want completed snapshot", err)
 	}
 	if len(github.resolveCalls) != 1 || github.resolveCalls[0].ThreadID != "t1" {
 		t.Fatalf("resolve calls = %#v, want exactly 1 resolve for t1", github.resolveCalls)
 	}
 	if len(github.replyCalls) != 1 {
 		t.Fatalf("reply calls = %d, want 1 fixed reply for t1", len(github.replyCalls))
+	}
+	if updated.Outcome == nil || !sameStringSlices(updated.Outcome.FollowUpThreadIDs, []string{"t2"}) {
+		t.Fatalf("updated.Outcome = %#v, want t2 follow-up", updated.Outcome)
 	}
 	var (
 		t1Reply *AddReviewThreadReplyInput
@@ -3410,11 +3406,11 @@ func TestRunResolveCommentsStepHandlesNewThreadAsContractViolationWithoutSkippin
 	if statusByThread["t1"] != "resolved" {
 		t.Fatalf("t1 status = %q, want resolved", statusByThread["t1"])
 	}
-	if statusByThread["t2"] != "skipped_missing_agent_decision" {
-		t.Fatalf("t2 status = %q, want skipped_missing_agent_decision", statusByThread["t2"])
+	if statusByThread["t2"] != "" {
+		t.Fatalf("t2 status = %q, want no mutation of follow-up work", statusByThread["t2"])
 	}
-	if updated.ResumePolicy != loops.ResumePolicyRestartFromDiscover {
-		t.Fatalf("updated.ResumePolicy = %q, want restart_from_discover", updated.ResumePolicy)
+	if updated.ResumePolicy != "advance_from_checkpoint" {
+		t.Fatalf("updated.ResumePolicy = %q, want advance_from_checkpoint", updated.ResumePolicy)
 	}
 }
 
@@ -3562,8 +3558,8 @@ func TestRunResolveCommentsStepSkipsThreadWhenObservedThreadSnapshotDriftsDuring
 	if updated.ResumePolicy != loops.ResumePolicyRestartFromDiscover {
 		t.Fatalf("updated.ResumePolicy = %q, want restart_from_discover", updated.ResumePolicy)
 	}
-	if len(updated.FixItems) != 2 || updated.FixItems[1].ID != "c2" {
-		t.Fatalf("updated.FixItems = %#v, want live unresolved comments to include c2 for rediscover", updated.FixItems)
+	if len(updated.FixItems) != 1 || updated.FixItems[0].ID != "c1" {
+		t.Fatalf("updated.FixItems = %#v, want the repair snapshot preserved", updated.FixItems)
 	}
 }
 
