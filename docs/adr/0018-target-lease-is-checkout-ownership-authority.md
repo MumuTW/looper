@@ -80,8 +80,11 @@ in a project, and blocked a worker on an issue a planner held.
 ### A lease carries a generation, not a flag
 
 Every acquisition increments a monotonic generation on the lease row. A holder
-carries the generation it acquired. Every guarded mutation presents its
-generation and is refused when it does not match the current one.
+carries the generation it acquired. Every guarded mutation — including release,
+the status-projection transition, and its queue mutation — presents the acquired
+`(target, holder, generation)` tuple and is refused when it does not match the
+current lease. A zero-row guarded write is a stale no-op: it must not clear a
+newer holder's projection or queue state.
 
 This is the ABA fix, and it is why a boolean is insufficient: takeover →
 handback → takeover produces the same *state* twice, and a stale writer from the
@@ -106,7 +109,10 @@ stale-run repair, startup recovery, and takeover itself.
 ### The lease, its status projection, and its queue mutation commit together
 
 Acquisition, the `human_takeover` projection, and the queue cancellation are one
-SQLite transaction. So are release, the projection clear, and the requeue.
+SQLite transaction. Handback atomically matches and releases the acquired lease,
+clears the projection, and requeues. Terminal disposition, which is permitted
+only after the human lease is gone, atomically records the terminal status and
+cancels active queue work; it never requeues terminal work.
 
 Neither half is safe alone. A lease with no projection is permanently held and
 invisible to handback, which finds no held loop to release — the operator never
@@ -114,6 +120,12 @@ got a session and cannot end one. A projection with no lease reports protection
 on the dashboard, `looper status`, and the API that no code is enforcing. Release
 has the symmetric hazard: freeing the lease before the requeue commits admits a
 sibling into a checkout whose owning loop is not yet queued.
+
+The transaction must derive every later status and queue statement from the
+successful generation-matched lease transition (for example, with a
+`DELETE ... RETURNING` CTE or an equivalent conditional write), not merely read
+the lease before it writes. If the tuple is stale, all three projections remain
+unchanged and the caller reports a stale lifecycle action.
 
 This costs nothing structurally, because the transaction already exists.
 `loops.Service.Hold` and `loops.Service.Terminate` already run their status write
@@ -129,7 +141,7 @@ two authorities, and **PID absence is never either of them**.
 
 | holder | release authority |
 | --- | --- |
-| human | the operator's own durable verb: handback, or explicit close/terminate |
+| human | handback after the operator has ended the interactive shell |
 | agent | ADR-0015 Supervisor-confirmed containment/drain |
 
 For agent-held leases this ADR states no rule of its own; it defers to ADR-0015,
@@ -151,12 +163,12 @@ reintroducing, at the filesystem, exactly the failure ADR-0015 closed at the
 process. Birth tokens in `internal/processidentity` sharpen *recognition* of an
 observed process; they cannot prove a tree drained, and only confirmed drain can.
 
-For human-held leases the authority is the operator's own recorded disposition,
-never a probe — the same authority ADR-0015 gives `settleDisposedQuarantine`,
-"the operator's existing verb — a durable loop disposition already recorded in
-SQLite". A human lease never expires and is never reclaimed by liveness rules.
+For human-held leases the authority is the operator's own handback after ending
+the interactive shell, never a probe. A human lease never expires and is never
+reclaimed by liveness rules; terminal disposition must wait until that handback
+has released it.
 
-### Close and terminate release the lease
+### Close and terminate cannot preempt a live human takeover
 
 `human_takeover → terminated` is a legal transition today, `terminated` has no
 outgoing transitions, and handback is `human_takeover → queued`. So an operator
@@ -164,22 +176,20 @@ who closes a held loop wedges its checkout permanently: the lease has no
 remaining release path, and every sibling and cleanup operation on that
 directory blocks forever.
 
-**Decision: close/terminate releases the lease, in the same transaction.** The
-alternative — refuse close while held, forcing handback first — was rejected.
-Terminate already runs a transaction that recognises the human hold and switches
-to `UpsertChangingHumanHold` for exactly this case, so release is one more
-statement in a transaction that already exists and already knows. Refusing close
-would instead make takeover a state with one exit, and strand the operator whose
-actual intent is to abandon the work rather than return it to the queue — the
-`retry`/`stop`/`close` escape hatch ADR-0015 had to retrofit onto quarantine for
-the same reason.
+**Decision: `close`/`terminate` rejects a currently human-held loop.** The
+previous alternative — releasing in the terminal transaction — is unsafe: the
+daemon has no containment handle for the operator's interactive shell, so it
+cannot prove that the shell will not write after terminal state becomes visible.
+Releasing would let a sibling or cleanup acquire the same checkout concurrently
+with that shell, defeating the authority this ADR creates.
 
-The consequence is accepted deliberately: terminate can release a checkout while
-the operator's interactive shell is still live in it. That is correct, because
-the daemon has no containment handle for that shell — ADR-0015 classifies CLI
-interactive takeover resume as independently lifecycle-owned, with the operator's
-terminal owning the agent. The operator's verb is the only authority available,
-which is precisely why it is the authority.
+The operator must first exit the interactive shell and hand back the loop. That
+generation-guarded transaction releases the lease, clears `human_takeover`, and
+requeues. They may then terminate the queued loop, whose terminal transaction
+has no lease to release and no requeue to create. This deliberately gives a
+human-held loop one safe exit before terminal disposition; it is preferable to
+either a permanently unreleasable lease or an uncontainable concurrent writer.
+There is no unsafe force-release escape in this ADR.
 
 ### Migration must backfill before the old guards come out
 
@@ -245,8 +255,12 @@ The implementation must add contract/invariant integration coverage for:
   retains the lease, and no competing checkout mutation starts;
 - two legacy targets whose different repositories map to the same detached-path
   candidate: they contend for one lease;
-- close/terminate during human takeover: the terminal transition and release
-  commit together, so a later actor is not wedged;
+- close/terminate during human takeover: the request is rejected without
+  changing the held lease, status, or queue; after shell exit, handback releases
+  and requeues before a separate terminal disposition can succeed;
+- a delayed release from generation N after a holder reacquires generation N+1:
+  the generation match affects zero rows and leaves the new lease, projection,
+  and queue state intact;
 - upgrade backfill: every unambiguous held loop receives a lease, while a
   duplicate or unkeyable holder aborts the entire migration and leaves no
   partially migrated authority; and
