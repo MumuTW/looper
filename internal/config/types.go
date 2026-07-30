@@ -394,7 +394,6 @@ const (
 )
 
 type NetworkConfig struct {
-	Enrolled         bool   `json:"enrolled"`
 	LoopernetBaseURL string `json:"loopernetBaseUrl"`
 	NodeName         string `json:"nodeName"`
 	GitHubLogin      string `json:"githubLogin"`
@@ -912,7 +911,6 @@ type PartialPackageConfig struct {
 }
 
 type PartialNetworkConfig struct {
-	Enrolled         *bool   `json:"enrolled,omitempty"`
 	LoopernetBaseURL *string `json:"loopernetBaseUrl,omitempty"`
 	NodeName         *string `json:"nodeName,omitempty"`
 	GitHubLogin      *string `json:"githubLogin,omitempty"`

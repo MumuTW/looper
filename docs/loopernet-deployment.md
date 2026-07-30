@@ -116,10 +116,12 @@ volumes:
 After `loopernet` is up:
 
 1. choose a stable public URL for `loopernet`
-2. join each Node with `looper network join <url> --key ... --name <node>`
+2. join each Node with `looper network join <url> --key <one-time-join-key> --name <node>`
 3. disable unsupported routed Planner/Fixer auto-discovery before opting projects into `network.mode=routed`
 4. onboard repos so GitHub webhooks point to `loopernet`
-5. confirm `looper network status --verbose` shows membership, identity, lease, and webhook health
+5. confirm `looper network status` shows membership and lease health
+
+`looper network leave --confirm` revokes the remote membership first and removes the local enrollment state only after that succeeds. Do not delete the state file manually: a failed remote leave must be repaired before the Node can safely rejoin.
 
 ## Availability expectations
 

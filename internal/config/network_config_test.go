@@ -40,7 +40,7 @@ func TestValidateAcceptsRoutedProjectWithExplicitNetworkAndDisabledPlannerFixer(
 	}
 	cfg.Roles.Planner.AutoDiscovery = false
 	cfg.Roles.Fixer.AutoDiscovery = false
-	cfg.Network = NetworkConfig{Enrolled: true, LoopernetBaseURL: "https://loopernet.example.com", NodeName: "red", GitHubLogin: "worker", GitHubUserID: 42}
+	cfg.Network = NetworkConfig{LoopernetBaseURL: "https://loopernet.example.com", NodeName: "red", GitHubLogin: "worker", GitHubUserID: 42}
 	cfg.Projects = []ProjectRefConfig{{ID: "project_1", Name: "Looper", RepoPath: t.TempDir(), Network: ProjectNetworkConfig{Mode: NetworkModeRouted}}}
 
 	if err := ValidateWithOptions(cfg, ValidateOptions{DefaultWorktreeRoot: t.TempDir()}); err != nil {
@@ -83,7 +83,7 @@ func TestValidateRejectsOverlongNetworkNodeName(t *testing.T) {
 	}
 	cfg.Roles.Planner.AutoDiscovery = false
 	cfg.Roles.Fixer.AutoDiscovery = false
-	cfg.Network = NetworkConfig{Enrolled: true, LoopernetBaseURL: "https://loopernet.example.com", NodeName: strings.Repeat("a", 33), GitHubLogin: "worker", GitHubUserID: 42}
+	cfg.Network = NetworkConfig{LoopernetBaseURL: "https://loopernet.example.com", NodeName: strings.Repeat("a", 33), GitHubLogin: "worker", GitHubUserID: 42}
 	cfg.Projects = []ProjectRefConfig{{ID: "project_1", Name: "Looper", RepoPath: t.TempDir(), Network: ProjectNetworkConfig{Mode: NetworkModeRouted}}}
 	err = ValidateWithOptions(cfg, ValidateOptions{DefaultWorktreeRoot: t.TempDir()})
 	if err == nil || !strings.Contains(err.Error(), "32 characters or fewer") {

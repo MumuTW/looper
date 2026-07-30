@@ -77,7 +77,6 @@ func TestIsHotEditablePathUsesExplicitAllowlist(t *testing.T) {
 		"daemon.worktreeCleanup",
 		"daemon.logDir",
 		"webhook.enabled",
-		"network.enrolled",
 		"hitl.github.mentionLogins",
 		"notifications.webhook.verificationTokenEnv",
 		"roles.reviewer.autoMerge.enabled",

@@ -36,6 +36,8 @@ import (
 	"time"
 
 	"github.com/nexu-io/looper/internal/config"
+	networkclient "github.com/nexu-io/looper/internal/network/client"
+	"github.com/nexu-io/looper/internal/network/protocol"
 	"github.com/nexu-io/looper/internal/version"
 )
 
@@ -95,6 +97,9 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	// non-global dash-argument) and must not collapse to a bodyless POST.
 	if parsed.Verb == "retry" {
 		return runRetry(ctx, args, stdout, stderr)
+	}
+	if parsed.Verb == "network" {
+		return reportError(stderr, runNetwork(ctx, parsed.Global, parsed.Operands, stdout))
 	}
 
 	// The onboarding verbs take no flags of their own — only the global ones —
@@ -276,7 +281,7 @@ func splitGlobalFlags(args []string) (parsedArgs, error) {
 			parsed.Verb = arg
 			continue
 		}
-		if strings.HasPrefix(arg, "-") && arg != "-" && parsed.Verb != "review" && parsed.Verb != "retry" {
+		if strings.HasPrefix(arg, "-") && arg != "-" && parsed.Verb != "review" && parsed.Verb != "retry" && parsed.Verb != "network" {
 			return parsedArgs{}, fmt.Errorf("unknown flag %q", name)
 		}
 		if parsed.Verb == "" {
@@ -558,6 +563,175 @@ func writeNewConfigFile(path string, contents io.Reader) error {
 		return fmt.Errorf("write %s: %w", path, err)
 	}
 	return nil
+}
+
+// --- network --------------------------------------------------------------
+
+func runNetwork(ctx context.Context, global, operands []string, stdout io.Writer) error {
+	if len(operands) == 0 {
+		return badUsage("network requires join, status, or leave")
+	}
+	statePath, err := defaultNetworkStatePath()
+	if err != nil {
+		return err
+	}
+	switch operands[0] {
+	case "join":
+		return runNetworkJoin(ctx, global, statePath, operands[1:], stdout)
+	case "status":
+		if len(operands) != 1 {
+			return badUsage("network status takes no arguments")
+		}
+		return runNetworkStatus(ctx, statePath, stdout)
+	case "leave":
+		if len(operands) != 2 || operands[1] != "--confirm" {
+			return badUsage("network leave requires --confirm")
+		}
+		return runNetworkLeave(ctx, statePath, stdout)
+	default:
+		return badUsage("network requires join, status, or leave")
+	}
+}
+
+func runNetworkJoin(ctx context.Context, global []string, statePath string, args []string, stdout io.Writer) error {
+	baseURL, joinKey, nodeName, err := parseNetworkJoinArgs(args)
+	if err != nil {
+		return err
+	}
+	if _, err := networkclient.LoadState(statePath); err == nil {
+		return fmt.Errorf("network state already exists at %s; run `looper network leave --confirm` before joining another Network", statePath)
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("read existing network state: %w", err)
+	}
+	if err := protocol.ValidateNodeName(nodeName); err != nil {
+		return fmt.Errorf("invalid node name: %w", err)
+	}
+	identity, err := currentGitHubIdentityForNetworkJoin(ctx, global)
+	if err != nil {
+		return err
+	}
+	response, err := networkclient.New(baseURL, "", nil).Join(ctx, protocol.JoinRequest{
+		ProtocolVersion: protocol.CurrentVersion,
+		DaemonVersion:   version.Value,
+		JoinKey:         joinKey,
+		NodeName:        nodeName,
+		GitHub:          identity,
+	})
+	if err != nil {
+		return fmt.Errorf("join Network: %w", err)
+	}
+	state := networkclient.LocalState{URL: baseURL, NetworkID: response.NetworkID, NodeID: response.NodeID, NodeName: nodeName, NodeToken: response.NodeToken, GitHub: identity}
+	if err := networkclient.SaveState(statePath, state); err != nil {
+		return fmt.Errorf("persist network enrollment: %w", err)
+	}
+	_, _ = fmt.Fprintf(stdout, "joined network %s as %s (%s); state saved to %s\n", state.NetworkID, state.NodeName, state.NodeID, statePath)
+	for _, warning := range response.Warnings {
+		_, _ = fmt.Fprintf(stdout, "warning: %s\n", warning)
+	}
+	return nil
+}
+
+func parseNetworkJoinArgs(args []string) (baseURL, joinKey, nodeName string, err error) {
+	if len(args) < 1 {
+		return "", "", "", badUsage("network join requires <loopernet-url> --key <join-key> --name <node-name>")
+	}
+	baseURL = strings.TrimRight(strings.TrimSpace(args[0]), "/")
+	parsed, parseErr := url.Parse(baseURL)
+	if parseErr != nil || parsed.Scheme == "" || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return "", "", "", badUsage("network join requires an absolute http(s) loopernet URL")
+	}
+	for index := 1; index < len(args); index++ {
+		if index+1 >= len(args) {
+			return "", "", "", badUsage("network join requires values for --key and --name")
+		}
+		switch args[index] {
+		case "--key":
+			joinKey = strings.TrimSpace(args[index+1])
+		case "--name":
+			nodeName = strings.TrimSpace(args[index+1])
+		default:
+			return "", "", "", badUsage("network join accepts only --key and --name")
+		}
+		index++
+	}
+	if joinKey == "" || nodeName == "" {
+		return "", "", "", badUsage("network join requires <loopernet-url> --key <join-key> --name <node-name>")
+	}
+	return baseURL, joinKey, nodeName, nil
+}
+
+func currentGitHubIdentityForNetworkJoin(ctx context.Context, global []string) (protocol.GitHubIdentity, error) {
+	cfg, err := loadConfig(global)
+	if err != nil {
+		return protocol.GitHubIdentity{}, err
+	}
+	ghPath := ""
+	if cfg.Tools.GHPath != nil {
+		ghPath = strings.TrimSpace(*cfg.Tools.GHPath)
+	}
+	if ghPath == "" {
+		ghPath = "gh"
+	}
+	output, err := exec.CommandContext(ctx, ghPath, "api", "user", "--jq", `{login: .login, id: .id}`).Output()
+	if err != nil {
+		return protocol.GitHubIdentity{}, fmt.Errorf("read authenticated GitHub identity for network join: %w", err)
+	}
+	var identity struct {
+		Login string `json:"login"`
+		ID    int64  `json:"id"`
+	}
+	if err := json.Unmarshal(output, &identity); err != nil {
+		return protocol.GitHubIdentity{}, fmt.Errorf("decode authenticated GitHub identity for network join: %w", err)
+	}
+	if strings.TrimSpace(identity.Login) == "" || identity.ID <= 0 {
+		return protocol.GitHubIdentity{}, fmt.Errorf("authenticated GitHub identity must include a login and positive numeric id")
+	}
+	return protocol.GitHubIdentity{Login: strings.TrimSpace(identity.Login), NumericID: identity.ID}, nil
+}
+
+func runNetworkStatus(ctx context.Context, statePath string, stdout io.Writer) error {
+	state, err := networkclient.LoadState(statePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("network is not enrolled; run `looper network join <loopernet-url> --key <join-key> --name <node-name>`")
+		}
+		return fmt.Errorf("read network state: %w", err)
+	}
+	status, err := networkclient.New(state.URL, state.NodeToken, nil).Status(ctx)
+	if err != nil {
+		return fmt.Errorf("read network status: %w", err)
+	}
+	_, _ = fmt.Fprintf(stdout, "network=%s node=%s (%s) membership=%s leaseHolder=%s\n", state.NetworkID, state.NodeName, state.NodeID, status.Membership.NodeName, status.Lease.HolderNodeID)
+	for _, warning := range status.Warnings {
+		_, _ = fmt.Fprintf(stdout, "warning: %s\n", warning)
+	}
+	return nil
+}
+
+func runNetworkLeave(ctx context.Context, statePath string, stdout io.Writer) error {
+	state, err := networkclient.LoadState(statePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("network is not enrolled")
+		}
+		return fmt.Errorf("read network state: %w", err)
+	}
+	if err := networkclient.New(state.URL, state.NodeToken, nil).Leave(ctx); err != nil {
+		return fmt.Errorf("leave Network: %w", err)
+	}
+	if err := networkclient.RemoveState(statePath); err != nil {
+		return fmt.Errorf("remove network enrollment state: %w", err)
+	}
+	_, _ = fmt.Fprintf(stdout, "left network %s as %s\n", state.NetworkID, state.NodeName)
+	return nil
+}
+
+func defaultNetworkStatePath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("determine home directory for network state: %w", err)
+	}
+	return networkclient.DefaultStatePath(home), nil
 }
 
 // --- status ----------------------------------------------------------------
@@ -1330,6 +1504,11 @@ func usage(w io.Writer) {
 
 Usage:
   looper init                  Write a starter config file (never overwrites)
+  looper network join <url> --key <one-time-key> --name <node>
+                               Join a Network and persist the issued node authority
+  looper network status        Read durable Network membership and lease status
+  looper network leave --confirm
+                               Revoke membership, then remove durable local state
   looper status                Report config, daemon reachability, and projects
   looper dashboard             Print a dashboard URL authenticated for this session
   looper project add <path>    Register a git repository root with the daemon
@@ -1367,7 +1546,7 @@ There is one more command, which is not for operators:
 A selector is a loop sequence number (looper stop 12) or a loop id
 (looper stop loop_1cf3); those are what the daemon resolves.
 The respond answer is a single argument, so quote anything with spaces.
-Every verb except init and version talks to looperd over HTTP and needs it
+Every verb except init, network, and version talks to looperd over HTTP and needs it
 running.
 `)
 }

@@ -77,9 +77,15 @@ func (m *Manager) Start(parent context.Context) error {
 		return nil
 	}
 	m.started = true
+	cfg := m.configSnapshot()
+	routed, local := countProjectModes(cfg)
 	state, err := LoadState(m.statePath)
 	if err != nil {
 		if os.IsNotExist(err) {
+			if routed > 0 {
+				m.started = false
+				return fmt.Errorf("routed projects require durable network enrollment at %s; run `looper network join` or set their network.mode to off", m.statePath)
+			}
 			m.mu.Lock()
 			m.status = Status{}
 			m.mu.Unlock()
@@ -89,13 +95,20 @@ func (m *Manager) Start(parent context.Context) error {
 		m.started = false
 		return err
 	}
+	if routed > 0 {
+		if err := ValidateState(state); err != nil {
+			m.started = false
+			return fmt.Errorf("invalid durable network enrollment at %s: %w", m.statePath, err)
+		}
+		if err := stateMatchesConfiguredNetwork(state, cfg.Network); err != nil {
+			m.started = false
+			return err
+		}
+	}
 	m.mu.Lock()
 	m.status = Status{Configured: true, NetworkID: state.NetworkID, NodeID: state.NodeID, NodeName: state.NodeName, GitHub: state.GitHub}
 	m.mu.Unlock()
-	cfg := m.configSnapshot()
-	routed, _ := countProjectModes(cfg)
 	if routed == 0 {
-		_, local := countProjectModes(cfg)
 		m.mu.Lock()
 		m.status.RoutedProjects = routed
 		m.status.LocalProjects = local
@@ -119,6 +132,22 @@ func (m *Manager) Start(parent context.Context) error {
 			}
 		}
 	}()
+	return nil
+}
+
+func stateMatchesConfiguredNetwork(state LocalState, configured config.NetworkConfig) error {
+	if configured.LoopernetBaseURL != "" && strings.TrimRight(strings.TrimSpace(configured.LoopernetBaseURL), "/") != strings.TrimRight(strings.TrimSpace(state.URL), "/") {
+		return fmt.Errorf("durable network enrollment URL does not match network.loopernetBaseUrl")
+	}
+	if configured.NodeName != "" && strings.TrimSpace(configured.NodeName) != strings.TrimSpace(state.NodeName) {
+		return fmt.Errorf("durable network enrollment node name does not match network.nodeName")
+	}
+	if configured.GitHubLogin != "" && !strings.EqualFold(strings.TrimSpace(configured.GitHubLogin), strings.TrimSpace(state.GitHub.Login)) {
+		return fmt.Errorf("durable network enrollment GitHub login does not match network.githubLogin")
+	}
+	if configured.GitHubUserID > 0 && configured.GitHubUserID != state.GitHub.NumericID {
+		return fmt.Errorf("durable network enrollment GitHub user id does not match network.githubUserId")
+	}
 	return nil
 }
 

@@ -46,7 +46,6 @@
         "publicBaseUrl": ""
       },
       "network": {
-        "enrolled": false,
         "githubLogin": "",
         "loopernetBaseUrl": "",
         "nodeName": ""

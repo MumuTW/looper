@@ -30,7 +30,7 @@ Operational notes:
 - `loopernet` centralizes webhook ingress and Node wakeups, but it must not mutate GitHub on its own.
 - Coordinator writes coarse GitHub authority first, then writes the exact target label last.
 - polling remains enabled as fallback and drift recovery when webhook delivery or SSE wakeups are missed.
-- when enabling Routed mode / network membership in config, Looper rejects enrollment when Planner or Fixer auto-discovery is still enabled for those projects; disable those settings first or opt projects into Routed mode manually.
+- join a Node with `looper network join` before enabling Routed projects. Runtime validates the durable enrollment issued by loopernet; config cannot prove membership. Looper still rejects Routed projects when Planner or Fixer auto-discovery is enabled; disable those settings first or opt projects into Routed mode manually.
 
 The formal contract is documented in ADRs [0007](adr/0007-coordinator-admission-assignment-authority.md) through [0011](adr/0011-coordinator-control-plane-for-routed-projects-v1.md).
 

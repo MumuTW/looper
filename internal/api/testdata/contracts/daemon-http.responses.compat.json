@@ -267,7 +267,6 @@
             "fallbackPollIntervalSeconds": 300
           },
           "network": {
-            "enrolled": false,
             "loopernetBaseUrl": "",
             "nodeName": "",
             "githubLogin": ""

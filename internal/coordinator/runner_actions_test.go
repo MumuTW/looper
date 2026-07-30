@@ -1873,7 +1873,7 @@ func TestRunnerAssignsReviewerAndTargetInRoutedMode(t *testing.T) {
 	t.Parallel()
 	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
 		cfg.Roles.Coordinator.Enabled = true
-		cfg.Network = config.NetworkConfig{Enrolled: true, NodeName: "coord", GitHubLogin: "coord"}
+		cfg.Network = config.NetworkConfig{NodeName: "coord", GitHubLogin: "coord"}
 		cfg.Projects = []config.ProjectRefConfig{{ID: coordinatorFixtureProjectID, Name: "Demo", RepoPath: "/tmp/demo", Network: config.ProjectNetworkConfig{Mode: config.NetworkModeRouted}}}
 		cfg.Roles.Reviewer.Discovery.Triggers.Labels = []string{"looper:review"}
 	})
@@ -1901,7 +1901,7 @@ func TestRunnerAssignsReviewerAndTargetInRoutedModeWhenLocalAutoDiscoveryDisable
 	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
 		cfg.Roles.Coordinator.Enabled = true
 		cfg.Roles.Reviewer.Discovery.AutoDiscovery = false
-		cfg.Network = config.NetworkConfig{Enrolled: true, NodeName: "coord", GitHubLogin: "coord"}
+		cfg.Network = config.NetworkConfig{NodeName: "coord", GitHubLogin: "coord"}
 		cfg.Projects = []config.ProjectRefConfig{{ID: coordinatorFixtureProjectID, Name: "Demo", RepoPath: "/tmp/demo", Network: config.ProjectNetworkConfig{Mode: config.NetworkModeRouted}}}
 	})
 	fixture.network.status = protocol.NodeStatusResponse{
@@ -1924,7 +1924,7 @@ func TestRunnerAssignsDeterministicTargetForDuplicateReviewerIdentity(t *testing
 	t.Parallel()
 	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
 		cfg.Roles.Coordinator.Enabled = true
-		cfg.Network = config.NetworkConfig{Enrolled: true, NodeName: "coord", GitHubLogin: "coord"}
+		cfg.Network = config.NetworkConfig{NodeName: "coord", GitHubLogin: "coord"}
 		cfg.Projects = []config.ProjectRefConfig{{ID: coordinatorFixtureProjectID, Name: "Demo", RepoPath: "/tmp/demo", Network: config.ProjectNetworkConfig{Mode: config.NetworkModeRouted}}}
 		cfg.Roles.Reviewer.Discovery.Triggers.Labels = []string{"looper:review"}
 	})
@@ -1953,7 +1953,7 @@ func TestRunnerExcludesSelfReviewCandidatesDuringRoutedAssignment(t *testing.T) 
 	t.Parallel()
 	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
 		cfg.Roles.Coordinator.Enabled = true
-		cfg.Network = config.NetworkConfig{Enrolled: true, NodeName: "coord", GitHubLogin: "coord"}
+		cfg.Network = config.NetworkConfig{NodeName: "coord", GitHubLogin: "coord"}
 		cfg.Projects = []config.ProjectRefConfig{{ID: coordinatorFixtureProjectID, Name: "Demo", RepoPath: "/tmp/demo", Network: config.ProjectNetworkConfig{Mode: config.NetworkModeRouted}}}
 		cfg.Roles.Reviewer.Discovery.Triggers.Labels = []string{"looper:review"}
 	})
@@ -1982,7 +1982,7 @@ func TestRunnerStopsBeforeTargetLabelWhenLeaseRevalidationFails(t *testing.T) {
 	t.Parallel()
 	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
 		cfg.Roles.Coordinator.Enabled = true
-		cfg.Network = config.NetworkConfig{Enrolled: true, NodeName: "coord", GitHubLogin: "coord"}
+		cfg.Network = config.NetworkConfig{NodeName: "coord", GitHubLogin: "coord"}
 		cfg.Projects = []config.ProjectRefConfig{{ID: coordinatorFixtureProjectID, Name: "Demo", RepoPath: "/tmp/demo", Network: config.ProjectNetworkConfig{Mode: config.NetworkModeRouted}}}
 		cfg.Roles.Reviewer.Discovery.Triggers.Labels = []string{"looper:review"}
 	})
@@ -2019,7 +2019,7 @@ func TestRunnerSkipsRoutedAssignmentWithoutReviewRequestWhenRequired(t *testing.
 	t.Parallel()
 	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
 		cfg.Roles.Coordinator.Enabled = true
-		cfg.Network = config.NetworkConfig{Enrolled: true, NodeName: "coord", GitHubLogin: "coord"}
+		cfg.Network = config.NetworkConfig{NodeName: "coord", GitHubLogin: "coord"}
 		cfg.Projects = []config.ProjectRefConfig{{ID: coordinatorFixtureProjectID, Name: "Demo", RepoPath: "/tmp/demo", Network: config.ProjectNetworkConfig{Mode: config.NetworkModeRouted}}}
 	})
 	fixture.network.status = protocol.NodeStatusResponse{
@@ -2050,7 +2050,7 @@ func TestRunnerSkipsRoutedAssignmentWithoutReviewRequestForLegacyCapabilityPaylo
 	t.Parallel()
 	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
 		cfg.Roles.Coordinator.Enabled = true
-		cfg.Network = config.NetworkConfig{Enrolled: true, NodeName: "coord", GitHubLogin: "coord"}
+		cfg.Network = config.NetworkConfig{NodeName: "coord", GitHubLogin: "coord"}
 		cfg.Projects = []config.ProjectRefConfig{{ID: coordinatorFixtureProjectID, Name: "Demo", RepoPath: "/tmp/demo", Network: config.ProjectNetworkConfig{Mode: config.NetworkModeRouted}}}
 	})
 	fixture.network.status = protocol.NodeStatusResponse{
@@ -2075,7 +2075,7 @@ func TestRunnerSkipsRoutedAssignmentWhenNoEligibleReviewerNodeExists(t *testing.
 	t.Parallel()
 	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
 		cfg.Roles.Coordinator.Enabled = true
-		cfg.Network = config.NetworkConfig{Enrolled: true, NodeName: "coord", GitHubLogin: "coord"}
+		cfg.Network = config.NetworkConfig{NodeName: "coord", GitHubLogin: "coord"}
 		cfg.Projects = []config.ProjectRefConfig{{ID: coordinatorFixtureProjectID, Name: "Demo", RepoPath: "/tmp/demo", Network: config.ProjectNetworkConfig{Mode: config.NetworkModeRouted}}}
 		cfg.Roles.Reviewer.Discovery.Triggers.Labels = []string{"looper:review"}
 	})

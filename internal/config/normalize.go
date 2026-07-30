@@ -597,9 +597,6 @@ func mergeWebhookConfig(config *WebhookConfig, partial PartialWebhookConfig) {
 }
 
 func mergeNetworkConfig(config *NetworkConfig, partial PartialNetworkConfig) {
-	if partial.Enrolled != nil {
-		config.Enrolled = *partial.Enrolled
-	}
 	if partial.LoopernetBaseURL != nil {
 		config.LoopernetBaseURL = *partial.LoopernetBaseURL
 	}

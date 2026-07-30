@@ -56,7 +56,7 @@ Routed mode keeps authorities separate:
 - `looper:target:<node_name>` is only the exact-Node authority.
 - the lease only decides which Coordinator may mutate GitHub.
 
-That means `loopernet` never becomes the source of truth for Issue admission or PR review assignment, and it must not mutate GitHub directly.
+That means `loopernet` never becomes the source of truth for Issue admission or PR review assignment, and it must not mutate GitHub directly. The local policy fields (`network.loopernetBaseUrl`, `network.nodeName`, `network.githubLogin`, and `network.githubUserId`) must agree with the durable enrollment; the issued node ID and token are never read from config.
 
 ## 1b. Routed setup and recovery
 
@@ -64,10 +64,11 @@ Before enrolling Nodes, deploy exactly one active `loopernet` instance per Netwo
 
 Typical Routed rollout:
 
-1. join each Node to `loopernet` by configuring network membership in the config file / dashboard (the `looper network join` CLI was removed)
+1. join each Node with `looper network join <loopernet-url> --key <one-time-join-key> --name <node-name>`; this is the only producer of the durable node ID/token state
 2. disable unsupported routed auto-discovery (`planner` and `fixer`) before opting projects into `network.mode=routed`
-3. keep Worker and Reviewer identities stable per Node; duplicate GitHub identities are safe only because the exact target label disambiguates which Node may claim
-4. restart `looperd` and confirm membership, identity, and lease state on the dashboard or `GET /api/v1/network/status`
+3. configure the local policy fields to match the joined Node, then set projects to `network.mode=routed`
+4. keep Worker and Reviewer identities stable per Node; duplicate GitHub identities are safe only because the exact target label disambiguates which Node may claim
+5. restart `looperd` and confirm membership, identity, and lease state with `looper network status`
 
 Operator recovery rules:
 

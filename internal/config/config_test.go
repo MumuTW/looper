@@ -234,7 +234,6 @@ func TestLoadFileDecodesTopLevelNetworkSectionForRoutedProjects(t *testing.T) {
 	configPath := filepath.Join(cwd, "config.json")
 	contents := `{
 		"network": {
-			"enrolled": true,
 			"loopernetBaseUrl": "https://loopernet.example.test",
 			"nodeName": "worker-1",
 			"githubLogin": "mrcfps",
@@ -260,9 +259,6 @@ func TestLoadFileDecodesTopLevelNetworkSectionForRoutedProjects(t *testing.T) {
 	loaded, err := LoadFile(LoadFileOptions{CWD: cwd, ConfigPath: configPath, LookupEnv: emptyEnvLookup, LookPath: fakeLookPath(map[string]string{"git": "/git", "gh": "/gh", "osascript": "/osascript"})})
 	if err != nil {
 		t.Fatalf("LoadFile() error = %v", err)
-	}
-	if !loaded.Config.Network.Enrolled {
-		t.Fatal("LoadFile().Config.Network.Enrolled = false, want true")
 	}
 	if got := loaded.Config.Network.LoopernetBaseURL; got != "https://loopernet.example.test" {
 		t.Fatalf("LoadFile().Config.Network.LoopernetBaseURL = %q, want %q", got, "https://loopernet.example.test")

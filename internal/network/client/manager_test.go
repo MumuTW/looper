@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -24,6 +25,15 @@ func TestManagerStartWithoutNetworkStateLeavesStatusUnconfigured(t *testing.T) {
 	defer manager.Stop()
 	if manager.Status().Configured {
 		t.Fatal("Status().Configured = true, want false")
+	}
+}
+
+func TestManagerStartRejectsRoutedProjectsWithoutDurableEnrollment(t *testing.T) {
+	t.Parallel()
+	statePath := filepath.Join(t.TempDir(), "missing-network.json")
+	manager := NewManager(statePath, config.Config{Projects: []config.ProjectRefConfig{{ID: "routed", Network: config.ProjectNetworkConfig{Mode: config.NetworkModeRouted}}}}, nil, nil)
+	if err := manager.Start(context.Background()); err == nil || !strings.Contains(err.Error(), "require durable network enrollment") {
+		t.Fatalf("Start() error = %v", err)
 	}
 }
 
