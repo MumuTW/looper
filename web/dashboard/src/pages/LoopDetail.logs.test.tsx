@@ -52,6 +52,12 @@ function snapshot(stdout: string): string {
   })}\n\n`;
 }
 
+function chunk(content: string): string {
+  return `event: chunk\ndata: ${JSON.stringify({ stream: "stdout", content })}\n\n`;
+}
+
+const end = "event: end\ndata: {}\n\n";
+
 beforeEach(() => {
   vi.useFakeTimers();
   apiMocks.openLoopLogsStream.mockReset();
@@ -72,6 +78,37 @@ afterEach(() => {
 });
 
 describe("LogsPane stream recovery", () => {
+
+  it("keeps stdout chunks connecting until the stderr baseline snapshot arrives", async () => {
+    let resolveStderr: ((response: Response) => void) | undefined;
+    apiMocks.openLoopLogsStream.mockImplementation(
+      async (_selector: string, _signal: AbortSignal, opts?: { stderr?: boolean }) => {
+        if (opts?.stderr) {
+          return new Promise<Response>((resolve) => {
+            resolveStderr = resolve;
+          });
+        }
+        return hangingSSE(snapshot("primary snapshot\n") + chunk("stdout before stderr\n"));
+      },
+    );
+
+    render(<LogsPane selector="loop_1" />);
+
+    await vi.waitFor(() => {
+      expect(screen.getByText(/stdout before stderr/)).toBeTruthy();
+    });
+    expect(screen.getByText("connecting")).toBeTruthy();
+    expect(screen.queryByText("live")).toBeNull();
+
+    await act(async () => {
+      resolveStderr?.(hangingSSE(snapshot("")));
+    });
+
+    await vi.waitFor(() => {
+      expect(screen.getByText("live")).toBeTruthy();
+    });
+  });
+
   it("shows degraded after a typed mid-stream error and returns live after reconnect", async () => {
     let primaryAttempts = 0;
     apiMocks.openLoopLogsStream.mockImplementation(
@@ -163,6 +200,57 @@ describe("LogsPane stream recovery", () => {
     });
     expect(screen.queryByText("stderr read failed")).toBeNull();
     expect(screen.getByText(/recovered/)).toBeTruthy();
+    expect(primaryAttempts).toBe(2);
+    expect(stderrAttempts).toBe(2);
+  });
+
+  it("reconnects when stderr fails after stdout ends normally", async () => {
+    let primaryAttempts = 0;
+    let stderrAttempts = 0;
+    apiMocks.openLoopLogsStream.mockImplementation(
+      async (
+        _selector: string,
+        _signal: AbortSignal,
+        opts?: { stderr?: boolean },
+      ) => {
+        if (opts?.stderr) {
+          stderrAttempts += 1;
+          if (stderrAttempts === 1) {
+            return finiteSSE(
+              snapshot("") +
+                `event: error\ndata: ${JSON.stringify({
+                  code: "INTERNAL_ERROR",
+                  message: "stderr failed after stdout end",
+                  retryable: true,
+                  retryAfterMs: 1000,
+                })}\n\n`,
+            );
+          }
+          return hangingSSE(snapshot(""));
+        }
+
+        primaryAttempts += 1;
+        if (primaryAttempts === 1) {
+          return finiteSSE(snapshot("final stdout\n") + end);
+        }
+        return hangingSSE(snapshot("recovered stdout\n"));
+      },
+    );
+
+    render(<LogsPane selector="loop_1" />);
+
+    await vi.waitFor(() => {
+      expect(screen.getByText("degraded")).toBeTruthy();
+    });
+    expect(screen.getByText("stderr failed after stdout end")).toBeTruthy();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1000);
+    });
+
+    await vi.waitFor(() => {
+      expect(screen.getByText("live")).toBeTruthy();
+    });
     expect(primaryAttempts).toBe(2);
     expect(stderrAttempts).toBe(2);
   });

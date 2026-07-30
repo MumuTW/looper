@@ -150,6 +150,32 @@ export function LogsPane({ selector }: { selector: string }) {
       const controller = new AbortController();
       abortRef.current = controller;
       let reconnectSettled = false;
+      let requiresStderrFollow = false;
+      let stdoutSnapshotReady = false;
+      let stderrSnapshotReady = false;
+      let stdoutEnded = false;
+      let stderrEnded = false;
+
+      // A generation is live only when every follow it requires has delivered
+      // its baseline snapshot. Chunks can update retained text but cannot prove
+      // that a lagging stderr follow has caught up.
+      const markLiveWhenReady = () => {
+        if (
+          stdoutSnapshotReady &&
+          (!requiresStderrFollow || stderrSnapshotReady)
+        ) {
+          setPhase("live");
+        }
+      };
+
+      // stdout's end is only terminal when its paired stderr follow has also
+      // ended. A stderr failure after stdout's normal end is still retryable.
+      const markEndedWhenComplete = () => {
+        if (!stdoutEnded || (requiresStderrFollow && !stderrEnded)) return;
+        explicitEndRef.current = true;
+        setEnded(true);
+        setPhase("idle");
+      };
 
       const recordStreamError = (streamError: LogsStreamErrorEvent) => {
         streamErrorRef.current = streamError;
@@ -222,7 +248,7 @@ export function LogsPane({ selector }: { selector: string }) {
       const startStderrFollow = (snap: LoopLogsSnapshot) => {
         // Always open stderr=1. Default follow may track stderr while stdout is
         // blank then switch to stdout, dropping later stderr without this stream.
-        if (!needsSeparateStderrFollow(snap.agent)) return;
+        if (!requiresStderrFollow) return;
 
         const primaryStderr = snap.agent?.stderr ?? "";
         let sectionHeaderPresent = Boolean(primaryStderr.trim());
@@ -257,7 +283,8 @@ export function LogsPane({ selector }: { selector: string }) {
                     } else if (secondary.agent?.stderr?.trim()) {
                       sectionHeaderPresent = true;
                     }
-                    setPhase("live");
+                    stderrSnapshotReady = true;
+                    markLiveWhenReady();
                   } catch {
                     // Keep primary stream alive; soft-fail malformed stderr only.
                   }
@@ -265,6 +292,8 @@ export function LogsPane({ selector }: { selector: string }) {
                 }
                 if (event === "end") {
                   secondaryEnded = true;
+                  stderrEnded = true;
+                  markEndedWhenComplete();
                   return;
                 }
                 if (event === "error") {
@@ -284,7 +313,6 @@ export function LogsPane({ selector }: { selector: string }) {
                       ),
                     );
                     sectionHeaderPresent = true;
-                    setPhase("live");
                   }
                 } catch {
                   // Keep primary stream alive; soft-fail malformed stderr only.
@@ -330,10 +358,10 @@ export function LogsPane({ selector }: { selector: string }) {
                 try {
                   const snap = JSON.parse(rawData) as LoopLogsSnapshot;
                   replaceText(seedFromSnapshot(snap));
-                  if (!needsSeparateStderrFollow(snap.agent)) {
-                    setPhase("live");
-                  }
+                  requiresStderrFollow = needsSeparateStderrFollow(snap.agent);
+                  stdoutSnapshotReady = true;
                   startStderrFollow(snap);
+                  markLiveWhenReady();
                 } catch {
                   setError("Malformed snapshot event (invalid JSON)");
                   setPhase("idle");
@@ -346,7 +374,7 @@ export function LogsPane({ selector }: { selector: string }) {
                   if (typeof chunk.content === "string" && chunk.content) {
                     appendText(chunk.content);
                   }
-                  setPhase("live");
+                  markLiveWhenReady();
                 } catch {
                   setError("Malformed chunk event (invalid JSON)");
                   setPhase("idle");
@@ -354,9 +382,8 @@ export function LogsPane({ selector }: { selector: string }) {
                 return;
               }
               if (event === "end") {
-                explicitEndRef.current = true;
-                setEnded(true);
-                setPhase("idle");
+                stdoutEnded = true;
+                markEndedWhenComplete();
                 return;
               }
               if (event === "error") {
@@ -371,6 +398,7 @@ export function LogsPane({ selector }: { selector: string }) {
           ) {
             return;
           }
+          if (stdoutEnded) return;
           setPhase("idle");
           // Unexpected stream end (no explicit end event) → reconnect while visible.
           if (!explicitEndRef.current) {
