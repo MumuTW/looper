@@ -4,9 +4,9 @@ This guide is for everyday users. It focuses on how `coordinator`, `planner`, `r
 
 > **CLI strip (read first).** The full `looper` CLI was removed ahead of the role-model rewrite. The **only** operator verbs are:
 >
-> `init` · `status` · `project add|list` · `start` · `pause` · `retry` · `stop` · `close` · `takeover` · `handback` · `respond` · `version`
+> `init` · `status` · `project add|list|discover` · `start` · `pause` · `retry` · `stop` · `close` · `takeover` · `handback` · `respond` · `version`
 >
-> (plus machine-only `review submit`). There is no `bootstrap`, `daemon *`, `ps`, `logs`, `jump`, `plan`, `review`, `fix`, `work`, or `webhook`/`provider`/`network` admin. Beyond `init`, `status`, and `project add|list`, every verb the CLI kept acts on a loop that **already exists**; nothing in the CLI creates one. Loops start from forge state — labels, assignment, review requests — picked up by daemon discovery, or from the create endpoints (`POST /api/v1/planners`, `POST /api/v1/workers`, or `POST /api/v1/loops` for any role). Inspection is the dashboard and the HTTP API. Where a removed verb still appears below, it is marked as removed and paired with what to do instead. Current install surface: [installation.md](installation.md) and the repository README.
+> (plus machine-only `review submit`). There is no `bootstrap`, `daemon *`, `ps`, `logs`, `jump`, `plan`, `review`, `fix`, `work`, or `webhook`/`provider`/`network` admin. Beyond `init`, `status`, and `project add|list|discover`, every verb the CLI kept acts on a loop that **already exists**; nothing in the CLI creates one. Loops start from forge state — labels, assignment, review requests — picked up by daemon discovery, or from the create endpoints (`POST /api/v1/planners`, `POST /api/v1/workers`, or `POST /api/v1/loops` for any role). Inspection is the dashboard and the HTTP API. Where a removed verb still appears below, it is marked as removed and paired with what to do instead. Current install surface: [installation.md](installation.md) and the repository README.
 
 ## 1. Prerequisites
 
@@ -14,7 +14,7 @@ Make sure these work first:
 
 ```bash
 command -v looperd
-looper status   # config file, daemon reachability, registered projects
+looper status   # config, daemon liveness, review/orphan ops lines, projects
 gh auth status  # GitHub projects only
 ```
 

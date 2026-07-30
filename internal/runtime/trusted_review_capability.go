@@ -110,6 +110,25 @@ func trustedReviewCapability(configuredPath string) (capable bool, reason string
 	return capable, reason, !hadPrevious || previous.capable != capable
 }
 
+// trustedReviewCapabilityCached returns only a verdict that a scheduler-path
+// probe has already recorded. In particular, it does not resolve, stat, or
+// execute configuredPath: status requests must remain read-only and must not
+// make a configured binary part of the request's latency or failure surface.
+func trustedReviewCapabilityCached(configuredPath string) (capable bool, reason string, known bool) {
+	configuredPath = strings.TrimSpace(configuredPath)
+	if configuredPath == "" {
+		return false, "trusted looper path is not configured", true
+	}
+
+	trustedReviewCapabilityCache.mu.Lock()
+	defer trustedReviewCapabilityCache.mu.Unlock()
+	entry, ok := trustedReviewCapabilityCache.entries[configuredPath]
+	if !ok {
+		return false, "", false
+	}
+	return entry.capable, entry.reason, true
+}
+
 func trustedReviewCapabilityIdentityFor(configuredPath string) trustedReviewCapabilityIdentity {
 	// LookPath first so a bare command name resolves the same way the trusted
 	// review proxy resolves it at mint time.

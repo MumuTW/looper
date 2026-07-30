@@ -9,7 +9,7 @@ Use this skill when an agent needs to install, configure, start, check, operate,
 
 > **The CLI is tiny, and installation is manual.** The whole operator surface is:
 >
-> `looper init|status|project add|project list|start|pause|retry|stop|close|takeover|handback|respond|version`
+> `looper init|status|project add|project list|project discover|start|pause|retry|stop|close|takeover|handback|respond|version`
 >
 > plus machine-only `looper review submit` (never suggest it to a user). Global flags (`--config`, `--host`, `--port`) work before or after the verb. A **selector** is a loop sequence number or a loop id — never a pull request URL.
 >
@@ -101,7 +101,9 @@ looperd
 Foreground only; nothing supervises it. Keep it running. Health check:
 
 ```bash
-curl -sS "http://127.0.0.1:17310/api/v1/healthz"
+curl -sS "http://127.0.0.1:17310/api/v1/healthz"  # liveness
+curl -sS "http://127.0.0.1:17310/api/v1/status"   # ops readiness (review publish, quarantine debt)
+looper status
 ```
 
 ### Step 5 — Register a project
@@ -121,7 +123,7 @@ The path must be a git repository **root** — `looper project add` asks the cli
 
 The dashboard at `http://127.0.0.1:17310/dashboard/` and `POST /api/v1/projects` register the same way, and are where the fields the CLI does not expose (explicit id, name, base branch, worktree root, provider) live — use them when you need an explicit id to sidestep a derived-id collision.
 
-`project add` can take minutes on a repository with many open pull requests: the daemon records the project first, then discovers its worktrees and PRs. If it does time out, run `looper project list` before retrying — the registration has probably landed.
+`project add` returns as soon as the project is validated, committed, and published — even on a repository with many open pull requests. Worktree/PR discovery runs as post-commit work in the daemon and is reported as pending; its status lives on the project record, and a failed discovery is retried with `looper project discover <id>` (or `POST /api/v1/projects/{id}/discover`), never by re-registering.
 
 ### Step 6 — Verify
 

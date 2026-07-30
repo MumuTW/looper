@@ -961,10 +961,15 @@ type statusService struct {
 	DaemonMode config.DaemonMode     `json:"daemonMode"`
 	// AdmissionState is the single live admission Authority (ADR-0015 R1).
 	// HTTP mutations and scheduler claims open only when this is "ready".
-	AdmissionState string       `json:"admissionState"`
-	StartedAt      *string      `json:"startedAt,omitempty"`
-	Recovery       any          `json:"recovery"`
-	Binary         statusBinary `json:"binary"`
+	AdmissionState string  `json:"admissionState"`
+	StartedAt      *string `json:"startedAt,omitempty"`
+	// Recovery mixes the one-shot startup snapshot with live outstanding
+	// quarantine/orphan debt under recovery.outstanding.
+	Recovery any `json:"recovery"`
+	// DegradedReasons lists sticky ops signals (review publish disabled,
+	// quarantine orphan debt). Empty when none apply.
+	DegradedReasons []string     `json:"degradedReasons,omitempty"`
+	Binary          statusBinary `json:"binary"`
 }
 
 type statusBinary struct {
@@ -1092,6 +1097,10 @@ type statusTools struct {
 	Git       bool `json:"git"`
 	GH        bool `json:"gh"`
 	Osascript bool `json:"osascript"`
+	// LooperPath is the configured tools.looperPath used for review publish.
+	LooperPath string `json:"looperPath,omitempty"`
+	// ReviewPublish surfaces capability-probe readiness for reviewer publishing.
+	ReviewPublish looperdruntime.ReviewPublishReadiness `json:"reviewPublish"`
 }
 
 func (h *Handler) handleConfigRoute(w http.ResponseWriter, r *http.Request, requestID string) {
@@ -1367,15 +1376,24 @@ func (h *Handler) buildStatusResponse(ctx context.Context) (statusResponse, erro
 	installDir := filepath.Join(homeDirOrEmpty(), ".looper", "bin")
 	artifactName := looperdArtifactName(currentTarget)
 
+	reviewPublish := looperdruntime.ReviewPublishReadinessFor(h.context.Config)
+	outstanding, err := looperdruntime.CountOutstandingQuarantineDebt(ctx, services.Repositories)
+	if err != nil {
+		return statusResponse{}, err
+	}
+	recovery := h.recoveryWithOutstanding(outstanding)
+	degradedReasons := statusDegradedReasons(reviewPublish, outstanding)
+
 	return statusResponse{
 		Service: statusService{
-			Healthy:        storageState.OK,
-			Version:        version.Current().Version,
-			Build:          version.Current().Metadata,
-			DaemonMode:     h.context.Config.Daemon.Mode,
-			AdmissionState: h.admissionStateString(),
-			StartedAt:      h.startedAtISO(),
-			Recovery:       h.recoverySummary(),
+			Healthy:         storageState.OK,
+			Version:         version.Current().Version,
+			Build:           version.Current().Metadata,
+			DaemonMode:      h.context.Config.Daemon.Mode,
+			AdmissionState:  h.admissionStateString(),
+			StartedAt:       h.startedAtISO(),
+			Recovery:        recovery,
+			DegradedReasons: degradedReasons,
 			Binary: statusBinary{
 				Name:             "looperd",
 				Path:             daemonExecutablePath(),
@@ -1429,9 +1447,11 @@ func (h *Handler) buildStatusResponse(ctx context.Context) (statusResponse, erro
 			OsascriptEnabled: h.context.Config.Notifications.Osascript.Enabled,
 		},
 		Tools: statusTools{
-			Git:       hasValue(h.context.Config.Tools.GitPath),
-			GH:        hasValue(h.context.Config.Tools.GHPath),
-			Osascript: hasValue(h.context.Config.Tools.OsascriptPath),
+			Git:           hasValue(h.context.Config.Tools.GitPath),
+			GH:            hasValue(h.context.Config.Tools.GHPath),
+			Osascript:     hasValue(h.context.Config.Tools.OsascriptPath),
+			LooperPath:    reviewPublish.LooperPath,
+			ReviewPublish: reviewPublish,
 		},
 		Providers: h.buildProviderHealth(ctx),
 	}, nil
@@ -1635,6 +1655,42 @@ func normalizeRecoverySummary(summary looperdruntime.RecoverySummary) map[string
 	return normalized
 }
 
+func (h *Handler) recoveryWithOutstanding(outstanding looperdruntime.OutstandingQuarantineDebt) any {
+	recovery := h.recoverySummary()
+	normalized, ok := recovery.(map[string]any)
+	if !ok {
+		if recovery == nil {
+			normalized = map[string]any{}
+		} else {
+			// Preserve non-map recovery payloads from test doubles.
+			return map[string]any{
+				"snapshot":    recovery,
+				"outstanding": outstanding,
+			}
+		}
+	} else {
+		// Copy so we do not mutate a shared recovery map.
+		copied := make(map[string]any, len(normalized)+1)
+		for key, value := range normalized {
+			copied[key] = value
+		}
+		normalized = copied
+	}
+	normalized["outstanding"] = outstanding
+	return normalized
+}
+
+func statusDegradedReasons(reviewPublish looperdruntime.ReviewPublishReadiness, outstanding looperdruntime.OutstandingQuarantineDebt) []string {
+	var reasons []string
+	if reviewPublish.Known && reviewPublish.PublishingDisabled && strings.TrimSpace(reviewPublish.LooperPath) != "" {
+		reasons = append(reasons, "review_publish_disabled")
+	}
+	if outstanding.QuarantinedActiveExecutions > 0 || outstanding.QuarantinedRunningRuns > 0 {
+		reasons = append(reasons, "quarantine_orphan_debt")
+	}
+	return reasons
+}
+
 type projectsListResponse struct {
 	Items []projectResponse `json:"items"`
 }
@@ -1790,15 +1846,34 @@ type projectResponse struct {
 	WorktreeRoot *string `json:"worktreeRoot"`
 	CreatedAt    string  `json:"createdAt"`
 	UpdatedAt    string  `json:"updatedAt"`
+	// Discovery reports post-commit worktree/PR discovery status when the
+	// project record carries it; omitted for records that predate it.
+	Discovery *discoveryResponse `json:"discovery,omitempty"`
+}
+
+// discoveryResponse is the observable post-commit discovery contract. Counts
+// are only meaningful once Status reaches succeeded/failed; registration
+// returns pending because discovery runs after the registration completes.
+type discoveryResponse struct {
+	Status                 string   `json:"status"`
+	SnapshotMode           string   `json:"snapshotMode,omitempty"`
+	UpdatedAt              string   `json:"updatedAt,omitempty"`
+	Error                  string   `json:"error,omitempty"`
+	DiscoveredPullRequests int      `json:"discoveredPullRequests,omitempty"`
+	DiscoveredWorktrees    int      `json:"discoveredWorktrees,omitempty"`
+	PendingSnapshots       int      `json:"pendingSnapshots,omitempty"`
+	CapturedSnapshots      int      `json:"capturedSnapshots,omitempty"`
+	Warnings               []string `json:"warnings,omitempty"`
 }
 
 type createProjectResponse struct {
 	projectResponse
-	DiscoveredPullRequests int      `json:"discoveredPullRequests"`
-	DiscoveredWorktrees    int      `json:"discoveredWorktrees"`
-	PendingSnapshots       int      `json:"pendingSnapshots"`
-	CapturedSnapshots      int      `json:"capturedSnapshots"`
-	Warnings               []string `json:"warnings"`
+	Discovery              discoveryResponse `json:"discovery"`
+	DiscoveredPullRequests int               `json:"discoveredPullRequests"`
+	DiscoveredWorktrees    int               `json:"discoveredWorktrees"`
+	PendingSnapshots       int               `json:"pendingSnapshots"`
+	CapturedSnapshots      int               `json:"capturedSnapshots"`
+	Warnings               []string          `json:"warnings"`
 }
 
 type runsListResponse struct {
@@ -1912,6 +1987,7 @@ type projectService interface {
 	List(context.Context) ([]storage.ProjectRecord, error)
 	AddProject(context.Context, projects.AddInput) (projects.AddResult, error)
 	RemoveProject(context.Context, string) (storage.ProjectRecord, error)
+	DiscoverProject(context.Context, projects.DiscoverInput) (projects.DiscoverResult, error)
 }
 
 func (h *Handler) buildProjectsRouteResponse(r *http.Request) (any, error) {
@@ -1969,10 +2045,28 @@ func (h *Handler) buildProjectRouteResponse(r *http.Request, path string) (any, 
 		}
 	}
 
-	identifier, err := decodeProjectIdentifier(normalizePath(r.URL.EscapedPath()))
+	requestPath := normalizePath(r.URL.EscapedPath())
+	discoverRoute := false
+	trimmed := strings.TrimSuffix(requestPath, "/")
+	projectPathPrefix := apiBasePath + "/projects/"
+	projectPathSuffix := strings.TrimPrefix(trimmed, projectPathPrefix)
+	if projectPathSuffix != trimmed {
+		segments := strings.Split(projectPathSuffix, "/")
+		if len(segments) == 2 && segments[1] == "discover" {
+			discoverRoute = true
+			requestPath = projectPathPrefix + segments[0]
+		}
+	}
+
+	identifier, err := decodeProjectIdentifier(requestPath)
 	if err != nil {
 		return nil, err
 	}
+
+	if discoverRoute {
+		return h.buildProjectDiscoverResponse(r, service, identifier)
+	}
+
 	if r.Method != http.MethodDelete {
 		return nil, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: fmt.Sprintf("Unsupported method for %s", path)}
 	}
@@ -1994,6 +2088,37 @@ func (h *Handler) buildProjectRouteResponse(r *http.Request, path string) (any, 
 		}
 	}
 	return serializeProject(removed, h.context.Config, h.context.Config.Defaults.BaseBranch), nil
+}
+
+// buildProjectDiscoverResponse retries post-commit worktree/PR discovery for
+// an already-registered project. Unlike registration this request is allowed
+// to block: discovery is the work the caller explicitly asked to wait for.
+func (h *Handler) buildProjectDiscoverResponse(r *http.Request, service projectService, identifier string) (any, error) {
+	if r.Method != http.MethodPost {
+		return nil, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: fmt.Sprintf("Unsupported method for %s", r.URL.EscapedPath())}
+	}
+	result, err := service.DiscoverProject(r.Context(), projects.DiscoverInput{ProjectID: identifier})
+	if err != nil {
+		var notFound projects.ProjectNotFoundError
+		var validation projects.ProjectValidationError
+		switch {
+		case errors.As(err, &notFound):
+			return nil, apiError{code: pkgapi.ErrorCodeProjectNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Project not found: %s", notFound.Identifier)}
+		case errors.As(err, &validation):
+			return nil, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: err.Error()}
+		default:
+			return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+		}
+	}
+	return createProjectResponse{
+		projectResponse:        serializeProject(result.Project, h.context.Config, h.context.Config.Defaults.BaseBranch),
+		Discovery:              serializeDiscovery(result.Discovery),
+		DiscoveredPullRequests: result.Discovery.DiscoveredPullRequests,
+		DiscoveredWorktrees:    result.Discovery.DiscoveredWorktrees,
+		PendingSnapshots:       result.Discovery.PendingSnapshots,
+		CapturedSnapshots:      result.Discovery.CapturedSnapshots,
+		Warnings:               append([]string{}, result.Discovery.Warnings...),
+	}, nil
 }
 
 func (h *Handler) buildLoopsRouteResponse(r *http.Request) (any, error) {
@@ -7180,12 +7305,27 @@ func (h *Handler) buildCreateProjectResponse(r *http.Request, service projectSer
 	}
 	return createProjectResponse{
 		projectResponse:        serializeProject(result.Project, h.context.Config, h.context.Config.Defaults.BaseBranch),
-		DiscoveredPullRequests: result.DiscoveredPullRequests,
-		DiscoveredWorktrees:    result.DiscoveredWorktrees,
-		PendingSnapshots:       result.PendingSnapshots,
-		CapturedSnapshots:      result.CapturedSnapshots,
+		Discovery:              serializeDiscovery(result.Discovery),
+		DiscoveredPullRequests: result.Discovery.DiscoveredPullRequests,
+		DiscoveredWorktrees:    result.Discovery.DiscoveredWorktrees,
+		PendingSnapshots:       result.Discovery.PendingSnapshots,
+		CapturedSnapshots:      result.Discovery.CapturedSnapshots,
 		Warnings:               append([]string{}, result.Warnings...),
 	}, nil
+}
+
+func serializeDiscovery(state projects.DiscoveryState) discoveryResponse {
+	return discoveryResponse{
+		Status:                 string(state.Status),
+		SnapshotMode:           string(state.SnapshotMode),
+		UpdatedAt:              state.UpdatedAt,
+		Error:                  state.Error,
+		DiscoveredPullRequests: state.DiscoveredPullRequests,
+		DiscoveredWorktrees:    state.DiscoveredWorktrees,
+		PendingSnapshots:       state.PendingSnapshots,
+		CapturedSnapshots:      state.CapturedSnapshots,
+		Warnings:               append([]string{}, state.Warnings...),
+	}
 }
 
 func serializeProject(project storage.ProjectRecord, cfg config.Config, defaultBaseBranch string) projectResponse {
@@ -7196,7 +7336,7 @@ func serializeProject(project storage.ProjectRecord, cfg config.Config, defaultB
 		baseBranch = *project.BaseBranch
 	}
 
-	return projectResponse{
+	response := projectResponse{
 		ID:           project.ID,
 		Name:         project.Name,
 		RepoPath:     project.RepoPath,
@@ -7208,6 +7348,11 @@ func serializeProject(project storage.ProjectRecord, cfg config.Config, defaultB
 		CreatedAt:    project.CreatedAt,
 		UpdatedAt:    project.UpdatedAt,
 	}
+	if state := projects.DiscoveryStateFromRecord(project); state.Status != "" {
+		serialized := serializeDiscovery(state)
+		response.Discovery = &serialized
+	}
+	return response
 }
 
 // resolveProjectProviderKind returns the display provider kind for a project:

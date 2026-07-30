@@ -997,6 +997,111 @@ func TestHandlerStatusSuccessContainsExpectedSections(t *testing.T) {
 	assertEqual(t, reviewer["waiting"], float64(1))
 	assertEqual(t, reviewer["terminated"], float64(1))
 	assertEqual(t, reviewer["stopped"], float64(1))
+
+	tools := data["tools"].(map[string]any)
+	reviewPublish, ok := tools["reviewPublish"].(map[string]any)
+	if !ok {
+		t.Fatalf("tools.reviewPublish missing: %#v", tools)
+	}
+	if _, ok := reviewPublish["publishingDisabled"].(bool); !ok {
+		t.Fatalf("tools.reviewPublish.publishingDisabled missing: %#v", reviewPublish)
+	}
+	recovery := service["recovery"].(map[string]any)
+	outstanding, ok := recovery["outstanding"].(map[string]any)
+	if !ok {
+		t.Fatalf("service.recovery.outstanding missing: %#v", recovery)
+	}
+	assertEqual(t, outstanding["quarantinedActiveExecutions"], float64(0))
+	assertEqual(t, outstanding["quarantinedRunningRuns"], float64(0))
+}
+
+func TestHandlerStatusSurfacesUnknownReviewPublishWithoutProbing(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	incapable := filepath.Join(t.TempDir(), "old-looper")
+	probeLog := filepath.Join(t.TempDir(), "probe-log")
+	if err := os.WriteFile(incapable, []byte("#!/bin/sh\necho probe > "+probeLog+"\necho unknown >&2\nexit 1\n"), 0o755); err != nil {
+		t.Fatalf("WriteFile(looper) error = %v", err)
+	}
+	cfg.Tools.LooperPath = &incapable
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/status", nil)
+	recorder := httptest.NewRecorder()
+	NewHandler(Context{Config: cfg, Runtime: runtimeWithConfig(rt, cfg)}).ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 body=%s", recorder.Code, recorder.Body.String())
+	}
+	data := parseJSONMap(t, recorder.Body.Bytes())["data"].(map[string]any)
+	service := data["service"].(map[string]any)
+	tools := data["tools"].(map[string]any)
+	assertEqual(t, tools["looperPath"], incapable)
+	reviewPublish := tools["reviewPublish"].(map[string]any)
+	assertEqual(t, reviewPublish["publishingDisabled"], true)
+	assertEqual(t, reviewPublish["capable"], false)
+	assertEqual(t, reviewPublish["known"], false)
+	assertEqual(t, reviewPublish["reason"], "capability has not been probed yet")
+	if _, err := os.Stat(probeLog); !os.IsNotExist(err) {
+		t.Fatalf("GET status executed capability probe: Stat(%q) error = %v, want not exist", probeLog, err)
+	}
+	reasons, _ := service["degradedReasons"].([]any)
+	if strings.Contains(fmt.Sprintf("%v", reasons), "review_publish_disabled") {
+		t.Fatalf("degradedReasons = %#v, unknown readiness must not be reported as disabled", reasons)
+	}
+}
+
+func TestHandlerStatusReportsDebtAfterStaleRunReconcile(t *testing.T) {
+	fixture := newTestFixture(t, func(options *looperdruntime.Options) {
+		options.ReadProcessCommand = func(context.Context, int) (string, error) { return "", nil }
+	})
+	rt, cfg := fixture.runtime, fixture.config
+	repos := rt.Services().Repositories
+	oldISO := fixture.now.Add(-2 * time.Hour).Format(time.RFC3339Nano)
+	projectID := "project_reconcile_status"
+	loopID := "loop_reconcile_status"
+	runID := "run_reconcile_status"
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Reconcile", RepoPath: fixture.rootDir, CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 1, ProjectID: projectID, Type: "worker", TargetType: "project", Status: "running", CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	if err := repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: runID, LoopID: loopID, Status: "running", CurrentStep: stringPtr("work"), StartedAt: oldISO, LastHeartbeatAt: &oldISO, CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	if err := repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_reconcile_status", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: projectID, DedupeKey: "worker:reconcile-status", Priority: storage.QueuePriorityWorker, Status: "running", AvailableAt: oldISO, StartedAt: &oldISO, MaxAttempts: 3, CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	pid := int64(9191)
+	if err := repos.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{ID: "execution_reconcile_status", ProjectID: &projectID, LoopID: &loopID, RunID: &runID, Vendor: "codex", Status: "running", PID: &pid, CommandJSON: stringPtr(`{"command":"codex"}`), CWD: stringPtr(fixture.rootDir), StartedAt: oldISO, CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
+		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
+	}
+
+	summary, err := rt.ReconcileStaleRunningRuns(context.Background())
+	if err != nil {
+		t.Fatalf("ReconcileStaleRunningRuns() error = %v", err)
+	}
+	if summary.QuarantinedExecutions != 1 {
+		t.Fatalf("summary = %#v, want one quarantined execution", summary)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/status", nil)
+	recorder := httptest.NewRecorder()
+	NewHandler(Context{Config: cfg, Runtime: rt}).ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 body=%s", recorder.Code, recorder.Body.String())
+	}
+	data := parseJSONMap(t, recorder.Body.Bytes())["data"].(map[string]any)
+	service := data["service"].(map[string]any)
+	outstanding := service["recovery"].(map[string]any)["outstanding"].(map[string]any)
+	assertEqual(t, outstanding["quarantinedActiveExecutions"], float64(1))
+	// Quarantine deliberately leaves uncertain execution/run evidence active;
+	// this counter exists to surface the resulting active-runs inflation.
+	assertEqual(t, outstanding["quarantinedRunningRuns"], float64(1))
+	if !strings.Contains(fmt.Sprintf("%v", service["degradedReasons"]), "quarantine_orphan_debt") {
+		t.Fatalf("degradedReasons = %#v, want quarantine debt", service["degradedReasons"])
+	}
+	if run, err := repos.Runs.GetByID(context.Background(), runID); err != nil || run == nil || run.Status != "running" {
+		t.Fatalf("run after reconcile = %#v, %v; want running quarantine evidence", run, err)
+	}
 }
 
 func TestHandlerStatusIncludesRedactedForgejoProviderHealth(t *testing.T) {
@@ -1796,6 +1901,28 @@ func TestHandlerMatchesFrozenSuccessArtifactsForCoreRoutes(t *testing.T) {
 		Config:  fixture.config,
 		Runtime: fixture.runtime,
 		Now:     func() time.Time { return fixture.now },
+		ProjectsService: fakeProjectService{addProject: func(context.Context, projects.AddInput) (projects.AddResult, error) {
+			nowISO := fixture.now.UTC().Format(javaScriptISOString)
+			baseBranch := "main"
+			metadataJSON := `{"repo":"nexu-io/looper","worktreeRoot":null,"source":"api"}`
+			return projects.AddResult{
+				Project: storage.ProjectRecord{
+					ID:           "looper",
+					Name:         "Looper",
+					RepoPath:     "/tmp/repos/looper",
+					BaseBranch:   &baseBranch,
+					MetadataJSON: &metadataJSON,
+					CreatedAt:    nowISO,
+					UpdatedAt:    nowISO,
+				},
+				Discovery: projects.DiscoveryState{
+					Status:       projects.DiscoveryStatusPending,
+					SnapshotMode: projects.SnapshotModeAsync,
+					UpdatedAt:    nowISO,
+				},
+				Warnings: []string{},
+			}, nil
+		}},
 		PatchConfig: func(context.Context, ConfigPatchRequest) error {
 			return nil
 		},
@@ -1804,7 +1931,7 @@ func TestHandlerMatchesFrozenSuccessArtifactsForCoreRoutes(t *testing.T) {
 		},
 	})
 
-	for _, routeID := range []string{"healthz.get", "status.get", "config.get", "config.patch"} {
+	for _, routeID := range []string{"healthz.get", "status.get", "config.get", "config.patch", "projects.create"} {
 		t.Run(routeID, func(t *testing.T) {
 			path := "/api/v1/healthz"
 			method := http.MethodGet
@@ -1818,11 +1945,18 @@ func TestHandlerMatchesFrozenSuccessArtifactsForCoreRoutes(t *testing.T) {
 				path = "/api/v1/config"
 				method = http.MethodPatch
 				requestBody = strings.NewReader(marshalArtifactRequestBody(t, requestRoutes, routeID))
+			case "projects.create":
+				path = "/api/v1/projects"
+				method = http.MethodPost
+				requestBody = strings.NewReader(marshalArtifactRequestBody(t, requestRoutes, routeID))
 			}
 
 			req := httptest.NewRequest(method, path, requestBody)
 			if routeID == "config.patch" {
 				req.RemoteAddr = "127.0.0.1:17310"
+			}
+			if requestBody != nil {
+				req.Header.Set("content-type", "application/json")
 			}
 			req.Header.Set("x-request-id", "fixture-request-id")
 			recorder := httptest.NewRecorder()
@@ -2033,10 +2167,9 @@ func TestHandlerProjectsCreateRouteSuccessDerivesDefaults(t *testing.T) {
 		addProject: func(context.Context, projects.AddInput) (projects.AddResult, error) {
 			metadataJSON := `{"repo":null,"worktreeRoot":null,"source":"api"}`
 			return projects.AddResult{
-				Project:                storage.ProjectRecord{ID: "looper-repo", Name: "looper-repo", RepoPath: `C:\\tmp/repos/Looper Repo`, BaseBranch: stringPtr(fixture.config.Defaults.BaseBranch), MetadataJSON: &metadataJSON, CreatedAt: nowISO, UpdatedAt: nowISO},
-				DiscoveredPullRequests: 0,
-				DiscoveredWorktrees:    0,
-				Warnings:               nil,
+				Project:   storage.ProjectRecord{ID: "looper-repo", Name: "looper-repo", RepoPath: `C:\\tmp/repos/Looper Repo`, BaseBranch: stringPtr(fixture.config.Defaults.BaseBranch), MetadataJSON: &metadataJSON, CreatedAt: nowISO, UpdatedAt: nowISO},
+				Discovery: projects.DiscoveryState{Status: projects.DiscoveryStatusPending},
+				Warnings:  nil,
 			}, nil
 		},
 	}}).ServeHTTP(recorder, req)
@@ -2058,8 +2191,18 @@ func TestHandlerProjectsCreateRouteSuccessDerivesDefaults(t *testing.T) {
 	if data["worktreeRoot"] != nil {
 		t.Fatalf("worktreeRoot = %#v, want nil", data["worktreeRoot"])
 	}
+	discovery, ok := data["discovery"].(map[string]any)
+	if !ok {
+		t.Fatalf("discovery = %#v, want object", data["discovery"])
+	}
+	assertEqual(t, discovery["status"], string(projects.DiscoveryStatusPending))
+	if _, present := discovery["discoveredPullRequests"]; present {
+		t.Fatalf("discoveredPullRequests = %#v, want omitted while pending", discovery["discoveredPullRequests"])
+	}
 	assertEqual(t, data["discoveredPullRequests"], float64(0))
 	assertEqual(t, data["discoveredWorktrees"], float64(0))
+	assertEqual(t, data["pendingSnapshots"], float64(0))
+	assertEqual(t, data["capturedSnapshots"], float64(0))
 	warnings, ok := data["warnings"].([]any)
 	if !ok || len(warnings) != 0 {
 		t.Fatalf("warnings = %#v, want empty array", data["warnings"])
@@ -2078,11 +2221,14 @@ func TestHandlerProjectsCreateRouteReturnsDiscoveryDetails(t *testing.T) {
 			repo := "acme/looper"
 			metadataJSON := `{"repo":"acme/looper","worktreeRoot":null,"source":"api"}`
 			return projects.AddResult{
-				Project:                storage.ProjectRecord{ID: "looper", Name: "Looper", RepoPath: "/tmp/repos/looper", BaseBranch: stringPtr("main"), MetadataJSON: &metadataJSON, CreatedAt: nowISO, UpdatedAt: nowISO},
-				Repo:                   &repo,
-				DiscoveredPullRequests: 2,
-				DiscoveredWorktrees:    3,
-				Warnings:               []string{"warn 1", "warn 2"},
+				Project: storage.ProjectRecord{ID: "looper", Name: "Looper", RepoPath: "/tmp/repos/looper", BaseBranch: stringPtr("main"), MetadataJSON: &metadataJSON, CreatedAt: nowISO, UpdatedAt: nowISO},
+				Repo:    &repo,
+				Discovery: projects.DiscoveryState{
+					Status:                 projects.DiscoveryStatusSucceeded,
+					DiscoveredPullRequests: 2,
+					DiscoveredWorktrees:    3,
+					Warnings:               []string{"warn 1", "warn 2"},
+				},
 			}, nil
 		},
 	}}).ServeHTTP(recorder, req)
@@ -2094,11 +2240,20 @@ func TestHandlerProjectsCreateRouteReturnsDiscoveryDetails(t *testing.T) {
 	data := body["data"].(map[string]any)
 	assertEqual(t, data["id"], "looper")
 	assertEqual(t, data["repo"], "acme/looper")
+	discovery, ok := data["discovery"].(map[string]any)
+	if !ok {
+		t.Fatalf("discovery = %#v, want object", data["discovery"])
+	}
+	assertEqual(t, discovery["status"], string(projects.DiscoveryStatusSucceeded))
+	assertEqual(t, discovery["discoveredPullRequests"], float64(2))
+	assertEqual(t, discovery["discoveredWorktrees"], float64(3))
 	assertEqual(t, data["discoveredPullRequests"], float64(2))
 	assertEqual(t, data["discoveredWorktrees"], float64(3))
-	warnings, ok := data["warnings"].([]any)
-	if !ok || !reflect.DeepEqual(warnings, []any{"warn 1", "warn 2"}) {
-		t.Fatalf("warnings = %#v, want [warn 1 warn 2]", data["warnings"])
+	assertEqual(t, data["pendingSnapshots"], float64(0))
+	assertEqual(t, data["capturedSnapshots"], float64(0))
+	discoveryWarnings, ok := discovery["warnings"].([]any)
+	if !ok || !reflect.DeepEqual(discoveryWarnings, []any{"warn 1", "warn 2"}) {
+		t.Fatalf("discovery.warnings = %#v, want [warn 1 warn 2]", discovery["warnings"])
 	}
 }
 
@@ -2160,12 +2315,78 @@ func TestHandlerProjectsCreateRouteReturnsSuccessWhenWebhookRefreshFails(t *test
 	assertEqual(t, data["repoPath"], "/tmp/repos/looper")
 	assertEqual(t, data["baseBranch"], "main")
 	assertEqual(t, data["archived"], false)
-	assertEqual(t, data["discoveredPullRequests"], float64(0))
-	assertEqual(t, data["discoveredWorktrees"], float64(0))
+	if _, ok := data["discovery"].(map[string]any); !ok {
+		t.Fatalf("discovery = %#v, want object", data["discovery"])
+	}
 	warnings, ok := data["warnings"].([]any)
 	if !ok || len(warnings) != 0 {
 		t.Fatalf("warnings = %#v, want empty array", data["warnings"])
 	}
+}
+
+func TestHandlerProjectDiscoverRouteRetriesDiscovery(t *testing.T) {
+	fixture := newTestFixture(t)
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects/looper/discover", nil)
+	recorder := httptest.NewRecorder()
+
+	NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, ProjectsService: fakeProjectService{
+		discoverProject: func(_ context.Context, input projects.DiscoverInput) (projects.DiscoverResult, error) {
+			if input.ProjectID != "looper" {
+				t.Fatalf("DiscoverProject().ProjectID = %q, want looper", input.ProjectID)
+			}
+			metadataJSON := `{"repo":"acme/looper","source":"api"}`
+			return projects.DiscoverResult{
+				Project: storage.ProjectRecord{ID: "looper", Name: "Looper", RepoPath: "/tmp/repos/looper", BaseBranch: stringPtr("main"), MetadataJSON: &metadataJSON, CreatedAt: nowISO, UpdatedAt: nowISO},
+				Discovery: projects.DiscoveryState{
+					Status:              projects.DiscoveryStatusSucceeded,
+					DiscoveredWorktrees: 2,
+				},
+			}, nil
+		},
+	}}).ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	data := body["data"].(map[string]any)
+	assertEqual(t, data["id"], "looper")
+	discovery, ok := data["discovery"].(map[string]any)
+	if !ok {
+		t.Fatalf("discovery = %#v, want object", data["discovery"])
+	}
+	assertEqual(t, discovery["status"], string(projects.DiscoveryStatusSucceeded))
+	assertEqual(t, discovery["discoveredWorktrees"], float64(2))
+}
+
+func TestHandlerProjectDiscoverRouteRejectsGet(t *testing.T) {
+	fixture := newTestFixture(t)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/projects/looper/discover", nil)
+	recorder := httptest.NewRecorder()
+
+	NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, ProjectsService: fakeProjectService{}}).ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want 405", recorder.Code)
+	}
+}
+
+func TestHandlerProjectsRemoveRouteDoesNotTreatDiscoverIDAsDiscoverSubroute(t *testing.T) {
+	fixture := newTestFixture(t)
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+	if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "discover", Name: "Discover", RepoPath: "/tmp/discover", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime}).ServeHTTP(recorder, httptest.NewRequest(http.MethodDelete, "/api/v1/projects/discover", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 body=%s", recorder.Code, recorder.Body.String())
+	}
+	data := parseJSONMap(t, recorder.Body.Bytes())["data"].(map[string]any)
+	assertEqual(t, data["id"], "discover")
+	assertEqual(t, data["archived"], true)
 }
 
 func TestHandlerProjectsRemoveRouteArchivesProject(t *testing.T) {
@@ -7884,9 +8105,10 @@ func seedConflictProject(t *testing.T, service *projects.Service) {
 }
 
 type fakeProjectService struct {
-	list          func(context.Context) ([]storage.ProjectRecord, error)
-	addProject    func(context.Context, projects.AddInput) (projects.AddResult, error)
-	removeProject func(context.Context, string) (storage.ProjectRecord, error)
+	list            func(context.Context) ([]storage.ProjectRecord, error)
+	addProject      func(context.Context, projects.AddInput) (projects.AddResult, error)
+	removeProject   func(context.Context, string) (storage.ProjectRecord, error)
+	discoverProject func(context.Context, projects.DiscoverInput) (projects.DiscoverResult, error)
 }
 
 func (f fakeProjectService) List(ctx context.Context) ([]storage.ProjectRecord, error) {
@@ -7908,6 +8130,13 @@ func (f fakeProjectService) RemoveProject(ctx context.Context, identifier string
 		return f.removeProject(ctx, identifier)
 	}
 	return storage.ProjectRecord{}, nil
+}
+
+func (f fakeProjectService) DiscoverProject(ctx context.Context, input projects.DiscoverInput) (projects.DiscoverResult, error) {
+	if f.discoverProject != nil {
+		return f.discoverProject(ctx, input)
+	}
+	return projects.DiscoverResult{}, nil
 }
 
 type errorArtifactCase struct {

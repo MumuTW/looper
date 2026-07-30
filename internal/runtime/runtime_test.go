@@ -2692,7 +2692,7 @@ func TestRuntimeReconcileStaleRunningRunsWithMultipleActiveExecutions(t *testing
 			default:
 				return "", nil
 			}
-		}, RunSchedulerTick: func(context.Context, Services) error { return nil }})
+		}})
 		if err := rt.Start(context.Background()); err != nil {
 			t.Fatalf("Start() error = %v", err)
 		}
@@ -3371,6 +3371,63 @@ func TestRuntimeStopClosesCoordinatorAndUnblocksWaitForShutdown(t *testing.T) {
 		t.Fatalf("sql.Open() after Stop() error = %v", err)
 	}
 	defer db.Close()
+}
+
+func TestRuntimeStopCancelsAndDrainsPostCommitProjectDiscovery(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
+	cfg.Daemon.ShutdownTimeoutMS = 500
+	rt := New(Options{Config: cfg, Logger: &testLogger{}, RunSchedulerTick: func(context.Context, Services) error { return nil }})
+	if err := rt.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	projectService := rt.Services().Projects
+	projectService.DetectRepo = nil
+	discoveryStarted := make(chan struct{})
+	discoveryCanceled := make(chan struct{})
+	projectService.ListWorktrees = func(ctx context.Context, _ string) ([]projects.WorktreeListEntry, error) {
+		close(discoveryStarted)
+		<-ctx.Done()
+		close(discoveryCanceled)
+		return nil, ctx.Err()
+	}
+	if _, err := projectService.AddProject(context.Background(), projects.AddInput{ID: "shutdown-discovery", Name: "Shutdown discovery", RepoPath: workingDir, BaseBranch: "main", SnapshotMode: projects.SnapshotModeOff}); err != nil {
+		t.Fatalf("AddProject() error = %v", err)
+	}
+	select {
+	case <-discoveryStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("post-commit discovery did not start")
+	}
+
+	stopped := make(chan struct{})
+	go func() {
+		rt.Stop("SIGTERM")
+		close(stopped)
+	}()
+	select {
+	case <-discoveryCanceled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Runtime.Stop() did not cancel post-commit discovery")
+	}
+	select {
+	case <-stopped:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Runtime.Stop() did not wait for canceled post-commit discovery")
+	}
+	if rt.StorageRetained() {
+		t.Fatal("StorageRetained() = true, want a drained project discovery")
+	}
+	if err := rt.ShutdownDrainError(); err != nil {
+		t.Fatalf("ShutdownDrainError() = %v, want nil", err)
+	}
 }
 
 func TestRuntimeStopTimesOutWaitingForSchedulerLoop(t *testing.T) {
