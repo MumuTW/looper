@@ -3,7 +3,7 @@ package workflow_test
 import (
 	"testing"
 
-	"github.com/nexu-io/looper/internal/loops"
+	"github.com/nexu-io/looper/internal/loops/policy"
 	"github.com/nexu-io/looper/internal/reviewer/workflow"
 )
 
@@ -147,7 +147,7 @@ func TestPlanResume(t *testing.T) {
 			},
 			want: workflow.ResumePlan{
 				StartStep:           workflow.StepDiscover,
-				InitialResumePolicy: loops.ResumePolicyReplayStep,
+				InitialResumePolicy: policy.ResumePolicyReplayStep,
 			},
 		},
 		{
@@ -160,7 +160,7 @@ func TestPlanResume(t *testing.T) {
 			},
 			want: workflow.ResumePlan{
 				StartStep:           workflow.StepDiscover,
-				InitialResumePolicy: loops.ResumePolicyReplayStep,
+				InitialResumePolicy: policy.ResumePolicyReplayStep,
 			},
 		},
 		{
@@ -170,13 +170,13 @@ func TestPlanResume(t *testing.T) {
 				LatestStatus:                "failed",
 				LastCompletedStep:           workflow.StepWorktree,
 				FailedStep:                  workflow.StepReview,
-				CheckpointResumePolicy:      loops.ResumePolicyRestartFromDiscover,
+				CheckpointResumePolicy:      policy.ResumePolicyRestartFromDiscover,
 				NeedsEligibilityRediscovery: panicCallback,
 			},
 			want: workflow.ResumePlan{
 				StartStep:           workflow.StepDiscover,
 				StickySnapshot:      true,
-				InitialResumePolicy: loops.ResumePolicyReplayStep,
+				InitialResumePolicy: policy.ResumePolicyReplayStep,
 			},
 		},
 		{
@@ -192,7 +192,7 @@ func TestPlanResume(t *testing.T) {
 			want: workflow.ResumePlan{
 				StartStep:           workflow.StepDiscover,
 				StickySnapshot:      true,
-				InitialResumePolicy: loops.ResumePolicyReplayStep,
+				InitialResumePolicy: policy.ResumePolicyReplayStep,
 			},
 		},
 		{
@@ -207,7 +207,7 @@ func TestPlanResume(t *testing.T) {
 			want: workflow.ResumePlan{
 				StartStep:           workflow.StepDiscover,
 				StickySnapshot:      true,
-				InitialResumePolicy: loops.ResumePolicyReplayStep,
+				InitialResumePolicy: policy.ResumePolicyReplayStep,
 			},
 		},
 		{
@@ -224,7 +224,7 @@ func TestPlanResume(t *testing.T) {
 			want: workflow.ResumePlan{
 				StartStep:           workflow.StepDiscover,
 				StickySnapshot:      true,
-				InitialResumePolicy: loops.ResumePolicyReplayStep,
+				InitialResumePolicy: policy.ResumePolicyReplayStep,
 			},
 		},
 		{
@@ -243,7 +243,7 @@ func TestPlanResume(t *testing.T) {
 				Resumed:                 true,
 				StickySnapshot:          true,
 				CarryCheckpoint:         true,
-				InitialResumePolicy:     loops.ResumePolicyAdvanceFromCheckpoint,
+				InitialResumePolicy:     policy.ResumePolicyAdvanceFromCheckpoint,
 				ClearWorktreePreparedAt: true,
 				CarryLastCompletedStep:  true,
 			},
@@ -262,7 +262,7 @@ func TestPlanResume(t *testing.T) {
 				Resumed:                true,
 				StickySnapshot:         true,
 				CarryCheckpoint:        true,
-				InitialResumePolicy:    loops.ResumePolicyAdvanceFromCheckpoint,
+				InitialResumePolicy:    policy.ResumePolicyAdvanceFromCheckpoint,
 				CarryLastCompletedStep: true,
 			},
 		},
@@ -280,7 +280,7 @@ func TestPlanResume(t *testing.T) {
 				Resumed:                true,
 				StickySnapshot:         true,
 				CarryCheckpoint:        true,
-				InitialResumePolicy:    loops.ResumePolicyAdvanceFromCheckpoint,
+				InitialResumePolicy:    policy.ResumePolicyAdvanceFromCheckpoint,
 				CarryLastCompletedStep: true,
 			},
 		},
@@ -298,7 +298,7 @@ func TestPlanResume(t *testing.T) {
 				Resumed:                 true,
 				StickySnapshot:          true,
 				CarryCheckpoint:         true,
-				InitialResumePolicy:     loops.ResumePolicyAdvanceFromCheckpoint,
+				InitialResumePolicy:     policy.ResumePolicyAdvanceFromCheckpoint,
 				ClearWorktreePreparedAt: true,
 				CarryLastCompletedStep:  true,
 			},
@@ -315,7 +315,7 @@ func TestPlanResume(t *testing.T) {
 			want: workflow.ResumePlan{
 				StartStep:           workflow.StepDiscover,
 				StickySnapshot:      true,
-				InitialResumePolicy: loops.ResumePolicyReplayStep,
+				InitialResumePolicy: policy.ResumePolicyReplayStep,
 			},
 		},
 		{
@@ -330,7 +330,7 @@ func TestPlanResume(t *testing.T) {
 			want: workflow.ResumePlan{
 				StartStep:           workflow.StepDiscover,
 				StickySnapshot:      true,
-				InitialResumePolicy: loops.ResumePolicyReplayStep,
+				InitialResumePolicy: policy.ResumePolicyReplayStep,
 			},
 		},
 		{
@@ -348,7 +348,7 @@ func TestPlanResume(t *testing.T) {
 				Resumed:                true,
 				StickySnapshot:         true,
 				CarryCheckpoint:        true,
-				InitialResumePolicy:    loops.ResumePolicyAdvanceFromCheckpoint,
+				InitialResumePolicy:    policy.ResumePolicyAdvanceFromCheckpoint,
 				CarryLastCompletedStep: true,
 			},
 		},
@@ -365,7 +365,7 @@ func TestPlanResume(t *testing.T) {
 				Resumed:                true,
 				StickySnapshot:         true,
 				CarryCheckpoint:        true,
-				InitialResumePolicy:    loops.ResumePolicyAdvanceFromCheckpoint,
+				InitialResumePolicy:    policy.ResumePolicyAdvanceFromCheckpoint,
 				CarryLastCompletedStep: true,
 			},
 		},
@@ -392,33 +392,33 @@ func TestNextResumePolicyOnFailure(t *testing.T) {
 	}{
 		// retryable_after_resume: advances to advance_from_checkpoint unless
 		// current is already restart_from_discover or rerun_review (sticky).
-		{"retryable-after-resume from empty advances", loops.FailureKindRetryableAfterResume, "", loops.ResumePolicyAdvanceFromCheckpoint},
-		{"retryable-after-resume from advance stays advance", loops.FailureKindRetryableAfterResume, loops.ResumePolicyAdvanceFromCheckpoint, loops.ResumePolicyAdvanceFromCheckpoint},
-		{"retryable-after-resume from replay advances", loops.FailureKindRetryableAfterResume, loops.ResumePolicyReplayStep, loops.ResumePolicyAdvanceFromCheckpoint},
-		{"retryable-after-resume from restart_from_discover is sticky", loops.FailureKindRetryableAfterResume, loops.ResumePolicyRestartFromDiscover, loops.ResumePolicyRestartFromDiscover},
-		{"retryable-after-resume from rerun_review is sticky", loops.FailureKindRetryableAfterResume, workflow.ResumePolicyRerunReview, workflow.ResumePolicyRerunReview},
-		{"retryable-after-resume from manual_intervention advances", loops.FailureKindRetryableAfterResume, loops.ResumePolicyManualIntervention, loops.ResumePolicyAdvanceFromCheckpoint},
+		{"retryable-after-resume from empty advances", policy.FailureKindRetryableAfterResume, "", policy.ResumePolicyAdvanceFromCheckpoint},
+		{"retryable-after-resume from advance stays advance", policy.FailureKindRetryableAfterResume, policy.ResumePolicyAdvanceFromCheckpoint, policy.ResumePolicyAdvanceFromCheckpoint},
+		{"retryable-after-resume from replay advances", policy.FailureKindRetryableAfterResume, policy.ResumePolicyReplayStep, policy.ResumePolicyAdvanceFromCheckpoint},
+		{"retryable-after-resume from restart_from_discover is sticky", policy.FailureKindRetryableAfterResume, policy.ResumePolicyRestartFromDiscover, policy.ResumePolicyRestartFromDiscover},
+		{"retryable-after-resume from rerun_review is sticky", policy.FailureKindRetryableAfterResume, workflow.ResumePolicyRerunReview, workflow.ResumePolicyRerunReview},
+		{"retryable-after-resume from manual_intervention advances", policy.FailureKindRetryableAfterResume, policy.ResumePolicyManualIntervention, policy.ResumePolicyAdvanceFromCheckpoint},
 
 		// manual_intervention: always wins outright, regardless of current.
-		{"manual-intervention from empty", loops.FailureKindManualIntervention, "", loops.ResumePolicyManualIntervention},
-		{"manual-intervention from advance", loops.FailureKindManualIntervention, loops.ResumePolicyAdvanceFromCheckpoint, loops.ResumePolicyManualIntervention},
-		{"manual-intervention from replay", loops.FailureKindManualIntervention, loops.ResumePolicyReplayStep, loops.ResumePolicyManualIntervention},
-		{"manual-intervention from restart_from_discover", loops.FailureKindManualIntervention, loops.ResumePolicyRestartFromDiscover, loops.ResumePolicyManualIntervention},
-		{"manual-intervention from manual_intervention", loops.FailureKindManualIntervention, loops.ResumePolicyManualIntervention, loops.ResumePolicyManualIntervention},
-		{"manual-intervention from rerun_review", loops.FailureKindManualIntervention, workflow.ResumePolicyRerunReview, loops.ResumePolicyManualIntervention},
+		{"manual-intervention from empty", policy.FailureKindManualIntervention, "", policy.ResumePolicyManualIntervention},
+		{"manual-intervention from advance", policy.FailureKindManualIntervention, policy.ResumePolicyAdvanceFromCheckpoint, policy.ResumePolicyManualIntervention},
+		{"manual-intervention from replay", policy.FailureKindManualIntervention, policy.ResumePolicyReplayStep, policy.ResumePolicyManualIntervention},
+		{"manual-intervention from restart_from_discover", policy.FailureKindManualIntervention, policy.ResumePolicyRestartFromDiscover, policy.ResumePolicyManualIntervention},
+		{"manual-intervention from manual_intervention", policy.FailureKindManualIntervention, policy.ResumePolicyManualIntervention, policy.ResumePolicyManualIntervention},
+		{"manual-intervention from rerun_review", policy.FailureKindManualIntervention, workflow.ResumePolicyRerunReview, policy.ResumePolicyManualIntervention},
 
 		// any other failure kind: replay_step only fills an empty current;
 		// otherwise current is preserved untouched.
-		{"retryable-transient from empty defaults to replay", "retryable_transient", "", loops.ResumePolicyReplayStep},
-		{"retryable-transient preserves advance", "retryable_transient", loops.ResumePolicyAdvanceFromCheckpoint, loops.ResumePolicyAdvanceFromCheckpoint},
-		{"retryable-transient preserves replay", "retryable_transient", loops.ResumePolicyReplayStep, loops.ResumePolicyReplayStep},
-		{"retryable-transient preserves restart_from_discover", "retryable_transient", loops.ResumePolicyRestartFromDiscover, loops.ResumePolicyRestartFromDiscover},
-		{"retryable-transient preserves manual_intervention", "retryable_transient", loops.ResumePolicyManualIntervention, loops.ResumePolicyManualIntervention},
+		{"retryable-transient from empty defaults to replay", "retryable_transient", "", policy.ResumePolicyReplayStep},
+		{"retryable-transient preserves advance", "retryable_transient", policy.ResumePolicyAdvanceFromCheckpoint, policy.ResumePolicyAdvanceFromCheckpoint},
+		{"retryable-transient preserves replay", "retryable_transient", policy.ResumePolicyReplayStep, policy.ResumePolicyReplayStep},
+		{"retryable-transient preserves restart_from_discover", "retryable_transient", policy.ResumePolicyRestartFromDiscover, policy.ResumePolicyRestartFromDiscover},
+		{"retryable-transient preserves manual_intervention", "retryable_transient", policy.ResumePolicyManualIntervention, policy.ResumePolicyManualIntervention},
 		{"retryable-transient preserves rerun_review", "retryable_transient", workflow.ResumePolicyRerunReview, workflow.ResumePolicyRerunReview},
-		{"non-retryable from empty defaults to replay", "non_retryable", "", loops.ResumePolicyReplayStep},
-		{"non-retryable preserves current", "non_retryable", loops.ResumePolicyAdvanceFromCheckpoint, loops.ResumePolicyAdvanceFromCheckpoint},
-		{"empty failure kind from empty defaults to replay", "", "", loops.ResumePolicyReplayStep},
-		{"empty failure kind preserves current", "", loops.ResumePolicyManualIntervention, loops.ResumePolicyManualIntervention},
+		{"non-retryable from empty defaults to replay", "non_retryable", "", policy.ResumePolicyReplayStep},
+		{"non-retryable preserves current", "non_retryable", policy.ResumePolicyAdvanceFromCheckpoint, policy.ResumePolicyAdvanceFromCheckpoint},
+		{"empty failure kind from empty defaults to replay", "", "", policy.ResumePolicyReplayStep},
+		{"empty failure kind preserves current", "", policy.ResumePolicyManualIntervention, policy.ResumePolicyManualIntervention},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -433,13 +433,13 @@ func TestNextResumePolicyOnFailure(t *testing.T) {
 func TestPreferInMemoryCheckpoint(t *testing.T) {
 	t.Parallel()
 
-	policies := []string{"", loops.ResumePolicyAdvanceFromCheckpoint, loops.ResumePolicyReplayStep, loops.ResumePolicyRestartFromDiscover, loops.ResumePolicyManualIntervention, workflow.ResumePolicyRerunReview}
-	for _, policy := range policies {
+	policies := []string{"", policy.ResumePolicyAdvanceFromCheckpoint, policy.ResumePolicyReplayStep, policy.ResumePolicyRestartFromDiscover, policy.ResumePolicyManualIntervention, workflow.ResumePolicyRerunReview}
+	for _, current := range policies {
 		for _, markerMiss := range []bool{false, true} {
-			want := policy == workflow.ResumePolicyRerunReview || markerMiss
-			got := workflow.PreferInMemoryCheckpoint(policy, markerMiss)
+			want := current == workflow.ResumePolicyRerunReview || markerMiss
+			got := workflow.PreferInMemoryCheckpoint(current, markerMiss)
 			if got != want {
-				t.Errorf("PreferInMemoryCheckpoint(%q, %v) = %v, want %v", policy, markerMiss, got, want)
+				t.Errorf("PreferInMemoryCheckpoint(%q, %v) = %v, want %v", current, markerMiss, got, want)
 			}
 		}
 	}
@@ -448,12 +448,12 @@ func TestPreferInMemoryCheckpoint(t *testing.T) {
 func TestCarryRestartFromDiscover(t *testing.T) {
 	t.Parallel()
 
-	policies := []string{"", loops.ResumePolicyAdvanceFromCheckpoint, loops.ResumePolicyReplayStep, loops.ResumePolicyRestartFromDiscover, loops.ResumePolicyManualIntervention, workflow.ResumePolicyRerunReview}
-	for _, policy := range policies {
-		want := policy == loops.ResumePolicyRestartFromDiscover
-		got := workflow.CarryRestartFromDiscover(policy)
+	policies := []string{"", policy.ResumePolicyAdvanceFromCheckpoint, policy.ResumePolicyReplayStep, policy.ResumePolicyRestartFromDiscover, policy.ResumePolicyManualIntervention, workflow.ResumePolicyRerunReview}
+	for _, current := range policies {
+		want := current == policy.ResumePolicyRestartFromDiscover
+		got := workflow.CarryRestartFromDiscover(current)
 		if got != want {
-			t.Errorf("CarryRestartFromDiscover(%q) = %v, want %v", policy, got, want)
+			t.Errorf("CarryRestartFromDiscover(%q) = %v, want %v", current, got, want)
 		}
 	}
 }
