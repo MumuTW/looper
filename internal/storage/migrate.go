@@ -138,11 +138,8 @@ func (r *MigrationRunner) RunPending(ctx context.Context, options ...RunPendingO
 		return MigrationRunResult{}, err
 	}
 
-	if unknown := unknownAppliedMigrationIDs(applied, r.migrations); len(unknown) > 0 {
-		return MigrationRunResult{}, fmt.Errorf(
-			"database has applied migrations unknown to this binary: %s; the database was likely created or migrated by a newer looper version (downgrade or mixed-version deployment) — run a looper binary that includes these migrations or restore a backup matching this version",
-			strings.Join(unknown, ", "),
-		)
+	if err := assertAppliedMigrationsKnown(applied, r.migrations); err != nil {
+		return MigrationRunResult{}, err
 	}
 
 	appliedIDs := make(map[string]struct{}, len(applied))
@@ -196,6 +193,85 @@ func (r *MigrationRunner) Backup(ctx context.Context) (string, error) {
 	defer conn.Close()
 
 	return r.backupOnConn(ctx, conn)
+}
+
+// ValidateCompatibility verifies that every migration recorded in
+// schema_migrations is present in the binary's migration manifest. It is the
+// schema-compatibility authority for daemon boot and runs on every startup
+// regardless of whether migration application is enabled, so a downgraded or
+// mixed-version binary cannot initialize repositories and run against a newer
+// schema it cannot prove it understands.
+//
+// Trade-off analysis (AGENTS.md "New concepts require an explicit trade-off"):
+//
+//   - Concrete failure prevented: after a manual downgrade or mixed-version
+//     deployment, an older binary silently treats a newer schema as fully
+//     migrated, starts normally, and later fails or writes incompatible data.
+//     ValidateCompatibility makes that state loud at boot instead of deferred.
+//
+//   - Costs / new failure modes:
+//
+//   - Every boot now reads schema_migrations and diffs it against the
+//     manifest. The read is a single indexed query against an in-process
+//     SQLite table, so the steady-state cost is negligible, but it is a new
+//     boot-time failure surface: a corrupt schema_migrations table now fails
+//     startup where it previously would have been ignored until first use.
+//
+//   - The check is point-in-time. It proves the binary understood the schema
+//     at boot; it does not coordinate with a concurrent daemon that migrates
+//     the database after this check passes. That interleaving is handled at
+//     the runtime layer by the database-lifetime attach lock, not here.
+//
+//   - A binary that legitimately shares a database with a newer binary (an
+//     unsupported deployment) now fails to boot instead of running blind.
+//
+//   - Why simpler alternatives are insufficient:
+//
+//   - "Delete the check and trust the binary" lets a downgrade run silently
+//     against an incompatible schema — the exact failure this gate exists
+//     to prevent.
+//
+//   - "Only check inside RunPending" is bypassed entirely when auto-migration
+//     is disabled, so the daemon boots and runs without any compatibility
+//     proof. Running the check on every boot closes that path while keeping
+//     migration application conditional.
+//
+// The authority for this action is the running binary's ordered migration
+// manifest (EmbeddedMigrations), not agent output or infra inference: unknown
+// applied IDs mean the binary cannot prove it understands the database, so it
+// refuses to proceed rather than treat the database as fully migrated.
+func (r *MigrationRunner) ValidateCompatibility(ctx context.Context) error {
+	conn, err := r.db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("open sqlite connection: %w", err)
+	}
+	defer conn.Close()
+
+	if err := ensureSchemaMigrationsTable(ctx, conn); err != nil {
+		return err
+	}
+
+	applied, err := readAppliedMigrations(ctx, conn)
+	if err != nil {
+		return err
+	}
+
+	return assertAppliedMigrationsKnown(applied, r.migrations)
+}
+
+// assertAppliedMigrationsKnown returns an error naming every applied migration
+// ID absent from the manifest, in the sorted order produced by
+// readAppliedMigrations, or nil when all applied IDs are known. Shared by
+// ValidateCompatibility (every boot) and RunPending (migration application) so
+// the two paths cannot drift in what they reject.
+func assertAppliedMigrationsKnown(applied []AppliedMigration, migrations []EmbeddedMigration) error {
+	if unknown := unknownAppliedMigrationIDs(applied, migrations); len(unknown) > 0 {
+		return fmt.Errorf(
+			"database has applied migrations unknown to this binary: %s; the database was likely created or migrated by a newer looper version (downgrade or mixed-version deployment) — run a looper binary that includes these migrations or restore a backup matching this version",
+			strings.Join(unknown, ", "),
+		)
+	}
+	return nil
 }
 
 // unknownAppliedMigrationIDs returns applied IDs absent from the binary's

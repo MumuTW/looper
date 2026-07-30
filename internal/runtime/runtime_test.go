@@ -4774,6 +4774,190 @@ func TestFormatJavaScriptISOStringPreservesMilliseconds(t *testing.T) {
 	}
 }
 
+// TestRuntimeStartValidatesSchemaCompatibilityWhenAutoMigrationDisabled
+// covers the boot path where package.autoMigrateOnStartup=false: previously
+// Runtime.start never called RunPending, so the unknown-applied-migration
+// check was bypassed and a downgraded daemon could run against a newer schema.
+// ValidateCompatibility now runs on every boot, so this downgraded boot fails
+// loudly even though migration application is disabled.
+func TestRuntimeStartValidatesSchemaCompatibilityWhenAutoMigrationDisabled(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	dbPath := filepath.Join(workingDir, "runtime.sqlite")
+	backupDir := filepath.Join(workingDir, "backups")
+
+	// Seed the database with a "newer" manifest that records an extra migration.
+	newerManifest := append(append([]storage.EmbeddedMigration{}, storage.EmbeddedMigrations...), storage.EmbeddedMigration{
+		ID:       "9999_compat_marker",
+		FileName: "9999_compat_marker.sql",
+		SQL:      "CREATE TABLE compat_marker (id TEXT PRIMARY KEY);",
+	})
+	seedCoordinator, err := storage.OpenSQLiteCoordinator(context.Background(), dbPath, storage.SQLiteCoordinatorOptions{
+		BackupDir:  backupDir,
+		Migrations: newerManifest,
+	})
+	if err != nil {
+		t.Fatalf("OpenSQLiteCoordinator() seed error = %v", err)
+	}
+	if _, err := seedCoordinator.MigrationRunner().RunPending(context.Background()); err != nil {
+		t.Fatalf("seed RunPending() error = %v", err)
+	}
+	if err := seedCoordinator.Close(); err != nil {
+		t.Fatalf("seed coordinator Close() error = %v", err)
+	}
+
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Storage.DBPath = dbPath
+	cfg.Storage.BackupDir = &backupDir
+	cfg.Package.AutoMigrateOnStartup = false
+
+	rt := New(Options{
+		Config: cfg,
+		Logger: &testLogger{},
+		// The running binary only knows the current manifest, not the extra
+		// 9999_compat_marker migration the newer daemon applied.
+		OpenSQLiteCoordinator: func(ctx context.Context, dbPath string, options storage.SQLiteCoordinatorOptions) (*storage.SQLiteCoordinator, error) {
+			return storage.OpenSQLiteCoordinator(ctx, dbPath, options)
+		},
+	})
+
+	startErr := rt.Start(context.Background())
+	if startErr == nil {
+		rt.Stop("test cleanup")
+		t.Fatal("Start() error = nil, want unknown-applied-migration error")
+	}
+	if !strings.Contains(startErr.Error(), "9999_compat_marker") || !strings.Contains(startErr.Error(), "newer looper version") {
+		t.Fatalf("Start() error = %q, want it to name 9999_compat_marker and diagnose a downgrade", startErr)
+	}
+}
+
+// TestRuntimeStartBlocksConcurrentDaemonFromMigratingSharedDatabase covers the
+// mixed-version interleaving: an older daemon (A) holds the database-lifetime
+// attach lock after booting, so a newer daemon (B) cannot attach — and therefore
+// cannot apply its additional migration — while A is still active. Once A stops
+// and releases the lock, B boots and applies its extra migration. This proves
+// the attach lock coordinates schema versions across concurrently running
+// daemons instead of leaving the boot compatibility check as a point-in-time
+// gate that a concurrent migration can race past.
+func TestRuntimeStartBlocksConcurrentDaemonFromMigratingSharedDatabase(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	dbPath := filepath.Join(workingDir, "shared.sqlite")
+	backupDir := filepath.Join(workingDir, "backups")
+
+	extraMigration := storage.EmbeddedMigration{
+		ID:       "9999_coord_interleave",
+		FileName: "9999_coord_interleave.sql",
+		SQL:      "CREATE TABLE coord_interleave_marker (id TEXT PRIMARY KEY, applied_by TEXT NOT NULL);",
+	}
+	newerManifest := append(append([]storage.EmbeddedMigration{}, storage.EmbeddedMigrations...), extraMigration)
+
+	noopSchedulerTick := func(context.Context, Services) error { return nil }
+
+	baseConfig := func() (config.Config, error) {
+		cfg, err := config.DefaultConfig(workingDir)
+		if err != nil {
+			return config.Config{}, err
+		}
+		cfg.Storage.DBPath = dbPath
+		cfg.Storage.BackupDir = &backupDir
+		cfg.Package.AutoMigrateOnStartup = true
+		return cfg, nil
+	}
+
+	// Daemon A: older binary, current manifest only. Boot it and let it hold the
+	// attach lock against the shared database.
+	cfgA, err := baseConfig()
+	if err != nil {
+		t.Fatalf("baseConfig() A error = %v", err)
+	}
+	daemonA := New(Options{
+		Config:           cfgA,
+		Logger:           &testLogger{},
+		RunSchedulerTick: noopSchedulerTick,
+	})
+	if err := daemonA.Start(context.Background()); err != nil {
+		t.Fatalf("daemonA.Start() error = %v", err)
+	}
+	t.Cleanup(func() { daemonA.Stop("test cleanup") })
+
+	// Daemon B: newer binary with the extra migration. It must not be able to
+	// boot (and therefore cannot apply its extra migration) while A holds the
+	// attach lock.
+	cfgB, err := baseConfig()
+	if err != nil {
+		t.Fatalf("baseConfig() B error = %v", err)
+	}
+	daemonB := New(Options{
+		Config:           cfgB,
+		Logger:           &testLogger{},
+		RunSchedulerTick: noopSchedulerTick,
+		OpenSQLiteCoordinator: func(ctx context.Context, dbPath string, options storage.SQLiteCoordinatorOptions) (*storage.SQLiteCoordinator, error) {
+			options.Migrations = newerManifest
+			return storage.OpenSQLiteCoordinator(ctx, dbPath, options)
+		},
+	})
+	bErr := daemonB.Start(context.Background())
+	if bErr == nil {
+		daemonB.Stop("test cleanup")
+		t.Fatal("daemonB.Start() while daemonA holds the attach lock = nil, want attach-lock error")
+	}
+	if !strings.Contains(bErr.Error(), "looperd.attach.lock") {
+		t.Fatalf("daemonB.Start() error = %q, want it to reference the attach lock", bErr)
+	}
+
+	// The extra migration must not have been applied while A was attached: B
+	// never reached migration because it could not acquire the attach lock.
+	if tableExists(t, dbPath, "coord_interleave_marker") {
+		t.Fatal("coord_interleave_marker table exists while daemonA still holds the attach lock, want the newer migration to be blocked")
+	}
+
+	// A stops and releases the attach lock. Now the newer daemon can boot and
+	// apply its extra migration.
+	daemonA.Stop("older daemon rolling away")
+
+	cfgC, err := baseConfig()
+	if err != nil {
+		t.Fatalf("baseConfig() C error = %v", err)
+	}
+	daemonC := New(Options{
+		Config:           cfgC,
+		Logger:           &testLogger{},
+		RunSchedulerTick: noopSchedulerTick,
+		OpenSQLiteCoordinator: func(ctx context.Context, dbPath string, options storage.SQLiteCoordinatorOptions) (*storage.SQLiteCoordinator, error) {
+			options.Migrations = newerManifest
+			return storage.OpenSQLiteCoordinator(ctx, dbPath, options)
+		},
+	})
+	if err := daemonC.Start(context.Background()); err != nil {
+		t.Fatalf("daemonC.Start() after daemonA stopped error = %v", err)
+	}
+	t.Cleanup(func() { daemonC.Stop("test cleanup") })
+
+	if !tableExists(t, dbPath, "coord_interleave_marker") {
+		t.Fatal("coord_interleave_marker table missing after the newer daemon booted, want the extra migration applied once the attach lock was released")
+	}
+}
+
+func tableExists(t *testing.T, dbPath, tableName string) bool {
+	t.Helper()
+	db, err := storage.OpenSQLiteDB(context.Background(), dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLiteDB(%q) error = %v", dbPath, err)
+	}
+	defer db.Close()
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?`, tableName).Scan(&count); err != nil {
+		t.Fatalf("SELECT sqlite_master for %q error = %v", tableName, err)
+	}
+	return count > 0
+}
+
 type testLogger struct {
 	mu      sync.Mutex
 	entries []string

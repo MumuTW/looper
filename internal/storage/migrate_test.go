@@ -963,6 +963,89 @@ func TestMigrationRunnerRejectsUnknownAppliedMigrations(t *testing.T) {
 	}
 }
 
+func TestMigrationRunnerValidateCompatibilityRejectsUnknownAppliedMigrationsWithoutApplying(t *testing.T) {
+	t.Parallel()
+
+	db := openTestSQLiteDB(t)
+	ctx := context.Background()
+
+	newer := NewMigrationRunner(db, MigrationRunnerOptions{
+		Migrations: []EmbeddedMigration{
+			{ID: "0001_init", FileName: "0001_init.sql", SQL: "CREATE TABLE widgets (id TEXT PRIMARY KEY);"},
+			{ID: "0002_seed", FileName: "0002_seed.sql", SQL: "INSERT INTO widgets (id) VALUES ('w_1');"},
+		},
+	})
+	if _, err := newer.RunPending(ctx); err != nil {
+		t.Fatalf("newer.RunPending() error = %v", err)
+	}
+
+	downgraded := NewMigrationRunner(db, MigrationRunnerOptions{
+		Migrations: []EmbeddedMigration{
+			{ID: "0001_init", FileName: "0001_init.sql", SQL: "CREATE TABLE widgets (id TEXT PRIMARY KEY);"},
+		},
+	})
+
+	if err := downgraded.ValidateCompatibility(ctx); err == nil {
+		t.Fatal("downgraded.ValidateCompatibility() error = nil, want unknown-migration error")
+	} else if !containsAll(err.Error(), []string{"0002_seed", "newer looper version"}) {
+		t.Fatalf("downgraded.ValidateCompatibility() error = %q, want it to name 0002_seed and diagnose a downgrade", err)
+	}
+
+	// ValidateCompatibility must not mutate schema_migrations: a downgraded
+	// binary that only validates leaves the applied set untouched.
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatalf("db.Conn() error = %v", err)
+	}
+	defer conn.Close()
+	applied, err := readAppliedMigrations(ctx, conn)
+	if err != nil {
+		t.Fatalf("readAppliedMigrations() error = %v", err)
+	}
+	gotIDs := make([]string, len(applied))
+	for i, m := range applied {
+		gotIDs[i] = m.ID
+	}
+	if !reflect.DeepEqual(gotIDs, []string{"0001_init", "0002_seed"}) {
+		t.Fatalf("applied IDs after ValidateCompatibility = %v, want [0001_init 0002_seed]", gotIDs)
+	}
+}
+
+func TestMigrationRunnerValidateCompatibilityAcceptsKnownAppliedMigrations(t *testing.T) {
+	t.Parallel()
+
+	db := openTestSQLiteDB(t)
+	ctx := context.Background()
+
+	manifest := []EmbeddedMigration{
+		{ID: "0001_init", FileName: "0001_init.sql", SQL: "CREATE TABLE widgets (id TEXT PRIMARY KEY);"},
+		{ID: "0002_seed", FileName: "0002_seed.sql", SQL: "INSERT INTO widgets (id) VALUES ('w_1');"},
+	}
+	runner := NewMigrationRunner(db, MigrationRunnerOptions{Migrations: manifest})
+	if _, err := runner.RunPending(ctx); err != nil {
+		t.Fatalf("runner.RunPending() error = %v", err)
+	}
+
+	if err := runner.ValidateCompatibility(ctx); err != nil {
+		t.Fatalf("runner.ValidateCompatibility() on known schema error = %v, want nil", err)
+	}
+}
+
+func TestMigrationRunnerValidateCompatibilityAcceptsFreshDatabase(t *testing.T) {
+	t.Parallel()
+
+	db := openTestSQLiteDB(t)
+	runner := NewMigrationRunner(db, MigrationRunnerOptions{
+		Migrations: []EmbeddedMigration{
+			{ID: "0001_init", FileName: "0001_init.sql", SQL: "CREATE TABLE widgets (id TEXT PRIMARY KEY);"},
+		},
+	})
+
+	if err := runner.ValidateCompatibility(context.Background()); err != nil {
+		t.Fatalf("runner.ValidateCompatibility() on fresh database error = %v, want nil", err)
+	}
+}
+
 func TestMigrationRunnerListsEveryUnknownAppliedMigration(t *testing.T) {
 	t.Parallel()
 

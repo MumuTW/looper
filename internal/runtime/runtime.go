@@ -201,6 +201,7 @@ type Runtime struct {
 	githubGateway               *githubinfra.Gateway
 	webhook                     *webhookRuntime
 	webhookDaemonLock           *daemonLock
+	databaseAttachLock          *daemonLock
 	webhookForwarder            WebhookForwarder
 	networkManager              runtimeNetworkManager
 	schedulerDisabled           bool
@@ -808,9 +809,18 @@ func (r *Runtime) stopWebhookRuntime() {
 	r.mu.RLock()
 	webhook := r.webhook
 	lock := r.webhookDaemonLock
+	attachLock := r.databaseAttachLock
 	r.mu.RUnlock()
 	if webhook != nil {
 		webhook.Stop()
+	}
+	if attachLock != nil {
+		_ = attachLock.Release()
+		r.mu.Lock()
+		if r.databaseAttachLock == attachLock {
+			r.databaseAttachLock = nil
+		}
+		r.mu.Unlock()
 	}
 	if lock != nil {
 		_ = lock.Release()
@@ -837,10 +847,23 @@ func (r *Runtime) start(ctx context.Context) error {
 
 	var lock *daemonLock
 	var err error
+	attachLockPath := databaseAttachLockPath(r.config.Storage.DBPath)
+	attachLock, err := acquireDaemonLock(attachLockPath, r.webhook.daemonID, r.now())
+	if err != nil {
+		if r.logger != nil {
+			holder, _ := os.ReadFile(attachLockPath)
+			r.logger.Warn("database.attach.lock_failed", map[string]any{"path": attachLockPath, "existing_holder": strings.TrimSpace(string(holder)), "error": err.Error()})
+		}
+		return err
+	}
+	if r.logger != nil {
+		r.logger.Info("database.attach.lock_acquired", map[string]any{"path": attachLockPath})
+	}
 	if r.config.Webhook.Enabled {
 		lockPath := webhookForwarderLockPath(r.config.Storage.DBPath)
 		lock, err = acquireDaemonLock(lockPath, r.webhook.daemonID, r.now())
 		if err != nil {
+			_ = attachLock.Release()
 			if r.logger != nil {
 				holder, _ := os.ReadFile(lockPath)
 				r.logger.Warn("webhook.daemon.lock_failed", map[string]any{"path": lockPath, "existing_holder": strings.TrimSpace(string(holder)), "error": err.Error()})
@@ -857,6 +880,7 @@ func (r *Runtime) start(ctx context.Context) error {
 		Now:       r.now,
 	})
 	if err != nil {
+		_ = attachLock.Release()
 		if lock != nil {
 			_ = lock.Release()
 		}
@@ -868,12 +892,21 @@ func (r *Runtime) start(ctx context.Context) error {
 	defer func() {
 		if !started && !resourcesPublished {
 			r.stopProjectDiscovery()
+			_ = attachLock.Release()
 			if lock != nil {
 				_ = lock.Release()
 			}
 			_ = coordinator.Close()
 		}
 	}()
+
+	// Validate schema compatibility on every boot, regardless of whether
+	// migration application is enabled, so a downgraded or mixed-version binary
+	// cannot initialize repositories and run against a newer schema it cannot
+	// prove it understands. Migration application remains conditional below.
+	if err := coordinator.MigrationRunner().ValidateCompatibility(ctx); err != nil {
+		return err
+	}
 
 	if r.config.Package.AutoMigrateOnStartup {
 		_, err = coordinator.MigrationRunner().RunPending(ctx, storage.RunPendingOptions{
@@ -1000,6 +1033,7 @@ func (r *Runtime) start(ctx context.Context) error {
 	r.githubGateway = githubGateway
 	r.networkManager = networkclient.NewManager(filepath.Join(runtimeHomeDirOrEmpty(), ".looper", "network.json"), r.config, repositories, githubGateway)
 	r.webhookDaemonLock = lock
+	r.databaseAttachLock = attachLock
 	r.schedulerDisabled = schedulerDisabled
 	r.mu.Unlock()
 	resourcesPublished = true

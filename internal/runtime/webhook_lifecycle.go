@@ -90,6 +90,64 @@ func newDaemonID() string {
 }
 
 func webhookForwarderLockPath(cfgStorageDBPath string) string {
+	return daemonLockPath(cfgStorageDBPath, "looperd.lock")
+}
+
+// databaseAttachLockPath returns the path of the database-lifetime attach lock
+// held by every daemon while it is attached to a SQLite database. Unlike the
+// webhook forwarder lock, this lock is acquired unconditionally on boot so that
+// only one daemon at a time can be attached to a given database. That prevents
+// the mixed-version interleaving where an older daemon passes the boot
+// compatibility check and then a newer daemon applies an additional migration
+// while the older process is still active against the changing schema: the
+// newer daemon cannot acquire this lock (and therefore cannot boot or migrate)
+// until the older daemon stops and releases it.
+//
+// Trade-off analysis (AGENTS.md "New concepts require an explicit trade-off"):
+//
+//   - Concrete failure prevented: during a live mixed-version rollout an older
+//     daemon can read a fully known migration set and pass ValidateCompatibility,
+//     after which a newer daemon applies its additional migration while the
+//     older process remains active against the changed schema. An exclusive
+//     database-lifetime attach lock makes that interleaving impossible — the
+//     newer daemon cannot attach (and so cannot migrate) until the older one
+//     detaches.
+//
+//   - Costs / new failure modes:
+//
+//   - Concurrent daemons sharing one database can no longer run at the same
+//     time. Previously only webhook-enabled daemons were serialized (via the
+//     webhook lock); non-webhook daemons could overlap. SQLite is a
+//     single-writer database not designed for two daemons to manage the same
+//     schema concurrently, so this serializes an already-hazardous setup, but
+//     it is a behavior change for deployments that relied on it.
+//
+//   - Boot now fails if another daemon holds the attach lock. flock is
+//     kernel-managed and auto-released when the holder process exits, so a
+//     crashed daemon never leaves a stale lock; a rolling update must wait for
+//     the previous daemon to stop before the new one can start (no overlap).
+//
+//   - The looper CLI does not open the storage database, so this lock never
+//     blocks CLI commands run against a live daemon.
+//
+//   - Why simpler alternatives are insufficient:
+//
+//   - "Rely on ValidateCompatibility alone" is a point-in-time check; it
+//     cannot see a migration applied by a concurrent daemon after the check
+//     passes.
+//
+//   - "Make the existing webhook lock unconditional" conflates webhook
+//     forwarder ownership with database attachment and would change the
+//     semantics of an existing, named lock. A dedicated attach lock keeps the
+//     two concerns separate and the webhook lock's behavior intact.
+//
+// The authority for refusing a second attach is the running daemon's
+// database-lifetime hold on this lock, not agent output or schema inference.
+func databaseAttachLockPath(cfgStorageDBPath string) string {
+	return daemonLockPath(cfgStorageDBPath, "looperd.attach.lock")
+}
+
+func daemonLockPath(cfgStorageDBPath, name string) string {
 	dbPath := strings.TrimSpace(cfgStorageDBPath)
 	if dbPath != "" {
 		if absPath, err := filepath.Abs(dbPath); err == nil {
@@ -102,7 +160,7 @@ func webhookForwarderLockPath(cfgStorageDBPath string) string {
 			dir = filepath.Join(home, ".looper")
 		}
 	}
-	return filepath.Join(dir, "looperd.lock")
+	return filepath.Join(dir, name)
 }
 
 type daemonLock struct {
