@@ -218,6 +218,16 @@ type fakeGitHub struct {
 	listInput    githubinfra.ListOpenIssuesInput
 	listEmpty    bool
 	permission   string
+	comments     []githubinfra.IssueCommentInput
+	commentErr   error
+}
+
+func (f *fakeGitHub) CreateIssueComment(_ context.Context, input githubinfra.IssueCommentInput) (githubinfra.IssueCommentResult, error) {
+	if f.commentErr != nil {
+		return githubinfra.IssueCommentResult{}, f.commentErr
+	}
+	f.comments = append(f.comments, input)
+	return githubinfra.IssueCommentResult{ID: int64(1000 + len(f.comments)), URL: "https://example.test/comment"}, nil
 }
 
 func (f *fakeGitHub) ListOpenIssues(_ context.Context, input githubinfra.ListOpenIssuesInput) ([]githubinfra.IssueSummary, error) {

@@ -66,8 +66,8 @@ func TestDiscoverIssuesRoutesConfirmedUnsafeReportWithoutRepeatingLLM(t *testing
 	if err != nil {
 		t.Fatalf("Events.List() error = %v", err)
 	}
-	if len(events) != 4 {
-		t.Fatalf("events = %d, want enrollment, report, confirmation, and projection", len(events))
+	if len(events) != 5 {
+		t.Fatalf("events = %d, want enrollment, report, ask, confirmation, and projection", len(events))
 	}
 }
 

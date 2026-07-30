@@ -97,9 +97,26 @@ The projection of an accepted Triage Report into Planner's durable loop and
 queue without consulting Planner's label/assignee discovery filters. This is
 distinct from Coordinator Dispatch, which remains the label-mediated action
 defined below. A report held by policy may instead be authorized by a later
-`triage.confirmed` record derived from an exact `/plan` comment by a repository
-collaborator with write access.
+`triage.confirmed` record derived from a `/plan <confirmation token>` comment by
+a repository collaborator with write access. The command must be the entire
+first line of the comment; text after it is a Clarification.
 _Avoid_: Dispatch (reserved for Coordinator).
+
+**Triage Ask**:
+Triager's durable record that it has asked a human to release a held report,
+stored as a `triage.asked` event. It is the idempotency authority for the
+question — a report carrying an Ask is never asked again — and the delivery
+channel for the report's Confirmation token, which exists nowhere else outside
+the local event log. The question is posted as an Issue comment listing the
+missing information and the exact command to reply with.
+_Avoid_: reminder, nag.
+
+**Clarification**:
+The answer a human supplies after the confirmation command, recorded on the
+`triage.confirmed` event and handed to Planner alongside the Issue. Planner is
+told it supersedes the Issue body where the two conflict, because Planner reads
+only the Issue title and body and would otherwise never see it.
+_Avoid_: reply, follow-up.
 
 **Disposition**:
 Defined at `internal/coordinator/triage.Disposition`, whose doc comment carries
