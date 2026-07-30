@@ -2506,12 +2506,14 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 		}
 		runGitHubHITLPoll(ctx, input, project)
 
-		// Deploy last for this project: a commit that just landed should be picked
-		// up by the tick that observed it, but never ahead of discovery.
+		// Deploy asynchronously. A deploy runs an operator command for up to
+		// roles.deployer.timeoutSeconds — fifteen minutes by default — and the tick
+		// is serial, so running it here would stall every other project's discovery
+		// for the duration.
 		if err := admissionRefuseWork(input); err != nil {
 			break
 		}
-		runDeployLane(ctx, input, project, repo)
+		startDeployLane(ctx, input, project, repo)
 	}
 
 	// HITL (feishu transport): poll the shared Cloudflare inbox once per tick and

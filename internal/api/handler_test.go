@@ -8451,3 +8451,31 @@ func TestHandlerPullRequestStatusUsesLatestRunOrderingForTiedTimestamps(t *testi
 	loopStatus := data["loopStatus"].(map[string]any)
 	assertEqual(t, loopStatus["latestRunStatus"], "running")
 }
+
+// projects[].roles.deployer.environment holds the credentials a deploy
+// authenticates with, and this response already withholds daemon.environment for
+// the same reason.
+func TestRedactProjectDeployerSecrets(t *testing.T) {
+	t.Parallel()
+	environment := map[string]string{"DEPLOY_TOKEN": "secret-value"}
+	projects := []config.ProjectRefConfig{{
+		ID: "looper",
+		Roles: &config.PartialRoleConfigs{Deployer: &config.PartialDeployerRoleConfig{
+			Environment: &environment,
+		}},
+	}}
+
+	redacted := redactProjectSecrets(projects)
+
+	if redacted[0].Roles.Deployer.Environment != nil {
+		t.Fatalf("deploy credentials reached the config response: %v", *redacted[0].Roles.Deployer.Environment)
+	}
+	// The slice copy shares the Roles pointer, so redaction must not reach back
+	// into the live configuration.
+	if projects[0].Roles.Deployer.Environment == nil {
+		t.Fatal("redaction mutated the live configuration")
+	}
+	if (*projects[0].Roles.Deployer.Environment)["DEPLOY_TOKEN"] != "secret-value" {
+		t.Fatal("redaction altered the live configuration values")
+	}
+}
