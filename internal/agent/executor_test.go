@@ -1059,6 +1059,45 @@ func TestParseCompletionAcceptsMarkerGluedToProse(t *testing.T) {
 	}
 }
 
+func TestParseCompletionContinuesPastStderrDiagnosticToValidStdout(t *testing.T) {
+	t.Parallel()
+
+	// A successful run writes a valid completion to stdout but also emits a
+	// diagnostic to stderr that mentions the marker. stderr is appended after
+	// stdout, so the diagnostic must not shadow the real completion.
+	stdout := CompletionMarkerPrefix + `{"summary":"pushed the fix","git_pr_lifecycle":{"pushed":true}}` + "\n"
+	stderr := "warning: expected " + CompletionMarkerPrefix + " JSON\n"
+
+	parsed := parseCompletion(stdout, stderr)
+	if parsed.ParseStatus != "parsed" || parsed.Summary != "pushed the fix" {
+		t.Fatalf("parseCompletion() = %#v, want parsed stdout completion past stderr diagnostic", parsed)
+	}
+}
+
+func TestParseCompletionContinuesPastMalformedCandidateToValidCompletion(t *testing.T) {
+	t.Parallel()
+
+	// A truncated marker payload (followed by "{" but invalid JSON) must not
+	// discard an older, valid completion; invalid_json is reported only when no
+	// valid non-template completion exists.
+	raw := CompletionMarkerPrefix + `{"summary":"real","git_pr_lifecycle":{"pushed":true}}` + "\n" +
+		CompletionMarkerPrefix + `{"summary":"truncated`
+
+	parsed := parseCompletion(raw, "")
+	if parsed.ParseStatus != "parsed" || parsed.Summary != "real" {
+		t.Fatalf("parseCompletion() = %#v, want older valid completion selected", parsed)
+	}
+}
+
+func TestParseCompletionReportsInvalidJSONWhenNoValidCompletionExists(t *testing.T) {
+	t.Parallel()
+
+	parsed := parseCompletion("", CompletionMarkerPrefix+`{"summary":"truncated`)
+	if parsed.ParseStatus != "invalid_json" {
+		t.Fatalf("parseCompletion() = %#v, want invalid_json when only malformed candidates exist", parsed)
+	}
+}
+
 func TestReadPersistedExecutionLogReadsTailToPreserveCompletionMarker(t *testing.T) {
 	t.Parallel()
 

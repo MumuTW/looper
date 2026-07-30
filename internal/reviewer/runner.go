@@ -4208,13 +4208,36 @@ func parseReviewerCommentOnlyCompletion(result AgentResult) (reviewerCommentOnly
 	if strings.TrimSpace(result.Stderr) != "" {
 		raw += "\n" + result.Stderr
 	}
+	var lastErr error
 	for _, payload := range agent.CompletionMarkerPayloads(raw) {
 		if err := json.Unmarshal([]byte(payload), &completion); err != nil {
-			return reviewerCommentOnlyCompletion{}, fmt.Errorf("parse reviewer comment-only completion: %w", err)
+			lastErr = fmt.Errorf("parse reviewer comment-only completion: %w", err)
+			continue
+		}
+		if isTemplateReviewerCommentOnlyCompletion(completion) {
+			// A prose-glued placeholder echo (e.g.
+			// `example.__LOOPER_RESULT__={"summary":"<one-sentence summary>"}`)
+			// parses but has no outcome; skip it like the core and fixer
+			// parsers skip template completions so a real, older completion
+			// is still selected.
+			continue
 		}
 		return validateReviewerCommentOnlyCompletion(completion)
 	}
+	if lastErr != nil {
+		return reviewerCommentOnlyCompletion{}, lastErr
+	}
 	return reviewerCommentOnlyCompletion{}, fmt.Errorf("reviewer comment-only completion marker is required")
+}
+
+// isTemplateReviewerCommentOnlyCompletion reports whether completion is the
+// echoed prompt placeholder (only the "<one-sentence summary>" summary, no
+// outcome or findings) rather than a real review completion.
+func isTemplateReviewerCommentOnlyCompletion(completion reviewerCommentOnlyCompletion) bool {
+	if strings.TrimSpace(completion.Summary) != "<one-sentence summary>" {
+		return false
+	}
+	return completion.Outcome == "" && len(completion.Findings) == 0
 }
 
 func validateReviewerCommentOnlyCompletion(completion reviewerCommentOnlyCompletion) (reviewerCommentOnlyCompletion, error) {

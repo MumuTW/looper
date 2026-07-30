@@ -34,6 +34,44 @@ func TestCompletionMarkerPayloadsReturnsEmptyWithoutMarker(t *testing.T) {
 	}
 }
 
+func TestCompletionMarkerPayloadsSelectsFramingMarkerNotMarkerInsideJSON(t *testing.T) {
+	t.Parallel()
+
+	// A legitimate JSON payload whose summary text mentions the protocol token.
+	// The marker echoed inside the JSON string value is not followed by "{", so
+	// the framing marker (the leftmost one) must be selected instead.
+	raw := CompletionMarkerPrefix + `{"summary":"Fixed __LOOPER_RESULT__= parsing"}`
+
+	payloads := CompletionMarkerPayloads(raw)
+	want := []string{`{"summary":"Fixed __LOOPER_RESULT__= parsing"}`}
+	if len(payloads) != len(want) {
+		t.Fatalf("CompletionMarkerPayloads() = %#v, want %#v", payloads, want)
+	}
+	if payloads[0] != want[0] {
+		t.Fatalf("CompletionMarkerPayloads()[0] = %q, want %q", payloads[0], want[0])
+	}
+}
+
+func TestCompletionMarkerPayloadsSkipsProseDiagnosticNotFollowedByJSON(t *testing.T) {
+	t.Parallel()
+
+	// A stderr-style diagnostic mentioning the marker is not a framing marker
+	// (not followed by "{") and must not shadow the real completion on stdout.
+	raw := strings.Join([]string{
+		CompletionMarkerPrefix + `{"summary":"done"}`,
+		"warning: expected " + CompletionMarkerPrefix + " JSON",
+	}, "\n")
+
+	payloads := CompletionMarkerPayloads(raw)
+	want := []string{`{"summary":"done"}`}
+	if len(payloads) != len(want) {
+		t.Fatalf("CompletionMarkerPayloads() = %#v, want %#v", payloads, want)
+	}
+	if payloads[0] != want[0] {
+		t.Fatalf("CompletionMarkerPayloads()[0] = %q, want %q", payloads[0], want[0])
+	}
+}
+
 func TestAppendCompletionInstruction(t *testing.T) {
 	t.Parallel()
 

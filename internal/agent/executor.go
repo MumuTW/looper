@@ -2637,10 +2637,16 @@ func tickerChan(ticker *time.Ticker) <-chan time.Time {
 
 func parseCompletion(stdout, stderr string) completionParse {
 	raw := stdout + "\n" + stderr
+	sawInvalid := false
 	for _, payload := range CompletionMarkerPayloads(raw) {
 		var parsed map[string]any
 		if err := json.Unmarshal([]byte(payload), &parsed); err != nil {
-			return completionParse{ParseStatus: "invalid_json", CompletionSignal: CompletionMarkerPrefix}
+			// A malformed candidate (e.g. a truncated marker payload) must not
+			// shadow an older, valid completion written to stdout when stderr
+			// is appended after it. Keep scanning and report invalid_json only
+			// if no valid non-template completion exists.
+			sawInvalid = true
+			continue
 		}
 		result := completionParse{
 			ParseStatus:      "parsed",
@@ -2659,6 +2665,9 @@ func parseCompletion(stdout, stderr string) completionParse {
 			continue
 		}
 		return result
+	}
+	if sawInvalid {
+		return completionParse{ParseStatus: "invalid_json", CompletionSignal: CompletionMarkerPrefix}
 	}
 	return completionParse{ParseStatus: "missing"}
 }

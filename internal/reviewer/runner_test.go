@@ -10474,3 +10474,33 @@ func TestUpdateLoopPreservesTerminatedLoop(t *testing.T) {
 		t.Fatalf("Loops.GetByID() = %#v, want terminated loop", persisted)
 	}
 }
+
+func TestParseReviewerCommentOnlyCompletionSkipsGluedTemplateEcho(t *testing.T) {
+	t.Parallel()
+
+	// A valid structured completion followed by a prose-glued placeholder echo.
+	// The placeholder parses but has no outcome; it must be skipped so the real
+	// completion is selected instead of failing validation.
+	real := `__LOOPER_RESULT__={"summary":"real review","outcome":"blocking","findings":[{"title":"t","body":"b"}]}`
+	echo := "example.__LOOPER_RESULT__={\"summary\":\"<one-sentence summary>\"}"
+	result := AgentResult{Stdout: real + "\n" + echo}
+
+	completion, err := parseReviewerCommentOnlyCompletion(result)
+	if err != nil {
+		t.Fatalf("parseReviewerCommentOnlyCompletion() error = %v, want real completion selected", err)
+	}
+	if completion.Summary != "real review" || completion.Outcome != "blocking" {
+		t.Fatalf("completion = %#v, want real review/blocking", completion)
+	}
+}
+
+func TestParseReviewerCommentOnlyCompletionFailsWhenOnlyTemplateEchoExists(t *testing.T) {
+	t.Parallel()
+
+	echo := "example.__LOOPER_RESULT__={\"summary\":\"<one-sentence summary>\"}"
+	result := AgentResult{Stdout: echo}
+
+	if _, err := parseReviewerCommentOnlyCompletion(result); err == nil {
+		t.Fatalf("parseReviewerCommentOnlyCompletion() error = nil, want required-marker error when only template echo present")
+	}
+}
