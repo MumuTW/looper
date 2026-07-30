@@ -103,7 +103,7 @@ There is no current-directory inference and no `--project` flag: the stripped CL
 
 1. Create a clear GitHub issue
 2. Triager persists a structured report and routes high-confidence, low-risk work directly to Planner
-3. If the report is risky, uncertain, or missing information, inspect the `triage.report` event; a collaborator with write access can confirm that exact report by commenting `/plan`
+3. If the report is risky, uncertain, or missing information, Triager comments on the issue with what it needs and the exact `/plan <confirmation token>` command for that report; a collaborator with write access replies with it. Anything typed after the command is passed to Planner as a clarification that supersedes the issue body
 4. Planner creates a spec PR
 5. Let `reviewer` review the spec PR
 6. Let `fixer` address review comments until the review is clean
