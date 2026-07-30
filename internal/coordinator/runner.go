@@ -58,6 +58,137 @@ type DiscoveryResult struct {
 	Ticked  bool
 }
 
+// BackfillInput defines the scope of a historical issue backfill operation.
+type BackfillInput struct {
+	ProjectID     string
+	Repo          string
+	IssueNumbers  []int64
+	LabelFilter   string
+	MaxAgeDays    int
+	MaxCount      int
+	SkipTriaged   bool
+	ForceRetriage bool
+}
+
+// BackfillResult reports what was considered, triaged, skipped, and why.
+type BackfillResult struct {
+	Considered      int                `json:"considered"`
+	Triaged         int                `json:"triaged"`
+	Skipped         int                `json:"skipped"`
+	SkipReasons     map[string]int     `json:"skipReasons,omitempty"`
+	ProcessedIssues []int64            `json:"processedIssues,omitempty"`
+	FailedIssues    map[int64]string   `json:"failedIssues,omitempty"`
+}
+
+func (r *Runner) BackfillIssues(ctx context.Context, input BackfillInput) (BackfillResult, error) {
+	result := BackfillResult{
+		SkipReasons:  make(map[string]int),
+		FailedIssues: make(map[int64]string),
+	}
+
+	if r.github == nil || r.repos == nil {
+		return result, fmt.Errorf("repositories not configured")
+	}
+	if input.MaxAgeDays <= 0 {
+		input.MaxAgeDays = 30
+	}
+	if input.MaxAgeDays > 365 {
+		input.MaxAgeDays = 365
+	}
+	if input.MaxCount <= 0 {
+		input.MaxCount = 50
+	}
+	if input.MaxCount > 200 {
+		input.MaxCount = 200
+	}
+
+	project, roleCfg, err := r.projectConfig(ctx, input.ProjectID)
+	if err != nil {
+		return result, err
+	}
+	if project.Archived || !roleCfg.Enabled {
+		return result, fmt.Errorf("project is archived or disabled")
+	}
+
+	issues, err := r.github.ListOpenIssues(ctx, githubinfra.ListOpenIssuesInput{
+		Repo: input.Repo, CWD: project.RepoPath, Limit: input.MaxCount * 2,
+	})
+	if err != nil {
+		return result, err
+	}
+
+	triageCfg := roleConfigToTriageConfig(roleCfg)
+
+	issueSet := make(map[int64]bool)
+	for _, n := range input.IssueNumbers {
+		issueSet[n] = true
+	}
+
+	var processed int64
+	for _, summary := range issues {
+		if processed >= int64(input.MaxCount) {
+			break
+		}
+		if len(input.IssueNumbers) > 0 && !issueSet[summary.Number] {
+			result.Skipped++
+			result.SkipReasons["not_in_selection"]++
+			continue
+		}
+
+		loaded, err := r.loadIssue(ctx, input.Repo, project.RepoPath, summary)
+		if err != nil {
+			result.FailedIssues[summary.Number] = err.Error()
+			continue
+		}
+
+		if input.LabelFilter != "" {
+			found := false
+			for _, l := range loaded.issue.Labels {
+				if l == input.LabelFilter {
+					found = true
+					break
+				}
+			}
+			if !found {
+				result.Skipped++
+				result.SkipReasons["label_mismatch"]++
+				continue
+			}
+		}
+
+		if input.SkipTriaged && !input.ForceRetriage && hasExactLabel(loaded.issue.Labels, triageCfg.TriagedLabel) {
+			result.Skipped++
+			result.SkipReasons["already_triaged"]++
+			continue
+		}
+
+		result.Considered++
+		analysisStartedAt := r.now().UTC()
+
+		decision, err := r.decide(ctx, project.RepoPath, input.Repo, loaded.issue, triageCfg)
+		if err != nil {
+			result.FailedIssues[summary.Number] = err.Error()
+			continue
+		}
+		if decision.NoOp {
+			result.Skipped++
+			result.SkipReasons["no_op_decision"]++
+			continue
+		}
+
+		if err := r.applyDecision(ctx, input.Repo, project.RepoPath, loaded.issue, triageCfg, analysisStartedAt, decision); err != nil {
+			result.FailedIssues[summary.Number] = err.Error()
+			continue
+		}
+
+		result.Triaged++
+		result.ProcessedIssues = append(result.ProcessedIssues, summary.Number)
+		processed++
+	}
+
+	return result, nil
+}
+
 type IssueSummary struct {
 	Number int64
 	Labels []string
