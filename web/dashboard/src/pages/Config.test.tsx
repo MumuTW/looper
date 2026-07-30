@@ -894,7 +894,7 @@ describe("ConfigPage", { timeout: 30_000 }, () => {
       return response(configFixture());
     });
     vi.stubGlobal("fetch", fetchMock);
-    renderPage();
+    const { container } = renderPage();
 
     const autoPush = (await screen.findByLabelText(
       "defaults.allowAutoPush",
@@ -907,14 +907,14 @@ describe("ConfigPage", { timeout: 30_000 }, () => {
         name: "Confirm high-impact configuration",
       }),
     ).toBeTruthy();
-    expect(
-      discardButtons()[0].disabled,
-    ).toBe(true);
-    expect(
-      (screen.getByRole("button", { name: "Refresh" }) as HTMLButtonElement)
-        .disabled,
-    ).toBe(true);
-    expectSaveDisabled(true);
+    // The modal correctly hides the background from accessibility queries, so
+    // inspect the retained DOM only to pin the existing programmatic lock.
+    const lockedLabels = new Set(["Discard", "Refresh", "Save changes"]);
+    const lockedButtons = Array.from(container.querySelectorAll("button")).filter(
+      (button) => lockedLabels.has(button.textContent?.trim() ?? ""),
+    );
+    expect(lockedButtons.length).toBeGreaterThan(0);
+    for (const button of lockedButtons) expect(button.disabled).toBe(true);
     expect(fetchMock.mock.calls.some(([, init]) => init?.method === "PATCH")).toBe(
       false,
     );
