@@ -210,14 +210,14 @@ func TestCountOutstandingQuarantineDebtReportsQuarantinedLoopRoster(t *testing.T
 	quarantinedAt := formatJavaScriptISOString(time.Date(2026, time.July, 30, 8, 18, 12, 0, time.UTC))
 	nowISO := formatJavaScriptISOString(time.Date(2026, time.July, 30, 9, 0, 0, 0, time.UTC))
 
-	rt := New(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time {
-		return time.Date(2026, time.July, 30, 9, 0, 0, 0, time.UTC)
-	}})
-	if err := rt.Start(context.Background()); err != nil {
-		t.Fatalf("Start() error = %v", err)
-	}
-	t.Cleanup(func() { rt.Stop("test cleanup") })
-	repos := rt.Services().Repositories
+	// Deliberately no live Runtime, for the same reason as the sibling test
+	// above: a started runtime's recovery pass settles these orphaned rows out
+	// from under the assertion — correctly. It races the seed loop below, so a
+	// live runtime here makes the test report whichever half the tick reached
+	// first, which is what made it flaky.
+	coordinator := openMigratedCoordinator(t, cfg.Storage.DBPath, backupDir)
+	t.Cleanup(func() { _ = coordinator.Close() })
+	repos := storage.NewRepositories(coordinator.DB())
 
 	projectID := "project_roster"
 	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Roster", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
