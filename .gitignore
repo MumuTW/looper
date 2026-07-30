@@ -1,5 +1,8 @@
 .ralph/
 .task/
+# Agent tooling checks out git worktrees here. Left untracked, they make every
+# local build probe dirty (tools/go-build-flags).
+.worktrees/
 .DS_Store
 node_modules/
 dist/
