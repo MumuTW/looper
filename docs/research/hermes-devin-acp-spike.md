@@ -156,9 +156,9 @@ invasive than "map Hermes tools onto Devin's tool surface": expose the
 desired Hermes tools (starting with `memory`, whose `MemoryStore` is already
 a plain Python class) as a stdio MCP server, and replace the shim's
 unconditional denial with a selective approval for calls to that server.
-Neither piece requires touching Hermes's agent loop. **Not yet built or
-tested against real Hermes tools** — the probe used a stub MCP server; the
-claim proven here is that the route is open, not that the patch exists.
+Neither piece requires touching Hermes's agent loop.
+
+That patch now exists in `tools/hermes-devin/` — see below.
 
 Note the security consequence: relaxing the permission denial widens what the
 backend can do, and the denial was never a containment boundary to begin with
@@ -219,6 +219,65 @@ and it was proven end-to-end with a stub server. The remaining work is a
 carried Hermes patch of modest size (an MCP server wrapping the Hermes tools
 worth exposing, plus a narrow, allow-listed replacement for the shim's
 blanket permission denial), not an upstream change.
+
+## The carried patch (`tools/hermes-devin/`)
+
+Two components, plus profile wiring:
+
+- **`memory_mcp_server.py`** — stdlib-only stdio MCP server exposing Hermes's
+  own memory store as `hermes_memory_add` / `_replace` / `_remove` / `_read`.
+  It wraps Hermes's `load_on_disk_store()` and `memory_tool()` rather than
+  reimplementing the format, builds a fresh store per call (Hermes sessions
+  write the same files concurrently), re-execs into Hermes's venv (the memory
+  import needs `yaml`, which the system interpreter lacks), and refuses to
+  write when `HERMES_HOME` is unset instead of silently hitting the default
+  profile. `--selftest` exercises it without an MCP client.
+- **`acp-permission-allowlist.patch`** + **`apply-hermes-patch.sh`** —
+  replaces the shim's blanket denial with an allow-list gate. Deny is still
+  the default and the list is empty unless `HERMES_ACP_ALLOWED_MCP_TOOLS` is
+  set, so an unconfigured install behaves exactly like stock Hermes. Only
+  `allow_once` / `allow_session` can ever be selected: `allow_always` and
+  `allow_server_always` outlive the session, `switch_bypass` drops the gate
+  entirely, and the `allow_server_*` options approve *every* tool on that
+  server — including ones never allow-listed, which would defeat the per-tool
+  list. The apply script pins both stock and patched checksums and refuses to
+  touch a Hermes that has moved underneath it.
+
+### Two defects the e2e caught
+
+Both were found only by running against the live server, and both are
+recorded here because the wire shapes are not documented anywhere:
+
+1. **`session/request_permission` carries no tool name.** Its params hold
+   only `{sessionId, toolCall: {toolCallId}, options: [...]}`. The name
+   appears earlier, on the `session/update` that announced the tool call, as
+   `_meta["cognition.ai/toolName"]` — fully qualified, e.g.
+   `mcp__hermes-memory__hermes_memory_add`. The gate therefore tracks
+   `toolCallId → name` per run and correlates on arrival. A first attempt
+   probed plausible name fields directly on the permission params, found
+   nothing, and silently denied every call. The other available signal is the
+   human-readable option labels ("Yes, allow calling X on the Y MCP
+   server"), which would mean gating security on UI copy — rejected.
+   Using the fully-qualified name also pins the server, so another server
+   exposing a same-named tool does not inherit the grant.
+2. **Devin spawns the MCP server, so `HERMES_HOME` does not propagate.**
+   The server correctly refused to write rather than guessing a profile.
+   Register it with the profile baked in: `devin mcp add <name> -e
+   HERMES_HOME=<profile> -- <path to memory_mcp_server.py>`.
+
+### Setup
+
+```bash
+tools/hermes-devin/apply-hermes-patch.sh          # once; --revert to undo
+devin mcp add hermes-memory \
+  -e HERMES_HOME="$HOME/.hermes/profiles/looper" \
+  -- "$PWD/tools/hermes-devin/memory_mcp_server.py"
+```
+
+`devin mcp add` writes a cwd-keyed local project config, so run it from the
+directory your Hermes sessions will use. `scripts/hermes-profile.sh
+--bootstrap` writes the matching allow-list into the profile's `.env` and
+prints both steps.
 
 ## Per-repo profile
 
