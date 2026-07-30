@@ -706,6 +706,40 @@ func TestHandlerActiveRunsProjectsWorkerTimeoutContinuationWithoutPaths(t *testi
 	}
 }
 
+func TestBuildActiveRunContinuationUsesTimeoutEvidenceBeforeRetry(t *testing.T) {
+	checkpoint := `{
+		"execution":{
+			"executionId":"agent_timed_out",
+			"progressBeforeTimeout":{
+				"headSha":"before-head",
+				"worktreeId":"wt_1",
+				"branch":"feature/continue",
+				"changedFileCount":3,
+				"stagedFileCount":1,
+				"untrackedFileCount":1,
+				"diffFingerprint":"before-status",
+				"timeoutType":"idle"
+			}
+		}
+	}`
+
+	continuation := buildActiveRunContinuation(&storage.RunRecord{CheckpointJSON: &checkpoint})
+	if continuation == nil {
+		t.Fatal("buildActiveRunContinuation() = nil, want timeout evidence")
+	}
+	assertEqual(t, continuation.PredecessorExecutionID, "agent_timed_out")
+	assertEqual(t, continuation.Mode, "timeout_observed")
+	if continuation.BeforeTimeout == nil {
+		t.Fatal("BeforeTimeout = nil, want timeout evidence")
+	}
+	assertEqual(t, continuation.BeforeTimeout.HeadSHA, "before-head")
+	assertEqual(t, continuation.BeforeTimeout.ChangedFileCount, 3)
+	assertEqual(t, continuation.BeforeTimeout.DiffFingerprint, "before-status")
+	if continuation.AfterRestart != nil {
+		t.Fatalf("AfterRestart = %#v, want nil", continuation.AfterRestart)
+	}
+}
+
 // Successful completeRun summaries must not populate lastFailureReason when there
 // is no queue error (queued/running loops and ps --all completed rows).
 func TestHandlerActiveRunsDoesNotUseSuccessSummaryAsFailureReason(t *testing.T) {

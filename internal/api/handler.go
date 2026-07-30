@@ -4009,29 +4009,33 @@ func buildActiveRunContinuation(run *storage.RunRecord) *activeRunContinuation {
 		return nil
 	}
 	checkpoint := parseJSONObject(run.CheckpointJSON)
-	continuation := readObject(checkpoint, "continuation")
-	if continuation != nil {
-		before := buildActiveRunProgress(readObject(continuation, "beforeTimeout"))
-		after := buildActiveRunProgress(readObject(continuation, "afterRestart"))
-		if before == nil && after == nil {
-			return nil
-		}
-		return &activeRunContinuation{
-			PredecessorRunID:       derefString(readObjectString(continuation, "predecessorRunId")),
-			PredecessorExecutionID: derefString(readObjectString(continuation, "predecessorExecutionId")),
-			Mode:                   derefString(readObjectString(continuation, "mode")),
-			Outcome:                derefString(readObjectString(continuation, "outcome")),
-			BeforeTimeout:          before,
-			AfterRestart:           after,
+	if continuation, ok := readOptionalObject(checkpoint, "continuation"); ok {
+		beforeTimeout, hasBeforeTimeout := readOptionalObject(continuation, "beforeTimeout")
+		afterRestart, hasAfterRestart := readOptionalObject(continuation, "afterRestart")
+		if hasBeforeTimeout || hasAfterRestart {
+			before := buildActiveRunProgress(beforeTimeout)
+			after := buildActiveRunProgress(afterRestart)
+			return &activeRunContinuation{
+				PredecessorRunID:       derefString(readObjectString(continuation, "predecessorRunId")),
+				PredecessorExecutionID: derefString(readObjectString(continuation, "predecessorExecutionId")),
+				Mode:                   derefString(readObjectString(continuation, "mode")),
+				Outcome:                derefString(readObjectString(continuation, "outcome")),
+				BeforeTimeout:          before,
+				AfterRestart:           after,
+			}
 		}
 	}
 	// A timeout that has not retried yet stores its evidence under execution.
 	// Project it too, so an operator can inspect it before choosing recovery.
-	execution := readObject(checkpoint, "execution")
-	before := buildActiveRunProgress(readObject(execution, "progressBeforeTimeout"))
-	if before == nil {
+	execution, ok := readOptionalObject(checkpoint, "execution")
+	if !ok {
 		return nil
 	}
+	progressBeforeTimeout, ok := readOptionalObject(execution, "progressBeforeTimeout")
+	if !ok {
+		return nil
+	}
+	before := buildActiveRunProgress(progressBeforeTimeout)
 	return &activeRunContinuation{
 		PredecessorExecutionID: derefString(readObjectString(execution, "executionId")),
 		Mode:                   "timeout_observed",
@@ -7902,6 +7906,15 @@ func readObject(value map[string]any, key string) map[string]any {
 		return map[string]any{}
 	}
 	return typed
+}
+
+func readOptionalObject(value map[string]any, key string) (map[string]any, bool) {
+	child, ok := value[key]
+	if !ok {
+		return nil, false
+	}
+	typed, ok := child.(map[string]any)
+	return typed, ok
 }
 
 func readObjectString(value map[string]any, key string) *string {
