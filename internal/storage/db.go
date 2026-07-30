@@ -79,6 +79,34 @@ func OpenSQLiteDB(ctx context.Context, dbPath string) (*sql.DB, error) {
 	return db, nil
 }
 
+// OpenSQLiteDBWithCompatibilityCheck opens the SQLite database at dbPath and
+// validates that its schema_migrations ledger contains no migration IDs
+// unknown to this binary's manifest. It is the shared database boundary for
+// supported CLI consumers — `looper review submit` and its authority lookups —
+// that open the daemon's database directly without a coordinator, so a
+// mixed-version CLI cannot read migration-sensitive authority state or publish
+// a review against a schema created or migrated by a newer looper binary.
+//
+// The validation reuses MigrationRunner.ValidateCompatibility and is read-only:
+// a database without a schema_migrations table (a freshly created file, or one
+// that has never been migrated) is treated as compatible, so this never
+// performs DDL and never blocks a CLI probing an empty or optional database.
+// The handle is closed before returning on a compatibility failure so the
+// caller never receives a connection to a database it cannot prove it
+// understands. The authority is the running binary's EmbeddedMigrations
+// manifest, not agent output or infra inference.
+func OpenSQLiteDBWithCompatibilityCheck(ctx context.Context, dbPath string) (*sql.DB, error) {
+	db, err := OpenSQLiteDB(ctx, dbPath)
+	if err != nil {
+		return nil, err
+	}
+	if err := NewMigrationRunner(db, MigrationRunnerOptions{}).ValidateCompatibility(ctx); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return db, nil
+}
+
 func (c *SQLiteCoordinator) DB() *sql.DB {
 	return c.db
 }

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"regexp"
 	"strings"
 
@@ -491,7 +492,17 @@ func validateReviewerReviewSubmitHold(ctx context.Context, cfg config.Config, re
 		return nil
 	}
 	if manual {
-		db, err := storage.OpenSQLiteDB(ctx, cfg.Storage.DBPath)
+		dbPath := strings.TrimSpace(cfg.Storage.DBPath)
+		if dbPath == "" {
+			return fmt.Errorf("reviewer review submit blocked because %s#%d is currently held", repo, prNumber)
+		}
+		if _, err := os.Stat(dbPath); err != nil {
+			if os.IsNotExist(err) {
+				return fmt.Errorf("reviewer review submit blocked because %s#%d is currently held", repo, prNumber)
+			}
+			return fmt.Errorf("validate held manual reviewer run: stat storage database: %w", err)
+		}
+		db, err := storage.OpenSQLiteDBWithCompatibilityCheck(ctx, dbPath)
 		if err != nil {
 			return fmt.Errorf("validate held manual reviewer run: %w", err)
 		}

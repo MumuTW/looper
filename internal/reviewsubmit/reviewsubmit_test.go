@@ -564,6 +564,27 @@ func TestValidateReviewerReviewSubmitHoldRejectsHeldAutomaticReviewerFlow(t *tes
 	}
 }
 
+func TestValidateReviewerReviewSubmitHoldDoesNotCreateMissingDatabase(t *testing.T) {
+	t.Parallel()
+
+	dbPath := filepath.Join(t.TempDir(), "missing.sqlite")
+	err := validateReviewerReviewSubmitHold(
+		context.Background(),
+		config.Config{Storage: config.StorageConfig{DBPath: dbPath}},
+		"acme/looper",
+		42,
+		true,
+		"run_manual",
+		[]string{labels.HoldReviewer},
+	)
+	if err == nil || !strings.Contains(err.Error(), "currently held") {
+		t.Fatalf("validateReviewerReviewSubmitHold() error = %v, want held rejection for missing database", err)
+	}
+	if _, statErr := os.Stat(dbPath); !os.IsNotExist(statErr) {
+		t.Fatalf("missing database stat error = %v, want os.ErrNotExist", statErr)
+	}
+}
+
 func TestValidateLatestReviewerReviewSubmitHoldRefreshesLabels(t *testing.T) {
 	t.Parallel()
 

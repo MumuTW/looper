@@ -1231,3 +1231,68 @@ func TestMigrationRunnerAcceptsKnownAppliedMigrationsOnRestart(t *testing.T) {
 		t.Fatalf("restarted.RunPending().SkippedIDs = %v, want [0001_init 0002_seed]", result.SkippedIDs)
 	}
 }
+
+// TestOpenSQLiteDBWithCompatibilityCheckRejectsUnknownSchema covers the shared
+// CLI database boundary: a newer daemon migrates the database (recording an
+// extra migration ID), then an older CLI opens the same file directly without a
+// coordinator. OpenSQLiteDBWithCompatibilityCheck must refuse to hand back a
+// connection to a schema the binary cannot prove it understands, naming the
+// unknown migration and the downgrade diagnosis, instead of letting the CLI
+// read migration-sensitive authority state against the newer schema.
+func TestOpenSQLiteDBWithCompatibilityCheckRejectsUnknownSchema(t *testing.T) {
+	t.Parallel()
+
+	dbPath := filepath.Join(t.TempDir(), "looper.sqlite")
+	backupDir := filepath.Join(t.TempDir(), "backups")
+
+	// A "newer" binary applies the current manifest plus one extra migration.
+	newerManifest := append(append([]EmbeddedMigration{}, EmbeddedMigrations...), EmbeddedMigration{
+		ID:       "9999_cli_compat_marker",
+		FileName: "9999_cli_compat_marker.sql",
+		SQL:      "CREATE TABLE cli_compat_marker (id TEXT PRIMARY KEY);",
+	})
+	seedCoordinator, err := OpenSQLiteCoordinator(context.Background(), dbPath, SQLiteCoordinatorOptions{
+		BackupDir:  backupDir,
+		Migrations: newerManifest,
+	})
+	if err != nil {
+		t.Fatalf("OpenSQLiteCoordinator() seed error = %v", err)
+	}
+	if _, err := seedCoordinator.MigrationRunner().RunPending(context.Background()); err != nil {
+		t.Fatalf("seed RunPending() error = %v", err)
+	}
+	if err := seedCoordinator.Close(); err != nil {
+		t.Fatalf("seed coordinator Close() error = %v", err)
+	}
+
+	// The running binary only knows EmbeddedMigrations, not the extra marker.
+	db, err := OpenSQLiteDBWithCompatibilityCheck(context.Background(), dbPath)
+	if err == nil {
+		_ = db.Close()
+		t.Fatal("OpenSQLiteDBWithCompatibilityCheck() error = nil, want unknown-applied-migration error")
+	}
+	if !containsAll(err.Error(), []string{"9999_cli_compat_marker", "newer looper version"}) {
+		t.Fatalf("OpenSQLiteDBWithCompatibilityCheck() error = %q, want it to name 9999_cli_compat_marker and diagnose a downgrade", err)
+	}
+}
+
+// TestOpenSQLiteDBWithCompatibilityCheckAcceptsFreshDatabase verifies the CLI
+// boundary does not block optional/empty databases: a file with no
+// schema_migrations ledger (freshly created, or never migrated) is treated as
+// compatible, so a CLI probing an optional storage.dbPath still opens.
+func TestOpenSQLiteDBWithCompatibilityCheckAcceptsFreshDatabase(t *testing.T) {
+	t.Parallel()
+
+	dbPath := filepath.Join(t.TempDir(), "looper.sqlite")
+	db, err := OpenSQLiteDBWithCompatibilityCheck(context.Background(), dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLiteDBWithCompatibilityCheck() on fresh database error = %v, want nil", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	var name string
+	err = db.QueryRow(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations' LIMIT 1`).Scan(&name)
+	if err != sql.ErrNoRows {
+		t.Fatalf("schema_migrations lookup error = %v, want sql.ErrNoRows (validation must not create the ledger)", err)
+	}
+}
