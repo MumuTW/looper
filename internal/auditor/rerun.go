@@ -27,5 +27,15 @@ type ConfirmationRecord struct {
 	ConfirmedChecks    []string            `json:"confirmedChecks,omitempty"`
 	Decision           Action              `json:"decision"`
 	Reason             string              `json:"reason"`
+	Candidate          *ConfirmedCandidate `json:"candidate,omitempty"`
 	ConfirmedAt        string              `json:"confirmedAt"`
+}
+
+// ConfirmedCandidate freezes the exact merge selected by attribution. A later
+// revert proposal consumes this record instead of re-ranking mutable history.
+type ConfirmedCandidate struct {
+	PRNumber          int64  `json:"prNumber"`
+	MergeCommitSHA    string `json:"mergeCommitSha"`
+	SourceIssueNumber int64  `json:"sourceIssueNumber"`
+	SourceIssueRepo   string `json:"sourceIssueRepo"`
 }
