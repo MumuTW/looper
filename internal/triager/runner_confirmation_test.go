@@ -41,10 +41,14 @@ func TestDiscoverIssuesRoutesConfirmedUnsafeReportWithoutRepeatingLLM(t *testing
 	if first.AwaitingConfirmation != 1 {
 		t.Fatalf("first DiscoverIssues() = %#v, want confirmation wait", first)
 	}
+	report := fixture.singleReport(t)
+	if report.ConfirmationToken == "" {
+		t.Fatal("ConfirmationToken is empty, want a report-specific token")
+	}
 	fixture.now = fixture.now.Add(10 * time.Minute)
 	fixture.github.detail.UpdatedAt = fixture.now.Format(time.RFC3339Nano)
 	fixture.github.detail.Comments = []githubinfra.CommentInfo{{
-		ID: 77, Author: "maintainer", Body: "/plan", CreatedAt: fixture.now.Format(time.RFC3339Nano),
+		ID: 77, Author: "maintainer", Body: confirmationCommand(report.ConfirmationToken), CreatedAt: fixture.now.Format(time.RFC3339Nano),
 	}}
 	fixture.github.permission = "write"
 
@@ -67,12 +71,9 @@ func TestDiscoverIssuesRoutesConfirmedUnsafeReportWithoutRepeatingLLM(t *testing
 	}
 }
 
-func TestDiscoverIssuesAcceptsNewConfirmationInReportTimestampSecond(t *testing.T) {
+func TestDiscoverIssuesRequiresReportSpecificConfirmationToken(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	fixture.now = fixture.now.Add(500 * time.Millisecond)
-	old := githubinfra.CommentInfo{ID: 76, Author: "maintainer", Body: "/plan", CreatedAt: fixture.now.Add(-time.Second).Format(time.RFC3339)}
-	fixture.github.detail.Comments = []githubinfra.CommentInfo{old}
 	fixture.llm.responses = []string{`{"classification":"feature","scope":"in_scope","risk":"high","confidence":0.98,"missingInformation":[],"recommendedNextRole":"planner","rationale":"Touches credentials."}`}
 	runner := fixture.runner()
 
@@ -80,21 +81,35 @@ func TestDiscoverIssuesAcceptsNewConfirmationInReportTimestampSecond(t *testing.
 	if err != nil || first.AwaitingConfirmation != 1 {
 		t.Fatalf("first DiscoverIssues() = (%#v, %v)", first, err)
 	}
+	report := fixture.singleReport(t)
+	if report.Version != 2 || report.ConfirmationToken == "" {
+		t.Fatalf("report version/token = %d/%q, want v2 report-specific token", report.Version, report.ConfirmationToken)
+	}
 	fixture.github.listEmpty = true
-	fixture.github.detail.Comments = append(fixture.github.detail.Comments, githubinfra.CommentInfo{
-		ID: 77, Author: "maintainer", Body: "/plan", CreatedAt: fixture.now.Truncate(time.Second).Format(time.RFC3339),
-	})
+	fixture.github.detail.Comments = []githubinfra.CommentInfo{{
+		ID: 77, Author: "maintainer", Body: "/plan", CreatedAt: fixture.now.Format(time.RFC3339Nano),
+	}}
 	fixture.github.permission = "write"
 	second, err := runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
 	if err != nil {
 		t.Fatalf("second DiscoverIssues() error = %v", err)
 	}
-	if second.Confirmed != 1 || second.Routed != 1 {
-		t.Fatalf("second DiscoverIssues() = %#v", second)
+	if second.AwaitingConfirmation != 1 || second.Confirmed != 0 || second.Routed != 0 {
+		t.Fatalf("second DiscoverIssues() = %#v, want plain /plan rejected", second)
+	}
+	fixture.github.detail.Comments = append(fixture.github.detail.Comments, githubinfra.CommentInfo{
+		ID: 78, Author: "maintainer", Body: confirmationCommand(report.ConfirmationToken), CreatedAt: fixture.now.Format(time.RFC3339Nano),
+	})
+	third, err := runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("third DiscoverIssues() error = %v", err)
+	}
+	if third.Confirmed != 1 || third.Routed != 1 {
+		t.Fatalf("third DiscoverIssues() = %#v", third)
 	}
 }
 
-func TestDiscoverIssuesDoesNotUsePlanPostedDuringDecisionToConfirmLaterReport(t *testing.T) {
+func TestDiscoverIssuesDoesNotUsePlanPostedBeforeReportTokenToConfirmLaterReport(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	fixture.llm.responses = []string{`{"classification":"feature","scope":"in_scope","risk":"high","confidence":0.98,"missingInformation":[],"recommendedNextRole":"planner","rationale":"Touches credentials."}`}
@@ -119,8 +134,8 @@ func TestDiscoverIssuesDoesNotUsePlanPostedDuringDecisionToConfirmLaterReport(t 
 		t.Fatalf("first DiscoverIssues() = %#v, want the mid-decision /plan excluded", first)
 	}
 	report := fixture.singleReport(t)
-	if report.ConfirmationAfterCommentID != 78 {
-		t.Fatalf("ConfirmationAfterCommentID = %d, want post-revalidation cutoff 78", report.ConfirmationAfterCommentID)
+	if report.ConfirmationToken == "" {
+		t.Fatal("ConfirmationToken is empty, want a report-specific token")
 	}
 
 	fixture.github.listEmpty = true
@@ -132,8 +147,19 @@ func TestDiscoverIssuesDoesNotUsePlanPostedDuringDecisionToConfirmLaterReport(t 
 	if err != nil {
 		t.Fatalf("second DiscoverIssues() error = %v", err)
 	}
-	if second.Confirmed != 1 || second.Routed != 1 || len(fixture.planner.inputs) != 1 {
-		t.Fatalf("second DiscoverIssues() = %#v planner=%d, want later /plan routed once", second, len(fixture.planner.inputs))
+	if second.AwaitingConfirmation != 1 || second.Confirmed != 0 || second.Routed != 0 || len(fixture.planner.inputs) != 0 {
+		t.Fatalf("second DiscoverIssues() = %#v planner=%d, want plain /plan rejected", second, len(fixture.planner.inputs))
+	}
+
+	fixture.github.detail.Comments = append(fixture.github.detail.Comments, githubinfra.CommentInfo{
+		ID: 80, Author: "maintainer", Body: confirmationCommand(report.ConfirmationToken), CreatedAt: fixture.now.Format(time.RFC3339Nano),
+	})
+	third, err := runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("third DiscoverIssues() error = %v", err)
+	}
+	if third.Confirmed != 1 || third.Routed != 1 || len(fixture.planner.inputs) != 1 {
+		t.Fatalf("third DiscoverIssues() = %#v planner=%d, want token-bound confirmation routed once", third, len(fixture.planner.inputs))
 	}
 	events, err := fixture.repos.Events.List(context.Background(), 10)
 	if err != nil {
@@ -147,15 +173,15 @@ func TestDiscoverIssuesDoesNotUsePlanPostedDuringDecisionToConfirmLaterReport(t 
 			}
 		}
 	}
-	if confirmed.CommentID != 79 {
-		t.Fatalf("confirmation comment = %d, want only post-report comment 79", confirmed.CommentID)
+	if confirmed.CommentID != 80 {
+		t.Fatalf("confirmation comment = %d, want only token-bound comment 80", confirmed.CommentID)
 	}
 
-	third, err := runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	fourth, err := runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
 	if err != nil {
-		t.Fatalf("third DiscoverIssues() error = %v", err)
+		t.Fatalf("fourth DiscoverIssues() error = %v", err)
 	}
-	if third.Confirmed != 0 || third.Routed != 0 || fixture.llm.calls != 1 || len(fixture.planner.inputs) != 1 {
-		t.Fatalf("third replay = %#v llm/planner=%d/%d, want idempotent no-op", third, fixture.llm.calls, len(fixture.planner.inputs))
+	if fourth.Confirmed != 0 || fourth.Routed != 0 || fixture.llm.calls != 1 || len(fixture.planner.inputs) != 1 {
+		t.Fatalf("fourth replay = %#v llm/planner=%d/%d, want idempotent no-op", fourth, fixture.llm.calls, len(fixture.planner.inputs))
 	}
 }

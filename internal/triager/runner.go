@@ -5,6 +5,7 @@ package triager
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -90,16 +91,19 @@ type SourceEvent struct {
 // are intentionally absent: they may be projected later, but do not authorize
 // Planner.
 type Report struct {
-	Version                    int            `json:"version"`
-	IdempotencyKey             string         `json:"idempotencyKey"`
-	ProjectID                  string         `json:"projectId"`
-	Repo                       string         `json:"repo"`
-	IssueNumber                int64          `json:"issueNumber"`
-	Source                     SourceEvent    `json:"source"`
-	Decision                   Decision       `json:"decision"`
-	Policy                     PolicyDecision `json:"policy"`
-	ConfirmationAfterCommentID int64          `json:"confirmationAfterCommentId,omitempty"`
-	CreatedAt                  string         `json:"createdAt"`
+	Version        int            `json:"version"`
+	IdempotencyKey string         `json:"idempotencyKey"`
+	ProjectID      string         `json:"projectId"`
+	Repo           string         `json:"repo"`
+	IssueNumber    int64          `json:"issueNumber"`
+	Source         SourceEvent    `json:"source"`
+	Decision       Decision       `json:"decision"`
+	Policy         PolicyDecision `json:"policy"`
+	// ConfirmationToken is minted before, and persisted with, the report. A
+	// human must cite it in /plan, so a comment made before this report existed
+	// cannot authorize Planner.
+	ConfirmationToken string `json:"confirmationToken,omitempty"`
+	CreatedAt         string `json:"createdAt"`
 }
 
 type Enrollment struct {
@@ -441,27 +445,20 @@ func (r *Runner) processSourceState(ctx context.Context, project storage.Project
 		if !matches {
 			return r.retireSource(ctx, state, "source_superseded", result)
 		}
-		// Source revalidation performs another GitHub read (timeline). Refresh the
-		// issue once more after it so the comment cutoff is the last remote
-		// snapshot before report persistence, not a pre-revalidation snapshot.
-		reportBoundary, err := r.github.ViewIssue(ctx, githubinfra.ViewIssueInput{Repo: repo, IssueNumber: enrollment.IssueNumber, CWD: project.RepoPath})
-		if err != nil {
-			return err
-		}
-		if !eligibleTarget(reportBoundary) {
-			return r.retireSource(ctx, state, "source_no_longer_eligible", result)
-		}
-		if domain.IsAutoLaneHeld(domain.LoopTypePlanner, reportBoundary.Labels) {
-			result.Skipped++
-			return nil
-		}
-		detail = reportBoundary
+		detail = refreshed
 		detailSource = refreshedSource
 		created := r.now().UTC().Format(time.RFC3339Nano)
 		value := Report{
-			Version: 1, IdempotencyKey: enrollment.IdempotencyKey, ProjectID: enrollment.ProjectID, Repo: enrollment.Repo,
+			Version: 2, IdempotencyKey: enrollment.IdempotencyKey, ProjectID: enrollment.ProjectID, Repo: enrollment.Repo,
 			IssueNumber: enrollment.IssueNumber, Source: detailSource, Decision: decision,
-			Policy: validateDecision(decision), ConfirmationAfterCommentID: latestCommentID(detail.Comments), CreatedAt: created,
+			Policy: validateDecision(decision), CreatedAt: created,
+		}
+		if value.Policy.Action == ActionAwaitHuman {
+			token, err := newConfirmationToken()
+			if err != nil {
+				return err
+			}
+			value.ConfirmationToken = token
 		}
 		if err := r.persistReport(ctx, value); err != nil {
 			return err
@@ -552,26 +549,13 @@ func (r *Runner) confirmedByHuman(ctx context.Context, repo, cwd string, issue g
 			return true, false, nil
 		}
 	}
-	var reportedAt time.Time
-	if report.ConfirmationAfterCommentID == 0 {
-		reportedAt, err = time.Parse(time.RFC3339Nano, report.CreatedAt)
-		if err != nil {
-			return false, false, fmt.Errorf("parse triage report timestamp: %w", err)
-		}
+	confirmationToken := strings.TrimSpace(report.ConfirmationToken)
+	if confirmationToken == "" {
+		return false, false, fmt.Errorf("triage report %s is missing its confirmation token", report.IdempotencyKey)
 	}
 	for _, comment := range issue.Comments {
-		if strings.TrimSpace(comment.Body) != "/plan" || strings.TrimSpace(comment.Author) == "" {
+		if strings.TrimSpace(comment.Body) != confirmationCommand(confirmationToken) || strings.TrimSpace(comment.Author) == "" {
 			continue
-		}
-		if report.ConfirmationAfterCommentID > 0 {
-			if comment.ID <= report.ConfirmationAfterCommentID {
-				continue
-			}
-		} else {
-			commentedAt, err := time.Parse(time.RFC3339Nano, comment.CreatedAt)
-			if err != nil || commentedAt.Before(reportedAt.Truncate(time.Second)) {
-				continue
-			}
 		}
 		permission, err := r.github.GetRepositoryPermission(ctx, githubinfra.RepositoryPermissionInput{
 			Repo: repo, User: comment.Author, CWD: cwd,
@@ -592,6 +576,18 @@ func (r *Runner) confirmedByHuman(ctx context.Context, repo, cwd string, issue g
 		return true, true, nil
 	}
 	return false, false, nil
+}
+
+func newConfirmationToken() (string, error) {
+	var value [16]byte
+	if _, err := rand.Read(value[:]); err != nil {
+		return "", fmt.Errorf("generate triage confirmation token: %w", err)
+	}
+	return "triage-confirm-" + hex.EncodeToString(value[:]), nil
+}
+
+func confirmationCommand(token string) string {
+	return "/plan " + token
 }
 
 func (r *Runner) sourceIsRecent(source SourceEvent, cutoff time.Time) bool {
