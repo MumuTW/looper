@@ -2803,6 +2803,18 @@ func (r *WorktreesRepository) GetByBranch(ctx context.Context, projectID, branch
 	return &record, nil
 }
 
+func (r *WorktreesRepository) GetByPath(ctx context.Context, worktreePath string) (*WorktreeRecord, error) {
+	row := r.q.QueryRowContext(ctx, `SELECT * FROM worktrees WHERE worktree_path = ? LIMIT 1`, worktreePath)
+	record, err := scanWorktree(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get worktree by path: %w", err)
+	}
+	return &record, nil
+}
+
 func (r *WorktreesRepository) ListByProject(ctx context.Context, projectID string) ([]WorktreeRecord, error) {
 	rows, err := r.q.QueryContext(ctx, `SELECT * FROM worktrees WHERE project_id = ? ORDER BY updated_at DESC`, projectID)
 	if err != nil {

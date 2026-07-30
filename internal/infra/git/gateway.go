@@ -296,7 +296,13 @@ func (g *Gateway) CreateWorktree(ctx context.Context, input CreateWorktreeInput)
 	nowISO := g.now().UTC().Format(javaScriptISOStringLayout)
 	var existingRecord *storage.WorktreeRecord
 	if g.repos != nil {
-		existingRecord, err = g.repos.Worktrees.GetByBranch(ctx, input.ProjectID, input.Branch)
+		existingRecord, err = g.repos.Worktrees.GetByPath(ctx, worktreePath)
+		if err != nil {
+			return storage.WorktreeRecord{}, fmt.Errorf("get existing worktree by path: %w", err)
+		}
+		if existingRecord == nil {
+			existingRecord, err = g.repos.Worktrees.GetByBranch(ctx, input.ProjectID, input.Branch)
+		}
 		if err != nil {
 			return storage.WorktreeRecord{}, fmt.Errorf("get existing worktree by branch: %w", err)
 		}
@@ -370,7 +376,14 @@ func (g *Gateway) RestoreWorktree(ctx context.Context, input RestoreWorktreeInpu
 	checkoutMode := normalizeCheckoutMode(input.CheckoutMode)
 
 	if g.repos != nil {
-		stored, err := g.repos.Worktrees.GetByBranch(ctx, input.ProjectID, input.Branch)
+		var stored *storage.WorktreeRecord
+		var err error
+		if input.ExpectedWorktreePath != "" {
+			stored, err = g.repos.Worktrees.GetByPath(ctx, input.ExpectedWorktreePath)
+		}
+		if stored == nil && err == nil {
+			stored, err = g.repos.Worktrees.GetByBranch(ctx, input.ProjectID, input.Branch)
+		}
 		if err != nil {
 			return nil, fmt.Errorf("get stored worktree by branch: %w", err)
 		}
@@ -480,7 +493,10 @@ func (g *Gateway) RestoreWorktree(ctx context.Context, input RestoreWorktreeInpu
 		CleanedAt:    nil,
 	}
 	if g.repos != nil {
-		existing, err := g.repos.Worktrees.GetByBranch(ctx, input.ProjectID, input.Branch)
+		existing, err := g.repos.Worktrees.GetByPath(ctx, match.Path)
+		if existing == nil && err == nil {
+			existing, err = g.repos.Worktrees.GetByBranch(ctx, input.ProjectID, input.Branch)
+		}
 		if err != nil {
 			return nil, fmt.Errorf("get existing restored worktree by branch: %w", err)
 		}
