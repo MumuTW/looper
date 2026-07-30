@@ -660,33 +660,6 @@ type CapturePullRequestSnapshotInput struct {
 	CapturedAt string
 }
 
-type InitializeLabelsInput struct {
-	Repo   string
-	CWD    string
-	DryRun bool
-}
-
-type LabelInitResult struct {
-	Repo    string           `json:"repo"`
-	DryRun  bool             `json:"dryRun"`
-	Labels  []LabelInitItem  `json:"labels"`
-	Summary LabelInitSummary `json:"summary"`
-}
-
-type LabelInitItem struct {
-	Name        string `json:"name"`
-	Status      string `json:"status"`
-	Color       string `json:"color"`
-	Description string `json:"description"`
-	Error       string `json:"error,omitempty"`
-}
-
-type LabelInitSummary struct {
-	Created int `json:"created"`
-	Skipped int `json:"skipped"`
-	Failed  int `json:"failed"`
-}
-
 type ReviewThreadNotFoundError struct {
 	ThreadID string
 }
@@ -3022,26 +2995,7 @@ func (g *Gateway) DetectCurrentRepository(ctx context.Context, cwd string) (stri
 	return repo, nil
 }
 
-func (g *Gateway) InitializeLabels(ctx context.Context, input InitializeLabelsInput) (LabelInitResult, error) {
-	repo := strings.TrimSpace(input.Repo)
-	if err := validateGitHubRepoSlug(repo); err != nil {
-		return LabelInitResult{}, err
-	}
-	return g.ensureLabels(ctx, repo, input.CWD, labels.Standard(), ensureLabelsOptions{
-		dryRun: input.DryRun,
-		// Provisioning reports a per-label plan, so it keeps going and records
-		// every outcome rather than stopping at the first failure.
-		requireListing: input.DryRun,
-	})
-}
-
-// ensureLabels creates every definition the repository does not already have,
-// and reports what it did.
-//
-// This is the single label-creating path. There used to be two — bulk
-// provisioning and the per-apply check — and each grew the same overwrite
-// defect independently, which is why the same fix had to be written twice.
-// One implementation cannot diverge from itself.
+// ensureLabels creates every definition the repository does not already have.
 //
 // Create-only, always. Looper needs a label to exist; it has no claim on how a
 // maintainer has worded one that already does.
@@ -3050,70 +3004,27 @@ func (g *Gateway) InitializeLabels(ctx context.Context, input InitializeLabelsIn
 // it exists only to skip creates that would fail anyway — so a failed list
 // must not block the caller: nothing is then known to exist, every create is
 // attempted, and one that loses to an existing label is tolerated exactly as a
-// lost race is.
-type ensureLabelsOptions struct {
-	dryRun bool
-	// requireListing makes a failed listing fatal. Tolerating one is only safe
-	// when creates follow: an attempted create corrects a wrong guess about
-	// what exists. A dry run performs none, so its entire output would be that
-	// guess presented as a plan.
-	requireListing bool
-	// stopOnFirstFailure abandons the remaining definitions once the caller's
-	// action is already known to fail. The apply paths want this: continuing
-	// to create labels that will never be applied leaves the repository
-	// changed for an action that did not happen.
-	stopOnFirstFailure bool
-}
-
-func (g *Gateway) ensureLabels(ctx context.Context, repo, cwd string, definitions []labels.Definition, opts ensureLabelsOptions) (LabelInitResult, error) {
-	result := LabelInitResult{Repo: repo, DryRun: opts.dryRun, Labels: make([]LabelInitItem, 0, len(definitions))}
+// lost race is. Any other create failure stops immediately because the caller's
+// label application will not happen.
+func (g *Gateway) ensureLabels(ctx context.Context, repo, cwd string, definitions []labels.Definition) error {
 	if len(definitions) == 0 {
-		return result, nil
+		return nil
 	}
 
 	existing, listErr := g.listRepositoryLabels(ctx, repo, cwd)
 	if listErr != nil {
-		if opts.requireListing {
-			return LabelInitResult{}, listErr
-		}
 		existing = nil
 	}
 
-	var firstFailure error
 	for _, definition := range definitions {
-		item := LabelInitItem{Name: definition.Name, Color: definition.Color, Description: definition.Description}
 		if _, exists := existing[labels.Normalize(definition.Name)]; exists {
-			item.Status = "skipped"
-		} else {
-			item.Status = "created"
-			if !opts.dryRun {
-				if _, createErr := g.runGh(ctx, cwd, "", "label", "create", definition.Name, "--repo", repo, "--color", definition.Color, "--description", definition.Description); createErr != nil {
-					if isLabelAlreadyExistsError(createErr) {
-						item.Status = "skipped"
-					} else {
-						item.Status = "failed"
-						item.Error = createErr.Error()
-						if firstFailure == nil {
-							firstFailure = fmt.Errorf("create label %s: %w", definition.Name, createErr)
-						}
-					}
-				}
-			}
+			continue
 		}
-		result.Labels = append(result.Labels, item)
-		incrementLabelSummary(&result.Summary, item.Status)
-		if firstFailure != nil && opts.stopOnFirstFailure {
-			break
+		if _, err := g.runGh(ctx, cwd, "", "label", "create", definition.Name, "--repo", repo, "--color", definition.Color, "--description", definition.Description); err != nil && !isLabelAlreadyExistsError(err) {
+			return fmt.Errorf("create label %s: %w", definition.Name, err)
 		}
 	}
-
-	// Return the underlying failure rather than a count. A caller applying a
-	// label needs to know it hit a 403, not that one mutation failed; the
-	// per-item errors on the result still carry the rest.
-	if firstFailure != nil {
-		return result, firstFailure
-	}
-	return result, nil
+	return nil
 }
 
 func (g *Gateway) CapturePullRequestSnapshot(ctx context.Context, input CapturePullRequestSnapshotInput) (storage.PullRequestSnapshotRecord, error) {
@@ -3454,8 +3365,7 @@ func (g *Gateway) ensureLabelsExist(ctx context.Context, repo string, wanted []s
 		seen[normalized] = struct{}{}
 		definitions = append(definitions, labelPresentation(label))
 	}
-	_, err := g.ensureLabels(ctx, repo, cwd, definitions, ensureLabelsOptions{stopOnFirstFailure: true})
-	return err
+	return g.ensureLabels(ctx, repo, cwd, definitions)
 }
 
 // isLabelAlreadyExistsError reports whether a `gh label create` failure is the
@@ -3853,17 +3763,6 @@ func extractIssueRepository(value any) IssueRepository {
 
 func normalizeLabelColor(value string) string {
 	return strings.TrimPrefix(strings.ToLower(strings.TrimSpace(value)), "#")
-}
-
-func incrementLabelSummary(summary *LabelInitSummary, status string) {
-	switch status {
-	case "created":
-		summary.Created++
-	case "skipped":
-		summary.Skipped++
-	case "failed":
-		summary.Failed++
-	}
 }
 
 func decodeJSONObject(value string) (map[string]any, error) {
