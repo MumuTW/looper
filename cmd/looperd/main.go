@@ -164,6 +164,7 @@ func startRuntimeWithAPI(ctx context.Context, deps bootstrap.RuntimeDependencies
 		TriggerSchedulerTick: func() {
 			rt.TriggerSchedulerTick()
 		},
+		LookupPullRequest: looperdapi.NewGatewayPullRequestLookup(deps.Config, time.Now),
 	})
 	root := looperdapi.NewRootHandler(apiHandler, dashboard.Handler())
 	server := looperdapi.NewServer(deps.Config, root, deps.Logger)

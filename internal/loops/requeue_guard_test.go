@@ -1,6 +1,8 @@
 package loops
 
 import (
+	"fmt"
+	"sync"
 	"testing"
 
 	"github.com/nexu-io/looper/internal/domain"
@@ -47,4 +49,87 @@ func TestLoopTargetGuardKeyOmitsTypeForPullRequest(t *testing.T) {
 	if got := LoopTargetGuardKey("proj", "worker", "project", "project:proj"); got != "" {
 		t.Fatalf("project worker key = %q, want empty (concurrent workers)", got)
 	}
+}
+
+func TestGuardRegistryReclaimsEntriesAfterChurn(t *testing.T) {
+	t.Parallel()
+
+	registry := newGuardRegistry()
+	for i := 0; i < 5000; i++ {
+		release := registry.lock(fmt.Sprintf("loop_churn_%d", i))
+		release()
+	}
+
+	if got := registry.size(); got != 0 {
+		t.Fatalf("registry.size() = %d after churn, want 0", got)
+	}
+}
+
+func TestGuardRegistryMutualExclusionSurvivesReclamation(t *testing.T) {
+	t.Parallel()
+
+	registry := newGuardRegistry()
+	const goroutines = 8
+	const iterations = 200
+	counter := 0
+	var wg sync.WaitGroup
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				release := registry.lock("loop_contended")
+				counter++
+				release()
+			}
+		}()
+	}
+	wg.Wait()
+
+	if counter != goroutines*iterations {
+		t.Fatalf("counter = %d, want %d: mutual exclusion violated across reclaim/recreate", counter, goroutines*iterations)
+	}
+	if got := registry.size(); got != 0 {
+		t.Fatalf("registry.size() = %d after contention, want 0", got)
+	}
+}
+
+func TestGuardRegistryReleaseIsIdempotent(t *testing.T) {
+	t.Parallel()
+
+	registry := newGuardRegistry()
+	release := registry.lock("loop_idempotent")
+	release()
+	release()
+
+	// The key must be lockable again after double release.
+	again := registry.lock("loop_idempotent")
+	again()
+	if got := registry.size(); got != 0 {
+		t.Fatalf("registry.size() = %d, want 0", got)
+	}
+}
+
+func TestLockLoopRequeueAndTargetStillSerialize(t *testing.T) {
+	t.Parallel()
+
+	// Public wrappers over the reclaiming registry keep their contract: the
+	// same key excludes concurrent holders, and empty target keys are no-ops.
+	release := LockLoopRequeue("loop_public_api")
+	locked := make(chan struct{})
+	go func() {
+		inner := LockLoopRequeue("loop_public_api")
+		close(locked)
+		inner()
+	}()
+	select {
+	case <-locked:
+		t.Fatal("second LockLoopRequeue acquired while first still held")
+	default:
+	}
+	release()
+	<-locked
+
+	noop := LockLoopTarget("  ")
+	noop()
 }

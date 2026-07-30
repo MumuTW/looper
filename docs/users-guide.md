@@ -383,6 +383,18 @@ curl -sS -X POST "http://127.0.0.1:17310/api/v1/workers" \
   -d '{"projectId":"<project-id>","title":"Implement the cache layer","specPath":"specs/2026-04-17-cache/spec.md"}'
 ```
 
+### Hand an existing PR to worker
+
+```bash
+curl -sS -X POST "http://127.0.0.1:17310/api/v1/workers" \
+  -H 'Content-Type: application/json' \
+  -d '{"projectId":"<project-id>","prNumber":42}'
+```
+
+Worker adopts the PR's head branch and pushes to it rather than opening a new PR. It needs a spec path to work from: normally the one written into the PR body, but you can pass `specPath` alongside `prNumber` when the body carries no spec marker.
+
+The PR does not have to have been discovered or reviewed first — if the daemon has no snapshot of it, it reads the PR from the forge. Merged and closed PRs are refused. The loop takes the same per-PR lock as reviewer and fixer, so it queues behind any run already working that PR instead of racing it.
+
 ### What happens when worker takes over a `spec-ready` PR
 
 When worker starts against a PR target, it first removes:
