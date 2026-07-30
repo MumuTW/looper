@@ -2,8 +2,6 @@ package projects
 
 import (
 	"context"
-	"errors"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -181,79 +179,60 @@ func TestServiceDiscoverProjectSerializesSameProjectRetries(t *testing.T) {
 	}
 }
 
-func TestServiceDiscoverProjectRetriesListFailures(t *testing.T) {
-	tests := []struct {
-		name            string
-		fail            func() error
-		wantWorktrees   int
-		wantPullRequest int
-	}{
-		{name: "worktree list", fail: func() error { return errors.New("git worktree failed") }, wantPullRequest: 1},
-		{name: "pull request list", fail: func() error { return errors.New("gh pr list failed") }, wantWorktrees: 1},
+func TestServiceProjectOperationLocksAreEvictedAfterUse(t *testing.T) {
+	service := &Service{}
+	for _, id := range []string{"missing-a", "missing-b", "missing-c"} {
+		unlock, err := service.lockProjectOperations(context.Background(), id)
+		if err != nil {
+			t.Fatalf("lockProjectOperations(%q) error = %v", id, err)
+		}
+		unlock()
 	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			coordinator := openCoordinator(t)
-			repos := storage.NewRepositories(coordinator.DB())
-			shouldFail := true
-			service := &Service{
-				DB:                coordinator.DB(),
-				Repos:             repos,
-				ScheduleDiscovery: func(func()) {},
-				ListWorktrees: func(context.Context, string) ([]WorktreeListEntry, error) {
-					if test.name == "worktree list" && shouldFail {
-						return nil, test.fail()
-					}
-					return []WorktreeListEntry{{Path: "/tmp/looper", Branch: "main", HeadSHA: "abc123"}}, nil
-				},
-				ListOpenPullRequests: func(context.Context, ListOpenPullRequestsInput) ([]PullRequestSummary, error) {
-					if test.name == "pull request list" && shouldFail {
-						return nil, test.fail()
-					}
-					return []PullRequestSummary{{Number: 1, State: "OPEN"}}, nil
-				},
-			}
-			repo := "acme/looper"
-			if _, err := service.AddProject(context.Background(), AddInput{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper", BaseBranch: "main", Repo: &repo}); err != nil {
-				t.Fatalf("AddProject() error = %v", err)
-			}
+	service.projectLocksMu.Lock()
+	defer service.projectLocksMu.Unlock()
+	if len(service.projectLocks) != 0 {
+		t.Fatalf("projectLocks retained %d entries after release", len(service.projectLocks))
+	}
+}
 
-			failed, err := service.DiscoverProject(context.Background(), DiscoverInput{ProjectID: "looper"})
-			if err == nil || !strings.Contains(err.Error(), test.fail().Error()) {
-				t.Fatalf("DiscoverProject() error = %v, want %q", err, test.fail())
-			}
-			if failed.Discovery.Status != DiscoveryStatusFailed || !strings.Contains(failed.Discovery.Error, test.fail().Error()) {
-				t.Fatalf("failed discovery = %#v, want failed state with %q", failed.Discovery, test.fail())
-			}
-			if failed.Discovery.DiscoveredWorktrees != test.wantWorktrees || failed.Discovery.DiscoveredPullRequests != test.wantPullRequest {
-				t.Fatalf("failed discovery counts = %#v, want worktrees=%d pullRequests=%d", failed.Discovery, test.wantWorktrees, test.wantPullRequest)
-			}
-			if len(failed.Discovery.Warnings) != 1 || !strings.Contains(failed.Discovery.Warnings[0], test.fail().Error()) {
-				t.Fatalf("failed discovery warnings = %#v, want command warning with %q", failed.Discovery.Warnings, test.fail())
-			}
-			stored, err := repos.Projects.GetByID(context.Background(), "looper")
-			if err != nil || stored == nil {
-				t.Fatalf("Projects.GetByID() = (%#v, %v), want stored project", stored, err)
-			}
-			if got := DiscoveryStateFromRecord(*stored); got.Status != DiscoveryStatusFailed || !strings.Contains(got.Error, test.fail().Error()) {
-				t.Fatalf("persisted discovery = %#v, want failed state with %q", got, test.fail())
-			}
-
-			shouldFail = false
-			retried, err := service.DiscoverProject(context.Background(), DiscoverInput{ProjectID: "looper"})
-			if err != nil {
-				t.Fatalf("DiscoverProject() retry error = %v", err)
-			}
-			if retried.Discovery.Status != DiscoveryStatusSucceeded {
-				t.Fatalf("retry discovery = %#v, want succeeded", retried.Discovery)
-			}
-			stored, err = repos.Projects.GetByID(context.Background(), "looper")
-			if err != nil || stored == nil {
-				t.Fatalf("Projects.GetByID() after retry = (%#v, %v), want stored project", stored, err)
-			}
-			if got := DiscoveryStateFromRecord(*stored); got.Status != DiscoveryStatusSucceeded {
-				t.Fatalf("persisted retry discovery = %#v, want succeeded", got)
-			}
-		})
+func TestServiceResumeIncompleteDiscoveriesReschedulesPersistedWork(t *testing.T) {
+	coordinator := openCoordinator(t)
+	repos := storage.NewRepositories(coordinator.DB())
+	nowISO := "2026-07-30T00:00:00.000Z"
+	runningMetadata := `{"registrationDiscovery":{"status":"running","snapshotMode":"full"}}`
+	pendingMetadata := `{"registrationDiscovery":{"status":"pending","snapshotMode":"off"}}`
+	succeededMetadata := `{"registrationDiscovery":{"status":"succeeded","snapshotMode":"off"}}`
+	for _, record := range []storage.ProjectRecord{
+		{ID: "running", MetadataJSON: &runningMetadata, CreatedAt: nowISO, UpdatedAt: nowISO},
+		{ID: "pending", MetadataJSON: &pendingMetadata, CreatedAt: nowISO, UpdatedAt: nowISO},
+		{ID: "succeeded", MetadataJSON: &succeededMetadata, CreatedAt: nowISO, UpdatedAt: nowISO},
+		{ID: "archived", Archived: true, MetadataJSON: &runningMetadata, CreatedAt: nowISO, UpdatedAt: nowISO},
+	} {
+		if err := repos.Projects.Upsert(context.Background(), record); err != nil {
+			t.Fatalf("Projects.Upsert(%q) error = %v", record.ID, err)
+		}
+	}
+	scheduled := 0
+	service := &Service{
+		Repos: repos,
+		ScheduleDiscovery: func(run func()) {
+			scheduled++
+			run()
+		},
+		ListWorktrees: func(context.Context, string) ([]WorktreeListEntry, error) { return nil, nil },
+	}
+	if err := service.ResumeIncompleteDiscoveries(context.Background()); err != nil {
+		t.Fatalf("ResumeIncompleteDiscoveries() error = %v", err)
+	}
+	if scheduled != 1 {
+		t.Fatalf("scheduled = %d, want one bounded job for the persisted discovery backlog", scheduled)
+	}
+	stored, err := repos.Projects.GetByID(context.Background(), "running")
+	if err != nil || stored == nil {
+		t.Fatalf("Projects.GetByID(running) = (%#v, %v)", stored, err)
+	}
+	discovery := DiscoveryStateFromRecord(*stored)
+	if discovery.Status != DiscoveryStatusSucceeded || discovery.SnapshotMode != SnapshotModeFull {
+		t.Fatalf("resumed discovery = %#v, want succeeded full discovery", discovery)
 	}
 }

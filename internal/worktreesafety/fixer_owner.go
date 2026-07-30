@@ -127,17 +127,9 @@ func resolveWorktreePrivateGitDir(worktreePath string, createMissing bool) (stri
 	if err != nil {
 		return "", err
 	}
-	line := strings.TrimSpace(string(data))
-	const prefix = "gitdir:"
-	if len(line) < len(prefix) || !strings.EqualFold(line[:len(prefix)], prefix) {
+	gitdir, ok := parseGitdirPointer(worktreePath, data)
+	if !ok {
 		return "", fmt.Errorf("worktree %s: .git is not a directory or gitdir pointer", worktreePath)
-	}
-	gitdir := strings.TrimSpace(line[len(prefix):])
-	if gitdir == "" {
-		return "", fmt.Errorf("worktree %s: empty gitdir pointer", worktreePath)
-	}
-	if !filepath.IsAbs(gitdir) {
-		gitdir = filepath.Join(worktreePath, gitdir)
 	}
 	return gitdir, nil
 }

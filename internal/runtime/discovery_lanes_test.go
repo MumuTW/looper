@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/forge"
 	"github.com/nexu-io/looper/internal/triager"
 )
 
@@ -21,12 +22,18 @@ func TestDiscoveryLanesRegisterTriagerAheadOfPlannerWithoutChangingFixerSupport(
 	if positions["triager"] >= positions[config.CodingRolePlanner] {
 		t.Fatalf("lane positions = %#v, want triager before planner", positions)
 	}
-	if byName["triager"].Supported(config.ProviderKindGitHub) != true ||
-		byName["triager"].Supported(config.ProviderKindForgejo) != false {
+	githubCapabilities, _ := forge.StaticCapabilities(forge.ProviderKindGitHub)
+	forgejoCapabilities, _ := forge.StaticCapabilities(forge.ProviderKindForgejo)
+	planeCapabilities, _ := forge.StaticCapabilities(forge.ProviderKindPlane)
+	if byName["triager"].Supported(githubCapabilities) != true ||
+		byName["triager"].Supported(forgejoCapabilities) != false {
 		t.Fatal("triager must accept GitHub issues only")
 	}
-	if !byName[config.CodingRoleFixer].Supported(config.ProviderKindForgejo) {
+	if !byName[config.CodingRoleFixer].Supported(forgejoCapabilities) {
 		t.Fatal("triager registration changed fixer Forgejo discovery support")
+	}
+	if !byName["coordinator"].Supported(githubCapabilities) || byName["coordinator"].Supported(forgejoCapabilities) || byName["coordinator"].Supported(planeCapabilities) {
+		t.Fatal("coordinator must run only where GitHub owns issue authority")
 	}
 }
 
@@ -43,6 +50,27 @@ func TestTriagerLaneSharesOneDecisionBudgetAcrossProjects(t *testing.T) {
 	if len(runner.budgets) != 2 || runner.budgets[0] != 1 || runner.budgets[1] != 0 {
 		t.Fatalf("decision budgets = %v, want [1 0]", runner.budgets)
 	}
+}
+
+func TestDiscoveryLanesOrderFromCanonicalRegistryPriority(t *testing.T) {
+	t.Parallel()
+	priority := 1
+	cfg, err := config.Normalize(t.TempDir(), config.PartialConfig{Roles: &config.PartialRoleConfigs{Coding: map[string]config.PartialCodingRoleConfig{
+		config.CodingRoleWorker: {Priority: &priority},
+	}}})
+	if err != nil {
+		t.Fatalf("Normalize() error = %v", err)
+	}
+	lanes := discoveryLanes(defaultSchedulerTickInput{Config: &cfg})
+	for _, lane := range lanes {
+		if lane.Name == config.CodingRoleWorker {
+			if lane.Priority != 1 {
+				t.Fatalf("worker lane priority = %d, want canonical registry priority", lane.Priority)
+			}
+			return
+		}
+	}
+	t.Fatal("worker discovery lane missing")
 }
 
 type budgetTriager struct{ budgets []int }

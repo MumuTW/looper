@@ -19,6 +19,7 @@ import (
 	"github.com/nexu-io/looper/internal/bootstrap"
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/domain"
+	"github.com/nexu-io/looper/internal/forge"
 	gitinfra "github.com/nexu-io/looper/internal/infra/git"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/specpr"
@@ -192,6 +193,7 @@ type Runtime struct {
 	worktreeCleanupInitialDelay time.Duration
 	worktreeCleanupStatus       WorktreeCleanupStatus
 	projectDiscovery            *projectDiscoveryRunner
+	resumeProjectDiscoveries    func(context.Context, *projects.Service) error
 	recoveryCancel              context.CancelFunc
 	recoveryDone                chan struct{}
 	activeExecutions            *ActiveExecutionRegistry
@@ -862,17 +864,12 @@ func (r *Runtime) start(ctx context.Context) error {
 	}
 
 	started := false
+	resourcesPublished := false
 	defer func() {
-		if !started {
+		if !started && !resourcesPublished {
+			r.stopProjectDiscovery()
 			if lock != nil {
 				_ = lock.Release()
-			}
-			r.mu.Lock()
-			forwarder := r.webhookForwarder
-			r.webhookForwarder = nil
-			r.mu.Unlock()
-			if forwarder != nil {
-				forwarder.Close()
 			}
 			_ = coordinator.Close()
 		}
@@ -902,7 +899,7 @@ func (r *Runtime) start(ctx context.Context) error {
 		ConfigBoundary: &r.configBoundary,
 		Now:            r.now,
 		DetectRepo: func(ctx context.Context, repoPath string) (projects.DetectedRepo, error) {
-			return detectProjectRepo(ctx, gitGateway, r.projectCatalog.Snapshot(), repoPath)
+			return detectProjectRepo(ctx, gitGateway, r.projectCatalog.View(), repoPath)
 		},
 		GetRepositorySettings: func(ctx context.Context, input githubinfra.RepositorySettingsInput) (githubinfra.RepositorySettings, error) {
 			if githubGateway == nil {
@@ -1005,6 +1002,7 @@ func (r *Runtime) start(ctx context.Context) error {
 	r.webhookDaemonLock = lock
 	r.schedulerDisabled = schedulerDisabled
 	r.mu.Unlock()
+	resourcesPublished = true
 
 	if r.deferRecovery {
 		if r.networkManager != nil {
@@ -1031,6 +1029,7 @@ func (r *Runtime) CompleteStartup(ctx context.Context) error {
 		}
 		startedAt := r.startedAt
 		repositories := r.services.Repositories
+		projectService := r.services.Projects
 		githubGateway := r.githubGateway
 		schedulerDisabled := r.schedulerDisabled
 		r.mu.RUnlock()
@@ -1092,6 +1091,22 @@ func (r *Runtime) CompleteStartup(ctx context.Context) error {
 			r.startupReadyErr = err
 			return
 		}
+		// Persisted discovery is runtime-owned work. Launch it only after
+		// dependency validation, recovery, ownership, producer assembly, and
+		// admission readiness have all succeeded.
+		if projectService != nil {
+			resume := r.resumeProjectDiscoveries
+			if resume == nil {
+				resume = func(ctx context.Context, service *projects.Service) error {
+					return service.ResumeIncompleteDiscoveries(ctx)
+				}
+			}
+			if err := resume(ctx, projectService); err != nil {
+				_ = r.MarkDegraded("resume incomplete project discovery: " + err.Error())
+				r.startupReadyErr = err
+				return
+			}
+		}
 		// Deferred reviewer recovery requeues failed loops without the scheduler
 		// claim path; start it only after admission is ready, and only while
 		// admission remains ready (startDeferredReviewerRecovery rechecks under
@@ -1117,6 +1132,12 @@ func (r *Runtime) CompleteStartup(ctx context.Context) error {
 		}
 	})
 
+	if r.startupReadyErr != nil {
+		// CompleteStartup owns every producer it starts. Roll back through the
+		// normal shutdown path so callers never receive an error while scheduler,
+		// cleanup, reload, webhook, or network resources remain live.
+		r.Stop("runtime startup failed: " + r.startupReadyErr.Error())
+	}
 	return r.startupReadyErr
 }
 
@@ -1206,25 +1227,13 @@ func asyncSnapshotQueueEnabled(customSchedulerTick bool, cfg config.Config) bool
 }
 
 func runtimeConfigHasGitHubProjects(cfg config.Config) bool {
+	providers := forge.NewResolver(cfg)
 	for _, project := range cfg.Projects {
-		switch config.ResolvedProjectProviderKind(cfg, project) {
-		case config.ProviderKindGitHub:
-			return true
-		case config.ProviderKindPlane:
-			// Plane is a task-source only: its pull requests live on the
-			// project's GitHub code repo, so the GitHub gateway is required.
+		if providers.ForProject(project.ID).Capabilities().GitHubPullRequests {
 			return true
 		}
 	}
 	return len(cfg.Projects) == 0
-}
-
-func runtimeProjectProviderKind(cfg config.Config, projectID string) config.ProviderKind {
-	project, ok := runtimeProjectBinding(cfg, projectID)
-	if ok {
-		return config.ResolvedProjectProviderKind(cfg, project)
-	}
-	return config.ProviderKindGitHub
 }
 
 func runtimeProjectBinding(cfg config.Config, projectID string) (config.ProjectRefConfig, bool) {
@@ -1236,7 +1245,7 @@ func runtimeProjectBinding(cfg config.Config, projectID string) (config.ProjectR
 	return config.ProjectRefConfig{}, false
 }
 
-func detectProjectRepo(ctx context.Context, gitGateway *gitinfra.Gateway, cfg config.Config, repoPath string) (projects.DetectedRepo, error) {
+func detectProjectRepo(ctx context.Context, gitGateway *gitinfra.Gateway, view projects.OperationView, repoPath string) (projects.DetectedRepo, error) {
 	if gitGateway == nil {
 		return projects.DetectedRepo{}, fmt.Errorf("git gateway is not configured")
 	}
@@ -1247,8 +1256,8 @@ func detectProjectRepo(ctx context.Context, gitGateway *gitinfra.Gateway, cfg co
 	if strings.TrimSpace(remote.Repo) == "" {
 		return projects.DetectedRepo{}, nil
 	}
-	if provider, ok := config.MatchForgejoProviderByRemoteHost(cfg, remote.Host); ok {
-		return projects.DetectedRepo{Repo: remote.Repo, Provider: provider.ID}, nil
+	if provider, ok := view.ProviderByRemoteHost(remote.Host); ok {
+		return projects.DetectedRepo{Repo: remote.Repo, Provider: provider.Provider.ID}, nil
 	}
 	if remote.Host == "github.com" || strings.HasSuffix(remote.Host, ".github.com") {
 		return projects.DetectedRepo{Repo: remote.Repo}, nil
@@ -3462,9 +3471,14 @@ type runtimeReviewerRecoveryPolicy struct {
 }
 
 func (r *Runtime) reviewerRecoveryPolicyForProject(projectID string) runtimeReviewerRecoveryPolicy {
-	roles := config.ProjectRoleConfigs(r.Config(), projectID)
+	cfg := r.Config()
+	roles := config.ProjectRoleConfigs(cfg, projectID)
+	includeDrafts := roles.Reviewer.Discovery.Triggers.IncludeDrafts
+	if reviewerRole, ok := config.ProjectCodingRoleConfig(cfg, projectID, config.CodingRoleReviewer); ok {
+		includeDrafts = reviewerRole.Discovery.IncludeDrafts
+	}
 	return runtimeReviewerRecoveryPolicy{
-		includeDrafts:    roles.Reviewer.Discovery.Triggers.IncludeDrafts,
+		includeDrafts:    includeDrafts,
 		stopOnApproved:   roles.Reviewer.Behavior.Loop.StopOnApproved,
 		stopOnReadyLabel: roles.Reviewer.Behavior.Loop.StopOnReadyLabel,
 		retry:            config.NormalizeReviewerRetryConfig(roles.Reviewer.Behavior.Retry),

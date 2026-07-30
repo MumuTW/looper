@@ -2,6 +2,7 @@ package config
 
 import (
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -58,15 +59,11 @@ type RoleDiscoveryConfig struct {
 	EnableSelfReview     bool         `json:"enableSelfReview,omitempty"`
 }
 
-// CodingRoleConfig is the per-role configuration consumed by the discovery
-// registry. Agent-free policy roles such as Gatekeeper leave Agent and
-// Instructions empty.
-//
-// Behaviour that only one role's runner implements (reviewer auto-merge,
-// publish mode, spec-review labels) deliberately stays out of this struct:
-// it belongs to that runner's own config section. Putting it here would
-// imply a custom role could switch it on, which no amount of configuration
-// can make true.
+// CodingRoleConfig is the per-role configuration consumed by the canonical
+// registry. It is deliberately limited to behavior shared by the compiled
+// planner, worker, reviewer, and fixer runners. Runner-specific behavior
+// (reviewer auto-merge, publish mode, spec-review labels) stays in that
+// runner's named section.
 type CodingRoleConfig struct {
 	Discovery    RoleDiscoveryConfig `json:"discovery"`
 	Instructions string              `json:"instructions,omitempty"`
@@ -79,24 +76,13 @@ type CodingRoleConfig struct {
 	// instead of inheriting whatever order a map happened to produce.
 	//
 	// The zero value is not a safe default: it sorts ahead of every shipped
-	// role, so an unset Priority silently claims the most consequential
-	// position in the tick. Every construction path fills it today
-	// (CodingRolesFromLegacy), which is what keeps that unreachable. Whoever
-	// makes roles authorable from TOML has to close it — reject an unset
-	// priority, or default it to the tail — before an omitted field can mean
-	// "run first".
+	// role, so validation requires a positive priority.
 	Priority int `json:"priority"`
 }
 
-// Lane priorities for the roles looper ships with. These are the only lane
-// priorities in play: roles cannot yet be authored from configuration (see
-// RoleConfigs.Coding), and a role name with no compiled-in discoverer is
-// skipped, so the set below is closed. Spaced by 10 so reordering means
-// editing one constant rather than renumbering the block.
-//
-// Internal Triager and Coordinator are listed here to keep the whole tick
-// order readable in one place, but they do not travel through
-// CodingRoleConfig.Priority: their internal lanes apply these values directly.
+// Lane priorities for the roles looper ships with. `roles.coding.<name>` may
+// change a runner-backed role's priority. Triager and Coordinator are
+// internal lanes, not coding-role registry entries.
 const (
 	PriorityTriager     = 5
 	PriorityPlanner     = 10
@@ -107,14 +93,8 @@ const (
 	PriorityWorker      = 50
 )
 
-// EffectiveCodingRoles returns the role map, projecting it from the legacy
-// named fields when it is empty.
-//
-// Normalize populates the map, but a Config assembled directly — tests, and
-// any caller that builds the struct rather than loading a file — would
-// otherwise present zero roles, which reads as "discovery is off" instead of
-// "this config never went through normalization". Silently running no lanes
-// is a far worse failure than projecting on demand.
+// EffectiveCodingRoles returns the canonical role map, projecting legacy
+// fields only for Config values assembled directly without Normalize.
 func EffectiveCodingRoles(roles RoleConfigs) map[string]CodingRoleConfig {
 	if len(roles.Coding) > 0 {
 		return roles.Coding
@@ -147,13 +127,10 @@ func NormalizeRoleName(raw string) string {
 	return strings.ToLower(strings.TrimSpace(raw))
 }
 
-// CodingRolesFromLegacy projects the four named legacy role structs onto the
-// role map. It is the single bridge between the old shape and the new one:
-// while both exist, normalization calls this so cfg.Roles.Coding is populated
-// for the consumers that have already moved onto it. That is currently the
-// discovery-lane builder alone, which reads role names and Priority; every
-// other consumer still reads the named fields, so the projection is a
-// migration step and not yet the authority.
+// CodingRolesFromLegacy projects the named role structs onto the canonical
+// registry. Normalize applies TOML-authored roles.coding.* fields afterwards;
+// the registry, not the legacy fields, is then consumed by discovery, agent
+// resolution, and custom instructions.
 func CodingRolesFromLegacy(roles RoleConfigs) map[string]CodingRoleConfig {
 	out := make(map[string]CodingRoleConfig, 5)
 
@@ -214,41 +191,398 @@ func CodingRolesFromLegacy(roles RoleConfigs) map[string]CodingRoleConfig {
 		},
 	}
 
-	out[RoleGatekeeper] = CodingRoleConfig{
+	out[RoleGatekeeper] = compiledGatekeeperRole()
+
+	return out
+}
+
+func compiledGatekeeperRole() CodingRoleConfig {
+	return CodingRoleConfig{
 		Priority: PriorityGatekeeper,
 		Discovery: RoleDiscoveryConfig{
 			Enabled:       true,
 			Source:        WorkSourcePullRequest,
 			Labels:        []string{},
+			LabelMode:     LabelModeAll,
 			IncludeDrafts: true,
 		},
 	}
+}
 
-	return out
+// CodingRoleSource identifies the fixed work source implemented by each
+// compiled agent runner. A schema entry cannot choose a different source:
+// that would leave configuration without a compatible runner.
+func CodingRoleSource(name string) (WorkSource, bool) {
+	switch name {
+	case CodingRolePlanner, CodingRoleWorker:
+		return WorkSourceIssue, true
+	case CodingRoleReviewer, CodingRoleFixer:
+		return WorkSourcePullRequest, true
+	default:
+		return "", false
+	}
 }
 
 // ValidateRoleDiscovery reports every field set on d that does not apply to
-// d.Source, plus an unknown-source error. Returning the offending field names
-// (rather than a bare "invalid config") is the point: a field that silently
-// does nothing is the failure mode this model exists to remove.
-func ValidateRoleDiscovery(role string, d RoleDiscoveryConfig) []string {
-	var issues []string
+// d.Source, plus an unknown-source error. pathPrefix is the config path of
+// the owning role section (for example "roles.coding.auditor"), so each
+// issue points at the exact key to fix. Reporting the offending field (rather
+// than a bare "invalid config") is the point: a field that silently does
+// nothing is the failure mode this model exists to remove.
+func ValidateRoleDiscovery(pathPrefix string, d RoleDiscoveryConfig) []ValidationIssue {
+	var issues []ValidationIssue
 	switch d.Source {
 	case WorkSourceIssue:
 		for _, field := range prOnlyDiscoveryFieldsSet(d) {
-			issues = append(issues, "roles."+role+".discovery."+field+
-				` does not apply to source "issue"`)
+			issues = append(issues, ValidationIssue{
+				Path:    pathPrefix + ".discovery." + field,
+				Message: `does not apply to source "issue"`,
+			})
 		}
 	case WorkSourcePullRequest:
 		for _, field := range issueOnlyDiscoveryFieldsSet(d) {
-			issues = append(issues, "roles."+role+".discovery."+field+
-				` does not apply to source "pull_request"`)
+			issues = append(issues, ValidationIssue{
+				Path:    pathPrefix + ".discovery." + field,
+				Message: `does not apply to source "pull_request"`,
+			})
 		}
 	default:
-		issues = append(issues, "roles."+role+
-			`.discovery.source must be "issue" or "pull_request"`)
+		issues = append(issues, ValidationIssue{
+			Path:    pathPrefix + ".discovery.source",
+			Message: `must be "issue" or "pull_request"`,
+		})
 	}
 	return issues
+}
+
+// collectAuthoredCodingRoles merges each layer's shared legacy role fields
+// followed by its roles.coding map. This gives roles.coding.* precedence over
+// the named form in the same layer while preserving the normal file -> env ->
+// CLI precedence across layers. The second result records instruction values
+// still authored by roles.coding after that merge, so Normalize can retain its
+// early safety validation without treating an overridden legacy instruction as
+// a coding-section error. Keys are normalized with NormalizeRoleName; an empty
+// key is a load-time error rather than a role no one can address.
+func collectAuthoredCodingRoles(partials ...PartialConfig) (map[string]PartialCodingRoleConfig, map[string]struct{}, map[string]bool, []ValidationIssue) {
+	var authored map[string]PartialCodingRoleConfig
+	var authoredInstructions map[string]struct{}
+	var codingModelCanonical map[string]bool
+	var issues []ValidationIssue
+	for _, partial := range partials {
+		if partial.Roles == nil {
+			continue
+		}
+		legacy := legacyCodingRoleOverrides(*partial.Roles)
+		for _, name := range sortedKeys(legacy) {
+			if authored == nil {
+				authored = make(map[string]PartialCodingRoleConfig)
+			}
+			authored[name] = mergePartialCodingRoleConfig(authored[name], legacy[name])
+			if legacy[name].Agent != nil && legacy[name].Agent.Model != nil {
+				if codingModelCanonical == nil {
+					codingModelCanonical = make(map[string]bool)
+				}
+				codingModelCanonical[name] = false
+			}
+			if legacy[name].Instructions != nil {
+				delete(authoredInstructions, name)
+			}
+		}
+		// A map can contain keys that become the same canonical role name
+		// (for example Auditor and auditor). Iterating and merging those keys
+		// would make the winning value depend on Go's randomized map order.
+		// Reject the ambiguous layer instead, and iterate sorted keys so both
+		// diagnostics and valid merges are deterministic.
+		seenInLayer := make(map[string]string, len(partial.Roles.Coding))
+		for _, rawName := range sortedKeys(partial.Roles.Coding) {
+			role := partial.Roles.Coding[rawName]
+			name := NormalizeRoleName(rawName)
+			if name == "" {
+				issues = append(issues, ValidationIssue{
+					Path:    "roles.coding",
+					Message: "role name must be a non-empty string",
+				})
+				continue
+			}
+			if previous, duplicate := seenInLayer[name]; duplicate && previous != rawName {
+				issues = append(issues, ValidationIssue{
+					Path:    "roles.coding." + name,
+					Message: "role name is ambiguous after case-folding and trimming: " + previous + " and " + rawName,
+				})
+				continue
+			}
+			seenInLayer[name] = rawName
+			if authored == nil {
+				authored = make(map[string]PartialCodingRoleConfig)
+			}
+			authored[name] = mergePartialCodingRoleConfig(authored[name], role)
+			if role.Agent != nil && role.Agent.Model != nil {
+				if codingModelCanonical == nil {
+					codingModelCanonical = make(map[string]bool)
+				}
+				codingModelCanonical[name] = true
+			}
+			if role.Instructions != nil {
+				if authoredInstructions == nil {
+					authoredInstructions = make(map[string]struct{})
+				}
+				authoredInstructions[name] = struct{}{}
+			}
+		}
+	}
+	return authored, authoredInstructions, codingModelCanonical, issues
+}
+
+func mergePartialCodingRoleConfig(base, overlay PartialCodingRoleConfig) PartialCodingRoleConfig {
+	if overlay.Priority != nil {
+		base.Priority = overlay.Priority
+	}
+	if overlay.Instructions != nil {
+		base.Instructions = overlay.Instructions
+	}
+	if overlay.Agent != nil {
+		if base.Agent == nil {
+			base.Agent = &RoleAgentConfig{}
+		}
+		if overlay.Agent.Profile != nil {
+			base.Agent.Profile = overlay.Agent.Profile
+		}
+		if overlay.Agent.Vendor != nil {
+			base.Agent.Vendor = overlay.Agent.Vendor
+		}
+		if overlay.Agent.Model != nil {
+			base.Agent.Model = overlay.Agent.Model
+		}
+	}
+	if overlay.Discovery != nil {
+		base.Discovery = mergePartialRoleDiscoveryConfig(base.Discovery, overlay.Discovery)
+	}
+	return base
+}
+
+func mergePartialRoleDiscoveryConfig(base, overlay *PartialRoleDiscoveryConfig) *PartialRoleDiscoveryConfig {
+	if base == nil {
+		base = &PartialRoleDiscoveryConfig{}
+	}
+	if overlay.Enabled != nil {
+		base.Enabled = overlay.Enabled
+	}
+	if overlay.Source != nil {
+		base.Source = overlay.Source
+	}
+	if overlay.Labels != nil {
+		base.Labels = overlay.Labels
+	}
+	if overlay.LabelMode != nil {
+		base.LabelMode = overlay.LabelMode
+	}
+	if overlay.RequireAssigneeCurrentUser != nil {
+		base.RequireAssigneeCurrentUser = overlay.RequireAssigneeCurrentUser
+	}
+	if overlay.PlaneAssigneeID != nil {
+		base.PlaneAssigneeID = overlay.PlaneAssigneeID
+	}
+	if overlay.IncludeDrafts != nil {
+		base.IncludeDrafts = overlay.IncludeDrafts
+	}
+	if overlay.AuthorFilter != nil {
+		base.AuthorFilter = overlay.AuthorFilter
+	}
+	if overlay.RequireReviewRequest != nil {
+		base.RequireReviewRequest = overlay.RequireReviewRequest
+	}
+	if overlay.EnableSelfReview != nil {
+		base.EnableSelfReview = overlay.EnableSelfReview
+	}
+	return base
+}
+
+// resolveCodingRoles builds the canonical registry: legacy named role sections
+// are the compatibility base, and roles.coding.<shipped-runner> overlays the
+// same runtime fields. Entries without a compiled runner are rejected rather
+// than accepted as configuration that no production consumer can execute.
+func resolveCodingRoles(legacy map[string]CodingRoleConfig, authored map[string]PartialCodingRoleConfig) (map[string]CodingRoleConfig, []ValidationIssue) {
+	resolved := make(map[string]CodingRoleConfig, len(legacy)+len(authored))
+	for name, role := range legacy {
+		resolved[name] = cloneCodingRoleConfig(role)
+	}
+
+	var issues []ValidationIssue
+	for _, name := range sortedKeys(authored) {
+		role := authored[name]
+		pathPrefix := "roles.coding." + name
+
+		if name == RoleGatekeeper {
+			issues = append(issues, ValidationIssue{
+				Path:    pathPrefix,
+				Message: "is a compiled-in policy role and cannot be configured",
+			})
+			continue
+		}
+		if name == "coordinator" {
+			issues = append(issues, ValidationIssue{
+				Path:    pathPrefix,
+				Message: "is not a coding role; configure roles.coordinator.* instead",
+			})
+			continue
+		}
+		source, runnerBacked := CodingRoleSource(name)
+		if !runnerBacked {
+			issues = append(issues, ValidationIssue{
+				Path:    pathPrefix,
+				Message: "has no compiled runner; roles.coding supports only planner, worker, reviewer, and fixer",
+			})
+			continue
+		}
+
+		entry := resolved[name]
+		issues = append(issues, validatePartialRoleDiscovery(pathPrefix, source, role.Discovery)...)
+		entry = applyPartialCodingRoleConfig(entry, role)
+		entry.Discovery.Source = source
+		if entry.Priority <= 0 {
+			issues = append(issues, ValidationIssue{Path: pathPrefix + ".priority", Message: "must be a positive integer"})
+		}
+		issues = append(issues, validateCodingRoleDiscoveryCommon(pathPrefix, entry.Discovery)...)
+		resolved[name] = entry
+	}
+
+	if len(issues) > 0 {
+		return nil, issues
+	}
+	return resolved, nil
+}
+
+func applyPartialCodingRoleConfig(base CodingRoleConfig, partial PartialCodingRoleConfig) CodingRoleConfig {
+	base = cloneCodingRoleConfig(base)
+	if partial.Priority != nil {
+		base.Priority = *partial.Priority
+	}
+	if partial.Instructions != nil {
+		base.Instructions = *partial.Instructions
+	}
+	if partial.Agent != nil {
+		mergeRoleAgentConfig(&base.Agent, partial.Agent)
+	}
+	if partial.Discovery == nil {
+		return base
+	}
+	discovery := partial.Discovery
+	if discovery.Enabled != nil {
+		base.Discovery.Enabled = *discovery.Enabled
+	}
+	if discovery.Source != nil {
+		base.Discovery.Source = *discovery.Source
+	}
+	if discovery.Labels != nil {
+		base.Discovery.Labels = cloneStrings(*discovery.Labels)
+	}
+	if discovery.LabelMode != nil {
+		base.Discovery.LabelMode = *discovery.LabelMode
+	}
+	if discovery.RequireAssigneeCurrentUser != nil {
+		base.Discovery.RequireAssigneeCurrentUser = *discovery.RequireAssigneeCurrentUser
+	}
+	if discovery.PlaneAssigneeID != nil {
+		base.Discovery.PlaneAssigneeID = *discovery.PlaneAssigneeID
+	}
+	if discovery.IncludeDrafts != nil {
+		base.Discovery.IncludeDrafts = *discovery.IncludeDrafts
+	}
+	if discovery.AuthorFilter != nil {
+		base.Discovery.AuthorFilter = *discovery.AuthorFilter
+	}
+	if discovery.RequireReviewRequest != nil {
+		base.Discovery.RequireReviewRequest = *discovery.RequireReviewRequest
+	}
+	if discovery.EnableSelfReview != nil {
+		base.Discovery.EnableSelfReview = *discovery.EnableSelfReview
+	}
+	return base
+}
+
+func cloneCodingRoleConfig(role CodingRoleConfig) CodingRoleConfig {
+	role.Discovery.Labels = cloneStrings(role.Discovery.Labels)
+	role.Agent = cloneRoleAgentConfig(role.Agent)
+	return role
+}
+
+// validatePartialRoleDiscovery checks field presence before pointer values are
+// collapsed. This catches explicit false settings on the wrong source, and
+// source mismatches before a runner can receive an inert policy.
+func validatePartialRoleDiscovery(pathPrefix string, expectedSource WorkSource, d *PartialRoleDiscoveryConfig) []ValidationIssue {
+	if d == nil {
+		return nil
+	}
+	var issues []ValidationIssue
+	if d.Source != nil && *d.Source != expectedSource {
+		issues = append(issues, ValidationIssue{
+			Path:    pathPrefix + ".discovery.source",
+			Message: "must be " + strconv.Quote(string(expectedSource)) + " for this compiled runner",
+		})
+	}
+	source := expectedSource
+	var fields []string
+	switch source {
+	case WorkSourceIssue:
+		if d.IncludeDrafts != nil {
+			fields = append(fields, "includeDrafts")
+		}
+		if d.AuthorFilter != nil {
+			fields = append(fields, "authorFilter")
+		}
+		if d.RequireReviewRequest != nil {
+			fields = append(fields, "requireReviewRequest")
+		}
+		if d.EnableSelfReview != nil {
+			fields = append(fields, "enableSelfReview")
+		}
+	case WorkSourcePullRequest:
+		if d.RequireAssigneeCurrentUser != nil {
+			fields = append(fields, "requireAssigneeCurrentUser")
+		}
+		if d.PlaneAssigneeID != nil {
+			fields = append(fields, "planeAssigneeId")
+		}
+	}
+	for _, field := range fields {
+		issues = append(issues, ValidationIssue{
+			Path:    pathPrefix + ".discovery." + field,
+			Message: "does not apply to source " + strconv.Quote(string(source)),
+		})
+	}
+	return issues
+}
+
+// validateCodingRoleDiscoveryCommon validates source-independent trigger
+// fields after an authored overlay is applied.
+func validateCodingRoleDiscoveryCommon(pathPrefix string, d RoleDiscoveryConfig) []ValidationIssue {
+	var issues []ValidationIssue
+	validateLabelTriggers(d.Labels, d.LabelMode, pathPrefix+".discovery", &issues)
+	if d.Source == WorkSourcePullRequest && d.AuthorFilter != "" && !isValidRoleAuthorFilter(d.AuthorFilter) {
+		issues = append(issues, ValidationIssue{
+			Path:    pathPrefix + ".discovery.authorFilter",
+			Message: `must be "current_user" or "any" when set`,
+		})
+	}
+	return issues
+}
+
+func isValidRoleAuthorFilter(filter AuthorFilter) bool {
+	switch filter {
+	case AuthorFilterCurrentUser, AuthorFilterAny:
+		return true
+	default:
+		return false
+	}
+}
+
+func sortedKeys[V any](values map[string]V) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // issueOnlyDiscoveryFields and prOnlyDiscoveryFields name the fields rejected

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -254,17 +255,46 @@ func TestNewForgejoClientFromConfigTeaMissingBinary(t *testing.T) {
 func TestTeaTransportReportsBinaryMissingAfterStartup(t *testing.T) {
 	t.Parallel()
 
+	teaPath := filepath.Join(t.TempDir(), "tea-that-disappeared")
+	if err := os.WriteFile(teaPath, []byte("#!/bin/sh\nprintf '{\"version\":\"ok\"}\\n'\n"), 0o755); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
 	transport := newTeaTransport(
-		filepath.Join(t.TempDir(), "tea-that-disappeared"),
+		teaPath,
 		"selected-login",
 		nil,
-		time.Second,
+		5*time.Second,
 		nil,
 	)
+	if _, err := transport.doRaw(context.Background(), "GET", "/api/v1/version", nil, nil); err != nil {
+		t.Fatalf("first doRaw() error = %v, want successful startup", err)
+	}
+	if err := os.Remove(teaPath); err != nil {
+		t.Fatalf("os.Remove() error = %v", err)
+	}
 	_, err := transport.doRaw(context.Background(), "GET", "/api/v1/version", nil, nil)
 	var teaErr *TeaAuthError
 	if !errors.As(err, &teaErr) || teaErr.Code != TeaErrorMissing {
 		t.Fatalf("error = %v, want tea_missing", err)
+	}
+}
+
+func TestTeaTransportDoesNotClassifyCommandOutputAsMissingBinary(t *testing.T) {
+	t.Parallel()
+	runner := &recordingTeaRunner{defaultAPI: &teaAPIResponse{Err: &shell.CommandExecutionError{
+		Message: "command failed: remote API says no such file",
+		Result:  shell.Result{ExitCode: 1, Stderr: "remote API says no such file"},
+		Err:     errors.New("exit status 1"),
+	}}}
+	transport := newTeaTransport("/usr/bin/fake-tea", "selected-login", nil, 5*time.Second, runner)
+
+	_, err := transport.doRaw(context.Background(), "GET", "/api/v1/version", nil, nil)
+	if err == nil {
+		t.Fatal("doRaw() error = nil, want command failure")
+	}
+	var teaErr *TeaAuthError
+	if errors.As(err, &teaErr) && teaErr.Code == TeaErrorMissing {
+		t.Fatalf("error = %v, command output must not be classified as a missing binary", err)
 	}
 }
 

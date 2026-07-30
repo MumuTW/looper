@@ -1164,10 +1164,19 @@ type configResponse struct {
 	Defaults      config.DefaultsConfig     `json:"defaults"`
 	Instructions  config.InstructionsConfig `json:"instructions"`
 	HITL          config.HITLConfig         `json:"hitl"`
-	Roles         config.RoleConfigs        `json:"roles"`
+	Roles         configRolesResponse       `json:"roles"`
 	Providers     []config.ProviderConfig   `json:"providers"`
 	Projects      []config.ProjectRefConfig `json:"projects"`
 	Metadata      ConfigMetadata            `json:"metadata"`
+}
+
+type configRolesResponse struct {
+	Coding      map[string]config.CodingRoleConfig `json:"coding"`
+	Planner     config.PlannerRoleConfig           `json:"planner"`
+	Reviewer    config.ReviewerRoleConfig          `json:"reviewer"`
+	Fixer       config.FixerRoleConfig             `json:"fixer"`
+	Worker      config.WorkerRoleConfig            `json:"worker"`
+	Coordinator config.CoordinatorRoleConfig       `json:"coordinator"`
 }
 
 type configServerResponse struct {
@@ -1241,10 +1250,17 @@ func (h *Handler) buildConfigResponse() configResponse {
 		Defaults:     cfg.Defaults,
 		Instructions: cfg.Instructions,
 		HITL:         cfg.HITL,
-		Roles:        cfg.Roles,
-		Providers:    append([]config.ProviderConfig{}, cfg.Providers...),
-		Projects:     append([]config.ProjectRefConfig{}, cfg.Projects...),
-		Metadata:     h.buildConfigMetadata(),
+		Roles: configRolesResponse{
+			Coding:      config.EffectiveCodingRoles(cfg.Roles),
+			Planner:     cfg.Roles.Planner,
+			Reviewer:    cfg.Roles.Reviewer,
+			Fixer:       cfg.Roles.Fixer,
+			Worker:      cfg.Roles.Worker,
+			Coordinator: cfg.Roles.Coordinator,
+		},
+		Providers: append([]config.ProviderConfig{}, cfg.Providers...),
+		Projects:  append([]config.ProjectRefConfig{}, cfg.Projects...),
+		Metadata:  h.buildConfigMetadata(),
 	}
 }
 
@@ -1376,13 +1392,10 @@ func (h *Handler) buildStatusResponse(ctx context.Context) (statusResponse, erro
 	installDir := filepath.Join(homeDirOrEmpty(), ".looper", "bin")
 	artifactName := looperdArtifactName(currentTarget)
 
-	reviewPublish := looperdruntime.ReviewPublishReadinessFor(h.context.Config)
-	outstanding, err := looperdruntime.CountOutstandingQuarantineDebt(ctx, services.Repositories)
-	if err != nil {
-		return statusResponse{}, err
-	}
+	reviewPublish := looperdruntime.ReviewPublishReadinessFor(h.effectiveConfig())
+	outstanding, debtErr := looperdruntime.CountOutstandingQuarantineDebt(ctx, services.Repositories)
 	recovery := h.recoveryWithOutstanding(outstanding)
-	degradedReasons := statusDegradedReasons(reviewPublish, outstanding)
+	degradedReasons := statusDegradedReasons(reviewPublish, outstanding, debtErr)
 
 	return statusResponse{
 		Service: statusService{
@@ -1680,13 +1693,16 @@ func (h *Handler) recoveryWithOutstanding(outstanding looperdruntime.Outstanding
 	return normalized
 }
 
-func statusDegradedReasons(reviewPublish looperdruntime.ReviewPublishReadiness, outstanding looperdruntime.OutstandingQuarantineDebt) []string {
+func statusDegradedReasons(reviewPublish looperdruntime.ReviewPublishReadiness, outstanding looperdruntime.OutstandingQuarantineDebt, debtErr error) []string {
 	var reasons []string
-	if reviewPublish.Known && reviewPublish.PublishingDisabled && strings.TrimSpace(reviewPublish.LooperPath) != "" {
+	if reviewPublish.Known && reviewPublish.PublishingDisabled {
 		reasons = append(reasons, "review_publish_disabled")
 	}
 	if outstanding.QuarantinedActiveExecutions > 0 || outstanding.QuarantinedRunningRuns > 0 {
 		reasons = append(reasons, "quarantine_orphan_debt")
+	}
+	if debtErr != nil {
+		reasons = append(reasons, "quarantine_debt_unavailable")
 	}
 	return reasons
 }
@@ -2099,6 +2115,9 @@ func (h *Handler) buildProjectDiscoverResponse(r *http.Request, service projectS
 	}
 	result, err := service.DiscoverProject(r.Context(), projects.DiscoverInput{ProjectID: identifier})
 	if err != nil {
+		if result.Discovery.Status == projects.DiscoveryStatusFailed {
+			return projectDiscoverResponse(result, h.context.Config), nil
+		}
 		var notFound projects.ProjectNotFoundError
 		var validation projects.ProjectValidationError
 		switch {
@@ -2110,15 +2129,19 @@ func (h *Handler) buildProjectDiscoverResponse(r *http.Request, service projectS
 			return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 		}
 	}
+	return projectDiscoverResponse(result, h.context.Config), nil
+}
+
+func projectDiscoverResponse(result projects.DiscoverResult, cfg config.Config) createProjectResponse {
 	return createProjectResponse{
-		projectResponse:        serializeProject(result.Project, h.context.Config, h.context.Config.Defaults.BaseBranch),
+		projectResponse:        serializeProject(result.Project, cfg, cfg.Defaults.BaseBranch),
 		Discovery:              serializeDiscovery(result.Discovery),
 		DiscoveredPullRequests: result.Discovery.DiscoveredPullRequests,
 		DiscoveredWorktrees:    result.Discovery.DiscoveredWorktrees,
 		PendingSnapshots:       result.Discovery.PendingSnapshots,
 		CapturedSnapshots:      result.Discovery.CapturedSnapshots,
 		Warnings:               append([]string{}, result.Discovery.Warnings...),
-	}, nil
+	}
 }
 
 func (h *Handler) buildLoopsRouteResponse(r *http.Request) (any, error) {

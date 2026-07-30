@@ -21,6 +21,7 @@ import (
 	"github.com/nexu-io/looper/internal/lifecycle"
 	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/validation"
 )
 
 func TestBuildFixerPromptUsesConcreteDisclosureMetadata(t *testing.T) {
@@ -5673,7 +5674,7 @@ func TestProcessClaimedItemResumeReacquiresPullRequestLock(t *testing.T) {
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowRiskyFixes: true, ValidationRunner: func(context.Context, ValidationInput) (ValidationResult, error) {
 		validationCalls++
 		if validationCalls == 1 {
-			return ValidationResult{Passed: false, Summary: "Validation failed: connection refused"}, nil
+			return ValidationResult{Passed: false, Summary: "Validation failed: connection refused", FailureCategory: validation.FailureInfrastructure}, nil
 		}
 		return ValidationResult{Passed: true, Summary: "ok"}, nil
 	}})
@@ -7063,7 +7064,7 @@ func TestProcessClaimedItemClearsFailureStreakOnSuccess(t *testing.T) {
 	}
 }
 
-func TestRecordFixerFailureStreakResetsCountWhenHeadChanges(t *testing.T) {
+func TestRecordFixerFailureStreakContinuesWhenHeadChanges(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	repo := "acme/looper"
@@ -7085,10 +7086,10 @@ func TestRecordFixerFailureStreakResetsCountWhenHeadChanges(t *testing.T) {
 		if err != nil {
 			t.Fatalf("recordFixerFailureStreak() error = %v", err)
 		}
-		// A new head SHA resets the streak, so each run with a different head is
-		// the first failure for that head.
-		if streak != 1 {
-			t.Fatalf("recordFixerFailureStreak() streak = %d on run %d, want 1", streak, i+1)
+		// A pushed head does not prove the same later-step failure was repaired;
+		// continuity comes from the unchanged step and fix-item state.
+		if streak != i+1 {
+			t.Fatalf("recordFixerFailureStreak() streak = %d on run %d, want %d", streak, i+1, i+1)
 		}
 	}
 }

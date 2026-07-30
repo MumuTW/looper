@@ -165,9 +165,9 @@ func TestProcessClaimedItemDefersDuringPendingRediscoveryHandoff(t *testing.T) {
 	repo := "acme/looper"
 	prNumber := int64(94)
 	loopID := "loop_paused_claim_gate"
-	loopTarget := buildPullRequestTargetID(repo, prNumber)
 	headSHA := "head-pending"
-	stateHash := "resume-handoff-state"
+	stateHash := "state-pending"
+	loopTarget := buildPullRequestTargetID(repo, prNumber)
 	metadata := mustMarshalJSON(map[string]any{
 		"pauseReason": failureStreakPauseReason,
 		"pendingFixerRediscovery": pendingFixerRediscoveryState{
@@ -200,26 +200,29 @@ func TestProcessClaimedItemDefersDuringPendingRediscoveryHandoff(t *testing.T) {
 	}
 }
 
-func TestProcessClaimedItemCancelsPersistentPausedLoop(t *testing.T) {
+func TestProcessClaimedItemCancelsDurablePause(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	nowISO := fixture.nowISO()
 	projectID := "project_1"
 	repo := "acme/looper"
 	prNumber := int64(95)
-	loopID := "loop_persistent_pause"
+	loopID := "loop_durable_pause"
 	loopTarget := buildPullRequestTargetID(repo, prNumber)
+	headSHA := "head-quarantined"
+	stateHash := "state-quarantined"
 	metadata := mustMarshalJSON(map[string]any{
-		"pauseReason": "operator_pause",
-		// A pending rediscovery may be present on a real paused loop, but it is
-		// not an authority to resume a running claim.
-		"pendingFixerRediscovery": pendingFixerRediscoveryState{HeadSHA: "head-95", FixItemsStateHash: "operator-state", RecordedAt: nowISO},
+		"pauseReason": "operator_quarantine",
+		"pendingFixerRediscovery": pendingFixerRediscoveryState{
+			HeadSHA:           headSHA,
+			FixItemsStateHash: stateHash,
+		},
 	})
 	loop := storage.LoopRecord{ID: loopID, Seq: 212, ProjectID: projectID, Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "paused", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
 	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
-	queue := storage.QueueItemRecord{ID: "queue_persistent_pause", ProjectID: &projectID, LoopID: &loopID, Type: "fixer", TargetType: "pull_request", TargetID: loopTarget, Repo: &repo, PRNumber: &prNumber, DedupeKey: buildFixerDedupeKey(projectID, loopID, repo, prNumber, "head-95", "operator-state"), Priority: storage.QueuePriorityFixer, Status: "running", AvailableAt: nowISO, Attempts: 2, MaxAttempts: -1, CreatedAt: nowISO, UpdatedAt: nowISO}
+	queue := storage.QueueItemRecord{ID: "queue_durable_pause", ProjectID: &projectID, LoopID: &loopID, Type: "fixer", TargetType: "pull_request", TargetID: loopTarget, Repo: &repo, PRNumber: &prNumber, DedupeKey: buildFixerDedupeKey(projectID, loopID, repo, prNumber, headSHA, stateHash), Priority: storage.QueuePriorityFixer, Status: "running", AvailableAt: nowISO, Attempts: 2, MaxAttempts: -1, CreatedAt: nowISO, UpdatedAt: nowISO}
 	if err := fixture.repos.Queue.Upsert(context.Background(), queue); err != nil {
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
@@ -227,7 +230,7 @@ func TestProcessClaimedItemCancelsPersistentPausedLoop(t *testing.T) {
 
 	result, err := runner.ProcessClaimedItem(context.Background(), queue)
 	if err != nil || result.Status != "cancelled" {
-		t.Fatalf("ProcessClaimedItem() = (%#v, %v), want persistent paused claim cancelled", result, err)
+		t.Fatalf("ProcessClaimedItem() = (%#v, %v), want durable pause claim cancelled", result, err)
 	}
 	persisted, err := fixture.repos.Queue.GetByID(context.Background(), queue.ID)
 	if err != nil || persisted == nil || persisted.Status != "cancelled" {

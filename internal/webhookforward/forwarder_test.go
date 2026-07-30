@@ -13,6 +13,7 @@ import (
 
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/fixer"
+	projectcatalog "github.com/nexu-io/looper/internal/projects"
 	"github.com/nexu-io/looper/internal/reviewer"
 	"github.com/nexu-io/looper/internal/storage"
 )
@@ -569,7 +570,7 @@ func TestForwardFansOutToMultipleProjectsForSameRepo(t *testing.T) {
 	reviewerRunner.assertRepos(t, []string{"acme/looper", "acme/looper"})
 }
 
-func TestForwardDoesNotRouteGitHubWebhookToSameSlugForgejoProject(t *testing.T) {
+func TestForwardUsesProviderSeamForNativePullRequestCapability(t *testing.T) {
 	repos := newTestRepositories(t)
 	seedProject(t, repos, "github", "acme/looper")
 	seedProject(t, repos, "plane", "acme/looper")
@@ -1003,6 +1004,12 @@ func (s *mutableConfigSource) Snapshot() config.Config {
 	return s.cfg
 }
 
+func (s *mutableConfigSource) View() projectcatalog.OperationView {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return projectcatalog.OperationViewFromConfig(s.cfg)
+}
+
 func (s *mutableConfigSource) Store(cfg config.Config) {
 	s.mu.Lock()
 	s.cfg = cfg
@@ -1085,4 +1092,32 @@ func (a targetedFixerAdapter) DiscoverPullRequest(ctx context.Context, input fix
 
 func (a targetedFixerAdapter) DiscoverPullRequestsForBaseBranchUpdate(ctx context.Context, input fixer.BaseBranchDiscoveryInput) (fixer.DiscoveryResult, error) {
 	return fixer.DiscoveryResult{}, a.runner.runBaseBranch(ctx, input.ProjectID, input.Repo, input.BaseRefName)
+}
+
+func TestEnabledLanesForProjectUsesNarrowRolePolicy(t *testing.T) {
+	t.Parallel()
+
+	// Focused consumer test: construct only the role policy that the lane
+	// filter needs, without unrelated configuration domains.
+	policy := projectcatalog.RolePolicyView{
+		ProjectID: "demo",
+		Roles: config.RoleConfigs{
+			Coding: map[string]config.CodingRoleConfig{
+				config.CodingRoleReviewer: {Discovery: config.RoleDiscoveryConfig{Enabled: true}},
+				config.CodingRoleFixer:    {Discovery: config.RoleDiscoveryConfig{Enabled: false}},
+			},
+			// Opposite legacy values prove the canonical registry is authoritative.
+			Reviewer: config.ReviewerRoleConfig{},
+			Fixer:    config.FixerRoleConfig{AutoDiscovery: true},
+		},
+	}
+
+	allLanes := map[Lane]struct{}{LaneReviewer: {}, LaneFixer: {}}
+	got := enabledLanesForProject(policy, allLanes)
+	if len(got) != 1 {
+		t.Fatalf("enabled lanes = %v, want one lane", got)
+	}
+	if _, ok := got[LaneReviewer]; !ok {
+		t.Fatalf("enabled lanes missing reviewer: %v", got)
+	}
 }

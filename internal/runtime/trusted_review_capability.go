@@ -123,7 +123,7 @@ func trustedReviewCapabilityCached(configuredPath string) (capable bool, reason 
 	trustedReviewCapabilityCache.mu.Lock()
 	defer trustedReviewCapabilityCache.mu.Unlock()
 	entry, ok := trustedReviewCapabilityCache.entries[configuredPath]
-	if !ok {
+	if !ok || !entry.retryAfter.IsZero() {
 		return false, "", false
 	}
 	return entry.capable, entry.reason, true

@@ -18,6 +18,7 @@ import (
 	"github.com/nexu-io/looper/internal/disclosure"
 	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/eventlog"
+	"github.com/nexu-io/looper/internal/forge"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/specpr"
 	"github.com/nexu-io/looper/internal/lifecycle"
@@ -660,8 +661,11 @@ func (r *Runner) discoveryPolicyForProject(projectID string) DiscoveryPolicy {
 	if r.projectRoleConfig == nil {
 		return r.discoveryPolicy
 	}
-	roles := config.ProjectRoleConfigs(*r.projectRoleConfig, projectID)
-	return DiscoveryPolicy{AutoDiscovery: roles.Planner.AutoDiscovery, Labels: append([]string(nil), roles.Planner.Triggers.Labels...), LabelMode: roles.Planner.Triggers.LabelMode, RequireAssigneeCurrentUser: roles.Planner.Triggers.RequireAssigneeCurrentUser}
+	role, ok := config.ProjectCodingRoleConfig(*r.projectRoleConfig, projectID, config.CodingRolePlanner)
+	if !ok {
+		return r.discoveryPolicy
+	}
+	return DiscoveryPolicy{AutoDiscovery: role.Discovery.Enabled, Labels: append([]string(nil), role.Discovery.Labels...), LabelMode: role.Discovery.LabelMode, RequireAssigneeCurrentUser: role.Discovery.RequireAssigneeCurrentUser}
 }
 
 func (r *Runner) ProcessNext(ctx context.Context, claimedBy string) (*ProcessResult, error) {
@@ -2034,7 +2038,7 @@ func (c *plannerCheckpoint) ensureLifecycle(runner, branch, baseBranch string, e
 }
 
 func buildPlannerPrompt(project storage.ProjectRecord, instructionConfig config.Config, issue *checkpointIssue, worktree *checkpointWorktree, allowAutoPush bool, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string) (string, config.CustomInstructionBlock) {
-	providerLabel := providerIssueSystemLabel(providerKindForProject(instructionConfig, project.ID))
+	providerLabel := forge.NewResolver(instructionConfig).ForProject(project.ID).PullRequestProviderName()
 	parts := []string{
 		fmt.Sprintf("Write a planning spec for %s issue %s#%d.", providerLabel, issue.Repo, issue.IssueNumber),
 		"Repository: " + issue.Repo,
@@ -2073,22 +2077,6 @@ func buildPlannerPrompt(project storage.ProjectRecord, instructionConfig config.
 		parts = append(parts, noRemoteLifecyclePromptInstruction("planner", worktree.Branch, worktree.BaseBranch, disclosureCfg, agentRuntime, agentModel))
 	}
 	return agent.AppendCompletionInstruction(strings.Join(parts, "\n\n")), instructionBlock
-}
-
-func providerKindForProject(cfg config.Config, projectID string) config.ProviderKind {
-	for _, project := range cfg.Projects {
-		if project.ID == projectID {
-			return config.ResolvedProjectProviderKind(cfg, project)
-		}
-	}
-	return config.ProviderKindGitHub
-}
-
-func providerIssueSystemLabel(kind config.ProviderKind) string {
-	if kind == config.ProviderKindForgejo {
-		return "Forgejo"
-	}
-	return "GitHub"
 }
 
 func customInstructionConfig(value *config.Config) config.Config {

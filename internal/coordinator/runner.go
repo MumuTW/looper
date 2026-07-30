@@ -215,13 +215,16 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 	triageCfg := roleConfigToTriageConfig(roleCfg)
 	projectRoles := config.ProjectRoleConfigs(*r.config, input.ProjectID)
 	dispatchCfg := roleConfigToDispatchConfig(roleCfg, projectRoles)
+	reviewerRole, _ := config.ProjectCodingRoleConfig(*r.config, input.ProjectID, config.CodingRoleReviewer)
+	fixerRole, _ := config.ProjectCodingRoleConfig(*r.config, input.ProjectID, config.CodingRoleFixer)
+	workerRole, _ := config.ProjectCodingRoleConfig(*r.config, input.ProjectID, config.CodingRoleWorker)
 	downstreamLabels := downstreamTriggerLabels{
-		reviewer:     append([]string(nil), projectRoles.Reviewer.Discovery.Triggers.Labels...),
-		reviewerMode: projectRoles.Reviewer.Discovery.Triggers.LabelMode,
-		fixer:        append([]string(nil), projectRoles.Fixer.Triggers.Labels...),
-		fixerMode:    projectRoles.Fixer.Triggers.LabelMode,
-		worker:       append([]string(nil), projectRoles.Worker.Triggers.Labels...),
-		workerMode:   projectRoles.Worker.Triggers.LabelMode,
+		reviewer:     append([]string(nil), reviewerRole.Discovery.Labels...),
+		reviewerMode: reviewerRole.Discovery.LabelMode,
+		fixer:        append([]string(nil), fixerRole.Discovery.Labels...),
+		fixerMode:    fixerRole.Discovery.LabelMode,
+		worker:       append([]string(nil), workerRole.Discovery.Labels...),
+		workerMode:   workerRole.Discovery.LabelMode,
 	}
 	loaded := make([]loadedIssue, 0, len(issues))
 	for _, summary := range issues {
@@ -995,9 +998,13 @@ func (r *Runner) hasPendingReviewerOrFixerWork(ctx context.Context, projectID, r
 	if r == nil || r.config == nil || r.repos == nil || r.github == nil {
 		return false, nil
 	}
-	roles := config.ProjectRoleConfigs(*r.config, projectID)
-	reviewerConfig := roles.Reviewer.Discovery.Triggers
-	fixerConfig := roles.Fixer.Triggers
+	reviewerRole, reviewerOK := config.ProjectCodingRoleConfig(*r.config, projectID, config.CodingRoleReviewer)
+	fixerRole, fixerOK := config.ProjectCodingRoleConfig(*r.config, projectID, config.CodingRoleFixer)
+	if !reviewerOK || !fixerOK {
+		return false, nil
+	}
+	reviewerConfig := reviewerRole.Discovery
+	fixerConfig := fixerRole.Discovery
 	reviewerLabels := downstreamLabels.reviewer
 	fixerLabels := downstreamLabels.fixer
 	active, err := r.activeQueueItemsByPR(ctx)
@@ -1020,7 +1027,7 @@ func (r *Runner) hasPendingReviewerOrFixerWork(ctx context.Context, projectID, r
 				return false, err
 			}
 			prKey := queuePullRequestKey(repo, pr.Number)
-			if !loadedCurrentLogin && (reviewerConfig.RequireReviewRequest || !reviewerConfig.EnableSelfReview || fixerConfig.AuthorFilter != config.FixerAuthorFilterAny) {
+			if !loadedCurrentLogin && (reviewerConfig.RequireReviewRequest || !reviewerConfig.EnableSelfReview || fixerConfig.AuthorFilter != config.AuthorFilterAny) {
 				lookupLogin, err := r.github.GetCurrentUserLoginForRepo(ctx, repo, cwd)
 				if err != nil {
 					return false, err
@@ -1041,7 +1048,7 @@ func (r *Runner) hasPendingReviewerOrFixerWork(ctx context.Context, projectID, r
 	return false, nil
 }
 
-func reviewerWorkPending(detail githubinfra.PullRequestDetail, currentLogin string, trigger config.ReviewerRoleTriggersConfig, requiredLabels []string, labelMode config.LabelMode) bool {
+func reviewerWorkPending(detail githubinfra.PullRequestDetail, currentLogin string, trigger config.RoleDiscoveryConfig, requiredLabels []string, labelMode config.LabelMode) bool {
 	if !trigger.IncludeDrafts && detail.IsDraft {
 		return false
 	}
@@ -1054,11 +1061,11 @@ func reviewerWorkPending(detail githubinfra.PullRequestDetail, currentLogin stri
 	return labelsMatch(detail.Labels, requiredLabels, labelMode)
 }
 
-func fixerWorkPending(detail githubinfra.PullRequestDetail, currentLogin string, trigger config.FixerRoleTriggersConfig, requiredLabels []string, labelMode config.LabelMode) bool {
+func fixerWorkPending(detail githubinfra.PullRequestDetail, currentLogin string, trigger config.RoleDiscoveryConfig, requiredLabels []string, labelMode config.LabelMode) bool {
 	if !trigger.IncludeDrafts && detail.IsDraft {
 		return false
 	}
-	if trigger.AuthorFilter != config.FixerAuthorFilterAny && normalizeLogin(detail.Author) != "" && normalizeLogin(detail.Author) != normalizeLogin(currentLogin) {
+	if trigger.AuthorFilter != config.AuthorFilterAny && normalizeLogin(detail.Author) != "" && normalizeLogin(detail.Author) != normalizeLogin(currentLogin) {
 		return false
 	}
 	if !labelsMatch(detail.Labels, requiredLabels, labelMode) {
@@ -1146,11 +1153,14 @@ func (r *Runner) applyReviewAssignments(ctx context.Context, projectID, repo, cw
 	if r == nil || r.github == nil || r.config == nil {
 		return nil
 	}
-	roles := config.ProjectRoleConfigs(*r.config, projectID)
-	trigger := roles.Reviewer.Discovery.Triggers
+	reviewerRole, ok := config.ProjectCodingRoleConfig(*r.config, projectID, config.CodingRoleReviewer)
+	if !ok {
+		return nil
+	}
+	trigger := reviewerDiscoveryTriggers(reviewerRole.Discovery)
 	policy := networkpolicy.ProjectPolicyForProject(*r.config, projectID)
 	routed := networkpolicy.IsRouted(policy)
-	if !roles.Reviewer.Discovery.AutoDiscovery && !routed {
+	if !reviewerRole.Discovery.Enabled && !routed {
 		return nil
 	}
 	var routedMemberships []protocol.Membership
@@ -1200,6 +1210,16 @@ func (r *Runner) applyReviewAssignments(ctx context.Context, projectID, repo, cw
 		}
 	}
 	return nil
+}
+
+func reviewerDiscoveryTriggers(discovery config.RoleDiscoveryConfig) config.ReviewerRoleTriggersConfig {
+	return config.ReviewerRoleTriggersConfig{
+		IncludeDrafts:        discovery.IncludeDrafts,
+		RequireReviewRequest: discovery.RequireReviewRequest,
+		EnableSelfReview:     discovery.EnableSelfReview,
+		Labels:               append([]string(nil), discovery.Labels...),
+		LabelMode:            discovery.LabelMode,
+	}
 }
 
 func (r *Runner) applyLocalReviewAssignment(ctx context.Context, repo, cwd string, detail githubinfra.PullRequestDetail, trigger config.ReviewerRoleTriggersConfig) error {
@@ -1683,6 +1703,9 @@ func (r *Runner) loadIssue(ctx context.Context, repo, cwd string, summary github
 }
 
 func roleConfigToDispatchConfig(roleCfg config.CoordinatorRoleConfig, roles config.RoleConfigs) dispatch.Config {
+	registry := config.EffectiveCodingRoles(roles)
+	planner := registry[config.CodingRolePlanner]
+	worker := registry[config.CodingRoleWorker]
 	return dispatch.Config{
 		Mode:                 roleCfg.Dispatch.Mode,
 		TriagedLabel:         roleCfg.Triage.TriagedLabel,
@@ -1691,19 +1714,23 @@ func roleConfigToDispatchConfig(roleCfg config.CoordinatorRoleConfig, roles conf
 		AllowedUsers:         append([]string(nil), roleCfg.Dispatch.HumanGate.AllowedUsers...),
 		SlashCommands:        append([]string(nil), roleCfg.Dispatch.HumanGate.SlashCommands...),
 		AssignTo:             roleCfg.Dispatch.AssignTo,
-		PlannerTriggerLabels: requiredTriggerLabels(roles.Planner.Triggers),
-		WorkerTriggerLabels:  requiredTriggerLabels(roles.Worker.Triggers),
+		PlannerTriggerLabels: requiredDiscoveryLabels(planner.Discovery.Labels, planner.Discovery.LabelMode),
+		WorkerTriggerLabels:  requiredDiscoveryLabels(worker.Discovery.Labels, worker.Discovery.LabelMode),
 	}
 }
 
 func requiredTriggerLabels(cfg config.IssueRoleTriggersConfig) []string {
-	if cfg.LabelMode == config.LabelModeAll {
-		return append([]string(nil), cfg.Labels...)
+	return requiredDiscoveryLabels(cfg.Labels, cfg.LabelMode)
+}
+
+func requiredDiscoveryLabels(labels []string, labelMode config.LabelMode) []string {
+	if labelMode == config.LabelModeAll {
+		return append([]string(nil), labels...)
 	}
-	if len(cfg.Labels) == 0 {
+	if len(labels) == 0 {
 		return nil
 	}
-	return []string{cfg.Labels[0]}
+	return []string{labels[0]}
 }
 
 func (r *Runner) dispatchIssue(ctx context.Context, repo, cwd string, issue triage.Issue, triagedLabel string, cfg dispatch.Config) (dispatch.Issue, error) {

@@ -1784,8 +1784,8 @@ func TestHydrateWorkerInputFromIssueInfersIssueRepoFromURL(t *testing.T) {
 	if issueRepoFromURL("https://github.com/nexu-io/looper/issues/not-a-number") != "" {
 		t.Fatal("issueRepoFromURL() should ignore invalid issue URLs")
 	}
-	if !strings.Contains(buildAgentPullRequestInstruction(work, config.ProviderKindGitHub), "Closes nexu-io/looper#27") {
-		t.Fatalf("instruction = %q, want cross-repo closing reference", buildAgentPullRequestInstruction(work, config.ProviderKindGitHub))
+	if !strings.Contains(buildAgentPullRequestInstruction(work, true), "Closes nexu-io/looper#27") {
+		t.Fatalf("instruction = %q, want cross-repo closing reference", buildAgentPullRequestInstruction(work, true))
 	}
 }
 

@@ -15,6 +15,7 @@ import (
 // operation's lifetime.
 type ConfigSource interface {
 	Snapshot() config.Config
+	View() OperationView
 }
 
 // Catalog owns the immutable runtime configuration view. Publish and
@@ -99,21 +100,11 @@ func cloneCatalogProjects(projects []config.ProjectRefConfig) []config.ProjectRe
 	return cloned.Projects
 }
 
-// Config is composed exclusively of JSON configuration values. JSON
-// round-tripping gives the Catalog a single complete deep-copy boundary,
-// including nested role overrides and map[string]any agent parameters. A
-// failure indicates a programming error: normalized Config must remain JSON
-// representable.
+// CloneConfig is the canonical detached-copy boundary. In particular it
+// preserves the derived Roles.Coding registry, which is intentionally omitted
+// from JSON to avoid serializing duplicate authoring inputs.
 func cloneCatalogConfig(source config.Config) config.Config {
-	encoded, err := json.Marshal(source)
-	if err != nil {
-		panic(fmt.Sprintf("clone project catalog config: %v", err))
-	}
-	var cloned config.Config
-	if err := json.Unmarshal(encoded, &cloned); err != nil {
-		panic(fmt.Sprintf("clone project catalog config: %v", err))
-	}
-	return cloned
+	return config.CloneConfig(source)
 }
 
 // MaterializeCatalog builds the immutable runtime Project view from active
@@ -168,11 +159,22 @@ func MaterializeCatalog(global config.Config, records []storage.ProjectRecord) (
 		if err := decodeMetadataValue(metadata, "roles", &project.Roles); err != nil {
 			return nil, fmt.Errorf("decode project %q role policy: %w", project.ID, err)
 		}
-		if config.ResolvedProjectProviderKind(global, project) == config.ProviderKindForgejo {
+		providerKind := config.ResolvedProjectProviderKind(global, project)
+		if providerKind == config.ProviderKindForgejo {
 			config.ApplyForgejoProjectProfile(&project)
+		}
+		if providerKind == config.ProviderKindForgejo || providerKind == config.ProviderKindPlane {
 			effectiveConfig := global
 			effectiveConfig.Projects = append(append([]config.ProjectRefConfig(nil), projects...), project)
-			if err := config.ValidateForgejoRoleCapabilities(config.ProjectRoleConfigs(effectiveConfig, project.ID), fmt.Sprintf("projects[%q]", project.ID)); err != nil {
+			roles := config.ProjectRoleConfigs(effectiveConfig, project.ID)
+			prefix := fmt.Sprintf("projects[%q]", project.ID)
+			var err error
+			if providerKind == config.ProviderKindForgejo {
+				err = config.ValidateForgejoRoleCapabilities(roles, prefix)
+			} else {
+				err = config.ValidatePlaneRoleCapabilities(roles, prefix)
+			}
+			if err != nil {
 				return nil, err
 			}
 		}
