@@ -192,6 +192,20 @@ func IsConflictingActiveLoopStatus(status LoopStatus) bool {
 	return ok
 }
 
+// ConflictingActiveLoopStatuses returns the statuses that hold a live claim on
+// a loop target. Storage queries use this instead of duplicating the claim
+// lifecycle vocabulary.
+func ConflictingActiveLoopStatuses() []LoopStatus {
+	return []LoopStatus{
+		LoopStatusIdle,
+		LoopStatusQueued,
+		LoopStatusRunning,
+		LoopStatusPaused,
+		LoopStatusAwaitingHuman,
+		LoopStatusHumanTakeover,
+	}
+}
+
 func IsTerminalRunStatus(status RunStatus) bool {
 	_, ok := terminalRunStatuses[status]
 	return ok

@@ -155,6 +155,10 @@ type Handler struct {
 	// before the requeue transaction so tests can inject a TX-time conflict
 	// after the sticky stop gate was already cleared.
 	retryAfterClearStopGateHook func(loopID string)
+	// workerReuseAfterClearStopGateHook is test-only: invoked after an
+	// issue-worker reuse clears its sticky stop gate and before its
+	// transaction rechecks issue-claim admission.
+	workerReuseAfterClearStopGateHook func(loopID string)
 	// loopLogsFollowObserve is test-only instrumentation for enforcing the
 	// stream's query/read budgets without coupling tests to SQLite internals.
 	loopLogsFollowObserve func(loopLogsFollowObservation)
@@ -4335,32 +4339,12 @@ func (h *Handler) buildCreateLoopResponse(r *http.Request) (loopResponse, error)
 }
 
 func (h *Handler) findIssueCollisionLoop(ctx context.Context, repos *storage.Repositories, projectID string, target domain.LoopTarget) (*collisionInfo, error) {
-	loops, err := repos.Loops.List(ctx)
+	loops, err := repos.Loops.ListConflictingIssueClaimLoops(ctx, projectID, target.Repo, target.IssueNumber, domain.ConflictingActiveLoopStatuses())
 	if err != nil {
 		return nil, err
 	}
-
-	// Construct the expected issue target ID for matching.
-	issueTargetID := fmt.Sprintf("issue:%s:%d", target.Repo, target.IssueNumber)
-
 	for _, loop := range loops {
-		// Only active loops count as collisions.
-		if !domain.IsConflictingActiveLoopStatus(domain.LoopStatus(loop.Status)) {
-			continue
-		}
-		// Must be in the same project.
-		if loop.ProjectID != projectID {
-			continue
-		}
-		// Skip planner and worker — they're the normal upstream/downstream.
-		loopType := domain.LoopType(loop.Type)
-		if loopType == domain.LoopTypePlanner || loopType == domain.LoopTypeWorker {
-			continue
-		}
-		// Check direct issue target match.
-		if loop.TargetType == string(domain.LoopTargetTypeIssue) && loop.TargetID != nil && *loop.TargetID == issueTargetID {
-			return &collisionInfo{ID: loop.ID, Type: loop.Type}, nil
-		}
+		return &collisionInfo{ID: loop.ID, Type: loop.Type}, nil
 	}
 
 	return nil, nil
@@ -4369,6 +4353,15 @@ func (h *Handler) findIssueCollisionLoop(ctx context.Context, repos *storage.Rep
 type collisionInfo struct {
 	ID   string
 	Type string
+}
+
+func issueCollisionError(issueNumber int64, collision collisionInfo) apiError {
+	return apiError{
+		code:    pkgapi.ErrorCodeLoopConflict,
+		status:  http.StatusConflict,
+		message: fmt.Sprintf("Issue #%d is occupied by active %s loop %s", issueNumber, collision.Type, collision.ID),
+		details: map[string]any{"occupiedBy": map[string]any{"loopId": collision.ID, "loopType": collision.Type}},
+	}
 }
 
 func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateResponse, error) {
@@ -4446,12 +4439,7 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 		if collision, checkErr := h.findIssueCollisionLoop(r.Context(), services.Repositories, projectID, *requestedIssueTarget); checkErr != nil {
 			return workerCreateResponse{}, checkErr
 		} else if collision != nil {
-			return workerCreateResponse{}, apiError{
-				code:    pkgapi.ErrorCodeProjectAmbiguous,
-				status:  http.StatusConflict,
-				message: fmt.Sprintf("Issue #%d is occupied by active %s loop %s", *issueNumber, collision.Type, collision.ID),
-				details: map[string]any{"occupiedBy": map[string]any{"loopId": collision.ID, "loopType": collision.Type}},
-			}
+			return workerCreateResponse{}, issueCollisionError(*issueNumber, *collision)
 		}
 	}
 
@@ -4597,6 +4585,9 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 			}
 		}
 	}
+	if reuseStopGateLoopID != "" && h.workerReuseAfterClearStopGateHook != nil {
+		h.workerReuseAfterClearStopGateHook(reuseStopGateLoopID)
+	}
 	restoreReuseStopGate := func() error {
 		if reuseGateWasActive && reuseStopGateLoopID != "" && services.ActiveExecutions != nil {
 			return services.ActiveExecutions.RestoreLoopStop(reuseStopGateLoopID)
@@ -4604,24 +4595,22 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 		return nil
 	}
 
-	// Issue 319: refuse dispatch when a fixer/reviewer loop already holds
-	// the issue (or its pull request). Excludes planner/worker (normal
-	// handoff) and non-active states. force overrides.
-	if issueNumber != nil && requestedIssueTarget != nil && !derefBool(body.Force) {
-		if collision, checkErr := h.findIssueCollisionLoop(r.Context(), services.Repositories, projectID, *requestedIssueTarget); checkErr != nil {
-			return workerCreateResponse{}, checkErr
-		} else if collision != nil {
-			return workerCreateResponse{}, apiError{
-				code:    pkgapi.ErrorCodeProjectAmbiguous,
-				status:  http.StatusConflict,
-				message: fmt.Sprintf("Issue #%d is occupied by active %s loop %s", *issueNumber, collision.Type, collision.ID),
-				details: map[string]any{"occupiedBy": map[string]any{"loopId": collision.ID, "loopType": collision.Type}},
-			}
-		}
-	}
-
 	record, err := storage.WithTransactionValue(r.Context(), services.Coordinator.DB(), nil, func(tx *sql.Tx) (storage.LoopRecord, error) {
 		repos := storage.NewRepositories(tx)
+		// The initial check above gives callers a conflict before any forge
+		// refresh. Recheck in the same immediate SQLite transaction that
+		// publishes the worker so a claim that arrives during preflight cannot
+		// be committed alongside it. PR-target creation shares the existing
+		// target guard with fixer/reviewer publication.
+		if requestedIssueTarget != nil && !derefBool(body.Force) {
+			collision, collisionErr := h.findIssueCollisionLoop(r.Context(), repos, projectID, *requestedIssueTarget)
+			if collisionErr != nil {
+				return storage.LoopRecord{}, collisionErr
+			}
+			if collision != nil {
+				return storage.LoopRecord{}, issueCollisionError(*issueNumber, *collision)
+			}
+		}
 
 		existing, listErr := repos.Loops.List(r.Context())
 		if listErr != nil {

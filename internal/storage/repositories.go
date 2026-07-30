@@ -852,6 +852,50 @@ func (r *LoopsRepository) ListByRepoAndPR(ctx context.Context, repo string, prNu
 	return scanLoops(rows)
 }
 
+// ListConflictingIssueClaimLoops returns the live fixer or reviewer loops that
+// declare an issue. A retargeted loop keeps its source issue in worker
+// metadata, so matching cannot rely on the current pull-request target alone.
+func (r *LoopsRepository) ListConflictingIssueClaimLoops(ctx context.Context, projectID, repo string, issueNumber int64, statuses []domain.LoopStatus) ([]LoopRecord, error) {
+	if strings.TrimSpace(projectID) == "" || strings.TrimSpace(repo) == "" || issueNumber <= 0 || len(statuses) == 0 {
+		return []LoopRecord{}, nil
+	}
+
+	statusPlaceholders := sqlPlaceholders(len(statuses))
+	issueTargetID := fmt.Sprintf("issue:%s:%d", repo, issueNumber)
+	query := `
+		SELECT * FROM loops
+		WHERE project_id = ?
+		  AND type IN (?, ?)
+		  AND status IN (` + statusPlaceholders + `)
+		  AND (
+			(target_type = ? AND target_id = ? COLLATE NOCASE)
+			OR (
+				metadata_json IS NOT NULL
+				AND JSON_EXTRACT(metadata_json, '$.worker.issueNumber') = ?
+				AND COALESCE(
+					JSON_EXTRACT(metadata_json, '$.worker.issueRepo'),
+					JSON_EXTRACT(metadata_json, '$.worker.repo'),
+					repo
+				) = ? COLLATE NOCASE
+			)
+		  )
+		ORDER BY updated_at DESC, seq DESC
+	`
+	args := make([]any, 0, len(statuses)+7)
+	args = append(args, projectID, string(domain.LoopTypeFixer), string(domain.LoopTypeReviewer))
+	for _, status := range statuses {
+		args = append(args, string(status))
+	}
+	args = append(args, string(domain.LoopTargetTypeIssue), issueTargetID, issueNumber, repo)
+
+	rows, err := r.q.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list conflicting issue claim loops: %w", err)
+	}
+	defer rows.Close()
+	return scanLoops(rows)
+}
+
 func (r *LoopsRepository) ListByStatuses(ctx context.Context, statuses []string) ([]LoopRecord, error) {
 	if len(statuses) == 0 {
 		return []LoopRecord{}, nil
