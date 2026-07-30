@@ -53,9 +53,11 @@ type hitlAsk struct {
 	Confidence        string            `json:"confidence,omitempty"`
 }
 
-// hitlSentinelQuarantineSuffix marks preserved invalid gate evidence next to
-// the sentinel path, out of the consume path so retries do not re-trip on it.
-const hitlSentinelQuarantineSuffix = ".invalid"
+// hitlSentinelQuarantinePattern names per-event quarantine directories under
+// the system temp dir: outside the Git worktree, so auto-commit reconciliation
+// can never commit the evidence, and unique per event, so a repeated malformed
+// ask cannot clobber earlier preserved evidence.
+const hitlSentinelQuarantinePattern = "looper-ask-quarantine-*"
 
 // maxAskSentinelBytes bounds a sentinel read; a decision brief is small, and
 // an enormous file is not a decodable gate request.
@@ -102,12 +104,28 @@ func consumeAskSentinel(worktreePath string) (*hitlAsk, error) {
 	return &ask, nil
 }
 
-// quarantineAskSentinel preserves undecodable gate evidence beside the
-// sentinel path and returns an actionable diagnostic.
+// quarantineAskSentinel preserves undecodable gate evidence in a unique
+// directory OUTSIDE the Git worktree and returns an actionable diagnostic.
+// In-worktree quarantine would become an untracked change that auto-commit
+// reconciliation commits into the branch, and a fixed name would let a
+// repeated malformed ask clobber earlier evidence.
 func quarantineAskSentinel(path string, cause error) error {
-	quarantined := path + hitlSentinelQuarantineSuffix
-	if err := os.Rename(path, quarantined); err != nil {
+	dir, err := os.MkdirTemp("", hitlSentinelQuarantinePattern)
+	if err != nil {
 		return fmt.Errorf("%v; quarantine also failed: %v (evidence left at %s)", cause, err, path)
+	}
+	quarantined := filepath.Join(dir, filepath.Base(path))
+	if err := os.Rename(path, quarantined); err != nil {
+		// Cross-device or permission failure: fall back to copy-and-remove so
+		// the evidence still leaves the consume path.
+		raw, readErr := os.ReadFile(path)
+		if readErr != nil {
+			return fmt.Errorf("%v; quarantine also failed: %v (evidence left at %s)", cause, err, path)
+		}
+		if writeErr := os.WriteFile(quarantined, raw, 0o600); writeErr != nil {
+			return fmt.Errorf("%v; quarantine also failed: %v (evidence left at %s)", cause, writeErr, path)
+		}
+		_ = os.Remove(path)
 	}
 	return fmt.Errorf("%v; evidence quarantined at %s — inspect it, then answer or retry the loop", cause, quarantined)
 }
@@ -304,10 +322,13 @@ func (r *Runner) readFreshHITLAsk(ctx context.Context, loop *storage.LoopRecord)
 func (r *Runner) detectHumanAsk(ctx context.Context, input stepInput, worktreePath, executionID string) (*awaitingHumanError, error) {
 	ask, err := consumeAskSentinel(worktreePath)
 	if err != nil {
-		// Fail closed: the sentinel exists, so the agent requested a human
-		// gate. Proceeding to validation and publication as if it didn't is
-		// the one outcome a gate must prevent.
-		return nil, fmt.Errorf("HITL ask sentinel failure for loop %s: %w", input.Loop.ID, err)
+		// Fail closed AND parked: the sentinel exists, so the agent requested
+		// a human gate. A plain error would classify as retryable-transient,
+		// auto-requeue, and the retry — finding the sentinel quarantined —
+		// would proceed to publication, exactly the bypass the gate exists to
+		// prevent. Manual intervention keeps the loop stopped until a human
+		// inspects the quarantined evidence.
+		return nil, &loopError{message: fmt.Sprintf("HITL ask sentinel failure for loop %s: %v", input.Loop.ID, err), kind: FailureManualIntervention}
 	}
 	if ask == nil {
 		return nil, nil
