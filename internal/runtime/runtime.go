@@ -3463,9 +3463,14 @@ type runtimeReviewerRecoveryPolicy struct {
 }
 
 func (r *Runtime) reviewerRecoveryPolicyForProject(projectID string) runtimeReviewerRecoveryPolicy {
-	roles := config.ProjectRoleConfigs(r.Config(), projectID)
+	cfg := r.Config()
+	roles := config.ProjectRoleConfigs(cfg, projectID)
+	includeDrafts := roles.Reviewer.Discovery.Triggers.IncludeDrafts
+	if reviewerRole, ok := config.ProjectCodingRoleConfig(cfg, projectID, config.CodingRoleReviewer); ok {
+		includeDrafts = reviewerRole.Discovery.IncludeDrafts
+	}
 	return runtimeReviewerRecoveryPolicy{
-		includeDrafts:    roles.Reviewer.Discovery.Triggers.IncludeDrafts,
+		includeDrafts:    includeDrafts,
 		stopOnApproved:   roles.Reviewer.Behavior.Loop.StopOnApproved,
 		stopOnReadyLabel: roles.Reviewer.Behavior.Loop.StopOnReadyLabel,
 		retry:            config.NormalizeReviewerRetryConfig(roles.Reviewer.Behavior.Retry),

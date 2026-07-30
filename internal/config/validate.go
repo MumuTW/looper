@@ -587,6 +587,17 @@ func ValidateForgejoRoleCapabilities(roles RoleConfigs, prefix string) error {
 	return &ConfigValidationError{Issues: issues}
 }
 
+// ValidatePlaneRoleCapabilities rejects role settings that require issue or
+// review-publishing capabilities Plane projects do not provide.
+func ValidatePlaneRoleCapabilities(roles RoleConfigs, prefix string) error {
+	issues := make([]ValidationIssue, 0)
+	validatePlaneRoleCapabilities(roles, prefix, &issues)
+	if len(issues) == 0 {
+		return nil
+	}
+	return &ConfigValidationError{Issues: issues}
+}
+
 func normalizeNetworkMode(mode NetworkMode) NetworkMode {
 	switch strings.TrimSpace(string(mode)) {
 	case "", string(NetworkModeOff):
