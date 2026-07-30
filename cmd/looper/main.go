@@ -1347,6 +1347,8 @@ Usage:
   looper upgrade preflight --target-looper <path> --target-looperd <path>
                                Report upgrade compatibility without changing the daemon
   looper upgrade backup       Create a daemon-owned rollback backup bundle
+  looper upgrade drain --deadline <duration>
+                               Close admission and wait for existing work
 
 Global flags, accepted before or after the verb:
   --config <path>              Config file to load

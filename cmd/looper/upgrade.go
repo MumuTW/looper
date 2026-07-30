@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+	"time"
 
 	"github.com/MumuTW/looper/internal/version"
 )
@@ -61,7 +62,7 @@ type upgradeDaemonVersion struct {
 
 func runUpgrade(ctx context.Context, global, operands []string, stdout interface{ Write([]byte) (int, error) }) error {
 	if len(operands) == 0 {
-		return badUsage("upgrade requires backup or preflight")
+		return badUsage("upgrade requires backup, drain, or preflight")
 	}
 	if operands[0] == "backup" {
 		if len(operands) != 1 {
@@ -77,8 +78,15 @@ func runUpgrade(ctx context.Context, global, operands []string, stdout interface
 		}
 		return writeVersionJSON(stdout, result)
 	}
+	if operands[0] == "drain" {
+		deadline, err := parseUpgradeDrainArgs(operands[1:])
+		if err != nil {
+			return err
+		}
+		return runUpgradeDrain(ctx, global, deadline, stdout)
+	}
 	if operands[0] != "preflight" {
-		return badUsage("upgrade requires backup or preflight")
+		return badUsage("upgrade requires backup, drain, or preflight")
 	}
 	targetLooper, targetLooperd, jsonOutput, err := parseUpgradePreflightArgs(operands[1:])
 	if err != nil {
@@ -126,6 +134,57 @@ type upgradeBackupResult struct {
 	Manifest  any    `json:"manifest"`
 }
 
+type upgradeDrainSnapshot struct {
+	LiveExecutions    int `json:"liveExecutions"`
+	PendingSpawns     int `json:"pendingSpawns"`
+	BoundOperations   int `json:"boundOperations"`
+	PendingOperations int `json:"pendingOperations"`
+}
+
+type upgradeDrainResult struct {
+	AdmissionState   string               `json:"admissionState"`
+	Snapshot         upgradeDrainSnapshot `json:"snapshot"`
+	Drained          bool                 `json:"drained"`
+	DeadlineExceeded bool                 `json:"deadlineExceeded"`
+}
+
+func runUpgradeDrain(ctx context.Context, global []string, deadline time.Duration, stdout interface{ Write([]byte) (int, error) }) error {
+	cfg, err := loadConfig(global)
+	if err != nil {
+		return err
+	}
+	result, err := requestJSON[upgradeDrainResult](ctx, cfg, "POST", "/api/v1/upgrade/drain", nil)
+	if err != nil {
+		return err
+	}
+	if result.Drained {
+		return writeVersionJSON(stdout, result)
+	}
+
+	drainCtx, cancel := context.WithTimeout(ctx, deadline)
+	defer cancel()
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-drainCtx.Done():
+			result.DeadlineExceeded = true
+			if err := writeVersionJSON(stdout, result); err != nil {
+				return err
+			}
+			return fmt.Errorf("upgrade drain deadline reached with %d live executions, %d pending spawns, %d bound operations, and %d pending operations", result.Snapshot.LiveExecutions, result.Snapshot.PendingSpawns, result.Snapshot.BoundOperations, result.Snapshot.PendingOperations)
+		case <-ticker.C:
+			result, err = requestJSON[upgradeDrainResult](drainCtx, cfg, "GET", "/api/v1/upgrade/drain", nil)
+			if err != nil {
+				return err
+			}
+			if result.Drained {
+				return writeVersionJSON(stdout, result)
+			}
+		}
+	}
+}
+
 func targetConfigCompatibility(ctx context.Context, binary string, global []string) (bool, string) {
 	args := append([]string{"--check-config"}, global...)
 	out, err := exec.CommandContext(ctx, binary, args...).CombinedOutput()
@@ -167,6 +226,17 @@ func parseUpgradePreflightArgs(args []string) (string, string, bool, error) {
 		return "", "", false, badUsage("upgrade preflight requires --target-looper and --target-looperd")
 	}
 	return looper, looperd, jsonOutput, nil
+}
+
+func parseUpgradeDrainArgs(args []string) (time.Duration, error) {
+	if len(args) != 2 || args[0] != "--deadline" || strings.TrimSpace(args[1]) == "" {
+		return 0, badUsage("upgrade drain requires --deadline <duration>")
+	}
+	deadline, err := time.ParseDuration(args[1])
+	if err != nil || deadline <= 0 {
+		return 0, badUsage("upgrade drain requires a positive Go duration for --deadline")
+	}
+	return deadline, nil
 }
 
 func targetBuildIdentity(ctx context.Context, binary string, args ...string) (version.Info, error) {

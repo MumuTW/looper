@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/MumuTW/looper/internal/version"
@@ -93,6 +94,61 @@ func TestUpgradeBackupRequestsDaemonOwnedBundle(t *testing.T) {
 	}
 	if result.Directory != "/backups/upgrade-1" {
 		t.Fatalf("backup result = %#v", result)
+	}
+}
+
+func TestUpgradeDrainWaitsForDaemonOwnedSnapshot(t *testing.T) {
+	var gets int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/upgrade/drain":
+			if r.Method == http.MethodPost {
+				writeEnvelope(w, http.StatusOK, upgradeDrainResult{AdmissionState: "draining", Snapshot: upgradeDrainSnapshot{LiveExecutions: 1}})
+				return
+			}
+			if r.Method == http.MethodGet {
+				gets++
+				writeEnvelope(w, http.StatusOK, upgradeDrainResult{AdmissionState: "draining", Drained: gets >= 1})
+				return
+			}
+		}
+		t.Fatalf("request = %s %s", r.Method, r.URL.Path)
+	}))
+	t.Cleanup(server.Close)
+	configForDaemon(t, server.URL)
+	stdout := &bytes.Buffer{}
+	if err := runUpgrade(context.Background(), nil, []string{"drain", "--deadline", "1s"}, stdout); err != nil {
+		t.Fatal(err)
+	}
+	var result upgradeDrainResult
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if !result.Drained || result.DeadlineExceeded || gets != 1 {
+		t.Fatalf("result = %#v, GETs = %d", result, gets)
+	}
+}
+
+func TestUpgradeDrainReturnsSnapshotWhenDeadlineExpires(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/upgrade/drain" {
+			t.Fatalf("path = %s", r.URL.Path)
+		}
+		writeEnvelope(w, http.StatusOK, upgradeDrainResult{AdmissionState: "draining", Snapshot: upgradeDrainSnapshot{LiveExecutions: 1}})
+	}))
+	t.Cleanup(server.Close)
+	configForDaemon(t, server.URL)
+	stdout := &bytes.Buffer{}
+	err := runUpgrade(context.Background(), nil, []string{"drain", "--deadline", "10ms"}, stdout)
+	if err == nil || !strings.Contains(err.Error(), "deadline reached") {
+		t.Fatalf("runUpgrade() error = %v", err)
+	}
+	var result upgradeDrainResult
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Drained || !result.DeadlineExceeded || result.Snapshot.LiveExecutions != 1 {
+		t.Fatalf("result = %#v", result)
 	}
 }
 
