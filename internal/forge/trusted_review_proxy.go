@@ -104,8 +104,8 @@ type TrustedReviewProxyPolicy struct {
 // StartTrustedReviewProxy listens on a private Unix socket and runs
 // `looper review submit` in a daemon-side child with the run-captured credential
 // environment injected. Agents receive only the socket path (via
-// TrustedReviewSockEnv), never a secret-bearing wrapper path, config snapshot
-// path, or LOOPER_TRUSTED_ENV_FILE.
+// TrustedReviewSockEnv), never provider tokens, a config snapshot path, or its
+// contents.
 //
 // trustedEnv may be empty for providers that have no tokenEnv, which is the
 // normal case: `gh` resolves its own ambient credentials in the child. The proxy
@@ -850,10 +850,9 @@ func trustedReviewProxyChildEnv(trustedEnv map[string]string, configFD int) []st
 		envMap[key] = value
 	}
 	// Security controls are applied after every data-environment source. A
-	// configured Agent.Env or provider tokenEnv must not retarget the config,
-	// re-enter the proxy, or expose a trusted-env file path.
+	// configured Agent.Env or provider tokenEnv must not retarget the config or
+	// re-enter the proxy.
 	delete(envMap, TrustedReviewSockEnv)
-	delete(envMap, TrustedEnvFileEnv)
 	delete(envMap, TrustedReviewConfigFDEnv)
 	delete(envMap, "LOOPER_CONFIG")
 	envMap[trustedReviewProxySkipEnv] = "1"

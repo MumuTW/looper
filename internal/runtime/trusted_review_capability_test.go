@@ -72,7 +72,7 @@ func TestResolveTrustedLooperCLIPathAcceptsCapableBinary(t *testing.T) {
 	if got != looperPath {
 		t.Fatalf("resolveTrustedLooperCLIPath() = %q, want %q", got, looperPath)
 	}
-	logger.requireMessage(t, "trusted looper review-submit wrapper verified")
+	logger.requireMessage(t, "trusted looper review-submit capability verified")
 }
 
 func TestResolveTrustedLooperCLIPathRejectsBinaryWithoutReviewSubmit(t *testing.T) {
@@ -141,7 +141,7 @@ func TestTrustedReviewCapabilityCachesVerdictUntilBinaryChanges(t *testing.T) {
 	if probes := countProbes(t, probeLog); probes != 1 {
 		t.Fatalf("probe count = %d, want 1 for repeated resolves of an unchanged binary", probes)
 	}
-	if count := logger.countMessage("trusted looper review-submit wrapper verified"); count != 1 {
+	if count := logger.countMessage("trusted looper review-submit capability verified"); count != 1 {
 		t.Fatalf("verdict log count = %d, want 1 for an unchanged verdict", count)
 	}
 

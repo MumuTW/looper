@@ -123,7 +123,7 @@ func Run(ctx context.Context, opts Options) error {
 
 	// When a daemon-side trusted review proxy is configured, forward the full
 	// invocation there so provider tokens stay out of the agent process and out
-	// of any agent-visible wrapper path. The proxy child clears the socket env
+	// of any agent-visible credential path. The proxy child clears the socket env
 	// and re-enters this command with tokens injected.
 	if forge.TrustedReviewSockConfigured() {
 		raw, err := io.ReadAll(opts.Stdin)

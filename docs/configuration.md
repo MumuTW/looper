@@ -756,7 +756,7 @@ OPENAI_API_KEY = "replace-me"
 
 # Agent subprocesses inherit only execution-safe host variables (for example,
 # PATH, HOME, locale, temporary/configuration directories, certificate paths,
-# SSH_AUTH_SOCK, and LOOPER_CONFIG so trusted wrappers resolve the same config).
+# SSH_AUTH_SOCK, and LOOPER_CONFIG so agent-invoked looper commands resolve the same config).
 # Add required credentials or tool-specific variables here.
 
 [agent.nativeResume]

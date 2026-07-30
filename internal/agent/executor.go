@@ -86,8 +86,8 @@ var inheritedAgentEnvKeys = []string{
 	"CODEX_HOME",
 	"CLAUDE_CONFIG_DIR",
 	"OPENCODE_CONFIG_DIR",
-	// Config path selector for trusted wrappers (looper review submit, etc.)
-	// that load via LOOPER_CONFIG when --config is not passed.
+	// Config path selector for agent-invoked looper commands that load via
+	// LOOPER_CONFIG when --config is not passed.
 	"LOOPER_CONFIG",
 	// Capability socket for daemon-side review submit (not a secret).
 	forge.TrustedReviewSockEnv,
@@ -2340,15 +2340,9 @@ func buildCommandEnv(workingDirectory string, prompt string, envSources ...map[s
 			envMap[key] = value
 		}
 	}
-	// Never expose the trusted-env file path to agent processes. Provider tokens
-	// for `looper review submit` stay on the daemon-side trusted review proxy;
-	// agents may only receive TrustedReviewSockEnv (a non-secret capability path).
-	delete(envMap, forge.TrustedEnvFileEnv)
 	for _, source := range envSources {
 		maps.Copy(envMap, source)
 	}
-	// Re-delete after source merge so caller env maps cannot reintroduce it.
-	delete(envMap, forge.TrustedEnvFileEnv)
 	for _, key := range unsafeAgentEnvKeys {
 		delete(envMap, key)
 	}

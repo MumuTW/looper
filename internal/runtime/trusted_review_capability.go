@@ -221,7 +221,7 @@ func logTrustedReviewCapabilityVerdict(logger bootstrap.Logger, configuredPath s
 		return
 	}
 	if capable {
-		logger.Info("trusted looper review-submit wrapper verified", map[string]any{"path": configuredPath})
+		logger.Info("trusted looper review-submit capability verified", map[string]any{"path": configuredPath})
 		return
 	}
 	logger.Warn("reviewer publishing disabled: configured looper binary cannot serve `looper review submit`", map[string]any{"path": configuredPath, "reason": reason})
