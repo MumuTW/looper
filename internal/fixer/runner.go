@@ -1993,6 +1993,10 @@ func (r *Runner) discoverPullRequestFromDetail(ctx context.Context, project stor
 		result.Skipped++
 		return nil
 	}
+	if loop != nil && loop.Status == string(domain.LoopStatusHumanTakeover) {
+		result.Skipped++
+		return nil
+	}
 	allFixItems := collectFixItems(detail)
 	if len(allFixItems) == 0 {
 		if err := r.clearFixerFollowupStateForPR(ctx, project.ID, repo, detail.Number); err != nil {

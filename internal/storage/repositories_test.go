@@ -2087,7 +2087,7 @@ func TestQueueClaimNextOfTypeSkipsTerminatedAndStoppedLoops(t *testing.T) {
 	if err := repos.Projects.Upsert(ctx, ProjectRecord{ID: projectID, Name: "Queue Terminal", RepoPath: "/tmp/repo", CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
-	for index, status := range []string{"terminated", "stopped"} {
+	for index, status := range []string{"terminated", "stopped", "human_takeover"} {
 		loopID := "loop_" + status
 		if err := repos.Loops.Upsert(ctx, LoopRecord{ID: loopID, Seq: int64(index + 1), ProjectID: projectID, Type: "reviewer", TargetType: "pull_request", Status: status, CreatedAt: now, UpdatedAt: now}); err != nil {
 			t.Fatalf("Loops.Upsert(%s) error = %v", status, err)

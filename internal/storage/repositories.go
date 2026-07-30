@@ -2895,7 +2895,7 @@ const scheduledQueueBaseQuery = `
 	WHERE qi.status = 'queued'
 		AND qi.available_at <= ?
 		AND (qi.project_id IS NULL OR p.archived = 0)
-		AND COALESCE(l.status, 'queued') NOT IN ('paused', 'completed', 'failed', 'interrupted', 'terminated', 'stopped')
+		AND COALESCE(l.status, 'queued') NOT IN ('paused', 'human_takeover', 'completed', 'failed', 'interrupted', 'terminated', 'stopped')
 		AND (
 			qi.lock_key IS NULL
 			OR NOT EXISTS (

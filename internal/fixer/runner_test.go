@@ -837,6 +837,45 @@ func TestDiscoverPullRequestsPreservesPausedLoop(t *testing.T) {
 	}
 }
 
+func TestDiscoverPullRequestsSkipsHumanTakeoverLoop(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(99)
+	nowISO := fixture.nowISO()
+	github := &fakeGitHubGateway{
+		listOpen:      []PullRequestSummary{{Number: prNumber, State: "OPEN", HeadSHA: "head-99"}},
+		viewResponses: []PullRequestDetail{{Number: prNumber, State: "OPEN", HeadSHA: "head-99", Comments: []map[string]any{{"id": "c99", "threadId": "t99", "body": "fix this thread"}}}},
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+	loop := storage.LoopRecord{ID: "loop_human_takeover", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "human_takeover", CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	if len(result.CreatedLoopIDs) != 0 || len(result.QueueItems) != 0 {
+		t.Fatalf("result = %#v, want no created loops or queue items for human_takeover loop", result)
+	}
+	persisted, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if persisted == nil || persisted.Status != "human_takeover" {
+		t.Fatalf("loop = %#v, want human_takeover status preserved", persisted)
+	}
+	items, err := fixture.repos.Queue.List(context.Background())
+	if err != nil {
+		t.Fatalf("Queue.List() error = %v", err)
+	}
+	if len(items) != 0 {
+		t.Fatalf("len(Queue.List()) = %d, want 0", len(items))
+	}
+}
+
 func TestDiscoverPullRequestsResumesPausedNoopResolveLoopWhenFixItemsChange(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
