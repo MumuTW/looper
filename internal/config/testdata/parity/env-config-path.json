@@ -69,7 +69,6 @@
         },
         "package": {
           "distribution": "github-release",
-          "autoUpgradeEnabled": true,
           "autoMigrateOnStartup": false,
           "requireBackupBeforeMigrate": true
         },
@@ -219,7 +218,6 @@
       },
       "package": {
         "distribution": "github-release",
-        "autoUpgradeEnabled": true,
         "autoMigrateOnStartup": false,
         "requireBackupBeforeMigrate": true
       },

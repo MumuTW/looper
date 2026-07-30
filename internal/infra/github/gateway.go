@@ -3024,13 +3024,6 @@ func (g *Gateway) IsAuthenticated(ctx context.Context, cwd, hostname string) (bo
 	return false, err
 }
 
-func (g *Gateway) GetCurrentUserLogin(ctx context.Context, cwd string) (string, error) {
-	if snapshot := discoverySnapshotFromContext(ctx); snapshot != nil {
-		return snapshot.getCurrentUserLogin(ctx, cwd)
-	}
-	return g.getCurrentUserLoginRaw(ctx, cwd)
-}
-
 func (g *Gateway) GetCurrentUserIdentity(ctx context.Context, cwd string) (CurrentUserIdentity, error) {
 	result, err := g.runGh(ctx, cwd, "", "api", "user", "--jq", `{login: .login, id: .id}`)
 	if err != nil {
@@ -3048,17 +3041,6 @@ func (g *Gateway) GetCurrentUserIdentity(ctx context.Context, cwd string) (Curre
 		return CurrentUserIdentity{}, err
 	}
 	return CurrentUserIdentity{Login: strings.TrimSpace(asString(row["login"])), NumericID: asInt64(row["id"])}, nil
-}
-
-func (g *Gateway) getCurrentUserLoginRaw(ctx context.Context, cwd string) (string, error) {
-	result, err := g.runGh(ctx, cwd, "", "api", "user", "--jq", ".login")
-	if err != nil {
-		if isUserLoginUnsupportedForCurrentToken(err) {
-			return "", nil
-		}
-		return "", err
-	}
-	return strings.TrimSpace(result.Stdout), nil
 }
 
 func (g *Gateway) GetCurrentUserLoginForRepo(ctx context.Context, repo string, cwd string) (string, error) {

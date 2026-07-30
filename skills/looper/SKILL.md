@@ -9,11 +9,13 @@ Use this skill when an agent needs to install, configure, start, check, operate,
 
 > **The CLI is tiny, and installation is manual.** The whole operator surface is:
 >
-> `looper init|status|project add|project list|project discover|start|pause|retry|stop|close|takeover|handback|respond|version`
+> `looper init|status|dashboard|project add|project list|project discover|start|pause|retry|stop|close|takeover|handback|respond|version`
 >
 > plus machine-only `looper review submit` (never suggest it to a user). Global flags (`--config`, `--host`, `--port`) work before or after the verb. A **selector** is a loop sequence number or a loop id — never a pull request URL.
 >
 > There is **no** `bootstrap`, `daemon install|start|…`, `upgrade`, `config show`, `webhook`/`provider`/`network` administration, or `ps`/`logs`/`jump`/`plan`/`review`/`work`. Those lived in the CLI removed ahead of the role-model rewrite. Do anything else by editing the config file, through the dashboard (`/dashboard/`), through the daemon's HTTP API, or with the user's process manager — never invent a `looper` verb.
+
+`looper dashboard` prints a URL; it does not start the daemon or control a browser. In `local-token` mode, set `LOOPER_TOKEN` to the token accepted by looperd (or select the same config file) and open the short-lived one-shot URL immediately.
 
 Webhook mode is configured in the config file and observed at `GET /api/v1/webhook/status` or on the dashboard. Stale GitHub CLI forwarder hooks have to be removed with `gh api` by hand after the user confirms.
 

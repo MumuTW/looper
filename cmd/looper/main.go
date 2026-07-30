@@ -112,6 +112,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return reportError(stderr, runInit(parsed.Global, parsed.Operands, stdout))
 	case "status":
 		return reportError(stderr, runStatus(ctx, parsed.Global, parsed.Operands, stdout))
+	case "dashboard":
+		return reportError(stderr, runDashboard(ctx, parsed.Global, parsed.Operands, stdout))
 	case "project":
 		return reportError(stderr, runProject(ctx, parsed.Global, parsed.Operands, stdout))
 	}
@@ -920,6 +922,8 @@ type statusAwaitingConfirmationSourceView struct {
 	Repo        string `json:"repo"`
 	IssueNumber int64  `json:"issueNumber"`
 	AgeSeconds  int64  `json:"ageSeconds"`
+	// Command is the comment that confirms this source, token included.
+	Command string `json:"command"`
 }
 
 type statusBinaryView struct {
@@ -1025,12 +1029,25 @@ func writeStatusOpsLines(stdout io.Writer, status daemonStatusResponse) {
 	if awaiting.Count > 0 {
 		_, _ = fmt.Fprintf(stdout, "triage:  awaitingHumanConfirmation=%d\n", awaiting.Count)
 		for _, source := range awaiting.Sources {
-			_, _ = fmt.Fprintf(stdout, "  - %s#%d  waiting %s\n", source.Repo, source.IssueNumber, statusAge(source.AgeSeconds))
+			_, _ = fmt.Fprintf(stdout, "  - %s\n", awaitingConfirmationLine(source))
 		}
 	}
 	if len(status.Service.DegradedReasons) > 0 {
 		_, _ = fmt.Fprintf(stdout, "degraded: %s\n", strings.Join(status.Service.DegradedReasons, ", "))
 	}
+}
+
+// awaitingConfirmationLine renders one parked triage source and the single
+// comment that releases it. The command carries a per-report token that exists
+// nowhere else an operator reads, so a line without it names a problem the
+// reader still cannot act on (#255). A source the daemon reported without one
+// is printed without the trailing clause rather than with an unusable command.
+func awaitingConfirmationLine(source statusAwaitingConfirmationSourceView) string {
+	line := fmt.Sprintf("%s#%d  waiting %s", source.Repo, source.IssueNumber, statusAge(source.AgeSeconds))
+	if command := strings.TrimSpace(source.Command); command != "" {
+		line += fmt.Sprintf("  ->  comment %q on the issue", command)
+	}
+	return line
 }
 
 func statusAge(seconds int64) string {
@@ -1314,6 +1331,7 @@ func usage(w io.Writer) {
 Usage:
   looper init                  Write a starter config file (never overwrites)
   looper status                Report config, daemon reachability, and projects
+  looper dashboard             Print a dashboard URL authenticated for this session
   looper project add <path>    Register a git repository root with the daemon
   looper project list          List registered projects
   looper project discover <id> Retry post-commit worktree/PR discovery for a project

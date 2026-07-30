@@ -1059,7 +1059,7 @@ func TestHandlerStatusProjectsAwaitingTriageConfirmationWithoutWritingState(t *t
 	}
 	payload, err := json.Marshal(triager.Report{
 		Version: 2, IdempotencyKey: "triage-awaiting-status", ProjectID: "project_1", Repo: "acme/looper", IssueNumber: 42,
-		Policy: triager.PolicyDecision{Action: triager.ActionAwaitHuman}, CreatedAt: createdAt,
+		Policy: triager.PolicyDecision{Action: triager.ActionAwaitHuman}, ConfirmationToken: "triage-confirm-42", CreatedAt: createdAt,
 	})
 	if err != nil {
 		t.Fatalf("marshal triage report: %v", err)
@@ -1102,6 +1102,8 @@ func TestHandlerStatusProjectsAwaitingTriageConfirmationWithoutWritingState(t *t
 	assertEqual(t, source["issueNumber"], float64(42))
 	assertEqual(t, source["createdAt"], createdAt)
 	assertEqual(t, source["ageSeconds"], float64(90*60))
+	// The token is the only thing that makes the roster actionable (#255).
+	assertEqual(t, source["command"], "/plan triage-confirm-42")
 }
 
 func TestHandlerStatusSurfacesUnknownReviewPublishWithoutProbing(t *testing.T) {

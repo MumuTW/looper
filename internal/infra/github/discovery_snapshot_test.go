@@ -102,19 +102,19 @@ func TestDiscoverySnapshotCachesPerProjectDataAndTickLoginByCWD(t *testing.T) {
 	if _, err := gateway.ViewPullRequest(projectOneCtx, ViewPullRequestInput{Repo: "acme/looper", PRNumber: 1, CWD: "/repo-one"}); err != nil {
 		t.Fatalf("ViewPullRequest(second) error = %v", err)
 	}
-	login, err := gateway.GetCurrentUserLogin(projectOneCtx, "/repo-one")
+	login, err := gateway.GetCurrentUserLoginForRepo(projectOneCtx, "", "/repo-one")
 	if err != nil {
-		t.Fatalf("GetCurrentUserLogin(project one) error = %v", err)
+		t.Fatalf("GetCurrentUserLoginForRepo(project one) error = %v", err)
 	}
 	if login != "octo" {
-		t.Fatalf("GetCurrentUserLogin(project one) = %q, want octo", login)
+		t.Fatalf("GetCurrentUserLoginForRepo(project one) = %q, want octo", login)
 	}
-	login, err = gateway.GetCurrentUserLogin(projectTwoCtx, "/repo-two")
+	login, err = gateway.GetCurrentUserLoginForRepo(projectTwoCtx, "", "/repo-two")
 	if err != nil {
-		t.Fatalf("GetCurrentUserLogin(project two) error = %v", err)
+		t.Fatalf("GetCurrentUserLoginForRepo(project two) error = %v", err)
 	}
 	if login != "other" {
-		t.Fatalf("GetCurrentUserLogin(project two) = %q, want other", login)
+		t.Fatalf("GetCurrentUserLoginForRepo(project two) = %q, want other", login)
 	}
 
 	if got := counts["pr_list"]; got != 1 {

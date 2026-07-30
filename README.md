@@ -207,7 +207,7 @@ Global flags, accepted before or after the verb: `--config <path>`, `--host <hos
 
 There is one more command that is not for operators: `looper review submit`, which publishes a reviewer agent's pull request review. Reviewer agents reach it through a wrapper the daemon writes; run directly it has no provider credentials and fails.
 
-**Not in the CLI.** Bootstrap, managed daemon install/start, plan/review/work, ps/logs/jump, provider/webhook/network administration, and upgrade lived in the CLI that was removed. Loop inspection is available through the dashboard and the daemon's HTTP API; install and supervise `looperd` yourself.
+**Not in the CLI.** General bootstrap, managed daemon install/start, plan/review/work, ps/logs/jump, provider/webhook/network administration, and upgrade lived in the CLI that was removed. `looper dashboard` only mints and prints a browser login URL; loop inspection remains in the dashboard and the daemon's HTTP API. Install and supervise `looperd` yourself.
 
 ## Configuration
 
@@ -218,7 +218,7 @@ There is one more command that is not for operators: `looper review submit`, whi
 - All role-specific config lives under `roles.<role>`; canonical reviewer behavior lives under `roles.reviewer.behavior.*`
 - Loading legacy `~/.looper/config.json` emits one informational note per process telling users that `~/.looper/config.toml` is now the preferred default path
 - `agent.vendor` is required to run loops (no default)
-- If `server.authMode=local-token`, set `server.localToken` and export `LOOPER_TOKEN` for the CLI
+- If `server.authMode=local-token`, set `server.localToken`; run `LOOPER_TOKEN=… looper dashboard` (or let the CLI read the same configured token), then open the one-shot URL it prints
 
 Every field, env var, CLI flag, validation rule, and troubleshooting note lives in **[docs/configuration.md](docs/configuration.md)**.
 

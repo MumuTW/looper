@@ -81,7 +81,7 @@ The dashboard provides curated field-level controls rather than a raw config edi
 
 - environment- or CLI-overridden fields are visible but read-only because those higher-precedence layers remain authoritative
 - `agent.env` values are write-only: the dashboard shows configured key names and supports set/replace/remove, but the API never returns values
-- `server.localToken`, `daemon.environment`, and arbitrary `agent.params` remain file-only
+- `server.localToken` (or its `LOOPER_TOKEN` environment override), `daemon.environment`, and arbitrary `agent.params` remain outside dashboard editing
 - projects remain managed by the Projects API and SQLite catalog, not the generic Configuration page
 - each config read returns the revision captured with its published values; each patch submits it and repeats an identity/mode/byte check immediately before atomic rename, catching changes present before that final check
 - portable filesystems leave a tiny final-check-to-rename race, so do not combine simultaneous manual and dashboard writes
