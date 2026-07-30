@@ -7799,13 +7799,6 @@ func serializeProject(project storage.ProjectRecord, cfg config.Config, defaultB
 	return response
 }
 
-func cloneProjectValidation(source *config.ProjectValidationConfig) *config.ProjectValidationConfig {
-	if source == nil {
-		return nil
-	}
-	return &config.ProjectValidationConfig{Commands: append([]string(nil), source.Commands...), OptOut: source.OptOut}
-}
-
 func serializeProjectValidation(metadata map[string]any, cfg config.Config) *projectValidationResponse {
 	if raw, ok := metadata["validation"]; ok && raw != nil {
 		encoded, err := json.Marshal(raw)
