@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/nexu-io/looper/internal/projects"
+	"github.com/MumuTW/looper/internal/projects"
 )
 
 func TestHandlerProjectsCreateRejectsProviderFieldByPresence(t *testing.T) {
