@@ -111,6 +111,10 @@ type ExecutorOptions struct {
 	Repos  *storage.Repositories
 	LogDir string
 	Now    func() time.Time
+	// ClaimLeaseRenewalInterval overrides how often a live execution renews its
+	// queue claim lease. Zero means defaultClaimLeaseRenewalInterval. Set it only
+	// in tests that need to observe a renewal without waiting minutes.
+	ClaimLeaseRenewalInterval time.Duration
 	// ParamsOwnerVendor marks Config.Params as global agent.params owned by that
 	// vendor (typically agent.vendor). effectiveConfig always filters command/args
 	// via ParamsForRoleVendor against the effective identity (role or sticky
@@ -226,6 +230,11 @@ type ConfiguredExecutor struct {
 	owner                SpawnOwner
 	onHardPersistFailure func(error)
 	onProgress           func(context.Context, ProgressUpdate)
+	// claimLeaseRenewalInterval is per-executor rather than a package var so a
+	// test that needs a fast tick speeds up only its own execution. A global
+	// would put every other execution in the package on the same fast timer and
+	// its writes on their critical path.
+	claimLeaseRenewalInterval time.Duration
 }
 
 func New(options ExecutorOptions) *ConfiguredExecutor {
@@ -242,6 +251,8 @@ func New(options ExecutorOptions) *ConfiguredExecutor {
 		owner:                options.Owner,
 		onHardPersistFailure: options.OnHardPersistFailure,
 		onProgress:           options.OnProgress,
+
+		claimLeaseRenewalInterval: options.ClaimLeaseRenewalInterval,
 	}
 }
 
@@ -887,7 +898,7 @@ func (x *execution) run(ctx context.Context) {
 	}
 	// The claim lease is renewed from here, not from output: this loop runs for
 	// exactly as long as the agent process does, which is what the lease means.
-	leaseTicker := time.NewTicker(claimLeaseRenewalInterval)
+	leaseTicker := time.NewTicker(x.claimLeaseRenewalInterval())
 	defer leaseTicker.Stop()
 
 	waiting := true
@@ -1278,7 +1289,7 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 	)
 	// The claim lease is renewed from here, not from output: this loop runs for
 	// exactly as long as the agent process does, which is what the lease means.
-	leaseTicker := time.NewTicker(claimLeaseRenewalInterval)
+	leaseTicker := time.NewTicker(x.claimLeaseRenewalInterval())
 	defer leaseTicker.Stop()
 	if x.timeout > 0 {
 		timeoutTimer = time.After(x.timeout)
@@ -1565,13 +1576,24 @@ func (x *execution) bumpRunHeartbeat(nowISO string) {
 	// here could resurrect stale run state captured before a concurrent writer,
 	// and an out-of-order heartbeat must not move liveness evidence backward.
 	_ = x.executor.repos.Runs.TouchHeartbeat(ctx, x.input.RunID, nowISO)
-	x.renewClaimLease()
+	// The lease is deliberately NOT renewed here. Output is not the liveness
+	// signal (see renewClaimLease), so the supervisor timer is the sole renewal
+	// authority. Renewing per output line as well would add a second synchronous
+	// write to the hot path for no extra guarantee, and it measurably delayed
+	// kill escalation.
 }
 
-// claimLeaseRenewalInterval keeps a comfortable margin inside the lease TTL, so
-// a single slow or failed write does not expire a live claim. It is a var only
-// so a test can watch a silent execution renew without waiting minutes.
-var claimLeaseRenewalInterval = storage.ClaimLeaseRenewalTTL / 3
+// defaultClaimLeaseRenewalInterval keeps a comfortable margin inside the lease
+// TTL, so a single slow or failed write does not expire a live claim.
+const defaultClaimLeaseRenewalInterval = storage.ClaimLeaseRenewalTTL / 3
+
+// claimLeaseRenewalInterval is the renewal period for this execution.
+func (x *execution) claimLeaseRenewalInterval() time.Duration {
+	if x != nil && x.executor != nil && x.executor.claimLeaseRenewalInterval > 0 {
+		return x.executor.claimLeaseRenewalInterval
+	}
+	return defaultClaimLeaseRenewalInterval
+}
 
 // renewClaimLease extends the queue claim lease that authorizes this run.
 //

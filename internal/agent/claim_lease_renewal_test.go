@@ -19,9 +19,7 @@ import (
 // process does, and a silent agent that has genuinely stalled is still killed
 // by its own idle timeout.
 func TestExecutorRenewsClaimLeaseForASilentLiveExecution(t *testing.T) {
-	previousInterval := claimLeaseRenewalInterval
-	claimLeaseRenewalInterval = 50 * time.Millisecond
-	t.Cleanup(func() { claimLeaseRenewalInterval = previousInterval })
+	t.Parallel()
 
 	ctx := context.Background()
 	coordinator := openAgentCoordinator(t)
@@ -67,6 +65,9 @@ func TestExecutorRenewsClaimLeaseForASilentLiveExecution(t *testing.T) {
 		}},
 		Repos:             repos,
 		ParamsOwnerVendor: &custom,
+		// Scoped to this executor: a package-level override would put every
+		// other execution in this package on a 50ms write timer too.
+		ClaimLeaseRenewalInterval: 50 * time.Millisecond,
 	})
 
 	execution, err := executor.Start(ctx, RunInput{
