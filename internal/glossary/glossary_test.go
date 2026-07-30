@@ -5,6 +5,7 @@ import (
 	"go/parser"
 	"go/token"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -45,25 +46,33 @@ var codePointer = regexp.MustCompile("`([a-z][a-z0-9_]*)\\.([A-Z][A-Za-z0-9_]*)`
 // backtick rather than stopping at the characters a path usually contains, so
 // that a reference carrying a suffix — an anchor, a stray bracket — is checked
 // and fails, instead of not matching at all and being silently skipped.
-var packagePath = regexp.MustCompile("`([A-Za-z0-9_.-]+/[^`]+)`")
+var packagePath = regexp.MustCompile("`([A-Za-z0-9_.-]+(?:/[^`]*)?)`")
 
-// repoTopLevelDirs is what a backticked path is checked against, read from the
-// repository rather than listed here: a path under docs or tools is as much a
-// reference that can rot as one under internal, and a new top-level directory
-// should not need this test edited to be covered.
-func repoTopLevelDirs(t *testing.T) map[string]struct{} {
+// repoRootEntries is what a backticked reference is checked against, read from
+// the repository rather than listed here: a path under docs or tools can rot
+// exactly like one under internal, a root file such as AGENTS.md is referenced
+// with no slash at all, and a new top-level entry should not need this test
+// edited to be covered.
+func repoRootEntries(t *testing.T) (map[string]struct{}, map[string]struct{}) {
 	t.Helper()
 	entries, err := os.ReadDir(repoRoot)
 	if err != nil {
 		t.Fatalf("read repo root: %v", err)
 	}
-	out := map[string]struct{}{}
+	names := map[string]struct{}{}
+	extensions := map[string]struct{}{}
 	for _, entry := range entries {
-		if entry.IsDir() && !strings.HasPrefix(entry.Name(), ".") {
-			out[entry.Name()] = struct{}{}
+		if strings.HasPrefix(entry.Name(), ".") {
+			continue
+		}
+		names[entry.Name()] = struct{}{}
+		if !entry.IsDir() {
+			if extension := path.Ext(entry.Name()); extension != "" {
+				extensions[extension] = struct{}{}
+			}
 		}
 	}
-	return out
+	return names, extensions
 }
 
 func contextDoc(t *testing.T) string {
@@ -151,16 +160,35 @@ func adrHeadingNumber(path string) (string, bool) {
 func TestContextPackagePathsResolve(t *testing.T) {
 	t.Parallel()
 
-	dirs := repoTopLevelDirs(t)
+	entries, rootExtensions := repoRootEntries(t)
 	for _, match := range packagePath.FindAllStringSubmatch(contextDoc(t), -1) {
 		reference := match[1]
-		top, _, _ := strings.Cut(reference, "/")
-		if _, isRepoPath := dirs[top]; !isRepoPath {
-			// Not a repository path — CONTEXT.md also backticks config keys
-			// and forge routes that happen to contain a slash.
+		top, hasSlash := "", strings.Contains(reference, "/")
+		top, _, _ = strings.Cut(reference, "/")
+		if !hasSlash {
+			// A root file is referenced with no slash, which makes it look
+			// exactly like the config keys and event names CONTEXT.md also
+			// backticks (triage.report, network.mode). Distinguish by
+			// extension, taken from the repository's own root files, so a
+			// typo in `AGENTS.md` is caught while `triage.report` is not
+			// mistaken for a file.
+			extension := path.Ext(reference)
+			if _, isRootExtension := rootExtensions[extension]; !isRootExtension {
+				continue
+			}
+		} else if _, isRepoReference := entries[top]; !isRepoReference {
+			// Not a repository reference — CONTEXT.md also backticks forge
+			// routes and config paths that look path-shaped.
 			continue
 		}
-		if _, err := os.Stat(filepath.Join(repoRoot, reference)); err != nil {
+		// A reference is a claim about repository content, so it has to stay
+		// inside the repository: `docs/../../../etc/passwd` names a real file
+		// on some machines and no repository content anywhere.
+		if reference != path.Clean(reference) || strings.HasPrefix(path.Clean(reference), "..") {
+			t.Errorf("CONTEXT.md references %q, which does not name repository content", reference)
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(repoRoot, filepath.FromSlash(reference))); err != nil {
 			t.Errorf("CONTEXT.md references %q, which does not exist", reference)
 		}
 	}

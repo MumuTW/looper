@@ -12,6 +12,27 @@
 // body because it is a static analysis with edge cases of its own — aliased
 // imports, assembled constants, per-owner exemption — that need to be covered
 // directly instead of through the repository it happens to scan.
+//
+// # What it does not detect
+//
+// The fold is syntactic. It resolves literals, concatenation, parentheses,
+// file-scope and block-scope string constants, and selectors on a confirmed
+// import of an owner package. It does not implement Go's constant evaluation,
+// so all of these are out of scope:
+//
+//   - a constant declared in one file of a non-owner package and used in
+//     another
+//   - a chain of owner constants deeper than one level of derivation
+//   - a local identifier that shadows an imported package name
+//   - anything built at runtime, such as fmt.Sprintf
+//
+// The boundary is deliberate. Completeness needs go/types and the whole
+// package graph, which would make a check that runs in `go test ./...`
+// markedly slower to guard cases nobody has written; both regressions this
+// exists to prevent were bare literals. A gap here is a missed report, never
+// a false one — the failure mode is silence, not a wrong accusation — and the
+// rule it enforces is a convention, not a security boundary. If a bypass in
+// this list ever happens for real, that is the evidence to spend go/types on.
 package labelaudit
 
 import (
