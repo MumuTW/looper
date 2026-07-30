@@ -11,12 +11,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/nexu-io/looper/internal/config"
-	"github.com/nexu-io/looper/internal/daemonbinary"
-	networkclient "github.com/nexu-io/looper/internal/network/client"
-	looperdruntime "github.com/nexu-io/looper/internal/runtime"
-	"github.com/nexu-io/looper/internal/triager"
-	"github.com/nexu-io/looper/internal/version"
+	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/daemonbinary"
+	networkclient "github.com/MumuTW/looper/internal/network/client"
+	looperdruntime "github.com/MumuTW/looper/internal/runtime"
+	"github.com/MumuTW/looper/internal/triager"
+	"github.com/MumuTW/looper/internal/version"
 )
 
 type statusResponse struct {

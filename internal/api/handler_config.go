@@ -5,8 +5,8 @@ import (
 	"net/http"
 	"sort"
 
-	"github.com/nexu-io/looper/internal/config"
-	pkgapi "github.com/nexu-io/looper/pkg/api"
+	"github.com/MumuTW/looper/internal/config"
+	pkgapi "github.com/MumuTW/looper/pkg/api"
 )
 
 func (h *Handler) handleConfigRoute(w http.ResponseWriter, r *http.Request, requestID string) {
