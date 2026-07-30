@@ -496,6 +496,10 @@ type Options struct {
 	// before. HITLNotify, when set, sends the ask-card to the human channel.
 	HITLEnabled bool
 	HITLNotify  HITLNotifyFunc
+	// HITLQuarantineRoot is daemon-owned durable storage for malformed ask
+	// sentinels. Production derives it from the configured storage directory;
+	// tests that exercise malformed evidence provide an isolated directory.
+	HITLQuarantineRoot string
 	// HITLAnswerTransport selects how a mid-run ask is delivered: "github" (post it
 	// as a PR comment; the default) or "feishu"/"respond" (via HITLNotify / the API).
 	HITLAnswerTransport string
@@ -584,6 +588,7 @@ type Runner struct {
 	network                 NetworkStatusGateway
 	hitlEnabled             bool
 	hitlNotify              HITLNotifyFunc
+	hitlQuarantineRoot      string
 	hitlAnswerTransport     string
 	hitlGitHub              HITLGitHubSettings
 }
@@ -846,6 +851,7 @@ func New(options Options) *Runner {
 		network:                 options.Network,
 		hitlEnabled:             options.HITLEnabled,
 		hitlNotify:              options.HITLNotify,
+		hitlQuarantineRoot:      strings.TrimSpace(options.HITLQuarantineRoot),
 		hitlAnswerTransport:     options.HITLAnswerTransport,
 		hitlGitHub:              options.HITLGitHub,
 	}

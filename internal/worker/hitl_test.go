@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -18,6 +17,7 @@ import (
 
 func TestConsumeAskSentinelReadsAndRemoves(t *testing.T) {
 	dir := t.TempDir()
+	quarantineRoot := filepath.Join(t.TempDir(), "quarantine")
 	if err := os.MkdirAll(filepath.Join(dir, ".looper"), 0o755); err != nil {
 		t.Fatalf("MkdirAll error = %v", err)
 	}
@@ -26,7 +26,7 @@ func TestConsumeAskSentinelReadsAndRemoves(t *testing.T) {
 		t.Fatalf("WriteFile error = %v", err)
 	}
 
-	ask, err := consumeAskSentinel(dir)
+	ask, err := consumeAskSentinel(dir, quarantineRoot, "loop-1", "run-1")
 	if err != nil {
 		t.Fatalf("consumeAskSentinel error = %v", err)
 	}
@@ -38,10 +38,10 @@ func TestConsumeAskSentinelReadsAndRemoves(t *testing.T) {
 	}
 
 	// No sentinel -> nil, nil (both a missing file and an absent .looper dir).
-	if again, err := consumeAskSentinel(dir); err != nil || again != nil {
+	if again, err := consumeAskSentinel(dir, quarantineRoot, "loop-1", "run-1"); err != nil || again != nil {
 		t.Fatalf("second consumeAskSentinel = (%#v, %v), want (nil, nil)", again, err)
 	}
-	if missing, err := consumeAskSentinel(t.TempDir()); err != nil || missing != nil {
+	if missing, err := consumeAskSentinel(t.TempDir(), quarantineRoot, "loop-1", "run-1"); err != nil || missing != nil {
 		t.Fatalf("consumeAskSentinel(empty dir) = (%#v, %v), want (nil, nil)", missing, err)
 	}
 }
@@ -564,6 +564,7 @@ func TestEnsureDraftPRForAskDoesNotPublishFailedValidation(t *testing.T) {
 
 func TestConsumeAskSentinelFailsClosedAndQuarantines(t *testing.T) {
 	t.Parallel()
+	quarantineRoot := filepath.Join(t.TempDir(), "quarantine")
 
 	writeSentinel := func(t *testing.T, content string) string {
 		t.Helper()
@@ -578,11 +579,11 @@ func TestConsumeAskSentinelFailsClosedAndQuarantines(t *testing.T) {
 	}
 	quarantinePathFromError := func(t *testing.T, err error) string {
 		t.Helper()
-		matches := regexp.MustCompile(`evidence quarantined at (\S+)`).FindStringSubmatch(err.Error())
-		if len(matches) != 2 {
-			t.Fatalf("error = %v, want it to name the quarantined path", err)
+		var incident *askSentinelProtocolError
+		if !errors.As(err, &incident) || incident.evidencePath == "" {
+			t.Fatalf("error = %#v, want structured quarantined evidence", err)
 		}
-		return matches[1]
+		return incident.evidencePath
 	}
 	assertQuarantined := func(t *testing.T, dir string, err error, wantContent string) string {
 		t.Helper()
@@ -594,7 +595,6 @@ func TestConsumeAskSentinelFailsClosedAndQuarantines(t *testing.T) {
 		if readErr != nil {
 			t.Fatalf("quarantined evidence unreadable: %v", readErr)
 		}
-		t.Cleanup(func() { _ = os.RemoveAll(filepath.Dir(quarantined)) })
 		if string(raw) != wantContent {
 			t.Fatalf("quarantined evidence = %q, want original content preserved", raw)
 		}
@@ -606,7 +606,7 @@ func TestConsumeAskSentinelFailsClosedAndQuarantines(t *testing.T) {
 
 	t.Run("truncated JSON fails closed with evidence quarantined", func(t *testing.T) {
 		dir := writeSentinel(t, `{"question":"delete prod?`)
-		ask, err := consumeAskSentinel(dir)
+		ask, err := consumeAskSentinel(dir, quarantineRoot, "loop-1", "run-1")
 		if err == nil || ask != nil {
 			t.Fatalf("consumeAskSentinel = (%#v, %v), want fail-closed error", ask, err)
 		}
@@ -618,7 +618,7 @@ func TestConsumeAskSentinelFailsClosedAndQuarantines(t *testing.T) {
 
 	t.Run("schema without question fails closed", func(t *testing.T) {
 		dir := writeSentinel(t, `{"options":["a","b"]}`)
-		ask, err := consumeAskSentinel(dir)
+		ask, err := consumeAskSentinel(dir, quarantineRoot, "loop-1", "run-1")
 		if err == nil || ask != nil {
 			t.Fatalf("consumeAskSentinel = (%#v, %v), want fail-closed error", ask, err)
 		}
@@ -635,21 +635,19 @@ func TestConsumeAskSentinelFailsClosedAndQuarantines(t *testing.T) {
 			t.Fatalf("Chmod error = %v", err)
 		}
 		t.Cleanup(func() { _ = os.Chmod(path, 0o644) })
-		ask, err := consumeAskSentinel(dir)
+		ask, err := consumeAskSentinel(dir, quarantineRoot, "loop-1", "run-1")
 		if err == nil || ask != nil {
 			t.Fatalf("consumeAskSentinel = (%#v, %v), want fail-closed error", ask, err)
 		}
 		if !strings.Contains(err.Error(), "cannot be read") {
 			t.Fatalf("error = %v, want read diagnostic", err)
 		}
-		if _, statErr := os.Stat(path); statErr != nil {
-			t.Fatalf("evidence missing after read failure: %v", statErr)
-		}
+		assertQuarantined(t, dir, err, `{"question":"q"}`)
 	})
 
 	t.Run("oversized sentinel fails closed", func(t *testing.T) {
 		dir := writeSentinel(t, `{"question":"`+strings.Repeat("x", maxAskSentinelBytes)+`"}`)
-		ask, err := consumeAskSentinel(dir)
+		ask, err := consumeAskSentinel(dir, quarantineRoot, "loop-1", "run-1")
 		if err == nil || ask != nil {
 			t.Fatalf("consumeAskSentinel = (%#v, %v), want fail-closed error", ask, err)
 		}
@@ -660,7 +658,7 @@ func TestConsumeAskSentinelFailsClosedAndQuarantines(t *testing.T) {
 
 	t.Run("repeated malformed asks preserve every piece of evidence", func(t *testing.T) {
 		dir := writeSentinel(t, `{"question":"first attempt`)
-		_, err1 := consumeAskSentinel(dir)
+		_, err1 := consumeAskSentinel(dir, quarantineRoot, "loop-1", "run-1")
 		if err1 == nil {
 			t.Fatal("first consumeAskSentinel error = nil, want fail-closed error")
 		}
@@ -669,7 +667,7 @@ func TestConsumeAskSentinelFailsClosedAndQuarantines(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(dir, hitlSentinelRelPath), []byte(`{"question":"second attempt`), 0o644); err != nil {
 			t.Fatalf("WriteFile(second) error = %v", err)
 		}
-		_, err2 := consumeAskSentinel(dir)
+		_, err2 := consumeAskSentinel(dir, quarantineRoot, "loop-1", "run-1")
 		if err2 == nil {
 			t.Fatal("second consumeAskSentinel error = nil, want fail-closed error")
 		}
@@ -684,24 +682,24 @@ func TestConsumeAskSentinelFailsClosedAndQuarantines(t *testing.T) {
 
 	t.Run("valid ask still consumed, absent still no-question", func(t *testing.T) {
 		dir := writeSentinel(t, `{"question":"Redis or Postgres?","options":["redis","postgres"]}`)
-		ask, err := consumeAskSentinel(dir)
+		ask, err := consumeAskSentinel(dir, quarantineRoot, "loop-1", "run-1")
 		if err != nil || ask == nil || ask.Question != "Redis or Postgres?" {
 			t.Fatalf("consumeAskSentinel = (%#v, %v), want the parsed ask", ask, err)
 		}
 		if _, statErr := os.Stat(filepath.Join(dir, hitlSentinelRelPath)); !os.IsNotExist(statErr) {
 			t.Fatal("valid sentinel must be consumed")
 		}
-		if again, err := consumeAskSentinel(dir); err != nil || again != nil {
+		if again, err := consumeAskSentinel(dir, quarantineRoot, "loop-1", "run-1"); err != nil || again != nil {
 			t.Fatalf("second consumeAskSentinel = (%#v, %v), want (nil, nil)", again, err)
 		}
 	})
 }
 
-func TestDetectHumanAskParksOnSentinelFailure(t *testing.T) {
+func TestDetectHumanAskCreatesAnswerableAskOnSentinelFailure(t *testing.T) {
 	t.Parallel()
 
 	fixture := newRunnerFixture(t)
-	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now, HITLEnabled: true})
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now, HITLEnabled: true, HITLQuarantineRoot: filepath.Join(t.TempDir(), "quarantine")})
 	dir := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(dir, ".looper"), 0o755); err != nil {
 		t.Fatalf("MkdirAll error = %v", err)
@@ -714,13 +712,12 @@ func TestDetectHumanAskParksOnSentinelFailure(t *testing.T) {
 	if err != nil || loop == nil {
 		t.Fatalf("Loops.GetByID() = (%#v, %v)", loop, err)
 	}
-	_, awaitErr := runner.detectHumanAsk(context.Background(), stepInput{Loop: *loop}, dir, "exec-1")
-	if awaitErr == nil {
-		t.Fatal("detectHumanAsk error = nil, want parked gate failure")
+	awaiting, awaitErr := runner.detectHumanAsk(context.Background(), stepInput{Loop: *loop, Run: storage.RunRecord{ID: "run-1"}}, dir, "exec-1")
+	if awaitErr != nil {
+		t.Fatalf("detectHumanAsk error = %v, want answerable synthetic ask", awaitErr)
 	}
-	var le *loopError
-	if !errors.As(awaitErr, &le) || le.kind != FailureManualIntervention {
-		t.Fatalf("detectHumanAsk error = %#v, want loopError with manual_intervention: a retryable kind auto-requeues and the retry, finding the sentinel quarantined, would publish the gated work", awaitErr)
+	if awaiting == nil || len(awaiting.options) != 2 || !strings.Contains(awaiting.question, "regenerate the decision brief") || !strings.Contains(awaiting.recommendation, "evidence quarantined") {
+		t.Fatalf("awaiting = %#v, want a diagnostic HITL ask that /respond can answer", awaiting)
 	}
 }
 

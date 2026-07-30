@@ -2,9 +2,11 @@ package worker
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -53,11 +55,7 @@ type hitlAsk struct {
 	Confidence        string            `json:"confidence,omitempty"`
 }
 
-// hitlSentinelQuarantinePattern names per-event quarantine directories under
-// the system temp dir: outside the Git worktree, so auto-commit reconciliation
-// can never commit the evidence, and unique per event, so a repeated malformed
-// ask cannot clobber earlier preserved evidence.
-const hitlSentinelQuarantinePattern = "looper-ask-quarantine-*"
+const hitlSentinelQuarantinePattern = "ask-*"
 
 // maxAskSentinelBytes bounds a sentinel read; a decision brief is small, and
 // an enormous file is not a decodable gate request.
@@ -71,7 +69,7 @@ const maxAskSentinelBytes = 1 << 20
 // decision must not let the worker continue to validation and publication.
 // Consuming (deleting) a valid sentinel prevents the same question from
 // re-suspending on resume.
-func consumeAskSentinel(worktreePath string) (*hitlAsk, error) {
+func consumeAskSentinel(worktreePath, quarantineRoot, loopID, runID string) (*hitlAsk, error) {
 	if strings.TrimSpace(worktreePath) == "" {
 		return nil, nil
 	}
@@ -81,53 +79,171 @@ func consumeAskSentinel(worktreePath string) (*hitlAsk, error) {
 		if os.IsNotExist(err) {
 			return nil, nil
 		}
-		return nil, fmt.Errorf("ask sentinel exists but cannot be read: %w", err)
+		return nil, quarantineAskSentinel(path, quarantineRoot, loopID, runID, fmt.Errorf("ask sentinel exists but cannot be read: %w", err), askSentinelFileOps{})
 	}
 	if info.Size() > maxAskSentinelBytes {
-		return nil, quarantineAskSentinel(path, fmt.Errorf("ask sentinel is %d bytes (limit %d)", info.Size(), maxAskSentinelBytes))
+		return nil, quarantineAskSentinel(path, quarantineRoot, loopID, runID, fmt.Errorf("ask sentinel is %d bytes (limit %d)", info.Size(), maxAskSentinelBytes), askSentinelFileOps{})
 	}
-	raw, err := os.ReadFile(path)
+	file, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
 		}
-		return nil, fmt.Errorf("ask sentinel exists but cannot be read: %w", err)
+		return nil, quarantineAskSentinel(path, quarantineRoot, loopID, runID, fmt.Errorf("ask sentinel exists but cannot be read: %w", err), askSentinelFileOps{})
+	}
+	raw, readErr := io.ReadAll(io.LimitReader(file, maxAskSentinelBytes+1))
+	closeErr := file.Close()
+	if readErr != nil {
+		return nil, quarantineAskSentinel(path, quarantineRoot, loopID, runID, fmt.Errorf("ask sentinel exists but cannot be read: %w", readErr), askSentinelFileOps{})
+	}
+	if closeErr != nil {
+		return nil, quarantineAskSentinel(path, quarantineRoot, loopID, runID, fmt.Errorf("ask sentinel exists but cannot be closed after reading: %w", closeErr), askSentinelFileOps{})
+	}
+	if len(raw) > maxAskSentinelBytes {
+		return nil, quarantineAskSentinel(path, quarantineRoot, loopID, runID, fmt.Errorf("ask sentinel exceeds %d-byte limit while being read", maxAskSentinelBytes), askSentinelFileOps{})
 	}
 	var ask hitlAsk
 	if err := json.Unmarshal(raw, &ask); err != nil {
-		return nil, quarantineAskSentinel(path, fmt.Errorf("ask sentinel is not valid JSON: %w", err))
+		return nil, quarantineAskSentinel(path, quarantineRoot, loopID, runID, fmt.Errorf("ask sentinel is not valid JSON: %w", err), askSentinelFileOps{})
 	}
 	if strings.TrimSpace(ask.Question) == "" {
-		return nil, quarantineAskSentinel(path, errors.New("ask sentinel has no question"))
+		return nil, quarantineAskSentinel(path, quarantineRoot, loopID, runID, errors.New("ask sentinel has no question"), askSentinelFileOps{})
 	}
-	_ = os.Remove(path)
+	if err := os.Remove(path); err != nil {
+		return nil, quarantineAskSentinel(path, quarantineRoot, loopID, runID, fmt.Errorf("decoded ask sentinel could not be consumed: %w", err), askSentinelFileOps{})
+	}
 	return &ask, nil
 }
 
-// quarantineAskSentinel preserves undecodable gate evidence in a unique
-// directory OUTSIDE the Git worktree and returns an actionable diagnostic.
-// In-worktree quarantine would become an untracked change that auto-commit
-// reconciliation commits into the branch, and a fixed name would let a
-// repeated malformed ask clobber earlier evidence.
-func quarantineAskSentinel(path string, cause error) error {
-	dir, err := os.MkdirTemp("", hitlSentinelQuarantinePattern)
+// askSentinelProtocolError is structured daemon evidence that the HITL sentinel
+// path was exercised but its request could not be decoded or consumed safely.
+// It is not action authority: detectHumanAsk turns it into the existing HITLAsk
+// state, and only a human response authorizes the resumed agent's next action.
+type askSentinelProtocolError struct {
+	cause           error
+	originalPath    string
+	evidencePath    string
+	originalRemoved bool
+	quarantineErr   error
+}
+
+func (e *askSentinelProtocolError) Error() string {
+	switch {
+	case e.quarantineErr == nil:
+		return fmt.Sprintf("%v; evidence quarantined at %s", e.cause, e.evidencePath)
+	case e.evidencePath != "" && e.originalRemoved:
+		return fmt.Sprintf("%v; evidence moved to %s but quarantine hardening failed: %v", e.cause, e.evidencePath, e.quarantineErr)
+	case e.evidencePath != "":
+		return fmt.Sprintf("%v; quarantine incomplete: %v (copy at %s; original remains at %s)", e.cause, e.quarantineErr, e.evidencePath, e.originalPath)
+	default:
+		return fmt.Sprintf("%v; quarantine failed: %v (evidence remains at %s)", e.cause, e.quarantineErr, e.originalPath)
+	}
+}
+
+func (e *askSentinelProtocolError) Unwrap() error { return e.cause }
+
+type askSentinelFileOps struct {
+	rename func(string, string) error
+	remove func(string) error
+}
+
+func (ops askSentinelFileOps) withDefaults() askSentinelFileOps {
+	if ops.rename == nil {
+		ops.rename = os.Rename
+	}
+	if ops.remove == nil {
+		ops.remove = os.Remove
+	}
+	return ops
+}
+
+// quarantineAskSentinel moves evidence into daemon-owned durable storage. A
+// symlink is always copied through to regular-file content so it cannot become
+// a dangling link after leaving the worktree. Rename failures use a streaming
+// copy, keeping memory bounded even for an oversized sentinel.
+func quarantineAskSentinel(path, root, loopID, runID string, cause error, ops askSentinelFileOps) error {
+	incident := &askSentinelProtocolError{cause: cause, originalPath: path}
+	if strings.TrimSpace(root) == "" {
+		incident.quarantineErr = errors.New("daemon quarantine root is not configured")
+		return incident
+	}
+	loopDir := filepath.Join(root, durableQuarantineComponent(loopID, "unknown-loop"))
+	parent := filepath.Join(loopDir, durableQuarantineComponent(runID, "unknown-run"))
+	for _, directory := range []string{root, loopDir, parent} {
+		if err := os.MkdirAll(directory, 0o700); err != nil {
+			incident.quarantineErr = fmt.Errorf("create quarantine directory %s: %w", directory, err)
+			return incident
+		}
+		if err := os.Chmod(directory, 0o700); err != nil {
+			incident.quarantineErr = fmt.Errorf("secure quarantine directory %s: %w", directory, err)
+			return incident
+		}
+	}
+	dir, err := os.MkdirTemp(parent, hitlSentinelQuarantinePattern)
 	if err != nil {
-		return fmt.Errorf("%v; quarantine also failed: %v (evidence left at %s)", cause, err, path)
+		incident.quarantineErr = fmt.Errorf("create quarantine event directory: %w", err)
+		return incident
 	}
-	quarantined := filepath.Join(dir, filepath.Base(path))
-	if err := os.Rename(path, quarantined); err != nil {
-		// Cross-device or permission failure: fall back to copy-and-remove so
-		// the evidence still leaves the consume path.
-		raw, readErr := os.ReadFile(path)
-		if readErr != nil {
-			return fmt.Errorf("%v; quarantine also failed: %v (evidence left at %s)", cause, err, path)
-		}
-		if writeErr := os.WriteFile(quarantined, raw, 0o600); writeErr != nil {
-			return fmt.Errorf("%v; quarantine also failed: %v (evidence left at %s)", cause, writeErr, path)
-		}
-		_ = os.Remove(path)
+	if err := os.Chmod(dir, 0o700); err != nil {
+		incident.quarantineErr = fmt.Errorf("secure quarantine event directory: %w", err)
+		return incident
 	}
-	return fmt.Errorf("%v; evidence quarantined at %s — inspect it, then answer or retry the loop", cause, quarantined)
+	destination := filepath.Join(dir, filepath.Base(path))
+	incident.evidencePath = destination
+	ops = ops.withDefaults()
+	info, lstatErr := os.Lstat(path)
+	if lstatErr == nil && info.Mode()&os.ModeSymlink == 0 {
+		if err := ops.rename(path, destination); err == nil {
+			incident.originalRemoved = true
+			if err := os.Chmod(destination, 0o600); err != nil {
+				incident.quarantineErr = fmt.Errorf("secure quarantined evidence: %w", err)
+			}
+			return incident
+		}
+	}
+	if err := copyAskSentinel(path, destination); err != nil {
+		incident.evidencePath = ""
+		incident.quarantineErr = err
+		return incident
+	}
+	if err := ops.remove(path); err != nil {
+		incident.quarantineErr = fmt.Errorf("remove original after fallback copy: %w", err)
+		return incident
+	}
+	incident.originalRemoved = true
+	return incident
+}
+
+func copyAskSentinel(source, destination string) error {
+	input, err := os.Open(source)
+	if err != nil {
+		return fmt.Errorf("open sentinel for fallback copy: %w", err)
+	}
+	defer input.Close()
+	output, err := os.OpenFile(destination, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return fmt.Errorf("create quarantine evidence: %w", err)
+	}
+	_, copyErr := io.Copy(output, input)
+	closeErr := output.Close()
+	if copyErr != nil {
+		_ = os.Remove(destination)
+		return fmt.Errorf("copy sentinel to quarantine: %w", copyErr)
+	}
+	if closeErr != nil {
+		_ = os.Remove(destination)
+		return fmt.Errorf("close quarantined evidence: %w", closeErr)
+	}
+	return nil
+}
+
+func durableQuarantineComponent(value, fallback string) string {
+	value = strings.TrimSpace(value)
+	if value != "" && value != "." && value != ".." && filepath.Base(value) == value {
+		return value
+	}
+	sum := sha256.Sum256([]byte(value))
+	return fmt.Sprintf("%s-%x", fallback, sum[:8])
 }
 
 // awaitingHumanError is returned from the execute step when the agent asked a
@@ -289,15 +405,27 @@ func (r *Runner) readFreshHITLAsk(ctx context.Context, loop *storage.LoopRecord)
 // returns a typed awaitingHumanError carrying the question, options, and the
 // agent's native session id (so the run can resume the same session).
 func (r *Runner) detectHumanAsk(ctx context.Context, input stepInput, worktreePath, executionID string) (*awaitingHumanError, error) {
-	ask, err := consumeAskSentinel(worktreePath)
+	ask, err := consumeAskSentinel(worktreePath, r.hitlQuarantineRoot, input.Loop.ID, input.Run.ID)
 	if err != nil {
-		// Fail closed AND parked: the sentinel exists, so the agent requested
-		// a human gate. A plain error would classify as retryable-transient,
-		// auto-requeue, and the retry — finding the sentinel quarantined —
-		// would proceed to publication, exactly the bypass the gate exists to
-		// prevent. Manual intervention keeps the loop stopped until a human
-		// inspects the quarantined evidence.
-		return nil, &loopError{message: fmt.Sprintf("HITL ask sentinel failure for loop %s: %v", input.Loop.ID, err), kind: FailureManualIntervention}
+		// Sentinel presence is daemon-observed protocol evidence, not authority
+		// for an inferred action. Persist a synthetic, answerable HITL ask so the
+		// existing /respond path remains the only authority that resumes work.
+		sessionID, vendor := r.latestAgentSession(ctx, input.Loop.ID)
+		diagnostic := fmt.Sprintf("HITL ask sentinel failure for loop %s: %v", input.Loop.ID, err)
+		return &awaitingHumanError{
+			question:          "Looper could not decode the agent's human-decision request. After inspecting the evidence, should the agent regenerate the decision brief or continue without it?",
+			options:           []string{"regenerate the decision brief", "continue without the original request"},
+			sessionID:         sessionID,
+			executionID:       executionID,
+			vendor:            vendor,
+			recommendation:    diagnostic,
+			recommendedOption: "regenerate the decision brief",
+			consequences: map[string]string{
+				"regenerate the decision brief":         "resume the same agent context and require a new valid question before proceeding",
+				"continue without the original request": "resume only because the human explicitly authorizes proceeding without that undecodable request",
+			},
+			confidence: "low",
+		}, nil
 	}
 	if ask == nil {
 		return nil, nil

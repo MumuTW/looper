@@ -46,6 +46,49 @@ Every transport below is just an adapter that (a) delivers the question and (b)
 feeds an answer into `deliverHumanAnswer`. The agent contract is unchanged: it
 writes `.looper/ask.json {question, options}` and stops.
 
+### 2.1 Invalid sentinel authority and quarantine
+
+The sentinel is a daemon-owned protocol boundary. Its **presence** is evidence
+that the sentinel path was exercised during the agent turn; it does not prove
+who wrote it or why. Its bytes are untrusted input and are not authority for any
+inferred answer or lifecycle action. A missing sentinel means “no question.” An
+existing sentinel that cannot be decoded or safely consumed can never mean the
+same thing, because proceeding would publish work past a possibly destructive
+decision gate.
+
+Looper therefore converts an invalid sentinel into the same persisted
+`HITLAsk` used by valid questions. The synthetic question names the decode or
+quarantine failure and asks the operator whether the resumed agent must
+regenerate its decision brief or may continue without the original request. The
+loop becomes `awaiting_human`, the claimed queue item is cancelled, and the run
+ends `interrupted`; `/respond` or the configured answer transport remains the
+only authority that resumes it. There is no separate manual-intervention state,
+quarantine ledger, or recovery state machine.
+
+The raw evidence moves outside the checkout to the daemon state directory:
+
+```
+<directory containing storage.dbPath>/quarantine/<loopID>/<runID>/ask-*/ask.json
+```
+
+Directories are private (`0700`) and evidence is a regular `0600` file. A
+same-filesystem regular file is renamed. Cross-device fallback copies as a
+stream before removing the original, so an oversized sentinel does not become
+an equally oversized memory allocation. Symlinks are always resolved and copied
+as regular content. A failed removal is reported as an incomplete quarantine
+with both locations; it is never described as success.
+
+This prevents three concrete failures: committing quarantined evidence from the
+worktree, losing evidence on reboot because it lived in `TMPDIR`, and silently
+auto-retrying after the malformed sentinel disappeared. The cost is durable raw
+agent-controlled bytes until an operator removes them, plus one ephemeral
+per-event directory and a path-bearing diagnostic in loop metadata. This record
+still cannot prove that the agent intentionally created the file, that a
+concurrently changing file is a coherent snapshot, or that its contents are
+safe to execute; it only preserves evidence for inspection. A simpler
+fail-loud/manual-intervention error is insufficient because it leaves no
+answerable `HITLAsk`, while deleting the sentinel and retrying bypasses the gate.
+
 ## 3. Transport A — GitHub PR comment (OSS default)
 
 **Out:** on suspend, ensure the loop has a (draft) PR, post an ask comment with a

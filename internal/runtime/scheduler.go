@@ -2160,6 +2160,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 				return notifyWorkerRunCompleted(ctx, workerRunCompletedNotificationInput{ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Subtitle: input.Subtitle, Status: input.Status, Summary: input.Summary, FailureKind: input.FailureKind, PullRequestNumber: input.PullRequestNumber, PullRequestURL: input.PullRequestURL})
 			},
 			HITLEnabled:         cfg.HITL.Enabled,
+			HITLQuarantineRoot:  filepath.Join(filepath.Dir(cfg.Storage.DBPath), "quarantine"),
 			HITLAnswerTransport: cfg.HITL.AnswerTransport,
 			HITLGitHub:          hitlGitHubSettings(cfg.HITL.GitHub),
 			HITLNotify:          notifyHITLAsk,
