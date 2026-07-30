@@ -78,6 +78,9 @@ type StaleRunReconcileSummary struct {
 	// QuarantinedLoopIDs names the loops parked by this pass, so a caller can
 	// report them without re-deriving the set from event_logs.
 	QuarantinedLoopIDs []string `json:"quarantinedLoopIds,omitempty"`
+	// QuarantineSettlement reports the evidence retired this pass because an
+	// operator already disposed of the loop behind it (#149 / #150).
+	QuarantineSettlement QuarantineSettlementSummary `json:"quarantineSettlement"`
 }
 
 type staleRunReconcileMode string
@@ -85,7 +88,6 @@ type staleRunReconcileMode string
 const (
 	staleRunReconcileModeStartup staleRunReconcileMode = "startup"
 	staleRunReconcileModeLive    staleRunReconcileMode = "live"
-	staleRunReconcileModeManual  staleRunReconcileMode = "manual"
 )
 
 type RecoveryOrphanAgentCleanup struct {
@@ -2309,20 +2311,6 @@ func (r *Runtime) ExecutionMatchesProcess(ctx context.Context, execution storage
 	return r.executionMatchesProcess(ctx, execution, pid)
 }
 
-func (r *Runtime) ReconcileStaleRunningRuns(ctx context.Context) (StaleRunReconcileSummary, error) {
-	r.mu.RLock()
-	repositories := r.services.Repositories
-	now := r.now
-	r.mu.RUnlock()
-	if repositories == nil {
-		return StaleRunReconcileSummary{}, fmt.Errorf("storage is not configured")
-	}
-	if now == nil {
-		now = time.Now
-	}
-	return r.reconcileStaleRunningRunsWithMode(ctx, repositories, now().UTC(), staleRunReconcileModeManual)
-}
-
 func (r *Runtime) reconcileLiveStaleRunningRuns(ctx context.Context) (StaleRunReconcileSummary, error) {
 	r.mu.RLock()
 	repositories := r.services.Repositories
@@ -2343,6 +2331,16 @@ func (r *Runtime) reconcileStaleRunningRunsWithMode(ctx context.Context, reposit
 		return summary, nil
 	}
 	nowISO := summary.StartedAt
+	// Retire quarantine evidence the operator already resolved before scanning
+	// running runs: settling frees the one-running-run-per-loop index the
+	// replacement run would otherwise collide with.
+	settlement, err := r.settleDisposedQuarantine(ctx, repositories, nowISO)
+	if err != nil {
+		return StaleRunReconcileSummary{}, err
+	}
+	summary.QuarantineSettlement = settlement
+	summary.EventsWritten += settlement.EventsWritten
+
 	runningRuns, err := repositories.Runs.ListByStatus(ctx, string(domain.RunStatusRunning))
 	if err != nil {
 		return StaleRunReconcileSummary{}, err
