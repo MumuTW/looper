@@ -59,8 +59,19 @@ export default function App() {
   useEffect(() => {
     let cancelled = false;
     void (async () => {
+      let bootstrapExchangeError: unknown;
       try {
         await exchangeBootstrapCodeIfPresent();
+      } catch (err) {
+        // An expired/replayed URL must not discard an otherwise valid restored
+        // session. The authenticated health request below is the authority for
+        // whether the browser token remains usable.
+        if (!isBootstrapRouteAbsent(err)) {
+          bootstrapExchangeError = err;
+        }
+      }
+
+      try {
         // One read verifies both a fresh browser and a restored session token.
         // A rotated/expired session must reach the same recovery UI as a browser
         // with no token instead of rendering several unrelated panel-level 401s.
@@ -68,10 +79,14 @@ export default function App() {
       } catch (err) {
         if (err instanceof ApiError && err.status === 401) {
           clearDashboardToken();
-        }
-        if (!cancelled && !isBootstrapRouteAbsent(err)) {
-          const message = err instanceof Error ? err.message : String(err);
-          setBootstrapError(message);
+          if (!cancelled) {
+            const displayError = bootstrapExchangeError ?? err;
+            const message =
+              displayError instanceof Error
+                ? displayError.message
+                : String(displayError);
+            setBootstrapError(message);
+          }
         }
       } finally {
         if (!cancelled) {

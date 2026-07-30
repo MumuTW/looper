@@ -72,8 +72,13 @@ describe("bootstrap code exchange", () => {
 
   it("reports a rejected code when the daemon does serve the route", async () => {
     window.history.replaceState({}, "", "/dashboard/?code=expired");
-    stubDaemon(() =>
-      response({ code: "UNAUTHORIZED", message: "Invalid bootstrap code" }, 401),
+    stubDaemon(
+      () => response({ code: "UNAUTHORIZED", message: "Invalid bootstrap code" }, 401),
+      () =>
+        response(
+          { code: "UNAUTHORIZED", message: "Authorization token is required" },
+          401,
+        ),
     );
 
     render(<App />);
@@ -106,6 +111,34 @@ describe("bootstrap code exchange", () => {
     expect(screen.getByText(/Authorization token is required/)).toBeTruthy();
     expect(screen.getByText("looper dashboard")).toBeTruthy();
     expect(screen.queryByRole("navigation")).toBeNull();
+  });
+
+  it("keeps a valid restored token when a stale bootstrap code is rejected", async () => {
+    window.history.replaceState({}, "", "/dashboard/?code=expired");
+    sessionStorage.setItem("looper.dashboard.token", "still-valid");
+    stubDaemon(
+      () => response({ code: "UNAUTHORIZED", message: "Invalid bootstrap code" }, 401),
+      () => response({ healthy: true }),
+    );
+
+    render(<App />);
+
+    expect(await screen.findByRole("navigation")).toBeTruthy();
+    expect(sessionStorage.getItem("looper.dashboard.token")).toBe("still-valid");
+    expect(screen.queryByText("Dashboard login required")).toBeNull();
+  });
+
+  it("leaves transient health failures to the dashboard retry surface", async () => {
+    window.history.replaceState({}, "", "/dashboard/?code=fresh");
+    stubDaemon(
+      () => response({ token: "tok_local" }),
+      () => response({ code: "INTERNAL", message: "temporarily unavailable" }, 503),
+    );
+
+    render(<App />);
+
+    expect(await screen.findByRole("navigation")).toBeTruthy();
+    expect(screen.queryByText("Dashboard login required")).toBeNull();
   });
 
   it("clears a rejected restored token and points back to the login flow", async () => {

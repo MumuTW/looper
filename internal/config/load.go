@@ -1219,7 +1219,7 @@ func buildEnvOverrides(lookupEnv EnvLookupFunc) (PartialConfig, error) {
 		ensureServerConfig(&overrides).Port = parsed
 	}
 	if value, ok := lookupEnv("LOOPER_TOKEN"); ok {
-		ensureServerConfig(&overrides).LocalToken = stringPtr(value)
+		ensureServerConfig(&overrides).LocalToken = stringPtr(strings.TrimSpace(value))
 	}
 	if value, ok := lookupEnv("LOOPER_DB_PATH"); ok {
 		ensureStorageConfig(&overrides).DBPath = stringPtr(value)
