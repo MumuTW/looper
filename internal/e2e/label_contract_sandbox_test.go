@@ -45,7 +45,7 @@ func TestGitHubSandboxLabelCreateDuplicateContract(t *testing.T) {
 		if err == nil {
 			t.Fatalf("gh label create on an existing name succeeded; fake-gh models it as a failure\noutput=%s", output)
 		}
-		if !strings.Contains(strings.ToLower(output), "already exists") && !strings.Contains(strings.ToLower(output), "already_exists") {
+		if !strings.Contains(strings.ToLower(output), "already exists") {
 			t.Fatalf("duplicate create failed with an unrecognised message; isLabelAlreadyExistsError matches on it\noutput=%s", output)
 		}
 
