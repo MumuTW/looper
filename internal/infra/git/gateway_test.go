@@ -212,6 +212,12 @@ func TestGatewayDetachedPRWorktreeReusesRecordAcrossBranches(t *testing.T) {
 	if items[0].Branch != "reviewer/pr-42-head" {
 		t.Fatalf("stored branch = %q, want reviewer/pr-42-head", items[0].Branch)
 	}
+	if err := gateway.CleanupWorktree(ctx, CleanupWorktreeInput{ProjectID: fixture.projectID, RepoPath: fixture.repoPath, WorktreeRoot: fixture.worktreeRoot, WorktreePath: first.WorktreePath, Branch: first.Branch}); err == nil || !strings.Contains(err.Error(), "currently claimed") {
+		t.Fatalf("CleanupWorktree(stale branch) error = %v, want current-claim refusal", err)
+	}
+	if _, err := os.Stat(second.WorktreePath); err != nil {
+		t.Fatalf("shared checkout removed by stale cleanup: %v", err)
+	}
 	if err := gateway.CleanupWorktree(ctx, CleanupWorktreeInput{ProjectID: fixture.projectID, RepoPath: fixture.repoPath, WorktreeRoot: fixture.worktreeRoot, WorktreePath: second.WorktreePath, Branch: "reviewer/pr-42-head"}); err != nil {
 		t.Fatalf("CleanupWorktree() error = %v", err)
 	}

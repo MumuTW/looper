@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -2825,6 +2826,45 @@ func (r *WorktreesRepository) Upsert(ctx context.Context, record WorktreeRecord)
 	return nil
 }
 
+// AdoptPath upserts record as the durable identity for its physical checkout.
+// If a different row currently owns the requested project/branch label, the
+// label is retired in the same transaction so a failed adoption cannot strand
+// the other active checkout under synthetic provenance.
+func (r *WorktreesRepository) AdoptPath(ctx context.Context, record WorktreeRecord) error {
+	if tx, ok := r.q.(*sql.Tx); ok {
+		return (&WorktreesRepository{q: tx}).adoptPath(ctx, record)
+	}
+	db, ok := r.q.(txBeginner)
+	if !ok {
+		return fmt.Errorf("worktree path adoption requires transactional storage")
+	}
+	return WithTransaction(ctx, db, nil, func(tx *sql.Tx) error {
+		return (&WorktreesRepository{q: tx}).adoptPath(ctx, record)
+	})
+}
+
+func (r *WorktreesRepository) adoptPath(ctx context.Context, record WorktreeRecord) error {
+	branchRecord, err := r.GetByBranch(ctx, record.ProjectID, record.Branch)
+	if err != nil {
+		return err
+	}
+	if branchRecord != nil && branchRecord.ID != record.ID {
+		if branchRecord.Status == "cleaned" || branchRecord.CleanedAt != nil {
+			if err := r.Delete(ctx, branchRecord.ID); err != nil {
+				return fmt.Errorf("delete colliding cleaned worktree %q: %w", branchRecord.ID, err)
+			}
+		} else {
+			retired := *branchRecord
+			retired.Branch = fmt.Sprintf("retired/%s/%s", branchRecord.ID, strings.ReplaceAll(branchRecord.Branch, "/", "-"))
+			retired.UpdatedAt = record.UpdatedAt
+			if err := r.Upsert(ctx, retired); err != nil {
+				return fmt.Errorf("retire colliding worktree branch %q: %w", branchRecord.ID, err)
+			}
+		}
+	}
+	return r.Upsert(ctx, record)
+}
+
 // Delete removes a worktree identity row. Callers use this when two durable
 // identities must collapse onto one physical path (or one branch label) and the
 // discarded row no longer describes a checkout Looper should manage.
@@ -2862,7 +2902,14 @@ func (r *WorktreesRepository) GetByBranch(ctx context.Context, projectID, branch
 }
 
 func (r *WorktreesRepository) GetByPath(ctx context.Context, worktreePath string) (*WorktreeRecord, error) {
-	row := r.q.QueryRowContext(ctx, `SELECT * FROM worktrees WHERE worktree_path = ? LIMIT 1`, worktreePath)
+	paths := equivalentWorktreePaths(worktreePath)
+	query := `SELECT * FROM worktrees WHERE worktree_path = ? LIMIT 1`
+	args := []any{paths[0]}
+	if len(paths) == 2 {
+		query = `SELECT * FROM worktrees WHERE worktree_path IN (?, ?) LIMIT 1`
+		args = []any{paths[0], paths[1]}
+	}
+	row := r.q.QueryRowContext(ctx, query, args...)
 	record, err := scanWorktree(row)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -2871,6 +2918,19 @@ func (r *WorktreesRepository) GetByPath(ctx context.Context, worktreePath string
 		return nil, fmt.Errorf("get worktree by path: %w", err)
 	}
 	return &record, nil
+}
+
+// equivalentWorktreePaths covers macOS's supported /var <-> /private/var
+// aliases while leaving all other paths as exact identities.
+func equivalentWorktreePaths(path string) []string {
+	canonical := filepath.Clean(strings.TrimSpace(path))
+	if strings.HasPrefix(canonical, "/private/var/") {
+		canonical = strings.TrimPrefix(canonical, "/private")
+	}
+	if strings.HasPrefix(canonical, "/var/") {
+		return []string{canonical, "/private" + canonical}
+	}
+	return []string{canonical}
 }
 
 func (r *WorktreesRepository) ListByProject(ctx context.Context, projectID string) ([]WorktreeRecord, error) {

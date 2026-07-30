@@ -1203,9 +1203,20 @@ func (s *Service) discoverWorktrees(ctx context.Context, project storage.Project
 			continue
 		}
 
-		existing, err := s.Repos.Worktrees.GetByBranch(ctx, project.ID, worktree.Branch)
+		existingByPath, err := s.Repos.Worktrees.GetByPath(ctx, worktree.Path)
 		if err != nil {
 			return discovered, err
+		}
+		if existingByPath != nil && existingByPath.ProjectID != project.ID {
+			return discovered, fmt.Errorf("worktree path %q belongs to project %q, not %q", worktree.Path, existingByPath.ProjectID, project.ID)
+		}
+		existingByBranch, err := s.Repos.Worktrees.GetByBranch(ctx, project.ID, worktree.Branch)
+		if err != nil {
+			return discovered, err
+		}
+		existing := existingByPath
+		if existing == nil {
+			existing = existingByBranch
 		}
 
 		baseBranch := stringPointer(worktree.Branch)
@@ -1236,7 +1247,15 @@ func (s *Service) discoverWorktrees(ctx context.Context, project storage.Project
 			UpdatedAt:    nowISO,
 			CleanedAt:    nil,
 		}
-		if err := s.Repos.Worktrees.Upsert(ctx, record); err != nil {
+		// A path row owns the physical checkout. If its new branch is already
+		// represented elsewhere, adopt it transactionally so the other checkout
+		// keeps cleanup provenance while this path takes the current branch.
+		if existingByPath != nil && existingByBranch != nil && existingByPath.ID != existingByBranch.ID {
+			err = s.Repos.Worktrees.AdoptPath(ctx, record)
+		} else {
+			err = s.Repos.Worktrees.Upsert(ctx, record)
+		}
+		if err != nil {
 			return discovered, err
 		}
 		discovered++
