@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "hermes-memory": {
+      "command": "/Users/johnson/dev/mine/looper/.claude/worktrees/hermes-devin-provider-c9b547/tools/hermes-devin/memory_mcp_server.py",
+      "transport": "stdio"
+    }
+  }
+}

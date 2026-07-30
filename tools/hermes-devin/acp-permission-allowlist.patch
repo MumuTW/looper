@@ -8,7 +8,7 @@
  import threading
  import time
  from collections import deque
-@@ -129,6 +130,115 @@
+@@ -129,6 +130,133 @@
          "result": {
              "outcome": {
                  "outcome": "cancelled",
@@ -18,10 +18,11 @@
 +
 +
 +# --- carried patch: selective MCP tool-call permission approval -------------
-+# Stock Hermes denies every session/request_permission. This opts specific MCP
-+# tools into approval, and nothing else: deny stays the default, the allow-list
-+# is empty unless the operator sets HERMES_ACP_ALLOWED_MCP_TOOLS, and only
-+# single-call approval options are ever selected.
++# Stock Hermes denies every session/request_permission, which makes any MCP
++# tool it is offered unreachable. This opts specific tools into approval and
++# nothing else: deny stays the default, the allow-list is empty unless the
++# operator sets HERMES_ACP_ALLOWED_MCP_TOOLS, and only single-call approvals
++# are ever selected.
 +_ACP_ALLOWED_TOOLS_ENV = "HERMES_ACP_ALLOWED_MCP_TOOLS"
 +
 +# Narrowest first. Everything broader is deliberately absent: standing grants
@@ -31,36 +32,37 @@
 +# the per-tool list this patch exists to enforce.
 +_ACP_APPROVAL_OPTION_IDS = ("allow_once", "allow_session")
 +
++# A session/request_permission carries only a toolCallId — no tool name. The
++# name arrives earlier, on the session/update that announced the tool call, in
++# vendor _meta. Correlating the two is what makes an allow-list possible at
++# all; matching the human-readable option labels instead would mean gating
++# security on UI copy.
++_ACP_TOOL_NAME_META_KEYS = (
++    "cognition.ai/toolName",
++    "cognition.ai/inferenceToolName",
++)
++
 +
 +def _acp_allowed_tools() -> set[str]:
 +    raw = os.environ.get(_ACP_ALLOWED_TOOLS_ENV) or ""
 +    return {name.strip() for name in raw.split(",") if name.strip()}
 +
 +
-+def _acp_permission_tool_names(params: Any) -> list[str]:
-+    """Best-effort tool-name candidates from a permission request.
-+
-+    The request shape is not contractual across ACP servers, so probe the
-+    fields that have been observed to carry a tool identity and treat anything
-+    unparseable as "no name" (which denies). Matching is exact against an
-+    operator-supplied list, so including loose fields like title/kind cannot
-+    approve a name the operator did not write out in full.
-+    """
-+    if not isinstance(params, dict):
-+        return []
-+    candidates: list[Any] = [params.get("toolName"), params.get("tool_name")]
-+    for key in ("toolCall", "tool_call", "toolUse", "tool_use", "tool"):
-+        block = params.get(key)
-+        if isinstance(block, dict):
-+            candidates.extend(
-+                block.get(field)
-+                for field in ("toolName", "tool_name", "name", "rawName", "title", "kind")
-+            )
-+    names: list[str] = []
-+    for value in candidates:
-+        if isinstance(value, str) and value.strip() and value.strip() not in names:
-+            names.append(value.strip())
-+    return names
++def _acp_tool_call_identity(update: Any) -> tuple[str, str] | None:
++    """Return ``(toolCallId, toolName)`` from a tool_call session update."""
++    if not isinstance(update, dict):
++        return None
++    call_id = update.get("toolCallId")
++    if not isinstance(call_id, str) or not call_id.strip():
++        return None
++    meta = update.get("_meta")
++    if not isinstance(meta, dict):
++        return None
++    for key in _ACP_TOOL_NAME_META_KEYS:
++        name = meta.get(key)
++        if isinstance(name, str) and name.strip():
++            return call_id.strip(), name.strip()
++    return None
 +
 +
 +def _acp_offered_option_ids(params: Any) -> list[str]:
@@ -78,21 +80,37 @@
 +    return offered
 +
 +
-+def _acp_permission_response(message_id: Any, params: Any) -> dict[str, Any]:
++def _acp_permission_response(
++    message_id: Any,
++    params: Any,
++    tool_names: dict[str, str] | None,
++) -> dict[str, Any]:
 +    allowed = _acp_allowed_tools()
 +    if not allowed:
 +        return _permission_denied(message_id)
 +
-+    names = _acp_permission_tool_names(params)
-+    if not names:
++    call_id = None
++    if isinstance(params, dict):
++        block = params.get("toolCall")
++        if isinstance(block, dict):
++            raw_id = block.get("toolCallId")
++            if isinstance(raw_id, str) and raw_id.strip():
++                call_id = raw_id.strip()
++
++    matched = (tool_names or {}).get(call_id) if call_id else None
++    if matched is None:
++        # No correlated name means we cannot tell what is being approved.
++        print(
++            "[acp-permission] denied: could not resolve a tool name for "
++            f"toolCallId {call_id!r}",
++            file=sys.stderr,
++            flush=True,
++        )
 +        return _permission_denied(message_id)
 +
-+    matched = next((name for name in names if name in allowed), None)
-+    if matched is None:
-+        # Deliberately log the near miss: the operator opted something in, so a
-+        # denial here is a configuration signal worth auditing.
++    if matched not in allowed:
 +        print(
-+            f"[acp-permission] denied: tool {names[0]!r} is not in ${_ACP_ALLOWED_TOOLS_ENV}",
++            f"[acp-permission] denied: tool {matched!r} is not in ${_ACP_ALLOWED_TOOLS_ENV}",
 +            file=sys.stderr,
 +            flush=True,
 +        )
@@ -124,12 +142,39 @@
              }
          },
      }
-@@ -700,7 +810,7 @@
+@@ -419,6 +547,8 @@
+         self.is_closed = False
+         self._active_process: subprocess.Popen[str] | None = None
+         self._active_process_lock = threading.Lock()
++        # toolCallId -> tool name, populated from session/update (carried patch).
++        self._acp_tool_names: dict[str, str] = {}
+ 
+     def close(self) -> None:
+         proc: subprocess.Popen[str] | None
+@@ -531,6 +661,7 @@
+         self.is_closed = False
+         with self._active_process_lock:
+             self._active_process = proc
++        self._acp_tool_names = {}
+ 
+         inbox: queue.Queue[dict[str, Any]] = queue.Queue()
+         stderr_tail: deque[str] = deque(maxlen=40)
+@@ -683,6 +814,9 @@
+             params = msg.get("params") or {}
+             update = params.get("update") or {}
+             kind = str(update.get("sessionUpdate") or "").strip()
++            identity = _acp_tool_call_identity(update)
++            if identity is not None:
++                self._acp_tool_names[identity[0]] = identity[1]
+             content = update.get("content") or {}
+             chunk_text = ""
+             if isinstance(content, dict):
+@@ -700,7 +834,7 @@
          params = msg.get("params") or {}
  
          if method == "session/request_permission":
 -            response = _permission_denied(message_id)
-+            response = _acp_permission_response(message_id, params)
++            response = _acp_permission_response(message_id, params, self._acp_tool_names)
          elif method == "fs/read_text_file":
              try:
                  path = _ensure_path_within_cwd(str(params.get("path") or ""), cwd)
