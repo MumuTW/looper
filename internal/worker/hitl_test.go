@@ -62,6 +62,7 @@ func (a *appendingAgentExecutor) Start(ctx context.Context, input AgentRunInput)
 		if err := appendHumanMessageForWorker(ctx, a.repos, a.at, a.loopID, a.text); err != nil {
 			return nil, err
 		}
+		a.text = ""
 	}
 	if a.ask != "" {
 		askPath := filepath.Join(input.WorkingDirectory, hitlSentinelRelPath)
@@ -213,6 +214,17 @@ func TestWorkerInboxAcknowledgementPreservesConcurrentMessageForNextTurn(t *test
 			}
 			if len(agent.inner.starts) != 2 || !strings.Contains(agent.inner.starts[1].Prompt, "late instruction") {
 				t.Fatalf("agent starts = %#v, want second prompt containing late instruction", agent.inner.starts)
+			}
+			loop, err = fixture.repos.Loops.GetByID(ctx, "loop_worker_1")
+			if err != nil || loop == nil || loop.Status != "completed" {
+				t.Fatalf("loop after second turn = (%#v, %v), want completed", loop, err)
+			}
+			if inbox := loops.ReadHumanInbox(loop.MetadataJSON); len(inbox) != 0 {
+				t.Fatalf("inbox after second turn = %#v, want empty", inbox)
+			}
+			queue, err = fixture.repos.Queue.GetByID(ctx, "queue_worker_1")
+			if err != nil || queue == nil || queue.Status != "completed" {
+				t.Fatalf("queue after second turn = (%#v, %v), want completed", queue, err)
 			}
 		})
 	}
