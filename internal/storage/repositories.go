@@ -881,21 +881,39 @@ func (r *RunsRepository) Upsert(ctx context.Context, record RunRecord) error {
 	return nil
 }
 
-// UpdateCheckpoint updates only the checkpoint projection for a durable run.
-// Callers that write after a run has already reached a terminal status use this
-// narrow write so they cannot overwrite concurrent status, step, heartbeat, or
-// completion transitions with a stale full row.
-func (r *RunsRepository) UpdateCheckpoint(ctx context.Context, id, checkpointJSON, updatedAt string) error {
-	result, err := r.q.ExecContext(ctx, `UPDATE runs SET checkpoint_json = ?, updated_at = ? WHERE id = ?`, checkpointJSON, updatedAt, id)
+// MergeWorktreeCleanupTimestamps records a terminal worktree cleanup attempt on a
+// run without disturbing anything else about it.
+//
+// Cleanup runs after the run reached a terminal status and starts from a checkpoint
+// captured earlier, so it must not write that stale copy back. Replacing the whole
+// checkpoint_json would erase a concurrent checkpoint transition — an operator
+// retry rewriting resumePolicy to restart_from_discover between completion and
+// cleanup, for instance, which would leave the requeued run resuming the invalid
+// downstream checkpoint it was retried to escape. Scalar columns being untouched
+// is not enough; the merge has to be inside the JSON too.
+//
+// json_set writes only the two cleanup fields, creating $.worktree if the stored
+// checkpoint has none and preserving its other fields when it does.
+func (r *RunsRepository) MergeWorktreeCleanupTimestamps(ctx context.Context, id, cleanupAttemptedAt, cleanedAt, updatedAt string) error {
+	result, err := r.q.ExecContext(ctx, `
+		UPDATE runs
+		SET checkpoint_json = json_set(
+				COALESCE(NULLIF(checkpoint_json, ''), '{}'),
+				'$.worktree.cleanupAttemptedAt', ?,
+				'$.worktree.cleanedAt', ?
+			),
+			updated_at = ?
+		WHERE id = ?
+	`, cleanupAttemptedAt, cleanedAt, updatedAt, id)
 	if err != nil {
-		return fmt.Errorf("update run checkpoint: %w", err)
+		return fmt.Errorf("merge run worktree cleanup timestamps: %w", err)
 	}
 	affected, err := result.RowsAffected()
 	if err != nil {
-		return fmt.Errorf("read updated run checkpoint rows: %w", err)
+		return fmt.Errorf("read merged run worktree cleanup rows: %w", err)
 	}
 	if affected == 0 {
-		return fmt.Errorf("update run checkpoint: run not found: %s", id)
+		return fmt.Errorf("merge run worktree cleanup timestamps: run not found: %s", id)
 	}
 	return nil
 }

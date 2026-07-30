@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -99,10 +100,58 @@ func TestTerminalCleanupPersistsFailureAsAttemptWithoutCleaned(t *testing.T) {
 	}
 }
 
-// TestTerminalCleanupDoesNotRevertConcurrentRunTransition is why the write is a
-// narrow checkpoint update rather than a full-row Upsert of the in-memory record.
-// Cleanup starts from a checkpoint captured before the run completed; a full-row
-// write would push that stale status and step back over the newer values.
+// TestTerminalCleanupPreservesConcurrentCheckpointRewrite is the assertion that
+// matters most here, and the one the first version of this file missed. Replacing
+// checkpoint_json wholesale leaves the scalar columns intact while still erasing a
+// concurrent checkpoint transition — an operator retry rewriting resumePolicy to
+// restart_from_discover between completion and cleanup — so the requeued run would
+// resume the invalid downstream checkpoint it was retried to escape.
+func TestTerminalCleanupPreservesConcurrentCheckpointRewrite(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	git := &fakeGitGateway{}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, Logger: fixture.logger, Now: fixture.now})
+	checkpoint := seedTerminalCleanupRun(t, fixture, "run_cleanup_policy_race", filepath.Join(t.TempDir(), "wt-46"))
+
+	// Something else rewrites the stored checkpoint after the in-memory copy was
+	// captured — as an operator retry does via
+	// MarkInvalidCompletionRunRestartFromDiscover, which sets exactly this policy.
+	stored, err := fixture.repos.Runs.GetByID(context.Background(), "run_cleanup_policy_race")
+	if err != nil || stored == nil {
+		t.Fatalf("Runs.GetByID() = (%#v, %v)", stored, err)
+	}
+	concurrent := parseCheckpoint(stored.CheckpointJSON)
+	concurrent.ResumePolicy = loops.ResumePolicyRestartFromDiscover
+	rewritten := mustMarshalJSON(concurrent)
+	updated := *stored
+	updated.CheckpointJSON = &rewritten
+	if err := fixture.repos.Runs.Upsert(context.Background(), updated); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+
+	runner.cleanupFixerWorktreeIfTerminal(context.Background(), storage.ProjectRecord{
+		ID: "project_1", RepoPath: t.TempDir(), BaseBranch: stringPtr("main"),
+	}, "run_cleanup_policy_race", &checkpoint)
+
+	after, err := fixture.repos.Runs.GetByID(context.Background(), "run_cleanup_policy_race")
+	if err != nil || after == nil {
+		t.Fatalf("Runs.GetByID() = (%#v, %v)", after, err)
+	}
+	final := parseCheckpoint(after.CheckpointJSON)
+	if final.ResumePolicy != loops.ResumePolicyRestartFromDiscover {
+		t.Fatalf("ResumePolicy = %q, want restart_from_discover preserved through cleanup", final.ResumePolicy)
+	}
+	if final.Worktree == nil || final.Worktree.CleanedAt == "" {
+		t.Fatalf("stored worktree = %#v, want cleanup recorded alongside the retry rewrite", final.Worktree)
+	}
+	// The merge must not damage the rest of the worktree object either.
+	if final.Worktree.Path == "" || final.Worktree.Branch == "" {
+		t.Fatalf("stored worktree = %#v, want path and branch preserved by the field-level merge", final.Worktree)
+	}
+}
+
+// TestTerminalCleanupDoesNotRevertConcurrentRunTransition covers the scalar columns:
+// cleanup must not push the stale in-memory status and step back over newer values.
 func TestTerminalCleanupDoesNotRevertConcurrentRunTransition(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

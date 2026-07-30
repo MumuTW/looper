@@ -7009,10 +7009,10 @@ func derefRunRecordID(run *storage.RunRecord) string {
 // disturbing the rest of the run row. A failure here is logged, not returned: the
 // run has already completed and its recorded status is the primary result.
 func (r *Runner) persistTerminalCleanupCheckpoint(ctx context.Context, runID string, checkpoint *fixerCheckpoint) {
-	if checkpoint == nil || r.repos == nil || r.repos.Runs == nil || strings.TrimSpace(runID) == "" {
+	if checkpoint == nil || checkpoint.Worktree == nil || r.repos == nil || r.repos.Runs == nil || strings.TrimSpace(runID) == "" {
 		return
 	}
-	if err := r.repos.Runs.UpdateCheckpoint(ctx, runID, mustMarshalJSON(checkpoint), r.nowISO()); err != nil {
+	if err := r.repos.Runs.MergeWorktreeCleanupTimestamps(ctx, runID, checkpoint.Worktree.CleanupAttemptedAt, checkpoint.Worktree.CleanedAt, r.nowISO()); err != nil {
 		r.logError("fixer terminal cleanup checkpoint persist failed", map[string]any{
 			"runId": runID, "worktreePath": checkpoint.Worktree.Path, "message": err.Error(),
 		})
