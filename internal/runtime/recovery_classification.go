@@ -1,7 +1,6 @@
 package runtime
 
 import (
-	"context"
 	"strings"
 	"time"
 
@@ -9,54 +8,40 @@ import (
 	"github.com/nexu-io/looper/internal/storage"
 )
 
+// executionLivenessLeaseTTL bounds how long a run's own heartbeat keeps it out
+// of live stale-run reconciliation. It is not containment Authority.
 const executionLivenessLeaseTTL = 30 * time.Minute
 
-type executionLivenessDisposition string
-
-const (
-	executionLivenessActive            executionLivenessDisposition = "active"
-	executionLivenessNeedsConfirmation executionLivenessDisposition = "needs_confirmation"
-)
-
-type executionLivenessAssessment struct {
-	Disposition    executionLivenessDisposition
-	Classification ContainmentClassification
-	LeaseHeartbeat string
-	LeaseExpiresAt string
-}
-
 // ContainmentClass is the startup-recovery classification of durable execution
-// evidence after a daemon restart (ADR-0015 R8 / #581).
+// evidence after a daemon restart (ADR-0015 R8, revised for #149).
 //
-// PID/PGID inspection is drift evidence only. It never authorizes live stop,
-// terminal marking, requeue, or overlapping work, and never alone establishes
-// confirmed-dead after restart.
+// There are two classes, and neither is an inference about a process. Recovery
+// asks one question — "does this daemon own this execution right now?" — and
+// answers it from its own in-memory handle registry. Everything else is
+// confirmed dead, because containment is enforced by retiring the execution's
+// worktree generation rather than by proving the old process exited.
+//
+// PID/PGID inspection is not consulted at all any more. It never could
+// authorize confirmed-dead (descendants outlive leaders, PIDs are reused), and
+// once the fence moved to the filesystem path it stopped being needed for the
+// negative case either.
 type ContainmentClass string
 
 const (
 	// ContainmentConfirmedDead means Authority exists to treat the execution as
-	// non-runnable for recovery purposes.
-	//
-	// After restart, only:
-	//   - durable terminal finalization already committed before crash, or
+	// non-runnable for recovery purposes. Authorized by:
+	//   - durable terminal finalization already committed before the crash, or
 	//   - a current-daemon owned processcontainment.Handle that has completed
-	//     confirmed drain
-	// may authorize this class.
-	//
-	// Must not authorize confirmed-dead: PID/PGID missing or not running,
-	// probe-then-signal on raw PID/PGID, or leader exit alone without
-	// descendant/containment proof.
+	//     confirmed drain, or
+	//   - the execution's worktree generation has been durably retired, so any
+	//     surviving writer is confined to a directory no daemon reads, pushes
+	//     from, or cleans.
 	ContainmentConfirmedDead ContainmentClass = "confirmed_dead"
 
-	// ContainmentObservedLive means a process probe matched the durable row.
-	// This is evidence only — not adopted live ownership. Recovery must not
-	// signal, terminalize, requeue, or start overlapping work from this class.
-	ContainmentObservedLive ContainmentClass = "observed_live"
-
-	// ContainmentUncertain covers every other observation (PID absent, command
-	// mismatch, probe error, leader-exit-only without containment proof, etc.).
-	// Uncertain work stays quarantined without raw PID/PGID action.
-	ContainmentUncertain ContainmentClass = "uncertain"
+	// ContainmentCurrentDaemonOwned means this daemon holds a live supervisor
+	// handle for the execution. It is the only class recovery must leave alone:
+	// the work is genuinely in flight in this process.
+	ContainmentCurrentDaemonOwned ContainmentClass = "still_owned_by_this_daemon"
 )
 
 // ContainmentClassification is one classified durable observation.
@@ -64,7 +49,7 @@ type ContainmentClassification struct {
 	Class ContainmentClass
 	// Reason is a stable machine-oriented explanation (event payloads / tests).
 	Reason string
-	// PID is the durable PID when present (evidence only).
+	// PID is the durable PID when present (evidence only, never Authority).
 	PID int
 }
 
@@ -79,14 +64,11 @@ func durableTerminalExecution(status string) bool {
 	}
 }
 
-// classifyFromDurableStatusAndHandle applies confirmed-dead Authority rules that
-// do not depend on PID probes. currentDaemonHandle may be nil (always after a
-// crash — pre-crash handles do not exist).
+// classifyFromDurableStatusAndHandle applies the two confirmed-dead Authority
+// rules that need no knowledge of the worktree. currentDaemonHandle may be nil
+// (always after a crash — pre-crash handles do not exist).
 func classifyFromDurableStatusAndHandle(execution storage.AgentExecutionRecord, currentDaemonHandle *processcontainment.Handle) (ContainmentClassification, bool) {
-	pid := 0
-	if execution.PID != nil && *execution.PID > 0 {
-		pid = int(*execution.PID)
-	}
+	pid := executionPID(execution)
 	if durableTerminalExecution(execution.Status) {
 		return ContainmentClassification{
 			Class:  ContainmentConfirmedDead,
@@ -104,114 +86,39 @@ func classifyFromDurableStatusAndHandle(execution storage.AgentExecutionRecord, 
 	return ContainmentClassification{}, false
 }
 
-// classifyStartupProbeEvidence maps PID probe outcomes to observed_live or
-// uncertain. Never returns confirmed_dead — PID absence / leader exit alone
-// cannot authorize that class after restart.
-func classifyStartupProbeEvidence(pid int, matches, running bool, probeErr error) ContainmentClassification {
-	if probeErr != nil {
+// classifyDurableExecution is the whole classifier. currentDaemonOwnsLiveHandle
+// is the only live signal; it comes from this process's own handle registry,
+// not from the operating system.
+func classifyDurableExecution(execution storage.AgentExecutionRecord, currentDaemonHandle *processcontainment.Handle, currentDaemonOwnsLiveHandle bool) ContainmentClassification {
+	if classification, ok := classifyFromDurableStatusAndHandle(execution, currentDaemonHandle); ok {
+		return classification
+	}
+	if currentDaemonOwnsLiveHandle {
 		return ContainmentClassification{
-			Class:  ContainmentUncertain,
-			Reason: "process_probe_error",
-			PID:    pid,
+			Class:  ContainmentCurrentDaemonOwned,
+			Reason: "current_daemon_supervisor_handle",
+			PID:    executionPID(execution),
 		}
 	}
-	if pid <= 0 {
-		return ContainmentClassification{
-			Class:  ContainmentUncertain,
-			Reason: "pid_absent",
-			PID:    0,
-		}
-	}
-	if running && matches {
-		return ContainmentClassification{
-			Class:  ContainmentObservedLive,
-			Reason: "process_identity_matched",
-			PID:    pid,
-		}
-	}
-	if running && !matches {
-		return ContainmentClassification{
-			Class:  ContainmentUncertain,
-			Reason: "process_identity_mismatch",
-			PID:    pid,
-		}
-	}
-	// PID not running / empty process command. Leader exit or PID reuse absence
-	// is not confirmed-dead Authority (descendants may remain; IDs are reusable).
+	// No handle in this daemon: whatever started this row belongs to a previous
+	// generation. Retiring its worktree generation is what makes that safe, and
+	// the caller does that before acting on this classification.
 	return ContainmentClassification{
-		Class:  ContainmentUncertain,
-		Reason: "pid_not_running_not_confirmed_dead",
-		PID:    pid,
+		Class:  ContainmentConfirmedDead,
+		Reason: "stale_generation_retired",
+		PID:    executionPID(execution),
 	}
 }
 
-// classifyStartupExecution classifies one durable agent_execution observation
-// for startup recovery. PID probes are evidence only.
-//
-// currentDaemonHandle is optional: after crash it is always nil. Mid-life tests
-// may inject a handle that has completed confirmed drain.
-func (r *Runtime) classifyStartupExecution(ctx context.Context, execution storage.AgentExecutionRecord, currentDaemonHandle *processcontainment.Handle) (ContainmentClassification, error) {
-	if class, ok := classifyFromDurableStatusAndHandle(execution, currentDaemonHandle); ok {
-		return class, nil
-	}
-	pid := 0
+func executionPID(execution storage.AgentExecutionRecord) int {
 	if execution.PID != nil && *execution.PID > 0 {
-		pid = int(*execution.PID)
+		return int(*execution.PID)
 	}
-	if pid <= 0 {
-		return classifyStartupProbeEvidence(0, false, false, nil), nil
-	}
-	matches, running, err := r.executionMatchesProcess(ctx, execution, pid)
-	return classifyStartupProbeEvidence(pid, matches, running, err), nil
+	return 0
 }
 
-// assessExecutionLiveness combines the durable renewable heartbeat lease with
-// persisted process identity. Neither signal is sufficient alone: a matching
-// live process always blocks overlap, while an invalid identity is stale only
-// after its lease expires. Missing/malformed lease evidence and probe failures
-// require operator confirmation.
-func (r *Runtime) assessExecutionLiveness(ctx context.Context, execution storage.AgentExecutionRecord, now time.Time) (executionLivenessAssessment, error) {
-	classification, err := r.classifyStartupExecution(ctx, execution, nil)
-	if err != nil {
-		return executionLivenessAssessment{}, err
-	}
-	assessment := executionLivenessAssessment{
-		Disposition:    executionLivenessNeedsConfirmation,
-		Classification: classification,
-	}
-	if classification.Class == ContainmentObservedLive {
-		assessment.Disposition = executionLivenessActive
-		return assessment, nil
-	}
-	if classification.Class == ContainmentConfirmedDead {
-		return assessment, nil
-	}
-
-	heartbeat := firstNonEmpty(stringOrEmpty(execution.LastHeartbeatAt), execution.UpdatedAt, execution.StartedAt)
-	heartbeatAt, parseErr := time.Parse(time.RFC3339Nano, strings.TrimSpace(heartbeat))
-	if parseErr != nil {
-		return assessment, nil
-	}
-	expiresAt := heartbeatAt.UTC().Add(executionLivenessLeaseTTL)
-	assessment.LeaseHeartbeat = formatJavaScriptISOString(heartbeatAt.UTC())
-	assessment.LeaseExpiresAt = formatJavaScriptISOString(expiresAt)
-	if now.UTC().Before(expiresAt) {
-		return assessment, nil
-	}
-	// An expired lease schedules observation and operator-visible quarantine,
-	// but it is not process-containment Authority. In particular, leader exit,
-	// PID reuse, or argv drift cannot prove that background descendants drained.
-	return assessment, nil
-}
-
-// classificationAllowsTerminalOrRequeue is true only for confirmed-dead.
-// Observed live and uncertain must not mark terminal, requeue, signal, or overlap.
+// classificationAllowsTerminalOrRequeue is true only for confirmed-dead. Work
+// this daemon still owns must not be marked terminal, requeued, or overlapped.
 func classificationAllowsTerminalOrRequeue(class ContainmentClass) bool {
 	return class == ContainmentConfirmedDead
-}
-
-// classificationRequiresQuarantine is true when recovery must park work via
-// existing manual_intervention / paused states without PID action.
-func classificationRequiresQuarantine(class ContainmentClass) bool {
-	return class == ContainmentObservedLive || class == ContainmentUncertain
 }

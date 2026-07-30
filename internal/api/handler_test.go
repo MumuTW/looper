@@ -1159,39 +1159,41 @@ func TestStatusDegradedReasonsIncludesUnavailableQuarantineDebt(t *testing.T) {
 	}
 }
 
-func TestHandlerStatusReportsDebtAfterStaleRunReconcile(t *testing.T) {
-	fixture := newTestFixture(t, func(options *looperdruntime.Options) {
-		options.ReadProcessCommand = func(context.Context, int) (string, error) { return "", nil }
-	})
+// Debt is what an operator can still act on: an execution carrying quarantine
+// evidence that is *still active*. After #149 that means an execution this
+// daemon is genuinely supervising — settled ones leave ListActive and drain the
+// counter on their own. The roster and the degraded reason are read from the
+// same durable evidence either way.
+func TestHandlerStatusReportsDebtForStillActiveQuarantinedExecution(t *testing.T) {
+	fixture := newTestFixture(t)
 	rt, cfg := fixture.runtime, fixture.config
 	repos := rt.Services().Repositories
 	oldISO := fixture.now.Add(-2 * time.Hour).Format(time.RFC3339Nano)
 	projectID := "project_reconcile_status"
 	loopID := "loop_reconcile_status"
 	runID := "run_reconcile_status"
+	executionID := "execution_reconcile_status"
 	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Reconcile", RepoPath: fixture.rootDir, CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
-	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 1, ProjectID: projectID, Type: "worker", TargetType: "project", Status: "running", CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 1, ProjectID: projectID, Type: "worker", TargetType: "project", Status: "paused", CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
 	if err := repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: runID, LoopID: loopID, Status: "running", CurrentStep: stringPtr("work"), StartedAt: oldISO, LastHeartbeatAt: &oldISO, CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
-	if err := repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_reconcile_status", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: projectID, DedupeKey: "worker:reconcile-status", Priority: storage.QueuePriorityWorker, Status: "running", AvailableAt: oldISO, StartedAt: &oldISO, MaxAttempts: 3, CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
-		t.Fatalf("Queue.Upsert() error = %v", err)
-	}
 	pid := int64(9191)
-	if err := repos.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{ID: "execution_reconcile_status", ProjectID: &projectID, LoopID: &loopID, RunID: &runID, Vendor: "codex", Status: "running", PID: &pid, CommandJSON: stringPtr(`{"command":"codex"}`), CWD: stringPtr(fixture.rootDir), StartedAt: oldISO, CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
+	if err := repos.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{ID: executionID, ProjectID: &projectID, LoopID: &loopID, RunID: &runID, Vendor: "codex", Status: "running", PID: &pid, CommandJSON: stringPtr(`{"command":"codex"}`), CWD: stringPtr(fixture.rootDir), StartedAt: oldISO, CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
 		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
 	}
-
-	summary, err := rt.ReconcileStaleRunningRuns(context.Background())
-	if err != nil {
-		t.Fatalf("ReconcileStaleRunningRuns() error = %v", err)
-	}
-	if summary.QuarantinedExecutions != 1 {
-		t.Fatalf("summary = %#v, want one quarantined execution", summary)
+	if err := repos.Events.Append(context.Background(), storage.EventLogRecord{
+		ID: "event_quarantine_status", EventType: "looperd.recovery.execution_quarantined",
+		ProjectID: &projectID, LoopID: &loopID, RunID: &runID,
+		EntityType: stringPtr("agent_execution"), EntityID: stringPtr(executionID),
+		PayloadJSON: `{"reason":"recovery deferred: this daemon still owns a live handle for the execution"}`,
+		CreatedAt:   oldISO,
+	}); err != nil {
+		t.Fatalf("Events.Append() error = %v", err)
 	}
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/status", nil)
@@ -1204,10 +1206,7 @@ func TestHandlerStatusReportsDebtAfterStaleRunReconcile(t *testing.T) {
 	service := data["service"].(map[string]any)
 	outstanding := service["recovery"].(map[string]any)["outstanding"].(map[string]any)
 	assertEqual(t, outstanding["quarantinedActiveExecutions"], float64(1))
-	// Quarantine deliberately leaves uncertain execution/run evidence active;
-	// this counter exists to surface the resulting active-runs inflation.
 	assertEqual(t, outstanding["quarantinedRunningRuns"], float64(1))
-	// The counters name the loops they are about, from the same evidence pass.
 	roster, ok := outstanding["loops"].([]any)
 	if !ok || len(roster) != 1 {
 		t.Fatalf("outstanding[loops] = %#v, want one quarantined loop", outstanding["loops"])
@@ -1223,8 +1222,26 @@ func TestHandlerStatusReportsDebtAfterStaleRunReconcile(t *testing.T) {
 	if !strings.Contains(fmt.Sprintf("%v", service["degradedReasons"]), "quarantine_orphan_debt") {
 		t.Fatalf("degradedReasons = %#v, want quarantine debt", service["degradedReasons"])
 	}
-	if run, err := repos.Runs.GetByID(context.Background(), runID); err != nil || run == nil || run.Status != "running" {
-		t.Fatalf("run after reconcile = %#v, %v; want running quarantine evidence", run, err)
+
+	// Settling the execution drains the debt without a restart: the row leaves
+	// ListActive and the same query returns zero.
+	settled, err := repos.AgentExecutions.GetByID(context.Background(), executionID)
+	if err != nil || settled == nil {
+		t.Fatalf("AgentExecutions.GetByID() = %#v, %v", settled, err)
+	}
+	settled.Status = "killed"
+	settled.EndedAt = &oldISO
+	if err := repos.AgentExecutions.Upsert(context.Background(), *settled); err != nil {
+		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
+	}
+	recorder = httptest.NewRecorder()
+	NewHandler(Context{Config: cfg, Runtime: rt}).ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/v1/status", nil))
+	data = parseJSONMap(t, recorder.Body.Bytes())["data"].(map[string]any)
+	service = data["service"].(map[string]any)
+	outstanding = service["recovery"].(map[string]any)["outstanding"].(map[string]any)
+	assertEqual(t, outstanding["quarantinedActiveExecutions"], float64(0))
+	if strings.Contains(fmt.Sprintf("%v", service["degradedReasons"]), "quarantine_orphan_debt") {
+		t.Fatalf("degradedReasons = %#v, want the daemon healthy once debt drained", service["degradedReasons"])
 	}
 }
 

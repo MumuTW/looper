@@ -282,19 +282,32 @@ recovery classifies each durable `agent_executions` observation as one of:
 
 | Class | Meaning | Recovery action |
 |-------|---------|-----------------|
-| **confirmed_dead** | Authority exists to treat the execution as non-runnable | Only when Authority holds (below) |
-| **observed_live** | Process probe matched the durable row | Evidence only — never adopt live ownership; quarantine |
-| **uncertain** | Everything else (PID absent, not running, mismatch, probe error, leader-exit-only) | Quarantine; no raw PID/PGID action |
+| **confirmed_dead** | Authority exists to treat the execution as non-runnable | Retire the worktree generation, then finalize the durable row |
+| **still_owned_by_this_daemon** | This process holds a live supervisor handle for the execution | Leave it alone; park its claim; stay degraded until it finishes |
 
-Issue #22 adds shared liveness observation on top of this classification.
-`agent_executions.last_heartbeat_at` (falling back to row timestamps for legacy
-observations) schedules reevaluation after 30 minutes; expiry is not Authority.
-The common executor also records an operating-system birth identity after
-`cmd.Start`: absolute process start time on supported non-Linux platforms, and
-Linux `/proc` start ticks paired with the kernel boot ID. The birth identity is
-authoritative for recognizing the same observed process even when a shebang or
-wrapper `exec`s another argv in place. PID absence, birth mismatch, missing
-identity, and probe errors remain `needs_confirmation` regardless of lease age.
+**Amended by #149.** The `uncertain` class is deleted, and with it the entire
+PID-probe input to recovery. The class existed because PID absence cannot prove
+descendant drain — which is still true. What changed is that recovery no longer
+needs that proof: containment moved to the filesystem path and the git ref, where
+it is enforceable without knowing anything about a process.
+
+**Heartbeat lease (amended by #149).** The claim lease was written once at claim
+time with a 5–10 minute TTL against agent timeouts of up to 7200s, so it expired
+mid-run on every long agent step: `created_at == updated_at` on every held lock.
+It was decorative, and `status='running'` was doing the real double-claim
+prevention. The lease is now renewed from the run's own heartbeat
+(`storage.RefreshClaimLeaseForRun`, called wherever `agent_executions` heartbeats
+are persisted), so “this claim heartbeated recently” is a fact the system can
+act on. Expiry still does not authorize confirmed-dead on its own.
+
+**Birth identity (amended by #149).** The operating-system birth identity the
+common executor records after `cmd.Start` — absolute process start time on
+non-Linux platforms, Linux `/proc` start ticks paired with the kernel boot ID —
+is **no longer used for recovery classification**, because recovery no longer
+inspects processes at all. It remains in use for **webhook forwarder identity**
+(`internal/runtime/webhook_lifecycle.go`, ADR-0005), and
+`Runtime.ExecutionMatchesProcess` remains available to the HTTP API for operator
+inspection. Neither use is Authority for recovery.
 
 The live scheduler performs this observation on each periodic full tick,
 independently of available capacity. It never overrides a current-daemon-owned
@@ -308,25 +321,40 @@ therefore remains authoritative over the older quarantine reason.
 |------------------------------|-----------------------------------|
 | Durable terminal finalization already committed before crash | PID/PGID missing or not running |
 | A **current-daemon** owned handle that has completed confirmed drain | Probe-then-signal on raw PID/PGID |
-| | Lease expiry, command drift, or invalid birth identity |
-| | Leader exit alone without descendant/containment proof |
+| **The execution's worktree generation has been durably retired** (containment by path divergence, not process proof) | Leader exit alone, taken as evidence that descendants drained |
 
-Otherwise the row remains **uncertain** (or **observed_live**) and is parked via
-existing `manual_intervention` / `paused` states — no new quarantine ledger.
-Running claims after restart have no live operation lease; keep them quarantined
-until an operator or a future durable containment Authority resolves them. Never
-consume the active row before all repair is durable, and never infer that repair
-is allowed from PID evidence or lease expiry alone.
-Mutations stay closed until classification finishes (#575/#580).
+**The third row is the amendment (#149).** Worktree generation lives on the
+`worktrees` table (`generation`, `retired_at`; migration 0021) because the
+contended thing is the checkout, not the process. Retiring a generation is a
+durable, daemon-written, locally-provable fact. The generation is carried in the
+directory name (`looper-fix-<project>-pr-<N>[-g<G>]`), so the next claim of that
+branch lands on a different path: a surviving writer from the previous daemon
+keeps writing into a directory no daemon will read, push from, or clean. Its
+writes still succeed — we do not claim otherwise — they are simply invisible.
+
+Generation retirement is paired with mandatory leased pushes
+(`internal/infra/git.Gateway.Push`): every push that updates an existing remote
+branch carries a lease, derived from the current remote head when the caller has
+no durable prior observation. A stale agent that pushed behind our back surfaces
+as a typed `*RemoteHeadChangedError` instead of an opaque rejection.
+
+The prior text — *“Running claims after restart have no live operation lease;
+keep them quarantined until an operator or a future durable containment Authority
+resolves them”* — is **resolved**: worktree generation retirement is that
+Authority. Only `still_owned_by_this_daemon` rows are parked now, and they drain
+by finishing rather than by waiting for a human.
+
+Never consume the active row before all repair is durable. Mutations stay closed
+until classification finishes (#575/#580).
 
 **Startup recovery concept trade-off (R8):**
 
 | | |
 |--|--|
-| **Failure prevented** | False cleanliness and overlap after leader exit; cross-boot PID/start-tick collision; wrapper `exec` mistaken for PID reuse; later operator pauses overwritten by stale quarantine provenance. |
-| **Costs** | More durable quarantine and deliberate operator recovery; one boot ID in existing Linux execution metadata; periodic observation and operator events without automatic capacity release. |
-| **Why not simpler** | PID/PGID probes and lease expiry cannot prove descendant drain. Command matching is not birth identity because wrappers legitimately replace argv. |
-| **Deletion attempt** | The invalid-identity auto-finalize/requeue layer was deleted. Existing `paused` / `manual_intervention` states retain retryable evidence without adding a quarantine ledger or inferred Authority. |
+| **Failure prevented** | Two agents writing one checkout, or one PR branch, across a daemon restart. Also the failure the first version of R8 introduced: a park with no exit, which #149 observed surviving multiple restarts. |
+| **Costs** | Two persisted columns on `worktrees` and a partial unique index; retired directories that are disk debt until a quiet period passes (reported as a skipped cleanup decision, never as blocked work); a push that now fails loudly where it previously failed opaquely; one one-shot startup reconciliation to release parks written before the fence existed. |
+| **Why not simpler** | The simpler thing was tried first and shipped: quarantine on uncertainty. It is correct about what it does not know and has no exit, so the debt is permanent. The alternative simplification — a generation token checked in the git/gh gateways — does not work: those gateways are libraries the daemon calls, not a proxy the agent is forced through, so a token there fences the daemon against itself and leaves the agent's own shell untouched. |
+| **Deletion attempt** | Succeeded, and it is the point of the change. Deleted: `classifyStartupProbeEvidence`, `assessExecutionLiveness`, `executionLivenessAssessment`/`Disposition`, `ContainmentObservedLive`, `ContainmentUncertain`, `classificationRequiresQuarantine`, `appendUncertainProcessIdentityEvent`, the two skip branches that made the state terminal, and the loop-pausing/queue-failing halves of `quarantineRecoveryEvidence`. `internal/runtime/recovery_classification.go` went from 218 to ~120 lines and the classification test matrix collapsed from 3 classes × 5 probe reasons to one table of five rows. |
 
 ### Full non-mutating coverage when not-ready or degraded (enforced by #580)
 
@@ -429,13 +457,37 @@ live a `queue_items.status=running` claim is an owned **operation** under #579
 |----------|------|--------------------|
 | **Webhook forwarder (`gh webhook forward`)** | `internal/runtime/webhook.go` (`newWebhookRuntime` / `runForwarder`; `webhook_forwarder.go` manager is not production-wired) | ADR-0005: local identity gate (PID + process start + command shape). Not Supervisor domain unless this ADR is amended. |
 | **Webhook tunnel `gh` subprocesses** | `internal/runtime/webhook_tunnel.go` | Local tunnel lifecycle under webhook tunnel design (ADR-0006 family); not agent work ownership. |
-| **CLI feedback agent** | `internal/cliapp/feedback.go` → `agent.ResolveSpawn` + `exec.CommandContext` in **CLI process** | CLI process owns the child for the duration of `looper feedback`. Not looperd Supervisor. |
-| **CLI interactive takeover resume** | `internal/cliapp/takeover_commands.go` runs operator shell with `ResumeCommand` after daemon parks loop | Operator terminal owns the interactive agent. Daemon Authority for parking/stopping the prior run remains Supervisor-owned once #576 lands. |
-| **CLI daemon spawn / stop** | `internal/cliapp/daemon_runtime.go` `SpawnDetached` / `KillProcess` of **looperd** | CLI/service manager owns the daemon process, not in-daemon work ownership. |
-| **CLI config editor / dashboard browser open** | `config_commands.go`, `dashboard_command.go` | Short-lived operator tools; CLI-owned. |
+| **CLI-side subprocesses** (feedback agent, interactive takeover resume, daemon spawn/stop, config editor, dashboard browser open) | `cmd/looper` and the packages it calls. **Drift note (#149):** earlier revisions of this table cited `internal/cliapp/feedback.go`, `internal/cliapp/takeover_commands.go`, `internal/cliapp/daemon_runtime.go`, and `internal/cliapp/config_commands.go`. **`internal/cliapp` does not exist in the tree.** Since “no known daemon spawn path may remain unclassified” is a rule of this section, a stale path is itself a contract violation; the row is generalized here rather than left pointing at nothing. | CLI process (or the operator's terminal, or the service manager) owns these children. Not looperd Supervisor. Daemon Authority for parking/stopping a prior run remains Supervisor-owned. |
 | **osascript notifications** | `internal/infra/notify/gateway.go` via `shell.Run` | Notification channel lifecycle; short-lived; not queue/agent ownership. |
 | **git / gh / tea tool invocations** | `internal/infra/git`, `internal/infra/github`, `internal/forge/tea` via `shell.Run` | Provider/tool gateways; request-scoped short commands under their gateways, not Supervisor agent leases. If a future path becomes long-lived owned work, reclassify before cutover. |
 | **Daemon `ps` liveness/identity probes** | `internal/runtime/runtime.go` (`defaultReadProcessCommand` for agent execution match); `internal/runtime/webhook_lifecycle.go` (`defaultProcessProbe.Argv` / `psProcessStart` non-Linux paths for forwarder identity) | Short-lived recovery/identity **evidence** only (see Authority). Not Supervisor-owned work producers and not R4 containment targets. They must never authorize live stop, terminal, requeue, or overlap while the daemon is live, and must not become confirmed-dead Authority after restart solely from PID absence. #575/#581 keep probes as evidence; do not migrate them onto Supervisor leases. |
+
+### Out of Supervisor containment: agent-initiated forge and git mutations
+
+**Added by #149**, because its absence is what made a generation token in the
+git/gh gateways read as a complete fence. The Supervisor owns the *agent process*.
+It does not own what that process does with the shell it was given.
+
+Looper spawns agents with permissive flags (Claude skip-permissions,
+Codex `workspace-write` with network, equivalent vendor flags) and an environment
+inheriting `PATH`, `HOME`, `SSH_AUTH_SOCK`, `XDG_CONFIG_HOME`, `SSL_CERT_*`, plus
+`cfg.Agent.Env` wholesale — which is where operators put `GH_TOKEN`. Only
+`LOOPER_TRUSTED_ENV_FILE` is scrubbed. The result is an unrestricted shell in a
+git worktree with `git`, `gh`, an ssh-agent socket, and `gh` hosts.yml reachable.
+
+| Surface | Status |
+|---------|--------|
+| Filesystem writes into the managed worktree directory | **Contained by generation** (path divergence). Unfenceable by any token — the writer is `open(2)`. |
+| `git push` from the agent shell with ambient credentials | **Open.** Forbidden by prompt text only. Leased daemon pushes make a stale agent's push detectable, not impossible. |
+| Any `gh` mutation from the agent shell | **Open.** Forbidden by prompt text only. |
+| `looper review submit` with the trusted socket env unset | **Open** — falls through to direct submission. |
+| `looper <verb>` against the new daemon's HTTP API | **Open.** |
+| Trusted review submit *while the socket env survives* | **Closed**, and closes automatically on daemon death — the listener dies with the daemon. |
+
+Closing the four open rows means turning the trusted review proxy into a general
+git/gh broker. That is tracked separately and is explicitly **not** a prerequisite
+for #149: generation containment and leased pushes are complete on their own terms
+for the failure #149 reports.
 
 ### Explicitly out of scope
 
@@ -481,7 +533,7 @@ These rules apply during multi-PR rollout and are part of this contract:
 - [x] No unowned in-scope agent or subprocess producer remains
 - [x] No live stop/shutdown/recovery path uses raw PID/PGID as Authority
 - [x] No running queue claim without an owned operation lease while daemon is live (#579)
-- [x] Uncertain recovery evidence cannot signal, mark terminal, requeue, or overlap work
+- [x] Uncertain recovery evidence cannot signal, mark terminal, requeue, or overlap work — **replaced (not violated) by #149**: there is no uncertain class, because containment no longer depends on process knowledge. Recovery still never signals a process. This ADR is `Proposed / Partially Implemented`, so this is a legitimate revision of an unaccepted contract, not a breach of an accepted one.
 - [x] Shutdown drains admission → ingress → producers → handles/finalizers before SQLite close (or retains storage / fails loud on timeout)
 
 **Status note:** With R0–R8 enforced and the exit checklist above complete, this ADR

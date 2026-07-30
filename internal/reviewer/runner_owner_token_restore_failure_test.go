@@ -24,7 +24,7 @@ func TestRunPrepareWorktreeStepPropagatesOwnerTokenRestoreFailureOnDirty(t *test
 	worktreeRoot := filepath.Join(t.TempDir(), "worktrees")
 	projectID := "project_1"
 	prNumber := int64(42)
-	wtPath := gitinfra.DetachedPRWorktreePath(worktreeRoot, projectID, prNumber)
+	wtPath := gitinfra.DetachedPRWorktreePath(worktreeRoot, projectID, prNumber, 1)
 	if err := os.MkdirAll(wtPath, 0o755); err != nil {
 		t.Fatalf("MkdirAll worktree: %v", err)
 	}

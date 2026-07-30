@@ -67,17 +67,14 @@ type StaleRunReconcileSummary struct {
 	QueueItemsRequeued  int64  `json:"queueItemsRequeued"`
 	QueueItemsCancelled int64  `json:"queueItemsCancelled"`
 	CleanedExecutions   int64  `json:"cleanedExecutions"`
-	// QuarantinedExecutions counts executions parked via quarantineRecoveryEvidence
-	// (still-running evidence + manual_intervention). Never report these as cleaned.
-	QuarantinedExecutions int64    `json:"quarantinedExecutions"`
-	SkippedUncertainRuns  int64    `json:"skippedUncertainRuns"`
-	EventsWritten         int64    `json:"eventsWritten"`
-	RunIDs                []string `json:"runIds,omitempty"`
-	LoopIDs               []string `json:"loopIds,omitempty"`
-	ExecutionIDs          []string `json:"executionIds,omitempty"`
-	// QuarantinedLoopIDs names the loops parked by this pass, so a caller can
-	// report them without re-deriving the set from event_logs.
-	QuarantinedLoopIDs []string `json:"quarantinedLoopIds,omitempty"`
+	EventsWritten       int64  `json:"eventsWritten"`
+	// SettledExecutions counts executions finalized under worktree-generation
+	// containment by this pass. There is no quarantine counterpart any more:
+	// an execution this daemon does not own is settleable, not debt.
+	SettledExecutions int64    `json:"settledExecutions"`
+	RunIDs            []string `json:"runIds,omitempty"`
+	LoopIDs           []string `json:"loopIds,omitempty"`
+	ExecutionIDs      []string `json:"executionIds,omitempty"`
 }
 
 type staleRunReconcileMode string
@@ -1690,7 +1687,6 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 	summary := createEmptyRecoverySummary()
 	summary.StartedAt = nowISO
 	summary.OrphanAgentCleanup.Attempted = true
-	uncertainAgentRunIDs := make(map[string]struct{})
 	activeAgentRunIDs := make(map[string]struct{})
 	quarantinedLoopIDs := make(map[string]struct{})
 	if repositories.AgentExecutions != nil {
@@ -1699,34 +1695,21 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 			return RecoverySummary{}, err
 		}
 		for _, execution := range activeExecutions {
-			assessment, observedEvents, observeErr := r.observeExecutionLiveness(ctx, repositories, execution, now, "orphan_cleanup")
+			classification, observedEvents, observeErr := r.observeExecutionLiveness(ctx, repositories, execution, now, "orphan_cleanup")
 			if observeErr != nil {
 				return RecoverySummary{}, observeErr
 			}
 			eventsWritten += observedEvents
-			classification := assessment.Classification
-			switch assessment.Disposition {
-			case executionLivenessActive:
+
+			if classification.Class == ContainmentCurrentDaemonOwned {
+				// This process is supervising the execution right now. It is
+				// not recoverable debt and it is not settleable: leave the work
+				// parked and keep the daemon degraded until it finishes.
 				summary.OrphanAgentCleanup.ObservedLiveCount += 1
 				if execution.RunID != nil && strings.TrimSpace(*execution.RunID) != "" {
 					activeAgentRunIDs[*execution.RunID] = struct{}{}
 				}
-			default:
-				summary.OrphanAgentCleanup.UncertainCount += 1
-			}
-
-			switch assessment.Disposition {
-			case executionLivenessActive, executionLivenessNeedsConfirmation:
-				reason := "startup recovery: matching live process from previous daemon"
-				if assessment.Disposition == executionLivenessNeedsConfirmation {
-					reason = "needs confirmation: startup liveness evidence is not authoritative (" + classification.Reason + ")"
-				}
-				if execution.RunID != nil && strings.TrimSpace(*execution.RunID) != "" {
-					if assessment.Disposition == executionLivenessNeedsConfirmation {
-						uncertainAgentRunIDs[*execution.RunID] = struct{}{}
-					}
-				}
-				quarantined, wrote, err := r.quarantineRecoveryEvidence(ctx, repositories, execution, nowISO, reason)
+				quarantined, wrote, err := r.quarantineRecoveryEvidence(ctx, repositories, execution, nowISO, "recovery deferred: this daemon still owns a live handle for the execution")
 				if err != nil {
 					return RecoverySummary{}, err
 				}
@@ -1739,12 +1722,35 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 				if wrote {
 					eventsWritten += 1
 				}
+				continue
 			}
+
+			// Confirmed dead by containment, not by process inspection: retire
+			// the worktree generation first so any surviving writer is confined
+			// to a directory this daemon will never read, push from, or clean,
+			// then finalize the durable row.
+			settledEvents, err := r.settleStaleExecution(ctx, repositories, execution, nowISO, classification.Reason)
+			if err != nil {
+				return RecoverySummary{}, err
+			}
+			eventsWritten += settledEvents
+			summary.OrphanAgentCleanup.ConfirmedDeadCount += 1
+			summary.OrphanAgentCleanup.CleanedCount += 1
 		}
 		if summary.OrphanAgentCleanup.QuarantinedCount > 0 {
-			summary.OrphanAgentCleanup.Warning = "active executions were quarantined without process kill; containment is not confirmed"
+			summary.OrphanAgentCleanup.Warning = "executions this daemon still owns were left parked; recovery does not kill processes"
 		}
 	}
+
+	// One-shot: release loops a pre-#149 daemon parked and could not release.
+	// Runs after the execution sweep so the rows behind those parks are already
+	// settled, and before the requeue passes so the released loops are picked up
+	// on this boot rather than the next one.
+	settlementEvents, err := r.settlePreFencingParks(ctx, repositories, nowISO)
+	if err != nil {
+		return RecoverySummary{}, err
+	}
+	eventsWritten += settlementEvents
 
 	expiredLocks, err := repositories.Locks.ListExpired(ctx, nowISO)
 	if err != nil {
@@ -1779,11 +1785,6 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 	summary.InterruptedRunsMarked += staleSummary.InterruptedRuns
 	summary.LoopsRequeued += staleSummary.LoopsRequeued
 	eventsWritten += staleSummary.EventsWritten
-	// The stale-run pass can park work the execution sweep above did not, and
-	// one recovery pass is one operator event regardless of which step parked it.
-	for _, loopID := range staleSummary.QuarantinedLoopIDs {
-		quarantinedLoopIDs[loopID] = struct{}{}
-	}
 	loops, err := repositories.Loops.List(ctx)
 	if err != nil {
 		return RecoverySummary{}, err
@@ -1806,7 +1807,10 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 		if _, wasRequeued := requeuedLoopIDs[loop.ID]; wasRequeued {
 			continue
 		}
-		// Quarantined work must not requeue or auto-recover as if cleaned.
+		// Work this daemon is actively supervising must not be requeued
+		// underneath itself. After #149 this set holds only current-daemon-owned
+		// executions: a row from a previous daemon has already been settled
+		// above, so it can no longer park a loop indefinitely.
 		if _, quarantined := quarantinedLoopIDs[loop.ID]; quarantined {
 			continue
 		}
@@ -1863,7 +1867,6 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 		}
 
 		_, latestRunHasActiveAgent := activeAgentRunIDs[derefRunID(latestRun)]
-		_, latestRunHasUncertainAgent := uncertainAgentRunIDs[derefRunID(latestRun)]
 		if latestQueueIsManualIntervention(latestQueue) && (loop.Status == "running" || loop.Status == "queued") {
 			if latestQueue.Status == "manual_intervention" {
 				normalizedLoop := loop
@@ -1933,7 +1936,7 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 			eventsWritten += 1
 			continue
 		}
-		if shouldRequeueLoop(loop, latestRun, latestRunHasActiveAgent || latestRunHasUncertainAgent) {
+		if shouldRequeueLoop(loop, latestRun, latestRunHasActiveAgent) {
 			requeuedLoop := loop
 			requeuedLoop.Status = "queued"
 			requeuedLoop.NextRunAt = stringPtr(nowISO)
@@ -2340,10 +2343,6 @@ func (r *Runtime) reconcileStaleRunningRunsWithMode(ctx context.Context, reposit
 			activeExecutionsByRunID[*execution.RunID] = append(activeExecutionsByRunID[*execution.RunID], execution)
 		}
 	}
-	// Loops whose work was parked via quarantineRecoveryEvidence must not be
-	// requeued by the post-interrupt repair pass or the later interrupted-loop
-	// sweep while agent_executions remain running evidence (#575).
-	quarantinedLoopIDs := make(map[string]struct{})
 	for _, run := range runningRuns {
 		if err := ctx.Err(); err != nil {
 			return StaleRunReconcileSummary{}, err
@@ -2367,31 +2366,21 @@ func (r *Runtime) reconcileStaleRunningRunsWithMode(ctx context.Context, reposit
 			continue
 		}
 		summary.CandidateRuns += 1
-		if decision.Uncertain {
-			summary.SkippedUncertainRuns += 1
-			summary.EventsWritten += decision.EventsWritten
-			for _, execution := range decision.ConfirmationExecutions {
-				reason := "needs confirmation: execution liveness is not authoritative"
-				quarantined, wrote, err := r.quarantineRecoveryEvidence(ctx, repositories, execution, nowISO, reason)
-				if err != nil {
-					return StaleRunReconcileSummary{}, err
-				}
-				if quarantined {
-					summary.QuarantinedExecutions += 1
-					summary.ExecutionIDs = append(summary.ExecutionIDs, execution.ID)
-					if _, seen := quarantinedLoopIDs[run.LoopID]; !seen {
-						quarantinedLoopIDs[run.LoopID] = struct{}{}
-						summary.QuarantinedLoopIDs = append(summary.QuarantinedLoopIDs, run.LoopID)
-					}
-				}
-				if wrote {
-					summary.EventsWritten += 1
-				}
-			}
-			continue
-		}
+		summary.EventsWritten += decision.EventsWritten
 		if !decision.Interrupt {
 			continue
+		}
+		// Settle every execution behind this run before the run itself:
+		// retiring the worktree generation is what makes it safe to move the run
+		// out of running without knowing whether a process remains.
+		for _, execution := range decision.ConfirmationExecutions {
+			settledEvents, err := r.settleStaleExecution(ctx, repositories, execution, nowISO, "stale_generation_retired")
+			if err != nil {
+				return StaleRunReconcileSummary{}, err
+			}
+			summary.EventsWritten += settledEvents
+			summary.SettledExecutions += 1
+			summary.ExecutionIDs = append(summary.ExecutionIDs, execution.ID)
 		}
 		if err := interruptRecoveryRun(ctx, repositories, run, *loop, nowISO, decision.Message); err != nil {
 			return StaleRunReconcileSummary{}, err
@@ -2408,7 +2397,7 @@ func (r *Runtime) reconcileStaleRunningRunsWithMode(ctx context.Context, reposit
 				return StaleRunReconcileSummary{}, err
 			}
 			summary.EventsWritten += verification.EventsWritten
-			latestRunBlocksRequeue = verification.Live || verification.Uncertain
+			latestRunBlocksRequeue = verification.Live
 		}
 		queueRepair, err := r.repairStaleRunQueueState(ctx, repositories, *loop, latestRun, latestRunBlocksRequeue, nowISO)
 		if err != nil {
@@ -2425,9 +2414,6 @@ func (r *Runtime) reconcileStaleRunningRunsWithMode(ctx context.Context, reposit
 			return StaleRunReconcileSummary{}, err
 		}
 		for _, loop := range loops {
-			if _, quarantined := quarantinedLoopIDs[loop.ID]; quarantined {
-				continue
-			}
 			queueRepair, err := r.repairInterruptedLoopQueueIfNeeded(ctx, repositories, loop, nowISO)
 			if err != nil {
 				return StaleRunReconcileSummary{}, err
@@ -2463,10 +2449,11 @@ func defaultSyncConfiguredProjects(ctx context.Context, service *projects.Servic
 }
 
 type staleRunCandidateDecision struct {
-	Candidate              bool
-	Interrupt              bool
-	Uncertain              bool
-	Message                string
+	Candidate bool
+	Interrupt bool
+	Message   string
+	// ConfirmationExecutions are the executions this daemon does not own that
+	// must have their worktree generation retired before the run is settled.
 	ConfirmationExecutions []storage.AgentExecutionRecord
 	EventsWritten          int64
 }
@@ -2507,11 +2494,7 @@ func (r *Runtime) evaluateStaleRunCandidate(ctx context.Context, repositories *s
 		if verification.Live {
 			return staleRunCandidateDecision{}, nil
 		}
-		if verification.Uncertain {
-			decision.Uncertain = true
-			decision.ConfirmationExecutions = append(decision.ConfirmationExecutions, verification.ConfirmationExecutions...)
-			return decision, nil
-		}
+		decision.ConfirmationExecutions = append(decision.ConfirmationExecutions, activeExecutions...)
 	}
 	decision.Interrupt = true
 	if mode == staleRunReconcileModeStartup {
@@ -2525,91 +2508,53 @@ func (r *Runtime) evaluateStaleRunCandidate(ctx context.Context, repositories *s
 }
 
 type executionLivenessResult struct {
-	Live bool
-	// Uncertain is true when any execution lacks the two-signal Authority needed
-	// for stale recovery.
-	Uncertain              bool
-	ConfirmationExecutions []storage.AgentExecutionRecord
-	EventsWritten          int64
+	// Live is true when this daemon holds a supervisor handle for at least one
+	// of the executions. There is no third state: an execution this daemon does
+	// not own is settleable, because containment comes from retiring its
+	// worktree generation rather than from proving its process exited.
+	Live          bool
+	EventsWritten int64
 }
 
 func (r *Runtime) verifyRunExecutionLiveness(ctx context.Context, repositories *storage.Repositories, executions []storage.AgentExecutionRecord, now time.Time, scope string) (executionLivenessResult, error) {
 	result := executionLivenessResult{}
 	for _, execution := range executions {
-		assessment, eventsWritten, err := r.observeExecutionLiveness(ctx, repositories, execution, now, scope)
+		classification, eventsWritten, err := r.observeExecutionLiveness(ctx, repositories, execution, now, scope)
 		if err != nil {
 			return executionLivenessResult{}, err
 		}
 		result.EventsWritten += eventsWritten
-		switch assessment.Disposition {
-		case executionLivenessActive:
+		if classification.Class == ContainmentCurrentDaemonOwned {
 			result.Live = true
-			continue
-		case executionLivenessNeedsConfirmation:
-			result.Uncertain = true
-			result.ConfirmationExecutions = append(result.ConfirmationExecutions, execution)
 		}
 	}
 	return result, nil
 }
 
-func (r *Runtime) observeExecutionLiveness(ctx context.Context, repositories *storage.Repositories, execution storage.AgentExecutionRecord, now time.Time, scope string) (executionLivenessAssessment, int64, error) {
-	assessment := executionLivenessAssessment{}
-	if r.currentDaemonOwnsExecution(execution) {
-		pid := 0
-		if execution.PID != nil {
-			pid = int(*execution.PID)
-		}
-		assessment = executionLivenessAssessment{
-			Disposition: executionLivenessActive,
-			Classification: ContainmentClassification{
-				Class:  ContainmentObservedLive,
-				Reason: "current_daemon_supervisor_handle",
-				PID:    pid,
-			},
-		}
-	} else {
-		var err error
-		assessment, err = r.assessExecutionLiveness(ctx, execution, now)
-		if err != nil {
-			return executionLivenessAssessment{}, 0, err
-		}
-	}
+// observeExecutionLiveness classifies one durable execution row and appends the
+// audit events for that observation. now is unused by the classifier itself and
+// is kept only to timestamp the events: recovery no longer derives Authority
+// from elapsed time.
+func (r *Runtime) observeExecutionLiveness(ctx context.Context, repositories *storage.Repositories, execution storage.AgentExecutionRecord, now time.Time, scope string) (ContainmentClassification, int64, error) {
+	classification := classifyDurableExecution(execution, nil, r.currentDaemonOwnsExecution(execution))
 
 	nowISO := formatJavaScriptISOString(now)
 	eventsWritten := int64(0)
-	wrote, err := r.appendContainmentClassificationEvent(ctx, repositories, execution, assessment.Classification, scope, nowISO)
+	wrote, err := r.appendContainmentClassificationEvent(ctx, repositories, execution, classification, scope, nowISO)
 	if err != nil {
-		return executionLivenessAssessment{}, 0, err
+		return ContainmentClassification{}, 0, err
 	}
 	if wrote {
 		eventsWritten++
 	}
-	wrote, err = r.appendExecutionLivenessEvent(ctx, repositories, execution, assessment, scope, nowISO)
+	wrote, err = r.appendExecutionLivenessEvent(ctx, repositories, execution, classification, scope, nowISO)
 	if err != nil {
-		return executionLivenessAssessment{}, 0, err
+		return ContainmentClassification{}, 0, err
 	}
 	if wrote {
 		eventsWritten++
 	}
-	if assessment.Disposition == executionLivenessNeedsConfirmation &&
-		(assessment.Classification.Reason == "process_probe_error" || assessment.Classification.Reason == "process_identity_mismatch") {
-		if r.logger != nil && assessment.Classification.Reason == "process_probe_error" {
-			r.logger.Warn("failed to verify agent execution identity", map[string]any{
-				"executionId": execution.ID,
-				"pid":         assessment.Classification.PID,
-				"scope":       scope,
-			})
-		}
-		wrote, err = r.appendUncertainProcessIdentityEvent(ctx, repositories, execution, assessment.Classification.PID, scope, nowISO)
-		if err != nil {
-			return executionLivenessAssessment{}, 0, err
-		}
-		if wrote {
-			eventsWritten++
-		}
-	}
-	return assessment, eventsWritten, nil
+	return classification, eventsWritten, nil
 }
 
 func (r *Runtime) currentDaemonOwnsExecution(execution storage.AgentExecutionRecord) bool {
@@ -2801,44 +2746,6 @@ func runHeartbeatIsRecent(run storage.RunRecord, now time.Time, ttl time.Duratio
 	return !parsed.UTC().Before(now.UTC().Add(-ttl))
 }
 
-func (r *Runtime) appendUncertainProcessIdentityEvent(ctx context.Context, repositories *storage.Repositories, execution storage.AgentExecutionRecord, pid int, scope string, nowISO string) (bool, error) {
-	if r.logger != nil {
-		r.logger.Warn("recovery skipped due to uncertain process identity", map[string]any{"executionId": execution.ID, "pid": pid, "scope": scope})
-	}
-	payloadJSON := mustMarshalJSON(map[string]any{
-		"pid":    pid,
-		"reason": "command_mismatch",
-		"scope":  scope,
-	})
-	if repositories != nil && repositories.Events != nil {
-		events, err := repositories.Events.ListByEntity(ctx, "agent_execution", execution.ID)
-		if err != nil {
-			return false, err
-		}
-		for _, event := range events {
-			if event.EventType == "looperd.recovery.process_identity_uncertain" && event.PayloadJSON == payloadJSON {
-				return false, nil
-			}
-		}
-	}
-	if err := appendSystemEvent(ctx, repositories, storage.EventLogRecord{
-		ID:          newRuntimeEventID(),
-		EventType:   "looperd.recovery.process_identity_uncertain",
-		ProjectID:   execution.ProjectID,
-		LoopID:      execution.LoopID,
-		RunID:       execution.RunID,
-		EntityType:  stringPtr("agent_execution"),
-		EntityID:    stringPtr(execution.ID),
-		PayloadJSON: payloadJSON,
-		CreatedAt:   nowISO,
-	}); err != nil {
-		return false, err
-	}
-	return true, nil
-}
-
-// appendContainmentClassificationEvent records confirmed_dead / observed_live /
-// uncertain for an execution observation. Dedupes identical class+reason+scope.
 func (r *Runtime) appendContainmentClassificationEvent(ctx context.Context, repositories *storage.Repositories, execution storage.AgentExecutionRecord, classification ContainmentClassification, scope, nowISO string) (bool, error) {
 	payload := map[string]any{
 		"class":  string(classification.Class),
@@ -2885,25 +2792,18 @@ func (r *Runtime) appendContainmentClassificationEvent(ctx context.Context, repo
 	return true, nil
 }
 
-func (r *Runtime) appendExecutionLivenessEvent(ctx context.Context, repositories *storage.Repositories, execution storage.AgentExecutionRecord, assessment executionLivenessAssessment, scope, nowISO string) (bool, error) {
-	eventType := "looperd.recovery.execution_confirmation_needed"
-	switch assessment.Disposition {
-	case executionLivenessActive:
+func (r *Runtime) appendExecutionLivenessEvent(ctx context.Context, repositories *storage.Repositories, execution storage.AgentExecutionRecord, classification ContainmentClassification, scope, nowISO string) (bool, error) {
+	eventType := "looperd.recovery.execution_settleable"
+	if classification.Class == ContainmentCurrentDaemonOwned {
 		eventType = "looperd.recovery.execution_active"
 	}
 	payload := map[string]any{
-		"status":         string(assessment.Disposition),
-		"identityReason": assessment.Classification.Reason,
+		"status":         string(classification.Class),
+		"identityReason": classification.Reason,
 		"scope":          scope,
 	}
-	if assessment.LeaseHeartbeat != "" {
-		payload["leaseHeartbeatAt"] = assessment.LeaseHeartbeat
-	}
-	if assessment.LeaseExpiresAt != "" {
-		payload["leaseExpiresAt"] = assessment.LeaseExpiresAt
-	}
-	if assessment.Classification.PID > 0 {
-		payload["pid"] = assessment.Classification.PID
+	if classification.PID > 0 {
+		payload["pid"] = classification.PID
 	}
 	payloadJSON := mustMarshalJSON(payload)
 	if repositories != nil && repositories.Events != nil {
@@ -2970,6 +2870,136 @@ func (r *Runtime) markRecoveredExecutionTerminal(ctx context.Context, repositori
 		PayloadJSON: mustMarshalJSON(payload),
 		CreatedAt:   nowISO,
 	})
+}
+
+// settleStaleExecution finalizes one durable execution row that no daemon owns.
+//
+// The order matters and is the whole design: the worktree generation is retired
+// FIRST, so that by the time the row is marked terminal any surviving writer
+// from the previous daemon is already confined to a directory this daemon will
+// never read, push from, or clean. Nothing is signalled and no PID is inspected
+// — recovery still does not kill processes.
+//
+// Returns the number of audit events written.
+func (r *Runtime) settleStaleExecution(ctx context.Context, repositories *storage.Repositories, execution storage.AgentExecutionRecord, nowISO, reason string) (int64, error) {
+	if repositories == nil {
+		return 0, nil
+	}
+	eventsWritten := int64(0)
+	retired, err := r.retireExecutionWorktreeGeneration(ctx, repositories, execution, nowISO)
+	if err != nil {
+		return 0, err
+	}
+	wrote, err := r.appendGenerationRetiredEvidence(ctx, repositories, execution, nowISO, reason, retired)
+	if err != nil {
+		return eventsWritten, err
+	}
+	if wrote {
+		eventsWritten++
+	}
+	if repositories.AgentExecutions == nil || durableTerminalExecution(execution.Status) {
+		return eventsWritten, nil
+	}
+	message := "settled by startup recovery; containment by worktree generation retirement (" + reason + ")"
+	if err := r.markRecoveredExecutionTerminal(ctx, repositories, execution, executionPID(execution), nowISO, message); err != nil {
+		return eventsWritten, err
+	}
+	return eventsWritten + 1, nil
+}
+
+// retireExecutionWorktreeGeneration retires the live worktree generation for the
+// execution's loop branch. Returns the retired record when one was resolvable.
+//
+// Not every loop type has a worktree, and a row can outlive its checkout. An
+// unresolvable generation is not a failure: there is then no checkout for a
+// stale writer to corrupt, which is the same containment outcome by a shorter
+// route.
+func (r *Runtime) retireExecutionWorktreeGeneration(ctx context.Context, repositories *storage.Repositories, execution storage.AgentExecutionRecord, nowISO string) (*storage.WorktreeRecord, error) {
+	if repositories.Worktrees == nil || repositories.Loops == nil {
+		return nil, nil
+	}
+	loopID := strings.TrimSpace(derefString(execution.LoopID))
+	if loopID == "" {
+		return nil, nil
+	}
+	loop, err := repositories.Loops.GetByID(ctx, loopID)
+	if err != nil || loop == nil {
+		return nil, err
+	}
+	worktrees, err := repositories.Worktrees.ListByProject(ctx, loop.ProjectID)
+	if err != nil {
+		return nil, err
+	}
+	cwd := strings.TrimSpace(derefString(execution.CWD))
+	for i := range worktrees {
+		candidate := worktrees[i]
+		if candidate.RetiredAt != nil {
+			continue
+		}
+		// The execution's working directory is the direct link between a row and
+		// the checkout it was mutating.
+		if cwd == "" || filepath.Clean(candidate.WorktreePath) != filepath.Clean(cwd) {
+			continue
+		}
+		if err := repositories.Worktrees.Retire(ctx, candidate.ID, nowISO); err != nil {
+			return nil, err
+		}
+		retired := candidate
+		retired.RetiredAt = stringPtr(nowISO)
+		return &retired, nil
+	}
+	return nil, nil
+}
+
+// appendGenerationRetiredEvidence records that recovery settled an execution
+// under generation containment. It writes audit history and nothing else: it
+// does not pause loops or fail queue items, because a settled execution is not
+// live debt. The event type is unchanged so the existing history stays readable.
+func (r *Runtime) appendGenerationRetiredEvidence(ctx context.Context, repositories *storage.Repositories, execution storage.AgentExecutionRecord, nowISO, reason string, retired *storage.WorktreeRecord) (bool, error) {
+	if repositories == nil || repositories.Events == nil {
+		return false, nil
+	}
+	payload := map[string]any{
+		"reason":      reason,
+		"recoveredAt": nowISO,
+		"executionId": execution.ID,
+		"status":      execution.Status,
+		"containment": "worktree_generation_retired",
+	}
+	if execution.PID != nil && *execution.PID > 0 {
+		payload["pid"] = *execution.PID
+	}
+	if retired != nil {
+		payload["retiredWorktreeId"] = retired.ID
+		payload["retiredWorktreePath"] = retired.WorktreePath
+		payload["retiredGeneration"] = retired.Generation
+	} else {
+		payload["retiredWorktreeId"] = nil
+	}
+	payloadJSON := mustMarshalJSON(payload)
+	events, err := repositories.Events.ListByEntity(ctx, "agent_execution", execution.ID)
+	if err != nil {
+		return false, err
+	}
+	for _, event := range events {
+		if event.EventType == recoveryExecutionQuarantinedEventType && event.PayloadJSON == payloadJSON {
+			return false, nil
+		}
+	}
+	if err := appendSystemEvent(ctx, repositories, storage.EventLogRecord{
+		ID:          newRuntimeEventID(),
+		EventType:   recoveryExecutionQuarantinedEventType,
+		ProjectID:   execution.ProjectID,
+		LoopID:      execution.LoopID,
+		RunID:       execution.RunID,
+		EntityType:  stringPtr("agent_execution"),
+		EntityID:    stringPtr(execution.ID),
+		PayloadJSON: payloadJSON,
+		CreatedAt:   nowISO,
+	}); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // quarantineRecoveryEvidence parks work tied to uncertain/orphan execution

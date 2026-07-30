@@ -10,6 +10,8 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -64,6 +66,9 @@ type RestoreWorktreeInput struct {
 	WorktreeRoot         string
 	CheckoutMode         CheckoutMode
 	ExpectedWorktreePath string
+	// Generation is the claim generation the caller already resolved. Zero
+	// means "resolve it from storage" (direct RestoreWorktree callers).
+	Generation int64
 }
 
 type PrepareWorktreeInput struct {
@@ -223,7 +228,14 @@ func (g *Gateway) CreateWorktree(ctx context.Context, input CreateWorktreeInput)
 		return storage.WorktreeRecord{}, fmt.Errorf("create worktree root: %w", err)
 	}
 
-	worktreePath := filepath.Join(input.WorktreeRoot, buildWorktreeDirectoryName(input))
+	// Generation is resolved before the path is formed: a retired generation is
+	// invisible to GetByBranch, so this claim allocates the next one and lands
+	// in a directory the previous writer cannot reach.
+	generation, err := g.LiveGenerationForBranch(ctx, input.ProjectID, input.Branch)
+	if err != nil {
+		return storage.WorktreeRecord{}, err
+	}
+	worktreePath := filepath.Join(input.WorktreeRoot, buildWorktreeDirectoryName(input, generation))
 	if err := worktreesafety.Validate(worktreesafety.CheckInput{WorktreePath: worktreePath, RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot}); err != nil {
 		return storage.WorktreeRecord{}, err
 	}
@@ -236,6 +248,7 @@ func (g *Gateway) CreateWorktree(ctx context.Context, input CreateWorktreeInput)
 		WorktreeRoot:         input.WorktreeRoot,
 		CheckoutMode:         checkoutMode,
 		ExpectedWorktreePath: worktreePath,
+		Generation:           generation,
 	})
 	if err != nil {
 		return storage.WorktreeRecord{}, err
@@ -311,6 +324,7 @@ func (g *Gateway) CreateWorktree(ctx context.Context, input CreateWorktreeInput)
 		CreatedAt:    valueOr(existingRecordCreatedAt(existingRecord), nowISO),
 		UpdatedAt:    nowISO,
 		CleanedAt:    nil,
+		Generation:   generation,
 	}
 
 	if g.repos != nil {
@@ -363,6 +377,22 @@ func (g *Gateway) DetectOriginRemote(ctx context.Context, repoPath string) (Orig
 
 func (g *Gateway) RestoreWorktree(ctx context.Context, input RestoreWorktreeInput) (*storage.WorktreeRecord, error) {
 	checkoutMode := normalizeCheckoutMode(input.CheckoutMode)
+
+	generation := input.Generation
+	if generation < 1 {
+		resolved, err := g.LiveGenerationForBranch(ctx, input.ProjectID, input.Branch)
+		if err != nil {
+			return nil, err
+		}
+		generation = resolved
+	}
+	// Directories belonging to retired generations are never adopted. Path
+	// equality is exactly what retirement revokes, so `git worktree list`
+	// discovery must not walk back into one.
+	retiredPaths, err := g.retiredWorktreePaths(ctx, input.ProjectID)
+	if err != nil {
+		return nil, err
+	}
 
 	if g.repos != nil {
 		stored, err := g.repos.Worktrees.GetByBranch(ctx, input.ProjectID, input.Branch)
@@ -420,6 +450,9 @@ func (g *Gateway) RestoreWorktree(ctx context.Context, input RestoreWorktreeInpu
 	var match *WorktreeListEntry
 	for i := range worktrees {
 		candidate := worktrees[i]
+		if _, retired := retiredPaths[normalizeComparablePath(candidate.Path)]; retired {
+			continue
+		}
 		if checkoutMode == CheckoutModeDetached {
 			expectedPath := candidate.Path
 			if input.ExpectedWorktreePath != "" {
@@ -474,6 +507,7 @@ func (g *Gateway) RestoreWorktree(ctx context.Context, input RestoreWorktreeInpu
 		CreatedAt:    nowISO,
 		UpdatedAt:    nowISO,
 		CleanedAt:    nil,
+		Generation:   generation,
 	}
 	if g.repos != nil {
 		existing, err := g.repos.Worktrees.GetByBranch(ctx, input.ProjectID, input.Branch)
@@ -644,19 +678,55 @@ func (g *Gateway) Push(ctx context.Context, input PushInput) error {
 		sourceRef = requested
 	}
 
-	if input.ExpectedRemoteHeadSHA != "" {
-		isExpectedAncestor, err := g.isAncestor(ctx, input.WorktreePath, input.ExpectedRemoteHeadSHA, sourceRef)
+	// Every push that updates an existing remote branch carries a lease. When
+	// the caller has no durable prior observation, the lease is the remote head
+	// resolved immediately before the push. Either way the branch can only move
+	// forward from a head this daemon actually saw, so a stale agent that pushed
+	// behind our back surfaces as a typed *RemoteHeadChangedError instead of an
+	// opaque git rejection or an unnoticed divergence.
+	expectedRemoteHeadSHA := strings.TrimSpace(input.ExpectedRemoteHeadSHA)
+	derivedLease := false
+	if expectedRemoteHeadSHA == "" {
+		branchExistsRemotely, err := g.remoteBranchExists(ctx, input.WorktreePath, remote, input.Branch)
+		if err != nil {
+			return err
+		}
+		if branchExistsRemotely {
+			resolved, err := g.getRemoteHeadSHA(ctx, input.WorktreePath, remote, input.Branch)
+			if err != nil {
+				return err
+			}
+			if strings.TrimSpace(resolved) == "" {
+				return fmt.Errorf("refusing unleased push to existing remote branch %s: remote head could not be resolved", input.Branch)
+			}
+			expectedRemoteHeadSHA = strings.TrimSpace(resolved)
+			derivedLease = true
+			// A remote head we do not even have locally is a commit we cannot
+			// be descended from — someone pushed it while we were not looking.
+			if !g.hasLocalObject(ctx, input.WorktreePath, expectedRemoteHeadSHA) {
+				return &RemoteHeadChangedError{Branch: input.Branch, ExpectedHeadSHA: "", ActualHeadSHA: expectedRemoteHeadSHA}
+			}
+		}
+	}
+
+	if expectedRemoteHeadSHA != "" {
+		isExpectedAncestor, err := g.isAncestor(ctx, input.WorktreePath, expectedRemoteHeadSHA, sourceRef)
 		if err != nil {
 			return err
 		}
 		if !isExpectedAncestor {
-			return fmt.Errorf("Refusing fixer push for %s because local HEAD no longer descends from %s", input.Branch, input.ExpectedRemoteHeadSHA)
+			if derivedLease {
+				// The remote moved to a commit we never built on. Report it in
+				// the recoverable shape callers already handle.
+				return &RemoteHeadChangedError{Branch: input.Branch, ExpectedHeadSHA: "", ActualHeadSHA: expectedRemoteHeadSHA}
+			}
+			return fmt.Errorf("Refusing fixer push for %s because local HEAD no longer descends from %s", input.Branch, expectedRemoteHeadSHA)
 		}
 
 		err = g.runGit(ctx, input.WorktreePath, nil,
 			"push",
 			"--porcelain",
-			fmt.Sprintf("--force-with-lease=refs/heads/%s:%s", input.Branch, input.ExpectedRemoteHeadSHA),
+			fmt.Sprintf("--force-with-lease=refs/heads/%s:%s", input.Branch, expectedRemoteHeadSHA),
 			"-u",
 			remote,
 			fmt.Sprintf("%s:refs/heads/%s", sourceRef, input.Branch),
@@ -667,17 +737,28 @@ func (g *Gateway) Push(ctx context.Context, input PushInput) error {
 				if lookupErr != nil {
 					return lookupErr
 				}
-				return &RemoteHeadChangedError{Branch: input.Branch, ExpectedHeadSHA: input.ExpectedRemoteHeadSHA, ActualHeadSHA: actualHeadSHA}
+				return &RemoteHeadChangedError{Branch: input.Branch, ExpectedHeadSHA: expectedRemoteHeadSHA, ActualHeadSHA: actualHeadSHA}
 			}
 			return err
 		}
 		return g.setPinnedPushUpstream(ctx, input.WorktreePath, remote, input.Branch, sourceRef)
 	}
 
+	// Reached only when the branch does not exist remotely: creating a ref has
+	// nothing to lease against.
 	if err := g.runGit(ctx, input.WorktreePath, nil, "push", "-u", remote, fmt.Sprintf("%s:refs/heads/%s", sourceRef, input.Branch)); err != nil {
 		return err
 	}
 	return g.setPinnedPushUpstream(ctx, input.WorktreePath, remote, input.Branch, sourceRef)
+}
+
+// hasLocalObject reports whether the commit is present in this checkout's
+// object database.
+func (g *Gateway) hasLocalObject(ctx context.Context, worktreePath, sha string) bool {
+	if strings.TrimSpace(sha) == "" {
+		return false
+	}
+	return g.runGit(ctx, worktreePath, nil, "cat-file", "-e", sha+"^{commit}") == nil
 }
 
 func (g *Gateway) setPinnedPushUpstream(ctx context.Context, worktreePath, remote, destinationBranch, sourceRef string) error {
@@ -1315,22 +1396,34 @@ func isRetryableFetchRefLockRace(args []string, err error) bool {
 	return strings.Contains(message, "cannot lock ref") && strings.Contains(message, " but expected ")
 }
 
-func buildWorktreeDirectoryName(input CreateWorktreeInput) string {
+// buildWorktreeDirectoryName renders the on-disk name for one generation of a
+// managed checkout. The generation is part of the path, which is what makes
+// containment enforceable without proving anything about a process: a retired
+// generation and its successor simply address different directories, and the
+// stale writer's open file handles keep pointing at the old one.
+//
+// Generation 1 keeps the historical name so no existing checkout moves on disk.
+func buildWorktreeDirectoryName(input CreateWorktreeInput, generation int64) string {
+	base := sanitizeBranchName(input.Branch)
 	if input.PRNumber != 0 {
 		if normalizeCheckoutMode(input.CheckoutMode) == CheckoutModeDetached {
-			return fmt.Sprintf("looper-fix-%s-pr-%d-detached", sanitizeBranchName(input.ProjectID), input.PRNumber)
+			base = fmt.Sprintf("looper-fix-%s-pr-%d-detached", sanitizeBranchName(input.ProjectID), input.PRNumber)
+		} else {
+			base = fmt.Sprintf("looper-fix-%s-pr-%d", sanitizeBranchName(input.ProjectID), input.PRNumber)
 		}
-		return fmt.Sprintf("looper-fix-%s-pr-%d", sanitizeBranchName(input.ProjectID), input.PRNumber)
 	}
-
-	return sanitizeBranchName(input.Branch)
+	if generation > 1 {
+		return fmt.Sprintf("%s-g%d", base, generation)
+	}
+	return base
 }
 
 // DetachedPRWorktreePath returns the managed shared detached worktree path that
-// CreateWorktree claims for a PR (looper-fix-<project>-pr-<N>-detached).
-// Callers that must read ownership markers before CreateWorktree revokes them
-// should probe this candidate path even when no checkpoint worktree exists.
-func DetachedPRWorktreePath(worktreeRoot, projectID string, prNumber int64) string {
+// CreateWorktree claims for a PR at a given generation
+// (looper-fix-<project>-pr-<N>-detached[-g<G>]). Callers that must read
+// ownership markers before CreateWorktree revokes them should probe this
+// candidate path even when no checkpoint worktree exists.
+func DetachedPRWorktreePath(worktreeRoot, projectID string, prNumber int64, generation int64) string {
 	worktreeRoot = strings.TrimSpace(worktreeRoot)
 	projectID = strings.TrimSpace(projectID)
 	if worktreeRoot == "" || projectID == "" || prNumber == 0 {
@@ -1340,7 +1433,87 @@ func DetachedPRWorktreePath(worktreeRoot, projectID string, prNumber int64) stri
 		ProjectID:    projectID,
 		PRNumber:     prNumber,
 		CheckoutMode: CheckoutModeDetached,
-	}))
+	}, generation))
+}
+
+// retiredWorktreePaths indexes the directories of retired generations so that
+// discovery and cleanup can refuse to touch them.
+func (g *Gateway) retiredWorktreePaths(ctx context.Context, projectID string) (map[string]struct{}, error) {
+	if g.repos == nil || g.repos.Worktrees == nil {
+		return nil, nil
+	}
+	retired, err := g.repos.Worktrees.ListRetired(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list retired worktrees: %w", err)
+	}
+	paths := make(map[string]struct{}, len(retired))
+	for _, record := range retired {
+		if projectID != "" && record.ProjectID != projectID {
+			continue
+		}
+		paths[normalizeComparablePath(record.WorktreePath)] = struct{}{}
+	}
+	return paths, nil
+}
+
+// DetachedPRWorktreePathCandidates returns every generation directory that
+// currently exists on disk for a PR's shared detached checkout, highest
+// generation first. Marker probes use this because the generation CreateWorktree
+// will claim is not knowable from the filesystem alone, and a marker left by an
+// earlier generation is still the provenance the caller needs.
+func DetachedPRWorktreePathCandidates(worktreeRoot, projectID string, prNumber int64) []string {
+	base := DetachedPRWorktreePath(worktreeRoot, projectID, prNumber, 1)
+	if base == "" {
+		return nil
+	}
+	prefix := filepath.Base(base) + "-g"
+	type candidate struct {
+		path       string
+		generation int64
+	}
+	found := []candidate{{path: base, generation: 1}}
+	entries, err := os.ReadDir(worktreeRoot)
+	if err == nil {
+		for _, entry := range entries {
+			name := entry.Name()
+			if !strings.HasPrefix(name, prefix) {
+				continue
+			}
+			generation, convErr := strconv.ParseInt(strings.TrimPrefix(name, prefix), 10, 64)
+			if convErr != nil || generation < 2 {
+				continue
+			}
+			found = append(found, candidate{path: filepath.Join(worktreeRoot, name), generation: generation})
+		}
+	}
+	sort.Slice(found, func(i, j int) bool { return found[i].generation > found[j].generation })
+	paths := make([]string, 0, len(found))
+	for _, entry := range found {
+		paths = append(paths, entry.path)
+	}
+	return paths
+}
+
+// LiveGenerationForBranch resolves the generation the next claim of this
+// branch's checkout must use. A live (non-retired) row keeps its own
+// generation; otherwise the next claim allocates one past the highest
+// generation ever recorded for the branch. Gateways without storage always
+// report generation 1, which is the historical path.
+func (g *Gateway) LiveGenerationForBranch(ctx context.Context, projectID, branch string) (int64, error) {
+	if g.repos == nil || g.repos.Worktrees == nil {
+		return 1, nil
+	}
+	live, err := g.repos.Worktrees.GetByBranch(ctx, projectID, branch)
+	if err != nil {
+		return 0, err
+	}
+	if live != nil {
+		if live.Generation < 1 {
+			return 1, nil
+		}
+		return live.Generation, nil
+	}
+	return g.repos.Worktrees.NextGenerationForBranch(ctx, projectID, branch)
 }
 
 func parseGitHubRepoFromRemoteURL(remoteURL string) string {

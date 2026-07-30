@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -66,7 +67,26 @@ type candidateState struct {
 const (
 	ActionWouldClean = "would_clean"
 	ActionSkipped    = "skipped"
+
+	// retiredWorktreeQuietPeriod is how long a retired generation's directory
+	// must sit untouched before its disk is reclaimed. If it never goes quiet,
+	// the directory stays and shows up as a skipped decision — noisy, bounded,
+	// and harmless, which is the right failure mode for a disk decision.
+	retiredWorktreeQuietPeriod = 6 * time.Hour
 )
+
+// recentlyModified reports whether the directory itself was written to within
+// quietPeriod. An unreadable path counts as quiet: it is already gone.
+func recentlyModified(path string, now time.Time, quietPeriod time.Duration) bool {
+	if strings.TrimSpace(path) == "" {
+		return false
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+	return now.Sub(info.ModTime().UTC()) < quietPeriod
+}
 
 func (s *Service) Plan(ctx context.Context) (PlanResult, error) {
 	if s == nil || s.Repos == nil || s.Repos.Worktrees == nil || s.Repos.Loops == nil || s.Repos.Runs == nil || s.Repos.Queue == nil {
@@ -100,6 +120,15 @@ func (s *Service) Plan(ctx context.Context) (PlanResult, error) {
 		state := candidateState{worktree: worktree}
 		state.noteTime(worktree.UpdatedAt)
 		state.noteTime(worktree.CreatedAt)
+		// A retired generation is disk debt, never blocked work: no loop can be
+		// scheduled onto it. Reclaiming it is still a judgment call, because a
+		// writer from the previous daemon may still be there. Recent directory
+		// activity is the observable that says so — deliberately not a PID
+		// probe, which is what #149 removed from the scheduling path and must
+		// not reappear here.
+		if worktree.RetiredAt != nil && recentlyModified(worktree.WorktreePath, now().UTC(), retiredWorktreeQuietPeriod) {
+			state.block("retired generation still being written to")
+		}
 		states = append(states, state)
 	}
 

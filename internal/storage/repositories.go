@@ -291,6 +291,14 @@ type WorktreeRecord struct {
 	CreatedAt    string
 	UpdatedAt    string
 	CleanedAt    *string
+	// Generation identifies one daemon's claim on this checkout. It is carried
+	// in the directory name (see git.BuildWorktreeDirectoryName) so that a
+	// retired generation and its successor cannot address the same files.
+	Generation int64
+	// RetiredAt is set when the daemon gives up on this generation without
+	// being able to prove the previous writer is gone. A retired row is
+	// history: it is never restored, pushed from, or matched by GetByBranch.
+	RetiredAt *string
 }
 
 type NotificationsRepository struct{ q sqliteQuerier }
@@ -504,6 +512,32 @@ func (r *EventsRepository) ListFirstEventTimestampsByType(ctx context.Context, e
 		}
 	}
 	return matched, nil
+}
+
+// ExistsByType reports whether any event of this type has ever been written.
+// One-shot migrations use it as their durable "already ran" marker so they do
+// not need a table of their own.
+func (r *EventsRepository) ExistsByType(ctx context.Context, eventType string) (bool, error) {
+	var found int
+	err := r.q.QueryRowContext(ctx, `SELECT 1 FROM event_logs WHERE event_type = ? LIMIT 1`, eventType).Scan(&found)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("check event type exists: %w", err)
+	}
+	return true, nil
+}
+
+// ListByType returns every event of one type, oldest first.
+func (r *EventsRepository) ListByType(ctx context.Context, eventType string) ([]EventLogRecord, error) {
+	rows, err := r.q.QueryContext(ctx, `SELECT * FROM event_logs WHERE event_type = ? ORDER BY created_at ASC, id ASC`, eventType)
+	if err != nil {
+		return nil, fmt.Errorf("list event logs by type: %w", err)
+	}
+	defer rows.Close()
+
+	return scanEventLogs(rows)
 }
 
 func (r *EventsRepository) ListByProjectAndEntityType(ctx context.Context, projectID, entityType string) ([]EventLogRecord, error) {
@@ -1451,6 +1485,48 @@ func (r *LocksRepository) Refresh(ctx context.Context, record LockRecord) (bool,
 	}
 
 	return affected > 0, nil
+}
+
+// ClaimLeaseRenewalTTL is how far past the last heartbeat a claim lease is
+// held. It is deliberately unrelated to how long an agent step is allowed to
+// run: a lease that is written once at claim time and then outlived by its own
+// run is decorative, and one long enough to cover a 7200s agent timeout cannot
+// distinguish a working agent from a dead one. The renewable window is the
+// thing that carries meaning — "this claim heartbeated recently".
+const ClaimLeaseRenewalTTL = 15 * time.Minute
+
+// RefreshClaimLeaseForRun extends the queue claim lease that authorizes runID,
+// using the run's own heartbeat as the renewal signal. Returns false when the
+// run has no active queue claim or the lock is held by someone else — a
+// heartbeat must never take a lease it did not already hold.
+func (r *Repositories) RefreshClaimLeaseForRun(ctx context.Context, runID, expiresAt, nowISO string) (bool, error) {
+	if r == nil || r.Runs == nil || r.Queue == nil || r.Locks == nil || strings.TrimSpace(runID) == "" {
+		return false, nil
+	}
+	run, err := r.Runs.GetByID(ctx, runID)
+	if err != nil || run == nil {
+		return false, err
+	}
+	item, err := r.Queue.FindActiveByLoopID(ctx, run.LoopID)
+	if err != nil || item == nil {
+		return false, err
+	}
+	lockKey := strings.TrimSpace(derefStringValue(item.LockKey))
+	if lockKey == "" {
+		return false, nil
+	}
+	lock, err := r.Locks.Get(ctx, lockKey)
+	if err != nil || lock == nil || lock.Owner != item.ID {
+		return false, err
+	}
+	return r.Locks.Refresh(ctx, LockRecord{Key: lockKey, Owner: item.ID, Reason: lock.Reason, ExpiresAt: expiresAt, UpdatedAt: nowISO})
+}
+
+func derefStringValue(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
 }
 
 func (r *LocksRepository) ListExpired(ctx context.Context, nowISO string) ([]LockRecord, error) {
@@ -2512,8 +2588,8 @@ func (r *QueueRepository) CancelActiveByLoopExcept(ctx context.Context, loopID, 
 
 func (r *WorktreesRepository) Upsert(ctx context.Context, record WorktreeRecord) error {
 	_, err := r.q.ExecContext(ctx, `
-		INSERT INTO worktrees (id, project_id, repo_path, worktree_path, branch, base_branch, status, head_sha, metadata_json, created_at, updated_at, cleaned_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO worktrees (id, project_id, repo_path, worktree_path, branch, base_branch, status, head_sha, metadata_json, created_at, updated_at, cleaned_at, generation, retired_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			project_id=excluded.project_id,
 			repo_path=excluded.repo_path,
@@ -2524,8 +2600,10 @@ func (r *WorktreesRepository) Upsert(ctx context.Context, record WorktreeRecord)
 			head_sha=excluded.head_sha,
 			metadata_json=excluded.metadata_json,
 			updated_at=excluded.updated_at,
-			cleaned_at=excluded.cleaned_at
-	`, record.ID, record.ProjectID, record.RepoPath, record.WorktreePath, record.Branch, record.BaseBranch, record.Status, record.HeadSHA, record.MetadataJSON, record.CreatedAt, record.UpdatedAt, record.CleanedAt)
+			cleaned_at=excluded.cleaned_at,
+			generation=excluded.generation,
+			retired_at=excluded.retired_at
+	`, record.ID, record.ProjectID, record.RepoPath, record.WorktreePath, record.Branch, record.BaseBranch, record.Status, record.HeadSHA, record.MetadataJSON, record.CreatedAt, record.UpdatedAt, record.CleanedAt, normalizeWorktreeGeneration(record.Generation), record.RetiredAt)
 	if err != nil {
 		return fmt.Errorf("upsert worktree: %w", err)
 	}
@@ -2546,8 +2624,11 @@ func (r *WorktreesRepository) GetByID(ctx context.Context, id string) (*Worktree
 	return &record, nil
 }
 
+// GetByBranch returns the live generation for a branch. Retired generations are
+// deliberately invisible here: recovery retires a row precisely so that no later
+// claim can restore, push from, or clean that checkout.
 func (r *WorktreesRepository) GetByBranch(ctx context.Context, projectID, branch string) (*WorktreeRecord, error) {
-	row := r.q.QueryRowContext(ctx, `SELECT * FROM worktrees WHERE project_id = ? AND branch = ? LIMIT 1`, projectID, branch)
+	row := r.q.QueryRowContext(ctx, `SELECT * FROM worktrees WHERE project_id = ? AND branch = ? AND retired_at IS NULL LIMIT 1`, projectID, branch)
 	record, err := scanWorktree(row)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -2557,6 +2638,59 @@ func (r *WorktreesRepository) GetByBranch(ctx context.Context, projectID, branch
 	}
 
 	return &record, nil
+}
+
+// NextGenerationForBranch returns the generation the next claim of this branch's
+// checkout must use: one past the highest generation ever recorded, live or
+// retired. Never returns less than 1.
+func (r *WorktreesRepository) NextGenerationForBranch(ctx context.Context, projectID, branch string) (int64, error) {
+	var highest sql.NullInt64
+	err := r.q.QueryRowContext(ctx, `SELECT MAX(generation) FROM worktrees WHERE project_id = ? AND branch = ?`, projectID, branch).Scan(&highest)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return 0, fmt.Errorf("read highest worktree generation for branch: %w", err)
+	}
+	if !highest.Valid || highest.Int64 < 1 {
+		return 1, nil
+	}
+	return highest.Int64 + 1, nil
+}
+
+// Retire marks one generation as no longer owned by any daemon. This is the
+// durable fact startup recovery writes instead of asserting a process is dead.
+// Idempotent: retiring an already-retired row keeps the original timestamp.
+func (r *WorktreesRepository) Retire(ctx context.Context, id, retiredAt string) error {
+	if strings.TrimSpace(id) == "" {
+		return nil
+	}
+	_, err := r.q.ExecContext(ctx, `
+		UPDATE worktrees
+		SET retired_at = ?, updated_at = ?
+		WHERE id = ? AND retired_at IS NULL
+	`, retiredAt, retiredAt, id)
+	if err != nil {
+		return fmt.Errorf("retire worktree %s: %w", id, err)
+	}
+	return nil
+}
+
+// ListRetired returns retired generations whose directory has not been reclaimed
+// yet, oldest first. Disk reclaim for these is a separate decision from work
+// scheduling: an unremovable retired directory is disk debt, not a blocked loop.
+func (r *WorktreesRepository) ListRetired(ctx context.Context) ([]WorktreeRecord, error) {
+	rows, err := r.q.QueryContext(ctx, `SELECT * FROM worktrees WHERE retired_at IS NOT NULL AND cleaned_at IS NULL ORDER BY retired_at ASC, created_at ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("list retired worktrees: %w", err)
+	}
+	defer rows.Close()
+
+	return scanWorktrees(rows)
+}
+
+func normalizeWorktreeGeneration(generation int64) int64 {
+	if generation < 1 {
+		return 1
+	}
+	return generation
 }
 
 func (r *WorktreesRepository) ListByProject(ctx context.Context, projectID string) ([]WorktreeRecord, error) {
@@ -3271,9 +3405,11 @@ func scanWorktree(row interface{ Scan(...any) error }) (WorktreeRecord, error) {
 		headSHA      sql.NullString
 		metadataJSON sql.NullString
 		cleanedAt    sql.NullString
+		generation   sql.NullInt64
+		retiredAt    sql.NullString
 	)
 
-	err := row.Scan(&record.ID, &record.ProjectID, &record.RepoPath, &record.WorktreePath, &record.Branch, &baseBranch, &record.Status, &headSHA, &metadataJSON, &record.CreatedAt, &record.UpdatedAt, &cleanedAt)
+	err := row.Scan(&record.ID, &record.ProjectID, &record.RepoPath, &record.WorktreePath, &record.Branch, &baseBranch, &record.Status, &headSHA, &metadataJSON, &record.CreatedAt, &record.UpdatedAt, &cleanedAt, &generation, &retiredAt)
 	if err != nil {
 		return WorktreeRecord{}, err
 	}
@@ -3281,6 +3417,8 @@ func scanWorktree(row interface{ Scan(...any) error }) (WorktreeRecord, error) {
 	record.HeadSHA = nullableString(headSHA)
 	record.MetadataJSON = nullableString(metadataJSON)
 	record.CleanedAt = nullableString(cleanedAt)
+	record.Generation = normalizeWorktreeGeneration(generation.Int64)
+	record.RetiredAt = nullableString(retiredAt)
 
 	return record, nil
 }

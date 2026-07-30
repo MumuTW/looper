@@ -9,58 +9,74 @@ import (
 	"github.com/nexu-io/looper/internal/storage"
 )
 
-func TestClassifyStartupProbeEvidenceNeverConfirmedDeadFromPID(t *testing.T) {
+// The classifier has two outcomes and one live input. This table is the whole
+// surface; the 3-class × 5-probe-reason matrix it replaces is gone because PID
+// probes no longer participate in recovery at all.
+func TestClassifyDurableExecution(t *testing.T) {
 	t.Parallel()
 
 	cases := []struct {
-		name     string
-		pid      int
-		matches  bool
-		running  bool
-		probeErr error
-		want     ContainmentClass
-		reason   string
+		name      string
+		execution storage.AgentExecutionRecord
+		ownsLive  bool
+		want      ContainmentClass
+		reason    string
 	}{
-		{name: "pid absent", pid: 0, want: ContainmentUncertain, reason: "pid_absent"},
-		{name: "pid not running", pid: 42, matches: false, running: false, want: ContainmentUncertain, reason: "pid_not_running_not_confirmed_dead"},
-		{name: "identity mismatch", pid: 42, matches: false, running: true, want: ContainmentUncertain, reason: "process_identity_mismatch"},
-		{name: "observed live", pid: 42, matches: true, running: true, want: ContainmentObservedLive, reason: "process_identity_matched"},
-		{name: "probe error", pid: 42, probeErr: context.DeadlineExceeded, want: ContainmentUncertain, reason: "process_probe_error"},
+		{
+			name:      "durable terminal status",
+			execution: storage.AgentExecutionRecord{ID: "e1", Status: "killed", PID: int64Ptr(99)},
+			want:      ContainmentConfirmedDead,
+			reason:    "durable_terminal_finalization",
+		},
+		{
+			name:      "running row this daemon supervises",
+			execution: storage.AgentExecutionRecord{ID: "e2", Status: "running", PID: int64Ptr(99)},
+			ownsLive:  true,
+			want:      ContainmentCurrentDaemonOwned,
+			reason:    "current_daemon_supervisor_handle",
+		},
+		{
+			name:      "running row from a previous daemon",
+			execution: storage.AgentExecutionRecord{ID: "e3", Status: "running", PID: int64Ptr(99)},
+			want:      ContainmentConfirmedDead,
+			reason:    "stale_generation_retired",
+		},
+		{
+			name:      "running row with no pid at all",
+			execution: storage.AgentExecutionRecord{ID: "e4", Status: "running"},
+			want:      ContainmentConfirmedDead,
+			reason:    "stale_generation_retired",
+		},
+		{
+			name:      "a live handle outranks a terminal-looking cancel",
+			execution: storage.AgentExecutionRecord{ID: "e5", Status: "cancelling", PID: int64Ptr(99)},
+			ownsLive:  true,
+			want:      ContainmentCurrentDaemonOwned,
+			reason:    "current_daemon_supervisor_handle",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := classifyStartupProbeEvidence(tc.pid, tc.matches, tc.running, tc.probeErr)
+			t.Parallel()
+			got := classifyDurableExecution(tc.execution, nil, tc.ownsLive)
 			if got.Class != tc.want || got.Reason != tc.reason {
 				t.Fatalf("classify = %#v, want class=%s reason=%s", got, tc.want, tc.reason)
 			}
-			if classificationAllowsTerminalOrRequeue(got.Class) {
-				t.Fatalf("probe class %s must not allow terminal/requeue", got.Class)
-			}
-			if got.Class != ContainmentObservedLive && !classificationRequiresQuarantine(got.Class) {
-				t.Fatalf("non-live class %s must require quarantine", got.Class)
+			if classificationAllowsTerminalOrRequeue(got.Class) != (tc.want == ContainmentConfirmedDead) {
+				t.Fatalf("terminal authority for %s = %v", got.Class, classificationAllowsTerminalOrRequeue(got.Class))
 			}
 		})
 	}
 }
 
-func TestClassifyConfirmedDeadOnlyFromDurableTerminalOrCurrentHandle(t *testing.T) {
+func TestClassifyConfirmedDeadFromCurrentDaemonDrainedHandle(t *testing.T) {
 	t.Parallel()
-
-	terminal := storage.AgentExecutionRecord{ID: "e1", Status: "killed", PID: int64Ptr(99)}
-	class, ok := classifyFromDurableStatusAndHandle(terminal, nil)
-	if !ok || class.Class != ContainmentConfirmedDead || class.Reason != "durable_terminal_finalization" {
-		t.Fatalf("terminal classification = %#v ok=%v", class, ok)
-	}
-	if !classificationAllowsTerminalOrRequeue(class.Class) {
-		t.Fatal("confirmed_dead must allow terminal authority path")
-	}
 
 	active := storage.AgentExecutionRecord{ID: "e2", Status: "running", PID: int64Ptr(99)}
 	if _, ok := classifyFromDurableStatusAndHandle(active, nil); ok {
-		t.Fatal("active status without handle must not be confirmed_dead")
+		t.Fatal("active status without handle must not be confirmed_dead by status alone")
 	}
 
-	// Current-daemon handle that completed confirmed drain authorizes confirmed_dead.
 	truePath, err := exec.LookPath("true")
 	if err != nil {
 		t.Skip("true binary not available")
@@ -83,7 +99,7 @@ func TestClassifyConfirmedDeadOnlyFromDurableTerminalOrCurrentHandle(t *testing.
 	if !handle.ConfirmedDead() {
 		t.Fatal("handle not ConfirmedDead after Drain")
 	}
-	class, ok = classifyFromDurableStatusAndHandle(active, handle)
+	class, ok := classifyFromDurableStatusAndHandle(active, handle)
 	if !ok || class.Class != ContainmentConfirmedDead || class.Reason != "current_daemon_confirmed_drain" {
 		t.Fatalf("drained handle classification = %#v ok=%v", class, ok)
 	}

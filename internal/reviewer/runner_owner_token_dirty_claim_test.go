@@ -24,7 +24,7 @@ func TestRunPrepareWorktreeStepFreshReviewerRestoresCandidateFixerTokenOnDirty(t
 	worktreeRoot := filepath.Join(t.TempDir(), "worktrees")
 	projectID := "project_1"
 	prNumber := int64(42)
-	wtPath := gitinfra.DetachedPRWorktreePath(worktreeRoot, projectID, prNumber)
+	wtPath := gitinfra.DetachedPRWorktreePath(worktreeRoot, projectID, prNumber, 1)
 	if wtPath == "" {
 		t.Fatal("DetachedPRWorktreePath empty")
 	}
@@ -89,7 +89,7 @@ func TestRunPrepareWorktreeStepRestoresFixerTokenWhenCheckpointPersistFails(t *t
 	worktreeRoot := filepath.Join(t.TempDir(), "worktrees")
 	projectID := "project_1"
 	prNumber := int64(42)
-	wtPath := gitinfra.DetachedPRWorktreePath(worktreeRoot, projectID, prNumber)
+	wtPath := gitinfra.DetachedPRWorktreePath(worktreeRoot, projectID, prNumber, 1)
 	if wtPath == "" {
 		t.Fatal("DetachedPRWorktreePath empty")
 	}

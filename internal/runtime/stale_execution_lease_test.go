@@ -2,7 +2,9 @@ package runtime
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -10,232 +12,125 @@ import (
 	"github.com/nexu-io/looper/internal/storage"
 )
 
-func TestRuntimeReconcileStaleRunningRunsQuarantinesExpiredMissingPIDExecution(t *testing.T) {
-	t.Parallel()
-
-	now := time.Date(2026, time.July, 30, 12, 0, 0, 0, time.UTC)
-	rt, repos := newStaleExecutionLeaseRuntime(t, now, nil)
-	loopID, runID, queueID := seedStaleExecutionLeaseRun(t, repos, now, "missing_pid")
-	oldISO := formatJavaScriptISOString(now.Add(-2 * time.Hour))
-	if err := repos.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{
-		ID:              "execution_missing_pid",
-		ProjectID:       stringPtr("project_1"),
-		LoopID:          &loopID,
-		RunID:           &runID,
-		Vendor:          "codex",
-		Status:          "running",
-		CommandJSON:     stringPtr(`{"command":"codex","args":["exec"]}`),
-		CWD:             stringPtr(t.TempDir()),
-		LastHeartbeatAt: &oldISO,
-		StartedAt:       oldISO,
-		CreatedAt:       oldISO,
-		UpdatedAt:       oldISO,
-	}); err != nil {
-		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
-	}
-
-	summary, err := rt.ReconcileStaleRunningRuns(context.Background())
-	if err != nil {
-		t.Fatalf("ReconcileStaleRunningRuns() error = %v", err)
-	}
-	if summary.SkippedUncertainRuns != 1 || summary.QuarantinedExecutions != 1 || summary.InterruptedRuns != 0 {
-		t.Fatalf("summary = %#v, want expired leader-only evidence quarantined", summary)
-	}
-
-	execution, err := repos.AgentExecutions.GetByID(context.Background(), "execution_missing_pid")
-	if err != nil {
-		t.Fatalf("AgentExecutions.GetByID() error = %v", err)
-	}
-	if execution == nil || execution.Status != "running" || execution.EndedAt != nil {
-		t.Fatalf("execution = %#v, want retryable active evidence", execution)
-	}
-	run, _ := repos.Runs.GetByID(context.Background(), runID)
-	loop, _ := repos.Loops.GetByID(context.Background(), loopID)
-	queue, _ := repos.Queue.GetByID(context.Background(), queueID)
-	if run == nil || run.Status != "running" {
-		t.Fatalf("run = %#v, want running quarantine", run)
-	}
-	if loop == nil || loop.Status != "paused" {
-		t.Fatalf("loop = %#v, want paused", loop)
-	}
-	if queue == nil || queue.Status != "manual_intervention" {
-		t.Fatalf("queue = %#v, want manual intervention", queue)
-	}
-	events, err := repos.Events.ListByEntity(context.Background(), "agent_execution", "execution_missing_pid")
-	if err != nil {
-		t.Fatalf("Events.ListByEntity() error = %v", err)
-	}
-	if !containsEventType(events, "looperd.recovery.execution_confirmation_needed") {
-		t.Fatalf("events = %#v, want operator-visible confirmation-needed outcome", events)
-	}
-}
-
-func TestRuntimeReconcileStaleRunningRunsQuarantinesExpiredMismatchedPID(t *testing.T) {
+// The four PID shapes this file used to enumerate — absent, mismatched,
+// matching, and fresh-but-invalid — all produce the same outcome now. The
+// classifier does not read PIDs, so there is one behavior to assert, not a
+// matrix: an execution this daemon does not own is settled under worktree
+// generation containment.
+func TestRuntimeReconcileStaleRunningRunsSettlesExecutionsNoDaemonOwns(t *testing.T) {
 	t.Parallel()
 
 	for _, tc := range []struct {
 		name      string
-		reconcile func(*Runtime) (StaleRunReconcileSummary, error)
+		pid       *int64
+		process   ReadProcessCommandFunc
+		heartbeat func(time.Time) time.Time
 	}{
-		{name: "live", reconcile: func(rt *Runtime) (StaleRunReconcileSummary, error) {
-			return rt.reconcileLiveStaleRunningRuns(context.Background())
-		}},
-		{name: "manual", reconcile: func(rt *Runtime) (StaleRunReconcileSummary, error) {
-			return rt.ReconcileStaleRunningRuns(context.Background())
-		}},
+		{name: "no pid recorded", heartbeat: func(now time.Time) time.Time { return now.Add(-2 * time.Hour) }},
+		{name: "pid recorded but process gone", pid: int64Ptr(2201), heartbeat: func(now time.Time) time.Time { return now.Add(-2 * time.Hour) }},
+		{
+			name:      "pid recorded and a matching process is running",
+			pid:       int64Ptr(2202),
+			process:   func(context.Context, int) (string, error) { return "codex exec", nil },
+			heartbeat: func(now time.Time) time.Time { return now.Add(-2 * time.Hour) },
+		},
+		{
+			name:      "pid recorded and an unrelated process is running",
+			pid:       int64Ptr(2203),
+			process:   func(context.Context, int) (string, error) { return "python unrelated.py", nil },
+			heartbeat: func(now time.Time) time.Time { return now.Add(-2 * time.Hour) },
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			now := time.Date(2026, time.July, 30, 12, 0, 0, 0, time.UTC)
-			rt, repos := newStaleExecutionLeaseRuntime(t, now, func(context.Context, int) (string, error) {
-				return "python unrelated.py", nil
-			})
-			loopID, runID, _ := seedStaleExecutionLeaseRun(t, repos, now, "mismatched_"+tc.name)
+			rt, repos := newStaleExecutionLeaseRuntime(t, now, tc.process)
+			suffix := strings.ReplaceAll(tc.name, " ", "_")
+			loopID, runID, queueID := seedStaleExecutionLeaseRun(t, repos, now, suffix)
+			heartbeatISO := formatJavaScriptISOString(tc.heartbeat(now))
 			oldISO := formatJavaScriptISOString(now.Add(-2 * time.Hour))
-			pid := int64(2201)
+			executionID := "execution_" + suffix
 			if err := repos.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{
-				ID: "execution_mismatched_" + tc.name, ProjectID: stringPtr("project_1"),
+				ID: executionID, ProjectID: stringPtr("project_1"),
 				LoopID: &loopID, RunID: &runID, Vendor: "codex", Status: "running",
-				PID: &pid, CommandJSON: stringPtr(`{"command":"codex","args":["exec"]}`), MetadataJSON: stringPtr(`{"processIdentity":{"startTime":2201,"bootId":"boot-a"}}`),
-				LastHeartbeatAt: &oldISO, StartedAt: oldISO, CreatedAt: oldISO, UpdatedAt: oldISO,
+				PID: tc.pid, CommandJSON: stringPtr(`{"command":"codex","args":["exec"]}`),
+				MetadataJSON:    stringPtr(`{"processIdentity":{"startTime":2202,"bootId":"boot-a"}}`),
+				CWD:             stringPtr(t.TempDir()),
+				LastHeartbeatAt: &heartbeatISO, StartedAt: oldISO, CreatedAt: oldISO, UpdatedAt: oldISO,
 			}); err != nil {
 				t.Fatalf("AgentExecutions.Upsert() error = %v", err)
 			}
 
-			summary, err := tc.reconcile(rt)
+			summary, err := rt.ReconcileStaleRunningRuns(context.Background())
 			if err != nil {
-				t.Fatalf("reconcile error = %v", err)
+				t.Fatalf("ReconcileStaleRunningRuns() error = %v", err)
 			}
-			if summary.SkippedUncertainRuns != 1 || summary.QuarantinedExecutions != 1 || summary.InterruptedRuns != 0 {
-				t.Fatalf("summary = %#v, want expired mismatched execution quarantined", summary)
+			if summary.InterruptedRuns != 1 || summary.SettledExecutions != 1 {
+				t.Fatalf("summary = %#v, want the run interrupted and its execution settled", summary)
+			}
+
+			execution, err := repos.AgentExecutions.GetByID(context.Background(), executionID)
+			if err != nil {
+				t.Fatalf("AgentExecutions.GetByID() error = %v", err)
+			}
+			if execution == nil || execution.Status != "killed" || execution.EndedAt == nil {
+				t.Fatalf("execution = %#v, want finalized row", execution)
+			}
+			run, _ := repos.Runs.GetByID(context.Background(), runID)
+			if run == nil || run.Status != "interrupted" {
+				t.Fatalf("run = %#v, want interrupted", run)
+			}
+			queue, _ := repos.Queue.GetByID(context.Background(), queueID)
+			if queue == nil || queue.Status == "manual_intervention" {
+				t.Fatalf("queue = %#v, want the claim released rather than parked", queue)
+			}
+			events, err := repos.Events.ListByEntity(context.Background(), "agent_execution", executionID)
+			if err != nil {
+				t.Fatalf("Events.ListByEntity() error = %v", err)
+			}
+			if !containsEventType(events, recoveryExecutionQuarantinedEventType) {
+				t.Fatalf("events = %#v, want the settlement recorded for audit", events)
+			}
+			if !containsEventType(events, "looperd.recovery.execution_settleable") {
+				t.Fatalf("events = %#v, want the classification recorded", events)
 			}
 		})
 	}
 }
 
-func TestRuntimeReconcileStaleRunningRunsNeverOverlapsMatchingLiveProcess(t *testing.T) {
+// The counterpart, and the only thing that still blocks recovery: this daemon
+// holds the supervisor handle, so the work is genuinely in flight here.
+func TestRuntimeReconcileStaleRunningRunsNeverSettlesExecutionThisDaemonOwns(t *testing.T) {
 	t.Parallel()
 
 	now := time.Date(2026, time.July, 30, 12, 0, 0, 0, time.UTC)
-	rt, repos := newStaleExecutionLeaseRuntime(t, now, func(context.Context, int) (string, error) {
-		return "codex exec", nil
-	})
-	loopID, runID, _ := seedStaleExecutionLeaseRun(t, repos, now, "matching_live")
+	rt, repos := newStaleExecutionLeaseRuntime(t, now, nil)
+	loopID, runID, _ := seedStaleExecutionLeaseRun(t, repos, now, "owned_by_this_daemon")
 	oldISO := formatJavaScriptISOString(now.Add(-2 * time.Hour))
-	pid := int64(2202)
+	executionID := "execution_owned_by_this_daemon"
 	if err := repos.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{
-		ID: "execution_matching_live", ProjectID: stringPtr("project_1"),
+		ID: executionID, ProjectID: stringPtr("project_1"),
 		LoopID: &loopID, RunID: &runID, Vendor: "codex", Status: "running",
-		PID: &pid, CommandJSON: stringPtr(`{"command":"codex","args":["exec"]}`),
-		MetadataJSON:    stringPtr(`{"processIdentity":{"startTime":2202,"bootId":"boot-a"}}`),
 		LastHeartbeatAt: &oldISO, StartedAt: oldISO, CreatedAt: oldISO, UpdatedAt: oldISO,
 	}); err != nil {
 		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
 	}
+	release := rt.Services().ActiveExecutions.Register(loopID, runID, executionID, stubAgentExecution{})
+	defer release()
 
 	summary, err := rt.ReconcileStaleRunningRuns(context.Background())
 	if err != nil {
 		t.Fatalf("ReconcileStaleRunningRuns() error = %v", err)
 	}
-	if summary.InterruptedRuns != 0 || summary.LoopsRequeued != 0 || summary.CleanedExecutions != 0 {
-		t.Fatalf("summary = %#v, want matching live process to block overlap", summary)
+	if summary.InterruptedRuns != 0 || summary.SettledExecutions != 0 || summary.LoopsRequeued != 0 {
+		t.Fatalf("summary = %#v, want current supervisor owner preserved", summary)
 	}
-	run, _ := repos.Runs.GetByID(context.Background(), runID)
-	if run == nil || run.Status != "running" {
-		t.Fatalf("run = %#v, want running", run)
+	execution, _ := repos.AgentExecutions.GetByID(context.Background(), executionID)
+	if execution == nil || execution.Status != "running" {
+		t.Fatalf("execution = %#v, want untouched running row", execution)
 	}
-	events, err := repos.Events.ListByEntity(context.Background(), "agent_execution", "execution_matching_live")
-	if err != nil {
-		t.Fatalf("Events.ListByEntity() error = %v", err)
-	}
+	events, _ := repos.Events.ListByEntity(context.Background(), "agent_execution", executionID)
 	if !containsEventType(events, "looperd.recovery.execution_active") {
 		t.Fatalf("events = %#v, want operator-visible execution_active event", events)
-	}
-}
-
-func TestRuntimeReconcileStaleRunningRunsParksFreshInvalidIdentityForConfirmation(t *testing.T) {
-	t.Parallel()
-
-	now := time.Date(2026, time.July, 30, 12, 0, 0, 0, time.UTC)
-	rt, repos := newStaleExecutionLeaseRuntime(t, now, nil)
-	loopID, runID, queueID := seedStaleExecutionLeaseRun(t, repos, now, "fresh_missing_pid")
-	nowISO := formatJavaScriptISOString(now)
-	if err := repos.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{
-		ID: "execution_fresh_missing_pid", ProjectID: stringPtr("project_1"),
-		LoopID: &loopID, RunID: &runID, Vendor: "codex", Status: "running",
-		LastHeartbeatAt: &nowISO, StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO,
-	}); err != nil {
-		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
-	}
-
-	summary, err := rt.ReconcileStaleRunningRuns(context.Background())
-	if err != nil {
-		t.Fatalf("ReconcileStaleRunningRuns() error = %v", err)
-	}
-	if summary.SkippedUncertainRuns != 1 || summary.QuarantinedExecutions != 1 || summary.InterruptedRuns != 0 {
-		t.Fatalf("summary = %#v, want explicit confirmation-needed quarantine", summary)
-	}
-	loop, _ := repos.Loops.GetByID(context.Background(), loopID)
-	queue, _ := repos.Queue.GetByID(context.Background(), queueID)
-	if loop == nil || loop.Status != "paused" || queue == nil || queue.Status != "manual_intervention" {
-		t.Fatalf("loop = %#v queue = %#v, want paused/manual_intervention", loop, queue)
-	}
-	events, err := repos.Events.ListByEntity(context.Background(), "agent_execution", "execution_fresh_missing_pid")
-	if err != nil {
-		t.Fatalf("Events.ListByEntity() error = %v", err)
-	}
-	if !containsEventType(events, "looperd.recovery.execution_confirmation_needed") {
-		t.Fatalf("events = %#v, want operator-visible confirmation-needed event", events)
-	}
-}
-
-func TestRuntimeReconcileStaleRunningRunsPreservesQuarantineAfterExpiry(t *testing.T) {
-	t.Parallel()
-
-	now := time.Date(2026, time.July, 30, 12, 0, 0, 0, time.UTC)
-	rt, repos := newStaleExecutionLeaseRuntime(t, now, nil)
-	loopID, runID, _ := seedStaleExecutionLeaseRun(t, repos, now, "confirmation_then_expired")
-	nowISO := formatJavaScriptISOString(now)
-	if err := repos.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{
-		ID: "execution_confirmation_then_expired", ProjectID: stringPtr("project_1"),
-		LoopID: &loopID, RunID: &runID, Vendor: "codex", Status: "running",
-		LastHeartbeatAt: &nowISO, StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO,
-	}); err != nil {
-		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
-	}
-	if _, err := rt.ReconcileStaleRunningRuns(context.Background()); err != nil {
-		t.Fatalf("first reconcile error = %v", err)
-	}
-
-	later := now.Add(executionLivenessLeaseTTL + time.Minute)
-	operatorPausedAt := formatJavaScriptISOString(now.Add(5 * time.Minute))
-	loop, _ := repos.Loops.GetByID(context.Background(), loopID)
-	loop.Status = "paused"
-	loop.UpdatedAt = operatorPausedAt
-	if err := repos.Loops.Upsert(context.Background(), *loop); err != nil {
-		t.Fatalf("record operator pause: %v", err)
-	}
-	reason := "Paused by operator after recovery quarantine"
-	if _, err := repos.Queue.CancelByLoop(context.Background(), loopID, operatorPausedAt, &reason); err != nil {
-		t.Fatalf("CancelByLoop() error = %v", err)
-	}
-	rt.mu.Lock()
-	rt.now = func() time.Time { return later }
-	rt.mu.Unlock()
-	summary, err := rt.ReconcileStaleRunningRuns(context.Background())
-	if err != nil {
-		t.Fatalf("second reconcile error = %v", err)
-	}
-	if summary.CleanedExecutions != 0 || summary.LoopsRequeued != 0 || summary.QueueItemsRequeued != 0 {
-		t.Fatalf("summary = %#v, want expired evidence to remain quarantined", summary)
-	}
-	loop, _ = repos.Loops.GetByID(context.Background(), loopID)
-	latestQueue, _ := repos.Queue.GetLatestByLoopID(context.Background(), loopID)
-	execution, _ := repos.AgentExecutions.GetByID(context.Background(), "execution_confirmation_then_expired")
-	if loop == nil || loop.Status != "paused" || latestQueue == nil || latestQueue.Status != "manual_intervention" || execution == nil || execution.Status != "running" {
-		t.Fatalf("loop = %#v queue = %#v execution = %#v, want durable quarantine", loop, latestQueue, execution)
-	}
-	if loop.UpdatedAt != operatorPausedAt {
-		t.Fatalf("loop.UpdatedAt = %q, want later operator pause %q preserved", loop.UpdatedAt, operatorPausedAt)
 	}
 }
 
@@ -273,15 +168,17 @@ func seedStaleExecutionLeaseRun(t *testing.T, repos *storage.Repositories, now t
 	runID := "run_lease_" + suffix
 	queueID := "queue_lease_" + suffix
 	repo := "nexu-io/looper"
-	prNumber := int64(22)
-	targetID := "pr:nexu-io/looper:22"
+	// Seeds must not collide when a test seeds several loops: loops.seq is
+	// unique and the PR target is the loop's identity.
+	prNumber := int64(22 + len(suffix))
+	targetID := fmt.Sprintf("pr:nexu-io/looper:%d", prNumber)
 	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{
 		ID: "project_1", Name: "Looper", RepoPath: t.TempDir(), CreatedAt: nowISO, UpdatedAt: nowISO,
 	}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
 	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{
-		ID: loopID, Seq: 22, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request",
+		ID: loopID, Seq: prNumber, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request",
 		TargetID: &targetID, Repo: &repo, PRNumber: &prNumber, Status: "running",
 		CreatedAt: oldISO, UpdatedAt: oldISO,
 	}); err != nil {

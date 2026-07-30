@@ -6791,7 +6791,10 @@ func capturePriorFixerOwnerToken(checkpoint reviewerCheckpoint, worktreeRoot, pr
 			probes = append(probes, probe{path: path})
 		}
 	}
-	if candidate := gitinfra.DetachedPRWorktreePath(worktreeRoot, projectID, prNumber); candidate != "" {
+	// Probe every generation that exists on disk, newest first: retirement moves
+	// the claimed path, but a marker left in an older generation is still the
+	// provenance a same-head dirty adopt needs.
+	for _, candidate := range gitinfra.DetachedPRWorktreePathCandidates(worktreeRoot, projectID, prNumber) {
 		probes = append(probes, probe{path: candidate, prefer: true})
 	}
 	seen := make(map[string]struct{}, len(probes))
@@ -6811,7 +6814,7 @@ func capturePriorFixerOwnerToken(checkpoint reviewerCheckpoint, worktreeRoot, pr
 		if got == "" {
 			continue
 		}
-		if p.prefer {
+		if p.prefer && preferred == "" {
 			preferred = got
 		}
 		if token == "" {

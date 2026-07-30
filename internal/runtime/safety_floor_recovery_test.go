@@ -11,7 +11,10 @@ import (
 	"github.com/nexu-io/looper/internal/storage"
 )
 
-func TestSafetyFloorRecoveryNoActAndQuarantineBlocksOverlap(t *testing.T) {
+// Safety floor: recovery settles an orphan from a previous daemon and never
+// signals a process. Releasing the claim is safe precisely because the settled
+// execution's worktree generation was retired first.
+func TestSafetyFloorRecoverySettlesOrphanWithoutSignal(t *testing.T) {
 	t.Parallel()
 
 	workingDir := t.TempDir()
@@ -86,41 +89,22 @@ func TestSafetyFloorRecoveryNoActAndQuarantineBlocksOverlap(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetByID error = %v", err)
 	}
-	if execution == nil || execution.Status != "running" || execution.EndedAt != nil {
-		t.Fatalf("execution = %#v, want running evidence (not terminalized)", execution)
-	}
-	loop, err := services.Repositories.Loops.GetByID(context.Background(), loopID)
-	if err != nil {
-		t.Fatalf("Loops.GetByID error = %v", err)
-	}
-	if loop == nil || loop.Status != "paused" {
-		t.Fatalf("loop = %#v, want paused", loop)
-	}
-	queue, err := services.Repositories.Queue.GetByID(context.Background(), "queue_live_orphan")
-	if err != nil {
-		t.Fatalf("Queue.GetByID error = %v", err)
-	}
-	if queue == nil || queue.Status != "manual_intervention" {
-		t.Fatalf("queue = %#v, want manual_intervention", queue)
+	if execution == nil || execution.Status != "killed" || execution.EndedAt == nil {
+		t.Fatalf("execution = %#v, want finalized row", execution)
 	}
 	run, err := services.Repositories.Runs.GetByID(context.Background(), runID)
 	if err != nil {
 		t.Fatalf("Runs.GetByID error = %v", err)
 	}
-	if run == nil || run.Status != "running" {
-		t.Fatalf("run = %#v, want still running evidence (no false interrupt cleanliness)", run)
+	if run == nil || run.Status == "running" {
+		t.Fatalf("run = %#v, want the run finalized", run)
 	}
-
-	// Claim must not pick up quarantined work after admission is ready.
-	if err := rt.AllowClaim(); err != nil {
-		t.Fatalf("AllowClaim() = %v", err)
-	}
-	claimed, err := services.Repositories.Queue.ClaimNext(context.Background(), nowISO, "scheduler")
+	queue, err := services.Repositories.Queue.GetByID(context.Background(), "queue_live_orphan")
 	if err != nil {
-		t.Fatalf("ClaimNext error = %v", err)
+		t.Fatalf("Queue.GetByID error = %v", err)
 	}
-	if claimed != nil {
-		t.Fatalf("ClaimNext = %#v, want nil for quarantined work", claimed)
+	if queue == nil || queue.Status == "manual_intervention" || queue.Status == "running" {
+		t.Fatalf("queue = %#v, want the stale claim released", queue)
 	}
 }
 
@@ -207,7 +191,9 @@ func TestSafetyFloorQuarantinePreservesHumanTakeover(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Queue.GetByID error = %v", err)
 	}
-	if queue == nil || queue.Status != "manual_intervention" {
-		t.Fatalf("queue = %#v, want manual_intervention", queue)
+	// The stale claim is released either way; what must not happen is the loop
+	// leaving human_takeover or the claim staying live.
+	if queue == nil || queue.Status == "running" || queue.Status == "queued" {
+		t.Fatalf("queue = %#v, want the stale claim not actionable", queue)
 	}
 }

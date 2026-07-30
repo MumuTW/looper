@@ -57,6 +57,11 @@ func loopIDForSeq(seq int64) string { return "loop_quarantine_" + strconv.Format
 
 // Contract: a recovery pass that parks work reports it exactly once, naming
 // every loop it parked and the command that clears each one.
+//
+// After #149 the only thing recovery parks is work this daemon still owns —
+// rows from a previous daemon settle themselves. So the fixture registers live
+// supervisor handles before recovery runs, which is the shape a deferred
+// recovery pass sees in production.
 func TestStartupRecoveryQuarantineNotifiesOncePerPass(t *testing.T) {
 	t.Parallel()
 
@@ -85,15 +90,23 @@ func TestStartupRecoveryQuarantineNotifiesOncePerPass(t *testing.T) {
 	}
 
 	rt := New(Options{
-		Config:             cfg,
-		Logger:             &testLogger{},
-		Now:                func() time.Time { return startedAt },
-		ReadProcessCommand: func(context.Context, int) (string, error) { return "", nil },
+		Config:        cfg,
+		Logger:        &testLogger{},
+		Now:           func() time.Time { return startedAt },
+		DeferRecovery: true,
 	})
 	if err := rt.Start(context.Background()); err != nil {
 		t.Fatalf("Start() error = %v", err)
 	}
 	t.Cleanup(func() { rt.Stop("test cleanup") })
+	for _, seq := range []int64{35, 36} {
+		loopID := loopIDForSeq(seq)
+		release := rt.Services().ActiveExecutions.Register(loopID, "run_quarantine_"+loopID, "agent_quarantine_"+loopID, stubAgentExecution{})
+		defer release()
+	}
+	if err := rt.CompleteStartup(context.Background()); err != nil {
+		t.Fatalf("CompleteStartup() error = %v", err)
+	}
 
 	if quarantined := rt.RecoverySummary().OrphanAgentCleanup.QuarantinedCount; quarantined != 2 {
 		t.Fatalf("QuarantinedCount = %d, want 2", quarantined)

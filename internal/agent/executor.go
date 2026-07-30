@@ -1546,6 +1546,11 @@ func (x *execution) bumpRunHeartbeat(nowISO string) {
 	updated.LastHeartbeatAt = &nowISO
 	updated.UpdatedAt = nowISO
 	_ = x.executor.repos.Runs.Upsert(ctx, updated)
+	// The heartbeat and the claim lease are the same fact, so they are written
+	// together. Without this the lease expires mid-run and "expired lease"
+	// carries no information about whether the claim is still being worked.
+	expiresAt := eventlog.FormatJavaScriptISOString(x.executor.now().UTC().Add(storage.ClaimLeaseRenewalTTL))
+	_, _ = x.executor.repos.RefreshClaimLeaseForRun(ctx, x.input.RunID, expiresAt, nowISO)
 }
 
 // persistStatus writes a live (or initial) observation. One ordered writer per

@@ -646,8 +646,11 @@ func TestRuntimeStartRunsRecoveryBeforeImmediateSchedulerTick(t *testing.T) {
 	}
 
 	recovery := rt.RecoverySummary()
-	if recovery.ExpiredLocksReleased != 1 || recovery.InterruptedRunsMarked != 1 || recovery.LoopsRequeued != 1 || recovery.EventsWritten != 4 {
-		t.Fatalf("RecoverySummary() = %#v, want one recovered lock/run/loop and 4 events", recovery)
+	// 4 recovery events plus the one-shot pre-fencing settlement marker, which
+	// every database writes exactly once on the first boot that carries the
+	// worktree-generation fence.
+	if recovery.ExpiredLocksReleased != 1 || recovery.InterruptedRunsMarked != 1 || recovery.LoopsRequeued != 1 || recovery.EventsWritten != 5 {
+		t.Fatalf("RecoverySummary() = %#v, want one recovered lock/run/loop and 5 events", recovery)
 	}
 
 	events, err := services.Repositories.Events.ListByEntity(context.Background(), "loop", loopID)
@@ -1718,7 +1721,9 @@ func TestRuntimeRecoveryRequeuesRunningQueueItemWithoutRun(t *testing.T) {
 	}
 }
 
-func TestRuntimeRecoveryQuarantinesOrphanAgentExecutionsWithoutKill(t *testing.T) {
+// Recovery settles an orphan execution and still never signals a process. The
+// native session id survives so the next run can resume the agent natively.
+func TestRuntimeRecoverySettlesOrphanAgentExecutionsWithoutKill(t *testing.T) {
 	t.Parallel()
 
 	workingDir := t.TempDir()
@@ -1801,8 +1806,8 @@ func TestRuntimeRecoveryQuarantinesOrphanAgentExecutionsWithoutKill(t *testing.T
 	if err != nil {
 		t.Fatalf("AgentExecutions.GetByID() error = %v", err)
 	}
-	if agentExecution == nil || agentExecution.Status != "running" || agentExecution.EndedAt != nil {
-		t.Fatalf("AgentExecutions.GetByID(agent_orphan_1) = %#v, want still running evidence", agentExecution)
+	if agentExecution == nil || agentExecution.Status != "killed" || agentExecution.EndedAt == nil {
+		t.Fatalf("AgentExecutions.GetByID(agent_orphan_1) = %#v, want finalized row", agentExecution)
 	}
 	if agentExecution.NativeSessionID == nil || *agentExecution.NativeSessionID != nativeSessionID {
 		t.Fatalf("AgentExecutions.GetByID(agent_orphan_1) = %#v, want native session preserved", agentExecution)
@@ -1815,238 +1820,31 @@ func TestRuntimeRecoveryQuarantinesOrphanAgentExecutionsWithoutKill(t *testing.T
 	if err != nil {
 		t.Fatalf("Loops.GetByID() error = %v", err)
 	}
-	if loop == nil || loop.Status != "paused" {
-		t.Fatalf("loop = %#v, want paused quarantine", loop)
+	if loop == nil || loop.Status == "paused" {
+		t.Fatalf("loop = %#v, want released rather than parked", loop)
 	}
 	queue, err := services.Repositories.Queue.GetByID(context.Background(), "queue_orphan_1")
 	if err != nil {
 		t.Fatalf("Queue.GetByID() error = %v", err)
 	}
-	if queue == nil || queue.Status != "manual_intervention" {
-		t.Fatalf("queue = %#v, want manual_intervention quarantine", queue)
+	if queue == nil || queue.Status == "manual_intervention" {
+		t.Fatalf("queue = %#v, want the claim released", queue)
 	}
 
 	events, err := services.Repositories.Events.ListByEntity(context.Background(), "agent_execution", "agent_orphan_1")
 	if err != nil {
 		t.Fatalf("Events.ListByEntity(agent_execution) error = %v", err)
 	}
-	if containsEventType(events, "agent.killed") {
-		t.Fatalf("agent_execution events = %#v, want no agent.killed", events)
-	}
-	if !containsEventType(events, "looperd.recovery.execution_quarantined") {
-		t.Fatalf("agent_execution events = %#v, want execution_quarantined", events)
+	if !containsEventType(events, recoveryExecutionQuarantinedEventType) {
+		t.Fatalf("agent_execution events = %#v, want the settlement recorded for audit", events)
 	}
 
 	recovery := rt.RecoverySummary()
-	if !recovery.OrphanAgentCleanup.Attempted || recovery.OrphanAgentCleanup.CleanedCount != 0 || recovery.OrphanAgentCleanup.QuarantinedCount != 1 {
-		t.Fatalf("RecoverySummary().OrphanAgentCleanup = %#v, want attempted + quarantinedCount=1 + cleanedCount=0", recovery.OrphanAgentCleanup)
+	if !recovery.OrphanAgentCleanup.Attempted || recovery.OrphanAgentCleanup.ConfirmedDeadCount != 1 || recovery.OrphanAgentCleanup.QuarantinedCount != 0 {
+		t.Fatalf("RecoverySummary().OrphanAgentCleanup = %#v, want attempted + confirmedDeadCount=1 + quarantinedCount=0", recovery.OrphanAgentCleanup)
 	}
 	if rt.AdmissionState() != AdmissionReady {
 		t.Fatalf("AdmissionState() = %q, want ready after CompleteStartup", rt.AdmissionState())
-	}
-}
-
-func TestRuntimeRecoverySkipsMismatchedRecoveredPID(t *testing.T) {
-	t.Parallel()
-
-	workingDir := t.TempDir()
-	cfg, err := config.DefaultConfig(workingDir)
-	if err != nil {
-		t.Fatalf("DefaultConfig() error = %v", err)
-	}
-
-	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
-	backupDir := filepath.Join(workingDir, "backups")
-	cfg.Storage.BackupDir = &backupDir
-	startedAt := time.Date(2026, time.April, 17, 12, 34, 56, 0, time.UTC)
-	nowISO := formatJavaScriptISOString(startedAt)
-
-	seedCoordinator := openMigratedCoordinator(t, cfg.Storage.DBPath, backupDir)
-	seedRepos := storage.NewRepositories(seedCoordinator.DB())
-	pid := int64(4343)
-	if err := seedRepos.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{
-		ID:             "agent_orphan_mismatch",
-		Vendor:         "codex",
-		Status:         "running",
-		PID:            &pid,
-		CommandJSON:    stringPtr(`{"command":"codex","args":["exec"]}`),
-		CWD:            stringPtr(workingDir),
-		HeartbeatCount: 0,
-		StartedAt:      nowISO,
-		CreatedAt:      nowISO,
-		UpdatedAt:      nowISO,
-	}); err != nil {
-		t.Fatalf("AgentExecutions.Upsert() seed error = %v", err)
-	}
-	if err := seedCoordinator.Close(); err != nil {
-		t.Fatalf("seed coordinator close error = %v", err)
-	}
-
-	logger := &testLogger{}
-	signaled := false
-	rt := New(Options{
-		Config: cfg,
-		Logger: logger,
-		Now: func() time.Time {
-			return startedAt
-		},
-		ReadProcessCommand: func(context.Context, int) (string, error) {
-			return "python unrelated.py", nil
-		},
-		SignalProcess: func(int, syscall.Signal) error {
-			signaled = true
-			return nil
-		},
-	})
-	if err := rt.Start(context.Background()); err != nil {
-		t.Fatalf("Start() error = %v", err)
-	}
-	t.Cleanup(func() { rt.Stop("test cleanup") })
-
-	services := rt.Services()
-	agentExecution, err := services.Repositories.AgentExecutions.GetByID(context.Background(), "agent_orphan_mismatch")
-	if err != nil {
-		t.Fatalf("AgentExecutions.GetByID() error = %v", err)
-	}
-	if agentExecution == nil || agentExecution.Status != "running" || agentExecution.EndedAt != nil {
-		t.Fatalf("AgentExecutions.GetByID(agent_orphan_mismatch) = %#v, want still running without ended_at", agentExecution)
-	}
-	if signaled {
-		t.Fatal("SignalProcess() called, want mismatched pid to be skipped")
-	}
-	events, err := services.Repositories.Events.ListByEntity(context.Background(), "agent_execution", "agent_orphan_mismatch")
-	if err != nil {
-		t.Fatalf("Events.ListByEntity(agent_execution) error = %v", err)
-	}
-	if containsEventType(events, "agent.killed") {
-		t.Fatalf("agent_execution events = %#v, want no agent.killed for mismatched pid", events)
-	}
-	if !containsEventType(events, "looperd.recovery.process_identity_uncertain") {
-		t.Fatalf("agent_execution events = %#v, want uncertain-identity event", events)
-	}
-	recovery := rt.RecoverySummary()
-	if recovery.OrphanAgentCleanup.CleanedCount != 0 {
-		t.Fatalf("RecoverySummary().OrphanAgentCleanup = %#v, want cleanedCount=0", recovery.OrphanAgentCleanup)
-	}
-	if recovery.OrphanAgentCleanup.QuarantinedCount != 1 {
-		t.Fatalf("RecoverySummary().OrphanAgentCleanup = %#v, want quarantinedCount=1", recovery.OrphanAgentCleanup)
-	}
-	if !logger.containsMessage("recovery skipped due to uncertain process identity") {
-		t.Fatalf("logger entries = %#v, want uncertain process identity warning", logger.messages())
-	}
-	if !containsEventType(events, "looperd.recovery.execution_quarantined") {
-		t.Fatalf("agent_execution events = %#v, want execution_quarantined", events)
-	}
-}
-
-func TestRuntimeRecoveryPreservesRunWithUncertainActiveAgentExecution(t *testing.T) {
-	t.Parallel()
-
-	workingDir := t.TempDir()
-	cfg, err := config.DefaultConfig(workingDir)
-	if err != nil {
-		t.Fatalf("DefaultConfig() error = %v", err)
-	}
-
-	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
-	backupDir := filepath.Join(workingDir, "backups")
-	cfg.Storage.BackupDir = &backupDir
-	startedAt := time.Date(2026, time.April, 17, 12, 34, 56, 0, time.UTC)
-	nowISO := formatJavaScriptISOString(startedAt)
-	oldISO := formatJavaScriptISOString(startedAt.Add(-2 * time.Hour))
-
-	seedCoordinator := openMigratedCoordinator(t, cfg.Storage.DBPath, backupDir)
-	seedRepos := storage.NewRepositories(seedCoordinator.DB())
-	repo := "nexu-io/looper"
-	prNumber := int64(186)
-	targetID := "pr:nexu-io/looper:186"
-	loopID := "loop_mismatched_agent_running"
-	runID := "run_mismatched_agent_running"
-	if err := seedRepos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
-		t.Fatalf("Projects.Upsert() seed error = %v", err)
-	}
-	if err := seedRepos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 186, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
-		t.Fatalf("Loops.Upsert() seed error = %v", err)
-	}
-	if err := seedRepos.Runs.Upsert(context.Background(), storage.RunRecord{ID: runID, LoopID: loopID, Status: "running", CurrentStep: stringPtr("execute"), StartedAt: oldISO, LastHeartbeatAt: &oldISO, CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
-		t.Fatalf("Runs.Upsert() seed error = %v", err)
-	}
-	pid := int64(4343)
-	if err := seedRepos.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{
-		ID:              "agent_mismatched_running_run",
-		ProjectID:       stringPtr("project_1"),
-		LoopID:          &loopID,
-		RunID:           &runID,
-		Vendor:          "codex",
-		Status:          "running",
-		PID:             &pid,
-		CommandJSON:     stringPtr(`{"command":"codex","args":["exec"]}`),
-		CWD:             stringPtr(workingDir),
-		HeartbeatCount:  0,
-		LastHeartbeatAt: &nowISO,
-		StartedAt:       oldISO,
-		CreatedAt:       oldISO,
-		UpdatedAt:       nowISO,
-	}); err != nil {
-		t.Fatalf("AgentExecutions.Upsert() seed error = %v", err)
-	}
-	if err := seedCoordinator.Close(); err != nil {
-		t.Fatalf("seed coordinator close error = %v", err)
-	}
-
-	logger := &testLogger{}
-	rt := New(Options{
-		Config: cfg,
-		Logger: logger,
-		Now: func() time.Time {
-			return startedAt
-		},
-		ReadProcessCommand: func(context.Context, int) (string, error) {
-			return "python unrelated.py", nil
-		},
-		SignalProcess: func(int, syscall.Signal) error {
-			return nil
-		},
-	})
-	if err := rt.Start(context.Background()); err != nil {
-		t.Fatalf("Start() error = %v", err)
-	}
-	t.Cleanup(func() { rt.Stop("test cleanup") })
-
-	services := rt.Services()
-	run, err := services.Repositories.Runs.GetByID(context.Background(), runID)
-	if err != nil {
-		t.Fatalf("Runs.GetByID() error = %v", err)
-	}
-	if run == nil || run.Status != "running" || run.EndedAt != nil {
-		t.Fatalf("Runs.GetByID(%s) = %#v, want preserved running run", runID, run)
-	}
-	loop, err := services.Repositories.Loops.GetByID(context.Background(), loopID)
-	if err != nil {
-		t.Fatalf("Loops.GetByID() error = %v", err)
-	}
-	if loop == nil || loop.Status != "paused" {
-		t.Fatalf("Loops.GetByID(%s) = %#v, want quarantined paused loop", loopID, loop)
-	}
-	agentExecution, err := services.Repositories.AgentExecutions.GetByID(context.Background(), "agent_mismatched_running_run")
-	if err != nil {
-		t.Fatalf("AgentExecutions.GetByID() error = %v", err)
-	}
-	if agentExecution == nil || agentExecution.Status != "running" {
-		t.Fatalf("AgentExecutions.GetByID(agent_mismatched_running_run) = %#v, want still running stale row", agentExecution)
-	}
-	events, err := services.Repositories.Events.ListByEntity(context.Background(), "agent_execution", "agent_mismatched_running_run")
-	if err != nil {
-		t.Fatalf("Events.ListByEntity(agent_mismatched_running_run) error = %v", err)
-	}
-	if !containsEventType(events, "looperd.recovery.process_identity_uncertain") {
-		t.Fatalf("agent_execution events = %#v, want uncertain-identity event", events)
-	}
-	if recovery := rt.RecoverySummary(); recovery.InterruptedRunsMarked != 0 || recovery.LoopsRequeued != 0 || recovery.OrphanAgentCleanup.CleanedCount != 0 {
-		t.Fatalf("RecoverySummary() = %#v, want preserved run and loop for uncertain live execution", recovery)
-	}
-	if !logger.containsMessage("recovery skipped due to uncertain process identity") {
-		t.Fatalf("logger entries = %#v, want uncertain process identity warning", logger.messages())
 	}
 }
 
@@ -2097,107 +1895,6 @@ func TestCommandPrefixMatchesPreservesLiteralOctalBackslashes(t *testing.T) {
 		splitProcessCommand(`codex exec Review code block containing \012 changed`),
 	) {
 		t.Fatal("commandPrefixMatches() = true, want false for changed literal octal-looking backslash tail")
-	}
-}
-
-func TestRuntimeRecoveryPreservesLoopWithActiveAgentExecution(t *testing.T) {
-	t.Parallel()
-
-	workingDir := t.TempDir()
-	cfg, err := config.DefaultConfig(workingDir)
-	if err != nil {
-		t.Fatalf("DefaultConfig() error = %v", err)
-	}
-
-	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
-	backupDir := filepath.Join(workingDir, "backups")
-	cfg.Storage.BackupDir = &backupDir
-	startedAt := time.Date(2026, time.April, 17, 12, 34, 56, 0, time.UTC)
-	nowISO := formatJavaScriptISOString(startedAt)
-	oldISO := formatJavaScriptISOString(startedAt.Add(-2 * time.Hour))
-
-	seedCoordinator := openMigratedCoordinator(t, cfg.Storage.DBPath, backupDir)
-	seedRepos := storage.NewRepositories(seedCoordinator.DB())
-	repo := "nexu-io/looper"
-	prNumber := int64(186)
-	targetID := "pr:nexu-io/looper:186"
-	loopID := "loop_active_agent_running"
-	runID := "run_active_agent_running"
-	if err := seedRepos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
-		t.Fatalf("Projects.Upsert() seed error = %v", err)
-	}
-	if err := seedRepos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 186, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
-		t.Fatalf("Loops.Upsert() seed error = %v", err)
-	}
-	if err := seedRepos.Runs.Upsert(context.Background(), storage.RunRecord{ID: runID, LoopID: loopID, Status: "running", CurrentStep: stringPtr("execute"), StartedAt: oldISO, LastHeartbeatAt: &oldISO, CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
-		t.Fatalf("Runs.Upsert() seed error = %v", err)
-	}
-	pid := int64(4444)
-	if err := seedRepos.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{
-		ID:             "agent_active_running_run",
-		ProjectID:      stringPtr("project_1"),
-		LoopID:         &loopID,
-		RunID:          &runID,
-		Vendor:         "codex",
-		Status:         "running",
-		PID:            &pid,
-		CommandJSON:    stringPtr(`{"command":"codex","args":["exec"]}`),
-		CWD:            stringPtr(workingDir),
-		HeartbeatCount: 0,
-		StartedAt:      oldISO,
-		CreatedAt:      oldISO,
-		UpdatedAt:      oldISO,
-	}); err != nil {
-		t.Fatalf("AgentExecutions.Upsert() seed error = %v", err)
-	}
-	if err := seedCoordinator.Close(); err != nil {
-		t.Fatalf("seed coordinator close error = %v", err)
-	}
-
-	rt := New(Options{
-		Config: cfg,
-		Logger: &testLogger{},
-		Now: func() time.Time {
-			return startedAt
-		},
-		ReadProcessCommand: func(context.Context, int) (string, error) {
-			return "codex exec", nil
-		},
-		SignalProcess: func(int, syscall.Signal) error {
-			return errors.New("process cleanup skipped")
-		},
-	})
-	if err := rt.Start(context.Background()); err != nil {
-		t.Fatalf("Start() error = %v", err)
-	}
-	t.Cleanup(func() { rt.Stop("test cleanup") })
-
-	services := rt.Services()
-	loop, err := services.Repositories.Loops.GetByID(context.Background(), loopID)
-	if err != nil {
-		t.Fatalf("Loops.GetByID() error = %v", err)
-	}
-	if loop == nil || loop.Status != "paused" {
-		t.Fatalf("Loops.GetByID(%s) = %#v, want quarantined paused loop", loopID, loop)
-	}
-	run, err := services.Repositories.Runs.GetByID(context.Background(), runID)
-	if err != nil {
-		t.Fatalf("Runs.GetByID() error = %v", err)
-	}
-	if run == nil || run.Status != "running" || run.EndedAt != nil {
-		t.Fatalf("Runs.GetByID(%s) = %#v, want preserved running run evidence", runID, run)
-	}
-	queueItems, err := services.Repositories.Queue.List(context.Background())
-	if err != nil {
-		t.Fatalf("Queue.List() error = %v", err)
-	}
-	for _, item := range queueItems {
-		if item.LoopID != nil && *item.LoopID == loopID && item.Status != "manual_intervention" && item.Status != "completed" && item.Status != "failed" && item.Status != "cancelled" {
-			t.Fatalf("unexpected actionable queue item for quarantined loop: %#v", item)
-		}
-	}
-	if recovery := rt.RecoverySummary(); recovery.InterruptedRunsMarked != 0 || recovery.LoopsRequeued != 0 || recovery.OrphanAgentCleanup.CleanedCount != 0 {
-		t.Fatalf("RecoverySummary() = %#v, want no run interruption or loop requeue while active agent remains", recovery)
 	}
 }
 
@@ -2343,7 +2040,8 @@ func TestRuntimeReconcileLiveStaleRunningRunsInterruptsWorkerExecuteRunWithoutEx
 	}
 }
 
-func TestRuntimeReconcileStaleRunningRunsSkipsVerifiedLiveExecution(t *testing.T) {
+// "Verified live" now means one thing: this daemon holds the supervisor handle.
+func TestRuntimeReconcileStaleRunningRunsSkipsCurrentDaemonOwnedExecution(t *testing.T) {
 	t.Parallel()
 
 	for _, tc := range []struct {
@@ -2392,13 +2090,15 @@ func TestRuntimeReconcileStaleRunningRunsSkipsVerifiedLiveExecution(t *testing.T
 			if err := repos.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{ID: "exec_live_execution", ProjectID: stringPtr("project_1"), LoopID: stringPtr("loop_live_execution"), RunID: stringPtr("run_live_execution"), Vendor: "codex", Status: "running", PID: &pid, CommandJSON: stringPtr(`{"command":"codex","args":["exec"]}`), CWD: stringPtr(workingDir), MetadataJSON: stringPtr(`{"processIdentity":{"startTime":515100,"bootId":"boot-test"}}`), StartedAt: oldISO, CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
 				t.Fatalf("AgentExecutions.Upsert() error = %v", err)
 			}
+			release := rt.Services().ActiveExecutions.Register("loop_live_execution", "run_live_execution", "exec_live_execution", stubAgentExecution{})
+			defer release()
 
 			summary, err := tc.reconcile(rt, context.Background())
 			if err != nil {
 				t.Fatalf("reconcile error = %v", err)
 			}
 			if summary.CandidateRuns != 0 || summary.InterruptedRuns != 0 {
-				t.Fatalf("summary = %#v, want verified live execution preserved", summary)
+				t.Fatalf("summary = %#v, want current-daemon owned execution preserved", summary)
 			}
 			run, _ := repos.Runs.GetByID(context.Background(), "run_live_execution")
 			if run == nil || run.Status != "running" {
@@ -2491,59 +2191,43 @@ func TestRuntimeReconcileStaleRunningRunsSkipsQueueRepairAfterQuarantine(t *test
 			if err != nil {
 				t.Fatalf("reconcile error = %v", err)
 			}
-			if summary.CandidateRuns != 1 || summary.InterruptedRuns != 0 || summary.SkippedUncertainRuns != 1 {
-				t.Fatalf("summary = %#v, want one confirmation-needed run", summary)
-			}
-			if summary.LoopsRequeued != 0 || summary.QueueItemsRequeued != 0 {
-				t.Fatalf("summary = %#v, want no requeue after quarantine", summary)
-			}
-			if summary.CleanedExecutions != 0 {
-				t.Fatalf("summary.CleanedExecutions = %d, want 0 (quarantine is not cleanup)", summary.CleanedExecutions)
-			}
-			if summary.QuarantinedExecutions != 1 {
-				t.Fatalf("summary.QuarantinedExecutions = %d, want 1", summary.QuarantinedExecutions)
+			if summary.CandidateRuns != 1 || summary.InterruptedRuns != 1 || summary.SettledExecutions != 1 {
+				t.Fatalf("summary = %#v, want the stale run settled rather than parked", summary)
 			}
 
 			run, err := repos.Runs.GetByID(context.Background(), runID)
 			if err != nil {
 				t.Fatalf("Runs.GetByID() error = %v", err)
 			}
-			if run == nil || run.Status != "running" {
-				t.Fatalf("run = %#v, want preserved running run", run)
+			if run == nil || run.Status != "interrupted" {
+				t.Fatalf("run = %#v, want interrupted run", run)
 			}
 			execution, err := repos.AgentExecutions.GetByID(context.Background(), "exec_dead_quarantine")
 			if err != nil {
 				t.Fatalf("AgentExecutions.GetByID() error = %v", err)
 			}
-			if execution == nil || execution.Status != "running" || execution.EndedAt != nil {
-				t.Fatalf("execution = %#v, want still-running evidence", execution)
+			if execution == nil || execution.Status != "killed" || execution.EndedAt == nil {
+				t.Fatalf("execution = %#v, want finalized evidence", execution)
 			}
 			loop, err := repos.Loops.GetByID(context.Background(), loopID)
 			if err != nil {
 				t.Fatalf("Loops.GetByID() error = %v", err)
 			}
-			if loop == nil || loop.Status != "paused" {
-				t.Fatalf("loop = %#v, want paused quarantine (not requeued)", loop)
+			if loop == nil || loop.Status == "paused" {
+				t.Fatalf("loop = %#v, want the loop released rather than parked", loop)
 			}
 			queue, err := repos.Queue.GetByID(context.Background(), queueID)
 			if err != nil {
 				t.Fatalf("Queue.GetByID() error = %v", err)
 			}
-			if queue == nil || queue.Status != "manual_intervention" {
-				t.Fatalf("queue = %#v, want manual_intervention quarantine", queue)
-			}
-			active, err := repos.Queue.FindActiveByLoopID(context.Background(), loopID)
-			if err != nil {
-				t.Fatalf("FindActiveByLoopID() error = %v", err)
-			}
-			if active != nil {
-				t.Fatalf("FindActiveByLoopID = %#v, want no active queue after quarantine", active)
+			if queue == nil || queue.Status == "manual_intervention" {
+				t.Fatalf("queue = %#v, want the claim released rather than parked", queue)
 			}
 		})
 	}
 }
 
-func TestRuntimeReconcileStaleRunningRunsKeepsSupersededRunWithVerifiedLiveExecution(t *testing.T) {
+func TestRuntimeReconcileStaleRunningRunsKeepsSupersededRunOwnedByThisDaemon(t *testing.T) {
 	t.Parallel()
 
 	for _, tc := range []struct {
@@ -2596,6 +2280,8 @@ func TestRuntimeReconcileStaleRunningRunsKeepsSupersededRunWithVerifiedLiveExecu
 			if err := repos.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{ID: "exec_superseded_live", ProjectID: stringPtr("project_1"), LoopID: stringPtr("loop_superseded_live"), RunID: stringPtr("run_superseded_old"), Vendor: "codex", Status: "running", PID: &pid, CommandJSON: stringPtr(`{"command":"codex","args":["exec"]}`), CWD: stringPtr(workingDir), MetadataJSON: stringPtr(`{"processIdentity":{"startTime":525200,"bootId":"boot-test"}}`), StartedAt: oldISO, CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
 				t.Fatalf("AgentExecutions.Upsert() error = %v", err)
 			}
+			release := rt.Services().ActiveExecutions.Register("loop_superseded_live", "run_superseded_old", "exec_superseded_live", stubAgentExecution{})
+			defer release()
 
 			summary, err := tc.reconcile(rt, context.Background())
 			if err != nil {
@@ -2673,122 +2359,77 @@ func TestRepairStaleRunQueueStateDoesNotRequeueLoopWhileNewerRunIsLive(t *testin
 	}
 }
 
+// A run can carry several execution rows. One handle this daemon owns is enough
+// to block settlement for the whole run; with no handle at all, every row is
+// settleable regardless of what the operating system reports about their PIDs.
 func TestRuntimeReconcileStaleRunningRunsWithMultipleActiveExecutions(t *testing.T) {
 	t.Parallel()
 
-	t.Run("verified live execution wins", func(t *testing.T) {
-		workingDir := t.TempDir()
-		cfg, err := config.DefaultConfig(workingDir)
-		if err != nil {
-			t.Fatalf("DefaultConfig() error = %v", err)
-		}
-		cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
-		backupDir := filepath.Join(workingDir, "backups")
-		cfg.Storage.BackupDir = &backupDir
-		now := time.Date(2026, time.May, 20, 12, 0, 0, 0, time.UTC)
-		nowISO := formatJavaScriptISOString(now)
-		oldISO := formatJavaScriptISOString(now.Add(-2 * time.Hour))
-		livePID := int64(5353)
-		deadPID := int64(5354)
-
-		rt := newManualReconcileRuntime(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }, ReadProcessCommand: func(_ context.Context, pid int) (string, error) {
-			switch pid {
-			case int(livePID):
-				return "codex exec", nil
-			case int(deadPID):
-				return "", nil
-			default:
-				return "", nil
+	for _, tc := range []struct {
+		name            string
+		registerOwned   bool
+		wantInterrupted int64
+		wantSettled     int64
+	}{
+		{name: "one execution owned by this daemon blocks the run", registerOwned: true},
+		{name: "no execution owned by this daemon settles the run", wantInterrupted: 1, wantSettled: 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			workingDir := t.TempDir()
+			cfg, err := config.DefaultConfig(workingDir)
+			if err != nil {
+				t.Fatalf("DefaultConfig() error = %v", err)
 			}
-		}, ReadProcessStart: func(context.Context, int) (int64, error) { return 535300, nil }, ReadProcessBootID: func(context.Context, int) (string, error) { return "boot-test", nil }, RunSchedulerTick: func(context.Context, Services) error { return nil }})
-		if err := rt.Start(context.Background()); err != nil {
-			t.Fatalf("Start() error = %v", err)
-		}
-		defer rt.Stop("test cleanup")
-		repos := rt.Services().Repositories
-		repo := "nexu-io/looper"
-		prNumber := int64(190)
-		targetID := "pr:nexu-io/looper:190"
-		if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
-			t.Fatalf("Projects.Upsert() error = %v", err)
-		}
-		if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_multi_exec_live", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
-			t.Fatalf("Loops.Upsert() error = %v", err)
-		}
-		if err := repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_multi_exec_live", LoopID: "loop_multi_exec_live", Status: "running", CurrentStep: stringPtr("review"), StartedAt: oldISO, LastHeartbeatAt: stringPtr(oldISO), CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
-			t.Fatalf("Runs.Upsert() error = %v", err)
-		}
-		for _, exec := range []storage.AgentExecutionRecord{{ID: "exec_multi_live", ProjectID: stringPtr("project_1"), LoopID: stringPtr("loop_multi_exec_live"), RunID: stringPtr("run_multi_exec_live"), Vendor: "codex", Status: "running", PID: &livePID, CommandJSON: stringPtr(`{"command":"codex","args":["exec"]}`), CWD: stringPtr(workingDir), MetadataJSON: stringPtr(`{"processIdentity":{"startTime":535300,"bootId":"boot-test"}}`), StartedAt: oldISO, CreatedAt: oldISO, UpdatedAt: oldISO}, {ID: "exec_multi_dead", ProjectID: stringPtr("project_1"), LoopID: stringPtr("loop_multi_exec_live"), RunID: stringPtr("run_multi_exec_live"), Vendor: "codex", Status: "running", PID: &deadPID, CommandJSON: stringPtr(`{"command":"codex","args":["exec"]}`), CWD: stringPtr(workingDir), StartedAt: oldISO, CreatedAt: oldISO, UpdatedAt: oldISO}} {
-			if err := repos.AgentExecutions.Upsert(context.Background(), exec); err != nil {
-				t.Fatalf("AgentExecutions.Upsert() error = %v", err)
+			cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
+			backupDir := filepath.Join(workingDir, "backups")
+			cfg.Storage.BackupDir = &backupDir
+			now := time.Date(2026, time.May, 20, 12, 0, 0, 0, time.UTC)
+			nowISO := formatJavaScriptISOString(now)
+			oldISO := formatJavaScriptISOString(now.Add(-2 * time.Hour))
+
+			rt := newManualReconcileRuntime(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }})
+			if err := rt.Start(context.Background()); err != nil {
+				t.Fatalf("Start() error = %v", err)
 			}
-		}
-
-		summary, err := rt.ReconcileStaleRunningRuns(context.Background())
-		if err != nil {
-			t.Fatalf("ReconcileStaleRunningRuns() error = %v", err)
-		}
-		if summary.CandidateRuns != 0 || summary.InterruptedRuns != 0 || summary.SkippedUncertainRuns != 0 {
-			t.Fatalf("summary = %#v, want live execution to keep run active", summary)
-		}
-	})
-
-	t.Run("ambiguous without verified live is uncertain", func(t *testing.T) {
-		workingDir := t.TempDir()
-		cfg, err := config.DefaultConfig(workingDir)
-		if err != nil {
-			t.Fatalf("DefaultConfig() error = %v", err)
-		}
-		cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
-		backupDir := filepath.Join(workingDir, "backups")
-		cfg.Storage.BackupDir = &backupDir
-		now := time.Date(2026, time.May, 20, 12, 0, 0, 0, time.UTC)
-		nowISO := formatJavaScriptISOString(now)
-		oldISO := formatJavaScriptISOString(now.Add(-2 * time.Hour))
-		ambiguousPID := int64(5453)
-		deadPID := int64(5454)
-
-		rt := newManualReconcileRuntime(Options{Config: cfg, Logger: &testLogger{}, Now: func() time.Time { return now }, ReadProcessCommand: func(_ context.Context, pid int) (string, error) {
-			switch pid {
-			case int(ambiguousPID):
-				return "python unrelated.py", nil
-			case int(deadPID):
-				return "", nil
-			default:
-				return "", nil
+			defer rt.Stop("test cleanup")
+			repos := rt.Services().Repositories
+			repo := "nexu-io/looper"
+			prNumber := int64(191)
+			targetID := "pr:nexu-io/looper:191"
+			loopID := "loop_multi_exec"
+			runID := "run_multi_exec"
+			if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+				t.Fatalf("Projects.Upsert() error = %v", err)
 			}
-		}})
-		if err := rt.Start(context.Background()); err != nil {
-			t.Fatalf("Start() error = %v", err)
-		}
-		defer rt.Stop("test cleanup")
-		repos := rt.Services().Repositories
-		repo := "nexu-io/looper"
-		prNumber := int64(191)
-		targetID := "pr:nexu-io/looper:191"
-		if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
-			t.Fatalf("Projects.Upsert() error = %v", err)
-		}
-		if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_multi_exec_uncertain", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
-			t.Fatalf("Loops.Upsert() error = %v", err)
-		}
-		if err := repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_multi_exec_uncertain", LoopID: "loop_multi_exec_uncertain", Status: "running", CurrentStep: stringPtr("review"), StartedAt: oldISO, LastHeartbeatAt: stringPtr(oldISO), CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
-			t.Fatalf("Runs.Upsert() error = %v", err)
-		}
-		for _, exec := range []storage.AgentExecutionRecord{{ID: "exec_multi_ambiguous", ProjectID: stringPtr("project_1"), LoopID: stringPtr("loop_multi_exec_uncertain"), RunID: stringPtr("run_multi_exec_uncertain"), Vendor: "codex", Status: "running", PID: &ambiguousPID, CommandJSON: stringPtr(`{"command":"codex","args":["exec"]}`), CWD: stringPtr(workingDir), LastHeartbeatAt: &nowISO, StartedAt: oldISO, CreatedAt: oldISO, UpdatedAt: nowISO}, {ID: "exec_multi_dead_2", ProjectID: stringPtr("project_1"), LoopID: stringPtr("loop_multi_exec_uncertain"), RunID: stringPtr("run_multi_exec_uncertain"), Vendor: "codex", Status: "running", PID: &deadPID, CommandJSON: stringPtr(`{"command":"codex","args":["exec"]}`), CWD: stringPtr(workingDir), StartedAt: oldISO, CreatedAt: oldISO, UpdatedAt: oldISO}} {
-			if err := repos.AgentExecutions.Upsert(context.Background(), exec); err != nil {
-				t.Fatalf("AgentExecutions.Upsert() error = %v", err)
+			if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
+				t.Fatalf("Loops.Upsert() error = %v", err)
 			}
-		}
+			if err := repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: runID, LoopID: loopID, Status: "running", CurrentStep: stringPtr("review"), StartedAt: oldISO, LastHeartbeatAt: stringPtr(oldISO), CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
+				t.Fatalf("Runs.Upsert() error = %v", err)
+			}
+			for _, executionID := range []string{"exec_multi_a", "exec_multi_b"} {
+				if err := repos.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{
+					ID: executionID, ProjectID: stringPtr("project_1"), LoopID: &loopID, RunID: &runID,
+					Vendor: "codex", Status: "running", CommandJSON: stringPtr(`{"command":"codex","args":["exec"]}`),
+					CWD: stringPtr(workingDir), StartedAt: oldISO, CreatedAt: oldISO, UpdatedAt: oldISO,
+				}); err != nil {
+					t.Fatalf("AgentExecutions.Upsert() error = %v", err)
+				}
+			}
+			if tc.registerOwned {
+				release := rt.Services().ActiveExecutions.Register(loopID, runID, "exec_multi_a", stubAgentExecution{})
+				defer release()
+			}
 
-		summary, err := rt.ReconcileStaleRunningRuns(context.Background())
-		if err != nil {
-			t.Fatalf("ReconcileStaleRunningRuns() error = %v", err)
-		}
-		if summary.CandidateRuns != 1 || summary.SkippedUncertainRuns != 1 || summary.InterruptedRuns != 0 {
-			t.Fatalf("summary = %#v, want uncertain candidate preserved", summary)
-		}
-	})
+			summary, err := rt.ReconcileStaleRunningRuns(context.Background())
+			if err != nil {
+				t.Fatalf("ReconcileStaleRunningRuns() error = %v", err)
+			}
+			if summary.InterruptedRuns != tc.wantInterrupted || summary.SettledExecutions != tc.wantSettled {
+				t.Fatalf("summary = %#v, want interrupted=%d settled=%d", summary, tc.wantInterrupted, tc.wantSettled)
+			}
+		})
+	}
 }
 
 func TestRuntimeReconcileStaleRunningRunsCancelsDuplicateActiveQueueItems(t *testing.T) {
@@ -2912,7 +2553,9 @@ func TestRuntimeReconcileStaleRunningRunsIsIdempotent(t *testing.T) {
 	}
 }
 
-func TestRuntimeReconcileStaleRunningRunsDedupesUncertainIdentityEvents(t *testing.T) {
+// Settlement is idempotent: the second pass finds a terminal row and a run that
+// is no longer running, so it writes nothing and settles nothing again.
+func TestRuntimeReconcileStaleRunningRunsSettlementIsIdempotent(t *testing.T) {
 	t.Parallel()
 
 	workingDir := t.TempDir()
@@ -2960,22 +2603,21 @@ func TestRuntimeReconcileStaleRunningRunsDedupesUncertainIdentityEvents(t *testi
 	if err != nil {
 		t.Fatalf("second reconcile error = %v", err)
 	}
-	// First pass writes classification, liveness, legacy identity, and quarantine events.
-	if first.SkippedUncertainRuns != 1 || first.EventsWritten != 4 {
-		t.Fatalf("first summary = %#v, want four operator events", first)
+	if first.SettledExecutions != 1 || first.InterruptedRuns != 1 {
+		t.Fatalf("first summary = %#v, want one settled execution and one interrupted run", first)
 	}
-	if second.SkippedUncertainRuns != 1 || second.EventsWritten != 0 {
-		t.Fatalf("second summary = %#v, want deduped events without new writes", second)
+	if second.SettledExecutions != 0 || second.InterruptedRuns != 0 || second.EventsWritten != 0 {
+		t.Fatalf("second summary = %#v, want a no-op second pass", second)
 	}
 	events, err := repos.Events.ListByEntity(context.Background(), "agent_execution", "exec_uncertain_event_dedupe")
 	if err != nil {
 		t.Fatalf("Events.ListByEntity() error = %v", err)
 	}
-	count := 0
+	settled := 0
 	classified := 0
 	for _, event := range events {
-		if event.EventType == "looperd.recovery.process_identity_uncertain" {
-			count += 1
+		if event.EventType == recoveryExecutionQuarantinedEventType {
+			settled += 1
 		}
 		if event.EventType == "looperd.recovery.containment_classified" {
 			classified += 1
@@ -2984,8 +2626,8 @@ func TestRuntimeReconcileStaleRunningRunsDedupesUncertainIdentityEvents(t *testi
 	if classified != 1 {
 		t.Fatalf("containment_classified events = %d, want 1", classified)
 	}
-	if count != 1 {
-		t.Fatalf("uncertain event count = %d, want 1; events = %#v", count, events)
+	if settled != 1 {
+		t.Fatalf("settlement evidence count = %d, want exactly one durable record; events = %#v", settled, events)
 	}
 }
 
