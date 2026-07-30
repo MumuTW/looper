@@ -25,6 +25,7 @@ import (
 	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/eventlog"
 	"github.com/nexu-io/looper/internal/fixer/failurepolicy"
+	"github.com/nexu-io/looper/internal/fixer/reconcile"
 	"github.com/nexu-io/looper/internal/fixer/workflow"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/specpr"
@@ -804,16 +805,9 @@ type replyExplanationEntry struct {
 	ThreadCommentsObserved string `json:"threadCommentsObserved,omitempty"`
 }
 
-type checkpointReconcileCommits struct {
-	BaseHeadSHA      string   `json:"baseHeadSha,omitempty"`
-	FinalHeadSHA     string   `json:"finalHeadSha,omitempty"`
-	NewCommitSHAs    []string `json:"newCommitShas,omitempty"`
-	CommittedByAgent bool     `json:"committedByAgent,omitempty"`
-	CommittedByLoop  bool     `json:"committedByLooperd,omitempty"`
-	WorkingTreeClean bool     `json:"workingTreeClean,omitempty"`
-	ChangedFiles     []string `json:"changedFiles,omitempty"`
-	CompletedAt      string   `json:"completedAt,omitempty"`
-}
+// checkpointReconcileCommits aliases the extracted reconcile authority's
+// state; the persisted shape and decision logic live in internal/fixer/reconcile.
+type checkpointReconcileCommits = reconcile.State
 
 type checkpointPush struct {
 	Pushed        bool         `json:"pushed"`
@@ -3371,12 +3365,12 @@ func (r *Runner) runValidateStep(ctx context.Context, input stepInput) (fixerChe
 		checkpoint.ResumePolicy = d.ResumePolicy
 		return checkpoint, &loopError{message: d.Message, kind: fixerFailureKind(d.Kind)}
 	}
-	inspect, err := r.git.InspectHead(ctx, InspectHeadInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, BaseRef: reconcileBaseHeadSHA(checkpoint.ReconcileCommits)})
+	inspect, err := r.git.InspectHead(ctx, InspectHeadInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, BaseRef: reconcile.BaseHeadSHA(checkpoint.ReconcileCommits)})
 	if err != nil {
 		return checkpoint, err
 	}
 	if inspect.HasUncommittedChanges {
-		baseHeadSHA := reconcileBaseHeadSHA(checkpoint.ReconcileCommits)
+		baseHeadSHA := reconcile.BaseHeadSHA(checkpoint.ReconcileCommits)
 		checkpoint.ReconcileCommits = &checkpointReconcileCommits{BaseHeadSHA: baseHeadSHA}
 		checkpoint, err = r.reconcileCommits(ctx, input.Project, checkpoint, buildFixerCommitMessage(input.PRNumber), input.Run)
 		if err != nil {
@@ -3396,7 +3390,7 @@ func (r *Runner) runValidateStep(ctx context.Context, input stepInput) (fixerChe
 			checkpoint.ResumePolicy = d.ResumePolicy
 			return checkpoint, &loopError{message: d.Message, kind: fixerFailureKind(d.Kind)}
 		}
-		finalInspect, err := r.git.InspectHead(ctx, InspectHeadInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, BaseRef: reconcileBaseHeadSHA(checkpoint.ReconcileCommits)})
+		finalInspect, err := r.git.InspectHead(ctx, InspectHeadInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, BaseRef: reconcile.BaseHeadSHA(checkpoint.ReconcileCommits)})
 		if err != nil {
 			return checkpoint, err
 		}
@@ -3470,12 +3464,12 @@ func (r *Runner) runPushStep(ctx context.Context, input stepInput) (fixerCheckpo
 		return checkpoint, &loopError{message: "Missing reconcile-commits checkpoint for push step", kind: FailureRetryableAfterResume}
 	}
 	if len(r.validationCommands) > 0 {
-		inspect, err := r.git.InspectHead(ctx, InspectHeadInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, BaseRef: reconcileBaseHeadSHA(checkpoint.ReconcileCommits)})
+		inspect, err := r.git.InspectHead(ctx, InspectHeadInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, BaseRef: reconcile.BaseHeadSHA(checkpoint.ReconcileCommits)})
 		if err != nil {
 			return checkpoint, err
 		}
 		if checkpoint.Validation == nil || !checkpoint.Validation.Passed || checkpoint.Validation.HeadSHA != inspect.HeadSHA || inspect.HasUncommittedChanges {
-			baseHeadSHA := reconcileBaseHeadSHA(checkpoint.ReconcileCommits)
+			baseHeadSHA := reconcile.BaseHeadSHA(checkpoint.ReconcileCommits)
 			checkpoint.ReconcileCommits = &checkpointReconcileCommits{BaseHeadSHA: baseHeadSHA}
 			checkpoint, err = r.reconcileCommits(ctx, input.Project, checkpoint, buildFixerCommitMessage(input.PRNumber), input.Run)
 			if err != nil {
@@ -4355,7 +4349,7 @@ func (r *Runner) publishRoundSummaryComment(ctx context.Context, input stepInput
 	if evidence == nil || !evidence.Valid || evidence.HeadSHA == "" {
 		return
 	}
-	if !roundProducedNewCommits(checkpoint) && (checkpoint.ReconcileCommits == nil || evidence.HeadSHA == reconcileBaseHeadSHA(checkpoint.ReconcileCommits)) {
+	if !roundProducedNewCommits(checkpoint) && (checkpoint.ReconcileCommits == nil || evidence.HeadSHA == reconcile.BaseHeadSHA(checkpoint.ReconcileCommits)) {
 		return
 	}
 	headSHA = evidence.HeadSHA
@@ -4403,17 +4397,13 @@ func (r *Runner) publishRoundSummaryComment(ctx context.Context, input stepInput
 // pushed at least one new commit. The summary is suppressed for no-op runs so
 // PR conversations aren't spammed with empty heartbeats.
 func roundProducedNewCommits(checkpoint *fixerCheckpoint) bool {
-	if checkpoint == nil || checkpoint.ReconcileCommits == nil {
-		return false
-	}
-	rc := checkpoint.ReconcileCommits
-	if len(rc.NewCommitSHAs) > 0 {
-		return true
-	}
-	if rc.FinalHeadSHA != "" && rc.BaseHeadSHA != "" && rc.FinalHeadSHA != rc.BaseHeadSHA {
-		return true
-	}
-	return false
+	return checkpoint != nil && reconcile.ProducedNewCommits(checkpoint.ReconcileCommits)
+}
+
+// toReconcileInspection maps a git head inspection onto the reconcile
+// authority's I/O-free input shape.
+func toReconcileInspection(result InspectHeadResult) reconcile.Inspection {
+	return reconcile.Inspection{HeadSHA: result.HeadSHA, NewCommitSHAs: result.NewCommitSHAs, ChangedFiles: result.ChangedFiles, HasUncommittedChanges: result.HasUncommittedChanges}
 }
 
 // fixerSummaryItem is the per-fix-item view rendered into the summary body.
@@ -6601,14 +6591,14 @@ func (r *Runner) reconcileCommits(ctx context.Context, project storage.ProjectRe
 	if checkpoint.SkipReason != "" {
 		return checkpoint, nil
 	}
-	if checkpoint.ReconcileCommits != nil && checkpoint.ReconcileCommits.CompletedAt != "" {
+	if reconcile.IsComplete(checkpoint.ReconcileCommits) {
 		return checkpoint, nil
 	}
 	worktree, err := requireWorktree(checkpoint)
 	if err != nil {
 		return checkpoint, err
 	}
-	baseHeadSHA := firstNonEmpty(reconcileBaseHeadSHA(checkpoint.ReconcileCommits), worktree.BaseHeadSHA, worktree.HeadSHA)
+	baseHeadSHA := reconcile.SelectBase(checkpoint.ReconcileCommits, worktree.BaseHeadSHA, worktree.HeadSHA)
 	worktreeRoot, rootErr := fixerWorktreeRoot(project)
 	if rootErr != nil {
 		return checkpoint, rootErr
@@ -6634,16 +6624,10 @@ func (r *Runner) reconcileCommits(ctx context.Context, project storage.ProjectRe
 	if err != nil {
 		return checkpoint, err
 	}
-	checkpoint.ReconcileCommits = &checkpointReconcileCommits{BaseHeadSHA: baseHeadSHA, FinalHeadSHA: final.HeadSHA, NewCommitSHAs: append([]string(nil), final.NewCommitSHAs...), CommittedByAgent: len(initial.NewCommitSHAs) > 0, CommittedByLoop: committedByLoop, WorkingTreeClean: !final.HasUncommittedChanges, ChangedFiles: append([]string(nil), final.ChangedFiles...), CompletedAt: r.nowISO()}
+	checkpoint.ReconcileCommits = reconcile.Complete(baseHeadSHA, toReconcileInspection(initial), toReconcileInspection(final), committedByLoop, r.nowISO())
 	checkpoint.ensureLifecycle("fixer", worktree.Branch, "", false)
 	checkpoint.Lifecycle.CommitSHAs = appendUniqueStrings(checkpoint.Lifecycle.CommitSHAs, final.NewCommitSHAs...)
-	if len(final.NewCommitSHAs) > 0 {
-		if committedByLoop {
-			checkpoint.Lifecycle.Actions.Commit = lifecycle.ActionSourceFallback
-		} else if checkpoint.Lifecycle.Actions.Commit == lifecycle.ActionSourceNone {
-			checkpoint.Lifecycle.Actions.Commit = lifecycle.ActionSourceAgent
-		}
-	}
+	checkpoint.Lifecycle.Actions.Commit = reconcile.CommitAttribution(len(final.NewCommitSHAs) > 0, committedByLoop, checkpoint.Lifecycle.Actions.Commit)
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	return checkpoint, nil
 }
@@ -7594,7 +7578,7 @@ func resolveCommentCommitSHA(checkpoint fixerCheckpoint, evidence *fixEvidence, 
 			commitSHA = checkpoint.ReconcileCommits.FinalHeadSHA
 		}
 	}
-	if commitSHA == "" || (verifiedEvidence && commitSHA == reconcileBaseHeadSHA(checkpoint.ReconcileCommits)) {
+	if commitSHA == "" || (verifiedEvidence && commitSHA == reconcile.BaseHeadSHA(checkpoint.ReconcileCommits)) {
 		commitSHA = firstNonEmpty(evidenceHeadSHA(evidence), commitSHA)
 	}
 	return commitSHA
@@ -8615,13 +8599,6 @@ func detailBaseRefName(detail *checkpointDetail) string {
 		return ""
 	}
 	return detail.BaseRefName
-}
-
-func reconcileBaseHeadSHA(reconcile *checkpointReconcileCommits) string {
-	if reconcile == nil {
-		return ""
-	}
-	return reconcile.BaseHeadSHA
 }
 
 func compactStrings(values []string) []string {
