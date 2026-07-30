@@ -39,7 +39,7 @@ func TestDaemonLockRejectsSecondHolderAndReacquiresAfterRelease(t *testing.T) {
 	_ = third.Release()
 }
 
-func TestWebhookForwarderLockPathUsesResolvedRelativeDBDirectory(t *testing.T) {
+func TestRuntimeDatabaseLockPathUsesResolvedRelativeDBDirectory(t *testing.T) {
 	t.Parallel()
 
 	cwd, err := os.Getwd()
@@ -47,11 +47,11 @@ func TestWebhookForwarderLockPathUsesResolvedRelativeDBDirectory(t *testing.T) {
 		t.Fatalf("os.Getwd() error = %v", err)
 	}
 
-	if got, want := webhookForwarderLockPath("looper.sqlite"), filepath.Join(cwd, "looperd.lock"); got != want {
-		t.Fatalf("webhookForwarderLockPath() = %q, want %q", got, want)
+	if got, want := runtimeDatabaseLockPath("looper.sqlite"), filepath.Join(cwd, "looperd.lock"); got != want {
+		t.Fatalf("runtimeDatabaseLockPath() = %q, want %q", got, want)
 	}
-	if got, want := webhookForwarderLockPath(filepath.Join("state", "looper.sqlite")), filepath.Join(cwd, "state", "looperd.lock"); got != want {
-		t.Fatalf("webhookForwarderLockPath() nested = %q, want %q", got, want)
+	if got, want := runtimeDatabaseLockPath(filepath.Join("state", "looper.sqlite")), filepath.Join(cwd, "state", "looperd.lock"); got != want {
+		t.Fatalf("runtimeDatabaseLockPath() nested = %q, want %q", got, want)
 	}
 }
 

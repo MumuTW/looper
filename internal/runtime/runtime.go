@@ -205,7 +205,7 @@ type Runtime struct {
 	projectCatalog              *projects.Catalog
 	githubGateway               *githubinfra.Gateway
 	webhook                     *webhookRuntime
-	webhookDaemonLock           *daemonLock
+	databaseDaemonLock          *daemonLock
 	webhookForwarder            WebhookForwarder
 	notificationGateways        *schedulerNotificationGatewayFactory
 	networkManager              runtimeNetworkManager
@@ -457,6 +457,7 @@ func (r *Runtime) Stop(reason string) {
 				r.logger.Warn("looperd runtime close failed", map[string]any{"error": err.Error()})
 			}
 		}
+		r.releaseDatabaseDaemonLock()
 
 		close(r.shutdownCh)
 
@@ -813,16 +814,21 @@ func (r *Runtime) RefreshWebhookForwarders() error {
 func (r *Runtime) stopWebhookRuntime() {
 	r.mu.RLock()
 	webhook := r.webhook
-	lock := r.webhookDaemonLock
 	r.mu.RUnlock()
 	if webhook != nil {
 		webhook.Stop()
 	}
+}
+
+func (r *Runtime) releaseDatabaseDaemonLock() {
+	r.mu.RLock()
+	lock := r.databaseDaemonLock
+	r.mu.RUnlock()
 	if lock != nil {
 		_ = lock.Release()
 		r.mu.Lock()
-		if r.webhookDaemonLock == lock {
-			r.webhookDaemonLock = nil
+		if r.databaseDaemonLock == lock {
+			r.databaseDaemonLock = nil
 		}
 		r.mu.Unlock()
 	}
@@ -841,21 +847,17 @@ func (r *Runtime) start(ctx context.Context) error {
 		backupDir = *r.config.Storage.BackupDir
 	}
 
-	var lock *daemonLock
-	var err error
-	if r.config.Webhook.Enabled {
-		lockPath := webhookForwarderLockPath(r.config.Storage.DBPath)
-		lock, err = acquireDaemonLock(lockPath, r.webhook.daemonID, r.now())
-		if err != nil {
-			if r.logger != nil {
-				holder, _ := os.ReadFile(lockPath)
-				r.logger.Warn("webhook.daemon.lock_failed", map[string]any{"path": lockPath, "existing_holder": strings.TrimSpace(string(holder)), "error": err.Error()})
-			}
-			return err
-		}
+	lockPath := runtimeDatabaseLockPath(r.config.Storage.DBPath)
+	lock, err := acquireDaemonLock(lockPath, r.webhook.daemonID, r.now())
+	if err != nil {
 		if r.logger != nil {
-			r.logger.Info("webhook.daemon.lock_acquired", map[string]any{"path": lockPath})
+			holder, _ := os.ReadFile(lockPath)
+			r.logger.Warn("runtime.database.lock_failed", map[string]any{"path": lockPath, "existing_holder": strings.TrimSpace(string(holder)), "error": err.Error()})
 		}
+		return err
+	}
+	if r.logger != nil {
+		r.logger.Info("runtime.database.lock_acquired", map[string]any{"path": lockPath})
 	}
 
 	coordinator, err := r.openSQLiteCoordinator(ctx, r.config.Storage.DBPath, storage.SQLiteCoordinatorOptions{
@@ -1023,7 +1025,7 @@ func (r *Runtime) start(ctx context.Context) error {
 	}
 	r.githubGateway = githubGateway
 	r.networkManager = networkclient.NewManager(filepath.Join(runtimeHomeDirOrEmpty(), ".looper", "network.json"), r.config, repositories, githubGateway)
-	r.webhookDaemonLock = lock
+	r.databaseDaemonLock = lock
 	r.schedulerDisabled = schedulerDisabled
 	r.mu.Unlock()
 	resourcesPublished = true

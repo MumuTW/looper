@@ -89,7 +89,11 @@ func newDaemonID() string {
 	return hex.EncodeToString(buf[:])
 }
 
-func webhookForwarderLockPath(cfgStorageDBPath string) string {
+// runtimeDatabaseLockPath returns the single-daemon lock path for the SQLite
+// database. The runtime holds this advisory lock from before compatibility
+// validation until the coordinator is closed, so one binary cannot validate an
+// older schema while another binary migrates the same database underneath it.
+func runtimeDatabaseLockPath(cfgStorageDBPath string) string {
 	dbPath := strings.TrimSpace(cfgStorageDBPath)
 	if dbPath != "" {
 		if absPath, err := filepath.Abs(dbPath); err == nil {

@@ -103,6 +103,33 @@ func TestRuntimeStartOpensSQLiteAndSyncsConfiguredProjects(t *testing.T) {
 	}
 }
 
+func TestRuntimeStartExclusivelyOwnsDatabaseForItsLifetime(t *testing.T) {
+	workingDir := t.TempDir()
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
+
+	first := New(Options{Config: cfg, Logger: &testLogger{}})
+	if err := first.Start(context.Background()); err != nil {
+		t.Fatalf("first Start() error = %v", err)
+	}
+	defer first.Stop("test cleanup")
+
+	second := New(Options{Config: cfg, Logger: &testLogger{}})
+	if err := second.Start(context.Background()); err == nil || !strings.Contains(err.Error(), "another looperd already holds") {
+		t.Fatalf("second Start() error = %v, want exclusive database ownership failure", err)
+	}
+
+	first.Stop("release database lock")
+	third := New(Options{Config: cfg, Logger: &testLogger{}})
+	if err := third.Start(context.Background()); err != nil {
+		t.Fatalf("Start() after prior runtime stopped error = %v", err)
+	}
+	third.Stop("test cleanup")
+}
+
 func TestRuntimeStartMaterializesProjectCatalogFromDatabase(t *testing.T) {
 	t.Parallel()
 
@@ -357,7 +384,7 @@ func TestRuntimeStartStopBeforeResourcePublicationCleansLocalResources(t *testin
 		t.Fatal("coordinator remained open after Stop raced pre-publication Start")
 	}
 
-	lock, err := acquireDaemonLock(webhookForwarderLockPath(cfg.Storage.DBPath), "replacement", time.Now())
+	lock, err := acquireDaemonLock(runtimeDatabaseLockPath(cfg.Storage.DBPath), "replacement", time.Now())
 	if err != nil {
 		t.Fatalf("daemon lock remained held after Stop raced pre-publication Start: %v", err)
 	}
