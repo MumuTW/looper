@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -40,6 +41,13 @@ func run(args []string, stdout, stderr io.Writer) int {
 }
 
 func runWithDeps(args []string, stdout, stderr io.Writer, deps runDeps) int {
+	if hasVersionJSONArg(args) {
+		if err := json.NewEncoder(stdout).Encode(version.Current()); err != nil {
+			_, _ = fmt.Fprintf(stderr, "looperd: encode build identity: %v\n", err)
+			return 1
+		}
+		return 0
+	}
 	if hasVersionArg(args) {
 		_, _ = fmt.Fprintln(stdout, version.Value)
 		return 0
@@ -1261,6 +1269,10 @@ func hasVersionArg(args []string) bool {
 	return slices.Contains(args, "--version")
 }
 
+func hasVersionJSONArg(args []string) bool {
+	return slices.Contains(args, "--version-json")
+}
+
 func hasHelpArg(args []string) bool {
 	return slices.ContainsFunc(args, isHelpArg)
 }
@@ -1274,6 +1286,7 @@ func writeUsage(w io.Writer) {
 
 Usage:
 	looperd [flags]
+	looperd --version-json
 	looperd service <install|print|uninstall|status>
 	looperd help
 

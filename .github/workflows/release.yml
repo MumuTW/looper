@@ -332,11 +332,9 @@ jobs:
           LOOPER_BUILD_VERSION_SOURCE: git-tag:${{ needs.prepare-go-release.outputs.release-tag }}
           LOOPER_BUILD_CHANNEL: ${{ needs.prepare-go-release.outputs.release-channel }}
           LOOPER_BUILD_API_VERSION: v1
+          LOOPER_BUILD_GIT_SHA: ${{ needs.prepare-go-release.outputs.release-commit }}
+          LOOPER_BUILD_TIMESTAMP: ${{ needs.prepare-go-release.outputs.release-timestamp }}
         run: |
-          looper_build_git_sha="$(git rev-parse HEAD)"
-          looper_build_timestamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          export LOOPER_BUILD_GIT_SHA="$looper_build_git_sha"
-          export LOOPER_BUILD_TIMESTAMP="$looper_build_timestamp"
           mkdir -p dist/release
           go build -trimpath -ldflags "$(go run ./tools/go-build-flags)" -o "dist/release/${{ matrix.artifact-name }}" ./cmd/looper
 
@@ -432,11 +430,9 @@ jobs:
           LOOPER_BUILD_VERSION_SOURCE: git-tag:${{ needs.prepare-go-release.outputs.release-tag }}
           LOOPER_BUILD_CHANNEL: ${{ needs.prepare-go-release.outputs.release-channel }}
           LOOPER_BUILD_API_VERSION: v1
+          LOOPER_BUILD_GIT_SHA: ${{ needs.prepare-go-release.outputs.release-commit }}
+          LOOPER_BUILD_TIMESTAMP: ${{ needs.prepare-go-release.outputs.release-timestamp }}
         run: |
-          looper_build_git_sha="$(git rev-parse HEAD)"
-          looper_build_timestamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          export LOOPER_BUILD_GIT_SHA="$looper_build_git_sha"
-          export LOOPER_BUILD_TIMESTAMP="$looper_build_timestamp"
           mkdir -p dist/release
           go build -trimpath -ldflags "$(go run ./tools/go-build-flags)" -o "dist/release/${{ matrix.artifact-name }}" ./cmd/looperd
 

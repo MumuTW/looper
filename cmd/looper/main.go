@@ -36,7 +36,6 @@ import (
 	"time"
 
 	"github.com/MumuTW/looper/internal/config"
-	"github.com/MumuTW/looper/internal/version"
 )
 
 // requestTimeout bounds a single call. Those are one storage transaction and at
@@ -71,10 +70,6 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		usage(stderr)
 		return 2
 	}
-	if parsed.Verb == "--version" || parsed.Verb == "version" {
-		_, _ = fmt.Fprintln(stdout, version.Value)
-		return 0
-	}
 	if parsed.Verb == "-h" || parsed.Verb == "--help" || parsed.Verb == "help" {
 		usage(stdout)
 		return 0
@@ -82,6 +77,9 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	if parsed.Verb == "--version" || parsed.Verb == "version" {
+		return reportError(stderr, runVersion(ctx, parsed.Global, parsed.Operands, stdout))
+	}
 
 	// `review` owns its own flag set, and the daemon's trusted review proxy
 	// composes that argv. Routing it before splitGlobalFlags is what keeps
@@ -276,7 +274,7 @@ func splitGlobalFlags(args []string) (parsedArgs, error) {
 			parsed.Verb = arg
 			continue
 		}
-		if strings.HasPrefix(arg, "-") && arg != "-" && parsed.Verb != "review" && parsed.Verb != "retry" {
+		if strings.HasPrefix(arg, "-") && arg != "-" && parsed.Verb != "review" && parsed.Verb != "retry" && parsed.Verb != "version" && parsed.Verb != "--version" {
 			return parsedArgs{}, fmt.Errorf("unknown flag %q", name)
 		}
 		if parsed.Verb == "" {
@@ -1340,6 +1338,9 @@ Usage:
   looper respond <selector> "<answer>"
                                Answer a loop waiting on a human and resume it
   looper version               Print the looper version
+  looper version --json        Print the complete local build identity
+  looper version --check-daemon
+                               Compare local and running-daemon build identity
 
 Global flags, accepted before or after the verb:
   --config <path>              Config file to load

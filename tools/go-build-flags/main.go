@@ -11,7 +11,8 @@ import (
 
 func main() {
 	overrides := version.BuildOverridesFromEnv(os.Getenv)
-	overrides.Version = applyDirtySuffix(overrides.Version, worktreeDirty(runGit))
+	overrides.Dirty = worktreeDirty(runGit)
+	overrides.Version = applyDirtySuffix(overrides.Version, overrides.Dirty != nil && *overrides.Dirty)
 	_, _ = fmt.Fprint(os.Stdout, version.LDFlags(overrides))
 }
 
@@ -47,13 +48,14 @@ func applyDirtySuffix(value string, dirty bool) string {
 //
 // Only the version string is suffixed. GitCommitSHA keeps its exact value — it
 // is a commit id, and appending to it would make it stop being one.
-func worktreeDirty(run func(name string, args ...string) ([]byte, error)) bool {
+func worktreeDirty(run func(name string, args ...string) ([]byte, error)) *bool {
 	out, err := run("git", "status", "--porcelain", "--untracked-files=all",
 		"--", ":(exclude)internal/dashboard/assets")
 	if err != nil {
-		return false
+		return nil
 	}
-	return len(bytes.TrimSpace(out)) > 0
+	dirty := len(bytes.TrimSpace(out)) > 0
+	return &dirty
 }
 
 func runGit(name string, args ...string) ([]byte, error) {

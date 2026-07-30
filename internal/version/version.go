@@ -16,6 +16,7 @@ var (
 	APIVersion     = defaultAPIVersion
 	GitCommitSHA   = ""
 	BuildTimestamp = ""
+	BuildDirty     = ""
 )
 
 type BuildMetadata struct {
@@ -24,6 +25,7 @@ type BuildMetadata struct {
 	APIVersion     string  `json:"apiVersion"`
 	GitCommitSHA   *string `json:"gitCommitSha"`
 	BuildTimestamp *string `json:"buildTimestamp"`
+	Dirty          *bool   `json:"dirty"`
 }
 
 type Info struct {
@@ -40,8 +42,23 @@ func Current() Info {
 			APIVersion:     APIVersion,
 			GitCommitSHA:   stringPtrOrNil(GitCommitSHA),
 			BuildTimestamp: stringPtrOrNil(BuildTimestamp),
+			Dirty:          boolPtrOrNil(BuildDirty),
 		},
 	}
+}
+
+// SameBuild reports whether two binaries carry the same complete build
+// identity. The build timestamp participates deliberately: release artifacts
+// use one preparation timestamp, so equality proves they came from the same
+// cut rather than merely the same source commit.
+func (i Info) SameBuild(other Info) bool {
+	return i.Version == other.Version &&
+		i.Metadata.VersionSource == other.Metadata.VersionSource &&
+		i.Metadata.Channel == other.Metadata.Channel &&
+		i.Metadata.APIVersion == other.Metadata.APIVersion &&
+		equalOptionalString(i.Metadata.GitCommitSHA, other.Metadata.GitCommitSHA) &&
+		equalOptionalString(i.Metadata.BuildTimestamp, other.Metadata.BuildTimestamp) &&
+		equalOptionalBool(i.Metadata.Dirty, other.Metadata.Dirty)
 }
 
 func stringPtrOrNil(value string) *string {
@@ -50,4 +67,25 @@ func stringPtrOrNil(value string) *string {
 	}
 
 	return &value
+}
+
+func boolPtrOrNil(value string) *bool {
+	switch value {
+	case "true":
+		value := true
+		return &value
+	case "false":
+		value := false
+		return &value
+	default:
+		return nil
+	}
+}
+
+func equalOptionalString(left, right *string) bool {
+	return left == nil && right == nil || left != nil && right != nil && *left == *right
+}
+
+func equalOptionalBool(left, right *bool) bool {
+	return left == nil && right == nil || left != nil && right != nil && *left == *right
 }
