@@ -12,18 +12,16 @@ import (
 
 func main() {
 	var (
-		tag             = flag.String("tag", "", "git tag (for example: v0.3.0)")
-		version         = flag.String("version", "", "release version without v prefix; defaults from tag")
-		released        = flag.String("released", "", "RFC3339 UTC release timestamp")
-		channel         = flag.String("channel", "", "release channel (stable|beta), defaults from version")
-		apiVersion      = flag.String("api-version", "v1", "management API version")
-		schemaVersion   = flag.String("schema-version", release.CurrentSchemaVersion(), "storage schema version")
-		minCliForDaemon = flag.String("min-cli-for-daemon", "", "optional; omitted from manifest when empty (unenforced)")
-		minDaemonForCli = flag.String("min-daemon-for-cli", "", "optional; omitted from manifest when empty (unenforced)")
-		repo            = flag.String("repo", "mumutw/looper", "GitHub repo owner/name")
-		assetsDir       = flag.String("assets-dir", "", "release assets directory")
-		output          = flag.String("output", "", "output manifest path")
-		requiredAssets  = flag.String("required-assets", "", "comma-separated required artifact names")
+		tag            = flag.String("tag", "", "git tag (for example: v0.3.0)")
+		version        = flag.String("version", "", "release version without v prefix; defaults from tag")
+		released       = flag.String("released", "", "RFC3339 UTC release timestamp")
+		channel        = flag.String("channel", "", "release channel (stable|beta), defaults from version")
+		apiVersion     = flag.String("api-version", "v1", "management API version")
+		schemaVersion  = flag.String("schema-version", release.CurrentSchemaVersion(), "storage schema version")
+		repo           = flag.String("repo", "mumutw/looper", "GitHub repo owner/name")
+		assetsDir      = flag.String("assets-dir", "", "release assets directory")
+		output         = flag.String("output", "", "output manifest path")
+		requiredAssets = flag.String("required-assets", "", "comma-separated required artifact names")
 	)
 	flag.Parse()
 
@@ -46,8 +44,6 @@ func main() {
 		Channel:           *channel,
 		APIVersion:        *apiVersion,
 		SchemaVersion:     *schemaVersion,
-		MinCliForDaemon:   *minCliForDaemon,
-		MinDaemonForCli:   *minDaemonForCli,
 		Repo:              *repo,
 		AssetsDir:         *assetsDir,
 		RequiredArtifacts: required,

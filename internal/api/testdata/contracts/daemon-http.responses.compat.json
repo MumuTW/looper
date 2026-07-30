@@ -56,8 +56,6 @@
               "versionSource": "internal/version/version.go",
               "channel": "dev",
               "apiVersion": "v1",
-              "minCliForDaemon": null,
-              "minDaemonForCli": null,
               "gitCommitSha": null,
               "buildTimestamp": null
             },
