@@ -381,9 +381,14 @@ selection, so every clone drives the same profile and the same backend:
 
 ```bash
 scripts/hermes-profile.sh --bootstrap   # create/repair the profile (once)
-source scripts/hermes-profile.sh        # export HERMES_HOME for this shell
+export HERMES_HOME="$(scripts/hermes-profile.sh --print)" # any shell
 hermes
 ```
+
+`source scripts/hermes-profile.sh` is a Bash-only convenience. Do not source
+it from zsh, fish, dash, or another shell: the script intentionally uses Bash
+arrays. The `--print`/`export` form above executes its Bash shebang and works
+from any shell that supports command substitution.
 
 The profile directory itself (config.yaml, .env, SOUL.md, memories/) is user
 state and is not checked in. `--bootstrap` creates missing config files,

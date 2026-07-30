@@ -12,7 +12,8 @@
 # is NOT checked in. `--bootstrap` creates it from scratch when missing.
 #
 # Usage:
-#   source scripts/hermes-profile.sh      # export HERMES_HOME into this shell
+#   source scripts/hermes-profile.sh      # Bash only: export HERMES_HOME
+#   export HERMES_HOME="$(scripts/hermes-profile.sh --print)" # any shell
 #   scripts/hermes-profile.sh --bootstrap # create/repair the profile, then exit
 #   scripts/hermes-profile.sh --print     # print the resolved HERMES_HOME
 #
@@ -80,7 +81,10 @@ write_profile_file() {
   fi
 
   if [ "$FORCE" -eq 1 ]; then
-    local backup="$path.bak-$(date +%Y%m%d_%H%M%S)"
+    # mktemp creates the name atomically. A timestamp alone can collide when
+    # automated retries force two replacements inside the same second.
+    local backup
+    backup="$(mktemp "${path}.bak-$(date +%Y%m%d_%H%M%S).XXXXXX")"
     cp "$path" "$backup"
     printf '%s' "$content" > "$path"
     echo "  replaced $label (previous contents saved to $(basename "$backup"))"
@@ -141,11 +145,11 @@ ENV
   fi
   echo
   echo "Memory WRITES additionally need, once each:"
-  echo "  $REPO_ROOT/tools/hermes-devin/apply-hermes-patch.sh"
-  echo "  devin mcp add $LOOPER_MCP_SERVER \\"
-  echo "    -e HERMES_HOME=$LOOPER_HERMES_HOME \\"
-  echo "    -e HERMES_INSTALL_DIR=$HERMES_INSTALL_DIR \\"
-  echo "    -- $REPO_ROOT/tools/hermes-devin/memory_mcp_server.py"
+  printf '  %q\n' "$REPO_ROOT/tools/hermes-devin/apply-hermes-patch.sh"
+  printf '  devin mcp add %q \\\n' "$LOOPER_MCP_SERVER"
+  printf '    -e %q \\\n' "HERMES_HOME=$LOOPER_HERMES_HOME"
+  printf '    -e %q \\\n' "HERMES_INSTALL_DIR=$HERMES_INSTALL_DIR"
+  printf '    -- %q\n' "$REPO_ROOT/tools/hermes-devin/memory_mcp_server.py"
   echo "Run the devin command once from this repo root: it writes"
   echo ".devin/mcp_config.local.json there (gitignored — it holds absolute"
   echo "paths), and Devin walks up from a session's cwd to find it, so"
@@ -164,7 +168,8 @@ if [ "$SOURCED" -eq 0 ]; then
     --print)     echo "$LOOPER_HERMES_HOME"; exit 0 ;;
     --help|-h)
       echo "usage: hermes-profile.sh [--bootstrap [--force] | --print]"
-      echo "       source hermes-profile.sh    # export HERMES_HOME for this shell"
+      echo "       source hermes-profile.sh    # Bash only: export HERMES_HOME"
+      echo "       export HERMES_HOME=\"\$(scripts/hermes-profile.sh --print)\"  # any shell"
       exit 0
       ;;
     "")
