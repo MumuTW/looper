@@ -700,7 +700,7 @@ func TestDiscoverIssuesDoesNotReactivateWorkerWhenReactiveLoopClaimsSourceIssue(
 	}
 }
 
-func TestRunPrepareWorktreeStepRecreatesUnsafeCheckpointAtRepoPath(t *testing.T) {
+func TestRunPrepareWorktreeStepRefusesUnsafeCheckpointAtRepoPath(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	repoPath := t.TempDir()
@@ -715,17 +715,15 @@ func TestRunPrepareWorktreeStepRecreatesUnsafeCheckpointAtRepoPath(t *testing.T)
 			Worktree: &checkpointWorktree{Path: repoPath, Branch: "stale", BaseBranch: "main"},
 		},
 	})
-	if err != nil {
-		t.Fatalf("runPrepareWorktreeStep() error = %v", err)
+	var loopErr *loopError
+	if !errors.As(err, &loopErr) || loopErr.kind != FailureManualIntervention {
+		t.Fatalf("runPrepareWorktreeStep() error = %v, want manual-intervention stale-worktree error", err)
 	}
-	if len(git.createCalls) != 1 {
-		t.Fatalf("len(git.createCalls) = %d, want 1", len(git.createCalls))
+	if len(git.createCalls) != 0 {
+		t.Fatalf("CreateWorktree calls = %#v, want no replacement checkout", git.createCalls)
 	}
-	if checkpoint.Worktree == nil || checkpoint.Worktree.Path != git.createResult.WorktreePath {
-		t.Fatalf("checkpoint.Worktree = %#v, want recreated worktree", checkpoint.Worktree)
-	}
-	if checkpoint.ResumePolicy != "advance_from_checkpoint" {
-		t.Fatalf("ResumePolicy = %q, want advance_from_checkpoint", checkpoint.ResumePolicy)
+	if checkpoint.Worktree == nil || checkpoint.Worktree.Path != repoPath {
+		t.Fatalf("checkpoint.Worktree = %#v, want original checkpoint preserved", checkpoint.Worktree)
 	}
 }
 
@@ -1498,6 +1496,115 @@ func TestRunExecuteStepRefusesWorktreeOutsideWorktreeRootBeforeAgentStart(t *tes
 	}
 	if len(agent.starts) != 0 {
 		t.Fatalf("unsafe worktree started agent: starts=%#v", agent.starts)
+	}
+}
+
+func TestProcessClaimedItemRefusesUnusableInRootCheckpointWorktree(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name    string
+		prepare func(t *testing.T, path string)
+		want    string
+	}{
+		{
+			name: "missing path",
+			want: "path does not exist",
+		},
+		{
+			name: "non-directory path",
+			prepare: func(t *testing.T, path string) {
+				t.Helper()
+				if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+					t.Fatalf("MkdirAll() error = %v", err)
+				}
+				if err := os.WriteFile(path, []byte("not a worktree"), 0o600); err != nil {
+					t.Fatalf("WriteFile() error = %v", err)
+				}
+			},
+			want: "path exists but is not a directory",
+		},
+		{
+			name: "missing git metadata",
+			prepare: func(t *testing.T, path string) {
+				t.Helper()
+				if err := os.MkdirAll(path, 0o755); err != nil {
+					t.Fatalf("MkdirAll() error = %v", err)
+				}
+			},
+			want: "path is not a usable git worktree",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			fixture := newRunnerFixture(t)
+			worktreeRoot := filepath.Join(t.TempDir(), "worktrees")
+			worktreePath := filepath.Join(worktreeRoot, "checkpoint-worktree")
+			if tc.prepare != nil {
+				tc.prepare(t, worktreePath)
+			}
+
+			project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+			if err != nil || project == nil {
+				t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+			}
+			metadata := fmt.Sprintf(`{"worktreeRoot":%q}`, worktreeRoot)
+			project.MetadataJSON = &metadata
+			project.UpdatedAt = fixture.nowISO()
+			if err := fixture.repos.Projects.Upsert(context.Background(), *project); err != nil {
+				t.Fatalf("Projects.Upsert() error = %v", err)
+			}
+
+			checkpointJSON := mustMarshalJSON(workerCheckpoint{
+				ResumePolicy: loops.ResumePolicyAdvanceFromCheckpoint,
+				Work:         &workerInput{Title: "Implement worker loop", Repo: "acme/looper", IssueNumber: 27, BaseBranch: "main", ExecutionMode: "create-pr"},
+				Worktree:     &checkpointWorktree{ID: "worktree_old", Path: worktreePath, Branch: "looper/feature", BaseBranch: "main", HeadSHA: "abc123"},
+				Plan:         &checkpointPlan{Summary: "Implement worker loop", Items: []string{"Do it"}},
+			})
+			if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_failed_unusable_worktree", LoopID: "loop_worker_1", Status: "failed", LastCompletedStep: stringPtr(string(stepPlan)), CheckpointJSON: &checkpointJSON, StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+				t.Fatalf("Runs.Upsert() error = %v", err)
+			}
+			git := &fakeGitGateway{}
+			agent := &fakeAgentExecutor{}
+			runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true})
+
+			claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-1", "worker")
+			if err != nil || claim == nil {
+				t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed worker item", claim, err)
+			}
+			result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+			if err != nil {
+				t.Fatalf("ProcessClaimedItem() error = %v", err)
+			}
+			if result.Status != "failed" || result.FailureKind != FailureManualIntervention || !strings.Contains(result.Summary, tc.want) {
+				t.Fatalf("result = %#v, want manual-intervention failure containing %q", result, tc.want)
+			}
+			if len(agent.starts) != 0 || len(git.inspectCalls) != 0 {
+				t.Fatalf("unusable worktree started agent or inspected progress: starts=%#v inspect=%#v", agent.starts, git.inspectCalls)
+			}
+
+			persisted, err := fixture.repos.Runs.GetByID(context.Background(), result.RunID)
+			if err != nil || persisted == nil {
+				t.Fatalf("Runs.GetByID() = (%#v, %v), want persisted failed run", persisted, err)
+			}
+			persistedCheckpoint, err := parseCheckpoint(persisted.CheckpointJSON)
+			if err != nil {
+				t.Fatalf("parseCheckpoint() error = %v", err)
+			}
+			if persistedCheckpoint.Worktree == nil || persistedCheckpoint.Worktree.ID != "worktree_old" || persistedCheckpoint.Worktree.Path != worktreePath {
+				t.Fatalf("persisted checkpoint worktree = %#v, want original checkpoint preserved", persistedCheckpoint.Worktree)
+			}
+			if persistedCheckpoint.ResumePolicy != loops.ResumePolicyAdvanceFromCheckpoint {
+				t.Fatalf("persisted checkpoint resume policy = %q, want %q", persistedCheckpoint.ResumePolicy, loops.ResumePolicyAdvanceFromCheckpoint)
+			}
+			queue, err := fixture.repos.Queue.GetByID(context.Background(), claim.ID)
+			if err != nil {
+				t.Fatalf("Queue.GetByID() error = %v", err)
+			}
+			if queue == nil || queue.Status != "manual_intervention" || queue.LastErrorKind == nil || *queue.LastErrorKind != string(FailureManualIntervention) {
+				t.Fatalf("queue = %#v, want parked manual-intervention item", queue)
+			}
+		})
 	}
 }
 
