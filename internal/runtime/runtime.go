@@ -1007,10 +1007,6 @@ func (r *Runtime) start(ctx context.Context) error {
 	r.schedulerDisabled = schedulerDisabled
 	r.mu.Unlock()
 
-	if err := projectService.ResumeRunningDiscoveries(ctx); err != nil {
-		return err
-	}
-
 	if r.deferRecovery {
 		if r.networkManager != nil {
 			_ = r.networkManager.Start(context.Background())
@@ -1036,6 +1032,7 @@ func (r *Runtime) CompleteStartup(ctx context.Context) error {
 		}
 		startedAt := r.startedAt
 		repositories := r.services.Repositories
+		projectService := r.services.Projects
 		githubGateway := r.githubGateway
 		schedulerDisabled := r.schedulerDisabled
 		r.mu.RUnlock()
@@ -1047,6 +1044,12 @@ func (r *Runtime) CompleteStartup(ctx context.Context) error {
 		if repositories == nil {
 			r.startupReadyErr = fmt.Errorf("runtime repositories are not configured")
 			return
+		}
+		if projectService != nil {
+			if err := projectService.ResumeRunningDiscoveries(ctx); err != nil {
+				r.startupReadyErr = err
+				return
+			}
 		}
 		if err := r.validateCoordinatorDependencyGates(ctx, repositories, githubGateway); err != nil {
 			r.startupReadyErr = err
