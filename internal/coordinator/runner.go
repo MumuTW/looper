@@ -165,7 +165,7 @@ func (r *Runner) BackfillIssues(ctx context.Context, input BackfillInput) (Backf
 		result.Considered++
 		analysisStartedAt := r.now().UTC()
 
-		decision, err := r.decide(ctx, project.RepoPath, input.Repo, loaded.issue, triageCfg)
+		decision, err := r.decide(ctx, project.RepoPath, input.Repo, loaded.issue, triageCfg, input.ForceRetriage)
 		if err != nil {
 			result.FailedIssues[summary.Number] = err.Error()
 			continue
@@ -502,7 +502,7 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 		}
 		analysisStartedAt := r.now().UTC()
 		processed++
-		decision, err := r.decide(ctx, project.RepoPath, input.Repo, loadedIssue.issue, triageCfg)
+		decision, err := r.decide(ctx, project.RepoPath, input.Repo, loadedIssue.issue, triageCfg, false)
 		if err != nil {
 			return DiscoveryResult{}, err
 		}
@@ -771,10 +771,12 @@ func (r *Runner) hasDispatchWork(action dispatch.Action) bool {
 	return action.ReactionCommentID != 0 || len(action.TriggerLabels) != 0 || action.FailureCommentBody != ""
 }
 
-func (r *Runner) decide(ctx context.Context, repoPath string, repo string, issue triage.Issue, cfg triage.Config) (triage.Decision, error) {
-	reTriage := triage.ShouldReTriage(issue, cfg, r.now().UTC())
-	if !reTriage && !triage.ShouldTriage(issue, cfg, r.now().UTC()) {
-		return triage.NoOpDecision(), nil
+func (r *Runner) decide(ctx context.Context, repoPath string, repo string, issue triage.Issue, cfg triage.Config, forceRetriage bool) (triage.Decision, error) {
+	if !forceRetriage {
+		reTriage := triage.ShouldReTriage(issue, cfg, r.now().UTC())
+		if !reTriage && !triage.ShouldTriage(issue, cfg, r.now().UTC()) {
+			return triage.NoOpDecision(), nil
+		}
 	}
 	repoCtx, err := r.inspector.Inspect(ctx, repoPath, issue)
 	if err != nil {
