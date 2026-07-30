@@ -16,6 +16,12 @@
 #   scripts/hermes-profile.sh --bootstrap # create/repair the profile, then exit
 #   scripts/hermes-profile.sh --print     # print the resolved HERMES_HOME
 #
+# SAFETY: a Hermes session on this backend can read and write the directory it
+# runs in. Hermes's ACP shim services fs/write_text_file directly, with no
+# permission round-trip, and in the default agent type Devin also runs its own
+# tools in its own loop. Neither side is sandboxed here. Run it from a
+# disposable worktree, not from a checkout you care about.
+#
 # Backend evidence and known gaps: docs/research/hermes-devin-acp-spike.md
 
 # Strict mode only when executed. When sourced, `set -e` would leak into the
