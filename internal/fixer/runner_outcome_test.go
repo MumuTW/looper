@@ -152,7 +152,7 @@ func TestFixerOutcomeReportsNonRetryableFailureAsNonRetryable(t *testing.T) {
 
 	checkpoint := fixerCheckpoint{}
 	checkpoint.recordFailure(stepRepair, &loopError{message: "invalid repository state", kind: FailureNonRetryable})
-	if checkpoint.Outcome == nil || checkpoint.Outcome.PrimaryFailure == nil || checkpoint.Outcome.PrimaryFailure.Retryable {
+	if checkpoint.Outcome == nil || checkpoint.Outcome.PrimaryFailure == nil || checkpoint.Outcome.PrimaryFailure.Retryable == nil || *checkpoint.Outcome.PrimaryFailure.Retryable {
 		t.Fatalf("Outcome = %#v, want non-retryable operator contract", checkpoint.Outcome)
 	}
 }
@@ -172,8 +172,23 @@ func TestDeriveRunOutcomeDecoratesHistoricalFixerCheckpoint(t *testing.T) {
 	if outcome == nil || outcome.PrimaryFailure == nil || outcome.PrimaryFailure.Step != string(stepRecheck) || outcome.PrimaryFailure.Message != "recheck failed" {
 		t.Fatalf("DeriveRunOutcome() = %#v, want historical primary failure", outcome)
 	}
+	if outcome.PrimaryFailure.Kind != "" || outcome.PrimaryFailure.Retryable != nil {
+		t.Fatalf("historical PrimaryFailure = %#v, want unknown kind and retryability preserved", outcome.PrimaryFailure)
+	}
 	if !outcome.Progress.CommitProduced || !outcome.Progress.Pushed || outcome.Progress.RepliesSent != 1 || outcome.Progress.ThreadsResolved != 1 || !outcome.PartialSuccess {
 		t.Fatalf("DeriveRunOutcome() = %#v, want derived durable progress", outcome)
+	}
+}
+
+func TestDeriveRunOutcomeRejectsNonFixerCheckpoint(t *testing.T) {
+	t.Parallel()
+
+	checkpointJSON := `{"detail":{"title":"worker task"},"worktree":{"path":"/tmp/worker"}}`
+	step := string(stepPrepareWorktree)
+	run := storage.RunRecord{Status: "failed", CurrentStep: &step, CheckpointJSON: &checkpointJSON, ErrorMessage: stringPtr("worker failed")}
+
+	if outcome := DeriveRunOutcome(run); outcome != nil {
+		t.Fatalf("DeriveRunOutcome() = %#v, want shared worker checkpoint fields rejected", outcome)
 	}
 }
 

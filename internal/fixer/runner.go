@@ -667,7 +667,7 @@ type FixerRunOutcome struct {
 type FixerOutcomeFailure struct {
 	Step      string           `json:"step,omitempty"`
 	Message   string           `json:"message,omitempty"`
-	Retryable bool             `json:"retryable"`
+	Retryable *bool            `json:"retryable,omitempty"`
 	Kind      QueueFailureKind `json:"kind,omitempty"`
 }
 
@@ -1070,7 +1070,8 @@ func (checkpoint *fixerCheckpoint) recordFailure(step FixerStep, failure *loopEr
 	if checkpoint.Outcome == nil {
 		checkpoint.Outcome = &FixerRunOutcome{}
 	}
-	next := FixerOutcomeFailure{Step: string(step), Message: failure.message, Kind: failure.kind, Retryable: failure.kind == FailureRetryableTransient || failure.kind == FailureRetryableAfterResume}
+	retryable := failure.kind == FailureRetryableTransient || failure.kind == FailureRetryableAfterResume
+	next := FixerOutcomeFailure{Step: string(step), Message: failure.message, Kind: failure.kind, Retryable: &retryable}
 	if checkpoint.Outcome.PrimaryFailure == nil {
 		checkpoint.Outcome.PrimaryFailure = &next
 		return
@@ -1143,24 +1144,25 @@ func DeriveRunOutcome(run storage.RunRecord) *FixerRunOutcome {
 		if step == "" {
 			step = asFixerStep(derefString(run.LastCompletedStep))
 		}
-		kind := FailureRetryableTransient
+		failure := FixerOutcomeFailure{Step: string(step), Message: firstNonEmpty(derefString(run.ErrorMessage), derefString(run.Summary), "fixer run failed")}
 		if checkpoint.ResumePolicy == loops.ResumePolicyManualIntervention {
-			kind = FailureManualIntervention
+			retryable := false
+			failure.Kind = FailureManualIntervention
+			failure.Retryable = &retryable
 		}
-		message := firstNonEmpty(derefString(run.ErrorMessage), derefString(run.Summary), "fixer run failed")
-		checkpoint.recordFailure(step, &loopError{message: message, kind: kind})
+		checkpoint.Outcome = &FixerRunOutcome{PrimaryFailure: &failure}
 	}
 	checkpoint.refreshOutcomeProgress()
 	return checkpoint.Outcome
 }
 
 func looksLikeFixerCheckpoint(run storage.RunRecord, checkpoint fixerCheckpoint) bool {
-	if checkpoint.Outcome != nil || checkpoint.Detail != nil || checkpoint.Worktree != nil || len(checkpoint.FixItems) > 0 || checkpoint.Repair != nil || checkpoint.ReconcileCommits != nil || checkpoint.ResolvedComments != nil || checkpoint.SummaryComment != nil {
+	if checkpoint.Outcome != nil || len(checkpoint.FixItems) > 0 || checkpoint.Repair != nil || checkpoint.ReconcileCommits != nil || checkpoint.ResolvedComments != nil || checkpoint.SummaryComment != nil {
 		return true
 	}
 	for _, step := range []string{derefString(run.CurrentStep), derefString(run.LastCompletedStep)} {
 		switch asFixerStep(step) {
-		case stepDiscoverPR, stepClaimPR, stepCollectFixes, stepPrepareWorktree, stepRepair, stepResolveComments, stepRecheck:
+		case stepDiscoverPR, stepClaimPR, stepCollectFixes, stepRepair, stepResolveComments, stepRecheck:
 			return true
 		}
 	}
@@ -7086,7 +7088,8 @@ func (r *Runner) recordTerminalCleanup(ctx context.Context, project storage.Proj
 	if checkpoint.Outcome == nil {
 		checkpoint.refreshOutcomeProgress()
 	}
-	issue := FixerOutcomeFailure{Step: string(stepCleanupWorktree), Message: cleanupErr.Error(), Kind: FailureRetryableTransient, Retryable: true}
+	retryable := true
+	issue := FixerOutcomeFailure{Step: string(stepCleanupWorktree), Message: cleanupErr.Error(), Kind: FailureRetryableTransient, Retryable: &retryable}
 	checkpoint.Outcome.SecondaryIssues = append(checkpoint.Outcome.SecondaryIssues, issue)
 	checkpoint.refreshOutcomeProgress()
 	if r.repos == nil || r.repos.Runs == nil || strings.TrimSpace(runID) == "" {

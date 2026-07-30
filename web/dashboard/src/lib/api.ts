@@ -218,7 +218,7 @@ export type ActiveRunsList = {
 export type FixerOutcomeFailure = {
   step?: string;
   message?: string;
-  retryable: boolean;
+  retryable?: boolean;
   kind?: string;
 };
 
