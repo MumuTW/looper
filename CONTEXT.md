@@ -153,8 +153,9 @@ method), whose doc comment carries the semantics: the tracked Issues whose
 
 **Acceptance criterion**:
 Defined at `internal/reviewer/criteria.AcceptanceCriterion`, whose doc comment
-carries the semantics: one checkbox item Reviewer's auto-merge gate verifies
-against diff evidence before APPROVE.
+carries the semantics: one item (checkbox by convention, plain bullets also
+accepted) Reviewer's auto-merge gate verifies against diff evidence before
+APPROVE.
 
 **Auto-merge scope**:
 Defined at `config.ReviewerAutoMergeScopeLooperOnly` in `internal/config`,
@@ -240,8 +241,8 @@ boundary.
 ### Testing
 
 **Live sandbox**:
-(Prose-only: test infrastructure convention; see `e2e/` and the sandbox CI
-workflows.)
+(Prose-only: test infrastructure convention; see `internal/e2e` and the
+sandbox CI workflows.)
 A dedicated remote repository on a real Provider used for live end-to-end tests. It is isolated from product and developer repositories, but still performs real provider mutations.
 _Avoid_: local sandbox, mock sandbox.
 

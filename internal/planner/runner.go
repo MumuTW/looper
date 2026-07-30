@@ -326,6 +326,7 @@ type DiscoveryPolicy struct {
 }
 
 // Runner is the Planner: a reactive Role that produces a Spec from an Issue.
+// Stateful: it persists runs in the local SQLite database.
 type Runner struct {
 	db                      *sql.DB
 	repos                   *storage.Repositories

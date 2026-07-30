@@ -157,6 +157,8 @@ type Options struct {
 // re-fetches current Pull Request state and writes an observe-only Gate
 // report. It never reviews code, repairs a Pull Request, resolves comments,
 // or merges.
+// Stateful: agent-free but not database-free — it persists Gate reports in
+// the local SQLite event log.
 type Runner struct {
 	repos               *storage.Repositories
 	github              GitHubGateway

@@ -547,7 +547,7 @@ type DiscoveryPolicy struct {
 }
 
 // Runner is the Fixer: a reactive Role that addresses review feedback on a
-// Pull Request.
+// Pull Request. Stateful: it persists runs in the local SQLite database.
 type Runner struct {
 	db                          *sql.DB
 	repos                       *storage.Repositories
