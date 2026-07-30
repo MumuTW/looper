@@ -217,6 +217,9 @@ type Runtime struct {
 	// this flag is not a mutation/claim gate.
 	ownershipAcquired bool
 	admission         *Admission
+	// daemonBinary answers whether the executable file this daemon was launched
+	// from still holds the image it is running (#154).
+	daemonBinary *daemonBinaryWatcher
 
 	// shutdownDrainErr is set by BeginShutdown when producer/handle drain fails.
 	// Stop retains SQLite when non-nil (ADR-0015 / #577).
@@ -317,6 +320,7 @@ func New(options Options) *Runtime {
 		projectCatalog:              projectCatalog,
 		webhook:                     newWebhookRuntime(options.Config, options.Logger, now),
 		admission:                   NewAdmission(),
+		daemonBinary:                newDaemonBinaryWatcher(options.Logger),
 	}
 	// Project daemon Admission onto agent spawn leases so cmd.Start is refused
 	// while starting/stopping/degraded (#576 + #575).
@@ -835,6 +839,12 @@ func (r *Runtime) start(ctx context.Context) error {
 		return fmt.Errorf("runtime already stopped")
 	}
 	r.mu.RUnlock()
+
+	// Record which executable this process actually loaded before anything can
+	// replace it. Later checks compare against this, not against a re-read.
+	if r.daemonBinary != nil {
+		r.daemonBinary.record()
+	}
 
 	backupDir := ""
 	if r.config.Storage.BackupDir != nil {
@@ -1639,6 +1649,12 @@ func (r *Runtime) executeSchedulerTick(ctx context.Context) {
 	}
 	if tick == nil {
 		return
+	}
+
+	// One stat per tick unless the file moved. Keeps a swap loud in the log
+	// without waiting for an operator to run `looper status`.
+	if r.daemonBinary != nil {
+		r.daemonBinary.Status()
 	}
 
 	if err := tick(ctx, services); err != nil && r.logger != nil {

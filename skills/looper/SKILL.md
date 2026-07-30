@@ -75,6 +75,8 @@ That only places `looper`. Also install `looperd` from the same release's `loope
 go build -o ~/.local/bin/looperd ./cmd/looperd
 ```
 
+Never build or install over the binary a running `looperd` was launched from — that silently replaces the build an operator chose and the next restart kills every in-flight run. To upgrade an existing daemon use `scripts/update-daemon.sh`, which stages the build and refuses to promote it while the target is executing.
+
 ### Step 3 — Write config
 
 Canonical path: `~/.looper/config.toml`. `looper init` writes a commented starter file there and refuses to overwrite an existing one, so it is safe to run first and read the path it prints. Never overwrite an existing file without the user's OK.
