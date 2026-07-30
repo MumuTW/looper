@@ -1,16 +1,20 @@
 package api
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
 
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/eventlog"
+	githubinfra "github.com/nexu-io/looper/internal/infra/github"
+	"github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/nexu-io/looper/internal/storage"
 	pkgapi "github.com/nexu-io/looper/pkg/api"
 )
@@ -604,4 +608,735 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 	}
 
 	return response, nil
+}
+
+func (h *Handler) validateManualHoldBypassForLoopTarget(ctx context.Context, projectID string, loopType domain.LoopType, target domain.LoopTarget, force bool) error {
+	if force || (loopType != domain.LoopTypePlanner && loopType != domain.LoopTypeWorker && loopType != domain.LoopTypeReviewer && loopType != domain.LoopTypeFixer) {
+		return nil
+	}
+	services := h.context.Runtime.Services()
+	if services.Repositories == nil || services.Repositories.Projects == nil {
+		return nil
+	}
+	project, err := requireActiveProjectRecord(ctx, services.Repositories.Projects, projectID)
+	if err != nil {
+		return err
+	}
+	// Hold preflight is best-effort at create time: when we cannot reliably talk to
+	// GitHub from this handler context (missing repo path, missing gh path, etc.) we
+	// skip validation rather than blocking manual creation for unrelated local setup.
+	if strings.TrimSpace(project.RepoPath) == "" {
+		return nil
+	}
+	if _, err := os.Stat(project.RepoPath); err != nil {
+		return nil
+	}
+	ghPath := strings.TrimSpace(derefString(h.context.Config.Tools.GHPath))
+	if ghPath == "" {
+		return nil
+	}
+	gh := githubinfra.New(githubinfra.Options{GHPath: ghPath, CWD: project.RepoPath, Env: config.DaemonGitHubCredentialEnv(h.context.Config), GHRun: shell.Run})
+	labels := []string(nil)
+	switch target.TargetType {
+	case domain.LoopTargetTypeIssue:
+		// Labels-only: ViewIssue would additionally page through every comment
+		// on the issue, and this preflight reads nothing but the labels.
+		issueLabels, err := gh.GetIssueLabels(ctx, githubinfra.ViewIssueInput{Repo: target.Repo, IssueNumber: target.IssueNumber, CWD: project.RepoPath})
+		if err != nil {
+			return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("refresh target before manual loop create: %v", err)}
+		}
+		labels = issueLabels
+	case domain.LoopTargetTypePullRequest:
+		detail, err := gh.ViewPullRequest(ctx, githubinfra.ViewPullRequestInput{Repo: target.Repo, PRNumber: target.PRNumber, CWD: project.RepoPath})
+		if err != nil {
+			return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("refresh target before manual loop create: %v", err)}
+		}
+		labels = detail.Labels
+	default:
+		return nil
+	}
+	if !domain.IsAutoLaneHeld(loopType, labels) {
+		return nil
+	}
+	return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("target is currently held for %s; rerun with --force to bypass hold", loopType)}
+}
+
+// refuseOccupiedIssueTarget asks the forge whether the issue is still open and
+// whether any open pull request already references it, and refuses dispatch
+// when either is true. The caller gates this on force=false and a configured
+// LookupIssueOccupancy, so a force override or a forge-unreachable process
+// keeps the local-only occupancy check from #319 working unchanged.
+func (h *Handler) refuseOccupiedIssueTarget(ctx context.Context, project storage.ProjectRecord, repo string, issueNumber int64) error {
+	occupancy, err := h.context.LookupIssueOccupancy(ctx, repo, issueNumber, project.RepoPath)
+	if err != nil {
+		if IsIssueLookupNotFound(err) {
+			return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Issue %s#%d not found; refresh target before manual loop create", repo, issueNumber)}
+		}
+		// A transient forge outage must not hard-fail dispatch: the local check
+		// still prevents self-collision, and prepare-work re-validates on claim.
+		return nil
+	}
+	if !occupancy.Occupied() {
+		return nil
+	}
+	reference := fmt.Sprintf("%s#%d", repo, issueNumber)
+	if occupancy.IsPullRequest {
+		return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("%s is a pull request, not an issue; rerun with --force to bypass", reference)}
+	}
+	if strings.TrimSpace(occupancy.State) != "" && !strings.EqualFold(strings.TrimSpace(occupancy.State), "open") {
+		return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("%s is %s; rerun with --force to bypass", reference, strings.ToLower(occupancy.State))}
+	}
+	if len(occupancy.OpenPullRequests) > 0 {
+		pr := occupancy.OpenPullRequests[0]
+		prReference := fmt.Sprintf("#%d", pr.Number)
+		if strings.TrimSpace(pr.Repo) != "" {
+			prReference = fmt.Sprintf("%s#%d", pr.Repo, pr.Number)
+		}
+		if strings.TrimSpace(pr.URL) != "" {
+			prReference += " (" + pr.URL + ")"
+		}
+		return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("%s already has an open pull request %s; rerun with --force to bypass", reference, prReference)}
+	}
+	return nil
+}
+
+func derefBool(value *bool) bool {
+	return value != nil && *value
+}
+
+func reusableWorkerLoopForIssueRequestCompat(existing []storage.LoopRecord, projectID string, issueTarget, effectiveTarget domain.LoopTarget) (storage.LoopRecord, domain.LoopTarget, bool, error) {
+	for _, loop := range existing {
+		if loop.ProjectID != projectID || loop.Type != string(domain.LoopTypeWorker) {
+			continue
+		}
+		status := domain.LoopStatus(loop.Status)
+		if !domain.IsConflictingActiveLoopStatus(status) {
+			continue
+		}
+		loopTarget, err := loopTargetFromRecordCompat(loop)
+		if err != nil {
+			return storage.LoopRecord{}, domain.LoopTarget{}, false, err
+		}
+		key := loopTargetKeyFromRecordCompat(loop)
+		if key != loopTargetKeyCompat(issueTarget) && key != loopTargetKeyCompat(effectiveTarget) {
+			continue
+		}
+		return loop, loopTarget, true, nil
+	}
+
+	return storage.LoopRecord{}, domain.LoopTarget{}, false, nil
+}
+
+func (h *Handler) resumeReusableWorkerLoopCompat(ctx context.Context, repos *storage.Repositories, loop storage.LoopRecord, target domain.LoopTarget, nowISO string, force bool) (storage.LoopRecord, error) {
+	status := domain.LoopStatus(loop.Status)
+	if force && status == domain.LoopStatusRunning {
+		return storage.LoopRecord{}, apiError{code: pkgapi.ErrorCodeLoopConflict, status: http.StatusConflict, message: fmt.Sprintf("Cannot force reuse running worker loop %s", loop.ID)}
+	}
+	if force {
+		normalized, err := forceManualWorkerLoopStateCompat(ctx, repos, loop, nowISO)
+		if err != nil {
+			return storage.LoopRecord{}, err
+		}
+		loop = normalized
+	}
+	shouldQueue := status == domain.LoopStatusIdle || status == domain.LoopStatusPaused || status == domain.LoopStatusQueued
+	if status == domain.LoopStatusIdle || status == domain.LoopStatusPaused {
+		if err := domain.AssertLoopStatusTransition(status, domain.LoopStatusQueued); err != nil {
+			return storage.LoopRecord{}, err
+		}
+		loop.Status = string(domain.LoopStatusQueued)
+		loop.NextRunAt = &nowISO
+		loop.UpdatedAt = nowISO
+		if err := repos.Loops.Upsert(ctx, loop); err != nil {
+			return storage.LoopRecord{}, err
+		}
+	}
+
+	if shouldQueue {
+		requeued, err := repos.Queue.RequeueLatestCancelledByLoop(ctx, loop.ID, nowISO)
+		if err != nil {
+			return storage.LoopRecord{}, err
+		}
+		if requeued == 0 {
+			activeQueue, findErr := repos.Queue.FindActiveByLoopID(ctx, loop.ID)
+			if findErr != nil {
+				return storage.LoopRecord{}, findErr
+			}
+			if activeQueue == nil {
+				latestQueue, latestErr := repos.Queue.GetLatestByLoopID(ctx, loop.ID)
+				if latestErr != nil {
+					return storage.LoopRecord{}, latestErr
+				}
+				if latestQueue != nil {
+					if latestQueue.DedupeKey != "" {
+						activeDedupe, dedupeErr := repos.Queue.FindActiveByDedupe(ctx, latestQueue.DedupeKey)
+						if dedupeErr != nil {
+							return storage.LoopRecord{}, dedupeErr
+						}
+						if activeDedupe != nil {
+							return loop, nil
+						}
+					}
+					replacement := *latestQueue
+					replacement.ID = generateRequestID()
+					replacement.Status = "queued"
+					replacement.AvailableAt = nowISO
+					replacement.Attempts = 0
+					replacement.ClaimedBy = nil
+					replacement.ClaimedAt = nil
+					replacement.StartedAt = nil
+					replacement.FinishedAt = nil
+					replacement.LastError = nil
+					replacement.LastErrorKind = nil
+					replacement.CreatedAt = nowISO
+					replacement.UpdatedAt = nowISO
+					if force {
+						replacement.PayloadJSON = forcedManualWorkerQueuePayloadJSONCompat(replacement.PayloadJSON)
+					}
+					if _, _, err := repos.Queue.UpsertActiveByDedupeOrGetExisting(ctx, replacement); err != nil {
+						return storage.LoopRecord{}, err
+					}
+				} else {
+					queueRecord, ok, queueErr := buildQueuedLoopQueueRecordCompat(loop, target, nowISO, loop.MetadataJSON, int64(h.context.Config.Scheduler.RetryMaxAttempts))
+					if queueErr != nil {
+						return storage.LoopRecord{}, queueErr
+					}
+					if ok {
+						if force {
+							queueRecord.PayloadJSON = forcedManualWorkerQueuePayloadJSONCompat(queueRecord.PayloadJSON)
+						}
+						if _, _, upsertQueueErr := repos.Queue.UpsertActiveByDedupeOrGetExisting(ctx, queueRecord); upsertQueueErr != nil {
+							return storage.LoopRecord{}, upsertQueueErr
+						}
+					}
+				}
+			} else if force {
+				activeQueue.PayloadJSON = forcedManualWorkerQueuePayloadJSONCompat(activeQueue.PayloadJSON)
+				activeQueue.UpdatedAt = nowISO
+				if err := repos.Queue.Upsert(ctx, *activeQueue); err != nil {
+					return storage.LoopRecord{}, err
+				}
+			}
+		} else if force {
+			activeQueue, findErr := repos.Queue.FindActiveByLoopID(ctx, loop.ID)
+			if findErr != nil {
+				return storage.LoopRecord{}, findErr
+			}
+			if activeQueue != nil {
+				activeQueue.PayloadJSON = forcedManualWorkerQueuePayloadJSONCompat(activeQueue.PayloadJSON)
+				activeQueue.UpdatedAt = nowISO
+				if err := repos.Queue.Upsert(ctx, *activeQueue); err != nil {
+					return storage.LoopRecord{}, err
+				}
+			}
+		}
+	}
+
+	return loop, nil
+}
+
+func forcedManualWorkerQueuePayloadJSONCompat(payloadJSON *string) *string {
+	payload := parseJSONObject(payloadJSON)
+	if len(payload) == 0 {
+		return payloadJSON
+	}
+	if payload["autoDiscovered"] != true {
+		return payloadJSON
+	}
+	delete(payload, "autoDiscovered")
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return payloadJSON
+	}
+	text := string(encoded)
+	return &text
+}
+
+func forceManualWorkerLoopStateCompat(ctx context.Context, repos *storage.Repositories, loop storage.LoopRecord, nowISO string) (storage.LoopRecord, error) {
+	metadataJSON := forcedManualWorkerMetadataJSONCompat(loop.MetadataJSON)
+	if !stringPtrEqual(metadataJSON, loop.MetadataJSON) {
+		loop.MetadataJSON = metadataJSON
+		loop.UpdatedAt = nowISO
+		if err := repos.Loops.Upsert(ctx, loop); err != nil {
+			return storage.LoopRecord{}, err
+		}
+	}
+	if repos.Runs != nil {
+		latestRun, err := repos.Runs.GetLatestByLoopID(ctx, loop.ID)
+		if err != nil {
+			return storage.LoopRecord{}, err
+		}
+		if latestRun != nil {
+			checkpointJSON := forcedManualWorkerCheckpointJSONCompat(latestRun.CheckpointJSON)
+			if !stringPtrEqual(checkpointJSON, latestRun.CheckpointJSON) {
+				latestRun.CheckpointJSON = checkpointJSON
+				latestRun.UpdatedAt = nowISO
+				if err := repos.Runs.Upsert(ctx, *latestRun); err != nil {
+					return storage.LoopRecord{}, err
+				}
+			}
+		}
+	}
+	return loop, nil
+}
+
+func forcedManualWorkerMetadataJSONCompat(metadataJSON *string) *string {
+	metadata := parseJSONObject(metadataJSON)
+	if len(metadata) == 0 {
+		return metadataJSON
+	}
+	worker, _ := metadata["worker"].(map[string]any)
+	if worker["autoDiscovered"] != true {
+		return metadataJSON
+	}
+	delete(worker, "autoDiscovered")
+	metadata["worker"] = worker
+	encoded, err := json.Marshal(metadata)
+	if err != nil {
+		return metadataJSON
+	}
+	text := string(encoded)
+	return &text
+}
+
+func forcedManualWorkerCheckpointJSONCompat(checkpointJSON *string) *string {
+	checkpoint := parseJSONObject(checkpointJSON)
+	if len(checkpoint) == 0 {
+		return checkpointJSON
+	}
+	work, _ := checkpoint["work"].(map[string]any)
+	if work["autoDiscovered"] != true {
+		return checkpointJSON
+	}
+	delete(work, "autoDiscovered")
+	checkpoint["work"] = work
+	encoded, err := json.Marshal(checkpoint)
+	if err != nil {
+		return checkpointJSON
+	}
+	text := string(encoded)
+	return &text
+}
+
+func stringPtrEqual(a, b *string) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
+}
+
+func reusedWorkerResponseFields(loop storage.LoopRecord, fallbackTitle string, fallbackPrompt, fallbackSpecPath, fallbackBaseBranch *string, fallbackIssueNumber *int64) (string, *string, *string, *string, *int64) {
+	metadata := parseJSONObject(loop.MetadataJSON)
+	worker, _ := metadata["worker"].(map[string]any)
+	title := fallbackTitle
+	if value := readStringAny(worker["title"]); value != nil {
+		title = *value
+	}
+	prompt := fallbackPrompt
+	if value := readStringAny(worker["prompt"]); value != nil {
+		prompt = value
+	}
+	specPath := fallbackSpecPath
+	if value := readStringAny(worker["specPath"]); value != nil {
+		specPath = value
+	}
+	baseBranch := fallbackBaseBranch
+	if value := readStringAny(worker["baseBranch"]); value != nil {
+		baseBranch = value
+	}
+	issueNumber := fallbackIssueNumber
+	if value := int64MetadataPtr(worker, "issueNumber"); value != nil {
+		issueNumber = value
+	}
+	return title, prompt, specPath, baseBranch, issueNumber
+}
+
+func (h *Handler) buildPlannersCreateResponse(r *http.Request) (plannerCreateResponse, error) {
+	if r.Method != http.MethodPost {
+		return plannerCreateResponse{}, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: fmt.Sprintf("Unsupported method for %s", apiBasePath+"/planners")}
+	}
+	if !isCodingRoleAgentConfigured(h.effectiveConfig(), config.CodingRolePlanner) {
+		return plannerCreateResponse{}, apiError{code: pkgapi.ErrorCodeAgentNotConfigured, status: http.StatusBadRequest, message: "Cannot create planner loop without config.agent.vendor"}
+	}
+
+	services := h.context.Runtime.Services()
+	if services.Repositories == nil || services.Coordinator == nil {
+		return plannerCreateResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: "Storage is not configured"}
+	}
+
+	body := createPlannerRequest{}
+	if aerr := decodeJSONMutationBody(r, &body, true); aerr != nil {
+		return plannerCreateResponse{}, *aerr
+	}
+
+	projectID := strings.TrimSpace(derefString(body.ProjectID))
+	if projectID == "" {
+		return plannerCreateResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "projectId is required"}
+	}
+	project, err := requireActiveProjectRecord(r.Context(), services.Repositories.Projects, projectID)
+	if err != nil {
+		return plannerCreateResponse{}, err
+	}
+
+	issueNumber := normalizePositiveInt64Ptr(body.IssueNumber)
+	if issueNumber == nil {
+		return plannerCreateResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "issueNumber must be a positive integer"}
+	}
+
+	repo := stringMetadataPtr(parseProjectMetadata(project.MetadataJSON), "repo")
+	if repo == nil {
+		return plannerCreateResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "project repo is required"}
+	}
+	target := domain.LoopTarget{TargetType: domain.LoopTargetTypeIssue, Repo: *repo, IssueNumber: *issueNumber}
+	if err := h.validateManualHoldBypassForLoopTarget(r.Context(), projectID, domain.LoopTypePlanner, target, derefBool(body.Force)); err != nil {
+		return plannerCreateResponse{}, err
+	}
+
+	// Share same-target lock with discard+retry so planner uniqueness races
+	// cannot interleave with requeue while discard mutates the worktree.
+	unlockPlannerTarget := h.lockLoopTargetForStatus(projectID, domain.LoopTypePlanner, target, domain.LoopStatusRunning)
+	defer unlockPlannerTarget()
+
+	nowISO := eventlog.FormatJavaScriptISOString(h.now().UTC())
+	targetID := fmt.Sprintf("issue:%s:%d", *repo, *issueNumber)
+	metadataJSONPtr, err := manualPlannerMetadataJSON(nil, *issueNumber)
+	if err != nil {
+		return plannerCreateResponse{}, err
+	}
+	metadataJSON := derefString(metadataJSONPtr)
+
+	record, err := storage.WithTransactionValue(r.Context(), services.Coordinator.DB(), nil, func(tx *sql.Tx) (storage.LoopRecord, error) {
+		repos := storage.NewRepositories(tx)
+		seq, seqErr := repos.Loops.AllocateSeq(r.Context())
+		if seqErr != nil {
+			return storage.LoopRecord{}, seqErr
+		}
+
+		existing, listErr := repos.Loops.List(r.Context())
+		if listErr != nil {
+			return storage.LoopRecord{}, listErr
+		}
+		if uniqueErr := assertUniqueActiveLoopCompat(existing, "", projectID, domain.LoopTypePlanner, target, domain.LoopStatusRunning); uniqueErr != nil {
+			return storage.LoopRecord{}, uniqueErr
+		}
+
+		record := storage.LoopRecord{
+			ID:           generateRequestID(),
+			Seq:          seq,
+			ProjectID:    projectID,
+			Type:         string(domain.LoopTypePlanner),
+			TargetType:   string(domain.LoopTargetTypeIssue),
+			TargetID:     &targetID,
+			Repo:         repo,
+			PRNumber:     nil,
+			Status:       string(domain.LoopStatusRunning),
+			ConfigJSON:   nil,
+			MetadataJSON: &metadataJSON,
+			NextRunAt:    &nowISO,
+			CreatedAt:    nowISO,
+			UpdatedAt:    nowISO,
+		}
+		if upsertErr := repos.Loops.Upsert(r.Context(), record); upsertErr != nil {
+			return storage.LoopRecord{}, upsertErr
+		}
+
+		queueRecord, ok, queueErr := buildQueuedLoopQueueRecordCompat(record, target, nowISO, &metadataJSON, int64(h.context.Config.Scheduler.RetryMaxAttempts))
+		if queueErr != nil {
+			return storage.LoopRecord{}, queueErr
+		}
+		if !ok {
+			return storage.LoopRecord{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: "failed to build planner queue item"}
+		}
+		if upsertQueueErr := repos.Queue.Upsert(r.Context(), queueRecord); upsertQueueErr != nil {
+			return storage.LoopRecord{}, upsertQueueErr
+		}
+
+		return record, nil
+	})
+	if err != nil {
+		var typed apiError
+		if asAPIError(err, &typed) {
+			return plannerCreateResponse{}, typed
+		}
+		return plannerCreateResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+	}
+	if h.context.TriggerSchedulerTick != nil {
+		h.context.TriggerSchedulerTick()
+	}
+
+	return plannerCreateResponse{loopResponse: serializeLoop(record), IssueNumber: *issueNumber}, nil
+}
+
+type resolveWorkerProjectInput struct {
+	ProjectID *string
+	Repo      *string
+	PRNumber  *int64
+}
+
+func (h *Handler) resolveWorkerProject(ctx context.Context, input resolveWorkerProjectInput) (storage.ProjectRecord, error) {
+	services := h.context.Runtime.Services()
+	if input.ProjectID != nil {
+		project, err := requireActiveProjectRecord(ctx, services.Repositories.Projects, *input.ProjectID)
+		if err != nil {
+			return storage.ProjectRecord{}, err
+		}
+		if input.Repo != nil {
+			configuredRepo := strings.TrimSpace(derefString(stringMetadataPtr(parseProjectMetadata(project.MetadataJSON), "repo")))
+			requestedRepo := strings.TrimSpace(*input.Repo)
+			if configuredRepo != "" && configuredRepo != requestedRepo {
+				if input.PRNumber != nil {
+					return storage.ProjectRecord{}, apiError{code: pkgapi.ErrorCodePullRequestProjectMismatch, status: http.StatusConflict, message: fmt.Sprintf("Pull request %s#%d does not belong to project %s", requestedRepo, *input.PRNumber, *input.ProjectID)}
+				}
+				return storage.ProjectRecord{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("project %s is configured for repo %s, not %s", *input.ProjectID, configuredRepo, requestedRepo)}
+			}
+		}
+		return *project, nil
+	}
+
+	if input.Repo != nil && input.PRNumber != nil {
+		requestedRepo := strings.TrimSpace(*input.Repo)
+		snapshots, err := services.Repositories.PullRequestSnapshots.List(ctx)
+		if err != nil {
+			return storage.ProjectRecord{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+		}
+		matchedProjectIDs := map[string]struct{}{}
+		for _, snapshot := range snapshots {
+			if snapshot.Repo == requestedRepo && snapshot.PRNumber == *input.PRNumber {
+				project, getErr := services.Repositories.Projects.GetByID(ctx, snapshot.ProjectID)
+				if getErr != nil {
+					return storage.ProjectRecord{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: getErr.Error()}
+				}
+				if project != nil && !project.Archived {
+					configuredRepo := strings.TrimSpace(derefString(stringMetadataPtr(parseProjectMetadata(project.MetadataJSON), "repo")))
+					if configuredRepo != "" && configuredRepo != requestedRepo {
+						continue
+					}
+					matchedProjectIDs[snapshot.ProjectID] = struct{}{}
+				}
+			}
+		}
+		if len(matchedProjectIDs) > 1 {
+			return storage.ProjectRecord{}, apiError{code: pkgapi.ErrorCodeProjectAmbiguous, status: http.StatusConflict, message: fmt.Sprintf("Multiple projects match pull request %s#%d; pass projectId explicitly", *input.Repo, *input.PRNumber)}
+		}
+		for projectID := range matchedProjectIDs {
+			project, getErr := services.Repositories.Projects.GetByID(ctx, projectID)
+			if getErr != nil {
+				return storage.ProjectRecord{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: getErr.Error()}
+			}
+			if project != nil {
+				return *project, nil
+			}
+		}
+	}
+
+	if input.Repo != nil {
+		projectsList, err := services.Repositories.Projects.List(ctx)
+		if err != nil {
+			return storage.ProjectRecord{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+		}
+		matches := make([]storage.ProjectRecord, 0)
+		for _, candidate := range projectsList {
+			if candidate.Archived {
+				continue
+			}
+			candidateRepo := stringMetadataPtr(parseProjectMetadata(candidate.MetadataJSON), "repo")
+			if candidateRepo != nil && *candidateRepo == *input.Repo {
+				matches = append(matches, candidate)
+			}
+		}
+		if len(matches) == 1 {
+			return matches[0], nil
+		}
+		if len(matches) > 1 {
+			return storage.ProjectRecord{}, apiError{code: pkgapi.ErrorCodeProjectAmbiguous, status: http.StatusConflict, message: fmt.Sprintf("Multiple projects match repo %s; pass projectId explicitly", *input.Repo)}
+		}
+	}
+
+	return storage.ProjectRecord{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "projectId is required unless it can be resolved from repo/prNumber"}
+}
+
+type requirePullRequestTargetInput struct {
+	ProjectID string
+	Repo      string
+	PRNumber  int64
+}
+
+func (h *Handler) requirePullRequestTarget(ctx context.Context, input requirePullRequestTargetInput) (int64, error) {
+	services := h.context.Runtime.Services()
+	project, err := requireActiveProjectRecord(ctx, services.Repositories.Projects, input.ProjectID)
+	if err != nil {
+		return 0, err
+	}
+	projectRepo := stringMetadataPtr(parseProjectMetadata(project.MetadataJSON), "repo")
+	if projectRepo == nil || *projectRepo != input.Repo {
+		return 0, apiError{code: pkgapi.ErrorCodePullRequestProjectMismatch, status: http.StatusConflict, message: fmt.Sprintf("Pull request %s#%d does not belong to project %s", input.Repo, input.PRNumber, input.ProjectID)}
+	}
+	snapshot, err := services.Repositories.PullRequestSnapshots.GetLatestByProject(ctx, input.ProjectID, input.Repo, input.PRNumber)
+	if err != nil {
+		return 0, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+	}
+	if snapshot == nil {
+		// Snapshots are written by Reviewer and by project discovery, and neither
+		// has to have run before a human decides this pull request needs Worker.
+		// Missing snapshot means "not seen yet", not "does not exist", so ask the
+		// forge rather than refusing work that is perfectly dispatchable.
+		return h.resolveUnsnapshottedPullRequestTarget(ctx, *project, input)
+	}
+	if snapshot.ProjectID != input.ProjectID {
+		return 0, apiError{code: pkgapi.ErrorCodePullRequestProjectMismatch, status: http.StatusConflict, message: fmt.Sprintf("Pull request %s#%d does not belong to project %s", input.Repo, input.PRNumber, input.ProjectID)}
+	}
+	// A snapshot captured while open does not prove the pull request is still
+	// open: project discovery only writes open PRs and never refreshes a
+	// snapshot after closure, so a stale-open snapshot would otherwise queue an
+	// expensive Worker run that pushes commits onto a closed or merged PR. The
+	// forge is the authority for current state; refresh it before accepting.
+	// When no lookup is configured, fall back to the snapshot's recorded state
+	// so a process without forge access keeps its previous behavior.
+	if h.context.LookupPullRequest != nil {
+		target, lookupErr := h.context.LookupPullRequest(ctx, input.Repo, input.PRNumber, project.RepoPath)
+		return h.acceptFreshPullRequestTarget(input, target, lookupErr)
+	}
+	if isOpen, known, stateErr := h.getPlannerPullRequestOpenState(ctx, input.ProjectID, input.Repo, input.PRNumber); stateErr == nil && known && !isOpen {
+		return 0, closedPullRequestTargetError(input.Repo, input.PRNumber)
+	}
+	return snapshot.PRNumber, nil
+}
+
+// resolveUnsnapshottedPullRequestTarget answers the same question as its caller
+// for a pull request Looper has no snapshot of. LookupPullRequest is optional;
+// without it an unsnapshotted pull request stays unresolvable, which is the
+// behavior every caller had before the forge fallback existed.
+func (h *Handler) resolveUnsnapshottedPullRequestTarget(ctx context.Context, project storage.ProjectRecord, input requirePullRequestTargetInput) (int64, error) {
+	if h.context.LookupPullRequest == nil {
+		return 0, apiError{code: pkgapi.ErrorCodePullRequestNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Pull request not found: %s#%d", input.Repo, input.PRNumber)}
+	}
+	target, err := h.context.LookupPullRequest(ctx, input.Repo, input.PRNumber, project.RepoPath)
+	return h.acceptFreshPullRequestTarget(input, target, err)
+}
+
+// acceptFreshPullRequestTarget turns a fresh forge lookup into the resolved PR
+// number or an API error. Only a classified "does not exist" result is a 404;
+// any other lookup failure is a retryable server error so a transient forge
+// outage is not reported as a permanently missing target. A PR the forge
+// confirms closed or merged is rejected before work is queued.
+func (h *Handler) acceptFreshPullRequestTarget(input requirePullRequestTargetInput, target PullRequestTarget, err error) (int64, error) {
+	if err != nil {
+		if IsPullRequestLookupNotFound(err) {
+			return 0, apiError{code: pkgapi.ErrorCodePullRequestNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Pull request not found: %s#%d (%s)", input.Repo, input.PRNumber, err.Error())}
+		}
+		return 0, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: fmt.Sprintf("Pull request lookup failed: %s#%d (%s)", input.Repo, input.PRNumber, err.Error())}
+	}
+	if target.Number <= 0 {
+		return 0, apiError{code: pkgapi.ErrorCodePullRequestNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Pull request not found: %s#%d", input.Repo, input.PRNumber)}
+	}
+	if target.Merged || (strings.TrimSpace(target.State) != "" && !strings.EqualFold(strings.TrimSpace(target.State), "open")) {
+		return 0, closedPullRequestTargetError(input.Repo, input.PRNumber)
+	}
+	return target.Number, nil
+}
+
+func closedPullRequestTargetError(repo string, prNumber int64) error {
+	return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Pull request %s#%d is not open", repo, prNumber)}
+}
+
+type findPlannerLoopForIssueInput struct {
+	ProjectID   string
+	Repo        string
+	IssueNumber int64
+}
+
+type workerPlannerMatch struct {
+	PRNumber *int64
+	SpecPath *string
+}
+
+func (h *Handler) maybeFindPlannerLoopForIssue(ctx context.Context, input findPlannerLoopForIssueInput) (*workerPlannerMatch, error) {
+	loopsList, err := h.context.Runtime.Services().Repositories.Loops.List(ctx)
+	if err != nil {
+		return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+	}
+	targetID := fmt.Sprintf("issue:%s:%d", input.Repo, input.IssueNumber)
+	for _, loop := range loopsList {
+		if loop.ProjectID != input.ProjectID || loop.Type != string(domain.LoopTypePlanner) || loop.TargetType != string(domain.LoopTargetTypeIssue) || derefString(loop.TargetID) != targetID {
+			continue
+		}
+		metadata := parseProjectMetadata(loop.MetadataJSON)
+		prNumber := loop.PRNumber
+		if prNumber == nil {
+			prNumber = int64MetadataPtr(metadata, "prNumber")
+		}
+		match := &workerPlannerMatch{PRNumber: prNumber, SpecPath: stringMetadataPtr(metadata, "specPath")}
+		if prNumber == nil {
+			return &workerPlannerMatch{PRNumber: nil, SpecPath: match.SpecPath}, nil
+		}
+		isOpen, known, err := h.getPlannerPullRequestOpenState(ctx, input.ProjectID, input.Repo, *prNumber)
+		if err != nil {
+			return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+		}
+		if known && !isOpen {
+			return &workerPlannerMatch{PRNumber: nil, SpecPath: match.SpecPath}, nil
+		}
+		return match, nil
+	}
+	return nil, nil
+}
+
+func (h *Handler) getPlannerPullRequestOpenState(ctx context.Context, projectID, repo string, prNumber int64) (bool, bool, error) {
+	if prNumber <= 0 {
+		return false, true, nil
+	}
+	snapshot, err := h.context.Runtime.Services().Repositories.PullRequestSnapshots.GetLatestByProject(ctx, projectID, repo, prNumber)
+	if err != nil {
+		return false, false, err
+	}
+	if snapshot == nil {
+		return false, false, nil
+	}
+	payload := parseJSONObject(snapshot.PayloadJSON)
+	detail, _ := payload["detail"].(map[string]any)
+	state := firstNonEmptyString(readStringAny(detail["state"]), readStringAny(detail["State"]))
+	if state == nil {
+		return false, false, nil
+	}
+	return strings.EqualFold(*state, "open"), true, nil
+}
+
+func deriveWorkerTitle(prompt, specPath, repo *string, prNumber, issueNumber *int64) string {
+	if prompt != nil {
+		if len(*prompt) > 80 {
+			return (*prompt)[:80]
+		}
+		return *prompt
+	}
+	if specPath != nil {
+		return "Implement " + *specPath
+	}
+	if prNumber != nil && repo != nil {
+		return fmt.Sprintf("Implement %s#%d", *repo, *prNumber)
+	}
+	if issueNumber != nil && repo != nil {
+		return fmt.Sprintf("Implement %s#%d", *repo, *issueNumber)
+	}
+	return "Worker run"
+}
+
+func normalizePositiveInt64Ptr(value *int64) *int64 {
+	if value == nil || *value <= 0 {
+		return nil
+	}
+	v := *value
+	return &v
+}
+
+func int64MetadataPtr(metadata map[string]any, key string) *int64 {
+	value, ok := metadata[key]
+	if !ok {
+		return nil
+	}
+	floatValue, ok := value.(float64)
+	if !ok || floatValue <= 0 || floatValue != float64(int64(floatValue)) {
+		return nil
+	}
+	parsed := int64(floatValue)
+	return &parsed
 }
