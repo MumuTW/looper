@@ -1962,14 +1962,14 @@ func (r *Runner) persistPlannerPullRequestReference(ctx context.Context, input s
 	// silently rolled back by this publish-time write.
 	var mergeErr error
 	if _, err := r.updateLoop(ctx, input.Loop, func(updated *storage.LoopRecord) {
-		updated.Repo = stringPtr(issue.Repo)
-		updated.PRNumber = &pr.Number
 		merged, err := mergeLoopMetadataJSON(updated.MetadataJSON, updates)
 		if err != nil {
 			mergeErr = err
 			return
 		}
 		updated.MetadataJSON = stringPtr(merged)
+		updated.Repo = stringPtr(issue.Repo)
+		updated.PRNumber = &pr.Number
 	}); err != nil {
 		return err
 	}
