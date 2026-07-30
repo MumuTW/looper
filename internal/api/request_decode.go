@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"reflect"
 	"strings"
 
 	pkgapi "github.com/nexu-io/looper/pkg/api"
@@ -76,16 +77,20 @@ func decodeStrictJSONValue(raw []byte, dst any) *apiError {
 	if dup := firstDuplicateJSONName(raw); dup != "" {
 		return &apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Request body has a duplicate field: %q", dup)}
 	}
+	if aerr := validateCanonicalFieldCasing(raw, reflect.TypeOf(dst)); aerr != nil {
+		return aerr
+	}
 	return nil
 }
 
 // firstDuplicateJSONName walks every object in raw and returns the first
-// member name that repeats within one object under case-folding, or "".
+// member name that repeats within one object under the same Unicode simple
+// folding encoding/json uses for field matching (strings.EqualFold), or "".
 // raw must already be known-valid JSON.
 func firstDuplicateJSONName(raw []byte) string {
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	type objectFrame struct {
-		seen      map[string]string
+		seen      []string
 		expectKey bool
 		isObject  bool
 	}
@@ -99,7 +104,7 @@ func firstDuplicateJSONName(raw []byte) string {
 		case json.Delim:
 			switch t {
 			case '{':
-				stack = append(stack, &objectFrame{seen: map[string]string{}, expectKey: true, isObject: true})
+				stack = append(stack, &objectFrame{expectKey: true, isObject: true})
 			case '[':
 				stack = append(stack, &objectFrame{})
 			case '}', ']':
@@ -111,11 +116,12 @@ func firstDuplicateJSONName(raw []byte) string {
 		case string:
 			if len(stack) > 0 && stack[len(stack)-1].isObject && stack[len(stack)-1].expectKey {
 				frame := stack[len(stack)-1]
-				folded := strings.ToLower(t)
-				if _, dup := frame.seen[folded]; dup {
-					return t
+				for _, seen := range frame.seen {
+					if strings.EqualFold(seen, t) {
+						return t
+					}
 				}
-				frame.seen[folded] = t
+				frame.seen = append(frame.seen, t)
 				frame.expectKey = false
 				continue
 			}
@@ -127,5 +133,102 @@ func firstDuplicateJSONName(raw []byte) string {
 				stack[len(stack)-1].expectKey = true
 			}
 		}
+	}
+}
+
+var jsonUnmarshalerType = reflect.TypeOf((*json.Unmarshaler)(nil)).Elem()
+
+// validateCanonicalFieldCasing rejects member names that reach a struct field
+// only through encoding/json's case-insensitive matching: a lone {"Force":true}
+// passes DisallowUnknownFields yet sets the force field, so the frozen schema's
+// exact spelling is enforced here. Plain maps accept arbitrary keys and types
+// with custom unmarshalers own their wire format, so both stop the walk.
+func validateCanonicalFieldCasing(raw json.RawMessage, t reflect.Type) *apiError {
+	for t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	if len(bytes.TrimSpace(raw)) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return nil
+	}
+	if t.Kind() != reflect.Struct && t.Kind() != reflect.Slice && t.Kind() != reflect.Array && t.Kind() != reflect.Map {
+		return nil
+	}
+	if reflect.PointerTo(t).Implements(jsonUnmarshalerType) {
+		return nil
+	}
+	switch t.Kind() {
+	case reflect.Slice, reflect.Array:
+		var elems []json.RawMessage
+		if err := json.Unmarshal(raw, &elems); err != nil {
+			return nil
+		}
+		for _, elem := range elems {
+			if aerr := validateCanonicalFieldCasing(elem, t.Elem()); aerr != nil {
+				return aerr
+			}
+		}
+		return nil
+	case reflect.Map:
+		var members map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &members); err != nil {
+			return nil
+		}
+		for _, value := range members {
+			if aerr := validateCanonicalFieldCasing(value, t.Elem()); aerr != nil {
+				return aerr
+			}
+		}
+		return nil
+	}
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &members); err != nil {
+		return nil
+	}
+	canonical := map[string]reflect.Type{}
+	collectCanonicalJSONFields(t, canonical)
+	for name, value := range members {
+		fieldType, exact := canonical[name]
+		if exact {
+			if aerr := validateCanonicalFieldCasing(value, fieldType); aerr != nil {
+				return aerr
+			}
+			continue
+		}
+		for tag := range canonical {
+			if strings.EqualFold(tag, name) {
+				return &apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Request body field %q must use its canonical spelling %q", name, tag)}
+			}
+		}
+	}
+	return nil
+}
+
+// collectCanonicalJSONFields records the exact wire names of t's fields,
+// flattening embedded structs the way encoding/json does.
+func collectCanonicalJSONFields(t reflect.Type, out map[string]reflect.Type) {
+	for i := 0; i < t.NumField(); i++ {
+		field := t.Field(i)
+		if !field.IsExported() {
+			continue
+		}
+		tag := field.Tag.Get("json")
+		name, _, _ := strings.Cut(tag, ",")
+		if name == "-" && tag == "-" {
+			continue
+		}
+		if field.Anonymous && name == "" {
+			embedded := field.Type
+			for embedded.Kind() == reflect.Pointer {
+				embedded = embedded.Elem()
+			}
+			if embedded.Kind() == reflect.Struct {
+				collectCanonicalJSONFields(embedded, out)
+				continue
+			}
+		}
+		if name == "" {
+			name = field.Name
+		}
+		out[name] = field.Type
 	}
 }

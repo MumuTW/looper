@@ -80,6 +80,36 @@ func TestDecodeJSONMutationBodyContract(t *testing.T) {
 		}
 	})
 
+	t.Run("lone noncanonical casing is rejected", func(t *testing.T) {
+		var dst decodeProbe
+		aerr := decodeJSONMutationBody(newRequest(`{"Force":true}`), &dst, true)
+		if aerr == nil || !strings.Contains(aerr.message, `canonical spelling "force"`) {
+			t.Fatalf("decode error = %#v, want canonical-casing rejection naming the exact field", aerr)
+		}
+	})
+
+	t.Run("unicode-fold duplicate is rejected", func(t *testing.T) {
+		// encoding/json matches with Unicode simple folding: U+017F LATIN
+		// SMALL LETTER LONG S folds to "s", so both members hit the same field.
+		var dst struct {
+			Status string `json:"status"`
+		}
+		aerr := decodeJSONMutationBody(newRequest(`{"status":"paused","ſtatus":"running"}`), &dst, true)
+		if aerr == nil || !strings.Contains(aerr.message, "duplicate field") {
+			t.Fatalf("decode error = %#v, want unicode-fold duplicate rejection", aerr)
+		}
+	})
+
+	t.Run("nested noncanonical casing is rejected", func(t *testing.T) {
+		var dst struct {
+			Inner decodeProbe `json:"inner"`
+		}
+		aerr := decodeJSONMutationBody(newRequest(`{"inner":{"NAME":"a"}}`), &dst, true)
+		if aerr == nil || !strings.Contains(aerr.message, `canonical spelling "name"`) {
+			t.Fatalf("decode error = %#v, want nested canonical-casing rejection", aerr)
+		}
+	})
+
 	t.Run("case-variant duplicate aliases are rejected", func(t *testing.T) {
 		// encoding/json matches struct fields case-insensitively, so a
 		// case-variant alias would silently let the last spelling win.
