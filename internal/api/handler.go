@@ -24,6 +24,7 @@ import (
 
 	"github.com/nexu-io/looper/internal/agent"
 	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/daemonbinary"
 	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/eventlog"
 	"github.com/nexu-io/looper/internal/fixer"
@@ -86,15 +87,19 @@ type ConfigMetadata struct {
 }
 
 type Context struct {
-	Config             config.Config
-	ConfigMetadata     func() ConfigMetadata
-	ConfigSnapshot     func() (config.Config, ConfigMetadata)
-	PatchConfig        func(context.Context, ConfigPatchRequest) error
-	Runtime            RuntimeState
-	WebhookForwarder   webhookforward.Forwarder
-	ProjectsService    projectService
-	Now                func() time.Time
-	RecoverySummary    func() any
+	Config           config.Config
+	ConfigMetadata   func() ConfigMetadata
+	ConfigSnapshot   func() (config.Config, ConfigMetadata)
+	PatchConfig      func(context.Context, ConfigPatchRequest) error
+	Runtime          RuntimeState
+	WebhookForwarder webhookforward.Forwarder
+	ProjectsService  projectService
+	Now              func() time.Time
+	RecoverySummary  func() any
+	// DaemonBinaryStatus reports whether the daemon's own executable file still
+	// holds the image it is running. Optional: when nil, /status reports the
+	// binary identity as unknown rather than as unchanged.
+	DaemonBinaryStatus func() daemonbinary.Status
 	ReconcileStaleRuns func(context.Context) (looperdruntime.StaleRunReconcileSummary, error)
 	StopLoop           func(context.Context, string, string) (any, error)
 	CloseLoop          func(context.Context, string, string) (any, error)
@@ -998,6 +1003,11 @@ type statusBinary struct {
 	CurrentTarget    string   `json:"currentTarget"`
 	ArtifactName     *string  `json:"artifactName"`
 	SupportedTargets []string `json:"supportedTargets"`
+	// Identity answers "is the file at Path still the build I am executing?".
+	// A running daemon whose binary was replaced keeps working on the old image
+	// and switches builds at the next restart, so the divergence is only
+	// visible here (#154).
+	Identity daemonbinary.Status `json:"identity"`
 }
 
 type versionResponse struct {
@@ -1009,6 +1019,17 @@ type versionResponse struct {
 type versionBinaryResponse struct {
 	Name string `json:"name"`
 	Path string `json:"path,omitempty"`
+}
+
+// daemonBinaryStatus reports the running-image-versus-on-disk comparison. With
+// no reporter wired the answer is "unknown", never "unchanged": a status that
+// cannot see a swap must not claim there was none.
+func (h *Handler) daemonBinaryStatus() daemonbinary.Status {
+	if h.context.DaemonBinaryStatus == nil {
+		return daemonbinary.Verify(daemonbinary.Identity{})
+	}
+
+	return h.context.DaemonBinaryStatus()
 }
 
 func daemonExecutablePath() string {
@@ -1415,7 +1436,8 @@ func (h *Handler) buildStatusResponse(ctx context.Context) (statusResponse, erro
 	forgeCredential := looperdruntime.ForgeCredentialReadinessFor(h.effectiveConfig())
 	outstanding, debtErr := looperdruntime.CountOutstandingQuarantineDebt(ctx, services.Repositories)
 	recovery := h.recoveryWithOutstanding(outstanding)
-	degradedReasons := statusDegradedReasons(reviewPublish, forgeCredential, outstanding, debtErr)
+	binaryIdentity := h.daemonBinaryStatus()
+	degradedReasons := statusDegradedReasons(reviewPublish, forgeCredential, outstanding, debtErr, binaryIdentity)
 
 	return statusResponse{
 		Service: statusService{
@@ -1434,6 +1456,7 @@ func (h *Handler) buildStatusResponse(ctx context.Context) (statusResponse, erro
 				CurrentTarget:    currentTarget,
 				ArtifactName:     artifactName,
 				SupportedTargets: []string{"darwin-arm64", "linux-amd64"},
+				Identity:         binaryIdentity,
 			},
 		},
 		Storage: statusStorage{
@@ -1695,8 +1718,11 @@ func (h *Handler) recoveryWithOutstanding(outstanding looperdruntime.Outstanding
 	return normalized
 }
 
-func statusDegradedReasons(reviewPublish looperdruntime.ReviewPublishReadiness, forgeCredential looperdruntime.ForgeCredentialReadiness, outstanding looperdruntime.OutstandingQuarantineDebt, debtErr error) []string {
+func statusDegradedReasons(reviewPublish looperdruntime.ReviewPublishReadiness, forgeCredential looperdruntime.ForgeCredentialReadiness, outstanding looperdruntime.OutstandingQuarantineDebt, debtErr error, binaryIdentity daemonbinary.Status) []string {
 	var reasons []string
+	if binaryIdentity.Swapped {
+		reasons = append(reasons, daemonbinary.SwappedDegradedReason)
+	}
 	if reviewPublish.Known && reviewPublish.PublishingDisabled {
 		reasons = append(reasons, "review_publish_disabled")
 	}
