@@ -188,12 +188,19 @@ func CollectTargetLabels(labels []string) []string {
 	return result
 }
 
+// IsTargetLikeLabel reports whether label uses the target-label prefix, even
+// when the node name that follows is missing or invalid. Removal paths need
+// this rather than ParseTargetLabel: a malformed target label must still be
+// stripped, not left behind for a later claim to trip over.
+func IsTargetLikeLabel(label string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(label)), strings.ToLower(TargetLabelPrefix))
+}
+
 func CollectTargetLikeLabels(labels []string) []string {
 	result := make([]string, 0, 1)
 	for _, label := range labels {
-		trimmed := strings.TrimSpace(label)
-		if strings.HasPrefix(strings.ToLower(trimmed), strings.ToLower(TargetLabelPrefix)) {
-			result = append(result, trimmed)
+		if IsTargetLikeLabel(label) {
+			result = append(result, strings.TrimSpace(label))
 		}
 	}
 	return result

@@ -3,12 +3,8 @@ package specpr
 import (
 	"regexp"
 	"strings"
-)
 
-const (
-	ReviewingLabel  = "looper:spec-reviewing"
-	ReadyLabel      = "looper:spec-ready"
-	NeedsHumanLabel = "looper:needs-human"
+	"github.com/nexu-io/looper/internal/labels"
 )
 
 type PullRequestPhase string
@@ -20,22 +16,8 @@ const (
 
 var pathPattern = regexp.MustCompile(`(?mi)^Spec:\s*(.+)$`)
 
-func NormalizeLabel(label string) string {
-	return strings.ToLower(strings.TrimSpace(label))
-}
-
-func HasLabel(labels []string, target string) bool {
-	normalizedTarget := NormalizeLabel(target)
-	for _, label := range labels {
-		if NormalizeLabel(label) == normalizedTarget {
-			return true
-		}
-	}
-	return false
-}
-
-func ResolvePullRequestPhase(labels []string) PullRequestPhase {
-	if HasLabel(labels, ReviewingLabel) {
+func ResolvePullRequestPhase(prLabels []string) PullRequestPhase {
+	if labels.Has(prLabels, labels.SpecReviewing) {
 		return PhaseSpec
 	}
 	return PhaseImplementation

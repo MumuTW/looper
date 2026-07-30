@@ -1,6 +1,10 @@
 package domain
 
-import "fmt"
+import (
+	"fmt"
+
+	"github.com/nexu-io/looper/internal/labels"
+)
 
 type LoopType string
 
@@ -9,13 +13,6 @@ const (
 	LoopTypeReviewer LoopType = "reviewer"
 	LoopTypeWorker   LoopType = "worker"
 	LoopTypeFixer    LoopType = "fixer"
-)
-
-const (
-	HoldLabelGlobal   = "looper:hold"
-	HoldLabelWorker   = "looper:hold:worker"
-	HoldLabelFixer    = "looper:hold:fixer"
-	HoldLabelReviewer = "looper:hold:reviewer"
 )
 
 var LoopTypes = []LoopType{
@@ -146,19 +143,19 @@ func AssertKnownLoopType(loopType LoopType) error {
 	return fmt.Errorf("loop.type must be one of: %s, %s, %s, %s", LoopTypePlanner, LoopTypeReviewer, LoopTypeWorker, LoopTypeFixer)
 }
 
-func IsAutoLaneHeld(loopType LoopType, labels []string) bool {
-	if hasExactLabel(labels, HoldLabelGlobal) {
+func IsAutoLaneHeld(loopType LoopType, itemLabels []string) bool {
+	if hasExactLabel(itemLabels, labels.HoldGlobal) {
 		return true
 	}
 	switch loopType {
 	case LoopTypePlanner:
 		return false
 	case LoopTypeWorker:
-		return hasExactLabel(labels, HoldLabelWorker)
+		return hasExactLabel(itemLabels, labels.HoldWorker)
 	case LoopTypeFixer:
-		return hasExactLabel(labels, HoldLabelFixer)
+		return hasExactLabel(itemLabels, labels.HoldFixer)
 	case LoopTypeReviewer:
-		return hasExactLabel(labels, HoldLabelReviewer)
+		return hasExactLabel(itemLabels, labels.HoldReviewer)
 	default:
 		return false
 	}

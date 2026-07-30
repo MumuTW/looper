@@ -14,10 +14,9 @@ import (
 
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/disclosure"
-	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/eventlog"
 	"github.com/nexu-io/looper/internal/forge"
-	"github.com/nexu-io/looper/internal/infra/specpr"
+	"github.com/nexu-io/looper/internal/labels"
 	"github.com/nexu-io/looper/internal/lifecycle"
 	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/storage"
@@ -496,7 +495,7 @@ func TestDiscoverPullRequestSkipsIneligiblePullRequest(t *testing.T) {
 func TestDiscoverPullRequestSkipsFixerHoldLabel(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{{Number: 42, State: "OPEN", HeadSHA: "head-42", Labels: []string{domain.HoldLabelFixer}, Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}}}}
+	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{{Number: 42, State: "OPEN", HeadSHA: "head-42", Labels: []string{labels.HoldFixer}, Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
 
 	result, err := runner.DiscoverPullRequest(context.Background(), TargetedDiscoveryInput{ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42})
@@ -524,7 +523,7 @@ func TestProcessClaimedItemSkipsHeldAutomaticFixerPR(t *testing.T) {
 	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_fixer_hold", ProjectID: &projectID, LoopID: &loopID, Type: "fixer", TargetType: "pull_request", TargetID: loopTarget, Repo: &repo, PRNumber: &prNumber, DedupeKey: "fixer:hold", Priority: storage.QueuePriorityFixer, Status: "running", AvailableAt: nowISO, LockKey: &lockKey, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
-	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{{Number: prNumber, State: "OPEN", Labels: []string{domain.HoldLabelFixer}}}}
+	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{{Number: prNumber, State: "OPEN", Labels: []string{labels.HoldFixer}}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Logger: fixture.logger, Now: fixture.now})
 
 	result, err := runner.ProcessClaimedItem(context.Background(), storage.QueueItemRecord{ID: "queue_fixer_hold", ProjectID: &projectID, LoopID: &loopID, Type: "fixer", TargetType: "pull_request", TargetID: loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "running"})
@@ -2466,7 +2465,7 @@ func TestDiscoverPullRequestAllowsManualFollowUpWhenFixerHoldAppliedLive(t *test
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
 	comment := map[string]any{"id": "c1", "threadId": "t1", "body": "please fix"}
-	github := &fakeGitHubGateway{currentUser: "looper-bot", viewResponses: []PullRequestDetail{{Number: prNumber, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Author: "human", Labels: []string{domain.HoldLabelFixer}, Comments: []map[string]any{comment}}}}
+	github := &fakeGitHubGateway{currentUser: "looper-bot", viewResponses: []PullRequestDetail{{Number: prNumber, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Author: "human", Labels: []string{labels.HoldFixer}, Comments: []map[string]any{comment}}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Logger: fixture.logger, Now: fixture.now})
 
 	result, err := runner.DiscoverPullRequest(context.Background(), TargetedDiscoveryInput{ProjectID: "project_1", Repo: repo, PRNumber: prNumber})
@@ -2487,7 +2486,7 @@ func TestDiscoverPullRequestsDoesNotRecoverLegacyNoopLoopWhenFixerHoldAppliedLiv
 	loopTarget := buildPullRequestTargetID(repo, prNumber)
 	legacyAt := eventlog.FormatJavaScriptISOString(fixture.now().Add(-10 * time.Minute))
 	comment := map[string]any{"id": "c1", "threadId": "t1", "body": "please fix"}
-	detail := PullRequestDetail{Number: prNumber, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Labels: []string{domain.HoldLabelFixer}, Comments: []map[string]any{comment}}
+	detail := PullRequestDetail{Number: prNumber, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Labels: []string{labels.HoldFixer}, Comments: []map[string]any{comment}}
 	metadata := mustMarshalJSON(map[string]any{"lastNoopResolveHeadSha": "head-1", "lastNoopResolveStateHash": hashFixItemsState(collectFixItems(detail)), "lastNoopResolveAt": legacyAt})
 	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_fixer_legacy_hold", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "failed", MetadataJSON: &metadata, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
@@ -2520,7 +2519,7 @@ func TestDiscoverPullRequestsRecoversManualLegacyNoopLoopWhenFixerHoldAppliedLiv
 	loopTarget := buildPullRequestTargetID(repo, prNumber)
 	legacyAt := eventlog.FormatJavaScriptISOString(fixture.now().Add(-10 * time.Minute))
 	comment := map[string]any{"id": "c1", "threadId": "t1", "body": "please fix"}
-	detail := PullRequestDetail{Number: prNumber, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Labels: []string{domain.HoldLabelFixer}, Comments: []map[string]any{comment}}
+	detail := PullRequestDetail{Number: prNumber, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Labels: []string{labels.HoldFixer}, Comments: []map[string]any{comment}}
 	metadata := mustMarshalJSON(map[string]any{"manual": true, "followUpdates": true, "lastNoopResolveHeadSha": "head-1", "lastNoopResolveStateHash": hashFixItemsState(collectFixItems(detail)), "lastNoopResolveAt": legacyAt})
 	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_fixer_manual_legacy_hold", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "failed", MetadataJSON: &metadata, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
@@ -4133,7 +4132,7 @@ func TestRunResolveCommentsStepPreservesCheckpointLabelSnapshotOnLiveRefresh(t *
 		}},
 	}}}
 	runner := New(Options{GitHub: github, Now: time.Now})
-	originalLabels := []string{specpr.ReviewingLabel}
+	originalLabels := []string{labels.SpecReviewing}
 	checkpoint := fixerCheckpoint{
 		Detail: &checkpointDetail{
 			Labels:      append([]string(nil), originalLabels...),
@@ -4164,8 +4163,8 @@ func TestRunResolveCommentsStepPreservesCheckpointLabelSnapshotOnLiveRefresh(t *
 	if updated.Detail == nil {
 		t.Fatal("updated.Detail = nil, want merged detail")
 	}
-	if !specpr.HasLabel(updated.Detail.Labels, specpr.ReviewingLabel) {
-		t.Fatalf("updated.Detail.Labels = %#v, want preserved %q label", updated.Detail.Labels, specpr.ReviewingLabel)
+	if !labels.Has(updated.Detail.Labels, labels.SpecReviewing) {
+		t.Fatalf("updated.Detail.Labels = %#v, want preserved %q label", updated.Detail.Labels, labels.SpecReviewing)
 	}
 	if len(updated.Detail.Labels) != 1 {
 		t.Fatalf("updated.Detail.Labels = %#v, want preserved snapshot only", updated.Detail.Labels)
@@ -6205,7 +6204,7 @@ func TestRunRepairStepSkipsWhenFixerHoldAppliedBeforeAgentStart(t *testing.T) {
 		t.Fatalf("MkdirAll() error = %v", err)
 	}
 	metadata := fmt.Sprintf(`{"worktreeRoot":%q}`, worktreeRoot)
-	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{{Number: 42, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", Labels: []string{domain.HoldLabelFixer}}}}
+	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{{Number: 42, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", Labels: []string{labels.HoldFixer}}}}
 	agent := &fakeAgentExecutor{}
 	git := &fakeGitGateway{}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, AllowRiskyFixes: true, Logger: fixture.logger, Now: fixture.now})
@@ -7987,7 +7986,7 @@ func TestRunPushStepRecordsPushEvidenceBeforePostPushHold(t *testing.T) {
 	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{
 		{Number: 42, State: "OPEN", HeadSHA: "base-head", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-head"},
 		{Number: 42, State: "OPEN", HeadSHA: "fix-head", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-head"},
-		{Number: 42, State: "OPEN", HeadSHA: "fix-head", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-head", Labels: []string{domain.HoldLabelFixer}},
+		{Number: 42, State: "OPEN", HeadSHA: "fix-head", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-head", Labels: []string{labels.HoldFixer}},
 	}}
 	git := &fakeGitGateway{}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, ValidationRunner: passValidation, AllowAutoPush: true, Now: fixture.now, Logger: fixture.logger})

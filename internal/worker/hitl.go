@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/nexu-io/looper/internal/labels"
 	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/storage"
 )
@@ -418,7 +419,7 @@ func (r *Runner) hitlAwaitingLabel() string {
 	if l := strings.TrimSpace(r.hitlGitHub.AwaitingLabel); l != "" {
 		return l
 	}
-	return "looper:awaiting-human"
+	return labels.AwaitingHuman
 }
 
 // deliverAskToGitHub ensures a (draft) PR exists for the loop, posts the agent's

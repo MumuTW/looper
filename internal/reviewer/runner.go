@@ -30,6 +30,7 @@ import (
 	gitinfra "github.com/nexu-io/looper/internal/infra/git"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/specpr"
+	"github.com/nexu-io/looper/internal/labels"
 	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/loops/failureclass"
 	"github.com/nexu-io/looper/internal/networkpolicy"
@@ -744,7 +745,7 @@ func New(options Options) *Runner {
 	}
 	policy := options.DiscoveryPolicy
 	if !policy.AutoDiscovery && !policy.IncludeDrafts && !policy.RequireReviewRequest && !policy.EnableSelfReview && len(policy.Labels) == 0 && policy.LabelMode == "" && !policy.IncludeSpecReviewingLabel && policy.SpecReviewingLabel == "" {
-		policy = DiscoveryPolicy{AutoDiscovery: true, IncludeDrafts: false, RequireReviewRequest: true, EnableSelfReview: false, Labels: []string{}, LabelMode: config.LabelModeAll, IncludeSpecReviewingLabel: true, SpecReviewingLabel: specpr.ReviewingLabel}
+		policy = DiscoveryPolicy{AutoDiscovery: true, IncludeDrafts: false, RequireReviewRequest: true, EnableSelfReview: false, Labels: []string{}, LabelMode: config.LabelModeAll, IncludeSpecReviewingLabel: true, SpecReviewingLabel: labels.SpecReviewing}
 	}
 	return &Runner{
 		db:                      options.DB,
@@ -1490,20 +1491,20 @@ func prQueryLabels(labels []string) []string {
 	return result
 }
 
-func labelsMatch(labels []string, required []string, mode config.LabelMode) bool {
+func labelsMatch(itemLabels []string, required []string, mode config.LabelMode) bool {
 	if len(required) == 0 {
 		return true
 	}
 	if mode == config.LabelModeAny {
 		for _, label := range required {
-			if specpr.HasLabel(labels, label) {
+			if labels.Has(itemLabels, label) {
 				return true
 			}
 		}
 		return false
 	}
 	for _, label := range required {
-		if !specpr.HasLabel(labels, label) {
+		if !labels.Has(itemLabels, label) {
 			return false
 		}
 	}
@@ -1994,7 +1995,7 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 		checkpoint.Detail.CurrentLogin = currentLogin
 		return nil
 	}
-	if !isManualReviewerLoop(input.Loop) && r.loopConfig.StopOnReadyLabel && specpr.HasLabel(checkpoint.Detail.Labels, specpr.ReadyLabel) {
+	if !isManualReviewerLoop(input.Loop) && r.loopConfig.StopOnReadyLabel && labels.Has(checkpoint.Detail.Labels, labels.SpecReady) {
 		checkpoint.SkipReason = fmt.Sprintf("Terminated reviewer loop for ready pull request %s#%d", input.Repo, input.PRNumber)
 		checkpoint.SkipKind = "ready_label"
 		if err := r.terminateLoop(ctx, input.Loop, "ready_label"); err != nil {
@@ -3600,8 +3601,8 @@ func (r *Runner) applyCleanSpecLabelTransition(ctx context.Context, input stepIn
 		return nil
 	}
 	specReviewingLabel := r.specReviewingLabel(input.Project.ID)
-	checkpointHadSpecReviewing := specpr.HasLabel(detailLabels(checkpoint.Detail), specReviewingLabel)
-	if !checkpointHadSpecReviewing && !specpr.HasLabel(detail.Labels, specReviewingLabel) {
+	checkpointHadSpecReviewing := labels.Has(detailLabels(checkpoint.Detail), specReviewingLabel)
+	if !checkpointHadSpecReviewing && !labels.Has(detail.Labels, specReviewingLabel) {
 		return nil
 	}
 	freshDetail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
@@ -3617,13 +3618,13 @@ func (r *Runner) applyCleanSpecLabelTransition(ctx context.Context, input stepIn
 	if !specpr.IsReviewClean(freshDetail.ReviewDecision, freshDetail.Comments) {
 		return nil
 	}
-	if specpr.HasLabel(freshDetail.Labels, specReviewingLabel) {
+	if labels.Has(freshDetail.Labels, specReviewingLabel) {
 		if err := r.github.RemovePullRequestLabels(ctx, PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: []string{specReviewingLabel}, CWD: input.Project.RepoPath}); err != nil {
 			return &loopError{message: fmt.Sprintf("Failed to remove spec-reviewing label before marking publish success: %v", err), kind: FailureRetryableAfterResume}
 		}
 	}
-	if !specpr.HasLabel(freshDetail.Labels, specpr.ReadyLabel) {
-		if err := r.github.AddPullRequestLabels(ctx, PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: []string{specpr.ReadyLabel}, CWD: input.Project.RepoPath}); err != nil {
+	if !labels.Has(freshDetail.Labels, labels.SpecReady) {
+		if err := r.github.AddPullRequestLabels(ctx, PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: []string{labels.SpecReady}, CWD: input.Project.RepoPath}); err != nil {
 			return &loopError{message: fmt.Sprintf("Failed to add spec-ready label before marking publish success: %v", err), kind: FailureRetryableAfterResume}
 		}
 	}
@@ -4482,7 +4483,7 @@ func (r *Runner) specReviewingLabel(projectID string) string {
 	if label := strings.TrimSpace(r.discoveryPolicyForProject(projectID).SpecReviewingLabel); label != "" {
 		return label
 	}
-	return specpr.ReviewingLabel
+	return labels.SpecReviewing
 }
 
 func pendingReviewEvent(pending pendingReviewCheckpoint) ReviewEvent {
@@ -4870,7 +4871,7 @@ func (r *Runner) failedReviewerLoopRecoveryEligibility(ctx context.Context, loop
 	if !r.discoveryPolicyForProject(loop.ProjectID).IncludeDrafts && pr.IsDraft {
 		return false, "", "draft_pr", nil
 	}
-	if r.loopConfig.StopOnReadyLabel && specpr.HasLabel(pr.Labels, specpr.ReadyLabel) {
+	if r.loopConfig.StopOnReadyLabel && labels.Has(pr.Labels, labels.SpecReady) {
 		return false, "", "ready_label", nil
 	}
 	meta := parseJSONObject(loop.MetadataJSON)
@@ -5878,7 +5879,7 @@ func reviewerDiscoverySuppressedByLastSkip(meta map[string]any, pr PullRequestSu
 			return false
 		}
 	case "ready_label":
-		if label, ok := stringFromAny(raw["requiredLabel"]); ok && label != "" && !specpr.HasLabel(pr.Labels, label) {
+		if label, ok := stringFromAny(raw["requiredLabel"]); ok && label != "" && !labels.Has(pr.Labels, label) {
 			return false
 		}
 	case "approved":
@@ -6223,7 +6224,7 @@ func filterSkipMetadata(checkpoint reviewerCheckpoint, recordedAt string) map[st
 		metadata["hasConflicts"] = true
 	}
 	if checkpoint.SkipKind == "ready_label" {
-		metadata["requiredLabel"] = specpr.ReadyLabel
+		metadata["requiredLabel"] = labels.SpecReady
 	}
 	if checkpoint.SkipKind == "already_reviewed_by_current_user" && checkpoint.SkipReviewerLogin != "" {
 		metadata["reviewerLogin"] = normalizeLogin(checkpoint.SkipReviewerLogin)

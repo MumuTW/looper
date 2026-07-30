@@ -29,6 +29,7 @@ import (
 	"github.com/nexu-io/looper/internal/forge"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/specpr"
+	"github.com/nexu-io/looper/internal/labels"
 	"github.com/nexu-io/looper/internal/lifecycle"
 	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/loops/failureclass"
@@ -4900,15 +4901,15 @@ func (r *Runner) runRecheckStep(ctx context.Context, input stepInput) (fixerChec
 	if err != nil {
 		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 	}
-	checkpointHadSpecReviewing := specpr.HasLabel(detailLabels(checkpoint.Detail), specpr.ReviewingLabel)
-	if (specpr.HasLabel(detail.Labels, specpr.ReviewingLabel) || checkpointHadSpecReviewing) && isSpecReviewClean(detail) {
-		if specpr.HasLabel(detail.Labels, specpr.ReviewingLabel) {
-			if err := r.github.RemovePullRequestLabels(ctx, PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: []string{specpr.ReviewingLabel}, CWD: input.Project.RepoPath}); err != nil {
+	checkpointHadSpecReviewing := labels.Has(detailLabels(checkpoint.Detail), labels.SpecReviewing)
+	if (labels.Has(detail.Labels, labels.SpecReviewing) || checkpointHadSpecReviewing) && isSpecReviewClean(detail) {
+		if labels.Has(detail.Labels, labels.SpecReviewing) {
+			if err := r.github.RemovePullRequestLabels(ctx, PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: []string{labels.SpecReviewing}, CWD: input.Project.RepoPath}); err != nil {
 				return checkpoint, err
 			}
 		}
-		if !specpr.HasLabel(detail.Labels, specpr.ReadyLabel) {
-			if err := r.github.AddPullRequestLabels(ctx, PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: []string{specpr.ReadyLabel}, CWD: input.Project.RepoPath}); err != nil {
+		if !labels.Has(detail.Labels, labels.SpecReady) {
+			if err := r.github.AddPullRequestLabels(ctx, PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: []string{labels.SpecReady}, CWD: input.Project.RepoPath}); err != nil {
 				return checkpoint, err
 			}
 		}
@@ -8333,20 +8334,20 @@ func prQueryLabels(labels []string) []string {
 	return result
 }
 
-func labelsMatch(labels []string, required []string, mode config.LabelMode) bool {
+func labelsMatch(itemLabels []string, required []string, mode config.LabelMode) bool {
 	if len(required) == 0 {
 		return true
 	}
 	if mode == config.LabelModeAny {
 		for _, label := range required {
-			if specpr.HasLabel(labels, label) {
+			if labels.Has(itemLabels, label) {
 				return true
 			}
 		}
 		return false
 	}
 	for _, label := range required {
-		if !specpr.HasLabel(labels, label) {
+		if !labels.Has(itemLabels, label) {
 			return false
 		}
 	}

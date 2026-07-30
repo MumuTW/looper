@@ -95,7 +95,7 @@ The act of putting an Issue into a state where Planner or Worker will discover i
 _Avoid_: handoff (overloaded — see below), route, promote, enqueue.
 
 **Trigger label**:
-The label a reactive Role watches for to claim an Issue or Pull Request. Configured per Role (e.g. Planner's trigger label is set in `roles.planner.triggers.labels`). In a Routed project, Worker still uses the generic `looper:worker-ready` Trigger label as work intent; exact Node targeting is expressed separately by `looper:target:<node_name>`.
+The label a reactive Role watches for to claim an Issue or Pull Request. Configured per Role under `roles.<role>.triggers.labels`; the defaults are `labels.DefaultPlanTrigger` and `labels.DefaultWorkerReadyTrigger` in `internal/labels`, which is the single definition point for every label Looper reads or writes. Runtime discovery must read the configured value, not the default.
 _Avoid_: queue label, pickup label, routed label, dispatched label, target label.
 
 **Veto signal**:
@@ -186,7 +186,7 @@ _Avoid_: router, dispatcher, scheduler, balancer.
 A project whose `network.mode` is `routed`. Coordinator admission/assignment is performed by the current Network Lease holder. Worker/Reviewer claim only when the exact target label matches the local Node and the role-specific GitHub-native coarse target is present. The complement is a *local-only project*, whose Roles keep existing single-machine behaviour and ignore `looper:target:*` labels.
 
 **Target label**:
-A Network-only exact Node target label of the form `looper:target:<node_name>`. Exactly one valid target label must be present before a Routed Worker/Reviewer may claim. Target labels are ignored in local-only projects.
+Constructed and parsed by `TargetLabelForNode`/`ParseTargetLabel` in `internal/network/protocol`, which is where they live because forming one requires validating a Node name. Exactly one valid target label must be present before a Routed Worker/Reviewer may claim; target labels are ignored in local-only projects.
 _Avoid_: trigger label, routed label, worker-ready suffix.
 
 **Lease**:

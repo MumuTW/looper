@@ -1,6 +1,10 @@
 package domain
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/nexu-io/looper/internal/labels"
+)
 
 func TestAssertLoopTypeMatchesTarget(t *testing.T) {
 	t.Parallel()
@@ -150,12 +154,12 @@ func TestIsAutoLaneHeld(t *testing.T) {
 		labels   []string
 		want     bool
 	}{
-		{name: "global blocks planner", loopType: LoopTypePlanner, labels: []string{HoldLabelGlobal}, want: true},
-		{name: "planner ignores worker hold", loopType: LoopTypePlanner, labels: []string{HoldLabelWorker}, want: false},
-		{name: "worker blocked by worker hold", loopType: LoopTypeWorker, labels: []string{HoldLabelWorker}, want: true},
-		{name: "worker blocked by global hold", loopType: LoopTypeWorker, labels: []string{HoldLabelGlobal}, want: true},
-		{name: "reviewer blocked by reviewer hold", loopType: LoopTypeReviewer, labels: []string{HoldLabelReviewer}, want: true},
-		{name: "fixer blocked by fixer hold", loopType: LoopTypeFixer, labels: []string{HoldLabelFixer}, want: true},
+		{name: "global blocks planner", loopType: LoopTypePlanner, labels: []string{labels.HoldGlobal}, want: true},
+		{name: "planner ignores worker hold", loopType: LoopTypePlanner, labels: []string{labels.HoldWorker}, want: false},
+		{name: "worker blocked by worker hold", loopType: LoopTypeWorker, labels: []string{labels.HoldWorker}, want: true},
+		{name: "worker blocked by global hold", loopType: LoopTypeWorker, labels: []string{labels.HoldGlobal}, want: true},
+		{name: "reviewer blocked by reviewer hold", loopType: LoopTypeReviewer, labels: []string{labels.HoldReviewer}, want: true},
+		{name: "fixer blocked by fixer hold", loopType: LoopTypeFixer, labels: []string{labels.HoldFixer}, want: true},
 		{name: "no prefix matching", loopType: LoopTypeWorker, labels: []string{"looper:hold:worker:extra"}, want: false},
 	}
 

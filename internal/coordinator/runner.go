@@ -20,7 +20,7 @@ import (
 	"github.com/nexu-io/looper/internal/disclosure"
 	"github.com/nexu-io/looper/internal/eventlog"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
-	"github.com/nexu-io/looper/internal/infra/specpr"
+	"github.com/nexu-io/looper/internal/labels"
 	"github.com/nexu-io/looper/internal/network/protocol"
 	"github.com/nexu-io/looper/internal/networkpolicy"
 	"github.com/nexu-io/looper/internal/storage"
@@ -1116,23 +1116,23 @@ func queuePullRequestKey(repo string, prNumber int64) string {
 }
 
 func isWorkerDispatch(issue triage.Issue) bool {
-	return specpr.HasLabel(issue.Labels, dispatch.DispatchImplement)
+	return labels.Has(issue.Labels, dispatch.DispatchImplement)
 }
 
-func labelsMatch(labels, expected []string, mode config.LabelMode) bool {
+func labelsMatch(itemLabels, expected []string, mode config.LabelMode) bool {
 	if len(expected) == 0 {
 		return true
 	}
 	if mode == config.LabelModeAny {
 		for _, label := range expected {
-			if specpr.HasLabel(labels, label) {
+			if labels.Has(itemLabels, label) {
 				return true
 			}
 		}
 		return false
 	}
 	for _, label := range expected {
-		if !specpr.HasLabel(labels, label) {
+		if !labels.Has(itemLabels, label) {
 			return false
 		}
 	}
@@ -1267,7 +1267,7 @@ func (r *Runner) applyRoutedReviewAssignment(ctx context.Context, projectID, rep
 	}
 	wantLabel := protocol.TargetLabelForNode(candidate.NodeName)
 	needReviewRequest := !isCurrentUserRequested(detail.ReviewRequests, candidate.Login)
-	currentTargets := targetLabels(detail.Labels)
+	currentTargets := protocol.CollectTargetLikeLabels(detail.Labels)
 	needTargetRepair := len(currentTargets) != 1 || !strings.EqualFold(strings.TrimSpace(currentTargets[0]), wantLabel)
 	if !needReviewRequest && !needTargetRepair {
 		return nil
@@ -1412,21 +1412,10 @@ func reviewAssignmentEligible(detail githubinfra.PullRequestDetail, trigger conf
 	return true
 }
 
-func targetLabels(labels []string) []string {
-	result := make([]string, 0, 1)
-	for _, label := range labels {
-		trimmed := strings.TrimSpace(label)
-		if strings.HasPrefix(strings.ToLower(trimmed), "looper:target:") {
-			result = append(result, trimmed)
-		}
-	}
-	return result
-}
-
-func removeTargetLabels(labels []string) []string {
-	result := make([]string, 0, len(labels))
-	for _, label := range labels {
-		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(label)), "looper:target:") {
+func removeTargetLabels(itemLabels []string) []string {
+	result := make([]string, 0, len(itemLabels))
+	for _, label := range itemLabels {
+		if protocol.IsTargetLikeLabel(label) {
 			continue
 		}
 		result = append(result, label)

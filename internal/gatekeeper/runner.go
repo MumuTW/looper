@@ -9,9 +9,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/eventlog"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
+	"github.com/nexu-io/looper/internal/labels"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -234,9 +234,9 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 		report.Reasons = append(report.Reasons, Reason{Code: ReasonPullRequestDraft})
 	}
 	for _, label := range detail.Labels {
-		if strings.TrimSpace(label) == domain.HoldLabelGlobal {
-			report.Evidence.HoldLabels = append(report.Evidence.HoldLabels, domain.HoldLabelGlobal)
-			report.Reasons = append(report.Reasons, Reason{Code: ReasonHold, Subject: domain.HoldLabelGlobal})
+		if strings.TrimSpace(label) == labels.HoldGlobal {
+			report.Evidence.HoldLabels = append(report.Evidence.HoldLabels, labels.HoldGlobal)
+			report.Reasons = append(report.Reasons, Reason{Code: ReasonHold, Subject: labels.HoldGlobal})
 		}
 	}
 	report.Evidence.ProjectPolicyPermitsTarget = r.policyPermitsTarget(input.ProjectID, input.Repo, report.Evidence.BaseRefName)

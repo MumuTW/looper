@@ -16,10 +16,10 @@ import (
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/diffanchor"
 	"github.com/nexu-io/looper/internal/disclosure"
-	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/forge"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/shell"
+	"github.com/nexu-io/looper/internal/labels"
 	"github.com/nexu-io/looper/internal/outboundguard"
 	"github.com/nexu-io/looper/internal/storage"
 )
@@ -782,7 +782,7 @@ func TestWriteReviewSubmitDiagnosticWritesStructuredJSON(t *testing.T) {
 
 func TestValidateReviewerReviewSubmitHoldRejectsHeldAutomaticReviewerFlow(t *testing.T) {
 	t.Parallel()
-	err := validateReviewerReviewSubmitHold(context.Background(), config.Config{}, "acme/looper", 42, false, "", []string{domain.HoldLabelReviewer})
+	err := validateReviewerReviewSubmitHold(context.Background(), config.Config{}, "acme/looper", 42, false, "", []string{labels.HoldReviewer})
 	if err == nil || !strings.Contains(err.Error(), "currently held") {
 		t.Fatalf("validateReviewerReviewSubmitHold() error = %v, want held automatic reviewer rejection", err)
 	}
@@ -794,7 +794,7 @@ func TestValidateReviewerReviewSubmitHoldRejectsHeldAutomaticReviewerFlow(t *tes
 func TestValidateLatestReviewerReviewSubmitHoldRefreshesLabels(t *testing.T) {
 	t.Parallel()
 
-	gh := &reviewSubmitFakePRViewer{detail: githubinfra.PullRequestDetail{Number: 42, Labels: []string{domain.HoldLabelReviewer}}}
+	gh := &reviewSubmitFakePRViewer{detail: githubinfra.PullRequestDetail{Number: 42, Labels: []string{labels.HoldReviewer}}}
 
 	labels, err := validateLatestReviewerReviewSubmitHold(context.Background(), gh, config.Config{}, "acme/looper", 42, false, "", "/repo")
 	if err == nil || !strings.Contains(err.Error(), "currently held") {
