@@ -3458,8 +3458,8 @@ func TestDefaultConfigMatchesDaemonDefaults(t *testing.T) {
 	if config.Daemon.WorktreeCleanup.MaxPerTick != 10 {
 		t.Fatalf("DefaultConfig().Daemon.WorktreeCleanup.MaxPerTick = %d, want 10", config.Daemon.WorktreeCleanup.MaxPerTick)
 	}
-	if config.Daemon.WorktreeCleanup.IncludeOrphans {
-		t.Fatal("DefaultConfig().Daemon.WorktreeCleanup.IncludeOrphans = true, want false")
+	if !config.Daemon.WorktreeCleanup.IncludeOrphans {
+		t.Fatal("DefaultConfig().Daemon.WorktreeCleanup.IncludeOrphans = false, want true so aged orphans are reclaimable")
 	}
 	if config.Daemon.WorktreeCleanup.DryRun {
 		t.Fatal("DefaultConfig().Daemon.WorktreeCleanup.DryRun = true, want false")
