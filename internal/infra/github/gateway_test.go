@@ -2684,7 +2684,7 @@ func TestRepositoryPermissionAllowsWrite(t *testing.T) {
 			t.Fatalf("RepositoryPermissionAllowsWrite(%q) = false", permission)
 		}
 	}
-	for _, permission := range []string{"", "read", "triage"} {
+	for _, permission := range []string{"", "read", "triage", "none"} {
 		if RepositoryPermissionAllowsWrite(permission) {
 			t.Fatalf("RepositoryPermissionAllowsWrite(%q) = true", permission)
 		}
@@ -2709,6 +2709,11 @@ func TestGetRepositoryPermission(t *testing.T) {
 			name:   "read permission is unauthorized but valid",
 			stdout: `{"permission":"read"}`,
 			want:   "read",
+		},
+		{
+			name:   "none permission is a valid denial, not malformed",
+			stdout: `{"permission":"none"}`,
+			want:   "none",
 		},
 		{
 			name: "404 maps to empty permission without error",
