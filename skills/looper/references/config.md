@@ -137,7 +137,7 @@ repoPath = "/absolute/path/to/repo"
 
 GitHub is the only supported provider kind.
 
-- `github` — backed by `gh`. Projects without `provider` keep GitHub autodetection/metadata behavior. Set `baseUrl` to point a project at GitHub Enterprise Server.
+- `github` — backed by `gh`. Projects without `provider` keep GitHub autodetection/metadata behavior.
 
 Minimal project bound to an explicit provider:
 
@@ -149,7 +149,6 @@ vendor = "opencode"
 id = "ghes-main"
 kind = "github"
 baseUrl = "https://code.example.com"
-tokenEnv = "LOOPER_GITHUB_TOKEN"
 
 [[projects]]
 id = "example"
@@ -162,7 +161,8 @@ repo = "acme/example"
 Provider validation notes:
 
 - `providers[].kind` must be `github`. `forgejo` and `plane` were removed and are rejected with an explicit unsupported-provider error; they are never reinterpreted as a supported provider.
-- `baseUrl`, when set, must be an absolute `http(s)` URL.
+- `baseUrl`, when set, must be an absolute `http(s)` URL. It feeds repository identity only. To target GHES, qualify `projects[].repo` as `host/owner/name`; the `gh` gateway derives `--hostname` from that string, not from `baseUrl`.
+- `tokenEnv` names an env var copied into trusted `looper review submit` children only. Normal GitHub calls use ambient `gh` auth.
 - A project bound to a provider requires a `provider` and repo. Configure the provider and the complete project together in the config file's `providers` + `[[projects]]` (or projects table), then restart `looperd`. Do not pre-register the path with `looper project add`, the dashboard, or `POST /api/v1/projects`: those create an API-managed record, and a later config entry with the same id conflicts with it and prevents daemon startup.
 - Duplicate `repo` values are rejected case-insensitively, even across providers.
 

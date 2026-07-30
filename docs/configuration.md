@@ -406,9 +406,9 @@ worktree with a fresh Devin session.
 
 GitHub is the only supported provider kind.
 
-- `github` — backed by `gh`. Projects without `provider` keep the legacy GitHub autodetection/metadata path. Set `baseUrl` on a provider to point a project at GitHub Enterprise Server.
+- `github` — backed by `gh`. Projects without `provider` keep the legacy GitHub autodetection/metadata path.
 
-Provider example:
+A `providers` entry is optional. Its practical uses today are narrow, so read the field notes below before adding one.
 
 ```toml
 [agent]
@@ -418,7 +418,6 @@ vendor = "opencode"
 id = "ghes-main"
 kind = "github"
 baseUrl = "https://code.example.com"
-tokenEnv = "LOOPER_GITHUB_TOKEN"
 
 [[projects]]
 id = "example"
@@ -432,6 +431,8 @@ Provider rules:
 
 - `providers[].id` must be unique.
 - `providers[].kind` must be `github`. A configured `forgejo` or `plane` kind is rejected with an explicit unsupported-provider error — both were removed and are never reinterpreted as a supported provider.
+- `providers[].baseUrl` is optional; when set it must be an absolute `http(s)` URL. **It does not route GitHub operations.** Its only production consumer is repository identity, which is what lets two projects share an `owner/name` slug across different hosts without colliding. The `gh` gateway receives whatever `projects[].repo` holds and derives the host from that string, not from the provider: a three-segment `host/owner/name` value becomes `gh --hostname host`, while a bare `owner/name` uses ambient `gh` configuration. To target GitHub Enterprise Server, qualify `projects[].repo` with the host; setting `baseUrl` alone does not do it.
+- `providers[].tokenEnv` names an environment variable, **not the credential the GitHub gateway uses.** Planner, worker, reviewer, fixer, webhook, and discovery calls all authenticate through ambient `gh` auth (`gh auth login`). The named variable is copied unchanged from the daemon environment into trusted `looper review submit` child processes and nowhere else.
 - A project bound to a provider names it with `provider` plus a repo (`owner/name`) in the config file. The project HTTP API can register a local `repoPath` against a running daemon, but provider bindings themselves are file-managed. Already-started work retains its previous catalog snapshot.
 - Config validation rejects duplicate configured `repo` values case-insensitively, even across different providers, because current runtime records are still keyed by bare repo.
 

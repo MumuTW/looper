@@ -3967,3 +3967,73 @@ repoPath = "/tmp/demo"`
 		t.Fatalf("LoadFile() returned *ConfigValidationError (%v), want a decode error that rejects the removed field", err)
 	}
 }
+
+func TestGitHubProviderRejectsMalformedBaseURL(t *testing.T) {
+	t.Parallel()
+
+	for _, baseURL := range []string{"code.example.com", "file:///tmp/x", "https://"} {
+		baseURL := baseURL
+		t.Run(baseURL, func(t *testing.T) {
+			t.Parallel()
+			cfg, err := Normalize(t.TempDir(), PartialConfig{
+				Providers: &[]PartialProviderConfig{{ID: "ghes", Kind: providerKindPtr(ProviderKindGitHub), BaseURL: stringPtr(baseURL)}},
+				Projects:  &[]PartialProjectRefConfig{{ID: "demo", Name: "Demo", Provider: stringPtr("ghes"), Repo: stringPtr("acme/app"), RepoPath: "/tmp/demo"}},
+			})
+			if err != nil {
+				t.Fatalf("Normalize() error = %v", err)
+			}
+			err = ValidateWithOptions(cfg, ValidateOptions{DefaultWorktreeRoot: t.TempDir()})
+			var validationErr *ConfigValidationError
+			if !errors.As(err, &validationErr) {
+				t.Fatalf("ValidateWithOptions() error = %v, want *ConfigValidationError", err)
+			}
+			assertValidationIssue(t, validationErr, "providers[0].baseUrl", "must be an absolute http(s) URL")
+		})
+	}
+}
+
+// TestLoadFileLegacyForgejoSchemaDecodesBeforeValidation extends the
+// rejectRemovedProviderKind pre-decode check to the removed Forgejo schema. A
+// config still carrying auth/teaLogin/teaPath must surface the explicit
+// "forgejo is no longer supported" error rather than a misleading
+// unknown-field decode failure, without those fields living in the schema.
+func TestLoadFileLegacyForgejoSchemaDecodesBeforeValidation(t *testing.T) {
+	t.Parallel()
+
+	cwd := t.TempDir()
+	configPath := filepath.Join(cwd, "config.toml")
+	contents := `
+[[providers]]
+id = "forgejo-main"
+kind = "forgejo"
+baseUrl = "https://code.example.com"
+auth = "tea"
+teaLogin = "powerformer-code"
+teaPath = "/opt/homebrew/bin/tea"
+
+[[projects]]
+id = "demo"
+name = "Demo"
+provider = "forgejo-main"
+repo = "acme/code"
+repoPath = "/tmp/demo"
+`
+	if err := os.WriteFile(configPath, []byte(contents), 0o644); err != nil {
+		t.Fatalf("os.WriteFile() error = %v", err)
+	}
+
+	_, err := LoadFile(LoadFileOptions{
+		CWD:        cwd,
+		ConfigPath: configPath,
+		LookupEnv:  emptyEnvLookup,
+		LookPath:   fakeLookPath(map[string]string{"git": "/detected/git", "gh": "/detected/gh", "osascript": "/detected/osascript"}),
+	})
+	if err == nil {
+		t.Fatal("LoadFile() error = nil, want removed-forgejo-kind validation error")
+	}
+	var validationErr *ConfigValidationError
+	if !errors.As(err, &validationErr) {
+		t.Fatalf("LoadFile() error = %T (%v), want *ConfigValidationError from removed-forgejo-kind validation", err, err)
+	}
+	assertValidationIssue(t, validationErr, "providers[0].kind", `provider kind "forgejo" is no longer supported: Forgejo support was removed; looper is a GitHub-only product`)
+}
