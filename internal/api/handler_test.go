@@ -2085,14 +2085,7 @@ func TestHandlerMatchesFrozenErrorArtifactForStatusRoutes(t *testing.T) {
 }
 
 func TestHandlerMatchesFrozenSuccessArtifactsForCoreRoutes(t *testing.T) {
-	// The frozen status artifact captures the seeded queue before a claim. Keep
-	// the asynchronous claim pump out of this snapshot; the dynamic status test
-	// separately asserts the queued/running occupancy invariant.
-	fixture := newTestFixture(t, func(options *looperdruntime.Options) {
-		options.RunSchedulerClaim = func(context.Context, looperdruntime.Services) error {
-			return nil
-		}
-	})
+	fixture := newTestFixture(t)
 	seedStatusData(t, fixture.runtime)
 
 	routes := loadResponseArtifact(t)
@@ -8003,6 +7996,14 @@ func newTestFixture(t *testing.T, configure ...func(*looperdruntime.Options)) te
 			return now
 		},
 		RunSchedulerTick: func(context.Context, looperdruntime.Services) error {
+			return nil
+		},
+		// API handler tests seed and inspect durable state synchronously. Keep
+		// both scheduler lanes inert so a background claim cannot consume that
+		// state between the request and its assertions. Scheduler pump behavior
+		// is exercised explicitly by internal/runtime tests; an API test that
+		// needs the real claim pass may set this option back to nil.
+		RunSchedulerClaim: func(context.Context, looperdruntime.Services) error {
 			return nil
 		},
 	}
