@@ -97,6 +97,9 @@ type HeartbeatResponse struct {
 	Warnings   []string  `json:"warnings,omitempty"`
 }
 
+// CoordinatorLease is the Lease: the durable Authority for Network
+// Coordinator control-plane leadership — a row in the loopernet database with
+// a fencing token, validated at every GitHub side-effect boundary.
 type CoordinatorLease struct {
 	Name         string     `json:"name"`
 	HolderNodeID string     `json:"holderNodeId,omitempty"`

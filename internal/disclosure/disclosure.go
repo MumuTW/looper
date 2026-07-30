@@ -30,6 +30,9 @@ var (
 	commitTrailerPattern = regexp.MustCompile(`(?m)^Generated-By: looper .*$`)
 )
 
+// Stamper applies the Stamp: the standard <!-- looper:stamp v=1 --> HTML
+// comment plus visible footer on every agent-authored comment, identifying it
+// as Looper-generated.
 type Stamper struct {
 	Config  config.DisclosureConfig
 	Version string

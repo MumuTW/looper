@@ -100,16 +100,21 @@ The label a reactive Role watches for to claim an Issue or Pull Request. Configu
 _Avoid_: queue label, pickup label, routed label, dispatched label, target label.
 
 **Veto signal**:
-A human-applied state on an Issue that blocks Coordinator's autonomous Dispatch. Examples: removing the `dispatch/*` label, applying `looper:hold`, or applying the trigger label manually.
+A human-applied state on an Issue that blocks Coordinator's autonomous Dispatch. Examples: removing the `dispatch/*` label, applying `looper:hold`, or applying the trigger label manually. (Prose-only: the signal is human GitHub state, not a Looper type.)
 
 **Blocker**:
-An Issue listed in another Issue's GitHub-native `blocked_by` set. The Blocker's `state` and `state_reason`, together with `blocked_by` itself, are the named **Authority** for the dependency gate.
+Defined at `internal/coordinator/depgraph.Blocker`, whose doc comment carries
+the semantics: an Issue in another Issue's GitHub-native `blocked_by` set, the
+named **Authority** for the dependency gate.
 
 **Dependency gate**:
-The **Dispatch** precondition that all **Blockers** be `state==closed AND state_reason==completed`. The gate is blocked when any Blocker is open or closed-not-completed, and released when every Blocker satisfies the condition.
+Defined at `internal/coordinator/depgraph.DependencyGraph`, whose doc comment
+carries the semantics: the **Dispatch** precondition over **Blockers**.
 
 **Ready set**:
-The subset of tracked Issues whose **Dependency gate** is currently released — the Issues that may be **Dispatched** this tick, subject to the existing PRD #334 conditions.
+Defined at `internal/coordinator/depgraph.DependencyGraph` (the `ReadySet`
+method), whose doc comment carries the semantics: the tracked Issues whose
+**Dependency gate** is currently released.
 
 **Acceptance criterion**:
 A checkbox item under an Issue's `## Acceptance criteria` section. Reviewer's auto-merge gate verifies each criterion has a satisfying-evidence pointer in the diff before submitting APPROVE.
@@ -118,7 +123,7 @@ A checkbox item under an Issue's `## Acceptance criteria` section. Reviewer's au
 The Looper-only constraint identifying which PRs Looper may opt into auto-merge: `looper:` label AND tracked-Issue link, both required. Encoded in `roles.reviewer.autoMerge.scope = "looper-only"`.
 
 **Merge-pending state**:
-The GitHub-native state of a Pull Request after `gh pr merge --auto` has been called and before GitHub merges or a **Veto signal** arrives. The PR's `auto_merge` field is non-null in this state. Coordinator's merge-watch classifies merge-pending PRs into WatchActions.
+The GitHub-native state of a Pull Request after `gh pr merge --auto` has been called and before GitHub merges or a **Veto signal** arrives. The PR's `auto_merge` field is non-null in this state. Coordinator's merge-watch classifies merge-pending PRs into WatchActions. (Prose-only: a GitHub-native state; the classifier over it is `internal/coordinator/mergewatch.WatchAction`.)
 
 **Watch marker**:
 Defined at `internal/coordinator/mergewatch.PriorWatchMarker`, whose doc
@@ -145,7 +150,9 @@ A Role whose memory lives entirely in GitHub (labels, comments with markers, eve
 ### Comment markers
 
 **Stamp**:
-The standard `<!-- looper:stamp v=1 -->` HTML comment plus visible footer applied by every agent-authored comment, identifying the comment as Looper-generated. Defined in `internal/disclosure/disclosure.go`.
+Defined at `disclosure.Stamper` in `internal/disclosure`, whose doc comment
+carries the semantics: the standard `<!-- looper:stamp v=1 -->` HTML comment
+plus visible footer on every agent-authored comment.
 
 **Self-dedup marker**:
 A Role-specific HTML comment marker (e.g. `<!-- looper:coordinator:triage -->`) used by a stateless Role to recognise its own prior comments and avoid duplicate posts.
@@ -171,7 +178,10 @@ Constructed and parsed by `protocol.TargetLabelForNode` and `protocol.ParseTarge
 _Avoid_: trigger label, routed label, worker-ready suffix.
 
 **Lease**:
-The durable Authority for Network Coordinator control-plane leadership. A row in the `loopernet` database with a fencing token, validated at every GitHub side-effect boundary.
+Defined at `internal/network/protocol.CoordinatorLease`, whose doc comment
+carries the semantics: the durable Authority for Network Coordinator
+control-plane leadership, fencing-token validated at every GitHub side-effect
+boundary.
 
 ### Testing
 
