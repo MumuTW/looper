@@ -170,7 +170,6 @@ func reproducerLane(input defaultSchedulerTickInput) discoveryLane {
 		Enabled: func(projectID string) bool {
 			return input.ReproducerEnabled != nil && input.ReproducerEnabled(projectID)
 		},
-		Supported: supportsGitHubIssueDiscovery,
 		Discover: func(ctx context.Context, projectID, repo string, snapshot *githubinfra.DiscoverySnapshot) ([]storage.QueueItemRecord, error) {
 			result, err := input.Reproducer.DiscoverIssues(ctx, reproducer.DiscoveryInput{ProjectID: projectID, Repo: repo, Snapshot: snapshot, DecisionBudget: &decisionBudget})
 			return result.QueueItems, err

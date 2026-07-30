@@ -5,7 +5,6 @@ import (
 	"testing"
 
 	"github.com/nexu-io/looper/internal/config"
-	"github.com/nexu-io/looper/internal/forge"
 	"github.com/nexu-io/looper/internal/reproducer"
 )
 
@@ -15,20 +14,14 @@ func TestReproducerLaneRunsBetweenTriagerAndPlanner(t *testing.T) {
 	t.Parallel()
 	lanes := discoveryLanes(defaultSchedulerTickInput{})
 	positions := make(map[string]int, len(lanes))
-	byName := make(map[string]discoveryLane, len(lanes))
 	for index, lane := range lanes {
 		positions[lane.Name] = index
-		byName[lane.Name] = lane
 	}
 	if positions["triager"] >= positions["reproducer"] || positions["reproducer"] >= positions[config.CodingRolePlanner] {
 		t.Fatalf("lane positions = %#v, want triager < reproducer < planner", positions)
 	}
 	if config.PriorityReproducer <= config.PriorityTriager || config.PriorityReproducer >= config.PriorityPlanner {
 		t.Fatalf("PriorityReproducer = %d, want it strictly between %d and %d", config.PriorityReproducer, config.PriorityTriager, config.PriorityPlanner)
-	}
-	githubCapabilities, _ := forge.StaticCapabilities(forge.ProviderKindGitHub)
-	if !byName["reproducer"].Supported(githubCapabilities) || byName["reproducer"].Supported(forge.Capabilities{}) {
-		t.Fatal("reproducer must share the GitHub-issue authority predicate with triager")
 	}
 }
 
