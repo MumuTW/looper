@@ -85,14 +85,12 @@ func LastFailedDiscoveryFingerprint(metadataJSON *string) string {
 // the autonomousRecovery namespace. The fingerprint may be empty, in which case
 // the field is cleared so the next discovery is allowed to revive the loop.
 func MergeLastFailedDiscoveryFingerprint(metadataJSON *string, fingerprint string) (string, error) {
-	parsed := map[string]any{}
-	if metadataJSON != nil {
-		raw := strings.TrimSpace(*metadataJSON)
-		if raw != "" {
-			if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
-				return "", err
-			}
-		}
+	// Strict write-path decode: a malformed value (including JSON null, which
+	// previously unmarshalled to a nil map and panicked on assignment) blocks
+	// the merge instead of being replaced.
+	parsed, err := DecodeMetadataObjectForWrite(metadataJSON)
+	if err != nil {
+		return "", err
 	}
 	autonomous, _ := parsed[metadataAutonomousRecoveryKey].(map[string]any)
 	if autonomous == nil {

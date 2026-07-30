@@ -1520,6 +1520,9 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (w
 			branch = buildWorkerBranchName(work, input.Loop.ID)
 		}
 	}
+	if _, err := loops.DecodeMetadataObjectForWrite(input.Loop.MetadataJSON); err != nil {
+		return checkpoint, fmt.Errorf("validate worktree metadata before create: %w", err)
+	}
 	created, err := r.git.CreateWorktree(ctx, CreateWorktreeInput{
 		ProjectID:         input.Project.ID,
 		RepoPath:          input.Project.RepoPath,
@@ -1550,8 +1553,13 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (w
 		baseBranch = work.BaseBranch
 	}
 	metadataJSON, err := mergeLoopMetadataJSON(input.Loop.MetadataJSON, map[string]any{"worktreeId": worktreeID, "worktreePath": created.WorktreePath, "branch": created.Branch, "baseBranch": baseBranch})
-	if err == nil {
-		_, _ = r.updateLoop(ctx, input.Loop, func(updated *storage.LoopRecord) { updated.MetadataJSON = stringPtr(metadataJSON) })
+	if err != nil {
+		// Continuing without the persisted worktree keys would run the agent
+		// in a worktree the loop's durable state cannot account for.
+		return checkpoint, fmt.Errorf("record worktree metadata: %w", err)
+	}
+	if _, err := r.updateLoop(ctx, input.Loop, func(updated *storage.LoopRecord) { updated.MetadataJSON = stringPtr(metadataJSON) }); err != nil {
+		return checkpoint, fmt.Errorf("record worktree metadata: %w", err)
 	}
 	checkpoint.Worktree = &checkpointWorktree{ID: worktreeID, Path: created.WorktreePath, Branch: created.Branch, BaseBranch: baseBranch, HeadSHA: created.HeadSHA}
 	checkpoint.Lifecycle = lifecycle.NewState(lifecycle.AgentManagedWithFallbackPolicy("worker", work.ExecutionMode == "create-pr"), created.Branch, baseBranch)
@@ -2896,9 +2904,12 @@ func (r *Runner) ensureLoopForDiscoveredIssue(ctx context.Context, project stora
 				updated.NextRunAt = &nowISO
 			}
 			metadataJSON, err := mergeLoopMetadataJSON(existing.MetadataJSON, map[string]any{"worker": mergeWorkerMetadata(parseJSONObject(existing.MetadataJSON), work)})
-			if err == nil {
-				updated.MetadataJSON = &metadataJSON
+			if err != nil {
+				// Do not revive/requeue a loop whose durable state could not
+				// be recorded.
+				return loopUpsertResult{}, fmt.Errorf("merge worker discovery metadata: %w", err)
 			}
+			updated.MetadataJSON = &metadataJSON
 			updated.UpdatedAt = nowISO
 			if err := r.repos.Loops.Upsert(ctx, updated); err != nil {
 				return loopUpsertResult{}, err
@@ -4146,7 +4157,12 @@ func uniqueNonEmptyLabels(labels []string) []string {
 }
 
 func mergeLoopMetadataJSON(current *string, updates map[string]any) (string, error) {
-	metadata := parseJSONObject(current)
+	// Loop metadata mutations share the strict decoder: a malformed stored
+	// value blocks the merge instead of being replaced with only the updates.
+	metadata, err := loops.DecodeMetadataObjectForWrite(current)
+	if err != nil {
+		return "", err
+	}
 	for key, value := range updates {
 		metadata[key] = value
 	}

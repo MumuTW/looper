@@ -1597,18 +1597,18 @@ func (r *Runner) persistPlannerPullRequestReference(ctx context.Context, input s
 	if pr.Number == 0 {
 		return nil
 	}
-	if _, err := r.updateLoop(ctx, input.Loop, func(updated *storage.LoopRecord) {
-		updated.Repo = stringPtr(issue.Repo)
-		updated.PRNumber = &pr.Number
-	}); err != nil {
-		return err
-	}
 	metadataJSON, err := mergeLoopMetadataJSON(input.Loop.MetadataJSON, map[string]any{"issueNumber": issue.IssueNumber, "issueUrl": issue.URL, "issueTitle": issue.Title, "specPath": issue.SpecPath, "branch": worktree.Branch, "prUrl": pr.URL, "prNumber": pr.Number, "requestedReviewers": issue.RequestedReviewers})
 	if err != nil {
 		return err
 	}
-	_, err = r.updateLoop(ctx, input.Loop, func(updated *storage.LoopRecord) { updated.MetadataJSON = stringPtr(metadataJSON) })
-	return err
+	if _, err := r.updateLoop(ctx, input.Loop, func(updated *storage.LoopRecord) {
+		updated.Repo = stringPtr(issue.Repo)
+		updated.PRNumber = &pr.Number
+		updated.MetadataJSON = stringPtr(metadataJSON)
+	}); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (r *Runner) runNotifyStep(input stepInput) (plannerCheckpoint, error) {
@@ -1817,9 +1817,12 @@ func (r *Runner) ensureLoopForIssueWithAuthority(ctx context.Context, project st
 				updated.NextRunAt = &nowISO
 			}
 			metadataJSON, err := mergeLoopMetadataJSON(existing.MetadataJSON, map[string]any{"issueTitle": issue.Title, "issueURL": issue.URL, "issueNumber": issue.Number, "specPath": buildSpecPath(r.now(), issue.Number, issue.Title)})
-			if err == nil {
-				updated.MetadataJSON = stringPtr(metadataJSON)
+			if err != nil {
+				// Discovery must not report success and enqueue work without
+				// the refreshed issue metadata.
+				return loopUpsertResult{}, fmt.Errorf("merge planner discovery metadata: %w", err)
 			}
+			updated.MetadataJSON = stringPtr(metadataJSON)
 			updated.UpdatedAt = nowISO
 			if err := r.repos.Loops.Upsert(ctx, updated); err != nil {
 				return loopUpsertResult{}, err
@@ -1858,9 +1861,10 @@ func (r *Runner) refreshIssueLoop(ctx context.Context, existing storage.LoopReco
 		metadata[plannerQueueRoutingAuthorityKey] = authority
 	}
 	metadataJSON, err := mergeLoopMetadataJSON(existing.MetadataJSON, metadata)
-	if err == nil {
-		updated.MetadataJSON = stringPtr(metadataJSON)
+	if err != nil {
+		return storage.LoopRecord{}, fmt.Errorf("merge planner issue-refresh metadata: %w", err)
 	}
+	updated.MetadataJSON = stringPtr(metadataJSON)
 	updated.UpdatedAt = nowISO
 	if err := r.repos.Loops.Upsert(ctx, updated); err != nil {
 		return storage.LoopRecord{}, err
@@ -2059,7 +2063,12 @@ func parseJSONObject(value *string) map[string]any {
 }
 
 func mergeLoopMetadataJSON(current *string, updates map[string]any) (string, error) {
-	parsed := parseJSONObject(current)
+	// Loop metadata mutations share the strict decoder: a malformed stored
+	// value blocks the merge instead of being replaced with only the updates.
+	parsed, err := loops.DecodeMetadataObjectForWrite(current)
+	if err != nil {
+		return "", err
+	}
 	for key, value := range updates {
 		parsed[key] = value
 	}

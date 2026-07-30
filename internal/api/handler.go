@@ -5628,12 +5628,16 @@ func (h *Handler) handbackLoop(ctx context.Context, r *http.Request, loopID stri
 		}
 		if execution, err := repos.AgentExecutions.GetLatestByLoopID(ctx, loopID); err == nil && execution != nil && execution.NativeSessionID != nil && strings.TrimSpace(*execution.NativeSessionID) != "" {
 			meta, werr := loops.WriteTakeoverResume(loop.MetadataJSON, loops.TakeoverResume{SessionID: strings.TrimSpace(*execution.NativeSessionID)})
-			if werr == nil {
-				loop.MetadataJSON = &meta
-				loop.UpdatedAt = nowISO
-				if err := repos.Loops.Upsert(ctx, *loop); err != nil {
-					return struct{}{}, err
-				}
+			if werr != nil {
+				// Without the resume marker the next worker run cannot attach
+				// to the human-driven session; leave the loop parked instead of
+				// pretending the handback succeeded.
+				return struct{}{}, fmt.Errorf("persist takeover resume marker: %w", werr)
+			}
+			loop.MetadataJSON = &meta
+			loop.UpdatedAt = nowISO
+			if err := repos.Loops.Upsert(ctx, *loop); err != nil {
+				return struct{}{}, err
 			}
 		}
 		reason := "Cleared for takeover handback"
@@ -6091,6 +6095,11 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string,
 			return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 		}
 		preflightLoop = freshLoop
+		if preflightLoop.Type == "fixer" {
+			if _, err := loops.DecodeMetadataObjectForWrite(preflightLoop.MetadataJSON); err != nil {
+				return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Cannot discard worktree changes while loop metadata is malformed: %v", err)}
+			}
+		}
 
 		discardResult, discardErr := h.discardLoopWorktreeChanges(ctx, services, *preflightLoop)
 		if discardErr != nil {
@@ -6871,7 +6880,10 @@ func resetFixerLoopRetryMetadata(current *string) (*string, error) {
 	if current == nil || strings.TrimSpace(*current) == "" {
 		return current, nil
 	}
-	metadata := parseJSONObject(current)
+	metadata, err := loops.DecodeMetadataObjectForWrite(current)
+	if err != nil {
+		return nil, err
+	}
 	delete(metadata, "fixerFailureStreak")
 	if pauseReason, _ := metadata["pauseReason"].(string); pauseReason == "agent_failure_streak" {
 		delete(metadata, "pauseReason")
