@@ -321,8 +321,13 @@ func (s *Service) addProjectLocked(ctx context.Context, input AddInput) (AddResu
 		return AddResult{}, nil, ProjectValidationError{Message: fmt.Sprintf("project %s is managed by config and cannot be changed through the project API", existing.ID)}
 	}
 	if existing != nil && !existing.Archived {
-		derivedReusesSameCheckout := input.IDSource == "derived" && sameProjectRepoPath(existing.RepoPath, input.RepoPath)
-		if !derivedReusesSameCheckout {
+		// A collision is an id that belongs to a *different* project. Re-registering
+		// the same checkout under the id it already has is an in-place update, and
+		// it is the only non-destructive way to repair a project's repository:
+		// RemoveProject terminates every loop and cancels every queue item, and
+		// "terminated" has no outbound transition. Requiring a derived id here made
+		// that repair unavailable to any project registered with an explicit one.
+		if !sameProjectRepoPath(existing.RepoPath, input.RepoPath) {
 			return AddResult{}, nil, ProjectIDCollisionError{ProjectID: projectID}
 		}
 	}
@@ -369,11 +374,15 @@ func (s *Service) addProjectLocked(ctx context.Context, input AddInput) (AddResu
 		// no role can act on: every discovery lane skips a project whose repo
 		// metadata is empty. Say so at registration instead of leaving the
 		// operator to infer it from a daemon log line on every tick.
-		// The repair path is named precisely because the obvious ones do not
-		// exist: the dashboard Projects page is read-only, /api/v1/projects/{id}
-		// accepts only DELETE, and `looper project add` has no repo flag. That
-		// leaves DELETE followed by a create carrying "repo".
-		warnings = append(warnings, `No repository is set for this project, so no automation will run for it. To repair it: DELETE /api/v1/projects/`+projectID+` then POST /api/v1/projects with {"repoPath":"...","repo":"owner/name"}. The CLI cannot set a repository.`)
+		// Re-registering the same repoPath updates the record in place: the
+		// derived-id reuse path in this function accepts it, so the project keeps
+		// its id and — critically — its loops. Do not send operators through
+		// DELETE: RemoveProject terminates every loop and cancels every queue
+		// item for the project, and "terminated" has no outbound transition, so
+		// repairing a missing repository would destroy the automation state it
+		// was meant to restore. Name and base branch are replaced by defaults
+		// when omitted, so they are named here too.
+		warnings = append(warnings, fmt.Sprintf(`No repository is set for this project, so no automation will run for it. To repair it without losing existing loops, POST /api/v1/projects again with {"id":%q,"repoPath":%q,"repo":"owner/name"}, including the project's current "name" and "baseBranch" so they are not reset. The CLI cannot set a repository.`, projectID, input.RepoPath))
 	}
 
 	if err := s.validateReviewerAutoMergeForProject(ctx, projectID, repo, input.BaseBranch, cfg); err != nil {

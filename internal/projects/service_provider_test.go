@@ -176,3 +176,83 @@ func TestServiceAddProjectWarnsWhenNoRepositoryCouldBeDetermined(t *testing.T) {
 		t.Fatalf("warnings = %#v, want the inert-project consequence reported", added.Warnings)
 	}
 }
+
+// The repair path the inert-project warning advertises must not destroy what it
+// repairs. RemoveProject terminates every loop and cancels every queue item for
+// a project, and "terminated" has no outbound transition, so a DELETE-then-POST
+// repair would permanently kill the automation the operator is trying to
+// restore. Re-registering the same repoPath updates in place instead.
+func TestAdvertisedRepairPreservesProjectIdentityAndLoops(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openCoordinator(t)
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.July, 31, 12, 0, 0, 0, time.UTC)
+	nowISO := now.UTC().Format(time.RFC3339Nano)
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	repoPath := t.TempDir()
+	projectID := deriveProjectIDFromRepoPath(repoPath)
+	service := &Service{
+		DB:              coordinator.DB(),
+		Repos:           repos,
+		Config:          cfg,
+		Now:             func() time.Time { return now },
+		PublishProjects: func([]config.ProjectRefConfig) {},
+	}
+
+	registered, err := service.AddProject(context.Background(), AddInput{
+		ID: projectID, Name: "Custom Name", RepoPath: repoPath, BaseBranch: "develop", IDSource: "derived",
+	})
+	if err != nil {
+		t.Fatalf("AddProject() error = %v", err)
+	}
+	if registered.Repo != nil {
+		t.Fatalf("registered.Repo = %v, want no repository detected", registered.Repo)
+	}
+
+	targetID := "pr:acme/app:1"
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{
+		ID: "loop_existing", Seq: 1, ProjectID: projectID, Type: "reviewer",
+		TargetType: "pull_request", TargetID: &targetID, Status: "queued",
+		CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	// The advertised repair: same repoPath, explicit repo, existing settings.
+	// IDSource is "explicit" because the advice tells the operator to send the
+	// project's current id; that must be an in-place update, not a collision.
+	repo := "acme/app"
+	repaired, err := service.AddProject(context.Background(), AddInput{
+		ID: projectID, Name: "Custom Name", RepoPath: repoPath, BaseBranch: "develop", IDSource: "explicit", Repo: &repo,
+	})
+	if err != nil {
+		t.Fatalf("repair AddProject() error = %v, want an in-place update", err)
+	}
+	if repaired.Project.ID != projectID {
+		t.Fatalf("repaired project id = %q, want the original %q", repaired.Project.ID, projectID)
+	}
+	if repaired.Project.Archived {
+		t.Fatal("repaired project is archived; the repair must not remove and recreate it")
+	}
+	if repaired.Repo == nil || *repaired.Repo != repo {
+		t.Fatalf("repaired.Repo = %v, want %q", repaired.Repo, repo)
+	}
+	if repaired.Project.Name != "Custom Name" {
+		t.Fatalf("repaired name = %q, want the supplied name preserved", repaired.Project.Name)
+	}
+
+	loop, err := repos.Loops.GetByID(context.Background(), "loop_existing")
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if loop == nil {
+		t.Fatal("existing loop was removed by the repair")
+	}
+	if loop.Status == "terminated" {
+		t.Fatal("existing loop was terminated by the repair; the advertised path must be non-destructive")
+	}
+}
