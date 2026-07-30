@@ -41,6 +41,17 @@ type state struct {
 	GraphQL          map[string]json.RawMessage  `json:"graphql,omitempty"`
 	CurrentUserLogin string                      `json:"currentUserLogin,omitempty"`
 	PullRequests     map[string]pullRequestState `json:"pullRequests,omitempty"`
+	// RepositoryLabels models the label set of each repo, keyed by repo slug.
+	// Looper reads it before creating a label so that applying a label never
+	// rewrites one a maintainer already worded; modelling it here is what lets
+	// a contract test observe that.
+	RepositoryLabels map[string][]labelState `json:"repositoryLabels,omitempty"`
+}
+
+type labelState struct {
+	Name        string `json:"name"`
+	Color       string `json:"color,omitempty"`
+	Description string `json:"description,omitempty"`
 }
 type pullRequestState struct {
 	Number            int64               `json:"number,omitempty"`
@@ -160,6 +171,19 @@ func dispatch(mode string, schemaDoc schema, st state, stdin string) error {
 			return nil
 		}
 		return emitDefaultJSON(key, fields)
+	case "label list":
+		payload, err := json.Marshal(repositoryLabels(st, strings.TrimSpace(flagValue(os.Args[1:], "--repo"))))
+		if err != nil {
+			return err
+		}
+		_, _ = fmt.Fprintln(os.Stdout, string(payload))
+		return nil
+	case "label create":
+		if err := handleLabelCreate(&st, os.Args[1:]); err != nil {
+			return err
+		}
+		_, _ = fmt.Fprintln(os.Stdout, "{}")
+		return nil
 	case "pr merge":
 		if err := handlePullRequestMerge(&st, os.Args[1:]); err != nil {
 			return err
@@ -183,6 +207,39 @@ func dispatch(mode string, schemaDoc schema, st state, stdin string) error {
 		_, _ = fmt.Fprintln(os.Stdout, "{}")
 		return nil
 	}
+}
+
+func repositoryLabels(st state, repo string) []labelState {
+	out := st.RepositoryLabels[repo]
+	if out == nil {
+		return []labelState{}
+	}
+	return out
+}
+
+// handleLabelCreate records a created label. A repeated create keeps the
+// stored wording rather than replacing it: real `gh label create` rejects a
+// duplicate unless --force is passed, and Looper no longer passes --force.
+func handleLabelCreate(st *state, args []string) error {
+	repo := strings.TrimSpace(flagValue(args, "--repo"))
+	name := strings.TrimSpace(firstNonFlag(args[2:]))
+	if repo == "" || name == "" {
+		return nil
+	}
+	for _, existing := range st.RepositoryLabels[repo] {
+		if strings.EqualFold(existing.Name, name) {
+			return nil
+		}
+	}
+	if st.RepositoryLabels == nil {
+		st.RepositoryLabels = map[string][]labelState{}
+	}
+	st.RepositoryLabels[repo] = append(st.RepositoryLabels[repo], labelState{
+		Name:        name,
+		Color:       strings.TrimSpace(flagValue(args, "--color")),
+		Description: strings.TrimSpace(flagValue(args, "--description")),
+	})
+	return saveState(strings.TrimSpace(os.Getenv(envFakeGHStatePath)), *st)
 }
 
 func handlePullRequestMerge(st *state, args []string) error {

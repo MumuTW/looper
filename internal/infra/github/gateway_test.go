@@ -107,6 +107,8 @@ func TestGatewayListsSnapshotsAndReviewsThroughGH(t *testing.T) {
 			return shell.Result{Stdout: `[{"id":7,"content":"eyes","user":{"login":"reviewer"}}]`}, nil
 		case args == "api repos/acme/looper/issues/42/reactions/7 --method DELETE -H Accept: application/vnd.github+json":
 			return shell.Result{Stdout: "{}"}, nil
+		case args == "label list --repo acme/looper --limit 1000 --json name,color,description":
+			return shell.Result{Stdout: `[{"name":"ready","color":"ededed","description":"Hand-written wording"}]`}, nil
 		case args == "pr create --repo acme/looper --head feature --base main --title Add support --body Body":
 			return shell.Result{Stdout: "https://example.test/pull/88\n"}, nil
 		case args == "pr edit 42 --repo acme/looper --title Implement support":
@@ -313,8 +315,8 @@ func TestGatewayListsSnapshotsAndReviewsThroughGH(t *testing.T) {
 		"api repos/acme/looper/issues/8/comments --method POST -f body=Looper started",
 		"api repos/acme/looper/issues/comments/91 --method PATCH -f body=Looper finished",
 		"api repos/acme/looper/issues/8/assignees --method POST -f assignees[]=reviewer",
-		"label create phase-1 --repo acme/looper --color 5319e7 --description Managed by looper --force",
-		"label create ready --repo acme/looper --color 5319e7 --description Managed by looper --force",
+		"label list --repo acme/looper --limit 1000 --json name,color,description",
+		"label create phase-1 --repo acme/looper --color 5319e7 --description Managed by looper",
 		"api repos/acme/looper/issues/42/labels --method POST -f labels[]=phase-1 -f labels[]=ready",
 		"api repos/acme/looper/issues/42/labels/needs-work --method DELETE",
 		"api repos/acme/looper/pulls/42/requested_reviewers --method POST -f reviewers[]=reviewer",

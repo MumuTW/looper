@@ -3373,14 +3373,42 @@ func (g *Gateway) getReviewThread(ctx context.Context, threadID, cwd string) (*r
 // and falls back to a neutral default for anything else — a project may
 // configure its own trigger labels, and those have no entry in the table.
 func (g *Gateway) ensureLabelsExist(ctx context.Context, repo string, wanted []string, cwd string) error {
+	pending := make([]string, 0, len(wanted))
 	seen := map[string]struct{}{}
 	for _, label := range wanted {
-		if _, ok := seen[label]; ok {
+		normalized := labels.Normalize(label)
+		if normalized == "" {
 			continue
 		}
-		seen[label] = struct{}{}
+		if _, duplicate := seen[normalized]; duplicate {
+			continue
+		}
+		seen[normalized] = struct{}{}
+		pending = append(pending, label)
+	}
+	if len(pending) == 0 {
+		return nil
+	}
+
+	// Read before writing, rather than creating with --force. --force updates
+	// an existing label in place, so applying a label also rewrote its color
+	// and description from this table on every call — quietly replacing
+	// wording a maintainer had chosen in the forge. Looper needs the label to
+	// exist; it has no claim on how an existing one reads.
+	//
+	// This costs one list call and saves one create per label that already
+	// exists, so the common case where every label is present is no more
+	// round trips than before.
+	existing, err := g.listRepositoryLabels(ctx, repo, cwd)
+	if err != nil {
+		return err
+	}
+	for _, label := range pending {
+		if _, ok := existing[labels.Normalize(label)]; ok {
+			continue
+		}
 		definition := labelPresentation(label)
-		if _, err := g.runGh(ctx, cwd, "", "label", "create", label, "--repo", repo, "--color", definition.Color, "--description", definition.Description, "--force"); err != nil {
+		if _, err := g.runGh(ctx, cwd, "", "label", "create", label, "--repo", repo, "--color", definition.Color, "--description", definition.Description); err != nil {
 			return err
 		}
 	}
