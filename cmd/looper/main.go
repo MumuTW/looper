@@ -81,6 +81,9 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if parsed.Verb == "--version" || parsed.Verb == "version" {
 		return reportError(stderr, runVersion(ctx, parsed.Global, parsed.Operands, stdout, version.Current()))
 	}
+	if parsed.Verb == "upgrade" {
+		return reportError(stderr, runUpgrade(ctx, parsed.Global, parsed.Operands, stdout))
+	}
 
 	// `review` owns its own flag set, and the daemon's trusted review proxy
 	// composes that argv. Routing it before splitGlobalFlags is what keeps
@@ -1342,6 +1345,8 @@ Usage:
   looper version --json        Print the complete local build identity
   looper version --check-daemon
                                Compare local and running-daemon build identity
+  looper upgrade preflight --target-looper <path> --target-looperd <path>
+                               Report upgrade compatibility without changing the daemon
 
 Global flags, accepted before or after the verb:
   --config <path>              Config file to load

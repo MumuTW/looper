@@ -154,6 +154,7 @@ Manual: replace the binaries. Download the newer `looper-<target>.tar.gz` and `l
 - `looper version` and `looperd --version` keep their concise semantic-version output
 - `looper version --json` and `looperd --version-json` print the complete build identity; `dirty` is `null` when a source-tree probe was unavailable rather than claiming the tree was clean
 - `looper version --check-daemon` compares the CLI identity with `GET /api/v1/version` and exits nonzero unless both identities are complete, clean, and every build field matches; dirty or unknown source trees cannot prove equality; add `--json` for a machine-readable `comparable` / `sameBuild` report
+- `looper upgrade preflight --target-looper <path> --target-looperd <path> --json` reads the running daemon's version/status and the candidate binaries' embedded identities without opening or mutating the production database; it reports identity pairing, schema/pending migrations, active work, and quarantine debt before a later cutover step
 - release builds are tag-driven (`vX.Y.Z` / `vX.Y.Z-rc.N`); local default builds use `0.0.0-dev`
 
 ## Uninstall
