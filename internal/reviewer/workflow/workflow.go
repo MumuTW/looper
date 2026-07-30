@@ -7,9 +7,10 @@
 package workflow
 
 import (
+	"slices"
 	"strings"
 
-	"github.com/nexu-io/looper/internal/loops"
+	"github.com/nexu-io/looper/internal/loops/policy"
 )
 
 // Step identifies a stage in the reviewer run pipeline.
@@ -45,14 +46,17 @@ var sequence = []Step{
 	StepPublish,
 }
 
-// Sequence returns the full ordered reviewer step pipeline.
+// Sequence returns the full ordered reviewer step pipeline. The result is a
+// copy: the package-level order is the workflow authority and callers must
+// not be able to reorder it.
 func Sequence() []Step {
-	return sequence
+	return slices.Clone(sequence)
 }
 
 // From returns the step sequence starting at start. An unrecognized (or
 // empty) start step returns the full sequence — start index defaults to 0
-// when no match is found, matching the historical stepsFrom behavior.
+// when no match is found, matching the historical stepsFrom behavior. Like
+// Sequence, the result is a copy rather than a view into the backing array.
 func From(start Step) []Step {
 	startIndex := 0
 	for i, step := range sequence {
@@ -61,7 +65,7 @@ func From(start Step) []Step {
 			break
 		}
 	}
-	return sequence[startIndex:]
+	return slices.Clone(sequence[startIndex:])
 }
 
 // Next returns the step after step, or "" if step is the last step or is
@@ -81,7 +85,7 @@ func Next(step Step) Step {
 // checkpoint.
 //
 // This is a different (and reviewer-specific) test from
-// loops.ShouldRestartFromDiscover, which only consults an explicit
+// policy.ShouldRestartFromDiscover, which only consults an explicit
 // resume-policy value already recorded on the checkpoint. This variant
 // additionally recognizes specific late-step preflight-failure messages
 // (head or review-request drift detected right before publish, or PR change
@@ -126,10 +130,11 @@ type ResumeInput struct {
 	// ManualLoop is true for reviewer loops created for a specific PR by a
 	// human rather than through autonomous discovery.
 	ManualLoop bool
-	// NeedsEligibilityRediscovery reports whether the checkpoint carries
-	// enough discovery detail to resume at startStep without rediscovering
-	// PR eligibility first. May be nil, in which case the override never
-	// fires (treated as false).
+	// NeedsEligibilityRediscovery reports whether PR eligibility must be
+	// rediscovered before the run can resume at startStep — true means the
+	// checkpoint lacks the discovery detail that resuming there would
+	// require, so PlanResume forces the run back to StepDiscover. May be
+	// nil, in which case the override never fires (treated as false).
 	NeedsEligibilityRediscovery func(startStep Step) bool
 }
 
@@ -146,10 +151,6 @@ type ResumePlan struct {
 	// predecessor, including a restart back to discover — it governs agent
 	// snapshot reuse, not step placement.
 	StickySnapshot bool
-	// RestartFromDiscover is true when the plan restarts at discover
-	// because of an explicit policy, a recognized preflight-failure
-	// signal, or an eligibility-rediscovery override.
-	RestartFromDiscover bool
 	// CarryCheckpoint is true when the new run's initial checkpoint should
 	// be seeded from the prior run's checkpoint (with InitialResumePolicy
 	// applied). False means start from a fresh checkpoint carrying only
@@ -173,7 +174,7 @@ func PlanResume(in ResumeInput) ResumePlan {
 	restartFromDiscover := false
 	rerunReview := false
 	if in.HasLatestRun {
-		restartFromDiscover = in.CheckpointResumePolicy == loops.ResumePolicyRestartFromDiscover ||
+		restartFromDiscover = in.CheckpointResumePolicy == policy.ResumePolicyRestartFromDiscover ||
 			ShouldRestartFromDiscover(in.LatestStatus, in.FailedStep, in.FailureSummary)
 		rerunReview = in.CheckpointResumePolicy == ResumePolicyRerunReview
 	}
@@ -195,8 +196,10 @@ func PlanResume(in ResumeInput) ResumePlan {
 	}
 	if startStep != StepDiscover && !in.ManualLoop && in.NeedsEligibilityRediscovery != nil && in.NeedsEligibilityRediscovery(startStep) {
 		startStep = StepDiscover
-		restartFromDiscover = true
 	}
+	// Every path that sets restartFromDiscover also lands startStep on
+	// StepDiscover, so a restart is never a resume: resumed and "restarting
+	// from discover" are mutually exclusive by construction.
 	resumed := failedOrInterrupted && startStep != StepDiscover
 	// stickySnapshot: any continuation of a failed/interrupted predecessor,
 	// including first-step retries.
@@ -206,22 +209,17 @@ func PlanResume(in ResumeInput) ResumePlan {
 		StartStep:           startStep,
 		Resumed:             resumed,
 		StickySnapshot:      stickySnapshot,
-		RestartFromDiscover: restartFromDiscover,
-		InitialResumePolicy: loops.ResumePolicyReplayStep,
+		InitialResumePolicy: policy.ResumePolicyReplayStep,
 	}
 	if resumed {
-		if restartFromDiscover {
-			plan.InitialResumePolicy = loops.ResumePolicyReplayStep
-		} else {
-			plan.CarryCheckpoint = true
-			plan.InitialResumePolicy = loops.ResumePolicyAdvanceFromCheckpoint
-			plan.ClearWorktreePreparedAt = startStep == StepReview
-			plan.CarryLastCompletedStep = in.LastCompletedStep != ""
-			// Fixer-owner invalidation for resume-past-worktree is deferred
-			// until ProcessClaimedItem successfully reacquires the PR lock.
-			// This package cannot do that check — it has no I/O — so the
-			// reviewer applies it itself after PlanResume returns.
-		}
+		plan.CarryCheckpoint = true
+		plan.InitialResumePolicy = policy.ResumePolicyAdvanceFromCheckpoint
+		plan.ClearWorktreePreparedAt = startStep == StepReview
+		plan.CarryLastCompletedStep = in.LastCompletedStep != ""
+		// Fixer-owner invalidation for resume-past-worktree is deferred
+		// until ProcessClaimedItem successfully reacquires the PR lock.
+		// This package cannot do that check — it has no I/O — so the
+		// reviewer applies it itself after PlanResume returns.
 	}
 	return plan
 }
@@ -231,25 +229,35 @@ func PlanResume(in ResumeInput) ResumePlan {
 // classified kind and the resume policy already recorded on that checkpoint
 // (current).
 //
-// This mirrors loops.NormalizeResumePolicy but is not a drop-in
-// replacement: it treats an already-explicit restart_from_discover or
-// rerun_review as sticky — a retryable_after_resume failure never
-// overwrites either — whereas loops.NormalizeResumePolicy unconditionally
-// returns advance_from_checkpoint for that failure kind. internal/loops is
-// shared with the fixer and worker loops and must not gain this
-// reviewer-only guard, so the reviewer semantics live here instead.
+// This is deliberately not a call to policy.NormalizeResumePolicy. That
+// helper returns any non-empty existing policy unchanged and only derives one
+// from failureKind when current is empty, so it can never move a checkpoint
+// off the policy it already carries. The reviewer needs the opposite in two
+// cases, which is the whole reason this function exists:
+//
+//   - retryable_after_resume must overwrite a soft existing policy (for
+//     example replay_step) with advance_from_checkpoint, while treating
+//     restart_from_discover and rerun_review as sticky so a transient retry
+//     cannot downgrade a decision to rediscover or to re-review.
+//   - manual_intervention must overwrite every existing policy, because a
+//     hard hold outranks whatever the previous step recorded.
+//
+// Only the default branch matches policy.NormalizeResumePolicy's
+// preserve-existing behavior. internal/loops is shared with the fixer and
+// worker loops and must not gain these reviewer-only overwrites, so the
+// reviewer semantics live here instead.
 func NextResumePolicyOnFailure(failureKind, current string) string {
 	switch failureKind {
-	case loops.FailureKindRetryableAfterResume:
-		if current != loops.ResumePolicyRestartFromDiscover && current != ResumePolicyRerunReview {
-			return loops.ResumePolicyAdvanceFromCheckpoint
+	case policy.FailureKindRetryableAfterResume:
+		if current != policy.ResumePolicyRestartFromDiscover && current != ResumePolicyRerunReview {
+			return policy.ResumePolicyAdvanceFromCheckpoint
 		}
 		return current
-	case loops.FailureKindManualIntervention:
-		return loops.ResumePolicyManualIntervention
+	case policy.FailureKindManualIntervention:
+		return policy.ResumePolicyManualIntervention
 	default:
 		if current == "" {
-			return loops.ResumePolicyReplayStep
+			return policy.ResumePolicyReplayStep
 		}
 		return current
 	}
@@ -268,5 +276,5 @@ func PreferInMemoryCheckpoint(currentResumePolicy string, pendingReviewMarkerMis
 // resume policy already on the in-memory checkpoint should be carried onto
 // the checkpoint chosen for persisting after a failure.
 func CarryRestartFromDiscover(currentResumePolicy string) bool {
-	return currentResumePolicy == loops.ResumePolicyRestartFromDiscover
+	return currentResumePolicy == policy.ResumePolicyRestartFromDiscover
 }
