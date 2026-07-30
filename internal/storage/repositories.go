@@ -884,6 +884,57 @@ func (r *RunsRepository) Upsert(ctx context.Context, record RunRecord) error {
 	return nil
 }
 
+// AppendCheckpointSecondaryIssue appends one issue to $.outcome.secondaryIssues.
+//
+// Append rather than read-modify-write for the same reason the other merges exist:
+// terminal cleanup runs after the run is written, so writing back a whole outcome
+// would erase whatever a concurrent transition stored. json_insert with '$[#]'
+// appends to the existing array, and the outcome/array are created when absent.
+//
+// The CASE guard normalizes a non-object checkpoint_json to an empty object; see
+// MergeRunResumePolicy for why the column cannot be trusted to hold one.
+func (r *RunsRepository) AppendCheckpointSecondaryIssue(ctx context.Context, id, issueJSON, updatedAt string) error {
+	result, err := r.q.ExecContext(ctx, `
+		WITH base(doc) AS (
+			SELECT CASE
+				WHEN json_valid(checkpoint_json) AND json_type(checkpoint_json) = 'object'
+					THEN checkpoint_json
+				ELSE '{}'
+			END
+			FROM runs WHERE id = ?
+		)
+		UPDATE runs
+		SET checkpoint_json = (
+				SELECT json_set(
+					doc,
+					'$.outcome.secondaryIssues',
+					json_insert(
+						CASE
+							WHEN json_type(doc, '$.outcome.secondaryIssues') = 'array'
+								THEN json_extract(doc, '$.outcome.secondaryIssues')
+							ELSE json('[]')
+						END,
+						'$[#]', json(?)
+					)
+				)
+				FROM base
+			),
+			updated_at = ?
+		WHERE id = ?
+	`, id, issueJSON, updatedAt, id)
+	if err != nil {
+		return fmt.Errorf("append run checkpoint secondary issue: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read appended run checkpoint secondary issue rows: %w", err)
+	}
+	if affected == 0 {
+		return fmt.Errorf("append run checkpoint secondary issue: run not found: %s", id)
+	}
+	return nil
+}
+
 // MergeRunResumePolicy rewrites only the checkpoint's resume policy.
 //
 // The retry-policy writers read a run, change this one field, and would otherwise

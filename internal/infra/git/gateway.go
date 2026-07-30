@@ -276,9 +276,6 @@ func (g *Gateway) CreateWorktree(ctx context.Context, input CreateWorktreeInput)
 		}
 	}
 
-	// Keep common build artifacts (e.g. .pnpm-store/, node_modules/) out of every
-	// loop commit via the worktree-local git exclude file. Best-effort.
-	g.applyWorktreeArtifactExcludes(ctx, worktreePath)
 	// Any CreateWorktree claim invalidates prior fixer ownership so path equality
 	// alone cannot authorize dirty adopt after another runner used this directory.
 	// Fail the claim if the marker cannot be revoked — stale authority is worse
@@ -398,7 +395,6 @@ func (g *Gateway) RestoreWorktree(ctx context.Context, input RestoreWorktreeInpu
 					if err := g.repos.Worktrees.Upsert(ctx, restored); err != nil {
 						return nil, fmt.Errorf("upsert restored worktree record: %w", err)
 					}
-					g.applyWorktreeArtifactExcludes(ctx, restored.WorktreePath)
 					// Restoring for a new CreateWorktree claim drops prior fixer ownership.
 					if err := worktreesafety.ClearFixerOwnerToken(restored.WorktreePath); err != nil {
 						return nil, err
@@ -505,7 +501,6 @@ func (g *Gateway) RestoreWorktree(ctx context.Context, input RestoreWorktreeInpu
 		}
 	}
 
-	g.applyWorktreeArtifactExcludes(ctx, record.WorktreePath)
 	if err := worktreesafety.ClearFixerOwnerToken(record.WorktreePath); err != nil {
 		return nil, err
 	}
@@ -805,25 +800,44 @@ func (g *Gateway) Commit(ctx context.Context, input CommitInput) (CommitResult, 
 		// Stage exactly the declared paths so exploratory or undeclared changes
 		// are not swept into a commit that is supposed to carry only the
 		// declared artifacts. `--` keeps paths literal (no pathspec options).
-		addArgs := []string{"add"}
-		// The reproduction manifest is a daemon-owned required artifact. Target
-		// repositories commonly ignore .looper/, so normal selected-path staging
-		// would fail even though the exact path is intentionally part of this
-		// commit. Keep force limited to that control file rather than broadening
-		// staging for arbitrary agent output.
+		ordinaryPaths := make([]string, 0, len(input.Paths))
+		manifestPaths := make([]string, 0, 1)
 		for _, path := range input.Paths {
-			if filepath.ToSlash(path) == ".looper/reproduction.json" {
-				addArgs = append(addArgs, "-f")
-				break
+			if filepath.ToSlash(filepath.Clean(path)) == ".looper/reproduction.json" {
+				manifestPaths = append(manifestPaths, path)
+			} else {
+				ordinaryPaths = append(ordinaryPaths, path)
 			}
 		}
-		addArgs = append(addArgs, "--")
-		addArgs = append(addArgs, input.Paths...)
-		if err := g.runGit(ctx, input.WorktreePath, nil, addArgs...); err != nil {
+		if len(ordinaryPaths) > 0 {
+			addArgs := append([]string{"add", "--"}, ordinaryPaths...)
+			if err := g.runGit(ctx, input.WorktreePath, nil, addArgs...); err != nil {
+				return CommitResult{}, err
+			}
+		}
+		// The reproduction manifest is daemon-owned and mandatory even when the
+		// target ignores .looper/. Force-add only that exact control file; using
+		// -f for the shared invocation would also publish ignored agent-declared
+		// files such as credentials.
+		if len(manifestPaths) > 0 {
+			addArgs := append([]string{"add", "-f", "--"}, manifestPaths...)
+			if err := g.runGit(ctx, input.WorktreePath, nil, addArgs...); err != nil {
+				return CommitResult{}, err
+			}
+		}
+	} else {
+		// Stage in two steps so artifact filtering has exactly info/exclude
+		// semantics without touching any shared repository state (#71): tracked
+		// files — including intentionally tracked dist/ etc. — always stage, and
+		// only UNTRACKED build artifacts are excluded, scoped to this operation
+		// via pathspecs.
+		if err := g.runGit(ctx, input.WorktreePath, nil, "add", "-u"); err != nil {
 			return CommitResult{}, err
 		}
-	} else if err := g.runGit(ctx, input.WorktreePath, nil, "add", "-A"); err != nil {
-		return CommitResult{}, err
+		addAll := append([]string{"add", "-A", "--", "."}, artifactExcludePathspecs()...)
+		if err := g.runGit(ctx, input.WorktreePath, nil, addAll...); err != nil {
+			return CommitResult{}, err
+		}
 	}
 	if err := g.runGit(ctx, input.WorktreePath, nil, "commit", "-m", input.Message); err != nil {
 		return CommitResult{}, err
@@ -1143,67 +1157,37 @@ var worktreeArtifactExcludePatterns = []string{
 
 const worktreeExcludeManagedHeader = "# looper: build-artifact excludes (managed; safe to remove)"
 
-// applyWorktreeArtifactExcludes appends looper's build-artifact ignore patterns
-// to the worktree's git exclude file (info/exclude). That file is local to this
-// clone and is never committed, so it cannot alter the repo's tracked files or
-// its .gitignore. The write is idempotent (patterns already present are skipped)
-// and best-effort: any failure is swallowed so it never blocks a loop worktree.
-func (g *Gateway) applyWorktreeArtifactExcludes(ctx context.Context, worktreePath string) {
-	if strings.TrimSpace(worktreePath) == "" {
-		return
-	}
-	result, err := g.runGitResult(ctx, worktreePath, nil, "rev-parse", "--git-path", "info/exclude")
-	if err != nil {
-		return
-	}
-	excludePath := strings.TrimSpace(result.Stdout)
-	if excludePath == "" {
-		return
-	}
-	if !filepath.IsAbs(excludePath) {
-		excludePath = filepath.Join(worktreePath, excludePath)
-	}
-
-	existing, err := os.ReadFile(excludePath)
-	if err != nil && !os.IsNotExist(err) {
-		return
-	}
-	existingText := string(existing)
-
-	missing := make([]string, 0, len(worktreeArtifactExcludePatterns))
+// artifactExcludePathspecs converts worktreeArtifactExcludePatterns into
+// git exclude pathspecs for one staging invocation. Each gitignore-style
+// pattern becomes a root and an any-depth glob so semantics match ignores.
+func artifactExcludePathspecs() []string {
+	specs := make([]string, 0, len(worktreeArtifactExcludePatterns)*2)
 	for _, pattern := range worktreeArtifactExcludePatterns {
-		if !worktreeExcludeContainsPattern(existingText, pattern) {
-			missing = append(missing, pattern)
+		if strings.HasSuffix(pattern, "/") {
+			name := strings.TrimSuffix(pattern, "/")
+			specs = append(specs, ":(exclude,glob)"+name+"/**", ":(exclude,glob)**/"+name+"/**")
+			continue
 		}
+		specs = append(specs, ":(exclude,glob)"+pattern, ":(exclude,glob)**/"+pattern)
 	}
-	if len(missing) == 0 {
-		return
-	}
-
-	if err := os.MkdirAll(filepath.Dir(excludePath), 0o755); err != nil {
-		return
-	}
-	var builder strings.Builder
-	builder.WriteString(existingText)
-	if existingText != "" && !strings.HasSuffix(existingText, "\n") {
-		builder.WriteByte('\n')
-	}
-	if !strings.Contains(existingText, worktreeExcludeManagedHeader) {
-		builder.WriteString(worktreeExcludeManagedHeader)
-		builder.WriteByte('\n')
-	}
-	for _, pattern := range missing {
-		builder.WriteString(pattern)
-		builder.WriteByte('\n')
-	}
-	_ = os.WriteFile(excludePath, []byte(builder.String()), 0o644)
+	return specs
 }
 
-// worktreeExcludeContainsPattern reports whether pattern already appears as its
-// own line in the exclude file (ignoring surrounding whitespace).
-func worktreeExcludeContainsPattern(content, pattern string) bool {
-	for _, line := range strings.Split(content, "\n") {
-		if strings.TrimSpace(line) == pattern {
+// isArtifactExcludedUntrackedPath reports whether an UNTRACKED status path
+// matches looper's artifact patterns. Only untracked entries are filtered —
+// tracked files under these paths keep appearing in status, exactly like a
+// gitignore would behave.
+func isArtifactExcludedUntrackedPath(path string) bool {
+	normalized := strings.TrimPrefix(filepath.ToSlash(strings.TrimSpace(path)), "./")
+	for _, pattern := range worktreeArtifactExcludePatterns {
+		if strings.HasSuffix(pattern, "/") {
+			name := strings.TrimSuffix(pattern, "/")
+			if normalized == name || strings.HasPrefix(normalized, name+"/") || strings.Contains(normalized, "/"+name+"/") {
+				return true
+			}
+			continue
+		}
+		if matched, _ := filepath.Match(pattern, filepath.Base(normalized)); matched {
 			return true
 		}
 	}

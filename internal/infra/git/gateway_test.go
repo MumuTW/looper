@@ -223,7 +223,7 @@ func TestGatewayWorktreeCleanIgnoresIgnoredFiles(t *testing.T) {
 	}
 }
 
-func TestGatewayWorktreeExcludesBuildArtifactsFromCommits(t *testing.T) {
+func TestGatewayCommitExcludesArtifactsWithoutTouchingSharedExcludes(t *testing.T) {
 	ctx := context.Background()
 	fixture := newFixture(t)
 	fixture.createMainOnlyRepo(t)
@@ -240,49 +240,128 @@ func TestGatewayWorktreeExcludesBuildArtifactsFromCommits(t *testing.T) {
 		t.Fatalf("CreateWorktree() error = %v", err)
 	}
 
-	// The worktree's info/exclude must carry looper's artifact patterns.
-	excludeRelPath := stringsTrimSpace(runGit(t, worktree.WorktreePath, "rev-parse", "--git-path", "info/exclude"))
-	excludePath := excludeRelPath
-	if !filepath.IsAbs(excludePath) {
-		excludePath = filepath.Join(worktree.WorktreePath, excludeRelPath)
+	// #71: creating a looper worktree must not write into the repository's
+	// COMMON .git/info/exclude — in a linked worktree that file is shared with
+	// the main checkout and every sibling.
+	commonExcludeRel := stringsTrimSpace(runGit(t, fixture.repoPath, "rev-parse", "--git-path", "info/exclude"))
+	commonExclude := commonExcludeRel
+	if !filepath.IsAbs(commonExclude) {
+		commonExclude = filepath.Join(fixture.repoPath, commonExcludeRel)
 	}
-	excludeContent := readFile(t, excludePath)
-	for _, pattern := range []string{".pnpm-store/", "node_modules/", ".turbo/", "dist/", ".next/", ".cache/", "*.log"} {
-		if !strings.Contains(excludeContent, "\n"+pattern) && !strings.HasPrefix(excludeContent, pattern) {
-			t.Fatalf("info/exclude missing pattern %q; content = %q", pattern, excludeContent)
+	if raw, err := os.ReadFile(commonExclude); err == nil {
+		for _, pattern := range []string{".pnpm-store/", "node_modules/", "dist/", "*.log"} {
+			if strings.Contains(string(raw), pattern) {
+				t.Fatalf("common info/exclude contains looper pattern %q after CreateWorktree; shared developer ignore policy was mutated", pattern)
+			}
 		}
 	}
 
-	// The real-world failure: `git add -A` must NOT stage a 100MB+ .pnpm-store,
-	// while ordinary source is still staged.
+	// The real-world failure: looper's fallback commit must NOT stage a
+	// 100MB+ .pnpm-store, while ordinary source (including nested) is staged.
 	mustMkdirAll(t, filepath.Join(worktree.WorktreePath, ".pnpm-store", "v3"))
 	writeFile(t, filepath.Join(worktree.WorktreePath, ".pnpm-store", "v3", "huge.bin"), "artifact\n")
 	mustMkdirAll(t, filepath.Join(worktree.WorktreePath, "node_modules"))
 	writeFile(t, filepath.Join(worktree.WorktreePath, "node_modules", "dep.js"), "module\n")
+	mustMkdirAll(t, filepath.Join(worktree.WorktreePath, "sub", "logs"))
+	writeFile(t, filepath.Join(worktree.WorktreePath, "sub", "logs", "run.log"), "log\n")
 	writeFile(t, filepath.Join(worktree.WorktreePath, "app.ts"), "export const x = 1\n")
+	mustMkdirAll(t, filepath.Join(worktree.WorktreePath, "src"))
+	writeFile(t, filepath.Join(worktree.WorktreePath, "src", "lib.ts"), "export const y = 2\n")
 
-	runGit(t, worktree.WorktreePath, "add", "-A")
-	staged := runGit(t, worktree.WorktreePath, "diff", "--cached", "--name-only")
-	if !strings.Contains(staged, "app.ts") {
-		t.Fatalf("git add -A did not stage source app.ts; staged = %q", staged)
+	if _, err := gateway.Commit(ctx, CommitInput{RepoPath: fixture.repoPath, WorktreeRoot: fixture.worktreeRoot, WorktreePath: worktree.WorktreePath, Message: "fallback commit"}); err != nil {
+		t.Fatalf("Commit() error = %v", err)
 	}
-	if strings.Contains(staged, ".pnpm-store") || strings.Contains(staged, "node_modules") {
-		t.Fatalf("git add -A staged an excluded build artifact; staged = %q", staged)
+	committed := runGit(t, worktree.WorktreePath, "show", "--name-only", "--format=", "HEAD")
+	for _, want := range []string{"app.ts", "src/lib.ts"} {
+		if !strings.Contains(committed, want) {
+			t.Fatalf("commit missing source %q; files = %q", want, committed)
+		}
+	}
+	for _, banned := range []string{".pnpm-store", "node_modules", "run.log"} {
+		if strings.Contains(committed, banned) {
+			t.Fatalf("commit contains excluded artifact %q; files = %q", banned, committed)
+		}
+	}
+	// The artifacts stay untracked (not deleted, not staged).
+	rawStatus := runGit(t, worktree.WorktreePath, "status", "--porcelain", "--untracked-files=all")
+	if !strings.Contains(rawStatus, ".pnpm-store/v3/huge.bin") {
+		t.Fatalf("artifact vanished from raw git status: %q", rawStatus)
 	}
 
-	// Idempotent: re-creating (which restores the existing worktree) must not
-	// duplicate the exclude patterns.
-	if _, err := gateway.CreateWorktree(ctx, CreateWorktreeInput{
-		ProjectID:    fixture.projectID,
-		RepoPath:     fixture.repoPath,
-		WorktreeRoot: fixture.worktreeRoot,
-		Branch:       "feature/pnpm",
-		BaseBranch:   "main",
+	// Main checkout and its status are untouched.
+	if mainStatus := runGit(t, fixture.repoPath, "status", "--porcelain"); strings.TrimSpace(mainStatus) != "" {
+		t.Fatalf("main checkout dirty after worktree commit: %q", mainStatus)
+	}
+
+	// Repositories that intentionally track these paths remain supported:
+	// tracked artifact-path files still stage their modifications, while an
+	// untracked neighbor stays excluded.
+	mustMkdirAll(t, filepath.Join(worktree.WorktreePath, "dist"))
+	writeFile(t, filepath.Join(worktree.WorktreePath, "dist", "keep.js"), "v1\n")
+	runGit(t, worktree.WorktreePath, "add", "-f", "dist/keep.js")
+	runGit(t, worktree.WorktreePath, "commit", "-m", "track dist artifact")
+	writeFile(t, filepath.Join(worktree.WorktreePath, "dist", "keep.js"), "v2\n")
+	writeFile(t, filepath.Join(worktree.WorktreePath, "dist", "junk.js"), "junk\n")
+	if _, err := gateway.Commit(ctx, CommitInput{RepoPath: fixture.repoPath, WorktreeRoot: fixture.worktreeRoot, WorktreePath: worktree.WorktreePath, Message: "update tracked artifact"}); err != nil {
+		t.Fatalf("Commit(tracked artifact) error = %v", err)
+	}
+	committed = runGit(t, worktree.WorktreePath, "show", "--name-only", "--format=", "HEAD")
+	if !strings.Contains(committed, "dist/keep.js") {
+		t.Fatalf("tracked artifact modification not committed; files = %q", committed)
+	}
+	if strings.Contains(committed, "dist/junk.js") {
+		t.Fatalf("untracked artifact neighbor was committed; files = %q", committed)
+	}
+}
+
+func TestGatewayCommitForceAddsOnlyTheReproductionManifest(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	fixture.createMainOnlyRepo(t)
+	gateway := fixture.gateway()
+
+	worktree, err := gateway.CreateWorktree(ctx, CreateWorktreeInput{
+		ProjectID: fixture.projectID, RepoPath: fixture.repoPath, WorktreeRoot: fixture.worktreeRoot,
+		Branch: "feature/reproduction", BaseBranch: "main",
+	})
+	if err != nil {
+		t.Fatalf("CreateWorktree() error = %v", err)
+	}
+	writeFile(t, filepath.Join(worktree.WorktreePath, ".gitignore"), ".looper/\n.env\n")
+	runGit(t, worktree.WorktreePath, "add", ".gitignore")
+	runGit(t, worktree.WorktreePath, "commit", "-m", "ignore local control files")
+
+	mustMkdirAll(t, filepath.Join(worktree.WorktreePath, ".looper"))
+	writeFile(t, filepath.Join(worktree.WorktreePath, ".looper", "reproduction.json"), "{}\n")
+	writeFile(t, filepath.Join(worktree.WorktreePath, "bug_test.go"), "package bug\n")
+	writeFile(t, filepath.Join(worktree.WorktreePath, ".env"), "SECRET=do-not-publish\n")
+
+	_, err = gateway.Commit(ctx, CommitInput{
+		RepoPath: fixture.repoPath, WorktreeRoot: fixture.worktreeRoot, WorktreePath: worktree.WorktreePath,
+		Message: "reproduce bug", Paths: []string{"bug_test.go", ".looper/reproduction.json", ".env"},
+	})
+	if err == nil {
+		t.Fatal("Commit() error = nil, want ignored agent-declared file to be rejected")
+	}
+	if staged := runGitMaybe(t, worktree.WorktreePath, "diff", "--cached", "--name-only", "--", ".env"); strings.TrimSpace(staged) != "" {
+		t.Fatalf("ignored agent-declared file was staged: %q", staged)
+	}
+
+	runGit(t, worktree.WorktreePath, "reset")
+	if _, err := gateway.Commit(ctx, CommitInput{
+		RepoPath: fixture.repoPath, WorktreeRoot: fixture.worktreeRoot, WorktreePath: worktree.WorktreePath,
+		Message: "reproduce bug", Paths: []string{"bug_test.go", ".looper/reproduction.json"},
 	}); err != nil {
-		t.Fatalf("CreateWorktree() second call error = %v", err)
+		t.Fatalf("Commit(manifest) error = %v", err)
 	}
-	if got := strings.Count(readFile(t, excludePath), ".pnpm-store/"); got != 1 {
-		t.Fatalf(".pnpm-store/ appears %d times in info/exclude, want 1 (idempotent)", got)
+	committed := runGit(t, worktree.WorktreePath, "show", "--name-only", "--format=", "HEAD")
+	for _, want := range []string{"bug_test.go", ".looper/reproduction.json"} {
+		if !strings.Contains(committed, want) {
+			t.Fatalf("commit missing %q; files = %q", want, committed)
+		}
+	}
+	if strings.Contains(committed, ".env") {
+		t.Fatalf("commit contains ignored credential file; files = %q", committed)
 	}
 }
 

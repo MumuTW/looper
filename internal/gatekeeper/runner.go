@@ -21,6 +21,13 @@ const (
 	StatusEligible      = "eligible"
 	StatusBlocked       = "blocked"
 	reportVersion       = 1
+
+	// DefaultDiscoveryPullRequestLimit is how many open pull requests this lane
+	// lists when the caller sets no limit. Exported because the scheduler sizes its
+	// shared discovery snapshot from it: a snapshot page smaller than this always
+	// fails the snapshot's truncation check, so the lane discards the page and
+	// issues its own raw query, paying for both.
+	DefaultDiscoveryPullRequestLimit = 100
 )
 
 type ReasonCode string
@@ -165,7 +172,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 	}
 	limit := input.Limit
 	if limit <= 0 {
-		limit = 100
+		limit = DefaultDiscoveryPullRequestLimit
 	}
 	if strings.TrimSpace(input.CWD) == "" {
 		input.CWD = r.projectCWD(ctx, input.ProjectID)

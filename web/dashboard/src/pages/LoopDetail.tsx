@@ -15,6 +15,7 @@ import { Card } from "@/components/ui/card";
 import {
   formatDurableProgress,
   formatPrimaryFailure,
+  formatSecondaryIssues,
 } from "@/lib/fixerOutcome";
 import {
   fetchLoop,
@@ -419,6 +420,10 @@ export function LoopDetailPage() {
     () => formatDurableProgress(data?.outcome),
     [data?.outcome],
   );
+  const secondaryIssues = useMemo(
+    () => formatSecondaryIssues(data?.outcome),
+    [data?.outcome],
+  );
 
   const hasActiveRun = useMemo(() => {
     if (!data) return false;
@@ -549,6 +554,30 @@ export function LoopDetailPage() {
                   data.outcome?.partialSuccess ? "Kept (partial)" : "Kept"
                 }
                 value={durableProgress ?? "—"}
+              />
+              {/*
+                Problems around the run's own result -- a refused cleanup, a failure
+                while parking. Kept separate from "First failure" so the causal one
+                stays easy to find.
+              */}
+              <Kv
+                label="Also"
+                value={
+                  secondaryIssues ? (
+                    <ul className="m-0 list-none space-y-0.5 p-0">
+                      {secondaryIssues.map((issue) => (
+                        <li
+                          key={issue}
+                          className="whitespace-pre-wrap break-words"
+                        >
+                          {issue}
+                        </li>
+                      ))}
+                    </ul>
+                  ) : (
+                    "—"
+                  )
+                }
               />
               <Kv label="Last run" value={formatTs(data.lastRunAt)} />
               <Kv label="Next run" value={formatTs(data.nextRunAt)} />
