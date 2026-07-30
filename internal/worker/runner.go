@@ -1230,24 +1230,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		}
 		return ProcessResult{}, err
 	}
-	unlockRequeue := loops.LockLoopRequeue(loop.ID)
-	_, err = r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
-		// A free-text message that arrived during this turn was preserved by
-		// acknowledgement, but nothing else will deliver it: the enqueue path
-		// saw the loop running and deliberately did not wake it. Requeue
-		// instead of completing so the next turn drains the survivors.
-		if len(loops.ReadHumanInbox(updated.MetadataJSON)) > 0 {
-			updated.Status = "queued"
-			nextRunAt := r.nowISO()
-			updated.NextRunAt = &nextRunAt
-		} else {
-			updated.Status = "completed"
-			updated.NextRunAt = nil
-		}
-		updated.LastRunAt = stringPtr(r.nowISO())
-	})
-	unlockRequeue()
-	if err != nil {
+	if _, err := r.finalizeCompletedHumanInboxTurn(ctx, loop.ID, queueItem.ID); err != nil {
 		return ProcessResult{}, err
 	}
 	finalIssueClaimStatus := issueClaimStatusSuccess
@@ -1361,23 +1344,11 @@ func (r *Runner) stopObsoleteResumedIssueRun(ctx context.Context, project storag
 			}
 			return ProcessResult{}, true, err
 		}
-		unlockRequeue := loops.LockLoopRequeue(loop.ID)
-		_, err = r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
-			// Same survivor rule as the main completion transition: preserved
-			// but undelivered inbox messages requeue the loop instead of
-			// completing it.
-			if len(loops.ReadHumanInbox(updated.MetadataJSON)) > 0 {
-				updated.Status = "queued"
-				nextRunAt := r.nowISO()
-				updated.NextRunAt = &nextRunAt
-			} else {
-				updated.Status = "completed"
-				updated.NextRunAt = nil
-			}
+		if _, err = r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
+			updated.Status = "completed"
+			updated.NextRunAt = nil
 			updated.LastRunAt = stringPtr(r.nowISO())
-		})
-		unlockRequeue()
-		if err != nil {
+		}); err != nil {
 			return ProcessResult{}, true, err
 		}
 		r.syncIssueClaim(ctx, stepInput{Project: project, Loop: loop, Run: completedRun, QueueItem: queueItem}, checkpoint, issueClaimStatusPaused, summary)
@@ -1838,12 +1809,7 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 		// answer that seeded it has been acted on. Flip it to "consumed" now — after
 		// the turn, never before — so a failed/timed-out turn re-reads the answer on
 		// retry, while a successful one never re-injects it on a later run.
-		if r.hitlEnabled {
-			r.markHumanAnswerConsumed(ctx, &input.Loop)
-			r.acknowledgeHumanInbox(ctx, &input.Loop, includedHumanInbox)
-			_, _ = r.requeueForSurvivingHumanInbox(ctx, input.Loop.ID)
-		}
-		r.markTakeoverResumeConsumed(ctx, &input.Loop)
+		r.acknowledgePostTurnMetadata(ctx, &input.Loop, includedHumanInbox)
 		if err := validateCompletedExecutionCheckpoint(&checkpointExecution{Status: result.Status, Summary: result.Summary, ParseStatus: result.ParseStatus}); err != nil {
 			return checkpoint, err
 		}
@@ -2552,6 +2518,13 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 	}
 	startStep := stepPrepareWork
 	resumedCheckpoint := checkpoint
+	// A successful worker normally has no follow-up turn. A survivor in the
+	// human inbox is the exception: keep its work/session context but clear the
+	// completed execution so the next queued claim actually starts the agent.
+	if latestRun != nil && latestRun.Status == "success" && r.hitlEnabled && len(loops.ReadHumanInbox(loop.MetadataJSON)) > 0 {
+		resumedCheckpoint.Execution = nil
+		resumedCheckpoint.Validation = nil
+	}
 	if latestRun != nil && (latestRun.Status == "failed" || latestRun.Status == "interrupted") && !loops.IsManualHoldResumePolicy(checkpoint.ResumePolicy) && lastCompletedStep != "" {
 		if restartFromDiscover {
 			startStep = stepPrepareWork

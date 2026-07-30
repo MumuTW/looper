@@ -212,42 +212,10 @@ func (r *Runner) latestNativeSessionID(ctx context.Context, loopID, agentVendor 
 	return strings.TrimSpace(*execution.NativeSessionID)
 }
 
-// acknowledgeHumanInbox removes exactly the drained messages after a successful
-// turn so they are not re-injected on a later run, while messages that arrived
-// mid-run — never seen by the agent — stay queued. No-op when nothing was
-// included in the turn or the inbox is empty.
-func (r *Runner) acknowledgeHumanInbox(ctx context.Context, loop *storage.LoopRecord, consumed []loops.HumanMessage) {
-	if r.repos == nil || r.repos.Loops == nil || len(consumed) == 0 {
-		return
-	}
-	// The enqueue path appends under the process-wide per-loop requeue mutex;
-	// holding it across this read-modify-write means a message persisted
-	// between our fresh read and upsert cannot be overwritten.
-	unlock := loops.LockLoopRequeue(loop.ID)
-	defer unlock()
-	fresh, err := r.repos.Loops.GetByID(ctx, loop.ID)
-	if err != nil || fresh == nil {
-		return
-	}
-	if len(loops.ReadHumanInbox(fresh.MetadataJSON)) == 0 {
-		return
-	}
-	meta, werr := loops.AcknowledgeHumanMessages(fresh.MetadataJSON, consumed)
-	if werr != nil {
-		return
-	}
-	fresh.MetadataJSON = &meta
-	fresh.UpdatedAt = r.nowISO()
-	if err := r.repos.Loops.Upsert(ctx, *fresh); err == nil {
-		loop.MetadataJSON = &meta
-	}
-}
-
-// requeueForSurvivingHumanInbox checks if unread human messages remain in the
-// inbox after a turn completes without asking a HITL question. If surviving
-// messages exist and the loop is not awaiting human decision, it flips the loop
-// back to queued so another turn drains them.
-func (r *Runner) requeueForSurvivingHumanInbox(ctx context.Context, loopID string) (bool, error) {
+// finalizeCompletedHumanInboxTurn completes the loop or re-arms the completed
+// queue item for a survivor. It runs after Queue.Complete: requeueing while the
+// old item is still running cannot create an eligible follow-up claim.
+func (r *Runner) finalizeCompletedHumanInboxTurn(ctx context.Context, loopID, queueID string) (bool, error) {
 	if r.repos == nil || r.repos.Loops == nil || r.repos.Queue == nil {
 		return false, nil
 	}
@@ -258,42 +226,81 @@ func (r *Runner) requeueForSurvivingHumanInbox(ctx context.Context, loopID strin
 	if err != nil || fresh == nil {
 		return false, err
 	}
-	if len(loops.ReadHumanInbox(fresh.MetadataJSON)) == 0 || fresh.Status == "awaiting_human" {
+	// A terminal operator action wins over the agent result. It must not be
+	// reopened merely because a late human message exists.
+	if fresh.Status != "running" {
 		return false, nil
 	}
+	unlockTarget := loops.LockLoopTarget(loops.LoopTargetGuardKeyFromRecord(*fresh))
+	defer unlockTarget()
+
 	nowISO := r.nowISO()
-	updated := *fresh
-	updated.Status = "queued"
-	updated.NextRunAt = &nowISO
-	updated.UpdatedAt = nowISO
-	if err := r.repos.Loops.Upsert(ctx, updated); err != nil {
-		return false, err
+	if r.hitlEnabled && len(loops.ReadHumanInbox(fresh.MetadataJSON)) > 0 {
+		requeued, err := r.repos.Queue.RequeueCompletedByID(ctx, loopID, queueID, nowISO)
+		if err != nil {
+			return false, err
+		}
+		if requeued == 0 {
+			return false, fmt.Errorf("requeue completed queue item %s for loop %s: no eligible completed item", queueID, loopID)
+		}
+		fresh.Status = "queued"
+		fresh.NextRunAt = &nowISO
+		fresh.UpdatedAt = nowISO
+		if err := r.repos.Loops.Upsert(ctx, *fresh); err != nil {
+			return false, err
+		}
+		return true, nil
 	}
-	_, err = r.repos.Queue.RequeueLatestCancelledByLoop(ctx, loopID, nowISO)
-	return true, err
+	fresh.Status = "completed"
+	fresh.NextRunAt = nil
+	fresh.LastRunAt = stringPtr(nowISO)
+	fresh.UpdatedAt = nowISO
+	return false, r.repos.Loops.Upsert(ctx, *fresh)
 }
 
-// markTakeoverResumeConsumed clears the takeover-resume marker after a successful
-// resumed turn so it is not re-applied on later runs. No-op when absent.
-func (r *Runner) markTakeoverResumeConsumed(ctx context.Context, loop *storage.LoopRecord) {
+// acknowledgePostTurnMetadata serializes every post-turn metadata mutation
+// with free-text enqueue. A single fresh read and upsert avoids one mutation
+// restoring metadata that an earlier mutation had just preserved.
+func (r *Runner) acknowledgePostTurnMetadata(ctx context.Context, loop *storage.LoopRecord, consumed []loops.HumanMessage) {
 	if r.repos == nil || r.repos.Loops == nil {
 		return
 	}
+	unlock := loops.LockLoopRequeue(loop.ID)
+	defer unlock()
 	fresh, err := r.repos.Loops.GetByID(ctx, loop.ID)
 	if err != nil || fresh == nil {
 		return
 	}
-	if _, ok := loops.ReadTakeoverResume(fresh.MetadataJSON); !ok {
+	meta := fresh.MetadataJSON
+	changed := false
+	if r.hitlEnabled {
+		if ask, ok := loops.ReadHITLAsk(meta); ok && ask.Status == "answered" {
+			ask.Status = "consumed"
+			if updated, werr := loops.WriteHITLAsk(meta, ask); werr == nil {
+				meta = &updated
+				changed = true
+			}
+		}
+		if len(consumed) > 0 {
+			if updated, werr := loops.AcknowledgeHumanMessages(meta, consumed); werr == nil {
+				meta = &updated
+				changed = true
+			}
+		}
+	}
+	if _, ok := loops.ReadTakeoverResume(meta); ok {
+		if updated, werr := loops.ClearTakeoverResume(meta); werr == nil {
+			meta = &updated
+			changed = true
+		}
+	}
+	if !changed {
 		return
 	}
-	meta, werr := loops.ClearTakeoverResume(fresh.MetadataJSON)
-	if werr != nil {
-		return
-	}
-	fresh.MetadataJSON = &meta
+	fresh.MetadataJSON = meta
 	fresh.UpdatedAt = r.nowISO()
 	if err := r.repos.Loops.Upsert(ctx, *fresh); err == nil {
-		loop.MetadataJSON = &meta
+		loop.MetadataJSON = meta
 	}
 }
 
@@ -310,35 +317,6 @@ func (r *Runner) pendingHumanAnswer(ctx context.Context, loop *storage.LoopRecor
 		return resumePrompt + "\nThe configured agent vendor changed after the question was asked, so continue in a fresh session rather than trying to attach to the prior vendor's session.", ""
 	}
 	return resumePrompt, strings.TrimSpace(ask.SessionID)
-}
-
-// markHumanAnswerConsumed flips a delivered human answer from "answered" to
-// "consumed" so it is not re-injected on any later run of the same loop. It is
-// called only after the resumed agent turn completes successfully. No-op when
-// there is no answered ask. Persists against the freshest loop record so it does
-// not clobber concurrent metadata writes. Only called when hitl.enabled is true.
-func (r *Runner) markHumanAnswerConsumed(ctx context.Context, loop *storage.LoopRecord) {
-	if r.repos == nil || r.repos.Loops == nil {
-		return
-	}
-	fresh, err := r.repos.Loops.GetByID(ctx, loop.ID)
-	if err != nil || fresh == nil {
-		return
-	}
-	ask, ok := loops.ReadHITLAsk(fresh.MetadataJSON)
-	if !ok || ask.Status != "answered" {
-		return
-	}
-	ask.Status = "consumed"
-	meta, werr := loops.WriteHITLAsk(fresh.MetadataJSON, ask)
-	if werr != nil {
-		return
-	}
-	fresh.MetadataJSON = &meta
-	fresh.UpdatedAt = r.nowISO()
-	if err := r.repos.Loops.Upsert(ctx, *fresh); err == nil {
-		loop.MetadataJSON = &meta
-	}
 }
 
 // readFreshHITLAsk reads the loop's HITL ask from the freshest persisted record,
