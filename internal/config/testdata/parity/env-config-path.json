@@ -281,6 +281,14 @@
             ],
             "labelMode": "all",
             "requireAssigneeCurrentUser": true
+          },
+          "escalation": {
+            "enabled": false,
+            "maxFilesTouched": 10,
+            "maxPackagesTouched": 3,
+            "onPublicSurfaceChange": true,
+            "onAdrConflict": true,
+            "onUnauthorizedDecision": true
           }
         },
         "reviewer": {

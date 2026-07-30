@@ -412,3 +412,57 @@ func TestHandlerRespondRequiresAnswer(t *testing.T) {
 		t.Fatalf("status = %d, want 400 for empty answer; body=%s", recorder.Code, recorder.Body.String())
 	}
 }
+
+// A Planner loop parked by the pre-spec escalation gate resumes through the same
+// /respond path as a worker's mid-run ask: no new transport, no new endpoint.
+func TestHandlerRespondResumesEscalatedPlannerLoop(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+	projectID := "project_planner_escalation"
+	loopID := "loop_planner_escalation"
+	targetID := "acme/looper:114"
+	repo := "acme/looper"
+	metadata := `{"hitl":{"question":"Authorize Planner to write a spec for acme/looper#114?","options":["proceed: authorize Planner to write the spec","stop: settle this Issue without a spec"],"status":"awaiting","askedAt":"2026-04-11T11:59:00.000Z","transport":"respond"}}`
+
+	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Looper", RepoPath: "/tmp/repos/looper", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 114, ProjectID: projectID, Type: "planner", TargetType: "issue", TargetID: &targetID, Repo: &repo, Status: "awaiting_human", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	cancelReason := "planner suspended awaiting human decision"
+	if err := services.Repositories.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_planner_escalation", ProjectID: &projectID, LoopID: &loopID, Type: "planner", TargetType: "issue", TargetID: targetID, DedupeKey: "planner:escalation", Priority: storage.QueuePriorityPlanner, Status: "cancelled", AvailableAt: nowISO, Attempts: 0, MaxAttempts: 3, LastError: &cancelReason, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/114/respond", strings.NewReader(`{"answer":"proceed, keep it inside internal/planner"}`))
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+
+	loop, err := services.Repositories.Loops.GetByID(context.Background(), loopID)
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = %#v, %v", loop, err)
+	}
+	if loop.Status != "running" {
+		t.Fatalf("loop.Status = %q, want running", loop.Status)
+	}
+	ask, ok := loops.ReadHITLAsk(loop.MetadataJSON)
+	if !ok || ask.Status != "answered" || ask.Answer != "proceed, keep it inside internal/planner" {
+		t.Fatalf("ask = (%#v, %v), want the human's answer stored for the planner resume", ask, ok)
+	}
+	items, err := services.Repositories.Queue.List(context.Background())
+	if err != nil {
+		t.Fatalf("Queue.List() error = %v", err)
+	}
+	for _, item := range items {
+		if item.LoopID != nil && *item.LoopID == loopID && item.Status == "queued" {
+			return
+		}
+	}
+	t.Fatalf("expected the planner queue item requeued; items=%#v", items)
+}

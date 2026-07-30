@@ -1434,6 +1434,30 @@ func mergePlannerRoleConfig(config *PlannerRoleConfig, partial PartialPlannerRol
 	if partial.Agent != nil {
 		mergeRoleAgentConfig(&config.Agent, partial.Agent)
 	}
+	if partial.Escalation != nil {
+		mergePlannerEscalationConfig(&config.Escalation, *partial.Escalation)
+	}
+}
+
+func mergePlannerEscalationConfig(config *PlannerEscalationConfig, partial PartialPlannerEscalationConfig) {
+	if partial.Enabled != nil {
+		config.Enabled = *partial.Enabled
+	}
+	if partial.MaxFilesTouched != nil {
+		config.MaxFilesTouched = *partial.MaxFilesTouched
+	}
+	if partial.MaxPackagesTouched != nil {
+		config.MaxPackagesTouched = *partial.MaxPackagesTouched
+	}
+	if partial.OnPublicSurfaceChange != nil {
+		config.OnPublicSurfaceChange = *partial.OnPublicSurfaceChange
+	}
+	if partial.OnADRConflict != nil {
+		config.OnADRConflict = *partial.OnADRConflict
+	}
+	if partial.OnUnauthorizedDecision != nil {
+		config.OnUnauthorizedDecision = *partial.OnUnauthorizedDecision
+	}
 }
 
 func mergeWorkerRoleConfig(config *WorkerRoleConfig, partial PartialWorkerRoleConfig) {
@@ -1996,6 +2020,10 @@ func clonePartialRoleConfigs(configs *PartialRoleConfigs) *PartialRoleConfigs {
 			planner.Triggers = &triggers
 		}
 		planner.Agent = cloneRoleAgentConfig(configs.Planner.Agent)
+		if configs.Planner.Escalation != nil {
+			escalation := *configs.Planner.Escalation
+			planner.Escalation = &escalation
+		}
 		cloned.Planner = &planner
 	}
 	if configs.Worker != nil {

@@ -541,6 +541,32 @@ type PlannerRoleConfig struct {
 	Triggers      IssueRoleTriggersConfig `json:"triggers"`
 	Instructions  string                  `json:"instructions,omitempty"`
 	Agent         *RoleAgentConfig        `json:"agent,omitempty"`
+	Escalation    PlannerEscalationConfig `json:"escalation"`
+}
+
+// PlannerEscalationConfig is the deterministic policy Planner applies to the
+// pre-spec scope assessment its agent reports after exploring the repository.
+// The agent reports facts; these thresholds — not the model — decide whether the
+// Issue stops for a human before any spec is authored.
+//
+// Enabled defaults to false for the same reason hitl.enabled does: the exit
+// parks work on a human, and it costs one extra agent turn per planner run, so
+// it is opt-in per install and per project.
+type PlannerEscalationConfig struct {
+	Enabled bool `json:"enabled"`
+	// MaxFilesTouched / MaxPackagesTouched escalate when the assessed blast
+	// radius exceeds the threshold. Zero or negative disables that criterion.
+	MaxFilesTouched    int `json:"maxFilesTouched"`
+	MaxPackagesTouched int `json:"maxPackagesTouched"`
+	// OnPublicSurfaceChange escalates when the change alters a public API,
+	// config schema, CLI surface, storage schema, or wire format.
+	OnPublicSurfaceChange bool `json:"onPublicSurfaceChange"`
+	// OnADRConflict escalates when the change contradicts or supersedes a
+	// decision recorded under docs/adr/.
+	OnADRConflict bool `json:"onAdrConflict"`
+	// OnUnauthorizedDecision escalates when the Issue cannot be satisfied
+	// without a decision Planner is not authorized to make.
+	OnUnauthorizedDecision bool `json:"onUnauthorizedDecision"`
 }
 
 type WorkerRoleConfig struct {
@@ -1056,6 +1082,16 @@ type PartialPlannerRoleConfig struct {
 	Triggers      *PartialIssueRoleTriggersConfig `json:"triggers,omitempty"`
 	Instructions  *string                         `json:"instructions,omitempty"`
 	Agent         *RoleAgentConfig                `json:"agent,omitempty"`
+	Escalation    *PartialPlannerEscalationConfig `json:"escalation,omitempty"`
+}
+
+type PartialPlannerEscalationConfig struct {
+	Enabled                *bool `json:"enabled,omitempty"`
+	MaxFilesTouched        *int  `json:"maxFilesTouched,omitempty"`
+	MaxPackagesTouched     *int  `json:"maxPackagesTouched,omitempty"`
+	OnPublicSurfaceChange  *bool `json:"onPublicSurfaceChange,omitempty"`
+	OnADRConflict          *bool `json:"onAdrConflict,omitempty"`
+	OnUnauthorizedDecision *bool `json:"onUnauthorizedDecision,omitempty"`
 }
 
 type PartialWorkerRoleConfig struct {

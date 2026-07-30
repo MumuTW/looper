@@ -220,6 +220,14 @@ func DefaultConfig(cwd string) (Config, error) {
 					LabelMode:                  LabelModeAll,
 					RequireAssigneeCurrentUser: true,
 				},
+				Escalation: PlannerEscalationConfig{
+					Enabled:                false,
+					MaxFilesTouched:        10,
+					MaxPackagesTouched:     3,
+					OnPublicSurfaceChange:  true,
+					OnADRConflict:          true,
+					OnUnauthorizedDecision: true,
+				},
 			},
 			Reviewer: ReviewerRoleConfig{
 				Discovery: ReviewerRoleDiscoveryConfig{

@@ -110,6 +110,7 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 
 	validateInstructions(config, &issues)
 	validateCoordinatorRoleConfig(config.Roles.Coordinator, "roles.coordinator", &issues)
+	validatePlannerEscalation(config.Roles.Planner.Escalation, "roles.planner.escalation", &issues)
 	validateCodingRoleRegistry(config, &issues)
 	if config.Roles.Reviewer.Discovery.SpecReview.IncludeReviewingLabel && strings.TrimSpace(config.Roles.Reviewer.Discovery.SpecReview.ReviewingLabel) == "" {
 		issues = append(issues, ValidationIssue{Path: "roles.reviewer.discovery.specReview.reviewingLabel", Message: "must be a non-empty string when includeReviewingLabel is true"})
@@ -273,6 +274,9 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 		}
 		if project.Roles != nil && project.Roles.Coordinator != nil {
 			validateCoordinatorRoleConfig(effectiveProjectRoles.Coordinator, prefix+".roles.coordinator", &issues)
+		}
+		if project.Roles != nil && project.Roles.Planner != nil && project.Roles.Planner.Escalation != nil {
+			validatePlannerEscalation(effectiveProjectRoles.Planner.Escalation, prefix+".roles.planner.escalation", &issues)
 		}
 		if providerKind == ProviderKindForgejo {
 			validateForgejoRoleCapabilities(effectiveProjectRoles, prefix, &issues)
@@ -710,6 +714,9 @@ func validateProjectRoleOverrides(roles *PartialRoleConfigs, prefix string, maxI
 		validateProjectRoleInstruction(prefix+".planner.instructions", "planner", roles.Planner.Instructions, maxInstructionBytes, issues)
 		if roles.Planner.Triggers != nil {
 			validateIssueRoleTriggers(partialIssueRoleTriggers(*roles.Planner.Triggers), prefix+".planner.triggers", issues)
+		}
+		if roles.Planner.Escalation != nil {
+			validatePartialPlannerEscalation(*roles.Planner.Escalation, prefix+".planner.escalation", issues)
 		}
 	}
 	if roles.Worker != nil {
@@ -1194,6 +1201,33 @@ func validatePartialReviewerAutoMerge(partial PartialReviewerAutoMergeConfig, pa
 	}
 	if partial.Scope != nil && *partial.Scope != ReviewerAutoMergeScopeLooperOnly {
 		*issues = append(*issues, ValidationIssue{Path: path + ".scope", Message: fmt.Sprintf("must be %s", ReviewerAutoMergeScopeLooperOnly)})
+	}
+}
+
+// validatePlannerEscalation rejects a policy that is enabled but can never
+// fire. "Enabled with every criterion off" is a silent no-op that costs an
+// agent turn per planner run, so it is a startup error rather than a surprise.
+func validatePlannerEscalation(escalation PlannerEscalationConfig, path string, issues *[]ValidationIssue) {
+	if escalation.MaxFilesTouched < 0 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".maxFilesTouched", Message: "must be zero (disabled) or a positive integer"})
+	}
+	if escalation.MaxPackagesTouched < 0 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".maxPackagesTouched", Message: "must be zero (disabled) or a positive integer"})
+	}
+	if !escalation.Enabled {
+		return
+	}
+	if escalation.MaxFilesTouched <= 0 && escalation.MaxPackagesTouched <= 0 && !escalation.OnPublicSurfaceChange && !escalation.OnADRConflict && !escalation.OnUnauthorizedDecision {
+		*issues = append(*issues, ValidationIssue{Path: path, Message: "must enable at least one criterion when enabled is true"})
+	}
+}
+
+func validatePartialPlannerEscalation(partial PartialPlannerEscalationConfig, path string, issues *[]ValidationIssue) {
+	if partial.MaxFilesTouched != nil && *partial.MaxFilesTouched < 0 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".maxFilesTouched", Message: "must be zero (disabled) or a positive integer"})
+	}
+	if partial.MaxPackagesTouched != nil && *partial.MaxPackagesTouched < 0 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".maxPackagesTouched", Message: "must be zero (disabled) or a positive integer"})
 	}
 }
 

@@ -1192,6 +1192,35 @@ Common fields:
 - reviewer: `triggers.includeDrafts`, `triggers.requireReviewRequest`, `triggers.enableSelfReview`, `triggers.labels`, `triggers.labelMode`, `specReview.includeReviewingLabel`, `specReview.reviewingLabel`
 - fixer: `triggers.includeDrafts`, `triggers.authorFilter` (`current_user` or `any`), `triggers.labels`, `triggers.labelMode`
 
+#### `roles.planner.escalation` — pre-spec exit to human review
+
+Planner is the first Role that reads the repository, so it is the first place where "this Issue is not suitable for autonomous work" becomes visible. After the worktree exists and before any spec is authored, Planner's agent reports a structured scope assessment (files and packages the change would touch, whether it alters a public surface, whether it contradicts a `docs/adr/` decision, whether it requires a design decision Planner is not authorized to make). These thresholds — not the model — decide whether the Issue stops.
+
+When a criterion fires the loop parks in `awaiting_human`, a structured `planner.escalation` record is appended to the event log (which criteria fired, the evidence, and the decision requested), and the Issue is not re-planned by later discovery ticks. A human answers through the existing HITL path (`POST /api/v1/loops/{seq}/respond`, or the dashboard): an answer beginning with `stop`, `reject`, `no`, `close`, `decline`, `abort`, `cancel`, `deny`, or `drop` settles the Issue without a spec; anything else authorizes Planner to proceed and is carried into the spec prompt as guidance. An escalation is not a run failure: the queue item is cancelled rather than failed, so no retry is scheduled and no failure accounting is touched.
+
+| field | default | meaning |
+| --- | --- | --- |
+| `enabled` | `false` | Opt-in, like `hitl.enabled`. When false the assessment never runs and Planner behaves exactly as before. |
+| `maxFilesTouched` | `10` | Escalate when the assessed change touches more files than this. `0` disables the criterion. |
+| `maxPackagesTouched` | `3` | Escalate when it touches more packages than this. `0` disables the criterion. |
+| `onPublicSurfaceChange` | `true` | Escalate when it alters a public API, config schema, CLI surface, storage schema, or wire format. |
+| `onAdrConflict` | `true` | Escalate when it contradicts or supersedes a decision recorded under `docs/adr/`. |
+| `onUnauthorizedDecision` | `true` | Escalate when the Issue cannot be satisfied without a decision Planner is not authorized to make. |
+
+Cost: enabling it adds one read-only agent turn per planner run. Enabling it with every criterion disabled is rejected at startup rather than silently paying for a gate that can never fire. Settable per project under `projects[].roles.planner.escalation`; restart-bound.
+
+This is a second, better-informed gate. Triager's pre-code gate is unchanged.
+
+```toml
+[roles.planner.escalation]
+enabled = true
+maxFilesTouched = 10
+maxPackagesTouched = 3
+onPublicSurfaceChange = true
+onAdrConflict = true
+onUnauthorizedDecision = true
+```
+
 Trigger fields are combined with logical AND except Forgejo reviewer labels plus native review requests, which are independent discovery sources and combine as a deduplicated union. Label lists use `labelMode=all` or `labelMode=any`; an empty labels list means no label constraint.
 
 When reviewer `triggers.requireReviewRequest=true` and no reviewer label filter is configured, discovery queries the forge for PRs review-requested from the current user. This avoids missing requested reviews that fall outside the generic open-PR discovery window. On Forgejo, label filters can instead be selected alone or combined with review-request discovery.

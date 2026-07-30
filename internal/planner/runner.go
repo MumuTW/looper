@@ -31,6 +31,7 @@ import (
 const (
 	stepDiscoverIssues  PlannerStep = "discover-issues"
 	stepPrepareWorktree PlannerStep = "prepare-worktree"
+	stepAssessScope     PlannerStep = "assess-scope"
 	stepWriteSpec       PlannerStep = "write-spec"
 	stepPublish         PlannerStep = "publish"
 	stepNotify          PlannerStep = "notify"
@@ -46,7 +47,7 @@ const (
 	defaultIssueLimit   = 30
 )
 
-var plannerStepSequence = []PlannerStep{stepDiscoverIssues, stepPrepareWorktree, stepWriteSpec, stepPublish, stepNotify}
+var plannerStepSequence = []PlannerStep{stepDiscoverIssues, stepPrepareWorktree, stepAssessScope, stepWriteSpec, stepPublish, stepNotify}
 
 type PlannerStep string
 
@@ -388,6 +389,7 @@ type plannerCheckpoint struct {
 	Issue          *checkpointIssue        `json:"issue,omitempty"`
 	ClaimedLockKey string                  `json:"claimedLockKey,omitempty"`
 	Worktree       *checkpointWorktree     `json:"worktree,omitempty"`
+	Scope          *checkpointScope        `json:"scope,omitempty"`
 	WriteSpec      *checkpointWriteSpec    `json:"writeSpec,omitempty"`
 	Lifecycle      *lifecycle.State        `json:"gitPrLifecycle,omitempty"`
 	Publish        *checkpointPublishState `json:"publish,omitempty"`
@@ -414,6 +416,21 @@ type checkpointWorktree struct {
 	Branch     string `json:"branch,omitempty"`
 	BaseBranch string `json:"baseBranch,omitempty"`
 	SpecPath   string `json:"specPath,omitempty"`
+}
+
+// checkpointScope carries the pre-spec scope assessment and, once a human has
+// answered an escalation, the decision that authorized spec authoring. It is
+// checkpointed so a resumed run neither re-runs the assessment nor loses the
+// human's guidance.
+type checkpointScope struct {
+	Assessed           bool             `json:"assessed,omitempty"`
+	Assessment         *ScopeAssessment `json:"assessment,omitempty"`
+	Criteria           []FiredCriterion `json:"criteria,omitempty"`
+	Escalated          bool             `json:"escalated,omitempty"`
+	HumanDecision      string           `json:"humanDecision,omitempty"`
+	HumanAuthorized    bool             `json:"humanAuthorized,omitempty"`
+	HumanDecidedAt     string           `json:"humanDecidedAt,omitempty"`
+	AuthorizedGuidance string           `json:"authorizedGuidance,omitempty"`
 }
 
 type checkpointWriteSpec struct {
@@ -807,6 +824,12 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			if errors.As(err, &holdErr) {
 				return r.finishHeldPlannerQueueItem(ctx, *loop, &run, queueItem, checkpoint, holdErr.summary)
 			}
+			// An escalation is a decision, not a run failure: it never reaches
+			// failure classification, so it cannot increment queue attempts,
+			// schedule a retry, or feed any consecutive-failure accounting.
+			if escalation, ok := asEscalationError(err); ok {
+				return r.suspendForHuman(ctx, stepInput{Project: *project, Loop: *loop, Run: run, QueueItem: queueItem, Checkpoint: checkpoint}, run, checkpoint, escalation)
+			}
 			failure := r.classifyFailureWithBoundary(err, plannerFailureBoundaryForStep(step))
 			latest := r.getLatestCheckpoint(ctx, run, checkpoint)
 			latest.ResumePolicy = loops.NormalizeResumePolicy(string(failure.kind), latest.ResumePolicy)
@@ -893,6 +916,8 @@ func (r *Runner) executeStep(ctx context.Context, step PlannerStep, input stepIn
 		return r.runDiscoverIssueStep(ctx, input)
 	case stepPrepareWorktree:
 		return r.runPrepareWorktreeStep(ctx, input)
+	case stepAssessScope:
+		return r.runAssessScopeStep(ctx, input)
 	case stepWriteSpec:
 		return r.runWriteSpecStep(ctx, input)
 	case stepPublish:
@@ -1025,6 +1050,138 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (p
 	return checkpoint, nil
 }
 
+// escalationPolicyForProject resolves the deterministic escalation thresholds
+// for a project. Absent config the policy is disabled, so the assess-scope step
+// is a no-op and Planner behaves exactly as it did before.
+func (r *Runner) escalationPolicyForProject(projectID string) EscalationPolicy {
+	if r.projectRoleConfig == nil {
+		return EscalationPolicy{}
+	}
+	roles := config.ProjectRoleConfigs(*r.projectRoleConfig, projectID)
+	return escalationPolicyFromConfig(roles.Planner.Escalation)
+}
+
+// runAssessScopeStep is Planner's exit to human review. It runs after the
+// worktree exists (so the agent can read the repository) and before any spec is
+// authored. The agent reports a structured scope assessment; the configured
+// policy — not the model — decides whether the Issue stops here.
+//
+// On resume it first drains a human answer to a prior escalation: an
+// authorization proceeds to spec authoring carrying the human's guidance, a
+// rejection settles the Issue through the existing skip path.
+func (r *Runner) runAssessScopeStep(ctx context.Context, input stepInput) (plannerCheckpoint, error) {
+	checkpoint := input.Checkpoint
+	if checkpoint.SkipReason != "" {
+		return checkpoint, nil
+	}
+	if ask, ok := r.pendingEscalationAnswer(ctx, input.Loop); ok {
+		return r.applyEscalationAnswer(ctx, input, checkpoint, ask)
+	}
+	policy := r.escalationPolicyForProject(input.Project.ID)
+	if !policy.Enabled {
+		return checkpoint, nil
+	}
+	if checkpoint.Scope != nil && checkpoint.Scope.Assessed {
+		return checkpoint, nil
+	}
+	issue, err := requireIssue(checkpoint)
+	if err != nil {
+		return checkpoint, err
+	}
+	worktree, err := requireWorktree(checkpoint)
+	if err != nil {
+		return checkpoint, err
+	}
+	assessment, err := r.assessScope(ctx, input, issue, worktree)
+	if err != nil {
+		return checkpoint, err
+	}
+	criteria := evaluateEscalationPolicy(policy, assessment)
+	checkpoint.Scope = &checkpointScope{Assessed: true, Assessment: &assessment, Criteria: criteria, Escalated: len(criteria) > 0}
+	checkpoint.ResumePolicy = "advance_from_checkpoint"
+	if len(criteria) == 0 {
+		return checkpoint, nil
+	}
+	record := EscalationRecord{
+		Version:           escalationRecordVersion,
+		ProjectID:         input.Project.ID,
+		Repo:              issue.Repo,
+		IssueNumber:       issue.IssueNumber,
+		LoopID:            input.Loop.ID,
+		RunID:             input.Run.ID,
+		Policy:            policy,
+		Assessment:        assessment,
+		Criteria:          criteria,
+		DecisionRequested: buildEscalationQuestion(issue.Repo, issue.IssueNumber, criteria),
+		Options:           []string{EscalationOptionProceed, EscalationOptionStop},
+	}
+	return checkpoint, &escalationError{record: record}
+}
+
+// applyEscalationAnswer resumes an escalated loop with the human's decision.
+func (r *Runner) applyEscalationAnswer(ctx context.Context, input stepInput, checkpoint plannerCheckpoint, ask loops.HITLAsk) (plannerCheckpoint, error) {
+	authorized := classifyEscalationAnswer(ask.Answer)
+	if checkpoint.Scope == nil {
+		checkpoint.Scope = &checkpointScope{}
+	}
+	checkpoint.Scope.HumanDecision = strings.TrimSpace(ask.Answer)
+	checkpoint.Scope.HumanAuthorized = authorized
+	checkpoint.Scope.HumanDecidedAt = ask.AnsweredAt
+	checkpoint.Scope.Assessed = true
+	checkpoint.ResumePolicy = "advance_from_checkpoint"
+	r.markEscalationAnswerConsumed(ctx, input.Loop)
+	repo, issueNumber := "", int64(0)
+	if checkpoint.Issue != nil {
+		repo, issueNumber = checkpoint.Issue.Repo, checkpoint.Issue.IssueNumber
+	}
+	r.appendEvent(ctx, eventInput{
+		eventType: EscalationResolutionEventType, projectID: input.Loop.ProjectID, loopID: input.Loop.ID, runID: input.Run.ID,
+		entityType: "loop", entityID: input.Loop.ID,
+		payload: map[string]any{"repo": repo, "issueNumber": issueNumber, "authorized": authorized, "answer": checkpoint.Scope.HumanDecision, "answeredAt": ask.AnsweredAt},
+	})
+	if !authorized {
+		checkpoint.SkipReason = fmt.Sprintf("Planner escalation settled by human for %s#%d: %s", repo, issueNumber, checkpoint.Scope.HumanDecision)
+		return checkpoint, nil
+	}
+	checkpoint.Scope.AuthorizedGuidance = checkpoint.Scope.HumanDecision
+	return checkpoint, nil
+}
+
+// assessScope runs one read-only agent turn in the prepared worktree and decodes
+// its strict-JSON scope assessment.
+func (r *Runner) assessScope(ctx context.Context, input stepInput, issue *checkpointIssue, worktree *checkpointWorktree) (ScopeAssessment, error) {
+	executionID := eventlog.NewEventID("agent")
+	agentVendor, agentModel, _, useSnapshot, err := r.identityFromRun(input.Run)
+	if err != nil {
+		return ScopeAssessment{}, fmt.Errorf("resolve run agent identity: %w", err)
+	}
+	useSnap, snapVendor, snapModel := agentRunSnapshotFields(agentVendor, agentModel, useSnapshot)
+	execution, err := r.agentExecutor.Start(ctx, AgentRunInput{
+		ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID,
+		Prompt: buildScopeAssessmentPrompt(issue.Repo, issue), WorkingDirectory: worktree.Path,
+		Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout,
+		Metadata:       map[string]any{"loopType": "planner", "step": string(stepAssessScope), "repo": issue.Repo, "issueNumber": issue.IssueNumber},
+		IdempotencyKey: fmt.Sprintf("planner-scope:%s", input.Loop.ID),
+		UseSnapshot:    useSnap, SnapshotVendor: snapVendor, SnapshotModel: snapModel,
+	})
+	if err != nil {
+		return ScopeAssessment{}, err
+	}
+	result, err := execution.Wait(ctx)
+	if err != nil {
+		return ScopeAssessment{}, err
+	}
+	if !strings.EqualFold(result.Status, "completed") {
+		message := firstNonEmpty(result.Summary, result.Stderr, "Planner scope assessment "+result.Status)
+		return ScopeAssessment{}, &loopError{message: message, kind: FailureRetryableTransient}
+	}
+	assessment, err := decodeScopeAssessment(agent.FinalMessage(result.Stdout))
+	if err != nil {
+		return ScopeAssessment{}, &loopError{message: err.Error(), kind: FailureRetryableTransient}
+	}
+	return assessment, nil
+}
+
 func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (plannerCheckpoint, error) {
 	checkpoint := input.Checkpoint
 	if checkpoint.SkipReason != "" {
@@ -1073,6 +1230,7 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 			return checkpoint, fmt.Errorf("resolve run agent identity: %w", err)
 		}
 		prompt, instructionBlock := buildPlannerPrompt(input.Project, r.customInstructions, issue, worktree, r.allowAutoPush, r.disclosure, agentVendor, derefString(agentModel))
+		prompt = appendEscalationAuthorization(prompt, checkpoint.Scope)
 		metadata := map[string]any{"loopType": "planner", "repo": issue.Repo, "issueNumber": issue.IssueNumber, "specPath": issue.SpecPath}
 		for key, value := range config.CustomInstructionMetadata(instructionBlock, prompt) {
 			metadata[key] = value
@@ -1536,18 +1694,24 @@ func (r *Runner) persistPlannerPullRequestReference(ctx context.Context, input s
 	if pr.Number == 0 {
 		return nil
 	}
+	updates := map[string]any{"issueNumber": issue.IssueNumber, "issueUrl": issue.URL, "issueTitle": issue.Title, "specPath": issue.SpecPath, "branch": worktree.Branch, "prUrl": pr.URL, "prNumber": pr.Number, "requestedReviewers": issue.RequestedReviewers}
+	// Merge against the freshest persisted metadata, not the run's opening
+	// snapshot: mid-run writers (HITL ask/answer state) would otherwise be
+	// silently rolled back by this publish-time write.
+	var mergeErr error
 	if _, err := r.updateLoop(ctx, input.Loop, func(updated *storage.LoopRecord) {
 		updated.Repo = stringPtr(issue.Repo)
 		updated.PRNumber = &pr.Number
+		merged, err := mergeLoopMetadataJSON(updated.MetadataJSON, updates)
+		if err != nil {
+			mergeErr = err
+			return
+		}
+		updated.MetadataJSON = stringPtr(merged)
 	}); err != nil {
 		return err
 	}
-	metadataJSON, err := mergeLoopMetadataJSON(input.Loop.MetadataJSON, map[string]any{"issueNumber": issue.IssueNumber, "issueUrl": issue.URL, "issueTitle": issue.Title, "specPath": issue.SpecPath, "branch": worktree.Branch, "prUrl": pr.URL, "prNumber": pr.Number, "requestedReviewers": issue.RequestedReviewers})
-	if err != nil {
-		return err
-	}
-	_, err = r.updateLoop(ctx, input.Loop, func(updated *storage.LoopRecord) { updated.MetadataJSON = stringPtr(metadataJSON) })
-	return err
+	return mergeErr
 }
 
 func (r *Runner) runNotifyStep(input stepInput) (plannerCheckpoint, error) {
@@ -1924,7 +2088,7 @@ func plannerFailureBoundaryForStep(step PlannerStep) failureclass.Boundary {
 		return failureclass.BoundaryGitHubAPI
 	case stepPrepareWorktree:
 		return failureclass.BoundaryGitRemote
-	case stepWriteSpec:
+	case stepAssessScope, stepWriteSpec:
 		return failureclass.BoundaryModelProvider
 	default:
 		return failureclass.BoundaryUnknown
