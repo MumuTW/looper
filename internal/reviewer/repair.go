@@ -23,7 +23,7 @@ var (
 
 type RepairGitHub interface {
 	ViewPullRequest(context.Context, ViewPullRequestInput) (PullRequestDetail, error)
-	GetCurrentUserLogin(context.Context, string) (string, error)
+	GetCurrentUserLogin(context.Context, string, string) (string, error)
 }
 
 type RepairOptions struct {
@@ -138,7 +138,7 @@ func (r *Repairer) Repair(ctx context.Context, input RepairInput) (RepairResult,
 	if err != nil {
 		return RepairResult{}, err
 	}
-	currentLogin, err := r.github.GetCurrentUserLogin(ctx, project.RepoPath)
+	currentLogin, err := r.github.GetCurrentUserLogin(ctx, input.Repo, project.RepoPath)
 	if err != nil {
 		return RepairResult{}, err
 	}

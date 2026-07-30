@@ -253,7 +253,7 @@ type GitHubGateway interface {
 	ListOpenIssues(context.Context, ListOpenIssuesInput) ([]IssueSummary, error)
 	ViewPullRequest(context.Context, ViewPullRequestInput) (PullRequestDetail, error)
 	ViewIssue(context.Context, ViewIssueInput) (IssueDetail, error)
-	GetCurrentUserLogin(context.Context, string) (string, error)
+	GetCurrentUserLogin(context.Context, string, string) (string, error)
 	AddIssueAssignees(context.Context, IssueAssigneesInput) error
 	CreateIssueComment(context.Context, IssueCommentInput) (IssueCommentResult, error)
 	UpdateIssueComment(context.Context, UpdateIssueCommentInput) error
@@ -872,7 +872,7 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 	}
 	login := ""
 	if networkpolicy.IsRouted(policy.RoutedClaimPolicy) {
-		login, err = r.github.GetCurrentUserLogin(ctx, project.RepoPath)
+		login, err = r.github.GetCurrentUserLogin(ctx, input.Repo, project.RepoPath)
 		if err != nil {
 			return DiscoveryResult{}, err
 		}
@@ -882,7 +882,7 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 		}
 	} else if policy.RequireAssigneeCurrentUser {
 		var err error
-		login, err = r.github.GetCurrentUserLogin(ctx, project.RepoPath)
+		login, err = r.github.GetCurrentUserLogin(ctx, input.Repo, project.RepoPath)
 		if err != nil {
 			return DiscoveryResult{}, err
 		}
@@ -1455,7 +1455,7 @@ func (r *Runner) selfAssignIssue(ctx context.Context, work workerInput, cwd stri
 	if repo == "" {
 		return nil
 	}
-	login, err := r.github.GetCurrentUserLogin(ctx, cwd)
+	login, err := r.github.GetCurrentUserLogin(ctx, repo, cwd)
 	if err != nil {
 		return &loopError{message: fmt.Sprintf("Unable to resolve GitHub login for worker issue self-assignment on %s#%d: %v", repo, work.IssueNumber, err), kind: FailureRetryableAfterResume}
 	}

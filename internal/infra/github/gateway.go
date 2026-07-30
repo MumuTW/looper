@@ -2672,7 +2672,7 @@ func (g *Gateway) AddPullRequestReaction(ctx context.Context, input PullRequestR
 }
 
 func (g *Gateway) RemovePullRequestReaction(ctx context.Context, input PullRequestReactionInput) error {
-	currentLogin, err := g.GetCurrentUserLogin(ctx, input.CWD)
+	currentLogin, err := g.GetCurrentUserLoginForRepo(ctx, input.Repo, input.CWD)
 	if err != nil {
 		return err
 	}
@@ -2957,6 +2957,13 @@ func (g *Gateway) getCurrentUserLoginRaw(ctx context.Context, cwd string) (strin
 }
 
 func (g *Gateway) GetCurrentUserLoginForRepo(ctx context.Context, repo string, cwd string) (string, error) {
+	if snapshot := discoverySnapshotFromContext(ctx); snapshot != nil {
+		return snapshot.getCurrentUserLoginForRepo(ctx, repo, cwd)
+	}
+	return g.getCurrentUserLoginForRepoRaw(ctx, repo, cwd)
+}
+
+func (g *Gateway) getCurrentUserLoginForRepoRaw(ctx context.Context, repo string, cwd string) (string, error) {
 	hostname, _ := splitRepoHostname(repo)
 	args := []string{"api", "user", "--jq", ".login"}
 	if hostname != "" {

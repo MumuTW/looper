@@ -66,7 +66,6 @@ type GitHubGateway interface {
 	ListIssueTimeline(context.Context, githubinfra.IssueTimelineInput) ([]map[string]any, error)
 	ListIssueBlockedBy(context.Context, githubinfra.ListIssueBlockedByInput) ([]githubinfra.IssueDependency, error)
 	GetIssueState(context.Context, githubinfra.ViewIssueInput) (githubinfra.IssueState, error)
-	GetCurrentUserLogin(context.Context, string) (string, error)
 	GetCurrentUserLoginForRepo(context.Context, string, string) (string, error)
 	GetRepositoryPermission(context.Context, githubinfra.RepositoryPermissionInput) (string, error)
 	ListBlockedByIssues(context.Context, githubinfra.ViewIssueInput) ([]githubinfra.DependencyIssue, error)

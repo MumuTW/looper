@@ -4630,7 +4630,7 @@ type fakeGitHubGateway struct {
 	createPRIndex           int
 }
 
-func (f *fakeGitHubGateway) GetCurrentUserLogin(context.Context, string) (string, error) {
+func (f *fakeGitHubGateway) GetCurrentUserLogin(context.Context, string, string) (string, error) {
 	f.currentLoginCalls++
 	if f.currentLogin == "" {
 		return "octocat", nil

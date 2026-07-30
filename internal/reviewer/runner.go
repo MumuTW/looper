@@ -373,7 +373,7 @@ type ResolveReviewThreadInput struct {
 type GitHubGateway interface {
 	ListOpenPullRequests(context.Context, ListOpenPullRequestsInput) ([]PullRequestSummary, error)
 	ListReviewRequestedPullRequests(context.Context, ListReviewRequestedPullRequestsInput) ([]PullRequestSummary, error)
-	GetCurrentUserLogin(context.Context, string) (string, error)
+	GetCurrentUserLogin(context.Context, string, string) (string, error)
 	ViewPullRequest(context.Context, ViewPullRequestInput) (PullRequestDetail, error)
 	ViewIssue(context.Context, githubinfra.ViewIssueInput) (githubinfra.IssueDetail, error)
 	GetPullRequestHeadSHA(context.Context, ViewPullRequestInput) (string, error)
@@ -785,7 +785,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 	currentLogin := ""
 	if policy.RequireReviewRequest || !policy.EnableSelfReview {
 		var err error
-		currentLogin, err = r.github.GetCurrentUserLogin(ctx, project.RepoPath)
+		currentLogin, err = r.github.GetCurrentUserLogin(ctx, input.Repo, project.RepoPath)
 		if err != nil {
 			return DiscoveryResult{}, err
 		}
@@ -843,7 +843,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 			continue
 		}
 		if networkpolicy.IsRouted(policy.RoutedClaimPolicy) {
-			_, resolvedLogin, err := r.routedReviewerClaimDecisionWithCurrentLogin(ctx, project.RepoPath, policy, currentLogin, pr.Author, pr.Labels, pr.ReviewRequestUsers)
+			_, resolvedLogin, err := r.routedReviewerClaimDecisionWithCurrentLogin(ctx, input.Repo, project.RepoPath, policy, currentLogin, pr.Author, pr.Labels, pr.ReviewRequestUsers)
 			if err != nil {
 				return DiscoveryResult{}, err
 			}
@@ -868,7 +868,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 			continue
 		}
 		if networkpolicy.IsRouted(policy.RoutedClaimPolicy) {
-			_, resolvedLogin, err := r.routedReviewerClaimDecisionWithCurrentLogin(ctx, project.RepoPath, policy, currentLogin, pr.Author, pr.Labels, pr.ReviewRequestUsers)
+			_, resolvedLogin, err := r.routedReviewerClaimDecisionWithCurrentLogin(ctx, input.Repo, project.RepoPath, policy, currentLogin, pr.Author, pr.Labels, pr.ReviewRequestUsers)
 			if err != nil {
 				return DiscoveryResult{}, err
 			}
@@ -940,7 +940,7 @@ func (r *Runner) DiscoverPullRequest(ctx context.Context, input TargetedDiscover
 
 	currentLogin := ""
 	if policy.RequireReviewRequest || !policy.EnableSelfReview {
-		currentLogin, err = r.github.GetCurrentUserLogin(ctx, project.RepoPath)
+		currentLogin, err = r.github.GetCurrentUserLogin(ctx, input.Repo, project.RepoPath)
 		if err != nil {
 			return DiscoveryResult{}, err
 		}
@@ -984,7 +984,7 @@ func (r *Runner) DiscoverPullRequest(ctx context.Context, input TargetedDiscover
 		return result, nil
 	}
 	if networkpolicy.IsRouted(policy.RoutedClaimPolicy) {
-		_, resolvedLogin, err := r.routedReviewerClaimDecisionWithCurrentLogin(ctx, project.RepoPath, policy, currentLogin, pr.Author, pr.Labels, pr.ReviewRequestUsers)
+		_, resolvedLogin, err := r.routedReviewerClaimDecisionWithCurrentLogin(ctx, input.Repo, project.RepoPath, policy, currentLogin, pr.Author, pr.Labels, pr.ReviewRequestUsers)
 		if err != nil {
 			return DiscoveryResult{}, err
 		}
@@ -1040,7 +1040,7 @@ func (r *Runner) enqueueReviewerDiscoveryCandidate(ctx context.Context, project 
 		return nil
 	}
 	if reviewerLastSkipNeedsCurrentLogin(meta, pr) && *currentLogin == "" {
-		lookupLogin, lookupErr := r.github.GetCurrentUserLogin(ctx, project.RepoPath)
+		lookupLogin, lookupErr := r.github.GetCurrentUserLogin(ctx, repo, project.RepoPath)
 		if lookupErr != nil {
 			lookupLogin = ""
 		}
@@ -1142,7 +1142,7 @@ func (r *Runner) findReviewerLoopsByPR(ctx context.Context, projectID, repo stri
 func (r *Runner) listOpenPullRequestsForDiscovery(ctx context.Context, repo, cwd string, limit int) ([]PullRequestSummary, error) {
 	currentLogin := ""
 	if r.discoveryPolicy.RequireReviewRequest {
-		login, err := r.github.GetCurrentUserLogin(ctx, cwd)
+		login, err := r.github.GetCurrentUserLogin(ctx, repo, cwd)
 		if err != nil {
 			return nil, err
 		}
@@ -1412,7 +1412,7 @@ func routedReviewerClaimDecision(policy DiscoveryPolicy, currentLogin string, au
 	return networkpolicy.ClaimDecision{Allowed: true, Reason: "", MatchMode: decision.MatchMode, TargetLabel: decision.TargetLabel}
 }
 
-func (r *Runner) routedReviewerClaimDecisionWithCurrentLogin(ctx context.Context, cwd string, policy DiscoveryPolicy, currentLogin string, author string, labels []string, reviewRequests []networkpolicy.GitHubUser) (networkpolicy.ClaimDecision, string, error) {
+func (r *Runner) routedReviewerClaimDecisionWithCurrentLogin(ctx context.Context, repo, cwd string, policy DiscoveryPolicy, currentLogin string, author string, labels []string, reviewRequests []networkpolicy.GitHubUser) (networkpolicy.ClaimDecision, string, error) {
 	decision := routedReviewerClaimDecision(policy, currentLogin, author, labels, reviewRequests)
 	if decision.Allowed || !policy.EnableSelfReview || decision.Reason != "local GitHub identity is not requested for review" {
 		return decision, currentLogin, nil
@@ -1421,7 +1421,7 @@ func (r *Runner) routedReviewerClaimDecisionWithCurrentLogin(ctx context.Context
 		if r.github == nil {
 			return decision, currentLogin, nil
 		}
-		lookupLogin, err := r.github.GetCurrentUserLogin(ctx, cwd)
+		lookupLogin, err := r.github.GetCurrentUserLogin(ctx, repo, cwd)
 		if err != nil {
 			return decision, currentLogin, nil
 		}
@@ -1773,7 +1773,7 @@ func (r *Runner) revalidateRoutedReviewerClaim(ctx context.Context, project stor
 	}
 	decision := routedReviewerClaimDecision(policy, "", detail.Author, detail.Labels, detail.ReviewRequestUsers)
 	if !decision.Allowed && policy.EnableSelfReview && decision.Reason == "local GitHub identity is not requested for review" {
-		currentLogin, lookupErr := r.github.GetCurrentUserLogin(ctx, project.RepoPath)
+		currentLogin, lookupErr := r.github.GetCurrentUserLogin(ctx, *queueItem.Repo, project.RepoPath)
 		if lookupErr != nil {
 			return &loopError{message: lookupErr.Error(), kind: FailureRetryableTransient}
 		}
@@ -1925,7 +1925,7 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 		if currentLogin != "" {
 			return nil
 		}
-		lookupLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
+		lookupLogin, err := r.github.GetCurrentUserLogin(ctx, input.Repo, input.Project.RepoPath)
 		if err != nil {
 			return err
 		}
@@ -1992,7 +1992,7 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 	}
 	requireReviewRequest := requireReviewRequestForLoop(input.Loop, reviewRequestRequiredForCandidate(policy, checkpoint.Detail.Labels), checkpoint.Detail.HeadSHA)
 	if !isManualReviewerLoop(input.Loop) && networkpolicy.IsRouted(policy.RoutedClaimPolicy) {
-		decision, resolvedLogin, err := r.routedReviewerClaimDecisionWithCurrentLogin(ctx, input.Project.RepoPath, policy, currentLogin, checkpoint.Detail.Author, checkpoint.Detail.Labels, checkpoint.Detail.ReviewRequestUsers)
+		decision, resolvedLogin, err := r.routedReviewerClaimDecisionWithCurrentLogin(ctx, input.Repo, input.Project.RepoPath, policy, currentLogin, checkpoint.Detail.Author, checkpoint.Detail.Labels, checkpoint.Detail.ReviewRequestUsers)
 		if err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableTransient}
 		}
@@ -2335,7 +2335,7 @@ func (r *Runner) runThreadResolutionStep(ctx context.Context, input stepInput) (
 	if normalizePRState(checkpoint.Detail.State) != "open" {
 		return checkpoint, nil
 	}
-	currentLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
+	currentLogin, err := r.github.GetCurrentUserLogin(ctx, input.Repo, input.Project.RepoPath)
 	if err != nil {
 		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableTransient}
 	}
@@ -3012,7 +3012,7 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 		policy := r.discoveryPolicyForProject(input.Project.ID)
 		requireReviewRequest := requireReviewRequestForLoop(input.Loop, reviewRequestRequiredForCandidate(policy, detail.Labels), pending.HeadSHA)
 		if requireReviewRequest {
-			currentLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
+			currentLogin, err := r.github.GetCurrentUserLogin(ctx, input.Repo, input.Project.RepoPath)
 			if err != nil {
 				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 			}
@@ -3118,7 +3118,7 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 			checkpoint.ResumePolicy = ""
 			return checkpoint, nil
 		}
-		currentLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
+		currentLogin, err := r.github.GetCurrentUserLogin(ctx, repo, input.Project.RepoPath)
 		if err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		}
@@ -3210,7 +3210,7 @@ func (r *Runner) skipThreadResolutionFollowUpReview(ctx context.Context, input s
 	}
 	currentLogin := strings.TrimSpace(checkpoint.Detail.CurrentLogin)
 	if currentLogin == "" {
-		lookupLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
+		lookupLogin, err := r.github.GetCurrentUserLogin(ctx, input.Repo, input.Project.RepoPath)
 		if err != nil {
 			return false, checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		}
@@ -3243,7 +3243,7 @@ func missingReviewMarkerMessage(input stepInput, pending pendingReviewCheckpoint
 }
 
 func (r *Runner) verifyAgentNativeReviewMarker(ctx context.Context, input stepInput, headSHA string, idempotencyKey string, prAuthorLogin string) (ReviewMarkerResult, error) {
-	currentLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
+	currentLogin, err := r.github.GetCurrentUserLogin(ctx, input.Repo, input.Project.RepoPath)
 	if err != nil {
 		return ReviewMarkerResult{}, err
 	}
@@ -3712,7 +3712,7 @@ func (r *Runner) decideAutoMerge(ctx context.Context, input stepInput, detail Pu
 
 func (r *Runner) submitOrReuseReview(ctx context.Context, input stepInput, detail PullRequestDetail, pending pendingReviewCheckpoint, event ReviewEvent, outcome string, body string) (ReviewMarkerResult, error) {
 	body = appendReviewMarker(body, agentNativeReviewMarker(input.Loop.ID, pending.HeadSHA, pending.IdempotencyKey), outcome)
-	currentLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
+	currentLogin, err := r.github.GetCurrentUserLogin(ctx, input.Repo, input.Project.RepoPath)
 	if err != nil {
 		return ReviewMarkerResult{}, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 	}
@@ -5244,7 +5244,7 @@ func (r *Runner) detectRediscoveryRequired(ctx context.Context, input stepInput,
 	if !requireReviewRequestForLoop(input.Loop, r.discoveryPolicyForProject(input.Project.ID).RequireReviewRequest, checkpoint.Snapshot.HeadSHA) {
 		return "", false
 	}
-	currentLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
+	currentLogin, err := r.github.GetCurrentUserLogin(ctx, input.Repo, input.Project.RepoPath)
 	if err != nil {
 		return "", false
 	}
@@ -5291,7 +5291,7 @@ func (r *Runner) detectMarkerMissingRecovery(ctx context.Context, input stepInpu
 	if !allowAlreadyReviewed {
 		return "", "", ""
 	}
-	currentLogin, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
+	currentLogin, err := r.github.GetCurrentUserLogin(ctx, input.Repo, input.Project.RepoPath)
 	if err != nil {
 		return "", "", ""
 	}
@@ -5350,7 +5350,7 @@ func (r *Runner) currentLoginForLoop(ctx context.Context, loop storage.LoopRecor
 	if project != nil {
 		cwd = project.RepoPath
 	}
-	login, err := r.github.GetCurrentUserLogin(ctx, cwd)
+	login, err := r.github.GetCurrentUserLogin(ctx, derefString(loop.Repo), cwd)
 	if err != nil {
 		return "", err
 	}

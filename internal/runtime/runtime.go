@@ -3679,7 +3679,12 @@ func (r *Runtime) currentReviewerLoginForRecovery(ctx context.Context, repositor
 	}
 	loginCtx, cancel := context.WithTimeout(ctx, reviewerRecoveryLoginTimeout)
 	defer cancel()
-	login, err := githubGateway.GetCurrentUserLogin(loginCtx, project.RepoPath)
+	repo := ""
+	if loop.Repo != nil {
+		repo = *loop.Repo
+	}
+	cfg := r.Config()
+	login, err := roleCurrentUserLogin(loginCtx, &cfg, githubGateway, repo, project.RepoPath)
 	if err != nil {
 		if r.logger != nil {
 			r.logger.Warn("failed to refresh reviewer login during recovery", map[string]any{"loopId": loop.ID, "projectId": loop.ProjectID, "error": err.Error()})

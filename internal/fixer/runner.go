@@ -304,7 +304,7 @@ type PullRequestLabelsInput struct {
 
 type GitHubGateway interface {
 	ListOpenPullRequests(context.Context, ListOpenPullRequestsInput) ([]PullRequestSummary, error)
-	GetCurrentUserLogin(context.Context, string) (string, error)
+	GetCurrentUserLogin(context.Context, string, string) (string, error)
 	GetPullRequestAuthor(context.Context, ViewPullRequestInput) (string, error)
 	ViewPullRequest(context.Context, ViewPullRequestInput) (PullRequestDetail, error)
 	ListReviewThreads(context.Context, ListReviewThreadsInput) ([]ReviewThread, error)
@@ -1644,7 +1644,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 	policy := r.discoveryPolicyForProject(project.ID)
 	currentUser := ""
 	if policy.AutoDiscovery && policy.AuthorFilter != config.FixerAuthorFilterAny {
-		currentUser, err = r.github.GetCurrentUserLogin(ctx, project.RepoPath)
+		currentUser, err = r.github.GetCurrentUserLogin(ctx, input.Repo, project.RepoPath)
 		if err != nil {
 			return DiscoveryResult{}, err
 		}
@@ -1751,7 +1751,7 @@ func (r *Runner) DiscoverPullRequest(ctx context.Context, input TargetedDiscover
 	}
 	currentUser := ""
 	if policy.AutoDiscovery && policy.AuthorFilter != config.FixerAuthorFilterAny {
-		currentUser, err = r.github.GetCurrentUserLogin(ctx, project.RepoPath)
+		currentUser, err = r.github.GetCurrentUserLogin(ctx, input.Repo, project.RepoPath)
 		if err != nil {
 			return DiscoveryResult{}, err
 		}
@@ -1804,7 +1804,7 @@ func (r *Runner) DiscoverPullRequestsForBaseBranchUpdate(ctx context.Context, in
 	policy := r.discoveryPolicyForProject(project.ID)
 	currentUser := ""
 	if policy.AutoDiscovery && policy.AuthorFilter != config.FixerAuthorFilterAny {
-		currentUser, err = r.github.GetCurrentUserLogin(ctx, project.RepoPath)
+		currentUser, err = r.github.GetCurrentUserLogin(ctx, input.Repo, project.RepoPath)
 		if err != nil {
 			return DiscoveryResult{}, err
 		}
@@ -2779,7 +2779,7 @@ func (r *Runner) pullRequestOwnershipSkipReason(ctx context.Context, loop storag
 	if r.discoveryPolicyForProject(projectID).AuthorFilter == config.FixerAuthorFilterAny {
 		return "", nil
 	}
-	currentUser, err := r.github.GetCurrentUserLogin(ctx, cwd)
+	currentUser, err := r.github.GetCurrentUserLogin(ctx, repo, cwd)
 	if err != nil {
 		return "", err
 	}
@@ -4466,7 +4466,7 @@ func (r *Runner) publishRoundSummaryComment(ctx context.Context, input stepInput
 		return
 	}
 	trustedLogin := ""
-	if login, err := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath); err == nil {
+	if login, err := r.github.GetCurrentUserLogin(ctx, input.Repo, input.Project.RepoPath); err == nil {
 		trustedLogin = login
 	}
 	if existingID, existingURL := findExistingFixerSummaryCommentID(checkpoint.Detail, headSHA, trustedLogin); existingID != 0 {
@@ -9272,7 +9272,7 @@ func (r *Runner) reRequestReviewersAfterFix(ctx context.Context, input stepInput
 	if err != nil {
 		return
 	}
-	self, _ := r.github.GetCurrentUserLogin(ctx, input.Project.RepoPath)
+	self, _ := r.github.GetCurrentUserLogin(ctx, input.Repo, input.Project.RepoPath)
 	seen := map[string]bool{}
 	reviewers := make([]string, 0, len(reviews))
 	for _, rv := range reviews {
