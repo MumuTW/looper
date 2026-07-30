@@ -75,6 +75,13 @@ func (g *Gateway) CreateDeployCheckout(ctx context.Context, input DeployCheckout
 		return DeployCheckout{}, fmt.Errorf("materialize %s: %w", sha, err)
 	}
 
+	// A worktree does not populate submodules, so a repository that keeps deployed
+	// files in one would otherwise deploy an incomplete tree that still verifies as
+	// the right commit.
+	if err := g.runGit(ctx, path, nil, "submodule", "update", "--init", "--recursive"); err != nil {
+		return DeployCheckout{}, fmt.Errorf("initialize submodules for %s: %w", sha, err)
+	}
+
 	// Prove the checkout is at the requested commit rather than trusting that the
 	// previous command did what it said.
 	result, err := g.runGitResult(ctx, path, nil, "rev-parse", "HEAD")

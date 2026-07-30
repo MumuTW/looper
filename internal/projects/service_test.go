@@ -253,6 +253,51 @@ func TestServiceAddProjectDiscoversPullRequestsAndWorktrees(t *testing.T) {
 	}
 }
 
+func TestServiceDiscoverProjectReusesPathIdentityWhenBranchChanges(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openCoordinator(t)
+	ctx := context.Background()
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.July, 30, 12, 34, 56, 0, time.UTC)
+	branch := "main"
+	service := &Service{
+		DB:                coordinator.DB(),
+		Repos:             repos,
+		Now:               func() time.Time { return now },
+		ScheduleDiscovery: func(func()) {},
+		ListWorktrees: func(context.Context, string) ([]WorktreeListEntry, error) {
+			return []WorktreeListEntry{{Path: "/tmp/looper-primary", Branch: branch, HeadSHA: "abc123"}}, nil
+		},
+	}
+	if _, err := service.AddProject(ctx, AddInput{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper-primary", BaseBranch: "main"}); err != nil {
+		t.Fatalf("AddProject() error = %v", err)
+	}
+	if _, err := service.DiscoverProject(ctx, DiscoverInput{ProjectID: "looper", SnapshotMode: SnapshotModeOff}); err != nil {
+		t.Fatalf("DiscoverProject(main) error = %v", err)
+	}
+	initial, err := repos.Worktrees.GetByPath(ctx, "/tmp/looper-primary")
+	if err != nil || initial == nil {
+		t.Fatalf("GetByPath(main) = %#v, %v", initial, err)
+	}
+
+	branch = "feature/fixer"
+	if _, err := service.DiscoverProject(ctx, DiscoverInput{ProjectID: "looper", SnapshotMode: SnapshotModeOff}); err != nil {
+		t.Fatalf("DiscoverProject(feature) error = %v", err)
+	}
+	updated, err := repos.Worktrees.GetByPath(ctx, "/tmp/looper-primary")
+	if err != nil || updated == nil {
+		t.Fatalf("GetByPath(feature) = %#v, %v", updated, err)
+	}
+	if updated.ID != initial.ID || updated.Branch != "feature/fixer" {
+		t.Fatalf("updated worktree = %#v, want path identity %q on feature/fixer", updated, initial.ID)
+	}
+	items, err := repos.Worktrees.ListByProject(ctx, "looper")
+	if err != nil || len(items) != 1 {
+		t.Fatalf("ListByProject() = %#v, %v; want one path row", items, err)
+	}
+}
+
 func TestServiceAddProjectDefaultAsyncEnqueuesSnapshotsWithoutCapturing(t *testing.T) {
 	t.Parallel()
 

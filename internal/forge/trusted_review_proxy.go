@@ -755,6 +755,14 @@ func marshalTrustedReviewConfigSnapshot(source config.Config) ([]byte, error) {
 	snapshot.Agent.Env = nil
 	snapshot.Agent.Params = nil
 	snapshot.Daemon.Environment = nil
+	// roles.deployer.environment holds the credentials a deploy needs, globally and
+	// per project. It is the same class of secret as daemon.environment above.
+	snapshot.Roles.Deployer.Environment = nil
+	for i := range snapshot.Projects {
+		if snapshot.Projects[i].Roles != nil && snapshot.Projects[i].Roles.Deployer != nil {
+			snapshot.Projects[i].Roles.Deployer.Environment = nil
+		}
+	}
 
 	encoded, err := json.Marshal(snapshot)
 	if err != nil {

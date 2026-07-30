@@ -110,7 +110,7 @@ func TestCleanupWorktreeRefusesWithMismatchedPath(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error when cleaning up worktree with mismatched path, got nil")
 	}
-	if !strings.Contains(err.Error(), "different path") {
+	if !strings.Contains(err.Error(), "no looper worktree record found") {
 		t.Fatalf("unexpected error message: %v", err)
 	}
 
