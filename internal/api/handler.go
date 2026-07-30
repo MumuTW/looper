@@ -6077,6 +6077,7 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string,
 		queueLoop.Status = string(domain.LoopStatusQueued)
 		queueLoop.NextRunAt = &nowISO
 		queueLoop.UpdatedAt = nowISO
+		escapeFixerManualPark := false
 		if queueLoop.Type == string(domain.LoopTypeReviewer) {
 			metadataJSON, metadataErr := resetReviewerLoopRetryMetadata(queueLoop.MetadataJSON)
 			if metadataErr != nil {
@@ -6089,16 +6090,10 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string,
 				return retryResult{}, metadataErr
 			}
 			queueLoop.MetadataJSON = metadataJSON
-			// An explicit operator retry must escape a fixer run parked for manual
-			// intervention (e.g. a missing/invalid repair completion result). Without
-			// rewriting the checkpoint, createRunContext resumes at the same
-			// downstream step and validateFixerResumeCheckpoint parks it again, so
-			// retry can never reach repair or discovery. Marking restart_from_discover
-			// is the supported recovery transition; runs not parked for manual
-			// recovery are left untouched.
-			if _, err := fixer.MarkManualInterventionRunRestartFromDiscover(ctx, repos, loop.ID, nowISO); err != nil {
-				return retryResult{}, err
-			}
+			// Deferred until the queue record is known to be committable — see the
+			// rewrite below. Rewriting here would destroy the park even on the
+			// no-queue-record and dedupe-conflict exits.
+			escapeFixerManualPark = true
 		}
 		var queueRecord storage.QueueItemRecord
 		var ok bool
@@ -6139,6 +6134,21 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string,
 			}
 			if activeDedupe != nil {
 				return retryResult{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusConflict, message: fmt.Sprintf("Cannot retry loop %s while dedupe queue item %s is active", loop.ID, activeDedupe.ID)}
+			}
+		}
+
+		// An explicit operator retry must escape a fixer run parked because the
+		// repair completion contract was missing or invalid. Without rewriting the
+		// checkpoint, createRunContext resumes at the same downstream step and
+		// validateFixerResumeCheckpoint parks it again, so retry can never reach
+		// repair or discovery.
+		//
+		// Rewritten only here, after the no-queue-record and dedupe-conflict exits:
+		// the first commits the transaction with a nil error, so an earlier rewrite
+		// would clear the park without queueing the retry that justified it.
+		if escapeFixerManualPark {
+			if _, err := fixer.MarkInvalidCompletionRunRestartFromDiscover(ctx, repos, loop.ID, nowISO); err != nil {
+				return retryResult{}, err
 			}
 		}
 

@@ -2163,7 +2163,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		// createRunContext sets a resumed checkpoint's policy to
 		// advance_from_checkpoint, so NormalizeResumePolicy would preserve that
 		// nonempty advance policy and leave the failed run ineligible for
-		// MarkManualInterventionRunRestartFromDiscover. A manual-intervention
+		// MarkInvalidCompletionRunRestartFromDiscover. A manual-intervention
 		// resume-validation failure (missing/invalid repair result on a legacy or
 		// interrupted downstream checkpoint) must durably park the checkpoint so
 		// operator retry can escape via restart_from_discover instead of resuming
@@ -3225,6 +3225,22 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 	if err := validateCompletedRepairCheckpoint(repair, checkpoint.Worktree); err != nil {
 		checkpoint.Repair = repair
 		checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
+		// The agent already ran and may have changed or pushed code, so the repair
+		// record is the only evidence of that work. Returning it in memory alone
+		// leaves the caller's completeRun as the single write that can persist it;
+		// a transient failure there loses the evidence and lets a later run repeat
+		// the repair. Checkpoint it here for the same reason the non-completed
+		// branch above does.
+		//
+		// A persist failure is reported as a secondary issue only: the validation
+		// error is the primary causal failure and must survive to classify the run
+		// as manual intervention.
+		if persistErr := r.persistCheckpoint(ctx, input.Run.ID, stepRepair, checkpoint); persistErr != nil {
+			r.logError("fixer manual-intervention checkpoint persist failed", map[string]any{
+				"projectId": input.Project.ID, "loopId": input.Loop.ID, "runId": input.Run.ID,
+				"message": persistErr.Error(),
+			})
+		}
 		return checkpoint, err
 	}
 	if held, summary, err := r.fixerHoldSummary(ctx, input.Project, input.Loop, input.Repo, input.PRNumber); err != nil {
@@ -5462,22 +5478,46 @@ func restartLatestRunFromDiscover(ctx context.Context, repos *storage.Repositori
 	return repos.Runs.Upsert(ctx, updated)
 }
 
-// MarkManualInterventionRunRestartFromDiscover rewrites the latest failed or
-// interrupted fixer run's checkpoint to restart_from_discover when it is parked
-// for manual intervention. Operator retry is the explicit authority that escapes
-// a parked manual-intervention checkpoint (for example a missing or invalid
-// repair completion result recorded at resolve-comments or recheck): without
-// this, createRunContext resumes at the same downstream step and
-// validateFixerResumeCheckpoint parks it again, so even a retry after manually
-// recovering or discarding the worktree can never reach repair or discovery.
-// Interrupted runs are included because the retry API exposes them as retryable
-// and createRunContext resumes interrupted predecessors at the same downstream
-// step; only the manual-intervention resume policy is rewritten, so distinct
-// handback/human-takeover resume policies are left untouched. Runs that are not
-// failed/interrupted or are not parked for manual recovery are left untouched so
-// createRunContext's natural resume logic still applies. The boolean reports
-// whether a checkpoint was rewritten.
-func MarkManualInterventionRunRestartFromDiscover(ctx context.Context, repos *storage.Repositories, loopID, updatedAt string) (bool, error) {
+// fixerRunParkedOnInvalidCompletion reports whether a manual-intervention park was
+// caused by the repair completion contract rather than by a condition an operator
+// must clear outside Looper.
+func fixerRunParkedOnInvalidCompletion(run storage.RunRecord, checkpoint fixerCheckpoint) bool {
+	// A skipped repair never had a contract to satisfy.
+	if checkpoint.SkipReason != "" {
+		return false
+	}
+	// Every other manual-intervention park records a pause reason naming its own
+	// cause (risky_conflict, dirty_worktree, auto_commit_disabled). The
+	// completion-contract park records none.
+	if checkpoint.Pause != nil && strings.TrimSpace(checkpoint.Pause.Reason) != "" {
+		return false
+	}
+	if checkpoint.Repair == nil {
+		// A wholly absent record only proves a missing contract when the run parked
+		// at a step that requires the structured result; before repair, a nil record
+		// is simply work that had not started.
+		return validateFixerResumeCheckpoint(asFixerStep(derefString(run.CurrentStep)), checkpoint) != nil
+	}
+	return validateCompletedRepairCheckpoint(checkpoint.Repair, checkpoint.Worktree) != nil
+}
+
+// MarkInvalidCompletionRunRestartFromDiscover rewrites a fixer run parked for
+// manual intervention to restart_from_discover, but only when the park was caused
+// by a missing or invalid repair completion contract.
+//
+// manual_intervention is also the policy for risky conflicts, dirty worktrees, and
+// auto-commit-disabled parks. Those name a condition an operator must resolve on
+// disk or in configuration; rewriting them to restart_from_discover would discard
+// the park and rerun discovery while the blocking condition still holds. Only the
+// completion-contract park is safe to escape this way, because discovery rebuilds
+// the fix items the missing result would have authorized.
+//
+// Interrupted runs are included because the retry API exposes them as retryable and
+// createRunContext resumes interrupted predecessors at the same downstream step.
+// Runs that are not failed/interrupted, not parked for manual recovery, or parked
+// for another cause are left untouched so createRunContext's natural resume logic
+// still applies. The boolean reports whether a checkpoint was rewritten.
+func MarkInvalidCompletionRunRestartFromDiscover(ctx context.Context, repos *storage.Repositories, loopID, updatedAt string) (bool, error) {
 	if repos == nil || repos.Runs == nil {
 		return false, nil
 	}
@@ -5490,6 +5530,9 @@ func MarkManualInterventionRunRestartFromDiscover(ctx context.Context, repos *st
 	}
 	checkpoint := parseCheckpoint(latestRun.CheckpointJSON)
 	if checkpoint.ResumePolicy != loops.ResumePolicyManualIntervention {
+		return false, nil
+	}
+	if !fixerRunParkedOnInvalidCompletion(*latestRun, checkpoint) {
 		return false, nil
 	}
 	checkpoint.ResumePolicy = loops.ResumePolicyRestartFromDiscover
@@ -7019,6 +7062,14 @@ func previousFixerStep(step FixerStep) FixerStep {
 func validateFixerResumeCheckpoint(startStep FixerStep, checkpoint fixerCheckpoint) error {
 	switch startStep {
 	case stepReconcileCommits, stepValidate, stepPush, stepResolveComments, stepRecheck:
+		// A skipped repair (ineligible PR, no remaining fix items) intentionally
+		// succeeds without creating a repair record, and every downstream step
+		// short-circuits on SkipReason before it would need the structured result.
+		// Demanding the contract here would park an interrupted skip for manual
+		// recovery even though no repair was ever authorized to run.
+		if checkpoint.SkipReason != "" {
+			return nil
+		}
 		// Resuming at any step after repair requires the structured completion
 		// result as the authority for reconcile/validate/push/resolve decisions.
 		// A legacy or interrupted run may record LastCompletedStep as repair or

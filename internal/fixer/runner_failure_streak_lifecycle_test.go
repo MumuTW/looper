@@ -121,7 +121,7 @@ func TestResumeCheckpointFailureBypassesBreaker(t *testing.T) {
 	}
 	// The resume-validation manual-intervention failure must durably park the
 	// checkpoint as manual_intervention so operator retry can escape via
-	// MarkManualInterventionRunRestartFromDiscover. createRunContext sets the
+	// MarkInvalidCompletionRunRestartFromDiscover. createRunContext sets the
 	// resumed checkpoint policy to advance_from_checkpoint; preserving that
 	// nonempty advance policy would leave the failed run ineligible for the
 	// retry escape and re-park on every retry.
@@ -132,9 +132,9 @@ func TestResumeCheckpointFailureBypassesBreaker(t *testing.T) {
 	if got := parseCheckpoint(parkedRun.CheckpointJSON).ResumePolicy; got != loops.ResumePolicyManualIntervention {
 		t.Fatalf("parked checkpoint ResumePolicy = %q, want manual_intervention", got)
 	}
-	rewrote, err := MarkManualInterventionRunRestartFromDiscover(context.Background(), fixture.repos, loop.ID, fixture.nowISO())
+	rewrote, err := MarkInvalidCompletionRunRestartFromDiscover(context.Background(), fixture.repos, loop.ID, fixture.nowISO())
 	if err != nil || !rewrote {
-		t.Fatalf("MarkManualInterventionRunRestartFromDiscover() = (%v, %v), want escape rewrite after durable manual park", rewrote, err)
+		t.Fatalf("MarkInvalidCompletionRunRestartFromDiscover() = (%v, %v), want escape rewrite after durable manual park", rewrote, err)
 	}
 	escaped, err := fixture.repos.Runs.GetByID(context.Background(), result.RunID)
 	if err != nil || escaped == nil {
