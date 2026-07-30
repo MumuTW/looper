@@ -34,9 +34,9 @@ func TestRuntimeReconcileStaleRunningRunsQuarantinesExpiredMissingPIDExecution(t
 		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
 	}
 
-	summary, err := rt.ReconcileStaleRunningRuns(context.Background())
+	summary, err := rt.reconcileLiveStaleRunningRuns(context.Background())
 	if err != nil {
-		t.Fatalf("ReconcileStaleRunningRuns() error = %v", err)
+		t.Fatalf("reconcileLiveStaleRunningRuns() error = %v", err)
 	}
 	if summary.SkippedUncertainRuns != 1 || summary.QuarantinedExecutions != 1 || summary.InterruptedRuns != 0 {
 		t.Fatalf("summary = %#v, want expired leader-only evidence quarantined", summary)
@@ -79,9 +79,6 @@ func TestRuntimeReconcileStaleRunningRunsQuarantinesExpiredMismatchedPID(t *test
 	}{
 		{name: "live", reconcile: func(rt *Runtime) (StaleRunReconcileSummary, error) {
 			return rt.reconcileLiveStaleRunningRuns(context.Background())
-		}},
-		{name: "manual", reconcile: func(rt *Runtime) (StaleRunReconcileSummary, error) {
-			return rt.ReconcileStaleRunningRuns(context.Background())
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -132,9 +129,9 @@ func TestRuntimeReconcileStaleRunningRunsNeverOverlapsMatchingLiveProcess(t *tes
 		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
 	}
 
-	summary, err := rt.ReconcileStaleRunningRuns(context.Background())
+	summary, err := rt.reconcileLiveStaleRunningRuns(context.Background())
 	if err != nil {
-		t.Fatalf("ReconcileStaleRunningRuns() error = %v", err)
+		t.Fatalf("reconcileLiveStaleRunningRuns() error = %v", err)
 	}
 	if summary.InterruptedRuns != 0 || summary.LoopsRequeued != 0 || summary.CleanedExecutions != 0 {
 		t.Fatalf("summary = %#v, want matching live process to block overlap", summary)
@@ -167,9 +164,9 @@ func TestRuntimeReconcileStaleRunningRunsParksFreshInvalidIdentityForConfirmatio
 		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
 	}
 
-	summary, err := rt.ReconcileStaleRunningRuns(context.Background())
+	summary, err := rt.reconcileLiveStaleRunningRuns(context.Background())
 	if err != nil {
-		t.Fatalf("ReconcileStaleRunningRuns() error = %v", err)
+		t.Fatalf("reconcileLiveStaleRunningRuns() error = %v", err)
 	}
 	if summary.SkippedUncertainRuns != 1 || summary.QuarantinedExecutions != 1 || summary.InterruptedRuns != 0 {
 		t.Fatalf("summary = %#v, want explicit confirmation-needed quarantine", summary)
@@ -202,7 +199,7 @@ func TestRuntimeReconcileStaleRunningRunsPreservesQuarantineAfterExpiry(t *testi
 	}); err != nil {
 		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
 	}
-	if _, err := rt.ReconcileStaleRunningRuns(context.Background()); err != nil {
+	if _, err := rt.reconcileLiveStaleRunningRuns(context.Background()); err != nil {
 		t.Fatalf("first reconcile error = %v", err)
 	}
 
@@ -221,7 +218,7 @@ func TestRuntimeReconcileStaleRunningRunsPreservesQuarantineAfterExpiry(t *testi
 	rt.mu.Lock()
 	rt.now = func() time.Time { return later }
 	rt.mu.Unlock()
-	summary, err := rt.ReconcileStaleRunningRuns(context.Background())
+	summary, err := rt.reconcileLiveStaleRunningRuns(context.Background())
 	if err != nil {
 		t.Fatalf("second reconcile error = %v", err)
 	}

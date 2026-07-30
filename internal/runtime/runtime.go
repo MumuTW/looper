@@ -88,7 +88,6 @@ type staleRunReconcileMode string
 const (
 	staleRunReconcileModeStartup staleRunReconcileMode = "startup"
 	staleRunReconcileModeLive    staleRunReconcileMode = "live"
-	staleRunReconcileModeManual  staleRunReconcileMode = "manual"
 )
 
 type RecoveryOrphanAgentCleanup struct {
@@ -2310,20 +2309,6 @@ func (r *Runtime) appendStartedEvent(ctx context.Context, startedAt time.Time, r
 
 func (r *Runtime) ExecutionMatchesProcess(ctx context.Context, execution storage.AgentExecutionRecord, pid int) (matches bool, running bool, err error) {
 	return r.executionMatchesProcess(ctx, execution, pid)
-}
-
-func (r *Runtime) ReconcileStaleRunningRuns(ctx context.Context) (StaleRunReconcileSummary, error) {
-	r.mu.RLock()
-	repositories := r.services.Repositories
-	now := r.now
-	r.mu.RUnlock()
-	if repositories == nil {
-		return StaleRunReconcileSummary{}, fmt.Errorf("storage is not configured")
-	}
-	if now == nil {
-		now = time.Now
-	}
-	return r.reconcileStaleRunningRunsWithMode(ctx, repositories, now().UTC(), staleRunReconcileModeManual)
 }
 
 func (r *Runtime) reconcileLiveStaleRunningRuns(ctx context.Context) (StaleRunReconcileSummary, error) {
