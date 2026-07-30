@@ -17,25 +17,26 @@ import (
 	"strings"
 	"time"
 
-	"github.com/MumuTW/looper/internal/agent"
-	"github.com/MumuTW/looper/internal/bootstrap"
-	"github.com/MumuTW/looper/internal/config"
-	"github.com/MumuTW/looper/internal/disclosure"
-	"github.com/MumuTW/looper/internal/domain"
-	"github.com/MumuTW/looper/internal/eventlog"
-	githubinfra "github.com/MumuTW/looper/internal/infra/github"
-	"github.com/MumuTW/looper/internal/infra/specpr"
-	"github.com/MumuTW/looper/internal/labels"
-	"github.com/MumuTW/looper/internal/lifecycle"
-	"github.com/MumuTW/looper/internal/loops"
-	"github.com/MumuTW/looper/internal/loops/failureclass"
-	"github.com/MumuTW/looper/internal/network/protocol"
-	"github.com/MumuTW/looper/internal/networkpolicy"
-	"github.com/MumuTW/looper/internal/processcontainment"
-	"github.com/MumuTW/looper/internal/storage"
-	"github.com/MumuTW/looper/internal/validation"
-	"github.com/MumuTW/looper/internal/worker/workflow"
-	"github.com/MumuTW/looper/internal/worktreesafety"
+	"github.com/nexu-io/looper/internal/agent"
+	"github.com/nexu-io/looper/internal/bootstrap"
+	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/disclosure"
+	"github.com/nexu-io/looper/internal/domain"
+	"github.com/nexu-io/looper/internal/eventlog"
+	githubinfra "github.com/nexu-io/looper/internal/infra/github"
+	"github.com/nexu-io/looper/internal/infra/specpr"
+	"github.com/nexu-io/looper/internal/labels"
+	"github.com/nexu-io/looper/internal/lifecycle"
+	"github.com/nexu-io/looper/internal/loops"
+	"github.com/nexu-io/looper/internal/loops/failureclass"
+	"github.com/nexu-io/looper/internal/network/protocol"
+	"github.com/nexu-io/looper/internal/networkpolicy"
+	"github.com/nexu-io/looper/internal/processcontainment"
+	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/validation"
+	"github.com/nexu-io/looper/internal/worker/workflow"
+	"github.com/nexu-io/looper/internal/worktreesafety"
+	"github.com/nexu-io/looper/internal/roles"
 )
 
 const (
@@ -46,10 +47,10 @@ const (
 	stepValidate        = workflow.StepValidate
 	stepOpenPR          = workflow.StepOpenPR
 
-	FailureRetryableTransient   QueueFailureKind = "retryable_transient"
-	FailureRetryableAfterResume QueueFailureKind = "retryable_after_resume"
-	FailureNonRetryable         QueueFailureKind = "non_retryable"
-	FailureManualIntervention   QueueFailureKind = "manual_intervention"
+	FailureRetryableTransient   roles.QueueFailureKind = "retryable_transient"
+	FailureRetryableAfterResume roles.QueueFailureKind = "retryable_after_resume"
+	FailureNonRetryable         roles.QueueFailureKind = "non_retryable"
+	FailureManualIntervention   roles.QueueFailureKind = "manual_intervention"
 
 	defaultAgentTimeout = time.Hour
 	defaultClaimTTL     = 10 * time.Minute
@@ -77,7 +78,7 @@ var (
 // pipeline order and resume decisions live in internal/worker/workflow.
 type WorkerStep = workflow.Step
 
-type QueueFailureKind string
+
 
 type PullRequestSummary struct {
 	Number      int64
@@ -449,7 +450,7 @@ type RunCompletedInput struct {
 	Subtitle          string
 	Status            string
 	Summary           string
-	FailureKind       QueueFailureKind
+	FailureKind       roles.QueueFailureKind
 	PullRequestNumber int64
 	PullRequestURL    string
 }
@@ -595,7 +596,7 @@ type ProcessResult struct {
 	QueueItemID       string
 	Status            string
 	Summary           string
-	FailureKind       QueueFailureKind
+	FailureKind       roles.QueueFailureKind
 	PullRequestNumber int64
 }
 
@@ -713,7 +714,7 @@ type stepInput struct {
 
 type loopError struct {
 	message string
-	kind    QueueFailureKind
+	kind    roles.QueueFailureKind
 }
 
 type holdSkipError struct{ summary string }
@@ -1049,7 +1050,7 @@ func (r *Runner) recoverClaimedItem(ctx context.Context, queueItem storage.Queue
 	return &ProcessResult{LoopID: derefString(queueItem.LoopID), QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
 }
 
-func (r *Runner) reconcileRecoveredLoop(ctx context.Context, queueItem storage.QueueItemRecord, failedQueue *storage.QueueItemRecord, failureKind QueueFailureKind) error {
+func (r *Runner) reconcileRecoveredLoop(ctx context.Context, queueItem storage.QueueItemRecord, failedQueue *storage.QueueItemRecord, failureKind roles.QueueFailureKind) error {
 	if queueItem.LoopID == nil {
 		return nil
 	}
@@ -2808,7 +2809,7 @@ func (r *Runner) runValidation(ctx context.Context, input ValidationInput) (Vali
 
 type validationFailure struct {
 	message      string
-	kind         QueueFailureKind
+	kind         roles.QueueFailureKind
 	resumePolicy string
 }
 
@@ -2817,7 +2818,7 @@ func classifyValidationFailure(result ValidationResult) validationFailure {
 		policy := validation.PolicyFor(result.FailureCategory)
 		return validationFailure{
 			message:      firstNonEmpty(strings.TrimSpace(result.Summary), "Validation failed"),
-			kind:         QueueFailureKind(policy.FailureKind),
+			kind:         roles.QueueFailureKind(policy.FailureKind),
 			resumePolicy: policy.ResumePolicy,
 		}
 	}
@@ -3076,7 +3077,7 @@ func (r *Runner) wakeSchedulerAfterEnqueue() {
 	}
 }
 
-func (r *Runner) failQueueItem(ctx context.Context, queueItem storage.QueueItemRecord, kind QueueFailureKind, message string) (*storage.QueueItemRecord, error) {
+func (r *Runner) failQueueItem(ctx context.Context, queueItem storage.QueueItemRecord, kind roles.QueueFailureKind, message string) (*storage.QueueItemRecord, error) {
 	nextAttempts := queueItem.Attempts + 1
 	nowISO := r.nowISO()
 	if !shouldRetryQueueFailure(kind, nextAttempts, queueItem.MaxAttempts) {
@@ -3285,7 +3286,7 @@ func runMatchesQueueAttempt(queueItem storage.QueueItemRecord, run storage.RunRe
 	return run.StartedAt >= *queueItem.ClaimedAt
 }
 
-func buildRunCompletedInput(project storage.ProjectRecord, loop storage.LoopRecord, run storage.RunRecord, checkpoint workerCheckpoint, status string, failureKind QueueFailureKind, summary string) RunCompletedInput {
+func buildRunCompletedInput(project storage.ProjectRecord, loop storage.LoopRecord, run storage.RunRecord, checkpoint workerCheckpoint, status string, failureKind roles.QueueFailureKind, summary string) RunCompletedInput {
 	return RunCompletedInput{
 		ProjectID:         project.ID,
 		LoopID:            loop.ID,
@@ -3309,7 +3310,7 @@ func runNotificationSubtitle(loop storage.LoopRecord, checkpoint workerCheckpoin
 	return loop.ID
 }
 
-func shouldNotifyCompletedRun(kind QueueFailureKind, failedQueue *storage.QueueItemRecord) bool {
+func shouldNotifyCompletedRun(kind roles.QueueFailureKind, failedQueue *storage.QueueItemRecord) bool {
 	if kind == FailureManualIntervention {
 		return true
 	}
@@ -3332,7 +3333,7 @@ func shouldNotifyCompletedRun(kind QueueFailureKind, failedQueue *storage.QueueI
 // inlined rather than shared with those copies, which name it
 // isQueueRetryEligible; only manual_intervention is excluded, because it has
 // left the automated lane and is waiting on a human.
-func shouldRetryQueueFailure(kind QueueFailureKind, nextAttempts, maxAttempts int64) bool {
+func shouldRetryQueueFailure(kind roles.QueueFailureKind, nextAttempts, maxAttempts int64) bool {
 	if kind != FailureRetryableTransient && kind != FailureRetryableAfterResume && kind != FailureNonRetryable {
 		return false
 	}
@@ -3342,7 +3343,7 @@ func shouldRetryQueueFailure(kind QueueFailureKind, nextAttempts, maxAttempts in
 	return maxAttempts > 0 && nextAttempts < maxAttempts
 }
 
-func issueClaimStatusForFailure(checkpoint workerCheckpoint, failedQueue *storage.QueueItemRecord, kind QueueFailureKind) string {
+func issueClaimStatusForFailure(checkpoint workerCheckpoint, failedQueue *storage.QueueItemRecord, kind roles.QueueFailureKind) string {
 	if failedQueue != nil && failedQueue.Status == "queued" {
 		if checkpoint.PullRequest != nil && strings.TrimSpace(checkpoint.PullRequest.URL) != "" {
 			return issueClaimStatusPRLinked
@@ -3418,7 +3419,7 @@ func workerFailureBoundaryForStep(step WorkerStep) failureclass.Boundary {
 	}
 }
 
-func workerFailureKind(kind failureclass.Kind) QueueFailureKind {
+func workerFailureKind(kind failureclass.Kind) roles.QueueFailureKind {
 	switch kind {
 	case failureclass.RetryableTransient:
 		return FailureRetryableTransient

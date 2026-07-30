@@ -18,28 +18,29 @@ import (
 	"strings"
 	"time"
 
-	"github.com/MumuTW/looper/internal/agent"
-	"github.com/MumuTW/looper/internal/bootstrap"
-	"github.com/MumuTW/looper/internal/config"
-	"github.com/MumuTW/looper/internal/disclosure"
-	"github.com/MumuTW/looper/internal/domain"
-	"github.com/MumuTW/looper/internal/eventlog"
-	"github.com/MumuTW/looper/internal/fixer/adopt"
-	"github.com/MumuTW/looper/internal/fixer/discovery"
-	"github.com/MumuTW/looper/internal/fixer/failurepolicy"
-	"github.com/MumuTW/looper/internal/fixer/publish"
-	"github.com/MumuTW/looper/internal/fixer/reconcile"
-	"github.com/MumuTW/looper/internal/fixer/workflow"
-	githubinfra "github.com/MumuTW/looper/internal/infra/github"
-	"github.com/MumuTW/looper/internal/infra/specpr"
-	"github.com/MumuTW/looper/internal/labels"
-	"github.com/MumuTW/looper/internal/lifecycle"
-	"github.com/MumuTW/looper/internal/loops"
-	"github.com/MumuTW/looper/internal/loops/failureclass"
-	"github.com/MumuTW/looper/internal/processcontainment"
-	"github.com/MumuTW/looper/internal/storage"
-	"github.com/MumuTW/looper/internal/validation"
-	"github.com/MumuTW/looper/internal/worktreesafety"
+	"github.com/nexu-io/looper/internal/agent"
+	"github.com/nexu-io/looper/internal/bootstrap"
+	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/disclosure"
+	"github.com/nexu-io/looper/internal/domain"
+	"github.com/nexu-io/looper/internal/eventlog"
+	"github.com/nexu-io/looper/internal/fixer/adopt"
+	"github.com/nexu-io/looper/internal/fixer/discovery"
+	"github.com/nexu-io/looper/internal/fixer/failurepolicy"
+	"github.com/nexu-io/looper/internal/fixer/publish"
+	"github.com/nexu-io/looper/internal/fixer/reconcile"
+	"github.com/nexu-io/looper/internal/fixer/workflow"
+	"github.com/nexu-io/looper/internal/roles"
+	githubinfra "github.com/nexu-io/looper/internal/infra/github"
+	"github.com/nexu-io/looper/internal/infra/specpr"
+	"github.com/nexu-io/looper/internal/labels"
+	"github.com/nexu-io/looper/internal/lifecycle"
+	"github.com/nexu-io/looper/internal/loops"
+	"github.com/nexu-io/looper/internal/loops/failureclass"
+	"github.com/nexu-io/looper/internal/processcontainment"
+	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/validation"
+	"github.com/nexu-io/looper/internal/worktreesafety"
 )
 
 // FixerStep aliases the extracted workflow authority's step type; the
@@ -59,14 +60,7 @@ const (
 	stepRecheck          = workflow.StepRecheck
 )
 
-type QueueFailureKind string
-
 const (
-	FailureRetryableTransient   QueueFailureKind = "retryable_transient"
-	FailureRetryableAfterResume QueueFailureKind = "retryable_after_resume"
-	FailureNonRetryable         QueueFailureKind = "non_retryable"
-	FailureManualIntervention   QueueFailureKind = "manual_intervention"
-
 	noopResolveManualIntervention = "resolve-comments left review threads unresolved because fixer produced no new commits to push"
 	riskyConflictManualHold       = "risky conflict fixes require manual intervention"
 
@@ -578,7 +572,7 @@ type ProcessResult struct {
 	QueueItemID string
 	Status      string
 	Summary     string
-	FailureKind QueueFailureKind
+	FailureKind roles.QueueFailureKind
 }
 
 type replyAction string
@@ -697,7 +691,7 @@ type FixerOutcomeFailure struct {
 	Step      string           `json:"step,omitempty"`
 	Message   string           `json:"message,omitempty"`
 	Retryable *bool            `json:"retryable,omitempty"`
-	Kind      QueueFailureKind `json:"kind,omitempty"`
+	Kind      roles.QueueFailureKind `json:"kind,omitempty"`
 }
 
 type fixerCheckpoint struct {
@@ -915,7 +909,7 @@ type stepInput struct {
 
 type loopError struct {
 	message string
-	kind    QueueFailureKind
+	kind    roles.QueueFailureKind
 }
 
 type holdSkipError struct{ summary string }
@@ -968,7 +962,7 @@ func validateCompletedRepairCheckpoint(repair *checkpointRepair, worktree *check
 	}
 	return &loopError{
 		message: message,
-		kind:    FailureManualIntervention,
+		kind:    roles.FailureManualIntervention,
 	}
 }
 
@@ -1170,7 +1164,7 @@ func backfilledPrimaryFailure(run storage.RunRecord, checkpoint fixerCheckpoint)
 	}
 	if checkpoint.ResumePolicy == loops.ResumePolicyManualIntervention {
 		retryable := false
-		failure.Kind = FailureManualIntervention
+		failure.Kind = roles.FailureManualIntervention
 		failure.Retryable = &retryable
 	}
 	return &failure
@@ -1346,7 +1340,7 @@ func (checkpoint *fixerCheckpoint) recordFailure(step FixerStep, failure *loopEr
 	if checkpoint.Outcome == nil {
 		checkpoint.Outcome = &FixerRunOutcome{}
 	}
-	retryable := failure.kind == FailureRetryableTransient || failure.kind == FailureRetryableAfterResume
+	retryable := failure.kind == roles.FailureRetryableTransient || failure.kind == roles.FailureRetryableAfterResume
 	next := FixerOutcomeFailure{Step: string(step), Message: failure.message, Kind: failure.kind, Retryable: &retryable}
 	if checkpoint.Outcome.PrimaryFailure == nil {
 		checkpoint.Outcome.PrimaryFailure = &next
@@ -1364,7 +1358,7 @@ func (checkpoint *fixerCheckpoint) recordFailure(step FixerStep, failure *loopEr
 // the agent declared completion. err is returned when the payload is absent,
 // unparseable, or declares no recognized outcome — the fixer must not advance to
 // validate/push/resolve on an unauthorized completion.
-func fixerRepairTaskOutcome(result AgentResult) (bool, string, QueueFailureKind, *loopError) {
+func fixerRepairTaskOutcome(result AgentResult) (bool, string, roles.QueueFailureKind, *loopError) {
 	payload := strings.TrimSpace(result.CompletionPayload)
 	if payload == "" {
 		// Older adapters and the checkpoint fallback path do not carry the parsed
@@ -1372,7 +1366,7 @@ func fixerRepairTaskOutcome(result AgentResult) (bool, string, QueueFailureKind,
 		payload = extractCompletionMarkerPayload(result.Stdout + "\n" + result.Stderr)
 	}
 	if payload == "" {
-		return false, "", "", &loopError{message: "Fixer agent completed without required structured outcome", kind: FailureRetryableTransient}
+		return false, "", "", &loopError{message: "Fixer agent completed without required structured outcome", kind: roles.FailureRetryableTransient}
 	}
 	var parsed struct {
 		Outcome     string `json:"outcome"`
@@ -1380,7 +1374,7 @@ func fixerRepairTaskOutcome(result AgentResult) (bool, string, QueueFailureKind,
 		FailureKind string `json:"failure_kind"`
 	}
 	if err := json.Unmarshal([]byte(payload), &parsed); err != nil {
-		return false, "", "", &loopError{message: "Fixer agent completed with invalid structured outcome", kind: FailureRetryableTransient}
+		return false, "", "", &loopError{message: "Fixer agent completed with invalid structured outcome", kind: roles.FailureRetryableTransient}
 	}
 	switch strings.ToLower(strings.TrimSpace(parsed.Outcome)) {
 	case "completed":
@@ -1388,12 +1382,12 @@ func fixerRepairTaskOutcome(result AgentResult) (bool, string, QueueFailureKind,
 	case "blocked":
 		kind, ok := parseFixerBlockedFailureKind(parsed.FailureKind)
 		if !ok {
-			return false, "", "", &loopError{message: "Fixer blocked outcome requires a valid failure_kind", kind: FailureRetryableTransient}
+			return false, "", "", &loopError{message: "Fixer blocked outcome requires a valid failure_kind", kind: roles.FailureRetryableTransient}
 		}
 		message := firstNonEmpty(strings.TrimSpace(parsed.Summary), result.Summary, "fixer repair task was blocked")
 		return true, message, kind, nil
 	default:
-		return false, "", "", &loopError{message: "Fixer agent completed with missing or unrecognized structured outcome", kind: FailureRetryableTransient}
+		return false, "", "", &loopError{message: "Fixer agent completed with missing or unrecognized structured outcome", kind: roles.FailureRetryableTransient}
 	}
 }
 
@@ -1408,14 +1402,14 @@ func fixerRepairTaskOutcome(result AgentResult) (bool, string, QueueFailureKind,
 // applies a kind-derived policy when none is set, and a resumed checkpoint always
 // carries advance_from_checkpoint — so offering it would promise a re-prepared
 // environment that this path does not deliver.
-func parseFixerBlockedFailureKind(raw string) (QueueFailureKind, bool) {
-	switch QueueFailureKind(strings.ToLower(strings.TrimSpace(raw))) {
-	case FailureManualIntervention:
-		return FailureManualIntervention, true
-	case FailureRetryableAfterResume:
-		return FailureRetryableAfterResume, true
-	case FailureRetryableTransient:
-		return FailureRetryableTransient, true
+func parseFixerBlockedFailureKind(raw string) (roles.QueueFailureKind, bool) {
+	switch roles.QueueFailureKind(strings.ToLower(strings.TrimSpace(raw))) {
+	case roles.FailureManualIntervention:
+		return roles.FailureManualIntervention, true
+	case roles.FailureRetryableAfterResume:
+		return roles.FailureRetryableAfterResume, true
+	case roles.FailureRetryableTransient:
+		return roles.FailureRetryableTransient, true
 	default:
 		return "", false
 	}
@@ -2188,7 +2182,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			AvailableAt:  availableAt,
 			Attempts:     queueItem.Attempts,
 			ErrorMessage: &message,
-			ErrorKind:    string(FailureRetryableAfterResume),
+			ErrorKind:    string(roles.FailureRetryableAfterResume),
 			UpdatedAt:    r.nowISO(),
 		}); err != nil {
 			return ProcessResult{}, err
@@ -2275,7 +2269,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 				return ProcessResult{}, err
 			}
 			if !acquired {
-				return ProcessResult{}, &loopError{message: fmt.Sprintf("Pull request lock is already held for %s", claimedLockKey), kind: FailureRetryableTransient}
+				return ProcessResult{}, &loopError{message: fmt.Sprintf("Pull request lock is already held for %s", claimedLockKey), kind: roles.FailureRetryableTransient}
 			}
 			acquiredClaimedLock = true
 		}
@@ -2307,7 +2301,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		// interrupted downstream checkpoint) must durably park the checkpoint so
 		// operator retry can escape via restart_from_discover instead of resuming
 		// the same downstream step and re-parking forever.
-		if failure.kind == FailureManualIntervention {
+		if failure.kind == roles.FailureManualIntervention {
 			latest.ResumePolicy = loops.ResumePolicyManualIntervention
 		} else {
 			latest.ResumePolicy = loops.NormalizeResumePolicy(string(failure.kind), latest.ResumePolicy)
@@ -2871,7 +2865,7 @@ func (r *Runner) runClaimPRStep(ctx context.Context, input stepInput) (fixerChec
 		return input.Checkpoint, err
 	}
 	if !acquired {
-		return input.Checkpoint, &loopError{message: fmt.Sprintf("Pull request lock is already held for %s", lockKey), kind: FailureRetryableTransient}
+		return input.Checkpoint, &loopError{message: fmt.Sprintf("Pull request lock is already held for %s", lockKey), kind: roles.FailureRetryableTransient}
 	}
 	checkpoint := input.Checkpoint
 	checkpoint.ClaimedLockKey = lockKey
@@ -2881,7 +2875,7 @@ func (r *Runner) runClaimPRStep(ctx context.Context, input stepInput) (fixerChec
 func (r *Runner) runCollectFixesStep(ctx context.Context, input stepInput) (fixerCheckpoint, error) {
 	checkpoint := input.Checkpoint
 	if checkpoint.Detail == nil {
-		return checkpoint, &loopError{message: "Missing PR detail checkpoint for collect-fixes step", kind: FailureRetryableTransient}
+		return checkpoint, &loopError{message: "Missing PR detail checkpoint for collect-fixes step", kind: roles.FailureRetryableTransient}
 	}
 	policy := r.discoveryPolicyForProject(input.Project.ID)
 	if (!policy.IncludeDrafts && checkpoint.Detail.IsDraft) || normalizePRState(checkpoint.Detail.State) != "open" {
@@ -2890,7 +2884,7 @@ func (r *Runner) runCollectFixesStep(ctx context.Context, input stepInput) (fixe
 	}
 	fixItems, err := collectFixItemsFromCheckpointForStep(checkpoint)
 	if err != nil {
-		return checkpoint, &loopError{message: err.Error(), kind: FailureNonRetryable}
+		return checkpoint, &loopError{message: err.Error(), kind: roles.FailureNonRetryable}
 	}
 	checkpoint.FixItems = fixItems
 	checkpoint.FixItemsHash = hashFixItems(fixItems)
@@ -2972,7 +2966,7 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (f
 				}
 				checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
 				checkpoint.Pause = newCheckpointPause(checkpointPauseReasonDirtyWorktree, false, "", "", nil)
-				return checkpoint, &loopError{message: fmt.Sprintf("Fixer worktree is dirty for branch %s; manual intervention required", existingBranch), kind: FailureManualIntervention}
+				return checkpoint, &loopError{message: fmt.Sprintf("Fixer worktree is dirty for branch %s; manual intervention required", existingBranch), kind: roles.FailureManualIntervention}
 			}
 		}
 		// Missing/unusable checkout: best-effort cleanup of stale registration,
@@ -2990,7 +2984,7 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (f
 		if err := clearUnusableFixerWorktreePath(existingPath); err != nil {
 			if errors.Is(err, worktreesafety.ErrUnusableFixerWorktreePreserved) {
 				checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
-				return checkpoint, &loopError{message: err.Error(), kind: FailureManualIntervention}
+				return checkpoint, &loopError{message: err.Error(), kind: roles.FailureManualIntervention}
 			}
 			return checkpoint, err
 		}
@@ -3014,7 +3008,7 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (f
 		}
 		checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
 		checkpoint.Pause = newCheckpointPause(checkpointPauseReasonDirtyWorktree, false, "", "", nil)
-		return checkpoint, &loopError{message: fmt.Sprintf("Fixer worktree is dirty for branch %s; manual intervention required", branch), kind: FailureManualIntervention}
+		return checkpoint, &loopError{message: fmt.Sprintf("Fixer worktree is dirty for branch %s; manual intervention required", branch), kind: roles.FailureManualIntervention}
 	}
 	return r.finishPreparedWorktree(ctx, input, checkpoint, branch, worktreeRoot, created.WorktreePath, prepared.HeadSHA)
 }
@@ -3161,7 +3155,7 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 		return checkpoint, nil
 	}
 	if len(checkpoint.FixItems) == 0 {
-		return checkpoint, &loopError{message: "Missing fix items checkpoint for repair step", kind: FailureRetryableTransient}
+		return checkpoint, &loopError{message: "Missing fix items checkpoint for repair step", kind: roles.FailureRetryableTransient}
 	}
 	hasConflict := false
 	for _, item := range checkpoint.FixItems {
@@ -3173,7 +3167,7 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 	if hasConflict && !r.allowRiskyFixes {
 		checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
 		checkpoint.Pause = newCheckpointPause(checkpointPauseReasonRiskyConflict, true, detailHeadSHA(checkpoint.Detail), currentFixItemsStateHash(checkpoint), nil)
-		return checkpoint, &loopError{message: fmt.Sprintf("Skipped %s#%d because risky conflict fixes require manual intervention", input.Repo, input.PRNumber), kind: FailureManualIntervention}
+		return checkpoint, &loopError{message: fmt.Sprintf("Skipped %s#%d because risky conflict fixes require manual intervention", input.Repo, input.PRNumber), kind: roles.FailureManualIntervention}
 	}
 	worktree, err := requireWorktree(checkpoint)
 	if err != nil {
@@ -3217,7 +3211,7 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 		if _, mergeErr := r.git.MergeBaseIntoWorktree(ctx, MergeBaseInput{WorktreePath: worktree.Path, Remote: "origin", BaseBranch: base}); mergeErr != nil {
 			checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
 			checkpoint.Pause = newCheckpointPause(checkpointPauseReasonRiskyConflict, true, detailHeadSHA(checkpoint.Detail), currentFixItemsStateHash(checkpoint), nil)
-			return checkpoint, &loopError{message: fmt.Sprintf("Could not merge base %q into %s#%d for conflict resolution: %v", base, input.Repo, input.PRNumber, mergeErr), kind: FailureManualIntervention}
+			return checkpoint, &loopError{message: fmt.Sprintf("Could not merge base %q into %s#%d for conflict resolution: %v", base, input.Repo, input.PRNumber, mergeErr), kind: roles.FailureManualIntervention}
 		}
 	}
 	executionID := eventlog.NewEventID("agent")
@@ -3267,10 +3261,10 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 		checkpoint.Repair = checkpointRepairFromAgentResult(executionID, detailHeadSHA(checkpoint.Detail), result, r.nowISO())
 		checkpoint.ResumePolicy = "retry_from_timeout_context"
 		if err := r.persistCheckpoint(ctx, input.Run.ID, stepRepair, checkpoint); err != nil {
-			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+			return checkpoint, &loopError{message: err.Error(), kind: roles.FailureRetryableAfterResume}
 		}
 		message := firstNonEmpty(result.Summary, result.Stderr, "Fixer agent "+result.Status)
-		return checkpoint, &loopError{message: message, kind: FailureRetryableTransient}
+		return checkpoint, &loopError{message: message, kind: roles.FailureRetryableTransient}
 	}
 	// Build the repair record before validating rather than probing with a
 	// two-field copy: validation and the persisted checkpoint then rest on the
@@ -3409,7 +3403,7 @@ func (r *Runner) runValidateStep(ctx context.Context, input stepInput) (fixerChe
 		if finalInspect.HasUncommittedChanges {
 			checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
 			checkpoint.Pause = newCheckpointPause(checkpointPauseReasonDirtyWorktree, false, "", "", nil)
-			return checkpoint, &loopError{message: "Validation keeps producing new modifications after an extra reconcile pass", kind: FailureManualIntervention}
+			return checkpoint, &loopError{message: "Validation keeps producing new modifications after an extra reconcile pass", kind: roles.FailureManualIntervention}
 		}
 		second.HeadSHA = finalInspect.HeadSHA
 		second.Summary = firstNonEmpty(second.Summary, "Validation passed after extra reconcile")
@@ -3457,17 +3451,17 @@ func (r *Runner) runPushStep(ctx context.Context, input stepInput) (fixerCheckpo
 	}
 	branch := firstNonEmpty(worktree.Branch, detailHeadRefName(checkpoint.Detail))
 	if branch == "" {
-		return checkpoint, &loopError{message: "Missing PR head branch for push step", kind: FailureRetryableAfterResume}
+		return checkpoint, &loopError{message: "Missing PR head branch for push step", kind: roles.FailureRetryableAfterResume}
 	}
 	if !r.allowAutoPush {
 		r.appendEvent(ctx, eventInput{eventType: "fixer.push.skipped", projectID: input.Project.ID, loopID: input.Loop.ID, entityType: "pull_request", entityID: buildPullRequestTargetID(input.Repo, input.PRNumber), payload: map[string]any{"branch": branch, "reason": "auto_push_disabled"}})
 		checkpoint.Push = &checkpointPush{Pushed: false, Branch: branch, Remote: "origin", SkippedReason: "Auto push disabled"}
 		checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
 		checkpoint.Pause = newCheckpointPause(checkpointPauseReasonAutoPushDisabled, false, "", "", nil)
-		return checkpoint, &loopError{message: fmt.Sprintf("Auto push disabled; manual fix push required for branch %s", branch), kind: FailureManualIntervention}
+		return checkpoint, &loopError{message: fmt.Sprintf("Auto push disabled; manual fix push required for branch %s", branch), kind: roles.FailureManualIntervention}
 	}
 	if checkpoint.ReconcileCommits == nil {
-		return checkpoint, &loopError{message: "Missing reconcile-commits checkpoint for push step", kind: FailureRetryableAfterResume}
+		return checkpoint, &loopError{message: "Missing reconcile-commits checkpoint for push step", kind: roles.FailureRetryableAfterResume}
 	}
 	if len(validationCommands) > 0 {
 		inspect, err := r.git.InspectHead(ctx, InspectHeadInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, BaseRef: reconcile.BaseHeadSHA(checkpoint.ReconcileCommits)})
@@ -3489,7 +3483,7 @@ func (r *Runner) runPushStep(ctx context.Context, input stepInput) (fixerCheckpo
 		}
 	}
 	if !checkpoint.ReconcileCommits.WorkingTreeClean {
-		return checkpoint, &loopError{message: "Working tree must be clean before push", kind: FailureRetryableAfterResume}
+		return checkpoint, &loopError{message: "Working tree must be clean before push", kind: roles.FailureRetryableAfterResume}
 	}
 	adopted, updatedCheckpoint, err := r.adoptLifecyclePushEvidence(ctx, input, checkpoint, branch)
 	if err != nil {
@@ -3512,7 +3506,7 @@ func (r *Runner) runPushStep(ctx context.Context, input stepInput) (fixerCheckpo
 	localHeadSHA := ""
 	if len(validationCommands) > 0 {
 		if checkpoint.Validation == nil || !checkpoint.Validation.Passed || strings.TrimSpace(checkpoint.Validation.HeadSHA) == "" {
-			return checkpoint, &loopError{message: "Missing validated head SHA for push step", kind: FailureRetryableAfterResume}
+			return checkpoint, &loopError{message: "Missing validated head SHA for push step", kind: roles.FailureRetryableAfterResume}
 		}
 		localHeadSHA = checkpoint.Validation.HeadSHA
 	}
@@ -3523,11 +3517,11 @@ func (r *Runner) runPushStep(ctx context.Context, input stepInput) (fixerCheckpo
 			eventType = "fixer.push.conflicted"
 		}
 		r.appendEvent(ctx, eventInput{eventType: eventType, projectID: input.Project.ID, loopID: input.Loop.ID, entityType: "pull_request", entityID: buildPullRequestTargetID(input.Repo, input.PRNumber), payload: map[string]any{"branch": branch, "message": message}})
-		return checkpoint, &loopError{message: message, kind: FailureRetryableAfterResume}
+		return checkpoint, &loopError{message: message, kind: roles.FailureRetryableAfterResume}
 	}
 	finalHeadSHA := checkpoint.ReconcileCommits.FinalHeadSHA
 	if finalHeadSHA == "" {
-		return checkpoint, &loopError{message: "reconcileCommits.finalHeadSha is required", kind: FailureRetryableAfterResume}
+		return checkpoint, &loopError{message: "reconcileCommits.finalHeadSha is required", kind: roles.FailureRetryableAfterResume}
 	}
 	pushedAt := r.nowISO()
 	pushedHeadSHA := resolveCommentsExpectedHeadSHA(checkpoint)
@@ -3628,7 +3622,7 @@ func (r *Runner) adoptLifecyclePushEvidence(ctx context.Context, input stepInput
 			return false, checkpoint, err
 		}
 		if !prepared.Clean {
-			return false, checkpoint, &loopError{message: fmt.Sprintf("Fixer worktree is dirty after adopting agent-pushed head %s", adoptedHead), kind: FailureRetryableAfterResume}
+			return false, checkpoint, &loopError{message: fmt.Sprintf("Fixer worktree is dirty after adopting agent-pushed head %s", adoptedHead), kind: roles.FailureRetryableAfterResume}
 		}
 		validationCommands := r.validationCommandsForProject(input.Project.ID)
 		validation, err := r.runValidation(ctx, ValidationInput{CWD: checkpoint.Worktree.Path, Commands: validationCommands})
@@ -3642,7 +3636,7 @@ func (r *Runner) adoptLifecyclePushEvidence(ctx context.Context, input stepInput
 		validation.HeadSHA = inspect.HeadSHA
 		checkpoint.Validation = &validation
 		if inspect.HasUncommittedChanges {
-			return false, checkpoint, &loopError{message: "Validation produced uncommitted changes after adopting agent-pushed head", kind: FailureRetryableAfterResume}
+			return false, checkpoint, &loopError{message: "Validation produced uncommitted changes after adopting agent-pushed head", kind: roles.FailureRetryableAfterResume}
 		}
 		if !validation.Passed {
 			failure := failurepolicy.ClassifyValidation(validation.FailureCategory, validation.Summary)
@@ -3650,7 +3644,7 @@ func (r *Runner) adoptLifecyclePushEvidence(ctx context.Context, input stepInput
 			return false, checkpoint, &loopError{message: firstNonEmpty(validation.Summary, "Validation failed for adopted agent-pushed head"), kind: fixerFailureKind(failure.Kind)}
 		}
 		if validation.HeadSHA != adoptedHead {
-			return false, checkpoint, &loopError{message: firstNonEmpty(validation.Summary, "Validation failed for adopted agent-pushed head"), kind: FailureRetryableAfterResume}
+			return false, checkpoint, &loopError{message: firstNonEmpty(validation.Summary, "Validation failed for adopted agent-pushed head"), kind: roles.FailureRetryableAfterResume}
 		}
 		checkpoint.Worktree.HeadSHA = adoptedHead
 	}
@@ -3685,10 +3679,10 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 		return checkpoint, nil
 	}
 	if checkpoint.Validation == nil || !checkpoint.Validation.Passed {
-		return checkpoint, &loopError{message: "resolve-comments requires successful validation", kind: FailureRetryableAfterResume}
+		return checkpoint, &loopError{message: "resolve-comments requires successful validation", kind: roles.FailureRetryableAfterResume}
 	}
 	if checkpoint.Push == nil {
-		return checkpoint, &loopError{message: "resolve-comments requires push step to complete", kind: FailureRetryableAfterResume}
+		return checkpoint, &loopError{message: "resolve-comments requires push step to complete", kind: roles.FailureRetryableAfterResume}
 	}
 	liveDetail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
 	if err != nil {
@@ -3713,14 +3707,14 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 		cmp, cmpErr := r.github.CompareCommits(ctx, CompareCommitsInput{Repo: input.Repo, Base: expectedHead, Head: liveDetail.HeadSHA, CWD: input.Project.RepoPath})
 		if cmpErr != nil {
 			checkpoint.ResumePolicy = loops.ResumePolicyRestartFromDiscover
-			return checkpoint, &loopError{message: fmt.Sprintf("Failed to verify fix commit %s is reachable from PR head %s: %v", expectedHead, liveDetail.HeadSHA, cmpErr), kind: FailureRetryableAfterResume}
+			return checkpoint, &loopError{message: fmt.Sprintf("Failed to verify fix commit %s is reachable from PR head %s: %v", expectedHead, liveDetail.HeadSHA, cmpErr), kind: roles.FailureRetryableAfterResume}
 		}
 		switch strings.ToLower(strings.TrimSpace(cmp.Status)) {
 		case "identical", "ahead":
 			// fix commit still in head's history; safe to continue
 		default:
 			checkpoint.ResumePolicy = loops.ResumePolicyRestartFromDiscover
-			return checkpoint, &loopError{message: fmt.Sprintf("PR head %s no longer descends from fix commit %s (compare status %q); will rediscover", liveDetail.HeadSHA, expectedHead, cmp.Status), kind: FailureRetryableAfterResume}
+			return checkpoint, &loopError{message: fmt.Sprintf("PR head %s no longer descends from fix commit %s (compare status %q); will rediscover", liveDetail.HeadSHA, expectedHead, cmp.Status), kind: roles.FailureRetryableAfterResume}
 		}
 	}
 	checkpoint.Detail = mergeCheckpointDetailPreservingLabels(checkpoint.Detail, liveDetail)
@@ -3913,15 +3907,15 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 		checkpoint.FixItems = liveFixItems
 		checkpoint.FixItemsHash = hashFixItems(liveFixItems)
 		checkpoint.ResumePolicy = loops.ResumePolicyRestartFromDiscover
-		return checkpoint, &loopError{message: fmt.Sprintf("Skipped %d review thread(s) because review thread content changed during the fixer run", driftCount), kind: FailureRetryableAfterResume}
+		return checkpoint, &loopError{message: fmt.Sprintf("Skipped %d review thread(s) because review thread content changed during the fixer run", driftCount), kind: roles.FailureRetryableAfterResume}
 	}
 	if contractViolationCount > 0 {
 		checkpoint.ResumePolicy = loops.ResumePolicyRestartFromDiscover
-		return checkpoint, &loopError{message: fmt.Sprintf("Skipped %d review thread(s) because the fixer response omitted or invalidated thread decisions", contractViolationCount), kind: FailureRetryableAfterResume}
+		return checkpoint, &loopError{message: fmt.Sprintf("Skipped %d review thread(s) because the fixer response omitted or invalidated thread decisions", contractViolationCount), kind: roles.FailureRetryableAfterResume}
 	}
 	if mutationFailureCount > 0 {
 		checkpoint.ResumePolicy = loops.ResumePolicyReplayStep
-		return checkpoint, &loopError{message: fmt.Sprintf("Failed to resolve %d review thread(s); will retry on next run", mutationFailureCount), kind: FailureRetryableAfterResume}
+		return checkpoint, &loopError{message: fmt.Sprintf("Failed to resolve %d review thread(s); will retry on next run", mutationFailureCount), kind: roles.FailureRetryableAfterResume}
 	}
 	deferredThreadIDs = canonicalizeStringSlice(deferredThreadIDs)
 	if len(deferredThreadIDs) > 0 {
@@ -4529,7 +4523,7 @@ func (r *Runner) runRecheckStep(ctx context.Context, input stepInput) (fixerChec
 	}
 	detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
 	if err != nil {
-		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+		return checkpoint, &loopError{message: err.Error(), kind: roles.FailureRetryableAfterResume}
 	}
 	checkpointHadSpecReviewing := labels.Has(detailLabels(checkpoint.Detail), labels.SpecReviewing)
 	if (labels.Has(detail.Labels, labels.SpecReviewing) || checkpointHadSpecReviewing) && isSpecReviewClean(detail) {
@@ -4554,7 +4548,7 @@ func (r *Runner) runRecheckStep(ctx context.Context, input stepInput) (fixerChec
 	if shouldBlockResolveWithoutFix(checkpoint, blockingFixItems, hasVerifiedNoPushHead) {
 		checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
 		checkpoint.Pause = newCheckpointPause(checkpointPauseReasonNoopResolveNoNewCommits, true, strings.TrimSpace(detail.HeadSHA), currentRecheckFixItemsStateHash(checkpoint), unresolvedThreadIDs(suppressDeclinedFixItems(input.Loop.MetadataJSON, strings.TrimSpace(detail.HeadSHA), checkpoint.Recheck.RemainingFixItems)))
-		return checkpoint, &loopError{message: "resolve-comments left review threads unresolved because fixer produced no new commits to push", kind: FailureManualIntervention}
+		return checkpoint, &loopError{message: "resolve-comments left review threads unresolved because fixer produced no new commits to push", kind: roles.FailureManualIntervention}
 	}
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	return checkpoint, nil
@@ -4716,7 +4710,7 @@ func (r *Runner) recoverOrphanPreStartRun(ctx context.Context, run storage.RunRe
 }
 
 func activeFixerRunError(message string) error {
-	return &activeRunError{loopError: &loopError{message: message, kind: FailureRetryableTransient}}
+	return &activeRunError{loopError: &loopError{message: message, kind: roles.FailureRetryableTransient}}
 }
 
 type activeRunError struct {
@@ -5679,7 +5673,7 @@ func (r *Runner) finishFailureStreakBreaker(ctx context.Context, project storage
 	return resumed, nil
 }
 
-func (r *Runner) failQueueItem(ctx context.Context, queueItem storage.QueueItemRecord, kind QueueFailureKind, message string) (*storage.QueueItemRecord, error) {
+func (r *Runner) failQueueItem(ctx context.Context, queueItem storage.QueueItemRecord, kind roles.QueueFailureKind, message string) (*storage.QueueItemRecord, error) {
 	nextAttempts := queueItem.Attempts + 1
 	return r.requeueOrFailQueueItem(ctx, queueItem, kind, message, nextAttempts)
 }
@@ -5690,7 +5684,7 @@ func (r *Runner) failQueueItemWithBreaker(ctx context.Context, loop storage.Loop
 	// breaker: tripping it would clean the preserved worktree and enqueue a
 	// rediscovery handoff that rewrites the checkpoint back to discover,
 	// destroying the very recovery evidence this state is meant to retain.
-	if failure.kind == FailureManualIntervention {
+	if failure.kind == roles.FailureManualIntervention {
 		failedQueue, err := r.failQueueItemTerminal(ctx, queueItem, failure.kind, failure.message, queueItem.Attempts+1)
 		return failedQueue, 0, err
 	}
@@ -5721,7 +5715,7 @@ func (r *Runner) appendFailureStreakPausedEvent(ctx context.Context, loop storag
 	r.appendEvent(ctx, eventInput{eventType: "loop.paused", projectID: loop.ProjectID, loopID: loop.ID, runID: runID, entityType: "loop", entityID: loop.ID, payload: map[string]any{"pauseReason": failureStreakPauseReason, "consecutiveCount": streak, "headSha": detailHeadSHA(checkpoint.Detail), "fixItemsStateHash": hashFixItemsState(checkpoint.FixItems)}})
 }
 
-func (r *Runner) requeueQueueItem(ctx context.Context, queueItem storage.QueueItemRecord, kind QueueFailureKind, message string, attempts int64) (*storage.QueueItemRecord, error) {
+func (r *Runner) requeueQueueItem(ctx context.Context, queueItem storage.QueueItemRecord, kind roles.QueueFailureKind, message string, attempts int64) (*storage.QueueItemRecord, error) {
 	nowISO := r.nowISO()
 	retryAt := eventlog.FormatJavaScriptISOString(r.now().Add(backoffDelay(r.retryBaseDelay, attempts+1)))
 	if err := r.repos.Queue.MarkRetry(ctx, storage.QueueMarkRetryInput{ID: queueItem.ID, AvailableAt: retryAt, Attempts: attempts, ErrorMessage: optionalString(message), ErrorKind: string(kind), UpdatedAt: nowISO}); err != nil {
@@ -5730,7 +5724,7 @@ func (r *Runner) requeueQueueItem(ctx context.Context, queueItem storage.QueueIt
 	return r.repos.Queue.GetByID(ctx, queueItem.ID)
 }
 
-func (r *Runner) requeueOrFailQueueItem(ctx context.Context, queueItem storage.QueueItemRecord, kind QueueFailureKind, message string, nextAttempts int64) (*storage.QueueItemRecord, error) {
+func (r *Runner) requeueOrFailQueueItem(ctx context.Context, queueItem storage.QueueItemRecord, kind roles.QueueFailureKind, message string, nextAttempts int64) (*storage.QueueItemRecord, error) {
 	nowISO := r.nowISO()
 	if !shouldRetryQueueFailure(kind, nextAttempts, queueItem.MaxAttempts) {
 		return r.failQueueItemTerminal(ctx, queueItem, kind, message, nextAttempts)
@@ -5746,7 +5740,7 @@ func (r *Runner) requeueOrFailQueueItem(ctx context.Context, queueItem storage.Q
 // regardless of MaxAttempts. The consecutive-failure circuit breaker uses this
 // to stop a loop whose runs keep failing even when the retry budget would
 // otherwise be unbounded.
-func (r *Runner) failQueueItemTerminal(ctx context.Context, queueItem storage.QueueItemRecord, kind QueueFailureKind, message string, nextAttempts int64) (*storage.QueueItemRecord, error) {
+func (r *Runner) failQueueItemTerminal(ctx context.Context, queueItem storage.QueueItemRecord, kind roles.QueueFailureKind, message string, nextAttempts int64) (*storage.QueueItemRecord, error) {
 	nowISO := r.nowISO()
 	if err := r.repos.Queue.Fail(ctx, storage.QueueFailInput{ID: queueItem.ID, Attempts: nextAttempts, FinishedAt: nowISO, ErrorMessage: optionalString(message), ErrorKind: string(kind), UpdatedAt: nowISO}); err != nil {
 		return nil, err
@@ -6480,16 +6474,16 @@ func (r *Runner) classifyFailureWithBoundary(err error, boundary failureclass.Bo
 	return &loopError{message: d.Message, kind: fixerFailureKind(d.Kind)}
 }
 
-func fixerFailureKind(kind failureclass.Kind) QueueFailureKind {
+func fixerFailureKind(kind failureclass.Kind) roles.QueueFailureKind {
 	switch kind {
 	case failureclass.RetryableTransient:
-		return FailureRetryableTransient
+		return roles.FailureRetryableTransient
 	case failureclass.RetryableAfterResume:
-		return FailureRetryableAfterResume
+		return roles.FailureRetryableAfterResume
 	case failureclass.ManualIntervention:
-		return FailureManualIntervention
+		return roles.FailureManualIntervention
 	default:
-		return FailureNonRetryable
+		return roles.FailureNonRetryable
 	}
 }
 
@@ -6518,7 +6512,7 @@ func (r *Runner) reconcileCommits(ctx context.Context, project storage.ProjectRe
 		if !r.allowAutoCommit {
 			checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
 			checkpoint.Pause = newCheckpointPause(checkpointPauseReasonAutoCommitDisabled, false, "", "", nil)
-			return checkpoint, &loopError{message: fmt.Sprintf("Auto commit disabled but fixer worktree has uncommitted changes: %s", firstNonEmpty(strings.Join(initial.ChangedFiles, ", "), "unknown files")), kind: FailureManualIntervention}
+			return checkpoint, &loopError{message: fmt.Sprintf("Auto commit disabled but fixer worktree has uncommitted changes: %s", firstNonEmpty(strings.Join(initial.ChangedFiles, ", "), "unknown files")), kind: roles.FailureManualIntervention}
 		}
 		disclosureAgent, disclosureModel := r.disclosureIdentity(run)
 		if _, err := r.git.Commit(ctx, CommitInput{RepoPath: project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, Message: commitMessage, DisclosureAgent: disclosureAgent, DisclosureModel: disclosureModel}); err != nil {
@@ -6612,7 +6606,7 @@ func (r *Runner) recordCleanupSecondaryIssue(ctx context.Context, runID string, 
 	issue := FixerOutcomeFailure{
 		Step:      string(stepRecheck),
 		Message:   "worktree cleanup refused: " + cause.Error(),
-		Kind:      FailureRetryableTransient,
+		Kind:      roles.FailureRetryableTransient,
 		Retryable: &retryable,
 	}
 	// Keep the in-memory checkpoint consistent so the returned ProcessResult and any
@@ -6715,7 +6709,7 @@ func (r *Runner) waitForPullRequestHeadSHA(ctx context.Context, input waitForPul
 	for attempt := 0; attempt < input.Attempts; attempt++ {
 		detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
 		if err != nil {
-			return PullRequestDetail{}, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+			return PullRequestDetail{}, &loopError{message: err.Error(), kind: roles.FailureRetryableAfterResume}
 		}
 		latest = detail
 		actual = detail.HeadSHA
@@ -6726,7 +6720,7 @@ func (r *Runner) waitForPullRequestHeadSHA(ctx context.Context, input waitForPul
 			r.sleep(input.Delay)
 		}
 	}
-	return latest, &loopError{message: input.FailureMessage(actual), kind: FailureRetryableAfterResume}
+	return latest, &loopError{message: input.FailureMessage(actual), kind: roles.FailureRetryableAfterResume}
 }
 
 func (r *Runner) runValidation(ctx context.Context, input ValidationInput) (ValidationResult, error) {
@@ -6826,7 +6820,7 @@ func validateFixerResumeCheckpoint(startStep FixerStep, checkpoint fixerCheckpoi
 		if checkpoint.Repair == nil {
 			return &loopError{
 				message: "Fixer resume checkpoint is missing the completed repair record; automatic retry paused for manual recovery",
-				kind:    FailureManualIntervention,
+				kind:    roles.FailureManualIntervention,
 			}
 		}
 		return validateCompletedRepairCheckpoint(checkpoint.Repair, checkpoint.Worktree)
@@ -7382,7 +7376,7 @@ func buildFixerCommitMessage(prNumber int64) string {
 
 func requireWorktree(checkpoint fixerCheckpoint) (*checkpointWorktree, error) {
 	if checkpoint.Worktree == nil || checkpoint.Worktree.Path == "" || checkpoint.Worktree.Branch == "" {
-		return nil, &loopError{message: "Missing worktree checkpoint for fixer step", kind: FailureRetryableAfterResume}
+		return nil, &loopError{message: "Missing worktree checkpoint for fixer step", kind: roles.FailureRetryableAfterResume}
 	}
 	return checkpoint.Worktree, nil
 }
@@ -7715,8 +7709,8 @@ func backoffDelay(base time.Duration, attempts int64) time.Duration {
 // purpose — whether it actually retries is decided by the attempt bound in
 // shouldRetryQueueFailure, not here. The name says "eligible" rather than
 // "retryable" for exactly that reason.
-func isQueueRetryEligible(kind QueueFailureKind) bool {
-	return kind == FailureRetryableTransient || kind == FailureRetryableAfterResume || kind == FailureNonRetryable
+func isQueueRetryEligible(kind roles.QueueFailureKind) bool {
+	return kind == roles.FailureRetryableTransient || kind == roles.FailureRetryableAfterResume || kind == roles.FailureNonRetryable
 }
 
 // shouldRetryQueueFailure applies the two-tier retry rule from #508.
@@ -7732,12 +7726,12 @@ func isQueueRetryEligible(kind QueueFailureKind) bool {
 // The asymmetry looks like an oversight and is not. Reintroducing the kind
 // check in the bounded branch breaks TestShouldRetryQueueFailureRespectsMaxAttempts
 // here and in the reviewer, planner and worker copies.
-func shouldRetryQueueFailure(kind QueueFailureKind, nextAttempts, maxAttempts int64) bool {
+func shouldRetryQueueFailure(kind roles.QueueFailureKind, nextAttempts, maxAttempts int64) bool {
 	if !isQueueRetryEligible(kind) {
 		return false
 	}
 	if maxAttempts < 0 {
-		return kind != FailureNonRetryable
+		return kind != roles.FailureNonRetryable
 	}
 	return maxAttempts > 0 && nextAttempts < maxAttempts
 }

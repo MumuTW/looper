@@ -6,8 +6,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/MumuTW/looper/internal/agent"
-	"github.com/MumuTW/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/agent"
+	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/roles"
 )
 
 // The fixer treats the agent's declared `outcome` as the authority for whether a
@@ -21,7 +22,7 @@ func TestFixerRepairTaskOutcomeUsesStructuredAuthority(t *testing.T) {
 		name        string
 		result      AgentResult
 		wantBlocked bool
-		wantKind    QueueFailureKind
+		wantKind    roles.QueueFailureKind
 		wantErr     string
 	}{
 		{
@@ -32,7 +33,7 @@ func TestFixerRepairTaskOutcomeUsesStructuredAuthority(t *testing.T) {
 			name:        "blocked outcome carries the declared kind",
 			result:      AgentResult{Status: "completed", CompletionPayload: `{"outcome":"blocked","failure_kind":"manual_intervention","summary":"needs a human"}`},
 			wantBlocked: true,
-			wantKind:    FailureManualIntervention,
+			wantKind:    roles.FailureManualIntervention,
 		},
 		{
 			name:    "no payload at all",
@@ -72,7 +73,7 @@ func TestFixerRepairTaskOutcomeUsesStructuredAuthority(t *testing.T) {
 				if err == nil || err.message != testCase.wantErr {
 					t.Fatalf("err = %v, want %q", err, testCase.wantErr)
 				}
-				if err.kind != FailureRetryableTransient {
+				if err.kind != roles.FailureRetryableTransient {
 					t.Fatalf("err.kind = %q, want retryable_transient", err.kind)
 				}
 				return
@@ -117,7 +118,7 @@ func TestFixerRepairTaskOutcomeFallsBackToTranscript(t *testing.T) {
 		if err != nil {
 			t.Fatalf("err = %v, want the JSONL-embedded marker to be translated", err)
 		}
-		if !blocked || kind != FailureRetryableAfterResume || message != "remote head moved" {
+		if !blocked || kind != roles.FailureRetryableAfterResume || message != "remote head moved" {
 			t.Fatalf("(blocked, kind, message) = (%v, %q, %q), want the declared block", blocked, kind, message)
 		}
 	})
@@ -248,7 +249,7 @@ func TestFixerPromptOffersOnlyHonoredFailureKinds(t *testing.T) {
 		}
 	}
 	// Still accepted so a reporting agent is not downgraded to a contract failure.
-	if kind, ok := parseFixerBlockedFailureKind("retryable_after_resume"); !ok || kind != FailureRetryableAfterResume {
+	if kind, ok := parseFixerBlockedFailureKind("retryable_after_resume"); !ok || kind != roles.FailureRetryableAfterResume {
 		t.Fatalf("parseFixerBlockedFailureKind(retryable_after_resume) = (%q, %v), want it still accepted", kind, ok)
 	}
 }

@@ -7,8 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MumuTW/looper/internal/loops"
-	"github.com/MumuTW/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/loops"
+	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/roles"
 )
 
 func TestEarlyRunFailuresParkAgainstDiscoveryState(t *testing.T) {
@@ -101,7 +102,7 @@ func TestResumeCheckpointFailureBypassesBreaker(t *testing.T) {
 	if err != nil || result.Status != "failed" {
 		t.Fatalf("ProcessClaimedItem() = (%#v, %v), want failed result", result, err)
 	}
-	if result.FailureKind != FailureManualIntervention {
+	if result.FailureKind != roles.FailureManualIntervention {
 		t.Fatalf("result.FailureKind = %v, want manual_intervention for missing repair result", result.FailureKind)
 	}
 	persisted, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
@@ -270,7 +271,7 @@ func TestRecoveryReconcilesAlreadyTerminalBreakerQueue(t *testing.T) {
 	if err := fixture.repos.Queue.Upsert(context.Background(), queue); err != nil {
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
-	if err := fixture.repos.Queue.Fail(context.Background(), storage.QueueFailInput{ID: queue.ID, Attempts: 3, FinishedAt: nowISO, ErrorMessage: stringPtr("breaker threshold"), ErrorKind: string(FailureNonRetryable), UpdatedAt: nowISO}); err != nil {
+	if err := fixture.repos.Queue.Fail(context.Background(), storage.QueueFailInput{ID: queue.ID, Attempts: 3, FinishedAt: nowISO, ErrorMessage: stringPtr("breaker threshold"), ErrorKind: string(roles.FailureNonRetryable), UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Queue.Fail() error = %v", err)
 	}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})

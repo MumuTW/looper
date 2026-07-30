@@ -11,9 +11,10 @@ import (
 	"strings"
 	"testing"
 
-	gitinfra "github.com/MumuTW/looper/internal/infra/git"
-	"github.com/MumuTW/looper/internal/storage"
-	"github.com/MumuTW/looper/internal/worktreesafety"
+	gitinfra "github.com/nexu-io/looper/internal/infra/git"
+	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/worktreesafety"
+	"github.com/nexu-io/looper/internal/roles"
 )
 
 // Shared fixtures for same-head dirty adopt / prepare-error recovery.
@@ -123,8 +124,8 @@ func assertPrepareDirtyManualIntervention(t *testing.T, checkpoint fixerCheckpoi
 	if !errors.As(err, &loopErr) {
 		t.Fatalf("error = %T, want *loopError", err)
 	}
-	if loopErr.kind != FailureManualIntervention {
-		t.Fatalf("loopErr.kind = %v, want %v", loopErr.kind, FailureManualIntervention)
+	if loopErr.kind != roles.FailureManualIntervention {
+		t.Fatalf("loopErr.kind = %v, want %v", loopErr.kind, roles.FailureManualIntervention)
 	}
 	if checkpoint.ResumePolicy != "manual_intervention" {
 		t.Fatalf("checkpoint.ResumePolicy = %q, want manual_intervention", checkpoint.ResumePolicy)

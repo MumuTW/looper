@@ -11,9 +11,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/MumuTW/looper/internal/labels"
-	"github.com/MumuTW/looper/internal/loops"
-	"github.com/MumuTW/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/labels"
+	"github.com/nexu-io/looper/internal/loops"
+	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/roles"
 )
 
 func TestConsumeAskSentinelReadsAndRemoves(t *testing.T) {
@@ -712,7 +713,7 @@ func TestDetectHumanAskParksOnSentinelFailure(t *testing.T) {
 		t.Fatal("detectHumanAsk error = nil, want parked gate failure")
 	}
 	var le *loopError
-	if !errors.As(awaitErr, &le) || le.kind != FailureManualIntervention {
+	if !errors.As(awaitErr, &le) || le.kind != roles.FailureManualIntervention {
 		t.Fatalf("detectHumanAsk error = %#v, want loopError with manual_intervention: a retryable kind auto-requeues and the retry, finding the sentinel quarantined, would publish the gated work", awaitErr)
 	}
 }

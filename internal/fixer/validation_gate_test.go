@@ -8,13 +8,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MumuTW/looper/internal/config"
-	"github.com/MumuTW/looper/internal/fixer/failurepolicy"
-	"github.com/MumuTW/looper/internal/lifecycle"
-	"github.com/MumuTW/looper/internal/loops"
-	"github.com/MumuTW/looper/internal/loops/failureclass"
-	"github.com/MumuTW/looper/internal/storage"
-	"github.com/MumuTW/looper/internal/validation"
+	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/fixer/failurepolicy"
+	"github.com/nexu-io/looper/internal/lifecycle"
+	"github.com/nexu-io/looper/internal/loops"
+	"github.com/nexu-io/looper/internal/loops/failureclass"
+	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/validation"
+	"github.com/nexu-io/looper/internal/roles"
 )
 
 func TestRunValidationRunsConfiguredCommands(t *testing.T) {
@@ -202,7 +203,7 @@ func TestRunValidateStepParksValidationThatRepeatedlyDirtiesWorktree(t *testing.
 		},
 	})
 	var loopErr *loopError
-	if !errors.As(err, &loopErr) || loopErr.kind != FailureManualIntervention {
+	if !errors.As(err, &loopErr) || loopErr.kind != roles.FailureManualIntervention {
 		t.Fatalf("runValidateStep() error = %v, want manual intervention", err)
 	}
 	if checkpoint.ResumePolicy != "manual_intervention" || checkpoint.Pause == nil || checkpoint.Pause.Reason != string(checkpointPauseReasonDirtyWorktree) {

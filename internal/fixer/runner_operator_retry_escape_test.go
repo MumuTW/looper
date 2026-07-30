@@ -6,9 +6,10 @@ import (
 	"strconv"
 	"testing"
 
-	"github.com/MumuTW/looper/internal/fixer/workflow"
-	"github.com/MumuTW/looper/internal/loops"
-	"github.com/MumuTW/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/fixer/workflow"
+	"github.com/nexu-io/looper/internal/loops"
+	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/roles"
 )
 
 // This file covers the operator-retry escape from a fixer run parked for manual
@@ -274,7 +275,7 @@ func TestProcessClaimedItemCheckpointsManualInterventionParkAtRepair(t *testing.
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
-	if result.FailureKind != FailureManualIntervention {
+	if result.FailureKind != roles.FailureManualIntervention {
 		t.Fatalf("result = %#v, want manual-intervention failure for the missing completion contract", result)
 	}
 	run, err := fixture.repos.Runs.GetByID(context.Background(), result.RunID)

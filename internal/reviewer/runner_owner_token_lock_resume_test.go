@@ -9,10 +9,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MumuTW/looper/internal/config"
-	"github.com/MumuTW/looper/internal/eventlog"
-	"github.com/MumuTW/looper/internal/storage"
-	"github.com/MumuTW/looper/internal/worktreesafety"
+	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/eventlog"
+	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/worktreesafety"
+	"github.com/nexu-io/looper/internal/roles"
 )
 
 // Lifecycle: resumed reviewer past stepWorktree must not revoke fixer ownership
@@ -102,7 +103,7 @@ func TestProcessClaimedItemFailedLockResumePreservesFixerOwnerToken(t *testing.T
 		t.Fatal("ProcessClaimedItem() error = nil, want lock-held failure")
 	}
 	var loopErr *loopError
-	if !errors.As(err, &loopErr) || loopErr.kind != FailureRetryableTransient {
+	if !errors.As(err, &loopErr) || loopErr.kind != roles.FailureRetryableTransient {
 		t.Fatalf("ProcessClaimedItem() error = %v, want retryable transient loopError", err)
 	}
 	if !contains(loopErr.message, "Pull request lock is already held") {

@@ -7,7 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MumuTW/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/roles"
 )
 
 func TestRecoveredPreStepBreakerFailureCleansPreparedWorktree(t *testing.T) {
@@ -116,7 +117,7 @@ func TestInlineLateStepBreakerCleansAndImmediatelyQueuesPendingState(t *testing.
 		}
 	}})
 
-	failedQueue, breakerStreak, err := runner.failQueueItemWithBreaker(context.Background(), loop, queue, failedRun.ID, checkpoint, stepValidate, &loopError{message: "validation failed", kind: FailureRetryableTransient})
+	failedQueue, breakerStreak, err := runner.failQueueItemWithBreaker(context.Background(), loop, queue, failedRun.ID, checkpoint, stepValidate, &loopError{message: "validation failed", kind: roles.FailureRetryableTransient})
 	if err != nil || breakerStreak != maxConsecutiveFixerFailures || failedQueue == nil || failedQueue.Status != "manual_intervention" {
 		t.Fatalf("failQueueItemWithBreaker() = (%#v, %d, %v), want breaker terminal", failedQueue, breakerStreak, err)
 	}

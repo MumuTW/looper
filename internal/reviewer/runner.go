@@ -19,27 +19,28 @@ import (
 	"strings"
 	"time"
 
-	"github.com/MumuTW/looper/internal/agent"
-	"github.com/MumuTW/looper/internal/bootstrap"
-	"github.com/MumuTW/looper/internal/config"
-	"github.com/MumuTW/looper/internal/disclosure"
-	"github.com/MumuTW/looper/internal/domain"
-	"github.com/MumuTW/looper/internal/eventlog"
-	gitinfra "github.com/MumuTW/looper/internal/infra/git"
-	githubinfra "github.com/MumuTW/looper/internal/infra/github"
-	"github.com/MumuTW/looper/internal/infra/specpr"
-	"github.com/MumuTW/looper/internal/labels"
-	"github.com/MumuTW/looper/internal/loops"
-	"github.com/MumuTW/looper/internal/loops/failureclass"
-	"github.com/MumuTW/looper/internal/networkpolicy"
-	"github.com/MumuTW/looper/internal/reviewer/automerge"
-	"github.com/MumuTW/looper/internal/reviewer/criteria"
-	"github.com/MumuTW/looper/internal/reviewer/publish"
-	"github.com/MumuTW/looper/internal/reviewer/resolution"
-	"github.com/MumuTW/looper/internal/reviewer/workflow"
-	"github.com/MumuTW/looper/internal/storage"
-	"github.com/MumuTW/looper/internal/version"
-	"github.com/MumuTW/looper/internal/worktreesafety"
+	"github.com/nexu-io/looper/internal/agent"
+	"github.com/nexu-io/looper/internal/bootstrap"
+	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/disclosure"
+	"github.com/nexu-io/looper/internal/domain"
+	"github.com/nexu-io/looper/internal/eventlog"
+	gitinfra "github.com/nexu-io/looper/internal/infra/git"
+	githubinfra "github.com/nexu-io/looper/internal/infra/github"
+	"github.com/nexu-io/looper/internal/infra/specpr"
+	"github.com/nexu-io/looper/internal/labels"
+	"github.com/nexu-io/looper/internal/loops"
+	"github.com/nexu-io/looper/internal/loops/failureclass"
+	"github.com/nexu-io/looper/internal/networkpolicy"
+	"github.com/nexu-io/looper/internal/reviewer/automerge"
+	"github.com/nexu-io/looper/internal/reviewer/criteria"
+	"github.com/nexu-io/looper/internal/reviewer/publish"
+	"github.com/nexu-io/looper/internal/reviewer/resolution"
+	"github.com/nexu-io/looper/internal/reviewer/workflow"
+	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/version"
+	"github.com/nexu-io/looper/internal/worktreesafety"
+	"github.com/nexu-io/looper/internal/roles"
 )
 
 // ReviewerStep and the stepXxx constants are a compatibility surface over
@@ -88,13 +89,11 @@ const (
 	reviewEventAgentNative    ReviewEvent = "AGENT_NATIVE"
 )
 
-type QueueFailureKind string
-
 const (
-	FailureRetryableTransient   QueueFailureKind = "retryable_transient"
-	FailureRetryableAfterResume QueueFailureKind = "retryable_after_resume"
-	FailureNonRetryable         QueueFailureKind = "non_retryable"
-	FailureManualIntervention   QueueFailureKind = "manual_intervention"
+	FailureRetryableTransient   roles.QueueFailureKind = "retryable_transient"
+	FailureRetryableAfterResume roles.QueueFailureKind = "retryable_after_resume"
+	FailureNonRetryable         roles.QueueFailureKind = "non_retryable"
+	FailureManualIntervention   roles.QueueFailureKind = "manual_intervention"
 )
 
 const (
@@ -518,7 +517,7 @@ type ProcessResult struct {
 	QueueItemID string
 	Status      string
 	Summary     string
-	FailureKind QueueFailureKind
+	FailureKind roles.QueueFailureKind
 }
 
 type reviewerCheckpoint struct {
@@ -605,7 +604,7 @@ type resumedRunContext struct {
 
 type loopError struct {
 	message     string
-	kind        QueueFailureKind
+	kind        roles.QueueFailureKind
 	interrupted bool
 }
 
@@ -4554,7 +4553,7 @@ func buildReviewerDedupeKey(projectID, loopID, repo string, prNumber int64) stri
 	return fmt.Sprintf("reviewer:%s:%s:%s:%d", projectID, loopID, repo, prNumber)
 }
 
-func (r *Runner) failQueueItem(ctx context.Context, queueItem storage.QueueItemRecord, kind QueueFailureKind, message string) (*storage.QueueItemRecord, error) {
+func (r *Runner) failQueueItem(ctx context.Context, queueItem storage.QueueItemRecord, kind roles.QueueFailureKind, message string) (*storage.QueueItemRecord, error) {
 	nextAttempts := queueItem.Attempts + 1
 	nowISO := r.nowISO()
 	if !shouldRetryQueueFailure(kind, nextAttempts, queueItem.MaxAttempts) {
@@ -4653,7 +4652,7 @@ func reviewerFailureBoundaryForStep(step ReviewerStep) failureclass.Boundary {
 	}
 }
 
-func reviewerFailureKind(kind failureclass.Kind) QueueFailureKind {
+func reviewerFailureKind(kind failureclass.Kind) roles.QueueFailureKind {
 	switch kind {
 	case failureclass.RetryableTransient:
 		return FailureRetryableTransient
@@ -6388,7 +6387,7 @@ func sleepWithContext(ctx context.Context, delay time.Duration) error {
 // purpose — whether it actually retries is decided by the attempt bound in
 // shouldRetryQueueFailure, not here. The name says "eligible" rather than
 // "retryable" for exactly that reason.
-func isQueueRetryEligible(kind QueueFailureKind) bool {
+func isQueueRetryEligible(kind roles.QueueFailureKind) bool {
 	return kind == FailureRetryableTransient || kind == FailureRetryableAfterResume || kind == FailureNonRetryable
 }
 
@@ -6405,7 +6404,7 @@ func isQueueRetryEligible(kind QueueFailureKind) bool {
 // The asymmetry looks like an oversight and is not. Reintroducing the kind
 // check in the bounded branch breaks TestShouldRetryQueueFailureRespectsMaxAttempts
 // here and in the fixer, planner and worker copies.
-func shouldRetryQueueFailure(kind QueueFailureKind, nextAttempts, maxAttempts int64) bool {
+func shouldRetryQueueFailure(kind roles.QueueFailureKind, nextAttempts, maxAttempts int64) bool {
 	if !isQueueRetryEligible(kind) {
 		return false
 	}

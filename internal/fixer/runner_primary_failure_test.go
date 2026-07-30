@@ -3,7 +3,8 @@ package fixer
 import (
 	"testing"
 
-	"github.com/MumuTW/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/roles"
 )
 
 // The first failure recorded is the causal one. Later failures -- a contract error
@@ -14,9 +15,9 @@ func TestRecordFailureKeepsTheFirstCauseAsPrimary(t *testing.T) {
 	t.Parallel()
 	checkpoint := fixerCheckpoint{}
 
-	checkpoint.recordFailure(stepRepair, &loopError{message: "agent timed out", kind: FailureRetryableTransient})
-	checkpoint.recordFailure(stepPush, &loopError{message: "remote head changed", kind: FailureRetryableAfterResume})
-	checkpoint.recordFailure(stepRecheck, &loopError{message: "needs a human", kind: FailureManualIntervention})
+	checkpoint.recordFailure(stepRepair, &loopError{message: "agent timed out", kind: roles.FailureRetryableTransient})
+	checkpoint.recordFailure(stepPush, &loopError{message: "remote head changed", kind: roles.FailureRetryableAfterResume})
+	checkpoint.recordFailure(stepRecheck, &loopError{message: "needs a human", kind: roles.FailureManualIntervention})
 
 	if checkpoint.Outcome == nil || checkpoint.Outcome.PrimaryFailure == nil {
 		t.Fatalf("Outcome = %#v, want a recorded primary failure", checkpoint.Outcome)
@@ -111,7 +112,7 @@ func TestDeriveRunOutcomeBackfillsHistoricalFailures(t *testing.T) {
 		if got == nil || got.PrimaryFailure == nil {
 			t.Fatalf("DeriveRunOutcome() = %#v, want the gap backfilled", got)
 		}
-		if got.PrimaryFailure.Kind != FailureManualIntervention {
+		if got.PrimaryFailure.Kind != roles.FailureManualIntervention {
 			t.Fatalf("PrimaryFailure.Kind = %q, want manual_intervention from the parked policy", got.PrimaryFailure.Kind)
 		}
 		if got.PrimaryFailure.Retryable == nil || *got.PrimaryFailure.Retryable {

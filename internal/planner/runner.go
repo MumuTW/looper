@@ -12,19 +12,20 @@ import (
 	"strings"
 	"time"
 
-	"github.com/MumuTW/looper/internal/agent"
-	"github.com/MumuTW/looper/internal/bootstrap"
-	"github.com/MumuTW/looper/internal/config"
-	"github.com/MumuTW/looper/internal/disclosure"
-	"github.com/MumuTW/looper/internal/domain"
-	"github.com/MumuTW/looper/internal/eventlog"
-	githubinfra "github.com/MumuTW/looper/internal/infra/github"
-	"github.com/MumuTW/looper/internal/labels"
-	"github.com/MumuTW/looper/internal/lifecycle"
-	"github.com/MumuTW/looper/internal/loops"
-	"github.com/MumuTW/looper/internal/loops/failureclass"
-	"github.com/MumuTW/looper/internal/storage"
-	"github.com/MumuTW/looper/internal/worktreesafety"
+	"github.com/nexu-io/looper/internal/agent"
+	"github.com/nexu-io/looper/internal/bootstrap"
+	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/disclosure"
+	"github.com/nexu-io/looper/internal/domain"
+	"github.com/nexu-io/looper/internal/eventlog"
+	githubinfra "github.com/nexu-io/looper/internal/infra/github"
+	"github.com/nexu-io/looper/internal/labels"
+	"github.com/nexu-io/looper/internal/lifecycle"
+	"github.com/nexu-io/looper/internal/loops"
+	"github.com/nexu-io/looper/internal/loops/failureclass"
+	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/worktreesafety"
+	"github.com/nexu-io/looper/internal/roles"
 )
 
 const (
@@ -49,13 +50,11 @@ var plannerStepSequence = []PlannerStep{stepDiscoverIssues, stepPrepareWorktree,
 
 type PlannerStep string
 
-type QueueFailureKind string
-
 const (
-	FailureRetryableTransient   QueueFailureKind = "retryable_transient"
-	FailureRetryableAfterResume QueueFailureKind = "retryable_after_resume"
-	FailureNonRetryable         QueueFailureKind = "non_retryable"
-	FailureManualIntervention   QueueFailureKind = "manual_intervention"
+	FailureRetryableTransient   roles.QueueFailureKind = "retryable_transient"
+	FailureRetryableAfterResume roles.QueueFailureKind = "retryable_after_resume"
+	FailureNonRetryable         roles.QueueFailureKind = "non_retryable"
+	FailureManualIntervention   roles.QueueFailureKind = "manual_intervention"
 )
 
 type IssueSummary struct {
@@ -385,7 +384,7 @@ type ProcessResult struct {
 	QueueItemID       string
 	Status            string
 	Summary           string
-	FailureKind       QueueFailureKind
+	FailureKind       roles.QueueFailureKind
 	PullRequestNumber int64
 }
 
@@ -477,7 +476,7 @@ type stepInput struct {
 
 type loopError struct {
 	message string
-	kind    QueueFailureKind
+	kind    roles.QueueFailureKind
 }
 
 type holdSkipError struct{ summary string }
@@ -713,7 +712,7 @@ func (r *Runner) recoverClaimedItem(ctx context.Context, queueItem storage.Queue
 	return &ProcessResult{LoopID: derefString(queueItem.LoopID), QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
 }
 
-func (r *Runner) reconcileRecoveredLoop(ctx context.Context, queueItem storage.QueueItemRecord, failedQueue *storage.QueueItemRecord, failureKind QueueFailureKind) error {
+func (r *Runner) reconcileRecoveredLoop(ctx context.Context, queueItem storage.QueueItemRecord, failedQueue *storage.QueueItemRecord, failureKind roles.QueueFailureKind) error {
 	if queueItem.LoopID == nil {
 		return nil
 	}
@@ -1874,7 +1873,7 @@ func (r *Runner) wakeSchedulerAfterEnqueue() {
 	}
 }
 
-func (r *Runner) failQueueItem(ctx context.Context, queueItem storage.QueueItemRecord, kind QueueFailureKind, message string) (*storage.QueueItemRecord, error) {
+func (r *Runner) failQueueItem(ctx context.Context, queueItem storage.QueueItemRecord, kind roles.QueueFailureKind, message string) (*storage.QueueItemRecord, error) {
 	nextAttempts := queueItem.Attempts + 1
 	nowISO := r.nowISO()
 	if !shouldRetryQueueFailure(kind, nextAttempts, queueItem.MaxAttempts) {
@@ -1949,7 +1948,7 @@ func plannerFailureBoundaryForStep(step PlannerStep) failureclass.Boundary {
 	}
 }
 
-func plannerFailureKind(kind failureclass.Kind) QueueFailureKind {
+func plannerFailureKind(kind failureclass.Kind) roles.QueueFailureKind {
 	switch kind {
 	case failureclass.RetryableTransient:
 		return FailureRetryableTransient
@@ -2509,7 +2508,7 @@ func backoffDelay(base time.Duration, attempts int64) time.Duration {
 // purpose — whether it actually retries is decided by the attempt bound in
 // shouldRetryQueueFailure, not here. The name says "eligible" rather than
 // "retryable" for exactly that reason.
-func isQueueRetryEligible(kind QueueFailureKind) bool {
+func isQueueRetryEligible(kind roles.QueueFailureKind) bool {
 	return kind == FailureRetryableTransient || kind == FailureRetryableAfterResume || kind == FailureNonRetryable
 }
 
@@ -2526,7 +2525,7 @@ func isQueueRetryEligible(kind QueueFailureKind) bool {
 // The asymmetry looks like an oversight and is not. Reintroducing the kind
 // check in the bounded branch breaks TestShouldRetryQueueFailureRespectsMaxAttempts
 // here and in the fixer, reviewer and worker copies.
-func shouldRetryQueueFailure(kind QueueFailureKind, nextAttempts, maxAttempts int64) bool {
+func shouldRetryQueueFailure(kind roles.QueueFailureKind, nextAttempts, maxAttempts int64) bool {
 	if !isQueueRetryEligible(kind) {
 		return false
 	}

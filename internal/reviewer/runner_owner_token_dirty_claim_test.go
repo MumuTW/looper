@@ -8,9 +8,10 @@ import (
 	"path/filepath"
 	"testing"
 
-	gitinfra "github.com/MumuTW/looper/internal/infra/git"
-	"github.com/MumuTW/looper/internal/storage"
-	"github.com/MumuTW/looper/internal/worktreesafety"
+	gitinfra "github.com/nexu-io/looper/internal/infra/git"
+	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/worktreesafety"
+	"github.com/nexu-io/looper/internal/roles"
 )
 
 // Fresh reviewer (no checkpoint worktree) still hits an interrupted fixer's dirty
@@ -58,7 +59,7 @@ func TestRunPrepareWorktreeStepFreshReviewerRestoresCandidateFixerTokenOnDirty(t
 		t.Fatal("expected dirty prepare error")
 	}
 	var loopErr *loopError
-	if !errors.As(err, &loopErr) || loopErr.kind != FailureManualIntervention {
+	if !errors.As(err, &loopErr) || loopErr.kind != roles.FailureManualIntervention {
 		t.Fatalf("error = %v, want dirty MI loopError", err)
 	}
 	if len(git.createCalls) != 1 {

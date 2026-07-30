@@ -11,17 +11,18 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MumuTW/looper/internal/agent"
-	"github.com/MumuTW/looper/internal/config"
-	"github.com/MumuTW/looper/internal/disclosure"
-	"github.com/MumuTW/looper/internal/eventlog"
-	"github.com/MumuTW/looper/internal/fixer/publish"
-	"github.com/MumuTW/looper/internal/fixer/workflow"
-	"github.com/MumuTW/looper/internal/labels"
-	"github.com/MumuTW/looper/internal/lifecycle"
-	"github.com/MumuTW/looper/internal/loops"
-	"github.com/MumuTW/looper/internal/storage"
-	"github.com/MumuTW/looper/internal/validation"
+	"github.com/nexu-io/looper/internal/agent"
+	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/disclosure"
+	"github.com/nexu-io/looper/internal/eventlog"
+	"github.com/nexu-io/looper/internal/fixer/publish"
+	"github.com/nexu-io/looper/internal/fixer/workflow"
+	"github.com/nexu-io/looper/internal/labels"
+	"github.com/nexu-io/looper/internal/lifecycle"
+	"github.com/nexu-io/looper/internal/loops"
+	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/validation"
+	"github.com/nexu-io/looper/internal/roles"
 )
 
 func (r *Runner) listOpenPullRequestsForDiscovery(ctx context.Context, repo, cwd string, limit int, author string) ([]PullRequestSummary, error) {
@@ -61,16 +62,16 @@ func TestBuildFixerPromptOmitsMissingAgentRuntime(t *testing.T) {
 func TestShouldRetryQueueFailureRespectsMaxAttempts(t *testing.T) {
 	t.Parallel()
 
-	if !shouldRetryQueueFailure(FailureRetryableTransient, 5, -1) {
+	if !shouldRetryQueueFailure(roles.FailureRetryableTransient, 5, -1) {
 		t.Fatal("shouldRetryQueueFailure() = false, want true for infinite retries")
 	}
-	if shouldRetryQueueFailure(FailureNonRetryable, 5, -1) {
+	if shouldRetryQueueFailure(roles.FailureNonRetryable, 5, -1) {
 		t.Fatal("shouldRetryQueueFailure() = true, want false for infinite non_retryable retries")
 	}
-	if !shouldRetryQueueFailure(FailureNonRetryable, 1, 3) {
+	if !shouldRetryQueueFailure(roles.FailureNonRetryable, 1, 3) {
 		t.Fatal("shouldRetryQueueFailure() = false, want true for bounded non_retryable retries")
 	}
-	if shouldRetryQueueFailure(FailureRetryableTransient, 3, 3) {
+	if shouldRetryQueueFailure(roles.FailureRetryableTransient, 3, 3) {
 		t.Fatal("shouldRetryQueueFailure() = true, want false once nextAttempts reaches maxAttempts")
 	}
 }
@@ -1260,7 +1261,7 @@ func TestRunRecheckStepRecordsPauseWithLiveHead(t *testing.T) {
 		t.Fatal("runRecheckStep() error = nil, want manual intervention hold")
 	}
 	loopErr, ok := err.(*loopError)
-	if !ok || loopErr.kind != FailureManualIntervention {
+	if !ok || loopErr.kind != roles.FailureManualIntervention {
 		t.Fatalf("runRecheckStep() error = %#v, want manual_intervention loopError", err)
 	}
 	if updated.Pause == nil || updated.Pause.HeadSHA != "new-head" {
@@ -1462,7 +1463,7 @@ func TestProcessClaimedItemDoesNotResolveCommentsWhenRepairProducesNoCommits(t *
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
-	if result.Status != "failed" || result.FailureKind != FailureRetryableAfterResume {
+	if result.Status != "failed" || result.FailureKind != roles.FailureRetryableAfterResume {
 		t.Fatalf("result = %#v, want failed retryable-after-resume completion", result)
 	}
 	if len(git.commitCalls) != 0 || len(git.pushCalls) != 0 || len(github.resolveCalls) != 0 {
@@ -1492,7 +1493,7 @@ func TestProcessClaimedItemDoesNotResolveCommentsWhenRepairProducesNoCommits(t *
 	if err != nil {
 		t.Fatalf("Queue.GetByID() error = %v", err)
 	}
-	if queue == nil || queue.Status != "queued" || queue.LastErrorKind == nil || *queue.LastErrorKind != string(FailureRetryableAfterResume) {
+	if queue == nil || queue.Status != "queued" || queue.LastErrorKind == nil || *queue.LastErrorKind != string(roles.FailureRetryableAfterResume) {
 		t.Fatalf("queue = %#v, want queued retryable queue item", queue)
 	}
 	loop, err := fixture.repos.Loops.GetByID(context.Background(), result.LoopID)
@@ -4571,7 +4572,7 @@ func TestCreateRunContextTreatsLegacyMarkerlessRunAsRetryable(t *testing.T) {
 		t.Fatal("createRunContext() error = nil, want retryable legacy markerless error")
 	}
 	var loopErr *loopError
-	if !errors.As(err, &loopErr) || loopErr.kind != FailureRetryableTransient {
+	if !errors.As(err, &loopErr) || loopErr.kind != roles.FailureRetryableTransient {
 		t.Fatalf("createRunContext() error = %#v, want retryable transient loopError", err)
 	}
 	preservedRun, err := fixture.repos.Runs.GetByID(context.Background(), active.ID)
@@ -4639,7 +4640,7 @@ func TestCreateRunContextTreatsFreshMarkerlessRunAsRetryable(t *testing.T) {
 		t.Fatal("createRunContext() error = nil, want retryable fresh-run error")
 	}
 	var loopErr *loopError
-	if !errors.As(err, &loopErr) || loopErr.kind != FailureRetryableTransient {
+	if !errors.As(err, &loopErr) || loopErr.kind != roles.FailureRetryableTransient {
 		t.Fatalf("createRunContext() error = %#v, want retryable transient loopError", err)
 	}
 }
@@ -4671,7 +4672,7 @@ func TestCreateRunContextTreatsRunningAgentExecutionAsRetryable(t *testing.T) {
 		t.Fatal("createRunContext() error = nil, want retryable active-run error")
 	}
 	var loopErr *loopError
-	if !errors.As(err, &loopErr) || loopErr.kind != FailureRetryableTransient {
+	if !errors.As(err, &loopErr) || loopErr.kind != roles.FailureRetryableTransient {
 		t.Fatalf("createRunContext() error = %#v, want retryable transient loopError", err)
 	}
 	activeRun, err := fixture.repos.Runs.GetByID(context.Background(), orphan.ID)
@@ -4706,7 +4707,7 @@ func TestCreateRunContextTreatsFreshPreStartRunAsRetryable(t *testing.T) {
 		t.Fatal("createRunContext() error = nil, want retryable pre-start error")
 	}
 	var loopErr *loopError
-	if !errors.As(err, &loopErr) || loopErr.kind != FailureRetryableTransient {
+	if !errors.As(err, &loopErr) || loopErr.kind != roles.FailureRetryableTransient {
 		t.Fatalf("createRunContext() error = %#v, want retryable transient loopError", err)
 	}
 	activeRun, err := fixture.repos.Runs.GetByID(context.Background(), preStartRun.ID)
@@ -4783,7 +4784,7 @@ func TestCreateRunContextTreatsOlderActiveAgentExecutionAsRetryable(t *testing.T
 		t.Fatal("createRunContext() error = nil, want retryable active-run error")
 	}
 	var loopErr *loopError
-	if !errors.As(err, &loopErr) || loopErr.kind != FailureRetryableTransient {
+	if !errors.As(err, &loopErr) || loopErr.kind != roles.FailureRetryableTransient {
 		t.Fatalf("createRunContext() error = %#v, want retryable transient loopError", err)
 	}
 	activeRun, err := fixture.repos.Runs.GetByID(context.Background(), orphan.ID)
@@ -4823,7 +4824,7 @@ func TestCreateRunContextTreatsMarkerlessRunWithTerminalAgentExecutionAsRetryabl
 		t.Fatal("createRunContext() error = nil, want retryable markerless active-run error")
 	}
 	var loopErr *loopError
-	if !errors.As(err, &loopErr) || loopErr.kind != FailureRetryableTransient {
+	if !errors.As(err, &loopErr) || loopErr.kind != roles.FailureRetryableTransient {
 		t.Fatalf("createRunContext() error = %#v, want retryable transient loopError", err)
 	}
 	preservedRun, err := fixture.repos.Runs.GetByID(context.Background(), active.ID)
@@ -4869,14 +4870,14 @@ func TestProcessClaimedQueueItemRequeuesWhenActiveRunHasAgentExecution(t *testin
 	if err != nil {
 		t.Fatalf("ProcessClaimedQueueItem() error = %v", err)
 	}
-	if result == nil || result.Status != "failed" || result.FailureKind != FailureRetryableTransient || !contains(result.Summary, "already has a running fixer run") {
+	if result == nil || result.Status != "failed" || result.FailureKind != roles.FailureRetryableTransient || !contains(result.Summary, "already has a running fixer run") {
 		t.Fatalf("result = %#v, want retryable_transient active-run recovery", result)
 	}
 	queue, err := fixture.repos.Queue.GetByID(context.Background(), claim.ID)
 	if err != nil {
 		t.Fatalf("Queue.GetByID() error = %v", err)
 	}
-	if queue == nil || queue.Status != "queued" || queue.Attempts != 0 || queue.LastErrorKind == nil || *queue.LastErrorKind != string(FailureRetryableTransient) {
+	if queue == nil || queue.Status != "queued" || queue.Attempts != 0 || queue.LastErrorKind == nil || *queue.LastErrorKind != string(roles.FailureRetryableTransient) {
 		t.Fatalf("queue = %#v, want requeued retryable_transient active-run failure without consuming attempts", queue)
 	}
 	loop, err := fixture.repos.Loops.GetByID(context.Background(), loopID)
@@ -4927,14 +4928,14 @@ func TestProcessClaimedQueueItemRequeuesLegacyMarkerlessRunWithoutConsumingAttem
 	if err != nil {
 		t.Fatalf("ProcessClaimedQueueItem() error = %v", err)
 	}
-	if result == nil || result.Status != "failed" || result.FailureKind != FailureRetryableTransient || !contains(result.Summary, "markerless running fixer run") {
+	if result == nil || result.Status != "failed" || result.FailureKind != roles.FailureRetryableTransient || !contains(result.Summary, "markerless running fixer run") {
 		t.Fatalf("result = %#v, want retryable_transient markerless active-run recovery", result)
 	}
 	queue, err := fixture.repos.Queue.GetByID(context.Background(), claim.ID)
 	if err != nil {
 		t.Fatalf("Queue.GetByID() error = %v", err)
 	}
-	if queue == nil || queue.Status != "queued" || queue.Attempts != 1 || queue.LastErrorKind == nil || *queue.LastErrorKind != string(FailureRetryableTransient) {
+	if queue == nil || queue.Status != "queued" || queue.Attempts != 1 || queue.LastErrorKind == nil || *queue.LastErrorKind != string(roles.FailureRetryableTransient) {
 		t.Fatalf("queue = %#v, want requeued markerless active-run failure without consuming attempts", queue)
 	}
 	preservedRun, err := fixture.repos.Runs.GetByID(context.Background(), activeRun.ID)
@@ -4973,7 +4974,7 @@ func TestCreateRunContextPreservesMarkerlessRunDespiteStartedEvent(t *testing.T)
 		t.Fatal("createRunContext() error = nil, want retryable markerless active-run error")
 	}
 	var loopErr *loopError
-	if !errors.As(err, &loopErr) || loopErr.kind != FailureRetryableTransient {
+	if !errors.As(err, &loopErr) || loopErr.kind != roles.FailureRetryableTransient {
 		t.Fatalf("createRunContext() error = %#v, want retryable transient loopError", err)
 	}
 	preserved, err := fixture.repos.Runs.GetByID(context.Background(), startedRun.ID)
@@ -5008,7 +5009,7 @@ func TestCreateRunContextTreatsDurablyStartedRunAsRetryableWhenEventMissing(t *t
 		t.Fatal("createRunContext() error = nil, want retryable started-run error")
 	}
 	var loopErr *loopError
-	if !errors.As(err, &loopErr) || loopErr.kind != FailureRetryableTransient {
+	if !errors.As(err, &loopErr) || loopErr.kind != roles.FailureRetryableTransient {
 		t.Fatalf("createRunContext() error = %#v, want retryable transient loopError", err)
 	}
 	activeRun, err := fixture.repos.Runs.GetByID(context.Background(), startedRun.ID)
@@ -5050,7 +5051,7 @@ func TestCreateRunContextTreatsLegacyStartedRunAsRetryable(t *testing.T) {
 		t.Fatal("createRunContext() error = nil, want retryable legacy started-run error")
 	}
 	var loopErr *loopError
-	if !errors.As(err, &loopErr) || loopErr.kind != FailureRetryableTransient {
+	if !errors.As(err, &loopErr) || loopErr.kind != roles.FailureRetryableTransient {
 		t.Fatalf("createRunContext() error = %#v, want retryable transient loopError", err)
 	}
 }
@@ -5190,7 +5191,7 @@ func TestProcessClaimedItemParksCompletedRepairWhenStructuredResultMissing(t *te
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
-	if result.Status != "failed" || result.FailureKind != FailureManualIntervention || !contains(result.Summary, "structured result") || !contains(result.Summary, "worktree preserved") {
+	if result.Status != "failed" || result.FailureKind != roles.FailureManualIntervention || !contains(result.Summary, "structured result") || !contains(result.Summary, "worktree preserved") {
 		t.Fatalf("result = %#v, want parked missing-result contract failure", result)
 	}
 	if validationCalls != 0 {
@@ -5209,7 +5210,7 @@ func TestProcessClaimedItemParksCompletedRepairWhenStructuredResultMissing(t *te
 	if err != nil {
 		t.Fatalf("Queue.GetByID() error = %v", err)
 	}
-	if queue == nil || queue.Status != "manual_intervention" || queue.LastErrorKind == nil || *queue.LastErrorKind != string(FailureManualIntervention) {
+	if queue == nil || queue.Status != "manual_intervention" || queue.LastErrorKind == nil || *queue.LastErrorKind != string(roles.FailureManualIntervention) {
 		t.Fatalf("queue = %#v, want parked manual_intervention item", queue)
 	}
 	loop, err := fixture.repos.Loops.GetByID(context.Background(), result.LoopID)
@@ -5286,7 +5287,7 @@ func TestProcessClaimedItemBypassesBreakerForManualInterventionCompletionFailure
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
-	if result.Status != "failed" || result.FailureKind != FailureManualIntervention {
+	if result.Status != "failed" || result.FailureKind != roles.FailureManualIntervention {
 		t.Fatalf("result = %#v, want parked manual_intervention failure", result)
 	}
 	if len(git.cleanupCalls) != 0 {
@@ -5371,7 +5372,7 @@ func TestValidateFixerResumeCheckpointRejectsNilRepairForDownstreamSteps(t *test
 	for _, step := range []FixerStep{stepReconcileCommits, stepValidate, stepPush, stepResolveComments, stepRecheck} {
 		err := validateFixerResumeCheckpoint(step, checkpoint)
 		var loopErr *loopError
-		if !errors.As(err, &loopErr) || loopErr.kind != FailureManualIntervention {
+		if !errors.As(err, &loopErr) || loopErr.kind != roles.FailureManualIntervention {
 			t.Fatalf("validateFixerResumeCheckpoint(%s) = %v, want manual_intervention for nil repair", step, err)
 		}
 		if !contains(err.Error(), "missing the completed repair record") {
@@ -5502,7 +5503,7 @@ func TestProcessClaimedItemPersistsCheckpointWhenRepairReturnsNonCompleted(t *te
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
-	if result.Status != "failed" || result.FailureKind != FailureRetryableTransient || !contains(result.Summary, "server_error") {
+	if result.Status != "failed" || result.FailureKind != roles.FailureRetryableTransient || !contains(result.Summary, "server_error") {
 		t.Fatalf("result = %#v, want retryable failed result with upstream error", result)
 	}
 	run, err := fixture.repos.Runs.GetByID(context.Background(), result.RunID)
@@ -5545,14 +5546,14 @@ func TestProcessClaimedItemTreatsAgentSetupFailureAsRetryableTransient(t *testin
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
-	if result.Status != "failed" || result.FailureKind != FailureRetryableTransient || !contains(result.Summary, "requires a newer version") {
+	if result.Status != "failed" || result.FailureKind != roles.FailureRetryableTransient || !contains(result.Summary, "requires a newer version") {
 		t.Fatalf("result = %#v, want retryable_transient with real agent error", result)
 	}
 	queue, err := fixture.repos.Queue.GetByID(context.Background(), claim.ID)
 	if err != nil {
 		t.Fatalf("Queue.GetByID() error = %v", err)
 	}
-	if queue == nil || queue.Status != "queued" || queue.LastErrorKind == nil || *queue.LastErrorKind != string(FailureRetryableTransient) {
+	if queue == nil || queue.Status != "queued" || queue.LastErrorKind == nil || *queue.LastErrorKind != string(roles.FailureRetryableTransient) {
 		t.Fatalf("queue = %#v, want queued retryable_transient failure", queue)
 	}
 	loop, err := fixture.repos.Loops.GetByID(context.Background(), result.LoopID)
@@ -5586,8 +5587,8 @@ func TestRunRepairStepFailsResumedCompletedCheckpointWithoutParsedResult(t *test
 	if !errors.As(err, &loopErr) {
 		t.Fatalf("error = %T, want *loopError", err)
 	}
-	if loopErr.kind != FailureManualIntervention {
-		t.Fatalf("loopErr.kind = %v, want %v", loopErr.kind, FailureManualIntervention)
+	if loopErr.kind != roles.FailureManualIntervention {
+		t.Fatalf("loopErr.kind = %v, want %v", loopErr.kind, roles.FailureManualIntervention)
 	}
 	if !contains(err.Error(), "structured result") || !contains(err.Error(), "automatic retry paused") || !contains(err.Error(), "server_error") {
 		t.Fatalf("error = %q, want missing-contract recovery guidance and agent summary", err.Error())
@@ -5837,7 +5838,7 @@ func TestProcessClaimedQueueItemParksResumedMissingResultCheckpoint(t *testing.T
 	if err != nil {
 		t.Fatalf("ProcessClaimedQueueItem() error = %v", err)
 	}
-	if result == nil || result.Status != "failed" || result.FailureKind != FailureManualIntervention {
+	if result == nil || result.Status != "failed" || result.FailureKind != roles.FailureManualIntervention {
 		t.Fatalf("result = %#v, want parked manual_intervention result", result)
 	}
 
@@ -5845,7 +5846,7 @@ func TestProcessClaimedQueueItemParksResumedMissingResultCheckpoint(t *testing.T
 	if err != nil {
 		t.Fatalf("Queue.GetByID() error = %v", err)
 	}
-	if queue == nil || queue.Status != "manual_intervention" || queue.LastErrorKind == nil || *queue.LastErrorKind != string(FailureManualIntervention) || queue.FinishedAt == nil {
+	if queue == nil || queue.Status != "manual_intervention" || queue.LastErrorKind == nil || *queue.LastErrorKind != string(roles.FailureManualIntervention) || queue.FinishedAt == nil {
 		t.Fatalf("queue = %#v, want manual_intervention queue item without another repair attempt", queue)
 	}
 
@@ -5903,7 +5904,7 @@ func TestProcessClaimedItemRestartsFromDiscoverAfterRemoteHeadChangeAtPush(t *te
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem(first) error = %v", err)
 	}
-	if first.Status != "failed" || first.FailureKind != FailureRetryableAfterResume || !contains(first.Summary, "remote head changed") {
+	if first.Status != "failed" || first.FailureKind != roles.FailureRetryableAfterResume || !contains(first.Summary, "remote head changed") {
 		t.Fatalf("first result = %#v, want retryable remote-head failure", first)
 	}
 	if len(agent.starts) != 1 {
@@ -5961,7 +5962,7 @@ func TestProcessClaimedItemResumeReacquiresPullRequestLock(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem(first) error = %v", err)
 	}
-	if first.Status != "failed" || first.FailureKind != FailureRetryableTransient {
+	if first.Status != "failed" || first.FailureKind != roles.FailureRetryableTransient {
 		t.Fatalf("first = %#v, want retryable-transient validation failure", first)
 	}
 	fixture.advance(5 * time.Second)
@@ -6010,14 +6011,14 @@ func TestProcessNextSetupFailureMarksQueueFailed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ProcessNext() error = %v", err)
 	}
-	if result == nil || result.Status != "failed" || result.FailureKind != FailureNonRetryable || !contains(result.Summary, "requires loopId") {
+	if result == nil || result.Status != "failed" || result.FailureKind != roles.FailureNonRetryable || !contains(result.Summary, "requires loopId") {
 		t.Fatalf("result = %#v, want non-retryable missing-loopId failure", result)
 	}
 	queue, err := fixture.repos.Queue.GetByID(context.Background(), "queue_missing_fixer")
 	if err != nil {
 		t.Fatalf("Queue.GetByID() error = %v", err)
 	}
-	if queue == nil || queue.Status != "queued" || queue.LastErrorKind == nil || *queue.LastErrorKind != string(FailureNonRetryable) || queue.FinishedAt != nil {
+	if queue == nil || queue.Status != "queued" || queue.LastErrorKind == nil || *queue.LastErrorKind != string(roles.FailureNonRetryable) || queue.FinishedAt != nil {
 		t.Fatalf("queue = %#v, want requeued non_retryable item", queue)
 	}
 }
@@ -6042,14 +6043,14 @@ func TestRecoverClaimedItemReconcilesRunningLoopState(t *testing.T) {
 	if err != nil {
 		t.Fatalf("recoverClaimedItem() error = %v", err)
 	}
-	if result == nil || result.Status != "failed" || result.FailureKind != FailureNonRetryable {
+	if result == nil || result.Status != "failed" || result.FailureKind != roles.FailureNonRetryable {
 		t.Fatalf("result = %#v, want failed non-retryable recovery", result)
 	}
 	queue, err := fixture.repos.Queue.GetByID(context.Background(), "queue_fixer_running")
 	if err != nil {
 		t.Fatalf("Queue.GetByID() error = %v", err)
 	}
-	if queue == nil || queue.Status != "manual_intervention" || queue.LastErrorKind == nil || *queue.LastErrorKind != string(FailureNonRetryable) || queue.FinishedAt == nil {
+	if queue == nil || queue.Status != "manual_intervention" || queue.LastErrorKind == nil || *queue.LastErrorKind != string(roles.FailureNonRetryable) || queue.FinishedAt == nil {
 		t.Fatalf("queue = %#v, want parked non_retryable recovery item", queue)
 	}
 	loop, err := fixture.repos.Loops.GetByID(context.Background(), loopID)
@@ -6095,7 +6096,7 @@ func TestProcessClaimedItemAutoPushDisabledSkipsManualIntervention(t *testing.T)
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
-	if result.Status != "failed" || result.FailureKind != FailureManualIntervention || !contains(result.Summary, "Auto push disabled") {
+	if result.Status != "failed" || result.FailureKind != roles.FailureManualIntervention || !contains(result.Summary, "Auto push disabled") {
 		t.Fatalf("result = %#v, want manual-intervention auto-push summary", result)
 	}
 	if len(git.pushCalls) != 0 {
@@ -6105,7 +6106,7 @@ func TestProcessClaimedItemAutoPushDisabledSkipsManualIntervention(t *testing.T)
 	if err != nil {
 		t.Fatalf("Queue.GetByID() error = %v", err)
 	}
-	if queue == nil || queue.Status != "manual_intervention" || queue.LastErrorKind == nil || *queue.LastErrorKind != string(FailureManualIntervention) || queue.FinishedAt == nil {
+	if queue == nil || queue.Status != "manual_intervention" || queue.LastErrorKind == nil || *queue.LastErrorKind != string(roles.FailureManualIntervention) || queue.FinishedAt == nil {
 		t.Fatalf("queue = %#v, want parked manual_intervention item", queue)
 	}
 	run, err := fixture.repos.Runs.GetByID(context.Background(), result.RunID)
@@ -6172,8 +6173,8 @@ func TestRunRepairStepRequiresManualInterventionForRiskyConflictWhenDisabled(t *
 	if !errors.As(err, &loopErr) {
 		t.Fatalf("error = %T, want *loopError", err)
 	}
-	if loopErr.kind != FailureManualIntervention {
-		t.Fatalf("loopErr.kind = %v, want %v", loopErr.kind, FailureManualIntervention)
+	if loopErr.kind != roles.FailureManualIntervention {
+		t.Fatalf("loopErr.kind = %v, want %v", loopErr.kind, roles.FailureManualIntervention)
 	}
 	if checkpoint.ResumePolicy != "manual_intervention" {
 		t.Fatalf("checkpoint.ResumePolicy = %q, want manual_intervention", checkpoint.ResumePolicy)
@@ -6283,8 +6284,8 @@ func TestReconcileCommitsRequiresManualInterventionWhenAutoCommitDisabledAndDirt
 	if !errors.As(err, &loopErr) {
 		t.Fatalf("error = %T, want *loopError", err)
 	}
-	if loopErr.kind != FailureManualIntervention {
-		t.Fatalf("loopErr.kind = %v, want %v", loopErr.kind, FailureManualIntervention)
+	if loopErr.kind != roles.FailureManualIntervention {
+		t.Fatalf("loopErr.kind = %v, want %v", loopErr.kind, roles.FailureManualIntervention)
 	}
 	if checkpoint.ResumePolicy != "manual_intervention" {
 		t.Fatalf("checkpoint.ResumePolicy = %q, want manual_intervention", checkpoint.ResumePolicy)
@@ -7166,7 +7167,7 @@ func TestProcessClaimedItemPausesAfterConsecutiveFailureStreak(t *testing.T) {
 		if err != nil {
 			t.Fatalf("attempt %d ProcessClaimedItem() error = %v", attempt, err)
 		}
-		if result.Status != "failed" || result.FailureKind != FailureRetryableTransient {
+		if result.Status != "failed" || result.FailureKind != roles.FailureRetryableTransient {
 			t.Fatalf("attempt %d result = %#v, want retryable failed result", attempt, result)
 		}
 		queue, err := fixture.repos.Queue.GetByID(context.Background(), result.QueueItemID)
@@ -7239,7 +7240,7 @@ func TestProcessClaimedItemPausesAfterCustomConsecutiveFailureThreshold(t *testi
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
-	if result.Status != "failed" || result.FailureKind != FailureRetryableTransient {
+	if result.Status != "failed" || result.FailureKind != roles.FailureRetryableTransient {
 		t.Fatalf("result = %#v, want retryable failed result", result)
 	}
 	queue, err := fixture.repos.Queue.GetByID(context.Background(), result.QueueItemID)
