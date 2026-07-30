@@ -60,8 +60,25 @@ type upgradeDaemonVersion struct {
 }
 
 func runUpgrade(ctx context.Context, global, operands []string, stdout interface{ Write([]byte) (int, error) }) error {
-	if len(operands) == 0 || operands[0] != "preflight" {
-		return badUsage("upgrade requires the preflight subcommand")
+	if len(operands) == 0 {
+		return badUsage("upgrade requires backup or preflight")
+	}
+	if operands[0] == "backup" {
+		if len(operands) != 1 {
+			return badUsage("upgrade backup accepts no operands")
+		}
+		cfg, err := loadConfig(global)
+		if err != nil {
+			return err
+		}
+		result, err := requestJSON[upgradeBackupResult](ctx, cfg, "POST", "/api/v1/upgrade/backup", nil)
+		if err != nil {
+			return err
+		}
+		return writeVersionJSON(stdout, result)
+	}
+	if operands[0] != "preflight" {
+		return badUsage("upgrade requires backup or preflight")
 	}
 	targetLooper, targetLooperd, jsonOutput, err := parseUpgradePreflightArgs(operands[1:])
 	if err != nil {
@@ -102,6 +119,11 @@ func runUpgrade(ctx context.Context, global, operands []string, stdout interface
 	}
 	_, _ = fmt.Fprintln(stdout, string(encoded))
 	return nil
+}
+
+type upgradeBackupResult struct {
+	Directory string `json:"directory"`
+	Manifest  any    `json:"manifest"`
 }
 
 func targetConfigCompatibility(ctx context.Context, binary string, global []string) (bool, string) {
