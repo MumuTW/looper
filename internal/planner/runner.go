@@ -1004,7 +1004,7 @@ func (r *Runner) runDiscoverIssueStep(ctx context.Context, input stepInput) (pla
 			return input.Checkpoint, &loopError{message: fmt.Sprintf("Unable to resolve GitHub login for planner issue %s#%d", repo, issueNumber), kind: FailureRetryableAfterResume}
 		}
 	}
-	if !manual && !reportAuthorized && !labelsMatch(detail.Labels, policy.Labels, policy.LabelMode) {
+	if !manual && !reportAuthorized && !config.LabelsMatch(detail.Labels, policy.Labels, policy.LabelMode) {
 		checkpoint := input.Checkpoint
 		checkpoint.Issue = &checkpointIssue{Repo: repo, IssueNumber: issueNumber, Title: detail.Title, Body: detail.Body, URL: detail.URL, Assignees: cloneStrings(detail.Assignees), Labels: cloneStrings(detail.Labels), CurrentUserLogin: currentLogin, SpecPath: buildSpecPath(r.now(), issueNumber, detail.Title), RequestedReviewers: resolveRequestedReviewers(input.Project, input.Loop, detail.Assignees, currentLogin)}
 		checkpoint.ClaimedLockKey = lockKey
@@ -2214,7 +2214,7 @@ func shouldClaimIssue(issue IssueSummary, login string, policy DiscoveryPolicy) 
 	if policy.RequireAssigneeCurrentUser && !includesLogin(issue.Assignees, login) {
 		return false
 	}
-	return labelsMatch(issue.Labels, policy.Labels, policy.LabelMode)
+	return config.LabelsMatch(issue.Labels, policy.Labels, policy.LabelMode)
 }
 
 func safeIssueQueryLabel(labels []string) string {
@@ -2299,26 +2299,6 @@ func uniqueNonEmptyLabels(labels []string) []string {
 		result = append(result, label)
 	}
 	return result
-}
-
-func labelsMatch(itemLabels []string, required []string, mode config.LabelMode) bool {
-	if len(required) == 0 {
-		return true
-	}
-	if mode == config.LabelModeAny {
-		for _, label := range required {
-			if labels.Has(itemLabels, label) {
-				return true
-			}
-		}
-		return false
-	}
-	for _, label := range required {
-		if !labels.Has(itemLabels, label) {
-			return false
-		}
-	}
-	return true
 }
 
 func resolveRequestedReviewers(project storage.ProjectRecord, loop storage.LoopRecord, assignees []string, currentLogin string) []string {

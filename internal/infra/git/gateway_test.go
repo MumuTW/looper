@@ -282,10 +282,13 @@ func TestGatewayCommitExcludesArtifactsWithoutTouchingSharedExcludes(t *testing.
 			t.Fatalf("commit contains excluded artifact %q; files = %q", banned, committed)
 		}
 	}
-	// The artifacts stay untracked (not deleted, not staged).
-	rawStatus := runGit(t, worktree.WorktreePath, "status", "--porcelain", "--untracked-files=all")
-	if !strings.Contains(rawStatus, ".pnpm-store/v3/huge.bin") {
-		t.Fatalf("artifact vanished from raw git status: %q", rawStatus)
+	// The artifacts stay on disk, untracked (ignored, not deleted, not staged).
+	if _, err := os.Stat(filepath.Join(worktree.WorktreePath, ".pnpm-store", "v3", "huge.bin")); err != nil {
+		t.Fatalf("artifact removed from disk: %v", err)
+	}
+	ignoredStatus := runGit(t, worktree.WorktreePath, "status", "--porcelain", "--ignored", "--untracked-files=all")
+	if !strings.Contains(ignoredStatus, ".pnpm-store/") {
+		t.Fatalf("artifact not reported as ignored: %q", ignoredStatus)
 	}
 
 	// Main checkout and its status are untouched.
@@ -1622,4 +1625,86 @@ func writeFakeGit(t *testing.T, script string) string {
 
 func stringsTrimSpace(value string) string {
 	return string(bytes.TrimSpace([]byte(value)))
+}
+
+// Follow-up to #71 (post-merge review of PR #206): agent-authored git
+// commands must also skip untracked artifacts, via worktree-scoped config
+// that never touches the main checkout or siblings; legacy shared-exclude
+// blocks from earlier looper versions are removed; and readStatus filters
+// untracked artifacts so dirt decisions match what Commit will stage.
+func TestGatewayWorktreeScopedExcludesProtectAgentCommits(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	fixture.createMainOnlyRepo(t)
+	gateway := fixture.gateway()
+
+	// Seed the legacy managed block in the COMMON info/exclude, plus a user
+	// line that must survive the migration.
+	commonExcludeRel := stringsTrimSpace(runGit(t, fixture.repoPath, "rev-parse", "--git-path", "info/exclude"))
+	commonExclude := commonExcludeRel
+	if !filepath.IsAbs(commonExclude) {
+		commonExclude = filepath.Join(fixture.repoPath, commonExcludeRel)
+	}
+	mustMkdirAll(t, filepath.Dir(commonExclude))
+	writeFile(t, commonExclude, "my-own-ignore/\n"+worktreeExcludeManagedHeader+"\n.pnpm-store/\nnode_modules/\n.turbo/\ndist/\n.next/\n.cache/\n*.log\n")
+
+	worktree, err := gateway.CreateWorktree(ctx, CreateWorktreeInput{
+		ProjectID:    fixture.projectID,
+		RepoPath:     fixture.repoPath,
+		WorktreeRoot: fixture.worktreeRoot,
+		Branch:       "feature/agent",
+		BaseBranch:   "main",
+	})
+	if err != nil {
+		t.Fatalf("CreateWorktree() error = %v", err)
+	}
+
+	// Legacy managed block removed; the user's own line preserved.
+	migrated := readFile(t, commonExclude)
+	if strings.Contains(migrated, worktreeExcludeManagedHeader) || strings.Contains(migrated, ".pnpm-store/") {
+		t.Fatalf("legacy managed block still present in common exclude: %q", migrated)
+	}
+	if !strings.Contains(migrated, "my-own-ignore/") {
+		t.Fatalf("user content lost during legacy migration: %q", migrated)
+	}
+
+	// Agent-style raw `git add -A` inside the worktree skips artifacts.
+	mustMkdirAll(t, filepath.Join(worktree.WorktreePath, ".pnpm-store", "v3"))
+	writeFile(t, filepath.Join(worktree.WorktreePath, ".pnpm-store", "v3", "huge.bin"), "artifact\n")
+	writeFile(t, filepath.Join(worktree.WorktreePath, "app.ts"), "export const x = 1\n")
+	runGit(t, worktree.WorktreePath, "add", "-A")
+	staged := runGit(t, worktree.WorktreePath, "diff", "--cached", "--name-only")
+	if !strings.Contains(staged, "app.ts") {
+		t.Fatalf("agent add -A did not stage source; staged = %q", staged)
+	}
+	if strings.Contains(staged, ".pnpm-store") {
+		t.Fatalf("agent add -A staged an artifact; staged = %q", staged)
+	}
+
+	// The main checkout is untouched by the worktree-scoped config: an
+	// artifact dir there still shows in ITS raw status.
+	mustMkdirAll(t, filepath.Join(fixture.repoPath, "node_modules"))
+	writeFile(t, filepath.Join(fixture.repoPath, "node_modules", "dep.js"), "module\n")
+	mainStatus := runGit(t, fixture.repoPath, "status", "--porcelain", "--untracked-files=all")
+	if !strings.Contains(mainStatus, "node_modules/dep.js") {
+		t.Fatalf("main checkout ignore behavior changed; status = %q", mainStatus)
+	}
+
+	// readStatus (dirt decisions) filters untracked artifacts, keeps source.
+	runGit(t, worktree.WorktreePath, "reset")
+	entries, err := gateway.readStatus(ctx, worktree.WorktreePath)
+	if err != nil {
+		t.Fatalf("readStatus() error = %v", err)
+	}
+	var paths []string
+	for _, entry := range entries {
+		paths = append(paths, entry.Path)
+	}
+	joined := strings.Join(paths, ",")
+	if strings.Contains(joined, ".pnpm-store") {
+		t.Fatalf("readStatus reports untracked artifact; entries = %q", joined)
+	}
+	if !strings.Contains(joined, "app.ts") {
+		t.Fatalf("readStatus lost source entry; entries = %q", joined)
+	}
 }

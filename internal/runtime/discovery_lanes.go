@@ -90,6 +90,15 @@ func roleDiscoverers(input defaultSchedulerTickInput) map[string]discoveryLane {
 			},
 			Discover: func(ctx context.Context, projectID, repo string, snapshot *githubinfra.DiscoverySnapshot) ([]storage.QueueItemRecord, error) {
 				result, err := input.Fixer.DiscoverPullRequests(ctx, fixer.DiscoveryInput{ProjectID: projectID, Repo: repo, Snapshot: snapshot})
+				// Examined is the per-PR forge work this lane performs; skipped is what the
+				// cheap local checks avoided before any call. Logging both is what decides
+				// whether a fingerprint-based skip has headroom here at all.
+				if input.Logger != nil {
+					input.Logger.Info("fixer discovery examined pull requests", map[string]any{
+						"projectId": projectID, "repo": repo,
+						"examined": result.Examined, "skipped": result.Skipped, "enqueued": len(result.QueueItems),
+					})
+				}
 				return result.QueueItems, err
 			},
 		},
@@ -106,7 +115,17 @@ func roleDiscoverers(input defaultSchedulerTickInput) map[string]discoveryLane {
 			Present:   input.Gatekeeper != nil,
 			Supported: func(capabilities forge.Capabilities) bool { return capabilities.GitHubPullRequests },
 			Discover: func(ctx context.Context, projectID, repo string, snapshot *githubinfra.DiscoverySnapshot) ([]storage.QueueItemRecord, error) {
-				_, err := input.Gatekeeper.DiscoverPullRequests(ctx, gatekeeper.DiscoveryInput{ProjectID: projectID, Repo: repo, Snapshot: snapshot})
+				result, err := input.Gatekeeper.DiscoverPullRequests(ctx, gatekeeper.DiscoveryInput{ProjectID: projectID, Repo: repo, Snapshot: snapshot})
+				// An optimisation that skips work is only verifiable if the skipping is
+				// visible. Logging both counts also means a fingerprint that silently
+				// stops matching shows up as skipped falling to zero, rather than as the
+				// lane quietly costing what it used to.
+				if input.Logger != nil {
+					input.Logger.Info("gatekeeper discovery evaluated pull requests", map[string]any{
+						"projectId": projectID, "repo": repo,
+						"evaluated": result.Evaluated, "skipped": result.Skipped,
+					})
+				}
 				return nil, err
 			},
 		},

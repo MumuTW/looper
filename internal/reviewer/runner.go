@@ -1117,7 +1117,7 @@ func (r *Runner) discoverExistingReviewerLoop(ctx context.Context, project stora
 			return nil
 		}
 	}
-	if !isManualReviewerLoop(loop) && !policy.MatchAnyTrigger && !labelsMatch(detail.Labels, policy.Labels, policy.LabelMode) {
+	if !isManualReviewerLoop(loop) && !policy.MatchAnyTrigger && !config.LabelsMatch(detail.Labels, policy.Labels, policy.LabelMode) {
 		result.Skipped++
 		return nil
 	}
@@ -1298,7 +1298,7 @@ func prEligibleForDiscoveryPreclaim(pr PullRequestSummary, currentLogin string, 
 	if !networkpolicy.IsRouted(policy.RoutedClaimPolicy) && reviewRequestRequiredForCandidate(policy, pr.Labels) && reviewRequestsKnownAbsent(pr.ReviewRequests, currentLogin) {
 		return false
 	}
-	if !policy.MatchAnyTrigger && !labelsMatch(pr.Labels, policy.Labels, policy.LabelMode) {
+	if !policy.MatchAnyTrigger && !config.LabelsMatch(pr.Labels, policy.Labels, policy.LabelMode) {
 		return false
 	}
 	return true
@@ -1321,7 +1321,7 @@ func reviewRequestRequiredForCandidate(policy DiscoveryPolicy, labels []string) 
 	if !policy.RequireReviewRequest {
 		return false
 	}
-	return !(policy.MatchAnyTrigger && len(prQueryLabels(policy.Labels)) > 0 && labelsMatch(labels, policy.Labels, policy.LabelMode))
+	return !(policy.MatchAnyTrigger && len(prQueryLabels(policy.Labels)) > 0 && config.LabelsMatch(labels, policy.Labels, policy.LabelMode))
 }
 
 func (r *Runner) reviewerAutoMergeConfigForProject(projectID string) config.ReviewerAutoMergeConfig {
@@ -1446,26 +1446,6 @@ func prQueryLabels(labels []string) []string {
 		result = append(result, label)
 	}
 	return result
-}
-
-func labelsMatch(itemLabels []string, required []string, mode config.LabelMode) bool {
-	if len(required) == 0 {
-		return true
-	}
-	if mode == config.LabelModeAny {
-		for _, label := range required {
-			if labels.Has(itemLabels, label) {
-				return true
-			}
-		}
-		return false
-	}
-	for _, label := range required {
-		if !labels.Has(itemLabels, label) {
-			return false
-		}
-	}
-	return true
 }
 
 func (r *Runner) ProcessNext(ctx context.Context, claimedBy string) (*ProcessResult, error) {
