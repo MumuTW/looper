@@ -1016,19 +1016,21 @@ func (r *Runtime) start(ctx context.Context) error {
 		ActiveExecutions: r.activeExecutions,
 	}
 	schedulerDisabled := false
-	if !r.customSchedulerTick {
+	if !r.customSchedulerTick || !r.customSchedulerClaim {
 		handlers := buildCatalogSchedulerHandlers(r.projectCatalog, &r.configBoundary, r.configPath, r.logger, coordinator, repositories, gitGateway, githubGateway, r.activeExecutions, func() schedulerAsyncRunner {
 			r.mu.RLock()
 			defer r.mu.RUnlock()
 			return r.schedulerTasks
 		}, r.TriggerSchedulerClaim, r.now, r.reconcileLiveStaleRunningRuns, r.AllowClaim, r.WithAllowClaim)
-		r.defaultSchedulerTick = handlers.tick
+		if !r.customSchedulerTick {
+			r.defaultSchedulerTick = handlers.tick
+			r.webhookForwarder = handlers.webhook
+			r.notificationGateways = handlers.notificationGateways
+			schedulerDisabled = !defaultSchedulerAgentsConfigured(r.config)
+		}
 		if !r.customSchedulerClaim {
 			r.defaultSchedulerClaim = handlers.claim
 		}
-		r.webhookForwarder = handlers.webhook
-		r.notificationGateways = handlers.notificationGateways
-		schedulerDisabled = !defaultSchedulerAgentsConfigured(r.config)
 	}
 	r.githubGateway = githubGateway
 	r.networkManager = networkclient.NewManager(filepath.Join(runtimeHomeDirOrEmpty(), ".looper", "network.json"), r.config, repositories, githubGateway)
