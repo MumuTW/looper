@@ -2,6 +2,7 @@ package loops
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 )
 
@@ -39,9 +40,13 @@ type HITLAsk struct {
 }
 
 // ReadHITLAsk extracts the HITL ask state from a loop's metadata JSON. The
-// second return is false when no HITL state is present.
+// second return is false when no HITL state is present. Malformed metadata is
+// treated as "no HITL state" (the same as a missing key).
 func ReadHITLAsk(metadataJSON *string) (HITLAsk, bool) {
-	meta := parseMetadataObject(metadataJSON)
+	meta, err := parseMetadataObject(metadataJSON)
+	if err != nil {
+		return HITLAsk{}, false
+	}
 	raw, ok := meta[hitlMetadataKey]
 	if !ok {
 		return HITLAsk{}, false
@@ -58,9 +63,13 @@ func ReadHITLAsk(metadataJSON *string) (HITLAsk, bool) {
 }
 
 // WriteHITLAsk merges the HITL ask state into a loop's metadata JSON, preserving
-// all other keys, and returns the updated JSON string.
+// all other keys, and returns the updated JSON string. Returns an error if the
+// existing metadata is malformed.
 func WriteHITLAsk(metadataJSON *string, ask HITLAsk) (string, error) {
-	meta := parseMetadataObject(metadataJSON)
+	meta, err := parseMetadataObject(metadataJSON)
+	if err != nil {
+		return "", err
+	}
 	encoded, err := json.Marshal(ask)
 	if err != nil {
 		return "", err
@@ -79,7 +88,10 @@ func WriteHITLAsk(metadataJSON *string, ask HITLAsk) (string, error) {
 
 // ClearHITLAsk removes the HITL ask state from a loop's metadata JSON.
 func ClearHITLAsk(metadataJSON *string) (string, error) {
-	meta := parseMetadataObject(metadataJSON)
+	meta, err := parseMetadataObject(metadataJSON)
+	if err != nil {
+		return "", err
+	}
 	delete(meta, hitlMetadataKey)
 	out, err := json.Marshal(meta)
 	if err != nil {
@@ -88,13 +100,16 @@ func ClearHITLAsk(metadataJSON *string) (string, error) {
 	return string(out), nil
 }
 
-func parseMetadataObject(metadataJSON *string) map[string]any {
+func parseMetadataObject(metadataJSON *string) (map[string]any, error) {
 	if metadataJSON == nil || strings.TrimSpace(*metadataJSON) == "" {
-		return map[string]any{}
+		return map[string]any{}, nil
 	}
 	var meta map[string]any
-	if err := json.Unmarshal([]byte(*metadataJSON), &meta); err != nil || meta == nil {
-		return map[string]any{}
+	if err := json.Unmarshal([]byte(*metadataJSON), &meta); err != nil {
+		return nil, fmt.Errorf("parse loop metadata: %w", err)
 	}
-	return meta
+	if meta == nil {
+		return map[string]any{}, nil
+	}
+	return meta, nil
 }

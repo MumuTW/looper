@@ -19,7 +19,10 @@ type Milestone struct {
 
 // ReadMilestones returns a loop's milestone log in chronological order.
 func ReadMilestones(metadataJSON *string) []Milestone {
-	meta := parseMetadataObject(metadataJSON)
+	meta, err := parseMetadataObject(metadataJSON)
+	if err != nil {
+		return nil
+	}
 	raw, ok := meta[milestonesMetadataKey]
 	if !ok {
 		return nil
@@ -52,7 +55,10 @@ func AppendMilestone(metadataJSON *string, m Milestone) (string, error) {
 }
 
 func marshalWithMilestones(metadataJSON *string, milestones []Milestone) (string, error) {
-	meta := parseMetadataObject(metadataJSON)
+	meta, err := parseMetadataObject(metadataJSON)
+	if err != nil {
+		return "", err
+	}
 	encoded, err := json.Marshal(milestones)
 	if err != nil {
 		return "", err

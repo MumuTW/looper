@@ -28,7 +28,10 @@ func TestHITLAskRoundTripPreservesOtherMetadata(t *testing.T) {
 	}
 
 	// Other metadata keys must be preserved.
-	meta := parseMetadataObject(&updated)
+	meta, err := parseMetadataObject(&updated)
+	if err != nil {
+		t.Fatalf("parseMetadataObject error = %v", err)
+	}
 	if meta["issueTitle"] != "Fix login" {
 		t.Fatalf("issueTitle not preserved: %#v", meta["issueTitle"])
 	}
@@ -58,7 +61,7 @@ func TestClearHITLAskRemovesOnlyHITL(t *testing.T) {
 	if _, ok := ReadHITLAsk(&cleared); ok {
 		t.Fatal("hitl still present after ClearHITLAsk")
 	}
-	if parseMetadataObject(&cleared)["issueTitle"] != "x" {
-		t.Fatal("issueTitle removed by ClearHITLAsk")
+	if meta, err := parseMetadataObject(&cleared); err != nil || meta["issueTitle"] != "x" {
+		t.Fatalf("issueTitle removed by ClearHITLAsk: err=%v meta=%v", err, meta)
 	}
 }

@@ -20,7 +20,10 @@ type HumanMessage struct {
 
 // ReadHumanInbox returns a loop's queued human messages in arrival order.
 func ReadHumanInbox(metadataJSON *string) []HumanMessage {
-	meta := parseMetadataObject(metadataJSON)
+	meta, err := parseMetadataObject(metadataJSON)
+	if err != nil {
+		return nil
+	}
 	raw, ok := meta[humanInboxMetadataKey]
 	if !ok {
 		return nil
@@ -53,7 +56,10 @@ func ClearHumanInbox(metadataJSON *string) (string, error) {
 }
 
 func marshalWithHumanInbox(metadataJSON *string, msgs []HumanMessage) (string, error) {
-	meta := parseMetadataObject(metadataJSON)
+	meta, err := parseMetadataObject(metadataJSON)
+	if err != nil {
+		return "", err
+	}
 	if len(msgs) == 0 {
 		delete(meta, humanInboxMetadataKey)
 	} else {
