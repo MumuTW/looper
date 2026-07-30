@@ -1320,6 +1320,51 @@ describe("ConfigPage", { timeout: 30_000 }, () => {
     });
   });
 
+  it("labels experimental Devin in global and role vendor selectors", async () => {
+    const initial = configFixture({
+      agent: {
+        ...configFixture().agent,
+        vendor: "devin-experimental",
+      },
+      roles: {
+        worker: { agent: { vendor: "devin-experimental" } },
+      },
+      metadata: {
+        ...configFixture().metadata,
+        fields: {
+          ...configFixture().metadata.fields,
+          "roles.worker.agent.vendor": {
+            source: "config-file",
+            editable: true,
+            applyMode: "hot",
+          },
+        },
+      },
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        if (String(input) !== "/api/v1/config") {
+          throw new Error(`unexpected request: ${String(input)}`);
+        }
+        return response(initial);
+      }),
+    );
+    renderPage();
+
+    const globalVendor = (await screen.findByLabelText(
+      "agent.vendor",
+    )) as HTMLSelectElement;
+    const workerVendor = screen.getByLabelText(
+      "roles.worker.agent.vendor",
+    ) as HTMLSelectElement;
+    for (const select of [globalVendor, workerVendor]) {
+      expect(select.selectedOptions[0]?.textContent).toBe(
+        "devin-experimental (fresh-run only)",
+      );
+    }
+  });
+
   it("edits agent profiles and role agent bindings without a params editor", async () => {
     const initial = configFixture({
       agent: {

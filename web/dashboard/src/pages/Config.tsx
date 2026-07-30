@@ -292,7 +292,9 @@ function ConfigControl({
         ) : null}
         {options.map((option) => (
           <option key={option} value={option}>
-            {option}
+            {path === "agent.vendor" || path.endsWith(".agent.vendor")
+              ? agentVendorOptionLabel(option)
+              : option}
           </option>
         ))}
       </select>
