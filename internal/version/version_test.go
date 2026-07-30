@@ -167,6 +167,17 @@ func TestInfoSameBuildRequiresCompleteIdentity(t *testing.T) {
 	if !base.SameBuild(base) {
 		t.Fatal("identical build identities did not match")
 	}
+	if (Info{Version: "0.0.0-dev", Metadata: BuildMetadata{VersionSource: "source", Channel: "dev", APIVersion: "v1"}}).SameBuild(
+		Info{Version: "0.0.0-dev", Metadata: BuildMetadata{VersionSource: "source", Channel: "dev", APIVersion: "v1"}},
+	) {
+		t.Fatal("incomplete identities were treated as proof of the same build")
+	}
+	dirty := base
+	value := true
+	dirty.Metadata.Dirty = &value
+	if dirty.SameBuild(dirty) {
+		t.Fatal("dirty identities were treated as proof of the same source build")
+	}
 
 	mutations := map[string]func(Info) Info{
 		"version": func(info Info) Info { info.Version = "1.2.4"; return info },

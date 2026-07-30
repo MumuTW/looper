@@ -36,6 +36,7 @@ import (
 	"time"
 
 	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/version"
 )
 
 // requestTimeout bounds a single call. Those are one storage transaction and at
@@ -78,7 +79,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	if parsed.Verb == "--version" || parsed.Verb == "version" {
-		return reportError(stderr, runVersion(ctx, parsed.Global, parsed.Operands, stdout))
+		return reportError(stderr, runVersion(ctx, parsed.Global, parsed.Operands, stdout, version.Current()))
 	}
 
 	// `review` owns its own flag set, and the daemon's trusted review proxy

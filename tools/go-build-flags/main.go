@@ -42,9 +42,10 @@ func applyDirtySuffix(value string, dirty bool) string {
 // stamp this tool exists to prevent. Hand edits under a generated output
 // directory are not a signal worth protecting.
 //
-// Uncertainty resolves to clean. A tarball build has no git at all, so
-// suffixing on a failed probe would corrupt artifact versions to avoid a stamp
-// that was accurate anyway. The suffix is added only on positive evidence.
+// Uncertainty stays unknown in the explicit dirty field. A tarball build has
+// no git at all, so suffixing on a failed probe would corrupt artifact versions
+// to avoid a stamp that may be accurate. The suffix is added only on positive
+// dirty evidence; build-identity comparison refuses unknown evidence.
 //
 // Only the version string is suffixed. GitCommitSHA keeps its exact value — it
 // is a commit id, and appending to it would make it stop being one.

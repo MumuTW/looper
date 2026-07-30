@@ -1,5 +1,7 @@
 package version
 
+import "strings"
+
 const (
 	defaultVersion       = "0.0.0-dev"
 	defaultVersionSource = "internal/version/version.go"
@@ -52,13 +54,27 @@ func Current() Info {
 // use one preparation timestamp, so equality proves they came from the same
 // cut rather than merely the same source commit.
 func (i Info) SameBuild(other Info) bool {
-	return i.Version == other.Version &&
+	return i.Complete() && other.Complete() &&
+		i.Version == other.Version &&
 		i.Metadata.VersionSource == other.Metadata.VersionSource &&
 		i.Metadata.Channel == other.Metadata.Channel &&
 		i.Metadata.APIVersion == other.Metadata.APIVersion &&
 		equalOptionalString(i.Metadata.GitCommitSHA, other.Metadata.GitCommitSHA) &&
 		equalOptionalString(i.Metadata.BuildTimestamp, other.Metadata.BuildTimestamp) &&
 		equalOptionalBool(i.Metadata.Dirty, other.Metadata.Dirty)
+}
+
+// Complete reports whether the identity contains enough source evidence to
+// prove equality. Two unknown fields being equal is not proof that two dev or
+// source-archive binaries came from the same build.
+func (i Info) Complete() bool {
+	return strings.TrimSpace(i.Version) != "" &&
+		strings.TrimSpace(i.Metadata.VersionSource) != "" &&
+		strings.TrimSpace(i.Metadata.Channel) != "" &&
+		strings.TrimSpace(i.Metadata.APIVersion) != "" &&
+		i.Metadata.GitCommitSHA != nil && strings.TrimSpace(*i.Metadata.GitCommitSHA) != "" &&
+		i.Metadata.BuildTimestamp != nil && strings.TrimSpace(*i.Metadata.BuildTimestamp) != "" &&
+		i.Metadata.Dirty != nil && !*i.Metadata.Dirty
 }
 
 func stringPtrOrNil(value string) *string {

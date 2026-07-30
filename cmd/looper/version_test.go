@@ -2,9 +2,11 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"testing"
 
 	"github.com/MumuTW/looper/internal/version"
@@ -20,21 +22,23 @@ func TestVersionJSONPrintsCompleteLocalBuildIdentity(t *testing.T) {
 	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
 		t.Fatalf("decode version json: %v\n%s", err, stdout.String())
 	}
-	if !got.SameBuild(version.Current()) {
+	if !reflect.DeepEqual(got, version.Current()) {
 		t.Fatalf("version json = %#v, want current identity %#v", got, version.Current())
 	}
 }
 
 func TestVersionCheckDaemonReportsSameBuildAndFailsOnMismatch(t *testing.T) {
-	current := version.Current()
+	current := completeVersionInfo()
 	for _, test := range []struct {
-		name      string
-		detail    version.Info
-		wantCode  int
-		wantMatch bool
+		name       string
+		detail     version.Info
+		wantError  bool
+		comparable bool
+		wantMatch  bool
 	}{
-		{name: "same build", detail: current, wantCode: 0, wantMatch: true},
-		{name: "different source commit", detail: withVersionCommit(current, "different"), wantCode: 1, wantMatch: false},
+		{name: "same build", detail: current, comparable: true, wantMatch: true},
+		{name: "different source commit", detail: withVersionCommit(current, "different"), wantError: true, comparable: true, wantMatch: false},
+		{name: "incomplete identity", detail: version.Current(), wantError: true, comparable: false, wantMatch: false},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -47,20 +51,29 @@ func TestVersionCheckDaemonReportsSameBuildAndFailsOnMismatch(t *testing.T) {
 			configForDaemon(t, server.URL)
 
 			stdout := &bytes.Buffer{}
-			stderr := &bytes.Buffer{}
-			code := run([]string{"version", "--check-daemon", "--json"}, nil, stdout, stderr)
-			if code != test.wantCode {
-				t.Fatalf("looper version --check-daemon --json exit code = %d, stderr = %q, want %d", code, stderr.String(), test.wantCode)
+			err := runVersion(context.Background(), nil, []string{"--check-daemon", "--json"}, stdout, current)
+			if (err != nil) != test.wantError {
+				t.Fatalf("runVersion() error = %v, wantError %t", err, test.wantError)
 			}
 			var report versionCheckReport
 			if err := json.Unmarshal(stdout.Bytes(), &report); err != nil {
 				t.Fatalf("decode comparison json: %v\n%s", err, stdout.String())
 			}
-			if report.SameBuild != test.wantMatch || !report.CLI.SameBuild(current) || !report.Daemon.SameBuild(test.detail) {
+			if report.Comparable != test.comparable || report.SameBuild != test.wantMatch || !reflect.DeepEqual(report.CLI, current) || !reflect.DeepEqual(report.Daemon, test.detail) {
 				t.Fatalf("comparison report = %#v", report)
 			}
 		})
 	}
+}
+
+func completeVersionInfo() version.Info {
+	clean := false
+	commit := "abc123"
+	timestamp := "2026-07-31T00:00:00Z"
+	return version.Info{Version: "1.2.3", Metadata: version.BuildMetadata{
+		VersionSource: "git-tag:v1.2.3", Channel: "stable", APIVersion: "v1",
+		GitCommitSHA: &commit, BuildTimestamp: &timestamp, Dirty: &clean,
+	}}
 }
 
 func withVersionCommit(info version.Info, commit string) version.Info {

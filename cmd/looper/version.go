@@ -16,12 +16,13 @@ type daemonVersionResponse struct {
 }
 
 type versionCheckReport struct {
-	SameBuild bool         `json:"sameBuild"`
-	CLI       version.Info `json:"cli"`
-	Daemon    version.Info `json:"daemon"`
+	Comparable bool         `json:"comparable"`
+	SameBuild  bool         `json:"sameBuild"`
+	CLI        version.Info `json:"cli"`
+	Daemon     version.Info `json:"daemon"`
 }
 
-func runVersion(ctx context.Context, global, operands []string, stdout io.Writer) error {
+func runVersion(ctx context.Context, global, operands []string, stdout io.Writer, local version.Info) error {
 	jsonOutput := false
 	checkDaemon := false
 	for _, operand := range operands {
@@ -41,7 +42,6 @@ func runVersion(ctx context.Context, global, operands []string, stdout io.Writer
 		}
 	}
 
-	local := version.Current()
 	if !checkDaemon {
 		if !jsonOutput {
 			_, _ = fmt.Fprintln(stdout, local.Version)
@@ -59,7 +59,7 @@ func runVersion(ctx context.Context, global, operands []string, stdout io.Writer
 		return err
 	}
 	daemon := version.Info{Version: remote.Version, Metadata: remote.Build}
-	report := versionCheckReport{SameBuild: local.SameBuild(daemon), CLI: local, Daemon: daemon}
+	report := versionCheckReport{Comparable: local.Complete() && daemon.Complete(), SameBuild: local.SameBuild(daemon), CLI: local, Daemon: daemon}
 	if jsonOutput {
 		if err := writeVersionJSON(stdout, report); err != nil {
 			return err
@@ -73,7 +73,10 @@ func runVersion(ctx context.Context, global, operands []string, stdout io.Writer
 		if err != nil {
 			return fmt.Errorf("encode looperd build identity: %w", err)
 		}
-		_, _ = fmt.Fprintf(stdout, "looper:    %s\nlooperd:   %s\nsameBuild: %t\n", localJSON, daemonJSON, report.SameBuild)
+		_, _ = fmt.Fprintf(stdout, "looper:     %s\nlooperd:    %s\ncomparable: %t\nsameBuild:  %t\n", localJSON, daemonJSON, report.Comparable, report.SameBuild)
+	}
+	if !report.Comparable {
+		return fmt.Errorf("cannot prove looper and looperd are the same build: one or both identities are incomplete")
 	}
 	if !report.SameBuild {
 		return fmt.Errorf("looper and looperd build identities do not match")

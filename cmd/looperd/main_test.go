@@ -9,6 +9,7 @@ import (
 	"net"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"slices"
 	"syscall"
@@ -74,7 +75,7 @@ func TestRunPrintsCompleteVersionJSONWithoutBootstrapping(t *testing.T) {
 	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
 		t.Fatalf("decode stdout: %v\n%s", err, stdout)
 	}
-	if !got.SameBuild(version.Current()) {
+	if !reflect.DeepEqual(got, version.Current()) {
 		t.Fatalf("identity = %#v, want %#v", got, version.Current())
 	}
 	if bootstrapCalled {
