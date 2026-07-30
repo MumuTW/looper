@@ -187,6 +187,7 @@ type Result struct {
 	Stderr                       string
 	ParseStatus                  string
 	CompletionSignal             string
+	CompletionPayload            string
 	Artifacts                    []string
 	ChangedFiles                 []string
 	Commits                      []string
@@ -201,13 +202,14 @@ type Result struct {
 }
 
 type completionParse struct {
-	ParseStatus      string
-	CompletionSignal string
-	Summary          string
-	Artifacts        []string
-	ChangedFiles     []string
-	Commits          []string
-	Lifecycle        *lifecycle.State
+	ParseStatus       string
+	CompletionSignal  string
+	CompletionPayload string
+	Summary           string
+	Artifacts         []string
+	ChangedFiles      []string
+	Commits           []string
+	Lifecycle         *lifecycle.State
 }
 
 type Execution interface {
@@ -985,6 +987,7 @@ func (x *execution) run(ctx context.Context) {
 		Stderr:                       stderr,
 		ParseStatus:                  completion.ParseStatus,
 		CompletionSignal:             completion.CompletionSignal,
+		CompletionPayload:            completion.CompletionPayload,
 		Artifacts:                    append([]string(nil), completion.Artifacts...),
 		ChangedFiles:                 append([]string(nil), completion.ChangedFiles...),
 		Commits:                      append([]string(nil), completion.Commits...),
@@ -1373,6 +1376,7 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 		Stderr:                       stderr,
 		ParseStatus:                  completion.ParseStatus,
 		CompletionSignal:             completion.CompletionSignal,
+		CompletionPayload:            completion.CompletionPayload,
 		Artifacts:                    append([]string(nil), completion.Artifacts...),
 		ChangedFiles:                 append([]string(nil), completion.ChangedFiles...),
 		Commits:                      append([]string(nil), completion.Commits...),
@@ -2643,11 +2647,12 @@ func parseCompletion(stdout, stderr string) completionParse {
 			return completionParse{ParseStatus: "invalid_json", CompletionSignal: CompletionMarkerPrefix}
 		}
 		result := completionParse{
-			ParseStatus:      "parsed",
-			CompletionSignal: CompletionMarkerPrefix,
-			Artifacts:        asStringSlice(parsed["artifacts"]),
-			ChangedFiles:     asStringSlice(parsed["changedFiles"]),
-			Commits:          asStringSlice(parsed["commits"]),
+			ParseStatus:       "parsed",
+			CompletionSignal:  CompletionMarkerPrefix,
+			CompletionPayload: payload,
+			Artifacts:         asStringSlice(parsed["artifacts"]),
+			ChangedFiles:      asStringSlice(parsed["changedFiles"]),
+			Commits:           asStringSlice(parsed["commits"]),
 		}
 		if state, err := lifecycle.FromMap(parsed["git_pr_lifecycle"]); err == nil {
 			result.Lifecycle = state

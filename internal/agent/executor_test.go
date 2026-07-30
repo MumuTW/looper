@@ -900,7 +900,7 @@ func TestExecutorSuccessfulExecutionPersistsExecutionAndEvents(t *testing.T) {
 	if result.Status != "completed" {
 		t.Fatalf("result.Status = %q, want completed", result.Status)
 	}
-	if result.ParseStatus != "parsed" || result.CompletionSignal != CompletionMarkerPrefix || result.Summary != "done" {
+	if result.ParseStatus != "parsed" || result.CompletionSignal != CompletionMarkerPrefix || result.CompletionPayload == "" || result.Summary != "done" {
 		t.Fatalf("result = %#v, want parsed completion marker result", result)
 	}
 	if len(result.Artifacts) != 1 || result.Artifacts[0] != "spec.md" || len(result.ChangedFiles) != 1 || result.ChangedFiles[0] != "main.go" || len(result.Commits) != 1 || result.Commits[0] != "abc123" {

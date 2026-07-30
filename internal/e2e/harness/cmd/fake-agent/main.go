@@ -84,9 +84,9 @@ func main() {
 	case "success-with-diff", "write-file":
 		path := envOr(envFakeAgentWriteFile, "agent-output.txt")
 		mustWriteFile(path, []byte("changed by fake agent\n"))
-		printCompletion(marker, map[string]any{"summary": "fake agent wrote file", "changedFiles": []string{path}})
+		printCompletion(marker, map[string]any{"outcome": "completed", "summary": "fake agent wrote file", "changedFiles": []string{path}})
 	case "success-no-diff":
-		printCompletion(marker, map[string]any{"summary": "fake agent no diff"})
+		printCompletion(marker, map[string]any{"outcome": "completed", "summary": "fake agent no diff"})
 	case "forgejo-reviewer-open":
 		printCompletion(marker, map[string]any{
 			"summary": "Found actionable Forgejo review items",
@@ -106,7 +106,7 @@ func main() {
 	case "modify-file":
 		path := envOr(envFakeAgentModifyFile, "README.md")
 		mustAppendFile(path, []byte("modified by fake agent\n"))
-		printCompletion(marker, map[string]any{"summary": "fake agent modified file", "changedFiles": []string{path}})
+		printCompletion(marker, map[string]any{"outcome": "completed", "summary": "fake agent modified file", "changedFiles": []string{path}})
 	case "commit":
 		path := envOr(envFakeAgentWriteFile, "agent-commit.txt")
 		mustWriteFile(path, []byte("commit from fake agent\n"))
@@ -114,7 +114,7 @@ func main() {
 		mustRun(gitPath, "add", path)
 		mustRun(gitPath, "commit", "-m", "fake agent commit")
 		sha := strings.TrimSpace(mustOutput(gitPath, "rev-parse", "HEAD"))
-		payload := map[string]any{"summary": "fake agent committed changes", "changedFiles": []string{path}, "commits": []string{sha}}
+		payload := map[string]any{"outcome": "completed", "summary": "fake agent committed changes", "changedFiles": []string{path}, "commits": []string{sha}}
 		if replies := promptReviewThreadReplies("Updated fix-target.txt to address the review feedback.", false, true); len(replies) > 0 {
 			payload["review_thread_replies"] = replies
 		}
@@ -128,6 +128,7 @@ func main() {
 		sha := strings.TrimSpace(mustOutput(gitPath, "rev-parse", "HEAD"))
 		replies := promptReviewThreadReplies("Updated fix-target.txt to address the review feedback.", true, true)
 		printCompletion(marker, map[string]any{
+			"outcome":               "completed",
 			"summary":               "fake agent committed changes",
 			"changedFiles":          []string{path},
 			"commits":               []string{sha},
@@ -139,7 +140,7 @@ func main() {
 			_, _ = fmt.Fprintln(os.Stderr, "transient fake-agent failure")
 			os.Exit(1)
 		}
-		printCompletion(marker, map[string]any{"summary": "fake agent recovered"})
+		printCompletion(marker, map[string]any{"outcome": "completed", "summary": "fake agent recovered"})
 	case "malformed-marker":
 		_, _ = fmt.Printf("%s{bad json}\n", marker)
 	case "timeout", "no-marker":
