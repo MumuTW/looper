@@ -13,8 +13,14 @@ const recoveryExecutionQuarantinedEventType = "looperd.recovery.execution_quaran
 
 // OutstandingQuarantineDebt is live (not startup-snapshot) quarantine/orphan
 // debt visible after recovery or live/manual stale reconcile. Quarantine parks
-// loops/queues but deliberately leaves agent_executions (and often runs) as
-// still-running evidence without process kill.
+// loops/queues and never kills processes, so agent_executions stay active while
+// the recorded process may still be running.
+//
+// Debt is scoped to active rows on purpose, and that is the exit: the stale-run
+// reconcile settles a parked execution (see settleQuarantinedExecution) once its
+// recorded process is verifiably gone, which drops it out of this count while
+// the looperd.recovery.execution_quarantined event stays in the log. Executions
+// whose process is still alive, or whose absence cannot be proven, keep counting.
 type OutstandingQuarantineDebt struct {
 	// QuarantinedActiveExecutions counts active agent_executions for which
 	// recovery wrote explicit quarantine evidence.

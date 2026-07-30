@@ -105,8 +105,13 @@ func TestRuntimeReconcileStaleRunningRunsQuarantinesExpiredMismatchedPID(t *test
 			if err != nil {
 				t.Fatalf("reconcile error = %v", err)
 			}
-			if summary.SkippedUncertainRuns != 1 || summary.QuarantinedExecutions != 1 || summary.InterruptedRuns != 0 {
+			if summary.SkippedUncertainRuns != 1 || summary.QuarantinedExecutions != 1 {
 				t.Fatalf("summary = %#v, want expired mismatched execution quarantined", summary)
+			}
+			// A mismatched birth token on a live PID proves the recorded process
+			// exited, so the parked row settles. Parking still holds: no requeue.
+			if summary.SettledQuarantinedExecutions != 1 || summary.LoopsRequeued != 0 || summary.QueueItemsRequeued != 0 {
+				t.Fatalf("summary = %#v, want settlement without requeue", summary)
 			}
 		})
 	}

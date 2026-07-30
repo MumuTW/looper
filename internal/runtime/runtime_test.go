@@ -2491,8 +2491,13 @@ func TestRuntimeReconcileStaleRunningRunsSkipsQueueRepairAfterQuarantine(t *test
 			if err != nil {
 				t.Fatalf("reconcile error = %v", err)
 			}
-			if summary.CandidateRuns != 1 || summary.InterruptedRuns != 0 || summary.SkippedUncertainRuns != 1 {
+			if summary.CandidateRuns != 1 || summary.SkippedUncertainRuns != 1 {
 				t.Fatalf("summary = %#v, want one confirmation-needed run", summary)
+			}
+			// The leader PID is verifiably gone, so quarantine evidence settles in
+			// the same live/manual pass and the run stops inflating activeRuns.
+			if summary.SettledQuarantinedExecutions != 1 || summary.InterruptedRuns != 1 {
+				t.Fatalf("summary = %#v, want the dead-process quarantine settled", summary)
 			}
 			if summary.LoopsRequeued != 0 || summary.QueueItemsRequeued != 0 {
 				t.Fatalf("summary = %#v, want no requeue after quarantine", summary)
@@ -2508,15 +2513,25 @@ func TestRuntimeReconcileStaleRunningRunsSkipsQueueRepairAfterQuarantine(t *test
 			if err != nil {
 				t.Fatalf("Runs.GetByID() error = %v", err)
 			}
-			if run == nil || run.Status != "running" {
-				t.Fatalf("run = %#v, want preserved running run", run)
+			if run == nil || run.Status != "interrupted" {
+				t.Fatalf("run = %#v, want settled run out of the active set", run)
 			}
 			execution, err := repos.AgentExecutions.GetByID(context.Background(), "exec_dead_quarantine")
 			if err != nil {
 				t.Fatalf("AgentExecutions.GetByID() error = %v", err)
 			}
-			if execution == nil || execution.Status != "running" || execution.EndedAt != nil {
-				t.Fatalf("execution = %#v, want still-running evidence", execution)
+			if execution == nil || execution.Status != "failed" || execution.EndedAt == nil {
+				t.Fatalf("execution = %#v, want settled terminal evidence", execution)
+			}
+			executionEvents, err := repos.Events.ListByEntity(context.Background(), "agent_execution", "exec_dead_quarantine")
+			if err != nil {
+				t.Fatalf("Events.ListByEntity() error = %v", err)
+			}
+			if !containsEventType(executionEvents, recoveryExecutionQuarantinedEventType) {
+				t.Fatalf("events = %#v, want the quarantine audit trail preserved", executionEvents)
+			}
+			if !containsEventType(executionEvents, quarantineSettledEventType) {
+				t.Fatalf("events = %#v, want settlement recorded", executionEvents)
 			}
 			loop, err := repos.Loops.GetByID(context.Background(), loopID)
 			if err != nil {

@@ -66,7 +66,9 @@ func TestStartupRecoveryExitedLeaderDoesNotConfirmDeadOrAct(t *testing.T) {
 	}
 
 	var signals []syscall.Signal
-	rt := New(Options{
+	// Scheduler ticks are suppressed so the startup phase is observed on its own:
+	// settlement belongs to the live/manual reconcile, asserted separately below.
+	rt := newManualReconcileRuntime(Options{
 		Config: cfg,
 		Logger: &testLogger{},
 		Now:    func() time.Time { return startedAt },
@@ -139,6 +141,26 @@ func TestStartupRecoveryExitedLeaderDoesNotConfirmDeadOrAct(t *testing.T) {
 	}
 	if !containsEventType(events, "looperd.recovery.execution_quarantined") {
 		t.Fatalf("events = %#v, want execution_quarantined", events)
+	}
+
+	// The parked row is not permanent debt: the live reconcile settles it once
+	// the recorded process is verifiably gone. Parking still holds afterwards.
+	settleSummary, err := rt.ReconcileStaleRunningRuns(context.Background())
+	if err != nil {
+		t.Fatalf("ReconcileStaleRunningRuns() error = %v", err)
+	}
+	if settleSummary.SettledQuarantinedExecutions != 1 || settleSummary.LoopsRequeued != 0 {
+		t.Fatalf("summary = %#v, want settlement without requeue", settleSummary)
+	}
+	settled, err := services.Repositories.AgentExecutions.GetByID(context.Background(), "agent_leader_exit")
+	if err != nil {
+		t.Fatalf("GetByID error = %v", err)
+	}
+	if settled == nil || settled.Status != "failed" {
+		t.Fatalf("execution = %#v, want settled terminal row", settled)
+	}
+	if len(signals) != 0 {
+		t.Fatalf("SignalProcess called with %v; want settlement without PID action", signals)
 	}
 }
 

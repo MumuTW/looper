@@ -1158,8 +1158,13 @@ func TestStatusDegradedReasonsIncludesUnavailableQuarantineDebt(t *testing.T) {
 	}
 }
 
-func TestHandlerStatusReportsDebtAfterStaleRunReconcile(t *testing.T) {
+// Regression for #150: a quarantined execution whose recorded process is
+// verifiably gone settles during the ordinary stale-run reconcile, so outstanding
+// debt clears and the daemon leaves the degraded state in the same process — no
+// restart and no manual database edit. The audit trail must survive settlement.
+func TestHandlerStatusClearsDebtAfterDeadProcessQuarantineSettles(t *testing.T) {
 	fixture := newTestFixture(t, func(options *looperdruntime.Options) {
+		// Empty process command == the recorded PID holds no process at all.
 		options.ReadProcessCommand = func(context.Context, int) (string, error) { return "", nil }
 	})
 	rt, cfg := fixture.runtime, fixture.config
@@ -1189,8 +1194,85 @@ func TestHandlerStatusReportsDebtAfterStaleRunReconcile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReconcileStaleRunningRuns() error = %v", err)
 	}
-	if summary.QuarantinedExecutions != 1 {
-		t.Fatalf("summary = %#v, want one quarantined execution", summary)
+	if summary.QuarantinedExecutions != 1 || summary.SettledQuarantinedExecutions != 1 {
+		t.Fatalf("summary = %#v, want one quarantined execution settled", summary)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/status", nil)
+	recorder := httptest.NewRecorder()
+	NewHandler(Context{Config: cfg, Runtime: rt}).ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 body=%s", recorder.Code, recorder.Body.String())
+	}
+	data := parseJSONMap(t, recorder.Body.Bytes())["data"].(map[string]any)
+	service := data["service"].(map[string]any)
+	outstanding := service["recovery"].(map[string]any)["outstanding"].(map[string]any)
+	assertEqual(t, outstanding["quarantinedActiveExecutions"], float64(0))
+	assertEqual(t, outstanding["quarantinedRunningRuns"], float64(0))
+	if strings.Contains(fmt.Sprintf("%v", service["degradedReasons"]), "quarantine_orphan_debt") {
+		t.Fatalf("degradedReasons = %#v, want no quarantine debt after settlement", service["degradedReasons"])
+	}
+	// activeRuns must reflect reality once the quarantined run is settled.
+	assertEqual(t, data["scheduler"].(map[string]any)["activeRuns"], float64(0))
+	if run, err := repos.Runs.GetByID(context.Background(), runID); err != nil || run == nil || run.Status != "interrupted" {
+		t.Fatalf("run after reconcile = %#v, %v; want settled run", run, err)
+	}
+	if loop, err := repos.Loops.GetByID(context.Background(), loopID); err != nil || loop == nil || loop.Status != "paused" {
+		t.Fatalf("loop after settlement = %#v, %v; want work still parked", loop, err)
+	}
+	events, err := repos.Events.ListByEntity(context.Background(), "agent_execution", "execution_reconcile_status")
+	if err != nil {
+		t.Fatalf("Events.ListByEntity() error = %v", err)
+	}
+	quarantineEvidence := false
+	for _, event := range events {
+		if event.EventType == "looperd.recovery.execution_quarantined" {
+			quarantineEvidence = true
+		}
+	}
+	if !quarantineEvidence {
+		t.Fatalf("events = %#v, want the quarantine audit trail preserved after settlement", events)
+	}
+}
+
+// Regression for #150: the settlement asymmetry. Absence is conclusive, presence
+// is not — an execution whose PID is held by a live process we cannot prove is
+// ours keeps counting as debt and keeps the daemon degraded.
+func TestHandlerStatusKeepsDebtForUnprovableLiveQuarantinedExecution(t *testing.T) {
+	fixture := newTestFixture(t, func(options *looperdruntime.Options) {
+		// The PID is occupied by a running process. The seeded row carries no
+		// recorded process birth, so we cannot rule out that it is still ours.
+		options.ReadProcessCommand = func(context.Context, int) (string, error) { return "codex exec", nil }
+	})
+	rt, cfg := fixture.runtime, fixture.config
+	repos := rt.Services().Repositories
+	oldISO := fixture.now.Add(-2 * time.Hour).Format(time.RFC3339Nano)
+	projectID := "project_live_debt"
+	loopID := "loop_live_debt"
+	runID := "run_live_debt"
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "LiveDebt", RepoPath: fixture.rootDir, CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 1, ProjectID: projectID, Type: "worker", TargetType: "project", Status: "running", CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	if err := repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: runID, LoopID: loopID, Status: "running", CurrentStep: stringPtr("work"), StartedAt: oldISO, LastHeartbeatAt: &oldISO, CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	if err := repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_live_debt", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: projectID, DedupeKey: "worker:live-debt", Priority: storage.QueuePriorityWorker, Status: "running", AvailableAt: oldISO, StartedAt: &oldISO, MaxAttempts: 3, CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	pid := int64(9292)
+	if err := repos.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{ID: "execution_live_debt", ProjectID: &projectID, LoopID: &loopID, RunID: &runID, Vendor: "codex", Status: "running", PID: &pid, CommandJSON: stringPtr(`{"command":"codex","args":["exec"]}`), CWD: stringPtr(fixture.rootDir), StartedAt: oldISO, CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
+		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
+	}
+
+	summary, err := rt.ReconcileStaleRunningRuns(context.Background())
+	if err != nil {
+		t.Fatalf("ReconcileStaleRunningRuns() error = %v", err)
+	}
+	if summary.QuarantinedExecutions != 1 || summary.SettledQuarantinedExecutions != 0 {
+		t.Fatalf("summary = %#v, want quarantine held open against a live process", summary)
 	}
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/status", nil)
@@ -1203,14 +1285,19 @@ func TestHandlerStatusReportsDebtAfterStaleRunReconcile(t *testing.T) {
 	service := data["service"].(map[string]any)
 	outstanding := service["recovery"].(map[string]any)["outstanding"].(map[string]any)
 	assertEqual(t, outstanding["quarantinedActiveExecutions"], float64(1))
-	// Quarantine deliberately leaves uncertain execution/run evidence active;
-	// this counter exists to surface the resulting active-runs inflation.
 	assertEqual(t, outstanding["quarantinedRunningRuns"], float64(1))
 	if !strings.Contains(fmt.Sprintf("%v", service["degradedReasons"]), "quarantine_orphan_debt") {
 		t.Fatalf("degradedReasons = %#v, want quarantine debt", service["degradedReasons"])
 	}
 	if run, err := repos.Runs.GetByID(context.Background(), runID); err != nil || run == nil || run.Status != "running" {
 		t.Fatalf("run after reconcile = %#v, %v; want running quarantine evidence", run, err)
+	}
+	execution, err := repos.AgentExecutions.GetByID(context.Background(), "execution_live_debt")
+	if err != nil {
+		t.Fatalf("AgentExecutions.GetByID() error = %v", err)
+	}
+	if execution == nil || execution.Status != "running" {
+		t.Fatalf("execution = %#v, want unsettled live evidence", execution)
 	}
 }
 

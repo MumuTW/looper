@@ -67,12 +67,16 @@ type StaleRunReconcileSummary struct {
 	CleanedExecutions   int64  `json:"cleanedExecutions"`
 	// QuarantinedExecutions counts executions parked via quarantineRecoveryEvidence
 	// (still-running evidence + manual_intervention). Never report these as cleaned.
-	QuarantinedExecutions int64    `json:"quarantinedExecutions"`
-	SkippedUncertainRuns  int64    `json:"skippedUncertainRuns"`
-	EventsWritten         int64    `json:"eventsWritten"`
-	RunIDs                []string `json:"runIds,omitempty"`
-	LoopIDs               []string `json:"loopIds,omitempty"`
-	ExecutionIDs          []string `json:"executionIds,omitempty"`
+	QuarantinedExecutions int64 `json:"quarantinedExecutions"`
+	// SettledQuarantinedExecutions counts previously quarantined executions
+	// finalized because their recorded process is verifiably gone. The quarantine
+	// evidence stays in the event log; only the row leaves the active set.
+	SettledQuarantinedExecutions int64    `json:"settledQuarantinedExecutions"`
+	SkippedUncertainRuns         int64    `json:"skippedUncertainRuns"`
+	EventsWritten                int64    `json:"eventsWritten"`
+	RunIDs                       []string `json:"runIds,omitempty"`
+	LoopIDs                      []string `json:"loopIds,omitempty"`
+	ExecutionIDs                 []string `json:"executionIds,omitempty"`
 }
 
 type staleRunReconcileMode string
@@ -2258,6 +2262,7 @@ func (r *Runtime) reconcileStaleRunningRunsWithMode(ctx context.Context, reposit
 		if decision.Uncertain {
 			summary.SkippedUncertainRuns += 1
 			summary.EventsWritten += decision.EventsWritten
+			settledExecutions := 0
 			for _, execution := range decision.ConfirmationExecutions {
 				reason := "needs confirmation: execution liveness is not authoritative"
 				quarantined, wrote, err := r.quarantineRecoveryEvidence(ctx, repositories, execution, nowISO, reason)
@@ -2267,11 +2272,44 @@ func (r *Runtime) reconcileStaleRunningRunsWithMode(ctx context.Context, reposit
 				if quarantined {
 					summary.QuarantinedExecutions += 1
 					summary.ExecutionIDs = append(summary.ExecutionIDs, execution.ID)
-					quarantinedLoopIDs[run.LoopID] = struct{}{}
 				}
 				if wrote {
 					summary.EventsWritten += 1
 				}
+				// The loop is parked whether or not this pass changed anything:
+				// quarantineRecoveryEvidence is idempotent, so a re-observed row
+				// reports no work while its loop is still parked.
+				quarantinedLoopIDs[run.LoopID] = struct{}{}
+
+				// ADR-0015 R8 scopes its no-terminalization rule to startup
+				// recovery: right after a restart the daemon has no containment
+				// handle for anything, so it parks and observes instead. Settlement
+				// is the deliberate second step and belongs to the live/manual
+				// reconcile, which the scheduler's periodic full tick drives.
+				if mode == staleRunReconcileModeStartup {
+					continue
+				}
+				settled, eventsWritten, err := r.settleQuarantinedExecution(ctx, repositories, execution, nowISO)
+				if err != nil {
+					return StaleRunReconcileSummary{}, err
+				}
+				summary.EventsWritten += eventsWritten
+				if settled {
+					settledExecutions++
+					summary.SettledQuarantinedExecutions += 1
+				}
+			}
+			// Once every parked execution behind this run is settled, the run is
+			// no longer evidence of a live process and must stop inflating
+			// activeRuns. The loop stays parked, so this interrupt never requeues.
+			if settledExecutions > 0 && settledExecutions == len(activeExecutionsByRunID[run.ID]) {
+				if err := interruptRecoveryRun(ctx, repositories, run, *loop, nowISO, "Interrupted run whose quarantined agent executions were settled: the recorded processes are gone"); err != nil {
+					return StaleRunReconcileSummary{}, err
+				}
+				summary.InterruptedRuns += 1
+				summary.EventsWritten += 1
+				summary.RunIDs = append(summary.RunIDs, run.ID)
+				summary.LoopIDs = append(summary.LoopIDs, run.LoopID)
 			}
 			continue
 		}
