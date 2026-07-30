@@ -93,6 +93,9 @@ func TestProcessClaimedItemTerminalPrepareErrorPreservesDirtyWorktree(t *testing
 			HeadSHA:     f.headSHA,
 			BaseHeadSHA: f.headSHA,
 			PreparedAt:  nowISO,
+			// This belongs to the predecessor's terminal cleanup and must not
+			// become evidence about the retried run.
+			CleanupAttemptedAt: nowISO,
 		},
 		Repair: &checkpointRepair{Summary: "interrupted", ParseStatus: "parsed", CompletedAt: nowISO},
 	})
@@ -195,5 +198,8 @@ func TestProcessClaimedItemTerminalPrepareErrorPreservesDirtyWorktree(t *testing
 	}
 	if persisted.Worktree.CleanedAt != "" {
 		t.Fatalf("persisted CleanedAt = %q, want empty", persisted.Worktree.CleanedAt)
+	}
+	if persisted.Worktree.CleanupAttemptedAt != "" {
+		t.Fatalf("persisted CleanupAttemptedAt = %q, want predecessor attempt cleared for the retried run", persisted.Worktree.CleanupAttemptedAt)
 	}
 }

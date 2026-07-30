@@ -41,6 +41,13 @@ func TestRecoveredPreStepBreakerFailureCleansPreparedWorktree(t *testing.T) {
 	git := &fakeGitGateway{}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, Logger: fixture.logger, Now: fixture.now})
 	checkpoint := fixerCheckpoint{Worktree: &checkpointWorktree{Path: filepath.Join(t.TempDir(), "wt-91"), Branch: "fix/pr-91", PreparedAt: nowISO}}
+	checkpointJSON := mustMarshalJSON(checkpoint)
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{
+		ID: "run-pre-step-3", LoopID: loopID, Status: "failed", CurrentStep: stringPtr(string(stepDiscoverPR)),
+		CheckpointJSON: &checkpointJSON, StartedAt: nowISO, EndedAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
 	runFailure := &claimedRunFailureError{cause: errors.New("ownership API failed"), runID: "run-pre-step-3", checkpoint: checkpoint, step: stepDiscoverPR}
 
 	result, err := runner.recoverClaimedItem(context.Background(), queue, runFailure)
@@ -49,6 +56,10 @@ func TestRecoveredPreStepBreakerFailureCleansPreparedWorktree(t *testing.T) {
 	}
 	if len(git.cleanupCalls) != 1 {
 		t.Fatalf("cleanup calls = %#v, want one terminal cleanup", git.cleanupCalls)
+	}
+	attempted, cleaned := storedCleanupTimestamps(t, fixture, runFailure.runID)
+	if attempted == "" || cleaned == "" {
+		t.Fatalf("stored cleanup timestamps = (%q, %q), want recovered breaker cleanup recorded durably", attempted, cleaned)
 	}
 	persisted, err := fixture.repos.Loops.GetByID(context.Background(), loopID)
 	if err != nil || persisted == nil || persisted.Status != "paused" {
@@ -116,7 +127,7 @@ func TestInlineLateStepBreakerCleansAndImmediatelyQueuesPendingState(t *testing.
 	if err != nil {
 		t.Fatalf("updateLoop(paused) error = %v", err)
 	}
-	resumed, err := runner.finishFailureStreakBreaker(context.Background(), *project, paused, queue, "", &checkpoint)
+	resumed, err := runner.finishFailureStreakBreaker(context.Background(), *project, paused, queue, failedRun.ID, &checkpoint)
 	if err != nil || !resumed {
 		t.Fatalf("finishFailureStreakBreaker() = (%v, %v), want immediate pending resume", resumed, err)
 	}
@@ -125,6 +136,10 @@ func TestInlineLateStepBreakerCleansAndImmediatelyQueuesPendingState(t *testing.
 	}
 	if len(git.cleanupCalls) != 1 {
 		t.Fatalf("cleanup calls = %#v, want one inline breaker cleanup", git.cleanupCalls)
+	}
+	attempted, cleaned := storedCleanupTimestamps(t, fixture, failedRun.ID)
+	if attempted == "" || cleaned == "" {
+		t.Fatalf("stored cleanup timestamps = (%q, %q), want inline breaker cleanup recorded durably", attempted, cleaned)
 	}
 	active, err := fixture.repos.Queue.FindActiveByLoopID(context.Background(), loopID)
 	if err != nil || active == nil || active.Status != "queued" {

@@ -6959,8 +6959,10 @@ func (r *Runner) reconcileCommits(ctx context.Context, project storage.ProjectRe
 // CleanupAttemptedAt but no CleanedAt is one whose cleanup failed. Callers reach
 // this after completeRun has already written the run, so a full-row Upsert of the
 // in-memory record could revert a concurrent transition (discovery persisting
-// restart_from_discover while cleanup runs, say). The narrow UpdateCheckpoint
-// write touches the checkpoint projection only.
+// restart_from_discover while cleanup runs, say). The narrow timestamp merge
+// touches only the cleanup projection. The attempt is persisted before the
+// filesystem mutation so a daemon exit after removal cannot erase the only
+// durable evidence that cleanup started.
 //
 // runID may be empty when no durable run owns the cleanup; the timestamps then
 // stay in-memory for the returned ProcessResult, as before.
@@ -6968,7 +6970,6 @@ func (r *Runner) cleanupFixerWorktreeIfTerminal(ctx context.Context, project sto
 	if checkpoint == nil || checkpoint.Worktree == nil || checkpoint.Worktree.Path == "" || checkpoint.Worktree.Branch == "" || checkpoint.Worktree.CleanedAt != "" {
 		return
 	}
-	defer r.persistTerminalCleanupCheckpoint(ctx, runID, checkpoint)
 	// Unprepared rewind paths (PreparedAt cleared, path kept) may still hold
 	// interrupted-repair dirt that prepare never evaluated. Terminal queue
 	// parking / success cleanup must not force-remove that evidence.
@@ -6976,6 +6977,12 @@ func (r *Runner) cleanupFixerWorktreeIfTerminal(ctx context.Context, project sto
 		return
 	}
 	checkpoint.Worktree.CleanupAttemptedAt = r.nowISO()
+	if err := r.persistTerminalCleanupCheckpoint(ctx, runID, checkpoint); err != nil {
+		r.logError("fixer terminal cleanup attempt persist failed", map[string]any{
+			"runId": runID, "worktreePath": checkpoint.Worktree.Path, "message": err.Error(),
+		})
+		return
+	}
 	worktreeRoot, rootErr := fixerWorktreeRoot(project)
 	if rootErr != nil {
 		r.logError("fixer worktree cleanup skipped", map[string]any{"projectId": project.ID, "worktreePath": checkpoint.Worktree.Path, "branch": checkpoint.Worktree.Branch, "message": rootErr.Error()})
@@ -6987,6 +6994,11 @@ func (r *Runner) cleanupFixerWorktreeIfTerminal(ctx context.Context, project sto
 		return
 	}
 	checkpoint.Worktree.CleanedAt = r.nowISO()
+	if err := r.persistTerminalCleanupCheckpoint(ctx, runID, checkpoint); err != nil {
+		r.logError("fixer terminal cleanup completion persist failed", map[string]any{
+			"runId": runID, "worktreePath": checkpoint.Worktree.Path, "message": err.Error(),
+		})
+	}
 	r.appendEvent(ctx, eventInput{eventType: "fixer.worktree.cleaned", projectID: project.ID, entityType: "pull_request", entityID: project.ID, payload: map[string]any{"path": checkpoint.Worktree.Path, "branch": checkpoint.Worktree.Branch}})
 }
 
@@ -6999,17 +7011,16 @@ func derefRunRecordID(run *storage.RunRecord) string {
 }
 
 // persistTerminalCleanupCheckpoint stores the cleanup timestamps without
-// disturbing the rest of the run row. A failure here is logged, not returned: the
-// run has already completed and its recorded status is the primary result.
-func (r *Runner) persistTerminalCleanupCheckpoint(ctx context.Context, runID string, checkpoint *fixerCheckpoint) {
+// disturbing the rest of the run row. Callers decide whether the write is a
+// precondition for the filesystem mutation or a secondary completion error.
+func (r *Runner) persistTerminalCleanupCheckpoint(ctx context.Context, runID string, checkpoint *fixerCheckpoint) error {
 	if checkpoint == nil || checkpoint.Worktree == nil || r.repos == nil || r.repos.Runs == nil || strings.TrimSpace(runID) == "" {
-		return
+		return nil
 	}
 	if err := r.repos.Runs.MergeWorktreeCleanupTimestamps(ctx, runID, checkpoint.Worktree.CleanupAttemptedAt, checkpoint.Worktree.CleanedAt, r.nowISO()); err != nil {
-		r.logError("fixer terminal cleanup checkpoint persist failed", map[string]any{
-			"runId": runID, "worktreePath": checkpoint.Worktree.Path, "message": err.Error(),
-		})
+		return err
 	}
+	return nil
 }
 
 // isMissingOrUnusableFixerWorktree reports whether a checkpoint worktree path
@@ -8336,6 +8347,7 @@ func rewindCheckpointForPrepareRetry(checkpoint fixerCheckpoint) fixerCheckpoint
 		worktree.HeadSHA = ""
 		worktree.BaseHeadSHA = ""
 		worktree.PreparedAt = ""
+		worktree.CleanupAttemptedAt = ""
 		worktree.CleanedAt = ""
 		checkpoint.Worktree = &worktree
 	}

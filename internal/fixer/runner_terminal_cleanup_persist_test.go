@@ -57,6 +57,18 @@ func storedCleanupTimestamps(t *testing.T, fixture *runnerFixture, runID string)
 	return stored.Worktree.CleanupAttemptedAt, stored.Worktree.CleanedAt
 }
 
+type observingCleanupGitGateway struct {
+	*fakeGitGateway
+	beforeCleanup func()
+}
+
+func (g *observingCleanupGitGateway) CleanupWorktree(ctx context.Context, input CleanupWorktreeInput) error {
+	if g.beforeCleanup != nil {
+		g.beforeCleanup()
+	}
+	return g.fakeGitGateway.CleanupWorktree(ctx, input)
+}
+
 func TestTerminalCleanupPersistsSuccessTimestamps(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -77,6 +89,31 @@ func TestTerminalCleanupPersistsSuccessTimestamps(t *testing.T) {
 	}
 	if cleaned == "" {
 		t.Fatal("stored CleanedAt is empty, want a successful cleanup recorded durably")
+	}
+}
+
+func TestTerminalCleanupPersistsAttemptBeforeWorktreeMutation(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	git := &observingCleanupGitGateway{fakeGitGateway: &fakeGitGateway{}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, Logger: fixture.logger, Now: fixture.now})
+	checkpoint := seedTerminalCleanupRun(t, fixture, "run_cleanup_attempt_boundary", filepath.Join(t.TempDir(), "wt-boundary"))
+
+	git.beforeCleanup = func() {
+		attempted, cleaned := storedCleanupTimestamps(t, fixture, "run_cleanup_attempt_boundary")
+		if attempted == "" {
+			t.Fatal("stored CleanupAttemptedAt is empty when CleanupWorktree starts")
+		}
+		if cleaned != "" {
+			t.Fatalf("stored CleanedAt = %q before CleanupWorktree completes, want empty", cleaned)
+		}
+	}
+	runner.cleanupFixerWorktreeIfTerminal(context.Background(), storage.ProjectRecord{
+		ID: "project_1", RepoPath: t.TempDir(), BaseBranch: stringPtr("main"),
+	}, "run_cleanup_attempt_boundary", &checkpoint)
+
+	if len(git.cleanupCalls) != 1 {
+		t.Fatalf("len(git.cleanupCalls) = %d, want 1", len(git.cleanupCalls))
 	}
 }
 
