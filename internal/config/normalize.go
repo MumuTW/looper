@@ -433,6 +433,26 @@ func mergeConfig(config *Config, partial PartialConfig) {
 		}
 	}
 
+	if partial.Intake != nil {
+		if tg := partial.Intake.Telegram; tg != nil {
+			if config.Intake.Telegram == nil {
+				config.Intake.Telegram = &TelegramIntakeConfig{}
+			}
+			if tg.Enabled != nil {
+				config.Intake.Telegram.Enabled = *tg.Enabled
+			}
+			if tg.BotTokenEnv != nil {
+				config.Intake.Telegram.BotTokenEnv = strings.TrimSpace(*tg.BotTokenEnv)
+			}
+			if tg.AllowedUserIDs != nil {
+				config.Intake.Telegram.AllowedUserIDs = append([]int64(nil), (*tg.AllowedUserIDs)...)
+			}
+			if tg.DefaultProjectID != nil {
+				config.Intake.Telegram.DefaultProjectID = strings.TrimSpace(*tg.DefaultProjectID)
+			}
+		}
+	}
+
 	if partial.Roles != nil {
 		mergeRoleConfigs(&config.Roles, *partial.Roles)
 	}
@@ -1567,6 +1587,22 @@ func clonePartialConfig(partial PartialConfig) PartialConfig {
 			hitl.Enabled = &enabled
 		}
 		cloned.HITL = &hitl
+	}
+	if partial.Intake != nil {
+		intake := *partial.Intake
+		if partial.Intake.Telegram != nil {
+			telegram := *partial.Intake.Telegram
+			if telegram.Enabled != nil {
+				enabled := *telegram.Enabled
+				telegram.Enabled = &enabled
+			}
+			if telegram.AllowedUserIDs != nil {
+				ids := append([]int64(nil), (*telegram.AllowedUserIDs)...)
+				telegram.AllowedUserIDs = &ids
+			}
+			intake.Telegram = &telegram
+		}
+		cloned.Intake = &intake
 	}
 	if partial.LegacyReviewer != nil {
 		cloned.LegacyReviewer = clonePartialReviewerConfig(partial.LegacyReviewer)

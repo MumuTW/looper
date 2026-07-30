@@ -2545,6 +2545,12 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 		runFeishuHITLPoll(ctx, input)
 	}
 
+	// Intake (telegram): drain one batch of chat messages, opening an Issue for
+	// each new request.
+	if err := admissionRefuseWork(input); err == nil {
+		runTelegramIntakePoll(ctx, input)
+	}
+
 	claimedCount, availableSlots, err = executeClaimPhase(ctx, "post_discovery", input, discoveredRunnableIDs, true)
 	recordClaim(claimedCount, availableSlots, err)
 
