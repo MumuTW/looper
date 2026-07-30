@@ -179,8 +179,25 @@ func (n DeployNotification) Body() string {
 	return b.String()
 }
 
+// deployerRoleForProject resolves just the deployer role.
+//
+// It deliberately avoids config.ProjectRoleConfigs, which clones the whole
+// coding-role registry to apply project overrides. This lane runs for every
+// project on every tick and reads one bool in the overwhelmingly common case
+// where deploys are off, so paying for that clone would be per-tick work in
+// service of nothing.
 func deployerRoleForProject(cfg config.Config, projectID string) config.DeployerRoleConfig {
-	return config.ProjectRoleConfigs(cfg, projectID).Deployer
+	role := cfg.Roles.Deployer
+	for _, project := range cfg.Projects {
+		if !strings.EqualFold(strings.TrimSpace(project.ID), strings.TrimSpace(projectID)) {
+			continue
+		}
+		if project.Roles != nil && project.Roles.Deployer != nil {
+			config.MergeDeployerRoleConfig(&role, *project.Roles.Deployer)
+		}
+		break
+	}
+	return role
 }
 
 func deployBaseBranch(cfg config.Config, project storage.ProjectRecord) string {
