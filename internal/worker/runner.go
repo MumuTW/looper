@@ -67,6 +67,9 @@ const (
 var (
 	workerANSIEscapePattern              = regexp.MustCompile(`\x1b\[[0-9;?]*[ -/]*[@-~]`)
 	workerStructuredResultMessagePattern = regexp.MustCompile(`^Worker completed without a valid structured result \(parse status: ([a-z_]+)\)\. See Looper logs for details\.$`)
+	// ErrSuccessfulClaimFinalization prevents generic failure recovery from
+	// requeueing externally completed work when the atomic terminal write fails.
+	ErrSuccessfulClaimFinalization = errors.New("worker successful claim finalization failed")
 )
 
 var workerStepSequence = []WorkerStep{
@@ -993,6 +996,9 @@ func (r *Runner) ProcessNext(ctx context.Context, claimedBy string) (*ProcessRes
 func (r *Runner) ProcessClaimedQueueItem(ctx context.Context, queueItem storage.QueueItemRecord) (*ProcessResult, error) {
 	result, err := r.ProcessClaimedItem(ctx, queueItem)
 	if err != nil {
+		if errors.Is(err, ErrSuccessfulClaimFinalization) {
+			return nil, err
+		}
 		return r.recoverClaimedItem(ctx, queueItem, err)
 	}
 	return &result, nil
@@ -1060,6 +1066,9 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	}
 	if project == nil {
 		return ProcessResult{}, fmt.Errorf("project not found: %s", loop.ProjectID)
+	}
+	if result, finalized, err := r.finalizePriorSuccessfulClaim(ctx, *loop, queueItem); err != nil || finalized {
+		return result, err
 	}
 	if err := r.revalidateRoutedWorkerClaim(ctx, *project, *loop, queueItem); err != nil {
 		return ProcessResult{}, err
@@ -1217,32 +1226,20 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	}
 
 	summary := r.buildSuccessSummary(*loop, checkpoint)
-	if _, err := r.completeRun(ctx, run, "success", summary, "", checkpoint); err != nil {
-		return ProcessResult{}, err
-	}
 	status := "success"
 	if checkpoint.SkipReason != "" {
 		status = "skipped"
 	}
-	if err := r.repos.Queue.Complete(ctx, queueItem.ID, r.nowISO()); err != nil {
-		if errors.Is(err, storage.ErrQueueItemNotActive) {
-			return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: status, Summary: summary, PullRequestNumber: pullRequestNumber(checkpoint.PullRequest)}, nil
-		}
-		return ProcessResult{}, err
-	}
-	if _, err := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
-		updated.Status = "completed"
-		updated.LastRunAt = stringPtr(r.nowISO())
-		updated.NextRunAt = nil
-	}); err != nil {
+	completedRun, err := r.finalizeSuccessfulClaim(ctx, run, queueItem, *loop, checkpoint, summary)
+	if err != nil {
 		return ProcessResult{}, err
 	}
 	finalIssueClaimStatus := issueClaimStatusSuccess
 	if checkpoint.SkipReason != "" {
 		finalIssueClaimStatus = issueClaimStatusPaused
 	}
-	r.syncIssueClaim(ctx, stepInput{Project: *project, Loop: *loop, Run: run, QueueItem: queueItem}, &checkpoint, finalIssueClaimStatus, summary)
-	r.notifyRunCompleted(ctx, buildRunCompletedInput(*project, *loop, run, checkpoint, statusForCheckpoint(checkpoint), "", summary))
+	r.syncIssueClaim(ctx, stepInput{Project: *project, Loop: *loop, Run: completedRun, QueueItem: queueItem}, &checkpoint, finalIssueClaimStatus, summary)
+	r.notifyRunCompleted(ctx, buildRunCompletedInput(*project, *loop, completedRun, checkpoint, statusForCheckpoint(checkpoint), "", summary))
 	return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: status, Summary: summary, PullRequestNumber: pullRequestNumber(checkpoint.PullRequest)}, nil
 }
 
@@ -1338,21 +1335,10 @@ func (r *Runner) stopObsoleteResumedIssueRun(ctx context.Context, project storag
 		checkpoint.SkipReason = fmt.Sprintf("Worker stopped because %s is no longer an open issue", formatIssueReference(issueLookupRepo(*checkpoint.Work), checkpoint.Work.IssueNumber))
 		checkpoint.ResumePolicy = loops.ResumePolicyAdvanceFromCheckpoint
 		summary := r.buildSuccessSummary(loop, *checkpoint)
-		completedRun, err := r.completeRun(ctx, run, "success", summary, "", *checkpoint)
+		finishedAt := r.nowISO()
+		completedRun := completedRunRecord(run, "success", summary, "", *checkpoint, finishedAt)
+		err := storage.FinalizeWorkerSuccess(ctx, r.db, storage.WorkerSuccessFinalizationInput{Run: completedRun, QueueItemID: queueItem.ID, LoopID: loop.ID, LoopStatus: "completed", FinishedAt: finishedAt})
 		if err != nil {
-			return ProcessResult{}, true, err
-		}
-		if err := r.repos.Queue.Complete(ctx, queueItem.ID, r.nowISO()); err != nil {
-			if errors.Is(err, storage.ErrQueueItemNotActive) {
-				return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "skipped", Summary: summary}, true, nil
-			}
-			return ProcessResult{}, true, err
-		}
-		if _, err := r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
-			updated.Status = "completed"
-			updated.LastRunAt = stringPtr(r.nowISO())
-			updated.NextRunAt = nil
-		}); err != nil {
 			return ProcessResult{}, true, err
 		}
 		r.syncIssueClaim(ctx, stepInput{Project: project, Loop: loop, Run: completedRun, QueueItem: queueItem}, checkpoint, issueClaimStatusPaused, summary)
@@ -2376,19 +2362,22 @@ func (r *Runner) finishHeldWorkerQueueItem(ctx context.Context, project storage.
 	checkpoint.SkipReason = summary
 	checkpoint.ResumePolicy = loops.ResumePolicyAdvanceFromCheckpoint
 	if run != nil {
-		if _, err := r.completeRun(ctx, *run, "success", summary, "", checkpoint); err != nil {
+		finishedAt := r.nowISO()
+		completed := completedRunRecord(*run, "success", summary, "", checkpoint, finishedAt)
+		if err := storage.FinalizeWorkerSuccess(ctx, r.db, storage.WorkerSuccessFinalizationInput{Run: completed, QueueItemID: queueItem.ID, LoopID: loop.ID, LoopStatus: "queued", FinishedAt: finishedAt}); err != nil {
 			return ProcessResult{}, err
 		}
-	}
-	if err := r.repos.Queue.Complete(ctx, queueItem.ID, r.nowISO()); err != nil && !errors.Is(err, storage.ErrQueueItemNotActive) {
-		return ProcessResult{}, err
-	}
-	if _, err := r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
-		updated.Status = "queued"
-		updated.LastRunAt = stringPtr(r.nowISO())
-		updated.NextRunAt = nil
-	}); err != nil {
-		return ProcessResult{}, err
+	} else {
+		if err := r.repos.Queue.Complete(ctx, queueItem.ID, r.nowISO()); err != nil && !errors.Is(err, storage.ErrQueueItemNotActive) {
+			return ProcessResult{}, err
+		}
+		if _, err := r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
+			updated.Status = "queued"
+			updated.LastRunAt = stringPtr(r.nowISO())
+			updated.NextRunAt = nil
+		}); err != nil {
+			return ProcessResult{}, err
+		}
 	}
 	result := ProcessResult{LoopID: loop.ID, QueueItemID: queueItem.ID, Status: "skipped", Summary: summary}
 	if run != nil {
@@ -2623,8 +2612,16 @@ func (r *Runner) persistCheckpoint(ctx context.Context, runID string, checkpoint
 }
 
 func (r *Runner) completeRun(ctx context.Context, run storage.RunRecord, status, summary, errorMessage string, checkpoint workerCheckpoint) (storage.RunRecord, error) {
-	updated := run
 	endedAt := r.nowISO()
+	updated := completedRunRecord(run, status, summary, errorMessage, checkpoint, endedAt)
+	if err := r.repos.Runs.Upsert(ctx, updated); err != nil {
+		return storage.RunRecord{}, err
+	}
+	return updated, nil
+}
+
+func completedRunRecord(run storage.RunRecord, status, summary, errorMessage string, checkpoint workerCheckpoint, endedAt string) storage.RunRecord {
+	updated := run
 	updated.Status = status
 	if summary != "" {
 		updated.Summary = stringPtr(summary)
@@ -2637,10 +2634,70 @@ func (r *Runner) completeRun(ctx context.Context, run storage.RunRecord, status,
 	updated.EndedAt = &endedAt
 	updated.LastHeartbeatAt = &endedAt
 	updated.UpdatedAt = endedAt
-	if err := r.repos.Runs.Upsert(ctx, updated); err != nil {
-		return storage.RunRecord{}, err
+	return updated
+}
+
+// IsSuccessfulClaimFinalizationCandidate reports durable evidence that worker
+// execution is already complete and only terminal storage finalization remains.
+func IsSuccessfulClaimFinalizationCandidate(run storage.RunRecord) bool {
+	if run.Status == "success" {
+		return derefString(run.LastCompletedStep) == string(stepOpenPR)
 	}
-	return updated, nil
+	return (run.Status == "running" || run.Status == "interrupted") && derefString(run.LastCompletedStep) == string(stepOpenPR)
+}
+
+func (r *Runner) finalizeSuccessfulClaim(ctx context.Context, run storage.RunRecord, queueItem storage.QueueItemRecord, loop storage.LoopRecord, checkpoint workerCheckpoint, summary string) (storage.RunRecord, error) {
+	finishedAt := r.nowISO()
+	completed := completedRunRecord(run, "success", summary, "", checkpoint, finishedAt)
+	if err := storage.FinalizeWorkerSuccess(ctx, r.db, storage.WorkerSuccessFinalizationInput{Run: completed, QueueItemID: queueItem.ID, LoopID: loop.ID, LoopStatus: "completed", FinishedAt: finishedAt}); err != nil {
+		return storage.RunRecord{}, errors.Join(ErrSuccessfulClaimFinalization, err)
+	}
+	return completed, nil
+}
+
+func (r *Runner) finalizePriorSuccessfulClaim(ctx context.Context, loop storage.LoopRecord, queueItem storage.QueueItemRecord) (ProcessResult, bool, error) {
+	latestRun, err := r.repos.Runs.GetLatestByLoopID(ctx, loop.ID)
+	if err != nil || latestRun == nil || !IsSuccessfulClaimFinalizationCandidate(*latestRun) || !CanFinalizeSuccessfulClaim(queueItem, *latestRun, loop.Status) {
+		return ProcessResult{}, false, err
+	}
+	checkpoint, err := parseCheckpoint(latestRun.CheckpointJSON)
+	if err != nil {
+		return ProcessResult{}, false, err
+	}
+	summary := derefString(latestRun.Summary)
+	if summary == "" {
+		summary = r.buildSuccessSummary(loop, checkpoint)
+	}
+	completed, err := r.finalizeSuccessfulClaim(ctx, *latestRun, queueItem, loop, checkpoint, summary)
+	if err != nil {
+		return ProcessResult{}, true, err
+	}
+	status := statusForCheckpoint(checkpoint)
+	return ProcessResult{LoopID: loop.ID, RunID: completed.ID, QueueItemID: queueItem.ID, Status: status, Summary: summary, PullRequestNumber: pullRequestNumber(checkpoint.PullRequest)}, true, nil
+}
+
+// CanFinalizeSuccessfulClaim prevents a later queue generation from being
+// consumed as recovery for an older completed run.
+func CanFinalizeSuccessfulClaim(queueItem storage.QueueItemRecord, run storage.RunRecord, loopStatus string) bool {
+	queueCreatedAt, queueErr := time.Parse(time.RFC3339Nano, strings.TrimSpace(queueItem.CreatedAt))
+	runStartedAt, runErr := time.Parse(time.RFC3339Nano, strings.TrimSpace(run.StartedAt))
+	if queueErr != nil || runErr != nil || queueCreatedAt.After(runStartedAt) {
+		return false
+	}
+	if run.Status != "success" {
+		return true
+	}
+	if run.EndedAt == nil {
+		return false
+	}
+	runEndedAt, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(*run.EndedAt))
+	if err != nil || queueCreatedAt.After(runEndedAt) {
+		return false
+	}
+	if queueItem.Status == "running" {
+		return loopStatus == "running"
+	}
+	return queueItem.Status == "queued" && queueItem.LastError != nil && strings.TrimSpace(*queueItem.LastError) != ""
 }
 
 func (r *Runner) getLatestCheckpoint(ctx context.Context, run storage.RunRecord, fallback workerCheckpoint) workerCheckpoint {
