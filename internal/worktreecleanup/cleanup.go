@@ -2,6 +2,7 @@ package worktreecleanup
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -10,6 +11,8 @@ import (
 
 	"github.com/nexu-io/looper/internal/config"
 	gitinfra "github.com/nexu-io/looper/internal/infra/git"
+	"github.com/nexu-io/looper/internal/loops"
+	"github.com/nexu-io/looper/internal/processidentity"
 	"github.com/nexu-io/looper/internal/storage"
 	"github.com/nexu-io/looper/internal/worktreesafety"
 )
@@ -59,6 +62,10 @@ func Run(ctx context.Context, options Options) (Result, error) {
 	if options.Git == nil {
 		return Result{}, fmt.Errorf("git gateway is required")
 	}
+	now := time.Now
+	if options.Now != nil {
+		now = options.Now
+	}
 
 	plan, err := (&Service{
 		Repos:  options.Repos,
@@ -107,6 +114,14 @@ func Run(ctx context.Context, options Options) (Result, error) {
 		if candidate.Action == "clean" {
 			result.Summary.Eligible++
 			if !options.DryRun {
+				releaseLease, leaseReason := acquireTargetLease(ctx, options.Repos, decision.Worktree, now())
+				if leaseReason != "" {
+					candidate.Action = "skip"
+					candidate.Reason = leaseReason
+					result.Summary.Skipped++
+					result.Candidates = append(result.Candidates, candidate)
+					continue
+				}
 				if err := options.Git.CleanupWorktree(ctx, gitinfra.CleanupWorktreeInput{
 					ProjectID:         decision.Worktree.ProjectID,
 					RepoPath:          decision.Worktree.RepoPath,
@@ -122,6 +137,7 @@ func Run(ctx context.Context, options Options) (Result, error) {
 				} else {
 					result.Summary.Cleaned++
 				}
+				releaseLease()
 			}
 		} else if candidate.Action == "error" {
 			result.Summary.Errors++
@@ -132,6 +148,55 @@ func Run(ctx context.Context, options Options) (Result, error) {
 	}
 
 	return result, nil
+}
+
+func acquireTargetLease(ctx context.Context, repos *storage.Repositories, worktree storage.WorktreeRecord, now time.Time) (func(), string) {
+	key := targetLeaseKey(worktree)
+	if key == "" {
+		// Historical records have no authoritative target mapping. Preserve the
+		// established utility behaviour rather than guessing from branch/path.
+		return func() {}, ""
+	}
+	if repos == nil || repos.TargetLeases == nil {
+		return func() {}, "target_lease_storage_unavailable"
+	}
+	token, err := loops.NewTargetLeaseOwnerToken()
+	if err != nil {
+		return func() {}, "target_lease_token_error"
+	}
+	pid := int64(os.Getpid())
+	birth, err := processidentity.Read(int(pid))
+	if err != nil {
+		return func() {}, "target_lease_process_identity_unavailable"
+	}
+	start := birth.StartTime
+	bootID := strings.TrimSpace(birth.BootID)
+	var bootIDPtr *string
+	if bootID != "" {
+		bootIDPtr = &bootID
+	}
+	nowISO := now.UTC().Format("2006-01-02T15:04:05.000Z")
+	acquired, err := repos.TargetLeases.Acquire(ctx, storage.TargetLeaseRecord{TargetKey: key, OwnerToken: token, OwnerKind: "automation", OwnerID: worktree.ID, Purpose: "cleanup", ProcessPID: &pid, ProcessStartTime: &start, ProcessBootID: bootIDPtr, AcquiredAt: nowISO, UpdatedAt: nowISO})
+	if err != nil {
+		return func() {}, "target_lease_acquire_failed"
+	}
+	if !acquired {
+		return func() {}, "target_lease_held"
+	}
+	return func() { _, _ = repos.TargetLeases.Release(context.Background(), key, token) }, ""
+}
+
+func targetLeaseKey(worktree storage.WorktreeRecord) string {
+	if worktree.MetadataJSON == nil || strings.TrimSpace(*worktree.MetadataJSON) == "" {
+		return ""
+	}
+	var metadata struct {
+		TargetLeaseKey string `json:"targetLeaseKey"`
+	}
+	if json.Unmarshal([]byte(*worktree.MetadataJSON), &metadata) != nil {
+		return ""
+	}
+	return strings.TrimSpace(metadata.TargetLeaseKey)
 }
 
 func candidateFromDecision(decision Decision) Candidate {
