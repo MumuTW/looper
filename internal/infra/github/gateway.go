@@ -318,6 +318,7 @@ type RepositorySettings struct {
 	AllowMergeCommit bool
 	AllowRebaseMerge bool
 	AllowAutoMerge   bool
+	Visibility       string
 }
 
 type BranchProtectionInput struct {
@@ -369,6 +370,7 @@ type IssueDetail struct {
 	ClosedAt          string
 	Author            string
 	AuthorAssociation string
+	AuthorType        string
 	Assignees         []string
 	AssigneeUsers     []GitHubUser
 	Labels            []string
@@ -1114,6 +1116,7 @@ func (g *Gateway) ViewIssue(ctx context.Context, input ViewIssueInput) (IssueDet
 		ClosedAt:          firstNonEmpty(asString(row["closed_at"]), asString(row["closedAt"])),
 		Author:            extractAuthor(firstNonNil(row["user"], row["author"])),
 		AuthorAssociation: asString(row["author_association"]),
+		AuthorType:        extractActorType(firstNonNil(row["user"], row["author"])),
 		Assignees:         extractActorLogins(row["assignees"]),
 		AssigneeUsers:     extractActorUsers(row["assignees"]),
 		Labels:            extractLabelNames(row["labels"]),
@@ -1674,7 +1677,21 @@ func (g *Gateway) GetRepositorySettings(ctx context.Context, input RepositorySet
 		AllowMergeCommit: asBool(row["allow_merge_commit"]),
 		AllowRebaseMerge: asBool(row["allow_rebase_merge"]),
 		AllowAutoMerge:   asBool(row["allow_auto_merge"]),
+		Visibility:       repositoryVisibility(row),
 	}, nil
+}
+
+func repositoryVisibility(row map[string]any) string {
+	if visibility := strings.ToLower(strings.TrimSpace(asString(row["visibility"]))); visibility != "" {
+		return visibility
+	}
+	if private, ok := row["private"].(bool); ok {
+		if private {
+			return "private"
+		}
+		return "public"
+	}
+	return "unknown"
 }
 
 func (g *Gateway) GetBranchProtection(ctx context.Context, input BranchProtectionInput) (BranchProtection, error) {
@@ -4465,6 +4482,10 @@ func extractAuthorIsBot(value any) bool {
 	return asBool(row["is_bot"])
 }
 
+func extractActorType(value any) string {
+	row, _ := value.(map[string]any)
+	return asString(row["type"])
+}
 func extractOID(value any) string {
 	row, ok := value.(map[string]any)
 	if !ok {

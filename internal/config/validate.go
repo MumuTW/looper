@@ -267,10 +267,16 @@ func validateCoreConfig(config Config, issues *[]ValidationIssue) {
 	validateAgentConfig(config, issues)
 	validateLoggingAndNotificationConfig(config, issues)
 	validateHITLConfig(config.HITL, issues)
+	validateTriagerRoleConfig(config.Roles.Triager, "roles.triager", issues)
 	validateGatekeeperRoleConfig(config.Roles.Gatekeeper, "roles.gatekeeper", config.Roles.Reviewer.AutoMerge.Enabled, issues)
 	validateAuditorRoleConfig(config.Roles.Auditor, "roles.auditor", issues)
 	validateDeployerRoleConfig(config.Roles.Deployer, "roles.deployer", issues)
 	validateEscalatorRoleConfig(config.Roles.Escalator, "roles.escalator", issues)
+	for i, project := range config.Projects {
+		if project.Roles != nil && project.Roles.Triager != nil {
+			validateTriagerRoleConfig(ProjectRoleConfigs(config, project.ID).Triager, fmt.Sprintf("projects[%d].roles.triager", i), issues)
+		}
+	}
 	for i, project := range config.Projects {
 		if project.Roles == nil || project.Roles.Deployer == nil {
 			continue
@@ -329,6 +335,41 @@ func validateEscalatorRoleConfig(role EscalatorRoleConfig, path string, issues *
 	}
 	if role.MaxItems < 1 || role.MaxItems > 5000 {
 		*issues = append(*issues, ValidationIssue{Path: path + ".maxItems", Message: "must be an integer between 1 and 5000"})
+	}
+}
+
+func validateTriagerRoleConfig(role TriagerRoleConfig, path string, issues *[]ValidationIssue) {
+	switch role.Preset {
+	case "", TriagerPresetLegacy, TriagerPresetPersonal, TriagerPresetMaintainedOSS, TriagerPresetCompany, TriagerPresetContributing:
+	default:
+		*issues = append(*issues, ValidationIssue{Path: path + ".preset", Message: fmt.Sprintf("must be one of: %s, %s, %s, %s, %s", TriagerPresetLegacy, TriagerPresetPersonal, TriagerPresetMaintainedOSS, TriagerPresetCompany, TriagerPresetContributing)})
+	}
+	if role.Legacy.AutoRouteConfidence < 0 || role.Legacy.AutoRouteConfidence > 1 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".legacy.autoRouteConfidence", Message: "must be between 0 and 1"})
+	}
+	switch role.Legacy.MaxAutoRouteRisk {
+	case "low", "medium", "high":
+	default:
+		*issues = append(*issues, ValidationIssue{Path: path + ".legacy.maxAutoRouteRisk", Message: "must be one of: low, medium, high"})
+	}
+	validTiers := map[string]struct{}{"owner": {}, "member": {}, "past-contributor": {}, "unaffiliated": {}, "bot": {}}
+	for tier, outcome := range role.AuthorTiers {
+		if _, ok := validTiers[tier]; !ok {
+			*issues = append(*issues, ValidationIssue{Path: path + ".authorTiers." + tier, Message: "author tier must be one of: owner, member, past-contributor, unaffiliated, bot"})
+			continue
+		}
+		switch outcome {
+		case TriagerAdmissionAuto, TriagerAdmissionAssess, TriagerAdmissionIgnore:
+		default:
+			*issues = append(*issues, ValidationIssue{Path: path + ".authorTiers." + tier, Message: "must be one of: auto, assess, ignore"})
+			continue
+		}
+		if outcome == TriagerAdmissionAuto && role.Preset == TriagerPresetContributing {
+			*issues = append(*issues, ValidationIssue{Path: path + ".authorTiers." + tier, Message: "cannot be auto under the contributing preset"})
+		}
+		if outcome == TriagerAdmissionAuto && tier == "bot" {
+			*issues = append(*issues, ValidationIssue{Path: path + ".authorTiers.bot", Message: "bot authors cannot be auto-admitted"})
+		}
 	}
 }
 

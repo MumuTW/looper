@@ -1251,6 +1251,9 @@ func mergeInstructionsConfig(config *InstructionsConfig, partial PartialInstruct
 }
 
 func mergeRoleConfigs(config *RoleConfigs, partial PartialRoleConfigs) {
+	if partial.Triager != nil {
+		mergeTriagerRoleConfig(&config.Triager, *partial.Triager)
+	}
 	if partial.Coordinator != nil {
 		mergeCoordinatorRoleConfig(&config.Coordinator, *partial.Coordinator)
 	}
@@ -1321,6 +1324,47 @@ func mergeEscalatorRoleConfig(config *EscalatorRoleConfig, partial PartialEscala
 	}
 	if partial.MaxItems != nil {
 		config.MaxItems = *partial.MaxItems
+	}
+}
+
+func mergeTriagerRoleConfig(config *TriagerRoleConfig, partial PartialTriagerRoleConfig) {
+	if partial.Preset != nil {
+		config.Preset = TriagerPreset(strings.TrimSpace(string(*partial.Preset)))
+	}
+	if partial.Classify != nil {
+		config.Classify = *partial.Classify
+	}
+	if partial.AuthorTiers != nil {
+		if config.AuthorTiers == nil {
+			config.AuthorTiers = map[string]TriagerAdmissionOutcome{}
+		}
+		for tier, outcome := range *partial.AuthorTiers {
+			config.AuthorTiers[tier] = TriagerAdmissionOutcome(strings.TrimSpace(string(outcome)))
+		}
+	}
+	if partial.Legacy != nil {
+		mergeTriagerLegacyPolicyConfig(&config.Legacy, *partial.Legacy)
+	}
+}
+
+func mergeTriagerLegacyPolicyConfig(config *TriagerLegacyPolicyConfig, partial PartialTriagerLegacyPolicyConfig) {
+	if partial.AutoRouteConfidence != nil {
+		config.AutoRouteConfidence = *partial.AutoRouteConfidence
+	}
+	if partial.MaxAutoRouteRisk != nil {
+		config.MaxAutoRouteRisk = strings.TrimSpace(*partial.MaxAutoRouteRisk)
+	}
+	if partial.RequireInScope != nil {
+		config.RequireInScope = *partial.RequireInScope
+	}
+	if partial.RequireNoMissingInformation != nil {
+		config.RequireNoMissingInformation = *partial.RequireNoMissingInformation
+	}
+	if partial.RequirePlanner != nil {
+		config.RequirePlanner = *partial.RequirePlanner
+	}
+	if partial.RequireRationale != nil {
+		config.RequireRationale = *partial.RequireRationale
 	}
 }
 
@@ -2120,6 +2164,21 @@ func clonePartialRoleConfigs(configs *PartialRoleConfigs) *PartialRoleConfigs {
 		}
 		planner.Agent = cloneRoleAgentConfig(configs.Planner.Agent)
 		cloned.Planner = &planner
+	}
+	if configs.Triager != nil {
+		triager := *configs.Triager
+		if configs.Triager.AuthorTiers != nil {
+			overrides := make(map[string]TriagerAdmissionOutcome, len(*configs.Triager.AuthorTiers))
+			for tier, outcome := range *configs.Triager.AuthorTiers {
+				overrides[tier] = outcome
+			}
+			triager.AuthorTiers = &overrides
+		}
+		if configs.Triager.Legacy != nil {
+			legacy := *configs.Triager.Legacy
+			triager.Legacy = &legacy
+		}
+		cloned.Triager = &triager
 	}
 	if configs.Worker != nil {
 		worker := *configs.Worker

@@ -22,6 +22,7 @@ import (
 	githubinfra "github.com/MumuTW/looper/internal/infra/github"
 	"github.com/MumuTW/looper/internal/planner"
 	"github.com/MumuTW/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/triager/admission"
 )
 
 const (
@@ -47,6 +48,7 @@ const (
 
 	ActionRoutePlanner Action = "route_planner"
 	ActionAwaitHuman   Action = "await_human_confirmation"
+	ActionIgnore       Action = "ignore"
 
 	ClassificationBug      Classification = "bug"
 	ClassificationFeature  Classification = "feature"
@@ -69,7 +71,6 @@ const (
 	pendingForgeReadLimit                  = 12
 	pendingSourceScanLimit                 = 64
 	defaultSourceLookback                  = 5 * time.Minute
-	autoRouteConfidence                    = 0.8
 	reportEntityType                       = "github_issue"
 	sourceEventNew         SourceEventKind = "new"
 	sourceEventReopened    SourceEventKind = "reopened"
@@ -112,14 +113,15 @@ type SourceEvent struct {
 // are intentionally absent: they may be projected later, but do not authorize
 // Planner.
 type Report struct {
-	Version        int            `json:"version"`
-	IdempotencyKey string         `json:"idempotencyKey"`
-	ProjectID      string         `json:"projectId"`
-	Repo           string         `json:"repo"`
-	IssueNumber    int64          `json:"issueNumber"`
-	Source         SourceEvent    `json:"source"`
-	Decision       Decision       `json:"decision"`
-	Policy         PolicyDecision `json:"policy"`
+	Version        int                `json:"version"`
+	IdempotencyKey string             `json:"idempotencyKey"`
+	ProjectID      string             `json:"projectId"`
+	Repo           string             `json:"repo"`
+	IssueNumber    int64              `json:"issueNumber"`
+	Source         SourceEvent        `json:"source"`
+	Decision       Decision           `json:"decision"`
+	Admission      admission.Decision `json:"admission"`
+	Policy         PolicyDecision     `json:"policy"`
 	// ConfirmationToken is minted before, and persisted with, the report. A
 	// human must cite it in /plan, so a comment made before this report existed
 	// cannot authorize Planner.
@@ -176,6 +178,7 @@ type GitHubGateway interface {
 	ViewIssue(context.Context, githubinfra.ViewIssueInput) (githubinfra.IssueDetail, error)
 	ListIssueTimeline(context.Context, githubinfra.IssueTimelineInput) ([]map[string]any, error)
 	GetRepositoryPermission(context.Context, githubinfra.RepositoryPermissionInput) (string, error)
+	GetRepositorySettings(context.Context, githubinfra.RepositorySettingsInput) (githubinfra.RepositorySettings, error)
 	CreateIssueComment(context.Context, githubinfra.IssueCommentInput) (githubinfra.IssueCommentResult, error)
 }
 
@@ -184,13 +187,28 @@ type PlannerRouter interface {
 }
 
 type Options struct {
-	Repos          *storage.Repositories
-	GitHub         GitHubGateway
-	LLM            LLM
-	Planner        PlannerRouter
-	Now            func() time.Time
-	SourceLookback time.Duration
-	DecisionLimit  int
+	Repos            *storage.Repositories
+	GitHub           GitHubGateway
+	LLM              LLM
+	Planner          PlannerRouter
+	Now              func() time.Time
+	SourceLookback   time.Duration
+	DecisionLimit    int
+	PolicyForProject func(string) ProjectPolicy
+}
+
+type LegacyPolicy struct {
+	AutoRouteConfidence         float64
+	MaxAutoRouteRisk            Risk
+	RequireInScope              bool
+	RequireNoMissingInformation bool
+	RequirePlanner              bool
+	RequireRationale            bool
+}
+
+type ProjectPolicy struct {
+	Admission admission.Policy
+	Legacy    LegacyPolicy
 }
 
 // Runner is the Triager: an internal proactive Role for the personal GitHub
@@ -212,6 +230,7 @@ type Runner struct {
 	awaitingCursor       map[string]awaitingRecheckCursor
 	pendingCursor        map[string]string
 	pendingProjectOffset int
+	policyForProject     func(string) ProjectPolicy
 }
 
 type DiscoveryInput struct {
@@ -258,6 +277,21 @@ func New(options Options) *Runner {
 		planner: options.Planner, now: now, sourceLookback: sourceLookback, decisionLimit: decisionLimit,
 		awaitingCursor: map[string]awaitingRecheckCursor{},
 		pendingCursor:  map[string]string{},
+		policyForProject: options.PolicyForProject,
+	}
+}
+
+func (r *Runner) projectPolicy(projectID string) ProjectPolicy {
+	if r.policyForProject != nil {
+		return r.policyForProject(projectID)
+	}
+	return ProjectPolicy{
+		Admission: admission.Policy{Preset: admission.PresetLegacy, Classify: true},
+		Legacy: LegacyPolicy{
+			AutoRouteConfidence: 0.8, MaxAutoRouteRisk: RiskLow,
+			RequireInScope: true, RequireNoMissingInformation: true,
+			RequirePlanner: true, RequireRationale: true,
+		},
 	}
 }
 
@@ -279,7 +313,7 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 	if r.repos == nil || r.repos.Projects == nil || r.repos.Events == nil {
 		return DiscoveryResult{}, fmt.Errorf("triager repositories are not configured")
 	}
-	if r.github == nil || r.llm == nil || r.planner == nil {
+	if r.github == nil || r.planner == nil {
 		return DiscoveryResult{}, fmt.Errorf("triager dependencies are not configured")
 	}
 	project, err := r.repos.Projects.GetByID(ctx, input.ProjectID)
@@ -297,6 +331,8 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 		return DiscoveryResult{}, err
 	}
 	result := DiscoveryResult{}
+	projectPolicy := r.projectPolicy(input.ProjectID)
+	configuredAdmission := projectPolicy.Admission.Preset != "" && projectPolicy.Admission.Preset != admission.PresetLegacy
 	cutoff := r.now().UTC().Add(-r.sourceLookback)
 	issues, err := r.github.ListOpenIssues(ctx, githubinfra.ListOpenIssuesInput{
 		Repo: input.Repo, CWD: project.RepoPath, Limit: defaultIssueLimit,
@@ -316,7 +352,7 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 		if err != nil {
 			return result, err
 		}
-		if !eligibleTarget(detail) || domain.IsAutoLaneHeld(domain.LoopTypePlanner, detail.Labels) {
+		if !eligibleTarget(detail) || (domain.IsAutoLaneHeld(domain.LoopTypePlanner, detail.Labels) && !configuredAdmission) {
 			result.Skipped++
 			continue
 		}
@@ -358,6 +394,14 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 	}
 
 	pending := pendingSourceStates(states)
+	repositoryVisibility := ""
+	if configuredAdmission && hasUnreportedSource(pending) {
+		settings, err := r.github.GetRepositorySettings(ctx, githubinfra.RepositorySettingsInput{Repo: input.Repo, CWD: project.RepoPath})
+		if err != nil {
+			return result, err
+		}
+		repositoryVisibility = settings.Visibility
+	}
 	// A source parked on a human cannot change unless someone touches its issue, but
 	// re-verifying it costs a ViewIssue and a ListIssueTimeline every tick. Left
 	// uncapped that grows without bound, because nothing ever removes an awaiting
@@ -376,7 +420,7 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 			result.Skipped++
 			continue
 		}
-		if err := r.processSourceState(ctx, *project, input.Repo, state, input.DecisionBudget, input.PendingForgeReadBudget, &result); err != nil {
+		if err := r.processSourceState(ctx, *project, input.Repo, state, repositoryVisibility, input.DecisionBudget, input.PendingForgeReadBudget, &result); err != nil {
 			if errors.Is(err, errPendingForgeReadBudgetExhausted) {
 				result.PendingSourcesDeferred++
 				result.Skipped++
@@ -386,6 +430,15 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 		}
 	}
 	return result, nil
+}
+
+func hasUnreportedSource(states []*sourceState) bool {
+	for _, state := range states {
+		if state.report == nil && !state.retired && !state.projected {
+			return true
+		}
+	}
+	return false
 }
 
 type sourceState struct {
@@ -475,11 +528,13 @@ func pendingSourceStates(states map[string]*sourceState) []*sourceState {
 	return pending
 }
 
-func (r *Runner) processSourceState(ctx context.Context, project storage.ProjectRecord, repo string, state *sourceState, decisionBudget *DecisionBudget, readBudget *PendingForgeReadBudget, result *DiscoveryResult) error {
+func (r *Runner) processSourceState(ctx context.Context, project storage.ProjectRecord, repo string, state *sourceState, repositoryVisibility string, decisionBudget *DecisionBudget, readBudget *PendingForgeReadBudget, result *DiscoveryResult) error {
 	enrollment := state.enrollment
 	if !reservePendingForgeRead(readBudget, project.ID, result) {
 		return errPendingForgeReadBudgetExhausted
 	}
+	projectPolicy := r.projectPolicy(enrollment.ProjectID)
+	configuredAdmission := projectPolicy.Admission.Preset != "" && projectPolicy.Admission.Preset != admission.PresetLegacy
 	detail, err := r.github.ViewIssue(ctx, githubinfra.ViewIssueInput{Repo: repo, IssueNumber: enrollment.IssueNumber, CWD: project.RepoPath})
 	if err != nil {
 		return err
@@ -487,7 +542,7 @@ func (r *Runner) processSourceState(ctx context.Context, project storage.Project
 	if !eligibleTarget(detail) {
 		return r.retireSource(ctx, state, "source_no_longer_eligible", result)
 	}
-	if domain.IsAutoLaneHeld(domain.LoopTypePlanner, detail.Labels) {
+	if domain.IsAutoLaneHeld(domain.LoopTypePlanner, detail.Labels) && (state.report != nil || !configuredAdmission) {
 		result.Skipped++
 		return nil
 	}
@@ -500,20 +555,30 @@ func (r *Runner) processSourceState(ctx context.Context, project storage.Project
 	}
 	report := state.report
 	if report == nil {
-		// The per-runner limit is checked first because it is this project's own
-		// count and must not consume a shared reservation. Reserve is the atomic
-		// check-and-claim against the tick-wide budget: concurrent projects can no
-		// longer each observe the same remaining count and all proceed.
-		if result.DecisionsAttempted >= r.decisionLimit {
-			return nil
+		admissionDecision := admission.Decision{Outcome: admission.OutcomeLegacy, Preset: admission.PresetLegacy, Rule: "legacy-seven-condition-policy", Classify: true}
+		visibility := "unknown"
+		if configuredAdmission {
+			visibility = repositoryVisibility
+			admissionDecision = admission.Decide(projectPolicy.Admission, admission.Input{
+				AuthorAssociation: detail.AuthorAssociation, AuthorLogin: detail.Author, AuthorType: detail.AuthorType,
+				Visibility: visibility, Held: domain.IsAutoLaneHeld(domain.LoopTypePlanner, detail.Labels),
+			})
 		}
-		if !decisionBudget.Reserve() {
-			return nil
-		}
-		result.DecisionsAttempted++
-		decision, err := r.decide(ctx, project, repo, detail)
-		if err != nil {
-			return err
+		var decision Decision
+		if admissionDecision.Outcome == admission.OutcomeLegacy || admissionDecision.Classify {
+			// Only model classification consumes the shared tick budget. Deterministic
+			// auto/ignore decisions cannot starve another project's assessment.
+			if result.DecisionsAttempted >= r.decisionLimit {
+				return nil
+			}
+			if !decisionBudget.Reserve() {
+				return nil
+			}
+			result.DecisionsAttempted++
+			decision, err = r.decide(ctx, project, repo, detail)
+			if err != nil {
+				return err
+			}
 		}
 		if !reservePendingForgeRead(readBudget, project.ID, result) {
 			return errPendingForgeReadBudgetExhausted
@@ -525,7 +590,7 @@ func (r *Runner) processSourceState(ctx context.Context, project storage.Project
 		if !eligibleTarget(refreshed) {
 			return r.retireSource(ctx, state, "source_no_longer_eligible", result)
 		}
-		if domain.IsAutoLaneHeld(domain.LoopTypePlanner, refreshed.Labels) {
+		if domain.IsAutoLaneHeld(domain.LoopTypePlanner, refreshed.Labels) && !configuredAdmission {
 			result.Skipped++
 			return nil
 		}
@@ -537,11 +602,29 @@ func (r *Runner) processSourceState(ctx context.Context, project storage.Project
 			return r.retireSource(ctx, state, "source_superseded", result)
 		}
 		detail = refreshed
+		if configuredAdmission {
+			admissionDecision = admission.Decide(projectPolicy.Admission, admission.Input{
+				AuthorAssociation: detail.AuthorAssociation, AuthorLogin: detail.Author, AuthorType: detail.AuthorType,
+				Visibility: visibility, Held: domain.IsAutoLaneHeld(domain.LoopTypePlanner, detail.Labels),
+			})
+		}
+		policyDecision := validateDecision(decision, projectPolicy.Legacy)
+		switch admissionDecision.Outcome {
+		case admission.OutcomeAuto:
+			policyDecision = PolicyDecision{Action: ActionRoutePlanner}
+		case admission.OutcomeAssess:
+			policyDecision = PolicyDecision{Action: ActionAwaitHuman, Reasons: []string{"admission_requires_confirmation"}}
+		case admission.OutcomeIgnore:
+			policyDecision = PolicyDecision{Action: ActionIgnore, Reasons: []string{"admission_ignored"}}
+		case admission.OutcomeLegacy:
+		default:
+			return fmt.Errorf("triage admission returned unknown outcome %q", admissionDecision.Outcome)
+		}
 		created := r.now().UTC().Format(time.RFC3339Nano)
 		value := Report{
-			Version: 2, IdempotencyKey: enrollment.IdempotencyKey, ProjectID: enrollment.ProjectID, Repo: enrollment.Repo,
+			Version: 3, IdempotencyKey: enrollment.IdempotencyKey, ProjectID: enrollment.ProjectID, Repo: enrollment.Repo,
 			IssueNumber: enrollment.IssueNumber, Source: refreshedSource, Decision: decision,
-			Policy: validateDecision(decision), CreatedAt: created,
+			Admission: admissionDecision, Policy: policyDecision, CreatedAt: created,
 		}
 		if value.Policy.Action == ActionAwaitHuman {
 			token, err := newConfirmationToken()
@@ -558,6 +641,9 @@ func (r *Runner) processSourceState(ctx context.Context, project storage.Project
 		result.ReportsPersisted++
 	}
 	action := report.Policy.Action
+	if action == ActionIgnore {
+		return r.retireSource(ctx, state, "admission_ignored", result)
+	}
 	var clarifications []string
 	if action == ActionAwaitHuman {
 		confirmed, created, err := r.confirmedByHuman(ctx, project.ID, repo, project.RepoPath, detail, *report, readBudget, result)
@@ -749,6 +835,9 @@ func sourceEvent(issue githubinfra.IssueDetail, timeline []map[string]any) (Sour
 }
 
 func (r *Runner) decide(ctx context.Context, project storage.ProjectRecord, repo string, issue githubinfra.IssueDetail) (Decision, error) {
+	if r.llm == nil {
+		return Decision{}, fmt.Errorf("triager classification LLM is not configured")
+	}
 	raw, err := r.llm.Complete(ctx, Request{
 		WorkingDirectory: project.RepoPath,
 		Prompt:           buildPrompt(repo, issue),
@@ -770,33 +859,44 @@ func (r *Runner) decide(ctx context.Context, project storage.ProjectRecord, repo
 	return decision, nil
 }
 
-func validateDecision(decision Decision) PolicyDecision {
+func validateDecision(decision Decision, policy LegacyPolicy) PolicyDecision {
 	reasons := make([]string, 0, 7)
 	if !validClassification(decision.Classification) {
 		reasons = append(reasons, "unsupported_classification")
 	}
-	if decision.Scope != ScopeInScope {
+	if policy.RequireInScope && decision.Scope != ScopeInScope {
 		reasons = append(reasons, "scope_not_in")
 	}
-	if decision.Risk != RiskLow {
-		reasons = append(reasons, "risk_not_low")
+	if !riskWithinThreshold(decision.Risk, policy.MaxAutoRouteRisk) {
+		reason := "risk_above_threshold"
+		if policy.MaxAutoRouteRisk == RiskLow {
+			reason = "risk_not_low"
+		}
+		reasons = append(reasons, reason)
 	}
-	if decision.Confidence < autoRouteConfidence || decision.Confidence > 1 {
+	if decision.Confidence < policy.AutoRouteConfidence || decision.Confidence > 1 {
 		reasons = append(reasons, "confidence_below_threshold")
 	}
-	if len(decision.MissingInformation) > 0 {
+	if policy.RequireNoMissingInformation && len(decision.MissingInformation) > 0 {
 		reasons = append(reasons, "missing_information")
 	}
-	if decision.RecommendedNextRole != NextRolePlanner {
+	if policy.RequirePlanner && decision.RecommendedNextRole != NextRolePlanner {
 		reasons = append(reasons, "next_role_not_planner")
 	}
-	if decision.Rationale == "" {
+	if policy.RequireRationale && decision.Rationale == "" {
 		reasons = append(reasons, "missing_rationale")
 	}
 	if len(reasons) > 0 {
 		return PolicyDecision{Action: ActionAwaitHuman, Reasons: reasons}
 	}
 	return PolicyDecision{Action: ActionRoutePlanner}
+}
+
+func riskWithinThreshold(actual, maximum Risk) bool {
+	ranks := map[Risk]int{RiskLow: 1, RiskMedium: 2, RiskHigh: 3}
+	actualRank, actualOK := ranks[actual]
+	maximumRank, maximumOK := ranks[maximum]
+	return actualOK && maximumOK && actualRank <= maximumRank
 }
 
 func validClassification(classification Classification) bool {

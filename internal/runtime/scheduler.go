@@ -2242,6 +2242,9 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			),
 			Now:            now,
 			SourceLookback: time.Duration(maxInt(300, 2*cfg.Scheduler.PollIntervalSeconds)) * time.Second,
+			PolicyForProject: func(projectID string) triager.ProjectPolicy {
+				return triagerProjectPolicy(cfg, projectID)
+			},
 		})
 	}
 
