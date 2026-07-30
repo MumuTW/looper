@@ -3441,6 +3441,12 @@ func ensureClaimFinalized(ctx context.Context, item storage.QueueItemRecord, run
 	if got == nil || got.Status != "running" {
 		return nil
 	}
+	// Worker has durably completed every execution step but its atomic
+	// run/queue/loop terminal transaction failed. Requeueing here would repeat
+	// already-published work; retain the operation lease and degrade instead.
+	if errors.Is(runErr, worker.ErrSuccessfulClaimFinalization) {
+		return errors.Join(ErrOperationFinalizeFailed, runErr)
+	}
 	// Still running after processor return: typed durable finalization.
 	if now == nil {
 		now = time.Now
