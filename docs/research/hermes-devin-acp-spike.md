@@ -55,6 +55,8 @@ Versioned artifacts live in `testdata/hermes-devin-acp/`:
 - `replay-default-agent.txt` — captured output for claim 1 below.
 - `replay-toolcall-probe.txt` + the two `prompt-toolcall-*.txt` inputs —
   captured output for the tool-loop finding.
+- `replay-mcp-route.txt` + `probe_mcp_server.py` — the stub MCP server and
+  captured output showing Hermes-side tools are reachable via MCP.
 
 Session ids and message uuids in the captures are replaced with
 `<REDACTED-*>`; no credentials, tokens, account identity, or repository
@@ -123,7 +125,47 @@ chooses it on its own. Trying to force this globally via `SOUL.md` was tested
 and rejected: it did not fix memory writes and it broke the coding path,
 because the default agent type genuinely does have native tools.
 
-Practical consequence: **treat repo memory as read-mostly.** Hermes recalls
+### The tool gap is closable via MCP, not via the prompt contract
+
+A follow-up probe (`testdata/hermes-devin-acp/replay-mcp-route.txt`) found a
+route that does work, and it inverts the fix: instead of fighting Devin for
+ownership of the tool loop, hand it the tools and let it call them natively.
+
+Devin's ACP `initialize` advertises `mcpCapabilities`, and a stdio MCP server
+registered with `devin mcp add` is discovered and called end-to-end from
+inside an ACP session: `tools/list` → `tools/call` → the tool executed with
+the correct argument, and the model reported success truthfully. Two
+constraints found along the way:
+
+- **`devin mcp add` is the registration path, not `session/new`.** Passing
+  the server inline in `session/new`'s `mcpServers` made Devin spawn the
+  process and complete the MCP handshake, but its own registry never picked
+  it up (`Server ... not found in configuration`) and `tools/list` was never
+  called. `devin mcp add` writes a *local project config* keyed to the
+  directory, so the ACP session cwd must match — which lines up neatly with
+  a per-repo profile.
+- **The shim's blanket permission denial blocks the call.** Hermes hardcodes
+  `{"outcome": "cancelled"}` for every `session/request_permission`
+  ([#L125-L134](https://github.com/NousResearch/hermes-agent/blob/v2026.7.20/agent/copilot_acp_client.py#L125-L134)),
+  so a registered, discovered tool still gets rejected at call time. Devin
+  offers `allow_once` / `allow_session` / `allow_always` (plus server-scoped
+  variants); selecting one is what turned the probe green.
+
+So a Hermes patch to make Hermes-side tools reachable is smaller and less
+invasive than "map Hermes tools onto Devin's tool surface": expose the
+desired Hermes tools (starting with `memory`, whose `MemoryStore` is already
+a plain Python class) as a stdio MCP server, and replace the shim's
+unconditional denial with a selective approval for calls to that server.
+Neither piece requires touching Hermes's agent loop. **Not yet built or
+tested against real Hermes tools** — the probe used a stub MCP server; the
+claim proven here is that the route is open, not that the patch exists.
+
+Note the security consequence: relaxing the permission denial widens what the
+backend can do, and the denial was never a containment boundary to begin with
+(see the safety section). Any such patch should approve narrowly — a
+specific server, specific tool names — not switch on `allow_always`.
+
+Practical consequence for today: **treat repo memory as read-mostly.** Hermes recalls
 and reasons over `memories/MEMORY.md` normally; writes should be made by a
 non-ACP Hermes session or by editing the file directly. A `memory`-toolset
 session on this backend will claim success without persisting anything.
@@ -167,12 +209,16 @@ with memory treated as read-mostly: recall and repo-scoped memory both work,
 which was the point of the exercise.
 
 No-go for treating it as a production provider until the per-turn process
-spawn, zero usage reporting, and — the blocker that matters most — the
-inability to drive Hermes-side tools are addressed. The last one is
-structural, not a config gap: as long as Devin's ACP server owns the tool
-loop, Hermes tools stay unreachable. Fixing it means either a carried Hermes
-patch (a Devin-aware ACP shim that maps Hermes tools onto Devin's own tool
-surface) or an upstream change neither project has planned.
+spawn, zero usage reporting, and the inability to drive Hermes-side tools are
+addressed.
+
+That last one is no longer believed to be structural. Devin's ACP server does
+own the tool loop, so Hermes's prompt-level `<tool_call>` contract stays dead
+— but the MCP route above reaches the same destination from the other side,
+and it was proven end-to-end with a stub server. The remaining work is a
+carried Hermes patch of modest size (an MCP server wrapping the Hermes tools
+worth exposing, plus a narrow, allow-listed replacement for the shim's
+blanket permission denial), not an upstream change.
 
 ## Per-repo profile
 
