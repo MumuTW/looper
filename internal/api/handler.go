@@ -115,6 +115,12 @@ type Context struct {
 	// paths that must accept a pull request Looper has never snapshotted. Optional:
 	// when nil, an unsnapshotted pull request stays unresolvable.
 	LookupPullRequest func(ctx context.Context, repo string, prNumber int64, cwd string) (PullRequestTarget, error)
+	// LookupIssueOccupancy reads an issue's forge-side occupancy (open/closed
+	// state plus open pull requests that reference it) for the dispatch-time
+	// check that refuses to hand out work someone else is already doing.
+	// Optional: when nil, dispatch keeps the local-only occupancy check from
+	// #319 and does not call the forge.
+	LookupIssueOccupancy func(ctx context.Context, repo string, issueNumber int64, cwd string) (IssueOccupancy, error)
 }
 
 // PullRequestTarget is the minimum a caller needs to decide whether a pull
@@ -4421,6 +4427,17 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 		}
 	}
 
+	// Forge-side occupancy for an issue target: refuse when the issue is closed
+	// or an open pull request already references it, so Looper does not duplicate
+	// work someone else is already doing. force overrides, matching the local
+	// occupancy check from #319. When the forge lookup is not configured (tests,
+	// embeddings without forge access) the local check keeps working unchanged.
+	if issueNumber != nil && !derefBool(body.Force) && h.context.LookupIssueOccupancy != nil {
+		if err := h.refuseOccupiedIssueTarget(r.Context(), project, *repo, *issueNumber); err != nil {
+			return workerCreateResponse{}, err
+		}
+	}
+
 	workerPayload := struct {
 		Title       string  `json:"title"`
 		Prompt      *string `json:"prompt"`
@@ -4692,6 +4709,45 @@ func (h *Handler) validateManualHoldBypassForLoopTarget(ctx context.Context, pro
 		return nil
 	}
 	return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("target is currently held for %s; rerun with --force to bypass hold", loopType)}
+}
+
+// refuseOccupiedIssueTarget asks the forge whether the issue is still open and
+// whether any open pull request already references it, and refuses dispatch
+// when either is true. The caller gates this on force=false and a configured
+// LookupIssueOccupancy, so a force override or a forge-unreachable process
+// keeps the local-only occupancy check from #319 working unchanged.
+func (h *Handler) refuseOccupiedIssueTarget(ctx context.Context, project storage.ProjectRecord, repo string, issueNumber int64) error {
+	occupancy, err := h.context.LookupIssueOccupancy(ctx, repo, issueNumber, project.RepoPath)
+	if err != nil {
+		if IsIssueLookupNotFound(err) {
+			return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Issue %s#%d not found; refresh target before manual loop create", repo, issueNumber)}
+		}
+		// A transient forge outage must not hard-fail dispatch: the local check
+		// still prevents self-collision, and prepare-work re-validates on claim.
+		return nil
+	}
+	if !occupancy.Occupied() {
+		return nil
+	}
+	reference := fmt.Sprintf("%s#%d", repo, issueNumber)
+	if occupancy.IsPullRequest {
+		return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("%s is a pull request, not an issue; rerun with --force to bypass", reference)}
+	}
+	if strings.TrimSpace(occupancy.State) != "" && !strings.EqualFold(strings.TrimSpace(occupancy.State), "open") {
+		return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("%s is %s; rerun with --force to bypass", reference, strings.ToLower(occupancy.State))}
+	}
+	if len(occupancy.OpenPullRequests) > 0 {
+		pr := occupancy.OpenPullRequests[0]
+		prReference := fmt.Sprintf("#%d", pr.Number)
+		if strings.TrimSpace(pr.Repo) != "" {
+			prReference = fmt.Sprintf("%s#%d", pr.Repo, pr.Number)
+		}
+		if strings.TrimSpace(pr.URL) != "" {
+			prReference += " (" + pr.URL + ")"
+		}
+		return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("%s already has an open pull request %s; rerun with --force to bypass", reference, prReference)}
+	}
+	return nil
 }
 
 func derefBool(value *bool) bool {
