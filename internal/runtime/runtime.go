@@ -882,6 +882,9 @@ func (r *Runtime) start(ctx context.Context) error {
 	}()
 
 	if r.config.Package.AutoMigrateOnStartup {
+		if err := r.enforceSchemaVersion(ctx, coordinator); err != nil {
+			return err
+		}
 		_, err = coordinator.MigrationRunner().RunPending(ctx, storage.RunPendingOptions{
 			RequireBackup: r.config.Package.RequireBackupBeforeMigrate,
 		})
@@ -1032,6 +1035,25 @@ func (r *Runtime) start(ctx context.Context) error {
 		return err
 	}
 	started = true
+	return nil
+}
+
+func (r *Runtime) enforceSchemaVersion(ctx context.Context, coordinator *storage.SQLiteCoordinator) error {
+	check, err := coordinator.MigrationRunner().CheckSchemaVersion(ctx)
+	if err != nil {
+		return fmt.Errorf("schema version check: %w", err)
+	}
+
+	if check.HasUnknownMigrations {
+		known := coordinator.MigrationRunner().AllMigrationIDs()
+		knownMax := ""
+		if len(known) > 0 {
+			knownMax = known[len(known)-1]
+		}
+		return fmt.Errorf("looperd: database schema is newer than this binary — unknown applied migration(s): %v; this build knows up to %q (db: %s). Install a build that includes the unknown migration, or restore a backup",
+			check.UnknownIDs, knownMax, r.config.Storage.DBPath)
+	}
+
 	return nil
 }
 

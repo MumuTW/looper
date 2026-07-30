@@ -122,6 +122,54 @@ func (r *MigrationRunner) Status(ctx context.Context) (MigrationStatus, error) {
 	}, nil
 }
 
+type SchemaVersionCheckResult struct {
+	HasUnknownMigrations bool
+	UnknownIDs           []string
+	HasPendingMigrations bool
+	PendingIDs           []string
+}
+
+func (r *MigrationRunner) CheckSchemaVersion(ctx context.Context) (SchemaVersionCheckResult, error) {
+	conn, err := r.db.Conn(ctx)
+	if err != nil {
+		return SchemaVersionCheckResult{}, fmt.Errorf("open sqlite connection: %w", err)
+	}
+	defer conn.Close()
+
+	if err := ensureSchemaMigrationsTable(ctx, conn); err != nil {
+		return SchemaVersionCheckResult{}, err
+	}
+
+	applied, err := readAppliedMigrations(ctx, conn)
+	if err != nil {
+		return SchemaVersionCheckResult{}, err
+	}
+
+	known := make(map[string]struct{}, len(r.migrations))
+	for _, m := range r.migrations {
+		known[m.ID] = struct{}{}
+	}
+
+	var unknownIDs []string
+	for _, a := range applied {
+		if _, ok := known[a.ID]; !ok {
+			unknownIDs = append(unknownIDs, a.ID)
+		}
+	}
+
+	pending, err := r.ListPending(ctx)
+	if err != nil {
+		return SchemaVersionCheckResult{}, err
+	}
+
+	return SchemaVersionCheckResult{
+		HasUnknownMigrations: len(unknownIDs) > 0,
+		UnknownIDs:           unknownIDs,
+		HasPendingMigrations: len(pending) > 0,
+		PendingIDs:           pending,
+	}, nil
+}
+
 func (r *MigrationRunner) RunPending(ctx context.Context, options ...RunPendingOptions) (MigrationRunResult, error) {
 	conn, err := r.db.Conn(ctx)
 	if err != nil {
@@ -179,6 +227,14 @@ func (r *MigrationRunner) RunPending(ctx context.Context, options ...RunPendingO
 	}
 
 	return result, nil
+}
+
+func (r *MigrationRunner) AllMigrationIDs() []string {
+	ids := make([]string, len(r.migrations))
+	for i, m := range r.migrations {
+		ids[i] = m.ID
+	}
+	return ids
 }
 
 func (r *MigrationRunner) Backup(ctx context.Context) (string, error) {
@@ -262,9 +318,6 @@ func readAppliedMigrations(ctx context.Context, conn *sql.Conn) ([]AppliedMigrat
 
 func runMigration(ctx context.Context, conn *sql.Conn, migration EmbeddedMigration, now func() time.Time) error {
 	if usesForeignKeyPragma(migration.SQL) {
-		// SQLite ignores PRAGMA foreign_keys changes inside a transaction, so we
-		// switch the connection setting before the
-		// migration transaction begins, then restore it afterward.
 		previousForeignKeysSetting, err := readForeignKeysSetting(ctx, conn)
 		if err != nil {
 			return fmt.Errorf("Migration failed (%s): read foreign_keys pragma: %w", migration.FileName, err)

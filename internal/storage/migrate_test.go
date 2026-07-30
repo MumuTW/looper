@@ -1014,3 +1014,82 @@ func TestMigration0020BackfillsRunSeqByInsertionOrderWithinTies(t *testing.T) {
 		t.Fatalf("seq for run_post_migration = %d, want 4", postSeq)
 	}
 }
+
+func TestCheckSchemaVersionDetectsUnknownAppliedMigration(t *testing.T) {
+	t.Parallel()
+
+	db := openTestSQLiteDB(t)
+	ctx := context.Background()
+
+	_, err := db.ExecContext(ctx, `
+		CREATE TABLE IF NOT EXISTS schema_migrations (
+			id TEXT PRIMARY KEY,
+			applied_at TEXT NOT NULL
+		);
+		INSERT INTO schema_migrations (id, applied_at) VALUES ('0001_init', '2026-01-01T00:00:00.000Z');
+		INSERT INTO schema_migrations (id, applied_at) VALUES ('0021_future_migration', '2026-07-30T12:00:00.000Z');
+	`)
+	if err != nil {
+		t.Fatalf("setup schema_migrations: %v", err)
+	}
+
+	runner := NewMigrationRunner(db, MigrationRunnerOptions{
+		Migrations: []EmbeddedMigration{
+			{ID: "0001_init", FileName: "0001_init.sql", SQL: "CREATE TABLE widgets (id TEXT PRIMARY KEY);"},
+		},
+		Now: func() time.Time { return time.Date(2026, time.July, 30, 12, 0, 0, 0, time.UTC) },
+	})
+
+	result, err := runner.CheckSchemaVersion(ctx)
+	if err != nil {
+		t.Fatalf("CheckSchemaVersion error = %v", err)
+	}
+
+	if !result.HasUnknownMigrations {
+		t.Fatal("expected HasUnknownMigrations = true")
+	}
+	if len(result.UnknownIDs) != 1 || result.UnknownIDs[0] != "0021_future_migration" {
+		t.Fatalf("UnknownIDs = %v, want [0021_future_migration]", result.UnknownIDs)
+	}
+	if result.HasPendingMigrations {
+		t.Fatal("expected HasPendingMigrations = false (0001_init is applied and known)")
+	}
+}
+
+func TestCheckSchemaVersionCleanWhenAllKnown(t *testing.T) {
+	t.Parallel()
+
+	db := openTestSQLiteDB(t)
+	ctx := context.Background()
+
+	_, err := db.ExecContext(ctx, `
+		CREATE TABLE IF NOT EXISTS schema_migrations (
+			id TEXT PRIMARY KEY,
+			applied_at TEXT NOT NULL
+		);
+	`)
+	if err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+
+	runner := NewMigrationRunner(db, MigrationRunnerOptions{
+		Migrations: []EmbeddedMigration{
+			{ID: "0001_init", FileName: "0001_init.sql", SQL: "CREATE TABLE widgets (id TEXT PRIMARY KEY);"},
+		},
+	})
+
+	result, err := runner.CheckSchemaVersion(ctx)
+	if err != nil {
+		t.Fatalf("CheckSchemaVersion error = %v", err)
+	}
+
+	if result.HasUnknownMigrations {
+		t.Fatal("expected HasUnknownMigrations = false")
+	}
+	if !result.HasPendingMigrations {
+		t.Fatal("expected HasPendingMigrations = true (0001_init not applied)")
+	}
+	if len(result.PendingIDs) != 1 || result.PendingIDs[0] != "0001_init" {
+		t.Fatalf("PendingIDs = %v, want [0001_init]", result.PendingIDs)
+	}
+}
