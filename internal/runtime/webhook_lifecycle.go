@@ -97,21 +97,37 @@ func webhookForwarderLockPath(cfgStorageDBPath string) string {
 // held by every daemon while it is attached to a SQLite database. Unlike the
 // webhook forwarder lock, this lock is acquired unconditionally on boot so that
 // only one daemon at a time can be attached to a given database. That prevents
-// the mixed-version interleaving where an older daemon passes the boot
-// compatibility check and then a newer daemon applies an additional migration
-// while the older process is still active against the changing schema: the
-// newer daemon cannot acquire this lock (and therefore cannot boot or migrate)
-// until the older daemon stops and releases it.
+// two daemons that both implement this lock from racing the same schema: a
+// second daemon cannot acquire this lock (and therefore cannot boot or migrate)
+// until the first stops and releases it.
+//
+// Cross-version scope (this lock is new in this change): it coordinates only
+// daemons that both acquire it. A release predating this lock never opens it,
+// so acquiring it proves nothing about whether such a release is still
+// attached — the lock cannot prevent a pre-lock release from remaining active
+// while a newer daemon migrates. There is no database-lifetime lifecycle
+// signal that preceding releases already honor (they open SQLite in WAL mode,
+// which permits concurrent readers, and only take the webhook forwarder lock
+// when webhooks are enabled). The cross-version contract for a rollout from a
+// pre-lock release is therefore operational, not lock-enforced: stop the old
+// daemon completely before starting the new one (no overlap). ValidateCompatibility
+// remains the authority for the downgrade direction (old binary vs. newer
+// schema); this lock is the authority for new-daemon-vs-new-daemon attachment.
+//
+// The lock filename is derived from a canonical identity of the database path
+// (see attachLockFileName) so two independent daemons using different databases
+// in the same directory — e.g. /srv/a.sqlite and /srv/b.sqlite — get distinct
+// lock files instead of colliding on a single parent-directory lock.
 //
 // Trade-off analysis (AGENTS.md "New concepts require an explicit trade-off"):
 //
-//   - Concrete failure prevented: during a live mixed-version rollout an older
-//     daemon can read a fully known migration set and pass ValidateCompatibility,
-//     after which a newer daemon applies its additional migration while the
-//     older process remains active against the changed schema. An exclusive
-//     database-lifetime attach lock makes that interleaving impossible — the
-//     newer daemon cannot attach (and so cannot migrate) until the older one
-//     detaches.
+//   - Concrete failure prevented: two daemons that both implement this lock and
+//     share one database can no longer run at the same time. Without it, a
+//     daemon that passes the point-in-time ValidateCompatibility check can have
+//     a concurrent daemon apply an additional migration while it remains active
+//     against the changing schema. The attach lock makes that new-vs-new
+//     interleaving impossible — the second daemon cannot attach (and so cannot
+//     migrate) until the first detaches.
 //
 //   - Costs / new failure modes:
 //
@@ -126,6 +142,12 @@ func webhookForwarderLockPath(cfgStorageDBPath string) string {
 //     kernel-managed and auto-released when the holder process exits, so a
 //     crashed daemon never leaves a stale lock; a rolling update must wait for
 //     the previous daemon to stop before the new one can start (no overlap).
+//
+//   - The lock cannot see pre-lock releases (see "Cross-version scope" above),
+//     so it does not by itself make a mixed-version rollout with a pre-lock
+//     binary safe. That is an inherent limit of introducing a new lock: only
+//     daemons that take it are coordinated. The cost is a documented boundary,
+//     not a silent overclaim.
 //
 //   - The looper CLI does not open the storage database, so this lock never
 //     blocks CLI commands run against a live daemon.
@@ -144,7 +166,34 @@ func webhookForwarderLockPath(cfgStorageDBPath string) string {
 // The authority for refusing a second attach is the running daemon's
 // database-lifetime hold on this lock, not agent output or schema inference.
 func databaseAttachLockPath(cfgStorageDBPath string) string {
-	return daemonLockPath(cfgStorageDBPath, "looperd.attach.lock")
+	return daemonLockPath(cfgStorageDBPath, attachLockFileName(cfgStorageDBPath))
+}
+
+// attachLockFileName derives the attach-lock filename from a canonical identity
+// of the database path so two independent daemons using different databases in
+// the same directory (e.g. /srv/a.sqlite and /srv/b.sqlite) get distinct lock
+// files. Keying only by the parent directory — as a fixed "looperd.attach.lock"
+// name would — collides both daemons into one lock and rejects the second even
+// though it cannot race the first daemon's schema. The identity is a short hash
+// of the absolute, slash-normalized database path; the lock file content still
+// records pid/daemon_id/started for operability.
+func attachLockFileName(cfgStorageDBPath string) string {
+	return "looperd.attach." + canonicalDatabaseIdentity(cfgStorageDBPath) + ".lock"
+}
+
+// canonicalDatabaseIdentity returns a stable short identifier for a database
+// path. Empty paths default to the conventional looper.sqlite so a daemon with
+// no explicit DBPath still gets a deterministic, distinct lock.
+func canonicalDatabaseIdentity(cfgStorageDBPath string) string {
+	dbPath := strings.TrimSpace(cfgStorageDBPath)
+	if dbPath == "" {
+		dbPath = "looper.sqlite"
+	}
+	if absPath, err := filepath.Abs(dbPath); err == nil {
+		dbPath = absPath
+	}
+	sum := sha256.Sum256([]byte(filepath.ToSlash(dbPath)))
+	return hex.EncodeToString(sum[:8])
 }
 
 func daemonLockPath(cfgStorageDBPath, name string) string {

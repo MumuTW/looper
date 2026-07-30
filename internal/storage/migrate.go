@@ -247,8 +247,20 @@ func (r *MigrationRunner) ValidateCompatibility(ctx context.Context) error {
 	}
 	defer conn.Close()
 
-	if err := ensureSchemaMigrationsTable(ctx, conn); err != nil {
+	// Compatibility validation must be read-only. When migration application
+	// is disabled (package.autoMigrateOnStartup=false) and the database has not
+	// been migrated yet, schema_migrations does not exist; creating it here
+	// would mutate the schema on every boot despite migration being disabled.
+	// Treat an absent table as an empty applied set (nothing unknown →
+	// compatible) so this path never performs DDL. Table creation remains the
+	// responsibility of RunPending/Status, which legitimately manage the
+	// migration ledger.
+	exists, err := schemaMigrationsTableExists(ctx, conn)
+	if err != nil {
 		return err
+	}
+	if !exists {
+		return nil
 	}
 
 	applied, err := readAppliedMigrations(ctx, conn)
@@ -257,6 +269,21 @@ func (r *MigrationRunner) ValidateCompatibility(ctx context.Context) error {
 	}
 
 	return assertAppliedMigrationsKnown(applied, r.migrations)
+}
+
+// schemaMigrationsTableExists reports whether the schema_migrations ledger
+// table is present, without creating it. Used by the read-only compatibility
+// validation path so it never performs DDL.
+func schemaMigrationsTableExists(ctx context.Context, conn *sql.Conn) (bool, error) {
+	var name string
+	err := conn.QueryRowContext(ctx, `SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations' LIMIT 1`).Scan(&name)
+	if err == nil {
+		return true, nil
+	}
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	return false, fmt.Errorf("check schema_migrations table: %w", err)
 }
 
 // assertAppliedMigrationsKnown returns an error naming every applied migration

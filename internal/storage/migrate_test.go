@@ -1046,6 +1046,47 @@ func TestMigrationRunnerValidateCompatibilityAcceptsFreshDatabase(t *testing.T) 
 	}
 }
 
+// TestMigrationRunnerValidateCompatibilityDoesNotCreateSchemaMigrationsTable
+// covers the read-only contract of the compatibility validation path: when the
+// database has not been migrated yet (no schema_migrations table), validating
+// compatibility must not perform DDL. This matters when
+// package.autoMigrateOnStartup=false, where every boot runs
+// ValidateCompatibility but must not mutate the schema. An absent ledger is
+// treated as an empty applied set (nothing unknown → compatible), not created.
+func TestMigrationRunnerValidateCompatibilityDoesNotCreateSchemaMigrationsTable(t *testing.T) {
+	t.Parallel()
+
+	db := openTestSQLiteDB(t)
+	ctx := context.Background()
+	runner := NewMigrationRunner(db, MigrationRunnerOptions{
+		Migrations: []EmbeddedMigration{
+			{ID: "0001_init", FileName: "0001_init.sql", SQL: "CREATE TABLE widgets (id TEXT PRIMARY KEY);"},
+		},
+	})
+
+	if err := runner.ValidateCompatibility(ctx); err != nil {
+		t.Fatalf("runner.ValidateCompatibility() on fresh database error = %v, want nil", err)
+	}
+
+	var name string
+	err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations' LIMIT 1`).Scan(&name)
+	if err == nil {
+		t.Fatalf("schema_migrations table exists after ValidateCompatibility (%q), want the validation path to be read-only and not create it", name)
+	}
+	if err != sql.ErrNoRows {
+		t.Fatalf("sqlite_master lookup for schema_migrations error = %v, want sql.ErrNoRows", err)
+	}
+
+	// Repeated validation must remain read-only and stable across boots.
+	if err := runner.ValidateCompatibility(ctx); err != nil {
+		t.Fatalf("second runner.ValidateCompatibility() error = %v, want nil", err)
+	}
+	err = db.QueryRow(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations' LIMIT 1`).Scan(&name)
+	if err != sql.ErrNoRows {
+		t.Fatalf("second lookup error = %v, want sql.ErrNoRows (table still must not exist)", err)
+	}
+}
+
 func TestMigrationRunnerListsEveryUnknownAppliedMigration(t *testing.T) {
 	t.Parallel()
 

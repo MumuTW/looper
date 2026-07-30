@@ -4836,13 +4836,16 @@ func TestRuntimeStartValidatesSchemaCompatibilityWhenAutoMigrationDisabled(t *te
 }
 
 // TestRuntimeStartBlocksConcurrentDaemonFromMigratingSharedDatabase covers the
-// mixed-version interleaving: an older daemon (A) holds the database-lifetime
-// attach lock after booting, so a newer daemon (B) cannot attach — and therefore
-// cannot apply its additional migration — while A is still active. Once A stops
-// and releases the lock, B boots and applies its extra migration. This proves
-// the attach lock coordinates schema versions across concurrently running
-// daemons instead of leaving the boot compatibility check as a point-in-time
-// gate that a concurrent migration can race past.
+// new-vs-new concurrent-daemon interleaving: a daemon (A) that implements the
+// database-lifetime attach lock holds it after booting, so a second daemon (B)
+// that also implements the lock cannot attach — and therefore cannot apply its
+// additional migration — while A is still active. Once A stops and releases the
+// lock, B boots and applies its extra migration. This proves the attach lock
+// coordinates schema versions across concurrently running daemons that both
+// honor it, instead of leaving the boot compatibility check as a point-in-time
+// gate that a concurrent migration can race past. The pre-lock-release boundary
+// (a release predating this lock never acquires it) is covered separately by
+// TestRuntimeAttachLockDoesNotBlockPreLockAttachment.
 func TestRuntimeStartBlocksConcurrentDaemonFromMigratingSharedDatabase(t *testing.T) {
 	t.Parallel()
 
@@ -4870,8 +4873,8 @@ func TestRuntimeStartBlocksConcurrentDaemonFromMigratingSharedDatabase(t *testin
 		return cfg, nil
 	}
 
-	// Daemon A: older binary, current manifest only. Boot it and let it hold the
-	// attach lock against the shared database.
+	// Daemon A: current manifest only. Boot it and let it hold the attach lock
+	// against the shared database.
 	cfgA, err := baseConfig()
 	if err != nil {
 		t.Fatalf("baseConfig() A error = %v", err)
@@ -4886,9 +4889,8 @@ func TestRuntimeStartBlocksConcurrentDaemonFromMigratingSharedDatabase(t *testin
 	}
 	t.Cleanup(func() { daemonA.Stop("test cleanup") })
 
-	// Daemon B: newer binary with the extra migration. It must not be able to
-	// boot (and therefore cannot apply its extra migration) while A holds the
-	// attach lock.
+	// Daemon B: extra migration. It must not be able to boot (and therefore
+	// cannot apply its extra migration) while A holds the attach lock.
 	cfgB, err := baseConfig()
 	if err != nil {
 		t.Fatalf("baseConfig() B error = %v", err)
@@ -4907,8 +4909,10 @@ func TestRuntimeStartBlocksConcurrentDaemonFromMigratingSharedDatabase(t *testin
 		daemonB.Stop("test cleanup")
 		t.Fatal("daemonB.Start() while daemonA holds the attach lock = nil, want attach-lock error")
 	}
-	if !strings.Contains(bErr.Error(), "looperd.attach.lock") {
-		t.Fatalf("daemonB.Start() error = %q, want it to reference the attach lock", bErr)
+	// The attach-lock filename is now derived per database (looperd.attach.<id>.lock),
+	// so assert on the stable prefix rather than a fixed filename.
+	if !strings.Contains(bErr.Error(), "looperd.attach.") || !strings.Contains(bErr.Error(), ".lock") {
+		t.Fatalf("daemonB.Start() error = %q, want it to reference the per-database attach lock", bErr)
 	}
 
 	// The extra migration must not have been applied while A was attached: B
@@ -4917,8 +4921,8 @@ func TestRuntimeStartBlocksConcurrentDaemonFromMigratingSharedDatabase(t *testin
 		t.Fatal("coord_interleave_marker table exists while daemonA still holds the attach lock, want the newer migration to be blocked")
 	}
 
-	// A stops and releases the attach lock. Now the newer daemon can boot and
-	// apply its extra migration.
+	// A stops and releases the attach lock (after closing storage). Now the
+	// newer daemon can boot and apply its extra migration.
 	daemonA.Stop("older daemon rolling away")
 
 	cfgC, err := baseConfig()
@@ -4956,6 +4960,99 @@ func tableExists(t *testing.T, dbPath, tableName string) bool {
 		t.Fatalf("SELECT sqlite_master for %q error = %v", tableName, err)
 	}
 	return count > 0
+}
+
+// TestDatabaseAttachLockPathDerivedPerDatabase covers the attach-lock naming
+// contract: two independent daemons using different databases in the same
+// directory must get distinct lock files so the second is not rejected for
+// racing a schema it cannot reach. Keying only by the parent directory would
+// collide both into one lock file.
+func TestDatabaseAttachLockPathDerivedPerDatabase(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	pathA := databaseAttachLockPath(filepath.Join(dir, "a.sqlite"))
+	pathB := databaseAttachLockPath(filepath.Join(dir, "b.sqlite"))
+	if pathA == pathB {
+		t.Fatalf("attach lock paths for different databases collide: %q == %q", pathA, pathB)
+	}
+	if filepath.Dir(pathA) != dir {
+		t.Fatalf("attach lock for %q lives in %q, want %q", "a.sqlite", filepath.Dir(pathA), dir)
+	}
+	if filepath.Dir(pathB) != dir {
+		t.Fatalf("attach lock for %q lives in %q, want %q", "b.sqlite", filepath.Dir(pathB), dir)
+	}
+	// Same database must resolve to the same lock path deterministically.
+	if databaseAttachLockPath(filepath.Join(dir, "a.sqlite")) != pathA {
+		t.Fatal("attach lock path for the same database is not deterministic")
+	}
+	// The webhook forwarder lock is intentionally still keyed by directory only
+	// (it predates this change and has rollout-stable naming); it must collide
+	// for the two databases, confirming the attach lock is the one that diverged.
+	if webhookForwarderLockPath(filepath.Join(dir, "a.sqlite")) != webhookForwarderLockPath(filepath.Join(dir, "b.sqlite")) {
+		t.Fatal("webhook forwarder lock path diverged for different databases; it is intentionally directory-keyed")
+	}
+}
+
+// TestRuntimeAttachLockDoesNotBlockPreLockAttachment covers the documented
+// cross-version boundary of the attach lock: a release predating this lock
+// never acquires it, so an attachment that does not take the lock (simulated
+// here by opening the SQLite database directly, the way a pre-lock binary
+// would) does NOT block a newer daemon from booting and migrating. This makes
+// the lock's scope explicit and tested rather than overclaimed: the lock
+// coordinates new-vs-new daemons only, and a rolling update from a pre-lock
+// release must stop the old daemon before starting the new one (operational,
+// not lock-enforced). ValidateCompatibility remains the downgrade authority.
+func TestRuntimeAttachLockDoesNotBlockPreLockAttachment(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	dbPath := filepath.Join(workingDir, "shared.sqlite")
+	backupDir := filepath.Join(workingDir, "backups")
+
+	// Simulate a pre-lock release: open the database directly without taking the
+	// attach lock, and keep the connection open for the whole test.
+	preLockDB, err := storage.OpenSQLiteDB(context.Background(), dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLiteDB pre-lock attachment error = %v", err)
+	}
+	defer preLockDB.Close()
+
+	extraMigration := storage.EmbeddedMigration{
+		ID:       "9999_prelock_boundary",
+		FileName: "9999_prelock_boundary.sql",
+		SQL:      "CREATE TABLE prelock_boundary_marker (id TEXT PRIMARY KEY);",
+	}
+	newerManifest := append(append([]storage.EmbeddedMigration{}, storage.EmbeddedMigrations...), extraMigration)
+
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Storage.DBPath = dbPath
+	cfg.Storage.BackupDir = &backupDir
+	cfg.Package.AutoMigrateOnStartup = true
+
+	daemon := New(Options{
+		Config:           cfg,
+		Logger:           &testLogger{},
+		RunSchedulerTick: func(context.Context, Services) error { return nil },
+		OpenSQLiteCoordinator: func(ctx context.Context, p string, options storage.SQLiteCoordinatorOptions) (*storage.SQLiteCoordinator, error) {
+			options.Migrations = newerManifest
+			return storage.OpenSQLiteCoordinator(ctx, p, options)
+		},
+	})
+	// The newer daemon boots and migrates despite the pre-lock attachment being
+	// open, because that attachment holds no attach lock. This is the documented
+	// boundary, not a guarantee the lock can close.
+	if err := daemon.Start(context.Background()); err != nil {
+		t.Fatalf("daemon.Start() with pre-lock attachment open = %v, want boot to succeed (attach lock cannot see pre-lock releases)", err)
+	}
+	t.Cleanup(func() { daemon.Stop("test cleanup") })
+
+	if !tableExists(t, dbPath, "prelock_boundary_marker") {
+		t.Fatal("prelock_boundary_marker table missing, want the newer daemon to migrate despite the pre-lock attachment")
+	}
 }
 
 type testLogger struct {
