@@ -11,6 +11,7 @@ import (
 	"github.com/nexu-io/looper/internal/disclosure"
 	"github.com/nexu-io/looper/internal/e2e/harness"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
+	"github.com/nexu-io/looper/internal/labels"
 	"github.com/nexu-io/looper/internal/reviewer/criteria"
 	"github.com/nexu-io/looper/internal/storage"
 )
@@ -80,7 +81,7 @@ func TestReviewerAutoMergeHappyPathWithFakeGH(t *testing.T) {
 		},
 		CurrentUserLogin: "reviewer",
 		PullRequests: map[string]harness.GHPullRequest{
-			"acme/looper#42": {Number: 42, Repo: "acme/looper", Title: "Review me", Body: "Implements feature.\n\nCloses #358", State: "OPEN", Labels: []string{"looper:worker-ready"}, HeadRefName: "feature/review-me", BaseRefName: "main", HeadSHA: "abc123", BaseSHA: "base123", Author: "octocat", ReviewRequests: []string{"reviewer"}},
+			"acme/looper#42": {Number: 42, Repo: "acme/looper", Title: "Review me", Body: "Implements feature.\n\nCloses #358", State: "OPEN", Labels: []string{labels.DefaultWorkerReadyTrigger}, HeadRefName: "feature/review-me", BaseRefName: "main", HeadSHA: "abc123", BaseSHA: "base123", Author: "octocat", ReviewRequests: []string{"reviewer"}},
 		},
 	})
 
@@ -145,7 +146,7 @@ func TestReviewerAutoMergeCriteriaFailWithFakeGH(t *testing.T) {
 		},
 		CurrentUserLogin: "reviewer",
 		PullRequests: map[string]harness.GHPullRequest{
-			"acme/looper#42": {Number: 42, Repo: "acme/looper", Title: "Review me", Body: "Implements feature.\n\nCloses #358", State: "OPEN", Labels: []string{"looper:worker-ready"}, HeadRefName: "feature/review-me", BaseRefName: "main", HeadSHA: "abc123", BaseSHA: "base123", Author: "octocat", ReviewRequests: []string{"reviewer"}},
+			"acme/looper#42": {Number: 42, Repo: "acme/looper", Title: "Review me", Body: "Implements feature.\n\nCloses #358", State: "OPEN", Labels: []string{labels.DefaultWorkerReadyTrigger}, HeadRefName: "feature/review-me", BaseRefName: "main", HeadSHA: "abc123", BaseSHA: "base123", Author: "octocat", ReviewRequests: []string{"reviewer"}},
 		},
 	})
 

@@ -6,10 +6,12 @@ import (
 	"errors"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
+	"github.com/nexu-io/looper/internal/labels"
 	"github.com/nexu-io/looper/internal/storage"
 )
 
@@ -149,7 +151,7 @@ func TestEvaluatePullRequestBlocksEachSafetyCondition(t *testing.T) {
 		{
 			name: "global hold",
 			mutate: func(f *gatekeeperFixture) {
-				f.github.detail.Labels = []string{"looper:hold"}
+				f.github.detail.Labels = []string{labels.HoldGlobal}
 			},
 			want: []ReasonCode{ReasonHold},
 		},
@@ -158,7 +160,7 @@ func TestEvaluatePullRequestBlocksEachSafetyCondition(t *testing.T) {
 			// while a human veto is in force.
 			name: "global hold despite case and padding",
 			mutate: func(f *gatekeeperFixture) {
-				f.github.detail.Labels = []string{" Looper:Hold "}
+				f.github.detail.Labels = []string{" " + strings.Title(labels.HoldGlobal) + " "}
 			},
 			want: []ReasonCode{ReasonHold},
 		},

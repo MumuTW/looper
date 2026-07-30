@@ -13,6 +13,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/nexu-io/looper/internal/labels"
 )
 
 func TestLoadFileUsesDefaultsWhenConfigMissing(t *testing.T) {
@@ -285,10 +287,10 @@ func TestRoleDefaultsMirrorCurrentDiscoveryPolicy(t *testing.T) {
 		t.Fatalf("agent timeout defaults = %#v", got)
 	}
 
-	if got := cfg.Roles.Planner; !got.AutoDiscovery || got.Triggers.LabelMode != LabelModeAll || !got.Triggers.RequireAssigneeCurrentUser || !reflectStringSlicesEqual(got.Triggers.Labels, []string{"looper:plan"}) {
+	if got := cfg.Roles.Planner; !got.AutoDiscovery || got.Triggers.LabelMode != LabelModeAll || !got.Triggers.RequireAssigneeCurrentUser || !reflectStringSlicesEqual(got.Triggers.Labels, []string{labels.DefaultPlanTrigger}) {
 		t.Fatalf("planner role defaults = %#v", got)
 	}
-	if got := cfg.Roles.Reviewer; !got.Discovery.AutoDiscovery || got.Discovery.Triggers.IncludeDrafts || !got.Discovery.Triggers.RequireReviewRequest || got.Discovery.Triggers.LabelMode != LabelModeAll || len(got.Discovery.Triggers.Labels) != 0 || !got.Discovery.SpecReview.IncludeReviewingLabel || got.Discovery.SpecReview.ReviewingLabel != "looper:spec-reviewing" {
+	if got := cfg.Roles.Reviewer; !got.Discovery.AutoDiscovery || got.Discovery.Triggers.IncludeDrafts || !got.Discovery.Triggers.RequireReviewRequest || got.Discovery.Triggers.LabelMode != LabelModeAll || len(got.Discovery.Triggers.Labels) != 0 || !got.Discovery.SpecReview.IncludeReviewingLabel || got.Discovery.SpecReview.ReviewingLabel != labels.SpecReviewing {
 		t.Fatalf("reviewer role defaults = %#v", got)
 	}
 	if got := cfg.Roles.Reviewer.Behavior.ReviewEvents.Clean; got != ReviewerReviewEventApprove {
@@ -306,7 +308,7 @@ func TestRoleDefaultsMirrorCurrentDiscoveryPolicy(t *testing.T) {
 	if got := cfg.Roles.Fixer; !got.AutoDiscovery || got.Triggers.IncludeDrafts || got.Triggers.AuthorFilter != FixerAuthorFilterCurrentUser || got.Triggers.LabelMode != LabelModeAll || len(got.Triggers.Labels) != 0 {
 		t.Fatalf("fixer role defaults = %#v", got)
 	}
-	if got := cfg.Roles.Worker; !got.AutoDiscovery || got.Triggers.LabelMode != LabelModeAll || !got.Triggers.RequireAssigneeCurrentUser || !reflectStringSlicesEqual(got.Triggers.Labels, []string{"looper:worker-ready"}) {
+	if got := cfg.Roles.Worker; !got.AutoDiscovery || got.Triggers.LabelMode != LabelModeAll || !got.Triggers.RequireAssigneeCurrentUser || !reflectStringSlicesEqual(got.Triggers.Labels, []string{labels.DefaultWorkerReadyTrigger}) {
 		t.Fatalf("worker role defaults = %#v", got)
 	}
 	if got := cfg.Roles.Reviewer.Behavior.Loop.MaxWallClockSeconds; got != 0 {

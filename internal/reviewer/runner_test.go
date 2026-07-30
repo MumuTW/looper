@@ -18,6 +18,7 @@ import (
 	"github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/nexu-io/looper/internal/labels"
 	"github.com/nexu-io/looper/internal/loops/failureclass"
+	"github.com/nexu-io/looper/internal/network/protocol"
 	"github.com/nexu-io/looper/internal/networkpolicy"
 	"github.com/nexu-io/looper/internal/reviewer/automerge"
 	"github.com/nexu-io/looper/internal/reviewer/criteria"
@@ -285,7 +286,7 @@ func TestDiscoverPullRequestSkipsIneligiblePullRequest(t *testing.T) {
 func TestDiscoverPullRequestRoutedModeRefreshesCurrentLoginBeforeSelfAuthoredCheck(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{author: "new-user", currentLogin: "new-user", labels: []string{"looper:target:red"}, reviewRequests: []string{"stale-user"}, reviewRequestUsers: []networkpolicy.GitHubUser{{Login: "new-user", ID: 42}}}
+	github := &fakeGitHubGateway{author: "new-user", currentLogin: "new-user", labels: []string{protocol.TargetLabelForNode("red")}, reviewRequests: []string{"stale-user"}, reviewRequestUsers: []networkpolicy.GitHubUser{{Login: "new-user", ID: 42}}}
 	cfg, err := config.DefaultConfig(t.TempDir())
 	if err != nil {
 		t.Fatalf("DefaultConfig() error = %v", err)
@@ -309,7 +310,7 @@ func TestDiscoverPullRequestRoutedModeRefreshesCurrentLoginBeforeSelfAuthoredChe
 func TestDiscoverPullRequestRoutedModeRequiresMatchingTargetLabel(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{currentLogin: "reviewer", reviewRequests: []string{"reviewer"}, labels: []string{"looper:target:blue"}}
+	github := &fakeGitHubGateway{currentLogin: "reviewer", reviewRequests: []string{"reviewer"}, labels: []string{protocol.TargetLabelForNode("blue")}}
 	cfg := config.Config{Network: config.NetworkConfig{NodeName: "red", GitHubLogin: "reviewer", GitHubUserID: 42}, Projects: []config.ProjectRefConfig{{ID: "project_1", Network: config.ProjectNetworkConfig{Mode: config.NetworkModeRouted}}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true}, CustomInstructions: &cfg})
 
@@ -325,7 +326,7 @@ func TestDiscoverPullRequestRoutedModeRequiresMatchingTargetLabel(t *testing.T) 
 func TestDiscoverPullRequestRoutedModeAllowsUnknownReviewRequestUsers(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{currentLogin: "reviewer", labels: []string{"looper:target:red"}, reviewRequestsUnknown: true}
+	github := &fakeGitHubGateway{currentLogin: "reviewer", labels: []string{protocol.TargetLabelForNode("red")}, reviewRequestsUnknown: true}
 	autoDiscovery := true
 	cfg := config.Config{Network: config.NetworkConfig{NodeName: "red", GitHubLogin: "reviewer", GitHubUserID: 42}, Projects: []config.ProjectRefConfig{{ID: "project_1", Network: config.ProjectNetworkConfig{Mode: config.NetworkModeRouted}, Roles: &config.PartialRoleConfigs{Reviewer: &config.PartialReviewerRoleConfig{Discovery: &config.PartialReviewerRoleDiscoveryConfig{AutoDiscovery: &autoDiscovery}}}}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true}, CustomInstructions: &cfg})
@@ -345,7 +346,7 @@ func TestDiscoverPullRequestsRoutedModeSelfReviewLoginRefreshFailureSkipsWithout
 	autoDiscovery := true
 	enableSelfReview := true
 	requireReviewRequest := false
-	github := &fakeGitHubGateway{author: "new-user", currentLoginErr: fmt.Errorf("gh auth failed"), labels: []string{"looper:target:red"}, reviewRequests: []string{}, reviewRequestUsers: []networkpolicy.GitHubUser{}}
+	github := &fakeGitHubGateway{author: "new-user", currentLoginErr: fmt.Errorf("gh auth failed"), labels: []string{protocol.TargetLabelForNode("red")}, reviewRequests: []string{}, reviewRequestUsers: []networkpolicy.GitHubUser{}}
 	cfg := config.Config{
 		Network: config.NetworkConfig{NodeName: "red", GitHubLogin: "stale-user", GitHubUserID: 42},
 		Projects: []config.ProjectRefConfig{{
@@ -373,7 +374,7 @@ func TestRunFilterStepSkipsRoutedPullRequestWhenReviewRequestRemoved(t *testing.
 	fixture := newRunnerFixture(t)
 	cfg := config.Config{Network: config.NetworkConfig{NodeName: "red", GitHubLogin: "reviewer", GitHubUserID: 42}, Projects: []config.ProjectRefConfig{{ID: "project_1", Network: config.ProjectNetworkConfig{Mode: config.NetworkModeRouted}}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{currentLogin: "reviewer"}, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, CustomInstructions: &cfg})
-	checkpoint, err := runner.runFilterStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repo"}, Repo: "acme/looper", PRNumber: 42, Checkpoint: reviewerCheckpoint{Detail: &checkpointDetail{State: "OPEN", HeadSHA: "abc123", Labels: []string{"looper:target:red"}, ReviewRequests: []string{}, ReviewRequestUsers: []networkpolicy.GitHubUser{}}}})
+	checkpoint, err := runner.runFilterStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repo"}, Repo: "acme/looper", PRNumber: 42, Checkpoint: reviewerCheckpoint{Detail: &checkpointDetail{State: "OPEN", HeadSHA: "abc123", Labels: []string{protocol.TargetLabelForNode("red")}, ReviewRequests: []string{}, ReviewRequestUsers: []networkpolicy.GitHubUser{}}}})
 	if err != nil {
 		t.Fatalf("runFilterStep() error = %v", err)
 	}
@@ -387,7 +388,7 @@ func TestRunFilterStepAllowsRoutedPullRequestWhenReviewRequestUsersUnknown(t *te
 	fixture := newRunnerFixture(t)
 	cfg := config.Config{Network: config.NetworkConfig{NodeName: "red", GitHubLogin: "reviewer", GitHubUserID: 42}, Projects: []config.ProjectRefConfig{{ID: "project_1", Network: config.ProjectNetworkConfig{Mode: config.NetworkModeRouted}}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{currentLogin: "reviewer"}, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, CustomInstructions: &cfg})
-	checkpoint, err := runner.runFilterStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repo"}, Repo: "acme/looper", PRNumber: 42, Checkpoint: reviewerCheckpoint{Detail: &checkpointDetail{State: "OPEN", HeadSHA: "abc123", Labels: []string{"looper:target:red"}, ReviewRequests: nil, ReviewRequestUsers: nil}}})
+	checkpoint, err := runner.runFilterStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repo"}, Repo: "acme/looper", PRNumber: 42, Checkpoint: reviewerCheckpoint{Detail: &checkpointDetail{State: "OPEN", HeadSHA: "abc123", Labels: []string{protocol.TargetLabelForNode("red")}, ReviewRequests: nil, ReviewRequestUsers: nil}}})
 	if err != nil {
 		t.Fatalf("runFilterStep() error = %v", err)
 	}
@@ -410,7 +411,7 @@ func TestRunFilterStepAllowsRoutedSelfReviewWithoutReviewRequest(t *testing.T) {
 		}},
 	}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{currentLogin: "reviewer"}, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, CustomInstructions: &cfg})
-	checkpoint, err := runner.runFilterStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repo"}, Repo: "acme/looper", PRNumber: 42, Checkpoint: reviewerCheckpoint{Detail: &checkpointDetail{State: "OPEN", Author: "reviewer", HeadSHA: "abc123", Labels: []string{"looper:target:red"}, ReviewRequests: []string{}, ReviewRequestUsers: []networkpolicy.GitHubUser{}}}})
+	checkpoint, err := runner.runFilterStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repo"}, Repo: "acme/looper", PRNumber: 42, Checkpoint: reviewerCheckpoint{Detail: &checkpointDetail{State: "OPEN", Author: "reviewer", HeadSHA: "abc123", Labels: []string{protocol.TargetLabelForNode("red")}, ReviewRequests: []string{}, ReviewRequestUsers: []networkpolicy.GitHubUser{}}}})
 	if err != nil {
 		t.Fatalf("runFilterStep() error = %v", err)
 	}
@@ -434,7 +435,7 @@ func TestRunFilterStepSkipsRoutedSelfReviewWhenLoginRefreshFails(t *testing.T) {
 		}},
 	}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, CustomInstructions: &cfg})
-	checkpoint, err := runner.runFilterStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repo"}, Repo: "acme/looper", PRNumber: 42, Checkpoint: reviewerCheckpoint{Detail: &checkpointDetail{State: "OPEN", Author: "reviewer", HeadSHA: "abc123", Labels: []string{"looper:target:red"}, ReviewRequests: []string{}, ReviewRequestUsers: []networkpolicy.GitHubUser{}}}})
+	checkpoint, err := runner.runFilterStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repo"}, Repo: "acme/looper", PRNumber: 42, Checkpoint: reviewerCheckpoint{Detail: &checkpointDetail{State: "OPEN", Author: "reviewer", HeadSHA: "abc123", Labels: []string{protocol.TargetLabelForNode("red")}, ReviewRequests: []string{}, ReviewRequestUsers: []networkpolicy.GitHubUser{}}}})
 	if err != nil {
 		t.Fatalf("runFilterStep() error = %v", err)
 	}
@@ -474,7 +475,7 @@ func TestRevalidateRoutedReviewerClaimAllowsSelfReviewWithoutReviewRequest(t *te
 	fixture := newRunnerFixture(t)
 	enableSelfReview := true
 	requireReviewRequest := false
-	github := &fakeGitHubGateway{author: "reviewer", currentLogin: "reviewer", labels: []string{"looper:target:red"}, reviewRequestUsers: []networkpolicy.GitHubUser{}}
+	github := &fakeGitHubGateway{author: "reviewer", currentLogin: "reviewer", labels: []string{protocol.TargetLabelForNode("red")}, reviewRequestUsers: []networkpolicy.GitHubUser{}}
 	cfg := config.Config{
 		Network: config.NetworkConfig{NodeName: "red", GitHubLogin: "reviewer", GitHubUserID: 42},
 		Projects: []config.ProjectRefConfig{{
@@ -496,7 +497,7 @@ func TestRevalidateRoutedReviewerClaimAllowsSelfReviewWithoutReviewRequest(t *te
 func TestRevalidateRoutedReviewerClaimAllowsUnknownReviewRequestUsers(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{labels: []string{"looper:target:red"}, reviewRequestsUnknown: true}
+	github := &fakeGitHubGateway{labels: []string{protocol.TargetLabelForNode("red")}, reviewRequestsUnknown: true}
 	cfg := config.Config{
 		Network: config.NetworkConfig{NodeName: "red", GitHubLogin: "reviewer", GitHubUserID: 42},
 		Projects: []config.ProjectRefConfig{{
@@ -522,7 +523,7 @@ func TestRevalidateRoutedReviewerClaimRequiresCurrentIdentityForSelfReviewBypass
 	fixture := newRunnerFixture(t)
 	enableSelfReview := true
 	requireReviewRequest := false
-	github := &fakeGitHubGateway{author: "reviewer", currentLogin: "someone-else", labels: []string{"looper:target:red"}, reviewRequestUsers: []networkpolicy.GitHubUser{}}
+	github := &fakeGitHubGateway{author: "reviewer", currentLogin: "someone-else", labels: []string{protocol.TargetLabelForNode("red")}, reviewRequestUsers: []networkpolicy.GitHubUser{}}
 	cfg := config.Config{
 		Network: config.NetworkConfig{NodeName: "red", GitHubLogin: "reviewer", GitHubUserID: 42},
 		Projects: []config.ProjectRefConfig{{
@@ -547,7 +548,7 @@ func TestRevalidateRoutedReviewerClaimTreatsLoginRefreshFailureAsTransient(t *te
 	fixture := newRunnerFixture(t)
 	enableSelfReview := true
 	requireReviewRequest := false
-	github := &fakeGitHubGateway{author: "reviewer", currentLoginErr: fmt.Errorf("gh auth failed"), labels: []string{"looper:target:red"}, reviewRequestUsers: []networkpolicy.GitHubUser{}}
+	github := &fakeGitHubGateway{author: "reviewer", currentLoginErr: fmt.Errorf("gh auth failed"), labels: []string{protocol.TargetLabelForNode("red")}, reviewRequestUsers: []networkpolicy.GitHubUser{}}
 	cfg := config.Config{
 		Network: config.NetworkConfig{NodeName: "red", GitHubLogin: "reviewer", GitHubUserID: 42},
 		Projects: []config.ProjectRefConfig{{
@@ -646,7 +647,7 @@ func TestProcessClaimedQueueItemRoutedRevalidationFailureDoesNotLeaveRunningRun(
 	requireReviewRequest := false
 	enableSelfReview := true
 	cfg := &config.Config{Network: config.NetworkConfig{NodeName: "red", GitHubLogin: "reviewer", GitHubUserID: 42}, Projects: []config.ProjectRefConfig{{ID: "project_1", RepoPath: t.TempDir(), Network: config.ProjectNetworkConfig{Mode: config.NetworkModeRouted}, Roles: &config.PartialRoleConfigs{Reviewer: &config.PartialReviewerRoleConfig{Discovery: &config.PartialReviewerRoleDiscoveryConfig{AutoDiscovery: &autoDiscovery, Triggers: &config.PartialReviewerRoleTriggersConfig{EnableSelfReview: &enableSelfReview, RequireReviewRequest: &requireReviewRequest}}}}}}}
-	github := &fakeGitHubGateway{author: "reviewer", currentLoginErr: fmt.Errorf("gh auth failed"), labels: []string{"looper:target:red"}, reviewRequestUsers: []networkpolicy.GitHubUser{}}
+	github := &fakeGitHubGateway{author: "reviewer", currentLoginErr: fmt.Errorf("gh auth failed"), labels: []string{protocol.TargetLabelForNode("red")}, reviewRequestUsers: []networkpolicy.GitHubUser{}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true}, CustomInstructions: cfg})
 
 	result, err := runner.ProcessClaimedQueueItem(context.Background(), queue)
@@ -1239,7 +1240,7 @@ func TestDiscoverPullRequestsSkipsSelfAuthoredPullRequestsByDefault(t *testing.T
 func TestDiscoverPullRequestsRoutedModeRefreshesCurrentLoginBeforeSelfAuthoredCheck(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{currentLogin: "new-user", listOpenByLabel: map[string][]PullRequestSummary{"": {{Number: 42, Title: "Self review", State: "OPEN", Author: "new-user", HeadSHA: "abc123", Labels: []string{"looper:target:red"}, ReviewRequests: []string{"stale-user"}, ReviewRequestUsers: []networkpolicy.GitHubUser{{Login: "new-user", ID: 42}}}}}}
+	github := &fakeGitHubGateway{currentLogin: "new-user", listOpenByLabel: map[string][]PullRequestSummary{"": {{Number: 42, Title: "Self review", State: "OPEN", Author: "new-user", HeadSHA: "abc123", Labels: []string{protocol.TargetLabelForNode("red")}, ReviewRequests: []string{"stale-user"}, ReviewRequestUsers: []networkpolicy.GitHubUser{{Login: "new-user", ID: 42}}}}}}
 	cfg, err := config.DefaultConfig(t.TempDir())
 	if err != nil {
 		t.Fatalf("DefaultConfig() error = %v", err)
@@ -1281,7 +1282,7 @@ func TestDiscoverPullRequestsAllowsRoutedSelfAuthoredPullRequestsWhenEnableSelfR
 	fixture := newRunnerFixture(t)
 	enableSelfReview := true
 	requireReviewRequest := false
-	github := &fakeGitHubGateway{currentLogin: "octocat", listOpenByLabel: map[string][]PullRequestSummary{"": {{Number: 42, Title: "Self review", State: "OPEN", Author: "octocat", HeadSHA: "abc123", Labels: []string{"looper:target:red"}, ReviewRequestUsers: []networkpolicy.GitHubUser{}}}}}
+	github := &fakeGitHubGateway{currentLogin: "octocat", listOpenByLabel: map[string][]PullRequestSummary{"": {{Number: 42, Title: "Self review", State: "OPEN", Author: "octocat", HeadSHA: "abc123", Labels: []string{protocol.TargetLabelForNode("red")}, ReviewRequestUsers: []networkpolicy.GitHubUser{}}}}}
 	cfg, err := config.DefaultConfig(t.TempDir())
 	if err != nil {
 		t.Fatalf("DefaultConfig() error = %v", err)
@@ -2310,7 +2311,7 @@ func TestRunFilterStepRoutedModeRefreshesCurrentLoginBeforeSelfAuthoredCheck(t *
 	repo := "acme/looper"
 	prNumber := int64(42)
 
-	checkpoint, err := runner.runFilterStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repos/looper"}, Repo: repo, PRNumber: prNumber, Checkpoint: reviewerCheckpoint{Detail: &checkpointDetail{State: "OPEN", HeadSHA: "abc123", Author: "new-user", Labels: []string{"looper:target:red"}, ReviewRequestUsers: []networkpolicy.GitHubUser{{Login: "new-user", ID: 42}}}}})
+	checkpoint, err := runner.runFilterStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repos/looper"}, Repo: repo, PRNumber: prNumber, Checkpoint: reviewerCheckpoint{Detail: &checkpointDetail{State: "OPEN", HeadSHA: "abc123", Author: "new-user", Labels: []string{protocol.TargetLabelForNode("red")}, ReviewRequestUsers: []networkpolicy.GitHubUser{{Login: "new-user", ID: 42}}}}})
 	if err != nil {
 		t.Fatalf("runFilterStep() error = %v", err)
 	}
@@ -2393,7 +2394,7 @@ func TestRunFilterStepRoutedModeSkipsAlreadyReviewedHeadByCurrentUser(t *testing
 	prNumber := int64(42)
 	reviews := []map[string]any{{"author": map[string]any{"login": "reviewer"}, "state": "COMMENTED", "commit": map[string]any{"oid": "abc123"}}}
 
-	checkpoint, err := runner.runFilterStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repos/looper"}, Repo: repo, PRNumber: prNumber, Checkpoint: reviewerCheckpoint{Detail: &checkpointDetail{State: "OPEN", HeadSHA: "abc123", Author: "octocat", Labels: []string{"looper:target:red"}, ReviewRequestUsers: []networkpolicy.GitHubUser{{Login: "reviewer", ID: 42}}, Reviews: reviews}}})
+	checkpoint, err := runner.runFilterStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repos/looper"}, Repo: repo, PRNumber: prNumber, Checkpoint: reviewerCheckpoint{Detail: &checkpointDetail{State: "OPEN", HeadSHA: "abc123", Author: "octocat", Labels: []string{protocol.TargetLabelForNode("red")}, ReviewRequestUsers: []networkpolicy.GitHubUser{{Login: "reviewer", ID: 42}}, Reviews: reviews}}})
 	if err != nil {
 		t.Fatalf("runFilterStep() error = %v", err)
 	}
@@ -3217,7 +3218,7 @@ func TestReviewerDiscoverySuppressedByLastSkipDoesNotUseCurrentReviewRequestsInR
 		Number:             42,
 		HeadSHA:            "new-head",
 		Author:             "alice",
-		Labels:             []string{"looper:target:red"},
+		Labels:             []string{protocol.TargetLabelForNode("red")},
 		ReviewRequests:     []string{},
 		ReviewRequestUsers: []networkpolicy.GitHubUser{{Login: "bob", ID: 42}},
 	}
@@ -4494,7 +4495,7 @@ func TestProcessClaimedItemAutoMergeApprovesAndEnablesAutoMergeWhenCriteriaPass(
 	github := &fakeGitHubGateway{
 		author:              "octocat",
 		currentLogin:        "reviewer",
-		labels:              []string{"looper:worker-ready"},
+		labels:              []string{labels.DefaultWorkerReadyTrigger},
 		reviewMarkerMissing: true,
 		reviewRequests:      []string{"reviewer"},
 		viewBody:            "Implements feature.\n\nCloses #358",
@@ -4557,7 +4558,7 @@ func TestProcessClaimedItemAutoMergeApprovesAndCommentsWhenAutoMergeRefused(t *t
 	github := &fakeGitHubGateway{
 		author:              "octocat",
 		currentLogin:        "reviewer",
-		labels:              []string{"looper:worker-ready"},
+		labels:              []string{labels.DefaultWorkerReadyTrigger},
 		reviewMarkerMissing: true,
 		reviewRequests:      []string{"reviewer"},
 		viewBody:            "Implements feature.\n\nCloses #358",
@@ -4643,7 +4644,7 @@ func TestProcessClaimedItemAutoMergeCommentsAndRetriagesWhenCriteriaFail(t *test
 	github := &fakeGitHubGateway{
 		author:              "octocat",
 		currentLogin:        "reviewer",
-		labels:              []string{"looper:worker-ready"},
+		labels:              []string{labels.DefaultWorkerReadyTrigger},
 		reviewMarkerMissing: true,
 		reviewRequests:      []string{"reviewer"},
 		viewBody:            "Implements feature.\n\nCloses #358",
@@ -4688,7 +4689,7 @@ func TestProcessClaimedItemSkipsLinkedIssueLabelRemovalWhenReviewerHoldApplied(t
 	github := &fakeGitHubGateway{
 		author:              "octocat",
 		currentLogin:        "reviewer",
-		labels:              []string{"looper:worker-ready"},
+		labels:              []string{labels.DefaultWorkerReadyTrigger},
 		reviewMarkerMissing: true,
 		reviewRequests:      []string{"reviewer"},
 		viewBody:            "Implements feature.\n\nCloses #358",
@@ -4729,7 +4730,7 @@ func TestProcessClaimedItemFallsBackWhenLinkedIssueLookupIsUnavailable(t *testin
 	github := &fakeGitHubGateway{
 		author:              "octocat",
 		currentLogin:        "reviewer",
-		labels:              []string{"looper:worker-ready"},
+		labels:              []string{labels.DefaultWorkerReadyTrigger},
 		reviewMarkerMissing: true,
 		reviewRequests:      []string{"reviewer"},
 		viewBody:            "Implements feature.\n\nCloses owner/private#358",
@@ -4772,7 +4773,7 @@ func TestProcessClaimedItemRetriesWhenLinkedIssueLookupIsTransient(t *testing.T)
 	github := &fakeGitHubGateway{
 		author:              "octocat",
 		currentLogin:        "reviewer",
-		labels:              []string{"looper:worker-ready"},
+		labels:              []string{labels.DefaultWorkerReadyTrigger},
 		reviewMarkerMissing: true,
 		reviewRequests:      []string{"reviewer"},
 		viewBody:            "Implements feature.\n\nCloses #358",
@@ -7859,7 +7860,7 @@ func TestBuildReviewPromptIncludesActionableQualityContract(t *testing.T) {
 		"runner will reconcile the clean-signal +1 reaction and any eligible spec label transition",
 		"review request removed before publish",
 		"PR head changed before publish",
-		"looper:spec-reviewing",
+		labels.SpecReviewing,
 		"Do not add or remove the PR main-conversation +1 reaction yourself",
 		"Review body style contract",
 		"Never post terminal/tool output",

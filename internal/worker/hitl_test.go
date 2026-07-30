@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/nexu-io/looper/internal/labels"
 	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/storage"
 )
@@ -453,7 +454,7 @@ func TestSuspendForHumanDeliversAskToGitHub(t *testing.T) {
 		HITLEnabled: true,
 		// github is the default transport; be explicit for the test's intent.
 		HITLAnswerTransport: "github",
-		HITLGitHub:          HITLGitHubSettings{AwaitingLabel: "looper:awaiting-human", MentionLogins: []string{"lefarcen"}},
+		HITLGitHub:          HITLGitHubSettings{AwaitingLabel: labels.AwaitingHuman, MentionLogins: []string{"lefarcen"}},
 		GitHub:              gh,
 	})
 
@@ -479,7 +480,7 @@ func TestSuspendForHumanDeliversAskToGitHub(t *testing.T) {
 		t.Fatalf("comment body missing marker/question/mention: %s", c.Body)
 	}
 	// Labelled awaiting-human.
-	if len(gh.addLabels) != 1 || len(gh.addLabels[0].Labels) != 1 || gh.addLabels[0].Labels[0] != "looper:awaiting-human" {
+	if len(gh.addLabels) != 1 || len(gh.addLabels[0].Labels) != 1 || gh.addLabels[0].Labels[0] != labels.AwaitingHuman {
 		t.Fatalf("addLabels = %#v, want one looper:awaiting-human on the PR", gh.addLabels)
 	}
 	// Ask metadata records the github correlation.

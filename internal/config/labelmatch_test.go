@@ -1,6 +1,12 @@
 package config
 
-import "testing"
+import (
+	"fmt"
+	"strings"
+	"testing"
+
+	"github.com/nexu-io/looper/internal/labels"
+)
 
 func TestLabelsMatch(t *testing.T) {
 	t.Parallel()
@@ -22,10 +28,10 @@ func TestLabelsMatch(t *testing.T) {
 		// unique case-insensitively, so both sides are normalized. Worker used
 		// to normalize only the observed label and therefore claimed nothing
 		// when a project's config carried a stray space.
-		{name: "configured label with a stray space still matches", itemLabels: []string{"looper:worker-ready"}, required: []string{" looper:worker-ready "}, mode: LabelModeAll, want: true},
-		{name: "observed label with a stray space still matches", itemLabels: []string{" looper:worker-ready "}, required: []string{"looper:worker-ready"}, mode: LabelModeAll, want: true},
-		{name: "case differences still match", itemLabels: []string{"LOOPER:Worker-Ready"}, required: []string{"looper:worker-ready"}, mode: LabelModeAll, want: true},
-		{name: "a different label still does not match", itemLabels: []string{"looper:worker-ready:extra"}, required: []string{"looper:worker-ready"}, mode: LabelModeAll, want: false},
+		{name: "configured label with a stray space still matches", itemLabels: []string{labels.DefaultWorkerReadyTrigger}, required: []string{fmt.Sprintf(" %s ", labels.DefaultWorkerReadyTrigger)}, mode: LabelModeAll, want: true},
+		{name: "observed label with a stray space still matches", itemLabels: []string{fmt.Sprintf(" %s ", labels.DefaultWorkerReadyTrigger)}, required: []string{labels.DefaultWorkerReadyTrigger}, mode: LabelModeAll, want: true},
+		{name: "case differences still match", itemLabels: []string{strings.ToUpper(labels.DefaultWorkerReadyTrigger)}, required: []string{labels.DefaultWorkerReadyTrigger}, mode: LabelModeAll, want: true},
+		{name: "a different label still does not match", itemLabels: []string{labels.DefaultWorkerReadyTrigger + ":extra"}, required: []string{labels.DefaultWorkerReadyTrigger}, mode: LabelModeAll, want: false},
 	}
 
 	for _, test := range tests {

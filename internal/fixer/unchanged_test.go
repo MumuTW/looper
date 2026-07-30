@@ -3,6 +3,8 @@ package fixer
 import (
 	"testing"
 	"time"
+
+	"github.com/nexu-io/looper/internal/labels"
 )
 
 func summaryFixture() PullRequestSummary {
@@ -51,7 +53,7 @@ func TestExaminationFingerprintChangesWithEveryObservableField(t *testing.T) {
 		{name: "updated at", mutate: func(p *PullRequestSummary) { p.UpdatedAt = "2026-07-30T10:00:00Z" }},
 		{name: "state", mutate: func(p *PullRequestSummary) { p.State = "CLOSED" }},
 		{name: "draft", mutate: func(p *PullRequestSummary) { p.IsDraft = true }},
-		{name: "labels", mutate: func(p *PullRequestSummary) { p.Labels = []string{"a", "b", "looper:hold"} }},
+		{name: "labels", mutate: func(p *PullRequestSummary) { p.Labels = []string{"a", "b", labels.HoldGlobal} }},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			t.Parallel()
