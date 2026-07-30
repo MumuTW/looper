@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 )
@@ -11,8 +12,9 @@ import (
 type PullRequest struct {
 	Number     int64     `json:"number"`
 	Title      string    `json:"title"`
-	Additions  int64     `json:"additions"`
-	Deletions  int64     `json:"deletions"`
+	Author     Author    `json:"author"`
+	Additions  *int64    `json:"additions"`
+	Deletions  *int64    `json:"deletions"`
 	MergedAt   string    `json:"mergedAt"`
 	HeadRefOID string    `json:"headRefOid"`
 	Reviews    []Review  `json:"reviews"`
@@ -91,7 +93,10 @@ type Finding struct {
 
 // ChangedLines is the size measure the audit reports and thresholds on.
 func (f Finding) ChangedLines() int64 {
-	return f.PR.Additions + f.PR.Deletions
+	if f.PR.Additions == nil || f.PR.Deletions == nil {
+		return 0
+	}
+	return *f.PR.Additions + *f.PR.Deletions
 }
 
 // Classify audits one merged PR. A review counts only when GitHub recorded
@@ -101,13 +106,17 @@ func (f Finding) ChangedLines() int64 {
 func Classify(pr PullRequest) Finding {
 	headReviewers := map[string]bool{}
 	staleReviewers := map[string]bool{}
+	prAuthor := strings.TrimSpace(pr.Author.Login)
 	for _, review := range pr.Reviews {
 		if !submittedReviewStates[strings.ToUpper(strings.TrimSpace(review.State))] {
 			continue
 		}
 		login := strings.TrimSpace(review.Author.Login)
-		if login == "" {
-			login = "(unknown)"
+		// Review coverage must come from an identifiable account other than the
+		// pull-request author. Without both identities GitHub's record cannot
+		// demonstrate independent scrutiny, so the gate fails closed.
+		if prAuthor == "" || login == "" || strings.EqualFold(login, prAuthor) {
+			continue
 		}
 		if pr.HeadRefOID != "" && review.Commit.OID != "" && review.Commit.OID == pr.HeadRefOID {
 			headReviewers[login] = true
@@ -159,9 +168,12 @@ func Audit(input []byte, largeThreshold int64) (string, bool, error) {
 	counts := map[Verdict]int{}
 	flagged := false
 	for _, pr := range prs {
+		if err := validateChangedLineCounts(pr); err != nil {
+			return "", false, err
+		}
 		finding := Classify(pr)
 		counts[finding.Verdict]++
-		line := fmt.Sprintf("#%d\t%s\t+%d/-%d", pr.Number, finding.Verdict, pr.Additions, pr.Deletions)
+		line := fmt.Sprintf("#%d\t%s\t+%d/-%d", pr.Number, finding.Verdict, *pr.Additions, *pr.Deletions)
 		if len(finding.Reviewers) > 0 {
 			line += "\t[" + strings.Join(finding.Reviewers, ",") + "]"
 		}
@@ -176,4 +188,23 @@ func Audit(input []byte, largeThreshold int64) (string, bool, error) {
 	b.WriteString(fmt.Sprintf("\ntotal=%d reviewed=%d stale-reviewed=%d rate-limit-refused=%d unreviewed=%d\n",
 		len(prs), counts[VerdictReviewed], counts[VerdictStaleReviewed], counts[VerdictRefused], counts[VerdictUnreviewed]))
 	return b.String(), flagged, nil
+}
+
+func validateChangedLineCounts(pr PullRequest) error {
+	switch {
+	case pr.Additions == nil && pr.Deletions == nil:
+		return fmt.Errorf("PR #%d is missing additions and deletions; request both changed-line counts before applying the audit", pr.Number)
+	case pr.Additions == nil:
+		return fmt.Errorf("PR #%d is missing additions; request both changed-line counts before applying the audit", pr.Number)
+	case pr.Deletions == nil:
+		return fmt.Errorf("PR #%d is missing deletions; request both changed-line counts before applying the audit", pr.Number)
+	case *pr.Additions < 0:
+		return fmt.Errorf("PR #%d has negative additions %d; changed-line counts must be non-negative", pr.Number, *pr.Additions)
+	case *pr.Deletions < 0:
+		return fmt.Errorf("PR #%d has negative deletions %d; changed-line counts must be non-negative", pr.Number, *pr.Deletions)
+	case *pr.Additions > math.MaxInt64-*pr.Deletions:
+		return fmt.Errorf("PR #%d changed-line counts overflow int64; additions %d plus deletions %d exceeds the supported range", pr.Number, *pr.Additions, *pr.Deletions)
+	default:
+		return nil
+	}
 }

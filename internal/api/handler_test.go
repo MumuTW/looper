@@ -7998,6 +7998,14 @@ func newTestFixture(t *testing.T, configure ...func(*looperdruntime.Options)) te
 		RunSchedulerTick: func(context.Context, looperdruntime.Services) error {
 			return nil
 		},
+		// API handler tests seed and inspect durable state synchronously. Keep
+		// both scheduler lanes inert so a background claim cannot consume that
+		// state between the request and its assertions. Scheduler pump behavior
+		// is exercised explicitly by internal/runtime tests; an API test that
+		// needs the real claim pass may set this option back to nil.
+		RunSchedulerClaim: func(context.Context, looperdruntime.Services) error {
+			return nil
+		},
 	}
 	for _, apply := range configure {
 		apply(&options)
