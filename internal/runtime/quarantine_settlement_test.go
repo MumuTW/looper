@@ -62,6 +62,10 @@ func newQuarantineSettlementFixture(t *testing.T, loopStatus string, processAliv
 	if err := rt.Start(context.Background()); err != nil {
 		t.Fatalf("Start() error = %v", err)
 	}
+	// These tests drive live reconciliation explicitly below. Stop the background
+	// scheduler before seeding the fixture so it cannot settle the rows first and
+	// turn the direct call into a timing-dependent no-op.
+	rt.stopSchedulerLoop()
 	t.Cleanup(func() { rt.Stop("test cleanup") })
 
 	repos := rt.Services().Repositories
