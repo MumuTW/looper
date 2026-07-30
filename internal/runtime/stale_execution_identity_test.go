@@ -31,9 +31,9 @@ func TestRuntimeReconcileStaleRunningRunsQuarantinesSameCommandPIDReuse(t *testi
 		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
 	}
 
-	summary, err := rt.ReconcileStaleRunningRuns(context.Background())
+	summary, err := rt.reconcileLiveStaleRunningRuns(context.Background())
 	if err != nil {
-		t.Fatalf("ReconcileStaleRunningRuns() error = %v", err)
+		t.Fatalf("reconcileLiveStaleRunningRuns() error = %v", err)
 	}
 	if summary.SkippedUncertainRuns != 1 || summary.QuarantinedExecutions != 1 || summary.CleanedExecutions != 0 || summary.LoopsRequeued != 0 {
 		t.Fatalf("summary = %#v, want reused PID evidence quarantined without overlap", summary)
@@ -94,9 +94,9 @@ func TestRuntimeReconcileNeverOverridesCurrentSupervisorOwner(t *testing.T) {
 	release := bindStaleExecutionTestOwner(t, rt.Services().ActiveExecutions, loopID, runID, executionID)
 	defer release()
 
-	summary, err := rt.ReconcileStaleRunningRuns(context.Background())
+	summary, err := rt.reconcileLiveStaleRunningRuns(context.Background())
 	if err != nil {
-		t.Fatalf("ReconcileStaleRunningRuns() error = %v", err)
+		t.Fatalf("reconcileLiveStaleRunningRuns() error = %v", err)
 	}
 	if summary.InterruptedRuns != 0 || summary.CleanedExecutions != 0 || summary.LoopsRequeued != 0 {
 		t.Fatalf("summary = %#v, want current Supervisor owner preserved", summary)

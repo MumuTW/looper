@@ -28,7 +28,7 @@ type OutstandingQuarantinedLoop struct {
 }
 
 // OutstandingQuarantineDebt is live (not startup-snapshot) quarantine/orphan
-// debt visible after recovery or live/manual stale reconcile. Quarantine parks
+// debt visible after recovery or scheduler-owned stale reconciliation. Quarantine parks
 // loops/queues but deliberately leaves agent_executions (and often runs) as
 // still-running evidence without process kill.
 type OutstandingQuarantineDebt struct {

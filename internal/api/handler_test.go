@@ -1304,7 +1304,7 @@ func TestHandlerStatusReportsUnknownBinaryIdentityWithoutReporter(t *testing.T) 
 	}
 }
 
-func TestHandlerStatusReportsDebtAfterStaleRunReconcile(t *testing.T) {
+func TestHandlerStatusReportsDebtFromDurableQuarantineEvidence(t *testing.T) {
 	fixture := newTestFixture(t, func(options *looperdruntime.Options) {
 		options.ReadProcessCommand = func(context.Context, int) (string, error) { return "", nil }
 	})
@@ -1317,7 +1317,7 @@ func TestHandlerStatusReportsDebtAfterStaleRunReconcile(t *testing.T) {
 	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Reconcile", RepoPath: fixture.rootDir, CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
-	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 1, ProjectID: projectID, Type: "worker", TargetType: "project", Status: "running", CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 1, ProjectID: projectID, Type: "worker", TargetType: "project", Status: "paused", CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
 	if err := repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: runID, LoopID: loopID, Status: "running", CurrentStep: stringPtr("work"), StartedAt: oldISO, LastHeartbeatAt: &oldISO, CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
@@ -1330,13 +1330,14 @@ func TestHandlerStatusReportsDebtAfterStaleRunReconcile(t *testing.T) {
 	if err := repos.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{ID: "execution_reconcile_status", ProjectID: &projectID, LoopID: &loopID, RunID: &runID, Vendor: "codex", Status: "running", PID: &pid, CommandJSON: stringPtr(`{"command":"codex"}`), CWD: stringPtr(fixture.rootDir), StartedAt: oldISO, CreatedAt: oldISO, UpdatedAt: oldISO}); err != nil {
 		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
 	}
-
-	summary, err := rt.ReconcileStaleRunningRuns(context.Background())
-	if err != nil {
-		t.Fatalf("ReconcileStaleRunningRuns() error = %v", err)
-	}
-	if summary.QuarantinedExecutions != 1 {
-		t.Fatalf("summary = %#v, want one quarantined execution", summary)
+	entityType := "agent_execution"
+	executionID := "execution_reconcile_status"
+	if err := repos.Events.Append(context.Background(), storage.EventLogRecord{
+		ID: "event_reconcile_status", EventType: "looperd.recovery.execution_quarantined",
+		ProjectID: &projectID, LoopID: &loopID, RunID: &runID,
+		EntityType: &entityType, EntityID: &executionID, PayloadJSON: `{}`, CreatedAt: oldISO,
+	}); err != nil {
+		t.Fatalf("Events.Append() error = %v", err)
 	}
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/status", nil)
@@ -1369,7 +1370,7 @@ func TestHandlerStatusReportsDebtAfterStaleRunReconcile(t *testing.T) {
 		t.Fatalf("degradedReasons = %#v, want quarantine debt", service["degradedReasons"])
 	}
 	if run, err := repos.Runs.GetByID(context.Background(), runID); err != nil || run == nil || run.Status != "running" {
-		t.Fatalf("run after reconcile = %#v, %v; want running quarantine evidence", run, err)
+		t.Fatalf("run = %#v, %v; want running quarantine evidence", run, err)
 	}
 }
 
