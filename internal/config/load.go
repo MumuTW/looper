@@ -424,13 +424,17 @@ func decodeStructuredConfigFile(raw []byte, unmarshal func(any) error) (PartialC
 	return decodeJSONConfigFile(normalizedRaw)
 }
 
-func decodeTopLevelConfigSections(decoder *json.Decoder, partialConfig *PartialConfig) error {
-	type topLevelConfigSection struct {
-		key    string
-		decode func(json.RawMessage) error
-	}
+type topLevelConfigSection struct {
+	key    string
+	decode func(json.RawMessage) error
+}
 
-	sections := []topLevelConfigSection{
+// topLevelConfigSections is the decoder's registry of top-level configuration
+// sections. A section missing from it is skipped silently, so the value a user
+// wrote never reaches Config — with no error and no failing test unless one
+// checks this list against PartialConfig itself.
+func topLevelConfigSections(partialConfig *PartialConfig) []topLevelConfigSection {
+	return []topLevelConfigSection{
 		{key: "server", decode: func(raw json.RawMessage) error {
 			return decodeTopLevelConfigSection(raw, "server", &partialConfig.Server)
 		}},
@@ -492,6 +496,10 @@ func decodeTopLevelConfigSections(decoder *json.Decoder, partialConfig *PartialC
 			return decodeTopLevelConfigSection(raw, "projects", &partialConfig.Projects)
 		}},
 	}
+}
+
+func decodeTopLevelConfigSections(decoder *json.Decoder, partialConfig *PartialConfig) error {
+	sections := topLevelConfigSections(partialConfig)
 
 	token, err := decoder.Token()
 	if err != nil {
