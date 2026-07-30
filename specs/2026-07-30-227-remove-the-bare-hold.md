@@ -39,7 +39,7 @@ The failure mode is silent. A maintainer reaching for a hold sees two identicall
 
 A single forge operation: delete the `hold` label from the repository.
 
-```
+```shell
 gh api -X DELETE /repos/MumuTW/looper/labels/hold
 ```
 
@@ -58,7 +58,7 @@ Before deleting, confirm nothing in the repository currently uses `hold` and not
 
 ### Execution
 
-Run the `DELETE` once the pre-delete check passes. The operation is idempotent in effect: a missing label is the desired end state.
+Run the `DELETE` once the pre-delete check passes. The desired state is a missing label; reruns return 404 and must be handled as an already-complete result.
 
 ## Alternatives considered
 
