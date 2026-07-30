@@ -865,6 +865,7 @@ func (r *Runtime) start(ctx context.Context) error {
 	started := false
 	defer func() {
 		if !started {
+			r.stopProjectDiscovery()
 			if lock != nil {
 				_ = lock.Release()
 			}
@@ -1016,7 +1017,6 @@ func (r *Runtime) start(ctx context.Context) error {
 	}
 
 	if err := r.CompleteStartup(ctx); err != nil {
-		r.stopProjectDiscovery()
 		return err
 	}
 	started = true

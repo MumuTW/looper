@@ -455,6 +455,27 @@ func TestRestartRequiredChangesReportsCanonicalRoleModelPath(t *testing.T) {
 	}
 }
 
+func TestRestartRequiredChangesPreservesNormalizedLegacyRoleModelPath(t *testing.T) {
+	t.Parallel()
+
+	oldConfig, err := Normalize(t.TempDir(), mustDecodeTOML(t, `
+[roles.worker.agent]
+vendor = "codex"
+model = "gpt-5"
+`))
+	if err != nil {
+		t.Fatalf("Normalize(old) error = %v", err)
+	}
+	newConfig := CloneConfig(oldConfig)
+	newVendor := AgentVendorClaudeCode
+	newConfig.Roles.Worker.Agent.Vendor = &newVendor
+	newConfig.Roles.Coding = CodingRolesFromLegacy(newConfig.Roles)
+
+	if got, want := RestartRequiredChanges(oldConfig, newConfig), []string{"roles.worker.agent.model"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("normalized legacy role vendor switch = %#v, want %#v", got, want)
+	}
+}
+
 func agentVendorPtr(v AgentVendor) *AgentVendor {
 	return &v
 }

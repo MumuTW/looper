@@ -535,8 +535,12 @@ func (s *Service) DiscoverProject(ctx context.Context, input DiscoverInput) (Dis
 		Warnings:               append([]string{}, warnings...),
 	}
 	if worktreeErr != nil || pullRequestErr != nil {
-		discovery.Status = DiscoveryStatusFailed
-		discovery.Error = firstErrorMessage(worktreeErr, pullRequestErr)
+		if discoveryCanceled(worktreeErr, pullRequestErr) {
+			discovery.Status = DiscoveryStatusPending
+		} else {
+			discovery.Status = DiscoveryStatusFailed
+			discovery.Error = firstErrorMessage(worktreeErr, pullRequestErr)
+		}
 		if writeErr := s.writeDiscoveryState(ctx, project, discovery); writeErr != nil {
 			return DiscoverResult{}, writeErr
 		}
@@ -1296,7 +1300,7 @@ func (s *Service) discoverPullRequests(ctx context.Context, project storage.Proj
 				return discovered, pending, captured, err
 			}
 			if ctxErr := ctx.Err(); errors.Is(ctxErr, context.Canceled) || errors.Is(ctxErr, context.DeadlineExceeded) {
-				return discovered, pending, captured, ctxErr
+				return discovered, pending, captured, errors.Join(err, ctxErr)
 			}
 			message := err.Error()
 			if s.Logger != nil {
@@ -1605,4 +1609,40 @@ func firstErrorMessage(errs ...error) string {
 		}
 	}
 	return ""
+}
+
+func discoveryCanceled(errs ...error) bool {
+	canceled := false
+	for _, err := range errs {
+		if err == nil {
+			continue
+		}
+		if !onlyContextCanceled(err) {
+			return false
+		}
+		canceled = true
+	}
+	return canceled
+}
+
+func onlyContextCanceled(err error) bool {
+	if err == context.Canceled {
+		return true
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		unwrapped := joined.Unwrap()
+		if len(unwrapped) == 0 {
+			return false
+		}
+		for _, nested := range unwrapped {
+			if !onlyContextCanceled(nested) {
+				return false
+			}
+		}
+		return true
+	}
+	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
+		return onlyContextCanceled(wrapped.Unwrap())
+	}
+	return false
 }

@@ -3,6 +3,7 @@ package projects
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -83,5 +84,38 @@ func TestServiceDiscoverProjectRetriesListFailures(t *testing.T) {
 				t.Fatalf("persisted retry discovery = %#v, want succeeded", got)
 			}
 		})
+	}
+}
+
+func TestServiceDiscoverProjectKeepsCancellationPendingForRestart(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openCoordinator(t)
+	repos := storage.NewRepositories(coordinator.DB())
+	service := &Service{
+		DB:                coordinator.DB(),
+		Repos:             repos,
+		ScheduleDiscovery: func(func()) {},
+		ListWorktrees: func(context.Context, string) ([]WorktreeListEntry, error) {
+			return nil, fmt.Errorf("list worktrees: %w", context.Canceled)
+		},
+	}
+	if _, err := service.AddProject(context.Background(), AddInput{ID: "looper", Name: "Looper", RepoPath: "/tmp/looper", BaseBranch: "main"}); err != nil {
+		t.Fatalf("AddProject() error = %v", err)
+	}
+
+	result, err := service.DiscoverProject(context.Background(), DiscoverInput{ProjectID: "looper"})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("DiscoverProject() error = %v, want context canceled", err)
+	}
+	if result.Discovery.Status != DiscoveryStatusPending || result.Discovery.Error != "" {
+		t.Fatalf("canceled discovery = %#v, want resumable pending state", result.Discovery)
+	}
+	stored, err := repos.Projects.GetByID(context.Background(), "looper")
+	if err != nil || stored == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want stored project", stored, err)
+	}
+	if got := DiscoveryStateFromRecord(*stored); got.Status != DiscoveryStatusPending || got.Error != "" {
+		t.Fatalf("persisted canceled discovery = %#v, want resumable pending state", got)
 	}
 }

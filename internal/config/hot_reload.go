@@ -436,7 +436,8 @@ func resolvedModelBindingPath(cfg Config, role string) string {
 		}
 	}
 	if binding != nil && binding.Model != nil {
-		if len(cfg.Roles.Coding) > 0 {
+		legacyBinding := CodingRolesFromLegacy(cfg.Roles)[role].Agent
+		if legacyBinding == nil || legacyBinding.Model == nil || *legacyBinding.Model != *binding.Model {
 			path = "roles.coding." + role + ".agent.model"
 		} else {
 			path = "roles." + role + ".agent.model"

@@ -590,8 +590,8 @@ func TestServiceAddProjectSucceedsIndependentlyOfDiscoveryCancellation(t *testin
 		t.Fatalf("Projects.GetByID() after discovery failure = %#v err=%v", stored, getErr)
 	}
 	discovery := DiscoveryStateFromRecord(*stored)
-	if discovery.Status != DiscoveryStatusFailed {
-		t.Fatalf("discovery status = %q, want failed", discovery.Status)
+	if discovery.Status != DiscoveryStatusPending {
+		t.Fatalf("discovery status = %q, want pending", discovery.Status)
 	}
 }
 

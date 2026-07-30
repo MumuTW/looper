@@ -289,6 +289,9 @@ func TestTeaTransportDoesNotClassifyCommandOutputAsMissingBinary(t *testing.T) {
 	transport := newTeaTransport("/usr/bin/fake-tea", "selected-login", nil, 5*time.Second, runner)
 
 	_, err := transport.doRaw(context.Background(), "GET", "/api/v1/version", nil, nil)
+	if err == nil {
+		t.Fatal("doRaw() error = nil, want command failure")
+	}
 	var teaErr *TeaAuthError
 	if errors.As(err, &teaErr) && teaErr.Code == TeaErrorMissing {
 		t.Fatalf("error = %v, command output must not be classified as a missing binary", err)

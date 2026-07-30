@@ -61,6 +61,99 @@ func TestRuntimeFailedStartupDoesNotResumeIncompleteDiscovery(t *testing.T) {
 	}
 }
 
+func TestRuntimeFailedStartCancelsAndDrainsConfiguredProjectDiscovery(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
+	discoveryStarted := make(chan struct{})
+	discoveryCanceled := make(chan struct{})
+	startupErr := errors.New("configured project sync failed")
+	rt := New(Options{
+		Config: cfg,
+		Logger: &testLogger{},
+		SyncConfiguredProjects: func(_ context.Context, service *projects.Service, _ config.Config, _ time.Time) error {
+			service.ScheduleDiscovery(func() {
+				close(discoveryStarted)
+				<-service.DiscoveryContext().Done()
+				close(discoveryCanceled)
+			})
+			<-discoveryStarted
+			return startupErr
+		},
+	})
+
+	if err := rt.Start(context.Background()); !errors.Is(err, startupErr) {
+		t.Fatalf("Start() error = %v, want %v", err, startupErr)
+	}
+	select {
+	case <-discoveryCanceled:
+	default:
+		t.Fatal("Start() returned before configured-project discovery was canceled and drained")
+	}
+}
+
+func TestRuntimeShutdownCanceledDiscoveryResumesAfterRestart(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
+	cfg.Daemon.ShutdownTimeoutMS = 500
+
+	first := New(Options{Config: cfg, Logger: &testLogger{}, RunSchedulerTick: func(context.Context, Services) error { return nil }})
+	if err := first.Start(context.Background()); err != nil {
+		t.Fatalf("first Start() error = %v", err)
+	}
+	firstDiscoveryStarted := make(chan struct{})
+	first.Services().Projects.DetectRepo = nil
+	first.Services().Projects.ListWorktrees = func(ctx context.Context, _ string) ([]projects.WorktreeListEntry, error) {
+		close(firstDiscoveryStarted)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	if _, err := first.Services().Projects.AddProject(context.Background(), projects.AddInput{
+		ID: "restart", Name: "Restart", RepoPath: workingDir, BaseBranch: "main", SnapshotMode: projects.SnapshotModeOff,
+	}); err != nil {
+		t.Fatalf("AddProject() error = %v", err)
+	}
+	select {
+	case <-firstDiscoveryStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first discovery did not start")
+	}
+	first.Stop("restart test")
+
+	second := New(Options{
+		Config: cfg, Logger: &testLogger{}, DeferRecovery: true,
+		RunSchedulerTick: func(context.Context, Services) error { return nil },
+	})
+	if err := second.Start(context.Background()); err != nil {
+		t.Fatalf("second Start() error = %v", err)
+	}
+	t.Cleanup(func() { second.Stop("test cleanup") })
+	resumed := make(chan struct{})
+	second.Services().Projects.ListWorktrees = func(context.Context, string) ([]projects.WorktreeListEntry, error) {
+		close(resumed)
+		return nil, nil
+	}
+	if err := second.CompleteStartup(context.Background()); err != nil {
+		t.Fatalf("second CompleteStartup() error = %v", err)
+	}
+	select {
+	case <-resumed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("shutdown-canceled discovery was not resumed after restart")
+	}
+}
+
 func startRuntimeWithPendingDiscovery(t *testing.T, projectID string) (*Runtime, *projects.Service) {
 	t.Helper()
 
