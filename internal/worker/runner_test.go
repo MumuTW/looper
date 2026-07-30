@@ -1735,6 +1735,11 @@ func TestPreservesWorktreeProgressRequiresContentAndCommitEvidence(t *testing.T)
 			want:  true,
 		},
 		{
+			name:  "preserves an unchanged legacy status-only checkpoint after upgrade",
+			after: worktreeProgress{HeadSHA: "before-head", Branch: "feature/test", ChangedFiles: []string{"tracked.go", "new.txt"}, StagedFiles: []string{"tracked.go"}, UntrackedFiles: []string{"new.txt"}, ChangedFileCount: 2, DiffFingerprint: "before-status", ContentFingerprint: "new-content-fingerprint"},
+			want:  true,
+		},
+		{
 			name:  "rejects content replacement with unchanged status",
 			after: worktreeProgress{HeadSHA: "before-head", Branch: "feature/test", ChangedFiles: []string{"tracked.go", "new.txt"}, StagedFiles: []string{"tracked.go"}, UntrackedFiles: []string{"new.txt"}, ChangedFileCount: 2, DiffFingerprint: "before-status", ContentFingerprint: "replacement-content"},
 			want:  false,
@@ -1756,7 +1761,11 @@ func TestPreservesWorktreeProgressRequiresContentAndCommitEvidence(t *testing.T)
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := preservesWorktreeProgress(before, tc.after); got != tc.want {
+			progress := before
+			if tc.name == "preserves an unchanged legacy status-only checkpoint after upgrade" {
+				progress.ContentFingerprint = ""
+			}
+			if got := preservesWorktreeProgress(progress, tc.after); got != tc.want {
 				t.Fatalf("preservesWorktreeProgress() = %t, want %t", got, tc.want)
 			}
 		})

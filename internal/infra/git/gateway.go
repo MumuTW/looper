@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -1033,6 +1034,30 @@ func (g *Gateway) gitCommonDir(ctx context.Context, path string) (string, error)
 // contentFingerprint hashes file identity and contents without persisting the
 // contents themselves. Missing paths are included so deletions can be
 // compared with a later committed deletion.
+func rejectTruncatedGitStdout(result shell.Result, operation string) error {
+	if result.StdoutTruncated {
+		return fmt.Errorf("git %s output was truncated; refusing incomplete evidence", operation)
+	}
+	return nil
+}
+
+func (g *Gateway) submoduleContentFingerprint(ctx context.Context, path string) (string, error) {
+	result, err := g.runGitResult(ctx, path, nil, "ls-files", "--cached", "--others", "--exclude-standard", "-z")
+	if err != nil {
+		return "", err
+	}
+	if err := rejectTruncatedGitStdout(result, "ls-files"); err != nil {
+		return "", err
+	}
+	contentPaths := make([]string, 0)
+	for _, path := range strings.Split(result.Stdout, "\x00") {
+		if path != "" {
+			contentPaths = append(contentPaths, path)
+		}
+	}
+	return g.contentFingerprint(ctx, path, contentPaths)
+}
+
 func (g *Gateway) contentFingerprint(ctx context.Context, worktreePath string, paths []string) (string, error) {
 	unique := make(map[string]struct{}, len(paths))
 	for _, path := range paths {
@@ -1075,16 +1100,42 @@ func (g *Gateway) contentFingerprint(ctx context.Context, worktreePath string, p
 			_, _ = fingerprint.Write([]byte{'\x00'})
 			continue
 		}
+		if info.IsDir() {
+			submoduleFingerprint, err := g.submoduleContentFingerprint(ctx, filepath.Join(worktreePath, path))
+			if err != nil {
+				return "", fmt.Errorf("fingerprint submodule %q: %w", path, err)
+			}
+			_, _ = fingerprint.Write([]byte("submodule"))
+			_, _ = fingerprint.Write([]byte{'\x00'})
+			_, _ = fingerprint.Write([]byte(submoduleFingerprint))
+			_, _ = fingerprint.Write([]byte{'\x00'})
+			continue
+		}
 		if !info.Mode().IsRegular() {
 			return "", fmt.Errorf("worktree content path %q is not a regular file", path)
 		}
-		result, err := g.runGitResult(ctx, worktreePath, nil, "hash-object", "--no-filters", "--", path)
+		file, err := os.Open(filepath.Join(worktreePath, path))
 		if err != nil {
 			return "", err
 		}
+		contents := sha256.New()
+		_, copyErr := io.Copy(contents, file)
+		closeErr := file.Close()
+		if copyErr != nil {
+			return "", copyErr
+		}
+		if closeErr != nil {
+			return "", closeErr
+		}
+		mode := "100644"
+		if info.Mode().Perm()&0o111 != 0 {
+			mode = "100755"
+		}
 		_, _ = fingerprint.Write([]byte("file"))
 		_, _ = fingerprint.Write([]byte{'\x00'})
-		_, _ = fingerprint.Write([]byte(strings.TrimSpace(result.Stdout)))
+		_, _ = fingerprint.Write([]byte(mode))
+		_, _ = fingerprint.Write([]byte{'\x00'})
+		_, _ = fingerprint.Write([]byte(fmt.Sprintf("%x", contents.Sum(nil))))
 		_, _ = fingerprint.Write([]byte{'\x00'})
 	}
 	return fmt.Sprintf("%x", fingerprint.Sum(nil)), nil

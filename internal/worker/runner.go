@@ -2555,10 +2555,21 @@ func preservesWorktreeProgress(before, after worktreeProgress) bool {
 	if before.ChangedFileCount == 0 {
 		return true
 	}
+	// Checkpoints written before content fingerprints existed retain the
+	// established status-based comparison for this retry. A later timeout
+	// overwrites that legacy snapshot with content evidence; rejecting it here
+	// would turn a daemon upgrade into a false lost-progress intervention.
+	if before.ContentFingerprint == "" {
+		return sameLegacyWorktreeProgress(before, after)
+	}
 	if sameWorktreeProgress(before, after) {
 		return true
 	}
 	return before.HeadSHA != "" && after.HeadSHA != "" && before.HeadSHA != after.HeadSHA && after.ChangedFileCount == 0 && after.HeadDescendsFromCompare && before.ContentFingerprint == after.ContentFingerprint
+}
+
+func sameLegacyWorktreeProgress(before, after worktreeProgress) bool {
+	return before.HeadSHA == after.HeadSHA && before.Branch == after.Branch && before.DiffFingerprint == after.DiffFingerprint && equalStringSlices(before.ChangedFiles, after.ChangedFiles) && equalStringSlices(before.StagedFiles, after.StagedFiles) && equalStringSlices(before.UntrackedFiles, after.UntrackedFiles)
 }
 
 func equalStringSlices(left, right []string) bool {

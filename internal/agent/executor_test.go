@@ -1725,14 +1725,16 @@ func TestExecutorHeartbeatTimeoutPreservesOriginalTimeoutTypeDuringGracefulShutd
 	}
 }
 
-func TestExecutorObservesBeforeTimeoutSignal(t *testing.T) {
+func TestExecutorObservesTimeoutOnlyAfterProcessGroupTermination(t *testing.T) {
 	t.Parallel()
 
-	marker := filepath.Join(t.TempDir(), "pre-timeout-observed")
-	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", `trap 'test -f "$MARKER" || exit 42; exit 0' TERM; while :; do sleep 0.01; done`}}}, ParamsOwnerVendor: customOwner()})
+	markerDir := t.TempDir()
+	marker := filepath.Join(markerDir, "timeout-observed")
+	terminationState := filepath.Join(markerDir, "termination-state")
+	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", `trap 'if test -f "$MARKER"; then echo observed > "$TERMINATION_STATE"; else echo clean > "$TERMINATION_STATE"; fi; exit 0' TERM; while :; do sleep 0.01; done`}}}, ParamsOwnerVendor: customOwner()})
 	execHandle, err := executor.Start(context.Background(), RunInput{
 		ExecutionID: "agent_pre_timeout_observation", WorkingDirectory: t.TempDir(), Prompt: "ignored", Timeout: 150 * time.Millisecond, HeartbeatTimeout: time.Second, GracefulShutdown: 50 * time.Millisecond,
-		Env: map[string]string{"MARKER": marker},
+		Env: map[string]string{"MARKER": marker, "TERMINATION_STATE": terminationState},
 		OnBeforeTimeout: func(_ context.Context, observation TimeoutObservation) error {
 			if observation.TimeoutType != "max_runtime" {
 				return errors.New("expected max_runtime timeout observation")
@@ -1751,11 +1753,14 @@ func TestExecutorObservesBeforeTimeoutSignal(t *testing.T) {
 		t.Fatalf("result = %#v, want timeout with successful observation", result)
 	}
 	if _, err := os.Stat(marker); err != nil {
-		t.Fatalf("timeout observer did not run before SIGTERM: %v", err)
+		t.Fatalf("timeout observer did not run after termination: %v", err)
+	}
+	if got, err := os.ReadFile(terminationState); err != nil || string(got) != "clean\n" {
+		t.Fatalf("agent observed timeout marker before termination: state=%q err=%v", got, err)
 	}
 }
 
-func TestExecutorReportsCompletionWhenProcessExitsDuringTimeoutObservation(t *testing.T) {
+func TestExecutorReportsTimeoutWhenDeadlineWinsBeforeTermination(t *testing.T) {
 	t.Parallel()
 
 	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", "sleep 0.08"}}}, ParamsOwnerVendor: customOwner()})
@@ -1773,8 +1778,8 @@ func TestExecutorReportsCompletionWhenProcessExitsDuringTimeoutObservation(t *te
 	if err != nil {
 		t.Fatalf("Wait() error = %v", err)
 	}
-	if result.Status != "completed" || result.PreTimeoutError != "" {
-		t.Fatalf("result = %#v, want completion without a timeout observation error", result)
+	if result.Status != "timeout" {
+		t.Fatalf("result.Status = %q, want timeout after deadline terminates process", result.Status)
 	}
 }
 
