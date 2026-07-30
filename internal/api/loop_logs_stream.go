@@ -66,6 +66,7 @@ func (h *Handler) streamLoopLogsCombined(w http.ResponseWriter, r *http.Request,
 	if err := writeSSEEvent(w, flusher, "snapshot", current.response); err != nil {
 		return nil
 	}
+	h.observeLoopLogsFollow("snapshot_delivered", 0)
 
 	observedRunID := ""
 	if current.response.Run != nil {
@@ -378,8 +379,8 @@ func (cursor *loopLogsFileCursor) readNext(maxBytes int) (string, bool, error) {
 	if err != nil {
 		return "", true, err
 	}
-	if int64(len(raw)) < info.Size()-cursor.offset {
-		raw = raw[:utf8ChunkBoundary(raw, len(raw))]
+	if cut := utf8ChunkBoundary(raw, len(raw)); cut < len(raw) {
+		raw = raw[:cut]
 	}
 	cursor.offset += int64(len(raw))
 	return string(raw), true, nil

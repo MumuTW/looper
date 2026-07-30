@@ -62,48 +62,70 @@ func TestCombinedLoopLogsStreamBoundsReadsAcrossSeveralLargeTabs(t *testing.T) {
 		t.Fatalf("upsert execution: %v", err)
 	}
 
+	const tabs = 4
+	stdoutAppend := strings.Repeat("o", loopLogsFollowMaxChunkBytes*2+17)
+	stderrAppend := strings.Repeat("e", loopLogsFollowMaxChunkBytes+29)
+	wantBytes := tabs * (len(stdoutAppend) + len(stderrAppend))
+
 	var observationsMu sync.Mutex
 	observations := make([]loopLogsFollowObservation, 0, 128)
+	snapshotReady := make(chan struct{})
+	bytesReady := make(chan struct{})
+	snapshotCount, incrementalBytes := 0, 0
+	snapshotsSignaled, bytesSignaled := false, false
 	handler := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime})
 	handler.loopLogsFollowObserve = func(observation loopLogsFollowObservation) {
 		observationsMu.Lock()
 		observations = append(observations, observation)
+		switch observation.Kind {
+		case "snapshot_delivered":
+			snapshotCount++
+			if !snapshotsSignaled && snapshotCount == tabs {
+				close(snapshotReady)
+				snapshotsSignaled = true
+			}
+		case "file_read":
+			incrementalBytes += observation.Bytes
+			if !bytesSignaled && incrementalBytes == wantBytes {
+				close(bytesReady)
+				bytesSignaled = true
+			}
+		}
 		observationsMu.Unlock()
 	}
 	server := httptest.NewServer(handler)
 	defer server.Close()
 
-	const tabs = 4
 	responses := make([]*http.Response, 0, tabs)
+	bodies := make([][]byte, tabs)
+	var readers sync.WaitGroup
+	readers.Add(tabs)
 	for index := 0; index < tabs; index++ {
 		response, getErr := http.Get(server.URL + "/api/v1/loops/loop_1/logs?follow=1&streams=both")
 		if getErr != nil {
 			t.Fatalf("open tab %d: %v", index, getErr)
 		}
 		responses = append(responses, response)
-	}
-
-	stdoutAppend := strings.Repeat("o", loopLogsFollowMaxChunkBytes*2+17)
-	stderrAppend := strings.Repeat("e", loopLogsFollowMaxChunkBytes+29)
-	go func() {
-		time.Sleep(250 * time.Millisecond)
-		appendFile(t, stdoutPath, stdoutAppend)
-		appendFile(t, stderrPath, stderrAppend)
-		time.Sleep(1100 * time.Millisecond)
-		markRunSuccess(t, fixture, "run_1")
-	}()
-
-	bodies := make([][]byte, tabs)
-	var readers sync.WaitGroup
-	readers.Add(tabs)
-	for index, response := range responses {
-		index, response := index, response
-		go func() {
+		go func(index int, response *http.Response) {
 			defer readers.Done()
 			defer response.Body.Close()
 			bodies[index], _ = io.ReadAll(response.Body)
-		}()
+		}(index, response)
 	}
+
+	select {
+	case <-snapshotReady:
+	case <-time.After(6 * time.Second):
+		t.Fatal("timed out waiting for every combined stream snapshot")
+	}
+	appendFile(t, stdoutPath, stdoutAppend)
+	appendFile(t, stderrPath, stderrAppend)
+	select {
+	case <-bytesReady:
+	case <-time.After(6 * time.Second):
+		t.Fatal("timed out waiting for every combined stream to read appended bytes")
+	}
+	markRunSuccess(t, fixture, "run_1")
 	done := make(chan struct{})
 	go func() {
 		readers.Wait()
@@ -134,13 +156,16 @@ func TestCombinedLoopLogsStreamBoundsReadsAcrossSeveralLargeTabs(t *testing.T) {
 			bytesRead += observation.Bytes
 		}
 	}
-	if stateRefreshes > tabs*3 {
-		t.Fatalf("state refreshes = %d, want <= %d for %d tabs", stateRefreshes, tabs*3, tabs)
+	// Snapshot delivery and final-byte observation are coordinated above, so each
+	// follower needs its initial state plus at most two 1 Hz refreshes to project
+	// the terminal run without relying on arbitrary sleep durations.
+	maxStateRefreshes := tabs * 3
+	if stateRefreshes > maxStateRefreshes {
+		t.Fatalf("state refreshes = %d, want <= %d for %d tabs", stateRefreshes, maxStateRefreshes, tabs)
 	}
 	if fileReads > tabs*2*12 {
 		t.Fatalf("file reads = %d, want <= %d for %d tabs", fileReads, tabs*2*12, tabs)
 	}
-	wantBytes := tabs * (len(stdoutAppend) + len(stderrAppend))
 	if bytesRead != wantBytes {
 		t.Fatalf("incremental bytes read = %d, want %d", bytesRead, wantBytes)
 	}
@@ -288,6 +313,36 @@ func TestLoopLogsFileCursorPreservesUTF8AtReadAndSnapshotBoundaries(t *testing.T
 	}
 	if got := joined.String(); got != first {
 		t.Fatalf("joined chunk = %q, want %q", got, first)
+	}
+	partialSource := append([]byte("partial "), 0xe7)
+	if err := os.WriteFile(path, partialSource, 0o644); err != nil {
+		t.Fatalf("write partial rune: %v", err)
+	}
+	partialCursor := loopLogsFileCursor{path: path}
+	partial, _, err := partialCursor.readNext(loopLogsFollowMaxChunkBytes)
+	if err != nil {
+		t.Fatalf("read partial rune: %v", err)
+	}
+	if partial != "partial " || partialCursor.offset != int64(len("partial ")) {
+		t.Fatalf("partial EOF = %q offset=%d, want retained rune bytes", partial, partialCursor.offset)
+	}
+	file, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open partial rune append: %v", err)
+	}
+	if _, err := file.Write([]byte{0x95, 0x8c}); err != nil {
+		_ = file.Close()
+		t.Fatalf("complete partial rune: %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("close partial rune append: %v", err)
+	}
+	completed, _, err := partialCursor.readNext(loopLogsFollowMaxChunkBytes)
+	if err != nil {
+		t.Fatalf("read completed rune: %v", err)
+	}
+	if completed != "界" || !utf8.ValidString(completed) {
+		t.Fatalf("completed rune = %q validUTF8=%t", completed, utf8.ValidString(completed))
 	}
 
 	snapshotPath := filepath.Join(dir, "snapshot.log")
