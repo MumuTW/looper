@@ -1,0 +1,31 @@
+name: PR Labeler
+
+# pull_request_target runs with a write token, so this job must never check out
+# or execute PR code. actions/labeler reads .github/labeler.yml from the base
+# branch via the API; the github-script step only reads the PR title.
+on: pull_request_target
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  label:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/labeler@b8dd2d9be0f68b860e7dae5dae7d772984eacd6d # v6
+
+      - name: Kind label from conventional-commit title
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          script: |
+            const m = context.payload.pull_request.title.match(/^(feat|fix|refactor|test|ci|docs|chore)[(:!]/);
+            const map = { fix: 'bug', feat: 'enhancement', docs: 'documentation' };
+            const label = m && map[m[1]];
+            if (label) {
+              await github.rest.issues.addLabels({
+                ...context.repo,
+                issue_number: context.payload.pull_request.number,
+                labels: [label],
+              });
+            }

@@ -1,0 +1,57 @@
+# Path-based area labels for PRs, applied by .github/workflows/labeler.yml.
+#
+# These are descriptive labels only. Control-plane labels (looper:*, dispatch/*)
+# are owned by the looper daemon and humans; no workflow may write them.
+area/triager:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "internal/triager/**"
+          - "internal/coordinator/**"
+
+area/worker:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "internal/worker/**"
+          - "internal/fixer/**"
+          - "internal/reviewer/**"
+          - "internal/reviewsubmit/**"
+          - "internal/planner/**"
+          - "internal/gatekeeper/**"
+
+area/agent:
+  - changed-files:
+      - any-glob-to-any-file: "internal/agent/**"
+
+area/storage:
+  - changed-files:
+      - any-glob-to-any-file: "internal/storage/**"
+
+area/forge:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "internal/forge/**"
+          - "internal/infra/**"
+          - "internal/network/**"
+          - "internal/networkpolicy/**"
+          - "internal/webhookforward/**"
+
+area/dashboard:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "web/**"
+          - "internal/dashboard/**"
+          - "internal/api/**"
+
+area/ci:
+  - changed-files:
+      - any-glob-to-any-file:
+          - ".github/**"
+          - "scripts/**"
+          - "e2e/**"
+
+area/docs:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "docs/**"
+          - "specs/**"
+          - "**/*.md"

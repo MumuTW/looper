@@ -1,0 +1,22 @@
+name: Issue Intake
+
+# Marks every new issue as awaiting triage. The label is a visibility
+# projection only: the durable authority for triage state is the Triager's
+# Triage Report (CONTEXT.md), and removing needs-triage belongs to the
+# Triager's projection step, not to any workflow.
+on:
+  issues:
+    types: [opened, reopened]
+
+permissions:
+  issues: write
+
+jobs:
+  mark-needs-triage:
+    runs-on: ubuntu-latest
+    steps:
+      - run: gh issue edit "$NUMBER" --add-label "needs-triage"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          NUMBER: ${{ github.event.issue.number }}
