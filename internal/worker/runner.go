@@ -279,23 +279,6 @@ type CreateWorktreeResult struct {
 	WorktreeID   string
 }
 
-type RestoreWorktreeInput struct {
-	ProjectID            string
-	RepoPath             string
-	Branch               string
-	WorktreeRoot         string
-	CheckoutMode         string
-	ExpectedWorktreePath string
-}
-
-type RestoreWorktreeResult struct {
-	WorktreePath string
-	Branch       string
-	BaseBranch   string
-	HeadSHA      string
-	WorktreeID   string
-}
-
 type PrepareWorktreeInput struct {
 	RepoPath        string
 	WorktreeRoot    string
@@ -348,7 +331,6 @@ type CommitResult struct{ CommitSHA string }
 
 type GitGateway interface {
 	CreateWorktree(context.Context, CreateWorktreeInput) (CreateWorktreeResult, error)
-	RestoreWorktree(context.Context, RestoreWorktreeInput) (*RestoreWorktreeResult, error)
 	PrepareWorktree(context.Context, PrepareWorktreeInput) (PrepareWorktreeResult, error)
 	InspectHead(context.Context, InspectHeadInput) (InspectHeadResult, error)
 	Commit(context.Context, CommitInput) (CommitResult, error)
@@ -1521,9 +1503,14 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (w
 				return checkpoint, err
 			}
 			return checkpoint, nil
+		} else {
+			// A checkpointed path may hold uncommitted progress even when the
+			// predecessor crashed before it could persist an execution result.
+			// Recreating its deterministic branch path here would silently turn a
+			// same-worktree continuation into a fresh checkout. Stop for an
+			// operator to recover the exact recorded checkout instead.
+			return checkpoint, staleWorkerWorktreeError(*checkpoint.Worktree, work, err.Error())
 		}
-		checkpoint.Worktree = nil
-		checkpoint.ResumePolicy = "advance_from_checkpoint"
 	}
 	branch := work.Branch
 	if branch == "" {
@@ -1589,16 +1576,16 @@ func (r *Runner) ensureWorkerWorktreeUsable(ctx context.Context, input stepInput
 		return worktree, &loopError{message: rootErr.Error(), kind: FailureRetryableTransient}
 	}
 	if err := worktreesafety.Validate(worktreesafety.CheckInput{WorktreePath: worktree.Path, RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot}); err != nil {
-		return r.recoverWorkerWorktree(ctx, input, checkpoint, work, worktree, err.Error())
+		return worktree, staleWorkerWorktreeError(worktree, work, err.Error())
 	}
 	info, err := os.Stat(worktree.Path)
 	if err == nil {
 		if !info.IsDir() {
-			return r.recoverWorkerWorktree(ctx, input, checkpoint, work, worktree, "path exists but is not a directory")
+			return worktree, staleWorkerWorktreeError(worktree, work, "path exists but is not a directory")
 		}
 		if _, gitErr := os.Stat(filepath.Join(worktree.Path, ".git")); gitErr != nil {
 			if errors.Is(gitErr, os.ErrNotExist) {
-				return r.recoverWorkerWorktree(ctx, input, checkpoint, work, worktree, "path is not a usable git worktree")
+				return worktree, staleWorkerWorktreeError(worktree, work, "path is not a usable git worktree")
 			}
 			return worktree, &loopError{message: fmt.Sprintf("Unable to inspect worker worktree git metadata at %s for branch %s: %v", worktree.Path, firstNonEmpty(worktree.Branch, work.Branch, "unknown"), gitErr), kind: FailureRetryableTransient}
 		}
@@ -1607,42 +1594,7 @@ func (r *Runner) ensureWorkerWorktreeUsable(ctx context.Context, input stepInput
 	if !errors.Is(err, os.ErrNotExist) {
 		return worktree, &loopError{message: fmt.Sprintf("Unable to inspect worker worktree path %s for branch %s: %v", worktree.Path, firstNonEmpty(worktree.Branch, work.Branch, "unknown"), err), kind: FailureRetryableTransient}
 	}
-	return r.recoverWorkerWorktree(ctx, input, checkpoint, work, worktree, "path does not exist")
-}
-
-func (r *Runner) recoverWorkerWorktree(ctx context.Context, input stepInput, checkpoint *workerCheckpoint, work workerInput, worktree checkpointWorktree, reason string) (checkpointWorktree, error) {
-	if r.git == nil {
-		return worktree, staleWorkerWorktreeError(worktree, work, reason+" and git gateway is not configured")
-	}
-	branch := firstNonEmpty(worktree.Branch, work.Branch)
-	if branch == "" {
-		return worktree, staleWorkerWorktreeError(worktree, work, reason+" and target branch is not recorded")
-	}
-	worktreeRoot, rootErr := workerWorktreeRoot(input.Project)
-	if rootErr != nil {
-		return worktree, &loopError{message: rootErr.Error(), kind: FailureRetryableTransient}
-	}
-	restored, restoreErr := r.git.RestoreWorktree(ctx, RestoreWorktreeInput{ProjectID: input.Project.ID, RepoPath: input.Project.RepoPath, Branch: branch, WorktreeRoot: worktreeRoot, ExpectedWorktreePath: worktree.Path})
-	if restoreErr != nil {
-		return worktree, &loopError{message: fmt.Sprintf("Worker worktree path %s for branch %s is stale (%s) and re-resolving registered git worktrees failed: %v", worktree.Path, branch, reason, restoreErr), kind: FailureRetryableAfterResume}
-	}
-	if restored == nil || strings.TrimSpace(restored.WorktreePath) == "" {
-		return worktree, staleWorkerWorktreeError(worktree, work, reason+" and no active git worktree is registered for that branch")
-	}
-	recovered := worktree
-	recovered.Path = restored.WorktreePath
-	recovered.Branch = firstNonEmpty(restored.Branch, branch)
-	recovered.BaseBranch = firstNonEmpty(worktree.BaseBranch, restored.BaseBranch, work.BaseBranch)
-	recovered.HeadSHA = firstNonEmpty(worktree.HeadSHA, restored.HeadSHA)
-	recovered.ID = firstNonEmpty(restored.WorktreeID, worktree.ID)
-	checkpoint.Worktree = &recovered
-	checkpoint.ResumePolicy = "advance_from_checkpoint"
-	if input.Run.ID != "" {
-		if persistErr := r.persistCheckpoint(ctx, input.Run.ID, *checkpoint); persistErr != nil {
-			return worktree, &loopError{message: persistErr.Error(), kind: FailureRetryableAfterResume}
-		}
-	}
-	return recovered, nil
+	return worktree, staleWorkerWorktreeError(worktree, work, "path does not exist")
 }
 
 func workerWorktreeRoot(project storage.ProjectRecord) (string, error) {

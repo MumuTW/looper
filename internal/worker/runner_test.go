@@ -751,7 +751,7 @@ func TestRunPrepareWorktreeRejectsMalformedMetadataBeforeCreatingWorktree(t *tes
 	}
 }
 
-func TestRunPrepareWorktreeStepRecreatesCheckpointOutsideWorktreeRoot(t *testing.T) {
+func TestRunPrepareWorktreeStepRefusesCheckpointOutsideWorktreeRoot(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	repoPath := t.TempDir()
@@ -769,20 +769,15 @@ func TestRunPrepareWorktreeStepRecreatesCheckpointOutsideWorktreeRoot(t *testing
 			Worktree: &checkpointWorktree{Path: legacyPath, Branch: "stale", BaseBranch: "main"},
 		},
 	})
-	if err != nil {
-		t.Fatalf("runPrepareWorktreeStep() error = %v", err)
+	var loopErr *loopError
+	if !errors.As(err, &loopErr) || loopErr.kind != FailureManualIntervention {
+		t.Fatalf("runPrepareWorktreeStep() error = %v, want manual-intervention stale-worktree error", err)
 	}
-	if len(git.createCalls) != 1 {
-		t.Fatalf("len(git.createCalls) = %d, want 1", len(git.createCalls))
+	if len(git.createCalls) != 0 {
+		t.Fatalf("CreateWorktree calls = %#v, want no replacement checkout", git.createCalls)
 	}
-	if checkpoint.Worktree == nil || checkpoint.Worktree.Path != git.createResult.WorktreePath {
-		t.Fatalf("checkpoint.Worktree = %#v, want recreated worktree", checkpoint.Worktree)
-	}
-	if checkpoint.Worktree.Path == legacyPath {
-		t.Fatalf("checkpoint.Worktree.Path = %q, want recreated path outside legacy worktree", checkpoint.Worktree.Path)
-	}
-	if git.createCalls[0].WorktreeRoot != worktreeRoot {
-		t.Fatalf("CreateWorktree().WorktreeRoot = %q, want %q", git.createCalls[0].WorktreeRoot, worktreeRoot)
+	if checkpoint.Worktree == nil || checkpoint.Worktree.Path != legacyPath {
+		t.Fatalf("checkpoint.Worktree = %#v, want original checkpoint preserved", checkpoint.Worktree)
 	}
 }
 
@@ -1348,16 +1343,12 @@ func TestBuildIssueClaimCommentBodyPreservesPausedSummary(t *testing.T) {
 	}
 }
 
-func TestRunExecuteStepRecoversStaleWorktreePathBeforeAgentStart(t *testing.T) {
+func TestRunExecuteStepRefusesReplacementWorktreeBeforeAgentStart(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	recoveredPath := t.TempDir()
 	stalePath := filepath.Join(t.TempDir(), "old-worktree")
 	branch := "looper/feature"
-	git := &fakeGitGateway{
-		restoreResult: &RestoreWorktreeResult{WorktreePath: recoveredPath, Branch: branch, BaseBranch: "main", HeadSHA: "def456", WorktreeID: "worktree_recovered"},
-		inspectResult: InspectHeadResult{HeadSHA: "def456"},
-	}
+	git := &fakeGitGateway{}
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "done", ParseStatus: "parsed"}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true})
 	run := storage.RunRecord{ID: "run_stale_worktree", LoopID: "loop_worker_1", Status: "running", CurrentStep: stringPtr(string(stepExecute)), StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
@@ -1382,31 +1373,15 @@ func TestRunExecuteStepRecoversStaleWorktreePathBeforeAgentStart(t *testing.T) {
 			Plan:     &checkpointPlan{Summary: "Implement worker loop", Items: []string{"Do it"}},
 		},
 	})
-	if err != nil {
-		t.Fatalf("runExecuteStep() error = %v", err)
+	var loopErr *loopError
+	if !errors.As(err, &loopErr) || loopErr.kind != FailureManualIntervention {
+		t.Fatalf("runExecuteStep() error = %v, want manual-intervention stale-worktree error", err)
 	}
-	if checkpoint.Worktree == nil || checkpoint.Worktree.Path != recoveredPath || checkpoint.Worktree.ID != "worktree_recovered" || checkpoint.Worktree.HeadSHA != "abc123" {
-		t.Fatalf("checkpoint.Worktree = %#v, want recovered worktree", checkpoint.Worktree)
+	if checkpoint.Worktree == nil || checkpoint.Worktree.Path != stalePath || checkpoint.Worktree.ID != "worktree_old" {
+		t.Fatalf("checkpoint.Worktree = %#v, want original worktree preserved", checkpoint.Worktree)
 	}
-	if len(git.restoreCalls) != 1 || git.restoreCalls[0].Branch != branch || git.restoreCalls[0].ExpectedWorktreePath != stalePath {
-		t.Fatalf("restoreCalls = %#v, want branch recovery from stale path", git.restoreCalls)
-	}
-	if len(agent.starts) != 1 || agent.starts[0].WorkingDirectory != recoveredPath {
-		t.Fatalf("agent starts = %#v, want recovered working directory", agent.starts)
-	}
-	if len(git.inspectCalls) != 1 || git.inspectCalls[0].WorktreePath != recoveredPath {
-		t.Fatalf("inspectCalls = %#v, want recovered worktree path", git.inspectCalls)
-	}
-	persisted, err := fixture.repos.Runs.GetByID(context.Background(), run.ID)
-	if err != nil || persisted == nil {
-		t.Fatalf("Runs.GetByID() = (%#v, %v), want persisted run", persisted, err)
-	}
-	persistedCheckpoint, err := parseCheckpoint(persisted.CheckpointJSON)
-	if err != nil {
-		t.Fatalf("parseCheckpoint() error = %v", err)
-	}
-	if persistedCheckpoint.Worktree == nil || persistedCheckpoint.Worktree.Path != recoveredPath {
-		t.Fatalf("persisted checkpoint worktree = %#v, want recovered path", persistedCheckpoint.Worktree)
+	if len(agent.starts) != 0 || len(git.inspectCalls) != 0 {
+		t.Fatalf("replacement worktree started agent or inspected progress: starts=%#v inspect=%#v", agent.starts, git.inspectCalls)
 	}
 }
 
@@ -1484,19 +1459,15 @@ func TestRunExecuteStepRechecksWorkerHoldAfterAgentCompletion(t *testing.T) {
 	}
 }
 
-func TestRunExecuteStepRecoversWorktreeOutsideWorktreeRootBeforeAgentStart(t *testing.T) {
+func TestRunExecuteStepRefusesWorktreeOutsideWorktreeRootBeforeAgentStart(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	repoPath := t.TempDir()
 	worktreeRoot := filepath.Join(t.TempDir(), "worktrees")
 	legacyPath := filepath.Join(t.TempDir(), "legacy-wt")
-	recoveredPath := filepath.Join(worktreeRoot, "recovered")
 	metadata := fmt.Sprintf(`{"worktreeRoot":%q}`, worktreeRoot)
 	branch := "looper/feature"
-	git := &fakeGitGateway{
-		restoreResult: &RestoreWorktreeResult{WorktreePath: recoveredPath, Branch: branch, BaseBranch: "main", HeadSHA: "def456", WorktreeID: "worktree_recovered"},
-		inspectResult: InspectHeadResult{HeadSHA: "def456"},
-	}
+	git := &fakeGitGateway{}
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "done", ParseStatus: "parsed"}}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true})
 	run := storage.RunRecord{ID: "run_outside_root_worktree", LoopID: "loop_worker_1", Status: "running", CurrentStep: stringPtr(string(stepExecute)), StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
@@ -1518,17 +1489,15 @@ func TestRunExecuteStepRecoversWorktreeOutsideWorktreeRootBeforeAgentStart(t *te
 			Plan:     &checkpointPlan{Summary: "Implement worker loop", Items: []string{"Do it"}},
 		},
 	})
-	if err != nil {
-		t.Fatalf("runExecuteStep() error = %v", err)
+	var loopErr *loopError
+	if !errors.As(err, &loopErr) || loopErr.kind != FailureManualIntervention {
+		t.Fatalf("runExecuteStep() error = %v, want manual-intervention stale-worktree error", err)
 	}
-	if checkpoint.Worktree == nil || checkpoint.Worktree.Path != recoveredPath || checkpoint.Worktree.ID != "worktree_recovered" {
-		t.Fatalf("checkpoint.Worktree = %#v, want recovered worktree", checkpoint.Worktree)
+	if checkpoint.Worktree == nil || checkpoint.Worktree.Path != legacyPath || checkpoint.Worktree.ID != "worktree_old" {
+		t.Fatalf("checkpoint.Worktree = %#v, want original worktree preserved", checkpoint.Worktree)
 	}
-	if len(git.restoreCalls) != 1 || git.restoreCalls[0].WorktreeRoot != worktreeRoot || git.restoreCalls[0].ExpectedWorktreePath != legacyPath {
-		t.Fatalf("restoreCalls = %#v, want recovery using configured worktree root", git.restoreCalls)
-	}
-	if len(agent.starts) != 1 || agent.starts[0].WorkingDirectory != recoveredPath {
-		t.Fatalf("agent starts = %#v, want recovered working directory", agent.starts)
+	if len(agent.starts) != 0 {
+		t.Fatalf("unsafe worktree started agent: starts=%#v", agent.starts)
 	}
 }
 
@@ -4887,7 +4856,6 @@ func (f *fakeGitHubGateway) AddPullRequestReviewers(_ context.Context, input Pul
 
 type fakeGitGateway struct {
 	createResult   CreateWorktreeResult
-	restoreResult  *RestoreWorktreeResult
 	prepareResult  PrepareWorktreeResult
 	inspectResult  InspectHeadResult
 	inspectResults []InspectHeadResult
@@ -4895,7 +4863,6 @@ type fakeGitGateway struct {
 	inspectIndex   int
 	commitResult   CommitResult
 	createCalls    []CreateWorktreeInput
-	restoreCalls   []RestoreWorktreeInput
 	pushCalls      []PushInput
 	prepareCalls   []PrepareWorktreeInput
 	inspectCalls   []InspectHeadInput
@@ -4920,14 +4887,6 @@ func (f *fakeGitGateway) CreateWorktree(_ context.Context, input CreateWorktreeI
 	}
 	f.createResult = result
 	return result, nil
-}
-
-func (f *fakeGitGateway) RestoreWorktree(_ context.Context, input RestoreWorktreeInput) (*RestoreWorktreeResult, error) {
-	f.restoreCalls = append(f.restoreCalls, input)
-	if f.restoreResult != nil {
-		return f.restoreResult, nil
-	}
-	return &RestoreWorktreeResult{WorktreePath: input.ExpectedWorktreePath, Branch: input.Branch}, nil
 }
 
 func (f *fakeGitGateway) PrepareWorktree(_ context.Context, input PrepareWorktreeInput) (PrepareWorktreeResult, error) {
