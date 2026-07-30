@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"sync/atomic"
 	"testing"
@@ -322,5 +323,47 @@ type countingCancelForwarder struct {
 func (f *countingCancelForwarder) CancelExecute() {
 	if f.onCancel != nil {
 		f.onCancel()
+	}
+}
+
+type closableForwarder struct {
+	stubRuntimeWebhookForwarder
+	closed atomic.Int64
+}
+
+func (f *closableForwarder) Close() { f.closed.Add(1) }
+
+// Contract (#368 review): an injected forwarder's ownership transfers at
+// construction, so a failed Start must close it — callers cannot be
+// required to Stop a runtime whose start failed.
+func TestFailedStartClosesInjectedWebhookForwarder(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
+
+	forwarder := &closableForwarder{}
+	bootErr := errors.New("coordinator boot refused")
+	rt := New(Options{
+		Config:           cfg,
+		Logger:           &testLogger{},
+		WebhookForwarder: forwarder,
+		OpenSQLiteCoordinator: func(context.Context, string, storage.SQLiteCoordinatorOptions) (*storage.SQLiteCoordinator, error) {
+			return nil, bootErr
+		},
+	})
+	if err := rt.Start(context.Background()); !errors.Is(err, bootErr) {
+		t.Fatalf("Start() error = %v, want the injected boot failure", err)
+	}
+	if got := forwarder.closed.Load(); got != 1 {
+		t.Fatalf("forwarder.Close() calls = %d, want exactly 1 after failed Start", got)
+	}
+	rt.Stop("cleanup after failed start")
+	if got := forwarder.closed.Load(); got != 1 {
+		t.Fatalf("forwarder.Close() calls = %d after Stop, want still 1 (no double close)", got)
 	}
 }

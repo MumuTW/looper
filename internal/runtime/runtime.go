@@ -398,9 +398,31 @@ func Start(ctx context.Context, deps bootstrap.RuntimeDependencies) (bootstrap.R
 func (r *Runtime) Start(ctx context.Context) error {
 	r.startOnce.Do(func() {
 		r.startErr = r.start(ctx)
+		if r.startErr != nil {
+			// Ownership of an injected forwarder transferred at construction;
+			// a caller whose Start failed must not be required to Stop the
+			// runtime just to release it.
+			r.closeInjectedWebhookForwarder()
+		}
 	})
 
 	return r.startErr
+}
+
+// closeInjectedWebhookForwarder releases a construction-injected forwarder
+// exactly once: the field is cleared under the lock so a later Stop cannot
+// double-close it.
+func (r *Runtime) closeInjectedWebhookForwarder() {
+	if !r.customWebhookForwarder {
+		return
+	}
+	r.mu.Lock()
+	forwarder := r.webhookForwarder
+	r.webhookForwarder = nil
+	r.mu.Unlock()
+	if forwarder != nil {
+		forwarder.Close()
+	}
 }
 
 func (r *Runtime) Stop(reason string) {
