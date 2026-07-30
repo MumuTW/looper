@@ -2289,6 +2289,8 @@ func TestGatewayInitializesLooperLabelsIdempotently(t *testing.T) {
 			return shell.Result{Stdout: `[{"name":"looper:plan","color":"5319e7","description":"Picked up automatically by planner"},{"name":"looper:spec-reviewing","color":"000000","description":"Old description"}]`}, nil
 		case "label edit looper:spec-reviewing --repo acme/looper --color 1d76db --description Spec PR is under review":
 			return shell.Result{Stdout: "{}"}, nil
+		case "label create looper:worker-ready --repo acme/looper --color 0052cc --description Picked up automatically by worker":
+			return shell.Result{Stdout: "{}"}, nil
 		case "label create looper:spec-ready --repo acme/looper --color 0e8a16 --description Spec PR is ready for implementation":
 			return shell.Result{Stdout: "{}"}, nil
 		case "label create looper:needs-human --repo acme/looper --color d93f0b --description Looper requires manual intervention":
@@ -2312,8 +2314,8 @@ func TestGatewayInitializesLooperLabelsIdempotently(t *testing.T) {
 	if err != nil {
 		t.Fatalf("InitializeLabels() error = %v", err)
 	}
-	if result.Summary.Created != 6 || result.Summary.Updated != 1 || result.Summary.Skipped != 1 || result.Summary.Failed != 0 {
-		t.Fatalf("InitializeLabels() summary = %#v, want created=6 updated=1 skipped=1 failed=0", result.Summary)
+	if result.Summary.Created != 7 || result.Summary.Updated != 1 || result.Summary.Skipped != 1 || result.Summary.Failed != 0 {
+		t.Fatalf("InitializeLabels() summary = %#v, want created=7 updated=1 skipped=1 failed=0", result.Summary)
 	}
 
 	log := strings.Join(runner.calls, "\n")
@@ -2345,6 +2347,8 @@ func TestGatewayInitializesLooperLabelsForHostQualifiedRepo(t *testing.T) {
 			return shell.Result{Stdout: "{}"}, nil
 		case "label create looper:spec-reviewing --repo github.example.com/acme/looper --color 1d76db --description Spec PR is under review":
 			return shell.Result{Stdout: "{}"}, nil
+		case "label create looper:worker-ready --repo github.example.com/acme/looper --color 0052cc --description Picked up automatically by worker":
+			return shell.Result{Stdout: "{}"}, nil
 		case "label create looper:spec-ready --repo github.example.com/acme/looper --color 0e8a16 --description Spec PR is ready for implementation":
 			return shell.Result{Stdout: "{}"}, nil
 		case "label create looper:needs-human --repo github.example.com/acme/looper --color d93f0b --description Looper requires manual intervention":
@@ -2368,7 +2372,7 @@ func TestGatewayInitializesLooperLabelsForHostQualifiedRepo(t *testing.T) {
 	if err != nil {
 		t.Fatalf("InitializeLabels() error = %v", err)
 	}
-	if result.Repo != "github.example.com/acme/looper" || result.Summary.Created != 8 {
+	if result.Repo != "github.example.com/acme/looper" || result.Summary.Created != 9 {
 		t.Fatalf("InitializeLabels() result = %#v, want host-qualified repo and created=8", result)
 	}
 }
@@ -2390,8 +2394,8 @@ func TestGatewayDryRunInitializesLooperLabelsWithoutMutating(t *testing.T) {
 	if err != nil {
 		t.Fatalf("InitializeLabels(dry run) error = %v", err)
 	}
-	if result.Summary.Created != 8 || len(runner.calls) != 1 {
-		t.Fatalf("dry run result = %#v, calls = %#v; want eight planned creates and only label list", result.Summary, runner.calls)
+	if result.Summary.Created != 9 || len(runner.calls) != 1 {
+		t.Fatalf("dry run result = %#v, calls = %#v; want nine planned creates and only label list", result.Summary, runner.calls)
 	}
 }
 
@@ -2404,6 +2408,8 @@ func TestGatewayInitializeLabelsReturnsErrorWhenMutationFails(t *testing.T) {
 		case "label list --repo acme/looper --limit 1000 --json name,color,description":
 			return shell.Result{Stdout: `[{"name":"looper:plan","color":"5319e7","description":"Picked up automatically by planner"}]`}, nil
 		case "label create looper:spec-reviewing --repo acme/looper --color 1d76db --description Spec PR is under review":
+			return shell.Result{Stdout: "{}"}, nil
+		case "label create looper:worker-ready --repo acme/looper --color 0052cc --description Picked up automatically by worker":
 			return shell.Result{Stdout: "{}"}, nil
 		case "label create looper:spec-ready --repo acme/looper --color 0e8a16 --description Spec PR is ready for implementation":
 			return shell.Result{Stdout: "{}"}, nil
@@ -2429,8 +2435,8 @@ func TestGatewayInitializeLabelsReturnsErrorWhenMutationFails(t *testing.T) {
 	if err == nil {
 		t.Fatalf("InitializeLabels() error = nil, want failure")
 	}
-	if result.Summary.Failed != 1 || result.Summary.Created != 6 || result.Summary.Skipped != 1 {
-		t.Fatalf("InitializeLabels() summary = %#v, want created=6 skipped=1 failed=1", result.Summary)
+	if result.Summary.Failed != 1 || result.Summary.Created != 7 || result.Summary.Skipped != 1 {
+		t.Fatalf("InitializeLabels() summary = %#v, want created=7 skipped=1 failed=1", result.Summary)
 	}
 	got := ""
 	for _, label := range result.Labels {
