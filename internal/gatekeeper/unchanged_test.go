@@ -88,10 +88,9 @@ func TestDiscoverPullRequestsReevaluatesWhenTheListPageChanges(t *testing.T) {
 	}
 }
 
-// Check-run state is the one gate input the list page cannot see: a pending check
-// turning green moves nothing on the pull request. A report blocked on a check
-// must therefore never be skipped, however unchanged the pull request looks.
-func TestDiscoverPullRequestsNeverSkipsWhileWaitingOnACheck(t *testing.T) {
+// A pending check resolves on its own: it turns green while every field the list
+// page can see stays identical, so it must never be skipped.
+func TestDiscoverPullRequestsNeverSkipsWhileACheckIsPending(t *testing.T) {
 	fixture := newGatekeeperFixture(t)
 	fixture.github.openPullRequests = []githubinfra.PullRequestSummary{openPullRequestFixture()}
 	fixture.github.checks = githubinfra.PullRequestCheckRuns{
@@ -100,13 +99,38 @@ func TestDiscoverPullRequestsNeverSkipsWhileWaitingOnACheck(t *testing.T) {
 	}
 
 	first := discover(t, fixture)
-	if !hasCheckReason(first.Reports[0]) {
-		t.Fatalf("first report reasons = %v, want a check reason so the skip guard is exercised", reasonCodes(first.Reports[0].Reasons))
+	if !reportAwaitsCheckState(first.Reports[0]) {
+		t.Fatalf("first report reasons = %v, want a pending-check reason so the guard is exercised", reasonCodes(first.Reports[0].Reasons))
 	}
 
 	second := discover(t, fixture)
 	if second.Evaluated != 1 || second.Skipped != 0 {
-		t.Fatalf("second tick = %d evaluated / %d skipped, want 1 / 0 while a check is outstanding",
+		t.Fatalf("second tick = %d evaluated / %d skipped, want 1 / 0 while a check is pending",
+			second.Evaluated, second.Skipped)
+	}
+}
+
+// A failed check is the opposite case and the one that decides whether this
+// optimisation is worth anything: on a live daemon nearly every open pull request
+// carried one, so treating it as volatile made almost nothing skippable. A failure
+// does not fix itself — a re-run with a push moves the head SHA and is caught by
+// the fingerprint, and a re-run without one is bounded by maxSkipAge.
+func TestDiscoverPullRequestsSkipsWhenACheckHasFailed(t *testing.T) {
+	fixture := newGatekeeperFixture(t)
+	fixture.github.openPullRequests = []githubinfra.PullRequestSummary{openPullRequestFixture()}
+	fixture.github.checks = githubinfra.PullRequestCheckRuns{
+		TotalCount: 1,
+		CheckRuns:  []githubinfra.PullRequestCheckRun{{Name: "ci", Status: "completed", Conclusion: "failure", AppID: 15368}},
+	}
+
+	first := discover(t, fixture)
+	if !hasReason(first.Reports[0], ReasonCheckFailed) {
+		t.Fatalf("first report reasons = %v, want required_check_failed", reasonCodes(first.Reports[0].Reasons))
+	}
+
+	second := discover(t, fixture)
+	if second.Evaluated != 0 || second.Skipped != 1 {
+		t.Fatalf("second tick = %d evaluated / %d skipped, want 0 / 1 (a failed check does not resolve itself)",
 			second.Evaluated, second.Skipped)
 	}
 }
@@ -134,6 +158,11 @@ func TestDiscoverPullRequestsReevaluatesAfterMaxSkipAge(t *testing.T) {
 	}
 }
 
-func hasCheckReason(report Report) bool {
-	return reportAwaitsCheckState(report)
+func hasReason(report Report, code ReasonCode) bool {
+	for _, reason := range report.Reasons {
+		if reason.Code == code {
+			return true
+		}
+	}
+	return false
 }
