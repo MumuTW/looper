@@ -1687,7 +1687,7 @@ func (r *Runner) DiscoverPullRequest(ctx context.Context, input TargetedDiscover
 		return result, nil
 	}
 	if !r.pullRequestEligibleForDiscovery(ctx, input.ProjectID, pr, input.Repo, currentUser, policy, loopsByPR) {
-		if !labelsMatch(detail.Labels, policy.Labels, policy.LabelMode) {
+		if !config.LabelsMatch(detail.Labels, policy.Labels, policy.LabelMode) {
 			if err := r.pauseFixerLoopForLabelMismatch(ctx, project.ID, input.Repo, input.PRNumber); err != nil {
 				return DiscoveryResult{}, err
 			}
@@ -1874,7 +1874,7 @@ func (r *Runner) pullRequestEligibleForDiscovery(ctx context.Context, projectID 
 	if policy.AuthorFilter != config.FixerAuthorFilterAny && !sameGitHubLogin(pr.Author, currentUser) {
 		return false
 	}
-	if !labelsMatch(pr.Labels, policy.Labels, policy.LabelMode) {
+	if !config.LabelsMatch(pr.Labels, policy.Labels, policy.LabelMode) {
 		return false
 	}
 	return true
@@ -2674,7 +2674,7 @@ func (r *Runner) runDiscoverPRStep(ctx context.Context, input stepInput) (fixerC
 		return checkpoint, &holdSkipError{summary: fmt.Sprintf("Fixer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
 	}
 	policy := r.discoveryPolicyForProject(input.Project.ID)
-	if !isManualFixerLoop(input.Loop) && len(prQueryLabels(policy.Labels)) > 0 && !labelsMatch(detail.Labels, policy.Labels, policy.LabelMode) {
+	if !isManualFixerLoop(input.Loop) && len(prQueryLabels(policy.Labels)) > 0 && !config.LabelsMatch(detail.Labels, policy.Labels, policy.LabelMode) {
 		return checkpoint, &labelMismatchSkipError{summary: fmt.Sprintf("Paused fixer run for %s#%d because PR labels no longer match fixer trigger policy", input.Repo, input.PRNumber)}
 	}
 	checkpoint.Detail = &checkpointDetail{State: detail.State, IsDraft: detail.IsDraft, Labels: cloneStrings(detail.Labels), HeadSHA: detail.HeadSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, BaseSHA: detail.BaseSHA, ReviewDecision: detail.ReviewDecision, Comments: cloneObjectSlice(detail.Comments), IssueComments: cloneObjectSlice(detail.IssueComments), Checks: cloneObjectSlice(detail.Checks), HasConflicts: detail.HasConflicts}
@@ -2724,7 +2724,7 @@ func (r *Runner) pullRequestLabelAuthoritySkipReason(ctx context.Context, loop s
 	if len(prQueryLabels(policy.Labels)) == 0 {
 		return "", runtimeSkipNone, nil
 	}
-	if labelsMatch(detail.Labels, policy.Labels, policy.LabelMode) {
+	if config.LabelsMatch(detail.Labels, policy.Labels, policy.LabelMode) {
 		return "", runtimeSkipNone, nil
 	}
 	return fmt.Sprintf("Paused fixer run for %s#%d because PR labels no longer match fixer trigger policy", repo, prNumber), runtimeSkipLabelMismatch, nil
@@ -5418,7 +5418,7 @@ func (r *Runner) recoverLegacyNoopFollowupLoops(ctx context.Context, project sto
 			seenTargets[targetKey] = struct{}{}
 			continue
 		}
-		if !isManualFixerLoop(loop) && !labelsMatch(detail.Labels, policy.Labels, policy.LabelMode) {
+		if !isManualFixerLoop(loop) && !config.LabelsMatch(detail.Labels, policy.Labels, policy.LabelMode) {
 			seenTargets[targetKey] = struct{}{}
 			continue
 		}
@@ -7914,26 +7914,6 @@ func prQueryLabels(labels []string) []string {
 		result = append(result, label)
 	}
 	return result
-}
-
-func labelsMatch(itemLabels []string, required []string, mode config.LabelMode) bool {
-	if len(required) == 0 {
-		return true
-	}
-	if mode == config.LabelModeAny {
-		for _, label := range required {
-			if labels.Has(itemLabels, label) {
-				return true
-			}
-		}
-		return false
-	}
-	for _, label := range required {
-		if !labels.Has(itemLabels, label) {
-			return false
-		}
-	}
-	return true
 }
 
 func isSpecReviewClean(detail PullRequestDetail) bool {
