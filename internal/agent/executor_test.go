@@ -200,6 +200,100 @@ func TestConfiguredExecutorRejectsRestrictedNonCodexAgent(t *testing.T) {
 	}
 }
 
+func TestConfiguredExecutorAssessmentRejectsUnsupportedVendorAndOperatorOverrides(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		config ExecutorConfig
+		input  RunInput
+		want   string
+	}{
+		{
+			name:   "unsupported vendor",
+			config: ExecutorConfig{Vendor: config.AgentVendorClaudeCode},
+			want:   "supported only for codex",
+		},
+		{
+			name:   "command wrapper",
+			config: ExecutorConfig{Vendor: config.AgentVendorCodex, Params: map[string]any{"command": "/tmp/assessment-wrapper"}},
+			want:   "rejects configured command wrappers",
+		},
+		{
+			name:   "sandbox argv and config override",
+			config: ExecutorConfig{Vendor: config.AgentVendorCodex, Params: map[string]any{"args": []any{"exec", "--sandbox", "danger-full-access", "-c", "sandbox_workspace_write.network_access=true"}}},
+			want:   "rejects configured argv overrides",
+		},
+		{
+			name:   "native resume",
+			config: ExecutorConfig{Vendor: config.AgentVendorCodex},
+			input:  RunInput{NativeSessionID: "resume-me"},
+			want:   "does not permit native resume",
+		},
+	}
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			vendor := tc.config.Vendor
+			executor := New(ExecutorOptions{Config: tc.config, ParamsOwnerVendor: &vendor})
+			input := tc.input
+			input.Assessment = true
+			input.Prompt = "inspect this issue"
+			input.WorkingDirectory = t.TempDir()
+			_, err := executor.Start(context.Background(), input)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Start() error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestAssessmentSandboxConfigIsAcceptedByCodexExec(t *testing.T) {
+	codex, err := exec.LookPath("codex")
+	if err != nil {
+		t.Skip("codex is not installed")
+	}
+	sandbox, err := validationcmd.NewAssessmentSandbox(t.TempDir(), "looper-assessment", "looper-assessment-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sandbox.Cleanup()
+
+	_, args := resolveAssessmentSpawn(ExecutorConfig{Vendor: config.AgentVendorCodex}, "inspect", sandbox)
+	args = append(args[:len(args)-1], "--strict-config", "--help")
+	if output, runErr := exec.Command(codex, args...).CombinedOutput(); runErr != nil {
+		t.Fatalf("codex rejected assessment sandbox config: %v\n%s", runErr, output)
+	}
+}
+
+func TestResolveAssessmentSpawnUsesDedicatedReadOnlyProfile(t *testing.T) {
+	sandbox, err := validationcmd.NewAssessmentSandbox(t.TempDir(), "looper-assessment", "looper-assessment-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sandbox.Cleanup()
+
+	command, args := resolveAssessmentSpawn(ExecutorConfig{Vendor: config.AgentVendorCodex}, "inspect", sandbox)
+	if command != "codex" {
+		t.Fatalf("command = %q, want codex", command)
+	}
+	joined := strings.Join(args, " ")
+	for _, want := range []string{"--ignore-user-config", "permission_profile=\"looper-assessment\"", `":workspace_roots" = { "." = "read" }`, "network = { enabled = false }"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("assessment args = %q, missing %q", joined, want)
+		}
+	}
+	for _, forbidden := range []string{"workspace-write", "network_access=true", "--search", "--profile"} {
+		if strings.Contains(joined, forbidden) {
+			t.Fatalf("assessment args retain %q: %q", forbidden, joined)
+		}
+	}
+	if args[len(args)-1] != "inspect" {
+		t.Fatalf("assessment args = %#v, want prompt last", args)
+	}
+}
+
 func TestResolveSpawnOpenCodeDoesNotDuplicateRunSubcommand(t *testing.T) {
 	t.Parallel()
 

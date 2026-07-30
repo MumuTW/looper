@@ -23,11 +23,30 @@ type Sandbox struct {
 	CWD         string
 	ProfileName string
 	TempRoot    string
+	access      workspaceAccess
 }
+
+type workspaceAccess string
+
+const (
+	workspaceWritable workspaceAccess = "write"
+	workspaceReadOnly workspaceAccess = "read"
+)
 
 // NewSandbox creates the disposable filesystem used by one sandboxed run.
 // Call Cleanup after the owning process has terminated.
 func NewSandbox(cwd, profileName, prefix string) (*Sandbox, error) {
+	return newSandbox(cwd, profileName, prefix, workspaceWritable)
+}
+
+// NewAssessmentSandbox creates the Codex tool profile used before a human has
+// authorized repository mutation. The worktree and linked Git metadata remain
+// readable, while only the run-scoped temporary root is writable.
+func NewAssessmentSandbox(cwd, profileName, prefix string) (*Sandbox, error) {
+	return newSandbox(cwd, profileName, prefix, workspaceReadOnly)
+}
+
+func newSandbox(cwd, profileName, prefix string, access workspaceAccess) (*Sandbox, error) {
 	cwd = strings.TrimSpace(cwd)
 	if cwd == "" {
 		return nil, fmt.Errorf("validation sandbox: cwd is required")
@@ -43,7 +62,11 @@ func NewSandbox(cwd, profileName, prefix string) (*Sandbox, error) {
 	if err != nil {
 		return nil, fmt.Errorf("validation sandbox: create temporary root: %w", err)
 	}
-	sandbox := &Sandbox{CWD: filepath.Clean(cwd), ProfileName: profileName, TempRoot: tempRoot}
+	if access != workspaceWritable && access != workspaceReadOnly {
+		_ = os.RemoveAll(tempRoot)
+		return nil, fmt.Errorf("validation sandbox: unsupported workspace access %q", access)
+	}
+	sandbox := &Sandbox{CWD: filepath.Clean(cwd), ProfileName: profileName, TempRoot: tempRoot, access: access}
 	for _, dir := range []string{"home", "tmp", "xdg-config", "xdg-cache", "xdg-data", "go", "go-cache"} {
 		if err := os.MkdirAll(filepath.Join(tempRoot, dir), 0o700); err != nil {
 			sandbox.Cleanup()
@@ -61,7 +84,7 @@ func (s *Sandbox) Cleanup() {
 
 // PermissionConfig returns the inline Codex permission profile definition.
 func (s *Sandbox) PermissionConfig() string {
-	return buildPermissionProfile(s.CWD, s.TempRoot, s.ProfileName)
+	return buildPermissionProfileForAccess(s.CWD, s.TempRoot, s.ProfileName, s.access)
 }
 
 // Environment returns the allowlisted environment exposed to sandboxed tools.
@@ -178,6 +201,10 @@ func resolvedModuleCache() string {
 }
 
 func buildPermissionProfile(cwd, tempRoot, profileName string) string {
+	return buildPermissionProfileForAccess(cwd, tempRoot, profileName, workspaceWritable)
+}
+
+func buildPermissionProfileForAccess(cwd, tempRoot, profileName string, access workspaceAccess) string {
 	readRoots := map[string]struct{}{}
 	for _, entry := range filepath.SplitList(os.Getenv("PATH")) {
 		entry = strings.TrimSpace(entry)
@@ -209,8 +236,11 @@ func buildPermissionProfile(cwd, tempRoot, profileName string) string {
 	}
 	sort.Strings(paths)
 
+	if access != workspaceWritable && access != workspaceReadOnly {
+		return ""
+	}
 	var filesystem strings.Builder
-	filesystem.WriteString(`":minimal" = "read", ":workspace_roots" = { "." = "write" }`)
+	fmt.Fprintf(&filesystem, `":minimal" = "read", ":workspace_roots" = { "." = %q }`, string(access))
 	fmt.Fprintf(&filesystem, ", %s = \"write\"", strconv.Quote(filepath.Clean(tempRoot)))
 	for _, path := range paths {
 		fmt.Fprintf(&filesystem, ", %s = \"read\"", strconv.Quote(path))

@@ -57,6 +57,14 @@ func ReadOnlyProfile(allowRead, allowedDomains []string) Profile {
 	}
 }
 
+// AssessmentProfile is the pre-authorization capability boundary. Assessment
+// commands may inspect only their explicit repository and tool roots; they
+// receive no network capability at all. Model transport belongs to the native
+// agent runtime, never to its tools.
+func AssessmentProfile(allowRead []string) Profile {
+	return ReadOnlyProfile(allowRead, nil)
+}
+
 // WritableWorkspaceProfile is for credential-free repository validation. It
 // can write the CWD, while callers identify host read roots that stay hidden.
 func WritableWorkspaceProfile(allowRead, denyRead []string) Profile {

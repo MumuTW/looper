@@ -34,6 +34,26 @@ func TestBuildPermissionProfileDeniesNetworkAndLimitsWrites(t *testing.T) {
 	}
 }
 
+func TestBuildAssessmentPermissionProfileReadsWorkspaceAndWritesOnlyTempRoot(t *testing.T) {
+	t.Setenv("PATH", "/usr/bin:/opt/tools/bin")
+
+	profile := buildPermissionProfileForAccess("/workspace/repo", "/private/tmp/assessment", "looper-assessment", workspaceReadOnly)
+	for _, want := range []string{
+		`permissions.looper-assessment=`,
+		`network = { enabled = false }`,
+		`":workspace_roots" = { "." = "read" }`,
+		`"/private/tmp/assessment" = "write"`,
+		`"/usr/bin" = "read"`,
+	} {
+		if !strings.Contains(profile, want) {
+			t.Fatalf("profile = %q, missing %q", profile, want)
+		}
+	}
+	if strings.Contains(profile, `":workspace_roots" = { "." = "write" }`) {
+		t.Fatalf("assessment profile grants worktree writes: %q", profile)
+	}
+}
+
 func TestIsolatedEnvironmentOmitsDaemonCredentials(t *testing.T) {
 	t.Setenv("SSH_AUTH_SOCK", "/tmp/daemon-agent.sock")
 	t.Setenv("LOOPER_CONFIG", "/home/daemon/.looper/config.json")
