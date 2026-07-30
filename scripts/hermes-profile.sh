@@ -36,7 +36,16 @@ LOOPER_HERMES_HOME="$HERMES_ROOT/profiles/$LOOPER_HERMES_PROFILE"
 LOOPER_DEVIN_MODEL="${LOOPER_DEVIN_MODEL:-glm-5-2}"
 # Deliberately narrow: the memory writers only. Widening this grants the ACP
 # backend unattended use of whatever you add.
-LOOPER_ALLOWED_TOOLS="${LOOPER_ALLOWED_TOOLS:-hermes_memory_add,hermes_memory_replace,hermes_memory_remove,hermes_memory_read}"
+# Fully-qualified MCP names (mcp__<server>__<tool>) — the form Devin reports.
+# Pinning the server too means another server exposing a same-named tool does
+# not inherit the grant.
+LOOPER_MCP_SERVER="${LOOPER_MCP_SERVER:-hermes-memory}"
+LOOPER_ALLOWED_TOOLS="${LOOPER_ALLOWED_TOOLS:-}"
+if [ -z "$LOOPER_ALLOWED_TOOLS" ]; then
+  for _t in hermes_memory_add hermes_memory_replace hermes_memory_remove hermes_memory_read; do
+    LOOPER_ALLOWED_TOOLS="${LOOPER_ALLOWED_TOOLS:+$LOOPER_ALLOWED_TOOLS,}mcp__${LOOPER_MCP_SERVER}__${_t}"
+  done
+fi
 
 bootstrap() {
   if [ ! -d "$LOOPER_HERMES_HOME" ]; then
