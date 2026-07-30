@@ -64,12 +64,15 @@ type activeRunExecutionVerifier interface {
 	ExecutionMatchesProcess(context.Context, storage.AgentExecutionRecord, int) (bool, bool, error)
 }
 
-// quarantineSettler retires quarantine evidence on the Authority of the
-// operator verb being served. Optional so processes without runtime control
-// keep working; when absent, retry on a quarantined loop simply fails its
-// preconditions as before.
-type quarantineSettler interface {
-	SettleQuarantineForLoop(context.Context, string, looperdruntime.SettlementProvenance) (looperdruntime.QuarantineSettlementSummary, error)
+// quarantineSettlementPlanner assesses, outside any transaction, what quarantine
+// evidence the operator verb being served may retire. The write itself happens
+// inside the caller's transaction via looperdruntime.ApplyQuarantineSettlement,
+// so evidence is never retired unless the operator's work commits.
+//
+// Optional so processes without runtime control keep working; when absent,
+// retry on a quarantined loop simply fails its preconditions as before.
+type quarantineSettlementPlanner interface {
+	PlanQuarantineSettlementForLoop(context.Context, string, looperdruntime.SettlementProvenance) (looperdruntime.QuarantineSettlementPlan, error)
 }
 
 // ConfigFieldMetadata describes where an effective field came from and whether
@@ -6022,27 +6025,24 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string,
 	unlockTarget := h.lockLoopTarget(preflightLoop.ProjectID, domain.LoopType(preflightLoop.Type), target)
 	defer unlockTarget()
 
-	// Retiring quarantine evidence is the first thing an operator retry does,
-	// because otherwise a quarantined loop can never be retried at all: recovery
-	// parks it at paused with its run left at running, and
-	// assertLoopRetryPreconditions below refuses any retry whose loop has a
-	// running run. The operator's verb is the disposition that breaks that cycle
-	// (#149 / #150).
+	// A quarantined loop can otherwise never be retried at all: recovery parks
+	// it at paused with its run left at running, and assertLoopRetryPreconditions
+	// refuses any retry whose loop has a running run. The operator's verb is the
+	// disposition that breaks that cycle (#149 / #150).
 	//
-	// It runs here, before the queue item is published, so the settled run is
-	// durable before the claim pump can start replacement work and collide with
-	// it on idx_runs_one_running_per_loop. A live agent is still refused: the
-	// settler retains observed-live executions, so the preconditions below fail
-	// exactly as they should.
-	if settler, ok := h.context.Runtime.(quarantineSettler); ok {
-		if _, err := settler.SettleQuarantineForLoop(ctx, loopID, looperdruntime.SettlementByOperatorRetry); err != nil {
-			return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: fmt.Sprintf("settle quarantine before retry: %v", err)}
+	// Only the assessment happens here — probing processes must not hold a write
+	// transaction open. The write is applied inside the requeue transaction
+	// below, against the exact row versions this plan recorded, so a failed
+	// retry rolls the settlement back with it and a concurrent heartbeat is
+	// never overwritten. A live agent is refused at plan time, leaving the
+	// preconditions to fail exactly as they should.
+	var quarantinePlan looperdruntime.QuarantineSettlementPlan
+	if planner, ok := h.context.Runtime.(quarantineSettlementPlanner); ok {
+		plan, planErr := planner.PlanQuarantineSettlementForLoop(ctx, loopID, looperdruntime.SettlementByOperatorRetry)
+		if planErr != nil {
+			return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: fmt.Sprintf("assess quarantine before retry: %v", planErr)}
 		}
-		if refreshed, refreshErr := services.Repositories.Loops.GetByID(ctx, loopID); refreshErr != nil {
-			return retryLoopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: refreshErr.Error()}
-		} else if refreshed != nil {
-			preflightLoop = refreshed
-		}
+		quarantinePlan = plan
 	}
 
 	// Opt-in discard runs before requeue so git mutation stays outside the
@@ -6164,6 +6164,19 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string,
 		}
 		if loop == nil {
 			return retryResult{}, apiError{code: pkgapi.ErrorCodeLoopNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Loop not found: %s", loopID)}
+		}
+		// Settle before the preconditions read, and inside this transaction, so
+		// the running run the quarantine stranded is gone by the time the
+		// running-run check looks — and so it comes back if anything below
+		// aborts. A row that moved since the plan was made aborts the retry
+		// rather than being overwritten.
+		if !quarantinePlan.Empty() {
+			if _, err := looperdruntime.ApplyQuarantineSettlement(ctx, repos, quarantinePlan, nowISO); err != nil {
+				if errors.Is(err, looperdruntime.ErrQuarantineEvidenceChanged) {
+					return retryResult{}, apiError{code: pkgapi.ErrorCodeLoopConflict, status: http.StatusConflict, message: fmt.Sprintf("Loop %s changed while its quarantine was being assessed; retry again", loopID)}
+				}
+				return retryResult{}, err
+			}
 		}
 		if err := h.assertLoopRetryPreconditions(ctx, repos, *loop, nowISO); err != nil {
 			return retryResult{}, err

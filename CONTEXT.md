@@ -255,11 +255,12 @@ control-plane leadership, fencing-token validated at every GitHub side-effect
 boundary.
 
 **Quarantine settlement**:
-Defined at `runtime.SettlementProvenance` in `internal/runtime`, whose doc
-comment carries the semantics: quarantine evidence stops describing an ongoing
-condition on a named Authority — the operator verb being served, or the loop
-having already moved on — and never on a PID probe. Its constants separate the
-inline operator path from the periodic backstop in the audit trail.
+Defined at `runtime.QuarantineSettlementPlan` in `internal/runtime`, whose doc
+comment carries the semantics: quarantine evidence is retired as a conditional
+authority boundary inside the operator verb being served — probed outside the
+transaction, applied inside it against the row versions probed, and never on the
+Authority of a PID probe. `runtime.SettlementProvenance` separates that operator
+path from the periodic backstop in the audit trail.
 _Avoid_: quarantine cleanup, confirmed-dead, reconcile.
 
 ### Testing

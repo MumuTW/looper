@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"database/sql"
 	"path/filepath"
 	"syscall"
 	"testing"
@@ -126,6 +127,23 @@ func (f quarantineSettlementFixture) eventTypes(t *testing.T) []string {
 		types = append(types, event.EventType)
 	}
 	return types
+}
+
+// applyOperatorPlan drives the real two-phase operator path: probe outside a
+// transaction, then apply the plan inside one.
+func (f quarantineSettlementFixture) applyOperatorPlan(t *testing.T) (QuarantineSettlementSummary, error) {
+	t.Helper()
+	ctx := context.Background()
+	plan, err := f.runtime.PlanQuarantineSettlementForLoop(ctx, f.loopID, SettlementByOperatorRetry)
+	if err != nil {
+		return QuarantineSettlementSummary{}, err
+	}
+	if plan.Empty() {
+		return plan.retained, nil
+	}
+	return storage.WithTransactionValue(ctx, f.runtime.Services().Coordinator.DB(), nil, func(tx *sql.Tx) (QuarantineSettlementSummary, error) {
+		return ApplyQuarantineSettlement(ctx, storage.NewRepositories(tx), plan, f.nowISO)
+	})
 }
 
 func containsString(values []string, want string) bool {
@@ -253,9 +271,6 @@ func TestQuarantineSettlementKeepsParkedLoopAsDebt(t *testing.T) {
 	if summary.QuarantineSettlement.SettledExecutions != 0 {
 		t.Fatalf("SettledExecutions = %d, want 0 while the loop is still parked", summary.QuarantineSettlement.SettledExecutions)
 	}
-	if summary.QuarantineSettlement.ParkedExecutionsRetained != 1 {
-		t.Fatalf("ParkedExecutionsRetained = %d, want 1", summary.QuarantineSettlement.ParkedExecutionsRetained)
-	}
 
 	after := fixture.debt(t)
 	if after.QuarantinedActiveExecutions != 1 {
@@ -329,9 +344,9 @@ func TestSettleQuarantineForLoopUnblocksParkedLoopWithRunningRun(t *testing.T) {
 		t.Fatalf("run status = %q, want the retry blocker still present before the operator acts", run.Status)
 	}
 
-	summary, err := fixture.runtime.SettleQuarantineForLoop(context.Background(), fixture.loopID, SettlementByOperatorRetry)
+	summary, err := fixture.applyOperatorPlan(t)
 	if err != nil {
-		t.Fatalf("SettleQuarantineForLoop() error = %v", err)
+		t.Fatalf("operator settlement error = %v", err)
 	}
 	if summary.SettledExecutions != 1 || summary.SettledRuns != 1 {
 		t.Fatalf("summary = %#v, want 1 execution and 1 run settled on operator authority", summary)
@@ -359,9 +374,9 @@ func TestSettleQuarantineForLoopRefusesLiveExecution(t *testing.T) {
 
 	fixture := newQuarantineSettlementFixture(t, "paused", true)
 
-	summary, err := fixture.runtime.SettleQuarantineForLoop(context.Background(), fixture.loopID, SettlementByOperatorRetry)
+	summary, err := fixture.applyOperatorPlan(t)
 	if err != nil {
-		t.Fatalf("SettleQuarantineForLoop() error = %v", err)
+		t.Fatalf("operator settlement error = %v", err)
 	}
 	if summary.SettledExecutions != 0 || summary.LiveExecutionsRetained != 1 {
 		t.Fatalf("summary = %#v, want the live execution retained, not settled", summary)

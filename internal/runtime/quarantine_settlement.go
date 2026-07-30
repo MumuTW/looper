@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -25,6 +26,11 @@ const (
 	executionStatusQuarantineSettled = "quarantine_settled"
 )
 
+// ErrQuarantineEvidenceChanged reports that durable state moved between the
+// liveness probe and the write. It aborts the caller's transaction rather than
+// letting a stale snapshot overwrite a concurrent heartbeat or finalization.
+var ErrQuarantineEvidenceChanged = errors.New("quarantine evidence changed after it was assessed")
+
 // SettlementProvenance names why quarantine evidence was retired. It is
 // recorded on the retirement event and is deliberately not collapsed into one
 // "operator" label: an explicit retry/stop/close is a human act, while a loop
@@ -33,33 +39,280 @@ const (
 type SettlementProvenance string
 
 const (
-	// SettlementByOperatorRetry / Stop are explicit human verbs. They authorize
+	// SettlementByOperatorRetry is an explicit human verb. It authorizes
 	// settling a loop that is still parked, because the operator's own action is
 	// the disposition — this is what makes `looper retry` on a quarantined loop
 	// work at all (#149).
 	SettlementByOperatorRetry SettlementProvenance = "operator_retry"
-	SettlementByOperatorStop  SettlementProvenance = "operator_stop"
 	// SettlementByLoopDisposed covers the periodic backstop: the loop is no
-	// longer parked, so whatever moved it — an operator verb whose settlement
-	// did not run, or a Role reaching a terminal status — there is no work left
-	// for this execution to describe. It never settles a parked loop.
+	// longer parked, so whatever moved it — an operator verb, or a Role reaching
+	// a terminal status — there is no work left for this execution to describe.
+	// It never settles a parked loop.
 	SettlementByLoopDisposed SettlementProvenance = "loop_disposed"
 )
 
-// QuarantineSettlementSummary reports one settlement pass.
+// QuarantineSettlementSummary reports one settlement.
 type QuarantineSettlementSummary struct {
-	// SettledExecutions counts quarantined executions retired this pass.
 	SettledExecutions int64 `json:"settledExecutions"`
-	// SettledRuns counts still-running runs closed alongside those executions.
-	SettledRuns int64 `json:"settledRuns"`
-	// LiveExecutionsRetained counts quarantined executions left as debt because
-	// a probe still matched their process.
-	LiveExecutionsRetained int64 `json:"liveExecutionsRetained"`
-	// ParkedExecutionsRetained counts quarantined executions left as debt
-	// because nothing has disposed of their loop yet.
-	ParkedExecutionsRetained int64    `json:"parkedExecutionsRetained"`
-	EventsWritten            int64    `json:"eventsWritten"`
-	ExecutionIDs             []string `json:"executionIds,omitempty"`
+	SettledRuns       int64 `json:"settledRuns"`
+	// LiveExecutionsRetained counts executions left alone because a probe still
+	// matched their process.
+	LiveExecutionsRetained int64    `json:"liveExecutionsRetained"`
+	EventsWritten          int64    `json:"eventsWritten"`
+	ExecutionIDs           []string `json:"executionIds,omitempty"`
+}
+
+// plannedSettlement is one execution the probe cleared for settling, carrying
+// the exact row version it was assessed against.
+type plannedSettlement struct {
+	execution      storage.AgentExecutionRecord
+	loopStatus     string
+	quarantinedAt  string
+	classification ContainmentClassification
+	// runObservedUpdatedAt is the run's version at probe time, empty when there
+	// is no run to close or a live sibling still holds it.
+	runObservedUpdatedAt string
+	closeRun             bool
+}
+
+// QuarantineSettlementPlan is the decision a liveness probe reached, ready to
+// be applied inside a caller's transaction.
+//
+// Planning and applying are split because the two have incompatible needs:
+// probing inspects processes and must not hold a write transaction open, while
+// the write must be atomic with whatever the caller is doing. Splitting them
+// introduces a window, which is why every write in Apply is conditional on the
+// row version recorded here.
+type QuarantineSettlementPlan struct {
+	provenance SettlementProvenance
+	planned    []plannedSettlement
+	retained   QuarantineSettlementSummary
+}
+
+// Empty reports whether the plan would write nothing.
+func (p QuarantineSettlementPlan) Empty() bool { return len(p.planned) == 0 }
+
+// PlanQuarantineSettlementForLoop probes one loop's quarantined executions and
+// returns what may be settled on the Authority of the operator verb being
+// served. It reads and probes only that loop: a single retry must not make the
+// daemon inspect every process it has ever recorded.
+//
+// It does not consult quarantineParkedLoopStatus. Quarantine parks the loop at
+// `paused` and leaves its run at `running`, and assertLoopRetryPreconditions
+// refuses any retry whose loop has a running run — so waiting for the loop to
+// be non-parked would deadlock. The operator's verb is what breaks that cycle.
+//
+// A live process is still refused: asking to retry does not make a running
+// agent go away, and the retry must fail loudly instead.
+func (r *Runtime) PlanQuarantineSettlementForLoop(ctx context.Context, loopID string, provenance SettlementProvenance) (QuarantineSettlementPlan, error) {
+	r.mu.RLock()
+	repositories := r.services.Repositories
+	r.mu.RUnlock()
+	loopID = strings.TrimSpace(loopID)
+	if repositories == nil || loopID == "" {
+		return QuarantineSettlementPlan{provenance: provenance}, nil
+	}
+	loop, err := repositories.Loops.GetByID(ctx, loopID)
+	if err != nil {
+		return QuarantineSettlementPlan{}, err
+	}
+	if loop == nil {
+		return QuarantineSettlementPlan{provenance: provenance}, nil
+	}
+	return r.planQuarantineSettlement(ctx, repositories, []storage.LoopRecord{*loop}, provenance)
+}
+
+// planQuarantineSettlement is the shared planner over an explicit loop set.
+func (r *Runtime) planQuarantineSettlement(ctx context.Context, repositories *storage.Repositories, loops []storage.LoopRecord, provenance SettlementProvenance) (QuarantineSettlementPlan, error) {
+	plan := QuarantineSettlementPlan{provenance: provenance}
+	if repositories == nil || repositories.AgentExecutions == nil || repositories.Events == nil || len(loops) == 0 {
+		return plan, nil
+	}
+	loopStatusByID := make(map[string]string, len(loops))
+	for _, loop := range loops {
+		loopStatusByID[loop.ID] = loop.Status
+	}
+
+	activeExecutions, err := repositories.AgentExecutions.ListActive(ctx)
+	if err != nil {
+		return QuarantineSettlementPlan{}, fmt.Errorf("list active agent executions: %w", err)
+	}
+	scoped := make([]storage.AgentExecutionRecord, 0, len(activeExecutions))
+	for _, execution := range activeExecutions {
+		if _, wanted := loopStatusByID[strings.TrimSpace(derefString(execution.LoopID))]; wanted {
+			scoped = append(scoped, execution)
+		}
+	}
+	if len(scoped) == 0 {
+		return plan, nil
+	}
+	executionIDs := make([]string, 0, len(scoped))
+	for _, execution := range scoped {
+		executionIDs = append(executionIDs, execution.ID)
+	}
+	quarantinedAtByExecutionID, err := repositories.Events.ListFirstEventTimestampsByType(ctx, recoveryExecutionQuarantinedEventType, "agent_execution", executionIDs)
+	if err != nil {
+		return QuarantineSettlementPlan{}, fmt.Errorf("list quarantine recovery evidence: %w", err)
+	}
+	if len(quarantinedAtByExecutionID) == 0 {
+		return plan, nil
+	}
+
+	// Liveness is classified across every execution in scope, not only the
+	// quarantined ones: a run is safe to close only when nothing on it is live,
+	// including a sibling this pass is not settling.
+	classifications := make(map[string]ContainmentClassification, len(scoped))
+	liveRunIDs := make(map[string]struct{})
+	for _, execution := range scoped {
+		classification, err := r.classifyStartupExecution(ctx, execution, nil)
+		if err != nil {
+			return QuarantineSettlementPlan{}, err
+		}
+		classifications[execution.ID] = classification
+		if classification.Class == ContainmentObservedLive {
+			if runID := strings.TrimSpace(derefString(execution.RunID)); runID != "" {
+				liveRunIDs[runID] = struct{}{}
+			}
+		}
+	}
+
+	runVersions := make(map[string]string)
+	for _, execution := range scoped {
+		quarantinedAt, quarantined := quarantinedAtByExecutionID[execution.ID]
+		if !quarantined {
+			continue
+		}
+		if classifications[execution.ID].Class == ContainmentObservedLive {
+			plan.retained.LiveExecutionsRetained++
+			continue
+		}
+		entry := plannedSettlement{
+			execution:      execution,
+			loopStatus:     loopStatusByID[strings.TrimSpace(derefString(execution.LoopID))],
+			quarantinedAt:  quarantinedAt,
+			classification: classifications[execution.ID],
+		}
+		runID := strings.TrimSpace(derefString(execution.RunID))
+		if _, live := liveRunIDs[runID]; runID != "" && !live && repositories.Runs != nil {
+			version, ok := runVersions[runID]
+			if !ok {
+				run, err := repositories.Runs.GetByID(ctx, runID)
+				if err != nil {
+					return QuarantineSettlementPlan{}, err
+				}
+				if run != nil && run.Status == string(domain.RunStatusRunning) {
+					version = run.UpdatedAt
+				}
+				runVersions[runID] = version
+			}
+			if version != "" {
+				entry.runObservedUpdatedAt = version
+				entry.closeRun = true
+			}
+		}
+		plan.planned = append(plan.planned, entry)
+	}
+	return plan, nil
+}
+
+// ApplyQuarantineSettlement writes a plan through the caller's repositories,
+// which are expected to be transaction-scoped.
+//
+// Every write is conditional on the row version the plan recorded, and a miss
+// returns ErrQuarantineEvidenceChanged rather than forcing the write. Two
+// properties follow, both of which an earlier revision got wrong:
+//
+//   - Concurrent state is never overwritten. Settlement touches only the
+//     columns it owns and only while the row is still the one that was probed,
+//     so a heartbeat or a terminal write landing in the probe window wins.
+//   - Evidence is never retired unless the caller's own work commits. Running
+//     inside the retry transaction means a later precondition failure rolls the
+//     settlement back with it, instead of leaving a loop whose quarantine was
+//     cleared but which was never actually retried.
+func ApplyQuarantineSettlement(ctx context.Context, repositories *storage.Repositories, plan QuarantineSettlementPlan, nowISO string) (QuarantineSettlementSummary, error) {
+	summary := plan.retained
+	if repositories == nil || len(plan.planned) == 0 {
+		return summary, nil
+	}
+	for _, entry := range plan.planned {
+		reason := quarantineSettlementReason(plan.provenance, entry.loopStatus)
+		settled, err := repositories.AgentExecutions.SettleQuarantined(ctx, storage.SettleQuarantinedExecutionInput{
+			ID:                entry.execution.ID,
+			ObservedStatus:    entry.execution.Status,
+			ObservedUpdatedAt: entry.execution.UpdatedAt,
+			Status:            executionStatusQuarantineSettled,
+			EndedAt:           nowISO,
+			ErrorMessage:      reason,
+			UpdatedAt:         nowISO,
+		})
+		if err != nil {
+			return QuarantineSettlementSummary{}, err
+		}
+		if !settled {
+			return QuarantineSettlementSummary{}, fmt.Errorf("%w: agent execution %s", ErrQuarantineEvidenceChanged, entry.execution.ID)
+		}
+
+		if entry.closeRun {
+			runID := strings.TrimSpace(derefString(entry.execution.RunID))
+			interrupted, err := repositories.Runs.InterruptQuarantinedIfUnchanged(ctx, runID, entry.runObservedUpdatedAt, reason, nowISO)
+			if err != nil {
+				return QuarantineSettlementSummary{}, err
+			}
+			if !interrupted {
+				return QuarantineSettlementSummary{}, fmt.Errorf("%w: run %s", ErrQuarantineEvidenceChanged, runID)
+			}
+			summary.SettledRuns++
+			if err := appendSystemEvent(ctx, repositories, storage.EventLogRecord{
+				ID:          newRuntimeEventID(),
+				EventType:   "looperd.recovery.run_interrupted",
+				ProjectID:   entry.execution.ProjectID,
+				LoopID:      entry.execution.LoopID,
+				RunID:       entry.execution.RunID,
+				EntityType:  stringPtr("run"),
+				EntityID:    stringPtr(runID),
+				PayloadJSON: mustMarshalJSON(map[string]any{"previousStatus": "running", "recoveredStatus": "interrupted"}),
+				CreatedAt:   nowISO,
+			}); err != nil {
+				return QuarantineSettlementSummary{}, err
+			}
+			summary.EventsWritten++
+		}
+
+		payload := map[string]any{
+			"reason":         reason,
+			"provenance":     string(plan.provenance),
+			"executionId":    entry.execution.ID,
+			"quarantinedAt":  entry.quarantinedAt,
+			"loopStatus":     entry.loopStatus,
+			"identityReason": entry.classification.Reason,
+			"class":          string(entry.classification.Class),
+			"statusBefore":   entry.execution.Status,
+			"statusAfter":    executionStatusQuarantineSettled,
+		}
+		if !entry.closeRun && strings.TrimSpace(derefString(entry.execution.RunID)) != "" {
+			payload["runRetained"] = "live_or_already_closed"
+		}
+		if entry.classification.PID > 0 {
+			payload["pid"] = entry.classification.PID
+		}
+		if err := appendSystemEvent(ctx, repositories, storage.EventLogRecord{
+			ID:          newRuntimeEventID(),
+			EventType:   recoveryExecutionQuarantineRetiredEventType,
+			ProjectID:   entry.execution.ProjectID,
+			LoopID:      entry.execution.LoopID,
+			RunID:       entry.execution.RunID,
+			EntityType:  stringPtr("agent_execution"),
+			EntityID:    stringPtr(entry.execution.ID),
+			PayloadJSON: mustMarshalJSON(payload),
+			CreatedAt:   nowISO,
+		}); err != nil {
+			return QuarantineSettlementSummary{}, err
+		}
+		summary.EventsWritten++
+		summary.SettledExecutions++
+		summary.ExecutionIDs = append(summary.ExecutionIDs, entry.execution.ID)
+	}
+	return summary, nil
 }
 
 // quarantineParkedLoopStatus reports whether a loop is still parked by
@@ -79,301 +332,76 @@ func quarantineParkedLoopStatus(status string) bool {
 	}
 }
 
-// settlementCandidate is one quarantined execution considered for settlement,
-// carrying the classification and the run-level context needed to decide.
-type settlementCandidate struct {
-	execution     storage.AgentExecutionRecord
-	loop          *storage.LoopRecord
-	quarantinedAt string
-}
-
-// SettleQuarantineForLoop retires the quarantine evidence on one loop on the
-// Authority of an explicit operator verb, and is the reason `looper retry`
-// works on a quarantined loop at all.
-//
-// Without it the recovery path deadlocks: quarantine parks the loop at `paused`
-// and leaves its run at `running`, assertLoopRetryPreconditions refuses any
-// retry whose loop has a running run, and the periodic backstop only settles
-// loops that are no longer parked. Nothing could move first. The operator's
-// verb breaks that cycle — it is a disposition in its own right, so this path
-// does not consult quarantineParkedLoopStatus.
-//
-// It still refuses to settle an execution whose process is observed live: an
-// operator asking to retry does not make a running agent go away, and the retry
-// must fail loudly instead.
-//
-// Callers run this before publishing replacement work, so the settled run is
-// durable before any claim can race it onto idx_runs_one_running_per_loop.
-func (r *Runtime) SettleQuarantineForLoop(ctx context.Context, loopID string, provenance SettlementProvenance) (QuarantineSettlementSummary, error) {
-	r.mu.RLock()
-	repositories := r.services.Repositories
-	now := r.now
-	r.mu.RUnlock()
-	if repositories == nil {
-		return QuarantineSettlementSummary{}, nil
-	}
-	if now == nil {
-		return QuarantineSettlementSummary{}, fmt.Errorf("runtime clock is not configured")
-	}
-	nowISO := formatJavaScriptISOString(now().UTC())
-	return r.settleQuarantine(ctx, repositories, nowISO, strings.TrimSpace(loopID), provenance)
-}
-
-// settleDisposedQuarantine is the periodic backstop: it retires quarantine
-// evidence for every loop that is no longer parked, so evidence an operator
-// resolved through a path that did not settle inline still stops counting
-// (#149 / #150).
-//
-// What it must not do, and does not do:
-//   - it never kills or signals a process;
-//   - it never treats a missing PID as confirmed-dead Authority. A quarantined
-//     execution whose loop is still parked keeps counting as debt no matter what
-//     the PID probe says, and one whose process still matches is retained even
-//     after disposition;
-//   - it never closes a run that any live execution still belongs to;
-//   - it never deletes the original quarantine event.
+// settleDisposedQuarantine is the periodic backstop for evidence whose loop
+// already moved on by a path that did not settle inline. It never settles a
+// parked loop, never kills a process, and never treats a missing PID as
+// confirmed-dead Authority.
 //
 // Executions already at a durable terminal status (including the "timeout" rows
 // #150 asks about) are out of scope by construction: ListActive only returns
 // running/cancelling, so they never counted toward debt in the first place.
 func (r *Runtime) settleDisposedQuarantine(ctx context.Context, repositories *storage.Repositories, nowISO string) (QuarantineSettlementSummary, error) {
-	return r.settleQuarantine(ctx, repositories, nowISO, "", SettlementByLoopDisposed)
-}
-
-// settleQuarantine is the shared core. When loopIDFilter is empty it runs the
-// parked gate (periodic backstop); when set it settles that loop only, on the
-// caller's provenance, without the parked gate.
-func (r *Runtime) settleQuarantine(ctx context.Context, repositories *storage.Repositories, nowISO, loopIDFilter string, provenance SettlementProvenance) (QuarantineSettlementSummary, error) {
 	var summary QuarantineSettlementSummary
-	if repositories == nil || repositories.AgentExecutions == nil || repositories.Events == nil || repositories.Loops == nil {
+	if repositories == nil || repositories.Loops == nil {
 		return summary, nil
 	}
-
-	activeExecutions, err := repositories.AgentExecutions.ListActive(ctx)
-	if err != nil {
-		return QuarantineSettlementSummary{}, fmt.Errorf("list active agent executions: %w", err)
-	}
-	if len(activeExecutions) == 0 {
-		return summary, nil
-	}
-	executionIDs := make([]string, 0, len(activeExecutions))
-	for _, execution := range activeExecutions {
-		executionIDs = append(executionIDs, execution.ID)
-	}
-	quarantinedAtByExecutionID, err := repositories.Events.ListFirstEventTimestampsByType(ctx, recoveryExecutionQuarantinedEventType, "agent_execution", executionIDs)
-	if err != nil {
-		return QuarantineSettlementSummary{}, fmt.Errorf("list quarantine recovery evidence: %w", err)
-	}
-	if len(quarantinedAtByExecutionID) == 0 {
-		return summary, nil
-	}
-
-	// Liveness is classified for every active execution first, not just the
-	// candidates: a run is only safe to close when no execution on it is live,
-	// including siblings this pass is not settling.
-	liveRunIDs, err := r.liveRunIDs(ctx, activeExecutions)
+	loops, err := repositories.Loops.List(ctx)
 	if err != nil {
 		return QuarantineSettlementSummary{}, err
 	}
-
-	var candidates []settlementCandidate
-	for _, execution := range activeExecutions {
-		quarantinedAt, quarantined := quarantinedAtByExecutionID[execution.ID]
-		if !quarantined {
+	disposed := make([]storage.LoopRecord, 0, len(loops))
+	for _, loop := range loops {
+		if quarantineParkedLoopStatus(loop.Status) {
 			continue
 		}
-		loopID := strings.TrimSpace(derefString(execution.LoopID))
-		if loopIDFilter != "" && loopID != loopIDFilter {
-			continue
-		}
-		var loop *storage.LoopRecord
-		if loopID != "" {
-			loop, err = repositories.Loops.GetByID(ctx, loopID)
-			if err != nil {
-				return QuarantineSettlementSummary{}, err
-			}
-		}
-		// An execution with no loop row has nothing that could have disposed of
-		// it, so it is retained rather than settled by default.
-		if loop == nil {
-			summary.ParkedExecutionsRetained++
-			continue
-		}
-		// The backstop only touches loops that already moved on. An explicit
-		// operator verb is itself the disposition and skips this gate.
-		if loopIDFilter == "" && quarantineParkedLoopStatus(loop.Status) {
-			summary.ParkedExecutionsRetained++
-			continue
-		}
-		candidates = append(candidates, settlementCandidate{execution: execution, loop: loop, quarantinedAt: quarantinedAt})
+		disposed = append(disposed, loop)
+	}
+	if len(disposed) == 0 {
+		return summary, nil
+	}
+	plan, err := r.planQuarantineSettlement(ctx, repositories, disposed, SettlementByLoopDisposed)
+	if err != nil {
+		return QuarantineSettlementSummary{}, err
+	}
+	if plan.Empty() {
+		return plan.retained, nil
 	}
 
-	for _, candidate := range candidates {
-		if err := ctx.Err(); err != nil {
-			return QuarantineSettlementSummary{}, err
-		}
-		// Disposition is not permission to forget a process that is demonstrably
-		// still there.
-		classification, err := r.classifyStartupExecution(ctx, candidate.execution, nil)
-		if err != nil {
-			return QuarantineSettlementSummary{}, err
-		}
-		if classification.Class == ContainmentObservedLive {
-			summary.LiveExecutionsRetained++
-			continue
-		}
-		runID := strings.TrimSpace(derefString(candidate.execution.RunID))
-		_, runHasLiveExecution := liveRunIDs[runID]
-
-		settledRuns, events, err := r.commitQuarantineSettlement(ctx, candidate, classification, provenance, runHasLiveExecution, nowISO)
-		if err != nil {
-			return QuarantineSettlementSummary{}, err
-		}
-		summary.SettledExecutions++
-		summary.SettledRuns += settledRuns
-		summary.EventsWritten += events
-		summary.ExecutionIDs = append(summary.ExecutionIDs, candidate.execution.ID)
-	}
-
-	if summary.SettledExecutions > 0 && r.logger != nil {
-		r.logger.Info("retired quarantine evidence", map[string]any{
-			"provenance":        string(provenance),
-			"settledExecutions": summary.SettledExecutions,
-			"settledRuns":       summary.SettledRuns,
-			"retainedLive":      summary.LiveExecutionsRetained,
-			"retainedParked":    summary.ParkedExecutionsRetained,
-		})
-	}
-	return summary, nil
-}
-
-// liveRunIDs classifies every active execution and returns the runs that still
-// have at least one observed-live execution on them. Settling one uncertain
-// execution must not close a run a live sibling is still working under, because
-// closing it frees idx_runs_one_running_per_loop and lets replacement work start
-// alongside a demonstrably live agent.
-func (r *Runtime) liveRunIDs(ctx context.Context, activeExecutions []storage.AgentExecutionRecord) (map[string]struct{}, error) {
-	live := make(map[string]struct{})
-	for _, execution := range activeExecutions {
-		runID := strings.TrimSpace(derefString(execution.RunID))
-		if runID == "" {
-			continue
-		}
-		if _, known := live[runID]; known {
-			continue
-		}
-		classification, err := r.classifyStartupExecution(ctx, execution, nil)
-		if err != nil {
-			return nil, err
-		}
-		if classification.Class == ContainmentObservedLive {
-			live[runID] = struct{}{}
-		}
-	}
-	return live, nil
-}
-
-// commitQuarantineSettlement writes one execution's settlement in a single
-// transaction: the execution leaves active, any run still stuck at running is
-// closed, and the events land together.
-//
-// Atomicity is the point. Split across statements, a failure after the
-// execution upsert would drop the row out of ListActive — so no later pass
-// would ever reconsider it — while leaving the run at running and the audit
-// trail incomplete. That failure is invisible and permanent, so the write is
-// all-or-nothing.
-func (r *Runtime) commitQuarantineSettlement(ctx context.Context, candidate settlementCandidate, classification ContainmentClassification, provenance SettlementProvenance, runHasLiveExecution bool, nowISO string) (int64, int64, error) {
 	r.mu.RLock()
 	coordinator := r.services.Coordinator
 	r.mu.RUnlock()
 	if coordinator == nil {
-		return 0, 0, fmt.Errorf("storage coordinator is not configured")
+		return QuarantineSettlementSummary{}, fmt.Errorf("storage coordinator is not configured")
 	}
-
-	var settledRuns, events int64
-	err := storage.WithTransaction(ctx, coordinator.DB(), nil, func(tx *sql.Tx) error {
-		settledRuns, events = 0, 0
-		repos := storage.NewRepositories(tx)
-		execution := candidate.execution
-		loop := candidate.loop
-		reason := quarantineSettlementReason(provenance, loop.Status)
-
-		settled := execution
-		settled.Status = executionStatusQuarantineSettled
-		if settled.EndedAt == nil {
-			settled.EndedAt = stringPtr(nowISO)
-		}
-		if settled.ErrorMessage == nil {
-			settled.ErrorMessage = stringPtr(reason)
-		}
-		settled.UpdatedAt = nowISO
-		if err := repos.AgentExecutions.Upsert(ctx, settled); err != nil {
-			return err
-		}
-
-		runID := strings.TrimSpace(derefString(execution.RunID))
-		if runID != "" && !runHasLiveExecution {
-			run, err := repos.Runs.GetByID(ctx, runID)
-			if err != nil {
-				return err
-			}
-			// Leaving the run at running is what inflated activeRuns and what
-			// the one-running-run-per-loop unique index trips over when the
-			// operator retries, so close it with the status migration 0008 uses.
-			if run != nil && run.Status == string(domain.RunStatusRunning) {
-				if err := interruptRecoveryRun(ctx, repos, *run, *loop, nowISO, reason); err != nil {
-					return err
-				}
-				settledRuns++
-				events++
-			}
-		}
-
-		payload := map[string]any{
-			"reason":         reason,
-			"provenance":     string(provenance),
-			"executionId":    execution.ID,
-			"quarantinedAt":  candidate.quarantinedAt,
-			"loopStatus":     loop.Status,
-			"identityReason": classification.Reason,
-			"class":          string(classification.Class),
-			"statusBefore":   execution.Status,
-			"statusAfter":    executionStatusQuarantineSettled,
-		}
-		if runHasLiveExecution {
-			payload["runRetained"] = "live_sibling_execution"
-		}
-		if classification.PID > 0 {
-			payload["pid"] = classification.PID
-		}
-		if err := appendSystemEvent(ctx, repos, storage.EventLogRecord{
-			ID:          newRuntimeEventID(),
-			EventType:   recoveryExecutionQuarantineRetiredEventType,
-			ProjectID:   execution.ProjectID,
-			LoopID:      execution.LoopID,
-			RunID:       execution.RunID,
-			EntityType:  stringPtr("agent_execution"),
-			EntityID:    stringPtr(execution.ID),
-			PayloadJSON: mustMarshalJSON(payload),
-			CreatedAt:   nowISO,
-		}); err != nil {
-			return err
-		}
-		events++
-		return nil
+	summary, err = storage.WithTransactionValue(ctx, coordinator.DB(), nil, func(tx *sql.Tx) (QuarantineSettlementSummary, error) {
+		return ApplyQuarantineSettlement(ctx, storage.NewRepositories(tx), plan, nowISO)
 	})
 	if err != nil {
-		return 0, 0, err
+		// Losing a race with concurrent execution state is expected on a busy
+		// daemon and self-corrects: the next tick re-probes. It is not a
+		// reconcile failure.
+		if errors.Is(err, ErrQuarantineEvidenceChanged) {
+			if r.logger != nil {
+				r.logger.Info("quarantine settlement deferred to next tick", map[string]any{"reason": err.Error()})
+			}
+			return plan.retained, nil
+		}
+		return QuarantineSettlementSummary{}, err
 	}
-	return settledRuns, events, nil
+	if summary.SettledExecutions > 0 && r.logger != nil {
+		r.logger.Info("retired quarantine evidence", map[string]any{
+			"provenance":        string(SettlementByLoopDisposed),
+			"settledExecutions": summary.SettledExecutions,
+			"settledRuns":       summary.SettledRuns,
+		})
+	}
+	return summary, nil
 }
 
 func quarantineSettlementReason(provenance SettlementProvenance, loopStatus string) string {
 	switch provenance {
 	case SettlementByOperatorRetry:
 		return "quarantine settled: operator retried this loop"
-	case SettlementByOperatorStop:
-		return "quarantine settled: operator stopped this loop"
 	default:
 		return fmt.Sprintf("quarantine settled: loop is no longer parked (loop status %s)", loopStatus)
 	}

@@ -610,6 +610,43 @@ func (r *ProjectsRepository) Archive(ctx context.Context, id string, updatedAt s
 	return rowsAffected > 0, nil
 }
 
+// SettleQuarantinedExecutionInput narrows a quarantine settlement to exactly
+// the row the caller observed. ObservedUpdatedAt is the compare-and-set guard:
+// a heartbeat or a terminal write landing between the caller's read and this
+// update must win, not be overwritten from the caller's stale snapshot.
+type SettleQuarantinedExecutionInput struct {
+	ID                string
+	ObservedStatus    string
+	ObservedUpdatedAt string
+	Status            string
+	EndedAt           string
+	ErrorMessage      string
+	UpdatedAt         string
+}
+
+// SettleQuarantined moves one quarantined execution out of the active set,
+// touching only the columns settlement owns. It reports false without writing
+// when the row already moved on, so the caller can abort rather than clobber.
+func (r *AgentExecutionsRepository) SettleQuarantined(ctx context.Context, input SettleQuarantinedExecutionInput) (bool, error) {
+	result, err := r.q.ExecContext(ctx, `
+		UPDATE agent_executions
+		SET status = ?,
+		    ended_at = COALESCE(ended_at, ?),
+		    error_message = COALESCE(error_message, ?),
+		    updated_at = ?
+		WHERE id = ? AND status = ? AND updated_at = ?`,
+		input.Status, input.EndedAt, input.ErrorMessage, input.UpdatedAt,
+		input.ID, input.ObservedStatus, input.ObservedUpdatedAt)
+	if err != nil {
+		return false, fmt.Errorf("settle quarantined agent execution: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("settle quarantined agent execution rows affected: %w", err)
+	}
+	return affected > 0, nil
+}
+
 type LoopsRepository struct{ q sqliteQuerier }
 
 func (r *LoopsRepository) Upsert(ctx context.Context, record LoopRecord) error {
@@ -909,6 +946,31 @@ func (r *LoopsRepository) TerminateByProject(ctx context.Context, projectID, upd
 }
 
 type RunsRepository struct{ q sqliteQuerier }
+
+// InterruptQuarantinedIfUnchanged closes a run stranded at running by a
+// quarantine, touching only the columns the interruption owns and only while
+// the row is still the one the caller observed. Reports false without writing
+// otherwise, so a run that resumed or finalized concurrently is never
+// overwritten from a stale snapshot.
+func (r *RunsRepository) InterruptQuarantinedIfUnchanged(ctx context.Context, id, observedUpdatedAt, errorMessage, nowISO string) (bool, error) {
+	result, err := r.q.ExecContext(ctx, `
+		UPDATE runs
+		SET status = 'interrupted',
+		    error_message = COALESCE(error_message, ?),
+		    ended_at = COALESCE(ended_at, ?),
+		    last_heartbeat_at = ?,
+		    updated_at = ?
+		WHERE id = ? AND status = 'running' AND updated_at = ?`,
+		errorMessage, nowISO, nowISO, nowISO, id, observedUpdatedAt)
+	if err != nil {
+		return false, fmt.Errorf("interrupt quarantined run: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("interrupt quarantined run rows affected: %w", err)
+	}
+	return affected > 0, nil
+}
 
 type AgentExecutionsRepository struct{ q sqliteQuerier }
 

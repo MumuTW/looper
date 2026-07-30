@@ -330,22 +330,35 @@ Worse, the exit was not merely missing but self-blocking. Quarantine parks the
 loop at `paused` *and* leaves its run at `running`, while
 `assertLoopRetryPreconditions` refuses any retry whose loop has a running run —
 so the remedy `looper status` prints could never succeed on the very loops it
-printed it for. Settlement therefore has two entry points, and the operator one
-is what breaks that cycle:
+printed it for.
 
-- `runtime.SettleQuarantineForLoop` runs inline in the operator verb being
-  served, before replacement work is published. Its Authority is the human act
-  itself, so it does not wait for the loop to leave `paused` — it is what lets
-  the loop leave `paused`. Running before the queue item is published also keeps
-  the settled run durable before any claim can race it onto
-  `idx_runs_one_running_per_loop`.
-- `runtime.settleDisposedQuarantine` is the periodic backstop for evidence whose
-  loop already moved on by some other path. Its provenance is recorded as
+Settlement is therefore not a layer that runs on its own schedule. It is a
+**conditional authority boundary inside the operator verb being served**, split
+into a plan and an apply because probing processes and holding a write
+transaction are incompatible:
+
+- `runtime.PlanQuarantineSettlementForLoop` probes, outside any transaction and
+  scoped to the one loop being retried. A single retry must not make the daemon
+  inspect every process it has ever recorded. It does not wait for the loop to
+  leave `paused` — the operator's verb is what lets it leave `paused`.
+- `runtime.ApplyQuarantineSettlement` writes inside the caller's transaction,
+  ahead of the precondition read, so the stranded run is gone when the
+  running-run check looks. Two properties follow: a later precondition failure
+  rolls the settlement back with it, so evidence is never retired for a retry
+  that did not happen; and the settled run is durable before the queue item is
+  published, so no claim can race it onto `idx_runs_one_running_per_loop`.
+- Every write is conditional on the row version the plan recorded. A heartbeat
+  or a terminal write landing in the probe window wins, and settlement returns
+  `ErrQuarantineEvidenceChanged` to abort rather than overwriting from a stale
+  snapshot. Settlement also touches only the columns it owns.
+- `runtime.settleDisposedQuarantine` remains as a periodic backstop for evidence
+  whose loop already moved on by some other path. Its provenance is recorded as
   `loop_disposed`, not as an operator act: `completed` / `failed` are also
   written autonomously by Roles, and the audit trail should not claim a human
-  did something a Role did.
+  did something a Role did. Losing the compare-and-set race there is expected on
+  a busy daemon and simply defers to the next tick.
 
-Both share the same refusals, and neither consults a PID probe for Authority:
+Neither path consults a PID probe for Authority, and both refuse the same way:
 
 - a loop still at `paused` / `human_takeover` is never settled by the backstop,
   no matter what its PID does, because nothing has decided anything about it;
@@ -358,10 +371,6 @@ Both share the same refusals, and neither consults a PID probe for Authority:
 - settled executions move to `quarantine_settled`, deliberately *not* one of the
   `durableTerminalExecution` statuses, so settling never reads as confirmed-dead
   Authority for any later classification;
-- the execution write, the run closure, and both events commit in one
-  transaction, because a partial write would drop the row out of `ListActive` —
-  where no later pass would reconsider it — while leaving the run `running` and
-  the audit trail incomplete;
 - settlement writes a `looperd.recovery.execution_quarantine_retired` event
   beside the original quarantine event, and kills nothing.
 
