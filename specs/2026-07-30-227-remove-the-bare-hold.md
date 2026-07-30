@@ -53,8 +53,13 @@ No production source or documentation change is needed. The active configuration
 
 Before deleting, establish that no item or live configuration uses `hold`, and that the GitHub search result is complete:
 
+**Authority:** the effective `looperd` configuration is authoritative because
+it is what the dispatch and label-application paths consume; a planner's claim
+about defaults or current labels is not. This remains a one-time operator
+precondition, not a new runtime gate or persisted state.
+
 1. **In-repo usage:** run `gh api "search/issues?q=repo:MumuTW/looper+label:hold" --jq '{total_count, incomplete_results}'`. It must report exactly `{"total_count":0,"incomplete_results":false}` (open and closed). The issue reports zero today; re-confirm at execution time. If either value differs, stop: use a complete, authoritative listing and migrate those items to `looper:hold` (or deliberately drop the label) before retrying.
-2. **Effective configuration:** inspect the running `looperd` configuration after all precedence layers (file, environment, and flags), not only the checked-in defaults. `roles.coordinator.dispatch.autonomous.holdLabel` must be `looper:hold` (or empty if legacy compatibility is intentionally disabled). Also reject any effective label value normalized to `hold` that can reach Looper's automatic issue/PR label-application paths; migrate it to its intended official or project-specific label, restart/reload the daemon, and re-inspect before deleting. This prevents both removal of a configured autonomous-dispatch veto and automatic recreation by `ensureLabelsExist`.
+2. **Effective configuration:** inspect the running `looperd` configuration after all precedence layers (file, environment, and flags), not only the checked-in defaults. `roles.coordinator.dispatch.autonomous.holdLabel` must be `looper:hold`; the config validator does not permit it to be empty. Also reject any effective label value normalized to `hold` that can reach Looper's automatic issue/PR label-application paths; migrate it to its intended official or project-specific label, restart/reload the daemon, and re-inspect before deleting. This prevents both removal of a configured autonomous-dispatch veto and automatic recreation by `ensureLabelsExist`.
 3. **External dependency:** the issue flags that a maintainer-owned automation or saved filter outside this repository could apply `hold`. There is no way to survey that exhaustively from inside the repo. `looper:hold` is the only documented operator-facing hold contract, but a known external consumer must be migrated before deletion rather than assumed harmless.
 
 ### Execution
