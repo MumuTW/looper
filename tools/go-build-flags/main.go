@@ -28,6 +28,11 @@ func applyDirtySuffix(value string, dirty bool) string {
 // worktreeDirty reports whether the working tree has uncommitted or untracked
 // changes. Untracked files count: a new .go file changes the build.
 //
+// --untracked-files=all is passed explicitly so a user's
+// status.showUntrackedFiles=no cannot defeat the untracked-file contract:
+// without it, a checkout whose only change is a new untracked .go file would
+// probe as clean and the build would keep the wrong stamp.
+//
 // Uncertainty resolves to clean. Release and CI builds run from a pristine
 // checkout and a tarball build has no git at all, so suffixing those on a
 // failed probe would corrupt artifact versions to avoid a stamp that was
@@ -36,7 +41,7 @@ func applyDirtySuffix(value string, dirty bool) string {
 // Only the version string is suffixed. GitCommitSHA keeps its exact value — it
 // is a commit id, and appending to it would make it stop being one.
 func worktreeDirty(run func(name string, args ...string) ([]byte, error)) bool {
-	out, err := run("git", "status", "--porcelain")
+	out, err := run("git", "status", "--porcelain", "--untracked-files=all")
 	if err != nil {
 		return false
 	}

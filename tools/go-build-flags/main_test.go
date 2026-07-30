@@ -72,7 +72,7 @@ func TestWorktreeDirtyProbesGitStatusPorcelain(t *testing.T) {
 	if gotName != "git" {
 		t.Fatalf("command = %q, want git", gotName)
 	}
-	want := []string{"status", "--porcelain"}
+	want := []string{"status", "--porcelain", "--untracked-files=all"}
 	if len(gotArgs) != len(want) {
 		t.Fatalf("args = %#v, want %#v", gotArgs, want)
 	}
