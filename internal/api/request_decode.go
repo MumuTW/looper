@@ -70,10 +70,10 @@ func decodeStrictJSONValue(raw []byte, dst any) *apiError {
 		return &apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "Request body must contain exactly one JSON value"}
 	}
 	// raw is valid single-value JSON at this point, so a failure here is a
-	// genuine duplicate. Comparison is case-folded because encoding/json
-	// matches struct fields case-insensitively even with
-	// DisallowUnknownFields: {"force":true,"Force":false} would silently let
-	// the last spelling win.
+	// genuine duplicate. Comparison uses strings.EqualFold to match the
+	// Unicode simple-fold equivalence that encoding/json applies when
+	// matching struct fields: {"force":true,"Force":false} and even
+	// {"status":"x","ſtatus":"y"} (ſ folds to s) are both caught.
 	if dup := firstDuplicateJSONName(raw); dup != "" {
 		return &apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Request body has a duplicate field: %q", dup)}
 	}

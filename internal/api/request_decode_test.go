@@ -1,10 +1,13 @@
 package api
 
 import (
+	"bytes"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	pkgapi "github.com/nexu-io/looper/pkg/api"
 )
@@ -138,6 +141,14 @@ func TestDecodeJSONMutationBodyContract(t *testing.T) {
 		}
 	})
 
+	t.Run("non-canonical field casing is rejected", func(t *testing.T) {
+		var dst decodeProbe
+		aerr := decodeJSONMutationBody(newRequest(`{"Force":true}`), &dst, true)
+		if aerr == nil || !strings.Contains(aerr.message, "canonical spelling") {
+			t.Fatalf("decode error = %#v, want non-canonical field casing rejection", aerr)
+		}
+	})
+
 	t.Run("empty body optional decodes to zero value", func(t *testing.T) {
 		var dst decodeProbe
 		if aerr := decodeJSONMutationBody(newRequest("   "), &dst, false); aerr != nil {
@@ -162,5 +173,41 @@ func TestServerBoundsRequestReadTime(t *testing.T) {
 	}
 	if httpServer.ReadHeaderTimeout <= 0 {
 		t.Fatalf("ReadHeaderTimeout = %v, want a positive bound", httpServer.ReadHeaderTimeout)
+	}
+
+	// Slow-body stall regression: a client that sends headers and a partial
+	// body then stalls must be terminated by the server's ReadTimeout.
+	httpServer.ReadTimeout = 100 * time.Millisecond
+	httpServer.ReadHeaderTimeout = 100 * time.Millisecond
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen error = %v", err)
+	}
+	defer listener.Close()
+
+	go func() { _ = httpServer.Serve(listener) }()
+	defer func() { _ = httpServer.Close() }()
+
+	conn, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatalf("Dial error = %v", err)
+	}
+	defer conn.Close()
+
+	// Write headers and partial body, then stall
+	_, _ = conn.Write([]byte("POST /api/v1/loops/retry HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 100\r\n\r\n{\"partial\":"))
+
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 1024)
+	n, readErr := conn.Read(buf)
+
+	// The server should terminate the stalled read. It may respond with
+	// 408/400/404 or simply close the connection (readErr != nil).
+	if readErr == nil && n > 0 &&
+		!bytes.Contains(buf[:n], []byte("408")) &&
+		!bytes.Contains(buf[:n], []byte("400")) &&
+		!bytes.Contains(buf[:n], []byte("404")) {
+		t.Fatalf("expected server to terminate stalled read, got output: %q", string(buf[:n]))
 	}
 }
