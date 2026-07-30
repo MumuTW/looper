@@ -53,32 +53,63 @@ type hitlAsk struct {
 	Confidence        string            `json:"confidence,omitempty"`
 }
 
+// hitlSentinelQuarantineSuffix marks preserved invalid gate evidence next to
+// the sentinel path, out of the consume path so retries do not re-trip on it.
+const hitlSentinelQuarantineSuffix = ".invalid"
+
+// maxAskSentinelBytes bounds a sentinel read; a decision brief is small, and
+// an enormous file is not a decodable gate request.
+const maxAskSentinelBytes = 1 << 20
+
 // consumeAskSentinel reads and removes the agent's ask sentinel from the
-// worktree, if present. Returns (nil, nil) when no sentinel exists. Consuming
-// (deleting) it prevents the same question from re-suspending on resume.
+// worktree, if present. A missing sentinel is the ONLY no-question case:
+// the sentinel is the agent's structured request for a human gate, so once
+// the file exists, inability to read or decode it fails closed with the
+// evidence quarantined for inspection — a truncated ask for a destructive
+// decision must not let the worker continue to validation and publication.
+// Consuming (deleting) a valid sentinel prevents the same question from
+// re-suspending on resume.
 func consumeAskSentinel(worktreePath string) (*hitlAsk, error) {
 	if strings.TrimSpace(worktreePath) == "" {
 		return nil, nil
 	}
 	path := filepath.Join(worktreePath, hitlSentinelRelPath)
+	info, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("ask sentinel exists but cannot be read: %w", err)
+	}
+	if info.Size() > maxAskSentinelBytes {
+		return nil, quarantineAskSentinel(path, fmt.Errorf("ask sentinel is %d bytes (limit %d)", info.Size(), maxAskSentinelBytes))
+	}
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
 		}
-		return nil, err
+		return nil, fmt.Errorf("ask sentinel exists but cannot be read: %w", err)
 	}
 	var ask hitlAsk
 	if err := json.Unmarshal(raw, &ask); err != nil {
-		// A malformed sentinel is not a hard failure: remove it and ignore.
-		_ = os.Remove(path)
-		return nil, nil
+		return nil, quarantineAskSentinel(path, fmt.Errorf("ask sentinel is not valid JSON: %w", err))
+	}
+	if strings.TrimSpace(ask.Question) == "" {
+		return nil, quarantineAskSentinel(path, errors.New("ask sentinel has no question"))
 	}
 	_ = os.Remove(path)
-	if strings.TrimSpace(ask.Question) == "" {
-		return nil, nil
-	}
 	return &ask, nil
+}
+
+// quarantineAskSentinel preserves undecodable gate evidence beside the
+// sentinel path and returns an actionable diagnostic.
+func quarantineAskSentinel(path string, cause error) error {
+	quarantined := path + hitlSentinelQuarantineSuffix
+	if err := os.Rename(path, quarantined); err != nil {
+		return fmt.Errorf("%v; quarantine also failed: %v (evidence left at %s)", cause, err, path)
+	}
+	return fmt.Errorf("%v; evidence quarantined at %s — inspect it, then answer or retry the loop", cause, quarantined)
 }
 
 // awaitingHumanError is returned from the execute step when the agent asked a
@@ -273,15 +304,10 @@ func (r *Runner) readFreshHITLAsk(ctx context.Context, loop *storage.LoopRecord)
 func (r *Runner) detectHumanAsk(ctx context.Context, input stepInput, worktreePath, executionID string) (*awaitingHumanError, error) {
 	ask, err := consumeAskSentinel(worktreePath)
 	if err != nil {
-		// Best-effort: a read error is treated as "no ask" rather than failing the
-		// run, but surface it — a present-but-unreadable sentinel means the agent
-		// wanted to ask a human and we're about to proceed as if it didn't.
-		if r.logger != nil {
-			r.logger.Warn("worker could not read HITL ask sentinel; proceeding as no ask", map[string]any{
-				"loopId": input.Loop.ID, "loopSeq": input.Loop.Seq, "error": err.Error(),
-			})
-		}
-		return nil, nil
+		// Fail closed: the sentinel exists, so the agent requested a human
+		// gate. Proceeding to validation and publication as if it didn't is
+		// the one outcome a gate must prevent.
+		return nil, fmt.Errorf("HITL ask sentinel failure for loop %s: %w", input.Loop.ID, err)
 	}
 	if ask == nil {
 		return nil, nil
