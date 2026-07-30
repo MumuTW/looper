@@ -748,7 +748,7 @@ func (s *Service) UpdateProject(ctx context.Context, identifier string, input Up
 
 	var published bool
 	err = s.withConfigBoundary(func() error {
-		next, materializeErr := s.materializeCandidate(ctx, &updated, "")
+		next, materializeErr := s.materializeCandidateValidate(ctx, &updated, "", false)
 		if materializeErr != nil {
 			return ProjectValidationError{Message: materializeErr.Error()}
 		}
@@ -1562,6 +1562,10 @@ func (s *Service) currentConfig() config.Config {
 }
 
 func (s *Service) materializeCandidate(ctx context.Context, replacement *storage.ProjectRecord, archiveID string) ([]config.ProjectRefConfig, error) {
+	return s.materializeCandidateValidate(ctx, replacement, archiveID, true)
+}
+
+func (s *Service) materializeCandidateValidate(ctx context.Context, replacement *storage.ProjectRecord, archiveID string, validate bool) ([]config.ProjectRefConfig, error) {
 	if s == nil || s.Repos == nil || s.Repos.Projects == nil {
 		return nil, fmt.Errorf("projects repository is not configured")
 	}
@@ -1587,7 +1591,7 @@ func (s *Service) materializeCandidate(ctx context.Context, replacement *storage
 	if err != nil {
 		return nil, err
 	}
-	if s.ConfigSource != nil {
+	if s.ConfigSource != nil && validate {
 		candidate := config.CloneConfig(current)
 		candidate.Projects = materialized
 		if err := config.ValidateProjectValidationPolicies(candidate); err != nil {
