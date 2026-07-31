@@ -352,6 +352,33 @@ jobs:
             exit 1
           fi
 
+      - name: Verify looper binary build identity
+        env:
+          EXPECTED_VERSION: ${{ needs.prepare-go-release.outputs.release-version }}
+          EXPECTED_VERSION_SOURCE: git-tag:${{ needs.prepare-go-release.outputs.release-tag }}
+          EXPECTED_CHANNEL: ${{ needs.prepare-go-release.outputs.release-channel }}
+          EXPECTED_API_VERSION: v1
+          EXPECTED_GIT_SHA: ${{ needs.prepare-go-release.outputs.release-commit }}
+          EXPECTED_TIMESTAMP: ${{ needs.prepare-go-release.outputs.release-timestamp }}
+        run: |
+          python3 - "dist/release/${{ matrix.artifact-name }}" <<'PY'
+          import json, os, subprocess, sys
+
+          identity = json.loads(subprocess.check_output([sys.argv[1], "version", "--json"], text=True))
+          metadata = identity["metadata"]
+          expected = {
+              "version": os.environ["EXPECTED_VERSION"],
+              "versionSource": os.environ["EXPECTED_VERSION_SOURCE"],
+              "channel": os.environ["EXPECTED_CHANNEL"],
+              "apiVersion": os.environ["EXPECTED_API_VERSION"],
+              "gitCommitSha": os.environ["EXPECTED_GIT_SHA"],
+              "buildTimestamp": os.environ["EXPECTED_TIMESTAMP"],
+              "dirty": False,
+          }
+          actual = {"version": identity["version"], **metadata}
+          assert actual == expected, f"unexpected looper build identity: {actual!r}"
+          PY
+
       - name: Create release archive
         working-directory: dist/release
         run: |
@@ -446,6 +473,33 @@ jobs:
             echo "Expected $artifact_path --version to print ${EXPECTED_VERSION}, got ${actual_version}." >&2
             exit 1
           fi
+
+      - name: Verify looperd binary build identity
+        env:
+          EXPECTED_VERSION: ${{ needs.prepare-go-release.outputs.release-version }}
+          EXPECTED_VERSION_SOURCE: git-tag:${{ needs.prepare-go-release.outputs.release-tag }}
+          EXPECTED_CHANNEL: ${{ needs.prepare-go-release.outputs.release-channel }}
+          EXPECTED_API_VERSION: v1
+          EXPECTED_GIT_SHA: ${{ needs.prepare-go-release.outputs.release-commit }}
+          EXPECTED_TIMESTAMP: ${{ needs.prepare-go-release.outputs.release-timestamp }}
+        run: |
+          python3 - "dist/release/${{ matrix.artifact-name }}" <<'PY'
+          import json, os, subprocess, sys
+
+          identity = json.loads(subprocess.check_output([sys.argv[1], "--version-json"], text=True))
+          metadata = identity["metadata"]
+          expected = {
+              "version": os.environ["EXPECTED_VERSION"],
+              "versionSource": os.environ["EXPECTED_VERSION_SOURCE"],
+              "channel": os.environ["EXPECTED_CHANNEL"],
+              "apiVersion": os.environ["EXPECTED_API_VERSION"],
+              "gitCommitSha": os.environ["EXPECTED_GIT_SHA"],
+              "buildTimestamp": os.environ["EXPECTED_TIMESTAMP"],
+              "dirty": False,
+          }
+          actual = {"version": identity["version"], **metadata}
+          assert actual == expected, f"unexpected looperd build identity: {actual!r}"
+          PY
 
       - name: Create release archive
         working-directory: dist/release
