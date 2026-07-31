@@ -88,6 +88,7 @@ var reasonExplanations = map[ReasonCode]string{
 	ReasonReviewRequired:           "a required review is missing",
 	ReasonReviewChangesRequested:   "a reviewer requested changes",
 	ReasonUnresolvedReviewThread:   "a review thread is unresolved",
+	ReasonReviewerConvergence:      "reviewer convergence has not reached its configured severity floor",
 	ReasonProjectPolicyDenied:      "project policy does not permit merging this target",
 	ReasonHold:                     "a hold label is applied",
 	ReasonProviderStateUnavailable: "the forge did not return the state needed to judge this",

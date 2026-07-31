@@ -13,10 +13,11 @@ import (
 )
 
 // maxSkipAge bounds how long a pull request may be skipped on an unchanged
-// fingerprint. Branch protection rules and project policy are inputs to the gate
-// that the list page cannot observe at all, so an unchanged pull request is
-// re-evaluated periodically regardless. This is the backstop for every
-// invalidator this fingerprint does not model.
+// fingerprint. Branch protection rules, project policy, and Reviewer
+// convergence metadata are inputs to the gate that the list page cannot
+// observe at all, so an unchanged pull request is re-evaluated periodically
+// regardless. This is the backstop for every invalidator this fingerprint does
+// not model.
 const maxSkipAge = 30 * time.Minute
 
 // sourceFingerprint summarises everything about a pull request that the shared
@@ -70,6 +71,16 @@ func reportAwaitsCheckState(report Report) bool {
 	return false
 }
 
+// reportAwaitsConvergenceState reports whether the durable Reviewer state can
+// change merge eligibility without changing the forge list fingerprint. A
+// blocked convergence report must be re-read until its floor-qualified items
+// are closed or deferred; otherwise unchanged discovery could retain a stale
+// blocker after the Reviewer makes progress.
+func reportAwaitsConvergenceState(report Report) bool {
+	evidence := report.Evidence.ReviewerConvergence
+	return evidence != nil && reviewerConvergenceBlocks(*evidence)
+}
+
 // latestGateReports returns the most recent gate report per pull request for one
 // project, keyed by the report's entity id (`repo#number`).
 //
@@ -107,7 +118,8 @@ func latestGateReports(ctx context.Context, repos *storage.Repositories, project
 //
 // Skipping is refused unless every one of these holds: a previous report exists,
 // it recorded a fingerprint, the fingerprint still matches, the gate is not
-// waiting on check state, and the report is younger than maxSkipAge.
+// waiting on check or convergence state, and the report is younger than
+// maxSkipAge.
 func skipUnchanged(previous Report, hasPrevious bool, fingerprint string, now time.Time) (Report, bool) {
 	if !hasPrevious || strings.TrimSpace(previous.SourceFingerprint) == "" {
 		return Report{}, false
@@ -116,6 +128,9 @@ func skipUnchanged(previous Report, hasPrevious bool, fingerprint string, now ti
 		return Report{}, false
 	}
 	if reportAwaitsCheckState(previous) {
+		return Report{}, false
+	}
+	if reportAwaitsConvergenceState(previous) {
 		return Report{}, false
 	}
 	evaluatedAt, err := time.Parse(time.RFC3339Nano, previous.EvaluatedAt)
