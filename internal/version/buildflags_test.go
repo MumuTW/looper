@@ -175,8 +175,8 @@ func trackedGoFiles(root string) ([]string, error) {
 func TestTrackedModulePathScanIgnoresUntrackedWorktrees(t *testing.T) {
 	t.Parallel()
 	root := initModulePathTestRepo(t)
-	writeModulePathTestFile(t, root, "tracked.go", "package tracked\n")
-	writeModulePathTestFile(t, root, filepath.Join(".worktrees", "stale", "legacy.go"), "package stale\nimport _ \"github.com/nexu-io/looper/internal/version\"\n")
+	writeModulePathTestFile(t, root, "tracked.go", "package tracked\n", true)
+	writeModulePathTestFile(t, root, filepath.Join(".worktrees", "stale", "legacy.go"), "package stale\nimport _ \"github.com/nexu-io/looper/internal/version\"\n", false)
 
 	legacyImports, err := trackedLegacyModuleImports(root, "github.com/nexu-io/looper")
 	if err != nil {
@@ -190,7 +190,7 @@ func TestTrackedModulePathScanIgnoresUntrackedWorktrees(t *testing.T) {
 func TestTrackedModulePathScanFindsTrackedLegacyImport(t *testing.T) {
 	t.Parallel()
 	root := initModulePathTestRepo(t)
-	writeModulePathTestFile(t, root, "tracked.go", "package tracked\nimport _ \"github.com/nexu-io/looper/internal/version\"\n")
+	writeModulePathTestFile(t, root, "tracked.go", "package tracked\nimport _ \"github.com/nexu-io/looper/internal/version\"\n", true)
 
 	legacyImports, err := trackedLegacyModuleImports(root, "github.com/nexu-io/looper")
 	if err != nil {
@@ -211,7 +211,7 @@ func initModulePathTestRepo(t *testing.T) string {
 	return root
 }
 
-func writeModulePathTestFile(t *testing.T, root, relativePath, contents string) {
+func writeModulePathTestFile(t *testing.T, root, relativePath, contents string, tracked bool) {
 	t.Helper()
 	path := filepath.Join(root, filepath.FromSlash(relativePath))
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -220,7 +220,7 @@ func writeModulePathTestFile(t *testing.T, root, relativePath, contents string) 
 	if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
 		t.Fatalf("write %s: %v", relativePath, err)
 	}
-	if strings.HasPrefix(relativePath, ".worktrees/") {
+	if !tracked {
 		return
 	}
 	command := exec.Command("git", "-C", root, "add", "--", filepath.FromSlash(relativePath))
