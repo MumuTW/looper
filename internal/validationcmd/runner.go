@@ -200,10 +200,6 @@ func resolvedModuleCache() string {
 	return ""
 }
 
-func buildPermissionProfile(cwd, tempRoot, profileName string) string {
-	return buildPermissionProfileForAccess(cwd, tempRoot, profileName, workspaceWritable)
-}
-
 func buildPermissionProfileForAccess(cwd, tempRoot, profileName string, access workspaceAccess) string {
 	readRoots := map[string]struct{}{}
 	for _, entry := range filepath.SplitList(os.Getenv("PATH")) {

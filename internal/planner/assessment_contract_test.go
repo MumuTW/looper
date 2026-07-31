@@ -56,6 +56,19 @@ func TestParseAssessmentRejectsDuplicateContractFields(t *testing.T) {
 	}
 }
 
+func TestParseAssessmentRejectsCaseFoldedContractFields(t *testing.T) {
+	binding := testAssessmentBinding(t)
+	for _, raw := range [][]byte{
+		[]byte(`{"schemaVersion":"looper.assessment.v1","binding":{"repo":"acme/looper","issueNumber":42,"issueDigest":"` + binding.IssueDigest + `","baseSha":"` + binding.BaseSHA + `"},"affectedFiles":[],"surfaces":[],"authorityQuestions":[],"recommendation":"escalate","Recommendation":"proceed","decisionRequest":""}`),
+		[]byte(`{"schemaVersion":"looper.assessment.v1","binding":{"repo":"acme/looper","issueNumber":42,"issueDigest":"` + binding.IssueDigest + `","baseSha":"` + binding.BaseSHA + `","BaseSha":"ffffffffffffffffffffffffffffffffffffffff"},"affectedFiles":[],"surfaces":[],"authorityQuestions":[],"recommendation":"proceed","decisionRequest":""}`),
+		[]byte(`{"schemaVersion":"looper.assessment.v1","Binding":{"repo":"acme/looper","issueNumber":42,"issueDigest":"` + binding.IssueDigest + `","baseSha":"` + binding.BaseSHA + `"},"affectedFiles":[],"surfaces":[],"authorityQuestions":[],"recommendation":"proceed","decisionRequest":""}`),
+	} {
+		if _, err := ParseAssessment(raw); err == nil || !strings.Contains(err.Error(), "noncanonical") {
+			t.Fatalf("ParseAssessment(%s) error = %v, want case-folded field rejection", raw, err)
+		}
+	}
+}
+
 func TestNewAssessmentBindingRequiresFullGitObjectID(t *testing.T) {
 	for _, baseSHA := range []string{
 		"main",

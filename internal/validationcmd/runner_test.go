@@ -18,7 +18,7 @@ func TestBuildPermissionProfileDeniesNetworkAndLimitsWrites(t *testing.T) {
 	t.Setenv("PATH", "/usr/bin:/opt/tools/bin")
 	t.Setenv("GOMODCACHE", "/cache/go-mod")
 
-	profile := buildPermissionProfile("/workspace/repo", "/private/tmp/validation", permissionProfile)
+	profile := buildPermissionProfileForAccess("/workspace/repo", "/private/tmp/validation", permissionProfile, workspaceWritable)
 	for _, want := range []string{
 		`permissions.looper-validation=`,
 		`network = { enabled = false }`,

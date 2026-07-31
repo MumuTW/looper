@@ -190,13 +190,30 @@ func ParseAssessment(raw []byte) (Assessment, error) {
 // structs, because encoding/json otherwise retains only the last occurrence.
 func rejectDuplicateAssessmentFields(raw []byte) error {
 	decoder := json.NewDecoder(bytes.NewReader(raw))
-	if err := rejectDuplicateJSONObjectFields(decoder, "assessment", true); err != nil {
+	if err := rejectDuplicateJSONObjectFields(decoder, "assessment", assessmentWireFields, true); err != nil {
 		return err
 	}
 	return nil
 }
 
-func rejectDuplicateJSONObjectFields(decoder *json.Decoder, label string, checkBinding bool) error {
+var assessmentWireFields = map[string]bool{
+	"schemaVersion":      true,
+	"binding":            true,
+	"affectedFiles":      true,
+	"surfaces":           true,
+	"authorityQuestions": true,
+	"recommendation":     true,
+	"decisionRequest":    true,
+}
+
+var assessmentBindingWireFields = map[string]bool{
+	"repo":        true,
+	"issueNumber": true,
+	"issueDigest": true,
+	"baseSha":     true,
+}
+
+func rejectDuplicateJSONObjectFields(decoder *json.Decoder, label string, allowedFields map[string]bool, checkBinding bool) error {
 	token, err := decoder.Token()
 	if err != nil {
 		return fmt.Errorf("decode %s: %w", label, err)
@@ -214,12 +231,18 @@ func rejectDuplicateJSONObjectFields(decoder *json.Decoder, label string, checkB
 		if !ok {
 			return fmt.Errorf("decode %s field name", label)
 		}
+		// encoding/json accepts case-insensitive struct-field matches. Require
+		// the one canonical spelling so differently cased duplicates cannot
+		// silently overwrite one another during the later struct decode.
+		if !allowedFields[field] {
+			return fmt.Errorf("%s contains noncanonical or unknown field %q", label, field)
+		}
 		if seen[field] {
 			return fmt.Errorf("%s repeats field %q", label, field)
 		}
 		seen[field] = true
 		if checkBinding && field == "binding" {
-			if err := rejectDuplicateJSONObjectFields(decoder, "assessment binding", false); err != nil {
+			if err := rejectDuplicateJSONObjectFields(decoder, "assessment binding", assessmentBindingWireFields, false); err != nil {
 				return err
 			}
 			continue
