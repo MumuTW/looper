@@ -573,7 +573,7 @@ func webhookTunnelRepoForProject(cfg config.Config, project config.ProjectRefCon
 		return repo
 	}
 	hostname := strings.TrimSpace(parsed.Hostname())
-	if hostname == "" || strings.EqualFold(hostname, "github.com") || strings.EqualFold(hostname, "www.github.com") || strings.EqualFold(hostname, "api.github.com") {
+	if hostname == "" || isPublicGitHubHostname(hostname) {
 		return repo
 	}
 	return hostname + "/" + repo

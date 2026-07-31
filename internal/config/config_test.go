@@ -3083,6 +3083,27 @@ func TestValidateRejectsDuplicateAndIncompleteProjects(t *testing.T) {
 	assertValidationIssue(t, validationErr, "projects[1].repoPath", "must be a non-empty path")
 }
 
+func TestValidateRejectsProjectsSharingARepoPath(t *testing.T) {
+	config, err := DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+
+	sharedPath := t.TempDir()
+	rawDuplicatePath := sharedPath + string(filepath.Separator) + "."
+	config.Projects = []ProjectRefConfig{
+		{ID: "cloud", Name: "Cloud", Repo: "acme/cloud", RepoPath: sharedPath},
+		{ID: "enterprise", Name: "Enterprise", Repo: "acme/enterprise", RepoPath: rawDuplicatePath},
+	}
+
+	err = Validate(config)
+	var validationErr *ConfigValidationError
+	if !errors.As(err, &validationErr) {
+		t.Fatalf("Validate() error = %v, want ConfigValidationError", err)
+	}
+	assertValidationIssue(t, validationErr, "projects[1].repoPath", "duplicates projects[0].repoPath: "+rawDuplicatePath)
+}
+
 func TestValidateRejectsRuntimePathsWhenNoWritableDirectoryCanBeFound(t *testing.T) {
 	rootDir := t.TempDir()
 	config, err := DefaultConfig(rootDir)

@@ -618,6 +618,7 @@ type ListReviewThreadsInput struct {
 type ViewReviewThreadInput struct {
 	ThreadID string
 	CWD      string
+	Hostname string
 }
 
 type ReviewThread struct {
@@ -668,11 +669,15 @@ type GetPullRequestDiffInput struct {
 }
 
 type CapturePullRequestSnapshotInput struct {
-	ProjectID  string
-	Repo       string
-	PRNumber   int64
-	CWD        string
-	CapturedAt string
+	ProjectID string
+	// Repo is the logical owner/name identity persisted with the snapshot.
+	Repo string
+	// TransportRepo may qualify Repo with a configured GHES hostname. It is
+	// used only for forge commands and never becomes snapshot identity.
+	TransportRepo string
+	PRNumber      int64
+	CWD           string
+	CapturedAt    string
 }
 
 type ReviewThreadNotFoundError struct {
@@ -1890,7 +1895,8 @@ func (g *Gateway) GetPullRequestHeadSHA(ctx context.Context, input ViewPullReque
 }
 
 func (g *Gateway) ResolveReviewThread(ctx context.Context, input ResolveReviewThreadInput) error {
-	thread, err := g.getReviewThread(ctx, input.ThreadID, input.CWD)
+	hostname, _ := splitRepoHostname(input.Repo)
+	thread, err := g.getReviewThread(ctx, input.ThreadID, input.CWD, hostname)
 	if err != nil {
 		return err
 	}
@@ -1900,13 +1906,17 @@ func (g *Gateway) ResolveReviewThread(ctx context.Context, input ResolveReviewTh
 	if thread.IsResolved {
 		return nil
 	}
-	result, err := g.runGh(ctx, input.CWD, "", "api", "graphql", "-f", "query="+strings.Join([]string{
+	args := []string{"api", "graphql", "-f", "query=" + strings.Join([]string{
 		"mutation($threadId: ID!) {",
 		"  resolveReviewThread(input: { threadId: $threadId }) {",
 		"    thread { id isResolved }",
 		"  }",
 		"}",
-	}, "\n"), "-F", "threadId="+input.ThreadID)
+	}, "\n"), "-F", "threadId=" + input.ThreadID}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGh(ctx, input.CWD, "", args...)
 	if err != nil {
 		return err
 	}
@@ -1924,7 +1934,7 @@ func (g *Gateway) ResolveReviewThread(ctx context.Context, input ResolveReviewTh
 }
 
 func (g *Gateway) ViewReviewThread(ctx context.Context, input ViewReviewThreadInput) (ReviewThread, error) {
-	thread, err := g.getReviewThread(ctx, input.ThreadID, input.CWD)
+	thread, err := g.getReviewThread(ctx, input.ThreadID, input.CWD, input.Hostname)
 	if err != nil {
 		return ReviewThread{}, err
 	}
@@ -1934,7 +1944,7 @@ func (g *Gateway) ViewReviewThread(ctx context.Context, input ViewReviewThreadIn
 	out := ReviewThread{ID: thread.ID, IsResolved: thread.IsResolved}
 	cursor := ""
 	for {
-		nodes, nextCursor, hasNextPage, err := g.fetchReviewThreadCommentsPage(ctx, input.CWD, input.ThreadID, cursor)
+		nodes, nextCursor, hasNextPage, err := g.fetchReviewThreadCommentsPage(ctx, input.Hostname, input.CWD, input.ThreadID, cursor)
 		if err != nil {
 			return ReviewThread{}, err
 		}
@@ -1948,11 +1958,12 @@ func (g *Gateway) ViewReviewThread(ctx context.Context, input ViewReviewThreadIn
 }
 
 func (g *Gateway) ListReviewThreads(ctx context.Context, input ListReviewThreadsInput) ([]ReviewThread, error) {
+	hostname, repo := splitRepoHostname(input.Repo)
 	limit := input.Limit
 	if limit <= 0 {
 		limit = 100
 	}
-	owner, name, err := parseRepo(input.Repo)
+	owner, name, err := parseRepo(repo)
 	if err != nil {
 		return nil, err
 	}
@@ -1960,7 +1971,7 @@ func (g *Gateway) ListReviewThreads(ctx context.Context, input ListReviewThreads
 	threadsCursor := ""
 	for len(out) < limit {
 		pageSize := min(100, limit-len(out))
-		nodes, nextCursor, hasNextPage, err := g.fetchReviewThreadPage(ctx, input.CWD, owner, name, input.PRNumber, pageSize, threadsCursor)
+		nodes, nextCursor, hasNextPage, err := g.fetchReviewThreadPage(ctx, hostname, input.CWD, owner, name, input.PRNumber, pageSize, threadsCursor)
 		if err != nil {
 			return nil, err
 		}
@@ -1977,7 +1988,7 @@ func (g *Gateway) ListReviewThreads(ctx context.Context, input ListReviewThreads
 			commentPageInfo, _ := commentsRow["pageInfo"].(map[string]any)
 			commentCursor := asString(commentPageInfo["endCursor"])
 			for asBool(commentPageInfo["hasNextPage"]) && commentCursor != "" {
-				moreComments, nextCommentCursor, hasMoreComments, err := g.fetchReviewThreadCommentsPage(ctx, input.CWD, id, commentCursor)
+				moreComments, nextCommentCursor, hasMoreComments, err := g.fetchReviewThreadCommentsPage(ctx, hostname, input.CWD, id, commentCursor)
 				if err != nil {
 					return nil, err
 				}
@@ -2005,13 +2016,18 @@ func (g *Gateway) AddReviewThreadReply(ctx context.Context, input AddReviewThrea
 	if err := outboundguard.ValidateReviewThreadReply(input.Body, input.ThreadID); err != nil {
 		return err
 	}
-	result, err := g.runGh(ctx, input.CWD, "", "api", "graphql", "-f", "query="+strings.Join([]string{
+	hostname, _ := splitRepoHostname(input.Repo)
+	args := []string{"api", "graphql", "-f", "query=" + strings.Join([]string{
 		"mutation($threadId: ID!, $body: String!) {",
 		"  addPullRequestReviewThreadReply(input: { pullRequestReviewThreadId: $threadId, body: $body }) {",
 		"    comment { id }",
 		"  }",
 		"}",
-	}, "\n"), "-F", "threadId="+input.ThreadID, "-f", "body="+input.Body)
+	}, "\n"), "-F", "threadId=" + input.ThreadID, "-f", "body=" + input.Body}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGh(ctx, input.CWD, "", args...)
 	if err != nil {
 		return err
 	}
@@ -3152,11 +3168,15 @@ func (g *Gateway) ensureLabels(ctx context.Context, repo, cwd string, definition
 }
 
 func (g *Gateway) CapturePullRequestSnapshot(ctx context.Context, input CapturePullRequestSnapshotInput) (storage.PullRequestSnapshotRecord, error) {
-	detail, err := g.ViewPullRequestForReviewer(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
+	transportRepo := strings.TrimSpace(input.TransportRepo)
+	if transportRepo == "" {
+		transportRepo = input.Repo
+	}
+	detail, err := g.ViewPullRequestForReviewer(ctx, ViewPullRequestInput{Repo: transportRepo, PRNumber: input.PRNumber, CWD: input.CWD})
 	if err != nil {
 		return storage.PullRequestSnapshotRecord{}, err
 	}
-	diff, err := g.GetPullRequestDiff(ctx, GetPullRequestDiffInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
+	diff, err := g.GetPullRequestDiff(ctx, GetPullRequestDiffInput{Repo: transportRepo, PRNumber: input.PRNumber, CWD: input.CWD})
 	if err != nil {
 		if !errors.Is(err, ErrDiffTooLarge) && !errors.Is(err, ErrLocalCaptureTruncated) {
 			return storage.PullRequestSnapshotRecord{}, err
@@ -3212,14 +3232,15 @@ type githubReaction struct {
 }
 
 func (g *Gateway) fetchReviewThreads(ctx context.Context, repo string, prNumber int64, cwd string) ([]map[string]any, error) {
-	owner, name, err := parseRepo(repo)
+	hostname, repoOnly := splitRepoHostname(repo)
+	owner, name, err := parseRepo(repoOnly)
 	if err != nil {
 		return nil, err
 	}
 	out := make([]map[string]any, 0, 100)
 	cursor := ""
 	for {
-		nodes, nextCursor, hasNextPage, err := g.fetchReviewThreadsSummaryPage(ctx, cwd, owner, name, prNumber, cursor)
+		nodes, nextCursor, hasNextPage, err := g.fetchReviewThreadsSummaryPage(ctx, hostname, cwd, owner, name, prNumber, cursor)
 		if err != nil {
 			return nil, err
 		}
@@ -3234,7 +3255,7 @@ func (g *Gateway) fetchReviewThreads(ctx context.Context, repo string, prNumber 
 				hasMoreComments := asBool(pageInfo["hasNextPage"])
 				allCommentNodes := append([]any(nil), commentNodes...)
 				for hasMoreComments {
-					moreComments, nextCommentCursor, hasMore, err := g.fetchReviewThreadCommentsPage(ctx, cwd, asString(normalized["threadId"]), commentCursor)
+					moreComments, nextCommentCursor, hasMore, err := g.fetchReviewThreadCommentsPage(ctx, hostname, cwd, asString(normalized["threadId"]), commentCursor)
 					if err != nil {
 						return nil, err
 					}
@@ -3256,7 +3277,7 @@ func (g *Gateway) fetchReviewThreads(ctx context.Context, repo string, prNumber 
 	return out, nil
 }
 
-func (g *Gateway) fetchReviewThreadPage(ctx context.Context, cwd, owner, name string, prNumber int64, limit int, cursor string) ([]any, string, bool, error) {
+func (g *Gateway) fetchReviewThreadPage(ctx context.Context, hostname, cwd, owner, name string, prNumber int64, limit int, cursor string) ([]any, string, bool, error) {
 	args := []string{"api", "graphql", "-f", "query=" + strings.Join([]string{
 		"query($owner: String!, $name: String!, $prNumber: Int!, $limit: Int!, $after: String) {",
 		"  repository(owner: $owner, name: $name) {",
@@ -3280,6 +3301,9 @@ func (g *Gateway) fetchReviewThreadPage(ctx context.Context, cwd, owner, name st
 		"  }",
 		"}",
 	}, "\n"), "-F", "owner=" + owner, "-F", "name=" + name, "-F", fmt.Sprintf("prNumber=%d", prNumber), "-F", fmt.Sprintf("limit=%d", limit)}
+	if strings.TrimSpace(hostname) != "" {
+		args = append(args, "--hostname", hostname)
+	}
 	if cursor != "" {
 		args = append(args, "-F", "after="+cursor)
 	}
@@ -3290,7 +3314,7 @@ func (g *Gateway) fetchReviewThreadPage(ctx context.Context, cwd, owner, name st
 	return decodeReviewThreadsResponse(result.Stdout)
 }
 
-func (g *Gateway) fetchReviewThreadsSummaryPage(ctx context.Context, cwd, owner, name string, prNumber int64, cursor string) ([]any, string, bool, error) {
+func (g *Gateway) fetchReviewThreadsSummaryPage(ctx context.Context, hostname, cwd, owner, name string, prNumber int64, cursor string) ([]any, string, bool, error) {
 	args := []string{"api", "graphql", "-f", "query=" + strings.Join([]string{
 		"query($owner: String!, $name: String!, $prNumber: Int!, $after: String) {",
 		"  repository(owner: $owner, name: $name) {",
@@ -3312,6 +3336,9 @@ func (g *Gateway) fetchReviewThreadsSummaryPage(ctx context.Context, cwd, owner,
 		"  }",
 		"}",
 	}, "\n"), "-F", "owner=" + owner, "-F", "name=" + name, "-F", fmt.Sprintf("prNumber=%d", prNumber)}
+	if strings.TrimSpace(hostname) != "" {
+		args = append(args, "--hostname", hostname)
+	}
 	if cursor != "" {
 		args = append(args, "-F", "after="+cursor)
 	}
@@ -3322,7 +3349,7 @@ func (g *Gateway) fetchReviewThreadsSummaryPage(ctx context.Context, cwd, owner,
 	return decodeReviewThreadsResponse(result.Stdout)
 }
 
-func (g *Gateway) fetchReviewThreadCommentsPage(ctx context.Context, cwd, threadID, cursor string) ([]any, string, bool, error) {
+func (g *Gateway) fetchReviewThreadCommentsPage(ctx context.Context, hostname, cwd, threadID, cursor string) ([]any, string, bool, error) {
 	args := []string{"api", "graphql", "-f", "query=" + strings.Join([]string{
 		"query($threadId: ID!, $after: String) {",
 		"  node(id: $threadId) {",
@@ -3340,6 +3367,9 @@ func (g *Gateway) fetchReviewThreadCommentsPage(ctx context.Context, cwd, thread
 		"  }",
 		"}",
 	}, "\n"), "-F", "threadId=" + threadID}
+	if strings.TrimSpace(hostname) != "" {
+		args = append(args, "--hostname", hostname)
+	}
 	if cursor != "" {
 		args = append(args, "-F", "after="+cursor)
 	}
@@ -3443,8 +3473,8 @@ func min(a, b int) int {
 	return b
 }
 
-func (g *Gateway) getReviewThread(ctx context.Context, threadID, cwd string) (*reviewThreadNode, error) {
-	result, err := g.runGh(ctx, cwd, "", "api", "graphql", "-f", "query="+strings.Join([]string{
+func (g *Gateway) getReviewThread(ctx context.Context, threadID, cwd string, hostname string) (*reviewThreadNode, error) {
+	args := []string{"api", "graphql", "-f", "query=" + strings.Join([]string{
 		"query($threadId: ID!) {",
 		"  node(id: $threadId) {",
 		"    ... on PullRequestReviewThread {",
@@ -3453,7 +3483,11 @@ func (g *Gateway) getReviewThread(ctx context.Context, threadID, cwd string) (*r
 		"    }",
 		"  }",
 		"}",
-	}, "\n"), "-F", "threadId="+threadID)
+	}, "\n"), "-F", "threadId=" + threadID}
+	if strings.TrimSpace(hostname) != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGh(ctx, cwd, "", args...)
 	if err != nil {
 		return nil, err
 	}

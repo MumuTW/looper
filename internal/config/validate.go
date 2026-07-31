@@ -139,6 +139,7 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 
 	projectIDs := make(map[string]struct{}, len(config.Projects))
 	projectRepos := make(map[string]int, len(config.Projects))
+	projectRepoPaths := make(map[string]int, len(config.Projects))
 	for index, project := range config.Projects {
 		prefix := fmt.Sprintf("projects[%d]", index)
 		if strings.TrimSpace(project.Provider) != "" {
@@ -165,6 +166,13 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 
 		if project.RepoPath == "" {
 			issues = append(issues, ValidationIssue{Path: prefix + ".repoPath", Message: "must be a non-empty path"})
+		} else {
+			cleanRepoPath := filepath.Clean(project.RepoPath)
+			if previousIndex, exists := projectRepoPaths[cleanRepoPath]; exists {
+				issues = append(issues, ValidationIssue{Path: prefix + ".repoPath", Message: fmt.Sprintf("duplicates projects[%d].repoPath: %s", previousIndex, project.RepoPath)})
+			} else {
+				projectRepoPaths[cleanRepoPath] = index
+			}
 		}
 		if strings.TrimSpace(project.Provider) != "" && strings.TrimSpace(project.Repo) == "" {
 			// A provider binding names the remote a project's automation targets.
