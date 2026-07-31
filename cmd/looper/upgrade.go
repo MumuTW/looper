@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os/exec"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -95,9 +97,20 @@ type upgradePostStartReport struct {
 	Blocks          []string      `json:"blocks"`
 }
 
+type upgradeRestorePreflight struct {
+	Bundle     string               `json:"bundle"`
+	Source     upgradebackup.Source `json:"source"`
+	OpenPIDs   []int                `json:"openPids"`
+	ProbeError string               `json:"probeError,omitempty"`
+	Ready      bool                 `json:"ready"`
+	Blocks     []string             `json:"blocks"`
+}
+
+var upgradeRestoreOpenPIDs = findUpgradeRestoreOpenPIDs
+
 func runUpgrade(ctx context.Context, global, operands []string, stdout interface{ Write([]byte) (int, error) }) error {
 	if len(operands) == 0 {
-		return badUsage("upgrade requires activate-release, backup, drain, preflight, stage-release, verify, or verify-start")
+		return badUsage("upgrade requires activate-release, backup, drain, preflight, restore-preflight, stage-release, verify, or verify-start")
 	}
 	if operands[0] == "backup" {
 		if len(operands) != 1 {
@@ -152,8 +165,15 @@ func runUpgrade(ctx context.Context, global, operands []string, stdout interface
 		}
 		return runUpgradeVerifyStart(ctx, global, root, releaseID, stdout)
 	}
+	if operands[0] == "restore-preflight" {
+		bundle, err := parseUpgradeVerifyArgs(operands[1:])
+		if err != nil {
+			return badUsage("upgrade restore-preflight requires --bundle <directory>")
+		}
+		return runUpgradeRestorePreflight(ctx, bundle, stdout)
+	}
 	if operands[0] != "preflight" {
-		return badUsage("upgrade requires activate-release, backup, drain, preflight, stage-release, verify, or verify-start")
+		return badUsage("upgrade requires activate-release, backup, drain, preflight, restore-preflight, stage-release, verify, or verify-start")
 	}
 	targetLooper, targetLooperd, jsonOutput, err := parseUpgradePreflightArgs(operands[1:])
 	if err != nil {
@@ -197,6 +217,61 @@ func runUpgrade(ctx context.Context, global, operands []string, stdout interface
 	}
 	_, _ = fmt.Fprintln(stdout, string(encoded))
 	return nil
+}
+
+func runUpgradeRestorePreflight(ctx context.Context, bundle string, stdout interface{ Write([]byte) (int, error) }) error {
+	verified, err := upgradebackup.Verify(bundle)
+	if err != nil {
+		return err
+	}
+	source, err := upgradebackup.RestoreSource(verified.Manifest)
+	if err != nil {
+		return err
+	}
+	paths := []string{source.ConfigPath, source.DatabasePath, source.DatabasePath + "-wal", source.DatabasePath + "-shm", source.CLIBinaryPath, source.DaemonBinaryPath}
+	pids, probeErr := upgradeRestoreOpenPIDs(ctx, paths)
+	report := upgradeRestorePreflight{Bundle: verified.Directory, Source: source, OpenPIDs: pids}
+	if probeErr != nil {
+		report.ProbeError = probeErr.Error()
+		report.Blocks = append(report.Blocks, "cannot prove rollback targets are unused")
+	}
+	if len(pids) > 0 {
+		report.Blocks = append(report.Blocks, "rollback targets are still open by one or more processes")
+	}
+	report.Ready = len(report.Blocks) == 0
+	if err := writeVersionJSON(stdout, report); err != nil {
+		return err
+	}
+	if !report.Ready {
+		return fmt.Errorf("rollback restore preflight failed: %s", strings.Join(report.Blocks, "; "))
+	}
+	return nil
+}
+
+func findUpgradeRestoreOpenPIDs(ctx context.Context, paths []string) ([]int, error) {
+	lsof, err := exec.LookPath("lsof")
+	if err != nil {
+		return nil, fmt.Errorf("lsof is required to prove rollback targets are unused: %w", err)
+	}
+	output, err := exec.CommandContext(ctx, lsof, append([]string{"-t", "--"}, paths...)...).Output()
+	if err != nil {
+		if exit, ok := err.(*exec.ExitError); ok && exit.ExitCode() == 1 {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("inspect rollback target users: %w", err)
+	}
+	seen := map[int]bool{}
+	pids := make([]int, 0)
+	for _, line := range strings.Fields(string(output)) {
+		pid, err := strconv.Atoi(line)
+		if err != nil || pid <= 0 || seen[pid] {
+			continue
+		}
+		seen[pid] = true
+		pids = append(pids, pid)
+	}
+	sort.Ints(pids)
+	return pids, nil
 }
 
 func upgradeStartDrainBlocks(report upgradePreflight) []string {

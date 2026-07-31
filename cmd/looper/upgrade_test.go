@@ -291,6 +291,43 @@ func TestUpgradeVerifyStartRefusesActiveSchedulerOwnership(t *testing.T) {
 	}
 }
 
+func TestUpgradeRestorePreflightRequiresVerifiedInactiveTargets(t *testing.T) {
+	bundle := createUpgradeRestoreBundle(t)
+	original := upgradeRestoreOpenPIDs
+	t.Cleanup(func() { upgradeRestoreOpenPIDs = original })
+	upgradeRestoreOpenPIDs = func(context.Context, []string) ([]int, error) { return nil, nil }
+	stdout := &bytes.Buffer{}
+	if err := runUpgrade(context.Background(), nil, []string{"restore-preflight", "--bundle", bundle}, stdout); err != nil {
+		t.Fatal(err)
+	}
+	var report upgradeRestorePreflight
+	if err := json.Unmarshal(stdout.Bytes(), &report); err != nil {
+		t.Fatal(err)
+	}
+	if !report.Ready || len(report.Blocks) != 0 || report.Source.DatabasePath == "" {
+		t.Fatalf("report = %#v", report)
+	}
+}
+
+func TestUpgradeRestorePreflightReportsOpenTargets(t *testing.T) {
+	bundle := createUpgradeRestoreBundle(t)
+	original := upgradeRestoreOpenPIDs
+	t.Cleanup(func() { upgradeRestoreOpenPIDs = original })
+	upgradeRestoreOpenPIDs = func(context.Context, []string) ([]int, error) { return []int{12, 34}, nil }
+	stdout := &bytes.Buffer{}
+	err := runUpgrade(context.Background(), nil, []string{"restore-preflight", "--bundle", bundle}, stdout)
+	if err == nil || !strings.Contains(err.Error(), "still open") {
+		t.Fatalf("runUpgrade() error = %v", err)
+	}
+	var report upgradeRestorePreflight
+	if err := json.Unmarshal(stdout.Bytes(), &report); err != nil {
+		t.Fatal(err)
+	}
+	if report.Ready || len(report.OpenPIDs) != 2 || len(report.Blocks) != 1 {
+		t.Fatalf("report = %#v", report)
+	}
+}
+
 func writeUpgradeBundleFile(t *testing.T, directory, name, contents string) string {
 	t.Helper()
 	path := filepath.Join(directory, name)
@@ -322,6 +359,21 @@ func stageReleaseForUpgradeTest(t *testing.T, identity version.Info) (string, st
 		t.Fatal(err)
 	}
 	return root, staged.ReleaseID
+}
+
+func createUpgradeRestoreBundle(t *testing.T) string {
+	t.Helper()
+	root := t.TempDir()
+	config := writeUpgradeBundleFile(t, root, "config.toml", "[server]\n")
+	cli := writeUpgradeBundleFile(t, root, "looper", "cli")
+	daemon := writeUpgradeBundleFile(t, root, "looperd", "daemon")
+	bundle, err := upgradebackup.Create(context.Background(), upgradebackup.Input{RootDir: filepath.Join(root, "backups"), ConfigPath: config, DatabasePath: filepath.Join(root, "looper.sqlite"), CLIBinaryPath: cli, DaemonBinaryPath: daemon, Snapshot: func(context.Context) (string, error) {
+		return writeUpgradeBundleFile(t, root, "snapshot.sqlite", "sqlite"), nil
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return bundle.Directory
 }
 
 func upgradePostStartDaemon(t *testing.T, identity version.Info, activeRuns int) *httptest.Server {

@@ -1358,6 +1358,8 @@ Usage:
                                Atomically switch the staged release pointer
   looper upgrade verify-start --release-root <directory> --release <id>
                                Verify the restarted daemon against that release
+  looper upgrade restore-preflight --bundle <directory>
+                               Verify a rollback bundle and inactive targets
 
 Global flags, accepted before or after the verb:
   --config <path>              Config file to load
