@@ -445,13 +445,6 @@ func takeoverLoop(ctx context.Context, services looperdruntime.Services, loopID,
 	if services.Loops == nil {
 		return result, fmt.Errorf("loops service is not configured")
 	}
-	// Terminal Fixer cleanup takes the same guard before inspecting the loop and
-	// removing its worktree. Holding it across the durable takeover fence and
-	// process drain means cleanup either finishes before takeover begins or sees
-	// human_takeover and preserves the checkout; it cannot remove the path while
-	// the human hold is active.
-	unlockLoop := looperdruntime.LockLoopRequeue(loopID)
-	defer unlockLoop()
 	if services.Repositories != nil && services.Repositories.AgentExecutions != nil {
 		execution, err := services.Repositories.AgentExecutions.GetLatestByLoopID(ctx, loopID)
 		if err != nil {
@@ -480,8 +473,15 @@ func takeoverLoop(ctx context.Context, services looperdruntime.Services, loopID,
 		return result, err
 	}
 	reasonCopy := reason
-	if _, err := services.Loops.Hold(ctx, loopID, &reasonCopy); err != nil {
-		return result, err
+	// Terminal Fixer cleanup takes the same guard before inspecting the loop and
+	// removing its worktree. Hold the guard only across the durable takeover
+	// fence: releasing it before process drain avoids a deadlock when the
+	// cancelled Fixer reaches its own terminal cleanup and needs this lock.
+	unlockLoop := looperdruntime.LockLoopRequeue(loopID)
+	_, holdErr := services.Loops.Hold(ctx, loopID, &reasonCopy)
+	unlockLoop()
+	if holdErr != nil {
+		return result, holdErr
 	}
 	if _, err := haltLoopWithPreflight(ctx, services, loopID, reason, now, signal, executionMatchesProcess, false, true, preflight); err != nil {
 		return result, err
