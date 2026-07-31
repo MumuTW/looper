@@ -209,17 +209,20 @@ func (f *runnerFixture) singleReport(t *testing.T) Report {
 }
 
 type fakeGitHub struct {
-	detail       githubinfra.IssueDetail
-	details      map[int64]githubinfra.IssueDetail
-	viewSequence []githubinfra.IssueDetail
-	viewCalls    int
-	timeline     []map[string]any
-	onTimeline   func()
-	listInput    githubinfra.ListOpenIssuesInput
-	listEmpty    bool
-	permission   string
-	comments     []githubinfra.IssueCommentInput
-	commentErr   error
+	detail           githubinfra.IssueDetail
+	details          map[int64]githubinfra.IssueDetail
+	viewSequence     []githubinfra.IssueDetail
+	viewCalls        int
+	viewRequests     []int64
+	timeline         []map[string]any
+	timelineRequests []int64
+	onTimeline       func()
+	listInput        githubinfra.ListOpenIssuesInput
+	listEmpty        bool
+	permission       string
+	permissionCalls  int
+	comments         []githubinfra.IssueCommentInput
+	commentErr       error
 }
 
 func (f *fakeGitHub) CreateIssueComment(_ context.Context, input githubinfra.IssueCommentInput) (githubinfra.IssueCommentResult, error) {
@@ -252,6 +255,7 @@ func (f *fakeGitHub) ListOpenIssues(_ context.Context, input githubinfra.ListOpe
 }
 
 func (f *fakeGitHub) ViewIssue(_ context.Context, input githubinfra.ViewIssueInput) (githubinfra.IssueDetail, error) {
+	f.viewRequests = append(f.viewRequests, input.IssueNumber)
 	if f.viewCalls < len(f.viewSequence) {
 		detail := f.viewSequence[f.viewCalls]
 		f.viewCalls++
@@ -263,7 +267,8 @@ func (f *fakeGitHub) ViewIssue(_ context.Context, input githubinfra.ViewIssueInp
 	return f.detail, nil
 }
 
-func (f *fakeGitHub) ListIssueTimeline(context.Context, githubinfra.IssueTimelineInput) ([]map[string]any, error) {
+func (f *fakeGitHub) ListIssueTimeline(_ context.Context, input githubinfra.IssueTimelineInput) ([]map[string]any, error) {
+	f.timelineRequests = append(f.timelineRequests, input.IssueNumber)
 	if f.onTimeline != nil {
 		f.onTimeline()
 		f.onTimeline = nil
@@ -272,6 +277,7 @@ func (f *fakeGitHub) ListIssueTimeline(context.Context, githubinfra.IssueTimelin
 }
 
 func (f *fakeGitHub) GetRepositoryPermission(context.Context, githubinfra.RepositoryPermissionInput) (string, error) {
+	f.permissionCalls++
 	return f.permission, nil
 }
 

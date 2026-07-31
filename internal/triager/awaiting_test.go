@@ -52,7 +52,7 @@ func TestSelectAwaitingRechecksIsBoundedAndFair(t *testing.T) {
 		pending = append(pending, awaitingState(fmt.Sprintf("k%d", i), int64(i), now))
 	}
 
-	selected := selectAwaitingRechecks(pending, map[int64]struct{}{}, 3)
+	selected, cursor := selectAwaitingRechecks(pending, map[int64]struct{}{}, 3, awaitingRecheckCursor{})
 	if len(selected) != 3 {
 		t.Fatalf("selected = %d, want 3 (the budget)", len(selected))
 	}
@@ -65,7 +65,7 @@ func TestSelectAwaitingRechecksIsBoundedAndFair(t *testing.T) {
 
 	// Sources the update window already covers must not consume the budget meant
 	// for quiet ones.
-	withTouched := selectAwaitingRechecks(pending, map[int64]struct{}{1: {}, 2: {}}, 3)
+	withTouched, _ := selectAwaitingRechecks(pending, map[int64]struct{}{1: {}, 2: {}}, 3, awaitingRecheckCursor{})
 	for _, key := range []string{"k1", "k2"} {
 		if _, ok := withTouched[key]; ok {
 			t.Fatalf("touched source %s consumed recheck budget", key)
@@ -75,8 +75,14 @@ func TestSelectAwaitingRechecksIsBoundedAndFair(t *testing.T) {
 		t.Fatalf("selected with touched = %d, want 3 quiet sources", len(withTouched))
 	}
 
-	if got := selectAwaitingRechecks(pending, map[int64]struct{}{}, 0); len(got) != 0 {
+	if got, _ := selectAwaitingRechecks(pending, map[int64]struct{}{}, 0, awaitingRecheckCursor{}); len(got) != 0 {
 		t.Fatalf("selected with zero budget = %d, want 0", len(got))
+	}
+	next, _ := selectAwaitingRechecks(pending, map[int64]struct{}{}, 3, cursor)
+	for _, key := range []string{"k4", "k5", "k6"} {
+		if _, ok := next[key]; !ok {
+			t.Fatalf("second selection = %v, want cursor to advance through %s", next, key)
+		}
 	}
 }
 
@@ -85,7 +91,7 @@ func TestSelectAwaitingRechecksIsBoundedAndFair(t *testing.T) {
 func TestSelectAwaitingRechecksIgnoresNonAwaitingSources(t *testing.T) {
 	t.Parallel()
 	pending := []*sourceState{routableState("k1", 1), awaitingState("k2", 2, time.Now())}
-	selected := selectAwaitingRechecks(pending, map[int64]struct{}{}, 3)
+	selected, _ := selectAwaitingRechecks(pending, map[int64]struct{}{}, 3, awaitingRecheckCursor{})
 	if _, ok := selected["k1"]; ok {
 		t.Fatal("a routable source was selected for awaiting recheck")
 	}

@@ -49,6 +49,32 @@ func TestTriagerLaneSharesOneDecisionBudgetAcrossProjects(t *testing.T) {
 	}
 }
 
+func TestTriagerLaneLogsPendingForgeReadExhaustion(t *testing.T) {
+	t.Parallel()
+	logger := &capturingSchedulerLogger{}
+	runner := &budgetTriager{result: triager.DiscoveryResult{PendingForgeReads: 12, PendingSourcesDeferred: 4}}
+	lane := triagerLane(defaultSchedulerTickInput{Triager: runner, Logger: logger})
+	if _, err := lane.Discover(context.Background(), "project_1", "acme/one", nil); err != nil {
+		t.Fatalf("Discover() error = %v", err)
+	}
+	logger.requireContextValue(t, "triager pending forge reads exhausted", "reads", 12)
+	logger.requireContextValue(t, "triager pending forge reads exhausted", "deferred", 4)
+}
+
+func TestTriagerLaneSharesActualForgeReadBudgetAcrossProjects(t *testing.T) {
+	t.Parallel()
+	runner := &pendingReadBudgetTriager{}
+	lane := triagerLane(defaultSchedulerTickInput{Triager: runner})
+	for _, projectID := range []string{"project_1", "project_2"} {
+		if _, err := lane.Discover(context.Background(), projectID, "acme/looper", nil); err != nil {
+			t.Fatalf("Discover(%q) error = %v", projectID, err)
+		}
+	}
+	if got := runner.reserved.Load(); got != triager.DefaultPendingForgeReadLimit {
+		t.Fatalf("reserved forge reads = %d, want shared tick cap %d", got, triager.DefaultPendingForgeReadLimit)
+	}
+}
+
 // Projects are discovered concurrently through one lane, so every project shares
 // the tick-wide budget. This asserts the lane still hands the same budget to each
 // caller under concurrency; the reservation invariant itself is proven under real
@@ -102,6 +128,16 @@ type budgetTriager struct {
 	budgets  []int
 	reserved atomic.Int64
 	onCall   func()
+	result   triager.DiscoveryResult
+}
+
+type pendingReadBudgetTriager struct{ reserved atomic.Int64 }
+
+func (f *pendingReadBudgetTriager) DiscoverIssues(_ context.Context, input triager.DiscoveryInput) (triager.DiscoveryResult, error) {
+	for input.PendingForgeReadBudget.Reserve(input.ProjectID) {
+		f.reserved.Add(1)
+	}
+	return triager.DiscoveryResult{}, nil
 }
 
 func (f *budgetTriager) DiscoverIssues(_ context.Context, input triager.DiscoveryInput) (triager.DiscoveryResult, error) {
@@ -121,7 +157,7 @@ func (f *budgetTriager) DiscoverIssues(_ context.Context, input triager.Discover
 	f.mu.Lock()
 	f.budgets = append(f.budgets, remaining)
 	f.mu.Unlock()
-	return triager.DiscoveryResult{}, nil
+	return f.result, nil
 }
 
 // Gatekeeper lists DefaultDiscoveryPullRequestLimit open PRs with no filters, so a
