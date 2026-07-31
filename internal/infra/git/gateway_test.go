@@ -1262,9 +1262,10 @@ func TestGatewayDiscardWorktreeChangesResetsTrackedAndUntracked(t *testing.T) {
 	writeFile(t, filepath.Join(worktree.WorktreePath, "untracked-dir", "nested.txt"), "nested\n")
 
 	result, err := gateway.DiscardWorktreeChanges(ctx, DiscardWorktreeChangesInput{
-		RepoPath:     fixture.repoPath,
-		WorktreeRoot: fixture.worktreeRoot,
-		WorktreePath: worktree.WorktreePath,
+		RepoPath:       fixture.repoPath,
+		WorktreeRoot:   fixture.worktreeRoot,
+		WorktreePath:   worktree.WorktreePath,
+		ExpectedBranch: "feature/fixer",
 	})
 	if err != nil {
 		t.Fatalf("DiscardWorktreeChanges() error = %v", err)
@@ -1291,9 +1292,10 @@ func TestGatewayDiscardWorktreeChangesResetsTrackedAndUntracked(t *testing.T) {
 
 	// Second call is a no-op when already clean.
 	second, err := gateway.DiscardWorktreeChanges(ctx, DiscardWorktreeChangesInput{
-		RepoPath:     fixture.repoPath,
-		WorktreeRoot: fixture.worktreeRoot,
-		WorktreePath: worktree.WorktreePath,
+		RepoPath:       fixture.repoPath,
+		WorktreeRoot:   fixture.worktreeRoot,
+		WorktreePath:   worktree.WorktreePath,
+		ExpectedBranch: "feature/fixer",
 	})
 	if err != nil {
 		t.Fatalf("DiscardWorktreeChanges(clean) error = %v", err)
@@ -1334,9 +1336,10 @@ func TestGatewayDiscardWorktreeChangesRemovesNestedRepositories(t *testing.T) {
 	runGit(t, nestedPath, "-c", "user.email=test@example.com", "-c", "user.name=test", "commit", "-m", "nested")
 
 	result, err := gateway.DiscardWorktreeChanges(ctx, DiscardWorktreeChangesInput{
-		RepoPath:     fixture.repoPath,
-		WorktreeRoot: fixture.worktreeRoot,
-		WorktreePath: worktree.WorktreePath,
+		RepoPath:       fixture.repoPath,
+		WorktreeRoot:   fixture.worktreeRoot,
+		WorktreePath:   worktree.WorktreePath,
+		ExpectedBranch: "feature/fixer",
 	})
 	if err != nil {
 		t.Fatalf("DiscardWorktreeChanges() error = %v", err)
@@ -1413,9 +1416,10 @@ func TestGatewayDiscardWorktreeChangesResetsDirtySubmodules(t *testing.T) {
 	writeFile(t, filepath.Join(vendorPath, "untracked-in-sub.txt"), "sub untracked\n")
 
 	result, err := gateway.DiscardWorktreeChanges(ctx, DiscardWorktreeChangesInput{
-		RepoPath:     fixture.repoPath,
-		WorktreeRoot: fixture.worktreeRoot,
-		WorktreePath: worktree.WorktreePath,
+		RepoPath:       fixture.repoPath,
+		WorktreeRoot:   fixture.worktreeRoot,
+		WorktreePath:   worktree.WorktreePath,
+		ExpectedBranch: "feature/fixer",
 	})
 	if err != nil {
 		t.Fatalf("DiscardWorktreeChanges() error = %v", err)

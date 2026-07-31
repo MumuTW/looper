@@ -130,9 +130,10 @@ type CleanupWorktreeInput struct {
 // DiscardWorktreeChangesInput discards tracked and untracked local changes in a
 // managed worktree, leaving HEAD and the worktree directory itself intact.
 type DiscardWorktreeChangesInput struct {
-	RepoPath     string
-	WorktreeRoot string
-	WorktreePath string
+	RepoPath       string
+	WorktreeRoot   string
+	WorktreePath   string
+	ExpectedBranch string
 }
 
 // DiscardWorktreeChangesResult reports whether discard mutated the worktree.
@@ -628,6 +629,11 @@ func (g *Gateway) DiscardWorktreeChanges(ctx context.Context, input DiscardWorkt
 	if err := g.validateMutationWorktree(worktreePath, input.RepoPath, input.WorktreeRoot); err != nil {
 		return DiscardWorktreeChangesResult{}, err
 	}
+	if err := g.VerifyWorktreeIdentity(ctx, VerifyWorktreeIdentityInput{
+		RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: worktreePath, ExpectedBranch: input.ExpectedBranch,
+	}); err != nil {
+		return DiscardWorktreeChangesResult{}, fmt.Errorf("verify worktree identity before discard: %w", err)
+	}
 	if _, err := os.Stat(worktreePath); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return DiscardWorktreeChangesResult{WorktreePath: worktreePath, NoOp: true}, nil
@@ -864,7 +870,26 @@ func (g *Gateway) VerifyWorktreeIdentity(ctx context.Context, input VerifyWorktr
 	if actualBranch != expectedBranch {
 		return fmt.Errorf("worktree branch is %q, expected %q", actualBranch, expectedBranch)
 	}
+	repoCommon, err := g.gitCommonDir(ctx, input.RepoPath)
+	if err != nil {
+		return fmt.Errorf("inspect project repository identity: %w", err)
+	}
+	worktreeCommon, err := g.gitCommonDir(ctx, input.WorktreePath)
+	if err != nil {
+		return fmt.Errorf("inspect worktree repository identity: %w", err)
+	}
+	if repoCommon != worktreeCommon {
+		return fmt.Errorf("worktree does not belong to project repository")
+	}
 	return nil
+}
+
+func (g *Gateway) gitCommonDir(ctx context.Context, path string) (string, error) {
+	result, err := g.runGitResult(ctx, path, nil, "rev-parse", "--path-format=absolute", "--git-common-dir")
+	if err != nil {
+		return "", err
+	}
+	return filepath.Clean(strings.TrimSpace(result.Stdout)), nil
 }
 
 func (g *Gateway) Commit(ctx context.Context, input CommitInput) (CommitResult, error) {

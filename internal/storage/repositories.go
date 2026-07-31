@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -3302,6 +3303,9 @@ func (r *WorktreesRepository) GetByPath(ctx context.Context, worktreePath string
 // aliases while leaving all other paths as exact identities.
 func equivalentWorktreePaths(path string) []string {
 	canonical := filepath.Clean(strings.TrimSpace(path))
+	if runtime.GOOS != "darwin" {
+		return []string{canonical}
+	}
 	if strings.HasPrefix(canonical, "/private/var/") {
 		canonical = strings.TrimPrefix(canonical, "/private")
 	}

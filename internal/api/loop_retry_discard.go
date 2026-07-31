@@ -285,9 +285,10 @@ func (h *Handler) discardLoopWorktreeChanges(ctx context.Context, services loope
 	}
 	gateway := gitinfra.New(gitinfra.Options{GitPath: gitPath, Repos: services.Repositories, Now: h.now})
 	discard, err := gateway.DiscardWorktreeChanges(ctx, gitinfra.DiscardWorktreeChangesInput{
-		RepoPath:     project.RepoPath,
-		WorktreeRoot: resolved.WorktreeRoot,
-		WorktreePath: resolved.Path,
+		RepoPath:       project.RepoPath,
+		WorktreeRoot:   resolved.WorktreeRoot,
+		WorktreePath:   resolved.Path,
+		ExpectedBranch: resolved.Branch,
 	})
 	if err != nil {
 		return worktreeDiscardResult{}, apiError{
@@ -407,6 +408,9 @@ func resolveManagedWorktreeForLoop(ctx context.Context, repos *storage.Repositor
 					unsafeReason = "checkpoint_identity_mismatch"
 					record = nil
 				}
+			}
+			if record == nil && unsafeReason == "" {
+				unsafeReason = "checkpoint_identity_missing"
 			}
 		}
 		if record == nil && unsafeReason == "" {
