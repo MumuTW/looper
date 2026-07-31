@@ -673,6 +673,12 @@ for new claims; project catalog changes retain the normal project restart
 boundary. An already-started loop keeps the policy snapshot stored with its
 convergence state.
 
+The loop API projects this stored state as `loop.convergence`. The dashboard's
+Loop Detail view shows the round budget, consecutive-unproductive counter,
+current open items, and recent productive/unproductive round history. This is
+an observation of the persisted metadata; it does not infer status from review
+prose or change merge eligibility.
+
 ### Reviewer auto-merge settings
 
 Reviewer auto-merge lives under `roles.reviewer.autoMerge.*`:
