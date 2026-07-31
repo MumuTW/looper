@@ -10,6 +10,7 @@ on:
       - synchronize
       - reopened
       - ready_for_review
+      - edited
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -23,6 +24,34 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          # The semantic-prefix gate inspects the complete PR commit range.
+          fetch-depth: 0
+
+      - name: Check semantic PR and commit subjects
+        if: github.event_name == 'pull_request'
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          semantic_prefix='^(feat|fix|docs|test|refactor|chore|ci)(\(.+\))?!?: .+'
+
+          check_subject() {
+            local kind="$1"
+            local subject="$2"
+            if [[ ! "$subject" =~ $semantic_prefix ]]; then
+              printf 'Invalid %s: %s\n' "$kind" "$subject" >&2
+              printf 'Expected prefix: feat:, fix:, docs:, test:, refactor:, chore:, or ci: (optional scope/breaking !).\n' >&2
+              return 1
+            fi
+          }
+
+          check_subject 'pull-request title' "$PR_TITLE"
+          while IFS= read -r subject; do
+            check_subject 'commit subject' "$subject"
+          done < <(git log --format=%s "$BASE_SHA..$HEAD_SHA")
 
       - name: Set up Go
         uses: actions/setup-go@v5
