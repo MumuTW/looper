@@ -759,13 +759,31 @@ is caught the same way, and a builder that reverses which constant fills which
 description bullet is caught by the pairing assertion. The earlier draft's
 cross-component fixer test
 `TestFixerPromptOffersOnlyHonoredFailureKinds`
-(`internal/fixer/runner_repair_outcome_test.go`) is deleted: it existed solely
-to synchronize the prompt's advertised values with the parser's honored values
-across the `internal/agent`/`internal/fixer` boundary, and that synchronization
-is now compile-time because both sides derive from the same `policy` constants.
-The parser's own allowlist remains covered by the fixer's existing
-`parseFixerBlockedFailureKind` tests; the prompt's advertised subset and
-field-to-bullet pairing are covered by the `internal/agent` unit test above.
+(`internal/fixer/runner_repair_outcome_test.go`) is split, not deleted whole.
+Its prompt-offers-only-honored-kinds assertions (the part that checked the
+prompt advertises only `retryable_transient`/`manual_intervention`) existed
+solely to synchronize the prompt's advertised values with the parser's honored
+values across the `internal/agent`/`internal/fixer` boundary, and that
+synchronization is now compile-time because both sides derive from the same
+`policy` constants, so that half is deleted. Its other half — the assertion
+that `parseFixerBlockedFailureKind("retryable_after_resume")` stays accepted
+and maps to `FailureRetryableAfterResume` — is **retained**, because it is the
+repository's only direct coverage of the parser's backward-compatible-acceptance
+promise (the comment at `parseFixerBlockedFailureKind` in
+`internal/fixer/runner.go` states `retryable_after_resume` stays accepted
+rather than rejected so a reporting agent is not downgraded to a contract
+failure). The `internal/agent` unit test above intentionally excludes
+`retryable_after_resume` from the advertised set, so it still passes if the
+parser later rejects that kind; the retained assertion is what fails in that
+case. It is relocated out of the deleted cross-component test into a focused
+fixer-package test of `parseFixerBlockedFailureKind` (still in
+`internal/fixer/runner_repair_outcome_test.go`, asserting the accepted kinds
+`manual_intervention`, `retryable_after_resume`, and `retryable_transient`
+each map to their constant and an unknown kind is rejected), so the parser's
+own allowlist — including the non-advertised `retryable_after_resume` — stays
+directly asserted rather than only implied by the prompt test; the prompt's
+advertised subset and field-to-bullet pairing are covered by the
+`internal/agent` unit test above.
 
 ## Alternatives considered
 
@@ -1118,10 +1136,16 @@ swap and no carrier struct to fill; the per-bullet description pairing catches
 the builder-side swap the derivation cannot prevent. The earlier draft's
 cross-component test
 `TestFixerPromptOffersOnlyHonoredFailureKinds`
-(`internal/fixer/runner_repair_outcome_test.go`) is deleted: it existed solely
-to synchronize the prompt's advertised values with the parser's honored values
-across packages, and that synchronization is now compile-time because both
-sides derive from the same `policy` constants. The unit test does not import
+(`internal/fixer/runner_repair_outcome_test.go`) is split, not deleted whole:
+its prompt-advertised-values synchronization half is deleted (now compile-time
+because both sides derive from the same `policy` constants), while its
+parser-acceptance half — the assertion that
+`parseFixerBlockedFailureKind("retryable_after_resume")` stays accepted — is
+retained and relocated into a focused fixer-package test of
+`parseFixerBlockedFailureKind`, because it is the only direct coverage of the
+parser's backward-compatible-acceptance promise and is not subsumed by the
+`internal/agent` test (which excludes `retryable_after_resume` from the
+advertised set). The unit test does not import
 `failureclass`, keeping `go test ./internal/agent` free of the
 `internal/infra/github`/`diffanchor`/`outboundguard` dependency tree (Step 6).
 
@@ -1284,7 +1308,21 @@ Per `AGENTS.md`, the root commands are the source of truth:
    (`internal/{fixer,reviewer,worker,planner}`), locates every `loopError`
    composite literal `kind` element (and every assignment to a `loopError`
    value's `.kind` field), and classifies the value expression by
-   intra-procedural origin tracking within the enclosing function. File
+   intra-procedural origin tracking within the enclosing function. A
+   `loopError` composite literal that **omits** the `kind` element, a
+   `new(loopError)` call, or a `var <name> loopError` declaration produces a
+   zero-valued `loopError` whose `kind` is the empty-string default — an
+   unknown kind that bypasses `Normalize` exactly as the uninitialized `Kind`
+   local below rejects — so the gate treats each of those constructions as
+   **unsafe** as well: it flags any `loopError` composite literal whose element
+   list has no `kind` key, any `new(loopError)` expression, and any
+   `var <name> loopError` (or `var <name> loopError = <zero-value>`) declaration
+   whose declared local is later returned, assigned to a `loopError` value's
+   `.kind`, or otherwise flows to a `*loopError`/`loopError` use, because none
+   of them supplies a `kind` for the origin tracker to classify. (A zero-valued
+   local that is never used is not flagged — the gate enforces the invariant on
+   `loopError` values that reach a return or a `.kind` copy, not on dead
+   declarations.) File
    selection is build-aware before parsing: the worker package contains
    mutually-exclusive build-constrained files (`internal/worker/specfile_unix.go`
    with `//go:build darwin || linux` and `specfile_other.go` with
@@ -1390,9 +1428,26 @@ Per `AGENTS.md`, the root commands are the source of truth:
      carry a future unknown kind past the fallback). This is the branch
      `blockedKind` (traced to `fixerRepairTaskOutcome(...)`) reaches, which is
      why Step 2 wraps it in `failureclass.Normalize(blockedKind)` too.
+   - A `loopError` construction that supplies **no `kind` at all** — a composite
+     literal whose element list omits `kind` (e.g. `&loopError{message: msg}`),
+     a `new(loopError)` call, or a `var <name> loopError` zero-value declaration
+     whose local flows to a return, a `.kind` copy, or any other
+     `*loopError`/`loopError` use — **unsafe**. These never produce a `kind`
+     element or `.kind` assignment for the origin tracker to classify, so the
+     rules above would not visit them at all and the construction would pass
+     silently with the empty-string default. That is the same hole the
+     uninitialized `Kind` local rule closes: a `var kind failureclass.Kind`
+     never written is unsafe because its zero value is an unknown kind, and a
+     `loopError` built with no `kind` element carries that same zero value with
+     no assignment to flag. The gate therefore flags the construction itself,
+     not a `kind` expression inside it, so the implementer must add an explicit
+     `kind:` element (a known-kind constant or a `Normalize`-wrapped dynamic
+     source) rather than rely on the zero default. A zero-valued local that is
+     never used is not flagged, matching the dead-declaration carve-out above.
 
-   The test fails on the first **unsafe** `kind` assignment, reporting the file
-   and position. This closes the indirect-assignment hole: `kind: classified`
+   The test fails on the first **unsafe** `kind` assignment (or zero-valued
+   `loopError` construction), reporting the file and position. This closes the
+   indirect-assignment hole: `kind: classified`
    resolves `classified` back to `failureclass.Classify(...)` and fails, so the
    implementer must write `kind: failureclass.Normalize(classified)`. The
    existing safe shapes keep passing — `kind: FailureRetryableTransient`,
@@ -1407,7 +1462,10 @@ Per `AGENTS.md`, the root commands are the source of truth:
    otherwise accept vacuously, and likewise a `.kind` read off a `loopError`
    parameter or a `loopError` returned from an untracked helper is **unsafe**
    unless wrapped, because the receiver's `kind` is not proven safe within this
-   function. The carrier reads pass because Step 2 wraps them in
+   function, and likewise a `loopError` built with no `kind` element (or via
+   `new(loopError)`/`var <name> loopError`) is **unsafe** because its zero-value
+   `kind` is an unknown kind with no assignment for the origin tracker to visit.
+   The carrier reads pass because Step 2 wraps them in
    `Normalize`, not because the gate recognizes their producers. The
    dynamic-vs-copy distinction is no longer made by selector name: `go/types`
    resolves the receiver, so a `.Kind` read on `Decision`/validation structs is
@@ -1421,8 +1479,13 @@ Per `AGENTS.md`, the root commands are the source of truth:
    `Normalize` fallback invariant the refactor relies on, and it replaces a
    regex that claimed to enforce that invariant but could not. The production
    surface it guards does not grow — the seven dynamic-source call sites and the
-   five known-safe carrier reads already route through `Normalize` after Step 2
-   — so the test is a regression net, not a new state machine.
+   five known-safe carrier reads already route through `Normalize` after Step 2,
+   and every existing `loopError` composite literal already supplies an explicit
+   `kind:` element (there are no `new(loopError)`, `var <name> loopError`, or
+   `kind`-omitting literals in production today) — so the zero-valued
+   construction rule flags nothing on the current branch and is a regression
+   net against a future construction that would otherwise bypass the fallback
+   silently. The test is a regression net, not a new state machine.
 
    (Step 5's reverse-dependency derivation — `failureclass` importing `policy`
    and aliasing `type Kind = policy.Kind` and re-exporting the typed constants —
@@ -1453,11 +1516,19 @@ Per `AGENTS.md`, the root commands are the source of truth:
    `policy` constants the builder uses — not cross-package synchronization
    coverage. The earlier draft's cross-component test
    `TestFixerPromptOffersOnlyHonoredFailureKinds`
-   (`internal/fixer/runner_repair_outcome_test.go`) is deleted: it existed solely
-   to synchronize the prompt's advertised values with the parser's honored values
-   across packages, and that synchronization is now compile-time because both
-   sides derive from the same `policy` constants. The parser's own allowlist
-   remains covered by the fixer's existing `parseFixerBlockedFailureKind` tests.
+   (`internal/fixer/runner_repair_outcome_test.go`) is split, not deleted whole:
+   its prompt-advertised-values synchronization half is deleted (now compile-time
+   because both sides derive from the same `policy` constants), while its
+   parser-acceptance half — the assertion that
+   `parseFixerBlockedFailureKind("retryable_after_resume")` stays accepted and
+   maps to `FailureRetryableAfterResume` — is retained and relocated into a
+   focused fixer-package test of `parseFixerBlockedFailureKind` (asserting the
+   accepted kinds `manual_intervention`, `retryable_after_resume`, and
+   `retryable_transient` each map to their constant and an unknown kind is
+   rejected), because it is the only direct coverage of the parser's
+   backward-compatible-acceptance promise and is not subsumed by the
+   `internal/agent` test (which excludes `retryable_after_resume` from the
+   advertised set, so it still passes if the parser later rejects that kind).
 
 **Definition of done:** `QueueFailureKind` is gone from all four runners (the 60
 type-name references replaced by `failureclass.Kind`), the four `xxxFailureKind`
@@ -1490,7 +1561,10 @@ Normalize call-site type-aware check (step 8) passes — so every former
 and a bypass fails the suite whether the dynamic
 value is assigned inline or stored in a local first (the type-aware check
 traces locals to their origin and treats a local with no reaching assignments
-as unsafe so an uninitialized zero-value `Kind` cannot pass vacuously, traces
+as unsafe so an uninitialized zero-value `Kind` cannot pass vacuously, flags a
+`loopError` composite literal that omits `kind` (or a `new(loopError)`/`var
+<name> loopError` zero-value construction that flows to a use) as unsafe so an
+empty-string default kind cannot bypass `Normalize` the same way, traces
 `loopError.kind` selector reads back to their receiver's origin so a
 `loopError` parameter or untracked-helper result is not accepted as a safe
 copy, and resolves selector ownership and call targets via `go/types`, and
@@ -1506,7 +1580,10 @@ itself from the `policy` import, so there is no call site to swap; the pairing
 catches a builder-side field-to-bullet swap the derivation cannot prevent), with
 `internal/agent/prompt_test.go` importing the stdlib-only `policy` leaf and no
 `failureclass` import, and the earlier cross-component
-`TestFixerPromptOffersOnlyHonoredFailureKinds` deleted — the full
-`go test ./...` suite is green, and the diff contains no changes to
-`workflow.Step` types, `failureclass.Classify` logic, or
+`TestFixerPromptOffersOnlyHonoredFailureKinds` split — its prompt-sync half
+deleted (now compile-time) and its `parseFixerBlockedFailureKind` acceptance
+half retained as a focused fixer-package test so the parser's
+`retryable_after_resume` backward-compatible acceptance stays directly
+asserted — the full `go test ./...` suite is green, and the diff contains no
+changes to `workflow.Step` types, `failureclass.Classify` logic, or
 `NormalizeResumePolicy` behavior.
