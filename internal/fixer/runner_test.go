@@ -4666,7 +4666,7 @@ func TestCreateRunContextPreservesAuthorSnapshotWhenResumingAfterRepair(t *testi
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
 	// No worktree checkpoint → shouldResumeFromPrepare is false; advance past
-	// repair to validate without replaying the agent step.
+	// repair to reconcile-commits without replaying the agent step.
 	checkpointJSON := mustMarshalJSON(fixerCheckpoint{ResumePolicy: "advance_from_checkpoint", Repair: &checkpointRepair{CompletedAt: nowISO}})
 	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{
 		ID:                "run_failed_after_repair",
