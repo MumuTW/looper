@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -397,6 +398,9 @@ func TestWorktreesAdoptPathRollsBackRetirementWhenAdoptionFails(t *testing.T) {
 
 func TestWorktreesGetByPathAcceptsPrivateVarAlias(t *testing.T) {
 	t.Parallel()
+	if runtime.GOOS != "darwin" {
+		t.Skip("/var and /private/var are distinct paths off macOS")
+	}
 
 	coordinator := openMigratedCoordinatorForRepositories(t)
 	ctx := context.Background()

@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -1353,6 +1354,9 @@ func TestHandlerLoopRetryDiscardRejectsCheckpointBranchMismatch(t *testing.T) {
 
 func TestSameFilesystemPathSupportsMacOSVarAlias(t *testing.T) {
 	t.Parallel()
+	if runtime.GOOS != "darwin" {
+		t.Skip("/var and /private/var are distinct paths off macOS")
+	}
 
 	if !sameFilesystemPath("/var/folders/example/worktree", "/private/var/folders/example/worktree") {
 		t.Fatal("macOS /var alias was treated as a moved worktree")
