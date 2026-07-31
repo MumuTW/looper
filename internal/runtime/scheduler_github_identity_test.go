@@ -241,11 +241,11 @@ func TestReviewerAndFixerViewPullRequestQualifyEmbeddedReviewThreadFetches(t *te
 	})
 
 	reviewerAdapter := reviewerGitHubAdapter{config: &cfg, gateway: gateway}
-	if _, err := reviewerAdapter.ViewPullRequest(context.Background(), reviewer.ViewPullRequestInput{Repo: "acme/not-authoritative", PRNumber: 42, CWD: ghesPath}); err != nil {
+	if _, err := reviewerAdapter.ViewPullRequest(context.Background(), reviewer.ViewPullRequestInput{Repo: "acme/enterprise", PRNumber: 42, CWD: ghesPath}); err != nil {
 		t.Fatalf("reviewer ViewPullRequest() error = %v", err)
 	}
 	fixerAdapter := fixerGitHubAdapter{config: &cfg, gateway: gateway}
-	if _, err := fixerAdapter.ViewPullRequest(context.Background(), fixer.ViewPullRequestInput{Repo: "acme/not-authoritative", PRNumber: 42, CWD: ghesPath}); err != nil {
+	if _, err := fixerAdapter.ViewPullRequest(context.Background(), fixer.ViewPullRequestInput{Repo: "acme/enterprise", PRNumber: 42, CWD: ghesPath}); err != nil {
 		t.Fatalf("fixer ViewPullRequest() error = %v", err)
 	}
 

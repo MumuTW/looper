@@ -1171,10 +1171,9 @@ func (a fixerGitHubAdapter) AddReviewThreadReply(ctx context.Context, input fixe
 	return a.gateway.AddReviewThreadReply(ctx, githubinfra.AddReviewThreadReplyInput{Repo: repo, ThreadID: input.ThreadID, Body: body, CWD: input.CWD})
 }
 
-// reviewThreadRepo turns the configured project's provider binding into the
-// gateway's host-qualified repository identity. The scheduler's discovery repo
-// is intentionally only an owner/slug; it must not decide which gh host reads
-// or mutates review threads.
+// reviewThreadRepo adds the configured provider hostname to the caller's
+// repository slug. The caller owns the slug because durable work may predate a
+// project update; the current catalog owns only the provider transport.
 func reviewThreadRepo(cfg *config.Config, repo, cwd string) (string, error) {
 	if cfg == nil {
 		return repo, nil
@@ -1183,9 +1182,11 @@ func reviewThreadRepo(cfg *config.Config, repo, cwd string) (string, error) {
 		if filepath.Clean(project.RepoPath) != filepath.Clean(cwd) {
 			continue
 		}
-		if strings.TrimSpace(project.Repo) == "" {
-			project.Repo = repo
+		_, repoSlug := githubinfra.SplitRepoHostname(repo)
+		if strings.TrimSpace(repoSlug) == "" {
+			return "", fmt.Errorf("repository identity is not configured for project %s", project.ID)
 		}
+		project.Repo = repoSlug
 		identity, ok := config.ProjectRepositoryIdentity(*cfg, project)
 		if !ok {
 			return "", fmt.Errorf("repository identity is not configured for project %s", project.ID)

@@ -19,6 +19,7 @@ import (
 	"github.com/MumuTW/looper/internal/fixer"
 	githubinfra "github.com/MumuTW/looper/internal/infra/github"
 	"github.com/MumuTW/looper/internal/planner"
+	"github.com/MumuTW/looper/internal/projects"
 	"github.com/MumuTW/looper/internal/reviewer"
 	"github.com/MumuTW/looper/internal/storage"
 	"github.com/MumuTW/looper/internal/worker"
@@ -989,6 +990,58 @@ func TestProcessSnapshotQueueItemQualifiesGHESCommandsAndPersistsLogicalRepo(t *
 	}
 	if snapshot == nil || snapshot.Repo != repo {
 		t.Fatalf("GetLatestByProject() = %#v, want logical-repo snapshot", snapshot)
+	}
+}
+
+func TestProcessSnapshotQueueItemPreservesQueuedRepoAfterProjectUpdate(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "snapshot-project-update.sqlite"), t.TempDir())
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.July, 31, 9, 0, 0, 0, time.UTC)
+	global, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	catalog := projects.NewCatalog(global)
+	service := &projects.Service{
+		DB: coordinator.DB(), Repos: repos, ConfigSource: catalog, Now: func() time.Time { return now },
+		PublishProjects: catalog.Publish,
+	}
+	oldRepo := "acme/old"
+	projectID := "updated"
+	repoPath := filepath.Join(workingDir, "repo")
+	if _, err := service.AddProject(context.Background(), projects.AddInput{ID: projectID, Name: "Updated", RepoPath: repoPath, Repo: &oldRepo}); err != nil {
+		t.Fatalf("AddProject() error = %v", err)
+	}
+	prNumber := int64(42)
+	nowISO := formatJavaScriptISOString(now)
+	queueItem := storage.QueueItemRecord{ID: "queue_snapshot_project_update", ProjectID: &projectID, Type: "snapshot", TargetType: "pull_request", TargetID: oldRepo + "#42", Repo: &oldRepo, PRNumber: &prNumber, DedupeKey: "snapshot:" + oldRepo + ":42", Priority: storage.QueuePrioritySnapshot, Status: "running", AvailableAt: nowISO, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := repos.Queue.Upsert(context.Background(), queueItem); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	newRepo := "acme/new"
+	if _, err := service.UpdateProject(context.Background(), projectID, projects.UpdateInput{Repo: projects.UpdateStringField{Set: true, Value: &newRepo}}); err != nil {
+		t.Fatalf("UpdateProject() error = %v", err)
+	}
+	current := catalog.Snapshot()
+	if len(current.Projects) != 1 || current.Projects[0].Repo != newRepo {
+		t.Fatalf("catalog projects = %#v, want updated repo %q", current.Projects, newRepo)
+	}
+	var captured githubinfra.CapturePullRequestSnapshotInput
+	if err := processSnapshotQueueItem(context.Background(), queueItem, defaultSchedulerTickInput{
+		Repos: repos, Now: func() time.Time { return now }, Config: &current,
+		Snapshotter: stubSnapshotScheduler{capture: func(input githubinfra.CapturePullRequestSnapshotInput) { captured = input }},
+	}); err != nil {
+		t.Fatalf("processSnapshotQueueItem() error = %v", err)
+	}
+	if captured.Repo != oldRepo || captured.TransportRepo != oldRepo {
+		t.Fatalf("snapshot repos = (%q, %q), want queued repo %q preserved after catalog update", captured.Repo, captured.TransportRepo, oldRepo)
+	}
+	stored, err := repos.PullRequestSnapshots.GetLatestByProject(context.Background(), projectID, oldRepo, prNumber)
+	if err != nil || stored == nil {
+		t.Fatalf("GetLatestByProject(old repo) = %#v, %v; want queued snapshot", stored, err)
 	}
 }
 
