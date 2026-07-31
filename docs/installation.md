@@ -175,6 +175,7 @@ To switch binaries back, activate a previously staged release ID. That is only a
 - `looper upgrade preflight --target-looper <path> --target-looperd <path> --json` reads the running daemon's version/status and the candidate binaries' embedded identities without opening or mutating the production database; it also runs the candidate daemon's read-only config validation and reports identity pairing, config compatibility, schema/pending migrations, active work, and quarantine debt. `canStartDrain` and `startDrainBlocks` make the current pre-drain constraints explicit, while `drainRequired` reports active work that the later drain step must finish. These are snapshots, so a later cutover must re-check them.
 - `looper upgrade backup` explicitly asks the running daemon to create a rollback bundle. It uses SQLite's online backup operation rather than copying a live WAL database file, then records the copied config, CLI, daemon, and database snapshot with SHA-256 checksums in `manifest.json`.
 - `looper upgrade verify --bundle <directory>` checks that a rollback bundle has exactly the expected files and that each one still matches its `manifest.json` checksum and size. It detects accidental corruption or a mixed bundle; it is not a signature or proof of where the bundle came from.
+- `package.autoUpgradeEnabled` and the old `--no-auto-upgrade` / `--package-auto-upgrade-enabled` flags are unsupported. Existing config files may retain the historical field so they remain readable, but it is ignored; use the explicit preflight, backup, drain, stage, activate, and verify commands above.
 - release builds are tag-driven (`vX.Y.Z` / `vX.Y.Z-rc.N`); local default builds use `0.0.0-dev`
 
 ## Uninstall
@@ -183,7 +184,7 @@ To switch binaries back, activate a previously staged release ID. That is only a
 curl -fsSL https://raw.githubusercontent.com/mumutw/looper/main/scripts/uninstall.sh | sh
 ```
 
-The uninstall script removes the installer-owned CLI binary, any daemon binary under `$LOOPER_HOME/bin/` (default `~/.looper/bin/`), updater state, and the exact PATH stanza added by the installer to `.zprofile`, `.bash_profile`, or `.profile`. Unrelated profile content is preserved.
+The uninstall script removes the installer-owned CLI binary, any daemon binary under `$LOOPER_HOME/bin/` (default `~/.looper/bin/`), legacy updater state, and the exact PATH stanza added by the installer to `.zprofile`, `.bash_profile`, or `.profile`. Unrelated profile content is preserved.
 
 Before removing user data, it lists every existing path in scope and asks for approval. That optional scope is `config.toml`, `config.json`, `config.yaml`, `config.yml`, `looper.sqlite` plus its `-wal`/`-shm` sidecars, `backups/`, `logs/`, and `worktrees/` under `$LOOPER_HOME`. Declining leaves all of those paths untouched. For an explicitly authorized non-interactive uninstall, set `LOOPER_UNINSTALL_YES=1`; other values do not grant deletion authority. A `looperd` installed elsewhere on `PATH` still has to be removed by hand.
 

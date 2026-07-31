@@ -1301,12 +1301,9 @@ type configDaemonResponse struct {
 }
 
 type configPackageResponse struct {
-	Distribution string `json:"distribution"`
-	// AutoUpgradeEnabled preserves the frozen response shape; runtime no longer
-	// reads or acts on this value.
-	AutoUpgradeEnabled         bool `json:"autoUpgradeEnabled"`
-	AutoMigrateOnStartup       bool `json:"autoMigrateOnStartup"`
-	RequireBackupBeforeMigrate bool `json:"requireBackupBeforeMigrate"`
+	Distribution               string `json:"distribution"`
+	AutoMigrateOnStartup       bool   `json:"autoMigrateOnStartup"`
+	RequireBackupBeforeMigrate bool   `json:"requireBackupBeforeMigrate"`
 }
 
 func (h *Handler) buildConfigResponse() configResponse {
@@ -1349,7 +1346,6 @@ func (h *Handler) buildConfigResponse() configResponse {
 		},
 		Package: configPackageResponse{
 			Distribution:               cfg.Package.Distribution,
-			AutoUpgradeEnabled:         true,
 			AutoMigrateOnStartup:       cfg.Package.AutoMigrateOnStartup,
 			RequireBackupBeforeMigrate: cfg.Package.RequireBackupBeforeMigrate,
 		},

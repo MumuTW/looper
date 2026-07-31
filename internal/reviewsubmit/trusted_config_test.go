@@ -74,8 +74,8 @@ func TestTrustedReviewConfigAcceptsOldDaemonAutoUpgradeSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("loadConfig() error = %v", err)
 	}
-	if loaded.Config.Package.DeprecatedAutoUpgradeEnabled {
-		t.Fatal("trusted snapshot autoUpgradeEnabled = true, want old daemon false wire value")
+	if loaded.Partial.Package == nil || loaded.Partial.Package.DeprecatedAutoUpgradeEnabled == nil || *loaded.Partial.Package.DeprecatedAutoUpgradeEnabled {
+		t.Fatalf("trusted snapshot autoUpgradeEnabled = %#v, want ignored false legacy input", loaded.Partial.Package)
 	}
 }
 

@@ -97,9 +97,9 @@ func TestLoadFileAcceptsIgnoredDeprecatedPackageAutoUpgradeEnabledAcrossFormats(
 	}
 }
 
-func TestLoadFileAcceptsDeprecatedAutoUpgradeStartupArgsAsNoOps(t *testing.T) {
+func TestLoadFileRejectsRemovedAutoUpgradeStartupArgs(t *testing.T) {
 	cwd := t.TempDir()
-	loaded, err := LoadFile(LoadFileOptions{
+	_, err := LoadFile(LoadFileOptions{
 		CWD:        cwd,
 		ConfigPath: filepath.Join(cwd, "missing.json"),
 		Args: []string{
@@ -109,11 +109,8 @@ func TestLoadFileAcceptsDeprecatedAutoUpgradeStartupArgsAsNoOps(t *testing.T) {
 		LookupEnv: emptyEnvLookup,
 		LookPath:  fakeLookPath(map[string]string{"git": "/git", "gh": "/gh", "osascript": "/osascript"}),
 	})
-	if err != nil {
-		t.Fatalf("LoadFile() error = %v", err)
-	}
-	if !loaded.Config.Package.AutoMigrateOnStartup {
-		t.Fatal("deprecated startup args changed active package config, want ignored")
+	if err == nil || !strings.Contains(err.Error(), "no longer supported") {
+		t.Fatalf("LoadFile() error = %v, want unsupported flag", err)
 	}
 }
 

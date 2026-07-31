@@ -1,6 +1,9 @@
 package config
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestParseCLIArgsDispatchesInterleavedFlagFamilies(t *testing.T) {
 	parsed, err := parseCLIArgs([]string{
@@ -29,7 +32,7 @@ func TestParseCLIArgsDispatchesInterleavedFlagFamilies(t *testing.T) {
 	}
 }
 
-func TestParseCLIArgsAcceptsDeprecatedAutoUpgradeFlagsAsNoOps(t *testing.T) {
+func TestParseCLIArgsRejectsRemovedAutoUpgradeFlags(t *testing.T) {
 	tests := []struct {
 		name string
 		args []string
@@ -43,12 +46,8 @@ func TestParseCLIArgsAcceptsDeprecatedAutoUpgradeFlagsAsNoOps(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			parsed, err := parseCLIArgs(test.args)
-			if err != nil {
-				t.Fatalf("parseCLIArgs() error = %v", err)
-			}
-			if parsed.overrides.Package != nil {
-				t.Fatalf("deprecated flag populated package override = %#v, want no-op", parsed.overrides.Package)
+			if _, err := parseCLIArgs(test.args); err == nil || !strings.Contains(err.Error(), "no longer supported") {
+				t.Fatalf("parseCLIArgs() error = %v, want unsupported flag", err)
 			}
 		})
 	}

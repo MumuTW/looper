@@ -372,12 +372,9 @@ type WorktreeCleanupConfig struct {
 }
 
 type PackageConfig struct {
-	Distribution string `json:"distribution"`
-	// DeprecatedAutoUpgradeEnabled only preserves daemon-to-CLI snapshot
-	// decoding across short-lived binary skew. Runtime never reads it.
-	DeprecatedAutoUpgradeEnabled bool `json:"autoUpgradeEnabled,omitempty"`
-	AutoMigrateOnStartup         bool `json:"autoMigrateOnStartup"`
-	RequireBackupBeforeMigrate   bool `json:"requireBackupBeforeMigrate"`
+	Distribution               string `json:"distribution"`
+	AutoMigrateOnStartup       bool   `json:"autoMigrateOnStartup"`
+	RequireBackupBeforeMigrate bool   `json:"requireBackupBeforeMigrate"`
 }
 
 type NetworkMode string
