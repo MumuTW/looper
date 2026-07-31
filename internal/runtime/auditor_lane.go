@@ -109,6 +109,9 @@ func auditorRoleForProject(cfg config.Config, projectID string) config.AuditorRo
 	return config.ProjectRoleConfigs(cfg, projectID).Auditor
 }
 
+//nolint:unused
+var _ = failedAuditorChecks
+
 func failedAuditorChecks(checks githubinfra.PullRequestCheckRuns) []string {
 	return failedAuditorCheckEvidence(checks).Names
 }
