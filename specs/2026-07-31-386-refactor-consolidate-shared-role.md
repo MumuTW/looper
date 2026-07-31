@@ -387,9 +387,14 @@ The `loopError.kind` assignments split into three groups:
 3. **Statically safe shapes (no `Normalize` needed).** Every other
    `loopError.kind` assignment is a named `FailureRetryable*` constant (a known
    kind that needs no normalization), or a copy of an already-normalized kind —
-   either a `loopError.kind` field read (`kind: failure.kind` where `failure` is
-   a `loopError`) or a local that is itself only ever assigned from those two
-   shapes (e.g. `kind := FailureRetryableTransient; ...; kind: kind`).
+   a `loopError.kind` field read (`kind: failure.kind` where `failure` is a
+   `loopError` *local constructed in this function with a safe `kind``) or a
+   local that is itself only ever assigned from those two
+   shapes (e.g. `kind := FailureRetryableTransient; ...; kind: kind`). A
+   `loopError.kind` read off a `loopError` parameter or a `loopError` returned
+   from an untracked helper is *not* in this group: the receiver's `kind` is not
+   proven safe within this function, so it is a dynamic source that must be
+   `Normalize`-wrapped (see the receiver-origin rule in Validation step 8).
 
 If an implementation replaces any dynamic-source or carrier call with a direct
 assignment (`kind: d.Kind` or `kind: failureclass.Classify(...)` without
@@ -410,7 +415,10 @@ function and fails when a dynamic source (`failureclass.Classify(...)` or a
 `kind` without being wrapped in `failureclass.Normalize`. Selector ownership and
 call resolution are proven with `go/types`, not syntax alone: a `.kind` read is
 treated as a `loopError` copy only when `go/types` resolves its receiver type to
-`loopError`, and a `failureclass.Normalize(...)` call is recognized only when
+`loopError` *and* the receiver's own origin is traced to a safe `loopError`
+construction within this function (a `loopError` parameter or a `loopError`
+returned from an untracked helper is not a safe copy — see the receiver-origin
+rule in Validation step 8), and a `failureclass.Normalize(...)` call is recognized only when
 `go/types` resolves it to the imported `failureclass` package's `Normalize`, so a
 shadowed `failureclass` identifier or an unrelated struct's lowercase `kind`
 field cannot pass as safe. A bare local like `kind: classified` is resolved to
@@ -420,8 +428,9 @@ function parameter (no local definition to trace) is **unsafe**: its value
 comes from an untrusted call-site argument the intra-procedural check cannot
 trace, so a helper returning `&loopError{kind: kind}` from a `Kind` parameter
 must wrap the parameter in `Normalize` rather than passing it through. Known-
-constant references, `loopError.kind` copies, and locals whose every reaching
-assignment is one of those two safe shapes pass. The carrier reads from group 2
+constant references, `loopError.kind` copies whose receiver origin is safe, and
+locals whose every reaching assignment is one of those two safe shapes pass. The
+carrier reads from group 2
 (`validationFailure.kind`, `blockedKind`) are `Normalize`-wrapped per Step 2, so
 they pass the gate via the `Normalize`-call rule — the gate does not recognize
 the carrier producers by name, which is why they must be wrapped rather than
@@ -646,24 +655,40 @@ constructed from the received field values rather than spelled as independent
 literals. A rename of either shared value updates the call site at compile time,
 the same way it updates the parser, so the two cannot silently diverge — that
 rename-drift layer is deleted, not pinned by a synchronization test. The struct's
-named fields also constrain argument order by construction: because each
-advertised value is assigned to a named field (`RetryableTransient:` /
-`ManualIntervention:`), a swapped assignment is a visible named-field edit, not
-an undetectable positional swap of two same-typed `string` parameters. This
-deletes the argument-order gate the earlier positional-parameter design would
-have required: that design deliberately introduced two interchangeable positional
-`string` arguments and then added a cross-component test solely to detect swaps,
-against the repo's "prefer deletion over another layer" guideline. The named
-struct makes the swap unrepresentable as a silent mistake, so no
-argument-order-pinning test is added; a cross-component fixer test (Step 6) still
-exercises the production prompt builder, but only to assert the advertised
-bullet set equals exactly the kinds `parseFixerBlockedFailureKind` honors
-(rename-drift and advertised-subset coverage), not to pin argument order. This removes the second spelling rather than pinning
-it, per the repo's "prefer deletion over another layer" guideline — a
-synchronization or argument-order test would only guard a ledger or a positional
-mistake that the named-struct design no longer admits, and would leave production
-correctness dependent on that test running. `internal/agent` stays a lightweight
-package that does not import `failureclass` or the infra stack.
+named fields also constrain *call-site* argument order by construction: because
+each advertised value is assigned to a named field (`RetryableTransient:` /
+`ManualIntervention:`), a swapped assignment at the call site is a visible
+named-field edit, not an undetectable positional swap of two same-typed `string`
+parameters. This deletes the call-site argument-order gate the earlier
+positional-parameter design would have required: that design deliberately
+introduced two interchangeable positional `string` arguments and then added a
+cross-component test solely to detect call-site swaps, against the repo's
+"prefer deletion over another layer" guideline. The named struct makes a
+call-site swap unrepresentable as a silent mistake, so no call-site
+argument-order-pinning test is added.
+
+The named struct does not, however, constrain the builder's internal
+field-to-bullet assignment: `AppendFixerCompletionInstruction` could still place
+`kinds.ManualIntervention` on the retryable-description bullet and
+`kinds.RetryableTransient` on the manual-description bullet, and a test that
+only checks the advertised bullet set equals the expected kinds would pass while
+agents receive reversed guidance. A cross-component fixer test (Step 6)
+therefore exercises the production prompt builder for three coverages:
+rename-drift and advertised-subset coverage (the advertised bullet set equals
+exactly the kinds `parseFixerBlockedFailureKind` honors), and field-to-bullet
+pairing coverage (each advertised bullet's value is paired with its
+corresponding description, so a builder-side swap fails even when the parsed set
+is still equal). The pairing assertion is not the call-site argument-order gate
+the positional-parameter design needed — that gate existed only because the
+call site admitted a silent positional swap, which the named struct removes —
+it is the narrower check that the builder assigns each received field to the
+correct description bullet, a mistake the named call site cannot prevent. This
+removes the second spelling rather than pinning it, per the repo's "prefer
+deletion over another layer" guideline — a synchronization or call-site
+argument-order test would only guard a ledger or a positional mistake that the
+named-struct design no longer admits, and would leave production correctness
+dependent on that test running. `internal/agent` stays a lightweight package
+that does not import `failureclass` or the infra stack.
 
 `AppendFixerCompletionInstruction` advertises each `failure_kind` value in two
 distinct forms; both are reconstructed from the received struct fields so a
@@ -728,19 +753,40 @@ and so does any extra bullet — `string(failureclass.RetryableAfterResume)`
 or any arbitrary third token retained or later added. An agent following a
 stray bullet has its blocked outcome rejected by `parseFixerBlockedFailureKind`,
 so the gate must reject the prompt that advertises it, not merely confirm the
-two expected bullets are present. It also
-asserts the blocked-completion example
+two expected bullets are present.
+
+Set-equality alone is not sufficient, because the named struct only prevents a
+*call-site* positional swap; it does not constrain the builder's internal
+field-to-bullet assignment. `AppendFixerCompletionInstruction` could place
+`kinds.ManualIntervention` on the retryable-description bullet and
+`kinds.RetryableTransient` on the manual-description bullet, and the
+set-equality check would still see both expected values, while the
+blocked-completion example (built from `kinds.ManualIntervention` directly)
+would still embed the manual value — so both assertions pass while agents
+receive reversed guidance. The test therefore also asserts each advertised
+bullet pairs its value with its corresponding description: the bullet whose
+description text is the retryable guidance ("another attempt at the repair
+could succeed...") must carry `string(failureclass.RetryableTransient)`, and the
+bullet whose description text is the manual guidance ("no retry can succeed
+without a human decision...") must carry
+`string(failureclass.ManualIntervention)`. The pairing is checked by matching
+each bullet line's quoted value against the kind expected for that bullet's
+description, so a builder that swaps which field fills which advertised slot
+fails even though the parsed set is still equal. It also asserts the
+blocked-completion example
 `{"outcome":"blocked","failure_kind":"<value>",...}` embeds
 `string(failureclass.ManualIntervention)` (not the transient value), so a rename
-that updates the bullet but misses the example is caught. This is rename-drift
-coverage plus advertised-subset coverage: because the call site fills named
-struct fields, a positional swap is no longer a representable silent mistake, so
-the test does not need the per-bullet description pairing the
-positional-parameter design required to catch swaps. A rename of either shared
-value updates the call site and the test's expected tokens together at compile
-time, a removal of either advertised bullet is caught because the parsed set no
-longer equals the expected set, and an addition of any non-honored bullet is
-caught the same way.
+that updates the bullet but misses the example is caught. This is rename-drift,
+advertised-subset, and field-to-bullet-pairing coverage: the call site fills
+named struct fields so a call-site positional swap is not a representable
+silent mistake, but the builder's internal assignment is not constrained by the
+call site, so the per-bullet description pairing is retained to catch a
+builder-side swap. A rename of either shared value updates the call site and
+the test's expected tokens together at compile time, a removal of either
+advertised bullet is caught because the parsed set no longer equals the
+expected set, an addition of any non-honored bullet is caught the same way, and
+a builder that reverses which kind fills which description bullet is caught by
+the pairing assertion.
 
 ## Alternatives considered
 
@@ -774,14 +820,18 @@ caught the same way.
   pinned their order with a cross-component test that paired each advertised
   bullet with its corresponding description. That design deliberately introduced
   two interchangeable same-typed positional arguments and then added a gate
-  solely to detect swaps — exactly the "add a layer to catch a mistake the
-  representation admits" pattern the repo's "prefer deletion over another layer"
-  guideline warns against. A named struct owned by `internal/agent`
+  solely to detect *call-site* swaps — exactly the "add a layer to catch a
+  mistake the representation admits" pattern the repo's "prefer deletion over
+  another layer" guideline warns against. A named struct owned by `internal/agent`
   (`FixerCompletionKinds{RetryableTransient, ManualIntervention}`, Step 6) lets
   the fixer initialize each field explicitly from `string(failureclass.*)`, making
-  the swap unrepresentable as a silent positional mistake and deleting the
-  argument-order gate. The cross-component test keeps its rename-drift and
-  advertised-subset role.
+  a call-site swap unrepresentable as a silent positional mistake and deleting
+  the call-site argument-order gate. The cross-component test keeps its
+  rename-drift and advertised-subset role, and retains the per-bullet description
+  pairing — not as a call-site argument-order gate (the named struct removes that
+  mistake), but as the narrower check that the builder assigns each received
+  field to its correct description bullet, a swap the named call site cannot
+  prevent.
   Recorded here per the guideline that the deletion-first attempt be recorded even
   when adopted.
 - **Generalize the step traversal helpers.** See Step 4 — rejected as net
@@ -1078,9 +1128,13 @@ cross-component test: `TestFixerPromptOffersOnlyHonoredFailureKinds`
 `buildFixerPrompt`, parse every advertised bullet token out of the produced
 prompt, and assert the parsed set equals exactly the `failure_kind` values
 `parseFixerBlockedFailureKind` honors (derived from `failureclass`) as
-rename-drift and advertised-subset coverage; the call site fills named struct
-fields (`agent.FixerCompletionKinds`), so a positional swap is unrepresentable
-as a silent mistake and no argument-order pinning is needed. The existing
+rename-drift and advertised-subset coverage, and assert each advertised bullet
+pairs its value with its corresponding description so a builder-side
+field-to-bullet swap fails even when the parsed set is still equal; the call
+site fills named struct fields (`agent.FixerCompletionKinds`), so a call-site
+positional swap is unrepresentable as a silent mistake and no call-site
+argument-order pinning is needed (the per-bullet description pairing catches
+the builder-side swap the named call site cannot prevent). The existing
 `internal/agent/prompt_test.go` is rewritten to use arbitrary sentinel `string`
 field values in `agent.FixerCompletionKinds` and assert the builder embeds the
 received values in both forms; it does not import `failureclass`, keeping
@@ -1121,6 +1175,16 @@ records are identical before and after. No migration, no schema touch.
      `requeueOrFailQueueItem`/`failQueueItemTerminal`, worker's
      `reconcileRecoveredLoop`/`buildRunCompletedInput`/`shouldNotifyCompletedRun`/
      `issueClaimStatusForFailure`, planner's `reconcileRecoveredLoop`).
+   - **Function return types:** `fixerRepairTaskOutcome`
+     (`internal/fixer/runner.go:1367`, returns `(bool, string, QueueFailureKind,
+     *loopError)`) and `parseFixerBlockedFailureKind`
+     (`internal/fixer/runner.go:1411`, returns `(QueueFailureKind, bool)`). These
+     are the structured-agent outcome and allowlisting boundaries whose declared
+     return type changes from `QueueFailureKind` to `failureclass.Kind`; their
+     callers feed the returned kind into `loopError.kind` (the `blockedKind` flow
+     Step 2 group 2 covers), so they are part of the caller audit, not just
+     internal plumbing. (The four `xxxFailureKind` conversion functions also
+     return `QueueFailureKind`, but they are deleted in Step 2, not retyped.)
    - **Test spelling:** `internal/fixer/runner_repair_outcome_test.go:24`
      (`wantKind QueueFailureKind`).
 
@@ -1246,7 +1310,17 @@ Per `AGENTS.md`, the root commands are the source of truth:
    checked. The test therefore selects files with `go/build.Context.MatchFile`
    (using `build.Default`, which honors `//go:build` and the current
    `GOOS`/`GOARCH`) so only the one file active under the build constraints is
-   parsed and type-checked, matching what `go build` actually compiles. Imports
+   parsed and type-checked, matching what `go build` actually compiles.
+   `MatchFile` alone is not sufficient: it applies filename and build-constraint
+   matching but still returns `true` for `_test.go` files, so it does not match
+   `go build`, which compiles only production sources. Type-checking the
+   packages' `runner_test.go` files would enforce the production
+   `loopError.kind` invariant on test-only literals — a test that deliberately
+   constructs an unknown kind (e.g. a sentinel `failureclass.Kind` value) could
+   then fail this structural gate even though it cannot affect production. The
+   test therefore excludes `_test.go` files explicitly (skipping any
+   `MatchFile`-matched file whose base name ends in `_test.go`), so the gate
+   type-checks exactly the production file set `go build` compiles. Imports
    are resolved via a source importer. Selector
    ownership and call targets are resolved from `go/types` info, not from
    selector spelling: a `.kind` read is treated as a `loopError` copy only when
@@ -1263,8 +1337,34 @@ Per `AGENTS.md`, the root commands are the source of truth:
      per-role `FailureRetryable*` / `FailureNonRetryable` /
      `FailureManualIntervention` aliases — **safe** (a known kind).
    - A `.kind` selector read whose receiver `go/types` resolves to `loopError`
-     (`kind: failure.kind`) — **safe** (a copy of an already-normalized kind, by
-     this same invariant).
+     (`kind: failure.kind`) — **safe only when the receiver's own origin is
+     safe**. Resolving the receiver's *type* to `loopError` is necessary but not
+     sufficient: a `loopError` parameter or a `loopError` returned from an
+     untracked helper can carry an empty or unknown `kind`, so accepting every
+     `loopError`-typed selector read as a copy of an already-normalized kind
+     opens the same untracked-source hole the parameter rule below closes. The
+     receiver identifier is therefore resolved to its origin within the
+     enclosing function by the same rule applied to bare identifiers: if the
+     receiver is a **local variable**, resolve it to every reaching assignment
+     and classify each right-hand side — **safe** only if every reaching
+     assignment is itself a `loopError` composite literal whose `kind` element
+     is safe (recursively), so a locally-constructed `loopError` whose `kind`
+     was normalized copies a safe kind; **unsafe** if any reaching assignment is
+     a function parameter, a call `go/types` does not resolve to a known-safe
+     producer, or any other untracked source. If the receiver is a **function
+     parameter** (a `loopError` declared in the enclosing signature with no
+     intra-procedural assignment) — **unsafe**: its `kind` originates from an
+     untrusted call-site argument the intra-procedural check cannot trace, so a
+     helper receiving a `loopError` parameter and returning
+     `&loopError{kind: input.kind}` cannot pass the selector read as safe; the
+     implementer must wrap the read in `failureclass.Normalize(input.kind)`.
+     (Tracing every call-site argument is inter-procedural and out of scope; the
+     conservative choice is unsafe-by-default, the same stance the parameter
+     rule below takes for a bare `Kind` parameter.) This keeps the
+     `loopError.kind` copy rule consistent with the unsafe-parameter rule rather
+     than contradicting it: the copy is safe only when the copy's source is
+     proven safe within this function, not merely because the source is typed
+     `loopError`.
    - A bare identifier that is a **local variable** — resolve it to every
      assignment to that name within the same function and classify each
      right-hand side recursively; **safe** only if every reaching assignment is
@@ -1306,17 +1406,22 @@ Per `AGENTS.md`, the root commands are the source of truth:
    resolves `classified` back to `failureclass.Classify(...)` and fails, so the
    implementer must write `kind: failureclass.Normalize(classified)`. The
    existing safe shapes keep passing — `kind: FailureRetryableTransient`,
-   `kind: failure.kind` (where `failure` is a `loopError`), and `kind: kind`
+   `kind: failure.kind` (where `failure` is a `loopError` *local* constructed in
+   this function with a safe `kind`), and `kind: kind`
    where `kind` is a local only ever assigned from `FailureRetryable*` constants
    all resolve to a safe origin; a `kind` that is a function parameter is
    **unsafe** unless wrapped, because its origin is an untraceable call-site
-   argument. The carrier reads pass because Step 2 wraps them in
+   argument, and likewise a `.kind` read off a `loopError` parameter or a
+   `loopError` returned from an untracked helper is **unsafe** unless wrapped,
+   because the receiver's `kind` is not proven safe within this function. The carrier reads pass because Step 2 wraps them in
    `Normalize`, not because the gate recognizes their producers. The
    dynamic-vs-copy distinction is no longer made by selector name: `go/types`
    resolves the receiver, so a `.Kind` read on `Decision`/validation structs is
    dynamic and a `.kind` read on a `loopError` is a copy, regardless of spelling
    — a struct that happened to spell its field the other way could not fool the
-   gate.
+   gate. A `loopError`-typed copy is safe only after the receiver's origin is
+   traced, so a `loopError` parameter or untracked-helper result cannot pass as
+   a safe copy the way a locally-constructed `loopError` can.
 
    This is covering, not propping up: it is the first enforcement of the
    `Normalize` fallback invariant the refactor relies on, and it replaces a
@@ -1339,14 +1444,21 @@ Per `AGENTS.md`, the root commands are the source of truth:
    `{string(failureclass.RetryableTransient), string(failureclass.ManualIntervention)}`
    — the kinds `parseFixerBlockedFailureKind` honors as advertised outcomes — so a
    missing expected bullet or any extra bullet (`retryable_after_resume`,
-   `non_retryable`, or any later-added token) fails the set-equality check, and
-   asserts the blocked-completion example embeds
+   `non_retryable`, or any later-added token) fails the set-equality check. It
+   also asserts each advertised bullet pairs its value with its corresponding
+   description: the retryable-description bullet must carry
+   `string(failureclass.RetryableTransient)` and the manual-description bullet
+   must carry `string(failureclass.ManualIntervention)`, so a builder that swaps
+   which field fills which advertised slot fails even when the parsed set is
+   still equal, and asserts the blocked-completion example embeds
    `string(failureclass.ManualIntervention)` (not the transient value). This is
-   rename-drift and advertised-subset coverage: the call site fills named struct
-   fields
+   rename-drift, advertised-subset, and field-to-bullet-pairing coverage: the
+   call site fills named struct fields
    (`agent.FixerCompletionKinds{RetryableTransient: ..., ManualIntervention: ...}`),
-   so a positional swap is unrepresentable as a silent mistake and no
-   per-bullet description pairing is needed to catch swaps.
+   so a call-site positional swap is unrepresentable as a silent mistake and no
+   call-site argument-order pinning is needed; the per-bullet description
+   pairing is retained to catch the builder-side field-to-bullet swap the named
+   call site cannot prevent.
    `internal/agent/prompt_test.go` is rewritten to use arbitrary
    sentinel `string` field values in `agent.FixerCompletionKinds` (no
    `failureclass` import) and assert the builder embeds the received values in
@@ -1379,15 +1491,20 @@ Normalize call-site type-aware check (step 8) passes — so every former
 `Normalize`-wrapped too so the gate stays uniform (no carrier-name allowlist),
 and a bypass fails the suite whether the dynamic
 value is assigned inline or stored in a local first (the type-aware check
-traces locals to their origin and resolves selector ownership and call targets
-via `go/types`, and selects files with `go/build.Context.MatchFile` so
-mutually-exclusive build-constrained files like the worker's
+traces locals to their origin, traces `loopError.kind` selector reads back to
+their receiver's origin so a `loopError` parameter or untracked-helper result is
+not accepted as a safe copy, and resolves selector ownership and call targets
+via `go/types`, and selects files with `go/build.Context.MatchFile` (excluding
+`_test.go` files so the gate type-checks only the production sources `go build`
+compiles) so mutually-exclusive build-constrained files like the worker's
 `specfile_unix.go`/`specfile_other.go` are not both type-checked) — the
 four-kind regression coverage above exists, the fixer-prompt call-site coverage
 test (step 9) exists — exercising `buildFixerPrompt` for rename-drift and
 advertised-subset coverage of the advertised `failure_kind` tokens via set
-equality (a positional swap is unrepresentable
-because the call site fills named struct fields), with
+equality plus per-bullet description pairing (a call-site positional swap is
+unrepresentable because the call site fills named struct fields; the pairing
+catches a builder-side field-to-bullet swap the named call site cannot prevent),
+with
 `internal/agent/prompt_test.go` using sentinel struct field values and no
 `failureclass` import — the full `go test ./...` suite is green, and the diff
 contains no changes to `workflow.Step` types, `failureclass.Classify` logic, or
