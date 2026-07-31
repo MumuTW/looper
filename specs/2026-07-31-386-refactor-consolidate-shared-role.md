@@ -150,13 +150,17 @@ not a solution to it.
    rename updates the prompt and the parser together at compile time. This
    deletes the second spelling rather than pinning it by import or by a carrier;
    no `FixerCompletionKinds` struct, fixer call-site wiring, or cross-component
-   synchronization test is added — the derivation is the simpler move the repo's
-   "prefer deletion over another layer" guideline requires before introducing a
-   carrier to pass the values across packages (Step 6). A unit test in
-   `internal/agent` exercises the builder and asserts the advertised bullet set
-   equals exactly the kinds `parseFixerBlockedFailureKind` honors, for
-   advertised-subset and field-to-bullet-pairing coverage of the builder's own
-   correctness.
+   rename-drift synchronization test is added — the derivation is the simpler
+   move the repo's "prefer deletion over another layer" guideline requires
+   before introducing a carrier to pass the values across packages (Step 6). A
+   unit test in `internal/agent` exercises the builder and asserts the
+   advertised bullet set equals exactly the kinds
+   `parseFixerBlockedFailureKind` honors, for advertised-subset and
+   field-to-bullet-pairing coverage of the builder's own correctness; a
+   fixer-package contract test additionally asserts the parser accepts every
+   advertised value (advertised-subset ⊆ parser-allowlist membership), since
+   the compile-time derivation enforces rename-drift but not parser-switch
+   membership.
    This is not an exhaustive audit of
    every bare-string spelling of the vocabulary: additional production consumers
    and the persisted schema also spell the kinds as bare strings and are
@@ -390,8 +394,11 @@ status predicates support it is contained to `NonRetryable` — the safe default
 rather than passing through to predicates that fall through as unknown. To give
 a new kind distinct behavior, the implementer must extend `Normalize` to preserve
 it **and** update every runner's predicates in the same change; the per-runner
-four-kind classification tests (Validation step 6) are extended to cover the new
-kind in each runner so a predicate that does not handle it is caught. This is
+downstream-predicate contract cases (Validation step 6) are extended to cover
+the new pass-through kind in each runner's retry, hold, notification, status,
+and persistence predicates — not only the `classifyFailure*` functions, which
+return the kind correctly while a predicate that consumes it can still fall
+through — so a predicate that does not handle the new kind is caught. This is
 the "authority constants remain normalized to `NonRetryable` until consumers
 explicitly opt in" contract: `Normalize` is the authority for "this kind is
 supported," and a constant is only pass-through after the consumers that act on
@@ -402,10 +409,19 @@ reach predicates that treat it as unknown (see Validation step 6).
 
 Add a focused test in `internal/loops/failureclass` asserting that the four
 known kinds pass through `Normalize` unchanged and that an unknown `Kind`
-normalizes to `NonRetryable`. The boundary normalization itself is covered by
-the four-kind per-runner classification tests and the per-runner alias-identity
-tests in Validation step 6, which assert each runner's persisted kind and retry
-decision for each known kind; no structural call-site gate is added.
+normalizes to `NonRetryable`. The boundary normalization itself is **not**
+covered only by the four-kind per-runner classification tests and alias-identity
+tests in Validation step 6: those assert each runner's persisted kind and retry
+decision for each *known* kind, and every known kind is a fixed point of
+`Normalize`, so they still pass if a runner's failure-handling entry point omits
+its `Normalize` call and an unknown `loopError.kind` reaches retry or
+persistence unnormalized. The implementation therefore adds a per-runner
+boundary-normalization contract test (Validation step 6) that injects an unknown
+`Kind` through each runner's queue-failure consumption boundary and asserts the
+kind seen by the retry predicate, the breaker's manual-kind check, the
+resume-policy derivation, and queue/checkpoint persistence is `NonRetryable` —
+not the injected unknown value — so a boundary that drops its `Normalize` call is
+caught in the runner that contains it. No structural call-site gate is added.
 
 ### Step 3 — Audit the cross-package typed surface
 
@@ -634,14 +650,18 @@ compile time — both trace to the same `policy` constants (the parser via the
 `FailureRetryable*` re-exports of `failureclass.*`, which are themselves
 re-exports of `policy.*`), so the two cannot silently diverge. That rename-drift
 layer is deleted, not pinned by a synchronization test: there is no second
-spelling to keep in sync, so no cross-component test is added to guard it. This
+spelling to keep in sync, so no cross-component rename-drift test is added to
+guard it. (The separate advertised-subset ⊆ parser-allowlist *membership*
+contract is retained as a fixer-package test — see below — because the
+compile-time derivation does not enforce the parser's switch still accepts every
+advertised value; that is a membership check, not a rename-drift check.) This
 deletes the `FixerCompletionKinds` carrier, the fixer call-site wiring, and the
-cross-component synchronization coverage an earlier draft introduced solely to
-pass those two values across the `internal/agent`/`internal/fixer` boundary —
-the simpler derivation the repo's "prefer deletion over another layer" guideline
-requires before adding a carrier. `internal/agent` stays a lightweight package
-that imports the stdlib-only `policy` leaf, not `failureclass` or the infra
-stack.
+cross-component rename-drift synchronization coverage an earlier draft
+introduced solely to pass those two values across the
+`internal/agent`/`internal/fixer` boundary — the simpler derivation the repo's
+"prefer deletion over another layer" guideline requires before adding a carrier.
+`internal/agent` stays a lightweight package that imports the stdlib-only
+`policy` leaf, not `failureclass` or the infra stack.
 
 `AppendFixerCompletionInstruction` advertises each `failure_kind` value in two
 distinct forms; both are reconstructed from the imported `policy` constants so a
@@ -750,6 +770,29 @@ directly asserted rather than only implied by the prompt test; the prompt's
 advertised subset and field-to-bullet pairing are covered by the
 `internal/agent` unit test above.
 
+The compile-time derivation deletes the *rename-drift* layer (both sides trace
+to the same `policy` constants, so a rename cannot silently diverge), but it
+does **not** delete the *membership* contract between the advertised subset and
+the parser's switch: importing the same constants does not enforce that
+`parseFixerBlockedFailureKind`'s switch still accepts every advertised value.
+If the parser intentionally stops accepting an advertised kind (e.g.
+`manual_intervention` or `retryable_transient`) and its focused parser test
+above is updated to drop that case, the unchanged `internal/agent` test and
+prompt still pass while agents are instructed to emit a value the fixer
+rejects. The implementation therefore retains a fixer-package contract test
+(in `internal/fixer/runner_repair_outcome_test.go`) asserting every advertised
+bullet is accepted by the parser: for each value in
+`{string(policy.RetryableTransient), string(policy.ManualIntervention)}` — the
+advertised subset the `internal/agent` builder derives, referenced from the
+same `policy` constants so the advertised subset and the parser-acceptance
+check share one definition — `parseFixerBlockedFailureKind(value)` returns
+`(<kind>, true)`, so a parser that drops an advertised kind fails in the fixer
+package even when the agent test and prompt are unchanged. This is the
+advertised-subset ⊆ parser-allowlist contract the deleted cross-component
+test's prompt-sync half enforced; the rename-drift half is compile-time, but
+the membership half stays asserted because the parser's switch is the authority
+for "this advertised value is honored," not the shared constant import.
+
 ## Alternatives considered
 
 - **Create `internal/roles/` as the issue suggests.** Rejected. A new package
@@ -790,13 +833,16 @@ advertised subset and field-to-bullet pairing are covered by the
   `internal/loops/policy` is a stdlib-only leaf that owns the `Kind` type and
   typed constants, so `internal/agent` imports `policy` directly and derives the
   two advertised values inside the builder (Step 6). This deletes the carrier,
-  the fixer call-site wiring, and the cross-component synchronization test
-  introduced solely to keep the prompt and parser in sync across packages —
-  both now trace to the same `policy` constants, so a rename updates them
-  together at compile time. The per-bullet description pairing is retained as a
-  unit test in `internal/agent` (not a cross-component gate), because the
-  derivation does not constrain which constant the builder places on which
-  description bullet.
+  the fixer call-site wiring, and the cross-component rename-drift
+  synchronization test introduced solely to keep the prompt and parser in sync
+  across packages — both now trace to the same `policy` constants, so a rename
+  updates them together at compile time. The advertised-subset ⊆
+  parser-allowlist membership contract is still retained as a fixer-package
+  test (Step 6, Validation step 9), because the compile-time derivation enforces
+  rename-drift, not parser-switch membership. The per-bullet description pairing
+  is retained as a unit test in `internal/agent` (not a cross-component gate),
+  because the derivation does not constrain which constant the builder places on
+  which description bullet.
   Recorded here per the guideline that the deletion-first attempt be recorded even
   when adopted.
 - **Generalize the step traversal helpers.** See Step 4 — rejected as net
@@ -1075,8 +1121,11 @@ Infra signals remain for drift detection, not authority.
   adds no infra edge. No `FixerCompletionKinds` carrier struct is declared and
   no call-site wiring is added; a rename of either `policy` constant updates
   the prompt and the parser together at compile time, so no cross-component
-  synchronization test is added (a unit test in `internal/agent`, Step 6,
-  covers advertised-subset and field-to-bullet-pairing correctness).
+  rename-drift synchronization test is added (a unit test in `internal/agent`,
+  Step 6, covers advertised-subset and field-to-bullet-pairing correctness; a
+  fixer-package contract test, Step 6 / Validation step 9, covers the
+  advertised-subset ⊆ parser-allowlist membership contract the derivation does
+  not enforce).
 - `internal/loops/policy/policy.go` — gains two new untyped `string` constants
   (`FailureKindRetryableTransient`, `FailureKindNonRetryable`) so it owns all
   four kind string values, plus `type Kind string` and the four typed `Kind`
@@ -1113,7 +1162,13 @@ a four-kind net that does not yet exist, including a per-runner alias-identity
 test in each of the four runner packages that compares all four local
 `FailureRetryable*`/`FailureNonRetryable`/`FailureManualIntervention` re-exports
 against their shared `failureclass.*` constants, so a mis-paired re-export is
-caught in the role that contains it rather than only in aggregate.
+caught in the role that contains it rather than only in aggregate. It also adds,
+in each of the four runner packages, the per-runner downstream-predicate
+contract cases over every `Normalize` pass-through kind (covering the retry,
+hold, notification, status, and persistence predicates, not only
+`classifyFailure*`) and the per-runner boundary-normalization contract test
+that injects an unknown kind through the queue-failure consumption boundary and
+asserts it reaches those predicates as `NonRetryable` (Validation step 6).
 
 No policy drift-detection test is added: Step 5 reverses the leaf dependency so `failureclass` imports `policy`
 and aliases `type Kind = policy.Kind` and re-exports the typed constants at
@@ -1136,7 +1191,7 @@ the builder-side swap the derivation cannot prevent. The earlier draft's
 cross-component test
 `TestFixerPromptOffersOnlyHonoredFailureKinds`
 (`internal/fixer/runner_repair_outcome_test.go`) is split, not deleted whole:
-its prompt-advertised-values synchronization half is deleted (now compile-time
+its prompt-advertised-values *rename-drift* half is deleted (now compile-time
 because both sides derive from the same `policy` constants), while its
 parser-acceptance half — the assertion that
 `parseFixerBlockedFailureKind("retryable_after_resume")` stays accepted — is
@@ -1144,7 +1199,14 @@ retained and relocated into a focused fixer-package test of
 `parseFixerBlockedFailureKind`, because it is the only direct coverage of the
 parser's backward-compatible-acceptance promise and is not subsumed by the
 `internal/agent` test (which excludes `retryable_after_resume` from the
-advertised set). The unit test does not import
+advertised set). The deleted rename-drift half does not carry the
+advertised-subset ⊆ parser-allowlist *membership* contract — importing the same
+constants does not enforce the parser's switch still accepts every advertised
+value — so a fixer-package contract test is retained that imports
+`internal/loops/policy` and asserts `parseFixerBlockedFailureKind` accepts
+every advertised value (`policy.RetryableTransient`, `policy.ManualIntervention`),
+so a parser that drops an advertised kind fails even when the agent test and
+prompt are unchanged (Step 6, Validation step 9). The unit test does not import
 `failureclass`, keeping `go test ./internal/agent` free of the
 `internal/infra/github`/`diffanchor`/`outboundguard` dependency tree (Step 6).
 
@@ -1277,14 +1339,54 @@ Per `AGENTS.md`, the root commands are the source of truth:
    constant is contained to the safe default until consumers explicitly opt in:
    to give a new kind distinct behavior, the implementer extends `Normalize` to
    preserve it **and** updates every runner's predicates in the same change,
-   extending these per-runner four-kind classification tests to cover the new
-   kind in each runner so a predicate that does not handle it is caught. This
-   is the "authority constants remain normalized to `NonRetryable` until
-   consumers explicitly opt in" contract (Step 2): `Normalize` is the authority
-   for "this kind is supported," and a constant is only pass-through after the
-   consumers that act on it have been updated — not the moment it is declared.
-   This is the regression net the refactor relies on; it must exist before the
-   conversion functions are deleted. Aggregate "each kind appears in at least
+   extending the per-runner downstream-predicate contract cases below to cover
+   the new pass-through kind in each runner so a predicate that does not handle
+   it is caught. This is the "authority constants remain normalized to
+   `NonRetryable` until consumers explicitly opt in" contract (Step 2):
+   `Normalize` is the authority for "this kind is supported," and a constant is
+   only pass-through after the consumers that act on it have been updated — not
+   the moment it is declared. This is the regression net the refactor relies on;
+   it must exist before the conversion functions are deleted.
+
+   The four-kind classification tests above exercise `classifyFailure*`, which
+   produces the kind — they do not exercise the retry, hold, notification,
+   status, and persistence predicates that *consume* it. A fifth kind can
+   therefore be added to `Normalize` and returned correctly by every classifier
+   while one runner's `shouldRetryQueueFailure` (or another downstream
+   predicate) still falls through, with the classification net green. The
+   implementation therefore adds, in each of the four runner packages
+   (`internal/{fixer,reviewer,worker,planner}`), per-runner downstream-predicate
+   contract cases over **every `Normalize` pass-through kind** — each of the four
+   known kinds today, and any kind a later change makes pass-through before it
+   may be opted in: for each pass-through kind, the case asserts the runner's
+   retry predicate (`isQueueRetryEligible`/`shouldRetryQueueFailure`), the
+   fixer breaker's manual-kind check (`failQueueItemWithBreaker`, fixer only),
+   the resume-policy derivation (`NormalizeResumePolicy`/
+   `NextResumePolicyOnFailure`), the notification/status predicates
+   (`shouldNotifyCompletedRun`/`issueClaimStatusForFailure`, where present), and
+   queue/checkpoint persistence (`failQueueItem`/`failQueueItemTerminal`/
+   `requeueQueueItem`/`ProcessResult.FailureKind`/`FixerOutcomeFailure.Kind`)
+   each handle the kind rather than fall through to an unintended default. A
+   predicate that silently drops a pass-through kind is caught in the runner
+   that contains it, so a new kind may not be opted in (made pass-through in
+   `Normalize`) until every runner's downstream-predicate cases cover it.
+
+   The classification tests and alias-identity tests below assert each runner's
+   persisted kind and retry decision for each *known* kind, and every known kind
+   is a fixed point of `Normalize`, so they still pass if a runner's
+   failure-handling entry point omits its `Normalize` call and an unknown
+   `loopError.kind` reaches retry or persistence unnormalized. The
+   implementation therefore also adds, in each of the four runner packages, a
+   per-runner boundary-normalization contract test that injects an unknown
+   `failureclass.Kind` (a value outside the four known constants) through the
+   runner's queue-failure consumption boundary — constructing a `loopError`
+   whose `kind` is the unknown value and driving the failure-handling entry
+   point — and asserts the kind seen by the retry predicate, the breaker's
+   manual-kind check, the resume-policy derivation, and queue/checkpoint
+   persistence is `NonRetryable`, not the injected unknown value. A boundary
+   that drops its `Normalize` call is caught in the runner that contains it,
+   closing the gap the deleted structural gate left without re-adding a
+   producer-side analyzer. Aggregate "each kind appears in at least
    one role" coverage is not sufficient on its own: the four per-runner
    re-export blocks (Step 1) are independent, so wiring one role's
    `FailureManualIntervention` to `failureclass.NonRetryable` still compiles,
@@ -1346,8 +1448,9 @@ Per `AGENTS.md`, the root commands are the source of truth:
    `build.Context.Import` separates from `GoFiles` when cgo is enabled — is moot.
    No `go/types`, `go/ast`, or `go/build`-based structural test is added; the
    `Normalize` fallback invariant is enforced at the boundary (Step 2) and covered
-   by the `Normalize` unit test and the four-kind per-runner classification tests
-   (step 6), not by modeling the producers.
+   by the `Normalize` unit test, the per-runner boundary-normalization contract
+   test (which injects an unknown kind through each boundary), and the four-kind
+   per-runner classification tests (step 6), not by modeling the producers.
 9. **Fixer-prompt builder coverage (Step 6).**
    `internal/agent/prompt_test.go` is rewritten to import
    `internal/loops/policy` (the same stdlib-only leaf the production builder
@@ -1372,7 +1475,7 @@ Per `AGENTS.md`, the root commands are the source of truth:
    coverage. The earlier draft's cross-component test
    `TestFixerPromptOffersOnlyHonoredFailureKinds`
    (`internal/fixer/runner_repair_outcome_test.go`) is split, not deleted whole:
-   its prompt-advertised-values synchronization half is deleted (now compile-time
+   its prompt-advertised-values *rename-drift* half is deleted (now compile-time
    because both sides derive from the same `policy` constants), while its
    parser-acceptance half — the assertion that
    `parseFixerBlockedFailureKind("retryable_after_resume")` stays accepted and
@@ -1384,6 +1487,20 @@ Per `AGENTS.md`, the root commands are the source of truth:
    backward-compatible-acceptance promise and is not subsumed by the
    `internal/agent` test (which excludes `retryable_after_resume` from the
    advertised set, so it still passes if the parser later rejects that kind).
+   The deleted rename-drift half does **not** carry the advertised-subset ⊆
+   parser-allowlist *membership* contract: importing the same `policy` constants
+   does not enforce that the parser's switch still accepts every advertised
+   value, so a parser that drops an advertised kind (and updates its own focused
+   test) leaves the agent test and prompt green while agents emit a value the
+   fixer rejects. The implementation therefore retains a fixer-package contract
+   test (in `internal/fixer/runner_repair_outcome_test.go`) that imports
+   `internal/loops/policy` and asserts `parseFixerBlockedFailureKind` accepts
+   every advertised value — for each value in
+   `{string(policy.RetryableTransient), string(policy.ManualIntervention)}`,
+   `parseFixerBlockedFailureKind(value)` returns `(<kind>, true)` — so the
+   advertised subset and the parser-acceptance check share one definition and a
+   parser that drops an advertised kind fails in the fixer package even when the
+   agent test and prompt are unchanged.
 
 **Definition of done:** `QueueFailureKind` is gone from all four runners (the 60
 type-name references replaced by `failureclass.Kind`), the four `xxxFailureKind`
@@ -1405,8 +1522,9 @@ prompt's advertised `failure_kind` tokens are derived from
 `policy.RetryableTransient` and `policy.ManualIntervention` inside
 `AppendFixerCompletionInstruction` (which imports the stdlib-only
 `internal/loops/policy` leaf, not `failureclass`, so no `FixerCompletionKinds`
-carrier, fixer call-site wiring, or cross-component synchronization test is
-added), the
+carrier, fixer call-site wiring, or cross-component rename-drift
+synchronization test is added; the advertised-subset ⊆ parser-allowlist
+membership contract is retained as a fixer-package test, see step 9), the
 deleted-symbol absence check (step 7) passes, each runner normalizes
 `failure.kind` once at its queue-failure consumption boundary via
 `failureclass.Normalize` before any retry, breaker, or persistence read (Step 2)
@@ -1425,18 +1543,27 @@ per-call-site wrap, and `Normalize` defaults an unrecognized kind to
 until consumers explicitly opt in (no enumeration assertion forces
 `Normalize(c) == c` for every authority constant) —
 the
-four-kind regression coverage above exists, the fixer-prompt builder coverage
-test (step 9) exists — exercising `AppendFixerCompletionInstruction` for
-advertised-subset coverage of the advertised `failure_kind` tokens via set
-equality plus per-bullet description pairing (the builder derives the values
-itself from the `policy` import, so there is no call site to swap; the pairing
-catches a builder-side field-to-bullet swap the derivation cannot prevent), with
+four-kind regression coverage above exists — including the per-runner
+downstream-predicate contract cases over every `Normalize` pass-through kind
+(retry, hold, notification, status, and persistence predicates, not only
+`classifyFailure*`) and the per-runner boundary-normalization contract test
+that injects an unknown kind through each runner's queue-failure consumption
+boundary and asserts it reaches those predicates as `NonRetryable` — the
+fixer-prompt builder coverage test (step 9) exists — exercising
+`AppendFixerCompletionInstruction` for advertised-subset coverage of the
+advertised `failure_kind` tokens via set equality plus per-bullet description
+pairing (the builder derives the values itself from the `policy` import, so
+there is no call site to swap; the pairing catches a builder-side
+field-to-bullet swap the derivation cannot prevent), with
 `internal/agent/prompt_test.go` importing the stdlib-only `policy` leaf and no
 `failureclass` import, and the earlier cross-component
-`TestFixerPromptOffersOnlyHonoredFailureKinds` split — its prompt-sync half
-deleted (now compile-time) and its `parseFixerBlockedFailureKind` acceptance
-half retained as a focused fixer-package test so the parser's
-`retryable_after_resume` backward-compatible acceptance stays directly
-asserted — the full `go test ./...` suite is green, and the diff contains no
+`TestFixerPromptOffersOnlyHonoredFailureKinds` split — its prompt-sync
+rename-drift half deleted (now compile-time), its
+`parseFixerBlockedFailureKind` acceptance half retained as a focused
+fixer-package test so the parser's `retryable_after_resume` backward-compatible
+acceptance stays directly asserted, and its advertised-subset ⊆
+parser-allowlist membership contract retained as a fixer-package contract test
+that imports `policy` and asserts the parser accepts every advertised value —
+the full `go test ./...` suite is green, and the diff contains no
 changes to `workflow.Step` types, `failureclass.Classify` logic, or
 `NormalizeResumePolicy` behavior.
