@@ -5,8 +5,15 @@
 immutable commit
 [`3ef6bbd201263d354fd83ec55b3c306ded2eb72a`](https://github.com/NousResearch/hermes-agent/commit/3ef6bbd201263d354fd83ec55b3c306ded2eb72a),
 which is the commit resolved by upstream tag `v2026.7.20` when this fixture
-was pinned. The separately verifiable SHA-256 of that exact upstream blob is
+was pinned. Its Git blob is
+[`5e095af3902bf7e42a946ab6ca46c67993c7ecbe`](https://github.com/NousResearch/hermes-agent/blob/3ef6bbd201263d354fd83ec55b3c306ded2eb72a/agent/copilot_acp_client.py),
+and the separately verifiable SHA-256 of those exact upstream bytes is
 `eb5b4bf7bf2c4ff7deb0f2928a2fb4ada0e8584996603b88541e90d3c5e8f178`.
+
+To refresh, resolve the signed tag to its commit, fetch that path from the
+commit (not an installed copy), and compare the downloaded bytes to both
+digests before replacing this fixture. The commit and blob are immutable
+source authority; the local fixture and patch script are only checked copies.
 
 The copied source is MIT licensed, Copyright (c) 2025 Nous Research. The
 applicable permission notice is included locally in `UPSTREAM-MIT-LICENSE`.

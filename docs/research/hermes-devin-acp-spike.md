@@ -337,10 +337,11 @@ recorded here because the wire shapes are not documented anywhere:
 ### Setup
 
 ```bash
-HERMES_INSTALL_DIR="${HERMES_INSTALL_DIR:-$HOME/.hermes/hermes-agent}"
+export HERMES_HOME="$(scripts/hermes-profile.sh --print)"
+export HERMES_INSTALL_DIR="${HERMES_INSTALL_DIR:-$HOME/.hermes/hermes-agent}"
 tools/hermes-devin/apply-hermes-patch.sh          # once; --revert to undo
 devin mcp add hermes-memory \
-  -e HERMES_HOME="$HOME/.hermes/profiles/looper" \
+  -e HERMES_HOME="$HERMES_HOME" \
   -e HERMES_INSTALL_DIR="$HERMES_INSTALL_DIR" \
   -- "$PWD/tools/hermes-devin/memory_mcp_server.py"
 ```
