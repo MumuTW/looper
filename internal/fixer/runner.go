@@ -340,7 +340,6 @@ type PullRequestCommit struct {
 	AuthorLogin    string
 	CommitterLogin string
 }
-
 type GitHubGateway interface {
 	ListOpenPullRequests(context.Context, ListOpenPullRequestsInput) ([]PullRequestSummary, error)
 	GetCurrentUserLogin(context.Context, string, string) (string, error)
