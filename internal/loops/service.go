@@ -293,6 +293,12 @@ func (s *Service) Terminate(ctx context.Context, loopID string, reason *string) 
 			return TerminateResult{}, fmt.Errorf("loop not found: %s", loopID)
 		}
 		currentStatus := domain.LoopStatus(loop.Status)
+		if currentStatus == domain.LoopStatusHumanTakeover {
+			// The daemon has no containment handle for the operator's shell.
+			// Handback is the authority that releases this checkout before a
+			// terminal disposition can make it eligible for cleanup.
+			return TerminateResult{}, fmt.Errorf("cannot terminate loop %s while it is in human_takeover; exit the interactive session and hand back the loop first", loopID)
+		}
 		if currentStatus != domain.LoopStatusTerminated {
 			if err := domain.AssertLoopStatusTransition(currentStatus, domain.LoopStatusTerminated); err != nil {
 				return TerminateResult{}, err
@@ -302,11 +308,7 @@ func (s *Service) Terminate(ctx context.Context, loopID string, reason *string) 
 		updated.Status = string(domain.LoopStatusTerminated)
 		updated.NextRunAt = nil
 		updated.UpdatedAt = eventlog.NextJavaScriptISOString(now, loop.UpdatedAt)
-		write := repos.Loops.Upsert
-		if currentStatus == domain.LoopStatusHumanTakeover {
-			write = repos.Loops.UpsertChangingHumanHold
-		}
-		if err := write(ctx, updated); err != nil {
+		if err := repos.Loops.Upsert(ctx, updated); err != nil {
 			return TerminateResult{}, err
 		}
 		cancelled, err := repos.Queue.CancelByLoop(ctx, loopID, updated.UpdatedAt, reason)

@@ -258,6 +258,34 @@ func TestServiceHoldIsIdempotentForHumanTakeover(t *testing.T) {
 	}
 }
 
+func TestServiceTerminateRejectsHumanTakeover(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openCoordinator(t)
+	ctx := context.Background()
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 17, 12, 34, 56, 0, time.UTC)
+	seedProject(t, repos, now)
+	service := &Service{DB: coordinator.DB(), Repos: repos, Now: func() time.Time { return now }}
+	loop, err := service.Create(ctx, CreateInput{
+		ProjectID: "project_1",
+		Type:      domain.LoopTypeReviewer,
+		Target:    domain.LoopTarget{TargetType: domain.LoopTargetTypePullRequest, Repo: "acme/looper", PRNumber: 46},
+		Status:    domain.LoopStatusHumanTakeover,
+	})
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	reason := "terminal disposition"
+	if _, err := service.Terminate(ctx, loop.ID, &reason); err == nil {
+		t.Fatal("Terminate(human_takeover) error = nil, want rejection")
+	}
+	stored, err := repos.Loops.GetByID(ctx, loop.ID)
+	if err != nil || stored == nil || stored.Status != string(domain.LoopStatusHumanTakeover) {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want unchanged human takeover", stored, err)
+	}
+}
+
 func TestTargetFromRecordNormalizesRepeatedProjectPrefix(t *testing.T) {
 	t.Parallel()
 

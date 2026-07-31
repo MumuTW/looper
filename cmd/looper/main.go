@@ -1337,7 +1337,8 @@ Usage:
                                --discard-worktree-changes --confirm)
   looper start <selector>      Start a loop now
   looper pause <selector>      Pause a loop
-  looper terminate <selector>  Terminate a loop permanently (retires it)
+  looper terminate <selector>  Stop and retire a loop permanently
+                               (hand back human takeovers first)
   looper respond <selector> "<answer>"
                                Answer a loop waiting on a human and resume it
   looper version               Print the looper version

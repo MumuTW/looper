@@ -5700,12 +5700,11 @@ func (h *Handler) takeoverLoop(ctx context.Context, loopID string) (takeoverLoop
 	return resp, nil
 }
 
-// terminateLoop transitions a stuck or failed loop to terminated so it stops
+// terminateLoop transitions a stopped or failed loop to terminated so it stops
 // scheduling and the operator can clean up. Unlike handback (which preserves
-// the native session for resume), terminate permanently retires the loop.
-// It is the operator-facing final state for loops that are wedged in states
-// like human_takeover awaiting a handback that never comes, or failed loops
-// that should not retry.
+// the native session for resume), terminate permanently retires the loop. A
+// human takeover must be handed back first: the daemon cannot establish that
+// the operator's interactive shell has stopped writing its checkout.
 func (h *Handler) terminateLoop(ctx context.Context, loopID string) (any, error) {
 	if h.context.TerminateLoop == nil {
 		return nil, apiError{code: pkgapi.ErrorCodeRuntimeControlUnavailable, status: http.StatusNotImplemented, message: "Runtime control is not available in this process"}

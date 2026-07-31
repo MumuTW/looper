@@ -548,6 +548,93 @@ func TestCloseLoopDoesNotTerminateLoopWhenActiveKillFails(t *testing.T) {
 		t.Fatalf("AdmitSpawn after aborted closeLoop error = %v, want success", err)
 	}
 }
+
+// Terminate must use the same terminal halt path as close: a durable terminal
+// loop may never coexist with an agent that still owns its execution lease.
+func TestTerminateLoopDrainsLiveExecutionBeforePersistingTermination(t *testing.T) {
+	ctx := context.Background()
+	services, repos, now := newStopAllTestServices(t)
+	fixture := stopAllLoopFixture{
+		loopID: "loop_terminate_live", seq: 81, loopType: "worker", loopStatus: "running",
+		runID: "run_terminate_live", runStatus: "running",
+		executionID: "execution_terminate_live", executionStatus: "running",
+		queueStatus: "queued",
+	}
+	insertStopAllTestLoop(t, ctx, repos, now, fixture)
+
+	registry := looperdruntime.NewActiveExecutionRegistry()
+	services.ActiveExecutions = registry
+	active := &fakeActiveExecution{}
+	cleanup := bindTestActiveExecution(t, registry, fixture.loopID, fixture.runID, fixture.executionID, active)
+	t.Cleanup(cleanup)
+
+	if _, err := terminateLoop(ctx, services, fixture.loopID, "Terminated by test", func() time.Time { return now }, nil, nil); err != nil {
+		t.Fatalf("terminateLoop() error = %v", err)
+	}
+	if !active.killed {
+		t.Fatal("terminateLoop() did not kill the active execution before terminating")
+	}
+	loop, err := repos.Loops.GetByID(ctx, fixture.loopID)
+	if err != nil || loop == nil || loop.Status != "terminated" {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want terminated loop", loop, err)
+	}
+	queue, err := repos.Queue.GetByID(ctx, "queue_"+fixture.loopID)
+	if err != nil || queue == nil || queue.Status != "cancelled" {
+		t.Fatalf("Queue.GetByID() = (%#v, %v), want cancelled queue item", queue, err)
+	}
+	if !registry.LoopStopActive(fixture.loopID) {
+		t.Fatal("LoopStopActive = false after successful terminate, want sticky admission gate")
+	}
+	if _, err := registry.AdmitSpawn(ctx, agent.SpawnMeta{LoopID: fixture.loopID, RunID: "run_after_terminate", ExecutionID: "execution_after_terminate"}); err == nil {
+		t.Fatal("AdmitSpawn after terminate error = nil, want closed admission")
+	}
+}
+
+func TestTerminateLoopRetiresFailedLoop(t *testing.T) {
+	ctx := context.Background()
+	services, repos, now := newStopAllTestServices(t)
+	fixture := stopAllLoopFixture{
+		loopID: "loop_terminate_failed", seq: 82, loopType: "worker", loopStatus: "failed", queueStatus: "queued",
+	}
+	insertStopAllTestLoop(t, ctx, repos, now, fixture)
+
+	if _, err := terminateLoop(ctx, services, fixture.loopID, "Terminated failed loop by test", func() time.Time { return now }, nil, nil); err != nil {
+		t.Fatalf("terminateLoop(failed) error = %v", err)
+	}
+	loop, err := repos.Loops.GetByID(ctx, fixture.loopID)
+	if err != nil || loop == nil || loop.Status != "terminated" {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want terminated failed loop", loop, err)
+	}
+}
+
+func TestTerminateLoopRejectsHumanTakeoverBeforeLifecycleMutation(t *testing.T) {
+	ctx := context.Background()
+	services, repos, now := newStopAllTestServices(t)
+	fixture := stopAllLoopFixture{
+		loopID: "loop_terminate_human", seq: 83, loopType: "worker", loopStatus: "human_takeover", queueStatus: "queued",
+	}
+	insertStopAllTestLoop(t, ctx, repos, now, fixture)
+
+	registry := looperdruntime.NewActiveExecutionRegistry()
+	services.ActiveExecutions = registry
+	if _, err := terminateLoop(ctx, services, fixture.loopID, "Terminated by test", func() time.Time { return now }, nil, nil); err == nil {
+		t.Fatal("terminateLoop(human_takeover) error = nil, want human takeover rejection")
+	}
+	loop, err := repos.Loops.GetByID(ctx, fixture.loopID)
+	if err != nil || loop == nil || loop.Status != "human_takeover" {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want unchanged human takeover", loop, err)
+	}
+	queue, err := repos.Queue.GetByID(ctx, "queue_"+fixture.loopID)
+	if err != nil || queue == nil || queue.Status != "queued" {
+		t.Fatalf("Queue.GetByID() = (%#v, %v), want queue untouched", queue, err)
+	}
+	lease, err := registry.AdmitSpawn(ctx, agent.SpawnMeta{LoopID: fixture.loopID, RunID: "run_after_reject", ExecutionID: "execution_after_reject"})
+	if err != nil {
+		t.Fatalf("AdmitSpawn after human takeover rejection error = %v, want no stop gate", err)
+	}
+	lease.Release()
+}
+
 func TestStopLoopKillsActiveInMemoryExecution(t *testing.T) {
 	ctx := context.Background()
 	coordinator, err := storage.OpenSQLiteCoordinator(ctx, filepath.Join(t.TempDir(), "looper.sqlite"), storage.SQLiteCoordinatorOptions{Migrations: storage.EmbeddedMigrations})
