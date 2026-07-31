@@ -45,23 +45,25 @@ const (
 type ReasonCode string
 
 const (
-	ReasonHeadStale                ReasonCode = "head_stale"
-	ReasonPullRequestNotOpen       ReasonCode = "pull_request_not_open"
-	ReasonPullRequestDraft         ReasonCode = "pull_request_draft"
-	ReasonMergeConflict            ReasonCode = "merge_conflict"
-	ReasonMergeabilityNotClean     ReasonCode = "mergeability_not_clean"
-	ReasonCheckMissing             ReasonCode = "required_check_missing"
-	ReasonCheckPending             ReasonCode = "required_check_pending"
-	ReasonCheckFailed              ReasonCode = "required_check_failed"
-	ReasonCheckCancelled           ReasonCode = "required_check_cancelled"
-	ReasonReviewRequired           ReasonCode = "required_review_missing"
-	ReasonReviewChangesRequested   ReasonCode = "review_changes_requested"
-	ReasonCodexReviewMissing       ReasonCode = "codex_review_missing"
-	ReasonUnresolvedReviewThread   ReasonCode = "unresolved_review_thread"
-	ReasonProjectPolicyDenied      ReasonCode = "project_policy_denied"
-	ReasonHold                     ReasonCode = "hold"
-	ReasonProviderStateUnavailable ReasonCode = "provider_state_unavailable"
-	ReasonProviderStateAmbiguous   ReasonCode = "provider_state_ambiguous"
+	ReasonHeadStale                 ReasonCode = "head_stale"
+	ReasonPullRequestNotOpen        ReasonCode = "pull_request_not_open"
+	ReasonPullRequestDraft          ReasonCode = "pull_request_draft"
+	ReasonMergeConflict             ReasonCode = "merge_conflict"
+	ReasonMergeabilityNotClean      ReasonCode = "mergeability_not_clean"
+	ReasonCheckMissing              ReasonCode = "required_check_missing"
+	ReasonCheckPending              ReasonCode = "required_check_pending"
+	ReasonCheckFailed               ReasonCode = "required_check_failed"
+	ReasonCheckCancelled            ReasonCode = "required_check_cancelled"
+	ReasonReviewRequired            ReasonCode = "required_review_missing"
+	ReasonReviewChangesRequested    ReasonCode = "review_changes_requested"
+	ReasonCodexReviewMissing        ReasonCode = "codex_review_missing"
+	ReasonCodexBlockingFindings     ReasonCode = "codex_blocking_findings"
+	ReasonCodexReviewOutcomeUnknown ReasonCode = "codex_review_outcome_unknown"
+	ReasonUnresolvedReviewThread    ReasonCode = "unresolved_review_thread"
+	ReasonProjectPolicyDenied       ReasonCode = "project_policy_denied"
+	ReasonHold                      ReasonCode = "hold"
+	ReasonProviderStateUnavailable  ReasonCode = "provider_state_unavailable"
+	ReasonProviderStateAmbiguous    ReasonCode = "provider_state_ambiguous"
 )
 
 type Reason struct {
@@ -83,6 +85,8 @@ type CodexReviewEvidence struct {
 	RequiredHeadSHA  string `json:"requiredHeadSha"`
 	ReviewedHeadSHA  string `json:"reviewedHeadSha,omitempty"`
 	Event            string `json:"event,omitempty"`
+	Outcome          string `json:"outcome,omitempty"`
+	OutcomeKnown     bool   `json:"outcomeKnown"`
 	RecordedAt       string `json:"recordedAt,omitempty"`
 	CurrentHeadValid bool   `json:"currentHeadValid"`
 }
@@ -325,6 +329,10 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 	report.Evidence.CodexReview = &codexReview
 	if !codexReview.CurrentHeadValid {
 		report.Reasons = append(report.Reasons, Reason{Code: ReasonCodexReviewMissing, Subject: codexReviewReasonSubject(codexReview)})
+	} else if !codexReview.OutcomeKnown {
+		report.Reasons = append(report.Reasons, Reason{Code: ReasonCodexReviewOutcomeUnknown, Subject: codexReviewOutcomeReasonSubject(codexReview)})
+	} else if codexReview.Outcome == "blocking" {
+		report.Reasons = append(report.Reasons, Reason{Code: ReasonCodexBlockingFindings, Subject: codexReviewOutcomeReasonSubject(codexReview)})
 	}
 
 	if report.Evidence.PullRequestState != "OPEN" {

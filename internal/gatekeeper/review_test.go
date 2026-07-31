@@ -45,6 +45,62 @@ func TestEvaluatePullRequestAcceptsDurableCodexReviewForCurrentHead(t *testing.T
 	}
 }
 
+func TestEvaluatePullRequestBlocksCurrentHeadCodexReviewWithBlockingFindings(t *testing.T) {
+	fixture := newGatekeeperFixtureWithoutReview(t)
+	seedReviewerReviewEventWithOutcome(t, fixture, "head-1", "COMMENT", "blocking", "reviewer-loop", 1)
+
+	report, err := New(Options{Repos: fixture.repos, GitHub: fixture.github, Now: func() time.Time { return fixture.now }}).EvaluatePullRequest(context.Background(), EvaluationInput{
+		ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, ExpectedHeadSHA: "head-1",
+	})
+	if err != nil {
+		t.Fatalf("EvaluatePullRequest() error = %v", err)
+	}
+	if report.Eligible || !hasReason(report, ReasonCodexBlockingFindings) || hasReason(report, ReasonCodexReviewMissing) {
+		t.Fatalf("report = %#v, want blocking-findings blocker without missing-review reason", report)
+	}
+	evidence := report.Evidence.CodexReview
+	if evidence == nil || !evidence.CurrentHeadValid || !evidence.OutcomeKnown || evidence.Outcome != "blocking" {
+		t.Fatalf("Codex review evidence = %#v, want blocking current-head outcome", evidence)
+	}
+}
+
+func TestEvaluatePullRequestFailsClosedForUnknownCodexReviewOutcome(t *testing.T) {
+	fixture := newGatekeeperFixtureWithoutReview(t)
+	seedReviewerReviewEventWithOutcome(t, fixture, "head-1", "COMMENT", "needs_triage", "reviewer-loop", 1)
+
+	report, err := New(Options{Repos: fixture.repos, GitHub: fixture.github, Now: func() time.Time { return fixture.now }}).EvaluatePullRequest(context.Background(), EvaluationInput{
+		ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, ExpectedHeadSHA: "head-1",
+	})
+	if err != nil {
+		t.Fatalf("EvaluatePullRequest() error = %v", err)
+	}
+	if report.Eligible || !hasReason(report, ReasonCodexReviewOutcomeUnknown) || hasReason(report, ReasonCodexReviewMissing) {
+		t.Fatalf("report = %#v, want unknown-outcome blocker without missing-review reason", report)
+	}
+	evidence := report.Evidence.CodexReview
+	if evidence == nil || !evidence.CurrentHeadValid || evidence.OutcomeKnown || evidence.Outcome != "needs_triage" {
+		t.Fatalf("Codex review evidence = %#v, want current-head unknown outcome", evidence)
+	}
+}
+
+func TestEvaluatePullRequestFailsClosedForMissingCodexReviewOutcome(t *testing.T) {
+	fixture := newGatekeeperFixtureWithoutReview(t)
+	seedReviewerReviewEventWithOutcome(t, fixture, "head-1", "COMMENT", "", "reviewer-loop", 1)
+
+	report, err := New(Options{Repos: fixture.repos, GitHub: fixture.github, Now: func() time.Time { return fixture.now }}).EvaluatePullRequest(context.Background(), EvaluationInput{
+		ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, ExpectedHeadSHA: "head-1",
+	})
+	if err != nil {
+		t.Fatalf("EvaluatePullRequest() error = %v", err)
+	}
+	if report.Eligible || !hasReason(report, ReasonCodexReviewOutcomeUnknown) {
+		t.Fatalf("report = %#v, want missing-outcome blocker", report)
+	}
+	if evidence := report.Evidence.CodexReview; evidence == nil || evidence.OutcomeKnown || evidence.Outcome != "" {
+		t.Fatalf("Codex review evidence = %#v, want missing outcome", evidence)
+	}
+}
+
 func TestEvaluatePullRequestRejectsStaleCodexReview(t *testing.T) {
 	fixture := newGatekeeperFixtureWithoutReview(t)
 	seedReviewerReviewEvent(t, fixture, "old-head", "COMMENT", "reviewer-loop", 1)
@@ -101,17 +157,49 @@ func TestDiscoverPullRequestsReevaluatesMissingCodexReview(t *testing.T) {
 	}
 }
 
+func TestDiscoverPullRequestsReevaluatesBlockingCodexReviewWhenOutcomeChanges(t *testing.T) {
+	fixture := newGatekeeperFixtureWithoutReview(t)
+	fixture.github.openPullRequests = []githubinfra.PullRequestSummary{{Number: 42, HeadSHA: "head-1", State: "OPEN", UpdatedAt: "2026-07-30T10:00:00Z", BaseRefName: "main", ReviewDecision: "APPROVED"}}
+	seedReviewerReviewEventWithOutcome(t, fixture, "head-1", "COMMENT", "blocking", "reviewer-loop", 1)
+	runner := New(Options{Repos: fixture.repos, GitHub: fixture.github, Now: func() time.Time { return fixture.now }})
+
+	first, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("first DiscoverPullRequests() error = %v", err)
+	}
+	if first.Evaluated != 1 || first.Skipped != 0 || first.Reports[0].Eligible || !hasReason(first.Reports[0], ReasonCodexBlockingFindings) {
+		t.Fatalf("first discovery = %#v, want blocking-review report", first)
+	}
+
+	seedReviewerReviewEventWithOutcome(t, fixture, "head-1", "COMMENT", "clean", "reviewer-loop", 2)
+	second, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("second DiscoverPullRequests() error = %v", err)
+	}
+	if second.Evaluated != 1 || second.Skipped != 0 || !second.Reports[0].Eligible {
+		t.Fatalf("second discovery = %#v, want re-evaluated eligible report", second)
+	}
+}
+
 func seedReviewerReviewEvent(t *testing.T, fixture *gatekeeperFixture, headSHA, reviewEvent, actorID string, ordinal int) {
+	seedReviewerReviewEventWithOutcome(t, fixture, headSHA, reviewEvent, "clean", actorID, ordinal)
+}
+
+func seedReviewerReviewEventWithOutcome(t *testing.T, fixture *gatekeeperFixture, headSHA, reviewEvent, outcome, actorID string, ordinal int) {
 	t.Helper()
 	projectID := "project_1"
 	entityType := "pull_request"
 	entityID := "acme/looper#42"
 	actorType := "system"
+	payload := map[string]any{"repo": "acme/looper", "prNumber": int64(42), "event": reviewEvent, "headSha": headSHA}
+	if outcome != "" {
+		payload["outcome"] = outcome
+	}
 	if err := eventlog.Append(context.Background(), fixture.repos, eventlog.AppendInput{
 		ID: fmt.Sprintf("review-posted-%d", ordinal), EventType: reviewerReviewPostedEventType,
 		ProjectID: &projectID, EntityType: &entityType, EntityID: &entityID,
 		ActorType: &actorType, ActorID: &actorID,
-		Payload:   map[string]any{"repo": "acme/looper", "prNumber": int64(42), "event": reviewEvent, "headSha": headSHA},
+		Payload:   payload,
 		CreatedAt: fixture.now.Add(time.Duration(ordinal) * time.Second),
 	}); err != nil {
 		t.Fatalf("append reviewer review event: %v", err)

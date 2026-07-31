@@ -16,6 +16,7 @@ type reviewerReviewPostedPayload struct {
 	PRNumber int64  `json:"prNumber"`
 	Event    string `json:"event"`
 	HeadSHA  string `json:"headSha"`
+	Outcome  string `json:"outcome"`
 }
 
 // latestCodexReviewForHead projects the latest durable Reviewer review event
@@ -57,6 +58,8 @@ func latestCodexReviewForHead(ctx context.Context, repos *storage.Repositories, 
 		}
 		evidence.ReviewedHeadSHA = reviewedHead
 		evidence.Event = reviewEvent
+		evidence.Outcome = normalizeCodexReviewOutcome(payload.Outcome)
+		evidence.OutcomeKnown = isKnownCodexReviewOutcome(evidence.Outcome)
 		evidence.RecordedAt = event.CreatedAt
 	}
 	evidence.CurrentHeadValid = evidence.ReviewedHeadSHA != "" && strings.EqualFold(evidence.ReviewedHeadSHA, evidence.RequiredHeadSHA)
@@ -79,4 +82,32 @@ func codexReviewReasonSubject(evidence CodexReviewEvidence) string {
 		return "reviewed=none;required=" + evidence.RequiredHeadSHA
 	}
 	return "reviewed=" + evidence.ReviewedHeadSHA + ";required=" + evidence.RequiredHeadSHA
+}
+
+func normalizeCodexReviewOutcome(outcome string) string {
+	switch strings.ToLower(strings.TrimSpace(outcome)) {
+	case "clean", "blocking", "non_blocking":
+		return strings.ToLower(strings.TrimSpace(outcome))
+	case "actionable":
+		return "non_blocking"
+	default:
+		return strings.ToLower(strings.TrimSpace(outcome))
+	}
+}
+
+func isKnownCodexReviewOutcome(outcome string) bool {
+	switch outcome {
+	case "clean", "blocking", "non_blocking":
+		return true
+	default:
+		return false
+	}
+}
+
+func codexReviewOutcomeReasonSubject(evidence CodexReviewEvidence) string {
+	outcome := strings.TrimSpace(evidence.Outcome)
+	if outcome == "" {
+		outcome = "missing"
+	}
+	return "outcome=" + outcome + ";head=" + evidence.ReviewedHeadSHA
 }

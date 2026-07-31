@@ -2808,7 +2808,7 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 		if criteriaResult, err := r.maybePublishCriteriaAnchoredCleanReview(ctx, input, checkpoint, pending, detail); err != nil {
 			return checkpoint, err
 		} else if criteriaResult != nil {
-			if err := r.recordPublishedReviewProgress(ctx, input, pending, criteriaResult.reviewEvent); err != nil {
+			if err := r.recordPublishedReviewProgress(ctx, input, pending, criteriaResult.reviewEvent, criteriaResult.marker.Outcome); err != nil {
 				return checkpoint, err
 			}
 			return checkpoint, nil
@@ -2834,7 +2834,7 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 			if err := r.applyVerifiedReviewSideEffects(ctx, input, checkpoint, detail, found); err != nil {
 				return checkpoint, err
 			}
-			if err := r.recordPublishedReviewProgress(ctx, input, pending, pendingReviewEvent(pending)); err != nil {
+			if err := r.recordPublishedReviewProgress(ctx, input, pending, pendingReviewEvent(pending), found.Outcome); err != nil {
 				return checkpoint, err
 			}
 			return checkpoint, nil
@@ -2842,7 +2842,7 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 		if err := r.applyCleanNoopReviewSideEffects(ctx, input, checkpoint, detail); err != nil {
 			return checkpoint, err
 		}
-		if err := r.recordPublishedReviewProgress(ctx, input, pending, ReviewEventComment); err != nil {
+		if err := r.recordPublishedReviewProgress(ctx, input, pending, ReviewEventComment, pending.Outcome); err != nil {
 			return checkpoint, err
 		}
 		return checkpoint, nil
@@ -2950,7 +2950,7 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 	if err := r.applyVerifiedReviewSideEffects(ctx, input, checkpoint, detail, markerResult); err != nil {
 		return checkpoint, err
 	}
-	if err := r.recordPublishedReviewProgress(ctx, input, pending, pendingReviewEvent(pending)); err != nil {
+	if err := r.recordPublishedReviewProgress(ctx, input, pending, pendingReviewEvent(pending), markerResult.Outcome); err != nil {
 		return checkpoint, err
 	}
 	return checkpoint, nil
@@ -3848,7 +3848,11 @@ func isValidBlockingReviewEvent(value string) bool {
 	}
 }
 
-func (r *Runner) recordPublishedReviewProgress(ctx context.Context, input stepInput, pending pendingReviewCheckpoint, reviewEvent ReviewEvent) error {
+func (r *Runner) recordPublishedReviewProgress(ctx context.Context, input stepInput, pending pendingReviewCheckpoint, reviewEvent ReviewEvent, outcome string) error {
+	if strings.TrimSpace(outcome) == "" {
+		outcome = pending.Outcome
+	}
+	normalizedOutcome := normalizeCommentOnlyOutcome(outcome)
 	var mergeErr error
 	if _, err := r.updateLoop(ctx, input.Loop, func(updated *storage.LoopRecord) {
 		metadataJSON, err := mergeLoopMetadataJSON(updated.MetadataJSON, map[string]any{"lastPublishedHeadSha": pending.HeadSHA, "lastReviewEvent": string(reviewEvent), "lastReviewSummary": pending.Summary, "lastPublishedAt": r.nowISO()})
@@ -3866,7 +3870,13 @@ func (r *Runner) recordPublishedReviewProgress(ctx context.Context, input stepIn
 		// discovery may re-run this head instead of silently double-publishing.
 		return fmt.Errorf("record published review progress: %w", mergeErr)
 	}
-	r.appendEvent(ctx, eventInput{eventType: "pr.review.posted", projectID: input.Project.ID, loopID: input.Loop.ID, runID: input.Run.ID, entityType: "pull_request", entityID: fmt.Sprintf("%s#%d", input.Repo, input.PRNumber), payload: map[string]any{"repo": input.Repo, "prNumber": input.PRNumber, "event": string(reviewEvent), "headSha": pending.HeadSHA}})
+	payload := map[string]any{"repo": input.Repo, "prNumber": input.PRNumber, "event": string(reviewEvent), "headSha": pending.HeadSHA}
+	if normalizedOutcome != "" {
+		payload["outcome"] = normalizedOutcome
+	} else if rawOutcome := strings.TrimSpace(outcome); rawOutcome != "" {
+		payload["outcome"] = rawOutcome
+	}
+	r.appendEvent(ctx, eventInput{eventType: "pr.review.posted", projectID: input.Project.ID, loopID: input.Loop.ID, runID: input.Run.ID, entityType: "pull_request", entityID: fmt.Sprintf("%s#%d", input.Repo, input.PRNumber), payload: payload})
 	return nil
 }
 
