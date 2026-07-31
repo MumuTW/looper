@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"unsafe"
 )
 
 var hotEditablePaths = map[string]struct{}{
@@ -461,21 +462,7 @@ func resolvedModelBindingPath(cfg Config, role string) string {
 // an isolation boundary, not validation, so it must not crash the daemon merely
 // because a later comparison or persistence boundary will reject such a value.
 func CloneConfig(source Config) Config {
-	cloned := CloneValue(source)
-	// Roles.Coding is derived runtime state and intentionally omitted from the
-	// JSON payload above. Keep it detached but intact: dropping an authored
-	// overlay here would make config snapshots silently fall back to legacy
-	// named fields and break the canonical-registry contract.
-	if source.Roles.Coding != nil {
-		cloned.Roles.Coding = cloneCodingRoleRegistry(source.Roles.Coding)
-	}
-	if source.Roles.codingModelCanonical != nil {
-		cloned.Roles.codingModelCanonical = make(map[string]bool, len(source.Roles.codingModelCanonical))
-		for role, canonical := range source.Roles.codingModelCanonical {
-			cloned.Roles.codingModelCanonical[role] = canonical
-		}
-	}
-	return cloned
+	return CloneValue(source)
 }
 
 // CloneValue returns a detached structural copy of a configuration value. It
@@ -522,6 +509,13 @@ func cloneConfigReflect(source reflect.Value, visited map[configCloneVisit]refle
 			return cloned
 		}
 		result := reflect.New(source.Type().Elem())
+		// A defined pointer type has the same underlying pointer shape as the
+		// value returned by reflect.New, but it is not assignable to that value.
+		// Convert it before retaining it in visited so interface and field clones
+		// preserve the original dynamic type.
+		if result.Type() != source.Type() {
+			result = result.Convert(source.Type())
+		}
 		visited[visit] = result
 		result.Elem().Set(cloneConfigReflect(source.Elem(), visited))
 		return result
@@ -567,14 +561,30 @@ func cloneConfigReflect(source reflect.Value, visited map[configCloneVisit]refle
 		result := reflect.New(source.Type()).Elem()
 		result.Set(source)
 		for i := 0; i < source.NumField(); i++ {
-			if result.Field(i).CanSet() && source.Type().Field(i).IsExported() {
-				result.Field(i).Set(cloneConfigReflect(source.Field(i), visited))
-			}
+			// result is addressable even when source came from a map or interface.
+			// Reflection marks unexported fields read-only; use an addressable view
+			// only for this detached copy so their mutable maps, slices, and
+			// pointers are cloned instead of retained by the shallow struct copy.
+			field := writableCloneValue(result.Field(i))
+			field.Set(cloneConfigReflect(field, visited))
 		}
 		return result
 	default:
 		return source
 	}
+}
+
+// writableCloneValue removes reflect's read-only marker from an addressable
+// field in the copy under construction. It is used only to detach unexported
+// mutable state; the source object is never made writable or modified.
+func writableCloneValue(value reflect.Value) reflect.Value {
+	if value.CanSet() && value.CanInterface() {
+		return value
+	}
+	if !value.CanAddr() {
+		return value
+	}
+	return reflect.NewAt(value.Type(), unsafe.Pointer(value.UnsafeAddr())).Elem()
 }
 
 var (
@@ -589,12 +599,27 @@ var (
 // complete round trip, otherwise keep the conservative exported-field walk.
 func cloneJSONRoundTrip(source reflect.Value) (reflect.Value, bool) {
 	typeOf := source.Type()
-	if !source.CanInterface() ||
-		(!typeOf.Implements(jsonMarshalerType) && !reflect.PointerTo(typeOf).Implements(jsonMarshalerType)) ||
-		!reflect.PointerTo(typeOf).Implements(jsonUnmarshalerType) {
+	pointerType := reflect.PointerTo(typeOf)
+	if !source.CanInterface() || !pointerType.Implements(jsonUnmarshalerType) {
 		return reflect.Value{}, false
 	}
-	raw, err := json.Marshal(source.Interface())
+
+	var marshaler json.Marshaler
+	switch {
+	case typeOf.Implements(jsonMarshalerType):
+		marshaler = source.Interface().(json.Marshaler)
+	case pointerType.Implements(jsonMarshalerType):
+		// A value obtained from a map or interface is not addressable, and
+		// json.Marshal(value.Interface()) consequently skips a pointer-only
+		// MarshalJSON method. Marshal an addressable copy through the pointer
+		// interface so custom schemas (and math/big.Int) survive the round trip.
+		addressable := reflect.New(typeOf)
+		addressable.Elem().Set(source)
+		marshaler = addressable.Interface().(json.Marshaler)
+	default:
+		return reflect.Value{}, false
+	}
+	raw, err := marshaler.MarshalJSON()
 	if err != nil {
 		return reflect.Value{}, false
 	}

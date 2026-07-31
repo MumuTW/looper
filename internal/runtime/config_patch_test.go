@@ -252,6 +252,36 @@ func TestPatchConfigVendorCompanionModelMessageIsNotRestart(t *testing.T) {
 	}
 }
 
+func TestPatchConfigDoesNotAttributeComparisonFailureToRequestedPaths(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	original := []byte(`{"notifications":{"osascript":{"enabled":false}},"scheduler":{"maxConcurrentRuns":2}}`)
+	if err := os.WriteFile(path, original, 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	rt := newConfigPatchRuntime(t, path, nil)
+	// The daemon's in-memory authority may contain a programmatic value that
+	// cannot be compared or persisted, while the file candidate remains valid.
+	rt.loadedConfig.Config.Agent.Params["callback"] = func() {}
+
+	err := rt.PatchConfig(context.Background(), ConfigPatch{
+		Revision: testConfigRevision(t, path),
+		Set:      map[string]json.RawMessage{"scheduler.maxConcurrentRuns": json.RawMessage("3")},
+	})
+	var patchErr *ConfigPatchError
+	if !errors.As(err, &patchErr) || patchErr.Kind != "validation" {
+		t.Fatalf("PatchConfig() error = %#v, want comparison validation error", err)
+	}
+	if len(patchErr.Paths) != 0 {
+		t.Fatalf("PatchConfig() paths = %#v, want no attributed fields", patchErr.Paths)
+	}
+	if got, readErr := os.ReadFile(path); readErr != nil || !bytes.Equal(got, original) {
+		t.Fatalf("comparison failure changed config: got=%q err=%v", got, readErr)
+	}
+}
+
 func TestPatchConfigRejectsShadowedUnsupportedAndInvalidFieldsWithoutWriting(t *testing.T) {
 	t.Parallel()
 

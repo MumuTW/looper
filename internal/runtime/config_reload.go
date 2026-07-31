@@ -365,7 +365,10 @@ func (r *Runtime) PatchConfig(ctx context.Context, patch ConfigPatch) error {
 		now := r.now().UTC()
 		r.configReloadStatus.LastAttemptAt = timePointer(now)
 		reloadErr := r.rejectConfigReloadLocked("invalid", nil, fmt.Errorf("compare effective configuration: %w", compareErr))
-		return &ConfigPatchError{Kind: "validation", Message: reloadErr.Error(), Paths: paths, Err: reloadErr}
+		// The comparison failed for the whole authoritative config, not for
+		// any requested patch field. Do not point the dashboard at every field
+		// in the request when the offending value has not been identified.
+		return &ConfigPatchError{Kind: "validation", Message: reloadErr.Error(), Err: reloadErr}
 	}
 	if len(rejected) > 0 {
 		sort.Strings(rejected)
