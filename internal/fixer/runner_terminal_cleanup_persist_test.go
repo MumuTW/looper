@@ -93,6 +93,63 @@ func TestTerminalCleanupPersistsSuccessTimestamps(t *testing.T) {
 	}
 }
 
+func TestTerminalCleanupSkipsHumanTakeoverWorktree(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	git := &fakeGitGateway{}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, Logger: fixture.logger, Now: fixture.now})
+	checkpoint := seedTerminalCleanupRun(t, fixture, "run_cleanup_human_takeover", filepath.Join(t.TempDir(), "wt-human"))
+
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_run_cleanup_human_takeover")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v)", loop, err)
+	}
+	loop.Status = "human_takeover"
+	if err := fixture.repos.Loops.UpsertChangingHumanHold(context.Background(), *loop); err != nil {
+		t.Fatalf("Loops.UpsertChangingHumanHold() error = %v", err)
+	}
+
+	runner.cleanupFixerWorktreeIfTerminal(context.Background(), storage.ProjectRecord{
+		ID: "project_1", RepoPath: t.TempDir(), BaseBranch: stringPtr("main"),
+	}, "run_cleanup_human_takeover", &checkpoint)
+
+	if len(git.cleanupCalls) != 0 {
+		t.Fatalf("len(git.cleanupCalls) = %d, want 0 while human_takeover owns the worktree", len(git.cleanupCalls))
+	}
+	if checkpoint.Worktree.CleanupAttemptedAt != "" || checkpoint.Worktree.CleanedAt != "" {
+		t.Fatalf("in-memory cleanup timestamps = attempted %q cleaned %q, want neither: removal was never attempted", checkpoint.Worktree.CleanupAttemptedAt, checkpoint.Worktree.CleanedAt)
+	}
+	if checkpoint.Outcome == nil || len(checkpoint.Outcome.SecondaryIssues) != 1 || !strings.Contains(checkpoint.Outcome.SecondaryIssues[0].Message, "human_takeover") {
+		t.Fatalf("in-memory Outcome = %#v, want a human_takeover cleanup skip", checkpoint.Outcome)
+	}
+
+	stored, err := fixture.repos.Runs.GetByID(context.Background(), "run_cleanup_human_takeover")
+	if err != nil || stored == nil {
+		t.Fatalf("Runs.GetByID() = (%#v, %v)", stored, err)
+	}
+	final := parseCheckpoint(stored.CheckpointJSON)
+	if final.Worktree == nil || final.Worktree.CleanupAttemptedAt != "" || final.Worktree.CleanedAt != "" {
+		t.Fatalf("stored worktree = %#v, want cleanup untouched while takeover holds", final.Worktree)
+	}
+	if final.Outcome == nil || len(final.Outcome.SecondaryIssues) != 1 || !strings.Contains(final.Outcome.SecondaryIssues[0].Message, "human_takeover") {
+		t.Fatalf("stored Outcome = %#v, want durable cleanup skip", final.Outcome)
+	}
+	events, err := fixture.repos.Events.ListByEntity(context.Background(), "loop", "loop_run_cleanup_human_takeover")
+	if err != nil {
+		t.Fatalf("Events.ListByEntity() error = %v", err)
+	}
+	foundSkip := false
+	for _, event := range events {
+		if event.EventType == "fixer.worktree.cleanup_skipped" {
+			foundSkip = true
+			break
+		}
+	}
+	if !foundSkip {
+		t.Fatalf("events = %#v, want fixer.worktree.cleanup_skipped", events)
+	}
+}
+
 func TestTerminalCleanupPersistsAttemptBeforeWorktreeMutation(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

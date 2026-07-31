@@ -445,6 +445,13 @@ func takeoverLoop(ctx context.Context, services looperdruntime.Services, loopID,
 	if services.Loops == nil {
 		return result, fmt.Errorf("loops service is not configured")
 	}
+	// Terminal Fixer cleanup takes the same guard before inspecting the loop and
+	// removing its worktree. Holding it across the durable takeover fence and
+	// process drain means cleanup either finishes before takeover begins or sees
+	// human_takeover and preserves the checkout; it cannot remove the path while
+	// the human hold is active.
+	unlockLoop := looperdruntime.LockLoopRequeue(loopID)
+	defer unlockLoop()
 	if services.Repositories != nil && services.Repositories.AgentExecutions != nil {
 		execution, err := services.Repositories.AgentExecutions.GetLatestByLoopID(ctx, loopID)
 		if err != nil {

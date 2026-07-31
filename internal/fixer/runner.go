@@ -6562,6 +6562,46 @@ func (r *Runner) cleanupFixerWorktreeIfTerminal(ctx context.Context, project sto
 	if checkpoint == nil || checkpoint.Worktree == nil || checkpoint.Worktree.Path == "" || checkpoint.Worktree.Branch == "" || checkpoint.Worktree.CleanedAt != "" {
 		return
 	}
+	// Cleanup and takeover serialize on the same process-wide loop guard. The
+	// queue/claim fence prevents new work, but a terminal run can already be on
+	// this path when a human takes ownership. Resolve the run's loop before
+	// touching the filesystem and fail closed if durable ownership cannot be
+	// read; a missing/unknown loop is not proof that deletion is safe.
+	if strings.TrimSpace(runID) != "" {
+		if r.repos == nil || r.repos.Runs == nil || r.repos.Loops == nil {
+			r.logError("fixer worktree cleanup skipped", map[string]any{"runId": runID, "worktreePath": checkpoint.Worktree.Path, "message": "durable loop ownership is unavailable"})
+			return
+		}
+		run, err := r.repos.Runs.GetByID(ctx, runID)
+		if err != nil || run == nil || strings.TrimSpace(run.LoopID) == "" {
+			message := "durable run owner is unavailable"
+			if err != nil {
+				message = err.Error()
+			} else if run == nil {
+				message = "run not found"
+			}
+			r.logError("fixer worktree cleanup skipped", map[string]any{"runId": runID, "worktreePath": checkpoint.Worktree.Path, "message": message})
+			return
+		}
+		unlockLoop := loops.LockLoopRequeue(run.LoopID)
+		defer unlockLoop()
+		loop, err := r.repos.Loops.GetByID(ctx, run.LoopID)
+		if err != nil || loop == nil {
+			message := "loop not found"
+			if err != nil {
+				message = err.Error()
+			}
+			r.logError("fixer worktree cleanup skipped", map[string]any{"runId": runID, "loopId": run.LoopID, "worktreePath": checkpoint.Worktree.Path, "message": message})
+			return
+		}
+		if loop.Status == string(domain.LoopStatusHumanTakeover) {
+			cause := errors.New("loop is human_takeover; interactive worktree ownership remains with the human")
+			r.appendEvent(ctx, eventInput{eventType: "fixer.worktree.cleanup_skipped", projectID: project.ID, loopID: loop.ID, runID: runID, entityType: "loop", entityID: loop.ID, payload: map[string]any{"path": checkpoint.Worktree.Path, "branch": checkpoint.Worktree.Branch, "reason": cause.Error()}})
+			r.recordCleanupSecondaryIssue(ctx, runID, checkpoint, cause)
+			r.logWarn("fixer worktree cleanup skipped for human takeover", map[string]any{"runId": runID, "loopId": loop.ID, "worktreePath": checkpoint.Worktree.Path, "branch": checkpoint.Worktree.Branch})
+			return
+		}
+	}
 	// Unprepared rewind paths (PreparedAt cleared, path kept) may still hold
 	// interrupted-repair dirt that prepare never evaluated. Terminal queue
 	// parking / success cleanup must not force-remove that evidence.
