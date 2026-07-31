@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/nexu-io/looper/internal/release"
+	"github.com/MumuTW/looper/internal/release"
 )
 
 func main() {

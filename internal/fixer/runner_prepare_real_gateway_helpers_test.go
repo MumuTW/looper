@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	gitinfra "github.com/nexu-io/looper/internal/infra/git"
+	gitinfra "github.com/MumuTW/looper/internal/infra/git"
 )
 
 // setupRealRepoWithBranch creates a bare remote + clone with main and a feature branch.

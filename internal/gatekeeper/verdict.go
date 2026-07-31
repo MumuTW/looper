@@ -7,8 +7,8 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/nexu-io/looper/internal/config"
-	githubinfra "github.com/nexu-io/looper/internal/infra/github"
+	"github.com/MumuTW/looper/internal/config"
+	githubinfra "github.com/MumuTW/looper/internal/infra/github"
 )
 
 // VerdictCommentMarker identifies the one comment Gatekeeper owns on a pull

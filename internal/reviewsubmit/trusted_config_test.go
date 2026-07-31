@@ -9,8 +9,8 @@ import (
 	"syscall"
 	"testing"
 
-	"github.com/nexu-io/looper/internal/config"
-	"github.com/nexu-io/looper/internal/forge"
+	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/forge"
 )
 
 func TestTrustedReviewConfigIgnoresChildPrecedenceLayers(t *testing.T) {

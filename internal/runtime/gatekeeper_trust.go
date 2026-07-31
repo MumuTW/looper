@@ -3,7 +3,7 @@ package runtime
 import (
 	"strings"
 
-	"github.com/nexu-io/looper/internal/config"
+	"github.com/MumuTW/looper/internal/config"
 )
 
 // gatekeeperTrustForProject resolves a project's merge-authority level.

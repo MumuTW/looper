@@ -5,9 +5,9 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/nexu-io/looper/internal/loops"
-	"github.com/nexu-io/looper/internal/loops/failureclass"
-	"github.com/nexu-io/looper/internal/validation"
+	"github.com/MumuTW/looper/internal/loops"
+	"github.com/MumuTW/looper/internal/loops/failureclass"
+	"github.com/MumuTW/looper/internal/validation"
 )
 
 func TestClassifyErrorRetriesContextCancellation(t *testing.T) {

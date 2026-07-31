@@ -5,8 +5,8 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/nexu-io/looper/internal/config"
-	"github.com/nexu-io/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/storage"
 )
 
 var _ ConfigSource = (*Catalog)(nil)
@@ -297,7 +297,7 @@ func TestMaterializeCatalogRejectsUnknownProvider(t *testing.T) {
 func TestMaterializeCatalogAllowsDuplicateReposAcrossProviders(t *testing.T) {
 	t.Parallel()
 
-	githubMetadata := `{"repo":"nexu-io/looper","source":"config"}`
+	githubMetadata := `{"repo":"MumuTW/looper","source":"config"}`
 	ghesMetadata := `{"provider":"ghes-main","repo":"NEXU-IO/LOOPER","source":"api"}`
 	global := config.Config{Providers: []config.ProviderConfig{{ID: "ghes-main", Kind: config.ProviderKindGitHub, BaseURL: "https://ghe.example.test"}}}
 
@@ -316,8 +316,8 @@ func TestMaterializeCatalogAllowsDuplicateReposAcrossProviders(t *testing.T) {
 func TestMaterializeCatalogRejectsDuplicateRepoWithinProvider(t *testing.T) {
 	t.Parallel()
 
-	first := `{"provider":"ghes-main","repo":"nexu-io/looper"}`
-	second := `{"provider":"ghes-main","repo":"NEXU-IO/LOOPER"}`
+	first := `{"provider":"ghes-main","repo":"MumuTW/looper"}`
+	second := `{"provider":"ghes-main","repo":"MUMUTW/LOOPER"}`
 	global := config.Config{Providers: []config.ProviderConfig{{ID: "ghes-main", Kind: config.ProviderKindGitHub, BaseURL: "https://code.example.test"}}}
 	_, err := MaterializeCatalog(global, []storage.ProjectRecord{{ID: "one", MetadataJSON: &first}, {ID: "two", MetadataJSON: &second}})
 	if err == nil || !strings.Contains(err.Error(), `duplicates active project "one"`) {
@@ -407,7 +407,7 @@ func TestCatalogViewProjectsAreDetachedAndImmutable(t *testing.T) {
 
 	cfg := config.Config{
 		Projects: []config.ProjectRefConfig{{
-			ID: "demo", Repo: "nexu-io/looper", Roles: &config.PartialRoleConfigs{
+			ID: "demo", Repo: "MumuTW/looper", Roles: &config.PartialRoleConfigs{
 				Reviewer: &config.PartialReviewerRoleConfig{Discovery: &config.PartialReviewerRoleDiscoveryConfig{AutoDiscovery: boolPtr(true)}},
 			},
 		}},
@@ -432,7 +432,7 @@ func TestCatalogViewProjectsAreDetachedAndImmutable(t *testing.T) {
 	if !ok {
 		t.Fatal("catalog.View().Project(\"demo\") not found")
 	}
-	if got.Project.Repo != "nexu-io/looper" {
+	if got.Project.Repo != "MumuTW/looper" {
 		t.Fatalf("view Project.Repo = %q, want original", got.Project.Repo)
 	}
 	if !got.Roles.Reviewer.Discovery.AutoDiscovery {
@@ -448,7 +448,7 @@ func TestCatalogViewRolePolicyMergesProjectOverrides(t *testing.T) {
 
 	cfg := config.Config{
 		Projects: []config.ProjectRefConfig{{
-			ID: "demo", Repo: "nexu-io/looper", Roles: &config.PartialRoleConfigs{
+			ID: "demo", Repo: "MumuTW/looper", Roles: &config.PartialRoleConfigs{
 				Reviewer: &config.PartialReviewerRoleConfig{Discovery: &config.PartialReviewerRoleDiscoveryConfig{
 					AutoDiscovery: boolPtr(false),
 					Triggers: &config.PartialReviewerRoleTriggersConfig{

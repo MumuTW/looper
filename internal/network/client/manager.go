@@ -10,11 +10,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/nexu-io/looper/internal/config"
-	githubinfra "github.com/nexu-io/looper/internal/infra/github"
-	"github.com/nexu-io/looper/internal/network/protocol"
-	"github.com/nexu-io/looper/internal/storage"
-	"github.com/nexu-io/looper/internal/version"
+	"github.com/MumuTW/looper/internal/config"
+	githubinfra "github.com/MumuTW/looper/internal/infra/github"
+	"github.com/MumuTW/looper/internal/network/protocol"
+	"github.com/MumuTW/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/version"
 )
 
 type Status struct {

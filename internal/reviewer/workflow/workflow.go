@@ -10,7 +10,7 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/nexu-io/looper/internal/loops/policy"
+	"github.com/MumuTW/looper/internal/loops/policy"
 )
 
 // Step identifies a stage in the reviewer run pipeline.

@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nexu-io/looper/internal/gatekeeper"
+	"github.com/MumuTW/looper/internal/gatekeeper"
 )
 
 func TestForwardTriggersGatekeeperFromHeadCheckAndReviewCompletion(t *testing.T) {

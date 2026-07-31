@@ -1,6 +1,6 @@
 package config
 
-import "github.com/nexu-io/looper/internal/labels"
+import "github.com/MumuTW/looper/internal/labels"
 
 // LabelsMatch reports whether itemLabels satisfy required under mode.
 //

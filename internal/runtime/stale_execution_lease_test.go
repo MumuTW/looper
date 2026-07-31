@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nexu-io/looper/internal/config"
-	"github.com/nexu-io/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/storage"
 )
 
 func TestRuntimeReconcileStaleRunningRunsQuarantinesExpiredMissingPIDExecution(t *testing.T) {
@@ -270,9 +270,9 @@ func seedStaleExecutionLeaseRun(t *testing.T, repos *storage.Repositories, now t
 	loopID := "loop_lease_" + suffix
 	runID := "run_lease_" + suffix
 	queueID := "queue_lease_" + suffix
-	repo := "nexu-io/looper"
+	repo := "MumuTW/looper"
 	prNumber := int64(22)
-	targetID := "pr:nexu-io/looper:22"
+	targetID := "pr:MumuTW/looper:22"
 	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{
 		ID: "project_1", Name: "Looper", RepoPath: t.TempDir(), CreatedAt: nowISO, UpdatedAt: nowISO,
 	}); err != nil {

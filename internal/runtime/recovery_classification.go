@@ -5,8 +5,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/nexu-io/looper/internal/processcontainment"
-	"github.com/nexu-io/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/processcontainment"
+	"github.com/MumuTW/looper/internal/storage"
 )
 
 const executionLivenessLeaseTTL = 30 * time.Minute

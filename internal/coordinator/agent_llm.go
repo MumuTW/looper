@@ -6,9 +6,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/nexu-io/looper/internal/agent"
-	"github.com/nexu-io/looper/internal/coordinator/triage"
-	"github.com/nexu-io/looper/internal/eventlog"
+	"github.com/MumuTW/looper/internal/agent"
+	"github.com/MumuTW/looper/internal/coordinator/triage"
+	"github.com/MumuTW/looper/internal/eventlog"
 )
 
 type agentLLM struct {

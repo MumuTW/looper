@@ -1,0 +1,28 @@
+# Wire shapes behind the ACP permission gate. devin 3000.3.22.
+# Captured 2026-07-31 with an instrumented replay_acp.py. Session ids and
+# toolCallIds are Devin-generated per run and are left verbatim (they identify
+# nothing outside that dead session); no credentials or account identity here.
+#
+# These two messages are why the gate correlates instead of pattern-matching:
+# the permission request has no tool name anywhere, and the name that does
+# exist arrives on an earlier message keyed by the same toolCallId.
+
+## 1. session/update announcing the tool call — carries the name in vendor _meta
+
+{"sessionUpdate": "tool_call", "toolCallId": "chatcmpl-tool-a45de8fae3ae7449", "title": "Calling hermes_memory_add from hermes-memory", "rawInput": {"content": "E2E-SHAPE-PROBE"}, "_meta": {"cognition.ai/toolName": "mcp__hermes-memory__hermes_memory_add", "cognition.ai/eventType": "mcp_tool_call", "cognition.ai/inferenceToolName": "mcp__hermes-memory__hermes_memory_add"}}
+
+## 2. session/request_permission for that same call — NO name, only the id
+
+{"sessionId": "third-peanut", "toolCall": {"toolCallId": "chatcmpl-tool-a45de8fae3ae7449"}, "options": [{"optionId": "allow_once", "name": "Allow", "kind": "allow_once"}, {"optionId": "allow_session", "name": "Yes, allow calling hermes_memory_add on the hermes-memory MCP server (this session)", "kind": "allow_always"}, {"optionId": "allow_always", "name": "Yes, always allow calling hermes_memory_add on the hermes-memory MCP server", "kind": "allow_always"}, {"optionId": "allow_server_session", "name": "Yes, allow calling all tools on the hermes-memory MCP server (this session)", "kind": "allow_always"}, {"optionId": "allow_server_always", "name": "Yes, always allow calling tools on the hermes-memory MCP server", "kind": "allow_always"}, {"optionId": "switch_bypass", "name": "Yes, switch to bypass mode", "kind": "allow_always"}, {"optionId": "reject_once", "name": "Reject", "kind": "reject_once"}]}
+
+# Notes for anyone extending the gate:
+#
+# - The only in-band name is inside options[].name, as English prose. Matching
+#   that would gate security on UI copy, and note that several distinct grants
+#   share kind "allow_always" while meaning very different scopes — the label
+#   is the only thing distinguishing "this tool, this session" from "all tools
+#   on this server, forever". Correlate on toolCallId instead.
+# - cognition.ai/toolName is fully qualified (mcp__<server>__<tool>), so an
+#   allow-list entry pins the server as well as the tool.
+# - allow_once is always offered in the observed shape, so a ladder of
+#   (allow_once, allow_session) never has to fall back in practice.

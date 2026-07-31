@@ -1,0 +1,19 @@
+$ ./replay_acp.py --cwd "$(mktemp -d)"
+# devin 3000.3.22 (d5152ff5), Hermes v0.19.0 (2026.7.20)
+# Captured 2026-07-31. Session id and message uuid replaced with <REDACTED-*>;
+# no other content removed. Long JSON lines are truncated by the script itself
+# at 300-400 chars, as shown.
+
+initialize OK: {"protocolVersion": 1, "agentCapabilities": {"loadSession": true, "promptCapabilities": {"image": true, "audio": false, "embeddedContext": true}, "mcpCapabilities": {"http": false, "sse": false}, "sessionCapabilities": {"list": {}, "delete": {}, "additionalDirectories": {}}, "auth": {}, "_meta": {"cognition.ai/multiRootWorkspace": true, "cognition.ai/sessionRename": true, "cognition.ai/documentLif
+  [update] available_commands_update
+session/new OK: {"sessionId": "<REDACTED-SESSION-ID>", "modes": {"currentModeId": "accept-edits", "availableModes": [{"id": "accept-edits", "name": "Code"}, {"id": "ask", "name": "Ask"}, {"id": "plan", "name": "Plan"}, {"id": "bypass", "name": "Bypass Permissions"}]}, "configOptions": [{"id": "mode", "name": "Session Mode", "category": "mode", "type": "select", "currentValue": "accept-edits", "options": [{"value": "a
+  [update] session_info_update
+  [update] config_option_update
+  [update] current_mode_update
+  [update] config_option_update
+  [update] current_mode_update
+  [update] usage_update
+session/prompt result: {"stopReason": "end_turn", "usage": {"totalTokens": 13617, "inputTokens": 13608, "outputTokens": 9, "cachedReadTokens": 11142}, "_meta": {"cognition.ai/userMessageId": "<REDACTED-UUID>"}}
+--- collected text ---
+HERMES_DEVIN_ACP_OK
+--- thought chars: 0 | permission reqs: 0 | unknown client methods: ['_cognition.ai/mcp/serversChanged', '_cognition.ai/agent_stopped']

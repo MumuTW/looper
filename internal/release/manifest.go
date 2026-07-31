@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/nexu-io/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/storage"
 )
 
 const ManifestVersion = 1

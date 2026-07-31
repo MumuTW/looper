@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/nexu-io/looper/internal/config"
+	"github.com/MumuTW/looper/internal/config"
 )
 
 // ConfigReloadStatus is transient diagnostic state. The config file overlaid by

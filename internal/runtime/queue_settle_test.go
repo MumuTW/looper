@@ -8,9 +8,9 @@ import (
 	"testing"
 	"time"
 
-	githubinfra "github.com/nexu-io/looper/internal/infra/github"
-	"github.com/nexu-io/looper/internal/infra/shell"
-	"github.com/nexu-io/looper/internal/storage"
+	githubinfra "github.com/MumuTW/looper/internal/infra/github"
+	"github.com/MumuTW/looper/internal/infra/shell"
+	"github.com/MumuTW/looper/internal/storage"
 )
 
 // newQueueSettleGateway fakes `gh issue list` to return the given open issue
@@ -67,7 +67,7 @@ func TestSettleQueuedWorkerIssueTargetsRetiresClosedIssue(t *testing.T) {
 	nowISO := formatJavaScriptISOString(now)
 
 	projectID := "looper"
-	repo := "nexu-io/looper"
+	repo := "MumuTW/looper"
 	loopID := seedQueuedIssueWorker(t, repos, now, projectID, repo, 77)
 
 	// Snapshot fetched open issues: 78 and 79 are open, 77 is not (it closed).
@@ -109,7 +109,7 @@ func TestRunDefaultSchedulerTickSettlesClosedIssueBeforePreDiscoveryClaim(t *tes
 	repos := storage.NewRepositories(coordinator.DB())
 	now := time.Date(2026, time.July, 31, 8, 0, 0, 0, time.UTC)
 	projectID := "looper"
-	repo := "nexu-io/looper"
+	repo := "MumuTW/looper"
 	loopID := seedQueuedIssueWorker(t, repos, now, projectID, repo, 77)
 	workerRunner := &stubWorkerScheduler{}
 
@@ -141,7 +141,7 @@ func TestSettleQueuedWorkerIssueTargetsKeepsOpenIssue(t *testing.T) {
 	nowISO := formatJavaScriptISOString(now)
 
 	projectID := "looper"
-	repo := "nexu-io/looper"
+	repo := "MumuTW/looper"
 	loopID := seedQueuedIssueWorker(t, repos, now, projectID, repo, 77)
 
 	// 77 is still open — must not be retired.
@@ -175,7 +175,7 @@ func TestSettleQueuedWorkerIssueTargetsNoopsWhenSnapshotIncomplete(t *testing.T)
 	nowISO := formatJavaScriptISOString(now)
 
 	projectID := "looper"
-	repo := "nexu-io/looper"
+	repo := "MumuTW/looper"
 	loopID := seedQueuedIssueWorker(t, repos, now, projectID, repo, 77)
 
 	// The snapshot clamps the issue limit to a minimum of 30, so to simulate a
@@ -216,7 +216,7 @@ func TestSettleQueuedWorkerIssueTargetsRefreshesUnfetchedSnapshot(t *testing.T) 
 	nowISO := formatJavaScriptISOString(now)
 
 	projectID := "looper"
-	repo := "nexu-io/looper"
+	repo := "MumuTW/looper"
 	loopID := seedQueuedIssueWorker(t, repos, now, projectID, repo, 77)
 
 	// Snapshot built but listOpenIssues never called. Settlement performs its

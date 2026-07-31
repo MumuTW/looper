@@ -6,7 +6,7 @@ import (
 	"slices"
 	"testing"
 
-	"github.com/nexu-io/looper/internal/lifecycle"
+	"github.com/MumuTW/looper/internal/lifecycle"
 )
 
 // The State JSON keys are a persisted checkpoint contract: existing

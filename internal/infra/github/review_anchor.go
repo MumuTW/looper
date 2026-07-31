@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/nexu-io/looper/internal/diffanchor"
+	"github.com/MumuTW/looper/internal/diffanchor"
 )
 
 const nearestReviewAnchorMaxDistance int64 = 3

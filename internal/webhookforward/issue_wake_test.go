@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nexu-io/looper/internal/planner"
-	"github.com/nexu-io/looper/internal/worker"
+	"github.com/MumuTW/looper/internal/planner"
+	"github.com/MumuTW/looper/internal/worker"
 )
 
 type fakePlanner struct {

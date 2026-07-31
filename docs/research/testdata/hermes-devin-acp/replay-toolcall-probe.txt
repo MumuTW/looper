@@ -1,0 +1,64 @@
+# Tool-loop ownership probe. devin 3000.3.22, Hermes v0.19.0 (2026.7.20).
+# Captured 2026-07-31 with --agent-type summarizer (an agent type with no
+# tools, chosen so any tool intent has nowhere native to go).
+#
+# The pair isolates WHY Hermes-side tools are unreachable: the shim's parser
+# only sees the ACP *message* channel, and the model resolves tool intent
+# natively instead of writing there. Probe B shows the parse path itself is
+# fine — told explicitly that no native tools exist, the same model emits a
+# correctly-shaped call into the message channel on the first try.
+
+$ ./replay_acp.py --cwd "$(mktemp -d)" --agent-type summarizer \
+    --prompt-file prompt-toolcall-native.txt --show-thoughts
+
+--- collected text ---
+
+--- thoughts ---
+The user is asking me to store a note "LOOPER-TEST-42" to memory using the memory tool. This is a straightforward request.
+
+Looking at the available tools, I have a "memory" tool with parameters:
+- action (string)
+- content (string)
+
+The user wants to store "LOOPER-TEST-42" as the content. For the action, since they want to "store" it, I should use an appropriate action like "store" or "save".
+
+Let me call the memory tool with the appropriate parameters.
+--- thought chars: 458 | permission reqs: 0 | unknown client methods: ['_cognition.ai/mcp/serversChanged', '_cognition.ai/thinking_complete', '_cognition.ai/agent_stopped']
+
+# ^ Message channel is EMPTY. The model decided to call `memory`, resolved
+#   that intent natively, and the turn ended. Hermes sees no tool call.
+
+$ ./replay_acp.py --cwd "$(mktemp -d)" --agent-type summarizer \
+    --prompt-file prompt-toolcall-astext.txt
+
+--- collected text ---
+{"id": "call_1", "type": "function", "function": {"name": "memory", "arguments": "{\"action\": \"add\", \"content\": \"LOOPER-TEST-42\"}"}}
+--- thought chars: 427 | permission reqs: 0 | unknown client methods: ['_cognition.ai/mcp/serversChanged', '_cognition.ai/thinking_complete', '_cognition.ai/agent_stopped']
+
+# ^ Same model, same tool schema, message channel now carries a well-formed
+#   OpenAI function-call object that Hermes's _extract_tool_calls_from_text
+#   would parse. The gap is model *choice*, not shim capability.
+#
+# Trying to force choice B globally via the profile's SOUL.md was tested and
+# rejected: it did not make Hermes's memory tool reachable in the default
+# agent type, and it broke the coding path, because the default agent type
+# genuinely does have native tools it should be using.
+
+# ---------------------------------------------------------------------------
+# Follow-up: the capture above is bare JSON, not a <tool_call> block, so on its
+# own it shows only that Devin can put text on the message channel — not that
+# Hermes would accept it. `test_hermes_devin_helpers.py` executes both the
+# captured bare representation and its exact <tool_call> wrapper through the
+# parser AST from the checked-in v2026.7.20 stock source; it needs no Devin
+# account or Hermes installation to reproduce:
+#
+#   captured bare JSON: 1 call(s) -> name='memory'
+#     args='{"action": "add", "content": "LOOPER-TEST-42"}' residual_text=''
+#   tagged form:        1 call(s) -> name='memory'
+#     args='{"action": "add", "content": "LOOPER-TEST-42"}' residual_text=''
+#
+# Both parse identically: the shim tries <tool_call> blocks first and falls
+# back to a bare-JSON regex when none are present. So the captured output would
+# have been accepted, and "the parsing path is fine, the model just never
+# chooses it" holds. Note this makes the prompt-contract route's failure even
+# starker — the format was never the obstacle.

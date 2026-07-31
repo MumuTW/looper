@@ -15,12 +15,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nexu-io/looper/internal/config"
-	"github.com/nexu-io/looper/internal/forge"
-	"github.com/nexu-io/looper/internal/processcontainment"
-	"github.com/nexu-io/looper/internal/processidentity"
-	"github.com/nexu-io/looper/internal/storage"
-	"github.com/nexu-io/looper/internal/validationcmd"
+	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/forge"
+	"github.com/MumuTW/looper/internal/processcontainment"
+	"github.com/MumuTW/looper/internal/processidentity"
+	"github.com/MumuTW/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/validationcmd"
 )
 
 func customOwner() *config.AgentVendor {
@@ -867,7 +867,7 @@ func TestExecutorSuccessfulExecutionPersistsExecutionAndEvents(t *testing.T) {
 	repos := storage.NewRepositories(coordinator.DB())
 	now := time.Date(2026, time.April, 20, 12, 0, 0, 0, time.UTC)
 	executor := New(ExecutorOptions{
-		Config:            ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", `printf 'ok\n'; printf '__LOOPER_RESULT__={"summary":"done","artifacts":["spec.md"],"changedFiles":["main.go"],"commits":["abc123"],"git_pr_lifecycle":{"branch":"looper/test","base_branch":"main","commit_shas":["abc123"],"pushed":true,"pr_number":84,"pr_url":"https://github.com/nexu-io/looper/pull/84","actions":{"commit":"agent","push":"agent","pr":"agent"}}}\n'`}}},
+		Config:            ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", `printf 'ok\n'; printf '__LOOPER_RESULT__={"summary":"done","artifacts":["spec.md"],"changedFiles":["main.go"],"commits":["abc123"],"git_pr_lifecycle":{"branch":"looper/test","base_branch":"main","commit_shas":["abc123"],"pushed":true,"pr_number":84,"pr_url":"https://github.com/MumuTW/looper/pull/84","actions":{"commit":"agent","push":"agent","pr":"agent"}}}\n'`}}},
 		Repos:             repos,
 		Now:               advancingNow(now, 10*time.Millisecond),
 		ParamsOwnerVendor: customOwner(),
@@ -975,7 +975,7 @@ func TestExecutorMalformedLifecycleDoesNotInvalidateCompletion(t *testing.T) {
 func TestExecutorParsesNestedLifecycleActionSources(t *testing.T) {
 	t.Parallel()
 
-	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", `printf '__LOOPER_RESULT__={"summary":"done","git_pr_lifecycle":{"branch":"looper/test","baseBranch":"main","prNumber":84,"prUrl":"https://github.com/nexu-io/looper/pull/84","actions":{"commit":{"source":"agent"},"push":{"source":"agent"},"pr":{"source":"agent"}}}}\n'`}}},
+	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", `printf '__LOOPER_RESULT__={"summary":"done","git_pr_lifecycle":{"branch":"looper/test","baseBranch":"main","prNumber":84,"prUrl":"https://github.com/MumuTW/looper/pull/84","actions":{"commit":{"source":"agent"},"push":{"source":"agent"},"pr":{"source":"agent"}}}}\n'`}}},
 		ParamsOwnerVendor: customOwner(),
 	})
 	execHandle, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_nested_lifecycle", WorkingDirectory: t.TempDir(), Prompt: "ignored", Timeout: time.Second})

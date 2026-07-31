@@ -11,14 +11,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nexu-io/looper/internal/config"
-	"github.com/nexu-io/looper/internal/disclosure"
-	"github.com/nexu-io/looper/internal/labels"
-	"github.com/nexu-io/looper/internal/lifecycle"
-	"github.com/nexu-io/looper/internal/loops"
-	"github.com/nexu-io/looper/internal/network/protocol"
-	"github.com/nexu-io/looper/internal/networkpolicy"
-	"github.com/nexu-io/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/disclosure"
+	"github.com/MumuTW/looper/internal/labels"
+	"github.com/MumuTW/looper/internal/lifecycle"
+	"github.com/MumuTW/looper/internal/loops"
+	"github.com/MumuTW/looper/internal/network/protocol"
+	"github.com/MumuTW/looper/internal/networkpolicy"
+	"github.com/MumuTW/looper/internal/storage"
 )
 
 func buildWorkerPrompt(repoRootPath string, work workerInput, plan *checkpointPlan, allowAgentPRCreation bool, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string) (string, error) {
@@ -639,6 +639,64 @@ func TestDiscoverIssuesRequeuesFailedWorkerLoopWhenFingerprintChanges(t *testing
 	}
 	if len(result.QueueItems) != 1 {
 		t.Fatalf("QueueItems = %#v, want one queue item after fingerprint change", result.QueueItems)
+	}
+}
+
+func TestDiscoverIssuesSkipsSourceIssueClaimHeldByReactiveLoop(t *testing.T) {
+	t.Parallel()
+	for _, loopType := range []string{"reviewer", "fixer"} {
+		t.Run(loopType, func(t *testing.T) {
+			fixture := newRunnerFixture(t)
+			repo := "acme/looper"
+			issue := IssueSummary{Number: 93, Title: "Claimed issue", URL: "https://github.com/acme/looper/issues/93", Assignees: []string{"octocat"}, Labels: []string{labels.DefaultWorkerReadyTrigger}}
+			prNumber := int64(193)
+			prTarget := "pr:acme/looper:193"
+			claimMetadata := `{"worker":{"repo":"acme/looper","issueNumber":93}}`
+			if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_" + loopType + "_claim", Seq: 2, ProjectID: "project_1", Type: loopType, TargetType: "pull_request", TargetID: &prTarget, Repo: &repo, PRNumber: &prNumber, Status: "queued", MetadataJSON: &claimMetadata, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+				t.Fatalf("seed %s claim: %v", loopType, err)
+			}
+			runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{currentLogin: "octocat", issues: []IssueSummary{issue}}, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+
+			result, err := runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+			if err != nil {
+				t.Fatalf("DiscoverIssues() error = %v", err)
+			}
+			if result.Skipped == 0 || len(result.CreatedLoopIDs) != 0 || len(result.QueueItems) != 0 {
+				t.Fatalf("result = %#v, want source-issue claim skipped", result)
+			}
+		})
+	}
+}
+
+func TestDiscoverIssuesDoesNotReactivateWorkerWhenReactiveLoopClaimsSourceIssue(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	issue := IssueSummary{Number: 94, Title: "Changed issue", Body: "new body", URL: "https://github.com/acme/looper/issues/94", Assignees: []string{"octocat"}, Labels: []string{labels.DefaultWorkerReadyTrigger}}
+	targetID := buildIssueTargetID(repo, issue.Number)
+	oldFingerprint := buildWorkerDiscoveryFingerprint(repo, "main", IssueSummary{Number: issue.Number, Title: issue.Title, Body: "old body", URL: issue.URL, Assignees: issue.Assignees, Labels: issue.Labels})
+	workerMetadata := fmt.Sprintf(`{"worker":{"repo":"acme/looper","issueNumber":94},"autonomousRecovery":{"lastFailedDiscoveryFingerprint":%q}}`, oldFingerprint)
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_failed_worker", Seq: 2, ProjectID: "project_1", Type: "worker", TargetType: "issue", TargetID: &targetID, Repo: &repo, Status: "failed", MetadataJSON: &workerMetadata, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("seed failed worker: %v", err)
+	}
+	prNumber := int64(194)
+	prTarget := "pr:acme/looper:194"
+	claimMetadata := `{"worker":{"repo":"acme/looper","issueNumber":94}}`
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_reviewer_claim", Seq: 3, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", TargetID: &prTarget, Repo: &repo, PRNumber: &prNumber, Status: "queued", MetadataJSON: &claimMetadata, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("seed reviewer claim: %v", err)
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{currentLogin: "octocat", issues: []IssueSummary{issue}}, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+
+	result, err := runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	if result.Skipped == 0 || len(result.QueueItems) != 0 {
+		t.Fatalf("result = %#v, want rediscovery blocked by reviewer claim", result)
+	}
+	persisted, err := fixture.repos.Loops.GetByID(context.Background(), "loop_failed_worker")
+	if err != nil || persisted == nil || persisted.Status != "failed" {
+		t.Fatalf("rediscovered worker = %#v, %v; want failed loop unchanged", persisted, err)
 	}
 }
 
@@ -1725,11 +1783,11 @@ func TestProcessClaimedQueueItemResumeValidationFailureUpdatesLoopState(t *testi
 
 func TestBuildPullRequestBodyUsesCrossRepoClosingReference(t *testing.T) {
 	t.Parallel()
-	body := buildPullRequestBody(workerInput{Repo: "acme/looper", IssueRepo: "nexu-io/looper", IssueNumber: 27, IssueURL: "https://github.com/nexu-io/looper/issues/27"}, &checkpointPlan{Items: []string{"Add linked issue auto-close support"}}, &checkpointExecution{Summary: "done"})
-	if !strings.Contains(body, "Issue: nexu-io/looper#27") {
+	body := buildPullRequestBody(workerInput{Repo: "acme/looper", IssueRepo: "MumuTW/looper", IssueNumber: 27, IssueURL: "https://github.com/MumuTW/looper/issues/27"}, &checkpointPlan{Items: []string{"Add linked issue auto-close support"}}, &checkpointExecution{Summary: "done"})
+	if !strings.Contains(body, "Issue: MumuTW/looper#27") {
 		t.Fatalf("body = %q, want issue repo reference", body)
 	}
-	if !strings.Contains(body, "Closes nexu-io/looper#27") {
+	if !strings.Contains(body, "Closes MumuTW/looper#27") {
 		t.Fatalf("body = %q, want cross-repo closing reference", body)
 	}
 	if strings.Contains(body, "Closes #27") {
@@ -1739,48 +1797,48 @@ func TestBuildPullRequestBodyUsesCrossRepoClosingReference(t *testing.T) {
 
 func TestBuildPullRequestBodyUsesBareClosingReferenceForSameRepo(t *testing.T) {
 	t.Parallel()
-	body := buildPullRequestBody(workerInput{Repo: "nexu-io/looper", IssueRepo: "nexu-io/looper", IssueNumber: 27}, nil, nil)
+	body := buildPullRequestBody(workerInput{Repo: "MumuTW/looper", IssueRepo: "MumuTW/looper", IssueNumber: 27}, nil, nil)
 	if !strings.Contains(body, "Closes #27") {
 		t.Fatalf("body = %q, want same-repo closing reference", body)
 	}
-	if strings.Contains(body, "Closes nexu-io/looper#27") {
+	if strings.Contains(body, "Closes MumuTW/looper#27") {
 		t.Fatalf("body = %q, want unqualified same-repo closing reference", body)
 	}
 }
 
 func TestHydrateWorkerInputFromIssueInfersIssueRepoFromURL(t *testing.T) {
 	t.Parallel()
-	work := hydrateWorkerInputFromIssue(workerInput{Repo: "acme/looper", IssueNumber: 27}, IssueDetail{Number: 27, Title: "Issue title", URL: "https://github.com/nexu-io/looper/issues/27"})
-	if work.IssueRepo != "nexu-io/looper" {
-		t.Fatalf("IssueRepo = %q, want nexu-io/looper", work.IssueRepo)
+	work := hydrateWorkerInputFromIssue(workerInput{Repo: "acme/looper", IssueNumber: 27}, IssueDetail{Number: 27, Title: "Issue title", URL: "https://github.com/MumuTW/looper/issues/27"})
+	if work.IssueRepo != "MumuTW/looper" {
+		t.Fatalf("IssueRepo = %q, want MumuTW/looper", work.IssueRepo)
 	}
-	if !strings.Contains(work.Prompt, "Implement issue nexu-io/looper#27") {
+	if !strings.Contains(work.Prompt, "Implement issue MumuTW/looper#27") {
 		t.Fatalf("Prompt = %q, want issue repo in prompt", work.Prompt)
 	}
-	if issueRepoFromURL("https://ghe.example.com/nexu-io/looper/issues/27") != "nexu-io/looper" {
+	if issueRepoFromURL("https://ghe.example.com/MumuTW/looper/issues/27") != "MumuTW/looper" {
 		t.Fatal("issueRepoFromURL() should infer issue repo from GitHub Enterprise URLs")
 	}
-	if issueRepoFromURL("https://gitlab.com/nexu-io/looper/-/issues/27") != "" {
+	if issueRepoFromURL("https://gitlab.com/MumuTW/looper/-/issues/27") != "" {
 		t.Fatal("issueRepoFromURL() should ignore non-GitHub hosts")
 	}
-	if issueRepoFromURL("https://github.com/nexu-io/looper/issues/not-a-number") != "" {
+	if issueRepoFromURL("https://github.com/MumuTW/looper/issues/not-a-number") != "" {
 		t.Fatal("issueRepoFromURL() should ignore invalid issue URLs")
 	}
-	if !strings.Contains(buildAgentPullRequestInstruction(work), "Closes nexu-io/looper#27") {
+	if !strings.Contains(buildAgentPullRequestInstruction(work), "Closes MumuTW/looper#27") {
 		t.Fatalf("instruction = %q, want cross-repo closing reference", buildAgentPullRequestInstruction(work))
 	}
 }
 
 func TestHydrateWorkerInputFromIssueUsesSourceIssueURLWhenIssueURLMissing(t *testing.T) {
 	t.Parallel()
-	work := hydrateWorkerInputFromIssue(workerInput{Repo: "acme/looper", IssueNumber: 27, IssueURL: "https://github.com/nexu-io/looper/issues/27"}, IssueDetail{Number: 27, Title: "Issue title"})
-	if work.IssueRepo != "nexu-io/looper" {
-		t.Fatalf("IssueRepo = %q, want nexu-io/looper", work.IssueRepo)
+	work := hydrateWorkerInputFromIssue(workerInput{Repo: "acme/looper", IssueNumber: 27, IssueURL: "https://github.com/MumuTW/looper/issues/27"}, IssueDetail{Number: 27, Title: "Issue title"})
+	if work.IssueRepo != "MumuTW/looper" {
+		t.Fatalf("IssueRepo = %q, want MumuTW/looper", work.IssueRepo)
 	}
-	if !strings.Contains(work.Prompt, "Implement issue nexu-io/looper#27") {
+	if !strings.Contains(work.Prompt, "Implement issue MumuTW/looper#27") {
 		t.Fatalf("Prompt = %q, want issue repo inferred from source issue URL", work.Prompt)
 	}
-	if work.IssueURL != "https://github.com/nexu-io/looper/issues/27" {
+	if work.IssueURL != "https://github.com/MumuTW/looper/issues/27" {
 		t.Fatalf("IssueURL = %q, want source issue URL preserved", work.IssueURL)
 	}
 }
@@ -1788,7 +1846,7 @@ func TestHydrateWorkerInputFromIssueUsesSourceIssueURLWhenIssueURLMissing(t *tes
 func TestResolveWorkerInputUsesIssueRepoForIssueHydration(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{issueDetail: IssueDetail{Number: 27, Title: "Cross-repo issue", URL: "https://github.com/nexu-io/looper/issues/27"}}
+	github := &fakeGitHubGateway{issueDetail: IssueDetail{Number: 27, Title: "Cross-repo issue", URL: "https://github.com/MumuTW/looper/issues/27"}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
 
 	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
@@ -1803,8 +1861,8 @@ func TestResolveWorkerInputUsesIssueRepoForIssueHydration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Queue.GetByID() error = %v", err)
 	}
-	payload := `{"title":"Implement worker loop","repo":"acme/looper","issueRepo":"nexu-io/looper","issueNumber":27,"baseBranch":"main"}`
-	loopMetadata := `{"worker":{"title":"Implement worker loop","repo":"acme/looper","issueRepo":"nexu-io/looper","issueNumber":27,"baseBranch":"main"}}`
+	payload := `{"title":"Implement worker loop","repo":"acme/looper","issueRepo":"MumuTW/looper","issueNumber":27,"baseBranch":"main"}`
+	loopMetadata := `{"worker":{"title":"Implement worker loop","repo":"acme/looper","issueRepo":"MumuTW/looper","issueNumber":27,"baseBranch":"main"}}`
 	loop.MetadataJSON = &loopMetadata
 	queueItem.PayloadJSON = &payload
 
@@ -1815,13 +1873,13 @@ func TestResolveWorkerInputUsesIssueRepoForIssueHydration(t *testing.T) {
 	if len(github.viewIssueCalls) != 1 {
 		t.Fatalf("len(github.viewIssueCalls) = %d, want 1", len(github.viewIssueCalls))
 	}
-	if github.viewIssueCalls[0].Repo != "nexu-io/looper" {
-		t.Fatalf("ViewIssue repo = %q, want nexu-io/looper", github.viewIssueCalls[0].Repo)
+	if github.viewIssueCalls[0].Repo != "MumuTW/looper" {
+		t.Fatalf("ViewIssue repo = %q, want MumuTW/looper", github.viewIssueCalls[0].Repo)
 	}
-	if work.IssueRepo != "nexu-io/looper" {
-		t.Fatalf("work.IssueRepo = %q, want nexu-io/looper", work.IssueRepo)
+	if work.IssueRepo != "MumuTW/looper" {
+		t.Fatalf("work.IssueRepo = %q, want MumuTW/looper", work.IssueRepo)
 	}
-	if !strings.Contains(work.Prompt, "Implement issue nexu-io/looper#27") {
+	if !strings.Contains(work.Prompt, "Implement issue MumuTW/looper#27") {
 		t.Fatalf("Prompt = %q, want resolved issue repo in prompt", work.Prompt)
 	}
 	if strings.Contains(work.Prompt, "Implement issue acme/looper#27") {
@@ -1832,7 +1890,7 @@ func TestResolveWorkerInputUsesIssueRepoForIssueHydration(t *testing.T) {
 func TestResolveWorkerInputFallsBackToWorkerRepoForIssueHydration(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	github := &fakeGitHubGateway{issueDetail: IssueDetail{Number: 27, Title: "Cross-repo issue", URL: "https://github.com/nexu-io/looper/issues/27"}}
+	github := &fakeGitHubGateway{issueDetail: IssueDetail{Number: 27, Title: "Cross-repo issue", URL: "https://github.com/MumuTW/looper/issues/27"}}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
 
 	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
@@ -1862,10 +1920,10 @@ func TestResolveWorkerInputFallsBackToWorkerRepoForIssueHydration(t *testing.T) 
 	if github.viewIssueCalls[0].Repo != "acme/looper" {
 		t.Fatalf("ViewIssue repo = %q, want worker repo fallback for hydration lookup", github.viewIssueCalls[0].Repo)
 	}
-	if work.IssueRepo != "nexu-io/looper" {
-		t.Fatalf("work.IssueRepo = %q, want nexu-io/looper", work.IssueRepo)
+	if work.IssueRepo != "MumuTW/looper" {
+		t.Fatalf("work.IssueRepo = %q, want MumuTW/looper", work.IssueRepo)
 	}
-	if !strings.Contains(work.Prompt, "Implement issue nexu-io/looper#27") {
+	if !strings.Contains(work.Prompt, "Implement issue MumuTW/looper#27") {
 		t.Fatalf("Prompt = %q, want resolved issue repo in prompt", work.Prompt)
 	}
 }
@@ -1975,8 +2033,8 @@ func TestResolveWorkerInputUsesIssueURLRepoForIssueHydrationLookup(t *testing.T)
 	if err != nil {
 		t.Fatalf("Queue.GetByID() error = %v", err)
 	}
-	payload := `{"title":"Implement worker loop","repo":"acme/looper","issueNumber":27,"issueUrl":"https://github.com/nexu-io/looper/issues/27","baseBranch":"main"}`
-	loopMetadata := `{"worker":{"title":"Implement worker loop","repo":"acme/looper","issueNumber":27,"issueUrl":"https://github.com/nexu-io/looper/issues/27","baseBranch":"main"}}`
+	payload := `{"title":"Implement worker loop","repo":"acme/looper","issueNumber":27,"issueUrl":"https://github.com/MumuTW/looper/issues/27","baseBranch":"main"}`
+	loopMetadata := `{"worker":{"title":"Implement worker loop","repo":"acme/looper","issueNumber":27,"issueUrl":"https://github.com/MumuTW/looper/issues/27","baseBranch":"main"}}`
 	loop.MetadataJSON = &loopMetadata
 	queueItem.PayloadJSON = &payload
 
@@ -1987,13 +2045,13 @@ func TestResolveWorkerInputUsesIssueURLRepoForIssueHydrationLookup(t *testing.T)
 	if len(github.viewIssueCalls) != 1 {
 		t.Fatalf("len(github.viewIssueCalls) = %d, want 1", len(github.viewIssueCalls))
 	}
-	if github.viewIssueCalls[0].Repo != "nexu-io/looper" {
-		t.Fatalf("ViewIssue repo = %q, want nexu-io/looper inferred from issue URL", github.viewIssueCalls[0].Repo)
+	if github.viewIssueCalls[0].Repo != "MumuTW/looper" {
+		t.Fatalf("ViewIssue repo = %q, want MumuTW/looper inferred from issue URL", github.viewIssueCalls[0].Repo)
 	}
-	if work.IssueRepo != "nexu-io/looper" {
-		t.Fatalf("work.IssueRepo = %q, want nexu-io/looper", work.IssueRepo)
+	if work.IssueRepo != "MumuTW/looper" {
+		t.Fatalf("work.IssueRepo = %q, want MumuTW/looper", work.IssueRepo)
 	}
-	if !strings.Contains(work.Prompt, "Implement issue nexu-io/looper#27") {
+	if !strings.Contains(work.Prompt, "Implement issue MumuTW/looper#27") {
 		t.Fatalf("Prompt = %q, want resolved issue repo in prompt", work.Prompt)
 	}
 	if strings.Contains(work.Prompt, "Implement issue acme/looper#27") {
@@ -2305,6 +2363,54 @@ func TestPersistPullRequestReferenceRollsBackLoopWhenQueueUpdateFails(t *testing
 	}
 	if updatedQueue.TargetType != "issue" || updatedQueue.TargetID != "issue:acme/looper:27" || updatedQueue.PRNumber != nil {
 		t.Fatalf("queue after failed persist = %#v, want original issue target", updatedQueue)
+	}
+}
+
+func TestPersistPullRequestReferenceCarriesForcedIssueClaimOverride(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_1")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want worker loop", loop, err)
+	}
+	queue, err := fixture.repos.Queue.GetByID(context.Background(), "queue_worker_1")
+	if err != nil || queue == nil {
+		t.Fatalf("Queue.GetByID() = (%#v, %v), want worker queue", queue, err)
+	}
+	// Start inactive so the reactive claim can exist, then model the force=true
+	// API dispatch that explicitly admits this worker alongside it.
+	loop.Status = "failed"
+	loop.UpdatedAt = fixture.nowISO()
+	if err := fixture.repos.Loops.Upsert(context.Background(), *loop); err != nil {
+		t.Fatalf("park worker before forced dispatch: %v", err)
+	}
+	prNumber := int64(101)
+	prTarget := "pr:acme/looper:101"
+	fixerMetadata := `{"worker":{"repo":"acme/looper","issueNumber":27}}`
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_conflicting_fixer", Seq: 2, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &prTarget, Repo: stringPtr("acme/looper"), PRNumber: &prNumber, Status: "queued", MetadataJSON: &fixerMetadata, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("seed conflicting fixer: %v", err)
+	}
+	forcedMetadata := `{"worker":{"title":"Implement worker loop","repo":"acme/looper","issueNumber":27,"baseBranch":"main","issueClaimOverride":true}}`
+	loop.MetadataJSON = &forcedMetadata
+	loop.Status = "queued"
+	loop.UpdatedAt = fixture.nowISO()
+	if err := fixture.repos.Loops.UpsertForcingIssueClaimAdmission(context.Background(), *loop); err != nil {
+		t.Fatalf("persist force authority on worker: %v", err)
+	}
+	forcedPayload := `{"title":"Implement worker loop","repo":"acme/looper","issueNumber":27,"baseBranch":"main","issueClaimOverride":true}`
+	queue.PayloadJSON = &forcedPayload
+	queue.UpdatedAt = fixture.nowISO()
+	if err := fixture.repos.Queue.Upsert(context.Background(), *queue); err != nil {
+		t.Fatalf("persist force authority on worker queue: %v", err)
+	}
+
+	if err := runner.persistPullRequestReference(context.Background(), *loop, *queue, "acme/looper", checkpointPullPR{Number: prNumber, URL: "https://example/pr/101"}); err != nil {
+		t.Fatalf("persistPullRequestReference() error = %v, want durable force authority to carry through retarget", err)
+	}
+	persisted, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil || persisted == nil || persisted.TargetType != "pull_request" || !storage.LoopForcesIssueClaimAdmission(*persisted) {
+		t.Fatalf("retargeted loop = %#v, %v; want PR target retaining force authority", persisted, err)
 	}
 }
 

@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nexu-io/looper/internal/agent"
-	"github.com/nexu-io/looper/internal/config"
+	"github.com/MumuTW/looper/internal/agent"
+	"github.com/MumuTW/looper/internal/config"
 )
 
 func TestExecutorStartBindsHandleAndKillConfirmedDrains(t *testing.T) {

@@ -6,8 +6,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/nexu-io/looper/internal/network/client"
-	"github.com/nexu-io/looper/internal/network/protocol"
+	"github.com/MumuTW/looper/internal/network/client"
+	"github.com/MumuTW/looper/internal/network/protocol"
 )
 
 type NetworkGateway interface {

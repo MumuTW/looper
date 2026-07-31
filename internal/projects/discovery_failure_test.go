@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/nexu-io/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/storage"
 )
 
 func TestServiceDiscoverProjectRetriesListFailures(t *testing.T) {

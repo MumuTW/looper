@@ -3,7 +3,7 @@ package worker
 import (
 	"testing"
 
-	"github.com/nexu-io/looper/internal/config"
+	"github.com/MumuTW/looper/internal/config"
 )
 
 func TestDiscoveryPolicyForProjectReadsCanonicalWorkerRegistry(t *testing.T) {

@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/nexu-io/looper/internal/config"
-	githubinfra "github.com/nexu-io/looper/internal/infra/github"
-	"github.com/nexu-io/looper/internal/reviewer/automerge"
+	"github.com/MumuTW/looper/internal/config"
+	githubinfra "github.com/MumuTW/looper/internal/infra/github"
+	"github.com/MumuTW/looper/internal/reviewer/automerge"
 )
 
 type GetRepositorySettingsFunc func(context.Context, githubinfra.RepositorySettingsInput) (githubinfra.RepositorySettings, error)

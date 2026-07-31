@@ -11,7 +11,7 @@ import (
 	"strings"
 	"unicode"
 
-	pkgapi "github.com/nexu-io/looper/pkg/api"
+	pkgapi "github.com/MumuTW/looper/pkg/api"
 )
 
 // maxJSONMutationBodyBytes bounds every JSON mutation request body decoded

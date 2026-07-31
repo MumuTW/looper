@@ -5,7 +5,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/nexu-io/looper/internal/infra/shell"
+	"github.com/MumuTW/looper/internal/infra/shell"
 )
 
 // The daemon runs detached, so a gh child that inherits only looperd's own
