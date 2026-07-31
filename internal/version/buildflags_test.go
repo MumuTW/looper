@@ -1,9 +1,10 @@
 package version
 
 import (
+	"bytes"
+	"fmt"
 	"go/parser"
 	"go/token"
-	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -121,42 +122,110 @@ func TestModulePathMigration(t *testing.T) {
 		t.Fatalf("go.mod module declaration = %q, want %q", strings.SplitN(string(goMod), "\n", 2)[0], "module "+modulePath)
 	}
 
-	err = filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if entry.IsDir() {
-			switch entry.Name() {
-			case ".git", "dist", "node_modules":
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if filepath.Ext(path) != ".go" {
-			return nil
-		}
+	legacyImports, err := trackedLegacyModuleImports(root, legacyModulePath)
+	if err != nil {
+		t.Fatalf("scan Go source for legacy module path: %v", err)
+	}
+	for _, relativePath := range legacyImports {
+		t.Errorf("%s still imports legacy module path %q", relativePath, legacyModulePath)
+	}
+}
 
+func trackedLegacyModuleImports(root, legacyModulePath string) ([]string, error) {
+	trackedFiles, err := trackedGoFiles(root)
+	if err != nil {
+		return nil, err
+	}
+
+	legacyImports := make([]string, 0)
+	for _, relativePath := range trackedFiles {
+		path := filepath.Join(root, filepath.FromSlash(relativePath))
 		file, err := parser.ParseFile(token.NewFileSet(), path, nil, parser.ImportsOnly)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		for _, imported := range file.Imports {
 			importPath, err := strconv.Unquote(imported.Path.Value)
 			if err != nil {
-				return err
+				return nil, err
 			}
 			if importPath == legacyModulePath || strings.HasPrefix(importPath, legacyModulePath+"/") {
-				relativePath, err := filepath.Rel(root, path)
-				if err != nil {
-					return err
-				}
-				t.Errorf("%s still imports legacy module path %q", relativePath, legacyModulePath)
+				legacyImports = append(legacyImports, relativePath)
+				break
 			}
 		}
-		return nil
-	})
+	}
+	return legacyImports, nil
+}
+
+func trackedGoFiles(root string) ([]string, error) {
+	command := exec.Command("git", "-C", root, "ls-files", "-z", "--", "*.go")
+	output, err := command.Output()
 	if err != nil {
-		t.Fatalf("scan Go source for legacy module path: %v", err)
+		return nil, fmt.Errorf("list tracked Go files: %w", err)
+	}
+	output = bytes.TrimSuffix(output, []byte{0})
+	if len(output) == 0 {
+		return nil, nil
+	}
+	files := strings.Split(string(output), "\x00")
+	return files, nil
+}
+
+func TestTrackedModulePathScanIgnoresUntrackedWorktrees(t *testing.T) {
+	t.Parallel()
+	root := initModulePathTestRepo(t)
+	writeModulePathTestFile(t, root, "tracked.go", "package tracked\n")
+	writeModulePathTestFile(t, root, filepath.Join(".worktrees", "stale", "legacy.go"), "package stale\nimport _ \"github.com/nexu-io/looper/internal/version\"\n")
+
+	legacyImports, err := trackedLegacyModuleImports(root, "github.com/nexu-io/looper")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(legacyImports) != 0 {
+		t.Fatalf("trackedLegacyModuleImports() = %v, want untracked worktree ignored", legacyImports)
+	}
+}
+
+func TestTrackedModulePathScanFindsTrackedLegacyImport(t *testing.T) {
+	t.Parallel()
+	root := initModulePathTestRepo(t)
+	writeModulePathTestFile(t, root, "tracked.go", "package tracked\nimport _ \"github.com/nexu-io/looper/internal/version\"\n")
+
+	legacyImports, err := trackedLegacyModuleImports(root, "github.com/nexu-io/looper")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(legacyImports) != 1 || legacyImports[0] != "tracked.go" {
+		t.Fatalf("trackedLegacyModuleImports() = %v, want [tracked.go]", legacyImports)
+	}
+}
+
+func initModulePathTestRepo(t *testing.T) string {
+	t.Helper()
+	root := t.TempDir()
+	command := exec.Command("git", "-C", root, "init", "--quiet")
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v\n%s", err, output)
+	}
+	return root
+}
+
+func writeModulePathTestFile(t *testing.T, root, relativePath, contents string) {
+	t.Helper()
+	path := filepath.Join(root, filepath.FromSlash(relativePath))
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("mkdir %s: %v", relativePath, err)
+	}
+	if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
+		t.Fatalf("write %s: %v", relativePath, err)
+	}
+	if strings.HasPrefix(relativePath, ".worktrees/") {
+		return
+	}
+	command := exec.Command("git", "-C", root, "add", "--", filepath.FromSlash(relativePath))
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("git add %s: %v\n%s", relativePath, err, output)
 	}
 }
 
