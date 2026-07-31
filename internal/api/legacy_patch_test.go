@@ -26,9 +26,9 @@ func TestHandlerProjectsPatchRepairsLegacyProjectWithoutValidationStance(t *test
 
 	workerRecorder := httptest.NewRecorder()
 	workerRequest := httptest.NewRequest(http.MethodPost, "/api/v1/workers", bytes.NewReader([]byte(`{"projectId":"legacy_inert","repo":"acme/app","baseBranch":"main","prompt":"repair me"}`)))
-	handler.ServeHTTP(workerRecorder, workerRequest)
+	NewHandler(Context{Config: cfg, Runtime: runtime}).ServeHTTP(workerRecorder, workerRequest)
 	if workerRecorder.Code != http.StatusBadRequest || !strings.Contains(workerRecorder.Body.String(), "validation policy is repaired") {
-		t.Fatalf("manual worker status = %d body=%s, want quarantined project rejection", workerRecorder.Code, workerRecorder.Body.String())
+		t.Fatalf("manual worker without ConfigSnapshot status = %d body=%s, want quarantined project rejection", workerRecorder.Code, workerRecorder.Body.String())
 	}
 
 	recorder := httptest.NewRecorder()

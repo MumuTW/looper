@@ -4226,7 +4226,7 @@ func (h *Handler) buildCreateLoopResponse(r *http.Request) (loopResponse, error)
 	if err != nil {
 		return loopResponse{}, err
 	}
-	if err := h.validateCodingProjectRunnable(projectID, domain.LoopType(loopType)); err != nil {
+	if err := h.validateCodingProjectRunnable(*project, domain.LoopType(loopType)); err != nil {
 		return loopResponse{}, err
 	}
 	if err := validateLoopTargetProjectCompatibility(projectID, parseProjectMetadata(project.MetadataJSON), target); err != nil {
@@ -4421,7 +4421,7 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 		return workerCreateResponse{}, err
 	}
 	projectID := project.ID
-	if err := h.validateCodingProjectRunnable(projectID, domain.LoopTypeWorker); err != nil {
+	if err := h.validateCodingProjectRunnable(project, domain.LoopTypeWorker); err != nil {
 		return workerCreateResponse{}, err
 	}
 
@@ -7902,20 +7902,27 @@ func validateLoopTargetProjectCompatibility(projectID string, projectMetadata ma
 	return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("project %s is configured for repo %s, not %s", projectID, configuredRepo, targetRepo)}
 }
 
-func (h *Handler) validateCodingProjectRunnable(projectID string, loopType domain.LoopType) error {
+func (h *Handler) validateCodingProjectRunnable(project storage.ProjectRecord, loopType domain.LoopType) error {
 	if loopType != domain.LoopTypeWorker && loopType != domain.LoopTypeFixer {
 		return nil
 	}
-	if h.context.ConfigSnapshot == nil {
+	cfg := h.context.Config
+	if h.context.ConfigSnapshot != nil {
+		cfg, _ = h.context.ConfigSnapshot()
+		for _, catalogProject := range cfg.Projects {
+			if catalogProject.ID == project.ID {
+				return nil
+			}
+		}
+		return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("project %s is unavailable for coding work until its validation policy is repaired", project.ID)}
+	}
+	if !projects.IsLegacyInertProject(project) || len(config.ResolveValidationCommands(cfg)) > 0 {
 		return nil
 	}
-	cfg, _ := h.context.ConfigSnapshot()
-	for _, project := range cfg.Projects {
-		if project.ID == projectID {
-			return nil
-		}
+	if !config.CodingRoleAgentConfigured(cfg, config.CodingRoleWorker) && !config.CodingRoleAgentConfigured(cfg, config.CodingRoleFixer) {
+		return nil
 	}
-	return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("project %s is unavailable for coding work until its validation policy is repaired", projectID)}
+	return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("project %s is unavailable for coding work until its validation policy is repaired", project.ID)}
 }
 
 func stringMetadataPtr(metadata map[string]any, key string) *string {
