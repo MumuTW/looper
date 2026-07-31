@@ -1652,6 +1652,28 @@ func TestEnsureWorkerWorktreeUsablePassesDetachedCheckpointIdentity(t *testing.T
 	}
 }
 
+func TestEnsureWorkerWorktreeUsableTreatsModeLessCheckpointAsBranch(t *testing.T) {
+	t.Parallel()
+	worktreeRoot := filepath.Join(t.TempDir(), "worktrees")
+	worktreePath := filepath.Join(worktreeRoot, "legacy-detached")
+	if err := os.MkdirAll(worktreePath, 0o755); err != nil {
+		t.Fatalf("MkdirAll(worktree) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(worktreePath, ".git"), []byte("gitdir: fake\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile(.git) error = %v", err)
+	}
+	metadata := fmt.Sprintf(`{"worktreeRoot":%q}`, worktreeRoot)
+	git := &fakeGitGateway{}
+	runner := New(Options{Git: git})
+	worktree := checkpointWorktree{Path: worktreePath, Branch: "feature/legacy-detached"}
+	if _, err := runner.ensureWorkerWorktreeUsable(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: filepath.Join(t.TempDir(), "repo"), MetadataJSON: &metadata}}, &workerCheckpoint{}, workerInput{}, worktree); err != nil {
+		t.Fatalf("ensureWorkerWorktreeUsable() error = %v", err)
+	}
+	if len(git.verifyCalls) != 1 || git.verifyCalls[0].CheckoutMode != "branch" || git.verifyCalls[0].ExpectedBranch != "feature/legacy-detached" {
+		t.Fatalf("VerifyWorktreeIdentity calls = %#v, want attached legacy checkpoint", git.verifyCalls)
+	}
+}
+
 func TestCreateRunContextCopiesPredecessorAgentSnapshotOnResume(t *testing.T) {
 	t.Parallel()
 

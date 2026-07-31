@@ -950,11 +950,18 @@ func TestGatewayIgnoresStoredWorktreesFromDifferentRepoPath(t *testing.T) {
 func TestNormalizeComparablePathTrimsOnlyPrivateSlashPrefix(t *testing.T) {
 	t.Parallel()
 
-	if got := normalizeComparablePath("/private/var/tmp/repo"); got != "/var/tmp/repo" {
-		t.Fatalf("normalizeComparablePath(/private/var/tmp/repo) = %q, want %q", got, "/var/tmp/repo")
-	}
-	if got := normalizeComparablePath("/private-repo/worktree"); got != "/private-repo/worktree" {
-		t.Fatalf("normalizeComparablePath(/private-repo/worktree) = %q, want %q", got, "/private-repo/worktree")
+	for _, tc := range []struct {
+		goos string
+		path string
+		want string
+	}{
+		{goos: "darwin", path: "/private/var/tmp/repo", want: "/var/tmp/repo"},
+		{goos: "linux", path: "/private/var/tmp/repo", want: "/private/var/tmp/repo"},
+		{goos: "darwin", path: "/private-repo/worktree", want: "/private-repo/worktree"},
+	} {
+		if got := normalizeComparablePathForOS(tc.path, tc.goos); got != tc.want {
+			t.Fatalf("normalizeComparablePathForOS(%q, %q) = %q, want %q", tc.path, tc.goos, got, tc.want)
+		}
 	}
 }
 

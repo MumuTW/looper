@@ -1606,6 +1606,9 @@ func (r *Runner) ensureWorkerWorktreeUsable(ctx context.Context, input stepInput
 	if err := worktreesafety.Validate(worktreesafety.CheckInput{WorktreePath: worktree.Path, RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot}); err != nil {
 		return worktree, staleWorkerWorktreeError(worktree, work, err.Error())
 	}
+	if err := r.verifyCheckpointWorktreeRecord(ctx, input.Project, worktree); err != nil {
+		return worktree, err
+	}
 	info, err := os.Stat(worktree.Path)
 	if err == nil {
 		if !info.IsDir() {
@@ -1618,9 +1621,6 @@ func (r *Runner) ensureWorkerWorktreeUsable(ctx context.Context, input stepInput
 			return worktree, &loopError{message: fmt.Sprintf("Unable to inspect worker worktree git metadata at %s for branch %s: %v", worktree.Path, firstNonEmpty(worktree.Branch, work.Branch, "unknown"), gitErr), kind: FailureRetryableTransient}
 		}
 		checkoutMode := strings.TrimSpace(worktree.CheckoutMode)
-		if checkoutMode == "" && strings.HasSuffix(filepath.Base(worktree.Path), "-detached") {
-			checkoutMode = "detached"
-		}
 		if checkoutMode == "" {
 			checkoutMode = "branch"
 		}
@@ -1651,6 +1651,30 @@ func (r *Runner) ensureWorkerWorktreeUsable(ctx context.Context, input stepInput
 		return worktree, &loopError{message: fmt.Sprintf("Unable to inspect worker worktree path %s for branch %s: %v", worktree.Path, firstNonEmpty(worktree.Branch, work.Branch, "unknown"), err), kind: FailureRetryableTransient}
 	}
 	return worktree, staleWorkerWorktreeError(worktree, work, "path does not exist")
+}
+
+// verifyCheckpointWorktreeRecord detects a replacement row without making the
+// mutable worktree table resume authority. A missing historical row is not
+// evidence of replacement; only an active row for the checkpoint path+branch
+// with a different ID proves the Worker would start in a replacement checkout.
+func (r *Runner) verifyCheckpointWorktreeRecord(ctx context.Context, project storage.ProjectRecord, worktree checkpointWorktree) error {
+	id := strings.TrimSpace(worktree.ID)
+	if id == "" || r.repos == nil {
+		return nil
+	}
+	records, err := r.repos.Worktrees.ListByProject(ctx, project.ID)
+	if err != nil {
+		return &loopError{message: fmt.Sprintf("Unable to inspect worker worktree records: %v", err), kind: FailureRetryableTransient}
+	}
+	for _, record := range records {
+		if record.CleanedAt != nil || record.Status == "cleaned" || record.Status == "retired" {
+			continue
+		}
+		if storage.WorktreePathsEquivalent(record.WorktreePath, worktree.Path) && strings.TrimSpace(record.Branch) == strings.TrimSpace(worktree.Branch) && record.ID != id {
+			return staleWorkerWorktreeError(worktree, workerInput{}, "checkpoint worktree record has been replaced")
+		}
+	}
+	return nil
 }
 
 func workerWorktreeRoot(project storage.ProjectRecord) (string, error) {

@@ -105,6 +105,9 @@ type checkpointWithWorktree struct {
 		HeadRefName string `json:"headRefName,omitempty"`
 		PRNumber    int64  `json:"prNumber,omitempty"`
 	} `json:"detail,omitempty"`
+	ReconcileCommits *struct {
+		FinalHeadSHA string `json:"finalHeadSha,omitempty"`
+	} `json:"reconcileCommits,omitempty"`
 }
 
 // loopWorktreeStatus resolves the managed worktree for a loop and reports
@@ -580,6 +583,9 @@ func parseCheckpointWorktree(raw *string) *checkpointWorktreeRef {
 		headSHA = strings.TrimSpace(checkpoint.Worktree.HeadSHA)
 		id = strings.TrimSpace(checkpoint.Worktree.ID)
 		checkoutMode = strings.TrimSpace(checkpoint.Worktree.CheckoutMode)
+	}
+	if checkpoint.ReconcileCommits != nil && strings.TrimSpace(checkpoint.ReconcileCommits.FinalHeadSHA) != "" {
+		headSHA = strings.TrimSpace(checkpoint.ReconcileCommits.FinalHeadSHA)
 	}
 	// Dirty prepare-worktree often aborts before checkpoint.worktree is set.
 	// Prefer an explicit worktree.branch, then worker work.branch, then

@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"time"
 
@@ -1657,6 +1658,10 @@ func sanitizeBranchName(branch string) string {
 }
 
 func normalizeComparablePath(path string) string {
+	return normalizeComparablePathForOS(path, runtime.GOOS)
+}
+
+func normalizeComparablePathForOS(path, goos string) string {
 	if path == "" {
 		return ""
 	}
@@ -1665,7 +1670,7 @@ func normalizeComparablePath(path string) string {
 		resolved = path
 	}
 	resolved = filepath.ToSlash(filepath.Clean(resolved))
-	if strings.HasPrefix(resolved, "/private/") {
+	if goos == "darwin" && strings.HasPrefix(resolved, "/private/") {
 		return strings.TrimPrefix(resolved, "/private")
 	}
 	return resolved

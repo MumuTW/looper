@@ -1427,6 +1427,46 @@ func TestHandlerLoopRetryDiscardRejectsReplacedCheckpointID(t *testing.T) {
 	if got := readTestFile(t, filepath.Join(fixture.WorktreePath, "dirty.txt")); got != "untracked\n" {
 		t.Fatalf("replacement ID worktree was discarded: dirty.txt = %q", got)
 	}
+
+	// Plain retry must also stop before agent execution: the physical checkout
+	// still matches, but the active record now proves its checkpoint ID was
+	// replaced at that same path and branch.
+	latestRun, err := services.Repositories.Runs.GetLatestByLoopID(context.Background(), fixture.LoopID)
+	if err != nil || latestRun == nil {
+		t.Fatalf("Runs.GetLatestByLoopID() = %#v, %v", latestRun, err)
+	}
+	checkpointJSON := fmt.Sprintf(`{"resumePolicy":"advance_from_checkpoint","work":{"title":"Resume checkpoint","repo":"acme/looper","baseBranch":"main","executionMode":"create-pr"},"worktree":{"id":%q,"path":%q,"branch":%q,"baseBranch":"main"},"plan":{"summary":"Resume checkpoint","items":["continue"]}}`, record.ID, fixture.WorktreePath, record.Branch)
+	lastCompletedStep := "plan"
+	failedStep := "execute"
+	latestRun.CheckpointJSON = &checkpointJSON
+	latestRun.LastCompletedStep = &lastCompletedStep
+	latestRun.CurrentStep = &failedStep
+	if err := services.Repositories.Runs.Upsert(context.Background(), *latestRun); err != nil {
+		t.Fatalf("Runs.Upsert(worker checkpoint) error = %v", err)
+	}
+	plainRetryReq := httptest.NewRequest(http.MethodPost, "/api/v1/loops/3139/retry", strings.NewReader(`{"mode":"auto"}`))
+	plainRetryRecorder := httptest.NewRecorder()
+	h.ServeHTTP(plainRetryRecorder, plainRetryReq)
+	if plainRetryRecorder.Code != http.StatusOK {
+		t.Fatalf("plain retry = %d body=%s, want API requeue", plainRetryRecorder.Code, plainRetryRecorder.Body.String())
+	}
+	claim, err := services.Repositories.Queue.ClaimNextOfType(context.Background(), "2026-12-31T00:00:00.000Z", "worker-replacement-id", "worker")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = %#v, %v", claim, err)
+	}
+	realGit := gitinfra.New(gitinfra.Options{GitPath: "git", Repos: services.Repositories})
+	agent := &recordingWorkerAgent{}
+	workerRunner := workerpkg.New(workerpkg.Options{DB: services.Coordinator.DB(), Repos: services.Repositories, Git: workerGitTestAdapter{gateway: realGit}, AgentExecutor: agent, Now: func() time.Time { return time.Date(2026, time.July, 31, 2, 0, 0, 0, time.UTC) }, AllowAutoCommit: true})
+	result, err := workerRunner.ProcessClaimedQueueItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedQueueItem() error = %v", err)
+	}
+	if result == nil || result.FailureKind != workerpkg.FailureManualIntervention || !strings.Contains(result.Summary, "record has been replaced") {
+		t.Fatalf("worker result = %#v, want replacement-ID manual intervention", result)
+	}
+	if len(agent.starts) != 0 {
+		t.Fatalf("replacement ID started agent: %#v", agent.starts)
+	}
 }
 
 func TestHandlerLoopRetryDiscardRejectsPathOnlyCheckpointWithoutBranch(t *testing.T) {
@@ -1533,6 +1573,39 @@ func TestHandlerLoopRetryDiscardAllowsDirtyDetachedFixerAndReviewer(t *testing.T
 				t.Fatalf("README after detached discard = %q, want clean content", got)
 			}
 		})
+	}
+}
+
+func TestHandlerLoopRetryDiscardUsesReconciledDetachedHead(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	fixture := seedManagedWorktreeFixture(t, services.Repositories, managedWorktreeSeed{
+		ProjectID: "project_retry_discard_reconciled_head", LoopID: "loop_retry_discard_reconciled_head", LoopSeq: 3145,
+		LoopType: "fixer", Branch: "feature/reconciled-head", NowISO: "2026-04-11T12:00:00.000Z", Dirty: true, CheckoutMode: gitinfra.CheckoutModeDetached,
+	})
+	record, err := services.Repositories.Worktrees.GetByBranch(context.Background(), "project_retry_discard_reconciled_head", "feature/reconciled-head")
+	if err != nil || record == nil || record.HeadSHA == nil {
+		t.Fatalf("GetByBranch() = %#v, %v", record, err)
+	}
+	initialHead := *record.HeadSHA
+	runGitTest(t, fixture.WorktreePath, "add", "README.md")
+	runGitTest(t, fixture.WorktreePath, "commit", "-m", "fix: reconciled detached head")
+	finalHead := runGitOutputTest(t, fixture.WorktreePath, "rev-parse", "HEAD")
+	latestRun, err := services.Repositories.Runs.GetLatestByLoopID(context.Background(), fixture.LoopID)
+	if err != nil || latestRun == nil {
+		t.Fatalf("Runs.GetLatestByLoopID() = %#v, %v", latestRun, err)
+	}
+	checkpoint := fmt.Sprintf(`{"worktree":{"id":%q,"path":%q,"branch":%q,"headSha":%q},"reconcileCommits":{"finalHeadSha":%q}}`, record.ID, fixture.WorktreePath, record.Branch, initialHead, finalHead)
+	latestRun.CheckpointJSON = &checkpoint
+	if err := services.Repositories.Runs.Upsert(context.Background(), *latestRun); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/3145/retry", strings.NewReader(`{"mode":"auto","discardWorktreeChanges":true}`))
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("discard retry = %d body=%s, want reconciled detached discard", recorder.Code, recorder.Body.String())
 	}
 }
 
@@ -2483,6 +2556,18 @@ func runGitTest(t *testing.T, cwd string, args ...string) {
 	if err != nil {
 		t.Fatalf("git %v in %s failed: %v\n%s", args, cwd, err, out)
 	}
+}
+
+func runGitOutputTest(t *testing.T, cwd string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = cwd
+	cmd.Env = append(os.Environ(), "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null")
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("git %v in %s failed: %v", args, cwd, err)
+	}
+	return strings.TrimSpace(string(out))
 }
 
 func readTestFile(t *testing.T, path string) string {
