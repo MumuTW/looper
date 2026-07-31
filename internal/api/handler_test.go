@@ -2411,6 +2411,25 @@ func TestHandlerProjectsCreateRouteSuccessDerivesDefaults(t *testing.T) {
 	}
 }
 
+func TestHandlerProjectsCreateRoutePassesValidationPolicyToService(t *testing.T) {
+	fixture := newTestFixture(t)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/projects", bytes.NewReader([]byte(`{"repoPath":"/tmp/repos/looper","validation":{"commands":["go test ./..."]}}`)))
+	var got projects.AddInput
+
+	_, err := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime}).buildCreateProjectResponse(req, fakeProjectService{
+		addProject: func(_ context.Context, input projects.AddInput) (projects.AddResult, error) {
+			got = input
+			return projects.AddResult{}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("buildCreateProjectResponse() error = %v", err)
+	}
+	if got.Validation == nil || !reflect.DeepEqual(got.Validation.Commands, []string{"go test ./..."}) || got.Validation.OptOut {
+		t.Fatalf("Validation = %#v, want commands passed through", got.Validation)
+	}
+}
+
 func TestHandlerProjectsCreateRouteReturnsDiscoveryDetails(t *testing.T) {
 	fixture := newTestFixture(t)
 	nowISO := fixture.now.UTC().Format(javaScriptISOString)
@@ -8777,30 +8796,38 @@ func TestHandlerPullRequestStatusUsesLatestRunOrderingForTiedTimestamps(t *testi
 	assertEqual(t, loopStatus["latestRunStatus"], "running")
 }
 
-// projects[].roles.deployer.environment holds the credentials a deploy
-// authenticates with, and this response already withholds daemon.environment for
-// the same reason.
-func TestRedactProjectDeployerSecrets(t *testing.T) {
-	t.Parallel()
-	environment := map[string]string{"DEPLOY_TOKEN": "secret-value"}
-	projects := []config.ProjectRefConfig{{
+// Driven through buildConfigResponse, the function that actually serves the
+// configuration, rather than through the redaction helper. The helper being
+// correct proves nothing about whether this path still calls it — and an earlier
+// version of this test said exactly that in its comment while calling the helper.
+func TestConfigResponseWithholdsProjectDeployCredentials(t *testing.T) {
+	// No t.Parallel: startTestRuntime uses t.Setenv.
+	const secret = "response-deploy-secret"
+	environment := map[string]string{"DEPLOY_TOKEN": secret}
+	_, cfg := startTestRuntime(t)
+	cfg.Projects = []config.ProjectRefConfig{{
 		ID: "looper",
 		Roles: &config.PartialRoleConfigs{Deployer: &config.PartialDeployerRoleConfig{
 			Environment: &environment,
 		}},
 	}}
 
-	redacted := redactProjectSecrets(projects)
+	response := NewHandler(Context{Config: cfg}).buildConfigResponse()
 
-	if redacted[0].Roles.Deployer.Environment != nil {
-		t.Fatalf("deploy credentials reached the config response: %v", *redacted[0].Roles.Deployer.Environment)
+	encoded, err := json.Marshal(response)
+	if err != nil {
+		t.Fatalf("marshal config response: %v", err)
 	}
-	// The slice copy shares the Roles pointer, so redaction must not reach back
-	// into the live configuration.
-	if projects[0].Roles.Deployer.Environment == nil {
-		t.Fatal("redaction mutated the live configuration")
+	if strings.Contains(string(encoded), secret) {
+		t.Fatalf("the config response carries a deploy credential:\n%s", encoded)
 	}
-	if (*projects[0].Roles.Deployer.Environment)["DEPLOY_TOKEN"] != "secret-value" {
-		t.Fatal("redaction altered the live configuration values")
+
+	// Withholding the secret must not destroy it: the response builder copies a
+	// slice whose Roles pointers are shared with the live configuration.
+	if cfg.Projects[0].Roles.Deployer.Environment == nil {
+		t.Fatal("building the response erased the live deploy credentials")
+	}
+	if (*cfg.Projects[0].Roles.Deployer.Environment)["DEPLOY_TOKEN"] != secret {
+		t.Fatal("building the response altered the live deploy credentials")
 	}
 }

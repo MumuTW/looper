@@ -221,8 +221,8 @@ func NewHandler(context Context) *Handler {
 }
 
 // lockLoopRetry acquires the process-wide per-loop requeue mutex shared by
-// retryLoop, start/requeue (mutateLoopStatus → Running), issue-worker reuse
-// (POST /workers), and runtime HITL free-text / answer requeues
+// retryLoop, terminal close, start/requeue (mutateLoopStatus → Running),
+// issue-worker reuse (POST /workers), and runtime HITL free-text / answer requeues
 // (looperdruntime.LockLoopRequeue). Without this shared exclusion, runtime
 // inbox delivery can requeue after discard preflight and before git reset,
 // wiping the worktree for the message-driven continuation when the retry TX
@@ -1213,28 +1213,6 @@ type configResponse struct {
 	Metadata      ConfigMetadata            `json:"metadata"`
 }
 
-// redactProjectSecrets copies projects with their deploy credentials removed.
-//
-// projects[].roles.deployer.environment holds the values a deploy authenticates
-// with — the same class of secret as daemon.environment, which this response
-// already withholds. The copy is deep through Roles because the slice copy shares
-// that pointer with the live configuration.
-func redactProjectSecrets(projects []config.ProjectRefConfig) []config.ProjectRefConfig {
-	redacted := append([]config.ProjectRefConfig{}, projects...)
-	for i := range redacted {
-		roles := redacted[i].Roles
-		if roles == nil || roles.Deployer == nil || roles.Deployer.Environment == nil {
-			continue
-		}
-		deployer := *roles.Deployer
-		deployer.Environment = nil
-		clonedRoles := *roles
-		clonedRoles.Deployer = &deployer
-		redacted[i].Roles = &clonedRoles
-	}
-	return redacted
-}
-
 type configRolesResponse struct {
 	Coding      map[string]config.CodingRoleConfig `json:"coding"`
 	Planner     config.PlannerRoleConfig           `json:"planner"`
@@ -1338,7 +1316,7 @@ func (h *Handler) buildConfigResponse() configResponse {
 			Coordinator: cfg.Roles.Coordinator,
 		},
 		Providers: append([]config.ProviderConfig{}, cfg.Providers...),
-		Projects:  redactProjectSecrets(cfg.Projects),
+		Projects:  config.RedactProjectSecrets(cfg.Projects),
 		Metadata:  h.buildConfigMetadata(),
 	}
 }
@@ -2984,6 +2962,12 @@ func (h *Handler) buildActiveRunRouteResponse(r *http.Request, path string) (any
 		if err != nil {
 			return nil, err
 		}
+		// Close and retry both change spawn admission and durable queue state.
+		// Hold the same per-loop mutex as retryLoop so a retry cannot clear the
+		// close gate and publish claimable work between BeginLoopStop and the
+		// terminal transaction (or immediately after close wins).
+		unlock := h.lockLoopRetry(loop.ID)
+		defer unlock()
 		return h.context.CloseLoop(r.Context(), loop.ID, fmt.Sprintf("Closed by user via selector %s", selector))
 	default:
 		return nil, apiError{code: pkgapi.ErrorCodeRouteNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Unknown route: %s", path)}
@@ -7644,7 +7628,6 @@ type createProjectRequest struct {
 	BaseBranch   *string                         `json:"baseBranch"`
 	WorktreeRoot *string                         `json:"worktreeRoot"`
 	Repo         *string                         `json:"repo"`
-	Provider     *string                         `json:"provider"`
 	Validation   *config.ProjectValidationConfig `json:"validation"`
 	SnapshotMode *string                         `json:"snapshotMode"`
 }
@@ -7751,8 +7734,7 @@ func (h *Handler) buildCreateProjectResponse(r *http.Request, service projectSer
 		IDSource:     idSource,
 		WorktreeRoot: normalizeOptionalString(body.WorktreeRoot),
 		Repo:         normalizeOptionalString(body.Repo),
-		Provider:     normalizeOptionalString(body.Provider),
-		Validation:   cloneProjectValidation(body.Validation),
+		Validation:   body.Validation,
 		SnapshotMode: snapshotMode,
 	})
 	if err != nil {
@@ -7821,13 +7803,6 @@ func serializeProject(project storage.ProjectRecord, cfg config.Config, defaultB
 		response.Discovery = &serialized
 	}
 	return response
-}
-
-func cloneProjectValidation(source *config.ProjectValidationConfig) *config.ProjectValidationConfig {
-	if source == nil {
-		return nil
-	}
-	return &config.ProjectValidationConfig{Commands: append([]string(nil), source.Commands...), OptOut: source.OptOut}
 }
 
 func serializeProjectValidation(metadata map[string]any, cfg config.Config) *projectValidationResponse {
