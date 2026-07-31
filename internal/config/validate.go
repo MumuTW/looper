@@ -637,7 +637,17 @@ func ValidateProjectValidationPolicy(validation *ProjectValidationConfig) error 
 func validateProjectValidationConfig(config Config, project ProjectRefConfig, prefix string, requirePresence bool, issues *[]ValidationIssue) {
 	validation := project.Validation
 	if validation == nil {
-		if requirePresence && len(ResolveValidationCommands(config)) == 0 {
+		if len(ResolveValidationCommands(config)) > 0 {
+			// The project has no authored policy but inherits the deprecated
+			// defaults.validationCommands fallback, so the gate is active:
+			// worker/fixer resolve these commands and run with
+			// RestrictToolNetwork. The same vendor capability check applies, or
+			// an unsupported vendor passes startup and fails at every spawn
+			// instead of failing fast here.
+			validateValidationVendorSupport(config, project, prefix, issues)
+			return
+		}
+		if requirePresence {
 			*issues = append(*issues, ValidationIssue{
 				Path:    prefix + ".validation",
 				Message: "must configure commands or set optOut=true; defaults.validationCommands is only a legacy migration fallback",

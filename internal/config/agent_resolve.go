@@ -121,9 +121,13 @@ func CodingRoleAgentConfigured(cfg Config, role string) bool {
 // predicate cannot live there and be used here; instead
 // TestToolNetworkDenialVendorsMatchAdapterTable in internal/agent fails if
 // this list and that table ever drift apart.
+//
+// devin-experimental is deliberately excluded: the captured Devin CLI
+// 3000.3.22 evidence marks strict tool-network containment a no-go, and no
+// integration check has verified a supported CLI version denies a network
+// probe from an exec tool. Adding it back requires that integration evidence.
 var toolNetworkDenialVendors = []AgentVendor{
 	AgentVendorCodex,
-	AgentVendorDevinExperimental,
 }
 
 // VendorSupportsToolNetworkDenial reports whether vendor can serve a
