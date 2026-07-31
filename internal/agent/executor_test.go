@@ -1721,6 +1721,41 @@ func TestCheckpointFallbackReapsSpawnWhenOwnershipPersistenceFails(t *testing.T)
 	}
 }
 
+// TestCheckpointFallbackPropagatesToolNetworkRestrictionRefusal verifies that a
+// checkpoint-restart fallback which cannot re-apply the tool-network restriction
+// returns the original ErrStaticConfigMismatch error instead of swallowing it.
+// Without propagation, both runners see only a non-completed Result and classify
+// the static config mismatch as retryable_transient, burning retries and tripping
+// the failure-streak circuit breaker.
+func TestCheckpointFallbackPropagatesToolNetworkRestrictionRefusal(t *testing.T) {
+	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendorClaudeCode}})
+	x := &execution{
+		executor:       executor,
+		input:          RunInput{WorkingDirectory: t.TempDir(), Prompt: "retry", RestrictToolNetwork: true},
+		executionID:    "agent_fallback_restriction_refusal",
+		startedAt:      time.Now(),
+		startedAtISO:   time.Now().UTC().Format("2006-01-02T15:04:05.000Z"),
+		maxOutputBytes: defaultMaxOutputBytes,
+	}
+
+	_, _, ok, err := x.runCheckpointFallback(context.Background(), "resume failed")
+	if ok {
+		t.Fatal("runCheckpointFallback() ok = true, want restriction refusal")
+	}
+	if err == nil {
+		t.Fatal("runCheckpointFallback() error = nil, want fail-closed restriction error")
+	}
+	if !errors.Is(err, failureclass.ErrStaticConfigMismatch) {
+		t.Fatalf("runCheckpointFallback() error = %v, want ErrStaticConfigMismatch", err)
+	}
+	if !strings.Contains(err.Error(), string(config.AgentVendorClaudeCode)) {
+		t.Fatalf("runCheckpointFallback() error = %v, want the vendor named", err)
+	}
+	if kind := failureclass.Classify(err, failureclass.Context{Runner: failureclass.RunnerFixer, Boundary: failureclass.BoundaryModelProvider}); kind != failureclass.ManualIntervention {
+		t.Fatalf("Classify() = %q, want %q", kind, failureclass.ManualIntervention)
+	}
+}
+
 func TestPersistStatusNoOpAfterTerminalPersisted(t *testing.T) {
 	coordinator := openAgentCoordinator(t)
 	repos := storage.NewRepositories(coordinator.DB())

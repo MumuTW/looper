@@ -6747,6 +6747,7 @@ func (f *fakeGitGateway) CleanupWorktree(_ context.Context, input CleanupWorktre
 type fakeAgentExecutor struct {
 	results []AgentResult
 	starts  []AgentRunInput
+	waitErr error
 }
 
 func (f *fakeAgentExecutor) Start(_ context.Context, input AgentRunInput) (AgentExecution, error) {
@@ -6776,12 +6777,20 @@ func (f *fakeAgentExecutor) Start(_ context.Context, input AgentRunInput) (Agent
 			}
 		}
 	}
-	return fakeAgentExecution{result: result}, nil
+	return fakeAgentExecution{result: result, waitErr: f.waitErr}, nil
 }
 
-type fakeAgentExecution struct{ result AgentResult }
+type fakeAgentExecution struct {
+	result  AgentResult
+	waitErr error
+}
 
-func (f fakeAgentExecution) Wait(context.Context) (AgentResult, error) { return f.result, nil }
+func (f fakeAgentExecution) Wait(context.Context) (AgentResult, error) {
+	if f.waitErr != nil {
+		return AgentResult{}, f.waitErr
+	}
+	return f.result, nil
+}
 
 func passValidation(context.Context, ValidationInput) (ValidationResult, error) {
 	return ValidationResult{Passed: true, Summary: "ok"}, nil
