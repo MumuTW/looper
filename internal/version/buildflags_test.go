@@ -154,10 +154,11 @@ func TestModulePathMigration(t *testing.T) {
 // at older revisions and are never listed by `git ls-files` run here. The test
 // therefore does not walk the filesystem or mutate those worktrees.
 //
-// The -t flag prefixes each entry with a status character. Entries marked S
-// carry the skip-worktree bit (for example files omitted by a sparse
-// checkout) and may be absent from the working tree, so they are excluded to
-// avoid parsing nonexistent paths; only H (cached, present) entries are kept.
+// `git ls-files` lists index entries regardless of working-tree presence: an
+// unstaged deletion keeps the cached entry, and a skip-worktree file may or
+// may not be present. The status tags (H cached, S skip-worktree) are index
+// flags, not presence indicators, so each candidate is statted to keep only
+// files the parser can actually open rather than trusting the tags.
 //
 // The Git index is read via os.ReadFile so Go's test result cache observes it
 // as an input. `git ls-files` runs in a child process, so without this read
@@ -173,7 +174,7 @@ func trackedGoFiles(root string) ([]string, error) {
 		return nil, fmt.Errorf("read git index: %w", err)
 	}
 
-	cmd := exec.Command("git", "-C", root, "ls-files", "-z", "-t", "--", "*.go")
+	cmd := exec.Command("git", "-C", root, "ls-files", "-z", "--", "*.go")
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
@@ -185,25 +186,37 @@ func trackedGoFiles(root string) ([]string, error) {
 		if entry == "" {
 			continue
 		}
-		// -t format is "<status> <path>". Only H (cached, present) entries are
-		// parseable; S (skip-worktree) entries may be absent from a sparse
-		// checkout's working tree.
-		if len(entry) < 3 || entry[1] != ' ' || entry[0] != 'H' {
-			continue
+		// `git ls-files` lists cached paths even when the working-tree file is
+		// gone (unstaged deletion) or carries the skip-worktree bit. Stat the
+		// path so the scanner only hands parseable, on-disk files to the
+		// parser; a missing file is skipped, any other stat error is surfaced.
+		if _, err := os.Stat(filepath.Join(root, entry)); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return nil, fmt.Errorf("stat tracked go file %s: %w", entry, err)
 		}
-		files = append(files, entry[2:])
+		files = append(files, entry)
 	}
 	return files, nil
 }
 
 // resolveGitDir returns the absolute path to root's Git directory, or
 // errNotAGitRepo when root is not inside a Git worktree (for example an
-// exported source archive produced by `git archive`).
+// exported source archive produced by `git archive`). errNotAGitRepo is
+// returned only after git actually ran and reported root is outside a
+// worktree; if the git executable cannot be started (absent from PATH, not
+// executable, ...) the execution failure is preserved so the caller fails the
+// guard loud instead of silently skipping it.
 func resolveGitDir(root string) (string, error) {
 	cmd := exec.Command("git", "-C", root, "rev-parse", "--absolute-git-dir")
 	cmd.Stderr = nil
 	out, err := cmd.Output()
 	if err != nil {
+		var execErr *exec.Error
+		if errors.As(err, &execErr) {
+			return "", fmt.Errorf("git rev-parse --absolute-git-dir: %w", err)
+		}
 		return "", errNotAGitRepo
 	}
 	dir := strings.TrimSpace(string(out))
@@ -447,10 +460,224 @@ func TestTrackedGoFilesSkipsSparseCheckoutAbsent(t *testing.T) {
 	}
 }
 
+// TestTrackedGoFilesExcludesUnstagedDeletion verifies that a tracked Go file
+// deleted from the working tree but still in the index (an unstaged deletion,
+// which `git ls-files` still lists as cached) is excluded, so the scanner does
+// not hand a nonexistent path to the parser.
+func TestTrackedGoFilesExcludesUnstagedDeletion(t *testing.T) {
+	root := t.TempDir()
+	for _, args := range [][]string{
+		{"init"},
+		{"config", "user.email", "test@example.com"},
+		{"config", "user.name", "test"},
+	} {
+		cmd := exec.Command("git", append([]string{"-C", root}, args...)...)
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		if err := cmd.Run(); err != nil {
+			t.Skipf("git %v unavailable in this environment: %v %s", args, err, stderr.String())
+		}
+	}
+
+	presentRel := filepath.Join("cmd", "looperd", "main.go")
+	deletedRel := filepath.Join("tools", "print-version-json", "main.go")
+	for _, rel := range []string{presentRel, deletedRel} {
+		if err := os.MkdirAll(filepath.Join(root, filepath.Dir(rel)), 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", rel, err)
+		}
+		if err := os.WriteFile(filepath.Join(root, rel), []byte("package main\n"), 0o644); err != nil {
+			t.Fatalf("write %s: %v", rel, err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(root, "go.mod"), []byte("module github.com/MumuTW/looper\n\ngo 1.24\n"), 0o644); err != nil {
+		t.Fatalf("write go.mod: %v", err)
+	}
+	for _, args := range [][]string{
+		{"add", presentRel, deletedRel, "go.mod"},
+		{"commit", "--no-gpg-sign", "-m", "seed"},
+	} {
+		cmd := exec.Command("git", append([]string{"-C", root}, args...)...)
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		if err := cmd.Run(); err != nil {
+			t.Fatalf("git %v: %v %s", args, err, stderr.String())
+		}
+	}
+
+	// Unstaged deletion: the file is gone from the working tree but still
+	// cached in the index, so `git ls-files` would list it without a presence
+	// check.
+	if err := os.Remove(filepath.Join(root, deletedRel)); err != nil {
+		t.Fatalf("remove %s: %v", deletedRel, err)
+	}
+
+	files, err := trackedGoFiles(root)
+	if err != nil {
+		t.Fatalf("trackedGoFiles: %v", err)
+	}
+	wantPresent := filepath.ToSlash(presentRel)
+	wantDeleted := filepath.ToSlash(deletedRel)
+	foundPresent, foundDeleted := false, false
+	for _, f := range files {
+		slash := filepath.ToSlash(f)
+		if slash == wantPresent {
+			foundPresent = true
+		}
+		if slash == wantDeleted {
+			foundDeleted = true
+		}
+	}
+	if !foundPresent {
+		t.Fatalf("trackedGoFiles = %v, want present file %q listed", files, wantPresent)
+	}
+	if foundDeleted {
+		t.Fatalf("trackedGoFiles = %v, want unstaged-deleted file %q excluded", files, wantDeleted)
+	}
+}
+
+// TestTrackedGoFilesIncludesPresentSkipWorktree verifies that a tracked Go
+// file carrying the skip-worktree bit but still present on disk is listed, so
+// the scanner does not silently omit a real source file based on the index
+// flag alone.
+func TestTrackedGoFilesIncludesPresentSkipWorktree(t *testing.T) {
+	root := t.TempDir()
+	for _, args := range [][]string{
+		{"init"},
+		{"config", "user.email", "test@example.com"},
+		{"config", "user.name", "test"},
+	} {
+		cmd := exec.Command("git", append([]string{"-C", root}, args...)...)
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		if err := cmd.Run(); err != nil {
+			t.Skipf("git %v unavailable in this environment: %v %s", args, err, stderr.String())
+		}
+	}
+
+	normalRel := filepath.Join("cmd", "looperd", "main.go")
+	skipRel := filepath.Join("tools", "print-version-json", "main.go")
+	for _, rel := range []string{normalRel, skipRel} {
+		if err := os.MkdirAll(filepath.Join(root, filepath.Dir(rel)), 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", rel, err)
+		}
+		if err := os.WriteFile(filepath.Join(root, rel), []byte("package main\n"), 0o644); err != nil {
+			t.Fatalf("write %s: %v", rel, err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(root, "go.mod"), []byte("module github.com/MumuTW/looper\n\ngo 1.24\n"), 0o644); err != nil {
+		t.Fatalf("write go.mod: %v", err)
+	}
+	for _, args := range [][]string{
+		{"add", normalRel, skipRel, "go.mod"},
+		{"commit", "--no-gpg-sign", "-m", "seed"},
+	} {
+		cmd := exec.Command("git", append([]string{"-C", root}, args...)...)
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		if err := cmd.Run(); err != nil {
+			t.Fatalf("git %v: %v %s", args, err, stderr.String())
+		}
+	}
+
+	// Mark skipRel skip-worktree but leave the file on disk; `git ls-files -t`
+	// would tag it S, but it is a real, parseable source file.
+	skip := exec.Command("git", "-C", root, "update-index", "--skip-worktree", filepath.ToSlash(skipRel))
+	var skipStderr bytes.Buffer
+	skip.Stderr = &skipStderr
+	if err := skip.Run(); err != nil {
+		t.Skipf("git update-index --skip-worktree unavailable: %v %s", err, skipStderr.String())
+	}
+	if _, err := os.Stat(filepath.Join(root, skipRel)); err != nil {
+		t.Fatalf("skip-worktree file %s must remain present: %v", skipRel, err)
+	}
+
+	files, err := trackedGoFiles(root)
+	if err != nil {
+		t.Fatalf("trackedGoFiles: %v", err)
+	}
+	wantNormal := filepath.ToSlash(normalRel)
+	wantSkip := filepath.ToSlash(skipRel)
+	foundNormal, foundSkip := false, false
+	for _, f := range files {
+		slash := filepath.ToSlash(f)
+		if slash == wantNormal {
+			foundNormal = true
+		}
+		if slash == wantSkip {
+			foundSkip = true
+		}
+	}
+	if !foundNormal {
+		t.Fatalf("trackedGoFiles = %v, want normal file %q listed", files, wantNormal)
+	}
+	if !foundSkip {
+		t.Fatalf("trackedGoFiles = %v, want present skip-worktree file %q listed", files, wantSkip)
+	}
+}
+
+// TestTrackedGoFilesPreservesGitExecFailure verifies that when root is a real
+// checkout but the git executable cannot be started, the execution failure is
+// preserved instead of being masked as errNotAGitRepo, so the migration guard
+// fails loud rather than silently skipping.
+func TestTrackedGoFilesPreservesGitExecFailure(t *testing.T) {
+	root := t.TempDir()
+	for _, args := range [][]string{
+		{"init"},
+		{"config", "user.email", "test@example.com"},
+		{"config", "user.name", "test"},
+	} {
+		cmd := exec.Command("git", append([]string{"-C", root}, args...)...)
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		if err := cmd.Run(); err != nil {
+			t.Skipf("git %v unavailable in this environment: %v %s", args, err, stderr.String())
+		}
+	}
+	trackedRel := filepath.Join("cmd", "looperd", "main.go")
+	if err := os.MkdirAll(filepath.Join(root, filepath.Dir(trackedRel)), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, trackedRel), []byte("package main\n"), 0o644); err != nil {
+		t.Fatalf("write tracked file: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "go.mod"), []byte("module github.com/MumuTW/looper\n\ngo 1.24\n"), 0o644); err != nil {
+		t.Fatalf("write go.mod: %v", err)
+	}
+	for _, args := range [][]string{
+		{"add", trackedRel, "go.mod"},
+		{"commit", "--no-gpg-sign", "-m", "seed"},
+	} {
+		cmd := exec.Command("git", append([]string{"-C", root}, args...)...)
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		if err := cmd.Run(); err != nil {
+			t.Fatalf("git %v: %v %s", args, err, stderr.String())
+		}
+	}
+
+	// Make git unstartable for child processes and confirm the guard does not
+	// collapse the execution failure into errNotAGitRepo.
+	t.Setenv("PATH", "")
+	if _, err := exec.LookPath("git"); err == nil {
+		t.Skip("git still resolvable with empty PATH; cannot simulate exec failure")
+	}
+	_, err := trackedGoFiles(root)
+	if errors.Is(err, errNotAGitRepo) {
+		t.Fatalf("trackedGoFiles masked a git exec failure as errNotAGitRepo; execution failures must be preserved: %v", err)
+	}
+	if err == nil {
+		t.Fatalf("trackedGoFiles unexpectedly succeeded with git unavailable")
+	}
+}
+
 // TestTrackedGoFilesNotARepo verifies the scan authority fails closed with
-// errNotAGitRepo when root is not a Git worktree, so the migration guard skips
-// cleanly instead of requiring VCS metadata.
+// errNotAGitRepo when root is genuinely outside a Git worktree (git ran and
+// reported as much), so the migration guard skips cleanly instead of requiring
+// VCS metadata. If git itself is unavailable the case is undecidable and skipped.
 func TestTrackedGoFilesNotARepo(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skipf("git unavailable; cannot determine non-repo behavior: %v", err)
+	}
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "go.mod"), []byte("module github.com/MumuTW/looper\n\ngo 1.24\n"), 0o644); err != nil {
 		t.Fatalf("write go.mod: %v", err)
