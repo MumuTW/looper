@@ -1221,6 +1221,14 @@ func mergeRoleConfigs(config *RoleConfigs, partial PartialRoleConfigs) {
 	if partial.Deployer != nil {
 		mergeDeployerRoleConfig(&config.Deployer, *partial.Deployer)
 	}
+	if partial.Auditor != nil {
+		if partial.Auditor.Enabled != nil {
+			config.Auditor.Enabled = *partial.Auditor.Enabled
+		}
+		if partial.Auditor.WindowMinutes != nil {
+			config.Auditor.WindowMinutes = *partial.Auditor.WindowMinutes
+		}
+	}
 	if partial.Gatekeeper != nil && partial.Gatekeeper.Trust != nil {
 		config.Gatekeeper.Trust = GatekeeperTrustLevel(strings.TrimSpace(string(*partial.Gatekeeper.Trust)))
 	}
@@ -2008,6 +2016,18 @@ func clonePartialRoleConfigs(configs *PartialRoleConfigs) *PartialRoleConfigs {
 			gatekeeper.Trust = &trust
 		}
 		cloned.Gatekeeper = &gatekeeper
+	}
+	if configs.Auditor != nil {
+		auditor := *configs.Auditor
+		if configs.Auditor.Enabled != nil {
+			enabled := *configs.Auditor.Enabled
+			auditor.Enabled = &enabled
+		}
+		if configs.Auditor.WindowMinutes != nil {
+			window := *configs.Auditor.WindowMinutes
+			auditor.WindowMinutes = &window
+		}
+		cloned.Auditor = &auditor
 	}
 	if configs.Coordinator != nil {
 		coordinator := *configs.Coordinator

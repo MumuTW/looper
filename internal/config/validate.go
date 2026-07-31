@@ -266,6 +266,7 @@ func validateCoreConfig(config Config, issues *[]ValidationIssue) {
 	validateLoggingAndNotificationConfig(config, issues)
 	validateHITLConfig(config.HITL, issues)
 	validateGatekeeperRoleConfig(config.Roles.Gatekeeper, "roles.gatekeeper", config.Roles.Reviewer.AutoMerge.Enabled, issues)
+	validateAuditorRoleConfig(config.Roles.Auditor, "roles.auditor", issues)
 	validateDeployerRoleConfig(config.Roles.Deployer, "roles.deployer", issues)
 	for i, project := range config.Projects {
 		if project.Roles == nil || project.Roles.Deployer == nil {
@@ -274,6 +275,19 @@ func validateCoreConfig(config Config, issues *[]ValidationIssue) {
 		role := config.Roles.Deployer
 		MergeDeployerRoleConfig(&role, *project.Roles.Deployer)
 		validateDeployerRoleConfig(role, fmt.Sprintf("projects[%d].roles.deployer", i), issues)
+	}
+	for i, project := range config.Projects {
+		if project.Roles == nil || project.Roles.Auditor == nil {
+			continue
+		}
+		role := config.Roles.Auditor
+		if project.Roles.Auditor.Enabled != nil {
+			role.Enabled = *project.Roles.Auditor.Enabled
+		}
+		if project.Roles.Auditor.WindowMinutes != nil {
+			role.WindowMinutes = *project.Roles.Auditor.WindowMinutes
+		}
+		validateAuditorRoleConfig(role, fmt.Sprintf("projects[%d].roles.auditor", i), issues)
 	}
 	for i, project := range config.Projects {
 		if project.Roles == nil || project.Roles.Gatekeeper == nil || project.Roles.Gatekeeper.Trust == nil {
@@ -290,6 +304,12 @@ func validateCoreConfig(config Config, issues *[]ValidationIssue) {
 	validateIntakeConfig(config, issues)
 	validateDaemonConfig(config.Daemon, issues)
 	validatePackageAndDefaultsConfig(config, issues)
+}
+
+func validateAuditorRoleConfig(auditor AuditorRoleConfig, path string, issues *[]ValidationIssue) {
+	if auditor.Enabled && auditor.WindowMinutes <= 0 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".windowMinutes", Message: "must be a positive integer when auditor is enabled"})
+	}
 }
 
 func validateServerConfig(server ServerConfig, issues *[]ValidationIssue) {

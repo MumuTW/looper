@@ -186,6 +186,7 @@ func DefaultConfig(cwd string) (Config, error) {
 		},
 		Instructions: InstructionsConfig{Enabled: true, MaxBytes: 8192},
 		Roles: RoleConfigs{
+			Auditor: AuditorRoleConfig{Enabled: false, WindowMinutes: 60},
 			Coordinator: CoordinatorRoleConfig{
 				Enabled:      false,
 				PollInterval: "5m",

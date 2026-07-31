@@ -653,6 +653,7 @@ type RoleConfigs struct {
 	Worker      WorkerRoleConfig      `json:"worker"`
 	Coordinator CoordinatorRoleConfig `json:"coordinator"`
 	Gatekeeper  GatekeeperRoleConfig  `json:"gatekeeper"`
+	Auditor     AuditorRoleConfig     `json:"auditor"`
 	Deployer    DeployerRoleConfig    `json:"deployer"`
 }
 
@@ -695,6 +696,14 @@ const (
 type GatekeeperRoleConfig struct {
 	// Trust is the merge authority level. Empty defaults to observe.
 	Trust GatekeeperTrustLevel `json:"trust,omitempty"`
+}
+
+// AuditorRoleConfig configures the opt-in Post-merge Auditor. It remains
+// disabled by default because watching default-branch checks changes operator
+// workload even though the Auditor never merges or pushes a revert itself.
+type AuditorRoleConfig struct {
+	Enabled       bool `json:"enabled"`
+	WindowMinutes int  `json:"windowMinutes"`
 }
 
 type ProjectRefConfig struct {
@@ -1280,6 +1289,11 @@ type PartialGatekeeperRoleConfig struct {
 	Trust *GatekeeperTrustLevel `json:"trust,omitempty"`
 }
 
+type PartialAuditorRoleConfig struct {
+	Enabled       *bool `json:"enabled,omitempty"`
+	WindowMinutes *int  `json:"windowMinutes,omitempty"`
+}
+
 type PartialRoleConfigs struct {
 	// Coding holds TOML-authored coding-role overlays
 	// (`[roles.coding.<shipped-role>]`). It is global-only:
@@ -1293,6 +1307,7 @@ type PartialRoleConfigs struct {
 	Worker      *PartialWorkerRoleConfig           `json:"worker,omitempty"`
 	Coordinator *PartialCoordinatorRoleConfig      `json:"coordinator,omitempty"`
 	Gatekeeper  *PartialGatekeeperRoleConfig       `json:"gatekeeper,omitempty"`
+	Auditor     *PartialAuditorRoleConfig          `json:"auditor,omitempty"`
 	Deployer    *PartialDeployerRoleConfig         `json:"deployer,omitempty"`
 	// Deprecated: sweeper was retired and is ignored when present in older configs.
 	Sweeper *map[string]any `json:"sweeper,omitempty"`
