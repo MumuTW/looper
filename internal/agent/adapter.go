@@ -89,7 +89,13 @@ var runtimeAdapters = map[config.AgentVendor]runtimeAdapter{
 		resolveStartArgs: func(cfg ExecutorConfig, args []string, _ string, prompt string) []string {
 			return resolveDevinArgs(cfg, args, prompt)
 		},
-		enforceToolNetworkDenied: enforceDevinToolNetworkDenied,
+		// enforceToolNetworkDenied is intentionally absent: the captured Devin
+		// CLI 3000.3.22 evidence (docs/research/devin-cli-3000.3.22.md) lists
+		// strict tool-network containment as a no-go, and no integration check
+		// has demonstrated that a supported CLI version actually denies a
+		// network probe from an exec tool. Leaving the hook unregistered keeps
+		// the validation gate fail-closed for devin rather than asserting an
+		// unverified security boundary from generated argument/config shapes.
 	},
 }
 
