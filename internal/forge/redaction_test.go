@@ -1,6 +1,7 @@
 package forge
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -24,17 +25,17 @@ func configWithProjectDeploySecret() config.Config {
 	}
 }
 
-// Driven through marshalTrustedReviewConfigSnapshot rather than the redaction
-// helper, because the helper being correct proves nothing about whether the
-// snapshot path still calls it. A caller that stops using it, or reintroduces an
-// in-place clear beside it, has to fail here.
+// The snapshot is returned as a detached config so the test observes the
+// production boundary directly. A caller that stops using the helper, or
+// reintroduces an in-place clear beside it, has to fail here.
 func TestTrustedReviewSnapshotWithholdsDeployCredentials(t *testing.T) {
 	t.Parallel()
 	source := configWithProjectDeploySecret()
 
-	encoded, err := marshalTrustedReviewConfigSnapshot(source)
+	snapshot := trustedReviewConfigSnapshot(source)
+	encoded, err := json.Marshal(snapshot)
 	if err != nil {
-		t.Fatalf("marshalTrustedReviewConfigSnapshot() error = %v", err)
+		t.Fatalf("json.Marshal(snapshot) error = %v", err)
 	}
 
 	if strings.Contains(string(encoded), deploySecret) {
@@ -53,9 +54,7 @@ func TestTrustedReviewSnapshotLeavesTheLiveConfigurationIntact(t *testing.T) {
 	t.Parallel()
 	source := configWithProjectDeploySecret()
 
-	if _, err := marshalTrustedReviewConfigSnapshot(source); err != nil {
-		t.Fatalf("marshalTrustedReviewConfigSnapshot() error = %v", err)
-	}
+	_ = trustedReviewConfigSnapshot(source)
 
 	if source.Roles.Deployer.Environment["GLOBAL_DEPLOY_TOKEN"] != deploySecret {
 		t.Fatal("minting a snapshot erased the global deploy credentials")
@@ -75,13 +74,15 @@ func TestTrustedReviewSnapshotIsRepeatable(t *testing.T) {
 	t.Parallel()
 	source := configWithProjectDeploySecret()
 
-	first, err := marshalTrustedReviewConfigSnapshot(source)
+	firstSnapshot := trustedReviewConfigSnapshot(source)
+	secondSnapshot := trustedReviewConfigSnapshot(source)
+	first, err := json.Marshal(firstSnapshot)
 	if err != nil {
-		t.Fatalf("first marshal error = %v", err)
+		t.Fatalf("first snapshot marshal error = %v", err)
 	}
-	second, err := marshalTrustedReviewConfigSnapshot(source)
+	second, err := json.Marshal(secondSnapshot)
 	if err != nil {
-		t.Fatalf("second marshal error = %v", err)
+		t.Fatalf("second snapshot marshal error = %v", err)
 	}
 
 	if string(first) != string(second) {
@@ -99,9 +100,10 @@ func TestTrustedReviewSnapshotWithholdsEveryProcessSecret(t *testing.T) {
 	source.Agent.Env = map[string]string{"AGENT_SECRET": "agent-secret-value"}
 	source.Daemon.Environment = map[string]string{"DAEMON_SECRET": "daemon-secret-value"}
 
-	encoded, err := marshalTrustedReviewConfigSnapshot(source)
+	snapshot := trustedReviewConfigSnapshot(source)
+	encoded, err := json.Marshal(snapshot)
 	if err != nil {
-		t.Fatalf("marshalTrustedReviewConfigSnapshot() error = %v", err)
+		t.Fatalf("json.Marshal(snapshot) error = %v", err)
 	}
 
 	for _, secret := range []string{token, "agent-secret-value", "daemon-secret-value", deploySecret} {

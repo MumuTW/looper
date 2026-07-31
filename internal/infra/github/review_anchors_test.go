@@ -202,6 +202,26 @@ func TestBuildLocalPathAnchorIndexPassesLiteralPathspecs(t *testing.T) {
 	}
 }
 
+func TestBuildLocalPathAnchorIndexPassesGatewayEnvironmentToGit(t *testing.T) {
+	t.Parallel()
+
+	const expected = "GIT_OBJECT_DIRECTORY=/daemon/objects"
+	var gotEnv map[string]string
+	gateway := New(Options{
+		GHPath:  "gh",
+		GitPath: "git",
+		Env:     map[string]string{"GIT_OBJECT_DIRECTORY": "/daemon/objects"},
+		GitRun: func(_ context.Context, options shell.Options) (shell.Result, error) {
+			gotEnv = options.Env
+			return shell.Result{Stdout: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"}, nil
+		},
+	})
+	_, _ = gateway.runGitForReviewAnchors(context.Background(), t.TempDir(), "rev-parse", "--verify", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa^{commit}")
+	if gotEnv["GIT_OBJECT_DIRECTORY"] != "/daemon/objects" {
+		t.Fatalf("git environment = %v, want %s", gotEnv, expected)
+	}
+}
+
 func TestBuildReviewAnchorIndexRejectsLocalBaseHeadMismatch(t *testing.T) {
 	t.Parallel()
 
