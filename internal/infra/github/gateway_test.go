@@ -487,6 +487,31 @@ func TestGatewayPullRequestProfilesAvoidUnboundedHistoryFields(t *testing.T) {
 	}
 }
 
+func TestGatewayGatekeeperReadsChangedFiles(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		if !strings.HasPrefix(args, "pr view 42 --repo acme/looper --json ") {
+			t.Fatalf("unexpected gh args: %q", args)
+		}
+		if !strings.Contains(args, "files") {
+			t.Fatalf("gatekeeper fields = %q, want files", args)
+		}
+		return shell.Result{Stdout: `{"number":42,"state":"OPEN","isDraft":false,"headRefName":"feature","baseRefName":"main","headRefOid":"head-1","baseRefOid":"base-1","files":[{"path":"./internal/gatekeeper/runner.go"},{"filename":"docs/README.md"},{"path":"internal/gatekeeper/runner.go"}]}`}, nil
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	detail, err := gateway.ViewPullRequestForGatekeeper(context.Background(), ViewPullRequestInput{Repo: "acme/looper", PRNumber: 42})
+	if err != nil {
+		t.Fatalf("ViewPullRequestForGatekeeper() error = %v", err)
+	}
+	want := []string{"internal/gatekeeper/runner.go", "docs/README.md"}
+	if !slices.Equal(detail.ChangedFiles, want) {
+		t.Fatalf("ChangedFiles = %#v, want %#v", detail.ChangedFiles, want)
+	}
+}
+
 func TestGatewayFixerDiscoveryProjectsPaginatedCommentsAboveShellCap(t *testing.T) {
 	t.Parallel()
 

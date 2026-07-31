@@ -21,9 +21,11 @@ import (
 const maxSkipAge = 30 * time.Minute
 
 // sourceFingerprint summarises everything about a pull request that the shared
-// discovery list page can observe. One list call already carries these fields for
-// every open pull request, so comparing them costs nothing beyond the call the
-// lane already makes.
+// discovery list page can observe, plus the protected-path policy that is applied
+// to it. One list call already carries the pull-request fields for every open
+// pull request, so comparing them costs nothing beyond the call the lane already
+// makes. Including the policy prevents a config reload from reusing a report made
+// under a different protected-path set.
 //
 // Deliberately excluded: check-run state. `gh pr list` does not carry it, and a
 // check completing moves neither UpdatedAt nor any field here — which is why
@@ -42,9 +44,14 @@ const maxSkipAge = 30 * time.Minute
 // every base-branch commit invalidate the cached report for every open pull
 // request, paying for a full re-evaluation (and its forge round trips) to
 // recompute a verdict that cannot have changed.
-func sourceFingerprint(pullRequest githubinfra.PullRequestSummary, budgetEnabled bool, reviewPolicyEnabled ...bool) string {
+func sourceFingerprint(pullRequest githubinfra.PullRequestSummary, budgetEnabled bool, protectedPaths []string, reviewPolicyEnabled ...bool) string {
 	labels := append([]string(nil), pullRequest.Labels...)
 	sort.Strings(labels)
+	paths := make([]string, 0, len(protectedPaths))
+	for _, protectedPath := range protectedPaths {
+		paths = append(paths, normalizeRepositoryPath(protectedPath))
+	}
+	sort.Strings(paths)
 	fields := []string{
 		pullRequest.HeadSHA,
 		pullRequest.UpdatedAt,
@@ -54,6 +61,7 @@ func sourceFingerprint(pullRequest githubinfra.PullRequestSummary, budgetEnabled
 		fmt.Sprintf("%t", pullRequest.IsDraft),
 		fmt.Sprintf("%t", pullRequest.HasConflicts),
 		strings.Join(labels, ","),
+		strings.Join(paths, ","),
 	}
 	reviewPolicy := len(reviewPolicyEnabled) > 0 && reviewPolicyEnabled[0]
 	if budgetEnabled || reviewPolicy {
@@ -70,7 +78,7 @@ func sourceFingerprint(pullRequest githubinfra.PullRequestSummary, budgetEnabled
 // Gatekeeper's skip authority the single definition; consumers must not
 // reconstruct the field order independently.
 func SourceFingerprint(pullRequest githubinfra.PullRequestSummary, budgetEnabled bool) string {
-	return sourceFingerprint(pullRequest, budgetEnabled)
+	return sourceFingerprint(pullRequest, budgetEnabled, nil)
 }
 
 // checkReasonCodes are the gate reasons that resolve on their own, without

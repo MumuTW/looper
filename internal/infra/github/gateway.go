@@ -39,7 +39,7 @@ var (
 	prViewMetadataJSONFields   = []string{"number", "title", "body", "url", "state", "createdAt", "updatedAt", "closedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "mergeStateStatus"}
 	prViewFixerJSONFields      = []string{"number", "title", "body", "url", "state", "createdAt", "updatedAt", "closedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "statusCheckRollup", "mergeStateStatus"}
 	prViewReviewerJSONFields   = []string{"number", "title", "body", "url", "state", "createdAt", "updatedAt", "closedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "reviews", "statusCheckRollup", "mergeStateStatus"}
-	prViewGatekeeperJSONFields = []string{"number", "state", "closedAt", "mergedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "additions", "deletions", "mergeStateStatus", "changedFiles", "closingIssuesReferences"}
+	prViewGatekeeperJSONFields = []string{"number", "state", "closedAt", "mergedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "additions", "deletions", "mergeStateStatus", "changedFiles", "closingIssuesReferences", "files"}
 )
 
 var prNumberURLPattern = regexp.MustCompile(`/pull/(\d+)(?:/|$)`)
@@ -179,6 +179,7 @@ type PullRequestDetail struct {
 	Reviews            []map[string]any
 	Checks             []map[string]any
 	DiffStats          *PullRequestDiffStats `json:"diffStats,omitempty"`
+	ChangedFiles       []string
 	Mergeable          *bool
 	MergeableState     MergeabilityState
 	MergedAt           string
@@ -1990,6 +1991,7 @@ func pullRequestDetailFromViewRow(row map[string]any, threads []map[string]any, 
 		Reviews:            toObjectSlice(row["reviews"]),
 		Checks:             toObjectSlice(row["statusCheckRollup"]),
 		DiffStats:          pullRequestDiffStatsFromRow(row),
+		ChangedFiles:       extractPullRequestFilePaths(row["files"]),
 		Mergeable:          boolPtrFromValue(row["mergeable"]),
 		MergeableState:     ParseMergeabilityState(firstNonEmpty(asString(row["mergeable_state"]), asString(row["mergeStateStatus"]))),
 		MergedAt:           firstNonEmpty(asString(row["mergedAt"]), asString(row["merged_at"])),
@@ -4879,6 +4881,40 @@ func extractLabelNamesFromConnection(value any) []string {
 		return []string{}
 	}
 	return extractLabelNames(row["nodes"])
+}
+
+func extractPullRequestFilePaths(value any) []string {
+	items, _ := value.([]any)
+	if len(items) == 0 {
+		if rows, ok := value.([]map[string]any); ok {
+			items = make([]any, 0, len(rows))
+			for _, row := range rows {
+				items = append(items, row)
+			}
+		}
+	}
+	paths := make([]string, 0, len(items))
+	seen := make(map[string]struct{}, len(items))
+	for _, rawItem := range items {
+		var path string
+		switch item := rawItem.(type) {
+		case map[string]any:
+			path = firstNonEmpty(asString(item["path"]), asString(item["filename"]))
+		case string:
+			path = item
+		}
+		path = strings.TrimSpace(path)
+		if path == "" {
+			continue
+		}
+		path = strings.TrimPrefix(strings.ReplaceAll(path, "\\", "/"), "./")
+		if _, exists := seen[path]; exists {
+			continue
+		}
+		seen[path] = struct{}{}
+		paths = append(paths, path)
+	}
+	return paths
 }
 
 func normalizeGitHubLogin(login string) string {

@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"reflect"
 	"regexp"
@@ -305,7 +306,7 @@ func validateCoreConfig(config Config, issues *[]ValidationIssue) {
 		validateAuditorRoleConfig(role, fmt.Sprintf("projects[%d].roles.auditor", i), issues)
 	}
 	for i, project := range config.Projects {
-		if project.Roles == nil || project.Roles.Gatekeeper == nil {
+		if project.Roles == nil || project.Roles.Gatekeeper == nil || (project.Roles.Gatekeeper.Trust == nil && project.Roles.Gatekeeper.DiffBudget == nil && project.Roles.Gatekeeper.ProtectedPaths == nil && project.Roles.Gatekeeper.RequiredReviewChangedLines == nil) {
 			continue
 		}
 		roles := ProjectRoleConfigs(config, project.ID)
@@ -313,9 +314,12 @@ func validateCoreConfig(config Config, issues *[]ValidationIssue) {
 		if project.Roles.Reviewer != nil && project.Roles.Reviewer.AutoMerge != nil && project.Roles.Reviewer.AutoMerge.Enabled != nil {
 			reviewerAutoMerge = *project.Roles.Reviewer.AutoMerge.Enabled
 		}
-		validateGatekeeperRoleConfig(
-			roles.Gatekeeper,
-			fmt.Sprintf("projects[%d].roles.gatekeeper", i), reviewerAutoMerge, issues)
+		role := config.Roles.Gatekeeper
+		mergeGatekeeperRoleConfig(&role, *project.Roles.Gatekeeper)
+		validateGatekeeperRoleConfig(role, fmt.Sprintf("projects[%d].roles.gatekeeper", i), reviewerAutoMerge, issues)
+		validatePartialGatekeeperDiffBudget(
+			project.Roles.Gatekeeper.DiffBudget,
+			fmt.Sprintf("projects[%d].roles.gatekeeper.diffBudget", i), issues)
 	}
 	validateIntakeConfig(config, issues)
 	validateDaemonConfig(config.Daemon, issues)
@@ -699,6 +703,29 @@ func validateGatekeeperRoleConfig(gatekeeper GatekeeperRoleConfig, path string, 
 	}
 	if gatekeeper.RequiredReviewChangedLines < 0 {
 		*issues = append(*issues, ValidationIssue{Path: path + ".requiredReviewChangedLines", Message: "must be zero (to disable the threshold) or a positive integer"})
+	}
+	validateProtectedPathPatterns(gatekeeper.ProtectedPaths, path+".protectedPaths", issues)
+}
+
+func validateProtectedPathPatterns(patterns []string, pathPrefix string, issues *[]ValidationIssue) {
+	for index, pattern := range patterns {
+		trimmed := strings.TrimSpace(pattern)
+		itemPath := fmt.Sprintf("%s[%d]", pathPrefix, index)
+		if trimmed == "" {
+			*issues = append(*issues, ValidationIssue{Path: itemPath, Message: "must be a non-empty repository-relative glob"})
+			continue
+		}
+		if trimmed != pattern {
+			*issues = append(*issues, ValidationIssue{Path: itemPath, Message: "must not contain leading or trailing whitespace"})
+		}
+		normalized := strings.TrimPrefix(strings.ReplaceAll(trimmed, "\\", "/"), "./")
+		cleaned := path.Clean(normalized)
+		if strings.HasPrefix(normalized, "/") || cleaned == ".." || strings.HasPrefix(cleaned, "../") {
+			*issues = append(*issues, ValidationIssue{Path: itemPath, Message: "must be repository-relative"})
+		}
+		if _, err := path.Match(normalized, "example/path.go"); err != nil {
+			*issues = append(*issues, ValidationIssue{Path: itemPath, Message: "must be a valid glob"})
+		}
 	}
 }
 

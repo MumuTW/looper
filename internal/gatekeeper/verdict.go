@@ -95,6 +95,7 @@ var reasonExplanations = map[ReasonCode]string{
 	ReasonDiffBudgetExceeded:       "the pull request exceeds the configured diff budget",
 	ReasonProviderStateUnavailable: "the forge did not return the state needed to judge this",
 	ReasonProviderStateAmbiguous:   "the forge returned ambiguous state for this",
+	ReasonProtectedPathTouched:     "the pull request changes a path protected from automatic merging",
 }
 
 // BuildVerdictComment renders a report as the comment published at advise.

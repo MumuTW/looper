@@ -69,6 +69,7 @@ const (
 	ReasonDiffBudgetExceeded       ReasonCode = "diff_budget_exceeded"
 	ReasonProviderStateUnavailable ReasonCode = "provider_state_unavailable"
 	ReasonProviderStateAmbiguous   ReasonCode = "provider_state_ambiguous"
+	ReasonProtectedPathTouched     ReasonCode = "protected_path_touched"
 )
 
 type Reason struct {
@@ -124,6 +125,7 @@ type Evidence struct {
 	UnresolvedReviewThreadIDs    []string                     `json:"unresolvedReviewThreadIds"`
 	HoldLabels                   []string                     `json:"holdLabels"`
 	DiffBudget                   *DiffBudgetEvidence          `json:"diffBudget,omitempty"`
+	ProtectedPaths               []string                     `json:"protectedPaths,omitempty"`
 	ReviewerConvergence          *ReviewerConvergenceEvidence `json:"reviewerConvergence,omitempty"`
 	ProjectPolicyPermitsTarget   bool                         `json:"projectPolicyPermitsTarget"`
 	FinalObservedHeadSHA         string                       `json:"finalObservedHeadSha,omitempty"`
@@ -257,7 +259,10 @@ type Options struct {
 	// It is folded into the discovery fingerprint so a policy generation change
 	// invalidates reused success within the skip window.
 	ConfiguredTargetBranch func(projectID string) string
-	LogWarn                func(msg string, fields map[string]any)
+	// ProtectedPathsForProject returns repository-relative globs that require
+	// human review before an auto-trust merge.
+	ProtectedPathsForProject func(projectID string) []string
+	LogWarn                  func(msg string, fields map[string]any)
 }
 
 // Runner is the Merge Gatekeeper: a reactive, agent-free policy Role that
@@ -273,10 +278,12 @@ type Runner struct {
 	labelNamespaceForProject             func(projectID string) (labels.Namespace, bool)
 	policyPermitsTarget                  func(projectID, repo, baseRefName string) bool
 	trustForProject                      func(projectID string) config.GatekeeperTrustLevel
+	mergeStrategyForProject              func(projectID string) config.ReviewerAutoMergeStrategy
 	diffBudgetForProject                 func(projectID string) config.GatekeeperDiffBudget
 	requiredReviewChangedLinesForProject func(projectID string) int
 	reviewEvidenceLookup                 reviewEvidenceLookup
 	configuredTargetBranch               func(projectID string) string
+	protectedPathsForProject             func(projectID string) []string
 	logWarn                              func(msg string, fields map[string]any)
 	lastPublishedStatusMu                sync.Mutex
 	lastPublishedStatus                  map[string]string
@@ -299,11 +306,12 @@ func New(options Options) *Runner {
 	}
 	return &Runner{
 		repos: options.Repos, github: options.GitHub, now: now, policyPermitsTarget: policy,
-		trustForProject: options.TrustForProject, diffBudgetForProject: options.DiffBudgetForProject,
+		trustForProject: options.TrustForProject, mergeStrategyForProject: options.MergeStrategyForProject, diffBudgetForProject: options.DiffBudgetForProject,
 		requiredReviewChangedLinesForProject: options.RequiredReviewChangedLinesForProject,
 		reviewEvidenceLookup:                 reviewerReviewEvidenceAppearedSince,
 		labelNamespaceForProject:             options.LabelNamespaceForProject,
 		configuredTargetBranch:               options.ConfiguredTargetBranch,
+		protectedPathsForProject:             options.ProtectedPathsForProject,
 		logWarn:                              options.LogWarn,
 	}
 }
@@ -362,6 +370,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 	configuredTarget := r.configuredTarget(input.ProjectID)
 	reviewThreshold := r.requiredReviewChangedLinesFor(input.ProjectID)
 	reviewPolicyEnabled := trust == config.GatekeeperTrustAuto && reviewThreshold > 0
+	protectedPaths := r.protectedPaths(input.ProjectID)
 	stillOpen := make(map[string]struct{}, len(pullRequests))
 	for _, pullRequest := range pullRequests {
 		// A budget change is a gate-input change even when the PR list page is
@@ -370,7 +379,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		// the fingerprint only while the budget is enabled, so a base advance on
 		// a repo with no configured limit does not invalidate every open report.
 		policyPermits := r.policyPermitsTarget(input.ProjectID, input.Repo, pullRequest.BaseRefName)
-		fingerprint := sourceFingerprint(pullRequest, budgetEnabled, reviewPolicyEnabled) + fmt.Sprintf("\x1fdiff-budget=%d,%d", diffBudget.MaxChangedFiles, diffBudget.MaxDeletions) + fmt.Sprintf("\x1fgatekeeper-trust=%s", trust) + fmt.Sprintf("\x1fconfigured-target=%s", configuredTarget) + fmt.Sprintf("\x1fpolicy-permits=%t", policyPermits) + fmt.Sprintf("\x1freview-threshold=%d", reviewThreshold)
+		fingerprint := sourceFingerprint(pullRequest, budgetEnabled, protectedPaths, reviewPolicyEnabled) + fmt.Sprintf("\x1fdiff-budget=%d,%d", diffBudget.MaxChangedFiles, diffBudget.MaxDeletions) + fmt.Sprintf("\x1fgatekeeper-trust=%s", trust) + fmt.Sprintf("\x1fconfigured-target=%s", configuredTarget) + fmt.Sprintf("\x1fpolicy-permits=%t", policyPermits) + fmt.Sprintf("\x1freview-threshold=%d", reviewThreshold)
 		entityID := fmt.Sprintf("%s#%d", input.Repo, pullRequest.Number)
 		stillOpen[entityID] = struct{}{}
 		previous, hasPrevious := previousReports[entityID]
@@ -765,6 +774,11 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 	// the report an operator later reads to ask whether the merged change was
 	// ever reviewed.
 	report.Evidence.ReviewProvenance = r.observeReviewProvenance(ctx, input)
+
+	if protectedPaths := matchedProtectedPaths(detail.ChangedFiles, r.protectedPaths(input.ProjectID)); len(protectedPaths) > 0 {
+		report.Evidence.ProtectedPaths = protectedPaths
+		report.Reasons = append(report.Reasons, Reason{Code: ReasonProtectedPathTouched, Subject: strings.Join(protectedPaths, ", ")})
+	}
 
 	if report.Evidence.PullRequestState != "OPEN" {
 		report.Reasons = append(report.Reasons, Reason{Code: ReasonPullRequestNotOpen})
@@ -1181,6 +1195,13 @@ func diffBudgetExceededSubject(stats githubinfra.PullRequestDiffStats, budget co
 		parts = append(parts, fmt.Sprintf("deletions %d > max %d", stats.Deletions, budget.MaxDeletions))
 	}
 	return strings.Join(parts, "; ")
+}
+
+func (r *Runner) protectedPaths(projectID string) []string {
+	if r == nil || r.protectedPathsForProject == nil {
+		return nil
+	}
+	return append([]string(nil), r.protectedPathsForProject(projectID)...)
 }
 
 // confirmingKey marks an evaluation as the pass performed immediately before a

@@ -950,6 +950,8 @@ must add the required check before relying on `auto`.
 trust = "auto"
 # additions + deletions; omitted uses the normalized default of 200
 requiredReviewChangedLines = 200
+# Optional repository-relative globs that always require human review.
+protectedPaths = [".github/workflows/*", "internal/migrations/**"]
 ```
 
 `requiredReviewChangedLines` is the additions-plus-deletions threshold for the
@@ -972,6 +974,16 @@ bounded recent-merged-PR scan writes `pr.review.unreviewed` for merged pull
 requests at or above the threshold with no completed/refused evidence. These
 events describe merged **pull requests**, not commits, and remain queryable
 through the existing event API.
+
+`protectedPaths` is empty by default. When it contains gitignore-style globs,
+Gatekeeper reads the pull request's changed files at the observed head and adds
+every matched path to the durable evidence with reason code
+`protected_path_touched`. A matched path blocks an eligible verdict, so an
+`auto` Gatekeeper never merges it; the confirming pass immediately before an
+`auto` merge performs the same file-and-head check again. Patterns with a slash
+are repository-relative; a pattern without a slash (for example `*.sql`) can
+match a file at any directory depth. Project overrides use
+`projects[].roles.gatekeeper.protectedPaths`.
 
 ### The owned comment and its lifecycle
 
