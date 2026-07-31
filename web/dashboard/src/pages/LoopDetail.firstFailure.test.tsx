@@ -165,3 +165,55 @@ describe("LoopDetail secondary issues row", () => {
     expect(row?.textContent).toContain("—");
   });
 });
+
+describe("LoopDetail reviewer convergence", () => {
+  it("shows the durable round budget, open items, and productivity trend", async () => {
+    renderLoopDetail(
+      loopFixture({
+        type: "reviewer",
+        convergence: {
+          policy: {
+            maxConsecutiveUnproductive: 3,
+            maxFixerAttemptsPerItem: 4,
+            maxTotalRounds: 40,
+            severityFloor: "non_blocking",
+          },
+          state: {
+            totalRounds: 5,
+            consecutiveUnproductive: 2,
+            items: {
+              "review-1": {
+                id: "review-1",
+                severity: "blocking",
+                status: "open",
+                fixerAttempts: 1,
+              },
+              "review-2": {
+                id: "review-2",
+                severity: "non_blocking",
+                status: "resolved",
+              },
+            },
+            history: [
+              { number: 4, productive: true, openItemIds: ["review-1"] },
+              { number: 5, productive: false, openItemIds: ["review-1"] },
+            ],
+          },
+          action: "escalate",
+          reason: "stalled",
+          status: "awaiting_human",
+          updatedAt: "2026-07-31T18:00:00.000Z",
+        },
+      }),
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText("Reviewer convergence")).toBeTruthy();
+    });
+    expect(screen.getByText("5 / 40")).toBeTruthy();
+    expect(screen.getByText("2 / 3")).toBeTruthy();
+    expect(screen.getByText("review-1")).toBeTruthy();
+    expect(screen.getByText("#4 productive")).toBeTruthy();
+    expect(screen.getByText("#5 unproductive")).toBeTruthy();
+  });
+});

@@ -263,6 +263,48 @@ export type FixerRunOutcome = {
   partialSuccess?: boolean | null;
 };
 
+export type ReviewerConvergencePolicy = {
+  maxConsecutiveUnproductive: number;
+  maxFixerAttemptsPerItem: number;
+  maxTotalRounds: number;
+  severityFloor: string;
+};
+
+export type ReviewerConvergenceItem = {
+  id: string;
+  severity: string;
+  status: string;
+  fixerResult?: string | null;
+  fixerAttemptKey?: string | null;
+  fixerAttempts?: number;
+  stuck?: boolean;
+};
+
+export type ReviewerConvergenceRound = {
+  number: number;
+  productive: boolean;
+  newItemIds?: string[];
+  closedItemIds?: string[];
+  stuckItemIds?: string[];
+  openItemIds?: string[];
+};
+
+export type ReviewerConvergenceState = {
+  totalRounds: number;
+  consecutiveUnproductive: number;
+  items?: Record<string, ReviewerConvergenceItem>;
+  history?: ReviewerConvergenceRound[];
+};
+
+export type ReviewerConvergence = {
+  policy: ReviewerConvergencePolicy;
+  state: ReviewerConvergenceState;
+  action?: string;
+  reason?: string;
+  status?: string;
+  updatedAt?: string;
+};
+
 export type Loop = {
   id: string;
   seq: number;
@@ -285,6 +327,8 @@ export type Loop = {
   maxAttempts?: number | null;
   lastFailureKind?: string | null;
   lastFailureReason?: string | null;
+  /** Durable Reviewer↔Fixer convergence projection, when recorded. */
+  convergence?: ReviewerConvergence | null;
   /** Latest run's derived outcome, when that run was a fixer run. */
   outcome?: FixerRunOutcome | null;
 };
