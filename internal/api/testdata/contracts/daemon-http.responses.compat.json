@@ -57,7 +57,8 @@
               "channel": "dev",
               "apiVersion": "v1",
               "gitCommitSha": null,
-              "buildTimestamp": null
+              "buildTimestamp": null,
+              "dirty": null
             },
             "daemonMode": "foreground",
             "admissionState": "ready",

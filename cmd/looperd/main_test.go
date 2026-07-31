@@ -3,11 +3,13 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"slices"
 	"syscall"
@@ -54,6 +56,30 @@ func TestRunPrintsVersionWithoutBootstrappingCommandHandling(t *testing.T) {
 
 	if got := stderr.String(); got != "" {
 		t.Fatalf("run([--version]) stderr = %q, want empty string", got)
+	}
+}
+
+func TestRunPrintsCompleteVersionJSONWithoutBootstrapping(t *testing.T) {
+	stdout, stderr := &bytes.Buffer{}, &bytes.Buffer{}
+	bootstrapCalled := false
+	exitCode := runWithDeps([]string{"--version-json"}, stdout, stderr, runDeps{
+		bootstrapImpl: func(context.Context, bootstrap.Options) (bootstrap.Result, error) {
+			bootstrapCalled = true
+			return bootstrap.Result{}, errors.New("bootstrap should not be called")
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("exit = %d, stderr = %q", exitCode, stderr.String())
+	}
+	var got version.Info
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatalf("decode stdout: %v\n%s", err, stdout)
+	}
+	if !reflect.DeepEqual(got, version.Current()) {
+		t.Fatalf("identity = %#v, want %#v", got, version.Current())
+	}
+	if bootstrapCalled {
+		t.Fatal("bootstrapImpl was called for --version-json")
 	}
 }
 

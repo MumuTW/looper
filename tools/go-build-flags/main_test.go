@@ -35,26 +35,30 @@ func TestWorktreeDirty(t *testing.T) {
 		name   string
 		output string
 		err    error
-		want   bool
+		want   *bool
 	}{
-		{name: "no output is clean", output: "", want: false},
-		{name: "whitespace only is clean", output: "\n  \n", want: false},
-		{name: "modified file is dirty", output: " M internal/version/version.go\n", want: true},
-		{name: "untracked file is dirty", output: "?? internal/version/new.go\n", want: true},
-		// A failed probe must not invent dirt: release builds run from a clean
-		// checkout, and a tarball build has no git at all.
-		{name: "probe failure resolves to clean", err: errors.New("exec: git not found"), want: false},
-		{name: "probe failure with output still resolves to clean", output: " M x.go\n", err: errors.New("boom"), want: false},
+		{name: "no output is clean", output: "", want: boolPtr(false)},
+		{name: "whitespace only is clean", output: "\n  \n", want: boolPtr(false)},
+		{name: "modified file is dirty", output: " M internal/version/version.go\n", want: boolPtr(true)},
+		{name: "untracked file is dirty", output: "?? internal/version/new.go\n", want: boolPtr(true)},
+		{name: "probe failure is unknown", err: errors.New("exec: git not found"), want: nil},
+		{name: "probe failure ignores output", output: " M x.go\n", err: errors.New("boom"), want: nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
 			run := func(string, ...string) ([]byte, error) { return []byte(tc.output), tc.err }
-			if got := worktreeDirty(run); got != tc.want {
+			if got := worktreeDirty(run); !equalBoolPtr(got, tc.want) {
 				t.Fatalf("worktreeDirty() = %v, want %v (output=%q err=%v)", got, tc.want, tc.output, tc.err)
 			}
 		})
 	}
+}
+
+func boolPtr(value bool) *bool { return &value }
+
+func equalBoolPtr(left, right *bool) bool {
+	return left == nil && right == nil || left != nil && right != nil && *left == *right
 }
 
 func TestWorktreeDirtyProbesGitStatusPorcelain(t *testing.T) {

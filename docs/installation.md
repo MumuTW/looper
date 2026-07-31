@@ -148,10 +148,12 @@ Manual: replace the binaries. Download the newer `looper-<target>.tar.gz` and `l
 
 ## Compatibility and version policy
 
-- CLI and daemon are published from the same git tag and should normally share the same version
+- CLI and daemon release artifacts are stamped from the same prepared version, git commit, channel, API version, and release timestamp
 - short-lived version skew is allowed while the HTTP API remains compatible
 - management endpoints stay under `/api/v1/*`
-- `looper version` prints the CLI's own version; the daemon reports its version at `GET /api/v1/version` and via `looperd --version`
+- `looper version` and `looperd --version` keep their concise semantic-version output
+- `looper version --json` and `looperd --version-json` print the complete build identity; `dirty` is `null` when a source-tree probe was unavailable rather than claiming the tree was clean
+- `looper version --check-daemon` compares the CLI identity with `GET /api/v1/version` and exits nonzero unless both identities are complete, clean, and every build field matches; dirty or unknown source trees cannot prove equality; add `--json` for a machine-readable `comparable` / `sameBuild` report
 - release builds are tag-driven (`vX.Y.Z` / `vX.Y.Z-rc.N`); local default builds use `0.0.0-dev`
 
 ## Uninstall

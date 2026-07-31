@@ -38,6 +38,9 @@ func TestDefaultBuildOverrides(t *testing.T) {
 	if overrides.BuildTimestamp != "" {
 		t.Fatalf("DefaultBuildOverrides().BuildTimestamp = %q, want empty string", overrides.BuildTimestamp)
 	}
+	if overrides.Dirty != nil {
+		t.Fatalf("DefaultBuildOverrides().Dirty = %v, want nil", overrides.Dirty)
+	}
 }
 
 func TestBuildOverridesFromEnvUsesOptionalBuildMetadata(t *testing.T) {
@@ -86,6 +89,7 @@ func TestBuildOverridesFromEnvUsesOptionalBuildMetadata(t *testing.T) {
 }
 
 func TestLDFlagsMatchesVersionVariables(t *testing.T) {
+	dirty := false
 	ldflags := LDFlags(BuildOverrides{
 		Version:        "1.2.3",
 		VersionSource:  "internal/version/version.go",
@@ -93,9 +97,10 @@ func TestLDFlagsMatchesVersionVariables(t *testing.T) {
 		APIVersion:     "v1",
 		GitCommitSHA:   "abc123",
 		BuildTimestamp: "2026-04-17T00:00:00Z",
+		Dirty:          &dirty,
 	})
 
-	const want = "-X github.com/MumuTW/looper/internal/version.Value=1.2.3 -X github.com/MumuTW/looper/internal/version.VersionSource=internal/version/version.go -X github.com/MumuTW/looper/internal/version.Channel=stable -X github.com/MumuTW/looper/internal/version.APIVersion=v1 -X github.com/MumuTW/looper/internal/version.GitCommitSHA=abc123 -X github.com/MumuTW/looper/internal/version.BuildTimestamp=2026-04-17T00:00:00Z"
+	const want = "-X github.com/MumuTW/looper/internal/version.Value=1.2.3 -X github.com/MumuTW/looper/internal/version.VersionSource=internal/version/version.go -X github.com/MumuTW/looper/internal/version.Channel=stable -X github.com/MumuTW/looper/internal/version.APIVersion=v1 -X github.com/MumuTW/looper/internal/version.GitCommitSHA=abc123 -X github.com/MumuTW/looper/internal/version.BuildTimestamp=2026-04-17T00:00:00Z -X github.com/MumuTW/looper/internal/version.BuildDirty=false"
 	if ldflags != want {
 		t.Fatalf("LDFlags(...) = %q, want %q", ldflags, want)
 	}
@@ -156,6 +161,7 @@ func TestModulePathMigration(t *testing.T) {
 }
 
 func TestLDFlagsInjectIntoBuiltBinary(t *testing.T) {
+	dirty := false
 	tempDir := t.TempDir()
 	outputPath := filepath.Join(tempDir, "print-version")
 
@@ -172,6 +178,7 @@ func TestLDFlagsInjectIntoBuiltBinary(t *testing.T) {
 			APIVersion:     "v1",
 			GitCommitSHA:   "deadbeef",
 			BuildTimestamp: "2026-04-17T12:34:56Z",
+			Dirty:          &dirty,
 		}),
 		"./tools/print-version-json",
 	)
@@ -190,7 +197,7 @@ func TestLDFlagsInjectIntoBuiltBinary(t *testing.T) {
 	}
 
 	got := strings.TrimSpace(string(runOutput))
-	const want = `{"version":"9.9.9","metadata":{"versionSource":"internal/version/version.go","channel":"stable","apiVersion":"v1","gitCommitSha":"deadbeef","buildTimestamp":"2026-04-17T12:34:56Z"}}`
+	const want = `{"version":"9.9.9","metadata":{"versionSource":"internal/version/version.go","channel":"stable","apiVersion":"v1","gitCommitSha":"deadbeef","buildTimestamp":"2026-04-17T12:34:56Z","dirty":false}}`
 	if got != want {
 		t.Fatalf("built helper output = %s, want %s", got, want)
 	}

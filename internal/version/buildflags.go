@@ -1,6 +1,9 @@
 package version
 
-import "strings"
+import (
+	"strconv"
+	"strings"
+)
 
 const (
 	packageImportPath        = "github.com/MumuTW/looper/internal/version"
@@ -19,6 +22,7 @@ type BuildOverrides struct {
 	APIVersion     string
 	GitCommitSHA   string
 	BuildTimestamp string
+	Dirty          *bool
 }
 
 func DefaultBuildOverrides() BuildOverrides {
@@ -29,6 +33,7 @@ func DefaultBuildOverrides() BuildOverrides {
 		APIVersion:     defaultAPIVersion,
 		GitCommitSHA:   "",
 		BuildTimestamp: "",
+		Dirty:          nil,
 	}
 }
 
@@ -59,7 +64,15 @@ func LDFlags(overrides BuildOverrides) string {
 		ldflagAssignment("APIVersion", overrides.APIVersion),
 		ldflagAssignment("GitCommitSHA", overrides.GitCommitSHA),
 		ldflagAssignment("BuildTimestamp", overrides.BuildTimestamp),
+		ldflagAssignment("BuildDirty", optionalBoolString(overrides.Dirty)),
 	}, " ")
+}
+
+func optionalBoolString(value *bool) string {
+	if value == nil {
+		return ""
+	}
+	return strconv.FormatBool(*value)
 }
 
 func ldflagAssignment(name string, value string) string {
