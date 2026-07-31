@@ -429,7 +429,23 @@ normalizes to `NonRetryable`. Deriving the pass-through cases from the same
 inventory `Normalize` consults keeps the unit test and the authority in one
 place: a kind added to `passThroughKinds` is automatically asserted as a
 fixed point here too, and a kind removed from the inventory is automatically
-asserted to fall back to `NonRetryable`. The boundary normalization itself is
+asserted to fall back to `NonRetryable`. The inventory-derived loop alone
+cannot detect a *removal* of a currently supported kind: if an entry such as
+`ManualIntervention` is accidentally dropped from `passThroughKinds`,
+`Normalize` starts converting that production value to `NonRetryable`, the
+inventory loop simply stops covering the removed kind, and the
+downstream-predicate cases (which also iterate `PassThroughKinds()`) drop its
+row — so retry, hold, and persistence behavior silently changes while every
+test stays green. The test therefore also asserts, independently of the
+inventory, that each of the four currently supported authority constants
+(`RetryableTransient`, `RetryableAfterResume`, `NonRetryable`, and
+`ManualIntervention`) is a fixed point of `Normalize` (`Normalize(c) == c`).
+This pins the currently supported pass-through set without requiring every
+future authority constant to pass through: a constant added later is not
+asserted here until it is opted into the inventory, but removing one of the
+four currently supported kinds from `passThroughKinds` makes `Normalize`
+convert it to `NonRetryable` and fails this explicit pin, so the silent
+behavior change is caught. The boundary normalization itself is
 **not**
 covered only by the four-kind per-runner classification tests and alias-identity
 tests in Validation step 6: those assert each runner's persisted kind and retry
@@ -438,11 +454,15 @@ decision for each *known* kind, and every known kind is a fixed point of
 its `Normalize` call and an unknown `loopError.kind` reaches retry or
 persistence unnormalized. The implementation therefore adds a per-runner
 boundary-normalization contract test (Validation step 6) that injects an unknown
-`Kind` through each runner's queue-failure consumption boundary and asserts the
-kind seen by the retry predicate, the breaker's manual-kind check, the
-resume-policy derivation, and queue/checkpoint persistence is `NonRetryable` —
-not the injected unknown value — so a boundary that drops its `Normalize` call is
-caught in the runner that contains it. No structural call-site gate is added.
+`Kind` through **every independent failure-handling entry point** in each runner
+(fixer recovery, deferred pre-start cleanup, resume-validation, and step
+failure; worker recovery, resume-validation, and step failure; reviewer
+claim-setup recovery and step failure; planner recovery and step failure) and
+asserts the kind seen by the retry predicate, the breaker's manual-kind check,
+the resume-policy derivation, and queue/checkpoint persistence is
+`NonRetryable` — not the injected unknown value — so a boundary that drops its
+`Normalize` call is caught in the runner and entry point that contains it. No
+structural call-site gate is added.
 
 ### Step 3 — Audit the cross-package typed surface
 
@@ -811,6 +831,14 @@ advertised bullet token out of the produced prompt using the same
 `- "<value>":` form the `internal/agent` unit test above parses (a leading
 `- `, a double-quoted value, then `:`), and for each parsed advertised value
 asserts `parseFixerBlockedFailureKind(value)` returns `(<kind>, true)`. Because
+the loop body runs only over whatever this duplicated extractor returns, the
+test first asserts the extraction is non-empty and equals the expected
+advertised count (the number of `policy` kinds the builder is documented to
+advertise — two today), so a bullet-format change or a drifted extractor that
+returns no values fails the count assertion before the acceptance loop runs
+rather than passing vacuously; the expected count is derived from the same
+`policy` constants the builder imports, so a builder that gains or loses an
+advertised kind updates the expected count in the same edit. Because
 the loop set is the prompt's actual advertised bullets, if the builder later
 advertises a third `policy` kind — and the `internal/agent` unit test's expected
 set is updated to admit it — this fixer test automatically gains a row for the
@@ -920,7 +948,12 @@ advertised value is honored," not the shared constant import.
   moment a fifth constant is added, letting a partially rolled-out kind reach
   predicates that fall through as unknown; `Normalize` instead defaults an
   unrecognized kind to `NonRetryable` so a new constant is contained to the safe
-  default until consumers explicitly opt in (Step 2, Validation step 6). Recorded
+  default until consumers explicitly opt in (Step 2, Validation step 6). This
+  rejects enumeration over *every* authority constant only; the four currently
+  supported kinds are still pinned as fixed points independently of the
+  `passThroughKinds` inventory (Step 2) so an accidental removal from the
+  inventory cannot silently convert a production value to `NonRetryable`.
+  Recorded
   here per the guideline that the deletion-first attempt be recorded even when
   adopted.
 
@@ -1205,8 +1238,9 @@ contract cases over every `Normalize` pass-through kind (derived from
 `failureclass.PassThroughKinds()`, covering the retry,
 hold, notification, status, and persistence predicates, not only
 `classifyFailure*`) and the per-runner boundary-normalization contract test
-that injects an unknown kind through the queue-failure consumption boundary and
-asserts it reaches those predicates as `NonRetryable` (Validation step 6).
+that injects an unknown kind through every independent failure-handling entry
+point in each runner and asserts it reaches that path's predicates as
+`NonRetryable` (Validation step 6).
 
 No policy drift-detection test is added: Step 5 reverses the leaf dependency so `failureclass` imports `policy`
 and aliases `type Kind = policy.Kind` and re-exports the typed constants at
@@ -1367,7 +1401,12 @@ Per `AGENTS.md`, the root commands are the source of truth:
    at least one role's classification test (including a new
    `internal/reviewer/failure_classification_test.go`), plus a test for
    `failureclass.Normalize` covering the four known kinds (each passes through
-   unchanged) and an unknown kind (normalizes to `NonRetryable`). No
+   unchanged) and an unknown kind (normalizes to `NonRetryable`). The four
+   known kinds are also pinned as fixed points of `Normalize` by an explicit
+   assertion independent of the `passThroughKinds` inventory, so accidentally
+   removing one of them from the inventory (which would make `Normalize`
+   convert it to `NonRetryable`) fails the pin rather than silently changing
+   retry, hold, or persistence behavior. No
    pass-through enumeration assertion is added over *all authority constants*:
    an assertion that forced `Normalize(c) == c` for every authority
    `policy.Kind`/`failureclass.Kind` constant would defeat the unknown-kind
@@ -1430,15 +1469,34 @@ Per `AGENTS.md`, the root commands are the source of truth:
    `loopError.kind` reaches retry or persistence unnormalized. The
    implementation therefore also adds, in each of the four runner packages, a
    per-runner boundary-normalization contract test that injects an unknown
-   `failureclass.Kind` (a value outside the four known constants) through the
-   runner's queue-failure consumption boundary — constructing a `loopError`
-   whose `kind` is the unknown value and driving the failure-handling entry
-   point — and asserts the kind seen by the retry predicate, the breaker's
-   manual-kind check, the resume-policy derivation, and queue/checkpoint
-   persistence is `NonRetryable`, not the injected unknown value. A boundary
-   that drops its `Normalize` call is caught in the runner that contains it,
-   closing the gap the deleted structural gate left without re-adding a
-   producer-side analyzer. Aggregate "each kind appears in at least
+   `failureclass.Kind` (a value outside the four known constants) through
+   **every independent failure-handling entry point** in that runner —
+   constructing a `loopError` whose `kind` is the unknown value and driving
+   each entry point — and asserts the kind seen by the retry predicate, the
+   breaker's manual-kind check, the resume-policy derivation, and
+   queue/checkpoint persistence is `NonRetryable`, not the injected unknown
+   value. These are not single boundaries in the current code, so driving only
+   one entry point per runner can stay green when another path omits its
+   `Normalize` call and persists an unknown kind. The contract test therefore
+   enumerates and exercises each runner's independent entry points: the fixer
+   independently handles failure in `recoverClaimedItem` (recovery before run
+   creation), the deferred pre-start cleanup path (the `defer` in the run-setup
+   that classifies a `retErr` when a pre-start step fails after the run is
+   created), `validateFixerResumeCheckpoint` failure (resume-checkpoint
+   validation), and ordinary step failure (`classifyFailureWithBoundary` in the
+   step loop); the worker independently handles `recoverClaimedItem` (recovery),
+   `validateWorkerResumeCheckpoint` failure (resume-validation), and ordinary
+   step failure (`classifyFailureWithBoundary` in the step loop); the reviewer
+   independently handles `finalizeClaimSetupFailure` (claim-setup recovery) and
+   ordinary step failure (`classifyFailureForProjectAndBoundary` in the step
+   loop); the planner independently handles `recoverClaimedItem` (recovery) and
+   ordinary step failure (`classifyFailureWithBoundary` in the step loop). For
+   each enumerated entry point the test injects the unknown kind through that
+   path's `loopError` construction and asserts the normalized `NonRetryable`
+   reaches that path's retry, breaker, resume-policy, and persistence reads, so
+   a boundary that drops its `Normalize` call is caught in the runner and entry
+   point that contains it, closing the gap the deleted structural gate left
+   without re-adding a producer-side analyzer. Aggregate "each kind appears in at least
    one role" coverage is not sufficient on its own: the four per-runner
    re-export blocks (Step 1) are independent, so wiring one role's
    `FailureManualIntervention` to `failureclass.NonRetryable` still compiles,
@@ -1486,9 +1544,11 @@ Per `AGENTS.md`, the root commands are the source of truth:
    call-site gate that parsed and type-checked each runner package, traced every
    `loopError.kind` assignment to its intra-procedural origin, and failed when a
    dynamic source reached `kind` without being wrapped in `failureclass.Normalize`.
-   Step 2 replaces that gate with a single `failureclass.Normalize` call at each
-   runner's queue-failure consumption boundary, before any retry, breaker, or
-   persistence read. Boundary normalization makes the symptom the gate existed to
+   Step 2 replaces that gate with a `failureclass.Normalize` call at each
+   runner's independent failure-handling entry point (recovery, resume-validation,
+   deferred pre-start cleanup where present, and ordinary step failure), before
+   any retry, breaker, or persistence read. Boundary normalization makes the
+   symptom the gate existed to
    prevent — an unnormalized kind reaching a decision — impossible regardless of
    how the kind was produced, so the gate is redundant and is not implemented; the
    twelve call-site `Normalize` wraps the gate enforced are deleted with it. This
@@ -1556,7 +1616,19 @@ Per `AGENTS.md`, the root commands are the source of truth:
    that drops an advertised kind fails in the fixer package even when the agent
    test and prompt are unchanged; if the builder later advertises a third
    `policy` kind, this test automatically gains a row for it and fails if the
-   parser rejects the new advertised bullet.
+   parser rejects the new advertised bullet. Because the loop body runs only
+   over whatever the duplicated prompt extractor returns, the test first
+   asserts the extraction is **non-empty and equals the expected advertised
+   count** (the number of `policy` kinds the builder is documented to
+   advertise — two today, `policy.RetryableTransient` and
+   `policy.ManualIntervention`), so the loop cannot pass vacuously: if the
+   bullet format changes or this duplicated extractor drifts and returns no
+   values, the count assertion fails before the acceptance loop runs, catching
+   a parser that rejects every advertised value (or a builder/extractor that
+   advertises nothing) rather than silently staying green. The expected count
+   is derived from the same `policy` constants the builder imports, so a
+   builder that gains or loses an advertised kind updates the expected count in
+   the same edit that changes the prompt.
 
 **Definition of done:** `QueueFailureKind` is gone from all four runners (the 60
 type-name references replaced by `failureclass.Kind`), the four `xxxFailureKind`
@@ -1597,15 +1669,21 @@ keep their direct assignments because the boundary normalizes them without a
 per-call-site wrap, and `Normalize` defaults an unrecognized kind to
 `NonRetryable` so a new `policy.Kind` constant is contained to the safe default
 until consumers explicitly opt in (no enumeration assertion forces
-`Normalize(c) == c` for every authority constant) —
+`Normalize(c) == c` for every authority constant; the four currently supported
+kinds are pinned as fixed points independently of the `passThroughKinds`
+inventory so a removal cannot silently change behavior) —
 the
 four-kind regression coverage above exists — including the per-runner
 downstream-predicate contract cases over every `Normalize` pass-through kind
 (derived from `failureclass.PassThroughKinds()`;
 retry, hold, notification, status, and persistence predicates, not only
 `classifyFailure*`) and the per-runner boundary-normalization contract test
-that injects an unknown kind through each runner's queue-failure consumption
-boundary and asserts it reaches those predicates as `NonRetryable` — the
+that injects an unknown kind through **every independent failure-handling
+entry point** in each runner (fixer recovery, deferred pre-start cleanup,
+resume-validation, and step failure; worker recovery, resume-validation, and
+step failure; reviewer claim-setup recovery and step failure; planner recovery
+and step failure) and asserts it reaches that path's predicates as
+`NonRetryable` — the
 fixer-prompt builder coverage test (step 9) exists — exercising
 `AppendFixerCompletionInstruction` for advertised-subset coverage of the
 advertised `failure_kind` tokens via set equality plus per-bullet description
@@ -1620,8 +1698,10 @@ rename-drift half deleted (now compile-time), its
 fixer-package test so the parser's `retryable_after_resume` backward-compatible
 acceptance stays directly asserted, and its advertised-subset ⊆
 parser-allowlist membership contract retained as a fixer-package contract test
-that parses the prompt `AppendFixerCompletionInstruction` produces and asserts
-the parser accepts every advertised value —
+that parses the prompt `AppendFixerCompletionInstruction` produces, asserts the
+extraction is non-empty and equals the expected advertised count (so the
+acceptance loop cannot pass vacuously), and asserts the parser accepts every
+advertised value —
 the full `go test ./...` suite is green, and the diff contains no
 changes to `workflow.Step` types, `failureclass.Classify` logic, or
 `NormalizeResumePolicy` behavior.
