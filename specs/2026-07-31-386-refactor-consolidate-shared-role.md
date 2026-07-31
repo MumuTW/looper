@@ -50,7 +50,8 @@ All four are byte-for-byte equivalent except for the prefix. The conversion
 exists only because the roles declared a distinct type instead of reusing the
 shared one.
 
-A fourth copy of the same shape sits in each role as the failure carrier:
+A fourth copy of the same shape sits in each role as the failure carrier. Three
+of the four are identical:
 
 ```go
 type loopError struct {
@@ -59,8 +60,22 @@ type loopError struct {
 }
 ```
 
-defined identically in fixer (`runner.go:916`), reviewer (`runner.go:606`),
-worker (`runner.go:714`), and planner (`runner.go:478`).
+defined in fixer (`runner.go:916`), worker (`runner.go:714`), and planner
+(`runner.go:478`). The reviewer carrier (`runner.go:606`) is *not* identical: it
+carries an additional `interrupted bool` field that participates in reviewer
+control flow (it records whether the run was interrupted, and is read by the
+reviewer's resume/skip logic), so its shape is:
+
+```go
+type loopError struct {
+    message     string
+    kind        QueueFailureKind
+    interrupted bool
+}
+```
+
+This shape divergence is why the `loopError` extraction trade-off below is not a
+straightforward identical-shape merge; see Alternatives.
 
 ### The step-traversal ledger (secondary)
 
@@ -85,16 +100,26 @@ not a solution to it.
 
 1. **One authority for the failure-kind vocabulary.** `failureclass.Kind`
    becomes the single source for the role runners; the per-role
-   `QueueFailureKind` is removed. The other packages that spell the vocabulary as
-   bare `string` constants or prompt literals — `internal/loops/policy` (two
-   constants), `internal/validation` (three constants, one a bare string), and
-   `internal/agent/prompt.go` (the fixer prompt's advertised literals) — remain
-   separate spellings, each for a concrete dependency reason (`policy` is an
-   intentional stdlib-only leaf so `reviewer/workflow` can depend on it without
-   pulling in the infra stack `failureclass` carries; `validation` and the prompt
-   embed literals in surfaces that cannot take a `failureclass.Kind` typed value),
-   but are pinned to the shared values by drift-detection tests (Steps 5 and 6)
-   rather than by import.
+   `QueueFailureKind` is removed. `internal/validation`'s three `FailureKind*`
+   constants are re-derived directly from `failureclass`
+   (`string(failureclass.*)`) rather than left as a bare-string ledger: every
+   production importer of `internal/validation` (`internal/fixer`,
+   `internal/fixer/failurepolicy`, and `internal/worker`) already imports
+   `failureclass`, and `failureclass` does not import `validation`, so adding the
+   import to `validation` introduces no cycle and no transitive dependency that
+   `validation`'s importers do not already carry. The remaining packages that
+   spell the vocabulary as bare `string` constants or prompt literals —
+   `internal/loops/policy` (two constants) and `internal/agent/prompt.go` (the
+   fixer prompt's advertised literals) — stay separate spellings, each for a
+   concrete dependency reason (`policy` is an intentional stdlib-only leaf so
+   `reviewer/workflow` can depend on it without pulling in the infra stack
+   `failureclass` carries; the prompt embeds literals in prose that cannot take a
+   typed value), and are pinned to the shared values by drift-detection tests
+   (Steps 5 and 6) rather than by import. This is not an exhaustive audit of
+   every bare-string spelling of the vocabulary: additional production consumers
+   and the persisted schema also spell the kinds as bare strings and are
+   explicitly out of scope for this refactor — see the Trade-off "What does it
+   still not catch" for the full inventory and the rationale for deferring them.
 2. **Delete the four `xxxFailureKind` conversion functions.** They exist only
    because of the type split; deleting the type deletes them. Their unknown-kind
    → `non_retryable` fallback is preserved by `failureclass.Normalize` (Step 2).
@@ -157,6 +182,36 @@ removes a compatibility layer rather than retaining one, per the repo's "prefer
 deletion over another layer" guideline, and is what makes the conversion
 functions deletable in the next step.
 
+In the same step, re-derive `internal/validation`'s three `FailureKind*`
+constants directly from `failureclass` instead of leaving them as a bare-string
+ledger. Today
+`validation.FailureKindManualIntervention = loops.FailureKindManualIntervention`
+and `validation.FailureKindRetryableAfterResume = loops.FailureKindRetryableAfterResume`
+(transitively `policy`'s bare strings), while
+`validation.FailureKindRetryableTransient = "retryable_transient"` is a bare
+string with no shared-authority link. Replace all three with direct derivations:
+
+```go
+const (
+    FailureKindManualIntervention   = string(failureclass.ManualIntervention)
+    FailureKindRetryableAfterResume = string(failureclass.RetryableAfterResume)
+    FailureKindRetryableTransient   = string(failureclass.RetryableTransient)
+)
+```
+
+The constants stay untyped `string` (their existing usage in
+`validation.Policy.FailureKind` and the `QueueFailureKind(policy.FailureKind)`
+conversion in `worker.classifyValidationFailure` takes a `string`, not a
+`failureclass.Kind`), so this is a value-only change: each constant still
+resolves to the same string, and `go build` confirms no call site breaks. This
+deletes the validation ledger outright rather than pinning it with a test-only
+synchronization gate, per the repo's "prefer deletion over another layer"
+guideline. Adding the `failureclass` import to `validation` is safe: every
+production importer of `validation` (`internal/fixer`, `internal/fixer/failurepolicy`,
+`internal/worker`) already imports `failureclass`, and `failureclass` does not
+import `validation`, so no cycle is created and no importer gains a transitive
+dependency it did not already carry.
+
 ### Step 2 — Delete the `xxxFailureKind` conversion functions; preserve the unknown-kind fallback
 
 With `QueueFailureKind` gone, `fixerFailureKind`, `reviewerFailureKind`,
@@ -208,32 +263,30 @@ generic abstraction to save ~20 lines per package — a net negative on a
 Low-severity path that has already been patched once. This is recorded here so
 the decision is explicit, not silent.
 
-### Step 5 — Pin the remaining bare-string kind constants to `failureclass` by test
+### Step 5 — Pin the policy bare-string kind constants to `failureclass` by test
 
-Two packages outside `failureclass` still spell the kind vocabulary as bare
+One package outside `failureclass` still spells the kind vocabulary as bare
 `string` constants and cannot import `failureclass` to share the values
 directly:
 
-1. `internal/loops/policy` re-declares two of the four kind strings as plain
-   `string` constants (`FailureKindRetryableAfterResume`,
-   `FailureKindManualIntervention`). `policy` is an intentional stdlib-only leaf
-   (its package doc states this) so that `internal/reviewer/workflow` can depend
-   on it without pulling in the `internal/infra/github` stack that
-   `failureclass` transitively imports.
-2. `internal/validation/validation.go:25-27` re-declares the same vocabulary as
-   `string` constants. Two of the three are already linked to `loops.*`
-   (`FailureKindManualIntervention = loops.FailureKindManualIntervention`,
-   `FailureKindRetryableAfterResume = loops.FailureKindRetryableAfterResume`),
-   but `FailureKindRetryableTransient = "retryable_transient"` is a bare string
-   with no shared-authority link — `loops`/`policy` do not export a
-   `FailureKindRetryableTransient` constant for it to reference. That string
-   flows into `worker.classifyValidationFailure` and
-   `fixer/failurepolicy.ClassifyValidation`; if `failureclass.RetryableTransient`
-   is renamed, those paths treat validation infrastructure failures as an
-   unknown, retry-ineligible kind while the parser follows the new value.
+`internal/loops/policy` re-declares two of the four kind strings as plain
+`string` constants (`FailureKindRetryableAfterResume`,
+`FailureKindManualIntervention`). `policy` is an intentional stdlib-only leaf
+(its package doc states this) so that `internal/reviewer/workflow` can depend on
+it without pulling in the `internal/infra/github` stack that `failureclass`
+transitively imports. Importing `failureclass` would break that leaf property
+for every workflow package, so the values are pinned by test instead of by
+import.
 
-Add drift-detection tests that assert each bare-string spelling matches the
-shared `failureclass` value. For `policy`, the test lives in `internal/loops` —
+(`internal/validation` also re-declared the same vocabulary as bare `string`
+constants, but Step 1 now re-derives those constants directly from
+`failureclass` (`string(failureclass.*)`), deleting that ledger outright rather
+than pinning it by test; see Step 1 for the no-cycle justification. No
+validation drift test is added or needed — a rename of a `failureclass` value
+updates the validation constants at compile time.)
+
+Add a drift-detection test that asserts each `policy` bare-string spelling
+matches the shared `failureclass` value. The test lives in `internal/loops` —
 the umbrella package already imports `policy` in production, and the test adds
 `failureclass` as a test-only import (so no production dependents of `policy`
 pull in the infra stack):
@@ -247,30 +300,11 @@ if policy.FailureKindManualIntervention != string(failureclass.ManualInterventio
 }
 ```
 
-For `validation`, the test lives in `internal/validation`'s test package —
-`validation` already imports `internal/loops` in production, so adding
-`failureclass` as a test-only import introduces no new production dependency and
-no import cycle (`internal/loops` cannot import `internal/validation` back, so
-the assertion must live on the `validation` side):
-
-```go
-if validation.FailureKindRetryableTransient != string(failureclass.RetryableTransient) {
-    t.Fatal("validation.FailureKindRetryableTransient drifted from failureclass.RetryableTransient")
-}
-if validation.FailureKindRetryableAfterResume != string(failureclass.RetryableAfterResume) {
-    t.Fatal("validation.FailureKindRetryableAfterResume drifted from failureclass.RetryableAfterResume")
-}
-if validation.FailureKindManualIntervention != string(failureclass.ManualIntervention) {
-    t.Fatal("validation.FailureKindManualIntervention drifted from failureclass.ManualIntervention")
-}
-```
-
 This catches the silent drift the single-authority goal is about (a rename of
-any shared value leaving `NormalizeResumePolicy` or
-`classifyValidationFailure`/`ClassifyValidation` matching the old spelling)
-without breaking `policy`'s leaf property or changing resume or validation
-behavior. The constants stay `string`; `NormalizeResumePolicy` and the
-validation classification paths keep their current signatures and branches.
+either shared value leaving `NormalizeResumePolicy` matching the old spelling)
+without breaking `policy`'s leaf property or changing resume behavior. The
+constants stay `string`; `NormalizeResumePolicy` keeps its current signature and
+branches.
 
 ### Step 6 — Pin the fixer prompt's advertised literals to `failureclass` by test
 
@@ -312,13 +346,17 @@ test asserts only the advertised subset, not the full parser allowlist.
   either way). Since the deletion is a small mechanical edit and is the cleanest
   end state, retaining the alias would preserve a layer for no benefit, against
   the repo's "prefer deletion over another layer" guideline.
-- **Share `loopError` across roles.** The four `loopError` structs are
-  identical in shape. Extracting a shared `roles.LoopError` is plausible, but
-  each role attaches role-specific skip-error siblings (`holdSkipError`,
-  `labelMismatchSkipError`, `runtimeSkipKind`) and helper methods around it.
-  Pulling the struct out without those neighbors would leave a half-extraction;
-  pulling them all out expands scope well past the failure-kind ledger the issue
-  names. Deferred.
+- **Share `loopError` across roles.** The four `loopError` structs are *not*
+  identical in shape: the reviewer carrier has an additional `interrupted bool`
+  field (see the inventory above) that the other three lack and that participates
+  in reviewer control flow. Extracting a shared `roles.LoopError` is plausible,
+  but the reviewer-specific field means a shared struct either carries an unused
+  `interrupted` field for three roles or forces the reviewer to keep a separate
+  carrier — a half-extraction either way. Each role also attaches role-specific
+  skip-error siblings (`holdSkipError`, `labelMismatchSkipError`,
+  `runtimeSkipKind`) and helper methods around it. Pulling the struct out without
+  those neighbors would leave a half-extraction; pulling them all out expands
+  scope well past the failure-kind ledger the issue names. Deferred.
 - **Generalize the step traversal helpers.** See Step 4 — rejected as net
   negative.
 
@@ -337,10 +375,14 @@ the unknown-kind fallback explicitly.
 
 > What does it still not catch?
 
-Three packages outside `failureclass` spell the kind vocabulary as bare
-`string` constants or literals and cannot share the values by import. Step 5
-pins the first two by drift-detection test; the third (the fixer prompt) is
-pinned by a cross-component test added in Step 6.
+This refactor targets the per-role `QueueFailureKind` ledger and the
+`internal/validation` bare-string ledger (deleted by direct derivation in Step
+1). It is deliberately not a repo-wide audit of every bare-string spelling of
+the vocabulary. The remaining spellings split into two groups: those pinned to
+`failureclass` by test (caught, but not by import), and those explicitly out of
+scope (not caught at all).
+
+**Pinned by drift-detection test (caught, not by import):**
 
 1. `internal/loops/policy`'s two bare string constants
    (`FailureKindRetryableAfterResume`, `FailureKindManualIntervention`) remain a
@@ -359,19 +401,7 @@ pinned by a cross-component test added in Step 6.
    rather than drifting silently. Resume-policy behavior is unchanged: the
    constants stay `string`, and `NormalizeResumePolicy` keeps its current
    signatures and branches.
-2. `internal/validation/validation.go:25-27` re-declares the same vocabulary as
-   `string` constants. Two are already linked to `loops.*`, but
-   `FailureKindRetryableTransient = "retryable_transient"` is a bare string with
-   no shared-authority link. That string flows into
-   `worker.classifyValidationFailure` and `fixer/failurepolicy.ClassifyValidation`;
-   a rename of `failureclass.RetryableTransient` would leave those paths matching
-   the old spelling while the parser follows the new one. Step 5 adds a
-   drift-detection test in `internal/validation` (which already imports
-   `internal/loops` in production and adds `failureclass` as a test-only import)
-   asserting each `validation.FailureKind*` constant equals the corresponding
-   `string(failureclass.*)` value. Validation classification behavior is
-   unchanged.
-3. `internal/agent/prompt.go:55-57` (`AppendFixerCompletionInstruction`) embeds
+2. `internal/agent/prompt.go:55-57` (`AppendFixerCompletionInstruction`) embeds
    `retryable_transient` and `manual_intervention` as string literals in the
    prompt that advertises the `failure_kind` values the fixer agent may report.
    That prompt is the advertising layer for `parseFixerBlockedFailureKind`: the
@@ -387,25 +417,90 @@ pinned by a cross-component test added in Step 6.
    `string(failureclass.ManualIntervention)`, so a rename of either shared value
    fails the suite unless the prompt is updated in the same change.
 
+(`internal/validation`'s three `FailureKind*` constants previously belonged in
+this group; Step 1 now re-derives them directly from `failureclass`, so a rename
+propagates at compile time and no drift test is needed.)
+
+**Explicitly out of scope (not caught — recorded here so a future rename does
+not pass silently):**
+
+3. Several production paths compare or emit the kind vocabulary as bare string
+   literals, independent of `failureclass` and of the per-role
+   `QueueFailureKind`. A rename of a `failureclass.Kind` value would leave these
+   paths on the old spelling while the runners follow the new one, and no test
+   added by this refactor catches that:
+   - `internal/runtime/runtime.go:3671` (`isRuntimeRetryableTransientWithRemainingAttempts`)
+     compares `queue.LastErrorKind` against the literal `"retryable_transient"`.
+   - `internal/api/handler.go:3498` (`isBackingOffQueue`) recognizes only
+     `"retryable_transient"` and `"retryable_after_resume"` for backoff display.
+   - `internal/runtime/scheduler.go:3268,3561-3563,3633-3682` emits and compares
+     bare kind strings (`"retryable_transient"`, `"non_retryable"`) when failing
+     snapshot queue items and deciding retry eligibility.
+   - `internal/storage/repositories.go`'s `longTermRetryPredicateLiteral` /
+     `longTermRetryPredicateParam` embed the kind strings in a SQL predicate.
+   These are read/write surfaces against the *persisted* kind string, not
+   compile-time-typed `failureclass.Kind` values; widening this refactor to
+   re-derive them would touch runtime recovery, the HTTP API, the scheduler, and
+   the storage layer — well past the failure-kind *type* ledger the issue names.
+   They are deferred to a separate, persisted-vocabulary audit that can evaluate
+   a migration against the schema constraint below in the same change.
+4. The persisted SQLite schema constrains `last_error_kind` to the four old
+   string literals. The CHECK constraints in
+   `internal/storage/migrations/0003_scheduler_queue.sql`,
+   `0004_worker_project_target.sql`, and `0016_queue_infinite_retry_attempts.sql`
+   (and the snapshot in `internal/storage/testdata/schema/sqlite-schema.snapshot.sql`)
+   accept only `('retryable_transient', 'retryable_after_resume',
+   'non_retryable', 'manual_intervention')`. A rename of a `failureclass.Kind`
+   value that the runners begin writing would violate this constraint at insert
+   time — a loud failure, not a silent drift, but one that requires a schema
+   migration coordinated with the rename. This refactor adds no migration
+   (Goal 3: no persisted-state change) and does not claim to catch it; a future
+   rename of any `failureclass.Kind` value must carry a matching migration in the
+   same change.
+
 > What is the authority for failure-kind values, and why is it not the agent's
 > own structured output?
 
-There are two authorities, one per production path, and neither is the agent's
-raw structured output. For errors raised inside a runner, `failureclass.Classify`
-is the authority: it maps the error and its boundary to a `Kind`. For the fixer's
-agent-reported *blocked* outcome, `parseFixerBlockedFailureKind` is the
-authority: its allowlist (`manual_intervention`, `retryable_after_resume`,
-`retryable_transient`; everything else rejected as a contract failure) is what
-bounds the agent's `failure_kind` string — `failureclass.Classify` and the
-`xxxFailureKind` conversions are never called on that path. After this refactor
-the agent string is parsed straight into `failureclass.Kind` (the parser's
-return type becomes `failureclass.Kind`), removing the re-wrap while keeping the
-allowlist as the bound. The prompt that advertises those values
-(`AppendFixerCompletionInstruction` in `internal/agent/prompt.go`) is a separate
-spelling of the same vocabulary — it tells the agent what to return, the parser
-bounds what is accepted — and is pinned to `failureclass` by the cross-component
-drift test in Step 6 so the two cannot silently diverge. Infra signals remain
-for drift detection, not authority.
+There is more than one authority for failure-kind values, and none of them is
+the agent's raw structured output. The authorities split by production path:
+
+- For *classifier-mediated* errors — errors raised inside a runner that flow
+  through the shared classifier — `failureclass.Classify` is the authority: it
+  maps the error and its boundary to a `Kind`. This is not the authority for
+  *all* runner-raised errors: several runner paths choose a `Kind` directly
+  without invoking `Classify`, and those paths are themselves the authority for
+  their semantics. Naming them so the consolidation does not mistake them for
+  classifier output:
+  - `internal/reviewer/runner.go:2417` (`refreshThreadResolutionCandidate`)
+    assigns `FailureRetryableAfterResume` directly when the PR's head or state
+    changed during thread reconciliation — a role-specific resume decision, not
+    classifier output.
+  - `internal/worker/runner.go:2815-2833` (`classifyValidationFailure`) derives
+    the validation kind from `validation.PolicyFor` plus hint-based branches
+    (dirty worktree → `manual_intervention`, stale checkpoint →
+    `retryable_after_resume`, timeout → `retryable_transient`) — a role-owned
+    validation classification, not `failureclass.Classify`.
+  - `internal/fixer/failurepolicy/policy.go:20-35` (`ClassifyError`) returns the
+    fixer's role-policy `Decision` (kind + resume policy) from the error and its
+    boundary — a separate role-policy boundary, not the shared `Classify`.
+  These role-specific policies are unchanged by this refactor (a Non-goal); the
+  consolidation only changes the *type* their results are spelled in (from
+  `QueueFailureKind` to `failureclass.Kind`), not the decision logic.
+- For the fixer's agent-reported *blocked* outcome,
+  `parseFixerBlockedFailureKind` is the authority: its allowlist
+  (`manual_intervention`, `retryable_after_resume`, `retryable_transient`;
+  everything else rejected as a contract failure) is what bounds the agent's
+  `failure_kind` string — `failureclass.Classify` and the `xxxFailureKind`
+  conversions are never called on that path. After this refactor the agent
+  string is parsed straight into `failureclass.Kind` (the parser's return type
+  becomes `failureclass.Kind`), removing the re-wrap while keeping the
+  allowlist as the bound. The prompt that advertises those values
+  (`AppendFixerCompletionInstruction` in `internal/agent/prompt.go`) is a
+  separate spelling of the same vocabulary — it tells the agent what to return,
+  the parser bounds what is accepted — and is pinned to `failureclass` by the
+  cross-component drift test in Step 6 so the two cannot silently diverge.
+
+Infra signals remain for drift detection, not authority.
 
 ## Impact
 
@@ -416,18 +511,16 @@ for drift detection, not authority.
 - `internal/planner/runner.go` — delete `QueueFailureKind` + delete `plannerFailureKind` + `s/QueueFailureKind/failureclass.Kind/` + call-site edits.
 - `internal/runtime/scheduler.go` — `workerRunCompletedNotificationInput.FailureKind` becomes `failureclass.Kind` (the one `QueueFailureKind` reference here).
 - `internal/loops/failureclass/failureclass.go` — add `Normalize(kind Kind) Kind` (the authority for the unknown-kind fallback); `Classify` logic unchanged.
+- `internal/validation/validation.go` — re-derive the three `FailureKind*`
+  constants directly from `failureclass` (`string(failureclass.*)`) and add the
+  `failureclass` import; the constants stay untyped `string` so no consumer
+  signature changes (Step 1).
 
 **Files unchanged but verified:**
 - `internal/loops/policy/policy.go` — untouched. Its two string constants stay
   `string` and `NormalizeResumePolicy` keeps its current branches; drift is
   caught by the new test in `internal/loops` (Step 5), not by an import that
   would break `policy`'s stdlib-only leaf property.
-- `internal/validation/validation.go` — untouched. Its three `FailureKind*`
-  constants stay `string` (two already link to `loops.*`; the bare-string
-  `FailureKindRetryableTransient` is left as-is to avoid widening scope into the
-  validation classification path); drift is caught by the new test in
-  `internal/validation` (Step 5), not by an import that would pull
-  `failureclass` into a production dependency.
 - `internal/agent/prompt.go` — untouched. The `retryable_transient` and
   `manual_intervention` literals in `AppendFixerCompletionInstruction` stay as
   prompt text; drift is caught by the new cross-component test in
@@ -446,8 +539,10 @@ of the three asserts all four kinds; they cover `retryable_transient` and
 `retryable_after_resume` or `manual_intervention`. The implementation therefore
 adds the missing focused coverage (see Validation step 6) rather than relying on
 a four-kind net that does not yet exist. New drift-detection tests are added in
-`internal/loops` (policy), `internal/validation` (validation constants), and
-`internal/agent` (fixer prompt literals), per Steps 5 and 6.
+`internal/loops` (policy) and `internal/agent` (fixer prompt literals), per
+Steps 5 and 6; no validation drift test is added because Step 1 re-derives the
+validation constants directly from `failureclass` (a rename propagates at
+compile time).
 
 **No persisted-state change:** The string values written to the queue/run
 records are identical before and after. No migration, no schema touch.
@@ -523,17 +618,14 @@ Per `AGENTS.md`, the root commands are the source of truth:
      exit 1
    fi
    ```
-8. **Policy and validation drift detection (Step 5).** A test in `internal/loops`
-   asserts
+8. **Policy drift detection (Step 5).** A test in `internal/loops` asserts
    `policy.FailureKindRetryableAfterResume == string(failureclass.RetryableAfterResume)`
    and
    `policy.FailureKindManualIntervention == string(failureclass.ManualIntervention)`,
-   and a test in `internal/validation` asserts each
-   `validation.FailureKind*` constant equals the corresponding
-   `string(failureclass.*)` value (covering the bare-string
-   `FailureKindRetryableTransient`), so a rename of any shared value that leaves
-   `NormalizeResumePolicy` or `classifyValidationFailure`/`ClassifyValidation`
-   matching the old spelling fails the suite.
+   so a rename of either shared value that leaves `NormalizeResumePolicy`
+   matching the old spelling fails the suite. (No validation drift test is
+   needed: Step 1 re-derives `validation.FailureKind*` directly from
+   `failureclass`, so a rename propagates at compile time.)
 9. **Fixer prompt drift detection (Step 6).** A cross-component test in
    `internal/agent` asserts the prompt text from `AppendFixerCompletionInstruction`
    contains `string(failureclass.RetryableTransient)` and
@@ -543,9 +635,10 @@ Per `AGENTS.md`, the root commands are the source of truth:
 **Definition of done:** `QueueFailureKind` is gone from all four runners (the 60
 type-name references replaced by `failureclass.Kind`), the four `xxxFailureKind`
 functions are gone and `failureclass.Normalize` preserves their unknown-kind →
-`non_retryable` fallback, the deleted-symbol absence check (step 7) passes, the
-four-kind regression coverage above exists, the policy and validation
-drift-detection tests (step 8) and the fixer prompt drift-detection test
-(step 9) exist, the full `go test ./...` suite is green, and the diff contains
-no changes to `workflow.Step` types, `failureclass.Classify` logic, or
+`non_retryable` fallback, `internal/validation`'s `FailureKind*` constants are
+re-derived from `failureclass` (`string(failureclass.*)`), the deleted-symbol
+absence check (step 7) passes, the four-kind regression coverage above exists,
+the policy drift-detection test (step 8) and the fixer prompt drift-detection
+test (step 9) exist, the full `go test ./...` suite is green, and the diff
+contains no changes to `workflow.Step` types, `failureclass.Classify` logic, or
 `NormalizeResumePolicy` behavior.
