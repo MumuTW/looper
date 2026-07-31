@@ -8,9 +8,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nexu-io/looper/internal/config"
-	"github.com/nexu-io/looper/internal/lifecycle"
-	"github.com/nexu-io/looper/internal/roles"
+	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/lifecycle"
+	"github.com/MumuTW/looper/internal/roles"
 )
 
 func TestRunValidationRunsConfiguredCommands(t *testing.T) {

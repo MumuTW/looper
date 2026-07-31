@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nexu-io/looper/internal/storage"
-	"github.com/nexu-io/looper/internal/roles"
+	"github.com/MumuTW/looper/internal/roles"
+	"github.com/MumuTW/looper/internal/storage"
 )
 
 func TestRecoveredPreStepBreakerFailureCleansPreparedWorktree(t *testing.T) {

@@ -3,8 +3,8 @@ package fixer
 import (
 	"testing"
 
-	"github.com/nexu-io/looper/internal/storage"
-	"github.com/nexu-io/looper/internal/roles"
+	"github.com/MumuTW/looper/internal/roles"
+	"github.com/MumuTW/looper/internal/storage"
 )
 
 // The first failure recorded is the causal one. Later failures -- a contract error
