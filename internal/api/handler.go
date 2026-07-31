@@ -1298,7 +1298,7 @@ type configRolesResponse struct {
 	Fixer       config.FixerRoleConfig             `json:"fixer"`
 	Worker      config.WorkerRoleConfig            `json:"worker"`
 	Coordinator config.CoordinatorRoleConfig       `json:"coordinator"`
-	Escalator   config.EscalatorRoleConfig         `json:"escalator"`
+	Gatekeeper  config.GatekeeperRoleConfig        `json:"gatekeeper"`
 }
 
 type configServerResponse struct {
@@ -1395,7 +1395,7 @@ func (h *Handler) buildConfigResponse() configResponse {
 			Fixer:       cfg.Roles.Fixer,
 			Worker:      cfg.Roles.Worker,
 			Coordinator: cfg.Roles.Coordinator,
-			Escalator:   cfg.Roles.Escalator,
+			Gatekeeper:  cfg.Roles.Gatekeeper,
 		},
 		Providers: append([]config.ProviderConfig{}, cfg.Providers...),
 		Projects:  config.RedactProjectSecrets(cfg.Projects),

@@ -285,7 +285,9 @@
             "assignTo": ""
           }
         },
-        "gatekeeper": {},
+        "gatekeeper": {
+          "strategy": "squash"
+        },
         "deployer": {
           "enabled": false
         },
@@ -308,13 +310,6 @@
           }
         },
         "reviewer": {
-          "autoMerge": {
-            "enabled": false,
-            "requireBranchProtection": true,
-            "scope": "looper-only",
-            "strategy": "squash",
-            "transientRetries": 3
-          },
           "behavior": {
             "loop": {
               "enabledByDefault": true,

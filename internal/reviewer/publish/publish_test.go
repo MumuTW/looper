@@ -15,9 +15,6 @@ func TestMarkerShapesAreStable(t *testing.T) {
 	if CriteriaFailMarker != "<!-- looper:reviewer:criteria-fail -->" {
 		t.Fatalf("CriteriaFailMarker = %q", CriteriaFailMarker)
 	}
-	if AutoMergeRefusedMarker != "<!-- looper:reviewer:automerge-refused -->" {
-		t.Fatalf("AutoMergeRefusedMarker = %q", AutoMergeRefusedMarker)
-	}
 	if CriteriaVerificationHeading != "### Acceptance criteria verification" {
 		t.Fatalf("CriteriaVerificationHeading = %q", CriteriaVerificationHeading)
 	}

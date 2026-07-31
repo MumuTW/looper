@@ -135,22 +135,30 @@ const (
 	ReviewerReviewEventRequestChanges ReviewerReviewEvent = "REQUEST_CHANGES"
 )
 
-type ReviewerAutoMergeStrategy string
+// MergeStrategy selects the forge merge method used by Merge Gatekeeper at
+// the auto trust level.
+type MergeStrategy string
 
 const (
-	ReviewerAutoMergeStrategySquash ReviewerAutoMergeStrategy = "squash"
-	ReviewerAutoMergeStrategyMerge  ReviewerAutoMergeStrategy = "merge"
-	ReviewerAutoMergeStrategyRebase ReviewerAutoMergeStrategy = "rebase"
+	MergeStrategySquash MergeStrategy = "squash"
+	MergeStrategyMerge  MergeStrategy = "merge"
+	MergeStrategyRebase MergeStrategy = "rebase"
+)
+
+// Deprecated reviewer auto-merge types remain only so old config snapshots and
+// source-compatible callers can be decoded long enough to receive the explicit
+// migration error. Runtime has no consumer for this policy.
+type ReviewerAutoMergeStrategy = MergeStrategy
+
+const (
+	ReviewerAutoMergeStrategySquash = MergeStrategySquash
+	ReviewerAutoMergeStrategyMerge  = MergeStrategyMerge
+	ReviewerAutoMergeStrategyRebase = MergeStrategyRebase
 )
 
 type ReviewerAutoMergeScope string
 
-const (
-	// ReviewerAutoMergeScopeLooperOnly is the Auto-merge scope: the
-	// Looper-only constraint identifying which PRs Looper may opt into
-	// auto-merge — the looper: label AND a tracked-Issue link, both required.
-	ReviewerAutoMergeScopeLooperOnly ReviewerAutoMergeScope = "looper-only"
-)
+const ReviewerAutoMergeScopeLooperOnly ReviewerAutoMergeScope = "looper-only"
 
 type CoordinatorMarkReadyScope string
 
@@ -541,12 +549,14 @@ type ReviewerThreadResolutionConfig struct {
 	MaxThreadsPerRun            int                                 `json:"maxThreadsPerRun"`
 }
 
+// ReviewerAutoMergeConfig is parse-only compatibility state. It is excluded
+// from projections and rejected when enabled.
 type ReviewerAutoMergeConfig struct {
-	Enabled                 bool                      `json:"enabled"`
-	Strategy                ReviewerAutoMergeStrategy `json:"strategy"`
-	RequireBranchProtection bool                      `json:"requireBranchProtection"`
-	TransientRetries        int                       `json:"transientRetries"`
-	Scope                   ReviewerAutoMergeScope    `json:"scope"`
+	Enabled                 bool
+	Strategy                MergeStrategy
+	RequireBranchProtection bool
+	TransientRetries        int
+	Scope                   ReviewerAutoMergeScope
 }
 
 type IssueRoleTriggersConfig struct {
@@ -619,7 +629,7 @@ type WorkerRoleConfig struct {
 type ReviewerRoleConfig struct {
 	Discovery    ReviewerRoleDiscoveryConfig `json:"discovery"`
 	Behavior     ReviewerConfig              `json:"behavior"`
-	AutoMerge    ReviewerAutoMergeConfig     `json:"autoMerge"`
+	AutoMerge    ReviewerAutoMergeConfig     `json:"-"`
 	Instructions string                      `json:"instructions,omitempty"`
 	Agent        *RoleAgentConfig            `json:"agent,omitempty"`
 }
@@ -824,44 +834,17 @@ const (
 	// GatekeeperTrustAdvise additionally publishes the verdict and its reasons on
 	// the pull request, so a human can decide without redoing the judgement.
 	GatekeeperTrustAdvise GatekeeperTrustLevel = "advise"
-	// GatekeeperTrustAuto publishes the required current-head status for GitHub
-	// branch protection on the pull request head SHA only. It never performs a
-	// merge itself: GitHub remains the merge authority. It does not publish
-	// status for GitHub native merge-queue merge-group SHAs; branch protection
-	// that requires Looper Gatekeeper on merge-group commits is unsupported.
+	// GatekeeperTrustAuto lets Gatekeeper merge what it judges eligible after a
+	// complete confirming evaluation.
 	GatekeeperTrustAuto GatekeeperTrustLevel = "auto"
 )
 
 // GatekeeperRoleConfig configures the agent-free Merge Gatekeeper.
 type GatekeeperRoleConfig struct {
 	// Trust is the merge authority level. Empty defaults to observe.
-	Trust      GatekeeperTrustLevel  `json:"trust,omitempty"`
-	DiffBudget *GatekeeperDiffBudget `json:"diffBudget,omitempty"`
-}
-
-// GatekeeperDiffBudget is a boolean change-size gate. A zero bound is
-// unlimited; non-zero bounds are enforced independently. The two bounds are
-// independent: configuring only maxDeletions leaves changedFiles unlimited, so a
-// very large addition concentrated in a few files can still pass.
-//
-// Remaining blind spots reviewers should weigh before relying on this gate:
-//
-//   - Only changed-file count and deletion count are bounded. There is no
-//     maxAdditions or total-line bound, so a massive purely-additive diff passes
-//     whenever maxDeletions is the only configured bound.
-//   - Counts are whole-PR totals from GitHub, computed against the current merge
-//     base. There is no per-file or per-path budget, so one very large file
-//     passes whenever the file count is under limit, and generated or vendored
-//     files are not excluded.
-//   - The gate is boolean per bound, not a score. It reports observed counts and
-//     configured limits as evidence; it does not model review effort or risk.
-//
-// What it still does not catch is the price of a cheap, deterministic,
-// provider-authoritative guard; a heuristic or inferred diff layer would be less
-// authoritative and is deliberately not built here.
-type GatekeeperDiffBudget struct {
-	MaxChangedFiles int `json:"maxChangedFiles"`
-	MaxDeletions    int `json:"maxDeletions"`
+	Trust GatekeeperTrustLevel `json:"trust,omitempty"`
+	// Strategy is used only at auto. Empty input normalizes to squash.
+	Strategy MergeStrategy `json:"strategy"`
 }
 
 // AuditorRoleConfig configures the opt-in Post-merge Auditor. It remains
@@ -1259,11 +1242,11 @@ type PartialReviewerThreadResolutionConfig struct {
 }
 
 type PartialReviewerAutoMergeConfig struct {
-	Enabled                 *bool                      `json:"enabled,omitempty"`
-	Strategy                *ReviewerAutoMergeStrategy `json:"strategy,omitempty"`
-	RequireBranchProtection *bool                      `json:"requireBranchProtection,omitempty"`
-	TransientRetries        *int                       `json:"transientRetries,omitempty"`
-	Scope                   *ReviewerAutoMergeScope    `json:"scope,omitempty"`
+	Enabled                 *bool          `json:"enabled,omitempty"`
+	Strategy                *MergeStrategy `json:"strategy,omitempty"`
+	RequireBranchProtection *bool          `json:"requireBranchProtection,omitempty"`
+	TransientRetries        *int           `json:"transientRetries,omitempty"`
+	Scope                   *string        `json:"scope,omitempty"`
 }
 
 type PartialInstructionsConfig struct {
@@ -1509,22 +1492,8 @@ type PartialDeployerRoleConfig struct {
 }
 
 type PartialGatekeeperRoleConfig struct {
-	Trust      *GatekeeperTrustLevel        `json:"trust,omitempty"`
-	DiffBudget *PartialGatekeeperDiffBudget `json:"diffBudget,omitempty"`
-}
-
-type PartialGatekeeperDiffBudget struct {
-	MaxChangedFiles *int `json:"maxChangedFiles,omitempty"`
-	MaxDeletions    *int `json:"maxDeletions,omitempty"`
-}
-
-type PartialEscalatorRoleConfig struct {
-	Enabled               *bool  `json:"enabled,omitempty"`
-	CadenceSeconds        *int   `json:"cadenceSeconds,omitempty"`
-	RetryAttemptThreshold *int64 `json:"retryAttemptThreshold,omitempty"`
-	UnroutedAfterSeconds  *int   `json:"unroutedAfterSeconds,omitempty"`
-	StaleHeadAfterSeconds *int   `json:"staleHeadAfterSeconds,omitempty"`
-	MaxItems              *int   `json:"maxItems,omitempty"`
+	Trust    *GatekeeperTrustLevel `json:"trust,omitempty"`
+	Strategy *MergeStrategy        `json:"strategy,omitempty"`
 }
 
 type PartialAuditorRoleConfig struct {

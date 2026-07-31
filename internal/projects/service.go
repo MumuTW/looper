@@ -117,8 +117,6 @@ type Service struct {
 	ConfigBoundary             *sync.RWMutex
 	Now                        func() time.Time
 	DetectRepo                 DetectRepoFunc
-	GetRepositorySettings      GetRepositorySettingsFunc
-	GetBranchProtection        GetBranchProtectionFunc
 	ListWorktrees              ListWorktreesFunc
 	ListOpenPullRequests       ListOpenPullRequestsFunc
 	CapturePullRequestSnapshot CapturePullRequestSnapshotFunc
@@ -353,7 +351,6 @@ func (s *Service) addProjectLocked(ctx context.Context, input AddInput) (AddResu
 		}
 	}
 
-	cfg := s.currentConfig()
 	repo := input.Repo
 	warnings := []string{}
 	if repo == nil && s.DetectRepo != nil {
@@ -379,10 +376,6 @@ func (s *Service) addProjectLocked(ctx context.Context, input AddInput) (AddResu
 		// RemoveProject terminates every loop, while AddProject applies creation
 		// defaults to omitted fields. The update contract preserves omitted state.
 		warnings = append(warnings, fmt.Sprintf(`No repository is set for this project, so no automation will run for it. Set one with PATCH /api/v1/projects/%s and body {"repo":"owner/name"}; unlike creation defaults, omitted name, baseBranch, and snapshotMode are preserved, as are existing loops. The CLI cannot set a repository.`, projectID))
-	}
-
-	if err := s.validateReviewerAutoMergeForProject(ctx, projectID, repo, input.BaseBranch, cfg); err != nil {
-		return AddResult{}, nil, err
 	}
 
 	nowISO := currentISO(s.Now)
@@ -734,17 +727,6 @@ func (s *Service) UpdateProject(ctx context.Context, identifier string, input Up
 		}
 	}
 
-	var repo *string
-	if value := metadataString(metadata, "repo"); value != "" {
-		repo = stringPointer(value)
-	}
-	baseBranch := s.currentConfig().Defaults.BaseBranch
-	if updated.BaseBranch != nil && strings.TrimSpace(*updated.BaseBranch) != "" {
-		baseBranch = *updated.BaseBranch
-	}
-	if err := s.validateReviewerAutoMergeForProject(ctx, updated.ID, repo, baseBranch, s.currentConfig()); err != nil {
-		return storage.ProjectRecord{}, err
-	}
 	if repoChanged {
 		discovery := discoveryStateFromMetadata(metadata)
 		discovery.Status = DiscoveryStatusPending
@@ -991,13 +973,9 @@ func (s *Service) SyncConfigured(ctx context.Context, cfg config.Config, now tim
 		if err != nil {
 			return fmt.Errorf("build project metadata for %s: %w", project.ID, err)
 		}
-
 		baseBranch := cfg.Defaults.BaseBranch
 		if project.BaseBranch != nil {
 			baseBranch = *project.BaseBranch
-		}
-		if err := s.validateReviewerAutoMergeForProject(ctx, project.ID, repo, baseBranch, cfg); err != nil {
-			return err
 		}
 
 		createdAt := nowISO

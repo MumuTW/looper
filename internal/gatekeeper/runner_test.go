@@ -437,24 +437,27 @@ type fakeGatekeeperGitHub struct {
 	// makes, so a test can prove a pull request was skipped rather than evaluated.
 	perPullRequestCalls int
 
-	currentLogin          string
-	commentErr            error
-	deletedIDs            []int64
-	listCalls             int
-	loginCalls            int
-	comments              []githubinfra.CommentInfo
-	createdBodies         []string
-	updatedBodies         []string
-	reviewMarker          githubinfra.ReviewMarkerResult
-	reviewMarkerErr       error
-	reviewMarkerCalls     []githubinfra.VerifyReviewMarkerInput
-	statusCalls           []githubinfra.CommitStatusInput
-	statusErr             error
-	viewErr               error
-	listReviewThreadsHook func(*fakeGatekeeperGitHub) error
+	currentLogin string
+	commentErr   error
+	deletedIDs   []int64
+	merges       []githubinfra.PullRequestMergeInput
+	mergeErr     error
 	// beforeView, when set, runs before each pull-request read, so a test can
-	// inject a state change between the first evaluation and a later one.
-	beforeView func(*fakeGatekeeperGitHub)
+	// change forge state between the primary and confirming evaluations.
+	beforeView    func(*fakeGatekeeperGitHub)
+	listCalls     int
+	loginCalls    int
+	comments      []githubinfra.CommentInfo
+	createdBodies []string
+	updatedBodies []string
+}
+
+func (f *fakeGatekeeperGitHub) MergePullRequest(_ context.Context, input githubinfra.PullRequestMergeInput) error {
+	if f.mergeErr != nil {
+		return f.mergeErr
+	}
+	f.merges = append(f.merges, input)
+	return nil
 }
 
 func (f *fakeGatekeeperGitHub) GetCurrentUserLoginForRepo(context.Context, string, string) (string, error) {

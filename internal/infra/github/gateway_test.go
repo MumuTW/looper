@@ -505,7 +505,7 @@ func TestGatewayFixerDiscoveryProjectsPaginatedCommentsAboveShellCap(t *testing.
 			if strings.Contains(args, "--slurp") {
 				t.Fatalf("comment command = %q, want page-wise projection without --slurp", args)
 			}
-			for _, required := range []string{"looper:fixer-round", "looper:conflict-notice", "looper:reviewer:automerge-refused", "{id,body,html_url,updated_at,user:{login:.user.login}}"} {
+			for _, required := range []string{"looper:fixer-round", "looper:conflict-notice", "{id,body,html_url,updated_at,user:{login:.user.login}}"} {
 				if !strings.Contains(args, required) {
 					t.Fatalf("comment command = %q, want projection %q", args, required)
 				}
@@ -517,8 +517,7 @@ func TestGatewayFixerDiscoveryProjectsPaginatedCommentsAboveShellCap(t *testing.
 				t.Fatalf("MaxCapturedBytes = %d, want unchanged generic default", options.MaxCapturedBytes)
 			}
 			return shell.Result{Stdout: "{\"id\":202,\"body\":\"<!-- looper:fixer-round head=head-42 -->\",\"html_url\":\"https://example.test/pull/42#issuecomment-202\",\"user\":{\"login\":\"looper\"}}\n" +
-				"{\"id\":303,\"body\":\"<!-- looper:conflict-notice id=notice-1 -->\",\"user\":{\"login\":\"looper\"}}\n" +
-				"{\"id\":404,\"body\":\"<!-- looper:reviewer:automerge-refused -->\",\"user\":{\"login\":\"looper\"}}\n"}, nil
+				"{\"id\":303,\"body\":\"<!-- looper:conflict-notice id=notice-1 -->\",\"user\":{\"login\":\"looper\"}}\n"}, nil
 		default:
 			t.Fatalf("unexpected gh args: %q", args)
 			return shell.Result{}, nil
@@ -530,7 +529,7 @@ func TestGatewayFixerDiscoveryProjectsPaginatedCommentsAboveShellCap(t *testing.
 	if err != nil {
 		t.Fatalf("ViewPullRequestForFixer() error = %v", err)
 	}
-	if len(detail.IssueComments) != 3 || detail.IssueComments[2].ID != 404 {
+	if len(detail.IssueComments) != 2 || detail.IssueComments[1].ID != 303 {
 		t.Fatalf("IssueComments = %#v, want all projected Looper marker comments", detail.IssueComments)
 	}
 }
@@ -2835,23 +2834,23 @@ func TestGatewayClosePullRequestIsIdempotent(t *testing.T) {
 	}
 }
 
-func TestGatewayEnableAutoMerge(t *testing.T) {
+func TestGatewayMergePullRequest(t *testing.T) {
 	t.Parallel()
 	runner := &fakeGHRunner{t: t}
 	runner.respond = func(options shell.Options) (shell.Result, error) {
 		args := strings.Join(options.Args, " ")
-		if args != "pr merge 42 --repo acme/looper --auto --squash --match-head-commit abc123" {
+		if args != "pr merge 42 --repo acme/looper --squash --match-head-commit abc123" {
 			t.Fatalf("unexpected gh args: %q", args)
 		}
 		return shell.Result{}, nil
 	}
 	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
-	if err := gateway.EnableAutoMerge(context.Background(), EnableAutoMergeInput{Repo: "acme/looper", PRNumber: 42, Strategy: config.ReviewerAutoMergeStrategySquash, HeadSHA: "abc123"}); err != nil {
-		t.Fatalf("EnableAutoMerge() error = %v", err)
+	if err := gateway.MergePullRequest(context.Background(), PullRequestMergeInput{Repo: "acme/looper", PRNumber: 42, Strategy: config.MergeStrategySquash, HeadSHA: "abc123"}); err != nil {
+		t.Fatalf("MergePullRequest() error = %v", err)
 	}
 }
 
-func TestGatewayEnableAutoMergeRequiresHeadSHA(t *testing.T) {
+func TestGatewayMergePullRequestRequiresHeadSHA(t *testing.T) {
 	t.Parallel()
 	runner := &fakeGHRunner{t: t}
 	runner.respond = func(options shell.Options) (shell.Result, error) {
@@ -2859,9 +2858,9 @@ func TestGatewayEnableAutoMergeRequiresHeadSHA(t *testing.T) {
 		return shell.Result{}, nil
 	}
 	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
-	err := gateway.EnableAutoMerge(context.Background(), EnableAutoMergeInput{Repo: "acme/looper", PRNumber: 42, Strategy: config.ReviewerAutoMergeStrategySquash})
-	if err == nil || err.Error() != "auto-merge head SHA is required" {
-		t.Fatalf("EnableAutoMerge() error = %v, want missing head SHA error", err)
+	err := gateway.MergePullRequest(context.Background(), PullRequestMergeInput{Repo: "acme/looper", PRNumber: 42, Strategy: config.MergeStrategySquash})
+	if err == nil || err.Error() != "merge head SHA is required" {
+		t.Fatalf("MergePullRequest() error = %v, want missing head SHA error", err)
 	}
 }
 

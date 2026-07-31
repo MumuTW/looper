@@ -190,18 +190,12 @@ method), whose doc comment carries the semantics: the tracked Issues whose
 
 **Acceptance criterion**:
 Defined at `internal/reviewer/criteria.AcceptanceCriterion`, whose doc comment
-carries the semantics: one item (checkbox by convention, plain bullets also
-accepted) Reviewer's auto-merge gate verifies against diff evidence before
-APPROVE.
-
-**Auto-merge scope**:
-Defined at `config.ReviewerAutoMergeScopeLooperOnly` in `internal/config`,
-whose doc comment carries the semantics: the Looper-only constraint
-(`looper:` label AND tracked-Issue link) encoded by
-`roles.reviewer.autoMerge.scope`.
+records the legacy diff-evidence representation retained by review formatting.
+It is not merge authority; Gatekeeper independently re-establishes every merge
+gate immediately before an `auto` merge.
 
 **Merge-pending state**:
-The GitHub-native state of a Pull Request after `gh pr merge --auto` has been called and before GitHub merges or a **Veto signal** arrives. The PR's `auto_merge` field is non-null in this state. Coordinator's merge-watch classifies merge-pending PRs into WatchActions. (Prose-only: a GitHub-native state; the classifier over it is `internal/coordinator/mergewatch.WatchAction`.)
+The GitHub-native state of a Pull Request after a human enables GitHub auto-merge and before GitHub merges or a **Veto signal** arrives. Looper no longer creates this state; Gatekeeper merges immediately after confirmation. Coordinator's merge-watch can still classify an observed merge-pending PR into WatchActions. (Prose-only: a GitHub-native state; the classifier over it is `internal/coordinator/mergewatch.WatchAction`.)
 
 **Watch marker**:
 Defined at `internal/coordinator/mergewatch.PriorWatchMarker`, whose doc

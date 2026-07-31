@@ -57,7 +57,6 @@ function fixture(): ConfigData {
           reviewEvents: { clean: "COMMENT", blocking: "COMMENT" },
           threadResolution: { enabled: true, mode: "report_only" },
         },
-        autoMerge: { enabled: false },
       },
     },
     metadata: {
@@ -535,7 +534,6 @@ describe("config form contract", () => {
           reviewEvents: { clean: "COMMENT", blocking: "COMMENT" },
           threadResolution: { enabled: true, mode: "report_only" },
         },
-        autoMerge: { enabled: false },
         agent: { vendor: "codex" },
       },
     };
@@ -640,7 +638,6 @@ describe("config form contract", () => {
         reviewEvents: { clean: "COMMENT", blocking: "COMMENT" },
         threadResolution: { enabled: true, mode: "report_only" },
       },
-      autoMerge: { enabled: false },
     };
     const globalWithRoleModel = buildConfigPatch(
       data,

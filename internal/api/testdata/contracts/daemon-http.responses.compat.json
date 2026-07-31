@@ -452,6 +452,47 @@
                 "priority": 50
               }
             },
+            "coordinator": {
+              "enabled": false,
+              "pollInterval": "5m",
+              "triage": {
+                "triagedLabel": "triaged",
+                "maxIssueAgeDays": 7,
+                "maxPerTick": 5,
+                "disposition": {
+                  "outOfScopeLabel": "wontfix",
+                  "unclearLabel": "needs-info",
+                  "reTriageOnAuthorReply": true
+                }
+              },
+              "dependencies": {
+                "enabled": false,
+                "apiTimeoutSeconds": 10,
+                "apiRetryAttempts": 3
+              },
+              "mergeWatch": {
+                "maxIndeterminateDuration": "15m",
+                "transientRetries": 3
+              },
+              "dispatch": {
+                "mode": "human-gated",
+                "humanGate": {
+                  "slashCommands": [
+                    "/plan",
+                    "/implement"
+                  ],
+                  "allowedUsers": []
+                },
+                "autonomous": {
+                  "delayMinutes": 30,
+                  "holdLabel": "looper:hold"
+                },
+                "assignTo": ""
+              }
+            },
+            "gatekeeper": {
+              "strategy": "squash"
+            },
             "planner": {
               "autoDiscovery": true,
               "triggers": {

@@ -464,10 +464,10 @@ type ClosePullRequestInput struct {
 	CWD          string
 }
 
-type EnableAutoMergeInput struct {
+type PullRequestMergeInput struct {
 	Repo     string
 	PRNumber int64
-	Strategy config.ReviewerAutoMergeStrategy
+	Strategy config.MergeStrategy
 	HeadSHA  string
 	CWD      string
 }
@@ -1301,7 +1301,7 @@ func (g *Gateway) ListIssueComments(ctx context.Context, input ViewIssueInput) (
 // fixer/reviewer protocols cross that bounded boundary.
 func (g *Gateway) listPullRequestAutomationComments(ctx context.Context, input ViewIssueInput) ([]CommentInfo, error) {
 	hostname, repo := splitRepoHostname(input.Repo)
-	filter := `.[] | select((.body // "") | (contains("looper:fixer-round") or contains("looper:conflict-notice") or contains("looper:reviewer:automerge-refused"))) | {id,body,html_url,updated_at,user:{login:.user.login}}`
+	filter := `.[] | select((.body // "") | (contains("looper:fixer-round") or contains("looper:conflict-notice"))) | {id,body,html_url,updated_at,user:{login:.user.login}}`
 	args := []string{"api", "--paginate", fmt.Sprintf("repos/%s/issues/%d/comments", repo, input.IssueNumber), "--jq", filter}
 	if hostname != "" {
 		args = append(args, "--hostname", hostname)
@@ -2101,19 +2101,6 @@ func (g *Gateway) ClosePullRequest(ctx context.Context, input ClosePullRequestIn
 	return err
 }
 
-func (g *Gateway) EnableAutoMerge(ctx context.Context, input EnableAutoMergeInput) error {
-	strategy := strings.TrimSpace(string(input.Strategy))
-	if strategy == "" {
-		return fmt.Errorf("auto-merge strategy is required")
-	}
-	headSHA := strings.TrimSpace(input.HeadSHA)
-	if headSHA == "" {
-		return fmt.Errorf("auto-merge head SHA is required")
-	}
-	_, err := g.runGh(ctx, input.CWD, "", "pr", "merge", strconv.FormatInt(input.PRNumber, 10), "--repo", input.Repo, "--auto", "--"+strategy, "--match-head-commit", headSHA)
-	return err
-}
-
 // MergePullRequest merges now, refusing if the head has moved.
 //
 // --match-head-commit is what closes the gap between deciding a pull request is
@@ -2124,16 +2111,7 @@ func (g *Gateway) EnableAutoMerge(ctx context.Context, input EnableAutoMergeInpu
 // This deliberately does not pass --auto. Auto-merge hands the decision to
 // GitHub to apply later, by which time the evaluation behind it is stale — the
 // opposite of the guarantee an immediate merge makes.
-//
-// Only the head is bound here: GitHub's merge API (and `gh pr merge`) accepts no
-// parameter that atomically pins the base. A diff-budget verdict depends on the
-// merge base, so when the base branch advances between the confirming pass's
-// final revalidation read and this call, the merge can still proceed against a
-// new base whose recomputed diff exceeds the budget. The confirming pass narrows
-// that window to the calls between the final read and the merge, but it cannot
-// close it; this is a documented blind spot of the diff-budget gate, not a
-// property this command can enforce.
-func (g *Gateway) MergePullRequest(ctx context.Context, input EnableAutoMergeInput) error {
+func (g *Gateway) MergePullRequest(ctx context.Context, input PullRequestMergeInput) error {
 	strategy := strings.TrimSpace(string(input.Strategy))
 	if strategy == "" {
 		return fmt.Errorf("merge strategy is required")

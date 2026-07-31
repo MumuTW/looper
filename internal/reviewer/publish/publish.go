@@ -20,7 +20,6 @@ import (
 // duplicate poster.
 const (
 	CriteriaFailMarker          = "<!-- looper:reviewer:criteria-fail -->"
-	AutoMergeRefusedMarker      = "<!-- looper:reviewer:automerge-refused -->"
 	CriteriaVerificationHeading = "### Acceptance criteria verification"
 )
 

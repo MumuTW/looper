@@ -17,49 +17,28 @@ import (
 // or trimmed comparison can stop on the wrong project when two configured IDs
 // differ only by case or surrounding whitespace, applying the wrong override.
 func gatekeeperTrustForProject(cfg config.Config, projectID string) config.GatekeeperTrustLevel {
-	trust := cfg.Roles.Gatekeeper.Trust
-	for _, project := range cfg.Projects {
-		if project.ID != projectID {
-			continue
-		}
-		if project.Roles != nil && project.Roles.Gatekeeper != nil && project.Roles.Gatekeeper.Trust != nil {
-			trust = *project.Roles.Gatekeeper.Trust
-		}
-		break
-	}
+	trust := gatekeeperRoleConfigForProject(cfg, projectID).Trust
 	if strings.TrimSpace(string(trust)) == "" {
 		return config.GatekeeperTrustObserve
 	}
 	return config.GatekeeperTrustLevel(strings.ToLower(strings.TrimSpace(string(trust))))
 }
 
-// gatekeeperDiffBudgetForProject resolves only the small project override used
-// by the Gatekeeper lane, avoiding a full ProjectRoleConfigs registry clone on
-// every pull request.
-//
-// Project IDs are matched by exact equality, matching runtimeProjectBinding and
-// config.ProjectRoleConfigs: a case-insensitive or trimmed comparison can select
-// the wrong project's budget when two configured IDs differ only by case or
-// surrounding whitespace, letting Gatekeeper apply limits that belong to another
-// project.
-func gatekeeperDiffBudgetForProject(cfg config.Config, projectID string) config.GatekeeperDiffBudget {
-	var budget config.GatekeeperDiffBudget
-	if cfg.Roles.Gatekeeper.DiffBudget != nil {
-		budget = *cfg.Roles.Gatekeeper.DiffBudget
-	}
+func gatekeeperRoleConfigForProject(cfg config.Config, projectID string) config.GatekeeperRoleConfig {
+	role := cfg.Roles.Gatekeeper
 	for _, project := range cfg.Projects {
-		if project.ID != projectID {
+		if !strings.EqualFold(strings.TrimSpace(project.ID), strings.TrimSpace(projectID)) {
 			continue
 		}
-		if project.Roles != nil && project.Roles.Gatekeeper != nil && project.Roles.Gatekeeper.DiffBudget != nil {
-			if project.Roles.Gatekeeper.DiffBudget.MaxChangedFiles != nil {
-				budget.MaxChangedFiles = *project.Roles.Gatekeeper.DiffBudget.MaxChangedFiles
+		if project.Roles != nil && project.Roles.Gatekeeper != nil {
+			if project.Roles.Gatekeeper.Trust != nil {
+				role.Trust = *project.Roles.Gatekeeper.Trust
 			}
-			if project.Roles.Gatekeeper.DiffBudget.MaxDeletions != nil {
-				budget.MaxDeletions = *project.Roles.Gatekeeper.DiffBudget.MaxDeletions
+			if project.Roles.Gatekeeper.Strategy != nil {
+				role.Strategy = *project.Roles.Gatekeeper.Strategy
 			}
 		}
 		break
 	}
-	return budget
+	return role
 }

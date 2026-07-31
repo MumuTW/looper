@@ -706,14 +706,6 @@ func (a reviewerGitHubAdapter) ViewIssue(ctx context.Context, input githubinfra.
 	return a.gateway.ViewIssue(ctx, input)
 }
 
-func (a reviewerGitHubAdapter) GetRepositorySettings(ctx context.Context, input githubinfra.RepositorySettingsInput) (githubinfra.RepositorySettings, error) {
-	return a.gateway.GetRepositorySettings(ctx, input)
-}
-
-func (a reviewerGitHubAdapter) GetBranchProtection(ctx context.Context, input githubinfra.BranchProtectionInput) (githubinfra.BranchProtection, error) {
-	return a.gateway.GetBranchProtection(ctx, input)
-}
-
 func (a reviewerGitHubAdapter) GetPullRequestHeadSHA(ctx context.Context, input reviewer.ViewPullRequestInput) (string, error) {
 	if a.gateway == nil {
 		return "", fmt.Errorf("github gateway is not configured")
@@ -798,10 +790,6 @@ func (a reviewerGitHubAdapter) SubmitReview(ctx context.Context, input githubinf
 		input.Comments = comments
 	}
 	return a.gateway.SubmitReview(ctx, input)
-}
-
-func (a reviewerGitHubAdapter) EnableAutoMerge(ctx context.Context, input githubinfra.EnableAutoMergeInput) error {
-	return a.gateway.EnableAutoMerge(ctx, input)
 }
 
 func (a reviewerGitHubAdapter) AddPullRequestReaction(ctx context.Context, input reviewer.PullRequestReactionInput) error {
@@ -2052,8 +2040,8 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			TrustForProject: func(projectID string) config.GatekeeperTrustLevel {
 				return gatekeeperTrustForProject(cfg, projectID)
 			},
-			DiffBudgetForProject: func(projectID string) config.GatekeeperDiffBudget {
-				return gatekeeperDiffBudgetForProject(cfg, projectID)
+			MergeStrategyForProject: func(projectID string) config.MergeStrategy {
+				return gatekeeperRoleConfigForProject(cfg, projectID).Strategy
 			},
 			LogWarn: func(msg string, fields map[string]any) {
 				if logger != nil {

@@ -1175,6 +1175,7 @@ func TestHandlerStatusUsesLiveConfigForReviewPublishReadiness(t *testing.T) {
 
 func TestBuildConfigResponseExposesCanonicalCodingRoles(t *testing.T) {
 	_, cfg := startTestRuntime(t)
+	cfg.Roles.Gatekeeper = config.GatekeeperRoleConfig{Trust: config.GatekeeperTrustAuto, Strategy: config.MergeStrategyRebase}
 	worker := config.EffectiveCodingRoles(cfg.Roles)[config.CodingRoleWorker]
 	worker.Priority = 7
 	worker.Discovery.Enabled = false
@@ -1187,6 +1188,16 @@ func TestBuildConfigResponseExposesCanonicalCodingRoles(t *testing.T) {
 	}
 	if response.Roles.Worker.AutoDiscovery == got.Discovery.Enabled {
 		t.Fatal("test setup did not retain a divergent legacy worker field")
+	}
+	if response.Roles.Gatekeeper.Trust != config.GatekeeperTrustAuto || response.Roles.Gatekeeper.Strategy != config.MergeStrategyRebase {
+		t.Fatalf("roles.gatekeeper = %#v, want inspectable auto/rebase authority", response.Roles.Gatekeeper)
+	}
+	raw, err := json.Marshal(response.Roles.Reviewer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "autoMerge") {
+		t.Fatalf("retired Reviewer auto-merge leaked into config response: %s", raw)
 	}
 }
 

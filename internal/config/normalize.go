@@ -1284,46 +1284,9 @@ func mergeRoleConfigs(config *RoleConfigs, partial PartialRoleConfigs) {
 		if partial.Gatekeeper.Trust != nil {
 			config.Gatekeeper.Trust = GatekeeperTrustLevel(strings.TrimSpace(string(*partial.Gatekeeper.Trust)))
 		}
-		if partial.Gatekeeper.DiffBudget != nil {
-			budget := config.Gatekeeper.DiffBudget
-			if budget == nil {
-				budget = &GatekeeperDiffBudget{}
-			} else {
-				cloned := *budget
-				budget = &cloned
-			}
-			if partial.Gatekeeper.DiffBudget.MaxChangedFiles != nil {
-				budget.MaxChangedFiles = *partial.Gatekeeper.DiffBudget.MaxChangedFiles
-			}
-			if partial.Gatekeeper.DiffBudget.MaxDeletions != nil {
-				budget.MaxDeletions = *partial.Gatekeeper.DiffBudget.MaxDeletions
-			}
-			config.Gatekeeper.DiffBudget = budget
+		if partial.Gatekeeper.Strategy != nil {
+			config.Gatekeeper.Strategy = MergeStrategy(strings.TrimSpace(string(*partial.Gatekeeper.Strategy)))
 		}
-	}
-	if partial.Escalator != nil {
-		mergeEscalatorRoleConfig(&config.Escalator, *partial.Escalator)
-	}
-}
-
-func mergeEscalatorRoleConfig(config *EscalatorRoleConfig, partial PartialEscalatorRoleConfig) {
-	if partial.Enabled != nil {
-		config.Enabled = *partial.Enabled
-	}
-	if partial.CadenceSeconds != nil {
-		config.CadenceSeconds = *partial.CadenceSeconds
-	}
-	if partial.RetryAttemptThreshold != nil {
-		config.RetryAttemptThreshold = *partial.RetryAttemptThreshold
-	}
-	if partial.UnroutedAfterSeconds != nil {
-		config.UnroutedAfterSeconds = *partial.UnroutedAfterSeconds
-	}
-	if partial.StaleHeadAfterSeconds != nil {
-		config.StaleHeadAfterSeconds = *partial.StaleHeadAfterSeconds
-	}
-	if partial.MaxItems != nil {
-		config.MaxItems = *partial.MaxItems
 	}
 }
 
@@ -1586,32 +1549,14 @@ func mergeReviewerRoleConfig(config *ReviewerRoleConfig, partial PartialReviewer
 	if partial.Behavior != nil {
 		mergeReviewerConfig(&config.Behavior, *partial.Behavior)
 	}
-	if partial.AutoMerge != nil {
-		mergeReviewerAutoMergeConfig(&config.AutoMerge, *partial.AutoMerge)
+	if partial.AutoMerge != nil && partial.AutoMerge.Enabled != nil {
+		config.AutoMerge.Enabled = *partial.AutoMerge.Enabled
 	}
 	if partial.Instructions != nil {
 		config.Instructions = *partial.Instructions
 	}
 	if partial.Agent != nil {
 		mergeRoleAgentConfig(&config.Agent, partial.Agent)
-	}
-}
-
-func mergeReviewerAutoMergeConfig(config *ReviewerAutoMergeConfig, partial PartialReviewerAutoMergeConfig) {
-	if partial.Enabled != nil {
-		config.Enabled = *partial.Enabled
-	}
-	if partial.Strategy != nil {
-		config.Strategy = *partial.Strategy
-	}
-	if partial.RequireBranchProtection != nil {
-		config.RequireBranchProtection = *partial.RequireBranchProtection
-	}
-	if partial.TransientRetries != nil {
-		config.TransientRetries = *partial.TransientRetries
-	}
-	if partial.Scope != nil {
-		config.Scope = *partial.Scope
 	}
 }
 
@@ -2222,8 +2167,9 @@ func clonePartialRoleConfigs(configs *PartialRoleConfigs) *PartialRoleConfigs {
 			trust := *configs.Gatekeeper.Trust
 			gatekeeper.Trust = &trust
 		}
-		if configs.Gatekeeper.DiffBudget != nil {
-			gatekeeper.DiffBudget = clonePartialGatekeeperDiffBudget(configs.Gatekeeper.DiffBudget)
+		if configs.Gatekeeper.Strategy != nil {
+			strategy := *configs.Gatekeeper.Strategy
+			gatekeeper.Strategy = &strategy
 		}
 		cloned.Gatekeeper = &gatekeeper
 	}

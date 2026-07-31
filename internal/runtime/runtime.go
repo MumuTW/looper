@@ -1006,18 +1006,6 @@ func (r *Runtime) start(ctx context.Context) error {
 		DetectRepo: func(ctx context.Context, repoPath string) (projects.DetectedRepo, error) {
 			return detectProjectRepo(ctx, gitGateway, r.projectCatalog.View(), repoPath)
 		},
-		GetRepositorySettings: func(ctx context.Context, input githubinfra.RepositorySettingsInput) (githubinfra.RepositorySettings, error) {
-			if githubGateway == nil {
-				return githubinfra.RepositorySettings{}, fmt.Errorf("github gateway is not configured")
-			}
-			return githubGateway.GetRepositorySettings(ctx, input)
-		},
-		GetBranchProtection: func(ctx context.Context, input githubinfra.BranchProtectionInput) (githubinfra.BranchProtection, error) {
-			if githubGateway == nil {
-				return githubinfra.BranchProtection{}, fmt.Errorf("github gateway is not configured")
-			}
-			return githubGateway.GetBranchProtection(ctx, input)
-		},
 		ListWorktrees: func(ctx context.Context, repoPath string) ([]projects.WorktreeListEntry, error) {
 			worktrees, err := gitGateway.ListWorktrees(ctx, repoPath)
 			if err != nil {

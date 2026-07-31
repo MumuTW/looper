@@ -206,8 +206,7 @@ type GitHubGateway interface {
 	UpdateIssueComment(context.Context, githubinfra.UpdateIssueCommentInput) error
 	GetCurrentUserLoginForRepo(context.Context, string, string) (string, error)
 	DeleteIssueComment(context.Context, githubinfra.DeleteIssueCommentInput) error
-	FindReviewMarker(context.Context, githubinfra.VerifyReviewMarkerInput) (githubinfra.ReviewMarkerResult, error)
-	SetCommitStatus(context.Context, githubinfra.CommitStatusInput) error
+	MergePullRequest(context.Context, githubinfra.PullRequestMergeInput) error
 }
 
 // RequiredStatusContext is the GitHub status context an operator adds to branch
@@ -223,14 +222,9 @@ type Options struct {
 	// TrustForProject reports a project's merge-authority level. Nil means every
 	// project stays at observe, which is also the configured default.
 	TrustForProject func(projectID string) config.GatekeeperTrustLevel
-	// DiffBudgetForProject returns the effective boolean change-size limits. Zero
-	// bounds are unlimited; nil means every project has no configured limit.
-	DiffBudgetForProject func(projectID string) config.GatekeeperDiffBudget
-	// ConfiguredTargetBranch reports the project policy's configured base branch.
-	// It is folded into the discovery fingerprint so a policy generation change
-	// invalidates reused success within the skip window.
-	ConfiguredTargetBranch func(projectID string) string
-	LogWarn                func(msg string, fields map[string]any)
+	// MergeStrategyForProject selects the strategy used at the auto trust level.
+	MergeStrategyForProject func(projectID string) config.MergeStrategy
+	LogWarn                 func(msg string, fields map[string]any)
 }
 
 // Runner is the Merge Gatekeeper: a reactive, agent-free policy Role that
@@ -240,16 +234,13 @@ type Options struct {
 // Stateful: agent-free but not database-free — it persists Gate reports in
 // the local SQLite event log.
 type Runner struct {
-	repos                  *storage.Repositories
-	github                 GitHubGateway
-	now                    func() time.Time
-	policyPermitsTarget    func(projectID, repo, baseRefName string) bool
-	trustForProject        func(projectID string) config.GatekeeperTrustLevel
-	diffBudgetForProject   func(projectID string) config.GatekeeperDiffBudget
-	configuredTargetBranch func(projectID string) string
-	logWarn                func(msg string, fields map[string]any)
-	lastPublishedStatusMu  sync.Mutex
-	lastPublishedStatus    map[string]string
+	repos                   *storage.Repositories
+	github                  GitHubGateway
+	now                     func() time.Time
+	policyPermitsTarget     func(projectID, repo, baseRefName string) bool
+	trustForProject         func(projectID string) config.GatekeeperTrustLevel
+	mergeStrategyForProject func(projectID string) config.MergeStrategy
+	logWarn                 func(msg string, fields map[string]any)
 }
 
 func New(options Options) *Runner {
