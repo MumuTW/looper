@@ -2647,6 +2647,16 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 			break
 		}
 
+		// Auditor observes the default branch only when the operator opted in.
+		// It appends evidence for a later confirmation/revert-proposal pass and
+		// never creates forge work from this scheduler tick.
+		if err := admissionRefuseWork(input); err != nil {
+			break
+		}
+		appendErr(runSchedulerLane(input, "auditor", project.ID, repo, func() error {
+			return runAuditorLane(ctx, input, project, repo)
+		}))
+
 		// HITL (github transport): deliver any human answers posted on this
 		// project's awaiting_human PRs so those loops resume.
 		if err := admissionRefuseWork(input); err != nil {
