@@ -632,7 +632,7 @@ func (a reviewerGitHubAdapter) CapturePullRequestSnapshot(ctx context.Context, i
 	if err != nil {
 		return storage.PullRequestSnapshotRecord{}, err
 	}
-	return a.gateway.CapturePullRequestSnapshot(ctx, githubinfra.CapturePullRequestSnapshotInput{ProjectID: input.ProjectID, Repo: repo, PRNumber: input.PRNumber, CWD: input.CWD, CapturedAt: input.CapturedAt})
+	return a.gateway.CapturePullRequestSnapshot(ctx, githubinfra.CapturePullRequestSnapshotInput{ProjectID: input.ProjectID, Repo: input.Repo, TransportRepo: repo, PRNumber: input.PRNumber, CWD: input.CWD, CapturedAt: input.CapturedAt})
 }
 
 func (a reviewerGitHubAdapter) FindReviewMarker(ctx context.Context, input reviewer.VerifyReviewMarkerInput) (reviewer.ReviewMarkerResult, error) {
@@ -3619,7 +3619,11 @@ func processSnapshotQueueItem(ctx context.Context, item storage.QueueItemRecord,
 	if now == nil {
 		now = time.Now
 	}
-	snapshot, err := input.Snapshotter.CapturePullRequestSnapshot(ctx, githubinfra.CapturePullRequestSnapshotInput{ProjectID: project.ID, Repo: *item.Repo, PRNumber: *item.PRNumber, CWD: cwd, CapturedAt: formatJavaScriptISOString(now().UTC())})
+	transportRepo, err := reviewThreadRepo(input.Config, *item.Repo, cwd)
+	if err != nil {
+		return failSnapshotQueueItem(ctx, item, input, err.Error(), "retryable_transient")
+	}
+	snapshot, err := input.Snapshotter.CapturePullRequestSnapshot(ctx, githubinfra.CapturePullRequestSnapshotInput{ProjectID: project.ID, Repo: *item.Repo, TransportRepo: transportRepo, PRNumber: *item.PRNumber, CWD: cwd, CapturedAt: formatJavaScriptISOString(now().UTC())})
 	if err != nil {
 		return failSnapshotQueueItem(ctx, item, input, err.Error(), "retryable_transient")
 	}

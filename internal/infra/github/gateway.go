@@ -669,11 +669,15 @@ type GetPullRequestDiffInput struct {
 }
 
 type CapturePullRequestSnapshotInput struct {
-	ProjectID  string
-	Repo       string
-	PRNumber   int64
-	CWD        string
-	CapturedAt string
+	ProjectID string
+	// Repo is the logical owner/name identity persisted with the snapshot.
+	Repo string
+	// TransportRepo may qualify Repo with a configured GHES hostname. It is
+	// used only for forge commands and never becomes snapshot identity.
+	TransportRepo string
+	PRNumber      int64
+	CWD           string
+	CapturedAt    string
 }
 
 type ReviewThreadNotFoundError struct {
@@ -3164,11 +3168,15 @@ func (g *Gateway) ensureLabels(ctx context.Context, repo, cwd string, definition
 }
 
 func (g *Gateway) CapturePullRequestSnapshot(ctx context.Context, input CapturePullRequestSnapshotInput) (storage.PullRequestSnapshotRecord, error) {
-	detail, err := g.ViewPullRequestForReviewer(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
+	transportRepo := strings.TrimSpace(input.TransportRepo)
+	if transportRepo == "" {
+		transportRepo = input.Repo
+	}
+	detail, err := g.ViewPullRequestForReviewer(ctx, ViewPullRequestInput{Repo: transportRepo, PRNumber: input.PRNumber, CWD: input.CWD})
 	if err != nil {
 		return storage.PullRequestSnapshotRecord{}, err
 	}
-	diff, err := g.GetPullRequestDiff(ctx, GetPullRequestDiffInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
+	diff, err := g.GetPullRequestDiff(ctx, GetPullRequestDiffInput{Repo: transportRepo, PRNumber: input.PRNumber, CWD: input.CWD})
 	if err != nil {
 		if !errors.Is(err, ErrDiffTooLarge) && !errors.Is(err, ErrLocalCaptureTruncated) {
 			return storage.PullRequestSnapshotRecord{}, err

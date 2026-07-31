@@ -949,6 +949,49 @@ func TestProcessSnapshotQueueItemRetriesTransientCaptureFailure(t *testing.T) {
 	}
 }
 
+func TestProcessSnapshotQueueItemQualifiesGHESCommandsAndPersistsLogicalRepo(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "snapshot-ghes.sqlite"), t.TempDir())
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.July, 31, 8, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+	projectID := "enterprise"
+	repo := "acme/enterprise"
+	prNumber := int64(42)
+	repoPath := filepath.Join(workingDir, "repo")
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Enterprise", RepoPath: repoPath, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	queueItem := storage.QueueItemRecord{ID: "queue_snapshot_ghes", ProjectID: &projectID, Type: "snapshot", TargetType: "pull_request", TargetID: repo + "#42", Repo: &repo, PRNumber: &prNumber, DedupeKey: "snapshot:" + repo + ":42", Priority: storage.QueuePriorityReviewer, Status: "running", AvailableAt: nowISO, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := repos.Queue.Upsert(context.Background(), queueItem); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	cfg := config.Config{
+		Providers: []config.ProviderConfig{{ID: "github-enterprise", Kind: config.ProviderKindGitHub, BaseURL: "https://github.example.com"}},
+		Projects:  []config.ProjectRefConfig{{ID: projectID, Provider: "github-enterprise", Repo: repo, RepoPath: repoPath}},
+	}
+	var captured githubinfra.CapturePullRequestSnapshotInput
+	err := processSnapshotQueueItem(context.Background(), queueItem, defaultSchedulerTickInput{
+		Repos: repos, Now: func() time.Time { return now }, Config: &cfg,
+		Snapshotter: stubSnapshotScheduler{capture: func(input githubinfra.CapturePullRequestSnapshotInput) { captured = input }},
+	})
+	if err != nil {
+		t.Fatalf("processSnapshotQueueItem() error = %v", err)
+	}
+	if captured.Repo != repo || captured.TransportRepo != "github.example.com/"+repo {
+		t.Fatalf("snapshot repos = (%q, %q), want logical %q and GHES transport", captured.Repo, captured.TransportRepo, repo)
+	}
+	snapshot, err := repos.PullRequestSnapshots.GetLatestByProject(context.Background(), projectID, repo, prNumber)
+	if err != nil {
+		t.Fatalf("GetLatestByProject() error = %v", err)
+	}
+	if snapshot == nil || snapshot.Repo != repo {
+		t.Fatalf("GetLatestByProject() = %#v, want logical-repo snapshot", snapshot)
+	}
+}
+
 func TestProcessSnapshotQueueItemStopsRetryingAtMaxAttempts(t *testing.T) {
 	t.Parallel()
 
@@ -1712,10 +1755,14 @@ func (s *stubFixerScheduler) processItemCount() int {
 }
 
 type stubSnapshotScheduler struct {
-	err error
+	err     error
+	capture func(githubinfra.CapturePullRequestSnapshotInput)
 }
 
 func (s stubSnapshotScheduler) CapturePullRequestSnapshot(_ context.Context, input githubinfra.CapturePullRequestSnapshotInput) (storage.PullRequestSnapshotRecord, error) {
+	if s.capture != nil {
+		s.capture(input)
+	}
 	return storage.PullRequestSnapshotRecord{ID: "snapshot_1", ProjectID: input.ProjectID, Repo: input.Repo, PRNumber: input.PRNumber, HeadSHA: "head", CapturedAt: input.CapturedAt, CreatedAt: input.CapturedAt}, s.err
 }
 

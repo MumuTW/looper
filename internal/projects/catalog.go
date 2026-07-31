@@ -3,6 +3,7 @@ package projects
 import (
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 
@@ -118,6 +119,7 @@ func MaterializeCatalog(global config.Config, records []storage.ProjectRecord) (
 	projects := make([]config.ProjectRefConfig, 0, len(records))
 	seen := make(map[string]struct{}, len(records))
 	seenRepos := make(map[string]string, len(records))
+	seenRepoPaths := make(map[string]string, len(records))
 	for _, record := range records {
 		if record.Archived {
 			continue
@@ -126,6 +128,13 @@ func MaterializeCatalog(global config.Config, records []storage.ProjectRecord) (
 			return nil, fmt.Errorf("duplicate active project id %q", record.ID)
 		}
 		seen[record.ID] = struct{}{}
+		if strings.TrimSpace(record.RepoPath) != "" {
+			cleanRepoPath := filepath.Clean(record.RepoPath)
+			if existingID, ok := seenRepoPaths[cleanRepoPath]; ok {
+				return nil, fmt.Errorf("project %q repo path %q duplicates active project %q", record.ID, record.RepoPath, existingID)
+			}
+			seenRepoPaths[cleanRepoPath] = record.ID
+		}
 
 		metadata := parseMetadata(record.MetadataJSON)
 		provider := metadataString(metadata, "provider")
