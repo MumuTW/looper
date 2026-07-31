@@ -117,3 +117,37 @@ func TestServiceSyncConfiguredActiveAPICollisionEscapesProjectIDInRecoveryURL(t 
 		t.Fatalf("SyncConfigured() error = %v, want escaped recovery URL", err)
 	}
 }
+
+func TestServiceSyncConfiguredRemovesLegacyAPIProviderBinding(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openCoordinator(t)
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.July, 31, 4, 0, 0, 0, time.UTC)
+	metadata := `{"provider":"removed","repo":"acme/api","source":"api"}`
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{
+		ID: "legacy-api", Name: "Legacy API", RepoPath: "/tmp/api", MetadataJSON: &metadata,
+		CreatedAt: now.Add(-time.Hour).Format(time.RFC3339Nano), UpdatedAt: now.Add(-time.Hour).Format(time.RFC3339Nano),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := &Service{DB: coordinator.DB(), Repos: repos, Now: func() time.Time { return now }}
+
+	if err := service.SyncConfigured(context.Background(), cfg, now); err != nil {
+		t.Fatalf("SyncConfigured() error = %v", err)
+	}
+	stored, err := repos.Projects.GetByID(context.Background(), "legacy-api")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored == nil || metadataString(parseMetadata(stored.MetadataJSON), "provider") != "" {
+		t.Fatalf("legacy API record = %#v, want provider binding removed", stored)
+	}
+	if _, err := MaterializeCatalog(cfg, []storage.ProjectRecord{*stored}); err != nil {
+		t.Fatalf("MaterializeCatalog() error = %v, want boot-safe reconciled record", err)
+	}
+}

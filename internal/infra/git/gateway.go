@@ -368,6 +368,7 @@ func (g *Gateway) DetectOriginRemote(ctx context.Context, repoPath string) (Orig
 
 func (g *Gateway) RestoreWorktree(ctx context.Context, input RestoreWorktreeInput) (*storage.WorktreeRecord, error) {
 	checkoutMode := normalizeCheckoutMode(input.CheckoutMode)
+	hasStoredIdentity := false
 
 	if g.repos != nil {
 		var stored *storage.WorktreeRecord
@@ -382,6 +383,7 @@ func (g *Gateway) RestoreWorktree(ctx context.Context, input RestoreWorktreeInpu
 		if err != nil {
 			return nil, err
 		}
+		hasStoredIdentity = stored != nil
 		if stored != nil && stored.Status != "cleaned" && normalizeComparablePath(stored.RepoPath) == normalizeComparablePath(input.RepoPath) && worktreesafety.IsSafe(worktreesafety.CheckInput{WorktreePath: stored.WorktreePath, RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot}) {
 			storedHealthy, err := g.isHealthyWorktree(ctx, stored.WorktreePath)
 			if err != nil {
@@ -454,6 +456,14 @@ func (g *Gateway) RestoreWorktree(ctx context.Context, input RestoreWorktreeInpu
 
 	if match == nil {
 		return nil, nil
+	}
+	// The worktrees table is the ownership authority. A linked checkout that
+	// survives after its row was retired (for example while a config project
+	// claims an archived API project ID) must not be adopted merely because Git
+	// reports it as healthy: it may contain uncommitted work from the retired
+	// project. Callers with a repository can restore only a durable record.
+	if g.repos != nil && !hasStoredIdentity {
+		return nil, fmt.Errorf("refusing to adopt unregistered worktree %q for project %q; remove or register the checkout before retrying", match.Path, input.ProjectID)
 	}
 
 	healthy, err := g.isHealthyWorktree(ctx, match.Path)

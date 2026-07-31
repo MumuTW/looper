@@ -912,6 +912,7 @@ func (s *Service) SyncConfigured(ctx context.Context, cfg config.Config, now tim
 	}
 	desiredRecords := make([]storage.ProjectRecord, 0, len(cfg.Projects))
 	reclaimingArchivedAPIProjectIDs := make(map[string]struct{})
+	legacyAPIProviderRecords := make([]storage.ProjectRecord, 0)
 	for _, project := range cfg.Projects {
 		desiredIDs[project.ID] = struct{}{}
 		if existing := existingByID[project.ID]; existing != nil {
@@ -922,6 +923,25 @@ func (s *Service) SyncConfigured(ctx context.Context, cfg config.Config, now tim
 				reclaimingArchivedAPIProjectIDs[project.ID] = struct{}{}
 			}
 		}
+	}
+	for _, existing := range existingProjects {
+		metadata := parseMetadata(existing.MetadataJSON)
+		if metadataString(metadata, "source") != "api" || metadataString(metadata, "provider") == "" {
+			continue
+		}
+		// API registration no longer owns provider selection. Persist the
+		// upgrade reconciliation before catalog materialization so a provider
+		// removed from config cannot make looperd unable to boot and repair its
+		// own database.
+		delete(metadata, "provider")
+		metadataJSON, err := buildAddProjectMetadataJSON(metadata)
+		if err != nil {
+			return fmt.Errorf("remove legacy provider binding for %s: %w", existing.ID, err)
+		}
+		updated := existing
+		updated.MetadataJSON = stringPointer(metadataJSON)
+		updated.UpdatedAt = nowISO
+		legacyAPIProviderRecords = append(legacyAPIProviderRecords, updated)
 	}
 
 	for _, project := range cfg.Projects {
@@ -964,6 +984,11 @@ func (s *Service) SyncConfigured(ctx context.Context, cfg config.Config, now tim
 	}
 
 	applyImport := func(repos *storage.Repositories) error {
+		for _, record := range legacyAPIProviderRecords {
+			if err := repos.Projects.Upsert(ctx, record); err != nil {
+				return err
+			}
+		}
 		for projectID := range reclaimingArchivedAPIProjectIDs {
 			if _, err := repos.Worktrees.DeleteByProject(ctx, projectID); err != nil {
 				return err

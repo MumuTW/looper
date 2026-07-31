@@ -248,6 +248,53 @@ func TestRuntimeStartMaterializesProjectCatalogFromDatabase(t *testing.T) {
 	}
 }
 
+func TestRuntimeStartReconcilesLegacyAPIProviderBinding(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Storage.DBPath = filepath.Join(workingDir, "runtime.sqlite")
+	seed, err := storage.OpenSQLiteCoordinator(context.Background(), cfg.Storage.DBPath, storage.SQLiteCoordinatorOptions{})
+	if err != nil {
+		t.Fatalf("OpenSQLiteCoordinator() error = %v", err)
+	}
+	if _, err := seed.MigrationRunner().RunPending(context.Background()); err != nil {
+		_ = seed.Close()
+		t.Fatalf("RunPending() error = %v", err)
+	}
+	metadata := `{"provider":"removed","repo":"acme/legacy","source":"api"}`
+	if err := storage.NewRepositories(seed.DB()).Projects.Upsert(context.Background(), storage.ProjectRecord{
+		ID: "legacy-api", Name: "Legacy API", RepoPath: "/repos/legacy", MetadataJSON: &metadata,
+		CreatedAt: "2026-07-31T04:00:00.000Z", UpdatedAt: "2026-07-31T04:00:00.000Z",
+	}); err != nil {
+		_ = seed.Close()
+		t.Fatal(err)
+	}
+	if err := seed.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	rt := New(Options{Config: cfg, Logger: &testLogger{}, RunSchedulerTick: func(context.Context, Services) error { return nil }})
+	if err := rt.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v, want legacy API binding migration before catalog materialization", err)
+	}
+	t.Cleanup(func() { rt.Stop("test cleanup") })
+	stored, err := rt.Services().Repositories.Projects.GetByID(context.Background(), "legacy-api")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored == nil || stored.MetadataJSON == nil || strings.Contains(*stored.MetadataJSON, `"provider"`) {
+		t.Fatalf("stored legacy API project = %#v, want provider binding removed", stored)
+	}
+	projects := rt.Config().Projects
+	if len(projects) != 1 || projects[0].ID != "legacy-api" || projects[0].Provider != "" {
+		t.Fatalf("runtime catalog = %#v, want reconciled default GitHub project", projects)
+	}
+}
+
 func TestRuntimeProjectMutationsAtomicallyPublishCatalog(t *testing.T) {
 	t.Parallel()
 

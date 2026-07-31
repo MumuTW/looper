@@ -1489,6 +1489,47 @@ func TestGatewayRestoreWorktreePropagatesHealthCheckFailureForStoredWorktree(t *
 	}
 }
 
+func TestGatewayRestoreWorktreeRefusesUnregisteredLinkedCheckout(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	fixture := newFixture(t)
+	fixture.createLocalFeatureRepo(t)
+	gateway := fixture.gateway()
+	retired, err := gateway.CreateWorktree(ctx, CreateWorktreeInput{
+		ProjectID: fixture.projectID, RepoPath: fixture.repoPath, WorktreeRoot: fixture.worktreeRoot,
+		Branch: "feature/fixer", BaseBranch: "main",
+	})
+	if err != nil {
+		t.Fatalf("CreateWorktree() error = %v", err)
+	}
+	writeFile(t, filepath.Join(retired.WorktreePath, "dirty.txt"), "retired project state\n")
+	if _, err := fixture.repos.Worktrees.DeleteByProject(ctx, fixture.projectID); err != nil {
+		t.Fatalf("DeleteByProject() error = %v", err)
+	}
+
+	_, err = gateway.RestoreWorktree(ctx, RestoreWorktreeInput{
+		ProjectID:            fixture.projectID,
+		RepoPath:             fixture.repoPath,
+		Branch:               "feature/fixer",
+		WorktreeRoot:         fixture.worktreeRoot,
+		ExpectedWorktreePath: retired.WorktreePath,
+	})
+	if err == nil || !strings.Contains(err.Error(), "refusing to adopt unregistered worktree") {
+		t.Fatalf("RestoreWorktree() error = %v, want refusal to adopt the retired checkout", err)
+	}
+	if got := readFile(t, filepath.Join(retired.WorktreePath, "dirty.txt")); got != "retired project state\n" {
+		t.Fatalf("retired checkout contents = %q, want untouched dirty state", got)
+	}
+	worktrees, err := fixture.repos.Worktrees.ListByProject(ctx, fixture.projectID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(worktrees) != 0 {
+		t.Fatalf("ListByProject() = %#v, want no adoption record", worktrees)
+	}
+}
+
 type fixture struct {
 	rootDir      string
 	repoPath     string
