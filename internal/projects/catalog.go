@@ -129,12 +129,13 @@ func MaterializeCatalog(global config.Config, records []storage.ProjectRecord) (
 
 		metadata := parseMetadata(record.MetadataJSON)
 		project := config.ProjectRefConfig{
-			ID:         record.ID,
-			Name:       record.Name,
-			RepoPath:   record.RepoPath,
-			BaseBranch: cloneStringPointer(record.BaseBranch),
-			Provider:   metadataString(metadata, "provider"),
-			Repo:       metadataString(metadata, "repo"),
+			ID:             record.ID,
+			Name:           record.Name,
+			RepoPath:       record.RepoPath,
+			LabelNamespace: metadataString(metadata, "labelNamespace"),
+			BaseBranch:     cloneStringPointer(record.BaseBranch),
+			Provider:       metadataString(metadata, "provider"),
+			Repo:           metadataString(metadata, "repo"),
 		}
 		if project.Provider != "" && !configuredProviderExists(global, project.Provider) {
 			// This is reachable on upgrade when a stored project was bound to a

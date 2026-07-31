@@ -1662,19 +1662,20 @@ func clonePartialProjects(projects []PartialProjectRefConfig) []PartialProjectRe
 	cloned := make([]PartialProjectRefConfig, len(projects))
 	for index, project := range projects {
 		cloned[index] = PartialProjectRefConfig{
-			ID:           project.ID,
-			Name:         project.Name,
-			Provider:     cloneStringPtr(project.Provider),
-			Repo:         cloneStringPtr(project.Repo),
-			RepoPath:     project.RepoPath,
-			Path:         project.Path,
-			BaseBranch:   cloneStringPtr(project.BaseBranch),
-			WorktreeRoot: cloneStringPtr(project.WorktreeRoot),
-			Network:      clonePartialProjectNetworkConfig(project.Network),
-			Webhook:      clonePartialProjectWebhookConfig(project.Webhook),
-			Validation:   clonePartialProjectValidationConfig(project.Validation),
-			Instructions: cloneStringMap(project.Instructions),
-			Roles:        clonePartialRoleConfigs(project.Roles),
+			ID:             project.ID,
+			Name:           project.Name,
+			Provider:       cloneStringPtr(project.Provider),
+			Repo:           cloneStringPtr(project.Repo),
+			RepoPath:       project.RepoPath,
+			Path:           project.Path,
+			LabelNamespace: cloneStringPtr(project.LabelNamespace),
+			BaseBranch:     cloneStringPtr(project.BaseBranch),
+			WorktreeRoot:   cloneStringPtr(project.WorktreeRoot),
+			Network:        clonePartialProjectNetworkConfig(project.Network),
+			Webhook:        clonePartialProjectWebhookConfig(project.Webhook),
+			Validation:     clonePartialProjectValidationConfig(project.Validation),
+			Instructions:   cloneStringMap(project.Instructions),
+			Roles:          clonePartialRoleConfigs(project.Roles),
 		}
 	}
 	return cloned
@@ -1788,6 +1789,9 @@ func cloneProjects(projects []PartialProjectRefConfig) []ProjectRefConfig {
 
 		if project.WorktreeRoot != nil {
 			cloned[index].WorktreeRoot = stringPtr(*project.WorktreeRoot)
+		}
+		if project.LabelNamespace != nil && strings.TrimSpace(*project.LabelNamespace) != "" {
+			cloned[index].LabelNamespace = strings.ToLower(strings.TrimSpace(*project.LabelNamespace))
 		}
 	}
 

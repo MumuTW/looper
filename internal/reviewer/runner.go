@@ -754,6 +754,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		}
 	}
 	result := DiscoveryResult{}
+	namespace := config.ProjectLabelNamespaceForMetadata(r.projectRoleConfig, project.ID, project.MetadataJSON)
 	seen := map[string]struct{}{}
 	resolveAuthor := func(pr PullRequestSummary) PullRequestSummary {
 		if policy.EnableSelfReview || strings.TrimSpace(pr.Author) != "" {
@@ -784,7 +785,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 	}
 	for _, pr := range openPRs {
 		pr = resolveAuthor(pr)
-		if domain.IsAutoLaneHeld(domain.LoopTypeReviewer, pr.Labels) {
+		if domain.IsAutoLaneHeldForNamespace(domain.LoopTypeReviewer, pr.Labels, namespace) {
 			result.Skipped++
 			continue
 		}
@@ -809,7 +810,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 	}
 	for _, pr := range specPRs {
 		pr = resolveAuthor(pr)
-		if domain.IsAutoLaneHeld(domain.LoopTypeReviewer, pr.Labels) {
+		if domain.IsAutoLaneHeldForNamespace(domain.LoopTypeReviewer, pr.Labels, namespace) {
 			result.Skipped++
 			continue
 		}
@@ -849,7 +850,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 			result.Skipped++
 			continue
 		}
-		if !isManualReviewerLoop(loop) && domain.IsAutoLaneHeld(domain.LoopTypeReviewer, detail.Labels) {
+		if !isManualReviewerLoop(loop) && domain.IsAutoLaneHeldForNamespace(domain.LoopTypeReviewer, detail.Labels, namespace) {
 			result.Skipped++
 			continue
 		}
@@ -897,6 +898,7 @@ func (r *Runner) DiscoverPullRequest(ctx context.Context, input TargetedDiscover
 		currentLogin = normalizeLogin(currentLogin)
 	}
 	result := DiscoveryResult{}
+	namespace := config.ProjectLabelNamespaceForMetadata(r.projectRoleConfig, project.ID, project.MetadataJSON)
 	existingLoops, err := r.findReviewerLoopsByPR(ctx, project.ID, input.Repo, input.PRNumber)
 	if err != nil {
 		return DiscoveryResult{}, err
@@ -907,7 +909,7 @@ func (r *Runner) DiscoverPullRequest(ctx context.Context, input TargetedDiscover
 			if isManualReviewerLoop(loop) {
 				manualLoopSeen = true
 			}
-			if !isManualReviewerLoop(loop) && domain.IsAutoLaneHeld(domain.LoopTypeReviewer, detail.Labels) {
+			if !isManualReviewerLoop(loop) && domain.IsAutoLaneHeldForNamespace(domain.LoopTypeReviewer, detail.Labels, namespace) {
 				result.Skipped++
 				continue
 			}
@@ -925,7 +927,7 @@ func (r *Runner) DiscoverPullRequest(ctx context.Context, input TargetedDiscover
 		return result, nil
 	}
 	pr := summaryFromDetail(detail)
-	if domain.IsAutoLaneHeld(domain.LoopTypeReviewer, pr.Labels) {
+	if domain.IsAutoLaneHeldForNamespace(domain.LoopTypeReviewer, pr.Labels, namespace) {
 		result.Skipped++
 		return result, nil
 	}
@@ -1247,8 +1249,9 @@ func (r *Runner) discoveryPolicyForProject(projectID string) DiscoveryPolicy {
 	if !ok {
 		return r.discoveryPolicy
 	}
-	labels := append([]string(nil), role.Discovery.Labels...)
-	return DiscoveryPolicy{AutoDiscovery: role.Discovery.Enabled, IncludeDrafts: role.Discovery.IncludeDrafts, RequireReviewRequest: role.Discovery.RequireReviewRequest, EnableSelfReview: role.Discovery.EnableSelfReview, Labels: labels, LabelMode: role.Discovery.LabelMode, IncludeSpecReviewingLabel: roles.Reviewer.Discovery.SpecReview.IncludeReviewingLabel, SpecReviewingLabel: roles.Reviewer.Discovery.SpecReview.ReviewingLabel, RoutedClaimPolicy: networkpolicy.ProjectPolicyForProject(*r.projectRoleConfig, projectID)}
+	namespace := config.ProjectLabelNamespace(r.projectRoleConfig, projectID)
+	triggerLabels := namespace.RemapAll(role.Discovery.Labels)
+	return DiscoveryPolicy{AutoDiscovery: role.Discovery.Enabled, IncludeDrafts: role.Discovery.IncludeDrafts, RequireReviewRequest: role.Discovery.RequireReviewRequest, EnableSelfReview: role.Discovery.EnableSelfReview, Labels: triggerLabels, LabelMode: role.Discovery.LabelMode, IncludeSpecReviewingLabel: roles.Reviewer.Discovery.SpecReview.IncludeReviewingLabel, SpecReviewingLabel: namespace.Remap(roles.Reviewer.Discovery.SpecReview.ReviewingLabel), RoutedClaimPolicy: networkpolicy.ProjectPolicyForProject(*r.projectRoleConfig, projectID)}
 }
 
 func reviewRequestRequiredForCandidate(policy DiscoveryPolicy, labels []string) bool {
@@ -1264,6 +1267,13 @@ func (r *Runner) reviewerAutoMergeConfigForProject(projectID string) config.Revi
 	}
 	roles := config.ProjectRoleConfigs(*r.projectRoleConfig, projectID)
 	return roles.Reviewer.AutoMerge
+}
+
+func (r *Runner) reviewerLabelNamespaceForProject(projectID string, metadataJSON *string) labels.Namespace {
+	if r == nil {
+		return labels.DefaultNamespace()
+	}
+	return config.ProjectLabelNamespaceForMetadata(r.projectRoleConfig, projectID, metadataJSON)
 }
 
 func (r *Runner) retryPolicyForProject(projectID string) config.ReviewerRetryConfig {
@@ -1702,7 +1712,7 @@ func (r *Runner) revalidateRoutedReviewerClaim(ctx context.Context, project stor
 	if err != nil {
 		return err
 	}
-	if domain.IsAutoLaneHeld(domain.LoopTypeReviewer, detail.Labels) {
+	if domain.IsAutoLaneHeldForNamespace(domain.LoopTypeReviewer, detail.Labels, config.ProjectLabelNamespaceForMetadata(r.projectRoleConfig, project.ID, project.MetadataJSON)) {
 		return &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", *queueItem.Repo, *queueItem.PRNumber)}
 	}
 	decision := routedReviewerClaimDecision(policy, "", detail.Author, detail.Labels, detail.ReviewRequestUsers)
@@ -1851,7 +1861,7 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 		}
 		return checkpoint, nil
 	}
-	if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeld(domain.LoopTypeReviewer, checkpoint.Detail.Labels) {
+	if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeldForNamespace(domain.LoopTypeReviewer, checkpoint.Detail.Labels, config.ProjectLabelNamespaceForMetadata(r.projectRoleConfig, input.Project.ID, input.Project.MetadataJSON)) {
 		return checkpoint, &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
 	}
 	currentLogin := ""
@@ -2320,7 +2330,7 @@ func (r *Runner) runThreadResolutionStep(ctx context.Context, input stepInput) (
 				r.appendThreadResolutionEvent(ctx, input, checkpoint.Snapshot.HeadSHA, strings.TrimSpace(decision.Decision), strings.TrimSpace(decision.Evidence), thread.ID, "skipped", skippedReason)
 				continue
 			}
-			if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeld(domain.LoopTypeReviewer, refreshedDetail.Labels) {
+			if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeldForNamespace(domain.LoopTypeReviewer, refreshedDetail.Labels, config.ProjectLabelNamespaceForMetadata(r.projectRoleConfig, input.Project.ID, input.Project.MetadataJSON)) {
 				return checkpoint, &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
 			}
 			checkpoint.Detail.ReviewRequests = cloneStrings(refreshedDetail.ReviewRequests)
@@ -2342,7 +2352,7 @@ func (r *Runner) runThreadResolutionStep(ctx context.Context, input stepInput) (
 				skippedReason = "candidate_no_longer_eligible"
 				continue
 			}
-			if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeld(domain.LoopTypeReviewer, refreshedDetail.Labels) {
+			if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeldForNamespace(domain.LoopTypeReviewer, refreshedDetail.Labels, config.ProjectLabelNamespaceForMetadata(r.projectRoleConfig, input.Project.ID, input.Project.MetadataJSON)) {
 				return checkpoint, &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
 			}
 			checkpoint.Detail.ReviewRequests = cloneStrings(refreshedDetail.ReviewRequests)
@@ -2729,7 +2739,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		return checkpoint, &loopError{message: "Reviewer agent did not report a valid completion marker after publishing review", kind: FailureRetryableAfterResume}
 	}
 	if cleanReviewNoopSummary(result.Summary) {
-		if reviewEvents.Clean == config.ReviewerReviewEventApprove && r.reviewerAutoMergeConfigForProject(input.Project.ID).Enabled && resolvePullRequestPhase(detailLabels(checkpoint.Detail)) != "spec" {
+		if reviewEvents.Clean == config.ReviewerReviewEventApprove && r.reviewerAutoMergeConfigForProject(input.Project.ID).Enabled && resolvePullRequestPhaseForNamespace(detailLabels(checkpoint.Detail), config.ProjectLabelNamespaceForMetadata(r.projectRoleConfig, input.Project.ID, input.Project.MetadataJSON)) != "spec" {
 			checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, Outcome: "clean", CleanNoop: true}
 			checkpoint.ResumePolicy = loops.ResumePolicyAdvanceFromCheckpoint
 			return checkpoint, nil
@@ -2781,7 +2791,7 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 		if detail.HeadSHA != "" && pending.HeadSHA != "" && detail.HeadSHA != pending.HeadSHA {
 			return markReviewerRunStale(checkpoint, fmt.Sprintf("PR head changed before publish: expected %s, got %s", pending.HeadSHA, detail.HeadSHA)), nil
 		}
-		if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeld(domain.LoopTypeReviewer, detail.Labels) {
+		if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeldForNamespace(domain.LoopTypeReviewer, detail.Labels, config.ProjectLabelNamespaceForMetadata(r.projectRoleConfig, input.Project.ID, input.Project.MetadataJSON)) {
 			return checkpoint, &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
 		}
 		if reason := reviewerPublishDriftReason(input, checkpoint, detail); reason != "" {
@@ -2799,7 +2809,7 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 				return checkpoint, nil
 			}
 		}
-		if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeld(domain.LoopTypeReviewer, detail.Labels) {
+		if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeldForNamespace(domain.LoopTypeReviewer, detail.Labels, config.ProjectLabelNamespaceForMetadata(r.projectRoleConfig, input.Project.ID, input.Project.MetadataJSON)) {
 			return checkpoint, &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
 		}
 		if criteriaResult, err := r.maybePublishCriteriaAnchoredCleanReview(ctx, input, checkpoint, pending, detail); err != nil {
@@ -2856,7 +2866,7 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 	if detail.HeadSHA != "" && pending.HeadSHA != "" && detail.HeadSHA != pending.HeadSHA {
 		return markReviewerRunStale(checkpoint, fmt.Sprintf("PR head changed before publish: expected %s, got %s", pending.HeadSHA, detail.HeadSHA)), nil
 	}
-	if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeld(domain.LoopTypeReviewer, detail.Labels) {
+	if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeldForNamespace(domain.LoopTypeReviewer, detail.Labels, config.ProjectLabelNamespaceForMetadata(r.projectRoleConfig, input.Project.ID, input.Project.MetadataJSON)) {
 		return checkpoint, &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
 	}
 	if reason := reviewerPublishDriftReason(input, checkpoint, detail); reason != "" {
@@ -2866,7 +2876,7 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 	if skipped, next, err := r.skipThreadResolutionFollowUpReview(ctx, input, checkpoint); skipped || err != nil {
 		return next, err
 	}
-	if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeld(domain.LoopTypeReviewer, detail.Labels) {
+	if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeldForNamespace(domain.LoopTypeReviewer, detail.Labels, config.ProjectLabelNamespaceForMetadata(r.projectRoleConfig, input.Project.ID, input.Project.MetadataJSON)) {
 		return checkpoint, &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
 	}
 	markerResult := ReviewMarkerResult{}
@@ -3198,7 +3208,7 @@ func (r *Runner) applyVerifiedReviewSideEffects(ctx context.Context, input stepI
 	if err != nil {
 		return &loopError{message: fmt.Sprintf("Failed to refresh pull request before applying review side effects: %v", err), kind: FailureRetryableAfterResume}
 	}
-	if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeld(domain.LoopTypeReviewer, freshDetail.Labels) {
+	if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeldForNamespace(domain.LoopTypeReviewer, freshDetail.Labels, config.ProjectLabelNamespaceForMetadata(r.projectRoleConfig, input.Project.ID, input.Project.MetadataJSON)) {
 		return &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
 	}
 	outcome := strings.ToLower(strings.TrimSpace(marker.Outcome))
@@ -3228,7 +3238,7 @@ func (r *Runner) applyCleanNoopReviewSideEffects(ctx context.Context, input step
 	if err != nil {
 		return &loopError{message: fmt.Sprintf("Failed to refresh pull request before applying clean review side effects: %v", err), kind: FailureRetryableAfterResume}
 	}
-	if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeld(domain.LoopTypeReviewer, freshDetail.Labels) {
+	if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeldForNamespace(domain.LoopTypeReviewer, freshDetail.Labels, config.ProjectLabelNamespaceForMetadata(r.projectRoleConfig, input.Project.ID, input.Project.MetadataJSON)) {
 		return &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
 	}
 	reaction := PullRequestReactionInput{Repo: input.Repo, PRNumber: input.PRNumber, Content: "+1", CWD: input.Project.RepoPath}
@@ -3256,6 +3266,7 @@ func (r *Runner) applyCleanSpecLabelTransition(ctx context.Context, input stepIn
 		return nil
 	}
 	specReviewingLabel := r.specReviewingLabel(input.Project.ID)
+	specReadyLabel := config.ProjectLabelNamespaceForMetadata(r.projectRoleConfig, input.Project.ID, input.Project.MetadataJSON).SpecReady()
 	checkpointHadSpecReviewing := labels.Has(detailLabels(checkpoint.Detail), specReviewingLabel)
 	if !checkpointHadSpecReviewing && !labels.Has(detail.Labels, specReviewingLabel) {
 		return nil
@@ -3264,7 +3275,7 @@ func (r *Runner) applyCleanSpecLabelTransition(ctx context.Context, input stepIn
 	if err != nil {
 		return &loopError{message: fmt.Sprintf("Failed to refresh pull request review state before spec-ready transition: %v", err), kind: FailureRetryableAfterResume}
 	}
-	if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeld(domain.LoopTypeReviewer, freshDetail.Labels) {
+	if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeldForNamespace(domain.LoopTypeReviewer, freshDetail.Labels, config.ProjectLabelNamespaceForMetadata(r.projectRoleConfig, input.Project.ID, input.Project.MetadataJSON)) {
 		return &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
 	}
 	if detail.HeadSHA != "" && freshDetail.HeadSHA != "" && detail.HeadSHA != freshDetail.HeadSHA {
@@ -3278,8 +3289,8 @@ func (r *Runner) applyCleanSpecLabelTransition(ctx context.Context, input stepIn
 			return &loopError{message: fmt.Sprintf("Failed to remove spec-reviewing label before marking publish success: %v", err), kind: FailureRetryableAfterResume}
 		}
 	}
-	if !labels.Has(freshDetail.Labels, labels.SpecReady) {
-		if err := r.github.AddPullRequestLabels(ctx, PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: []string{labels.SpecReady}, CWD: input.Project.RepoPath}); err != nil {
+	if !labels.Has(freshDetail.Labels, specReadyLabel) {
+		if err := r.github.AddPullRequestLabels(ctx, PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: []string{specReadyLabel}, CWD: input.Project.RepoPath}); err != nil {
 			return &loopError{message: fmt.Sprintf("Failed to add spec-ready label before marking publish success: %v", err), kind: FailureRetryableAfterResume}
 		}
 	}
@@ -3291,7 +3302,7 @@ func (r *Runner) reviewerPublishFreshDetailForMutation(ctx context.Context, inpu
 	if err != nil {
 		return PullRequestDetail{}, &loopError{message: fmt.Sprintf("Failed to refresh pull request before %s: %v", action, err), kind: FailureRetryableAfterResume}
 	}
-	if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeld(domain.LoopTypeReviewer, freshDetail.Labels) {
+	if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeldForNamespace(domain.LoopTypeReviewer, freshDetail.Labels, config.ProjectLabelNamespaceForMetadata(r.projectRoleConfig, input.Project.ID, input.Project.MetadataJSON)) {
 		return PullRequestDetail{}, &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
 	}
 	return freshDetail, nil
@@ -3310,7 +3321,7 @@ type criteriaPublishResult struct {
 }
 
 func (r *Runner) maybePublishCriteriaAnchoredCleanReview(ctx context.Context, input stepInput, checkpoint reviewerCheckpoint, pending pendingReviewCheckpoint, detail PullRequestDetail) (*criteriaPublishResult, error) {
-	if resolvePullRequestPhase(detail.Labels) == "spec" {
+	if resolvePullRequestPhaseForNamespace(detail.Labels, config.ProjectLabelNamespaceForMetadata(r.projectRoleConfig, input.Project.ID, input.Project.MetadataJSON)) == "spec" {
 		return nil, nil
 	}
 	if r.effectiveReviewEvents(input.Project.ID, input.Loop.MetadataJSON).Clean != config.ReviewerReviewEventApprove {
@@ -3404,7 +3415,7 @@ func (r *Runner) publishCriteriaFailureReview(ctx context.Context, input stepInp
 	if err != nil {
 		return nil, &loopError{message: fmt.Sprintf("Failed to refresh linked issue before applying criteria failure side effects: %v", err), kind: FailureRetryableAfterResume}
 	}
-	if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeld(domain.LoopTypeReviewer, freshIssue.Labels) {
+	if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeldForNamespace(domain.LoopTypeReviewer, freshIssue.Labels, config.ProjectLabelNamespaceForMetadata(r.projectRoleConfig, input.Project.ID, input.Project.MetadataJSON)) {
 		return nil, &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", issueRef.Repo, issueRef.Number)}
 	}
 	if err := r.github.RemoveIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: issueRef.Repo, IssueNumber: issueRef.Number, Labels: criteriaFailureLabels(freshIssue.Labels), CWD: input.Project.RepoPath}); err != nil {
@@ -3454,11 +3465,13 @@ func (r *Runner) verifyAcceptanceCriteria(rawDiff string, extracted []criteria.A
 }
 
 func (r *Runner) decideAutoMerge(ctx context.Context, input stepInput, detail PullRequestDetail, autoMergeCfg config.ReviewerAutoMergeConfig, issueRef linkedIssueReference) (automerge.AutoMergeDecision, error) {
-	decision := automerge.Decide(
+	namespace := r.reviewerLabelNamespaceForProject(input.Project.ID, input.Project.MetadataJSON)
+	decision := automerge.DecideForNamespace(
 		automerge.PRSnapshot{Labels: append([]string(nil), detail.Labels...), HasTrackedIssueLink: issueRef.Tracked},
 		autoMergeCfg,
 		automerge.BranchProtectionSnapshot{},
 		automerge.RepoSettingsSnapshot{},
+		namespace,
 	)
 	if decision.Reason == automerge.RefusalReasonDisabled || decision.Reason == automerge.RefusalReasonScope {
 		return decision, nil
@@ -3474,11 +3487,12 @@ func (r *Runner) decideAutoMerge(ctx context.Context, input stepInput, detail Pu
 			return automerge.AutoMergeDecision{}, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		}
 	}
-	return automerge.Decide(
+	return automerge.DecideForNamespace(
 		automerge.PRSnapshot{Labels: append([]string(nil), detail.Labels...), HasTrackedIssueLink: issueRef.Tracked},
 		autoMergeCfg,
 		automerge.BranchProtectionSnapshot{Exists: protection.Enabled, HasRequiredChecks: protection.HasRequiredChecks},
 		automerge.RepoSettingsSnapshot{AllowSquashMerge: settings.AllowSquashMerge, AllowMergeCommit: settings.AllowMergeCommit, AllowRebaseMerge: settings.AllowRebaseMerge, AllowAutoMerge: settings.AllowAutoMerge},
+		namespace,
 	), nil
 }
 
@@ -5768,7 +5782,7 @@ func reviewerAgentSideGitHubFetchContract() string {
 func buildReviewPromptWithInstructions(projectID string, instructionConfig config.Config, repo string, prNumber int64, checkpoint reviewerCheckpoint, runID string, idempotencyKey string, reviewEvents config.ReviewerReviewEventsConfig, manual bool, requireReviewRequest bool, reviewRequestBypassReason string, scope config.ReviewerScope, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string, looperCLIPath string, autoMergeEnabled bool) (string, config.CustomInstructionBlock) {
 	looperCLIPath = normalizeLooperCLIPath(looperCLIPath)
 	looperCLICommand := shellQuote(looperCLIPath)
-	phase := resolvePullRequestPhase(detailLabels(checkpoint.Detail))
+	phase := resolvePullRequestPhaseForNamespace(detailLabels(checkpoint.Detail), config.ProjectLabelNamespace(&instructionConfig, projectID))
 	phaseInstruction := "This is an implementation review. Focus on code correctness, safety, tests, and maintainability."
 	if phase == "spec" {
 		phaseInstruction = "This is a spec review. Focus on scope, correctness, feasibility, risks, and validation. Do not review implementation details beyond whether the spec is actionable."
@@ -6451,8 +6465,8 @@ func derefInt64(value *int64) int64 {
 	return *value
 }
 
-func resolvePullRequestPhase(labels []string) string {
-	if specpr.ResolvePullRequestPhase(labels) == specpr.PhaseSpec {
+func resolvePullRequestPhaseForNamespace(prLabels []string, namespace labels.Namespace) string {
+	if specpr.ResolvePullRequestPhaseForNamespace(prLabels, namespace) == specpr.PhaseSpec {
 		return "spec"
 	}
 	return "implementation"

@@ -14,6 +14,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/nexu-io/looper/internal/labels"
 )
 
 var networkNodeNamePattern = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
@@ -182,6 +184,11 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 		}
 		if project.Path != "" && project.RepoPath != "" && project.Path != project.RepoPath {
 			issues = append(issues, ValidationIssue{Path: prefix + ".path", Message: "must match repoPath when both path and repoPath are set"})
+		}
+		if project.LabelNamespace != "" {
+			if err := labels.ValidatePrefix(project.LabelNamespace); err != nil {
+				issues = append(issues, ValidationIssue{Path: prefix + ".labelNamespace", Message: err.Error()})
+			}
 		}
 		if !isValidWebhookModeOrEmpty(project.Webhook.Mode) {
 			issues = append(issues, ValidationIssue{Path: prefix + ".webhook.mode", Message: fmt.Sprintf("must be one of: %s, %s", WebhookModeGHForward, WebhookModeTunnel)})

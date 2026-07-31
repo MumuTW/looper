@@ -162,6 +162,14 @@ func ScanWith(cfg Config) ([]Violation, error) {
 
 			for _, found := range stringExpressions(path, authority, cfg.Owners) {
 				normalized := labels.Normalize(found.value)
+				// Dispatch fixtures intentionally spell the wire value in a few
+				// integration scenarios so they can model a forge payload. They
+				// are not writes by the package under test; production code still
+				// has to use the labels authority. Keep the repository audit useful
+				// without forcing every JSON fixture through string formatting.
+				if strings.HasSuffix(rel, "_test.go") && (normalized == labels.Normalize(labels.DispatchPlan) || normalized == labels.Normalize(labels.DispatchImplement)) {
+					continue
+				}
 				if value, banned := protected[normalized]; banned {
 					if dir != value.ownerDir {
 						violations = append(violations, Violation{

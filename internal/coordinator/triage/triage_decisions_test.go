@@ -4,6 +4,8 @@ import (
 	"context"
 	"testing"
 	"time"
+
+	"github.com/nexu-io/looper/internal/labels"
 )
 
 type fixtureLLM struct{ raw string }
@@ -43,6 +45,24 @@ func TestDecideUnclearDisposition(t *testing.T) {
 	}
 	if len(decision.ApplyLabels) != 2 || decision.ApplyLabels[0] != "needs-info" || decision.ApplyLabels[1] != "triaged" {
 		t.Fatalf("ApplyLabels = %v, want [needs-info triaged]", decision.ApplyLabels)
+	}
+}
+
+func TestDecideCustomNamespaceDoesNotProjectClassificationByDefault(t *testing.T) {
+	t.Parallel()
+	cfg := testConfig()
+	cfg.Namespace = labels.NewNamespace("team.looper:")
+	decision := Decide(context.Background(), fixtureLLM{raw: `{"disposition":"valid","comment":"Looks actionable.","labels":{"kind":["kind/bug"],"area":["area/coordinator"],"complexity":["complexity/m"],"dispatch":["team.looper:dispatch:plan"]}}`}, Input{Issue: Issue{Title: "Coordinator bug", CreatedAt: time.Now().UTC().Format(time.RFC3339)}, Config: cfg, Now: time.Now().UTC()})
+	if decision.NoOp {
+		t.Fatalf("Decide() = %#v, want a valid decision", decision)
+	}
+	if got, want := decision.ApplyLabels, []string{"team.looper:dispatch:plan", "triaged"}; len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("ApplyLabels = %v, want %v", got, want)
+	}
+	for _, pattern := range decision.ClearLabelPatterns {
+		if pattern == "kind/*" || pattern == "area/*" || pattern == "complexity/*" {
+			t.Fatalf("classification cleanup pattern %q leaked into custom namespace decision", pattern)
+		}
 	}
 }
 

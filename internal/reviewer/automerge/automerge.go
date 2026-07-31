@@ -46,10 +46,17 @@ func RefuseWithReason(reason RefusalReason) AutoMergeDecision {
 }
 
 func Decide(pr PRSnapshot, autoMergeConfig config.ReviewerAutoMergeConfig, protection BranchProtectionSnapshot, settings RepoSettingsSnapshot) AutoMergeDecision {
+	return DecideForNamespace(pr, autoMergeConfig, protection, settings, labels.DefaultNamespace())
+}
+
+// DecideForNamespace applies the auto-merge policy against the project's label
+// namespace. The namespace is an authority boundary: a PR carrying another
+// Looper instance's labels must not opt this instance into auto-merge.
+func DecideForNamespace(pr PRSnapshot, autoMergeConfig config.ReviewerAutoMergeConfig, protection BranchProtectionSnapshot, settings RepoSettingsSnapshot, namespace labels.Namespace) AutoMergeDecision {
 	if !autoMergeConfig.Enabled {
 		return RefuseWithReason(RefusalReasonDisabled)
 	}
-	if !labels.AnyLooperOwned(pr.Labels) || !pr.HasTrackedIssueLink {
+	if !namespace.AnyOwned(pr.Labels) || !pr.HasTrackedIssueLink {
 		return RefuseWithReason(RefusalReasonScope)
 	}
 	if autoMergeConfig.RequireBranchProtection && (!protection.Exists || !protection.HasRequiredChecks) {

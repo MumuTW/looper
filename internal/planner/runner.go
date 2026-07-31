@@ -568,8 +568,9 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 		return DiscoveryResult{}, err
 	}
 	result := DiscoveryResult{}
+	namespace := config.ProjectLabelNamespaceForMetadata(r.projectRoleConfig, project.ID, project.MetadataJSON)
 	for _, issue := range issues {
-		if domain.IsAutoLaneHeld(domain.LoopTypePlanner, issue.Labels) {
+		if domain.IsAutoLaneHeldForNamespace(domain.LoopTypePlanner, issue.Labels, namespace) {
 			result.Skipped++
 			continue
 		}
@@ -607,7 +608,7 @@ func (r *Runner) RouteIssue(ctx context.Context, input RouteIssueInput) (Discove
 	if project == nil {
 		return DiscoveryResult{}, fmt.Errorf("project not found: %s", input.ProjectID)
 	}
-	if project.Archived || domain.IsAutoLaneHeld(domain.LoopTypePlanner, input.Issue.Labels) {
+	if project.Archived || domain.IsAutoLaneHeldForNamespace(domain.LoopTypePlanner, input.Issue.Labels, config.ProjectLabelNamespaceForMetadata(r.projectRoleConfig, project.ID, project.MetadataJSON)) {
 		return DiscoveryResult{Skipped: 1}, nil
 	}
 	fingerprint := loops.ComputeDiscoveryFingerprint(
@@ -676,7 +677,8 @@ func (r *Runner) discoveryPolicyForProject(projectID string) DiscoveryPolicy {
 	if !ok {
 		return r.discoveryPolicy
 	}
-	return DiscoveryPolicy{AutoDiscovery: role.Discovery.Enabled, Labels: append([]string(nil), role.Discovery.Labels...), LabelMode: role.Discovery.LabelMode, RequireAssigneeCurrentUser: role.Discovery.RequireAssigneeCurrentUser}
+	namespace := config.ProjectLabelNamespace(r.projectRoleConfig, projectID)
+	return DiscoveryPolicy{AutoDiscovery: role.Discovery.Enabled, Labels: namespace.RemapAll(role.Discovery.Labels), LabelMode: role.Discovery.LabelMode, RequireAssigneeCurrentUser: role.Discovery.RequireAssigneeCurrentUser}
 }
 
 func (r *Runner) ProcessNext(ctx context.Context, claimedBy string) (*ProcessResult, error) {
@@ -1326,6 +1328,7 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (plannerCh
 	if pr == nil || pr.Number == 0 {
 		return checkpoint, &loopError{message: "Planner publish requires a pull request number", kind: FailureRetryableAfterResume}
 	}
+	namespace := config.ProjectLabelNamespaceForMetadata(r.projectRoleConfig, input.Project.ID, input.Project.MetadataJSON)
 	if plannerQueueItemIsManual(input.QueueItem) {
 		// Phase 2 applies only to automatic planner lanes.
 	} else if held, summary, err := r.plannerHoldSummaryForCheckpoint(ctx, input.Project, checkpoint); err != nil {
@@ -1333,11 +1336,12 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (plannerCh
 	} else if held {
 		return checkpoint, &holdSkipError{summary: summary}
 	}
-	if !stringInSlice(labels.SpecReviewing, checkpoint.Publish.LabelsAdded) {
-		if err := r.github.AddPullRequestLabels(ctx, PullRequestLabelsInput{Repo: issue.Repo, PRNumber: pr.Number, Labels: []string{labels.SpecReviewing}, CWD: input.Project.RepoPath}); err != nil {
+	specReviewingLabel := namespace.SpecReviewing()
+	if !stringInSlice(specReviewingLabel, checkpoint.Publish.LabelsAdded) {
+		if err := r.github.AddPullRequestLabels(ctx, PullRequestLabelsInput{Repo: issue.Repo, PRNumber: pr.Number, Labels: []string{specReviewingLabel}, CWD: input.Project.RepoPath}); err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		}
-		checkpoint.Publish.LabelsAdded = append(checkpoint.Publish.LabelsAdded, labels.SpecReviewing)
+		checkpoint.Publish.LabelsAdded = append(checkpoint.Publish.LabelsAdded, specReviewingLabel)
 		if err := r.persistCheckpoint(ctx, input.Run.ID, stepPublish, checkpoint); err != nil {
 			return checkpoint, wrapRetryableAfterResume(err)
 		}
@@ -1377,7 +1381,7 @@ func (r *Runner) plannerHoldSummary(ctx context.Context, project storage.Project
 	if err != nil {
 		return false, "", err
 	}
-	if !domain.IsAutoLaneHeld(domain.LoopTypePlanner, detail.Labels) {
+	if !domain.IsAutoLaneHeldForNamespace(domain.LoopTypePlanner, detail.Labels, config.ProjectLabelNamespaceForMetadata(r.projectRoleConfig, project.ID, project.MetadataJSON)) {
 		return false, "", nil
 	}
 	return true, fmt.Sprintf("Planner stopped because %s#%d is currently held", repo, issueNumber), nil
@@ -1394,7 +1398,7 @@ func (r *Runner) plannerHoldSummaryForCheckpoint(ctx context.Context, project st
 	if err != nil {
 		return false, "", err
 	}
-	if domain.IsAutoLaneHeld(domain.LoopTypePlanner, detail.Labels) {
+	if domain.IsAutoLaneHeldForNamespace(domain.LoopTypePlanner, detail.Labels, config.ProjectLabelNamespaceForMetadata(r.projectRoleConfig, project.ID, project.MetadataJSON)) {
 		return true, fmt.Sprintf("Planner stopped because %s#%d is currently held", checkpoint.Issue.Repo, checkpoint.Issue.IssueNumber), nil
 	}
 	if checkpoint.Publish == nil || checkpoint.Publish.PullRequest == nil || checkpoint.Publish.PullRequest.Number == 0 {
@@ -1404,7 +1408,7 @@ func (r *Runner) plannerHoldSummaryForCheckpoint(ctx context.Context, project st
 	if err != nil {
 		return false, "", err
 	}
-	if domain.IsAutoLaneHeld(domain.LoopTypePlanner, prDetail.Labels) {
+	if domain.IsAutoLaneHeldForNamespace(domain.LoopTypePlanner, prDetail.Labels, config.ProjectLabelNamespaceForMetadata(r.projectRoleConfig, project.ID, project.MetadataJSON)) {
 		return true, fmt.Sprintf("Planner stopped because %s#%d is currently held", checkpoint.Issue.Repo, checkpoint.Publish.PullRequest.Number), nil
 	}
 	return false, "", nil
@@ -1418,7 +1422,7 @@ func (r *Runner) plannerAdoptedPullRequestHoldSummary(ctx context.Context, proje
 	if err != nil {
 		return false, "", err
 	}
-	if domain.IsAutoLaneHeld(domain.LoopTypePlanner, detail.Labels) {
+	if domain.IsAutoLaneHeldForNamespace(domain.LoopTypePlanner, detail.Labels, config.ProjectLabelNamespaceForMetadata(r.projectRoleConfig, project.ID, project.MetadataJSON)) {
 		return true, fmt.Sprintf("Planner stopped because %s#%d is currently held", repo, prNumber), nil
 	}
 	return false, "", nil

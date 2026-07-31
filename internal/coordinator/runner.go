@@ -217,17 +217,23 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 		return DiscoveryResult{}, err
 	}
 	triageCfg := roleConfigToTriageConfig(roleCfg)
+	triageCfg.Namespace = r.projectLabelNamespace(input.ProjectID, project.MetadataJSON)
+	triageCfg.ProjectClassificationLabels = labels.Normalize(triageCfg.Namespace.Prefix) == labels.Prefix
 	projectRoles := config.ProjectRoleConfigs(*r.config, input.ProjectID)
 	dispatchCfg := roleConfigToDispatchConfig(roleCfg, projectRoles)
+	dispatchCfg.Namespace = triageCfg.Namespace
+	dispatchCfg.HoldLabel = triageCfg.Namespace.Remap(dispatchCfg.HoldLabel)
+	dispatchCfg.PlannerTriggerLabels = triageCfg.Namespace.RemapAll(dispatchCfg.PlannerTriggerLabels)
+	dispatchCfg.WorkerTriggerLabels = triageCfg.Namespace.RemapAll(dispatchCfg.WorkerTriggerLabels)
 	reviewerRole, _ := config.ProjectCodingRoleConfig(*r.config, input.ProjectID, config.CodingRoleReviewer)
 	fixerRole, _ := config.ProjectCodingRoleConfig(*r.config, input.ProjectID, config.CodingRoleFixer)
 	workerRole, _ := config.ProjectCodingRoleConfig(*r.config, input.ProjectID, config.CodingRoleWorker)
 	downstreamLabels := downstreamTriggerLabels{
-		reviewer:     append([]string(nil), reviewerRole.Discovery.Labels...),
+		reviewer:     triageCfg.Namespace.RemapAll(reviewerRole.Discovery.Labels),
 		reviewerMode: reviewerRole.Discovery.LabelMode,
-		fixer:        append([]string(nil), fixerRole.Discovery.Labels...),
+		fixer:        triageCfg.Namespace.RemapAll(fixerRole.Discovery.Labels),
 		fixerMode:    fixerRole.Discovery.LabelMode,
-		worker:       append([]string(nil), workerRole.Discovery.Labels...),
+		worker:       triageCfg.Namespace.RemapAll(workerRole.Discovery.Labels),
 		workerMode:   workerRole.Discovery.LabelMode,
 	}
 	loaded := make([]loadedIssue, 0, len(issues))
@@ -238,7 +244,7 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 		}
 		loaded = append(loaded, issue)
 	}
-	mergeWatchRetriggers, err := r.applyMergeWatch(ctx, input.Repo, project.RepoPath, loaded, config.ProjectRoleConfigs(*r.config, input.ProjectID))
+	mergeWatchRetriggers, err := r.applyMergeWatch(ctx, input.Repo, project.RepoPath, loaded, config.ProjectRoleConfigs(*r.config, input.ProjectID), triageCfg.Namespace)
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
@@ -494,7 +500,7 @@ func (r *Runner) workerAdmissionIntent(issue triage.Issue, action dispatch.Actio
 	if len(intersectExactLabels(action.TriggerLabels, desired)) > 0 {
 		return workerAdmissionIntent{Active: true, TriggerLabels: desired}
 	}
-	if hasExactLabel(issue.Labels, dispatch.DispatchPlan) {
+	if cfg.Namespace.IsDispatchPlanForLabels(issue.Labels) {
 		return workerAdmissionIntent{}
 	}
 	if len(intersectExactLabels(issue.Labels, desired)) > 0 {
@@ -784,7 +790,7 @@ func (r *Runner) applyDependencyActions(ctx context.Context, repo, cwd string, t
 		if _, ok := deps.retriageIssueNumbers[ref.Number]; !ok {
 			continue
 		}
-		patterns := append([]string{triageCfg.TriagedLabel}, labels.DispatchLabels()...)
+		patterns := append([]string{triageCfg.TriagedLabel}, triageCfg.Namespace.DispatchLabels()...)
 		if err := r.removeIssueLabels(ctx, repo, cwd, item.issue.Number, item.issue.Labels, patterns); err != nil {
 			return err
 		}
@@ -1473,7 +1479,7 @@ func dependencyTrackedIssue(issue triage.Issue, triagedLabel string, dispatchCfg
 	if !hasExactLabel(issue.Labels, triagedLabel) {
 		return false
 	}
-	dispatchLabel, ok := issueDispatchLabel(issue.Labels)
+	dispatchLabel, ok := issueDispatchLabelForNamespace(issue.Labels, dispatchCfg.Namespace)
 	if !ok {
 		return false
 	}
@@ -1484,25 +1490,36 @@ func dependencyTrackedIssue(issue triage.Issue, triagedLabel string, dispatchCfg
 	return len(removeExistingLabels(triggerLabels, issue.Labels)) > 0
 }
 
-func issueDispatchLabel(issueLabels []string) (string, bool) {
-	match := ""
+func issueDispatchLabelForNamespace(issueLabels []string, namespace labels.Namespace) (string, bool) {
+	configured := ""
+	legacy := ""
 	for _, label := range issueLabels {
-		if !labels.IsDispatch(label) {
+		if !namespace.IsDispatch(label) {
 			continue
 		}
-		if match != "" {
+		if namespace.IsConfiguredDispatch(label) {
+			if configured != "" {
+				return "", false
+			}
+			configured = label
+			continue
+		}
+		if legacy != "" {
 			return "", false
 		}
-		match = label
+		legacy = label
 	}
-	return match, match != ""
+	if configured != "" {
+		return configured, true
+	}
+	return legacy, legacy != ""
 }
 
 func configuredTriggerLabels(dispatchLabel string, cfg dispatch.Config) []string {
-	switch dispatchLabel {
-	case dispatch.DispatchPlan:
+	switch {
+	case cfg.Namespace.IsDispatchPlan(dispatchLabel):
 		return append([]string(nil), cfg.PlannerTriggerLabels...)
-	case dispatch.DispatchImplement:
+	case cfg.Namespace.IsDispatchImplement(dispatchLabel):
 		return append([]string(nil), cfg.WorkerTriggerLabels...)
 	default:
 		return nil
@@ -1622,6 +1639,13 @@ func roleConfigToDispatchConfig(roleCfg config.CoordinatorRoleConfig, roles conf
 		PlannerTriggerLabels: requiredDiscoveryLabels(planner.Discovery.Labels, planner.Discovery.LabelMode),
 		WorkerTriggerLabels:  requiredDiscoveryLabels(worker.Discovery.Labels, worker.Discovery.LabelMode),
 	}
+}
+
+func (r *Runner) projectLabelNamespace(projectID string, metadataJSON *string) labels.Namespace {
+	if r == nil {
+		return labels.DefaultNamespace()
+	}
+	return config.ProjectLabelNamespaceForMetadata(r.config, projectID, metadataJSON)
 }
 
 func requiredDiscoveryLabels(labels []string, labelMode config.LabelMode) []string {

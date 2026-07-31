@@ -204,6 +204,24 @@ Looper's frozen canonical top-level config roots are:
 
 See [ADR-0012](adr/0012-sqlite-project-authority.md) for the Authority and lifecycle decision.
 
+### Project label namespace
+
+Each project may set `projects[].labelNamespace` to isolate Looper's forge
+labels from another Looper instance. It must be a 1–63 character prefix ending
+in `:` and may contain only letters, numbers, `.`, `_`, or `-`; the default is
+`looper:`. Built-in dispatch and ownership checks use this namespace, and the
+legacy bare `dispatch/plan` and `dispatch/implement` labels are read-only
+compatibility inputs and are never emitted. Classification-label projection is
+kept as a separate opt-in policy; this setting does not make host-repository
+`kind/*`, `area/*`, or `complexity/*` labels Looper-owned.
+
+```toml
+[[projects]]
+id = "client-app"
+repoPath = "/absolute/path/to/client-app"
+labelNamespace = "client.looper:"
+```
+
 Legacy top-level `reviewer.*` input is compatibility-only. The canonical reviewer behavior home is `roles.reviewer.behavior.*`.
 
 Schema migration is independent from config-file format migration: precedence stays `defaults → config file → environment variables → CLI flags` regardless of whether a file still uses legacy reviewer paths or legacy JSON defaults.

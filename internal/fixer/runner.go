@@ -1645,12 +1645,13 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		return DiscoveryResult{}, err
 	}
 	result := DiscoveryResult{}
+	namespace := config.ProjectLabelNamespaceForMetadata(r.projectRoleConfig, project.ID, project.MetadataJSON)
 	for _, item := range recoveredQueueItems {
 		appendDiscoveryQueueItem(&result.QueueItems, item)
 	}
 	for _, pr := range openPRs {
 		manualFollowupLoop := manualFixerFollowupLoopFromCandidates(loopsByPR[pr.Number])
-		if manualFollowupLoop == nil && domain.IsAutoLaneHeld(domain.LoopTypeFixer, pr.Labels) {
+		if manualFollowupLoop == nil && domain.IsAutoLaneHeldForNamespace(domain.LoopTypeFixer, pr.Labels, namespace) {
 			result.Skipped++
 			continue
 		}
@@ -1732,7 +1733,7 @@ func (r *Runner) DiscoverPullRequest(ctx context.Context, input TargetedDiscover
 	}
 	pr := PullRequestSummary{Number: detail.Number, State: detail.State, IsDraft: detail.IsDraft, Labels: append([]string(nil), detail.Labels...), HeadSHA: detail.HeadSHA, Author: detail.Author}
 	result := DiscoveryResult{}
-	if manualFixerFollowupLoopFromCandidates(loopsByPR[input.PRNumber]) == nil && domain.IsAutoLaneHeld(domain.LoopTypeFixer, pr.Labels) {
+	if manualFixerFollowupLoopFromCandidates(loopsByPR[input.PRNumber]) == nil && domain.IsAutoLaneHeldForNamespace(domain.LoopTypeFixer, pr.Labels, config.ProjectLabelNamespaceForMetadata(r.projectRoleConfig, project.ID, project.MetadataJSON)) {
 		result.Skipped++
 		return result, nil
 	}
@@ -1792,9 +1793,10 @@ func (r *Runner) DiscoverPullRequestsForBaseBranchUpdate(ctx context.Context, in
 		return DiscoveryResult{Skipped: 1}, nil
 	}
 	result := DiscoveryResult{}
+	namespace := config.ProjectLabelNamespaceForMetadata(r.projectRoleConfig, project.ID, project.MetadataJSON)
 	for _, pr := range openPRs {
 		manualFollowupLoop := manualFixerFollowupLoopFromCandidates(loopsByPR[pr.Number])
-		if manualFollowupLoop == nil && domain.IsAutoLaneHeld(domain.LoopTypeFixer, pr.Labels) {
+		if manualFollowupLoop == nil && domain.IsAutoLaneHeldForNamespace(domain.LoopTypeFixer, pr.Labels, namespace) {
 			result.Skipped++
 			continue
 		}
@@ -1872,7 +1874,8 @@ func (r *Runner) discoveryPolicyForProject(projectID string) DiscoveryPolicy {
 	if !ok {
 		return r.discoveryPolicy
 	}
-	return DiscoveryPolicy{AutoDiscovery: role.Discovery.Enabled, IncludeDrafts: role.Discovery.IncludeDrafts, AuthorFilter: config.FixerAuthorFilter(role.Discovery.AuthorFilter), Labels: append([]string(nil), role.Discovery.Labels...), LabelMode: role.Discovery.LabelMode}
+	namespace := config.ProjectLabelNamespace(r.projectRoleConfig, projectID)
+	return DiscoveryPolicy{AutoDiscovery: role.Discovery.Enabled, IncludeDrafts: role.Discovery.IncludeDrafts, AuthorFilter: config.FixerAuthorFilter(role.Discovery.AuthorFilter), Labels: namespace.RemapAll(role.Discovery.Labels), LabelMode: role.Discovery.LabelMode}
 }
 
 func defaultDiscoveryLimit(limit int) int {
@@ -1942,7 +1945,7 @@ func (r *Runner) discoverPullRequestFromDetail(ctx context.Context, project stor
 	if err != nil {
 		return err
 	}
-	if (loop == nil || !isManualFixerFollowupCandidate(*loop)) && domain.IsAutoLaneHeld(domain.LoopTypeFixer, detail.Labels) {
+	if (loop == nil || !isManualFixerFollowupCandidate(*loop)) && domain.IsAutoLaneHeldForNamespace(domain.LoopTypeFixer, detail.Labels, config.ProjectLabelNamespaceForMetadata(r.projectRoleConfig, project.ID, project.MetadataJSON)) {
 		result.Skipped++
 		return nil
 	}
@@ -2709,7 +2712,7 @@ func (r *Runner) runDiscoverPRStep(ctx context.Context, input stepInput) (fixerC
 		return input.Checkpoint, err
 	}
 	checkpoint := input.Checkpoint
-	if !isManualFixerLoop(input.Loop) && domain.IsAutoLaneHeld(domain.LoopTypeFixer, detail.Labels) {
+	if !isManualFixerLoop(input.Loop) && domain.IsAutoLaneHeldForNamespace(domain.LoopTypeFixer, detail.Labels, config.ProjectLabelNamespaceForMetadata(r.projectRoleConfig, input.Project.ID, input.Project.MetadataJSON)) {
 		return checkpoint, &holdSkipError{summary: fmt.Sprintf("Fixer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
 	}
 	policy := r.discoveryPolicyForProject(input.Project.ID)
@@ -2757,7 +2760,7 @@ func (r *Runner) pullRequestLabelAuthoritySkipReason(ctx context.Context, loop s
 	if err != nil {
 		return "", runtimeSkipNone, err
 	}
-	if domain.IsAutoLaneHeld(domain.LoopTypeFixer, detail.Labels) {
+	if domain.IsAutoLaneHeldForNamespace(domain.LoopTypeFixer, detail.Labels, config.ProjectLabelNamespace(r.projectRoleConfig, projectID)) {
 		return fmt.Sprintf("Fixer stopped because %s#%d is currently held", repo, prNumber), runtimeSkipHold, nil
 	}
 	if len(prQueryLabels(policy.Labels)) == 0 {
@@ -2780,7 +2783,7 @@ func (r *Runner) fixerHoldSummary(ctx context.Context, project storage.ProjectRe
 	if err != nil {
 		return false, "", err
 	}
-	if !domain.IsAutoLaneHeld(domain.LoopTypeFixer, detail.Labels) {
+	if !domain.IsAutoLaneHeldForNamespace(domain.LoopTypeFixer, detail.Labels, config.ProjectLabelNamespaceForMetadata(r.projectRoleConfig, project.ID, project.MetadataJSON)) {
 		return false, "", nil
 	}
 	return true, fmt.Sprintf("Fixer stopped because %s#%d is currently held", repo, prNumber), nil
@@ -3704,7 +3707,7 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 	if err != nil {
 		return checkpoint, err
 	}
-	if !isManualFixerLoop(input.Loop) && domain.IsAutoLaneHeld(domain.LoopTypeFixer, liveDetail.Labels) {
+	if !isManualFixerLoop(input.Loop) && domain.IsAutoLaneHeldForNamespace(domain.LoopTypeFixer, liveDetail.Labels, config.ProjectLabelNamespaceForMetadata(r.projectRoleConfig, input.Project.ID, input.Project.MetadataJSON)) {
 		return checkpoint, &holdSkipError{summary: fmt.Sprintf("Fixer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
 	}
 	// Ancestor guard: if we previously pushed a fix commit, make sure the
@@ -4541,15 +4544,18 @@ func (r *Runner) runRecheckStep(ctx context.Context, input stepInput) (fixerChec
 	if err != nil {
 		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 	}
-	checkpointHadSpecReviewing := labels.Has(detailLabels(checkpoint.Detail), labels.SpecReviewing)
-	if (labels.Has(detail.Labels, labels.SpecReviewing) || checkpointHadSpecReviewing) && isSpecReviewClean(detail) {
-		if labels.Has(detail.Labels, labels.SpecReviewing) {
-			if err := r.github.RemovePullRequestLabels(ctx, PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: []string{labels.SpecReviewing}, CWD: input.Project.RepoPath}); err != nil {
+	namespace := config.ProjectLabelNamespaceForMetadata(r.projectRoleConfig, input.Project.ID, input.Project.MetadataJSON)
+	specReviewingLabel := namespace.SpecReviewing()
+	specReadyLabel := namespace.SpecReady()
+	checkpointHadSpecReviewing := labels.Has(detailLabels(checkpoint.Detail), specReviewingLabel)
+	if (labels.Has(detail.Labels, specReviewingLabel) || checkpointHadSpecReviewing) && isSpecReviewClean(detail) {
+		if labels.Has(detail.Labels, specReviewingLabel) {
+			if err := r.github.RemovePullRequestLabels(ctx, PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: []string{specReviewingLabel}, CWD: input.Project.RepoPath}); err != nil {
 				return checkpoint, err
 			}
 		}
-		if !labels.Has(detail.Labels, labels.SpecReady) {
-			if err := r.github.AddPullRequestLabels(ctx, PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: []string{labels.SpecReady}, CWD: input.Project.RepoPath}); err != nil {
+		if !labels.Has(detail.Labels, specReadyLabel) {
+			if err := r.github.AddPullRequestLabels(ctx, PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: []string{specReadyLabel}, CWD: input.Project.RepoPath}); err != nil {
 				return checkpoint, err
 			}
 		}
@@ -5354,7 +5360,7 @@ func (r *Runner) recoverLegacyNoopFollowupLoops(ctx context.Context, project sto
 			seenTargets[targetKey] = struct{}{}
 			continue
 		}
-		if !isManualFixerFollowupCandidate(loop) && domain.IsAutoLaneHeld(domain.LoopTypeFixer, detail.Labels) {
+		if !isManualFixerFollowupCandidate(loop) && domain.IsAutoLaneHeldForNamespace(domain.LoopTypeFixer, detail.Labels, config.ProjectLabelNamespaceForMetadata(r.projectRoleConfig, project.ID, project.MetadataJSON)) {
 			seenTargets[targetKey] = struct{}{}
 			continue
 		}
@@ -8723,7 +8729,7 @@ func (r *Runner) reRequestReviewersAfterFix(ctx context.Context, input stepInput
 	if err != nil {
 		return
 	}
-	if !isManualFixerLoop(input.Loop) && domain.IsAutoLaneHeld(domain.LoopTypeFixer, detail.Labels) {
+	if !isManualFixerLoop(input.Loop) && domain.IsAutoLaneHeldForNamespace(domain.LoopTypeFixer, detail.Labels, config.ProjectLabelNamespaceForMetadata(r.projectRoleConfig, input.Project.ID, input.Project.MetadataJSON)) {
 		return
 	}
 	if err := r.github.AddPullRequestReviewers(ctx, PullRequestReviewersInput{Repo: input.Repo, PRNumber: input.PRNumber, Reviewers: reviewers, CWD: input.Project.RepoPath}); err != nil && r.logger != nil {

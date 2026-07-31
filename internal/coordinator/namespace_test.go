@@ -1,0 +1,40 @@
+package coordinator
+
+import (
+	"testing"
+
+	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/labels"
+)
+
+func TestIssueDispatchLabelPrefersConfiguredLabelOverLegacyCompatibilityLabel(t *testing.T) {
+	namespace := labels.NewNamespace("team.looper:")
+	got, ok := issueDispatchLabelForNamespace([]string{"dispatch/plan", "team.looper:dispatch:plan"}, namespace)
+	if !ok || got != "team.looper:dispatch:plan" {
+		t.Fatalf("issueDispatchLabelForNamespace() = %q, %t, want configured dispatch label", got, ok)
+	}
+}
+
+func TestRetriageCleanupPatternsStayInsideConfiguredNamespace(t *testing.T) {
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	namespace := labels.NewNamespace("team.looper:")
+	patterns := retriageCleanupPatterns(cfg.Roles, "triaged", namespace)
+	if containsExact(patterns, "dispatch/plan") || containsExact(patterns, labels.DispatchPlan) {
+		t.Fatalf("cleanup patterns = %v, want no bare/default dispatch labels", patterns)
+	}
+	if !containsExact(patterns, namespace.DispatchPlan()) {
+		t.Fatalf("cleanup patterns = %v, want %q", patterns, namespace.DispatchPlan())
+	}
+}
+
+func containsExact(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}

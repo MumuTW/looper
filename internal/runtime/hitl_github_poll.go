@@ -5,9 +5,9 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/eventlog"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
-	"github.com/nexu-io/looper/internal/labels"
 	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/storage"
 )
@@ -315,7 +315,7 @@ func runGitHubHITLPoll(ctx context.Context, input defaultSchedulerTickInput, pro
 		return
 	}
 
-	awaitingLabel := labels.AwaitingHuman
+	awaitingLabel := config.ProjectLabelNamespaceForMetadata(input.Config, project.ID, project.MetadataJSON).AwaitingHuman()
 	var answerAuthors []string
 	if gh := input.Config.HITL.GitHub; gh != nil {
 		if strings.TrimSpace(gh.AwaitingLabel) != "" {
