@@ -470,12 +470,31 @@ directly: it invokes `buildFixerPrompt` (the function containing the
 `failure_kind` values that `parseFixerBlockedFailureKind` honors —
 `string(failureclass.RetryableTransient)` and
 `string(failureclass.ManualIntervention)` as advertised bullets, and not
-`retryable_after_resume` (still accepted on input, not advertised). Because the
-test exercises the production call site, swapped or unrelated `string` arguments
-at `runner.go:7307` produce a prompt that fails the assertion rather than
-compiling silently. A rename of either shared value updates the call site and the
-test's expected tokens together at compile time, and a removal of either
-advertised bullet is caught because the test asserts both.
+`retryable_after_resume` (still accepted on input, not advertised).
+
+The argument-order coverage the test claims depends on asserting each value in
+its semantic position, not just the bullet-token set: the two `string` arguments
+at `runner.go:7307` are the same type, so a swap still yields a prompt whose
+bullet-token set is exactly `{retryable_transient, manual_intervention}` and
+still omits `retryable_after_resume` — a set-only assertion passes despite
+attaching the retryable description to the manual kind and the manual
+description to the transient kind. The test therefore asserts each advertised
+bullet together with its corresponding description: the
+`- "retryable_transient":` bullet is followed by the retryable description
+("another attempt at the repair could succeed"), and the
+`- "manual_intervention":` bullet is followed by the manual description ("no
+retry can succeed without a human decision"). A swapped call site attaches the
+wrong description to each token and fails the paired assertion. The test
+additionally asserts the blocked-completion example
+`{"outcome":"blocked","failure_kind":"<value>",...}` embeds
+`string(failureclass.ManualIntervention)` (not the transient value), so using
+the transient kind in the example is caught too. With both the per-bullet
+description pairing and the example-kind assertion in place, swapped or
+unrelated `string` arguments at `runner.go:7307` produce a prompt that fails the
+assertion rather than compiling silently. A rename of either shared value
+updates the call site and the test's expected tokens together at compile time,
+and a removal of either advertised bullet is caught because the test asserts
+both.
 
 ## Alternatives considered
 
@@ -896,9 +915,14 @@ Per `AGENTS.md`, the root commands are the source of truth:
    `string(failureclass.RetryableTransient)` and
    `string(failureclass.ManualIntervention)` as advertised bullets (and not
    `retryable_after_resume`), matching the kinds `parseFixerBlockedFailureKind`
-   honors. Because the test drives the production call site at `runner.go:7307`,
-   swapped or unrelated `string` arguments produce a prompt that fails the
-   assertion. `internal/agent/prompt_test.go` is rewritten to use arbitrary
+   honors. The assertion pairs each advertised bullet with its corresponding
+   description (the `retryable_transient` bullet with the retryable description,
+   the `manual_intervention` bullet with the manual description) and asserts the
+   blocked-completion example embeds `string(failureclass.ManualIntervention)`,
+   not the transient value — a set-only check would pass under swapped same-typed
+   arguments, so the per-bullet pairing and example-kind assertion are what make
+   swapped or unrelated `string` arguments at `runner.go:7307` fail the suite.
+   `internal/agent/prompt_test.go` is rewritten to use arbitrary
    sentinel `string` parameters (no `failureclass` import) and assert the
    builder embeds the received values in both forms, keeping
    `go test ./internal/agent` free of the infra stack.
