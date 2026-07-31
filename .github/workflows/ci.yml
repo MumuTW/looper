@@ -270,7 +270,7 @@ jobs:
       - name: Run contract/invariant smoke
         env:
           LOOPER_E2E_ARTIFACT_ROOT: ${{ runner.temp }}/looper-e2e/contract-invariant-integration-smoke
-        run: go test ./internal/e2e -run 'TestSmokeLooperdBoots|TestSmokeLooperdFailsFast' -count=1 && go test ./internal/e2e/githubcontract -run 'TestInvariantGatewayUsesSupportedGHJSONFields|TestRegressionPR261FallsBackToIssueDetailForPRAuthorAssociation|TestFakeGHFixtureRejectsUnsupportedJSONField' -count=1
+        run: go test ./internal/e2e -run 'TestSmokeLooperdBoots|TestSmokeLooperdFailsFast|TestSmokeLooperdExits' -timeout 10m -count=1 && go test ./internal/e2e/githubcontract -run 'TestInvariantGatewayUsesSupportedGHJSONFields|TestRegressionPR261FallsBackToIssueDetailForPRAuthorAssociation|TestFakeGHFixtureRejectsUnsupportedJSONField' -timeout 10m -count=1
 
       - name: Upload smoke artifacts on failure
         if: failure()
@@ -301,7 +301,7 @@ jobs:
         if: needs.detect-e2e-changes.outputs.daemon_boot == 'true'
         env:
           LOOPER_E2E_ARTIFACT_ROOT: ${{ runner.temp }}/looper-e2e/daemon-boot-e2e
-        run: go test ./internal/e2e -run 'TestSmokeLooperdBoots|TestSmokeLooperdFailsFast' -count=1
+        run: go test ./internal/e2e -run 'TestSmokeLooperdBoots|TestSmokeLooperdFailsFast|TestSmokeLooperdExits' -timeout 10m -count=1
 
       - name: Upload daemon boot artifacts on failure
         if: failure()
@@ -332,7 +332,7 @@ jobs:
         if: needs.detect-e2e-changes.outputs.github_contract == 'true'
         env:
           LOOPER_E2E_ARTIFACT_ROOT: ${{ runner.temp }}/looper-e2e/github-contract-e2e
-        run: go test ./internal/e2e/githubcontract -count=1
+        run: go test ./internal/e2e/githubcontract -timeout 10m -count=1
 
       - name: Upload GitHub contract artifacts on failure
         if: failure()
@@ -363,7 +363,7 @@ jobs:
         if: needs.detect-e2e-changes.outputs.resolve_comments == 'true'
         env:
           LOOPER_E2E_ARTIFACT_ROOT: ${{ runner.temp }}/looper-e2e/resolve-comments-e2e
-        run: go test ./internal/e2e -run 'TestScenarioResolveComments' -count=1
+        run: go test ./internal/e2e -run 'TestScenarioResolveComments' -timeout 10m -count=1
 
       - name: Upload resolve-comments artifacts on failure
         if: failure()
@@ -394,7 +394,7 @@ jobs:
         if: needs.detect-e2e-changes.outputs.worktree_invariants == 'true'
         env:
           LOOPER_E2E_ARTIFACT_ROOT: ${{ runner.temp }}/looper-e2e/worktree-invariants-e2e
-        run: go test ./internal/e2e -run 'TestInvariantWorker' -count=1
+        run: go test ./internal/e2e -run 'TestInvariantWorker' -timeout 10m -count=1
 
       - name: Upload worktree artifacts on failure
         if: failure()

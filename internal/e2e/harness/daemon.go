@@ -20,15 +20,17 @@ import (
 )
 
 type DaemonProcess struct {
-	cmd        *exec.Cmd
-	home       TempHome
-	configPath string
-	stdoutPath string
-	stderrPath string
-	baseURL    string
-	doneCh     chan struct{}
-	mu         sync.RWMutex
-	waitErr    error
+	cmd             *exec.Cmd
+	home            TempHome
+	configPath      string
+	stdoutPath      string
+	stderrPath      string
+	baseURL         string
+	doneCh          chan struct{}
+	supervision     *os.File
+	supervisionOnce sync.Once
+	mu              sync.RWMutex
+	waitErr         error
 }
 
 func (d *DaemonProcess) BaseURL() string {
@@ -59,12 +61,28 @@ func StartLooperd(tb testing.TB, bins BuiltBinaries, home TempHome, configPath s
 	for key, value := range extraEnv {
 		cmd.Env = append(cmd.Env, key+"="+value)
 	}
+	// Supervision pipe: the daemon watches its stdin and exits when it reads
+	// EOF. Holding the write end in this process means the kernel closes it
+	// when the test binary dies for any reason — including SIGKILL and the
+	// go-test timeout panic, both of which skip tb.Cleanup — so no orphaned
+	// looperd survives the test run.
+	supervisionR, supervisionW, err := os.Pipe()
+	if err != nil {
+		_ = stdoutFile.Close()
+		_ = stderrFile.Close()
+		tb.Fatalf("create looperd supervision pipe: %v", err)
+	}
+	cmd.Stdin = supervisionR
+	cmd.Env = append(cmd.Env, "LOOPER_EXIT_ON_STDIN_CLOSE=1")
 	if err := cmd.Start(); err != nil {
 		_ = stdoutFile.Close()
 		_ = stderrFile.Close()
+		_ = supervisionR.Close()
+		_ = supervisionW.Close()
 		tb.Fatalf("start looperd: %v", err)
 	}
-	proc := &DaemonProcess{cmd: cmd, home: home, configPath: configPath, stdoutPath: stdoutPath, stderrPath: stderrPath, baseURL: BaseURL(host, port), doneCh: make(chan struct{})}
+	_ = supervisionR.Close()
+	proc := &DaemonProcess{cmd: cmd, home: home, configPath: configPath, stdoutPath: stdoutPath, stderrPath: stderrPath, baseURL: BaseURL(host, port), doneCh: make(chan struct{}), supervision: supervisionW}
 	go func() {
 		err := cmd.Wait()
 		_ = stdoutFile.Close()
@@ -73,6 +91,7 @@ func StartLooperd(tb testing.TB, bins BuiltBinaries, home TempHome, configPath s
 		proc.waitErr = err
 		proc.mu.Unlock()
 		close(proc.doneCh)
+		proc.CloseSupervision()
 	}()
 	tb.Cleanup(func() {
 		proc.Stop(context.Background())
@@ -163,6 +182,22 @@ func (d *DaemonProcess) Stop(ctx context.Context) {
 	case <-d.doneCh:
 	}
 	d.cmd = nil
+}
+
+// CloseSupervision closes the write end of the daemon's stdin supervision
+// pipe, which is what the kernel does when the test binary dies. The daemon
+// reads EOF and shuts itself down; tests use this to exercise the orphan
+// protection directly.
+func (d *DaemonProcess) CloseSupervision() {
+	if d == nil || d.supervision == nil {
+		return
+	}
+	d.supervisionOnce.Do(func() { _ = d.supervision.Close() })
+}
+
+// Exited is closed once the daemon process has exited.
+func (d *DaemonProcess) Exited() <-chan struct{} {
+	return d.doneCh
 }
 
 func (d *DaemonProcess) exitErr() error {

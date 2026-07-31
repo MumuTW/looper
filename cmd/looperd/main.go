@@ -65,6 +65,12 @@ func runWithDeps(args []string, stdout, stderr io.Writer, deps runDeps) int {
 		return 0
 	}
 
+	if stdinSupervisionEnabled(deps.env) {
+		startStdinSupervision(os.Stdin, stderr, stdinSupervisionForceExitDelay,
+			func() { _ = syscall.Kill(os.Getpid(), syscall.SIGTERM) },
+			func() { os.Exit(1) })
+	}
+
 	bootstrapImpl := deps.bootstrapImpl
 	if bootstrapImpl == nil {
 		bootstrapImpl = func(ctx context.Context, options bootstrap.Options) (bootstrap.Result, error) {
