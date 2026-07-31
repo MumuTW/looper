@@ -58,7 +58,7 @@ jobs:
         env:
           LOOPER_E2E_ARTIFACT_ROOT: ${{ runner.temp }}/looper-e2e/github-sandbox-e2e
           LOOPER_E2E_GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
-        run: go test ./internal/e2e -run '^TestGitHubSandbox' -count=1
+        run: go test ./internal/e2e -run '^TestGitHubSandbox' -timeout 10m -count=1
 
       - name: Upload sandbox artifacts on failure
         if: failure()

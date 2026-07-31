@@ -65,6 +65,8 @@ func runWithDeps(args []string, stdout, stderr io.Writer, deps runDeps) int {
 		return 0
 	}
 
+	supervisionNotifier := setupStdinSupervision(deps.env, stderr)
+
 	bootstrapImpl := deps.bootstrapImpl
 	if bootstrapImpl == nil {
 		bootstrapImpl = func(ctx context.Context, options bootstrap.Options) (bootstrap.Result, error) {
@@ -79,6 +81,7 @@ func runWithDeps(args []string, stdout, stderr io.Writer, deps runDeps) int {
 		Stdout:          stdout,
 		Stderr:          stderr,
 		WaitForShutdown: true,
+		SignalNotifier:  supervisionNotifier,
 	})
 	if err == nil {
 		return 0
