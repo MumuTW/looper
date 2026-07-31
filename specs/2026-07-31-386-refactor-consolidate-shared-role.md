@@ -120,7 +120,9 @@ not a solution to it.
    its four `Kind` constants from `policy`'s string constants at compile time
    (Step 5). `policy` gains the two kind constants it currently lacks
    (`FailureKindRetryableTransient`, `FailureKindNonRetryable`) so it owns all
-   four string values; `failureclass.Kind` stays `type Kind string` and
+   four string values, and the umbrella `internal/loops` package re-exports those
+   two alongside its existing two to keep its "re-exports every name here"
+   contract (Step 5); `failureclass.Kind` stays `type Kind string` and
    `Classify`'s public API is unchanged, but each `failureclass` constant is now
    `const RetryableTransient Kind = policy.FailureKindRetryableTransient` (an
    untyped-string-to-`Kind` constant conversion), so a rename in `policy`
@@ -318,18 +320,33 @@ receive a *dynamic* `failureclass.Kind` — four in the fixer
 (`runner.go:3378,3403,3650,6480`, taking `d.Kind` / `failure.Kind` from a
 `Decision` or validation failure) and one each in the reviewer, worker, and
 planner (`runner.go:4640/3403/1936`, taking `failureclass.Classify(...)`
-directly). Every other `loopError.kind` assignment spells a named
-`FailureRetryable*` constant (a known kind that needs no normalization). If an
+directly). Every other `loopError.kind` assignment is one of two safe shapes: a
+named `FailureRetryable*` constant (a known kind that needs no normalization),
+or a copy of an already-normalized kind — either a `loopError.kind` field read
+(`kind: failure.kind`) or a local that is itself only ever assigned from those
+two shapes (e.g. `kind := FailureRetryableTransient; ...; kind: kind`). If an
 implementation replaces any of the seven dynamic-source calls with a direct
 assignment (`kind: d.Kind` or `kind: failureclass.Classify(...)` without
 `Normalize`), the `Normalize` unit test, the four-kind runner tests, staticcheck,
 and the deleted-symbol search (Step 7) all still pass, while a future unknown
-kind no longer falls back to `non_retryable`. A structural check (Validation
-step 8) ties every former conversion site to `failureclass.Normalize`: it scans
-the `kind:` assignments in the four runners for a dynamic source
-(`failureclass.Classify` or a `.Kind` field access) and fails any line that does
-not also contain `failureclass.Normalize`, so a direct-assignment bypass of the
-fallback fails the suite rather than compiling silently.
+kind no longer falls back to `non_retryable`.
+
+A line-regex check is not a sound gate for this: it only sees the text of the
+`kind:` line, so storing the dynamic value in a local first
+(`classified := failureclass.Classify(...)` then `kind: classified`) bypasses
+`Normalize` while matching no dynamic-source pattern on the `kind:` line. A
+regex that claims every bypass fails is claiming an invariant it cannot enforce.
+Validation step 8 therefore uses an AST-based check with intra-procedural origin
+tracking instead of a regex: for every `loopError.kind` assignment in the four
+runners it traces the value expression back to its origin within the same
+function and fails when a dynamic source (`failureclass.Classify(...)` or a
+capital-`K` `.Kind` field read off a non-`loopError` struct such as `Decision`)
+reaches `kind` without being wrapped in `failureclass.Normalize`. A bare local
+like `kind: classified` is resolved to its assignments, so the indirect
+assignment is caught — the implementer must write
+`kind: failureclass.Normalize(classified)`. Known-constant references,
+`loopError.kind` copies, and locals whose every reaching assignment is one of
+those two safe shapes pass. This makes the gate match the invariant it claims.
 
 ### Step 3 — Audit the cross-package typed surface
 
@@ -389,6 +406,28 @@ const (
 	// ... existing ResumePolicy* constants unchanged ...
 )
 ```
+
+The umbrella `internal/loops` package's documented compatibility contract
+(`internal/loops/policy.go:7`: "internal/loops re-exports every name here")
+covers every exported name in the leaf, so the two new constants must be
+re-exported there too, not added to the leaf alone. `internal/loops/policy.go`
+gains the matching two aliases alongside the existing two:
+
+```go
+const (
+	FailureKindRetryableTransient   = policy.FailureKindRetryableTransient
+	FailureKindRetryableAfterResume = policy.FailureKindRetryableAfterResume
+	FailureKindNonRetryable         = policy.FailureKindNonRetryable
+	FailureKindManualIntervention   = policy.FailureKindManualIntervention
+	// ... existing ResumePolicy* aliases unchanged ...
+)
+```
+
+Without these aliases, callers following the documented `loops.*` umbrella API
+cannot reach `loops.FailureKindRetryableTransient` or
+`loops.FailureKindNonRetryable` — the leaf gains names the umbrella promises to
+expose, breaking the contract the package doc asserts. Adding them is part of
+this step, not a follow-up.
 
 `failureclass` imports `policy` and re-derives its four `Kind` constants from
 `policy`'s untyped string constants (an untyped-string-to-`Kind` constant
@@ -629,7 +668,10 @@ test):**
    (`FailureKindRetryableTransient`, `FailureKindNonRetryable`) so it owns all
    four, and `failureclass` imports `policy` and derives its four `Kind`
    constants from `policy`'s untyped string constants at compile time (Step 5).
-   The dependency runs in that direction because `policy` is an intentional
+   The umbrella `internal/loops` package re-exports the two new constants
+   alongside its existing two, keeping its "re-exports every name here" contract
+   so the documented `loops.*` API exposes all four (Step 5). The dependency runs
+   in that direction because `policy` is an intentional
    stdlib-only leaf (its package doc states this) so `reviewer/workflow` can
    depend on it without pulling in the `internal/infra/github` stack
    `failureclass` carries; `failureclass` importing `policy` adds no cycle
@@ -814,6 +856,12 @@ Infra signals remain for drift detection, not authority.
   drift test is added: `failureclass` imports `policy` and derives its `Kind`
   constants from these strings at compile time (Step 5), so a rename propagates
   by import, not by a synchronization gate.
+- `internal/loops/policy.go` — the umbrella package re-exports the two new leaf
+  constants (`FailureKindRetryableTransient`, `FailureKindNonRetryable`) as
+  aliases alongside the existing two, satisfying its own package-doc contract
+  ("internal/loops re-exports every name here", `policy.go:7`). Without this
+  edit the leaf gains names the documented `loops.*` API does not expose, so
+  callers using the umbrella path cannot reach the new constants.
 
 **Test files:** Call sites in `*_test.go` that reference `FailureRetryable*`
 constants continue to compile unchanged (the constants are re-exported). The one
@@ -971,35 +1019,64 @@ Per `AGENTS.md`, the root commands are the source of truth:
      exit 1
    fi
    ```
-8. **Normalize call-site structural check (Step 2).** The `Normalize` unit test
+8. **Normalize call-site AST check (Step 2).** The `Normalize` unit test
    and the four-kind runner tests do not prove the seven former `xxxFailureKind`
    call sites actually invoke `failureclass.Normalize` — a direct `kind: d.Kind`
    or `kind: failureclass.Classify(...)` assignment bypasses the fallback but
    still passes those tests, staticcheck, and the deleted-symbol search (step 7).
-   The seven sites are the only `loopError.kind` assignments that receive a
-   *dynamic* `failureclass.Kind` (a `.Kind` field access or a `Classify` call);
-   every other `loopError.kind` assignment spells a named `FailureRetryable*`
-   constant and needs no normalization. A structural search fails when any
-   `kind:` assignment in the four runners carries a dynamic source but does not
-   also contain `failureclass.Normalize`, so a direct-assignment bypass of the
-   unknown-kind → `non_retryable` fallback fails the suite rather than compiling
-   silently:
+   A line-regex gate is not sound here: it only inspects the text of the `kind:`
+   line, so an indirect assignment that first stores the dynamic value in a local
+   (`classified := failureclass.Classify(...)` then `kind: classified`) bypasses
+   `Normalize` while matching no dynamic-source pattern on the `kind:` line. The
+   gate must therefore see through locals, which a regex cannot.
 
-   ```shell
-   #!/usr/bin/env bash
-   set -euo pipefail
+   The check is a Go test, not a shell regex, using the stdlib `go/parser` +
+   `go/ast` (the same parser-only pattern the repo already uses for structural
+   contract tests such as `internal/runtime/runs_service_absent_test.go`; no
+   `go/types` or `golang.org/x/tools` dependency is added). It parses each of
+   `internal/{fixer,reviewer,worker,planner}/runner.go`, locates every
+   `loopError` composite literal `kind` element (and every assignment to a
+   `loopError` value's `.kind` field), and classifies the value expression by
+   intra-procedural origin tracking within the enclosing function:
 
-   # kind: lines that receive a dynamic failureclass.Kind (a .Kind field access
-   # or a failureclass.Classify call) but do not route it through Normalize.
-   if rg -n 'kind:.*(failureclass\.Classify|\w+\.Kind)\b' \
-        internal/fixer/runner.go internal/reviewer/runner.go \
-        internal/worker/runner.go internal/planner/runner.go \
-        | rg -v 'failureclass\.Normalize'
-   then
-     echo "loopError.kind receives a dynamic failureclass.Kind without failureclass.Normalize" >&2
-     exit 1
-   fi
-   ```
+   - A call to `failureclass.Normalize(...)` — **safe** (normalized).
+   - A reference to a known-kind constant — `failureclass.RetryableTransient` /
+     `RetryableAfterResume` / `NonRetryable` / `ManualIntervention`, or the
+     per-role `FailureRetryable*` / `FailureNonRetryable` /
+     `FailureManualIntervention` aliases — **safe** (a known kind).
+   - A lowercase `.kind` selector read off a `loopError` value
+     (`kind: failure.kind`) — **safe** (a copy of an already-normalized kind, by
+     this same invariant).
+   - A bare identifier (local variable or parameter) — resolve it to every
+     assignment to that name within the same function and classify each
+     right-hand side recursively; **safe** only if every reaching assignment is
+     itself safe, **unsafe** if any reaching assignment is a dynamic source not
+     wrapped in `Normalize`.
+   - A dynamic source — `failureclass.Classify(...)` or a capital-`K` `.Kind`
+     selector read off a non-`loopError` struct (e.g. `Decision.Kind`,
+     `failure.Kind` on a validation failure) — **unsafe** unless it is the
+     argument of a `failureclass.Normalize(...)` call.
+   - Any other expression — **unsafe** (conservative: an untracked source could
+     carry a future unknown kind past the fallback).
+
+   The test fails on the first **unsafe** `kind` assignment, reporting the file
+   and position. This closes the indirect-assignment hole: `kind: classified`
+   resolves `classified` back to `failureclass.Classify(...)` and fails, so the
+   implementer must write `kind: failureclass.Normalize(classified)`. The
+   existing safe shapes keep passing — `kind: FailureRetryableTransient`,
+   `kind: failure.kind`, and `kind: kind` where `kind` is only ever assigned
+   from `FailureRetryable*` constants all resolve to a safe origin. Capital-`K`
+   `.Kind` (dynamic, on `Decision`/validation structs) is distinguished from
+   lowercase `.kind` (a `loopError` copy) by the selector name, which is the same
+   distinction the deleted regex relied on, now applied through data flow rather
+   than a single line of text.
+
+   This is covering, not propping up: it is the first enforcement of the
+   `Normalize` fallback invariant the refactor relies on, and it replaces a
+   regex that claimed to enforce that invariant but could not. The production
+   surface it guards does not grow — the seven call sites already route through
+   `Normalize` after Step 2 — so the test is a regression net, not a new state
+   machine.
 
    (Step 5's reverse-dependency derivation — `failureclass` importing `policy`
    and re-deriving its `Kind` constants from `policy`'s strings — needs no
@@ -1033,13 +1110,18 @@ deleted, `Policy.FailureKind` is typed `failureclass.Kind`, and `PolicyFor`
 returns the shared constants directly (with both consumers'
 string→kind casts deleted), `internal/loops/policy` owns all four kind string
 constants and `failureclass` imports `policy` and derives its `Kind` constants
-from them at compile time (no policy or validation drift test), the fixer
+from them at compile time (no policy or validation drift test), the umbrella
+`internal/loops` package re-exports the two new policy constants
+(`FailureKindRetryableTransient`, `FailureKindNonRetryable`) alongside the
+existing two so the documented `loops.*` API exposes all four, the fixer
 prompt's advertised `failure_kind` tokens are derived from
 `string(failureclass.*)` passed into `AppendFixerCompletionInstruction` from the
 fixer call site, the deleted-symbol absence check (step 7) passes, the
-Normalize call-site structural check (step 8) passes — so every former
+Normalize call-site AST check (step 8) passes — so every former
 `xxxFailureKind` call site routes its dynamic `failureclass.Kind` through
-`failureclass.Normalize` and a direct-assignment bypass fails the suite — the
+`failureclass.Normalize`, and a bypass fails the suite whether the dynamic
+value is assigned inline or stored in a local first (the AST check traces
+locals to their origin) — the
 four-kind regression coverage above exists, the fixer-prompt call-site coverage
 test (step 9) exists — exercising `buildFixerPrompt` to catch swapped or
 unrelated `string` arguments at the `runner.go:7307` call site, with
