@@ -287,10 +287,20 @@ func TestMaterializeCatalogDoesNotApplyConfigPolicyToAPIRecord(t *testing.T) {
 func TestMaterializeCatalogRejectsUnknownProvider(t *testing.T) {
 	t.Parallel()
 
-	metadata := `{"provider":"removed","repo":"core/odcrew","source":"api"}`
+	metadata := `{"provider":"removed","repo":"core/odcrew","source":"config"}`
 	_, err := MaterializeCatalog(config.Config{}, []storage.ProjectRecord{{ID: "odcrew", MetadataJSON: &metadata}})
 	if err == nil || !strings.Contains(err.Error(), `unknown provider "removed"`) {
 		t.Fatalf("MaterializeCatalog() error = %v, want unknown provider", err)
+	}
+}
+
+func TestMaterializeCatalogRejectsUnreconciledLegacyAPIProviderBinding(t *testing.T) {
+	t.Parallel()
+
+	metadata := `{"provider":"removed","repo":"core/odcrew","source":"api"}`
+	_, err := MaterializeCatalog(config.Config{}, []storage.ProjectRecord{{ID: "odcrew", MetadataJSON: &metadata}})
+	if err == nil || !strings.Contains(err.Error(), `unknown provider "removed"`) {
+		t.Fatalf("MaterializeCatalog() error = %v, want unreconciled legacy provider rejected", err)
 	}
 }
 
@@ -298,7 +308,7 @@ func TestMaterializeCatalogAllowsDuplicateReposAcrossProviders(t *testing.T) {
 	t.Parallel()
 
 	githubMetadata := `{"repo":"MumuTW/looper","source":"config"}`
-	ghesMetadata := `{"provider":"ghes-main","repo":"NEXU-IO/LOOPER","source":"api"}`
+	ghesMetadata := `{"provider":"ghes-main","repo":"MUMUTW/LOOPER","source":"config"}`
 	global := config.Config{Providers: []config.ProviderConfig{{ID: "ghes-main", Kind: config.ProviderKindGitHub, BaseURL: "https://ghe.example.test"}}}
 
 	got, err := MaterializeCatalog(global, []storage.ProjectRecord{
