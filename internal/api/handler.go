@@ -221,8 +221,8 @@ func NewHandler(context Context) *Handler {
 }
 
 // lockLoopRetry acquires the process-wide per-loop requeue mutex shared by
-// retryLoop, start/requeue (mutateLoopStatus → Running), issue-worker reuse
-// (POST /workers), and runtime HITL free-text / answer requeues
+// retryLoop, terminal close, start/requeue (mutateLoopStatus → Running),
+// issue-worker reuse (POST /workers), and runtime HITL free-text / answer requeues
 // (looperdruntime.LockLoopRequeue). Without this shared exclusion, runtime
 // inbox delivery can requeue after discard preflight and before git reset,
 // wiping the worktree for the message-driven continuation when the retry TX
@@ -2962,6 +2962,12 @@ func (h *Handler) buildActiveRunRouteResponse(r *http.Request, path string) (any
 		if err != nil {
 			return nil, err
 		}
+		// Close and retry both change spawn admission and durable queue state.
+		// Hold the same per-loop mutex as retryLoop so a retry cannot clear the
+		// close gate and publish claimable work between BeginLoopStop and the
+		// terminal transaction (or immediately after close wins).
+		unlock := h.lockLoopRetry(loop.ID)
+		defer unlock()
 		return h.context.CloseLoop(r.Context(), loop.ID, fmt.Sprintf("Closed by user via selector %s", selector))
 	default:
 		return nil, apiError{code: pkgapi.ErrorCodeRouteNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Unknown route: %s", path)}
