@@ -88,6 +88,7 @@ var reasonExplanations = map[ReasonCode]string{
 	ReasonReviewRequired:            "a required review is missing",
 	ReasonReviewChangesRequested:    "a reviewer requested changes",
 	ReasonCodexReviewMissing:        "a completed Codex review for the current head is required",
+	ReasonCodexReviewInProgress:     "a Codex review for the current head is still in progress",
 	ReasonCodexBlockingFindings:     "the current-head Codex review reported blocking findings",
 	ReasonCodexReviewOutcomeUnknown: "the current-head Codex review has no recognized outcome",
 	ReasonUnresolvedReviewThread:    "a review thread is unresolved",

@@ -26,6 +26,65 @@ func TestEvaluatePullRequestRequiresCodexReviewForCurrentHead(t *testing.T) {
 	}
 }
 
+func TestEvaluatePullRequestReportsCodexReviewInProgress(t *testing.T) {
+	fixture := newGatekeeperFixtureWithoutReview(t)
+	seedReviewerAgentEvent(t, fixture, reviewerAgentStartedEventType, "head-1", "execution-1", 1)
+
+	report, err := New(Options{Repos: fixture.repos, GitHub: fixture.github, Now: func() time.Time { return fixture.now }}).EvaluatePullRequest(context.Background(), EvaluationInput{
+		ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, ExpectedHeadSHA: "head-1",
+	})
+	if err != nil {
+		t.Fatalf("EvaluatePullRequest() error = %v", err)
+	}
+	if report.Eligible || !hasReason(report, ReasonCodexReviewInProgress) || hasReason(report, ReasonCodexReviewMissing) {
+		t.Fatalf("report = %#v, want in-progress blocker without missing-review reason", report)
+	}
+	evidence := report.Evidence.CodexReview
+	if evidence == nil || !evidence.InProgress || evidence.ExecutionID != "execution-1" || evidence.StartedAt == "" {
+		t.Fatalf("Codex review evidence = %#v, want active review execution", evidence)
+	}
+}
+
+func TestEvaluatePullRequestReturnsMissingAfterReviewerTerminalWithoutPublish(t *testing.T) {
+	fixture := newGatekeeperFixtureWithoutReview(t)
+	seedReviewerAgentEvent(t, fixture, reviewerAgentStartedEventType, "head-1", "execution-1", 1)
+	seedReviewerAgentEvent(t, fixture, reviewerAgentCompletedEventType, "", "execution-1", 2)
+
+	report, err := New(Options{Repos: fixture.repos, GitHub: fixture.github, Now: func() time.Time { return fixture.now }}).EvaluatePullRequest(context.Background(), EvaluationInput{
+		ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, ExpectedHeadSHA: "head-1",
+	})
+	if err != nil {
+		t.Fatalf("EvaluatePullRequest() error = %v", err)
+	}
+	if report.Eligible || !hasReason(report, ReasonCodexReviewMissing) || hasReason(report, ReasonCodexReviewInProgress) {
+		t.Fatalf("report = %#v, want terminal missing-review blocker", report)
+	}
+}
+
+func TestDiscoverPullRequestsReevaluatesInProgressReviewAfterTerminalEvent(t *testing.T) {
+	fixture := newGatekeeperFixtureWithoutReview(t)
+	fixture.github.openPullRequests = []githubinfra.PullRequestSummary{{Number: 42, HeadSHA: "head-1", State: "OPEN", UpdatedAt: "2026-07-30T10:00:00Z", BaseRefName: "main", ReviewDecision: "APPROVED"}}
+	seedReviewerAgentEvent(t, fixture, reviewerAgentStartedEventType, "head-1", "execution-1", 1)
+	runner := New(Options{Repos: fixture.repos, GitHub: fixture.github, Now: func() time.Time { return fixture.now }})
+
+	first, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("first DiscoverPullRequests() error = %v", err)
+	}
+	if first.Evaluated != 1 || first.Skipped != 0 || !hasReason(first.Reports[0], ReasonCodexReviewInProgress) {
+		t.Fatalf("first discovery = %#v, want in-progress review report", first)
+	}
+
+	seedReviewerAgentEvent(t, fixture, reviewerAgentCompletedEventType, "", "execution-1", 2)
+	second, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("second DiscoverPullRequests() error = %v", err)
+	}
+	if second.Evaluated != 1 || second.Skipped != 0 || !hasReason(second.Reports[0], ReasonCodexReviewMissing) || hasReason(second.Reports[0], ReasonCodexReviewInProgress) {
+		t.Fatalf("second discovery = %#v, want terminal missing-review report", second)
+	}
+}
+
 func TestEvaluatePullRequestAcceptsDurableCodexReviewForCurrentHead(t *testing.T) {
 	fixture := newGatekeeperFixtureWithoutReview(t)
 	seedReviewerReviewEvent(t, fixture, "head-1", "APPROVE", "reviewer-loop", 1)
@@ -203,5 +262,26 @@ func seedReviewerReviewEventWithOutcome(t *testing.T, fixture *gatekeeperFixture
 		CreatedAt: fixture.now.Add(time.Duration(ordinal) * time.Second),
 	}); err != nil {
 		t.Fatalf("append reviewer review event: %v", err)
+	}
+}
+
+func seedReviewerAgentEvent(t *testing.T, fixture *gatekeeperFixture, eventType, headSHA, executionID string, ordinal int) {
+	t.Helper()
+	projectID := "project_1"
+	entityType := "pull_request"
+	entityID := "acme/looper#42"
+	actorType := "system"
+	actorID := "reviewer-loop"
+	payload := map[string]any{"repo": "acme/looper", "prNumber": int64(42), "phase": "review", "executionId": executionID}
+	if headSHA != "" {
+		payload["headSha"] = headSHA
+	}
+	if err := eventlog.Append(context.Background(), fixture.repos, eventlog.AppendInput{
+		ID: fmt.Sprintf("review-agent-%d", ordinal), EventType: eventType,
+		ProjectID: &projectID, EntityType: &entityType, EntityID: &entityID,
+		ActorType: &actorType, ActorID: &actorID, Payload: payload,
+		CreatedAt: fixture.now.Add(time.Duration(ordinal) * time.Second),
+	}); err != nil {
+		t.Fatalf("append reviewer agent event: %v", err)
 	}
 }
