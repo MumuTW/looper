@@ -175,6 +175,38 @@ describe("LoopDetail timeout continuation", () => {
     expect(screen.getByText(/3\/1\/1 changed\/staged\/untracked/)).toBeTruthy();
     expect(screen.queryByText("private.go")).toBeNull();
   });
+
+  it("does not call a failed continuation observation an awaiting retry", async () => {
+    renderLoopDetail(loopFixture({ status: "paused" }), [
+      {
+        seq: 42,
+        runId: "run_observation_failed",
+        loopId: "loop_1",
+        projectId: "project_1",
+        type: "worker",
+        status: "failed",
+        loopStatus: "paused",
+        displayStatus: "manual_intervention",
+        target: { type: "pull_request", label: "acme/looper#42" },
+        continuation: {
+          predecessorRunId: "run_timeout",
+          predecessorExecutionId: "agent_timeout",
+          mode: "checkpoint_same_worktree",
+          beforeTimeout: {
+            headSha: "before-head",
+            changedFileCount: 3,
+            stagedFileCount: 1,
+            untrackedFileCount: 1,
+          },
+        },
+      },
+    ]);
+
+    await waitFor(() => {
+      expect(screen.getByText("observation failed")).toBeTruthy();
+    });
+    expect(screen.queryByText("awaiting retry")).toBeNull();
+  });
 });
 
 describe("LoopDetail secondary issues row", () => {

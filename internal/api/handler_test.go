@@ -740,6 +740,43 @@ func TestBuildActiveRunContinuationUsesTimeoutEvidenceBeforeRetry(t *testing.T) 
 	}
 }
 
+func TestBuildActiveRunContinuationPrefersNewestTimeoutEvidenceAfterRetry(t *testing.T) {
+	checkpoint := `{
+		"continuation":{
+			"predecessorRunId":"run_first_timeout",
+			"predecessorExecutionId":"agent_first_timeout",
+			"mode":"checkpoint_same_worktree",
+			"outcome":"preserved",
+			"beforeTimeout":{"headSha":"first-head","diffFingerprint":"first-timeout"},
+			"afterRestart":{"headSha":"first-head","diffFingerprint":"first-restart"}
+		},
+		"execution":{
+			"executionId":"agent_second_timeout",
+			"progressBeforeTimeout":{
+				"headSha":"second-head",
+				"worktreeId":"wt_1",
+				"branch":"feature/continue",
+				"changedFileCount":5,
+				"diffFingerprint":"second-timeout",
+				"timeoutType":"wall"
+			}
+		}
+	}`
+
+	continuation := buildActiveRunContinuation(&storage.RunRecord{CheckpointJSON: &checkpoint})
+	if continuation == nil || continuation.BeforeTimeout == nil {
+		t.Fatalf("buildActiveRunContinuation() = %#v, want newest timeout evidence", continuation)
+	}
+	assertEqual(t, continuation.PredecessorExecutionID, "agent_second_timeout")
+	assertEqual(t, continuation.Mode, "timeout_observed")
+	assertEqual(t, continuation.BeforeTimeout.HeadSHA, "second-head")
+	assertEqual(t, continuation.BeforeTimeout.ChangedFileCount, 5)
+	assertEqual(t, continuation.BeforeTimeout.DiffFingerprint, "second-timeout")
+	if continuation.Outcome != "" || continuation.AfterRestart != nil {
+		t.Fatalf("continuation = %#v, must not report older retry outcome", continuation)
+	}
+}
+
 // Successful completeRun summaries must not populate lastFailureReason when there
 // is no queue error (queued/running loops and ps --all completed rows).
 func TestHandlerActiveRunsDoesNotUseSuccessSummaryAsFailureReason(t *testing.T) {

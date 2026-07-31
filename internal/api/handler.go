@@ -4009,6 +4009,18 @@ func buildActiveRunContinuation(run *storage.RunRecord) *activeRunContinuation {
 		return nil
 	}
 	checkpoint := parseJSONObject(run.CheckpointJSON)
+	// A retry can time out again after inheriting a predecessor continuation.
+	// Its own execution evidence is newer than that inherited comparison, so
+	// expose it first while the operator decides how to recover this attempt.
+	if execution, ok := readOptionalObject(checkpoint, "execution"); ok {
+		if progressBeforeTimeout, ok := readOptionalObject(execution, "progressBeforeTimeout"); ok {
+			return &activeRunContinuation{
+				PredecessorExecutionID: derefString(readObjectString(execution, "executionId")),
+				Mode:                   "timeout_observed",
+				BeforeTimeout:          buildActiveRunProgress(progressBeforeTimeout),
+			}
+		}
+	}
 	if continuation, ok := readOptionalObject(checkpoint, "continuation"); ok {
 		beforeTimeout, hasBeforeTimeout := readOptionalObject(continuation, "beforeTimeout")
 		afterRestart, hasAfterRestart := readOptionalObject(continuation, "afterRestart")
@@ -4025,22 +4037,7 @@ func buildActiveRunContinuation(run *storage.RunRecord) *activeRunContinuation {
 			}
 		}
 	}
-	// A timeout that has not retried yet stores its evidence under execution.
-	// Project it too, so an operator can inspect it before choosing recovery.
-	execution, ok := readOptionalObject(checkpoint, "execution")
-	if !ok {
-		return nil
-	}
-	progressBeforeTimeout, ok := readOptionalObject(execution, "progressBeforeTimeout")
-	if !ok {
-		return nil
-	}
-	before := buildActiveRunProgress(progressBeforeTimeout)
-	return &activeRunContinuation{
-		PredecessorExecutionID: derefString(readObjectString(execution, "executionId")),
-		Mode:                   "timeout_observed",
-		BeforeTimeout:          before,
-	}
+	return nil
 }
 
 func buildActiveRunProgress(value map[string]any) *activeRunProgressView {

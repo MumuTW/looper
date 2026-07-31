@@ -588,7 +588,12 @@ export function LoopDetailPage() {
             <Kv label="Mode" value={activeRun.continuation.mode ?? "—"} />
             <Kv
               label="Outcome"
-              value={activeRun.continuation.outcome ?? "awaiting retry"}
+              value={
+                activeRun.continuation.outcome ??
+                (activeRun.continuation.mode === "timeout_observed"
+                  ? "awaiting retry"
+                  : "observation failed")
+              }
             />
             <Kv
               label="Predecessor run"
