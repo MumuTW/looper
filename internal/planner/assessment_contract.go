@@ -1,6 +1,7 @@
 package planner
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -60,10 +61,20 @@ func (b AssessmentBinding) validate() error {
 	if _, err := hex.DecodeString(b.IssueDigest); err != nil {
 		return fmt.Errorf("assessment binding issue digest must be a SHA-256 hex digest")
 	}
-	if strings.TrimSpace(b.BaseSHA) == "" {
-		return fmt.Errorf("assessment binding base SHA is required")
+	if !isFullGitObjectID(b.BaseSHA) {
+		return fmt.Errorf("assessment binding base SHA must be a full hexadecimal Git object ID")
 	}
 	return nil
+}
+
+// isFullGitObjectID accepts the full SHA-1 and SHA-256 object ID encodings
+// used by Git repositories. Abbreviated names are not stable bindings.
+func isFullGitObjectID(value string) bool {
+	if len(value) != 40 && len(value) != 64 {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
 }
 
 // AssessmentSurface names a repository contract surface. It is evidence, not
@@ -148,8 +159,11 @@ func ParseAssessment(raw []byte) (Assessment, error) {
 		Recommendation     *AssessmentRecommendation `json:"recommendation"`
 		DecisionRequest    *string                   `json:"decisionRequest"`
 	}
+	if err := rejectDuplicateAssessmentFields(raw); err != nil {
+		return Assessment{}, err
+	}
 	var wire wireAssessment
-	decoder := json.NewDecoder(strings.NewReader(string(raw)))
+	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&wire); err != nil {
 		return Assessment{}, fmt.Errorf("decode assessment: %w", err)
@@ -170,6 +184,55 @@ func ParseAssessment(raw []byte) (Assessment, error) {
 		return Assessment{}, err
 	}
 	return assessment, nil
+}
+
+// rejectDuplicateAssessmentFields rejects duplicate names before decoding into
+// structs, because encoding/json otherwise retains only the last occurrence.
+func rejectDuplicateAssessmentFields(raw []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	if err := rejectDuplicateJSONObjectFields(decoder, "assessment", true); err != nil {
+		return err
+	}
+	return nil
+}
+
+func rejectDuplicateJSONObjectFields(decoder *json.Decoder, label string, checkBinding bool) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return fmt.Errorf("decode %s: %w", label, err)
+	}
+	if delimiter, ok := token.(json.Delim); !ok || delimiter != '{' {
+		return fmt.Errorf("%s must be a JSON object", label)
+	}
+	seen := map[string]bool{}
+	for decoder.More() {
+		token, err := decoder.Token()
+		if err != nil {
+			return fmt.Errorf("decode %s field name: %w", label, err)
+		}
+		field, ok := token.(string)
+		if !ok {
+			return fmt.Errorf("decode %s field name", label)
+		}
+		if seen[field] {
+			return fmt.Errorf("%s repeats field %q", label, field)
+		}
+		seen[field] = true
+		if checkBinding && field == "binding" {
+			if err := rejectDuplicateJSONObjectFields(decoder, "assessment binding", false); err != nil {
+				return err
+			}
+			continue
+		}
+		var discard json.RawMessage
+		if err := decoder.Decode(&discard); err != nil {
+			return fmt.Errorf("decode %s field %q: %w", label, field, err)
+		}
+	}
+	if _, err := decoder.Token(); err != nil {
+		return fmt.Errorf("decode %s: %w", label, err)
+	}
+	return nil
 }
 
 func (a *Assessment) validate() error {

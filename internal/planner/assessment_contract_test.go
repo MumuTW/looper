@@ -44,6 +44,34 @@ func TestParseAssessmentRequiresCompleteStrictContract(t *testing.T) {
 	}
 }
 
+func TestParseAssessmentRejectsDuplicateContractFields(t *testing.T) {
+	binding := testAssessmentBinding(t)
+	for _, raw := range [][]byte{
+		[]byte(`{"schemaVersion":"looper.assessment.v1","schemaVersion":"looper.assessment.v1","binding":{"repo":"acme/looper","issueNumber":42,"issueDigest":"` + binding.IssueDigest + `","baseSha":"` + binding.BaseSHA + `"},"affectedFiles":[],"surfaces":[],"authorityQuestions":[],"recommendation":"proceed","decisionRequest":""}`),
+		[]byte(`{"schemaVersion":"looper.assessment.v1","binding":{"repo":"acme/looper","issueNumber":42,"issueDigest":"` + binding.IssueDigest + `","baseSha":"` + binding.BaseSHA + `","baseSha":"ffffffffffffffffffffffffffffffffffffffff"},"affectedFiles":[],"surfaces":[],"authorityQuestions":[],"recommendation":"proceed","decisionRequest":""}`),
+	} {
+		if _, err := ParseAssessment(raw); err == nil || !strings.Contains(err.Error(), "repeats field") {
+			t.Fatalf("ParseAssessment(%s) error = %v, want duplicate-field rejection", raw, err)
+		}
+	}
+}
+
+func TestNewAssessmentBindingRequiresFullGitObjectID(t *testing.T) {
+	for _, baseSHA := range []string{
+		"main",
+		"0123456789abcdef",
+		"0123456789abcdef0123456789abcdef0123456g",
+		"",
+	} {
+		if _, err := NewAssessmentBinding("acme/looper", 42, "Add endpoint", "Please add it", baseSHA); err == nil {
+			t.Fatalf("NewAssessmentBinding(%q) error = nil", baseSHA)
+		}
+	}
+	if _, err := NewAssessmentBinding("acme/looper", 42, "Add endpoint", "Please add it", strings.Repeat("a", 64)); err != nil {
+		t.Fatalf("NewAssessmentBinding(SHA-256 object ID) error = %v", err)
+	}
+}
+
 func TestParseAssessmentRejectsInvalidEvidence(t *testing.T) {
 	binding := testAssessmentBinding(t)
 	for _, mutate := range []func(*Assessment){
@@ -98,7 +126,7 @@ func TestEvaluateAssessmentUsesCurrentBindingAndDeterministicPolicy(t *testing.T
 		t.Fatalf("proceed with fired rule error = %v", err)
 	}
 	changed := binding
-	changed.BaseSHA = "different"
+	changed.BaseSHA = "fedcba9876543210fedcba9876543210fedcba98"
 	if _, err := EvaluateAssessment(changed, AssessmentPolicy{}, proceed); err == nil || !strings.Contains(err.Error(), "no longer matches") {
 		t.Fatalf("stale binding error = %v", err)
 	}
