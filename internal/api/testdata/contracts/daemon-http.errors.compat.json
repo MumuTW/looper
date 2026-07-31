@@ -1,17 +1,22 @@
 {
   "artifactVersion": 2,
   "generatedFrom": [
-    "apps/looperd/src/server/index.ts",
-    "apps/looperd/src/server/index.test.ts",
-    "specs/2026-04-17-go-port-plan/spec.md",
-    "specs/2026-04-17-go-port-plan/checklist.md"
+    "internal/api/handler.go",
+    "internal/api/bootstrap_routes.go",
+    "internal/api/loop_logs_stream.go",
+    "internal/api/loop_retry_discard.go",
+    "internal/api/request_decode.go",
+    "pkg/api/envelope.go",
+    "internal/api/contract_artifact_regen_test.go"
   ],
+  "generatedBy": "go generate ./internal/api/...",
   "notes": [
-    "This artifact freezes the current /api/v1 error envelope and error-code compatibility boundary for the Go port.",
-    "Each case is machine-verifiable against the Bun daemon test harness and captures the exact status plus JSON body shape.",
+    "This artifact freezes the current /api/v1 error envelope and error-code compatibility boundary.",
+    "Generated, not hand-edited: change the handler, then run go generate ./internal/api/... in the same commit.",
+    "Each case replays the recorded request against the in-process Go handler and captures the exact status plus JSON body.",
     "When requestId is omitted from the request, the daemon generates one; the fixture normalizes generated UUID values as <uuid>.",
     "error.details is omitted from these envelopes because the current daemon does not include details for these failures.",
-    "errorCodes freezes the complete set of daemon error codes and their HTTP statuses; exact message variants remain frozen by the per-case fixtures."
+    "errorCodes is the complete set of daemon error codes and their HTTP statuses, read from pkg/api.AllErrorCodes; exact message variants remain frozen by the per-case fixtures."
   ],
   "placeholders": {
     "<uuid>": "Runtime-generated UUID for requestId when x-request-id is not supplied."
@@ -27,7 +32,10 @@
       "ok": false,
       "requestId": "always present on error responses",
       "error": {
-        "requiredFields": ["code", "message"],
+        "requiredFields": [
+          "code",
+          "message"
+        ],
         "details": "omitted when undefined"
       }
     }
@@ -102,12 +110,12 @@
       "status": 404
     },
     {
-      "code": "RUN_NOT_FOUND",
-      "status": 404
-    },
-    {
       "code": "RUNTIME_CONTROL_UNAVAILABLE",
       "status": 501
+    },
+    {
+      "code": "RUN_NOT_FOUND",
+      "status": 404
     },
     {
       "code": "SERVICE_UNAVAILABLE",
