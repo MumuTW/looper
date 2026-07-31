@@ -394,33 +394,51 @@ boundary already does.
 `policy.Kind` constant added before the runners' retry, hold, notification, and
 status predicates support it is contained to `NonRetryable` — the safe default —
 rather than passing through to predicates that fall through as unknown. To give
-a new kind distinct behavior, the implementer must extend `Normalize` to preserve
-it **and** update every runner's predicates in the same change. The pass-through
-set is a single, named inventory so those two edits cannot drift apart:
-`Normalize` consults a package-level `passThroughKinds []Kind` (today the four
-known kinds) and returns the input unchanged when it is a member, otherwise
-`NonRetryable`; an exported `failureclass.PassThroughKinds() []Kind` returns a
-copy of that same inventory. The per-runner downstream-predicate contract cases
-(Validation step 6) do not hard-code the four kinds — they iterate over
-`failureclass.PassThroughKinds()`, so adding a kind to `passThroughKinds` is the
-single opt-in edit that simultaneously makes `Normalize` pass it through **and**
-enters a row for it in every runner's retry, hold, notification, status, and
-persistence predicate table — not only the `classifyFailure*` functions, which
-return the kind correctly while a predicate that consumes it can still fall
-through — so a runner predicate that does not handle the newly pass-through kind
-fails in the runner that contains it, and the kind may not be opted in until
-every runner's table covers it. This is the "authority constants remain
-normalized to `NonRetryable` until consumers explicitly opt in" contract:
-`Normalize` is the authority for "this kind is supported," and a constant is only
-pass-through after the consumers that act on it have been updated — the inventory
-is the single place that records the opt-in, shared by `Normalize` and every
-runner's downstream-predicate test. No enumeration assertion forces
-`Normalize(c) == c` for every authority constant — that would defeat the
-fallback by requiring pass-through the moment a constant is added, letting a
-partially rolled-out kind reach predicates that treat it as unknown (see
-Validation step 6); the inventory is the explicitly maintained pass-through
-*subset*, not the set of all authority constants, so adding a fifth authority
-constant alone does not enter it.
+a new kind distinct behavior, the implementer must perform a coordinated set of
+opt-in edits in the same change: (1) extend `Normalize` to preserve the new kind
+by adding it to the `passThroughKinds` inventory; (2) update every runner's
+retry, hold, notification, status, and persistence predicate to handle it rather
+than fall through; and (3) extend the persisted SQLite schema to accept the new
+value, because every runner persists `failure.kind` to
+`queue_items.last_error_kind`. The CHECK constraint on that column (in
+`internal/storage/migrations/0003_scheduler_queue.sql`,
+`0004_worker_project_target.sql`, and `0016_queue_infinite_retry_attempts.sql`,
+mirrored in the `internal/storage/testdata/schema/sqlite-schema.snapshot.sql`
+snapshot) accepts only the four current literals
+(`retryable_transient`, `retryable_after_resume`, `non_retryable`,
+`manual_intervention`), so a fifth kind that `Normalize` passes through but the
+schema does not accept is rejected at insert time on every queue write — a loud
+failure, but one that leaves the opt-in incomplete. The schema migration
+(constraint update plus any backfill migration that writes the literal, per
+Trade-off item 4) is therefore a required opt-in step, not an optional follow-up.
+
+The pass-through set is a single, named inventory so the first two edits cannot
+drift apart: `Normalize` consults a package-level `passThroughKinds []Kind`
+(today the four known kinds) and returns the input unchanged when it is a
+member, otherwise `NonRetryable`; an exported `failureclass.PassThroughKinds()
+[]Kind` returns a copy of that same inventory. The per-runner
+downstream-predicate contract cases (Validation step 6) do not hard-code the
+four kinds — they iterate over `failureclass.PassThroughKinds()`, so adding a
+kind to `passThroughKinds` is the single edit that simultaneously makes
+`Normalize` pass it through **and** enters a row for it in every runner's
+retry, hold, notification, status, and persistence predicate table — not only
+the `classifyFailure*` functions, which return the kind correctly while a
+predicate that consumes it can still fall through — so a runner predicate that
+does not handle the newly pass-through kind fails in the runner that contains
+it, and the kind may not be opted in until every runner's table covers it. The
+inventory coordinates `Normalize` with the test matrix; it does not coordinate
+the schema migration, which is a separate required opt-in step above. This is
+the "authority constants remain normalized to `NonRetryable` until consumers
+explicitly opt in" contract: `Normalize` is the authority for "this kind is
+supported," and a constant is only pass-through after the consumers that act on
+it have been updated — the inventory is the single place that records the
+opt-in, shared by `Normalize` and every runner's downstream-predicate test. No
+enumeration assertion forces `Normalize(c) == c` for every authority constant —
+that would defeat the fallback by requiring pass-through the moment a constant
+is added, letting a partially rolled-out kind reach predicates that treat it as
+unknown (see Validation step 6); the inventory is the explicitly maintained
+pass-through *subset*, not the set of all authority constants, so adding a
+fifth authority constant alone does not enter it.
 
 Add a focused test in `internal/loops/failureclass` that iterates over
 `PassThroughKinds()` asserting each inventoried kind passes through `Normalize`
@@ -970,6 +988,76 @@ mechanical rename. The conversion functions, once deleted, cannot silently drift
 back — there is no second type to reconcile, and `failureclass.Normalize` carries
 the unknown-kind fallback explicitly.
 
+### Pass-through inventory (`passThroughKinds` / `PassThroughKinds()`)
+
+Step 2 introduces a new runtime artifact — a package-level `passThroughKinds
+[]Kind` inventory in `internal/loops/failureclass` plus an exported
+`PassThroughKinds() []Kind` that returns a copy — solely to coordinate `Normalize`
+with the per-runner downstream-predicate tests in four packages and the
+`Normalize` unit test. Its own deletion trade-off, distinct from the
+`QueueFailureKind` ledger above:
+
+> Delete this inventory six months from now — what breaks?
+
+Deleting `passThroughKinds` and `PassThroughKinds()` while keeping `Normalize`
+forces `Normalize` back to a hard-coded four-branch `switch` (or an inline
+literal set), and forces every per-runner downstream-predicate test and the
+`Normalize` unit test back to a hard-coded four-kind table. The single-edit
+propagation claim breaks: adding a fifth kind then requires a coordinated edit
+to `Normalize`'s switch **and** to the test table in each of the four runner
+packages **and** the `Normalize` unit test, with nothing but reviewer attention
+keeping the five tables in sync — exactly the double-ledger friction this
+refactor removes from `QueueFailureKind`, re-introduced inside `failureclass`.
+The inventory exists so `Normalize` and its consumers consult one set; deleting
+it re-opens the gap between the authority and the tests that exercise it.
+
+> What does it still not catch?
+
+The inventory is the pass-through *subset*, not the set of all authority
+constants, so it does not catch a new `policy.Kind` constant added without being
+opted in — that constant stays contained to `NonRetryable` by design (Step 2),
+and neither `Normalize` nor the test matrix mentions it. It also does not catch
+a *removal* of a currently supported kind from the inventory: `Normalize` would
+start converting that production value to `NonRetryable`, the inventory-derived
+test loop would simply drop the removed kind's row, and the downstream-predicate
+cases would drop theirs, so retry, hold, and persistence behavior silently
+changes while every inventory-derived test stays green. That removal is caught
+not by the inventory but by the explicit fixed-point pin (Validation step 6),
+which asserts each of the four currently supported authority constants is a
+fixed point of `Normalize` independent of the inventory. The inventory also
+does not define the *expected* predicate semantics for a kind — only that each
+predicate handles it rather than falls through; that gap is closed by the
+shared expected-semantics authority in Validation step 6 (see below). Finally,
+the inventory coordinates `Normalize` with the test matrix but does not
+coordinate the schema migration, which is a separate required opt-in step
+(Step 2): a kind added to the inventory without a matching CHECK-constraint
+migration is rejected at insert time and caught by the schema-contract test,
+not by the inventory itself.
+
+> Why is a simpler normalization switch with explicit consumer contracts
+> insufficient?
+
+`Normalize` could be a bare `switch` over the four known kinds with no
+inventory, and each runner's test could hard-code the same four-kind table with
+an explicit "this kind → this expected predicate output" contract per package.
+That is strictly less robust for two reasons. First, the test table and
+`Normalize`'s switch would be two independent spellings of the pass-through set;
+a kind added to `Normalize` but not to a runner's test table (or vice versa)
+drifts silently, the same class of bug the `QueueFailureKind` ledger produced.
+The inventory makes `Normalize` and every test consult one set, so the
+pass-through set cannot drift between the authority and its consumers. Second,
+the per-runner "explicit consumer contract" tables would each have to be edited
+when a kind is added — four coordinated per-package test edits — which is the
+coordinated-edit cost the inventory's single-iteration design exists to delete.
+The inventory is therefore not a new layer on top of a sufficient switch; it is
+the replacement for the four hard-coded test tables a bare switch would require,
+and its exported `PassThroughKinds()` is the single read the tests perform
+instead of re-declaring the set. Per the repo's "prefer deletion over another
+layer" guideline, the simpler switch was attempted first: it leaves the
+pass-through set duplicated across `Normalize` and four test packages, so the
+inventory is added only because the switch cannot make that duplication
+disappear.
+
 > What does it still not catch?
 
 This refactor targets the per-role `QueueFailureKind` ledger and the
@@ -1153,7 +1241,7 @@ Infra signals remain for drift detection, not authority.
 - `internal/worker/runner.go` — delete `QueueFailureKind` + delete `workerFailureKind` + `s/QueueFailureKind/failureclass.Kind/` + call-site edits, including Step 2's boundary normalization at each failure-handling entry point.
 - `internal/planner/runner.go` — delete `QueueFailureKind` + delete `plannerFailureKind` + `s/QueueFailureKind/failureclass.Kind/` + call-site edits, including Step 2's boundary normalization at each failure-handling entry point.
 - `internal/runtime/scheduler.go` — `workerRunCompletedNotificationInput.FailureKind` becomes `failureclass.Kind` (the one `QueueFailureKind` reference here).
-- `internal/loops/failureclass/failureclass.go` — add `Normalize(kind Kind) Kind` (the authority for the unknown-kind fallback), backed by a package-level `passThroughKinds []Kind` inventory (today the four known kinds) that `Normalize` consults for membership, plus an exported `PassThroughKinds() []Kind` returning a copy of that inventory so the per-runner downstream-predicate tests and the `Normalize` unit test (Validation step 6) iterate over the single pass-through set rather than a hard-coded four-kind table; add the `internal/loops/policy` import and alias `type Kind = policy.Kind` and re-export the four typed constants from `policy` at compile time (Step 5), deleting the second spelling rather than pinning it by test; `Classify` logic and public API unchanged.
+- `internal/loops/failureclass/failureclass.go` — add `Normalize(kind Kind) Kind` (the authority for the unknown-kind fallback), backed by a package-level `passThroughKinds []Kind` inventory (today the four known kinds) that `Normalize` consults for membership, plus an exported `PassThroughKinds() []Kind` returning a copy of that inventory so the per-runner downstream-predicate tests and the `Normalize` unit test (Validation step 6) iterate over the single pass-through set rather than a hard-coded four-kind table; add an `ExpectedBehavior` struct and `ExpectedBehaviorFor(kind Kind) ExpectedBehavior` oracle over the same inventory recording each pass-through kind's intended retry-eligibility and resume policy, so the per-runner downstream-predicate cases assert against the shared expected semantics rather than only "did not fall through" (Validation step 6); add the `internal/loops/policy` import and alias `type Kind = policy.Kind` and re-export the four typed constants from `policy` at compile time (Step 5), deleting the second spelling rather than pinning it by test; `Classify` logic and public API unchanged.
 - `internal/loops/policy/policy.go` — add the two missing untyped `FailureKind*` string constants so the leaf owns all four string values; add `type Kind string` and the four typed `Kind` constants derived from the untyped ones (Step 5); no predicate changes (the untyped constants stay for the `string`-parameter functions).
 - `internal/loops/policy.go` (umbrella) — re-export the two new untyped `FailureKind*` constants, the `Kind` type alias, and the four typed constants, keeping the "re-exports every name here" contract (Step 5).
 - `internal/validation/validation.go` — delete the three `FailureKind*`
@@ -1241,6 +1329,40 @@ hold, notification, status, and persistence predicates, not only
 that injects an unknown kind through every independent failure-handling entry
 point in each runner and asserts it reaches that path's predicates as
 `NonRetryable` (Validation step 6).
+
+**Test-growth classification (per AGENTS.md "Test-file growth is a design
+smell"):** this growth is *covering*, not *propping*. The production refactor
+*deletes* states, it does not add them: four per-role `QueueFailureKind` types,
+four `xxxFailureKind` conversion functions, three `internal/validation`
+`FailureKind*` constants, and the earlier draft's structural call-site gate are
+all removed in the same diff (production files shrink). The new tests fall into
+two groups, both covering behavior that either shipped untested or did not exist
+to be tested before. First, the classification and alias-identity tests assert
+behavior that already shipped with no coverage: the existing
+`failure_classification_test.go` files cover only `retryable_transient` and
+`non_retryable` in three of four runners, so `retryable_after_resume` and
+`manual_intervention` and the entire `internal/reviewer` role were never
+asserted — these are first assertions on already-shipped logic, the "covering"
+tell. Second, the per-kind downstream-predicate matrix and the
+boundary-normalization contract test cover invariants that *replace* the deleted
+conversion functions rather than prop up a new state machine: each
+`xxxFailureKind` previously mapped every unrecognized kind to `NonRetryable` and
+bridged the per-role type to the shared one; with both the type and the bridge
+deleted, `Normalize` carries the fallback and the kind flows directly to each
+predicate, so the predicates must now be asserted per pass-through kind. The
+matrix is the surviving behavior the deleted bridge used to guarantee — its size
+is proportional to (pass-through kinds × predicates × runners), the surface the
+conversion functions previously covered, not to a newly introduced state
+machine. What was attempted to be removed: the per-role type, the conversion
+functions, and the structural gate; the remaining matrix is the cost of that
+deletion (the kind now reaches predicates unbridged, so the predicates are
+asserted directly), not a parallel structure kept alive to excuse keeping the
+layer. No new production state, flag, or output field is introduced to
+motivate the rows; if the inventory were removed (Trade-off "Pass-through
+inventory"), the matrix would collapse to a hard-coded four-kind table per
+runner — the same row count, fewer authorities — which is the propping shape
+this design avoids by deriving the rows from the shared inventory and the
+`ExpectedBehaviorFor` oracle.
 
 No policy drift-detection test is added: Step 5 reverses the leaf dependency so `failureclass` imports `policy`
 and aliases `type Kind = policy.Kind` and re-exports the typed constants at
@@ -1434,6 +1556,21 @@ Per `AGENTS.md`, the root commands are the source of truth:
    without a separate edit to each test. This is the regression net the refactor
    relies on; it must exist before the conversion functions are deleted.
 
+   The opt-in is not complete until the persisted schema accepts the new value
+   (Step 2): every runner writes `failure.kind` to `queue_items.last_error_kind`,
+   whose CHECK constraint accepts only the four current literals, so a
+   pass-through kind the schema rejects fails every queue write at insert time.
+   The implementation therefore adds a schema-contract test (in
+   `internal/storage`) that asserts the `last_error_kind` CHECK constraint —
+   read from the migrated schema, not hard-coded — accepts exactly
+   `failureclass.PassThroughKinds()` (each pass-through kind inserts and
+   persists) and rejects a value outside that inventory (insert fails), so a
+   kind added to `passThroughKinds` without a matching migration fails the
+   contract test in the same change rather than failing at runtime on the first
+   queue write. This pins the schema to the inventory the way the per-runner
+   predicate cases pin the runners: the inventory is the single pass-through
+   set, and both the test matrix and the schema-contract test derive from it.
+
    The four-kind classification tests above exercise `classifyFailure*`, which
    produces the kind — they do not exercise the retry, hold, notification,
    status, and persistence predicates that *consume* it. A fifth kind can
@@ -1458,9 +1595,46 @@ Per `AGENTS.md`, the root commands are the source of truth:
    rather than fall through to an unintended default. A predicate that silently
    drops a pass-through kind is caught in the runner that contains it, so a new
    kind may not be opted in (added to `passThroughKinds`) until every runner's
-   downstream-predicate cases cover it — the single inventory edit is what makes
-   the new kind pass-through and what propagates the new row, so the two cannot
-   drift apart.
+   downstream-predicate cases cover it and the schema-contract test above
+   accepts it — the inventory edit is what makes the new kind pass-through and
+   what propagates the new runner row and the new schema-contract row, so the
+   code and test edits cannot drift apart; the schema migration itself remains a
+   separate required opt-in step (Step 2).
+
+   Iterating `PassThroughKinds()` supplies only the input kind to each predicate
+   case; it does not by itself define whether that kind should retry, hold,
+   notify, or select a particular resume policy. Several legitimate outcomes
+   coincide with an unintended default — both an unknown kind and
+   `ManualIntervention` are retry-ineligible, for example — so a case that only
+   asserts "the predicate did not fall through" cannot distinguish an explicit
+   branch from a coincidental default. The implementation therefore moves the
+   *expected* semantics into a shared authority the tests consume rather than
+   hard-coding them per runner: `failureclass` gains an
+   `ExpectedBehaviorFor(kind Kind) ExpectedBehavior` oracle (a small struct
+   holding the intended retry-eligibility and resume policy for a pass-through
+   kind) backed by the same `passThroughKinds` inventory, and each per-runner
+   downstream-predicate case asserts the runner's retry predicate returns
+   `ExpectedBehaviorFor(kind).RetryEligible` and the runner's resume-policy
+   derivation returns `ExpectedBehaviorFor(kind).ResumePolicy` — i.e. the test
+   compares the predicate's output to the shared expected value, not merely to
+   "not the default." A runner whose predicate falls through to a value that
+   differs from the oracle fails; a runner whose predicate falls through to a
+   value that *matches* the oracle still passes, but the oracle now records that
+   the match is intended, so a later change to that default which diverges from
+   the intended semantics is caught. Adding a kind is therefore: add it to
+   `passThroughKinds`, add its `ExpectedBehaviorFor` row to the oracle, update
+   each runner's predicate to satisfy the oracle, and extend the schema — the
+   per-runner tests auto-iterate over the inventory and assert against the
+   oracle, so no per-runner test edit is needed for the new kind (the inventory
+   and the oracle are the two coordinated `failureclass` edits, both in one
+   package). The residual the oracle does not close: where a kind's intended
+   semantics coincide with a predicate's default fallthrough, the test still
+   cannot distinguish an explicit branch from a coincidental default at that
+   instant — but the oracle pins the intent, so the coincidence is no longer
+   silent if the default later moves. Per the repo's "name the authority before
+   enforcing it" guideline, the authority for "what this kind should do" is the
+   shared `ExpectedBehaviorFor` oracle, not each runner's hard-coded test
+   expectation and not the runner predicate's own output.
 
    The classification tests and alias-identity tests below assert each runner's
    persisted kind and retry decision for each *known* kind, and every known kind
