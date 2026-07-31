@@ -126,6 +126,12 @@ func TestAssertStatusTransitions(t *testing.T) {
 	if err := AssertLoopStatusTransition(LoopStatusHumanTakeover, LoopStatusQueued); err != nil {
 		t.Fatalf("AssertLoopStatusTransition(human_takeover, queued) error = %v", err)
 	}
+	if err := AssertLoopStatusTransition(LoopStatusHumanTakeover, LoopStatusTerminated); err != nil {
+		t.Fatalf("AssertLoopStatusTransition(human_takeover, terminated) error = %v", err)
+	}
+	if err := AssertLoopStatusTransition(LoopStatusFailed, LoopStatusTerminated); err != nil {
+		t.Fatalf("AssertLoopStatusTransition(failed, terminated) error = %v", err)
+	}
 	if err := AssertLoopStatusTransition(LoopStatusQueued, LoopStatusHumanTakeover); err != nil {
 		t.Fatalf("AssertLoopStatusTransition(queued, human_takeover) error = %v", err)
 	}
