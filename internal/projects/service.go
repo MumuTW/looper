@@ -414,6 +414,19 @@ func (s *Service) addProjectLocked(ctx context.Context, input AddInput) (AddResu
 	} else if existing == nil {
 		delete(metadata, "validation")
 	}
+	// Re-registration is the only non-destructive repair path for an API
+	// project with missing repository metadata, but a legacy inert record that
+	// gains repository metadata leaves the repair exception, so it must carry
+	// an effective stance immediately — independently of whether a coding
+	// agent is currently configured. Otherwise enabling Worker or Fixer later
+	// turns the stored row into a startup failure with no running PATCH API
+	// left to repair it. Mirrors the UpdateProject gate at the shared
+	// materialization boundary.
+	if existing != nil && IsLegacyInertProject(*existing) && metadataString(metadata, "repo") != "" {
+		if _, hasValidation := metadata["validation"]; !hasValidation && len(config.ResolveValidationCommands(cfg)) == 0 {
+			return AddResult{}, nil, ProjectValidationError{Message: "adding repository metadata requires validation commands or optOut=true in the same request while defaults.validationCommands is empty"}
+		}
+	}
 	delete(metadata, "roles")
 	if input.WorktreeRoot != nil {
 		metadata["worktreeRoot"] = *input.WorktreeRoot

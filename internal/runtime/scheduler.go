@@ -2825,8 +2825,14 @@ func schedulerProjectsForCapturedCatalog(ctx context.Context, input defaultSched
 			continue
 		}
 		binding, ok := runtimeProjectBinding(*input.Config, project.ID)
-		codingPolicyRequired := config.CodingRoleAgentConfigured(*input.Config, config.CodingRoleWorker) || config.CodingRoleAgentConfigured(*input.Config, config.CodingRoleFixer)
-		if !ok && codingPolicyRequired && projects.IsLegacyInertProject(project) && len(config.ResolveValidationCommands(*input.Config)) == 0 {
+		// validateCatalogValidationPolicies quarantines an unstanced legacy
+		// project whenever defaults.validationCommands is empty, independently
+		// of whether a coding agent is configured. The missing catalog binding
+		// is therefore intentional in the agentless case too; recognizing only
+		// the coding-policy-required case would report the catalog as stale and
+		// block every claim pass — including durable sticky Worker/Fixer retries
+		// — until the legacy record is repaired.
+		if !ok && projects.IsLegacyInertProject(project) && len(config.ResolveValidationCommands(*input.Config)) == 0 {
 			continue
 		}
 		if !ok || !catalogBindingMatchesProject(binding, project) {

@@ -10,14 +10,20 @@ import (
 	"github.com/MumuTW/looper/internal/storage"
 )
 
-// TestRuntimeReloadRematerializesStoredProjects drives the shared publication
-// boundary the way a hot-safe policy-requirement change would: the legacy
-// default-commands fallback appears, so the previously quarantined stored row
-// must re-enter the runtime catalog from SQLite instead of waiting for a
-// restart or an unrelated project mutation. defaults.validationCommands is
-// restart-bound through ReloadConfig, so the test holds configBoundary and
-// calls the boundary function directly.
-func TestRuntimeReloadRematerializesStoredProjects(t *testing.T) {
+// TestRuntimeReloadPreservesMaterializedCatalogWithoutRematerializing drives
+// the supported hot-reload path (ReloadConfig) the way a common agent.vendor
+// flip does. A hot reload cannot change filtered catalog membership — the only
+// policy input that does is defaults.validationCommands, which is restart-bound
+// and rejected before the publication boundary, and an unstanced legacy project
+// is quarantined independently of agent configuration. The previously
+// materialized SQLite slice must therefore be preserved as-is instead of
+// re-reading SQLite and running post-publication hooks under configBoundary.
+//
+// The out-of-band stanced record inserted after startup is the signal: if the
+// reload re-materialized, it would appear in the catalog. The original stanced
+// project stays published and the legacy inert row stays quarantined, proving
+// the preserved slice is coherent without re-materialization or hook work.
+func TestRuntimeReloadPreservesMaterializedCatalogWithoutRematerializing(t *testing.T) {
 	workingDir := t.TempDir()
 	cfg, err := config.DefaultConfig(workingDir)
 	if err != nil {
@@ -35,9 +41,13 @@ func TestRuntimeReloadRematerializesStoredProjects(t *testing.T) {
 	seedCoordinator := openMigratedCoordinator(t, cfg.Storage.DBPath, backupDir)
 	seedRepos := storage.NewRepositories(seedCoordinator.DB())
 	baseBranch := "develop"
-	metadata := `{"repo":null,"worktreeRoot":"/tmp/worktrees","source":"api","registrationDiscovery":{"status":"succeeded","snapshotMode":"off"}}`
-	if err := seedRepos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "legacy_inert", Name: "Legacy", RepoPath: filepath.Join(workingDir, "legacy"), BaseBranch: &baseBranch, MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
-		t.Fatalf("Projects.Upsert() error = %v", err)
+	legacyMetadata := `{"repo":null,"worktreeRoot":"/tmp/worktrees","source":"api","registrationDiscovery":{"status":"succeeded","snapshotMode":"off"}}`
+	if err := seedRepos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "legacy_inert", Name: "Legacy", RepoPath: filepath.Join(workingDir, "legacy"), BaseBranch: &baseBranch, MetadataJSON: &legacyMetadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert(legacy) error = %v", err)
+	}
+	stancedMetadata := `{"repo":"acme/one","worktreeRoot":"/tmp/worktrees","source":"api","validation":{"optOut":true},"registrationDiscovery":{"status":"succeeded","snapshotMode":"off"}}`
+	if err := seedRepos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "stanced_one", Name: "One", RepoPath: filepath.Join(workingDir, "one"), BaseBranch: &baseBranch, MetadataJSON: &stancedMetadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert(stanced) error = %v", err)
 	}
 	if err := seedCoordinator.Close(); err != nil {
 		t.Fatalf("seed coordinator Close() error = %v", err)
@@ -64,57 +74,34 @@ func TestRuntimeReloadRematerializesStoredProjects(t *testing.T) {
 		t.Fatalf("CompleteStartup() error = %v", err)
 	}
 	defer rt.Stop("test cleanup")
-	if got := rt.Config().Projects; len(got) != 0 {
-		t.Fatalf("runtime catalog projects = %#v, want legacy inert project quarantined", got)
+	if got := rt.Config().Projects; len(got) != 1 || got[0].ID != "stanced_one" {
+		t.Fatalf("runtime catalog projects at startup = %#v, want only stanced_one (legacy inert quarantined)", got)
 	}
 
-	next := loaded
-	next.Config.Defaults.ValidationCommands = []string{"go test ./..."}
-	rt.configBoundary.Lock()
-	applyErr := rt.applyLoadedConfigBoundaryLocked(context.Background(), next, startedAt)
-	rt.configBoundary.Unlock()
-	if applyErr != nil {
-		t.Fatalf("applyLoadedConfigBoundaryLocked() error = %v", applyErr)
-	}
-	if got := rt.Config().Projects; len(got) != 1 || got[0].ID != "legacy_inert" {
-		t.Fatalf("runtime catalog projects after policy-requirement reload = %#v, want legacy project re-materialized", got)
-	}
-}
-
-func TestStoredProjectPolicyRequirementChanged(t *testing.T) {
-	t.Parallel()
-
-	base, err := config.DefaultConfig(t.TempDir())
+	// Insert a second stanced project out-of-band after startup. Re-materialize
+	// on reload would publish it; preserving the slice leaves it absent.
+	extraCoordinator, err := storage.OpenSQLiteCoordinator(context.Background(), cfg.Storage.DBPath, storage.SQLiteCoordinatorOptions{BackupDir: backupDir})
 	if err != nil {
-		t.Fatalf("DefaultConfig() error = %v", err)
+		t.Fatalf("OpenSQLiteCoordinator() error = %v", err)
 	}
-	base.Defaults.ValidationCommands = nil
-	vendor := config.AgentVendorOpenCode
-
-	withAgent := config.CloneConfig(base)
-	withAgent.Agent.Vendor = &vendor
-	if !storedProjectPolicyRequirementChanged(base, withAgent) {
-		t.Fatal("storedProjectPolicyRequirementChanged(agent configured) = false, want true")
+	extraRepos := storage.NewRepositories(extraCoordinator.DB())
+	extraMetadata := `{"repo":"acme/two","worktreeRoot":"/tmp/worktrees","source":"api","validation":{"optOut":true},"registrationDiscovery":{"status":"succeeded","snapshotMode":"off"}}`
+	if err := extraRepos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "stanced_two", Name: "Two", RepoPath: filepath.Join(workingDir, "two"), BaseBranch: &baseBranch, MetadataJSON: &extraMetadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert(extra) error = %v", err)
 	}
-	if !storedProjectPolicyRequirementChanged(withAgent, base) {
-		t.Fatal("storedProjectPolicyRequirementChanged(agent revoked) = false, want true")
+	if err := extraCoordinator.Close(); err != nil {
+		t.Fatalf("extra coordinator Close() error = %v", err)
 	}
 
-	withDefaults := config.CloneConfig(base)
-	withDefaults.Defaults.ValidationCommands = []string{"go test ./..."}
-	if !storedProjectPolicyRequirementChanged(base, withDefaults) {
-		t.Fatal("storedProjectPolicyRequirementChanged(defaults added) = false, want true")
+	// A common agent.vendor hot reload: revoke the only coding agent. This is
+	// the reachable coding-role flip the removed re-materialization trigger
+	// fired on; it must not re-read SQLite or run post-publication hooks.
+	loaded.Config.Agent.Vendor = nil
+	if err := rt.ReloadConfig(context.Background()); err != nil {
+		t.Fatalf("ReloadConfig() error = %v", err)
 	}
-	if !storedProjectPolicyRequirementChanged(withDefaults, base) {
-		t.Fatal("storedProjectPolicyRequirementChanged(defaults removed) = false, want true")
-	}
-
-	if storedProjectPolicyRequirementChanged(base, base) {
-		t.Fatal("storedProjectPolicyRequirementChanged(unchanged) = true, want false")
-	}
-	unrelated := config.CloneConfig(base)
-	unrelated.Daemon.LogDir = filepath.Join(t.TempDir(), "logs")
-	if storedProjectPolicyRequirementChanged(base, unrelated) {
-		t.Fatal("storedProjectPolicyRequirementChanged(unrelated change) = true, want false")
+	got := rt.Config().Projects
+	if len(got) != 1 || got[0].ID != "stanced_one" {
+		t.Fatalf("runtime catalog projects after reload = %#v, want preserved slice with only stanced_one (no re-materialization)", got)
 	}
 }

@@ -229,22 +229,17 @@ func (r *Runtime) applyLoadedConfigBoundaryLocked(ctx context.Context, loaded co
 	}
 
 	if r.projectCatalog != nil {
+		// PublishGlobals atomically installs the new global configuration while
+		// preserving the currently materialized SQLite Projects view. A hot
+		// reload cannot change that filtered catalog membership: the only policy
+		// input that does is defaults.validationCommands, which is restart-bound
+		// and rejected before this boundary, and validateCatalogValidationPolicies
+		// quarantines an unstanced legacy project independently of agent
+		// configuration. Re-materializing on every agent.vendor flip would only
+		// add a SQLite scan and run post-publication hooks under the config
+		// boundary; the preserved slice is already coherent, so publish globals
+		// alone.
 		r.projectCatalog.PublishGlobals(loaded.Config)
-		if storedProjectPolicyRequirementChanged(previous, loaded.Config) {
-			// PublishGlobals preserves the previously filtered project slice,
-			// so a reload that changes whether stored projects need an
-			// effective validation policy must re-materialize the catalog from
-			// SQLite. Otherwise a project whose quarantine status flipped
-			// would wait for a restart or an unrelated project mutation.
-			r.mu.RLock()
-			repositories := r.services.Repositories
-			r.mu.RUnlock()
-			if repositories != nil {
-				if err := r.reloadProjectCatalog(ctx, repositories); err != nil && r.logger != nil {
-					r.logger.Warn("configuration reloaded but project catalog re-materialization failed", map[string]any{"error": err.Error()})
-				}
-			}
-		}
 		r.publishCatalogConsumers(r.projectCatalog.Snapshot())
 	}
 	r.configReloadStatus.LastAppliedAt = timePointer(now)
@@ -260,18 +255,6 @@ func (r *Runtime) applyLoadedConfigBoundaryLocked(ctx context.Context, loaded co
 		r.TriggerWorktreeCleanup()
 	}
 	return nil
-}
-
-// storedProjectPolicyRequirementChanged reports whether a reload changes
-// whether a stored project needs an effective validation policy to remain in
-// the runtime catalog: a coding role becoming configured or unconfigured, or
-// the legacy defaults.validationCommands fallback appearing or disappearing.
-func storedProjectPolicyRequirementChanged(before, after config.Config) bool {
-	codingRoleConfigured := func(cfg config.Config) bool {
-		return config.CodingRoleAgentConfigured(cfg, config.CodingRoleWorker) || config.CodingRoleAgentConfigured(cfg, config.CodingRoleFixer)
-	}
-	return codingRoleConfigured(before) != codingRoleConfigured(after) ||
-		(len(config.ResolveValidationCommands(before)) == 0) != (len(config.ResolveValidationCommands(after)) == 0)
 }
 
 // PatchConfig applies a targeted mutation to the file layer. It rereads the
