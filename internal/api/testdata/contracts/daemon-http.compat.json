@@ -1,15 +1,16 @@
 {
   "artifactVersion": 1,
   "generatedFrom": [
-    "apps/looperd/src/server/index.ts",
-    "apps/looperd/src/server/index.test.ts",
+    "internal/api/handler.go",
+    "internal/api/bootstrap_routes.go",
     "specs/2026-04-17-go-port-plan/reference/daemon-http-endpoints.md"
   ],
   "notes": [
     "This artifact freezes the current /api/v1 HTTP compatibility boundary for the Go port.",
     "It covers route paths, methods, success statuses, shared response headers, request-id propagation, and local-token auth behavior.",
+    "Hand-maintained: this artifact describes routing and auth behavior rather than payloads, so it is not produced by go generate ./internal/api/....",
     "JSON request body shapes are frozen in daemon-http.requests.compat.json.",
-    "JSON success-envelope response shapes are frozen in daemon-http.responses.compat.json."
+    "JSON success-envelope response shapes are frozen in daemon-http.responses.compat.json, generated from the Go handlers."
   ],
   "basePath": "/api/v1",
   "sharedBehavior": {

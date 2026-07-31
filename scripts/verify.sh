@@ -85,6 +85,15 @@ go run honnef.co/go/tools/cmd/staticcheck@v0.6.1 \
 step "go test ./..."
 go test ./...
 
+# Same gate as ci.yml's "Check frozen HTTP contract artifacts are current".
+step "frozen /api/v1 contract artifacts"
+go generate ./internal/api/... >/dev/null
+if ! git diff --exit-code -- internal/api/testdata/contracts/ >/dev/null; then
+  printf '  the frozen /api/v1 compat artifacts are stale; regenerate them in this commit:\n\n    go generate ./internal/api/...\n\n' >&2
+  exit 1
+fi
+echo "  current"
+
 # Same focused package set as ci.yml's `race` job — both read this file, so the
 # two cannot drift. -race is the one gate `go test ./...` structurally cannot
 # substitute for: without it there is no race detector at all.

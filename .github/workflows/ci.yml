@@ -131,6 +131,17 @@ jobs:
           LOOPER_REQUIRE_TRUSTED_SRT: "1"
         run: go test ./...
 
+      # The /api/v1 compat artifacts are generated from the Go handlers. Catch a
+      # response-shape change that forgot to regenerate here, with the command
+      # to run, instead of as a fixture mismatch deep in a table test.
+      - name: Check frozen HTTP contract artifacts are current
+        run: |
+          go generate ./internal/api/...
+          if ! git diff --exit-code -- internal/api/testdata/contracts/; then
+            printf '\nThe frozen /api/v1 compat artifacts are stale. Regenerate them in this commit:\n\n  go generate ./internal/api/...\n\n' >&2
+            exit 1
+          fi
+
       - name: Build
         env:
           LOOPER_BUILD_GIT_SHA: ${{ github.sha }}

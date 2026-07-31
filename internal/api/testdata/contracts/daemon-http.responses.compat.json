@@ -1,14 +1,21 @@
 {
   "artifactVersion": 1,
   "generatedFrom": [
-    "apps/looperd/src/server/index.ts",
-    "apps/looperd/src/server/index.test.ts",
-    "internal/api/testdata/contracts/daemon-http.compat.json"
+    "internal/api/handler.go",
+    "internal/api/bootstrap_routes.go",
+    "internal/api/loop_logs_stream.go",
+    "internal/api/loop_retry_discard.go",
+    "internal/api/request_decode.go",
+    "pkg/api/envelope.go",
+    "internal/api/contract_artifact_regen_test.go"
   ],
+  "generatedBy": "go generate ./internal/api/...",
   "notes": [
-    "This artifact freezes the current /api/v1 success-envelope JSON shapes using the seeded fixture in apps/looperd/src/server/index.test.ts.",
+    "This artifact freezes the current /api/v1 success-envelope JSON shapes captured by replaying the frozen request fixtures against the in-process Go handler.",
+    "Generated, not hand-edited: change the handler, then run go generate ./internal/api/... in the same commit.",
     "Values normalized as placeholders are environment- or runtime-generated but the surrounding JSON shape is part of the compatibility boundary.",
-    "A route with sameAs intentionally shares the complete frozen response shape of the referenced route."
+    "A route with sameAs intentionally shares the complete frozen response shape of the referenced route.",
+    "loop.logs.follow documents the text/event-stream wire format; its samples are declared in internal/api/contract_artifact_regen_test.go because the stream is timing-dependent."
   ],
   "placeholders": {
     "<tmp-root>": "Temporary fixture root directory used by the test harness.",
@@ -17,7 +24,9 @@
     "<generated-timestamp>": "Runtime-generated ISO-8601 timestamp.",
     "<current-target>": "Current looperd build target for the running platform.",
     "<artifact-name>": "Compiled looperd artifact name for the current target.",
-    "<daemon-executable-path>": "Resolved executable path of the running looperd process."
+    "<daemon-executable-path>": "Resolved executable path of the running looperd process.",
+    "<bootstrap-code>": "Runtime-generated one-shot dashboard bootstrap code.",
+    "<local-token>": "Configured server.localToken returned by a successful bootstrap exchange."
   },
   "routes": [
     {
@@ -62,9 +71,6 @@
             },
             "daemonMode": "foreground",
             "admissionState": "ready",
-            "degradedReasons": [
-              "review_publish_disabled"
-            ],
             "startedAt": "2026-04-11T12:00:00.000Z",
             "recovery": {
               "expiredLocksReleased": 1,
@@ -79,6 +85,9 @@
                 "sources": []
               }
             },
+            "degradedReasons": [
+              "review_publish_disabled"
+            ],
             "binary": {
               "name": "looperd",
               "path": "<daemon-executable-path>",
@@ -274,27 +283,27 @@
             "githubLogin": ""
           },
           "agent": {
+            "vendor": "opencode",
+            "params": {},
             "env": {},
             "envKeys": [],
-            "nativeResume": {
-              "enabled": true
-            },
-            "params": {},
             "timeouts": {
-              "fixerIdleTimeoutSeconds": 600,
-              "fixerMaxRuntimeSeconds": 7200,
+              "plannerSeconds": 3600,
+              "workerSeconds": 10800,
+              "reviewerSeconds": 5400,
               "fixerSeconds": 7200,
               "plannerIdleTimeoutSeconds": 600,
               "plannerMaxRuntimeSeconds": 3600,
-              "plannerSeconds": 3600,
-              "reviewerIdleTimeoutSeconds": 600,
-              "reviewerMaxRuntimeSeconds": 5400,
-              "reviewerSeconds": 5400,
               "workerIdleTimeoutSeconds": 900,
               "workerMaxRuntimeSeconds": 10800,
-              "workerSeconds": 10800
+              "reviewerIdleTimeoutSeconds": 600,
+              "reviewerMaxRuntimeSeconds": 5400,
+              "fixerIdleTimeoutSeconds": 600,
+              "fixerMaxRuntimeSeconds": 7200
             },
-            "vendor": "opencode"
+            "nativeResume": {
+              "enabled": true
+            }
           },
           "logging": {
             "level": "info",
@@ -378,6 +387,26 @@
           },
           "roles": {
             "coding": {
+              "fixer": {
+                "discovery": {
+                  "enabled": true,
+                  "source": "pull_request",
+                  "labels": null,
+                  "labelMode": "all",
+                  "authorFilter": "current_user"
+                },
+                "priority": 40
+              },
+              "gatekeeper": {
+                "discovery": {
+                  "enabled": true,
+                  "source": "pull_request",
+                  "labels": [],
+                  "labelMode": "all",
+                  "includeDrafts": true
+                },
+                "priority": 45
+              },
               "planner": {
                 "discovery": {
                   "enabled": true,
@@ -400,26 +429,6 @@
                 },
                 "priority": 30
               },
-              "fixer": {
-                "discovery": {
-                  "enabled": true,
-                  "source": "pull_request",
-                  "labels": null,
-                  "labelMode": "all",
-                  "authorFilter": "current_user"
-                },
-                "priority": 40
-              },
-              "gatekeeper": {
-                "discovery": {
-                  "enabled": true,
-                  "source": "pull_request",
-                  "labels": [],
-                  "labelMode": "all",
-                  "includeDrafts": true
-                },
-                "priority": 45
-              },
               "worker": {
                 "discovery": {
                   "enabled": true,
@@ -433,44 +442,6 @@
                 "priority": 50
               }
             },
-            "coordinator": {
-              "enabled": false,
-              "pollInterval": "5m",
-              "triage": {
-                "triagedLabel": "triaged",
-                "maxIssueAgeDays": 7,
-                "maxPerTick": 5,
-                "disposition": {
-                  "outOfScopeLabel": "wontfix",
-                  "unclearLabel": "needs-info",
-                  "reTriageOnAuthorReply": true
-                }
-              },
-              "dependencies": {
-                "enabled": false,
-                "apiTimeoutSeconds": 10,
-                "apiRetryAttempts": 3
-              },
-              "mergeWatch": {
-                "maxIndeterminateDuration": "15m",
-                "transientRetries": 3
-              },
-              "dispatch": {
-                "mode": "human-gated",
-                "humanGate": {
-                  "slashCommands": [
-                    "/plan",
-                    "/implement"
-                  ],
-                  "allowedUsers": []
-                },
-                "autonomous": {
-                  "delayMinutes": 30,
-                  "holdLabel": "looper:hold"
-                },
-                "assignTo": ""
-              }
-            },
             "planner": {
               "autoDiscovery": true,
               "triggers": {
@@ -482,12 +453,18 @@
               }
             },
             "reviewer": {
-              "autoMerge": {
-                "enabled": false,
-                "requireBranchProtection": true,
-                "scope": "looper-only",
-                "strategy": "squash",
-                "transientRetries": 3
+              "discovery": {
+                "autoDiscovery": true,
+                "triggers": {
+                  "includeDrafts": false,
+                  "requireReviewRequest": true,
+                  "labels": [],
+                  "labelMode": "all"
+                },
+                "specReview": {
+                  "includeReviewingLabel": true,
+                  "reviewingLabel": "looper:spec-reviewing"
+                }
               },
               "behavior": {
                 "loop": {
@@ -522,37 +499,31 @@
                   "reReviewPromptOnHeadChange": false
                 },
                 "threadResolution": {
-                  "autoResolve": "objective_only",
                   "enabled": false,
-                  "maxThreadsPerRun": 10,
                   "mode": "report_only",
+                  "scope": "looper_authored_only",
+                  "autoResolve": "objective_only",
                   "requireAuditComment": true,
-                  "requireCurrentReviewRequest": true,
                   "requireNewHeadSinceThread": true,
-                  "scope": "looper_authored_only"
+                  "requireCurrentReviewRequest": true,
+                  "maxThreadsPerRun": 10
                 }
               },
-              "discovery": {
-                "autoDiscovery": true,
-                "triggers": {
-                  "includeDrafts": false,
-                  "requireReviewRequest": true,
-                  "labels": [],
-                  "labelMode": "all"
-                },
-                "specReview": {
-                  "includeReviewingLabel": true,
-                  "reviewingLabel": "looper:spec-reviewing"
-                }
+              "autoMerge": {
+                "enabled": false,
+                "strategy": "squash",
+                "requireBranchProtection": true,
+                "transientRetries": 3,
+                "scope": "looper-only"
               }
             },
             "fixer": {
               "autoDiscovery": true,
               "triggers": {
                 "includeDrafts": false,
+                "authorFilter": "current_user",
                 "labels": [],
-                "labelMode": "all",
-                "authorFilter": "current_user"
+                "labelMode": "all"
               }
             },
             "worker": {
@@ -563,6 +534,44 @@
                 ],
                 "labelMode": "all",
                 "requireAssigneeCurrentUser": true
+              }
+            },
+            "coordinator": {
+              "enabled": false,
+              "pollInterval": "5m",
+              "triage": {
+                "triagedLabel": "triaged",
+                "maxIssueAgeDays": 7,
+                "maxPerTick": 5,
+                "disposition": {
+                  "outOfScopeLabel": "wontfix",
+                  "unclearLabel": "needs-info",
+                  "reTriageOnAuthorReply": true
+                }
+              },
+              "dispatch": {
+                "mode": "human-gated",
+                "humanGate": {
+                  "slashCommands": [
+                    "/plan",
+                    "/implement"
+                  ],
+                  "allowedUsers": []
+                },
+                "autonomous": {
+                  "delayMinutes": 30,
+                  "holdLabel": "looper:hold"
+                },
+                "assignTo": ""
+              },
+              "dependencies": {
+                "enabled": false,
+                "apiTimeoutSeconds": 10,
+                "apiRetryAttempts": 3
+              },
+              "mergeWatch": {
+                "transientRetries": 3,
+                "maxIndeterminateDuration": "15m"
               }
             }
           },

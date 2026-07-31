@@ -108,6 +108,23 @@ func TestMain(m *testing.M) {
 
 Tests that assert `HOME`-derived default paths should clear `LOOPER_HOME` (`t.Setenv("LOOPER_HOME", "")`), the same way they clear `LOOPER_CONFIG`.
 
+### Frozen `/api/v1` contract artifacts
+
+`internal/api/testdata/contracts/` freezes the daemon's HTTP boundary. Two of the four artifacts are **generated from the Go handlers** and must not be hand-edited:
+
+- `daemon-http.responses.compat.json` — success-envelope bodies, captured by replaying the recorded requests against the in-process handler
+- `daemon-http.errors.compat.json` — error statuses, bodies, and the error-code table read from `pkg/api.AllErrorCodes`
+
+The other two stay hand-maintained: `daemon-http.requests.compat.json` is the recorded input the generator replays, and `daemon-http.compat.json` describes routing and auth behavior rather than payloads.
+
+When you deliberately change a response shape, regenerate in the same commit so the diff is reviewed alongside the handler change:
+
+```bash
+go generate ./internal/api/...
+```
+
+CI runs the same command and fails if the artifacts come back dirty. The frozen-boundary guarantee is not "this JSON never changes" — it is "changes to this JSON are explicit, reviewed diffs".
+
 Provider e2e coverage:
 
 ```bash
