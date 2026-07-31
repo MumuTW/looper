@@ -151,7 +151,7 @@ func upgradeCutoverStatus(identity version.Info, healthy bool) map[string]any {
 				"quarantinedRunningRuns":      0,
 			}},
 		},
-		"storage":   map[string]any{"schemaVersion": "0021", "pendingMigrations": []string{}, "healthy": true},
+		"storage":   map[string]any{"schemaVersion": "0022_durable_payload_baseline", "pendingMigrations": []string{}, "healthy": true},
 		"scheduler": map[string]any{"activeRuns": 0, "runningItems": 0},
 	}
 }

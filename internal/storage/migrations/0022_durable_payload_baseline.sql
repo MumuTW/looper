@@ -1,0 +1,13 @@
+-- The initial SQLite schema stored checkpoints, event payloads, PR snapshots,
+-- and agent retry snapshots as JSON without per-row version envelopes. Those
+-- payloads are durable execution authority, not incidental diagnostics: an
+-- older binary can silently ignore a field added by a newer binary even when
+-- every SQL table and column still matches.
+--
+-- Recording this compatibility barrier in schema_migrations makes the running
+-- binary's ordered migration manifest the downgrade authority. A binary that
+-- predates this baseline sees 0022 as unknown and must restore a matching
+-- backup rather than open the database and infer payload safety from SQL IDs.
+-- Future incompatible durable-payload changes must add a later marker
+-- migration in the same way.
+SELECT 1;
