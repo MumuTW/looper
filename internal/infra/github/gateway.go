@@ -176,10 +176,11 @@ type PullRequestCheckRuns struct {
 }
 
 type PullRequestCheckRun struct {
-	Name       string
-	Status     string
-	Conclusion string
-	AppID      int64
+	Name         string
+	Status       string
+	Conclusion   string
+	AppID        int64
+	CheckSuiteID int64
 }
 
 type PullRequestStatus struct {
@@ -444,6 +445,14 @@ type PullRequestCheckRunsInput struct {
 	Repo string
 	Ref  string
 	CWD  string
+}
+
+// RerequestCheckSuiteInput identifies one GitHub check suite to rerun. The
+// suite identifier is read from the check-runs response for the audited ref.
+type RerequestCheckSuiteInput struct {
+	Repo         string
+	CheckSuiteID int64
+	CWD          string
 }
 
 type SubmitReviewInput struct {
@@ -1757,7 +1766,7 @@ func (g *Gateway) ListPullRequestCheckRuns(ctx context.Context, input PullReques
 	checkRuns := toObjectSlice(row["check_runs"])
 	out := PullRequestCheckRuns{TotalCount: int(asInt64(row["total_count"])), CheckRuns: make([]PullRequestCheckRun, 0, len(checkRuns))}
 	for _, checkRun := range checkRuns {
-		out.CheckRuns = append(out.CheckRuns, PullRequestCheckRun{Name: asString(checkRun["name"]), Status: asString(checkRun["status"]), Conclusion: asString(checkRun["conclusion"]), AppID: nestedInt64(checkRun, "app", "id")})
+		out.CheckRuns = append(out.CheckRuns, PullRequestCheckRun{Name: asString(checkRun["name"]), Status: asString(checkRun["status"]), Conclusion: asString(checkRun["conclusion"]), AppID: nestedInt64(checkRun, "app", "id"), CheckSuiteID: nestedInt64(checkRun, "check_suite", "id")})
 	}
 	statuses := toObjectSlice(statusRow["statuses"])
 	out.Statuses = make([]PullRequestStatus, 0, len(statuses))
@@ -1775,6 +1784,25 @@ func (g *Gateway) ListPullRequestCheckRuns(ctx context.Context, input PullReques
 		out.Statuses = append(out.Statuses, PullRequestStatus{Context: contextName, State: asString(status["state"])})
 	}
 	return out, nil
+}
+
+// RerequestCheckSuite asks GitHub to rerun one check suite. It deliberately
+// does not infer a suite from a check name: the caller must carry the exact
+// suite ID obtained from the observed branch head.
+func (g *Gateway) RerequestCheckSuite(ctx context.Context, input RerequestCheckSuiteInput) error {
+	if strings.TrimSpace(input.Repo) == "" {
+		return fmt.Errorf("rerequest check suite: repository is required")
+	}
+	if input.CheckSuiteID <= 0 {
+		return fmt.Errorf("rerequest check suite: positive check suite ID is required")
+	}
+	hostname, repo := splitRepoHostname(input.Repo)
+	args := []string{"api", fmt.Sprintf("repos/%s/check-suites/%d/rerequest", repo, input.CheckSuiteID), "--method", "POST", "-H", "Accept: application/vnd.github+json"}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	_, err := g.runGh(ctx, input.CWD, "", args...)
+	return err
 }
 
 func (g *Gateway) ListLinkedPullRequests(ctx context.Context, input LinkedPullRequestsInput) ([]LinkedPullRequest, error) {

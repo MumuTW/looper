@@ -682,7 +682,7 @@ func TestListPullRequestCheckRunsIncludesStatusContexts(t *testing.T) {
 			if args != "api repos/acme/looper/commits/abc123/check-runs?filter=latest&per_page=100 -H Accept: application/vnd.github+json" {
 				t.Fatalf("unexpected gh args: %q", args)
 			}
-			return shell.Result{Stdout: `{"total_count":1,"check_runs":[{"name":"unit","status":"completed","conclusion":"success","app":{"id":15368}}]}`}, nil
+			return shell.Result{Stdout: `{"total_count":1,"check_runs":[{"name":"unit","status":"completed","conclusion":"success","app":{"id":15368},"check_suite":{"id":7654}}]}`}, nil
 		case 2:
 			if args != "api repos/acme/looper/commits/abc123/status -H Accept: application/vnd.github+json" {
 				t.Fatalf("unexpected gh args: %q", args)
@@ -702,11 +702,40 @@ func TestListPullRequestCheckRunsIncludesStatusContexts(t *testing.T) {
 	if len(runs.CheckRuns) != 1 || runs.CheckRuns[0].Name != "unit" {
 		t.Fatalf("CheckRuns = %#v, want decoded check run", runs.CheckRuns)
 	}
-	if runs.CheckRuns[0].AppID != 15368 {
-		t.Fatalf("CheckRuns[0].AppID = %d, want 15368", runs.CheckRuns[0].AppID)
+	if runs.CheckRuns[0].AppID != 15368 || runs.CheckRuns[0].CheckSuiteID != 7654 {
+		t.Fatalf("CheckRuns[0] = %#v, want app and check-suite identities", runs.CheckRuns[0])
 	}
 	if len(runs.Statuses) != 2 || runs.Statuses[0].Context != "legacy-ci" || runs.Statuses[1].Context != "lint" {
 		t.Fatalf("Statuses = %#v, want deduped status contexts in API order", runs.Statuses)
+	}
+}
+
+func TestRerequestCheckSuiteUsesExplicitSuiteIdentityAndHostname(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		if got, want := strings.Join(options.Args, " "), "api repos/acme/looper/check-suites/7654/rerequest --method POST -H Accept: application/vnd.github+json --hostname ghes.example"; got != want {
+			t.Fatalf("gh args = %q, want %q", got, want)
+		}
+		return shell.Result{Stdout: "{}"}, nil
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	if err := gateway.RerequestCheckSuite(context.Background(), RerequestCheckSuiteInput{Repo: "ghes.example/acme/looper", CheckSuiteID: 7654}); err != nil {
+		t.Fatalf("RerequestCheckSuite() error = %v", err)
+	}
+}
+
+func TestRerequestCheckSuiteRejectsMissingIdentityBeforeCallingGitHub(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+
+	if err := gateway.RerequestCheckSuite(context.Background(), RerequestCheckSuiteInput{Repo: "acme/looper"}); err == nil {
+		t.Fatal("RerequestCheckSuite() error = nil, want missing suite identity error")
+	}
+	if len(runner.calls) != 0 {
+		t.Fatalf("GitHub calls = %#v, want none", runner.calls)
 	}
 }
 
