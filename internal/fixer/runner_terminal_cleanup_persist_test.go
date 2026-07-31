@@ -7,8 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/nexu-io/looper/internal/loops"
-	"github.com/nexu-io/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/loops"
+	"github.com/MumuTW/looper/internal/storage"
 )
 
 // Terminal worktree cleanup runs after completeRun has already written the run,

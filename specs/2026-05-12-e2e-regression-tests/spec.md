@@ -132,7 +132,7 @@ PR 默认 integration smoke 目标耗时控制在 60 秒左右；更深的 path-
 
 ### 4.3 Real sandbox E2E：真实 GitHub 现实校验
 
-这层使用专门 sandbox 仓库，例如 `nexu-io/looper-sandbox`，允许创建 issue、PR、review comment、resolve thread。
+这层使用专门 sandbox 仓库，例如 `MumuTW/looper-sandbox`，允许创建 issue、PR、review comment、resolve thread。
 
 职责：验证 Looper 对真实 GitHub 行为、auth/scope、rate limit、review thread mutation 的理解没有偏差。
 
@@ -252,7 +252,7 @@ PR #255 的根因是 mock 允许了真实 `gh` 不支持的字段，因此 fake 
 LOOPER_E2E_REAL_GH=1 go test ./internal/e2e/githubcontract -count=1
 ```
 
-该测试只读真实 `nexu-io/looper`，验证关键 `gh ... --json ...` / `gh api ...` 命令可以执行，并提示 fixture 是否过期。
+该测试只读真实 `MumuTW/looper`，验证关键 `gh ... --json ...` / `gh api ...` 命令可以执行，并提示 fixture 是否过期。
 
 ### 5.4 Resolve-comments 必须覆盖状态迁移
 
@@ -402,7 +402,7 @@ LOOPER_E2E_GITHUB=1 go test ./internal/e2e/github -count=1
 
 sandbox 要求：
 
-- 使用专用 sandbox repo，例如 `LOOPER_E2E_SANDBOX_REPO=nexu-io/looper-sandbox`。
+- 使用专用 sandbox repo，例如 `LOOPER_E2E_SANDBOX_REPO=MumuTW/looper-sandbox`。
 - 使用专用 secret，例如 `LOOPER_E2E_GITHUB_TOKEN`，不能使用 maintainer 个人 token。
 - token 最小权限：metadata read、issues read/write、pull requests read/write、contents read/write，仅限 sandbox repo。
 - 测试资源使用唯一 run label / 标题 / branch 前缀，例如 `looper-e2e:<run-id>`。
@@ -433,7 +433,7 @@ sandbox 要求：
 - Phase 4 已部分落地并通过：已覆盖 fresh schedule worktree isolation、cwd evidence、user repo unchanged、isolated commit、worker reuse / active loop、bad checkpoint safe reject、fixer isolation 等价路径；仅剩 worktree restore 路径待补充或澄清产品语义。
 - Phase 5 已落地：fake-gh 已支持基于 bare origin 的 PR head、thread state 持久化、resolve/unresolve mutation、closed/open target state、no-push rerun 所需状态种子；并已覆盖 stale-head-after-push、no-push-rerun-stale-head、no-new-commit-unresolved、closed-PR skip、resumed-closed-target、worker no-diff/no-PR 场景。
 - Phase 6 已落地：PR 默认 `Contract/invariant integration smoke` 已接入；高风险路径使用 centralized changed-files path filter 路由到 daemon boot / gh contract / resolve-comments / worktree E2E；`go.mod` / `go.sum` 与 path-filter 失败会 fallback 全跑；E2E job 已统一 `-count=1`、超时与失败 artifact 上传（含 temp HOME、config、sqlite DB、looperd logs、fake gh invocation log、fake agent cwd evidence、bare origin refs、worktree list）；main/release 现已衔接 sandbox workflow。
-- Phase 7 已落地：已创建 `nexu-io/looper-sandbox`；新增 `LOOPER_E2E_GITHUB=1` / `LOOPER_E2E_SANDBOX_REPO` / `LOOPER_E2E_GITHUB_TOKEN` 运行约定，并在 CI 侧改用 GitHub App（`LOOPER_E2E_GITHUB_APP_ID` repo var + `LOOPER_E2E_GITHUB_APP_PRIVATE_KEY` secret）通过 `actions/create-github-app-token@v3` 按需铸造 repo-scoped 短期 token；新增真实 GitHub sandbox E2E（issue→worker→PR、PR review thread→fixer resolve、worker no-diff、fixer no-new-commit）；新增 `sandbox-e2e.yml`（main + manual）、release preflight 与 24h cleanup workflow；测试命令新增 rate-limit/retry backoff；本地与 CI 均采用 non-interactive git/auth 路径，真实 sandbox suite 已通过。
+- Phase 7 已落地：已创建 `MumuTW/looper-sandbox`；新增 `LOOPER_E2E_GITHUB=1` / `LOOPER_E2E_SANDBOX_REPO` / `LOOPER_E2E_GITHUB_TOKEN` 运行约定，并在 CI 侧改用 GitHub App（`LOOPER_E2E_GITHUB_APP_ID` repo var + `LOOPER_E2E_GITHUB_APP_PRIVATE_KEY` secret）通过 `actions/create-github-app-token@v3` 按需铸造 repo-scoped 短期 token；新增真实 GitHub sandbox E2E（issue→worker→PR、PR review thread→fixer resolve、worker no-diff、fixer no-new-commit）；新增 `sandbox-e2e.yml`（main + manual）、release preflight 与 24h cleanup workflow；测试命令新增 rate-limit/retry backoff；本地与 CI 均采用 non-interactive git/auth 路径，真实 sandbox suite 已通过。
 - Phase 8 已落地：PR template、code review checklist、review blocker policy、历史回归映射与 regression coverage tracking 均已补齐。
 - Phase 10 已落地：`go test ./internal/e2e -count=1`、`go test ./internal/e2e/githubcontract -count=1`、`go test ./...`、`go vet ./...`、`go build ./...` 已验证通过；daemon boot smoke、worktree bad-checkpoint regression、unsupported-field gh contract、agent malformed/no-marker parsing、CI path-filter fallback 均已手动验证。
 

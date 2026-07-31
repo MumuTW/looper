@@ -3,7 +3,7 @@ package agent
 import (
 	"strings"
 
-	"github.com/nexu-io/looper/internal/config"
+	"github.com/MumuTW/looper/internal/config"
 )
 
 // runtimeAdapter owns the CLI-shaped parts of an agent runtime. Process

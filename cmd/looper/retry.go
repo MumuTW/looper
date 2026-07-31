@@ -9,8 +9,8 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/nexu-io/looper/internal/config"
-	pkgapi "github.com/nexu-io/looper/pkg/api"
+	"github.com/MumuTW/looper/internal/config"
+	pkgapi "github.com/MumuTW/looper/pkg/api"
 )
 
 // runRetry is the dirty-worktree-safe retry path. A bodyless POST would requeue

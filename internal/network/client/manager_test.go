@@ -9,11 +9,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nexu-io/looper/internal/config"
-	githubinfra "github.com/nexu-io/looper/internal/infra/github"
-	"github.com/nexu-io/looper/internal/infra/shell"
-	"github.com/nexu-io/looper/internal/network/cloud"
-	"github.com/nexu-io/looper/internal/network/protocol"
+	"github.com/MumuTW/looper/internal/config"
+	githubinfra "github.com/MumuTW/looper/internal/infra/github"
+	"github.com/MumuTW/looper/internal/infra/shell"
+	"github.com/MumuTW/looper/internal/network/cloud"
+	"github.com/MumuTW/looper/internal/network/protocol"
 )
 
 func TestManagerStartWithoutNetworkStateLeavesStatusUnconfigured(t *testing.T) {

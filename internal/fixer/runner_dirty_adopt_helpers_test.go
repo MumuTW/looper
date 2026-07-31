@@ -11,9 +11,9 @@ import (
 	"strings"
 	"testing"
 
-	gitinfra "github.com/nexu-io/looper/internal/infra/git"
-	"github.com/nexu-io/looper/internal/storage"
-	"github.com/nexu-io/looper/internal/worktreesafety"
+	gitinfra "github.com/MumuTW/looper/internal/infra/git"
+	"github.com/MumuTW/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/worktreesafety"
 )
 
 // Shared fixtures for same-head dirty adopt / prepare-error recovery.

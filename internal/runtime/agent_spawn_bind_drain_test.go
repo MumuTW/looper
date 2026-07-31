@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nexu-io/looper/internal/agent"
-	"github.com/nexu-io/looper/internal/processcontainment"
+	"github.com/MumuTW/looper/internal/agent"
+	"github.com/MumuTW/looper/internal/processcontainment"
 )
 
 // BeginLoopStop must report drain failure when a pending Start→BindHandle

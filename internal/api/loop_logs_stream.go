@@ -10,8 +10,8 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/nexu-io/looper/internal/storage"
-	pkgapi "github.com/nexu-io/looper/pkg/api"
+	"github.com/MumuTW/looper/internal/storage"
+	pkgapi "github.com/MumuTW/looper/pkg/api"
 )
 
 type loopLogsFollowObservation struct {

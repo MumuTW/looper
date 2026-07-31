@@ -11,9 +11,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/nexu-io/looper/internal/labels"
-	"github.com/nexu-io/looper/internal/loops"
-	"github.com/nexu-io/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/labels"
+	"github.com/MumuTW/looper/internal/loops"
+	"github.com/MumuTW/looper/internal/storage"
 )
 
 func TestConsumeAskSentinelReadsAndRemoves(t *testing.T) {
@@ -59,21 +59,10 @@ type appendingAgentExecutor struct {
 
 func (a *appendingAgentExecutor) Start(ctx context.Context, input AgentRunInput) (AgentExecution, error) {
 	if a.text != "" {
-		loop, err := a.repos.Loops.GetByID(ctx, a.loopID)
-		if err != nil {
+		if err := appendHumanMessageForWorker(ctx, a.repos, a.at, a.loopID, a.text); err != nil {
 			return nil, err
 		}
-		if loop == nil {
-			return nil, fmt.Errorf("loop not found: %s", a.loopID)
-		}
-		meta, err := loops.AppendHumanMessage(loop.MetadataJSON, loops.HumanMessage{At: a.at, Text: a.text})
-		if err != nil {
-			return nil, err
-		}
-		loop.MetadataJSON = &meta
-		if err := a.repos.Loops.Upsert(ctx, *loop); err != nil {
-			return nil, err
-		}
+		a.text = ""
 	}
 	if a.ask != "" {
 		askPath := filepath.Join(input.WorkingDirectory, hitlSentinelRelPath)
@@ -173,26 +162,33 @@ func TestWorkerInboxAcknowledgementPreservesConcurrentMessageForNextTurn(t *test
 				t.Fatalf("Loops.Upsert() error = %v", err)
 			}
 
-			agent := &blockingAgentExecutor{started: make(chan struct{}), release: make(chan struct{})}
+			project, err := fixture.repos.Projects.GetByID(ctx, loop.ProjectID)
+			if err != nil || project == nil {
+				t.Fatalf("Projects.GetByID() = (%#v, %v)", project, err)
+			}
+			worktreeRoot := t.TempDir()
+			project.MetadataJSON = stringPtr(fmt.Sprintf(`{"worktreeRoot":%q}`, worktreeRoot))
+			if err := fixture.repos.Projects.Upsert(ctx, *project); err != nil {
+				t.Fatalf("Projects.Upsert() = %v", err)
+			}
+			worktreePath := filepath.Join(worktreeRoot, "inbox")
+			if err := os.MkdirAll(worktreePath, 0o755); err != nil {
+				t.Fatalf("MkdirAll(worktree) = %v", err)
+			}
+			if err := os.WriteFile(filepath.Join(worktreePath, ".git"), []byte("gitdir: test\n"), 0o644); err != nil {
+				t.Fatalf("WriteFile(worktree .git) = %v", err)
+			}
+			agent := &appendingAgentExecutor{repos: fixture.repos, loopID: loop.ID, at: fixture.nowISO(), text: "late instruction"}
 			runner := New(Options{
 				DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now,
-				GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: t.TempDir(), Branch: "looper/inbox", BaseBranch: "main"}},
+				GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: worktreePath, Branch: "looper/inbox", BaseBranch: "main"}},
 				AgentExecutor: agent, HITLEnabled: true, AllowAutoCommit: true,
 			})
 			claim, err := fixture.repos.Queue.ClaimNextOfType(ctx, fixture.nowISO(), "worker-1", "worker")
 			if err != nil || claim == nil {
 				t.Fatalf("ClaimNextOfType() = (%#v, %v)", claim, err)
 			}
-			finished := make(chan error, 1)
-			go func() {
-				_, runErr := runner.ProcessClaimedItem(ctx, *claim)
-				finished <- runErr
-			}()
-			<-agent.started
-
-			appendHumanMessageForWorkerTest(t, ctx, fixture.repos, fixture.nowISO(), "loop_worker_1", "late instruction")
-			close(agent.release)
-			if err := <-finished; err != nil {
+			if _, err := runner.ProcessClaimedItem(ctx, *claim); err != nil {
 				t.Fatalf("ProcessClaimedItem(first) error = %v", err)
 			}
 
@@ -216,8 +212,19 @@ func TestWorkerInboxAcknowledgementPreservesConcurrentMessageForNextTurn(t *test
 			if _, err := runner.ProcessClaimedItem(ctx, *next); err != nil {
 				t.Fatalf("ProcessClaimedItem(next) error = %v", err)
 			}
-			if len(agent.starts) != 2 || !strings.Contains(agent.starts[1].Prompt, "late instruction") {
-				t.Fatalf("agent starts = %#v, want second prompt containing late instruction", agent.starts)
+			if len(agent.inner.starts) != 2 || !strings.Contains(agent.inner.starts[1].Prompt, "late instruction") {
+				t.Fatalf("agent starts = %#v, want second prompt containing late instruction", agent.inner.starts)
+			}
+			loop, err = fixture.repos.Loops.GetByID(ctx, "loop_worker_1")
+			if err != nil || loop == nil || loop.Status != "completed" {
+				t.Fatalf("loop after second turn = (%#v, %v), want completed", loop, err)
+			}
+			if inbox := loops.ReadHumanInbox(loop.MetadataJSON); len(inbox) != 0 {
+				t.Fatalf("inbox after second turn = %#v, want empty", inbox)
+			}
+			queue, err = fixture.repos.Queue.GetByID(ctx, "queue_worker_1")
+			if err != nil || queue == nil || queue.Status != "completed" {
+				t.Fatalf("queue after second turn = (%#v, %v), want completed", queue, err)
 			}
 		})
 	}
@@ -274,46 +281,32 @@ func TestSuspendForHumanAcknowledgesOnlyPromptInboxSnapshot(t *testing.T) {
 
 func appendHumanMessageForWorkerTest(t *testing.T, ctx context.Context, repos *storage.Repositories, nowISO, loopID, text string) {
 	t.Helper()
+	if err := appendHumanMessageForWorker(ctx, repos, nowISO, loopID, text); err != nil {
+		t.Fatalf("appendHumanMessageForWorker() = %v", err)
+	}
+}
+
+func appendHumanMessageForWorker(ctx context.Context, repos *storage.Repositories, nowISO, loopID, text string) error {
 	unlock := loops.LockLoopRequeue(loopID)
 	defer unlock()
 	loop, err := repos.Loops.GetByID(ctx, loopID)
 	if err != nil || loop == nil {
-		t.Fatalf("Loops.GetByID() = (%#v, %v)", loop, err)
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("loop not found: %s", loopID)
 	}
 	meta, err := loops.AppendHumanMessage(loop.MetadataJSON, loops.HumanMessage{At: nowISO, Text: text})
 	if err != nil {
-		t.Fatalf("AppendHumanMessage() error = %v", err)
+		return err
 	}
 	loop.MetadataJSON = &meta
 	loop.UpdatedAt = nowISO
 	if err := repos.Loops.Upsert(ctx, *loop); err != nil {
-		t.Fatalf("Loops.Upsert() error = %v", err)
+		return err
 	}
+	return nil
 }
-
-type blockingAgentExecutor struct {
-	started chan struct{}
-	release chan struct{}
-	starts  []AgentRunInput
-}
-
-func (a *blockingAgentExecutor) Start(_ context.Context, input AgentRunInput) (AgentExecution, error) {
-	a.starts = append(a.starts, input)
-	if len(a.starts) == 1 {
-		close(a.started)
-		return blockingAgentExecution{release: a.release}, nil
-	}
-	return fakeAgentExecution{result: AgentResult{Status: "completed", Summary: "done", ParseStatus: "parsed"}}, nil
-}
-
-type blockingAgentExecution struct{ release <-chan struct{} }
-
-func (a blockingAgentExecution) Wait(context.Context) (AgentResult, error) {
-	<-a.release
-	return AgentResult{Status: "completed", Summary: "done", ParseStatus: "parsed"}, nil
-}
-
-func (blockingAgentExecution) Kill(string) error { return nil }
 
 func TestSuspendForHumanTransitionsAndNotifies(t *testing.T) {
 	fixture := newRunnerFixture(t)

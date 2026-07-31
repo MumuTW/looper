@@ -1,8 +1,8 @@
 package violations
 
 import (
-	l "github.com/nexu-io/looper/internal/labels"
-	. "github.com/nexu-io/looper/internal/network/protocol"
+	l "github.com/MumuTW/looper/internal/labels"
+	. "github.com/MumuTW/looper/internal/network/protocol"
 )
 
 // 1. bare literal

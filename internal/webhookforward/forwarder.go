@@ -11,15 +11,15 @@ import (
 	"sync"
 	"time"
 
-	"github.com/nexu-io/looper/internal/bootstrap"
-	"github.com/nexu-io/looper/internal/config"
-	"github.com/nexu-io/looper/internal/fixer"
-	"github.com/nexu-io/looper/internal/gatekeeper"
-	"github.com/nexu-io/looper/internal/planner"
-	projectcatalog "github.com/nexu-io/looper/internal/projects"
-	"github.com/nexu-io/looper/internal/reviewer"
-	"github.com/nexu-io/looper/internal/storage"
-	"github.com/nexu-io/looper/internal/worker"
+	"github.com/MumuTW/looper/internal/bootstrap"
+	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/fixer"
+	"github.com/MumuTW/looper/internal/gatekeeper"
+	"github.com/MumuTW/looper/internal/planner"
+	projectcatalog "github.com/MumuTW/looper/internal/projects"
+	"github.com/MumuTW/looper/internal/reviewer"
+	"github.com/MumuTW/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/worker"
 )
 
 const (

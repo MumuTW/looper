@@ -4,8 +4,8 @@ import (
 	"context"
 	"testing"
 
-	"github.com/nexu-io/looper/internal/loops"
-	"github.com/nexu-io/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/loops"
+	"github.com/MumuTW/looper/internal/storage"
 )
 
 // A repeated operator Pause can finish before handoff begins and retain the

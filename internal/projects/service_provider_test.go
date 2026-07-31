@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nexu-io/looper/internal/config"
-	"github.com/nexu-io/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/storage"
 )
 
 func TestServiceSyncConfiguredIgnoresProviderDetectionForGitHubDefault(t *testing.T) {
@@ -81,59 +81,37 @@ func TestServiceAddProjectAllowsExplicitGitHubRepoOnDetectedProviderOrigin(t *te
 	}
 }
 
-func TestServiceAddProjectRejectsDetectedRepoFromMismatchedProvider(t *testing.T) {
+func TestServiceAddProjectRejectsDetectedProviderBinding(t *testing.T) {
 	t.Parallel()
 
-	tests := []struct {
-		name             string
-		detectedProvider string
-		wantMessage      string
-	}{
-		{name: "GitHub origin", detectedProvider: "", wantMessage: "belongs to the GitHub default"},
-		{name: "different provider", detectedProvider: "ghes-other", wantMessage: "belongs to ghes-other"},
+	coordinator := openCoordinator(t)
+	repos := storage.NewRepositories(coordinator.DB())
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
+	published := false
+	service := &Service{
+		DB:     coordinator.DB(),
+		Repos:  repos,
+		Config: cfg,
+		Now:    time.Now,
+		DetectRepo: func(context.Context, string) (DetectedRepo, error) {
+			return DetectedRepo{Repo: "owner/repo", Provider: "forgejo-main"}, nil
+		},
+		PublishProjects: func([]config.ProjectRefConfig) { published = true },
+	}
 
-			coordinator := openCoordinator(t)
-			repos := storage.NewRepositories(coordinator.DB())
-			cfg, err := config.DefaultConfig(t.TempDir())
-			if err != nil {
-				t.Fatalf("DefaultConfig() error = %v", err)
-			}
-			tokenEnv := "LOOPER_GHES_TOKEN"
-			cfg.Providers = []config.ProviderConfig{
-				{ID: "ghes-main", Kind: config.ProviderKindGitHub, BaseURL: "https://code.example.com", TokenEnv: &tokenEnv},
-				{ID: "ghes-other", Kind: config.ProviderKindGitHub, BaseURL: "https://other.example.com", TokenEnv: &tokenEnv},
-			}
-			published := false
-			service := &Service{
-				DB:     coordinator.DB(),
-				Repos:  repos,
-				Config: cfg,
-				Now:    time.Now,
-				DetectRepo: func(context.Context, string) (DetectedRepo, error) {
-					return DetectedRepo{Repo: "owner/repo", Provider: tt.detectedProvider}, nil
-				},
-				PublishProjects: func([]config.ProjectRefConfig) { published = true },
-			}
-			provider := "ghes-main"
-
-			_, err = service.AddProject(context.Background(), AddInput{
-				ID: "project", Name: "Project", RepoPath: "/tmp/project", Provider: &provider,
-			})
-			if err == nil || !strings.Contains(err.Error(), tt.wantMessage) {
-				t.Fatalf("AddProject() error = %v, want %q", err, tt.wantMessage)
-			}
-			stored, getErr := repos.Projects.GetByID(context.Background(), "project")
-			if getErr != nil {
-				t.Fatalf("GetByID() error = %v", getErr)
-			}
-			if stored != nil || published {
-				t.Fatalf("stored = %#v, published = %v; want rejection before persistence", stored, published)
-			}
-		})
+	_, err = service.AddProject(context.Background(), AddInput{ID: "project", Name: "Project", RepoPath: "/tmp/project"})
+	if err == nil || !strings.Contains(err.Error(), "provider bindings are config-file authority") {
+		t.Fatalf("AddProject() error = %v, want config-file authority guidance", err)
+	}
+	stored, getErr := repos.Projects.GetByID(context.Background(), "project")
+	if getErr != nil {
+		t.Fatalf("GetByID() error = %v", getErr)
+	}
+	if stored != nil || published {
+		t.Fatalf("stored = %#v, published = %v; want rejection before persistence", stored, published)
 	}
 }
 

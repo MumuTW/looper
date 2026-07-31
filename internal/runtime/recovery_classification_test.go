@@ -5,8 +5,8 @@ import (
 	"os/exec"
 	"testing"
 
-	"github.com/nexu-io/looper/internal/processcontainment"
-	"github.com/nexu-io/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/processcontainment"
+	"github.com/MumuTW/looper/internal/storage"
 )
 
 func TestClassifyStartupProbeEvidenceNeverConfirmedDeadFromPID(t *testing.T) {

@@ -4,7 +4,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/nexu-io/looper/internal/testenv"
+	"github.com/MumuTW/looper/internal/testenv"
 )
 
 func TestMain(m *testing.M) {

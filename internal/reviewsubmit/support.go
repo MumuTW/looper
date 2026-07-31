@@ -7,8 +7,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/nexu-io/looper/internal/config"
-	"github.com/nexu-io/looper/internal/forge"
+	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/forge"
 )
 
 // loadConfig resolves the configuration this submission is judged against.

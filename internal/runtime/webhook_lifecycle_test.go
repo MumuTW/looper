@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nexu-io/looper/internal/processidentity"
+	"github.com/MumuTW/looper/internal/processidentity"
 )
 
 func TestPSProcessStartForcesCLocale(t *testing.T) {

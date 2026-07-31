@@ -8,8 +8,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/nexu-io/looper/internal/agent"
-	"github.com/nexu-io/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/agent"
+	"github.com/MumuTW/looper/internal/storage"
 )
 
 // Retry must restore the sticky stop gate when a later TX validation fails so

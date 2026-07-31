@@ -14,13 +14,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nexu-io/looper/internal/api"
-	"github.com/nexu-io/looper/internal/bootstrap"
-	"github.com/nexu-io/looper/internal/config"
-	looperdruntime "github.com/nexu-io/looper/internal/runtime"
-	"github.com/nexu-io/looper/internal/storage"
-	"github.com/nexu-io/looper/internal/version"
-	pkgapi "github.com/nexu-io/looper/pkg/api"
+	"github.com/MumuTW/looper/internal/api"
+	"github.com/MumuTW/looper/internal/bootstrap"
+	"github.com/MumuTW/looper/internal/config"
+	looperdruntime "github.com/MumuTW/looper/internal/runtime"
+	"github.com/MumuTW/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/version"
+	pkgapi "github.com/MumuTW/looper/pkg/api"
 )
 
 // The CLI builds request paths by string concatenation, so a table of expected

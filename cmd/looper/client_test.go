@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/nexu-io/looper/internal/config"
+	"github.com/MumuTW/looper/internal/config"
 )
 
 // TestSplitGlobalFlags covers the bug that made --config/--host/--port

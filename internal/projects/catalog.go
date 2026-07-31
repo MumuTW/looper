@@ -6,8 +6,8 @@ import (
 	"strings"
 	"sync/atomic"
 
-	"github.com/nexu-io/looper/internal/config"
-	"github.com/nexu-io/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/storage"
 )
 
 // ConfigSource supplies a coherent runtime configuration snapshot. Consumers
@@ -128,12 +128,13 @@ func MaterializeCatalog(global config.Config, records []storage.ProjectRecord) (
 		seen[record.ID] = struct{}{}
 
 		metadata := parseMetadata(record.MetadataJSON)
+		provider := metadataString(metadata, "provider")
 		project := config.ProjectRefConfig{
 			ID:         record.ID,
 			Name:       record.Name,
 			RepoPath:   record.RepoPath,
 			BaseBranch: cloneStringPointer(record.BaseBranch),
-			Provider:   metadataString(metadata, "provider"),
+			Provider:   provider,
 			Repo:       metadataString(metadata, "repo"),
 		}
 		if project.Provider != "" && !configuredProviderExists(global, project.Provider) {

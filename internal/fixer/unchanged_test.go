@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nexu-io/looper/internal/labels"
+	"github.com/MumuTW/looper/internal/labels"
 )
 
 func summaryFixture() PullRequestSummary {

@@ -193,7 +193,7 @@
 
 ## Phase 7 - GitHub sandbox E2E
 
-- [x] 创建或指定 sandbox repo，例如 `nexu-io/looper-sandbox`
+- [x] 创建或指定 sandbox repo，例如 `MumuTW/looper-sandbox`
 - [x] 配置 `LOOPER_E2E_GITHUB=1` env gate
 - [x] 配置 `LOOPER_E2E_SANDBOX_REPO` secret/env
 - [x] 配置 `LOOPER_E2E_GITHUB_APP_PRIVATE_KEY` secret

@@ -13,9 +13,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/nexu-io/looper/internal/infra/shell"
-	"github.com/nexu-io/looper/internal/storage"
-	"github.com/nexu-io/looper/internal/worktreesafety"
+	"github.com/MumuTW/looper/internal/infra/shell"
+	"github.com/MumuTW/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/worktreesafety"
 )
 
 const javaScriptISOStringLayout = "2006-01-02T15:04:05.000Z"
@@ -368,6 +368,7 @@ func (g *Gateway) DetectOriginRemote(ctx context.Context, repoPath string) (Orig
 
 func (g *Gateway) RestoreWorktree(ctx context.Context, input RestoreWorktreeInput) (*storage.WorktreeRecord, error) {
 	checkoutMode := normalizeCheckoutMode(input.CheckoutMode)
+	hasStoredIdentity := false
 
 	if g.repos != nil {
 		var stored *storage.WorktreeRecord
@@ -382,6 +383,7 @@ func (g *Gateway) RestoreWorktree(ctx context.Context, input RestoreWorktreeInpu
 		if err != nil {
 			return nil, err
 		}
+		hasStoredIdentity = stored != nil
 		if stored != nil && stored.Status != "cleaned" && normalizeComparablePath(stored.RepoPath) == normalizeComparablePath(input.RepoPath) && worktreesafety.IsSafe(worktreesafety.CheckInput{WorktreePath: stored.WorktreePath, RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot}) {
 			storedHealthy, err := g.isHealthyWorktree(ctx, stored.WorktreePath)
 			if err != nil {
@@ -455,7 +457,6 @@ func (g *Gateway) RestoreWorktree(ctx context.Context, input RestoreWorktreeInpu
 	if match == nil {
 		return nil, nil
 	}
-
 	healthy, err := g.isHealthyWorktree(ctx, match.Path)
 	if err != nil {
 		return nil, err
@@ -463,6 +464,20 @@ func (g *Gateway) RestoreWorktree(ctx context.Context, input RestoreWorktreeInpu
 	if !healthy {
 		g.tryRemoveWorktree(ctx, input.RepoPath, match.Path)
 		return nil, nil
+	}
+	// Check health before consulting retirement provenance. A vanished path can
+	// be pruned and recreated, while a healthy retired checkout may contain
+	// uncommitted work from the previous owner and must never be adopted. A
+	// healthy checkout with no provenance is instead an interrupted create and
+	// is safely recovered below.
+	if g.repos != nil && !hasStoredIdentity {
+		owner, err := g.repos.Worktrees.GetByPath(ctx, match.Path)
+		if err != nil {
+			return nil, fmt.Errorf("get worktree retirement provenance: %w", err)
+		}
+		if owner != nil && owner.Status == "retired" {
+			return nil, fmt.Errorf("refusing to adopt retired worktree %q for project %q; remove or register the checkout before retrying", match.Path, input.ProjectID)
+		}
 	}
 
 	checkoutMatches, err := g.matchesRestoreCheckoutMode(ctx, match.Path, checkoutMode, input.Branch)
@@ -1141,11 +1156,17 @@ func (g *Gateway) resolveWorktreeIdentity(ctx context.Context, projectID, branch
 		if pathRecord != nil && pathRecord.ProjectID != "" && pathRecord.ProjectID != projectID {
 			return nil, fmt.Errorf("refusing worktree path %q: looper record belongs to project %q, not %q", worktreePath, pathRecord.ProjectID, projectID)
 		}
+		if pathRecord != nil && pathRecord.Status == "retired" {
+			pathRecord = nil
+		}
 	}
 	if projectID != "" && branch != "" {
 		branchRecord, err = g.repos.Worktrees.GetByBranch(ctx, projectID, branch)
 		if err != nil {
 			return nil, fmt.Errorf("get existing worktree by branch: %w", err)
+		}
+		if branchRecord != nil && branchRecord.Status == "retired" {
+			branchRecord = nil
 		}
 	}
 

@@ -16,7 +16,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nexu-io/looper/internal/network/protocol"
+	"github.com/MumuTW/looper/internal/network/protocol"
 )
 
 func TestAdminAndNodeAuthScopingAndJoinKeyConsumption(t *testing.T) {

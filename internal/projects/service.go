@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -16,10 +17,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/nexu-io/looper/internal/bootstrap"
-	"github.com/nexu-io/looper/internal/config"
-	"github.com/nexu-io/looper/internal/eventlog"
-	"github.com/nexu-io/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/bootstrap"
+	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/eventlog"
+	"github.com/MumuTW/looper/internal/storage"
 )
 
 const legacyProjectIDPrefix = "legacy-id-"
@@ -225,7 +226,6 @@ type AddInput struct {
 	IDSource     string
 	WorktreeRoot *string
 	Repo         *string
-	Provider     *string
 	Validation   *config.ProjectValidationConfig
 	SnapshotMode SnapshotMode
 }
@@ -248,9 +248,8 @@ type UpdateInput struct {
 }
 
 type AddResult struct {
-	Project  storage.ProjectRecord
-	Repo     *string
-	Provider *string
+	Project storage.ProjectRecord
+	Repo    *string
 	// Discovery is pending when registration returns; progress is observable on
 	// the Project record and via DiscoverProject retries.
 	Discovery DiscoveryState
@@ -356,34 +355,20 @@ func (s *Service) addProjectLocked(ctx context.Context, input AddInput) (AddResu
 
 	cfg := s.currentConfig()
 	repo := input.Repo
-	provider := normalizeOptionalProvider(input.Provider)
 	warnings := []string{}
-	if (repo == nil || provider == nil) && s.DetectRepo != nil {
+	if repo == nil && s.DetectRepo != nil {
 		detected, detectErr := s.DetectRepo(ctx, input.RepoPath)
 		if detectErr != nil {
 			warnings = append(warnings, fmt.Sprintf("Could not detect repository from git remote: %s", detectErr.Error()))
-		} else {
-			if repo == nil && strings.TrimSpace(detected.Repo) != "" {
-				if provider != nil && strings.TrimSpace(detected.Provider) != strings.TrimSpace(*provider) {
-					detectedProvider := strings.TrimSpace(detected.Provider)
-					if detectedProvider == "" {
-						detectedProvider = "the GitHub default"
-					}
-					return AddResult{}, nil, ProjectValidationError{Message: fmt.Sprintf("detected origin belongs to %s, not provider %q; pass --repo owner/name explicitly or use a checkout whose origin matches the provider", detectedProvider, strings.TrimSpace(*provider))}
-				}
+		} else if repo == nil {
+			if detectedProvider := strings.TrimSpace(detected.Provider); detectedProvider != "" {
+				return AddResult{}, nil, ProjectValidationError{Message: fmt.Sprintf("non-GitHub origin %q requires a provider binding; provider bindings are config-file authority, so define the project under [[projects]] instead of project add", detectedProvider)}
+			}
+			if strings.TrimSpace(detected.Repo) != "" {
 				value := strings.TrimSpace(detected.Repo)
 				repo = &value
-				if provider == nil && strings.TrimSpace(detected.Provider) != "" {
-					return AddResult{}, nil, ProjectValidationError{Message: fmt.Sprintf("non-GitHub origin matches provider %q; rerun with --provider %s to confirm the binding", strings.TrimSpace(detected.Provider), strings.TrimSpace(detected.Provider))}
-				}
 			}
 		}
-	}
-	if err := validateExplicitProvider(cfg, provider); err != nil {
-		return AddResult{}, nil, err
-	}
-	if provider != nil && (repo == nil || strings.TrimSpace(*repo) == "") {
-		return AddResult{}, nil, ProjectValidationError{Message: "provider is set but repo is missing; pass --repo owner/name or use a checkout with a detectable origin remote"}
 	}
 	if repo == nil || strings.TrimSpace(*repo) == "" {
 		// Registering without a repository is allowed, but it produces a project
@@ -417,11 +402,7 @@ func (s *Service) addProjectLocked(ctx context.Context, input AddInput) (AddResu
 	if repo != nil {
 		metadata["repo"] = *repo
 	}
-	if provider != nil {
-		metadata["provider"] = *provider
-	} else {
-		delete(metadata, "provider")
-	}
+	delete(metadata, "provider")
 	if input.Validation != nil {
 		metadata["validation"] = config.ProjectValidationConfig{
 			Commands: append([]string(nil), input.Validation.Commands...),
@@ -499,7 +480,6 @@ func (s *Service) addProjectLocked(ctx context.Context, input AddInput) (AddResu
 	return AddResult{
 		Project:   record,
 		Repo:      repo,
-		Provider:  provider,
 		Discovery: discovery,
 		Warnings:  warnings,
 	}, &job, nil
@@ -833,6 +813,9 @@ func (s *Service) RemoveProject(ctx context.Context, identifier string) (storage
 			if _, cancelErr := repos.Queue.CancelByProject(ctx, project.ID, nowISO, &cancelReason); cancelErr != nil {
 				return false, cancelErr
 			}
+			if _, retireErr := repos.Worktrees.RetireByProject(ctx, project.ID, nowISO); retireErr != nil {
+				return false, retireErr
+			}
 			return true, nil
 		})
 		if transactionErr != nil || !archived {
@@ -935,13 +918,36 @@ func (s *Service) SyncConfigured(ctx context.Context, cfg config.Config, now tim
 		existingByID[existingProjects[index].ID] = &existingProjects[index]
 	}
 	desiredRecords := make([]storage.ProjectRecord, 0, len(cfg.Projects))
+	reclaimingArchivedAPIProjectIDs := make(map[string]struct{})
+	legacyAPIProviderRecords := make([]storage.ProjectRecord, 0)
 	for _, project := range cfg.Projects {
 		desiredIDs[project.ID] = struct{}{}
 		if existing := existingByID[project.ID]; existing != nil {
 			if source, _ := parseMetadata(existing.MetadataJSON)["source"].(string); source == "api" {
-				return ProjectValidationError{Message: fmt.Sprintf("configured project %s conflicts with an API-managed project", project.ID)}
+				if !existing.Archived {
+					return ProjectValidationError{Message: fmt.Sprintf("configured project %s conflicts with an API-managed project that is still active; temporarily remove this project from [[projects]], restart looperd, send DELETE /api/v1/projects/%s to archive the API record, stop looperd, restore the config entry, and restart so config can claim the archived id", project.ID, url.PathEscape(project.ID))}
+				}
+				reclaimingArchivedAPIProjectIDs[project.ID] = struct{}{}
 			}
 		}
+	}
+	for _, existing := range existingProjects {
+		metadata := parseMetadata(existing.MetadataJSON)
+		if metadataString(metadata, "source") != "api" || metadataString(metadata, "provider") == "" {
+			continue
+		}
+		if existing.Archived {
+			continue
+		}
+		// Provider bindings are now config-file authority. Dropping an old API
+		// binding would silently turn its repository into github.com, which is
+		// unsafe for a prior GHES/other-host identity. Archive the record before
+		// catalog materialization instead; an operator may later hand the ID to
+		// an explicit [[projects]] entry.
+		updated := existing
+		updated.Archived = true
+		updated.UpdatedAt = nowISO
+		legacyAPIProviderRecords = append(legacyAPIProviderRecords, updated)
 	}
 
 	for _, project := range cfg.Projects {
@@ -984,6 +990,25 @@ func (s *Service) SyncConfigured(ctx context.Context, cfg config.Config, now tim
 	}
 
 	applyImport := func(repos *storage.Repositories) error {
+		for _, record := range legacyAPIProviderRecords {
+			if _, err := repos.Loops.TerminateByProject(ctx, record.ID, nowISO); err != nil {
+				return err
+			}
+			if _, err := repos.Queue.CancelByProject(ctx, record.ID, nowISO, &cancelReason); err != nil {
+				return err
+			}
+			if _, err := repos.Worktrees.RetireByProject(ctx, record.ID, nowISO); err != nil {
+				return err
+			}
+			if err := repos.Projects.Upsert(ctx, record); err != nil {
+				return err
+			}
+		}
+		for projectID := range reclaimingArchivedAPIProjectIDs {
+			if _, err := repos.Worktrees.RetireByProject(ctx, projectID, nowISO); err != nil {
+				return err
+			}
+		}
 		for _, record := range desiredRecords {
 			if err := repos.Projects.Upsert(ctx, record); err != nil {
 				return err
@@ -1147,22 +1172,24 @@ func parseMetadata(metadataJSON *string) map[string]any {
 func buildProjectMetadataJSON(existing *storage.ProjectRecord, project config.ProjectRefConfig, repo *string) (string, error) {
 	extras := map[string]json.RawMessage{}
 	repoRaw := json.RawMessage("null")
+	reclaimingArchivedAPIProject := existing != nil && existing.Archived && metadataString(parseMetadata(existing.MetadataJSON), "source") == "api"
 
 	if existing != nil {
 		existingMetadata := parseMetadata(existing.MetadataJSON)
 		for key, value := range existingMetadata {
 			switch key {
-			case "repo":
+			case "repo", "worktreeRoot", "source":
 				continue
-			case "worktreeRoot", "source":
-				continue
-			default:
-				encoded, err := json.Marshal(value)
-				if err != nil {
-					return "", err
+			case registrationDiscoveryMetadataKey:
+				if reclaimingArchivedAPIProject {
+					continue
 				}
-				extras[key] = encoded
 			}
+			encoded, err := json.Marshal(value)
+			if err != nil {
+				return "", err
+			}
+			extras[key] = encoded
 		}
 	}
 	if repo != nil && strings.TrimSpace(*repo) != "" {
@@ -1276,33 +1303,6 @@ func buildAddProjectMetadataJSON(metadata map[string]any) (string, error) {
 	}
 	entries = append(entries, orderedJSONEntry{Key: "source", Raw: sourceEncoded})
 	return marshalOrderedJSONObject(entries)
-}
-
-func normalizeOptionalProvider(value *string) *string {
-	if value == nil {
-		return nil
-	}
-	trimmed := strings.TrimSpace(*value)
-	if trimmed == "" {
-		return nil
-	}
-	return &trimmed
-}
-
-// validateExplicitProvider rejects provider bindings on `project add`. The only
-// remaining provider kind is GitHub, which projects get by default, so an
-// explicit binding has nothing left to express; it belongs in [[projects]].
-func validateExplicitProvider(cfg config.Config, provider *string) error {
-	if provider == nil {
-		return nil
-	}
-	providerID := strings.TrimSpace(*provider)
-	for _, configured := range cfg.Providers {
-		if configured.ID == providerID {
-			return ProjectValidationError{Message: fmt.Sprintf("provider %q cannot be bound by project add; define the project under [[projects]] instead", providerID)}
-		}
-	}
-	return ProjectValidationError{Message: fmt.Sprintf("unknown provider id %q; configure it under [[providers]] first", providerID)}
 }
 
 type orderedJSONEntry struct {

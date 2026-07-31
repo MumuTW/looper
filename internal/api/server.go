@@ -10,8 +10,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/nexu-io/looper/internal/bootstrap"
-	"github.com/nexu-io/looper/internal/config"
+	"github.com/MumuTW/looper/internal/bootstrap"
+	"github.com/MumuTW/looper/internal/config"
 )
 
 type Server struct {

@@ -6,9 +6,9 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/nexu-io/looper/internal/config"
-	"github.com/nexu-io/looper/internal/gatekeeper"
-	"github.com/nexu-io/looper/internal/triager"
+	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/gatekeeper"
+	"github.com/MumuTW/looper/internal/triager"
 )
 
 func TestDiscoveryLanesRegisterTriagerAheadOfPlanner(t *testing.T) {

@@ -4,7 +4,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/nexu-io/looper/internal/e2e/harness"
+	"github.com/MumuTW/looper/internal/e2e/harness"
 )
 
 func TestMain(m *testing.M) {

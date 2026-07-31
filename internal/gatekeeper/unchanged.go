@@ -8,8 +8,8 @@ import (
 	"strings"
 	"time"
 
-	githubinfra "github.com/nexu-io/looper/internal/infra/github"
-	"github.com/nexu-io/looper/internal/storage"
+	githubinfra "github.com/MumuTW/looper/internal/infra/github"
+	"github.com/MumuTW/looper/internal/storage"
 )
 
 // maxSkipAge bounds how long a pull request may be skipped on an unchanged

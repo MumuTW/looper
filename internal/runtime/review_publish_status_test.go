@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/nexu-io/looper/internal/config"
-	"github.com/nexu-io/looper/internal/forge"
+	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/forge"
 )
 
 func TestReviewPublishReadinessForUnknownBinaryDoesNotProbe(t *testing.T) {

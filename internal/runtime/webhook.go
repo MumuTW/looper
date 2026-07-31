@@ -14,9 +14,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/nexu-io/looper/internal/bootstrap"
-	"github.com/nexu-io/looper/internal/config"
-	"github.com/nexu-io/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/bootstrap"
+	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/storage"
 )
 
 const webhookListenerPath = "/webhook/forward"

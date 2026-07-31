@@ -9,7 +9,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/nexu-io/looper/internal/config"
+	"github.com/MumuTW/looper/internal/config"
 )
 
 func TestReloadConfigHidesSecretBearingUnstructuredDecodeErrors(t *testing.T) {

@@ -3,8 +3,8 @@ package runtime
 import (
 	"sync"
 
-	"github.com/nexu-io/looper/internal/bootstrap"
-	"github.com/nexu-io/looper/internal/daemonbinary"
+	"github.com/MumuTW/looper/internal/bootstrap"
+	"github.com/MumuTW/looper/internal/daemonbinary"
 )
 
 // daemonBinaryWatcher holds the identity of the executable this daemon started
