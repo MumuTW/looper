@@ -58,6 +58,7 @@ const (
 	ReasonReviewChangesRequested   ReasonCode = "review_changes_requested"
 	ReasonCodexReviewMissing       ReasonCode = "codex_review_missing"
 	ReasonUnresolvedReviewThread   ReasonCode = "unresolved_review_thread"
+	ReasonReviewerConvergence      ReasonCode = "reviewer_convergence_blocked"
 	ReasonProjectPolicyDenied      ReasonCode = "project_policy_denied"
 	ReasonHold                     ReasonCode = "hold"
 	ReasonDiffBudgetExceeded       ReasonCode = "diff_budget_exceeded"
@@ -103,21 +104,22 @@ type CodexReviewEvidence struct {
 }
 
 type Evidence struct {
-	PullRequestState             string               `json:"pullRequestState,omitempty"`
-	Draft                        bool                 `json:"draft"`
-	BaseRefName                  string               `json:"baseRefName,omitempty"`
-	Mergeable                    *bool                `json:"mergeable,omitempty"`
-	MergeableState               string               `json:"mergeableState,omitempty"`
-	RequiredChecks               []string             `json:"requiredChecks"`
-	Checks                       []CheckEvidence      `json:"checks"`
-	RequiredApprovingReviewCount int                  `json:"requiredApprovingReviewCount"`
-	ReviewDecision               string               `json:"reviewDecision,omitempty"`
-	CodexReview                  *CodexReviewEvidence `json:"codexReview,omitempty"`
-	UnresolvedReviewThreadIDs    []string             `json:"unresolvedReviewThreadIds"`
-	HoldLabels                   []string             `json:"holdLabels"`
-	DiffBudget                   *DiffBudgetEvidence  `json:"diffBudget,omitempty"`
-	ProjectPolicyPermitsTarget   bool                 `json:"projectPolicyPermitsTarget"`
-	FinalObservedHeadSHA         string               `json:"finalObservedHeadSha,omitempty"`
+	PullRequestState             string                       `json:"pullRequestState,omitempty"`
+	Draft                        bool                         `json:"draft"`
+	BaseRefName                  string                       `json:"baseRefName,omitempty"`
+	Mergeable                    *bool                        `json:"mergeable,omitempty"`
+	MergeableState               string                       `json:"mergeableState,omitempty"`
+	RequiredChecks               []string                     `json:"requiredChecks"`
+	Checks                       []CheckEvidence              `json:"checks"`
+	RequiredApprovingReviewCount int                          `json:"requiredApprovingReviewCount"`
+	ReviewDecision               string                       `json:"reviewDecision,omitempty"`
+	CodexReview                  *CodexReviewEvidence         `json:"codexReview,omitempty"`
+	UnresolvedReviewThreadIDs    []string                     `json:"unresolvedReviewThreadIds"`
+	HoldLabels                   []string                     `json:"holdLabels"`
+	DiffBudget                   *DiffBudgetEvidence          `json:"diffBudget,omitempty"`
+	ReviewerConvergence          *ReviewerConvergenceEvidence `json:"reviewerConvergence,omitempty"`
+	ProjectPolicyPermitsTarget   bool                         `json:"projectPolicyPermitsTarget"`
+	FinalObservedHeadSHA         string                       `json:"finalObservedHeadSha,omitempty"`
 }
 
 type Report struct {
@@ -513,6 +515,17 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 		}
 	}
 	sort.Strings(report.Evidence.UnresolvedReviewThreadIDs)
+
+	convergenceEvidence, hasConvergence, err := latestReviewerConvergence(ctx, r.repos, input.ProjectID, input.Repo, input.PRNumber)
+	if err != nil {
+		return r.persistProviderBlock(ctx, report, ReasonProviderStateUnavailable, "reviewer_convergence")
+	}
+	if hasConvergence {
+		report.Evidence.ReviewerConvergence = &convergenceEvidence
+		if reviewerConvergenceBlocks(convergenceEvidence) {
+			report.Reasons = append(report.Reasons, Reason{Code: ReasonReviewerConvergence, Subject: reviewerConvergenceReasonSubject(convergenceEvidence)})
+		}
+	}
 
 	finalHead, finalBase, err := r.github.GetPullRequestHeadAndBaseSHA(ctx, viewInput)
 	if err != nil {
