@@ -695,7 +695,15 @@ const (
 // GatekeeperRoleConfig configures the agent-free Merge Gatekeeper.
 type GatekeeperRoleConfig struct {
 	// Trust is the merge authority level. Empty defaults to observe.
-	Trust GatekeeperTrustLevel `json:"trust,omitempty"`
+	Trust      GatekeeperTrustLevel  `json:"trust,omitempty"`
+	DiffBudget *GatekeeperDiffBudget `json:"diffBudget,omitempty"`
+}
+
+// GatekeeperDiffBudget is a boolean change-size gate. A zero bound is
+// unlimited; non-zero bounds are enforced independently.
+type GatekeeperDiffBudget struct {
+	MaxChangedFiles int `json:"maxChangedFiles"`
+	MaxDeletions    int `json:"maxDeletions"`
 }
 
 // AuditorRoleConfig configures the opt-in Post-merge Auditor. It remains
@@ -1286,7 +1294,13 @@ type PartialDeployerRoleConfig struct {
 }
 
 type PartialGatekeeperRoleConfig struct {
-	Trust *GatekeeperTrustLevel `json:"trust,omitempty"`
+	Trust      *GatekeeperTrustLevel        `json:"trust,omitempty"`
+	DiffBudget *PartialGatekeeperDiffBudget `json:"diffBudget,omitempty"`
+}
+
+type PartialGatekeeperDiffBudget struct {
+	MaxChangedFiles *int `json:"maxChangedFiles,omitempty"`
+	MaxDeletions    *int `json:"maxDeletions,omitempty"`
 }
 
 type PartialAuditorRoleConfig struct {

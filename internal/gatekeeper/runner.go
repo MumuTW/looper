@@ -59,6 +59,7 @@ const (
 	ReasonUnresolvedReviewThread   ReasonCode = "unresolved_review_thread"
 	ReasonProjectPolicyDenied      ReasonCode = "project_policy_denied"
 	ReasonHold                     ReasonCode = "hold"
+	ReasonDiffBudgetExceeded       ReasonCode = "diff_budget_exceeded"
 	ReasonProviderStateUnavailable ReasonCode = "provider_state_unavailable"
 	ReasonProviderStateAmbiguous   ReasonCode = "provider_state_ambiguous"
 )
@@ -75,20 +76,28 @@ type CheckEvidence struct {
 	Conclusion string `json:"conclusion,omitempty"`
 }
 
+type DiffBudgetEvidence struct {
+	ChangedFiles    int `json:"changedFiles"`
+	Deletions       int `json:"deletions"`
+	MaxChangedFiles int `json:"maxChangedFiles"`
+	MaxDeletions    int `json:"maxDeletions"`
+}
+
 type Evidence struct {
-	PullRequestState             string          `json:"pullRequestState,omitempty"`
-	Draft                        bool            `json:"draft"`
-	BaseRefName                  string          `json:"baseRefName,omitempty"`
-	Mergeable                    *bool           `json:"mergeable,omitempty"`
-	MergeableState               string          `json:"mergeableState,omitempty"`
-	RequiredChecks               []string        `json:"requiredChecks"`
-	Checks                       []CheckEvidence `json:"checks"`
-	RequiredApprovingReviewCount int             `json:"requiredApprovingReviewCount"`
-	ReviewDecision               string          `json:"reviewDecision,omitempty"`
-	UnresolvedReviewThreadIDs    []string        `json:"unresolvedReviewThreadIds"`
-	HoldLabels                   []string        `json:"holdLabels"`
-	ProjectPolicyPermitsTarget   bool            `json:"projectPolicyPermitsTarget"`
-	FinalObservedHeadSHA         string          `json:"finalObservedHeadSha,omitempty"`
+	PullRequestState             string              `json:"pullRequestState,omitempty"`
+	Draft                        bool                `json:"draft"`
+	BaseRefName                  string              `json:"baseRefName,omitempty"`
+	Mergeable                    *bool               `json:"mergeable,omitempty"`
+	MergeableState               string              `json:"mergeableState,omitempty"`
+	RequiredChecks               []string            `json:"requiredChecks"`
+	Checks                       []CheckEvidence     `json:"checks"`
+	RequiredApprovingReviewCount int                 `json:"requiredApprovingReviewCount"`
+	ReviewDecision               string              `json:"reviewDecision,omitempty"`
+	UnresolvedReviewThreadIDs    []string            `json:"unresolvedReviewThreadIds"`
+	HoldLabels                   []string            `json:"holdLabels"`
+	DiffBudget                   *DiffBudgetEvidence `json:"diffBudget,omitempty"`
+	ProjectPolicyPermitsTarget   bool                `json:"projectPolicyPermitsTarget"`
+	FinalObservedHeadSHA         string              `json:"finalObservedHeadSha,omitempty"`
 }
 
 type Report struct {
@@ -172,7 +181,10 @@ type Options struct {
 	TrustForProject func(projectID string) config.GatekeeperTrustLevel
 	// MergeStrategyForProject selects the strategy used at the auto trust level.
 	MergeStrategyForProject func(projectID string) config.ReviewerAutoMergeStrategy
-	LogWarn                 func(msg string, fields map[string]any)
+	// DiffBudgetForProject returns the effective boolean change-size limits. Zero
+	// bounds are unlimited; nil means every project has no configured limit.
+	DiffBudgetForProject func(projectID string) config.GatekeeperDiffBudget
+	LogWarn              func(msg string, fields map[string]any)
 }
 
 // Runner is the Merge Gatekeeper: a reactive, agent-free policy Role that
@@ -188,6 +200,7 @@ type Runner struct {
 	policyPermitsTarget     func(projectID, repo, baseRefName string) bool
 	trustForProject         func(projectID string) config.GatekeeperTrustLevel
 	mergeStrategyForProject func(projectID string) config.ReviewerAutoMergeStrategy
+	diffBudgetForProject    func(projectID string) config.GatekeeperDiffBudget
 	logWarn                 func(msg string, fields map[string]any)
 }
 
@@ -202,7 +215,7 @@ func New(options Options) *Runner {
 	}
 	return &Runner{
 		repos: options.Repos, github: options.GitHub, now: now, policyPermitsTarget: policy,
-		trustForProject: options.TrustForProject, mergeStrategyForProject: options.MergeStrategyForProject,
+		trustForProject: options.TrustForProject, mergeStrategyForProject: options.MergeStrategyForProject, diffBudgetForProject: options.DiffBudgetForProject,
 		logWarn: options.LogWarn,
 	}
 }
@@ -237,8 +250,12 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		return DiscoveryResult{}, err
 	}
 	result := DiscoveryResult{Reports: make([]Report, 0, len(pullRequests))}
+	diffBudget := r.diffBudget(input.ProjectID)
 	for _, pullRequest := range pullRequests {
-		fingerprint := sourceFingerprint(pullRequest)
+		// A budget change is a gate-input change even when the PR list page is
+		// otherwise unchanged; include it so enabling or disabling the gate does
+		// not wait for the periodic maxSkipAge backstop.
+		fingerprint := sourceFingerprint(pullRequest) + fmt.Sprintf("\x1fdiff-budget=%d,%d", diffBudget.MaxChangedFiles, diffBudget.MaxDeletions)
 		entityID := fmt.Sprintf("%s#%d", input.Repo, pullRequest.Number)
 		previous, hasPrevious := previousReports[entityID]
 		if reused, ok := skipUnchanged(previous, hasPrevious, fingerprint, r.now()); ok {
@@ -322,6 +339,22 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 	report.Evidence.ProjectPolicyPermitsTarget = r.policyPermitsTarget(input.ProjectID, input.Repo, report.Evidence.BaseRefName)
 	if !report.Evidence.ProjectPolicyPermitsTarget {
 		report.Reasons = append(report.Reasons, Reason{Code: ReasonProjectPolicyDenied})
+	}
+
+	diffBudget := r.diffBudget(input.ProjectID)
+	if diffBudget.MaxChangedFiles > 0 || diffBudget.MaxDeletions > 0 {
+		if detail.DiffStats == nil {
+			return r.persistProviderBlock(ctx, report, ReasonProviderStateUnavailable, "diff_stats")
+		}
+		report.Evidence.DiffBudget = &DiffBudgetEvidence{
+			ChangedFiles:    detail.DiffStats.ChangedFiles,
+			Deletions:       detail.DiffStats.Deletions,
+			MaxChangedFiles: diffBudget.MaxChangedFiles,
+			MaxDeletions:    diffBudget.MaxDeletions,
+		}
+		if subject := diffBudgetExceededSubject(*detail.DiffStats, diffBudget); subject != "" {
+			report.Reasons = append(report.Reasons, Reason{Code: ReasonDiffBudgetExceeded, Subject: subject})
+		}
 	}
 
 	mergeability, err := r.github.ViewPullRequestMergeWatch(ctx, viewInput)
@@ -451,6 +484,24 @@ func (r *Runner) trustFor(projectID string) config.GatekeeperTrustLevel {
 	default:
 		return config.GatekeeperTrustObserve
 	}
+}
+
+func (r *Runner) diffBudget(projectID string) config.GatekeeperDiffBudget {
+	if r == nil || r.diffBudgetForProject == nil {
+		return config.GatekeeperDiffBudget{}
+	}
+	return r.diffBudgetForProject(projectID)
+}
+
+func diffBudgetExceededSubject(stats githubinfra.PullRequestDiffStats, budget config.GatekeeperDiffBudget) string {
+	parts := make([]string, 0, 2)
+	if budget.MaxChangedFiles > 0 && stats.ChangedFiles > budget.MaxChangedFiles {
+		parts = append(parts, fmt.Sprintf("changed files %d > max %d", stats.ChangedFiles, budget.MaxChangedFiles))
+	}
+	if budget.MaxDeletions > 0 && stats.Deletions > budget.MaxDeletions {
+		parts = append(parts, fmt.Sprintf("deletions %d > max %d", stats.Deletions, budget.MaxDeletions))
+	}
+	return strings.Join(parts, "; ")
 }
 
 // confirmingKey marks an evaluation as the pass performed immediately before a

@@ -290,16 +290,21 @@ func validateCoreConfig(config Config, issues *[]ValidationIssue) {
 		validateAuditorRoleConfig(role, fmt.Sprintf("projects[%d].roles.auditor", i), issues)
 	}
 	for i, project := range config.Projects {
-		if project.Roles == nil || project.Roles.Gatekeeper == nil || project.Roles.Gatekeeper.Trust == nil {
+		if project.Roles == nil || project.Roles.Gatekeeper == nil || (project.Roles.Gatekeeper.Trust == nil && project.Roles.Gatekeeper.DiffBudget == nil) {
 			continue
 		}
 		reviewerAutoMerge := config.Roles.Reviewer.AutoMerge.Enabled
 		if project.Roles.Reviewer != nil && project.Roles.Reviewer.AutoMerge != nil && project.Roles.Reviewer.AutoMerge.Enabled != nil {
 			reviewerAutoMerge = *project.Roles.Reviewer.AutoMerge.Enabled
 		}
-		validateGatekeeperRoleConfig(
-			GatekeeperRoleConfig{Trust: *project.Roles.Gatekeeper.Trust},
-			fmt.Sprintf("projects[%d].roles.gatekeeper", i), reviewerAutoMerge, issues)
+		if project.Roles.Gatekeeper.Trust != nil {
+			validateGatekeeperRoleConfig(
+				GatekeeperRoleConfig{Trust: *project.Roles.Gatekeeper.Trust},
+				fmt.Sprintf("projects[%d].roles.gatekeeper", i), reviewerAutoMerge, issues)
+		}
+		validatePartialGatekeeperDiffBudget(
+			project.Roles.Gatekeeper.DiffBudget,
+			fmt.Sprintf("projects[%d].roles.gatekeeper.diffBudget", i), issues)
 	}
 	validateIntakeConfig(config, issues)
 	validateDaemonConfig(config.Daemon, issues)
@@ -508,6 +513,7 @@ func validateDeployerRoleConfig(deployerRole DeployerRoleConfig, path string, is
 }
 
 func validateGatekeeperRoleConfig(gatekeeper GatekeeperRoleConfig, path string, reviewerAutoMerge bool, issues *[]ValidationIssue) {
+	validateGatekeeperDiffBudget(gatekeeper.DiffBudget, path+".diffBudget", issues)
 	switch GatekeeperTrustLevel(strings.ToLower(strings.TrimSpace(string(gatekeeper.Trust)))) {
 	case "", GatekeeperTrustObserve, GatekeeperTrustAdvise:
 	case GatekeeperTrustAuto:
@@ -525,6 +531,30 @@ func validateGatekeeperRoleConfig(gatekeeper GatekeeperRoleConfig, path string, 
 			Path:    path + ".trust",
 			Message: fmt.Sprintf("must be one of: %s, %s, %s", GatekeeperTrustObserve, GatekeeperTrustAdvise, GatekeeperTrustAuto),
 		})
+	}
+}
+
+func validateGatekeeperDiffBudget(budget *GatekeeperDiffBudget, path string, issues *[]ValidationIssue) {
+	if budget == nil {
+		return
+	}
+	if budget.MaxChangedFiles < 0 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".maxChangedFiles", Message: "must be zero or a positive integer"})
+	}
+	if budget.MaxDeletions < 0 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".maxDeletions", Message: "must be zero or a positive integer"})
+	}
+}
+
+func validatePartialGatekeeperDiffBudget(budget *PartialGatekeeperDiffBudget, path string, issues *[]ValidationIssue) {
+	if budget == nil {
+		return
+	}
+	if budget.MaxChangedFiles != nil && *budget.MaxChangedFiles < 0 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".maxChangedFiles", Message: "must be zero or a positive integer"})
+	}
+	if budget.MaxDeletions != nil && *budget.MaxDeletions < 0 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".maxDeletions", Message: "must be zero or a positive integer"})
 	}
 }
 

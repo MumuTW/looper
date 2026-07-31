@@ -38,7 +38,7 @@ var (
 	prViewMetadataJSONFields   = []string{"number", "title", "body", "url", "state", "createdAt", "updatedAt", "closedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "mergeStateStatus"}
 	prViewFixerJSONFields      = []string{"number", "title", "body", "url", "state", "createdAt", "updatedAt", "closedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "statusCheckRollup", "mergeStateStatus"}
 	prViewReviewerJSONFields   = []string{"number", "title", "body", "url", "state", "createdAt", "updatedAt", "closedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "reviews", "statusCheckRollup", "mergeStateStatus"}
-	prViewGatekeeperJSONFields = []string{"number", "state", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "mergeStateStatus"}
+	prViewGatekeeperJSONFields = []string{"number", "state", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "mergeStateStatus", "changedFiles", "deletions"}
 )
 
 var prNumberURLPattern = regexp.MustCompile(`/pull/(\d+)(?:/|$)`)
@@ -158,10 +158,18 @@ type PullRequestDetail struct {
 	IssueComments      []CommentInfo
 	Reviews            []map[string]any
 	Checks             []map[string]any
+	DiffStats          *PullRequestDiffStats `json:"diffStats,omitempty"`
 	Mergeable          *bool
 	MergeableState     string
 	MergedAt           string
 	AutoMerge          *PullRequestAutoMerge
+}
+
+// PullRequestDiffStats is the provider-observed change size for a pull request.
+// It is fetched with the same head metadata as Gatekeeper's other gates.
+type PullRequestDiffStats struct {
+	ChangedFiles int `json:"changedFiles"`
+	Deletions    int `json:"deletions"`
 }
 
 type PullRequestAutoMerge struct {
@@ -1682,11 +1690,34 @@ func pullRequestDetailFromViewRow(row map[string]any, threads []map[string]any, 
 		IssueComments:      issueComments,
 		Reviews:            toObjectSlice(row["reviews"]),
 		Checks:             toObjectSlice(row["statusCheckRollup"]),
+		DiffStats:          pullRequestDiffStatsFromRow(row),
 		Mergeable:          boolPtrFromValue(row["mergeable"]),
 		MergeableState:     asString(row["mergeable_state"]),
 		MergedAt:           asString(row["merged_at"]),
 		AutoMerge:          extractAutoMerge(row["auto_merge"]),
 	}
+}
+
+func pullRequestDiffStatsFromRow(row map[string]any) *PullRequestDiffStats {
+	changedFiles, changedFilesOK := firstPresentRowValue(row, "changedFiles", "changed_files")
+	deletions, deletionsOK := firstPresentRowValue(row, "deletions")
+	if !changedFilesOK || !deletionsOK {
+		return nil
+	}
+	return &PullRequestDiffStats{
+		ChangedFiles: int(asInt64(changedFiles)),
+		Deletions:    int(asInt64(deletions)),
+	}
+}
+
+func firstPresentRowValue(row map[string]any, keys ...string) (any, bool) {
+	for _, key := range keys {
+		value, ok := row[key]
+		if ok && value != nil {
+			return value, true
+		}
+	}
+	return nil, false
 }
 
 func (g *Gateway) viewPullRequestRow(ctx context.Context, input ViewPullRequestInput, fields []string) (map[string]any, error) {
@@ -1727,6 +1758,7 @@ func (g *Gateway) ViewPullRequestMergeWatch(ctx context.Context, input ViewPullR
 		BaseRefName:    nestedString(row, "base", "ref"),
 		HeadSHA:        nestedString(row, "head", "sha"),
 		BaseSHA:        nestedString(row, "base", "sha"),
+		DiffStats:      pullRequestDiffStatsFromRow(row),
 		Mergeable:      boolPtrFromValue(row["mergeable"]),
 		MergeableState: firstNonEmpty(asString(row["mergeable_state"]), asString(row["mergeStateStatus"])),
 		AutoMerge:      extractAutoMerge(row["auto_merge"]),
