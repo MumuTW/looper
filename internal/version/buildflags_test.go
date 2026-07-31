@@ -2,6 +2,7 @@ package version
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"go/parser"
 	"go/token"
@@ -12,6 +13,12 @@ import (
 	"strings"
 	"testing"
 )
+
+// errNotAGitRepo is reported by trackedGoFiles when root is not inside a Git
+// worktree (for example an exported source archive). The module path migration
+// guard is repository hygiene rather than package behavior, so the test skips
+// cleanly in that case instead of requiring VCS metadata.
+var errNotAGitRepo = errors.New("not a git repository")
 
 func TestDefaultBuildOverrides(t *testing.T) {
 	overrides := DefaultBuildOverrides()
@@ -123,6 +130,9 @@ func TestModulePathMigration(t *testing.T) {
 	}
 
 	goFiles, err := trackedGoFiles(root)
+	if errors.Is(err, errNotAGitRepo) {
+		t.Skipf("not a git repository; skipping module path migration guard: %v", err)
+	}
 	if err != nil {
 		t.Fatalf("list tracked Go files: %v", err)
 	}
@@ -136,14 +146,34 @@ func TestModulePathMigration(t *testing.T) {
 	}
 }
 
-// trackedGoFiles returns the repository's Git-tracked *.go files, relative to
-// root. Using `git ls-files` as the scan authority keeps the migration guard
-// focused on this checkout's own source: sibling worktrees (`.worktrees`,
+// trackedGoFiles returns the repository's Git-tracked *.go files that are
+// present in this checkout's working tree, relative to root. Using
+// `git ls-files` as the scan authority keeps the migration guard focused on
+// this checkout's own source: sibling worktrees (`.worktrees`,
 // `.claude/worktrees`, ...) are separate checkouts that may legitimately sit
 // at older revisions and are never listed by `git ls-files` run here. The test
 // therefore does not walk the filesystem or mutate those worktrees.
+//
+// The -t flag prefixes each entry with a status character. Entries marked S
+// carry the skip-worktree bit (for example files omitted by a sparse
+// checkout) and may be absent from the working tree, so they are excluded to
+// avoid parsing nonexistent paths; only H (cached, present) entries are kept.
+//
+// The Git index is read via os.ReadFile so Go's test result cache observes it
+// as an input. `git ls-files` runs in a child process, so without this read
+// staging a new tracked Go file would not invalidate a cached pass; tying the
+// cache key to the index contents keeps the documented test command from
+// silently reusing a stale result.
 func trackedGoFiles(root string) ([]string, error) {
-	cmd := exec.Command("git", "-C", root, "ls-files", "-z", "--", "*.go")
+	gitDir, err := resolveGitDir(root)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := os.ReadFile(filepath.Join(gitDir, "index")); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("read git index: %w", err)
+	}
+
+	cmd := exec.Command("git", "-C", root, "ls-files", "-z", "-t", "--", "*.go")
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
@@ -151,13 +181,36 @@ func trackedGoFiles(root string) ([]string, error) {
 		return nil, fmt.Errorf("git ls-files: %v: %s", err, stderr.String())
 	}
 	var files []string
-	for _, name := range strings.Split(string(out), "\x00") {
-		if name == "" {
+	for _, entry := range strings.Split(string(out), "\x00") {
+		if entry == "" {
 			continue
 		}
-		files = append(files, name)
+		// -t format is "<status> <path>". Only H (cached, present) entries are
+		// parseable; S (skip-worktree) entries may be absent from a sparse
+		// checkout's working tree.
+		if len(entry) < 3 || entry[1] != ' ' || entry[0] != 'H' {
+			continue
+		}
+		files = append(files, entry[2:])
 	}
 	return files, nil
+}
+
+// resolveGitDir returns the absolute path to root's Git directory, or
+// errNotAGitRepo when root is not inside a Git worktree (for example an
+// exported source archive produced by `git archive`).
+func resolveGitDir(root string) (string, error) {
+	cmd := exec.Command("git", "-C", root, "rev-parse", "--absolute-git-dir")
+	cmd.Stderr = nil
+	out, err := cmd.Output()
+	if err != nil {
+		return "", errNotAGitRepo
+	}
+	dir := strings.TrimSpace(string(out))
+	if dir == "" {
+		return "", errNotAGitRepo
+	}
+	return filepath.Clean(dir), nil
 }
 
 type legacyModulePathViolation struct {
@@ -254,7 +307,7 @@ func TestTrackedGoFilesExcludesWorktrees(t *testing.T) {
 	}
 	for _, args := range [][]string{
 		{"add", trackedRel, "go.mod"},
-		{"commit", "-m", "seed"},
+		{"commit", "--no-gpg-sign", "-m", "seed"},
 	} {
 		cmd := exec.Command("git", append([]string{"-C", root}, args...)...)
 		var stderr bytes.Buffer
@@ -282,7 +335,7 @@ func TestTrackedGoFilesExcludesWorktrees(t *testing.T) {
 	}
 	for _, args := range [][]string{
 		{"add", worktreeGoRel},
-		{"commit", "-m", "stale legacy import"},
+		{"commit", "--no-gpg-sign", "-m", "stale legacy import"},
 	} {
 		cmd := exec.Command("git", append([]string{"-C", worktreeRoot}, args...)...)
 		var stderr bytes.Buffer
@@ -308,6 +361,102 @@ func TestTrackedGoFilesExcludesWorktrees(t *testing.T) {
 	}
 	if !foundTracked {
 		t.Fatalf("trackedGoFiles = %v, want %q listed", files, wantTracked)
+	}
+}
+
+// TestTrackedGoFilesSkipsSparseCheckoutAbsent verifies that a tracked Go file
+// omitted by a sparse checkout (skip-worktree bit set, absent from the working
+// tree) is not listed, so the scanner never tries to parse a nonexistent path.
+func TestTrackedGoFilesSkipsSparseCheckoutAbsent(t *testing.T) {
+	root := t.TempDir()
+	for _, args := range [][]string{
+		{"init"},
+		{"config", "user.email", "test@example.com"},
+		{"config", "user.name", "test"},
+		{"config", "core.sparseCheckout", "true"},
+	} {
+		cmd := exec.Command("git", append([]string{"-C", root}, args...)...)
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		if err := cmd.Run(); err != nil {
+			t.Skipf("git %v unavailable in this environment: %v %s", args, err, stderr.String())
+		}
+	}
+
+	presentRel := filepath.Join("cmd", "looperd", "main.go")
+	absentRel := filepath.Join("tools", "print-version-json", "main.go")
+	for _, rel := range []string{presentRel, absentRel} {
+		if err := os.MkdirAll(filepath.Join(root, filepath.Dir(rel)), 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", rel, err)
+		}
+		if err := os.WriteFile(filepath.Join(root, rel), []byte("package main\n"), 0o644); err != nil {
+			t.Fatalf("write %s: %v", rel, err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(root, "go.mod"), []byte("module github.com/MumuTW/looper\n\ngo 1.24\n"), 0o644); err != nil {
+		t.Fatalf("write go.mod: %v", err)
+	}
+	for _, args := range [][]string{
+		{"add", presentRel, absentRel, "go.mod"},
+		{"commit", "--no-gpg-sign", "-m", "seed"},
+	} {
+		cmd := exec.Command("git", append([]string{"-C", root}, args...)...)
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		if err := cmd.Run(); err != nil {
+			t.Fatalf("git %v: %v %s", args, err, stderr.String())
+		}
+	}
+
+	// Restrict the working tree to cmd/ only; tools/ becomes skip-worktree and
+	// its file is removed from the working tree.
+	if err := os.WriteFile(filepath.Join(root, ".git", "info", "sparse-checkout"), []byte("/cmd/\n"), 0o644); err != nil {
+		t.Fatalf("write sparse-checkout: %v", err)
+	}
+	read := exec.Command("git", "-C", root, "sparse-checkout", "reapply")
+	var reapplyStderr bytes.Buffer
+	read.Stderr = &reapplyStderr
+	if err := read.Run(); err != nil {
+		t.Skipf("git sparse-checkout reapply unavailable: %v %s", err, reapplyStderr.String())
+	}
+	if _, err := os.Stat(filepath.Join(root, absentRel)); !os.IsNotExist(err) {
+		t.Skipf("sparse-checkout did not remove %s in this git version: %v", absentRel, err)
+	}
+
+	files, err := trackedGoFiles(root)
+	if err != nil {
+		t.Fatalf("trackedGoFiles: %v", err)
+	}
+	wantPresent := filepath.ToSlash(presentRel)
+	wantAbsent := filepath.ToSlash(absentRel)
+	foundPresent, foundAbsent := false, false
+	for _, f := range files {
+		slash := filepath.ToSlash(f)
+		if slash == wantPresent {
+			foundPresent = true
+		}
+		if slash == wantAbsent {
+			foundAbsent = true
+		}
+	}
+	if !foundPresent {
+		t.Fatalf("trackedGoFiles = %v, want present sparse file %q listed", files, wantPresent)
+	}
+	if foundAbsent {
+		t.Fatalf("trackedGoFiles = %v, want absent sparse file %q excluded (skip-worktree)", files, wantAbsent)
+	}
+}
+
+// TestTrackedGoFilesNotARepo verifies the scan authority fails closed with
+// errNotAGitRepo when root is not a Git worktree, so the migration guard skips
+// cleanly instead of requiring VCS metadata.
+func TestTrackedGoFilesNotARepo(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "go.mod"), []byte("module github.com/MumuTW/looper\n\ngo 1.24\n"), 0o644); err != nil {
+		t.Fatalf("write go.mod: %v", err)
+	}
+	if _, err := trackedGoFiles(root); !errors.Is(err, errNotAGitRepo) {
+		t.Fatalf("trackedGoFiles on non-repo = %v, want errNotAGitRepo", err)
 	}
 }
 
