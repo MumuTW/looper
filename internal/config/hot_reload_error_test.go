@@ -1,6 +1,7 @@
 package config
 
 import (
+	"math/big"
 	"reflect"
 	"strings"
 	"testing"
@@ -45,6 +46,35 @@ func TestCloneConfigPreservesCyclesWithoutAliasingSource(t *testing.T) {
 	}
 	if got := clonedCycle["self"].(map[string]any); reflect.ValueOf(got).Pointer() != reflect.ValueOf(clonedCycle).Pointer() {
 		t.Fatal("cycle did not point at cloned map")
+	}
+}
+
+func TestCloneConfigSeparatesOverlappingSlicesAndUnexportedState(t *testing.T) {
+	cfg, err := DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := []byte{1, 2, 3}
+	cfg.Agent.Params["short"] = base[:1]
+	cfg.Agent.Params["long"] = base[:2]
+	originalBig := big.NewInt(7)
+	cfg.Agent.Params["big"] = originalBig
+
+	cloned := CloneConfig(cfg)
+	short := cloned.Agent.Params["short"].([]byte)
+	long := cloned.Agent.Params["long"].([]byte)
+	if len(short) != 1 || len(long) != 2 {
+		t.Fatalf("overlapping slice lengths = (%d, %d), want (1, 2)", len(short), len(long))
+	}
+	long[0] = 9
+	if base[0] != 1 || short[0] != 1 {
+		t.Fatalf("overlapping slice clone aliased source or sibling: base=%v short=%v", base, short)
+	}
+
+	clonedBig := cloned.Agent.Params["big"].(*big.Int)
+	clonedBig.Add(clonedBig, big.NewInt(1))
+	if originalBig.String() != "7" {
+		t.Fatalf("big.Int clone shares unexported storage: original=%s", originalBig)
 	}
 }
 

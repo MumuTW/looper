@@ -138,15 +138,13 @@ func providerByID(cfg config.Config, providerID string) (config.ProviderConfig, 
 }
 
 func cloneProjectRefConfig(source config.ProjectRefConfig) config.ProjectRefConfig {
-	cloned := config.CloneConfig(config.Config{Projects: []config.ProjectRefConfig{source}})
-	return cloned.Projects[0]
+	return config.CloneValue(source)
 }
 
 func cloneProviderConfig(source config.ProviderConfig) config.ProviderConfig {
-	cloned := config.CloneConfig(config.Config{Providers: []config.ProviderConfig{source}})
-	return cloned.Providers[0]
+	return config.CloneValue(source)
 }
 
 func cloneRoleConfigs(source config.RoleConfigs) config.RoleConfigs {
-	return config.CloneConfig(config.Config{Roles: source}).Roles
+	return config.CloneValue(source)
 }

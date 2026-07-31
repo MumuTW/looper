@@ -461,7 +461,7 @@ func resolvedModelBindingPath(cfg Config, role string) string {
 // an isolation boundary, not validation, so it must not crash the daemon merely
 // because a later comparison or persistence boundary will reject such a value.
 func CloneConfig(source Config) Config {
-	cloned := cloneConfigReflect(reflect.ValueOf(source), make(map[configCloneVisit]reflect.Value)).Interface().(Config)
+	cloned := CloneValue(source)
 	// Roles.Coding is derived runtime state and intentionally omitted from the
 	// JSON payload above. Keep it detached but intact: dropping an authored
 	// overlay here would make config snapshots silently fall back to legacy
@@ -478,9 +478,26 @@ func CloneConfig(source Config) Config {
 	return cloned
 }
 
+// CloneValue returns a detached structural copy of a configuration value. It
+// is intentionally generic so narrow views can clone only the value they
+// expose instead of walking a zero-filled Config wrapper. Values that cannot
+// be structurally copied (functions, channels, and unsafe pointers) remain
+// identity values; comparison and persistence boundaries still reject them
+// when JSON encoding is required.
+func CloneValue[T any](source T) T {
+	cloned := cloneConfigReflect(reflect.ValueOf(source), make(map[configCloneVisit]reflect.Value))
+	if !cloned.IsValid() {
+		var zero T
+		return zero
+	}
+	return cloned.Interface().(T)
+}
+
 type configCloneVisit struct {
-	typeOf  reflect.Type
-	pointer uintptr
+	typeOf   reflect.Type
+	pointer  uintptr
+	length   int
+	capacity int
 }
 
 func cloneConfigReflect(source reflect.Value, visited map[configCloneVisit]reflect.Value) reflect.Value {
@@ -527,11 +544,11 @@ func cloneConfigReflect(source reflect.Value, visited map[configCloneVisit]refle
 		if source.IsNil() {
 			return reflect.Zero(source.Type())
 		}
-		visit := configCloneVisit{typeOf: source.Type(), pointer: source.Pointer()}
+		visit := configCloneVisit{typeOf: source.Type(), pointer: source.Pointer(), length: source.Len(), capacity: source.Cap()}
 		if cloned, ok := visited[visit]; ok {
 			return cloned
 		}
-		result := reflect.MakeSlice(source.Type(), source.Len(), source.Cap())
+		result := reflect.MakeSlice(source.Type(), source.Len(), source.Len())
 		visited[visit] = result
 		for i := 0; i < source.Len(); i++ {
 			result.Index(i).Set(cloneConfigReflect(source.Index(i), visited))
@@ -544,6 +561,9 @@ func cloneConfigReflect(source reflect.Value, visited map[configCloneVisit]refle
 		}
 		return result
 	case reflect.Struct:
+		if cloned, ok := cloneJSONRoundTrip(source); ok {
+			return cloned
+		}
 		result := reflect.New(source.Type()).Elem()
 		result.Set(source)
 		for i := 0; i < source.NumField(); i++ {
@@ -555,6 +575,34 @@ func cloneConfigReflect(source reflect.Value, visited map[configCloneVisit]refle
 	default:
 		return source
 	}
+}
+
+var (
+	jsonMarshalerType   = reflect.TypeOf((*json.Marshaler)(nil)).Elem()
+	jsonUnmarshalerType = reflect.TypeOf((*json.Unmarshaler)(nil)).Elem()
+)
+
+// cloneJSONRoundTrip handles standard-library value types whose mutable state
+// is intentionally kept in unexported fields (for example math/big.Int and
+// time.Time). A reflective field walk cannot detach those fields without
+// unsafe access; use the type's own serialization contract when it provides a
+// complete round trip, otherwise keep the conservative exported-field walk.
+func cloneJSONRoundTrip(source reflect.Value) (reflect.Value, bool) {
+	typeOf := source.Type()
+	if !source.CanInterface() ||
+		(!typeOf.Implements(jsonMarshalerType) && !reflect.PointerTo(typeOf).Implements(jsonMarshalerType)) ||
+		!reflect.PointerTo(typeOf).Implements(jsonUnmarshalerType) {
+		return reflect.Value{}, false
+	}
+	raw, err := json.Marshal(source.Interface())
+	if err != nil {
+		return reflect.Value{}, false
+	}
+	cloned := reflect.New(typeOf)
+	if err := json.Unmarshal(raw, cloned.Interface()); err != nil {
+		return reflect.Value{}, false
+	}
+	return cloned.Elem(), true
 }
 
 // RestartRequiredChangesChecked is the recoverable comparison boundary used by
