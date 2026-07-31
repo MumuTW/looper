@@ -475,6 +475,10 @@ func (r *FeishuThreadsRepository) LoopByRoot(ctx context.Context, rootMessageID 
 
 type EventsRepository struct{ q sqliteQuerier }
 
+const eventLogColumns = `id, event_type, project_id, loop_id, run_id, entity_type,
+	entity_id, correlation_id, causation_id, actor_type, actor_id,
+	actor_display_name, payload_json, created_at`
+
 func (r *EventsRepository) Append(ctx context.Context, record EventLogRecord) error {
 	_, err := r.q.ExecContext(ctx, `
 		INSERT INTO event_logs (
@@ -519,6 +523,36 @@ func (r *EventsRepository) ListByEntity(ctx context.Context, entityType, entityI
 	rows, err := r.q.QueryContext(ctx, `SELECT * FROM event_logs WHERE entity_type = ? AND entity_id = ? ORDER BY created_at ASC`, entityType, entityID)
 	if err != nil {
 		return nil, fmt.Errorf("list event logs by entity: %w", err)
+	}
+	defer rows.Close()
+
+	return scanEventLogs(rows)
+}
+
+// ListByEventType returns the newest durable events of one type. The optional
+// project filter is applied in SQLite so a read-only projection cannot load an
+// unrelated project's full event history into the daemon before applying its
+// limit.
+func (r *EventsRepository) ListByEventType(ctx context.Context, eventType, projectID string, limit int64) ([]EventLogRecord, error) {
+	if strings.TrimSpace(eventType) == "" {
+		return []EventLogRecord{}, nil
+	}
+	if limit <= 0 {
+		limit = 100
+	}
+
+	query := "SELECT " + eventLogColumns + " FROM event_logs WHERE event_type = ?"
+	args := []any{eventType}
+	if projectID = strings.TrimSpace(projectID); projectID != "" {
+		query += " AND project_id = ?"
+		args = append(args, projectID)
+	}
+	query += " ORDER BY created_at DESC, id DESC LIMIT ?"
+	args = append(args, limit)
+
+	rows, err := r.q.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list event logs by type: %w", err)
 	}
 	defer rows.Close()
 

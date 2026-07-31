@@ -106,6 +106,14 @@
       "routeSpecificStatuses": [400]
     },
     {
+      "id": "gatekeeper.agreements",
+      "method": "GET",
+      "path": "/api/v1/gatekeeper/agreements?limit=1",
+      "fixture": "default",
+      "expectedStatus": 200,
+      "routeSpecificStatuses": [400]
+    },
+    {
       "id": "pullRequests.list",
       "method": "GET",
       "path": "/api/v1/pull-requests",

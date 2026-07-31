@@ -15,8 +15,10 @@ import { StatusChip } from "@/components/StatusChip";
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import {
+  fetchGatekeeperAgreements,
   fetchStatus,
   type ActiveRun,
+  type GatekeeperAgreement,
   type LoopRoleCounts,
   type StatusData,
 } from "@/lib/api";
@@ -28,6 +30,7 @@ import {
   truncateReason,
 } from "@/lib/format";
 import { useProjectFilter } from "@/lib/ProjectFilterContext";
+import { usePolling } from "@/lib/usePolling";
 
 const STATUS_SLOW_MS = 45_000;
 
@@ -118,6 +121,10 @@ function activeAgentLabel(run: ActiveRun): string {
   return `${vendor} · ${pid}`;
 }
 
+function agreementOutcomeColor(agreement: GatekeeperAgreement): string {
+  return agreement.agreement ? "var(--ok)" : "var(--warning)";
+}
+
 export function OverviewPage({
   onHealthChange,
 }: {
@@ -126,6 +133,21 @@ export function OverviewPage({
   const navigate = useNavigate();
   const { projectId } = useProjectFilter();
   const { health, healthy: sharedHealthy, activeRuns } = useDashboardData();
+
+  const agreementFetcher = useCallback(
+    (signal: AbortSignal) =>
+      fetchGatekeeperAgreements({
+        projectId: projectId || undefined,
+        limit: 20,
+        signal,
+      }),
+    [projectId],
+  );
+  const agreements = usePolling({
+    intervalMs: 60_000,
+    fetcher: agreementFetcher,
+    key: projectId,
+  });
 
   const [status, setStatus] = useState<StatusData | null>(null);
   const [statusError, setStatusError] = useState<string | null>(null);
@@ -378,6 +400,7 @@ export function OverviewPage({
           onClick={() => {
             health.refresh();
             void loadStatus();
+            agreements.refresh();
           }}
         >
           Refresh
@@ -541,6 +564,64 @@ export function OverviewPage({
                     ) : null}
                   </div>
                 ),
+              )}
+            </>
+          )}
+        </Card>
+
+        <Card
+          title={
+            projectId
+              ? `Advise agreements · project ${projectId}`
+              : "Advise agreements"
+          }
+        >
+          {agreements.error && !agreements.data ? (
+            <div className="flex flex-col gap-2">
+              <p className="m-0 text-[12px] text-[var(--danger)]">
+                Unavailable: {agreements.error}
+              </p>
+              <Button variant="ghost" size="sm" onClick={agreements.refresh}>
+                Retry
+              </Button>
+            </div>
+          ) : agreements.loading && !agreements.data ? (
+            <p className="m-0 text-[12px] text-[var(--text-muted)]">
+              Loading agreement history…
+            </p>
+          ) : (
+            <>
+              {agreements.error ? (
+                <p className="m-0 mb-2 text-[12px] text-[var(--danger)]">
+                  Refresh failed: {agreements.error}
+                </p>
+              ) : null}
+              {(agreements.data?.items ?? []).length === 0 ? (
+                <p className="m-0 text-[12px] text-[var(--text-muted)]">
+                  No advise agreements recorded.
+                </p>
+              ) : (
+                <div className="flex flex-col gap-1">
+                  {agreements.data?.items.map((agreement) => (
+                    <div
+                      className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[12px]"
+                      key={agreement.id}
+                    >
+                      <span className="mono">
+                        {agreement.repo}#{agreement.prNumber}
+                      </span>
+                      <span style={{ color: agreementOutcomeColor(agreement) }}>
+                        {agreement.outcome}
+                      </span>
+                      <span className="text-[var(--text-muted)]">
+                        {agreement.agreement ? "agreement" : "disagreement"}
+                      </span>
+                      <span className="mono text-[var(--text-muted)]">
+                        {agreement.recordedAt || agreement.createdAt || "—"}
+                      </span>
+                    </div>
+                  ))}
+                </div>
               )}
             </>
           )}
