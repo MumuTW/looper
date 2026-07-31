@@ -388,8 +388,11 @@ The `loopError.kind` assignments split into three groups:
 3. **Statically safe shapes (no `Normalize` needed).** Every other
    `loopError.kind` assignment is a named `FailureRetryable*` constant (a known
    kind that needs no normalization — the accepted set is derived from the
-   `policy.Kind`/`failureclass.Kind` authority, not enumerated in the gate, so a
-   future fifth constant is accepted automatically; see Validation step 8), or a
+   `policy.Kind`/`failureclass.Kind` authority constants that `Normalize`
+   preserves, not enumerated in the gate, so a future fifth constant is accepted
+   automatically only when `Normalize` is extended to preserve it; a constant
+   `Normalize` does not preserve must be `Normalize`-wrapped rather than assigned
+   directly; see Validation step 8), or a
    copy of an already-normalized kind —
    a `loopError.kind` field read (`kind: failure.kind` where `failure` is a
    `loopError` *local constructed in this function with a safe `kind``) or a
@@ -436,13 +439,16 @@ function parameter (no local definition to trace) is **unsafe**: its value
 comes from an untrusted call-site argument the intra-procedural check cannot
 trace, so a helper returning `&loopError{kind: kind}` from a `Kind` parameter
 must wrap the parameter in `Normalize` rather than passing it through. A local
-with no reaching assignments is likewise **unsafe**: its uninitialized
-zero-value `Kind` is an unknown kind, and the "every reaching assignment is
-safe" rule would accept the empty assignment set vacuously — the same hole the
-parameter rule closes — so the implementer must wrap it in `Normalize` too.
-Known-constant references, `loopError.kind` copies whose receiver origin is
-safe, and locals with at least one reaching assignment whose every reaching
-assignment is one of those two safe shapes pass. The
+is likewise **unsafe** unless a safe assignment is definite on every
+control-flow path reaching the use: a local with no reaching assignments is the
+degenerate case (every path reaches the use with the uninitialized zero-value
+`Kind`, an unknown kind), and a local assigned only on some paths (e.g.
+`var kind failureclass.Kind; if cond { kind = FailureRetryableTransient };
+... kind: kind`) leaves the zero value on the unassigned paths — the same hole
+the parameter rule closes — so the implementer must either assign the local on
+every path or wrap the use in `Normalize`. Known-constant references,
+`loopError.kind` copies whose receiver origin is safe, and locals whose every
+reaching path passes through one of those two safe shapes pass. The
 carrier reads from group 2
 (`validationFailure.kind`, `blockedKind`) are `Normalize`-wrapped per Step 2, so
 they pass the gate via the `Normalize`-call rule — the gate does not recognize
@@ -1276,7 +1282,15 @@ Per `AGENTS.md`, the root commands are the source of truth:
    coverage so that each of the four `failureclass.Kind` values is asserted by
    at least one role's classification test (including a new
    `internal/reviewer/failure_classification_test.go`), plus a test for
-   `failureclass.Normalize` covering the four known kinds and an unknown kind.
+   `failureclass.Normalize` covering the four known kinds and an unknown kind,
+   plus a pass-through enumeration assertion that enumerates every authority
+   `policy.Kind`/`failureclass.Kind` constant (via the same `go/types`
+   enumeration the step-8 gate uses, factored into a shared helper) and asserts
+   `Normalize(c) == c` for each, so adding a `policy.Kind` constant without
+   extending `Normalize` to preserve it fails the test. This assertion is the
+   authority the step-8 call-site safe set is derived from: the gate trusts
+   `Normalize`'s pass-through, and this test guarantees `Normalize` passes
+   through every authority constant.
    This is the regression net the refactor relies on; it must exist before the
    conversion functions are deleted. Aggregate "each kind appears in at least
    one role" coverage is not sufficient on its own: the four per-runner
@@ -1374,16 +1388,30 @@ Per `AGENTS.md`, the root commands are the source of truth:
    local that is never used is not flagged — the gate enforces the invariant on
    `loopError` values that reach a return or a `.kind` copy, not on dead
    declarations.) File
-   selection is build-aware before parsing: the worker package contains
-   mutually-exclusive build-constrained files (`internal/worker/specfile_unix.go`
-   with `//go:build darwin || linux` and `specfile_other.go` with
-   `//go:build !darwin && !linux`) that both declare `openSpecFileBeneath`;
-   loading the directory's full file set with `go/parser` would include both, and
-   `go/types` would report a duplicate declaration before this invariant is ever
-   checked. The test therefore selects files with `go/build.Context.MatchFile`
-   (using `build.Default`, which honors `//go:build` and the current
-   `GOOS`/`GOARCH`) so only the one file active under the build constraints is
-   parsed and type-checked, matching what `go build` actually compiles.
+   selection is build-aware before parsing, and the gate runs once per supported
+   production build context rather than once for the host OS. The worker package
+   contains mutually-exclusive build-constrained files
+   (`internal/worker/specfile_unix.go` with `//go:build darwin || linux` and
+   `specfile_other.go` with `//go:build !darwin && !linux`) that both declare
+   `openSpecFileBeneath`; loading the directory's full file set with `go/parser`
+   would include both, and `go/types` would report a duplicate declaration before
+   this invariant is ever checked. The release workflow
+   (`.github/workflows/release.yml`) ships `darwin/arm64` and `linux/amd64`
+   artifacts, while CI's verify job runs only on `ubuntu-latest`, so selecting
+   files with `build.Default` would type-check only the Linux context and leave a
+   Darwin-only runner file invisible — a future `//go:build darwin` runner that
+   assigns an unnormalized dynamic value to `loopError.kind` would remain
+   invisible to the test, compile successfully in the release build, and ship
+   despite the claimed invariant. The test therefore iterates over the supported
+   `GOOS`/`GOARCH` pairs (`linux/amd64` and `darwin/arm64` — the release
+   matrix), and for each constructs a `build.Context` copied from
+   `build.Default` with `GOOS`/`GOARCH` overridden, selects files with that
+   context's `MatchFile` (excluding `_test.go` files as below), and runs the
+   full type-check and origin analysis under that context. A build-constrained
+   file active only under one OS is type-checked under that OS even when the test
+   runs on Linux, so only the one file active under each context's build
+   constraints is parsed and type-checked, matching what `go build` actually
+   compiles for that target.
    `MatchFile` alone is not sufficient: it applies filename and build-constraint
    matching but still returns `true` for `_test.go` files, so it does not match
    `go build`, which compiles only production sources. Type-checking the
@@ -1406,27 +1434,44 @@ Per `AGENTS.md`, the root commands are the source of truth:
    - A call resolved by `go/types` to `failureclass.Normalize(...)` — **safe**
      (normalized).
    - A reference to a known-kind constant — **safe** (a known kind). The set of
-     accepted constants is **derived from the authority, not enumerated in the
-     gate**: the test uses `go/types` to enumerate every `const` declaration
-     whose type is `policy.Kind` (the authority after Step 5) in the imported
-     `internal/loops/policy` package and every `const` declaration whose type is
-     `failureclass.Kind` (the `type Kind = policy.Kind` alias) in the imported
+     accepted constants is **derived from the values `Normalize` actually
+     preserves, not enumerated in the gate**: the test uses `go/types` to
+     enumerate every `const` declaration whose type is `policy.Kind` (the
+     authority after Step 5) in the imported `internal/loops/policy` package and
+     every `const` declaration whose type is `failureclass.Kind` (the
+     `type Kind = policy.Kind` alias) in the imported
      `internal/loops/failureclass` package, plus the per-role
      `FailureRetryable*` / `FailureNonRetryable` / `FailureManualIntervention`
      re-exports by resolving each to the `failureclass.*` / `policy.*` constant
-     it aliases. A reference is safe when `go/types` resolves it to one of those
-     authority constants (directly or through a re-export alias). The gate never
-     spells the four current names; today that set is
+     it aliases. The test then imports `failureclass` and calls
+     `failureclass.Normalize` on each enumerated authority constant, keeping
+     only those for which `Normalize(c) == c` (pass-through). A reference is safe
+     when `go/types` resolves it to one of those **preserved** authority
+     constants (directly or through a re-export alias). Anchoring the safe set
+     to `Normalize`'s pass-through — rather than to every `policy.Kind`
+     constant — closes the hole a future fifth constant opens: adding
+     `Experimental Kind = "experimental"` and assigning it directly to
+     `loopError.kind` would pass a gate that accepts every authority constant,
+     even when `Normalize` still maps `Experimental` to `NonRetryable`, so the
+     direct assignment bypasses the fallback the gate exists to enforce. Under
+     this rule `kind: Experimental` is **unsafe** unless `Normalize` is extended
+     to preserve it (then it joins the derived safe set automatically) or the
+     assignment is wrapped in `failureclass.Normalize(Experimental)`. The gate
+     never spells the four current names; today the preserved set is
      `failureclass.RetryableTransient` / `RetryableAfterResume` / `NonRetryable`
-     / `ManualIntervention` (and the per-role re-exports of them), but when a
-     fifth `policy.Kind` constant is added and `failureclass.Normalize` is
-     extended to preserve it, a safe direct assignment such as
+     / `ManualIntervention` (and the per-role re-exports of them), and when a
+     fifth `policy.Kind` constant is added **and `failureclass.Normalize` is
+     extended to preserve it**, a safe direct assignment such as
      `kind: FailureNewKind` is accepted automatically because the new constant
      is already in the derived set — the gate does not recreate a manually
-     synchronized failure-kind ledger inside itself. (A constant of type
-     `policy.Kind` that `Normalize` does *not* preserve would still pass this
-     branch; that gap is closed by the `Normalize` unit test in step 6, which is
-     the authority for the fallback behavior, not by the call-site gate.)
+     synchronized failure-kind ledger inside itself. The authority for "this
+     constant is a known kind" is `Normalize` itself (per the repo's "name the
+     authority before enforcing it" guideline), so the safe set is exactly the
+     set `Normalize` preserves and there is no gap between the call-site gate
+     and the fallback authority. The complementary guarantee — that
+     `Normalize` *does* preserve every authority constant, so adding a
+     `policy.Kind` constant without extending `Normalize` is caught — is owned
+     by the `Normalize` enumeration assertion in step 6, not by this branch.
    - A `.kind` selector read whose receiver `go/types` resolves to `loopError`
      (`kind: failure.kind`) — **safe only when the receiver's own origin is
      safe**. Resolving the receiver's *type* to `loopError` is necessary but not
@@ -1437,12 +1482,17 @@ Per `AGENTS.md`, the root commands are the source of truth:
      receiver identifier is therefore resolved to its origin within the
      enclosing function by the same rule applied to bare identifiers: if the
      receiver is a **local variable**, resolve it to every reaching assignment
-     and classify each right-hand side — **safe** only if every reaching
-     assignment is itself a `loopError` composite literal whose `kind` element
-     is safe (recursively), so a locally-constructed `loopError` whose `kind`
-     was normalized copies a safe kind; **unsafe** if any reaching assignment is
-     a function parameter, a call `go/types` does not resolve to a known-safe
-     producer, or any other untracked source. If the receiver is a **function
+     and classify each right-hand side, and require a safe assignment to the
+     receiver to be definite on every control-flow path reaching the use (the
+     same every-path rule the bare-local branch below enforces) — **safe** only
+     if every path reaching the use passes through a `loopError` composite
+     literal whose `kind` element is safe (recursively), so a
+     locally-constructed `loopError` whose `kind` was normalized copies a safe
+     kind; **unsafe** if any reaching path leaves the receiver at its zero value
+     (e.g. a `var failure loopError` assigned only inside an `if`, so the false
+     branch reaches the use with the empty-string default `kind`), or if any
+     reaching assignment is a function parameter, a call `go/types` does not
+     resolve to a known-safe producer, or any other untracked source. If the receiver is a **function
      parameter** (a `loopError` declared in the enclosing signature with no
      intra-procedural assignment) — **unsafe**: its `kind` originates from an
      untrusted call-site argument the intra-procedural check cannot trace, so a
@@ -1458,15 +1508,27 @@ Per `AGENTS.md`, the root commands are the source of truth:
      `loopError`.
    - A bare identifier that is a **local variable** — resolve it to every
      assignment to that name within the same function and classify each
-     right-hand side recursively; **safe** only if there is at least one
-     reaching assignment and every reaching assignment is itself safe,
-     **unsafe** if the local has no reaching assignments (an uninitialized
-     zero-value `Kind` is an unknown kind — the empty-string default — so a
-     helper that declares `var kind failureclass.Kind` and then returns
-     `&loopError{kind: kind}` without ever writing the local passes the empty
-     assignment set vacuously, the same hole the parameter rule below closes)
-     or if any reaching assignment is a dynamic source not wrapped in
-     `Normalize`.
+     right-hand side recursively; **safe** only if a safe assignment to the
+     local is definite on every control-flow path reaching the use (the gate
+     builds the function's control-flow graph from the `go/ast`/`go/types`
+     statement tree and, for the use site, computes which paths reach it),
+     **unsafe** if any reaching path has no assignment to the local on it. The
+     earlier "at least one reaching assignment and every reaching assignment is
+     safe" rule rejected only an empty assignment set, not an execution path
+     with no assignment: for `var kind failureclass.Kind; if condition { kind =
+     FailureRetryableTransient }; return &loopError{kind: kind}`, that rule saw
+     one reaching assignment, classified it as safe, and accepted the use, yet
+     when `condition` is false the path reaches the return with the zero-value
+     `Kind` (the empty-string default — an unknown kind) and bypasses
+     `Normalize`. The every-path rule closes that hole: the local is safe only
+     when every path reaching the use passes through a safe assignment, so a
+     local assigned only inside an `if` (or any conditional branch) is
+     **unsafe** unless the implementer assigns it on every path or wraps the use
+     in `failureclass.Normalize(kind)`. A local with no reaching assignments at
+     all is the degenerate case (every reaching path has no assignment) and is
+     **unsafe** for the same reason — the same hole the parameter rule below
+     closes. A local is also **unsafe** if any reaching assignment is a dynamic
+     source not wrapped in `Normalize`.
    - A bare identifier that is a **function parameter** (a name declared in the
      enclosing function's signature with no intra-procedural assignment) —
      **unsafe**. A parameter has no local definition to trace, so the
@@ -1634,18 +1696,26 @@ Normalize call-site type-aware check (step 8) passes — so every former
 `Normalize`-wrapped too so the gate stays uniform (no carrier-name allowlist),
 and a bypass fails the suite whether the dynamic
 value is assigned inline or stored in a local first (the type-aware check
-traces locals to their origin and treats a local with no reaching assignments
-as unsafe so an uninitialized zero-value `Kind` cannot pass vacuously, flags a
-`loopError` composite literal that omits `kind` (or a `new(loopError)`/`var
-<name> loopError` zero-value construction that flows to a use) as unsafe so an
-empty-string default kind cannot bypass `Normalize` the same way, traces
+derives the safe-constant set from the authority constants `Normalize` actually
+preserves (`Normalize(c) == c`), so a constant `Normalize` does not preserve is
+unsafe at the call site unless wrapped, traces locals to their origin and
+requires a safe assignment to be definite on every control-flow path reaching
+the use so an uninitialized or only-conditionally-assigned zero-value `Kind`
+cannot pass (a local with no reaching assignments is the degenerate case),
+flags a `loopError` composite literal that omits `kind` (or a `new(loopError)`/
+`var <name> loopError` zero-value construction that flows to a use) as unsafe
+so an empty-string default kind cannot bypass `Normalize` the same way, traces
 `loopError.kind` selector reads back to their receiver's origin so a
 `loopError` parameter or untracked-helper result is not accepted as a safe
-copy, and resolves selector ownership and call targets via `go/types`, and
-selects files with `go/build.Context.MatchFile` (excluding `_test.go` files so
-the gate type-checks only the production sources `go build` compiles) so
-mutually-exclusive build-constrained files like the worker's
-`specfile_unix.go`/`specfile_other.go` are not both type-checked) — the
+copy, and resolves selector ownership and call targets via `go/types`, and runs
+the full type-check once per supported production build context
+(`linux/amd64` and `darwin/arm64` — the release matrix), selecting files with
+`go/build.Context.MatchFile` per context (excluding `_test.go` files so the
+gate type-checks only the production sources `go build` compiles for that
+target) so mutually-exclusive build-constrained files like the worker's
+`specfile_unix.go`/`specfile_other.go` are not both type-checked and a
+Darwin-only runner file is checked under Darwin even when CI runs on Linux) —
+the
 four-kind regression coverage above exists, the fixer-prompt builder coverage
 test (step 9) exists — exercising `AppendFixerCompletionInstruction` for
 advertised-subset coverage of the advertised `failure_kind` tokens via set
