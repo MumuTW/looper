@@ -199,18 +199,52 @@ const (
 )
 ```
 
-The constants stay untyped `string` (their existing usage in
-`validation.Policy.FailureKind` and the `QueueFailureKind(policy.FailureKind)`
-conversion in `worker.classifyValidationFailure` takes a `string`, not a
-`failureclass.Kind`), so this is a value-only change: each constant still
-resolves to the same string, and `go build` confirms no call site breaks. This
-deletes the validation ledger outright rather than pinning it with a test-only
-synchronization gate, per the repo's "prefer deletion over another layer"
-guideline. Adding the `failureclass` import to `validation` is safe: every
-production importer of `validation` (`internal/fixer`, `internal/fixer/failurepolicy`,
-`internal/worker`) already imports `failureclass`, and `failureclass` does not
-import `validation`, so no cycle is created and no importer gains a transitive
-dependency it did not already carry.
+This is a value-preserving change but **not** a value-only one: it is a
+source-level type change. Today the three constants are *untyped* string
+constants (`policy.FailureKindManualIntervention` and
+`policy.FailureKindRetryableAfterResume` are declared without a type, and
+`validation.FailureKindRetryableTransient` is a bare literal), so an in-module
+caller can assign them to any named type whose underlying type is `string`
+without a conversion. Each `string(failureclass.*)` conversion, however,
+produces a *typed* `string` constant: `failureclass.ManualIntervention` et al.
+are declared as `Kind` (a named type), and converting a named-type constant via
+`string(...)` yields a constant of type `string`, not an untyped string
+constant. A typed `string` constant is no longer implicitly assignable to a
+distinct named string type — a caller that today writes
+`var x QueueFailureKind = validation.FailureKindManualIntervention` (relying on
+the untyped constant's implicit conversion) would stop compiling after the
+change and would need an explicit `QueueFailureKind(...)` conversion. So `go
+build` establishes compatibility only for the call sites that exist today, not
+for the untyped API contract in general.
+
+The audit of present call sites: the only production use of the three
+`validation.FailureKind*` constants is inside `validation.PolicyFor`, which
+assigns them to `Policy.FailureKind` (declared `string`) — a typed-`string`-to-
+`string` assignment that still compiles. From there the value flows as a `string`
+field into `worker.classifyValidationFailure`, which applies an explicit
+`QueueFailureKind(policy.FailureKind)` conversion; that conversion takes the
+`string` field, not the constants directly, and is unaffected by the constants'
+typing. No in-module caller assigns any `validation.FailureKind*` constant
+directly to a distinct named string type, so `go build` confirms every present
+call site compiles. The untyped API contract cannot be preserved *while also*
+deleting the ledger via `failureclass` derivation: any conversion from the typed
+`Kind` (`string(failureclass.*)`) yields a typed `string` constant, and the only
+way to keep the constants untyped is to keep bare literals or re-export
+`policy`'s untyped constants — which is the ledger this step deletes. The
+typed-`string` derivation is therefore the chosen trade-off, assessed against
+Goal 3 as follows: the runtime values are byte-identical (each constant still
+resolves to the same string, so the persisted kind strings, retry/hold
+decisions, and resume-policy derivation are unchanged), and the only thing that
+changes is compile-time assignability of the exported constants, which the
+call-site audit plus `go build` confirms does not break any present consumer.
+
+This deletes the validation ledger outright rather than pinning it with a
+test-only synchronization gate, per the repo's "prefer deletion over another
+layer" guideline. Adding the `failureclass` import to `validation` is safe:
+every production importer of `validation` (`internal/fixer`,
+`internal/fixer/failurepolicy`, `internal/worker`) already imports
+`failureclass`, and `failureclass` does not import `validation`, so no cycle is
+created and no importer gains a transitive dependency it did not already carry.
 
 ### Step 2 — Delete the `xxxFailureKind` conversion functions; preserve the unknown-kind fallback
 
@@ -323,13 +357,30 @@ constants, so it would not catch the divergence either.
 
 Add a cross-component drift test (in `internal/agent`'s test package, which can
 import `failureclass` without a cycle) asserting that the prompt text produced by
-`AppendFixerCompletionInstruction` contains
+`AppendFixerCompletionInstruction` advertises exactly
 `string(failureclass.RetryableTransient)` and
 `string(failureclass.ManualIntervention)`, so a rename of either shared value
 fails the suite unless the prompt is updated in the same change. The prompt
 intentionally advertises only those two (not `retryable_after_resume`, which the
 parser still accepts — see the comment at `parseFixerBlockedFailureKind`), so the
 test asserts only the advertised subset, not the full parser allowlist.
+
+The match must be on token boundaries, not an unconstrained `strings.Contains`
+over the bare value. `AppendFixerCompletionInstruction` emits each advertised
+value as a quoted bullet token of the form `- "retryable_transient":` (a leading
+`- `, a double-quoted value, then `:`), so the test reconstructs the exact
+expected token from the shared constant —
+`"- " + strconv.Quote(string(failureclass.RetryableTransient)) + ":"` and the
+same for `ManualIntervention` — and asserts the prompt contains that exact token.
+A bare `Contains(prompt, string(failureclass.ManualIntervention))` would still
+pass after a rename to a shorter value that is a substring of the old prompt
+literal (e.g. renaming `ManualIntervention` to `"manual"` or
+`RetryableTransient` to `"retryable"` leaves the old `"manual_intervention"` /
+`"retryable_transient"` prompt literal still matching), so the parser would
+accept the new value while the prompt keeps advertising the old one and the test
+would not fail. Reconstructing the quoted bullet token from the shared constant
+makes a rename change the expected token (e.g. to `- "manual":`), which no longer
+matches the stale literal in the prompt, so the drift fails the suite.
 
 ## Alternatives considered
 
@@ -412,10 +463,12 @@ scope (not caught at all).
    old one — valid blocked outcomes become contract failures with no drift test
    failing. The existing `internal/agent/prompt_test.go` asserts the literals
    too, not the shared constants. Step 6 adds a cross-component drift test
-   asserting the prompt's advertised literals match
-   `string(failureclass.RetryableTransient)` and
-   `string(failureclass.ManualIntervention)`, so a rename of either shared value
-   fails the suite unless the prompt is updated in the same change.
+   asserting the prompt advertises the exact quoted bullet token reconstructed
+   from the shared constant (`"- " + strconv.Quote(string(failureclass.*)) + ":"`),
+   matching on token boundaries rather than an unconstrained `Contains` over the
+   bare value (a substring match would still pass after a rename to a shorter
+   value that is a substring of the old prompt literal), so a rename of either
+   shared value fails the suite unless the prompt is updated in the same change.
 
 (`internal/validation`'s three `FailureKind*` constants previously belonged in
 this group; Step 1 now re-derives them directly from `failureclass`, so a rename
@@ -429,13 +482,25 @@ not pass silently):**
    `QueueFailureKind`. A rename of a `failureclass.Kind` value would leave these
    paths on the old spelling while the runners follow the new one, and no test
    added by this refactor catches that:
+   - `internal/runtime/runtime.go:3096` writes `ErrorKind: "manual_intervention"`
+     into a `storage.QueueFailInput` when the runtime fails a queue item outside
+     the runner path (a write surface, not a comparison).
    - `internal/runtime/runtime.go:3671` (`isRuntimeRetryableTransientWithRemainingAttempts`)
      compares `queue.LastErrorKind` against the literal `"retryable_transient"`.
+   - `internal/runtime/runtime.go:3965` (`latestQueueIsManualIntervention`)
+     compares `queue.LastErrorKind` (and `queue.Status`) against the literal
+     `"manual_intervention"`.
+   - `internal/api/handler.go:3391` (`isManualInterventionQueue`) compares
+     `item.LastErrorKind` (and `item.Status`) against the literal
+     `"manual_intervention"`.
    - `internal/api/handler.go:3498` (`isBackingOffQueue`) recognizes only
      `"retryable_transient"` and `"retryable_after_resume"` for backoff display.
    - `internal/runtime/scheduler.go:3268,3561-3563,3633-3682` emits and compares
      bare kind strings (`"retryable_transient"`, `"non_retryable"`) when failing
      snapshot queue items and deciding retry eligibility.
+   - `internal/storage/repositories.go:2497` (`QueueRepository.CleanupStaleQueued`)
+     writes `last_error_kind = 'non_retryable'` when cancelling stale queued
+     items (a write surface embedded in SQL, not a comparison).
    - `internal/storage/repositories.go`'s `longTermRetryPredicateLiteral` /
      `longTermRetryPredicateParam` embed the kind strings in a SQL predicate.
    These are read/write surfaces against the *persisted* kind string, not
@@ -450,13 +515,18 @@ not pass silently):**
    `0004_worker_project_target.sql`, and `0016_queue_infinite_retry_attempts.sql`
    (and the snapshot in `internal/storage/testdata/schema/sqlite-schema.snapshot.sql`)
    accept only `('retryable_transient', 'retryable_after_resume',
-   'non_retryable', 'manual_intervention')`. A rename of a `failureclass.Kind`
-   value that the runners begin writing would violate this constraint at insert
-   time — a loud failure, not a silent drift, but one that requires a schema
-   migration coordinated with the rename. This refactor adds no migration
-   (Goal 3: no persisted-state change) and does not claim to catch it; a future
-   rename of any `failureclass.Kind` value must carry a matching migration in the
-   same change.
+   'non_retryable', 'manual_intervention')`. A migration also *writes* the
+   literal: `internal/storage/migrations/0013_active_queue_dedupe.sql` backfills
+   `last_error_kind = COALESCE(last_error_kind, 'non_retryable')` when collapsing
+   duplicate active queues, so a future rename of `NonRetryable` would leave that
+   migration writing the old spelling even after the CHECK constraint is updated.
+   A rename of a `failureclass.Kind` value that the runners begin writing would
+   violate this constraint at insert time — a loud failure, not a silent drift,
+   but one that requires a schema migration coordinated with the rename. This
+   refactor adds no migration (Goal 3: no persisted-state change) and does not
+   claim to catch it; a future rename of any `failureclass.Kind` value must carry
+   a matching migration (constraint update plus any backfill migration that
+   writes the literal) in the same change.
 
 > What is the authority for failure-kind values, and why is it not the agent's
 > own structured output?
@@ -513,8 +583,9 @@ Infra signals remain for drift detection, not authority.
 - `internal/loops/failureclass/failureclass.go` — add `Normalize(kind Kind) Kind` (the authority for the unknown-kind fallback); `Classify` logic unchanged.
 - `internal/validation/validation.go` — re-derive the three `FailureKind*`
   constants directly from `failureclass` (`string(failureclass.*)`) and add the
-  `failureclass` import; the constants stay untyped `string` so no consumer
-  signature changes (Step 1).
+  `failureclass` import; the constants become typed `string` (a source-level
+  type change from the current untyped string constants), but every present
+  consumer compiles unchanged — see the call-site audit in Step 1.
 
 **Files unchanged but verified:**
 - `internal/loops/policy/policy.go` — untouched. Its two string constants stay
@@ -552,9 +623,62 @@ records are identical before and after. No migration, no schema touch.
 1. **Type-name rename.** `QueueFailureKind` is replaced by `failureclass.Kind`
    at 60 sites. If any code relied on the two being *distinct* types (e.g. a type
    switch distinguishing them, or an interface implemented by only one), it
-   would break. Audit: the only typed surfaces are the scheduler field and the
-   `loopError.kind` field; both are internal and expect the same four values.
-   Risk: negligible, caught by `go build`.
+   would break. The typed `QueueFailureKind` surfaces are not just the scheduler
+   field and `loopError.kind`; the full inventory of declared `QueueFailureKind`
+   surfaces that change type:
+
+   - **Exported result structs** (one per role): `fixer.ProcessResult.FailureKind`
+     (`internal/fixer/runner.go:581`), `reviewer.ProcessResult.FailureKind`
+     (`internal/reviewer/runner.go:521`), `worker.ProcessResult.FailureKind`
+     (`internal/worker/runner.go:598`), `planner.ProcessResult.FailureKind`
+     (`internal/planner/runner.go:388`).
+   - **Exported input struct:** `worker.RunCompletedInput.FailureKind`
+     (`internal/worker/runner.go:452`), consumed cross-package by the runtime.
+   - **Exported, JSON-persisted checkpoint field:** `fixer.FixerOutcomeFailure.Kind`
+     (`internal/fixer/runner.go:700`, tagged `json:"kind,omitempty"`), serialized
+     inside `fixerCheckpoint` via `encoding/json`.
+   - **Cross-package scheduler field:**
+     `runtime.workerRunCompletedNotificationInput.FailureKind`
+     (`internal/runtime/scheduler.go:241`), declared `worker.QueueFailureKind`.
+   - **Internal carrier structs:** `loopError.kind` in all four runners
+     (`fixer/runner.go:918`, `reviewer/runner.go:608`, `worker/runner.go:716`,
+     `planner/runner.go:480`) and `worker.validationFailure.kind`
+     (`internal/worker/runner.go:2811`).
+   - **Function parameters:** each role's `failQueueItem`/`isQueueRetryEligible`/
+     `shouldRetryQueueFailure` (and fixer's `requeueQueueItem`/
+     `requeueOrFailQueueItem`/`failQueueItemTerminal`, worker's
+     `reconcileRecoveredLoop`/`buildRunCompletedInput`/`shouldNotifyCompletedRun`/
+     `issueClaimStatusForFailure`, planner's `reconcileRecoveredLoop`).
+   - **Test spelling:** `internal/fixer/runner_repair_outcome_test.go:24`
+     (`wantKind QueueFailureKind`).
+
+   Two of these surfaces cross a package or persistence boundary and need an
+   explicit contract check beyond "it compiles":
+
+   - *Cross-package (worker → runtime):* `worker.RunCompletedInput.FailureKind`
+     and `runtime.workerRunCompletedNotificationInput.FailureKind` both become
+     `failureclass.Kind`, so the value passes from worker to runtime without a
+     conversion (previously the scheduler field was `worker.QueueFailureKind` and
+     received a `worker.QueueFailureKind` value). The value set is identical, so
+     runtime behavior is unchanged; `go build ./...` confirms the cross-package
+     assignment compiles.
+   - *JSON-persisted (fixer checkpoint):* `fixer.FixerOutcomeFailure.Kind` is
+     serialized to and deserialized from the fixer checkpoint JSON. Both
+     `QueueFailureKind` and `failureclass.Kind` are `type X string` with the same
+     underlying string, so `encoding/json` marshals and unmarshals the field to
+     the identical JSON string before and after the change — the persisted
+     checkpoint shape is byte-identical, satisfying Goal 3. Because the field is
+     read back into a `failureclass.Kind` (formerly `QueueFailureKind`) and
+     compared only by string value against the four known kinds, no caller
+     depends on the named type being distinct. Historical checkpoints written
+     under the old type name deserialize unchanged because JSON decoding keys
+     only on the JSON value, not the Go type name.
+
+   All of these are `internal/` surfaces, so the API audience is in-module and
+   fully covered by `go build ./...`. Audit found no type switch on
+   `QueueFailureKind`, no interface implemented by only one of the two types, and
+   no `reflect` use keyed on the named type. Risk: negligible, caught by
+   `go build` plus the JSON-shape equivalence above.
 2. **Constant re-export typing.** The local `FailureRetryableTransient` is a
    typed constant inheriting `failureclass.Kind` from
    `failureclass.RetryableTransient` (which is declared as `Kind`, not as an
@@ -628,9 +752,13 @@ Per `AGENTS.md`, the root commands are the source of truth:
    `failureclass`, so a rename propagates at compile time.)
 9. **Fixer prompt drift detection (Step 6).** A cross-component test in
    `internal/agent` asserts the prompt text from `AppendFixerCompletionInstruction`
-   contains `string(failureclass.RetryableTransient)` and
-   `string(failureclass.ManualIntervention)`, so a rename of either shared value
-   fails the suite unless the prompt is updated in the same change.
+   contains the exact quoted bullet token reconstructed from the shared constant
+   (`"- " + strconv.Quote(string(failureclass.RetryableTransient)) + ":"` and the
+   same for `ManualIntervention`), matching on token boundaries rather than an
+   unconstrained `Contains` over the bare value, so a rename of either shared
+   value (including a rename to a shorter value that is a substring of the old
+   prompt literal) fails the suite unless the prompt is updated in the same
+   change.
 
 **Definition of done:** `QueueFailureKind` is gone from all four runners (the 60
 type-name references replaced by `failureclass.Kind`), the four `xxxFailureKind`
