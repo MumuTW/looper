@@ -111,7 +111,7 @@ func TestFixerReviewThreadCommandsUseConfiguredProviderHostname(t *testing.T) {
 		},
 	})
 	adapter := fixerGitHubAdapter{config: &cfg, gateway: gateway}
-	if _, err := adapter.ViewReviewThread(context.Background(), fixer.ViewReviewThreadInput{ThreadID: "thread-1", CWD: ghesPath}); err != nil {
+	if _, err := adapter.ViewReviewThread(context.Background(), fixer.ViewReviewThreadInput{Repo: "acme/not-authoritative", ThreadID: "thread-1", CWD: ghesPath}); err != nil {
 		t.Fatalf("ViewReviewThread() error = %v", err)
 	}
 	if err := adapter.AddReviewThreadReply(context.Background(), fixer.AddReviewThreadReplyInput{Repo: "acme/not-authoritative", ThreadID: "thread-1", Body: "fixed", CWD: ghesPath}); err != nil {

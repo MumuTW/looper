@@ -1114,7 +1114,7 @@ func (a fixerGitHubAdapter) ListReviewThreads(ctx context.Context, input fixer.L
 }
 
 func (a fixerGitHubAdapter) ViewReviewThread(ctx context.Context, input fixer.ViewReviewThreadInput) (fixer.ReviewThread, error) {
-	repo, err := a.reviewThreadRepo("", input.CWD)
+	repo, err := a.reviewThreadRepo(input.Repo, input.CWD)
 	if err != nil {
 		return fixer.ReviewThread{}, err
 	}
