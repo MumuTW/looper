@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/MumuTW/looper/internal/upgradebackup"
+	"github.com/MumuTW/looper/internal/upgraderelease"
 	"github.com/MumuTW/looper/internal/version"
 )
 
@@ -204,6 +205,55 @@ func TestUpgradeVerifyChecksLocalRollbackBundle(t *testing.T) {
 	}
 }
 
+func TestUpgradeStageAndActivateReleaseUsesVerifiedPair(t *testing.T) {
+	identity := releasedUpgradeIdentity("1.2.3", "aaaaaaa")
+	cli := writeIdentityProgram(t, identity)
+	daemon := writeIdentityProgram(t, identity)
+	root := t.TempDir()
+	stdout := &bytes.Buffer{}
+	if err := runUpgrade(context.Background(), nil, []string{"stage-release", "--target-looperd", daemon, "--release-root", root, "--target-looper", cli}, stdout); err != nil {
+		t.Fatal(err)
+	}
+	var staged upgraderelease.StageResult
+	if err := json.Unmarshal(stdout.Bytes(), &staged); err != nil {
+		t.Fatal(err)
+	}
+	if staged.ReleaseID == "" || staged.Manifest.Build.Version != identity.Version {
+		t.Fatalf("staged release = %#v", staged)
+	}
+	if err := os.WriteFile(cli, []byte("not an identity program"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	stdout.Reset()
+	if err := runUpgrade(context.Background(), nil, []string{"activate-release", "--release", staged.ReleaseID, "--release-root", root}, stdout); err != nil {
+		t.Fatal(err)
+	}
+	var activated upgraderelease.ActivationResult
+	if err := json.Unmarshal(stdout.Bytes(), &activated); err != nil {
+		t.Fatal(err)
+	}
+	if activated.CurrentReleaseID != staged.ReleaseID {
+		t.Fatalf("activation = %#v", activated)
+	}
+	target, err := os.Readlink(filepath.Join(root, "current"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if target != filepath.Join("releases", staged.ReleaseID) {
+		t.Fatalf("current target = %q", target)
+	}
+}
+
+func TestUpgradeStageReleaseRejectsDevelopmentSnapshot(t *testing.T) {
+	dev := version.Current()
+	cli := writeIdentityProgram(t, dev)
+	daemon := writeIdentityProgram(t, dev)
+	err := runUpgrade(context.Background(), nil, []string{"stage-release", "--target-looper", cli, "--target-looperd", daemon, "--release-root", t.TempDir()}, &bytes.Buffer{})
+	if err == nil || !strings.Contains(err.Error(), "development snapshots are unsupported") {
+		t.Fatalf("runUpgrade() error = %v", err)
+	}
+}
+
 func writeUpgradeBundleFile(t *testing.T, directory, name, contents string) string {
 	t.Helper()
 	path := filepath.Join(directory, name)
@@ -211,6 +261,12 @@ func writeUpgradeBundleFile(t *testing.T, directory, name, contents string) stri
 		t.Fatal(err)
 	}
 	return path
+}
+
+func releasedUpgradeIdentity(value, commit string) version.Info {
+	timestamp := "2026-07-31T12:34:56Z"
+	dirty := false
+	return version.Info{Version: value, Metadata: version.BuildMetadata{VersionSource: "git-tag:v" + value, Channel: "stable", APIVersion: "v1", GitCommitSHA: &commit, BuildTimestamp: &timestamp, Dirty: &dirty}}
 }
 
 func upgradeTestDaemon(t *testing.T, identity version.Info) *httptest.Server {

@@ -23,7 +23,7 @@ For source development:
 
 Looper uses Go binaries as the default supported implementation. Installing is manual: you place two binaries, write a config, and run the daemon yourself.
 
-> **There is no managed daemon install and no setup wizard.** `looper bootstrap`, `looper daemon install|start|status|logs|restart`, and `looper upgrade` were removed along with the old CLI ahead of the role-model rewrite. Nothing installs, supervises, or upgrades `looperd` for you.
+> **There is no managed daemon install, setup wizard, or daemon restart command.** `looper bootstrap` and `looper daemon install|start|status|logs|restart` were removed along with the old CLI ahead of the role-model rewrite. The supported upgrade commands can stage and atomically select a release, but they never stop, signal, or restart `looperd` for you.
 
 ### 1. Install the CLI
 
@@ -142,7 +142,19 @@ looper stop <selector>   # fails loudly if looperd is down or the loop is unknow
 
 ## Upgrade
 
-Manual: replace the binaries. Download the newer `looper-<target>.tar.gz` and `looperd-<target>.tar.gz` release artifacts (or re-run the install script for the CLI), put them back on your `PATH`, and restart `looperd`. There is no self-upgrade, version check, rollback, or channel switching.
+For a versioned binary cutover, configure both the interactive CLI path and the daemon service command to use one release root's `current` pointer, for example `/opt/looper/current/looper` and `/opt/looper/current/looperd`. Stage a matching pair and atomically select it:
+
+```sh
+looper upgrade stage-release \
+  --target-looper /downloads/looper-darwin-arm64 \
+  --target-looperd /downloads/looperd-darwin-arm64 \
+  --release-root /opt/looper
+looper upgrade activate-release --release-root /opt/looper --release <release-id>
+```
+
+`stage-release` accepts only a matching, clean stable/beta pair with a source commit and build timestamp; it copies both binaries to an immutable release directory, then re-reads their embedded identity. `activate-release` verifies the release contents and identities again before atomically renaming the single `current` symlink. It does not stop or restart the old daemon, so after a successful drain the operator still stops it and starts the supervisor service normally.
+
+To switch binaries back, activate a previously staged release ID. That is only a binary rollback: do it only after compatibility preflight proves the database remains readable by that release. If a migration or durable payload change is forward-only, restore the matching database/config backup rather than merely moving the binary pointer.
 
 ## Compatibility and version policy
 

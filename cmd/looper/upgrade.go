@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/MumuTW/looper/internal/upgradebackup"
+	"github.com/MumuTW/looper/internal/upgraderelease"
 	"github.com/MumuTW/looper/internal/version"
 )
 
@@ -69,7 +71,7 @@ type upgradeDaemonVersion struct {
 
 func runUpgrade(ctx context.Context, global, operands []string, stdout interface{ Write([]byte) (int, error) }) error {
 	if len(operands) == 0 {
-		return badUsage("upgrade requires backup, drain, preflight, or verify")
+		return badUsage("upgrade requires activate-release, backup, drain, preflight, stage-release, or verify")
 	}
 	if operands[0] == "backup" {
 		if len(operands) != 1 {
@@ -103,8 +105,22 @@ func runUpgrade(ctx context.Context, global, operands []string, stdout interface
 		}
 		return writeVersionJSON(stdout, result)
 	}
+	if operands[0] == "stage-release" {
+		targetLooper, targetLooperd, root, err := parseUpgradeStageReleaseArgs(operands[1:])
+		if err != nil {
+			return err
+		}
+		return runUpgradeStageRelease(ctx, targetLooper, targetLooperd, root, stdout)
+	}
+	if operands[0] == "activate-release" {
+		root, releaseID, err := parseUpgradeActivateReleaseArgs(operands[1:])
+		if err != nil {
+			return err
+		}
+		return runUpgradeActivateRelease(ctx, root, releaseID, stdout)
+	}
 	if operands[0] != "preflight" {
-		return badUsage("upgrade requires backup, drain, preflight, or verify")
+		return badUsage("upgrade requires activate-release, backup, drain, preflight, stage-release, or verify")
 	}
 	targetLooper, targetLooperd, jsonOutput, err := parseUpgradePreflightArgs(operands[1:])
 	if err != nil {
@@ -297,6 +313,140 @@ func parseUpgradeVerifyArgs(args []string) (string, error) {
 		return "", badUsage("upgrade verify requires --bundle <directory>")
 	}
 	return args[1], nil
+}
+
+func runUpgradeStageRelease(ctx context.Context, targetLooper, targetLooperd, root string, stdout interface{ Write([]byte) (int, error) }) error {
+	cli, err := targetBuildIdentity(ctx, targetLooper, "version", "--json")
+	if err != nil {
+		return err
+	}
+	daemon, err := targetBuildIdentity(ctx, targetLooperd, "--version-json")
+	if err != nil {
+		return err
+	}
+	if !cli.SameBuild(daemon) {
+		return fmt.Errorf("target CLI and daemon build identities differ")
+	}
+	if err := releaseCandidateAllowed(cli); err != nil {
+		return err
+	}
+	releaseID := releaseIDFor(cli)
+	staged, err := upgraderelease.Stage(upgraderelease.StageInput{RootDir: root, ReleaseID: releaseID, CLIBinaryPath: targetLooper, DaemonBinaryPath: targetLooperd, Build: cli})
+	if err != nil {
+		return err
+	}
+	if err := verifyStagedReleaseIdentity(ctx, staged); err != nil {
+		return err
+	}
+	return writeVersionJSON(stdout, staged)
+}
+
+func runUpgradeActivateRelease(ctx context.Context, root, releaseID string, stdout interface{ Write([]byte) (int, error) }) error {
+	staged, err := upgraderelease.Verify(root, releaseID)
+	if err != nil {
+		return err
+	}
+	if err := releaseCandidateAllowed(staged.Manifest.Build); err != nil {
+		return err
+	}
+	if err := verifyStagedReleaseIdentity(ctx, staged); err != nil {
+		return err
+	}
+	result, err := upgraderelease.Activate(root, releaseID)
+	if err != nil {
+		return err
+	}
+	return writeVersionJSON(stdout, result)
+}
+
+func verifyStagedReleaseIdentity(ctx context.Context, staged upgraderelease.StageResult) error {
+	cli, err := targetBuildIdentity(ctx, filepath.Join(staged.Directory, "looper"), "version", "--json")
+	if err != nil {
+		return fmt.Errorf("verify staged CLI identity: %w", err)
+	}
+	daemon, err := targetBuildIdentity(ctx, filepath.Join(staged.Directory, "looperd"), "--version-json")
+	if err != nil {
+		return fmt.Errorf("verify staged daemon identity: %w", err)
+	}
+	if !cli.SameBuild(daemon) || !cli.SameBuild(staged.Manifest.Build) {
+		return fmt.Errorf("staged CLI and daemon do not match the release manifest build identity")
+	}
+	return nil
+}
+
+func releaseCandidateAllowed(identity version.Info) error {
+	if !validBuildIdentity(identity) {
+		return fmt.Errorf("release staging requires a complete build identity")
+	}
+	if identity.Metadata.Channel != "stable" && identity.Metadata.Channel != "beta" {
+		return fmt.Errorf("release staging rejects %q channel; development snapshots are unsupported", identity.Metadata.Channel)
+	}
+	if identity.Metadata.GitCommitSHA == nil || strings.TrimSpace(*identity.Metadata.GitCommitSHA) == "" || identity.Metadata.BuildTimestamp == nil || strings.TrimSpace(*identity.Metadata.BuildTimestamp) == "" || identity.Metadata.Dirty == nil || *identity.Metadata.Dirty {
+		return fmt.Errorf("release staging requires a complete, clean build identity")
+	}
+	return nil
+}
+
+func releaseIDFor(identity version.Info) string {
+	commit := strings.TrimSpace(*identity.Metadata.GitCommitSHA)
+	timestamp := strings.TrimSpace(*identity.Metadata.BuildTimestamp)
+	if len(commit) > 12 {
+		commit = commit[:12]
+	}
+	return releaseIDComponent(identity.Version) + "-" + releaseIDComponent(identity.Metadata.Channel) + "-" + releaseIDComponent(commit) + "-" + releaseIDComponent(timestamp)
+}
+
+func releaseIDComponent(value string) string {
+	var builder strings.Builder
+	for _, char := range strings.TrimSpace(value) {
+		if char >= 'a' && char <= 'z' || char >= 'A' && char <= 'Z' || char >= '0' && char <= '9' || char == '.' || char == '_' || char == '-' {
+			builder.WriteRune(char)
+		} else {
+			builder.WriteByte('-')
+		}
+	}
+	return strings.Trim(builder.String(), "-")
+}
+
+func parseUpgradeStageReleaseArgs(args []string) (string, string, string, error) {
+	values, err := parseUpgradeNamedArgs(args, "stage-release", []string{"--target-looper", "--target-looperd", "--release-root"})
+	if err != nil {
+		return "", "", "", err
+	}
+	return values["--target-looper"], values["--target-looperd"], values["--release-root"], nil
+}
+
+func parseUpgradeActivateReleaseArgs(args []string) (string, string, error) {
+	values, err := parseUpgradeNamedArgs(args, "activate-release", []string{"--release-root", "--release"})
+	if err != nil {
+		return "", "", err
+	}
+	return values["--release-root"], values["--release"], nil
+}
+
+func parseUpgradeNamedArgs(args []string, command string, names []string) (map[string]string, error) {
+	allowed := map[string]bool{}
+	values := map[string]string{}
+	for _, name := range names {
+		allowed[name] = true
+	}
+	for index := 0; index < len(args); index++ {
+		name := args[index]
+		if !allowed[name] || index+1 >= len(args) || strings.HasPrefix(args[index+1], "--") || strings.TrimSpace(args[index+1]) == "" {
+			return nil, badUsage("upgrade %s requires %s", command, strings.Join(names, " "))
+		}
+		if _, exists := values[name]; exists {
+			return nil, badUsage("upgrade %s accepts %s at most once", command, name)
+		}
+		index++
+		values[name] = args[index]
+	}
+	for _, name := range names {
+		if strings.TrimSpace(values[name]) == "" {
+			return nil, badUsage("upgrade %s requires %s", command, strings.Join(names, " "))
+		}
+	}
+	return values, nil
 }
 
 func targetBuildIdentity(ctx context.Context, binary string, args ...string) (version.Info, error) {

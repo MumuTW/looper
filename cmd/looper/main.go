@@ -1351,6 +1351,11 @@ Usage:
                                Close admission and wait for existing work
   looper upgrade verify --bundle <directory>
                                Verify a rollback backup bundle before cutover
+  looper upgrade stage-release --target-looper <path> --target-looperd <path>
+                               --release-root <directory>
+                               Stage a matching, immutable binary pair
+  looper upgrade activate-release --release-root <directory> --release <id>
+                               Atomically switch the staged release pointer
 
 Global flags, accepted before or after the verb:
   --config <path>              Config file to load
