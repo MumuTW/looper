@@ -336,15 +336,20 @@ A line-regex check is not a sound gate for this: it only sees the text of the
 (`classified := failureclass.Classify(...)` then `kind: classified`) bypasses
 `Normalize` while matching no dynamic-source pattern on the `kind:` line. A
 regex that claims every bypass fails is claiming an invariant it cannot enforce.
-Validation step 8 therefore uses an AST-based check with intra-procedural origin
-tracking instead of a regex: for every `loopError.kind` assignment in the four
-runners it traces the value expression back to its origin within the same
+Validation step 8 therefore uses a type-aware check with intra-procedural
+origin tracking instead of a regex: for every `loopError.kind` assignment in the
+four runners it traces the value expression back to its origin within the same
 function and fails when a dynamic source (`failureclass.Classify(...)` or a
-capital-`K` `.Kind` field read off a non-`loopError` struct such as `Decision`)
-reaches `kind` without being wrapped in `failureclass.Normalize`. A bare local
-like `kind: classified` is resolved to its assignments, so the indirect
-assignment is caught — the implementer must write
-`kind: failureclass.Normalize(classified)`. Known-constant references,
+`.Kind` field read off a non-`loopError` struct such as `Decision`) reaches
+`kind` without being wrapped in `failureclass.Normalize`. Selector ownership and
+call resolution are proven with `go/types`, not syntax alone: a `.kind` read is
+treated as a `loopError` copy only when `go/types` resolves its receiver type to
+`loopError`, and a `failureclass.Normalize(...)` call is recognized only when
+`go/types` resolves it to the imported `failureclass` package's `Normalize`, so a
+shadowed `failureclass` identifier or an unrelated struct's lowercase `kind`
+field cannot pass as safe. A bare local like `kind: classified` is resolved to
+its assignments, so the indirect assignment is caught — the implementer must
+write `kind: failureclass.Normalize(classified)`. Known-constant references,
 `loopError.kind` copies, and locals whose every reaching assignment is one of
 those two safe shapes pass. This makes the gate match the invariant it claims.
 
@@ -449,17 +454,21 @@ const (
 ```
 
 `Classify`'s public API is unchanged (it still returns `Kind`), and `Kind` stays
-`type Kind string`, so every `failureclass.Kind` surface — the runners, the
-scheduler field, `loopError.kind`, `parseFixerBlockedFailureKind`'s return type,
-`Policy.FailureKind` — keeps compiling unchanged. A rename of any `policy`
-string constant propagates to `failureclass` and to every consumer at compile
-time, so no drift-detection test is added or needed. `policy`'s leaf property is
-preserved: it still imports only the standard library, so `reviewer/workflow`
-depending on `policy` still pulls in no infra. Adding `policy` to
-`failureclass`'s import graph adds only a stdlib-only package to
-`failureclass`'s existing `internal/infra/github` closure, and every runner
-already imports `policy` transitively via `internal/loops`, so no importer of
-`failureclass` gains a transitive dependency it did not already carry.
+`type Kind string`: `failureclass.Classify` and `failureclass.Kind` themselves
+keep compiling unchanged. The surfaces that adopt `failureclass.Kind` — the
+runners, the scheduler field, `loopError.kind`,
+`parseFixerBlockedFailureKind`'s return type, and `Policy.FailureKind` — retain
+their semantic values but do not keep compiling unchanged: their declarations
+change to `failureclass.Kind` as the planned type edits of Steps 1 and 3, and
+Step 5 adds no further edit to them. A rename of any `policy` string constant
+propagates to `failureclass` and to every consumer at compile time, so no
+drift-detection test is added or needed. `policy`'s leaf property is preserved:
+it still imports only the standard library, so `reviewer/workflow` depending on
+`policy` still pulls in no infra. Adding `policy` to `failureclass`'s import
+graph adds only a stdlib-only package to `failureclass`'s existing
+`internal/infra/github` closure, and every runner already imports `policy`
+transitively via `internal/loops`, so no importer of `failureclass` gains a
+transitive dependency it did not already carry.
 
 `NormalizeResumePolicy` and the other `policy` predicates keep their current
 `string` signatures and branches: the `policy` constants stay untyped `string`,
@@ -1019,7 +1028,7 @@ Per `AGENTS.md`, the root commands are the source of truth:
      exit 1
    fi
    ```
-8. **Normalize call-site AST check (Step 2).** The `Normalize` unit test
+8. **Normalize call-site type-aware check (Step 2).** The `Normalize` unit test
    and the four-kind runner tests do not prove the seven former `xxxFailureKind`
    call sites actually invoke `failureclass.Normalize` — a direct `kind: d.Kind`
    or `kind: failureclass.Classify(...)` assignment bypasses the fallback but
@@ -1031,20 +1040,32 @@ Per `AGENTS.md`, the root commands are the source of truth:
    gate must therefore see through locals, which a regex cannot.
 
    The check is a Go test, not a shell regex, using the stdlib `go/parser` +
-   `go/ast` (the same parser-only pattern the repo already uses for structural
-   contract tests such as `internal/runtime/runs_service_absent_test.go`; no
-   `go/types` or `golang.org/x/tools` dependency is added). It parses each of
-   `internal/{fixer,reviewer,worker,planner}/runner.go`, locates every
-   `loopError` composite literal `kind` element (and every assignment to a
-   `loopError` value's `.kind` field), and classifies the value expression by
-   intra-procedural origin tracking within the enclosing function:
+   `go/ast` + `go/types` (the same parser-based pattern the repo already uses
+   for structural contract tests such as
+   `internal/runtime/runs_service_absent_test.go`, extended with `go/types`
+   because this gate makes claims parser-only analysis cannot prove; no
+   `golang.org/x/tools` dependency is added — `go/types` is standard library).
+   It parses and type-checks each of the four runner packages
+   (`internal/{fixer,reviewer,worker,planner}`, loading each package's full file
+   set and resolving imports via a source importer), locates every `loopError`
+   composite literal `kind` element (and every assignment to a `loopError`
+   value's `.kind` field), and classifies the value expression by
+   intra-procedural origin tracking within the enclosing function. Selector
+   ownership and call targets are resolved from `go/types` info, not from
+   selector spelling: a `.kind` read is treated as a `loopError` copy only when
+   `go/types` resolves its receiver type to `loopError`, and a
+   `failureclass.Normalize(...)` / `failureclass.Classify(...)` call is
+   recognized only when `go/types` resolves it to the imported `failureclass`
+   package's function, so a shadowed `failureclass` identifier or an unrelated
+   struct's lowercase `kind` field cannot pass as safe:
 
-   - A call to `failureclass.Normalize(...)` — **safe** (normalized).
+   - A call resolved by `go/types` to `failureclass.Normalize(...)` — **safe**
+     (normalized).
    - A reference to a known-kind constant — `failureclass.RetryableTransient` /
      `RetryableAfterResume` / `NonRetryable` / `ManualIntervention`, or the
      per-role `FailureRetryable*` / `FailureNonRetryable` /
      `FailureManualIntervention` aliases — **safe** (a known kind).
-   - A lowercase `.kind` selector read off a `loopError` value
+   - A `.kind` selector read whose receiver `go/types` resolves to `loopError`
      (`kind: failure.kind`) — **safe** (a copy of an already-normalized kind, by
      this same invariant).
    - A bare identifier (local variable or parameter) — resolve it to every
@@ -1052,10 +1073,11 @@ Per `AGENTS.md`, the root commands are the source of truth:
      right-hand side recursively; **safe** only if every reaching assignment is
      itself safe, **unsafe** if any reaching assignment is a dynamic source not
      wrapped in `Normalize`.
-   - A dynamic source — `failureclass.Classify(...)` or a capital-`K` `.Kind`
-     selector read off a non-`loopError` struct (e.g. `Decision.Kind`,
+   - A dynamic source — a call resolved by `go/types` to
+     `failureclass.Classify(...)`, or a `.Kind` selector read whose receiver
+     `go/types` resolves to a non-`loopError` struct (e.g. `Decision.Kind`,
      `failure.Kind` on a validation failure) — **unsafe** unless it is the
-     argument of a `failureclass.Normalize(...)` call.
+     argument of a call resolved to `failureclass.Normalize(...)`.
    - Any other expression — **unsafe** (conservative: an untracked source could
      carry a future unknown kind past the fallback).
 
@@ -1065,11 +1087,12 @@ Per `AGENTS.md`, the root commands are the source of truth:
    implementer must write `kind: failureclass.Normalize(classified)`. The
    existing safe shapes keep passing — `kind: FailureRetryableTransient`,
    `kind: failure.kind`, and `kind: kind` where `kind` is only ever assigned
-   from `FailureRetryable*` constants all resolve to a safe origin. Capital-`K`
-   `.Kind` (dynamic, on `Decision`/validation structs) is distinguished from
-   lowercase `.kind` (a `loopError` copy) by the selector name, which is the same
-   distinction the deleted regex relied on, now applied through data flow rather
-   than a single line of text.
+   from `FailureRetryable*` constants all resolve to a safe origin. The
+   dynamic-vs-copy distinction is no longer made by selector name: `go/types`
+   resolves the receiver, so a `.Kind` read on `Decision`/validation structs is
+   dynamic and a `.kind` read on a `loopError` is a copy, regardless of spelling
+   — a struct that happened to spell its field the other way could not fool the
+   gate.
 
    This is covering, not propping up: it is the first enforcement of the
    `Normalize` fallback invariant the refactor relies on, and it replaces a
@@ -1117,11 +1140,12 @@ existing two so the documented `loops.*` API exposes all four, the fixer
 prompt's advertised `failure_kind` tokens are derived from
 `string(failureclass.*)` passed into `AppendFixerCompletionInstruction` from the
 fixer call site, the deleted-symbol absence check (step 7) passes, the
-Normalize call-site AST check (step 8) passes — so every former
+Normalize call-site type-aware check (step 8) passes — so every former
 `xxxFailureKind` call site routes its dynamic `failureclass.Kind` through
 `failureclass.Normalize`, and a bypass fails the suite whether the dynamic
-value is assigned inline or stored in a local first (the AST check traces
-locals to their origin) — the
+value is assigned inline or stored in a local first (the type-aware check
+traces locals to their origin and resolves selector ownership and call targets
+via `go/types`) — the
 four-kind regression coverage above exists, the fixer-prompt call-site coverage
 test (step 9) exists — exercising `buildFixerPrompt` to catch swapped or
 unrelated `string` arguments at the `runner.go:7307` call site, with
