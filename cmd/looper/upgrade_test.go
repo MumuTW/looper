@@ -186,7 +186,7 @@ func TestUpgradeVerifyChecksLocalRollbackBundle(t *testing.T) {
 	config := writeUpgradeBundleFile(t, root, "config.toml", "[server]\n")
 	cli := writeUpgradeBundleFile(t, root, "looper-bin", "cli")
 	daemon := writeUpgradeBundleFile(t, root, "looperd-bin", "daemon")
-	bundle, err := upgradebackup.Create(context.Background(), upgradebackup.Input{RootDir: filepath.Join(root, "backups"), ConfigPath: config, CLIBinaryPath: cli, DaemonBinaryPath: daemon, Snapshot: func(context.Context) (string, error) {
+	bundle, err := upgradebackup.Create(context.Background(), upgradebackup.Input{RootDir: filepath.Join(root, "backups"), ConfigPath: config, DatabasePath: filepath.Join(root, "looper.sqlite"), CLIBinaryPath: cli, DaemonBinaryPath: daemon, Snapshot: func(context.Context) (string, error) {
 		return writeUpgradeBundleFile(t, root, "snapshot.sqlite", "sqlite"), nil
 	}})
 	if err != nil {

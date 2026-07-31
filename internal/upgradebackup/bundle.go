@@ -16,11 +16,15 @@ import (
 	"time"
 )
 
-const ManifestVersion = 1
+const (
+	LegacyManifestVersion = 1
+	ManifestVersion       = 2
+)
 
 type Input struct {
 	RootDir          string
 	ConfigPath       string
+	DatabasePath     string
 	CLIBinaryPath    string
 	DaemonBinaryPath string
 	Now              func() time.Time
@@ -35,6 +39,18 @@ type Manifest struct {
 	Version   int             `json:"version"`
 	CreatedAt string          `json:"createdAt"`
 	Files     map[string]File `json:"files"`
+	Source    *Source         `json:"source,omitempty"`
+}
+
+// Source records the exact pre-cutover destinations a v2 bundle can restore.
+// The bundle directory is 0700 and manifest.json is 0600 because these paths
+// can expose an operator's installation layout. A v1 manifest has no Source:
+// it remains verifiable but restore must fail closed instead of guessing.
+type Source struct {
+	ConfigPath       string `json:"configPath"`
+	DatabasePath     string `json:"databasePath"`
+	CLIBinaryPath    string `json:"cliBinaryPath"`
+	DaemonBinaryPath string `json:"daemonBinaryPath"`
 }
 type Result struct {
 	Directory string   `json:"directory"`
@@ -55,8 +71,24 @@ func Create(ctx context.Context, input Input) (Result, error) {
 	if strings.TrimSpace(input.RootDir) == "" || input.Snapshot == nil {
 		return Result{}, fmt.Errorf("backup root and snapshot operation are required")
 	}
-	if strings.TrimSpace(input.ConfigPath) == "" || strings.TrimSpace(input.CLIBinaryPath) == "" || strings.TrimSpace(input.DaemonBinaryPath) == "" {
-		return Result{}, fmt.Errorf("config, CLI binary, and daemon binary paths are required")
+	if strings.TrimSpace(input.ConfigPath) == "" || strings.TrimSpace(input.DatabasePath) == "" || strings.TrimSpace(input.CLIBinaryPath) == "" || strings.TrimSpace(input.DaemonBinaryPath) == "" {
+		return Result{}, fmt.Errorf("config, database, CLI binary, and daemon binary paths are required")
+	}
+	configPath, err := absolutePath(input.ConfigPath, "config")
+	if err != nil {
+		return Result{}, err
+	}
+	databasePath, err := absolutePath(input.DatabasePath, "database")
+	if err != nil {
+		return Result{}, err
+	}
+	cliBinaryPath, err := absolutePath(input.CLIBinaryPath, "CLI binary")
+	if err != nil {
+		return Result{}, err
+	}
+	daemonBinaryPath, err := absolutePath(input.DaemonBinaryPath, "daemon binary")
+	if err != nil {
+		return Result{}, err
 	}
 	now := time.Now
 	if input.Now != nil {
@@ -78,12 +110,12 @@ func Create(ctx context.Context, input Input) (Result, error) {
 	if err := moveAndRecord(snapshot, filepath.Join(bundle, "database.sqlite"), files, "database.sqlite"); err != nil {
 		return fail(err)
 	}
-	for _, item := range []struct{ source, name string }{{input.ConfigPath, "config" + filepath.Ext(input.ConfigPath)}, {input.CLIBinaryPath, "looper"}, {input.DaemonBinaryPath, "looperd"}} {
+	for _, item := range []struct{ source, name string }{{configPath, "config" + filepath.Ext(configPath)}, {cliBinaryPath, "looper"}, {daemonBinaryPath, "looperd"}} {
 		if err := copyAndRecord(item.source, filepath.Join(bundle, item.name), files, item.name); err != nil {
 			return fail(err)
 		}
 	}
-	manifest := Manifest{Version: ManifestVersion, CreatedAt: now().UTC().Format(time.RFC3339Nano), Files: files}
+	manifest := Manifest{Version: ManifestVersion, CreatedAt: now().UTC().Format(time.RFC3339Nano), Files: files, Source: &Source{ConfigPath: configPath, DatabasePath: databasePath, CLIBinaryPath: cliBinaryPath, DaemonBinaryPath: daemonBinaryPath}}
 	encoded, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
 		return fail(fmt.Errorf("encode backup manifest: %w", err))
@@ -201,7 +233,7 @@ func Verify(directory string) (Verification, error) {
 }
 
 func validateManifest(manifest Manifest) error {
-	if manifest.Version != ManifestVersion {
+	if manifest.Version != LegacyManifestVersion && manifest.Version != ManifestVersion {
 		return fmt.Errorf("unsupported backup manifest version %d", manifest.Version)
 	}
 	if _, err := time.Parse(time.RFC3339Nano, manifest.CreatedAt); err != nil {
@@ -228,7 +260,35 @@ func validateManifest(manifest Manifest) error {
 	if !manifest.Files["database.sqlite"].valid() || !manifest.Files["looper"].valid() || !manifest.Files["looperd"].valid() || configFiles != 1 {
 		return fmt.Errorf("backup manifest must name database.sqlite, looper, looperd, and one config file")
 	}
+	if manifest.Version == ManifestVersion {
+		if manifest.Source == nil || strings.TrimSpace(manifest.Source.ConfigPath) == "" || strings.TrimSpace(manifest.Source.DatabasePath) == "" || strings.TrimSpace(manifest.Source.CLIBinaryPath) == "" || strings.TrimSpace(manifest.Source.DaemonBinaryPath) == "" {
+			return fmt.Errorf("backup manifest v%d requires source restore metadata", ManifestVersion)
+		}
+		for _, item := range []struct{ name, path string }{{"config", manifest.Source.ConfigPath}, {"database", manifest.Source.DatabasePath}, {"CLI binary", manifest.Source.CLIBinaryPath}, {"daemon binary", manifest.Source.DaemonBinaryPath}} {
+			if !filepath.IsAbs(item.path) {
+				return fmt.Errorf("backup manifest v%d %s path must be absolute", ManifestVersion, item.name)
+			}
+		}
+	}
 	return nil
+}
+
+// RestoreSource returns the exact original destinations recorded in a v2
+// bundle. Older bundles deliberately return an error: guessing paths during a
+// destructive restore would make the manifest less safe than no restore.
+func RestoreSource(manifest Manifest) (Source, error) {
+	if manifest.Version != ManifestVersion || manifest.Source == nil {
+		return Source{}, fmt.Errorf("backup manifest v%d has no restore target metadata; create a new backup before using restore", manifest.Version)
+	}
+	return *manifest.Source, nil
+}
+
+func absolutePath(path, description string) (string, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("resolve %s path: %w", description, err)
+	}
+	return filepath.Clean(abs), nil
 }
 
 func (file File) valid() bool {

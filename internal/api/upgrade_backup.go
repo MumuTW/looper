@@ -31,7 +31,7 @@ func (h *Handler) createUpgradeBackup(ctx context.Context) (upgradebackup.Result
 		return upgradebackup.Result{}, fmt.Errorf("storage.backupDir is required")
 	}
 	return upgradebackup.Create(ctx, upgradebackup.Input{
-		RootDir: *cfg.Storage.BackupDir, ConfigPath: metadata.ConfigPath,
+		RootDir: *cfg.Storage.BackupDir, ConfigPath: metadata.ConfigPath, DatabasePath: cfg.Storage.DBPath,
 		CLIBinaryPath: *cfg.Tools.LooperPath, DaemonBinaryPath: daemonExecutablePath(), Now: h.now,
 		Snapshot: services.Coordinator.Backup,
 	})
