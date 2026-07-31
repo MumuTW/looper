@@ -2538,7 +2538,7 @@ func defaultSyncConfiguredProjects(ctx context.Context, service *projects.Servic
 }
 
 func captureProjectPullRequestSnapshot(ctx context.Context, cfg *config.Config, gateway *githubinfra.Gateway, input projects.CapturePullRequestSnapshotInput) (storage.PullRequestSnapshotRecord, error) {
-	transportRepo, err := reviewThreadRepo(cfg, input.Repo, input.CWD)
+	transportRepo, err := reviewThreadRepoForProject(cfg, input.ProjectID, input.Repo)
 	if err != nil {
 		return storage.PullRequestSnapshotRecord{}, err
 	}

@@ -403,6 +403,102 @@ func TestConfiguredProjectDiscoverySnapshotUsesGHESCommands(t *testing.T) {
 	}
 }
 
+func TestSnapshotQueueUsesProjectIDForGHESAfterConfiguredPathChange(t *testing.T) {
+	root := t.TempDir()
+	oldPath := filepath.Join(root, "old-checkout")
+	newPath := filepath.Join(root, "new-checkout")
+	cfg, err := config.DefaultConfig(root)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Providers = []config.ProviderConfig{{ID: "github-enterprise", Kind: config.ProviderKindGitHub, BaseURL: "https://github.example.com"}}
+	cfg.Projects = []config.ProjectRefConfig{{ID: "enterprise", Name: "Enterprise", Provider: "github-enterprise", Repo: "acme/enterprise", RepoPath: oldPath}}
+
+	var calls []shell.Options
+	gateway := githubinfra.New(githubinfra.Options{
+		GHPath: "gh",
+		GHRun: func(_ context.Context, options shell.Options) (shell.Result, error) {
+			calls = append(calls, options)
+			args := strings.Join(options.Args, " ")
+			switch {
+			case strings.HasPrefix(args, "pr view 42 --repo github.example.com/acme/enterprise --json "):
+				return shell.Result{Stdout: `{"number":42,"headRefOid":"head","baseRefOid":"base","title":"Enterprise PR"}`}, nil
+			case strings.Contains(args, "reviewThreads(first: 100, after: $after)"):
+				return shell.Result{Stdout: `{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`}, nil
+			case strings.HasPrefix(args, "api --paginate repos/acme/enterprise/issues/42/comments "):
+				return shell.Result{Stdout: "[]"}, nil
+			case strings.HasPrefix(args, "pr diff 42 --repo github.example.com/acme/enterprise"):
+				return shell.Result{Stdout: "diff --git a/a.go b/a.go\n"}, nil
+			default:
+				return shell.Result{}, fmt.Errorf("unexpected gh args: %s", args)
+			}
+		},
+	})
+	coordinator := openMigratedCoordinator(t, filepath.Join(root, "snapshot-path-change.sqlite"), t.TempDir())
+	repos := storage.NewRepositories(coordinator.DB())
+	catalog := projects.NewCatalog(cfg)
+	now := time.Date(2026, time.July, 31, 10, 0, 0, 0, time.UTC)
+	service := &projects.Service{DB: coordinator.DB(), Repos: repos, ConfigSource: catalog, Now: func() time.Time { return now }}
+	if err := service.SyncConfigured(context.Background(), cfg, now); err != nil {
+		t.Fatalf("SyncConfigured(old path) error = %v", err)
+	}
+	projectID := "enterprise"
+	repo := "acme/enterprise"
+	prNumber := int64(42)
+	payload := `{"cwd":"` + oldPath + `"}`
+	nowISO := formatJavaScriptISOString(now)
+	queueItem := storage.QueueItemRecord{ID: "queue_snapshot_path_change", ProjectID: &projectID, Type: "snapshot", TargetType: "pull_request", TargetID: repo + "#42", Repo: &repo, PRNumber: &prNumber, PayloadJSON: &payload, DedupeKey: "snapshot:" + repo + ":42:path-change", Priority: storage.QueuePrioritySnapshot, Status: "running", AvailableAt: nowISO, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := repos.Queue.Upsert(context.Background(), queueItem); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	updatedCfg := config.CloneConfig(cfg)
+	updatedCfg.Projects[0].RepoPath = newPath
+	if err := service.SyncConfigured(context.Background(), updatedCfg, now.Add(time.Minute)); err != nil {
+		t.Fatalf("SyncConfigured(new path) error = %v", err)
+	}
+	records, err := repos.Projects.List(context.Background())
+	if err != nil {
+		t.Fatalf("Projects.List() error = %v", err)
+	}
+	materialized, err := projects.MaterializeCatalog(updatedCfg, records)
+	if err != nil {
+		t.Fatalf("MaterializeCatalog() error = %v", err)
+	}
+	catalog.PublishGlobals(updatedCfg)
+	catalog.Publish(materialized)
+	current := catalog.Snapshot()
+	if len(current.Projects) != 1 || current.Projects[0].RepoPath != newPath {
+		t.Fatalf("catalog projects = %#v, want current path %q", current.Projects, newPath)
+	}
+
+	if err := processSnapshotQueueItem(context.Background(), queueItem, defaultSchedulerTickInput{Repos: repos, Config: &current, Snapshotter: gateway, Now: func() time.Time { return now }}); err != nil {
+		t.Fatalf("processSnapshotQueueItem() error = %v", err)
+	}
+	stored, err := repos.PullRequestSnapshots.GetLatestByProject(context.Background(), projectID, repo, prNumber)
+	if err != nil || stored == nil {
+		t.Fatalf("GetLatestByProject() = %#v, %v; want logical snapshot", stored, err)
+	}
+	if len(calls) != 4 {
+		t.Fatalf("gh calls = %#v, want PR, review-thread, issue-comment, and diff commands", calls)
+	}
+	for _, call := range calls {
+		args := strings.Join(call.Args, " ")
+		if call.CWD != oldPath {
+			t.Errorf("gh CWD = %q, want queued checkout %q", call.CWD, oldPath)
+		}
+		if strings.HasPrefix(args, "pr view ") || strings.HasPrefix(args, "pr diff ") {
+			if !strings.Contains(args, "--repo github.example.com/acme/enterprise") {
+				t.Errorf("gh pull-request command = %q, want GHES-qualified queued repo", args)
+			}
+			continue
+		}
+		if !strings.Contains(args, "--hostname github.example.com") {
+			t.Errorf("gh nested fetch = %q, want current GHES provider hostname", args)
+		}
+	}
+}
+
 func TestReviewThreadCommandsPreserveConfiguredGHESPort(t *testing.T) {
 	ghesPath := filepath.Join(t.TempDir(), "ghes")
 	cfg := config.Config{

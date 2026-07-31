@@ -1171,36 +1171,52 @@ func (a fixerGitHubAdapter) AddReviewThreadReply(ctx context.Context, input fixe
 	return a.gateway.AddReviewThreadReply(ctx, githubinfra.AddReviewThreadReplyInput{Repo: repo, ThreadID: input.ThreadID, Body: body, CWD: input.CWD})
 }
 
-// reviewThreadRepo adds the configured provider hostname to the caller's
-// repository slug. The caller owns the slug because durable work may predate a
-// project update; the current catalog owns only the provider transport.
+// reviewThreadRepo adds the provider hostname selected by the live checkout.
 func reviewThreadRepo(cfg *config.Config, repo, cwd string) (string, error) {
 	if cfg == nil {
 		return repo, nil
 	}
 	for _, project := range cfg.Projects {
-		if filepath.Clean(project.RepoPath) != filepath.Clean(cwd) {
-			continue
+		if filepath.Clean(project.RepoPath) == filepath.Clean(cwd) {
+			return qualifyProjectRepo(*cfg, project, repo)
 		}
-		_, repoSlug := githubinfra.SplitRepoHostname(repo)
-		if strings.TrimSpace(repoSlug) == "" {
-			return "", fmt.Errorf("repository identity is not configured for project %s", project.ID)
-		}
-		project.Repo = repoSlug
-		identity, ok := config.ProjectRepositoryIdentity(*cfg, project)
-		if !ok {
-			return "", fmt.Errorf("repository identity is not configured for project %s", project.ID)
-		}
-		baseURL, err := url.Parse(identity.BaseURL)
-		if err != nil || strings.TrimSpace(baseURL.Hostname()) == "" || strings.TrimSpace(baseURL.Host) == "" {
-			return "", fmt.Errorf("github provider hostname is not configured for project %s", project.ID)
-		}
-		if isPublicGitHubHostname(baseURL.Hostname()) {
-			return identity.Repo, nil
-		}
-		return strings.TrimSpace(baseURL.Host) + "/" + identity.Repo, nil
 	}
 	return repo, nil
+}
+
+// reviewThreadRepoForProject adds the current provider hostname by durable
+// project identity. The operation owns its queued slug and CWD; both may
+// predate a config-managed path change.
+func reviewThreadRepoForProject(cfg *config.Config, projectID, repo string) (string, error) {
+	if cfg == nil {
+		return repo, nil
+	}
+	for _, project := range cfg.Projects {
+		if project.ID == strings.TrimSpace(projectID) {
+			return qualifyProjectRepo(*cfg, project, repo)
+		}
+	}
+	return "", fmt.Errorf("repository provider is not configured for project %s", projectID)
+}
+
+func qualifyProjectRepo(cfg config.Config, project config.ProjectRefConfig, repo string) (string, error) {
+	_, repoSlug := githubinfra.SplitRepoHostname(repo)
+	if strings.TrimSpace(repoSlug) == "" {
+		return "", fmt.Errorf("repository identity is not configured for project %s", project.ID)
+	}
+	project.Repo = repoSlug
+	identity, ok := config.ProjectRepositoryIdentity(cfg, project)
+	if !ok {
+		return "", fmt.Errorf("repository identity is not configured for project %s", project.ID)
+	}
+	baseURL, err := url.Parse(identity.BaseURL)
+	if err != nil || strings.TrimSpace(baseURL.Hostname()) == "" || strings.TrimSpace(baseURL.Host) == "" {
+		return "", fmt.Errorf("github provider hostname is not configured for project %s", project.ID)
+	}
+	if isPublicGitHubHostname(baseURL.Hostname()) {
+		return identity.Repo, nil
+	}
+	return strings.TrimSpace(baseURL.Host) + "/" + identity.Repo, nil
 }
 
 func isPublicGitHubHostname(hostname string) bool {
@@ -3636,7 +3652,7 @@ func processSnapshotQueueItem(ctx context.Context, item storage.QueueItemRecord,
 	if now == nil {
 		now = time.Now
 	}
-	transportRepo, err := reviewThreadRepo(input.Config, *item.Repo, cwd)
+	transportRepo, err := reviewThreadRepoForProject(input.Config, *item.ProjectID, *item.Repo)
 	if err != nil {
 		return failSnapshotQueueItem(ctx, item, input, err.Error(), "retryable_transient")
 	}
