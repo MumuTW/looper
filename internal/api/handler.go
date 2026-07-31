@@ -7665,7 +7665,7 @@ func (h *Handler) buildUpdateProjectResponse(r *http.Request, service projectSer
 	updated, err := service.UpdateProject(r.Context(), identifier, projects.UpdateInput{
 		Repo: updateProjectField(body.Repo), Name: updateProjectField(body.Name),
 		BaseBranch: updateProjectField(body.BaseBranch), WorktreeRoot: updateProjectField(body.WorktreeRoot),
-		Validation: cloneProjectValidation(body.Validation),
+		Validation: body.Validation,
 	})
 	if err != nil {
 		var notFound projects.ProjectNotFoundError
