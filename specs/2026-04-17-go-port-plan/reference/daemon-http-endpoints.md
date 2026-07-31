@@ -199,6 +199,17 @@ does not authorize or perform a merge.
   - invalid ids/body values return `400 VALIDATION_FAILED`
   - id collision returns `409 PROJECT_ID_CONFLICT`
 
+### `PATCH /api/v1/projects/:id`
+
+- Existing project field updates remain available for API-managed projects.
+- `gatekeeperTrust` is an optional explicit promotion target: `advise` or
+  `auto`. Promotion is monotonic (`observe → advise → auto`) and is persisted
+  in the existing project role metadata.
+- Config-managed projects reject this field with a validation error; their
+  declared configuration remains the authority.
+- The serialized project includes `gatekeeperTrust` for non-default levels;
+  an omitted value means `observe`.
+
 ### `GET /api/v1/runs`
 
 - Route registration: `apps/looperd/src/server/index.ts:163-166`

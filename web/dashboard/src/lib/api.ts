@@ -415,6 +415,8 @@ export type Project = {
   provider: string;
   repo?: string | null;
   worktreeRoot?: string | null;
+  /** Omitted by the daemon when the effective level is the default observe. */
+  gatekeeperTrust?: "advise" | "auto" | null;
   createdAt: string;
   updatedAt: string;
 };

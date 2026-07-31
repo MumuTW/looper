@@ -245,6 +245,10 @@ type UpdateInput struct {
 	BaseBranch   UpdateStringField
 	WorktreeRoot UpdateStringField
 	Validation   *config.ProjectValidationConfig
+	// GatekeeperTrust is an explicit, monotonic operator promotion. It is
+	// stored in the existing API-managed project role metadata so the
+	// materialized project catalog remains the runtime authority.
+	GatekeeperTrust UpdateStringField
 }
 
 type AddResult struct {
@@ -638,7 +642,7 @@ func (s *Service) UpdateProject(ctx context.Context, identifier string, input Up
 	if s.Repos == nil || s.Repos.Projects == nil {
 		return storage.ProjectRecord{}, fmt.Errorf("projects repository is not configured")
 	}
-	if !input.Repo.Set && !input.Name.Set && !input.BaseBranch.Set && !input.WorktreeRoot.Set && input.Validation == nil {
+	if !input.Repo.Set && !input.Name.Set && !input.BaseBranch.Set && !input.WorktreeRoot.Set && input.Validation == nil && !input.GatekeeperTrust.Set {
 		return storage.ProjectRecord{}, ProjectValidationError{Message: "at least one project field is required"}
 	}
 
@@ -672,6 +676,9 @@ func (s *Service) UpdateProject(ctx context.Context, identifier string, input Up
 	}
 	metadata := parseMetadata(project.MetadataJSON)
 	if metadataString(metadata, "source") == "config" {
+		if input.GatekeeperTrust.Set {
+			return storage.ProjectRecord{}, ProjectValidationError{Message: fmt.Sprintf("project %s is managed by config; promote Gatekeeper trust by editing roles.gatekeeper.trust in that config", project.ID)}
+		}
 		return storage.ProjectRecord{}, ProjectValidationError{Message: fmt.Sprintf("project %s is managed by config and cannot be changed through the project API", project.ID)}
 	}
 
@@ -723,14 +730,20 @@ func (s *Service) UpdateProject(ctx context.Context, identifier string, input Up
 			OptOut:   input.Validation.OptOut,
 		}
 	}
-	// A legacy inert record that gains repository metadata leaves the repair
-	// exception, so it must carry an effective stance immediately —
-	// independently of whether a coding agent is currently configured.
-	// Otherwise enabling Worker or Fixer later turns the stored row into a
-	// startup failure with no running PATCH API left to repair it.
-	if IsLegacyInertProject(*project) && metadataString(metadata, "repo") != "" {
-		if _, hasValidation := metadata["validation"]; !hasValidation && len(config.ResolveValidationCommands(s.currentConfig())) == 0 {
-			return storage.ProjectRecord{}, ProjectValidationError{Message: "adding repository metadata requires validation commands or optOut=true in the same request while defaults.validationCommands is empty"}
+	if input.GatekeeperTrust.Set {
+		if input.GatekeeperTrust.Value == nil {
+			return storage.ProjectRecord{}, ProjectValidationError{Message: "gatekeeperTrust must be advise or auto when promoting a project"}
+		}
+		target, err := parseGatekeeperPromotionTarget(*input.GatekeeperTrust.Value)
+		if err != nil {
+			return storage.ProjectRecord{}, ProjectValidationError{Message: err.Error()}
+		}
+		current := effectiveGatekeeperTrust(s.currentConfig(), project.ID)
+		if gatekeeperTrustRank(target) <= gatekeeperTrustRank(current) {
+			return storage.ProjectRecord{}, ProjectValidationError{Message: fmt.Sprintf("gatekeeper trust promotion must advance from %s to a higher level (requested %s)", current, target)}
+		}
+		if err := setProjectGatekeeperTrust(metadata, target); err != nil {
+			return storage.ProjectRecord{}, ProjectValidationError{Message: err.Error()}
 		}
 	}
 
@@ -767,6 +780,14 @@ func (s *Service) UpdateProject(ctx context.Context, identifier string, input Up
 		next, materializeErr := s.materializeCandidate(ctx, &updated, "")
 		if materializeErr != nil {
 			return ProjectValidationError{Message: materializeErr.Error()}
+		}
+		if input.GatekeeperTrust.Set {
+			candidate := s.currentConfig()
+			candidate.Projects = next
+			roles := config.ProjectRoleConfigs(candidate, updated.ID)
+			if roles.Gatekeeper.Trust == config.GatekeeperTrustAuto && roles.Reviewer.AutoMerge.Enabled {
+				return ProjectValidationError{Message: `"auto" cannot be combined with roles.reviewer.autoMerge.enabled: disable one, and prefer Gatekeeper because it also gates on unresolved review threads and requested changes`}
+			}
 		}
 		if upsertErr := s.Repos.Projects.Upsert(ctx, updated); upsertErr != nil {
 			return upsertErr
@@ -1595,6 +1616,59 @@ func (s *Service) currentConfig() config.Config {
 		return config.Config{}
 	}
 	return s.Config
+}
+
+func parseGatekeeperPromotionTarget(value string) (config.GatekeeperTrustLevel, error) {
+	target := config.GatekeeperTrustLevel(strings.ToLower(strings.TrimSpace(value)))
+	switch target {
+	case config.GatekeeperTrustAdvise, config.GatekeeperTrustAuto:
+		return target, nil
+	default:
+		return "", fmt.Errorf("gatekeeperTrust must be one of: %s, %s", config.GatekeeperTrustAdvise, config.GatekeeperTrustAuto)
+	}
+}
+
+func effectiveGatekeeperTrust(cfg config.Config, projectID string) config.GatekeeperTrustLevel {
+	trust := config.ProjectRoleConfigs(cfg, projectID).Gatekeeper.Trust
+	trust = config.GatekeeperTrustLevel(strings.ToLower(strings.TrimSpace(string(trust))))
+	if trust == "" {
+		return config.GatekeeperTrustObserve
+	}
+	return trust
+}
+
+func gatekeeperTrustRank(trust config.GatekeeperTrustLevel) int {
+	switch trust {
+	case config.GatekeeperTrustAdvise:
+		return 1
+	case config.GatekeeperTrustAuto:
+		return 2
+	default:
+		return 0
+	}
+}
+
+func setProjectGatekeeperTrust(metadata map[string]any, trust config.GatekeeperTrustLevel) error {
+	roles := map[string]any{}
+	if raw, exists := metadata["roles"]; exists && raw != nil {
+		var ok bool
+		roles, ok = raw.(map[string]any)
+		if !ok {
+			return fmt.Errorf("project roles metadata must be an object before Gatekeeper promotion")
+		}
+	}
+	gatekeeper := map[string]any{}
+	if raw, exists := roles["gatekeeper"]; exists && raw != nil {
+		var ok bool
+		gatekeeper, ok = raw.(map[string]any)
+		if !ok {
+			return fmt.Errorf("project roles.gatekeeper metadata must be an object before promotion")
+		}
+	}
+	gatekeeper["trust"] = string(trust)
+	roles["gatekeeper"] = gatekeeper
+	metadata["roles"] = roles
+	return nil
 }
 
 func (s *Service) materializeCandidate(ctx context.Context, replacement *storage.ProjectRecord, archiveID string) ([]config.ProjectRefConfig, error) {
