@@ -11,6 +11,7 @@ import (
 	"github.com/MumuTW/looper/internal/fixer"
 	githubinfra "github.com/MumuTW/looper/internal/infra/github"
 	"github.com/MumuTW/looper/internal/infra/shell"
+	"github.com/MumuTW/looper/internal/reviewer"
 )
 
 func TestCodingRoleIdentityLookupsUseProjectProviderHostname(t *testing.T) {
@@ -128,5 +129,83 @@ func TestFixerReviewThreadCommandsUseConfiguredProviderHostname(t *testing.T) {
 		if !strings.HasSuffix(call, "--hostname github.example.com") {
 			t.Fatalf("gh call = %q, want configured GHES hostname", call)
 		}
+	}
+}
+
+func TestReviewerAndGatekeeperReviewThreadCommandsUseConfiguredProviderHostname(t *testing.T) {
+	ghesPath := filepath.Join(t.TempDir(), "ghes")
+	cfg := config.Config{
+		Providers: []config.ProviderConfig{{ID: "github-enterprise", Kind: config.ProviderKindGitHub, BaseURL: "https://github.example.com"}},
+		Projects:  []config.ProjectRefConfig{{ID: "enterprise", Provider: "github-enterprise", Repo: "acme/enterprise", RepoPath: ghesPath}},
+	}
+	var calls []string
+	gateway := githubinfra.New(githubinfra.Options{
+		GHPath: "gh",
+		GHRun: func(_ context.Context, options shell.Options) (shell.Result, error) {
+			args := strings.Join(options.Args, " ")
+			calls = append(calls, args)
+			switch {
+			case strings.Contains(args, "reviewThreads(first: $limit, after: $after)"):
+				return shell.Result{Stdout: `{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`}, nil
+			case strings.Contains(args, "addPullRequestReviewThreadReply"):
+				return shell.Result{Stdout: `{"data":{"addPullRequestReviewThreadReply":{"comment":{"id":"comment-1"}}}}`}, nil
+			case strings.Contains(args, "resolveReviewThread"):
+				return shell.Result{Stdout: `{"data":{"resolveReviewThread":{"thread":{"id":"thread-1","isResolved":true}}}}`}, nil
+			case strings.Contains(args, "query($threadId: ID!)"):
+				return shell.Result{Stdout: `{"data":{"node":{"id":"thread-1","isResolved":false}}}`}, nil
+			default:
+				return shell.Result{}, fmt.Errorf("unexpected gh args: %s", args)
+			}
+		},
+	})
+	reviewerAdapter := reviewerGitHubAdapter{config: &cfg, gateway: gateway}
+	if _, err := reviewerAdapter.ListReviewThreads(context.Background(), reviewer.ListReviewThreadsInput{Repo: "acme/not-authoritative", PRNumber: 42, CWD: ghesPath, Limit: 10}); err != nil {
+		t.Fatalf("ListReviewThreads() error = %v", err)
+	}
+	if err := reviewerAdapter.AddReviewThreadReply(context.Background(), reviewer.AddReviewThreadReplyInput{Repo: "acme/not-authoritative", ThreadID: "thread-1", Body: "fixed", CWD: ghesPath}); err != nil {
+		t.Fatalf("AddReviewThreadReply() error = %v", err)
+	}
+	if err := reviewerAdapter.ResolveReviewThread(context.Background(), reviewer.ResolveReviewThreadInput{Repo: "acme/not-authoritative", ThreadID: "thread-1", CWD: ghesPath}); err != nil {
+		t.Fatalf("ResolveReviewThread() error = %v", err)
+	}
+	gatekeeperAdapter := gatekeeperGitHubAdapter{Gateway: gateway, config: &cfg}
+	if _, err := gatekeeperAdapter.ListReviewThreads(context.Background(), githubinfra.ListReviewThreadsInput{Repo: "acme/not-authoritative", PRNumber: 42, CWD: ghesPath, Limit: 10}); err != nil {
+		t.Fatalf("gatekeeper ListReviewThreads() error = %v", err)
+	}
+
+	if len(calls) != 5 {
+		t.Fatalf("gh calls = %#v, want reviewer list/reply/read/resolve and gatekeeper list", calls)
+	}
+	for _, call := range calls {
+		if !strings.HasSuffix(call, "--hostname github.example.com") {
+			t.Fatalf("gh call = %q, want configured GHES hostname", call)
+		}
+	}
+}
+
+func TestReviewThreadCommandsTreatGitHubAPIHostnameAsPublic(t *testing.T) {
+	githubPath := filepath.Join(t.TempDir(), "github")
+	cfg := config.Config{
+		Providers: []config.ProviderConfig{{ID: "github-cloud", Kind: config.ProviderKindGitHub, BaseURL: "https://api.github.com"}},
+		Projects:  []config.ProjectRefConfig{{ID: "cloud", Provider: "github-cloud", Repo: "acme/cloud", RepoPath: githubPath}},
+	}
+	var calls []string
+	gateway := githubinfra.New(githubinfra.Options{
+		GHPath: "gh",
+		GHRun: func(_ context.Context, options shell.Options) (shell.Result, error) {
+			args := strings.Join(options.Args, " ")
+			calls = append(calls, args)
+			if !strings.Contains(args, "reviewThreads(first: $limit, after: $after)") {
+				return shell.Result{}, fmt.Errorf("unexpected gh args: %s", args)
+			}
+			return shell.Result{Stdout: `{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`}, nil
+		},
+	})
+	adapter := reviewerGitHubAdapter{config: &cfg, gateway: gateway}
+	if _, err := adapter.ListReviewThreads(context.Background(), reviewer.ListReviewThreadsInput{Repo: "acme/not-authoritative", PRNumber: 42, CWD: githubPath, Limit: 10}); err != nil {
+		t.Fatalf("ListReviewThreads() error = %v", err)
+	}
+	if len(calls) != 1 || strings.Contains(calls[0], "--hostname") {
+		t.Fatalf("gh calls = %#v, want public GitHub command without hostname selector", calls)
 	}
 }

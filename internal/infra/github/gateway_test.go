@@ -1332,9 +1332,14 @@ func TestGatewayListReviewThreadsPaginatesThreadsAndComments(t *testing.T) {
 		t.Fatalf("threads[100] = %#v, want second paginated thread", threads[100])
 	}
 	log := strings.Join(runner.calls, "\n")
-	for _, needle := range []string{"limit=100", "after=thread-cursor-1", "threadId=thread-1", "after=comment-cursor-1", "--hostname code.example.test"} {
+	for _, needle := range []string{"limit=100", "after=thread-cursor-1", "threadId=thread-1", "after=comment-cursor-1"} {
 		if !strings.Contains(log, needle) {
 			t.Fatalf("gh log missing %q\n%s", needle, log)
+		}
+	}
+	for _, call := range runner.calls {
+		if !strings.Contains(call, "--hostname code.example.test") {
+			t.Fatalf("gh call = %q, want configured hostname", call)
 		}
 	}
 }

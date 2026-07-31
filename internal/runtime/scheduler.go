@@ -726,7 +726,11 @@ func (a reviewerGitHubAdapter) ListReviewThreads(ctx context.Context, input revi
 	if a.gateway == nil {
 		return nil, fmt.Errorf("github gateway is not configured")
 	}
-	threads, err := a.gateway.ListReviewThreads(ctx, githubinfra.ListReviewThreadsInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD, Limit: input.Limit})
+	repo, err := reviewThreadRepo(a.config, input.Repo, input.CWD)
+	if err != nil {
+		return nil, err
+	}
+	threads, err := a.gateway.ListReviewThreads(ctx, githubinfra.ListReviewThreadsInput{Repo: repo, PRNumber: input.PRNumber, CWD: input.CWD, Limit: input.Limit})
 	if err != nil {
 		return nil, err
 	}
@@ -745,15 +749,23 @@ func (a reviewerGitHubAdapter) AddReviewThreadReply(ctx context.Context, input r
 	if a.gateway == nil {
 		return fmt.Errorf("github gateway is not configured")
 	}
+	repo, err := reviewThreadRepo(a.config, input.Repo, input.CWD)
+	if err != nil {
+		return err
+	}
 	body := a.stamper.WithIdentity(input.DisclosureAgent, input.DisclosureModel).ReviewComment(input.Body, "reviewer")
-	return a.gateway.AddReviewThreadReply(ctx, githubinfra.AddReviewThreadReplyInput{Repo: input.Repo, ThreadID: input.ThreadID, Body: body, CWD: input.CWD})
+	return a.gateway.AddReviewThreadReply(ctx, githubinfra.AddReviewThreadReplyInput{Repo: repo, ThreadID: input.ThreadID, Body: body, CWD: input.CWD})
 }
 
 func (a reviewerGitHubAdapter) ResolveReviewThread(ctx context.Context, input reviewer.ResolveReviewThreadInput) error {
 	if a.gateway == nil {
 		return fmt.Errorf("github gateway is not configured")
 	}
-	return a.gateway.ResolveReviewThread(ctx, githubinfra.ResolveReviewThreadInput{Repo: input.Repo, ThreadID: input.ThreadID, CWD: input.CWD})
+	repo, err := reviewThreadRepo(a.config, input.Repo, input.CWD)
+	if err != nil {
+		return err
+	}
+	return a.gateway.ResolveReviewThread(ctx, githubinfra.ResolveReviewThreadInput{Repo: repo, ThreadID: input.ThreadID, CWD: input.CWD})
 }
 
 type reviewerAgentExecutorAdapter struct {
@@ -1094,7 +1106,7 @@ func commentInfosToObjects(items []githubinfra.CommentInfo) []map[string]any {
 }
 
 func (a fixerGitHubAdapter) ListReviewThreads(ctx context.Context, input fixer.ListReviewThreadsInput) ([]fixer.ReviewThread, error) {
-	repo, err := a.reviewThreadRepo(input.Repo, input.CWD)
+	repo, err := reviewThreadRepo(a.config, input.Repo, input.CWD)
 	if err != nil {
 		return nil, err
 	}
@@ -1114,7 +1126,7 @@ func (a fixerGitHubAdapter) ListReviewThreads(ctx context.Context, input fixer.L
 }
 
 func (a fixerGitHubAdapter) ViewReviewThread(ctx context.Context, input fixer.ViewReviewThreadInput) (fixer.ReviewThread, error) {
-	repo, err := a.reviewThreadRepo(input.Repo, input.CWD)
+	repo, err := reviewThreadRepo(a.config, input.Repo, input.CWD)
 	if err != nil {
 		return fixer.ReviewThread{}, err
 	}
@@ -1131,7 +1143,7 @@ func (a fixerGitHubAdapter) ViewReviewThread(ctx context.Context, input fixer.Vi
 }
 
 func (a fixerGitHubAdapter) ResolveReviewThread(ctx context.Context, input fixer.ResolveReviewThreadInput) error {
-	repo, err := a.reviewThreadRepo(input.Repo, input.CWD)
+	repo, err := reviewThreadRepo(a.config, input.Repo, input.CWD)
 	if err != nil {
 		return err
 	}
@@ -1139,7 +1151,7 @@ func (a fixerGitHubAdapter) ResolveReviewThread(ctx context.Context, input fixer
 }
 
 func (a fixerGitHubAdapter) AddReviewThreadReply(ctx context.Context, input fixer.AddReviewThreadReplyInput) error {
-	repo, err := a.reviewThreadRepo(input.Repo, input.CWD)
+	repo, err := reviewThreadRepo(a.config, input.Repo, input.CWD)
 	if err != nil {
 		return err
 	}
@@ -1151,18 +1163,18 @@ func (a fixerGitHubAdapter) AddReviewThreadReply(ctx context.Context, input fixe
 // gateway's host-qualified repository identity. The scheduler's discovery repo
 // is intentionally only an owner/slug; it must not decide which gh host reads
 // or mutates review threads.
-func (a fixerGitHubAdapter) reviewThreadRepo(repo, cwd string) (string, error) {
-	if a.config == nil {
+func reviewThreadRepo(cfg *config.Config, repo, cwd string) (string, error) {
+	if cfg == nil {
 		return repo, nil
 	}
-	for _, project := range a.config.Projects {
+	for _, project := range cfg.Projects {
 		if filepath.Clean(project.RepoPath) != filepath.Clean(cwd) {
 			continue
 		}
 		if strings.TrimSpace(project.Repo) == "" {
 			project.Repo = repo
 		}
-		identity, ok := config.ProjectRepositoryIdentity(*a.config, project)
+		identity, ok := config.ProjectRepositoryIdentity(*cfg, project)
 		if !ok {
 			return "", fmt.Errorf("repository identity is not configured for project %s", project.ID)
 		}
@@ -1170,9 +1182,39 @@ func (a fixerGitHubAdapter) reviewThreadRepo(repo, cwd string) (string, error) {
 		if err != nil || strings.TrimSpace(baseURL.Hostname()) == "" {
 			return "", fmt.Errorf("github provider hostname is not configured for project %s", project.ID)
 		}
-		return baseURL.Hostname() + "/" + identity.Repo, nil
+		hostname := strings.TrimSpace(baseURL.Hostname())
+		if isPublicGitHubHostname(hostname) {
+			return identity.Repo, nil
+		}
+		return hostname + "/" + identity.Repo, nil
 	}
 	return repo, nil
+}
+
+func isPublicGitHubHostname(hostname string) bool {
+	switch {
+	case strings.EqualFold(hostname, "github.com"), strings.EqualFold(hostname, "www.github.com"), strings.EqualFold(hostname, "api.github.com"):
+		return true
+	default:
+		return false
+	}
+}
+
+// gatekeeperGitHubAdapter supplies the provider-qualified repository identity
+// only for review-thread operations. All other gatekeeper calls retain their
+// owner/slug repository contract.
+type gatekeeperGitHubAdapter struct {
+	*githubinfra.Gateway
+	config *config.Config
+}
+
+func (a gatekeeperGitHubAdapter) ListReviewThreads(ctx context.Context, input githubinfra.ListReviewThreadsInput) ([]githubinfra.ReviewThread, error) {
+	repo, err := reviewThreadRepo(a.config, input.Repo, input.CWD)
+	if err != nil {
+		return nil, err
+	}
+	input.Repo = repo
+	return a.Gateway.ListReviewThreads(ctx, input)
 }
 
 func (a fixerGitHubAdapter) CompareCommits(ctx context.Context, input fixer.CompareCommitsInput) (fixer.CompareCommitsResult, error) {
@@ -1748,7 +1790,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 	if githubGateway != nil {
 		gatekeeperRunner = gatekeeper.New(gatekeeper.Options{
 			Repos:  repos,
-			GitHub: githubGateway,
+			GitHub: gatekeeperGitHubAdapter{Gateway: githubGateway, config: &cfg},
 			Now:    now,
 			TrustForProject: func(projectID string) config.GatekeeperTrustLevel {
 				return gatekeeperTrustForProject(cfg, projectID)
