@@ -3185,6 +3185,18 @@ func (r *WorktreesRepository) AdoptPath(ctx context.Context, record WorktreeReco
 }
 
 func (r *WorktreesRepository) adoptPath(ctx context.Context, record WorktreeRecord) error {
+	pathRecord, err := r.GetByPath(ctx, record.WorktreePath)
+	if err != nil {
+		return err
+	}
+	// A retired record is provenance for an abandoned physical checkout. Once
+	// RestoreWorktree has proved that checkout missing and CreateWorktree has
+	// recreated the path, the new durable claim replaces that provenance.
+	if pathRecord != nil && pathRecord.ID != record.ID && pathRecord.Status == "retired" {
+		if err := r.Delete(ctx, pathRecord.ID); err != nil {
+			return fmt.Errorf("delete retired worktree %q before path adoption: %w", pathRecord.ID, err)
+		}
+	}
 	branchRecord, err := r.GetByBranch(ctx, record.ProjectID, record.Branch)
 	if err != nil {
 		return err
@@ -3216,20 +3228,29 @@ func (r *WorktreesRepository) Delete(ctx context.Context, id string) error {
 	return nil
 }
 
-// DeleteByProject removes worktree identities for a project that Looper no
-// longer manages. The physical checkouts are deliberately left untouched: a
-// project handoff must not discard potentially dirty work, but its replacement
-// must not inherit those records under the reused project ID.
-func (r *WorktreesRepository) DeleteByProject(ctx context.Context, projectID string) (int64, error) {
-	result, err := r.q.ExecContext(ctx, `DELETE FROM worktrees WHERE project_id = ?`, projectID)
+// RetireByProject keeps enough durable provenance to distinguish a checkout
+// deliberately left behind by a project handoff from an interrupted creation
+// that has not yet reached AdoptPath. Physical checkouts are deliberately left
+// untouched: a handoff must not discard potentially dirty work, and a later
+// CreateWorktree must refuse to adopt it.
+func (r *WorktreesRepository) RetireByProject(ctx context.Context, projectID, updatedAt string) (int64, error) {
+	records, err := r.ListByProject(ctx, projectID)
 	if err != nil {
-		return 0, fmt.Errorf("delete worktrees by project: %w", err)
+		return 0, err
 	}
-	affected, err := result.RowsAffected()
-	if err != nil {
-		return 0, fmt.Errorf("read delete worktrees by project rows affected: %w", err)
+	for _, record := range records {
+		if record.Status == "retired" {
+			continue
+		}
+		retired := record
+		retired.Status = "retired"
+		retired.Branch = fmt.Sprintf("retired/%s/%s", record.ID, strings.ReplaceAll(record.Branch, "/", "-"))
+		retired.UpdatedAt = updatedAt
+		if err := r.Upsert(ctx, retired); err != nil {
+			return 0, fmt.Errorf("retire worktree %q: %w", record.ID, err)
+		}
 	}
-	return affected, nil
+	return int64(len(records)), nil
 }
 
 func (r *WorktreesRepository) GetByID(ctx context.Context, id string) (*WorktreeRecord, error) {
@@ -3307,7 +3328,7 @@ func (r *WorktreesRepository) ListCleanupCandidates(ctx context.Context, limit i
 	rows, err := r.q.QueryContext(ctx, `
 		SELECT *
 		FROM worktrees
-		WHERE status != 'cleaned'
+		WHERE status NOT IN ('cleaned', 'retired')
 		ORDER BY updated_at ASC
 		LIMIT ?
 	`, limit)
@@ -3320,7 +3341,7 @@ func (r *WorktreesRepository) ListCleanupCandidates(ctx context.Context, limit i
 }
 
 func (r *WorktreesRepository) ListActive(ctx context.Context) ([]WorktreeRecord, error) {
-	rows, err := r.q.QueryContext(ctx, `SELECT * FROM worktrees WHERE cleaned_at IS NULL ORDER BY updated_at ASC, created_at ASC`)
+	rows, err := r.q.QueryContext(ctx, `SELECT * FROM worktrees WHERE cleaned_at IS NULL AND status != 'retired' ORDER BY updated_at ASC, created_at ASC`)
 	if err != nil {
 		return nil, fmt.Errorf("list active worktrees: %w", err)
 	}

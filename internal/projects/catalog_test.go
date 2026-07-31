@@ -294,16 +294,13 @@ func TestMaterializeCatalogRejectsUnknownProvider(t *testing.T) {
 	}
 }
 
-func TestMaterializeCatalogIgnoresLegacyAPIProviderBinding(t *testing.T) {
+func TestMaterializeCatalogRejectsUnreconciledLegacyAPIProviderBinding(t *testing.T) {
 	t.Parallel()
 
 	metadata := `{"provider":"removed","repo":"core/odcrew","source":"api"}`
-	got, err := MaterializeCatalog(config.Config{}, []storage.ProjectRecord{{ID: "odcrew", MetadataJSON: &metadata}})
-	if err != nil {
-		t.Fatalf("MaterializeCatalog() error = %v", err)
-	}
-	if len(got) != 1 || got[0].Provider != "" || got[0].Repo != "core/odcrew" {
-		t.Fatalf("MaterializeCatalog() = %#v, want legacy API provider binding ignored", got)
+	_, err := MaterializeCatalog(config.Config{}, []storage.ProjectRecord{{ID: "odcrew", MetadataJSON: &metadata}})
+	if err == nil || !strings.Contains(err.Error(), `unknown provider "removed"`) {
+		t.Fatalf("MaterializeCatalog() error = %v, want unreconciled legacy provider rejected", err)
 	}
 }
 

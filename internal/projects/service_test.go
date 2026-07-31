@@ -1183,8 +1183,8 @@ func TestServiceRemoveProjectArchivesProjectAndPreservesHistory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Worktrees.ListByProject() error = %v", err)
 	}
-	if len(worktrees) != 0 {
-		t.Fatalf("Worktrees.ListByProject() = %#v, want retired identities after project archive", worktrees)
+	if len(worktrees) != 1 || worktrees[0].Status != "retired" {
+		t.Fatalf("Worktrees.ListByProject() = %#v, want retained retirement provenance after project archive", worktrees)
 	}
 }
 

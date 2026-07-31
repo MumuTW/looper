@@ -129,13 +129,6 @@ func MaterializeCatalog(global config.Config, records []storage.ProjectRecord) (
 
 		metadata := parseMetadata(record.MetadataJSON)
 		provider := metadataString(metadata, "provider")
-		// Provider bindings became configuration-owned. Older releases persisted
-		// them on API projects, so ignore that stale field while startup sync
-		// durably removes it; otherwise a provider removed from config prevents
-		// looperd from starting and repairing the record.
-		if metadataString(metadata, "source") == "api" {
-			provider = ""
-		}
 		project := config.ProjectRefConfig{
 			ID:         record.ID,
 			Name:       record.Name,

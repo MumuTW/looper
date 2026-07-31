@@ -1504,8 +1504,8 @@ func TestGatewayRestoreWorktreeRefusesUnregisteredLinkedCheckout(t *testing.T) {
 		t.Fatalf("CreateWorktree() error = %v", err)
 	}
 	writeFile(t, filepath.Join(retired.WorktreePath, "dirty.txt"), "retired project state\n")
-	if _, err := fixture.repos.Worktrees.DeleteByProject(ctx, fixture.projectID); err != nil {
-		t.Fatalf("DeleteByProject() error = %v", err)
+	if _, err := fixture.repos.Worktrees.RetireByProject(ctx, fixture.projectID, fixture.now().UTC().Format(javaScriptISOStringLayout)); err != nil {
+		t.Fatalf("RetireByProject() error = %v", err)
 	}
 
 	_, err = gateway.RestoreWorktree(ctx, RestoreWorktreeInput{
@@ -1515,7 +1515,7 @@ func TestGatewayRestoreWorktreeRefusesUnregisteredLinkedCheckout(t *testing.T) {
 		WorktreeRoot:         fixture.worktreeRoot,
 		ExpectedWorktreePath: retired.WorktreePath,
 	})
-	if err == nil || !strings.Contains(err.Error(), "refusing to adopt unregistered worktree") {
+	if err == nil || !strings.Contains(err.Error(), "refusing to adopt retired worktree") {
 		t.Fatalf("RestoreWorktree() error = %v, want refusal to adopt the retired checkout", err)
 	}
 	if got := readFile(t, filepath.Join(retired.WorktreePath, "dirty.txt")); got != "retired project state\n" {
@@ -1525,8 +1525,56 @@ func TestGatewayRestoreWorktreeRefusesUnregisteredLinkedCheckout(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(worktrees) != 0 {
-		t.Fatalf("ListByProject() = %#v, want no adoption record", worktrees)
+	if len(worktrees) != 1 || worktrees[0].Status != "retired" {
+		t.Fatalf("ListByProject() = %#v, want no adoption and retained retirement provenance", worktrees)
+	}
+}
+
+func TestGatewayRecreatesMissingRetiredWorktree(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	fixture.createLocalFeatureRepo(t)
+	gateway := fixture.gateway()
+	retired, err := gateway.CreateWorktree(ctx, CreateWorktreeInput{ProjectID: fixture.projectID, RepoPath: fixture.repoPath, WorktreeRoot: fixture.worktreeRoot, Branch: "feature/fixer", BaseBranch: "main"})
+	if err != nil {
+		t.Fatalf("CreateWorktree() error = %v", err)
+	}
+	if _, err := fixture.repos.Worktrees.RetireByProject(ctx, fixture.projectID, fixture.now().UTC().Format(javaScriptISOStringLayout)); err != nil {
+		t.Fatalf("RetireByProject() error = %v", err)
+	}
+	if err := os.RemoveAll(retired.WorktreePath); err != nil {
+		t.Fatalf("RemoveAll(retired worktree) error = %v", err)
+	}
+
+	recreated, err := gateway.CreateWorktree(ctx, CreateWorktreeInput{ProjectID: fixture.projectID, RepoPath: fixture.repoPath, WorktreeRoot: fixture.worktreeRoot, Branch: "feature/fixer", BaseBranch: "main"})
+	if err != nil {
+		t.Fatalf("CreateWorktree() after missing retired checkout = %v", err)
+	}
+	if normalizeComparablePath(recreated.WorktreePath) != normalizeComparablePath(retired.WorktreePath) || recreated.Status != "active" {
+		t.Fatalf("recreated = %#v, want active replacement at %q", recreated, retired.WorktreePath)
+	}
+}
+
+func TestGatewayRecoversUnpersistedCreatedWorktree(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	fixture.createLocalFeatureRepo(t)
+	input := CreateWorktreeInput{ProjectID: fixture.projectID, RepoPath: fixture.repoPath, WorktreeRoot: fixture.worktreeRoot, Branch: "feature/fixer", BaseBranch: "main"}
+
+	created, err := New(Options{GitPath: "git", Now: fixture.now}).CreateWorktree(ctx, input)
+	if err != nil {
+		t.Fatalf("physical CreateWorktree() error = %v", err)
+	}
+	recovered, err := fixture.gateway().CreateWorktree(ctx, input)
+	if err != nil {
+		t.Fatalf("CreateWorktree() after interrupted persistence = %v", err)
+	}
+	if normalizeComparablePath(recovered.WorktreePath) != normalizeComparablePath(created.WorktreePath) || recovered.Status != "active" {
+		t.Fatalf("recovered = %#v, want active claim of %q", recovered, created.WorktreePath)
+	}
+	stored, err := fixture.repos.Worktrees.GetByPath(ctx, created.WorktreePath)
+	if err != nil || stored == nil || stored.Status != "active" {
+		t.Fatalf("GetByPath() = %#v, %v; want persisted recovered claim", stored, err)
 	}
 }
 

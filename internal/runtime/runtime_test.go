@@ -248,7 +248,7 @@ func TestRuntimeStartMaterializesProjectCatalogFromDatabase(t *testing.T) {
 	}
 }
 
-func TestRuntimeStartReconcilesLegacyAPIProviderBinding(t *testing.T) {
+func TestRuntimeStartArchivesLegacyAPIProviderBinding(t *testing.T) {
 	t.Parallel()
 
 	workingDir := t.TempDir()
@@ -286,12 +286,12 @@ func TestRuntimeStartReconcilesLegacyAPIProviderBinding(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stored == nil || stored.MetadataJSON == nil || strings.Contains(*stored.MetadataJSON, `"provider"`) {
-		t.Fatalf("stored legacy API project = %#v, want provider binding removed", stored)
+	if stored == nil || !stored.Archived || stored.MetadataJSON == nil || !strings.Contains(*stored.MetadataJSON, `"provider":"removed"`) {
+		t.Fatalf("stored legacy API project = %#v, want archived record retaining provider provenance", stored)
 	}
 	projects := rt.Config().Projects
-	if len(projects) != 1 || projects[0].ID != "legacy-api" || projects[0].Provider != "" {
-		t.Fatalf("runtime catalog = %#v, want reconciled default GitHub project", projects)
+	if len(projects) != 0 {
+		t.Fatalf("runtime catalog = %#v, want legacy provider project excluded", projects)
 	}
 }
 

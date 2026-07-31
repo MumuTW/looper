@@ -806,7 +806,7 @@ func (s *Service) RemoveProject(ctx context.Context, identifier string) (storage
 			if _, cancelErr := repos.Queue.CancelByProject(ctx, project.ID, nowISO, &cancelReason); cancelErr != nil {
 				return false, cancelErr
 			}
-			if _, retireErr := repos.Worktrees.DeleteByProject(ctx, project.ID); retireErr != nil {
+			if _, retireErr := repos.Worktrees.RetireByProject(ctx, project.ID, nowISO); retireErr != nil {
 				return false, retireErr
 			}
 			return true, nil
@@ -929,17 +929,16 @@ func (s *Service) SyncConfigured(ctx context.Context, cfg config.Config, now tim
 		if metadataString(metadata, "source") != "api" || metadataString(metadata, "provider") == "" {
 			continue
 		}
-		// API registration no longer owns provider selection. Persist the
-		// upgrade reconciliation before catalog materialization so a provider
-		// removed from config cannot make looperd unable to boot and repair its
-		// own database.
-		delete(metadata, "provider")
-		metadataJSON, err := buildAddProjectMetadataJSON(metadata)
-		if err != nil {
-			return fmt.Errorf("remove legacy provider binding for %s: %w", existing.ID, err)
+		if existing.Archived {
+			continue
 		}
+		// Provider bindings are now config-file authority. Dropping an old API
+		// binding would silently turn its repository into github.com, which is
+		// unsafe for a prior GHES/other-host identity. Archive the record before
+		// catalog materialization instead; an operator may later hand the ID to
+		// an explicit [[projects]] entry.
 		updated := existing
-		updated.MetadataJSON = stringPointer(metadataJSON)
+		updated.Archived = true
 		updated.UpdatedAt = nowISO
 		legacyAPIProviderRecords = append(legacyAPIProviderRecords, updated)
 	}
@@ -985,12 +984,21 @@ func (s *Service) SyncConfigured(ctx context.Context, cfg config.Config, now tim
 
 	applyImport := func(repos *storage.Repositories) error {
 		for _, record := range legacyAPIProviderRecords {
+			if _, err := repos.Loops.TerminateByProject(ctx, record.ID, nowISO); err != nil {
+				return err
+			}
+			if _, err := repos.Queue.CancelByProject(ctx, record.ID, nowISO, &cancelReason); err != nil {
+				return err
+			}
+			if _, err := repos.Worktrees.RetireByProject(ctx, record.ID, nowISO); err != nil {
+				return err
+			}
 			if err := repos.Projects.Upsert(ctx, record); err != nil {
 				return err
 			}
 		}
 		for projectID := range reclaimingArchivedAPIProjectIDs {
-			if _, err := repos.Worktrees.DeleteByProject(ctx, projectID); err != nil {
+			if _, err := repos.Worktrees.RetireByProject(ctx, projectID, nowISO); err != nil {
 				return err
 			}
 		}

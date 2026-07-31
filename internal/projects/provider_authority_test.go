@@ -58,8 +58,8 @@ func TestServiceSyncConfiguredAllowsConfigToClaimArchivedAPIProject(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(worktrees) != 0 {
-		t.Fatalf("ListByProject(shared) = %#v, want API worktree identities retired before ID reuse", worktrees)
+	if len(worktrees) != 1 || worktrees[0].Status != "retired" {
+		t.Fatalf("ListByProject(shared) = %#v, want retired API worktree provenance before ID reuse", worktrees)
 	}
 }
 
@@ -118,7 +118,7 @@ func TestServiceSyncConfiguredActiveAPICollisionEscapesProjectIDInRecoveryURL(t 
 	}
 }
 
-func TestServiceSyncConfiguredRemovesLegacyAPIProviderBinding(t *testing.T) {
+func TestServiceSyncConfiguredArchivesLegacyAPIProviderBinding(t *testing.T) {
 	t.Parallel()
 
 	coordinator := openCoordinator(t)
@@ -144,10 +144,56 @@ func TestServiceSyncConfiguredRemovesLegacyAPIProviderBinding(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stored == nil || metadataString(parseMetadata(stored.MetadataJSON), "provider") != "" {
-		t.Fatalf("legacy API record = %#v, want provider binding removed", stored)
+	if stored == nil || !stored.Archived || metadataString(parseMetadata(stored.MetadataJSON), "provider") != "removed" {
+		t.Fatalf("legacy API record = %#v, want archived record retaining provider provenance", stored)
 	}
-	if _, err := MaterializeCatalog(cfg, []storage.ProjectRecord{*stored}); err != nil {
-		t.Fatalf("MaterializeCatalog() error = %v, want boot-safe reconciled record", err)
+	materialized, err := MaterializeCatalog(cfg, []storage.ProjectRecord{*stored})
+	if err != nil {
+		t.Fatalf("MaterializeCatalog() error = %v, want archived legacy record skipped", err)
+	}
+	if len(materialized) != 0 {
+		t.Fatalf("MaterializeCatalog() = %#v, want archived legacy record excluded", materialized)
+	}
+}
+
+func TestServiceSyncConfiguredArchivesProviderSeparatedLegacyProjectsBeforeCatalogCollision(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openCoordinator(t)
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.July, 31, 5, 0, 0, 0, time.UTC)
+	for _, project := range []struct {
+		id       string
+		provider string
+	}{{id: "github-enterprise", provider: "ghes"}, {id: "forge-legacy", provider: "forgejo"}} {
+		metadata := `{"provider":"` + project.provider + `","repo":"acme/app","source":"api"}`
+		if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: project.id, Name: project.id, RepoPath: "/tmp/" + project.id, MetadataJSON: &metadata, CreatedAt: now.Add(-time.Hour).Format(time.RFC3339Nano), UpdatedAt: now.Add(-time.Hour).Format(time.RFC3339Nano)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := &Service{DB: coordinator.DB(), Repos: repos, Now: func() time.Time { return now }}
+
+	if err := service.SyncConfigured(context.Background(), cfg, now); err != nil {
+		t.Fatalf("SyncConfigured() error = %v, want legacy identities archived before catalog materialization", err)
+	}
+	records, err := repos.Projects.List(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, record := range records {
+		if !record.Archived || metadataString(parseMetadata(record.MetadataJSON), "provider") == "" {
+			t.Fatalf("legacy record = %#v, want archived provider provenance", record)
+		}
+	}
+	materialized, err := MaterializeCatalog(cfg, records)
+	if err != nil {
+		t.Fatalf("MaterializeCatalog() error = %v, want no collapsed default-GitHub collision", err)
+	}
+	if len(materialized) != 0 {
+		t.Fatalf("MaterializeCatalog() = %#v, want both legacy projects absent", materialized)
 	}
 }
