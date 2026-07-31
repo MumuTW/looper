@@ -835,7 +835,9 @@ const (
 	// the pull request, so a human can decide without redoing the judgement.
 	GatekeeperTrustAdvise GatekeeperTrustLevel = "advise"
 	// GatekeeperTrustAuto lets Gatekeeper merge what it judges eligible after a
-	// complete confirming evaluation.
+	// complete confirming evaluation. Legacy roles.reviewer.autoMerge.enabled
+	// configurations are rejected with an explicit migration error so Reviewer
+	// cannot remain a second merge authority.
 	GatekeeperTrustAuto GatekeeperTrustLevel = "auto"
 )
 
