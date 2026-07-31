@@ -181,10 +181,10 @@ func (r *Runtime) ReloadConfig(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return r.rejectConfigReloadLocked("canceled", nil, err)
 	}
-	return r.applyLoadedConfigLocked(loaded, now)
+	return r.applyLoadedConfigLocked(ctx, loaded, now)
 }
 
-func (r *Runtime) applyLoadedConfigLocked(loaded config.LoadedFileConfig, now time.Time) error {
+func (r *Runtime) applyLoadedConfigLocked(ctx context.Context, loaded config.LoadedFileConfig, now time.Time) error {
 	restartRequired, err := config.RestartRequiredChangesChecked(r.loadedConfig.Config, loaded.Config)
 	if err != nil {
 		return r.rejectConfigReloadLocked("invalid", nil, fmt.Errorf("compare effective configuration: %w", err))
@@ -195,13 +195,13 @@ func (r *Runtime) applyLoadedConfigLocked(loaded config.LoadedFileConfig, now ti
 	}
 	r.configBoundary.Lock()
 	defer r.configBoundary.Unlock()
-	return r.applyLoadedConfigBoundaryLocked(loaded, now)
+	return r.applyLoadedConfigBoundaryLocked(ctx, loaded, now)
 }
 
 // applyLoadedConfigBoundaryLocked requires configBoundary's write lock. It is
 // split out so a dashboard patch can hold the same publication boundary across
 // final validation, rename, and publication.
-func (r *Runtime) applyLoadedConfigBoundaryLocked(loaded config.LoadedFileConfig, now time.Time) error {
+func (r *Runtime) applyLoadedConfigBoundaryLocked(ctx context.Context, loaded config.LoadedFileConfig, now time.Time) error {
 	runtimeCandidate := loaded.Config
 	if r.projectCatalog != nil {
 		runtimeCandidate.Projects = r.projectCatalog.Snapshot().Projects
@@ -213,7 +213,8 @@ func (r *Runtime) applyLoadedConfigBoundaryLocked(loaded config.LoadedFileConfig
 		return r.rejectConfigReloadLocked("invalid", configValidationPaths(err), err)
 	}
 
-	changed := !reflect.DeepEqual(r.loadedConfig.Config, loaded.Config)
+	previous := r.loadedConfig.Config
+	changed := !reflect.DeepEqual(previous, loaded.Config)
 	cleanupChanged := r.loadedConfig.Config.Daemon.WorktreeCleanup != loaded.Config.Daemon.WorktreeCleanup
 	r.loadedConfig = loaded
 	r.configReloadStatus.ConfigPath = loaded.Metadata.ConfigPath
@@ -229,6 +230,21 @@ func (r *Runtime) applyLoadedConfigBoundaryLocked(loaded config.LoadedFileConfig
 
 	if r.projectCatalog != nil {
 		r.projectCatalog.PublishGlobals(loaded.Config)
+		if storedProjectPolicyRequirementChanged(previous, loaded.Config) {
+			// PublishGlobals preserves the previously filtered project slice,
+			// so a reload that changes whether stored projects need an
+			// effective validation policy must re-materialize the catalog from
+			// SQLite. Otherwise a project whose quarantine status flipped
+			// would wait for a restart or an unrelated project mutation.
+			r.mu.RLock()
+			repositories := r.services.Repositories
+			r.mu.RUnlock()
+			if repositories != nil {
+				if err := r.reloadProjectCatalog(ctx, repositories); err != nil && r.logger != nil {
+					r.logger.Warn("configuration reloaded but project catalog re-materialization failed", map[string]any{"error": err.Error()})
+				}
+			}
+		}
 		r.publishCatalogConsumers(r.projectCatalog.Snapshot())
 	}
 	r.configReloadStatus.LastAppliedAt = timePointer(now)
@@ -244,6 +260,18 @@ func (r *Runtime) applyLoadedConfigBoundaryLocked(loaded config.LoadedFileConfig
 		r.TriggerWorktreeCleanup()
 	}
 	return nil
+}
+
+// storedProjectPolicyRequirementChanged reports whether a reload changes
+// whether a stored project needs an effective validation policy to remain in
+// the runtime catalog: a coding role becoming configured or unconfigured, or
+// the legacy defaults.validationCommands fallback appearing or disappearing.
+func storedProjectPolicyRequirementChanged(before, after config.Config) bool {
+	codingRoleConfigured := func(cfg config.Config) bool {
+		return config.CodingRoleAgentConfigured(cfg, config.CodingRoleWorker) || config.CodingRoleAgentConfigured(cfg, config.CodingRoleFixer)
+	}
+	return codingRoleConfigured(before) != codingRoleConfigured(after) ||
+		(len(config.ResolveValidationCommands(before)) == 0) != (len(config.ResolveValidationCommands(after)) == 0)
 }
 
 // PatchConfig applies a targeted mutation to the file layer. It rereads the
@@ -421,7 +449,7 @@ func (r *Runtime) PatchConfig(ctx context.Context, patch ConfigPatch) error {
 	candidate.Metadata.ConfigFilePresent = true
 	now := r.now().UTC()
 	r.configReloadStatus.LastAttemptAt = timePointer(now)
-	if err := r.applyLoadedConfigBoundaryLocked(candidate, now); err != nil {
+	if err := r.applyLoadedConfigBoundaryLocked(ctx, candidate, now); err != nil {
 		return &ConfigPatchError{Kind: "validation", Message: err.Error(), Err: err}
 	}
 	return nil
