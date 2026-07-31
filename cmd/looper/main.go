@@ -849,41 +849,72 @@ func runProjectDiscover(ctx context.Context, global []string, identifier string,
 
 // runGatekeeper owns read-only Gatekeeper operator views. It intentionally
 // routes through looperd rather than opening SQLite: the daemon is authoritative
-// for the immutable agreement event stream and remains the only storage writer.
+// for the immutable Gatekeeper event stream and remains the only storage writer.
 func runGatekeeper(ctx context.Context, global []string, operands []string, stdout io.Writer) error {
-	if len(operands) == 0 || operands[0] != "agreements" {
-		return badUsage("gatekeeper requires the agreements subcommand")
+	if len(operands) == 0 || (operands[0] != "agreements" && operands[0] != "verdicts") {
+		return badUsage("gatekeeper requires the agreements or verdicts subcommand")
 	}
 	if len(operands) > 2 || (len(operands) == 2 && strings.TrimSpace(operands[1]) == "") {
-		return badUsage("gatekeeper agreements accepts at most one project id")
+		return badUsage(fmt.Sprintf("gatekeeper %s accepts at most one project id", operands[0]))
 	}
 
 	cfg, err := loadConfig(global)
 	if err != nil {
 		return err
 	}
-	path := "/api/v1/gatekeeper/agreements"
+	path := "/api/v1/gatekeeper/" + operands[0]
 	if len(operands) == 2 {
 		path += "?projectId=" + url.QueryEscape(strings.TrimSpace(operands[1]))
 	}
-	agreements, err := requestJSON[gatekeeperAgreementsResponse](ctx, cfg, http.MethodGet, path, nil)
+	if operands[0] == "agreements" {
+		agreements, err := requestJSON[gatekeeperAgreementsResponse](ctx, cfg, http.MethodGet, path, nil)
+		if err != nil {
+			return err
+		}
+		if len(agreements.Items) == 0 {
+			_, _ = fmt.Fprintln(stdout, "no advise agreements recorded")
+			return nil
+		}
+		for _, agreement := range agreements.Items {
+			outcome := strings.TrimSpace(agreement.Outcome)
+			if outcome == "" {
+				outcome = "unknown"
+			}
+			agreementLabel := "disagreement"
+			if agreement.Agreement {
+				agreementLabel = "agreement"
+			}
+			_, _ = fmt.Fprintf(stdout, "%s#%d  %s  %s  %s  verdict=%s\n", agreement.Repo, agreement.PRNumber, outcome, agreementLabel, agreement.RecordedAt, agreement.VerdictEventID)
+		}
+		return nil
+	}
+
+	verdicts, err := requestJSON[gatekeeperVerdictsResponse](ctx, cfg, http.MethodGet, path, nil)
 	if err != nil {
 		return err
 	}
-	if len(agreements.Items) == 0 {
-		_, _ = fmt.Fprintln(stdout, "no advise agreements recorded")
+	if len(verdicts.Items) == 0 {
+		_, _ = fmt.Fprintln(stdout, "no gatekeeper verdicts recorded")
 		return nil
 	}
-	for _, agreement := range agreements.Items {
-		outcome := strings.TrimSpace(agreement.Outcome)
-		if outcome == "" {
-			outcome = "unknown"
+	for _, verdict := range verdicts.Items {
+		status := strings.TrimSpace(verdict.Status)
+		if status == "" {
+			status = "unknown"
 		}
-		agreementLabel := "disagreement"
-		if agreement.Agreement {
-			agreementLabel = "agreement"
+		reasons := make([]string, 0, len(verdict.Reasons))
+		for _, reason := range verdict.Reasons {
+			value := string(reason.Code)
+			if strings.TrimSpace(reason.Subject) != "" {
+				value += "(" + strings.TrimSpace(reason.Subject) + ")"
+			}
+			reasons = append(reasons, value)
 		}
-		_, _ = fmt.Fprintf(stdout, "%s#%d  %s  %s  %s  verdict=%s\n", agreement.Repo, agreement.PRNumber, outcome, agreementLabel, agreement.RecordedAt, agreement.VerdictEventID)
+		reasonText := "-"
+		if len(reasons) > 0 {
+			reasonText = strings.Join(reasons, ",")
+		}
+		_, _ = fmt.Fprintf(stdout, "%s#%d  %s  head=%s  evaluated=%s  reasons=%s\n", verdict.Repo, verdict.PRNumber, status, verdict.ObservedHeadSHA, verdict.EvaluatedAt, reasonText)
 	}
 	return nil
 }
@@ -1275,6 +1306,10 @@ type gatekeeperAgreementsResponse struct {
 	Items []gatekeeperAgreement `json:"items"`
 }
 
+type gatekeeperVerdictsResponse struct {
+	Items []gatekeeperVerdict `json:"items"`
+}
+
 type gatekeeperAgreement struct {
 	Repo           string `json:"repo"`
 	PRNumber       int64  `json:"prNumber"`
@@ -1282,6 +1317,21 @@ type gatekeeperAgreement struct {
 	Outcome        string `json:"outcome"`
 	Agreement      bool   `json:"agreement"`
 	RecordedAt     string `json:"recordedAt"`
+}
+
+type gatekeeperVerdictReason struct {
+	Code    string `json:"code"`
+	Subject string `json:"subject"`
+}
+
+type gatekeeperVerdict struct {
+	Repo            string                    `json:"repo"`
+	PRNumber        int64                     `json:"prNumber"`
+	Status          string                    `json:"status"`
+	Eligible        bool                      `json:"eligible"`
+	ObservedHeadSHA string                    `json:"observedHeadSha"`
+	Reasons         []gatekeeperVerdictReason `json:"reasons"`
+	EvaluatedAt     string                    `json:"evaluatedAt"`
 }
 
 // daemonBaseURL is where this CLI expects the daemon to answer.
@@ -1502,6 +1552,8 @@ Usage:
   looper dashboard             Print a dashboard URL authenticated for this session
   looper gatekeeper agreements [project-id]
                                Inspect immutable advise agreement outcomes
+  looper gatekeeper verdicts [project-id]
+                               Inspect the newest Gatekeeper verdict per PR
   looper project add <path>    Register a git repository root with the daemon
   looper project list          List registered projects
   looper project discover <id> Retry post-commit worktree/PR discovery for a project

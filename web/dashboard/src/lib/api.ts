@@ -378,6 +378,58 @@ export type GatekeeperAgreementsList = {
   items: GatekeeperAgreement[];
 };
 
+export type GatekeeperVerdictReason = {
+  code: string;
+  subject?: string | null;
+};
+
+export type GatekeeperCheckEvidence = {
+  name: string;
+  appId?: number;
+  status?: string;
+  conclusion?: string;
+};
+
+export type GatekeeperVerdictEvidence = {
+  pullRequestState?: string;
+  closedAt?: string;
+  mergedAt?: string;
+  draft: boolean;
+  baseRefName?: string;
+  mergeable?: boolean | null;
+  mergeableState?: string;
+  requiredChecks: string[];
+  checks: GatekeeperCheckEvidence[];
+  requiredApprovingReviewCount: number;
+  reviewDecision?: string;
+  unresolvedReviewThreadIds: string[];
+  holdLabels: string[];
+  projectPolicyPermitsTarget: boolean;
+  finalObservedHeadSha?: string;
+};
+
+export type GatekeeperVerdict = {
+  id: string;
+  projectId: string;
+  repo: string;
+  prNumber: number;
+  version: number;
+  mode: string;
+  status: string;
+  eligible: boolean;
+  expectedHeadSha?: string | null;
+  observedHeadSha?: string | null;
+  requiresFreshRevalidation: boolean;
+  reasons: GatekeeperVerdictReason[];
+  evidence: GatekeeperVerdictEvidence;
+  evaluatedAt: string;
+  createdAt: string;
+};
+
+export type GatekeeperVerdictsList = {
+  items: GatekeeperVerdict[];
+};
+
 export type ConfigScalar = string | number | boolean | null;
 export type ConfigValue =
   | ConfigScalar
@@ -576,6 +628,21 @@ export function fetchGatekeeperAgreements(opts?: {
   const query = params.toString();
   return apiFetch<GatekeeperAgreementsList>(
     `/api/v1/gatekeeper/agreements${query ? `?${query}` : ""}`,
+    { signal: opts?.signal },
+  );
+}
+
+export function fetchGatekeeperVerdicts(opts?: {
+  projectId?: string;
+  limit?: number;
+  signal?: AbortSignal;
+}): Promise<GatekeeperVerdictsList> {
+  const params = new URLSearchParams();
+  if (opts?.projectId) params.set("projectId", opts.projectId);
+  if (opts?.limit != null) params.set("limit", String(opts.limit));
+  const query = params.toString();
+  return apiFetch<GatekeeperVerdictsList>(
+    `/api/v1/gatekeeper/verdicts${query ? `?${query}` : ""}`,
     { signal: opts?.signal },
   );
 }

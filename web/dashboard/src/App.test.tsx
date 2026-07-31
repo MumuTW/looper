@@ -220,6 +220,36 @@ describe("triage confirmation status", () => {
           ],
         });
       }
+      if (path.startsWith("/api/v1/gatekeeper/verdicts")) {
+        return response({
+          items: [
+            {
+              id: "verdict_1",
+              projectId: "project_1",
+              repo: "acme/gate",
+              prNumber: 99,
+              version: 2,
+              mode: "advise",
+              status: "blocked",
+              eligible: false,
+              observedHeadSha: "head-42",
+              requiresFreshRevalidation: true,
+              reasons: [{ code: "hold", subject: "looper:hold" }],
+              evidence: {
+                draft: false,
+                requiredChecks: [],
+                checks: [],
+                requiredApprovingReviewCount: 1,
+                unresolvedReviewThreadIds: [],
+                holdLabels: ["looper:hold"],
+                projectPolicyPermitsTarget: true,
+              },
+              evaluatedAt: "2026-07-30T12:00:00Z",
+              createdAt: "2026-07-30T12:00:00Z",
+            },
+          ],
+        });
+      }
       if (path.startsWith("/api/v1/loops")) return response({ items: [] });
       return bootstrapRouteAbsent();
     });
@@ -238,6 +268,9 @@ describe("triage confirmation status", () => {
     expect(screen.getByText("/plan triage-confirm-b2")).toBeTruthy();
     expect(screen.getAllByRole("button", { name: /copy/i })).toHaveLength(2);
     expect(await screen.findByText("merged_as_is")).toBeTruthy();
+    expect(await screen.findByText(/blocked/)).toBeTruthy();
+    expect(screen.getByText("acme/gate#99")).toBeTruthy();
+    expect(screen.getByText("hold (looper:hold)")).toBeTruthy();
     expect(screen.getAllByText(/acme\/looper#42/)).toHaveLength(2);
   });
 });

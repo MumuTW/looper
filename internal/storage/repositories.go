@@ -597,6 +597,50 @@ func (r *EventsRepository) ListByEventType(ctx context.Context, eventType, proje
 
 	return scanEventLogs(rows)
 }
+
+// ListLatestByEventType returns the newest event for each durable entity in an
+// event family. The optional project filter is applied before the window so a
+// read-only projection can bound its scan without loading another project's
+// history. Entity identity includes project_id because the same pull request
+// can be observed by more than one registered project.
+func (r *EventsRepository) ListLatestByEventType(ctx context.Context, eventType, projectID string, limit int64) ([]EventLogRecord, error) {
+	if strings.TrimSpace(eventType) == "" {
+		return []EventLogRecord{}, nil
+	}
+	if limit <= 0 {
+		limit = 100
+	}
+
+	query := `SELECT ` + eventLogColumns + `
+		FROM (
+			SELECT ` + eventLogColumns + `,
+				ROW_NUMBER() OVER (
+					PARTITION BY COALESCE(project_id, ''), COALESCE(entity_id, '')
+					ORDER BY created_at DESC, id DESC
+				) AS event_rank
+			FROM event_logs
+			WHERE event_type = ?`
+	args := []any{eventType}
+	if projectID = strings.TrimSpace(projectID); projectID != "" {
+		query += " AND project_id = ?"
+		args = append(args, projectID)
+	}
+	query += `
+		) AS ranked
+		WHERE event_rank = 1
+		ORDER BY created_at DESC, id DESC
+		LIMIT ?`
+	args = append(args, limit)
+
+	rows, err := r.q.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list latest event logs by type: %w", err)
+	}
+	defer rows.Close()
+
+	return scanEventLogs(rows)
+}
+
 // ListByEntityTypeAndEventTypes reads the complete lifecycle for one entity
 // family without imposing an arbitrary status-page limit. Callers derive live
 // projections from the returned durable events; this query does not record a

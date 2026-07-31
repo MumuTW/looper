@@ -1414,6 +1414,51 @@ func TestEventsListByEventTypeScopesProjectAndLimit(t *testing.T) {
 		t.Fatalf("ListByEventType(global) = %#v, want newest-first agreements", all)
 	}
 }
+
+func TestEventsListLatestByEventTypeDeduplicatesEntities(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	repos := NewRepositories(coordinator.DB())
+
+	projectA := "project_a"
+	projectB := "project_b"
+	entityType := "pull_request"
+	entityA := "acme/looper#42"
+	entityB := "acme/looper#43"
+	for _, projectID := range []string{projectA, projectB} {
+		if err := repos.Projects.Upsert(ctx, ProjectRecord{ID: projectID, Name: projectID, RepoPath: "/tmp/" + projectID, CreatedAt: "2026-04-11T12:00:00.000Z", UpdatedAt: "2026-04-11T12:00:00.000Z"}); err != nil {
+			t.Fatalf("Projects.Upsert(%s) error = %v", projectID, err)
+		}
+	}
+	for _, event := range []EventLogRecord{
+		{ID: "verdict_a_old", EventType: "pull_request.merge_gate.evaluated", ProjectID: &projectA, EntityType: &entityType, EntityID: &entityA, PayloadJSON: `{}`, CreatedAt: "2026-04-11T12:00:00.000Z"},
+		{ID: "verdict_b", EventType: "pull_request.merge_gate.evaluated", ProjectID: &projectA, EntityType: &entityType, EntityID: &entityB, PayloadJSON: `{}`, CreatedAt: "2026-04-11T12:01:00.000Z"},
+		{ID: "verdict_a_new", EventType: "pull_request.merge_gate.evaluated", ProjectID: &projectA, EntityType: &entityType, EntityID: &entityA, PayloadJSON: `{}`, CreatedAt: "2026-04-11T12:02:00.000Z"},
+		{ID: "verdict_other_project", EventType: "pull_request.merge_gate.evaluated", ProjectID: &projectB, EntityType: &entityType, EntityID: &entityA, PayloadJSON: `{}`, CreatedAt: "2026-04-11T12:03:00.000Z"},
+	} {
+		if err := repos.Events.Append(ctx, event); err != nil {
+			t.Fatalf("Events.Append(%s) error = %v", event.ID, err)
+		}
+	}
+
+	got, err := repos.Events.ListLatestByEventType(ctx, "pull_request.merge_gate.evaluated", projectA, 10)
+	if err != nil {
+		t.Fatalf("ListLatestByEventType() error = %v", err)
+	}
+	if len(got) != 2 || got[0].ID != "verdict_a_new" || got[1].ID != "verdict_b" {
+		t.Fatalf("ListLatestByEventType() = %#v, want newest event per project-a entity", got)
+	}
+
+	global, err := repos.Events.ListLatestByEventType(ctx, "pull_request.merge_gate.evaluated", "", 10)
+	if err != nil {
+		t.Fatalf("ListLatestByEventType(global) error = %v", err)
+	}
+	if len(global) != 3 || global[0].ID != "verdict_other_project" || global[1].ID != "verdict_a_new" || global[2].ID != "verdict_b" {
+		t.Fatalf("ListLatestByEventType(global) = %#v, want newest event per project/entity", global)
+	}
+}
+
 func TestRunsListByStatusOrdersByStartedAtThenIDDesc(t *testing.T) {
 	t.Parallel()
 

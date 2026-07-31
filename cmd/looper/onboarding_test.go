@@ -245,6 +245,7 @@ func TestUsageListsEveryImplementedVerb(t *testing.T) {
 	for _, verb := range []string{
 		"looper init", "looper status", "looper dashboard", "looper project add", "looper project list",
 		"looper gatekeeper agreements",
+		"looper gatekeeper verdicts",
 		"looper stop", "looper close", "looper takeover", "looper handback",
 		"looper retry", "looper start", "looper pause", "looper respond",
 		"looper version",
