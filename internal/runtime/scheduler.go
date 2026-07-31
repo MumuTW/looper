@@ -391,7 +391,7 @@ func (a plannerGitHubAdapter) ListOpenIssues(ctx context.Context, input planner.
 	}
 	result := make([]planner.IssueSummary, 0, len(issues))
 	for _, issue := range issues {
-		result = append(result, planner.IssueSummary{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.URL, Assignees: issue.Assignees, Labels: issue.Labels})
+		result = append(result, planner.IssueSummary{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.URL, Author: issue.Author, Assignees: issue.Assignees, Labels: issue.Labels})
 	}
 	return result, nil
 }

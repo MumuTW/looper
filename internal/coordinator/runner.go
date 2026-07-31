@@ -811,6 +811,10 @@ func (r *Runner) applyDispatches(ctx context.Context, projectID, repo, cwd strin
 		action := dispatch.Decide(dispatchIssue, dispatchCfg, r.now().UTC(), &deps.graph)
 		action = applyHumanDependencyGate(action, item.issue.Number, deps)
 		if r.hasDispatchWork(action) || r.workerAdmissionIntent(item.issue, action, dispatchCfg).Active {
+			item.summary, err = r.assignPersonalIssueIfEligible(ctx, projectID, repo, cwd, item.summary, action, dispatchCfg)
+			if err != nil {
+				return err
+			}
 			if _, err := r.applyDispatchAction(ctx, projectID, repo, cwd, item.issue, action, dispatchCfg); err != nil {
 				return err
 			}
@@ -844,7 +848,7 @@ func (r *Runner) applyAutonomousDispatches(ctx context.Context, projectID, repo,
 				}
 			}
 		}
-		ready = append(ready, autonomousDispatchCandidate{issue: item.issue, action: action, order: deps.parentOrderByIssue[item.issue.Number], worker: isWorkerDispatch(item.issue)})
+		ready = append(ready, autonomousDispatchCandidate{issue: item.issue, summary: item.summary, action: action, order: deps.parentOrderByIssue[item.issue.Number], worker: isWorkerDispatch(item.issue)})
 	}
 	sortAutonomousDispatchCandidates(ready)
 	budget, preemptWorkers, err := r.dispatchBudget(ctx, projectID, repo, cwd, loaded, ready, downstreamLabels)
@@ -859,6 +863,10 @@ func (r *Runner) applyAutonomousDispatches(ctx context.Context, projectID, repo,
 		if dispatched >= budget {
 			break
 		}
+		candidate.summary, err = r.assignPersonalIssueIfEligible(ctx, projectID, repo, cwd, candidate.summary, candidate.action, dispatchCfg)
+		if err != nil {
+			return err
+		}
 		mutated, err := r.applyDispatchAction(ctx, projectID, repo, cwd, candidate.issue, candidate.action, dispatchCfg)
 		if err != nil {
 			return err
@@ -871,10 +879,34 @@ func (r *Runner) applyAutonomousDispatches(ctx context.Context, projectID, repo,
 }
 
 type autonomousDispatchCandidate struct {
-	issue  triage.Issue
-	action dispatch.Action
-	order  issueOrder
-	worker bool
+	issue   triage.Issue
+	summary githubinfra.IssueSummary
+	action  dispatch.Action
+	order   issueOrder
+	worker  bool
+}
+
+func (r *Runner) assignPersonalIssueIfEligible(ctx context.Context, projectID, repo, cwd string, summary githubinfra.IssueSummary, action dispatch.Action, cfg dispatch.Config) (githubinfra.IssueSummary, error) {
+	if r.config == nil || !config.IsPersonalProject(*r.config, projectID) || r.projectNetworkMode(projectID) != config.ProjectNetworkModeOff || action.NoOp || strings.TrimSpace(action.FailureCommentBody) != "" || strings.TrimSpace(action.AssignTo) != "" || len(summary.Assignees) > 0 || len(summary.AssigneeUsers) > 0 {
+		return summary, nil
+	}
+	workerIntent := r.workerAdmissionIntent(triage.Issue{Number: summary.Number, Labels: summary.Labels}, action, cfg)
+	if !workerIntent.Active && len(intersectExactLabels(action.TriggerLabels, cfg.PlannerTriggerLabels)) == 0 && len(intersectExactLabels(action.TriggerLabels, cfg.WorkerTriggerLabels)) == 0 {
+		return summary, nil
+	}
+	login, err := r.github.GetCurrentUserLoginForRepo(ctx, repo, cwd)
+	if err != nil {
+		return summary, err
+	}
+	login = strings.TrimSpace(login)
+	if login == "" || !strings.EqualFold(strings.TrimSpace(summary.Author), login) {
+		return summary, nil
+	}
+	if err := r.github.AddIssueAssignees(ctx, githubinfra.IssueAssigneesInput{Repo: repo, IssueNumber: summary.Number, Assignees: []string{login}, CWD: cwd}); err != nil {
+		return summary, fmt.Errorf("assign self-authored coordinator issue %s#%d: %w", repo, summary.Number, err)
+	}
+	summary.Assignees = append(summary.Assignees, login)
+	return summary, nil
 }
 
 func sortAutonomousDispatchCandidates(candidates []autonomousDispatchCandidate) {

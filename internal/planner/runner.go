@@ -59,12 +59,14 @@ const (
 )
 
 type IssueSummary struct {
-	Number    int64
-	Title     string
-	Body      string
-	URL       string
-	Assignees []string
-	Labels    []string
+	Number                       int64
+	Title                        string
+	Body                         string
+	URL                          string
+	Author                       string
+	Assignees                    []string
+	Labels                       []string
+	PersonalAssigneeAutoAssigned bool
 	// Clarifications are answers a human gave to Triager's questions before this
 	// Issue was routed. They are carried explicitly rather than re-read from the
 	// Issue's comments so Planner sees exactly what was answered, without having
@@ -559,8 +561,9 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 	if policy.RequireAssigneeCurrentUser && login == "" {
 		return DiscoveryResult{Skipped: 1}, nil
 	}
+	personalProject := r.isPersonalProject(project.ID)
 	assigneeFilter := ""
-	if policy.RequireAssigneeCurrentUser {
+	if policy.RequireAssigneeCurrentUser && !personalProject {
 		assigneeFilter = login
 	}
 	issues, err := r.listOpenIssuesForDiscovery(ctx, ListOpenIssuesInput{Repo: input.Repo, CWD: project.RepoPath, Limit: input.Limit, Assignee: assigneeFilter}, policy)
@@ -569,6 +572,11 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 	}
 	result := DiscoveryResult{}
 	for _, issue := range issues {
+		assigned, err := r.assignPersonalIssueIfEligible(ctx, *project, input.Repo, issue, login, personalProject, policy.RequireAssigneeCurrentUser)
+		if err != nil {
+			return DiscoveryResult{}, err
+		}
+		issue = assigned
 		if domain.IsAutoLaneHeld(domain.LoopTypePlanner, issue.Labels) {
 			result.Skipped++
 			continue
@@ -587,6 +595,22 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 		result.Skipped += materialized.Skipped
 	}
 	return result, nil
+}
+
+func (r *Runner) isPersonalProject(projectID string) bool {
+	return r.projectRoleConfig != nil && config.IsPersonalProject(*r.projectRoleConfig, projectID)
+}
+
+func (r *Runner) assignPersonalIssueIfEligible(ctx context.Context, project storage.ProjectRecord, repo string, issue IssueSummary, login string, personalProject, requireAssignee bool) (IssueSummary, error) {
+	if !personalProject || !requireAssignee || normalizeLogin(login) == "" || !strings.EqualFold(strings.TrimSpace(issue.Author), strings.TrimSpace(login)) || len(issue.Assignees) > 0 {
+		return issue, nil
+	}
+	if err := r.github.AddIssueAssignees(ctx, IssueAssigneesInput{Repo: repo, IssueNumber: issue.Number, Assignees: []string{login}, CWD: project.RepoPath}); err != nil {
+		return issue, fmt.Errorf("assign self-authored planner issue %s#%d: %w", repo, issue.Number, err)
+	}
+	issue.Assignees = append(issue.Assignees, login)
+	issue.PersonalAssigneeAutoAssigned = true
+	return issue, nil
 }
 
 // RouteIssue projects a persisted routing authority into Planner's durable
@@ -649,6 +673,9 @@ func (r *Runner) materializeIssue(ctx context.Context, project storage.ProjectRe
 	}
 	if len(issue.Clarifications) > 0 {
 		payload["clarifications"] = issue.Clarifications
+	}
+	if issue.PersonalAssigneeAutoAssigned {
+		payload["personalProjectAutoAssigned"] = true
 	}
 	if authority != "" {
 		payload[plannerQueueRoutingAuthorityKey] = authority
@@ -1769,7 +1796,11 @@ func (r *Runner) ensureLoopForIssueWithAuthority(ctx context.Context, project st
 				updated.Status = "queued"
 				updated.NextRunAt = &nowISO
 			}
-			metadataJSON, err := mergeLoopMetadataJSON(existing.MetadataJSON, map[string]any{"issueTitle": issue.Title, "issueURL": issue.URL, "issueNumber": issue.Number, "specPath": buildSpecPath(r.now(), issue.Number, issue.Title)})
+			updates := map[string]any{"issueTitle": issue.Title, "issueURL": issue.URL, "issueNumber": issue.Number, "specPath": buildSpecPath(r.now(), issue.Number, issue.Title)}
+			if issue.PersonalAssigneeAutoAssigned {
+				updates["personalProjectAutoAssigned"] = true
+			}
+			metadataJSON, err := mergeLoopMetadataJSON(existing.MetadataJSON, updates)
 			if err != nil {
 				// Discovery must not report success and enqueue work without
 				// the refreshed issue metadata.
@@ -1788,6 +1819,9 @@ func (r *Runner) ensureLoopForIssueWithAuthority(ctx context.Context, project st
 		return loopUpsertResult{}, err
 	}
 	metadata := map[string]any{"issueTitle": issue.Title, "issueURL": issue.URL, "issueNumber": issue.Number, "specPath": buildSpecPath(r.now(), issue.Number, issue.Title)}
+	if issue.PersonalAssigneeAutoAssigned {
+		metadata["personalProjectAutoAssigned"] = true
+	}
 	if authority != "" {
 		metadata[plannerQueueRoutingAuthorityKey] = authority
 	}
@@ -1810,6 +1844,9 @@ func (r *Runner) refreshIssueLoop(ctx context.Context, existing storage.LoopReco
 		updated.NextRunAt = &nowISO
 	}
 	metadata := map[string]any{"issueTitle": issue.Title, "issueURL": issue.URL, "issueNumber": issue.Number, "specPath": buildSpecPath(r.now(), issue.Number, issue.Title)}
+	if issue.PersonalAssigneeAutoAssigned {
+		metadata["personalProjectAutoAssigned"] = true
+	}
 	if authority != "" {
 		metadata[plannerQueueRoutingAuthorityKey] = authority
 	}
