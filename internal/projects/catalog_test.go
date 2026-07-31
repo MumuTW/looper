@@ -264,8 +264,8 @@ func TestMaterializeCatalogUsesRecordsAsProjectAuthority(t *testing.T) {
 	if project.Provider != "ghes-main" || project.Repo != "core/odcrew" {
 		t.Fatalf("project binding = (%q, %q), want stored binding", project.Provider, project.Repo)
 	}
-	if project.Network.Mode != config.NetworkModeRouted {
-		t.Fatalf("project policy network mode = %q, want imported routed policy", project.Network.Mode)
+	if project.Network.Mode != "" {
+		t.Fatalf("project policy network mode = %q, want legacy routed metadata ignored", project.Network.Mode)
 	}
 }
 
@@ -363,7 +363,6 @@ func TestConfiguredProjectMetadataRoundTripsRuntimePolicy(t *testing.T) {
 		Repo:            "core/odcrew",
 		RepoPath:        "/repos/odcrew",
 		Path:            "nested/path",
-		Network:         config.ProjectNetworkConfig{Mode: config.NetworkModeRouted},
 		Webhook:         config.ProjectWebhookConfig{Mode: config.WebhookModeTunnel},
 		Roles:           &config.PartialRoleConfigs{},
 	}
@@ -386,7 +385,7 @@ func TestConfiguredProjectMetadataRoundTripsRuntimePolicy(t *testing.T) {
 	if materialized.Provider != project.Provider || materialized.Repo != project.Repo || materialized.Path != project.Path || !materialized.PersonalProject {
 		t.Fatalf("materialized binding = %#v, want %#v", materialized, project)
 	}
-	if materialized.Network.Mode != project.Network.Mode || materialized.Webhook.Mode != project.Webhook.Mode || materialized.Roles == nil {
+	if materialized.Network.Mode != "" || materialized.Webhook.Mode != project.Webhook.Mode || materialized.Roles == nil {
 		t.Fatalf("materialized policy = %#v, want persisted project policy", materialized)
 	}
 }

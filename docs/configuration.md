@@ -12,29 +12,16 @@ For the default supported install flow:
 
 Keep the runtime directory (`~/.looper` by default, or the directory containing `storage.dbPath`) on a local filesystem. The database lock uses OS file locking and is not designed for NFS-style shared filesystems. If shutdown retains SQLite after an undrained ownership failure, it retains the shared lock too; start a replacement only after the owning process has exited. Tunnel-mode webhook secrets live under the same runtime directory in `secrets/` and must be mode `0600`.
 
-## Network mode summary
+## Network mode
 
-Looper has two project-level network modes:
+Only local operation is supported. `looper:target:*` labels are ignored and the
+single-Node assignee/review-request behavior remains authoritative.
 
-- `projects[].network.mode = "off"` — local-only operation. `looper:target:*` labels are ignored and the classic single-Node assignee/review-request behavior stays unchanged.
-- `projects[].network.mode = "routed"` — multi-Node operation coordinated through `loopernet`.
-
-Authority stays split on purpose:
-
-- GitHub work intent stays on GitHub: `looper:worker-ready` for Worker and GitHub review requests for Reviewer.
-- exactly one `looper:target:<node_name>` label is the exact-Node authority in Routed mode.
-- the `loopernet` lease is a mutation fence for Coordinator only; it does not become the source of truth for work intent.
-
-Operational notes:
-
-- `loopernet` centralizes webhook ingress and Node wakeups, but it must not mutate GitHub on its own.
-- Coordinator writes coarse GitHub authority first, then writes the exact target label last.
-- polling remains enabled as fallback and drift recovery when webhook delivery or SSE wakeups are missed.
-- when enabling Routed mode / network membership in config, Looper rejects enrollment when Planner or Fixer auto-discovery is still enabled for those projects; disable those settings first or opt projects into Routed mode manually.
-
-The formal contract is documented in ADRs [0007](adr/0007-coordinator-admission-assignment-authority.md) through [0011](adr/0011-coordinator-control-plane-for-routed-projects-v1.md).
-
-For runtime deployment details — container image, required environment variables, persistence, and the current single-instance recommendation — see [loopernet deployment](loopernet-deployment.md).
+The former `[network]` and `projects[].network` sections are rejected. They were
+removed because a user-authored enrollment flag or URL cannot prove that a
+credential was issued, persisted, or can be revoked safely. Routed mode may be
+reintroduced only with one crash-safe enrollment producer and recovery contract.
+The Network ADRs document the withdrawn design and are not configuration guidance.
 
 ## Webhook delivery modes
 

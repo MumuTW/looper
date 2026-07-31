@@ -35,7 +35,7 @@ Also make sure:
 - GitHub projects: `gh` is authenticated with the target GitHub account
 - each coding role you want to run can resolve a vendor: set global `agent.vendor` in the config (for example `vendor = "opencode"`), or supply vendor via `agent.profiles` / `roles.<role>.agent` as described in [Multi-role agent vendor and model](configuration.md#multi-role-agent-vendor-and-model). A single global vendor is the zero-diff default that covers planner, worker, reviewer, and fixer until you add per-role bindings. Coordinator triage always uses the global agent only and is skipped when global vendor is unset.
 
-`GET /api/v1/status` reports service, storage, scheduler, agent, webhook, loop, network, safety, notification, and tool state; there is no per-provider health surface. `looper status` reports the config file, daemon reachability, and the registered projects.
+`GET /api/v1/status` reports service, storage, scheduler, agent, webhook, loop, safety, notification, and tool state; there is no per-provider health surface. `looper status` reports the config file, daemon reachability, and the registered projects.
 
 ### Grok Build (xAI)
 
@@ -43,38 +43,17 @@ For xAI Grok Build, configure `agent.vendor = "grok-build"`; Looper runs the `gr
 
 Configured Grok arguments take precedence: `--permission-mode` can prompt or fail unattended work, a non-`plain` `--output-format` can break direct completion-marker parsing, and `-p`/`--single` replaces Looper's generated task prompt. Grok Build has no daemon native resume or interactive park-for-handwork path beyond the generic `looper takeover <selector>` loop park. Retries start with a fresh checkpoint prompt; Looper never uses ambient `--continue`.
 
-## 1a. Local-only vs Routed projects
+## 1a. Local-only projects
 
-Looper supports two project modes:
+Looper currently runs local-only. Worker claims `looper:worker-ready` Issues
+assigned to the local GitHub user, Reviewer claims PRs with a review request for
+that user, and `looper:target:*` labels do nothing.
 
-- `network.mode=off` — local-only. Worker claims `looper:worker-ready` Issues assigned to the local GitHub user, Reviewer claims PRs with a review request for the local GitHub user, and `looper:target:*` labels do nothing.
-- `network.mode=routed` — multi-Node. `loopernet` receives centralized webhook ingress, fans out wakeups to Nodes, and exposes the Coordinator lease used for fencing.
-
-Routed mode keeps authorities separate:
-
-- GitHub remains the work-intent authority.
-- `looper:target:<node_name>` is only the exact-Node authority.
-- the lease only decides which Coordinator may mutate GitHub.
-
-That means `loopernet` never becomes the source of truth for Issue admission or PR review assignment, and it must not mutate GitHub directly.
-
-## 1b. Routed setup and recovery
-
-Before enrolling Nodes, deploy exactly one active `loopernet` instance per Network. For container examples, persistence requirements, and the current non-HA constraint, see [loopernet deployment](loopernet-deployment.md).
-
-Typical Routed rollout:
-
-1. join each Node to `loopernet` by configuring network membership in the config file / dashboard (the `looper network join` CLI was removed)
-2. disable unsupported routed auto-discovery (`planner` and `fixer`) before opting projects into `network.mode=routed`
-3. keep Worker and Reviewer identities stable per Node; duplicate GitHub identities are safe only because the exact target label disambiguates which Node may claim
-4. restart `looperd` and confirm membership, identity, and lease state on the dashboard or `GET /api/v1/network/status`
-
-Operator recovery rules:
-
-- if the target label is removed, duplicated, changed, or stale before work starts, Worker/Reviewer will not claim it
-- if `looper:worker-ready`, the GitHub assignee, or the review request disappears before processing starts, the queued item becomes unclaimable
-- if webhook ingress or SSE wakeups degrade, polling continues as a fallback so Coordinator can repair drift
-- if a stale target label remains after lease loss or a partial GitHub mutation, let Coordinator reconciliation repair or remove it before retrying
+Routed setup is not supported. Remove old `[network]` and
+`projects[].network` configuration before starting an upgraded daemon. Looper
+rejects those fields explicitly because neither config nor the dashboard has a
+safe producer for durable membership credentials. There is no Network status or
+maintenance API while this surface is withdrawn.
 
 ## 2. How Looper resolves the project
 

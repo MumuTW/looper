@@ -163,22 +163,17 @@ Each role runs in its own worktree, coordinated by `looperd` and gated by labels
 
 Looper is poll-driven by default: keep `looperd` running and forge credentials available for the loop to fire. Projects use `gh`. Everything runs locally — no hosted control plane required.
 
-## Networked operation
+## Network operation
 
-Looper supports two project modes:
+Looper currently supports local-only projects. Worker claims `looper:worker-ready`
+Issues assigned to the local GitHub user, Reviewer claims review requests for the
+local GitHub user, and `looper:target:*` labels are ignored.
 
-- `network.mode=off` — local-only behavior. Worker still claims `looper:worker-ready` Issues assigned to the local GitHub user, Reviewer still claims review requests for the local GitHub user, and any `looper:target:*` labels are ignored.
-- `network.mode=routed` — multi-Node behavior. `loopernet` centralizes webhook ingress and event fan-out, but GitHub remains the authority for work intent.
-
-In Routed mode:
-
-- Coordinator, not `loopernet`, mutates GitHub for Issue admission and PR review assignment.
-- `looper:worker-ready` and GitHub review requests express work intent.
-- exactly one `looper:target:<node_name>` label is the exact-Node authority, and Coordinator writes it last.
-- the `loopernet` Coordinator lease is only a fencing gate for mutation rights; if the lease is stale, Coordinator must stop mutating GitHub.
-- polling stays enabled as drift recovery if webhook ingress or SSE wakeups are missed; it is not the primary wakeup path.
-
-For setup, identity strategy, recovery steps, and `loopernet` deployment, see **[docs/users-guide.md](docs/users-guide.md)**, **[docs/configuration.md](docs/configuration.md)**, and **[docs/loopernet-deployment.md](docs/loopernet-deployment.md)**. The formal authority rules live in ADRs **[0007](docs/adr/0007-coordinator-admission-assignment-authority.md)** through **[0011](docs/adr/0011-coordinator-control-plane-for-routed-projects-v1.md)**.
+Routed multi-Node mode is withdrawn until Looper has one crash-safe producer for
+durable membership credentials. The old `[network]` and
+`projects[].network.mode` settings are rejected instead of accepting a
+configuration that cannot prove enrollment. Historical Network ADRs remain in
+the repository as design context, not as a supported operator workflow.
 
 ## Command cheatsheet
 
