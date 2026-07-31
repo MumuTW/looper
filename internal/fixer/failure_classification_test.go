@@ -5,6 +5,9 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/MumuTW/looper/internal/agent"
+	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/fixer/failurepolicy"
 	"github.com/MumuTW/looper/internal/loops/failureclass"
 )
 
@@ -56,5 +59,21 @@ func TestValidateCompletedRepairCheckpointAcceptsParsedResults(t *testing.T) {
 	repair := &checkpointRepair{ParseStatus: "parsed", Summary: "gh: could not connect to api.github.com"}
 	if err := validateCompletedRepairCheckpoint(repair, nil); err != nil {
 		t.Fatalf("validateCompletedRepairCheckpoint() = %v, want nil for a parsed result", err)
+	}
+}
+
+// A vendor that cannot deny tool network access is a static configuration
+// mismatch: without this the repair step's model-provider boundary reads it as
+// transient and burns every retry attempt into the failure-streak breaker.
+func TestClassifyFailureHoldsUnsupportedToolNetworkVendorForOperator(t *testing.T) {
+	runner := &Runner{}
+	_, err := agent.New(agent.ExecutorOptions{Config: agent.ExecutorConfig{Vendor: config.AgentVendorClaudeCode}}).
+		Start(context.Background(), agent.RunInput{Prompt: "hello", WorkingDirectory: t.TempDir(), RestrictToolNetwork: true})
+	if err == nil {
+		t.Fatal("agent Start() error = nil, want fail-closed refusal")
+	}
+	got := runner.classifyFailureWithBoundary(err, failurepolicy.BoundaryForStep(string(stepRepair)))
+	if got.kind != FailureManualIntervention {
+		t.Fatalf("classifyFailure() kind = %s, want %s", got.kind, FailureManualIntervention)
 	}
 }

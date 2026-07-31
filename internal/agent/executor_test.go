@@ -17,6 +17,7 @@ import (
 
 	"github.com/MumuTW/looper/internal/config"
 	"github.com/MumuTW/looper/internal/forge"
+	"github.com/MumuTW/looper/internal/loops/failureclass"
 	"github.com/MumuTW/looper/internal/processcontainment"
 	"github.com/MumuTW/looper/internal/processidentity"
 	"github.com/MumuTW/looper/internal/storage"
@@ -190,13 +191,142 @@ func TestRestrictedAgentSandboxConfigIsAcceptedByCodexExec(t *testing.T) {
 	}
 }
 
-func TestConfiguredExecutorRejectsRestrictedNonCodexAgent(t *testing.T) {
+func TestConfiguredExecutorRejectsRestrictedUnsupportedVendor(t *testing.T) {
 	t.Parallel()
 
-	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendorClaudeCode}})
-	_, err := executor.Start(context.Background(), RunInput{Prompt: "hello", WorkingDirectory: t.TempDir(), RestrictToolNetwork: true})
-	if err == nil || !strings.Contains(err.Error(), "supported only for codex") {
-		t.Fatalf("Start() error = %v, want fail-closed unsupported-vendor error", err)
+	for _, vendor := range []config.AgentVendor{config.AgentVendorClaudeCode, config.AgentVendor("not-a-vendor")} {
+		vendor := vendor
+		t.Run(string(vendor), func(t *testing.T) {
+			t.Parallel()
+			executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: vendor}})
+			_, err := executor.Start(context.Background(), RunInput{Prompt: "hello", WorkingDirectory: t.TempDir(), RestrictToolNetwork: true})
+			if err == nil {
+				t.Fatal("Start() error = nil, want fail-closed unsupported-vendor error")
+			}
+			if !strings.Contains(err.Error(), string(vendor)) {
+				t.Fatalf("Start() error = %v, want the vendor named", err)
+			}
+			for _, supported := range ToolNetworkDenialVendors() {
+				if !strings.Contains(err.Error(), string(supported)) {
+					t.Fatalf("Start() error = %v, want supported vendor %q named", err, supported)
+				}
+			}
+			// A vendor that cannot express the restriction is a static config
+			// mismatch: retrying it burns attempts and trips the breaker.
+			if !errors.Is(err, failureclass.ErrStaticConfigMismatch) {
+				t.Fatalf("Start() error = %v, want a static-config-mismatch classification", err)
+			}
+			if kind := failureclass.Classify(err, failureclass.Context{Runner: failureclass.RunnerFixer, Boundary: failureclass.BoundaryModelProvider}); kind != failureclass.ManualIntervention {
+				t.Fatalf("Classify() = %q, want %q", kind, failureclass.ManualIntervention)
+			}
+		})
+	}
+}
+
+func TestEnforceDevinToolNetworkDeniedPinsSandboxAndConfig(t *testing.T) {
+	t.Parallel()
+
+	sandbox, err := validationcmd.NewSandbox(t.TempDir(), "looper-agent", "looper-agent-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sandbox.Cleanup()
+
+	_, spawnArgs := ResolveSpawn(ExecutorConfig{Vendor: config.AgentVendorDevinExperimental}, t.TempDir(), "hello")
+	got, err := enforceDevinToolNetworkDenied(spawnArgs, "hello", sandbox)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(sandbox.TempRoot, devinRestrictedConfigFileName)
+	want := []string{"--sandbox", "--config", configPath, "--respect-workspace-trust", "false", "--print", "hello"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("restricted devin args = %#v, want %#v", got, want)
+	}
+
+	raw, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var parsed struct {
+		Sandbox struct {
+			NetworkMode    string   `json:"network_mode"`
+			AllowedDomains []string `json:"allowed_domains"`
+			DeniedDomains  []string `json:"denied_domains"`
+		} `json:"sandbox"`
+	}
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		t.Fatalf("generated devin config is not valid JSON: %v\n%s", err, raw)
+	}
+	if parsed.Sandbox.NetworkMode != "limited" {
+		t.Fatalf("network_mode = %q, want limited", parsed.Sandbox.NetworkMode)
+	}
+	if len(parsed.Sandbox.AllowedDomains) != 0 || len(parsed.Sandbox.DeniedDomains) != 0 {
+		t.Fatalf("domain lists = %#v/%#v, want both empty", parsed.Sandbox.AllowedDomains, parsed.Sandbox.DeniedDomains)
+	}
+}
+
+func TestEnforceDevinToolNetworkDeniedStripsWideningFlags(t *testing.T) {
+	t.Parallel()
+
+	sandbox, err := validationcmd.NewSandbox(t.TempDir(), "looper-agent", "looper-agent-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sandbox.Cleanup()
+
+	args := []string{
+		"--config", "/tmp/operator-config.json",
+		"--agent-config=/tmp/operator-agent.yaml",
+		"--permission-mode", "dangerous",
+		"--sandbox",
+		"--respect-workspace-trust", "false",
+		"--print", "hello",
+	}
+	got, err := enforceDevinToolNetworkDenied(args, "hello", sandbox)
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(got, " ")
+	for _, forbidden := range []string{"operator-config.json", "operator-agent.yaml", "--permission-mode", "dangerous"} {
+		if strings.Contains(joined, forbidden) {
+			t.Fatalf("restricted devin args retain %q: %q", forbidden, joined)
+		}
+	}
+	if strings.Count(joined, "--sandbox") != 1 {
+		t.Fatalf("restricted devin args = %q, want exactly one --sandbox", joined)
+	}
+	if got[len(got)-1] != "hello" {
+		t.Fatalf("restricted devin args = %#v, want the prompt last", got)
+	}
+	if !strings.Contains(joined, "--config "+filepath.Join(sandbox.TempRoot, devinRestrictedConfigFileName)) {
+		t.Fatalf("restricted devin args = %q, want the generated config", joined)
+	}
+}
+
+func TestEnforceDevinToolNetworkDeniedRequiresSandbox(t *testing.T) {
+	t.Parallel()
+
+	if _, err := enforceDevinToolNetworkDenied([]string{"--print", "hello"}, "hello", nil); err == nil {
+		t.Fatal("enforceDevinToolNetworkDenied() error = nil, want fail-closed without a prepared sandbox")
+	}
+}
+
+// TestToolNetworkDenialVendorsMatchAdapterTable is the drift guard between the
+// adapter table (source of truth) and the allowlist internal/config carries so
+// startup validation can reject the mismatch without importing internal/agent.
+func TestToolNetworkDenialVendorsMatchAdapterTable(t *testing.T) {
+	t.Parallel()
+
+	got := ToolNetworkDenialVendors()
+	want := config.ToolNetworkDenialVendors()
+	slices.Sort(want)
+	if !slices.Equal(got, want) {
+		t.Fatalf("adapter vendors %#v differ from config.ToolNetworkDenialVendors() %#v; update internal/config/agent_resolve.go", got, want)
+	}
+	for _, vendor := range config.ConfigurableAgentVendors() {
+		if VendorSupportsToolNetworkDenial(vendor) != config.VendorSupportsToolNetworkDenial(vendor) {
+			t.Fatalf("vendor %q: adapter support = %v, config support = %v", vendor, VendorSupportsToolNetworkDenial(vendor), config.VendorSupportsToolNetworkDenial(vendor))
+		}
 	}
 }
 
