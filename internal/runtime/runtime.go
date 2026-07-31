@@ -1352,7 +1352,8 @@ func (r *Runtime) reloadProjectCatalog(ctx context.Context, repos *storage.Repos
 	if err != nil {
 		return fmt.Errorf("materialize runtime project catalog: %w", err)
 	}
-	if err := projects.ValidateStoredCatalogValidationPolicies(global, records, materialized); err != nil {
+	materialized, err = projects.ValidateStoredCatalogValidationPolicies(global, records, materialized)
+	if err != nil {
 		return fmt.Errorf("validate runtime project catalog: %w", err)
 	}
 	r.publishProjects(materialized)

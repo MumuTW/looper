@@ -19,10 +19,21 @@ import (
 func TestHandlerProjectsPatchRepairsLegacyProjectWithoutValidationStance(t *testing.T) {
 	runtime, cfg := startLegacyProjectRuntime(t)
 	runtime.Services().Projects.ScheduleDiscovery = func(func()) {}
+	handler := legacyProjectHandler(runtime, cfg)
+	if got := runtime.Config().Projects; len(got) != 0 {
+		t.Fatalf("runtime catalog projects = %#v, want legacy inert project quarantined", got)
+	}
+
+	workerRecorder := httptest.NewRecorder()
+	workerRequest := httptest.NewRequest(http.MethodPost, "/api/v1/workers", bytes.NewReader([]byte(`{"projectId":"legacy_inert","repo":"acme/app","baseBranch":"main","prompt":"repair me"}`)))
+	handler.ServeHTTP(workerRecorder, workerRequest)
+	if workerRecorder.Code != http.StatusBadRequest || !strings.Contains(workerRecorder.Body.String(), "validation policy is repaired") {
+		t.Fatalf("manual worker status = %d body=%s, want quarantined project rejection", workerRecorder.Code, workerRecorder.Body.String())
+	}
 
 	recorder := httptest.NewRecorder()
 	request := httptest.NewRequest(http.MethodPatch, "/api/v1/projects/legacy_inert", bytes.NewReader([]byte(`{"repo":"acme/app"}`)))
-	NewHandler(Context{Config: cfg, Runtime: runtime}).ServeHTTP(recorder, request)
+	handler.ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusBadRequest {
 		t.Fatalf("status without validation stance = %d, want 400 body=%s", recorder.Code, recorder.Body.String())
 	}
@@ -36,7 +47,7 @@ func TestHandlerProjectsPatchRepairsLegacyProjectWithoutValidationStance(t *test
 
 	recorder = httptest.NewRecorder()
 	request = httptest.NewRequest(http.MethodPatch, "/api/v1/projects/legacy_inert", bytes.NewReader([]byte(`{"repo":"acme/app","validation":{"optOut":true}}`)))
-	NewHandler(Context{Config: cfg, Runtime: runtime}).ServeHTTP(recorder, request)
+	handler.ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200 body=%s", recorder.Code, recorder.Body.String())
 	}
@@ -49,9 +60,55 @@ func TestHandlerProjectsPatchRepairsLegacyProjectWithoutValidationStance(t *test
 	if !strings.Contains(*stored.MetadataJSON, `"repo":"acme/app"`) || !strings.Contains(*stored.MetadataJSON, `"validation":{"optOut":true}`) {
 		t.Fatalf("metadata = %s, want repo and explicit validation opt-out", *stored.MetadataJSON)
 	}
+	if got := runtime.Config().Projects; len(got) != 1 || got[0].ID != "legacy_inert" {
+		t.Fatalf("runtime catalog projects after repair = %#v, want repaired project published", got)
+	}
+}
+
+func TestHandlerProjectsPatchRejectsInvalidAuthoredPolicyWithoutAgent(t *testing.T) {
+	runtime, cfg := startLegacyProjectRuntimeWithAgent(t, false)
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPatch, "/api/v1/projects/legacy_inert", bytes.NewReader([]byte(`{"validation":{"commands":[]}}`)))
+	NewHandler(Context{Config: cfg, Runtime: runtime}).ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 body=%s", recorder.Code, recorder.Body.String())
+	}
+	stored, err := runtime.Services().Repositories.Projects.GetByID(context.Background(), "legacy_inert")
+	if err != nil || stored == nil || stored.MetadataJSON == nil {
+		t.Fatalf("Projects.GetByID() = %#v, %v", stored, err)
+	}
+	if strings.Contains(*stored.MetadataJSON, `"validation"`) {
+		t.Fatalf("metadata = %s, invalid authored policy was persisted", *stored.MetadataJSON)
+	}
+}
+
+func TestLegacyProjectRuntimeReloadKeepsQuarantine(t *testing.T) {
+	runtime, _ := startLegacyProjectRuntime(t)
+
+	if err := runtime.ReloadConfig(context.Background()); err != nil {
+		t.Fatalf("ReloadConfig() error = %v", err)
+	}
+	if got := runtime.Config().Projects; len(got) != 0 {
+		t.Fatalf("runtime catalog projects after reload = %#v, want quarantine preserved", got)
+	}
 }
 
 func startLegacyProjectRuntime(t *testing.T) (*looperdruntime.Runtime, config.Config) {
+	return startLegacyProjectRuntimeWithAgent(t, true)
+}
+
+func legacyProjectHandler(runtime *looperdruntime.Runtime, cfg config.Config) *Handler {
+	return NewHandler(Context{
+		Config:  cfg,
+		Runtime: runtime,
+		ConfigSnapshot: func() (config.Config, ConfigMetadata) {
+			return runtime.Config(), ConfigMetadata{}
+		},
+	})
+}
+
+func startLegacyProjectRuntimeWithAgent(t *testing.T, withAgent bool) (*looperdruntime.Runtime, config.Config) {
 	t.Helper()
 
 	rootDir := t.TempDir()
@@ -70,8 +127,10 @@ func startLegacyProjectRuntime(t *testing.T) (*looperdruntime.Runtime, config.Co
 	cfg.Storage.BackupDir = &backupDir
 	cfg.Daemon.LogDir = filepath.Join(rootDir, "logs")
 	cfg.Daemon.WorkingDirectory = rootDir
-	vendor := config.AgentVendorOpenCode
-	cfg.Agent.Vendor = &vendor
+	if withAgent {
+		vendor := config.AgentVendorOpenCode
+		cfg.Agent.Vendor = &vendor
+	}
 
 	coordinator, err := storage.OpenSQLiteCoordinator(context.Background(), cfg.Storage.DBPath, storage.SQLiteCoordinatorOptions{BackupDir: backupDir})
 	if err != nil {
@@ -96,8 +155,13 @@ func startLegacyProjectRuntime(t *testing.T) (*looperdruntime.Runtime, config.Co
 		t.Fatalf("SQLiteCoordinator.Close() error = %v", err)
 	}
 
+	loaded := config.LoadedFileConfig{Config: cfg}
 	runtime := looperdruntime.New(looperdruntime.Options{
-		Config: cfg,
+		Config:        cfg,
+		InitialConfig: loaded,
+		ReloadConfig: func() (config.LoadedFileConfig, error) {
+			return loaded, nil
+		},
 		Logger: noopLogger{},
 		Now: func() time.Time {
 			return now

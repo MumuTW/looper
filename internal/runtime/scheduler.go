@@ -2683,6 +2683,10 @@ func schedulerProjectsForCapturedCatalog(ctx context.Context, input defaultSched
 			continue
 		}
 		binding, ok := runtimeProjectBinding(*input.Config, project.ID)
+		codingPolicyRequired := config.CodingRoleAgentConfigured(*input.Config, config.CodingRoleWorker) || config.CodingRoleAgentConfigured(*input.Config, config.CodingRoleFixer)
+		if !ok && codingPolicyRequired && projects.IsLegacyInertProject(project) && len(config.ResolveValidationCommands(*input.Config)) == 0 {
+			continue
+		}
 		if !ok || !catalogBindingMatchesProject(binding, project) {
 			if input.Logger != nil {
 				input.Logger.Debug("scheduler deferred pass until project catalog catches up", map[string]any{"projectId": project.ID})
@@ -2969,10 +2973,11 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 		return claimContinue, nil
 	}
 
+	projectScopedTypes, runnableProjectIDs := codingClaimProjectScope(input.Config)
 	stopClaiming := false
 	for i := 0; i < availableSlots; i++ {
 		result, err := claimOne(func(ctx context.Context, nowISO, claimedBy string) (*storage.QueueItemRecord, error) {
-			return input.Repos.Queue.ClaimNextNonLongTermRetryAmongTypeSets(ctx, nowISO, claimedBy, unrestrictedTypes, stickySnapshotTypes)
+			return input.Repos.Queue.ClaimNextNonLongTermRetryAmongTypeSetsForProjects(ctx, nowISO, claimedBy, unrestrictedTypes, stickySnapshotTypes, projectScopedTypes, runnableProjectIDs)
 		})
 		if err != nil {
 			return queueItems, dispatchOwnedQueueClaims(ctx, owned, input, err)
@@ -2987,7 +2992,7 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 	}
 	for !stopClaiming && len(queueItems) < availableSlots {
 		result, err := claimOne(func(ctx context.Context, nowISO, claimedBy string) (*storage.QueueItemRecord, error) {
-			return input.Repos.Queue.ClaimNextLongTermRetryAmongTypeSets(ctx, nowISO, claimedBy, unrestrictedTypes, stickySnapshotTypes)
+			return input.Repos.Queue.ClaimNextLongTermRetryAmongTypeSetsForProjects(ctx, nowISO, claimedBy, unrestrictedTypes, stickySnapshotTypes, projectScopedTypes, runnableProjectIDs)
 		})
 		if err != nil {
 			return queueItems, dispatchOwnedQueueClaims(ctx, owned, input, err)
@@ -2997,6 +3002,17 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 		}
 	}
 	return queueItems, dispatchOwnedQueueClaims(ctx, owned, input, nil)
+}
+
+func codingClaimProjectScope(cfg *config.Config) ([]string, []string) {
+	if cfg == nil {
+		return nil, nil
+	}
+	projectIDs := make([]string, 0, len(cfg.Projects))
+	for _, project := range cfg.Projects {
+		projectIDs = append(projectIDs, project.ID)
+	}
+	return []string{"fixer", "worker"}, projectIDs
 }
 
 // claimErrorIsAmbiguousCancel reports whether a ClaimNext* error may have

@@ -4220,6 +4220,9 @@ func (h *Handler) buildCreateLoopResponse(r *http.Request) (loopResponse, error)
 	if err != nil {
 		return loopResponse{}, err
 	}
+	if err := h.validateCodingProjectRunnable(projectID, domain.LoopType(loopType)); err != nil {
+		return loopResponse{}, err
+	}
 	if err := validateLoopTargetProjectCompatibility(projectID, parseProjectMetadata(project.MetadataJSON), target); err != nil {
 		return loopResponse{}, err
 	}
@@ -4412,6 +4415,9 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 		return workerCreateResponse{}, err
 	}
 	projectID := project.ID
+	if err := h.validateCodingProjectRunnable(projectID, domain.LoopTypeWorker); err != nil {
+		return workerCreateResponse{}, err
+	}
 
 	repo := normalizeOptionalString(body.Repo)
 	if repo == nil {
@@ -7888,6 +7894,22 @@ func validateLoopTargetProjectCompatibility(projectID string, projectMetadata ma
 	}
 
 	return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("project %s is configured for repo %s, not %s", projectID, configuredRepo, targetRepo)}
+}
+
+func (h *Handler) validateCodingProjectRunnable(projectID string, loopType domain.LoopType) error {
+	if loopType != domain.LoopTypeWorker && loopType != domain.LoopTypeFixer {
+		return nil
+	}
+	if h.context.ConfigSnapshot == nil {
+		return nil
+	}
+	cfg, _ := h.context.ConfigSnapshot()
+	for _, project := range cfg.Projects {
+		if project.ID == projectID {
+			return nil
+		}
+	}
+	return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("project %s is unavailable for coding work until its validation policy is repaired", projectID)}
 }
 
 func stringMetadataPtr(metadata map[string]any, key string) *string {

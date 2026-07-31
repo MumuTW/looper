@@ -404,6 +404,9 @@ func (s *Service) addProjectLocked(ctx context.Context, input AddInput) (AddResu
 	}
 	delete(metadata, "provider")
 	if input.Validation != nil {
+		if err := config.ValidateProjectValidationPolicy(input.Validation); err != nil {
+			return AddResult{}, nil, ProjectValidationError{Message: err.Error()}
+		}
 		metadata["validation"] = config.ProjectValidationConfig{
 			Commands: append([]string(nil), input.Validation.Commands...),
 			OptOut:   input.Validation.OptOut,
@@ -699,6 +702,9 @@ func (s *Service) UpdateProject(ctx context.Context, identifier string, input Up
 		}
 	}
 	if input.Validation != nil {
+		if err := config.ValidateProjectValidationPolicy(input.Validation); err != nil {
+			return storage.ProjectRecord{}, ProjectValidationError{Message: err.Error()}
+		}
 		metadata["validation"] = config.ProjectValidationConfig{
 			Commands: append([]string(nil), input.Validation.Commands...),
 			OptOut:   input.Validation.OptOut,
@@ -1600,24 +1606,33 @@ func (s *Service) materializeCandidate(ctx context.Context, replacement *storage
 		// may remain unstanced while it is repaired. New registrations and a
 		// PATCH that adds repository metadata still validate every project.
 		legacyInert := intersectProjectIDs(legacyInertProjectIDs(records), originalLegacyInert)
-		if err := validateCatalogValidationPolicies(current, materialized, legacyInert); err != nil {
+		materialized, err = validateCatalogValidationPolicies(current, materialized, legacyInert)
+		if err != nil {
 			return nil, err
 		}
 	}
 	return materialized, nil
 }
 
+// IsLegacyInertProject reports whether record predates project validation and
+// has no repository identity, so it cannot enter automatic discovery while an
+// operator repairs it. This classification never grants coding authority.
+func IsLegacyInertProject(record storage.ProjectRecord) bool {
+	if record.Archived {
+		return false
+	}
+	metadata := parseMetadata(record.MetadataJSON)
+	if metadataString(metadata, "source") != "api" || metadataString(metadata, "repo") != "" {
+		return false
+	}
+	_, hasValidation := metadata["validation"]
+	return !hasValidation
+}
+
 func legacyInertProjectIDs(records []storage.ProjectRecord) map[string]struct{} {
 	ids := map[string]struct{}{}
 	for _, record := range records {
-		if record.Archived {
-			continue
-		}
-		metadata := parseMetadata(record.MetadataJSON)
-		if metadataString(metadata, "source") != "api" || metadataString(metadata, "repo") != "" {
-			continue
-		}
-		if _, hasValidation := metadata["validation"]; !hasValidation {
+		if IsLegacyInertProject(record) {
 			ids[record.ID] = struct{}{}
 		}
 	}
@@ -1634,22 +1649,39 @@ func intersectProjectIDs(left, right map[string]struct{}) map[string]struct{} {
 	return intersection
 }
 
-func validateCatalogValidationPolicies(global config.Config, materialized []config.ProjectRefConfig, allowedMissingPolicy map[string]struct{}) error {
+func validateCatalogValidationPolicies(global config.Config, materialized []config.ProjectRefConfig, allowedMissingPolicy map[string]struct{}) ([]config.ProjectRefConfig, error) {
 	candidate := config.CloneConfig(global)
-	candidate.Projects = make([]config.ProjectRefConfig, 0, len(materialized))
+	candidate.Projects = append([]config.ProjectRefConfig(nil), materialized...)
+	for index := range candidate.Projects {
+		project := &candidate.Projects[index]
+		if _, allowed := allowedMissingPolicy[project.ID]; allowed && project.Validation == nil {
+			// Validate a detached pass-through so diagnostics keep their original
+			// projects[index] labels. This synthetic opt-out is never published.
+			project.Validation = &config.ProjectValidationConfig{OptOut: true}
+		}
+	}
+	if err := config.ValidateProjectValidationPolicies(candidate); err != nil {
+		return nil, err
+	}
+	if (!config.CodingRoleAgentConfigured(global, config.CodingRoleWorker) && !config.CodingRoleAgentConfigured(global, config.CodingRoleFixer)) || len(config.ResolveValidationCommands(global)) > 0 {
+		return materialized, nil
+	}
+	runnable := make([]config.ProjectRefConfig, 0, len(materialized))
 	for _, project := range materialized {
-		if _, allowed := allowedMissingPolicy[project.ID]; allowed {
+		if _, allowed := allowedMissingPolicy[project.ID]; allowed && project.Validation == nil {
 			continue
 		}
-		candidate.Projects = append(candidate.Projects, project)
+		runnable = append(runnable, project)
 	}
-	return config.ValidateProjectValidationPolicies(candidate)
+	return runnable, nil
 }
 
 // ValidateStoredCatalogValidationPolicies preserves startup repair for only
 // API projects that predate project validation and cannot run without repo
-// metadata. Their persisted record is the authority for that exception.
-func ValidateStoredCatalogValidationPolicies(global config.Config, records []storage.ProjectRecord, materialized []config.ProjectRefConfig) error {
+// metadata. Their persisted record is the authority for the validation
+// exception; the returned runtime catalog quarantines any project that still
+// lacks an effective policy.
+func ValidateStoredCatalogValidationPolicies(global config.Config, records []storage.ProjectRecord, materialized []config.ProjectRefConfig) ([]config.ProjectRefConfig, error) {
 	return validateCatalogValidationPolicies(global, materialized, legacyInertProjectIDs(records))
 }
 
