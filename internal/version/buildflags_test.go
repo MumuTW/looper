@@ -1,9 +1,13 @@
 package version
 
 import (
+	"go/parser"
+	"go/token"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -91,9 +95,63 @@ func TestLDFlagsMatchesVersionVariables(t *testing.T) {
 		BuildTimestamp: "2026-04-17T00:00:00Z",
 	})
 
-	const want = "-X github.com/nexu-io/looper/internal/version.Value=1.2.3 -X github.com/nexu-io/looper/internal/version.VersionSource=internal/version/version.go -X github.com/nexu-io/looper/internal/version.Channel=stable -X github.com/nexu-io/looper/internal/version.APIVersion=v1 -X github.com/nexu-io/looper/internal/version.GitCommitSHA=abc123 -X github.com/nexu-io/looper/internal/version.BuildTimestamp=2026-04-17T00:00:00Z"
+	const want = "-X github.com/MumuTW/looper/internal/version.Value=1.2.3 -X github.com/MumuTW/looper/internal/version.VersionSource=internal/version/version.go -X github.com/MumuTW/looper/internal/version.Channel=stable -X github.com/MumuTW/looper/internal/version.APIVersion=v1 -X github.com/MumuTW/looper/internal/version.GitCommitSHA=abc123 -X github.com/MumuTW/looper/internal/version.BuildTimestamp=2026-04-17T00:00:00Z"
 	if ldflags != want {
 		t.Fatalf("LDFlags(...) = %q, want %q", ldflags, want)
+	}
+}
+
+func TestModulePathMigration(t *testing.T) {
+	const (
+		modulePath       = "github.com/MumuTW/looper"
+		legacyModulePath = "github.com/nexu-io/looper"
+	)
+
+	root := repoRoot(t)
+	goMod, err := os.ReadFile(filepath.Join(root, "go.mod"))
+	if err != nil {
+		t.Fatalf("read go.mod: %v", err)
+	}
+	if !strings.HasPrefix(string(goMod), "module "+modulePath+"\n") {
+		t.Fatalf("go.mod module declaration = %q, want %q", strings.SplitN(string(goMod), "\n", 2)[0], "module "+modulePath)
+	}
+
+	err = filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			switch entry.Name() {
+			case ".git", "dist", "node_modules":
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if filepath.Ext(path) != ".go" {
+			return nil
+		}
+
+		file, err := parser.ParseFile(token.NewFileSet(), path, nil, parser.ImportsOnly)
+		if err != nil {
+			return err
+		}
+		for _, imported := range file.Imports {
+			importPath, err := strconv.Unquote(imported.Path.Value)
+			if err != nil {
+				return err
+			}
+			if importPath == legacyModulePath || strings.HasPrefix(importPath, legacyModulePath+"/") {
+				relativePath, err := filepath.Rel(root, path)
+				if err != nil {
+					return err
+				}
+				t.Errorf("%s still imports legacy module path %q", relativePath, legacyModulePath)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("scan Go source for legacy module path: %v", err)
 	}
 }
 

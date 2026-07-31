@@ -6,9 +6,9 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/nexu-io/looper/internal/domain"
-	"github.com/nexu-io/looper/internal/infra/github"
-	"github.com/nexu-io/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/domain"
+	"github.com/MumuTW/looper/internal/infra/github"
+	"github.com/MumuTW/looper/internal/storage"
 )
 
 // settleQueuedWorkerIssueTargets retires queued worker items whose target issue

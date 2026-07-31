@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	pkgapi "github.com/nexu-io/looper/pkg/api"
+	pkgapi "github.com/MumuTW/looper/pkg/api"
 )
 
 type decodeProbe struct {

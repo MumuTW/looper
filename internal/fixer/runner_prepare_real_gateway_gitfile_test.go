@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/nexu-io/looper/internal/worktreesafety"
+	"github.com/MumuTW/looper/internal/worktreesafety"
 )
 
 func TestRunPrepareWorktreeStepRealGatewayRecreatesInvalidGitfilePrefix(t *testing.T) {

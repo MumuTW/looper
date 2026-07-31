@@ -29,7 +29,7 @@ func TestRuntimeDoesNotImportRunsServicePackage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read runtime.go: %v", err)
 	}
-	if strings.Contains(string(src), "github.com/nexu-io/looper/internal/runs") {
+	if strings.Contains(string(src), "github.com/MumuTW/looper/internal/runs") {
 		t.Fatal("runtime must not import internal/runs; that package was the unused transition seam")
 	}
 }

@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nexu-io/looper/internal/config"
-	"github.com/nexu-io/looper/internal/lifecycle"
+	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/lifecycle"
 )
 
 func TestRunValidationRunsConfiguredCommands(t *testing.T) {

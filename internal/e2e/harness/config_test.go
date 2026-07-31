@@ -5,7 +5,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/nexu-io/looper/internal/config"
+	"github.com/MumuTW/looper/internal/config"
 )
 
 func TestWriteConfigPreservesRawOverrides(t *testing.T) {

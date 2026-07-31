@@ -1,8 +1,8 @@
 package runtime
 
 import (
-	"github.com/nexu-io/looper/internal/loops"
-	"github.com/nexu-io/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/loops"
+	"github.com/MumuTW/looper/internal/storage"
 )
 
 // LockLoopRequeue acquires the process-wide per-loop requeue mutex shared by

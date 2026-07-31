@@ -9,9 +9,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/nexu-io/looper/internal/e2e/harness"
-	githubinfra "github.com/nexu-io/looper/internal/infra/github"
-	"github.com/nexu-io/looper/internal/labels"
+	"github.com/MumuTW/looper/internal/e2e/harness"
+	githubinfra "github.com/MumuTW/looper/internal/infra/github"
+	"github.com/MumuTW/looper/internal/labels"
 )
 
 type fakeGHState struct {
@@ -355,7 +355,7 @@ func TestRealGHReadOnlySmoke(t *testing.T) {
 	}
 	root := t.TempDir()
 	gateway := githubinfra.New(githubinfra.Options{GHPath: ghPath, CWD: root})
-	if _, err := gateway.ListOpenPullRequests(context.Background(), githubinfra.ListOpenPullRequestsInput{Repo: "nexu-io/looper", CWD: root, Limit: 1}); err != nil {
+	if _, err := gateway.ListOpenPullRequests(context.Background(), githubinfra.ListOpenPullRequestsInput{Repo: "MumuTW/looper", CWD: root, Limit: 1}); err != nil {
 		t.Fatalf("real-gh pr list smoke failed; fixture may be stale: %v", err)
 	}
 }

@@ -7,10 +7,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nexu-io/looper/internal/config"
-	coordinatorrole "github.com/nexu-io/looper/internal/coordinator"
-	"github.com/nexu-io/looper/internal/projects"
-	"github.com/nexu-io/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/config"
+	coordinatorrole "github.com/MumuTW/looper/internal/coordinator"
+	"github.com/MumuTW/looper/internal/projects"
+	"github.com/MumuTW/looper/internal/storage"
 )
 
 const validationGateDisabledWarning = "worker/fixer validation gate disabled: defaults.validationCommands is empty; the validate step passes without running anything"

@@ -10,9 +10,9 @@ import (
 	"strings"
 	"testing"
 
-	looperdapi "github.com/nexu-io/looper/internal/api"
-	"github.com/nexu-io/looper/internal/config"
-	looperdruntime "github.com/nexu-io/looper/internal/runtime"
+	looperdapi "github.com/MumuTW/looper/internal/api"
+	"github.com/MumuTW/looper/internal/config"
+	looperdruntime "github.com/MumuTW/looper/internal/runtime"
 )
 
 func TestRuntimeConfigMetadataMarksHotOverridesReadOnly(t *testing.T) {

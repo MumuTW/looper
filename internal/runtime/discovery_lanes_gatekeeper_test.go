@@ -4,8 +4,8 @@ import (
 	"context"
 	"testing"
 
-	"github.com/nexu-io/looper/internal/config"
-	"github.com/nexu-io/looper/internal/gatekeeper"
+	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/gatekeeper"
 )
 
 func TestCodingDiscoveryLanesRegistersSourceBasedGatekeeper(t *testing.T) {

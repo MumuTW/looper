@@ -15,8 +15,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/nexu-io/looper/internal/processidentity"
-	"github.com/nexu-io/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/processidentity"
+	"github.com/MumuTW/looper/internal/storage"
 )
 
 const adoptedForwarderPollInterval = 2 * time.Second

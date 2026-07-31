@@ -13,9 +13,9 @@ import (
 	"sync"
 	"testing"
 
-	looperapi "github.com/nexu-io/looper/internal/api"
-	"github.com/nexu-io/looper/internal/config"
-	"github.com/nexu-io/looper/internal/dashboard"
+	looperapi "github.com/MumuTW/looper/internal/api"
+	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/dashboard"
 )
 
 func TestDashboardCommandCompletesUnauthenticatedBrowserLogin(t *testing.T) {

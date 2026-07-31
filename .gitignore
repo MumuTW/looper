@@ -28,3 +28,12 @@ deploy/**/*.env
 # Built onboarding bundles may contain the shared secrets — never commit.
 looper-hitl-onboarding*.zip
 .slim/deepwork/
+
+# Devin CLI local project config: machine-specific absolute paths, and it
+# carries the HERMES_HOME of whoever registered it. Register per clone with
+# scripts/hermes-profile.sh --bootstrap's printed command instead.
+.devin/
+
+# Python bytecode from running the checked-in tools directly.
+__pycache__/
+*.pyc

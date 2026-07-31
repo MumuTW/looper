@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nexu-io/looper/internal/config"
-	looperdruntime "github.com/nexu-io/looper/internal/runtime"
+	"github.com/MumuTW/looper/internal/config"
+	looperdruntime "github.com/MumuTW/looper/internal/runtime"
 )
 
 type configRouteRuntime struct {

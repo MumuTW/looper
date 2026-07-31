@@ -13,9 +13,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/MumuTW/looper/internal/network/protocol"
+	"github.com/MumuTW/looper/internal/storage"
 	"github.com/mattn/go-sqlite3"
-	"github.com/nexu-io/looper/internal/network/protocol"
-	"github.com/nexu-io/looper/internal/storage"
 )
 
 var errUnauthorized = errors.New("unauthorized")

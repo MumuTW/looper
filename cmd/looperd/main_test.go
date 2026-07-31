@@ -14,14 +14,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nexu-io/looper/internal/agent"
-	"github.com/nexu-io/looper/internal/bootstrap"
-	"github.com/nexu-io/looper/internal/config"
-	"github.com/nexu-io/looper/internal/loops"
-	"github.com/nexu-io/looper/internal/processcontainment"
-	looperdruntime "github.com/nexu-io/looper/internal/runtime"
-	"github.com/nexu-io/looper/internal/storage"
-	"github.com/nexu-io/looper/internal/version"
+	"github.com/MumuTW/looper/internal/agent"
+	"github.com/MumuTW/looper/internal/bootstrap"
+	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/loops"
+	"github.com/MumuTW/looper/internal/processcontainment"
+	looperdruntime "github.com/MumuTW/looper/internal/runtime"
+	"github.com/MumuTW/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/version"
 )
 
 func TestRunPrintsVersionWithoutBootstrappingCommandHandling(t *testing.T) {
@@ -224,9 +224,9 @@ func TestStartRuntimeWithAPIDoesNotRunRecoveryBeforeServerOwnership(t *testing.T
 	if err := repos.Projects.Upsert(ctx, project); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
-	repo := "nexu-io/looper"
+	repo := "MumuTW/looper"
 	prNumber := int64(266)
-	targetID := "pr:nexu-io/looper:266"
+	targetID := "pr:MumuTW/looper:266"
 	loop := storage.LoopRecord{ID: "loop_1", Seq: 266, ProjectID: project.ID, Type: "fixer", TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}
 	if err := repos.Loops.Upsert(ctx, loop); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)

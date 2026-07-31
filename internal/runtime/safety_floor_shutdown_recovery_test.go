@@ -1,3 +1,11 @@
+// The tests in this file deliberately reach through rt.mu into the
+// deferred-recovery lifecycle fields (services, recoveryCancel,
+// recoveryDone). Reviewed under #121 and kept white-box: they pin
+// shutdown-ORDERING windows (an arm racing BeginShutdown; cancel-but-
+// retain semantics that Runtime.Stop's wait depends on) that no
+// production API reproduces deterministically, and the retention rules
+// they assert have no external observable short of a hanging Stop.
+// Exporting recovery-lifecycle introspection for them would be a prop.
 package runtime
 
 import (
@@ -6,9 +14,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nexu-io/looper/internal/config"
-	githubinfra "github.com/nexu-io/looper/internal/infra/github"
-	"github.com/nexu-io/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/config"
+	githubinfra "github.com/MumuTW/looper/internal/infra/github"
+	"github.com/MumuTW/looper/internal/storage"
 )
 
 // Contract: after MarkReady, if BeginShutdown runs before recoveryCancel is

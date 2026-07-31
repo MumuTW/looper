@@ -6,8 +6,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/nexu-io/looper/internal/agent"
-	"github.com/nexu-io/looper/internal/processcontainment"
+	"github.com/MumuTW/looper/internal/agent"
+	"github.com/MumuTW/looper/internal/processcontainment"
 )
 
 // ErrAgentLiveHandleMissing is returned by stop paths when an in-scope agent

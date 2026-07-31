@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/nexu-io/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/storage"
 )
 
 // writeMinimalGitRepoMetadata creates non-remote repository integrity metadata

@@ -17,20 +17,20 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/nexu-io/looper/internal/bootstrap"
-	"github.com/nexu-io/looper/internal/config"
-	"github.com/nexu-io/looper/internal/domain"
-	gitinfra "github.com/nexu-io/looper/internal/infra/git"
-	githubinfra "github.com/nexu-io/looper/internal/infra/github"
-	"github.com/nexu-io/looper/internal/infra/notify"
-	"github.com/nexu-io/looper/internal/labels"
-	"github.com/nexu-io/looper/internal/loops"
-	networkclient "github.com/nexu-io/looper/internal/network/client"
-	"github.com/nexu-io/looper/internal/processidentity"
-	"github.com/nexu-io/looper/internal/projects"
-	"github.com/nexu-io/looper/internal/storage"
-	"github.com/nexu-io/looper/internal/webhookforward"
-	"github.com/nexu-io/looper/internal/worker"
+	"github.com/MumuTW/looper/internal/bootstrap"
+	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/domain"
+	gitinfra "github.com/MumuTW/looper/internal/infra/git"
+	githubinfra "github.com/MumuTW/looper/internal/infra/github"
+	"github.com/MumuTW/looper/internal/infra/notify"
+	"github.com/MumuTW/looper/internal/labels"
+	"github.com/MumuTW/looper/internal/loops"
+	networkclient "github.com/MumuTW/looper/internal/network/client"
+	"github.com/MumuTW/looper/internal/processidentity"
+	"github.com/MumuTW/looper/internal/projects"
+	"github.com/MumuTW/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/webhookforward"
+	"github.com/MumuTW/looper/internal/worker"
 )
 
 type OpenSQLiteCoordinatorFunc func(context.Context, string, storage.SQLiteCoordinatorOptions) (*storage.SQLiteCoordinator, error)
@@ -123,11 +123,25 @@ type Options struct {
 	OpenSQLiteCoordinator       OpenSQLiteCoordinatorFunc
 	SyncConfiguredProjects      SyncConfiguredProjectsFunc
 	RunSchedulerTick            RunSchedulerTickFunc
-	ReadProcessCommand          ReadProcessCommandFunc
-	ReadProcessStart            ReadProcessStartFunc
-	ReadProcessBootID           ReadProcessBootIDFunc
-	SignalProcess               SignalProcessFunc
-	DeferRecovery               bool
+	// RunSchedulerClaim overrides the claim pass the scheduler pump drives,
+	// independently of RunSchedulerTick in both directions: either can be
+	// injected while the other keeps its default catalog implementation.
+	//
+	// Blind spots, stated for reviewers of tests built on this seam: an
+	// injected claim observes that the pump invoked a pass, not when the
+	// pump chose to fire (ticker/trigger cadence regressions pass through),
+	// and it bypasses the default claim's own internal admission gating,
+	// which only the default implementation exercises.
+	RunSchedulerClaim RunSchedulerTickFunc
+	// WebhookForwarder overrides the webhook forwarder wired during startup.
+	// Like RunSchedulerTick, an injected forwarder owns its own dependencies;
+	// nil uses the default catalog-scheduler forwarder.
+	WebhookForwarder   WebhookForwarder
+	ReadProcessCommand ReadProcessCommandFunc
+	ReadProcessStart   ReadProcessStartFunc
+	ReadProcessBootID  ReadProcessBootIDFunc
+	SignalProcess      SignalProcessFunc
+	DeferRecovery      bool
 }
 
 type Services struct {
@@ -170,6 +184,8 @@ type Runtime struct {
 	defaultSchedulerTick   RunSchedulerTickFunc
 	defaultSchedulerClaim  RunSchedulerTickFunc
 	customSchedulerTick    bool
+	customSchedulerClaim   bool
+	customWebhookForwarder bool
 	readProcessCommand     ReadProcessCommandFunc
 	readProcessStart       ReadProcessStartFunc
 	readProcessBootID      ReadProcessBootIDFunc
@@ -258,6 +274,8 @@ func New(options Options) *Runtime {
 
 	runSchedulerTick := options.RunSchedulerTick
 	customSchedulerTick := runSchedulerTick != nil
+	customSchedulerClaim := options.RunSchedulerClaim != nil
+	customWebhookForwarder := options.WebhookForwarder != nil
 
 	readProcessCommand := options.ReadProcessCommand
 	if readProcessCommand == nil {
@@ -308,6 +326,10 @@ func New(options Options) *Runtime {
 		syncConfiguredProjects:      syncConfiguredProjects,
 		runSchedulerTick:            runSchedulerTick,
 		customSchedulerTick:         customSchedulerTick,
+		defaultSchedulerClaim:       options.RunSchedulerClaim,
+		customSchedulerClaim:        customSchedulerClaim,
+		webhookForwarder:            options.WebhookForwarder,
+		customWebhookForwarder:      customWebhookForwarder,
 		readProcessCommand:          readProcessCommand,
 		readProcessStart:            readProcessStart,
 		readProcessBootID:           readProcessBootID,
@@ -376,9 +398,31 @@ func Start(ctx context.Context, deps bootstrap.RuntimeDependencies) (bootstrap.R
 func (r *Runtime) Start(ctx context.Context) error {
 	r.startOnce.Do(func() {
 		r.startErr = r.start(ctx)
+		if r.startErr != nil {
+			// Ownership of an injected forwarder transferred at construction;
+			// a caller whose Start failed must not be required to Stop the
+			// runtime just to release it.
+			r.closeInjectedWebhookForwarder()
+		}
 	})
 
 	return r.startErr
+}
+
+// closeInjectedWebhookForwarder releases a construction-injected forwarder
+// exactly once: the field is cleared under the lock so a later Stop cannot
+// double-close it.
+func (r *Runtime) closeInjectedWebhookForwarder() {
+	if !r.customWebhookForwarder {
+		return
+	}
+	r.mu.Lock()
+	forwarder := r.webhookForwarder
+	r.webhookForwarder = nil
+	r.mu.Unlock()
+	if forwarder != nil {
+		forwarder.Close()
+	}
 }
 
 func (r *Runtime) Stop(reason string) {
@@ -1009,17 +1053,32 @@ func (r *Runtime) start(ctx context.Context) error {
 		ActiveExecutions: r.activeExecutions,
 	}
 	schedulerDisabled := false
-	if !r.customSchedulerTick {
+	if !r.customSchedulerTick || !r.customSchedulerClaim {
 		handlers := buildCatalogSchedulerHandlers(r.projectCatalog, &r.configBoundary, r.configPath, r.logger, coordinator, repositories, gitGateway, githubGateway, r.activeExecutions, func() schedulerAsyncRunner {
 			r.mu.RLock()
 			defer r.mu.RUnlock()
 			return r.schedulerTasks
 		}, r.TriggerSchedulerClaim, r.now, r.reconcileLiveStaleRunningRuns, r.AllowClaim, r.WithAllowClaim)
-		r.defaultSchedulerTick = handlers.tick
-		r.defaultSchedulerClaim = handlers.claim
-		r.webhookForwarder = handlers.webhook
-		r.notificationGateways = handlers.notificationGateways
-		schedulerDisabled = !defaultSchedulerAgentsConfigured(r.config)
+		if !r.customSchedulerTick {
+			r.defaultSchedulerTick = handlers.tick
+			if !r.customWebhookForwarder {
+				r.webhookForwarder = handlers.webhook
+			} else if handlers.webhook != nil {
+				// An injected forwarder replaces the default; close the one
+				// the handler bundle constructed so its workers do not leak.
+				handlers.webhook.Close()
+			}
+			r.notificationGateways = handlers.notificationGateways
+			schedulerDisabled = !defaultSchedulerAgentsConfigured(r.config)
+		} else if handlers.webhook != nil {
+			// The bundle was built only for its claim (or not at all for an
+			// injected one); close the eagerly constructed webhook forwarder
+			// it carries so its workers do not leak.
+			handlers.webhook.Close()
+		}
+		if !r.customSchedulerClaim {
+			r.defaultSchedulerClaim = handlers.claim
+		}
 	}
 	r.githubGateway = githubGateway
 	r.networkManager = networkclient.NewManager(filepath.Join(runtimeHomeDirOrEmpty(), ".looper", "network.json"), r.config, repositories, githubGateway)

@@ -1,0 +1,51 @@
+# MCP route probe. devin 3000.3.22, Hermes v0.19.0 (2026.7.20).
+# Captured 2026-07-31. Session uuids replaced with <REDACTED-UUID>.
+#
+# Establishes that Hermes-side tools ARE reachable through the Devin ACP
+# backend — not via the shim's prompt-level <tool_call> contract (which the
+# model never chooses; see replay-toolcall-probe.txt), but by exposing them as
+# an MCP server that Devin calls through its own native tool loop.
+#
+# Setup:
+#   devin mcp add looper-memory -- python3 probe_mcp_server.py   # from the
+#     directory that will be the ACP session cwd — `devin mcp add` writes to a
+#     *local project config* keyed to cwd, so the session must share it.
+#   ./replay_acp.py --cwd "$PWD" --prompt-file <prompt asking for the tool> \\
+#       --approve-allow-once
+#     (explicit replay-only opt-in: selects only an offered allow_once; every
+#      broader or unknown permission shape remains cancelled)
+#
+# Two attempts failed first, and the failures are the useful part:
+#
+# 1. Passing the server inline via session/new's `mcpServers` param: Devin
+#    spawned the process and completed the MCP handshake (the server logged
+#    `initialize` + `notifications/initialized`), but never called tools/list,
+#    and the model reported: "Server `looper-memory` not found in
+#    configuration." Devin's own registry lookup does not pick up
+#    session-scoped servers. Registering via `devin mcp add` is the path that
+#    works.
+#
+# 2. With the server registered but the shim's stock permission handling:
+#    tools/list fired and the model tried to call the tool, but Hermes's shim
+#    hardcodes `{"outcome": "cancelled"}` for every session/request_permission,
+#    so the call was rejected. Model output: "The store call was rejected (you
+#    skipped it), so the note LOOPER-MCP-42 was not stored."
+#
+# Below: registered server + permission approved.
+
+  [permission] options=['allow_once', 'allow_session', 'allow_always', 'allow_server_session', 'allow_server_always', 'switch_bypass', 'reject_once'] -> allow_once
+  [update] tool_call_update
+  [update] tool_call_update
+  [update] tool_call_update
+  [update] usage_update
+session/prompt result: {"stopReason": "end_turn", "usage": {"totalTokens": 13969, "inputTokens": 13947, "outputTokens": 22, "cachedReadTokens": 13891}, "_meta": {"cognition.ai/userMessageId": "<REDACTED-UUID>"}}
+--- collected text ---
+Done. Stored the note `LOOPER-MCP-42` in Looper's persistent memory.
+
+# MCP server's own log for the same run — the tool really executed with the
+# right argument, end to end:
+RECV initialize
+RECV notifications/initialized
+RECV tools/list
+RECV tools/call
+TOOL_CALL content='LOOPER-MCP-42'

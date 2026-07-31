@@ -3,7 +3,7 @@ package domain
 import (
 	"fmt"
 
-	"github.com/nexu-io/looper/internal/labels"
+	"github.com/MumuTW/looper/internal/labels"
 )
 
 type LoopType string
@@ -190,6 +190,20 @@ func IsActiveLoopStatus(status LoopStatus) bool {
 func IsConflictingActiveLoopStatus(status LoopStatus) bool {
 	_, ok := conflictingActiveLoopStatuses[status]
 	return ok
+}
+
+// ConflictingActiveLoopStatuses returns the statuses that hold a live claim on
+// a loop target. Storage queries use this instead of duplicating the claim
+// lifecycle vocabulary.
+func ConflictingActiveLoopStatuses() []LoopStatus {
+	return []LoopStatus{
+		LoopStatusIdle,
+		LoopStatusQueued,
+		LoopStatusRunning,
+		LoopStatusPaused,
+		LoopStatusAwaitingHuman,
+		LoopStatusHumanTakeover,
+	}
 }
 
 func IsTerminalRunStatus(status RunStatus) bool {

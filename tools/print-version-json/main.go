@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/nexu-io/looper/internal/version"
+	"github.com/MumuTW/looper/internal/version"
 )
 
 func main() {

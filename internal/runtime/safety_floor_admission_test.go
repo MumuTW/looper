@@ -7,7 +7,7 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/nexu-io/looper/internal/config"
+	"github.com/MumuTW/looper/internal/config"
 )
 
 // Contract: mutations and claims are gated until admission is ready; there is
@@ -24,10 +24,15 @@ func TestSafetyFloorMutationsAndClaimsGatedUntilReady(t *testing.T) {
 	backupDir := filepath.Join(workingDir, "backups")
 	cfg.Storage.BackupDir = &backupDir
 
+	var claimCalls atomic.Int64
 	rt := New(Options{
 		Config:        cfg,
 		Logger:        &testLogger{},
 		DeferRecovery: true,
+		RunSchedulerClaim: func(context.Context, Services) error {
+			claimCalls.Add(1)
+			return nil
+		},
 	})
 	if err := rt.Start(context.Background()); err != nil {
 		t.Fatalf("Start() error = %v", err)
@@ -48,13 +53,6 @@ func TestSafetyFloorMutationsAndClaimsGatedUntilReady(t *testing.T) {
 		t.Fatal("ownershipAcquired = true before CompleteStartup")
 	}
 
-	var claimCalls atomic.Int64
-	rt.mu.Lock()
-	rt.defaultSchedulerClaim = func(context.Context, Services) error {
-		claimCalls.Add(1)
-		return nil
-	}
-	rt.mu.Unlock()
 	rt.executeSchedulerClaimPass(context.Background())
 	if claimCalls.Load() != 0 {
 		t.Fatalf("claim pump ran while starting, calls=%d", claimCalls.Load())
@@ -63,6 +61,10 @@ func TestSafetyFloorMutationsAndClaimsGatedUntilReady(t *testing.T) {
 	if err := rt.CompleteStartup(context.Background()); err != nil {
 		t.Fatalf("CompleteStartup() error = %v", err)
 	}
+	// CompleteStartup wakes the scheduler claim pump. Stop and join it before
+	// the exact-count assertions below so an in-flight asynchronous pass cannot
+	// race the manual admission checks.
+	rt.stopSchedulerLoop()
 	if got := rt.AdmissionState(); got != AdmissionReady {
 		t.Fatalf("AdmissionState() after CompleteStartup = %q, want ready", got)
 	}

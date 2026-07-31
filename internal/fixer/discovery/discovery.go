@@ -10,7 +10,7 @@ package discovery
 import (
 	"strings"
 
-	"github.com/nexu-io/looper/internal/config"
+	"github.com/MumuTW/looper/internal/config"
 )
 
 // PR is the candidate's display-independent view: only what eligibility

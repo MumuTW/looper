@@ -7,7 +7,7 @@
 // internal/reviewer/workflow (#131) and internal/fixer/workflow (#309).
 package reconcile
 
-import "github.com/nexu-io/looper/internal/lifecycle"
+import "github.com/MumuTW/looper/internal/lifecycle"
 
 // State is the durable record of one commit-reconciliation pass. It is
 // embedded in the fixer checkpoint JSON; the field tags are a persisted

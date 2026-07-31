@@ -17,8 +17,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/nexu-io/looper/internal/config"
-	"github.com/nexu-io/looper/internal/processcontainment"
+	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/processcontainment"
 )
 
 // TrustedReviewSockEnv is the agent-facing env key for the trusted review-submit
@@ -757,12 +757,13 @@ func marshalTrustedReviewConfigSnapshot(source config.Config) ([]byte, error) {
 	snapshot.Daemon.Environment = nil
 	// roles.deployer.environment holds the credentials a deploy needs, globally and
 	// per project. It is the same class of secret as daemon.environment above.
+	//
+	// The per-project values need copying first. `snapshot := source` copies the
+	// slice header, so the projects share a backing array and their Roles pointers
+	// are the same objects — clearing through them would erase the operator's real
+	// deploy credentials and break every later deploy, not just hide them here.
 	snapshot.Roles.Deployer.Environment = nil
-	for i := range snapshot.Projects {
-		if snapshot.Projects[i].Roles != nil && snapshot.Projects[i].Roles.Deployer != nil {
-			snapshot.Projects[i].Roles.Deployer.Environment = nil
-		}
-	}
+	snapshot.Projects = config.RedactProjectSecrets(source.Projects)
 
 	encoded, err := json.Marshal(snapshot)
 	if err != nil {

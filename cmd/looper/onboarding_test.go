@@ -24,8 +24,8 @@ import (
 	"testing/iotest"
 	"time"
 
-	"github.com/nexu-io/looper/internal/config"
-	"github.com/nexu-io/looper/internal/version"
+	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/version"
 )
 
 // fakeDaemon stands in for looperd. Only the routes the onboarding verbs call

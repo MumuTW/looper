@@ -19,27 +19,27 @@ import (
 	"strings"
 	"time"
 
-	"github.com/nexu-io/looper/internal/agent"
-	"github.com/nexu-io/looper/internal/bootstrap"
-	"github.com/nexu-io/looper/internal/config"
-	"github.com/nexu-io/looper/internal/disclosure"
-	"github.com/nexu-io/looper/internal/domain"
-	"github.com/nexu-io/looper/internal/eventlog"
-	gitinfra "github.com/nexu-io/looper/internal/infra/git"
-	githubinfra "github.com/nexu-io/looper/internal/infra/github"
-	"github.com/nexu-io/looper/internal/infra/specpr"
-	"github.com/nexu-io/looper/internal/labels"
-	"github.com/nexu-io/looper/internal/loops"
-	"github.com/nexu-io/looper/internal/loops/failureclass"
-	"github.com/nexu-io/looper/internal/networkpolicy"
-	"github.com/nexu-io/looper/internal/reviewer/automerge"
-	"github.com/nexu-io/looper/internal/reviewer/criteria"
-	"github.com/nexu-io/looper/internal/reviewer/publish"
-	"github.com/nexu-io/looper/internal/reviewer/resolution"
-	"github.com/nexu-io/looper/internal/reviewer/workflow"
-	"github.com/nexu-io/looper/internal/storage"
-	"github.com/nexu-io/looper/internal/version"
-	"github.com/nexu-io/looper/internal/worktreesafety"
+	"github.com/MumuTW/looper/internal/agent"
+	"github.com/MumuTW/looper/internal/bootstrap"
+	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/disclosure"
+	"github.com/MumuTW/looper/internal/domain"
+	"github.com/MumuTW/looper/internal/eventlog"
+	gitinfra "github.com/MumuTW/looper/internal/infra/git"
+	githubinfra "github.com/MumuTW/looper/internal/infra/github"
+	"github.com/MumuTW/looper/internal/infra/specpr"
+	"github.com/MumuTW/looper/internal/labels"
+	"github.com/MumuTW/looper/internal/loops"
+	"github.com/MumuTW/looper/internal/loops/failureclass"
+	"github.com/MumuTW/looper/internal/networkpolicy"
+	"github.com/MumuTW/looper/internal/reviewer/automerge"
+	"github.com/MumuTW/looper/internal/reviewer/criteria"
+	"github.com/MumuTW/looper/internal/reviewer/publish"
+	"github.com/MumuTW/looper/internal/reviewer/resolution"
+	"github.com/MumuTW/looper/internal/reviewer/workflow"
+	"github.com/MumuTW/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/version"
+	"github.com/MumuTW/looper/internal/worktreesafety"
 )
 
 // ReviewerStep and the stepXxx constants are a compatibility surface over
@@ -965,6 +965,12 @@ func (r *Runner) enqueueReviewerDiscoveryCandidate(ctx context.Context, project 
 
 	loopResult, loopErr := r.ensureLoopForPullRequest(ctx, project, repo, pr.Number, existing)
 	if loopErr != nil {
+		// Source-issue occupation is a typed candidate skip, not a failed
+		// discovery pass. Other pull requests in this batch remain admissible.
+		if _, occupied := storage.IsIssueClaimConflictError(loopErr); occupied {
+			result.Skipped++
+			return nil
+		}
 		return loopErr
 	}
 	if terminalReviewerLoopReason(loopResult.record) == "failed" {
@@ -1005,7 +1011,7 @@ func (r *Runner) enqueueReviewerDiscoveryCandidate(ctx context.Context, project 
 		return nil
 	}
 	availableAt := r.nextReviewAvailableAt(meta)
-	queueItem, queueErr := r.enqueue(ctx, enqueueInput{
+	queueItem, queueErr := r.enqueueAndMarkLoopQueuedForReview(ctx, loopResult.record, enqueueInput{
 		ProjectID:   project.ID,
 		LoopID:      loopResult.record.ID,
 		Repo:        repo,
@@ -1015,9 +1021,6 @@ func (r *Runner) enqueueReviewerDiscoveryCandidate(ctx context.Context, project 
 	})
 	if queueErr != nil {
 		return queueErr
-	}
-	if err := r.markLoopQueuedForReview(ctx, loopResult.record, queueItem.AvailableAt); err != nil {
-		return err
 	}
 	result.QueueItems = append(result.QueueItems, queueItem)
 	return nil
@@ -4060,7 +4063,7 @@ func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.P
 			text := string(encoded)
 			metadataJSONSource = &text
 		}
-		metadataJSON, err := r.ensureLoopMetadataJSON(metadataJSONSource, project.ID, repo, prNumber)
+		metadataJSON, err := r.ensureLoopMetadataJSON(metadataJSONSource, project.ID, repo, prNumber, "")
 		if err != nil {
 			return loopUpsertResult{}, err
 		}
@@ -4075,17 +4078,31 @@ func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.P
 		}
 		return loopUpsertResult{record: updated, created: false}, nil
 	}
-	seq, err := r.repos.Loops.AllocateSeq(ctx)
-	if err != nil {
-		return loopUpsertResult{}, err
-	}
 	targetID := fmt.Sprintf("pr:%s:%d", repo, prNumber)
-	metadataJSON, err := r.ensureLoopMetadataJSON(nil, project.ID, repo, prNumber)
+	if r.db == nil {
+		return loopUpsertResult{}, fmt.Errorf("reviewer runner database is not configured")
+	}
+	sourceWorkerID, err := r.sourceWorkerIDForPullRequest(ctx, project.ID, repo, prNumber)
 	if err != nil {
 		return loopUpsertResult{}, err
 	}
-	loop := storage.LoopRecord{ID: eventlog.NewEventID("loop"), Seq: seq, ProjectID: project.ID, Type: "reviewer", TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber, Status: "queued", NextRunAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO, MetadataJSON: &metadataJSON}
-	if err := r.repos.Loops.Upsert(ctx, loop); err != nil {
+	metadataJSON, err := r.ensureLoopMetadataJSON(nil, project.ID, repo, prNumber, sourceWorkerID)
+	if err != nil {
+		return loopUpsertResult{}, err
+	}
+	var loop storage.LoopRecord
+	if err := storage.WithTransaction(ctx, r.db, nil, func(tx *sql.Tx) error {
+		repos := storage.NewRepositories(tx)
+		seq, err := repos.Loops.AllocateSeq(ctx)
+		if err != nil {
+			return err
+		}
+		loop = storage.LoopRecord{ID: eventlog.NewEventID("loop"), Seq: seq, ProjectID: project.ID, Type: "reviewer", TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber, Status: "queued", NextRunAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO, MetadataJSON: &metadataJSON}
+		if err := repos.Loops.AssertIssueClaimAdmission(ctx, loop, false); err != nil {
+			return err
+		}
+		return repos.Loops.Upsert(ctx, loop)
+	}); err != nil {
 		return loopUpsertResult{}, err
 	}
 	r.appendEvent(ctx, eventInput{eventType: "loop.created", projectID: project.ID, loopID: loop.ID, entityType: "loop", entityID: loop.ID, payload: map[string]any{"type": "reviewer", "repo": repo, "prNumber": prNumber}})
@@ -4102,25 +4119,21 @@ func (r *Runner) recoverFailedReviewerLoop(ctx context.Context, loop storage.Loo
 		r.appendEvent(ctx, eventInput{eventType: "reviewer.auto_recovery.skipped", projectID: loop.ProjectID, loopID: loop.ID, entityType: "loop", entityID: loop.ID, payload: map[string]any{"reason": reason}})
 		return nil, nil
 	}
+	if r.db == nil {
+		return nil, fmt.Errorf("reviewer runner database is not configured")
+	}
 	nowISO := r.nowISO()
-	latestQueue, err := r.repos.Queue.GetByID(ctx, queueID)
-	if err != nil {
-		return nil, err
-	}
-	requeued, err := r.requeueFailedReviewerQueueItem(ctx, loop.ID, queueID, nowISO, latestQueue, reason)
-	if err != nil {
-		return nil, err
-	}
-	if requeued == 0 {
-		active, activeErr := r.repos.Queue.FindActiveByLoopID(ctx, loop.ID)
-		if activeErr != nil {
-			return nil, activeErr
+	updated, err := storage.WithTransactionValue(ctx, r.db, nil, func(tx *sql.Tx) (*storage.LoopRecord, error) {
+		repos := storage.NewRepositories(tx)
+		current, err := repos.Loops.GetByID(ctx, loop.ID)
+		if err != nil {
+			return nil, err
 		}
-		if active == nil {
-			return nil, fmt.Errorf("reviewer auto-recovery did not requeue failed queue item %s for loop %s", queueID, loop.ID)
+		if current == nil || current.Status != "failed" {
+			return nil, nil
 		}
-	}
-	updated, err := r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
+
+		updated := *current
 		updated.Status = "queued"
 		updated.NextRunAt = stringPtr(nowISO)
 		meta := parseJSONObject(updated.MetadataJSON)
@@ -4136,20 +4149,54 @@ func (r *Runner) recoverFailedReviewerLoop(ctx context.Context, loop storage.Loo
 			text := string(encoded)
 			updated.MetadataJSON = &text
 		}
+		// Check before mutating the failed queue item. The same immediate
+		// transaction then publishes the loop, so an occupied source issue is a
+		// skipped recovery candidate rather than an escaped active queue item.
+		if err := repos.Loops.AssertIssueClaimAdmission(ctx, updated, false); err != nil {
+			return nil, err
+		}
+
+		latestQueue, err := repos.Queue.GetByID(ctx, queueID)
+		if err != nil {
+			return nil, err
+		}
+		var requeued int64
+		if latestQueue != nil && (isRetryableTransientWithRemainingAttempts(*latestQueue) || reason == "enhanced_transient_match_attempts_remaining") {
+			requeued, err = repos.Queue.RequeueFailedByIDWithAttempts(ctx, updated.ID, queueID, nowISO, latestQueue.Attempts)
+		} else {
+			requeued, err = repos.Queue.RequeueFailedByID(ctx, updated.ID, queueID, nowISO)
+		}
+		if err != nil {
+			return nil, err
+		}
+		if requeued == 0 {
+			active, activeErr := repos.Queue.FindActiveByLoopID(ctx, updated.ID)
+			if activeErr != nil {
+				return nil, activeErr
+			}
+			if active == nil {
+				return nil, fmt.Errorf("reviewer auto-recovery did not requeue failed queue item %s for loop %s", queueID, updated.ID)
+			}
+		}
+		if err := repos.Loops.Upsert(ctx, updated); err != nil {
+			return nil, err
+		}
+		return &updated, nil
 	})
 	if err != nil {
+		if _, occupied := storage.IsIssueClaimConflictError(err); occupied {
+			r.logInfo("reviewer auto-recovery skipped", map[string]any{"loopId": loop.ID, "reason": "source_issue_occupied"})
+			r.appendEvent(ctx, eventInput{eventType: "reviewer.auto_recovery.skipped", projectID: loop.ProjectID, loopID: loop.ID, entityType: "loop", entityID: loop.ID, payload: map[string]any{"reason": "source_issue_occupied"}})
+			return nil, nil
+		}
 		return nil, err
+	}
+	if updated == nil {
+		return nil, nil
 	}
 	r.logInfo("reviewer auto-recovered failed loop", map[string]any{"loopId": loop.ID, "reason": reason})
 	r.appendEvent(ctx, eventInput{eventType: "reviewer.auto_recovery.requeued", projectID: loop.ProjectID, loopID: loop.ID, entityType: "loop", entityID: loop.ID, payload: map[string]any{"reason": reason, "attempt": intFromAny(reviewerLoopMetadata(parseJSONObject(updated.MetadataJSON))["autoRecoveryAttempts"])}})
-	return &updated, nil
-}
-
-func (r *Runner) requeueFailedReviewerQueueItem(ctx context.Context, loopID, queueID, queuedAt string, queue *storage.QueueItemRecord, reason string) (int64, error) {
-	if queue != nil && (isRetryableTransientWithRemainingAttempts(*queue) || reason == "enhanced_transient_match_attempts_remaining") {
-		return r.repos.Queue.RequeueFailedByIDWithAttempts(ctx, loopID, queueID, queuedAt, queue.Attempts)
-	}
-	return r.repos.Queue.RequeueFailedByID(ctx, loopID, queueID, queuedAt)
+	return updated, nil
 }
 
 func (r *Runner) failedReviewerLoopRecoveryEligibility(ctx context.Context, loop storage.LoopRecord, pr PullRequestSummary) (bool, string, string, error) {
@@ -4302,35 +4349,6 @@ func isReviewerRediscoveryRunStep(run *storage.RunRecord) bool {
 	return step == string(stepPublish) || step == string(stepReview) || step == string(stepThreadResolution)
 }
 
-func (r *Runner) markLoopQueuedForReview(ctx context.Context, loop storage.LoopRecord, availableAt string) error {
-	if terminalReviewerLoopReason(loop) != "" {
-		return nil
-	}
-	_, err := r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
-		if active, activeErr := r.hasActiveRunningRun(ctx, updated.ID); activeErr == nil && active {
-			updated.Status = "running"
-			updated.NextRunAt = nil
-			return
-		}
-		updated.Status = "queued"
-		updated.NextRunAt = stringPtr(availableAt)
-	})
-	return err
-}
-
-func (r *Runner) hasActiveRunningRun(ctx context.Context, loopID string) (bool, error) {
-	runs, err := r.repos.Runs.ListByLoop(ctx, loopID)
-	if err != nil {
-		return false, err
-	}
-	for _, run := range runs {
-		if run.Status == "running" {
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
 func (r *Runner) listFollowUpLoops(ctx context.Context, projectID, repo string) ([]storage.LoopRecord, error) {
 	loops, err := r.repos.Loops.List(ctx)
 	if err != nil {
@@ -4397,11 +4415,14 @@ type enqueueInput struct {
 	AvailableAt time.Time
 }
 
-func (r *Runner) enqueue(ctx context.Context, input enqueueInput) (storage.QueueItemRecord, error) {
+// enqueueWithQueue keeps queue construction usable inside a caller-owned
+// transaction. The caller wakes the scheduler only after that transaction has
+// committed, so it can never observe a queue item without its loop transition.
+func (r *Runner) enqueueWithQueue(ctx context.Context, queue *storage.QueueRepository, input enqueueInput) (storage.QueueItemRecord, bool, error) {
 	dedupeKey := buildReviewerDedupeKey(input.ProjectID, input.LoopID, input.Repo, input.PRNumber)
-	existing, err := r.repos.Queue.FindActiveByDedupe(ctx, dedupeKey)
+	existing, err := queue.FindActiveByDedupe(ctx, dedupeKey)
 	if err != nil {
-		return storage.QueueItemRecord{}, err
+		return storage.QueueItemRecord{}, false, err
 	}
 	availableAt := r.nowISO()
 	if !input.AvailableAt.IsZero() {
@@ -4411,7 +4432,7 @@ func (r *Runner) enqueue(ctx context.Context, input enqueueInput) (storage.Queue
 	if strings.TrimSpace(input.HeadSHA) != "" {
 		payload, err := json.Marshal(map[string]any{"headSha": input.HeadSHA})
 		if err != nil {
-			return storage.QueueItemRecord{}, err
+			return storage.QueueItemRecord{}, false, err
 		}
 		payloadJSON = string(payload)
 	}
@@ -4424,16 +4445,15 @@ func (r *Runner) enqueue(ctx context.Context, input enqueueInput) (storage.Queue
 				updated.AvailableAt = availableAt
 				updated.UpdatedAt = r.nowISO()
 				updated.PayloadJSON = &payloadJSON
-				persisted, _, err := r.repos.Queue.UpsertActiveByDedupeOrGetExisting(ctx, updated)
+				persisted, _, err := queue.UpsertActiveByDedupeOrGetExisting(ctx, updated)
 				if err != nil {
-					return storage.QueueItemRecord{}, err
+					return storage.QueueItemRecord{}, false, err
 				}
 				updated = persisted
-				r.wakeSchedulerAfterEnqueue()
-				return updated, nil
+				return updated, true, nil
 			}
 		}
-		return *existing, nil
+		return *existing, false, nil
 	}
 	nowISO := r.nowISO()
 	targetID := fmt.Sprintf("pr:%s:%d", input.Repo, input.PRNumber)
@@ -4444,14 +4464,75 @@ func (r *Runner) enqueue(ctx context.Context, input enqueueInput) (storage.Queue
 	if payloadJSON != "" {
 		queueItem.PayloadJSON = &payloadJSON
 	}
-	persisted, created, err := r.repos.Queue.CreateOrGetActiveByDedupe(ctx, queueItem)
+	persisted, created, err := queue.CreateOrGetActiveByDedupe(ctx, queueItem)
+	if err != nil {
+		return storage.QueueItemRecord{}, false, err
+	}
+	return persisted, created, nil
+}
+
+// enqueueAndMarkLoopQueuedForReview makes reviewer rediscovery a single
+// publication: source-issue admission, queued loop state, and claimable queue
+// work all commit together. This prevents a rejected reactivation from leaving
+// a queue item runnable on behalf of a waiting reviewer.
+func (r *Runner) enqueueAndMarkLoopQueuedForReview(ctx context.Context, loop storage.LoopRecord, input enqueueInput) (storage.QueueItemRecord, error) {
+	if r.db == nil {
+		return storage.QueueItemRecord{}, fmt.Errorf("reviewer runner database is not configured")
+	}
+	shouldWake := false
+	queueItem, err := storage.WithTransactionValue(ctx, r.db, nil, func(tx *sql.Tx) (storage.QueueItemRecord, error) {
+		repos := storage.NewRepositories(tx)
+		current, err := repos.Loops.GetByID(ctx, loop.ID)
+		if err != nil {
+			return storage.QueueItemRecord{}, err
+		}
+		if current == nil || terminalReviewerLoopReason(*current) != "" {
+			return storage.QueueItemRecord{}, fmt.Errorf("reviewer loop %s is no longer eligible for discovery", loop.ID)
+		}
+		updated := *current
+		runs, err := repos.Runs.ListByLoop(ctx, updated.ID)
+		if err != nil {
+			return storage.QueueItemRecord{}, err
+		}
+		activeRun := false
+		for _, run := range runs {
+			if run.Status == "running" {
+				activeRun = true
+				break
+			}
+		}
+		if activeRun {
+			updated.Status = "running"
+			updated.NextRunAt = nil
+		} else {
+			updated.Status = "queued"
+			availableAt := eventlog.FormatJavaScriptISOString(input.AvailableAt.UTC())
+			if input.AvailableAt.IsZero() {
+				availableAt = r.nowISO()
+			}
+			updated.NextRunAt = &availableAt
+		}
+		updated.UpdatedAt = r.nowISO()
+		if err := repos.Loops.AssertIssueClaimAdmission(ctx, updated, false); err != nil {
+			return storage.QueueItemRecord{}, err
+		}
+		if err := repos.Loops.Upsert(ctx, updated); err != nil {
+			return storage.QueueItemRecord{}, err
+		}
+		queueItem, wake, err := r.enqueueWithQueue(ctx, repos.Queue, input)
+		if err != nil {
+			return storage.QueueItemRecord{}, err
+		}
+		shouldWake = wake
+		return queueItem, nil
+	})
 	if err != nil {
 		return storage.QueueItemRecord{}, err
 	}
-	if created {
+	if shouldWake {
 		r.wakeSchedulerAfterEnqueue()
 	}
-	return persisted, nil
+	return queueItem, nil
 }
 
 func (r *Runner) wakeSchedulerAfterEnqueue() {
@@ -5260,7 +5341,7 @@ func loopEnabledMetadataMissing(meta map[string]any) bool {
 	return true
 }
 
-func (r *Runner) ensureLoopMetadataJSON(current *string, projectID, repo string, prNumber int64) (string, error) {
+func (r *Runner) ensureLoopMetadataJSON(current *string, projectID, repo string, prNumber int64, sourceWorkerID string) (string, error) {
 	meta, err := loops.DecodeMetadataObjectForWrite(current)
 	if err != nil {
 		return "", err
@@ -5288,6 +5369,9 @@ func (r *Runner) ensureLoopMetadataJSON(current *string, projectID, repo string,
 	loopMeta["repo"] = repo
 	loopMeta["prNumber"] = prNumber
 	loopMeta["scope"] = string(r.scope)
+	if strings.TrimSpace(sourceWorkerID) != "" {
+		meta["sourceWorkerId"] = sourceWorkerID
+	}
 	loopMeta["quietPeriodSeconds"] = r.loopConfig.QuietPeriodSeconds
 	loopMeta["minPublishIntervalSeconds"] = r.loopConfig.MinPublishIntervalSeconds
 	removeDeprecatedReviewerLoopBudgetMetadata(loopMeta)
@@ -5329,6 +5413,23 @@ func (r *Runner) ensureLoopMetadataJSON(current *string, projectID, repo string,
 	meta["loop"] = loopMeta
 	encoded, err := json.Marshal(meta)
 	return string(encoded), err
+}
+
+func (r *Runner) sourceWorkerIDForPullRequest(ctx context.Context, projectID, repo string, prNumber int64) (string, error) {
+	loops, err := r.repos.Loops.List(ctx)
+	if err != nil {
+		return "", err
+	}
+	for _, loop := range loops {
+		if loop.ProjectID != projectID || loop.Type != string(domain.LoopTypeWorker) || loop.TargetType != string(domain.LoopTargetTypePullRequest) || !strings.EqualFold(derefString(loop.Repo), repo) || derefInt64(loop.PRNumber) != prNumber {
+			continue
+		}
+		worker, _ := parseJSONObject(loop.MetadataJSON)["worker"].(map[string]any)
+		if worker != nil && intFromAny(worker["issueNumber"]) > 0 {
+			return loop.ID, nil
+		}
+	}
+	return "", nil
 }
 
 func (r *Runner) recordLoopRunStartMetadata(current *string, projectID string) (string, error) {

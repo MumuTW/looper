@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	githubinfra "github.com/nexu-io/looper/internal/infra/github"
+	githubinfra "github.com/MumuTW/looper/internal/infra/github"
 )
 
 func TestDiscoverIssuesSkipsHistoricalOpenBacklog(t *testing.T) {

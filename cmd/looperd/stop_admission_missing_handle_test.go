@@ -8,9 +8,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nexu-io/looper/internal/loops"
-	looperdruntime "github.com/nexu-io/looper/internal/runtime"
-	"github.com/nexu-io/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/loops"
+	looperdruntime "github.com/MumuTW/looper/internal/runtime"
+	"github.com/MumuTW/looper/internal/storage"
 )
 
 // When the Supervisor registry is present but has no entry for a stoppable
