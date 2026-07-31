@@ -1490,10 +1490,12 @@ func (a workerGitAdapter) InspectHead(ctx context.Context, input worker.InspectH
 
 func (a workerGitAdapter) VerifyWorktreeIdentity(ctx context.Context, input worker.VerifyWorktreeIdentityInput) error {
 	return a.gateway.VerifyWorktreeIdentity(ctx, gitinfra.VerifyWorktreeIdentityInput{
-		RepoPath:       input.RepoPath,
-		WorktreeRoot:   input.WorktreeRoot,
-		WorktreePath:   input.WorktreePath,
-		ExpectedBranch: input.ExpectedBranch,
+		RepoPath:        input.RepoPath,
+		WorktreeRoot:    input.WorktreeRoot,
+		WorktreePath:    input.WorktreePath,
+		ExpectedBranch:  input.ExpectedBranch,
+		ExpectedHeadSHA: input.ExpectedHeadSHA,
+		CheckoutMode:    gitinfra.CheckoutMode(input.CheckoutMode),
 	})
 }
 

@@ -319,10 +319,12 @@ type InspectHeadResult struct {
 }
 
 type VerifyWorktreeIdentityInput struct {
-	RepoPath       string
-	WorktreeRoot   string
-	WorktreePath   string
-	ExpectedBranch string
+	RepoPath        string
+	WorktreeRoot    string
+	WorktreePath    string
+	ExpectedBranch  string
+	ExpectedHeadSHA string
+	CheckoutMode    string
 }
 
 type CommitInput struct {
@@ -652,11 +654,12 @@ type checkpointIssueClaim struct {
 }
 
 type checkpointWorktree struct {
-	ID         string `json:"id,omitempty"`
-	Path       string `json:"path,omitempty"`
-	Branch     string `json:"branch,omitempty"`
-	BaseBranch string `json:"baseBranch,omitempty"`
-	HeadSHA    string `json:"headSha,omitempty"`
+	ID           string `json:"id,omitempty"`
+	Path         string `json:"path,omitempty"`
+	Branch       string `json:"branch,omitempty"`
+	BaseBranch   string `json:"baseBranch,omitempty"`
+	HeadSHA      string `json:"headSha,omitempty"`
+	CheckoutMode string `json:"checkoutMode,omitempty"`
 }
 
 type checkpointPlan struct {
@@ -1586,7 +1589,7 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (w
 	if _, err := r.updateLoop(ctx, input.Loop, func(updated *storage.LoopRecord) { updated.MetadataJSON = stringPtr(metadataJSON) }); err != nil {
 		return checkpoint, fmt.Errorf("record worktree metadata: %w", err)
 	}
-	checkpoint.Worktree = &checkpointWorktree{ID: worktreeID, Path: created.WorktreePath, Branch: created.Branch, BaseBranch: baseBranch, HeadSHA: created.HeadSHA}
+	checkpoint.Worktree = &checkpointWorktree{ID: worktreeID, Path: created.WorktreePath, Branch: created.Branch, BaseBranch: baseBranch, HeadSHA: created.HeadSHA, CheckoutMode: "branch"}
 	checkpoint.Lifecycle = lifecycle.NewState(lifecycle.AgentManagedWithFallbackPolicy("worker", work.ExecutionMode == "create-pr"), created.Branch, baseBranch)
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	return checkpoint, nil
@@ -1614,18 +1617,31 @@ func (r *Runner) ensureWorkerWorktreeUsable(ctx context.Context, input stepInput
 			}
 			return worktree, &loopError{message: fmt.Sprintf("Unable to inspect worker worktree git metadata at %s for branch %s: %v", worktree.Path, firstNonEmpty(worktree.Branch, work.Branch, "unknown"), gitErr), kind: FailureRetryableTransient}
 		}
+		checkoutMode := strings.TrimSpace(worktree.CheckoutMode)
+		if checkoutMode == "" && strings.HasSuffix(filepath.Base(worktree.Path), "-detached") {
+			checkoutMode = "detached"
+		}
+		if checkoutMode == "" {
+			checkoutMode = "branch"
+		}
 		expectedBranch := firstNonEmpty(worktree.Branch, work.Branch)
-		if expectedBranch == "" {
+		if checkoutMode == "detached" {
+			if strings.TrimSpace(worktree.HeadSHA) == "" {
+				return worktree, staleWorkerWorktreeError(worktree, work, "checkpoint detached head is not recorded")
+			}
+		} else if expectedBranch == "" {
 			return worktree, staleWorkerWorktreeError(worktree, work, "checkpoint branch is not recorded")
 		}
 		if r.git == nil {
 			return worktree, &loopError{message: "Unable to verify worker worktree identity: git gateway is not configured", kind: FailureRetryableTransient}
 		}
 		if identityErr := r.git.VerifyWorktreeIdentity(ctx, VerifyWorktreeIdentityInput{
-			RepoPath:       input.Project.RepoPath,
-			WorktreeRoot:   worktreeRoot,
-			WorktreePath:   worktree.Path,
-			ExpectedBranch: expectedBranch,
+			RepoPath:        input.Project.RepoPath,
+			WorktreeRoot:    worktreeRoot,
+			WorktreePath:    worktree.Path,
+			ExpectedBranch:  expectedBranch,
+			ExpectedHeadSHA: strings.TrimSpace(worktree.HeadSHA),
+			CheckoutMode:    checkoutMode,
 		}); identityErr != nil {
 			return worktree, staleWorkerWorktreeError(worktree, work, "checkout identity mismatch: "+identityErr.Error())
 		}

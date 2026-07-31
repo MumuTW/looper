@@ -124,6 +124,53 @@ func TestRunRetryAllowsCheckpointIdentityMismatchPreflight(t *testing.T) {
 	}
 }
 
+func TestRunRetryAllowsExplicitRetrySafeWorktreePreflightError(t *testing.T) {
+	var posts int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/worktree"):
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"ok":false,"error":{"code":"VALIDATION_FAILED","message":"checkpoint checkout changed","details":{"retrySafe":true}}}`))
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/retry"):
+			posts++
+			_, _ = w.Write([]byte(`{"ok":true,"data":{}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	host, port := splitHostPort(server.URL)
+	if code := run([]string{"--host", host, "--port", port, "retry", "12"}, strings.NewReader(""), io.Discard, io.Discard); code != 0 {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if posts != 1 {
+		t.Fatalf("posts = %d, want 1", posts)
+	}
+}
+
+func TestRunRetryRefusesUnmarkedValidationPreflightError(t *testing.T) {
+	var posts int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/worktree") {
+			writeAPIError(w, http.StatusBadRequest, "VALIDATION_FAILED", "checkpoint checkout changed")
+			return
+		}
+		posts++
+		_, _ = w.Write([]byte(`{"ok":true,"data":{}}`))
+	}))
+	defer server.Close()
+
+	host, port := splitHostPort(server.URL)
+	if code := run([]string{"--host", host, "--port", port, "retry", "12"}, strings.NewReader(""), io.Discard, io.Discard); code == 0 {
+		t.Fatal("exit = 0, want validation preflight refusal")
+	}
+	if posts != 0 {
+		t.Fatalf("posts = %d, want 0", posts)
+	}
+}
+
 func TestRunRetryDiscardsWhenConfirmed(t *testing.T) {
 	var body map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -875,7 +875,7 @@ func (g *Gateway) VerifyWorktreeIdentity(ctx context.Context, input VerifyWorktr
 	if err != nil {
 		return fmt.Errorf("inspect worktree repository identity: %w", err)
 	}
-	if repoCommon != worktreeCommon {
+	if normalizeComparablePath(repoCommon) != normalizeComparablePath(worktreeCommon) {
 		return fmt.Errorf("worktree does not belong to project repository")
 	}
 	if normalizeCheckoutMode(input.CheckoutMode) == CheckoutModeDetached {
@@ -928,11 +928,25 @@ func worktreeRecordMetadata(raw *string, checkoutMode CheckoutMode, recovered bo
 }
 
 func (g *Gateway) gitCommonDir(ctx context.Context, path string) (string, error) {
-	result, err := g.runGitResult(ctx, path, nil, "rev-parse", "--path-format=absolute", "--git-common-dir")
+	// --path-format was added in Git 2.31. git-common-dir itself is enough for
+	// this comparison as long as a relative result is made absolute from the
+	// directory in which rev-parse ran.
+	result, err := g.runGitResult(ctx, path, nil, "rev-parse", "--git-common-dir")
 	if err != nil {
 		return "", err
 	}
-	return filepath.Clean(strings.TrimSpace(result.Stdout)), nil
+	commonDir := strings.TrimSpace(result.Stdout)
+	if commonDir == "" {
+		return "", fmt.Errorf("git common directory is empty")
+	}
+	if !filepath.IsAbs(commonDir) {
+		commonDir = filepath.Join(path, commonDir)
+	}
+	abs, err := filepath.Abs(commonDir)
+	if err != nil {
+		return "", fmt.Errorf("make git common directory absolute: %w", err)
+	}
+	return filepath.Clean(abs), nil
 }
 
 func (g *Gateway) Commit(ctx context.Context, input CommitInput) (CommitResult, error) {

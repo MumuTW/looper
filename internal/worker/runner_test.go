@@ -1623,6 +1623,35 @@ func TestProcessClaimedItemRefusesUnusableInRootCheckpointWorktree(t *testing.T)
 	}
 }
 
+func TestEnsureWorkerWorktreeUsablePassesDetachedCheckpointIdentity(t *testing.T) {
+	t.Parallel()
+	worktreeRoot := filepath.Join(t.TempDir(), "worktrees")
+	worktreePath := filepath.Join(worktreeRoot, "checkpoint-detached")
+	if err := os.MkdirAll(worktreePath, 0o755); err != nil {
+		t.Fatalf("MkdirAll(worktree) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(worktreePath, ".git"), []byte("gitdir: fake\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile(.git) error = %v", err)
+	}
+	metadata := fmt.Sprintf(`{"worktreeRoot":%q}`, worktreeRoot)
+	git := &fakeGitGateway{}
+	runner := New(Options{Git: git})
+	checkpoint := workerCheckpoint{}
+	worktree := checkpointWorktree{Path: worktreePath, HeadSHA: "detached-head", CheckoutMode: "detached"}
+	if _, err := runner.ensureWorkerWorktreeUsable(context.Background(), stepInput{
+		Project: storage.ProjectRecord{ID: "project_1", RepoPath: filepath.Join(t.TempDir(), "repo"), MetadataJSON: &metadata},
+	}, &checkpoint, workerInput{}, worktree); err != nil {
+		t.Fatalf("ensureWorkerWorktreeUsable() error = %v", err)
+	}
+	if len(git.verifyCalls) != 1 {
+		t.Fatalf("VerifyWorktreeIdentity calls = %#v, want one", git.verifyCalls)
+	}
+	got := git.verifyCalls[0]
+	if got.CheckoutMode != "detached" || got.ExpectedHeadSHA != "detached-head" || got.ExpectedBranch != "" {
+		t.Fatalf("VerifyWorktreeIdentity input = %#v, want detached checkpoint identity", got)
+	}
+}
+
 func TestCreateRunContextCopiesPredecessorAgentSnapshotOnResume(t *testing.T) {
 	t.Parallel()
 
@@ -5018,6 +5047,7 @@ type fakeGitGateway struct {
 	pushCalls      []PushInput
 	prepareCalls   []PrepareWorktreeInput
 	inspectCalls   []InspectHeadInput
+	verifyCalls    []VerifyWorktreeIdentityInput
 	commitCalls    []CommitInput
 	pushErrors     []error
 	pushIndex      int
@@ -5071,7 +5101,8 @@ func (f *fakeGitGateway) InspectHead(_ context.Context, input InspectHeadInput) 
 	return f.inspectResult, nil
 }
 
-func (f *fakeGitGateway) VerifyWorktreeIdentity(context.Context, VerifyWorktreeIdentityInput) error {
+func (f *fakeGitGateway) VerifyWorktreeIdentity(_ context.Context, input VerifyWorktreeIdentityInput) error {
+	f.verifyCalls = append(f.verifyCalls, input)
 	return nil
 }
 

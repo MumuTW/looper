@@ -87,6 +87,14 @@ export function isWorktreeRouteUnavailable(err: unknown): boolean {
   return err.status === 404 && err.code === "ROUTE_NOT_FOUND";
 }
 
+/** True only when the daemon explicitly allows a non-destructive plain retry. */
+export function isRetrySafeWorktreePreflight(err: unknown): boolean {
+  if (!(err instanceof ApiError)) return false;
+  if (err.status !== 400 || err.code !== "VALIDATION_FAILED") return false;
+  if (!err.details || typeof err.details !== "object") return false;
+  return (err.details as { retrySafe?: unknown }).retrySafe === true;
+}
+
 /**
  * Classify worktree preflight for retry UX.
  * Discard is only offered for present + managed + dirty.
@@ -197,8 +205,9 @@ export function LoopActionBar({
       try {
         worktree = await fetchLoopWorktree(selector);
       } catch (err) {
-        if (isWorktreeRouteUnavailable(err)) {
-          // Older daemon without /worktree — keep prior plain-retry behavior.
+        if (isWorktreeRouteUnavailable(err) || isRetrySafeWorktreePreflight(err)) {
+          // Older daemons and explicit retry-safe validation errors both allow
+          // the non-destructive retry path.
           await finishRetry(false);
           return;
         }

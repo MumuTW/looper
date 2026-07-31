@@ -45,7 +45,7 @@ func runRetry(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		if statusErr != nil {
 			// Older daemons without /worktree: keep plain retry, matching the
 			// dashboard fallback when the route is missing.
-			if !isWorktreeRouteMissing(statusErr) {
+			if !isWorktreeRouteMissing(statusErr) && !isRetrySafeWorktreePreflight(statusErr) {
 				_, _ = fmt.Fprintf(stderr, "looper: %v\n", statusErr)
 				return 1
 			}
@@ -261,4 +261,18 @@ func isWorktreeRouteMissing(err error) bool {
 	// must agree before the gate stands down.
 	return daemonErr.StatusCode == http.StatusNotFound &&
 		daemonErr.Code == string(pkgapi.ErrorCodeRouteNotFound)
+}
+
+// isRetrySafeWorktreePreflight permits only the daemon's explicit statement
+// that a failed status check blocks discard but not plain retry. The worker
+// revalidates the checkpoint checkout before agent execution, so accepting a
+// generic 400 here would be unsafe.
+func isRetrySafeWorktreePreflight(err error) bool {
+	var daemonErr *daemonError
+	if !errors.As(err, &daemonErr) {
+		return false
+	}
+	return daemonErr.StatusCode == http.StatusBadRequest &&
+		daemonErr.Code == string(pkgapi.ErrorCodeValidationFailed) &&
+		daemonErr.RetrySafe
 }

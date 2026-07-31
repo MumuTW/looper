@@ -701,6 +701,7 @@ export async function openLoopLogsStream(
           status: response.status,
           code: envelope?.error?.code,
           requestId: envelope?.requestId,
+          details: envelope?.error?.details,
         });
       } catch (err) {
         if (err instanceof ApiError) throw err;

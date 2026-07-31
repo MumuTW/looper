@@ -1210,6 +1210,13 @@ func TestHandlerLoopRetryDiscardRejectsMovedCheckpointWorktree(t *testing.T) {
 		t.Fatalf("GetByBranch() = %#v, %v", record, err)
 	}
 	record.WorktreePath = movedPath
+	// A replacement record may also have a different checkout identity. The
+	// resolver must discard these record-derived values with the record and
+	// re-derive identity from the checkpoint path before preflight.
+	detachedMetadata := `{"checkoutMode":"detached"}`
+	replacementHead := "replacement-head"
+	record.MetadataJSON = &detachedMetadata
+	record.HeadSHA = &replacementHead
 	record.UpdatedAt = nowISO
 	if err := services.Repositories.Worktrees.Upsert(context.Background(), *record); err != nil {
 		t.Fatalf("Worktrees.Upsert(moved) error = %v", err)
@@ -1303,6 +1310,9 @@ func TestHandlerLoopRetryDiscardRejectsCheckpointBranchMismatch(t *testing.T) {
 	if statusRecorder.Code != http.StatusBadRequest || !strings.Contains(statusRecorder.Body.String(), "not retry-safe") {
 		t.Fatalf("worktree status = %d body=%s, want physical branch mismatch rejection", statusRecorder.Code, statusRecorder.Body.String())
 	}
+	statusError := parseJSONMap(t, statusRecorder.Body.Bytes())["error"].(map[string]any)
+	statusDetails := statusError["details"].(map[string]any)
+	assertEqual(t, statusDetails["retrySafe"], true)
 
 	retryReq := httptest.NewRequest(http.MethodPost, "/api/v1/loops/3137/retry", strings.NewReader(`{"mode":"auto","discardWorktreeChanges":true}`))
 	retryRecorder := httptest.NewRecorder()
@@ -1416,6 +1426,44 @@ func TestHandlerLoopRetryDiscardRejectsReplacedCheckpointID(t *testing.T) {
 	}
 	if got := readTestFile(t, filepath.Join(fixture.WorktreePath, "dirty.txt")); got != "untracked\n" {
 		t.Fatalf("replacement ID worktree was discarded: dirty.txt = %q", got)
+	}
+}
+
+func TestHandlerLoopRetryDiscardRejectsPathOnlyCheckpointWithoutBranch(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+	fixture := seedManagedWorktreeFixture(t, services.Repositories, managedWorktreeSeed{
+		ProjectID: "project_retry_discard_path_only", LoopID: "loop_retry_discard_path_only", LoopSeq: 3144,
+		LoopType: "worker", Branch: "feature/path-only", NowISO: nowISO, Dirty: true,
+	})
+	record, err := services.Repositories.Worktrees.GetByBranch(context.Background(), "project_retry_discard_path_only", "feature/path-only")
+	if err != nil || record == nil {
+		t.Fatalf("GetByBranch() = %#v, %v", record, err)
+	}
+	if err := services.Repositories.Worktrees.Delete(context.Background(), record.ID); err != nil {
+		t.Fatalf("Worktrees.Delete() error = %v", err)
+	}
+	latestRun, err := services.Repositories.Runs.GetLatestByLoopID(context.Background(), fixture.LoopID)
+	if err != nil || latestRun == nil {
+		t.Fatalf("Runs.GetLatestByLoopID() = %#v, %v", latestRun, err)
+	}
+	checkpoint := fmt.Sprintf(`{"worktree":{"path":%q}}`, fixture.WorktreePath)
+	latestRun.CheckpointJSON = &checkpoint
+	latestRun.UpdatedAt = nowISO
+	if err := services.Repositories.Runs.Upsert(context.Background(), *latestRun); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/3144/retry", strings.NewReader(`{"mode":"auto","discardWorktreeChanges":true}`))
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), "checkpoint branch is required") {
+		t.Fatalf("discard retry = %d body=%s, want branch validation failure", recorder.Code, recorder.Body.String())
+	}
+	if got := readTestFile(t, filepath.Join(fixture.WorktreePath, "dirty.txt")); got != "untracked\n" {
+		t.Fatalf("path-only checkpoint discarded worktree: dirty.txt = %q", got)
 	}
 }
 
@@ -2269,7 +2317,14 @@ func (a workerGitTestAdapter) InspectHead(ctx context.Context, input workerpkg.I
 }
 
 func (a workerGitTestAdapter) VerifyWorktreeIdentity(ctx context.Context, input workerpkg.VerifyWorktreeIdentityInput) error {
-	return a.gateway.VerifyWorktreeIdentity(ctx, gitinfra.VerifyWorktreeIdentityInput{RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, ExpectedBranch: input.ExpectedBranch})
+	return a.gateway.VerifyWorktreeIdentity(ctx, gitinfra.VerifyWorktreeIdentityInput{
+		RepoPath:        input.RepoPath,
+		WorktreeRoot:    input.WorktreeRoot,
+		WorktreePath:    input.WorktreePath,
+		ExpectedBranch:  input.ExpectedBranch,
+		ExpectedHeadSHA: input.ExpectedHeadSHA,
+		CheckoutMode:    gitinfra.CheckoutMode(input.CheckoutMode),
+	})
 }
 
 func (a workerGitTestAdapter) Commit(ctx context.Context, input workerpkg.CommitInput) (workerpkg.CommitResult, error) {

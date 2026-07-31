@@ -78,11 +78,12 @@ type loopWorktreeStatusResponse struct {
 }
 
 type checkpointWorktreeRef struct {
-	ID       string `json:"id,omitempty"`
-	Path     string `json:"path,omitempty"`
-	Branch   string `json:"branch,omitempty"`
-	HeadSHA  string `json:"headSha,omitempty"`
-	PRNumber int64  `json:"prNumber,omitempty"`
+	ID           string `json:"id,omitempty"`
+	Path         string `json:"path,omitempty"`
+	Branch       string `json:"branch,omitempty"`
+	HeadSHA      string `json:"headSha,omitempty"`
+	CheckoutMode string `json:"checkoutMode,omitempty"`
+	PRNumber     int64  `json:"prNumber,omitempty"`
 }
 
 // checkpointWithWorktree extracts worktree location hints from a run checkpoint.
@@ -169,6 +170,11 @@ func (h *Handler) loopWorktreeStatus(ctx context.Context, loop storage.LoopRecor
 					code:    pkgapi.ErrorCodeValidationFailed,
 					status:  http.StatusBadRequest,
 					message: fmt.Sprintf("Checkpoint worktree for loop %s is not retry-safe: %v", loop.ID, identityErr),
+					// This denies destructive discard, not a plain retry. The runner
+					// verifies the checkpoint checkout again before it starts an
+					// agent, so requeueing remains safe and lets it record the
+					// manual-intervention outcome.
+					details: map[string]any{"retrySafe": true, "reason": resolved.UnsafeReason},
 				}
 			}
 		}
@@ -281,6 +287,20 @@ func (h *Handler) discardLoopWorktreeChanges(ctx context.Context, services loope
 			message: fmt.Sprintf("Cannot discard worktree changes for loop %s: path %s is not a Looper-managed worktree", loop.ID, resolved.Path),
 		}
 	}
+	if resolved.CheckoutMode == gitinfra.CheckoutModeDetached && strings.TrimSpace(resolved.ExpectedHeadSHA) == "" {
+		return worktreeDiscardResult{}, apiError{
+			code:    pkgapi.ErrorCodeValidationFailed,
+			status:  http.StatusBadRequest,
+			message: fmt.Sprintf("Cannot discard worktree changes for loop %s: checkpoint detached head is required", loop.ID),
+		}
+	}
+	if resolved.CheckoutMode != gitinfra.CheckoutModeDetached && strings.TrimSpace(resolved.Branch) == "" {
+		return worktreeDiscardResult{}, apiError{
+			code:    pkgapi.ErrorCodeValidationFailed,
+			status:  http.StatusBadRequest,
+			message: fmt.Sprintf("Cannot discard worktree changes for loop %s: checkpoint branch is required", loop.ID),
+		}
+	}
 
 	gitPath := ""
 	if h.context.Config.Tools.GitPath != nil {
@@ -386,11 +406,8 @@ func resolveManagedWorktreeForLoop(ctx context.Context, repos *storage.Repositor
 		prNumber = fromCheckpoint.PRNumber
 	}
 
-	expectedHeadSHA := ""
-	if fromCheckpoint != nil {
-		expectedHeadSHA = strings.TrimSpace(fromCheckpoint.HeadSHA)
-	}
-	checkoutMode := gitinfra.CheckoutModeBranch
+	expectedHeadSHA := checkpointExpectedHeadSHA(fromCheckpoint)
+	checkoutMode := checkpointCheckoutMode(fromCheckpoint)
 	var record *storage.WorktreeRecord
 	unsafeReason := ""
 	if fromCheckpoint != nil {
@@ -400,10 +417,6 @@ func resolveManagedWorktreeForLoop(ctx context.Context, repos *storage.Repositor
 				return nil, err
 			}
 			if record != nil {
-				checkoutMode = checkoutModeForWorktreeRecord(*record)
-				if expectedHeadSHA == "" {
-					expectedHeadSHA = derefString(record.HeadSHA)
-				}
 				checkpointPath := strings.TrimSpace(fromCheckpoint.Path)
 				if record.ProjectID != project.ID {
 					return nil, apiError{
@@ -415,6 +428,8 @@ func resolveManagedWorktreeForLoop(ctx context.Context, repos *storage.Repositor
 				if record.CleanedAt != nil || record.Status == "cleaned" || record.Status == "retired" {
 					unsafeReason = "checkpoint_identity_inactive"
 					record = nil
+					checkoutMode = checkpointCheckoutMode(fromCheckpoint)
+					expectedHeadSHA = checkpointExpectedHeadSHA(fromCheckpoint)
 				} else {
 					checkpointBranch := strings.TrimSpace(fromCheckpoint.Branch)
 					pathMismatch := checkpointPath != "" && !sameFilesystemPath(record.WorktreePath, checkpointPath)
@@ -427,6 +442,13 @@ func resolveManagedWorktreeForLoop(ctx context.Context, repos *storage.Repositor
 						// reset the replacement checkout that the worker refused to use.
 						unsafeReason = "checkpoint_identity_mismatch"
 						record = nil
+						checkoutMode = checkpointCheckoutMode(fromCheckpoint)
+						expectedHeadSHA = checkpointExpectedHeadSHA(fromCheckpoint)
+					} else {
+						checkoutMode = checkoutModeForWorktreeRecord(*record)
+						if expectedHeadSHA == "" {
+							expectedHeadSHA = derefString(record.HeadSHA)
+						}
 					}
 				}
 			}
@@ -524,6 +546,20 @@ func resolveManagedWorktreeForLoop(ctx context.Context, repos *storage.Repositor
 	}, nil
 }
 
+func checkpointExpectedHeadSHA(checkpoint *checkpointWorktreeRef) string {
+	if checkpoint == nil {
+		return ""
+	}
+	return strings.TrimSpace(checkpoint.HeadSHA)
+}
+
+func checkpointCheckoutMode(checkpoint *checkpointWorktreeRef) gitinfra.CheckoutMode {
+	if checkpoint != nil && strings.TrimSpace(checkpoint.CheckoutMode) == string(gitinfra.CheckoutModeDetached) {
+		return gitinfra.CheckoutModeDetached
+	}
+	return gitinfra.CheckoutModeBranch
+}
+
 func parseCheckpointWorktree(raw *string) *checkpointWorktreeRef {
 	if raw == nil || strings.TrimSpace(*raw) == "" {
 		return nil
@@ -536,12 +572,14 @@ func parseCheckpointWorktree(raw *string) *checkpointWorktreeRef {
 	branch := ""
 	headSHA := ""
 	id := ""
+	checkoutMode := ""
 	prNumber := int64(0)
 	if checkpoint.Worktree != nil {
 		path = strings.TrimSpace(checkpoint.Worktree.Path)
 		branch = strings.TrimSpace(checkpoint.Worktree.Branch)
 		headSHA = strings.TrimSpace(checkpoint.Worktree.HeadSHA)
 		id = strings.TrimSpace(checkpoint.Worktree.ID)
+		checkoutMode = strings.TrimSpace(checkpoint.Worktree.CheckoutMode)
 	}
 	// Dirty prepare-worktree often aborts before checkpoint.worktree is set.
 	// Prefer an explicit worktree.branch, then worker work.branch, then
@@ -568,7 +606,7 @@ func parseCheckpointWorktree(raw *string) *checkpointWorktreeRef {
 	if path == "" && branch == "" && headSHA == "" && id == "" && prNumber == 0 {
 		return nil
 	}
-	return &checkpointWorktreeRef{ID: id, Path: path, Branch: branch, HeadSHA: headSHA, PRNumber: prNumber}
+	return &checkpointWorktreeRef{ID: id, Path: path, Branch: branch, HeadSHA: headSHA, CheckoutMode: checkoutMode, PRNumber: prNumber}
 }
 
 func findProjectWorktreeByPath(ctx context.Context, repos *storage.Repositories, projectID, path string) (*storage.WorktreeRecord, error) {

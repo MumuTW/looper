@@ -1227,8 +1227,8 @@ func doHTTPWithin(ctx context.Context, timeout time.Duration, cfg config.Config,
 		return "", fmt.Errorf("read response: %w", err)
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		code, message := apiErrorEnvelope(payload)
-		return "", &daemonError{Status: response.Status, StatusCode: response.StatusCode, Code: code, Message: message}
+		code, message, retrySafe := apiErrorEnvelope(payload)
+		return "", &daemonError{Status: response.Status, StatusCode: response.StatusCode, Code: code, Message: message, RetrySafe: retrySafe}
 	}
 	return string(payload), nil
 }
@@ -1284,19 +1284,22 @@ func stopAllResultCounts(payload []byte) (failed, pausedOnly int, err error) {
 // The code is what callers must branch on: the message is prose that varies by
 // cause, and the status alone cannot distinguish "this route does not exist on
 // an older daemon" from "this daemon answered the route with a 404 of its own".
-func apiErrorEnvelope(payload []byte) (code, message string) {
+func apiErrorEnvelope(payload []byte) (code, message string, retrySafe bool) {
 	var envelope struct {
 		Error struct {
 			Code    string `json:"code"`
 			Message string `json:"message"`
+			Details struct {
+				RetrySafe bool `json:"retrySafe"`
+			} `json:"details"`
 		} `json:"error"`
 	}
 	if err := json.Unmarshal(payload, &envelope); err == nil {
 		if trimmed := strings.TrimSpace(envelope.Error.Message); trimmed != "" {
-			return strings.TrimSpace(envelope.Error.Code), trimmed
+			return strings.TrimSpace(envelope.Error.Code), trimmed, envelope.Error.Details.RetrySafe
 		}
 	}
-	return "", strings.TrimSpace(string(payload))
+	return "", strings.TrimSpace(string(payload)), false
 }
 
 // daemonError is a non-2xx answer from looperd, carrying the typed error code
@@ -1306,6 +1309,7 @@ type daemonError struct {
 	StatusCode int
 	Code       string
 	Message    string
+	RetrySafe  bool
 }
 
 func (e *daemonError) Error() string {
