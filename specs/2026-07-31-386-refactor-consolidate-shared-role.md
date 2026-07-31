@@ -321,7 +321,7 @@ no cycle is created, and every production importer of `validation`
 imports `failureclass`, so no importer gains a transitive dependency it did not
 already carry.
 
-### Step 2 — Delete the `xxxFailureKind` conversion functions; normalize at the queue-failure boundary
+### Step 2 — Delete the `xxxFailureKind` conversion functions; normalize at the classifier
 
 With `QueueFailureKind` gone, `fixerFailureKind`, `reviewerFailureKind`,
 `workerFailureKind`, and `plannerFailureKind` would be identity functions for
@@ -333,16 +333,15 @@ unknown value instead of being normalized to `non_retryable`, changing retry
 behavior before all retry predicates are updated. That violates Goal 3 (no
 behavior change).
 
-Preserve the fallback at the **consumption boundary**, not at every production
-site. Add `failureclass.Normalize(kind Kind) Kind` to
+Preserve the fallback at the **classifier**, not at every production site or at
+each consumption boundary. Add `failureclass.Normalize(kind Kind) Kind` to
 `internal/loops/failureclass`, returning each inventoried pass-through kind
 unchanged (membership tested against a package-level `passThroughKinds` inventory
 — today the four known kinds — described below) and any unrecognized kind as
-`NonRetryable`, and normalize `failure.kind` once at each
-runner's queue-failure consumption boundary — the point where the `loopError`'s
-`kind` is first read for a retry decision, breaker check, resume-policy
-derivation, or persistence — before any such read. The four runner paths
-converge at these boundaries before retry decisions and persistence: each
+`NonRetryable`, and normalize `failure.kind` **inside each runner's
+`classifyFailure*` functions** — the single choke point every failure-handling
+entry point flows through — before they return the `loopError`. The four runner
+paths converge at the classifier before retry decisions and persistence: each
 failure-handling entry point begins with `failure := r.classifyFailure*(...)`
 and then reads `failure.kind` for the retry predicates
 (`isQueueRetryEligible`/`shouldRetryQueueFailure`), the resume-policy derivation
@@ -351,44 +350,78 @@ queue/checkpoint persistence (`failQueueItem`/`failQueueItemTerminal`/
 `requeueQueueItem`/`ProcessResult.FailureKind`/`FixerOutcomeFailure.Kind`). The
 fixer's breaker reads `failure.kind` for its manual-kind check
 (`failQueueItemWithBreaker`) before delegating to the queue-failure path, so the
-fixer's normalization precedes that check and the breaker receives an
-already-normalized kind. Normalizing `failure.kind` once at each entry point
-(or, equivalently, inside the `classifyFailure*` functions that produce every
-dynamic-source `loopError`, since each entry point begins with such a call)
-covers every downstream read in that block, so a single normalization per
-failure-handling path is sufficient.
+classifier's normalization precedes that check and the breaker receives an
+already-normalized kind. Every `classifyFailure*` function today does
+`errors.As(err, &typed)` and returns an existing `*loopError` unchanged, then
+falls back to `failurepolicy.ClassifyError`/`failureclass.Classify` for other
+errors; normalization is applied to the kind in **both** branches before the
+`loopError` is returned, so a kind that entered the classifier through either
+path — a pre-constructed `loopError` (the `errors.As` branch, including the
+resume-validation validators' returned errors and the carrier sites' returned
+errors) or a freshly classified dynamic error (the `Classify` branch) — is
+normalized once at the single point all entry points share. Normalizing inside
+the classifier covers every downstream read in each failure-handling block, so a
+single normalization per failure-handling path is sufficient.
+
+Centralizing normalization in the classifier — rather than at each consumption
+boundary after `classifyFailure*` returns — is chosen because it makes the
+normalization a single, directly-testable invariant rather than a per-entry-point
+property that must be injection-tested at each boundary. The resume-validation
+entry points cannot be injection-tested at a consumption boundary:
+`validateFixerResumeCheckpoint` and `validateCompletedRepairCheckpoint`
+synthesize only fixed known-kind `loopError` values (`FailureManualIntervention`),
+and `validateWorkerResumeCheckpoint` delegates to
+`validateCompletedExecutionCheckpoint`, which likewise hard-codes
+`FailureRetryableTransient`, so a test cannot construct a `loopError` whose
+`kind` is an unknown value and drive either resume-validation entry point as the
+earlier per-boundary contract promised — the validator produces the `loopError`
+itself with a fixed kind, and there is no seam to inject a different one. Those
+validators' returned errors do flow through `classifyFailure*`
+(`failure := r.classifyFailure(err)` / `r.classifyFailureWithBoundary(err, …)` at
+the resume-validation call site), so normalizing inside the classifier covers the
+resume-validation path without injecting through the validator: the classifier's
+`errors.As` branch returns the validator's `loopError`, and the normalization
+applied there is the boundary the earlier design placed after the call. The
+classifier invariant is then tested directly (Validation step 6) by constructing
+a `loopError` whose `kind` is an unknown value, passing it through each runner's
+`classifyFailure*` function, and asserting the returned kind is `NonRetryable` —
+one test per runner covers every entry point that flows through that classifier,
+including the non-injectable resume-validation validators, without a per-entry-
+point injection harness or a production test seam in the validators.
 
 This deletes the twelve call-site `Normalize` wraps the earlier draft added
 (seven dynamic-source sites plus five known-safe carrier reads) and the entire
 structural gate (the type-aware `go/parser`+`go/ast`+`go/types` call-site check
-the earlier draft's Validation step 8 specified). Boundary normalization is
+the earlier draft's Validation step 8 specified). Classifier normalization is
 strictly more robust than a producer-side gate: it preserves the unknown-kind →
 `NonRetryable` fallback for every producer — including sources a structural
-analyzer cannot model — because the boundary normalizes regardless of how the
+analyzer cannot model — because the classifier normalizes regardless of how the
 kind was produced. A producer that assigns an unknown kind directly to
 `loopError.kind` cannot reach a retry decision or persistence unnormalized,
-because the boundary normalizes before any decision read. The structural gate
-existed to prevent that symptom; boundary normalization makes the symptom
+because every failure-handling entry point flows through `classifyFailure*` and
+the classifier normalizes before any decision read. The structural gate
+existed to prevent that symptom; classifier normalization makes the symptom
 impossible, so the gate is redundant — the deletion the repo's "prefer deletion
 over another layer" guideline requires before adding a validation layer. Per the
 repo's "name the authority before enforcing it" guideline, the authority for
-"this kind is supported" is `Normalize` itself, and the boundary enforces it
+"this kind is supported" is `Normalize` itself, and the classifier enforces it
 once rather than inferring per-producer safety.
 
-The earlier draft did not record attempting boundary enforcement before adding
-the structural gate. Boundary normalization was weighed against the
+The earlier draft did not record attempting classifier enforcement before adding
+the structural gate. Classifier normalization was weighed against the
 producer-side gate and adopted because it deletes both the call-site wraps and
 the gate while covering strictly more producers; the producer-side gate is
 recorded as a rejected alternative below. The carrier sources the earlier draft
 wrapped — `worker.validationFailure.kind` (read into `loopError.kind` at four
 worker sites) and `fixerRepairTaskOutcome`'s `blockedKind` — are bounded to the
 four known kinds by their producers, so `Normalize` is a no-op for them today;
-the boundary covers them without a per-carrier allowlist, so no carrier-name
+the classifier covers them without a per-carrier allowlist, so no carrier-name
 recognition and no per-call-site wrap is needed. Those `loopError` construction
 sites keep their direct assignments (`kind: failure.kind`, `kind: blockedKind`)
-unchanged — the boundary normalizes the resulting `failure.kind` before any
-decision read, so wrapping each construction would only duplicate work the
-boundary already does.
+unchanged — the constructed `loopError` is returned from a step function and
+flows through `classifyFailureWithBoundary` in the step loop, where the
+classifier normalizes the kind before any decision read, so wrapping each
+construction would only duplicate work the classifier already does.
 
 `Normalize` defaults an unrecognized kind to `NonRetryable`, so a future
 `policy.Kind` constant added before the runners' retry, hold, notification, and
@@ -411,6 +444,44 @@ schema does not accept is rejected at insert time on every queue write — a lou
 failure, but one that leaves the opt-in incomplete. The schema migration
 (constraint update plus any backfill migration that writes the literal, per
 Trade-off item 4) is therefore a required opt-in step, not an optional follow-up.
+
+(4) Update the persisted-string predicate consumers that read
+`queue_items.last_error_kind` as a bare string, because steps (1)–(3) cover only
+the typed runner predicates and the schema constraint, leaving the bare-string
+read surfaces on the old vocabulary. Two such predicates bound runtime behavior
+over the persisted kind and must be opted in alongside the typed predicates:
+`internal/api/handler.go:isBackingOffQueue` recognizes only
+`retryable_transient` and `retryable_after_resume` for backoff display, so a
+fifth retryable kind that `Normalize` passes through and the schema accepts is
+still not displayed as backing off; and `internal/storage/repositories.go`'s
+`longTermRetryPredicateLiteral` / `longTermRetryPredicateParam` embed only
+`retryable_transient`, `retryable_after_resume`, and `non_retryable` in a SQL
+predicate, so a fifth queue-eligible kind escapes long-term-retry ordering. A
+kind that is pass-through, schema-accepted, and handled by every runner
+predicate but unrecognized by these two bare-string predicates is therefore
+displayed incorrectly during backoff and scheduled incorrectly — a partial
+roll-out the first three steps do not catch, because the runner and schema
+contracts stay green while the persisted-string consumers stay on the old
+vocabulary. These consumers remain bare-string read surfaces against the
+persisted kind (out of scope for the type-ledger deletion this refactor performs
+— they are not re-derived from `policy` here), but the opt-in procedure must
+include them so a new kind is not partially rolled out: a persisted-string
+predicate contract test (Validation step 6) iterates
+`failureclass.PassThroughKinds()` and asserts each kind that is retry-eligible
+under the infinite attempt bound (the "always-retryable" kinds that earn backoff
+display — `retryable_transient` and `retryable_after_resume` today; `NonRetryable`
+is retry-eligible only under a bounded attempt cap, not under the infinite bound,
+so it is not a backoff kind and is not asserted here) is recognized by
+`isBackingOffQueue`, and each queue-eligible kind (every pass-through kind except
+`ManualIntervention`) appears in
+`longTermRetryPredicateLiteral` / `longTermRetryPredicateParam`, so a kind added
+to the inventory that these predicates do not recognize fails the contract in
+the same change rather than silently mis-displaying or mis-scheduling at
+runtime. The retry-eligible-under-infinite and queue-eligible subsets are read
+from the expected-behavior oracle (Validation step 6) — the oracle's
+`RetryEligible` for the infinite-bound state supplies the backoff subset — not
+re-hard-coded here, so the contract test and the oracle consult one authority
+for which kinds each persisted-string predicate must recognize.
 
 The pass-through set is a single, named inventory so the first two edits cannot
 drift apart: `Normalize` consults a package-level `passThroughKinds []Kind`
@@ -463,23 +534,23 @@ future authority constant to pass through: a constant added later is not
 asserted here until it is opted into the inventory, but removing one of the
 four currently supported kinds from `passThroughKinds` makes `Normalize`
 convert it to `NonRetryable` and fails this explicit pin, so the silent
-behavior change is caught. The boundary normalization itself is
+behavior change is caught. The classifier normalization itself is
 **not**
 covered only by the four-kind per-runner classification tests and alias-identity
 tests in Validation step 6: those assert each runner's persisted kind and retry
 decision for each *known* kind, and every known kind is a fixed point of
-`Normalize`, so they still pass if a runner's failure-handling entry point omits
+`Normalize`, so they still pass if a runner's `classifyFailure*` function omits
 its `Normalize` call and an unknown `loopError.kind` reaches retry or
 persistence unnormalized. The implementation therefore adds a per-runner
-boundary-normalization contract test (Validation step 6) that injects an unknown
-`Kind` through **every independent failure-handling entry point** in each runner
-(fixer recovery, deferred pre-start cleanup, resume-validation, and step
-failure; worker recovery, resume-validation, and step failure; reviewer
-claim-setup recovery and step failure; planner recovery and step failure) and
-asserts the kind seen by the retry predicate, the breaker's manual-kind check,
-the resume-policy derivation, and queue/checkpoint persistence is
-`NonRetryable` — not the injected unknown value — so a boundary that drops its
-`Normalize` call is caught in the runner and entry point that contains it. No
+classifier-normalization contract test (Validation step 6) that passes an
+unknown `Kind` (a value outside the four known constants) through each runner's
+`classifyFailure*` function — the single choke point every failure-handling
+entry point in that runner flows through (fixer recovery, deferred pre-start
+cleanup, resume-validation, and step failure; worker recovery, resume-validation,
+and step failure; reviewer claim-setup recovery and step failure; planner
+recovery and step failure) — and asserts the returned `loopError`'s kind is
+`NonRetryable`, not the injected unknown value, so a classifier that drops its
+`Normalize` call is caught in the runner that contains it. No
 structural call-site gate is added.
 
 ### Step 3 — Audit the cross-package typed surface
@@ -950,17 +1021,17 @@ advertised value is honored," not the shared constant import.
   source importer to type-check the import graph under each release OS, and a
   pass-through enumeration assertion forcing `Normalize(c) == c` for every
   authority constant. The four runner paths already converge at their
-  queue-failure consumption boundaries before retry decisions and persistence
+  `classifyFailure*` functions before retry decisions and persistence
   (with the fixer needing normalization immediately before its breaker's
-  manual-kind check), so applying `failureclass.Normalize` once at those
-  boundaries preserves the unknown-kind fallback for every producer — including
+  manual-kind check), so applying `failureclass.Normalize` once inside the
+  classifier preserves the unknown-kind fallback for every producer — including
   sources the structural analyzer cannot model — and deletes the twelve
   call-site wraps, the entire structural gate, its source importer, and the
-  enumeration assertion. Boundary normalization makes the symptom the gate
+  enumeration assertion. Classifier normalization makes the symptom the gate
   existed to prevent impossible regardless of how the kind was produced, so the
   gate is redundant; the producer-side gate is the validation layer the repo's
   "prefer deletion over another layer" guideline requires a deletion-first
-  attempt before adding, and the deletion-first attempt (boundary normalization)
+  attempt before adding, and the deletion-first attempt (classifier normalization)
   succeeds. The enumeration assertion was also rejected on its own: forcing
   `Normalize(c) == c` for every authority constant would require pass-through the
   moment a fifth constant is added, letting a partially rolled-out kind reach
@@ -1058,6 +1129,84 @@ pass-through set duplicated across `Normalize` and four test packages, so the
 inventory is added only because the switch cannot make that duplication
 disappear.
 
+### Expected-behavior oracle (`ExpectedBehaviorFor`)
+
+Step 2 / Validation step 6 introduce a second shared semantic ledger distinct
+from the pass-through inventory above: an `ExpectedBehavior` struct and
+`ExpectedBehaviorFor(kind, runner, state)` oracle in `internal/loops/failureclass`
+that records each pass-through kind's intended retry-eligibility and resume
+policy parameterized by the runner and decision-relevant state, so the
+per-runner downstream-predicate cases assert against the shared expected
+semantics rather than only "did not fall through." Its deletion trade-off,
+distinct from both the `QueueFailureKind` ledger and the pass-through inventory:
+
+> Delete this oracle six months from now — what breaks?
+
+Deleting `ExpectedBehaviorFor` while keeping the per-runner downstream-predicate
+contract cases forces each runner package back to a hard-coded
+"this kind → this expected predicate output" table per runner, with the
+expected retry-eligibility and resume policy re-stated in each of the four
+runner test packages. The two state-dependent divergences the oracle encodes
+centrally — `NonRetryable`'s retry-eligibility flipping between the bounded and
+infinite attempt branches, and `RetryableAfterResume`'s resume policy differing
+between the reviewer's `NextResumePolicyOnFailure` and the other runners'
+`NormalizeResumePolicy` — must then be re-encoded in each runner's table
+separately, with nothing but reviewer attention keeping the four tables
+consistent with each other and with the predicates they assert against. That is
+the same double-ledger friction this refactor removes from `QueueFailureKind`,
+re-introduced inside the test layer: a predicate whose output changes (e.g. the
+attempt-bound rule in #508 is revised) must be edited in the oracle once today,
+but in four hard-coded tables after deletion, and a table that drifts from its
+predicate silently passes when the divergent branch is not the one the table
+happens to record. The oracle exists so the four runner tests consult one
+expected-semantics authority; deleting it re-opens the gap between the
+predicates and the expectations that exercise them.
+
+> What does it still not catch?
+
+The oracle pins the *intended* semantics, but where a kind's intended semantics
+coincide with a predicate's default fallthrough, the test still cannot
+distinguish an explicit branch from a coincidental default at that instant —
+the oracle records the intent so the coincidence is no longer silent if the
+default later moves, but it does not prove the predicate took an explicit branch
+at the time. It also does not catch a state tuple the tests do not exercise: the
+oracle is consulted only for the (runner, state) combinations the per-runner
+cases iterate, so a divergence on an unexercised state (e.g. a resume-policy
+derivation path the tests do not drive) is not recorded and not asserted. The
+oracle coordinates the expected semantics with the tests but does not coordinate
+the schema migration or the persisted-string predicate consumers, which remain
+separate required opt-in steps (Step 2 opt-in steps 3–4). Finally, the oracle
+records expected semantics only for pass-through kinds — a new `policy.Kind`
+constant added without being opted into `passThroughKinds` is contained to
+`NonRetryable` by `Normalize` and is not given an `ExpectedBehaviorFor` row, so
+the oracle does not assert anything about it until it is opted in.
+
+> Why are simpler per-runner contracts insufficient?
+
+Each runner's test could hard-code its own "this kind → this expected output"
+table with no shared oracle. That is strictly less robust for two reasons.
+First, the four tables would be four independent spellings of the expected
+semantics; a predicate output that changes must be edited in four places, and a
+table that drifts from its predicate silently passes when the divergent branch
+is not the one the table records — the same class of bug the `QueueFailureKind`
+ledger produced. The oracle makes the four runner tests consult one
+expected-semantics authority, so the expected semantics cannot drift between
+runners. Second, the state-dependent divergences (bounded-vs-infinite retry for
+`NonRetryable`; reviewer-vs-other-runner resume policy for `RetryableAfterResume`)
+mean a single `ExpectedBehaviorFor(kind)` keyed only on kind cannot supply a
+correct expected value — it would have to pick one branch and mis-label the
+other — so the per-runner tables would each have to re-encode the state
+dependence independently, multiplying the coordinated-edit cost. Parameterizing
+the shared oracle by `(runner, state)` keeps one authority while recording the
+divergences centrally, so the per-runner tests assert against the correct
+expected value for each (kind, runner, state) tuple without re-encoding the
+divergence four times. Per the repo's "prefer deletion over another layer"
+guideline, the simpler per-runner tables were attempted first: they leave the
+expected semantics duplicated across four test packages and cannot represent the
+state dependence without per-runner re-encoding, so the oracle is added only
+because the per-runner tables cannot make that duplication or that
+state-parameterization disappear.
+
 > What does it still not catch?
 
 This refactor targets the per-role `QueueFailureKind` ledger and the
@@ -1152,6 +1301,15 @@ not pass silently):**
      `"manual_intervention"`.
    - `internal/api/handler.go:3498` (`isBackingOffQueue`) recognizes only
      `"retryable_transient"` and `"retryable_after_resume"` for backoff display.
+     This predicate is now covered by the opt-in contract for *new-kind
+     additions* (Step 2 opt-in step 4 / Validation step 6): a fifth kind added
+     to `passThroughKinds` is asserted to be recognized by `isBackingOffQueue`
+     when it is retry-eligible under the infinite attempt bound (the
+     "always-retryable" kinds that earn backoff display), so a new always-retryable
+     kind that escapes backoff display fails the contract. It remains out of
+     scope for *rename* drift: a
+     rename of an existing kind value still leaves this bare-string predicate on
+     the old spelling, and no test added by this refactor catches that.
    - `internal/runtime/scheduler.go:3268,3561-3563,3633-3682` emits and compares
      bare kind strings (`"retryable_transient"`, `"non_retryable"`) when failing
      snapshot queue items and deciding retry eligibility.
@@ -1160,12 +1318,22 @@ not pass silently):**
      items (a write surface embedded in SQL, not a comparison).
    - `internal/storage/repositories.go`'s `longTermRetryPredicateLiteral` /
      `longTermRetryPredicateParam` embed the kind strings in a SQL predicate.
+     This predicate is now covered by the opt-in contract for *new-kind
+     additions* (Step 2 opt-in step 4 / Validation step 6): a fifth kind added
+     to `passThroughKinds` is asserted to appear in
+     `longTermRetryPredicateLiteral` / `longTermRetryPredicateParam` when it is
+     queue-eligible, so a new queue-eligible kind that escapes long-term-retry
+     ordering fails the contract. It remains out of scope for *rename* drift.
    These are read/write surfaces against the *persisted* kind string, not
    compile-time-typed `failureclass.Kind` values; widening this refactor to
    re-derive them would touch runtime recovery, the HTTP API, the scheduler, and
    the storage layer — well past the failure-kind *type* ledger the issue names.
-   They are deferred to a separate, persisted-vocabulary audit that can evaluate
-   a migration against the schema constraint below in the same change.
+   The two that bound runtime behavior over the persisted kind
+   (`isBackingOffQueue` and `longTermRetryPredicate`) are brought into the
+   new-kind opt-in contract so a fifth kind cannot be partially rolled out
+   through them; the rest (write surfaces and single-kind comparisons) remain
+   deferred to a separate, persisted-vocabulary audit that can evaluate a
+   migration against the schema constraint below in the same change.
 4. The persisted SQLite schema constrains `last_error_kind` to the four old
    string literals. The CHECK constraints in
    `internal/storage/migrations/0003_scheduler_queue.sql`,
@@ -1236,12 +1404,12 @@ Infra signals remain for drift detection, not authority.
 ## Impact
 
 **Files changed (production):**
-- `internal/fixer/runner.go` — delete `QueueFailureKind` + delete `fixerFailureKind` + `s/QueueFailureKind/failureclass.Kind/` + call-site edits. The `AppendFixerCompletionInstruction` call at `runner.go:7307` is unchanged (the builder now derives the advertised values itself from the `policy` import, Step 6, so no `string(failureclass.*)` wiring is added at the call site). The call-site edits include normalizing `failure.kind` once at each failure-handling entry point (Step 2's boundary normalization), before the breaker's manual-kind check and any retry/persistence read.
-- `internal/reviewer/runner.go` — delete `QueueFailureKind` + delete `reviewerFailureKind` + `s/QueueFailureKind/failureclass.Kind/` + call-site edits, including Step 2's boundary normalization at each failure-handling entry point.
-- `internal/worker/runner.go` — delete `QueueFailureKind` + delete `workerFailureKind` + `s/QueueFailureKind/failureclass.Kind/` + call-site edits, including Step 2's boundary normalization at each failure-handling entry point.
-- `internal/planner/runner.go` — delete `QueueFailureKind` + delete `plannerFailureKind` + `s/QueueFailureKind/failureclass.Kind/` + call-site edits, including Step 2's boundary normalization at each failure-handling entry point.
+- `internal/fixer/runner.go` — delete `QueueFailureKind` + delete `fixerFailureKind` + `s/QueueFailureKind/failureclass.Kind/` + call-site edits. The `AppendFixerCompletionInstruction` call at `runner.go:7307` is unchanged (the builder now derives the advertised values itself from the `policy` import, Step 6, so no `string(failureclass.*)` wiring is added at the call site). The call-site edits include normalizing `failure.kind` inside `classifyFailure`/`classifyFailureWithBoundary` (Step 2's classifier normalization), before the breaker's manual-kind check and any retry/persistence read.
+- `internal/reviewer/runner.go` — delete `QueueFailureKind` + delete `reviewerFailureKind` + `s/QueueFailureKind/failureclass.Kind/` + call-site edits, including Step 2's classifier normalization inside `classifyFailureForProjectAndBoundary`.
+- `internal/worker/runner.go` — delete `QueueFailureKind` + delete `workerFailureKind` + `s/QueueFailureKind/failureclass.Kind/` + call-site edits, including Step 2's classifier normalization inside `classifyFailureWithBoundary`.
+- `internal/planner/runner.go` — delete `QueueFailureKind` + delete `plannerFailureKind` + `s/QueueFailureKind/failureclass.Kind/` + call-site edits, including Step 2's classifier normalization inside `classifyFailureWithBoundary`.
 - `internal/runtime/scheduler.go` — `workerRunCompletedNotificationInput.FailureKind` becomes `failureclass.Kind` (the one `QueueFailureKind` reference here).
-- `internal/loops/failureclass/failureclass.go` — add `Normalize(kind Kind) Kind` (the authority for the unknown-kind fallback), backed by a package-level `passThroughKinds []Kind` inventory (today the four known kinds) that `Normalize` consults for membership, plus an exported `PassThroughKinds() []Kind` returning a copy of that inventory so the per-runner downstream-predicate tests and the `Normalize` unit test (Validation step 6) iterate over the single pass-through set rather than a hard-coded four-kind table; add an `ExpectedBehavior` struct and `ExpectedBehaviorFor(kind Kind) ExpectedBehavior` oracle over the same inventory recording each pass-through kind's intended retry-eligibility and resume policy, so the per-runner downstream-predicate cases assert against the shared expected semantics rather than only "did not fall through" (Validation step 6); add the `internal/loops/policy` import and alias `type Kind = policy.Kind` and re-export the four typed constants from `policy` at compile time (Step 5), deleting the second spelling rather than pinning it by test; `Classify` logic and public API unchanged.
+- `internal/loops/failureclass/failureclass.go` — add `Normalize(kind Kind) Kind` (the authority for the unknown-kind fallback), backed by a package-level `passThroughKinds []Kind` inventory (today the four known kinds) that `Normalize` consults for membership, plus an exported `PassThroughKinds() []Kind` returning a copy of that inventory so the per-runner downstream-predicate tests and the `Normalize` unit test (Validation step 6) iterate over the single pass-through set rather than a hard-coded four-kind table; add an `ExpectedBehavior` struct and `ExpectedBehaviorFor(kind Kind, runner Runner, state RunnerState) ExpectedBehavior` oracle over the same inventory recording each pass-through kind's intended retry-eligibility and resume policy parameterized by the runner and decision-relevant state (attempt bound and current resume policy), so the per-runner downstream-predicate cases assert against the shared expected semantics — covering the bounded-vs-infinite retry divergence for `NonRetryable` and the reviewer-vs-other-runner resume-policy divergence for `RetryableAfterResume` — rather than only "did not fall through" (Validation step 6); add the `internal/loops/policy` import and alias `type Kind = policy.Kind` and re-export the four typed constants from `policy` at compile time (Step 5), deleting the second spelling rather than pinning it by test; `Classify` logic and public API unchanged.
 - `internal/loops/policy/policy.go` — add the two missing untyped `FailureKind*` string constants so the leaf owns all four string values; add `type Kind string` and the four typed `Kind` constants derived from the untyped ones (Step 5); no predicate changes (the untyped constants stay for the `string`-parameter functions).
 - `internal/loops/policy.go` (umbrella) — re-export the two new untyped `FailureKind*` constants, the `Kind` type alias, and the four typed constants, keeping the "re-exports every name here" contract (Step 5).
 - `internal/validation/validation.go` — delete the three `FailureKind*`
@@ -1258,12 +1426,15 @@ Infra signals remain for drift detection, not authority.
   `loopError{... kind: failure.kind}` sites that read `validationFailure.kind`
   (`runner.go:1943,1958,2007,2038`) keep their direct assignment unchanged —
   `validationFailure.kind` is bounded to the four known kinds by its producer,
-  and Step 2's boundary normalization covers it without a per-call-site wrap.
+  and Step 2's classifier normalization covers it (the constructed `loopError`
+  flows through `classifyFailureWithBoundary` in the step loop) without a
+  per-call-site wrap.
 - `internal/fixer/runner.go` (additional edit beyond the type rename) — the
   blocked-outcome `loopError{... kind: blockedKind}` site (`runner.go:3327`)
   keeps its direct assignment unchanged — `blockedKind` originates from the
   allowlisting `fixerRepairTaskOutcome` (bounded to the four known kinds), and
-  Step 2's boundary normalization covers it without a per-call-site wrap.
+  Step 2's classifier normalization covers it (the constructed `loopError` flows
+  through `classifyFailureWithBoundary`) without a per-call-site wrap.
 - `internal/fixer/failurepolicy/policy.go` — `ClassifyValidation` drops the
   `failureclass.Kind(policy.FailureKind)` cast and assigns
   `Kind: policy.FailureKind` directly, now that the field is `policy.Kind`
@@ -1325,10 +1496,9 @@ in each of the four runner packages, the per-runner downstream-predicate
 contract cases over every `Normalize` pass-through kind (derived from
 `failureclass.PassThroughKinds()`, covering the retry,
 hold, notification, status, and persistence predicates, not only
-`classifyFailure*`) and the per-runner boundary-normalization contract test
-that injects an unknown kind through every independent failure-handling entry
-point in each runner and asserts it reaches that path's predicates as
-`NonRetryable` (Validation step 6).
+`classifyFailure*`) and the per-runner classifier-normalization contract test
+that passes an unknown kind through each runner's `classifyFailure*` function
+and asserts the returned kind is `NonRetryable` (Validation step 6).
 
 **Test-growth classification (per AGENTS.md "Test-file growth is a design
 smell"):** this growth is *covering*, not *propping*. The production refactor
@@ -1344,7 +1514,7 @@ behavior that already shipped with no coverage: the existing
 `manual_intervention` and the entire `internal/reviewer` role were never
 asserted — these are first assertions on already-shipped logic, the "covering"
 tell. Second, the per-kind downstream-predicate matrix and the
-boundary-normalization contract test cover invariants that *replace* the deleted
+classifier-normalization contract test cover invariants that *replace* the deleted
 conversion functions rather than prop up a new state machine: each
 `xxxFailureKind` previously mapped every unrecognized kind to `NonRetryable` and
 bridged the per-role type to the shared one; with both the type and the bridge
@@ -1447,7 +1617,7 @@ records are identical before and after. No migration, no schema touch.
      are the structured-agent outcome and allowlisting boundaries whose declared
      return type changes from `QueueFailureKind` to `failureclass.Kind`; their
      callers feed the returned kind into `loopError.kind` (the `blockedKind` flow
-     Step 2's boundary normalization covers), so they are part of the caller
+     Step 2's classifier normalization covers), so they are part of the caller
      audit, not just internal plumbing. (The four `xxxFailureKind` conversion
      functions also return `QueueFailureKind`, but they are deleted in Step 2,
      not retyped.)
@@ -1571,6 +1741,41 @@ Per `AGENTS.md`, the root commands are the source of truth:
    predicate cases pin the runners: the inventory is the single pass-through
    set, and both the test matrix and the schema-contract test derive from it.
 
+   The opt-in is also not complete until the persisted-string predicate
+   consumers that bound runtime behavior over `queue_items.last_error_kind`
+   recognize the new kind (Step 2 opt-in step 4): `isBackingOffQueue`
+   (`internal/api/handler.go`) recognizes only the two existing retry kinds for
+   backoff display, and `longTermRetryPredicateLiteral` /
+   `longTermRetryPredicateParam` (`internal/storage/repositories.go`) embed only
+   the three existing queue-eligible kinds in a SQL ordering predicate, so a
+   fifth kind that is pass-through, schema-accepted, and handled by every runner
+   predicate is still displayed incorrectly during backoff and escapes
+   long-term-retry ordering if these bare-string predicates stay on the old
+   vocabulary — and the runner and schema contracts above stay green while it
+   happens. The implementation therefore adds a persisted-string predicate
+   contract test (in `internal/api` for `isBackingOffQueue` and in
+   `internal/storage` for `longTermRetryPredicateLiteral` /
+   `longTermRetryPredicateParam`) that iterates
+   `failureclass.PassThroughKinds()` and asserts each kind that is retry-eligible
+   under the infinite attempt bound (per the expected-behavior oracle below — the
+   kinds that earn backoff display; `NonRetryable` is retry-eligible only under a
+   bounded cap, not under the infinite bound, so it is not a backoff kind and is
+   not asserted here) is recognized by `isBackingOffQueue` and
+   each queue-eligible kind (every pass-through kind except `ManualIntervention`)
+   appears in `longTermRetryPredicateLiteral` / `longTermRetryPredicateParam`,
+   so a kind added to `passThroughKinds` that these predicates do not recognize
+   fails the contract in the same change rather than silently mis-displaying or
+   mis-scheduling at runtime. These consumers stay bare-string in production
+   (they are not re-derived from `policy` in this refactor); the contract test
+   pins only their *membership* against the inventory, not their spelling, so a
+   rename of an existing kind value still leaves them on the old literal and
+   remains out of scope (Trade-off "What does it still not catch"). The
+   retry-eligible-under-infinite and queue-eligible subsets are read from the
+   expected-behavior oracle (the oracle's `RetryEligible` for the infinite-bound
+   state supplies the backoff subset), not re-hard-coded, so the contract test
+   and the oracle consult one authority for which kinds each persisted-string
+   predicate must recognize.
+
    The four-kind classification tests above exercise `classifyFailure*`, which
    produces the kind — they do not exercise the retry, hold, notification,
    status, and persistence predicates that *consume* it. A fifth kind can
@@ -1610,71 +1815,120 @@ Per `AGENTS.md`, the root commands are the source of truth:
    branch from a coincidental default. The implementation therefore moves the
    *expected* semantics into a shared authority the tests consume rather than
    hard-coding them per runner: `failureclass` gains an
-   `ExpectedBehaviorFor(kind Kind) ExpectedBehavior` oracle (a small struct
-   holding the intended retry-eligibility and resume policy for a pass-through
-   kind) backed by the same `passThroughKinds` inventory, and each per-runner
+   `ExpectedBehaviorFor(kind Kind, runner Runner, state RunnerState) ExpectedBehavior`
+   oracle (a small struct holding the intended retry-eligibility and resume
+   policy for a pass-through kind under a given runner and decision-relevant
+   state) backed by the same `passThroughKinds` inventory, and each per-runner
    downstream-predicate case asserts the runner's retry predicate returns
-   `ExpectedBehaviorFor(kind).RetryEligible` and the runner's resume-policy
-   derivation returns `ExpectedBehaviorFor(kind).ResumePolicy` — i.e. the test
+   `ExpectedBehaviorFor(kind, runner, state).RetryEligible` and the runner's
+   resume-policy derivation returns
+   `ExpectedBehaviorFor(kind, runner, state).ResumePolicy` — i.e. the test
    compares the predicate's output to the shared expected value, not merely to
    "not the default." A runner whose predicate falls through to a value that
    differs from the oracle fails; a runner whose predicate falls through to a
    value that *matches* the oracle still passes, but the oracle now records that
    the match is intended, so a later change to that default which diverges from
-   the intended semantics is caught. Adding a kind is therefore: add it to
-   `passThroughKinds`, add its `ExpectedBehaviorFor` row to the oracle, update
-   each runner's predicate to satisfy the oracle, and extend the schema — the
-   per-runner tests auto-iterate over the inventory and assert against the
-   oracle, so no per-runner test edit is needed for the new kind (the inventory
-   and the oracle are the two coordinated `failureclass` edits, both in one
-   package). The residual the oracle does not close: where a kind's intended
-   semantics coincide with a predicate's default fallthrough, the test still
-   cannot distinguish an explicit branch from a coincidental default at that
-   instant — but the oracle pins the intent, so the coincidence is no longer
-   silent if the default later moves. Per the repo's "name the authority before
-   enforcing it" guideline, the authority for "what this kind should do" is the
-   shared `ExpectedBehaviorFor` oracle, not each runner's hard-coded test
-   expectation and not the runner predicate's own output.
+   the intended semantics is caught.
+
+   The oracle is parameterized by runner and state — not just by kind — because
+   neither expected value is a pure function of the kind alone. The retry
+   predicate's output for `NonRetryable` depends on the attempt bound: every
+   runner's `shouldRetryQueueFailure` applies the same two-tier rule from #508,
+   under which `NonRetryable` is retried while attempts remain under a *bounded*
+   `MaxAttempts` (`maxAttempts > 0 && nextAttempts < maxAttempts`) but is the
+   sole brake and is *not* retried under an *infinite* bound
+   (`maxAttempts < 0 → kind != NonRetryable`). An oracle keyed only on `kind`
+   would have to pick one `RetryEligible` value for `NonRetryable` and would
+   mis-label the other branch, so `RunnerState` carries the attempt bound
+   (`Infinite` vs a bounded `MaxAttempts`) and the next attempt count, and the
+   oracle returns the retry-eligibility that bound implies. The resume-policy
+   output additionally depends on the runner and the current resume policy: the
+   reviewer derives its step-loop resume policy with
+   `workflow.NextResumePolicyOnFailure`, which for `RetryableAfterResume` with a
+   `current` policy of `ReplayStep` returns `AdvanceFromCheckpoint` (because
+   `ReplayStep` is neither `RestartFromDiscover` nor `RerunReview`), while the
+   fixer, worker, and planner derive theirs with `loops.NormalizeResumePolicy`,
+   which preserves a non-empty `current` policy unchanged and so returns
+   `ReplayStep` for the same inputs. An oracle keyed only on `kind` cannot
+   supply a single `ResumePolicy` that matches both derivations, so `Runner`
+   identifies which derivation the runner uses and `RunnerState` carries the
+   current resume policy, and the oracle returns the resume policy that
+   (runner, kind, current) combination produces. The oracle therefore encodes
+   the intended semantics for every (kind, runner, state) tuple the tests
+   exercise — the two divergences above are the ones the current code exhibits,
+   and the oracle records them explicitly rather than testing only the context
+   where the runners happen to agree.
+
+   Adding a kind is therefore: add it to `passThroughKinds`, add its
+   `ExpectedBehaviorFor` rows to the oracle (one per (runner, state) tuple the
+   tests exercise), update each runner's predicate to satisfy the oracle, and
+   extend the schema — the per-runner tests auto-iterate over the inventory and
+   assert against the oracle, so no per-runner test edit is needed for the new
+   kind (the inventory and the oracle are the two coordinated `failureclass`
+   edits, both in one package). The residual the oracle does not close: where a
+   kind's intended semantics coincide with a predicate's default fallthrough,
+   the test still cannot distinguish an explicit branch from a coincidental
+   default at that instant — but the oracle pins the intent, so the coincidence
+   is no longer silent if the default later moves. Per the repo's "name the
+   authority before enforcing it" guideline, the authority for "what this kind
+   should do" is the shared `ExpectedBehaviorFor` oracle, not each runner's
+   hard-coded test expectation and not the runner predicate's own output.
 
    The classification tests and alias-identity tests below assert each runner's
    persisted kind and retry decision for each *known* kind, and every known kind
    is a fixed point of `Normalize`, so they still pass if a runner's
-   failure-handling entry point omits its `Normalize` call and an unknown
+   `classifyFailure*` function omits its `Normalize` call and an unknown
    `loopError.kind` reaches retry or persistence unnormalized. The
    implementation therefore also adds, in each of the four runner packages, a
-   per-runner boundary-normalization contract test that injects an unknown
-   `failureclass.Kind` (a value outside the four known constants) through
-   **every independent failure-handling entry point** in that runner —
-   constructing a `loopError` whose `kind` is the unknown value and driving
-   each entry point — and asserts the kind seen by the retry predicate, the
-   breaker's manual-kind check, the resume-policy derivation, and
-   queue/checkpoint persistence is `NonRetryable`, not the injected unknown
-   value. These are not single boundaries in the current code, so driving only
-   one entry point per runner can stay green when another path omits its
-   `Normalize` call and persists an unknown kind. The contract test therefore
-   enumerates and exercises each runner's independent entry points: the fixer
-   independently handles failure in `recoverClaimedItem` (recovery before run
-   creation), the deferred pre-start cleanup path (the `defer` in the run-setup
-   that classifies a `retErr` when a pre-start step fails after the run is
-   created), `validateFixerResumeCheckpoint` failure (resume-checkpoint
-   validation), and ordinary step failure (`classifyFailureWithBoundary` in the
-   step loop); the worker independently handles `recoverClaimedItem` (recovery),
-   `validateWorkerResumeCheckpoint` failure (resume-validation), and ordinary
-   step failure (`classifyFailureWithBoundary` in the step loop); the reviewer
-   independently handles `finalizeClaimSetupFailure` (claim-setup recovery) and
-   ordinary step failure (`classifyFailureForProjectAndBoundary` in the step
-   loop); the planner independently handles `recoverClaimedItem` (recovery) and
-   ordinary step failure (`classifyFailureWithBoundary` in the step loop). For
-   each enumerated entry point the test injects the unknown kind through that
-   path's `loopError` construction and asserts the normalized `NonRetryable`
-   reaches that path's retry, breaker, resume-policy, and persistence reads, so
-   a boundary that drops its `Normalize` call is caught in the runner and entry
-   point that contains it, closing the gap the deleted structural gate left
-   without re-adding a producer-side analyzer. Aggregate "each kind appears in at least
+   per-runner classifier-normalization contract test that asserts the runner's
+   `classifyFailure*` function normalizes an unknown kind to `NonRetryable`. The
+   test constructs a `loopError` whose `kind` is an unknown `failureclass.Kind`
+   (a value outside the four known constants) and passes it through the runner's
+   `classifyFailure*` function (`classifyFailureWithBoundary` for fixer, worker,
+   and planner; `classifyFailureForProjectAndBoundary` for reviewer), then
+   asserts the returned `loopError`'s kind is `NonRetryable`, not the injected
+   unknown value. This covers every failure-handling entry point in the runner
+   because they all flow through that `classifyFailure*` function: the fixer's
+   `recoverClaimedItem` (recovery), the deferred pre-start cleanup path (the
+   `defer` that classifies a `retErr`), `validateFixerResumeCheckpoint` failure
+   (resume-validation), and ordinary step failure all begin with
+   `r.classifyFailure*`; the worker's `recoverClaimedItem`,
+   `validateWorkerResumeCheckpoint` failure, and ordinary step failure all begin
+   with `r.classifyFailureWithBoundary`; the reviewer's
+   `finalizeClaimSetupFailure` and ordinary step failure all begin with
+   `r.classifyFailureForProjectAndBoundary`; the planner's `recoverClaimedItem`
+   and ordinary step failure all begin with `r.classifyFailureWithBoundary`. The
+   test also passes a non-`loopError` error whose `Classify` result is an
+   unknown kind through `classifyFailure*` and asserts the same normalization on
+   the `Classify` branch, so both classifier branches (the `errors.As` return and
+   the `Classify` fallback) are covered.
+
+   The resume-validation entry points cannot be injection-tested by driving the
+   validator directly: `validateFixerResumeCheckpoint` and
+   `validateCompletedRepairCheckpoint` synthesize only fixed known-kind
+   `loopError` values (`FailureManualIntervention`), and
+   `validateWorkerResumeCheckpoint` delegates to
+   `validateCompletedExecutionCheckpoint`, which hard-codes
+   `FailureRetryableTransient`, so a test cannot construct a `loopError` with an
+   unknown kind and feed it through either validator — the validator produces the
+   `loopError` itself, and there is no seam to inject a different kind. The
+   earlier draft's per-boundary contract promised to inject an unknown kind
+   through each entry point by constructing the `loopError` and driving the entry
+   point, which is not achievable for the resume-validation entry points without
+   a production test hook in the validators. Centralizing normalization in the
+   classifier (Step 2) removes that need: the validators' returned errors flow
+   through `classifyFailure*` at the resume-validation call site, so the
+   classifier-normalization contract test covers the resume-validation path by
+   passing an unknown-kind `loopError` through `classifyFailure*` directly — the
+   same path the validator's returned error takes — without injecting through the
+   validator. No injectable validator seam is added to production; the
+   normalization invariant is tested at the classifier, the single point all
+   entry points share, closing the gap the deleted structural gate left without
+   re-adding a producer-side analyzer or a test-only validator hook. Aggregate "each kind appears in at least
    one role" coverage is not sufficient on its own: the four per-runner
    re-export blocks (Step 1) are independent, so wiring one role's
    `FailureManualIntervention` to `failureclass.NonRetryable` still compiles,
-   passes the boundary normalization (it is a known-kind constant), and
+   passes the classifier normalization (it is a known-kind constant), and
    satisfies the aggregate coverage when another role tests the manual kind,
    while that role's failures silently change behavior. The implementation
    therefore adds a per-runner alias-identity test in each of the four runner
@@ -1713,15 +1967,16 @@ Per `AGENTS.md`, the root commands are the source of truth:
      exit 1
    fi
    ```
-8. **No structural call-site gate (deleted in favor of boundary normalization).**
+8. **No structural call-site gate (deleted in favor of classifier normalization).**
    The earlier draft specified a type-aware `go/parser`+`go/ast`+`go/types`
    call-site gate that parsed and type-checked each runner package, traced every
    `loopError.kind` assignment to its intra-procedural origin, and failed when a
    dynamic source reached `kind` without being wrapped in `failureclass.Normalize`.
-   Step 2 replaces that gate with a `failureclass.Normalize` call at each
-   runner's independent failure-handling entry point (recovery, resume-validation,
-   deferred pre-start cleanup where present, and ordinary step failure), before
-   any retry, breaker, or persistence read. Boundary normalization makes the
+   Step 2 replaces that gate with a `failureclass.Normalize` call inside each
+   runner's `classifyFailure*` function — the single choke point every
+   failure-handling entry point (recovery, resume-validation, deferred pre-start
+   cleanup where present, and ordinary step failure) flows through — before any
+   retry, breaker, or persistence read. Classifier normalization makes the
    symptom the gate existed to
    prevent — an unnormalized kind reaching a decision — impossible regardless of
    how the kind was produced, so the gate is redundant and is not implemented; the
@@ -1733,9 +1988,10 @@ Per `AGENTS.md`, the root commands are the source of truth:
    `github.com/mattn/go-sqlite3` (reached through `internal/storage`), which
    `build.Context.Import` separates from `GoFiles` when cgo is enabled — is moot.
    No `go/types`, `go/ast`, or `go/build`-based structural test is added; the
-   `Normalize` fallback invariant is enforced at the boundary (Step 2) and covered
-   by the `Normalize` unit test, the per-runner boundary-normalization contract
-   test (which injects an unknown kind through each boundary), and the four-kind
+   `Normalize` fallback invariant is enforced at the classifier (Step 2) and covered
+   by the `Normalize` unit test, the per-runner classifier-normalization contract
+   test (which passes an unknown kind through each runner's `classifyFailure*`
+   function), and the four-kind
    per-runner classification tests (step 6), not by modeling the producers.
 9. **Fixer-prompt builder coverage (Step 6).**
    `internal/agent/prompt_test.go` is rewritten to import
@@ -1828,7 +2084,7 @@ carrier, fixer call-site wiring, or cross-component rename-drift
 synchronization test is added; the advertised-subset ⊆ parser-allowlist
 membership contract is retained as a fixer-package test, see step 9), the
 deleted-symbol absence check (step 7) passes, each runner normalizes
-`failure.kind` once at its queue-failure consumption boundary via
+`failure.kind` inside its `classifyFailure*` function via
 `failureclass.Normalize` before any retry, breaker, or persistence read (Step 2)
 — so every `loopError.kind` value that reaches a retry decision, the fixer
 breaker's manual-kind check, a resume-policy derivation, or queue/checkpoint
@@ -1836,10 +2092,11 @@ persistence is normalized, regardless of how the kind was produced, and the
 unknown-kind → `non_retryable` fallback holds for every producer including
 sources a structural analyzer cannot model; no structural call-site gate is
 added (step 8 records why the earlier draft's `go/types` gate is deleted in
-favor of boundary normalization, and no `go/types`/`go/ast`/`go/build`-based
+favor of classifier normalization, and no `go/types`/`go/ast`/`go/build`-based
 test or per-target source importer is implemented), the known-safe carrier
 reads (`validationFailure.kind`, `blockedKind` from `fixerRepairTaskOutcome`)
-keep their direct assignments because the boundary normalizes them without a
+keep their direct assignments because the constructed `loopError` flows through
+`classifyFailure*`, which normalizes the kind without a
 per-call-site wrap, and `Normalize` defaults an unrecognized kind to
 `NonRetryable` so a new `policy.Kind` constant is contained to the safe default
 until consumers explicitly opt in (no enumeration assertion forces
@@ -1851,12 +2108,13 @@ four-kind regression coverage above exists — including the per-runner
 downstream-predicate contract cases over every `Normalize` pass-through kind
 (derived from `failureclass.PassThroughKinds()`;
 retry, hold, notification, status, and persistence predicates, not only
-`classifyFailure*`) and the per-runner boundary-normalization contract test
-that injects an unknown kind through **every independent failure-handling
-entry point** in each runner (fixer recovery, deferred pre-start cleanup,
+`classifyFailure*`) and the per-runner classifier-normalization contract test
+that passes an unknown kind through each runner's `classifyFailure*` function
+(the single choke point every failure-handling entry point in each runner flows
+through: fixer recovery, deferred pre-start cleanup,
 resume-validation, and step failure; worker recovery, resume-validation, and
 step failure; reviewer claim-setup recovery and step failure; planner recovery
-and step failure) and asserts it reaches that path's predicates as
+and step failure) and asserts the returned kind is
 `NonRetryable` — the
 fixer-prompt builder coverage test (step 9) exists — exercising
 `AppendFixerCompletionInstruction` for advertised-subset coverage of the
