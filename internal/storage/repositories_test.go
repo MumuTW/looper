@@ -1373,6 +1373,47 @@ func TestEventsListByEntityAndEventTypesFiltersByType(t *testing.T) {
 	}
 }
 
+func TestEventsListByEventTypeScopesProjectAndLimit(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	repos := NewRepositories(coordinator.DB())
+
+	projectA := "project_a"
+	projectB := "project_b"
+	entityType := "pull_request"
+	for _, projectID := range []string{projectA, projectB} {
+		if err := repos.Projects.Upsert(ctx, ProjectRecord{ID: projectID, Name: projectID, RepoPath: "/tmp/" + projectID, CreatedAt: "2026-04-11T12:00:00.000Z", UpdatedAt: "2026-04-11T12:00:00.000Z"}); err != nil {
+			t.Fatalf("Projects.Upsert(%s) error = %v", projectID, err)
+		}
+	}
+	for _, event := range []EventLogRecord{
+		{ID: "agreement_a_old", EventType: "pull_request.merge_gate.advice_agreement_recorded", ProjectID: &projectA, EntityType: &entityType, PayloadJSON: `{}`, CreatedAt: "2026-04-11T12:00:00.000Z"},
+		{ID: "agreement_a_new", EventType: "pull_request.merge_gate.advice_agreement_recorded", ProjectID: &projectA, EntityType: &entityType, PayloadJSON: `{}`, CreatedAt: "2026-04-11T12:01:00.000Z"},
+		{ID: "agreement_b", EventType: "pull_request.merge_gate.advice_agreement_recorded", ProjectID: &projectB, EntityType: &entityType, PayloadJSON: `{}`, CreatedAt: "2026-04-11T12:02:00.000Z"},
+		{ID: "other_a", EventType: "pull_request.merge_gate.evaluated", ProjectID: &projectA, EntityType: &entityType, PayloadJSON: `{}`, CreatedAt: "2026-04-11T12:03:00.000Z"},
+	} {
+		if err := repos.Events.Append(ctx, event); err != nil {
+			t.Fatalf("Events.Append(%s) error = %v", event.ID, err)
+		}
+	}
+
+	got, err := repos.Events.ListByEventType(ctx, "pull_request.merge_gate.advice_agreement_recorded", projectA, 1)
+	if err != nil {
+		t.Fatalf("ListByEventType() error = %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "agreement_a_new" {
+		t.Fatalf("ListByEventType() = %#v, want newest project-a agreement only", got)
+	}
+
+	all, err := repos.Events.ListByEventType(ctx, "pull_request.merge_gate.advice_agreement_recorded", "", 10)
+	if err != nil {
+		t.Fatalf("ListByEventType(global) error = %v", err)
+	}
+	if len(all) != 3 || all[0].ID != "agreement_b" || all[1].ID != "agreement_a_new" || all[2].ID != "agreement_a_old" {
+		t.Fatalf("ListByEventType(global) = %#v, want newest-first agreements", all)
+	}
+}
 func TestRunsListByStatusOrdersByStartedAtThenIDDesc(t *testing.T) {
 	t.Parallel()
 

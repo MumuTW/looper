@@ -23,6 +23,7 @@ import (
 	"github.com/MumuTW/looper/internal/config"
 	"github.com/MumuTW/looper/internal/daemonbinary"
 	"github.com/MumuTW/looper/internal/domain"
+	"github.com/MumuTW/looper/internal/gatekeeper"
 	githubinfra "github.com/MumuTW/looper/internal/infra/github"
 	"github.com/MumuTW/looper/internal/labels"
 	"github.com/MumuTW/looper/internal/projects"
@@ -2215,6 +2216,7 @@ func TestHandlerEventAndPullRequestRoutesMatchFrozenSuccessArtifacts(t *testing.
 	}{
 		{routeID: "events.list", method: http.MethodGet, path: "/api/v1/events?limit=1"},
 		{routeID: "events.entity", method: http.MethodGet, path: "/api/v1/events/loop/loop_1"},
+		{routeID: "gatekeeper.agreements", method: http.MethodGet, path: "/api/v1/gatekeeper/agreements?limit=1"},
 		{routeID: "pullRequests.list", method: http.MethodGet, path: "/api/v1/pull-requests"},
 		{routeID: "pullRequests.detail", method: http.MethodGet, path: "/api/v1/pull-requests/acme%2Flooper/42"},
 		{routeID: "pullRequests.status", method: http.MethodGet, path: "/api/v1/pull-requests/acme%2Flooper/42/status"},
@@ -8307,6 +8309,15 @@ func seedEventAndPullRequestRouteData(t *testing.T, rt *looperdruntime.Runtime) 
 		CreatedAt:        nowISO,
 	}); err != nil {
 		t.Fatalf("Events.Append(event_1) error = %v", err)
+	}
+
+	if err := rt.Services().Repositories.Events.Append(context.Background(), storage.EventLogRecord{
+		ID: "agreement_1", EventType: gatekeeper.AdviceAgreementEventType,
+		ProjectID: stringPtr("project_1"), EntityType: stringPtr("pull_request"), EntityID: stringPtr("acme/looper#42"),
+		CausationID: stringPtr("event_gate_1"), PayloadJSON: `{"version":1,"verdictEventId":"event_gate_1","projectId":"project_1","repo":"acme/looper","prNumber":42,"verdictEligible":true,"verdictHeadSha":"abc123","outcome":"merged_as_is","agreement":true,"terminalState":"MERGED","terminalHeadSha":"abc123","terminalAt":"2026-04-11T12:00:00.000Z","recordedAt":"2026-04-11T11:59:00.000Z"}`,
+		CreatedAt: "2026-04-11T11:59:00.000Z",
+	}); err != nil {
+		t.Fatalf("Events.Append(agreement_1) error = %v", err)
 	}
 
 	if err := rt.Services().Repositories.PullRequestSnapshots.Upsert(context.Background(), storage.PullRequestSnapshotRecord{

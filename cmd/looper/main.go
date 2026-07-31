@@ -847,6 +847,47 @@ func runProjectDiscover(ctx context.Context, global []string, identifier string,
 	return printProjectDiscoveryResult(result, stdout)
 }
 
+// runGatekeeper owns read-only Gatekeeper operator views. It intentionally
+// routes through looperd rather than opening SQLite: the daemon is authoritative
+// for the immutable agreement event stream and remains the only storage writer.
+func runGatekeeper(ctx context.Context, global []string, operands []string, stdout io.Writer) error {
+	if len(operands) == 0 || operands[0] != "agreements" {
+		return badUsage("gatekeeper requires the agreements subcommand")
+	}
+	if len(operands) > 2 || (len(operands) == 2 && strings.TrimSpace(operands[1]) == "") {
+		return badUsage("gatekeeper agreements accepts at most one project id")
+	}
+
+	cfg, err := loadConfig(global)
+	if err != nil {
+		return err
+	}
+	path := "/api/v1/gatekeeper/agreements"
+	if len(operands) == 2 {
+		path += "?projectId=" + url.QueryEscape(strings.TrimSpace(operands[1]))
+	}
+	agreements, err := requestJSON[gatekeeperAgreementsResponse](ctx, cfg, http.MethodGet, path, nil)
+	if err != nil {
+		return err
+	}
+	if len(agreements.Items) == 0 {
+		_, _ = fmt.Fprintln(stdout, "no advise agreements recorded")
+		return nil
+	}
+	for _, agreement := range agreements.Items {
+		outcome := strings.TrimSpace(agreement.Outcome)
+		if outcome == "" {
+			outcome = "unknown"
+		}
+		agreementLabel := "disagreement"
+		if agreement.Agreement {
+			agreementLabel = "agreement"
+		}
+		_, _ = fmt.Fprintf(stdout, "%s#%d  %s  %s  %s  verdict=%s\n", agreement.Repo, agreement.PRNumber, outcome, agreementLabel, agreement.RecordedAt, agreement.VerdictEventID)
+	}
+	return nil
+}
+
 func printProjectDiscoveryResult(result createProjectResponse, stdout io.Writer) error {
 	if result.Discovery == nil {
 		_, _ = fmt.Fprintf(stdout, "discovery for project %s: unknown (daemon did not report discovery status)\n", result.ID)
@@ -1230,6 +1271,19 @@ type discoveryResponse struct {
 	Warnings               []string `json:"warnings"`
 }
 
+type gatekeeperAgreementsResponse struct {
+	Items []gatekeeperAgreement `json:"items"`
+}
+
+type gatekeeperAgreement struct {
+	Repo           string `json:"repo"`
+	PRNumber       int64  `json:"prNumber"`
+	VerdictEventID string `json:"verdictEventId"`
+	Outcome        string `json:"outcome"`
+	Agreement      bool   `json:"agreement"`
+	RecordedAt     string `json:"recordedAt"`
+}
+
 // daemonBaseURL is where this CLI expects the daemon to answer.
 //
 // server.baseUrl wins when set: it is the operator's statement of the address
@@ -1446,6 +1500,8 @@ Usage:
   looper init                  Write a starter config file (never overwrites)
   looper status                Report config, daemon reachability, and projects
   looper dashboard             Print a dashboard URL authenticated for this session
+  looper gatekeeper agreements [project-id]
+                               Inspect immutable advise agreement outcomes
   looper project add <path>    Register a git repository root with the daemon
   looper project list          List registered projects
   looper project discover <id> Retry post-commit worktree/PR discovery for a project
