@@ -310,13 +310,13 @@ func TestRunOpenPRStepDoesNotInheritIssueHoldAfterPullRequestRetarget(t *testing
 	}
 
 	checkpoint, err := runner.runOpenPRStep(context.Background(), stepInput{
-		Project:   storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()},
+		Project:   fixture.project(t),
 		Loop:      loop,
 		QueueItem: queue,
 		Run:       storage.RunRecord{ID: "run_worker_pr_open_hold"},
 		Checkpoint: workerCheckpoint{
 			Work:        &workerInput{Repo: repo, BaseBranch: "main", ExecutionMode: "create-pr", IssueNumber: issueNumber, PRNumber: prNumber, AutoDiscovered: true},
-			Worktree:    &checkpointWorktree{Path: t.TempDir(), Branch: "worker/46", BaseBranch: "main"},
+			Worktree:    &checkpointWorktree{Path: fixture.usableWorktree(t, "retargeted-pr"), Branch: "worker/46", BaseBranch: "main"},
 			Validation:  &ValidationResult{Passed: true},
 			PullRequest: &checkpointPullPR{Number: prNumber, URL: "https://example/pr/101"},
 			Lifecycle:   &lifecycle.State{Policy: lifecycle.PolicyAgentManagedWithFallback, PolicyVersion: lifecycle.PolicyVersion, Branch: "worker/46", BaseBranch: "main", Pushed: true},
@@ -1331,18 +1331,28 @@ func TestBuildIssueClaimCommentBodySanitizesTranscriptSummary(t *testing.T) {
 	}
 }
 
-func TestBuildIssueClaimCommentBodySanitizesPausedSummary(t *testing.T) {
+func TestBuildIssueClaimCommentBodyRedactsStaleWorktreePausedSummary(t *testing.T) {
 	t.Parallel()
 
 	summary := `Worker worktree path /Users/alice/dev/looper/worktrees/wt for branch looper/feature is stale (path does not exist; root /Users/alice/dev/looper/worktrees).`
 	body := buildIssueClaimCommentBody("loop_1", "run_1", workerInput{Repo: "acme/looper", IssueNumber: 27}, issueClaimStatusPaused, nil, summary)
-	if !strings.Contains(body, "Latest status: See Looper logs for details.") {
-		t.Fatalf("body = %q, want sanitized paused summary", body)
+	if !strings.Contains(body, "Latest status: Worker checkpoint worktree is unavailable or unsafe. Restore the original branch checkout, then resume the worker run.") {
+		t.Fatalf("body = %q, want actionable redacted paused summary", body)
 	}
 	for _, fragment := range []string{"/Users/alice", "worktrees/wt", "looper/feature"} {
 		if strings.Contains(body, fragment) {
 			t.Fatalf("body = %q, want local detail %q removed", body, fragment)
 		}
+	}
+}
+
+func TestBuildIssueClaimCommentBodyPreservesSafePausedSummary(t *testing.T) {
+	t.Parallel()
+
+	summary := "Worker stopped because acme/looper#27 is no longer an open issue"
+	body := buildIssueClaimCommentBody("loop_1", "run_1", workerInput{Repo: "acme/looper", IssueNumber: 27}, issueClaimStatusPaused, nil, summary)
+	if !strings.Contains(body, "Latest status: "+summary) {
+		t.Fatalf("body = %q, want safe paused summary preserved", body)
 	}
 }
 
@@ -1413,7 +1423,7 @@ func TestRunExecuteStepSkipsWhenWorkerHoldAppliedBeforeAgentStart(t *testing.T) 
 		Run:     run,
 		Checkpoint: workerCheckpoint{
 			Work:     &workerInput{Title: "Implement worker loop", Repo: "acme/looper", PRNumber: 42, BaseBranch: "main", ExecutionMode: "push-existing", AutoDiscovered: true},
-			Worktree: &checkpointWorktree{Path: t.TempDir(), Branch: "looper/feature", BaseBranch: "main", HeadSHA: "abc123"},
+			Worktree: &checkpointWorktree{Path: fixture.usableWorktree(t, "hold-before-agent"), Branch: "looper/feature", BaseBranch: "main", HeadSHA: "abc123"},
 			Plan:     &checkpointPlan{Summary: "Implement worker loop", Items: []string{"Do it"}},
 		},
 	})
@@ -1449,7 +1459,7 @@ func TestRunExecuteStepRechecksWorkerHoldAfterAgentCompletion(t *testing.T) {
 		Project: *project, Loop: *loop, Run: run,
 		Checkpoint: workerCheckpoint{
 			Work:     &workerInput{Title: "Implement worker loop", Repo: "acme/looper", PRNumber: 42, BaseBranch: "main", ExecutionMode: "push-existing", AutoDiscovered: true},
-			Worktree: &checkpointWorktree{Path: t.TempDir(), Branch: "looper/feature", BaseBranch: "main", HeadSHA: "abc123"},
+			Worktree: &checkpointWorktree{Path: fixture.usableWorktree(t, "hold-after-agent"), Branch: "looper/feature", BaseBranch: "main", HeadSHA: "abc123"},
 			Plan:     &checkpointPlan{Summary: "Implement worker loop", Items: []string{"Do it"}},
 		},
 	})
@@ -4087,7 +4097,7 @@ func TestRunOpenPRStepPushesWhenFallbackCommitCreatedAndLifecycleAlreadyPushed(t
 
 	checkpoint := workerCheckpoint{
 		Work:       &workerInput{Title: "Existing PR fallback regression", ExecutionMode: "create-pr", Repo: "acme/looper", BaseBranch: "main", PRNumber: prNumber, Branch: "feature/pr-555", IssueNumber: 0},
-		Worktree:   &checkpointWorktree{Path: filepath.Join(t.TempDir(), "wt"), Branch: "feature/pr-555", BaseBranch: "main", HeadSHA: "abc123", ID: "worktree_555"},
+		Worktree:   &checkpointWorktree{Path: fixture.usableWorktree(t, "pr-555-fallback"), Branch: "feature/pr-555", BaseBranch: "main", HeadSHA: "abc123", ID: "worktree_555"},
 		Validation: &ValidationResult{Passed: true, Summary: "ok"},
 		Lifecycle: &lifecycle.State{
 			Policy:        lifecycle.PolicyAgentManagedWithFallback,
@@ -4495,7 +4505,7 @@ func TestRunOpenPRStepStampsLifecycleAgentPRWithoutExistingFooter(t *testing.T) 
 	}
 	checkpoint := workerCheckpoint{
 		Work:       &workerInput{Title: "Existing PR lifecycle", ExecutionMode: "create-pr", Repo: "acme/looper", BaseBranch: "main", PRNumber: prNumber, Branch: "feature/pr-555"},
-		Worktree:   &checkpointWorktree{Path: filepath.Join(t.TempDir(), "wt"), Branch: "feature/pr-555", BaseBranch: "main", HeadSHA: "abc123", ID: "worktree_555"},
+		Worktree:   &checkpointWorktree{Path: fixture.usableWorktree(t, "pr-555-lifecycle"), Branch: "feature/pr-555", BaseBranch: "main", HeadSHA: "abc123", ID: "worktree_555"},
 		Validation: &ValidationResult{Passed: true, Summary: "ok"},
 		Lifecycle: &lifecycle.State{
 			Policy:        lifecycle.PolicyAgentManagedWithFallback,
@@ -4551,7 +4561,7 @@ func TestRunOpenPRStepLeavesPushExistingAgentPRBodyUntouchedWithoutExistingFoote
 	}
 	checkpoint := workerCheckpoint{
 		Work:       &workerInput{Title: "Existing PR agent-created", ExecutionMode: "push-existing", Repo: "acme/looper", BaseBranch: "main", PRNumber: prNumber, Branch: "feature/pr-556"},
-		Worktree:   &checkpointWorktree{Path: filepath.Join(t.TempDir(), "wt"), Branch: "feature/pr-556", BaseBranch: "main", HeadSHA: "abc123", ID: "worktree_556"},
+		Worktree:   &checkpointWorktree{Path: fixture.usableWorktree(t, "pr-556-agent"), Branch: "feature/pr-556", BaseBranch: "main", HeadSHA: "abc123", ID: "worktree_556"},
 		Validation: &ValidationResult{Passed: true, Summary: "ok"},
 		Lifecycle: &lifecycle.State{
 			Policy:        lifecycle.PolicyAgentManagedWithFallback,
@@ -4611,7 +4621,7 @@ func TestRunOpenPRStepUsesPersistedPRWhenLifecycleLookupFailsOnResume(t *testing
 	}
 	checkpoint := workerCheckpoint{
 		Work:       &workerInput{Title: "Existing PR lifecycle error", ExecutionMode: "create-pr", Repo: "acme/looper", BaseBranch: "main", PRNumber: prNumber, Branch: "feature/pr-558"},
-		Worktree:   &checkpointWorktree{Path: filepath.Join(t.TempDir(), "wt"), Branch: "feature/pr-558", BaseBranch: "main", HeadSHA: "abc123", ID: "worktree_558"},
+		Worktree:   &checkpointWorktree{Path: fixture.usableWorktree(t, "pr-558-lookup"), Branch: "feature/pr-558", BaseBranch: "main", HeadSHA: "abc123", ID: "worktree_558"},
 		Validation: &ValidationResult{Passed: true, Summary: "ok"},
 		Lifecycle: &lifecycle.State{
 			Policy:        lifecycle.PolicyAgentManagedWithFallback,
@@ -4670,7 +4680,7 @@ func TestRunOpenPRStepUsesPersistedPRWhenLifecycleAdoptionRejectsOnResume(t *tes
 	}
 	checkpoint := workerCheckpoint{
 		Work:       &workerInput{Title: "Existing PR lifecycle rejection", ExecutionMode: "create-pr", Repo: "acme/looper", BaseBranch: "main", PRNumber: prNumber, Branch: "feature/pr-559"},
-		Worktree:   &checkpointWorktree{Path: filepath.Join(t.TempDir(), "wt"), Branch: "feature/pr-559", BaseBranch: "main", HeadSHA: "abc123", ID: "worktree_559"},
+		Worktree:   &checkpointWorktree{Path: fixture.usableWorktree(t, "pr-559-adoption"), Branch: "feature/pr-559", BaseBranch: "main", HeadSHA: "abc123", ID: "worktree_559"},
 		Validation: &ValidationResult{Passed: true, Summary: "ok"},
 		Lifecycle: &lifecycle.State{
 			Policy:        lifecycle.PolicyAgentManagedWithFallback,
@@ -4713,7 +4723,7 @@ func TestRunOpenPRStepPreservesAdoptedPushExistingPRWithoutExistingFooter(t *tes
 	}
 	checkpoint := workerCheckpoint{
 		Work:       &workerInput{Title: "Existing PR adopted", ExecutionMode: "push-existing", Repo: "acme/looper", BaseBranch: "main", PRNumber: prNumber, Branch: "feature/pr-557"},
-		Worktree:   &checkpointWorktree{Path: filepath.Join(t.TempDir(), "wt"), Branch: "feature/pr-557", BaseBranch: "main", HeadSHA: "abc123", ID: "worktree_557"},
+		Worktree:   &checkpointWorktree{Path: fixture.usableWorktree(t, "pr-557-adopted"), Branch: "feature/pr-557", BaseBranch: "main", HeadSHA: "abc123", ID: "worktree_557"},
 		Validation: &ValidationResult{Passed: true, Summary: "ok"},
 		Lifecycle: &lifecycle.State{
 			Policy:        lifecycle.PolicyAgentManagedWithFallback,
@@ -4795,6 +4805,36 @@ func (f *runnerFixture) nowISO() string {
 }
 
 func (f *runnerFixture) advance(delta time.Duration) { f.current = f.current.Add(delta) }
+
+func (f *runnerFixture) project(t *testing.T) storage.ProjectRecord {
+	t.Helper()
+	project, err := f.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	return *project
+}
+
+func (f *runnerFixture) usableWorktree(t *testing.T, name string) string {
+	t.Helper()
+	root, err := workerWorktreeRoot(f.project(t))
+	if err != nil {
+		t.Fatalf("workerWorktreeRoot() error = %v", err)
+	}
+	return makeUsableTestWorktree(t, root, name)
+}
+
+func makeUsableTestWorktree(t *testing.T, root, name string) string {
+	t.Helper()
+	path := filepath.Join(root, name)
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		t.Fatalf("MkdirAll(fake worktree) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(path, ".git"), []byte("gitdir: fake\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile(fake worktree metadata) error = %v", err)
+	}
+	return path
+}
 
 type fakeGitHubGateway struct {
 	currentLogin            string
@@ -4996,6 +5036,12 @@ func (f *fakeGitGateway) CreateWorktree(_ context.Context, input CreateWorktreeI
 	}
 	if result.BaseBranch == "" {
 		result.BaseBranch = input.BaseBranch
+	}
+	if err := os.MkdirAll(result.WorktreePath, 0o755); err != nil {
+		return CreateWorktreeResult{}, fmt.Errorf("create fake worktree path: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join(result.WorktreePath, ".git"), []byte("gitdir: fake\n"), 0o600); err != nil {
+		return CreateWorktreeResult{}, fmt.Errorf("create fake worktree metadata: %w", err)
 	}
 	f.createResult = result
 	return result, nil

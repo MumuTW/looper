@@ -3311,6 +3311,22 @@ func equivalentWorktreePaths(path string) []string {
 	return []string{canonical}
 }
 
+// WorktreePathsEquivalent reports whether two path spellings identify the
+// same supported worktree location. In particular, macOS exposes /var through
+// /private/var, and worktree discovery may persist either spelling.
+func WorktreePathsEquivalent(a, b string) bool {
+	aPaths := equivalentWorktreePaths(a)
+	bPaths := equivalentWorktreePaths(b)
+	for _, aPath := range aPaths {
+		for _, bPath := range bPaths {
+			if aPath == bPath {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (r *WorktreesRepository) ListByProject(ctx context.Context, projectID string) ([]WorktreeRecord, error) {
 	rows, err := r.q.QueryContext(ctx, `SELECT * FROM worktrees WHERE project_id = ? ORDER BY updated_at DESC`, projectID)
 	if err != nil {

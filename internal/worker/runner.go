@@ -747,6 +747,23 @@ func sanitizePublicIssueClaimSummary(summary string) string {
 	return cleaned
 }
 
+func sanitizePublicPausedIssueClaimSummary(summary string) string {
+	cleaned := strings.TrimSpace(disclosure.StripMarkdownStamp(summary))
+	cleaned = workerANSIEscapePattern.ReplaceAllString(cleaned, "")
+	cleaned = strings.Join(strings.Fields(cleaned), " ")
+	if cleaned == "" {
+		return ""
+	}
+	if strings.HasPrefix(cleaned, "Worker worktree path ") && strings.Contains(cleaned, " is stale (") {
+		return "Worker checkpoint worktree is unavailable or unsafe. Restore the original branch checkout, then resume the worker run."
+	}
+	runes := []rune(cleaned)
+	if len(runes) > maxPublicIssueClaimSummaryLength {
+		cleaned = strings.TrimSpace(string(runes[:maxPublicIssueClaimSummaryLength])) + "…"
+	}
+	return cleaned
+}
+
 func checkpointExecutionFromAgentResult(result AgentResult) *checkpointExecution {
 	return &checkpointExecution{
 		Status: result.Status, Summary: result.Summary, ParseStatus: result.ParseStatus,
@@ -3176,7 +3193,7 @@ func buildIssueClaimCommentBody(loopID, runID string, work workerInput, status s
 		}
 	case issueClaimStatusPaused:
 		lines = append(lines, "Looper paused work on this issue.")
-		if summary = sanitizePublicIssueClaimSummary(summary); summary != "" {
+		if summary = sanitizePublicPausedIssueClaimSummary(summary); summary != "" {
 			lines = append(lines, "", "Latest status: "+summary)
 		}
 	default:

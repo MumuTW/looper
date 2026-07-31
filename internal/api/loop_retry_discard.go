@@ -136,6 +136,23 @@ func (h *Handler) loopWorktreeStatus(ctx context.Context, loop storage.LoopRecor
 	resp.WorktreePath = stringPtrOrNil(path)
 	resp.Branch = stringPtrOrNil(strings.TrimSpace(resolved.Branch))
 	resp.Managed = resolved.Managed
+	if resolved.UnsafeReason != "" {
+		// The read-only preflight must not substitute the mutable row's
+		// checkout, but it also must not prevent a plain retry after an
+		// operator restores the exact checkpoint path. Omit clean/dirty so
+		// clients cannot offer destructive discard for this disagreement.
+		if _, statErr := os.Stat(path); statErr == nil {
+			resp.Present = true
+		} else if !os.IsNotExist(statErr) {
+			return loopWorktreeStatusResponse{}, apiError{
+				code:    pkgapi.ErrorCodeInternalError,
+				status:  http.StatusInternalServerError,
+				message: fmt.Sprintf("Failed to stat worktree at %s: %v", path, statErr),
+			}
+		}
+		resp.Reason = resolved.UnsafeReason
+		return resp, nil
+	}
 	if _, statErr := os.Stat(path); statErr != nil {
 		if os.IsNotExist(statErr) {
 			// Path resolved but not on disk — present stays false so jump refuses cd.
@@ -206,6 +223,13 @@ func (h *Handler) discardLoopWorktreeChanges(ctx context.Context, services loope
 	}
 	if resolved == nil || strings.TrimSpace(resolved.Path) == "" {
 		return worktreeDiscardResult{NoOp: true, Reason: "no_worktree"}, nil
+	}
+	if resolved.UnsafeReason != "" {
+		return worktreeDiscardResult{}, apiError{
+			code:    pkgapi.ErrorCodeValidationFailed,
+			status:  http.StatusBadRequest,
+			message: fmt.Sprintf("Cannot discard worktree changes for loop %s: %s", loop.ID, resolved.UnsafeReason),
+		}
 	}
 
 	if err := worktreesafety.Validate(worktreesafety.CheckInput{
@@ -305,6 +329,7 @@ type managedWorktreeRef struct {
 	WorktreeRoot string
 	Source       string
 	Managed      bool
+	UnsafeReason string
 }
 
 func resolveManagedWorktreeForLoop(ctx context.Context, repos *storage.Repositories, project storage.ProjectRecord, loop storage.LoopRecord) (*managedWorktreeRef, error) {
@@ -333,6 +358,7 @@ func resolveManagedWorktreeForLoop(ctx context.Context, repos *storage.Repositor
 	}
 
 	var record *storage.WorktreeRecord
+	unsafeReason := ""
 	if fromCheckpoint != nil {
 		if id := strings.TrimSpace(fromCheckpoint.ID); id != "" {
 			record, err = repos.Worktrees.GetByID(ctx, id)
@@ -348,21 +374,21 @@ func resolveManagedWorktreeForLoop(ctx context.Context, repos *storage.Repositor
 						message: fmt.Sprintf("Cannot use checkpointed worktree %s for loop %s: it belongs to another project", id, loop.ID),
 					}
 				}
-				if checkpointPath != "" && !sameFilesystemPath(record.WorktreePath, checkpointPath) {
+				checkpointBranch := strings.TrimSpace(fromCheckpoint.Branch)
+				pathMismatch := checkpointPath != "" && !sameFilesystemPath(record.WorktreePath, checkpointPath)
+				branchMismatch := checkpointBranch != "" && strings.TrimSpace(record.Branch) != checkpointBranch
+				if pathMismatch || branchMismatch {
 					// A worktree row can be retargeted when AdoptPath moves the
 					// branch identity to a replacement checkout. The checkpoint's
-					// ID and path jointly identify the progress an operator may
-					// choose to discard; accepting either half independently could
+					// ID, path, and branch jointly identify the progress an operator
+					// may choose to discard; accepting any part independently could
 					// reset the replacement checkout that the worker refused to use.
-					return nil, apiError{
-						code:    pkgapi.ErrorCodeValidationFailed,
-						status:  http.StatusBadRequest,
-						message: fmt.Sprintf("Cannot use checkpointed worktree for loop %s: recorded worktree ID %s no longer matches its checkpoint path", loop.ID, id),
-					}
+					unsafeReason = "checkpoint_identity_mismatch"
+					record = nil
 				}
 			}
 		}
-		if record == nil {
+		if record == nil && unsafeReason == "" {
 			path := strings.TrimSpace(fromCheckpoint.Path)
 			if path != "" {
 				record, err = findProjectWorktreeByPath(ctx, repos, project.ID, path)
@@ -371,7 +397,7 @@ func resolveManagedWorktreeForLoop(ctx context.Context, repos *storage.Repositor
 				}
 			}
 		}
-		if record == nil {
+		if record == nil && unsafeReason == "" {
 			if branch := strings.TrimSpace(fromCheckpoint.Branch); branch != "" {
 				record, err = findProjectWorktreeByBranch(ctx, repos, project.ID, branch, prNumber)
 				if err != nil {
@@ -382,7 +408,7 @@ func resolveManagedWorktreeForLoop(ctx context.Context, repos *storage.Repositor
 	}
 	// When checkpoint only has a branch (or none) but the loop is PR-scoped,
 	// resolve via PR-tagged managed path so we never pick a sibling PR's row.
-	if record == nil && prNumber > 0 {
+	if record == nil && unsafeReason == "" && prNumber > 0 {
 		record, err = findProjectWorktreeByPR(ctx, repos, project.ID, prNumber)
 		if err != nil {
 			return nil, err
@@ -428,6 +454,9 @@ func resolveManagedWorktreeForLoop(ctx context.Context, repos *storage.Repositor
 			managed = true
 		}
 	}
+	if unsafeReason != "" {
+		managed = false
+	}
 
 	return &managedWorktreeRef{
 		Path:         path,
@@ -436,6 +465,7 @@ func resolveManagedWorktreeForLoop(ctx context.Context, repos *storage.Repositor
 		WorktreeRoot: worktreeRoot,
 		Source:       source,
 		Managed:      managed,
+		UnsafeReason: unsafeReason,
 	}, nil
 }
 
@@ -635,5 +665,5 @@ func sameFilesystemPath(a, b string) bool {
 	if a == "" || b == "" {
 		return false
 	}
-	return filepath.Clean(a) == filepath.Clean(b)
+	return storage.WorktreePathsEquivalent(a, b)
 }

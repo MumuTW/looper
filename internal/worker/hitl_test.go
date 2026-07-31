@@ -496,7 +496,9 @@ func containsAll(s string, subs ...string) bool {
 func TestEnsureDraftPRForAskValidatesAndPinsPublishedHead(t *testing.T) {
 	t.Parallel()
 
-	worktree := t.TempDir()
+	repoPath := t.TempDir()
+	worktreeRoot := filepath.Join(t.TempDir(), "worktrees")
+	worktree := makeUsableTestWorktree(t, worktreeRoot, "draft-pr")
 	git := &fakeGitGateway{inspectResults: []InspectHeadResult{
 		{HeadSHA: "validated-head", NewCommitSHAs: []string{"validated-head"}},
 		{HeadSHA: "validated-head", NewCommitSHAs: []string{"validated-head"}},
@@ -514,7 +516,8 @@ func TestEnsureDraftPRForAskValidatesAndPinsPublishedHead(t *testing.T) {
 		Work:     &workerInput{Repo: "acme/widgets", Branch: "looper/feature", BaseBranch: "main", Title: "Feature"},
 		Worktree: &checkpointWorktree{Path: worktree, Branch: "looper/feature", BaseBranch: "main", HeadSHA: "base-head"},
 	}
-	input := stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: worktree}, Loop: storage.LoopRecord{ID: "loop_1"}}
+	metadata := fmt.Sprintf(`{"worktreeRoot":%q}`, worktreeRoot)
+	input := stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: repoPath, MetadataJSON: &metadata}, Loop: storage.LoopRecord{ID: "loop_1"}}
 
 	number, err := runner.ensureDraftPRForAsk(context.Background(), input, &checkpoint, "acme/widgets", worktree)
 	if err != nil {

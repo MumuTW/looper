@@ -1216,15 +1216,29 @@ func TestHandlerLoopRetryDiscardRejectsMovedCheckpointWorktree(t *testing.T) {
 	statusReq := httptest.NewRequest(http.MethodGet, "/api/v1/loops/3136/worktree", nil)
 	statusRecorder := httptest.NewRecorder()
 	h.ServeHTTP(statusRecorder, statusReq)
-	if statusRecorder.Code != http.StatusBadRequest || !strings.Contains(statusRecorder.Body.String(), "no longer matches its checkpoint path") {
-		t.Fatalf("worktree status = %d body=%s, want moved-checkpoint rejection", statusRecorder.Code, statusRecorder.Body.String())
+	if statusRecorder.Code != http.StatusOK {
+		t.Fatalf("worktree status = %d body=%s, want structured unsafe status", statusRecorder.Code, statusRecorder.Body.String())
+	}
+	statusData := parseJSONMap(t, statusRecorder.Body.Bytes())["data"].(map[string]any)
+	assertEqual(t, statusData["reason"], "checkpoint_identity_mismatch")
+	assertEqual(t, statusData["managed"], false)
+	assertEqual(t, statusData["worktreePath"], fixture.WorktreePath)
+	if _, ok := statusData["dirty"]; ok {
+		t.Fatalf("moved-checkpoint status = %#v, want dirty omitted so plain retry remains available", statusData)
 	}
 
 	retryReq := httptest.NewRequest(http.MethodPost, "/api/v1/loops/3136/retry", strings.NewReader(`{"mode":"auto","discardWorktreeChanges":true}`))
 	retryRecorder := httptest.NewRecorder()
 	h.ServeHTTP(retryRecorder, retryReq)
-	if retryRecorder.Code != http.StatusBadRequest || !strings.Contains(retryRecorder.Body.String(), "no longer matches its checkpoint path") {
+	if retryRecorder.Code != http.StatusBadRequest || !strings.Contains(retryRecorder.Body.String(), "checkpoint_identity_mismatch") {
 		t.Fatalf("discard retry = %d body=%s, want moved-checkpoint rejection", retryRecorder.Code, retryRecorder.Body.String())
+	}
+
+	plainRetryReq := httptest.NewRequest(http.MethodPost, "/api/v1/loops/3136/retry", strings.NewReader(`{"mode":"auto"}`))
+	plainRetryRecorder := httptest.NewRecorder()
+	h.ServeHTTP(plainRetryRecorder, plainRetryReq)
+	if plainRetryRecorder.Code != http.StatusOK {
+		t.Fatalf("plain retry = %d body=%s, want restored-checkpoint retry to remain available", plainRetryRecorder.Code, plainRetryRecorder.Body.String())
 	}
 	if got := readTestFile(t, filepath.Join(fixture.WorktreePath, "dirty.txt")); got != "untracked\n" {
 		t.Fatalf("checkpoint worktree was discarded: dirty.txt = %q", got)
@@ -1233,12 +1247,60 @@ func TestHandlerLoopRetryDiscardRejectsMovedCheckpointWorktree(t *testing.T) {
 		t.Fatalf("replacement worktree was discarded: replacement-dirty.txt = %q", got)
 	}
 	loop, err := services.Repositories.Loops.GetByID(context.Background(), fixture.LoopID)
-	if err != nil || loop == nil || loop.Status != "paused" {
-		t.Fatalf("loop after rejected discard = %#v, %v, want paused", loop, err)
+	if err != nil || loop == nil || loop.Status != "queued" {
+		t.Fatalf("loop after plain retry = %#v, %v, want queued", loop, err)
 	}
-	queue, err := services.Repositories.Queue.GetByID(context.Background(), fixture.FailedQueueID)
-	if err != nil || queue == nil || queue.Status != "manual_intervention" {
-		t.Fatalf("queue after rejected discard = %#v, %v, want manual_intervention", queue, err)
+	queue, err := services.Repositories.Queue.GetLatestByLoopID(context.Background(), fixture.LoopID)
+	if err != nil || queue == nil || queue.Status != "queued" {
+		t.Fatalf("queue after plain retry = %#v, %v, want queued", queue, err)
+	}
+}
+
+func TestHandlerLoopRetryDiscardRejectsCheckpointBranchMismatch(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+	fixture := seedManagedWorktreeFixture(t, services.Repositories, managedWorktreeSeed{
+		ProjectID: "project_retry_discard_branch_mismatch",
+		LoopID:    "loop_retry_discard_branch_mismatch",
+		LoopSeq:   3137,
+		LoopType:  "worker",
+		Branch:    "feature/checkpoint-branch",
+		NowISO:    nowISO,
+		Dirty:     true,
+	})
+
+	runGitTest(t, fixture.WorktreePath, "switch", "-c", "feature/replacement-branch")
+	record, err := services.Repositories.Worktrees.GetByBranch(context.Background(), "project_retry_discard_branch_mismatch", "feature/checkpoint-branch")
+	if err != nil || record == nil {
+		t.Fatalf("GetByBranch() = %#v, %v", record, err)
+	}
+	record.Branch = "feature/replacement-branch"
+	record.UpdatedAt = nowISO
+	if err := services.Repositories.Worktrees.Upsert(context.Background(), *record); err != nil {
+		t.Fatalf("Worktrees.Upsert(replacement branch) error = %v", err)
+	}
+
+	retryReq := httptest.NewRequest(http.MethodPost, "/api/v1/loops/3137/retry", strings.NewReader(`{"mode":"auto","discardWorktreeChanges":true}`))
+	retryRecorder := httptest.NewRecorder()
+	h.ServeHTTP(retryRecorder, retryReq)
+	if retryRecorder.Code != http.StatusBadRequest || !strings.Contains(retryRecorder.Body.String(), "checkpoint_identity_mismatch") {
+		t.Fatalf("discard retry = %d body=%s, want branch-mismatch rejection", retryRecorder.Code, retryRecorder.Body.String())
+	}
+	if got := readTestFile(t, filepath.Join(fixture.WorktreePath, "dirty.txt")); got != "untracked\n" {
+		t.Fatalf("replacement branch progress was discarded: dirty.txt = %q", got)
+	}
+}
+
+func TestSameFilesystemPathSupportsMacOSVarAlias(t *testing.T) {
+	t.Parallel()
+
+	if !sameFilesystemPath("/var/folders/example/worktree", "/private/var/folders/example/worktree") {
+		t.Fatal("macOS /var alias was treated as a moved worktree")
+	}
+	if sameFilesystemPath("/var/folders/example/one", "/private/var/folders/example/two") {
+		t.Fatal("different worktrees were treated as equivalent")
 	}
 }
 
