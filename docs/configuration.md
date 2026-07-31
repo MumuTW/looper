@@ -754,7 +754,7 @@ The reviewer defaults above are intentionally aggressive: clean reviews publish 
 
 ### Removed Reviewer auto-merge
 
-Reviewer no longer holds merge authority and never calls `gh pr merge`. Legacy `roles.reviewer.autoMerge` input is accepted only so an upgraded daemon can report a precise migration error. If its effective `enabled` value is `true`, startup fails and directs the operator to `roles.gatekeeper.trust = "auto"` and `roles.gatekeeper.strategy`. A disabled legacy block is ignored and omitted from config projections; delete it after upgrading.
+Reviewer no longer holds merge authority and never calls `gh pr merge`. Legacy `roles.reviewer.autoMerge` input is accepted only so an upgraded daemon can report a precise migration error. If its effective `enabled` value is `true`, startup fails and directs the operator to `roles.gatekeeper.trust = "auto"` and `roles.gatekeeper.strategy`. A disabled legacy block is ignored only when it uses the old default `squash` strategy; `merge` or `rebase` fails startup so an upgrade cannot silently change merge behavior. Compatibility blocks are omitted from global and project config projections; delete them after upgrading.
 
 ## Telegram intake
 

@@ -1,5 +1,5 @@
-// Package gatekeeper evaluates pull requests against merge policy and writes
-// durable, observe-only gate reports. It never reviews, repairs, or merges.
+// Package gatekeeper evaluates pull requests against merge policy, publishes
+// durable gate reports, and at auto trust is the sole role allowed to merge.
 package gatekeeper
 
 import (
@@ -228,9 +228,9 @@ type Options struct {
 }
 
 // Runner is the Merge Gatekeeper: a reactive, agent-free policy Role that
-// re-fetches current Pull Request state and writes an observe-only Gate
-// report. It never reviews code, repairs a Pull Request, resolves comments,
-// or merges.
+// re-fetches current Pull Request state and writes Gate reports. At auto trust
+// it confirms every gate again immediately before merging; lower trust levels
+// only report. It never reviews code, repairs a Pull Request, or resolves comments.
 // Stateful: agent-free but not database-free — it persists Gate reports in
 // the local SQLite event log.
 type Runner struct {
@@ -323,21 +323,12 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		entityID := fmt.Sprintf("%s#%d", input.Repo, pullRequest.Number)
 		stillOpen[entityID] = struct{}{}
 		previous, hasPrevious := previousReports[entityID]
-		// When the previous report is waiting on a current-head review, check
-		// the local event log cheaply before deciding to skip. This avoids a
-		// full forge evaluation every tick for PRs that may never receive a
-		// Reviewer review (unrequested, self-authored), while still observing
-		// a review the moment its durable event appears.
-		reviewEvidenceAppeared := false
-		if hasPrevious && previous.SourceFingerprint == fingerprint && reportAwaitsCurrentHeadReview(previous) {
-			if evidence, err := latestCodexReviewForHead(ctx, r.repos, input.ProjectID, input.Repo, pullRequest.Number, pullRequest.HeadSHA); err == nil && evidence.CurrentHeadValid {
-				reviewEvidenceAppeared = true
+		if r.trustFor(input.ProjectID) != config.GatekeeperTrustAuto {
+			if reused, ok := skipUnchanged(previous, hasPrevious, fingerprint, r.now()); ok {
+				result.Skipped++
+				result.Reports = append(result.Reports, reused)
+				continue
 			}
-		}
-		if reused, ok := skipUnchanged(previous, hasPrevious, fingerprint, r.now(), convergenceRevisions[entityID], reviewEvidenceAppeared); ok {
-			result.Skipped++
-			result.Reports = append(result.Reports, reused)
-			continue
 		}
 		report, err := r.EvaluatePullRequest(ctx, EvaluationInput{
 			ProjectID: input.ProjectID, Repo: input.Repo, PRNumber: pullRequest.Number,

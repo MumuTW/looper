@@ -1549,8 +1549,13 @@ func mergeReviewerRoleConfig(config *ReviewerRoleConfig, partial PartialReviewer
 	if partial.Behavior != nil {
 		mergeReviewerConfig(&config.Behavior, *partial.Behavior)
 	}
-	if partial.AutoMerge != nil && partial.AutoMerge.Enabled != nil {
-		config.AutoMerge.Enabled = *partial.AutoMerge.Enabled
+	if partial.AutoMerge != nil {
+		if partial.AutoMerge.Enabled != nil {
+			config.AutoMerge.Enabled = *partial.AutoMerge.Enabled
+		}
+		if partial.AutoMerge.Strategy != nil {
+			config.AutoMerge.Strategy = *partial.AutoMerge.Strategy
+		}
 	}
 	if partial.Instructions != nil {
 		config.Instructions = *partial.Instructions

@@ -2839,14 +2839,39 @@ func TestGatewayMergePullRequest(t *testing.T) {
 	runner := &fakeGHRunner{t: t}
 	runner.respond = func(options shell.Options) (shell.Result, error) {
 		args := strings.Join(options.Args, " ")
-		if args != "pr merge 42 --repo acme/looper --squash --match-head-commit abc123" {
+		switch args {
+		case "api repos/acme/looper/rules/branches/main":
+			return shell.Result{Stdout: "[]"}, nil
+		case "pr merge 42 --repo acme/looper --squash --match-head-commit abc123":
+			return shell.Result{}, nil
+		default:
 			t.Fatalf("unexpected gh args: %q", args)
+			return shell.Result{}, nil
 		}
-		return shell.Result{}, nil
 	}
 	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
-	if err := gateway.MergePullRequest(context.Background(), PullRequestMergeInput{Repo: "acme/looper", PRNumber: 42, Strategy: config.MergeStrategySquash, HeadSHA: "abc123"}); err != nil {
+	if err := gateway.MergePullRequest(context.Background(), PullRequestMergeInput{Repo: "acme/looper", PRNumber: 42, Strategy: config.MergeStrategySquash, HeadSHA: "abc123", BaseBranch: "main"}); err != nil {
 		t.Fatalf("MergePullRequest() error = %v", err)
+	}
+}
+
+func TestGatewayMergePullRequestRejectsMergeQueueBranch(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		if args != "api repos/acme/looper/rules/branches/main" {
+			t.Fatalf("unexpected gh args: %q", args)
+		}
+		return shell.Result{Stdout: `[{"type":"merge_queue"}]`}, nil
+	}
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	err := gateway.MergePullRequest(context.Background(), PullRequestMergeInput{Repo: "acme/looper", PRNumber: 42, Strategy: config.MergeStrategySquash, HeadSHA: "abc123", BaseBranch: "main"})
+	if err == nil || !strings.Contains(err.Error(), "requires a merge queue") {
+		t.Fatalf("MergePullRequest() error = %v, want merge queue refusal", err)
+	}
+	if len(runner.calls) != 1 {
+		t.Fatalf("gh calls = %v, want rules preflight only", runner.calls)
 	}
 }
 

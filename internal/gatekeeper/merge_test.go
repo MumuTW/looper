@@ -71,6 +71,9 @@ func TestAutoMergesAnEligiblePullRequest(t *testing.T) {
 	if fixture.github.merges[0].HeadSHA != "head-1" {
 		t.Fatalf("merge head = %q", fixture.github.merges[0].HeadSHA)
 	}
+	if fixture.github.merges[0].BaseBranch != "main" {
+		t.Fatalf("merge base branch = %q, want main", fixture.github.merges[0].BaseBranch)
+	}
 	outcomes := mergeOutcomes(t, fixture.repos)
 	if len(outcomes) != 1 || !outcomes[0].Merged {
 		t.Fatalf("outcomes = %+v", outcomes)
@@ -134,6 +137,21 @@ func TestAutoRecordsAForgeRefusalWithoutFailing(t *testing.T) {
 	outcomes := mergeOutcomes(t, fixture.repos)
 	if len(outcomes) != 1 || outcomes[0].Merged || outcomes[0].Reason != refusalMergeFailed {
 		t.Fatalf("outcomes = %+v", outcomes)
+	}
+}
+
+func TestAutoPropagatesTransientMergeFailureWithoutPersistingRefusal(t *testing.T) {
+	t.Parallel()
+	fixture := newGatekeeperFixture(t)
+	fixture.github.mergeErr = &githubinfra.TransientError{Err: errors.New("GitHub API temporarily unavailable")}
+	runner := autoRunner(t, fixture)
+	if _, err := runner.EvaluatePullRequest(context.Background(), EvaluationInput{
+		ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, ExpectedHeadSHA: "head-1",
+	}); err == nil || !githubinfra.IsTransientError(err) {
+		t.Fatalf("EvaluatePullRequest() error = %v, want transient error", err)
+	}
+	if outcomes := mergeOutcomes(t, fixture.repos); len(outcomes) != 0 {
+		t.Fatalf("outcomes = %+v, want no durable refusal for transient failure", outcomes)
 	}
 }
 
@@ -239,7 +257,7 @@ func TestAutoUsesGatekeeperMergeStrategy(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if len(fixture.github.merges) != 1 || fixture.github.merges[0].Strategy != config.MergeStrategyRebase {
+	if len(fixture.github.merges) != 1 || fixture.github.merges[0].Strategy != config.MergeStrategyRebase || fixture.github.merges[0].BaseBranch != "main" {
 		t.Fatalf("merges = %+v, want one rebase merge", fixture.github.merges)
 	}
 }

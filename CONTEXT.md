@@ -91,8 +91,9 @@ _Avoid_: patcher, responder.
 
 **Merge Gatekeeper**:
 Defined at `gatekeeper.Runner` in `internal/gatekeeper`, whose doc comment
-carries the semantics: the agent-free policy Role writing observe-only **Gate
-report**s, never reviewing, repairing, resolving, or merging.
+carries the semantics: the agent-free policy Role writing **Gate report**s and,
+at auto trust, confirming every gate before merging. It never reviews, repairs,
+or resolves comments.
 _Avoid_: merger, reviewer, fixer.
 
 **Coordinator**:

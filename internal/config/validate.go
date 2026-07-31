@@ -98,6 +98,9 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 	if config.Roles.Reviewer.AutoMerge.Enabled {
 		issues = append(issues, ValidationIssue{Path: "roles.reviewer.autoMerge.enabled", Message: "Reviewer auto-merge was removed; set roles.gatekeeper.trust = \"auto\" and move strategy to roles.gatekeeper.strategy"})
 	}
+	if strategy := config.Roles.Reviewer.AutoMerge.Strategy; strategy != "" && strategy != MergeStrategySquash {
+		issues = append(issues, ValidationIssue{Path: "roles.reviewer.autoMerge.strategy", Message: "Reviewer auto-merge was removed; move strategy to roles.gatekeeper.strategy"})
+	}
 	if config.Roles.Reviewer.Behavior.ReviewEvents.Clean != ReviewerReviewEventComment && config.Roles.Reviewer.Behavior.ReviewEvents.Clean != ReviewerReviewEventApprove {
 		issues = append(issues, ValidationIssue{Path: "roles.reviewer.behavior.reviewEvents.clean", Message: fmt.Sprintf("must be one of: %s, %s", ReviewerReviewEventComment, ReviewerReviewEventApprove)})
 	}
@@ -625,8 +628,8 @@ func validateIntakeConfig(config Config, issues *[]ValidationIssue) {
 	*issues = append(*issues, ValidationIssue{Path: "intake.telegram.defaultProjectId", Message: fmt.Sprintf("must name a configured project; %q is not in projects[]", defaultProject)})
 }
 
-// validateGatekeeperRoleConfig rejects unknown Gatekeeper trust levels.
-//
+// validateGatekeeperRoleConfig validates the graduated trust and merge strategy
+// that Gatekeeper itself owns.
 // validateDeployerRoleConfig fails startup rather than at deploy time. A project
 // configured to deploy but unable to is otherwise only discovered on the first
 // merge, which is the worst moment to learn it.
@@ -1728,6 +1731,9 @@ func isValidMergeStrategy(strategy MergeStrategy) bool {
 func validatePartialReviewerAutoMerge(partial PartialReviewerAutoMergeConfig, path string, issues *[]ValidationIssue) {
 	if partial.Enabled != nil && *partial.Enabled {
 		*issues = append(*issues, ValidationIssue{Path: path + ".enabled", Message: "Reviewer auto-merge was removed; set the matching roles.gatekeeper.trust = \"auto\" and move strategy to roles.gatekeeper.strategy"})
+	}
+	if partial.Strategy != nil && *partial.Strategy != MergeStrategySquash {
+		*issues = append(*issues, ValidationIssue{Path: path + ".strategy", Message: "Reviewer auto-merge was removed; move strategy to roles.gatekeeper.strategy"})
 	}
 }
 

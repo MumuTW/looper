@@ -17,6 +17,34 @@ func openPullRequestFixture() githubinfra.PullRequestSummary {
 	}
 }
 
+func TestDiscoverPullRequestsReevaluatesEveryAutoTrustTick(t *testing.T) {
+	fixture := newGatekeeperFixture(t)
+	fixture.github.openPullRequests = []githubinfra.PullRequestSummary{openPullRequestFixture()}
+	runner := New(Options{
+		Repos: fixture.repos, GitHub: fixture.github, Now: func() time.Time { return fixture.now },
+		PolicyPermitsTarget: func(string, string, string) bool { return fixture.policyPermits },
+		TrustForProject:     func(string) config.GatekeeperTrustLevel { return config.GatekeeperTrustAuto },
+	})
+	first, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("first discovery error = %v", err)
+	}
+	if first.Evaluated != 1 || first.Skipped != 0 {
+		t.Fatalf("first tick = %d evaluated / %d skipped", first.Evaluated, first.Skipped)
+	}
+	callsAfterFirst := fixture.github.perPullRequestCalls
+	second, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("second discovery error = %v", err)
+	}
+	if second.Evaluated != 1 || second.Skipped != 0 {
+		t.Fatalf("second tick = %d evaluated / %d skipped, want 1 / 0", second.Evaluated, second.Skipped)
+	}
+	if fixture.github.perPullRequestCalls <= callsAfterFirst {
+		t.Fatal("auto trust reused the observe cache instead of re-evaluating")
+	}
+}
+
 func discover(t *testing.T, fixture *gatekeeperFixture) DiscoveryResult {
 	t.Helper()
 	result, err := fixture.runner().DiscoverPullRequests(context.Background(), DiscoveryInput{

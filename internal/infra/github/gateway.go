@@ -465,11 +465,12 @@ type ClosePullRequestInput struct {
 }
 
 type PullRequestMergeInput struct {
-	Repo     string
-	PRNumber int64
-	Strategy config.MergeStrategy
-	HeadSHA  string
-	CWD      string
+	Repo       string
+	PRNumber   int64
+	Strategy   config.MergeStrategy
+	HeadSHA    string
+	BaseBranch string
+	CWD        string
 }
 
 type MarkPullRequestReadyInput struct {
@@ -2108,6 +2109,10 @@ func (g *Gateway) ClosePullRequest(ctx context.Context, input ClosePullRequestIn
 // in between, so the decision cannot be applied to a different commit than the
 // one it was made about.
 //
+// Before acting, this reads GitHub's branch-rule authority. A merge-queue rule
+// is a deferred merge request, not an immediate merge, so Gatekeeper fails
+// closed instead of recording a merge that is merely queued.
+//
 // This deliberately does not pass --auto. Auto-merge hands the decision to
 // GitHub to apply later, by which time the evaluation behind it is stale — the
 // opposite of the guarantee an immediate merge makes.
@@ -2120,7 +2125,29 @@ func (g *Gateway) MergePullRequest(ctx context.Context, input PullRequestMergeIn
 	if headSHA == "" {
 		return fmt.Errorf("merge head SHA is required")
 	}
-	_, err := g.runGh(ctx, input.CWD, "", "pr", "merge", strconv.FormatInt(input.PRNumber, 10), "--repo", input.Repo, "--"+strategy, "--match-head-commit", headSHA)
+	baseBranch := strings.TrimSpace(input.BaseBranch)
+	if baseBranch == "" {
+		return fmt.Errorf("merge base branch is required")
+	}
+	hostname, repo := splitRepoHostname(input.Repo)
+	rulesArgs := []string{"api", fmt.Sprintf("repos/%s/rules/branches/%s", repo, url.PathEscape(baseBranch))}
+	if hostname != "" {
+		rulesArgs = append(rulesArgs, "--hostname", hostname)
+	}
+	rulesResult, err := g.runGh(ctx, input.CWD, "", rulesArgs...)
+	if err != nil {
+		return fmt.Errorf("inspect base branch rules before merge: %w", err)
+	}
+	rules, err := decodeJSONArray(rulesResult.Stdout)
+	if err != nil {
+		return fmt.Errorf("decode base branch rules before merge: %w", err)
+	}
+	for _, rule := range rules {
+		if strings.EqualFold(asString(rule["type"]), "merge_queue") {
+			return fmt.Errorf("base branch %q requires a merge queue; Gatekeeper only performs immediate merges", baseBranch)
+		}
+	}
+	_, err = g.runGh(ctx, input.CWD, "", "pr", "merge", strconv.FormatInt(input.PRNumber, 10), "--repo", input.Repo, "--"+strategy, "--match-head-commit", headSHA)
 	return err
 }
 

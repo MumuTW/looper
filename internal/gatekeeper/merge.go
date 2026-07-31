@@ -68,8 +68,12 @@ func (r *Runner) confirmAndMerge(ctx context.Context, input EvaluationInput, rep
 	if err := r.github.MergePullRequest(ctx, githubinfra.PullRequestMergeInput{
 		Repo: report.Repo, PRNumber: report.PRNumber,
 		Strategy: r.mergeStrategy(report.ProjectID), HeadSHA: outcome.HeadSHA,
-		CWD: r.projectCWD(ctx, report.ProjectID),
+		BaseBranch: report.Evidence.BaseRefName,
+		CWD:        r.projectCWD(ctx, report.ProjectID),
 	}); err != nil {
+		if githubinfra.IsTransientError(err) {
+			return err
+		}
 		// The forge has its own view — branch protection, a race with another
 		// merge — and refusing is a legitimate answer, not a lane failure.
 		outcome.Reason = refusalMergeFailed

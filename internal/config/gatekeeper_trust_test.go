@@ -68,11 +68,11 @@ func TestReviewerAutoMergeEnabledProducesMigrationError(t *testing.T) {
 	}
 }
 
-func TestDisabledReviewerAutoMergeIsAcceptedButNotProjected(t *testing.T) {
+func TestDisabledReviewerAutoMergeDefaultStrategyIsAcceptedButNonDefaultFails(t *testing.T) {
 	t.Parallel()
 	disabled := false
-	strategy := MergeStrategyRebase
-	cfg, err := Normalize(t.TempDir(), PartialConfig{Roles: &PartialRoleConfigs{Reviewer: &PartialReviewerRoleConfig{AutoMerge: &PartialReviewerAutoMergeConfig{Enabled: &disabled, Strategy: &strategy}}}})
+	defaultStrategy := MergeStrategySquash
+	cfg, err := Normalize(t.TempDir(), PartialConfig{Roles: &PartialRoleConfigs{Reviewer: &PartialReviewerRoleConfig{AutoMerge: &PartialReviewerAutoMergeConfig{Enabled: &disabled, Strategy: &defaultStrategy}}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -82,6 +82,30 @@ func TestDisabledReviewerAutoMergeIsAcceptedButNotProjected(t *testing.T) {
 	raw := string(mustJSON(t, cfg.Roles.Reviewer))
 	if strings.Contains(raw, "autoMerge") {
 		t.Fatalf("deprecated autoMerge was projected: %s", raw)
+	}
+	for _, strategy := range []MergeStrategy{MergeStrategyRebase, MergeStrategyMerge} {
+		cfg, err := Normalize(t.TempDir(), PartialConfig{Roles: &PartialRoleConfigs{Reviewer: &PartialReviewerRoleConfig{AutoMerge: &PartialReviewerAutoMergeConfig{Enabled: &disabled, Strategy: &strategy}}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := Validate(cfg); err == nil || !strings.Contains(err.Error(), "roles.reviewer.autoMerge.strategy") {
+			t.Fatalf("Validate(strategy=%q) error = %v, want explicit migration", strategy, err)
+		}
+	}
+}
+
+func TestRedactProjectSecretsOmitsReviewerCompatibilityBlock(t *testing.T) {
+	t.Parallel()
+	projects := []ProjectRefConfig{{ID: "project_1", Roles: &PartialRoleConfigs{Reviewer: &PartialReviewerRoleConfig{AutoMerge: &PartialReviewerAutoMergeConfig{}}}}}
+	redacted := RedactProjectSecrets(projects)
+	if redacted[0].Roles == projects[0].Roles {
+		t.Fatal("redaction reused project roles pointer")
+	}
+	if redacted[0].Roles.Reviewer == nil || redacted[0].Roles.Reviewer.AutoMerge != nil {
+		t.Fatalf("redacted reviewer role = %#v, want compatibility block omitted", redacted[0].Roles.Reviewer)
+	}
+	if projects[0].Roles.Reviewer.AutoMerge == nil {
+		t.Fatal("redaction mutated source project")
 	}
 }
 
