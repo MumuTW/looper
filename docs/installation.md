@@ -162,7 +162,90 @@ looper upgrade verify-start --release-root /opt/looper --release <release-id>
 
 This verifies the selected pointer, live daemon identity, health/readiness, storage migration state, scheduler ownership, quarantine debt, project-catalog access, and the durable `looperd.started` recovery event. It returns nonzero while still printing the evidence report if any check fails.
 
-To switch binaries back, activate a previously staged release ID. That is only a binary rollback: do it only after compatibility preflight proves the database remains readable by that release. If a migration or durable payload change is forward-only, restore the matching database/config backup rather than merely moving the binary pointer.
+### Release-to-release cutover
+
+The supported path is intentionally explicit. The commands below never stop or
+restart a daemon; use your foreground terminal, launchd, or systemd to do that
+only after the drain succeeds.
+
+1. Download the matching `looper-<target>.tar.gz` and
+   `looperd-<target>.tar.gz` assets for one GitHub Release, and verify each
+   published `.sha256` before extraction. Do not mix a CLI from one tag with a
+   daemon from another tag.
+2. Before changing the running process, run `looper upgrade preflight` with
+   the extracted pair. Resolve every reported identity, config, migration,
+   health, or quarantine blocker; the report is read-only and only describes
+   that moment.
+3. Ask the running daemon for a rollback bundle with `looper upgrade backup`.
+   Keep the printed bundle directory off the host or volume being changed.
+4. Close admission and wait for work to finish with
+   `looper upgrade drain --deadline 10m`. A deadline error is not permission to
+   kill agents; choose a later maintenance window or explicitly handle the
+   remaining work outside the routine upgrade path.
+5. Stage the verified binary pair, stop the drained daemon through its
+   supervisor, activate the staged release, and start the supervisor again:
+
+   ```sh
+   looper upgrade stage-release \
+     --target-looper /downloads/looper-darwin-arm64 \
+     --target-looperd /downloads/looperd-darwin-arm64 \
+     --release-root /opt/looper
+   looper upgrade activate-release --release-root /opt/looper --release <release-id>
+   # Stop and start looperd using the foreground terminal, launchd, or systemd.
+   looper upgrade verify-start --release-root /opt/looper --release <release-id>
+   ```
+
+   `verify-start` must succeed before the cutover is called complete. If it
+   reports a block, leave admission closed and use the failed-start procedure
+   below rather than starting new work on an unverified daemon.
+
+### Pinned-source development
+
+Development builds are not release candidates. `stage-release` rejects the
+`dev` channel and dirty or incomplete identities so a local checkout cannot
+silently become a production rollback point. Build both binaries from one
+immutable commit in a separate checkout, use a separate config and SQLite path
+for testing, and record the commit in the test notes. For example:
+
+```sh
+git worktree add --detach /tmp/looper-test <commit>
+(cd /tmp/looper-test && go build -o /tmp/looper-dev ./cmd/looper && go build -o /tmp/looperd-dev ./cmd/looperd)
+LOOPER_CONFIG=/tmp/looper-dev.toml /tmp/looperd-dev --check-config
+```
+
+Do not point a dev build at the production database, and do not use
+`scripts/update-daemon.sh --promote` as an upgrade mechanism: it stages a
+developer build safely, but it is deliberately not a versioned release
+cutover.
+
+### Failed start and downgrade
+
+Moving `current` back to an older release is a **binary-only** rollback. Looper
+does not infer durable-state compatibility from matching SQL migration IDs: a
+checkpoint, event, or run-snapshot payload can still make an older binary
+unsafe. Use a binary-only rollback only when the relevant release's documented
+compatibility contract explicitly proves it is safe.
+
+The default recovery for a failed start or an unproven downgrade restores the
+matching backup's config and database. Keep the daemon stopped and admission
+closed, then:
+
+```sh
+looper upgrade restore-preflight --bundle <backup-directory>
+looper upgrade restore --bundle <backup-directory> --confirm
+looper upgrade activate-release --release-root /opt/looper --release <previous-release-id>
+# Start the supervisor only after the restore and pointer switch succeed.
+looper upgrade verify-start --release-root /opt/looper --release <previous-release-id>
+```
+
+`restore-preflight` includes the recorded binary paths in its read-only process
+check; `restore` repeats its own config/SQLite checks, takes the SQLite
+exclusion lock, and restores only config plus database state. The copied backup
+binaries are never executed. A restore intentionally discards every config or
+database write made after that backup; it does not merge newer runs, events, or
+migrations into the earlier snapshot. If `restore` reports an interrupted
+transaction, rerun the same confirmed command only while the daemon remains
+stopped so it can recover the journal before applying the bundle.
 
 ## Compatibility and version policy
 
