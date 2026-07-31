@@ -802,6 +802,54 @@ func TestClaimAndRunScheduledQueueItemsSkipsUnconfiguredRoles(t *testing.T) {
 	}
 }
 
+func TestClaimAndRunScheduledQueueItemsSkipsCodingWorkOutsideRunnableCatalog(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "claim-runnable-projects.sqlite"), t.TempDir())
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 21, 8, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+	for _, projectID := range []string{"legacy_inert", "runnable"} {
+		if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: projectID, RepoPath: filepath.Join(workingDir, projectID), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+			t.Fatalf("Projects.Upsert(%s) error = %v", projectID, err)
+		}
+	}
+	for _, item := range []storage.QueueItemRecord{
+		{ID: "inert_worker", ProjectID: stringPtr("legacy_inert"), Type: "worker", TargetType: "project", TargetID: "project:legacy_inert", DedupeKey: "worker:legacy_inert", Priority: storage.QueuePriorityReviewer, Status: "queued", AvailableAt: nowISO, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO},
+		{ID: "runnable_worker", ProjectID: stringPtr("runnable"), Type: "worker", TargetType: "project", TargetID: "project:runnable", DedupeKey: "worker:runnable", Priority: storage.QueuePriorityWorker, Status: "queued", AvailableAt: nowISO, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO},
+	} {
+		if err := repos.Queue.Upsert(context.Background(), item); err != nil {
+			t.Fatalf("Queue.Upsert(%s) error = %v", item.ID, err)
+		}
+	}
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	vendor := config.AgentVendorCodex
+	cfg.Agent.Vendor = &vendor
+	cfg.Projects = []config.ProjectRefConfig{{ID: "runnable", Validation: &config.ProjectValidationConfig{OptOut: true}}}
+
+	claimed, err := claimAndRunScheduledQueueItems(context.Background(), 2, defaultSchedulerTickInput{
+		Repos: repos, Now: func() time.Time { return now }, Config: &cfg,
+		Worker: &stubWorkerScheduler{}, AsyncRunner: immediateSchedulerRunner{},
+	})
+	if err != nil {
+		t.Fatalf("claimAndRunScheduledQueueItems() error = %v", err)
+	}
+	if len(claimed) != 1 || claimed[0].ID != "runnable_worker" {
+		t.Fatalf("claimed = %#v, want only runnable project work", claimed)
+	}
+	inert, err := repos.Queue.GetByID(context.Background(), "inert_worker")
+	if err != nil {
+		t.Fatalf("Queue.GetByID(inert_worker) error = %v", err)
+	}
+	if inert == nil || inert.Status != "queued" {
+		t.Fatalf("inert queue item = %#v, want durable queued quarantine", inert)
+	}
+}
+
 func TestClaimAndRunScheduledQueueItemsClaimsStickySnapshotWithoutLiveRole(t *testing.T) {
 	t.Parallel()
 
@@ -822,6 +870,7 @@ func TestClaimAndRunScheduledQueueItemsClaimsStickySnapshotWithoutLiveRole(t *te
 	cfg.Agent.Vendor = nil
 	workerVendor := config.AgentVendorCodex
 	cfg.Roles.Worker.Agent = &config.RoleAgentConfig{Vendor: &workerVendor}
+	cfg.Projects = []config.ProjectRefConfig{{ID: "project_sticky", Validation: &config.ProjectValidationConfig{OptOut: true}}}
 
 	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_sticky", Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
@@ -847,6 +896,7 @@ func TestClaimAndRunScheduledQueueItemsClaimsStickySnapshotWithoutLiveRole(t *te
 	stickyLoopID := "loop_reviewer_sticky"
 	freshLoopID := "loop_reviewer_fresh"
 	workerLoopID := "loop_worker_live"
+	projectID := "project_sticky"
 	repo := "acme/looper"
 	prSticky := int64(10)
 	prFresh := int64(11)
@@ -854,7 +904,7 @@ func TestClaimAndRunScheduledQueueItemsClaimsStickySnapshotWithoutLiveRole(t *te
 		// Higher priority reviewer items first: sticky should claim, fresh must not.
 		{ID: "reviewer_sticky", LoopID: &stickyLoopID, Type: "reviewer", TargetType: "pull_request", TargetID: "pr:10", Repo: &repo, PRNumber: &prSticky, DedupeKey: "d_sticky", Priority: storage.QueuePriorityReviewer, Status: "queued", AvailableAt: nowISO, Attempts: 1, MaxAttempts: -1, CreatedAt: "2026-04-21T07:00:00.000Z", UpdatedAt: nowISO},
 		{ID: "reviewer_fresh", LoopID: &freshLoopID, Type: "reviewer", TargetType: "pull_request", TargetID: "pr:11", Repo: &repo, PRNumber: &prFresh, DedupeKey: "d_fresh", Priority: storage.QueuePriorityReviewer, Status: "queued", AvailableAt: nowISO, Attempts: 0, MaxAttempts: -1, CreatedAt: "2026-04-21T07:00:01.000Z", UpdatedAt: nowISO},
-		{ID: "worker_live", LoopID: &workerLoopID, Type: "worker", TargetType: "project", TargetID: "project_sticky", DedupeKey: "d_worker", Priority: storage.QueuePriorityWorker, Status: "queued", AvailableAt: nowISO, Attempts: 0, MaxAttempts: -1, CreatedAt: "2026-04-21T07:00:02.000Z", UpdatedAt: nowISO},
+		{ID: "worker_live", ProjectID: &projectID, LoopID: &workerLoopID, Type: "worker", TargetType: "project", TargetID: "project_sticky", DedupeKey: "d_worker", Priority: storage.QueuePriorityWorker, Status: "queued", AvailableAt: nowISO, Attempts: 0, MaxAttempts: -1, CreatedAt: "2026-04-21T07:00:02.000Z", UpdatedAt: nowISO},
 	} {
 		if err := repos.Queue.Upsert(context.Background(), item); err != nil {
 			t.Fatalf("Queue.Upsert(%s) error = %v", item.ID, err)

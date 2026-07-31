@@ -563,6 +563,19 @@ func ValidateProjectValidationPolicies(config Config) error {
 	return nil
 }
 
+// ValidateProjectValidationPolicy validates an explicitly authored project
+// policy independently of whether a coding agent is currently configured.
+// Mutation boundaries use this before persistence so enabling Worker or Fixer
+// later cannot turn an accepted stored policy into a startup failure.
+func ValidateProjectValidationPolicy(validation *ProjectValidationConfig) error {
+	issues := []ValidationIssue{}
+	validateProjectValidationConfig(Config{}, ProjectRefConfig{Validation: validation}, "project", false, &issues)
+	if len(issues) > 0 {
+		return &ConfigValidationError{Issues: issues}
+	}
+	return nil
+}
+
 func validateProjectValidationConfig(config Config, project ProjectRefConfig, prefix string, requirePresence bool, issues *[]ValidationIssue) {
 	validation := project.Validation
 	if validation == nil {
