@@ -86,7 +86,7 @@ func (q *syncSnapshotGateQuerier) ExecContext(ctx context.Context, query string,
 
 func (q *syncSnapshotGateQuerier) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
 	rows, err := q.db.QueryContext(ctx, query, args...)
-	if err != nil || !strings.Contains(query, "SELECT * FROM projects") {
+	if err != nil || !strings.Contains(query, "FROM projects") {
 		return rows, err
 	}
 	q.once.Do(func() {

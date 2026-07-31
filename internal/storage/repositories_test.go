@@ -2897,6 +2897,44 @@ func TestRunsUpsertPreservesAgentSnapshotOnUpdate(t *testing.T) {
 	}
 }
 
+func TestRunRepositoryProjectionIgnoresAdditionalColumn(t *testing.T) {
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	ctx := context.Background()
+	repos := NewRepositories(coordinator.DB())
+	now := "2026-07-31T00:00:00.000Z"
+	if err := repos.Projects.Upsert(ctx, ProjectRecord{
+		ID: "project_projection", Name: "Projection", RepoPath: "/tmp/projection",
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := repos.Loops.Upsert(ctx, LoopRecord{
+		ID: "loop_projection", Seq: 1, ProjectID: "project_projection", Type: "worker",
+		TargetType: "project", Status: "running", CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	if err := repos.Runs.Upsert(ctx, RunRecord{
+		ID: "run_projection", LoopID: "loop_projection", Status: "running",
+		StartedAt: now, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+
+	// A forward-compatible schema change appends a column that is not part of
+	// the record scan contract. A wildcard projection would now return one value too many.
+	if _, err := coordinator.DB().ExecContext(ctx, `ALTER TABLE runs ADD COLUMN future_runtime_column TEXT`); err != nil {
+		t.Fatalf("ALTER TABLE runs error = %v", err)
+	}
+	got, err := repos.Runs.GetByID(ctx, "run_projection")
+	if err != nil {
+		t.Fatalf("Runs.GetByID() after additional column error = %v", err)
+	}
+	if got == nil || got.ID != "run_projection" || got.LoopID != "loop_projection" {
+		t.Fatalf("Runs.GetByID() = %#v, want run_projection linked to loop_projection", got)
+	}
+}
+
 func strPtr(value string) *string {
 	return &value
 }
