@@ -63,9 +63,6 @@ type capturedResponse struct {
 
 type responseArtifactEntry struct {
 	id string
-	// sameAs emits a shared-shape reference instead of a body; the referenced
-	// route's captured body must match this route's byte for byte.
-	sameAs string
 	// declared holds an entry that cannot be captured deterministically and is
 	// therefore authored here instead.
 	declared string
@@ -85,7 +82,7 @@ var responseArtifactOrder = []responseArtifactEntry{
 		"/data/service/binary/artifactName":  "<artifact-name>",
 	}},
 	{id: "config.get"},
-	{id: "config.patch", sameAs: "config.get"},
+	{id: "config.patch"},
 	{id: "events.list"},
 	{id: "events.entity"},
 	{id: "pullRequests.list"},
@@ -223,7 +220,7 @@ const responsesArtifactNotes = `[
   "This artifact freezes the current /api/v1 success-envelope JSON shapes captured by replaying the frozen request fixtures against the in-process Go handler.",
   "Generated, not hand-edited: change the handler, then run go generate ./internal/api/... in the same commit.",
   "Values normalized as placeholders are environment- or runtime-generated but the surrounding JSON shape is part of the compatibility boundary.",
-  "A route with sameAs intentionally shares the complete frozen response shape of the referenced route.",
+  "Every route carries its own captured body: two routes that happen to agree today are still two independent boundaries.",
   "loop.logs.follow documents the text/event-stream wire format; its samples are declared in internal/api/contract_artifact_regen_test.go because the stream is timing-dependent."
 ]`
 
@@ -272,11 +269,60 @@ const errorsArtifactSharedBehavior = `{
   }
 }`
 
+// contractConfigFixture reproduces, for the contract fixtures, the two halves
+// of a config PATCH that production wires separately: PatchConfig hands the
+// mutation to the configuration authority, and the handler then republishes the
+// applied configuration through ConfigSnapshot before building the response. A
+// stub that only returns nil leaves the PATCH response equal to the preceding
+// GET and freezes that false equality into the artifact.
+type contractConfigFixture struct {
+	config config.Config
+}
+
+// newContractConfigFixture seeds from the runtime's own config because that is
+// what the handler reads for /api/v1/config when no ConfigSnapshot is wired, so
+// GET responses stay identical once one is.
+func newContractConfigFixture(rt interface{ Config() config.Config }) *contractConfigFixture {
+	return &contractConfigFixture{config: rt.Config()}
+}
+
+// patch applies the request through config.ApplyFieldPatch, the same canonical
+// dotted-path applier the daemon's file-layer patch uses, so an invalid path or
+// value fails here exactly as it would in production.
+func (f *contractConfigFixture) patch(_ context.Context, request ConfigPatchRequest) error {
+	partial, err := config.ApplyFieldPatch(config.PartialConfig{}, request.Set, request.Unset)
+	if err != nil {
+		return ConfigRequestError{
+			Kind:    ConfigRequestErrorKindValidation,
+			Message: "Invalid configuration patch",
+			Issues:  []ConfigPatchIssue{{Code: "invalid_patch", Message: err.Error()}},
+		}
+	}
+
+	// The patched partial carries only the fields the request touched, and its
+	// JSON names match config.Config's, so decoding it over a copy of the
+	// current config overlays exactly those fields.
+	encoded, err := json.Marshal(partial)
+	if err != nil {
+		return err
+	}
+	applied := f.config
+	if err := json.Unmarshal(encoded, &applied); err != nil {
+		return err
+	}
+	f.config = applied
+
+	return nil
+}
+
+func (f *contractConfigFixture) snapshot() (config.Config, ConfigMetadata) {
+	return f.config, ConfigMetadata{}
+}
+
 func buildResponsesArtifact(t *testing.T, captured map[string]capturedResponse) *jsonObject {
 	t.Helper()
 
 	routes := make([]any, 0, len(responseArtifactOrder))
-	bodies := make(map[string][]byte, len(responseArtifactOrder))
 
 	for _, entry := range responseArtifactOrder {
 		if entry.declared != "" {
@@ -292,28 +338,10 @@ func buildResponsesArtifact(t *testing.T, captured map[string]capturedResponse) 
 			setJSONPointer(t, response.body, pointer, placeholder)
 		}
 
-		encoded, err := encodeOrderedJSON(response.body)
-		if err != nil {
-			t.Fatalf("encodeOrderedJSON(%s) error = %v", entry.id, err)
-		}
-		bodies[entry.id] = encoded
-
-		route := newJSONObject().
+		routes = append(routes, newJSONObject().
 			set("id", entry.id).
-			set("status", json.Number(strconv.Itoa(response.status)))
-		if entry.sameAs != "" {
-			base, ok := bodies[entry.sameAs]
-			if !ok {
-				t.Fatalf("route %q references sameAs %q, which is not captured earlier", entry.id, entry.sameAs)
-			}
-			if !bytes.Equal(base, encoded) {
-				t.Fatalf("route %q no longer matches sameAs %q\nthis=%s\nbase=%s", entry.id, entry.sameAs, encoded, base)
-			}
-			route.set("sameAs", entry.sameAs)
-		} else {
-			route.set("body", response.body)
-		}
-		routes = append(routes, route)
+			set("status", json.Number(strconv.Itoa(response.status))).
+			set("body", response.body))
 	}
 
 	artifact := newJSONObject().set("artifactVersion", json.Number("1"))
@@ -452,6 +480,7 @@ func captureCoreRouteResponses(t *testing.T, out map[string]capturedResponse) {
 	fixture := newTestFixture(t)
 	seedStatusData(t, fixture.runtime)
 	requestRoutes := loadRequestArtifact(t)
+	configFixture := newContractConfigFixture(fixture.runtime)
 
 	h := NewHandler(Context{
 		Config:  fixture.config,
@@ -487,7 +516,8 @@ func captureCoreRouteResponses(t *testing.T, out map[string]capturedResponse) {
 				return storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: "/tmp/looper", BaseBranch: &baseBranch, MetadataJSON: &metadataJSON, CreatedAt: nowISO, UpdatedAt: nowISO}, nil
 			},
 		},
-		PatchConfig:     func(context.Context, ConfigPatchRequest) error { return nil },
+		PatchConfig:     configFixture.patch,
+		ConfigSnapshot:  configFixture.snapshot,
 		RecoverySummary: func() any { return map[string]any{"expiredLocksReleased": 1} },
 	})
 

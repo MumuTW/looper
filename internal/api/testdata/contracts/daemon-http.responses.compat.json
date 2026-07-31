@@ -14,7 +14,7 @@
     "This artifact freezes the current /api/v1 success-envelope JSON shapes captured by replaying the frozen request fixtures against the in-process Go handler.",
     "Generated, not hand-edited: change the handler, then run go generate ./internal/api/... in the same commit.",
     "Values normalized as placeholders are environment- or runtime-generated but the surrounding JSON shape is part of the compatibility boundary.",
-    "A route with sameAs intentionally shares the complete frozen response shape of the referenced route.",
+    "Every route carries its own captured body: two routes that happen to agree today are still two independent boundaries.",
     "loop.logs.follow documents the text/event-stream wire format; its samples are declared in internal/api/contract_artifact_regen_test.go because the stream is timing-dependent."
   ],
   "placeholders": {
@@ -592,7 +592,347 @@
     {
       "id": "config.patch",
       "status": 200,
-      "sameAs": "config.get"
+      "body": {
+        "ok": true,
+        "data": {
+          "server": {
+            "host": "127.0.0.1",
+            "port": 17310,
+            "authMode": "none"
+          },
+          "storage": {
+            "mode": "sqlite",
+            "dbPath": "<tmp-root>/state/looper.sqlite",
+            "backupDir": "<tmp-root>/backups"
+          },
+          "scheduler": {
+            "pollIntervalSeconds": 30,
+            "maxConcurrentRuns": 4,
+            "retryMaxAttempts": -1,
+            "consecutiveFailureThreshold": 3,
+            "retryBaseDelayMs": 5000,
+            "slowLaneWarnThresholdMs": 5000,
+            "discoveryCacheTtlSeconds": 30
+          },
+          "webhook": {
+            "enabled": false,
+            "mode": "gh-forward",
+            "listenPort": 0,
+            "publicBaseUrl": "",
+            "fallbackPollIntervalSeconds": 300
+          },
+          "network": {
+            "enrolled": false,
+            "loopernetBaseUrl": "",
+            "nodeName": "",
+            "githubLogin": ""
+          },
+          "agent": {
+            "vendor": "opencode",
+            "params": {},
+            "env": {},
+            "envKeys": [],
+            "timeouts": {
+              "plannerSeconds": 3600,
+              "workerSeconds": 10800,
+              "reviewerSeconds": 5400,
+              "fixerSeconds": 7200,
+              "plannerIdleTimeoutSeconds": 600,
+              "plannerMaxRuntimeSeconds": 3600,
+              "workerIdleTimeoutSeconds": 900,
+              "workerMaxRuntimeSeconds": 10800,
+              "reviewerIdleTimeoutSeconds": 600,
+              "reviewerMaxRuntimeSeconds": 5400,
+              "fixerIdleTimeoutSeconds": 600,
+              "fixerMaxRuntimeSeconds": 7200
+            },
+            "nativeResume": {
+              "enabled": true
+            }
+          },
+          "logging": {
+            "level": "info",
+            "maxSizeMB": 10,
+            "maxFiles": 5
+          },
+          "notifications": {
+            "inApp": true,
+            "osascript": {
+              "enabled": true,
+              "soundForLevels": [
+                "action_required",
+                "failure"
+              ],
+              "throttleWindowSeconds": 60
+            },
+            "webhook": {
+              "enabled": false,
+              "urlEnv": "",
+              "format": "generic",
+              "levels": null,
+              "throttleWindowSeconds": 60
+            }
+          },
+          "disclosure": {
+            "enabled": true,
+            "includeAgent": true,
+            "includeOS": false,
+            "channels": {
+              "gitCommit": true,
+              "pullRequest": true,
+              "issueComment": true,
+              "reviewComment": true,
+              "inlineCommentVisible": true
+            }
+          },
+          "tools": {
+            "gitPath": "/usr/bin/git",
+            "ghPath": "/usr/bin/gh",
+            "osascriptPath": "/usr/bin/osascript"
+          },
+          "daemon": {
+            "mode": "foreground",
+            "restartPolicy": "on-failure",
+            "restartThrottleSeconds": 10,
+            "logDir": "<tmp-root>/logs",
+            "workingDirectory": "<tmp-root>",
+            "environment": {},
+            "worktreeCleanup": {
+              "enabled": true,
+              "interval": "24h",
+              "retentionDays": 7,
+              "maxPerTick": 10,
+              "includeOrphans": true,
+              "dryRun": false
+            }
+          },
+          "package": {
+            "distribution": "github-release",
+            "autoUpgradeEnabled": true,
+            "autoMigrateOnStartup": true,
+            "requireBackupBeforeMigrate": false
+          },
+          "defaults": {
+            "baseBranch": "main",
+            "allowAutoCommit": true,
+            "allowAutoPush": true,
+            "allowAutoApprove": true,
+            "allowAutoMerge": false,
+            "allowRiskyFixes": false,
+            "fixAllPullRequests": false,
+            "openPrStrategy": "all_done",
+            "addSnapshotMode": "async"
+          },
+          "instructions": {
+            "enabled": true,
+            "maxBytes": 8192
+          },
+          "hitl": {
+            "enabled": false
+          },
+          "roles": {
+            "coding": {
+              "fixer": {
+                "discovery": {
+                  "enabled": true,
+                  "source": "pull_request",
+                  "labels": null,
+                  "labelMode": "all",
+                  "authorFilter": "current_user"
+                },
+                "priority": 40
+              },
+              "gatekeeper": {
+                "discovery": {
+                  "enabled": true,
+                  "source": "pull_request",
+                  "labels": [],
+                  "labelMode": "all",
+                  "includeDrafts": true
+                },
+                "priority": 45
+              },
+              "planner": {
+                "discovery": {
+                  "enabled": true,
+                  "source": "issue",
+                  "labels": [
+                    "looper:plan"
+                  ],
+                  "labelMode": "all",
+                  "requireAssigneeCurrentUser": true
+                },
+                "priority": 10
+              },
+              "reviewer": {
+                "discovery": {
+                  "enabled": true,
+                  "source": "pull_request",
+                  "labels": null,
+                  "labelMode": "all",
+                  "requireReviewRequest": true
+                },
+                "priority": 30
+              },
+              "worker": {
+                "discovery": {
+                  "enabled": true,
+                  "source": "issue",
+                  "labels": [
+                    "looper:worker-ready"
+                  ],
+                  "labelMode": "all",
+                  "requireAssigneeCurrentUser": true
+                },
+                "priority": 50
+              }
+            },
+            "planner": {
+              "autoDiscovery": true,
+              "triggers": {
+                "labels": [
+                  "looper:plan"
+                ],
+                "labelMode": "all",
+                "requireAssigneeCurrentUser": true
+              }
+            },
+            "reviewer": {
+              "discovery": {
+                "autoDiscovery": true,
+                "triggers": {
+                  "includeDrafts": false,
+                  "requireReviewRequest": true,
+                  "labels": [],
+                  "labelMode": "all"
+                },
+                "specReview": {
+                  "includeReviewingLabel": true,
+                  "reviewingLabel": "looper:spec-reviewing"
+                }
+              },
+              "behavior": {
+                "loop": {
+                  "enabledByDefault": true,
+                  "quietPeriodSeconds": 60,
+                  "minPublishIntervalSeconds": 300,
+                  "maxIterationsPerPR": 20,
+                  "maxIterationsPerHead": 1,
+                  "maxWallClockSeconds": 0,
+                  "maxConsecutiveFailures": 3,
+                  "maxAgentExecutionsPerPR": 25,
+                  "stopOnApproved": false,
+                  "stopOnReadyLabel": true,
+                  "stopOnIdenticalOutput": true
+                },
+                "retry": {
+                  "enhancedTransientClassification": false,
+                  "extraTransientErrorPatterns": [],
+                  "recoverExistingMatchedFailures": false,
+                  "autoRecoveryMaxAttempts": 3,
+                  "maxDelayMs": 300000
+                },
+                "scope": "changed_ranges",
+                "publishMode": "single_review",
+                "reviewEvents": {
+                  "clean": "APPROVE",
+                  "blocking": "REQUEST_CHANGES"
+                },
+                "detectDuplicateFindings": true,
+                "nativeResume": {
+                  "onHeadChange": false,
+                  "reReviewPromptOnHeadChange": false
+                },
+                "threadResolution": {
+                  "enabled": false,
+                  "mode": "report_only",
+                  "scope": "looper_authored_only",
+                  "autoResolve": "objective_only",
+                  "requireAuditComment": true,
+                  "requireNewHeadSinceThread": true,
+                  "requireCurrentReviewRequest": true,
+                  "maxThreadsPerRun": 10
+                }
+              },
+              "autoMerge": {
+                "enabled": false,
+                "strategy": "squash",
+                "requireBranchProtection": true,
+                "transientRetries": 3,
+                "scope": "looper-only"
+              }
+            },
+            "fixer": {
+              "autoDiscovery": true,
+              "triggers": {
+                "includeDrafts": false,
+                "authorFilter": "current_user",
+                "labels": [],
+                "labelMode": "all"
+              }
+            },
+            "worker": {
+              "autoDiscovery": true,
+              "triggers": {
+                "labels": [
+                  "looper:worker-ready"
+                ],
+                "labelMode": "all",
+                "requireAssigneeCurrentUser": true
+              }
+            },
+            "coordinator": {
+              "enabled": false,
+              "pollInterval": "5m",
+              "triage": {
+                "triagedLabel": "triaged",
+                "maxIssueAgeDays": 7,
+                "maxPerTick": 5,
+                "disposition": {
+                  "outOfScopeLabel": "wontfix",
+                  "unclearLabel": "needs-info",
+                  "reTriageOnAuthorReply": true
+                }
+              },
+              "dispatch": {
+                "mode": "human-gated",
+                "humanGate": {
+                  "slashCommands": [
+                    "/plan",
+                    "/implement"
+                  ],
+                  "allowedUsers": []
+                },
+                "autonomous": {
+                  "delayMinutes": 30,
+                  "holdLabel": "looper:hold"
+                },
+                "assignTo": ""
+              },
+              "dependencies": {
+                "enabled": false,
+                "apiTimeoutSeconds": 10,
+                "apiRetryAttempts": 3
+              },
+              "mergeWatch": {
+                "transientRetries": 3,
+                "maxIndeterminateDuration": "15m"
+              }
+            }
+          },
+          "providers": [],
+          "projects": [],
+          "metadata": {
+            "configPath": "",
+            "format": "",
+            "filePresent": false,
+            "revision": "",
+            "rejectedPaths": [],
+            "fields": {}
+          }
+        },
+        "requestId": "fixture-request-id"
+      }
     },
     {
       "id": "events.list",
