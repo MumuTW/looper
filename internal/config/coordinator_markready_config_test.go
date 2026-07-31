@@ -25,6 +25,36 @@ func TestProjectRoleConfigsMergesCoordinatorMarkReadyOverride(t *testing.T) {
 	}
 }
 
+// Publishing a draft only starts a review if something will claim it. In the
+// default single-daemon shape nothing will: the reviewer refuses Pull Requests
+// authored by the account it runs as, and GitHub cannot request review from a
+// Pull Request's own author.
+func TestMarkReadyReviewerUnreachableProjects(t *testing.T) {
+	base, err := DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	base.Projects = []ProjectRefConfig{{ID: "demo"}}
+	base.Roles.Coordinator.MarkReady = CoordinatorMarkReadyConfig{Enabled: true, Scope: CoordinatorMarkReadyScopeLooperOnly}
+
+	if got := MarkReadyReviewerUnreachableProjects(base); len(got) != 1 || got[0] != "demo" {
+		t.Fatalf("unreachable projects = %#v, want [demo] under the default reviewer config", got)
+	}
+
+	selfReviewing := base
+	selfReviewing.Roles.Reviewer.Discovery.Triggers.EnableSelfReview = true
+	selfReviewing.Roles.Coding = CodingRolesFromLegacy(selfReviewing.Roles)
+	if got := MarkReadyReviewerUnreachableProjects(selfReviewing); len(got) != 0 {
+		t.Fatalf("unreachable projects = %#v, want none once the reviewer reviews its own pull requests", got)
+	}
+
+	disabled := base
+	disabled.Roles.Coordinator.MarkReady.Enabled = false
+	if got := MarkReadyReviewerUnreachableProjects(disabled); len(got) != 0 {
+		t.Fatalf("unreachable projects = %#v, want none while mark-ready is off", got)
+	}
+}
+
 func TestCoordinatorMarkReadyRejectsForeignScope(t *testing.T) {
 	cfg, err := DefaultConfig(t.TempDir())
 	if err != nil {

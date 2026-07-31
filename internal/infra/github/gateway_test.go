@@ -2770,6 +2770,50 @@ func TestGatewayListPullRequestCommitsReportsAuthorLogins(t *testing.T) {
 	}
 }
 
+func TestGatewayListPullRequestDraftEventsKeepsOnlyLifecycleEvents(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		if args != "api --paginate --slurp repos/acme/looper/issues/42/timeline -H Accept: application/vnd.github+json" {
+			t.Fatalf("unexpected gh args: %q", args)
+		}
+		return shell.Result{Stdout: `[[{"event":"commented","actor":{"login":"octo"}},{"event":"ready_for_review","actor":{"login":"looper"},"created_at":"2026-05-14T12:00:00Z"},{"event":"convert_to_draft","actor":{"login":"octo"},"created_at":"2026-05-14T12:05:00Z"}]]`}, nil
+	}
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	events, err := gateway.ListPullRequestDraftEvents(context.Background(), PullRequestDraftEventsInput{Repo: "acme/looper", PRNumber: 42})
+	if err != nil {
+		t.Fatalf("ListPullRequestDraftEvents() error = %v", err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("events = %#v, want the two draft-lifecycle events", events)
+	}
+	if events[0].Event != DraftEventReadyForReview || events[0].Actor != "looper" || events[0].CreatedAt != "2026-05-14T12:00:00Z" {
+		t.Fatalf("events[0] = %#v, want the daemon's publish", events[0])
+	}
+	if events[1].Event != DraftEventConvertToDraft || events[1].Actor != "octo" {
+		t.Fatalf("events[1] = %#v, want octo's conversion back to draft", events[1])
+	}
+}
+
+// The mark-ready lane compares the Pull Request's own author against the
+// account the daemon runs as, so this read has to carry it.
+func TestGatewayViewPullRequestMergeWatchReportsAuthor(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		return shell.Result{Stdout: `{"number":42,"state":"open","draft":true,"user":{"login":"looper"},"head":{"sha":"abc123","ref":"feat/x"},"base":{"ref":"main"}}`}, nil
+	}
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	detail, err := gateway.ViewPullRequestMergeWatch(context.Background(), ViewPullRequestInput{Repo: "acme/looper", PRNumber: 42})
+	if err != nil {
+		t.Fatalf("ViewPullRequestMergeWatch() error = %v", err)
+	}
+	if detail.Author != "looper" {
+		t.Fatalf("Author = %q, want looper", detail.Author)
+	}
+}
+
 func TestGatewayCloseIssueRejectsUnknownStateReason(t *testing.T) {
 	t.Parallel()
 	runner := &fakeGHRunner{t: t}

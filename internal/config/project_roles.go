@@ -198,3 +198,32 @@ func AnyProjectRoleAutoDiscoveryEnabled(cfg Config, role string) bool {
 	}
 	return false
 }
+
+// MarkReadyReviewerUnreachableProjects names the projects where coordinator
+// mark-ready is enabled but the local reviewer can never claim what it
+// publishes.
+//
+// Taking a draft out of draft emits ready_for_review, which wakes the reviewer
+// lane — but the reviewer rejects a Pull Request authored by the account it
+// runs as unless enableSelfReview is set, and GitHub will not let anyone
+// request review from a Pull Request's own author. So in a single-daemon
+// configuration with the default enableSelfReview = false, mark-ready publishes
+// drafts that nothing then reviews. The repair is either a distinct reviewer
+// identity (a routed reviewer runs under its own login and is unaffected) or
+// enableSelfReview, and neither is something to change silently on the
+// operator's behalf.
+func MarkReadyReviewerUnreachableProjects(cfg Config) []string {
+	unreachable := []string(nil)
+	for _, project := range cfg.Projects {
+		roles := ProjectRoleConfigs(cfg, project.ID)
+		if !roles.Coordinator.MarkReady.Enabled {
+			continue
+		}
+		reviewer, ok := ProjectCodingRoleConfig(cfg, project.ID, CodingRoleReviewer)
+		if !ok || reviewer.Discovery.EnableSelfReview {
+			continue
+		}
+		unreachable = append(unreachable, project.ID)
+	}
+	return unreachable
+}

@@ -1545,7 +1545,7 @@ func newCoordinatorFixture(t *testing.T, configure ...func(*config.Config)) coor
 	for _, fn := range configure {
 		fn(&cfg)
 	}
-	github := &stubCoordinatorGitHub{details: map[int64]githubinfra.IssueDetail{}, comments: map[int64][][]githubinfra.CommentInfo{}, timeline: map[int64][]map[string]any{}, blockedBy: map[int64][]githubinfra.DependencyIssue{}, subIssues: map[int64][]githubinfra.DependencyIssue{}, linkedPullRequests: map[int64][]githubinfra.LinkedPullRequest{}, pullRequests: map[int64]githubinfra.PullRequestDetail{}, subIssueErr: map[int64]error{}, prDetails: map[int64]githubinfra.PullRequestDetail{}, prCheckRuns: map[string]githubinfra.PullRequestCheckRuns{}, branchProtection: map[string]githubinfra.BranchProtection{}, prCommits: map[int64][]githubinfra.PullRequestCommit{}, failPRCommits: map[int64]error{}, failMarkReady: map[int64]error{}}
+	github := &stubCoordinatorGitHub{details: map[int64]githubinfra.IssueDetail{}, comments: map[int64][][]githubinfra.CommentInfo{}, timeline: map[int64][]map[string]any{}, blockedBy: map[int64][]githubinfra.DependencyIssue{}, subIssues: map[int64][]githubinfra.DependencyIssue{}, linkedPullRequests: map[int64][]githubinfra.LinkedPullRequest{}, pullRequests: map[int64]githubinfra.PullRequestDetail{}, subIssueErr: map[int64]error{}, prDetails: map[int64]githubinfra.PullRequestDetail{}, prCheckRuns: map[string]githubinfra.PullRequestCheckRuns{}, branchProtection: map[string]githubinfra.BranchProtection{}, prDetailRevalidations: map[int64]githubinfra.PullRequestDetail{}, prDetailReads: map[int64]int{}, prCommits: map[int64][]githubinfra.PullRequestCommit{}, failPRCommits: map[int64]error{}, prDraftEvents: map[int64][]githubinfra.PullRequestDraftEvent{}, failPRDraftEvents: map[int64]error{}, failMarkReady: map[int64]error{}}
 	network := &stubCoordinatorNetwork{}
 	runner := New(Options{Repos: repos, GitHub: github, Config: &cfg, Now: func() time.Time { return now }, TriageLLM: stubCoordinatorLLM{}, Inspector: stubCoordinatorInspector{}, Network: network})
 	return coordinatorFixture{runner: runner, github: github, network: network, cfg: &cfg, projectID: projectID, now: now, coord: coord}
@@ -1610,6 +1610,8 @@ type stubCoordinatorGitHub struct {
 	removedLabels            []githubinfra.IssueLabelsInput
 	assigned                 []githubinfra.IssueAssigneesInput
 	prDetails                map[int64]githubinfra.PullRequestDetail
+	prDetailRevalidations    map[int64]githubinfra.PullRequestDetail
+	prDetailReads            map[int64]int
 	failPRDetails            map[int64][]error
 	prCheckRuns              map[string]githubinfra.PullRequestCheckRuns
 	failPRCheckRuns          map[string]error
@@ -1617,6 +1619,8 @@ type stubCoordinatorGitHub struct {
 	failBranchProtection     map[string]error
 	prCommits                map[int64][]githubinfra.PullRequestCommit
 	failPRCommits            map[int64]error
+	prDraftEvents            map[int64][]githubinfra.PullRequestDraftEvent
+	failPRDraftEvents        map[int64]error
 	failMarkReady            map[int64]error
 	markedReady              []githubinfra.MarkPullRequestReadyInput
 	addedPRLabels            []githubinfra.PullRequestLabelsInput
@@ -1635,10 +1639,27 @@ func (s *stubCoordinatorGitHub) ListOpenIssues(_ context.Context, input githubin
 	}
 	return append([]githubinfra.IssueSummary(nil), s.issues...), nil
 }
+
+// ListOpenPullRequests projects both Pull Request maps, so a fixture that
+// registers a PR only for the merge-watch reads is still listed as open. The
+// forge makes no such distinction, and a lane that prefilters on this listing
+// would otherwise see an empty repository.
 func (s *stubCoordinatorGitHub) ListOpenPullRequests(context.Context, githubinfra.ListOpenPullRequestsInput) ([]githubinfra.PullRequestSummary, error) {
-	result := make([]githubinfra.PullRequestSummary, 0, len(s.pullRequests))
+	result := make([]githubinfra.PullRequestSummary, 0, len(s.pullRequests)+len(s.prDetails))
+	summarize := func(detail githubinfra.PullRequestDetail) githubinfra.PullRequestSummary {
+		return githubinfra.PullRequestSummary{Number: detail.Number, State: detail.State, Labels: append([]string(nil), detail.Labels...), Author: detail.Author, ReviewRequests: append([]string(nil), detail.ReviewRequests...), ReviewRequestUsers: append([]githubinfra.GitHubUser(nil), detail.ReviewRequestUsers...), IsDraft: detail.IsDraft}
+	}
 	for _, detail := range s.pullRequests {
-		result = append(result, githubinfra.PullRequestSummary{Number: detail.Number, State: detail.State, Labels: append([]string(nil), detail.Labels...), Author: detail.Author, ReviewRequests: append([]string(nil), detail.ReviewRequests...), ReviewRequestUsers: append([]githubinfra.GitHubUser(nil), detail.ReviewRequestUsers...), IsDraft: detail.IsDraft})
+		result = append(result, summarize(detail))
+	}
+	for number, detail := range s.prDetails {
+		if _, ok := s.pullRequests[number]; ok {
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSpace(detail.State), "open") {
+			continue
+		}
+		result = append(result, summarize(detail))
 	}
 	return result, nil
 }
@@ -1780,6 +1801,10 @@ func (s *stubCoordinatorGitHub) RemovePullRequestLabels(_ context.Context, input
 	s.removedPRLabels = append(s.removedPRLabels, input)
 	return nil
 }
+
+// ViewPullRequestMergeWatch serves prDetailRevalidations from the second read
+// of a Pull Request onwards, which is how a test says "this changed between the
+// evidence and the mutation" without racing a real forge.
 func (s *stubCoordinatorGitHub) ViewPullRequestMergeWatch(_ context.Context, input githubinfra.ViewPullRequestInput) (githubinfra.PullRequestDetail, error) {
 	if failures := s.failPRDetails[input.PRNumber]; len(failures) > 0 {
 		err := failures[0]
@@ -1790,6 +1815,13 @@ func (s *stubCoordinatorGitHub) ViewPullRequestMergeWatch(_ context.Context, inp
 	}
 	if s.prDetails == nil {
 		return githubinfra.PullRequestDetail{}, nil
+	}
+	if s.prDetailReads == nil {
+		s.prDetailReads = map[int64]int{}
+	}
+	s.prDetailReads[input.PRNumber]++
+	if revalidated, ok := s.prDetailRevalidations[input.PRNumber]; ok && s.prDetailReads[input.PRNumber] > 1 {
+		return revalidated, nil
 	}
 	return s.prDetails[input.PRNumber], nil
 }
@@ -1807,6 +1839,12 @@ func (s *stubCoordinatorGitHub) ListPullRequestCommits(_ context.Context, input 
 		return nil, err
 	}
 	return append([]githubinfra.PullRequestCommit(nil), s.prCommits[input.PRNumber]...), nil
+}
+func (s *stubCoordinatorGitHub) ListPullRequestDraftEvents(_ context.Context, input githubinfra.PullRequestDraftEventsInput) ([]githubinfra.PullRequestDraftEvent, error) {
+	if err := s.failPRDraftEvents[input.PRNumber]; err != nil {
+		return nil, err
+	}
+	return append([]githubinfra.PullRequestDraftEvent(nil), s.prDraftEvents[input.PRNumber]...), nil
 }
 func (s *stubCoordinatorGitHub) MarkPullRequestReady(_ context.Context, input githubinfra.MarkPullRequestReadyInput) error {
 	if err := s.failMarkReady[input.PRNumber]; err != nil {

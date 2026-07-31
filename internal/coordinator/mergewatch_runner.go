@@ -39,13 +39,14 @@ func (r *Runner) applyMergeWatch(ctx context.Context, repo, cwd string, loaded [
 	if err != nil {
 		return nil, err
 	}
+	markReadyDrafts := r.markReadyCandidates(ctx, repo, cwd, roles)
 	for _, issue := range loaded {
 		if !issueHasCoordinatorTracking(issue.detail.Labels, roles.Coordinator.Triage.TriagedLabel) {
 			continue
 		}
 		lock := r.watchLock(repo, issue.detail.Number)
 		lock.Lock()
-		r.applyMarkReady(ctx, repo, cwd, issue, roles, currentLogin)
+		r.applyMarkReady(ctx, repo, cwd, issue, currentLogin, markReadyDrafts)
 		removed, applyErr := r.applyMergeWatchLocked(ctx, repo, cwd, issue, roles, currentLogin, budget)
 		lock.Unlock()
 		if applyErr != nil {
@@ -189,7 +190,7 @@ func (r *Runner) mergeWatchSnapshot(ctx context.Context, repo, cwd string, issue
 		}
 		return mergewatch.PRSnapshot{}, nil, err
 	}
-	checks := summarizeRequiredChecks(requiredCheckSet(protection.RequiredChecks), checkRuns, mergeableState.IsUnstable())
+	checks := summarizeRequiredChecks(requiredCheckRulesFor(protection), checkRuns, mergeableState.IsUnstable())
 	open := strings.EqualFold(detail.State, "open")
 	return mergewatch.PRSnapshot{
 		Repo:                   repo,
@@ -207,12 +208,85 @@ func (r *Runner) mergeWatchSnapshot(ctx context.Context, repo, cwd string, issue
 	}, nil, nil
 }
 
-func requiredCheckSet(names []string) map[string]struct{} {
-	required := make(map[string]struct{}, len(names))
-	for _, name := range names {
-		if key := strings.ToLower(strings.TrimSpace(name)); key != "" {
-			required[key] = struct{}{}
+// requiredCheckRules is the set of checks that must be green, with GitHub's
+// optional App binding preserved.
+//
+// Branch protection can bind a required context to one GitHub App, and the
+// context alone does not identify it: any App may publish a check run named
+// "verify", so reducing the rules to their names lets a green check from the
+// wrong App satisfy a gate whose actual check never ran. The gatekeeper already
+// matches on the pair; this is the same matching for the merge-watch lanes.
+type requiredCheckRules struct {
+	rules []githubinfra.RequiredCheckRule
+	seen  map[string]struct{}
+}
+
+func (r *requiredCheckRules) add(context string, appID int64) {
+	key := strings.ToLower(strings.TrimSpace(context))
+	if key == "" {
+		return
+	}
+	if r.seen == nil {
+		r.seen = map[string]struct{}{}
+	}
+	identity := fmt.Sprintf("%s\x00%d", key, appID)
+	if _, ok := r.seen[identity]; ok {
+		return
+	}
+	r.seen[identity] = struct{}{}
+	r.rules = append(r.rules, githubinfra.RequiredCheckRule{Context: key, AppID: appID})
+}
+
+func (r requiredCheckRules) len() int { return len(r.rules) }
+
+// matchCheckRun names the rules a check run satisfies. An unbound rule accepts
+// any App's run of that name, which is what "no App binding" means.
+func (r requiredCheckRules) matchCheckRun(name string, appID int64) []int {
+	key := strings.ToLower(strings.TrimSpace(name))
+	matched := []int(nil)
+	for index, rule := range r.rules {
+		if rule.Context == key && (rule.AppID == 0 || rule.AppID == appID) {
+			matched = append(matched, index)
 		}
+	}
+	return matched
+}
+
+// matchStatus names the rules a commit status satisfies. A commit status
+// carries no App, so an App-bound rule can only ever be satisfied by a check
+// run — the same reading the gatekeeper applies.
+func (r requiredCheckRules) matchStatus(context string) []int {
+	key := strings.ToLower(strings.TrimSpace(context))
+	matched := []int(nil)
+	for index, rule := range r.rules {
+		if rule.Context == key && rule.AppID == 0 {
+			matched = append(matched, index)
+		}
+	}
+	return matched
+}
+
+func (r requiredCheckRules) subject(index int) string {
+	rule := r.rules[index]
+	if rule.AppID == 0 {
+		return rule.Context
+	}
+	return fmt.Sprintf("%s (app %d)", rule.Context, rule.AppID)
+}
+
+// requiredCheckRulesFor reads branch protection's required checks, preferring
+// the App-bound rules and falling back to the plain context list only when the
+// forge reported no rules at all.
+func requiredCheckRulesFor(protection githubinfra.BranchProtection) requiredCheckRules {
+	required := requiredCheckRules{}
+	for _, rule := range protection.RequiredCheckRules {
+		required.add(rule.Context, rule.AppID)
+	}
+	if required.len() > 0 {
+		return required
+	}
+	for _, name := range protection.RequiredChecks {
+		required.add(name, 0)
 	}
 	return required
 }
@@ -228,35 +302,45 @@ func requiredCheckSet(names []string) map[string]struct{} {
 // conclusions directly. Reading them directly can only add blockers, never
 // remove one, which is the safe direction for a guard whose failure mode is
 // leaving the draft alone.
-func summarizeRequiredChecks(required map[string]struct{}, checkRuns githubinfra.PullRequestCheckRuns, countFailures bool) mergewatch.RequiredCheckSummary {
+func summarizeRequiredChecks(required requiredCheckRules, checkRuns githubinfra.PullRequestCheckRuns, countFailures bool) mergewatch.RequiredCheckSummary {
 	checks := mergewatch.RequiredCheckSummary{}
-	seenChecks := map[string]struct{}{}
+	satisfied := make([]bool, required.len())
 	for _, checkRun := range checkRuns.CheckRuns {
+		matched := required.matchCheckRun(checkRun.Name, checkRun.AppID)
+		if len(matched) == 0 {
+			continue
+		}
+		for _, index := range matched {
+			satisfied[index] = true
+		}
 		status := strings.ToLower(strings.TrimSpace(checkRun.Status))
 		conclusion := strings.ToLower(strings.TrimSpace(checkRun.Conclusion))
-		nameKey := strings.ToLower(strings.TrimSpace(checkRun.Name))
-		seenChecks[nameKey] = struct{}{}
 		switch {
-		case status != "completed" && requiredCheck(required, nameKey):
+		case status != "completed":
 			checks.Pending = append(checks.Pending, checkRun.Name)
-		case countFailures && requiredCheck(required, nameKey) && failedCheckRunConclusion(conclusion):
+		case countFailures && failedCheckRunConclusion(conclusion):
 			checks.Failed = append(checks.Failed, checkRun.Name)
 		}
 	}
 	for _, status := range checkRuns.Statuses {
-		contextKey := strings.ToLower(strings.TrimSpace(status.Context))
+		matched := required.matchStatus(status.Context)
+		if len(matched) == 0 {
+			continue
+		}
+		for _, index := range matched {
+			satisfied[index] = true
+		}
 		state := strings.ToLower(strings.TrimSpace(status.State))
-		seenChecks[contextKey] = struct{}{}
 		switch {
-		case requiredCheck(required, contextKey) && state == "pending":
+		case state == "pending":
 			checks.Pending = append(checks.Pending, status.Context)
-		case countFailures && requiredCheck(required, contextKey) && (state == "failure" || state == "error"):
+		case countFailures && (state == "failure" || state == "error"):
 			checks.Failed = append(checks.Failed, status.Context)
 		}
 	}
-	for requiredName := range required {
-		if _, ok := seenChecks[requiredName]; !ok {
-			checks.Missing = append(checks.Missing, requiredName)
+	for index := range required.rules {
+		if !satisfied[index] {
+			checks.Missing = append(checks.Missing, required.subject(index))
 		}
 	}
 	return checks
@@ -488,14 +572,6 @@ func prLinksIssue(repo string, issueNumber int64, body string) bool {
 		}
 	}
 	return false
-}
-
-func requiredCheck(required map[string]struct{}, name string) bool {
-	if len(required) == 0 {
-		return false
-	}
-	_, ok := required[name]
-	return ok
 }
 
 func issueHasCoordinatorTracking(labels []string, triagedLabel string) bool {

@@ -461,6 +461,33 @@ type ListPullRequestCommitsInput struct {
 	CWD      string
 }
 
+type PullRequestDraftEventsInput struct {
+	Repo     string
+	PRNumber int64
+	CWD      string
+}
+
+// PullRequestDraftEvent is one draft-lifecycle event on a Pull Request's
+// timeline: who took it out of draft, or who put it back, and when.
+//
+// It is the only durable record of that distinction. A draft the machine
+// opened and a published Pull Request a human converted back to draft look
+// identical on the Pull Request itself; only the timeline says which one is in
+// front of you, and it says so across daemon restarts.
+type PullRequestDraftEvent struct {
+	Event     string
+	Actor     string
+	CreatedAt string
+}
+
+const (
+	// DraftEventConvertToDraft and DraftEventReadyForReview are GitHub's own
+	// names for the two timeline events that move a Pull Request across the
+	// draft boundary.
+	DraftEventConvertToDraft = "convert_to_draft"
+	DraftEventReadyForReview = "ready_for_review"
+)
+
 // PullRequestCommit is one commit on a Pull Request branch together with the
 // forge accounts GitHub attributes it to. Authors is what makes a commit
 // attributable: a commit whose author email matches no account resolves to an
@@ -1782,6 +1809,7 @@ func (g *Gateway) ViewPullRequestMergeWatch(ctx context.Context, input ViewPullR
 		UpdatedAt:      firstNonEmpty(asString(row["updated_at"]), asString(row["updatedAt"])),
 		ClosedAt:       firstNonEmpty(asString(row["closed_at"]), asString(row["closedAt"])),
 		IsDraft:        asBool(row["draft"]),
+		Author:         extractAuthor(row["user"]),
 		MergedAt:       firstNonEmpty(asString(row["merged_at"]), asString(row["mergedAt"])),
 		Labels:         extractLabelNames(row["labels"]),
 		HeadRefName:    nestedString(row, "head", "ref"),
@@ -1978,9 +2006,10 @@ func (g *Gateway) MergePullRequest(ctx context.Context, input EnableAutoMergeInp
 // "Ready for review" between the caller's decision and this call makes gh fail
 // with a "not a draft" error, which is the outcome the caller wanted, not a
 // failure. Only a PR that is still a draft after a failed attempt is reported
-// as an error. Deliberately no --match-head-commit equivalent exists for this
-// mutation: unlike a merge, publishing a draft applies to the pull request
-// rather than to a commit, so a push landing in between does not invalidate it.
+// as an error. GitHub offers no --match-head-commit equivalent for this
+// mutation, so the caller — not the gateway — is responsible for re-reading the
+// Pull Request immediately beforehand and confirming the head its evidence was
+// gathered against is still the head being published.
 func (g *Gateway) MarkPullRequestReady(ctx context.Context, input MarkPullRequestReadyInput) error {
 	_, err := g.runGh(ctx, input.CWD, "", "pr", "ready", strconv.FormatInt(input.PRNumber, 10), "--repo", input.Repo)
 	if err == nil {
@@ -2015,6 +2044,44 @@ func (g *Gateway) ListPullRequestCommits(ctx context.Context, input ListPullRequ
 			}
 		}
 		out = append(out, commit)
+	}
+	return out, nil
+}
+
+// ListPullRequestDraftEvents returns a Pull Request's convert_to_draft and
+// ready_for_review timeline events, oldest first, each with the account that
+// performed it.
+//
+// A Pull Request is an Issue to this endpoint, which is why it reads the same
+// path ListIssueTimeline does with the Pull Request number. Everything that is
+// not a draft-lifecycle event is dropped here rather than by the caller: the
+// timeline of a long-lived Pull Request is mostly commits and comments, and
+// this is the only question the gateway is being asked.
+func (g *Gateway) ListPullRequestDraftEvents(ctx context.Context, input PullRequestDraftEventsInput) ([]PullRequestDraftEvent, error) {
+	hostname, repo := splitRepoHostname(input.Repo)
+	args := []string{"api", "--paginate", "--slurp", fmt.Sprintf("repos/%s/issues/%d/timeline", repo, input.PRNumber), "-H", "Accept: application/vnd.github+json"}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGh(ctx, input.CWD, "", args...)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := decodeJSONArrayOrPages(result.Stdout)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]PullRequestDraftEvent, 0, 4)
+	for _, row := range rows {
+		event := strings.ToLower(strings.TrimSpace(asString(row["event"])))
+		if event != DraftEventConvertToDraft && event != DraftEventReadyForReview {
+			continue
+		}
+		out = append(out, PullRequestDraftEvent{
+			Event:     event,
+			Actor:     extractAuthor(row["actor"]),
+			CreatedAt: firstNonEmpty(asString(row["created_at"]), asString(row["createdAt"])),
+		})
 	}
 	return out, nil
 }

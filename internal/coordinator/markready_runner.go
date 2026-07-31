@@ -10,6 +10,47 @@ import (
 	"github.com/MumuTW/looper/internal/labels"
 )
 
+// markReadyOpenPullRequestLimit caps the per-tick open-Pull-Request listing.
+// Beyond it a draft is simply not considered this tick, which is the same
+// direction every other guard in this lane fails: leave the draft alone.
+const markReadyOpenPullRequestLimit = 100
+
+// markReadyCandidates lists the repository's open drafts once per tick.
+//
+// Without it the lane spends a Pull Request read on every reference an Issue
+// has ever accumulated, on every tick, forever — a merged Pull Request from six
+// months ago re-read 288 times a day to be told it is not a draft. An open
+// draft is the only thing this lane can act on, so everything else is dropped
+// by one listing rather than by N detail reads.
+//
+// A nil result means "consider nothing": the lane is disabled, or the listing
+// failed and the lane has no idea what is open. Both leave every draft alone.
+func (r *Runner) markReadyCandidates(ctx context.Context, repo, cwd string, roles config.RoleConfigs) map[int64]struct{} {
+	cfg := roles.Coordinator.MarkReady
+	if !cfg.Enabled || r.github == nil {
+		return nil
+	}
+	// Fail closed on an unknown scope. Validation rejects any other value, so
+	// reaching this branch means the config was assembled without it.
+	if cfg.Scope != config.CoordinatorMarkReadyScopeLooperOnly {
+		return nil
+	}
+	summaries, err := r.github.ListOpenPullRequests(ctx, githubinfra.ListOpenPullRequestsInput{Repo: repo, CWD: cwd, Limit: markReadyOpenPullRequestLimit})
+	if err != nil {
+		if r.logger != nil {
+			r.logger.Warn("coordinator mark-ready skipped after forge error", map[string]any{"repo": repo, "action": "list open pull requests", "error": err.Error()})
+		}
+		return nil
+	}
+	candidates := map[int64]struct{}{}
+	for _, summary := range summaries {
+		if summary.Number > 0 && summary.IsDraft {
+			candidates[summary.Number] = struct{}{}
+		}
+	}
+	return candidates
+}
+
 // applyMarkReady publishes looper-authored drafts whose CI has gone green.
 //
 // It runs inside the merge-watch lane because that lane already holds the
@@ -22,17 +63,14 @@ import (
 // on top of a pipeline that works without it, so a forge hiccup leaves the
 // draft alone and the next tick tries again rather than aborting discovery and
 // stalling triage and dispatch behind an optional lane.
-func (r *Runner) applyMarkReady(ctx context.Context, repo, cwd string, issue loadedIssue, roles config.RoleConfigs, currentLogin string) {
-	cfg := roles.Coordinator.MarkReady
-	if !cfg.Enabled || r.github == nil {
-		return
-	}
-	// Fail closed on an unknown scope. Validation rejects any other value, so
-	// reaching this branch means the config was assembled without it.
-	if cfg.Scope != config.CoordinatorMarkReadyScopeLooperOnly {
+func (r *Runner) applyMarkReady(ctx context.Context, repo, cwd string, issue loadedIssue, currentLogin string, candidates map[int64]struct{}) {
+	if len(candidates) == 0 {
 		return
 	}
 	for _, prNumber := range linkedPullRequestNumbers(issue.rawTimeline) {
+		if _, ok := candidates[prNumber]; !ok {
+			continue
+		}
 		r.applyMarkReadyForPullRequest(ctx, repo, cwd, issue.detail.Number, prNumber, currentLogin)
 	}
 }
@@ -43,10 +81,21 @@ func (r *Runner) applyMarkReadyForPullRequest(ctx context.Context, repo, cwd str
 		r.logMarkReadySkip(repo, issueNumber, prNumber, "read pull request", err)
 		return
 	}
-	snapshot := markReadySnapshot(repo, issueNumber, prNumber, detail)
+	snapshot := markReadySnapshot(repo, issueNumber, prNumber, detail, currentLogin)
 	// First pass over the guards that need nothing but the Pull Request
 	// itself. A draft that already fails one of those is left alone without
-	// spending the check-run, branch-protection, and commit reads below.
+	// spending the timeline, check-run, branch-protection, and commit reads
+	// below.
+	if decision := mergewatch.DecideMarkReady(snapshot); !decision.MarkReady {
+		r.logMarkReadyBlocked(repo, issueNumber, prNumber, decision.Blocker)
+		return
+	}
+	draftEvents, err := r.github.ListPullRequestDraftEvents(ctx, githubinfra.PullRequestDraftEventsInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
+	if err != nil {
+		r.logMarkReadySkip(repo, issueNumber, prNumber, "read draft history", err)
+		return
+	}
+	snapshot.HumanConvertedToDraft = mergewatch.HumanConvertedToDraft(markReadyDraftEvents(draftEvents), currentLogin)
 	if decision := mergewatch.DecideMarkReady(snapshot); !decision.MarkReady {
 		r.logMarkReadyBlocked(repo, issueNumber, prNumber, decision.Blocker)
 		return
@@ -61,15 +110,37 @@ func (r *Runner) applyMarkReadyForPullRequest(ctx context.Context, repo, cwd str
 		r.logMarkReadySkip(repo, issueNumber, prNumber, "read branch protection", err)
 		return
 	}
-	snapshot.RequiredChecks = summarizeRequiredChecks(markReadyRequiredCheckSet(protection, checkRuns), checkRuns, true)
+	required, known := markReadyRequiredChecks(protection, checkRuns)
+	snapshot.ChecksUnknown = !known
+	snapshot.RequiredChecks = summarizeRequiredChecks(required, checkRuns, true)
+	if decision := mergewatch.DecideMarkReady(snapshot); !decision.MarkReady {
+		r.logMarkReadyBlocked(repo, issueNumber, prNumber, decision.Blocker)
+		return
+	}
 	commits, err := r.github.ListPullRequestCommits(ctx, githubinfra.ListPullRequestCommitsInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
 	if err != nil {
 		r.logMarkReadySkip(repo, issueNumber, prNumber, "read branch commits", err)
 		return
 	}
 	snapshot.ForeignCommitAuthors, snapshot.UnattributedCommits = foreignCommitAuthors(commits, currentLogin)
-	decision := mergewatch.DecideMarkReady(snapshot)
-	if !decision.MarkReady {
+	if decision := mergewatch.DecideMarkReady(snapshot); !decision.MarkReady {
+		r.logMarkReadyBlocked(repo, issueNumber, prNumber, decision.Blocker)
+		return
+	}
+	// Everything above is a statement about the moment it was read. Between the
+	// first read and this line a push can land, a hold label can appear, or a
+	// human can publish the draft themselves — none of which move any signal the
+	// evidence already collected would notice. `gh pr ready` takes no head
+	// argument, so it would apply that stale evidence to whatever the Pull
+	// Request has become. Making the evidence true again first is the only
+	// conditional mutation available.
+	confirmDetail, err := r.github.ViewPullRequestMergeWatch(ctx, githubinfra.ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
+	if err != nil {
+		r.logMarkReadySkip(repo, issueNumber, prNumber, "revalidate pull request", err)
+		return
+	}
+	confirming := markReadySnapshot(repo, issueNumber, prNumber, confirmDetail, currentLogin)
+	if decision := mergewatch.ConfirmMarkReady(snapshot, confirming); !decision.MarkReady {
 		r.logMarkReadyBlocked(repo, issueNumber, prNumber, decision.Blocker)
 		return
 	}
@@ -82,43 +153,57 @@ func (r *Runner) applyMarkReadyForPullRequest(ctx context.Context, repo, cwd str
 	}
 }
 
-func markReadySnapshot(repo string, issueNumber, prNumber int64, detail githubinfra.PullRequestDetail) mergewatch.MarkReadySnapshot {
+func markReadySnapshot(repo string, issueNumber, prNumber int64, detail githubinfra.PullRequestDetail, currentLogin string) mergewatch.MarkReadySnapshot {
+	daemon := strings.ToLower(strings.TrimSpace(currentLogin))
 	return mergewatch.MarkReadySnapshot{
-		Repo:           repo,
-		PRNumber:       prNumber,
-		IssueNumber:    issueNumber,
-		HeadSHA:        detail.HeadSHA,
-		Draft:          detail.IsDraft,
-		Open:           strings.EqualFold(strings.TrimSpace(detail.State), "open") && detail.MergedAt == "",
-		InScope:        labels.AnyLooperOwned(detail.Labels) && prLinksIssue(repo, issueNumber, detail.Body),
-		Held:           labels.Has(detail.Labels, labels.HoldGlobal) || labels.Has(detail.Labels, labels.DoNotMerge),
-		Mergeable:      detail.Mergeable,
-		MergeableState: detail.MergeableState.Raw(),
+		Repo:             repo,
+		PRNumber:         prNumber,
+		IssueNumber:      issueNumber,
+		HeadSHA:          detail.HeadSHA,
+		Draft:            detail.IsDraft,
+		Open:             strings.EqualFold(strings.TrimSpace(detail.State), "open") && detail.MergedAt == "",
+		InScope:          labels.AnyLooperOwned(detail.Labels) && prLinksIssue(repo, issueNumber, detail.Body),
+		AuthoredByDaemon: daemon != "" && strings.ToLower(strings.TrimSpace(detail.Author)) == daemon,
+		Held:             labels.Has(detail.Labels, labels.HoldGlobal) || labels.Has(detail.Labels, labels.DoNotMerge),
+		Mergeable:        detail.Mergeable,
+		MergeableState:   detail.MergeableState.Raw(),
 	}
 }
 
-// markReadyRequiredCheckSet names the checks that must be green before a draft
-// is published. Branch protection is the authority whenever it names any
-// check. When it names none there is no authority to defer to, so every check
-// observed on the head counts instead: the alternative — treating "no required
-// checks" as "nothing to wait for" — would publish drafts while CI is still
-// running, which is exactly what this lane promises not to do.
-func markReadyRequiredCheckSet(protection githubinfra.BranchProtection, checkRuns githubinfra.PullRequestCheckRuns) map[string]struct{} {
-	if required := requiredCheckSet(protection.RequiredChecks); len(required) > 0 {
-		return required
+func markReadyDraftEvents(events []githubinfra.PullRequestDraftEvent) []mergewatch.MarkReadyDraftEvent {
+	out := make([]mergewatch.MarkReadyDraftEvent, 0, len(events))
+	for _, event := range events {
+		out = append(out, mergewatch.MarkReadyDraftEvent{Event: event.Event, Actor: event.Actor, CreatedAt: event.CreatedAt})
 	}
-	observed := map[string]struct{}{}
+	return out
+}
+
+// markReadyRequiredChecks names the checks that must be green before a draft is
+// published, and reports whether "green" is knowable at all.
+//
+// Branch protection is the authority whenever it names any check. When it names
+// none there is no authority to defer to, so every check observed on the head
+// counts instead: the alternative — treating "no required checks" as "nothing
+// to wait for" — would publish drafts while CI is still running, which is
+// exactly what this lane promises not to do.
+//
+// The second return value is what separates "nothing is required" from "nothing
+// is known yet". An unprotected branch whose head has not registered a single
+// check run produces an empty set either way, and a tick landing in the seconds
+// before a workflow appears would read that emptiness as success. It is not
+// evidence of anything, so it is reported as unknown and the draft waits.
+func markReadyRequiredChecks(protection githubinfra.BranchProtection, checkRuns githubinfra.PullRequestCheckRuns) (requiredCheckRules, bool) {
+	if required := requiredCheckRulesFor(protection); required.len() > 0 {
+		return required, true
+	}
+	observed := requiredCheckRules{}
 	for _, checkRun := range checkRuns.CheckRuns {
-		if key := strings.ToLower(strings.TrimSpace(checkRun.Name)); key != "" {
-			observed[key] = struct{}{}
-		}
+		observed.add(checkRun.Name, 0)
 	}
 	for _, status := range checkRuns.Statuses {
-		if key := strings.ToLower(strings.TrimSpace(status.Context)); key != "" {
-			observed[key] = struct{}{}
-		}
+		observed.add(status.Context, 0)
 	}
-	return observed
+	return observed, observed.len() > 0
 }
 
 // foreignCommitAuthors splits a branch's commits into the logins that are not

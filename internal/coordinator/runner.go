@@ -90,6 +90,7 @@ type GitHubGateway interface {
 	ViewPullRequestMergeWatch(context.Context, githubinfra.ViewPullRequestInput) (githubinfra.PullRequestDetail, error)
 	ListPullRequestCheckRuns(context.Context, githubinfra.PullRequestCheckRunsInput) (githubinfra.PullRequestCheckRuns, error)
 	ListPullRequestCommits(context.Context, githubinfra.ListPullRequestCommitsInput) ([]githubinfra.PullRequestCommit, error)
+	ListPullRequestDraftEvents(context.Context, githubinfra.PullRequestDraftEventsInput) ([]githubinfra.PullRequestDraftEvent, error)
 	GetBranchProtection(context.Context, githubinfra.BranchProtectionInput) (githubinfra.BranchProtection, error)
 	MarkPullRequestReady(context.Context, githubinfra.MarkPullRequestReadyInput) error
 }
@@ -195,7 +196,7 @@ func New(options Options) *Runner {
 	if state == nil {
 		state = NewRuntimeState()
 	}
-	return &Runner{
+	runner := &Runner{
 		repos:      options.Repos,
 		github:     options.GitHub,
 		config:     options.Config,
@@ -206,6 +207,30 @@ func New(options Options) *Runner {
 		network:    options.Network,
 		disclosure: options.Disclosure,
 		state:      state,
+	}
+	runner.warnMarkReadyReviewerUnreachable()
+	return runner
+}
+
+// warnMarkReadyReviewerUnreachable says out loud what publishing a draft does
+// and does not achieve, once per config generation rather than once per tick.
+//
+// Publishing emits ready_for_review, and that delivery does wake the reviewer
+// lane — but a reviewer that refuses self-authored Pull Requests has nothing to
+// do when it arrives, and GitHub cannot request review from a Pull Request's
+// own author, so nothing else can make it eligible either. In that shape
+// mark-ready produces drafts that publish and then sit. The operator needs a
+// distinct reviewer identity or enableSelfReview, and should hear it at
+// startup rather than infer it from an empty review queue.
+func (r *Runner) warnMarkReadyReviewerUnreachable() {
+	if r.logger == nil || r.config == nil {
+		return
+	}
+	for _, projectID := range config.MarkReadyReviewerUnreachableProjects(*r.config) {
+		r.logger.Warn("coordinator markReady is enabled but the local reviewer will not claim looper-authored pull requests", map[string]any{
+			"project": projectID,
+			"setting": "roles.reviewer.discovery.enableSelfReview",
+		})
 	}
 }
 

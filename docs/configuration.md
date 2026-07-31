@@ -556,12 +556,26 @@ Coordinator can take a looper-authored draft PR out of draft once CI is green, s
 A draft is published only when every one of these holds. Any one failing leaves the draft exactly as it is, and the next tick looks again:
 
 - `looper-only` scope: the PR carries a `looper:` label **and** links the tracked issue with a closing reference
-- all required checks on the head are green — branch protection names them, and where it names none, every check observed on the head counts
+- the PR itself is authored by the account the daemon runs as — a maintainer's own draft over machine-written commits is theirs to publish
+- nobody has converted the PR back to draft: a `convert_to_draft` timeline event performed by anyone but the daemon is an explicit "not ready" and skips the PR for good
+- all required checks on the head are green — branch protection names them (matching the required GitHub App where protection binds one), and where it names none, every check observed on the head counts
+- at least one check is known. A head with no required checks *and* no observed checks says nothing about CI, so the draft waits rather than publishing seconds before the first workflow registers
 - GitHub reports the branch as mergeable and not conflicting
 - no `looper:hold` and no `do-not-merge` label
 - every commit on the branch is attributed to the account the daemon runs as
 
-Marking ready is idempotent: a human clicking "Ready for review" first is success, not an error. Publishing emits the `ready_for_review` webhook that already wakes the reviewer lane, so review begins on the next delivery with no extra configuration.
+Immediately before publishing, the PR is read once more and every guard above that does not depend on the head is re-evaluated, with the head compared against the one the checks and commits were read from. A push, a new hold label, or a human publishing first between the decision and the mutation leaves the draft alone; `gh pr ready` takes no head argument, so making the evidence true again is the only conditional mutation available.
+
+The lane only ever considers open drafts: it lists them once per tick and intersects that with the issue's linked PRs, so a merged or already-published reference costs nothing on later ticks.
+
+Marking ready is idempotent: a human clicking "Ready for review" first is success, not an error.
+
+**Publishing alone does not start a review.** It emits `ready_for_review`, and that delivery does wake the reviewer lane — but the reviewer refuses a PR authored by the account it runs as unless `roles.reviewer.discovery.enableSelfReview` is true, and GitHub will not let anyone request review from a PR's own author. So with the shipped defaults (`requireReviewRequest = true`, `enableSelfReview = false`) and a single daemon identity, mark-ready produces drafts that publish and then sit. Make review actually happen with one of:
+
+- a **distinct reviewer identity** — a second daemon, or a routed reviewer node, running under its own GitHub login. The PR is not self-authored from its point of view, so the default reviewer configuration applies unchanged.
+- `roles.reviewer.discovery.enableSelfReview = true`, accepting that the same account both writes and reviews.
+
+Coordinator logs a warning at startup when `markReady.enabled` is true and the effective reviewer configuration can never claim a looper-authored PR. Mark-ready does not change any reviewer default on your behalf.
 
 ## Hold labels
 
