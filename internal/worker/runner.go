@@ -32,6 +32,7 @@ import (
 	"github.com/MumuTW/looper/internal/network/protocol"
 	"github.com/MumuTW/looper/internal/networkpolicy"
 	"github.com/MumuTW/looper/internal/processcontainment"
+	"github.com/MumuTW/looper/internal/reproducer"
 	"github.com/MumuTW/looper/internal/storage"
 	"github.com/MumuTW/looper/internal/validation"
 	"github.com/MumuTW/looper/internal/worker/workflow"
@@ -634,9 +635,10 @@ type workerInput struct {
 	// IssueClaimOverride is the durable operator authority from a force=true
 	// manual issue dispatch. It follows the worker through PR creation and
 	// adoption so source-issue admission is not re-applied mid-lifecycle.
-	IssueClaimOverride   bool     `json:"issueClaimOverride,omitempty"`
-	RoutedClaimMatchMode string   `json:"routedClaimMatchMode,omitempty"`
-	Reviewers            []string `json:"reviewers,omitempty"`
+	IssueClaimOverride   bool                 `json:"issueClaimOverride,omitempty"`
+	RoutedClaimMatchMode string               `json:"routedClaimMatchMode,omitempty"`
+	Reviewers            []string             `json:"reviewers,omitempty"`
+	Reproduction         *reproducer.Manifest `json:"reproduction,omitempty"`
 }
 
 type workerCheckpoint struct {
@@ -741,6 +743,66 @@ func validateCompletedExecutionCheckpoint(execution *checkpointExecution) error 
 
 func invalidWorkerStructuredResultMessage(parseStatus string) string {
 	return fmt.Sprintf("Worker completed without a valid structured result (parse status: %s). See Looper logs for details.", firstNonEmpty(parseStatus, "missing"))
+}
+
+func reproductionFailure(err error) *loopError {
+	return &loopError{message: "Reproduction test integrity check failed: " + err.Error(), kind: FailureManualIntervention}
+}
+
+// captureWorkerReproduction records an optional manifest once the worktree is
+// prepared. A later retry must see the same manifest; silently adopting a new
+// one would let a run replace the reproduction authority after the agent ran.
+func captureWorkerReproduction(checkpoint *workerCheckpoint, worktreePath string) error {
+	if checkpoint == nil || checkpoint.Work == nil {
+		return nil
+	}
+	manifest, err := reproducer.Load(worktreePath)
+	if err != nil {
+		return reproductionFailure(err)
+	}
+	if checkpoint.Work.Reproduction != nil {
+		if manifest == nil {
+			return reproductionFailure(errors.New("reproduction manifest is missing"))
+		}
+		if !checkpoint.Work.Reproduction.Equal(*manifest) {
+			return reproductionFailure(errors.New("reproduction manifest changed during run"))
+		}
+		if err := checkpoint.Work.Reproduction.Verify(worktreePath); err != nil {
+			return reproductionFailure(err)
+		}
+		return nil
+	}
+	if manifest != nil {
+		checkpoint.Work.Reproduction = manifest
+	}
+	return nil
+}
+
+func verifyWorkerReproduction(checkpoint workerCheckpoint, worktreePath string) error {
+	if checkpoint.Work == nil || checkpoint.Work.Reproduction == nil {
+		return nil
+	}
+	if err := checkpoint.Work.Reproduction.Verify(worktreePath); err != nil {
+		return reproductionFailure(err)
+	}
+	return nil
+}
+
+func workerValidationCommands(base []string, work workerInput) []string {
+	commands := append([]string(nil), base...)
+	if work.Reproduction != nil && strings.TrimSpace(work.Reproduction.TestCommand) != "" && !containsWorkerCommand(commands, work.Reproduction.TestCommand) {
+		commands = append(commands, work.Reproduction.TestCommand)
+	}
+	return commands
+}
+
+func containsWorkerCommand(commands []string, target string) bool {
+	for _, command := range commands {
+		if command == target {
+			return true
+		}
+	}
+	return false
 }
 
 func sanitizePublicIssueClaimSummary(summary string) string {
@@ -1707,18 +1769,25 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 	if err != nil {
 		return checkpoint, err
 	}
+	if err := captureWorkerReproduction(&checkpoint, worktree.Path); err != nil {
+		return checkpoint, err
+	}
+	work = *checkpoint.Work
 	if !executionCompleted {
 		agentVendor, agentModel, _, useSnapshot, err := r.identityFromRun(input.Run)
 		if err != nil {
 			return checkpoint, fmt.Errorf("resolve run agent identity: %w", err)
 		}
-		validationCommands := r.validationCommandsForProject(input.Project.ID)
+		validationCommands := workerValidationCommands(r.validationCommandsForProject(input.Project.ID), work)
 		prompt, instructionBlock, err := buildWorkerPromptWithInstructions(worktree.Path, input.Project.ID, r.customInstructions, work, checkpoint.Plan, r.canAgentCreatePR(ctx, input.Project.ID, work, input.Project.RepoPath), r.disclosure, agentVendor, derefString(agentModel))
 		if err != nil {
 			return checkpoint, err
 		}
 		if len(validationCommands) > 0 {
 			prompt += validationGatedLocalOnlyPrompt
+		}
+		if work.Reproduction != nil {
+			prompt += "\n\n" + work.Reproduction.PromptInstruction()
 		}
 		// HITL (gated): let the agent pause to ask a human, and on resume feed the
 		// human's answer back into the same agent session.
@@ -1834,6 +1903,9 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 		}
 		checkpoint.Execution = checkpointExecutionFromAgentResult(result)
 		checkpoint.ensureLifecycle("worker", worktree.Branch, worktree.BaseBranch, work.ExecutionMode == "create-pr")
+		if err := verifyWorkerReproduction(checkpoint, worktree.Path); err != nil {
+			return checkpoint, err
+		}
 		if result.Lifecycle != nil {
 			checkpoint.Lifecycle.MergeAgent(result.Lifecycle, r.nowISO())
 		} else if len(result.Commits) > 0 {
@@ -1846,6 +1918,9 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 	}
 	if _, err := r.reconcileWorkerGitState(ctx, &checkpoint, input.Project, work, worktree, input.Run); err != nil {
+		return checkpoint, err
+	}
+	if err := verifyWorkerReproduction(checkpoint, worktree.Path); err != nil {
 		return checkpoint, err
 	}
 	checkpoint.Execution.GitReconciled = true
@@ -1919,7 +1994,7 @@ func (r *Runner) reconcileWorkerGitState(ctx context.Context, checkpoint *worker
 
 func (r *Runner) runValidateStep(ctx context.Context, input stepInput) (workerCheckpoint, error) {
 	checkpoint := input.Checkpoint
-	validationCommands := r.validationCommandsForProject(input.Project.ID)
+	var validationCommands []string
 	work, err := requireWork(checkpoint)
 	if err != nil {
 		return checkpoint, err
@@ -1932,8 +2007,16 @@ func (r *Runner) runValidateStep(ctx context.Context, input stepInput) (workerCh
 	if err != nil {
 		return checkpoint, err
 	}
+	if err := captureWorkerReproduction(&checkpoint, worktree.Path); err != nil {
+		return checkpoint, err
+	}
+	work = *checkpoint.Work
+	validationCommands = workerValidationCommands(r.validationCommandsForProject(input.Project.ID), work)
 	result, err := r.runValidation(ctx, ValidationInput{CWD: worktree.Path, Commands: validationCommands})
 	if err != nil {
+		return checkpoint, err
+	}
+	if err := verifyWorkerReproduction(checkpoint, worktree.Path); err != nil {
 		return checkpoint, err
 	}
 	checkpoint.Validation = &result
@@ -1956,6 +2039,9 @@ func (r *Runner) runValidateStep(ctx context.Context, input stepInput) (workerCh
 			failure := classifyValidationFailure(result)
 			checkpoint.ResumePolicy = failure.resumePolicy
 			return checkpoint, &loopError{message: failure.message, kind: failure.kind}
+		}
+		if err := verifyWorkerReproduction(checkpoint, worktree.Path); err != nil {
+			return checkpoint, err
 		}
 		worktreeRoot, rootErr := workerWorktreeRoot(input.Project)
 		if rootErr != nil {
@@ -1990,7 +2076,7 @@ func (r *Runner) runValidateStep(ctx context.Context, input stepInput) (workerCh
 
 func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerCheckpoint, error) {
 	checkpoint := input.Checkpoint
-	validationCommands := r.validationCommandsForProject(input.Project.ID)
+	var validationCommands []string
 	work, err := requireWork(checkpoint)
 	if err != nil {
 		return checkpoint, err
@@ -2012,6 +2098,14 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 	}
 	worktree, err = r.ensureWorkerWorktreeUsable(ctx, input, &checkpoint, work, worktree)
 	if err != nil {
+		return checkpoint, err
+	}
+	if err := captureWorkerReproduction(&checkpoint, worktree.Path); err != nil {
+		return checkpoint, err
+	}
+	work = *checkpoint.Work
+	validationCommands = workerValidationCommands(r.validationCommandsForProject(input.Project.ID), work)
+	if err := verifyWorkerReproduction(checkpoint, worktree.Path); err != nil {
 		return checkpoint, err
 	}
 	if err := r.validateWorkerIssueStillOpen(ctx, input.Project.RepoPath, work); err != nil {
@@ -3928,6 +4022,9 @@ func buildPullRequestBody(work workerInput, plan *checkpointPlan, execution *che
 	}
 	if work.SpecPath != "" {
 		lines = append(lines, "", fmt.Sprintf("Spec: %s", work.SpecPath))
+	}
+	if work.Reproduction != nil {
+		lines = append(lines, "", "Reproduction manifest: "+reproducer.ManifestPath, "Reproduction test: "+work.Reproduction.TestName+" ("+work.Reproduction.TestPath+")")
 	}
 	if work.Prompt != "" {
 		lines = append(lines, "", fmt.Sprintf("Prompt: %s", work.Prompt))
