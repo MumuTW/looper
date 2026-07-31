@@ -169,15 +169,24 @@ For each `pull_request.merge_gate.merge_attempted` event with
   (`GetLatestByProjectAndHead` for the merge event's `HeadSHA`); when no
   snapshot matches the merged head, the title is rendered unavailable
   rather than read from a newer snapshot for a different head.
-- Originating issue: resolved via `LoopsRepository.ListByRepoAndPR(repo,
-  prNumber)` (`internal/storage/repositories.go`) using the merge event's
-  own `Repo`/`PRNumber` identity — the loop's source issue is the
-  originating issue. The merge event is appended by
-  `persistMergeOutcome` with only `ProjectID`, `EntityType`, and
-  `EntityID`; it carries no `LoopID`, so a `merge event → LoopRecord` join
-  on `LoopID` is not possible. `ListByRepoAndPR` returns loops ordered by
-  `updated_at DESC, seq DESC`; the assembly picks the most recent loop
-  whose source issue is set. If multiple loops conflict or none is
+- Originating issue: resolved via a project-scoped loop lookup using the
+  merge event's `ProjectID`, `Repo`, and `PRNumber` — the loop's source
+  issue is the originating issue. The merge event is appended by
+  `persistMergeOutcome` with `ProjectID`, `EntityType`, and `EntityID`;
+  it carries no `LoopID`, so a `merge event → LoopRecord` join on
+  `LoopID` is not possible. The existing
+  `LoopsRepository.ListByRepoAndPR(repo, prNumber)`
+  (`internal/storage/repositories.go`) has **no project predicate**, and
+  the repository explicitly supports the same `repo`/`prNumber` appearing
+  under multiple projects; in that configuration the most recently
+  updated loop returned by `ListByRepoAndPR` can belong to another
+  project, causing the digest to attribute that other project's source
+  issue to this merge. The assembly therefore uses a new
+  `LoopsRepository.ListByProjectRepoAndPR(projectID, repo, prNumber)`
+  that adds a `project_id` predicate to the same `updated_at DESC, seq
+  DESC` ordering, so only loops belonging to the merge event's
+  `ProjectID` are candidates; the assembly picks the most recent such
+  loop whose source issue is set. If multiple loops conflict or none is
   recoverable, the issue is omitted rather than guessed.
 - Reviewer verdict summary: the most recent `pr.review.posted` at or before
   the merge attempt for the same PR **whose `headSha` equals the merge
@@ -298,51 +307,83 @@ locked by a fixture before the digest assembly is implemented.
 
 **Event contract — `pull_request.closed_and_regenerated`:**
 
-- Event type: `pull_request.closed_and_regenerated` (a new
-  `event_logs.event_type`, emitted by #462/#464 at the close-and-regenerate
-  transition).
-- Entity: `entity_type = "pull_request"`,
+The close-and-regenerate transition and the retry that follows it are
+**two distinct observations** with different terminal reachability, so
+they are emitted as two event types sharing one payload schema. A single
+append-only event emitted at the transition can only carry
+`retryOutcome = pending` (the retry that follows the regeneration has
+not completed yet), and a one-event-per-transition dedupe rule would
+then prevent any later terminal observation, leaving dashboards and
+digests permanently stale instead of reporting whether the retry
+succeeded. The contract therefore defines a transition event and a
+follow-up completion event:
+
+- **Transition event** — type `pull_request.closed_and_regenerated` (a
+  new `event_logs.event_type`, emitted by #462/#464 at the close-and-
+  regenerate transition).
+- **Completion event** — type
+  `pull_request.closed_and_regenerated.retry_completed` (a second new
+  `event_logs.event_type`, emitted by #462/#464 when the retry loop that
+  followed the regeneration terminates).
+- Entity (both): `entity_type = "pull_request"`,
   `entity_id = "<repo>#<prNumber>"`.
-- Payload fields:
+- Payload fields (both):
   - `repo` (string), `prNumber` (int), `headSha` (string) — PR identity,
     matching the identity the gatekeeper and reviewer events already carry.
   - `discoveryFingerprint` (string) — the fingerprint of the discovery
     that failed and triggered regeneration, observed at transition time.
   - `retryOutcome` (enum string): `succeeded` | `failed` | `pending` —
     whether the retry loop that followed the regeneration succeeded,
-    failed, or had not completed when the event was emitted.
-  - `closedAt` (RFC3339 string) — the transition timestamp.
-- Deduplication: one event per `(entity_id, discoveryFingerprint,
-  closedAt)` transition; #462/#464 are responsible for not emitting
-  duplicates for the same transition (the digest does not dedupe producer
-  output).
+    failed, or had not completed when the event was emitted. The
+    transition event is emitted with `pending`; the completion event is
+    emitted with `succeeded` or `failed`.
+  - `closedAt` (RFC3339 string) — the transition timestamp (carried by
+    both events so the completion event joins back to its transition).
+- Deduplication: one transition event per `(entity_id,
+  discoveryFingerprint, closedAt)` transition and one completion event
+  per `(entity_id, discoveryFingerprint, closedAt)` transition;
+  #462/#464 are responsible for not emitting duplicates for the same
+  transition (the digest does not dedupe producer output). The two event
+  types dedupe independently, so the terminal completion event is not
+  suppressed by the transition event that preceded it.
 
 The assembly lists PRs in the window that were closed by the regenerate
 flow and the retry loop that followed, with the failure fingerprint and
-retry outcome. The fingerprint and retry outcome come from this event's
-own payload, not from a join against the mutable `LoopRecord`.
+retry outcome. The fingerprint and retry outcome come from these events'
+own payloads, not from a join against the mutable `LoopRecord`.
 `autonomousRecovery.lastFailedDiscoveryFingerprint` on
 `LoopRecord.MetadataJSON` is a mutable "last" value: a later failure can
 overwrite it, recovery can clear it, and the loop's completion status can
 change after another retry, so a dashboard request issued later could
 attach a newer fingerprint or outcome to an older close event. The
-lifecycle event carries both values observed at transition time; the
-digest reads `discoveryFingerprint` and `retryOutcome` directly. If
-#462/#464 have not yet persisted an event of this type with these fields,
-the section renders empty with a note naming the missing event type and
-fills in once they do.
+lifecycle events carry both values observed at the transition and at
+retry termination; the digest reads `discoveryFingerprint` directly and
+selects `retryOutcome` as the **latest** outcome for the
+`(entity_id, discoveryFingerprint, closedAt)` triple: if a
+`retry_completed` event exists for that triple, its terminal
+`succeeded`/`failed` outcome is used; otherwise the transition event's
+`pending` is used and the section renders the retry as "in progress
+(pending)". This lets a `pending` observation reach a terminal state
+once the completion event lands, and a triple whose retry never
+terminates (or whose completion event has not yet been emitted) is
+reported as `pending`, not silently promoted to a terminal outcome. If
+#462/#464 have not yet persisted events of these types with these
+fields, the section renders empty with a note naming the missing event
+types and fills in once they do.
 
 **Producer-consumer contract coverage.** Because the producer (#462/#464)
 is separate work, an assembly fixture that seeds a prebuilt
 `EventLogRecord` cannot detect producer/consumer drift — the section could
 ship without a working producer. The validation therefore includes an
-integration test that emits the real `pull_request.closed_and_regenerated`
-transition event through the producer path #462/#464 define and then
-assembles the digest, asserting the section renders the fingerprint and
-`retryOutcome` from the emitted event. The fixture and the integration
-test both conform to the payload schema above, so a producer that emits
-different field names fails the test rather than silently producing an
-empty section.
+integration test that emits the real
+`pull_request.closed_and_regenerated` transition event and its
+`pull_request.closed_and_regenerated.retry_completed` follow-up through
+the producer path #462/#464 define and then assembles the digest,
+asserting the section renders the fingerprint and the terminal
+`retryOutcome` from the emitted completion event. The fixture and the
+integration test both conform to the payload schema above, so a producer
+that emits different field names fails the test rather than silently
+producing an empty section.
 
 ### Awaiting human
 
@@ -370,6 +411,30 @@ new reason codes are introduced. The triager's
 *issue* triage awaiting confirmation and is a separate surface; this
 section is PR-scoped and reads gate reports, not triage reports.
 
+**Exclude PRs with durable close evidence after the last blocked report.**
+Using the latest gate report as the current-state authority leaves a PR
+listed forever when a maintainer closes or manually merges it after a
+blocked report: those paths emit no durable merge event, the closed PR
+disappears from gatekeeper discovery, and no later eligible report
+replaces the blocked one. To keep the actionable section from presenting
+work that no longer exists, membership additionally requires that **no
+durable merge event for the PR exists after its last blocked report**:
+the assembly checks the PR's lifecycle (read via `ListByEntity`, see
+below) for a `MergeOutcomeEventType` event with `Merged == true` whose
+`created_at` is after the latest blocked report's `EvaluatedAt`; if one
+exists, the PR was merged through the gatekeeper path and is excluded.
+PRs closed or merged via paths that emit **no** durable event (manual
+maintainer merge, reviewer auto-merge — see Merge authority coverage)
+have no durable close evidence, so they remain listed until a subsequent
+gate report or merge event supersedes the blocked report. This is an
+explicit, documented stale-state limitation of a derived projection that
+adds no new persisted state: the section renders the last blocked
+report's `EvaluatedAt` so the human can see staleness, and the
+limitation plus its reconciliation path (a later gate report or durable
+merge event removes the PR) are listed in Risks. Requiring a durable
+"still open" signal that no merge path produces today would be a larger
+change and is out of scope.
+
 **Age from the start of the continuous blocked interval.** Gatekeeper
 re-evaluates an unchanged pull request every `maxSkipAge` (30 minutes in
 `internal/gatekeeper/unchanged.go`), so a PR held for days will have a
@@ -382,6 +447,22 @@ continuous blocked interval (the boundary where the PR transitioned into
 the blocked state). A gap in the blocked-reason sequence, or a report with
 a non-human-actionable reason, ends the walk; the age is
 `assemblyInstant − firstBlockedEvaluatedAt`.
+
+**Candidate enumeration is unbounded, not windowed.** `ListByEntity`
+requires an already-known `entityID`, so the assembly must first enumerate
+the candidate PR entities. The only global event source specified for the
+other sections is the date-bounded `ListBetween` result, but a PR first
+blocked at 08:00 on the digest date — after the previous day's window
+midnight `until` — has no event inside that prior-day window, so it would
+never become a candidate if the windowed result seeded the entity set.
+The assembly therefore enumerates pull-request gate entities through an
+**unbounded current-state query**,
+`EventsRepository.ListByEntityTypeAndEventTypes(ctx, "pull_request",
+[GateReportEventType])` (`internal/storage/repositories.go`), and takes
+the distinct `entity_id` values as the candidate set; it then reads each
+candidate's full lifecycle via `ListByEntity` for the membership check
+and backward walk. This ensures a PR whose latest blocked report falls
+after the window's `until` is still discovered.
 
 The backward walk and the membership check both read the PR's full
 lifecycle via `EventsRepository.ListByEntity(ctx, "pull_request",
@@ -478,12 +559,24 @@ The scheduler's behavior is fixed and tested for both cases:
 
 - **Spring-forward (nonexistent local time):** if `FireTime` does not
   exist on a given calendar day in the configured location (e.g. `02:30`
-  on a spring-forward day that jumps 02:00 → 03:00), the scheduler does
-  not fire on that day. It computes the next fire instant as the next
-  calendar day's `FireTime` and fires once there. The skipped day still
-  produces a digest on the following fire: that fire selects `D` = the
-  skipped day's date (its window has closed) and pushes it, so no digest
-  date is lost — only the fire instant is shifted by one day.
+  on a spring-forward day that jumps 02:00 → 03:00), the scheduler fires
+  **once on that same calendar day at a defined substitute instant**: the
+  first valid local instant at or after the configured `FireTime` on that
+  day, i.e. the gap-end instant the clock jumps to (`03:00` for a `02:30`
+  `FireTime` on a 02:00 → 03:00 spring-forward). Firing on the skipped
+  calendar day is required because that day's fire is responsible for
+  digest date `D = F − 1`: shifting the fire to the next calendar day
+  would select `D = F` and permanently lose `F − 1` (the next day's fire
+  never selects `F − 1`, and relying on a later daemon restart to invoke
+  startup catch-up is not guaranteed). The substitute instant stays on
+  day `F`, so `D = F − 1` is still selected and delivered; only the fire
+  instant shifts from `02:30` to `03:00` on the same day, which does not
+  move the date-derived window. The substitute is computed via
+  `time.Date(F.year, F.month, F.day, hh, mm, 0, 0, loc)` and, when that
+  instant is nonexistent, advancing to the gap-end instant the
+  `time.Location` resolves the nonexistent input to (Go's `time.Date`
+  normalizes a nonexistent local time forward to the first valid instant
+  after the gap); the scheduler does not skip the calendar day.
 - **Fall-back (repeated local time):** if `FireTime` occurs twice on a
   given calendar day (e.g. `01:30` on a fall-back day that repeats
   01:00–02:00), the scheduler fires **once**, at the first occurrence
@@ -492,9 +585,10 @@ The scheduler's behavior is fixed and tested for both cases:
   and matches the once-per-day contract.
 
 Both cases are covered by tests asserting the selected digest date and
-the fire count (one fire per calendar day that has a valid fire instant;
-the spring-forward day fires zero times and its digest is produced by the
-next day's fire).
+the fire count (one fire per calendar day: the spring-forward day fires
+once at the gap-end substitute instant and still selects `D = F − 1`, so
+no digest date is lost; the fall-back day fires once at the first
+occurrence).
 
 #### Catch-up from durable notification history
 
@@ -508,14 +602,35 @@ under 24 hours. Instead the startup catch-up determines missed dates from
 the **durable notification history**: it walks back from the most recent
 closed `D` through a bounded catch-up horizon (a fixed 7 calendar days),
 and for each date `d` in that range queries
-`NotificationsRepository.GetLatestByDedupe(ctx, channel,
+`NotificationsRepository.GetLatestByDedupe(ctx, "in_app",
 "digest:<d>:<configFingerprint>")` (see Same-date delivery idempotence
-for the key). Any date with no delivered record is pushed, in
+for the key and why the check is a single date-wide invocation marker,
+not a per-channel check). Any date with no delivered record is pushed, in
 chronological order, before the regular schedule resumes. The horizon is
 bounded so a long outage does not flood the channel on restart; dates
 older than the horizon are accepted as lost (an audit surface, not a
 retry queue). The in-memory `lastDigestDate` is then set to the newest
 pushed date so the regular schedule does not re-fire it.
+
+**Activation boundary — first enablement is not a backfill.** Absence of
+a delivered notification is not evidence that a digest was scheduled and
+missed: on the first startup with this disabled-by-default feature
+enabled, notification history contains no digest keys for any prior
+date, so a naive "any date with no delivered record is missed" rule
+would classify all seven dates in the horizon as missed and push seven
+historical digests, flooding configured channels on first enablement.
+The catch-up therefore treats a date `d` as missed **only if there is
+durable evidence the feature was already active on or before `d`**:
+specifically, only dates `d` that are at or before the **newest delivered
+digest date** in the horizon are candidates. If no delivered digest
+record exists anywhere in the horizon (first enablement, or an outage
+longer than the horizon with no prior delivery), the catch-up pushes
+nothing and the regular schedule begins from the most recent closed `D`
+(`lastDigestDate` is set to that `D`). This uses already-persisted
+notification records as the activation boundary — no new "first enabled
+at" timestamp is introduced — so enabling the feature never produces a
+historical backfill unless the operator explicitly requests one
+(operator-triggered historical backfill is out of scope for this PR).
 
 ### Same-date delivery idempotence across restarts
 
@@ -537,20 +652,36 @@ suppress it. The `DedupeKey` is therefore
 `digest:<D>:<configFingerprint>` where `<D>` is the digest date and
 `<configFingerprint>` is a short stable hash (e.g. the first 8 hex chars
 of `sha256(Timezone + ":" + VerdictFlipWindowMinutes)`) over the
-configuration that affects digest output. For each configured channel the
-job queries `NotificationsRepository.GetLatestByDedupe(ctx, channel,
-"digest:<D>:<configFingerprint>")` and skips the push when a delivered
-record exists for that key, regardless of age. This bounds restart
-re-fires using already-persisted state — no new "last digest delivered
-at" timestamp is introduced. The gateway's short throttle still
-suppresses a same-process double-fire within the throttle window; the
-date-wide notification-log check is the durable backstop that covers
-restarts beyond that window. The dashboard route reconstructs the window
-from the daemon's current config, so after a config change the
-date-only route re-derives under the new config (a current projection,
-see Delivery); the config-fingerprinted dedupe key ensures the new
-projection is delivered rather than suppressed as a duplicate of the old
-one.
+configuration that affects digest output.
+
+The idempotence unit is the **single `Gateway.Notify` invocation**, not
+each channel: one `Notify` call fans out to every configured channel, so
+a per-channel durable check is incoherent with the all-channel operation
+— skipping when any delivered record exists permanently abandons a
+channel that failed, while requiring every channel to have succeeded
+re-fires `Notify` and duplicates delivery on the successful channel
+after its throttle expires. The Delivery section explicitly chooses
+persistence over retries, so partial per-channel failure is accepted
+rather than retried. The durable backstop is therefore a single
+date-wide invocation marker: the job queries
+`NotificationsRepository.GetLatestByDedupe(ctx, "in_app",
+"digest:<D>:<configFingerprint>")` and skips the push when that record
+exists, regardless of age. The gateway persists an `in_app`
+`NotificationRecord` for every `Notify` call regardless of push-channel
+outcome (`recordInApp` in `internal/infra/notify/gateway.go`), so the
+`in_app` record is the durable proof that the invocation already
+happened; a push channel that failed on the first call is not retried,
+and the human pulls the digest from the dashboard (see Delivery). This
+bounds restart re-fires using already-persisted state — no new "last
+digest delivered at" timestamp is introduced. The gateway's short
+throttle still suppresses a same-process double-fire within the throttle
+window; the date-wide `in_app` notification-log check is the durable
+backstop that covers restarts beyond that window. The dashboard route
+reconstructs the window from the daemon's current config, so after a
+config change the date-only route re-derives under the new config (a
+current projection, see Delivery); the config-fingerprinted dedupe key
+ensures the new projection is delivered rather than suppressed as a
+duplicate of the old one.
 
 ## Configuration
 
@@ -579,13 +710,20 @@ Added to `Config` as `Digest DigestConfig` and to `PartialConfig` as
 `Enabled: false`, `FireTime: "09:00"`, `Timezone: "UTC"`, `EmptyDayMode:
 "quiet"`, `VerdictFlipWindowMinutes: 120`. Config validation fails fast
 at daemon boot on a malformed `FireTime`, an unknown
-`Timezone`/`EmptyDayMode`, and a non-positive
-`VerdictFlipWindowMinutes` (required: `> 0`; zero or negative makes the
-verdict-flip anomaly ill-defined), consistent with looperd's existing
-fail-fast-on-config-validation behavior. There is no `LookbackHours`
-field: the digest window is always the calendar day in the configured
-timezone (see Digest window), so a window-length knob is not exposed.
-TOML example:
+`Timezone`/`EmptyDayMode`, and a `VerdictFlipWindowMinutes` outside the
+valid range. The lower bound is `> 0` (zero or negative makes the
+verdict-flip anomaly ill-defined); the upper bound is
+`math.MaxInt64 / int64(time.Minute)` (153,722,867 minutes), because the
+implementation converts this value to a `time.Duration` to compute
+`AttemptedAt − VerdictFlipWindowMinutes`, and values above that
+threshold overflow a nanosecond `time.Duration`, turning the lookback
+negative or moving the interval to the wrong side of the merge and
+silently suppressing anomalies. Validation rejects any value exceeding
+that threshold during fail-fast config validation, consistent with
+looperd's existing fail-fast-on-config-validation behavior. There is no
+`LookbackHours` field: the digest window is always the calendar day in
+the configured timezone (see Digest window), so a window-length knob is
+not exposed. TOML example:
 
 ```toml
 [digest]
@@ -606,7 +744,8 @@ fingerprint over `Timezone` and `VerdictFlipWindowMinutes`, see Scheduling)
 so a same-date re-fire under the same config is deduped by the gateway's
 existing throttle/dedupe path within the throttle window, while a config
 change produces a new key and is delivered rather than suppressed; the
-date-wide notification-log check in Scheduling is the durable backstop.
+date-wide `in_app` notification-log check in Scheduling is the durable
+backstop (one invocation marker, not a per-channel check).
 `Level` is set to a value the outbound channel allow-lists
 accept and `Sound` is left empty so osascript does not play a sound for a
 routine digest. Sound is controlled independently of level
@@ -639,8 +778,24 @@ hand-maintained route/auth map), add deterministic response and error
 captures under `internal/api/testdata/contracts/`, and register the
 capture IDs in `contract_artifact_regen_test.go` so
 `go generate ./internal/api/...` regenerates the artifacts; an ordinary
-handler test does not add the endpoint automatically (see Validation). The
-handler re-assembles the same four sections on demand from the same
+handler test does not add the endpoint automatically (see Validation).
+
+**The route rejects unclosed windows.** The design requires every queried
+window to be completed, but the explicit `date` parameter permits today
+or a future date: at 09:00 a request for today's date would assemble only
+the first nine hours of `[today 00:00, tomorrow 00:00)` and present that
+incomplete slice as the day's digest. The handler therefore validates
+that the requested window end `(D+1) 00:00 in tz` is at or before the
+request instant (`now`): a `date` whose window has not closed (today or
+any future date, and any date whose `(D+1) 00:00 in tz` is after `now`)
+is rejected with a `422 Unprocessable Content` (or `400 Bad Request`,
+consistent with the existing handler error convention) carrying a message
+naming the earliest acceptable date, and no `ListBetween` query is run.
+The default (no `date`) selects the most recent closed `D` and is always
+acceptable. This keeps the dashboard from presenting a partial day as a
+complete digest.
+
+The handler re-assembles the same four sections on demand from the same
 `ListBetween` storage query over the **same fixed date-derived window**
 (`[D 00:00 in tz, (D+1) 00:00 in tz)`), so a failed push delivery never
 loses the digest — the human can always pull it from the dashboard. The
@@ -726,13 +881,15 @@ window).
   a separate, larger change and is intentionally out of scope for this
   derived projection.
 - **#462/#464 dependency.** The closed-and-regenerated section reads the
-  `pull_request.closed_and_regenerated` event defined in Closed-and-
-  regenerated. The event contract (type, identity fields,
-  `discoveryFingerprint`, `retryOutcome` enum, dedup) is fixed in this
-  spec and locked by a fixture and a producer-consumer integration test,
-  so a producer that emits a different shape fails the test rather than
-  silently rendering the section empty. If #462/#464 have not landed, the
-  section renders empty with a note naming the missing event type.
+  `pull_request.closed_and_regenerated` transition event and its
+  `pull_request.closed_and_regenerated.retry_completed` follow-up defined
+  in Closed-and-regenerated. The event contract (two types, identity
+  fields, `discoveryFingerprint`, `retryOutcome` enum, dedup) is fixed in
+  this spec and locked by a fixture and a producer-consumer integration
+  test, so a producer that emits a different shape fails the test rather
+  than silently rendering the section empty. If #462/#464 have not
+  landed, the section renders empty with a note naming the missing event
+  types.
 - **Snapshot head match.** PR title, review state, and diff size come
   from the snapshot matching the merge event's `HeadSHA`
   (`GetLatestByProjectAndHead`). If no snapshot matches the merged head
@@ -766,6 +923,18 @@ window).
   webhook/Feishu, which may over-signal urgency. The trade-off is
   documented in Delivery; a less alarming level requires extending the
   level vocabulary and allow-list (out of scope).
+- **Awaiting-human stale state for non-durable closes.** Membership
+  excludes a PR when a durable `MergeOutcomeEventType` event with
+  `Merged == true` follows its last blocked report (gatekeeper merge).
+  PRs closed or merged via paths that emit no durable event (manual
+  maintainer merge, reviewer auto-merge) have no durable close evidence,
+  so they remain listed until a subsequent gate report or durable merge
+  event supersedes the blocked report. The section renders the last
+  blocked report's `EvaluatedAt` so the staleness is visible to the
+  human; the reconciliation path is a later gate report or durable merge
+  event. A durable "still open" signal shared by all merge paths would
+  remove this limitation and is a separate, larger change out of scope
+  for this derived projection.
 
 ## Validation
 
@@ -776,16 +945,22 @@ Regression coverage (Go tests, fixture-based, no network):
   flip, and a closed-and-regenerated retry; assert the four sections match
   expected content (titles, reason codes, ages, anomaly flags). The
   closed-and-regenerated fixture conforms to the
-  `pull_request.closed_and_regenerated` payload schema (type, identity,
-  `discoveryFingerprint`, `retryOutcome`, `closedAt`) so a producer
-  emitting different field names is detected. Include a `pr.review.posted`
+  `pull_request.closed_and_regenerated` and
+  `pull_request.closed_and_regenerated.retry_completed` payload schema
+  (type, identity, `discoveryFingerprint`, `retryOutcome`, `closedAt`) so
+  a producer emitting different field names is detected. Include a `pr.review.posted`
   with `event=COMMENT` and `outcome=clean` to assert it is **not** flagged
   as a non-blocking anomaly, and one with `outcome=non_blocking` to assert
   it is.
 - Originating issue resolution: seed a merge event with no `LoopID` and a
-  matching `LoopRecord` reachable by `ListByRepoAndPR`; assert the
-  originating issue is resolved. Seed a merge with no matching loop; assert
-  the issue is omitted, not guessed.
+  matching `LoopRecord` reachable by `ListByProjectRepoAndPR` for the
+  merge event's `ProjectID`; assert the originating issue is resolved.
+  Seed a merge with no matching loop; assert the issue is omitted, not
+  guessed. Seed the same `repo`/`prNumber` under two projects with
+  distinct source issues, where the other project's loop is more
+  recently updated; assert the digest attributes the merge project's own
+  source issue (the lookup is scoped to the merge event's `ProjectID`),
+  not the other project's issue.
 - Gate summary (confirming report selection): seed a successful merge
   (`Merged == true`, `ConfirmingReasons` empty) where the confirming
   `GateReportEventType` has `EvaluatedAt` **after** the merge event's
@@ -829,6 +1004,18 @@ Regression coverage (Go tests, fixture-based, no network):
   each with no active reviewer/fixer loop; assert it is included. Seed a
   `ReasonHold` gate report with an active fixer loop; assert it is still
   included.
+- Awaiting-human durable-close exclusion: seed a PR whose latest gate
+  report is blocked, then a later `MergeOutcomeEventType` event with
+  `Merged == true` for the same PR (gatekeeper merge after the blocked
+  report); assert the PR is omitted. Seed a PR whose latest blocked
+  report has no subsequent durable merge event (simulating a manual
+  maintainer close); assert the PR is still listed and the section
+  renders the last blocked report's `EvaluatedAt` so the staleness is
+  visible.
+- Awaiting-human candidate enumeration: seed a PR first blocked at 08:00
+  on the digest date with no gate event inside the previous day's
+  `ListBetween` window; assert it is still discovered as a candidate via
+  `ListByEntityTypeAndEventTypes` and listed in the 09:00 digest.
 - Verdict-flip anomaly threshold: seed two `pr.review.posted` events for
   the merged head with differing `outcome` 30 minutes apart, both within
   `VerdictFlipWindowMinutes` of `AttemptedAt`; assert a flip is flagged.
@@ -860,26 +1047,38 @@ Regression coverage (Go tests, fixture-based, no network):
   that returns an error; assert an in-app `NotificationRecord` is still
   persisted and the `/api/v1/digest` handler still returns the assembled
   digest.
-- Same-date restart idempotence: persist a delivered notification record
-  with `DedupeKey digest:<D>:<configFingerprint>` older than
-  `ThrottleWindowSeconds`; fire the job under the same config; assert the
-  push is skipped by the date-wide notification-log check and no
-  duplicate `Notify` occurs. Then change `Timezone` (or
+- Same-date restart idempotence: persist an `in_app` delivered
+  notification record with `DedupeKey digest:<D>:<configFingerprint>`
+  older than `ThrottleWindowSeconds`; fire the job under the same config;
+  assert the push is skipped by the date-wide `in_app` notification-log
+  check and no duplicate `Notify` occurs. Then change `Timezone` (or
   `VerdictFlipWindowMinutes`) and fire again for the same `D`; assert the
   push is **not** skipped (the config-fingerprinted key differs) and the
-  new projection is delivered.
+  new projection is delivered. Assert that when the `in_app` record
+  exists but a push channel failed, the failed channel is **not**
+  retried (the `in_app` invocation marker is the idempotence unit, not
+  per-channel delivery).
 - DST-affected fire times: in a timezone with a spring-forward transition,
   configure a `FireTime` that is nonexistent on the transition date;
-  assert the scheduler fires zero times on that date and fires once on the
-  next day, selecting `D` = the skipped date. In a timezone with a
-  fall-back transition, configure a `FireTime` that occurs twice; assert
-  the scheduler fires once (the first occurrence) and selects the correct
-  `D`.
+  assert the scheduler fires once on that date at the gap-end substitute
+  instant (e.g. `03:00` for a `02:30` `FireTime` on a 02:00 → 03:00
+  spring-forward) and selects `D = F − 1`, so digest date `F − 1` is
+  delivered and not lost. In a timezone with a fall-back transition,
+  configure a `FireTime` that occurs twice; assert the scheduler fires
+  once (the first occurrence) and selects the correct `D`.
 - Catch-up from durable history: with no delivered digest for `F−1` and a
   delivered record for `F`, restart the daemon after midnight on `F+1`;
   assert the startup catch-up pushes `F−1` (missed) in chronological order
   before resuming the regular schedule, and does not re-push `F` (already
   delivered). Assert dates older than the 7-day horizon are not pushed.
+- Catch-up activation boundary: on first enablement with no delivered
+  digest record anywhere in the 7-day horizon, restart/start the daemon
+  and assert the catch-up pushes **nothing** (no historical backfill) and
+  the regular schedule begins from the most recent closed `D`. Then seed
+  a delivered digest record for `F` only and restart with no record for
+  `F−1`; assert `F−1` is pushed (the `F` record is the activation
+  boundary proving the feature was active) but dates before the oldest
+  delivered record are not treated as missed.
 - Completed-window selection: under defaults (`FireTime = "09:00"`), fire
   the job on day `F` and assert it selects `D = F − 1` and queries
   `[F−1 00:00, F 00:00)`; assert an event at `F 00:00` belongs to the
@@ -890,25 +1089,42 @@ Regression coverage (Go tests, fixture-based, no network):
   `(D+1) 00:00` is excluded). Assert `end(D)` is `(D+1) 00:00` constructed
   via the configured location (assert correct behavior on a DST
   transition date).
+- Unclosed-window rejection: at 09:00 on day `F`, request
+  `/api/v1/digest?date=<F>` (today) and `/api/v1/digest?date=<F+1>` (a
+  future date); assert both are rejected with a 4xx error and no
+  `ListBetween` query is run. Request `/api/v1/digest` with no `date`
+  (default) and `/api/v1/digest?date=<F−1>` (a closed window); assert
+  both succeed.
 - Dashboard is a current projection: push a digest, then advance `now` by
   one minute and request `/api/v1/digest?date=<D>`; assert the
   Awaiting-human age differs from the pushed body (the dashboard is not
   byte-identical), while the merged/closed sections over the fixed window
   match.
 - Lifecycle producer-consumer integration: emit a real
-  `pull_request.closed_and_regenerated` transition event through the
-  producer path #462/#464 define and assemble the digest; assert the
-  section renders `discoveryFingerprint` and `retryOutcome` from the
-  emitted event. Emit an event with mismatched field names and assert the
-  test fails rather than the section silently rendering empty.
+  `pull_request.closed_and_regenerated` transition event and its
+  `pull_request.closed_and_regenerated.retry_completed` follow-up through
+  the producer path #462/#464 define and assemble the digest; assert the
+  section renders `discoveryFingerprint` and the terminal `retryOutcome`
+  from the emitted completion event. Emit events with mismatched field
+  names and assert the test fails rather than the section silently
+  rendering empty.
+- Closed-and-regenerated pending reaches terminal state: seed a
+  transition event with `retryOutcome = pending` and no completion event;
+  assert the section renders the retry as "in progress (pending)". Then
+  emit the matching `retry_completed` event with `retryOutcome =
+  succeeded` (and separately `failed`); assert the section now renders
+  the terminal outcome, not `pending` — this fails if `pending` remains
+  stale after the completion event lands.
 - HTTP contract registration: assert the `/api/v1/digest` route is
   present in `internal/api/testdata/contracts/daemon-http.compat.json`,
   has deterministic response and error captures, and that
   `go generate ./internal/api/...` regenerates them from the capture IDs
   registered in `contract_artifact_regen_test.go`.
 - Config validation: malformed `FireTime`, unknown `Timezone`, unknown
-  `EmptyDayMode`, and `VerdictFlipWindowMinutes <= 0` all fail fast at
-  boot.
+  `EmptyDayMode`, `VerdictFlipWindowMinutes <= 0`, and
+  `VerdictFlipWindowMinutes` exceeding `math.MaxInt64 / int64(time.Minute)`
+  (153,722,867) all fail fast at boot; a value just under the threshold is
+  accepted.
 
 Contract coverage for the lifecycle: the digest goroutine starts with
 `Runtime.Start` and stops cleanly on the stop channel (no leak across
