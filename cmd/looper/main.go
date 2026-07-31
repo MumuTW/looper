@@ -121,6 +121,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return reportError(stderr, runProject(ctx, parsed.Global, parsed.Operands, stdout))
 	case "provider":
 		return reportError(stderr, runProvider(ctx, parsed.Global, parsed.Operands, stdout))
+	case "gatekeeper":
+		return reportError(stderr, runGatekeeper(ctx, parsed.Global, parsed.Operands, stdout))
 	}
 
 	request, err := routeForVerb(parsed.Verb, parsed.Operands)
@@ -847,12 +849,40 @@ func runProjectDiscover(ctx context.Context, global []string, identifier string,
 	return printProjectDiscoveryResult(result, stdout)
 }
 
-// runGatekeeper owns read-only Gatekeeper operator views. It intentionally
-// routes through looperd rather than opening SQLite: the daemon is authoritative
-// for the immutable Gatekeeper event stream and remains the only storage writer.
+// runGatekeeper owns Gatekeeper operator views and the explicit trust-promotion
+// action. It routes through looperd rather than opening SQLite: the daemon is
+// authoritative for the project catalog and immutable Gatekeeper event stream.
 func runGatekeeper(ctx context.Context, global []string, operands []string, stdout io.Writer) error {
-	if len(operands) == 0 || (operands[0] != "agreements" && operands[0] != "verdicts") {
-		return badUsage("gatekeeper requires the agreements or verdicts subcommand")
+	if len(operands) == 0 || (operands[0] != "agreements" && operands[0] != "verdicts" && operands[0] != "promote") {
+		return badUsage("gatekeeper requires the agreements, verdicts, or promote subcommand")
+	}
+	if operands[0] == "promote" {
+		if len(operands) != 3 || strings.TrimSpace(operands[1]) == "" || strings.TrimSpace(operands[2]) == "" {
+			return badUsage("gatekeeper promote requires a project id and target trust (advise or auto)")
+		}
+		target := strings.ToLower(strings.TrimSpace(operands[2]))
+		if target != "advise" && target != "auto" {
+			return badUsage("gatekeeper promote target must be advise or auto")
+		}
+		cfg, err := loadConfig(global)
+		if err != nil {
+			return err
+		}
+		body, err := json.Marshal(map[string]string{"gatekeeperTrust": target})
+		if err != nil {
+			return err
+		}
+		projectID := strings.TrimSpace(operands[1])
+		updated, err := requestJSON[projectResponse](ctx, cfg, http.MethodPatch, "/api/v1/projects/"+url.PathEscape(projectID), body)
+		if err != nil {
+			return err
+		}
+		trust := strings.TrimSpace(updated.GatekeeperTrust)
+		if trust == "" {
+			trust = "observe"
+		}
+		_, _ = fmt.Fprintf(stdout, "project %s  gatekeeper-trust=%s\n", updated.ID, trust)
+		return nil
 	}
 	if len(operands) > 2 || (len(operands) == 2 && strings.TrimSpace(operands[1]) == "") {
 		return badUsage(fmt.Sprintf("gatekeeper %s accepts at most one project id", operands[0]))
@@ -1038,6 +1068,11 @@ func canonicalRepoPath(path string) string {
 
 func describeProject(project projectResponse) string {
 	line := fmt.Sprintf("%s\t%s", project.ID, project.RepoPath)
+	trust := strings.TrimSpace(project.GatekeeperTrust)
+	if trust == "" {
+		trust = "observe"
+	}
+	line += "\tgatekeeper-trust=" + trust
 	if project.Archived {
 		line += "\t(archived)"
 	}
@@ -1275,13 +1310,14 @@ func quarantinedLoopLine(loop statusQuarantinedLoopView) string {
 }
 
 type projectResponse struct {
-	ID         string             `json:"id"`
-	Name       string             `json:"name"`
-	RepoPath   string             `json:"repoPath"`
-	BaseBranch string             `json:"baseBranch"`
-	Archived   bool               `json:"archived"`
-	Repo       *string            `json:"repo"`
-	Discovery  *discoveryResponse `json:"discovery"`
+	ID              string             `json:"id"`
+	Name            string             `json:"name"`
+	RepoPath        string             `json:"repoPath"`
+	BaseBranch      string             `json:"baseBranch"`
+	Archived        bool               `json:"archived"`
+	Repo            *string            `json:"repo"`
+	GatekeeperTrust string             `json:"gatekeeperTrust"`
+	Discovery       *discoveryResponse `json:"discovery"`
 }
 
 type projectsListResponse struct {
@@ -1554,6 +1590,8 @@ Usage:
                                Inspect immutable advise agreement outcomes
   looper gatekeeper verdicts [project-id]
                                Inspect the newest Gatekeeper verdict per PR
+  looper gatekeeper promote <project-id> <advise|auto>
+                               Explicitly promote an API-managed project
   looper project add <path>    Register a git repository root with the daemon
   looper project list          List registered projects
   looper project discover <id> Retry post-commit worktree/PR discovery for a project

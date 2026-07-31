@@ -2546,6 +2546,54 @@ func TestHandlerProjectsPatchDistinguishesNullFromOmittedFields(t *testing.T) {
 	}
 }
 
+func TestHandlerProjectsPatchPromotesGatekeeperTrust(t *testing.T) {
+	fixture := newTestFixture(t)
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+	metadata := `{"repo":"acme/looper","source":"api","validation":{"optOut":true}}`
+	if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{
+		ID: "project_a", Name: "Project A", RepoPath: "/tmp/project-a", BaseBranch: stringPtr("main"),
+		MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	h := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime})
+	h.ServeHTTP(recorder, httptest.NewRequest(http.MethodPatch, "/api/v1/projects/project_a", bytes.NewReader([]byte(`{"gatekeeperTrust":"advise"}`))))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	data := parseJSONMap(t, recorder.Body.Bytes())["data"].(map[string]any)
+	assertEqual(t, data["id"], "project_a")
+	assertEqual(t, data["gatekeeperTrust"], "advise")
+	stored, err := fixture.runtime.Services().Repositories.Projects.GetByID(context.Background(), "project_a")
+	if err != nil || stored == nil || stored.MetadataJSON == nil {
+		t.Fatalf("Projects.GetByID() = %#v, %v, want promoted project", stored, err)
+	}
+	if !strings.Contains(*stored.MetadataJSON, `"trust":"advise"`) {
+		t.Fatalf("metadata = %s, want advise trust", *stored.MetadataJSON)
+	}
+}
+
+func TestHandlerProjectsPatchMapsGatekeeperPromotionValidation(t *testing.T) {
+	fixture := newTestFixture(t)
+	var got projects.UpdateInput
+	h := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, ProjectsService: fakeProjectService{
+		updateProject: func(_ context.Context, _ string, input projects.UpdateInput) (storage.ProjectRecord, error) {
+			got = input
+			return storage.ProjectRecord{ID: "project_a", Name: "Project A", RepoPath: "/tmp/project-a"}, projects.ProjectValidationError{Message: "project is managed by config"}
+		},
+	}})
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, httptest.NewRequest(http.MethodPatch, "/api/v1/projects/project_a", bytes.NewReader([]byte(`{"gatekeeperTrust":"auto"}`))))
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if !got.GatekeeperTrust.Set || got.GatekeeperTrust.Value == nil || *got.GatekeeperTrust.Value != "auto" {
+		t.Fatalf("gatekeeper trust input = %#v, want auto", got.GatekeeperTrust)
+	}
+}
+
 func TestHandlerProjectsCreateRouteLeavesCatalogPublicationToService(t *testing.T) {
 	fixture := newTestFixture(t)
 	nowISO := fixture.now.UTC().Format(javaScriptISOString)

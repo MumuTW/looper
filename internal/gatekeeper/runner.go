@@ -120,6 +120,8 @@ type Evidence struct {
 	ReviewerConvergence          *ReviewerConvergenceEvidence `json:"reviewerConvergence,omitempty"`
 	ProjectPolicyPermitsTarget   bool                         `json:"projectPolicyPermitsTarget"`
 	FinalObservedHeadSHA         string                       `json:"finalObservedHeadSha,omitempty"`
+	MergedAt                     string                       `json:"mergedAt,omitempty"`
+	ClosedAt                     string                       `json:"closedAt,omitempty"`
 }
 
 type Report struct {

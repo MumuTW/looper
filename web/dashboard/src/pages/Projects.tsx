@@ -67,6 +67,15 @@ export function ProjectsPage() {
         cell: (p) => <span className="mono">{p.baseBranch}</span>,
       },
       {
+        key: "gatekeeperTrust",
+        header: "Gatekeeper",
+        cell: (p) => (
+          <span className="mono">
+            {p.gatekeeperTrust ?? "observe"}
+          </span>
+        ),
+      },
+      {
         key: "updatedAt",
         header: "Updated",
         cell: (p) => (

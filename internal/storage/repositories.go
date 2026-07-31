@@ -497,6 +497,7 @@ END`
 
 const triageLifecyclePredicateSQL = `entity_type = 'github_issue'
 	AND event_type IN ('triage.enrolled', 'triage.report', 'triage.confirmed', 'triage.routed', 'triage.retired')`
+
 func (r *EventsRepository) Append(ctx context.Context, record EventLogRecord) error {
 	_, err := r.q.ExecContext(ctx, `
 		INSERT INTO event_logs (
