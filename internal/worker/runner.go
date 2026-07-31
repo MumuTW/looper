@@ -834,6 +834,21 @@ func (r *Runner) ensureWorkerReproductionBaseline(ctx context.Context, checkpoin
 	return nil
 }
 
+// persistWorkerReproductionBaseline closes the crash window between observing
+// a red reproduction and starting the next operation. Normal workflow steps
+// also persist their returned checkpoint, but execute/validate/open-pr can be
+// entered directly when resuming an older run, so the evidence must be written
+// before those operations proceed.
+func (r *Runner) persistWorkerReproductionBaseline(ctx context.Context, input stepInput, checkpoint workerCheckpoint, wasPresent bool) error {
+	if wasPresent || checkpoint.ReproductionBaseline == nil || strings.TrimSpace(input.Run.ID) == "" {
+		return nil
+	}
+	if err := r.persistCheckpoint(ctx, input.Run.ID, checkpoint); err != nil {
+		return &loopError{message: fmt.Sprintf("persist reproduction baseline checkpoint: %v", err), kind: FailureRetryableAfterResume}
+	}
+	return nil
+}
+
 func workerValidationCommands(base []string, work workerInput) []string {
 	commands := append([]string(nil), base...)
 	if work.Reproduction != nil && strings.TrimSpace(work.Reproduction.TestCommand) != "" && !containsWorkerCommand(commands, work.Reproduction.TestCommand) {
@@ -1631,7 +1646,11 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (w
 			if err := captureWorkerReproduction(&checkpoint, checkpoint.Worktree.Path); err != nil {
 				return checkpoint, err
 			}
+			baselineWasPresent := checkpoint.ReproductionBaseline != nil
 			if err := r.ensureWorkerReproductionBaseline(ctx, &checkpoint, checkpoint.Worktree.Path); err != nil {
+				return checkpoint, err
+			}
+			if err := r.persistWorkerReproductionBaseline(ctx, input, checkpoint, baselineWasPresent); err != nil {
 				return checkpoint, err
 			}
 			return checkpoint, nil
@@ -1694,7 +1713,11 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (w
 	if err := captureWorkerReproduction(&checkpoint, created.WorktreePath); err != nil {
 		return checkpoint, err
 	}
+	baselineWasPresent := checkpoint.ReproductionBaseline != nil
 	if err := r.ensureWorkerReproductionBaseline(ctx, &checkpoint, created.WorktreePath); err != nil {
+		return checkpoint, err
+	}
+	if err := r.persistWorkerReproductionBaseline(ctx, input, checkpoint, baselineWasPresent); err != nil {
 		return checkpoint, err
 	}
 	return checkpoint, nil
@@ -1830,7 +1853,11 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 	if err := captureWorkerReproduction(&checkpoint, worktree.Path); err != nil {
 		return checkpoint, err
 	}
+	baselineWasPresent := checkpoint.ReproductionBaseline != nil
 	if err := r.ensureWorkerReproductionBaseline(ctx, &checkpoint, worktree.Path); err != nil {
+		return checkpoint, err
+	}
+	if err := r.persistWorkerReproductionBaseline(ctx, input, checkpoint, baselineWasPresent); err != nil {
 		return checkpoint, err
 	}
 	work = *checkpoint.Work
@@ -2071,7 +2098,11 @@ func (r *Runner) runValidateStep(ctx context.Context, input stepInput) (workerCh
 	if err := captureWorkerReproduction(&checkpoint, worktree.Path); err != nil {
 		return checkpoint, err
 	}
+	baselineWasPresent := checkpoint.ReproductionBaseline != nil
 	if err := r.ensureWorkerReproductionBaseline(ctx, &checkpoint, worktree.Path); err != nil {
+		return checkpoint, err
+	}
+	if err := r.persistWorkerReproductionBaseline(ctx, input, checkpoint, baselineWasPresent); err != nil {
 		return checkpoint, err
 	}
 	work = *checkpoint.Work
@@ -2167,7 +2198,11 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 	if err := captureWorkerReproduction(&checkpoint, worktree.Path); err != nil {
 		return checkpoint, err
 	}
+	baselineWasPresent := checkpoint.ReproductionBaseline != nil
 	if err := r.ensureWorkerReproductionBaseline(ctx, &checkpoint, worktree.Path); err != nil {
+		return checkpoint, err
+	}
+	if err := r.persistWorkerReproductionBaseline(ctx, input, checkpoint, baselineWasPresent); err != nil {
 		return checkpoint, err
 	}
 	work = *checkpoint.Work
