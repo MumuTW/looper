@@ -564,7 +564,23 @@ func TestCloseLoopDrainsLiveExecutionBeforePersistingTermination(t *testing.T) {
 
 	registry := looperdruntime.NewActiveExecutionRegistry()
 	services.ActiveExecutions = registry
-	active := &fakeActiveExecution{}
+	active := &fakeActiveExecution{onKill: func() error {
+		loop, err := repos.Loops.GetByID(ctx, fixture.loopID)
+		if err != nil {
+			return fmt.Errorf("read loop while killing active execution: %w", err)
+		}
+		if loop == nil || loop.Status == "terminated" {
+			return fmt.Errorf("loop at active-execution kill = %#v, want non-terminal loop", loop)
+		}
+		queue, err := repos.Queue.GetByID(ctx, "queue_"+fixture.loopID)
+		if err != nil {
+			return fmt.Errorf("read queue while killing active execution: %w", err)
+		}
+		if queue == nil || queue.Status == "cancelled" {
+			return fmt.Errorf("queue at active-execution kill = %#v, want non-cancelled queue", queue)
+		}
+		return nil
+	}}
 	cleanup := bindTestActiveExecution(t, registry, fixture.loopID, fixture.runID, fixture.executionID, active)
 	t.Cleanup(cleanup)
 
@@ -611,12 +627,23 @@ func TestCloseLoopAtomicallyRetiresHumanTakeoverWithoutHandback(t *testing.T) {
 	ctx := context.Background()
 	services, repos, now := newStopAllTestServices(t)
 	fixture := stopAllLoopFixture{
-		loopID: "loop_close_human", seq: 83, loopType: "worker", loopStatus: "human_takeover", queueStatus: "queued",
+		loopID: "loop_close_human", seq: 83, loopType: "worker", loopStatus: "queued", queueStatus: "queued",
 	}
 	insertStopAllTestLoop(t, ctx, repos, now, fixture)
 
 	registry := looperdruntime.NewActiveExecutionRegistry()
 	services.ActiveExecutions = registry
+	if _, err := takeoverLoop(ctx, services, fixture.loopID, "Taken over by operator", func() time.Time { return now }, nil, nil); err != nil {
+		t.Fatalf("takeoverLoop() error = %v", err)
+	}
+	heldLoop, err := repos.Loops.GetByID(ctx, fixture.loopID)
+	if err != nil || heldLoop == nil || heldLoop.Status != "human_takeover" || heldLoop.NextRunAt != nil {
+		t.Fatalf("Loops.GetByID() after takeover = (%#v, %v), want held loop without reschedule", heldLoop, err)
+	}
+	heldQueue, err := repos.Queue.GetByID(ctx, "queue_"+fixture.loopID)
+	if err != nil || heldQueue == nil || heldQueue.Status != "cancelled" || heldQueue.LastError == nil || *heldQueue.LastError != "Taken over by operator" {
+		t.Fatalf("Queue.GetByID() after takeover = (%#v, %v), want cancelled queue with takeover reason", heldQueue, err)
+	}
 	if _, err := closeLoop(ctx, services, fixture.loopID, "Closed by operator", func() time.Time { return now }, nil, nil); err != nil {
 		t.Fatalf("closeLoop(human_takeover) error = %v", err)
 	}
@@ -625,8 +652,8 @@ func TestCloseLoopAtomicallyRetiresHumanTakeoverWithoutHandback(t *testing.T) {
 		t.Fatalf("Loops.GetByID() = (%#v, %v), want terminated loop without reschedule", loop, err)
 	}
 	queue, err := repos.Queue.GetByID(ctx, "queue_"+fixture.loopID)
-	if err != nil || queue == nil || queue.Status != "cancelled" || queue.LastError == nil || *queue.LastError != "Closed by operator" {
-		t.Fatalf("Queue.GetByID() = (%#v, %v), want cancelled queue with close reason", queue, err)
+	if err != nil || queue == nil || queue.Status != "cancelled" || queue.LastError == nil || *queue.LastError != "Taken over by operator" {
+		t.Fatalf("Queue.GetByID() = (%#v, %v), want takeover-cancelled queue without requeue", queue, err)
 	}
 	if !registry.LoopStopActive(fixture.loopID) {
 		t.Fatal("LoopStopActive = false after closing human takeover, want sticky admission gate")

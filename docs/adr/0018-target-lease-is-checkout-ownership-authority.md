@@ -110,9 +110,11 @@ stale-run repair, startup recovery, and takeover itself.
 
 Acquisition, the `human_takeover` projection, and the queue cancellation are one
 SQLite transaction. Handback atomically matches and releases the acquired lease,
-clears the projection, and requeues. Terminal disposition, which is permitted
-only after the human lease is gone, atomically records the terminal status and
-cancels active queue work; it never requeues terminal work.
+clears the projection, and requeues. An authenticated `close` request is the
+sole terminal exception: it atomically releases a human lease while recording
+the terminal status and cancelling active queue work; it never requeues terminal
+work. All other terminal disposition is permitted only after the human lease is
+gone.
 
 Neither half is safe alone. A lease with no projection is permanently held and
 invisible to handback, which finds no held loop to release — the operator never
@@ -141,7 +143,7 @@ two authorities, and **PID absence is never either of them**.
 
 | holder | release authority |
 | --- | --- |
-| human | handback after the operator has ended the interactive shell |
+| human | handback after the operator has ended the interactive shell to requeue; authenticated `close` after it has ended to terminalize |
 | agent | ADR-0015 Supervisor-confirmed containment/drain |
 
 For agent-held leases this ADR states no rule of its own; it defers to ADR-0015,
@@ -163,9 +165,10 @@ reintroducing, at the filesystem, exactly the failure ADR-0015 closed at the
 process. Birth tokens in `internal/processidentity` sharpen *recognition* of an
 observed process; they cannot prove a tree drained, and only confirmed drain can.
 
-For human-held leases the authority is an authenticated operator control request
-after ending the interactive shell, never a probe. A human lease never expires
-and is never reclaimed by liveness rules.
+For human-held leases, handback is the authority to requeue and authenticated
+`close` is the authority to terminalize, both only after the operator has ended
+the interactive shell and never from a probe. A human lease never expires and is
+never reclaimed by liveness rules.
 
 ### Close atomically relinquishes a human takeover
 
