@@ -1205,10 +1205,13 @@
       "notes": [
         "GET /api/v1/loops/{id}/logs?follow=1 returns text/event-stream (not a JSON envelope).",
         "Wire format: event: <name>\\ndata: <json>\\n\\n",
-        "Event order: snapshot (once), zero or more chunk, optional end then close.",
+        "Event order: snapshot (once), zero or more chunk, then either end or error, then close.",
         "snapshot data shape matches loop.logs body.data.",
         "chunk data shape: { content: string, runId?, currentStep?, executionId?, vendor?, pid?, status? }.",
-        "end data shape: { reason?: string } (e.g. run_completed)."
+        "end data shape: { reason?: string } (e.g. run_completed).",
+        "error data shape: { code: string, message: string, retryable: boolean, retryAfterMs?: number }; code is a daemon error code from the errors artifact's errorCodes list.",
+        "error is emitted when a follow-mode poll, state refresh, or persisted-log read fails; the server writes it and closes the stream.",
+        "retryable is true when the underlying failure maps to a 5xx status, and retryAfterMs is present (1000) only then."
       ],
       "events": {
         "snapshot": {
@@ -1246,6 +1249,15 @@
           "event": "end",
           "data": {
             "reason": "run_completed"
+          }
+        },
+        "error": {
+          "event": "error",
+          "data": {
+            "code": "INTERNAL_ERROR",
+            "message": "read loop logs: permission denied",
+            "retryable": true,
+            "retryAfterMs": 1000
           }
         }
       }
