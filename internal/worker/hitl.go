@@ -5,8 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -14,10 +12,6 @@ import (
 	"github.com/MumuTW/looper/internal/loops"
 	"github.com/MumuTW/looper/internal/storage"
 )
-
-// hitlSentinelRelPath is where an agent writes a mid-run question, relative to
-// the worktree root. Mirrors synclo's afk ask sentinel.
-const hitlSentinelRelPath = ".looper/ask.json"
 
 // hitlPromptInstruction is appended to the worker prompt ONLY when hitl.enabled
 // is true. It tells the agent how to pause and ask a human instead of guessing.
@@ -53,12 +47,6 @@ type hitlAsk struct {
 	Confidence        string            `json:"confidence,omitempty"`
 }
 
-// hitlSentinelQuarantinePattern names per-event quarantine directories under
-// the system temp dir: outside the Git worktree, so auto-commit reconciliation
-// can never commit the evidence, and unique per event, so a repeated malformed
-// ask cannot clobber earlier preserved evidence.
-const hitlSentinelQuarantinePattern = "looper-ask-quarantine-*"
-
 // maxAskSentinelBytes bounds a sentinel read; a decision brief is small, and
 // an enormous file is not a decodable gate request.
 const maxAskSentinelBytes = 1 << 20
@@ -72,63 +60,46 @@ const maxAskSentinelBytes = 1 << 20
 // Consuming (deleting) a valid sentinel prevents the same question from
 // re-suspending on resume.
 func consumeAskSentinel(worktreePath string) (*hitlAsk, error) {
-	if strings.TrimSpace(worktreePath) == "" {
-		return nil, nil
+	raw, evidence, err := loops.StageHITLGateEvidence(worktreePath, maxAskSentinelBytes)
+	if evidence == nil {
+		return nil, err
 	}
-	path := filepath.Join(worktreePath, hitlSentinelRelPath)
-	info, err := os.Stat(path)
+	protocolError := func(cause error) (*hitlAsk, error) {
+		return nil, &askSentinelProtocolError{cause: cause, evidence: evidence}
+	}
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("ask sentinel exists but cannot be read: %w", err)
+		return protocolError(err)
 	}
-	if info.Size() > maxAskSentinelBytes {
-		return nil, quarantineAskSentinel(path, fmt.Errorf("ask sentinel is %d bytes (limit %d)", info.Size(), maxAskSentinelBytes))
+	if evidence.Kind == "symlink" {
+		return protocolError(errors.New("ask sentinel is a symlink; target content was not read"))
 	}
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("ask sentinel exists but cannot be read: %w", err)
+	if evidence.Truncated {
+		return protocolError(fmt.Errorf("ask sentinel is %d bytes (limit %d)", evidence.Size, maxAskSentinelBytes))
 	}
 	var ask hitlAsk
 	if err := json.Unmarshal(raw, &ask); err != nil {
-		return nil, quarantineAskSentinel(path, fmt.Errorf("ask sentinel is not valid JSON: %w", err))
+		return protocolError(fmt.Errorf("ask sentinel is not valid JSON: %w", err))
 	}
 	if strings.TrimSpace(ask.Question) == "" {
-		return nil, quarantineAskSentinel(path, errors.New("ask sentinel has no question"))
+		return protocolError(errors.New("ask sentinel has no question"))
 	}
-	_ = os.Remove(path)
+	if err := loops.ConsumeHITLGateEvidence(evidence); err != nil {
+		return protocolError(fmt.Errorf("decoded ask sentinel could not be consumed: %w", err))
+	}
 	return &ask, nil
 }
 
-// quarantineAskSentinel preserves undecodable gate evidence in a unique
-// directory OUTSIDE the Git worktree and returns an actionable diagnostic.
-// In-worktree quarantine would become an untracked change that auto-commit
-// reconciliation commits into the branch, and a fixed name would let a
-// repeated malformed ask clobber earlier evidence.
-func quarantineAskSentinel(path string, cause error) error {
-	dir, err := os.MkdirTemp("", hitlSentinelQuarantinePattern)
-	if err != nil {
-		return fmt.Errorf("%v; quarantine also failed: %v (evidence left at %s)", cause, err, path)
-	}
-	quarantined := filepath.Join(dir, filepath.Base(path))
-	if err := os.Rename(path, quarantined); err != nil {
-		// Cross-device or permission failure: fall back to copy-and-remove so
-		// the evidence still leaves the consume path.
-		raw, readErr := os.ReadFile(path)
-		if readErr != nil {
-			return fmt.Errorf("%v; quarantine also failed: %v (evidence left at %s)", cause, err, path)
-		}
-		if writeErr := os.WriteFile(quarantined, raw, 0o600); writeErr != nil {
-			return fmt.Errorf("%v; quarantine also failed: %v (evidence left at %s)", cause, writeErr, path)
-		}
-		_ = os.Remove(path)
-	}
-	return fmt.Errorf("%v; evidence quarantined at %s — inspect it, then answer or retry the loop", cause, quarantined)
+type askSentinelProtocolError struct {
+	cause    error
+	evidence *loops.HITLGateEvidence
 }
+
+func (e *askSentinelProtocolError) Error() string {
+	return fmt.Sprintf("%v; staged bounded evidence at %s (kind=%s size=%d prefix_sha256=%s)",
+		e.cause, e.evidence.PendingPath, e.evidence.Kind, e.evidence.Size, e.evidence.PrefixSHA256)
+}
+
+func (e *askSentinelProtocolError) Unwrap() error { return e.cause }
 
 // awaitingHumanError is returned from the execute step when the agent asked a
 // human mid-run. The step loop catches it and suspends the loop as
@@ -144,6 +115,7 @@ type awaitingHumanError struct {
 	recommendedOption string
 	consequences      map[string]string
 	confidence        string
+	gateEvidence      *loops.HITLGateEvidence
 }
 
 func (e *awaitingHumanError) Error() string { return "worker paused awaiting human decision" }
@@ -291,13 +263,27 @@ func (r *Runner) readFreshHITLAsk(ctx context.Context, loop *storage.LoopRecord)
 func (r *Runner) detectHumanAsk(ctx context.Context, input stepInput, worktreePath, executionID string) (*awaitingHumanError, error) {
 	ask, err := consumeAskSentinel(worktreePath)
 	if err != nil {
-		// Fail closed AND parked: the sentinel exists, so the agent requested
-		// a human gate. A plain error would classify as retryable-transient,
-		// auto-requeue, and the retry — finding the sentinel quarantined —
-		// would proceed to publication, exactly the bypass the gate exists to
-		// prevent. Manual intervention keeps the loop stopped until a human
-		// inspects the quarantined evidence.
-		return nil, &loopError{message: fmt.Sprintf("HITL ask sentinel failure for loop %s: %v", input.Loop.ID, err), kind: FailureManualIntervention}
+		var protocol *askSentinelProtocolError
+		if errors.As(err, &protocol) {
+			sessionID, vendor := r.latestAgentSession(ctx, input.Loop.ID)
+			diagnostic := fmt.Sprintf("HITL ask sentinel failure for loop %s: %v", input.Loop.ID, err)
+			return &awaitingHumanError{
+				question:  "Looper could not decode the agent's human-decision request. Should the staged request be discarded so the agent can regenerate it or continue with your guidance?",
+				options:   []string{"discard and regenerate the decision brief", "discard and continue with my guidance"},
+				sessionID: sessionID, executionID: executionID, vendor: vendor,
+				recommendation: diagnostic, recommendedOption: "discard and regenerate the decision brief",
+				consequences: map[string]string{
+					"discard and regenerate the decision brief": "consume the exact staged identity and require a fresh decision brief",
+					"discard and continue with my guidance":     "consume the exact staged identity and resume only under this human answer",
+				},
+				confidence: "low", gateEvidence: protocol.evidence,
+			}, nil
+		}
+		kind := FailureRetryableAfterResume
+		if errors.Is(err, loops.ErrUnsupportedHITLGateFile) {
+			kind = FailureManualIntervention
+		}
+		return nil, &loopError{message: fmt.Sprintf("HITL ask sentinel inspection failed for loop %s: %v", input.Loop.ID, err), kind: kind}
 	}
 	if ask == nil {
 		return nil, nil
@@ -362,6 +348,7 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 		RecommendedOption: awaiting.recommendedOption,
 		Consequences:      awaiting.consequences,
 		Confidence:        awaiting.confidence,
+		GateEvidence:      awaiting.gateEvidence,
 	}
 	// Preflight the strict metadata decode before ANY GitHub side effects: a
 	// malformed value would otherwise let deliverAskToGitHub publish a branch,
@@ -373,8 +360,8 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 	// GitHub transport (default): post the question on a (draft) PR before parking,
 	// so the ask metadata carries the PR + comment id the answer-poll lane needs.
 	// Best-effort — the loop still parks awaiting_human if delivery fails.
-	if r.hitlTransportGitHub() {
-		if err := r.deliverAskToGitHub(ctx, input, &checkpoint, awaiting, &ask); err != nil && r.logger != nil {
+	if r.hitlTransportGitHub() && awaiting.gateEvidence == nil {
+		if err := r.deliverAskToGitHub(ctx, input, &checkpoint, awaiting, &ask, true); err != nil && r.logger != nil {
 			r.logger.Warn("worker HITL github ask delivery failed; loop parked awaiting human without a PR comment", map[string]any{
 				"loopId": input.Loop.ID, "error": err.Error(),
 			})
@@ -418,6 +405,31 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 	summary := "Awaiting human decision: " + awaiting.question
 	if _, err := r.completeRun(ctx, run, "interrupted", summary, "", checkpoint); err != nil {
 		return ProcessResult{}, err
+	}
+	// A malformed gate is persisted and parked before any default-GitHub side
+	// effect. It may be surfaced on an existing PR, but this path is forbidden
+	// from pushing a branch or creating a PR merely to carry undecodable work.
+	if r.hitlTransportGitHub() && awaiting.gateEvidence != nil {
+		if err := r.deliverAskToGitHub(ctx, input, &checkpoint, awaiting, &ask, false); err != nil {
+			if r.logger != nil {
+				r.logger.Warn("worker malformed HITL github delivery skipped; loop remains answerable via API", map[string]any{"loopId": input.Loop.ID, "error": err.Error()})
+			}
+		} else {
+			unlock := loops.LockLoopRequeue(input.Loop.ID)
+			var correlationWriteErr error
+			_, persistErr := r.updateLoop(ctx, input.Loop, func(updated *storage.LoopRecord) {
+				meta, err := loops.WriteHITLAsk(updated.MetadataJSON, ask)
+				if err != nil {
+					correlationWriteErr = err
+					return
+				}
+				updated.MetadataJSON = &meta
+			})
+			unlock()
+			if persistErr = errors.Join(persistErr, correlationWriteErr); persistErr != nil && r.logger != nil {
+				r.logger.Warn("worker malformed HITL github correlation was not persisted", map[string]any{"loopId": input.Loop.ID, "error": persistErr.Error()})
+			}
+		}
 	}
 	if !r.hitlTransportGitHub() && r.hitlNotify != nil {
 		notif := HITLAskNotification{
@@ -473,11 +485,10 @@ func (r *Runner) hitlAwaitingLabel() string {
 	return labels.AwaitingHuman
 }
 
-// deliverAskToGitHub ensures a (draft) PR exists for the loop, posts the agent's
-// question as a marked PR comment, labels the PR so the answer-poll lane finds
-// it, and records the PR + comment id on the ask. Best-effort; returns an error
-// the caller logs while still parking the loop awaiting_human.
-func (r *Runner) deliverAskToGitHub(ctx context.Context, input stepInput, checkpoint *workerCheckpoint, awaiting *awaitingHumanError, ask *loops.HITLAsk) error {
+// deliverAskToGitHub posts a marked question and records its correlation. Normal
+// asks may create a draft PR; malformed gates pass allowCreate=false so they can
+// only use a PR that already existed before the gate was observed.
+func (r *Runner) deliverAskToGitHub(ctx context.Context, input stepInput, checkpoint *workerCheckpoint, awaiting *awaitingHumanError, ask *loops.HITLAsk, allowCreate bool) error {
 	if checkpoint == nil {
 		return fmt.Errorf("hitl github: worker checkpoint is required")
 	}
@@ -517,6 +528,9 @@ func (r *Runner) deliverAskToGitHub(ctx context.Context, input stepInput, checkp
 		}
 	}
 	if prNumber == 0 {
+		if !allowCreate {
+			return fmt.Errorf("hitl github: no existing PR for malformed gate on loop %s", input.Loop.ID)
+		}
 		created, err := r.ensureDraftPRForAsk(ctx, input, checkpoint, repo, cwd)
 		if err != nil {
 			return err
@@ -533,7 +547,7 @@ func (r *Runner) deliverAskToGitHub(ctx context.Context, input stepInput, checkp
 		return fmt.Errorf("hitl github: could not resolve a PR for loop %s", input.Loop.ID)
 	}
 
-	body := buildGitHubAskComment(input.Loop.Seq, awaiting.question, awaiting.options, r.hitlGitHub.MentionLogins)
+	body := buildGitHubAskComment(input.Loop.Seq, awaiting.question, awaiting.options, awaiting.recommendation, r.hitlGitHub.MentionLogins)
 	disclosureAgent, disclosureModel := r.disclosureIdentity(input.Run)
 	res, err := r.github.CreateIssueComment(ctx, IssueCommentInput{Repo: repo, IssueNumber: prNumber, Body: body, CWD: cwd, DisclosureAgent: disclosureAgent, DisclosureModel: disclosureModel})
 	if err != nil {
@@ -609,7 +623,7 @@ const hitlGitHubAskMarkerPrefix = "<!-- looper:hitl:ask v=1"
 
 // buildGitHubAskComment renders the ask as a PR comment carrying a machine marker
 // (so the poll lane finds it and never mistakes it for a human answer).
-func buildGitHubAskComment(loopSeq int64, question string, options []string, mentionLogins []string) string {
+func buildGitHubAskComment(loopSeq int64, question string, options []string, recommendation string, mentionLogins []string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "%s loop=%d -->\n", hitlGitHubAskMarkerPrefix, loopSeq)
 	b.WriteString("🤔 **looper needs a decision to continue.**\n\n")
@@ -618,6 +632,9 @@ func buildGitHubAskComment(loopSeq int64, question string, options []string, men
 		if o = strings.TrimSpace(o); o != "" {
 			fmt.Fprintf(&b, "\n- %s", o)
 		}
+	}
+	if recommendation = strings.TrimSpace(recommendation); recommendation != "" {
+		b.WriteString("\n\n**Context**\n\n" + recommendation)
 	}
 	b.WriteString("\n\nReply to this comment with your choice — a letter, an option, or free-form guidance. I'll pick it up and continue on this PR.")
 	if m := githubMentionLine(mentionLogins); m != "" {

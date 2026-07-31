@@ -39,6 +39,25 @@ type HITLAsk struct {
 	RecommendedOption string            `json:"recommendedOption,omitempty"`
 	Consequences      map[string]string `json:"consequences,omitempty"`
 	Confidence        string            `json:"confidence,omitempty"`
+	// GateEvidence identifies a malformed sentinel that was atomically moved
+	// out of the active ask path. Only an authenticated human response may
+	// consume this exact identity and let the loop resume.
+	GateEvidence *HITLGateEvidence `json:"gateEvidence,omitempty"`
+}
+
+// HITLGateEvidence is bounded daemon-observed protocol evidence. It does not
+// authorize an action and never contains the sentinel's untrusted bytes.
+type HITLGateEvidence struct {
+	WorktreeRoot  string `json:"worktreeRoot"`
+	PendingPath   string `json:"pendingPath"`
+	Kind          string `json:"kind"`
+	Device        uint64 `json:"device"`
+	Inode         uint64 `json:"inode"`
+	Size          int64  `json:"size"`
+	Mode          uint32 `json:"mode"`
+	PrefixSHA256  string `json:"prefixSha256,omitempty"`
+	CapturedBytes int64  `json:"capturedBytes,omitempty"`
+	Truncated     bool   `json:"truncated,omitempty"`
 }
 
 // ReadHITLAsk extracts the HITL ask state from a loop's metadata JSON. The

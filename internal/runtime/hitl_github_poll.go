@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"strings"
 
@@ -257,6 +258,12 @@ func deliverHITLAnswerToLoop(ctx context.Context, repos *storage.Repositories, n
 	ask, ok := loops.ReadHITLAsk(loop.MetadataJSON)
 	if !ok {
 		return nil
+	}
+	// GitHub answers are admitted only after author allowlist/repository-write
+	// checks above. That authenticated answer is the authority to consume the
+	// exact staged malformed gate identity; changed evidence remains parked.
+	if err := loops.ConsumeHITLGateEvidence(ask.GateEvidence); err != nil {
+		return fmt.Errorf("consume malformed HITL gate evidence: %w", err)
 	}
 	ask.Answer = answer
 	ask.Status = "answered"

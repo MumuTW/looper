@@ -5959,6 +5959,13 @@ func (h *Handler) deliverHumanAnswer(ctx context.Context, loopID string, rawAnsw
 			return storage.LoopRecord{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Loop %s is not awaiting a human (status: %s)", loopID, loop.Status)}
 		}
 		ask, _ := loops.ReadHITLAsk(loop.MetadataJSON)
+		// The authenticated response is the authority to discard a malformed
+		// gate, but only when the staged filesystem identity still matches the
+		// bounded evidence persisted with this ask. A replacement leaves the
+		// loop parked and is never removed by daemon privilege.
+		if err := loops.ConsumeHITLGateEvidence(ask.GateEvidence); err != nil {
+			return storage.LoopRecord{}, fmt.Errorf("consume malformed HITL gate evidence: %w", err)
+		}
 		ask.Answer = answer
 		ask.Status = "answered"
 		ask.AnsweredAt = nowISO
