@@ -1718,6 +1718,27 @@ func (r *Runner) validationCommandsForProject(projectID string) []string {
 	return r.validationCommands
 }
 
+// projectValidationPolicyKnown reports whether projectID has a resolved
+// validation policy entry from the runtime catalog. The runtime always
+// supplies validationCommandsByProject (possibly empty) from
+// config.ResolveProjectValidationCommandsByID; a nil map means the runner was
+// constructed without catalog policy information (tests/legacy), so the legacy
+// global-defaults fallback in validationCommandsForProject is preserved. A
+// non-nil map without an entry for projectID means the project was removed from
+// the catalog — an unstanced legacy row quarantined because
+// defaults.validationCommands is empty and it carries no validation stance.
+// Its durable sticky retry must fail closed before any agent work so it cannot
+// modify or publish code without the project-owned validation gate that caused
+// it to be quarantined; validation.RunCommands otherwise reports success
+// without running anything against the empty defaults fallback.
+func (r *Runner) projectValidationPolicyKnown(projectID string) bool {
+	if r.validationCommandsByProject == nil {
+		return true
+	}
+	_, ok := r.validationCommandsByProject[projectID]
+	return ok
+}
+
 func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput) (DiscoveryResult, error) {
 	ctx = githubinfra.ContextWithDiscoverySnapshot(ctx, input.Snapshot)
 	if r.repos == nil || r.repos.Projects == nil || r.repos.Loops == nil || r.repos.Queue == nil || r.repos.Runs == nil || r.repos.Locks == nil {
@@ -2365,6 +2386,19 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	}
 	if project == nil {
 		return ProcessResult{}, fmt.Errorf("project not found: %s", loop.ProjectID)
+	}
+	// A project removed from the runtime catalog (quarantined unstanced legacy
+	// row with empty defaults.validationCommands) has no resolved validation
+	// policy. Its durable sticky retry must fail closed before any agent work
+	// so it cannot modify or publish code without the project-owned validation
+	// gate. recoverClaimedItem terminal-fails the queue item and pauses the
+	// loop; the project becomes runnable again once repaired via PATCH or once
+	// defaults.validationCommands is configured.
+	if !r.projectValidationPolicyKnown(project.ID) {
+		return ProcessResult{}, &loopError{
+			message: fmt.Sprintf("project %s is quarantined without a validation policy; repair the project validation stance or configure defaults.validationCommands before retrying", project.ID),
+			kind:    FailureManualIntervention,
+		}
 	}
 	resumedRun, err := r.createRunContext(ctx, *loop)
 	if err != nil {

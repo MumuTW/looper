@@ -873,6 +873,59 @@ func TestProcessClaimedItemCompletesCreatePRFlow(t *testing.T) {
 	}
 }
 
+// TestProcessClaimedItemFailsClosedForQuarantinedProject verifies the
+// claim-to-run fail-closed invariant for a quarantined unstanced legacy
+// project. When the runtime catalog (modeled by a non-nil
+// ValidationCommandsByProject) has no entry for the project, the durable
+// sticky retry must fail closed before any agent work instead of falling back
+// to empty defaults and letting validation.RunCommands report success without
+// running anything. recoverClaimedItem terminal-fails the queue item and
+// pauses the loop; the agent never executes.
+func TestProcessClaimedItemFailsClosedForQuarantinedProject(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	git := &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "looper/feature", BaseBranch: "main", HeadSHA: "abc123", WorktreeID: "worktree_1"}}
+	github := &fakeGitHubGateway{createPRResult: CreatePullRequestResult{Number: 101, URL: "https://example/pr/101"}}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "done", Stdout: "ok", ParseStatus: "parsed"}}}
+	// Non-nil map with no entry for project_1 models a catalog that quarantined
+	// the unstanced legacy project (empty defaults.validationCommands, no
+	// validation stance). A nil map would mean "no catalog provided" and is
+	// intentionally treated as policy-known to preserve legacy/test behavior.
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true, OpenPRStrategy: config.OpenPRStrategyAllDone, ValidationCommandsByProject: map[string][]string{}})
+
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-1", "worker")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed item", claim, err)
+	}
+	result, err := runner.ProcessClaimedQueueItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedQueueItem() error = %v", err)
+	}
+	if result.Status != "failed" || result.FailureKind != FailureManualIntervention {
+		t.Fatalf("result = %#v, want failed/manual_intervention fail-closed", result)
+	}
+	if len(agent.starts) != 0 {
+		t.Fatalf("agent starts = %d, want 0: quarantined retry must not execute the agent", len(agent.starts))
+	}
+	if len(git.pushCalls) != 0 || len(github.createPRCalls) != 0 {
+		t.Fatalf("push=%d createPR=%d, want 0/0: quarantined retry must not publish", len(git.pushCalls), len(github.createPRCalls))
+	}
+	queue, err := fixture.repos.Queue.GetByID(context.Background(), claim.ID)
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	if queue == nil || queue.Status != "manual_intervention" {
+		t.Fatalf("queue = %#v, want terminal manual_intervention (not retried) fail-closed", queue)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_1")
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if loop == nil || loop.Status != "paused" {
+		t.Fatalf("loop = %#v, want paused after fail-closed", loop)
+	}
+}
+
 func TestBuildWorkerPromptDisablesRemoteLifecycleWhenAgentPRCreationDisabled(t *testing.T) {
 	t.Parallel()
 

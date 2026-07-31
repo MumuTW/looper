@@ -4322,6 +4322,69 @@ func TestProcessClaimedItemSkipsPRsNotOwnedByCurrentUser(t *testing.T) {
 	}
 }
 
+// TestProcessClaimedItemFailsClosedForQuarantinedProject verifies the
+// claim-to-run fail-closed invariant for a quarantined unstanced legacy
+// project's durable sticky fixer retry. When the runtime catalog (modeled by a
+// non-nil ValidationCommandsByProject) has no entry for the project, the retry
+// must fail closed before any agent work instead of falling back to empty
+// defaults and letting validation.RunCommands report success without running
+// anything. recoverClaimedItem terminal-fails the queue item and pauses the
+// loop; the agent never executes or pushes.
+func TestProcessClaimedItemFailsClosedForQuarantinedProject(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{
+		currentUser:   "looper-bot",
+		viewResponses: []PullRequestDetail{{Number: 42, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Author: "looper-bot", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}}},
+	}
+	git := &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt-42"), Branch: "feature/fix-42", HeadSHA: "base-head"}}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "applied fixes", ParseStatus: "parsed", Stdout: `__LOOPER_RESULT__={"summary":"applied fixes"}` + "\n"}}}
+	// Non-nil map with no entry for project_1 models a catalog that quarantined
+	// the unstanced legacy project (empty defaults.validationCommands, no
+	// validation stance). A nil map would mean "no catalog provided" and is
+	// intentionally treated as policy-known to preserve legacy/test behavior.
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, ValidationCommands: []string{"go test ./..."}, ValidationCommandsByProject: map[string][]string{}, AllowAutoCommit: true, AllowAutoPush: true, AllowRiskyFixes: true, Logger: fixture.logger, Now: fixture.now})
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	loop := storage.LoopRecord{ID: "loop_quarantined", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: stringPtr("pr:acme/looper:42"), Repo: &repo, PRNumber: &prNumber, Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	queue := storage.QueueItemRecord{ID: "queue_quarantined", ProjectID: stringPtr("project_1"), LoopID: &loop.ID, Type: "fixer", TargetType: "pull_request", TargetID: "pr:acme/looper:42", Repo: &repo, PRNumber: &prNumber, DedupeKey: "fixer:quarantined", Priority: storage.QueuePriorityFixer, Status: "running", AvailableAt: nowISO, Attempts: 0, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Queue.Upsert(context.Background(), queue); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	result, err := runner.ProcessClaimedQueueItem(context.Background(), queue)
+	if err != nil {
+		t.Fatalf("ProcessClaimedQueueItem() error = %v", err)
+	}
+	if result.Status != "failed" || result.FailureKind != FailureManualIntervention {
+		t.Fatalf("result = %#v, want failed/manual_intervention fail-closed", result)
+	}
+	if len(agent.starts) != 0 {
+		t.Fatalf("agent starts = %d, want 0: quarantined retry must not execute the agent", len(agent.starts))
+	}
+	if len(git.pushCalls) != 0 {
+		t.Fatalf("push calls = %d, want 0: quarantined retry must not publish", len(git.pushCalls))
+	}
+	persistedQueue, err := fixture.repos.Queue.GetByID(context.Background(), queue.ID)
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	if persistedQueue == nil || persistedQueue.Status != "manual_intervention" {
+		t.Fatalf("queue = %#v, want terminal manual_intervention (not retried) fail-closed", persistedQueue)
+	}
+	persistedLoop, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if persistedLoop == nil || persistedLoop.Status != "paused" {
+		t.Fatalf("loop = %#v, want paused after fail-closed", persistedLoop)
+	}
+}
+
 func TestProcessClaimedItemAllowsManualFixerRunForForeignPR(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
