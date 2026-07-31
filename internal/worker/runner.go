@@ -32,11 +32,11 @@ import (
 	"github.com/nexu-io/looper/internal/network/protocol"
 	"github.com/nexu-io/looper/internal/networkpolicy"
 	"github.com/nexu-io/looper/internal/processcontainment"
+	"github.com/nexu-io/looper/internal/roles"
 	"github.com/nexu-io/looper/internal/storage"
 	"github.com/nexu-io/looper/internal/validation"
 	"github.com/nexu-io/looper/internal/worker/workflow"
 	"github.com/nexu-io/looper/internal/worktreesafety"
-	"github.com/nexu-io/looper/internal/roles"
 )
 
 const (
@@ -47,10 +47,10 @@ const (
 	stepValidate        = workflow.StepValidate
 	stepOpenPR          = workflow.StepOpenPR
 
-	FailureRetryableTransient   roles.QueueFailureKind = "retryable_transient"
-	FailureRetryableAfterResume roles.QueueFailureKind = "retryable_after_resume"
-	FailureNonRetryable         roles.QueueFailureKind = "non_retryable"
-	FailureManualIntervention   roles.QueueFailureKind = "manual_intervention"
+	FailureRetryableTransient   = roles.FailureRetryableTransient
+	FailureRetryableAfterResume = roles.FailureRetryableAfterResume
+	FailureNonRetryable         = roles.FailureNonRetryable
+	FailureManualIntervention   = roles.FailureManualIntervention
 
 	defaultAgentTimeout = time.Hour
 	defaultClaimTTL     = 10 * time.Minute
@@ -77,8 +77,6 @@ var (
 // WorkerStep aliases the extracted workflow authority's step type; the
 // pipeline order and resume decisions live in internal/worker/workflow.
 type WorkerStep = workflow.Step
-
-
 
 type PullRequestSummary struct {
 	Number      int64

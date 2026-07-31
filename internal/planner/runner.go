@@ -23,9 +23,9 @@ import (
 	"github.com/nexu-io/looper/internal/lifecycle"
 	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/loops/failureclass"
+	"github.com/nexu-io/looper/internal/roles"
 	"github.com/nexu-io/looper/internal/storage"
 	"github.com/nexu-io/looper/internal/worktreesafety"
-	"github.com/nexu-io/looper/internal/roles"
 )
 
 const (
@@ -51,10 +51,10 @@ var plannerStepSequence = []PlannerStep{stepDiscoverIssues, stepPrepareWorktree,
 type PlannerStep string
 
 const (
-	FailureRetryableTransient   roles.QueueFailureKind = "retryable_transient"
-	FailureRetryableAfterResume roles.QueueFailureKind = "retryable_after_resume"
-	FailureNonRetryable         roles.QueueFailureKind = "non_retryable"
-	FailureManualIntervention   roles.QueueFailureKind = "manual_intervention"
+	FailureRetryableTransient   = roles.FailureRetryableTransient
+	FailureRetryableAfterResume = roles.FailureRetryableAfterResume
+	FailureNonRetryable         = roles.FailureNonRetryable
+	FailureManualIntervention   = roles.FailureManualIntervention
 )
 
 type IssueSummary struct {

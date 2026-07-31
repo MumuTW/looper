@@ -37,10 +37,10 @@ import (
 	"github.com/nexu-io/looper/internal/reviewer/publish"
 	"github.com/nexu-io/looper/internal/reviewer/resolution"
 	"github.com/nexu-io/looper/internal/reviewer/workflow"
+	"github.com/nexu-io/looper/internal/roles"
 	"github.com/nexu-io/looper/internal/storage"
 	"github.com/nexu-io/looper/internal/version"
 	"github.com/nexu-io/looper/internal/worktreesafety"
-	"github.com/nexu-io/looper/internal/roles"
 )
 
 // ReviewerStep and the stepXxx constants are a compatibility surface over
@@ -90,10 +90,10 @@ const (
 )
 
 const (
-	FailureRetryableTransient   roles.QueueFailureKind = "retryable_transient"
-	FailureRetryableAfterResume roles.QueueFailureKind = "retryable_after_resume"
-	FailureNonRetryable         roles.QueueFailureKind = "non_retryable"
-	FailureManualIntervention   roles.QueueFailureKind = "manual_intervention"
+	FailureRetryableTransient   = roles.FailureRetryableTransient
+	FailureRetryableAfterResume = roles.FailureRetryableAfterResume
+	FailureNonRetryable         = roles.FailureNonRetryable
+	FailureManualIntervention   = roles.FailureManualIntervention
 )
 
 const (
