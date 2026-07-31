@@ -11,6 +11,14 @@ import (
 	"github.com/MumuTW/looper/internal/storage"
 )
 
+// Post-merge digest events are intentionally ordinary EventLog records. The
+// digest consumes these durable observations instead of querying GitHub at
+// report time, so a daily report has one local source of truth.
+const (
+	CoordinatorPullRequestMergedEventType = "coordinator.pull_request.merged"
+	PostMergeDigestSentEventType          = "coordinator.post_merge_digest.sent"
+)
+
 type AppendInput struct {
 	ID               string
 	EventType        string

@@ -33,6 +33,7 @@ import (
 	"github.com/MumuTW/looper/internal/network/protocol"
 	"github.com/MumuTW/looper/internal/networkpolicy"
 	"github.com/MumuTW/looper/internal/planner"
+	"github.com/MumuTW/looper/internal/postmergedigest"
 	"github.com/MumuTW/looper/internal/projects"
 	"github.com/MumuTW/looper/internal/reviewer"
 	"github.com/MumuTW/looper/internal/reviewsubmit"
@@ -186,6 +187,8 @@ type defaultSchedulerTickInput struct {
 	// OnDeployFinished, when set, reports a completed deploy so the person who
 	// asked for the change learns it shipped.
 	OnDeployFinished func(context.Context, DeployNotification)
+	// PostMergeDigest is the optional agent-free daily audit lane.
+	PostMergeDigest *postmergedigest.Service
 }
 
 type defaultSchedulerHandlers struct {
@@ -2567,6 +2570,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 					DedupeKey: fmt.Sprintf("deploy:%s:%s", notification.Repo, notification.Outcome.SHA),
 				})
 			},
+			PostMergeDigest: postMergeDigest,
 		}
 	}
 
@@ -2893,6 +2897,13 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 
 	claimedCount, availableSlots, err = executeClaimPhase(ctx, "post_discovery", input, discoveredRunnableIDs, true)
 	recordClaim(claimedCount, availableSlots, err)
+	// The digest is a read/notification lane, but it still respects the tick's
+	// admission fence so shutdown cannot append a sent marker after stopping.
+	if input.PostMergeDigest != nil {
+		if err := admissionRefuseWork(input); err == nil {
+			appendErr(input.PostMergeDigest.Run(ctx))
+		}
+	}
 
 	if len(errs) == 0 {
 		return nil

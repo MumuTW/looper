@@ -536,6 +536,29 @@ Coordinator dispatch lives under `roles.coordinator.dispatch.*`:
 | `roles.coordinator.dispatch.autonomous.delayMinutes` | Grace window after `triaged` before autonomous dispatch can commit | `30` |
 | `roles.coordinator.dispatch.autonomous.holdLabel` | Legacy compatibility-only veto label for autonomous dispatch | `"looper:hold"` |
 
+### Post-merge digest
+
+The optional `roles.coordinator.postMergeDigest` lane sends one timezone-aware
+daily audit after the configured time and exposes the same four sections in the
+dashboard. It is disabled by default. The digest reads only durable local
+`event_logs`, pull-request snapshots, and loop records; it does not make a
+GitHub read or ask an agent to supply evidence. A successful notification (or a
+quiet-day marker when `includeEmpty = false`) is recorded locally so a tick
+retry cannot duplicate the day.
+
+| Path | Purpose | Default |
+| --- | --- | --- |
+| `roles.coordinator.postMergeDigest.enabled` | Enable the daily digest scheduler lane | disabled |
+| `roles.coordinator.postMergeDigest.schedule` | Local 24-hour `HH:MM` delivery time | required when enabled |
+| `roles.coordinator.postMergeDigest.timezone` | IANA timezone used for day boundaries and schedule | required when enabled |
+| `roles.coordinator.postMergeDigest.includeEmpty` | Deliver a one-line digest on days with no activity | `false` |
+| `roles.coordinator.postMergeDigest.maxItems` | Maximum items retained per section | required, `1..200` |
+
+Sections are `Merged`, `Closed-and-regenerated`, `Awaiting human`, and
+`Anomalies`. Gate/reviewer summaries, retry fingerprints, and diff sizes are
+included only when corresponding durable records exist; missing evidence is
+reported as an anomaly rather than inferred from live GitHub state.
+
 Behavior notes:
 
 - `/plan` maps to the first planner trigger label at `roles.planner.triggers.labels[0]`
@@ -627,6 +650,13 @@ allowedUsers = []
 [roles.coordinator.dispatch.autonomous]
 delayMinutes = 30
 holdLabel = "looper:hold"
+
+[roles.coordinator.postMergeDigest]
+enabled = true
+schedule = "18:00"
+timezone = "Asia/Taipei"
+includeEmpty = false
+maxItems = 50
 ```
 
 Reviewer is the main migration example:

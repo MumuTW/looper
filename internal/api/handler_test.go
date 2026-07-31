@@ -23,6 +23,7 @@ import (
 	"github.com/MumuTW/looper/internal/config"
 	"github.com/MumuTW/looper/internal/daemonbinary"
 	"github.com/MumuTW/looper/internal/domain"
+	"github.com/MumuTW/looper/internal/eventlog"
 	githubinfra "github.com/MumuTW/looper/internal/infra/github"
 	"github.com/MumuTW/looper/internal/labels"
 	"github.com/MumuTW/looper/internal/projects"
@@ -67,6 +68,36 @@ func TestHandlerHealthzSuccessAndRequestIDEcho(t *testing.T) {
 	assertEqual(t, storageInfo["mode"], "sqlite")
 	if _, ok := storageInfo["dbPath"].(string); !ok {
 		t.Fatalf("data.storage.dbPath missing/invalid: %#v", storageInfo["dbPath"])
+	}
+}
+
+func TestHandlerPostMergeDigestReadsDurableLocalProjection(t *testing.T) {
+	now := time.Date(2026, 7, 31, 12, 0, 0, 0, time.UTC)
+	fixture := newTestFixture(t, func(options *looperdruntime.Options) {
+		options.Now = func() time.Time { return now }
+		options.Config.Roles.Coordinator.PostMergeDigest = &config.CoordinatorPostMergeDigestConfig{Enabled: true, Schedule: "08:00", Timezone: "UTC", MaxItems: 10}
+	})
+	rt := fixture.runtime
+	cfg := rt.Config()
+	h := NewHandler(Context{Config: cfg, Runtime: rt, Now: func() time.Time { return now }})
+	services := rt.Services()
+	projectID := "project_digest"
+	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Digest", RepoPath: t.TempDir(), CreatedAt: "2026-07-31T00:00:00.000Z", UpdatedAt: "2026-07-31T00:00:00.000Z"}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	entityType, entityID := "pull_request", "acme/looper#12"
+	if err := eventlog.Append(context.Background(), services.Repositories, eventlog.AppendInput{EventType: eventlog.CoordinatorPullRequestMergedEventType, ProjectID: &projectID, EntityType: &entityType, EntityID: &entityID, Payload: map[string]any{"repo": "acme/looper", "prNumber": 12}, CreatedAt: now.Add(-time.Hour)}); err != nil {
+		t.Fatalf("eventlog.Append() error = %v", err)
+	}
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/v1/post-merge-digest", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	data := parseJSONMap(t, recorder.Body.Bytes())["data"].(map[string]any)
+	digest := data["digest"].(map[string]any)
+	if got := len(digest["merged"].([]any)); got != 1 {
+		t.Fatalf("merged count = %d, want 1", got)
 	}
 }
 

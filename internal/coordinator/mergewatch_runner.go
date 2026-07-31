@@ -13,6 +13,7 @@ import (
 	"github.com/MumuTW/looper/internal/config"
 	"github.com/MumuTW/looper/internal/coordinator/mergewatch"
 	"github.com/MumuTW/looper/internal/disclosure"
+	"github.com/MumuTW/looper/internal/eventlog"
 	githubinfra "github.com/MumuTW/looper/internal/infra/github"
 	"github.com/MumuTW/looper/internal/labels"
 )
@@ -27,7 +28,7 @@ type mergeWatchComment struct {
 	Body    string
 }
 
-func (r *Runner) applyMergeWatch(ctx context.Context, repo, cwd string, loaded []loadedIssue, roles config.RoleConfigs) (map[int64]struct{}, error) {
+func (r *Runner) applyMergeWatch(ctx context.Context, projectID, repo, cwd string, loaded []loadedIssue, roles config.RoleConfigs) (map[int64]struct{}, error) {
 	result := map[int64]struct{}{}
 	if r.github == nil {
 		return result, nil
@@ -62,7 +63,7 @@ func (r *Runner) applyMergeWatch(ctx context.Context, repo, cwd string, loaded [
 	return result, nil
 }
 
-func (r *Runner) applyMergeWatchLocked(ctx context.Context, repo, cwd string, issue loadedIssue, roles config.RoleConfigs, currentLogin string, maxIndeterminateDuration time.Duration) (bool, error) {
+func (r *Runner) applyMergeWatchLocked(ctx context.Context, projectID, repo, cwd string, issue loadedIssue, roles config.RoleConfigs, currentLogin string, maxIndeterminateDuration time.Duration) (bool, error) {
 	marker := findMergeWatchComment(issue.detail.Comments, currentLogin)
 	watchedPR, ok, err := r.resolveWatchedPR(ctx, repo, cwd, issue, marker, currentLogin)
 	if err != nil || !ok {
@@ -88,6 +89,11 @@ func (r *Runner) applyMergeWatchLocked(ctx context.Context, repo, cwd string, is
 	}
 	switch action.Kind {
 	case mergewatch.ActionMerged, mergewatch.ActionHumanDisabledAutoMerge:
+		if action.Kind == mergewatch.ActionMerged {
+			if err := r.recordPostMergeEvent(ctx, projectID, repo, issue.detail.Number, snapshot); err != nil {
+				return false, err
+			}
+		}
 		return false, r.deleteMergeWatchComment(ctx, repo, cwd, marker)
 	case mergewatch.ActionStillPending:
 		baseMarker.FirstUnknownAt = nil
@@ -136,6 +142,45 @@ func (r *Runner) applyMergeWatchLocked(ctx context.Context, repo, cwd string, is
 	default:
 		return false, nil
 	}
+}
+
+// recordPostMergeEvent turns the merge-watch observation into durable local
+// evidence before the forge marker is removed. The event is idempotent by
+// pull-request entity so repeated polling cannot inflate a daily digest.
+func (r *Runner) recordPostMergeEvent(ctx context.Context, projectID, repo string, issueNumber int64, snapshot mergewatch.PRSnapshot) error {
+	entityType := "pull_request"
+	entityID := fmt.Sprintf("%s#%d", repo, snapshot.PRNumber)
+	existing, err := r.repos.Events.ListByEntity(ctx, entityType, entityID)
+	if err != nil {
+		return fmt.Errorf("check post-merge event: %w", err)
+	}
+	for _, event := range existing {
+		if event.EventType == eventlog.CoordinatorPullRequestMergedEventType {
+			return nil
+		}
+	}
+	payload := map[string]any{
+		"repo":        repo,
+		"prNumber":    snapshot.PRNumber,
+		"issueNumber": issueNumber,
+		"headSha":     snapshot.HeadSHA,
+		"mergedAt":    r.now().UTC().Format(time.RFC3339Nano),
+	}
+	if err := eventlog.Append(ctx, r.repos, eventlog.AppendInput{
+		EventType: eventlog.CoordinatorPullRequestMergedEventType,
+		ProjectID: nilIfBlank(projectID), EntityType: &entityType, EntityID: &entityID,
+		Payload: payload, CreatedAt: r.now(),
+	}); err != nil {
+		return fmt.Errorf("record post-merge event: %w", err)
+	}
+	return nil
+}
+
+func nilIfBlank(value string) *string {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+	return &value
 }
 
 func (r *Runner) resolveWatchedPR(ctx context.Context, repo, cwd string, issue loadedIssue, marker *mergeWatchComment, currentLogin string) (int64, bool, error) {
