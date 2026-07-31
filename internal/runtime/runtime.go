@@ -1007,7 +1007,8 @@ func (r *Runtime) start(ctx context.Context) error {
 			if githubGateway == nil {
 				return storage.PullRequestSnapshotRecord{}, fmt.Errorf("github gateway is not configured")
 			}
-			return githubGateway.CapturePullRequestSnapshot(ctx, githubinfra.CapturePullRequestSnapshotInput{ProjectID: input.ProjectID, Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD, CapturedAt: input.CapturedAt})
+			cfg := r.Config()
+			return captureProjectPullRequestSnapshot(ctx, &cfg, githubGateway, input)
 		},
 		AsyncSnapshotQueueEnabled: func() bool {
 			return asyncSnapshotQueueEnabled(r.customSchedulerTick, r.Config())
@@ -1352,9 +1353,8 @@ func (r *Runtime) reloadProjectCatalog(ctx context.Context, repos *storage.Repos
 	if err != nil {
 		return fmt.Errorf("materialize runtime project catalog: %w", err)
 	}
-	candidate := config.CloneConfig(global)
-	candidate.Projects = materialized
-	if err := config.ValidateProjectValidationPolicies(candidate); err != nil {
+	materialized, err = projects.ValidateStoredCatalogValidationPolicies(global, records, materialized)
+	if err != nil {
 		return fmt.Errorf("validate runtime project catalog: %w", err)
 	}
 	r.publishProjects(materialized)
@@ -2535,6 +2535,17 @@ func defaultSyncConfiguredProjects(ctx context.Context, service *projects.Servic
 		return fmt.Errorf("projects service is not configured")
 	}
 	return service.SyncConfigured(ctx, cfg, now)
+}
+
+func captureProjectPullRequestSnapshot(ctx context.Context, cfg *config.Config, gateway *githubinfra.Gateway, input projects.CapturePullRequestSnapshotInput) (storage.PullRequestSnapshotRecord, error) {
+	transportRepo, err := reviewThreadRepoForProject(cfg, input.ProjectID, input.Repo)
+	if err != nil {
+		return storage.PullRequestSnapshotRecord{}, err
+	}
+	return gateway.CapturePullRequestSnapshot(ctx, githubinfra.CapturePullRequestSnapshotInput{
+		ProjectID: input.ProjectID, Repo: input.Repo, TransportRepo: transportRepo,
+		PRNumber: input.PRNumber, CWD: input.CWD, CapturedAt: input.CapturedAt,
+	})
 }
 
 type staleRunCandidateDecision struct {

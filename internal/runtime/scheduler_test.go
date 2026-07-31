@@ -19,6 +19,7 @@ import (
 	"github.com/MumuTW/looper/internal/fixer"
 	githubinfra "github.com/MumuTW/looper/internal/infra/github"
 	"github.com/MumuTW/looper/internal/planner"
+	"github.com/MumuTW/looper/internal/projects"
 	"github.com/MumuTW/looper/internal/reviewer"
 	"github.com/MumuTW/looper/internal/storage"
 	"github.com/MumuTW/looper/internal/worker"
@@ -802,6 +803,54 @@ func TestClaimAndRunScheduledQueueItemsSkipsUnconfiguredRoles(t *testing.T) {
 	}
 }
 
+func TestClaimAndRunScheduledQueueItemsSkipsCodingWorkOutsideRunnableCatalog(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "claim-runnable-projects.sqlite"), t.TempDir())
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 21, 8, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+	for _, projectID := range []string{"legacy_inert", "runnable"} {
+		if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: projectID, RepoPath: filepath.Join(workingDir, projectID), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+			t.Fatalf("Projects.Upsert(%s) error = %v", projectID, err)
+		}
+	}
+	for _, item := range []storage.QueueItemRecord{
+		{ID: "inert_worker", ProjectID: stringPtr("legacy_inert"), Type: "worker", TargetType: "project", TargetID: "project:legacy_inert", DedupeKey: "worker:legacy_inert", Priority: storage.QueuePriorityReviewer, Status: "queued", AvailableAt: nowISO, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO},
+		{ID: "runnable_worker", ProjectID: stringPtr("runnable"), Type: "worker", TargetType: "project", TargetID: "project:runnable", DedupeKey: "worker:runnable", Priority: storage.QueuePriorityWorker, Status: "queued", AvailableAt: nowISO, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO},
+	} {
+		if err := repos.Queue.Upsert(context.Background(), item); err != nil {
+			t.Fatalf("Queue.Upsert(%s) error = %v", item.ID, err)
+		}
+	}
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	vendor := config.AgentVendorCodex
+	cfg.Agent.Vendor = &vendor
+	cfg.Projects = []config.ProjectRefConfig{{ID: "runnable", Validation: &config.ProjectValidationConfig{OptOut: true}}}
+
+	claimed, err := claimAndRunScheduledQueueItems(context.Background(), 2, defaultSchedulerTickInput{
+		Repos: repos, Now: func() time.Time { return now }, Config: &cfg,
+		Worker: &stubWorkerScheduler{}, AsyncRunner: immediateSchedulerRunner{},
+	})
+	if err != nil {
+		t.Fatalf("claimAndRunScheduledQueueItems() error = %v", err)
+	}
+	if len(claimed) != 1 || claimed[0].ID != "runnable_worker" {
+		t.Fatalf("claimed = %#v, want only runnable project work", claimed)
+	}
+	inert, err := repos.Queue.GetByID(context.Background(), "inert_worker")
+	if err != nil {
+		t.Fatalf("Queue.GetByID(inert_worker) error = %v", err)
+	}
+	if inert == nil || inert.Status != "queued" {
+		t.Fatalf("inert queue item = %#v, want durable queued quarantine", inert)
+	}
+}
+
 func TestClaimAndRunScheduledQueueItemsClaimsStickySnapshotWithoutLiveRole(t *testing.T) {
 	t.Parallel()
 
@@ -822,6 +871,7 @@ func TestClaimAndRunScheduledQueueItemsClaimsStickySnapshotWithoutLiveRole(t *te
 	cfg.Agent.Vendor = nil
 	workerVendor := config.AgentVendorCodex
 	cfg.Roles.Worker.Agent = &config.RoleAgentConfig{Vendor: &workerVendor}
+	cfg.Projects = []config.ProjectRefConfig{{ID: "project_sticky", Validation: &config.ProjectValidationConfig{OptOut: true}}}
 
 	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_sticky", Name: "Looper", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
@@ -847,6 +897,7 @@ func TestClaimAndRunScheduledQueueItemsClaimsStickySnapshotWithoutLiveRole(t *te
 	stickyLoopID := "loop_reviewer_sticky"
 	freshLoopID := "loop_reviewer_fresh"
 	workerLoopID := "loop_worker_live"
+	projectID := "project_sticky"
 	repo := "acme/looper"
 	prSticky := int64(10)
 	prFresh := int64(11)
@@ -854,7 +905,7 @@ func TestClaimAndRunScheduledQueueItemsClaimsStickySnapshotWithoutLiveRole(t *te
 		// Higher priority reviewer items first: sticky should claim, fresh must not.
 		{ID: "reviewer_sticky", LoopID: &stickyLoopID, Type: "reviewer", TargetType: "pull_request", TargetID: "pr:10", Repo: &repo, PRNumber: &prSticky, DedupeKey: "d_sticky", Priority: storage.QueuePriorityReviewer, Status: "queued", AvailableAt: nowISO, Attempts: 1, MaxAttempts: -1, CreatedAt: "2026-04-21T07:00:00.000Z", UpdatedAt: nowISO},
 		{ID: "reviewer_fresh", LoopID: &freshLoopID, Type: "reviewer", TargetType: "pull_request", TargetID: "pr:11", Repo: &repo, PRNumber: &prFresh, DedupeKey: "d_fresh", Priority: storage.QueuePriorityReviewer, Status: "queued", AvailableAt: nowISO, Attempts: 0, MaxAttempts: -1, CreatedAt: "2026-04-21T07:00:01.000Z", UpdatedAt: nowISO},
-		{ID: "worker_live", LoopID: &workerLoopID, Type: "worker", TargetType: "project", TargetID: "project_sticky", DedupeKey: "d_worker", Priority: storage.QueuePriorityWorker, Status: "queued", AvailableAt: nowISO, Attempts: 0, MaxAttempts: -1, CreatedAt: "2026-04-21T07:00:02.000Z", UpdatedAt: nowISO},
+		{ID: "worker_live", ProjectID: &projectID, LoopID: &workerLoopID, Type: "worker", TargetType: "project", TargetID: "project_sticky", DedupeKey: "d_worker", Priority: storage.QueuePriorityWorker, Status: "queued", AvailableAt: nowISO, Attempts: 0, MaxAttempts: -1, CreatedAt: "2026-04-21T07:00:02.000Z", UpdatedAt: nowISO},
 	} {
 		if err := repos.Queue.Upsert(context.Background(), item); err != nil {
 			t.Fatalf("Queue.Upsert(%s) error = %v", item.ID, err)
@@ -946,6 +997,101 @@ func TestProcessSnapshotQueueItemRetriesTransientCaptureFailure(t *testing.T) {
 	}
 	if updated.LastError == nil || *updated.LastError != "gh timeout" || updated.LastErrorKind == nil || *updated.LastErrorKind != "retryable_transient" {
 		t.Fatalf("queue item error = (%v, %v), want retryable gh timeout", updated.LastError, updated.LastErrorKind)
+	}
+}
+
+func TestProcessSnapshotQueueItemQualifiesGHESCommandsAndPersistsLogicalRepo(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "snapshot-ghes.sqlite"), t.TempDir())
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.July, 31, 8, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+	projectID := "enterprise"
+	repo := "acme/enterprise"
+	prNumber := int64(42)
+	repoPath := filepath.Join(workingDir, "repo")
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Enterprise", RepoPath: repoPath, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	queueItem := storage.QueueItemRecord{ID: "queue_snapshot_ghes", ProjectID: &projectID, Type: "snapshot", TargetType: "pull_request", TargetID: repo + "#42", Repo: &repo, PRNumber: &prNumber, DedupeKey: "snapshot:" + repo + ":42", Priority: storage.QueuePriorityReviewer, Status: "running", AvailableAt: nowISO, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := repos.Queue.Upsert(context.Background(), queueItem); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	cfg := config.Config{
+		Providers: []config.ProviderConfig{{ID: "github-enterprise", Kind: config.ProviderKindGitHub, BaseURL: "https://github.example.com"}},
+		Projects:  []config.ProjectRefConfig{{ID: projectID, Provider: "github-enterprise", Repo: repo, RepoPath: repoPath}},
+	}
+	var captured githubinfra.CapturePullRequestSnapshotInput
+	err := processSnapshotQueueItem(context.Background(), queueItem, defaultSchedulerTickInput{
+		Repos: repos, Now: func() time.Time { return now }, Config: &cfg,
+		Snapshotter: stubSnapshotScheduler{capture: func(input githubinfra.CapturePullRequestSnapshotInput) { captured = input }},
+	})
+	if err != nil {
+		t.Fatalf("processSnapshotQueueItem() error = %v", err)
+	}
+	if captured.Repo != repo || captured.TransportRepo != "github.example.com/"+repo {
+		t.Fatalf("snapshot repos = (%q, %q), want logical %q and GHES transport", captured.Repo, captured.TransportRepo, repo)
+	}
+	snapshot, err := repos.PullRequestSnapshots.GetLatestByProject(context.Background(), projectID, repo, prNumber)
+	if err != nil {
+		t.Fatalf("GetLatestByProject() error = %v", err)
+	}
+	if snapshot == nil || snapshot.Repo != repo {
+		t.Fatalf("GetLatestByProject() = %#v, want logical-repo snapshot", snapshot)
+	}
+}
+
+func TestProcessSnapshotQueueItemPreservesQueuedRepoAfterProjectUpdate(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "snapshot-project-update.sqlite"), t.TempDir())
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.July, 31, 9, 0, 0, 0, time.UTC)
+	global, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	catalog := projects.NewCatalog(global)
+	service := &projects.Service{
+		DB: coordinator.DB(), Repos: repos, ConfigSource: catalog, Now: func() time.Time { return now },
+		PublishProjects: catalog.Publish,
+	}
+	oldRepo := "acme/old"
+	projectID := "updated"
+	repoPath := filepath.Join(workingDir, "repo")
+	if _, err := service.AddProject(context.Background(), projects.AddInput{ID: projectID, Name: "Updated", RepoPath: repoPath, Repo: &oldRepo}); err != nil {
+		t.Fatalf("AddProject() error = %v", err)
+	}
+	prNumber := int64(42)
+	nowISO := formatJavaScriptISOString(now)
+	queueItem := storage.QueueItemRecord{ID: "queue_snapshot_project_update", ProjectID: &projectID, Type: "snapshot", TargetType: "pull_request", TargetID: oldRepo + "#42", Repo: &oldRepo, PRNumber: &prNumber, DedupeKey: "snapshot:" + oldRepo + ":42", Priority: storage.QueuePrioritySnapshot, Status: "running", AvailableAt: nowISO, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := repos.Queue.Upsert(context.Background(), queueItem); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	newRepo := "acme/new"
+	if _, err := service.UpdateProject(context.Background(), projectID, projects.UpdateInput{Repo: projects.UpdateStringField{Set: true, Value: &newRepo}}); err != nil {
+		t.Fatalf("UpdateProject() error = %v", err)
+	}
+	current := catalog.Snapshot()
+	if len(current.Projects) != 1 || current.Projects[0].Repo != newRepo {
+		t.Fatalf("catalog projects = %#v, want updated repo %q", current.Projects, newRepo)
+	}
+	var captured githubinfra.CapturePullRequestSnapshotInput
+	if err := processSnapshotQueueItem(context.Background(), queueItem, defaultSchedulerTickInput{
+		Repos: repos, Now: func() time.Time { return now }, Config: &current,
+		Snapshotter: stubSnapshotScheduler{capture: func(input githubinfra.CapturePullRequestSnapshotInput) { captured = input }},
+	}); err != nil {
+		t.Fatalf("processSnapshotQueueItem() error = %v", err)
+	}
+	if captured.Repo != oldRepo || captured.TransportRepo != oldRepo {
+		t.Fatalf("snapshot repos = (%q, %q), want queued repo %q preserved after catalog update", captured.Repo, captured.TransportRepo, oldRepo)
+	}
+	stored, err := repos.PullRequestSnapshots.GetLatestByProject(context.Background(), projectID, oldRepo, prNumber)
+	if err != nil || stored == nil {
+		t.Fatalf("GetLatestByProject(old repo) = %#v, %v; want queued snapshot", stored, err)
 	}
 }
 
@@ -1712,10 +1858,14 @@ func (s *stubFixerScheduler) processItemCount() int {
 }
 
 type stubSnapshotScheduler struct {
-	err error
+	err     error
+	capture func(githubinfra.CapturePullRequestSnapshotInput)
 }
 
 func (s stubSnapshotScheduler) CapturePullRequestSnapshot(_ context.Context, input githubinfra.CapturePullRequestSnapshotInput) (storage.PullRequestSnapshotRecord, error) {
+	if s.capture != nil {
+		s.capture(input)
+	}
 	return storage.PullRequestSnapshotRecord{ID: "snapshot_1", ProjectID: input.ProjectID, Repo: input.Repo, PRNumber: input.PRNumber, HeadSHA: "head", CapturedAt: input.CapturedAt, CreatedAt: input.CapturedAt}, s.err
 }
 

@@ -55,6 +55,33 @@ func TestServiceAddProjectCreatesAPIProject(t *testing.T) {
 	}
 }
 
+func TestServiceAddProjectRejectsDuplicateNormalizedRepoPath(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openCoordinator(t)
+	ctx := context.Background()
+	repos := storage.NewRepositories(coordinator.DB())
+	service := &Service{DB: coordinator.DB(), Repos: repos, Now: time.Now}
+	root := t.TempDir()
+	firstRepo := "acme/one"
+	secondRepo := "acme/two"
+	if _, err := service.AddProject(ctx, AddInput{ID: "one", Name: "One", RepoPath: root, Repo: &firstRepo}); err != nil {
+		t.Fatalf("AddProject(one) error = %v", err)
+	}
+	duplicate := root + string(filepath.Separator) + "."
+	_, err := service.AddProject(ctx, AddInput{ID: "two", Name: "Two", RepoPath: duplicate, Repo: &secondRepo})
+	if err == nil || !strings.Contains(err.Error(), `duplicates active project "one"`) {
+		t.Fatalf("AddProject(two) error = %v, want normalized repo-path duplicate rejection", err)
+	}
+	stored, getErr := repos.Projects.GetByID(ctx, "two")
+	if getErr != nil {
+		t.Fatalf("Projects.GetByID(two) error = %v", getErr)
+	}
+	if stored != nil {
+		t.Fatalf("Projects.GetByID(two) = %#v, want rejected registration absent", stored)
+	}
+}
+
 func TestServiceConcurrentAddsPublishCommittedCatalog(t *testing.T) {
 	t.Parallel()
 

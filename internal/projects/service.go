@@ -244,6 +244,7 @@ type UpdateInput struct {
 	Name         UpdateStringField
 	BaseBranch   UpdateStringField
 	WorktreeRoot UpdateStringField
+	Validation   *config.ProjectValidationConfig
 }
 
 type AddResult struct {
@@ -403,6 +404,9 @@ func (s *Service) addProjectLocked(ctx context.Context, input AddInput) (AddResu
 	}
 	delete(metadata, "provider")
 	if input.Validation != nil {
+		if err := config.ValidateProjectValidationPolicy(input.Validation); err != nil {
+			return AddResult{}, nil, ProjectValidationError{Message: err.Error()}
+		}
 		metadata["validation"] = config.ProjectValidationConfig{
 			Commands: append([]string(nil), input.Validation.Commands...),
 			OptOut:   input.Validation.OptOut,
@@ -621,7 +625,7 @@ func (s *Service) UpdateProject(ctx context.Context, identifier string, input Up
 	if s.Repos == nil || s.Repos.Projects == nil {
 		return storage.ProjectRecord{}, fmt.Errorf("projects repository is not configured")
 	}
-	if !input.Repo.Set && !input.Name.Set && !input.BaseBranch.Set && !input.WorktreeRoot.Set {
+	if !input.Repo.Set && !input.Name.Set && !input.BaseBranch.Set && !input.WorktreeRoot.Set && input.Validation == nil {
 		return storage.ProjectRecord{}, ProjectValidationError{Message: "at least one project field is required"}
 	}
 
@@ -695,6 +699,15 @@ func (s *Service) UpdateProject(ctx context.Context, identifier string, input Up
 			metadata["worktreeRoot"] = nil
 		} else {
 			metadata["worktreeRoot"] = strings.TrimSpace(*input.WorktreeRoot.Value)
+		}
+	}
+	if input.Validation != nil {
+		if err := config.ValidateProjectValidationPolicy(input.Validation); err != nil {
+			return storage.ProjectRecord{}, ProjectValidationError{Message: err.Error()}
+		}
+		metadata["validation"] = config.ProjectValidationConfig{
+			Commands: append([]string(nil), input.Validation.Commands...),
+			OptOut:   input.Validation.OptOut,
 		}
 	}
 
@@ -1569,6 +1582,7 @@ func (s *Service) materializeCandidate(ctx context.Context, replacement *storage
 	if err != nil {
 		return nil, err
 	}
+	originalLegacyInert := legacyInertProjectIDs(records)
 	replaced := false
 	for index := range records {
 		if replacement != nil && records[index].ID == replacement.ID {
@@ -1588,13 +1602,87 @@ func (s *Service) materializeCandidate(ctx context.Context, replacement *storage
 		return nil, err
 	}
 	if s.ConfigSource != nil {
-		candidate := config.CloneConfig(current)
-		candidate.Projects = materialized
-		if err := config.ValidateProjectValidationPolicies(candidate); err != nil {
+		// Only a record that was already an inert pre-validation API project
+		// may remain unstanced while it is repaired. New registrations and a
+		// PATCH that adds repository metadata still validate every project.
+		legacyInert := intersectProjectIDs(legacyInertProjectIDs(records), originalLegacyInert)
+		materialized, err = validateCatalogValidationPolicies(current, materialized, legacyInert)
+		if err != nil {
 			return nil, err
 		}
 	}
 	return materialized, nil
+}
+
+// IsLegacyInertProject reports whether record predates project validation and
+// has no repository identity, so it cannot enter automatic discovery while an
+// operator repairs it. This classification never grants coding authority.
+func IsLegacyInertProject(record storage.ProjectRecord) bool {
+	if record.Archived {
+		return false
+	}
+	metadata := parseMetadata(record.MetadataJSON)
+	if metadataString(metadata, "source") != "api" || metadataString(metadata, "repo") != "" {
+		return false
+	}
+	_, hasValidation := metadata["validation"]
+	return !hasValidation
+}
+
+func legacyInertProjectIDs(records []storage.ProjectRecord) map[string]struct{} {
+	ids := map[string]struct{}{}
+	for _, record := range records {
+		if IsLegacyInertProject(record) {
+			ids[record.ID] = struct{}{}
+		}
+	}
+	return ids
+}
+
+func intersectProjectIDs(left, right map[string]struct{}) map[string]struct{} {
+	intersection := map[string]struct{}{}
+	for id := range left {
+		if _, ok := right[id]; ok {
+			intersection[id] = struct{}{}
+		}
+	}
+	return intersection
+}
+
+func validateCatalogValidationPolicies(global config.Config, materialized []config.ProjectRefConfig, allowedMissingPolicy map[string]struct{}) ([]config.ProjectRefConfig, error) {
+	candidate := config.CloneConfig(global)
+	candidate.Projects = append([]config.ProjectRefConfig(nil), materialized...)
+	for index := range candidate.Projects {
+		project := &candidate.Projects[index]
+		if _, allowed := allowedMissingPolicy[project.ID]; allowed && project.Validation == nil {
+			// Validate a detached pass-through so diagnostics keep their original
+			// projects[index] labels. This synthetic opt-out is never published.
+			project.Validation = &config.ProjectValidationConfig{OptOut: true}
+		}
+	}
+	if err := config.ValidateProjectValidationPolicies(candidate); err != nil {
+		return nil, err
+	}
+	if (!config.CodingRoleAgentConfigured(global, config.CodingRoleWorker) && !config.CodingRoleAgentConfigured(global, config.CodingRoleFixer)) || len(config.ResolveValidationCommands(global)) > 0 {
+		return materialized, nil
+	}
+	runnable := make([]config.ProjectRefConfig, 0, len(materialized))
+	for _, project := range materialized {
+		if _, allowed := allowedMissingPolicy[project.ID]; allowed && project.Validation == nil {
+			continue
+		}
+		runnable = append(runnable, project)
+	}
+	return runnable, nil
+}
+
+// ValidateStoredCatalogValidationPolicies preserves startup repair for only
+// API projects that predate project validation and cannot run without repo
+// metadata. Their persisted record is the authority for the validation
+// exception; the returned runtime catalog quarantines any project that still
+// lacks an effective policy.
+func ValidateStoredCatalogValidationPolicies(global config.Config, records []storage.ProjectRecord, materialized []config.ProjectRefConfig) ([]config.ProjectRefConfig, error) {
+	return validateCatalogValidationPolicies(global, materialized, legacyInertProjectIDs(records))
 }
 
 func snapshotModeOrDefault(mode SnapshotMode) SnapshotMode {

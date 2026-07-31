@@ -121,6 +121,19 @@ func TestValidateProjectValidationRejectsAmbiguousOrInvalidPolicies(t *testing.T
 	}
 }
 
+func TestValidateProjectValidationPolicyRejectsInvalidPolicyWithoutConfiguredAgent(t *testing.T) {
+	t.Parallel()
+
+	err := ValidateProjectValidationPolicy(&ProjectValidationConfig{})
+	var validationErr *ConfigValidationError
+	if !errors.As(err, &validationErr) {
+		t.Fatalf("ValidateProjectValidationPolicy() error = %v, want ConfigValidationError", err)
+	}
+	if !validationIssuesContainPath(validationErr.Issues, "project.validation.commands") {
+		t.Fatalf("validation issues = %#v, missing project.validation.commands", validationErr.Issues)
+	}
+}
+
 func TestNormalizeProjectValidationKeepsDistinctProjectPolicies(t *testing.T) {
 	t.Parallel()
 

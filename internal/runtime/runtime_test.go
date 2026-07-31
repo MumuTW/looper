@@ -105,11 +105,11 @@ func TestRuntimeStartOpensSQLiteAndSyncsConfiguredProjects(t *testing.T) {
 	}
 }
 
-// TestRuntimeStartRejectsPreexistingProjectWithoutValidationStance covers the
-// upgrade path for projects persisted before validation policy enforcement.
-// The runtime catalog is the authority boundary: it must reject the legacy
-// record before startup can make a PATCH handler available for it.
-func TestRuntimeStartRejectsPreexistingProjectWithoutValidationStance(t *testing.T) {
+// TestRuntimeStartRejectsPreexistingRunnableProjectWithoutValidationStance
+// keeps the fail-closed startup boundary for projects that can run. The
+// separate API integration test covers the only repair exception: a legacy
+// API-source record with neither repo metadata nor a validation policy.
+func TestRuntimeStartRejectsPreexistingRunnableProjectWithoutValidationStance(t *testing.T) {
 	t.Parallel()
 
 	workingDir := t.TempDir()
@@ -129,7 +129,7 @@ func TestRuntimeStartRejectsPreexistingProjectWithoutValidationStance(t *testing
 	seedCoordinator := openMigratedCoordinator(t, cfg.Storage.DBPath, backupDir)
 	seedRepos := storage.NewRepositories(seedCoordinator.DB())
 	baseBranch := "develop"
-	metadata := `{"repo":null,"worktreeRoot":"/tmp/worktrees","source":"api","registrationDiscovery":{"status":"succeeded","snapshotMode":"off"}}`
+	metadata := `{"repo":"acme/legacy","worktreeRoot":"/tmp/worktrees","source":"api","registrationDiscovery":{"status":"succeeded","snapshotMode":"off"}}`
 	if err := seedRepos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "legacy", Name: "Legacy", RepoPath: filepath.Join(workingDir, "legacy"), BaseBranch: &baseBranch, MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
@@ -147,7 +147,7 @@ func TestRuntimeStartRejectsPreexistingProjectWithoutValidationStance(t *testing
 	})
 	err = rt.Start(context.Background())
 	if err == nil {
-		t.Fatal("Start() error = nil, want legacy project validation failure")
+		t.Fatal("Start() error = nil, want runnable project validation failure")
 	}
 	if !strings.Contains(err.Error(), "projects[0].validation") {
 		t.Fatalf("Start() error = %v, want projects[0].validation", err)

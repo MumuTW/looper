@@ -1315,7 +1315,7 @@ func TestGatewayListReviewThreadsPaginatesThreadsAndComments(t *testing.T) {
 	}
 
 	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
-	threads, err := gateway.ListReviewThreads(context.Background(), ListReviewThreadsInput{Repo: "acme/looper", PRNumber: 42, Limit: 101})
+	threads, err := gateway.ListReviewThreads(context.Background(), ListReviewThreadsInput{Repo: "code.example.test/acme/looper", PRNumber: 42, Limit: 101})
 	if err != nil {
 		t.Fatalf("ListReviewThreads() error = %v", err)
 	}
@@ -1335,6 +1335,48 @@ func TestGatewayListReviewThreadsPaginatesThreadsAndComments(t *testing.T) {
 	for _, needle := range []string{"limit=100", "after=thread-cursor-1", "threadId=thread-1", "after=comment-cursor-1"} {
 		if !strings.Contains(log, needle) {
 			t.Fatalf("gh log missing %q\n%s", needle, log)
+		}
+	}
+	for _, call := range runner.calls {
+		if !strings.Contains(call, "--hostname code.example.test") {
+			t.Fatalf("gh call = %q, want configured hostname", call)
+		}
+	}
+}
+
+func TestGatewayReviewThreadMutationsUseRepoHostname(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		switch {
+		case strings.Contains(args, "resolveReviewThread"):
+			return shell.Result{Stdout: `{"data":{"resolveReviewThread":{"thread":{"id":"thread-1","isResolved":true}}}}`}, nil
+		case strings.Contains(args, "addPullRequestReviewThreadReply"):
+			return shell.Result{Stdout: `{"data":{"addPullRequestReviewThreadReply":{"comment":{"id":"comment-1"}}}}`}, nil
+		case strings.Contains(args, "query($threadId: ID!)"):
+			return shell.Result{Stdout: `{"data":{"node":{"id":"thread-1","isResolved":false}}}`}, nil
+		default:
+			t.Fatalf("unexpected gh args: %q", args)
+			return shell.Result{}, nil
+		}
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	input := ResolveReviewThreadInput{Repo: "code.example.test/acme/looper", ThreadID: "thread-1"}
+	if err := gateway.ResolveReviewThread(context.Background(), input); err != nil {
+		t.Fatalf("ResolveReviewThread() error = %v", err)
+	}
+	if err := gateway.AddReviewThreadReply(context.Background(), AddReviewThreadReplyInput{Repo: input.Repo, ThreadID: input.ThreadID, Body: "fixed"}); err != nil {
+		t.Fatalf("AddReviewThreadReply() error = %v", err)
+	}
+
+	if len(runner.calls) != 3 {
+		t.Fatalf("gh calls = %#v, want read, resolve, and reply", runner.calls)
+	}
+	for _, call := range runner.calls {
+		if !strings.HasSuffix(call, "--hostname code.example.test") {
+			t.Fatalf("gh call = %q, want configured hostname", call)
 		}
 	}
 }

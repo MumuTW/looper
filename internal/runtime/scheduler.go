@@ -591,7 +591,11 @@ func (a reviewerGitHubAdapter) ViewPullRequest(ctx context.Context, input review
 	if a.gateway == nil {
 		return reviewer.PullRequestDetail{}, fmt.Errorf("github gateway is not configured")
 	}
-	detail, err := a.gateway.ViewPullRequestForReviewer(ctx, githubinfra.ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
+	repo, err := reviewThreadRepo(a.config, input.Repo, input.CWD)
+	if err != nil {
+		return reviewer.PullRequestDetail{}, err
+	}
+	detail, err := a.gateway.ViewPullRequestForReviewer(ctx, githubinfra.ViewPullRequestInput{Repo: repo, PRNumber: input.PRNumber, CWD: input.CWD})
 	if err != nil {
 		return reviewer.PullRequestDetail{}, err
 	}
@@ -624,7 +628,11 @@ func (a reviewerGitHubAdapter) CapturePullRequestSnapshot(ctx context.Context, i
 	if a.gateway == nil {
 		return storage.PullRequestSnapshotRecord{}, fmt.Errorf("github gateway is not configured")
 	}
-	return a.gateway.CapturePullRequestSnapshot(ctx, githubinfra.CapturePullRequestSnapshotInput{ProjectID: input.ProjectID, Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD, CapturedAt: input.CapturedAt})
+	repo, err := reviewThreadRepo(a.config, input.Repo, input.CWD)
+	if err != nil {
+		return storage.PullRequestSnapshotRecord{}, err
+	}
+	return a.gateway.CapturePullRequestSnapshot(ctx, githubinfra.CapturePullRequestSnapshotInput{ProjectID: input.ProjectID, Repo: input.Repo, TransportRepo: repo, PRNumber: input.PRNumber, CWD: input.CWD, CapturedAt: input.CapturedAt})
 }
 
 func (a reviewerGitHubAdapter) FindReviewMarker(ctx context.Context, input reviewer.VerifyReviewMarkerInput) (reviewer.ReviewMarkerResult, error) {
@@ -726,7 +734,11 @@ func (a reviewerGitHubAdapter) ListReviewThreads(ctx context.Context, input revi
 	if a.gateway == nil {
 		return nil, fmt.Errorf("github gateway is not configured")
 	}
-	threads, err := a.gateway.ListReviewThreads(ctx, githubinfra.ListReviewThreadsInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD, Limit: input.Limit})
+	repo, err := reviewThreadRepo(a.config, input.Repo, input.CWD)
+	if err != nil {
+		return nil, err
+	}
+	threads, err := a.gateway.ListReviewThreads(ctx, githubinfra.ListReviewThreadsInput{Repo: repo, PRNumber: input.PRNumber, CWD: input.CWD, Limit: input.Limit})
 	if err != nil {
 		return nil, err
 	}
@@ -745,15 +757,23 @@ func (a reviewerGitHubAdapter) AddReviewThreadReply(ctx context.Context, input r
 	if a.gateway == nil {
 		return fmt.Errorf("github gateway is not configured")
 	}
+	repo, err := reviewThreadRepo(a.config, input.Repo, input.CWD)
+	if err != nil {
+		return err
+	}
 	body := a.stamper.WithIdentity(input.DisclosureAgent, input.DisclosureModel).ReviewComment(input.Body, "reviewer")
-	return a.gateway.AddReviewThreadReply(ctx, githubinfra.AddReviewThreadReplyInput{Repo: input.Repo, ThreadID: input.ThreadID, Body: body, CWD: input.CWD})
+	return a.gateway.AddReviewThreadReply(ctx, githubinfra.AddReviewThreadReplyInput{Repo: repo, ThreadID: input.ThreadID, Body: body, CWD: input.CWD})
 }
 
 func (a reviewerGitHubAdapter) ResolveReviewThread(ctx context.Context, input reviewer.ResolveReviewThreadInput) error {
 	if a.gateway == nil {
 		return fmt.Errorf("github gateway is not configured")
 	}
-	return a.gateway.ResolveReviewThread(ctx, githubinfra.ResolveReviewThreadInput{Repo: input.Repo, ThreadID: input.ThreadID, CWD: input.CWD})
+	repo, err := reviewThreadRepo(a.config, input.Repo, input.CWD)
+	if err != nil {
+		return err
+	}
+	return a.gateway.ResolveReviewThread(ctx, githubinfra.ResolveReviewThreadInput{Repo: repo, ThreadID: input.ThreadID, CWD: input.CWD})
 }
 
 type reviewerAgentExecutorAdapter struct {
@@ -1070,7 +1090,11 @@ func (a fixerGitHubAdapter) GetPullRequestAuthor(ctx context.Context, input fixe
 }
 
 func (a fixerGitHubAdapter) ViewPullRequest(ctx context.Context, input fixer.ViewPullRequestInput) (fixer.PullRequestDetail, error) {
-	detail, err := a.gateway.ViewPullRequestForFixer(ctx, githubinfra.ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
+	repo, err := reviewThreadRepo(a.config, input.Repo, input.CWD)
+	if err != nil {
+		return fixer.PullRequestDetail{}, err
+	}
+	detail, err := a.gateway.ViewPullRequestForFixer(ctx, githubinfra.ViewPullRequestInput{Repo: repo, PRNumber: input.PRNumber, CWD: input.CWD})
 	if err != nil {
 		return fixer.PullRequestDetail{}, err
 	}
@@ -1094,7 +1118,11 @@ func commentInfosToObjects(items []githubinfra.CommentInfo) []map[string]any {
 }
 
 func (a fixerGitHubAdapter) ListReviewThreads(ctx context.Context, input fixer.ListReviewThreadsInput) ([]fixer.ReviewThread, error) {
-	threads, err := a.gateway.ListReviewThreads(ctx, githubinfra.ListReviewThreadsInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD, Limit: input.Limit})
+	repo, err := reviewThreadRepo(a.config, input.Repo, input.CWD)
+	if err != nil {
+		return nil, err
+	}
+	threads, err := a.gateway.ListReviewThreads(ctx, githubinfra.ListReviewThreadsInput{Repo: repo, PRNumber: input.PRNumber, CWD: input.CWD, Limit: input.Limit})
 	if err != nil {
 		return nil, err
 	}
@@ -1110,7 +1138,12 @@ func (a fixerGitHubAdapter) ListReviewThreads(ctx context.Context, input fixer.L
 }
 
 func (a fixerGitHubAdapter) ViewReviewThread(ctx context.Context, input fixer.ViewReviewThreadInput) (fixer.ReviewThread, error) {
-	thread, err := a.gateway.ViewReviewThread(ctx, githubinfra.ViewReviewThreadInput{ThreadID: input.ThreadID, CWD: input.CWD})
+	repo, err := reviewThreadRepo(a.config, input.Repo, input.CWD)
+	if err != nil {
+		return fixer.ReviewThread{}, err
+	}
+	hostname, _ := githubinfra.SplitRepoHostname(repo)
+	thread, err := a.gateway.ViewReviewThread(ctx, githubinfra.ViewReviewThreadInput{ThreadID: input.ThreadID, CWD: input.CWD, Hostname: hostname})
 	if err != nil {
 		return fixer.ReviewThread{}, err
 	}
@@ -1122,12 +1155,94 @@ func (a fixerGitHubAdapter) ViewReviewThread(ctx context.Context, input fixer.Vi
 }
 
 func (a fixerGitHubAdapter) ResolveReviewThread(ctx context.Context, input fixer.ResolveReviewThreadInput) error {
-	return a.gateway.ResolveReviewThread(ctx, githubinfra.ResolveReviewThreadInput{Repo: input.Repo, ThreadID: input.ThreadID, CWD: input.CWD})
+	repo, err := reviewThreadRepo(a.config, input.Repo, input.CWD)
+	if err != nil {
+		return err
+	}
+	return a.gateway.ResolveReviewThread(ctx, githubinfra.ResolveReviewThreadInput{Repo: repo, ThreadID: input.ThreadID, CWD: input.CWD})
 }
 
 func (a fixerGitHubAdapter) AddReviewThreadReply(ctx context.Context, input fixer.AddReviewThreadReplyInput) error {
+	repo, err := reviewThreadRepo(a.config, input.Repo, input.CWD)
+	if err != nil {
+		return err
+	}
 	body := a.stamper.WithIdentity(input.DisclosureAgent, input.DisclosureModel).ReviewComment(input.Body, "fixer")
-	return a.gateway.AddReviewThreadReply(ctx, githubinfra.AddReviewThreadReplyInput{Repo: input.Repo, ThreadID: input.ThreadID, Body: body, CWD: input.CWD})
+	return a.gateway.AddReviewThreadReply(ctx, githubinfra.AddReviewThreadReplyInput{Repo: repo, ThreadID: input.ThreadID, Body: body, CWD: input.CWD})
+}
+
+// reviewThreadRepo adds the provider hostname selected by the live checkout.
+func reviewThreadRepo(cfg *config.Config, repo, cwd string) (string, error) {
+	if cfg == nil {
+		return repo, nil
+	}
+	for _, project := range cfg.Projects {
+		if filepath.Clean(project.RepoPath) == filepath.Clean(cwd) {
+			return qualifyProjectRepo(*cfg, project, repo)
+		}
+	}
+	return repo, nil
+}
+
+// reviewThreadRepoForProject adds the current provider hostname by durable
+// project identity. The operation owns its queued slug and CWD; both may
+// predate a config-managed path change.
+func reviewThreadRepoForProject(cfg *config.Config, projectID, repo string) (string, error) {
+	if cfg == nil {
+		return repo, nil
+	}
+	for _, project := range cfg.Projects {
+		if project.ID == strings.TrimSpace(projectID) {
+			return qualifyProjectRepo(*cfg, project, repo)
+		}
+	}
+	return "", fmt.Errorf("repository provider is not configured for project %s", projectID)
+}
+
+func qualifyProjectRepo(cfg config.Config, project config.ProjectRefConfig, repo string) (string, error) {
+	_, repoSlug := githubinfra.SplitRepoHostname(repo)
+	if strings.TrimSpace(repoSlug) == "" {
+		return "", fmt.Errorf("repository identity is not configured for project %s", project.ID)
+	}
+	project.Repo = repoSlug
+	identity, ok := config.ProjectRepositoryIdentity(cfg, project)
+	if !ok {
+		return "", fmt.Errorf("repository identity is not configured for project %s", project.ID)
+	}
+	baseURL, err := url.Parse(identity.BaseURL)
+	if err != nil || strings.TrimSpace(baseURL.Hostname()) == "" || strings.TrimSpace(baseURL.Host) == "" {
+		return "", fmt.Errorf("github provider hostname is not configured for project %s", project.ID)
+	}
+	if isPublicGitHubHostname(baseURL.Hostname()) {
+		return identity.Repo, nil
+	}
+	return strings.TrimSpace(baseURL.Host) + "/" + identity.Repo, nil
+}
+
+func isPublicGitHubHostname(hostname string) bool {
+	switch {
+	case strings.EqualFold(hostname, "github.com"), strings.EqualFold(hostname, "www.github.com"), strings.EqualFold(hostname, "api.github.com"):
+		return true
+	default:
+		return false
+	}
+}
+
+// gatekeeperGitHubAdapter supplies the provider-qualified repository identity
+// only for review-thread operations. All other gatekeeper calls retain their
+// owner/slug repository contract.
+type gatekeeperGitHubAdapter struct {
+	*githubinfra.Gateway
+	config *config.Config
+}
+
+func (a gatekeeperGitHubAdapter) ListReviewThreads(ctx context.Context, input githubinfra.ListReviewThreadsInput) ([]githubinfra.ReviewThread, error) {
+	repo, err := reviewThreadRepo(a.config, input.Repo, input.CWD)
+	if err != nil {
+		return nil, err
+	}
+	input.Repo = repo
+	return a.Gateway.ListReviewThreads(ctx, input)
 }
 
 func (a fixerGitHubAdapter) CompareCommits(ctx context.Context, input fixer.CompareCommitsInput) (fixer.CompareCommitsResult, error) {
@@ -1706,7 +1821,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 	if githubGateway != nil {
 		gatekeeperRunner = gatekeeper.New(gatekeeper.Options{
 			Repos:  repos,
-			GitHub: githubGateway,
+			GitHub: gatekeeperGitHubAdapter{Gateway: githubGateway, config: &cfg},
 			Now:    now,
 			TrustForProject: func(projectID string) config.GatekeeperTrustLevel {
 				return gatekeeperTrustForProject(cfg, projectID)
@@ -2686,6 +2801,10 @@ func schedulerProjectsForCapturedCatalog(ctx context.Context, input defaultSched
 			continue
 		}
 		binding, ok := runtimeProjectBinding(*input.Config, project.ID)
+		codingPolicyRequired := config.CodingRoleAgentConfigured(*input.Config, config.CodingRoleWorker) || config.CodingRoleAgentConfigured(*input.Config, config.CodingRoleFixer)
+		if !ok && codingPolicyRequired && projects.IsLegacyInertProject(project) && len(config.ResolveValidationCommands(*input.Config)) == 0 {
+			continue
+		}
 		if !ok || !catalogBindingMatchesProject(binding, project) {
 			if input.Logger != nil {
 				input.Logger.Debug("scheduler deferred pass until project catalog catches up", map[string]any{"projectId": project.ID})
@@ -2972,10 +3091,11 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 		return claimContinue, nil
 	}
 
+	projectScopedTypes, runnableProjectIDs := codingClaimProjectScope(input.Config)
 	stopClaiming := false
 	for i := 0; i < availableSlots; i++ {
 		result, err := claimOne(func(ctx context.Context, nowISO, claimedBy string) (*storage.QueueItemRecord, error) {
-			return input.Repos.Queue.ClaimNextNonLongTermRetryAmongTypeSets(ctx, nowISO, claimedBy, unrestrictedTypes, stickySnapshotTypes)
+			return input.Repos.Queue.ClaimNextNonLongTermRetryAmongTypeSetsForProjects(ctx, nowISO, claimedBy, unrestrictedTypes, stickySnapshotTypes, projectScopedTypes, runnableProjectIDs)
 		})
 		if err != nil {
 			return queueItems, dispatchOwnedQueueClaims(ctx, owned, input, err)
@@ -2990,7 +3110,7 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 	}
 	for !stopClaiming && len(queueItems) < availableSlots {
 		result, err := claimOne(func(ctx context.Context, nowISO, claimedBy string) (*storage.QueueItemRecord, error) {
-			return input.Repos.Queue.ClaimNextLongTermRetryAmongTypeSets(ctx, nowISO, claimedBy, unrestrictedTypes, stickySnapshotTypes)
+			return input.Repos.Queue.ClaimNextLongTermRetryAmongTypeSetsForProjects(ctx, nowISO, claimedBy, unrestrictedTypes, stickySnapshotTypes, projectScopedTypes, runnableProjectIDs)
 		})
 		if err != nil {
 			return queueItems, dispatchOwnedQueueClaims(ctx, owned, input, err)
@@ -3000,6 +3120,17 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 		}
 	}
 	return queueItems, dispatchOwnedQueueClaims(ctx, owned, input, nil)
+}
+
+func codingClaimProjectScope(cfg *config.Config) ([]string, []string) {
+	if cfg == nil {
+		return nil, nil
+	}
+	projectIDs := make([]string, 0, len(cfg.Projects))
+	for _, project := range cfg.Projects {
+		projectIDs = append(projectIDs, project.ID)
+	}
+	return []string{"fixer", "worker"}, projectIDs
 }
 
 // claimErrorIsAmbiguousCancel reports whether a ClaimNext* error may have
@@ -3524,7 +3655,11 @@ func processSnapshotQueueItem(ctx context.Context, item storage.QueueItemRecord,
 	if now == nil {
 		now = time.Now
 	}
-	snapshot, err := input.Snapshotter.CapturePullRequestSnapshot(ctx, githubinfra.CapturePullRequestSnapshotInput{ProjectID: project.ID, Repo: *item.Repo, PRNumber: *item.PRNumber, CWD: cwd, CapturedAt: formatJavaScriptISOString(now().UTC())})
+	transportRepo, err := reviewThreadRepoForProject(input.Config, *item.ProjectID, *item.Repo)
+	if err != nil {
+		return failSnapshotQueueItem(ctx, item, input, err.Error(), "retryable_transient")
+	}
+	snapshot, err := input.Snapshotter.CapturePullRequestSnapshot(ctx, githubinfra.CapturePullRequestSnapshotInput{ProjectID: project.ID, Repo: *item.Repo, TransportRepo: transportRepo, PRNumber: *item.PRNumber, CWD: cwd, CapturedAt: formatJavaScriptISOString(now().UTC())})
 	if err != nil {
 		return failSnapshotQueueItem(ctx, item, input, err.Error(), "retryable_transient")
 	}

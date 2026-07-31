@@ -1,6 +1,7 @@
 package projects
 
 import (
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -332,6 +333,22 @@ func TestMaterializeCatalogRejectsDuplicateRepoWithinProvider(t *testing.T) {
 	_, err := MaterializeCatalog(global, []storage.ProjectRecord{{ID: "one", MetadataJSON: &first}, {ID: "two", MetadataJSON: &second}})
 	if err == nil || !strings.Contains(err.Error(), `duplicates active project "one"`) {
 		t.Fatalf("MaterializeCatalog() error = %v, want same-provider duplicate rejection", err)
+	}
+}
+
+func TestMaterializeCatalogRejectsDuplicateNormalizedRepoPaths(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	duplicate := root + string(filepath.Separator) + "."
+	first := `{"repo":"acme/one"}`
+	second := `{"repo":"acme/two"}`
+	_, err := MaterializeCatalog(config.Config{}, []storage.ProjectRecord{
+		{ID: "one", RepoPath: root, MetadataJSON: &first},
+		{ID: "two", RepoPath: duplicate, MetadataJSON: &second},
+	})
+	if err == nil || !strings.Contains(err.Error(), `repo path "`+duplicate+`" duplicates active project "one"`) {
+		t.Fatalf("MaterializeCatalog() error = %v, want normalized repo-path duplicate rejection", err)
 	}
 }
 
