@@ -2951,6 +2951,9 @@ func TestGatewayClosePullRequestIsIdempotent(t *testing.T) {
 	if err := gateway.ClosePullRequest(context.Background(), ClosePullRequestInput{Repo: "acme/looper", PRNumber: 45, DeleteBranch: true}); err != nil {
 		t.Fatalf("ClosePullRequest(delete branch) error = %v", err)
 	}
+	if err := gateway.ClosePullRequest(context.Background(), ClosePullRequestInput{Repo: "acme/looper", PRNumber: 45, DeleteBranch: true}); err != nil {
+		t.Fatalf("ClosePullRequest(delete branch) error = %v", err)
+	}
 	log := strings.Join(runner.calls, "\n")
 	if !strings.Contains(log, "pr close 42 --repo acme/looper") {
 		t.Fatalf("gh log missing close pr command\n%s", log)

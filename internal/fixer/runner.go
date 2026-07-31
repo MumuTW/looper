@@ -2727,6 +2727,11 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 				return runpipe.ProcessResult{}, err
 			}
 		}
+		if failedQueue != nil && failedQueue.Status == "failed" {
+			if _, _, err := r.applyTerminalRegeneration(ctx, *project, pausedLoop, queueItem, latest, failure); err != nil {
+				return runpipe.ProcessResult{}, err
+			}
+		}
 		if queueResultIsTerminalForCleanup(failedQueue) {
 			r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, run.ID, &latest)
 		}
@@ -2875,6 +2880,11 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 				}
 			}
 			if queueResultAllowsRegeneration(failedQueue, failure) {
+				if _, _, err := r.applyTerminalRegeneration(ctx, *project, pausedLoop, queueItem, latest, failure); err != nil {
+					return runpipe.ProcessResult{}, err
+				}
+			}
+			if failedQueue != nil && failedQueue.Status == "failed" {
 				if _, _, err := r.applyTerminalRegeneration(ctx, *project, pausedLoop, queueItem, latest, failure); err != nil {
 					return runpipe.ProcessResult{}, err
 				}
