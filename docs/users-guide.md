@@ -55,6 +55,28 @@ rejects those fields explicitly because neither config nor the dashboard has a
 safe producer for durable membership credentials. There is no Network status or
 maintenance API while this surface is withdrawn.
 
+### Decommission extra Nodes before the local-only cutover
+
+The previous Routed rollout explicitly allowed multiple Nodes to share one
+GitHub identity because the `looper:target:<node_name>` label disambiguated
+which Node could claim work. Once `[network]` and `projects[].network` are
+removed, every upgraded daemon treats the same projects as local-only and
+ignores `looper:target:*`; `EvaluateWorker` and `EvaluateReviewer` then allow
+the work on every Node, so separate SQLite queues can run the same Issue or
+review concurrently.
+
+Before removing those fields and restarting, an existing Routed installation
+that ran more than one Node under a shared GitHub identity must do one of the
+following first:
+
+- stop all but one Node, so only a single daemon can claim work for that
+  identity; or
+- assign each surviving Node a distinct GitHub identity and drain any in-flight
+  work that the old shared identity still owns.
+
+Only after that cutover is complete, remove the `[network]` and
+`projects[].network` sections and restart the remaining daemon(s).
+
 ## 2. How Looper resolves the project
 
 Looper only acts on **registered projects**. Register a project with `looper project add /absolute/path/to/repo`, or use `POST /api/v1/projects` with the repo's absolute `repoPath` when you need the advanced fields. The dashboard only lists registered projects. The daemon polls every registered project on each discovery pass.
