@@ -16,7 +16,7 @@ import (
 
 	"github.com/MumuTW/looper/internal/infra/shell"
 	"github.com/MumuTW/looper/internal/processcontainment"
-	"golang.org/x/sys/unix"
+	"github.com/MumuTW/looper/internal/processsandbox/trustmanifest"
 )
 
 type workspaceAccess string
@@ -26,8 +26,8 @@ const (
 	workspaceWritable workspaceAccess = "writable"
 )
 
-// Available verifies that the pinned runtime and its pre-sandbox support
-// executables are installed outside caller-writable storage.
+// Available verifies the pinned runtime and its complete executable closure
+// against the root-sealed content manifest written at installation time.
 func Available() error {
 	cwd, err := os.Getwd()
 	if err != nil {
@@ -310,10 +310,8 @@ func installedRuntime(cwd string) (runtimePaths, error) {
 		}
 		moduleRoot = parent
 	}
-	if err := requireTrustedTree(moduleRoot); err != nil {
-		return runtimePaths{}, fmt.Errorf("process sandbox: untrusted srt installation: %w", err)
-	}
-	paths := runtimePaths{command: path}
+	paths := runtimePaths{command: resolved}
+	resolvedRoots := map[string]string{"srt": resolved}
 	required := []struct {
 		name   string
 		target *string
@@ -345,58 +343,16 @@ func installedRuntime(cwd string) (runtimePaths, error) {
 		if pathContains(cwd, resolvedCommand) {
 			return runtimePaths{}, fmt.Errorf("process sandbox: support tool %s resolves inside cwd", requiredCommand.name)
 		}
-		if err := requireTrustedPath(resolvedCommand); err != nil {
-			return runtimePaths{}, fmt.Errorf("process sandbox: untrusted support tool %s: %w", requiredCommand.name, err)
-		}
 		*requiredCommand.target = resolvedCommand
+		resolvedRoots[requiredCommand.name] = resolvedCommand
 	}
 	if pathContains(cwd, resolved) {
 		return runtimePaths{}, fmt.Errorf("process sandbox: srt runtime resolves inside cwd")
 	}
-	paths.command = resolved
+	if err := trustmanifest.Verify(trustmanifest.ManifestPath(moduleRoot), trustmanifest.Input{PackageRoot: moduleRoot, Roots: resolvedRoots}); err != nil {
+		return runtimePaths{}, fmt.Errorf("process sandbox: untrusted srt installation: %w", err)
+	}
 	return paths, nil
-}
-
-func requireTrustedTree(root string) error {
-	if os.Geteuid() == 0 {
-		return fmt.Errorf("sandboxed execution is not supported as root")
-	}
-	if err := requireTrustedPath(root); err != nil {
-		return err
-	}
-	return filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if entry.Type()&os.ModeSymlink != 0 {
-			resolved, err := filepath.EvalSymlinks(path)
-			if err != nil {
-				return err
-			}
-			if !pathContains(root, resolved) {
-				return fmt.Errorf("%s links outside the trusted module tree", path)
-			}
-		}
-		if unix.Access(path, unix.W_OK) == nil {
-			return fmt.Errorf("%s is writable by the daemon user", path)
-		}
-		return nil
-	})
-}
-
-func requireTrustedPath(path string) error {
-	if os.Geteuid() == 0 {
-		return fmt.Errorf("sandboxed execution is not supported as root")
-	}
-	for current := filepath.Clean(path); ; current = filepath.Dir(current) {
-		if unix.Access(current, unix.W_OK) == nil {
-			return fmt.Errorf("%s is writable by the daemon user", current)
-		}
-		parent := filepath.Dir(current)
-		if parent == current {
-			return nil
-		}
-	}
 }
 
 func platformSystemReadRoots() []string {

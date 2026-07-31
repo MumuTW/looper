@@ -46,7 +46,9 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
-          node-version: "22"
+          # Pin both Node and its bundled npm. Floating sudo-npm was part of
+          # the executable-substitution surface identified in #338.
+          node-version: "22.14.0"
           cache: pnpm
           cache-dependency-path: web/dashboard/pnpm-lock.yaml
 
@@ -79,61 +81,39 @@ jobs:
       - name: Reject committed binaries
         run: go run ./tools/check-binaries
 
-      # The srt trust probe rejects the runtime when any path in or above
-      # the installation is writable by the daemon user. Hosted-runner
-      # images vary: some ship /usr/local and /usr/local/lib writable by
-      # the runner account, via ownership or ACLs, and a default ACL on
-      # /usr/local/lib would propagate runner-writable entries into
-      # anything installed under it. Rather than hope for a clean image,
-      # every run first RECREATES the hostile conditions (runner
-      # ownership plus a default ACL granting the runner write), so the
-      # hardening below is exercised deterministically on every image and
-      # a regression fails this step on every run instead of only on
-      # whichever image the pool happens to serve.
-      - name: Simulate hostile runner image
-        run: |
-          sudo chown "$(id -u):$(id -g)" /usr/local/lib
-          sudo setfacl -m "d:u:$(id -un):rwx" -m "u:$(id -un):rwx" /usr/local/lib
-
-      # Harden BEFORE installing so nothing installed can inherit a
-      # default ACL: pin the ancestor chain root-owned, 0755, and strip
-      # both access and default ACL entries (-b alone leaves default
-      # entries in place on some acl builds; -k removes them explicitly).
-      # The chain runs all the way to / because the probe walks every
-      # ancestor and image variance has been observed as high as /usr
-      # (PR #318's verify run failed on "/usr is writable").
-      - name: Harden sandbox runtime ancestors
-        run: |
-          sudo chown root:root / /usr /usr/local /usr/local/lib
-          sudo chmod 0755 / /usr /usr/local /usr/local/lib
-          sudo setfacl -b -k / /usr /usr/local /usr/local/lib
-
       - name: Install process sandbox runtime
         run: |
+          test "$(node --version)" = "v22.14.0"
+          test "$(npm --version)" = "10.9.2"
           sudo apt-get update
           sudo apt-get install --no-install-recommends bubblewrap socat ripgrep
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-          sudo npm install --global --prefix /usr/local/lib/looper-srt-runtime @anthropic-ai/sandbox-runtime@0.0.67
-          sudo install -d -m 0555 /usr/local/lib/looper-srt-tools
-          sudo install -m 0555 "$(command -v node)" /usr/local/lib/looper-srt-tools/node
-          sudo ln -s ../looper-srt-runtime/bin/srt /usr/local/lib/looper-srt-tools/srt
-          echo /usr/local/lib/looper-srt-tools >> "$GITHUB_PATH"
 
-      # Belt-and-braces sweep of the installed trees, then assert the
-      # probe's own criterion — access(W_OK) as the runner user — over
-      # the full chain. find -writable uses the same access(2) check the
-      # Go probe uses, so this fails the job at setup time with the
-      # offending paths listed, instead of surfacing later as
-      # intermittent test failures.
-      - name: Verify sandbox runtime is unwritable by the daemon user
-        run: |
-          sudo chmod -R go-w /usr/local/lib/looper-srt-runtime /usr/local/lib/looper-srt-tools
-          sudo setfacl -R -b -k /usr/local/lib/looper-srt-runtime /usr/local/lib/looper-srt-tools
-          writable="$(find / /usr /usr/local /usr/local/lib -maxdepth 0 -writable; find /usr/local/lib/looper-srt-runtime /usr/local/lib/looper-srt-tools -writable)"
-          if [ -n "$writable" ]; then
-            printf 'srt paths still writable by the daemon user:\n%s\n' "$writable"
-            exit 1
-          fi
+          # Install with the pinned unprivileged npm into staging. Root only
+          # copies the reviewed result and seals its executable closure; npm
+          # itself never runs under sudo. RUNNER_TEMP is intentionally
+          # user-writable, proving trust no longer depends on ancestor modes.
+          srt_stage="$RUNNER_TEMP/looper-srt-stage"
+          srt_prefix="$RUNNER_TEMP/looper-srt-runtime"
+          srt_tools="$RUNNER_TEMP/looper-srt-tools"
+          npm install --global --prefix "$srt_stage" @anthropic-ai/sandbox-runtime@0.0.67
+          sudo install -d -m 0755 "$srt_prefix" "$srt_tools"
+          sudo cp -R "$srt_stage/." "$srt_prefix/"
+          sudo chown -R root:root "$srt_prefix" "$srt_tools"
+          sudo chmod -R go-w "$srt_prefix" "$srt_tools"
+          sudo install -m 0555 "$(command -v node)" "$srt_tools/node"
+          sudo ln -s ../looper-srt-runtime/bin/srt "$srt_tools/srt"
+
+          go build -o "$RUNNER_TEMP/looper-srt-seal" ./cmd/looper-srt-seal
+          sudo "$RUNNER_TEMP/looper-srt-seal" \
+            --manifest "$srt_prefix/.looper-srt-trust.json" \
+            --package-root "$srt_prefix/lib/node_modules" \
+            --srt "$srt_tools/srt" \
+            --node "$srt_tools/node" \
+            --rg "$(command -v rg)" \
+            --bwrap "$(command -v bwrap)" \
+            --socat "$(command -v socat)"
+          echo "$srt_tools" >> "$GITHUB_PATH"
 
       # The /api/v1 compat artifacts are generated from the Go handlers. Catch a
       # response-shape change that forgot to regenerate here, with the command
