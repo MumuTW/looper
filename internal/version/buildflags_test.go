@@ -1,9 +1,10 @@
 package version
 
 import (
+	"bytes"
+	"fmt"
 	"go/parser"
 	"go/token"
-	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -121,42 +122,192 @@ func TestModulePathMigration(t *testing.T) {
 		t.Fatalf("go.mod module declaration = %q, want %q", strings.SplitN(string(goMod), "\n", 2)[0], "module "+modulePath)
 	}
 
-	err = filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if entry.IsDir() {
-			switch entry.Name() {
-			case ".git", "dist", "node_modules":
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if filepath.Ext(path) != ".go" {
-			return nil
-		}
+	goFiles, err := trackedGoFiles(root)
+	if err != nil {
+		t.Fatalf("list tracked Go files: %v", err)
+	}
 
-		file, err := parser.ParseFile(token.NewFileSet(), path, nil, parser.ImportsOnly)
+	violations, err := legacyModulePathViolations(root, goFiles, legacyModulePath)
+	if err != nil {
+		t.Fatalf("scan tracked Go source for legacy module path: %v", err)
+	}
+	for _, v := range violations {
+		t.Errorf("%s still imports legacy module path %q", v.Path, v.LegacyPath)
+	}
+}
+
+// trackedGoFiles returns the repository's Git-tracked *.go files, relative to
+// root. Using `git ls-files` as the scan authority keeps the migration guard
+// focused on this checkout's own source: sibling worktrees (`.worktrees`,
+// `.claude/worktrees`, ...) are separate checkouts that may legitimately sit
+// at older revisions and are never listed by `git ls-files` run here. The test
+// therefore does not walk the filesystem or mutate those worktrees.
+func trackedGoFiles(root string) ([]string, error) {
+	cmd := exec.Command("git", "-C", root, "ls-files", "-z", "--", "*.go")
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("git ls-files: %v: %s", err, stderr.String())
+	}
+	var files []string
+	for _, name := range strings.Split(string(out), "\x00") {
+		if name == "" {
+			continue
+		}
+		files = append(files, name)
+	}
+	return files, nil
+}
+
+type legacyModulePathViolation struct {
+	Path       string
+	LegacyPath string
+}
+
+// legacyModulePathViolations parses the given Go files (paths relative to root)
+// and reports any that import legacyModulePath or one of its subpackages.
+func legacyModulePathViolations(root string, relativeGoFiles []string, legacyModulePath string) ([]legacyModulePathViolation, error) {
+	fset := token.NewFileSet()
+	var violations []legacyModulePathViolation
+	for _, rel := range relativeGoFiles {
+		file, err := parser.ParseFile(fset, filepath.Join(root, rel), nil, parser.ImportsOnly)
 		if err != nil {
-			return err
+			return nil, fmt.Errorf("parse %s: %w", rel, err)
 		}
 		for _, imported := range file.Imports {
 			importPath, err := strconv.Unquote(imported.Path.Value)
 			if err != nil {
-				return err
+				return nil, fmt.Errorf("unquote import in %s: %w", rel, err)
 			}
 			if importPath == legacyModulePath || strings.HasPrefix(importPath, legacyModulePath+"/") {
-				relativePath, err := filepath.Rel(root, path)
-				if err != nil {
-					return err
-				}
-				t.Errorf("%s still imports legacy module path %q", relativePath, legacyModulePath)
+				violations = append(violations, legacyModulePathViolation{Path: rel, LegacyPath: legacyModulePath})
 			}
 		}
-		return nil
-	})
+	}
+	return violations, nil
+}
+
+// TestLegacyModulePathViolationsDetectsTrackedImports verifies the scanner
+// reports a legacy import in a tracked file by its relative path, while a
+// legacy import that lives in a sibling worktree on disk is invisible because
+// it is not part of the tracked file list handed to the scanner.
+func TestLegacyModulePathViolationsDetectsTrackedImports(t *testing.T) {
+	const legacyModulePath = "github.com/nexu-io/looper"
+	root := t.TempDir()
+
+	trackedRel := filepath.Join("internal", "version", "legacy.go")
+	trackedPath := filepath.Join(root, trackedRel)
+	if err := os.MkdirAll(filepath.Dir(trackedPath), 0o755); err != nil {
+		t.Fatalf("mkdir tracked: %v", err)
+	}
+	if err := os.WriteFile(trackedPath, []byte("package version\n\nimport (\n\t\"github.com/nexu-io/looper/internal/foo\"\n)\n"), 0o644); err != nil {
+		t.Fatalf("write tracked file: %v", err)
+	}
+
+	worktreeRel := filepath.Join(".worktrees", "stale", "cmd", "looperd", "main.go")
+	worktreePath := filepath.Join(root, worktreeRel)
+	if err := os.MkdirAll(filepath.Dir(worktreePath), 0o755); err != nil {
+		t.Fatalf("mkdir worktree: %v", err)
+	}
+	if err := os.WriteFile(worktreePath, []byte("package main\n\nimport (\n\t\"github.com/nexu-io/looper/internal/runtime\"\n)\n"), 0o644); err != nil {
+		t.Fatalf("write worktree file: %v", err)
+	}
+
+	violations, err := legacyModulePathViolations(root, []string{trackedRel}, legacyModulePath)
 	if err != nil {
-		t.Fatalf("scan Go source for legacy module path: %v", err)
+		t.Fatalf("legacyModulePathViolations: %v", err)
+	}
+	if len(violations) != 1 || violations[0].Path != trackedRel {
+		t.Fatalf("violations = %#v, want exactly one entry with Path %q", violations, trackedRel)
+	}
+}
+
+// TestTrackedGoFilesExcludesWorktrees verifies the scan authority (git ls-files)
+// lists only this checkout's tracked Go files and never files that live in a
+// linked worktree, even when those files are tracked inside the worktree.
+func TestTrackedGoFilesExcludesWorktrees(t *testing.T) {
+	root := t.TempDir()
+	for _, args := range [][]string{
+		{"init"},
+		{"config", "user.email", "test@example.com"},
+		{"config", "user.name", "test"},
+	} {
+		cmd := exec.Command("git", append([]string{"-C", root}, args...)...)
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		if err := cmd.Run(); err != nil {
+			t.Skipf("git %v unavailable in this environment: %v %s", args, err, stderr.String())
+		}
+	}
+
+	trackedRel := filepath.Join("cmd", "looperd", "main.go")
+	trackedPath := filepath.Join(root, trackedRel)
+	if err := os.MkdirAll(filepath.Dir(trackedPath), 0o755); err != nil {
+		t.Fatalf("mkdir tracked: %v", err)
+	}
+	if err := os.WriteFile(trackedPath, []byte("package main\n"), 0o644); err != nil {
+		t.Fatalf("write tracked file: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "go.mod"), []byte("module github.com/MumuTW/looper\n\ngo 1.24\n"), 0o644); err != nil {
+		t.Fatalf("write go.mod: %v", err)
+	}
+	for _, args := range [][]string{
+		{"add", trackedRel, "go.mod"},
+		{"commit", "-m", "seed"},
+	} {
+		cmd := exec.Command("git", append([]string{"-C", root}, args...)...)
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		if err := cmd.Run(); err != nil {
+			t.Fatalf("git %v: %v %s", args, err, stderr.String())
+		}
+	}
+
+	worktreeRoot := filepath.Join(root, ".worktrees", "stale")
+	worktreeAdd := exec.Command("git", "-C", root, "worktree", "add", worktreeRoot, "-b", "stale")
+	var worktreeStderr bytes.Buffer
+	worktreeAdd.Stderr = &worktreeStderr
+	if err := worktreeAdd.Run(); err != nil {
+		t.Skipf("git worktree add unavailable: %v %s", err, worktreeStderr.String())
+	}
+
+	worktreeGoRel := filepath.Join("internal", "runtime", "runtime.go")
+	worktreeGoPath := filepath.Join(worktreeRoot, worktreeGoRel)
+	if err := os.MkdirAll(filepath.Dir(worktreeGoPath), 0o755); err != nil {
+		t.Fatalf("mkdir worktree file: %v", err)
+	}
+	if err := os.WriteFile(worktreeGoPath, []byte("package runtime\n\nimport (\n\t\"github.com/nexu-io/looper/internal/foo\"\n)\n"), 0o644); err != nil {
+		t.Fatalf("write worktree file: %v", err)
+	}
+	for _, args := range [][]string{
+		{"add", worktreeGoRel},
+		{"commit", "-m", "stale legacy import"},
+	} {
+		cmd := exec.Command("git", append([]string{"-C", worktreeRoot}, args...)...)
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		if err := cmd.Run(); err != nil {
+			t.Fatalf("git %v in worktree: %v %s", args, err, stderr.String())
+		}
+	}
+
+	files, err := trackedGoFiles(root)
+	if err != nil {
+		t.Fatalf("trackedGoFiles: %v", err)
+	}
+	wantTracked := filepath.ToSlash(trackedRel)
+	foundTracked := false
+	for _, f := range files {
+		if strings.Contains(filepath.ToSlash(f), ".worktrees") {
+			t.Fatalf("trackedGoFiles listed worktree path %q; scan authority must be limited to this checkout", f)
+		}
+		if filepath.ToSlash(f) == wantTracked {
+			foundTracked = true
+		}
+	}
+	if !foundTracked {
+		t.Fatalf("trackedGoFiles = %v, want %q listed", files, wantTracked)
 	}
 }
 
