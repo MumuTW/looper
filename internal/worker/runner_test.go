@@ -1331,13 +1331,18 @@ func TestBuildIssueClaimCommentBodySanitizesTranscriptSummary(t *testing.T) {
 	}
 }
 
-func TestBuildIssueClaimCommentBodyPreservesPausedSummary(t *testing.T) {
+func TestBuildIssueClaimCommentBodySanitizesPausedSummary(t *testing.T) {
 	t.Parallel()
 
-	summary := "Worker stopped because acme/looper#27 is no longer an open issue"
+	summary := `Worker worktree path /Users/alice/dev/looper/worktrees/wt for branch looper/feature is stale (path does not exist; root /Users/alice/dev/looper/worktrees).`
 	body := buildIssueClaimCommentBody("loop_1", "run_1", workerInput{Repo: "acme/looper", IssueNumber: 27}, issueClaimStatusPaused, nil, summary)
-	if !strings.Contains(body, "Latest status: "+summary) {
-		t.Fatalf("body = %q, want paused summary preserved", body)
+	if !strings.Contains(body, "Latest status: See Looper logs for details.") {
+		t.Fatalf("body = %q, want sanitized paused summary", body)
+	}
+	for _, fragment := range []string{"/Users/alice", "worktrees/wt", "looper/feature"} {
+		if strings.Contains(body, fragment) {
+			t.Fatalf("body = %q, want local detail %q removed", body, fragment)
+		}
 	}
 }
 

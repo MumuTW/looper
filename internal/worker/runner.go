@@ -3176,7 +3176,7 @@ func buildIssueClaimCommentBody(loopID, runID string, work workerInput, status s
 		}
 	case issueClaimStatusPaused:
 		lines = append(lines, "Looper paused work on this issue.")
-		if summary != "" {
+		if summary = sanitizePublicIssueClaimSummary(summary); summary != "" {
 			lines = append(lines, "", "Latest status: "+summary)
 		}
 	default:

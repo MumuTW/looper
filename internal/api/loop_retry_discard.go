@@ -339,6 +339,28 @@ func resolveManagedWorktreeForLoop(ctx context.Context, repos *storage.Repositor
 			if err != nil {
 				return nil, err
 			}
+			if record != nil {
+				checkpointPath := strings.TrimSpace(fromCheckpoint.Path)
+				if record.ProjectID != project.ID {
+					return nil, apiError{
+						code:    pkgapi.ErrorCodeValidationFailed,
+						status:  http.StatusBadRequest,
+						message: fmt.Sprintf("Cannot use checkpointed worktree %s for loop %s: it belongs to another project", id, loop.ID),
+					}
+				}
+				if checkpointPath != "" && !sameFilesystemPath(record.WorktreePath, checkpointPath) {
+					// A worktree row can be retargeted when AdoptPath moves the
+					// branch identity to a replacement checkout. The checkpoint's
+					// ID and path jointly identify the progress an operator may
+					// choose to discard; accepting either half independently could
+					// reset the replacement checkout that the worker refused to use.
+					return nil, apiError{
+						code:    pkgapi.ErrorCodeValidationFailed,
+						status:  http.StatusBadRequest,
+						message: fmt.Sprintf("Cannot use checkpointed worktree for loop %s: recorded worktree ID %s no longer matches its checkpoint path", loop.ID, id),
+					}
+				}
+			}
 		}
 		if record == nil {
 			path := strings.TrimSpace(fromCheckpoint.Path)

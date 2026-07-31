@@ -1176,6 +1176,72 @@ func TestHandlerLoopRetryDiscardResolvesByPRNotSiblingBranch(t *testing.T) {
 	}
 }
 
+// TestHandlerLoopRetryDiscardRejectsMovedCheckpointWorktree verifies that a
+// checkpoint's worktree identity is the ID/path pair, not whichever path a
+// mutable worktree row currently reports. AdoptPath may retarget the same ID;
+// discard must not reset either the old checkpoint checkout or its replacement.
+func TestHandlerLoopRetryDiscardRejectsMovedCheckpointWorktree(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+	fixture := seedManagedWorktreeFixture(t, services.Repositories, managedWorktreeSeed{
+		ProjectID: "project_retry_discard_moved_checkpoint",
+		LoopID:    "loop_retry_discard_moved_checkpoint",
+		LoopSeq:   3136,
+		LoopType:  "worker",
+		Branch:    "feature/discard-moved-checkpoint",
+		NowISO:    nowISO,
+		Dirty:     true,
+	})
+
+	// This is a real replacement worktree, so a regression would reset and
+	// clean it successfully. Keep the same database ID while moving its path,
+	// matching AdoptPath's identity-preserving update.
+	movedPath := filepath.Join(fixture.WorktreeRoot, "moved-checkpoint")
+	runGitTest(t, fixture.RepoPath, "worktree", "add", "--force", movedPath, "feature/discard-moved-checkpoint")
+	if err := os.WriteFile(filepath.Join(movedPath, "replacement-dirty.txt"), []byte("keep replacement progress\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(replacement dirty) error = %v", err)
+	}
+	record, err := services.Repositories.Worktrees.GetByBranch(context.Background(), "project_retry_discard_moved_checkpoint", "feature/discard-moved-checkpoint")
+	if err != nil || record == nil {
+		t.Fatalf("GetByBranch() = %#v, %v", record, err)
+	}
+	record.WorktreePath = movedPath
+	record.UpdatedAt = nowISO
+	if err := services.Repositories.Worktrees.Upsert(context.Background(), *record); err != nil {
+		t.Fatalf("Worktrees.Upsert(moved) error = %v", err)
+	}
+
+	statusReq := httptest.NewRequest(http.MethodGet, "/api/v1/loops/3136/worktree", nil)
+	statusRecorder := httptest.NewRecorder()
+	h.ServeHTTP(statusRecorder, statusReq)
+	if statusRecorder.Code != http.StatusBadRequest || !strings.Contains(statusRecorder.Body.String(), "no longer matches its checkpoint path") {
+		t.Fatalf("worktree status = %d body=%s, want moved-checkpoint rejection", statusRecorder.Code, statusRecorder.Body.String())
+	}
+
+	retryReq := httptest.NewRequest(http.MethodPost, "/api/v1/loops/3136/retry", strings.NewReader(`{"mode":"auto","discardWorktreeChanges":true}`))
+	retryRecorder := httptest.NewRecorder()
+	h.ServeHTTP(retryRecorder, retryReq)
+	if retryRecorder.Code != http.StatusBadRequest || !strings.Contains(retryRecorder.Body.String(), "no longer matches its checkpoint path") {
+		t.Fatalf("discard retry = %d body=%s, want moved-checkpoint rejection", retryRecorder.Code, retryRecorder.Body.String())
+	}
+	if got := readTestFile(t, filepath.Join(fixture.WorktreePath, "dirty.txt")); got != "untracked\n" {
+		t.Fatalf("checkpoint worktree was discarded: dirty.txt = %q", got)
+	}
+	if got := readTestFile(t, filepath.Join(movedPath, "replacement-dirty.txt")); got != "keep replacement progress\n" {
+		t.Fatalf("replacement worktree was discarded: replacement-dirty.txt = %q", got)
+	}
+	loop, err := services.Repositories.Loops.GetByID(context.Background(), fixture.LoopID)
+	if err != nil || loop == nil || loop.Status != "paused" {
+		t.Fatalf("loop after rejected discard = %#v, %v, want paused", loop, err)
+	}
+	queue, err := services.Repositories.Queue.GetByID(context.Background(), fixture.FailedQueueID)
+	if err != nil || queue == nil || queue.Status != "manual_intervention" {
+		t.Fatalf("queue after rejected discard = %#v, %v, want manual_intervention", queue, err)
+	}
+}
+
 // TestHandlerLoopRetryDiscardRejectsAwaitingHuman ensures discard+retry refuses
 // awaiting_human loops so runtime HITL poll requeue cannot race after preflight
 // and leave a wiped worktree when the retry TX conflicts.
