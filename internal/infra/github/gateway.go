@@ -449,6 +449,27 @@ type EnableAutoMergeInput struct {
 	CWD      string
 }
 
+type MarkPullRequestReadyInput struct {
+	Repo     string
+	PRNumber int64
+	CWD      string
+}
+
+type ListPullRequestCommitsInput struct {
+	Repo     string
+	PRNumber int64
+	CWD      string
+}
+
+// PullRequestCommit is one commit on a Pull Request branch together with the
+// forge accounts GitHub attributes it to. Authors is what makes a commit
+// attributable: a commit whose author email matches no account resolves to an
+// empty list, which callers must read as unattributable rather than as Looper's.
+type PullRequestCommit struct {
+	OID     string
+	Authors []string
+}
+
 type PullRequestCheckRunsInput struct {
 	Repo string
 	Ref  string
@@ -1949,6 +1970,53 @@ func (g *Gateway) MergePullRequest(ctx context.Context, input EnableAutoMergeInp
 	}
 	_, err := g.runGh(ctx, input.CWD, "", "pr", "merge", strconv.FormatInt(input.PRNumber, 10), "--repo", input.Repo, "--"+strategy, "--match-head-commit", headSHA)
 	return err
+}
+
+// MarkPullRequestReady takes a draft Pull Request out of draft.
+//
+// It is idempotent by re-reading rather than by pre-checking: a human clicking
+// "Ready for review" between the caller's decision and this call makes gh fail
+// with a "not a draft" error, which is the outcome the caller wanted, not a
+// failure. Only a PR that is still a draft after a failed attempt is reported
+// as an error. Deliberately no --match-head-commit equivalent exists for this
+// mutation: unlike a merge, publishing a draft applies to the pull request
+// rather than to a commit, so a push landing in between does not invalidate it.
+func (g *Gateway) MarkPullRequestReady(ctx context.Context, input MarkPullRequestReadyInput) error {
+	_, err := g.runGh(ctx, input.CWD, "", "pr", "ready", strconv.FormatInt(input.PRNumber, 10), "--repo", input.Repo)
+	if err == nil {
+		return nil
+	}
+	draft, draftErr := g.viewPullRequestDraft(ctx, input.Repo, input.PRNumber, input.CWD)
+	if draftErr == nil && !draft {
+		return nil
+	}
+	return err
+}
+
+// ListPullRequestCommits returns the commits on a Pull Request branch with the
+// forge accounts each is attributed to, newest page limits aside. It exists so
+// callers can ask who wrote a branch without cloning it.
+func (g *Gateway) ListPullRequestCommits(ctx context.Context, input ListPullRequestCommitsInput) ([]PullRequestCommit, error) {
+	result, err := g.runGh(ctx, input.CWD, "", "pr", "view", strconv.FormatInt(input.PRNumber, 10), "--repo", input.Repo, "--json", "commits")
+	if err != nil {
+		return nil, err
+	}
+	row, err := decodeJSONObject(result.Stdout)
+	if err != nil {
+		return nil, err
+	}
+	rows := toObjectSlice(row["commits"])
+	out := make([]PullRequestCommit, 0, len(rows))
+	for _, commitRow := range rows {
+		commit := PullRequestCommit{OID: asString(commitRow["oid"])}
+		for _, author := range toObjectSlice(commitRow["authors"]) {
+			if login := strings.TrimSpace(asString(author["login"])); login != "" {
+				commit.Authors = append(commit.Authors, login)
+			}
+		}
+		out = append(out, commit)
+	}
+	return out, nil
 }
 
 func (g *Gateway) GetPullRequestHeadSHA(ctx context.Context, input ViewPullRequestInput) (string, error) {
@@ -3925,6 +3993,14 @@ func (g *Gateway) viewIssueState(ctx context.Context, repo string, issueNumber i
 		return "", err
 	}
 	return strings.ToLower(strings.TrimSpace(result.Stdout)), nil
+}
+
+func (g *Gateway) viewPullRequestDraft(ctx context.Context, repo string, prNumber int64, cwd string) (bool, error) {
+	result, err := g.runGh(ctx, cwd, "", "pr", "view", strconv.FormatInt(prNumber, 10), "--repo", repo, "--json", "isDraft", "--jq", ".isDraft")
+	if err != nil {
+		return false, err
+	}
+	return strings.EqualFold(strings.TrimSpace(result.Stdout), "true"), nil
 }
 
 func (g *Gateway) viewPullRequestState(ctx context.Context, repo string, prNumber int64, cwd string) (string, error) {

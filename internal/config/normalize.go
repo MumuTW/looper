@@ -1271,6 +1271,9 @@ func mergeCoordinatorRoleConfig(config *CoordinatorRoleConfig, partial PartialCo
 	if partial.MergeWatch != nil {
 		mergeCoordinatorMergeWatchConfig(&config.MergeWatch, *partial.MergeWatch)
 	}
+	if partial.MarkReady != nil {
+		mergeCoordinatorMarkReadyConfig(&config.MarkReady, *partial.MarkReady)
+	}
 }
 
 func mergeCoordinatorTriageConfig(config *CoordinatorTriageConfig, partial PartialCoordinatorTriageConfig) {
@@ -1351,6 +1354,15 @@ func mergeCoordinatorMergeWatchConfig(config *CoordinatorMergeWatchConfig, parti
 	}
 	if partial.MaxIndeterminateDuration != nil {
 		config.MaxIndeterminateDuration = *partial.MaxIndeterminateDuration
+	}
+}
+
+func mergeCoordinatorMarkReadyConfig(config *CoordinatorMarkReadyConfig, partial PartialCoordinatorMarkReadyConfig) {
+	if partial.Enabled != nil {
+		config.Enabled = *partial.Enabled
+	}
+	if partial.Scope != nil {
+		config.Scope = CoordinatorMarkReadyScope(strings.TrimSpace(string(*partial.Scope)))
 	}
 }
 
@@ -2081,6 +2093,18 @@ func clonePartialRoleConfigs(configs *PartialRoleConfigs) *PartialRoleConfigs {
 				dispatch.Autonomous = &autonomous
 			}
 			coordinator.Dispatch = &dispatch
+		}
+		if configs.Coordinator.MarkReady != nil {
+			markReady := *configs.Coordinator.MarkReady
+			if configs.Coordinator.MarkReady.Enabled != nil {
+				enabled := *configs.Coordinator.MarkReady.Enabled
+				markReady.Enabled = &enabled
+			}
+			if configs.Coordinator.MarkReady.Scope != nil {
+				scope := *configs.Coordinator.MarkReady.Scope
+				markReady.Scope = &scope
+			}
+			coordinator.MarkReady = &markReady
 		}
 		cloned.Coordinator = &coordinator
 	}

@@ -45,6 +45,7 @@ func (r *Runner) applyMergeWatch(ctx context.Context, repo, cwd string, loaded [
 		}
 		lock := r.watchLock(repo, issue.detail.Number)
 		lock.Lock()
+		r.applyMarkReady(ctx, repo, cwd, issue, roles, currentLogin)
 		removed, applyErr := r.applyMergeWatchLocked(ctx, repo, cwd, issue, roles, currentLogin, budget)
 		lock.Unlock()
 		if applyErr != nil {
@@ -180,7 +181,6 @@ func (r *Runner) mergeWatchSnapshot(ctx context.Context, repo, cwd string, issue
 		}
 		return mergewatch.PRSnapshot{}, nil, err
 	}
-	checks := mergewatch.RequiredCheckSummary{}
 	mergeableState := detail.MergeableState
 	protection, err := r.github.GetBranchProtection(ctx, githubinfra.BranchProtectionInput{Repo: repo, Branch: detail.BaseRefName, CWD: cwd})
 	if err != nil {
@@ -189,39 +189,7 @@ func (r *Runner) mergeWatchSnapshot(ctx context.Context, repo, cwd string, issue
 		}
 		return mergewatch.PRSnapshot{}, nil, err
 	}
-	requiredChecks := map[string]struct{}{}
-	for _, name := range protection.RequiredChecks {
-		requiredChecks[strings.ToLower(strings.TrimSpace(name))] = struct{}{}
-	}
-	seenChecks := map[string]struct{}{}
-	for _, checkRun := range checkRuns.CheckRuns {
-		status := strings.ToLower(strings.TrimSpace(checkRun.Status))
-		conclusion := strings.ToLower(strings.TrimSpace(checkRun.Conclusion))
-		nameKey := strings.ToLower(strings.TrimSpace(checkRun.Name))
-		seenChecks[nameKey] = struct{}{}
-		switch {
-		case status != "completed" && requiredCheck(requiredChecks, nameKey):
-			checks.Pending = append(checks.Pending, checkRun.Name)
-		case mergeableState.IsUnstable() && requiredCheck(requiredChecks, nameKey) && (conclusion == "failure" || conclusion == "timed_out" || conclusion == "cancelled" || conclusion == "action_required" || conclusion == "startup_failure" || conclusion == "stale"):
-			checks.Failed = append(checks.Failed, checkRun.Name)
-		}
-	}
-	for _, status := range checkRuns.Statuses {
-		contextKey := strings.ToLower(strings.TrimSpace(status.Context))
-		state := strings.ToLower(strings.TrimSpace(status.State))
-		seenChecks[contextKey] = struct{}{}
-		switch {
-		case requiredCheck(requiredChecks, contextKey) && state == "pending":
-			checks.Pending = append(checks.Pending, status.Context)
-		case mergeableState.IsUnstable() && requiredCheck(requiredChecks, contextKey) && (state == "failure" || state == "error"):
-			checks.Failed = append(checks.Failed, status.Context)
-		}
-	}
-	for requiredName := range requiredChecks {
-		if _, ok := seenChecks[requiredName]; !ok {
-			checks.Missing = append(checks.Missing, requiredName)
-		}
-	}
+	checks := summarizeRequiredChecks(requiredCheckSet(protection.RequiredChecks), checkRuns, mergeableState.IsUnstable())
 	open := strings.EqualFold(detail.State, "open")
 	return mergewatch.PRSnapshot{
 		Repo:                   repo,
@@ -237,6 +205,70 @@ func (r *Runner) mergeWatchSnapshot(ctx context.Context, repo, cwd string, issue
 		MergeableState:         mergeableState,
 		RequiredChecks:         checks,
 	}, nil, nil
+}
+
+func requiredCheckSet(names []string) map[string]struct{} {
+	required := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		if key := strings.ToLower(strings.TrimSpace(name)); key != "" {
+			required[key] = struct{}{}
+		}
+	}
+	return required
+}
+
+// summarizeRequiredChecks folds check runs and commit statuses into the
+// required-check summary both merge-watch lanes read.
+//
+// countFailures is the one thing the two callers disagree about. Merge-watch
+// only believes a failing check run when GitHub also reports the Pull Request
+// as "unstable", because a stale check run on a clean PR is not a reason to
+// route work to the Fixer. A draft has no such corroboration available —
+// GitHub reports mergeable_state "draft" however CI went — so mark-ready reads
+// conclusions directly. Reading them directly can only add blockers, never
+// remove one, which is the safe direction for a guard whose failure mode is
+// leaving the draft alone.
+func summarizeRequiredChecks(required map[string]struct{}, checkRuns githubinfra.PullRequestCheckRuns, countFailures bool) mergewatch.RequiredCheckSummary {
+	checks := mergewatch.RequiredCheckSummary{}
+	seenChecks := map[string]struct{}{}
+	for _, checkRun := range checkRuns.CheckRuns {
+		status := strings.ToLower(strings.TrimSpace(checkRun.Status))
+		conclusion := strings.ToLower(strings.TrimSpace(checkRun.Conclusion))
+		nameKey := strings.ToLower(strings.TrimSpace(checkRun.Name))
+		seenChecks[nameKey] = struct{}{}
+		switch {
+		case status != "completed" && requiredCheck(required, nameKey):
+			checks.Pending = append(checks.Pending, checkRun.Name)
+		case countFailures && requiredCheck(required, nameKey) && failedCheckRunConclusion(conclusion):
+			checks.Failed = append(checks.Failed, checkRun.Name)
+		}
+	}
+	for _, status := range checkRuns.Statuses {
+		contextKey := strings.ToLower(strings.TrimSpace(status.Context))
+		state := strings.ToLower(strings.TrimSpace(status.State))
+		seenChecks[contextKey] = struct{}{}
+		switch {
+		case requiredCheck(required, contextKey) && state == "pending":
+			checks.Pending = append(checks.Pending, status.Context)
+		case countFailures && requiredCheck(required, contextKey) && (state == "failure" || state == "error"):
+			checks.Failed = append(checks.Failed, status.Context)
+		}
+	}
+	for requiredName := range required {
+		if _, ok := seenChecks[requiredName]; !ok {
+			checks.Missing = append(checks.Missing, requiredName)
+		}
+	}
+	return checks
+}
+
+func failedCheckRunConclusion(conclusion string) bool {
+	switch conclusion {
+	case "failure", "timed_out", "cancelled", "action_required", "startup_failure", "stale":
+		return true
+	default:
+		return false
+	}
 }
 
 func mergeWatchPartialSnapshot(repo string, issueNumber, prNumber int64, detail githubinfra.PullRequestDetail, currentLogin string) mergewatch.PRSnapshot {

@@ -1102,6 +1102,9 @@ func validateProjectRoleOverrides(roles *PartialRoleConfigs, prefix string, maxI
 		if roles.Coordinator.PollInterval != nil && strings.TrimSpace(*roles.Coordinator.PollInterval) == "" {
 			*issues = append(*issues, ValidationIssue{Path: prefix + ".coordinator.pollInterval", Message: "must be a non-empty duration string"})
 		}
+		if roles.Coordinator.MarkReady != nil {
+			validatePartialCoordinatorMarkReady(*roles.Coordinator.MarkReady, prefix+".coordinator.markReady", issues)
+		}
 	}
 }
 
@@ -1557,6 +1560,12 @@ func validatePartialReviewerAutoMerge(partial PartialReviewerAutoMergeConfig, pa
 	}
 }
 
+func validatePartialCoordinatorMarkReady(partial PartialCoordinatorMarkReadyConfig, path string, issues *[]ValidationIssue) {
+	if partial.Scope != nil && *partial.Scope != CoordinatorMarkReadyScopeLooperOnly {
+		*issues = append(*issues, ValidationIssue{Path: path + ".scope", Message: fmt.Sprintf("must be %s", CoordinatorMarkReadyScopeLooperOnly)})
+	}
+}
+
 func validateIssueRoleTriggers(triggers IssueRoleTriggersConfig, path string, issues *[]ValidationIssue) {
 	validateLabelTriggers(triggers.Labels, triggers.LabelMode, path, issues)
 }
@@ -1634,6 +1643,9 @@ func validateCoordinatorRoleConfig(config CoordinatorRoleConfig, path string, is
 		*issues = append(*issues, ValidationIssue{Path: path + ".mergeWatch.maxIndeterminateDuration", Message: "must be a valid time.Duration string"})
 	} else if duration <= 0 {
 		*issues = append(*issues, ValidationIssue{Path: path + ".mergeWatch.maxIndeterminateDuration", Message: "must be greater than 0"})
+	}
+	if config.MarkReady.Scope != CoordinatorMarkReadyScopeLooperOnly {
+		*issues = append(*issues, ValidationIssue{Path: path + ".markReady.scope", Message: fmt.Sprintf("must be %s", CoordinatorMarkReadyScopeLooperOnly)})
 	}
 	validateDistinctLabels([]labelPathValue{
 		{Path: path + ".triage.triagedLabel", Value: config.Triage.TriagedLabel},

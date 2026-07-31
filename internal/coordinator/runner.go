@@ -89,7 +89,9 @@ type GitHubGateway interface {
 	RemovePullRequestLabels(context.Context, githubinfra.PullRequestLabelsInput) error
 	ViewPullRequestMergeWatch(context.Context, githubinfra.ViewPullRequestInput) (githubinfra.PullRequestDetail, error)
 	ListPullRequestCheckRuns(context.Context, githubinfra.PullRequestCheckRunsInput) (githubinfra.PullRequestCheckRuns, error)
+	ListPullRequestCommits(context.Context, githubinfra.ListPullRequestCommitsInput) ([]githubinfra.PullRequestCommit, error)
 	GetBranchProtection(context.Context, githubinfra.BranchProtectionInput) (githubinfra.BranchProtection, error)
+	MarkPullRequestReady(context.Context, githubinfra.MarkPullRequestReadyInput) error
 }
 
 type RepositoryInspector interface {

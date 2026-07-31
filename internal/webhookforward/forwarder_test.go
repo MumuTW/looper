@@ -1093,6 +1093,34 @@ func (a targetedFixerAdapter) DiscoverPullRequestsForBaseBranchUpdate(ctx contex
 	return fixer.DiscoveryResult{}, a.runner.runBaseBranch(ctx, input.ProjectID, input.Repo, input.BaseRefName)
 }
 
+// Publishing a draft is only useful if review starts without another human
+// action, so the reviewer lane must wake on ready_for_review. Coordinator's
+// mark-ready lane relies on this routing and adds no wiring of its own.
+func TestRouteDeliveryWakesReviewerOnDraftStateTransitions(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		action       string
+		wantReviewer bool
+	}{
+		{action: "ready_for_review", wantReviewer: true},
+		{action: "converted_to_draft", wantReviewer: false},
+	} {
+		tc := tc
+		t.Run(tc.action, func(t *testing.T) {
+			t.Parallel()
+			payload := []byte(`{"action":"` + tc.action + `","number":77,"pull_request":{"number":77,"head":{"sha":"abc123"}},"repository":{"full_name":"acme/looper"}}`)
+			routed, ok, err := routeDelivery("pull_request", payload)
+			if err != nil || !ok {
+				t.Fatalf("routeDelivery() = %v, %v, %v, want a routed delivery", routed, ok, err)
+			}
+			if _, reviewer := routed.lanes[LaneReviewer]; reviewer != tc.wantReviewer {
+				t.Fatalf("reviewer lane woken = %v, want %v (lanes %v)", reviewer, tc.wantReviewer, routed.lanes)
+			}
+		})
+	}
+}
+
 func TestEnabledLanesForProjectUsesNarrowRolePolicy(t *testing.T) {
 	t.Parallel()
 

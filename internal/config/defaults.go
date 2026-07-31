@@ -248,6 +248,10 @@ func DefaultConfig(cwd string) (Config, error) {
 					TransientRetries:         3,
 					MaxIndeterminateDuration: "15m",
 				},
+				MarkReady: CoordinatorMarkReadyConfig{
+					Enabled: false,
+					Scope:   CoordinatorMarkReadyScopeLooperOnly,
+				},
 			},
 			Planner: PlannerRoleConfig{
 				AutoDiscovery: true,

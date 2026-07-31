@@ -544,6 +544,25 @@ Behavior notes:
 - Coordinator never stores its own dispatch state; the authority chain stays on GitHub labels, comments, and timeline events
 - `roles.coordinator.dispatch.autonomous.holdLabel` is compatibility-only for coordinator autonomous dispatch; the official global hold contract is `looper:hold`
 
+## Coordinator mark-ready
+
+Coordinator can take a looper-authored draft PR out of draft once CI is green, so review starts without a human clicking "Ready for review". It lives under `roles.coordinator.markReady.*` and runs inside the merge-watch lane:
+
+| Path | Purpose | Default |
+| --- | --- | --- |
+| `roles.coordinator.markReady.enabled` | Publishes eligible looper-authored drafts | `false` |
+| `roles.coordinator.markReady.scope` | Which drafts Looper may publish; `looper-only` is the only accepted value | `"looper-only"` |
+
+A draft is published only when every one of these holds. Any one failing leaves the draft exactly as it is, and the next tick looks again:
+
+- `looper-only` scope: the PR carries a `looper:` label **and** links the tracked issue with a closing reference
+- all required checks on the head are green — branch protection names them, and where it names none, every check observed on the head counts
+- GitHub reports the branch as mergeable and not conflicting
+- no `looper:hold` and no `do-not-merge` label
+- every commit on the branch is attributed to the account the daemon runs as
+
+Marking ready is idempotent: a human clicking "Ready for review" first is success, not an error. Publishing emits the `ready_for_review` webhook that already wakes the reviewer lane, so review begins on the next delivery with no extra configuration.
+
 ## Hold labels
 
 Official hold labels are fixed:

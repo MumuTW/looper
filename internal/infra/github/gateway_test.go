@@ -2685,6 +2685,91 @@ func TestGatewayEnableAutoMergeRequiresHeadSHA(t *testing.T) {
 	}
 }
 
+func TestGatewayMarkPullRequestReady(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		if args != "pr ready 42 --repo acme/looper" {
+			t.Fatalf("unexpected gh args: %q", args)
+		}
+		return shell.Result{}, nil
+	}
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	if err := gateway.MarkPullRequestReady(context.Background(), MarkPullRequestReadyInput{Repo: "acme/looper", PRNumber: 42}); err != nil {
+		t.Fatalf("MarkPullRequestReady() error = %v", err)
+	}
+}
+
+func TestGatewayMarkPullRequestReadyTreatsConcurrentPublishAsSuccess(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		switch args {
+		case "pr ready 42 --repo acme/looper":
+			return shell.Result{}, errors.New("GraphQL: Pull request is not a draft")
+		case "pr view 42 --repo acme/looper --json isDraft --jq .isDraft":
+			return shell.Result{Stdout: "false\n"}, nil
+		default:
+			t.Fatalf("unexpected gh args: %q", args)
+			return shell.Result{}, nil
+		}
+	}
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	if err := gateway.MarkPullRequestReady(context.Background(), MarkPullRequestReadyInput{Repo: "acme/looper", PRNumber: 42}); err != nil {
+		t.Fatalf("MarkPullRequestReady() error = %v, want nil for already-published pull request", err)
+	}
+}
+
+func TestGatewayMarkPullRequestReadyReportsFailureWhileStillDraft(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		switch args {
+		case "pr ready 42 --repo acme/looper":
+			return shell.Result{}, errors.New("HTTP 403 forbidden")
+		case "pr view 42 --repo acme/looper --json isDraft --jq .isDraft":
+			return shell.Result{Stdout: "true\n"}, nil
+		default:
+			t.Fatalf("unexpected gh args: %q", args)
+			return shell.Result{}, nil
+		}
+	}
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	err := gateway.MarkPullRequestReady(context.Background(), MarkPullRequestReadyInput{Repo: "acme/looper", PRNumber: 42})
+	if err == nil || !strings.Contains(err.Error(), "HTTP 403") {
+		t.Fatalf("MarkPullRequestReady() error = %v, want forbidden error", err)
+	}
+}
+
+func TestGatewayListPullRequestCommitsReportsAuthorLogins(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		if args != "pr view 42 --repo acme/looper --json commits" {
+			t.Fatalf("unexpected gh args: %q", args)
+		}
+		return shell.Result{Stdout: `{"commits":[{"oid":"abc123","authors":[{"login":"looper"}]},{"oid":"def456","authors":[{"login":""}]}]}`}, nil
+	}
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	commits, err := gateway.ListPullRequestCommits(context.Background(), ListPullRequestCommitsInput{Repo: "acme/looper", PRNumber: 42})
+	if err != nil {
+		t.Fatalf("ListPullRequestCommits() error = %v", err)
+	}
+	if len(commits) != 2 {
+		t.Fatalf("commits = %#v, want two commits", commits)
+	}
+	if commits[0].OID != "abc123" || len(commits[0].Authors) != 1 || commits[0].Authors[0] != "looper" {
+		t.Fatalf("commits[0] = %#v, want looper-authored commit", commits[0])
+	}
+	if commits[1].OID != "def456" || len(commits[1].Authors) != 0 {
+		t.Fatalf("commits[1] = %#v, want unattributed commit", commits[1])
+	}
+}
+
 func TestGatewayCloseIssueRejectsUnknownStateReason(t *testing.T) {
 	t.Parallel()
 	runner := &fakeGHRunner{t: t}

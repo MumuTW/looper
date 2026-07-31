@@ -1545,7 +1545,7 @@ func newCoordinatorFixture(t *testing.T, configure ...func(*config.Config)) coor
 	for _, fn := range configure {
 		fn(&cfg)
 	}
-	github := &stubCoordinatorGitHub{details: map[int64]githubinfra.IssueDetail{}, comments: map[int64][][]githubinfra.CommentInfo{}, timeline: map[int64][]map[string]any{}, blockedBy: map[int64][]githubinfra.DependencyIssue{}, subIssues: map[int64][]githubinfra.DependencyIssue{}, linkedPullRequests: map[int64][]githubinfra.LinkedPullRequest{}, pullRequests: map[int64]githubinfra.PullRequestDetail{}, subIssueErr: map[int64]error{}, prDetails: map[int64]githubinfra.PullRequestDetail{}, prCheckRuns: map[string]githubinfra.PullRequestCheckRuns{}, branchProtection: map[string]githubinfra.BranchProtection{}}
+	github := &stubCoordinatorGitHub{details: map[int64]githubinfra.IssueDetail{}, comments: map[int64][][]githubinfra.CommentInfo{}, timeline: map[int64][]map[string]any{}, blockedBy: map[int64][]githubinfra.DependencyIssue{}, subIssues: map[int64][]githubinfra.DependencyIssue{}, linkedPullRequests: map[int64][]githubinfra.LinkedPullRequest{}, pullRequests: map[int64]githubinfra.PullRequestDetail{}, subIssueErr: map[int64]error{}, prDetails: map[int64]githubinfra.PullRequestDetail{}, prCheckRuns: map[string]githubinfra.PullRequestCheckRuns{}, branchProtection: map[string]githubinfra.BranchProtection{}, prCommits: map[int64][]githubinfra.PullRequestCommit{}, failPRCommits: map[int64]error{}, failMarkReady: map[int64]error{}}
 	network := &stubCoordinatorNetwork{}
 	runner := New(Options{Repos: repos, GitHub: github, Config: &cfg, Now: func() time.Time { return now }, TriageLLM: stubCoordinatorLLM{}, Inspector: stubCoordinatorInspector{}, Network: network})
 	return coordinatorFixture{runner: runner, github: github, network: network, cfg: &cfg, projectID: projectID, now: now, coord: coord}
@@ -1615,6 +1615,10 @@ type stubCoordinatorGitHub struct {
 	failPRCheckRuns          map[string]error
 	branchProtection         map[string]githubinfra.BranchProtection
 	failBranchProtection     map[string]error
+	prCommits                map[int64][]githubinfra.PullRequestCommit
+	failPRCommits            map[int64]error
+	failMarkReady            map[int64]error
+	markedReady              []githubinfra.MarkPullRequestReadyInput
 	addedPRLabels            []githubinfra.PullRequestLabelsInput
 	removedPRLabels          []githubinfra.PullRequestLabelsInput
 	addedReviewers           []githubinfra.PullRequestReviewersInput
@@ -1797,6 +1801,20 @@ func (s *stubCoordinatorGitHub) ListPullRequestCheckRuns(_ context.Context, inpu
 		return githubinfra.PullRequestCheckRuns{}, nil
 	}
 	return s.prCheckRuns[input.Ref], nil
+}
+func (s *stubCoordinatorGitHub) ListPullRequestCommits(_ context.Context, input githubinfra.ListPullRequestCommitsInput) ([]githubinfra.PullRequestCommit, error) {
+	if err := s.failPRCommits[input.PRNumber]; err != nil {
+		return nil, err
+	}
+	return append([]githubinfra.PullRequestCommit(nil), s.prCommits[input.PRNumber]...), nil
+}
+func (s *stubCoordinatorGitHub) MarkPullRequestReady(_ context.Context, input githubinfra.MarkPullRequestReadyInput) error {
+	if err := s.failMarkReady[input.PRNumber]; err != nil {
+		return err
+	}
+	s.ops = append(s.ops, "mark-ready:"+intToString(input.PRNumber))
+	s.markedReady = append(s.markedReady, input)
+	return nil
 }
 func (s *stubCoordinatorGitHub) GetBranchProtection(_ context.Context, input githubinfra.BranchProtectionInput) (githubinfra.BranchProtection, error) {
 	if err := s.failBranchProtection[input.Branch]; err != nil {
