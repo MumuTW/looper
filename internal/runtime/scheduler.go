@@ -3121,11 +3121,15 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 		return claimContinue, nil
 	}
 
-	projectScopedTypes, runnableProjectIDs := codingClaimProjectScope(input.Config)
+	quarantinedIDs, err := quarantinedProjectIDsForClaim(ctx, input)
+	if err != nil {
+		return queueItems, dispatchOwnedQueueClaims(ctx, owned, input, err)
+	}
+	projectScopedTypes, runnableProjectIDs, stickyOnlyProjectIDs := codingClaimProjectScope(input.Config, quarantinedIDs)
 	stopClaiming := false
 	for i := 0; i < availableSlots; i++ {
 		result, err := claimOne(func(ctx context.Context, nowISO, claimedBy string) (*storage.QueueItemRecord, error) {
-			return input.Repos.Queue.ClaimNextNonLongTermRetryAmongTypeSetsForProjects(ctx, nowISO, claimedBy, unrestrictedTypes, stickySnapshotTypes, projectScopedTypes, runnableProjectIDs)
+			return input.Repos.Queue.ClaimNextNonLongTermRetryAmongTypeSetsForProjects(ctx, nowISO, claimedBy, unrestrictedTypes, stickySnapshotTypes, projectScopedTypes, runnableProjectIDs, stickyOnlyProjectIDs)
 		})
 		if err != nil {
 			return queueItems, dispatchOwnedQueueClaims(ctx, owned, input, err)
@@ -3140,7 +3144,7 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 	}
 	for !stopClaiming && len(queueItems) < availableSlots {
 		result, err := claimOne(func(ctx context.Context, nowISO, claimedBy string) (*storage.QueueItemRecord, error) {
-			return input.Repos.Queue.ClaimNextLongTermRetryAmongTypeSetsForProjects(ctx, nowISO, claimedBy, unrestrictedTypes, stickySnapshotTypes, projectScopedTypes, runnableProjectIDs)
+			return input.Repos.Queue.ClaimNextLongTermRetryAmongTypeSetsForProjects(ctx, nowISO, claimedBy, unrestrictedTypes, stickySnapshotTypes, projectScopedTypes, runnableProjectIDs, stickyOnlyProjectIDs)
 		})
 		if err != nil {
 			return queueItems, dispatchOwnedQueueClaims(ctx, owned, input, err)
@@ -3152,15 +3156,49 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 	return queueItems, dispatchOwnedQueueClaims(ctx, owned, input, nil)
 }
 
-func codingClaimProjectScope(cfg *config.Config) ([]string, []string) {
+func codingClaimProjectScope(cfg *config.Config, quarantinedProjectIDs []string) (projectScopedTypes, runnableProjectIDs, stickyOnlyProjectIDs []string) {
 	if cfg == nil {
-		return nil, nil
+		return nil, nil, nil
 	}
 	projectIDs := make([]string, 0, len(cfg.Projects))
 	for _, project := range cfg.Projects {
 		projectIDs = append(projectIDs, project.ID)
 	}
-	return []string{"fixer", "worker"}, projectIDs
+	return []string{"fixer", "worker"}, projectIDs, quarantinedProjectIDs
+}
+
+// quarantinedProjectIDsForClaim returns the IDs of unstanced legacy projects
+// that validateCatalogValidationPolicies removed from the runtime catalog
+// because defaults.validationCommands is empty and they carry no validation
+// stance. The scheduler keeps these IDs in the claim scope for sticky-only
+// retries (the latest run is failed/interrupted with a recorded agent snapshot)
+// without admitting fresh work, mirroring the agent-independent quarantine
+// predicate in schedulerProjectsForCapturedCatalog so the catalog-to-claim
+// contract is covered end to end.
+func quarantinedProjectIDsForClaim(ctx context.Context, input defaultSchedulerTickInput) ([]string, error) {
+	if input.Config == nil || input.Repos == nil || input.Repos.Projects == nil {
+		return nil, nil
+	}
+	if len(config.ResolveValidationCommands(*input.Config)) > 0 {
+		return nil, nil
+	}
+	projectsList, err := input.Repos.Projects.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0)
+	for _, project := range projectsList {
+		if project.Archived {
+			continue
+		}
+		if _, ok := runtimeProjectBinding(*input.Config, project.ID); ok {
+			continue
+		}
+		if projects.IsLegacyInertProject(project) {
+			ids = append(ids, project.ID)
+		}
+	}
+	return ids, nil
 }
 
 // claimErrorIsAmbiguousCancel reports whether a ClaimNext* error may have

@@ -3087,6 +3087,103 @@ func TestQueueStickySnapshotClaimInspectsNewestTiedRun(t *testing.T) {
 	}
 }
 
+// TestQueueClaimStickyOnlyProjectScopePreservesQuarantinedRetries verifies that
+// stickyOnlyProjectIDs admits sticky-snapshot retries for quarantined projects
+// (absent from the runnable project list) without admitting fresh work for
+// them. A quarantined project's fresh item must stay unclaimed even when the
+// role is unrestricted, while its sticky retry is claimed; a runnable project's
+// fresh item is claimed normally.
+func TestQueueClaimStickyOnlyProjectScopePreservesQuarantinedRetries(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	ctx := context.Background()
+	repos := NewRepositories(coordinator.DB())
+
+	now := "2026-04-11T12:00:00.000Z"
+	for _, pid := range []string{"project_runnable", "project_quarantined"} {
+		if err := repos.Projects.Upsert(ctx, ProjectRecord{ID: pid, Name: pid, RepoPath: "/tmp/" + pid, CreatedAt: now, UpdatedAt: now}); err != nil {
+			t.Fatalf("Projects.Upsert(%s) error = %v", pid, err)
+		}
+	}
+
+	snapshot := `{"vendor":"claude"}`
+	// Quarantined project loop: latest run is a failed sticky snapshot.
+	quarantinedLoop := "loop_quarantined_sticky"
+	if err := repos.Loops.Upsert(ctx, LoopRecord{ID: quarantinedLoop, Seq: 1, ProjectID: "project_quarantined", Type: "worker", TargetType: "project", Status: "running", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Loops.Upsert(quarantined) error = %v", err)
+	}
+	if err := repos.Runs.Upsert(ctx, RunRecord{ID: "run_quarantined_failed", LoopID: quarantinedLoop, Status: "failed", AgentSnapshotJSON: &snapshot, StartedAt: now, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Runs.Upsert(quarantined) error = %v", err)
+	}
+	// Quarantined project fresh loop: latest run completed (no sticky snapshot).
+	quarantinedFreshLoop := "loop_quarantined_fresh"
+	if err := repos.Loops.Upsert(ctx, LoopRecord{ID: quarantinedFreshLoop, Seq: 2, ProjectID: "project_quarantined", Type: "worker", TargetType: "project", Status: "running", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Loops.Upsert(quarantined_fresh) error = %v", err)
+	}
+	if err := repos.Runs.Upsert(ctx, RunRecord{ID: "run_quarantined_done", LoopID: quarantinedFreshLoop, Status: "completed", StartedAt: now, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Runs.Upsert(quarantined_fresh) error = %v", err)
+	}
+	// Runnable project fresh loop: latest run completed (fresh work claimable).
+	runnableFreshLoop := "loop_runnable_fresh"
+	if err := repos.Loops.Upsert(ctx, LoopRecord{ID: runnableFreshLoop, Seq: 3, ProjectID: "project_runnable", Type: "worker", TargetType: "project", Status: "running", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Loops.Upsert(runnable_fresh) error = %v", err)
+	}
+	if err := repos.Runs.Upsert(ctx, RunRecord{ID: "run_runnable_done", LoopID: runnableFreshLoop, Status: "completed", StartedAt: now, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("Runs.Upsert(runnable_fresh) error = %v", err)
+	}
+
+	quarantinedProjectID := "project_quarantined"
+	runnableProjectID := "project_runnable"
+	for _, item := range []QueueItemRecord{
+		{ID: "qi_quarantined_sticky", ProjectID: &quarantinedProjectID, LoopID: &quarantinedLoop, Type: "worker", TargetType: "project", TargetID: "project_quarantined", DedupeKey: "d_q_sticky", Priority: 1, Status: "queued", AvailableAt: now, Attempts: 0, MaxAttempts: 3, CreatedAt: now, UpdatedAt: now},
+		{ID: "qi_quarantined_fresh", ProjectID: &quarantinedProjectID, LoopID: &quarantinedFreshLoop, Type: "worker", TargetType: "project", TargetID: "project_quarantined", DedupeKey: "d_q_fresh", Priority: 2, Status: "queued", AvailableAt: now, Attempts: 0, MaxAttempts: 3, CreatedAt: now, UpdatedAt: now},
+		{ID: "qi_runnable_fresh", ProjectID: &runnableProjectID, LoopID: &runnableFreshLoop, Type: "worker", TargetType: "project", TargetID: "project_runnable", DedupeKey: "d_r_fresh", Priority: 3, Status: "queued", AvailableAt: now, Attempts: 0, MaxAttempts: 3, CreatedAt: now, UpdatedAt: now},
+	} {
+		if err := repos.Queue.Upsert(ctx, item); err != nil {
+			t.Fatalf("Queue.Upsert(%s) error = %v", item.ID, err)
+		}
+	}
+
+	// Without stickyOnlyProjectIDs (the pre-fix behavior), the quarantined
+	// project's sticky retry is excluded: only the runnable project's fresh
+	// item is claimable.
+	withoutSticky, err := repos.Queue.ClaimNextNonLongTermRetryAmongTypeSetsForProjects(ctx, now, "worker-a", []string{"worker"}, nil, []string{"fixer", "worker"}, []string{"project_runnable"}, nil)
+	if err != nil {
+		t.Fatalf("without-sticky claim error = %v", err)
+	}
+	if withoutSticky == nil || withoutSticky.ID != "qi_runnable_fresh" {
+		t.Fatalf("without-sticky claim = %#v, want qi_runnable_fresh: quarantined sticky retry must be excluded when no sticky-only scope is provided", withoutSticky)
+	}
+	withoutStickySecond, err := repos.Queue.ClaimNextNonLongTermRetryAmongTypeSetsForProjects(ctx, now, "worker-a", []string{"worker"}, nil, []string{"fixer", "worker"}, []string{"project_runnable"}, nil)
+	if err != nil {
+		t.Fatalf("without-sticky second claim error = %v", err)
+	}
+	if withoutStickySecond != nil {
+		t.Fatalf("without-sticky second claim = %#v, want nil: quarantined items must stay excluded without sticky-only scope", withoutStickySecond)
+	}
+
+	// With stickyOnlyProjectIDs preserving the quarantined project, its sticky
+	// retry becomes claimable while fresh work for it stays blocked.
+	claimed, err := repos.Queue.ClaimNextNonLongTermRetryAmongTypeSetsForProjects(ctx, now, "worker-b", []string{"worker"}, nil, []string{"fixer", "worker"}, []string{"project_runnable"}, []string{"project_quarantined"})
+	if err != nil {
+		t.Fatalf("ClaimNextNonLongTermRetryAmongTypeSetsForProjects() error = %v", err)
+	}
+	if claimed == nil || claimed.ID != "qi_quarantined_sticky" {
+		t.Fatalf("first claim = %#v, want qi_quarantined_sticky: quarantined sticky retry must be claimable via sticky-only scope", claimed)
+	}
+
+	// The quarantined project's fresh item must NOT be claimed even with the
+	// sticky-only scope: fresh work for quarantined projects is never admitted.
+	second, err := repos.Queue.ClaimNextNonLongTermRetryAmongTypeSetsForProjects(ctx, now, "worker-b", []string{"worker"}, nil, []string{"fixer", "worker"}, []string{"project_runnable"}, []string{"project_quarantined"})
+	if err != nil {
+		t.Fatalf("second claim error = %v", err)
+	}
+	if second != nil {
+		t.Fatalf("second claim = %#v, want nil: fresh work for a quarantined project must never be admitted", second)
+	}
+}
+
 func TestRunsTouchHeartbeatOnlyMovesForward(t *testing.T) {
 	t.Parallel()
 
