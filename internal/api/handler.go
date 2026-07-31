@@ -4226,6 +4226,9 @@ func (h *Handler) buildCreateLoopResponse(r *http.Request) (loopResponse, error)
 	if err != nil {
 		return loopResponse{}, err
 	}
+	if err := h.validateCodingProjectRunnable(*project, domain.LoopType(loopType)); err != nil {
+		return loopResponse{}, err
+	}
 	if err := validateLoopTargetProjectCompatibility(projectID, parseProjectMetadata(project.MetadataJSON), target); err != nil {
 		return loopResponse{}, err
 	}
@@ -4418,6 +4421,9 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 		return workerCreateResponse{}, err
 	}
 	projectID := project.ID
+	if err := h.validateCodingProjectRunnable(project, domain.LoopTypeWorker); err != nil {
+		return workerCreateResponse{}, err
+	}
 
 	repo := normalizeOptionalString(body.Repo)
 	if repo == nil {
@@ -7652,10 +7658,11 @@ func (f *updateProjectStringField) UnmarshalJSON(raw []byte) error {
 }
 
 type updateProjectRequest struct {
-	Repo         updateProjectStringField `json:"repo"`
-	Name         updateProjectStringField `json:"name"`
-	BaseBranch   updateProjectStringField `json:"baseBranch"`
-	WorktreeRoot updateProjectStringField `json:"worktreeRoot"`
+	Repo         updateProjectStringField        `json:"repo"`
+	Name         updateProjectStringField        `json:"name"`
+	BaseBranch   updateProjectStringField        `json:"baseBranch"`
+	WorktreeRoot updateProjectStringField        `json:"worktreeRoot"`
+	Validation   *config.ProjectValidationConfig `json:"validation"`
 }
 
 func updateProjectField(field updateProjectStringField) projects.UpdateStringField {
@@ -7670,6 +7677,7 @@ func (h *Handler) buildUpdateProjectResponse(r *http.Request, service projectSer
 	updated, err := service.UpdateProject(r.Context(), identifier, projects.UpdateInput{
 		Repo: updateProjectField(body.Repo), Name: updateProjectField(body.Name),
 		BaseBranch: updateProjectField(body.BaseBranch), WorktreeRoot: updateProjectField(body.WorktreeRoot),
+		Validation: body.Validation,
 	})
 	if err != nil {
 		var notFound projects.ProjectNotFoundError
@@ -7892,6 +7900,29 @@ func validateLoopTargetProjectCompatibility(projectID string, projectMetadata ma
 	}
 
 	return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("project %s is configured for repo %s, not %s", projectID, configuredRepo, targetRepo)}
+}
+
+func (h *Handler) validateCodingProjectRunnable(project storage.ProjectRecord, loopType domain.LoopType) error {
+	if loopType != domain.LoopTypeWorker && loopType != domain.LoopTypeFixer {
+		return nil
+	}
+	cfg := h.context.Config
+	if h.context.ConfigSnapshot != nil {
+		cfg, _ = h.context.ConfigSnapshot()
+		for _, catalogProject := range cfg.Projects {
+			if catalogProject.ID == project.ID {
+				return nil
+			}
+		}
+		return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("project %s is unavailable for coding work until its validation policy is repaired", project.ID)}
+	}
+	if !projects.IsLegacyInertProject(project) || len(config.ResolveValidationCommands(cfg)) > 0 {
+		return nil
+	}
+	if !config.CodingRoleAgentConfigured(cfg, config.CodingRoleWorker) && !config.CodingRoleAgentConfigured(cfg, config.CodingRoleFixer) {
+		return nil
+	}
+	return apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("project %s is unavailable for coding work until its validation policy is repaired", project.ID)}
 }
 
 func stringMetadataPtr(metadata map[string]any, key string) *string {
