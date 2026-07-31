@@ -2,7 +2,8 @@
 # Local mirror of CI's blocking gates — run this before you push and CI won't
 # surprise you. Covers .github/workflows/ci.yml's `verify` and `race` jobs:
 #   optional gofmt -w → dashboard (pnpm install/test/build + artifact checks)
-#   → Hermes/Devin helper tests → gofmt -l → go vet → production-only staticcheck → go test
+#   → Hermes/Devin helper tests → gofmt -l → go vet → production-only staticcheck
+#   → frozen /api/v1 contract artifacts → go test
 #   → go test -race (focused)
 #   → go build (with release ldflags)
 #
@@ -82,17 +83,38 @@ go run honnef.co/go/tools/cmd/staticcheck@v0.6.1 \
   -checks='U1000,SA1006,SA4004,SA4006' \
   ./...
 
-step "go test ./..."
-go test ./...
-
-# Same gate as ci.yml's "Check frozen HTTP contract artifacts are current".
+# Same gate as ci.yml's "Check frozen HTTP contract artifacts are current", and
+# it runs BEFORE `go test ./...` for the same reason: the frozen-artifact table
+# tests read these files, so a stale artifact fails them first and this
+# actionable message would never print.
+#
+# Unlike CI, this runs against your working tree, which may legitimately hold
+# regenerated-but-uncommitted artifacts. The question here is therefore "did
+# regeneration change anything?", not "does the tree match HEAD?" — comparing
+# against HEAD would fail a developer whose artifacts are already current.
 step "frozen /api/v1 contract artifacts"
-go generate ./internal/api/... >/dev/null
-if ! git diff --exit-code -- internal/api/testdata/contracts/ >/dev/null; then
-  printf '  the frozen /api/v1 compat artifacts are stale; regenerate them in this commit:\n\n    go generate ./internal/api/...\n\n' >&2
+contract_artifact_digest() {
+  find internal/api/testdata/contracts -type f | LC_ALL=C sort | while IFS= read -r file; do
+    printf '%s  %s\n' "$(git hash-object -- "$file")" "$file"
+  done
+}
+contracts_before="$(contract_artifact_digest)"
+# go generate runs the regenerator as a `go test` invocation; its stdout carries
+# the route and response detail that explains a capture failure, so hold it and
+# replay it instead of discarding it.
+if ! contracts_log="$(go generate ./internal/api/... 2>&1)"; then
+  printf '%s\n' "$contracts_log" >&2
+  printf '\n  regenerating the frozen /api/v1 compat artifacts failed; see the output above\n\n' >&2
+  exit 1
+fi
+if [ "$contracts_before" != "$(contract_artifact_digest)" ]; then
+  printf '  the frozen /api/v1 compat artifacts were stale; regeneration has just rewritten them:\n\n    git diff -- internal/api/testdata/contracts/\n\n  review that diff and include it in this commit.\n\n' >&2
   exit 1
 fi
 echo "  current"
+
+step "go test ./..."
+go test ./...
 
 # Same focused package set as ci.yml's `race` job — both read this file, so the
 # two cannot drift. -race is the one gate `go test ./...` structurally cannot
