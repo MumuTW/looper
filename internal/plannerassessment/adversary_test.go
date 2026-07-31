@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nexu-io/looper/internal/processsandbox"
+	"github.com/MumuTW/looper/internal/processsandbox"
 )
 
 // TestAdversaryIsolatedFromWorktree verifies the credential-free assessment

@@ -1217,13 +1217,20 @@ func (a fixerGitHubAdapter) ListPullRequestCommits(ctx context.Context, input fi
 	if err != nil {
 		return nil, err
 	}
-	commits, err := a.gateway.ListPullRequestCommits(ctx, githubinfra.ViewPullRequestInput{Repo: repo, PRNumber: input.PRNumber, CWD: input.CWD})
+	commits, err := a.gateway.ListPullRequestCommits(ctx, githubinfra.ListPullRequestCommitsInput{Repo: repo, PRNumber: input.PRNumber, CWD: input.CWD})
 	if err != nil {
 		return nil, err
 	}
 	out := make([]fixer.PullRequestCommit, 0, len(commits))
 	for _, commit := range commits {
-		out = append(out, fixer.PullRequestCommit{SHA: commit.SHA, AuthorLogin: commit.AuthorLogin, CommitterLogin: commit.CommitterLogin})
+		var authorLogin, committerLogin string
+		if len(commit.Authors) > 0 {
+			authorLogin = commit.Authors[0]
+		}
+		if len(commit.Committers) > 0 {
+			committerLogin = commit.Committers[0]
+		}
+		out = append(out, fixer.PullRequestCommit{SHA: commit.OID, AuthorLogin: authorLogin, CommitterLogin: committerLogin})
 	}
 	return out, nil
 }
