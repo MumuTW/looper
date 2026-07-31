@@ -4548,6 +4548,88 @@ func TestProcessClaimedItemMarksRunFailedWhenOwnershipCheckErrorsBeforeStart(t *
 	}
 }
 
+func TestCreateRunContextRefreshesUnsupportedSnapshotWhenValidationGateEnabled(t *testing.T) {
+	t.Parallel()
+
+	// A failed fixer run was created with a vendor that cannot serve the
+	// validation gate (claude-code). The operator then enabled validation
+	// commands and switched the role vendor to codex. The retry must refresh
+	// the stale snapshot to the current role vendor instead of copying the
+	// unsupported predecessor — otherwise the spawn refuses with a permanent
+	// manual-intervention hold regardless of the role switch.
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	loopTarget := buildPullRequestTargetID(repo, prNumber)
+	predecessorSnapshot := `{"vendor":"claude-code","model":"sonnet","profileId":"sticky"}`
+	runner := New(Options{
+		DB:             fixture.coordinator.DB(),
+		Repos:          fixture.repos,
+		Git:            &fakeGitGateway{},
+		AgentExecutor:  &fakeAgentExecutor{},
+		Logger:         fixture.logger,
+		Now:            fixture.now,
+		AgentRuntime:   string(config.AgentVendorCodex),
+		AgentModel:     stringPtr("gpt-5"),
+		AgentProfileID: "fast",
+		ValidationCommandsByProject: map[string][]string{
+			"project_1": {"go test ./..."},
+		},
+	})
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_unsupported_snapshot", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	checkpointJSON := mustMarshalJSON(fixerCheckpoint{ResumePolicy: "retry_from_timeout_context"})
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{
+		ID:                "run_failed_unsupported_snapshot",
+		LoopID:            "loop_unsupported_snapshot",
+		Status:            "failed",
+		CurrentStep:       stringPtr(string(stepDiscoverPR)),
+		CheckpointJSON:    &checkpointJSON,
+		AgentSnapshotJSON: &predecessorSnapshot,
+		StartedAt:         nowISO,
+		CreatedAt:         nowISO,
+		UpdatedAt:         nowISO,
+	}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_unsupported_snapshot")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v)", loop, err)
+	}
+
+	resumed, err := runner.createRunContext(context.Background(), *loop)
+	if err != nil {
+		t.Fatalf("createRunContext() error = %v", err)
+	}
+	if resumed.Run.AgentSnapshotJSON == nil {
+		t.Fatal("AgentSnapshotJSON = nil, want refreshed snapshot")
+	}
+	parsed, err := config.ParseAgentSnapshot(*resumed.Run.AgentSnapshotJSON)
+	if err != nil {
+		t.Fatalf("ParseAgentSnapshot() error = %v", err)
+	}
+	if parsed.Vendor != string(config.AgentVendorCodex) {
+		t.Fatalf("refreshed Vendor = %q, want codex (current role vendor)", parsed.Vendor)
+	}
+	if parsed.ProfileID != "fast" {
+		t.Fatalf("refreshed ProfileID = %q, want fast (current role identity)", parsed.ProfileID)
+	}
+	if parsed.Model == nil || *parsed.Model != "gpt-5" {
+		t.Fatalf("refreshed Model = %v, want gpt-5 (current role identity)", parsed.Model)
+	}
+	// The refreshed snapshot must be execution authority at spawn: identityFromRun
+	// resolves the codex vendor from it, not the live fallback.
+	vendor, _, _, useSnapshot, err := runner.identityFromRun(resumed.Run)
+	if err != nil {
+		t.Fatalf("identityFromRun() error = %v", err)
+	}
+	if !useSnapshot || vendor != string(config.AgentVendorCodex) {
+		t.Fatalf("identityFromRun() = (%q, %v), want codex from refreshed snapshot", vendor, useSnapshot)
+	}
+}
+
 func TestCreateRunContextTreatsLegacyMarkerlessRunAsRetryable(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

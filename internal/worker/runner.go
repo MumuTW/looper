@@ -3025,7 +3025,7 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 	nowISO := r.nowISO()
 	encoded := mustMarshalJSON(workerCheckpoint{ResumePolicy: ternary(resumed, "advance_from_checkpoint", "replay_step"), Work: resumedCheckpoint.Work, ClaimedLockKey: resumedCheckpoint.ClaimedLockKey, Worktree: resumedCheckpoint.Worktree, Plan: resumedCheckpoint.Plan, Execution: resumedCheckpoint.Execution, Lifecycle: resumedCheckpoint.Lifecycle, ReproductionBaseline: resumedCheckpoint.ReproductionBaseline, Validation: resumedCheckpoint.Validation, PullRequest: resumedCheckpoint.PullRequest, SkipReason: resumedCheckpoint.SkipReason})
 	run := storage.RunRecord{ID: eventlog.NewEventID("run"), LoopID: loop.ID, Status: "running", CurrentStep: stringPtr(string(startStep)), LastCompletedStep: nil, CheckpointJSON: &encoded, StartedAt: nowISO, LastHeartbeatAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
-	snapshotJSON, err := r.agentSnapshotJSONForNewRun(latestRun, stickySnapshot)
+	snapshotJSON, err := r.agentSnapshotJSONForNewRun(latestRun, stickySnapshot, len(r.validationCommandsForProject(loop.ProjectID)) > 0)
 	if err != nil {
 		return resumedRunContext{}, err
 	}
@@ -4914,14 +4914,23 @@ func optionalString(value string) *string {
 	return &value
 }
 
-func (r *Runner) agentSnapshotJSONForNewRun(previous *storage.RunRecord, sticky bool) (*string, error) {
+func (r *Runner) agentSnapshotJSONForNewRun(previous *storage.RunRecord, sticky, requireToolNetworkDenial bool) (*string, error) {
 	var previousSnapshot *string
 	if previous != nil {
 		previousSnapshot = previous.AgentSnapshotJSON
 	}
-	snapshotJSON, legacyResume, err := config.ResolveRunAgentSnapshotJSON(previousSnapshot, sticky, r.agentRuntime, r.agentModel, r.agentProfileID)
+	snapshotJSON, refreshed, legacyResume, err := config.ResolveRunAgentSnapshotJSONForValidationGate(previousSnapshot, sticky, requireToolNetworkDenial, r.agentRuntime, r.agentModel, r.agentProfileID)
 	if err != nil {
 		return nil, err
+	}
+	if refreshed && r.logger != nil && previous != nil {
+		r.logger.Warn("refreshed stale agent snapshot whose vendor cannot serve the validation gate; using current runner agent identity", map[string]any{
+			"loopId":   previous.LoopID,
+			"runId":    previous.ID,
+			"vendor":   r.agentRuntime,
+			"model":    derefString(r.agentModel),
+			"previous": derefString(previousSnapshot),
+		})
 	}
 	if legacyResume && r.logger != nil && previous != nil {
 		r.logger.Warn("resuming run without agent_snapshot_json; using current runner agent identity", map[string]any{
