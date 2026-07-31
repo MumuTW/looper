@@ -177,7 +177,6 @@ type ListReviewThreadsInput struct {
 type ViewReviewThreadInput struct {
 	ThreadID string
 	CWD      string
-	Hostname string
 }
 
 type ReviewThread struct {
@@ -3812,7 +3811,7 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 			decisionIssueStatus = "skipped_invalid_agent_decision"
 			decisionIssueMessage = agentDeclinedThreadWithoutReason
 		}
-		thread, err := r.github.ViewReviewThread(ctx, ViewReviewThreadInput{ThreadID: item.ThreadID, CWD: input.Project.RepoPath, Hostname: ""})
+		thread, err := r.github.ViewReviewThread(ctx, ViewReviewThreadInput{ThreadID: item.ThreadID, CWD: input.Project.RepoPath})
 		if err != nil {
 			return checkpoint, err
 		}
@@ -4000,7 +3999,7 @@ func (r *Runner) hasExistingFixerReply(ctx context.Context, input stepInput, ite
 	if marker == "" {
 		return false, nil
 	}
-	thread, err := r.github.ViewReviewThread(ctx, ViewReviewThreadInput{ThreadID: item.ThreadID, CWD: input.Project.RepoPath, Hostname: ""})
+	thread, err := r.github.ViewReviewThread(ctx, ViewReviewThreadInput{ThreadID: item.ThreadID, CWD: input.Project.RepoPath})
 	if err != nil {
 		return false, err
 	}
@@ -4017,7 +4016,7 @@ func (r *Runner) hasExistingFixerDeclinedReply(ctx context.Context, input stepIn
 	if marker == "" {
 		return false, nil
 	}
-	thread, err := r.github.ViewReviewThread(ctx, ViewReviewThreadInput{ThreadID: item.ThreadID, CWD: input.Project.RepoPath, Hostname: ""})
+	thread, err := r.github.ViewReviewThread(ctx, ViewReviewThreadInput{ThreadID: item.ThreadID, CWD: input.Project.RepoPath})
 	if err != nil {
 		return false, err
 	}

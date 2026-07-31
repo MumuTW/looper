@@ -1094,7 +1094,11 @@ func commentInfosToObjects(items []githubinfra.CommentInfo) []map[string]any {
 }
 
 func (a fixerGitHubAdapter) ListReviewThreads(ctx context.Context, input fixer.ListReviewThreadsInput) ([]fixer.ReviewThread, error) {
-	threads, err := a.gateway.ListReviewThreads(ctx, githubinfra.ListReviewThreadsInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD, Limit: input.Limit})
+	repo, err := a.reviewThreadRepo(input.Repo, input.CWD)
+	if err != nil {
+		return nil, err
+	}
+	threads, err := a.gateway.ListReviewThreads(ctx, githubinfra.ListReviewThreadsInput{Repo: repo, PRNumber: input.PRNumber, CWD: input.CWD, Limit: input.Limit})
 	if err != nil {
 		return nil, err
 	}
@@ -1110,7 +1114,12 @@ func (a fixerGitHubAdapter) ListReviewThreads(ctx context.Context, input fixer.L
 }
 
 func (a fixerGitHubAdapter) ViewReviewThread(ctx context.Context, input fixer.ViewReviewThreadInput) (fixer.ReviewThread, error) {
-	thread, err := a.gateway.ViewReviewThread(ctx, githubinfra.ViewReviewThreadInput{ThreadID: input.ThreadID, CWD: input.CWD, Hostname: input.Hostname})
+	repo, err := a.reviewThreadRepo("", input.CWD)
+	if err != nil {
+		return fixer.ReviewThread{}, err
+	}
+	hostname, _ := githubinfra.SplitRepoHostname(repo)
+	thread, err := a.gateway.ViewReviewThread(ctx, githubinfra.ViewReviewThreadInput{ThreadID: input.ThreadID, CWD: input.CWD, Hostname: hostname})
 	if err != nil {
 		return fixer.ReviewThread{}, err
 	}
@@ -1122,12 +1131,48 @@ func (a fixerGitHubAdapter) ViewReviewThread(ctx context.Context, input fixer.Vi
 }
 
 func (a fixerGitHubAdapter) ResolveReviewThread(ctx context.Context, input fixer.ResolveReviewThreadInput) error {
-	return a.gateway.ResolveReviewThread(ctx, githubinfra.ResolveReviewThreadInput{Repo: input.Repo, ThreadID: input.ThreadID, CWD: input.CWD})
+	repo, err := a.reviewThreadRepo(input.Repo, input.CWD)
+	if err != nil {
+		return err
+	}
+	return a.gateway.ResolveReviewThread(ctx, githubinfra.ResolveReviewThreadInput{Repo: repo, ThreadID: input.ThreadID, CWD: input.CWD})
 }
 
 func (a fixerGitHubAdapter) AddReviewThreadReply(ctx context.Context, input fixer.AddReviewThreadReplyInput) error {
+	repo, err := a.reviewThreadRepo(input.Repo, input.CWD)
+	if err != nil {
+		return err
+	}
 	body := a.stamper.WithIdentity(input.DisclosureAgent, input.DisclosureModel).ReviewComment(input.Body, "fixer")
-	return a.gateway.AddReviewThreadReply(ctx, githubinfra.AddReviewThreadReplyInput{Repo: input.Repo, ThreadID: input.ThreadID, Body: body, CWD: input.CWD})
+	return a.gateway.AddReviewThreadReply(ctx, githubinfra.AddReviewThreadReplyInput{Repo: repo, ThreadID: input.ThreadID, Body: body, CWD: input.CWD})
+}
+
+// reviewThreadRepo turns the configured project's provider binding into the
+// gateway's host-qualified repository identity. The scheduler's discovery repo
+// is intentionally only an owner/slug; it must not decide which gh host reads
+// or mutates review threads.
+func (a fixerGitHubAdapter) reviewThreadRepo(repo, cwd string) (string, error) {
+	if a.config == nil {
+		return repo, nil
+	}
+	for _, project := range a.config.Projects {
+		if filepath.Clean(project.RepoPath) != filepath.Clean(cwd) {
+			continue
+		}
+		if strings.TrimSpace(project.Repo) == "" {
+			project.Repo = repo
+		}
+		identity, ok := config.ProjectRepositoryIdentity(*a.config, project)
+		if !ok {
+			return "", fmt.Errorf("repository identity is not configured for project %s", project.ID)
+		}
+		baseURL, err := url.Parse(identity.BaseURL)
+		if err != nil || strings.TrimSpace(baseURL.Hostname()) == "" {
+			return "", fmt.Errorf("github provider hostname is not configured for project %s", project.ID)
+		}
+		return baseURL.Hostname() + "/" + identity.Repo, nil
+	}
+	return repo, nil
 }
 
 func (a fixerGitHubAdapter) CompareCommits(ctx context.Context, input fixer.CompareCommitsInput) (fixer.CompareCommitsResult, error) {

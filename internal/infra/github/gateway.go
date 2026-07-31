@@ -1902,13 +1902,17 @@ func (g *Gateway) ResolveReviewThread(ctx context.Context, input ResolveReviewTh
 	if thread.IsResolved {
 		return nil
 	}
-	result, err := g.runGh(ctx, input.CWD, "", "api", "graphql", "-f", "query="+strings.Join([]string{
+	args := []string{"api", "graphql", "-f", "query=" + strings.Join([]string{
 		"mutation($threadId: ID!) {",
 		"  resolveReviewThread(input: { threadId: $threadId }) {",
 		"    thread { id isResolved }",
 		"  }",
 		"}",
-	}, "\n"), "-F", "threadId="+input.ThreadID)
+	}, "\n"), "-F", "threadId=" + input.ThreadID}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGh(ctx, input.CWD, "", args...)
 	if err != nil {
 		return err
 	}
@@ -1950,13 +1954,12 @@ func (g *Gateway) ViewReviewThread(ctx context.Context, input ViewReviewThreadIn
 }
 
 func (g *Gateway) ListReviewThreads(ctx context.Context, input ListReviewThreadsInput) ([]ReviewThread, error) {
-	hostname, _ := splitRepoHostname(input.Repo)
+	hostname, repo := splitRepoHostname(input.Repo)
 	limit := input.Limit
 	if limit <= 0 {
 		limit = 100
 	}
-	owner, name, err := parseRepo(input.Repo)
-	_ = hostname // used in fetchReviewThreadPage below
+	owner, name, err := parseRepo(repo)
 	if err != nil {
 		return nil, err
 	}
@@ -2009,13 +2012,18 @@ func (g *Gateway) AddReviewThreadReply(ctx context.Context, input AddReviewThrea
 	if err := outboundguard.ValidateReviewThreadReply(input.Body, input.ThreadID); err != nil {
 		return err
 	}
-	result, err := g.runGh(ctx, input.CWD, "", "api", "graphql", "-f", "query="+strings.Join([]string{
+	hostname, _ := splitRepoHostname(input.Repo)
+	args := []string{"api", "graphql", "-f", "query=" + strings.Join([]string{
 		"mutation($threadId: ID!, $body: String!) {",
 		"  addPullRequestReviewThreadReply(input: { pullRequestReviewThreadId: $threadId, body: $body }) {",
 		"    comment { id }",
 		"  }",
 		"}",
-	}, "\n"), "-F", "threadId="+input.ThreadID, "-f", "body="+input.Body)
+	}, "\n"), "-F", "threadId=" + input.ThreadID, "-f", "body=" + input.Body}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGh(ctx, input.CWD, "", args...)
 	if err != nil {
 		return err
 	}
