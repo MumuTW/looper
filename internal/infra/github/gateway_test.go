@@ -2624,6 +2624,10 @@ func TestGatewayClosePullRequestIsIdempotent(t *testing.T) {
 			return shell.Result{Stdout: "CLOSED\n"}, nil
 		case "pr view 44 --repo acme/looper --json state --jq .state":
 			return shell.Result{Stdout: "MERGED\n"}, nil
+		case "pr view 45 --repo acme/looper --json state --jq .state":
+			return shell.Result{Stdout: "OPEN\n"}, nil
+		case "pr close 45 --repo acme/looper --delete-branch":
+			return shell.Result{Stdout: ""}, nil
 		default:
 			t.Fatalf("unexpected gh args: %q", args)
 			return shell.Result{}, nil
@@ -2640,6 +2644,9 @@ func TestGatewayClosePullRequestIsIdempotent(t *testing.T) {
 	if err := gateway.ClosePullRequest(context.Background(), ClosePullRequestInput{Repo: "acme/looper", PRNumber: 44}); err != nil {
 		t.Fatalf("ClosePullRequest(merged) error = %v", err)
 	}
+	if err := gateway.ClosePullRequest(context.Background(), ClosePullRequestInput{Repo: "acme/looper", PRNumber: 45, DeleteBranch: true}); err != nil {
+		t.Fatalf("ClosePullRequest(delete branch) error = %v", err)
+	}
 	log := strings.Join(runner.calls, "\n")
 	if !strings.Contains(log, "pr close 42 --repo acme/looper") {
 		t.Fatalf("gh log missing close pr command\n%s", log)
@@ -2650,8 +2657,11 @@ func TestGatewayClosePullRequestIsIdempotent(t *testing.T) {
 	if strings.Contains(log, "pr close 44 --repo acme/looper") {
 		t.Fatalf("gh log unexpectedly closed an already-merged pr\n%s", log)
 	}
-	if strings.Contains(log, "--delete-branch") {
-		t.Fatalf("gh log unexpectedly included destructive flags\n%s", log)
+	if !strings.Contains(log, "pr close 45 --repo acme/looper --delete-branch") {
+		t.Fatalf("gh log missing delete-branch close command\n%s", log)
+	}
+	if strings.Contains(log, "pr close 42 --repo acme/looper --delete-branch") {
+		t.Fatalf("gh log unexpectedly included destructive flags for default close\n%s", log)
 	}
 }
 

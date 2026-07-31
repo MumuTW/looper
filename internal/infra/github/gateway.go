@@ -436,9 +436,16 @@ type CloseIssueInput struct {
 }
 
 type ClosePullRequestInput struct {
-	Repo     string
-	PRNumber int64
-	CWD      string
+	Repo         string
+	PRNumber     int64
+	DeleteBranch bool
+	CWD          string
+}
+
+type PullRequestCommit struct {
+	SHA            string
+	AuthorLogin    string
+	CommitterLogin string
 }
 
 type EnableAutoMergeInput struct {
@@ -1202,6 +1209,34 @@ func (g *Gateway) ListIssueComments(ctx context.Context, input ViewIssueInput) (
 	return extractCommentInfos(rows), nil
 }
 
+// ListPullRequestCommits returns provider-authored commit identities for the
+// PR.  The GitHub commit list is the authority for the human-commit guard;
+// local lifecycle metadata cannot detect a later human push.
+func (g *Gateway) ListPullRequestCommits(ctx context.Context, input ViewPullRequestInput) ([]PullRequestCommit, error) {
+	hostname, repo := splitRepoHostname(input.Repo)
+	args := []string{"api", "--paginate", "--slurp", fmt.Sprintf("repos/%s/pulls/%d/commits?per_page=100", repo, input.PRNumber)}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGh(ctx, input.CWD, "", args...)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := decodeJSONArrayOrPages(result.Stdout)
+	if err != nil {
+		return nil, err
+	}
+	commits := make([]PullRequestCommit, 0, len(rows))
+	for _, row := range rows {
+		commits = append(commits, PullRequestCommit{
+			SHA:            asString(row["sha"]),
+			AuthorLogin:    extractAuthor(row["author"]),
+			CommitterLogin: extractAuthor(row["committer"]),
+		})
+	}
+	return commits, nil
+}
+
 // listPullRequestAutomationComments keeps PR discovery independent of the size
 // of the full issue conversation. gh applies this projection to each page
 // before writing to the shell capture buffer, so only comments consumed by the
@@ -1895,7 +1930,11 @@ func (g *Gateway) ClosePullRequest(ctx context.Context, input ClosePullRequestIn
 	if state == "closed" || state == "merged" {
 		return nil
 	}
-	_, err = g.runGh(ctx, input.CWD, "", "pr", "close", strconv.FormatInt(input.PRNumber, 10), "--repo", input.Repo)
+	args := []string{"pr", "close", strconv.FormatInt(input.PRNumber, 10), "--repo", input.Repo}
+	if input.DeleteBranch {
+		args = append(args, "--delete-branch")
+	}
+	_, err = g.runGh(ctx, input.CWD, "", args...)
 	if err == nil {
 		return nil
 	}

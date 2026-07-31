@@ -73,6 +73,9 @@ type IssueSummary struct {
 	// Issue's comments so Planner sees exactly what was answered, without having
 	// to guess which of the comments are relevant.
 	Clarifications []string
+	// FailureContext is the explicit Fixer-to-Planner handoff after retry
+	// exhaustion. It lets the planning prompt account for the prior failure.
+	FailureContext string
 }
 
 type IssueDetail struct {
@@ -418,6 +421,7 @@ type checkpointIssue struct {
 	SpecPath           string   `json:"specPath,omitempty"`
 	RequestedReviewers []string `json:"requestedReviewers,omitempty"`
 	Clarifications     []string `json:"clarifications,omitempty"`
+	FailureContext     string   `json:"failureContext,omitempty"`
 }
 
 type checkpointWorktree struct {
@@ -814,8 +818,8 @@ func (r *Runner) enqueueAdmittedIssue(ctx context.Context, project storage.Proje
 	if len(issue.Clarifications) > 0 {
 		payload["clarifications"] = issue.Clarifications
 	}
-	if issue.PersonalAssigneeAutoAssigned {
-		payload["personalProjectAutoAssigned"] = true
+	if strings.TrimSpace(issue.FailureContext) != "" {
+		payload["failureContext"] = issue.FailureContext
 	}
 	if authority != "" {
 		payload[plannerQueueRoutingAuthorityKey] = authority
@@ -1103,6 +1107,7 @@ func (r *Runner) runDiscoverIssueStep(ctx context.Context, input stepInput) (pla
 		return input.Checkpoint, err
 	}
 	currentLogin := firstNonEmpty(normalizeLogin(stringFromAnyDefault(payload["currentUserLogin"])), input.CheckpointIssueLogin())
+	failureContext := stringFromAnyDefault(payload["failureContext"])
 	lockKey := firstNonEmpty(derefString(input.QueueItem.LockKey), storage.IssueLockKey(input.Project.ID, repo, issueNumber))
 	nowISO := r.nowISO()
 	reason := "planner-run"
@@ -1134,7 +1139,7 @@ func (r *Runner) runDiscoverIssueStep(ctx context.Context, input stepInput) (pla
 	}
 	if !manual && !reportAuthorized && !config.LabelsMatch(detail.Labels, policy.Labels, policy.LabelMode) {
 		checkpoint := input.Checkpoint
-		checkpoint.Issue = &checkpointIssue{Repo: repo, IssueNumber: issueNumber, Title: detail.Title, Body: detail.Body, URL: detail.URL, Assignees: cloneStrings(detail.Assignees), Labels: cloneStrings(detail.Labels), CurrentUserLogin: currentLogin, SpecPath: buildSpecPath(r.now(), issueNumber, detail.Title), RequestedReviewers: resolveRequestedReviewers(input.Project, input.Loop, detail.Assignees, currentLogin), Clarifications: toStrings(payload["clarifications"])}
+		checkpoint.Issue = &checkpointIssue{Repo: repo, IssueNumber: issueNumber, Title: detail.Title, Body: detail.Body, URL: detail.URL, Assignees: cloneStrings(detail.Assignees), Labels: cloneStrings(detail.Labels), CurrentUserLogin: currentLogin, SpecPath: buildSpecPath(r.now(), issueNumber, detail.Title), RequestedReviewers: resolveRequestedReviewers(input.Project, input.Loop, detail.Assignees, currentLogin), Clarifications: toStrings(payload["clarifications"]), FailureContext: failureContext}
 		checkpoint.ClaimedLockKey = lockKey
 		checkpoint.ResumePolicy = "advance_from_checkpoint"
 		checkpoint.SkipReason = fmt.Sprintf("Issue %s#%d no longer matches planner labels", repo, issueNumber)
@@ -1143,7 +1148,7 @@ func (r *Runner) runDiscoverIssueStep(ctx context.Context, input stepInput) (pla
 	}
 	if !manual && !reportAuthorized && policy.RequireAssigneeCurrentUser && currentLogin != "" && !includesLogin(detail.Assignees, currentLogin) {
 		checkpoint := input.Checkpoint
-		checkpoint.Issue = &checkpointIssue{Repo: repo, IssueNumber: issueNumber, Title: detail.Title, Body: detail.Body, URL: detail.URL, Assignees: cloneStrings(detail.Assignees), Labels: cloneStrings(detail.Labels), CurrentUserLogin: currentLogin, SpecPath: buildSpecPath(r.now(), issueNumber, detail.Title), RequestedReviewers: resolveRequestedReviewers(input.Project, input.Loop, detail.Assignees, currentLogin), Clarifications: toStrings(payload["clarifications"])}
+		checkpoint.Issue = &checkpointIssue{Repo: repo, IssueNumber: issueNumber, Title: detail.Title, Body: detail.Body, URL: detail.URL, Assignees: cloneStrings(detail.Assignees), Labels: cloneStrings(detail.Labels), CurrentUserLogin: currentLogin, SpecPath: buildSpecPath(r.now(), issueNumber, detail.Title), RequestedReviewers: resolveRequestedReviewers(input.Project, input.Loop, detail.Assignees, currentLogin), Clarifications: toStrings(payload["clarifications"]), FailureContext: failureContext}
 		checkpoint.ClaimedLockKey = lockKey
 		checkpoint.ResumePolicy = "advance_from_checkpoint"
 		checkpoint.SkipReason = fmt.Sprintf("Issue %s#%d is no longer assigned to %s", repo, issueNumber, currentLogin)
@@ -1157,7 +1162,7 @@ func (r *Runner) runDiscoverIssueStep(ctx context.Context, input stepInput) (pla
 		detail.Assignees = appendUniqueStrings(detail.Assignees, currentLogin)
 	}
 	checkpoint := input.Checkpoint
-	checkpoint.Issue = &checkpointIssue{Repo: repo, IssueNumber: issueNumber, Title: detail.Title, Body: detail.Body, URL: detail.URL, Assignees: cloneStrings(detail.Assignees), Labels: cloneStrings(detail.Labels), CurrentUserLogin: currentLogin, SpecPath: buildSpecPath(r.now(), issueNumber, detail.Title), RequestedReviewers: resolveRequestedReviewers(input.Project, input.Loop, detail.Assignees, currentLogin), Clarifications: toStrings(payload["clarifications"])}
+	checkpoint.Issue = &checkpointIssue{Repo: repo, IssueNumber: issueNumber, Title: detail.Title, Body: detail.Body, URL: detail.URL, Assignees: cloneStrings(detail.Assignees), Labels: cloneStrings(detail.Labels), CurrentUserLogin: currentLogin, SpecPath: buildSpecPath(r.now(), issueNumber, detail.Title), RequestedReviewers: resolveRequestedReviewers(input.Project, input.Loop, detail.Assignees, currentLogin), Clarifications: toStrings(payload["clarifications"]), FailureContext: failureContext}
 	checkpoint.ClaimedLockKey = lockKey
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	checkpoint.SkipReason = ""
@@ -2260,6 +2265,9 @@ func buildPlannerPrompt(project storage.ProjectRecord, instructionConfig config.
 		}
 		parts = append(parts, strings.Join(clarifications, "\n"))
 	}
+	if strings.TrimSpace(issue.FailureContext) != "" {
+		parts = append(parts, "Prior fixer failure context (use this to avoid repeating the failed approach):\n"+strings.TrimSpace(issue.FailureContext))
+	}
 	if agentsBlock := readAgentsBlock(project.RepoPath); agentsBlock != "" {
 		parts = append(parts, agentsBlock)
 	}
@@ -2314,6 +2322,9 @@ func buildPullRequestBody(issue checkpointIssue, worktree checkpointWorktree, wr
 	}
 	if writeSpec != nil && strings.TrimSpace(writeSpec.Summary) != "" {
 		lines = append(lines, "", "## Agent Summary", writeSpec.Summary)
+	}
+	if strings.TrimSpace(issue.FailureContext) != "" {
+		lines = append(lines, "", "## Prior Fixer Failure", issue.FailureContext)
 	}
 	lines = append(lines, "", "Spec: "+issue.SpecPath, fmt.Sprintf("Issue: %s#%d", issue.Repo, issue.IssueNumber))
 	return strings.Join(lines, "\n")
