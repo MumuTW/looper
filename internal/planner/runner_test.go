@@ -829,6 +829,92 @@ func TestRunWriteSpecStepRechecksPlannerHoldAfterAgentCompletion(t *testing.T) {
 	}
 }
 
+func TestRunWriteSpecStepRejectsInvalidDependencyGraphBeforeGitReconciliation(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repoPath := t.TempDir()
+	worktreeRoot := t.TempDir()
+	worktreePath := filepath.Join(worktreeRoot, "wt")
+	if err := os.MkdirAll(filepath.Join(worktreePath, ".looper"), 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(worktreePath, plannerDependencyGraphRelPath), []byte(`{"version":1,"nodes":[{"key":"a","goal":"A","acceptanceCriteria":["done"],"dependencies":["missing"],"pullRequestScope":"a"}]}`), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	metadata := fmt.Sprintf(`{"worktreeRoot":%q}`, worktreeRoot)
+	issue := &checkpointIssue{Repo: "acme/looper", IssueNumber: 42, Title: "Plan this", SpecPath: "specs/42.md"}
+	loopResult, err := (&Runner{repos: fixture.repos, now: fixture.now}).ensureLoopForIssue(context.Background(), storage.ProjectRecord{ID: "project_1"}, issue.Repo, IssueSummary{Number: issue.IssueNumber, Title: issue.Title}, buildPlannerDiscoveryFingerprint(issue.Repo, fixture.now(), IssueSummary{Number: issue.IssueNumber, Title: issue.Title}))
+	if err != nil {
+		t.Fatalf("ensureLoopForIssue() error = %v", err)
+	}
+	runID := "run_invalid_dependency_graph"
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: runID, LoopID: loopResult.record.ID, Status: "running", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	git := &fakeGitGateway{}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, Logger: fixture.logger, Now: fixture.now})
+	_, err = runner.runWriteSpecStep(context.Background(), stepInput{
+		Project: storage.ProjectRecord{ID: "project_1", RepoPath: repoPath, MetadataJSON: &metadata},
+		Loop:    loopResult.record,
+		Run:     storage.RunRecord{ID: runID, LoopID: loopResult.record.ID},
+		Checkpoint: plannerCheckpoint{
+			Issue:     issue,
+			Worktree:  &checkpointWorktree{Path: worktreePath, Branch: "looper/planner/42-plan-this", BaseBranch: "main"},
+			WriteSpec: &checkpointWriteSpec{Status: "completed"},
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "missing node") {
+		t.Fatalf("runWriteSpecStep() error = %v, want missing-node validation", err)
+	}
+	if len(git.inspectCalls) != 0 || len(git.commitCalls) != 0 {
+		t.Fatalf("git reconciliation calls = inspect %d, commit %d; want none", len(git.inspectCalls), len(git.commitCalls))
+	}
+}
+
+func TestRunWriteSpecStepRecordsValidatedDependencyGraphPath(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repoPath := t.TempDir()
+	worktreeRoot := t.TempDir()
+	worktreePath := filepath.Join(worktreeRoot, "wt")
+	if err := os.MkdirAll(filepath.Join(worktreePath, ".looper"), 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(worktreePath, plannerDependencyGraphRelPath), []byte(`{"version":1,"nodes":[{"key":"a","goal":"A","acceptanceCriteria":["done"],"pullRequestScope":"a"},{"key":"b","goal":"B","acceptanceCriteria":["done"],"dependencies":["a"],"pullRequestScope":"b"}]}`), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	metadata := fmt.Sprintf(`{"worktreeRoot":%q}`, worktreeRoot)
+	issue := &checkpointIssue{Repo: "acme/looper", IssueNumber: 42, Title: "Plan this", SpecPath: "specs/42.md"}
+	loopResult, err := (&Runner{repos: fixture.repos, now: fixture.now}).ensureLoopForIssue(context.Background(), storage.ProjectRecord{ID: "project_1"}, issue.Repo, IssueSummary{Number: issue.IssueNumber, Title: issue.Title}, buildPlannerDiscoveryFingerprint(issue.Repo, fixture.now(), IssueSummary{Number: issue.IssueNumber, Title: issue.Title}))
+	if err != nil {
+		t.Fatalf("ensureLoopForIssue() error = %v", err)
+	}
+	runID := "run_valid_dependency_graph"
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: runID, LoopID: loopResult.record.ID, Status: "running", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: &fakeGitGateway{}, Logger: fixture.logger, Now: fixture.now})
+	checkpoint, err := runner.runWriteSpecStep(context.Background(), stepInput{
+		Project: storage.ProjectRecord{ID: "project_1", RepoPath: repoPath, MetadataJSON: &metadata},
+		Loop:    loopResult.record,
+		Run:     storage.RunRecord{ID: runID, LoopID: loopResult.record.ID},
+		Checkpoint: plannerCheckpoint{
+			Issue:     issue,
+			Worktree:  &checkpointWorktree{Path: worktreePath, Branch: "looper/planner/42-plan-this", BaseBranch: "main"},
+			WriteSpec: &checkpointWriteSpec{Status: "completed"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("runWriteSpecStep() error = %v", err)
+	}
+	if checkpoint.Issue == nil || checkpoint.Issue.DependencyGraphPath != plannerDependencyGraphRelPath {
+		t.Fatalf("DependencyGraphPath = %#v, want %q", checkpoint.Issue, plannerDependencyGraphRelPath)
+	}
+	if checkpoint.WriteSpec == nil || !checkpoint.WriteSpec.GitReconciled {
+		t.Fatalf("WriteSpec = %#v, want reconciled", checkpoint.WriteSpec)
+	}
+}
+
 func TestProcessClaimedItemManualPlannerBypassesDiscoveryChecks(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

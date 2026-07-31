@@ -403,17 +403,18 @@ type plannerCheckpoint struct {
 }
 
 type checkpointIssue struct {
-	Repo               string   `json:"repo,omitempty"`
-	IssueNumber        int64    `json:"issueNumber,omitempty"`
-	Title              string   `json:"title,omitempty"`
-	Body               string   `json:"body,omitempty"`
-	URL                string   `json:"url,omitempty"`
-	Assignees          []string `json:"assignees,omitempty"`
-	Labels             []string `json:"labels,omitempty"`
-	CurrentUserLogin   string   `json:"currentUserLogin,omitempty"`
-	SpecPath           string   `json:"specPath,omitempty"`
-	RequestedReviewers []string `json:"requestedReviewers,omitempty"`
-	Clarifications     []string `json:"clarifications,omitempty"`
+	Repo                string   `json:"repo,omitempty"`
+	IssueNumber         int64    `json:"issueNumber,omitempty"`
+	Title               string   `json:"title,omitempty"`
+	Body                string   `json:"body,omitempty"`
+	URL                 string   `json:"url,omitempty"`
+	Assignees           []string `json:"assignees,omitempty"`
+	Labels              []string `json:"labels,omitempty"`
+	CurrentUserLogin    string   `json:"currentUserLogin,omitempty"`
+	SpecPath            string   `json:"specPath,omitempty"`
+	DependencyGraphPath string   `json:"dependencyGraphPath,omitempty"`
+	RequestedReviewers  []string `json:"requestedReviewers,omitempty"`
+	Clarifications      []string `json:"clarifications,omitempty"`
 }
 
 type checkpointWorktree struct {
@@ -1150,6 +1151,15 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 		}
 	}
 	checkpoint.ensureLifecycle("planner", worktree.Branch, worktree.BaseBranch, true)
+	graph, err := loadPlannerDependencyGraph(worktree.Path)
+	if err != nil {
+		return checkpoint, &loopError{message: err.Error(), kind: FailureNonRetryable}
+	}
+	if graph != nil {
+		checkpoint.Issue.DependencyGraphPath = plannerDependencyGraphRelPath
+	} else if checkpoint.Issue.DependencyGraphPath != "" {
+		return checkpoint, &loopError{message: "planner dependency graph disappeared after validation", kind: FailureNonRetryable}
+	}
 	if err := r.persistCheckpoint(ctx, input.Run.ID, stepWriteSpec, checkpoint); err != nil {
 		return checkpoint, wrapRetryableAfterResume(err)
 	}
@@ -2066,6 +2076,7 @@ func buildPlannerPrompt(project storage.ProjectRecord, instructionConfig config.
 		"Repository: " + issue.Repo,
 		"Base branch: " + worktree.BaseBranch,
 		"Spec path: " + issue.SpecPath,
+		"Optional dependency graph path: " + plannerDependencyGraphRelPath,
 		"Issue title: " + issue.Title,
 	}
 	if strings.TrimSpace(issue.Body) != "" {
@@ -2095,6 +2106,8 @@ func buildPlannerPrompt(project storage.ProjectRecord, instructionConfig config.
 		"- Create or update the spec at " + issue.SpecPath,
 		"- Use Markdown with clear problem, goals, approach, risks, and validation sections",
 		"- Keep the implementation scope aligned to the issue",
+		"- For a multi-step implementation, also create " + plannerDependencyGraphRelPath + " as JSON with version 1 and nodes containing unique key, goal, acceptanceCriteria, dependencies, and pullRequestScope; omit the file for one-step work",
+		"- Treat the dependency graph as a validated Planner proposal; do not infer dispatch authority from it or edit GitHub dependency state from the agent",
 	}
 	if allowAutoPush {
 		requirements = append(requirements, "- Commit the spec changes on the current branch so the PR can be opened")
@@ -2132,6 +2145,9 @@ func noRemoteLifecyclePromptInstruction(runner, branch, baseBranch string, discl
 
 func buildPullRequestBody(issue checkpointIssue, worktree checkpointWorktree, writeSpec *checkpointWriteSpec) string {
 	lines := []string{"## Summary", fmt.Sprintf("- Adds the planning spec for %s#%d", issue.Repo, issue.IssueNumber), "- Spec path: " + issue.SpecPath, "- Planner branch: " + worktree.Branch}
+	if issue.DependencyGraphPath != "" {
+		lines = append(lines, "- Validated dependency graph: "+issue.DependencyGraphPath)
+	}
 	if issue.URL != "" {
 		lines = append(lines, "- Source issue: "+issue.URL)
 	}
