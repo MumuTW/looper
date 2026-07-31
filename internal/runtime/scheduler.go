@@ -628,7 +628,11 @@ func (a reviewerGitHubAdapter) CapturePullRequestSnapshot(ctx context.Context, i
 	if a.gateway == nil {
 		return storage.PullRequestSnapshotRecord{}, fmt.Errorf("github gateway is not configured")
 	}
-	return a.gateway.CapturePullRequestSnapshot(ctx, githubinfra.CapturePullRequestSnapshotInput{ProjectID: input.ProjectID, Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD, CapturedAt: input.CapturedAt})
+	repo, err := reviewThreadRepo(a.config, input.Repo, input.CWD)
+	if err != nil {
+		return storage.PullRequestSnapshotRecord{}, err
+	}
+	return a.gateway.CapturePullRequestSnapshot(ctx, githubinfra.CapturePullRequestSnapshotInput{ProjectID: input.ProjectID, Repo: repo, PRNumber: input.PRNumber, CWD: input.CWD, CapturedAt: input.CapturedAt})
 }
 
 func (a reviewerGitHubAdapter) FindReviewMarker(ctx context.Context, input reviewer.VerifyReviewMarkerInput) (reviewer.ReviewMarkerResult, error) {

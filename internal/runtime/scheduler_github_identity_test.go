@@ -262,6 +262,54 @@ func TestReviewerAndFixerViewPullRequestQualifyEmbeddedReviewThreadFetches(t *te
 	}
 }
 
+func TestReviewerSnapshotQualifiesGHESReviewThreadFetches(t *testing.T) {
+	ghesPath := filepath.Join(t.TempDir(), "ghes")
+	cfg := config.Config{
+		Providers: []config.ProviderConfig{{ID: "github-enterprise", Kind: config.ProviderKindGitHub, BaseURL: "https://github.example.com"}},
+		Projects:  []config.ProjectRefConfig{{ID: "enterprise", Provider: "github-enterprise", Repo: "acme/enterprise", RepoPath: ghesPath}},
+	}
+	var calls []string
+	gateway := githubinfra.New(githubinfra.Options{
+		GHPath: "gh",
+		GHRun: func(_ context.Context, options shell.Options) (shell.Result, error) {
+			args := strings.Join(options.Args, " ")
+			calls = append(calls, args)
+			switch {
+			case strings.HasPrefix(args, "pr view 42 --repo github.example.com/acme/enterprise --json "):
+				return shell.Result{Stdout: `{"number":42}`}, nil
+			case strings.Contains(args, "reviewThreads(first: 100, after: $after)"):
+				return shell.Result{Stdout: `{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`}, nil
+			case strings.HasPrefix(args, "api --paginate repos/acme/enterprise/issues/42/comments "):
+				return shell.Result{Stdout: "[]"}, nil
+			case strings.HasPrefix(args, "pr diff 42 --repo github.example.com/acme/enterprise"):
+				return shell.Result{Stdout: "diff --git a/a.go b/a.go\n"}, nil
+			default:
+				return shell.Result{}, fmt.Errorf("unexpected gh args: %s", args)
+			}
+		},
+	})
+
+	adapter := reviewerGitHubAdapter{config: &cfg, gateway: gateway}
+	if _, err := adapter.CapturePullRequestSnapshot(context.Background(), reviewer.CapturePullRequestSnapshotInput{ProjectID: "enterprise", Repo: "acme/not-authoritative", PRNumber: 42, CWD: ghesPath}); err != nil {
+		t.Fatalf("CapturePullRequestSnapshot() error = %v", err)
+	}
+
+	if len(calls) != 4 {
+		t.Fatalf("gh calls = %#v, want PR, review-thread, comment, and diff commands", calls)
+	}
+	for _, call := range calls {
+		if strings.HasPrefix(call, "pr view ") || strings.HasPrefix(call, "pr diff ") {
+			if !strings.Contains(call, "--repo github.example.com/acme/enterprise") {
+				t.Fatalf("gh pull-request command = %q, want configured GHES repository", call)
+			}
+			continue
+		}
+		if !strings.HasSuffix(call, "--hostname github.example.com") {
+			t.Fatalf("gh nested fetch = %q, want configured GHES hostname", call)
+		}
+	}
+}
+
 func TestReviewThreadCommandsPreserveConfiguredGHESPort(t *testing.T) {
 	ghesPath := filepath.Join(t.TempDir(), "ghes")
 	cfg := config.Config{
