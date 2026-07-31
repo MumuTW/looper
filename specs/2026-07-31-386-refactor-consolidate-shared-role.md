@@ -1356,7 +1356,23 @@ Per `AGENTS.md`, the root commands are the source of truth:
    (`internal/{fixer,reviewer,worker,planner}`), locates every `loopError`
    composite literal `kind` element (and every assignment to a `loopError`
    value's `.kind` field), and classifies the value expression by
-   intra-procedural origin tracking within the enclosing function. It also
+   intra-procedural origin tracking within the enclosing function. A compound
+   assignment (`+=`, `-=`, `*=`, `|=`, `&=`, `^=`, `<<=`, `>>=`, etc.) whose
+   left-hand side is a `.kind` field `go/types` resolves to `loopError` is
+   rejected outright as **unsafe** before its right-hand side is ever
+   classified. `Kind` has a string underlying type, so
+   `failure.kind += FailureRetryableTransient` type-checks and its right-hand
+   side resolves to a preserved constant the origin tracker would classify
+   safe, yet the stored value becomes a concatenated, un-normalized kind
+   (`"retryable_transientretryable_transient"`) that bypasses `Normalize`
+   exactly as an untracked dynamic source would; classifying only the
+   assigned value models the operation as a plain `=` and misses this, so the
+   gate treats the compound operator itself as the violation regardless of the
+   right-hand side's origin. The implementer must rewrite the compound write
+   as an explicit `failureclass.Normalize(...)` call (e.g.
+   `failure.kind = failureclass.Normalize(failure.kind + FailureRetryableTransient)`,
+   which routes the concatenated value through the fallback) so the result
+   passes through `Normalize` rather than being assembled in place. It also
    flags any `&<receiver>.kind` unary address-of expression whose selector
    receiver `go/types` resolves to `loopError` as **unsafe** — forbidding taking
    the field's address — because an address-taken `kind` field can be mutated
@@ -1422,7 +1438,30 @@ Per `AGENTS.md`, the root commands are the source of truth:
    test therefore excludes `_test.go` files explicitly (skipping any
    `MatchFile`-matched file whose base name ends in `_test.go`), so the gate
    type-checks exactly the production file set `go build` compiles. Imports
-   are resolved via a source importer. Selector
+   are resolved by a source importer built per target `build.Context`, not by
+   the default importer: the importer resolves each imported package through
+   the same context's `build.Context.Import` (with the overridden
+   `GOOS`/`GOARCH`), so the entire import graph — not just the runner files
+   selected by `MatchFile` — is loaded under the target build context. Passing
+   the copied context only to `MatchFile` would select the runner's own
+   build-constrained files for Darwin while the importer still resolved every
+   imported package against `build.Default`, so a Linux-hosted Darwin pass
+   would import the worker's `internal/processcontainment` dependency as
+   `group_live_linux.go` instead of `group_live_other.go` and the claimed
+   full-Darwin type-check could miss or spuriously reject target-specific
+   APIs. Resolving imports through the target context closes that: the
+   importer's package lookup honors the same build constraints as `MatchFile`,
+   so a build-constrained file active only under the target OS is the one
+   type-checked transitively, matching what `go build` compiles for that
+   target across the whole import graph. (The stdlib
+   `go/importer.ForCompiler(fset, "source", nil)` importer uses `build.Default`
+   and cannot be parameterized with a custom context, so the gate provides a
+   small `types.Importer` implementation that calls `build.Context.Import` on
+   the per-target context, parses the returned `GoFiles` (excluding
+   `*_test.go`), and type-checks each imported package with a nested
+   `types.Config` reusing the same importer — no `golang.org/x/tools`
+   dependency is added, consistent with the stdlib-only stance above.)
+   Selector
    ownership and call targets are resolved from `go/types` info, not from
    selector spelling: a `.kind` read is treated as a `loopError` copy only when
    `go/types` resolves its receiver type to `loopError`, and a
@@ -1707,14 +1746,21 @@ flags a `loopError` composite literal that omits `kind` (or a `new(loopError)`/
 so an empty-string default kind cannot bypass `Normalize` the same way, traces
 `loopError.kind` selector reads back to their receiver's origin so a
 `loopError` parameter or untracked-helper result is not accepted as a safe
-copy, and resolves selector ownership and call targets via `go/types`, and runs
-the full type-check once per supported production build context
+copy, rejects any compound assignment (`+=`, `|=`, etc.) to a `loopError`
+`.kind` field outright so a concatenated kind cannot be assembled in place
+without `Normalize` regardless of the right-hand side's origin, and resolves
+selector ownership and call targets via `go/types`, and runs the full
+type-check once per supported production build context
 (`linux/amd64` and `darwin/arm64` — the release matrix), selecting files with
 `go/build.Context.MatchFile` per context (excluding `_test.go` files so the
 gate type-checks only the production sources `go build` compiles for that
-target) so mutually-exclusive build-constrained files like the worker's
-`specfile_unix.go`/`specfile_other.go` are not both type-checked and a
-Darwin-only runner file is checked under Darwin even when CI runs on Linux) —
+target) and resolving the entire import graph through a source importer built
+per target `build.Context` (via that context's `build.Context.Import`, not
+`build.Default`) so mutually-exclusive build-constrained files like the
+worker's `specfile_unix.go`/`specfile_other.go` are not both type-checked and
+a Darwin-only runner file — and a build-constrained file in an imported
+package such as `internal/processcontainment`'s `group_live_linux.go` vs
+`group_live_other.go` — is checked under Darwin even when CI runs on Linux) —
 the
 four-kind regression coverage above exists, the fixer-prompt builder coverage
 test (step 9) exists — exercising `AppendFixerCompletionInstruction` for
