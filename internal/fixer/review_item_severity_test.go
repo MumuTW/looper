@@ -3,7 +3,7 @@ package fixer
 import (
 	"testing"
 
-	"github.com/nexu-io/looper/internal/reviewitem"
+	"github.com/MumuTW/looper/internal/reviewitem"
 )
 
 func TestNormalizeFixItemsReadsValidatedReviewItemSeverity(t *testing.T) {

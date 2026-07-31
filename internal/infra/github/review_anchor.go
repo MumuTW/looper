@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/MumuTW/looper/internal/diffanchor"
+	"github.com/MumuTW/looper/internal/reviewitem"
 )
 
 const nearestReviewAnchorMaxDistance int64 = 3
@@ -76,6 +77,15 @@ func normalizeReviewAnchors(body string, comments []ReviewComment, anchors *diff
 			kept = append(kept, normalized)
 			processing.NormalizedCount++
 			processing.Comments = append(processing.Comments, reviewCommentProcessingEntry(idx, "retargeted", original, normalized, result.Reason))
+			continue
+		}
+		if _, trustedSeverity := reviewitem.SeverityFromBody(comment.Body); trustedSeverity {
+			// A structured review item must remain an inline artifact. Moving it
+			// into the top-level body would make the forge lose its item ID and
+			// let later convergence rounds mistake feedback for progress.
+			flags = append(flags, reviewQualityFlag{Kind: "review-item-anchor-missing", Detail: result.Reason})
+			processing.DroppedCount++
+			processing.Comments = append(processing.Comments, reviewCommentProcessingEntry(idx, "dropped", original, ReviewComment{}, result.Reason))
 			continue
 		}
 		downgraded = append(downgraded, diffanchor.FallbackBody(comment.Body, anchor, result.Reason))

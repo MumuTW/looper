@@ -446,8 +446,27 @@ type ReviewerLoopConfig struct {
 	StopOnIdenticalOutput     bool `json:"stopOnIdenticalOutput"`
 }
 
+// ReviewerConvergenceConfig bounds semantic Reviewer↔Fixer progress. A nil
+// pointer on ReviewerConfig means the documented defaults; keeping the field
+// optional preserves canonical config output for existing installations.
+type ReviewerConvergenceConfig struct {
+	MaxConsecutiveUnproductive int                   `json:"maxConsecutiveUnproductive"`
+	MaxFixerAttemptsPerItem    int                   `json:"maxFixerAttemptsPerItem"`
+	MaxTotalRounds             int                   `json:"maxTotalRounds"`
+	SeverityFloor              ReviewerSeverityFloor `json:"severityFloor"`
+}
+
+type ReviewerSeverityFloor string
+
+const (
+	ReviewerSeverityFloorBlocking    ReviewerSeverityFloor = "blocking"
+	ReviewerSeverityFloorNonBlocking ReviewerSeverityFloor = "non_blocking"
+	ReviewerSeverityFloorAll         ReviewerSeverityFloor = "all"
+)
+
 type ReviewerConfig struct {
 	Loop                    ReviewerLoopConfig             `json:"loop"`
+	Convergence             *ReviewerConvergenceConfig     `json:"convergence,omitempty"`
 	Retry                   ReviewerRetryConfig            `json:"retry"`
 	Scope                   ReviewerScope                  `json:"scope"`
 	PublishMode             ReviewerPublishMode            `json:"publishMode"`
@@ -1065,8 +1084,16 @@ type PartialReviewerLoopConfig struct {
 	StopOnIdenticalOutput     *bool `json:"stopOnIdenticalOutput,omitempty"`
 }
 
+type PartialReviewerConvergenceConfig struct {
+	MaxConsecutiveUnproductive *int                   `json:"maxConsecutiveUnproductive,omitempty"`
+	MaxFixerAttemptsPerItem    *int                   `json:"maxFixerAttemptsPerItem,omitempty"`
+	MaxTotalRounds             *int                   `json:"maxTotalRounds,omitempty"`
+	SeverityFloor              *ReviewerSeverityFloor `json:"severityFloor,omitempty"`
+}
+
 type PartialReviewerConfig struct {
 	Loop                    *PartialReviewerLoopConfig             `json:"loop,omitempty"`
+	Convergence             *PartialReviewerConvergenceConfig      `json:"convergence,omitempty"`
 	Retry                   *PartialReviewerRetryConfig            `json:"retry,omitempty"`
 	Scope                   *ReviewerScope                         `json:"scope,omitempty"`
 	PublishMode             *ReviewerPublishMode                   `json:"publishMode,omitempty"`

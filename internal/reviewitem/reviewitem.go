@@ -47,13 +47,13 @@ func AttachMarker(body string, severity Severity) (string, error) {
 	if markerPattern.MatchString(body) {
 		return "", fmt.Errorf("review item body already contains a severity marker")
 	}
+	body = strings.TrimSpace(body)
+	if body == "" {
+		return "", fmt.Errorf("review item body must not be empty")
+	}
 	marker, err := Marker(severity)
 	if err != nil {
 		return "", err
-	}
-	body = strings.TrimSpace(body)
-	if body == "" {
-		return marker, nil
 	}
 	return body + "\n\n" + marker, nil
 }

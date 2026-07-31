@@ -209,12 +209,30 @@ func TestValidateReviewSubmitBodyAllowsRequestChangesOnlyForBlocking(t *testing.
 	}
 }
 
+func TestValidateReviewSubmitBodyRejectsLegacyActionableBlockingUnderRequestChangesPolicy(t *testing.T) {
+	t.Parallel()
+	body := "<!-- looper:review id=abc head=def outcome=actionable -->"
+	err := validateReviewSubmitBody(body, []reviewSubmitComment{{Body: "blocking", Severity: "blocking", Path: "main.go", Line: 10, Side: "RIGHT"}}, "def", "COMMENT", decisionReviewPolicy, "octocat")
+	if err == nil || !strings.Contains(err.Error(), "requires REQUEST_CHANGES") {
+		t.Fatalf("validateReviewSubmitBody(legacy actionable blocker) error = %v, want policy rejection", err)
+	}
+}
+
 func TestValidateReviewSubmitBodyRejectsCleanApproveWithInlineComments(t *testing.T) {
 	t.Parallel()
 	body := "<!-- looper:review id=abc head=def outcome=clean -->"
 	err := validateReviewSubmitBody(body, []reviewSubmitComment{{Body: "inline", Path: "main.go", Line: 10, Side: "RIGHT"}}, "def", "APPROVE", decisionReviewPolicy, "octocat")
 	if err == nil || !strings.Contains(err.Error(), "without inline comments") {
 		t.Fatalf("validateReviewSubmitBody(APPROVE with comments) error = %v, want inline rejection", err)
+	}
+}
+
+func TestValidateReviewSubmitBodyRejectsCleanCommentWithInlineComments(t *testing.T) {
+	t.Parallel()
+	body := "<!-- looper:review id=abc head=def outcome=clean -->"
+	err := validateReviewSubmitBody(body, []reviewSubmitComment{{Body: "nit", Severity: "nit", Path: "main.go", Line: 10, Side: "RIGHT"}}, "def", "COMMENT", commentOnlyReviewPolicy, "octocat")
+	if err == nil || !strings.Contains(err.Error(), "outcome=non_blocking or blocking") {
+		t.Fatalf("validateReviewSubmitBody(clean COMMENT with comments) error = %v, want outcome rejection", err)
 	}
 }
 

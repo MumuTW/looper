@@ -7,7 +7,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/nexu-io/looper/internal/reviewitem"
+	"github.com/MumuTW/looper/internal/reviewitem"
 )
 
 type SeverityFloor string
@@ -53,10 +53,10 @@ const (
 )
 
 type Policy struct {
-	MaxConsecutiveUnproductive int
-	MaxFixerAttemptsPerItem    int
-	MaxTotalRounds             int
-	SeverityFloor              SeverityFloor
+	MaxConsecutiveUnproductive int           `json:"maxConsecutiveUnproductive"`
+	MaxFixerAttemptsPerItem    int           `json:"maxFixerAttemptsPerItem"`
+	MaxTotalRounds             int           `json:"maxTotalRounds"`
+	SeverityFloor              SeverityFloor `json:"severityFloor"`
 }
 
 func DefaultPolicy() Policy {
@@ -87,39 +87,40 @@ func (p Policy) Validate() error {
 }
 
 type Item struct {
-	ID            string
-	Severity      reviewitem.Severity
-	Status        ItemStatus
-	FixerResult   FixerResult
-	FixerAttempts int
-	Stuck         bool
+	ID              string              `json:"id"`
+	Severity        reviewitem.Severity `json:"severity"`
+	Status          ItemStatus          `json:"status"`
+	FixerResult     FixerResult         `json:"fixerResult,omitempty"`
+	FixerAttemptKey string              `json:"fixerAttemptKey,omitempty"`
+	FixerAttempts   int                 `json:"fixerAttempts,omitempty"`
+	Stuck           bool                `json:"stuck,omitempty"`
 }
 
 type State struct {
-	TotalRounds             int
-	ConsecutiveUnproductive int
-	Items                   map[string]Item
-	History                 []RoundSummary
+	TotalRounds             int             `json:"totalRounds"`
+	ConsecutiveUnproductive int             `json:"consecutiveUnproductive"`
+	Items                   map[string]Item `json:"items,omitempty"`
+	History                 []RoundSummary  `json:"history,omitempty"`
 }
 
 type Round struct {
-	Items []Item
+	Items []Item `json:"items"`
 }
 
 type RoundSummary struct {
-	Number        int
-	Productive    bool
-	NewItemIDs    []string
-	ClosedItemIDs []string
-	StuckItemIDs  []string
-	OpenItemIDs   []string
+	Number        int      `json:"number"`
+	Productive    bool     `json:"productive"`
+	NewItemIDs    []string `json:"newItemIds,omitempty"`
+	ClosedItemIDs []string `json:"closedItemIds,omitempty"`
+	StuckItemIDs  []string `json:"stuckItemIds,omitempty"`
+	OpenItemIDs   []string `json:"openItemIds,omitempty"`
 }
 
 type Decision struct {
-	State      State
-	Action     Action
-	Reason     Reason
-	Productive bool
+	State      State  `json:"state"`
+	Action     Action `json:"action"`
+	Reason     Reason `json:"reason"`
+	Productive bool   `json:"productive"`
 }
 
 // Evaluate applies one explicit artifact observation. Missing items do not
@@ -163,7 +164,7 @@ func Evaluate(previous State, round Round, policy Policy) (Decision, error) {
 			item.FixerAttempts = 0
 			item.Stuck = false
 		}
-		if item.FixerResult != "" {
+		if item.FixerResult != "" && fixerAttemptObserved(prior, item, existed) {
 			item.FixerAttempts++
 		}
 		if item.Status == ItemStatusOpen && item.FixerAttempts >= policy.MaxFixerAttemptsPerItem {
@@ -222,6 +223,21 @@ func Evaluate(previous State, round Round, policy Policy) (Decision, error) {
 	decision.Action = ActionContinue
 	decision.Reason = ReasonConverging
 	return decision, nil
+}
+
+func fixerAttemptObserved(previous Item, current Item, existed bool) bool {
+	if !existed {
+		return true
+	}
+	// A durable fixer marker can be observed repeatedly while a reviewer run
+	// retries or the daemon restarts. Count only a new marker key; otherwise a
+	// single declined/deferred result would exhaust the per-item budget merely
+	// by being re-read. Legacy artifacts without a key count only the first
+	// transition into a result state.
+	if current.FixerAttemptKey != "" || previous.FixerAttemptKey != "" {
+		return current.FixerAttemptKey != previous.FixerAttemptKey || current.FixerResult != previous.FixerResult
+	}
+	return previous.FixerResult == ""
 }
 
 func (p Policy) Includes(severity reviewitem.Severity) bool {
