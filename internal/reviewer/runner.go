@@ -419,6 +419,7 @@ type Options struct {
 	AllowAutoApprove        bool
 	ReviewEvents            config.ReviewerReviewEventsConfig
 	LoopConfig              config.ReviewerLoopConfig
+	Convergence             config.ReviewerConvergenceConfig
 	DiscoveryPolicy         DiscoveryPolicy
 	Scope                   config.ReviewerScope
 	DetectDuplicateFindings bool
@@ -469,6 +470,7 @@ type Runner struct {
 	allowAutoApprove        bool
 	reviewEvents            config.ReviewerReviewEventsConfig
 	loopConfig              config.ReviewerLoopConfig
+	convergence             config.ReviewerConvergenceConfig
 	discoveryPolicy         DiscoveryPolicy
 	scope                   config.ReviewerScope
 	detectDuplicateFindings bool
@@ -693,6 +695,7 @@ func New(options Options) *Runner {
 		allowAutoApprove:        options.AllowAutoApprove,
 		reviewEvents:            reviewEvents,
 		loopConfig:              loopConfig,
+		convergence:             options.Convergence,
 		discoveryPolicy:         policy,
 		scope:                   scope,
 		detectDuplicateFindings: options.DetectDuplicateFindings,
@@ -1560,6 +1563,10 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		r.appendEvent(ctx, eventInput{eventType: "loop.step.started", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"step": string(step), "startedAt": eventlog.FormatJavaScriptISOString(stepStartedAt.UTC())}})
 		checkpoint, err = r.executeStep(ctx, step, stepInput{Project: *project, Loop: *loop, Run: run, QueueItem: queueItem, Repo: *queueItem.Repo, PRNumber: *queueItem.PRNumber, Checkpoint: checkpoint})
 		if err != nil {
+			var convergenceErr *reviewerConvergenceAwaitingHumanError
+			if errors.As(err, &convergenceErr) {
+				return r.suspendReviewerForConvergence(ctx, *loop, run, queueItem, checkpoint, convergenceErr)
+			}
 			var holdErr *holdSkipError
 			if errors.As(err, &holdErr) {
 				return r.finishHeldReviewerQueueItem(ctx, *loop, &run, queueItem, checkpoint, holdErr.summary)
@@ -2768,6 +2775,9 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 		return checkpoint, &loopError{message: "Missing pending review checkpoint for publish step", kind: FailureRetryableAfterResume}
 	}
 	pending := *checkpoint.PendingReview
+	if handled, err := r.handleConvergenceHumanAnswer(ctx, input, &checkpoint); handled || err != nil {
+		return checkpoint, err
+	}
 	meta := parseJSONObject(input.Loop.MetadataJSON)
 	if last, ok := stringFromAny(meta["lastPublishedHeadSha"]); ok && last == pending.HeadSHA {
 		checkpoint.SkipReason = fmt.Sprintf("Skipped already-published review for head %s", pending.HeadSHA)
@@ -2808,7 +2818,7 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 		if criteriaResult, err := r.maybePublishCriteriaAnchoredCleanReview(ctx, input, checkpoint, pending, detail); err != nil {
 			return checkpoint, err
 		} else if criteriaResult != nil {
-			if err := r.recordPublishedReviewProgress(ctx, input, pending, criteriaResult.reviewEvent); err != nil {
+			if err := r.recordPublishedReviewAndConvergence(ctx, input, pending, criteriaResult.reviewEvent, detail); err != nil {
 				return checkpoint, err
 			}
 			return checkpoint, nil
@@ -2834,7 +2844,7 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 			if err := r.applyVerifiedReviewSideEffects(ctx, input, checkpoint, detail, found); err != nil {
 				return checkpoint, err
 			}
-			if err := r.recordPublishedReviewProgress(ctx, input, pending, pendingReviewEvent(pending)); err != nil {
+			if err := r.recordPublishedReviewAndConvergence(ctx, input, pending, pendingReviewEvent(pending), detail); err != nil {
 				return checkpoint, err
 			}
 			return checkpoint, nil
@@ -2842,7 +2852,7 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 		if err := r.applyCleanNoopReviewSideEffects(ctx, input, checkpoint, detail); err != nil {
 			return checkpoint, err
 		}
-		if err := r.recordPublishedReviewProgress(ctx, input, pending, ReviewEventComment); err != nil {
+		if err := r.recordPublishedReviewAndConvergence(ctx, input, pending, ReviewEventComment, detail); err != nil {
 			return checkpoint, err
 		}
 		return checkpoint, nil
@@ -2950,7 +2960,7 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 	if err := r.applyVerifiedReviewSideEffects(ctx, input, checkpoint, detail, markerResult); err != nil {
 		return checkpoint, err
 	}
-	if err := r.recordPublishedReviewProgress(ctx, input, pending, pendingReviewEvent(pending)); err != nil {
+	if err := r.recordPublishedReviewAndConvergence(ctx, input, pending, pendingReviewEvent(pending), detail); err != nil {
 		return checkpoint, err
 	}
 	return checkpoint, nil
@@ -5451,6 +5461,9 @@ func (r *Runner) recordLoopRunStartMetadata(current *string, projectID string) (
 			"blocking": string(reviewEvents.Blocking),
 		}
 	}
+	if err := r.snapshotConvergencePolicy(meta, projectID); err != nil {
+		return "", err
+	}
 	meta["loop"] = loopMeta
 	encoded, err := json.Marshal(meta)
 	return string(encoded), err
@@ -5475,6 +5488,9 @@ func (r *Runner) recordAgentExecutionStarted(ctx context.Context, loopID string)
 }
 
 func (r *Runner) loopSuccessStatus(currentStatus string, metadataJSON *string, skipReason string) string {
+	if convergenceStatus := r.convergenceLoopStatus(metadataJSON); convergenceStatus != "" {
+		return convergenceStatus
+	}
 	meta := parseJSONObject(metadataJSON)
 	loopMeta := reviewerLoopMetadata(meta)
 	if status, ok := loopMeta["status"].(string); ok && isTerminalReviewerLoopStatus(status) {
@@ -5879,10 +5895,10 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 	if looperCLIPath == "" {
 		publishInstruction = "The trusted Looper review-submit capability is unavailable for this run, so fail closed: do not publish any GitHub review, do not add or remove any GitHub reaction, and exit non-zero with the exact message `trusted looper review submit capability unavailable`."
 	}
-	outcomeInstruction := "Use outcome=clean only when there are no blocking or non-blocking findings, outcome=non_blocking for actionable feedback that should not block merge, and outcome=blocking for findings that should block merge. Legacy outcome=actionable may be treated as comment-only compatibility, but prefer non_blocking or blocking. For no-actionable-finding results, follow the clean-result instructions for this run and finish with a completion summary that starts with `No actionable findings`."
+	outcomeInstruction := "Use outcome=clean only when there are no inline comments. Use outcome=non_blocking for any published inline feedback that should not block merge, including nit-only findings, and outcome=blocking for findings that should block merge. Legacy outcome=actionable may be treated as comment-only compatibility, but prefer non_blocking or blocking. For no-actionable-finding results, follow the clean-result instructions for this run and finish with a completion summary that starts with `No actionable findings`."
 	cleanResultCompletionInstruction := "Prefer 3 deeply specific comments over 10 shallow comments. Group related findings by file, subsystem, function, or rule in a single review round instead of splitting adjacent concerns across multiple small reviews. If there is no concrete actionable feedback, follow the clean-result instructions for this run and finish successfully with a summary beginning `No actionable findings`. Do not invent feedback."
 	if looperCLIPath == "" {
-		outcomeInstruction = "Use outcome=clean only when there are no blocking or non-blocking findings, outcome=non_blocking for actionable feedback that should not block merge, and outcome=blocking for findings that should block merge. Legacy outcome=actionable may be treated as comment-only compatibility, but prefer non_blocking or blocking. For no-actionable-finding results, do not report clean success because the trusted review-submit capability is unavailable; exit non-zero with the exact message `trusted looper review submit capability unavailable`."
+		outcomeInstruction = "Use outcome=clean only when there are no inline comments. Use outcome=non_blocking for any published inline feedback that should not block merge, including nit-only findings, and outcome=blocking for findings that should block merge. Legacy outcome=actionable may be treated as comment-only compatibility, but prefer non_blocking or blocking. For no-actionable-finding results, do not report clean success because the trusted review-submit capability is unavailable; exit non-zero with the exact message `trusted looper review submit capability unavailable`."
 		cleanResultCompletionInstruction = "Prefer 3 deeply specific comments over 10 shallow comments. Group related findings by file, subsystem, function, or rule in a single review round instead of splitting adjacent concerns across multiple small reviews. If there is no concrete actionable feedback, do not finish successfully or add a clean signal because the trusted review-submit capability is unavailable; exit non-zero with the exact message `trusted looper review submit capability unavailable`. Do not invent feedback."
 	}
 	fetchContract := reviewerAgentSideGitHubFetchContract()

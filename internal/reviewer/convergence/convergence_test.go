@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/nexu-io/looper/internal/reviewitem"
+	"github.com/MumuTW/looper/internal/reviewitem"
 )
 
 func TestLongProductiveHistoryKeepsRunning(t *testing.T) {
@@ -190,5 +190,26 @@ func TestEvaluateRejectsAuthorityDrift(t *testing.T) {
 	_, err := Evaluate(state, Round{Items: []Item{{ID: "item-1", Severity: reviewitem.SeverityNit, Status: ItemStatusOpen}}}, policy)
 	if err == nil {
 		t.Fatal("expected same-ID severity drift to fail closed")
+	}
+}
+
+func TestEvaluateDoesNotCountRepeatedFixerEvidence(t *testing.T) {
+	policy := DefaultPolicy()
+	policy.MaxFixerAttemptsPerItem = 2
+	state := State{}
+	item := Item{ID: "item-1", Severity: reviewitem.SeverityBlocking, Status: ItemStatusOpen, FixerResult: FixerResultDeclined, FixerAttemptKey: "attempt-1"}
+	first, err := Evaluate(state, Round{Items: []Item{item}}, policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := Evaluate(first.State, Round{Items: []Item{item}}, policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := second.State.Items["item-1"].FixerAttempts; got != 1 {
+		t.Fatalf("repeated fixer evidence counted %d attempts, want 1", got)
+	}
+	if second.State.Items["item-1"].Stuck {
+		t.Fatal("repeated fixer evidence marked item stuck")
 	}
 }

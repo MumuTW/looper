@@ -61,6 +61,7 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 	if config.Roles.Reviewer.Behavior.Loop.MinPublishIntervalSeconds < 0 {
 		issues = append(issues, ValidationIssue{Path: "roles.reviewer.behavior.loop.minPublishIntervalSeconds", Message: "must be an integer >= 0"})
 	}
+	validateReviewerConvergence(config.Roles.Reviewer.Behavior.Convergence, "roles.reviewer.behavior.convergence", &issues)
 	if config.Roles.Reviewer.Behavior.Retry.AutoRecoveryMaxAttempts < 1 {
 		issues = append(issues, ValidationIssue{Path: "roles.reviewer.behavior.retry.autoRecoveryMaxAttempts", Message: "must be a positive integer"})
 	}
@@ -968,6 +969,11 @@ func validateProjectRoleOverrides(roles *PartialRoleConfigs, prefix string, maxI
 	}
 	if roles.Reviewer != nil {
 		validateProjectRoleInstruction(prefix+".reviewer.instructions", "reviewer", roles.Reviewer.Instructions, maxInstructionBytes, issues)
+		if roles.Reviewer.Behavior != nil && roles.Reviewer.Behavior.Convergence != nil {
+			candidate := DefaultReviewerConvergenceConfig()
+			mergeReviewerConvergenceConfig(&candidate, *roles.Reviewer.Behavior.Convergence)
+			validateReviewerConvergence(&candidate, prefix+".reviewer.behavior.convergence", issues)
+		}
 		if roles.Reviewer.Discovery != nil {
 			if roles.Reviewer.Discovery.Triggers != nil {
 				validateReviewerRoleTriggers(partialReviewerRoleTriggers(*roles.Reviewer.Discovery.Triggers), prefix+".reviewer.discovery.triggers", issues)
@@ -1014,6 +1020,26 @@ func validatePlannerEscalation(escalation *PlannerEscalationConfig, path string,
 	}
 	if escalation.MaxEstimatedPackages < 0 {
 		*issues = append(*issues, ValidationIssue{Path: path + ".maxEstimatedPackages", Message: "must be an integer >= 0"})
+	}
+}
+
+func validateReviewerConvergence(convergence *ReviewerConvergenceConfig, path string, issues *[]ValidationIssue) {
+	if convergence == nil {
+		return
+	}
+	if convergence.MaxConsecutiveUnproductive < 1 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".maxConsecutiveUnproductive", Message: "must be a positive integer"})
+	}
+	if convergence.MaxFixerAttemptsPerItem < 1 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".maxFixerAttemptsPerItem", Message: "must be a positive integer"})
+	}
+	if convergence.MaxTotalRounds < 1 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".maxTotalRounds", Message: "must be a positive integer"})
+	}
+	switch convergence.SeverityFloor {
+	case ReviewerSeverityFloorBlocking, ReviewerSeverityFloorNonBlocking, ReviewerSeverityFloorAll:
+	default:
+		*issues = append(*issues, ValidationIssue{Path: path + ".severityFloor", Message: fmt.Sprintf("must be one of: %s, %s, %s", ReviewerSeverityFloorBlocking, ReviewerSeverityFloorNonBlocking, ReviewerSeverityFloorAll)})
 	}
 }
 

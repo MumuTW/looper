@@ -315,6 +315,19 @@ func DefaultReviewerRetryConfig() ReviewerRetryConfig {
 	}
 }
 
+// DefaultReviewerConvergenceConfig returns the semantic loop defaults from
+// issue #115. It is separate from DefaultConfig so the optional config
+// pointer can remain nil in canonical output while runtime still has one
+// documented default authority.
+func DefaultReviewerConvergenceConfig() ReviewerConvergenceConfig {
+	return ReviewerConvergenceConfig{
+		MaxConsecutiveUnproductive: 3,
+		MaxFixerAttemptsPerItem:    4,
+		MaxTotalRounds:             40,
+		SeverityFloor:              ReviewerSeverityFloorNonBlocking,
+	}
+}
+
 func DefaultDisclosureConfig() DisclosureConfig {
 	return DisclosureConfig{
 		Enabled:      true,

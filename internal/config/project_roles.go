@@ -13,6 +13,10 @@ func ProjectRoleConfigs(cfg Config, projectID string) RoleConfigs {
 		cloned := *roles.Planner.Escalation
 		roles.Planner.Escalation = &cloned
 	}
+	if roles.Reviewer.Behavior.Convergence != nil {
+		cloned := *roles.Reviewer.Behavior.Convergence
+		roles.Reviewer.Behavior.Convergence = &cloned
+	}
 	project := findConfiguredProject(cfg.Projects, projectID)
 	if project == nil {
 		return roles

@@ -26,3 +26,9 @@ func TestAttachMarkerRejectsAgentSuppliedMarker(t *testing.T) {
 		t.Fatal("expected existing marker to be rejected")
 	}
 }
+
+func TestAttachMarkerRejectsEmptyVisibleFeedback(t *testing.T) {
+	if _, err := AttachMarker(" \n\t", SeverityBlocking); err == nil {
+		t.Fatal("AttachMarker() error = nil, want empty visible feedback rejection")
+	}
+}

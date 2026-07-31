@@ -2153,6 +2153,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			AllowAutoApprove: cfg.Defaults.AllowAutoApprove,
 			ReviewEvents:     cfg.Roles.Reviewer.Behavior.ReviewEvents,
 			LoopConfig:       cfg.Roles.Reviewer.Behavior.Loop,
+			Convergence:      convergenceConfigValue(cfg.Roles.Reviewer.Behavior.Convergence),
 			DiscoveryPolicy: reviewer.DiscoveryPolicy{
 				AutoDiscovery:             reviewerAutoDiscovery,
 				IncludeDrafts:             reviewerRole.Discovery.IncludeDrafts,
@@ -3745,6 +3746,13 @@ func runtimeFirstNonEmpty(values ...string) string {
 
 func boolPtr(value bool) *bool {
 	return &value
+}
+
+func convergenceConfigValue(value *config.ReviewerConvergenceConfig) config.ReviewerConvergenceConfig {
+	if value == nil {
+		return config.ReviewerConvergenceConfig{}
+	}
+	return *value
 }
 
 func summarizeCheckStates(checks []map[string]any) string {

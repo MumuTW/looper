@@ -1068,6 +1068,13 @@ func mergeReviewerConfig(config *ReviewerConfig, partial PartialReviewerConfig) 
 	if partial.Loop != nil {
 		mergeReviewerLoopConfig(&config.Loop, *partial.Loop)
 	}
+	if partial.Convergence != nil {
+		if config.Convergence == nil {
+			defaults := DefaultReviewerConvergenceConfig()
+			config.Convergence = &defaults
+		}
+		mergeReviewerConvergenceConfig(config.Convergence, *partial.Convergence)
+	}
 	if partial.Retry != nil {
 		mergeReviewerRetryConfig(&config.Retry, *partial.Retry)
 	}
@@ -1090,6 +1097,21 @@ func mergeReviewerConfig(config *ReviewerConfig, partial PartialReviewerConfig) 
 	}
 	if partial.ThreadResolution != nil {
 		mergeReviewerThreadResolutionConfig(&config.ThreadResolution, *partial.ThreadResolution)
+	}
+}
+
+func mergeReviewerConvergenceConfig(config *ReviewerConvergenceConfig, partial PartialReviewerConvergenceConfig) {
+	if partial.MaxConsecutiveUnproductive != nil {
+		config.MaxConsecutiveUnproductive = *partial.MaxConsecutiveUnproductive
+	}
+	if partial.MaxFixerAttemptsPerItem != nil {
+		config.MaxFixerAttemptsPerItem = *partial.MaxFixerAttemptsPerItem
+	}
+	if partial.MaxTotalRounds != nil {
+		config.MaxTotalRounds = *partial.MaxTotalRounds
+	}
+	if partial.SeverityFloor != nil {
+		config.SeverityFloor = *partial.SeverityFloor
 	}
 }
 
@@ -1716,6 +1738,10 @@ func clonePartialReviewerConfig(config *PartialReviewerConfig) *PartialReviewerC
 	if config.Loop != nil {
 		loop := *config.Loop
 		cloned.Loop = &loop
+	}
+	if config.Convergence != nil {
+		convergence := *config.Convergence
+		cloned.Convergence = &convergence
 	}
 	if config.Retry != nil {
 		retry := *config.Retry

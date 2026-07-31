@@ -11,16 +11,16 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/nexu-io/looper/internal/config"
-	"github.com/nexu-io/looper/internal/diffanchor"
-	"github.com/nexu-io/looper/internal/disclosure"
-	"github.com/nexu-io/looper/internal/domain"
-	"github.com/nexu-io/looper/internal/forge"
-	githubinfra "github.com/nexu-io/looper/internal/infra/github"
-	"github.com/nexu-io/looper/internal/infra/shell"
-	"github.com/nexu-io/looper/internal/outboundguard"
-	"github.com/nexu-io/looper/internal/reviewitem"
-	"github.com/nexu-io/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/diffanchor"
+	"github.com/MumuTW/looper/internal/disclosure"
+	"github.com/MumuTW/looper/internal/domain"
+	"github.com/MumuTW/looper/internal/forge"
+	githubinfra "github.com/MumuTW/looper/internal/infra/github"
+	"github.com/MumuTW/looper/internal/infra/shell"
+	"github.com/MumuTW/looper/internal/outboundguard"
+	"github.com/MumuTW/looper/internal/reviewitem"
+	"github.com/MumuTW/looper/internal/storage"
 )
 
 type reviewSubmitPayload struct {
@@ -411,6 +411,9 @@ func validateReviewSubmitBody(body string, comments []reviewSubmitComment, commi
 			return fmt.Errorf("review marker outcome=%s does not match REQUEST_CHANGES event", outcome)
 		}
 	case "COMMENT":
+		if outcome == "clean" && len(comments) > 0 {
+			return fmt.Errorf("clean reviews require outcome=non_blocking or blocking when inline comments are present")
+		}
 		if outcome == "clean" && policy.Clean == config.ReviewerReviewEventApprove {
 			return fmt.Errorf("review marker outcome=clean requires APPROVE under effective policy")
 		}
@@ -418,17 +421,20 @@ func validateReviewSubmitBody(body string, comments []reviewSubmitComment, commi
 			return fmt.Errorf("review marker outcome=blocking requires REQUEST_CHANGES under effective policy")
 		}
 	}
-	if err := validateReviewItemSeverities(outcome, comments); err != nil {
+	if err := validateReviewItemSeverities(outcome, comments, policy); err != nil {
 		return err
 	}
 	return nil
 }
 
-func validateReviewItemSeverities(outcome string, comments []reviewSubmitComment) error {
+func validateReviewItemSeverities(outcome string, comments []reviewSubmitComment, policy config.ReviewerReviewEventsConfig) error {
 	for index, comment := range comments {
 		severity, err := reviewitem.ParseSeverity(comment.Severity)
 		if err != nil {
 			return fmt.Errorf("review comment %d: %w", index+1, err)
+		}
+		if severity == reviewitem.SeverityBlocking && outcome == "actionable" && policy.Blocking == config.ReviewerReviewEventRequestChanges {
+			return fmt.Errorf("review comment %d severity=blocking requires REQUEST_CHANGES under effective policy", index+1)
 		}
 		if severity == reviewitem.SeverityBlocking && outcome != "blocking" && outcome != "actionable" {
 			return fmt.Errorf("review comment %d severity=blocking exceeds review outcome=%s", index+1, outcome)

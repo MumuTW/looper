@@ -107,7 +107,7 @@ Profile and role agent vendor/model fields are hot-safe curated identity fields:
 
 `agent.vendor` can switch from one configured vendor to another when `agent.params` is empty and no explicit model is being silently carried across vendors. If `agent.model` is set, change or unset it in the same candidate; an unchanged explicit model blocks that vendor-to-vendor switch. Clearing a configured vendor uses the same guard, so a retained profile cannot be laundered through an intermediate `null`. The same leave/switch guards apply to each coding role's *resolved* vendor after global → profile → role overlay. Configuring the first vendor may use an already prepared model/params profile. Continuations of failed or interrupted runs copy the predecessor's durable `agent_snapshot_json` (sticky identity across the retry lineage) while retaining checkpoint, worktree, HITL answer, and queued human instructions. Only legacy predecessors with a null snapshot adopt the runner's current resolved identity. Looper never sends an old vendor's native session ID to a different CLI.
 
-Notably, `agent.nativeResume`, `agent.params`, `roles.coordinator.enabled`, `instructions.maxBytes`, all `hitl.*`, all `intake.*`, all `notifications.webhook.*`, `roles.reviewer.autoMerge.*`, `roles.reviewer.behavior.loop.quietPeriodSeconds`, `roles.reviewer.behavior.loop.minPublishIntervalSeconds`, `roles.reviewer.behavior.retry.maxDelayMs`, `roles.coordinator.mergeWatch.transientRetries`, and `roles.coordinator.dependencies.*` require restart. `agent.params` stay global, file-only, and restart-bound; the dashboard does not edit params. The scheduler retry budget/base delay and these Reviewer timing fields are durable queue-scheduling inputs; Coordinator transient retries are persisted as a remaining budget, so they are also restart-bound. Listener, storage, daemon, logging, webhook/network topology, providers/projects, scheduler polling/cache, and `tools.gitPath`/`tools.ghPath` also require restart. New fields are restart-bound until explicitly classified.
+Notably, `agent.nativeResume`, `agent.params`, `roles.coordinator.enabled`, `instructions.maxBytes`, all `hitl.*`, all `intake.*`, all `notifications.webhook.*`, `roles.reviewer.autoMerge.*`, `roles.reviewer.behavior.loop.quietPeriodSeconds`, `roles.reviewer.behavior.loop.minPublishIntervalSeconds`, `roles.reviewer.behavior.retry.maxDelayMs`, `roles.coordinator.mergeWatch.transientRetries`, and `roles.coordinator.dependencies.*` require restart. `roles.reviewer.behavior.convergence.*` is the exception for new claims: its four leaves are hot-safe and an active loop keeps its captured policy snapshot. `agent.params` stay global, file-only, and restart-bound; the dashboard does not edit params. The scheduler retry budget/base delay and these Reviewer timing fields are durable queue-scheduling inputs; Coordinator transient retries are persisted as a remaining budget, so they are also restart-bound. Listener, storage, daemon, logging, webhook/network topology, providers/projects, scheduler polling/cache, and `tools.gitPath`/`tools.ghPath` also require restart. New fields are restart-bound until explicitly classified.
 
 Deprecated file-layer aliases for `agent.timeouts.{planner,worker,reviewer,fixer}Seconds`, `defaults.allowAutoApprove`, and `defaults.fixAllPullRequests` are normalized into their canonical hot-safe fields so existing files can still reload without a restart. They remain file-only compatibility syntax: the dashboard exposes and writes only canonical paths, and a canonical dashboard edit removes the corresponding alias leaf so a later unset cannot resurrect the old value.
 
@@ -629,6 +629,12 @@ enabledByDefault = true
 quietPeriodSeconds = 60
 minPublishIntervalSeconds = 300
 
+[roles.reviewer.behavior.convergence]
+maxConsecutiveUnproductive = 3
+maxFixerAttemptsPerItem = 4
+maxTotalRounds = 40
+severityFloor = "non_blocking"
+
 [roles.reviewer.behavior.reviewEvents]
 clean = "APPROVE"
 blocking = "REQUEST_CHANGES"
@@ -639,6 +645,28 @@ reReviewPromptOnHeadChange = false
 ```
 
 The reviewer defaults above are intentionally aggressive: clean reviews publish `APPROVE`, blocking reviews publish `REQUEST_CHANGES`, and `enableSelfReview` still defaults to `false`.
+
+### Reviewer convergence settings
+
+`roles.reviewer.behavior.convergence.*` is the per-project authority for
+semantic Reviewer↔Fixer loop bounds. The structured `looper:review-item`
+severity marker remains the forge authority; the reviewer persists only the
+observed round history and decision in the existing loop metadata.
+
+| Path | Purpose | Default | Valid values |
+| --- | --- | --- | --- |
+| `roles.reviewer.behavior.convergence.maxConsecutiveUnproductive` | Consecutive rounds with no new item or explicit resolution before human escalation | `3` | positive integers |
+| `roles.reviewer.behavior.convergence.maxFixerAttemptsPerItem` | Distinct structured Fixer attempts allowed for one open item before it is deferred | `4` | positive integers |
+| `roles.reviewer.behavior.convergence.maxTotalRounds` | Absolute runaway backstop, reported separately from a stall | `40` | positive integers |
+| `roles.reviewer.behavior.convergence.severityFloor` | Lowest severity that continues the loop and blocks progress | `"non_blocking"` | `"blocking"`, `"non_blocking"`, `"all"` |
+
+When a stall or absolute ceiling fires, Reviewer records the reason, round
+history, and open item IDs in loop metadata and parks the loop as
+`awaiting_human`; the HITL answer `resume` resets only the stall counter,
+while `close` ends that reviewer loop. Global role leaves are hot-reloadable
+for new claims; project catalog changes retain the normal project restart
+boundary. An already-started loop keeps the policy snapshot stored with its
+convergence state.
 
 ### Reviewer auto-merge settings
 

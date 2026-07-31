@@ -44,6 +44,12 @@ var (
 var prNumberURLPattern = regexp.MustCompile(`/pull/(\d+)(?:/|$)`)
 
 var (
+	fixerReplyEvidencePattern    = regexp.MustCompile(`(?i)<!--\s*looper-fixer-reply\s+thread:\S+\s+commit:([^\s]+)\s*-->`)
+	fixerDeclinedEvidencePattern = regexp.MustCompile(`(?i)<!--\s*looper-fixer-reply-declined\s+thread:\S+\s+fingerprint:([^\s]+)\s*-->`)
+	fixerDeferredEvidencePattern = regexp.MustCompile(`(?i)<!--\s*looper-fixer-reply-deferred\s+thread:\S+\s+fingerprint:([^\s]+)\s*-->`)
+)
+
+var (
 	// ErrDiffTooLarge is returned when GitHub itself refuses a PR diff as oversized
 	// (for example HTTP 406 too_large / 20k-line limit).
 	ErrDiffTooLarge = errors.New("github pull request diff is too large")
@@ -3266,6 +3272,10 @@ func (g *Gateway) fetchReviewThreads(ctx context.Context, repo string, prNumber 
 				if fingerprint := reviewThreadFingerprintFromNodes(allCommentNodes); fingerprint != "" {
 					normalized["threadFingerprint"] = fingerprint
 				}
+				if result, key := fixerResultFromReviewThreadNodes(allCommentNodes); result != "" {
+					normalized["fixerResult"] = result
+					normalized["fixerAttemptKey"] = key
+				}
 				out = append(out, normalized)
 			}
 		}
@@ -3766,6 +3776,7 @@ func normalizeReviewThread(value any) (map[string]any, bool) {
 	out := map[string]any{
 		"id":         commentID,
 		"threadId":   threadID,
+		"source":     "review_thread",
 		"state":      ternary(isResolved, "RESOLVED", "UNRESOLVED"),
 		"isResolved": isResolved,
 	}
@@ -3792,6 +3803,27 @@ func normalizeReviewThread(value any) (map[string]any, bool) {
 		out["threadFingerprint"] = fingerprint
 	}
 	return out, true
+}
+
+// fixerResultFromReviewThreadNodes projects only explicit Looper reply
+// markers into the reviewer/fixer handoff. Visible prose is never treated as
+// a fixer outcome; the marker's commit/fingerprint is the attempt identity so
+// retries do not increment a convergence budget by re-observing one result.
+func fixerResultFromReviewThreadNodes(nodes []any) (string, string) {
+	for _, raw := range nodes {
+		row, _ := raw.(map[string]any)
+		body := asString(row["body"])
+		if match := fixerDeclinedEvidencePattern.FindStringSubmatch(body); len(match) == 2 {
+			return "declined", match[1]
+		}
+		if match := fixerDeferredEvidencePattern.FindStringSubmatch(body); len(match) == 2 {
+			return "deferred", match[1]
+		}
+		if match := fixerReplyEvidencePattern.FindStringSubmatch(body); len(match) == 2 {
+			return "fixed", match[1]
+		}
+	}
+	return "", ""
 }
 
 func reviewThreadFingerprintFromNodes(nodes []any) string {
