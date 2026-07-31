@@ -32,6 +32,11 @@ func TestSmokeLooperdExitsWhenSupervisionPipeCloses(t *testing.T) {
 	case <-time.After(15 * time.Second):
 		t.Fatal("looperd still running 15s after its supervision pipe closed; orphan protection is broken")
 	}
+	// Exit status 0 only happens when graceful shutdown ran to completion;
+	// death by default signal action or the 30s force-exit reports an error.
+	if err := proc.ExitErr(); err != nil {
+		t.Fatalf("looperd exited without completing graceful shutdown: %v", err)
+	}
 }
 
 // TestSmokeLooperdExitsWhenSupervisionPipeClosesDuringStartup closes the pipe
@@ -53,5 +58,13 @@ func TestSmokeLooperdExitsWhenSupervisionPipeClosesDuringStartup(t *testing.T) {
 	case <-proc.Exited():
 	case <-time.After(45 * time.Second):
 		t.Fatal("looperd still running 45s after its supervision pipe closed during startup")
+	}
+	// The regression this guards: a shutdown request from the startup window
+	// hitting the default SIGTERM action (or falling through to the 30s
+	// force-exit) kills the process without draining the forwarders and
+	// executions startup already launched. Both failure modes exit non-zero;
+	// only a completed graceful shutdown exits 0.
+	if err := proc.ExitErr(); err != nil {
+		t.Fatalf("looperd exited without completing graceful shutdown after startup-window pipe close: %v", err)
 	}
 }

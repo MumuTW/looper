@@ -200,6 +200,15 @@ func (d *DaemonProcess) Exited() <-chan struct{} {
 	return d.doneCh
 }
 
+// ExitErr returns the daemon's Wait error; only meaningful once Exited() is
+// closed. nil means exit status 0, which the daemon only produces when
+// graceful shutdown ran to completion — death by default signal action or the
+// supervision force-exit both report a non-nil error, so tests use this to
+// distinguish a drained shutdown from mere process death.
+func (d *DaemonProcess) ExitErr() error {
+	return d.exitErr()
+}
+
 func (d *DaemonProcess) exitErr() error {
 	d.mu.RLock()
 	defer d.mu.RUnlock()

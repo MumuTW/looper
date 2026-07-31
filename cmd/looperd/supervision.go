@@ -7,6 +7,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -102,35 +103,48 @@ func startStdinSupervision(stdin io.Reader, stderr io.Writer, forceExitDelay tim
 // registers late (after the runtime is up); forwarding from the channel
 // registered in setupStdinSupervision means a signal from the startup window
 // is delivered to the listener instead of lost to a channel nobody reads.
+// Single-use, matching how bootstrap drives the seam: one Notify, then one
+// Stop after the listener is done.
 type forwardingSignalNotifier struct {
-	source <-chan os.Signal
-	stop   chan struct{}
+	source  <-chan os.Signal
+	stop    chan struct{}
+	done    chan struct{}
+	started atomic.Bool
 }
 
 func newForwardingSignalNotifier(source <-chan os.Signal) *forwardingSignalNotifier {
-	return &forwardingSignalNotifier{source: source, stop: make(chan struct{})}
+	return &forwardingSignalNotifier{source: source, stop: make(chan struct{}), done: make(chan struct{})}
 }
 
 // Notify ignores the requested signal set: the source channel is already
 // registered for exactly the signals bootstrap's shutdown listener asks for
 // (os.Interrupt, SIGTERM).
 func (n *forwardingSignalNotifier) Notify(ch chan<- os.Signal, _ ...os.Signal) {
+	n.started.Store(true)
 	go func() {
+		defer close(n.done)
 		for {
 			select {
-			case sig := <-n.source:
-				select {
-				case ch <- sig:
-				case <-n.stop:
-					return
-				}
 			case <-n.stop:
 				return
+			case sig := <-n.source:
+				select {
+				case <-n.stop:
+					return
+				case ch <- sig:
+				}
 			}
 		}
 	}()
 }
 
+// Stop waits for the forwarding goroutine to exit so that no signal can be
+// delivered after Stop returns. Without the wait, a signal already buffered
+// in source when Stop closes n.stop could still win the goroutine's select
+// and land in a channel whose listener has already gone away.
 func (n *forwardingSignalNotifier) Stop(chan<- os.Signal) {
 	close(n.stop)
+	if n.started.Load() {
+		<-n.done
+	}
 }

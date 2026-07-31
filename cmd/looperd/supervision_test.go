@@ -98,6 +98,33 @@ func TestForwardingNotifierStopEndsForwarding(t *testing.T) {
 	}
 }
 
+// TestForwardingNotifierStopPreventsDeliveryAfterReturn pins the Stop
+// synchronization contract: with a signal already buffered in source when
+// Stop is called, the forwarding goroutine must not deliver it after Stop
+// returns. Deliveries racing Stop itself are allowed; the assertion is that
+// nothing new arrives once Stop has returned.
+func TestForwardingNotifierStopPreventsDeliveryAfterReturn(t *testing.T) {
+	for i := 0; i < 100; i++ {
+		source := make(chan os.Signal, 1)
+		requestShutdownSignal(source)
+
+		notifier := newForwardingSignalNotifier(source)
+		listener := make(chan os.Signal, 1)
+		notifier.Notify(listener, os.Interrupt, syscall.SIGTERM)
+		notifier.Stop(listener)
+
+		select {
+		case <-listener:
+		default:
+		}
+		select {
+		case sig := <-listener:
+			t.Fatalf("iteration %d: received %v after Stop returned", i, sig)
+		case <-time.After(time.Millisecond):
+		}
+	}
+}
+
 func TestRequestShutdownSignalDropsWhenRequestAlreadyPending(t *testing.T) {
 	signals := make(chan os.Signal, 1)
 	requestShutdownSignal(signals)
