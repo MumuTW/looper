@@ -36,8 +36,8 @@ PATCH_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/acp-permission-allowli
 
 # sha256 of the exact upstream file this patch was generated against, and of
 # the result of applying it. Anything else means "do not touch".
-STOCK_SHA="03190fcd4f9c985cab5cbaa90f7391cad8122148d7d300a81da8be0c2189c4bf"
-PATCHED_SHA="4ec44e3260a9d86bba91e19a3dd8dc1d9f793e341855df19fd876b122bac1517"
+STOCK_SHA="eb5b4bf7bf2c4ff7deb0f2928a2fb4ada0e8584996603b88541e90d3c5e8f178"
+PATCHED_SHA="e4dc6dfeb79e25a66543af2487265c468e93515d04a6725d134428d562ce7950"
 
 die() { echo "$*" >&2; exit 1; }
 

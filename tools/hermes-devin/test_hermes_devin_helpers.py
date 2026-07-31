@@ -40,7 +40,7 @@ class HermesDevinHelperTests(unittest.TestCase):
         stock = STOCK_ACP_CLIENT.read_bytes()
         self.assertEqual(
             hashlib.sha256(stock).hexdigest(),
-            "03190fcd4f9c985cab5cbaa90f7391cad8122148d7d300a81da8be0c2189c4bf",
+            "eb5b4bf7bf2c4ff7deb0f2928a2fb4ada0e8584996603b88541e90d3c5e8f178",
         )
         with tempfile.TemporaryDirectory() as temp:
             install = Path(temp) / "hermes-agent"
@@ -53,7 +53,7 @@ class HermesDevinHelperTests(unittest.TestCase):
             self.assertEqual(applied.returncode, 0, applied.stderr)
             self.assertEqual(
                 hashlib.sha256(target.read_bytes()).hexdigest(),
-                "4ec44e3260a9d86bba91e19a3dd8dc1d9f793e341855df19fd876b122bac1517",
+                "e4dc6dfeb79e25a66543af2487265c468e93515d04a6725d134428d562ce7950",
             )
             reverted = subprocess.run([str(script), "--revert"], env=env, text=True, capture_output=True, check=False)
             self.assertEqual(reverted.returncode, 0, reverted.stderr)

@@ -303,12 +303,12 @@ Two components, plus profile wiring:
   replaces the shim's blanket denial with an allow-list gate. Deny is still
   the default and the list is empty unless `HERMES_ACP_ALLOWED_MCP_TOOLS` is
   set, so an unconfigured install behaves exactly like stock Hermes. Only
-  `allow_once` / `allow_session` can ever be selected: `allow_always` and
-  `allow_server_always` outlive the session, `switch_bypass` drops the gate
-  entirely, and the `allow_server_*` options approve *every* tool on that
-  server — including ones never allow-listed, which would defeat the per-tool
-  list. The apply script pins both stock and patched checksums and refuses to
-  touch a Hermes that has moved underneath it.
+  `allow_once` can ever be selected: every other offered approval option
+  outlives that call, `switch_bypass` drops the gate entirely, and the
+  `allow_server_*` options approve *every* tool on that server — including
+  ones never allow-listed, which would defeat the per-tool list. The apply
+  script pins both stock and patched checksums and refuses to touch a Hermes
+  that has moved underneath it.
 
 ### Two defects the e2e caught
 
@@ -327,17 +327,21 @@ recorded here because the wire shapes are not documented anywhere:
    server"), which would mean gating security on UI copy — rejected.
    Using the fully-qualified name also pins the server, so another server
    exposing a same-named tool does not inherit the grant.
-2. **Devin spawns the MCP server, so `HERMES_HOME` does not propagate.**
-   The server correctly refused to write rather than guessing a profile.
-   Register it with the profile baked in: `devin mcp add <name> -e
-   HERMES_HOME=<profile> -- <path to memory_mcp_server.py>`.
+2. **Devin spawns the MCP server, so shell environment does not propagate.**
+   The server correctly refused to write rather than guessing a profile, and
+   a non-default Hermes install cannot be imported unless its
+   `HERMES_INSTALL_DIR` is also registered. Register both values with the
+   profile baked in: `devin mcp add <name> -e HERMES_HOME=<profile> -e
+   HERMES_INSTALL_DIR=<hermes-agent root> -- <path to memory_mcp_server.py>`.
 
 ### Setup
 
 ```bash
+HERMES_INSTALL_DIR="${HERMES_INSTALL_DIR:-$HOME/.hermes/hermes-agent}"
 tools/hermes-devin/apply-hermes-patch.sh          # once; --revert to undo
 devin mcp add hermes-memory \
   -e HERMES_HOME="$HOME/.hermes/profiles/looper" \
+  -e HERMES_INSTALL_DIR="$HERMES_INSTALL_DIR" \
   -- "$PWD/tools/hermes-devin/memory_mcp_server.py"
 ```
 
@@ -370,14 +374,17 @@ selection, so every clone drives the same profile and the same backend:
 
 ```bash
 scripts/hermes-profile.sh --bootstrap   # create/repair the profile (once)
-source scripts/hermes-profile.sh        # export HERMES_HOME for this shell
+export HERMES_HOME="$(scripts/hermes-profile.sh --print)"
 hermes
 ```
 
 The profile directory itself (config.yaml, .env, SOUL.md, memories/) is user
-state and is not checked in; `--bootstrap` rewrites config.yaml and .env while
-leaving `memories/` untouched. Repo-scoped memory is a real benefit here: the
-looper profile's memory stays separate from the default profile's.
+state and is not checked in. On a new profile, `--bootstrap` replaces the
+generated defaults with this repo's `config.yaml` and `.env` templates. On an
+existing profile it preserves either file when it differs, reports the skip,
+and requires an explicit `--force` (which first backs up the file) to replace
+it; `memories/` is always untouched. Repo-scoped memory is a real benefit
+here: the looper profile's memory stays separate from the default profile's.
 
 ## Reproduce (without the profile script)
 
