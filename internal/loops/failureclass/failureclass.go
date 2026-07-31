@@ -49,6 +49,13 @@ type Context struct {
 	SideEffectState string
 }
 
+// ErrStaticConfigMismatch marks a failure that no retry can change because the
+// running configuration, not the world, is what is wrong. Producers wrap it so
+// classification does not have to sniff messages; Classify short-circuits it to
+// ManualIntervention so such a failure neither burns retry attempts nor feeds
+// the consecutive-failure circuit breaker.
+var ErrStaticConfigMismatch = errors.New("static configuration mismatch")
+
 type BoundaryError struct {
 	Boundary Boundary
 	Err      error
@@ -68,6 +75,11 @@ func (e *BoundaryError) Unwrap() error { return e.Err }
 func Classify(err error, ctx Context) Kind {
 	if err == nil {
 		return NonRetryable
+	}
+	// A static configuration mismatch outranks every boundary heuristic below:
+	// the step boundary would otherwise read as an external one and retry.
+	if errors.Is(err, ErrStaticConfigMismatch) {
+		return ManualIntervention
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return RetryableTransient

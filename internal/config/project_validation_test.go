@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -151,5 +152,58 @@ func TestNormalizeProjectValidationKeepsDistinctProjectPolicies(t *testing.T) {
 	}
 	if got := cfg.Projects[1].Validation; got == nil || !got.OptOut || len(got.Commands) != 0 {
 		t.Fatalf("fluenx validation = %#v", got)
+	}
+}
+
+func TestValidateProjectValidationRequiresVendorWithToolNetworkDenial(t *testing.T) {
+	t.Parallel()
+
+	for _, testCase := range []struct {
+		name       string
+		vendor     AgentVendor
+		validation *ProjectValidationConfig
+		wantIssue  bool
+	}{
+		{name: "commands with unsupported vendor", vendor: AgentVendorClaudeCode, validation: &ProjectValidationConfig{Commands: []string{"go test ./..."}}, wantIssue: true},
+		{name: "commands with codex", vendor: AgentVendorCodex, validation: &ProjectValidationConfig{Commands: []string{"go test ./..."}}},
+		{name: "commands with devin", vendor: AgentVendorDevinExperimental, validation: &ProjectValidationConfig{Commands: []string{"go test ./..."}}},
+		{name: "opt out with unsupported vendor", vendor: AgentVendorClaudeCode, validation: &ProjectValidationConfig{OptOut: true}},
+	} {
+		testCase := testCase
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			cfg, err := DefaultConfig(t.TempDir())
+			if err != nil {
+				t.Fatalf("DefaultConfig() error = %v", err)
+			}
+			vendor := testCase.vendor
+			cfg.Agent.Vendor = &vendor
+			cfg.Projects = []ProjectRefConfig{{ID: "demo", Name: "Demo", RepoPath: t.TempDir(), Validation: testCase.validation}}
+
+			err = ValidateWithOptions(cfg, ValidateOptions{DefaultWorktreeRoot: t.TempDir()})
+			var validationErr *ConfigValidationError
+			hasIssue := errors.As(err, &validationErr) && validationIssuesContainPath(validationErr.Issues, "projects[0].validation.commands")
+			if hasIssue != testCase.wantIssue {
+				t.Fatalf("ValidateWithOptions() error = %v, want vendor issue = %t", err, testCase.wantIssue)
+			}
+			if !testCase.wantIssue {
+				return
+			}
+			messages := []string{}
+			for _, issue := range validationErr.Issues {
+				if issue.Path == "projects[0].validation.commands" {
+					messages = append(messages, issue.Message)
+				}
+			}
+			if len(messages) != 2 {
+				t.Fatalf("issues = %#v, want one per coding role", messages)
+			}
+			message := strings.Join(messages, "\n")
+			for _, want := range []string{"demo", "roles.worker.agent.vendor", "roles.fixer.agent.vendor", "optOut=true", string(AgentVendorCodex), string(AgentVendorDevinExperimental)} {
+				if !strings.Contains(message, want) {
+					t.Fatalf("issue message = %q, missing %q", message, want)
+				}
+			}
+		})
 	}
 }
