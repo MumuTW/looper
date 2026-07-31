@@ -821,23 +821,74 @@ func LoadTrustedReviewConfigSnapshot() (config.LoadedFileConfig, bool, error) {
 	if len(raw) > maxTrustedReviewConfigSnapshotSize {
 		return config.LoadedFileConfig{}, true, fmt.Errorf("trusted review config snapshot exceeds size limit")
 	}
+	loaded, err := decodeTrustedReviewConfigSnapshot(raw)
+	if err != nil {
+		return config.LoadedFileConfig{}, true, err
+	}
+	if err := config.Validate(loaded.Config); err != nil {
+		return config.LoadedFileConfig{}, true, fmt.Errorf("validate trusted review config snapshot: %w", err)
+	}
+	return loaded, true, nil
+}
+
+// decodeTrustedReviewConfigSnapshot accepts precisely the historical package
+// field that older daemons could have serialized. The field is still decoded
+// into Partial for observability, then removed before strict Config decoding so
+// it cannot restore the unsupported auto-upgrade behavior. Every other field
+// remains subject to DisallowUnknownFields.
+func decodeTrustedReviewConfigSnapshot(raw []byte) (config.LoadedFileConfig, error) {
+	var document map[string]json.RawMessage
 	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.DisallowUnknownFields()
-	var snapshot config.Config
-	if err := decoder.Decode(&snapshot); err != nil {
-		return config.LoadedFileConfig{}, true, fmt.Errorf("decode trusted review config snapshot: %w", err)
+	if err := decoder.Decode(&document); err != nil {
+		return config.LoadedFileConfig{}, fmt.Errorf("decode trusted review config snapshot: %w", err)
 	}
 	var trailing any
 	if err := decoder.Decode(&trailing); err != io.EOF {
 		if err == nil {
 			err = fmt.Errorf("multiple JSON values")
 		}
-		return config.LoadedFileConfig{}, true, fmt.Errorf("decode trusted review config snapshot: %w", err)
+		return config.LoadedFileConfig{}, fmt.Errorf("decode trusted review config snapshot: %w", err)
 	}
-	if err := config.Validate(snapshot); err != nil {
-		return config.LoadedFileConfig{}, true, fmt.Errorf("validate trusted review config snapshot: %w", err)
+
+	loaded := config.LoadedFileConfig{}
+	if packageRaw, ok := document["package"]; ok {
+		var partialPackage config.PartialPackageConfig
+		packageDecoder := json.NewDecoder(bytes.NewReader(packageRaw))
+		packageDecoder.DisallowUnknownFields()
+		if err := packageDecoder.Decode(&partialPackage); err != nil {
+			return config.LoadedFileConfig{}, fmt.Errorf("decode trusted review package snapshot: %w", err)
+		}
+		if partialPackage.DeprecatedAutoUpgradeEnabled != nil {
+			var packageFields map[string]json.RawMessage
+			if err := json.Unmarshal(packageRaw, &packageFields); err != nil {
+				return config.LoadedFileConfig{}, fmt.Errorf("decode trusted review package snapshot: %w", err)
+			}
+			delete(packageFields, "autoUpgradeEnabled")
+			sanitizedPackage, err := json.Marshal(packageFields)
+			if err != nil {
+				return config.LoadedFileConfig{}, fmt.Errorf("encode trusted review package snapshot: %w", err)
+			}
+			document["package"] = sanitizedPackage
+			raw, err = json.Marshal(document)
+			if err != nil {
+				return config.LoadedFileConfig{}, fmt.Errorf("encode trusted review config snapshot: %w", err)
+			}
+			loaded.Partial.Package = &partialPackage
+		}
 	}
-	return config.LoadedFileConfig{Config: snapshot}, true, nil
+
+	decoder = json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&loaded.Config); err != nil {
+		return config.LoadedFileConfig{}, fmt.Errorf("decode trusted review config snapshot: %w", err)
+	}
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			err = fmt.Errorf("multiple JSON values")
+		}
+		return config.LoadedFileConfig{}, fmt.Errorf("decode trusted review config snapshot: %w", err)
+	}
+	return loaded, nil
 }
 
 func trustedReviewProxyChildEnv(trustedEnv map[string]string, configFD int) []string {

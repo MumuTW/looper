@@ -1360,6 +1360,8 @@ Usage:
                                Verify the restarted daemon against that release
   looper upgrade restore-preflight --bundle <directory>
                                Verify a rollback bundle and inactive targets
+  looper upgrade restore --bundle <directory> --confirm
+                               Restore the verified config and SQLite snapshot
 
 Global flags, accepted before or after the verb:
   --config <path>              Config file to load
