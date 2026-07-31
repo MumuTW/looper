@@ -317,7 +317,7 @@ no cycle is created, and every production importer of `validation`
 imports `failureclass`, so no importer gains a transitive dependency it did not
 already carry.
 
-### Step 2 — Delete the `xxxFailureKind` conversion functions; preserve the unknown-kind fallback
+### Step 2 — Delete the `xxxFailureKind` conversion functions; normalize at the queue-failure boundary
 
 With `QueueFailureKind` gone, `fixerFailureKind`, `reviewerFailureKind`,
 `workerFailureKind`, and `plannerFailureKind` would be identity functions for
@@ -329,131 +329,83 @@ unknown value instead of being normalized to `non_retryable`, changing retry
 behavior before all retry predicates are updated. That violates Goal 3 (no
 behavior change).
 
-Preserve the fallback explicitly. Add
-`failureclass.Normalize(kind Kind) Kind` to `internal/loops/failureclass`,
-returning each known kind unchanged and any unrecognized kind as `NonRetryable`,
-and replace the four conversion functions with calls to it (e.g.
-`kind: failureclass.Normalize(d.Kind)` instead of `kind: fixerFailureKind(d.Kind)`).
-This keeps the unknown-kind → `non_retryable` normalization as a named,
-testable invariant rather than an implicit side effect of the type split. Add a
-focused test in `internal/loops/failureclass` asserting that an unknown `Kind`
-normalizes to `NonRetryable` and that the four known kinds pass through.
+Preserve the fallback at the **consumption boundary**, not at every production
+site. Add `failureclass.Normalize(kind Kind) Kind` to
+`internal/loops/failureclass`, returning each known kind unchanged and any
+unrecognized kind as `NonRetryable`, and normalize `failure.kind` once at each
+runner's queue-failure consumption boundary — the point where the `loopError`'s
+`kind` is first read for a retry decision, breaker check, resume-policy
+derivation, or persistence — before any such read. The four runner paths
+converge at these boundaries before retry decisions and persistence: each
+failure-handling entry point begins with `failure := r.classifyFailure*(...)`
+and then reads `failure.kind` for the retry predicates
+(`isQueueRetryEligible`/`shouldRetryQueueFailure`), the resume-policy derivation
+(`NormalizeResumePolicy`/`NextResumePolicyOnFailure`), event logging, and the
+queue/checkpoint persistence (`failQueueItem`/`failQueueItemTerminal`/
+`requeueQueueItem`/`ProcessResult.FailureKind`/`FixerOutcomeFailure.Kind`). The
+fixer's breaker reads `failure.kind` for its manual-kind check
+(`failQueueItemWithBreaker`) before delegating to the queue-failure path, so the
+fixer's normalization precedes that check and the breaker receives an
+already-normalized kind. Normalizing `failure.kind` once at each entry point
+(or, equivalently, inside the `classifyFailure*` functions that produce every
+dynamic-source `loopError`, since each entry point begins with such a call)
+covers every downstream read in that block, so a single normalization per
+failure-handling path is sufficient.
 
-The `Normalize` unit test and the four-kind runner tests do not, by themselves,
-prove that the former `xxxFailureKind` call sites actually invoke `Normalize`.
-The `loopError.kind` assignments split into three groups:
+This deletes the twelve call-site `Normalize` wraps the earlier draft added
+(seven dynamic-source sites plus five known-safe carrier reads) and the entire
+structural gate (the type-aware `go/parser`+`go/ast`+`go/types` call-site check
+the earlier draft's Validation step 8 specified). Boundary normalization is
+strictly more robust than a producer-side gate: it preserves the unknown-kind →
+`NonRetryable` fallback for every producer — including sources a structural
+analyzer cannot model — because the boundary normalizes regardless of how the
+kind was produced. A producer that assigns an unknown kind directly to
+`loopError.kind` cannot reach a retry decision or persistence unnormalized,
+because the boundary normalizes before any decision read. The structural gate
+existed to prevent that symptom; boundary normalization makes the symptom
+impossible, so the gate is redundant — the deletion the repo's "prefer deletion
+over another layer" guideline requires before adding a validation layer. Per the
+repo's "name the authority before enforcing it" guideline, the authority for
+"this kind is supported" is `Normalize` itself, and the boundary enforces it
+once rather than inferring per-producer safety.
 
-1. **Dynamic sources (must be `Normalize`-wrapped).** Seven sites receive a
-   `failureclass.Kind` whose value is not bounded to the four known kinds at the
-   assignment: four in the fixer (`runner.go:3378,3403,3650,6480`, taking
-   `d.Kind` / `failure.Kind` from a `Decision` or validation failure) and one
-   each in the reviewer, worker, and planner (`runner.go:4640/3403/1936`, taking
-   `failureclass.Classify(...)` directly). These are the former `xxxFailureKind`
-   call sites and become `kind: failureclass.Normalize(...)`.
+The earlier draft did not record attempting boundary enforcement before adding
+the structural gate. Boundary normalization was weighed against the
+producer-side gate and adopted because it deletes both the call-site wraps and
+the gate while covering strictly more producers; the producer-side gate is
+recorded as a rejected alternative below. The carrier sources the earlier draft
+wrapped — `worker.validationFailure.kind` (read into `loopError.kind` at four
+worker sites) and `fixerRepairTaskOutcome`'s `blockedKind` — are bounded to the
+four known kinds by their producers, so `Normalize` is a no-op for them today;
+the boundary covers them without a per-carrier allowlist, so no carrier-name
+recognition and no per-call-site wrap is needed. Those `loopError` construction
+sites keep their direct assignments (`kind: failure.kind`, `kind: blockedKind`)
+unchanged — the boundary normalizes the resulting `failure.kind` before any
+decision read, so wrapping each construction would only duplicate work the
+boundary already does.
 
-2. **Known-safe carrier sources (also `Normalize`-wrapped, for a uniform
-   gate).** Two carrier producers feed `loopError.kind` with a value that is
-   *not* a known-constant literal and *not* a `loopError.kind` copy, yet is
-   provably bounded to the four known kinds by its producer:
-   - `worker.validationFailure.kind` (`internal/worker/runner.go:2811`) is
-     assigned only from `policy.FailureKind` (after Step 1 a known
-     `policy.Kind` from `validation.PolicyFor`, which returns only the four
-     known constants) or from `FailureManualIntervention` /
-     `FailureRetryableAfterResume` / `FailureRetryableTransient` constants. It is
-     read into `loopError.kind` at four worker sites
-     (`runner.go:1943,1958,2007,2038` as `kind: failure.kind`).
-   - `fixerRepairTaskOutcome` (`internal/fixer/runner.go:1367`) returns the
-     `blockedKind` that flows into `loopError.kind` at
-     `internal/fixer/runner.go:3327` (`kind: blockedKind`); its kind result comes
-     only from `parseFixerBlockedFailureKind`, which allowlists
-     `FailureManualIntervention` / `FailureRetryableAfterResume` /
-     `FailureRetryableTransient` (the empty-string return is paired with
-     `blocked=false`, so it never reaches this `loopError`).
+`Normalize` defaults an unrecognized kind to `NonRetryable`, so a future
+`policy.Kind` constant added before the runners' retry, hold, notification, and
+status predicates support it is contained to `NonRetryable` — the safe default —
+rather than passing through to predicates that fall through as unknown. To give
+a new kind distinct behavior, the implementer must extend `Normalize` to preserve
+it **and** update every runner's predicates in the same change; the per-runner
+four-kind classification tests (Validation step 6) are extended to cover the new
+kind in each runner so a predicate that does not handle it is caught. This is
+the "authority constants remain normalized to `NonRetryable` until consumers
+explicitly opt in" contract: `Normalize` is the authority for "this kind is
+supported," and a constant is only pass-through after the consumers that act on
+it have been updated. No enumeration assertion forces `Normalize(c) == c` for
+every authority constant — that would defeat the fallback by requiring
+pass-through the moment a constant is added, letting a partially rolled-out kind
+reach predicates that treat it as unknown (see Validation step 6).
 
-   Neither carrier can hold an unknown kind, so `Normalize` is a no-op for them.
-   They are nevertheless wrapped in `failureclass.Normalize` at the call site
-   (`kind: failureclass.Normalize(failure.kind)` and
-   `kind: failureclass.Normalize(blockedKind)`) rather than special-cased as
-   "safe carriers" in the gate. This keeps the gate's rule uniform — every
-   `loopError.kind` assignment whose value is not a known-kind constant and not a
-   `loopError.kind` copy must be `Normalize`-wrapped — so the gate does not
-   maintain an allowlist of carrier struct/function names whose "only known
-   kinds" property must be re-proven by hand when a producer changes. The wrap is
-   defensive too: if a future edit makes either carrier hold a dynamic kind,
-   `Normalize` catches it instead of letting an unknown kind reach
-   `isQueueRetryEligible`. Per the repo's "name the authority before enforcing
-   it" guideline, the authority for "this is a known kind" is `Normalize` itself,
-   not an inferred allowlist of producer names.
-
-3. **Statically safe shapes (no `Normalize` needed).** Every other
-   `loopError.kind` assignment is a named `FailureRetryable*` constant (a known
-   kind that needs no normalization — the accepted set is derived from the
-   `policy.Kind`/`failureclass.Kind` authority constants that `Normalize`
-   preserves, not enumerated in the gate, so a future fifth constant is accepted
-   automatically only when `Normalize` is extended to preserve it; a constant
-   `Normalize` does not preserve must be `Normalize`-wrapped rather than assigned
-   directly; see Validation step 8), or a
-   copy of an already-normalized kind —
-   a `loopError.kind` field read (`kind: failure.kind` where `failure` is a
-   `loopError` *local constructed in this function with a safe `kind``) or a
-   local that is itself only ever assigned from those two
-   shapes (e.g. `kind := FailureRetryableTransient; ...; kind: kind`). A
-   `loopError.kind` read off a `loopError` parameter or a `loopError` returned
-   from an untracked helper is *not* in this group: the receiver's `kind` is not
-   proven safe within this function, so it is a dynamic source that must be
-   `Normalize`-wrapped (see the receiver-origin rule in Validation step 8).
-   Taking the field's address (`&failure.kind`) is also *not* safe: the gate
-   forbids it because an address-taken `kind` can be mutated through the pointer
-   without an assignment the origin tracker visits (see the address-of rule in
-   Validation step 8).
-
-If an implementation replaces any dynamic-source or carrier call with a direct
-assignment (`kind: d.Kind` or `kind: failureclass.Classify(...)` without
-`Normalize`), the `Normalize` unit test, the four-kind runner tests, staticcheck,
-and the deleted-symbol search (Step 7) all still pass, while a future unknown
-kind no longer falls back to `non_retryable`.
-
-A line-regex check is not a sound gate for this: it only sees the text of the
-`kind:` line, so storing the dynamic value in a local first
-(`classified := failureclass.Classify(...)` then `kind: classified`) bypasses
-`Normalize` while matching no dynamic-source pattern on the `kind:` line. A
-regex that claims every bypass fails is claiming an invariant it cannot enforce.
-Validation step 8 therefore uses a type-aware check with intra-procedural
-origin tracking instead of a regex: for every `loopError.kind` assignment in the
-four runners it traces the value expression back to its origin within the same
-function and fails when a dynamic source (`failureclass.Classify(...)` or a
-`.Kind` field read off a non-`loopError` struct such as `Decision`) reaches
-`kind` without being wrapped in `failureclass.Normalize`. Selector ownership and
-call resolution are proven with `go/types`, not syntax alone: a `.kind` read is
-treated as a `loopError` copy only when `go/types` resolves its receiver type to
-`loopError` *and* the receiver's own origin is traced to a safe `loopError`
-construction within this function (a `loopError` parameter or a `loopError`
-returned from an untracked helper is not a safe copy — see the receiver-origin
-rule in Validation step 8), and a `failureclass.Normalize(...)` call is recognized only when
-`go/types` resolves it to the imported `failureclass` package's `Normalize`, so a
-shadowed `failureclass` identifier or an unrelated struct's lowercase `kind`
-field cannot pass as safe. A bare local like `kind: classified` is resolved to
-its assignments, so the indirect assignment is caught — the implementer must
-write `kind: failureclass.Normalize(classified)`. A bare identifier that is a
-function parameter (no local definition to trace) is **unsafe**: its value
-comes from an untrusted call-site argument the intra-procedural check cannot
-trace, so a helper returning `&loopError{kind: kind}` from a `Kind` parameter
-must wrap the parameter in `Normalize` rather than passing it through. A local
-is likewise **unsafe** unless a safe assignment is definite on every
-control-flow path reaching the use: a local with no reaching assignments is the
-degenerate case (every path reaches the use with the uninitialized zero-value
-`Kind`, an unknown kind), and a local assigned only on some paths (e.g.
-`var kind failureclass.Kind; if cond { kind = FailureRetryableTransient };
-... kind: kind`) leaves the zero value on the unassigned paths — the same hole
-the parameter rule closes — so the implementer must either assign the local on
-every path or wrap the use in `Normalize`. Known-constant references,
-`loopError.kind` copies whose receiver origin is safe, and locals whose every
-reaching path passes through one of those two safe shapes pass. The
-carrier reads from group 2
-(`validationFailure.kind`, `blockedKind`) are `Normalize`-wrapped per Step 2, so
-they pass the gate via the `Normalize`-call rule — the gate does not recognize
-the carrier producers by name, which is why they must be wrapped rather than
-allowlisted. This makes the gate match the invariant it claims.
+Add a focused test in `internal/loops/failureclass` asserting that the four
+known kinds pass through `Normalize` unchanged and that an unknown `Kind`
+normalizes to `NonRetryable`. The boundary normalization itself is covered by
+the four-kind per-runner classification tests and the per-runner alias-identity
+tests in Validation step 6, which assert each runner's persisted kind and retry
+decision for each known kind; no structural call-site gate is added.
 
 ### Step 3 — Audit the cross-package typed surface
 
@@ -859,6 +811,35 @@ advertised subset and field-to-bullet pairing are covered by the
   correctness dependent on the full suite running, against the repo's "prefer
   deletion over another layer" guideline; the compile-time alias deletes the
   second spelling entirely.
+- **Enforce the `Normalize` fallback with a producer-side structural gate.**
+  Considered, rejected. An earlier draft wrapped each dynamic `loopError.kind`
+  production site in `failureclass.Normalize` (seven dynamic-source sites plus
+  five known-safe carrier reads) and added a type-aware `go/parser`+`go/ast`+
+  `go/types` gate that parsed and type-checked each runner package, traced every
+  `loopError.kind` assignment to its intra-procedural origin, and failed when a
+  dynamic source reached `kind` unwrapped — plus a per-target `build.Context`
+  source importer to type-check the import graph under each release OS, and a
+  pass-through enumeration assertion forcing `Normalize(c) == c` for every
+  authority constant. The four runner paths already converge at their
+  queue-failure consumption boundaries before retry decisions and persistence
+  (with the fixer needing normalization immediately before its breaker's
+  manual-kind check), so applying `failureclass.Normalize` once at those
+  boundaries preserves the unknown-kind fallback for every producer — including
+  sources the structural analyzer cannot model — and deletes the twelve
+  call-site wraps, the entire structural gate, its source importer, and the
+  enumeration assertion. Boundary normalization makes the symptom the gate
+  existed to prevent impossible regardless of how the kind was produced, so the
+  gate is redundant; the producer-side gate is the validation layer the repo's
+  "prefer deletion over another layer" guideline requires a deletion-first
+  attempt before adding, and the deletion-first attempt (boundary normalization)
+  succeeds. The enumeration assertion was also rejected on its own: forcing
+  `Normalize(c) == c` for every authority constant would require pass-through the
+  moment a fifth constant is added, letting a partially rolled-out kind reach
+  predicates that fall through as unknown; `Normalize` instead defaults an
+  unrecognized kind to `NonRetryable` so a new constant is contained to the safe
+  default until consumers explicitly opt in (Step 2, Validation step 6). Recorded
+  here per the guideline that the deletion-first attempt be recorded even when
+  adopted.
 
 ## Trade-off (per design guidelines)
 
@@ -1051,10 +1032,10 @@ Infra signals remain for drift detection, not authority.
 ## Impact
 
 **Files changed (production):**
-- `internal/fixer/runner.go` — delete `QueueFailureKind` + delete `fixerFailureKind` + `s/QueueFailureKind/failureclass.Kind/` + call-site edits. The `AppendFixerCompletionInstruction` call at `runner.go:7307` is unchanged (the builder now derives the advertised values itself from the `policy` import, Step 6, so no `string(failureclass.*)` wiring is added at the call site).
-- `internal/reviewer/runner.go` — delete `QueueFailureKind` + delete `reviewerFailureKind` + `s/QueueFailureKind/failureclass.Kind/` + call-site edits.
-- `internal/worker/runner.go` — delete `QueueFailureKind` + delete `workerFailureKind` + `s/QueueFailureKind/failureclass.Kind/` + call-site edits.
-- `internal/planner/runner.go` — delete `QueueFailureKind` + delete `plannerFailureKind` + `s/QueueFailureKind/failureclass.Kind/` + call-site edits.
+- `internal/fixer/runner.go` — delete `QueueFailureKind` + delete `fixerFailureKind` + `s/QueueFailureKind/failureclass.Kind/` + call-site edits. The `AppendFixerCompletionInstruction` call at `runner.go:7307` is unchanged (the builder now derives the advertised values itself from the `policy` import, Step 6, so no `string(failureclass.*)` wiring is added at the call site). The call-site edits include normalizing `failure.kind` once at each failure-handling entry point (Step 2's boundary normalization), before the breaker's manual-kind check and any retry/persistence read.
+- `internal/reviewer/runner.go` — delete `QueueFailureKind` + delete `reviewerFailureKind` + `s/QueueFailureKind/failureclass.Kind/` + call-site edits, including Step 2's boundary normalization at each failure-handling entry point.
+- `internal/worker/runner.go` — delete `QueueFailureKind` + delete `workerFailureKind` + `s/QueueFailureKind/failureclass.Kind/` + call-site edits, including Step 2's boundary normalization at each failure-handling entry point.
+- `internal/planner/runner.go` — delete `QueueFailureKind` + delete `plannerFailureKind` + `s/QueueFailureKind/failureclass.Kind/` + call-site edits, including Step 2's boundary normalization at each failure-handling entry point.
 - `internal/runtime/scheduler.go` — `workerRunCompletedNotificationInput.FailureKind` becomes `failureclass.Kind` (the one `QueueFailureKind` reference here).
 - `internal/loops/failureclass/failureclass.go` — add `Normalize(kind Kind) Kind` (the authority for the unknown-kind fallback); add the `internal/loops/policy` import and alias `type Kind = policy.Kind` and re-export the four typed constants from `policy` at compile time (Step 5), deleting the second spelling rather than pinning it by test; `Classify` logic and public API unchanged.
 - `internal/loops/policy/policy.go` — add the two missing untyped `FailureKind*` string constants so the leaf owns all four string values; add `type Kind string` and the four typed `Kind` constants derived from the untyped ones (Step 5); no predicate changes (the untyped constants stay for the `string`-parameter functions).
@@ -1071,14 +1052,14 @@ Infra signals remain for drift detection, not authority.
   cast and assigns `kind: policy.FailureKind` directly, now that the field is
   `policy.Kind` (identical to `failureclass.Kind` via the Step 5 alias); the four
   `loopError{... kind: failure.kind}` sites that read `validationFailure.kind`
-  (`runner.go:1943,1958,2007,2038`) become `kind:
-  failureclass.Normalize(failure.kind)` per Step 2's carrier-source wrapping.
+  (`runner.go:1943,1958,2007,2038`) keep their direct assignment unchanged —
+  `validationFailure.kind` is bounded to the four known kinds by its producer,
+  and Step 2's boundary normalization covers it without a per-call-site wrap.
 - `internal/fixer/runner.go` (additional edit beyond the type rename) — the
   blocked-outcome `loopError{... kind: blockedKind}` site (`runner.go:3327`)
-  becomes `kind: failureclass.Normalize(blockedKind)` per Step 2's
-  carrier-source wrapping (`blockedKind` originates from the allowlisting
-  `fixerRepairTaskOutcome`, so `Normalize` is a no-op but keeps the gate
-  uniform).
+  keeps its direct assignment unchanged — `blockedKind` originates from the
+  allowlisting `fixerRepairTaskOutcome` (bounded to the four known kinds), and
+  Step 2's boundary normalization covers it without a per-call-site wrap.
 - `internal/fixer/failurepolicy/policy.go` — `ClassifyValidation` drops the
   `failureclass.Kind(policy.FailureKind)` cast and assigns
   `Kind: policy.FailureKind` directly, now that the field is `policy.Kind`
@@ -1208,9 +1189,10 @@ records are identical before and after. No migration, no schema touch.
      are the structured-agent outcome and allowlisting boundaries whose declared
      return type changes from `QueueFailureKind` to `failureclass.Kind`; their
      callers feed the returned kind into `loopError.kind` (the `blockedKind` flow
-     Step 2 group 2 covers), so they are part of the caller audit, not just
-     internal plumbing. (The four `xxxFailureKind` conversion functions also
-     return `QueueFailureKind`, but they are deleted in Step 2, not retyped.)
+     Step 2's boundary normalization covers), so they are part of the caller
+     audit, not just internal plumbing. (The four `xxxFailureKind` conversion
+     functions also return `QueueFailureKind`, but they are deleted in Step 2,
+     not retyped.)
    - **Test spelling:** `internal/fixer/runner_repair_outcome_test.go:24`
      (`wantKind QueueFailureKind`).
 
@@ -1282,39 +1264,50 @@ Per `AGENTS.md`, the root commands are the source of truth:
    coverage so that each of the four `failureclass.Kind` values is asserted by
    at least one role's classification test (including a new
    `internal/reviewer/failure_classification_test.go`), plus a test for
-   `failureclass.Normalize` covering the four known kinds and an unknown kind,
-   plus a pass-through enumeration assertion that enumerates every authority
-   `policy.Kind`/`failureclass.Kind` constant (via the same `go/types`
-   enumeration the step-8 gate uses, factored into a shared helper) and asserts
-   `Normalize(c) == c` for each, so adding a `policy.Kind` constant without
-   extending `Normalize` to preserve it fails the test. This assertion is the
-   authority the step-8 call-site safe set is derived from: the gate trusts
-   `Normalize`'s pass-through, and this test guarantees `Normalize` passes
-   through every authority constant.
+   `failureclass.Normalize` covering the four known kinds (each passes through
+   unchanged) and an unknown kind (normalizes to `NonRetryable`). No
+   pass-through enumeration assertion is added: an assertion that forced
+   `Normalize(c) == c` for every authority `policy.Kind`/`failureclass.Kind`
+   constant would defeat the unknown-kind fallback — the moment a fifth
+   constant is added the test would require `Normalize` to pass it through,
+   letting a partially rolled-out kind reach the runners' retry, hold,
+   notification, and status predicates (e.g. `isQueueRetryEligible`/
+   `shouldRetryQueueFailure`) that still fall through as unknown. `Normalize`
+   instead defaults an unrecognized kind to `NonRetryable`, so a new authority
+   constant is contained to the safe default until consumers explicitly opt in:
+   to give a new kind distinct behavior, the implementer extends `Normalize` to
+   preserve it **and** updates every runner's predicates in the same change,
+   extending these per-runner four-kind classification tests to cover the new
+   kind in each runner so a predicate that does not handle it is caught. This
+   is the "authority constants remain normalized to `NonRetryable` until
+   consumers explicitly opt in" contract (Step 2): `Normalize` is the authority
+   for "this kind is supported," and a constant is only pass-through after the
+   consumers that act on it have been updated — not the moment it is declared.
    This is the regression net the refactor relies on; it must exist before the
    conversion functions are deleted. Aggregate "each kind appears in at least
    one role" coverage is not sufficient on its own: the four per-runner
    re-export blocks (Step 1) are independent, so wiring one role's
    `FailureManualIntervention` to `failureclass.NonRetryable` still compiles,
-   passes the call-site gate (it is a known-kind constant), and satisfies the
-   aggregate coverage when another role tests the manual kind, while that
-   role's failures silently change behavior. The implementation therefore adds
-   a per-runner alias-identity test in each of the four runner packages
-   (`internal/{fixer,reviewer,worker,planner}`) that compares all four local
-   aliases — `FailureRetryableTransient`, `FailureRetryableAfterResume`,
-   `FailureNonRetryable`, and `FailureManualIntervention` — against their
-   shared `failureclass.*` constants
-   (`failureclass.RetryableTransient`, `RetryableAfterResume`, `NonRetryable`,
-   `ManualIntervention`) in every runner, so a swapped or mis-paired re-export
-   is caught in the role that contains it rather than only in aggregate. (The
-   alternative — removing the local aliases and having every call site spell
-   `failureclass.*` directly — was considered and rejected: the ~290 call sites
-   that spell the short names are unchanged by this refactor, and re-exporting
-   the constants is a compile-time alias that adds no persisted state or
-   runtime ledger, so the per-runner identity test is the smaller complete
-   check. A rename of a shared value still propagates at compile time; the
-   identity test guards only against a re-export that points at the wrong
-   constant, which the compiler cannot detect because all four share one type.)
+   passes the boundary normalization (it is a known-kind constant), and
+   satisfies the aggregate coverage when another role tests the manual kind,
+   while that role's failures silently change behavior. The implementation
+   therefore adds a per-runner alias-identity test in each of the four runner
+   packages (`internal/{fixer,reviewer,worker,planner}`) that compares all
+   four local aliases — `FailureRetryableTransient`,
+   `FailureRetryableAfterResume`, `FailureNonRetryable`, and
+   `FailureManualIntervention` — against their shared `failureclass.*`
+   constants (`failureclass.RetryableTransient`, `RetryableAfterResume`,
+   `NonRetryable`, `ManualIntervention`) in every runner, so a swapped or
+   mis-paired re-export is caught in the role that contains it rather than only
+   in aggregate. (The alternative — removing the local aliases and having every
+   call site spell `failureclass.*` directly — was considered and rejected: the
+   ~290 call sites that spell the short names are unchanged by this refactor,
+   and re-exporting the constants is a compile-time alias that adds no
+   persisted state or runtime ledger, so the per-runner identity test is the
+   smaller complete check. A rename of a shared value still propagates at
+   compile time; the identity test guards only against a re-export that points
+   at the wrong constant, which the compiler cannot detect because all four
+   share one type.)
 7. **Deleted-symbol absence check.** `go build ./...` can pass even if a stale
    alias or conversion function remains, so the definition of done is verified
    by an explicit repository search that fails when `QueueFailureKind` or any of
@@ -1334,340 +1327,27 @@ Per `AGENTS.md`, the root commands are the source of truth:
      exit 1
    fi
    ```
-8. **Normalize call-site type-aware check (Step 2).** The `Normalize` unit test
-   and the four-kind runner tests do not prove the former `xxxFailureKind` call
-   sites (and the known-safe carrier reads — see Step 2's group 2) actually
-   invoke `failureclass.Normalize` — a direct `kind: d.Kind` or
-   `kind: failureclass.Classify(...)` assignment bypasses the fallback but
-   still passes those tests, staticcheck, and the deleted-symbol search (step 7).
-   A line-regex gate is not sound here: it only inspects the text of the `kind:`
-   line, so an indirect assignment that first stores the dynamic value in a local
-   (`classified := failureclass.Classify(...)` then `kind: classified`) bypasses
-   `Normalize` while matching no dynamic-source pattern on the `kind:` line. The
-   gate must therefore see through locals, which a regex cannot.
-
-   The check is a Go test, not a shell regex, using the stdlib `go/parser` +
-   `go/ast` + `go/types` (the same parser-based pattern the repo already uses
-   for structural contract tests such as
-   `internal/runtime/runs_service_absent_test.go`, extended with `go/types`
-   because this gate makes claims parser-only analysis cannot prove; no
-   `golang.org/x/tools` dependency is added — `go/types` is standard library).
-   It parses and type-checks each of the four runner packages
-   (`internal/{fixer,reviewer,worker,planner}`), locates every `loopError`
-   composite literal `kind` element (and every assignment to a `loopError`
-   value's `.kind` field), and classifies the value expression by
-   intra-procedural origin tracking within the enclosing function. A compound
-   assignment (`+=`, `-=`, `*=`, `|=`, `&=`, `^=`, `<<=`, `>>=`, etc.) whose
-   left-hand side is a `.kind` field `go/types` resolves to `loopError` is
-   rejected outright as **unsafe** before its right-hand side is ever
-   classified. `Kind` has a string underlying type, so
-   `failure.kind += FailureRetryableTransient` type-checks and its right-hand
-   side resolves to a preserved constant the origin tracker would classify
-   safe, yet the stored value becomes a concatenated, un-normalized kind
-   (`"retryable_transientretryable_transient"`) that bypasses `Normalize`
-   exactly as an untracked dynamic source would; classifying only the
-   assigned value models the operation as a plain `=` and misses this, so the
-   gate treats the compound operator itself as the violation regardless of the
-   right-hand side's origin. The implementer must rewrite the compound write
-   as an explicit `failureclass.Normalize(...)` call (e.g.
-   `failure.kind = failureclass.Normalize(failure.kind + FailureRetryableTransient)`,
-   which routes the concatenated value through the fallback) so the result
-   passes through `Normalize` rather than being assembled in place. It also
-   flags any `&<receiver>.kind` unary address-of expression whose selector
-   receiver `go/types` resolves to `loopError` as **unsafe** — forbidding taking
-   the field's address — because an address-taken `kind` field can be mutated
-   through the pointer (`dst := &failure.kind; *dst = decision.Kind`) without
-   producing an assignment whose left side is `.kind` or a dynamic
-   composite-literal element for the origin tracker to visit, so the pointer
-   alias would otherwise bypass `Normalize` while the gate claims every
-   assignment is covered. There is no legitimate production reason to take the
-   address of `loopError.kind` (it is a value field read by value, never passed
-   to a mutator), so the gate fails closed on the address-of expression itself
-   rather than attempting to track pointer aliases and indirect stores through
-   them, which is inter-procedural and out of scope for the same reason the
-   parameter rule is conservative. (A `*<ptr>` store whose pointer does not
-   originate from `&<loopError>.kind` within this function is not reachable
-   today — the audit found no `&failure.kind` or `&loopError`-kind address-of
-   use — so the address-of rule is a regression net against a future
-   pointer-mutation construction, the same stance the zero-valued-construction
-   rule below takes.) A `loopError` composite literal that **omits** the `kind`
-   element, a `new(loopError)` call, or a `var <name> loopError` declaration produces a
-   zero-valued `loopError` whose `kind` is the empty-string default — an
-   unknown kind that bypasses `Normalize` exactly as the uninitialized `Kind`
-   local below rejects — so the gate treats each of those constructions as
-   **unsafe** as well: it flags any `loopError` composite literal whose element
-   list has no `kind` key, any `new(loopError)` expression, and any
-   `var <name> loopError` (or `var <name> loopError = <zero-value>`) declaration
-   whose declared local is later returned, assigned to a `loopError` value's
-   `.kind`, or otherwise flows to a `*loopError`/`loopError` use, because none
-   of them supplies a `kind` for the origin tracker to classify. (A zero-valued
-   local that is never used is not flagged — the gate enforces the invariant on
-   `loopError` values that reach a return or a `.kind` copy, not on dead
-   declarations.) File
-   selection is build-aware before parsing, and the gate runs once per supported
-   production build context rather than once for the host OS. The worker package
-   contains mutually-exclusive build-constrained files
-   (`internal/worker/specfile_unix.go` with `//go:build darwin || linux` and
-   `specfile_other.go` with `//go:build !darwin && !linux`) that both declare
-   `openSpecFileBeneath`; loading the directory's full file set with `go/parser`
-   would include both, and `go/types` would report a duplicate declaration before
-   this invariant is ever checked. The release workflow
-   (`.github/workflows/release.yml`) ships `darwin/arm64` and `linux/amd64`
-   artifacts, while CI's verify job runs only on `ubuntu-latest`, so selecting
-   files with `build.Default` would type-check only the Linux context and leave a
-   Darwin-only runner file invisible — a future `//go:build darwin` runner that
-   assigns an unnormalized dynamic value to `loopError.kind` would remain
-   invisible to the test, compile successfully in the release build, and ship
-   despite the claimed invariant. The test therefore iterates over the supported
-   `GOOS`/`GOARCH` pairs (`linux/amd64` and `darwin/arm64` — the release
-   matrix), and for each constructs a `build.Context` copied from
-   `build.Default` with `GOOS`/`GOARCH` overridden, selects files with that
-   context's `MatchFile` (excluding `_test.go` files as below), and runs the
-   full type-check and origin analysis under that context. A build-constrained
-   file active only under one OS is type-checked under that OS even when the test
-   runs on Linux, so only the one file active under each context's build
-   constraints is parsed and type-checked, matching what `go build` actually
-   compiles for that target.
-   `MatchFile` alone is not sufficient: it applies filename and build-constraint
-   matching but still returns `true` for `_test.go` files, so it does not match
-   `go build`, which compiles only production sources. Type-checking the
-   packages' `runner_test.go` files would enforce the production
-   `loopError.kind` invariant on test-only literals — a test that deliberately
-   constructs an unknown kind (e.g. a sentinel `failureclass.Kind` value) could
-   then fail this structural gate even though it cannot affect production. The
-   test therefore excludes `_test.go` files explicitly (skipping any
-   `MatchFile`-matched file whose base name ends in `_test.go`), so the gate
-   type-checks exactly the production file set `go build` compiles. Imports
-   are resolved by a source importer built per target `build.Context`, not by
-   the default importer: the importer resolves each imported package through
-   the same context's `build.Context.Import` (with the overridden
-   `GOOS`/`GOARCH`), so the entire import graph — not just the runner files
-   selected by `MatchFile` — is loaded under the target build context. Passing
-   the copied context only to `MatchFile` would select the runner's own
-   build-constrained files for Darwin while the importer still resolved every
-   imported package against `build.Default`, so a Linux-hosted Darwin pass
-   would import the worker's `internal/processcontainment` dependency as
-   `group_live_linux.go` instead of `group_live_other.go` and the claimed
-   full-Darwin type-check could miss or spuriously reject target-specific
-   APIs. Resolving imports through the target context closes that: the
-   importer's package lookup honors the same build constraints as `MatchFile`,
-   so a build-constrained file active only under the target OS is the one
-   type-checked transitively, matching what `go build` compiles for that
-   target across the whole import graph. (The stdlib
-   `go/importer.ForCompiler(fset, "source", nil)` importer uses `build.Default`
-   and cannot be parameterized with a custom context, so the gate provides a
-   small `types.Importer` implementation that calls `build.Context.Import` on
-   the per-target context, parses the returned `GoFiles` (excluding
-   `*_test.go`), and type-checks each imported package with a nested
-   `types.Config` reusing the same importer — no `golang.org/x/tools`
-   dependency is added, consistent with the stdlib-only stance above.)
-   Selector
-   ownership and call targets are resolved from `go/types` info, not from
-   selector spelling: a `.kind` read is treated as a `loopError` copy only when
-   `go/types` resolves its receiver type to `loopError`, and a
-   `failureclass.Normalize(...)` / `failureclass.Classify(...)` call is
-   recognized only when `go/types` resolves it to the imported `failureclass`
-   package's function, so a shadowed `failureclass` identifier or an unrelated
-   struct's lowercase `kind` field cannot pass as safe:
-
-   - A call resolved by `go/types` to `failureclass.Normalize(...)` — **safe**
-     (normalized).
-   - A reference to a known-kind constant — **safe** (a known kind). The set of
-     accepted constants is **derived from the values `Normalize` actually
-     preserves, not enumerated in the gate**: the test uses `go/types` to
-     enumerate every `const` declaration whose type is `policy.Kind` (the
-     authority after Step 5) in the imported `internal/loops/policy` package and
-     every `const` declaration whose type is `failureclass.Kind` (the
-     `type Kind = policy.Kind` alias) in the imported
-     `internal/loops/failureclass` package, plus the per-role
-     `FailureRetryable*` / `FailureNonRetryable` / `FailureManualIntervention`
-     re-exports by resolving each to the `failureclass.*` / `policy.*` constant
-     it aliases. The test then imports `failureclass` and calls
-     `failureclass.Normalize` on each enumerated authority constant, keeping
-     only those for which `Normalize(c) == c` (pass-through). A reference is safe
-     when `go/types` resolves it to one of those **preserved** authority
-     constants (directly or through a re-export alias). Anchoring the safe set
-     to `Normalize`'s pass-through — rather than to every `policy.Kind`
-     constant — closes the hole a future fifth constant opens: adding
-     `Experimental Kind = "experimental"` and assigning it directly to
-     `loopError.kind` would pass a gate that accepts every authority constant,
-     even when `Normalize` still maps `Experimental` to `NonRetryable`, so the
-     direct assignment bypasses the fallback the gate exists to enforce. Under
-     this rule `kind: Experimental` is **unsafe** unless `Normalize` is extended
-     to preserve it (then it joins the derived safe set automatically) or the
-     assignment is wrapped in `failureclass.Normalize(Experimental)`. The gate
-     never spells the four current names; today the preserved set is
-     `failureclass.RetryableTransient` / `RetryableAfterResume` / `NonRetryable`
-     / `ManualIntervention` (and the per-role re-exports of them), and when a
-     fifth `policy.Kind` constant is added **and `failureclass.Normalize` is
-     extended to preserve it**, a safe direct assignment such as
-     `kind: FailureNewKind` is accepted automatically because the new constant
-     is already in the derived set — the gate does not recreate a manually
-     synchronized failure-kind ledger inside itself. The authority for "this
-     constant is a known kind" is `Normalize` itself (per the repo's "name the
-     authority before enforcing it" guideline), so the safe set is exactly the
-     set `Normalize` preserves and there is no gap between the call-site gate
-     and the fallback authority. The complementary guarantee — that
-     `Normalize` *does* preserve every authority constant, so adding a
-     `policy.Kind` constant without extending `Normalize` is caught — is owned
-     by the `Normalize` enumeration assertion in step 6, not by this branch.
-   - A `.kind` selector read whose receiver `go/types` resolves to `loopError`
-     (`kind: failure.kind`) — **safe only when the receiver's own origin is
-     safe**. Resolving the receiver's *type* to `loopError` is necessary but not
-     sufficient: a `loopError` parameter or a `loopError` returned from an
-     untracked helper can carry an empty or unknown `kind`, so accepting every
-     `loopError`-typed selector read as a copy of an already-normalized kind
-     opens the same untracked-source hole the parameter rule below closes. The
-     receiver identifier is therefore resolved to its origin within the
-     enclosing function by the same rule applied to bare identifiers: if the
-     receiver is a **local variable**, resolve it to every reaching assignment
-     and classify each right-hand side, and require a safe assignment to the
-     receiver to be definite on every control-flow path reaching the use (the
-     same every-path rule the bare-local branch below enforces) — **safe** only
-     if every path reaching the use passes through a `loopError` composite
-     literal whose `kind` element is safe (recursively), so a
-     locally-constructed `loopError` whose `kind` was normalized copies a safe
-     kind; **unsafe** if any reaching path leaves the receiver at its zero value
-     (e.g. a `var failure loopError` assigned only inside an `if`, so the false
-     branch reaches the use with the empty-string default `kind`), or if any
-     reaching assignment is a function parameter, a call `go/types` does not
-     resolve to a known-safe producer, or any other untracked source. If the receiver is a **function
-     parameter** (a `loopError` declared in the enclosing signature with no
-     intra-procedural assignment) — **unsafe**: its `kind` originates from an
-     untrusted call-site argument the intra-procedural check cannot trace, so a
-     helper receiving a `loopError` parameter and returning
-     `&loopError{kind: input.kind}` cannot pass the selector read as safe; the
-     implementer must wrap the read in `failureclass.Normalize(input.kind)`.
-     (Tracing every call-site argument is inter-procedural and out of scope; the
-     conservative choice is unsafe-by-default, the same stance the parameter
-     rule below takes for a bare `Kind` parameter.) This keeps the
-     `loopError.kind` copy rule consistent with the unsafe-parameter rule rather
-     than contradicting it: the copy is safe only when the copy's source is
-     proven safe within this function, not merely because the source is typed
-     `loopError`.
-   - A bare identifier that is a **local variable** — resolve it to every
-     assignment to that name within the same function and classify each
-     right-hand side recursively; **safe** only if a safe assignment to the
-     local is definite on every control-flow path reaching the use (the gate
-     builds the function's control-flow graph from the `go/ast`/`go/types`
-     statement tree and, for the use site, computes which paths reach it),
-     **unsafe** if any reaching path has no assignment to the local on it. The
-     earlier "at least one reaching assignment and every reaching assignment is
-     safe" rule rejected only an empty assignment set, not an execution path
-     with no assignment: for `var kind failureclass.Kind; if condition { kind =
-     FailureRetryableTransient }; return &loopError{kind: kind}`, that rule saw
-     one reaching assignment, classified it as safe, and accepted the use, yet
-     when `condition` is false the path reaches the return with the zero-value
-     `Kind` (the empty-string default — an unknown kind) and bypasses
-     `Normalize`. The every-path rule closes that hole: the local is safe only
-     when every path reaching the use passes through a safe assignment, so a
-     local assigned only inside an `if` (or any conditional branch) is
-     **unsafe** unless the implementer assigns it on every path or wraps the use
-     in `failureclass.Normalize(kind)`. A local with no reaching assignments at
-     all is the degenerate case (every reaching path has no assignment) and is
-     **unsafe** for the same reason — the same hole the parameter rule below
-     closes. A local is also **unsafe** if any reaching assignment is a dynamic
-     source not wrapped in `Normalize`.
-   - A bare identifier that is a **function parameter** (a name declared in the
-     enclosing function's signature with no intra-procedural assignment) —
-     **unsafe**. A parameter has no local definition to trace, so the
-     "every reaching assignment is safe" rule would accept it vacuously (an
-     empty set of assignments is trivially all-safe), letting a helper such as
-     one returning `&loopError{kind: kind}` from a `Kind` parameter bypass
-     `Normalize` while this gate claims every indirect bypass fails. The
-     parameter's value originates from an untrusted call-site argument the
-     intra-procedural check cannot trace, so it is treated like any other
-     untracked source: the implementer must wrap it in
-     `failureclass.Normalize(kind)` at the assignment site. (Tracing and proving
-     every call-site argument is inter-procedural and out of scope for this
-     gate; the conservative choice is unsafe-by-default.)
-   - A dynamic source — a call resolved by `go/types` to
-     `failureclass.Classify(...)`, or a `.Kind` selector read whose receiver
-     `go/types` resolves to a non-`loopError` struct (e.g. `Decision.Kind`,
-     `failure.Kind` on a `validationFailure`) — **unsafe** unless it is the
-     argument of a call resolved to `failureclass.Normalize(...)`. This is the
-     rule the Step 2 carrier reads satisfy: `kind: failure.kind` where `failure`
-     is a `validationFailure` is a `.kind` read on a non-`loopError` struct, so
-     it is dynamic and **unsafe** unless wrapped — which is why Step 2 wraps it
-     in `failureclass.Normalize(failure.kind)` rather than allowlisting
-     `validationFailure` as a "safe carrier". Likewise `kind: blockedKind`
-     resolves `blockedKind` to its assignment from `fixerRepairTaskOutcome(...)`,
-     a call `go/types` does not resolve to `failureclass.Normalize` or
-     `failureclass.Classify`, so it falls through to the next branch.
-   - Any other expression — **unsafe** (conservative: an untracked source could
-     carry a future unknown kind past the fallback). This is the branch
-     `blockedKind` (traced to `fixerRepairTaskOutcome(...)`) reaches, which is
-     why Step 2 wraps it in `failureclass.Normalize(blockedKind)` too.
-   - A `loopError` construction that supplies **no `kind` at all** — a composite
-     literal whose element list omits `kind` (e.g. `&loopError{message: msg}`),
-     a `new(loopError)` call, or a `var <name> loopError` zero-value declaration
-     whose local flows to a return, a `.kind` copy, or any other
-     `*loopError`/`loopError` use — **unsafe**. These never produce a `kind`
-     element or `.kind` assignment for the origin tracker to classify, so the
-     rules above would not visit them at all and the construction would pass
-     silently with the empty-string default. That is the same hole the
-     uninitialized `Kind` local rule closes: a `var kind failureclass.Kind`
-     never written is unsafe because its zero value is an unknown kind, and a
-     `loopError` built with no `kind` element carries that same zero value with
-     no assignment to flag. The gate therefore flags the construction itself,
-     not a `kind` expression inside it, so the implementer must add an explicit
-     `kind:` element (a known-kind constant or a `Normalize`-wrapped dynamic
-     source) rather than rely on the zero default. A zero-valued local that is
-     never used is not flagged, matching the dead-declaration carve-out above.
-
-   The test fails on the first **unsafe** `kind` assignment (or zero-valued
-   `loopError` construction, or address-of `loopError.kind` expression),
-   reporting the file and position. This closes the
-   indirect-assignment hole: `kind: classified`
-   resolves `classified` back to `failureclass.Classify(...)` and fails, so the
-   implementer must write `kind: failureclass.Normalize(classified)`. The
-   existing safe shapes keep passing — `kind: FailureRetryableTransient`,
-   `kind: failure.kind` (where `failure` is a `loopError` *local* constructed in
-   this function with a safe `kind`), and `kind: kind`
-   where `kind` is a local only ever assigned from `FailureRetryable*` constants
-   all resolve to a safe origin; a `kind` that is a function parameter is
-   **unsafe** unless wrapped, because its origin is an untraceable call-site
-   argument, and likewise a `kind` local that is never assigned (an
-   uninitialized zero-value `Kind`) is **unsafe** unless wrapped, because its
-   empty-string default is an unknown kind the reaching-assignment rule would
-   otherwise accept vacuously, and likewise a `.kind` read off a `loopError`
-   parameter or a `loopError` returned from an untracked helper is **unsafe**
-   unless wrapped, because the receiver's `kind` is not proven safe within this
-   function, and likewise a `loopError` built with no `kind` element (or via
-   `new(loopError)`/`var <name> loopError`) is **unsafe** because its zero-value
-   `kind` is an unknown kind with no assignment for the origin tracker to visit,
-   and likewise `&<loopError>.kind` is **unsafe** because the address-taken field
-   can be mutated through the pointer without an assignment the origin tracker
-   visits.
-   The carrier reads pass because Step 2 wraps them in
-   `Normalize`, not because the gate recognizes their producers. The
-   dynamic-vs-copy distinction is no longer made by selector name: `go/types`
-   resolves the receiver, so a `.Kind` read on `Decision`/validation structs is
-   dynamic and a `.kind` read on a `loopError` is a copy, regardless of spelling
-   — a struct that happened to spell its field the other way could not fool the
-   gate. A `loopError`-typed copy is safe only after the receiver's origin is
-   traced, so a `loopError` parameter or untracked-helper result cannot pass as
-   a safe copy the way a locally-constructed `loopError` can.
-
-   This is covering, not propping up: it is the first enforcement of the
-   `Normalize` fallback invariant the refactor relies on, and it replaces a
-   regex that claimed to enforce that invariant but could not. The production
-   surface it guards does not grow — the seven dynamic-source call sites and the
-   five known-safe carrier reads already route through `Normalize` after Step 2,
-   and every existing `loopError` composite literal already supplies an explicit
-   `kind:` element (there are no `new(loopError)`, `var <name> loopError`,
-   `kind`-omitting literals, or `&<loopError>.kind` address-of expressions in
-   production today) — so the zero-valued construction and address-of rules
-   flag nothing on the current branch and are a regression
-   net against a future construction that would otherwise bypass the fallback
-   silently. The test is a regression net, not a new state machine.
-
-   (Step 5's reverse-dependency derivation — `failureclass` importing `policy`
-   and aliasing `type Kind = policy.Kind` and re-exporting the typed constants —
-   needs no separate validation step: it is a compile-time alias and constant
-   re-export, so a rename in `policy` that `failureclass` does not follow is a
-   `go build` failure covered by step 1. No policy or validation drift test is
-   added or needed.)
+8. **No structural call-site gate (deleted in favor of boundary normalization).**
+   The earlier draft specified a type-aware `go/parser`+`go/ast`+`go/types`
+   call-site gate that parsed and type-checked each runner package, traced every
+   `loopError.kind` assignment to its intra-procedural origin, and failed when a
+   dynamic source reached `kind` without being wrapped in `failureclass.Normalize`.
+   Step 2 replaces that gate with a single `failureclass.Normalize` call at each
+   runner's queue-failure consumption boundary, before any retry, breaker, or
+   persistence read. Boundary normalization makes the symptom the gate existed to
+   prevent — an unnormalized kind reaching a decision — impossible regardless of
+   how the kind was produced, so the gate is redundant and is not implemented; the
+   twelve call-site `Normalize` wraps the gate enforced are deleted with it. This
+   also deletes the gate's per-target `build.Context` source importer, which
+   resolved the import graph through `build.Context.Import` and parsed only the
+   returned `GoFiles`: with no gate there is no source importer, so the gap that
+   importer opened — omitting active `CgoFiles` from packages such as
+   `github.com/mattn/go-sqlite3` (reached through `internal/storage`), which
+   `build.Context.Import` separates from `GoFiles` when cgo is enabled — is moot.
+   No `go/types`, `go/ast`, or `go/build`-based structural test is added; the
+   `Normalize` fallback invariant is enforced at the boundary (Step 2) and covered
+   by the `Normalize` unit test and the four-kind per-runner classification tests
+   (step 6), not by modeling the producers.
 9. **Fixer-prompt builder coverage (Step 6).**
    `internal/agent/prompt_test.go` is rewritten to import
    `internal/loops/policy` (the same stdlib-only leaf the production builder
@@ -1727,40 +1407,23 @@ prompt's advertised `failure_kind` tokens are derived from
 `internal/loops/policy` leaf, not `failureclass`, so no `FixerCompletionKinds`
 carrier, fixer call-site wiring, or cross-component synchronization test is
 added), the
-deleted-symbol absence check (step 7) passes, the
-Normalize call-site type-aware check (step 8) passes — so every former
-`xxxFailureKind` call site routes its dynamic `failureclass.Kind` through
-`failureclass.Normalize`, and the known-safe carrier reads
-(`validationFailure.kind`, `blockedKind` from `fixerRepairTaskOutcome`) are
-`Normalize`-wrapped too so the gate stays uniform (no carrier-name allowlist),
-and a bypass fails the suite whether the dynamic
-value is assigned inline or stored in a local first (the type-aware check
-derives the safe-constant set from the authority constants `Normalize` actually
-preserves (`Normalize(c) == c`), so a constant `Normalize` does not preserve is
-unsafe at the call site unless wrapped, traces locals to their origin and
-requires a safe assignment to be definite on every control-flow path reaching
-the use so an uninitialized or only-conditionally-assigned zero-value `Kind`
-cannot pass (a local with no reaching assignments is the degenerate case),
-flags a `loopError` composite literal that omits `kind` (or a `new(loopError)`/
-`var <name> loopError` zero-value construction that flows to a use) as unsafe
-so an empty-string default kind cannot bypass `Normalize` the same way, traces
-`loopError.kind` selector reads back to their receiver's origin so a
-`loopError` parameter or untracked-helper result is not accepted as a safe
-copy, rejects any compound assignment (`+=`, `|=`, etc.) to a `loopError`
-`.kind` field outright so a concatenated kind cannot be assembled in place
-without `Normalize` regardless of the right-hand side's origin, and resolves
-selector ownership and call targets via `go/types`, and runs the full
-type-check once per supported production build context
-(`linux/amd64` and `darwin/arm64` — the release matrix), selecting files with
-`go/build.Context.MatchFile` per context (excluding `_test.go` files so the
-gate type-checks only the production sources `go build` compiles for that
-target) and resolving the entire import graph through a source importer built
-per target `build.Context` (via that context's `build.Context.Import`, not
-`build.Default`) so mutually-exclusive build-constrained files like the
-worker's `specfile_unix.go`/`specfile_other.go` are not both type-checked and
-a Darwin-only runner file — and a build-constrained file in an imported
-package such as `internal/processcontainment`'s `group_live_linux.go` vs
-`group_live_other.go` — is checked under Darwin even when CI runs on Linux) —
+deleted-symbol absence check (step 7) passes, each runner normalizes
+`failure.kind` once at its queue-failure consumption boundary via
+`failureclass.Normalize` before any retry, breaker, or persistence read (Step 2)
+— so every `loopError.kind` value that reaches a retry decision, the fixer
+breaker's manual-kind check, a resume-policy derivation, or queue/checkpoint
+persistence is normalized, regardless of how the kind was produced, and the
+unknown-kind → `non_retryable` fallback holds for every producer including
+sources a structural analyzer cannot model; no structural call-site gate is
+added (step 8 records why the earlier draft's `go/types` gate is deleted in
+favor of boundary normalization, and no `go/types`/`go/ast`/`go/build`-based
+test or per-target source importer is implemented), the known-safe carrier
+reads (`validationFailure.kind`, `blockedKind` from `fixerRepairTaskOutcome`)
+keep their direct assignments because the boundary normalizes them without a
+per-call-site wrap, and `Normalize` defaults an unrecognized kind to
+`NonRetryable` so a new `policy.Kind` constant is contained to the safe default
+until consumers explicitly opt in (no enumeration assertion forces
+`Normalize(c) == c` for every authority constant) —
 the
 four-kind regression coverage above exists, the fixer-prompt builder coverage
 test (step 9) exists — exercising `AppendFixerCompletionInstruction` for
