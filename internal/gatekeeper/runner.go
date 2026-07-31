@@ -56,6 +56,7 @@ const (
 	ReasonCheckCancelled           ReasonCode = "required_check_cancelled"
 	ReasonReviewRequired           ReasonCode = "required_review_missing"
 	ReasonReviewChangesRequested   ReasonCode = "review_changes_requested"
+	ReasonCodexReviewMissing       ReasonCode = "codex_review_missing"
 	ReasonUnresolvedReviewThread   ReasonCode = "unresolved_review_thread"
 	ReasonProjectPolicyDenied      ReasonCode = "project_policy_denied"
 	ReasonHold                     ReasonCode = "hold"
@@ -76,35 +77,32 @@ type CheckEvidence struct {
 	Conclusion string `json:"conclusion,omitempty"`
 }
 
-// DiffBudgetEvidence records the provider-observed change size and the
-// configured bounds that were applied. See config.GatekeeperDiffBudget for the
-// gate's semantics and the blind spots it does not catch (no additions or
-// per-file bound, generated files not excluded, whole-PR totals against the
-// current merge base, and the merge action binding only the head — see
-// MergePullRequest — so a base advance between the final revalidation read and
-// the merge is not atomically refused).
-type DiffBudgetEvidence struct {
-	ChangedFiles    int `json:"changedFiles"`
-	Deletions       int `json:"deletions"`
-	MaxChangedFiles int `json:"maxChangedFiles"`
-	MaxDeletions    int `json:"maxDeletions"`
+// CodexReviewEvidence is the durable Reviewer review signal considered by the
+// current-head gate. The event log is the authority because Reviewer appends
+// it only after its structured review marker has been verified.
+type CodexReviewEvidence struct {
+	RequiredHeadSHA  string `json:"requiredHeadSha"`
+	ReviewedHeadSHA  string `json:"reviewedHeadSha,omitempty"`
+	Event            string `json:"event,omitempty"`
+	RecordedAt       string `json:"recordedAt,omitempty"`
+	CurrentHeadValid bool   `json:"currentHeadValid"`
 }
 
 type Evidence struct {
-	PullRequestState             string              `json:"pullRequestState,omitempty"`
-	Draft                        bool                `json:"draft"`
-	BaseRefName                  string              `json:"baseRefName,omitempty"`
-	Mergeable                    *bool               `json:"mergeable,omitempty"`
-	MergeableState               string              `json:"mergeableState,omitempty"`
-	RequiredChecks               []string            `json:"requiredChecks"`
-	Checks                       []CheckEvidence     `json:"checks"`
-	RequiredApprovingReviewCount int                 `json:"requiredApprovingReviewCount"`
-	ReviewDecision               string              `json:"reviewDecision,omitempty"`
-	UnresolvedReviewThreadIDs    []string            `json:"unresolvedReviewThreadIds"`
-	HoldLabels                   []string            `json:"holdLabels"`
-	DiffBudget                   *DiffBudgetEvidence `json:"diffBudget,omitempty"`
-	ProjectPolicyPermitsTarget   bool                `json:"projectPolicyPermitsTarget"`
-	FinalObservedHeadSHA         string              `json:"finalObservedHeadSha,omitempty"`
+	PullRequestState             string               `json:"pullRequestState,omitempty"`
+	Draft                        bool                 `json:"draft"`
+	BaseRefName                  string               `json:"baseRefName,omitempty"`
+	Mergeable                    *bool                `json:"mergeable,omitempty"`
+	MergeableState               string               `json:"mergeableState,omitempty"`
+	RequiredChecks               []string             `json:"requiredChecks"`
+	Checks                       []CheckEvidence      `json:"checks"`
+	RequiredApprovingReviewCount int                  `json:"requiredApprovingReviewCount"`
+	ReviewDecision               string               `json:"reviewDecision,omitempty"`
+	CodexReview                  *CodexReviewEvidence `json:"codexReview,omitempty"`
+	UnresolvedReviewThreadIDs    []string             `json:"unresolvedReviewThreadIds"`
+	HoldLabels                   []string             `json:"holdLabels"`
+	ProjectPolicyPermitsTarget   bool                 `json:"projectPolicyPermitsTarget"`
+	FinalObservedHeadSHA         string               `json:"finalObservedHeadSha,omitempty"`
 }
 
 type Report struct {
@@ -340,6 +338,14 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 	}
 	if detail.Number != input.PRNumber || report.ObservedHeadSHA == "" || report.Evidence.BaseRefName == "" {
 		return r.persistProviderBlock(ctx, report, ReasonProviderStateAmbiguous, "pull_request")
+	}
+	codexReview, err := latestCodexReviewForHead(ctx, r.repos, input.ProjectID, input.Repo, input.PRNumber, report.ObservedHeadSHA)
+	if err != nil {
+		return r.persistProviderBlock(ctx, report, ReasonProviderStateUnavailable, "codex_review")
+	}
+	report.Evidence.CodexReview = &codexReview
+	if !codexReview.CurrentHeadValid {
+		report.Reasons = append(report.Reasons, Reason{Code: ReasonCodexReviewMissing, Subject: codexReviewReasonSubject(codexReview)})
 	}
 
 	if report.Evidence.PullRequestState != "OPEN" {

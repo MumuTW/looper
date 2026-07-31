@@ -77,6 +77,15 @@ var checkReasonCodes = map[ReasonCode]struct{}{
 	ReasonCheckPending: {},
 }
 
+func reportAwaitsCurrentHeadReview(report Report) bool {
+	for _, reason := range report.Reasons {
+		if reason.Code == ReasonCodexReviewMissing {
+			return true
+		}
+	}
+	return false
+}
+
 func reportAwaitsCheckState(report Report) bool {
 	for _, reason := range report.Reasons {
 		if _, ok := checkReasonCodes[reason.Code]; ok {
@@ -132,6 +141,9 @@ func skipUnchanged(previous Report, hasPrevious bool, fingerprint string, now ti
 		return Report{}, false
 	}
 	if reportAwaitsCheckState(previous) {
+		return Report{}, false
+	}
+	if reportAwaitsCurrentHeadReview(previous) {
 		return Report{}, false
 	}
 	evaluatedAt, err := time.Parse(time.RFC3339Nano, previous.EvaluatedAt)
