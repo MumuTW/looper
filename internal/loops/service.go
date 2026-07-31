@@ -3,6 +3,7 @@ package loops
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -17,6 +18,10 @@ type Service struct {
 	Repos *storage.Repositories
 	Now   func() time.Time
 }
+
+// ErrLoopNotFound lets transport adapters map a missing durable loop without
+// parsing an error string emitted by the lifecycle service.
+var ErrLoopNotFound = errors.New("loop not found")
 
 type CreateInput struct {
 	ProjectID    string
@@ -209,7 +214,7 @@ func (s *Service) Pause(ctx context.Context, loopID string, reason *string) (Pau
 			return PauseResult{}, err
 		}
 		if loop == nil {
-			return PauseResult{}, fmt.Errorf("loop not found: %s", loopID)
+			return PauseResult{}, fmt.Errorf("%w: %s", ErrLoopNotFound, loopID)
 		}
 		currentStatus := domain.LoopStatus(loop.Status)
 		if currentStatus != domain.LoopStatusPaused {
