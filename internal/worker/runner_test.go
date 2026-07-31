@@ -1292,9 +1292,24 @@ func testBoolPtr(value bool) *bool { return &value }
 func TestProcessClaimedItemFailsWhenAgentCompletionResultMissing(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	git := &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "looper/feature", BaseBranch: "main", HeadSHA: "abc123", WorktreeID: "worktree_1"}}
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	worktreeRoot, err := workerWorktreeRoot(*project)
+	if err != nil {
+		t.Fatalf("workerWorktreeRoot() error = %v", err)
+	}
+	worktreePath := filepath.Join(worktreeRoot, "wt")
+	if err := os.MkdirAll(worktreePath, 0o755); err != nil {
+		t.Fatalf("MkdirAll(worktree) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(worktreePath, ".git"), []byte("gitdir: /tmp/test\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile(.git) error = %v", err)
+	}
+	git := &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: worktreePath, Branch: "looper/feature", BaseBranch: "main", HeadSHA: "abc123", WorktreeID: "worktree_1"}}
 	github := &fakeGitHubGateway{}
-	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "upstream server_error", Stdout: "server_error", ParseStatus: "missing"}}}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "upstream server_error", Stdout: "server_error", ParseStatus: "missing", NativeResumeMode: "native_resume", NativeResumeStatus: "failed"}}}
 	validationCalls := 0
 	completed := make([]RunCompletedInput, 0, 1)
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true, OpenPRStrategy: config.OpenPRStrategyAllDone, ValidationRunner: func(context.Context, ValidationInput) (ValidationResult, error) {
@@ -1345,6 +1360,13 @@ func TestProcessClaimedItemFailsWhenAgentCompletionResultMissing(t *testing.T) {
 	}
 	if run == nil || run.Status != "failed" || run.CurrentStep == nil || *run.CurrentStep != string(stepExecute) {
 		t.Fatalf("run = %#v, want failed run at execute step", run)
+	}
+	checkpoint, err := parseCheckpoint(run.CheckpointJSON)
+	if err != nil {
+		t.Fatalf("parseCheckpoint() error = %v", err)
+	}
+	if checkpoint.Execution == nil || checkpoint.Execution.NativeResumeMode != "native_resume" || checkpoint.Execution.NativeResumeStatus != "failed" {
+		t.Fatalf("checkpoint.Execution = %#v, want persisted finalized native-resume result after invalid completion", checkpoint.Execution)
 	}
 	if run.LastCompletedStep != nil && *run.LastCompletedStep == string(stepOpenPR) {
 		t.Fatalf("run = %#v, want open-pr to remain incomplete", run)

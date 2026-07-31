@@ -944,6 +944,9 @@ func TestExecutorNativeResumeFailureAfterAttachDoesNotFallback(t *testing.T) {
 	if result.Status != "failed" || result.Summary != "failed to resume work: missing session token" {
 		t.Fatalf("result = %#v, want native resume failure without checkpoint fallback", result)
 	}
+	if result.NativeResumeMode != "native_resume" || result.NativeResumeStatus != "failed" {
+		t.Fatalf("result native resume = %q/%q, want native_resume/failed", result.NativeResumeMode, result.NativeResumeStatus)
+	}
 	record, err := repos.AgentExecutions.GetByID(context.Background(), "agent_resume_attached_failed")
 	if err != nil {
 		t.Fatalf("AgentExecutions.GetByID() error = %v", err)

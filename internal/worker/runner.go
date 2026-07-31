@@ -2489,6 +2489,16 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 		if err != nil {
 			return checkpoint, err
 		}
+		// The executor owns the native-resume decision. Persist the continuation
+		// projection before any completed-result gate can suspend or reject this
+		// run. A HITL suspension deliberately cannot set Execution: doing so
+		// would make the resumed run skip the agent turn that consumes the answer.
+		checkpoint.recordContinuationResumeMode(result)
+		if checkpoint.Continuation != nil {
+			if err := r.persistCheckpoint(ctx, input.Run.ID, checkpoint); err != nil {
+				return checkpoint, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
+			}
+		}
 		// HITL (gated): after the agent turn, if it wrote an ask sentinel, suspend
 		// the run so a human can answer. Returned as a typed error the step loop
 		// converts into an awaiting_human suspension (not a failure).
@@ -2546,11 +2556,15 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 		// the turn, never before — so a failed/timed-out turn re-reads the answer on
 		// retry, while a successful one never re-injects it on a later run.
 		r.acknowledgePostTurnMetadata(ctx, &input.Loop, includedHumanInbox)
-		if err := validateCompletedExecutionCheckpoint(&checkpointExecution{Status: result.Status, Summary: result.Summary, ParseStatus: result.ParseStatus}); err != nil {
-			return checkpoint, err
-		}
 		checkpoint.recordContinuationResumeMode(result)
 		checkpoint.Execution = checkpointExecutionFromAgentResult(result, input.Run.ID, executionID)
+		checkpoint.Execution.ProgressBeforeTimeout = preTimeoutProgress
+		if err := validateCompletedExecutionCheckpoint(checkpoint.Execution); err != nil {
+			if persistErr := r.persistCheckpoint(ctx, input.Run.ID, checkpoint); persistErr != nil {
+				return checkpoint, &runpipe.LoopError{Message: persistErr.Error(), Kind: runpipe.FailureRetryableAfterResume}
+			}
+			return checkpoint, err
+		}
 		checkpoint.ensureLifecycle("worker", worktree.Branch, worktree.BaseBranch, work.ExecutionMode == "create-pr")
 		if err := verifyWorkerReproduction(checkpoint, worktree.Path); err != nil {
 			return checkpoint, err

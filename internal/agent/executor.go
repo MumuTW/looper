@@ -1158,6 +1158,8 @@ func (x *execution) run(ctx context.Context) {
 			}
 		}
 	}
+	x.finalizeNativeResumeStatus(status, errorMessage, result.Stderr)
+	_, result.NativeResumeMode, result.NativeResumeStatus, _ = x.nativeResumeSnapshot()
 
 	// No terminal observation before containment is confirmed dead for owned
 	// executions (ties to #574/#576 / ADR-0015 R5).
@@ -1207,6 +1209,20 @@ func (x *execution) run(ctx context.Context) {
 	}
 
 	x.doneCh <- execOutcome{result: result, err: persistErr}
+}
+
+// finalizeNativeResumeStatus makes the returned terminal result agree with the
+// native-resume state that persistFinal records. Fallbacks have already
+// replaced this state before this point, so only an attached native session
+// that terminates without fallback is finalized here.
+func (x *execution) finalizeNativeResumeStatus(status, errorMessage, stderr string) {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	if x.nativeResumeMode != "native_resume" || status != "failed" {
+		return
+	}
+	x.nativeResumeStatus = "failed"
+	x.nativeResumeError = firstNonEmpty(x.nativeResumeError, errorMessage, strings.TrimSpace(stderr))
 }
 
 func (x *execution) observeBeforeTimeout(timeoutType string) string {
@@ -1903,10 +1919,6 @@ func (x *execution) persistFinal(status string, result Result, errorMessage, end
 	} else {
 		// Fail closed: assessments never persist a resumable native session id.
 		nativeSessionID = ""
-	}
-	if nativeResumeMode == "native_resume" && status == "failed" {
-		nativeResumeStatus = "failed"
-		nativeResumeError = firstNonEmpty(nativeResumeError, errorMessage, strings.TrimSpace(result.Stderr))
 	}
 	if nativeSessionID != "" && (nativeResumeStatus == "" || nativeResumeStatus == "unavailable") {
 		nativeResumeStatus = "captured"
