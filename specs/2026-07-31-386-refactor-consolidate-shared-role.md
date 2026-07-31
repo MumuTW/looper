@@ -98,37 +98,45 @@ not a solution to it.
 
 ## Goals
 
-1. **One authority for the failure-kind vocabulary.** `failureclass.Kind`
-   becomes the single source for the role runners; the per-role
-   `QueueFailureKind` is removed. `internal/validation`'s three `FailureKind*`
-   constants are deleted, `Policy.FailureKind` is typed `failureclass.Kind`
-   (not `string`), and `PolicyFor` returns the shared constants directly with no
-   `string()` cast: every production importer of `internal/validation`
-   (`internal/fixer`, `internal/fixer/failurepolicy`, and `internal/worker`)
-   already imports `failureclass`, and `failureclass` does not import
-   `validation`, so adding the import to `validation` introduces no cycle and no
-   transitive dependency that `validation`'s importers do not already carry; the
-   two production consumers (`worker.classifyValidationFailure` and
-   `fixer/failurepolicy.ClassifyValidation`) delete their string→kind casts. The
-   remaining package that spells the vocabulary as bare `string` constants —
-   `internal/loops/policy` — becomes the *owner* of the kind string values
-   rather than a second spelling pinned by a gate: `policy` is an intentional
-   stdlib-only leaf (its package doc states this) so that `reviewer/workflow` can
-   depend on it without pulling in the infra stack `failureclass` carries, and
-   the dependency runs in the opposite direction — `failureclass` imports
-   `policy` (no cycle: `policy` imports only the standard library) and derives
-   its four `Kind` constants from `policy`'s string constants at compile time
-   (Step 5). `policy` gains the two kind constants it currently lacks
-   (`FailureKindRetryableTransient`, `FailureKindNonRetryable`) so it owns all
-   four string values, and the umbrella `internal/loops` package re-exports those
-   two alongside its existing two to keep its "re-exports every name here"
-   contract (Step 5); `failureclass.Kind` stays `type Kind string` and
+1. **One authority for the failure-kind vocabulary.** `policy.Kind` becomes the
+   single source for the kind *type and values*; the per-role `QueueFailureKind`
+   is removed. `internal/validation`'s three `FailureKind*` constants are
+   deleted, `Policy.FailureKind` is typed `policy.Kind` (not `string`), and
+   `PolicyFor` returns the shared constants directly with no `string()` cast:
+   `validation` imports the stdlib-only `internal/loops/policy` leaf for the
+   `Kind` type and constants — **not** the infrastructure-backed
+   `internal/loops/failureclass` — so `go test ./internal/validation` does not
+   compile `failureclass` and its `internal/infra/github`, `diffanchor`, and
+   `outboundguard` dependency tree. This is the same focused-package coupling
+   avoidance Step 6 applies to `internal/agent`: a generic validation-policy
+   package must not depend on the infrastructure-backed classifier just to name
+   a kind. `failureclass` does not import `validation`, so no cycle is created;
+   and because `failureclass.Kind` is a type alias for `policy.Kind` (Step 5),
+   the two production consumers (`worker.classifyValidationFailure` and
+   `fixer/failurepolicy.ClassifyValidation`) delete their string→kind casts —
+   `policy.FailureKind` is already the same type as the `failureclass.Kind`
+   fields they assign into. The remaining package that spells the vocabulary as
+   bare `string` constants — `internal/loops/policy` — becomes the *owner* of
+   the kind type and string values rather than a second spelling pinned by a
+   gate: `policy` is an intentional stdlib-only leaf (its package doc states
+   this) so that `reviewer/workflow` and `internal/validation` can depend on it
+   without pulling in the infra stack `failureclass` carries, and the dependency
+   runs in the opposite direction — `failureclass` imports `policy` (no cycle:
+   `policy` imports only the standard library) and aliases its `Kind` type and
+   re-exports its constants at compile time (Step 5). `policy` gains the two
+   kind constants it currently lacks (`FailureKindRetryableTransient`,
+   `FailureKindNonRetryable`) so it owns all four string values, plus the typed
+   `Kind` constants the runners consume via the `failureclass` alias, and the
+   umbrella `internal/loops` package re-exports those new names alongside its
+   existing ones to keep its "re-exports every name here" contract (Step 5);
+   `failureclass.Kind` becomes `type Kind = policy.Kind` (a type alias, so
+   `failureclass.Kind` and `policy.Kind` are the identical type) and
    `Classify`'s public API is unchanged, but each `failureclass` constant is now
-   `const RetryableTransient Kind = policy.FailureKindRetryableTransient` (an
-   untyped-string-to-`Kind` constant conversion), so a rename in `policy`
-   propagates to `failureclass` and to every runner at compile time. This deletes
-   the second spelling rather than retaining both ledgers plus a drift gate,
-   per the repo's "prefer deletion over another layer" guideline. The fixer prompt's
+   `const RetryableTransient = policy.RetryableTransient` (a re-export of the
+   `policy.Kind`-typed constant), so a rename in `policy` propagates to
+   `failureclass` and to every runner at compile time. This deletes the second
+   spelling rather than retaining both ledgers plus a drift gate, per the repo's
+   "prefer deletion over another layer" guideline. The fixer prompt's
    advertised literals (`internal/agent/prompt.go`) are no longer a separate
    spelling: the fixer (which already imports `failureclass`) passes the
    advertised kind values into `AppendFixerCompletionInstruction` as fields of a
@@ -215,9 +223,13 @@ deletion over another layer" guideline, and is what makes the conversion
 functions deletable in the next step.
 
 In the same step, delete `internal/validation`'s three `FailureKind*`
-constants, type `Policy.FailureKind` as `failureclass.Kind` (not `string`), and
+constants, type `Policy.FailureKind` as `policy.Kind` (not `string`), and
 have `PolicyFor` return the shared constants directly with no `string()` cast.
-Today
+`validation` imports the stdlib-only `internal/loops/policy` leaf for the `Kind`
+type and typed constants — **not** `internal/loops/failureclass` — so the
+focused `go test ./internal/validation` build does not compile `failureclass`
+and its `internal/infra/github`, `diffanchor`, and `outboundguard` dependency
+tree. Today
 `validation.FailureKindManualIntervention = loops.FailureKindManualIntervention`
 and `validation.FailureKindRetryableAfterResume = loops.FailureKindRetryableAfterResume`
 (transitively `policy`'s bare strings), while
@@ -231,32 +243,34 @@ applies `QueueFailureKind(policy.FailureKind)` and
 `fixer/failurepolicy.ClassifyValidation` applies
 `failureclass.Kind(policy.FailureKind)`. Only same-package tests additionally
 spell the constant names. Keeping `Policy.FailureKind` as `string` and inlining
-`string(failureclass.*)` in `PolicyFor` would preserve an untyped boundary where
+`string(policy.*)` in `PolicyFor` would preserve an untyped boundary where
 a typo or future unsupported value still compiles and can reach retry or
 persistence logic, and would force both consumers to keep their string→kind
 casts — an authority converted to a string only to be converted back. Typing the
-field `failureclass.Kind` deletes that boundary: the constants are deleted,
+field `policy.Kind` deletes that boundary: the constants are deleted,
 `PolicyFor` returns the shared constants directly, and both consumers drop their
-casts. `Policy` is an in-memory struct consumed only by those two call sites
-plus same-package tests (it is not persisted or JSON-marshaled), so widening the
-field type breaks no persistence or string-context consumer.
+casts (the `failureclass.Kind` fields they assign into are the same type as
+`policy.Kind` via the Step 5 alias). `Policy` is an in-memory struct consumed
+only by those two call sites plus same-package tests (it is not persisted or
+JSON-marshaled), so widening the field type breaks no persistence or
+string-context consumer.
 
 ```go
 type Policy struct {
-    FailureKind  failureclass.Kind
+    FailureKind  policy.Kind
     ResumePolicy string
 }
 
 func PolicyFor(category FailureCategory) Policy {
     switch category {
     case FailureContextCanceled:
-        return Policy{FailureKind: failureclass.RetryableAfterResume, ResumePolicy: loops.ResumePolicyReplayStep}
+        return Policy{FailureKind: policy.RetryableAfterResume, ResumePolicy: loops.ResumePolicyReplayStep}
     case FailureSupervisorTimeout, FailureInfrastructure:
-        return Policy{FailureKind: failureclass.RetryableTransient, ResumePolicy: loops.ResumePolicyReplayStep}
+        return Policy{FailureKind: policy.RetryableTransient, ResumePolicy: loops.ResumePolicyReplayStep}
     case FailureNonZeroExit:
-        return Policy{FailureKind: failureclass.ManualIntervention, ResumePolicy: loops.ResumePolicyManualIntervention}
+        return Policy{FailureKind: policy.ManualIntervention, ResumePolicy: loops.ResumePolicyManualIntervention}
     default:
-        return Policy{FailureKind: failureclass.ManualIntervention, ResumePolicy: loops.ResumePolicyManualIntervention}
+        return Policy{FailureKind: policy.ManualIntervention, ResumePolicy: loops.ResumePolicyManualIntervention}
     }
 }
 ```
@@ -265,7 +279,8 @@ The two consumers delete their casts:
 `worker.classifyValidationFailure` becomes `kind: policy.FailureKind` (was
 `QueueFailureKind(policy.FailureKind)`, itself becoming
 `failureclass.Kind(policy.FailureKind)` after Step 1 renames the type — a
-redundant cast once the field is already `failureclass.Kind`), and
+redundant cast once the field is already `policy.Kind`, identical to
+`failureclass.Kind` via the Step 5 alias), and
 `fixer/failurepolicy.ClassifyValidation` becomes `Kind: policy.FailureKind` (was
 `failureclass.Kind(policy.FailureKind)`). The two same-package tests that spell
 the constant names are updated to compare against the shared values instead:
@@ -273,8 +288,8 @@ the constant names are updated to compare against the shared values instead:
 `TestRunCommandsKeepsPolicyWordsDiagnosticForNonZeroExit` compares
 `policy.FailureKind` to `FailureKindManualIntervention`, and
 `TestPolicyForOperationalFailureCategory` table-tests all three; both are
-rewritten to expect `failureclass.ManualIntervention`,
-`failureclass.RetryableAfterResume`, and `failureclass.RetryableTransient`
+rewritten to expect `policy.ManualIntervention`,
+`policy.RetryableAfterResume`, and `policy.RetryableTransient`
 respectively (typed comparisons, no `string()` cast), so the test expectations
 stay pinned to the shared authority after the constants are gone. No other
 production consumer references the constant names or reads `Policy.FailureKind`
@@ -286,14 +301,19 @@ pinning it with a test-only synchronization gate, per the repo's "prefer
 deletion over another layer" and "name the authority before enforcing it"
 guidelines: there is no caller to preserve and no string-context consumer, so
 the untyped layer adds only the documented source-level incompatibility and two
-redundant casts. Because `Policy.FailureKind` is now `failureclass.Kind`, a
-rename of any `failureclass.Kind` value propagates to `PolicyFor` and to both
-consumers at compile time, and no validation drift test is needed. Adding the
-`failureclass` import to `validation` is safe: every production importer of
-`validation` (`internal/fixer`, `internal/fixer/failurepolicy`,
-`internal/worker`) already imports `failureclass`, and `failureclass` does not
-import `validation`, so no cycle is created and no importer gains a transitive
-dependency it did not already carry.
+redundant casts. Because `Policy.FailureKind` is now `policy.Kind` (aliased as
+`failureclass.Kind`), a rename of any kind value propagates to `PolicyFor` and
+to both consumers at compile time, and no validation drift test is needed.
+`validation` imports only the stdlib-only `policy` leaf for the kind type — not
+`failureclass` — so `go test ./internal/validation` does not pull the
+GitHub-infrastructure dependency tree into the focused test build. This is the
+same coupling avoidance Step 6 applies to `internal/agent`: a generic
+validation-policy package must not depend on the infrastructure-backed
+classifier just to name a kind. `failureclass` does not import `validation`, so
+no cycle is created, and every production importer of `validation`
+(`internal/fixer`, `internal/fixer/failurepolicy`, `internal/worker`) already
+imports `failureclass`, so no importer gains a transitive dependency it did not
+already carry.
 
 ### Step 2 — Delete the `xxxFailureKind` conversion functions; preserve the unknown-kind fallback
 
@@ -335,7 +355,7 @@ The `loopError.kind` assignments split into three groups:
    provably bounded to the four known kinds by its producer:
    - `worker.validationFailure.kind` (`internal/worker/runner.go:2811`) is
      assigned only from `policy.FailureKind` (after Step 1 a known
-     `failureclass.Kind` from `validation.PolicyFor`, which returns only the four
+     `policy.Kind` from `validation.PolicyFor`, which returns only the four
      known constants) or from `FailureManualIntervention` /
      `FailureRetryableAfterResume` / `FailureRetryableTransient` constants. It is
      read into `loopError.kind` at four worker sites
@@ -394,9 +414,13 @@ treated as a `loopError` copy only when `go/types` resolves its receiver type to
 shadowed `failureclass` identifier or an unrelated struct's lowercase `kind`
 field cannot pass as safe. A bare local like `kind: classified` is resolved to
 its assignments, so the indirect assignment is caught — the implementer must
-write `kind: failureclass.Normalize(classified)`. Known-constant references,
-`loopError.kind` copies, and locals whose every reaching assignment is one of
-those two safe shapes pass. The carrier reads from group 2
+write `kind: failureclass.Normalize(classified)`. A bare identifier that is a
+function parameter (no local definition to trace) is **unsafe**: its value
+comes from an untrusted call-site argument the intra-procedural check cannot
+trace, so a helper returning `&loopError{kind: kind}` from a `Kind` parameter
+must wrap the parameter in `Normalize` rather than passing it through. Known-
+constant references, `loopError.kind` copies, and locals whose every reaching
+assignment is one of those two safe shapes pass. The carrier reads from group 2
 (`validationFailure.kind`, `blockedKind`) are `Normalize`-wrapped per Step 2, so
 they pass the gate via the `Normalize`-call rule — the gate does not recognize
 the carrier producers by name, which is why they must be wrapped rather than
@@ -431,7 +455,7 @@ generic abstraction to save ~20 lines per package — a net negative on a
 Low-severity path that has already been patched once. This is recorded here so
 the decision is explicit, not silent.
 
-### Step 5 — Reverse the leaf dependency: `failureclass` derives its constants from `policy`
+### Step 5 — Reverse the leaf dependency: `policy` owns the `Kind` type; `failureclass` aliases it
 
 One package outside `failureclass` still spells part of the kind vocabulary as
 bare `string` constants: `internal/loops/policy` re-declares two of the four
@@ -441,17 +465,27 @@ second spelling pinned by a drift test considered only one dependency direction
 — making `policy` import the heavyweight `failureclass` (which would break
 `policy`'s stdlib-only leaf property). The dependency runs in the opposite
 direction with no cycle: `policy` imports only the standard library, so
-`failureclass` can import `policy` and derive its `Kind` constants from `policy`'s
-string constants at compile time. That deletes the second spelling and the
+`failureclass` can import `policy` and alias its `Kind` type and re-export its
+constants at compile time. That deletes the second spelling and the
 synchronization test entirely, rather than retaining both ledgers plus a new
 gate that leaves correctness dependent on the full suite running — the simpler
 deletion the repo's "prefer deletion over another layer" guideline requires
 before adding a gate.
 
-`policy` becomes the single owner of the kind *string values*. It gains the two
-constants it currently lacks so it owns all four:
+`policy` becomes the single owner of the kind *type and string values*. It gains
+the two untyped `string` constants it currently lacks so it owns all four string
+values, and it gains the `Kind` type plus four typed `Kind` constants derived
+from those untyped strings. The untyped `string` constants stay so the existing
+`policy` predicates (`NormalizeResumePolicy`, `IsHardHold`, etc.) keep their
+`string` signatures with no function change (see below); the typed `Kind`
+constants are the authority the runners consume via the `failureclass` alias and
+that `internal/validation` consumes directly:
 
 ```go
+package policy
+
+type Kind string
+
 const (
 	FailureKindRetryableTransient   = "retryable_transient"
 	FailureKindRetryableAfterResume = "retryable_after_resume"
@@ -459,15 +493,35 @@ const (
 	FailureKindManualIntervention   = "manual_intervention"
 	// ... existing ResumePolicy* constants unchanged ...
 )
+
+const (
+	RetryableTransient   Kind = FailureKindRetryableTransient
+	RetryableAfterResume Kind = FailureKindRetryableAfterResume
+	NonRetryable         Kind = FailureKindNonRetryable
+	ManualIntervention   Kind = FailureKindManualIntervention
+)
 ```
+
+The typed constants derive from the untyped ones in the same package, so there
+is one owner and one derivation direction — not a second ledger. The untyped
+constants exist only to feed the `string`-parameter predicates; the typed
+constants are the single `Kind` authority.
 
 The umbrella `internal/loops` package's documented compatibility contract
 (`internal/loops/policy.go:7`: "internal/loops re-exports every name here")
-covers every exported name in the leaf, so the two new constants must be
-re-exported there too, not added to the leaf alone. `internal/loops/policy.go`
-gains the matching two aliases alongside the existing two:
+covers every exported name in the leaf, so the two new untyped constants, the
+`Kind` type, and the four typed constants must be re-exported there too, not
+added to the leaf alone. `internal/loops/policy.go` gains the matching untyped
+aliases alongside the existing two, plus a `Kind` type alias and the four typed
+constant re-exports:
 
 ```go
+package loops
+
+import "github.com/MumuTW/looper/internal/loops/policy"
+
+type Kind = policy.Kind
+
 const (
 	FailureKindRetryableTransient   = policy.FailureKindRetryableTransient
 	FailureKindRetryableAfterResume = policy.FailureKindRetryableAfterResume
@@ -475,60 +529,74 @@ const (
 	FailureKindManualIntervention   = policy.FailureKindManualIntervention
 	// ... existing ResumePolicy* aliases unchanged ...
 )
+
+const (
+	RetryableTransient   = policy.RetryableTransient
+	RetryableAfterResume = policy.RetryableAfterResume
+	NonRetryable         = policy.NonRetryable
+	ManualIntervention   = policy.ManualIntervention
+)
 ```
 
 Without these aliases, callers following the documented `loops.*` umbrella API
-cannot reach `loops.FailureKindRetryableTransient` or
-`loops.FailureKindNonRetryable` — the leaf gains names the umbrella promises to
+cannot reach `loops.FailureKindRetryableTransient`, `loops.Kind`, or
+`loops.RetryableTransient` — the leaf gains names the umbrella promises to
 expose, breaking the contract the package doc asserts. Adding them is part of
 this step, not a follow-up.
 
-`failureclass` imports `policy` and re-derives its four `Kind` constants from
-`policy`'s untyped string constants (an untyped-string-to-`Kind` constant
-conversion, valid because `Kind` is `type Kind string`):
+`failureclass` imports `policy` and aliases the `Kind` type and re-exports the
+typed constants, so `failureclass.Kind` and `failureclass.RetryableTransient`
+etc. remain available to the runners without the runners (or
+`internal/validation`) depending on `failureclass` for the *type*:
 
 ```go
 package failureclass
 
 import "github.com/MumuTW/looper/internal/loops/policy"
 
-type Kind string
+type Kind = policy.Kind
 
 const (
-	RetryableTransient   Kind = policy.FailureKindRetryableTransient
-	RetryableAfterResume Kind = policy.FailureKindRetryableAfterResume
-	NonRetryable         Kind = policy.FailureKindNonRetryable
-	ManualIntervention   Kind = policy.FailureKindManualIntervention
+	RetryableTransient   = policy.RetryableTransient
+	RetryableAfterResume = policy.RetryableAfterResume
+	NonRetryable         = policy.NonRetryable
+	ManualIntervention   = policy.ManualIntervention
 )
 ```
 
-`Classify`'s public API is unchanged (it still returns `Kind`), and `Kind` stays
-`type Kind string`: `failureclass.Classify` and `failureclass.Kind` themselves
-keep compiling unchanged. The surfaces that adopt `failureclass.Kind` — the
-runners, the scheduler field, `loopError.kind`,
-`parseFixerBlockedFailureKind`'s return type, and `Policy.FailureKind` — retain
-their semantic values but do not keep compiling unchanged: their declarations
-change to `failureclass.Kind` as the planned type edits of Steps 1 and 3, and
-Step 5 adds no further edit to them. A rename of any `policy` string constant
-propagates to `failureclass` and to every consumer at compile time, so no
+`Classify`'s public API is unchanged (it still returns `Kind`, now `policy.Kind`
+via the alias), and `failureclass.Kind` is `type Kind = policy.Kind` (a type
+alias, so `failureclass.Kind` and `policy.Kind` are the identical type):
+`failureclass.Classify` and `failureclass.Kind` themselves keep compiling
+unchanged. The surfaces that adopt `failureclass.Kind` — the runners, the
+scheduler field, `loopError.kind`, and `parseFixerBlockedFailureKind`'s return
+type — retain their semantic values but do not keep compiling unchanged: their
+declarations change to `failureclass.Kind` as the planned type edits of Steps 1
+and 3, and Step 5 adds no further edit to them. `Policy.FailureKind` is typed
+`policy.Kind` (Step 1), which is the same type as `failureclass.Kind` via the
+alias, so the two consumers assign `policy.FailureKind` into `failureclass.Kind`
+fields with no cast. A rename of any `policy` constant propagates to
+`failureclass`, to the umbrella, and to every consumer at compile time, so no
 drift-detection test is added or needed. `policy`'s leaf property is preserved:
-it still imports only the standard library, so `reviewer/workflow` depending on
-`policy` still pulls in no infra. Adding `policy` to `failureclass`'s import
-graph adds only a stdlib-only package to `failureclass`'s existing
-`internal/infra/github` closure, and every runner already imports `policy`
-transitively via `internal/loops`, so no importer of `failureclass` gains a
-transitive dependency it did not already carry.
+it still imports only the standard library, so `reviewer/workflow` and
+`internal/validation` depending on `policy` still pull in no infra. Adding
+`policy` to `failureclass`'s import graph adds only a stdlib-only package to
+`failureclass`'s existing `internal/infra/github` closure, and every runner
+already imports `policy` transitively via `internal/loops`, so no importer of
+`failureclass` gains a transitive dependency it did not already carry.
 
 `NormalizeResumePolicy` and the other `policy` predicates keep their current
-`string` signatures and branches: the `policy` constants stay untyped `string`,
-so they remain assignable to the `string` parameters those functions take. No
-`policy` function changes.
+`string` signatures and branches: the untyped `FailureKind*` constants stay
+untyped `string`, so they remain assignable to the `string` parameters those
+functions take. The typed `Kind` constants are a separate declaration set and do
+not affect the predicates. No `policy` function changes.
 
 (`internal/validation` also re-declared the same vocabulary as bare `string`
 constants, but Step 1 deletes those constants, types `Policy.FailureKind` as
-`failureclass.Kind`, and has `PolicyFor` return the shared constants directly,
-deleting that ledger outright; see Step 1 for the no-cycle justification. No
-validation drift test is added or needed.)
+`policy.Kind` (importing the stdlib-only `policy` leaf, not the infra-backed
+`failureclass`), and has `PolicyFor` return the shared constants directly,
+deleting that ledger outright; see Step 1 for the no-cycle and no-infra-coupling
+justification. No validation drift test is added or needed.)
 
 ### Step 6 — Derive the fixer prompt's advertised literals from `failureclass`
 
@@ -651,7 +719,8 @@ directly: it invokes `buildFixerPrompt` (the function containing the
 `failure_kind` values that `parseFixerBlockedFailureKind` honors —
 `string(failureclass.RetryableTransient)` and
 `string(failureclass.ManualIntervention)` as advertised bullets, and not
-`retryable_after_resume` (still accepted on input, not advertised). It also
+`string(failureclass.RetryableAfterResume)` (still accepted on input, not
+advertised). It also
 asserts the blocked-completion example
 `{"outcome":"blocked","failure_kind":"<value>",...}` embeds
 `string(failureclass.ManualIntervention)` (not the transient value), so a rename
@@ -711,10 +780,10 @@ bullet is caught because the test asserts both.
   direction — making `policy` import `failureclass`, which would break `policy`'s
   stdlib-only leaf property. The dependency runs the other way with no cycle
   (`policy` imports only the standard library), so `failureclass` can import
-  `policy` and derive its `Kind` constants from `policy`'s string constants at
-  compile time (Step 5). A drift gate would retain both ledgers and leave
+  `policy` and alias its `Kind` type and re-export its typed constants at compile
+  time (Step 5). A drift gate would retain both ledgers and leave
   correctness dependent on the full suite running, against the repo's "prefer
-  deletion over another layer" guideline; the compile-time derivation deletes the
+  deletion over another layer" guideline; the compile-time alias deletes the
   second spelling entirely.
 
 ## Trade-off (per design guidelines)
@@ -734,36 +803,40 @@ the unknown-kind fallback explicitly.
 
 This refactor targets the per-role `QueueFailureKind` ledger and the
 `internal/validation` bare-string ledger (deleted by typing
-`Policy.FailureKind` as `failureclass.Kind` and having `PolicyFor` return the
+`Policy.FailureKind` as `policy.Kind` and having `PolicyFor` return the
 shared constants directly in Step 1). It is deliberately not a repo-wide audit
 of every bare-string spelling of the vocabulary. The remaining spellings split
 into two groups: those derived from the shared constants at compile time (caught
 by import, no drift test), and those explicitly out of scope (not caught at all).
 No spelling is pinned by a drift-detection test after Step 5 reverses the leaf
-dependency: `policy` owns the kind string values and `failureclass` derives from
-it by import, so the former "pinned by test" group is deleted, not retained.
+dependency: `policy` owns the kind type and string values and `failureclass`
+aliases the type and re-exports the constants by import, so the former "pinned by
+test" group is deleted, not retained.
 
 **Derived from the shared constants (caught at the call site by import, no drift
 test):**
 
 1. `internal/loops/policy`'s kind constants become the single owner of the kind
-   *string values*. `policy` gains the two constants it currently lacks
-   (`FailureKindRetryableTransient`, `FailureKindNonRetryable`) so it owns all
-   four, and `failureclass` imports `policy` and derives its four `Kind`
-   constants from `policy`'s untyped string constants at compile time (Step 5).
-   The umbrella `internal/loops` package re-exports the two new constants
-   alongside its existing two, keeping its "re-exports every name here" contract
-   so the documented `loops.*` API exposes all four (Step 5). The dependency runs
-   in that direction because `policy` is an intentional
-   stdlib-only leaf (its package doc states this) so `reviewer/workflow` can
-   depend on it without pulling in the `internal/infra/github` stack
-   `failureclass` carries; `failureclass` importing `policy` adds no cycle
-   (`policy` imports only the standard library) and no transitive dependency any
-   `failureclass` importer did not already carry. A rename of any `policy` string
-   constant propagates to `failureclass` and to every runner at compile time, so
-   no drift-detection test is added. Resume-policy behavior is unchanged: the
-   `policy` constants stay untyped `string`, and `NormalizeResumePolicy` keeps
-   its current signature and branches.
+   *type and string values*. `policy` gains the two untyped `string` constants it
+   currently lacks (`FailureKindRetryableTransient`, `FailureKindNonRetryable`)
+   so it owns all four string values, plus the `Kind` type and four typed `Kind`
+   constants derived from those untyped strings, and `failureclass` imports
+   `policy` and aliases `type Kind = policy.Kind` and re-exports the four typed
+   constants at compile time (Step 5). The umbrella `internal/loops` package
+   re-exports the two new untyped constants, the `Kind` type alias, and the four
+   typed constants alongside its existing ones, keeping its "re-exports every
+   name here" contract so the documented `loops.*` API exposes all of them
+   (Step 5). The dependency runs in that direction because `policy` is an
+   intentional stdlib-only leaf (its package doc states this) so
+   `reviewer/workflow` and `internal/validation` can depend on it without
+   pulling in the `internal/infra/github` stack `failureclass` carries;
+   `failureclass` importing `policy` adds no cycle (`policy` imports only the
+   standard library) and no transitive dependency any `failureclass` importer
+   did not already carry. A rename of any `policy` constant propagates to
+   `failureclass`, to the umbrella, and to every runner at compile time, so no
+   drift-detection test is added. Resume-policy behavior is unchanged: the
+   untyped `FailureKind*` constants stay untyped `string`, and
+   `NormalizeResumePolicy` keeps its current signature and branches.
 
 2. `internal/agent/prompt.go:55-57` (`AppendFixerCompletionInstruction`) embeds
    `retryable_transient` and `manual_intervention` as string literals in the
@@ -794,10 +867,12 @@ test):**
 
 (`internal/validation`'s three `FailureKind*` constants previously belonged in a
 separate-spelling group; Step 1 now deletes them, types `Policy.FailureKind` as
-`failureclass.Kind`, and has `PolicyFor` return the shared constants directly,
+`policy.Kind` (importing the stdlib-only `policy` leaf, not the infra-backed
+`failureclass`), and has `PolicyFor` return the shared constants directly,
 so a rename propagates at compile time to `PolicyFor` and to both consumers
 (`worker.classifyValidationFailure` and `fixer/failurepolicy.ClassifyValidation`,
-which delete their string→kind casts). No drift test is needed.)
+which delete their string→kind casts, since `policy.Kind` is the same type as
+`failureclass.Kind` via the Step 5 alias). No drift test is needed.)
 
 **Explicitly out of scope (not caught — recorded here so a future rename does
 not pass silently):**
@@ -909,20 +984,23 @@ Infra signals remain for drift detection, not authority.
 - `internal/worker/runner.go` — delete `QueueFailureKind` + delete `workerFailureKind` + `s/QueueFailureKind/failureclass.Kind/` + call-site edits.
 - `internal/planner/runner.go` — delete `QueueFailureKind` + delete `plannerFailureKind` + `s/QueueFailureKind/failureclass.Kind/` + call-site edits.
 - `internal/runtime/scheduler.go` — `workerRunCompletedNotificationInput.FailureKind` becomes `failureclass.Kind` (the one `QueueFailureKind` reference here).
-- `internal/loops/failureclass/failureclass.go` — add `Normalize(kind Kind) Kind` (the authority for the unknown-kind fallback); add the `internal/loops/policy` import and re-derive the four `Kind` constants from `policy`'s string constants at compile time (Step 5), deleting the second spelling rather than pinning it by test; `Classify` logic and public API unchanged.
+- `internal/loops/failureclass/failureclass.go` — add `Normalize(kind Kind) Kind` (the authority for the unknown-kind fallback); add the `internal/loops/policy` import and alias `type Kind = policy.Kind` and re-export the four typed constants from `policy` at compile time (Step 5), deleting the second spelling rather than pinning it by test; `Classify` logic and public API unchanged.
+- `internal/loops/policy/policy.go` — add the two missing untyped `FailureKind*` string constants so the leaf owns all four string values; add `type Kind string` and the four typed `Kind` constants derived from the untyped ones (Step 5); no predicate changes (the untyped constants stay for the `string`-parameter functions).
+- `internal/loops/policy.go` (umbrella) — re-export the two new untyped `FailureKind*` constants, the `Kind` type alias, and the four typed constants, keeping the "re-exports every name here" contract (Step 5).
 - `internal/validation/validation.go` — delete the three `FailureKind*`
-  constants, type `Policy.FailureKind` as `failureclass.Kind`, have `PolicyFor`
+  constants, type `Policy.FailureKind` as `policy.Kind`, have `PolicyFor`
   return the shared constants directly (no `string()` cast), and add the
-  `failureclass` import; the two same-package tests that spell the constant
-  names are updated to compare against the typed `failureclass.*` constants —
-  see the call-site audit in Step 1.
+  `internal/loops/policy` import (not `failureclass`, so `go test
+  ./internal/validation` does not pull in the infra stack); the two same-package
+  tests that spell the constant names are updated to compare against the typed
+  `policy.*` constants — see the call-site audit in Step 1.
 - `internal/worker/runner.go` (additional edits beyond the type rename) —
   `classifyValidationFailure` drops the `QueueFailureKind(policy.FailureKind)`
   cast and assigns `kind: policy.FailureKind` directly, now that the field is
-  `failureclass.Kind`; the four `loopError{... kind: failure.kind}` sites that
-  read `validationFailure.kind` (`runner.go:1943,1958,2007,2038`) become
-  `kind: failureclass.Normalize(failure.kind)` per Step 2's carrier-source
-  wrapping.
+  `policy.Kind` (identical to `failureclass.Kind` via the Step 5 alias); the four
+  `loopError{... kind: failure.kind}` sites that read `validationFailure.kind`
+  (`runner.go:1943,1958,2007,2038`) become `kind:
+  failureclass.Normalize(failure.kind)` per Step 2's carrier-source wrapping.
 - `internal/fixer/runner.go` (additional edit beyond the type rename) — the
   blocked-outcome `loopError{... kind: blockedKind}` site (`runner.go:3327`)
   becomes `kind: failureclass.Normalize(blockedKind)` per Step 2's
@@ -931,7 +1009,8 @@ Infra signals remain for drift detection, not authority.
   uniform).
 - `internal/fixer/failurepolicy/policy.go` — `ClassifyValidation` drops the
   `failureclass.Kind(policy.FailureKind)` cast and assigns
-  `Kind: policy.FailureKind` directly, now that the field is `failureclass.Kind`.
+  `Kind: policy.FailureKind` directly, now that the field is `policy.Kind`
+  (identical to `failureclass.Kind` via the Step 5 alias).
 - `internal/agent/prompt.go` — `AppendFixerCompletionInstruction` takes the
   advertised `failure_kind` values as fields of a named struct
   (`agent.FixerCompletionKinds`) and embeds them (both the quoted bullet tokens
@@ -945,19 +1024,24 @@ Infra signals remain for drift detection, not authority.
   cross-component fixer test, Step 6, covers rename drift only).
 - `internal/loops/policy/policy.go` — gains two new untyped `string` constants
   (`FailureKindRetryableTransient`, `FailureKindNonRetryable`) so it owns all
-  four kind string values; its existing two constants, `NormalizeResumePolicy`,
-  and the other predicates keep their current `string` signatures and branches
-  (no behavior change). `policy` stays a stdlib-only leaf (the new constants add
-  no import), so `reviewer/workflow` depending on it still pulls in no infra. No
-  drift test is added: `failureclass` imports `policy` and derives its `Kind`
-  constants from these strings at compile time (Step 5), so a rename propagates
-  by import, not by a synchronization gate.
+  four kind string values, plus `type Kind string` and the four typed `Kind`
+  constants derived from the untyped ones (Step 5); its existing two constants,
+  `NormalizeResumePolicy`, and the other predicates keep their current `string`
+  signatures and branches (no behavior change — the untyped constants stay for
+  the `string`-parameter predicates). `policy` stays a stdlib-only leaf (the new
+  type and constants add no import), so `reviewer/workflow` and
+  `internal/validation` depending on it still pull in no infra. No drift test is
+  added: `failureclass` imports `policy` and aliases `type Kind = policy.Kind`
+  and re-exports the typed constants at compile time (Step 5), so a rename
+  propagates by import, not by a synchronization gate.
 - `internal/loops/policy.go` — the umbrella package re-exports the two new leaf
-  constants (`FailureKindRetryableTransient`, `FailureKindNonRetryable`) as
-  aliases alongside the existing two, satisfying its own package-doc contract
+  untyped constants (`FailureKindRetryableTransient`, `FailureKindNonRetryable`)
+  as aliases alongside the existing two, plus a `Kind` type alias and the four
+  typed constant re-exports, satisfying its own package-doc contract
   ("internal/loops re-exports every name here", `policy.go:7`). Without this
   edit the leaf gains names the documented `loops.*` API does not expose, so
-  callers using the umbrella path cannot reach the new constants.
+  callers using the umbrella path cannot reach the new constants or the `Kind`
+  type.
 
 **Test files:** Call sites in `*_test.go` that reference `FailureRetryable*`
 constants continue to compile unchanged (the constants are re-exported). The one
@@ -972,11 +1056,11 @@ of the three asserts all four kinds; they cover `retryable_transient` and
 adds the missing focused coverage (see Validation step 6) rather than relying on
 a four-kind net that does not yet exist. No policy drift-detection test is
 added: Step 5 reverses the leaf dependency so `failureclass` imports `policy`
-and derives its `Kind` constants from `policy`'s strings at compile time, and no
-validation drift test is added because Step 1 deletes the validation constants,
-types `Policy.FailureKind` as `failureclass.Kind`, and has `PolicyFor` return
-the shared constants directly (a rename propagates at compile time in both
-cases). The fixer-prompt call path is covered by a
+and aliases `type Kind = policy.Kind` and re-exports the typed constants at
+compile time, and no validation drift test is added because Step 1 deletes the
+validation constants, types `Policy.FailureKind` as `policy.Kind`, and has
+`PolicyFor` return the shared constants directly (a rename propagates at compile
+time in both cases). The fixer-prompt call path is covered by a
 cross-component test: `TestFixerPromptOffersOnlyHonoredFailureKinds`
 (`internal/fixer/runner_repair_outcome_test.go`) is rewritten to exercise
 `buildFixerPrompt` and assert the produced prompt offers exactly the
@@ -1168,11 +1252,24 @@ Per `AGENTS.md`, the root commands are the source of truth:
    - A `.kind` selector read whose receiver `go/types` resolves to `loopError`
      (`kind: failure.kind`) — **safe** (a copy of an already-normalized kind, by
      this same invariant).
-   - A bare identifier (local variable or parameter) — resolve it to every
+   - A bare identifier that is a **local variable** — resolve it to every
      assignment to that name within the same function and classify each
      right-hand side recursively; **safe** only if every reaching assignment is
      itself safe, **unsafe** if any reaching assignment is a dynamic source not
      wrapped in `Normalize`.
+   - A bare identifier that is a **function parameter** (a name declared in the
+     enclosing function's signature with no intra-procedural assignment) —
+     **unsafe**. A parameter has no local definition to trace, so the
+     "every reaching assignment is safe" rule would accept it vacuously (an
+     empty set of assignments is trivially all-safe), letting a helper such as
+     one returning `&loopError{kind: kind}` from a `Kind` parameter bypass
+     `Normalize` while this gate claims every indirect bypass fails. The
+     parameter's value originates from an untrusted call-site argument the
+     intra-procedural check cannot trace, so it is treated like any other
+     untracked source: the implementer must wrap it in
+     `failureclass.Normalize(kind)` at the assignment site. (Tracing and proving
+     every call-site argument is inter-procedural and out of scope for this
+     gate; the conservative choice is unsafe-by-default.)
    - A dynamic source — a call resolved by `go/types` to
      `failureclass.Classify(...)`, or a `.Kind` selector read whose receiver
      `go/types` resolves to a non-`loopError` struct (e.g. `Decision.Kind`,
@@ -1197,8 +1294,10 @@ Per `AGENTS.md`, the root commands are the source of truth:
    implementer must write `kind: failureclass.Normalize(classified)`. The
    existing safe shapes keep passing — `kind: FailureRetryableTransient`,
    `kind: failure.kind` (where `failure` is a `loopError`), and `kind: kind`
-   where `kind` is only ever assigned from `FailureRetryable*` constants all
-   resolve to a safe origin. The carrier reads pass because Step 2 wraps them in
+   where `kind` is a local only ever assigned from `FailureRetryable*` constants
+   all resolve to a safe origin; a `kind` that is a function parameter is
+   **unsafe** unless wrapped, because its origin is an untraceable call-site
+   argument. The carrier reads pass because Step 2 wraps them in
    `Normalize`, not because the gate recognizes their producers. The
    dynamic-vs-copy distinction is no longer made by selector name: `go/types`
    resolves the receiver, so a `.Kind` read on `Decision`/validation structs is
@@ -1214,10 +1313,11 @@ Per `AGENTS.md`, the root commands are the source of truth:
    — so the test is a regression net, not a new state machine.
 
    (Step 5's reverse-dependency derivation — `failureclass` importing `policy`
-   and re-deriving its `Kind` constants from `policy`'s strings — needs no
-   separate validation step: it is a compile-time constant derivation, so a
-   rename in `policy` that `failureclass` does not follow is a `go build` failure
-   covered by step 1. No policy or validation drift test is added or needed.)
+   and aliasing `type Kind = policy.Kind` and re-exporting the typed constants —
+   needs no separate validation step: it is a compile-time alias and constant
+   re-export, so a rename in `policy` that `failureclass` does not follow is a
+   `go build` failure covered by step 1. No policy or validation drift test is
+   added or needed.)
 9. **Fixer-prompt call-site coverage (Step 6).**
    `TestFixerPromptOffersOnlyHonoredFailureKinds`
    (`internal/fixer/runner_repair_outcome_test.go`) is rewritten to exercise
@@ -1240,14 +1340,18 @@ Per `AGENTS.md`, the root commands are the source of truth:
 type-name references replaced by `failureclass.Kind`), the four `xxxFailureKind`
 functions are gone and `failureclass.Normalize` preserves their unknown-kind →
 `non_retryable` fallback, `internal/validation`'s `FailureKind*` constants are
-deleted, `Policy.FailureKind` is typed `failureclass.Kind`, and `PolicyFor`
+deleted, `Policy.FailureKind` is typed `policy.Kind` (importing the stdlib-only
+`policy` leaf, not the infra-backed `failureclass`), and `PolicyFor`
 returns the shared constants directly (with both consumers'
-string→kind casts deleted), `internal/loops/policy` owns all four kind string
-constants and `failureclass` imports `policy` and derives its `Kind` constants
-from them at compile time (no policy or validation drift test), the umbrella
-`internal/loops` package re-exports the two new policy constants
-(`FailureKindRetryableTransient`, `FailureKindNonRetryable`) alongside the
-existing two so the documented `loops.*` API exposes all four, the fixer
+string→kind casts deleted, since `policy.Kind` is the same type as
+`failureclass.Kind` via the Step 5 alias), `internal/loops/policy` owns the
+`Kind` type and all four kind string constants and `failureclass` imports
+`policy` and aliases `type Kind = policy.Kind` and re-exports the typed
+constants from it at compile time (no policy or validation drift test), the
+umbrella `internal/loops` package re-exports the two new untyped policy
+constants (`FailureKindRetryableTransient`, `FailureKindNonRetryable`), the
+`Kind` type alias, and the four typed constants alongside the existing ones so
+the documented `loops.*` API exposes all of them, the fixer
 prompt's advertised `failure_kind` tokens are derived from
 `string(failureclass.*)` passed into `AppendFixerCompletionInstruction` as named
 struct fields (`agent.FixerCompletionKinds`) from the fixer call site, the
