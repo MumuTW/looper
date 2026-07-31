@@ -153,8 +153,9 @@ not a solution to it.
    argument-order gate is added — the swap is unrepresentable as a silent
    positional mistake by construction (Step 6). A cross-component fixer test
    (Step 6) still exercises the production prompt builder and asserts the
-   advertised tokens match the kinds `parseFixerBlockedFailureKind` honors, but
-   only for rename-drift coverage, not argument-order pinning.
+   advertised bullet set equals exactly the kinds `parseFixerBlockedFailureKind`
+   honors, for rename-drift and advertised-subset coverage, not argument-order
+   pinning.
    This is not an exhaustive audit of
    every bare-string spelling of the vocabulary: additional production consumers
    and the persisted schema also spell the kinds as bare strings and are
@@ -655,9 +656,9 @@ have required: that design deliberately introduced two interchangeable positiona
 against the repo's "prefer deletion over another layer" guideline. The named
 struct makes the swap unrepresentable as a silent mistake, so no
 argument-order-pinning test is added; a cross-component fixer test (Step 6) still
-exercises the production prompt builder, but only to assert the advertised tokens
-match the kinds `parseFixerBlockedFailureKind` honors (rename-drift coverage),
-not to pin argument order. This removes the second spelling rather than pinning
+exercises the production prompt builder, but only to assert the advertised
+bullet set equals exactly the kinds `parseFixerBlockedFailureKind` honors
+(rename-drift and advertised-subset coverage), not to pin argument order. This removes the second spelling rather than pinning
 it, per the repo's "prefer deletion over another layer" guideline — a
 synchronization or argument-order test would only guard a ledger or a positional
 mistake that the named-struct design no longer admits, and would leave production
@@ -715,22 +716,31 @@ cross-component fixer test `TestFixerPromptOffersOnlyHonoredFailureKinds`
 `failureclass` in production. That test is rewritten to exercise the production
 prompt-building path rather than call `AppendFixerCompletionInstruction`
 directly: it invokes `buildFixerPrompt` (the function containing the
-`runner.go:7307` call site) and asserts the produced prompt offers exactly the
-`failure_kind` values that `parseFixerBlockedFailureKind` honors —
-`string(failureclass.RetryableTransient)` and
-`string(failureclass.ManualIntervention)` as advertised bullets, and not
-`string(failureclass.RetryableAfterResume)` (still accepted on input, not
-advertised). It also
+`runner.go:7307` call site) and parses every advertised bullet token out of the
+produced prompt — each line matching the `- "<value>":` form (a leading `- `, a
+double-quoted value, then `:`) — collecting the quoted values into a set. It
+then compares that parsed set for equality with exactly
+`{string(failureclass.RetryableTransient), string(failureclass.ManualIntervention)}`,
+the subset `parseFixerBlockedFailureKind` honors as advertised outcomes. The
+comparison is set-equality, not membership: a missing expected bullet fails it,
+and so does any extra bullet — `string(failureclass.RetryableAfterResume)`
+(still accepted on input, not advertised) or `string(failureclass.NonRetryable)`
+or any arbitrary third token retained or later added. An agent following a
+stray bullet has its blocked outcome rejected by `parseFixerBlockedFailureKind`,
+so the gate must reject the prompt that advertises it, not merely confirm the
+two expected bullets are present. It also
 asserts the blocked-completion example
 `{"outcome":"blocked","failure_kind":"<value>",...}` embeds
 `string(failureclass.ManualIntervention)` (not the transient value), so a rename
 that updates the bullet but misses the example is caught. This is rename-drift
-coverage only: because the call site fills named struct fields, a positional
-swap is no longer a representable silent mistake, so the test does not need the
-per-bullet description pairing the positional-parameter design required to catch
-swaps. A rename of either shared value updates the call site and the test's
-expected tokens together at compile time, and a removal of either advertised
-bullet is caught because the test asserts both.
+coverage plus advertised-subset coverage: because the call site fills named
+struct fields, a positional swap is no longer a representable silent mistake, so
+the test does not need the per-bullet description pairing the
+positional-parameter design required to catch swaps. A rename of either shared
+value updates the call site and the test's expected tokens together at compile
+time, a removal of either advertised bullet is caught because the parsed set no
+longer equals the expected set, and an addition of any non-honored bullet is
+caught the same way.
 
 ## Alternatives considered
 
@@ -770,7 +780,8 @@ bullet is caught because the test asserts both.
   (`FixerCompletionKinds{RetryableTransient, ManualIntervention}`, Step 6) lets
   the fixer initialize each field explicitly from `string(failureclass.*)`, making
   the swap unrepresentable as a silent positional mistake and deleting the
-  argument-order gate. The cross-component test keeps only its rename-drift role.
+  argument-order gate. The cross-component test keeps its rename-drift and
+  advertised-subset role.
   Recorded here per the guideline that the deletion-first attempt be recorded even
   when adopted.
 - **Generalize the step traversal helpers.** See Step 4 — rejected as net
@@ -860,8 +871,9 @@ test):**
    way it updates the parser, so the two cannot silently diverge. The struct's
    named fields make a positional swap unrepresentable as a silent mistake, so no
    argument-order gate is added; a cross-component fixer test (Step 6) exercises
-   `buildFixerPrompt` and asserts the advertised tokens match the kinds
-   `parseFixerBlockedFailureKind` honors for rename-drift coverage only. The
+   `buildFixerPrompt` and asserts the advertised bullet set equals exactly the
+   kinds `parseFixerBlockedFailureKind` honors for rename-drift and
+   advertised-subset coverage. The
    second spelling no longer exists in production, so no synchronization test
    guarding a duplicate ledger is added.
 
@@ -1063,9 +1075,10 @@ validation constants, types `Policy.FailureKind` as `policy.Kind`, and has
 time in both cases). The fixer-prompt call path is covered by a
 cross-component test: `TestFixerPromptOffersOnlyHonoredFailureKinds`
 (`internal/fixer/runner_repair_outcome_test.go`) is rewritten to exercise
-`buildFixerPrompt` and assert the produced prompt offers exactly the
-`failure_kind` values `parseFixerBlockedFailureKind` honors (derived from
-`failureclass`) as rename-drift coverage; the call site fills named struct
+`buildFixerPrompt`, parse every advertised bullet token out of the produced
+prompt, and assert the parsed set equals exactly the `failure_kind` values
+`parseFixerBlockedFailureKind` honors (derived from `failureclass`) as
+rename-drift and advertised-subset coverage; the call site fills named struct
 fields (`agent.FixerCompletionKinds`), so a positional swap is unrepresentable
 as a silent mistake and no argument-order pinning is needed. The existing
 `internal/agent/prompt_test.go` is rewritten to use arbitrary sentinel `string`
@@ -1321,13 +1334,16 @@ Per `AGENTS.md`, the root commands are the source of truth:
 9. **Fixer-prompt call-site coverage (Step 6).**
    `TestFixerPromptOffersOnlyHonoredFailureKinds`
    (`internal/fixer/runner_repair_outcome_test.go`) is rewritten to exercise
-   `buildFixerPrompt` and assert the produced prompt offers exactly
-   `string(failureclass.RetryableTransient)` and
-   `string(failureclass.ManualIntervention)` as advertised bullets (and not
-   `retryable_after_resume`), matching the kinds `parseFixerBlockedFailureKind`
-   honors, and asserts the blocked-completion example embeds
+   `buildFixerPrompt`, parse every advertised bullet token (each `- "<value>":`
+   line) out of the produced prompt, and assert the parsed set equals exactly
+   `{string(failureclass.RetryableTransient), string(failureclass.ManualIntervention)}`
+   — the kinds `parseFixerBlockedFailureKind` honors as advertised outcomes — so a
+   missing expected bullet or any extra bullet (`retryable_after_resume`,
+   `non_retryable`, or any later-added token) fails the set-equality check, and
+   asserts the blocked-completion example embeds
    `string(failureclass.ManualIntervention)` (not the transient value). This is
-   rename-drift coverage: the call site fills named struct fields
+   rename-drift and advertised-subset coverage: the call site fills named struct
+   fields
    (`agent.FixerCompletionKinds{RetryableTransient: ..., ManualIntervention: ...}`),
    so a positional swap is unrepresentable as a silent mistake and no
    per-bullet description pairing is needed to catch swaps.
@@ -1368,8 +1384,9 @@ via `go/types`, and selects files with `go/build.Context.MatchFile` so
 mutually-exclusive build-constrained files like the worker's
 `specfile_unix.go`/`specfile_other.go` are not both type-checked) — the
 four-kind regression coverage above exists, the fixer-prompt call-site coverage
-test (step 9) exists — exercising `buildFixerPrompt` for rename-drift coverage
-of the advertised `failure_kind` tokens (a positional swap is unrepresentable
+test (step 9) exists — exercising `buildFixerPrompt` for rename-drift and
+advertised-subset coverage of the advertised `failure_kind` tokens via set
+equality (a positional swap is unrepresentable
 because the call site fills named struct fields), with
 `internal/agent/prompt_test.go` using sentinel struct field values and no
 `failureclass` import — the full `go test ./...` suite is green, and the diff
