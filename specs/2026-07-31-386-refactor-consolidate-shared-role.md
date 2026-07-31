@@ -101,8 +101,9 @@ not a solution to it.
 1. **One authority for the failure-kind vocabulary.** `failureclass.Kind`
    becomes the single source for the role runners; the per-role
    `QueueFailureKind` is removed. `internal/validation`'s three `FailureKind*`
-   constants are re-derived directly from `failureclass`
-   (`string(failureclass.*)`) rather than left as a bare-string ledger: every
+   constants are deleted, with `PolicyFor` inlining `string(failureclass.*)`
+   directly at their sole call site rather than leaving a bare-string (or
+   re-exported) ledger: every
    production importer of `internal/validation` (`internal/fixer`,
    `internal/fixer/failurepolicy`, and `internal/worker`) already imports
    `failureclass`, and `failureclass` does not import `validation`, so adding the
@@ -182,69 +183,66 @@ removes a compatibility layer rather than retaining one, per the repo's "prefer
 deletion over another layer" guideline, and is what makes the conversion
 functions deletable in the next step.
 
-In the same step, re-derive `internal/validation`'s three `FailureKind*`
-constants directly from `failureclass` instead of leaving them as a bare-string
-ledger. Today
+In the same step, delete `internal/validation`'s three `FailureKind*`
+constants and inline `string(failureclass.*)` directly at their sole production
+call site, `PolicyFor`. Today
 `validation.FailureKindManualIntervention = loops.FailureKindManualIntervention`
 and `validation.FailureKindRetryableAfterResume = loops.FailureKindRetryableAfterResume`
 (transitively `policy`'s bare strings), while
 `validation.FailureKindRetryableTransient = "retryable_transient"` is a bare
-string with no shared-authority link. Replace all three with direct derivations:
+string with no shared-authority link. The call-site audit establishes that these
+exported constants have no production consumer outside `validation.PolicyFor`,
+which assigns them to `Policy.FailureKind` (declared `string`); from there the
+value flows as a `string` field into `worker.classifyValidationFailure`, which
+applies an explicit `QueueFailureKind(policy.FailureKind)` conversion that takes
+the `string` field, not the constants directly. Only same-package tests
+additionally spell the constant names. Keeping them as re-exported constants
+would preserve an API layer for no caller — and re-exporting them as
+`string(failureclass.*)` would additionally turn the current *untyped* string
+constants into *typed* `string` constants (a source-level type change that
+narrows implicit assignability) without preserving any needed caller — so the
+constants are deleted and `PolicyFor` is rewritten to spell the shared values
+inline:
 
 ```go
-const (
-    FailureKindManualIntervention   = string(failureclass.ManualIntervention)
-    FailureKindRetryableAfterResume = string(failureclass.RetryableAfterResume)
-    FailureKindRetryableTransient   = string(failureclass.RetryableTransient)
-)
+func PolicyFor(category FailureCategory) Policy {
+    switch category {
+    case FailureContextCanceled:
+        return Policy{FailureKind: string(failureclass.RetryableAfterResume), ResumePolicy: loops.ResumePolicyReplayStep}
+    case FailureSupervisorTimeout, FailureInfrastructure:
+        return Policy{FailureKind: string(failureclass.RetryableTransient), ResumePolicy: loops.ResumePolicyReplayStep}
+    case FailureNonZeroExit:
+        return Policy{FailureKind: string(failureclass.ManualIntervention), ResumePolicy: loops.ResumePolicyManualIntervention}
+    default:
+        return Policy{FailureKind: string(failureclass.ManualIntervention), ResumePolicy: loops.ResumePolicyManualIntervention}
+    }
+}
 ```
 
-This is a value-preserving change but **not** a value-only one: it is a
-source-level type change. Today the three constants are *untyped* string
-constants (`policy.FailureKindManualIntervention` and
-`policy.FailureKindRetryableAfterResume` are declared without a type, and
-`validation.FailureKindRetryableTransient` is a bare literal), so an in-module
-caller can assign them to any named type whose underlying type is `string`
-without a conversion. Each `string(failureclass.*)` conversion, however,
-produces a *typed* `string` constant: `failureclass.ManualIntervention` et al.
-are declared as `Kind` (a named type), and converting a named-type constant via
-`string(...)` yields a constant of type `string`, not an untyped string
-constant. A typed `string` constant is no longer implicitly assignable to a
-distinct named string type — a caller that today writes
-`var x QueueFailureKind = validation.FailureKindManualIntervention` (relying on
-the untyped constant's implicit conversion) would stop compiling after the
-change and would need an explicit `QueueFailureKind(...)` conversion. So `go
-build` establishes compatibility only for the call sites that exist today, not
-for the untyped API contract in general.
+The two same-package tests that spell the constant names are updated to compare
+against the shared values instead:
+`internal/validation/validation_test.go`'s
+`TestRunCommandsKeepsPolicyWordsDiagnosticForNonZeroExit` compares
+`policy.FailureKind` to `FailureKindManualIntervention`, and
+`TestPolicyForOperationalFailureCategory` table-tests all three; both are
+rewritten to expect `string(failureclass.ManualIntervention)`,
+`string(failureclass.RetryableAfterResume)`, and
+`string(failureclass.RetryableTransient)` respectively, so the test expectations
+stay pinned to the shared authority after the constants are gone. No production
+consumer references the constant names, so no other call site changes.
 
-The audit of present call sites: the only production use of the three
-`validation.FailureKind*` constants is inside `validation.PolicyFor`, which
-assigns them to `Policy.FailureKind` (declared `string`) — a typed-`string`-to-
-`string` assignment that still compiles. From there the value flows as a `string`
-field into `worker.classifyValidationFailure`, which applies an explicit
-`QueueFailureKind(policy.FailureKind)` conversion; that conversion takes the
-`string` field, not the constants directly, and is unaffected by the constants'
-typing. No in-module caller assigns any `validation.FailureKind*` constant
-directly to a distinct named string type, so `go build` confirms every present
-call site compiles. The untyped API contract cannot be preserved *while also*
-deleting the ledger via `failureclass` derivation: any conversion from the typed
-`Kind` (`string(failureclass.*)`) yields a typed `string` constant, and the only
-way to keep the constants untyped is to keep bare literals or re-export
-`policy`'s untyped constants — which is the ledger this step deletes. The
-typed-`string` derivation is therefore the chosen trade-off, assessed against
-Goal 3 as follows: the runtime values are byte-identical (each constant still
-resolves to the same string, so the persisted kind strings, retry/hold
-decisions, and resume-policy derivation are unchanged), and the only thing that
-changes is compile-time assignability of the exported constants, which the
-call-site audit plus `go build` confirms does not break any present consumer.
-
-This deletes the validation ledger outright rather than pinning it with a
-test-only synchronization gate, per the repo's "prefer deletion over another
-layer" guideline. Adding the `failureclass` import to `validation` is safe:
-every production importer of `validation` (`internal/fixer`,
-`internal/fixer/failurepolicy`, `internal/worker`) already imports
-`failureclass`, and `failureclass` does not import `validation`, so no cycle is
-created and no importer gains a transitive dependency it did not already carry.
+This deletes the validation ledger outright rather than re-exporting it as
+typed-string constants or pinning it with a test-only synchronization gate, per
+the repo's "prefer deletion over another layer" guideline: there is no caller to
+preserve, so the layer adds only the documented source-level incompatibility.
+Because the values are now spelled inline as `string(failureclass.*)`, a rename
+of any `failureclass.Kind` value propagates to `PolicyFor` at compile time and
+no validation drift test is needed. Adding the `failureclass` import to
+`validation` is safe: every production importer of `validation`
+(`internal/fixer`, `internal/fixer/failurepolicy`, `internal/worker`) already
+imports `failureclass`, and `failureclass` does not import `validation`, so no
+cycle is created and no importer gains a transitive dependency it did not
+already carry.
 
 ### Step 2 — Delete the `xxxFailureKind` conversion functions; preserve the unknown-kind fallback
 
@@ -313,11 +311,11 @@ for every workflow package, so the values are pinned by test instead of by
 import.
 
 (`internal/validation` also re-declared the same vocabulary as bare `string`
-constants, but Step 1 now re-derives those constants directly from
-`failureclass` (`string(failureclass.*)`), deleting that ledger outright rather
-than pinning it by test; see Step 1 for the no-cycle justification. No
+constants, but Step 1 now deletes those constants and inlines
+`string(failureclass.*)` directly in `PolicyFor`, deleting that ledger outright
+rather than pinning it by test; see Step 1 for the no-cycle justification. No
 validation drift test is added or needed — a rename of a `failureclass` value
-updates the validation constants at compile time.)
+updates `PolicyFor` at compile time.)
 
 Add a drift-detection test that asserts each `policy` bare-string spelling
 matches the shared `failureclass` value. The test lives in `internal/loops` —
@@ -366,21 +364,40 @@ parser still accepts — see the comment at `parseFixerBlockedFailureKind`), so 
 test asserts only the advertised subset, not the full parser allowlist.
 
 The match must be on token boundaries, not an unconstrained `strings.Contains`
-over the bare value. `AppendFixerCompletionInstruction` emits each advertised
-value as a quoted bullet token of the form `- "retryable_transient":` (a leading
-`- `, a double-quoted value, then `:`), so the test reconstructs the exact
-expected token from the shared constant —
-`"- " + strconv.Quote(string(failureclass.RetryableTransient)) + ":"` and the
-same for `ManualIntervention` — and asserts the prompt contains that exact token.
+over the bare value. `AppendFixerCompletionInstruction` advertises each
+`failure_kind` value in two distinct forms, and the test reconstructs both from
+the shared constants so a rename that updates one form but misses the other
+fails the suite:
+
+1. The quoted bullet tokens `- "retryable_transient":` and
+   `- "manual_intervention":` (a leading `- `, a double-quoted value, then `:`).
+   The test reconstructs each expected token from the shared constant —
+   `"- " + strconv.Quote(string(failureclass.RetryableTransient)) + ":"` and the
+   same for `ManualIntervention` — and asserts the prompt contains that exact
+   token.
+2. The blocked-completion example at `internal/agent/prompt.go:57`
+   (`{"outcome":"blocked","failure_kind":"manual_intervention","summary":"<one-sentence summary>"}`)
+   independently embeds `manual_intervention` as a `"failure_kind":"<value>"`
+   occurrence. That example is a separate spelling of the same vocabulary: if
+   `ManualIntervention` is renamed and the bullet token is updated but the
+   example is missed, the prompt keeps demonstrating a value that
+   `parseFixerBlockedFailureKind` would reject after the rename, while the
+   bullet-only assertions still pass. The test therefore reconstructs the
+   example's `failure_kind` fragment from the shared constant —
+   `"\"failure_kind\":" + strconv.Quote(string(failureclass.ManualIntervention))`
+   — and asserts the prompt contains that exact fragment, so a rename that
+   misses the example fails the suite.
+
 A bare `Contains(prompt, string(failureclass.ManualIntervention))` would still
 pass after a rename to a shorter value that is a substring of the old prompt
 literal (e.g. renaming `ManualIntervention` to `"manual"` or
 `RetryableTransient` to `"retryable"` leaves the old `"manual_intervention"` /
 `"retryable_transient"` prompt literal still matching), so the parser would
 accept the new value while the prompt keeps advertising the old one and the test
-would not fail. Reconstructing the quoted bullet token from the shared constant
-makes a rename change the expected token (e.g. to `- "manual":`), which no longer
-matches the stale literal in the prompt, so the drift fails the suite.
+would not fail. Reconstructing both the quoted bullet tokens and the example's
+`failure_kind` fragment from the shared constants makes a rename change every
+expected token (e.g. to `- "manual":` and `"failure_kind":"manual"`), so a stale
+literal in either form no longer matches and the drift fails the suite.
 
 ## Alternatives considered
 
@@ -427,11 +444,11 @@ the unknown-kind fallback explicitly.
 > What does it still not catch?
 
 This refactor targets the per-role `QueueFailureKind` ledger and the
-`internal/validation` bare-string ledger (deleted by direct derivation in Step
-1). It is deliberately not a repo-wide audit of every bare-string spelling of
-the vocabulary. The remaining spellings split into two groups: those pinned to
-`failureclass` by test (caught, but not by import), and those explicitly out of
-scope (not caught at all).
+`internal/validation` bare-string ledger (deleted by inlining
+`string(failureclass.*)` in `PolicyFor` in Step 1). It is deliberately not a
+repo-wide audit of every bare-string spelling of the vocabulary. The remaining
+spellings split into two groups: those pinned to `failureclass` by test (caught,
+but not by import), and those explicitly out of scope (not caught at all).
 
 **Pinned by drift-detection test (caught, not by import):**
 
@@ -454,8 +471,11 @@ scope (not caught at all).
    signatures and branches.
 2. `internal/agent/prompt.go:55-57` (`AppendFixerCompletionInstruction`) embeds
    `retryable_transient` and `manual_intervention` as string literals in the
-   prompt that advertises the `failure_kind` values the fixer agent may report.
-   That prompt is the advertising layer for `parseFixerBlockedFailureKind`: the
+   prompt that advertises the `failure_kind` values the fixer agent may report,
+   in two forms: the quoted bullet tokens (`- "retryable_transient":`,
+   `- "manual_intervention":`) and the blocked-completion example
+   (`{"outcome":"blocked","failure_kind":"manual_intervention",...}`). That
+   prompt is the advertising layer for `parseFixerBlockedFailureKind`: the
    parser bounds what the agent returns, but the prompt tells the agent what to
    return. The literals are not derived from `failureclass`, so a rename of
    `failureclass.RetryableTransient` or `failureclass.ManualIntervention` would
@@ -464,15 +484,18 @@ scope (not caught at all).
    failing. The existing `internal/agent/prompt_test.go` asserts the literals
    too, not the shared constants. Step 6 adds a cross-component drift test
    asserting the prompt advertises the exact quoted bullet token reconstructed
-   from the shared constant (`"- " + strconv.Quote(string(failureclass.*)) + ":"`),
-   matching on token boundaries rather than an unconstrained `Contains` over the
-   bare value (a substring match would still pass after a rename to a shorter
-   value that is a substring of the old prompt literal), so a rename of either
-   shared value fails the suite unless the prompt is updated in the same change.
+   from the shared constant (`"- " + strconv.Quote(string(failureclass.*)) + ":"`)
+   and the blocked-completion example's `"failure_kind":"<value>"` fragment
+   reconstructed from `string(failureclass.ManualIntervention)`, matching on
+   token boundaries rather than an unconstrained `Contains` over the bare value
+   (a substring match would still pass after a rename to a shorter value that is
+   a substring of the old prompt literal), so a rename of either shared value —
+   or a rename that updates one form but misses the other — fails the suite
+   unless the prompt is updated in the same change.
 
 (`internal/validation`'s three `FailureKind*` constants previously belonged in
-this group; Step 1 now re-derives them directly from `failureclass`, so a rename
-propagates at compile time and no drift test is needed.)
+this group; Step 1 now deletes them and inlines `string(failureclass.*)` in
+`PolicyFor`, so a rename propagates at compile time and no drift test is needed.)
 
 **Explicitly out of scope (not caught — recorded here so a future rename does
 not pass silently):**
@@ -581,11 +604,11 @@ Infra signals remain for drift detection, not authority.
 - `internal/planner/runner.go` — delete `QueueFailureKind` + delete `plannerFailureKind` + `s/QueueFailureKind/failureclass.Kind/` + call-site edits.
 - `internal/runtime/scheduler.go` — `workerRunCompletedNotificationInput.FailureKind` becomes `failureclass.Kind` (the one `QueueFailureKind` reference here).
 - `internal/loops/failureclass/failureclass.go` — add `Normalize(kind Kind) Kind` (the authority for the unknown-kind fallback); `Classify` logic unchanged.
-- `internal/validation/validation.go` — re-derive the three `FailureKind*`
-  constants directly from `failureclass` (`string(failureclass.*)`) and add the
-  `failureclass` import; the constants become typed `string` (a source-level
-  type change from the current untyped string constants), but every present
-  consumer compiles unchanged — see the call-site audit in Step 1.
+- `internal/validation/validation.go` — delete the three `FailureKind*`
+  constants, inline `string(failureclass.*)` directly in `PolicyFor`, and add
+  the `failureclass` import; the two same-package tests that spell the constant
+  names are updated to compare against `string(failureclass.*)` — see the
+  call-site audit in Step 1.
 
 **Files unchanged but verified:**
 - `internal/loops/policy/policy.go` — untouched. Its two string constants stay
@@ -593,9 +616,10 @@ Infra signals remain for drift detection, not authority.
   caught by the new test in `internal/loops` (Step 5), not by an import that
   would break `policy`'s stdlib-only leaf property.
 - `internal/agent/prompt.go` — untouched. The `retryable_transient` and
-  `manual_intervention` literals in `AppendFixerCompletionInstruction` stay as
-  prompt text; drift is caught by the new cross-component test in
-  `internal/agent` (Step 6) that compares the advertised literals to
+  `manual_intervention` literals in `AppendFixerCompletionInstruction` (both the
+  quoted bullet tokens and the blocked-completion example) stay as prompt text;
+  drift is caught by the new cross-component test in `internal/agent` (Step 6)
+  that compares every advertised `failure_kind` occurrence to
   `string(failureclass.*)`.
 
 **Test files:** Call sites in `*_test.go` that reference `FailureRetryable*`
@@ -611,9 +635,9 @@ of the three asserts all four kinds; they cover `retryable_transient` and
 adds the missing focused coverage (see Validation step 6) rather than relying on
 a four-kind net that does not yet exist. New drift-detection tests are added in
 `internal/loops` (policy) and `internal/agent` (fixer prompt literals), per
-Steps 5 and 6; no validation drift test is added because Step 1 re-derives the
-validation constants directly from `failureclass` (a rename propagates at
-compile time).
+Steps 5 and 6; no validation drift test is added because Step 1 deletes the
+validation constants and inlines `string(failureclass.*)` in `PolicyFor` (a
+rename propagates at compile time).
 
 **No persisted-state change:** The string values written to the queue/run
 records are identical before and after. No migration, no schema touch.
@@ -748,23 +772,27 @@ Per `AGENTS.md`, the root commands are the source of truth:
    `policy.FailureKindManualIntervention == string(failureclass.ManualIntervention)`,
    so a rename of either shared value that leaves `NormalizeResumePolicy`
    matching the old spelling fails the suite. (No validation drift test is
-   needed: Step 1 re-derives `validation.FailureKind*` directly from
-   `failureclass`, so a rename propagates at compile time.)
+   needed: Step 1 deletes `validation.FailureKind*` and inlines
+   `string(failureclass.*)` in `PolicyFor`, so a rename propagates at compile
+   time.)
 9. **Fixer prompt drift detection (Step 6).** A cross-component test in
    `internal/agent` asserts the prompt text from `AppendFixerCompletionInstruction`
    contains the exact quoted bullet token reconstructed from the shared constant
    (`"- " + strconv.Quote(string(failureclass.RetryableTransient)) + ":"` and the
-   same for `ManualIntervention`), matching on token boundaries rather than an
-   unconstrained `Contains` over the bare value, so a rename of either shared
-   value (including a rename to a shorter value that is a substring of the old
-   prompt literal) fails the suite unless the prompt is updated in the same
-   change.
+   same for `ManualIntervention`) and the blocked-completion example's
+   `"failure_kind":"<value>"` fragment reconstructed from
+   `string(failureclass.ManualIntervention)`, matching on token boundaries
+   rather than an unconstrained `Contains` over the bare value, so a rename of
+   either shared value (including a rename to a shorter value that is a
+   substring of the old prompt literal, or a rename that updates one advertised
+   form but misses the other) fails the suite unless the prompt is updated in
+   the same change.
 
 **Definition of done:** `QueueFailureKind` is gone from all four runners (the 60
 type-name references replaced by `failureclass.Kind`), the four `xxxFailureKind`
 functions are gone and `failureclass.Normalize` preserves their unknown-kind →
 `non_retryable` fallback, `internal/validation`'s `FailureKind*` constants are
-re-derived from `failureclass` (`string(failureclass.*)`), the deleted-symbol
+deleted and `PolicyFor` inlines `string(failureclass.*)`, the deleted-symbol
 absence check (step 7) passes, the four-kind regression coverage above exists,
 the policy drift-detection test (step 8) and the fixer prompt drift-detection
 test (step 9) exist, the full `go test ./...` suite is green, and the diff
