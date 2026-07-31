@@ -81,6 +81,32 @@ else
   fail=$((fail + 1))
 fi
 
+# --- stdin mode: a blank line is a blank subject, not a separator to skip ---
+blank_stdin_rc=0
+printf 'feat: ok\n\nfix: ok two\n' | "$script" --stdin >/dev/null 2>&1 || blank_stdin_rc=$?
+if [ $blank_stdin_rc -ne 0 ]; then
+  pass=$((pass + 1))
+else
+  echo "FAIL (stdin batch with a blank line should exit non-zero)" >&2
+  fail=$((fail + 1))
+fi
+
+# --- `--` forces a literal subject that looks like the --stdin flag ---
+if ! "$script" -- "--stdin" >/dev/null 2>&1; then
+  pass=$((pass + 1))
+else
+  echo "FAIL (literal '--stdin' subject after -- should fail validation)" >&2
+  fail=$((fail + 1))
+fi
+
+# --- `--` still lets a valid subject through ---
+if "$script" -- "feat: valid after dashdash" >/dev/null 2>&1; then
+  pass=$((pass + 1))
+else
+  echo "FAIL (valid subject after -- should pass)" >&2
+  fail=$((fail + 1))
+fi
+
 # --- usage error: no args exits non-zero ---
 usage_rc=0
 "$script" >/dev/null 2>&1 || usage_rc=$?

@@ -12,6 +12,7 @@
 #
 # Usage:
 #   scripts/check-semantic-prefix.sh <subject>          # validate one subject
+#   scripts/check-semantic-prefix.sh -- <subject>       # force a literal subject
 #   printf 'subj1\nsubj2\n' | scripts/check-semantic-prefix.sh --stdin
 #
 # Exit status is non-zero if any subject fails. The allowed prefixes are
@@ -49,11 +50,19 @@ main() {
   local rc=0
   if [ "${1:-}" = "--stdin" ]; then
     shift
+    # An empty line is a commit with a blank subject, not a separator to
+    # skip: validate it so a blank subject fails the check instead of
+    # being silently ignored.
     while IFS= read -r line; do
-      [ -z "$line" ] && continue
       validate_one "$line" || rc=1
     done
   elif [ $# -ge 1 ]; then
+    # `--` ends option parsing so a literal subject that looks like a flag
+    # (e.g. a PR title of "--stdin") is validated instead of being mistaken
+    # for the stdin mode.
+    if [ "${1:-}" = "--" ]; then
+      shift
+    fi
     validate_one "$1" || rc=1
   else
     echo "usage: $0 <subject> | --stdin (one subject per line)" >&2

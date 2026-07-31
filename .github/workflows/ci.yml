@@ -10,6 +10,7 @@ on:
       - synchronize
       - reopened
       - ready_for_review
+      - edited
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -190,7 +191,7 @@ jobs:
           PR_TITLE: ${{ github.event.pull_request.title }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
-          scripts/check-semantic-prefix.sh "$PR_TITLE"
+          scripts/check-semantic-prefix.sh -- "$PR_TITLE"
           git log --no-merges --format=%s "${BASE_SHA}..HEAD" \
             | scripts/check-semantic-prefix.sh --stdin
 
