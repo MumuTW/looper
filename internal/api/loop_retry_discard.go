@@ -81,6 +81,7 @@ type checkpointWorktreeRef struct {
 	ID       string `json:"id,omitempty"`
 	Path     string `json:"path,omitempty"`
 	Branch   string `json:"branch,omitempty"`
+	HeadSHA  string `json:"headSha,omitempty"`
 	PRNumber int64  `json:"prNumber,omitempty"`
 }
 
@@ -157,10 +158,12 @@ func (h *Handler) loopWorktreeStatus(ctx context.Context, loop storage.LoopRecor
 			}
 			gateway := gitinfra.New(gitinfra.Options{GitPath: gitPath, Repos: services.Repositories, Now: h.now})
 			if identityErr := gateway.VerifyWorktreeIdentity(ctx, gitinfra.VerifyWorktreeIdentityInput{
-				RepoPath:       project.RepoPath,
-				WorktreeRoot:   resolved.WorktreeRoot,
-				WorktreePath:   path,
-				ExpectedBranch: strings.TrimSpace(resolved.Branch),
+				RepoPath:        project.RepoPath,
+				WorktreeRoot:    resolved.WorktreeRoot,
+				WorktreePath:    path,
+				ExpectedBranch:  strings.TrimSpace(resolved.Branch),
+				ExpectedHeadSHA: resolved.ExpectedHeadSHA,
+				CheckoutMode:    resolved.CheckoutMode,
 			}); identityErr != nil {
 				return loopWorktreeStatusResponse{}, apiError{
 					code:    pkgapi.ErrorCodeValidationFailed,
@@ -285,10 +288,12 @@ func (h *Handler) discardLoopWorktreeChanges(ctx context.Context, services loope
 	}
 	gateway := gitinfra.New(gitinfra.Options{GitPath: gitPath, Repos: services.Repositories, Now: h.now})
 	discard, err := gateway.DiscardWorktreeChanges(ctx, gitinfra.DiscardWorktreeChangesInput{
-		RepoPath:       project.RepoPath,
-		WorktreeRoot:   resolved.WorktreeRoot,
-		WorktreePath:   resolved.Path,
-		ExpectedBranch: resolved.Branch,
+		RepoPath:        project.RepoPath,
+		WorktreeRoot:    resolved.WorktreeRoot,
+		WorktreePath:    resolved.Path,
+		ExpectedBranch:  resolved.Branch,
+		ExpectedHeadSHA: resolved.ExpectedHeadSHA,
+		CheckoutMode:    resolved.CheckoutMode,
 	})
 	if err != nil {
 		return worktreeDiscardResult{}, apiError{
@@ -345,13 +350,15 @@ func (h *Handler) discardLoopWorktreeChanges(ctx context.Context, services loope
 }
 
 type managedWorktreeRef struct {
-	Path         string
-	Branch       string
-	ID           string
-	WorktreeRoot string
-	Source       string
-	Managed      bool
-	UnsafeReason string
+	Path            string
+	Branch          string
+	ID              string
+	ExpectedHeadSHA string
+	CheckoutMode    gitinfra.CheckoutMode
+	WorktreeRoot    string
+	Source          string
+	Managed         bool
+	UnsafeReason    string
 }
 
 func resolveManagedWorktreeForLoop(ctx context.Context, repos *storage.Repositories, project storage.ProjectRecord, loop storage.LoopRecord) (*managedWorktreeRef, error) {
@@ -379,6 +386,11 @@ func resolveManagedWorktreeForLoop(ctx context.Context, repos *storage.Repositor
 		prNumber = fromCheckpoint.PRNumber
 	}
 
+	expectedHeadSHA := ""
+	if fromCheckpoint != nil {
+		expectedHeadSHA = strings.TrimSpace(fromCheckpoint.HeadSHA)
+	}
+	checkoutMode := gitinfra.CheckoutModeBranch
 	var record *storage.WorktreeRecord
 	unsafeReason := ""
 	if fromCheckpoint != nil {
@@ -388,6 +400,10 @@ func resolveManagedWorktreeForLoop(ctx context.Context, repos *storage.Repositor
 				return nil, err
 			}
 			if record != nil {
+				checkoutMode = checkoutModeForWorktreeRecord(*record)
+				if expectedHeadSHA == "" {
+					expectedHeadSHA = derefString(record.HeadSHA)
+				}
 				checkpointPath := strings.TrimSpace(fromCheckpoint.Path)
 				if record.ProjectID != project.ID {
 					return nil, apiError{
@@ -396,17 +412,22 @@ func resolveManagedWorktreeForLoop(ctx context.Context, repos *storage.Repositor
 						message: fmt.Sprintf("Cannot use checkpointed worktree %s for loop %s: it belongs to another project", id, loop.ID),
 					}
 				}
-				checkpointBranch := strings.TrimSpace(fromCheckpoint.Branch)
-				pathMismatch := checkpointPath != "" && !sameFilesystemPath(record.WorktreePath, checkpointPath)
-				branchMismatch := checkpointBranch != "" && strings.TrimSpace(record.Branch) != checkpointBranch
-				if pathMismatch || branchMismatch {
-					// A worktree row can be retargeted when AdoptPath moves the
-					// branch identity to a replacement checkout. The checkpoint's
-					// ID, path, and branch jointly identify the progress an operator
-					// may choose to discard; accepting any part independently could
-					// reset the replacement checkout that the worker refused to use.
-					unsafeReason = "checkpoint_identity_mismatch"
+				if record.CleanedAt != nil || record.Status == "cleaned" || record.Status == "retired" {
+					unsafeReason = "checkpoint_identity_inactive"
 					record = nil
+				} else {
+					checkpointBranch := strings.TrimSpace(fromCheckpoint.Branch)
+					pathMismatch := checkpointPath != "" && !sameFilesystemPath(record.WorktreePath, checkpointPath)
+					branchMismatch := checkpointBranch != "" && strings.TrimSpace(record.Branch) != checkpointBranch
+					if pathMismatch || branchMismatch {
+						// A worktree row can be retargeted when AdoptPath moves the
+						// branch identity to a replacement checkout. The checkpoint's
+						// ID, path, and branch jointly identify the progress an operator
+						// may choose to discard; accepting any part independently could
+						// reset the replacement checkout that the worker refused to use.
+						unsafeReason = "checkpoint_identity_mismatch"
+						record = nil
+					}
 				}
 			}
 			if record == nil && unsafeReason == "" {
@@ -445,6 +466,10 @@ func resolveManagedWorktreeForLoop(ctx context.Context, repos *storage.Repositor
 	id := ""
 	source := ""
 	if record != nil && strings.TrimSpace(record.WorktreePath) != "" && record.CleanedAt == nil {
+		checkoutMode = checkoutModeForWorktreeRecord(*record)
+		if expectedHeadSHA == "" {
+			expectedHeadSHA = derefString(record.HeadSHA)
+		}
 		path = strings.TrimSpace(record.WorktreePath)
 		branch = strings.TrimSpace(record.Branch)
 		id = record.ID
@@ -455,6 +480,9 @@ func resolveManagedWorktreeForLoop(ctx context.Context, repos *storage.Repositor
 		branch = strings.TrimSpace(fromCheckpoint.Branch)
 		id = strings.TrimSpace(fromCheckpoint.ID)
 		source = "checkpoint"
+	}
+	if checkoutMode != gitinfra.CheckoutModeDetached && strings.HasSuffix(filepath.Base(path), "-detached") {
+		checkoutMode = gitinfra.CheckoutModeDetached
 	}
 	if path == "" {
 		return nil, nil
@@ -484,13 +512,15 @@ func resolveManagedWorktreeForLoop(ctx context.Context, repos *storage.Repositor
 	}
 
 	return &managedWorktreeRef{
-		Path:         path,
-		Branch:       branch,
-		ID:           id,
-		WorktreeRoot: worktreeRoot,
-		Source:       source,
-		Managed:      managed,
-		UnsafeReason: unsafeReason,
+		Path:            path,
+		Branch:          branch,
+		ID:              id,
+		ExpectedHeadSHA: expectedHeadSHA,
+		CheckoutMode:    checkoutMode,
+		WorktreeRoot:    worktreeRoot,
+		Source:          source,
+		Managed:         managed,
+		UnsafeReason:    unsafeReason,
 	}, nil
 }
 
@@ -504,11 +534,13 @@ func parseCheckpointWorktree(raw *string) *checkpointWorktreeRef {
 	}
 	path := ""
 	branch := ""
+	headSHA := ""
 	id := ""
 	prNumber := int64(0)
 	if checkpoint.Worktree != nil {
 		path = strings.TrimSpace(checkpoint.Worktree.Path)
 		branch = strings.TrimSpace(checkpoint.Worktree.Branch)
+		headSHA = strings.TrimSpace(checkpoint.Worktree.HeadSHA)
 		id = strings.TrimSpace(checkpoint.Worktree.ID)
 	}
 	// Dirty prepare-worktree often aborts before checkpoint.worktree is set.
@@ -533,10 +565,10 @@ func parseCheckpointWorktree(raw *string) *checkpointWorktreeRef {
 	if branch == "" && checkpoint.Detail != nil {
 		branch = strings.TrimSpace(checkpoint.Detail.HeadRefName)
 	}
-	if path == "" && branch == "" && id == "" && prNumber == 0 {
+	if path == "" && branch == "" && headSHA == "" && id == "" && prNumber == 0 {
 		return nil
 	}
-	return &checkpointWorktreeRef{ID: id, Path: path, Branch: branch, PRNumber: prNumber}
+	return &checkpointWorktreeRef{ID: id, Path: path, Branch: branch, HeadSHA: headSHA, PRNumber: prNumber}
 }
 
 func findProjectWorktreeByPath(ctx context.Context, repos *storage.Repositories, projectID, path string) (*storage.WorktreeRecord, error) {
@@ -682,6 +714,21 @@ func projectWorktreeRoot(project storage.ProjectRecord) (string, error) {
 		}
 	}
 	return config.DefaultProjectWorktreeRoot(project.ID, project.RepoPath)
+}
+
+func checkoutModeForWorktreeRecord(record storage.WorktreeRecord) gitinfra.CheckoutMode {
+	if record.MetadataJSON != nil && strings.TrimSpace(*record.MetadataJSON) != "" {
+		var metadata map[string]any
+		if json.Unmarshal([]byte(*record.MetadataJSON), &metadata) == nil {
+			if value, ok := metadata["checkoutMode"].(string); ok && value == string(gitinfra.CheckoutModeDetached) {
+				return gitinfra.CheckoutModeDetached
+			}
+		}
+	}
+	if strings.HasSuffix(filepath.Base(strings.TrimSpace(record.WorktreePath)), "-detached") {
+		return gitinfra.CheckoutModeDetached
+	}
+	return gitinfra.CheckoutModeBranch
 }
 
 func sameFilesystemPath(a, b string) bool {

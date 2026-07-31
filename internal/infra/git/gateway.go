@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
@@ -96,10 +97,12 @@ type InspectHeadResult struct {
 }
 
 type VerifyWorktreeIdentityInput struct {
-	RepoPath       string
-	WorktreeRoot   string
-	WorktreePath   string
-	ExpectedBranch string
+	RepoPath        string
+	WorktreeRoot    string
+	WorktreePath    string
+	ExpectedBranch  string
+	ExpectedHeadSHA string
+	CheckoutMode    CheckoutMode
 }
 
 type CommitInput struct {
@@ -130,10 +133,12 @@ type CleanupWorktreeInput struct {
 // DiscardWorktreeChangesInput discards tracked and untracked local changes in a
 // managed worktree, leaving HEAD and the worktree directory itself intact.
 type DiscardWorktreeChangesInput struct {
-	RepoPath       string
-	WorktreeRoot   string
-	WorktreePath   string
-	ExpectedBranch string
+	RepoPath        string
+	WorktreeRoot    string
+	WorktreePath    string
+	ExpectedBranch  string
+	ExpectedHeadSHA string
+	CheckoutMode    CheckoutMode
 }
 
 // DiscardWorktreeChangesResult reports whether discard mutated the worktree.
@@ -320,11 +325,12 @@ func (g *Gateway) CreateWorktree(ctx context.Context, input CreateWorktreeInput)
 		BaseBranch:   stringPtr(baseBranch),
 		Status:       "active",
 		HeadSHA:      stringPtrIfNotEmpty(headSHA),
-		MetadataJSON: stringPtr(`{"recovered":false}`),
+		MetadataJSON: worktreeRecordMetadata(nil, checkoutMode, false),
 		CreatedAt:    valueOr(existingRecordCreatedAt(existingRecord), nowISO),
 		UpdatedAt:    nowISO,
 		CleanedAt:    nil,
 	}
+	record.MetadataJSON = worktreeRecordMetadata(record.MetadataJSON, checkoutMode, false)
 
 	if g.repos != nil {
 		if err := g.repos.Worktrees.AdoptPath(ctx, record); err != nil {
@@ -507,7 +513,7 @@ func (g *Gateway) RestoreWorktree(ctx context.Context, input RestoreWorktreeInpu
 		BaseBranch:   stringPtr(input.Branch),
 		Status:       "active",
 		HeadSHA:      stringPtrIfNotEmpty(match.HeadSHA),
-		MetadataJSON: stringPtr(`{"recovered":true}`),
+		MetadataJSON: worktreeRecordMetadata(nil, checkoutMode, true),
 		CreatedAt:    nowISO,
 		UpdatedAt:    nowISO,
 		CleanedAt:    nil,
@@ -532,6 +538,7 @@ func (g *Gateway) RestoreWorktree(ctx context.Context, input RestoreWorktreeInpu
 			record.CreatedAt = nowISO
 		}
 	}
+	record.MetadataJSON = worktreeRecordMetadata(record.MetadataJSON, checkoutMode, true)
 
 	if err := worktreesafety.ClearFixerOwnerToken(record.WorktreePath); err != nil {
 		return nil, err
@@ -629,16 +636,17 @@ func (g *Gateway) DiscardWorktreeChanges(ctx context.Context, input DiscardWorkt
 	if err := g.validateMutationWorktree(worktreePath, input.RepoPath, input.WorktreeRoot); err != nil {
 		return DiscardWorktreeChangesResult{}, err
 	}
-	if err := g.VerifyWorktreeIdentity(ctx, VerifyWorktreeIdentityInput{
-		RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: worktreePath, ExpectedBranch: input.ExpectedBranch,
-	}); err != nil {
-		return DiscardWorktreeChangesResult{}, fmt.Errorf("verify worktree identity before discard: %w", err)
-	}
 	if _, err := os.Stat(worktreePath); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return DiscardWorktreeChangesResult{WorktreePath: worktreePath, NoOp: true}, nil
 		}
 		return DiscardWorktreeChangesResult{}, err
+	}
+	if err := g.VerifyWorktreeIdentity(ctx, VerifyWorktreeIdentityInput{
+		RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: worktreePath,
+		ExpectedBranch: input.ExpectedBranch, ExpectedHeadSHA: input.ExpectedHeadSHA, CheckoutMode: input.CheckoutMode,
+	}); err != nil {
+		return DiscardWorktreeChangesResult{}, fmt.Errorf("verify worktree identity before discard: %w", err)
 	}
 
 	clean, err := g.WorktreeClean(ctx, worktreePath)
@@ -859,17 +867,6 @@ func (g *Gateway) VerifyWorktreeIdentity(ctx context.Context, input VerifyWorktr
 	if err := g.validateMutationWorktree(input.WorktreePath, input.RepoPath, input.WorktreeRoot); err != nil {
 		return err
 	}
-	expectedBranch := strings.TrimSpace(input.ExpectedBranch)
-	if expectedBranch == "" {
-		return fmt.Errorf("expected worktree branch is required")
-	}
-	actualBranch, err := g.getCurrentBranch(ctx, input.WorktreePath)
-	if err != nil {
-		return fmt.Errorf("inspect current worktree branch: %w", err)
-	}
-	if actualBranch != expectedBranch {
-		return fmt.Errorf("worktree branch is %q, expected %q", actualBranch, expectedBranch)
-	}
 	repoCommon, err := g.gitCommonDir(ctx, input.RepoPath)
 	if err != nil {
 		return fmt.Errorf("inspect project repository identity: %w", err)
@@ -881,7 +878,53 @@ func (g *Gateway) VerifyWorktreeIdentity(ctx context.Context, input VerifyWorktr
 	if repoCommon != worktreeCommon {
 		return fmt.Errorf("worktree does not belong to project repository")
 	}
+	if normalizeCheckoutMode(input.CheckoutMode) == CheckoutModeDetached {
+		expectedHeadSHA := strings.TrimSpace(input.ExpectedHeadSHA)
+		if expectedHeadSHA == "" {
+			return fmt.Errorf("expected detached worktree head is required")
+		}
+		actualBranch, err := g.getCurrentBranch(ctx, input.WorktreePath)
+		if err != nil {
+			return fmt.Errorf("inspect current worktree branch: %w", err)
+		}
+		if actualBranch != "" {
+			return fmt.Errorf("worktree branch is %q, expected detached checkout", actualBranch)
+		}
+		actualHeadSHA, err := g.getHeadSHA(ctx, input.WorktreePath)
+		if err != nil {
+			return fmt.Errorf("inspect detached worktree head: %w", err)
+		}
+		if actualHeadSHA != expectedHeadSHA {
+			return fmt.Errorf("worktree head is %q, expected %q", actualHeadSHA, expectedHeadSHA)
+		}
+		return nil
+	}
+	expectedBranch := strings.TrimSpace(input.ExpectedBranch)
+	if expectedBranch == "" {
+		return fmt.Errorf("expected worktree branch is required")
+	}
+	actualBranch, err := g.getCurrentBranch(ctx, input.WorktreePath)
+	if err != nil {
+		return fmt.Errorf("inspect current worktree branch: %w", err)
+	}
+	if actualBranch != expectedBranch {
+		return fmt.Errorf("worktree branch is %q, expected %q", actualBranch, expectedBranch)
+	}
 	return nil
+}
+
+func worktreeRecordMetadata(raw *string, checkoutMode CheckoutMode, recovered bool) *string {
+	metadata := map[string]any{}
+	if raw != nil && strings.TrimSpace(*raw) != "" {
+		_ = json.Unmarshal([]byte(*raw), &metadata)
+	}
+	metadata["recovered"] = recovered
+	metadata["checkoutMode"] = string(normalizeCheckoutMode(checkoutMode))
+	encoded, err := json.Marshal(metadata)
+	if err != nil {
+		return raw
+	}
+	return stringPtr(string(encoded))
 }
 
 func (g *Gateway) gitCommonDir(ctx context.Context, path string) (string, error) {
