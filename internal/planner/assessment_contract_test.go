@@ -8,7 +8,7 @@ import (
 
 func testAssessmentBinding(t *testing.T) AssessmentBinding {
 	t.Helper()
-	binding, err := NewAssessmentBinding("acme/looper", 42, "Add endpoint", "Please add it", "0123456789abcdef0123456789abcdef01234567")
+	binding, err := NewAssessmentBinding("acme/looper", 42, "Add endpoint", "Please add it", nil, "0123456789abcdef0123456789abcdef01234567")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -76,12 +76,34 @@ func TestNewAssessmentBindingRequiresFullGitObjectID(t *testing.T) {
 		"0123456789abcdef0123456789abcdef0123456g",
 		"",
 	} {
-		if _, err := NewAssessmentBinding("acme/looper", 42, "Add endpoint", "Please add it", baseSHA); err == nil {
+		if _, err := NewAssessmentBinding("acme/looper", 42, "Add endpoint", "Please add it", nil, baseSHA); err == nil {
 			t.Fatalf("NewAssessmentBinding(%q) error = nil", baseSHA)
 		}
 	}
-	if _, err := NewAssessmentBinding("acme/looper", 42, "Add endpoint", "Please add it", strings.Repeat("a", 64)); err != nil {
+	if _, err := NewAssessmentBinding("acme/looper", 42, "Add endpoint", "Please add it", nil, strings.Repeat("a", 64)); err != nil {
 		t.Fatalf("NewAssessmentBinding(SHA-256 object ID) error = %v", err)
+	}
+}
+
+func TestAssessmentBindingRejectsStaleReporterClarifications(t *testing.T) {
+	baseSHA := "0123456789abcdef0123456789abcdef01234567"
+	bound, err := NewAssessmentBinding("acme/looper", 42, "Add endpoint", "Please add it", []string{"Use the versioned endpoint."}, baseSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err := NewAssessmentBinding("acme/looper", 42, "Add endpoint", "Please add it", []string{"Use the legacy endpoint."}, baseSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bound.IssueDigest == current.IssueDigest {
+		t.Fatal("bindings with different reporter clarifications share an issue digest")
+	}
+	assessment, err := ParseAssessment(assessmentJSON(t, bound, AssessmentProceed, ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := EvaluateAssessment(current, AssessmentPolicy{}, assessment); err == nil || !strings.Contains(err.Error(), "no longer matches") {
+		t.Fatalf("EvaluateAssessment() error = %v, want stale clarification binding rejection", err)
 	}
 }
 

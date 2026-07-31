@@ -3,6 +3,7 @@ package planner
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -28,11 +29,11 @@ type AssessmentBinding struct {
 }
 
 // NewAssessmentBinding validates the daemon-owned inputs for one assessment.
-func NewAssessmentBinding(repo string, issueNumber int64, issueTitle, issueBody, baseSHA string) (AssessmentBinding, error) {
+func NewAssessmentBinding(repo string, issueNumber int64, issueTitle, issueBody string, clarifications []string, baseSHA string) (AssessmentBinding, error) {
 	binding := AssessmentBinding{
 		Repo:        strings.TrimSpace(repo),
 		IssueNumber: issueNumber,
-		IssueDigest: IssueContentDigest(issueTitle, issueBody),
+		IssueDigest: IssueContentDigest(issueTitle, issueBody, clarifications),
 		BaseSHA:     strings.TrimSpace(baseSHA),
 	}
 	if err := binding.validate(); err != nil {
@@ -42,10 +43,26 @@ func NewAssessmentBinding(repo string, issueNumber int64, issueTitle, issueBody,
 }
 
 // IssueContentDigest deliberately covers exactly the Issue text the assessor
-// receives. The issue number/repository live separately in AssessmentBinding.
-func IssueContentDigest(title, body string) string {
-	sum := sha256.Sum256([]byte(title + "\x00" + body))
-	return hex.EncodeToString(sum[:])
+// receives, including reporter clarifications that supersede the Issue body.
+// The issue number/repository live separately in AssessmentBinding.
+func IssueContentDigest(title, body string, clarifications []string) string {
+	digest := sha256.New()
+	writeDigestString(digest, title)
+	writeDigestString(digest, body)
+	var count [8]byte
+	binary.BigEndian.PutUint64(count[:], uint64(len(clarifications)))
+	_, _ = digest.Write(count[:])
+	for _, clarification := range clarifications {
+		writeDigestString(digest, clarification)
+	}
+	return hex.EncodeToString(digest.Sum(nil))
+}
+
+func writeDigestString(digest interface{ Write([]byte) (int, error) }, value string) {
+	var length [8]byte
+	binary.BigEndian.PutUint64(length[:], uint64(len(value)))
+	_, _ = digest.Write(length[:])
+	_, _ = digest.Write([]byte(value))
 }
 
 func (b AssessmentBinding) validate() error {
