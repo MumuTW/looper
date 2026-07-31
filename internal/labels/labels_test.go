@@ -92,3 +92,14 @@ func TestLabelWireValues(t *testing.T) {
 		}
 	}
 }
+
+func TestMergeQueueRoutingLabelWireValues(t *testing.T) {
+	t.Parallel()
+
+	if AutoMerge != "auto-merge" || NeedsHumanReview != "needs-human-review" || DoNotMerge != "do-not-merge" {
+		t.Fatalf("routing labels = %q/%q/%q, want the Mergify wire contract", AutoMerge, NeedsHumanReview, DoNotMerge)
+	}
+	if IsLooperOwned(AutoMerge) || IsLooperOwned(NeedsHumanReview) || IsLooperOwned(DoNotMerge) {
+		t.Fatal("Mergify routing labels unexpectedly entered the Looper-owned namespace")
+	}
+}

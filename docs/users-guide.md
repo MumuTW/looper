@@ -446,6 +446,8 @@ These are the most important labels right now:
 | `looper:spec-reviewing` | PR | This PR is in the spec review phase |
 | `looper:spec-ready` | PR | The spec is approved and ready for worker |
 | `looper:needs-human` | PR | Reserved for manual intervention cases |
+| `auto-merge` | PR | Gatekeeper's eligible route into the Mergify queue |
+| `needs-human-review` | PR | Gatekeeper's escalation route; blocks the Mergify queue |
 | `looper:hold` | issue or PR | Block all automatic Looper activity on that item |
 | `looper:hold:worker` | issue or PR | Block automatic worker activity on that item |
 | `looper:hold:fixer` | issue or PR | Block automatic fixer activity on that item |

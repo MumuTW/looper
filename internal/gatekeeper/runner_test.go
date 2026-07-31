@@ -728,6 +728,7 @@ type fakeGatekeeperGitHub struct {
 	reviews            []githubinfra.ReviewSummary
 	reviewsErr         error
 	finalHeadSHA       string
+	headSHAResponses   []string
 	finalBaseSHA       string
 	protectionErr      error
 	commentsErr        error
@@ -738,6 +739,9 @@ type fakeGatekeeperGitHub struct {
 	currentLogin          string
 	commentErr            error
 	deletedIDs            []int64
+	labelAdds             []githubinfra.PullRequestLabelsInput
+	labelRemoves          []githubinfra.PullRequestLabelsInput
+	labelErr              error
 	listCalls             int
 	loginCalls            int
 	comments              []githubinfra.CommentInfo
@@ -867,8 +871,29 @@ func (f *fakeGatekeeperGitHub) ListReviewThreads(context.Context, githubinfra.Li
 	}
 	return f.threads, nil
 }
-func (f *fakeGatekeeperGitHub) GetPullRequestHeadAndBaseSHA(context.Context, githubinfra.ViewPullRequestInput) (string, string, error) {
-	return f.finalHeadSHA, f.finalBaseSHA, nil
+func (f *fakeGatekeeperGitHub) GetPullRequestHeadSHA(context.Context, githubinfra.ViewPullRequestInput) (string, error) {
+	if len(f.headSHAResponses) > 0 {
+		head := f.headSHAResponses[0]
+		f.headSHAResponses = f.headSHAResponses[1:]
+		return head, nil
+	}
+	return f.finalHeadSHA, nil
+}
+
+func (f *fakeGatekeeperGitHub) AddPullRequestLabels(_ context.Context, input githubinfra.PullRequestLabelsInput) error {
+	if f.labelErr != nil {
+		return f.labelErr
+	}
+	f.labelAdds = append(f.labelAdds, input)
+	return nil
+}
+
+func (f *fakeGatekeeperGitHub) RemovePullRequestLabels(_ context.Context, input githubinfra.PullRequestLabelsInput) error {
+	if f.labelErr != nil {
+		return f.labelErr
+	}
+	f.labelRemoves = append(f.labelRemoves, input)
+	return nil
 }
 func (f *fakeGatekeeperGitHub) FindReviewMarker(_ context.Context, input githubinfra.VerifyReviewMarkerInput) (githubinfra.ReviewMarkerResult, error) {
 	f.reviewMarkerCalls = append(f.reviewMarkerCalls, input)

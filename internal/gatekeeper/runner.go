@@ -219,6 +219,8 @@ type GitHubGateway interface {
 	DeleteIssueComment(context.Context, githubinfra.DeleteIssueCommentInput) error
 	FindReviewMarker(context.Context, githubinfra.VerifyReviewMarkerInput) (githubinfra.ReviewMarkerResult, error)
 	SetCommitStatus(context.Context, githubinfra.CommitStatusInput) error
+	AddPullRequestLabels(context.Context, githubinfra.PullRequestLabelsInput) error
+	RemovePullRequestLabels(context.Context, githubinfra.PullRequestLabelsInput) error
 }
 
 // RequiredStatusContext is the GitHub status context an operator adds to branch
@@ -1443,6 +1445,11 @@ func (r *Runner) persist(ctx context.Context, report Report) (Report, error) {
 		Payload: report, CreatedAt: r.now(),
 	}); err != nil {
 		return Report{}, fmt.Errorf("persist gate report: %w", err)
+	}
+	if err := r.reconcileRoutingLabels(ctx, report, previous); err != nil && r.logWarn != nil {
+		r.logWarn("gatekeeper: could not reconcile routing labels", map[string]any{
+			"repo": report.Repo, "pr": report.PRNumber, "error": err.Error(),
+		})
 	}
 	// The owned comment is reconciled after the durable report: the report is the
 	// record, the comment is a convenience for whoever is deciding. A forge that
