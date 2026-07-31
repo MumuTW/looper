@@ -452,47 +452,6 @@
                 "priority": 50
               }
             },
-            "coordinator": {
-              "enabled": false,
-              "pollInterval": "5m",
-              "triage": {
-                "triagedLabel": "triaged",
-                "maxIssueAgeDays": 7,
-                "maxPerTick": 5,
-                "disposition": {
-                  "outOfScopeLabel": "wontfix",
-                  "unclearLabel": "needs-info",
-                  "reTriageOnAuthorReply": true
-                }
-              },
-              "dependencies": {
-                "enabled": false,
-                "apiTimeoutSeconds": 10,
-                "apiRetryAttempts": 3
-              },
-              "mergeWatch": {
-                "maxIndeterminateDuration": "15m",
-                "transientRetries": 3
-              },
-              "dispatch": {
-                "mode": "human-gated",
-                "humanGate": {
-                  "slashCommands": [
-                    "/plan",
-                    "/implement"
-                  ],
-                  "allowedUsers": []
-                },
-                "autonomous": {
-                  "delayMinutes": 30,
-                  "holdLabel": "looper:hold"
-                },
-                "assignTo": ""
-              }
-            },
-            "gatekeeper": {
-              "strategy": "squash"
-            },
             "planner": {
               "autoDiscovery": true,
               "triggers": {
@@ -559,13 +518,6 @@
                   "requireCurrentReviewRequest": true,
                   "maxThreadsPerRun": 10
                 }
-              },
-              "autoMerge": {
-                "enabled": false,
-                "strategy": "squash",
-                "requireBranchProtection": true,
-                "transientRetries": 3,
-                "scope": "looper-only"
               }
             },
             "fixer": {
@@ -629,13 +581,8 @@
                 "scope": "looper-only"
               }
             },
-            "escalator": {
-              "enabled": false,
-              "cadenceSeconds": 3600,
-              "retryAttemptThreshold": 2,
-              "unroutedAfterSeconds": 3600,
-              "staleHeadAfterSeconds": 86400,
-              "maxItems": 500
+            "gatekeeper": {
+              "strategy": "squash"
             }
           },
           "providers": [],
