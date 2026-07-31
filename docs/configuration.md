@@ -8,7 +8,7 @@ For the default supported install flow:
 
 - `looper` and `looperd` are installed as separate GitHub Release Go binaries (or built from source)
 - you write the config file and start `looperd` yourself — there is no managed daemon install or `looper daemon *` lifecycle
-- `looperd` holds a database-specific advisory lock beside each SQLite file. It holds a shared lock while serving a compatible schema and upgrades to an exclusive lock only while applying startup migrations; this prevents a migration from racing a daemon or review-submit authority read. A daemon configured to auto-migrate fails fast if another compatible holder is active, while review-submit children may share the read lock with their daemon.
+- `looperd` holds a database-specific advisory lock beside each SQLite file. It holds a shared lock while serving a compatible schema and upgrades to an exclusive lock only while applying startup migrations; this prevents a migration from racing a serving daemon. A daemon configured to auto-migrate fails fast if another compatible holder is active.
 
 Keep the runtime directory (`~/.looper` by default, or the directory containing `storage.dbPath`) on a local filesystem. The database lock uses OS file locking and is not designed for NFS-style shared filesystems. If shutdown retains SQLite after an undrained ownership failure, it retains the shared lock too; start a replacement only after the owning process has exited. Tunnel-mode webhook secrets live under the same runtime directory in `secrets/` and must be mode `0600`.
 

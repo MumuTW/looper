@@ -6,31 +6,7 @@ import (
 	"io"
 	"strconv"
 	"strings"
-
-	"github.com/MumuTW/looper/internal/config"
-	"github.com/MumuTW/looper/internal/forge"
 )
-
-// loadConfig resolves the configuration this submission is judged against.
-//
-// A trusted proxy child gets its configuration from a one-shot descriptor the
-// daemon materialized when it captured the run, not from the file the agent can
-// see: the daemon already resolved file, environment, and CLI precedence, and
-// re-resolving here would let the agent's environment rewrite the review-event
-// policy the daemon bound. The descriptor is consumed exactly once, so this
-// must stay the only config load on the trusted path.
-func loadConfig(opts Options) (config.LoadedFileConfig, error) {
-	if loaded, configured, err := forge.LoadTrustedReviewConfigSnapshot(); configured {
-		if err != nil {
-			return config.LoadedFileConfig{}, err
-		}
-		return loaded, nil
-	}
-	return config.LoadFile(config.LoadFileOptions{
-		CWD:  opts.CWD,
-		Args: append([]string(nil), opts.ConfigArgs...),
-	})
-}
 
 // parsePullRequestRef splits the "<repo>#<number>" target. The proxy validates
 // the same shape before spawning this process and binds it to the run's PR, so

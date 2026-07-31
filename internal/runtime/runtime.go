@@ -114,7 +114,7 @@ type Options struct {
 	ConfigReloadInterval time.Duration
 	// ConfigPath is the daemon-loaded config file path (from --config /
 	// LOOPER_CONFIG resolution). Runtime config management patches this source;
-	// trusted review-submit children receive a separate sanitized run snapshot.
+	// trusted review submission receives a separate sanitized run snapshot.
 	ConfigPath                  string
 	Logger                      bootstrap.Logger
 	Now                         func() time.Time

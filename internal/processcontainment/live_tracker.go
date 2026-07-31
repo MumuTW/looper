@@ -2,7 +2,7 @@ package processcontainment
 
 // LiveTracker is the optional Supervisor hook for non-agent containment handles
 // (ADR-0015 / #577). Supervisor-owned spawn boundaries (validation/shell,
-// trusted review-submit children) register live handles so daemon shutdown can
+// daemon-owned validation shells) register live handles so daemon shutdown can
 // wait for confirmed drain and record Kill/Drain failures for retain-storage.
 //
 // Independently lifecycle-owned shell users (git/gh/tea gateways, osascript)

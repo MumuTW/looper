@@ -44,7 +44,7 @@ func TestReviewSubmitOrchestrationPreservesInlineCommentsWhenFullDiffExceedsCapt
 	opts := reviewSubmitTestOptions(t, payloadPath, configPath, repo, stdout, stderr)
 	opts.CommitID = headSHA
 
-	if err := Run(context.Background(), opts); err != nil {
+	if err := runTrustedForTest(context.Background(), opts); err != nil {
 		t.Fatalf("Run() error = %v\nstderr=%s", err, stderr.String())
 	}
 	if !strings.Contains(stdout.String(), `"submitted"`) || !strings.Contains(stdout.String(), "true") {
@@ -90,7 +90,7 @@ func TestReviewSubmitOrchestrationPreservesLeftDeletedInlineComment(t *testing.T
 	opts := reviewSubmitTestOptions(t, payloadPath, configPath, repo, stdout, stderr)
 	opts.CommitID = headSHA
 
-	if err := Run(context.Background(), opts); err != nil {
+	if err := runTrustedForTest(context.Background(), opts); err != nil {
 		t.Fatalf("Run() error = %v\nstderr=%s", err, stderr.String())
 	}
 	submitted := readLastReviewSubmitPayload(t, submitLog)

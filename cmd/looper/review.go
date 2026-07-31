@@ -11,13 +11,10 @@ import (
 	"github.com/MumuTW/looper/internal/reviewsubmit"
 )
 
-// `looper review submit` is not an operator command and is not in the usage
-// text: it is the child half of the daemon's trusted review proxy. The daemon
-// writes a wrapper that reviewer agents call, validates the argv shape, rewrites
-// the review-event policy flags to the ones it bound at run start, and spawns
-// this binary with provider credentials and a config snapshot attached. Removing
-// the verb did not remove that machinery — it only made every reviewer run fail
-// at publish time.
+// `looper review submit` is not an operator command. It is the agent-facing
+// client for the daemon's trusted review socket. The daemon validates argv,
+// replaces agent-supplied authority with the PR/CWD/policy/config captured for
+// the run, and performs the submission internally; direct execution is refused.
 //
 // Its flags therefore belong to the proxy's contract, not to taste. See
 // forge.applyTrustedReviewProxyPolicy for the argv it appends and

@@ -16,6 +16,6 @@
 //
 // Agent producers migrate onto this handle via the common executor boundary
 // (#576). Non-agent Supervisor-owned producers (validation/shell, trusted
-// review-submit children) migrate via their spawn boundaries (#577). Recovery
+// validation shell children) migrate via their spawn boundaries (#577). Recovery
 // must still not treat raw PID/PGID as live Authority (#575).
 package processcontainment

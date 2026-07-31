@@ -58,7 +58,7 @@ type reviewSubmitGateway interface {
 	SubmitReview(context.Context, githubinfra.SubmitReviewInput) error
 }
 
-func reviewSubmitGatewayForConfig(cfg config.Config, repo, cwd string, diagnostic func(string, map[string]any)) (reviewSubmitGateway, error) {
+func reviewSubmitGatewayForConfig(cfg config.Config, repo, cwd string, credentialEnv map[string]string, diagnostic func(string, map[string]any)) (reviewSubmitGateway, error) {
 	if cfg.Tools.GHPath == nil || strings.TrimSpace(*cfg.Tools.GHPath) == "" {
 		return nil, fmt.Errorf("GitHub CLI (gh) not found; install gh or set --gh-path <path>")
 	}
@@ -66,9 +66,18 @@ func reviewSubmitGatewayForConfig(cfg config.Config, repo, cwd string, diagnosti
 	if cfg.Tools.GitPath != nil && strings.TrimSpace(*cfg.Tools.GitPath) != "" {
 		gitPath = strings.TrimSpace(*cfg.Tools.GitPath)
 	}
+	env := config.DaemonGitHubCredentialEnv(cfg)
+	if len(credentialEnv) > 0 {
+		if env == nil {
+			env = map[string]string{}
+		}
+		for key, value := range credentialEnv {
+			env[key] = value
+		}
+	}
 	return githubinfra.New(githubinfra.Options{
 		GHPath:                 *cfg.Tools.GHPath,
-		Env:                    config.DaemonGitHubCredentialEnv(cfg),
+		Env:                    env,
 		GitPath:                gitPath,
 		CWD:                    cwd,
 		GHRun:                  shell.Run,
@@ -111,30 +120,31 @@ type Options struct {
 
 // Run publishes a validated pull request review.
 //
-// It is the child half of the trusted review proxy: reviewer agents are told to
-// invoke it through a daemon-written wrapper, and the daemon spawns this same
-// binary with provider credentials injected and a config snapshot on an
-// inherited descriptor. Everything the reviewer prompt promises about review
-// publication — marker validation, head/base drift checks, anchor authority,
-// hold gates, self-approval downgrade — is enforced here, because there is no
-// other place between the agent and the forge that can enforce it.
+// Reviewer agents invoke this through a daemon-written wrapper. Run only
+// forwards to that socket; the daemon-internal RunTrusted path enforces marker
+// validation, head/base drift checks, anchor authority, hold gates, and
+// self-approval downgrade before reaching the forge.
 func Run(ctx context.Context, opts Options) error {
-	stdout, stderr := opts.Stdout, opts.Stderr
+	if !forge.TrustedReviewSockConfigured() {
+		return fmt.Errorf("trusted review proxy is required; direct review submission is disabled")
+	}
+	raw, err := io.ReadAll(opts.Stdin)
+	if err != nil {
+		return fmt.Errorf("read review payload from stdin: %w", err)
+	}
+	// Argv is forwarded whole. The proxy re-validates the shape and rebinds
+	// the policy flags itself, so anything reconstructed here from the parsed
+	// options would be a second, divergent account of what the agent asked for.
+	return forge.ProxyReviewSubmit(append([]string(nil), opts.Argv...), raw, opts.CWD)
+}
 
-	// When a daemon-side trusted review proxy is configured, forward the full
-	// invocation there so provider tokens stay out of the agent process and out
-	// of any agent-visible credential path. The proxy child clears the socket env
-	// and re-enters this command with tokens injected.
-	if forge.TrustedReviewSockConfigured() {
-		raw, err := io.ReadAll(opts.Stdin)
-		if err != nil {
-			return fmt.Errorf("read review payload from stdin: %w", err)
-		}
-		// Argv is forwarded whole. The proxy re-validates the shape and rebinds
-		// the policy flags itself, so anything reconstructed here from the
-		// parsed options would be a second, divergent account of what the agent
-		// asked for.
-		return forge.ProxyReviewSubmit(append([]string(nil), opts.Argv...), raw, opts.CWD)
+// RunTrusted publishes after the daemon proxy has bound PR, CWD, policy,
+// config, and credential environment. It is deliberately separate from Run:
+// the agent-facing CLI has no direct path to this function.
+func RunTrusted(ctx context.Context, opts Options, cfg config.Config, credentialEnv map[string]string) error {
+	stdout, stderr := opts.Stdout, opts.Stderr
+	if err := config.Validate(cfg); err != nil {
+		return fmt.Errorf("validate trusted review config: %w", err)
 	}
 
 	repo, prNumber, err := parsePullRequestRef(opts.PRRef)
@@ -159,12 +169,8 @@ func Run(ctx context.Context, opts Options) error {
 		return fmt.Errorf("parse review payload JSON from stdin: %w", err)
 	}
 
-	loaded, err := loadConfig(opts)
-	if err != nil {
-		return err
-	}
 	policy, err := effectiveReviewSubmitPolicy(
-		loaded.Config.Roles.Reviewer.Behavior.ReviewEvents,
+		cfg.Roles.Reviewer.Behavior.ReviewEvents,
 		opts.CleanReviewEvent,
 		opts.BlockingReviewEvent,
 	)
@@ -179,7 +185,7 @@ func Run(ctx context.Context, opts Options) error {
 	diagnosticWriter := func(event string, fields map[string]any) {
 		writeReviewSubmitDiagnosticEntry(stderr, event, fields)
 	}
-	gateway, err := reviewSubmitGatewayForConfig(loaded.Config, repo, cwd, diagnosticWriter)
+	gateway, err := reviewSubmitGatewayForConfig(cfg, repo, cwd, credentialEnv, diagnosticWriter)
 	if err != nil {
 		return err
 	}
@@ -190,7 +196,7 @@ func Run(ctx context.Context, opts Options) error {
 	if err := validateExpectedHeadCommit(commitID, detail.HeadSHA); err != nil {
 		return err
 	}
-	if err := validateReviewerReviewSubmitHold(ctx, loaded.Config, repo, prNumber, opts.ReviewerManual, opts.ReviewerRunID, detail.Labels); err != nil {
+	if err := validateReviewerReviewSubmitHold(ctx, cfg, repo, prNumber, opts.ReviewerManual, opts.ReviewerRunID, detail.Labels); err != nil {
 		return err
 	}
 	if err := validateReviewSubmitBody(payload.Body, payload.Comments, commitID, event, policy, detail.Author); err != nil {
@@ -215,10 +221,10 @@ func Run(ctx context.Context, opts Options) error {
 		if canSubmitWithoutAnchorValidation(err, payload.Comments) {
 			// Body-only oversized/truncated fallback still must fail closed on base/head
 			// drift: hold-only refresh is not enough when commit_id was captured earlier.
-			if _, err := validateLatestReviewerReviewSubmitPublication(ctx, gateway, loaded.Config, repo, prNumber, commitID, detail.BaseSHA, opts.ReviewerManual, opts.ReviewerRunID, cwd); err != nil {
+			if _, err := validateLatestReviewerReviewSubmitPublication(ctx, gateway, cfg, repo, prNumber, commitID, detail.BaseSHA, opts.ReviewerManual, opts.ReviewerRunID, cwd); err != nil {
 				return err
 			}
-			return submitReviewWithoutAnchorValidation(ctx, stdout, stderr, gateway, repo, prNumber, submissionEvent, payload, commitID, cwd, loaded.Config.Disclosure)
+			return submitReviewWithoutAnchorValidation(ctx, stdout, stderr, gateway, repo, prNumber, submissionEvent, payload, commitID, cwd, cfg.Disclosure)
 		}
 		// Never reach SubmitReview's content guard on this path: redact paths and
 		// never return path-bearing git/remote errors (path may be secret-shaped).
@@ -236,10 +242,10 @@ func Run(ctx context.Context, opts Options) error {
 		comments = append(comments, githubinfra.ReviewComment{Body: comment.Body, Path: comment.Path, Line: comment.Line, Side: comment.Side, StartLine: comment.StartLine, StartSide: comment.StartSide})
 	}
 	// Fail closed on base/head drift between anchor resolution and mutation.
-	if _, err := validateLatestReviewerReviewSubmitPublication(ctx, gateway, loaded.Config, repo, prNumber, commitID, detail.BaseSHA, opts.ReviewerManual, opts.ReviewerRunID, cwd); err != nil {
+	if _, err := validateLatestReviewerReviewSubmitPublication(ctx, gateway, cfg, repo, prNumber, commitID, detail.BaseSHA, opts.ReviewerManual, opts.ReviewerRunID, cwd); err != nil {
 		return err
 	}
-	if err := gateway.SubmitReview(ctx, githubinfra.SubmitReviewInput{Repo: repo, PRNumber: prNumber, Event: submissionEvent, Body: payload.Body, CommitID: commitID, Comments: comments, Anchors: anchors, Disclosure: loaded.Config.Disclosure, CWD: cwd}); err != nil {
+	if err := gateway.SubmitReview(ctx, githubinfra.SubmitReviewInput{Repo: repo, PRNumber: prNumber, Event: submissionEvent, Body: payload.Body, CommitID: commitID, Comments: comments, Anchors: anchors, Disclosure: cfg.Disclosure, CWD: cwd}); err != nil {
 		return wrapReviewSubmitError(stderr, repo, prNumber, submissionEvent, commitID, payload, "submit validated PR review", err)
 	}
 	return writeJSON(stdout, map[string]any{"submitted": true})

@@ -410,7 +410,7 @@ storage close (#580 aligns with #577).
 |----------|----------------|-------------|
 | **Worker / Fixer validation shell** | `internal/infra/shell.Run` (`Configure` + `Start` + `Bind`) + `LiveTracker` | Cancel/timeout → `Handle.Kill` confirmed drain; normal exit → `Handle.Drain`; track + `ReportDrainFailure` for retain-storage |
 | **Other daemon `shell.Run` work steps** on inventory-listed role helpers | same package boundary | Same as validation when Supervisor-owned; short git/gh remain independently lifecycle-owned (gateway Authority, Tracker nil) but still get group containment when they share `shell.Run` |
-| **Trusted review-submit children** | `internal/forge/trusted_review_proxy.go` + `LiveTracker` | `Configure` + `Bind` after Start; cancel → `Handle.Kill`; success path `Drain`; track + report for retain-storage |
+| **Trusted review submission** | `internal/forge/trusted_review_proxy.go` invokes an in-process daemon submitter | No child process; request cancellation propagates through context |
 
 Raw PID signal-only stop is removed at these boundaries. Agent live SQLite-PID
 fallback was already removed when the registry is present (#576). Non-agent
@@ -439,7 +439,6 @@ Classification:
 | **Native-resume fallback** | Same `agent.Executor.Start` with `NativeResumePrompt` / session; fallback to full prompt on resume failure | **Enforced by #576**; cancellation must not spawn a second process after stop |
 | **Worker validation shell** | `internal/worker/runner.go` → `shell.Run` (`/bin/sh -c` validation commands) | **Enforced by #577** via `shell.Run` containment spawn boundary |
 | **Fixer (and other role) shell helpers** that run daemon-owned long/blocking shell for work steps | e.g. fixer `shell.Run` helpers used during run processing | **Enforced by #577** via same `shell.Run` boundary |
-| **Trusted review-submit children** | `internal/forge/trusted_review_proxy.go` spawns `looper review submit` child from daemon-bound proxy | **Enforced by #577**; handle Bind + confirmed Kill/Drain while proxy request is live |
 | **Active agent stop / loop halt / daemon shutdown kill of owned agents** | Registry `Kill` via bound containment handle (confirmed drain); no live SQLite PID fallback when registry present | **Enforced by #576** after common-executor ownership; recovery still no raw PID action (#575) |
 
 Queue **claims** themselves are not process producers, but while the daemon is

@@ -1,27 +1,13 @@
 package main
 
 import (
-	"bytes"
-	"os"
-	"os/exec"
-	"path/filepath"
-	"strings"
+	"context"
+	"io"
 	"testing"
 
 	"github.com/MumuTW/looper/internal/config"
 	"github.com/MumuTW/looper/internal/forge"
 )
-
-// The reviewer runner tells agents to publish through a daemon-written wrapper
-// that ends in `looper review submit`, and the daemon's trusted proxy rewrites
-// that argv before spawning this binary. Nothing in this repository forced the
-// two ends to agree, which is how the verb came to be deleted while the daemon
-// kept emitting it.
-//
-// This runs the real binary behind the real proxy: the argv the runner prompts
-// for goes in, and the assertion is that the child got far enough to need a
-// forge. Anything earlier — an unknown command, an unknown flag, a rejected
-// config snapshot — means the contract is broken again.
 
 // agentReviewSubmitArgv is the argv the reviewer prompt tells agents to run.
 // It is spelled out rather than derived so a change to the prompt has to be
@@ -35,44 +21,38 @@ var agentReviewSubmitArgv = []string{
 }
 
 func TestProxyArgvReachesReviewSubmit(t *testing.T) {
-	if testing.Short() {
-		t.Skip("builds the looper binary")
-	}
-
 	dir := t.TempDir()
-	binary := buildLooperBinary(t, dir)
-	snapshot := trustedReviewSnapshotConfig(t, dir)
+	snapshot, err := config.DefaultConfig(dir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
 
 	policy := forge.TrustedReviewProxyPolicy{
 		Clean:            "COMMENT",
 		Blocking:         "COMMENT",
 		ExpectedCommitID: "daemon-bound-head",
 	}
-	sockPath, cleanup, err := forge.StartTrustedReviewProxy(binary, nil, "acme/looper#42", dir, snapshot, policy, nil)
+	called := make(chan forge.TrustedReviewSubmission, 1)
+	submitter := func(_ context.Context, submission forge.TrustedReviewSubmission, _, _ io.Writer) error {
+		called <- submission
+		return nil
+	}
+	sockPath, cleanup, err := forge.StartTrustedReviewProxy(submitter, nil, "acme/looper#42", dir, snapshot, policy)
 	if err != nil {
 		t.Fatalf("StartTrustedReviewProxy() error = %v", err)
 	}
 	t.Cleanup(cleanup)
 
 	t.Setenv(forge.TrustedReviewSockEnv, sockPath)
-	stderr := captureStderr(t, func() {
-		err = forge.ProxyReviewSubmit(agentReviewSubmitArgv, []byte(`{"body":"x"}`), dir)
-	})
-
-	// The child cannot publish: the snapshot has no gh binary and no provider
-	// provider, so it stops at gateway construction. That it got there at all is
-	// the contract — argv routed, flags parsed, snapshot loaded and validated,
-	// and the daemon-bound review-event policy accepted.
-	if err == nil {
-		t.Fatal("review submit succeeded without a forge; the test fixture is wrong, not the CLI")
+	if err := forge.ProxyReviewSubmit(agentReviewSubmitArgv, []byte(`{"body":"x"}`), dir); err != nil {
+		t.Fatalf("ProxyReviewSubmit() error = %v", err)
 	}
-	if !strings.Contains(stderr, "GitHub CLI (gh) not found") {
-		t.Fatalf("proxy child stderr = %q, want it to fail at gateway construction (error was %v)", stderr, err)
+	submission := <-called
+	if submission.PRRef != "acme/looper#42" || submission.CommitID != "daemon-bound-head" {
+		t.Fatalf("submission = %+v, want daemon-bound PR and head", submission)
 	}
-	for _, broken := range []string{"unknown command", "unknown flag", "review command is"} {
-		if strings.Contains(stderr, broken) {
-			t.Fatalf("proxy child rejected the daemon's own argv: %s", stderr)
-		}
+	if submission.CWD != dir {
+		t.Fatalf("submission.CWD = %q, want %q", submission.CWD, dir)
 	}
 }
 
@@ -133,62 +113,4 @@ func TestParseReviewSubmitAcceptsInlineValues(t *testing.T) {
 	if opts.Event != "APPROVE" || opts.CommitID != "abc123" {
 		t.Fatalf("opts = %+v, want event APPROVE and commit abc123", opts)
 	}
-}
-
-func buildLooperBinary(t *testing.T, dir string) string {
-	t.Helper()
-
-	binary := filepath.Join(dir, "looper")
-	build := exec.Command("go", "build", "-o", binary, ".")
-	build.Dir = "."
-	if out, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("go build ./cmd/looper: %v\n%s", err, out)
-	}
-	return binary
-}
-
-// trustedReviewSnapshotConfig is the config the daemon would materialize for a
-// run, minus any way to reach a forge: no gh path and no provider, so the child
-// stops at the first step that needs one.
-func trustedReviewSnapshotConfig(t *testing.T, dir string) config.Config {
-	t.Helper()
-
-	cfg, err := config.DefaultConfig(dir)
-	if err != nil {
-		t.Fatalf("DefaultConfig() error = %v", err)
-	}
-	cfg.Tools.GHPath = nil
-	cfg.Projects = nil
-	cfg.Providers = nil
-	cfg.Network = config.NetworkConfig{}
-	cfg.Storage.DBPath = filepath.Join(dir, "state", "looper.sqlite")
-	return cfg
-}
-
-// captureStderr collects what ProxyReviewSubmit relays from the child, which it
-// writes to the process's own stderr rather than returning.
-func captureStderr(t *testing.T, fn func()) string {
-	t.Helper()
-
-	read, write, err := os.Pipe()
-	if err != nil {
-		t.Fatalf("os.Pipe() error = %v", err)
-	}
-	original := os.Stderr
-	os.Stderr = write
-
-	done := make(chan string, 1)
-	go func() {
-		var buf bytes.Buffer
-		_, _ = buf.ReadFrom(read)
-		done <- buf.String()
-	}()
-
-	fn()
-
-	os.Stderr = original
-	_ = write.Close()
-	captured := <-done
-	_ = read.Close()
-	return captured
 }
