@@ -5,6 +5,10 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -99,4 +103,69 @@ func sseEventData(t *testing.T, eventText string) string {
 	}
 	t.Fatalf("SSE event has no data line: %q", eventText)
 	return ""
+}
+
+// loop.logs.follow is the one contract entry that is declared rather than
+// replayed, so regeneration cannot notice it drifting from the wire. Bind the
+// declared error event to the struct the server actually writes: adding a field
+// to loopLogsFollowErrorEvent fails here until the declaration in
+// contract_artifact_regen_test.go and the artifact are updated with it.
+func TestDeclaredLoopLogsFollowErrorEventMatchesWireStruct(t *testing.T) {
+	artifactPath := filepath.Join("testdata", "contracts", "daemon-http.responses.compat.json")
+	raw, err := os.ReadFile(artifactPath)
+	if err != nil {
+		t.Fatalf("ReadFile(%s) error = %v", artifactPath, err)
+	}
+
+	var artifact struct {
+		Routes []struct {
+			ID     string `json:"id"`
+			Events map[string]struct {
+				Event string          `json:"event"`
+				Data  json.RawMessage `json:"data"`
+			} `json:"events"`
+		} `json:"routes"`
+	}
+	if err := json.Unmarshal(raw, &artifact); err != nil {
+		t.Fatalf("json.Unmarshal(%s) error = %v", artifactPath, err)
+	}
+
+	var declared json.RawMessage
+	for _, route := range artifact.Routes {
+		if route.ID != "loop.logs.follow" {
+			continue
+		}
+		event, ok := route.Events["error"]
+		if !ok {
+			t.Fatal("loop.logs.follow declares no error event, but the stream emits one on poll, state, or log-read failure")
+		}
+		if event.Event != "error" {
+			t.Fatalf("declared error event name = %q, want %q", event.Event, "error")
+		}
+		declared = event.Data
+	}
+	if declared == nil {
+		t.Fatal("response artifact has no loop.logs.follow route")
+	}
+
+	var fields map[string]any
+	if err := json.Unmarshal(declared, &fields); err != nil {
+		t.Fatalf("decode declared error data: %v", err)
+	}
+	got := make([]string, 0, len(fields))
+	for name := range fields {
+		got = append(got, name)
+	}
+	sort.Strings(got)
+
+	structType := reflect.TypeOf(loopLogsFollowErrorEvent{})
+	want := make([]string, 0, structType.NumField())
+	for i := 0; i < structType.NumField(); i++ {
+		want = append(want, strings.Split(structType.Field(i).Tag.Get("json"), ",")[0])
+	}
+	sort.Strings(want)
+
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("declared error event fields = %v, want %v (regenerate: %s)", got, want, contractRegenerateCommand)
+	}
 }

@@ -126,14 +126,19 @@ jobs:
             exit 1
           fi
 
-      - name: Test
-        env:
-          LOOPER_REQUIRE_TRUSTED_SRT: "1"
-        run: go test ./...
-
       # The /api/v1 compat artifacts are generated from the Go handlers. Catch a
       # response-shape change that forgot to regenerate here, with the command
       # to run, instead of as a fixture mismatch deep in a table test.
+      #
+      # This runs BEFORE `go test ./...` on purpose: the frozen-artifact table
+      # tests in internal/api compare live handler responses against these same
+      # files, so a stale artifact fails them first and the job would end
+      # without ever printing the regeneration command.
+      #
+      # CI checks out a clean tree, so "did generation change anything" and
+      # "does the tree still match HEAD" are the same question here and the
+      # git diff is the cheaper of the two. scripts/verify.sh runs against a
+      # dirty working tree and deliberately uses before/after digests instead.
       - name: Check frozen HTTP contract artifacts are current
         run: |
           go generate ./internal/api/...
@@ -141,6 +146,11 @@ jobs:
             printf '\nThe frozen /api/v1 compat artifacts are stale. Regenerate them in this commit:\n\n  go generate ./internal/api/...\n\n' >&2
             exit 1
           fi
+
+      - name: Test
+        env:
+          LOOPER_REQUIRE_TRUSTED_SRT: "1"
+        run: go test ./...
 
       - name: Build
         env:

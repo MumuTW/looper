@@ -2090,6 +2090,7 @@ func TestHandlerMatchesFrozenSuccessArtifactsForCoreRoutes(t *testing.T) {
 
 	routes := loadResponseArtifact(t)
 	requestRoutes := loadRequestArtifact(t)
+	configFixture := newContractConfigFixture(fixture.runtime)
 	h := NewHandler(Context{
 		Config:  fixture.config,
 		Runtime: fixture.runtime,
@@ -2121,14 +2122,17 @@ func TestHandlerMatchesFrozenSuccessArtifactsForCoreRoutes(t *testing.T) {
 			metadataJSON := `{"repo":"nexu-io/looper","worktreeRoot":null,"source":"api"}`
 			return storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: "/tmp/looper", BaseBranch: &baseBranch, MetadataJSON: &metadataJSON, CreatedAt: nowISO, UpdatedAt: nowISO}, nil
 		}},
-		PatchConfig: func(context.Context, ConfigPatchRequest) error {
-			return nil
-		},
+		// The frozen config.patch body records the patch applied, so this test
+		// has to apply it too — see contractConfigFixture.
+		PatchConfig:    configFixture.patch,
+		ConfigSnapshot: configFixture.snapshot,
 		RecoverySummary: func() any {
 			return map[string]any{"expiredLocksReleased": 1}
 		},
 	})
 
+	// config.get runs before config.patch on purpose: the patch mutates the
+	// published configuration, which is the difference the two frozen bodies record.
 	for _, routeID := range []string{"healthz.get", "status.get", "config.get", "config.patch", "projects.create", "projects.update"} {
 		t.Run(routeID, func(t *testing.T) {
 			path := "/api/v1/healthz"
@@ -8453,10 +8457,6 @@ func findResponseArtifactRoute(t *testing.T, routes []responseArtifactRoute, rou
 	t.Helper()
 	for _, route := range routes {
 		if route.ID == routeID {
-			if route.SameAs != "" {
-				base := findResponseArtifactRoute(t, routes, route.SameAs)
-				route.Body = base.Body
-			}
 			return route
 		}
 	}
@@ -8728,9 +8728,8 @@ type errorArtifactCase struct {
 }
 
 type responseArtifactRoute struct {
-	ID     string `json:"id"`
-	Body   any    `json:"body"`
-	SameAs string `json:"sameAs,omitempty"`
+	ID   string `json:"id"`
+	Body any    `json:"body"`
 }
 
 type requestArtifactRoute struct {
