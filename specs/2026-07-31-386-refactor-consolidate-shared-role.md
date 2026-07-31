@@ -387,7 +387,10 @@ The `loopError.kind` assignments split into three groups:
 
 3. **Statically safe shapes (no `Normalize` needed).** Every other
    `loopError.kind` assignment is a named `FailureRetryable*` constant (a known
-   kind that needs no normalization), or a copy of an already-normalized kind —
+   kind that needs no normalization — the accepted set is derived from the
+   `policy.Kind`/`failureclass.Kind` authority, not enumerated in the gate, so a
+   future fifth constant is accepted automatically; see Validation step 8), or a
+   copy of an already-normalized kind —
    a `loopError.kind` field read (`kind: failure.kind` where `failure` is a
    `loopError` *local constructed in this function with a safe `kind``) or a
    local that is itself only ever assigned from those two
@@ -396,6 +399,10 @@ The `loopError.kind` assignments split into three groups:
    from an untracked helper is *not* in this group: the receiver's `kind` is not
    proven safe within this function, so it is a dynamic source that must be
    `Normalize`-wrapped (see the receiver-origin rule in Validation step 8).
+   Taking the field's address (`&failure.kind`) is also *not* safe: the gate
+   forbids it because an address-taken `kind` can be mutated through the pointer
+   without an assignment the origin tracker visits (see the address-of rule in
+   Validation step 8).
 
 If an implementation replaces any dynamic-source or carrier call with a direct
 assignment (`kind: d.Kind` or `kind: failureclass.Classify(...)` without
@@ -1115,8 +1122,13 @@ of the three asserts all four kinds; they cover `retryable_transient` and
 `non_retryable` via `classifyFailure` and do not exercise
 `retryable_after_resume` or `manual_intervention`. The implementation therefore
 adds the missing focused coverage (see Validation step 6) rather than relying on
-a four-kind net that does not yet exist. No policy drift-detection test is
-added: Step 5 reverses the leaf dependency so `failureclass` imports `policy`
+a four-kind net that does not yet exist, including a per-runner alias-identity
+test in each of the four runner packages that compares all four local
+`FailureRetryable*`/`FailureNonRetryable`/`FailureManualIntervention` re-exports
+against their shared `failureclass.*` constants, so a mis-paired re-export is
+caught in the role that contains it rather than only in aggregate.
+
+No policy drift-detection test is added: Step 5 reverses the leaf dependency so `failureclass` imports `policy`
 and aliases `type Kind = policy.Kind` and re-exports the typed constants at
 compile time, and no validation drift test is added because Step 1 deletes the
 validation constants, types `Policy.FailureKind` as `policy.Kind`, and has
@@ -1266,7 +1278,29 @@ Per `AGENTS.md`, the root commands are the source of truth:
    `internal/reviewer/failure_classification_test.go`), plus a test for
    `failureclass.Normalize` covering the four known kinds and an unknown kind.
    This is the regression net the refactor relies on; it must exist before the
-   conversion functions are deleted.
+   conversion functions are deleted. Aggregate "each kind appears in at least
+   one role" coverage is not sufficient on its own: the four per-runner
+   re-export blocks (Step 1) are independent, so wiring one role's
+   `FailureManualIntervention` to `failureclass.NonRetryable` still compiles,
+   passes the call-site gate (it is a known-kind constant), and satisfies the
+   aggregate coverage when another role tests the manual kind, while that
+   role's failures silently change behavior. The implementation therefore adds
+   a per-runner alias-identity test in each of the four runner packages
+   (`internal/{fixer,reviewer,worker,planner}`) that compares all four local
+   aliases — `FailureRetryableTransient`, `FailureRetryableAfterResume`,
+   `FailureNonRetryable`, and `FailureManualIntervention` — against their
+   shared `failureclass.*` constants
+   (`failureclass.RetryableTransient`, `RetryableAfterResume`, `NonRetryable`,
+   `ManualIntervention`) in every runner, so a swapped or mis-paired re-export
+   is caught in the role that contains it rather than only in aggregate. (The
+   alternative — removing the local aliases and having every call site spell
+   `failureclass.*` directly — was considered and rejected: the ~290 call sites
+   that spell the short names are unchanged by this refactor, and re-exporting
+   the constants is a compile-time alias that adds no persisted state or
+   runtime ledger, so the per-runner identity test is the smaller complete
+   check. A rename of a shared value still propagates at compile time; the
+   identity test guards only against a re-export that points at the wrong
+   constant, which the compiler cannot detect because all four share one type.)
 7. **Deleted-symbol absence check.** `go build ./...` can pass even if a stale
    alias or conversion function remains, so the definition of done is verified
    by an explicit repository search that fails when `QueueFailureKind` or any of
@@ -1308,9 +1342,26 @@ Per `AGENTS.md`, the root commands are the source of truth:
    (`internal/{fixer,reviewer,worker,planner}`), locates every `loopError`
    composite literal `kind` element (and every assignment to a `loopError`
    value's `.kind` field), and classifies the value expression by
-   intra-procedural origin tracking within the enclosing function. A
-   `loopError` composite literal that **omits** the `kind` element, a
-   `new(loopError)` call, or a `var <name> loopError` declaration produces a
+   intra-procedural origin tracking within the enclosing function. It also
+   flags any `&<receiver>.kind` unary address-of expression whose selector
+   receiver `go/types` resolves to `loopError` as **unsafe** — forbidding taking
+   the field's address — because an address-taken `kind` field can be mutated
+   through the pointer (`dst := &failure.kind; *dst = decision.Kind`) without
+   producing an assignment whose left side is `.kind` or a dynamic
+   composite-literal element for the origin tracker to visit, so the pointer
+   alias would otherwise bypass `Normalize` while the gate claims every
+   assignment is covered. There is no legitimate production reason to take the
+   address of `loopError.kind` (it is a value field read by value, never passed
+   to a mutator), so the gate fails closed on the address-of expression itself
+   rather than attempting to track pointer aliases and indirect stores through
+   them, which is inter-procedural and out of scope for the same reason the
+   parameter rule is conservative. (A `*<ptr>` store whose pointer does not
+   originate from `&<loopError>.kind` within this function is not reachable
+   today — the audit found no `&failure.kind` or `&loopError`-kind address-of
+   use — so the address-of rule is a regression net against a future
+   pointer-mutation construction, the same stance the zero-valued-construction
+   rule below takes.) A `loopError` composite literal that **omits** the `kind`
+   element, a `new(loopError)` call, or a `var <name> loopError` declaration produces a
    zero-valued `loopError` whose `kind` is the empty-string default — an
    unknown kind that bypasses `Normalize` exactly as the uninitialized `Kind`
    local below rejects — so the gate treats each of those constructions as
@@ -1354,10 +1405,28 @@ Per `AGENTS.md`, the root commands are the source of truth:
 
    - A call resolved by `go/types` to `failureclass.Normalize(...)` — **safe**
      (normalized).
-   - A reference to a known-kind constant — `failureclass.RetryableTransient` /
-     `RetryableAfterResume` / `NonRetryable` / `ManualIntervention`, or the
-     per-role `FailureRetryable*` / `FailureNonRetryable` /
-     `FailureManualIntervention` aliases — **safe** (a known kind).
+   - A reference to a known-kind constant — **safe** (a known kind). The set of
+     accepted constants is **derived from the authority, not enumerated in the
+     gate**: the test uses `go/types` to enumerate every `const` declaration
+     whose type is `policy.Kind` (the authority after Step 5) in the imported
+     `internal/loops/policy` package and every `const` declaration whose type is
+     `failureclass.Kind` (the `type Kind = policy.Kind` alias) in the imported
+     `internal/loops/failureclass` package, plus the per-role
+     `FailureRetryable*` / `FailureNonRetryable` / `FailureManualIntervention`
+     re-exports by resolving each to the `failureclass.*` / `policy.*` constant
+     it aliases. A reference is safe when `go/types` resolves it to one of those
+     authority constants (directly or through a re-export alias). The gate never
+     spells the four current names; today that set is
+     `failureclass.RetryableTransient` / `RetryableAfterResume` / `NonRetryable`
+     / `ManualIntervention` (and the per-role re-exports of them), but when a
+     fifth `policy.Kind` constant is added and `failureclass.Normalize` is
+     extended to preserve it, a safe direct assignment such as
+     `kind: FailureNewKind` is accepted automatically because the new constant
+     is already in the derived set — the gate does not recreate a manually
+     synchronized failure-kind ledger inside itself. (A constant of type
+     `policy.Kind` that `Normalize` does *not* preserve would still pass this
+     branch; that gap is closed by the `Normalize` unit test in step 6, which is
+     the authority for the fallback behavior, not by the call-site gate.)
    - A `.kind` selector read whose receiver `go/types` resolves to `loopError`
      (`kind: failure.kind`) — **safe only when the receiver's own origin is
      safe**. Resolving the receiver's *type* to `loopError` is necessary but not
@@ -1446,7 +1515,8 @@ Per `AGENTS.md`, the root commands are the source of truth:
      never used is not flagged, matching the dead-declaration carve-out above.
 
    The test fails on the first **unsafe** `kind` assignment (or zero-valued
-   `loopError` construction), reporting the file and position. This closes the
+   `loopError` construction, or address-of `loopError.kind` expression),
+   reporting the file and position. This closes the
    indirect-assignment hole: `kind: classified`
    resolves `classified` back to `failureclass.Classify(...)` and fails, so the
    implementer must write `kind: failureclass.Normalize(classified)`. The
@@ -1464,7 +1534,10 @@ Per `AGENTS.md`, the root commands are the source of truth:
    unless wrapped, because the receiver's `kind` is not proven safe within this
    function, and likewise a `loopError` built with no `kind` element (or via
    `new(loopError)`/`var <name> loopError`) is **unsafe** because its zero-value
-   `kind` is an unknown kind with no assignment for the origin tracker to visit.
+   `kind` is an unknown kind with no assignment for the origin tracker to visit,
+   and likewise `&<loopError>.kind` is **unsafe** because the address-taken field
+   can be mutated through the pointer without an assignment the origin tracker
+   visits.
    The carrier reads pass because Step 2 wraps them in
    `Normalize`, not because the gate recognizes their producers. The
    dynamic-vs-copy distinction is no longer made by selector name: `go/types`
@@ -1481,9 +1554,10 @@ Per `AGENTS.md`, the root commands are the source of truth:
    surface it guards does not grow — the seven dynamic-source call sites and the
    five known-safe carrier reads already route through `Normalize` after Step 2,
    and every existing `loopError` composite literal already supplies an explicit
-   `kind:` element (there are no `new(loopError)`, `var <name> loopError`, or
-   `kind`-omitting literals in production today) — so the zero-valued
-   construction rule flags nothing on the current branch and is a regression
+   `kind:` element (there are no `new(loopError)`, `var <name> loopError`,
+   `kind`-omitting literals, or `&<loopError>.kind` address-of expressions in
+   production today) — so the zero-valued construction and address-of rules
+   flag nothing on the current branch and are a regression
    net against a future construction that would otherwise bypass the fallback
    silently. The test is a regression net, not a new state machine.
 
