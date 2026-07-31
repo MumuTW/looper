@@ -176,7 +176,7 @@ func trackedGoFiles(root string) ([]string, error) {
 		return nil, fmt.Errorf("read git index: %w", err)
 	}
 
-	cmd := exec.Command("git", "-C", root, "ls-files", "-z", "--", "*.go")
+	cmd := gitReadCommand(root, "ls-files", "-z")
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
@@ -185,7 +185,7 @@ func trackedGoFiles(root string) ([]string, error) {
 	}
 	var files []string
 	for _, entry := range strings.Split(string(out), "\x00") {
-		if entry == "" {
+		if entry == "" || !strings.HasSuffix(entry, ".go") {
 			continue
 		}
 		// `git ls-files` lists cached paths even when the working-tree file is
@@ -210,11 +210,14 @@ func trackedGoFiles(root string) ([]string, error) {
 // Repository membership is decided in two stages so an exported archive can
 // skip without requiring the git executable:
 //   - root is checked for a `.git` entry first (a directory for a primary
-//     worktree, a file for a linked worktree's gitdir pointer). No `.git` means
-//     root is not a checkout, so errNotAGitRepo is returned without starting
-//     git; this lets the guard skip in minimal build environments where the Go
-//     toolchain is present but git is not installed.
-//   - When `.git` is present, git is the authority for the effective index
+//     worktree, a file for a linked worktree's gitdir pointer). When no entry
+//     exists, an explicit GIT_DIR/GIT_WORK_TREE/GIT_COMMON_DIR environment can
+//     still select an external checkout, so Git is consulted in that case;
+//     otherwise errNotAGitRepo is returned without starting git. The latter
+//     lets the guard skip in minimal build environments where the Go toolchain
+//     is present but git is not installed.
+//   - When repository metadata or an explicit Git environment is present, Git
+//     is the authority for the effective index
 //     path. `git rev-parse --git-path index` resolves GIT_INDEX_FILE (and the
 //     other index-selection environment), so the cache-tied read observes the
 //     same index `git ls-files` reads rather than a hard-coded `<gitDir>/index`.
@@ -225,10 +228,10 @@ func trackedGoFiles(root string) ([]string, error) {
 // failed for an unrelated reason such as a malformed GIT_CONFIG_GLOBAL — is
 // preserved so the caller fails the guard loud instead of silently skipping.
 func resolveGitIndex(root string) (string, error) {
-	if !hasGitRepoMetadata(root) {
+	if !hasGitRepoMetadata(root) && !gitEnvironmentSelectsRepository() {
 		return "", errNotAGitRepo
 	}
-	cmd := exec.Command("git", "-C", root, "rev-parse", "--git-path", "index")
+	cmd := gitReadCommand(root, "rev-parse", "--git-path", "index")
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
@@ -256,10 +259,29 @@ func resolveGitIndex(root string) (string, error) {
 // `.git` entry (a directory for a primary worktree, a file for a linked
 // worktree's gitdir pointer) at root itself. root is always a repository root
 // (see repoRoot), so an ancestor walk is unnecessary; an exported source
-// archive has no `.git` and is detected here without starting git.
+// archive has no `.git` and is detected here without starting git. An explicit
+// external Git environment is handled separately by gitEnvironmentSelectsRepository.
 func hasGitRepoMetadata(root string) bool {
 	_, err := os.Stat(filepath.Join(root, ".git"))
 	return err == nil
+}
+
+func gitEnvironmentSelectsRepository() bool {
+	for _, name := range []string{"GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR"} {
+		if strings.TrimSpace(os.Getenv(name)) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// gitReadCommand scopes Git's read-only repository access to this checkout.
+// The command-line safe.directory setting avoids requiring a global config
+// mutation when a supported test checkout is mounted with a different UID.
+func gitReadCommand(root string, args ...string) *exec.Cmd {
+	gitArgs := []string{"-c", "safe.directory=" + root, "-C", root}
+	gitArgs = append(gitArgs, args...)
+	return exec.Command("git", gitArgs...)
 }
 
 // isNotAGitRepoMessage reports whether stderr is Git's canonical "not a git
@@ -267,7 +289,20 @@ func hasGitRepoMetadata(root string) bool {
 // worktree. Other failures (a malformed GIT_CONFIG_GLOBAL, ...) must not be
 // collapsed into this sentinel.
 func isNotAGitRepoMessage(stderr string) bool {
-	return strings.Contains(stderr, "not a git repository")
+	const (
+		canonical  = "fatal: not a git repository"
+		withParent = canonical + " (or any of the parent directories): "
+	)
+	for _, line := range strings.Split(stderr, "\n") {
+		line = strings.TrimSpace(line)
+		switch {
+		case line == canonical:
+			return true
+		case strings.HasPrefix(line, withParent) && strings.TrimSpace(strings.TrimPrefix(line, withParent)) != "":
+			return true
+		}
+	}
+	return false
 }
 
 type legacyModulePathViolation struct {
@@ -418,6 +453,151 @@ func TestTrackedGoFilesExcludesWorktrees(t *testing.T) {
 	}
 	if !foundTracked {
 		t.Fatalf("trackedGoFiles = %v, want %q listed", files, wantTracked)
+	}
+}
+
+func TestTrackedGoFilesIgnoresGitPathspecEnvironment(t *testing.T) {
+	root := t.TempDir()
+	for _, args := range [][]string{
+		{"init"},
+		{"config", "user.email", "test@example.com"},
+		{"config", "user.name", "test"},
+	} {
+		cmd := exec.Command("git", append([]string{"-C", root}, args...)...)
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		if err := cmd.Run(); err != nil {
+			t.Skipf("git %v unavailable in this environment: %v %s", args, err, stderr.String())
+		}
+	}
+	trackedRel := filepath.Join("cmd", "looperd", "main.go")
+	if err := os.MkdirAll(filepath.Dir(filepath.Join(root, trackedRel)), 0o755); err != nil {
+		t.Fatalf("mkdir tracked: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, trackedRel), []byte("package main\n"), 0o644); err != nil {
+		t.Fatalf("write tracked file: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "go.mod"), []byte("module github.com/MumuTW/looper\n\ngo 1.24\n"), 0o644); err != nil {
+		t.Fatalf("write go.mod: %v", err)
+	}
+	for _, args := range [][]string{
+		{"add", trackedRel, "go.mod"},
+		{"commit", "--no-gpg-sign", "-m", "seed"},
+	} {
+		cmd := exec.Command("git", append([]string{"-C", root}, args...)...)
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		if err := cmd.Run(); err != nil {
+			t.Fatalf("git %v: %v %s", args, err, stderr.String())
+		}
+	}
+
+	// These variables change the meaning of a pathspec. The scanner must not
+	// pass a pathspec at all, so a tracked nested Go file remains visible.
+	t.Setenv("GIT_LITERAL_PATHSPECS", "1")
+	t.Setenv("GIT_GLOB_PATHSPECS", "1")
+	files, err := trackedGoFiles(root)
+	if err != nil {
+		t.Fatalf("trackedGoFiles: %v", err)
+	}
+	want := filepath.ToSlash(trackedRel)
+	for _, file := range files {
+		if filepath.ToSlash(file) == want {
+			return
+		}
+	}
+	t.Fatalf("trackedGoFiles = %v, want %q with Git pathspec modes enabled", files, want)
+}
+
+func TestTrackedGoFilesRespectsExternalGitDirectory(t *testing.T) {
+	root := t.TempDir()
+	gitDir := t.TempDir()
+	cleanEnv := withoutGitRepositoryEnvironment(os.Environ())
+	initGit := exec.Command("git", "-C", gitDir, "init")
+	initGit.Env = cleanEnv
+	if output, err := initGit.CombinedOutput(); err != nil {
+		t.Skipf("git init unavailable in this environment: %v\n%s", err, output)
+	}
+	for _, args := range [][]string{
+		{"config", "user.email", "test@example.com"},
+		{"config", "user.name", "test"},
+	} {
+		cmd := exec.Command("git", append([]string{"-C", gitDir}, args...)...)
+		cmd.Env = cleanEnv
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, output)
+		}
+	}
+	trackedRel := filepath.Join("cmd", "looperd", "main.go")
+	if err := os.MkdirAll(filepath.Dir(filepath.Join(root, trackedRel)), 0o755); err != nil {
+		t.Fatalf("mkdir tracked: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, trackedRel), []byte("package main\n"), 0o644); err != nil {
+		t.Fatalf("write tracked file: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "go.mod"), []byte("module github.com/MumuTW/looper\n\ngo 1.24\n"), 0o644); err != nil {
+		t.Fatalf("write go.mod: %v", err)
+	}
+	externalGitDir := filepath.Join(gitDir, ".git")
+	env := append(cleanEnv, "GIT_DIR="+externalGitDir, "GIT_WORK_TREE="+root)
+	for _, args := range [][]string{
+		{"add", trackedRel, "go.mod"},
+		{"commit", "--no-gpg-sign", "-m", "seed"},
+	} {
+		cmd := exec.Command("git", append([]string{"-C", root}, args...)...)
+		cmd.Env = env
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("external git %v: %v\n%s", args, err, output)
+		}
+	}
+	t.Setenv("GIT_DIR", externalGitDir)
+	t.Setenv("GIT_WORK_TREE", root)
+
+	files, err := trackedGoFiles(root)
+	if err != nil {
+		t.Fatalf("trackedGoFiles with external Git directory: %v", err)
+	}
+	want := filepath.ToSlash(trackedRel)
+	for _, file := range files {
+		if filepath.ToSlash(file) == want {
+			return
+		}
+	}
+	t.Fatalf("trackedGoFiles = %v, want %q with external GIT_DIR/GIT_WORK_TREE", files, want)
+}
+
+func withoutGitRepositoryEnvironment(env []string) []string {
+	var clean []string
+	for _, entry := range env {
+		name, _, ok := strings.Cut(entry, "=")
+		switch name {
+		case "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE":
+			continue
+		default:
+			if ok {
+				clean = append(clean, entry)
+			}
+		}
+	}
+	return clean
+}
+
+func TestIsNotAGitRepoMessageMatchesOnlyCanonicalDiagnostics(t *testing.T) {
+	for _, stderr := range []string{
+		"fatal: not a git repository\n",
+		"fatal: not a git repository (or any of the parent directories): .git\n",
+	} {
+		if !isNotAGitRepoMessage(stderr) {
+			t.Errorf("isNotAGitRepoMessage(%q) = false, want true", stderr)
+		}
+	}
+	for _, stderr := range []string{
+		"fatal: bad config line 1 in file /tmp/not a git repository/config\n",
+		"fatal: not a git repository: custom wrapper\n",
+	} {
+		if isNotAGitRepoMessage(stderr) {
+			t.Errorf("isNotAGitRepoMessage(%q) = true, want false", stderr)
+		}
 	}
 }
 
