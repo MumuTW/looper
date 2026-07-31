@@ -209,3 +209,83 @@ func TestReviewThreadCommandsTreatGitHubAPIHostnameAsPublic(t *testing.T) {
 		t.Fatalf("gh calls = %#v, want public GitHub command without hostname selector", calls)
 	}
 }
+
+func TestReviewerAndFixerViewPullRequestQualifyEmbeddedReviewThreadFetches(t *testing.T) {
+	ghesPath := filepath.Join(t.TempDir(), "ghes")
+	cfg := config.Config{
+		Providers: []config.ProviderConfig{{ID: "github-enterprise", Kind: config.ProviderKindGitHub, BaseURL: "https://github.example.com"}},
+		Projects:  []config.ProjectRefConfig{{ID: "enterprise", Provider: "github-enterprise", Repo: "acme/enterprise", RepoPath: ghesPath}},
+	}
+	var calls []string
+	gateway := githubinfra.New(githubinfra.Options{
+		GHPath: "gh",
+		GHRun: func(_ context.Context, options shell.Options) (shell.Result, error) {
+			args := strings.Join(options.Args, " ")
+			calls = append(calls, args)
+			switch {
+			case strings.HasPrefix(args, "pr view "):
+				return shell.Result{Stdout: `{"number":42}`}, nil
+			case strings.Contains(args, "reviewThreads(first: 100, after: $after)"):
+				return shell.Result{Stdout: `{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"id":"thread-1","isResolved":false,"path":"file.go","line":1,"comments":{"nodes":[],"pageInfo":{"hasNextPage":true,"endCursor":"comment-cursor"}}}],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`}, nil
+			case strings.Contains(args, "comments(first: 100, after: $after)"):
+				return shell.Result{Stdout: `{"data":{"node":{"comments":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}`}, nil
+			case strings.HasPrefix(args, "api --paginate repos/acme/enterprise/issues/42/comments "):
+				return shell.Result{Stdout: "[]"}, nil
+			default:
+				return shell.Result{}, fmt.Errorf("unexpected gh args: %s", args)
+			}
+		},
+	})
+
+	reviewerAdapter := reviewerGitHubAdapter{config: &cfg, gateway: gateway}
+	if _, err := reviewerAdapter.ViewPullRequest(context.Background(), reviewer.ViewPullRequestInput{Repo: "acme/not-authoritative", PRNumber: 42, CWD: ghesPath}); err != nil {
+		t.Fatalf("reviewer ViewPullRequest() error = %v", err)
+	}
+	fixerAdapter := fixerGitHubAdapter{config: &cfg, gateway: gateway}
+	if _, err := fixerAdapter.ViewPullRequest(context.Background(), fixer.ViewPullRequestInput{Repo: "acme/not-authoritative", PRNumber: 42, CWD: ghesPath}); err != nil {
+		t.Fatalf("fixer ViewPullRequest() error = %v", err)
+	}
+
+	if len(calls) != 8 {
+		t.Fatalf("gh calls = %#v, want two complete pull-request reads", calls)
+	}
+	for _, call := range calls {
+		if strings.HasPrefix(call, "pr view ") {
+			if !strings.Contains(call, "--repo github.example.com/acme/enterprise") {
+				t.Fatalf("gh PR view = %q, want configured GHES repository", call)
+			}
+			continue
+		}
+		if !strings.Contains(call, "--hostname github.example.com") {
+			t.Fatalf("gh embedded review-thread call = %q, want configured GHES hostname", call)
+		}
+	}
+}
+
+func TestReviewThreadCommandsPreserveConfiguredGHESPort(t *testing.T) {
+	ghesPath := filepath.Join(t.TempDir(), "ghes")
+	cfg := config.Config{
+		Providers: []config.ProviderConfig{{ID: "github-enterprise", Kind: config.ProviderKindGitHub, BaseURL: "https://github.example.com:8443"}},
+		Projects:  []config.ProjectRefConfig{{ID: "enterprise", Provider: "github-enterprise", Repo: "acme/enterprise", RepoPath: ghesPath}},
+	}
+	var calls []string
+	gateway := githubinfra.New(githubinfra.Options{
+		GHPath: "gh",
+		GHRun: func(_ context.Context, options shell.Options) (shell.Result, error) {
+			args := strings.Join(options.Args, " ")
+			calls = append(calls, args)
+			if !strings.Contains(args, "reviewThreads(first: $limit, after: $after)") {
+				return shell.Result{}, fmt.Errorf("unexpected gh args: %s", args)
+			}
+			return shell.Result{Stdout: `{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`}, nil
+		},
+	})
+
+	adapter := reviewerGitHubAdapter{config: &cfg, gateway: gateway}
+	if _, err := adapter.ListReviewThreads(context.Background(), reviewer.ListReviewThreadsInput{Repo: "acme/not-authoritative", PRNumber: 42, CWD: ghesPath, Limit: 10}); err != nil {
+		t.Fatalf("ListReviewThreads() error = %v", err)
+	}
+	if len(calls) != 1 || !strings.HasSuffix(calls[0], "--hostname github.example.com:8443") {
+		t.Fatalf("gh calls = %#v, want configured GHES authority including port", calls)
+	}
+}

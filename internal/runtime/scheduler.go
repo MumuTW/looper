@@ -591,7 +591,11 @@ func (a reviewerGitHubAdapter) ViewPullRequest(ctx context.Context, input review
 	if a.gateway == nil {
 		return reviewer.PullRequestDetail{}, fmt.Errorf("github gateway is not configured")
 	}
-	detail, err := a.gateway.ViewPullRequestForReviewer(ctx, githubinfra.ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
+	repo, err := reviewThreadRepo(a.config, input.Repo, input.CWD)
+	if err != nil {
+		return reviewer.PullRequestDetail{}, err
+	}
+	detail, err := a.gateway.ViewPullRequestForReviewer(ctx, githubinfra.ViewPullRequestInput{Repo: repo, PRNumber: input.PRNumber, CWD: input.CWD})
 	if err != nil {
 		return reviewer.PullRequestDetail{}, err
 	}
@@ -1082,7 +1086,11 @@ func (a fixerGitHubAdapter) GetPullRequestAuthor(ctx context.Context, input fixe
 }
 
 func (a fixerGitHubAdapter) ViewPullRequest(ctx context.Context, input fixer.ViewPullRequestInput) (fixer.PullRequestDetail, error) {
-	detail, err := a.gateway.ViewPullRequestForFixer(ctx, githubinfra.ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
+	repo, err := reviewThreadRepo(a.config, input.Repo, input.CWD)
+	if err != nil {
+		return fixer.PullRequestDetail{}, err
+	}
+	detail, err := a.gateway.ViewPullRequestForFixer(ctx, githubinfra.ViewPullRequestInput{Repo: repo, PRNumber: input.PRNumber, CWD: input.CWD})
 	if err != nil {
 		return fixer.PullRequestDetail{}, err
 	}
@@ -1179,14 +1187,13 @@ func reviewThreadRepo(cfg *config.Config, repo, cwd string) (string, error) {
 			return "", fmt.Errorf("repository identity is not configured for project %s", project.ID)
 		}
 		baseURL, err := url.Parse(identity.BaseURL)
-		if err != nil || strings.TrimSpace(baseURL.Hostname()) == "" {
+		if err != nil || strings.TrimSpace(baseURL.Hostname()) == "" || strings.TrimSpace(baseURL.Host) == "" {
 			return "", fmt.Errorf("github provider hostname is not configured for project %s", project.ID)
 		}
-		hostname := strings.TrimSpace(baseURL.Hostname())
-		if isPublicGitHubHostname(hostname) {
+		if isPublicGitHubHostname(baseURL.Hostname()) {
 			return identity.Repo, nil
 		}
-		return hostname + "/" + identity.Repo, nil
+		return strings.TrimSpace(baseURL.Host) + "/" + identity.Repo, nil
 	}
 	return repo, nil
 }
