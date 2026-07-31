@@ -31,6 +31,12 @@ type upgradePreflight struct {
 	TargetConfigCompatible bool   `json:"targetConfigCompatible"`
 	TargetConfigError      string `json:"targetConfigError,omitempty"`
 	Relationship           string `json:"relationship"`
+	// CanStartDrain and StartDrainBlockers are a point-in-time operator report,
+	// not a durable authorization for a later cutover. Runtime status and target
+	// binaries must be queried again when a state-changing command is added.
+	CanStartDrain    bool     `json:"canStartDrain"`
+	StartDrainBlocks []string `json:"startDrainBlocks"`
+	DrainRequired    bool     `json:"drainRequired"`
 }
 
 type upgradeStatus struct {
@@ -130,6 +136,9 @@ func runUpgrade(ctx context.Context, global, operands []string, stdout interface
 	report.Current.CLI, report.Current.Daemon, report.Current.Status = version.Current(), currentDaemon, status
 	report.Target.CLI, report.Target.Daemon = targetCLI, targetDaemon
 	report.Relationship = buildRelationship(currentDaemon, targetDaemon)
+	report.StartDrainBlocks = upgradeStartDrainBlocks(report)
+	report.CanStartDrain = len(report.StartDrainBlocks) == 0
+	report.DrainRequired = status.Scheduler.ActiveRuns > 0 || status.Scheduler.RunningItems > 0
 	if jsonOutput {
 		return writeVersionJSON(stdout, report)
 	}
@@ -139,6 +148,38 @@ func runUpgrade(ctx context.Context, global, operands []string, stdout interface
 	}
 	_, _ = fmt.Fprintln(stdout, string(encoded))
 	return nil
+}
+
+func upgradeStartDrainBlocks(report upgradePreflight) []string {
+	blocks := make([]string, 0, 8)
+	if !report.CurrentPairMatches {
+		blocks = append(blocks, "current CLI and daemon build identities differ")
+	}
+	if !report.TargetPairMatches {
+		blocks = append(blocks, "target CLI and daemon build identities differ")
+	}
+	if !report.TargetIdentityValid {
+		blocks = append(blocks, "target build identity is incomplete")
+	}
+	if !report.TargetConfigCompatible {
+		blocks = append(blocks, "target daemon rejects the selected configuration")
+	}
+	if !report.Current.Status.Service.Healthy {
+		blocks = append(blocks, "current daemon service is unhealthy")
+	}
+	if report.Current.Status.Service.AdmissionState != "ready" {
+		blocks = append(blocks, "current daemon admission is not ready")
+	}
+	if !report.Current.Status.Storage.Healthy {
+		blocks = append(blocks, "current storage is unhealthy")
+	}
+	if len(report.Current.Status.Storage.PendingMigrations) > 0 {
+		blocks = append(blocks, "current storage has pending migrations")
+	}
+	if report.Current.Status.Service.Recovery.Outstanding.QuarantinedActiveExecutions > 0 || report.Current.Status.Service.Recovery.Outstanding.QuarantinedRunningRuns > 0 {
+		blocks = append(blocks, "current daemon has outstanding quarantine debt")
+	}
+	return blocks
 }
 
 type upgradeBackupResult struct {

@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -40,8 +41,15 @@ func TestUpgradePreflightReadsCurrentDaemonAndTargetPair(t *testing.T) {
 			if err := json.Unmarshal(stdout.Bytes(), &report); err != nil {
 				t.Fatalf("decode report: %v\n%s", err, stdout.String())
 			}
-			if !report.CurrentPairMatches || report.TargetPairMatches != test.wantPairMatches || !report.TargetIdentityValid || !report.TargetConfigCompatible || report.Relationship != test.wantRelation {
+			if !report.CurrentPairMatches || report.TargetPairMatches != test.wantPairMatches || !report.TargetIdentityValid || !report.TargetConfigCompatible || report.Relationship != test.wantRelation || !report.DrainRequired || report.CanStartDrain {
 				t.Fatalf("report = %#v", report)
+			}
+			wantBlocks := []string{"current daemon has outstanding quarantine debt"}
+			if !test.wantPairMatches {
+				wantBlocks = append([]string{"target CLI and daemon build identities differ"}, wantBlocks...)
+			}
+			if !slices.Equal(report.StartDrainBlocks, wantBlocks) {
+				t.Fatalf("start drain blocks = %v, want %v", report.StartDrainBlocks, wantBlocks)
 			}
 			if report.Current.Status.Storage.SchemaVersion != "0021" || report.Current.Status.Scheduler.ActiveRuns != 2 || report.Current.Status.Service.Recovery.Outstanding.QuarantinedActiveExecutions != 1 {
 				t.Fatalf("current status missing from report: %#v", report.Current.Status)
@@ -64,8 +72,27 @@ func TestUpgradePreflightReportsTargetConfigFailure(t *testing.T) {
 	if err := json.Unmarshal(stdout.Bytes(), &report); err != nil {
 		t.Fatal(err)
 	}
-	if report.TargetConfigCompatible || report.TargetConfigError != "configuration schema rejected" {
+	if report.TargetConfigCompatible || report.TargetConfigError != "configuration schema rejected" || report.CanStartDrain || len(report.StartDrainBlocks) != 2 {
 		t.Fatalf("config result = (%v, %q)", report.TargetConfigCompatible, report.TargetConfigError)
+	}
+}
+
+func TestUpgradeStartDrainBlocksReportsOnlyRealPreDrainConstraints(t *testing.T) {
+	report := upgradePreflight{CurrentPairMatches: true, TargetPairMatches: true, TargetIdentityValid: true, TargetConfigCompatible: true}
+	report.Current.Status.Service.Healthy = true
+	report.Current.Status.Service.AdmissionState = "ready"
+	report.Current.Status.Storage.Healthy = true
+	if blocks := upgradeStartDrainBlocks(report); len(blocks) != 0 {
+		t.Fatalf("ready report blocks = %v", blocks)
+	}
+	report.Current.Status.Scheduler.ActiveRuns = 3
+	report.Current.Status.Scheduler.RunningItems = 2
+	if blocks := upgradeStartDrainBlocks(report); len(blocks) != 0 {
+		t.Fatalf("active work blocks starting drain = %v", blocks)
+	}
+	report.Current.Status.Storage.PendingMigrations = []string{"0022"}
+	if blocks := upgradeStartDrainBlocks(report); len(blocks) != 1 || blocks[0] != "current storage has pending migrations" {
+		t.Fatalf("migration blocks = %v", blocks)
 	}
 }
 
