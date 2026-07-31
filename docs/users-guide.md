@@ -356,7 +356,7 @@ Comment markers used by this flow:
 
 - `<!-- looper:reviewer:criteria-fail -->` — Reviewer found at least one acceptance criterion without satisfying evidence in the diff and returned the linked Issue to re-Triage
 - `<!-- looper:reviewer:automerge-refused -->` — Reviewer approved the PR, but GitHub repo settings or branch protection refused the auto-merge opt-in
-- `<!-- looper:coordinator:merge-watch retries=N -->` — Coordinator is watching a merge-pending PR and carrying retry state on the linked Issue
+- `<!-- looper:coordinator:merge-watch retries=N conflict_repairs=N -->` — Coordinator is watching a merge-pending PR and carrying transient retry plus durable conflict-repair state on the linked Issue
 
 Human override is silent: if someone clicks **Disable auto-merge** on the PR, Looper respects it and does not re-enable auto-merge just because an earlier Reviewer pass opted in.
 

@@ -293,6 +293,26 @@ type RegenerateIssueFunc func(context.Context, RegenerateIssueInput) error
 // closing it when the downstream Planner authority is unavailable.
 type RegenerationAvailabilityFunc func(projectID string) string
 
+// ConflictRegenerationInput is the coordinator handoff for a PR that has
+// repeatedly conflicted with its base branch. Unlike ordinary Fixer
+// exhaustion it has no agent run or queue row; the durable authority is the
+// merge-watch marker, while this method reuses the same close-and-regenerate
+// side-effect contract.
+type ConflictRegenerationInput struct {
+	ProjectID       string
+	Repo            string
+	IssueRepo       string
+	IssueNumber     int64
+	PRNumber        int64
+	ConflictRepairs int
+	CWD             string
+}
+
+type ConflictRegenerationResult struct {
+	Completed bool
+	Escalated bool
+}
+
 // RegenerationGateway is deliberately separate from GitHubGateway.  Existing
 // fixer fakes and integrations remain source-compatible while terminal
 // exhaustion opts into the stronger close-and-regenerate capability.

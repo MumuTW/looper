@@ -1839,6 +1839,13 @@ func validateCoordinatorRoleConfig(config CoordinatorRoleConfig, path string, is
 			*issues = append(*issues, ValidationIssue{Path: path + ".postMergeDigest.maxItems", Message: "must be an integer between 1 and 200"})
 		}
 	}
+	maxConflictRepairs := 2
+	if config.ConflictPolicy != nil {
+		maxConflictRepairs = config.ConflictPolicy.MaxRepairs
+	}
+	if maxConflictRepairs <= 0 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".conflictPolicy.maxRepairs", Message: "must be a positive integer"})
+	}
 	validateDistinctLabels([]labelPathValue{
 		{Path: path + ".triage.triagedLabel", Value: config.Triage.TriagedLabel},
 		{Path: path + ".triage.disposition.outOfScopeLabel", Value: config.Triage.Disposition.OutOfScopeLabel},

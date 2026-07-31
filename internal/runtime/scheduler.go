@@ -2207,6 +2207,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 	var coordinatorRunner coordinatorScheduler
 	var reviewerRunner reviewerScheduler
 	var fixerRunner fixerScheduler
+	var fixerRoleRunner *fixer.Runner
 	var workerRunner workerScheduler
 
 	looperCLIPath := resolveTrustedLooperCLIPath(cfg, logger)
@@ -2356,6 +2357,16 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		Now:     now,
 		State:   coordinatorState,
 		Network: coordinatorrole.NewLoopernetGateway(networkclient.DefaultStatePath(runtimeHomeDirOrEmpty())),
+		RegenerateConflict: func(ctx context.Context, input coordinatorrole.ConflictRegenerationInput) (coordinatorrole.ConflictRegenerationResult, error) {
+			if fixerRoleRunner == nil {
+				return coordinatorrole.ConflictRegenerationResult{}, fmt.Errorf("fixer runner is not configured for coordinator conflict regeneration")
+			}
+			result, err := fixerRoleRunner.RegenerateConflict(ctx, fixer.ConflictRegenerationInput{
+				ProjectID: input.ProjectID, Repo: input.Repo, IssueRepo: input.IssueRepo, IssueNumber: input.IssueNumber,
+				PRNumber: input.PRNumber, ConflictRepairs: input.ConflictRepairs, CWD: input.CWD,
+			})
+			return coordinatorrole.ConflictRegenerationResult{Completed: result.Completed, Escalated: result.Escalated}, err
+		},
 	}
 	if cfg.Agent.Vendor != nil {
 		// Same ParamsOwnerVendor as coding-role executors: agent.params.command/args
@@ -2470,7 +2481,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		if !fixerConfigured {
 			fixerAutoDiscovery = false
 		}
-		fixerRunner = fixer.New(fixer.Options{
+		fixerRoleRunner = fixer.New(fixer.Options{
 			DB:                          coordinator.DB(),
 			Repos:                       repos,
 			GitHub:                      fixerGitHubAdapter{gateway: githubGateway, stamper: fixerStamper, config: &cfg},
@@ -2544,6 +2555,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 				return notifyAgentExecutionStarted(ctx, agentExecutionNotificationInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Title: "Looper Fixer", Subtitle: input.Subtitle, Body: input.Body, DedupeKey: input.DedupeKey})
 			},
 		})
+		fixerRunner = fixerRoleRunner
 	}
 	notifyHITLAsk := func(ctx context.Context, ask worker.HITLAskNotification) error {
 		return notificationGateway.SendHITLAsk(ctx, notify.HITLAskCard{

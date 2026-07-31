@@ -378,6 +378,139 @@ func (r *Runner) handleTerminalExhaustion(ctx context.Context, project storage.P
 	return regenerationCompleted, nil
 }
 
+// RegenerateConflict applies the same ordered close-and-regenerate authority
+// as terminal Fixer exhaustion to a coordinator merge-watch conflict. The
+// PR's issue-comment markers are the durable ledger because this path has no
+// Fixer loop yet. A pending marker makes retries safe after a crash between
+// close and the Planner route; a completed/escalated marker makes replay a
+// no-op.
+func (r *Runner) RegenerateConflict(ctx context.Context, input ConflictRegenerationInput) (ConflictRegenerationResult, error) {
+	if input.ProjectID == "" || input.Repo == "" || input.PRNumber <= 0 || input.IssueNumber <= 0 {
+		return ConflictRegenerationResult{}, fmt.Errorf("conflict regeneration requires project, repo, PR, and issue identity")
+	}
+	if r.onRegenerateIssue == nil {
+		return ConflictRegenerationResult{}, fmt.Errorf("planner regeneration authority is not configured")
+	}
+	bridge, ok := r.github.(RegenerationGateway)
+	if !ok {
+		return ConflictRegenerationResult{}, fmt.Errorf("conflict regeneration gateway is unavailable")
+	}
+	if r.repos == nil || r.repos.Projects == nil {
+		return ConflictRegenerationResult{}, fmt.Errorf("conflict regeneration repositories are not configured")
+	}
+	project, err := r.repos.Projects.GetByID(ctx, input.ProjectID)
+	if err != nil {
+		return ConflictRegenerationResult{}, err
+	}
+	if project == nil {
+		return ConflictRegenerationResult{}, fmt.Errorf("project not found: %s", input.ProjectID)
+	}
+	pr, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
+	if err != nil {
+		return ConflictRegenerationResult{}, fmt.Errorf("inspect conflicted PR: %w", err)
+	}
+	originRepo := strings.TrimSpace(input.IssueRepo)
+	if originRepo == "" {
+		originRepo = input.Repo
+	}
+	issue, err := bridge.ViewIssue(ctx, ViewIssueInput{Repo: originRepo, IssueNumber: input.IssueNumber, CWD: input.CWD})
+	if err != nil {
+		return ConflictRegenerationResult{}, fmt.Errorf("inspect originating issue %s#%d: %w", originRepo, input.IssueNumber, err)
+	}
+	authority := fmt.Sprintf("coordinator-conflict:%s#%d", input.Repo, input.PRNumber)
+	comments, err := bridge.ListIssueComments(ctx, ViewIssueInput{Repo: input.Repo, IssueNumber: input.PRNumber, CWD: input.CWD})
+	if err != nil {
+		return ConflictRegenerationResult{}, fmt.Errorf("inspect conflicted PR comments: %w", err)
+	}
+	if status := conflictRegenerationMarkerStatus(comments, authority); status == "completed" {
+		return ConflictRegenerationResult{Completed: true}, nil
+	} else if status == "escalated" {
+		return ConflictRegenerationResult{Escalated: true}, nil
+	}
+
+	reason, guardErr := r.regenerationHumanCommitGuard(ctx, *project, input.Repo, pr)
+	if guardErr != nil {
+		return ConflictRegenerationResult{}, guardErr
+	}
+	if reason == "" && strings.EqualFold(strings.TrimSpace(issue.State), "closed") {
+		reason = "originating issue is already closed"
+	}
+	if reason != "" {
+		if err := r.persistConflictRegenerationEscalation(ctx, bridge, input, authority, reason); err != nil {
+			return ConflictRegenerationResult{}, err
+		}
+		return ConflictRegenerationResult{Escalated: true}, nil
+	}
+
+	if !conflictRegenerationMarkerExists(comments, authority, "pending") {
+		body := fmt.Sprintf("%s authority=%s outcome=pending -->\n\nCoordinator observed %d merge conflicts for this PR and will close it before returning the originating issue to Planner.\n\n- Conflict repairs: %d\n- Originating issue: %s#%d\n- PR: %s#%d", regenerationCommentMarker, authority, input.ConflictRepairs, input.ConflictRepairs, originRepo, input.IssueNumber, input.Repo, input.PRNumber)
+		if _, err := r.github.CreateIssueComment(ctx, IssueCommentInput{Repo: input.Repo, IssueNumber: input.PRNumber, Body: body, CWD: input.CWD, DisclosureAgent: r.agentRuntime, DisclosureModel: derefString(r.agentModel)}); err != nil {
+			return ConflictRegenerationResult{}, fmt.Errorf("comment conflicted PR: %w", err)
+		}
+	}
+
+	branchOwned := strings.HasPrefix(strings.ToLower(strings.TrimSpace(pr.HeadRefName)), "looper/")
+	deleteBranch := branchOwned
+	if r.deleteBranchOnRegeneration != nil {
+		deleteBranch = branchOwned && r.deleteBranchOnRegeneration(project.ID)
+	}
+	if !strings.EqualFold(strings.TrimSpace(pr.State), "closed") && !strings.EqualFold(strings.TrimSpace(pr.State), "merged") {
+		if err := bridge.ClosePullRequest(ctx, ClosePullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, DeleteBranch: deleteBranch, CWD: input.CWD}); err != nil {
+			return ConflictRegenerationResult{}, fmt.Errorf("close conflicted PR: %w", err)
+		}
+	}
+	if err := r.onRegenerateIssue(ctx, RegenerateIssueInput{
+		ProjectID: project.ID, Repo: input.Repo, IssueRepo: originRepo, IssueNumber: issue.Number,
+		IssueTitle: issue.Title, IssueBody: issue.Body, IssueURL: issue.URL, IssueLabels: append([]string(nil), issue.Labels...), IssueAssignees: append([]string(nil), issue.Assignees...),
+		FailureSummary: fmt.Sprintf("base branch conflict repair limit reached after %d repairs", input.ConflictRepairs),
+		FailureContext: fmt.Sprintf("conflictRepairs=%d; pr=%s#%d; base=%s", input.ConflictRepairs, input.Repo, input.PRNumber, pr.BaseRefName),
+		Attempts:       int64(input.ConflictRepairs), MaxAttempts: int64(input.ConflictRepairs), Authority: authority,
+	}); err != nil {
+		return ConflictRegenerationResult{}, fmt.Errorf("route conflicted issue back to planner: %w", err)
+	}
+	if err := bridge.AddIssueLabels(ctx, IssueLabelsInput{Repo: originRepo, IssueNumber: issue.Number, Labels: []string{labels.DefaultPlanTrigger}, CWD: input.CWD}); err != nil {
+		return ConflictRegenerationResult{}, fmt.Errorf("mark regenerated issue for planner: %w", err)
+	}
+	if err := bridge.RemoveIssueLabels(ctx, IssueLabelsInput{Repo: originRepo, IssueNumber: issue.Number, Labels: []string{labels.DefaultWorkerReadyTrigger}, CWD: input.CWD}); err != nil {
+		return ConflictRegenerationResult{}, fmt.Errorf("clear worker-ready label from regenerated issue: %w", err)
+	}
+	completed := fmt.Sprintf("%s authority=%s outcome=completed -->\n\nCoordinator closed this conflicted PR and returned the originating issue to Planner after %d conflict repairs.", regenerationCommentMarker, authority, input.ConflictRepairs)
+	if _, err := r.github.CreateIssueComment(ctx, IssueCommentInput{Repo: input.Repo, IssueNumber: input.PRNumber, Body: completed, CWD: input.CWD, DisclosureAgent: r.agentRuntime, DisclosureModel: derefString(r.agentModel)}); err != nil {
+		return ConflictRegenerationResult{}, fmt.Errorf("record conflict regeneration completion: %w", err)
+	}
+	return ConflictRegenerationResult{Completed: true}, nil
+}
+
+func conflictRegenerationMarkerExists(comments []IssueComment, authority, outcome string) bool {
+	needle := "authority=" + authority
+	for _, comment := range comments {
+		if strings.Contains(comment.Body, regenerationCommentMarker) && strings.Contains(comment.Body, needle) && strings.Contains(comment.Body, "outcome="+outcome) {
+			return true
+		}
+	}
+	return false
+}
+
+func conflictRegenerationMarkerStatus(comments []IssueComment, authority string) string {
+	for _, outcome := range []string{"completed", "escalated"} {
+		if conflictRegenerationMarkerExists(comments, authority, outcome) {
+			return outcome
+		}
+	}
+	return ""
+}
+
+func (r *Runner) persistConflictRegenerationEscalation(ctx context.Context, bridge RegenerationGateway, input ConflictRegenerationInput, authority, reason string) error {
+	body := fmt.Sprintf("%s authority=%s outcome=escalated -->\n\nFixer stopped automatic close-and-regenerate because: %s\nThe PR remains open for human review.\n\nConflict repairs: %d", regenerationCommentMarker, authority, reason, input.ConflictRepairs)
+	if _, err := r.github.CreateIssueComment(ctx, IssueCommentInput{Repo: input.Repo, IssueNumber: input.PRNumber, Body: body, CWD: input.CWD, DisclosureAgent: r.agentRuntime, DisclosureModel: derefString(r.agentModel)}); err != nil {
+		return fmt.Errorf("comment conflict human escalation: %w", err)
+	}
+	if err := bridge.AddPullRequestLabels(ctx, PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: []string{labels.NeedsHuman}, CWD: input.CWD}); err != nil {
+		return fmt.Errorf("label conflict human escalation: %w", err)
+	}
+	return nil
+}
+
 func (r *Runner) regenerationHumanCommitGuard(ctx context.Context, project storage.ProjectRecord, repo string, pr PullRequestDetail) (string, error) {
 	if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(pr.HeadRefName)), "looper/") {
 		return "pull request branch is not Looper-authored", nil
