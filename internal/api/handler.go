@@ -391,6 +391,19 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request) {
 
 		h.writeSuccess(w, requestID, payload)
 		return
+	case apiBasePath + "/gatekeeper/verdicts":
+		payload, err := h.buildGatekeeperVerdictsRouteResponse(r)
+		if err != nil {
+			var typed apiError
+			if !asAPIError(err, &typed) {
+				typed = internalServerError(err)
+			}
+			h.writeError(w, requestID, typed)
+			return
+		}
+
+		h.writeSuccess(w, requestID, payload)
+		return
 	case apiBasePath + "/pull-requests":
 		payload, err := h.buildPullRequestsRouteResponse(r)
 		if err != nil {
@@ -1826,6 +1839,10 @@ type gatekeeperAgreementsResponse struct {
 	Items []gatekeeperAgreementResponse `json:"items"`
 }
 
+type gatekeeperVerdictsResponse struct {
+	Items []gatekeeperVerdictResponse `json:"items"`
+}
+
 // gatekeeperAgreementResponse is a read-only projection of the immutable
 // agreement event. The event ID and verdict event ID keep the causal evidence
 // inspectable without exposing the generic event-log payload contract.
@@ -1844,6 +1861,28 @@ type gatekeeperAgreementResponse struct {
 	TerminalAt      string `json:"terminalAt"`
 	RecordedAt      string `json:"recordedAt"`
 	CreatedAt       string `json:"createdAt"`
+}
+
+// gatekeeperVerdictResponse is a read-only projection of the newest immutable
+// Gate report per project/pull request. The event remains the authority; this
+// typed shape keeps clients from decoding generic payloads or re-evaluating
+// merge eligibility from mutable forge state.
+type gatekeeperVerdictResponse struct {
+	ID                        string              `json:"id"`
+	ProjectID                 string              `json:"projectId"`
+	Repo                      string              `json:"repo"`
+	PRNumber                  int64               `json:"prNumber"`
+	Version                   int                 `json:"version"`
+	Mode                      string              `json:"mode"`
+	Status                    string              `json:"status"`
+	Eligible                  bool                `json:"eligible"`
+	ExpectedHeadSHA           string              `json:"expectedHeadSha,omitempty"`
+	ObservedHeadSHA           string              `json:"observedHeadSha,omitempty"`
+	RequiresFreshRevalidation bool                `json:"requiresFreshRevalidation"`
+	Reasons                   []gatekeeper.Reason `json:"reasons"`
+	Evidence                  gatekeeper.Evidence `json:"evidence"`
+	EvaluatedAt               string              `json:"evaluatedAt"`
+	CreatedAt                 string              `json:"createdAt"`
 }
 
 type eventResponse struct {
@@ -2495,6 +2534,70 @@ func serializeGatekeeperAgreement(event storage.EventLogRecord, agreement gateke
 		TerminalAt:      agreement.TerminalAt,
 		RecordedAt:      agreement.RecordedAt,
 		CreatedAt:       event.CreatedAt,
+	}
+}
+
+const maxGatekeeperVerdictsLimit int64 = 200
+
+func (h *Handler) buildGatekeeperVerdictsRouteResponse(r *http.Request) (gatekeeperVerdictsResponse, error) {
+	services := h.context.Runtime.Services()
+	if services.Repositories == nil || services.Repositories.Events == nil {
+		return gatekeeperVerdictsResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: "Events repository is not configured"}
+	}
+	if r.Method != http.MethodGet {
+		return gatekeeperVerdictsResponse{}, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: fmt.Sprintf("Unsupported method for %s", apiBasePath+"/gatekeeper/verdicts")}
+	}
+
+	limit := int64(100)
+	if limitValue := strings.TrimSpace(r.URL.Query().Get("limit")); limitValue != "" {
+		parsed, err := strconv.ParseInt(limitValue, 10, 64)
+		if err != nil || parsed <= 0 || parsed > maxGatekeeperVerdictsLimit {
+			return gatekeeperVerdictsResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("limit must be a positive integer no greater than %d", maxGatekeeperVerdictsLimit)}
+		}
+		limit = parsed
+	}
+
+	projectID := strings.TrimSpace(r.URL.Query().Get("projectId"))
+	events, err := services.Repositories.Events.ListLatestByEventType(r.Context(), gatekeeper.GateReportEventType, projectID, limit)
+	if err != nil {
+		return gatekeeperVerdictsResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+	}
+
+	items := make([]gatekeeperVerdictResponse, 0, len(events))
+	for _, event := range events {
+		var report gatekeeper.Report
+		if err := json.Unmarshal([]byte(event.PayloadJSON), &report); err != nil {
+			return gatekeeperVerdictsResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: fmt.Sprintf("decode gatekeeper verdict %s: %v", event.ID, err)}
+		}
+		if strings.TrimSpace(report.ProjectID) == "" && event.ProjectID != nil {
+			report.ProjectID = strings.TrimSpace(*event.ProjectID)
+		}
+		if strings.TrimSpace(report.ProjectID) == "" || strings.TrimSpace(report.Repo) == "" || report.PRNumber <= 0 {
+			return gatekeeperVerdictsResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: fmt.Sprintf("gatekeeper verdict %s is missing its causal identity", event.ID)}
+		}
+		items = append(items, serializeGatekeeperVerdict(event, report))
+	}
+
+	return gatekeeperVerdictsResponse{Items: items}, nil
+}
+
+func serializeGatekeeperVerdict(event storage.EventLogRecord, report gatekeeper.Report) gatekeeperVerdictResponse {
+	return gatekeeperVerdictResponse{
+		ID:                        event.ID,
+		ProjectID:                 report.ProjectID,
+		Repo:                      report.Repo,
+		PRNumber:                  report.PRNumber,
+		Version:                   report.Version,
+		Mode:                      report.Mode,
+		Status:                    report.Status,
+		Eligible:                  report.Eligible,
+		ExpectedHeadSHA:           report.ExpectedHeadSHA,
+		ObservedHeadSHA:           report.ObservedHeadSHA,
+		RequiresFreshRevalidation: report.RequiresFreshRevalidation,
+		Reasons:                   append([]gatekeeper.Reason{}, report.Reasons...),
+		Evidence:                  report.Evidence,
+		EvaluatedAt:               report.EvaluatedAt,
+		CreatedAt:                 event.CreatedAt,
 	}
 }
 

@@ -2213,6 +2213,7 @@ func TestHandlerEventAndPullRequestRoutesMatchFrozenSuccessArtifacts(t *testing.
 		{routeID: "events.list", method: http.MethodGet, path: "/api/v1/events?limit=1"},
 		{routeID: "events.entity", method: http.MethodGet, path: "/api/v1/events/loop/loop_1"},
 		{routeID: "gatekeeper.agreements", method: http.MethodGet, path: "/api/v1/gatekeeper/agreements?limit=1"},
+		{routeID: "gatekeeper.verdicts", method: http.MethodGet, path: "/api/v1/gatekeeper/verdicts?limit=1"},
 		{routeID: "pullRequests.list", method: http.MethodGet, path: "/api/v1/pull-requests"},
 		{routeID: "pullRequests.detail", method: http.MethodGet, path: "/api/v1/pull-requests/acme%2Flooper/42"},
 		{routeID: "pullRequests.status", method: http.MethodGet, path: "/api/v1/pull-requests/acme%2Flooper/42/status"},

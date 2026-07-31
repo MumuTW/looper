@@ -5,6 +5,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/MumuTW/looper/internal/labels"
 )
 
 func TestGatekeeperAgreementsCLIUsesProjectFilterAndPrintsEvidence(t *testing.T) {
@@ -44,7 +46,40 @@ func TestGatekeeperAgreementsCLIRejectsUnknownSubcommand(t *testing.T) {
 	if code != 2 {
 		t.Fatalf("exit code = %d, want 2", code)
 	}
-	if !strings.Contains(stderr, "gatekeeper requires the agreements subcommand") {
+	if !strings.Contains(stderr, "gatekeeper requires the agreements or verdicts subcommand") {
 		t.Fatalf("stderr = %q, want usage error", stderr)
+	}
+}
+
+func TestGatekeeperVerdictsCLIUsesProjectFilterAndPrintsReasons(t *testing.T) {
+	var seenProjectID string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/gatekeeper/verdicts" || r.Method != http.MethodGet {
+			t.Fatalf("request = %s %s, want GET /api/v1/gatekeeper/verdicts", r.Method, r.URL.Path)
+		}
+		seenProjectID = r.URL.Query().Get("projectId")
+		writeEnvelope(w, http.StatusOK, map[string]any{
+			"items": []map[string]any{{
+				"repo": "acme/looper", "prNumber": 42, "status": "blocked", "eligible": false,
+				"observedHeadSha": "head-42", "evaluatedAt": "2026-04-11T12:00:00Z",
+				"reasons": []map[string]any{{"code": "hold", "subject": labels.HoldGlobal}},
+			}},
+		})
+	}))
+	defer server.Close()
+	configForDaemon(t, server.URL)
+
+	code, stdout, stderr := runCLI(t, "gatekeeper", "verdicts", "project_a")
+	if code != 0 {
+		t.Fatalf("exit code = %d (stderr %q), want 0", code, stderr)
+	}
+	if seenProjectID != "project_a" {
+		t.Fatalf("projectId = %q, want project_a", seenProjectID)
+	}
+	if !strings.Contains(stdout, "acme/looper#42  blocked") || !strings.Contains(stdout, "head=head-42") || !strings.Contains(stdout, "reasons=hold("+labels.HoldGlobal+")") {
+		t.Fatalf("stdout = %q, want formatted verdict evidence", stdout)
+	}
+	if stderr != "" {
+		t.Fatalf("stderr = %q, want empty", stderr)
 	}
 }

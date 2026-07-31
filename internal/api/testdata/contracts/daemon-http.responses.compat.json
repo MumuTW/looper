@@ -677,6 +677,17 @@
       }
     },
     {
+      "id": "gatekeeper.verdicts",
+      "status": 200,
+      "body": {
+        "ok": true,
+        "data": {
+          "items": []
+        },
+        "requestId": "fixture-request-id"
+      }
+    },
+    {
       "id": "pullRequests.list",
       "status": 200,
       "body": {

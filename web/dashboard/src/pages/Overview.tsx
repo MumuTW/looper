@@ -16,9 +16,11 @@ import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import {
   fetchGatekeeperAgreements,
+  fetchGatekeeperVerdicts,
   fetchStatus,
   type ActiveRun,
   type GatekeeperAgreement,
+  type GatekeeperVerdict,
   type LoopRoleCounts,
   type StatusData,
 } from "@/lib/api";
@@ -125,6 +127,10 @@ function agreementOutcomeColor(agreement: GatekeeperAgreement): string {
   return agreement.agreement ? "var(--ok)" : "var(--warning)";
 }
 
+function verdictColor(verdict: GatekeeperVerdict): string {
+  return verdict.eligible ? "var(--ok)" : "var(--danger)";
+}
+
 export function OverviewPage({
   onHealthChange,
 }: {
@@ -146,6 +152,21 @@ export function OverviewPage({
   const agreements = usePolling({
     intervalMs: 60_000,
     fetcher: agreementFetcher,
+    key: projectId,
+  });
+
+  const verdictFetcher = useCallback(
+    (signal: AbortSignal) =>
+      fetchGatekeeperVerdicts({
+        projectId: projectId || undefined,
+        limit: 20,
+        signal,
+      }),
+    [projectId],
+  );
+  const verdicts = usePolling({
+    intervalMs: 60_000,
+    fetcher: verdictFetcher,
     key: projectId,
   });
 
@@ -401,6 +422,7 @@ export function OverviewPage({
             health.refresh();
             void loadStatus();
             agreements.refresh();
+            verdicts.refresh();
           }}
         >
           Refresh
@@ -621,6 +643,81 @@ export function OverviewPage({
                       </span>
                     </div>
                   ))}
+                </div>
+              )}
+            </>
+          )}
+        </Card>
+
+        <Card
+          title={
+            projectId
+              ? `Latest Gatekeeper verdicts · project ${projectId}`
+              : "Latest Gatekeeper verdicts"
+          }
+        >
+          {verdicts.error && !verdicts.data ? (
+            <div className="flex flex-col gap-2">
+              <p className="m-0 text-[12px] text-[var(--danger)]">
+                Unavailable: {verdicts.error}
+              </p>
+              <Button variant="ghost" size="sm" onClick={verdicts.refresh}>
+                Retry
+              </Button>
+            </div>
+          ) : verdicts.loading && !verdicts.data ? (
+            <p className="m-0 text-[12px] text-[var(--text-muted)]">
+              Loading Gatekeeper verdicts…
+            </p>
+          ) : (
+            <>
+              {verdicts.error ? (
+                <p className="m-0 mb-2 text-[12px] text-[var(--danger)]">
+                  Refresh failed: {verdicts.error}
+                </p>
+              ) : null}
+              {(verdicts.data?.items ?? []).length === 0 ? (
+                <p className="m-0 text-[12px] text-[var(--text-muted)]">
+                  No Gatekeeper verdicts recorded.
+                </p>
+              ) : (
+                <div className="flex flex-col gap-1">
+                  {verdicts.data?.items.map((verdict) => {
+                    const reasons = verdict.reasons
+                      .map((reason) =>
+                        reason.subject
+                          ? `${reason.code} (${reason.subject})`
+                          : reason.code,
+                      )
+                      .join(", ");
+                    return (
+                      <div
+                        className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[12px]"
+                        key={verdict.id}
+                      >
+                        <span className="mono">
+                          {verdict.repo}#{verdict.prNumber}
+                        </span>
+                        <span style={{ color: verdictColor(verdict) }}>
+                          {verdict.status || (verdict.eligible ? "eligible" : "blocked")}
+                        </span>
+                        {reasons ? (
+                          <span
+                            className="max-w-[22rem] truncate text-[var(--text-muted)]"
+                            title={reasons}
+                          >
+                            {reasons}
+                          </span>
+                        ) : null}
+                        <span
+                          className="mono text-[var(--text-muted)]"
+                          title={verdict.evaluatedAt}
+                        >
+                          {formatAge(verdict.evaluatedAt)}
+                        </span>
+                      </div>
+                    );
+                  })}
                 </div>
               )}
             </>
