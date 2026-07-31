@@ -163,33 +163,30 @@ reintroducing, at the filesystem, exactly the failure ADR-0015 closed at the
 process. Birth tokens in `internal/processidentity` sharpen *recognition* of an
 observed process; they cannot prove a tree drained, and only confirmed drain can.
 
-For human-held leases the authority is the operator's own handback after ending
-the interactive shell, never a probe. A human lease never expires and is never
-reclaimed by liveness rules; terminal disposition must wait until that handback
-has released it.
+For human-held leases the authority is an authenticated operator control request
+after ending the interactive shell, never a probe. A human lease never expires
+and is never reclaimed by liveness rules.
 
-### Close and terminate cannot preempt a live human takeover
+### Close atomically relinquishes a human takeover
 
-`human_takeover → terminated` is a legal transition today, `terminated` has no
-outgoing transitions, and handback is `human_takeover → queued`. So an operator
-who closes a held loop wedges its checkout permanently: the lease has no
-remaining release path, and every sibling and cleanup operation on that
-directory blocks forever.
+`human_takeover → terminated` is a legal transition, `terminated` has no
+outgoing transitions, and handback is `human_takeover → queued`. Requiring
+handback before close is unsafe operationally: handback immediately requeues,
+so a scheduler tick can resume the agent between the two operator requests.
 
-**Decision: `close`/`terminate` rejects a currently human-held loop.** The
-previous alternative — releasing in the terminal transaction — is unsafe: the
-daemon has no containment handle for the operator's interactive shell, so it
-cannot prove that the shell will not write after terminal state becomes visible.
-Releasing would let a sibling or cleanup acquire the same checkout concurrently
-with that shell, defeating the authority this ADR creates.
+**Decision: `close` is the single terminal-control verb and its authenticated
+operator request is the authority to relinquish a human hold.** In one
+transaction it changes the held loop to `terminated`, releases the human lease,
+and cancels queued work; it never requeues or triggers scheduling. This keeps
+the handback-to-close recovery atomic and removes a duplicate `terminate`
+surface.
 
-The operator must first exit the interactive shell and hand back the loop. That
-generation-guarded transaction releases the lease, clears `human_takeover`, and
-requeues. They may then terminate the queued loop, whose terminal transaction
-has no lease to release and no requeue to create. This deliberately gives a
-human-held loop one safe exit before terminal disposition; it is preferable to
-either a permanently unreleasable lease or an uncontainable concurrent writer.
-There is no unsafe force-release escape in this ADR.
+The daemon cannot independently establish that an operator shell has stopped
+writing; it deliberately does not infer release from a PID probe. Thus this does
+not catch an operator who closes while continuing to write in that shell. The
+operator must exit it before issuing `close`; the request records that explicit
+relinquishment rather than letting scheduler state or agent output impersonate
+that authority.
 
 ### Migration must backfill before the old guards come out
 
@@ -255,9 +252,9 @@ The implementation must add contract/invariant integration coverage for:
   retains the lease, and no competing checkout mutation starts;
 - two legacy targets whose different repositories map to the same detached-path
   candidate: they contend for one lease;
-- close/terminate during human takeover: the request is rejected without
-  changing the held lease, status, or queue; after shell exit, handback releases
-  and requeues before a separate terminal disposition can succeed;
+- close during human takeover: the authenticated close request atomically
+  releases the held lease, terminalizes the loop, and cancels its queue without
+  requeueing or reopening spawn admission;
 - a delayed release from generation N after a holder reacquires generation N+1:
   the generation match affects zero rows and leaves the new lease, projection,
   and queue state intact;

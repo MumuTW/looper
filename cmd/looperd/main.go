@@ -158,9 +158,6 @@ func startRuntimeWithAPI(ctx context.Context, deps bootstrap.RuntimeDependencies
 		CloseLoop: func(ctx context.Context, loopID, reason string) (any, error) {
 			return closeLoop(ctx, rt.Services(), loopID, reason, time.Now, syscall.Kill, rt.ExecutionMatchesProcess)
 		},
-		TerminateLoop: func(ctx context.Context, loopID, reason string) (any, error) {
-			return terminateLoop(ctx, rt.Services(), loopID, reason, time.Now, syscall.Kill, rt.ExecutionMatchesProcess)
-		},
 		StopAll: func(ctx context.Context, reason string) (any, error) {
 			return stopAllLoopsForRequest(ctx, rt.Services(), reason, time.Now, syscall.Kill, rt.ExecutionMatchesProcess)
 		},
@@ -427,13 +424,6 @@ func closeLoop(ctx context.Context, services looperdruntime.Services, loopID, re
 	return haltLoop(ctx, services, loopID, reason, now, signal, executionMatchesProcess, true)
 }
 
-// terminateLoop deliberately shares closeLoop's terminal halt path. A terminal
-// status is only durable after the execution lease has drained, so terminate
-// cannot bypass process cancellation or spawn admission.
-func terminateLoop(ctx context.Context, services looperdruntime.Services, loopID, reason string, now func() time.Time, signal signalProcessFunc, executionMatchesProcess executionMatchesProcessFunc) (any, error) {
-	return closeLoop(ctx, services, loopID, reason, now, signal, executionMatchesProcess)
-}
-
 // takeoverLoop parks a loop for interactive human takeover: it captures the loop's
 // latest agent session id + worktree + vendor, atomically parks the loop and
 // cancels queued work, then stops the daemon's in-flight run. The session id
@@ -515,21 +505,6 @@ func loadHaltPreflight(ctx context.Context, services looperdruntime.Services, lo
 func haltLoop(ctx context.Context, services looperdruntime.Services, loopID, reason string, now func() time.Time, signal signalProcessFunc, executionMatchesProcess executionMatchesProcessFunc, terminal bool) (any, error) {
 	if services.Loops == nil {
 		return nil, fmt.Errorf("loops service is not configured")
-	}
-	if terminal {
-		loop, err := services.Loops.Get(ctx, loopID)
-		if err != nil {
-			return nil, fmt.Errorf("load loop before terminal halt: %w", err)
-		}
-		if loop == nil {
-			return nil, fmt.Errorf("loop not found: %s", loopID)
-		}
-		if domain.LoopStatus(loop.Status) == domain.LoopStatusHumanTakeover {
-			// The human's handback is the only authority that proves the
-			// interactive checkout is no longer being written. Do not cancel a
-			// daemon lease or expose terminal cleanup while that hold remains.
-			return nil, fmt.Errorf("cannot close or terminate loop %s while it is in human_takeover; exit the interactive session and hand back the loop first", loopID)
-		}
 	}
 	preflight, err := loadHaltPreflight(ctx, services, loopID)
 	if err != nil {

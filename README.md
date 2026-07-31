@@ -36,7 +36,7 @@ The loops compose: planner hands off to reviewer↔fixer, reviewer↔fixer hands
 - 🛰️ **Many repos, one daemon.** Register your projects once — Looper watches them together and runs loops across repos in parallel.
 - 🌳 **Parallel-safe by design.** Every loop runs in its own git worktree, so agents work across issues and repos without stepping on each other.
 - 🤖 **Bring your own agent.** Pluggable vendor layer (`opencode`, `claude-code`, `codex`, `cursor-cli`, `grok-build`, plus `devin-experimental` for fresh runs) so you're not locked into one model or CLI.
-- 🧰 **Local, inspectable, stoppable.** Daemon on your machine, thin CLI and dashboard to drive it. `looper stop` / `pause` / `retry` / `terminate`, plus the local dashboard — no hosted control plane.
+- 🧰 **Local, inspectable, stoppable.** Daemon on your machine, thin CLI and dashboard to drive it. `looper stop` / `pause` / `retry`, plus the local dashboard — no hosted control plane.
 
 ## Quick start
 
@@ -92,7 +92,6 @@ looper pause 12
 looper retry 12
 looper takeover 12     # park an existing loop for manual worktree work
 looper handback 12     # return a parked loop to the daemon
-looper terminate 12    # stop and permanently retire a loop
 looper respond 12 "lgtm — ship it"
 ```
 
@@ -199,7 +198,6 @@ looper pause <selector>
 looper retry <selector>
 looper takeover <selector>             # park an existing loop for manual work
 looper handback <selector>
-looper terminate <selector>            # stop and permanently retire a loop
 looper respond <selector> "<answer>"   # answer a loop waiting on a human
 ```
 

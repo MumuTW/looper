@@ -109,7 +109,7 @@ var loopStatusTransitions = map[LoopStatus][]LoopStatus{
 	LoopStatusPaused:        {LoopStatusQueued, LoopStatusCompleted, LoopStatusStopped, LoopStatusHumanTakeover, LoopStatusTerminated},
 	LoopStatusWaiting:       {LoopStatusQueued, LoopStatusPaused, LoopStatusStopped, LoopStatusHumanTakeover, LoopStatusTerminated},
 	LoopStatusAwaitingHuman: {LoopStatusRunning, LoopStatusQueued, LoopStatusPaused, LoopStatusStopped, LoopStatusHumanTakeover, LoopStatusTerminated},
-	LoopStatusHumanTakeover: {LoopStatusQueued, LoopStatusRunning, LoopStatusStopped},
+	LoopStatusHumanTakeover: {LoopStatusQueued, LoopStatusRunning, LoopStatusStopped, LoopStatusTerminated},
 	LoopStatusStopped:       {},
 	LoopStatusTerminated:    {},
 	LoopStatusCompleted:     {},

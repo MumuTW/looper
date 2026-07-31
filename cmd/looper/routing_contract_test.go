@@ -39,7 +39,7 @@ func TestRoutedPathsReachTheDaemonRoute(t *testing.T) {
 	// Both selector spellings the usage text promises: the loop's sequence
 	// number and its id.
 	for _, selector := range []string{"12", contractLoopID} {
-		for _, verb := range []string{"stop", "close", "takeover", "handback", "start", "pause", "terminate"} {
+		for _, verb := range []string{"stop", "close", "takeover", "handback", "start", "pause"} {
 			t.Run(verb+"/"+selector, func(t *testing.T) {
 				request, err := routeForVerb(verb, []string{selector})
 				if err != nil {
@@ -235,9 +235,6 @@ func newContractFixture(t *testing.T) *contractFixture {
 		},
 		CloseLoop: func(_ context.Context, loopID string, _ string) (any, error) {
 			return map[string]any{"closed": loopID}, nil
-		},
-		TerminateLoop: func(_ context.Context, loopID string, _ string) (any, error) {
-			return map[string]any{"terminated": loopID}, nil
 		},
 		StopAll: func(ctx context.Context, _ string) (any, error) {
 			if err := fixture.workFor(ctx); err != nil {

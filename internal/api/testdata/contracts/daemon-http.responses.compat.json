@@ -1029,35 +1029,6 @@
       }
     },
     {
-      "id": "loop.terminate",
-      "status": 200,
-      "body": {
-        "ok": true,
-        "data": {
-          "id": "loop_1",
-          "seq": 1,
-          "projectId": "project_1",
-          "type": "reviewer",
-          "targetType": "pull_request",
-          "targetId": "pr:acme/looper:42",
-          "repo": "acme/looper",
-          "prNumber": 42,
-          "status": "terminated",
-          "configJson": null,
-          "metadataJson": null,
-          "lastRunAt": "2026-04-11T12:00:00.000Z",
-          "nextRunAt": null,
-          "attempts": 1,
-          "maxAttempts": 3,
-          "lastFailureKind": "manual_intervention",
-          "lastFailureReason": "dirty worker worktree",
-          "createdAt": "2026-04-11T12:00:00.000Z",
-          "updatedAt": "<generated-timestamp>"
-        },
-        "requestId": "fixture-request-id"
-      }
-    },
-    {
       "id": "workers.create",
       "status": 200,
       "body": {

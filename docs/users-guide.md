@@ -84,7 +84,7 @@ There is no current-directory inference and no `--project` flag: the stripped CL
 
 - `POST /api/v1/planners` and `POST /api/v1/loops` require `projectId`; `POST /api/v1/workers` takes `projectId`, or infers it from `repo` + `prNumber`
 - read-only lookups such as `GET /api/v1/pull-requests/{repo}/{number}` accept an optional `projectId`, and fail with a "multiple projects match" conflict when the same repo is registered under more than one project
-- the surviving control verbs (`looper stop`, `pause`, `retry`, `terminate`, …) take a loop selector, not a project — the loop already knows which project it belongs to
+- the surviving control verbs (`looper stop`, `pause`, `retry`, …) take a loop selector, not a project — the loop already knows which project it belongs to
 
 ## 3. What each role does
 
@@ -515,7 +515,7 @@ Typical usage (stripped CLI + dashboard):
 - Dirty-worktree dialog: copy a shell-quoted `cd -- '<path>'` when you need a terminal
 - Worktree cleanup runs on the daemon schedule (`daemon.worktreeCleanup`); no CLI verb
 - `looper stop <selector>`: stop an active loop
-- `looper pause` / `retry` / `takeover` / `handback` / `terminate` / `respond`: remaining control surface. `terminate` stops and permanently retires a loop; hand back a human takeover first.
+- `looper pause` / `retry` / `takeover` / `handback` / `respond`: remaining control surface
 - After sleep/wake, restart `looperd` if loops look stuck
 
 ## 15. Minimal end-to-end example
@@ -540,7 +540,7 @@ You already have a PR and only want Looper to handle the review/fix cycle:
 1. make sure the PR's repo is a registered project
 2. request a review from the intended forge user on the PR — that is what reviewer discovery watches
 3. reviewer runs, fixer follows on its findings, and the two alternate as in Option A
-4. steer the resulting loops with `looper stop|pause|retry|takeover|terminate <selector>` or the dashboard
+4. steer the resulting loops with `looper stop|pause|retry|takeover <selector>` or the dashboard
 
 ### Option C: babysit one PR without repo-wide automation
 
@@ -550,7 +550,7 @@ Today:
 
 1. Register the repo with `looper project add /absolute/path/to/repo` or `POST /api/v1/projects`.
 2. Let discovery claim the PR through a review request (or an explicitly configured label policy), **or** drive the PR live with the [`pr-takeover` skill](../skills/pr-takeover/SKILL.md) (`gh` + `git` in your agent session).
-3. Control **existing** loops with `looper stop|pause|retry|takeover|handback|terminate|respond <selector>` — where `takeover` now means *park this loop for manual worktree work*, not “adopt a PR”. Hand back a human takeover before terminating it.
+3. Control **existing** loops with `looper stop|pause|retry|takeover|handback|respond <selector>` — where `takeover` now means *park this loop for manual worktree work*, not “adopt a PR”.
 
 ## 16. Quick decision guide
 

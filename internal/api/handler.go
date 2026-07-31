@@ -105,7 +105,6 @@ type Context struct {
 	DaemonBinaryStatus func() daemonbinary.Status
 	StopLoop           func(context.Context, string, string) (any, error)
 	CloseLoop          func(context.Context, string, string) (any, error)
-	TerminateLoop      func(context.Context, string, string) (any, error)
 	StopAll            func(context.Context, string) (any, error)
 	// TakeoverLoop parks a loop for interactive human takeover: stops the daemon's
 	// in-flight run (session id preserved on disk) and transitions the loop to
@@ -3888,11 +3887,6 @@ func (h *Handler) buildLoopRouteResponse(r *http.Request, path string) (any, err
 			return nil, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: fmt.Sprintf("Unsupported method for %s", path)}
 		}
 		return h.handbackLoop(r.Context(), r, loop.ID)
-	case "terminate":
-		if r.Method != http.MethodPost {
-			return nil, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: fmt.Sprintf("Unsupported method for %s", path)}
-		}
-		return h.terminateLoop(r.Context(), loop.ID)
 	default:
 		return nil, apiError{code: pkgapi.ErrorCodeRouteNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Unknown route: %s", path)}
 	}
@@ -5698,27 +5692,6 @@ func (h *Handler) takeoverLoop(ctx context.Context, loopID string) (takeoverLoop
 		resp.Message = "Interactive takeover needs a captured session id and a supported agent (codex/claude); the loop is parked in human_takeover — hand it back with `looper handback` to resume the daemon."
 	}
 	return resp, nil
-}
-
-// terminateLoop transitions a stopped or failed loop to terminated so it stops
-// scheduling and the operator can clean up. Unlike handback (which preserves
-// the native session for resume), terminate permanently retires the loop. A
-// human takeover must be handed back first: the daemon cannot establish that
-// the operator's interactive shell has stopped writing its checkout.
-func (h *Handler) terminateLoop(ctx context.Context, loopID string) (any, error) {
-	if h.context.TerminateLoop == nil {
-		return nil, apiError{code: pkgapi.ErrorCodeRuntimeControlUnavailable, status: http.StatusNotImplemented, message: "Runtime control is not available in this process"}
-	}
-	if _, err := h.context.TerminateLoop(ctx, loopID, fmt.Sprintf("Terminated by user via looper terminate %s", loopID)); err != nil {
-		return nil, err
-	}
-	// Re-read to return the updated loop so the response matches the standard loop shape.
-	services := h.context.Runtime.Services()
-	updated, err := services.Repositories.Loops.GetByID(ctx, loopID)
-	if err != nil {
-		return nil, err
-	}
-	return h.serializeLoopWithDiagnostics(ctx, *updated)
 }
 
 // handbackLoop re-arms a taken-over loop so the daemon resumes it. It stamps the
