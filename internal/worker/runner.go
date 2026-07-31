@@ -3025,7 +3025,17 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 	nowISO := r.nowISO()
 	encoded := mustMarshalJSON(workerCheckpoint{ResumePolicy: ternary(resumed, "advance_from_checkpoint", "replay_step"), Work: resumedCheckpoint.Work, ClaimedLockKey: resumedCheckpoint.ClaimedLockKey, Worktree: resumedCheckpoint.Worktree, Plan: resumedCheckpoint.Plan, Execution: resumedCheckpoint.Execution, Lifecycle: resumedCheckpoint.Lifecycle, ReproductionBaseline: resumedCheckpoint.ReproductionBaseline, Validation: resumedCheckpoint.Validation, PullRequest: resumedCheckpoint.PullRequest, SkipReason: resumedCheckpoint.SkipReason})
 	run := storage.RunRecord{ID: eventlog.NewEventID("run"), LoopID: loop.ID, Status: "running", CurrentStep: stringPtr(string(startStep)), LastCompletedStep: nil, CheckpointJSON: &encoded, StartedAt: nowISO, LastHeartbeatAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
-	snapshotJSON, err := r.agentSnapshotJSONForNewRun(latestRun, stickySnapshot, len(r.validationCommandsForProject(loop.ProjectID)) > 0, workflow.Reaches(startStep, stepExecute))
+	// replaysAgentStep must reflect whether an agent process will actually
+	// run under the gate, not just whether the workflow reaches execute. A
+	// manual-hold resume (failed + manual_intervention policy) restarts at
+	// prepare-work while retaining a completed execution checkpoint, so
+	// runExecuteStep is a no-op — no Codex agent launches even though
+	// Reaches(prepare-work, execute) is true. Refreshing the snapshot in
+	// that case would only rewrite disclosure identity, misattributing the
+	// predecessor's changes. Gate the refresh on the retained execution
+	// state of the checkpoint the new run will actually carry.
+	replaysAgentStep := workflow.Reaches(startStep, stepExecute) && !executeStepAlreadyCompleted(resumedCheckpoint)
+	snapshotJSON, err := r.agentSnapshotJSONForNewRun(latestRun, stickySnapshot, len(r.validationCommandsForProject(loop.ProjectID)) > 0, replaysAgentStep)
 	if err != nil {
 		return resumedRunContext{}, err
 	}
@@ -3942,6 +3952,20 @@ func shouldReplayExecuteOnResume(status string, failedStep WorkerStep, checkpoin
 		return false
 	}
 	return validateCompletedExecutionCheckpoint(checkpoint.Execution) != nil
+}
+
+// executeStepAlreadyCompleted reports whether the retained execution checkpoint
+// makes runExecuteStep skip launching an agent. runExecuteStep never starts an
+// agent process when Execution.Status == "completed": at GitReconciled it
+// returns immediately, and without GitReconciled it only re-reconciles git
+// state. On such a resume the agent step does not replay, so the predecessor
+// author snapshot must be preserved instead of refreshed — otherwise the
+// predecessor's changes get re-stamped as the current vendor's. The argument
+// is the checkpoint the new run will actually carry (after any rewind), not
+// the raw predecessor checkpoint, so a replay-execute rewind (Execution=nil)
+// correctly reports false.
+func executeStepAlreadyCompleted(checkpoint workerCheckpoint) bool {
+	return checkpoint.Execution != nil && checkpoint.Execution.Status == "completed"
 }
 
 func rewindCheckpointForExecuteRetry(checkpoint workerCheckpoint) workerCheckpoint {
