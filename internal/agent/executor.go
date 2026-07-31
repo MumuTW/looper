@@ -1029,8 +1029,11 @@ func (x *execution) run(ctx context.Context) {
 				errorMessage = fallbackErrorMessage
 				endedAtISO = eventlog.FormatJavaScriptISOString(x.executor.now().UTC())
 			} else if fallbackErr != nil {
-				// Fallback ownership persist failed; process reaped only when
-				// Kill confirmed dead (releaseLease keeps ownership otherwise).
+				// Fallback refused or ownership persist failed. A restriction
+				// refusal (ErrStaticConfigMismatch) surfaces as the execution
+				// error so the runner classifies it as manual intervention; an
+				// ownership persist failure reaps the process only when Kill
+				// confirmed dead (releaseLease keeps ownership otherwise).
 				x.doneCh <- execOutcome{result: result, err: fallbackErr}
 				return
 			}
@@ -1173,13 +1176,16 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 		restricted, restrictErr := enforceToolNetworkDenied(cfg.Vendor, args, x.input.Prompt, x.toolSandbox)
 		if restrictErr != nil {
 			// Fail closed: a restart that cannot re-apply the restriction must
-			// not spawn an unrestricted process.
+			// not spawn an unrestricted process. Propagate the original error
+			// (wrapped in ErrStaticConfigMismatch) so the runner classifies
+			// this as manual intervention instead of burning retries on a
+			// static config mismatch — matching the native-resume fallback.
 			x.mu.Lock()
 			x.status = "failed"
 			x.nativeResumeStatus = "fallback_failed"
 			x.nativeResumeError = firstNonEmpty(restrictErr.Error(), nativeError)
 			x.mu.Unlock()
-			return Result{}, "", false, nil
+			return Result{}, "", false, restrictErr
 		}
 		args = restricted
 	}

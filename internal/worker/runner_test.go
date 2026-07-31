@@ -16,6 +16,7 @@ import (
 	"github.com/MumuTW/looper/internal/labels"
 	"github.com/MumuTW/looper/internal/lifecycle"
 	"github.com/MumuTW/looper/internal/loops"
+	"github.com/MumuTW/looper/internal/loops/failureclass"
 	"github.com/MumuTW/looper/internal/network/protocol"
 	"github.com/MumuTW/looper/internal/networkpolicy"
 	"github.com/MumuTW/looper/internal/storage"
@@ -1278,6 +1279,46 @@ func TestProcessClaimedItemPersistsCheckpointWhenAgentReturnsNonCompleted(t *tes
 	}
 	if checkpoint.Execution == nil || checkpoint.Execution.Status != "failed" || checkpoint.Execution.Summary != "upstream server_error" {
 		t.Fatalf("checkpoint.Execution = %#v, want persisted execution checkpoint", checkpoint.Execution)
+	}
+}
+
+// TestProcessClaimedItemHoldsCheckpointFallbackRestrictionForOperator verifies
+// that when the agent executor propagates a checkpoint-fallback tool-network
+// restriction refusal (ErrStaticConfigMismatch) through Wait, the worker
+// classifies it as manual intervention — not retryable_transient — so it does
+// not burn retry attempts or trip the failure-streak circuit breaker.
+func TestProcessClaimedItemHoldsCheckpointFallbackRestrictionForOperator(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	git := &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "looper/feature", BaseBranch: "main", HeadSHA: "abc123", WorktreeID: "worktree_1"}}
+	github := &fakeGitHubGateway{}
+	agent := &fakeAgentExecutor{waitErr: fmt.Errorf("agent vendor %q cannot deny tool network access: %w", config.AgentVendorClaudeCode, failureclass.ErrStaticConfigMismatch)}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true, OpenPRStrategy: config.OpenPRStrategyAllDone})
+
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-1", "worker")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed item", claim, err)
+	}
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "failed" || result.FailureKind != FailureManualIntervention {
+		t.Fatalf("result = %#v, want failed manual_intervention for checkpoint fallback restriction refusal", result)
+	}
+	queue, err := fixture.repos.Queue.GetByID(context.Background(), claim.ID)
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	if queue == nil || queue.Status != "manual_intervention" || queue.FinishedAt == nil {
+		t.Fatalf("queue = %#v, want terminal manual_intervention (no retry)", queue)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_1")
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if loop == nil || loop.Status != "paused" {
+		t.Fatalf("loop = %#v, want paused loop for manual intervention (no retry)", loop)
 	}
 }
 

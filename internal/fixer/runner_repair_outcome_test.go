@@ -2,11 +2,13 @@ package fixer
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/MumuTW/looper/internal/agent"
+	"github.com/MumuTW/looper/internal/loops/failureclass"
 	"github.com/MumuTW/looper/internal/storage"
 )
 
@@ -250,5 +252,51 @@ func TestFixerPromptOffersOnlyHonoredFailureKinds(t *testing.T) {
 	// Still accepted so a reporting agent is not downgraded to a contract failure.
 	if kind, ok := parseFixerBlockedFailureKind("retryable_after_resume"); !ok || kind != FailureRetryableAfterResume {
 		t.Fatalf("parseFixerBlockedFailureKind(retryable_after_resume) = (%q, %v), want it still accepted", kind, ok)
+	}
+}
+
+// TestRepairStepHoldsCheckpointFallbackRestrictionForOperator verifies that when
+// the agent executor propagates a checkpoint-fallback tool-network restriction
+// refusal (ErrStaticConfigMismatch) through Wait, the fixer classifies it as
+// manual intervention — not retryable_transient — so it does not burn retry
+// attempts or trip the failure-streak circuit breaker.
+func TestRepairStepHoldsCheckpointFallbackRestrictionForOperator(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	detail := PullRequestDetail{Number: 42, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}}
+	github := &fakeGitHubGateway{
+		listOpen:      []PullRequestSummary{{Number: 42, State: "OPEN", HeadSHA: "head-1"}},
+		viewResponses: []PullRequestDetail{detail},
+	}
+	git := &fakeGitGateway{
+		createResult:  CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt-42"), Branch: "feature/fix-42", HeadSHA: "base-head"},
+		prepareResult: PrepareWorktreeResult{HeadSHA: "base-head", Clean: true},
+	}
+	agentExec := &fakeAgentExecutor{
+		results: []AgentResult{{Status: "completed", ParseStatus: "parsed", Summary: "attempted"}},
+		waitErr: fmt.Errorf("agent vendor %q cannot deny tool network access: %w", "claude-code", failureclass.ErrStaticConfigMismatch),
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agentExec, AllowAutoCommit: true, AllowAutoPush: true, AllowRiskyFixes: true, Logger: fixture.logger, Now: fixture.now})
+
+	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "fixer-worker-1", "fixer")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed item", claim, err)
+	}
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "failed" || result.FailureKind != FailureManualIntervention {
+		t.Fatalf("result = %#v, want failed manual_intervention for checkpoint fallback restriction refusal", result)
+	}
+	queue, err := fixture.repos.Queue.GetByID(context.Background(), claim.ID)
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	if queue == nil || queue.Status != "manual_intervention" || queue.FinishedAt == nil {
+		t.Fatalf("queue = %#v, want terminal manual_intervention (no retry)", queue)
 	}
 }
