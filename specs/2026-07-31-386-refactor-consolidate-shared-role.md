@@ -981,11 +981,13 @@ cross-component test: `TestFixerPromptOffersOnlyHonoredFailureKinds`
 (`internal/fixer/runner_repair_outcome_test.go`) is rewritten to exercise
 `buildFixerPrompt` and assert the produced prompt offers exactly the
 `failure_kind` values `parseFixerBlockedFailureKind` honors (derived from
-`failureclass`), so swapped or unrelated `string` arguments at the
-`runner.go:7307` call site fail the suite. The existing
+`failureclass`) as rename-drift coverage; the call site fills named struct
+fields (`agent.FixerCompletionKinds`), so a positional swap is unrepresentable
+as a silent mistake and no argument-order pinning is needed. The existing
 `internal/agent/prompt_test.go` is rewritten to use arbitrary sentinel `string`
-parameters and assert the builder embeds the received values in both forms; it
-does not import `failureclass`, keeping `go test ./internal/agent` free of the
+field values in `agent.FixerCompletionKinds` and assert the builder embeds the
+received values in both forms; it does not import `failureclass`, keeping
+`go test ./internal/agent` free of the
 `internal/infra/github`/`diffanchor`/`outboundguard` dependency tree (Step 6).
 
 **No persisted-state change:** The string values written to the queue/run
