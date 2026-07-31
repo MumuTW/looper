@@ -423,6 +423,27 @@ export type ProjectsList = {
   items: Project[];
 };
 
+export type GatekeeperAgreement = {
+  id: string;
+  projectId: string;
+  repo: string;
+  prNumber: number;
+  verdictEventId: string;
+  verdictEligible: boolean;
+  verdictHeadSha?: string | null;
+  outcome: string;
+  agreement: boolean;
+  terminalState: string;
+  terminalHeadSha?: string | null;
+  terminalAt: string;
+  recordedAt: string;
+  createdAt: string;
+};
+
+export type GatekeeperAgreementsList = {
+  items: GatekeeperAgreement[];
+};
+
 export type ConfigScalar = string | number | boolean | null;
 export type ConfigValue =
   | ConfigScalar
@@ -615,6 +636,21 @@ export function fetchLoop(
 
 export function fetchProjects(signal?: AbortSignal): Promise<ProjectsList> {
   return apiFetch<ProjectsList>("/api/v1/projects", { signal });
+}
+
+export function fetchGatekeeperAgreements(opts?: {
+  projectId?: string;
+  limit?: number;
+  signal?: AbortSignal;
+}): Promise<GatekeeperAgreementsList> {
+  const params = new URLSearchParams();
+  if (opts?.projectId) params.set("projectId", opts.projectId);
+  if (opts?.limit != null) params.set("limit", String(opts.limit));
+  const query = params.toString();
+  return apiFetch<GatekeeperAgreementsList>(
+    `/api/v1/gatekeeper/agreements${query ? `?${query}` : ""}`,
+    { signal: opts?.signal },
+  );
 }
 
 export function fetchConfig(signal?: AbortSignal): Promise<ConfigData> {

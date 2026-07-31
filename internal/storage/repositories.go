@@ -542,7 +542,6 @@ END`
 
 const triageLifecyclePredicateSQL = `entity_type = 'github_issue'
 	AND event_type IN ('triage.enrolled', 'triage.report', 'triage.confirmed', 'triage.routed', 'triage.retired')`
-
 func (r *EventsRepository) Append(ctx context.Context, record EventLogRecord) error {
 	_, err := r.q.ExecContext(ctx, `
 		INSERT INTO event_logs (
@@ -627,6 +626,35 @@ func (r *EventsRepository) ListByEntityAndEventTypes(ctx context.Context, entity
 	return scanEventLogs(rows)
 }
 
+// ListByEventType returns the newest durable events of one type. The optional
+// project filter is applied in SQLite so a read-only projection cannot load an
+// unrelated project's full event history into the daemon before applying its
+// limit.
+func (r *EventsRepository) ListByEventType(ctx context.Context, eventType, projectID string, limit int64) ([]EventLogRecord, error) {
+	if strings.TrimSpace(eventType) == "" {
+		return []EventLogRecord{}, nil
+	}
+	if limit <= 0 {
+		limit = 100
+	}
+
+	query := "SELECT " + eventLogColumns + " FROM event_logs WHERE event_type = ?"
+	args := []any{eventType}
+	if projectID = strings.TrimSpace(projectID); projectID != "" {
+		query += " AND project_id = ?"
+		args = append(args, projectID)
+	}
+	query += " ORDER BY created_at DESC, id DESC LIMIT ?"
+	args = append(args, limit)
+
+	rows, err := r.q.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list event logs by type: %w", err)
+	}
+	defer rows.Close()
+
+	return scanEventLogs(rows)
+}
 // ListByEntityTypeAndEventTypes reads the complete lifecycle for one entity
 // family without imposing an arbitrary status-page limit. Callers derive live
 // projections from the returned durable events; this query does not record a

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/labels"
 )
 
 func TestTerminalAdviseVerdictsRecordCausalAgreementOnce(t *testing.T) {
@@ -68,7 +69,7 @@ func TestClassifyAdviceOutcome(t *testing.T) {
 		{name: "merged as is", verdict: eligible, terminal: Report{Evidence: Evidence{PullRequestState: "CLOSED", MergedAt: "2026-07-30T10:01:00Z", FinalObservedHeadSHA: "head-1"}}, outcome: AdviceOutcomeMergedAsIs, agreement: true},
 		{name: "merged after changes", verdict: eligible, terminal: Report{Evidence: Evidence{PullRequestState: "CLOSED", MergedAt: "2026-07-30T10:01:00Z", FinalObservedHeadSHA: "head-2"}}, outcome: AdviceOutcomeMergedAfterChange},
 		{name: "blocked verdict overridden", verdict: blocked, terminal: Report{Evidence: Evidence{PullRequestState: "MERGED", FinalObservedHeadSHA: "head-1"}}, outcome: AdviceOutcomeOverridden},
-		{name: "closed on hold", verdict: eligible, terminal: Report{Evidence: Evidence{PullRequestState: "CLOSED", HoldLabels: []string{"looper:hold"}}}, outcome: AdviceOutcomeHeld},
+		{name: "closed on hold", verdict: eligible, terminal: Report{Evidence: Evidence{PullRequestState: "CLOSED", HoldLabels: []string{labels.HoldGlobal}}}, outcome: AdviceOutcomeHeld},
 		{name: "closed", verdict: eligible, terminal: Report{Evidence: Evidence{PullRequestState: "CLOSED"}}, outcome: AdviceOutcomeClosed},
 	} {
 		t.Run(test.name, func(t *testing.T) {

@@ -62,6 +62,15 @@ Source of truth inspected from:
 - Validation/status notes:
   - missing params return `400 VALIDATION_FAILED`
 
+### `GET /api/v1/gatekeeper/agreements`
+
+- Returns the newest immutable Gatekeeper `advise` agreement outcomes for operator inspection.
+- Query params:
+  - `projectId` optional project scope
+  - `limit` optional positive integer, capped at 200 (default 100)
+- The response projects the causal agreement event (`id`, `verdictEventId`, outcome, agreement flag, terminal state, and timestamps); it does not infer outcomes from current pull-request state.
+- Invalid limits return `400 VALIDATION_FAILED`.
+
 ### `GET /api/v1/pull-requests`
 
 - Route registration: `apps/looperd/src/server/index.ts:137-140`

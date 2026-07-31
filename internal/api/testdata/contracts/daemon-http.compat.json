@@ -107,12 +107,12 @@
       "routeSpecificStatuses": [400]
     },
     {
-      "id": "gateReports.unreviewed",
+      "id": "gatekeeper.agreements",
       "method": "GET",
-      "path": "/api/v1/gate-reports/unreviewed?state=merged",
+      "path": "/api/v1/gatekeeper/agreements?limit=1",
       "fixture": "default",
       "expectedStatus": 200,
-      "routeSpecificStatuses": []
+      "routeSpecificStatuses": [400]
     },
     {
       "id": "pullRequests.list",

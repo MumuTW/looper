@@ -1010,21 +1010,29 @@
       }
     },
     {
-      "id": "postMergeDigest.get",
+      "id": "gatekeeper.agreements",
       "status": 200,
       "body": {
         "ok": true,
         "data": {
-          "enabled": false,
-          "digest": {
-            "date": "2026-04-11",
-            "generatedAt": "2026-04-11T12:00:00Z",
-            "empty": true,
-            "merged": [],
-            "closedAndRegenerated": [],
-            "awaitingHuman": [],
-            "anomalies": []
-          }
+          "items": [
+            {
+              "id": "agreement_1",
+              "projectId": "project_1",
+              "repo": "acme/looper",
+              "prNumber": 42,
+              "verdictEventId": "event_gate_1",
+              "verdictEligible": true,
+              "verdictHeadSha": "abc123",
+              "outcome": "merged_as_is",
+              "agreement": true,
+              "terminalState": "MERGED",
+              "terminalHeadSha": "abc123",
+              "terminalAt": "2026-04-11T12:00:00.000Z",
+              "recordedAt": "2026-04-11T11:59:00.000Z",
+              "createdAt": "2026-04-11T11:59:00.000Z"
+            }
+          ]
         },
         "requestId": "fixture-request-id"
       }

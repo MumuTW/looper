@@ -454,15 +454,17 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request) {
 
 		h.writeSuccess(w, requestID, payload)
 		return
-	case apiBasePath + "/post-merge-digest":
-		if !assertMethod(r.Method, http.MethodGet, path, w, requestID, h.writeError) {
-			return
-		}
-		payload, err := h.buildPostMergeDigestResponse(r.Context())
+	case apiBasePath + "/gatekeeper/agreements":
+		payload, err := h.buildGatekeeperAgreementsRouteResponse(r)
 		if err != nil {
-			h.writeError(w, requestID, internalServerError(err))
+			var typed apiError
+			if !asAPIError(err, &typed) {
+				typed = internalServerError(err)
+			}
+			h.writeError(w, requestID, typed)
 			return
 		}
+
 		h.writeSuccess(w, requestID, payload)
 		return
 	case apiBasePath + "/pull-requests":
@@ -1909,6 +1911,30 @@ type entityEventsResponse struct {
 	Items      []eventResponse `json:"items"`
 }
 
+type gatekeeperAgreementsResponse struct {
+	Items []gatekeeperAgreementResponse `json:"items"`
+}
+
+// gatekeeperAgreementResponse is a read-only projection of the immutable
+// agreement event. The event ID and verdict event ID keep the causal evidence
+// inspectable without exposing the generic event-log payload contract.
+type gatekeeperAgreementResponse struct {
+	ID              string `json:"id"`
+	ProjectID       string `json:"projectId"`
+	Repo            string `json:"repo"`
+	PRNumber        int64  `json:"prNumber"`
+	VerdictEventID  string `json:"verdictEventId"`
+	VerdictEligible bool   `json:"verdictEligible"`
+	VerdictHeadSHA  string `json:"verdictHeadSha,omitempty"`
+	Outcome         string `json:"outcome"`
+	Agreement       bool   `json:"agreement"`
+	TerminalState   string `json:"terminalState"`
+	TerminalHeadSHA string `json:"terminalHeadSha,omitempty"`
+	TerminalAt      string `json:"terminalAt"`
+	RecordedAt      string `json:"recordedAt"`
+	CreatedAt       string `json:"createdAt"`
+}
+
 type eventResponse struct {
 	ID               string  `json:"id"`
 	EventType        string  `json:"eventType"`
@@ -2542,28 +2568,68 @@ func (h *Handler) buildEventsRouteResponse(r *http.Request) (eventsListResponse,
 	return eventsListResponse{Items: responseItems}, nil
 }
 
-func (h *Handler) buildPostMergeDigestResponse(ctx context.Context) (postMergeDigestResponse, error) {
+const maxGatekeeperAgreementsLimit int64 = 200
+
+func (h *Handler) buildGatekeeperAgreementsRouteResponse(r *http.Request) (gatekeeperAgreementsResponse, error) {
 	services := h.context.Runtime.Services()
-	if services.Repositories == nil {
-		return postMergeDigestResponse{}, errors.New("repositories are not configured")
+	if services.Repositories == nil || services.Repositories.Events == nil {
+		return gatekeeperAgreementsResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: "Events repository is not configured"}
 	}
-	effective := h.effectiveConfig()
-	digestConfig := postmergedigest.ConfigFromRole(effective.Roles.Coordinator.PostMergeDigest)
-	response := postMergeDigestResponse{Enabled: digestConfig.Enabled, Schedule: digestConfig.Schedule, Timezone: digestConfig.Timezone}
-	if !digestConfig.Enabled {
-		now := h.now().UTC()
-		response.Digest = postmergedigest.Digest{
-			Date: now.Format("2006-01-02"), GeneratedAt: now.Format(time.RFC3339Nano), Empty: true,
-			Merged: []postmergedigest.MergedItem{}, ClosedAndRegenerated: []postmergedigest.RegeneratedItem{}, AwaitingHuman: []postmergedigest.AwaitingHumanItem{}, Anomalies: []postmergedigest.Anomaly{},
+	if r.Method != http.MethodGet {
+		return gatekeeperAgreementsResponse{}, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: fmt.Sprintf("Unsupported method for %s", apiBasePath+"/gatekeeper/agreements")}
+	}
+
+	limit := int64(100)
+	if limitValue := strings.TrimSpace(r.URL.Query().Get("limit")); limitValue != "" {
+		parsed, err := strconv.ParseInt(limitValue, 10, 64)
+		if err != nil || parsed <= 0 || parsed > maxGatekeeperAgreementsLimit {
+			return gatekeeperAgreementsResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("limit must be a positive integer no greater than %d", maxGatekeeperAgreementsLimit)}
 		}
-		return response, nil
+		limit = parsed
 	}
-	digest, err := postmergedigest.Assemble(ctx, services.Repositories, digestConfig, h.now())
+
+	projectID := strings.TrimSpace(r.URL.Query().Get("projectId"))
+	events, err := services.Repositories.Events.ListByEventType(r.Context(), gatekeeper.AdviceAgreementEventType, projectID, limit)
 	if err != nil {
-		return postMergeDigestResponse{}, err
+		return gatekeeperAgreementsResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 	}
-	response.Digest = digest
-	return response, nil
+
+	items := make([]gatekeeperAgreementResponse, 0, len(events))
+	for _, event := range events {
+		var agreement gatekeeper.AdviceAgreement
+		if err := json.Unmarshal([]byte(event.PayloadJSON), &agreement); err != nil {
+			return gatekeeperAgreementsResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: fmt.Sprintf("decode advise agreement %s: %v", event.ID, err)}
+		}
+		if strings.TrimSpace(agreement.VerdictEventID) == "" || strings.TrimSpace(agreement.Repo) == "" || agreement.PRNumber <= 0 {
+			return gatekeeperAgreementsResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: fmt.Sprintf("advise agreement %s is missing its causal identity", event.ID)}
+		}
+		items = append(items, serializeGatekeeperAgreement(event, agreement))
+	}
+
+	return gatekeeperAgreementsResponse{Items: items}, nil
+}
+
+func serializeGatekeeperAgreement(event storage.EventLogRecord, agreement gatekeeper.AdviceAgreement) gatekeeperAgreementResponse {
+	projectID := agreement.ProjectID
+	if strings.TrimSpace(projectID) == "" && event.ProjectID != nil {
+		projectID = strings.TrimSpace(*event.ProjectID)
+	}
+	return gatekeeperAgreementResponse{
+		ID:              event.ID,
+		ProjectID:       projectID,
+		Repo:            agreement.Repo,
+		PRNumber:        agreement.PRNumber,
+		VerdictEventID:  agreement.VerdictEventID,
+		VerdictEligible: agreement.VerdictEligible,
+		VerdictHeadSHA:  agreement.VerdictHeadSHA,
+		Outcome:         string(agreement.Outcome),
+		Agreement:       agreement.Agreement,
+		TerminalState:   agreement.TerminalState,
+		TerminalHeadSHA: agreement.TerminalHeadSHA,
+		TerminalAt:      agreement.TerminalAt,
+		RecordedAt:      agreement.RecordedAt,
+		CreatedAt:       event.CreatedAt,
+	}
 }
 
 func (h *Handler) buildEntityEventsRouteResponse(r *http.Request, path string) (entityEventsResponse, error) {
