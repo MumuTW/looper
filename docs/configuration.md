@@ -744,26 +744,22 @@ decides what it may do with that judgement.
 | Level | Behaviour |
 | --- | --- |
 | `observe` (default) | Gate report only. Nothing is published, nothing is merged. |
-| `advise` | Additionally publishes the verdict and every blocking reason on the pull request, so the decision costs one read instead of a re-investigation. The human still merges. |
-| `auto` | Gatekeeper merges what it judges eligible, after re-establishing that judgement immediately beforehand. |
+| `advise` | Publishes the verdict and reconciles the Mergify routing labels. Eligible PRs receive `auto-merge`; escalations receive `needs-human-review`; the human still controls whether the queue may act. |
+| `auto` | Uses the same routing labels without a daemon-side merge call. Mergify's serialized queue rechecks branch protection and performs the merge. |
 
-### What `auto` does before merging
+### How `auto` reaches the merge queue
 
 An eligible verdict is not a licence. Holds, reviews, threads, and project policy
 can all change without moving the head, so a Gate report is only ever a statement
 about the moment it was made.
 
-At `auto`, Gatekeeper therefore **re-runs the complete evaluation** immediately
-before merging and proceeds only if it still passes against the same head. A
-cheaper head comparison would miss exactly the changes that invariant names. The
-merge itself passes `--match-head-commit`, so the forge refuses if anything was
-pushed in between — the decision cannot be applied to a commit it was not made
-about.
-
-Every attempt is recorded, refusals included, with the gates that blocked the
-confirming pass. The merge is immediate rather than handed to GitHub's
-auto-merge: auto-merge applies the decision later, by which time the evaluation
-behind it is stale.
+At `auto`, Gatekeeper revalidates the observed head before each routing-label
+mutation. An eligible report gets `auto-merge`, which is the sole opt-in signal
+under `.mergify.yml`; the queue then re-tests the PR against the current `main`
+and GitHub branch protection before merging. If the head changes before the
+label projection, Gatekeeper skips the write and retries on the next evaluation.
+`needs-human-review` and `do-not-merge` are explicit Mergify vetoes, so an
+escalation removes `auto-merge` before applying the human-review route.
 
 `auto` cannot be combined with `roles.reviewer.autoMerge.enabled`. Two merge
 authorities on one pull request is not a configuration anyone can reason about —
@@ -776,6 +772,18 @@ trust = "advise"
 ```
 
 Project overrides use `projects[].roles.gatekeeper.trust`.
+
+Routing labels are reconciled on every `advise`/`auto` evaluation (and removed
+when a published project is demoted to `observe`):
+
+- `auto-merge` only for an eligible report;
+- `needs-human-review` for `protected_path_touched`, `diff_budget_exceeded`, or a
+  repeated `review_changes_requested` reason;
+- neither label for mechanical blockers such as pending checks or conflicts.
+
+The labels are defined in `internal/labels` and are the exact host-repository
+contract consumed by Mergify. Gatekeeper never rewrites or removes unrelated
+labels.
 
 ### The owned comment and its lifecycle
 
@@ -808,13 +816,13 @@ report is audit evidence rather than merge authority.
 
 ### Relationship to `roles.reviewer.autoMerge`
 
-These are two different merge stories, and today they coexist: Reviewer's
-auto-merge opts a PR into GitHub's native auto-merge on its own approval, while
-Gatekeeper only observes or advises. Reviewer's path checks a narrower set of
-conditions — notably **not** unresolved review threads or requested changes.
+These are two different merge stories: Reviewer's native auto-merge is a
+separate legacy opt-in, while Gatekeeper's `auto` trust now routes through the
+Mergify label queue. Reviewer's path checks a narrower set of conditions — notably
+**not** unresolved review threads or requested changes.
 [#116](https://github.com/MumuTW/looper/issues/116) consolidates both behind this
-ladder and retires `roles.reviewer.autoMerge`; until `auto` exists, Reviewer's
-setting remains the only way Looper merges anything.
+ladder and retires `roles.reviewer.autoMerge`; do not enable both authorities on
+the same repository.
 
 ## Merge Gatekeeper diff budget (`roles.gatekeeper.diffBudget`)
 

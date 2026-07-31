@@ -192,7 +192,8 @@ type GitHubGateway interface {
 	UpdateIssueComment(context.Context, githubinfra.UpdateIssueCommentInput) error
 	GetCurrentUserLoginForRepo(context.Context, string, string) (string, error)
 	DeleteIssueComment(context.Context, githubinfra.DeleteIssueCommentInput) error
-	MergePullRequest(context.Context, githubinfra.EnableAutoMergeInput) error
+	AddPullRequestLabels(context.Context, githubinfra.PullRequestLabelsInput) error
+	RemovePullRequestLabels(context.Context, githubinfra.PullRequestLabelsInput) error
 }
 
 type Options struct {
@@ -203,12 +204,7 @@ type Options struct {
 	// TrustForProject reports a project's merge-authority level. Nil means every
 	// project stays at observe, which is also the configured default.
 	TrustForProject func(projectID string) config.GatekeeperTrustLevel
-	// MergeStrategyForProject selects the strategy used at the auto trust level.
-	MergeStrategyForProject func(projectID string) config.ReviewerAutoMergeStrategy
-	// DiffBudgetForProject returns the effective boolean change-size limits. Zero
-	// bounds are unlimited; nil means every project has no configured limit.
-	DiffBudgetForProject func(projectID string) config.GatekeeperDiffBudget
-	LogWarn              func(msg string, fields map[string]any)
+	LogWarn         func(msg string, fields map[string]any)
 }
 
 // Runner is the Merge Gatekeeper: a reactive, agent-free policy Role that
@@ -218,14 +214,12 @@ type Options struct {
 // Stateful: agent-free but not database-free — it persists Gate reports in
 // the local SQLite event log.
 type Runner struct {
-	repos                   *storage.Repositories
-	github                  GitHubGateway
-	now                     func() time.Time
-	policyPermitsTarget     func(projectID, repo, baseRefName string) bool
-	trustForProject         func(projectID string) config.GatekeeperTrustLevel
-	mergeStrategyForProject func(projectID string) config.ReviewerAutoMergeStrategy
-	diffBudgetForProject    func(projectID string) config.GatekeeperDiffBudget
-	logWarn                 func(msg string, fields map[string]any)
+	repos               *storage.Repositories
+	github              GitHubGateway
+	now                 func() time.Time
+	policyPermitsTarget func(projectID, repo, baseRefName string) bool
+	trustForProject     func(projectID string) config.GatekeeperTrustLevel
+	logWarn             func(msg string, fields map[string]any)
 }
 
 func New(options Options) *Runner {
@@ -239,8 +233,8 @@ func New(options Options) *Runner {
 	}
 	return &Runner{
 		repos: options.Repos, github: options.GitHub, now: now, policyPermitsTarget: policy,
-		trustForProject: options.TrustForProject, mergeStrategyForProject: options.MergeStrategyForProject, diffBudgetForProject: options.DiffBudgetForProject,
-		logWarn: options.LogWarn,
+		trustForProject: options.TrustForProject,
+		logWarn:         options.LogWarn,
 	}
 }
 
@@ -525,31 +519,7 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 	if report.Evidence.FinalObservedHeadSHA != report.ObservedHeadSHA {
 		report.Reasons = append(report.Reasons, Reason{Code: ReasonHeadStale})
 	}
-	// The diff-budget verdict was captured against diffBudgetBaseSHA at the
-	// merge-watch read. The base branch can advance between that read and this
-	// final observation without moving the head, so the head revalidation above
-	// cannot catch it: GitHub would recompute the change size against a new
-	// merge base while the recorded counts still describe the previous one, and
-	// an eligible verdict would proceed toward auto-merge on stale evidence. Fail
-	// closed so the next tick (whose fingerprint folds in BaseSHA while the budget
-	// is enabled) re-evaluates against the current base. diffBudgetBaseSHA is
-	// guaranteed non-empty here because the budget block above fails closed when
-	// the provider omits it.
-	if budgetEnabled && strings.TrimSpace(finalBase) != diffBudgetBaseSHA {
-		return r.persistProviderBlock(ctx, report, ReasonProviderStateAmbiguous, "diff_budget_base")
-	}
-	persisted, err := r.persist(ctx, report)
-	if err != nil {
-		return Report{}, err
-	}
-	// Merging is the last thing, and only on the primary pass: the confirming
-	// evaluation exists to serve this decision, not to make another one.
-	if !input.Confirming && persisted.Eligible && r.trustFor(persisted.ProjectID) == config.GatekeeperTrustAuto {
-		if err := r.confirmAndMerge(ctx, input, persisted); err != nil {
-			return persisted, err
-		}
-	}
-	return persisted, nil
+	return r.persist(ctx, report)
 }
 
 func (r *Runner) projectCWD(ctx context.Context, projectID string) string {
@@ -661,6 +631,11 @@ func (r *Runner) persist(ctx context.Context, report Report) (Report, error) {
 		Payload: report, CreatedAt: r.now(),
 	}); err != nil {
 		return Report{}, fmt.Errorf("persist gate report: %w", err)
+	}
+	if err := r.reconcileRoutingLabels(ctx, report, previous); err != nil && r.logWarn != nil {
+		r.logWarn("gatekeeper: could not reconcile routing labels", map[string]any{
+			"repo": report.Repo, "pr": report.PRNumber, "error": err.Error(),
+		})
 	}
 	// The owned comment is reconciled after the durable report: the report is the
 	// record, the comment is a convenience for whoever is deciding. A forge that
