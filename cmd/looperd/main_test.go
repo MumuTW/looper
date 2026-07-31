@@ -626,8 +626,10 @@ func TestCloseLoopRetiresFailedLoop(t *testing.T) {
 func TestCloseLoopAtomicallyRetiresHumanTakeoverWithoutHandback(t *testing.T) {
 	ctx := context.Background()
 	services, repos, now := newStopAllTestServices(t)
+	nowISO := now.Format("2006-01-02T15:04:05.000Z")
 	fixture := stopAllLoopFixture{
-		loopID: "loop_close_human", seq: 83, loopType: "worker", loopStatus: "queued", queueStatus: "queued",
+		loopID: "loop_close_human", seq: 83, loopType: "fixer", loopStatus: "queued", queueStatus: "queued",
+		targetType: "pull_request", targetID: "pr:acme/looper:149", repo: "acme/looper", prNumber: 149,
 	}
 	insertStopAllTestLoop(t, ctx, repos, now, fixture)
 
@@ -644,6 +646,22 @@ func TestCloseLoopAtomicallyRetiresHumanTakeoverWithoutHandback(t *testing.T) {
 	if err != nil || heldQueue == nil || heldQueue.Status != "cancelled" || heldQueue.LastError == nil || *heldQueue.LastError != "Taken over by operator" {
 		t.Fatalf("Queue.GetByID() after takeover = (%#v, %v), want cancelled queue with takeover reason", heldQueue, err)
 	}
+	// A sibling claim against the same checkout is the lease probe: takeover
+	// must fence it, while close must release that fence without handback.
+	siblingQueueID := "queue_close_human_sibling"
+	if err := repos.Queue.Upsert(ctx, storage.QueueItemRecord{
+		ID: siblingQueueID, ProjectID: stringPtr("project_1"), Type: "fixer",
+		TargetType: fixture.targetType, TargetID: fixture.targetID, Repo: stringPtr(fixture.repo), PRNumber: &fixture.prNumber,
+		DedupeKey: "dedupe:" + siblingQueueID, Priority: 1, Status: "queued", AvailableAt: nowISO,
+		Attempts: 0, MaxAttempts: 1, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Queue.Upsert(%s) error = %v", siblingQueueID, err)
+	}
+	if claimed, err := repos.Queue.ClaimNextOfType(ctx, nowISO, "test-before-close", "fixer"); err != nil {
+		t.Fatalf("Queue.ClaimNextOfType() while held error = %v", err)
+	} else if claimed != nil {
+		t.Fatalf("Queue.ClaimNextOfType() while held = %#v, want no claim", claimed)
+	}
 	if _, err := closeLoop(ctx, services, fixture.loopID, "Closed by operator", func() time.Time { return now }, nil, nil); err != nil {
 		t.Fatalf("closeLoop(human_takeover) error = %v", err)
 	}
@@ -654,6 +672,10 @@ func TestCloseLoopAtomicallyRetiresHumanTakeoverWithoutHandback(t *testing.T) {
 	queue, err := repos.Queue.GetByID(ctx, "queue_"+fixture.loopID)
 	if err != nil || queue == nil || queue.Status != "cancelled" || queue.LastError == nil || *queue.LastError != "Taken over by operator" {
 		t.Fatalf("Queue.GetByID() = (%#v, %v), want takeover-cancelled queue without requeue", queue, err)
+	}
+	claimed, err := repos.Queue.ClaimNextOfType(ctx, nowISO, "test-after-close", "fixer")
+	if err != nil || claimed == nil || claimed.ID != siblingQueueID {
+		t.Fatalf("Queue.ClaimNextOfType() after close = (%#v, %v), want same-target queue %s", claimed, err, siblingQueueID)
 	}
 	if !registry.LoopStopActive(fixture.loopID) {
 		t.Fatal("LoopStopActive = false after closing human takeover, want sticky admission gate")
@@ -1543,6 +1565,10 @@ type stopAllLoopFixture struct {
 	seq             int64
 	loopType        string
 	loopStatus      string
+	targetType      string
+	targetID        string
+	repo            string
+	prNumber        int64
 	runID           string
 	runStatus       string
 	executionID     string
@@ -1577,7 +1603,23 @@ func newStopAllTestServices(t *testing.T) (looperdruntime.Services, *storage.Rep
 func insertStopAllTestLoop(t *testing.T, ctx context.Context, repos *storage.Repositories, now time.Time, fixture stopAllLoopFixture) {
 	t.Helper()
 	nowISO := now.Format("2006-01-02T15:04:05.000Z")
-	if err := repos.Loops.Upsert(ctx, storage.LoopRecord{ID: fixture.loopID, Seq: fixture.seq, ProjectID: "project_1", Type: fixture.loopType, TargetType: "project", Status: fixture.loopStatus, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+	targetType := fixture.targetType
+	if targetType == "" {
+		targetType = "project"
+	}
+	var targetID *string
+	if fixture.targetID != "" {
+		targetID = &fixture.targetID
+	}
+	var repo *string
+	if fixture.repo != "" {
+		repo = &fixture.repo
+	}
+	var prNumber *int64
+	if fixture.prNumber != 0 {
+		prNumber = &fixture.prNumber
+	}
+	if err := repos.Loops.Upsert(ctx, storage.LoopRecord{ID: fixture.loopID, Seq: fixture.seq, ProjectID: "project_1", Type: fixture.loopType, TargetType: targetType, TargetID: targetID, Repo: repo, PRNumber: prNumber, Status: fixture.loopStatus, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Loops.Upsert(%s) error = %v", fixture.loopID, err)
 	}
 	if fixture.runID != "" {
@@ -1596,7 +1638,11 @@ func insertStopAllTestLoop(t *testing.T, ctx context.Context, repos *storage.Rep
 		}
 	}
 	if fixture.queueStatus != "" {
-		if err := repos.Queue.Upsert(ctx, storage.QueueItemRecord{ID: "queue_" + fixture.loopID, ProjectID: stringPtr("project_1"), LoopID: &fixture.loopID, Type: fixture.loopType, TargetType: "project", TargetID: "project_1", DedupeKey: "dedupe:" + fixture.loopID, Priority: 1, Status: fixture.queueStatus, AvailableAt: nowISO, Attempts: 0, MaxAttempts: 1, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		queueTargetID := fixture.targetID
+		if queueTargetID == "" {
+			queueTargetID = "project_1"
+		}
+		if err := repos.Queue.Upsert(ctx, storage.QueueItemRecord{ID: "queue_" + fixture.loopID, ProjectID: stringPtr("project_1"), LoopID: &fixture.loopID, Type: fixture.loopType, TargetType: targetType, TargetID: queueTargetID, Repo: repo, PRNumber: prNumber, DedupeKey: "dedupe:" + fixture.loopID, Priority: 1, Status: fixture.queueStatus, AvailableAt: nowISO, Attempts: 0, MaxAttempts: 1, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 			t.Fatalf("Queue.Upsert(%s) error = %v", fixture.loopID, err)
 		}
 	}
