@@ -28,8 +28,9 @@ const retiredVerdictBody = VerdictCommentMarker + "\n" +
 type verdictAction string
 
 const (
-	// verdictActionNone is the steady state: nothing needs to change, so
-	// Gatekeeper performs no forge reads or writes at all.
+	// verdictActionNone is the steady state for the owned comment. Routing-label
+	// reconciliation is separate and still runs each published evaluation so an
+	// external label edit cannot silently disable or enable the merge queue.
 	verdictActionNone verdictAction = "none"
 	// verdictActionPublish creates or updates the owned comment.
 	verdictActionPublish verdictAction = "publish"

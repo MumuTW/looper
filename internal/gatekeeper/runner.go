@@ -206,8 +206,8 @@ type GitHubGateway interface {
 	UpdateIssueComment(context.Context, githubinfra.UpdateIssueCommentInput) error
 	GetCurrentUserLoginForRepo(context.Context, string, string) (string, error)
 	DeleteIssueComment(context.Context, githubinfra.DeleteIssueCommentInput) error
-	FindReviewMarker(context.Context, githubinfra.VerifyReviewMarkerInput) (githubinfra.ReviewMarkerResult, error)
-	SetCommitStatus(context.Context, githubinfra.CommitStatusInput) error
+	AddPullRequestLabels(context.Context, githubinfra.PullRequestLabelsInput) error
+	RemovePullRequestLabels(context.Context, githubinfra.PullRequestLabelsInput) error
 }
 
 // RequiredStatusContext is the GitHub status context an operator adds to branch
@@ -223,14 +223,7 @@ type Options struct {
 	// TrustForProject reports a project's merge-authority level. Nil means every
 	// project stays at observe, which is also the configured default.
 	TrustForProject func(projectID string) config.GatekeeperTrustLevel
-	// DiffBudgetForProject returns the effective boolean change-size limits. Zero
-	// bounds are unlimited; nil means every project has no configured limit.
-	DiffBudgetForProject func(projectID string) config.GatekeeperDiffBudget
-	// ConfiguredTargetBranch reports the project policy's configured base branch.
-	// It is folded into the discovery fingerprint so a policy generation change
-	// invalidates reused success within the skip window.
-	ConfiguredTargetBranch func(projectID string) string
-	LogWarn                func(msg string, fields map[string]any)
+	LogWarn         func(msg string, fields map[string]any)
 }
 
 // Runner is the Merge Gatekeeper: a reactive, agent-free policy Role that
@@ -240,16 +233,12 @@ type Options struct {
 // Stateful: agent-free but not database-free — it persists Gate reports in
 // the local SQLite event log.
 type Runner struct {
-	repos                  *storage.Repositories
-	github                 GitHubGateway
-	now                    func() time.Time
-	policyPermitsTarget    func(projectID, repo, baseRefName string) bool
-	trustForProject        func(projectID string) config.GatekeeperTrustLevel
-	diffBudgetForProject   func(projectID string) config.GatekeeperDiffBudget
-	configuredTargetBranch func(projectID string) string
-	logWarn                func(msg string, fields map[string]any)
-	lastPublishedStatusMu  sync.Mutex
-	lastPublishedStatus    map[string]string
+	repos               *storage.Repositories
+	github              GitHubGateway
+	now                 func() time.Time
+	policyPermitsTarget func(projectID, repo, baseRefName string) bool
+	trustForProject     func(projectID string) config.GatekeeperTrustLevel
+	logWarn             func(msg string, fields map[string]any)
 }
 
 func New(options Options) *Runner {
@@ -263,9 +252,8 @@ func New(options Options) *Runner {
 	}
 	return &Runner{
 		repos: options.Repos, github: options.GitHub, now: now, policyPermitsTarget: policy,
-		trustForProject: options.TrustForProject, diffBudgetForProject: options.DiffBudgetForProject,
-		configuredTargetBranch: options.ConfiguredTargetBranch,
-		logWarn:                options.LogWarn,
+		trustForProject: options.TrustForProject,
+		logWarn:         options.LogWarn,
 	}
 }
 
@@ -722,73 +710,7 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 	if report.Evidence.FinalObservedHeadSHA != report.ObservedHeadSHA {
 		report.Reasons = append(report.Reasons, Reason{Code: ReasonHeadStale})
 	}
-	// The diff-budget verdict was captured against diffBudgetBaseSHA at the
-	// merge-watch read. The base branch can advance between that read and this
-	// final observation without moving the head, so the head revalidation above
-	// cannot catch it: GitHub would recompute the change size against a new
-	// merge base while the recorded counts still describe the previous one, and
-	// an eligible verdict would proceed toward auto-merge on stale evidence. Fail
-	// closed so the next tick (whose fingerprint folds in BaseSHA while the budget
-	// is enabled) re-evaluates against the current base. diffBudgetBaseSHA is
-	// guaranteed non-empty here because the budget block above fails closed when
-	// the provider omits it.
-	if budgetEnabled && strings.TrimSpace(finalBase) != diffBudgetBaseSHA {
-		return r.persistProviderBlock(ctx, report, ReasonProviderStateAmbiguous, "diff_budget_base")
-	}
 	return r.persist(ctx, report)
-}
-
-// observeReviewProvenance reads who reviewed this pull request and who refused
-// to.
-//
-// It never returns an error, and that is deliberate rather than lax: Gatekeeper
-// is observe-only, so an observation must not be able to move a pull request
-// from eligible to blocked. A forge that will not answer yields
-// ReviewProvenanceUnknown, which the enumeration excludes — the record says it
-// does not know instead of saying nobody reviewed.
-//
-// It costs two forge reads per full evaluation. The review list is REST because
-// only REST classifies the reviewer's account, and the comment list is where a
-// refusal lives, because a refusal is not a review and the forge files it
-// nowhere else. Both are skipped entirely for a pull request whose fingerprint
-// is unchanged.
-//
-// The two reads fail differently, because they answer different questions. The
-// review list is the whole of `reviewed`; comments only separate `refused` from
-// `absent`, and only when nothing was reviewed. So a comment read that fails
-// after the reviews came back keeps what those reviews already settled —
-// discarding a list of named reviewers because a later call timed out would
-// throw away evidence Looper is holding.
-func (r *Runner) observeReviewProvenance(ctx context.Context, input EvaluationInput) ReviewProvenance {
-	unknown := ReviewProvenance{Status: ReviewProvenanceUnknown, Reviewers: []ReviewerObservation{}, Refusals: []ReviewRefusal{}}
-	reviews, err := r.github.ListPullRequestReviews(ctx, githubinfra.ViewPullRequestInput{
-		Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD,
-	})
-	if err != nil {
-		r.warnReviewProvenance(input, "reviews", err)
-		return unknown
-	}
-	observed := reviewsObservedFrom(reviews)
-	comments, err := r.github.ListIssueCommentsContaining(ctx, githubinfra.ViewIssueInput{
-		Repo: input.Repo, IssueNumber: input.PRNumber, CWD: input.CWD,
-	}, RefusalCommentMarkers())
-	if err != nil {
-		r.warnReviewProvenance(input, "comments", err)
-		if observed.CompletedReviews > 0 {
-			return observed
-		}
-		return unknown
-	}
-	return withRefusalsFrom(observed, comments)
-}
-
-func (r *Runner) warnReviewProvenance(input EvaluationInput, subject string, err error) {
-	if r.logWarn == nil {
-		return
-	}
-	r.logWarn("gatekeeper: could not observe review provenance", map[string]any{
-		"repo": input.Repo, "pr": input.PRNumber, "subject": subject, "error": err.Error(),
-	})
 }
 
 func (r *Runner) projectCWD(ctx context.Context, projectID string) string {
@@ -1114,6 +1036,11 @@ func (r *Runner) persist(ctx context.Context, report Report) (Report, error) {
 		Payload: report, CreatedAt: r.now(),
 	}); err != nil {
 		return Report{}, fmt.Errorf("persist gate report: %w", err)
+	}
+	if err := r.reconcileRoutingLabels(ctx, report, previous); err != nil && r.logWarn != nil {
+		r.logWarn("gatekeeper: could not reconcile routing labels", map[string]any{
+			"repo": report.Repo, "pr": report.PRNumber, "error": err.Error(),
+		})
 	}
 	// The owned comment is reconciled after the durable report: the report is the
 	// record, the comment is a convenience for whoever is deciding. A forge that

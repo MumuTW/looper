@@ -879,36 +879,25 @@ decides what it may do with that judgement.
 | Level | Behaviour |
 | --- | --- |
 | `observe` (default) | Gate report only. Nothing is published, nothing is merged. |
-| `advise` | Additionally publishes the verdict and every blocking reason on the pull request, so the decision costs one read instead of a re-investigation. The human still merges. |
-| `auto` | Requires a completed Looper/Codex review for the current head, then publishes the `Looper Gatekeeper` status for that exact **pull request head SHA**. GitHub branch protection consumes the status; Gatekeeper never calls merge itself. |
+| `advise` | Publishes the verdict and reconciles the Mergify routing labels. Eligible PRs receive `auto-merge`; escalations receive `needs-human-review`; the human still controls whether the queue may act. |
+| `auto` | Uses the same routing labels without a daemon-side merge call. Mergify's serialized queue rechecks branch protection and performs the merge. |
 
-`auto` has one required external authority: GitHub branch protection must require
-the `Looper Gatekeeper` status context on the target branch. The status is the
-enforcement point for Mergify's branch-protection queue injection on the PR head;
-the local Gate report remains audit evidence only. If protection does not
-require that context, Gatekeeper publishes a failing status and marks the PR
-ineligible — but an *unrequired* failing status cannot stop merge, so operators
-must add the required check before relying on `auto`.
+### How `auto` reaches the merge queue
 
 **Known limitations at `auto`:**
 
-- Status is keyed by commit SHA, not pull request. If two open pull requests share
-  the same head commit, discovery aggregates their verdicts before publishing
-  success — any blocked open PR on that head keeps the status non-successful.
-- Status is published on the pull request head only. GitHub's native merge queue
-  evaluates required checks on merge-group commits; `auto` does not publish
-  status for those SHAs and cannot satisfy branch protection bound to merge-group
-  heads. Use observe/advise, or require the status only on PR heads with a merge
-  path that does not depend on merge-group checks.
-- `roles.auditor` cannot be enabled on the same project scope while gatekeeper
-  trust is `auto`. Auditor still reads Gatekeeper `MergeOutcome` events that
-  status-only auto no longer emits; forge-observed merge evidence is not yet
-  implemented.
-- `roles.coordinator.postMergeDigest` still classifies merges from Coordinator
-  merge-watch events and historical Gatekeeper `MergeOutcome` rows. Status-only
-  `auto` does not emit new merge-outcome events, so Mergify or manual merges
-  without a linked Coordinator merge-watch are absent from the daily digest
-  until forge-observed merge evidence exists.
+At `auto`, Gatekeeper revalidates the observed head before each routing-label
+mutation. An eligible report gets `auto-merge`, which is the sole opt-in signal
+under `.mergify.yml`; the queue then re-tests the PR against the current `main`
+and GitHub branch protection before merging. If the head changes before the
+label projection, Gatekeeper skips the write and retries on the next evaluation.
+`needs-human-review` and `do-not-merge` are explicit Mergify vetoes, so an
+escalation removes `auto-merge` before applying the human-review route.
+
+`auto` cannot be combined with `roles.reviewer.autoMerge.enabled`. Two merge
+authorities on one pull request is not a configuration anyone can reason about —
+whichever wins the race decides, and Reviewer's path checks a strictly narrower
+set of gates.
 
 ```toml
 [roles.gatekeeper]
@@ -916,6 +905,18 @@ trust = "auto"
 ```
 
 Project overrides use `projects[].roles.gatekeeper.trust`.
+
+Routing labels are reconciled on every `advise`/`auto` evaluation (and removed
+when a published project is demoted to `observe`):
+
+- `auto-merge` only for an eligible report;
+- `needs-human-review` for `protected_path_touched`, `diff_budget_exceeded`, or a
+  repeated `review_changes_requested` reason;
+- neither label for mechanical blockers such as pending checks or conflicts.
+
+The labels are defined in `internal/labels` and are the exact host-repository
+contract consumed by Mergify. Gatekeeper never rewrites or removes unrelated
+labels.
 
 ### The owned comment and its lifecycle
 
@@ -948,11 +949,13 @@ report is audit evidence rather than merge authority.
 
 ### Relationship to `roles.reviewer.autoMerge`
 
-These are two different responsibilities. Reviewer can opt a PR into GitHub's
-native auto-merge, while `Gatekeeper = auto` supplies the externally enforced
-status that prevents GitHub or Mergify from completing a merge until the exact
-head has a completed Codex review and every other Gatekeeper condition passes.
-Reviewer approval alone is therefore insufficient once the status is required.
+These are two different merge stories: Reviewer's native auto-merge is a
+separate legacy opt-in, while Gatekeeper's `auto` trust now routes through the
+Mergify label queue. Reviewer's path checks a narrower set of conditions — notably
+**not** unresolved review threads or requested changes.
+[#116](https://github.com/MumuTW/looper/issues/116) consolidates both behind this
+ladder and retires `roles.reviewer.autoMerge`; do not enable both authorities on
+the same repository.
 
 ## Merge Gatekeeper diff budget (`roles.gatekeeper.diffBudget`)
 

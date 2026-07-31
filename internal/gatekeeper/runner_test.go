@@ -430,31 +430,27 @@ type fakeGatekeeperGitHub struct {
 	reviews          []githubinfra.ReviewSummary
 	reviewsErr       error
 	finalHeadSHA     string
-	finalBaseSHA     string
+	headSHAResponses []string
 	protectionErr    error
 	commentsErr      error
 	// perPullRequestCalls counts the forge round trips that only a full evaluation
 	// makes, so a test can prove a pull request was skipped rather than evaluated.
 	perPullRequestCalls int
 
-	currentLogin          string
-	commentErr            error
-	deletedIDs            []int64
-	listCalls             int
-	loginCalls            int
-	comments              []githubinfra.CommentInfo
-	createdBodies         []string
-	updatedBodies         []string
-	reviewMarker          githubinfra.ReviewMarkerResult
-	reviewMarkerErr       error
-	reviewMarkerCalls     []githubinfra.VerifyReviewMarkerInput
-	statusCalls           []githubinfra.CommitStatusInput
-	statusErr             error
-	viewErr               error
-	listReviewThreadsHook func(*fakeGatekeeperGitHub) error
+	currentLogin string
+	commentErr   error
+	deletedIDs   []int64
+	labelAdds    []githubinfra.PullRequestLabelsInput
+	labelRemoves []githubinfra.PullRequestLabelsInput
+	labelErr     error
 	// beforeView, when set, runs before each pull-request read, so a test can
-	// inject a state change between the first evaluation and a later one.
-	beforeView func(*fakeGatekeeperGitHub)
+	// change forge state between the primary and confirming evaluations.
+	beforeView    func(*fakeGatekeeperGitHub)
+	listCalls     int
+	loginCalls    int
+	comments      []githubinfra.CommentInfo
+	createdBodies []string
+	updatedBodies []string
 }
 
 func (f *fakeGatekeeperGitHub) GetCurrentUserLoginForRepo(context.Context, string, string) (string, error) {
@@ -562,8 +558,29 @@ func (f *fakeGatekeeperGitHub) ListReviewThreads(context.Context, githubinfra.Li
 	}
 	return f.threads, nil
 }
-func (f *fakeGatekeeperGitHub) GetPullRequestHeadAndBaseSHA(context.Context, githubinfra.ViewPullRequestInput) (string, string, error) {
-	return f.finalHeadSHA, f.finalBaseSHA, nil
+func (f *fakeGatekeeperGitHub) GetPullRequestHeadSHA(context.Context, githubinfra.ViewPullRequestInput) (string, error) {
+	if len(f.headSHAResponses) > 0 {
+		head := f.headSHAResponses[0]
+		f.headSHAResponses = f.headSHAResponses[1:]
+		return head, nil
+	}
+	return f.finalHeadSHA, nil
+}
+
+func (f *fakeGatekeeperGitHub) AddPullRequestLabels(_ context.Context, input githubinfra.PullRequestLabelsInput) error {
+	if f.labelErr != nil {
+		return f.labelErr
+	}
+	f.labelAdds = append(f.labelAdds, input)
+	return nil
+}
+
+func (f *fakeGatekeeperGitHub) RemovePullRequestLabels(_ context.Context, input githubinfra.PullRequestLabelsInput) error {
+	if f.labelErr != nil {
+		return f.labelErr
+	}
+	f.labelRemoves = append(f.labelRemoves, input)
+	return nil
 }
 func (f *fakeGatekeeperGitHub) FindReviewMarker(_ context.Context, input githubinfra.VerifyReviewMarkerInput) (githubinfra.ReviewMarkerResult, error) {
 	f.reviewMarkerCalls = append(f.reviewMarkerCalls, input)
