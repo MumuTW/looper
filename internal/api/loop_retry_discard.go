@@ -139,8 +139,8 @@ func (h *Handler) loopWorktreeStatus(ctx context.Context, loop storage.LoopRecor
 	if resolved.UnsafeReason != "" {
 		// The read-only preflight must not substitute the mutable row's
 		// checkout, but it also must not prevent a plain retry after an
-		// operator restores the exact checkpoint path. Omit clean/dirty so
-		// clients cannot offer destructive discard for this disagreement.
+		// operator restores the exact checkpoint path. The physical checkout's
+		// branch is the resume authority; the mutable row only detected drift.
 		if _, statErr := os.Stat(path); statErr == nil {
 			resp.Present = true
 		} else if !os.IsNotExist(statErr) {
@@ -150,6 +150,27 @@ func (h *Handler) loopWorktreeStatus(ctx context.Context, loop storage.LoopRecor
 				message: fmt.Sprintf("Failed to stat worktree at %s: %v", path, statErr),
 			}
 		}
+		if resp.Present {
+			gitPath := ""
+			if h.context.Config.Tools.GitPath != nil {
+				gitPath = strings.TrimSpace(*h.context.Config.Tools.GitPath)
+			}
+			gateway := gitinfra.New(gitinfra.Options{GitPath: gitPath, Repos: services.Repositories, Now: h.now})
+			if identityErr := gateway.VerifyWorktreeIdentity(ctx, gitinfra.VerifyWorktreeIdentityInput{
+				RepoPath:       project.RepoPath,
+				WorktreeRoot:   resolved.WorktreeRoot,
+				WorktreePath:   path,
+				ExpectedBranch: strings.TrimSpace(resolved.Branch),
+			}); identityErr != nil {
+				return loopWorktreeStatusResponse{}, apiError{
+					code:    pkgapi.ErrorCodeValidationFailed,
+					status:  http.StatusBadRequest,
+					message: fmt.Sprintf("Checkpoint worktree for loop %s is not retry-safe: %v", loop.ID, identityErr),
+				}
+			}
+		}
+		// Omit clean/dirty so clients cannot offer destructive discard for a
+		// row disagreement after the checkpoint checkout itself is verified.
 		resp.Reason = resolved.UnsafeReason
 		return resp, nil
 	}

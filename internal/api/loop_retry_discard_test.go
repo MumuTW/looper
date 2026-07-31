@@ -18,6 +18,7 @@ import (
 	gitinfra "github.com/MumuTW/looper/internal/infra/git"
 	looperdruntime "github.com/MumuTW/looper/internal/runtime"
 	"github.com/MumuTW/looper/internal/storage"
+	workerpkg "github.com/MumuTW/looper/internal/worker"
 )
 
 func TestHandlerLoopWorktreeStatusDirtyAndClean(t *testing.T) {
@@ -1281,6 +1282,26 @@ func TestHandlerLoopRetryDiscardRejectsCheckpointBranchMismatch(t *testing.T) {
 	if err := services.Repositories.Worktrees.Upsert(context.Background(), *record); err != nil {
 		t.Fatalf("Worktrees.Upsert(replacement branch) error = %v", err)
 	}
+	latestRun, err := services.Repositories.Runs.GetLatestByLoopID(context.Background(), fixture.LoopID)
+	if err != nil || latestRun == nil {
+		t.Fatalf("Runs.GetLatestByLoopID() = %#v, %v", latestRun, err)
+	}
+	checkpointJSON := fmt.Sprintf(`{"resumePolicy":"advance_from_checkpoint","work":{"title":"Resume checkpoint","repo":"acme/looper","baseBranch":"main","executionMode":"create-pr"},"worktree":{"id":%q,"path":%q,"branch":"feature/checkpoint-branch","baseBranch":"main"},"plan":{"summary":"Resume checkpoint","items":["continue"]}}`, record.ID, fixture.WorktreePath)
+	lastCompletedStep := "plan"
+	failedStep := "execute"
+	latestRun.CheckpointJSON = &checkpointJSON
+	latestRun.LastCompletedStep = &lastCompletedStep
+	latestRun.CurrentStep = &failedStep
+	if err := services.Repositories.Runs.Upsert(context.Background(), *latestRun); err != nil {
+		t.Fatalf("Runs.Upsert(worker checkpoint) error = %v", err)
+	}
+
+	statusReq := httptest.NewRequest(http.MethodGet, "/api/v1/loops/3137/worktree", nil)
+	statusRecorder := httptest.NewRecorder()
+	h.ServeHTTP(statusRecorder, statusReq)
+	if statusRecorder.Code != http.StatusBadRequest || !strings.Contains(statusRecorder.Body.String(), "not retry-safe") {
+		t.Fatalf("worktree status = %d body=%s, want physical branch mismatch rejection", statusRecorder.Code, statusRecorder.Body.String())
+	}
 
 	retryReq := httptest.NewRequest(http.MethodPost, "/api/v1/loops/3137/retry", strings.NewReader(`{"mode":"auto","discardWorktreeChanges":true}`))
 	retryRecorder := httptest.NewRecorder()
@@ -1290,6 +1311,43 @@ func TestHandlerLoopRetryDiscardRejectsCheckpointBranchMismatch(t *testing.T) {
 	}
 	if got := readTestFile(t, filepath.Join(fixture.WorktreePath, "dirty.txt")); got != "untracked\n" {
 		t.Fatalf("replacement branch progress was discarded: dirty.txt = %q", got)
+	}
+
+	// A caller can bypass the CLI preflight and POST a plain retry directly.
+	// The Worker must recheck the physical checkout immediately before agent
+	// start so that API retry cannot turn row drift into replacement-branch work.
+	plainRetryReq := httptest.NewRequest(http.MethodPost, "/api/v1/loops/3137/retry", strings.NewReader(`{"mode":"auto"}`))
+	plainRetryRecorder := httptest.NewRecorder()
+	h.ServeHTTP(plainRetryRecorder, plainRetryReq)
+	if plainRetryRecorder.Code != http.StatusOK {
+		t.Fatalf("plain retry = %d body=%s, want API requeue before Worker identity check", plainRetryRecorder.Code, plainRetryRecorder.Body.String())
+	}
+	claim, err := services.Repositories.Queue.ClaimNextOfType(context.Background(), "2026-12-31T00:00:00.000Z", "worker-identity-test", "worker")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = %#v, %v", claim, err)
+	}
+	realGit := gitinfra.New(gitinfra.Options{GitPath: "git", Repos: services.Repositories})
+	agent := &recordingWorkerAgent{}
+	workerRunner := workerpkg.New(workerpkg.Options{
+		DB:              services.Coordinator.DB(),
+		Repos:           services.Repositories,
+		Git:             workerGitTestAdapter{gateway: realGit},
+		AgentExecutor:   agent,
+		Now:             func() time.Time { return time.Date(2026, time.July, 31, 2, 0, 0, 0, time.UTC) },
+		AllowAutoCommit: true,
+	})
+	result, err := workerRunner.ProcessClaimedQueueItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedQueueItem() error = %v", err)
+	}
+	if result == nil || result.Status != "failed" || result.FailureKind != workerpkg.FailureManualIntervention || !strings.Contains(result.Summary, "checkout identity mismatch") {
+		t.Fatalf("worker result = %#v, want manual-intervention identity refusal", result)
+	}
+	if len(agent.starts) != 0 {
+		t.Fatalf("replacement branch started agent: %#v", agent.starts)
+	}
+	if got := readTestFile(t, filepath.Join(fixture.WorktreePath, "dirty.txt")); got != "untracked\n" {
+		t.Fatalf("replacement branch progress changed during identity refusal: dirty.txt = %q", got)
 	}
 }
 
@@ -2025,6 +2083,39 @@ type managedWorktreeSeed struct {
 	Branch    string
 	NowISO    string
 	Dirty     bool
+}
+
+type workerGitTestAdapter struct{ gateway *gitinfra.Gateway }
+
+func (a workerGitTestAdapter) CreateWorktree(ctx context.Context, input workerpkg.CreateWorktreeInput) (workerpkg.CreateWorktreeResult, error) {
+	return workerpkg.CreateWorktreeResult{}, fmt.Errorf("unexpected CreateWorktree(%s)", input.Branch)
+}
+
+func (a workerGitTestAdapter) PrepareWorktree(ctx context.Context, input workerpkg.PrepareWorktreeInput) (workerpkg.PrepareWorktreeResult, error) {
+	return workerpkg.PrepareWorktreeResult{}, fmt.Errorf("unexpected PrepareWorktree(%s)", input.WorktreePath)
+}
+
+func (a workerGitTestAdapter) InspectHead(ctx context.Context, input workerpkg.InspectHeadInput) (workerpkg.InspectHeadResult, error) {
+	return workerpkg.InspectHeadResult{}, fmt.Errorf("unexpected InspectHead(%s)", input.WorktreePath)
+}
+
+func (a workerGitTestAdapter) VerifyWorktreeIdentity(ctx context.Context, input workerpkg.VerifyWorktreeIdentityInput) error {
+	return a.gateway.VerifyWorktreeIdentity(ctx, gitinfra.VerifyWorktreeIdentityInput{RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, ExpectedBranch: input.ExpectedBranch})
+}
+
+func (a workerGitTestAdapter) Commit(ctx context.Context, input workerpkg.CommitInput) (workerpkg.CommitResult, error) {
+	return workerpkg.CommitResult{}, fmt.Errorf("unexpected Commit(%s)", input.WorktreePath)
+}
+
+func (a workerGitTestAdapter) Push(ctx context.Context, input workerpkg.PushInput) error {
+	return fmt.Errorf("unexpected Push(%s)", input.WorktreePath)
+}
+
+type recordingWorkerAgent struct{ starts []workerpkg.AgentRunInput }
+
+func (a *recordingWorkerAgent) Start(_ context.Context, input workerpkg.AgentRunInput) (workerpkg.AgentExecution, error) {
+	a.starts = append(a.starts, input)
+	return nil, fmt.Errorf("unexpected worker agent start")
 }
 
 type managedWorktreeFixture struct {

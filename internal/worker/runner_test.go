@@ -5071,6 +5071,10 @@ func (f *fakeGitGateway) InspectHead(_ context.Context, input InspectHeadInput) 
 	return f.inspectResult, nil
 }
 
+func (f *fakeGitGateway) VerifyWorktreeIdentity(context.Context, VerifyWorktreeIdentityInput) error {
+	return nil
+}
+
 func (f *fakeGitGateway) Commit(_ context.Context, input CommitInput) (CommitResult, error) {
 	f.commitCalls = append(f.commitCalls, input)
 	if f.commitResult.CommitSHA == "" {

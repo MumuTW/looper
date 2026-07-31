@@ -95,6 +95,13 @@ type InspectHeadResult struct {
 	ChangedFiles          []string
 }
 
+type VerifyWorktreeIdentityInput struct {
+	RepoPath       string
+	WorktreeRoot   string
+	WorktreePath   string
+	ExpectedBranch string
+}
+
 type CommitInput struct {
 	RepoPath     string
 	WorktreeRoot string
@@ -837,6 +844,27 @@ func (g *Gateway) InspectHead(ctx context.Context, input InspectHeadInput) (Insp
 		HasUncommittedChanges: len(status) > 0,
 		ChangedFiles:          changedFiles,
 	}, nil
+}
+
+// VerifyWorktreeIdentity compares the checkpoint's branch authority with the
+// physical checkout. Worktree rows are mutable discovery state and may point
+// at a replacement checkout, so they are not sufficient resume authority.
+func (g *Gateway) VerifyWorktreeIdentity(ctx context.Context, input VerifyWorktreeIdentityInput) error {
+	if err := g.validateMutationWorktree(input.WorktreePath, input.RepoPath, input.WorktreeRoot); err != nil {
+		return err
+	}
+	expectedBranch := strings.TrimSpace(input.ExpectedBranch)
+	if expectedBranch == "" {
+		return fmt.Errorf("expected worktree branch is required")
+	}
+	actualBranch, err := g.getCurrentBranch(ctx, input.WorktreePath)
+	if err != nil {
+		return fmt.Errorf("inspect current worktree branch: %w", err)
+	}
+	if actualBranch != expectedBranch {
+		return fmt.Errorf("worktree branch is %q, expected %q", actualBranch, expectedBranch)
+	}
+	return nil
 }
 
 func (g *Gateway) Commit(ctx context.Context, input CommitInput) (CommitResult, error) {

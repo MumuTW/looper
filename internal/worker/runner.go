@@ -318,6 +318,13 @@ type InspectHeadResult struct {
 	ChangedFiles          []string
 }
 
+type VerifyWorktreeIdentityInput struct {
+	RepoPath       string
+	WorktreeRoot   string
+	WorktreePath   string
+	ExpectedBranch string
+}
+
 type CommitInput struct {
 	RepoPath        string
 	WorktreeRoot    string
@@ -333,6 +340,7 @@ type GitGateway interface {
 	CreateWorktree(context.Context, CreateWorktreeInput) (CreateWorktreeResult, error)
 	PrepareWorktree(context.Context, PrepareWorktreeInput) (PrepareWorktreeResult, error)
 	InspectHead(context.Context, InspectHeadInput) (InspectHeadResult, error)
+	VerifyWorktreeIdentity(context.Context, VerifyWorktreeIdentityInput) error
 	Commit(context.Context, CommitInput) (CommitResult, error)
 	Push(context.Context, PushInput) error
 }
@@ -1605,6 +1613,21 @@ func (r *Runner) ensureWorkerWorktreeUsable(ctx context.Context, input stepInput
 				return worktree, staleWorkerWorktreeError(worktree, work, "path is not a usable git worktree")
 			}
 			return worktree, &loopError{message: fmt.Sprintf("Unable to inspect worker worktree git metadata at %s for branch %s: %v", worktree.Path, firstNonEmpty(worktree.Branch, work.Branch, "unknown"), gitErr), kind: FailureRetryableTransient}
+		}
+		expectedBranch := firstNonEmpty(worktree.Branch, work.Branch)
+		if expectedBranch == "" {
+			return worktree, staleWorkerWorktreeError(worktree, work, "checkpoint branch is not recorded")
+		}
+		if r.git == nil {
+			return worktree, &loopError{message: "Unable to verify worker worktree identity: git gateway is not configured", kind: FailureRetryableTransient}
+		}
+		if identityErr := r.git.VerifyWorktreeIdentity(ctx, VerifyWorktreeIdentityInput{
+			RepoPath:       input.Project.RepoPath,
+			WorktreeRoot:   worktreeRoot,
+			WorktreePath:   worktree.Path,
+			ExpectedBranch: expectedBranch,
+		}); identityErr != nil {
+			return worktree, staleWorkerWorktreeError(worktree, work, "checkout identity mismatch: "+identityErr.Error())
 		}
 		return worktree, nil
 	}
