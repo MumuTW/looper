@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"os"
@@ -9,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/MumuTW/looper/internal/reproducer"
+	"github.com/MumuTW/looper/internal/validation"
 )
 
 func writeWorkerReproductionFixture(t *testing.T) (string, *reproducer.Manifest) {
@@ -67,5 +69,80 @@ func TestWorkerValidationCommandsIncludeReproductionCommand(t *testing.T) {
 	commands = workerValidationCommands(commands, workerInput{Reproduction: manifest})
 	if len(commands) != 2 {
 		t.Fatalf("workerValidationCommands() duplicated command: %#v", commands)
+	}
+}
+
+func TestWorkerReproductionBaselineRequiresOrdinaryTestFailure(t *testing.T) {
+	root, manifest := writeWorkerReproductionFixture(t)
+	checkpoint := workerCheckpoint{Work: &workerInput{Reproduction: manifest}}
+	var got ValidationInput
+	runner := New(Options{ValidationRunner: func(_ context.Context, input ValidationInput) (ValidationResult, error) {
+		got = input
+		return ValidationResult{Passed: false, Summary: "Validation failed: " + manifest.TestCommand, FailureCategory: validation.FailureNonZeroExit}, nil
+	}})
+
+	if err := runner.ensureWorkerReproductionBaseline(context.Background(), &checkpoint, root); err != nil {
+		t.Fatalf("ensureWorkerReproductionBaseline() error = %v, want red evidence", err)
+	}
+	if checkpoint.ReproductionBaseline == nil || checkpoint.ReproductionBaseline.Passed {
+		t.Fatalf("ReproductionBaseline = %#v, want persisted failing result", checkpoint.ReproductionBaseline)
+	}
+	if len(got.Commands) != 1 || got.Commands[0] != manifest.TestCommand || got.CWD != root {
+		t.Fatalf("baseline input = %#v, want exactly the manifest command in the worktree", got)
+	}
+}
+
+func TestWorkerReproductionBaselineRejectsPassingTest(t *testing.T) {
+	root, manifest := writeWorkerReproductionFixture(t)
+	checkpoint := workerCheckpoint{Work: &workerInput{Reproduction: manifest}}
+	runner := New(Options{ValidationRunner: func(context.Context, ValidationInput) (ValidationResult, error) {
+		return ValidationResult{Passed: true, Summary: "Validation passed"}, nil
+	}})
+
+	err := runner.ensureWorkerReproductionBaseline(context.Background(), &checkpoint, root)
+	if err == nil || !strings.Contains(err.Error(), "passed immediately") {
+		t.Fatalf("ensureWorkerReproductionBaseline() error = %v, want immediate-pass rejection", err)
+	}
+	if got := err.(*loopError).kind; got != FailureManualIntervention {
+		t.Fatalf("failure kind = %q, want %q", got, FailureManualIntervention)
+	}
+	if checkpoint.ReproductionBaseline == nil || !checkpoint.ReproductionBaseline.Passed {
+		t.Fatalf("ReproductionBaseline = %#v, want persisted passing diagnostic", checkpoint.ReproductionBaseline)
+	}
+}
+
+func TestWorkerReproductionBaselineRejectsOperationalFailure(t *testing.T) {
+	root, manifest := writeWorkerReproductionFixture(t)
+	checkpoint := workerCheckpoint{Work: &workerInput{Reproduction: manifest}}
+	runner := New(Options{ValidationRunner: func(context.Context, ValidationInput) (ValidationResult, error) {
+		return ValidationResult{Passed: false, Summary: "Validation timed out: " + manifest.TestCommand, FailureCategory: validation.FailureSupervisorTimeout}, nil
+	}})
+
+	err := runner.ensureWorkerReproductionBaseline(context.Background(), &checkpoint, root)
+	if err == nil || !strings.Contains(err.Error(), "ordinary failing test result") {
+		t.Fatalf("ensureWorkerReproductionBaseline() error = %v, want operational-failure rejection", err)
+	}
+	if got := err.(*loopError).kind; got != FailureRetryableTransient {
+		t.Fatalf("failure kind = %q, want %q", got, FailureRetryableTransient)
+	}
+}
+
+func TestWorkerReproductionBaselineIsReplaySafe(t *testing.T) {
+	root, manifest := writeWorkerReproductionFixture(t)
+	checkpoint := workerCheckpoint{
+		Work:                 &workerInput{Reproduction: manifest},
+		ReproductionBaseline: &ValidationResult{Passed: false, FailureCategory: validation.FailureNonZeroExit},
+	}
+	called := false
+	runner := New(Options{ValidationRunner: func(context.Context, ValidationInput) (ValidationResult, error) {
+		called = true
+		return ValidationResult{Passed: true}, nil
+	}})
+
+	if err := runner.ensureWorkerReproductionBaseline(context.Background(), &checkpoint, root); err != nil {
+		t.Fatalf("ensureWorkerReproductionBaseline() replay error = %v", err)
+	}
+	if called {
+		t.Fatal("ensureWorkerReproductionBaseline() re-ran a persisted baseline")
 	}
 }
