@@ -33,3 +33,25 @@ func TestSmokeLooperdExitsWhenSupervisionPipeCloses(t *testing.T) {
 		t.Fatal("looperd still running 15s after its supervision pipe closed; orphan protection is broken")
 	}
 }
+
+// TestSmokeLooperdExitsWhenSupervisionPipeClosesDuringStartup closes the pipe
+// immediately after spawn, before waiting for readiness. Bootstrap's shutdown
+// listener registers only after the runtime is up, so this exercises the
+// window where the shutdown request must be buffered by the early signal
+// registration instead of hitting the default SIGTERM action or being lost.
+func TestSmokeLooperdExitsWhenSupervisionPipeClosesDuringStartup(t *testing.T) {
+	bins := harness.MustBinaries(t)
+	home := harness.NewTempHome(t)
+	port := harness.MustFreePort(t)
+	cfg := harness.DefaultConfig(t, home, harness.ConfigOptions{Port: port})
+	harness.WriteConfig(t, home.ConfigPath, cfg, nil)
+	proc := harness.StartLooperd(t, bins, home, home.ConfigPath, nil, cfg.Server.Host, cfg.Server.Port)
+
+	proc.CloseSupervision()
+
+	select {
+	case <-proc.Exited():
+	case <-time.After(45 * time.Second):
+		t.Fatal("looperd still running 45s after its supervision pipe closed during startup")
+	}
+}

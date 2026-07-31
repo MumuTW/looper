@@ -65,11 +65,7 @@ func runWithDeps(args []string, stdout, stderr io.Writer, deps runDeps) int {
 		return 0
 	}
 
-	if stdinSupervisionEnabled(deps.env) {
-		startStdinSupervision(os.Stdin, stderr, stdinSupervisionForceExitDelay,
-			func() { _ = syscall.Kill(os.Getpid(), syscall.SIGTERM) },
-			func() { os.Exit(1) })
-	}
+	supervisionNotifier := setupStdinSupervision(deps.env, stderr)
 
 	bootstrapImpl := deps.bootstrapImpl
 	if bootstrapImpl == nil {
@@ -85,6 +81,7 @@ func runWithDeps(args []string, stdout, stderr io.Writer, deps runDeps) int {
 		Stdout:          stdout,
 		Stderr:          stderr,
 		WaitForShutdown: true,
+		SignalNotifier:  supervisionNotifier,
 	})
 	if err == nil {
 		return 0

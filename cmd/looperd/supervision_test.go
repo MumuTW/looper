@@ -2,6 +2,8 @@ package main
 
 import (
 	"io"
+	"os"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -54,6 +56,54 @@ func TestStdinSupervisionRequestsShutdownOnEOFThenForceExits(t *testing.T) {
 	case <-exitCh:
 	case <-time.After(5 * time.Second):
 		t.Fatal("force exit not requested after grace period")
+	}
+}
+
+// TestForwardingNotifierDeliversSignalBufferedBeforeListenerRegisters covers
+// the startup race: the supervision pipe closes while bootstrap is still
+// starting the runtime, so the shutdown request lands in the supervision
+// channel before bootstrap's listener calls Notify. The forwarder must hand
+// that buffered signal to the late listener instead of losing it.
+func TestForwardingNotifierDeliversSignalBufferedBeforeListenerRegisters(t *testing.T) {
+	source := make(chan os.Signal, 1)
+	requestShutdownSignal(source)
+
+	notifier := newForwardingSignalNotifier(source)
+	listener := make(chan os.Signal, 1)
+	notifier.Notify(listener, os.Interrupt, syscall.SIGTERM)
+	defer notifier.Stop(listener)
+
+	select {
+	case sig := <-listener:
+		if sig != syscall.SIGTERM {
+			t.Fatalf("forwarded signal = %v, want SIGTERM", sig)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("signal buffered before Notify never reached the listener")
+	}
+}
+
+func TestForwardingNotifierStopEndsForwarding(t *testing.T) {
+	source := make(chan os.Signal, 1)
+	notifier := newForwardingSignalNotifier(source)
+	listener := make(chan os.Signal, 1)
+	notifier.Notify(listener, os.Interrupt, syscall.SIGTERM)
+	notifier.Stop(listener)
+
+	requestShutdownSignal(source)
+	select {
+	case sig := <-listener:
+		t.Fatalf("received %v after Stop", sig)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func TestRequestShutdownSignalDropsWhenRequestAlreadyPending(t *testing.T) {
+	signals := make(chan os.Signal, 1)
+	requestShutdownSignal(signals)
+	requestShutdownSignal(signals)
+	if got := len(signals); got != 1 {
+		t.Fatalf("pending signals = %d, want 1", got)
 	}
 }
 
