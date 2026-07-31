@@ -240,7 +240,7 @@ func TestResolveRunAgentSnapshotJSONForValidationGate_RefreshesUnsupportedPredec
 	// gate (claude-code is not in toolNetworkDenialVendors); the operator has
 	// since switched the role vendor to a supported one (codex).
 	predecessor := `{"vendor":"claude-code","model":"sonnet","profileId":"sticky"}`
-	got, refreshed, legacy, err := ResolveRunAgentSnapshotJSONForValidationGate(&predecessor, true, true, string(AgentVendorCodex), strPtr("gpt-5"), "fast")
+	got, refreshed, legacy, err := ResolveRunAgentSnapshotJSONForValidationGate(&predecessor, true, true, true, string(AgentVendorCodex), strPtr("gpt-5"), "fast")
 	if err != nil {
 		t.Fatalf("ResolveRunAgentSnapshotJSONForValidationGate() error = %v", err)
 	}
@@ -268,13 +268,38 @@ func TestResolveRunAgentSnapshotJSONForValidationGate_RefreshesUnsupportedPredec
 	}
 }
 
+func TestResolveRunAgentSnapshotJSONForValidationGate_PreservesStickyWhenNoAgentReplay(t *testing.T) {
+	t.Parallel()
+
+	// A sticky predecessor whose vendor cannot serve the gate is preserved
+	// when the resume will NOT replay an agent step (e.g. a worker run that
+	// completed "execute" and resumes at "validate"). No agent process runs
+	// under the gate, so refreshing the snapshot would only rewrite disclosure
+	// identity — publishing the predecessor's authored changes stamped as the
+	// current vendor's. The predecessor snapshot stays sticky for attribution.
+	predecessor := `{"vendor":"claude-code","model":"sonnet","profileId":"sticky"}`
+	got, refreshed, legacy, err := ResolveRunAgentSnapshotJSONForValidationGate(&predecessor, true, true, false, string(AgentVendorCodex), strPtr("gpt-5"), "fast")
+	if err != nil {
+		t.Fatalf("ResolveRunAgentSnapshotJSONForValidationGate() error = %v", err)
+	}
+	if refreshed {
+		t.Fatal("refreshed = true, want false when no agent step will replay")
+	}
+	if legacy {
+		t.Fatal("legacyResume = true, want false")
+	}
+	if got == nil || *got != predecessor {
+		t.Fatalf("snapshot = %v, want sticky predecessor copy %q so disclosure stays with the author that ran", got, predecessor)
+	}
+}
+
 func TestResolveRunAgentSnapshotJSONForValidationGate_PreservesStickyWhenGateDisabled(t *testing.T) {
 	t.Parallel()
 
 	// Without the validation gate, the unsupported predecessor stays sticky —
 	// it can still spawn unrestricted, so stickiness must be preserved.
 	predecessor := `{"vendor":"claude-code","model":"sonnet","profileId":"sticky"}`
-	got, refreshed, legacy, err := ResolveRunAgentSnapshotJSONForValidationGate(&predecessor, true, false, string(AgentVendorCodex), strPtr("gpt-5"), "fast")
+	got, refreshed, legacy, err := ResolveRunAgentSnapshotJSONForValidationGate(&predecessor, true, false, true, string(AgentVendorCodex), strPtr("gpt-5"), "fast")
 	if err != nil {
 		t.Fatalf("ResolveRunAgentSnapshotJSONForValidationGate() error = %v", err)
 	}
@@ -295,7 +320,7 @@ func TestResolveRunAgentSnapshotJSONForValidationGate_PreservesStickyWhenPredece
 	// A predecessor whose vendor already serves the gate stays sticky even with
 	// the gate required — no refresh needed.
 	predecessor := `{"vendor":"codex","model":"old","profileId":"sticky"}`
-	got, refreshed, legacy, err := ResolveRunAgentSnapshotJSONForValidationGate(&predecessor, true, true, string(AgentVendorCodex), strPtr("new"), "fresh")
+	got, refreshed, legacy, err := ResolveRunAgentSnapshotJSONForValidationGate(&predecessor, true, true, true, string(AgentVendorCodex), strPtr("new"), "fresh")
 	if err != nil {
 		t.Fatalf("ResolveRunAgentSnapshotJSONForValidationGate() error = %v", err)
 	}
@@ -317,7 +342,7 @@ func TestResolveRunAgentSnapshotJSONForValidationGate_NoRefreshWhenCurrentAlsoUn
 	// would not help, so the sticky predecessor is preserved and the spawn
 	// refuses with a manual-intervention diagnostic instead.
 	predecessor := `{"vendor":"claude-code","model":"sonnet","profileId":"sticky"}`
-	got, refreshed, legacy, err := ResolveRunAgentSnapshotJSONForValidationGate(&predecessor, true, true, string(AgentVendorClaudeCode), strPtr("sonnet"), "sticky")
+	got, refreshed, legacy, err := ResolveRunAgentSnapshotJSONForValidationGate(&predecessor, true, true, true, string(AgentVendorClaudeCode), strPtr("sonnet"), "sticky")
 	if err != nil {
 		t.Fatalf("ResolveRunAgentSnapshotJSONForValidationGate() error = %v", err)
 	}
@@ -336,7 +361,7 @@ func TestResolveRunAgentSnapshotJSONForValidationGate_RejectsInvalidPredecessor(
 	t.Parallel()
 
 	malformed := `{not-json`
-	_, _, _, err := ResolveRunAgentSnapshotJSONForValidationGate(&malformed, true, true, string(AgentVendorCodex), strPtr("gpt-5"), "fast")
+	_, _, _, err := ResolveRunAgentSnapshotJSONForValidationGate(&malformed, true, true, true, string(AgentVendorCodex), strPtr("gpt-5"), "fast")
 	if err == nil {
 		t.Fatal("error = nil, want parse error for malformed predecessor")
 	}
@@ -347,7 +372,7 @@ func TestResolveRunAgentSnapshotJSONForValidationGate_NonStickyDelegates(t *test
 
 	// A fresh (non-sticky) create builds from current identity regardless of the
 	// gate flag; no predecessor to refresh.
-	got, refreshed, legacy, err := ResolveRunAgentSnapshotJSONForValidationGate(nil, false, true, string(AgentVendorCodex), strPtr("gpt-5"), "fast")
+	got, refreshed, legacy, err := ResolveRunAgentSnapshotJSONForValidationGate(nil, false, true, true, string(AgentVendorCodex), strPtr("gpt-5"), "fast")
 	if err != nil {
 		t.Fatalf("ResolveRunAgentSnapshotJSONForValidationGate() error = %v", err)
 	}

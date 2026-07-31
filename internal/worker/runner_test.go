@@ -1912,6 +1912,84 @@ func TestCreateRunContextRefreshesUnsupportedSnapshotWhenValidationGateEnabled(t
 	}
 }
 
+func TestCreateRunContextPreservesAuthorSnapshotWhenResumingAfterExecute(t *testing.T) {
+	t.Parallel()
+
+	// A failed worker run already completed the agent step (execute) with a
+	// valid structured result, so the resume advances to validate — no agent
+	// process replays. The predecessor snapshot was authored by a vendor that
+	// cannot serve the validation gate (claude-code), and the operator has
+	// switched the role vendor to a supported one (codex). Because no agent
+	// will spawn under the gate, the snapshot must NOT be refreshed: refreshing
+	// would only rewrite disclosure identity, publishing the predecessor's
+	// Claude-authored changes stamped as Codex. The predecessor snapshot stays
+	// sticky so attribution follows the author that actually ran.
+	fixture := newRunnerFixture(t)
+	predecessorSnapshot := `{"vendor":"claude-code","model":"sonnet","profileId":"sticky"}`
+	runner := New(Options{
+		DB:             fixture.coordinator.DB(),
+		Repos:          fixture.repos,
+		Logger:         fixture.logger,
+		Now:            fixture.now,
+		AgentRuntime:   string(config.AgentVendorCodex),
+		AgentModel:     stringPtr("gpt-5"),
+		AgentProfileID: "fast",
+		ValidationCommandsByProject: map[string][]string{
+			"project_1": {"go test ./..."},
+		},
+	})
+	checkpointJSON := mustMarshalJSON(workerCheckpoint{
+		Work:           &workerInput{Title: "Worker task"},
+		ClaimedLockKey: "worker:loop_worker_1",
+		Worktree:       &checkpointWorktree{ID: "wt_1", Path: filepath.Join(t.TempDir(), "wt"), Branch: "feature/test"},
+		Plan:           &checkpointPlan{Summary: "plan"},
+		// A parsed completed execution means shouldReplayExecuteOnResume is false,
+		// so the resume advances to validate instead of replaying execute.
+		Execution: &checkpointExecution{Status: "completed", Summary: "done", ParseStatus: "parsed"},
+	})
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{
+		ID:                "run_failed_after_execute",
+		LoopID:            "loop_worker_1",
+		Status:            "failed",
+		CurrentStep:       stringPtr(string(stepValidate)),
+		LastCompletedStep: stringPtr(string(stepExecute)),
+		CheckpointJSON:    &checkpointJSON,
+		AgentSnapshotJSON: &predecessorSnapshot,
+		StartedAt:         fixture.nowISO(),
+		CreatedAt:         fixture.nowISO(),
+		UpdatedAt:         fixture.nowISO(),
+	}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_1")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v)", loop, err)
+	}
+
+	resumed, err := runner.createRunContext(context.Background(), *loop)
+	if err != nil {
+		t.Fatalf("createRunContext() error = %v", err)
+	}
+	if resumed.StartStep != stepValidate {
+		t.Fatalf("StartStep = %q, want validate (advance past execute, no replay)", resumed.StartStep)
+	}
+	if resumed.Run.AgentSnapshotJSON == nil {
+		t.Fatal("AgentSnapshotJSON = nil, want preserved predecessor snapshot")
+	}
+	if *resumed.Run.AgentSnapshotJSON != predecessorSnapshot {
+		t.Fatalf("AgentSnapshotJSON = %q, want preserved predecessor %q (no refresh when no agent replays)", *resumed.Run.AgentSnapshotJSON, predecessorSnapshot)
+	}
+	// Disclosure identity must follow the preserved author snapshot, not the
+	// current role vendor — otherwise Claude-authored changes get stamped as Codex.
+	agent, model := runner.disclosureIdentity(resumed.Run)
+	if agent != string(config.AgentVendorClaudeCode) {
+		t.Fatalf("disclosureIdentity agent = %q, want claude-code (preserved author)", agent)
+	}
+	if model != "sonnet" {
+		t.Fatalf("disclosureIdentity model = %q, want sonnet (preserved author)", model)
+	}
+}
+
 func TestCreateRunContextReplaysExecuteWhenResumeCheckpointParseStatusIsInvalid(t *testing.T) {
 	t.Parallel()
 

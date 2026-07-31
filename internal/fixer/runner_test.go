@@ -4630,6 +4630,87 @@ func TestCreateRunContextRefreshesUnsupportedSnapshotWhenValidationGateEnabled(t
 	}
 }
 
+func TestCreateRunContextPreservesAuthorSnapshotWhenResumingAfterRepair(t *testing.T) {
+	t.Parallel()
+
+	// A failed fixer run already completed the agent step (repair) and resumes
+	// at reconcile-commits (the step after repair) — no agent process replays.
+	// The predecessor snapshot was authored by a vendor that cannot serve the
+	// validation gate (claude-code), and the operator has switched the role
+	// vendor to a supported one (codex). Because no agent will spawn under
+	// the gate, the snapshot must NOT be refreshed: refreshing would only
+	// rewrite disclosure identity, publishing the predecessor's Claude-authored
+	// changes stamped as Codex. The predecessor snapshot stays sticky so
+	// attribution follows the author.
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	nowISO := fixture.nowISO()
+	loopTarget := buildPullRequestTargetID(repo, prNumber)
+	predecessorSnapshot := `{"vendor":"claude-code","model":"sonnet","profileId":"sticky"}`
+	runner := New(Options{
+		DB:             fixture.coordinator.DB(),
+		Repos:          fixture.repos,
+		Git:            &fakeGitGateway{},
+		AgentExecutor:  &fakeAgentExecutor{},
+		Logger:         fixture.logger,
+		Now:            fixture.now,
+		AgentRuntime:   string(config.AgentVendorCodex),
+		AgentModel:     stringPtr("gpt-5"),
+		AgentProfileID: "fast",
+		ValidationCommandsByProject: map[string][]string{
+			"project_1": {"go test ./..."},
+		},
+	})
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_preserved_snapshot", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	// No worktree checkpoint → shouldResumeFromPrepare is false; advance past
+	// repair to validate without replaying the agent step.
+	checkpointJSON := mustMarshalJSON(fixerCheckpoint{ResumePolicy: "advance_from_checkpoint", Repair: &checkpointRepair{CompletedAt: nowISO}})
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{
+		ID:                "run_failed_after_repair",
+		LoopID:            "loop_preserved_snapshot",
+		Status:            "failed",
+		CurrentStep:       stringPtr(string(stepValidate)),
+		LastCompletedStep: stringPtr(string(stepRepair)),
+		CheckpointJSON:    &checkpointJSON,
+		AgentSnapshotJSON: &predecessorSnapshot,
+		StartedAt:         nowISO,
+		CreatedAt:         nowISO,
+		UpdatedAt:         nowISO,
+	}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_preserved_snapshot")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v)", loop, err)
+	}
+
+	resumed, err := runner.createRunContext(context.Background(), *loop)
+	if err != nil {
+		t.Fatalf("createRunContext() error = %v", err)
+	}
+	if resumed.StartStep != stepReconcileCommits {
+		t.Fatalf("StartStep = %q, want reconcile-commits (advance past repair, no replay)", resumed.StartStep)
+	}
+	if resumed.Run.AgentSnapshotJSON == nil {
+		t.Fatal("AgentSnapshotJSON = nil, want preserved predecessor snapshot")
+	}
+	if *resumed.Run.AgentSnapshotJSON != predecessorSnapshot {
+		t.Fatalf("AgentSnapshotJSON = %q, want preserved predecessor %q (no refresh when no agent replays)", *resumed.Run.AgentSnapshotJSON, predecessorSnapshot)
+	}
+	// Disclosure identity must follow the preserved author snapshot, not the
+	// current role vendor — otherwise Claude-authored changes get stamped as Codex.
+	agent, model := runner.disclosureIdentity(resumed.Run)
+	if agent != string(config.AgentVendorClaudeCode) {
+		t.Fatalf("disclosureIdentity agent = %q, want claude-code (preserved author)", agent)
+	}
+	if model != "sonnet" {
+		t.Fatalf("disclosureIdentity model = %q, want sonnet (preserved author)", model)
+	}
+}
+
 func TestCreateRunContextTreatsLegacyMarkerlessRunAsRetryable(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
