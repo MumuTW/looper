@@ -164,13 +164,15 @@ func TestModulePathMigration(t *testing.T) {
 // as an input. `git ls-files` runs in a child process, so without this read
 // staging a new tracked Go file would not invalidate a cached pass; tying the
 // cache key to the index contents keeps the documented test command from
-// silently reusing a stale result.
+// silently reusing a stale result. resolveGitIndex returns Git's effective
+// index path (honoring GIT_INDEX_FILE), so the read observes the same index
+// `git ls-files` reads rather than a hard-coded `<gitDir>/index`.
 func trackedGoFiles(root string) ([]string, error) {
-	gitDir, err := resolveGitDir(root)
+	indexPath, err := resolveGitIndex(root)
 	if err != nil {
 		return nil, err
 	}
-	if _, err := os.ReadFile(filepath.Join(gitDir, "index")); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if _, err := os.ReadFile(indexPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, fmt.Errorf("read git index: %w", err)
 	}
 
@@ -201,29 +203,71 @@ func trackedGoFiles(root string) ([]string, error) {
 	return files, nil
 }
 
-// resolveGitDir returns the absolute path to root's Git directory, or
-// errNotAGitRepo when root is not inside a Git worktree (for example an
-// exported source archive produced by `git archive`). errNotAGitRepo is
-// returned only after git actually ran and reported root is outside a
-// worktree; if the git executable cannot be started (absent from PATH, not
-// executable, ...) the execution failure is preserved so the caller fails the
-// guard loud instead of silently skipping it.
-func resolveGitDir(root string) (string, error) {
-	cmd := exec.Command("git", "-C", root, "rev-parse", "--absolute-git-dir")
-	cmd.Stderr = nil
+// resolveGitIndex returns the absolute path to Git's effective index file for
+// root, or errNotAGitRepo when root is not inside a Git worktree (for example
+// an exported source archive produced by `git archive`).
+//
+// Repository membership is decided in two stages so an exported archive can
+// skip without requiring the git executable:
+//   - root is checked for a `.git` entry first (a directory for a primary
+//     worktree, a file for a linked worktree's gitdir pointer). No `.git` means
+//     root is not a checkout, so errNotAGitRepo is returned without starting
+//     git; this lets the guard skip in minimal build environments where the Go
+//     toolchain is present but git is not installed.
+//   - When `.git` is present, git is the authority for the effective index
+//     path. `git rev-parse --git-path index` resolves GIT_INDEX_FILE (and the
+//     other index-selection environment), so the cache-tied read observes the
+//     same index `git ls-files` reads rather than a hard-coded `<gitDir>/index`.
+//
+// errNotAGitRepo is returned only for the actual nonrepository response: no
+// `.git` metadata, or git ran and reported root is outside a worktree. Any
+// other git failure — the executable cannot be started, or git started but
+// failed for an unrelated reason such as a malformed GIT_CONFIG_GLOBAL — is
+// preserved so the caller fails the guard loud instead of silently skipping.
+func resolveGitIndex(root string) (string, error) {
+	if !hasGitRepoMetadata(root) {
+		return "", errNotAGitRepo
+	}
+	cmd := exec.Command("git", "-C", root, "rev-parse", "--git-path", "index")
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
 	out, err := cmd.Output()
 	if err != nil {
 		var execErr *exec.Error
 		if errors.As(err, &execErr) {
-			return "", fmt.Errorf("git rev-parse --absolute-git-dir: %w", err)
+			return "", fmt.Errorf("git rev-parse --git-path index: %w", err)
 		}
+		if isNotAGitRepoMessage(stderr.String()) {
+			return "", errNotAGitRepo
+		}
+		return "", fmt.Errorf("git rev-parse --git-path index: %v: %s", err, stderr.String())
+	}
+	p := strings.TrimSpace(string(out))
+	if p == "" {
 		return "", errNotAGitRepo
 	}
-	dir := strings.TrimSpace(string(out))
-	if dir == "" {
-		return "", errNotAGitRepo
+	if !filepath.IsAbs(p) {
+		p = filepath.Join(root, p)
 	}
-	return filepath.Clean(dir), nil
+	return filepath.Clean(p), nil
+}
+
+// hasGitRepoMetadata reports whether root carries repository metadata, i.e. a
+// `.git` entry (a directory for a primary worktree, a file for a linked
+// worktree's gitdir pointer) at root itself. root is always a repository root
+// (see repoRoot), so an ancestor walk is unnecessary; an exported source
+// archive has no `.git` and is detected here without starting git.
+func hasGitRepoMetadata(root string) bool {
+	_, err := os.Stat(filepath.Join(root, ".git"))
+	return err == nil
+}
+
+// isNotAGitRepoMessage reports whether stderr is Git's canonical "not a git
+// repository" diagnostic, the only response that means root is outside a
+// worktree. Other failures (a malformed GIT_CONFIG_GLOBAL, ...) must not be
+// collapsed into this sentinel.
+func isNotAGitRepoMessage(stderr string) bool {
+	return strings.Contains(stderr, "not a git repository")
 }
 
 type legacyModulePathViolation struct {
@@ -671,19 +715,148 @@ func TestTrackedGoFilesPreservesGitExecFailure(t *testing.T) {
 }
 
 // TestTrackedGoFilesNotARepo verifies the scan authority fails closed with
-// errNotAGitRepo when root is genuinely outside a Git worktree (git ran and
-// reported as much), so the migration guard skips cleanly instead of requiring
-// VCS metadata. If git itself is unavailable the case is undecidable and skipped.
+// errNotAGitRepo when root is genuinely outside a Git worktree (no `.git`
+// metadata), so the migration guard skips cleanly instead of requiring VCS
+// metadata. Membership is decided from `.git` metadata, so this passes without
+// requiring the git executable to be installed.
 func TestTrackedGoFilesNotARepo(t *testing.T) {
-	if _, err := exec.LookPath("git"); err != nil {
-		t.Skipf("git unavailable; cannot determine non-repo behavior: %v", err)
-	}
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "go.mod"), []byte("module github.com/MumuTW/looper\n\ngo 1.24\n"), 0o644); err != nil {
 		t.Fatalf("write go.mod: %v", err)
 	}
 	if _, err := trackedGoFiles(root); !errors.Is(err, errNotAGitRepo) {
 		t.Fatalf("trackedGoFiles on non-repo = %v, want errNotAGitRepo", err)
+	}
+}
+
+// TestTrackedGoFilesSkipsArchiveWithoutGit verifies the combined archive and
+// missing-git scenario: an exported source archive (no `.git`) tested in a
+// minimal build environment where the Go toolchain is present but git is not
+// installed skips via errNotAGitRepo instead of failing, because membership is
+// decided from `.git` metadata before git is required.
+func TestTrackedGoFilesSkipsArchiveWithoutGit(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "go.mod"), []byte("module github.com/MumuTW/looper\n\ngo 1.24\n"), 0o644); err != nil {
+		t.Fatalf("write go.mod: %v", err)
+	}
+	t.Setenv("PATH", "")
+	if _, err := exec.LookPath("git"); err == nil {
+		t.Skip("git still resolvable with empty PATH; cannot simulate archive without git")
+	}
+	if _, err := trackedGoFiles(root); !errors.Is(err, errNotAGitRepo) {
+		t.Fatalf("trackedGoFiles on archive without git = %v, want errNotAGitRepo", err)
+	}
+}
+
+// TestTrackedGoFilesFailsLoudOnGitConfigError verifies that when root is a real
+// checkout but git starts and fails for an unrelated reason (a malformed
+// GIT_CONFIG_GLOBAL), the failure is preserved instead of being collapsed into
+// errNotAGitRepo, so the migration guard fails loud rather than silently
+// skipping. Only the actual "not a git repository" response is the sentinel.
+func TestTrackedGoFilesFailsLoudOnGitConfigError(t *testing.T) {
+	root := t.TempDir()
+	for _, args := range [][]string{
+		{"init"},
+		{"config", "user.email", "test@example.com"},
+		{"config", "user.name", "test"},
+	} {
+		cmd := exec.Command("git", append([]string{"-C", root}, args...)...)
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		if err := cmd.Run(); err != nil {
+			t.Skipf("git %v unavailable in this environment: %v %s", args, err, stderr.String())
+		}
+	}
+	trackedRel := filepath.Join("cmd", "looperd", "main.go")
+	if err := os.MkdirAll(filepath.Join(root, filepath.Dir(trackedRel)), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, trackedRel), []byte("package main\n"), 0o644); err != nil {
+		t.Fatalf("write tracked file: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "go.mod"), []byte("module github.com/MumuTW/looper\n\ngo 1.24\n"), 0o644); err != nil {
+		t.Fatalf("write go.mod: %v", err)
+	}
+	for _, args := range [][]string{
+		{"add", trackedRel, "go.mod"},
+		{"commit", "--no-gpg-sign", "-m", "seed"},
+	} {
+		cmd := exec.Command("git", append([]string{"-C", root}, args...)...)
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		if err := cmd.Run(); err != nil {
+			t.Fatalf("git %v: %v %s", args, err, stderr.String())
+		}
+	}
+
+	// A malformed global config makes `git rev-parse` report a config error
+	// (exit 128) rather than "not a git repository"; the guard must preserve it.
+	badConfig := filepath.Join(t.TempDir(), "badconfig")
+	if err := os.WriteFile(badConfig, []byte("this is not = valid\n[[[[\n"), 0o644); err != nil {
+		t.Fatalf("write bad config: %v", err)
+	}
+	t.Setenv("GIT_CONFIG_GLOBAL", badConfig)
+	_, err := trackedGoFiles(root)
+	if errors.Is(err, errNotAGitRepo) {
+		t.Fatalf("trackedGoFiles masked a git config error as errNotAGitRepo; unexpected git failures must be preserved: %v", err)
+	}
+	if err == nil {
+		t.Fatalf("trackedGoFiles unexpectedly succeeded with malformed git config")
+	}
+}
+
+// TestResolveGitIndexRespectsGitIndexFile verifies resolveGitIndex returns
+// Git's effective index path, honoring GIT_INDEX_FILE, so the cache-tied read
+// observes the same index `git ls-files` reads rather than a hard-coded
+// `<gitDir>/index`.
+func TestResolveGitIndexRespectsGitIndexFile(t *testing.T) {
+	root := t.TempDir()
+	for _, args := range [][]string{
+		{"init"},
+		{"config", "user.email", "test@example.com"},
+		{"config", "user.name", "test"},
+	} {
+		cmd := exec.Command("git", append([]string{"-C", root}, args...)...)
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		if err := cmd.Run(); err != nil {
+			t.Skipf("git %v unavailable in this environment: %v %s", args, err, stderr.String())
+		}
+	}
+	trackedRel := filepath.Join("cmd", "looperd", "main.go")
+	if err := os.MkdirAll(filepath.Join(root, filepath.Dir(trackedRel)), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, trackedRel), []byte("package main\n"), 0o644); err != nil {
+		t.Fatalf("write tracked file: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "go.mod"), []byte("module github.com/MumuTW/looper\n\ngo 1.24\n"), 0o644); err != nil {
+		t.Fatalf("write go.mod: %v", err)
+	}
+	for _, args := range [][]string{
+		{"add", trackedRel, "go.mod"},
+		{"commit", "--no-gpg-sign", "-m", "seed"},
+	} {
+		cmd := exec.Command("git", append([]string{"-C", root}, args...)...)
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		if err := cmd.Run(); err != nil {
+			t.Fatalf("git %v: %v %s", args, err, stderr.String())
+		}
+	}
+
+	altIndex := filepath.Join(t.TempDir(), "alt-index")
+	if err := os.WriteFile(altIndex, []byte("alternate index\n"), 0o644); err != nil {
+		t.Fatalf("write alt index: %v", err)
+	}
+	t.Setenv("GIT_INDEX_FILE", altIndex)
+
+	got, err := resolveGitIndex(root)
+	if err != nil {
+		t.Fatalf("resolveGitIndex: %v", err)
+	}
+	if want := filepath.Clean(altIndex); got != want {
+		t.Fatalf("resolveGitIndex = %q, want effective index %q (GIT_INDEX_FILE)", got, want)
 	}
 }
 
