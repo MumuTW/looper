@@ -335,8 +335,10 @@ behavior change).
 
 Preserve the fallback at the **consumption boundary**, not at every production
 site. Add `failureclass.Normalize(kind Kind) Kind` to
-`internal/loops/failureclass`, returning each known kind unchanged and any
-unrecognized kind as `NonRetryable`, and normalize `failure.kind` once at each
+`internal/loops/failureclass`, returning each inventoried pass-through kind
+unchanged (membership tested against a package-level `passThroughKinds` inventory
+— today the four known kinds — described below) and any unrecognized kind as
+`NonRetryable`, and normalize `failure.kind` once at each
 runner's queue-failure consumption boundary — the point where the `loopError`'s
 `kind` is first read for a retry decision, breaker check, resume-policy
 derivation, or persistence — before any such read. The four runner paths
@@ -393,23 +395,42 @@ boundary already does.
 status predicates support it is contained to `NonRetryable` — the safe default —
 rather than passing through to predicates that fall through as unknown. To give
 a new kind distinct behavior, the implementer must extend `Normalize` to preserve
-it **and** update every runner's predicates in the same change; the per-runner
-downstream-predicate contract cases (Validation step 6) are extended to cover
-the new pass-through kind in each runner's retry, hold, notification, status,
-and persistence predicates — not only the `classifyFailure*` functions, which
+it **and** update every runner's predicates in the same change. The pass-through
+set is a single, named inventory so those two edits cannot drift apart:
+`Normalize` consults a package-level `passThroughKinds []Kind` (today the four
+known kinds) and returns the input unchanged when it is a member, otherwise
+`NonRetryable`; an exported `failureclass.PassThroughKinds() []Kind` returns a
+copy of that same inventory. The per-runner downstream-predicate contract cases
+(Validation step 6) do not hard-code the four kinds — they iterate over
+`failureclass.PassThroughKinds()`, so adding a kind to `passThroughKinds` is the
+single opt-in edit that simultaneously makes `Normalize` pass it through **and**
+enters a row for it in every runner's retry, hold, notification, status, and
+persistence predicate table — not only the `classifyFailure*` functions, which
 return the kind correctly while a predicate that consumes it can still fall
-through — so a predicate that does not handle the new kind is caught. This is
-the "authority constants remain normalized to `NonRetryable` until consumers
-explicitly opt in" contract: `Normalize` is the authority for "this kind is
-supported," and a constant is only pass-through after the consumers that act on
-it have been updated. No enumeration assertion forces `Normalize(c) == c` for
-every authority constant — that would defeat the fallback by requiring
-pass-through the moment a constant is added, letting a partially rolled-out kind
-reach predicates that treat it as unknown (see Validation step 6).
+through — so a runner predicate that does not handle the newly pass-through kind
+fails in the runner that contains it, and the kind may not be opted in until
+every runner's table covers it. This is the "authority constants remain
+normalized to `NonRetryable` until consumers explicitly opt in" contract:
+`Normalize` is the authority for "this kind is supported," and a constant is only
+pass-through after the consumers that act on it have been updated — the inventory
+is the single place that records the opt-in, shared by `Normalize` and every
+runner's downstream-predicate test. No enumeration assertion forces
+`Normalize(c) == c` for every authority constant — that would defeat the
+fallback by requiring pass-through the moment a constant is added, letting a
+partially rolled-out kind reach predicates that treat it as unknown (see
+Validation step 6); the inventory is the explicitly maintained pass-through
+*subset*, not the set of all authority constants, so adding a fifth authority
+constant alone does not enter it.
 
-Add a focused test in `internal/loops/failureclass` asserting that the four
-known kinds pass through `Normalize` unchanged and that an unknown `Kind`
-normalizes to `NonRetryable`. The boundary normalization itself is **not**
+Add a focused test in `internal/loops/failureclass` that iterates over
+`PassThroughKinds()` asserting each inventoried kind passes through `Normalize`
+unchanged, and that an unknown `Kind` (a value outside that inventory)
+normalizes to `NonRetryable`. Deriving the pass-through cases from the same
+inventory `Normalize` consults keeps the unit test and the authority in one
+place: a kind added to `passThroughKinds` is automatically asserted as a
+fixed point here too, and a kind removed from the inventory is automatically
+asserted to fall back to `NonRetryable`. The boundary normalization itself is
+**not**
 covered only by the four-kind per-runner classification tests and alias-identity
 tests in Validation step 6: those assert each runner's persisted kind and retry
 decision for each *known* kind, and every known kind is a fixed point of
@@ -781,17 +802,33 @@ above is updated to drop that case, the unchanged `internal/agent` test and
 prompt still pass while agents are instructed to emit a value the fixer
 rejects. The implementation therefore retains a fixer-package contract test
 (in `internal/fixer/runner_repair_outcome_test.go`) asserting every advertised
-bullet is accepted by the parser: for each value in
-`{string(policy.RetryableTransient), string(policy.ManualIntervention)}` — the
-advertised subset the `internal/agent` builder derives, referenced from the
-same `policy` constants so the advertised subset and the parser-acceptance
-check share one definition — `parseFixerBlockedFailureKind(value)` returns
-`(<kind>, true)`, so a parser that drops an advertised kind fails in the fixer
-package even when the agent test and prompt are unchanged. This is the
-advertised-subset ⊆ parser-allowlist contract the deleted cross-component
-test's prompt-sync half enforced; the rename-drift half is compile-time, but
-the membership half stays asserted because the parser's switch is the authority
-for "this advertised value is honored," not the shared constant import.
+bullet is accepted by the parser. The test derives its loop set from the prompt
+the builder actually produces, not from a separately hard-coded two-value set:
+it calls `agent.AppendFixerCompletionInstruction` (the same builder the fixer's
+production call site at `runner.go:7307` uses — `internal/fixer` already imports
+`internal/agent` in production, so this adds no dependency edge), parses every
+advertised bullet token out of the produced prompt using the same
+`- "<value>":` form the `internal/agent` unit test above parses (a leading
+`- `, a double-quoted value, then `:`), and for each parsed advertised value
+asserts `parseFixerBlockedFailureKind(value)` returns `(<kind>, true)`. Because
+the loop set is the prompt's actual advertised bullets, if the builder later
+advertises a third `policy` kind — and the `internal/agent` unit test's expected
+set is updated to admit it — this fixer test automatically gains a row for the
+new advertised value and fails if `parseFixerBlockedFailureKind` rejects the new
+bullet, the exact cross-component regression the test claims to prevent; a
+hard-coded two-value set would keep checking only the original two values and
+pass while agents are instructed to emit a value the fixer rejects. A parser
+that drops an advertised kind fails in the fixer package even when the agent
+test and prompt are unchanged, because the still-advertised bullet is parsed and
+the dropped parser case returns `(_, false)`; a builder that stops advertising a
+kind is caught by the `internal/agent` unit test's set-equality assertion, and
+that kind's parser acceptance stays directly asserted by the focused
+`parseFixerBlockedFailureKind` test below. This is the advertised-subset ⊆
+parser-allowlist contract the deleted cross-component test's prompt-sync half
+enforced; the rename-drift half is compile-time (both sides import the same
+`policy` constants), but the membership half stays asserted against the prompt's
+own advertised set because the parser's switch is the authority for "this
+advertised value is honored," not the shared constant import.
 
 ## Alternatives considered
 
@@ -1083,7 +1120,7 @@ Infra signals remain for drift detection, not authority.
 - `internal/worker/runner.go` — delete `QueueFailureKind` + delete `workerFailureKind` + `s/QueueFailureKind/failureclass.Kind/` + call-site edits, including Step 2's boundary normalization at each failure-handling entry point.
 - `internal/planner/runner.go` — delete `QueueFailureKind` + delete `plannerFailureKind` + `s/QueueFailureKind/failureclass.Kind/` + call-site edits, including Step 2's boundary normalization at each failure-handling entry point.
 - `internal/runtime/scheduler.go` — `workerRunCompletedNotificationInput.FailureKind` becomes `failureclass.Kind` (the one `QueueFailureKind` reference here).
-- `internal/loops/failureclass/failureclass.go` — add `Normalize(kind Kind) Kind` (the authority for the unknown-kind fallback); add the `internal/loops/policy` import and alias `type Kind = policy.Kind` and re-export the four typed constants from `policy` at compile time (Step 5), deleting the second spelling rather than pinning it by test; `Classify` logic and public API unchanged.
+- `internal/loops/failureclass/failureclass.go` — add `Normalize(kind Kind) Kind` (the authority for the unknown-kind fallback), backed by a package-level `passThroughKinds []Kind` inventory (today the four known kinds) that `Normalize` consults for membership, plus an exported `PassThroughKinds() []Kind` returning a copy of that inventory so the per-runner downstream-predicate tests and the `Normalize` unit test (Validation step 6) iterate over the single pass-through set rather than a hard-coded four-kind table; add the `internal/loops/policy` import and alias `type Kind = policy.Kind` and re-export the four typed constants from `policy` at compile time (Step 5), deleting the second spelling rather than pinning it by test; `Classify` logic and public API unchanged.
 - `internal/loops/policy/policy.go` — add the two missing untyped `FailureKind*` string constants so the leaf owns all four string values; add `type Kind string` and the four typed `Kind` constants derived from the untyped ones (Step 5); no predicate changes (the untyped constants stay for the `string`-parameter functions).
 - `internal/loops/policy.go` (umbrella) — re-export the two new untyped `FailureKind*` constants, the `Kind` type alias, and the four typed constants, keeping the "re-exports every name here" contract (Step 5).
 - `internal/validation/validation.go` — delete the three `FailureKind*`
@@ -1164,7 +1201,8 @@ test in each of the four runner packages that compares all four local
 against their shared `failureclass.*` constants, so a mis-paired re-export is
 caught in the role that contains it rather than only in aggregate. It also adds,
 in each of the four runner packages, the per-runner downstream-predicate
-contract cases over every `Normalize` pass-through kind (covering the retry,
+contract cases over every `Normalize` pass-through kind (derived from
+`failureclass.PassThroughKinds()`, covering the retry,
 hold, notification, status, and persistence predicates, not only
 `classifyFailure*`) and the per-runner boundary-normalization contract test
 that injects an unknown kind through the queue-failure consumption boundary and
@@ -1202,9 +1240,11 @@ parser's backward-compatible-acceptance promise and is not subsumed by the
 advertised set). The deleted rename-drift half does not carry the
 advertised-subset ⊆ parser-allowlist *membership* contract — importing the same
 constants does not enforce the parser's switch still accepts every advertised
-value — so a fixer-package contract test is retained that imports
-`internal/loops/policy` and asserts `parseFixerBlockedFailureKind` accepts
-every advertised value (`policy.RetryableTransient`, `policy.ManualIntervention`),
+value — so a fixer-package contract test is retained that calls
+`agent.AppendFixerCompletionInstruction`, parses the advertised bullet tokens
+out of the produced prompt, and asserts `parseFixerBlockedFailureKind` accepts
+each parsed advertised value (deriving the loop set from the prompt rather than
+a hard-coded two-value set, so a third advertised kind is checked automatically),
 so a parser that drops an advertised kind fails even when the agent test and
 prompt are unchanged (Step 6, Validation step 9). The unit test does not import
 `failureclass`, keeping `go test ./internal/agent` free of the
@@ -1328,48 +1368,60 @@ Per `AGENTS.md`, the root commands are the source of truth:
    `internal/reviewer/failure_classification_test.go`), plus a test for
    `failureclass.Normalize` covering the four known kinds (each passes through
    unchanged) and an unknown kind (normalizes to `NonRetryable`). No
-   pass-through enumeration assertion is added: an assertion that forced
-   `Normalize(c) == c` for every authority `policy.Kind`/`failureclass.Kind`
-   constant would defeat the unknown-kind fallback — the moment a fifth
-   constant is added the test would require `Normalize` to pass it through,
-   letting a partially rolled-out kind reach the runners' retry, hold,
-   notification, and status predicates (e.g. `isQueueRetryEligible`/
-   `shouldRetryQueueFailure`) that still fall through as unknown. `Normalize`
-   instead defaults an unrecognized kind to `NonRetryable`, so a new authority
-   constant is contained to the safe default until consumers explicitly opt in:
-   to give a new kind distinct behavior, the implementer extends `Normalize` to
-   preserve it **and** updates every runner's predicates in the same change,
-   extending the per-runner downstream-predicate contract cases below to cover
-   the new pass-through kind in each runner so a predicate that does not handle
-   it is caught. This is the "authority constants remain normalized to
-   `NonRetryable` until consumers explicitly opt in" contract (Step 2):
-   `Normalize` is the authority for "this kind is supported," and a constant is
-   only pass-through after the consumers that act on it have been updated — not
-   the moment it is declared. This is the regression net the refactor relies on;
-   it must exist before the conversion functions are deleted.
+   pass-through enumeration assertion is added over *all authority constants*:
+   an assertion that forced `Normalize(c) == c` for every authority
+   `policy.Kind`/`failureclass.Kind` constant would defeat the unknown-kind
+   fallback — the moment a fifth constant is added the test would require
+   `Normalize` to pass it through, letting a partially rolled-out kind reach the
+   runners' retry, hold, notification, and status predicates (e.g.
+   `isQueueRetryEligible`/`shouldRetryQueueFailure`) that still fall through as
+   unknown. `Normalize` instead defaults an unrecognized kind to `NonRetryable`,
+   so a new authority constant is contained to the safe default until consumers
+   explicitly opt in: to give a new kind distinct behavior, the implementer adds
+   it to the `passThroughKinds` inventory (Step 2), which makes `Normalize`
+   preserve it **and** — because the per-runner downstream-predicate contract
+   cases below iterate over `failureclass.PassThroughKinds()` rather than a
+   hard-coded four-kind table — automatically enters a row for the new
+   pass-through kind in each runner so a predicate that does not handle it is
+   caught. This is the "authority constants remain normalized to `NonRetryable`
+   until consumers explicitly opt in" contract (Step 2): `Normalize` is the
+   authority for "this kind is supported," and a constant is only pass-through
+   after the consumers that act on it have been updated — not the moment it is
+   declared. The inventory is the explicitly maintained pass-through *subset*
+   (not the set of all authority constants), so the per-runner tables track the
+   pass-through set exactly: a fifth authority constant added without being
+   opted into the inventory stays contained to `NonRetryable` and adds no runner
+   row, while opting it into the inventory adds a runner row in every package
+   without a separate edit to each test. This is the regression net the refactor
+   relies on; it must exist before the conversion functions are deleted.
 
    The four-kind classification tests above exercise `classifyFailure*`, which
    produces the kind — they do not exercise the retry, hold, notification,
    status, and persistence predicates that *consume* it. A fifth kind can
-   therefore be added to `Normalize` and returned correctly by every classifier
-   while one runner's `shouldRetryQueueFailure` (or another downstream
-   predicate) still falls through, with the classification net green. The
-   implementation therefore adds, in each of the four runner packages
+   therefore be made pass-through in `Normalize` and returned correctly by every
+   classifier while one runner's `shouldRetryQueueFailure` (or another
+   downstream predicate) still falls through, with the classification net green.
+   The implementation therefore adds, in each of the four runner packages
    (`internal/{fixer,reviewer,worker,planner}`), per-runner downstream-predicate
-   contract cases over **every `Normalize` pass-through kind** — each of the four
-   known kinds today, and any kind a later change makes pass-through before it
-   may be opted in: for each pass-through kind, the case asserts the runner's
-   retry predicate (`isQueueRetryEligible`/`shouldRetryQueueFailure`), the
-   fixer breaker's manual-kind check (`failQueueItemWithBreaker`, fixer only),
-   the resume-policy derivation (`NormalizeResumePolicy`/
-   `NextResumePolicyOnFailure`), the notification/status predicates
-   (`shouldNotifyCompletedRun`/`issueClaimStatusForFailure`, where present), and
-   queue/checkpoint persistence (`failQueueItem`/`failQueueItemTerminal`/
-   `requeueQueueItem`/`ProcessResult.FailureKind`/`FixerOutcomeFailure.Kind`)
-   each handle the kind rather than fall through to an unintended default. A
-   predicate that silently drops a pass-through kind is caught in the runner
-   that contains it, so a new kind may not be opted in (made pass-through in
-   `Normalize`) until every runner's downstream-predicate cases cover it.
+   contract cases over **every `Normalize` pass-through kind**, derived by
+   iterating over `failureclass.PassThroughKinds()` rather than a hard-coded
+   four-kind table — so the four known kinds today are covered, and any kind a
+   later change opts into the `passThroughKinds` inventory automatically enters
+   every runner's table before it may be opted in: for each pass-through kind,
+   the case asserts the runner's retry predicate
+   (`isQueueRetryEligible`/`shouldRetryQueueFailure`), the fixer breaker's
+   manual-kind check (`failQueueItemWithBreaker`, fixer only), the resume-policy
+   derivation (`NormalizeResumePolicy`/`NextResumePolicyOnFailure`), the
+   notification/status predicates (`shouldNotifyCompletedRun`/
+   `issueClaimStatusForFailure`, where present), and queue/checkpoint
+   persistence (`failQueueItem`/`failQueueItemTerminal`/`requeueQueueItem`/
+   `ProcessResult.FailureKind`/`FixerOutcomeFailure.Kind`) each handle the kind
+   rather than fall through to an unintended default. A predicate that silently
+   drops a pass-through kind is caught in the runner that contains it, so a new
+   kind may not be opted in (added to `passThroughKinds`) until every runner's
+   downstream-predicate cases cover it — the single inventory edit is what makes
+   the new kind pass-through and what propagates the new row, so the two cannot
+   drift apart.
 
    The classification tests and alias-identity tests below assert each runner's
    persisted kind and retry decision for each *known* kind, and every known kind
@@ -1493,14 +1545,18 @@ Per `AGENTS.md`, the root commands are the source of truth:
    value, so a parser that drops an advertised kind (and updates its own focused
    test) leaves the agent test and prompt green while agents emit a value the
    fixer rejects. The implementation therefore retains a fixer-package contract
-   test (in `internal/fixer/runner_repair_outcome_test.go`) that imports
-   `internal/loops/policy` and asserts `parseFixerBlockedFailureKind` accepts
-   every advertised value — for each value in
-   `{string(policy.RetryableTransient), string(policy.ManualIntervention)}`,
+   test (in `internal/fixer/runner_repair_outcome_test.go`) that calls
+   `agent.AppendFixerCompletionInstruction`, parses every advertised bullet token
+   (each `- "<value>":` line) out of the produced prompt, and asserts
+   `parseFixerBlockedFailureKind` accepts each parsed advertised value — for
+   each advertised value parsed from the prompt,
    `parseFixerBlockedFailureKind(value)` returns `(<kind>, true)` — so the
-   advertised subset and the parser-acceptance check share one definition and a
-   parser that drops an advertised kind fails in the fixer package even when the
-   agent test and prompt are unchanged.
+   parser-acceptance check derives its loop set from the prompt the builder
+   actually produces (not a separately hard-coded two-value set), and a parser
+   that drops an advertised kind fails in the fixer package even when the agent
+   test and prompt are unchanged; if the builder later advertises a third
+   `policy` kind, this test automatically gains a row for it and fails if the
+   parser rejects the new advertised bullet.
 
 **Definition of done:** `QueueFailureKind` is gone from all four runners (the 60
 type-name references replaced by `failureclass.Kind`), the four `xxxFailureKind`
@@ -1545,7 +1601,8 @@ until consumers explicitly opt in (no enumeration assertion forces
 the
 four-kind regression coverage above exists — including the per-runner
 downstream-predicate contract cases over every `Normalize` pass-through kind
-(retry, hold, notification, status, and persistence predicates, not only
+(derived from `failureclass.PassThroughKinds()`;
+retry, hold, notification, status, and persistence predicates, not only
 `classifyFailure*`) and the per-runner boundary-normalization contract test
 that injects an unknown kind through each runner's queue-failure consumption
 boundary and asserts it reaches those predicates as `NonRetryable` — the
@@ -1563,7 +1620,8 @@ rename-drift half deleted (now compile-time), its
 fixer-package test so the parser's `retryable_after_resume` backward-compatible
 acceptance stays directly asserted, and its advertised-subset ⊆
 parser-allowlist membership contract retained as a fixer-package contract test
-that imports `policy` and asserts the parser accepts every advertised value —
+that parses the prompt `AppendFixerCompletionInstruction` produces and asserts
+the parser accepts every advertised value —
 the full `go test ./...` suite is green, and the diff contains no
 changes to `workflow.Step` types, `failureclass.Classify` logic, or
 `NormalizeResumePolicy` behavior.
