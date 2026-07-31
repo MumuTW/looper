@@ -37,6 +37,20 @@ func Sequence() []Step {
 	return slices.Clone(sequence)
 }
 
+// Reaches reports whether the pipeline from start reaches target — i.e. target
+// is at or after start in the ordered sequence. An unrecognized (or empty) start
+// returns the full sequence, so Reaches returns true when target is a real step
+// (a fresh run reaches every step). The runner uses this to decide whether a
+// resume will replay an agent step (the agent step is a runner-owned concept).
+func Reaches(start, target Step) bool {
+	for _, step := range From(start) {
+		if step == target {
+			return true
+		}
+	}
+	return false
+}
+
 // From returns the step sequence starting at start. An unrecognized (or
 // empty) start step returns the full sequence — start index defaults to 0
 // when no match is found, matching the historical stepsFrom behavior. Like

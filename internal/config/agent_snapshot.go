@@ -117,17 +117,30 @@ func ResolveRunAgentSnapshotJSON(predecessorSnapshot *string, sticky bool, vendo
 // When sticky and requireToolNetworkDenial is true, a predecessor snapshot whose
 // vendor cannot deny tool network access is abandoned in favor of a fresh
 // snapshot built from the current role identity — but only when the current
-// role vendor CAN serve the gate. Without this refresh, switching the role
-// vendor to a supported one and retrying would keep spawning the unsupported
-// snapshotted vendor (the snapshot is execution authority) and repeat the same
-// permanent hold; the sticky-identity contract would defeat the recovery action
-// the spawn diagnostic recommends, leaving the operator to disable the gate or
+// role vendor CAN serve the gate AND the resume will actually replay an agent
+// step (replaysAgentStep). Without this refresh, switching the role vendor to a
+// supported one and retrying would keep spawning the unsupported snapshotted
+// vendor (the snapshot is execution authority) and repeat the same permanent
+// hold; the sticky-identity contract would defeat the recovery action the
+// spawn diagnostic recommends, leaving the operator to disable the gate or
 // abandon the lineage.
+//
+// replaysAgentStep gates the refresh because the snapshot is also the disclosure
+// authority: PR/issue stamps derive from it via disclosureIdentity. When a
+// resume advances past the agent step (e.g. a worker predecessor whose
+// LastCompletedStep is "execute" resumes at "validate"), no agent process runs
+// under the gate, so refreshing the snapshot would only rewrite disclosure
+// identity — publishing the predecessor's authored changes stamped as the
+// current vendor's. The predecessor snapshot is preserved in that case so
+// attribution stays with the author that actually ran. The caller is the
+// authority for replaysAgentStep: it knows the workflow's agent step and
+// whether the resume start step reaches it.
 //
 // Authority: the current role vendor (operator/config policy captured at run
 // create) is the authority for the refresh, not the agent's structured output.
 // The predecessor snapshot is abandoned only when it is structurally
-// incompatible with the configured gate; otherwise stickiness is preserved.
+// incompatible with the configured gate AND an agent will replay; otherwise
+// stickiness is preserved.
 //
 // Trade-off: refreshing abandons the predecessor's native-resume session, but
 // the predecessor vendor cannot spawn under the gate anyway, so native resume
@@ -144,8 +157,8 @@ func ResolveRunAgentSnapshotJSON(predecessorSnapshot *string, sticky bool, vendo
 //
 // refreshed is true when the predecessor snapshot was replaced; legacyResume is
 // true when continuing a predecessor that had no snapshot (pre-migration).
-func ResolveRunAgentSnapshotJSONForValidationGate(predecessorSnapshot *string, sticky, requireToolNetworkDenial bool, vendor string, model *string, profileID string) (snapshotJSON *string, refreshed, legacyResume bool, err error) {
-	if sticky && requireToolNetworkDenial && predecessorSnapshot != nil {
+func ResolveRunAgentSnapshotJSONForValidationGate(predecessorSnapshot *string, sticky, requireToolNetworkDenial, replaysAgentStep bool, vendor string, model *string, profileID string) (snapshotJSON *string, refreshed, legacyResume bool, err error) {
+	if sticky && requireToolNetworkDenial && replaysAgentStep && predecessorSnapshot != nil {
 		if trimmed := strings.TrimSpace(*predecessorSnapshot); trimmed != "" {
 			predecessor, parseErr := ParseAgentSnapshot(trimmed)
 			if parseErr != nil {
