@@ -1102,59 +1102,6 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 	return r.persist(ctx, report)
 }
 
-// observeReviewProvenance reads who reviewed this pull request and who refused
-// to.
-//
-// It never returns an error, and that is deliberate rather than lax: Gatekeeper
-// is observe-only, so an observation must not be able to move a pull request
-// from eligible to blocked. A forge that will not answer yields
-// ReviewProvenanceUnknown, which the enumeration excludes — the record says it
-// does not know instead of saying nobody reviewed.
-//
-// It costs two forge reads per full evaluation. The review list is REST because
-// only REST classifies the reviewer's account, and the comment list is where a
-// refusal lives, because a refusal is not a review and the forge files it
-// nowhere else. Both are skipped entirely for a pull request whose fingerprint
-// is unchanged.
-//
-// The two reads fail differently, because they answer different questions. The
-// review list is the whole of `reviewed`; comments only separate `refused` from
-// `absent`, and only when nothing was reviewed. So a comment read that fails
-// after the reviews came back keeps what those reviews already settled —
-// discarding a list of named reviewers because a later call timed out would
-// throw away evidence Looper is holding.
-func (r *Runner) observeReviewProvenance(ctx context.Context, input EvaluationInput) ReviewProvenance {
-	unknown := ReviewProvenance{Status: ReviewProvenanceUnknown, Reviewers: []ReviewerObservation{}, Refusals: []ReviewRefusal{}}
-	reviews, err := r.github.ListPullRequestReviews(ctx, githubinfra.ViewPullRequestInput{
-		Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD,
-	})
-	if err != nil {
-		r.warnReviewProvenance(input, "reviews", err)
-		return unknown
-	}
-	observed := reviewsObservedFrom(reviews)
-	comments, err := r.github.ListIssueCommentsContaining(ctx, githubinfra.ViewIssueInput{
-		Repo: input.Repo, IssueNumber: input.PRNumber, CWD: input.CWD,
-	}, RefusalCommentMarkers())
-	if err != nil {
-		r.warnReviewProvenance(input, "comments", err)
-		if observed.CompletedReviews > 0 {
-			return observed
-		}
-		return unknown
-	}
-	return withRefusalsFrom(observed, comments)
-}
-
-func (r *Runner) warnReviewProvenance(input EvaluationInput, subject string, err error) {
-	if r.logWarn == nil {
-		return
-	}
-	r.logWarn("gatekeeper: could not observe review provenance", map[string]any{
-		"repo": input.Repo, "pr": input.PRNumber, "subject": subject, "error": err.Error(),
-	})
-}
-
 func (r *Runner) projectCWD(ctx context.Context, projectID string) string {
 	if r == nil || r.repos == nil || r.repos.Projects == nil || strings.TrimSpace(projectID) == "" {
 		return ""
@@ -1548,6 +1495,11 @@ func (r *Runner) persist(ctx context.Context, report Report) (Report, error) {
 	// empty-fingerprint pending record.
 	if err := r.appendGateReportAt(ctx, report, entityType, entityID, r.now().Add(time.Millisecond)); err != nil {
 		return Report{}, fmt.Errorf("persist gate report: %w", err)
+	}
+	if err := r.reconcileRoutingLabels(ctx, report, previous); err != nil && r.logWarn != nil {
+		r.logWarn("gatekeeper: could not reconcile routing labels", map[string]any{
+			"repo": report.Repo, "pr": report.PRNumber, "error": err.Error(),
+		})
 	}
 	// The owned comment is reconciled after the durable report: the report is the
 	// record, the comment is a convenience for whoever is deciding. A forge that
