@@ -44,7 +44,9 @@ type upgradePreflight struct {
 type upgradeStatus struct {
 	Service struct {
 		Healthy        bool                  `json:"healthy"`
+		Version        string                `json:"version"`
 		AdmissionState string                `json:"admissionState"`
+		StartedAt      *string               `json:"startedAt"`
 		Build          version.BuildMetadata `json:"build"`
 		Recovery       struct {
 			Outstanding struct {
@@ -69,9 +71,33 @@ type upgradeDaemonVersion struct {
 	Build   version.BuildMetadata `json:"build"`
 }
 
+type upgradeProjects struct {
+	Items []struct {
+		ID string `json:"id"`
+	} `json:"items"`
+}
+
+type upgradeEvents struct {
+	Items []struct {
+		EventType string `json:"eventType"`
+	} `json:"items"`
+}
+
+type upgradePostStartReport struct {
+	ExpectedBuild   version.Info  `json:"expectedBuild"`
+	ExpectedRelease string        `json:"expectedRelease"`
+	DaemonBuild     version.Info  `json:"daemonBuild"`
+	CurrentRelease  string        `json:"currentRelease"`
+	Status          upgradeStatus `json:"status"`
+	ProjectCount    int           `json:"projectCount"`
+	StartedEvent    bool          `json:"startedEvent"`
+	Verified        bool          `json:"verified"`
+	Blocks          []string      `json:"blocks"`
+}
+
 func runUpgrade(ctx context.Context, global, operands []string, stdout interface{ Write([]byte) (int, error) }) error {
 	if len(operands) == 0 {
-		return badUsage("upgrade requires activate-release, backup, drain, preflight, stage-release, or verify")
+		return badUsage("upgrade requires activate-release, backup, drain, preflight, stage-release, verify, or verify-start")
 	}
 	if operands[0] == "backup" {
 		if len(operands) != 1 {
@@ -119,8 +145,15 @@ func runUpgrade(ctx context.Context, global, operands []string, stdout interface
 		}
 		return runUpgradeActivateRelease(ctx, root, releaseID, stdout)
 	}
+	if operands[0] == "verify-start" {
+		root, releaseID, err := parseUpgradeActivateReleaseArgs(operands[1:])
+		if err != nil {
+			return err
+		}
+		return runUpgradeVerifyStart(ctx, global, root, releaseID, stdout)
+	}
 	if operands[0] != "preflight" {
-		return badUsage("upgrade requires activate-release, backup, drain, preflight, stage-release, or verify")
+		return badUsage("upgrade requires activate-release, backup, drain, preflight, stage-release, verify, or verify-start")
 	}
 	targetLooper, targetLooperd, jsonOutput, err := parseUpgradePreflightArgs(operands[1:])
 	if err != nil {
@@ -357,6 +390,102 @@ func runUpgradeActivateRelease(ctx context.Context, root, releaseID string, stdo
 		return err
 	}
 	return writeVersionJSON(stdout, result)
+}
+
+func runUpgradeVerifyStart(ctx context.Context, global []string, root, releaseID string, stdout interface{ Write([]byte) (int, error) }) error {
+	staged, err := upgraderelease.Verify(root, releaseID)
+	if err != nil {
+		return err
+	}
+	if err := releaseCandidateAllowed(staged.Manifest.Build); err != nil {
+		return err
+	}
+	if err := verifyStagedReleaseIdentity(ctx, staged); err != nil {
+		return err
+	}
+	currentRelease, err := upgraderelease.CurrentReleaseID(root)
+	if err != nil {
+		return err
+	}
+	cfg, err := loadConfig(global)
+	if err != nil {
+		return err
+	}
+	remote, err := requestJSON[upgradeDaemonVersion](ctx, cfg, "GET", "/api/v1/version", nil)
+	if err != nil {
+		return err
+	}
+	status, err := requestJSON[upgradeStatus](ctx, cfg, "GET", "/api/v1/status", nil)
+	if err != nil {
+		return err
+	}
+	projects, err := requestJSON[upgradeProjects](ctx, cfg, "GET", "/api/v1/projects", nil)
+	if err != nil {
+		return err
+	}
+	events, err := requestJSON[upgradeEvents](ctx, cfg, "GET", "/api/v1/events/notification/looperd", nil)
+	if err != nil {
+		return err
+	}
+	daemon := version.Info{Version: remote.Version, Metadata: remote.Build}
+	report := upgradePostStartReport{ExpectedBuild: staged.Manifest.Build, ExpectedRelease: releaseID, DaemonBuild: daemon, CurrentRelease: currentRelease, Status: status, ProjectCount: len(projects.Items), StartedEvent: containsUpgradeEvent(events, "looperd.started")}
+	report.Blocks = upgradePostStartBlocks(report)
+	report.Verified = len(report.Blocks) == 0
+	if err := writeVersionJSON(stdout, report); err != nil {
+		return err
+	}
+	if !report.Verified {
+		return fmt.Errorf("post-start verification failed: %s", strings.Join(report.Blocks, "; "))
+	}
+	return nil
+}
+
+func containsUpgradeEvent(events upgradeEvents, eventType string) bool {
+	for _, event := range events.Items {
+		if event.EventType == eventType {
+			return true
+		}
+	}
+	return false
+}
+
+func upgradePostStartBlocks(report upgradePostStartReport) []string {
+	blocks := make([]string, 0, 9)
+	if !report.DaemonBuild.SameBuild(report.ExpectedBuild) {
+		blocks = append(blocks, "running daemon build does not match staged release")
+	}
+	if report.CurrentRelease == "" || report.CurrentRelease != report.ExpectedRelease {
+		blocks = append(blocks, "current release pointer does not select the verified release")
+	}
+	statusBuild := version.Info{Version: report.Status.Service.Version, Metadata: report.Status.Service.Build}
+	if !statusBuild.SameBuild(report.ExpectedBuild) {
+		blocks = append(blocks, "daemon status build does not match staged release")
+	}
+	if !report.Status.Service.Healthy {
+		blocks = append(blocks, "daemon service is unhealthy")
+	}
+	if report.Status.Service.AdmissionState != "ready" {
+		blocks = append(blocks, "daemon admission is not ready")
+	}
+	if report.Status.Service.StartedAt == nil || strings.TrimSpace(*report.Status.Service.StartedAt) == "" {
+		blocks = append(blocks, "daemon startup time is unavailable")
+	}
+	if !report.Status.Storage.Healthy {
+		blocks = append(blocks, "daemon storage is unhealthy")
+	}
+	if len(report.Status.Storage.PendingMigrations) > 0 {
+		blocks = append(blocks, "daemon storage has pending migrations")
+	}
+	if report.Status.Scheduler.ActiveRuns > 0 || report.Status.Scheduler.RunningItems > 0 {
+		blocks = append(blocks, "scheduler still owns active work after cutover")
+	}
+	if report.Status.Service.Recovery.Outstanding.QuarantinedActiveExecutions > 0 || report.Status.Service.Recovery.Outstanding.QuarantinedRunningRuns > 0 {
+		blocks = append(blocks, "daemon has outstanding quarantine debt")
+	}
+	if !report.StartedEvent {
+		blocks = append(blocks, "daemon startup recovery event is unavailable")
+	}
+	return blocks
 }
 
 func verifyStagedReleaseIdentity(ctx context.Context, staged upgraderelease.StageResult) error {

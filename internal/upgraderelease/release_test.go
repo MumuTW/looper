@@ -39,6 +39,9 @@ func TestStageVerifyAndActivateSwitchesOneCurrentPointer(t *testing.T) {
 		t.Fatalf("first activation = %#v", activated)
 	}
 	assertCurrentTarget(t, root, first.ReleaseID)
+	if current, err := CurrentReleaseID(root); err != nil || current != first.ReleaseID {
+		t.Fatalf("CurrentReleaseID() = (%q, %v)", current, err)
+	}
 
 	secondCLI := writeExecutable(t, sources, "looper-source-v2", "cli-v2")
 	secondDaemon := writeExecutable(t, sources, "looperd-source-v2", "daemon-v2")
@@ -54,6 +57,9 @@ func TestStageVerifyAndActivateSwitchesOneCurrentPointer(t *testing.T) {
 		t.Fatalf("second activation = %#v", activated)
 	}
 	assertCurrentTarget(t, root, second.ReleaseID)
+	if current, err := CurrentReleaseID(root); err != nil || current != second.ReleaseID {
+		t.Fatalf("CurrentReleaseID() = (%q, %v)", current, err)
+	}
 	ids, err := ReleaseIDs(root)
 	if err != nil {
 		t.Fatal(err)

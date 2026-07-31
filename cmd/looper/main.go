@@ -1356,6 +1356,8 @@ Usage:
                                Stage a matching, immutable binary pair
   looper upgrade activate-release --release-root <directory> --release <id>
                                Atomically switch the staged release pointer
+  looper upgrade verify-start --release-root <directory> --release <id>
+                               Verify the restarted daemon against that release
 
 Global flags, accepted before or after the verb:
   --config <path>              Config file to load

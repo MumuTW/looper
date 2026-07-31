@@ -241,6 +241,17 @@ func ReleaseIDs(rootDir string) ([]string, error) {
 	return ids, nil
 }
 
+// CurrentReleaseID reports the release selected by root/current. An empty
+// value means no release has been activated yet; a malformed pointer is an
+// error rather than a guess about what a future daemon launch will select.
+func CurrentReleaseID(rootDir string) (string, error) {
+	root, err := normalizedRoot(rootDir)
+	if err != nil {
+		return "", err
+	}
+	return currentReleaseID(root)
+}
+
 func normalizedRoot(rootDir string) (string, error) {
 	if strings.TrimSpace(rootDir) == "" {
 		return "", fmt.Errorf("release root directory is required")

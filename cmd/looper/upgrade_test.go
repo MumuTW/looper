@@ -254,6 +254,43 @@ func TestUpgradeStageReleaseRejectsDevelopmentSnapshot(t *testing.T) {
 	}
 }
 
+func TestUpgradeVerifyStartChecksRestartedDaemonEvidence(t *testing.T) {
+	identity := releasedUpgradeIdentity("1.2.3", "aaaaaaa")
+	root, releaseID := stageReleaseForUpgradeTest(t, identity)
+	server := upgradePostStartDaemon(t, identity, 0)
+	configForDaemon(t, server.URL)
+	stdout := &bytes.Buffer{}
+	if err := runUpgrade(context.Background(), nil, []string{"verify-start", "--release-root", root, "--release", releaseID}, stdout); err != nil {
+		t.Fatal(err)
+	}
+	var report upgradePostStartReport
+	if err := json.Unmarshal(stdout.Bytes(), &report); err != nil {
+		t.Fatal(err)
+	}
+	if !report.Verified || report.ProjectCount != 1 || !report.StartedEvent || len(report.Blocks) != 0 {
+		t.Fatalf("report = %#v", report)
+	}
+}
+
+func TestUpgradeVerifyStartRefusesActiveSchedulerOwnership(t *testing.T) {
+	identity := releasedUpgradeIdentity("1.2.3", "aaaaaaa")
+	root, releaseID := stageReleaseForUpgradeTest(t, identity)
+	server := upgradePostStartDaemon(t, identity, 1)
+	configForDaemon(t, server.URL)
+	stdout := &bytes.Buffer{}
+	err := runUpgrade(context.Background(), nil, []string{"verify-start", "--release-root", root, "--release", releaseID}, stdout)
+	if err == nil || !strings.Contains(err.Error(), "scheduler still owns active work") {
+		t.Fatalf("runUpgrade() error = %v", err)
+	}
+	var report upgradePostStartReport
+	if err := json.Unmarshal(stdout.Bytes(), &report); err != nil {
+		t.Fatal(err)
+	}
+	if report.Verified || len(report.Blocks) != 1 || report.Blocks[0] != "scheduler still owns active work after cutover" {
+		t.Fatalf("report = %#v", report)
+	}
+}
+
 func writeUpgradeBundleFile(t *testing.T, directory, name, contents string) string {
 	t.Helper()
 	path := filepath.Join(directory, name)
@@ -267,6 +304,44 @@ func releasedUpgradeIdentity(value, commit string) version.Info {
 	timestamp := "2026-07-31T12:34:56Z"
 	dirty := false
 	return version.Info{Version: value, Metadata: version.BuildMetadata{VersionSource: "git-tag:v" + value, Channel: "stable", APIVersion: "v1", GitCommitSHA: &commit, BuildTimestamp: &timestamp, Dirty: &dirty}}
+}
+
+func stageReleaseForUpgradeTest(t *testing.T, identity version.Info) (string, string) {
+	t.Helper()
+	root := t.TempDir()
+	stdout := &bytes.Buffer{}
+	if err := runUpgrade(context.Background(), nil, []string{"stage-release", "--target-looper", writeIdentityProgram(t, identity), "--target-looperd", writeIdentityProgram(t, identity), "--release-root", root}, stdout); err != nil {
+		t.Fatal(err)
+	}
+	var staged upgraderelease.StageResult
+	if err := json.Unmarshal(stdout.Bytes(), &staged); err != nil {
+		t.Fatal(err)
+	}
+	stdout.Reset()
+	if err := runUpgrade(context.Background(), nil, []string{"activate-release", "--release-root", root, "--release", staged.ReleaseID}, stdout); err != nil {
+		t.Fatal(err)
+	}
+	return root, staged.ReleaseID
+}
+
+func upgradePostStartDaemon(t *testing.T, identity version.Info, activeRuns int) *httptest.Server {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/version":
+			writeEnvelope(w, http.StatusOK, upgradeDaemonVersion{Version: identity.Version, Build: identity.Metadata})
+		case "/api/v1/status":
+			writeEnvelope(w, http.StatusOK, map[string]any{"service": map[string]any{"healthy": true, "version": identity.Version, "build": identity.Metadata, "admissionState": "ready", "startedAt": "2026-07-31T12:35:00.000Z", "recovery": map[string]any{"outstanding": map[string]any{"quarantinedActiveExecutions": 0, "quarantinedRunningRuns": 0}}}, "storage": map[string]any{"schemaVersion": "0021", "pendingMigrations": []string{}, "healthy": true}, "scheduler": map[string]any{"activeRuns": activeRuns, "runningItems": activeRuns}})
+		case "/api/v1/projects":
+			writeEnvelope(w, http.StatusOK, map[string]any{"items": []map[string]any{{"id": "project_1"}}})
+		case "/api/v1/events/notification/looperd":
+			writeEnvelope(w, http.StatusOK, map[string]any{"items": []map[string]any{{"eventType": "looperd.started"}}})
+		default:
+			t.Fatalf("unexpected request %s", r.URL.Path)
+		}
+	}))
+	t.Cleanup(server.Close)
+	return server
 }
 
 func upgradeTestDaemon(t *testing.T, identity version.Info) *httptest.Server {

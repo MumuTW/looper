@@ -154,6 +154,14 @@ looper upgrade activate-release --release-root /opt/looper --release <release-id
 
 `stage-release` accepts only a matching, clean stable/beta pair with a source commit and build timestamp; it copies both binaries to an immutable release directory, then re-reads their embedded identity. `activate-release` verifies the release contents and identities again before atomically renaming the single `current` symlink. It does not stop or restart the old daemon, so after a successful drain the operator still stops it and starts the supervisor service normally.
 
+After that restart, verify the live daemon rather than treating pointer movement as success:
+
+```sh
+looper upgrade verify-start --release-root /opt/looper --release <release-id>
+```
+
+This verifies the selected pointer, live daemon identity, health/readiness, storage migration state, scheduler ownership, quarantine debt, project-catalog access, and the durable `looperd.started` recovery event. It returns nonzero while still printing the evidence report if any check fails.
+
 To switch binaries back, activate a previously staged release ID. That is only a binary rollback: do it only after compatibility preflight proves the database remains readable by that release. If a migration or durable payload change is forward-only, restore the matching database/config backup rather than merely moving the binary pointer.
 
 ## Compatibility and version policy
