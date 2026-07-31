@@ -7509,10 +7509,11 @@ func (f *updateProjectStringField) UnmarshalJSON(raw []byte) error {
 }
 
 type updateProjectRequest struct {
-	Repo         updateProjectStringField `json:"repo"`
-	Name         updateProjectStringField `json:"name"`
-	BaseBranch   updateProjectStringField `json:"baseBranch"`
-	WorktreeRoot updateProjectStringField `json:"worktreeRoot"`
+	Repo         updateProjectStringField        `json:"repo"`
+	Name         updateProjectStringField        `json:"name"`
+	BaseBranch   updateProjectStringField        `json:"baseBranch"`
+	WorktreeRoot updateProjectStringField        `json:"worktreeRoot"`
+	Validation   *config.ProjectValidationConfig `json:"validation"`
 }
 
 func updateProjectField(field updateProjectStringField) projects.UpdateStringField {
@@ -7527,6 +7528,7 @@ func (h *Handler) buildUpdateProjectResponse(r *http.Request, service projectSer
 	updated, err := service.UpdateProject(r.Context(), identifier, projects.UpdateInput{
 		Repo: updateProjectField(body.Repo), Name: updateProjectField(body.Name),
 		BaseBranch: updateProjectField(body.BaseBranch), WorktreeRoot: updateProjectField(body.WorktreeRoot),
+		Validation: cloneProjectValidation(body.Validation),
 	})
 	if err != nil {
 		var notFound projects.ProjectNotFoundError

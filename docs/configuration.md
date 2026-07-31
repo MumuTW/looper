@@ -1349,7 +1349,7 @@ repoPath = "/absolute/path/to/fluenx"
 optOut = true
 ```
 
-Each project with a configured Worker or Fixer must choose commands or explicitly set `optOut = true`. `commands` and `optOut` are mutually exclusive. Missing, empty, blank, or ambiguous policies fail closed at daemon startup, catalog publication, project registration, and configuration reload. The project API accepts the same JSON shape as `"validation":{"commands":["make check"]}` or `"validation":{"optOut":true}`. Explicit opt-outs are emitted in project responses and logged at scheduler startup; they are not silently treated as successful test runs.
+Each project with a configured Worker or Fixer must choose commands or explicitly set `optOut = true`. `commands` and `optOut` are mutually exclusive. Missing, empty, blank, or ambiguous policies fail closed at daemon startup, catalog publication, project registration, and configuration reload. A stored pre-validation API project with no `repo` metadata is inert and may start without a policy only so an operator can repair that legacy record; a PATCH that adds `repo` must include `validation` in the same request. The project API accepts the same JSON shape as `"validation":{"commands":["make check"]}` or `"validation":{"optOut":true}`. Explicit opt-outs are emitted in project responses and logged at scheduler startup; they are not silently treated as successful test runs.
 
 For migration, the old global list remains a temporary fallback for projects that do not yet have a `validation` block:
 
