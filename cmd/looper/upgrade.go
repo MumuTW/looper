@@ -713,13 +713,12 @@ func upgradePostStartBlocks(report upgradePostStartReport) []string {
 	if !report.Status.Service.Healthy {
 		blocks = append(blocks, "daemon service is unhealthy")
 	}
-	// ready = normal post-start. draining is allowed when the replacement
-	// daemon was started with LOOPER_UPGRADE_VERIFY_HOLD=1 so work cannot run
-	// until verification succeeds.
-	switch report.Status.Service.AdmissionState {
-	case "ready", "draining":
-	default:
-		blocks = append(blocks, "daemon admission is not ready")
+	// Cutover verify-start requires held admission (draining under
+	// LOOPER_UPGRADE_VERIFY_HOLD=1). Accepting ordinary ready would let the
+	// scheduler claim/commit work before verification; a later failed verify +
+	// restore of the pre-restart rollback bundle would discard those writes.
+	if report.Status.Service.AdmissionState != "draining" {
+		blocks = append(blocks, "daemon admission is not held for cutover verify (want draining under LOOPER_UPGRADE_VERIFY_HOLD)")
 	}
 	if report.Status.Service.StartedAt == nil || strings.TrimSpace(*report.Status.Service.StartedAt) == "" {
 		blocks = append(blocks, "daemon startup time is unavailable")

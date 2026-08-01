@@ -861,12 +861,27 @@ func (h *Handler) beginTrackedAdmittedMutation() (release func(), denied bool, t
 }
 
 func (h *Handler) beginTrackedAdmittedMutationForBackup() (release func(), denied bool, typed apiError) {
-	// Backup has its own ready-or-drained gate; once allowed, still hold a lease.
-	if typed, denied := h.upgradeBackupMutationDenial(); denied {
-		return nil, true, typed
-	}
+	// Prefer the atomic ready-or-drained + lease path so drain cannot observe a
+	// gap between the backup gate and the admitted-mutation counter.
 	if h == nil || h.context.Runtime == nil {
 		return nil, false, apiError{}
+	}
+	if tracker, ok := any(h.context.Runtime).(interface {
+		BeginBackupMutationIfAllowed() (func(), error)
+	}); ok {
+		rel, err := tracker.BeginBackupMutationIfAllowed()
+		if err != nil {
+			return nil, true, apiError{
+				code:    pkgapi.ErrorCodeServiceUnavailable,
+				status:  http.StatusServiceUnavailable,
+				message: err.Error(),
+			}
+		}
+		return rel, false, apiError{}
+	}
+	// Fallback: separate gate then track (older embeds / test doubles).
+	if typed, denied := h.upgradeBackupMutationDenial(); denied {
+		return nil, true, typed
 	}
 	if tracker, ok := any(h.context.Runtime).(interface{ BeginAdmittedMutation() func() }); ok {
 		return tracker.BeginAdmittedMutation(), false, apiError{}

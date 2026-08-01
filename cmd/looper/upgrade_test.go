@@ -290,10 +290,10 @@ func TestUpgradeVerifyStartChecksRestartedDaemonEvidence(t *testing.T) {
 	}
 }
 
-func TestUpgradeVerifyStartAllowsResumedSchedulerOwnership(t *testing.T) {
-	// Drain leaves queued work intact. After activate, the replacement daemon
-	// may claim that work before a separately invoked verify-start runs; that
-	// must not be treated as a cutover failure.
+func TestUpgradeVerifyStartAllowsHeldAdmissionWithFinishingWork(t *testing.T) {
+	// Under LOOPER_UPGRADE_VERIFY_HOLD, admission stays draining so the
+	// scheduler cannot claim. Finishing agent telemetry (ActiveRuns) is not a
+	// cutover failure — only identity, hold, health, and quarantine are gates.
 	identity := releasedUpgradeIdentity("1.2.3", "aaaaaaa")
 	root, releaseID := stageReleaseForUpgradeTest(t, identity)
 	server := upgradePostStartDaemon(t, identity, 1, upgraderelease.CurrentDaemonExecutable(root))
@@ -307,10 +307,58 @@ func TestUpgradeVerifyStartAllowsResumedSchedulerOwnership(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !report.Verified || len(report.Blocks) != 0 {
-		t.Fatalf("report = %#v, want verified with no blocks despite active scheduler work", report)
+		t.Fatalf("report = %#v, want verified under held draining admission", report)
 	}
-	if report.Status.Scheduler.ActiveRuns != 1 {
-		t.Fatalf("ActiveRuns = %d, want fixture active work preserved as telemetry", report.Status.Scheduler.ActiveRuns)
+	if report.Status.Service.AdmissionState != "draining" {
+		t.Fatalf("AdmissionState = %q, want draining", report.Status.Service.AdmissionState)
+	}
+}
+
+func TestUpgradeVerifyStartRejectsUnheldReadyAdmission(t *testing.T) {
+	// Without VERIFY_HOLD the candidate opens ready and may claim work before
+	// verify-start; that must fail so restore cannot discard post-restart writes.
+	identity := releasedUpgradeIdentity("1.2.3", "aaaaaaa")
+	root, releaseID := stageReleaseForUpgradeTest(t, identity)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/version":
+			versionBody := upgradeDaemonVersion{Version: identity.Version, Build: identity.Metadata}
+			versionBody.Binary.Name = "looperd"
+			versionBody.Binary.Path = upgraderelease.CurrentDaemonExecutable(root)
+			writeEnvelope(w, http.StatusOK, versionBody)
+		case "/api/v1/status":
+			writeEnvelope(w, http.StatusOK, map[string]any{"service": map[string]any{"healthy": true, "version": identity.Version, "build": identity.Metadata, "admissionState": "ready", "startedAt": "2026-07-31T12:35:00.000Z", "recovery": map[string]any{"outstanding": map[string]any{"quarantinedActiveExecutions": 0, "quarantinedRunningRuns": 0}}}, "storage": map[string]any{"schemaVersion": "0022_durable_payload_baseline", "pendingMigrations": []string{}, "healthy": true}, "scheduler": map[string]any{"activeRuns": 0, "runningItems": 0}})
+		case "/api/v1/projects":
+			writeEnvelope(w, http.StatusOK, map[string]any{"items": []map[string]any{{"id": "project_1"}}})
+		case "/api/v1/events/notification/looperd":
+			writeEnvelope(w, http.StatusOK, map[string]any{"items": []map[string]any{{"eventType": "looperd.started"}}})
+		default:
+			t.Fatalf("unexpected request %s", r.URL.Path)
+		}
+	}))
+	t.Cleanup(server.Close)
+	configForDaemon(t, server.URL)
+	stdout := &bytes.Buffer{}
+	err := runUpgrade(context.Background(), nil, []string{"verify-start", "--release-root", root, "--release", releaseID}, stdout)
+	if err == nil {
+		t.Fatal("verify-start error = nil, want unheld ready rejection")
+	}
+	var report upgradePostStartReport
+	if decodeErr := json.Unmarshal(stdout.Bytes(), &report); decodeErr != nil {
+		t.Fatal(decodeErr)
+	}
+	if report.Verified {
+		t.Fatalf("report = %#v, want unverified", report)
+	}
+	found := false
+	for _, block := range report.Blocks {
+		if strings.Contains(block, "not held for cutover verify") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("blocks = %v, want held-admission failure", report.Blocks)
 	}
 }
 
@@ -583,7 +631,8 @@ func upgradePostStartDaemon(t *testing.T, identity version.Info, activeRuns int,
 			versionBody.Binary.Path = runningExecutable
 			writeEnvelope(w, http.StatusOK, versionBody)
 		case "/api/v1/status":
-			writeEnvelope(w, http.StatusOK, map[string]any{"service": map[string]any{"healthy": true, "version": identity.Version, "build": identity.Metadata, "admissionState": "ready", "startedAt": "2026-07-31T12:35:00.000Z", "recovery": map[string]any{"outstanding": map[string]any{"quarantinedActiveExecutions": 0, "quarantinedRunningRuns": 0}}}, "storage": map[string]any{"schemaVersion": "0022_durable_payload_baseline", "pendingMigrations": []string{}, "healthy": true}, "scheduler": map[string]any{"activeRuns": activeRuns, "runningItems": activeRuns}})
+			// verify-start requires held (draining) admission under LOOPER_UPGRADE_VERIFY_HOLD.
+			writeEnvelope(w, http.StatusOK, map[string]any{"service": map[string]any{"healthy": true, "version": identity.Version, "build": identity.Metadata, "admissionState": "draining", "startedAt": "2026-07-31T12:35:00.000Z", "recovery": map[string]any{"outstanding": map[string]any{"quarantinedActiveExecutions": 0, "quarantinedRunningRuns": 0}}}, "storage": map[string]any{"schemaVersion": "0022_durable_payload_baseline", "pendingMigrations": []string{}, "healthy": true}, "scheduler": map[string]any{"activeRuns": activeRuns, "runningItems": activeRuns}})
 		case "/api/v1/projects":
 			writeEnvelope(w, http.StatusOK, map[string]any{"items": []map[string]any{{"id": "project_1"}}})
 		case "/api/v1/events/notification/looperd":

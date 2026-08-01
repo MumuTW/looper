@@ -151,7 +151,7 @@ func upgradeCutoverStatus(identity version.Info, healthy bool) map[string]any {
 			"healthy":        healthy,
 			"version":        identity.Version,
 			"build":          identity.Metadata,
-			"admissionState": "ready",
+			"admissionState": "draining", // verify-hold: cutover verify requires held admission
 			"startedAt":      "2026-07-31T12:35:00.000Z",
 			"recovery": map[string]any{"outstanding": map[string]any{
 				"quarantinedActiveExecutions": 0,
