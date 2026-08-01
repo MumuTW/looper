@@ -4,6 +4,7 @@ package gatekeeper
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -301,18 +302,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 	ctx = withDeferCommitStatus(ctx)
 	trust := r.trustFor(input.ProjectID)
 	result := DiscoveryResult{Reports: make([]Report, 0, len(pullRequests))}
-	// Deferred commit statuses must still publish on abort: a blocked report that
-	// was already evaluated this tick is durable in result.Reports, and leaving
-	// without publishing would keep a prior success visible to branch protection.
-	publishDeferredStatuses := func() {
-		if trust == config.GatekeeperTrustAuto {
-			r.publishDiscoveryCommitStatuses(ctx, input.ProjectID, input.Repo, input.CWD, result.Reports)
-		}
-	}
-	diffBudget := r.diffBudget(input.ProjectID)
-	budgetEnabled := diffBudget.MaxChangedFiles > 0 || diffBudget.MaxDeletions > 0
-	configuredTarget := r.configuredTarget(input.ProjectID)
-	stillOpen := make(map[string]struct{}, len(pullRequests))
+	var evaluationErrs []error
 	for _, pullRequest := range pullRequests {
 		fingerprint := r.sourceFingerprintForProject(pullRequest, input.ProjectID, input.Repo)
 		entityID := fmt.Sprintf("%s#%d", input.Repo, pullRequest.Number)
@@ -339,25 +329,23 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 			CWD: input.CWD, ExpectedHeadSHA: pullRequest.HeadSHA, SourceFingerprint: fingerprint,
 		})
 		if err != nil {
-			publishDeferredStatuses()
-			return result, err
+			// Evaluation persists a durable report before a routing projection
+			// failure is returned. Keep that report in the result, then continue
+			// through the stable list so one PR's forge failure cannot strand
+			// stale routes on every later PR.
+			if report.PRNumber == pullRequest.Number {
+				result.Evaluated++
+				result.Reports = append(result.Reports, report)
+			}
+			evaluationErrs = append(evaluationErrs, fmt.Errorf("evaluate pull request %s#%d: %w", input.Repo, pullRequest.Number, err))
+			continue
 		}
 		result.Evaluated++
 		result.Reports = append(result.Reports, report)
 	}
-
-	for _, entityID := range r.departedFromOpenSet(input.Repo, pullRequests, limit, previousReports, stillOpen) {
-		report, err := r.EvaluatePullRequest(ctx, EvaluationInput{
-			ProjectID: input.ProjectID, Repo: input.Repo, PRNumber: previousReports[entityID].PRNumber, CWD: input.CWD,
-		})
-		if err != nil {
-			publishDeferredStatuses()
-			return result, err
-		}
-		result.Reconciled++
-		result.Reports = append(result.Reports, report)
+	if len(evaluationErrs) > 0 {
+		return result, errors.Join(evaluationErrs...)
 	}
-	publishDeferredStatuses()
 	return result, nil
 }
 

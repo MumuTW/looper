@@ -65,6 +65,14 @@ func (r *Runner) reconcileRoutingLabels(ctx context.Context, report Report, prev
 		if err := r.github.ValidateMergifyRouting(ctx, githubinfra.ValidateMergifyRoutingInput{
 			Repo: report.Repo, CWD: r.projectCWD(ctx, report.ProjectID),
 		}); err != nil {
+			// A repository contract failure must retire an already-published
+			// route before returning. Leaving auto-merge in place while the
+			// contract is invalid is the fail-open state this validation is
+			// intended to prevent.
+			cleanupErr := r.applyRoutingLabelPlan(ctx, report, routingLabelPlan{})
+			if cleanupErr != nil {
+				return fmt.Errorf("validate Mergify routing contract: %w (remove stale routing labels: %v)", err, cleanupErr)
+			}
 			return fmt.Errorf("validate Mergify routing contract: %w", err)
 		}
 	}
@@ -100,24 +108,30 @@ func (r *Runner) revalidateRoutingState(ctx context.Context, report Report, expe
 	if strings.TrimSpace(detail.HeadSHA) != expectedHead {
 		return fmt.Errorf("skip routing labels because pull request head moved from %s to %s", expectedHead, strings.TrimSpace(detail.HeadSHA))
 	}
-	if state := strings.TrimSpace(report.Evidence.PullRequestState); state != "" && !strings.EqualFold(state, detail.State) {
-		return fmt.Errorf("skip routing labels because pull request state changed from %s to %s", state, strings.TrimSpace(detail.State))
-	}
-	if report.Evidence.PullRequestState != "" && report.Evidence.Draft != detail.IsDraft {
-		return fmt.Errorf("skip routing labels because draft state changed")
-	}
-	if report.Evidence.BaseRefName != "" && strings.TrimSpace(report.Evidence.BaseRefName) != strings.TrimSpace(detail.BaseRefName) {
-		return fmt.Errorf("skip routing labels because base branch changed from %s to %s", report.Evidence.BaseRefName, strings.TrimSpace(detail.BaseRefName))
-	}
-	if report.Evidence.ReviewDecision != "" && !strings.EqualFold(report.Evidence.ReviewDecision, detail.ReviewDecision) {
-		return fmt.Errorf("skip routing labels because review decision changed from %s to %s", report.Evidence.ReviewDecision, strings.TrimSpace(detail.ReviewDecision))
+	// Reports produced by EvaluatePullRequest always carry PullRequestState;
+	// hand-built/legacy reports in storage may omit the full authority evidence,
+	// so retain their compatibility fallback while enforcing every field on
+	// current state-bound reports.
+	if state := strings.TrimSpace(report.Evidence.PullRequestState); state != "" {
+		if !strings.EqualFold(state, strings.TrimSpace(detail.State)) {
+			return fmt.Errorf("skip routing labels because pull request state changed from %s to %s", state, strings.TrimSpace(detail.State))
+		}
+		if report.Evidence.Draft != detail.IsDraft {
+			return fmt.Errorf("skip routing labels because draft state changed")
+		}
+		if strings.TrimSpace(report.Evidence.BaseRefName) != strings.TrimSpace(detail.BaseRefName) {
+			return fmt.Errorf("skip routing labels because base branch changed from %s to %s", report.Evidence.BaseRefName, strings.TrimSpace(detail.BaseRefName))
+		}
+		if !strings.EqualFold(strings.TrimSpace(report.Evidence.ReviewDecision), strings.TrimSpace(detail.ReviewDecision)) {
+			return fmt.Errorf("skip routing labels because review decision changed from %s to %s", report.Evidence.ReviewDecision, strings.TrimSpace(detail.ReviewDecision))
+		}
 	}
 	recordedHold := len(report.Evidence.HoldLabels) > 0
 	currentHold := labels.Has(detail.Labels, labels.HoldGlobal)
 	if recordedHold != currentHold {
 		return fmt.Errorf("skip routing labels because hold state changed")
 	}
-	if report.Evidence.BaseRefName != "" {
+	if strings.TrimSpace(report.Evidence.BaseRefName) != "" {
 		currentPolicy := r.policyPermitsTarget(report.ProjectID, report.Repo, report.Evidence.BaseRefName)
 		if currentPolicy != report.Evidence.ProjectPolicyPermitsTarget {
 			return fmt.Errorf("skip routing labels because project policy changed")
