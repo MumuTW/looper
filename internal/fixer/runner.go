@@ -490,8 +490,11 @@ type Options struct {
 	RetryBaseDelay              time.Duration
 	RetryMaxAttempts            int64
 	MaxConsecutiveFixerFailures int
-	OnAgentExecutionStarted     AgentExecutionStartedFunc
-	OnQueueItemEnqueued         func()
+	// MaxFixerRoundsPerPullRequest bounds how many pushes this fixer may draw
+	// review on for one pull request before the loop is parked for a human.
+	MaxFixerRoundsPerPullRequest int
+	OnAgentExecutionStarted      AgentExecutionStartedFunc
+	OnQueueItemEnqueued          func()
 }
 
 type DiscoveryPolicy struct {
@@ -534,6 +537,7 @@ type Runner struct {
 	retryBaseDelay              time.Duration
 	retryMaxAttempts            int64
 	consecutiveFailureThreshold int
+	maxFixerRounds              int
 	onAgentExecutionStarted     AgentExecutionStartedFunc
 	onQueueItemEnqueued         func()
 }
@@ -1587,6 +1591,10 @@ func New(options Options) *Runner {
 	if consecutiveFailureThreshold <= 0 {
 		consecutiveFailureThreshold = maxConsecutiveFixerFailures
 	}
+	maxFixerRounds := options.MaxFixerRoundsPerPullRequest
+	if maxFixerRounds <= 0 {
+		maxFixerRounds = maxFixerRoundsPerPullRequest
+	}
 	sleep := options.Sleep
 	if sleep == nil {
 		sleep = time.Sleep
@@ -1632,6 +1640,7 @@ func New(options Options) *Runner {
 		retryBaseDelay:              retryBaseDelay,
 		retryMaxAttempts:            retryMax,
 		consecutiveFailureThreshold: consecutiveFailureThreshold,
+		maxFixerRounds:              maxFixerRounds,
 		onAgentExecutionStarted:     options.OnAgentExecutionStarted,
 		onQueueItemEnqueued:         options.OnQueueItemEnqueued,
 	}
@@ -2013,6 +2022,11 @@ func (r *Runner) discoverPullRequestFromDetail(ctx context.Context, project stor
 	allFixItems := collectFixItems(detail)
 	if len(allFixItems) == 0 {
 		if err := r.clearFixerFollowupStateForPR(ctx, project.ID, repo, detail.Number); err != nil {
+			return err
+		}
+		// Zero fix items is the only evidence this loop converged, so it is the
+		// only automatic budget reset.
+		if err := r.clearRoundBudgetForPullRequest(ctx, project.ID, repo, detail.Number); err != nil {
 			return err
 		}
 		result.Skipped++
@@ -5069,6 +5083,16 @@ func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.P
 			}
 			return loopUpsertResult{record: updatedLoop, created: false, pending: true}, nil
 		}
+		// Charged after the pending-rediscovery branch above: a discovery that
+		// lands while a run is active is not another round, it is the same one.
+		charged, parked, err := r.chargeFixerRound(ctx, updatedLoop, headSHA)
+		if err != nil {
+			return loopUpsertResult{}, err
+		}
+		if parked {
+			return loopUpsertResult{record: charged, created: false, skipped: true}, nil
+		}
+		updatedLoop = charged
 		updatedLoop.Status = "queued"
 		updatedLoop.NextRunAt = &availableAtISO
 		updatedLoop.UpdatedAt = eventlog.NextJavaScriptISOString(now, updatedLoop.UpdatedAt)
