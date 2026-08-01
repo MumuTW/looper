@@ -190,6 +190,7 @@ type GitHubGateway interface {
 	// merge base (the diff budget) can detect a base advance that the head
 	// revalidation alone cannot.
 	GetPullRequestHeadAndBaseSHA(context.Context, githubinfra.ViewPullRequestInput) (string, string, error)
+	GetPullRequestHeadSHA(context.Context, githubinfra.ViewPullRequestInput) (string, error)
 	ListIssueComments(context.Context, githubinfra.ViewIssueInput) ([]githubinfra.CommentInfo, error)
 	CreateIssueComment(context.Context, githubinfra.IssueCommentInput) (githubinfra.IssueCommentResult, error)
 	UpdateIssueComment(context.Context, githubinfra.UpdateIssueCommentInput) error
@@ -208,7 +209,10 @@ type Options struct {
 	// TrustForProject reports a project's merge-authority level. Nil means every
 	// project stays at observe, which is also the configured default.
 	TrustForProject func(projectID string) config.GatekeeperTrustLevel
-	LogWarn         func(msg string, fields map[string]any)
+	// DiffBudgetForProject returns the effective boolean change-size limits. Zero
+	// bounds are unlimited; nil means every project has no configured limit.
+	DiffBudgetForProject func(projectID string) config.GatekeeperDiffBudget
+	LogWarn              func(msg string, fields map[string]any)
 }
 
 // Runner is the Merge Gatekeeper: a reactive, agent-free policy Role that
@@ -218,12 +222,13 @@ type Options struct {
 // Stateful: agent-free but not database-free — it persists Gate reports in
 // the local SQLite event log.
 type Runner struct {
-	repos               *storage.Repositories
-	github              GitHubGateway
-	now                 func() time.Time
-	policyPermitsTarget func(projectID, repo, baseRefName string) bool
-	trustForProject     func(projectID string) config.GatekeeperTrustLevel
-	logWarn             func(msg string, fields map[string]any)
+	repos                *storage.Repositories
+	github               GitHubGateway
+	now                  func() time.Time
+	policyPermitsTarget  func(projectID, repo, baseRefName string) bool
+	trustForProject      func(projectID string) config.GatekeeperTrustLevel
+	diffBudgetForProject func(projectID string) config.GatekeeperDiffBudget
+	logWarn              func(msg string, fields map[string]any)
 }
 
 func New(options Options) *Runner {
@@ -237,8 +242,9 @@ func New(options Options) *Runner {
 	}
 	return &Runner{
 		repos: options.Repos, github: options.GitHub, now: now, policyPermitsTarget: policy,
-		trustForProject: options.TrustForProject,
-		logWarn:         options.LogWarn,
+		trustForProject:      options.TrustForProject,
+		diffBudgetForProject: options.DiffBudgetForProject,
+		logWarn:              options.LogWarn,
 	}
 }
 
@@ -312,7 +318,9 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 // leave a previously published auto-merge label in place merely because the
 // pull request itself is unchanged.
 func (r *Runner) sourceFingerprintForProject(pullRequest githubinfra.PullRequestSummary, projectID, repo string) string {
-	base := sourceFingerprint(pullRequest)
+	budget := r.diffBudget(projectID)
+	budgetEnabled := budget.MaxChangedFiles > 0 || budget.MaxDeletions > 0
+	base := sourceFingerprint(pullRequest, budgetEnabled)
 	permitsTarget := r.policyPermitsTarget(projectID, repo, pullRequest.BaseRefName)
 	return strings.Join([]string{base, string(r.trustFor(projectID)), fmt.Sprintf("%t", permitsTarget)}, "\x1f")
 }
@@ -517,7 +525,18 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 	}
 	sort.Strings(report.Evidence.UnresolvedReviewThreadIDs)
 
-	finalHead, finalBase, err := r.github.GetPullRequestHeadAndBaseSHA(ctx, viewInput)
+	// The final revalidation read confirms the head has not moved between the
+	// evaluation and persistence. When the diff budget is enabled it also
+	// returns the base ref OID so a gate whose verdict depends on the merge
+	// base can detect a base advance that the head revalidation alone cannot;
+	// when the budget is disabled a base advance is not a gate input, so the
+	// lighter head-only read is sufficient.
+	var finalHead, finalBase string
+	if budgetEnabled {
+		finalHead, finalBase, err = r.github.GetPullRequestHeadAndBaseSHA(ctx, viewInput)
+	} else {
+		finalHead, err = r.github.GetPullRequestHeadSHA(ctx, viewInput)
+	}
 	if err != nil {
 		return r.persistProviderBlock(ctx, report, ReasonProviderStateUnavailable, "head_revalidation")
 	}
@@ -527,6 +546,15 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 	}
 	if report.Evidence.FinalObservedHeadSHA != report.ObservedHeadSHA {
 		report.Reasons = append(report.Reasons, Reason{Code: ReasonHeadStale})
+	}
+	// The diff-budget verdict was anchored to diffBudgetBaseSHA. A base branch
+	// can advance between the merge-watch read and this final revalidation
+	// without moving the head, so the head check above cannot detect that the
+	// recorded counts now describe a stale merge base. Fail closed so an
+	// eligible verdict is not persisted on counts GitHub would no longer
+	// produce.
+	if budgetEnabled && diffBudgetBaseSHA != "" && strings.TrimSpace(finalBase) != diffBudgetBaseSHA {
+		return r.persistProviderBlock(ctx, report, ReasonProviderStateAmbiguous, "diff_budget_base")
 	}
 	return r.persist(ctx, report)
 }

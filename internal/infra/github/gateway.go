@@ -1940,6 +1940,24 @@ func (g *Gateway) GetPullRequestHeadSHA(ctx context.Context, input ViewPullReque
 	return asString(row["headRefOid"]), nil
 }
 
+// GetPullRequestHeadAndBaseSHA is the final revalidation read for gates whose
+// verdict depends on the merge base, not only on the head. A base branch can
+// advance between the merge-watch read and this observation without moving the
+// head, so revalidating the head alone cannot detect that a diff-budget verdict
+// was computed against a stale base. It costs the same `gh pr view` call as
+// GetPullRequestHeadSHA with one additional JSON field.
+func (g *Gateway) GetPullRequestHeadAndBaseSHA(ctx context.Context, input ViewPullRequestInput) (string, string, error) {
+	result, err := g.runGh(ctx, input.CWD, "", "pr", "view", fmt.Sprintf("%d", input.PRNumber), "--repo", input.Repo, "--json", "headRefOid,baseRefOid")
+	if err != nil {
+		return "", "", err
+	}
+	row, err := decodeJSONObject(result.Stdout)
+	if err != nil {
+		return "", "", err
+	}
+	return asString(row["headRefOid"]), asString(row["baseRefOid"]), nil
+}
+
 // ValidateMergifyRouting checks the repository-owned Mergify contract before
 // Gatekeeper publishes an auto-merge label. The repository file is the
 // authority for how that label is consumed; Gatekeeper must fail closed when

@@ -328,6 +328,7 @@ type fakeGatekeeperGitHub struct {
 	checks           githubinfra.PullRequestCheckRuns
 	threads          []githubinfra.ReviewThread
 	finalHeadSHA     string
+	finalBaseSHA     string
 	headSHAResponses []string
 	protectionErr    error
 	// perPullRequestCalls counts the forge round trips that only a full evaluation
@@ -428,6 +429,10 @@ func (f *fakeGatekeeperGitHub) GetPullRequestHeadSHA(context.Context, githubinfr
 		return head, nil
 	}
 	return f.finalHeadSHA, nil
+}
+
+func (f *fakeGatekeeperGitHub) GetPullRequestHeadAndBaseSHA(context.Context, githubinfra.ViewPullRequestInput) (string, string, error) {
+	return f.finalHeadSHA, f.finalBaseSHA, nil
 }
 
 func (f *fakeGatekeeperGitHub) AddPullRequestLabels(_ context.Context, input githubinfra.PullRequestLabelsInput) error {

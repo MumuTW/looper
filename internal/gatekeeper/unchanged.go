@@ -84,6 +84,8 @@ var checkReasonCodes = map[ReasonCode]struct{}{
 // leaves Evidence.CodexReview.CurrentHeadValid false, so checking the evidence
 // alone would miss that case and checking the reason alone would miss a
 // provider-blocked report. Both signals are authoritative.
+var _ = reportAwaitsCurrentHeadReview
+
 func reportAwaitsCurrentHeadReview(report Report) bool {
 	if report.Evidence.CodexReview != nil && !report.Evidence.CodexReview.CurrentHeadValid {
 		return true

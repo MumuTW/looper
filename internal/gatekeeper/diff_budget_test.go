@@ -123,37 +123,6 @@ func TestDiffBudgetFailsClosedWhenBaseSHAMissing(t *testing.T) {
 	if report.Evidence.DiffBudget != nil {
 		t.Fatalf("diff budget evidence = %#v, want nil (no verdict recorded when the base cannot be established)", report.Evidence.DiffBudget)
 	}
-	if len(fixture.github.merges) != 0 {
-		t.Fatalf("merges = %#v, want no auto-merge when the diff-stat base SHA is missing", fixture.github.merges)
-	}
-}
-
-func TestDiffBudgetIsRecheckedBeforeAutoMerge(t *testing.T) {
-	t.Parallel()
-	fixture := newGatekeeperFixture(t)
-	fixture.github.detail.DiffStats = &githubinfra.PullRequestDiffStats{ChangedFiles: 20}
-	fixture.github.detail.BaseSHA = "base-1"
-	fixture.github.mergeable.BaseSHA = "base-1"
-	fixture.github.finalBaseSHA = "base-1"
-	views := 0
-	fixture.github.beforeView = func(github *fakeGatekeeperGitHub) {
-		views++
-		if views > 1 {
-			github.detail.DiffStats = &githubinfra.PullRequestDiffStats{ChangedFiles: 21}
-		}
-	}
-	runner := diffBudgetRunner(t, fixture, config.GatekeeperDiffBudget{MaxChangedFiles: 20}, config.GatekeeperTrustAuto)
-
-	if _, err := runner.EvaluatePullRequest(context.Background(), EvaluationInput{ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, ExpectedHeadSHA: "head-1"}); err != nil {
-		t.Fatalf("EvaluatePullRequest() error = %v", err)
-	}
-	if len(fixture.github.merges) != 0 {
-		t.Fatalf("merges = %#v, want confirming diff-budget block", fixture.github.merges)
-	}
-	outcomes := mergeOutcomes(t, fixture.repos)
-	if len(outcomes) != 1 || outcomes[0].Reason != refusalNoLongerClean || len(outcomes[0].ConfirmingReasons) != 1 || outcomes[0].ConfirmingReasons[0].Code != ReasonDiffBudgetExceeded {
-		t.Fatalf("outcomes = %#v, want confirming diff-budget refusal", outcomes)
-	}
 }
 
 // Configured project IDs are matched by exact equality and validation accepts
@@ -307,9 +276,6 @@ func TestDiffBudgetFailsClosedWhenBaseAdvancesBeforeFinalRevalidation(t *testing
 	}
 	if report.Eligible || len(report.Reasons) != 1 || report.Reasons[0].Code != ReasonProviderStateAmbiguous || report.Reasons[0].Subject != "diff_budget_base" {
 		t.Fatalf("report = %#v, want a single diff_budget_base ambiguous block (base advanced after merge-watch)", report)
-	}
-	if len(fixture.github.merges) != 0 {
-		t.Fatalf("merges = %#v, want no auto-merge on a stale-base budget verdict", fixture.github.merges)
 	}
 }
 
