@@ -2461,9 +2461,12 @@ func TestHandlerProjectsCreateRouteReturnsDiscoveryDetails(t *testing.T) {
 
 func TestHandlerProjectsPatchRepairsRepoWithoutResettingProjectState(t *testing.T) {
 	fixture := newTestFixture(t)
+	// Discovery runs as a separate post-commit lifecycle job; suppress it so
+	// this test observes the committed pending transition deterministically.
+	fixture.runtime.Services().Projects.ScheduleDiscovery = func(func()) {}
 	nowISO := fixture.now.UTC().Format(javaScriptISOString)
 	baseBranch := "develop"
-	metadata := `{"repo":null,"worktreeRoot":"/tmp/worktrees","source":"api","registrationDiscovery":{"status":"succeeded","snapshotMode":"off"}}`
+	metadata := `{"repo":null,"worktreeRoot":"/tmp/worktrees","validation":{"optOut":true},"source":"api","registrationDiscovery":{"status":"succeeded","snapshotMode":"off"}}`
 	if err := fixture.runtime.Services().Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "inert", Name: "Custom Name", RepoPath: "/tmp/inert", BaseBranch: &baseBranch, MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
@@ -2485,7 +2488,7 @@ func TestHandlerProjectsPatchRepairsRepoWithoutResettingProjectState(t *testing.
 	if err != nil || stored == nil || stored.MetadataJSON == nil {
 		t.Fatalf("Projects.GetByID() = %#v, %v", stored, err)
 	}
-	if !strings.Contains(*stored.MetadataJSON, `"snapshotMode":"off"`) || !strings.Contains(*stored.MetadataJSON, `"worktreeRoot":"/tmp/worktrees"`) || !strings.Contains(*stored.MetadataJSON, `"status":"pending"`) {
+	if !strings.Contains(*stored.MetadataJSON, `"snapshotMode":"off"`) || !strings.Contains(*stored.MetadataJSON, `"validation":{"optOut":true}`) || !strings.Contains(*stored.MetadataJSON, `"worktreeRoot":"/tmp/worktrees"`) || !strings.Contains(*stored.MetadataJSON, `"status":"pending"`) {
 		t.Fatalf("metadata = %s, want preserved settings and reset discovery", *stored.MetadataJSON)
 	}
 	loop, err := fixture.runtime.Services().Repositories.Loops.GetByID(context.Background(), "loop_inert")
