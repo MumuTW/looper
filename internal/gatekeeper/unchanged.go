@@ -144,9 +144,13 @@ func latestGateReports(ctx context.Context, repos *storage.Repositories, project
 //
 // Skipping is refused unless every one of these holds: a previous report exists,
 // it recorded a fingerprint, the fingerprint still matches, the gate is not
-// waiting on check state, the report is younger than maxSkipAge, and — at auto
-// trust — the report does not carry a failed required check.
-func skipUnchanged(previous Report, hasPrevious bool, fingerprint string, trust config.GatekeeperTrustLevel, now time.Time) (Report, bool) {
+// waiting on check state, a newly posted current-head review has not appeared,
+// the report is younger than maxSkipAge, and — at auto trust — the report does
+// not carry a failed required check.
+//
+// reviewEvidenceAppeared is a cheap local event-log result supplied by the
+// discovery caller for reports waiting on a current-head review.
+func skipUnchanged(previous Report, hasPrevious bool, fingerprint string, trust config.GatekeeperTrustLevel, now time.Time, reviewEvidenceAppeared bool) (Report, bool) {
 	if !hasPrevious || strings.TrimSpace(previous.SourceFingerprint) == "" {
 		return Report{}, false
 	}
@@ -162,6 +166,9 @@ func skipUnchanged(previous Report, hasPrevious bool, fingerprint string, trust 
 	// failed report would leave a now-eligible PR unqueued until maxSkipAge.
 	// Re-evaluate instead so the route is published promptly.
 	if trust == config.GatekeeperTrustAuto && reportHasFailedCheck(previous) {
+		return Report{}, false
+	}
+	if reportAwaitsCurrentHeadReview(previous) && reviewEvidenceAppeared {
 		return Report{}, false
 	}
 	evaluatedAt, err := time.Parse(time.RFC3339Nano, previous.EvaluatedAt)

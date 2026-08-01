@@ -283,7 +283,17 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		fingerprint := r.sourceFingerprintForProject(pullRequest, input.ProjectID, input.Repo)
 		entityID := fmt.Sprintf("%s#%d", input.Repo, pullRequest.Number)
 		previous, hasPrevious := previousReports[entityID]
-		if reused, ok := skipUnchanged(previous, hasPrevious, fingerprint, r.trustFor(input.ProjectID), r.now()); ok {
+		// Review evidence is durable local state rather than a list-page field.
+		// Poll it cheaply while a report is waiting for the current head, so a
+		// newly posted Reviewer event invalidates the cache without paying the
+		// full forge evaluation on every tick.
+		reviewEvidenceAppeared := false
+		if hasPrevious && previous.SourceFingerprint == fingerprint && reportAwaitsCurrentHeadReview(previous) {
+			if evidence, reviewErr := latestCodexReviewForHead(ctx, r.repos, input.ProjectID, input.Repo, pullRequest.Number, pullRequest.HeadSHA); reviewErr == nil && evidence.CurrentHeadValid {
+				reviewEvidenceAppeared = true
+			}
+		}
+		if reused, ok := skipUnchanged(previous, hasPrevious, fingerprint, r.trustFor(input.ProjectID), r.now(), reviewEvidenceAppeared); ok {
 			result.Skipped++
 			result.Reports = append(result.Reports, reused)
 			continue
