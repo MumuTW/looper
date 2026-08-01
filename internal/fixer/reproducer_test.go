@@ -147,3 +147,22 @@ func TestFixerReproductionRefusesAgentAuthoredManifestAfterAbsentStart(t *testin
 		t.Fatalf("capture after agent-authored manifest = %v, want refusal", err)
 	}
 }
+
+func TestFixerReproductionFirstCaptureWithPreparedWorktreeAdoptsManifest(t *testing.T) {
+	// Fresh Fixer runs always have FixItems and PreparedAt before the first
+	// capture; that must not be treated as "already past first capture".
+	root, expected := writeFixerReproductionFixture(t)
+	checkpoint := fixerCheckpoint{
+		FixItems: []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", Summary: "bug"}},
+		Worktree: &checkpointWorktree{Path: root, Branch: "fix/pr-1", PreparedAt: "2026-08-01T00:00:00.000Z"},
+	}
+	if err := captureFixerReproduction(&checkpoint, root); err != nil {
+		t.Fatalf("captureFixerReproduction() error = %v", err)
+	}
+	if checkpoint.Reproduction == nil || !checkpoint.Reproduction.Equal(*expected) {
+		t.Fatalf("captured = %#v, want %#v", checkpoint.Reproduction, expected)
+	}
+	if checkpoint.ReproductionAbsent {
+		t.Fatal("ReproductionAbsent = true, want false after successful first capture")
+	}
+}

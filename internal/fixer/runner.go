@@ -979,22 +979,21 @@ func captureFixerReproduction(checkpoint *fixerCheckpoint, worktreePath string) 
 // fixerPastInitialReproductionCapture reports whether the run already advanced
 // past the first durable capture opportunity. Used to fail closed for legacy
 // checkpoints that lack ReproductionAbsent after an upgrade.
+//
+// A freshly prepared worktree with FixItems is NOT past the first capture:
+// runPrepareWorktreeStep always sets Worktree/PreparedAt before the first
+// captureFixerReproduction call, so treating that as "already captured" would
+// refuse every base-branch manifest on a brand-new Fixer run.
 func fixerPastInitialReproductionCapture(checkpoint fixerCheckpoint) bool {
-	// In-progress repair (agent started but Repair not yet stored) still counts:
-	// FixItems + prepared worktree mean capture already had a chance to run.
-	if checkpoint.Repair != nil ||
+	// Steps after the initial capture opportunity. Repair may be set once the
+	// agent has started even if it has not completed.
+	return checkpoint.Repair != nil ||
 		checkpoint.Validation != nil ||
 		checkpoint.Push != nil ||
 		checkpoint.ReconcileCommits != nil ||
 		checkpoint.ResolvedComments != nil ||
 		checkpoint.SummaryComment != nil ||
-		checkpoint.Recheck != nil {
-		return true
-	}
-	if len(checkpoint.FixItems) > 0 && checkpoint.Worktree != nil && strings.TrimSpace(checkpoint.Worktree.PreparedAt) != "" {
-		return true
-	}
-	return false
+		checkpoint.Recheck != nil
 }
 
 func verifyFixerReproduction(checkpoint fixerCheckpoint, worktreePath string) error {

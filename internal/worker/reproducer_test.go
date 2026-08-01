@@ -419,3 +419,38 @@ func TestWorkerCaptureReproductionAdoptsUnscopedManifest(t *testing.T) {
 		t.Fatalf("Reproduction = %#v, want adopted unscoped manifest", checkpoint.Work.Reproduction)
 	}
 }
+
+func TestWorkerReproductionFirstCaptureWithPreparedWorktreeAdoptsManifest(t *testing.T) {
+	// Prepare-worktree always sets Worktree before the first capture call.
+	// That must not trip the legacy past-initial fail-closed path.
+	root, expected := writeWorkerReproductionFixture(t)
+	checkpoint := workerCheckpoint{
+		Work:     &workerInput{IssueNumber: 1, Repo: "acme/app"},
+		Worktree: &checkpointWorktree{Path: root, Branch: "worker/issue-1"},
+	}
+	if err := captureWorkerReproduction(&checkpoint, root); err != nil {
+		t.Fatalf("captureWorkerReproduction() error = %v", err)
+	}
+	if checkpoint.Work.Reproduction == nil || !checkpoint.Work.Reproduction.Equal(*expected) {
+		t.Fatalf("captured = %#v, want %#v", checkpoint.Work.Reproduction, expected)
+	}
+	if checkpoint.ReproductionAbsent {
+		t.Fatal("ReproductionAbsent = true, want false after successful first capture")
+	}
+}
+
+func TestWorkerReproductionFailsClosedForLegacyUnknownAbsence(t *testing.T) {
+	root, _ := writeWorkerReproductionFixture(t)
+	checkpoint := workerCheckpoint{
+		Work:      &workerInput{IssueNumber: 1, Repo: "acme/app"},
+		Worktree:  &checkpointWorktree{Path: root, Branch: "worker/issue-1"},
+		Execution: &checkpointExecution{Status: "timeout"},
+	}
+	err := captureWorkerReproduction(&checkpoint, root)
+	if err == nil || !strings.Contains(err.Error(), "legacy checkpoint") {
+		t.Fatalf("captureWorkerReproduction() = %v, want legacy unknown absence refusal", err)
+	}
+	if checkpoint.Work.Reproduction != nil {
+		t.Fatalf("Reproduction = %#v, want nil", checkpoint.Work.Reproduction)
+	}
+}

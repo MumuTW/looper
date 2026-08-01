@@ -853,18 +853,16 @@ func captureWorkerReproduction(checkpoint *workerCheckpoint, worktreePath string
 
 // workerPastInitialReproductionCapture reports whether the run already advanced
 // past the first durable capture opportunity (for legacy fail-closed migration).
+//
+// A prepared worktree alone is NOT past the first capture: prepare-worktree
+// assigns Worktree then immediately calls captureWorkerReproduction. Treating
+// Worktree presence as "already captured" would refuse every applicable
+// base-branch manifest on a brand-new Worker run.
 func workerPastInitialReproductionCapture(checkpoint workerCheckpoint) bool {
-	if checkpoint.Execution != nil {
-		return true
-	}
-	if checkpoint.Plan != nil || checkpoint.Validation != nil || checkpoint.PullRequest != nil {
-		return true
-	}
-	if checkpoint.Worktree != nil && strings.TrimSpace(checkpoint.Worktree.Path) != "" {
-		// Prepare-worktree completed: first capture opportunity already ran.
-		return true
-	}
-	return false
+	return checkpoint.Execution != nil ||
+		checkpoint.Plan != nil ||
+		checkpoint.Validation != nil ||
+		checkpoint.PullRequest != nil
 }
 
 // workerReproductionManifestAppliesToTask reports whether a manifest loaded
