@@ -17,11 +17,15 @@ import (
 )
 
 const (
-	// reportVersion is 2 because Report.Mode changed meaning: it now carries the
-	// project's configured trust level, spelled as in configuration, where version 1
-	// always wrote the literal "observe_only". Readers must branch on Version rather
-	// than assume a spelling — that no consumer reads Mode today does not make the
-	// persisted format free to redefine in place.
+	// reportVersion is 3. Version 1 always wrote the literal "observe_only" for
+	// Mode; version 2 redefined Mode to carry the project's configured trust
+	// level, spelled as in configuration. Version 3 projects the verified Codex
+	// review outcome for the observed head and adds the codex_blocking_findings
+	// and codex_review_outcome_unknown reason codes, so a report predating it can
+	// advertise an eligible verdict for a head whose underlying pr.review.posted
+	// event has no outcome a fresh evaluation would fail closed on. Readers must
+	// branch on Version rather than assume a spelling — that no consumer reads
+	// Mode today does not make the persisted format free to redefine in place.
 	//
 	// GateReportEventType is the Gate report: the durable event written by
 	// Merge Gatekeeper recording eligible or blocked, stable reasons and
@@ -32,7 +36,7 @@ const (
 	GateReportEventType = "pull_request.merge_gate.evaluated"
 	StatusEligible      = "eligible"
 	StatusBlocked       = "blocked"
-	reportVersion       = 2
+	reportVersion       = 3
 
 	// DefaultDiscoveryPullRequestLimit is how many open pull requests this lane
 	// lists when the caller sets no limit. Exported because the scheduler sizes its

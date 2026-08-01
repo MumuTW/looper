@@ -116,10 +116,20 @@ func latestGateReports(ctx context.Context, repos *storage.Repositories, project
 // instead of being re-evaluated, and that report when so.
 //
 // Skipping is refused unless every one of these holds: a previous report exists,
-// it recorded a fingerprint, the fingerprint still matches, the gate is not
-// waiting on check state, and the report is younger than maxSkipAge.
+// it was written by the current report format, it recorded a fingerprint, the
+// fingerprint still matches, the gate is not waiting on check state, and the
+// report is younger than maxSkipAge.
 func skipUnchanged(previous Report, hasPrevious bool, fingerprint string, now time.Time) (Report, bool) {
 	if !hasPrevious || strings.TrimSpace(previous.SourceFingerprint) == "" {
+		return Report{}, false
+	}
+	// A report predating the current format cannot be reused on rollout: an
+	// eligible report from before outcome gating carries none of the
+	// codex_blocking_findings or codex_review_outcome_unknown reason codes, so
+	// reusing it would keep advertising the old verdict for up to maxSkipAge
+	// even though a fresh evaluation would fail closed on the now-required
+	// review outcome. Re-evaluating is always safe.
+	if previous.Version != reportVersion {
 		return Report{}, false
 	}
 	if previous.SourceFingerprint != fingerprint {

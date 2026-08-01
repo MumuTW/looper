@@ -167,3 +167,41 @@ func hasReason(report Report, code ReasonCode) bool {
 	}
 	return false
 }
+
+// A report predating the outcome-aware format carries none of the
+// codex_blocking_findings or codex_review_outcome_unknown reason codes, so on
+// rollout it must not be reused even when the fingerprint still matches and the
+// report is well inside maxSkipAge — otherwise the gate keeps advertising the
+// old eligible verdict for a head a fresh evaluation would fail closed on.
+func TestSkipUnchangedRejectsReportPredatingOutcomeGating(t *testing.T) {
+	now := time.Date(2026, time.August, 1, 12, 0, 0, 0, time.UTC)
+	fingerprint := sourceFingerprint(openPullRequestFixture())
+	previous := Report{
+		Version: reportVersion - 1, Status: StatusEligible, Eligible: true,
+		SourceFingerprint: fingerprint,
+		EvaluatedAt:       now.Add(-5 * time.Minute).UTC().Format(time.RFC3339Nano),
+	}
+	if _, skipped := skipUnchanged(previous, true, fingerprint, now); skipped {
+		t.Fatalf("skipUnchanged() skipped a version-%d report, want re-evaluation for any report not at the current version", previous.Version)
+	}
+}
+
+// A report at the current version with a matching fingerprint, no volatile
+// reasons, and within maxSkipAge is still reused — the version gate must not
+// regress the steady-state skip.
+func TestSkipUnchangedAcceptsCurrentVersionReport(t *testing.T) {
+	now := time.Date(2026, time.August, 1, 12, 0, 0, 0, time.UTC)
+	fingerprint := sourceFingerprint(openPullRequestFixture())
+	previous := Report{
+		Version: reportVersion, Status: StatusEligible, Eligible: true,
+		SourceFingerprint: fingerprint,
+		EvaluatedAt:       now.Add(-5 * time.Minute).UTC().Format(time.RFC3339Nano),
+	}
+	reused, skipped := skipUnchanged(previous, true, fingerprint, now)
+	if !skipped {
+		t.Fatalf("skipUnchanged() = (_, false), want the current-version report reused")
+	}
+	if reused.Version != reportVersion {
+		t.Fatalf("reused report version = %d, want %d", reused.Version, reportVersion)
+	}
+}

@@ -2834,7 +2834,7 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 			if err := r.applyVerifiedReviewSideEffects(ctx, input, checkpoint, detail, found); err != nil {
 				return checkpoint, err
 			}
-			if err := r.recordPublishedReviewProgress(ctx, input, pending, pendingReviewEvent(pending), found.Outcome); err != nil {
+			if err := r.recordPublishedReviewProgress(ctx, input, pending, verifiedReviewEvent(found), found.Outcome); err != nil {
 				return checkpoint, err
 			}
 			return checkpoint, nil
@@ -2950,7 +2950,7 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 	if err := r.applyVerifiedReviewSideEffects(ctx, input, checkpoint, detail, markerResult); err != nil {
 		return checkpoint, err
 	}
-	if err := r.recordPublishedReviewProgress(ctx, input, pending, pendingReviewEvent(pending), markerResult.Outcome); err != nil {
+	if err := r.recordPublishedReviewProgress(ctx, input, pending, verifiedReviewEvent(markerResult), markerResult.Outcome); err != nil {
 		return checkpoint, err
 	}
 	return checkpoint, nil
@@ -3770,11 +3770,16 @@ func (r *Runner) specReviewingLabel(projectID string) string {
 	return labels.SpecReviewing
 }
 
-func pendingReviewEvent(pending pendingReviewCheckpoint) ReviewEvent {
-	if pending.Event != "" {
-		return pending.Event
-	}
-	return reviewEventAgentNative
+// verifiedReviewEvent returns the GitHub review event observed on the verified
+// marker. This is only called after marker verification succeeds, so Event is
+// one of the GitHub review values Gatekeeper projects (COMMENT, APPROVE,
+// REQUEST_CHANGES). Persisting the pending checkpoint's AGENT_NATIVE placeholder
+// instead would be rejected by Gatekeeper's latestCodexReviewForHead, leaving a
+// prior clean outcome as the latest accepted event for the head — so a later
+// blocking review would not supersede it and the gate could keep treating the
+// head as clean.
+func verifiedReviewEvent(marker ReviewMarkerResult) ReviewEvent {
+	return marker.Event
 }
 
 func hasPendingReviewMarkerMiss(checkpoint reviewerCheckpoint) bool {
