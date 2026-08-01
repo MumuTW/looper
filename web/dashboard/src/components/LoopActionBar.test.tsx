@@ -7,8 +7,9 @@ import {
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
-  classifyRetryWorktree,
-  isWorktreeRouteUnavailable,
+	classifyRetryWorktree,
+	isRetrySafeWorktreePreflight,
+	isWorktreeRouteUnavailable,
   LoopActionBar,
 } from "@/components/LoopActionBar";
 import { ApiError } from "@/lib/api";
@@ -130,6 +131,28 @@ describe("isWorktreeRouteUnavailable", () => {
           "Failed to stat worktree at /w/looper-fix-acme-pr-404: permission denied",
           { status: 500, code: "INTERNAL_ERROR" },
         ),
+      ),
+    ).toBe(false);
+  });
+});
+
+describe("isRetrySafeWorktreePreflight", () => {
+  it("accepts only the daemon's explicit retry-safe validation error", () => {
+    expect(
+      isRetrySafeWorktreePreflight(
+        new ApiError("checkpoint changed", {
+          status: 400,
+          code: "VALIDATION_FAILED",
+          details: { retrySafe: true },
+        }),
+      ),
+    ).toBe(true);
+    expect(
+      isRetrySafeWorktreePreflight(
+        new ApiError("checkpoint changed", {
+          status: 400,
+          code: "VALIDATION_FAILED",
+        }),
       ),
     ).toBe(false);
   });

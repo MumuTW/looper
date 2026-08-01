@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -3468,6 +3469,9 @@ func (r *WorktreesRepository) GetByPath(ctx context.Context, worktreePath string
 // aliases while leaving all other paths as exact identities.
 func equivalentWorktreePaths(path string) []string {
 	canonical := filepath.Clean(strings.TrimSpace(path))
+	if runtime.GOOS != "darwin" {
+		return []string{canonical}
+	}
 	if strings.HasPrefix(canonical, "/private/var/") {
 		canonical = strings.TrimPrefix(canonical, "/private")
 	}
@@ -3475,6 +3479,22 @@ func equivalentWorktreePaths(path string) []string {
 		return []string{canonical, "/private" + canonical}
 	}
 	return []string{canonical}
+}
+
+// WorktreePathsEquivalent reports whether two path spellings identify the
+// same supported worktree location. In particular, macOS exposes /var through
+// /private/var, and worktree discovery may persist either spelling.
+func WorktreePathsEquivalent(a, b string) bool {
+	aPaths := equivalentWorktreePaths(a)
+	bPaths := equivalentWorktreePaths(b)
+	for _, aPath := range aPaths {
+		for _, bPath := range bPaths {
+			if aPath == bPath {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (r *WorktreesRepository) ListByProject(ctx context.Context, projectID string) ([]WorktreeRecord, error) {

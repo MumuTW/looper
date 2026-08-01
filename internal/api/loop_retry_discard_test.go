@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -18,6 +19,7 @@ import (
 	gitinfra "github.com/MumuTW/looper/internal/infra/git"
 	looperdruntime "github.com/MumuTW/looper/internal/runtime"
 	"github.com/MumuTW/looper/internal/storage"
+	workerpkg "github.com/MumuTW/looper/internal/worker"
 )
 
 func TestHandlerLoopWorktreeStatusDirtyAndClean(t *testing.T) {
@@ -1176,6 +1178,479 @@ func TestHandlerLoopRetryDiscardResolvesByPRNotSiblingBranch(t *testing.T) {
 	}
 }
 
+// TestHandlerLoopRetryDiscardRejectsMovedCheckpointWorktree verifies that a
+// checkpoint's worktree identity is the ID/path pair, not whichever path a
+// mutable worktree row currently reports. AdoptPath may retarget the same ID;
+// discard must not reset either the old checkpoint checkout or its replacement.
+func TestHandlerLoopRetryDiscardRejectsMovedCheckpointWorktree(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+	fixture := seedManagedWorktreeFixture(t, services.Repositories, managedWorktreeSeed{
+		ProjectID: "project_retry_discard_moved_checkpoint",
+		LoopID:    "loop_retry_discard_moved_checkpoint",
+		LoopSeq:   3136,
+		LoopType:  "worker",
+		Branch:    "feature/discard-moved-checkpoint",
+		NowISO:    nowISO,
+		Dirty:     true,
+	})
+
+	// This is a real replacement worktree, so a regression would reset and
+	// clean it successfully. Keep the same database ID while moving its path,
+	// matching AdoptPath's identity-preserving update.
+	movedPath := filepath.Join(fixture.WorktreeRoot, "moved-checkpoint")
+	runGitTest(t, fixture.RepoPath, "worktree", "add", "--force", movedPath, "feature/discard-moved-checkpoint")
+	if err := os.WriteFile(filepath.Join(movedPath, "replacement-dirty.txt"), []byte("keep replacement progress\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(replacement dirty) error = %v", err)
+	}
+	record, err := services.Repositories.Worktrees.GetByBranch(context.Background(), "project_retry_discard_moved_checkpoint", "feature/discard-moved-checkpoint")
+	if err != nil || record == nil {
+		t.Fatalf("GetByBranch() = %#v, %v", record, err)
+	}
+	record.WorktreePath = movedPath
+	// A replacement record may also have a different checkout identity. The
+	// resolver must discard these record-derived values with the record and
+	// re-derive identity from the checkpoint path before preflight.
+	detachedMetadata := `{"checkoutMode":"detached"}`
+	replacementHead := "replacement-head"
+	record.MetadataJSON = &detachedMetadata
+	record.HeadSHA = &replacementHead
+	record.UpdatedAt = nowISO
+	if err := services.Repositories.Worktrees.Upsert(context.Background(), *record); err != nil {
+		t.Fatalf("Worktrees.Upsert(moved) error = %v", err)
+	}
+
+	statusReq := httptest.NewRequest(http.MethodGet, "/api/v1/loops/3136/worktree", nil)
+	statusRecorder := httptest.NewRecorder()
+	h.ServeHTTP(statusRecorder, statusReq)
+	if statusRecorder.Code != http.StatusOK {
+		t.Fatalf("worktree status = %d body=%s, want structured unsafe status", statusRecorder.Code, statusRecorder.Body.String())
+	}
+	statusData := parseJSONMap(t, statusRecorder.Body.Bytes())["data"].(map[string]any)
+	assertEqual(t, statusData["reason"], "checkpoint_identity_mismatch")
+	assertEqual(t, statusData["managed"], false)
+	assertEqual(t, statusData["worktreePath"], fixture.WorktreePath)
+	if _, ok := statusData["dirty"]; ok {
+		t.Fatalf("moved-checkpoint status = %#v, want dirty omitted so plain retry remains available", statusData)
+	}
+
+	retryReq := httptest.NewRequest(http.MethodPost, "/api/v1/loops/3136/retry", strings.NewReader(`{"mode":"auto","discardWorktreeChanges":true}`))
+	retryRecorder := httptest.NewRecorder()
+	h.ServeHTTP(retryRecorder, retryReq)
+	if retryRecorder.Code != http.StatusBadRequest || !strings.Contains(retryRecorder.Body.String(), "checkpoint_identity_mismatch") {
+		t.Fatalf("discard retry = %d body=%s, want moved-checkpoint rejection", retryRecorder.Code, retryRecorder.Body.String())
+	}
+
+	plainRetryReq := httptest.NewRequest(http.MethodPost, "/api/v1/loops/3136/retry", strings.NewReader(`{"mode":"auto"}`))
+	plainRetryRecorder := httptest.NewRecorder()
+	h.ServeHTTP(plainRetryRecorder, plainRetryReq)
+	if plainRetryRecorder.Code != http.StatusOK {
+		t.Fatalf("plain retry = %d body=%s, want restored-checkpoint retry to remain available", plainRetryRecorder.Code, plainRetryRecorder.Body.String())
+	}
+	if got := readTestFile(t, filepath.Join(fixture.WorktreePath, "dirty.txt")); got != "untracked\n" {
+		t.Fatalf("checkpoint worktree was discarded: dirty.txt = %q", got)
+	}
+	if got := readTestFile(t, filepath.Join(movedPath, "replacement-dirty.txt")); got != "keep replacement progress\n" {
+		t.Fatalf("replacement worktree was discarded: replacement-dirty.txt = %q", got)
+	}
+	loop, err := services.Repositories.Loops.GetByID(context.Background(), fixture.LoopID)
+	if err != nil || loop == nil || loop.Status != "queued" {
+		t.Fatalf("loop after plain retry = %#v, %v, want queued", loop, err)
+	}
+	queue, err := services.Repositories.Queue.GetLatestByLoopID(context.Background(), fixture.LoopID)
+	if err != nil || queue == nil || queue.Status != "queued" {
+		t.Fatalf("queue after plain retry = %#v, %v, want queued", queue, err)
+	}
+}
+
+func TestHandlerLoopRetryDiscardRejectsCheckpointBranchMismatch(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+	fixture := seedManagedWorktreeFixture(t, services.Repositories, managedWorktreeSeed{
+		ProjectID: "project_retry_discard_branch_mismatch",
+		LoopID:    "loop_retry_discard_branch_mismatch",
+		LoopSeq:   3137,
+		LoopType:  "worker",
+		Branch:    "feature/checkpoint-branch",
+		NowISO:    nowISO,
+		Dirty:     true,
+	})
+
+	runGitTest(t, fixture.WorktreePath, "switch", "-c", "feature/replacement-branch")
+	record, err := services.Repositories.Worktrees.GetByBranch(context.Background(), "project_retry_discard_branch_mismatch", "feature/checkpoint-branch")
+	if err != nil || record == nil {
+		t.Fatalf("GetByBranch() = %#v, %v", record, err)
+	}
+	record.Branch = "feature/replacement-branch"
+	record.UpdatedAt = nowISO
+	if err := services.Repositories.Worktrees.Upsert(context.Background(), *record); err != nil {
+		t.Fatalf("Worktrees.Upsert(replacement branch) error = %v", err)
+	}
+	latestRun, err := services.Repositories.Runs.GetLatestByLoopID(context.Background(), fixture.LoopID)
+	if err != nil || latestRun == nil {
+		t.Fatalf("Runs.GetLatestByLoopID() = %#v, %v", latestRun, err)
+	}
+	checkpointJSON := fmt.Sprintf(`{"resumePolicy":"advance_from_checkpoint","work":{"title":"Resume checkpoint","repo":"acme/looper","baseBranch":"main","executionMode":"create-pr"},"worktree":{"id":%q,"path":%q,"branch":"feature/checkpoint-branch","baseBranch":"main"},"plan":{"summary":"Resume checkpoint","items":["continue"]}}`, record.ID, fixture.WorktreePath)
+	lastCompletedStep := "plan"
+	failedStep := "execute"
+	latestRun.CheckpointJSON = &checkpointJSON
+	latestRun.LastCompletedStep = &lastCompletedStep
+	latestRun.CurrentStep = &failedStep
+	if err := services.Repositories.Runs.Upsert(context.Background(), *latestRun); err != nil {
+		t.Fatalf("Runs.Upsert(worker checkpoint) error = %v", err)
+	}
+
+	statusReq := httptest.NewRequest(http.MethodGet, "/api/v1/loops/3137/worktree", nil)
+	statusRecorder := httptest.NewRecorder()
+	h.ServeHTTP(statusRecorder, statusReq)
+	if statusRecorder.Code != http.StatusBadRequest || !strings.Contains(statusRecorder.Body.String(), "not retry-safe") {
+		t.Fatalf("worktree status = %d body=%s, want physical branch mismatch rejection", statusRecorder.Code, statusRecorder.Body.String())
+	}
+	statusError := parseJSONMap(t, statusRecorder.Body.Bytes())["error"].(map[string]any)
+	statusDetails := statusError["details"].(map[string]any)
+	assertEqual(t, statusDetails["retrySafe"], true)
+
+	retryReq := httptest.NewRequest(http.MethodPost, "/api/v1/loops/3137/retry", strings.NewReader(`{"mode":"auto","discardWorktreeChanges":true}`))
+	retryRecorder := httptest.NewRecorder()
+	h.ServeHTTP(retryRecorder, retryReq)
+	if retryRecorder.Code != http.StatusBadRequest || !strings.Contains(retryRecorder.Body.String(), "checkpoint_identity_mismatch") {
+		t.Fatalf("discard retry = %d body=%s, want branch-mismatch rejection", retryRecorder.Code, retryRecorder.Body.String())
+	}
+	if got := readTestFile(t, filepath.Join(fixture.WorktreePath, "dirty.txt")); got != "untracked\n" {
+		t.Fatalf("replacement branch progress was discarded: dirty.txt = %q", got)
+	}
+
+	// A caller can bypass the CLI preflight and POST a plain retry directly.
+	// The Worker must recheck the physical checkout immediately before agent
+	// start so that API retry cannot turn row drift into replacement-branch work.
+	plainRetryReq := httptest.NewRequest(http.MethodPost, "/api/v1/loops/3137/retry", strings.NewReader(`{"mode":"auto"}`))
+	plainRetryRecorder := httptest.NewRecorder()
+	h.ServeHTTP(plainRetryRecorder, plainRetryReq)
+	if plainRetryRecorder.Code != http.StatusOK {
+		t.Fatalf("plain retry = %d body=%s, want API requeue before Worker identity check", plainRetryRecorder.Code, plainRetryRecorder.Body.String())
+	}
+	claim, err := services.Repositories.Queue.ClaimNextOfType(context.Background(), "2026-12-31T00:00:00.000Z", "worker-identity-test", "worker")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = %#v, %v", claim, err)
+	}
+	realGit := gitinfra.New(gitinfra.Options{GitPath: "git", Repos: services.Repositories})
+	agent := &recordingWorkerAgent{}
+	workerRunner := workerpkg.New(workerpkg.Options{
+		DB:              services.Coordinator.DB(),
+		Repos:           services.Repositories,
+		Git:             workerGitTestAdapter{gateway: realGit},
+		AgentExecutor:   agent,
+		Now:             func() time.Time { return time.Date(2026, time.July, 31, 2, 0, 0, 0, time.UTC) },
+		AllowAutoCommit: true,
+	})
+	result, err := workerRunner.ProcessClaimedQueueItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedQueueItem() error = %v", err)
+	}
+	if result == nil || result.Status != "failed" || result.FailureKind != workerpkg.FailureManualIntervention || !strings.Contains(result.Summary, "checkout identity mismatch") {
+		t.Fatalf("worker result = %#v, want manual-intervention identity refusal", result)
+	}
+	if len(agent.starts) != 0 {
+		t.Fatalf("replacement branch started agent: %#v", agent.starts)
+	}
+	if got := readTestFile(t, filepath.Join(fixture.WorktreePath, "dirty.txt")); got != "untracked\n" {
+		t.Fatalf("replacement branch progress changed during identity refusal: dirty.txt = %q", got)
+	}
+}
+
+func TestHandlerLoopRetryDiscardRejectsPhysicalBranchMismatchBeforeReset(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	fixture := seedManagedWorktreeFixture(t, services.Repositories, managedWorktreeSeed{
+		ProjectID: "project_retry_discard_stale_row",
+		LoopID:    "loop_retry_discard_stale_row",
+		LoopSeq:   3138,
+		LoopType:  "worker",
+		Branch:    "feature/checkpoint-branch",
+		NowISO:    "2026-04-11T12:00:00.000Z",
+		Dirty:     true,
+	})
+
+	// Discovery has not refreshed the row: only the physical checkout proves
+	// that the checkpoint branch was replaced.
+	runGitTest(t, fixture.WorktreePath, "switch", "-c", "feature/replacement-branch")
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/3138/retry", strings.NewReader(`{"mode":"auto","discardWorktreeChanges":true}`))
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusInternalServerError || !strings.Contains(recorder.Body.String(), "verify worktree identity before discard") {
+		t.Fatalf("discard retry = %d body=%s, want physical-branch refusal", recorder.Code, recorder.Body.String())
+	}
+	if got := readTestFile(t, filepath.Join(fixture.WorktreePath, "dirty.txt")); got != "untracked\n" {
+		t.Fatalf("stale-row replacement branch was discarded: dirty.txt = %q", got)
+	}
+}
+
+func TestHandlerLoopRetryDiscardRejectsReplacedCheckpointID(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+	fixture := seedManagedWorktreeFixture(t, services.Repositories, managedWorktreeSeed{
+		ProjectID: "project_retry_discard_replaced_id",
+		LoopID:    "loop_retry_discard_replaced_id",
+		LoopSeq:   3139,
+		LoopType:  "worker",
+		Branch:    "feature/replaced-id",
+		NowISO:    nowISO,
+		Dirty:     true,
+	})
+	record, err := services.Repositories.Worktrees.GetByBranch(context.Background(), "project_retry_discard_replaced_id", "feature/replaced-id")
+	if err != nil || record == nil {
+		t.Fatalf("GetByBranch() = %#v, %v", record, err)
+	}
+	if err := services.Repositories.Worktrees.Delete(context.Background(), record.ID); err != nil {
+		t.Fatalf("Worktrees.Delete() error = %v", err)
+	}
+	replacement := *record
+	replacement.ID = "replacement-worktree-id"
+	replacement.UpdatedAt = nowISO
+	if err := services.Repositories.Worktrees.Upsert(context.Background(), replacement); err != nil {
+		t.Fatalf("Worktrees.Upsert(replacement) error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/3139/retry", strings.NewReader(`{"mode":"auto","discardWorktreeChanges":true}`))
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), "checkpoint_identity_missing") {
+		t.Fatalf("discard retry = %d body=%s, want missing checkpoint ID refusal", recorder.Code, recorder.Body.String())
+	}
+	if got := readTestFile(t, filepath.Join(fixture.WorktreePath, "dirty.txt")); got != "untracked\n" {
+		t.Fatalf("replacement ID worktree was discarded: dirty.txt = %q", got)
+	}
+
+	// Plain retry must also stop before agent execution: the physical checkout
+	// still matches, but the active record now proves its checkpoint ID was
+	// replaced at that same path and branch.
+	latestRun, err := services.Repositories.Runs.GetLatestByLoopID(context.Background(), fixture.LoopID)
+	if err != nil || latestRun == nil {
+		t.Fatalf("Runs.GetLatestByLoopID() = %#v, %v", latestRun, err)
+	}
+	checkpointJSON := fmt.Sprintf(`{"resumePolicy":"advance_from_checkpoint","work":{"title":"Resume checkpoint","repo":"acme/looper","baseBranch":"main","executionMode":"create-pr"},"worktree":{"id":%q,"path":%q,"branch":%q,"baseBranch":"main"},"plan":{"summary":"Resume checkpoint","items":["continue"]}}`, record.ID, fixture.WorktreePath, record.Branch)
+	lastCompletedStep := "plan"
+	failedStep := "execute"
+	latestRun.CheckpointJSON = &checkpointJSON
+	latestRun.LastCompletedStep = &lastCompletedStep
+	latestRun.CurrentStep = &failedStep
+	if err := services.Repositories.Runs.Upsert(context.Background(), *latestRun); err != nil {
+		t.Fatalf("Runs.Upsert(worker checkpoint) error = %v", err)
+	}
+	plainRetryReq := httptest.NewRequest(http.MethodPost, "/api/v1/loops/3139/retry", strings.NewReader(`{"mode":"auto"}`))
+	plainRetryRecorder := httptest.NewRecorder()
+	h.ServeHTTP(plainRetryRecorder, plainRetryReq)
+	if plainRetryRecorder.Code != http.StatusOK {
+		t.Fatalf("plain retry = %d body=%s, want API requeue", plainRetryRecorder.Code, plainRetryRecorder.Body.String())
+	}
+	claim, err := services.Repositories.Queue.ClaimNextOfType(context.Background(), "2026-12-31T00:00:00.000Z", "worker-replacement-id", "worker")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = %#v, %v", claim, err)
+	}
+	realGit := gitinfra.New(gitinfra.Options{GitPath: "git", Repos: services.Repositories})
+	agent := &recordingWorkerAgent{}
+	workerRunner := workerpkg.New(workerpkg.Options{DB: services.Coordinator.DB(), Repos: services.Repositories, Git: workerGitTestAdapter{gateway: realGit}, AgentExecutor: agent, Now: func() time.Time { return time.Date(2026, time.July, 31, 2, 0, 0, 0, time.UTC) }, AllowAutoCommit: true})
+	result, err := workerRunner.ProcessClaimedQueueItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedQueueItem() error = %v", err)
+	}
+	if result == nil || result.FailureKind != workerpkg.FailureManualIntervention || !strings.Contains(result.Summary, "record has been replaced") {
+		t.Fatalf("worker result = %#v, want replacement-ID manual intervention", result)
+	}
+	if len(agent.starts) != 0 {
+		t.Fatalf("replacement ID started agent: %#v", agent.starts)
+	}
+}
+
+func TestHandlerLoopRetryDiscardRejectsPathOnlyCheckpointWithoutBranch(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+	fixture := seedManagedWorktreeFixture(t, services.Repositories, managedWorktreeSeed{
+		ProjectID: "project_retry_discard_path_only", LoopID: "loop_retry_discard_path_only", LoopSeq: 3144,
+		LoopType: "worker", Branch: "feature/path-only", NowISO: nowISO, Dirty: true,
+	})
+	record, err := services.Repositories.Worktrees.GetByBranch(context.Background(), "project_retry_discard_path_only", "feature/path-only")
+	if err != nil || record == nil {
+		t.Fatalf("GetByBranch() = %#v, %v", record, err)
+	}
+	if err := services.Repositories.Worktrees.Delete(context.Background(), record.ID); err != nil {
+		t.Fatalf("Worktrees.Delete() error = %v", err)
+	}
+	latestRun, err := services.Repositories.Runs.GetLatestByLoopID(context.Background(), fixture.LoopID)
+	if err != nil || latestRun == nil {
+		t.Fatalf("Runs.GetLatestByLoopID() = %#v, %v", latestRun, err)
+	}
+	checkpoint := fmt.Sprintf(`{"worktree":{"path":%q}}`, fixture.WorktreePath)
+	latestRun.CheckpointJSON = &checkpoint
+	latestRun.UpdatedAt = nowISO
+	if err := services.Repositories.Runs.Upsert(context.Background(), *latestRun); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/3144/retry", strings.NewReader(`{"mode":"auto","discardWorktreeChanges":true}`))
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), "checkpoint branch is required") {
+		t.Fatalf("discard retry = %d body=%s, want branch validation failure", recorder.Code, recorder.Body.String())
+	}
+	if got := readTestFile(t, filepath.Join(fixture.WorktreePath, "dirty.txt")); got != "untracked\n" {
+		t.Fatalf("path-only checkpoint discarded worktree: dirty.txt = %q", got)
+	}
+}
+
+func TestHandlerLoopRetryDiscardRejectsWrongRepository(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	fixture := seedManagedWorktreeFixture(t, services.Repositories, managedWorktreeSeed{
+		ProjectID: "project_retry_discard_wrong_repo",
+		LoopID:    "loop_retry_discard_wrong_repo",
+		LoopSeq:   3140,
+		LoopType:  "worker",
+		Branch:    "feature/wrong-repo",
+		NowISO:    "2026-04-11T12:00:00.000Z",
+		Dirty:     true,
+	})
+
+	runGitTest(t, fixture.RepoPath, "worktree", "remove", "--force", fixture.WorktreePath)
+	if err := os.MkdirAll(fixture.WorktreePath, 0o755); err != nil {
+		t.Fatalf("MkdirAll(replacement repo) error = %v", err)
+	}
+	runGitTest(t, fixture.WorktreePath, "init", "-b", "feature/wrong-repo")
+	runGitTest(t, fixture.WorktreePath, "config", "user.email", "looper@example.com")
+	runGitTest(t, fixture.WorktreePath, "config", "user.name", "Looper Test")
+	if err := os.WriteFile(filepath.Join(fixture.WorktreePath, "dirty.txt"), []byte("replacement progress\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(replacement progress) error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/3140/retry", strings.NewReader(`{"mode":"auto","discardWorktreeChanges":true}`))
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusInternalServerError || !strings.Contains(recorder.Body.String(), "does not belong to project repository") {
+		t.Fatalf("discard retry = %d body=%s, want wrong-repository refusal", recorder.Code, recorder.Body.String())
+	}
+	if got := readTestFile(t, filepath.Join(fixture.WorktreePath, "dirty.txt")); got != "replacement progress\n" {
+		t.Fatalf("wrong repository progress was discarded: dirty.txt = %q", got)
+	}
+}
+
+func TestHandlerLoopRetryDiscardAllowsDirtyDetachedFixerAndReviewer(t *testing.T) {
+	for _, loopType := range []string{"fixer", "reviewer"} {
+		loopType := loopType
+		t.Run(loopType, func(t *testing.T) {
+			rt, cfg := startTestRuntime(t)
+			h := NewHandler(Context{Config: cfg, Runtime: rt})
+			services := rt.Services()
+			fixture := seedManagedWorktreeFixture(t, services.Repositories, managedWorktreeSeed{
+				ProjectID:    "project_retry_discard_detached_" + loopType,
+				LoopID:       "loop_retry_discard_detached_" + loopType,
+				LoopSeq:      3141,
+				LoopType:     loopType,
+				Branch:       "feature/detached-" + loopType,
+				NowISO:       "2026-04-11T12:00:00.000Z",
+				Dirty:        true,
+				CheckoutMode: gitinfra.CheckoutModeDetached,
+			})
+			req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/v1/loops/%d/retry", 3141), strings.NewReader(`{"mode":"auto","discardWorktreeChanges":true}`))
+			recorder := httptest.NewRecorder()
+			h.ServeHTTP(recorder, req)
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("discard retry = %d body=%s, want detached checkout discard", recorder.Code, recorder.Body.String())
+			}
+			data := parseJSONMap(t, recorder.Body.Bytes())["data"].(map[string]any)
+			discard := data["worktreeDiscard"].(map[string]any)
+			assertEqual(t, discard["discarded"], true)
+			if got := readTestFile(t, filepath.Join(fixture.WorktreePath, "README.md")); got != "hello\n" {
+				t.Fatalf("README after detached discard = %q, want clean content", got)
+			}
+		})
+	}
+}
+
+func TestHandlerLoopRetryDiscardUsesReconciledDetachedHead(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	fixture := seedManagedWorktreeFixture(t, services.Repositories, managedWorktreeSeed{
+		ProjectID: "project_retry_discard_reconciled_head", LoopID: "loop_retry_discard_reconciled_head", LoopSeq: 3145,
+		LoopType: "fixer", Branch: "feature/reconciled-head", NowISO: "2026-04-11T12:00:00.000Z", Dirty: true, CheckoutMode: gitinfra.CheckoutModeDetached,
+	})
+	record, err := services.Repositories.Worktrees.GetByBranch(context.Background(), "project_retry_discard_reconciled_head", "feature/reconciled-head")
+	if err != nil || record == nil || record.HeadSHA == nil {
+		t.Fatalf("GetByBranch() = %#v, %v", record, err)
+	}
+	initialHead := *record.HeadSHA
+	runGitTest(t, fixture.WorktreePath, "add", "README.md")
+	runGitTest(t, fixture.WorktreePath, "commit", "-m", "fix: reconciled detached head")
+	finalHead := runGitOutputTest(t, fixture.WorktreePath, "rev-parse", "HEAD")
+	latestRun, err := services.Repositories.Runs.GetLatestByLoopID(context.Background(), fixture.LoopID)
+	if err != nil || latestRun == nil {
+		t.Fatalf("Runs.GetLatestByLoopID() = %#v, %v", latestRun, err)
+	}
+	checkpoint := fmt.Sprintf(`{"worktree":{"id":%q,"path":%q,"branch":%q,"headSha":%q},"reconcileCommits":{"finalHeadSha":%q}}`, record.ID, fixture.WorktreePath, record.Branch, initialHead, finalHead)
+	latestRun.CheckpointJSON = &checkpoint
+	if err := services.Repositories.Runs.Upsert(context.Background(), *latestRun); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/3145/retry", strings.NewReader(`{"mode":"auto","discardWorktreeChanges":true}`))
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("discard retry = %d body=%s, want reconciled detached discard", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestHandlerLoopRetryDiscardMissingWorktreeRemainsNoOp(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	fixture := seedManagedWorktreeFixture(t, services.Repositories, managedWorktreeSeed{
+		ProjectID: "project_retry_discard_missing_path",
+		LoopID:    "loop_retry_discard_missing_path",
+		LoopSeq:   3142,
+		LoopType:  "worker",
+		Branch:    "feature/missing-path",
+		NowISO:    "2026-04-11T12:00:00.000Z",
+		Dirty:     true,
+	})
+	if err := os.RemoveAll(fixture.WorktreePath); err != nil {
+		t.Fatalf("RemoveAll(worktree) error = %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/3142/retry", strings.NewReader(`{"mode":"auto","discardWorktreeChanges":true}`))
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("discard retry = %d body=%s, want missing-path no-op", recorder.Code, recorder.Body.String())
+	}
+	data := parseJSONMap(t, recorder.Body.Bytes())["data"].(map[string]any)
+	discard := data["worktreeDiscard"].(map[string]any)
+	assertEqual(t, discard["noOp"], true)
+	assertEqual(t, discard["reason"], "worktree_missing")
+}
+
+func TestSameFilesystemPathSupportsMacOSVarAlias(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS != "darwin" {
+		t.Skip("/var and /private/var are distinct paths off macOS")
+	}
+
+	if !sameFilesystemPath("/var/folders/example/worktree", "/private/var/folders/example/worktree") {
+		t.Fatal("macOS /var alias was treated as a moved worktree")
+	}
+	if sameFilesystemPath("/var/folders/example/one", "/private/var/folders/example/two") {
+		t.Fatal("different worktrees were treated as equivalent")
+	}
+}
+
 // TestHandlerLoopRetryDiscardRejectsAwaitingHuman ensures discard+retry refuses
 // awaiting_human loops so runtime HITL poll requeue cannot race after preflight
 // and leave a wiped worktree when the retry TX conflicts.
@@ -1890,13 +2365,54 @@ func mustLoopTargetFromFixture(t *testing.T, repos *storage.Repositories, loopID
 }
 
 type managedWorktreeSeed struct {
-	ProjectID string
-	LoopID    string
-	LoopSeq   int64
-	LoopType  string
-	Branch    string
-	NowISO    string
-	Dirty     bool
+	ProjectID    string
+	LoopID       string
+	LoopSeq      int64
+	LoopType     string
+	Branch       string
+	NowISO       string
+	Dirty        bool
+	CheckoutMode gitinfra.CheckoutMode
+}
+
+type workerGitTestAdapter struct{ gateway *gitinfra.Gateway }
+
+func (a workerGitTestAdapter) CreateWorktree(ctx context.Context, input workerpkg.CreateWorktreeInput) (workerpkg.CreateWorktreeResult, error) {
+	return workerpkg.CreateWorktreeResult{}, fmt.Errorf("unexpected CreateWorktree(%s)", input.Branch)
+}
+
+func (a workerGitTestAdapter) PrepareWorktree(ctx context.Context, input workerpkg.PrepareWorktreeInput) (workerpkg.PrepareWorktreeResult, error) {
+	return workerpkg.PrepareWorktreeResult{}, fmt.Errorf("unexpected PrepareWorktree(%s)", input.WorktreePath)
+}
+
+func (a workerGitTestAdapter) InspectHead(ctx context.Context, input workerpkg.InspectHeadInput) (workerpkg.InspectHeadResult, error) {
+	return workerpkg.InspectHeadResult{}, fmt.Errorf("unexpected InspectHead(%s)", input.WorktreePath)
+}
+
+func (a workerGitTestAdapter) VerifyWorktreeIdentity(ctx context.Context, input workerpkg.VerifyWorktreeIdentityInput) error {
+	return a.gateway.VerifyWorktreeIdentity(ctx, gitinfra.VerifyWorktreeIdentityInput{
+		RepoPath:        input.RepoPath,
+		WorktreeRoot:    input.WorktreeRoot,
+		WorktreePath:    input.WorktreePath,
+		ExpectedBranch:  input.ExpectedBranch,
+		ExpectedHeadSHA: input.ExpectedHeadSHA,
+		CheckoutMode:    gitinfra.CheckoutMode(input.CheckoutMode),
+	})
+}
+
+func (a workerGitTestAdapter) Commit(ctx context.Context, input workerpkg.CommitInput) (workerpkg.CommitResult, error) {
+	return workerpkg.CommitResult{}, fmt.Errorf("unexpected Commit(%s)", input.WorktreePath)
+}
+
+func (a workerGitTestAdapter) Push(ctx context.Context, input workerpkg.PushInput) error {
+	return fmt.Errorf("unexpected Push(%s)", input.WorktreePath)
+}
+
+type recordingWorkerAgent struct{ starts []workerpkg.AgentRunInput }
+
+func (a *recordingWorkerAgent) Start(_ context.Context, input workerpkg.AgentRunInput) (workerpkg.AgentExecution, error) {
+	a.starts = append(a.starts, input)
+	return nil, fmt.Errorf("unexpected worker agent start")
 }
 
 type managedWorktreeFixture struct {
@@ -1955,6 +2471,7 @@ func seedManagedWorktreeFixture(t *testing.T, repos *storage.Repositories, seed 
 		Branch:       seed.Branch,
 		BaseBranch:   "main",
 		PRNumber:     42,
+		CheckoutMode: seed.CheckoutMode,
 	})
 	if err != nil {
 		t.Fatalf("CreateWorktree() error = %v", err)
@@ -2039,6 +2556,18 @@ func runGitTest(t *testing.T, cwd string, args ...string) {
 	if err != nil {
 		t.Fatalf("git %v in %s failed: %v\n%s", args, cwd, err, out)
 	}
+}
+
+func runGitOutputTest(t *testing.T, cwd string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = cwd
+	cmd.Env = append(os.Environ(), "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null")
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("git %v in %s failed: %v", args, cwd, err)
+	}
+	return strings.TrimSpace(string(out))
 }
 
 func readTestFile(t *testing.T, path string) string {

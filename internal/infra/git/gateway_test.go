@@ -950,11 +950,18 @@ func TestGatewayIgnoresStoredWorktreesFromDifferentRepoPath(t *testing.T) {
 func TestNormalizeComparablePathTrimsOnlyPrivateSlashPrefix(t *testing.T) {
 	t.Parallel()
 
-	if got := normalizeComparablePath("/private/var/tmp/repo"); got != "/var/tmp/repo" {
-		t.Fatalf("normalizeComparablePath(/private/var/tmp/repo) = %q, want %q", got, "/var/tmp/repo")
-	}
-	if got := normalizeComparablePath("/private-repo/worktree"); got != "/private-repo/worktree" {
-		t.Fatalf("normalizeComparablePath(/private-repo/worktree) = %q, want %q", got, "/private-repo/worktree")
+	for _, tc := range []struct {
+		goos string
+		path string
+		want string
+	}{
+		{goos: "darwin", path: "/private/var/tmp/repo", want: "/var/tmp/repo"},
+		{goos: "linux", path: "/private/var/tmp/repo", want: "/private/var/tmp/repo"},
+		{goos: "darwin", path: "/private-repo/worktree", want: "/private-repo/worktree"},
+	} {
+		if got := normalizeComparablePathForOS(tc.path, tc.goos); got != tc.want {
+			t.Fatalf("normalizeComparablePathForOS(%q, %q) = %q, want %q", tc.path, tc.goos, got, tc.want)
+		}
 	}
 }
 
@@ -1262,9 +1269,10 @@ func TestGatewayDiscardWorktreeChangesResetsTrackedAndUntracked(t *testing.T) {
 	writeFile(t, filepath.Join(worktree.WorktreePath, "untracked-dir", "nested.txt"), "nested\n")
 
 	result, err := gateway.DiscardWorktreeChanges(ctx, DiscardWorktreeChangesInput{
-		RepoPath:     fixture.repoPath,
-		WorktreeRoot: fixture.worktreeRoot,
-		WorktreePath: worktree.WorktreePath,
+		RepoPath:       fixture.repoPath,
+		WorktreeRoot:   fixture.worktreeRoot,
+		WorktreePath:   worktree.WorktreePath,
+		ExpectedBranch: "feature/fixer",
 	})
 	if err != nil {
 		t.Fatalf("DiscardWorktreeChanges() error = %v", err)
@@ -1291,9 +1299,10 @@ func TestGatewayDiscardWorktreeChangesResetsTrackedAndUntracked(t *testing.T) {
 
 	// Second call is a no-op when already clean.
 	second, err := gateway.DiscardWorktreeChanges(ctx, DiscardWorktreeChangesInput{
-		RepoPath:     fixture.repoPath,
-		WorktreeRoot: fixture.worktreeRoot,
-		WorktreePath: worktree.WorktreePath,
+		RepoPath:       fixture.repoPath,
+		WorktreeRoot:   fixture.worktreeRoot,
+		WorktreePath:   worktree.WorktreePath,
+		ExpectedBranch: "feature/fixer",
 	})
 	if err != nil {
 		t.Fatalf("DiscardWorktreeChanges(clean) error = %v", err)
@@ -1334,9 +1343,10 @@ func TestGatewayDiscardWorktreeChangesRemovesNestedRepositories(t *testing.T) {
 	runGit(t, nestedPath, "-c", "user.email=test@example.com", "-c", "user.name=test", "commit", "-m", "nested")
 
 	result, err := gateway.DiscardWorktreeChanges(ctx, DiscardWorktreeChangesInput{
-		RepoPath:     fixture.repoPath,
-		WorktreeRoot: fixture.worktreeRoot,
-		WorktreePath: worktree.WorktreePath,
+		RepoPath:       fixture.repoPath,
+		WorktreeRoot:   fixture.worktreeRoot,
+		WorktreePath:   worktree.WorktreePath,
+		ExpectedBranch: "feature/fixer",
 	})
 	if err != nil {
 		t.Fatalf("DiscardWorktreeChanges() error = %v", err)
@@ -1413,9 +1423,10 @@ func TestGatewayDiscardWorktreeChangesResetsDirtySubmodules(t *testing.T) {
 	writeFile(t, filepath.Join(vendorPath, "untracked-in-sub.txt"), "sub untracked\n")
 
 	result, err := gateway.DiscardWorktreeChanges(ctx, DiscardWorktreeChangesInput{
-		RepoPath:     fixture.repoPath,
-		WorktreeRoot: fixture.worktreeRoot,
-		WorktreePath: worktree.WorktreePath,
+		RepoPath:       fixture.repoPath,
+		WorktreeRoot:   fixture.worktreeRoot,
+		WorktreePath:   worktree.WorktreePath,
+		ExpectedBranch: "feature/fixer",
 	})
 	if err != nil {
 		t.Fatalf("DiscardWorktreeChanges() error = %v", err)
