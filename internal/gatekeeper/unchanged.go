@@ -152,15 +152,23 @@ func latestGateReports(ctx context.Context, repos *storage.Repositories, project
 //
 // Skipping is refused unless every one of these holds: a previous report exists,
 // it recorded a fingerprint, the fingerprint still matches, the gate is not
-// waiting on check or convergence state, the gate is not waiting on a review
-// event that has since appeared, and the report is younger than maxSkipAge.
+// waiting on check or convergence state, the convergence blocker (if any) has
+// not advanced, the gate is not waiting on a review event that has since
+// appeared, and the report is younger than maxSkipAge.
+//
+// currentConvergenceRevision is the newest persisted convergence revision for
+// this pull request, read locally by the discovery lane. A blocked convergence
+// report is reused when that revision is unchanged — the durable Reviewer state
+// has not moved, so the blocker is still valid and a local SQLite read is
+// enough — and re-evaluated only when it advances, instead of re-polling the
+// forge on every tick while a PR awaits human or reviewer progress.
 //
 // reviewEvidenceAppeared is the result of a cheap local event-log check made by
 // the caller for reports awaiting a current-head review. When the review event
 // has not appeared, the PR is skipped because re-evaluating would reach the same
 // conclusion without the event and would pay forge round trips every tick; when
 // it has appeared, the PR is re-evaluated so the new evidence is observed.
-func skipUnchanged(previous Report, hasPrevious bool, fingerprint string, now time.Time, reviewEvidenceAppeared bool) (Report, bool) {
+func skipUnchanged(previous Report, hasPrevious bool, fingerprint string, now time.Time, currentConvergenceRevision string, reviewEvidenceAppeared bool) (Report, bool) {
 	if !hasPrevious || strings.TrimSpace(previous.SourceFingerprint) == "" {
 		return Report{}, false
 	}
@@ -171,7 +179,14 @@ func skipUnchanged(previous Report, hasPrevious bool, fingerprint string, now ti
 		return Report{}, false
 	}
 	if reportAwaitsConvergenceState(previous) {
-		return Report{}, false
+		// The durable Reviewer state can change merge eligibility without moving
+		// any field the forge list fingerprint observes. Re-evaluate when the
+		// convergence revision has advanced (the Reviewer recorded progress, or
+		// its loop was superseded); otherwise the persisted blocker is still
+		// valid and the report can be reused without re-polling the forge.
+		if previousConvergenceRevision(previous) != currentConvergenceRevision {
+			return Report{}, false
+		}
 	}
 	if reportAwaitsCurrentHeadReview(previous) && reviewEvidenceAppeared {
 		return Report{}, false
@@ -184,4 +199,15 @@ func skipUnchanged(previous Report, hasPrevious bool, fingerprint string, now ti
 		return Report{}, false
 	}
 	return previous, true
+}
+
+// previousConvergenceRevision is the convergence revision recorded on a prior
+// gate report. An empty result means the report carried no convergence evidence
+// (and therefore no convergence blocker), so it cannot match a non-empty live
+// revision and forces re-evaluation if one appears.
+func previousConvergenceRevision(report Report) string {
+	if report.Evidence.ReviewerConvergence == nil {
+		return ""
+	}
+	return convergenceRevision(*report.Evidence.ReviewerConvergence)
 }

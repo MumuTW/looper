@@ -275,6 +275,15 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
+	// Convergence state is durable Reviewer metadata in SQLite, so a blocked
+	// report can be reused unless that metadata advanced. Reading the current
+	// convergence revision per pull request in one local query lets the
+	// unchanged path detect Reviewer progress without re-polling the forge on
+	// every tick.
+	convergenceRevisions, err := latestConvergenceRevisions(ctx, r.repos, input.ProjectID)
+	if err != nil {
+		return DiscoveryResult{}, err
+	}
 	result := DiscoveryResult{Reports: make([]Report, 0, len(pullRequests))}
 	diffBudget := r.diffBudget(input.ProjectID)
 	budgetEnabled := diffBudget.MaxChangedFiles > 0 || diffBudget.MaxDeletions > 0
@@ -298,7 +307,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 				reviewEvidenceAppeared = true
 			}
 		}
-		if reused, ok := skipUnchanged(previous, hasPrevious, fingerprint, r.now(), reviewEvidenceAppeared); ok {
+		if reused, ok := skipUnchanged(previous, hasPrevious, fingerprint, r.now(), convergenceRevisions[entityID], reviewEvidenceAppeared); ok {
 			result.Skipped++
 			result.Reports = append(result.Reports, reused)
 			continue
@@ -516,7 +525,7 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 	}
 	sort.Strings(report.Evidence.UnresolvedReviewThreadIDs)
 
-	convergenceEvidence, hasConvergence, err := latestReviewerConvergence(ctx, r.repos, input.ProjectID, input.Repo, input.PRNumber)
+	convergenceEvidence, hasConvergence, err := latestReviewerConvergence(ctx, r.repos, input.ProjectID, input.Repo, input.PRNumber, report.ObservedHeadSHA)
 	if err != nil {
 		return r.persistProviderBlock(ctx, report, ReasonProviderStateUnavailable, "reviewer_convergence")
 	}
