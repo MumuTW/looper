@@ -106,6 +106,16 @@ hour, causing overlap or missing merges. `end(D)` is built via
 `time.Location` resolve the DST transition so the window is always the
 full calendar day.
 
+The start boundary uses the same calendar-day helper and does not assume that
+`time.Date(D.year, D.month, D.day, 0, 0, 0, 0, loc)` is a valid instant. Some
+timezones move their clocks forward at local midnight; Go may normalize that
+request to the prior date (or another wall time), which would make the window
+overlap the preceding digest. The helper validates the returned local date and
+wall clock, and when midnight is nonexistent it searches forward from the
+transition until the first valid instant whose local date is `D` (the start of
+that calendar date). `end(D)` is computed as the same helper for `D+1`, so both
+bounds are valid date boundaries even on a midnight transition.
+
 A fixed date-derived boundary is required so the date-only dashboard route
 can reconstruct the exact window the job pushed: the window is a pure
 function of the digest date and the configured timezone, both of which the
@@ -119,7 +129,13 @@ Assembly reads:
 - `EventsRepository.ListBetween(ctx, sinceISO, untilISO)` for the window
   (`internal/storage/repositories.go`), a new bounded range query with an
   **exclusive end bound**:
-  `SELECT * FROM event_logs WHERE created_at >= ? AND created_at < ? ORDER BY created_at ASC, id ASC`.
+  `SELECT * FROM event_logs WHERE created_at >= ? AND created_at < ? ORDER BY created_at ASC, rowid ASC`.
+  The implicit SQLite `rowid` is the insertion-order tie-breaker; random event
+  IDs are not causal and must not be used for this purpose. Every
+  latest/consecutive-event query used by the digest (`ListBetween`,
+  `ListByEntity`, and latest-per-entity enumeration) applies the same
+  `created_at, rowid` ordering, and validation inserts equal-millisecond events
+  to prove the backward scan selects the actual insertion order.
   The existing `ListSince` applies only `created_at >= since` and is not
   used: an unbounded historical scan would let a `/api/v1/digest?date=`
   request for an old date read every event from that date through the
@@ -168,6 +184,12 @@ For each `pull_request.merge_gate.merge_attempted` event with
 - PR identity (`Repo`, `PRNumber`) from the `MergeOutcome` event itself,
   which carries them authoritatively; PR title from the head-matched
   snapshot (`GetLatestByProjectAndHead` for the merge event's `HeadSHA`).
+  The rendered pull-request URL is built from the event's `Repo` using
+  `githubinfra.SplitRepoHostname`: an unqualified repo uses `github.com`,
+  while a host-qualified value such as
+  `github.example.com/acme/looper` preserves that enterprise hostname and
+  links to `https://github.example.com/acme/looper/pull/<PRNumber>`. The
+  renderer must never hard-code the cloud host.
   Every selected `MergeOutcome` already carries `Repo` and `PRNumber`, so
   the repository and PR number never depend on the snapshot: when no
   snapshot matches the merged head, only snapshot-owned fields (title,
@@ -176,7 +198,13 @@ For each `pull_request.merge_gate.merge_attempted` event with
   is never read from a newer snapshot for a different head.
 - Originating issue: resolved via a project-scoped loop lookup using the
   merge event's `ProjectID`, `Repo`, and `PRNumber` — the loop's source
-  issue is the originating issue. The merge event is appended by
+  issue is the originating issue. A source issue is identified by the
+  **composite** `(IssueRepo, IssueNumber)` from the worker metadata, not by
+  number alone: `owner/a#42` and `owner/b#42` are distinct issues. The
+  collected candidate set and conflict check therefore use both fields, the
+  digest renders both repo and number (using the persisted `IssueURL` when
+  present for the link's host), and a missing `IssueRepo` or number omits the
+  issue rather than guessing the merge repository. The merge event is appended by
   `persistMergeOutcome` with `ProjectID`, `EntityType`, and `EntityID`;
   it carries no `LoopID`, so a `merge event → LoopRecord` join on
   `LoopID` is not possible. The existing
@@ -215,7 +243,7 @@ For each `pull_request.merge_gate.merge_attempted` event with
   A's clean verdict for B. This per-PR verdict is read from the PR's full
   `pr.review.posted` history via
   `EventsRepository.ListByEntity(ctx, "pull_request", entityID)` (ordered
-  `created_at ASC`), **not** from the digest date's `ListBetween` result:
+  `created_at ASC, rowid ASC`), **not** from the digest date's `ListBetween` result:
   a merge at 00:05 whose head-matched review was posted at 23:55 the
   previous day lies outside the digest's `ListBetween` window, so a
   window-bounded lookup would render the verdict unavailable despite a
@@ -229,7 +257,13 @@ For each `pull_request.merge_gate.merge_attempted` event with
   GitHub's aggregate decision, not Looper's outcome, so presenting it as
   the verdict would be a guess.
 - Gatekeeper gate summary at merge time: the confirming `GateReport`
-  evidence. `MergeOutcome.AttemptedAt` is stamped **before**
+  evidence. The confirming pass carries a fresh
+  `ConfirmationCorrelationID` through its `GateReport` event and the
+  eventual `merge_attempted` event's existing event-log `CorrelationID`; the
+  digest requires that exact correlation match in addition to project and
+  head. Generate it once for the confirming pass and thread it through the
+  existing `EvaluationInput`/event-log fields; no new table or persisted
+  authority is introduced. `MergeOutcome.AttemptedAt` is stamped **before**
   `confirmAndMerge` calls `EvaluatePullRequest` for the confirming pass
   (`internal/gatekeeper/merge.go`), and that confirming evaluation
   persists the `GateReport` that proves the merge was eligible, so the
@@ -238,13 +272,16 @@ For each `pull_request.merge_gate.merge_attempted` event with
   return the earlier first-pass report and exclude the actual confirming
   evidence. The assembly instead selects the most recent
   `GateReportEventType` event for the PR **whose head matches the merged
-  `HeadSHA`** and **whose event record's `ProjectID` equals the
-  `MergeOutcome.ProjectID`** and whose `EvaluatedAt` is at or before the
+  `HeadSHA`**, **whose event record's `ProjectID` equals the
+  `MergeOutcome.ProjectID`**, and **whose event-log `CorrelationID` equals
+  the merge event's confirming correlation**; the report's `EvaluatedAt` is
+  still required to be at or before the
   `MergeOutcomeEventType` event's own persisted `created_at` (the outcome
   event bounds the confirming report, which is persisted before the
   outcome is appended). This confirming report is read from the merge
   PR's full gate-report history via
-  `EventsRepository.ListByEntity(ctx, "pull_request", entityID)`, **not**
+  `EventsRepository.ListByEntity(ctx, "pull_request", entityID)` (ordered
+  `created_at ASC, rowid ASC`), **not**
   from the digest date's `ListBetween` result: when confirmation starts
   just before midnight and the forge merge finishes just after midnight,
   the successful `MergeOutcome` belongs to the new digest window while
@@ -256,7 +293,9 @@ For each `pull_request.merge_gate.merge_attempted` event with
   it is populated only when the confirming evaluation becomes blocked, in
   which case `Merged` remains `false`, so every event selected here with
   `Merged == true` has an empty `ConfirmingReasons`. A successful merge
-  therefore has no blocking-reason summary by definition. The digest
+  therefore has no blocking-reason summary by definition. A legacy merge
+  event without the confirming correlation renders the gate evidence
+  unavailable rather than falling back to timestamp/head matching. The digest
   reports the confirming `GateReport`'s `Status` and, for the actual gate
   detail, its `Evidence` (`gatekeeper.Report.Evidence`): the required
   checks and their per-check status/conclusion (`Evidence.Checks`,
@@ -354,18 +393,15 @@ retry (the head-sha update already landed) while leaving no
 `pr.review.posted` outcome for the digest, so the field does not in fact
 stay synchronized under failure. The implementation must not claim the
 field stays synchronized without making the update and the event
-observable together: either (a) make the `lastPublishedHeadSha` update
-and the `appendEvent` call atomic — persist the head-sha update only when
-the event append succeeds, so a transient append failure leaves both in
-their pre-call state and the retry re-attempts the whole publish — or
-(b) surface the append error so a failed outcome write is observable
-rather than silently dropped. The validation adds a **failure-path
-contract test** that injects an `eventlog.Append` error into
-`recordPublishedReviewProgress` and asserts the head-sha update is not
-left committed ahead of the missing event (atomic variant) or that the
-error is surfaced (observable variant), so a transient append failure
-does not silently desynchronize the persisted `outcome` from the
-published review.
+observable together: make the `lastPublishedHeadSha` update and the
+`appendEvent` call atomic (a single SQLite transaction, or an equivalent
+rollback that restores the prior head marker when append fails). A bare
+"surface the append error" is insufficient: if the head marker remains
+committed, the retry sees that SHA and skips publishing, so no later event
+repairs the digest. The validation adds a **failure-path contract test** that
+injects an `eventlog.Append` error into `recordPublishedReviewProgress`,
+asserts the head-sha update is not left committed ahead of the missing event,
+then retries and proves the whole publish/event path is attempted again.
 
 ### Closed-and-regenerated (#462/#464)
 
@@ -455,7 +491,7 @@ event through the **assembly instant**, not the window: for every
 discovered transition triple `(entity_id, discoveryFingerprint,
 closedAt)`, it reads the PR's full lifecycle via
 `EventsRepository.ListByEntity(ctx, "pull_request", entityID)` (ordered
-`created_at ASC`) and selects the latest
+`created_at ASC, rowid ASC`) and selects the latest
 `pull_request.closed_and_regenerated.retry_completed` event whose
 `(entity_id, discoveryFingerprint, closedAt)` matches the transition,
 regardless of whether that completion event falls inside or outside the
@@ -551,26 +587,29 @@ previous day's window midnight `until` — has no event inside that
 prior-day window, so it would never become a candidate if the windowed
 result seeded the entity set. The assembly therefore enumerates
 pull-request gate entities through an **unbounded current-state query**
-that returns only the **latest** report per entity,
-`EventsRepository.ListLatestByEntityTypeAndEventTypes(ctx,
-"pull_request", [GateReportEventType])`
-(`internal/storage/repositories.go`), and takes the distinct `entity_id`
-values whose latest report is blocked as the candidate set; it then
-reads each candidate's full lifecycle via `ListByEntity` for the
+that returns only the **latest** report per `(project_id, entity_id)`,
+  `EventsRepository.ListLatestByProjectAndEntityTypeAndEventTypes(ctx,
+  "pull_request", [GateReportEventType])`
+  (`internal/storage/repositories.go`), partitioned by `(project_id,
+  entity_id)`, and takes the distinct `(ProjectID, entity_id)` tuples whose
+  latest report is blocked as the candidate set; it then reads each
+  candidate's full lifecycle via a project-scoped `ListByProjectAndEntity`
+  (or an equivalent `ListByEntity` result filtered by `ProjectID`) for the
 membership check and backward walk. Materializing every gate report ever
 written (the unbounded `ListByEntityTypeAndEventTypes` over all history)
 and then performing another full-lifecycle query for each distinct PR
 makes work and memory grow continuously with historical evaluations even
 when the number of current PRs is stable, because unchanged blocked PRs
 are re-evaluated every 30 minutes; enumerating only the latest report
-per entity bounds the candidate set to the current PR count, reserving
-the per-entity `ListByEntity` walk for the small set whose blocked
+per project/entity bounds the candidate set to the current project/PR count,
+reserving the project-scoped lifecycle walk for the small set whose blocked
 interval actually needs walking. This ensures a PR whose latest blocked
 report falls after the window's `until` is still discovered.
 
 The backward walk and the membership check both read the PR's full
-lifecycle via `EventsRepository.ListByEntity(ctx, "pull_request",
-entityID)` (ordered `created_at ASC`), not the windowed `ListBetween`
+lifecycle via `EventsRepository.ListByProjectAndEntity(ctx, "pull_request",
+projectID, entityID)` (ordered `created_at ASC, rowid ASC`), not the windowed
+`ListBetween`
 result: the latest report as of the assembly instant may lie after the
 window's `until`, and the transition into the blocked state may lie before
 the window's `since`. The assembly walks backward from the latest blocked
@@ -717,9 +756,13 @@ The scheduler's behavior is fixed and tested for both cases:
 - **Fall-back (repeated local time):** if `FireTime` occurs twice on a
   given calendar day (e.g. `01:30` on a fall-back day that repeats
   01:00–02:00), the scheduler fires **once**, at the first occurrence
-  (the earlier UTC instant). Firing twice would select the same `D` and
-  rely on dedupe; firing once at the first occurrence is deterministic
-  and matches the once-per-day contract.
+  (the earlier UTC instant). The scheduler must find both valid instants
+  whose local `(hour, minute)` equals `FireTime` (for example by checking
+  both transition offsets), compare their UTC timestamps, and choose the
+  earlier one explicitly; it must not rely on which zone `time.Date` happens
+  to select. Firing twice would select the same `D` and rely on dedupe;
+  firing once at the first occurrence is deterministic and matches the
+  once-per-day contract.
 
 Both cases are covered by tests asserting the selected digest date and
 the fire count (one fire per calendar day: the spring-forward day fires
@@ -738,7 +781,11 @@ pushes `F` (early), the in-memory guard then suppresses another `F` at
 under 24 hours. Instead the startup catch-up determines missed dates from
 the **durable notification history**: it walks back from the most recent
 closed `D` through a bounded catch-up horizon (a fixed 7 calendar days),
-and for each date `d` in that range queries
+but considers a date `d` missed only when that date's scheduled fire instant
+(`d+1` calendar day at the configured `FireTime`, resolved through the same
+DST-aware helper) is at or before the current instant. A window can be closed
+at local midnight while its fire is still in the future; that date is left for
+the regular schedule. For each eligible date `d` in that range it queries
 `NotificationsRepository.GetLatestByDedupe(ctx, "in_app",
 "digest:<d>:<configFingerprint>")` (see Same-date delivery idempotence
 for the key and why the check is a single date-wide invocation marker,
@@ -886,15 +933,18 @@ gateway drops that error and continues sending osascript/webhook/Feishu,
 so a transient SQLite failure can deliver externally with no `in_app`
 record, and a restart then re-delivers the same date because the
 dedupe-check finds no marker. The implementation must therefore require
-the `in_app` marker write to succeed **before** channel fan-out, or
-otherwise surface and handle the missing marker so the restart-idempotence
-guarantee holds: `recordInApp` is attempted first, and on failure the
-`Notify` call returns the error without fanning out to push channels
-(fail closed — no external delivery without durable proof), or the
-marker is written and confirmed before any push channel is invoked. The
-validation adds a test that injects an `in_app` persistence failure and
-asserts no push channel is invoked and no external delivery occurs, so a
-transient marker-write failure cannot break restart idempotence. The
+the `in_app` marker write to succeed **before** channel fan-out, but scope this
+fail-closed behavior to a digest opt-in flag on the notification payload
+(for example `RequireDurableMarker: true`). When that flag is set,
+`recordInApp` is attempted first and a failure returns without fanning out
+(no external delivery without durable proof). Ordinary worker-failure,
+PR-ready, deployment, HITL, and recovery notifications keep the existing
+best-effort fan-out semantics; changing the shared default would suppress
+urgent alerts while storage is unhealthy. The validation adds a digest test
+that injects an `in_app` persistence failure and asserts no push channel is
+invoked, plus a non-digest regression proving the flag-off path still fans
+out, so a transient marker-write failure cannot break restart idempotence or
+silence unrelated alerts. The
 gateway's short throttle still suppresses a same-process double-fire
 within the throttle window; the date-wide `in_app` notification-log
 check is the durable backstop that covers restarts beyond that window.
@@ -966,7 +1016,10 @@ so a same-date re-fire under the same config is deduped by the gateway's
 existing throttle/dedupe path within the throttle window, while a config
 change produces a new key and is delivered rather than suppressed; the
 date-wide `in_app` notification-log check in Scheduling is the durable
-backstop (one invocation marker, not a per-channel check).
+backstop (one invocation marker, not a per-channel check). The digest sets
+the payload-only `RequireDurableMarker: true` flag; this is an ephemeral
+delivery policy, not new persisted state, and it scopes marker fail-closed
+behavior to the digest without changing unrelated notification callers.
 `Level` is set to a value the outbound channel allow-lists
 accept and `Sound` is left empty so osascript does not play a sound for a
 routine digest. Sound is controlled independently of level
@@ -1033,8 +1086,11 @@ time — a new persisted artifact this design explicitly avoids; the
 dashboard instead re-derives over the same window on demand. The dashboard
 page (`web/dashboard/src`) adds a `/digest` route and a `DigestPage`
 component following the existing page pattern (`useDashboardData`, table
-render). The dashboard fetches the digest on-demand (not polled) since it
-is a daily artifact.
+render), and adds a `Digest` entry to the fixed `navItems` list in
+`web/dashboard/src/components/layout/Shell.tsx` so the page is discoverable.
+The route/navigation regression test must assert both that `/digest` renders
+the page and that the navigation link is present/active. The dashboard fetches
+the digest on-demand (not polled) since it is a daily artifact.
 
 ## Trade-off: derived projection, no persisted digest state
 
@@ -1176,6 +1232,11 @@ Regression coverage (Go tests, fixture-based, no network):
   with `event=COMMENT` and `outcome=clean` to assert it is **not** flagged
   as a non-blocking anomaly, and one with `outcome=non_blocking` to assert
   it is.
+- Event ordering tie-breaker: append successive gate/review/lifecycle events
+  with the same millisecond `created_at`; assert every latest/consecutive
+  selection follows SQLite insertion (`rowid`) order rather than random event
+  IDs, including `ListBetween`, `ListByEntity`, and latest-per-project/entity
+  enumeration.
 - Originating issue resolution: seed a merge event with no `LoopID` and a
   matching `LoopRecord` reachable by `ListByProjectRepoAndPR` for the
   merge event's `ProjectID`; assert the originating issue is resolved.
@@ -1189,6 +1250,11 @@ Regression coverage (Go tests, fixture-based, no network):
   (retries or manually created loops that disagree); assert the issue is
   omitted rather than attributed to the newest loop — the conflict check
   inspects all candidates for distinct source issues before selecting.
+  Seed two otherwise matching loops whose source issue numbers are equal but
+  whose `IssueRepo` values differ; assert they are treated as two distinct
+  source issues and the digest omits the ambiguous issue. Seed a cross-repo
+  source issue (`IssueRepo` different from the merged `Repo`) and assert both
+  the source repo/number and enterprise-aware issue link are rendered.
 - Gate summary (confirming report selection): seed a successful merge
   (`Merged == true`, `ConfirmingReasons` empty) where the confirming
   `GateReportEventType` has `EvaluatedAt` **after** the merge event's
@@ -1205,7 +1271,12 @@ Regression coverage (Go tests, fixture-based, no network):
   digest window (confirmation started before midnight, forge merge
   finished after midnight); assert the report is still selected via
   `ListByEntity` through the outcome event, not lost to the
-  `ListBetween` window boundary.
+  `ListBetween` window boundary. Seed an unrelated webhook-triggered
+  evaluation for the same project, head, and PR after the confirming report
+  but before `persistMergeOutcome`; assert its different event-log
+  `CorrelationID` is ignored and the report carrying the merge's confirming
+  correlation is selected. A merge event without that correlation must render
+  gate evidence unavailable rather than use timestamp-only matching.
 - Reviewer verdict head match: seed a merge for head B with a preceding
   `pr.review.posted` carrying `outcome=clean` for head A (older) and one
   for head B carrying `outcome=blocking`; assert the verdict summary uses
@@ -1237,6 +1308,9 @@ Regression coverage (Go tests, fixture-based, no network):
   "unavailable" but the **repo and PR number are still rendered from the
   `MergeOutcome` event** (the digest can still identify and link the
   merged PR), so only snapshot-owned fields are unavailable.
+  Seed a host-qualified repo (`github.example.com/acme/looper`) and assert
+  the rendered pull-request URL uses `https://github.example.com/...` rather
+  than hard-coded `github.com`.
 - Awaiting-human current state: seed a PR blocked at 08:00 on the **fire
   date** `F = D + 1` (i.e. 08:00 on `F`, which is after the digest date
   `D`'s window end `(D+1) 00:00 = F 00:00`), with no earlier in-window
@@ -1276,11 +1350,14 @@ Regression coverage (Go tests, fixture-based, no network):
 - Awaiting-human candidate enumeration: seed a PR first blocked at 08:00
   on the fire date `F = D + 1` with no gate event inside the digest
   date's `ListBetween` window; assert it is still discovered as a
-  candidate via `ListLatestByEntityTypeAndEventTypes` (latest report per
-  entity) and listed in the 09:00 digest. Seed many historical gate
+  candidate via `ListLatestByProjectAndEntityTypeAndEventTypes` (latest
+  report per `(ProjectID, entity_id)`) and listed in the 09:00 digest. Seed
+  the same PR under two projects with different latest gate states and assert
+  each project's candidate is evaluated independently. Seed many historical gate
   reports for already-merged PRs outside the candidate set; assert the
   candidate enumeration does not materialize them (only the latest
-  report per entity is read).
+  report per project/entity is read, and each full lifecycle walk is
+  project-scoped.
 - Verdict-flip anomaly threshold: seed two `pr.review.posted` events for
   the merged head with differing `outcome` 30 minutes apart, both within
   `VerdictFlipWindowMinutes` of `AttemptedAt`; assert a flip is flagged.
@@ -1311,11 +1388,10 @@ Regression coverage (Go tests, fixture-based, no network):
   (producer-level test, not an assembly fixture).
 - Producer review-outcome persistence failure path: inject an
   `eventlog.Append` error into `recordPublishedReviewProgress` after the
-  `lastPublishedHeadSha` update is staged; assert the head-sha update is
-  not left committed ahead of the missing event (atomic variant: both
-  roll back) or that the append error is surfaced (observable variant),
-  so a transient append failure does not permanently suppress a retry
-  while leaving no `pr.review.posted` outcome for the digest.
+  `lastPublishedHeadSha` update is staged; assert the head-sha update rolls
+  back with the missing event, then retry and assert the publish/event path is
+  attempted again. A surfaced error without rollback is not sufficient because
+  the committed head marker would suppress that retry.
 - Empty-day behavior: no qualifying events in the window → `quiet` mode
   produces no `Notify` call; `notice` mode produces one payload with the
   "nothing merged" body.
@@ -1326,11 +1402,13 @@ Regression coverage (Go tests, fixture-based, no network):
   that returns an error; assert an in-app `NotificationRecord` is still
   persisted and the `/api/v1/digest` handler still returns the assembled
   digest.
-- Invocation marker fail-closed: inject an `in_app` persistence failure
-  into `Gateway.Notify` (the `recordInApp` write fails); assert no push
-  channel (osascript/webhook/Feishu) is invoked and no external delivery
-  occurs, so a transient marker-write failure cannot deliver externally
-  without durable proof and break restart idempotence.
+- Invocation marker fail-closed: for a digest payload with
+  `RequireDurableMarker: true`, inject an `in_app` persistence failure into
+  `Gateway.Notify` (the `recordInApp` write fails); assert no push channel
+  (osascript/webhook/Feishu) is invoked and no external delivery occurs. Add
+  a non-digest payload with the flag unset and assert the existing best-effort
+  fan-out remains, so a transient marker-write failure cannot break digest
+  restart idempotence or silence unrelated alerts.
 - Same-date restart idempotence: persist an `in_app` delivered
   notification record with `DedupeKey digest:<D>:<configFingerprint>`
   older than `ThrottleWindowSeconds`; fire the job under the same config;
@@ -1356,12 +1434,19 @@ Regression coverage (Go tests, fixture-based, no network):
   `F − 1` is delivered and not lost and the fire does not occur before
   the configured wall time. In a timezone with a fall-back transition,
   configure a `FireTime` that occurs twice; assert the scheduler fires
-  once (the first occurrence) and selects the correct `D`.
+  once (the explicitly selected first occurrence) and selects the correct
+  `D`. Add a timezone whose transition skips local midnight (for example
+  `America/Santiago` on 2026-09-06); assert the digest window starts at the
+  first valid instant on the requested local date rather than a normalized
+  instant on the prior date, and that the adjacent date windows do not
+  overlap.
 - Catch-up from durable history: with no delivered digest for `F−1` and a
   delivered record for `F`, restart the daemon after midnight on `F+1`;
   assert the startup catch-up pushes `F−1` (missed) in chronological order
   before resuming the regular schedule, and does not re-push `F` (already
-  delivered). Assert dates older than the 7-day horizon are not pushed.
+  delivered). Also restart at 00:01 on `F`, before the configured 09:00 fire,
+  and assert `F−1` is not pushed early; the regular schedule later delivers
+  it at 09:00. Assert dates older than the 7-day horizon are not pushed.
 - Catch-up trailing missed dates: with a delivered record for `F−2` only
   and no delivered record for `F−1` or `F`, restart the daemon after
   midnight on `F+1`; assert the startup catch-up pushes both `F−1` and
@@ -1372,10 +1457,12 @@ Regression coverage (Go tests, fixture-based, no network):
   digest record anywhere in the 7-day horizon, restart/start the daemon
   and assert the catch-up pushes **nothing** (no historical backfill) and
   `lastDigestDate` stays empty. Then seed a delivered digest record for
-  `F` only and restart with no record for `F−1`; assert `F−1` is pushed
-  (the `F` record is the activation boundary proving the feature was
-  active) but dates before the oldest delivered record are not treated
-  as missed.
+  `F−1` only and restart after `F`'s scheduled fire has passed, with no
+  record for `F`; assert `F` is pushed (the `F−1` record is the activation
+  boundary proving the feature was active) but dates before the oldest
+  delivered record are not treated as missed. A record for `F` alone must
+  not make `F−1` eligible, because it cannot prove activation for that
+  earlier date.
 - First scheduled fire not suppressed: on first enablement at 08:00 with
   the default 09:00 fire time and no delivered records, start the daemon
   and assert the regular schedule fires 09:00 for `D = F − 1` (the guard
