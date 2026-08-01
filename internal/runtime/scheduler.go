@@ -2347,6 +2347,12 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 					return err
 				}
 				if !result.ProjectionAccepted {
+					// Distinguish permanent projection rejection (skipped) from transient routing errors.
+					// When the planner skips the issue (e.g., archived project, held lane), this is a
+					// permanent condition that should escalate to human intervention rather than retry.
+					if result.Skipped > 0 {
+						return &fixer.RegenerationPermanentRejectionError{Reason: "planner route projection was permanently rejected (skipped)"}
+					}
 					return fmt.Errorf("planner route projection was not accepted")
 				}
 				return nil

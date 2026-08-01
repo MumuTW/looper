@@ -32,6 +32,20 @@ type regenerationHandoffError struct {
 func (e *regenerationHandoffError) Error() string { return e.cause.Error() }
 func (e *regenerationHandoffError) Unwrap() error { return e.cause }
 
+// RegenerationPermanentRejectionError signals that planner routing permanently
+// rejected the issue (e.g., archived project, held lane). This triggers escalation
+// to human intervention instead of retry.
+type RegenerationPermanentRejectionError struct {
+	Reason string
+}
+
+func (e *RegenerationPermanentRejectionError) Error() string {
+	if e.Reason != "" {
+		return e.Reason
+	}
+	return "planner routing permanently rejected issue"
+}
+
 // fixerRegenerationState is the durable side-effect ledger for #462.  Each
 // field is written after its remote action, so a crash can replay only the
 // missing suffix of comment -> close -> Planner route.
@@ -277,6 +291,26 @@ func (r *Runner) handleTerminalExhaustion(ctx context.Context, project storage.P
 		IssueTitle: issue.Title, IssueBody: issue.Body, IssueURL: issue.URL, IssueLabels: append([]string(nil), issue.Labels...), IssueAssignees: append([]string(nil), issue.Assignees...),
 		FailureSummary: failure.message, FailureContext: failureContext, Attempts: queueItem.Attempts, MaxAttempts: queueItem.MaxAttempts, Authority: state.Authority,
 	}); err != nil {
+		// If planner permanently rejects the routing (e.g., archived project, held lane),
+		// escalate to human intervention instead of retrying indefinitely.
+		var permanentRejection *RegenerationPermanentRejectionError
+		if errors.As(err, &permanentRejection) {
+			reason := permanentRejection.Reason
+			if reason == "" {
+				reason = "planner routing was permanently rejected"
+			}
+			// PR is already closed at this point. Add looper:needs-human to the originating issue
+			// so humans are aware the regeneration failed permanently.
+			if err := bridge.AddIssueLabels(ctx, IssueLabelsInput{Repo: originRepo, IssueNumber: originNumber, Labels: []string{labels.NeedsHuman}, CWD: project.RepoPath}); err != nil {
+				return regenerationNone, fmt.Errorf("label originating issue for permanent rejection: %w", err)
+			}
+			state.Escalated = true
+			state.EscalationWhy = reason
+			if _, err := r.mergeLoopMetadata(ctx, current, map[string]any{"fixerRegeneration": state}); err != nil {
+				return regenerationNone, err
+			}
+			return regenerationEscalated, nil
+		}
 		return regenerationNone, fmt.Errorf("route originating issue back to planner: %w", err)
 	}
 	if err := bridge.AddIssueLabels(ctx, IssueLabelsInput{Repo: originRepo, IssueNumber: originNumber, Labels: []string{labels.DefaultPlanTrigger}, CWD: project.RepoPath}); err != nil {

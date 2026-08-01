@@ -821,6 +821,9 @@ func (r *Runner) enqueueAdmittedIssue(ctx context.Context, project storage.Proje
 	if strings.TrimSpace(issue.FailureContext) != "" {
 		payload["failureContext"] = issue.FailureContext
 	}
+	if issue.PersonalAssigneeAutoAssigned {
+		payload["personalProjectAutoAssigned"] = true
+	}
 	if authority != "" {
 		payload[plannerQueueRoutingAuthorityKey] = authority
 	}
