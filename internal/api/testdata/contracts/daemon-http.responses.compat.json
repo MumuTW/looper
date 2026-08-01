@@ -583,6 +583,14 @@
                 "transientRetries": 3,
                 "maxIndeterminateDuration": "15m"
               }
+            },
+            "escalator": {
+              "enabled": false,
+              "cadenceSeconds": 3600,
+              "retryAttemptThreshold": 2,
+              "unroutedAfterSeconds": 3600,
+              "staleHeadAfterSeconds": 86400,
+              "maxItems": 500
             }
           },
           "providers": [],
@@ -934,6 +942,14 @@
                 "transientRetries": 3,
                 "maxIndeterminateDuration": "15m"
               }
+            },
+            "escalator": {
+              "enabled": false,
+              "cadenceSeconds": 3600,
+              "retryAttemptThreshold": 2,
+              "unroutedAfterSeconds": 3600,
+              "staleHeadAfterSeconds": 86400,
+              "maxItems": 500
             }
           },
           "providers": [],

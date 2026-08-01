@@ -347,6 +347,14 @@ func DefaultConfig(cwd string) (Config, error) {
 					RequireAssigneeCurrentUser: true,
 				},
 			},
+			Escalator: EscalatorRoleConfig{
+				Enabled:               false,
+				CadenceSeconds:        3600,
+				RetryAttemptThreshold: 2,
+				UnroutedAfterSeconds:  3600,
+				StaleHeadAfterSeconds: 86400,
+				MaxItems:              500,
+			},
 		},
 		Projects: []ProjectRefConfig{},
 	}, nil

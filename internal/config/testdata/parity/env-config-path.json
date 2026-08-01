@@ -285,6 +285,14 @@
         "deployer": {
           "enabled": false
         },
+        "escalator": {
+          "cadenceSeconds": 3600,
+          "enabled": false,
+          "maxItems": 500,
+          "retryAttemptThreshold": 2,
+          "staleHeadAfterSeconds": 86400,
+          "unroutedAfterSeconds": 3600
+        },
         "planner": {
           "autoDiscovery": true,
           "triggers": {

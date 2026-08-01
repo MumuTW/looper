@@ -921,6 +921,39 @@ Reviewers should weigh these blind spots before relying on it:
   against a new base whose recomputed diff exceeds the budget. That window is
   narrow but not closed — it is a documented blind spot, not a guarantee.
 
+## Pipeline digest (`roles.escalator`)
+
+Escalator is an agent-free, global Role that periodically derives one attention
+digest from durable loop, queue, Triage, Gatekeeper, and pull-request snapshot
+state. It uses the existing notification gateway; it does not start an agent,
+claim work, change forge state, or add another delivery transport.
+
+```toml
+[roles.escalator]
+enabled = true
+cadenceSeconds = 3600
+retryAttemptThreshold = 2
+unroutedAfterSeconds = 3600
+staleHeadAfterSeconds = 86400
+maxItems = 500
+```
+
+| Path | Purpose | Default |
+| --- | --- | --- |
+| `roles.escalator.enabled` | Enables the global digest | `false` |
+| `roles.escalator.cadenceSeconds` | Minimum interval between successful census attempts | `3600` |
+| `roles.escalator.retryAttemptThreshold` | Queue attempts at which an item is reported as repeatedly retrying | `2` |
+| `roles.escalator.unroutedAfterSeconds` | Age before an enrolled/unprojected Triage source is stuck | `3600` |
+| `roles.escalator.staleHeadAfterSeconds` | Age before current-head evidence is stale | `86400` |
+| `roles.escalator.maxItems` | Hard bound on one durable delta baseline | `500` |
+
+The role is global-only: `projects[].roles.escalator` is rejected because one
+digest intentionally aggregates all active projects. An unchanged digest is
+suppressed, an empty digest advances the baseline without sending a content-free
+notification, and a failed census retries on the next scheduler tick. A daemon
+restart may run an immediate census; durable delta comparison still prevents an
+unchanged notification.
+
 ## Deploy on merge (`roles.deployer`)
 
 When a project's base branch moves, the deployer runs one configured command
