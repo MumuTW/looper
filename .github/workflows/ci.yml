@@ -10,6 +10,7 @@ on:
       - synchronize
       - reopened
       - ready_for_review
+      - edited
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -159,6 +160,45 @@ jobs:
           looper_build_timestamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           export LOOPER_BUILD_TIMESTAMP="$looper_build_timestamp"
           go build -ldflags "$(go run ./tools/go-build-flags)" ./...
+
+  # AGENTS.md requires a semantic prefix (feat/fix/docs/test/refactor/chore/ci)
+  # on every PR title and commit subject. This is a deterministic, regex-
+  # checkable rule, so it is enforced here instead of by an LLM reviewer —
+  # instant, consistent feedback that frees review rounds for the design-
+  # guideline checks that genuinely need contextual judgment. See #470.
+  #
+  # Mergify merges (not squashes) into main (.mergify.yml), so every non-merge
+  # commit subject in the PR range lands on main verbatim and is checked here.
+  # Merge commits are skipped: their "Merge branch ..." subjects are not
+  # authored semantic messages.
+  semantic-prefix:
+    if: github.event_name == 'pull_request'
+    name: Semantic prefix
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          # Full history so the base..HEAD range and its merge-base resolve.
+          fetch-depth: 0
+          # The job runs pull-request-controlled shell scripts; do not leave a
+          # write-capable token on disk for them to access.
+          persist-credentials: false
+
+      - name: Test the semantic-prefix validator
+        run: scripts/check-semantic-prefix.test.sh
+
+      - name: Validate PR title and commit subjects
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          scripts/check-semantic-prefix.sh -- "$PR_TITLE"
+          git log --no-merges --format=%s "${BASE_SHA}..HEAD" \
+            | scripts/check-semantic-prefix.sh --stdin
 
   race:
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
