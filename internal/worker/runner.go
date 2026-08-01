@@ -15,6 +15,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/MumuTW/looper/internal/agent"
@@ -317,9 +318,13 @@ type InspectHeadInput struct {
 
 type InspectHeadResult struct {
 	HeadSHA               string
+	Branch                string
 	NewCommitSHAs         []string
 	HasUncommittedChanges bool
 	ChangedFiles          []string
+	StagedFiles           []string
+	UntrackedFiles        []string
+	DiffFingerprint       string
 }
 
 type VerifyWorktreeIdentityInput struct {
@@ -365,6 +370,7 @@ type AgentRunInput struct {
 	Metadata            map[string]any
 	IdempotencyKey      string
 	RestrictToolNetwork bool
+	OnBeforeTimeout     func(context.Context, agent.TimeoutObservation) error
 	// UseSnapshot + SnapshotVendor/Model override the executor config for this
 	// start when the run has a durable agent snapshot (execution authority).
 	UseSnapshot    bool
@@ -386,6 +392,7 @@ type AgentResult struct {
 	ConfiguredMaxRuntimeSeconds  int64
 	ElapsedRuntimeSeconds        int64
 	LastProgressAt               string
+	PreTimeoutError              string
 }
 
 const validationGatedLocalOnlyPrompt = `
@@ -684,19 +691,40 @@ type checkpointPlan struct {
 }
 
 type checkpointExecution struct {
-	Status                       string           `json:"status,omitempty"`
-	Summary                      string           `json:"summary,omitempty"`
-	ParseStatus                  string           `json:"parseStatus,omitempty"`
-	ChangedFiles                 []string         `json:"changedFiles,omitempty"`
-	Commits                      []string         `json:"commits,omitempty"`
-	Lifecycle                    *lifecycle.State `json:"gitPrLifecycle,omitempty"`
-	Stdout                       string           `json:"stdout,omitempty"`
-	GitReconciled                bool             `json:"gitReconciled,omitempty"`
-	TimeoutType                  string           `json:"timeoutType,omitempty"`
-	ConfiguredIdleTimeoutSeconds int64            `json:"configuredIdleTimeoutSeconds,omitempty"`
-	ConfiguredMaxRuntimeSeconds  int64            `json:"configuredMaxRuntimeSeconds,omitempty"`
-	ElapsedRuntimeSeconds        int64            `json:"elapsedRuntimeSeconds,omitempty"`
-	LastProgressAt               string           `json:"lastProgressAt,omitempty"`
+	Status                       string            `json:"status,omitempty"`
+	Summary                      string            `json:"summary,omitempty"`
+	ParseStatus                  string            `json:"parseStatus,omitempty"`
+	ChangedFiles                 []string          `json:"changedFiles,omitempty"`
+	Commits                      []string          `json:"commits,omitempty"`
+	Lifecycle                    *lifecycle.State  `json:"gitPrLifecycle,omitempty"`
+	Stdout                       string            `json:"stdout,omitempty"`
+	GitReconciled                bool              `json:"gitReconciled,omitempty"`
+	TimeoutType                  string            `json:"timeoutType,omitempty"`
+	ConfiguredIdleTimeoutSeconds int64             `json:"configuredIdleTimeoutSeconds,omitempty"`
+	ConfiguredMaxRuntimeSeconds  int64             `json:"configuredMaxRuntimeSeconds,omitempty"`
+	ElapsedRuntimeSeconds        int64             `json:"elapsedRuntimeSeconds,omitempty"`
+	LastProgressAt               string            `json:"lastProgressAt,omitempty"`
+	ProgressBeforeTimeout        *worktreeProgress `json:"progressBeforeTimeout,omitempty"`
+	ProgressSnapshotError        string            `json:"progressSnapshotError,omitempty"`
+}
+
+// worktreeProgress records only status metadata; it never persists diff
+// content. It is captured immediately before an executor timeout terminates
+// the process group, so a retry can prove what it inherited.
+type worktreeProgress struct {
+	HeadSHA            string   `json:"headSha,omitempty"`
+	WorktreeID         string   `json:"worktreeId,omitempty"`
+	Branch             string   `json:"branch,omitempty"`
+	ChangedFiles       []string `json:"changedFiles,omitempty"`
+	ChangedFileCount   int      `json:"changedFileCount"`
+	StagedFiles        []string `json:"stagedFiles,omitempty"`
+	StagedFileCount    int      `json:"stagedFileCount"`
+	UntrackedFiles     []string `json:"untrackedFiles,omitempty"`
+	UntrackedFileCount int      `json:"untrackedFileCount"`
+	DiffFingerprint    string   `json:"diffFingerprint,omitempty"`
+	TimeoutType        string   `json:"timeoutType,omitempty"`
+	LastProgressAt     string   `json:"lastProgressAt,omitempty"`
+	CapturedAt         string   `json:"capturedAt,omitempty"`
 }
 
 type checkpointPullPR struct {
@@ -1078,6 +1106,7 @@ func checkpointExecutionFromAgentResult(result AgentResult) *checkpointExecution
 		ChangedFiles: append([]string(nil), result.ChangedFiles...), Commits: append([]string(nil), result.Commits...), Lifecycle: result.Lifecycle, Stdout: result.Stdout,
 		TimeoutType: result.TimeoutType, ConfiguredIdleTimeoutSeconds: result.ConfiguredIdleTimeoutSeconds, ConfiguredMaxRuntimeSeconds: result.ConfiguredMaxRuntimeSeconds,
 		ElapsedRuntimeSeconds: result.ElapsedRuntimeSeconds, LastProgressAt: result.LastProgressAt,
+		ProgressSnapshotError: result.PreTimeoutError,
 	}
 }
 
@@ -2174,6 +2203,16 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 	}
 	work = *checkpoint.Work
 	if !executionCompleted {
+		// Crash recovery: if StageHITLGateEvidence left ask.pending before
+		// suspendForHuman persisted the ask, do not start another agent turn.
+		// Re-enter the suspension path from the staged evidence first.
+		if r.hitlEnabled {
+			if awaiting, awaitErr := r.detectHumanAsk(ctx, input, worktree.Path, ""); awaitErr != nil {
+				return checkpoint, awaitErr
+			} else if awaiting != nil {
+				return checkpoint, awaiting
+			}
+		}
 		agentVendor, agentModel, _, useSnapshot, err := r.identityFromRun(input.Run)
 		if err != nil {
 			return checkpoint, fmt.Errorf("resolve run agent identity: %w", err)
@@ -2247,12 +2286,37 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 			return checkpoint, &holdSkipError{summary: summary}
 		}
 		useSnap, snapVendor, snapModel := agentRunSnapshotFields(agentVendor, agentModel, useSnapshot)
+		var (
+			preTimeoutProgress *worktreeProgress
+			progressMu         sync.Mutex
+		)
+		onBeforeTimeout := func(timeoutCtx context.Context, observation agent.TimeoutObservation) error {
+			progress, progressErr := r.captureWorktreeProgress(timeoutCtx, input.Project, work, worktree, observation)
+			progressMu.Lock()
+			defer progressMu.Unlock()
+			if progressErr != nil {
+				checkpoint.Execution = &checkpointExecution{Status: "timeout_observing", ProgressSnapshotError: progressErr.Error()}
+				checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
+				if persistErr := r.persistCheckpoint(timeoutCtx, input.Run.ID, checkpoint); persistErr != nil {
+					return errors.Join(progressErr, fmt.Errorf("persist pre-timeout worker progress failure: %w", persistErr))
+				}
+				return progressErr
+			}
+			preTimeoutProgress = &progress
+			checkpoint.Execution = &checkpointExecution{Status: "timeout_observing", ProgressBeforeTimeout: &progress}
+			checkpoint.ResumePolicy = "retry_from_timeout_context"
+			if err := r.persistCheckpoint(timeoutCtx, input.Run.ID, checkpoint); err != nil {
+				return fmt.Errorf("persist pre-timeout worker progress: %w", err)
+			}
+			return nil
+		}
 		execution, err := r.agentExecutor.Start(ctx, AgentRunInput{
 			ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID,
 			Prompt: prompt, NativeResumePrompt: nativeResumePrompt, NativeSessionID: nativeSessionID,
 			WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout,
 			Metadata: metadata, IdempotencyKey: fmt.Sprintf("worker:%s", input.Loop.ID),
 			RestrictToolNetwork: len(validationCommands) > 0,
+			OnBeforeTimeout:     onBeforeTimeout,
 			UseSnapshot:         useSnap, SnapshotVendor: snapVendor, SnapshotModel: snapModel,
 		})
 		if err != nil {
@@ -2262,6 +2326,8 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 			_ = r.onAgentExecutionStarted(ctx, AgentExecutionStartedInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Subtitle: work.Title, Body: "Worker started", DedupeKey: fmt.Sprintf("runtime.agent.started:worker:%s", input.Run.ID)})
 		}
 		result, err := execution.Wait(ctx)
+		progressMu.Lock()
+		defer progressMu.Unlock()
 		if err != nil {
 			return checkpoint, err
 		}
@@ -2277,6 +2343,15 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 		}
 		if result.Status != "completed" {
 			checkpoint.Execution = checkpointExecutionFromAgentResult(result)
+			checkpoint.Execution.ProgressBeforeTimeout = preTimeoutProgress
+			if result.PreTimeoutError != "" {
+				checkpoint.Execution.ProgressSnapshotError = result.PreTimeoutError
+				checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
+				if err := r.persistCheckpoint(ctx, input.Run.ID, checkpoint); err != nil {
+					return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+				}
+				return checkpoint, &loopError{message: "Worker timeout progress snapshot failed: " + result.PreTimeoutError, kind: FailureManualIntervention}
+			}
 			checkpoint.ResumePolicy = "retry_from_timeout_context"
 			if err := r.persistCheckpoint(ctx, input.Run.ID, checkpoint); err != nil {
 				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
@@ -2326,6 +2401,46 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 	checkpoint.Execution.GitReconciled = true
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	return checkpoint, nil
+}
+
+func (r *Runner) captureWorktreeProgress(ctx context.Context, project storage.ProjectRecord, work workerInput, worktree checkpointWorktree, observation agent.TimeoutObservation) (worktreeProgress, error) {
+	if r.git == nil {
+		return worktreeProgress{}, fmt.Errorf("worker git gateway is not configured")
+	}
+	worktreeRoot, err := workerWorktreeRoot(project)
+	if err != nil {
+		return worktreeProgress{}, err
+	}
+	inspect, err := r.git.InspectHead(ctx, InspectHeadInput{RepoPath: project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path})
+	if err != nil {
+		return worktreeProgress{}, err
+	}
+	return worktreeProgress{
+		HeadSHA:            inspect.HeadSHA,
+		WorktreeID:         worktree.ID,
+		Branch:             inspect.Branch,
+		ChangedFiles:       boundPathList(inspect.ChangedFiles, worktreeProgressPathCap),
+		ChangedFileCount:   len(inspect.ChangedFiles),
+		StagedFiles:        boundPathList(inspect.StagedFiles, worktreeProgressPathCap),
+		StagedFileCount:    len(inspect.StagedFiles),
+		UntrackedFiles:     boundPathList(inspect.UntrackedFiles, worktreeProgressPathCap),
+		UntrackedFileCount: len(inspect.UntrackedFiles),
+		DiffFingerprint:    inspect.DiffFingerprint,
+		TimeoutType:        observation.TimeoutType,
+		LastProgressAt:     observation.LastProgressAt,
+		CapturedAt:         eventlog.FormatJavaScriptISOString(r.now().UTC()),
+	}, nil
+}
+
+// worktreeProgressPathCap bounds path lists stored in checkpoint_json. Counts
+// still reflect the full InspectHead result; only the sample is truncated.
+const worktreeProgressPathCap = 64
+
+func boundPathList(paths []string, capN int) []string {
+	if capN <= 0 || len(paths) <= capN {
+		return append([]string(nil), paths...)
+	}
+	return append([]string(nil), paths[:capN]...)
 }
 
 func (r *Runner) reconcileWorkerGitState(ctx context.Context, checkpoint *workerCheckpoint, project storage.ProjectRecord, work workerInput, worktree checkpointWorktree, run storage.RunRecord) (bool, error) {

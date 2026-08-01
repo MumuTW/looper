@@ -283,3 +283,20 @@ func TestDiscoverPullRequestsReevaluatesWhenDiffBudgetChanges(t *testing.T) {
 		t.Fatalf("second report reasons = %v, want diff_budget_exceeded against the tightened bound", reasonCodes(second.Reports[0].Reasons))
 	}
 }
+
+// A provider block after the review check replaces all reasons with the
+// provider reason but leaves Evidence.CodexReview.CurrentHeadValid false.
+// reportAwaitsCurrentHeadReview must still detect this as waiting for a review
+// so the PR is not silently skipped for up to maxSkipAge.
+func TestReportAwaitsCurrentHeadReviewDetectsProviderBlockedEvidence(t *testing.T) {
+	report := Report{
+		Reasons: []Reason{{Code: ReasonProviderStateUnavailable, Subject: "mergeability"}},
+		Evidence: Evidence{CodexReview: &CodexReviewEvidence{
+			RequiredHeadSHA:  "head-1",
+			CurrentHeadValid: false,
+		}},
+	}
+	if !reportAwaitsCurrentHeadReview(report) {
+		t.Fatalf("reportAwaitsCurrentHeadReview() = false, want true for provider-blocked report with invalid CodexReview evidence")
+	}
+}

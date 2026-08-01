@@ -23,7 +23,7 @@ For source development:
 
 Looper uses Go binaries as the default supported implementation. Installing is manual: you place two binaries, write a config, and run the daemon yourself.
 
-> **There is no managed daemon install and no setup wizard.** `looper bootstrap`, `looper daemon install|start|status|logs|restart`, and `looper upgrade` were removed along with the old CLI ahead of the role-model rewrite. Nothing installs, supervises, or upgrades `looperd` for you.
+> **There is no managed daemon install and no setup wizard.** `looper bootstrap`, `looper daemon install|start|status|logs|restart`, remain out of the managed-install path. Controlled upgrade starts with read-only `looper upgrade preflight`; nothing silently self-upgrades `looperd` for you.
 
 ### 1. Install the CLI
 
@@ -144,7 +144,24 @@ looper stop <selector>   # fails loudly if looperd is down or the loop is unknow
 
 ## Upgrade
 
-Manual: replace the binaries. Download the newer `looper-<target>.tar.gz` and `looperd-<target>.tar.gz` release artifacts (or re-run the install script for the CLI), put them back on your `PATH`, and restart `looperd`. There is no self-upgrade, version check, rollback, or channel switching.
+Before replacing binaries, run a read-only preflight against explicit candidate paths:
+
+```bash
+looper upgrade preflight --target-looper /path/to/candidate/looper --target-looperd /path/to/candidate/looperd --json
+```
+
+Preflight only calls `GET /api/v1/version` and `GET /api/v1/status` on the running daemon and executes the candidate binaries' identity (and optional `--check-config`) commands. It does not start a second production daemon or mutate the production database. Incomplete build identities never count as a matching CLI/daemon pair.
+
+After a clean preflight, create an explicit rollback bundle (daemon-owned SQLite online backup + config + matching binaries + checksums):
+
+```bash
+looper upgrade backup
+looper upgrade verify --bundle <directory>
+```
+
+`upgrade verify` is offline and fail-closed on missing files, bad checksums, or manifest problems.
+
+Manual cutover after a clean preflight: replace the binaries from matching release artifacts. Download the newer `looper-<target>.tar.gz` and `looperd-<target>.tar.gz` release artifacts (or re-run the install script for the CLI), put them back on your `PATH`, and restart `looperd`. There is no self-upgrade, version check, rollback, or channel switching.
 
 ## Compatibility and version policy
 
@@ -189,3 +206,21 @@ In another shell, run the CLI from source:
 go run ./cmd/looper version
 go run ./cmd/looper stop 12
 ```
+
+
+### Graceful drain before cutover
+
+`looper upgrade drain --deadline <duration>` moves admission to `draining` (no new claims/mutations) and waits for in-flight supervisor work without hard-killing agents as the routine path.
+
+
+### Atomic release switch
+
+Stage a matching CLI/daemon pair, then activate via an atomic release pointer:
+
+```bash
+looper upgrade stage-release --root <dir> --release-id <id> --target-looper <path> --target-looperd <path>
+looper upgrade activate-release --root <dir> --release-id <id>
+looper upgrade verify-start --root <dir>
+```
+
+`verify-start` must succeed before declaring cutover success. `package.autoUpgradeEnabled` is not a supported managed upgrade path (legacy decode only).

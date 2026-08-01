@@ -242,6 +242,248 @@ func TestToolNetworkDenialVendorsMatchAdapterTable(t *testing.T) {
 	}
 }
 
+func TestConfiguredExecutorAssessmentRejectsUnsupportedVendorAndOperatorOverrides(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		config ExecutorConfig
+		input  RunInput
+		want   string
+	}{
+		{
+			name:   "unsupported vendor",
+			config: ExecutorConfig{Vendor: config.AgentVendorClaudeCode},
+			want:   "supported only for codex",
+		},
+		{
+			name:   "command wrapper",
+			config: ExecutorConfig{Vendor: config.AgentVendorCodex, Params: map[string]any{"command": "/tmp/assessment-wrapper"}},
+			want:   "rejects configured command wrappers",
+		},
+		{
+			name:   "sandbox argv and config override",
+			config: ExecutorConfig{Vendor: config.AgentVendorCodex, Params: map[string]any{"args": []any{"exec", "--sandbox", "danger-full-access", "-c", "sandbox_workspace_write.network_access=true"}}},
+			want:   "rejects configured argv overrides",
+		},
+		{
+			name:   "native resume",
+			config: ExecutorConfig{Vendor: config.AgentVendorCodex},
+			input:  RunInput{NativeSessionID: "resume-me"},
+			want:   "does not permit native resume",
+		},
+	}
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			vendor := tc.config.Vendor
+			executor := New(ExecutorOptions{Config: tc.config, ParamsOwnerVendor: &vendor})
+			input := tc.input
+			input.Assessment = true
+			input.Prompt = "inspect this issue"
+			input.WorkingDirectory = t.TempDir()
+			_, err := executor.Start(context.Background(), input)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Start() error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestAssessmentBypassesPersistedNativeResume(t *testing.T) {
+	coordinator := openAgentCoordinator(t)
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 20, 12, 0, 0, 0, time.UTC)
+	nowISO := now.Format("2006-01-02T15:04:05.000Z")
+	workdir := t.TempDir()
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Project", RepoPath: workdir, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_1", Seq: 1, ProjectID: "project_1", Type: "worker", TargetType: "issue", Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	sessionID := "codex-session-1"
+	mode := "native_resume"
+	status := "pending"
+	if err := repos.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{
+		ID:                 "agent_previous",
+		ProjectID:          strPtr("project_1"),
+		LoopID:             strPtr("loop_1"),
+		Vendor:             string(config.AgentVendorCodex),
+		Status:             "killed",
+		NativeSessionID:    &sessionID,
+		NativeResumeMode:   &mode,
+		NativeResumeStatus: &status,
+		StartedAt:          nowISO,
+		CreatedAt:          nowISO,
+		UpdatedAt:          nowISO,
+	}); err != nil {
+		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
+	}
+
+	scriptDir := t.TempDir()
+	argsPath := filepath.Join(scriptDir, "args.txt")
+	scriptPath := filepath.Join(scriptDir, "codex")
+	assessmentSessionID := "assessment-session-id"
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" > \"$ARGS_PATH\"\nprintf '%s\\n' 'session id: " + assessmentSessionID + "'\nprintf '%s\\n' '__LOOPER_RESULT__={\"summary\":\"assessed\"}'\n"
+	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("WriteFile(scriptPath) error = %v", err)
+	}
+	t.Setenv("PATH", scriptDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	executor := New(ExecutorOptions{
+		Config:            ExecutorConfig{Vendor: config.AgentVendorCodex, NativeResumeEnabled: true},
+		Repos:             repos,
+		Now:               advancingNow(now, 10*time.Millisecond),
+		ParamsOwnerVendor: codexOwner(),
+	})
+
+	execHandle, err := executor.Start(context.Background(), RunInput{
+		ExecutionID:        "agent_assessment",
+		LoopID:             "loop_1",
+		WorkingDirectory:   workdir,
+		Prompt:             "full assessment prompt",
+		NativeResumePrompt: "resume assessment prompt",
+		Assessment:         true,
+		Timeout:            5 * time.Second,
+		Env:                map[string]string{"ARGS_PATH": argsPath},
+	})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	result, err := execHandle.Wait(context.Background())
+	if err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	if result.Status != "completed" || result.Summary != "assessed" {
+		t.Fatalf("result = %#v, want completed assessment", result)
+	}
+	argsBytes, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatalf("ReadFile(argsPath) error = %v", err)
+	}
+	if got := strings.TrimSpace(string(argsBytes)); !strings.Contains(got, "full assessment prompt") || strings.Contains(got, "resume") || strings.Contains(got, sessionID) {
+		t.Fatalf("assessment args = %q, want fresh assessment prompt without native resume", got)
+	}
+	record, err := repos.AgentExecutions.GetByID(context.Background(), "agent_assessment")
+	if err != nil {
+		t.Fatalf("AgentExecutions.GetByID() error = %v", err)
+	}
+	if record == nil || record.NativeSessionID != nil || record.NativeResumeMode == nil || *record.NativeResumeMode != "checkpoint_restart" || record.NativeResumeStatus == nil || *record.NativeResumeStatus != "disabled" {
+		t.Fatalf("assessment native resume metadata = %#v, want checkpoint_restart/disabled without a session", record)
+	}
+}
+
+func TestAssessmentDoesNotCaptureJSONLThreadID(t *testing.T) {
+	coordinator := openAgentCoordinator(t)
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 20, 12, 0, 0, 0, time.UTC)
+	nowISO := now.Format("2006-01-02T15:04:05.000Z")
+	workdir := t.TempDir()
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Project", RepoPath: workdir, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_1", Seq: 1, ProjectID: "project_1", Type: "worker", TargetType: "issue", Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	scriptDir := t.TempDir()
+	scriptPath := filepath.Join(scriptDir, "codex")
+	// LiveToolEvents path: JSONL with thread.started then a completion payload.
+	script := `#!/bin/sh
+printf '%s\n' '{"type":"thread.started","thread_id":"th_assessment_must_not_persist"}'
+printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"__LOOPER_RESULT__={\"summary\":\"assessed-json\"}"}}'
+`
+	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("WriteFile(scriptPath) error = %v", err)
+	}
+	t.Setenv("PATH", scriptDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	executor := New(ExecutorOptions{
+		Config: ExecutorConfig{
+			Vendor:              config.AgentVendorCodex,
+			LiveToolEvents:      true,
+			NativeResumeEnabled: true,
+		},
+		Repos:             repos,
+		Now:               advancingNow(now, 10*time.Millisecond),
+		ParamsOwnerVendor: codexOwner(),
+	})
+
+	execHandle, err := executor.Start(context.Background(), RunInput{
+		ExecutionID:      "agent_assessment_jsonl",
+		LoopID:           "loop_1",
+		WorkingDirectory: workdir,
+		Prompt:           "assess with json events",
+		Assessment:       true,
+		Timeout:          5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	result, err := execHandle.Wait(context.Background())
+	if err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	if result.Status != "completed" {
+		t.Fatalf("result = %#v, want completed", result)
+	}
+	record, err := repos.AgentExecutions.GetByID(context.Background(), "agent_assessment_jsonl")
+	if err != nil {
+		t.Fatalf("AgentExecutions.GetByID() error = %v", err)
+	}
+	if record == nil {
+		t.Fatal("missing assessment execution record")
+	}
+	if record.NativeSessionID != nil {
+		t.Fatalf("assessment with LiveToolEvents persisted NativeSessionID=%q; must stay empty", *record.NativeSessionID)
+	}
+}
+
+func TestAssessmentSandboxConfigIsAcceptedByCodexExec(t *testing.T) {
+	codex, err := exec.LookPath("codex")
+	if err != nil {
+		t.Skip("codex is not installed")
+	}
+	sandbox, err := validationcmd.NewAssessmentSandbox(t.TempDir(), "looper-assessment", "looper-assessment-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sandbox.Cleanup()
+
+	_, args := resolveAssessmentSpawn(ExecutorConfig{Vendor: config.AgentVendorCodex}, "inspect", sandbox)
+	args = append(args[:len(args)-1], "--strict-config", "--help")
+	if output, runErr := exec.Command(codex, args...).CombinedOutput(); runErr != nil {
+		t.Fatalf("codex rejected assessment sandbox config: %v\n%s", runErr, output)
+	}
+}
+
+func TestResolveAssessmentSpawnUsesDedicatedReadOnlyProfile(t *testing.T) {
+	sandbox, err := validationcmd.NewAssessmentSandbox(t.TempDir(), "looper-assessment", "looper-assessment-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sandbox.Cleanup()
+
+	command, args := resolveAssessmentSpawn(ExecutorConfig{Vendor: config.AgentVendorCodex}, "inspect", sandbox)
+	if command != "codex" {
+		t.Fatalf("command = %q, want codex", command)
+	}
+	joined := strings.Join(args, " ")
+	for _, want := range []string{"--ignore-user-config", "project_doc_max_bytes=0", "--disable apps", "--disable computer_use", "permission_profile=\"looper-assessment\"", `":workspace_roots" = { "." = "read" }`, "network = { enabled = false }"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("assessment args = %q, missing %q", joined, want)
+		}
+	}
+	for _, forbidden := range []string{"workspace-write", "network_access=true", "--search", "--profile"} {
+		if strings.Contains(joined, forbidden) {
+			t.Fatalf("assessment args retain %q: %q", forbidden, joined)
+		}
+	}
+	if args[len(args)-1] != "inspect" {
+		t.Fatalf("assessment args = %#v, want prompt last", args)
+	}
+}
+
 func TestResolveSpawnOpenCodeDoesNotDuplicateRunSubcommand(t *testing.T) {
 	t.Parallel()
 
@@ -1480,6 +1722,124 @@ func TestExecutorHeartbeatTimeoutPreservesOriginalTimeoutTypeDuringGracefulShutd
 	}
 	if result.TimeoutType != "idle" {
 		t.Fatalf("result.TimeoutType = %q, want idle preserved after max runtime fires", result.TimeoutType)
+	}
+}
+
+func TestExecutorObservesBeforeTimeoutSignal(t *testing.T) {
+	t.Parallel()
+
+	marker := filepath.Join(t.TempDir(), "pre-timeout-observed")
+	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", `trap 'test -f "$MARKER" || exit 42; exit 0' TERM; while :; do sleep 0.01; done`}}}, ParamsOwnerVendor: customOwner()})
+	execHandle, err := executor.Start(context.Background(), RunInput{
+		ExecutionID: "agent_pre_timeout_observation", WorkingDirectory: t.TempDir(), Prompt: "ignored", Timeout: 150 * time.Millisecond, HeartbeatTimeout: time.Second, GracefulShutdown: 50 * time.Millisecond,
+		Env: map[string]string{"MARKER": marker},
+		OnBeforeTimeout: func(_ context.Context, observation TimeoutObservation) error {
+			if observation.TimeoutType != "max_runtime" {
+				return errors.New("expected max_runtime timeout observation")
+			}
+			return os.WriteFile(marker, []byte("captured\n"), 0o600)
+		},
+	})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	result, err := execHandle.Wait(context.Background())
+	if err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	if result.Status != "timeout" || result.TimeoutType != "max_runtime" || result.PreTimeoutError != "" {
+		t.Fatalf("result = %#v, want timeout with successful observation", result)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("timeout observer did not run before SIGTERM: %v", err)
+	}
+}
+
+func TestExecutorReportsCompletionWhenProcessExitsDuringTimeoutObservation(t *testing.T) {
+	t.Parallel()
+
+	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", "sleep 0.08"}}}, ParamsOwnerVendor: customOwner()})
+	execHandle, err := executor.Start(context.Background(), RunInput{
+		ExecutionID: "agent_completion_during_timeout_observation", WorkingDirectory: t.TempDir(), Prompt: "ignored", Timeout: 25 * time.Millisecond, GracefulShutdown: 10 * time.Millisecond,
+		OnBeforeTimeout: func(context.Context, TimeoutObservation) error {
+			time.Sleep(150 * time.Millisecond)
+			return errors.New("observation lost the completion race")
+		},
+	})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	result, err := execHandle.Wait(context.Background())
+	if err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	if result.Status != "completed" || result.PreTimeoutError != "" {
+		t.Fatalf("result = %#v, want completion without a timeout observation error", result)
+	}
+}
+
+func TestExecutorHonorsKillDuringTimeoutObservation(t *testing.T) {
+	t.Parallel()
+
+	observing := make(chan struct{})
+	releaseObservation := make(chan struct{})
+	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", "trap '' TERM; while :; do sleep 0.01; done"}}}, ParamsOwnerVendor: customOwner()})
+	execHandle, err := executor.Start(context.Background(), RunInput{
+		ExecutionID: "agent_killed_during_timeout_observation", WorkingDirectory: t.TempDir(), Prompt: "ignored", Timeout: 25 * time.Millisecond, GracefulShutdown: 10 * time.Millisecond,
+		OnBeforeTimeout: func(context.Context, TimeoutObservation) error {
+			close(observing)
+			<-releaseObservation
+			return errors.New("observation should not survive an operator stop")
+		},
+	})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	<-observing
+	if err := execHandle.Kill("operator stop"); err != nil {
+		t.Fatalf("Kill() error = %v", err)
+	}
+	close(releaseObservation)
+	result, err := execHandle.Wait(context.Background())
+	if err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	if result.Status != "killed" || result.PreTimeoutError != "" {
+		t.Fatalf("result = %#v, want killed without a timeout observation error", result)
+	}
+}
+
+func TestExecutorDoesNotIdleTimeoutActivityDuringObservation(t *testing.T) {
+	t.Parallel()
+
+	marker := filepath.Join(t.TempDir(), "activity-produced")
+	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendor("custom"), Params: map[string]any{"command": "/bin/sh", "args": []any{"-c", "sleep 0.15; printf 'active\\n'; touch \"$MARKER\"; sleep 0.04"}}}, ParamsOwnerVendor: customOwner()})
+	execHandle, err := executor.Start(context.Background(), RunInput{
+		ExecutionID: "agent_activity_during_timeout_observation", WorkingDirectory: t.TempDir(), Prompt: "ignored", Timeout: time.Second, HeartbeatTimeout: 100 * time.Millisecond, GracefulShutdown: 10 * time.Millisecond,
+		Env: map[string]string{"MARKER": marker},
+		OnBeforeTimeout: func(ctx context.Context, _ TimeoutObservation) error {
+			for {
+				if _, err := os.Stat(marker); err == nil {
+					time.Sleep(20 * time.Millisecond)
+					return nil
+				}
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(5 * time.Millisecond):
+				}
+			}
+		},
+	})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	result, err := execHandle.Wait(context.Background())
+	if err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	if result.Status != "completed" || result.PreTimeoutError != "" {
+		t.Fatalf("result = %#v, want activity during observation to cancel the idle timeout", result)
 	}
 }
 

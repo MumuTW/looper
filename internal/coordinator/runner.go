@@ -369,6 +369,15 @@ func (r *Runner) listCoordinatorBacklog(ctx context.Context, projectID, repo, cw
 		pageIssues := backlog[pageStart:pageEnd]
 		for index := range pageIssues {
 			issue := pageIssues[(candidateStart+index)%len(pageIssues)]
+			// Recovery scans re-route stuck worker work. A single exact target
+			// is an active claim: the coordinator assigned this issue to that
+			// worker node. Heartbeat staleness is an infrastructure drift
+			// signal, not authority to revoke the claim — a temporarily
+			// partitioned worker may still be executing, and rerouting it would
+			// let two workers run the same issue concurrently. Skip
+			// single-target candidates and leave the target untouched;
+			// recovery happens when the worker releases the claim (target
+			// label removed) and the issue re-enters dispatch with no target.
 			if target.recovery && len(protocol.CollectTargetLabels(issue.Labels)) == 1 {
 				continue
 			}

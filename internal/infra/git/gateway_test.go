@@ -121,9 +121,16 @@ func TestGatewayCreatesRestoresAndCleansWorktreesWithBranchProtection(t *testing
 	}
 
 	writeFile(t, filepath.Join(worktree.WorktreePath, "README.md"), "hello updated\n")
+	runGit(t, worktree.WorktreePath, "add", "README.md")
+	writeFile(t, filepath.Join(worktree.WorktreePath, "timeout-progress.txt"), "first observation\n")
 	inspectBeforeCommit, err := gateway.InspectHead(ctx, InspectHeadInput{WorktreePath: worktree.WorktreePath, BaseRef: prepared.HeadSHA})
 	if err != nil {
 		t.Fatalf("InspectHead(before) error = %v", err)
+	}
+	writeFile(t, filepath.Join(worktree.WorktreePath, "timeout-progress.txt"), "changed contents stay private\n")
+	inspectBeforeCommitContentChange, err := gateway.InspectHead(ctx, InspectHeadInput{WorktreePath: worktree.WorktreePath, BaseRef: prepared.HeadSHA})
+	if err != nil {
+		t.Fatalf("InspectHead(before content change) error = %v", err)
 	}
 	globalEmailBefore := stringsTrimSpace(runGitMaybe(t, fixture.repoPath, "config", "--global", "--get", "user.email"))
 	commitResult, err := gateway.Commit(ctx, CommitInput{WorktreePath: worktree.WorktreePath, Message: "fixer: address PR #42 follow-up items"})
@@ -146,6 +153,18 @@ func TestGatewayCreatesRestoresAndCleansWorktreesWithBranchProtection(t *testing
 	}
 	if !inspectBeforeCommit.HasUncommittedChanges {
 		t.Fatalf("InspectHead(before).HasUncommittedChanges = false, want true")
+	}
+	if got := inspectBeforeCommit.StagedFiles; len(got) != 1 || got[0] != "README.md" {
+		t.Fatalf("InspectHead(before).StagedFiles = %#v, want [README.md]", got)
+	}
+	if got := inspectBeforeCommit.UntrackedFiles; len(got) != 1 || got[0] != "timeout-progress.txt" {
+		t.Fatalf("InspectHead(before).UntrackedFiles = %#v, want [timeout-progress.txt]", got)
+	}
+	if inspectBeforeCommit.DiffFingerprint == "" {
+		t.Fatal("InspectHead(before).DiffFingerprint = empty, want status fingerprint")
+	}
+	if inspectBeforeCommitContentChange.DiffFingerprint != inspectBeforeCommit.DiffFingerprint {
+		t.Fatalf("status fingerprint changed after content-only update: before=%q after=%q", inspectBeforeCommit.DiffFingerprint, inspectBeforeCommitContentChange.DiffFingerprint)
 	}
 	if commitResult.CommitSHA == "" {
 		t.Fatal("Commit().CommitSHA = empty, want value")
@@ -180,6 +199,58 @@ func TestGatewayCreatesRestoresAndCleansWorktreesWithBranchProtection(t *testing
 	var protectedErr *ProtectedBranchError
 	if err == nil || !errors.As(err, &protectedErr) {
 		t.Fatalf("AssertWritableBranch() error = %v, want *ProtectedBranchError", err)
+	}
+}
+
+func TestGatewayInspectHeadRecordsExactRenamePathsAndDetachedBranch(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	fixture := newFixture(t)
+	fixture.createRemoteRepo(t, "feature/inspect-head")
+	gateway := fixture.gateway()
+	worktree, err := gateway.CreateWorktree(ctx, CreateWorktreeInput{
+		ProjectID: fixture.projectID, RepoPath: fixture.repoPath, WorktreeRoot: fixture.worktreeRoot,
+		Branch: "feature/inspect-head", BaseBranch: "main",
+	})
+	if err != nil {
+		t.Fatalf("CreateWorktree() error = %v", err)
+	}
+
+	writeFile(t, filepath.Join(worktree.WorktreePath, "before name.txt"), "before\n")
+	runGit(t, worktree.WorktreePath, "add", "before name.txt")
+	runGit(t, worktree.WorktreePath, "commit", "-m", "add rename source")
+	runGit(t, worktree.WorktreePath, "mv", "before name.txt", "after name.txt")
+
+	inspect, err := gateway.InspectHead(ctx, InspectHeadInput{RepoPath: fixture.repoPath, WorktreeRoot: fixture.worktreeRoot, WorktreePath: worktree.WorktreePath})
+	if err != nil {
+		t.Fatalf("InspectHead() error = %v", err)
+	}
+	if inspect.Branch != "feature/inspect-head" {
+		t.Fatalf("InspectHead().Branch = %q, want feature/inspect-head", inspect.Branch)
+	}
+	if got := inspect.ChangedFiles; len(got) != 1 || got[0] != "after name.txt" {
+		t.Fatalf("InspectHead().ChangedFiles = %#v, want exact rename destination", got)
+	}
+	if got := inspect.StagedFiles; len(got) != 1 || got[0] != "after name.txt" {
+		t.Fatalf("InspectHead().StagedFiles = %#v, want exact rename destination", got)
+	}
+
+	runGit(t, worktree.WorktreePath, "checkout", "--detach")
+	detached, err := gateway.InspectHead(ctx, InspectHeadInput{RepoPath: fixture.repoPath, WorktreeRoot: fixture.worktreeRoot, WorktreePath: worktree.WorktreePath})
+	if err != nil {
+		t.Fatalf("InspectHead(detached) error = %v", err)
+	}
+	if detached.Branch != "HEAD" {
+		t.Fatalf("InspectHead(detached).Branch = %q, want HEAD", detached.Branch)
+	}
+}
+
+func TestParseStatusResultRejectsTruncatedOutput(t *testing.T) {
+	t.Parallel()
+
+	_, err := parseStatusResult(shell.Result{Stdout: "?? partial-path", StdoutTruncated: true})
+	if err == nil || !strings.Contains(err.Error(), "exceeded capture limit") {
+		t.Fatalf("parseStatusResult() error = %v, want truncated-output rejection", err)
 	}
 }
 

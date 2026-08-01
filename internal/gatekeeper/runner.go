@@ -56,6 +56,7 @@ const (
 	ReasonCheckCancelled           ReasonCode = "required_check_cancelled"
 	ReasonReviewRequired           ReasonCode = "required_review_missing"
 	ReasonReviewChangesRequested   ReasonCode = "review_changes_requested"
+	ReasonCodexReviewMissing       ReasonCode = "codex_review_missing"
 	ReasonUnresolvedReviewThread   ReasonCode = "unresolved_review_thread"
 	ReasonProjectPolicyDenied      ReasonCode = "project_policy_denied"
 	ReasonHold                     ReasonCode = "hold"
@@ -90,21 +91,33 @@ type DiffBudgetEvidence struct {
 	MaxDeletions    int `json:"maxDeletions"`
 }
 
+// CodexReviewEvidence is the durable Reviewer review signal considered by the
+// current-head gate. The event log is the authority because Reviewer appends
+// it only after its structured review marker has been verified.
+type CodexReviewEvidence struct {
+	RequiredHeadSHA  string `json:"requiredHeadSha"`
+	ReviewedHeadSHA  string `json:"reviewedHeadSha,omitempty"`
+	Event            string `json:"event,omitempty"`
+	RecordedAt       string `json:"recordedAt,omitempty"`
+	CurrentHeadValid bool   `json:"currentHeadValid"`
+}
+
 type Evidence struct {
-	PullRequestState             string              `json:"pullRequestState,omitempty"`
-	Draft                        bool                `json:"draft"`
-	BaseRefName                  string              `json:"baseRefName,omitempty"`
-	Mergeable                    *bool               `json:"mergeable,omitempty"`
-	MergeableState               string              `json:"mergeableState,omitempty"`
-	RequiredChecks               []string            `json:"requiredChecks"`
-	Checks                       []CheckEvidence     `json:"checks"`
-	RequiredApprovingReviewCount int                 `json:"requiredApprovingReviewCount"`
-	ReviewDecision               string              `json:"reviewDecision,omitempty"`
-	UnresolvedReviewThreadIDs    []string            `json:"unresolvedReviewThreadIds"`
-	HoldLabels                   []string            `json:"holdLabels"`
-	DiffBudget                   *DiffBudgetEvidence `json:"diffBudget,omitempty"`
-	ProjectPolicyPermitsTarget   bool                `json:"projectPolicyPermitsTarget"`
-	FinalObservedHeadSHA         string              `json:"finalObservedHeadSha,omitempty"`
+	PullRequestState             string               `json:"pullRequestState,omitempty"`
+	Draft                        bool                 `json:"draft"`
+	BaseRefName                  string               `json:"baseRefName,omitempty"`
+	Mergeable                    *bool                `json:"mergeable,omitempty"`
+	MergeableState               string               `json:"mergeableState,omitempty"`
+	RequiredChecks               []string             `json:"requiredChecks"`
+	Checks                       []CheckEvidence      `json:"checks"`
+	RequiredApprovingReviewCount int                  `json:"requiredApprovingReviewCount"`
+	ReviewDecision               string               `json:"reviewDecision,omitempty"`
+	CodexReview                  *CodexReviewEvidence `json:"codexReview,omitempty"`
+	UnresolvedReviewThreadIDs    []string             `json:"unresolvedReviewThreadIds"`
+	HoldLabels                   []string             `json:"holdLabels"`
+	DiffBudget                   *DiffBudgetEvidence  `json:"diffBudget,omitempty"`
+	ProjectPolicyPermitsTarget   bool                 `json:"projectPolicyPermitsTarget"`
+	FinalObservedHeadSHA         string               `json:"finalObservedHeadSha,omitempty"`
 }
 
 type Report struct {
@@ -272,7 +285,18 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		fingerprint := sourceFingerprint(pullRequest, budgetEnabled) + fmt.Sprintf("\x1fdiff-budget=%d,%d", diffBudget.MaxChangedFiles, diffBudget.MaxDeletions)
 		entityID := fmt.Sprintf("%s#%d", input.Repo, pullRequest.Number)
 		previous, hasPrevious := previousReports[entityID]
-		if reused, ok := skipUnchanged(previous, hasPrevious, fingerprint, r.now()); ok {
+		// When the previous report is waiting on a current-head review, check
+		// the local event log cheaply before deciding to skip. This avoids a
+		// full forge evaluation every tick for PRs that may never receive a
+		// Reviewer review (unrequested, self-authored), while still observing
+		// a review the moment its durable event appears.
+		reviewEvidenceAppeared := false
+		if hasPrevious && previous.SourceFingerprint == fingerprint && reportAwaitsCurrentHeadReview(previous) {
+			if evidence, err := latestCodexReviewForHead(ctx, r.repos, input.ProjectID, input.Repo, pullRequest.Number, pullRequest.HeadSHA); err == nil && evidence.CurrentHeadValid {
+				reviewEvidenceAppeared = true
+			}
+		}
+		if reused, ok := skipUnchanged(previous, hasPrevious, fingerprint, r.now(), reviewEvidenceAppeared); ok {
 			result.Skipped++
 			result.Reports = append(result.Reports, reused)
 			continue
@@ -340,6 +364,22 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 	}
 	if detail.Number != input.PRNumber || report.ObservedHeadSHA == "" || report.Evidence.BaseRefName == "" {
 		return r.persistProviderBlock(ctx, report, ReasonProviderStateAmbiguous, "pull_request")
+	}
+	codexReview, err := latestCodexReviewForHead(ctx, r.repos, input.ProjectID, input.Repo, input.PRNumber, report.ObservedHeadSHA)
+	if err != nil {
+		// Persist the invalid projection so reportAwaitsCurrentHeadReview
+		// recognizes this report as waiting on review evidence. Without it the
+		// report carries only the provider reason and a nil CodexReview
+		// projection, which neither signal detects, so unchanged discovery
+		// would reuse this transient read failure for up to maxSkipAge even
+		// after the event store recovers or the review event appears. The
+		// placeholder carries RequiredHeadSHA and CurrentHeadValid=false.
+		report.Evidence.CodexReview = &codexReview
+		return r.persistProviderBlock(ctx, report, ReasonProviderStateUnavailable, "codex_review")
+	}
+	report.Evidence.CodexReview = &codexReview
+	if !codexReview.CurrentHeadValid {
+		report.Reasons = append(report.Reasons, Reason{Code: ReasonCodexReviewMissing, Subject: codexReviewReasonSubject(codexReview)})
 	}
 
 	if report.Evidence.PullRequestState != "OPEN" {

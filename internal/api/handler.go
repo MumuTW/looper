@@ -354,6 +354,33 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request) {
 
 		h.writeSuccess(w, requestID, h.buildVersionResponse())
 		return
+	case apiBasePath + "/upgrade/backup":
+		if !assertMethod(r.Method, http.MethodPost, path, w, requestID, h.writeError) {
+			return
+		}
+		result, err := h.createUpgradeBackup(r.Context())
+		if err != nil {
+			h.writeError(w, requestID, internalServerError(err))
+			return
+		}
+		h.writeSuccess(w, requestID, result)
+		return
+	case apiBasePath + "/upgrade/drain":
+		if r.Method != http.MethodGet && r.Method != http.MethodPost {
+			h.writeError(w, requestID, apiError{code: "method_not_allowed", status: http.StatusMethodNotAllowed, message: "Unsupported method for /api/v1/upgrade/drain"})
+			return
+		}
+		result, err := h.upgradeDrainStatus(r.Method == http.MethodPost)
+		if err != nil {
+			var typed apiError
+			if !asAPIError(err, &typed) {
+				typed = internalServerError(err)
+			}
+			h.writeError(w, requestID, typed)
+			return
+		}
+		h.writeSuccess(w, requestID, result)
+		return
 	case apiBasePath + "/config":
 		h.handleConfigRoute(w, r, requestID)
 		return
@@ -5983,6 +6010,10 @@ func (h *Handler) deliverHumanAnswer(ctx context.Context, loopID string, rawAnsw
 
 	services := h.context.Runtime.Services()
 	nowISO := eventlog.FormatJavaScriptISOString(h.now().UTC())
+	// Serialize with worker HITL correlation writes (same per-loop requeue
+	// guard). Hold only around the metadata write — mutateLoopStatus(Running)
+	// acquires the same lock and would deadlock if we nested.
+	unlock := loops.LockLoopRequeue(loopID)
 	_, err := storage.WithTransactionValue(ctx, services.Coordinator.DB(), nil, func(tx *sql.Tx) (storage.LoopRecord, error) {
 		repos := storage.NewRepositories(tx)
 		loop, err := repos.Loops.GetByID(ctx, loopID)
@@ -6018,6 +6049,7 @@ func (h *Handler) deliverHumanAnswer(ctx context.Context, loopID string, rawAnsw
 		}
 		return updated, nil
 	})
+	unlock()
 	if err != nil {
 		var typed apiError
 		if asAPIError(err, &typed) {
