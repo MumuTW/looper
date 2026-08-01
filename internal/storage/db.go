@@ -38,13 +38,18 @@ type txBeginner interface {
 }
 
 func OpenSQLiteCoordinator(ctx context.Context, dbPath string, options SQLiteCoordinatorOptions) (*SQLiteCoordinator, error) {
-	db, err := OpenSQLiteDB(ctx, dbPath)
+	// Freeze restore metadata path before open so a parent symlink cannot be
+	// retargeted between open/ping and path resolution.
+	openedPath, err := resolveOpenedDatabasePath(dbPath)
 	if err != nil {
 		return nil, err
 	}
-	openedPath, err := resolveOpenedDatabasePath(dbPath)
+	openPath := dbPath
+	if openedPath != "" {
+		openPath = openedPath
+	}
+	db, err := OpenSQLiteDB(ctx, openPath)
 	if err != nil {
-		_ = db.Close()
 		return nil, err
 	}
 

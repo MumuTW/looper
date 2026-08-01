@@ -43,15 +43,26 @@ func AvailableInDirectory(cwd string) error {
 	return availableInEnvironment(cwd, "")
 }
 
-// ServiceProbePATH is the PATH assumed when a launchd/systemd unit injects no
-// environment (typical supervised install). Preflight must not inherit the
-// operator shell PATH or it can authorize a candidate that fails at daemon boot.
-const ServiceProbePATH = "/usr/bin:/bin:/usr/sbin:/sbin"
+// ServiceProbePATH is the historical alias for launchd-like defaults.
+const ServiceProbePATH = ServiceProbePATHLaunchd
+
+// ServiceProbePATHLaunchd approximates launchd's default PATH when the unit
+// injects no environment.
+const ServiceProbePATHLaunchd = "/usr/bin:/bin:/usr/sbin:/sbin"
+
+// ServiceProbePATHSystemd approximates a systemd user unit default PATH
+// (includes /usr/local/bin commonly used for operator installs).
+const ServiceProbePATHSystemd = "/usr/local/bin:/usr/bin:/bin"
 
 // AvailableInServiceEnvironment probes sandbox readiness with the supervised
-// daemon's working directory and a minimal service PATH.
-func AvailableInServiceEnvironment(cwd string) error {
-	return availableInEnvironment(cwd, ServiceProbePATH)
+// daemon's working directory and a manager-default PATH. Empty pathEnv falls
+// back to ServiceProbePATHLaunchd.
+func AvailableInServiceEnvironment(cwd string, pathEnv ...string) error {
+	path := ServiceProbePATHLaunchd
+	if len(pathEnv) > 0 && strings.TrimSpace(pathEnv[0]) != "" {
+		path = pathEnv[0]
+	}
+	return availableInEnvironment(cwd, path)
 }
 
 func availableInEnvironment(cwd, pathEnv string) error {

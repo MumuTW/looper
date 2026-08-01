@@ -331,10 +331,18 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			h.writeError(w, requestID, typed)
 			return
 		}
+		// Backup is a mutation for drain purposes once admitted.
+		if release := h.beginAdmittedMutation(); release != nil {
+			defer release()
+		}
 	} else if isMutatingHTTPMethod(r.Method) && !isAdmissionExemptMutationPath(path) && path != apiBasePath+"/hitl/feishu" {
 		if typed, denied := h.admissionMutationDenial(); denied {
 			h.writeError(w, requestID, typed)
 			return
+		}
+		// Track until the handler returns so drain waits for in-flight commits.
+		if release := h.beginAdmittedMutation(); release != nil {
+			defer release()
 		}
 	}
 
@@ -927,6 +935,17 @@ func (h *Handler) upgradeBackupMutationDenial() (apiError, bool) {
 			message: "Upgrade backup requires ready admission or a completed drain",
 		}, true
 	}
+}
+
+func (h *Handler) beginAdmittedMutation() func() {
+	if h == nil || h.context.Runtime == nil {
+		return nil
+	}
+	tracker, ok := any(h.context.Runtime).(interface{ BeginAdmittedMutation() func() })
+	if !ok {
+		return nil
+	}
+	return tracker.BeginAdmittedMutation()
 }
 
 func (h *Handler) admissionMutationDenial() (apiError, bool) {
