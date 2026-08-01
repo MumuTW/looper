@@ -37,6 +37,7 @@ import (
 	"github.com/MumuTW/looper/internal/loops"
 	"github.com/MumuTW/looper/internal/loops/failureclass"
 	"github.com/MumuTW/looper/internal/processcontainment"
+	"github.com/MumuTW/looper/internal/reproducer"
 	"github.com/MumuTW/looper/internal/storage"
 	"github.com/MumuTW/looper/internal/validation"
 	"github.com/MumuTW/looper/internal/worktreesafety"
@@ -721,6 +722,7 @@ type fixerCheckpoint struct {
 	ResolvedComments *checkpointResolvedComments `json:"resolvedComments,omitempty"`
 	SummaryComment   *checkpointSummaryComment   `json:"summaryComment,omitempty"`
 	Recheck          *checkpointRecheck          `json:"recheck,omitempty"`
+	Reproduction     *reproducer.Manifest        `json:"reproduction,omitempty"`
 	SkipReason       string                      `json:"skipReason,omitempty"`
 }
 
@@ -911,6 +913,62 @@ type stepInput struct {
 	Repo       string
 	PRNumber   int64
 	Checkpoint fixerCheckpoint
+}
+
+func fixerReproductionFailure(err error) *loopError {
+	return &loopError{message: "Reproduction test integrity check failed: " + err.Error(), kind: FailureManualIntervention}
+}
+
+// captureFixerReproduction records the optional committed reproduction
+// manifest. Once captured, a retry cannot silently replace its test identity
+// or hash with a new agent-authored manifest.
+func captureFixerReproduction(checkpoint *fixerCheckpoint, worktreePath string) error {
+	if checkpoint == nil {
+		return nil
+	}
+	manifest, err := reproducer.Load(worktreePath)
+	if err != nil {
+		return fixerReproductionFailure(err)
+	}
+	if checkpoint.Reproduction != nil {
+		if manifest == nil {
+			return fixerReproductionFailure(errors.New("reproduction manifest is missing"))
+		}
+		if !checkpoint.Reproduction.Equal(*manifest) {
+			return fixerReproductionFailure(errors.New("reproduction manifest changed during run"))
+		}
+		if err := checkpoint.Reproduction.Verify(worktreePath); err != nil {
+			return fixerReproductionFailure(err)
+		}
+		return nil
+	}
+	if manifest != nil {
+		checkpoint.Reproduction = manifest
+	}
+	return nil
+}
+
+func verifyFixerReproduction(checkpoint fixerCheckpoint, worktreePath string) error {
+	if checkpoint.Reproduction == nil {
+		return nil
+	}
+	if err := checkpoint.Reproduction.Verify(worktreePath); err != nil {
+		return fixerReproductionFailure(err)
+	}
+	return nil
+}
+
+func fixerValidationCommands(base []string, checkpoint fixerCheckpoint) []string {
+	commands := append([]string(nil), base...)
+	if checkpoint.Reproduction == nil || strings.TrimSpace(checkpoint.Reproduction.TestCommand) == "" {
+		return commands
+	}
+	for _, command := range commands {
+		if command == checkpoint.Reproduction.TestCommand {
+			return commands
+		}
+	}
+	return append(commands, checkpoint.Reproduction.TestCommand)
 }
 
 type loopError struct {
@@ -3200,6 +3258,10 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 			return checkpoint, err
 		}
 	}
+	if err := captureFixerReproduction(&checkpoint, worktree.Path); err != nil {
+		return checkpoint, err
+	}
+	validationCommands = fixerValidationCommands(validationCommands, checkpoint)
 	if held, summary, err := r.fixerHoldSummary(ctx, input.Project, input.Loop, input.Repo, input.PRNumber); err != nil {
 		return checkpoint, err
 	} else if held {
@@ -3226,6 +3288,9 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 		return checkpoint, fmt.Errorf("resolve run agent identity: %w", err)
 	}
 	prompt, instructionBlock := buildFixerPrompt(input.Project.ID, r.customInstructions, input.Repo, input.PRNumber, checkpoint.Detail, checkpoint.FixItems, r.disclosure, agentVendor, derefString(agentModel))
+	if checkpoint.Reproduction != nil {
+		prompt += "\n\n" + checkpoint.Reproduction.PromptInstruction()
+	}
 	if len(validationCommands) > 0 {
 		prompt += validationGatedLocalOnlyPrompt
 	}
@@ -3271,6 +3336,9 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 		}
 		message := firstNonEmpty(result.Summary, result.Stderr, "Fixer agent "+result.Status)
 		return checkpoint, &loopError{message: message, kind: FailureRetryableTransient}
+	}
+	if err := verifyFixerReproduction(checkpoint, worktree.Path); err != nil {
+		return checkpoint, err
 	}
 	// Build the repair record before validating rather than probing with a
 	// two-field copy: validation and the persisted checkpoint then rest on the
@@ -3367,6 +3435,13 @@ func (r *Runner) runValidateStep(ctx context.Context, input stepInput) (fixerChe
 	if rootErr != nil {
 		return checkpoint, rootErr
 	}
+	if err := captureFixerReproduction(&checkpoint, worktree.Path); err != nil {
+		return checkpoint, err
+	}
+	validationCommands = fixerValidationCommands(validationCommands, checkpoint)
+	if err := verifyFixerReproduction(checkpoint, worktree.Path); err != nil {
+		return checkpoint, err
+	}
 	result, err := r.runValidation(ctx, ValidationInput{CWD: worktree.Path, Commands: validationCommands})
 	if err != nil {
 		return checkpoint, err
@@ -3376,6 +3451,9 @@ func (r *Runner) runValidateStep(ctx context.Context, input stepInput) (fixerChe
 		d := failurepolicy.ClassifyValidation(result.FailureCategory, result.Summary)
 		checkpoint.ResumePolicy = d.ResumePolicy
 		return checkpoint, &loopError{message: d.Message, kind: fixerFailureKind(d.Kind)}
+	}
+	if err := verifyFixerReproduction(checkpoint, worktree.Path); err != nil {
+		return checkpoint, err
 	}
 	inspect, err := r.git.InspectHead(ctx, InspectHeadInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, BaseRef: reconcile.BaseHeadSHA(checkpoint.ReconcileCommits)})
 	if err != nil {
@@ -3401,6 +3479,9 @@ func (r *Runner) runValidateStep(ctx context.Context, input stepInput) (fixerChe
 			d := failurepolicy.ClassifyValidation(second.FailureCategory, second.Summary)
 			checkpoint.ResumePolicy = d.ResumePolicy
 			return checkpoint, &loopError{message: d.Message, kind: fixerFailureKind(d.Kind)}
+		}
+		if err := verifyFixerReproduction(checkpoint, worktree.Path); err != nil {
+			return checkpoint, err
 		}
 		finalInspect, err := r.git.InspectHead(ctx, InspectHeadInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, BaseRef: reconcile.BaseHeadSHA(checkpoint.ReconcileCommits)})
 		if err != nil {
@@ -3449,6 +3530,13 @@ func (r *Runner) runPushStep(ctx context.Context, input stepInput) (fixerCheckpo
 	}
 	worktree, err := requireWorktree(checkpoint)
 	if err != nil {
+		return checkpoint, err
+	}
+	if err := captureFixerReproduction(&checkpoint, worktree.Path); err != nil {
+		return checkpoint, err
+	}
+	validationCommands = fixerValidationCommands(validationCommands, checkpoint)
+	if err := verifyFixerReproduction(checkpoint, worktree.Path); err != nil {
 		return checkpoint, err
 	}
 	worktreeRoot, rootErr := fixerWorktreeRoot(input.Project)

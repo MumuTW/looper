@@ -32,6 +32,7 @@ import (
 	"github.com/MumuTW/looper/internal/network/protocol"
 	"github.com/MumuTW/looper/internal/networkpolicy"
 	"github.com/MumuTW/looper/internal/processcontainment"
+	"github.com/MumuTW/looper/internal/reproducer"
 	"github.com/MumuTW/looper/internal/storage"
 	"github.com/MumuTW/looper/internal/validation"
 	"github.com/MumuTW/looper/internal/worker/workflow"
@@ -630,9 +631,10 @@ type workerInput struct {
 	// IssueClaimOverride is the durable operator authority from a force=true
 	// manual issue dispatch. It follows the worker through PR creation and
 	// adoption so source-issue admission is not re-applied mid-lifecycle.
-	IssueClaimOverride   bool     `json:"issueClaimOverride,omitempty"`
-	RoutedClaimMatchMode string   `json:"routedClaimMatchMode,omitempty"`
-	Reviewers            []string `json:"reviewers,omitempty"`
+	IssueClaimOverride   bool                 `json:"issueClaimOverride,omitempty"`
+	RoutedClaimMatchMode string               `json:"routedClaimMatchMode,omitempty"`
+	Reviewers            []string             `json:"reviewers,omitempty"`
+	Reproduction         *reproducer.Manifest `json:"reproduction,omitempty"`
 }
 
 type workerCheckpoint struct {
@@ -644,9 +646,14 @@ type workerCheckpoint struct {
 	Plan           *checkpointPlan       `json:"plan,omitempty"`
 	Execution      *checkpointExecution  `json:"execution,omitempty"`
 	Lifecycle      *lifecycle.State      `json:"gitPrLifecycle,omitempty"`
-	Validation     *ValidationResult     `json:"validation,omitempty"`
-	PullRequest    *checkpointPullPR     `json:"pullRequest,omitempty"`
-	SkipReason     string                `json:"skipReason,omitempty"`
+	// ReproductionBaseline is the durable red evidence captured before the
+	// Worker agent is allowed to edit the worktree. It is separate from
+	// Validation because a non-zero reproduction test is expected here while
+	// the completion gate requires that same test to pass later.
+	ReproductionBaseline *ValidationResult `json:"reproductionBaseline,omitempty"`
+	Validation           *ValidationResult `json:"validation,omitempty"`
+	PullRequest          *checkpointPullPR `json:"pullRequest,omitempty"`
+	SkipReason           string            `json:"skipReason,omitempty"`
 }
 
 type checkpointIssueClaim struct {
@@ -738,6 +745,241 @@ func validateCompletedExecutionCheckpoint(execution *checkpointExecution) error 
 
 func invalidWorkerStructuredResultMessage(parseStatus string) string {
 	return fmt.Sprintf("Worker completed without a valid structured result (parse status: %s). See Looper logs for details.", firstNonEmpty(parseStatus, "missing"))
+}
+
+func reproductionFailure(err error) *loopError {
+	return &loopError{message: "Reproduction test integrity check failed: " + err.Error(), kind: FailureManualIntervention}
+}
+
+// captureWorkerReproduction records an optional manifest once the worktree is
+// prepared. A later retry must see the same manifest; silently adopting a new
+// one would let a run replace the reproduction authority after the agent ran.
+//
+// A manifest that declares an originating issue is only adopted for the task
+// that owns that issue. A manifest left in the base branch after a previous
+// reproduction fix merged is already-fixed history, not the current task's
+// reproduction; adopting it would gate unrelated work on a now-green test.
+func captureWorkerReproduction(checkpoint *workerCheckpoint, worktreePath string) error {
+	if checkpoint == nil || checkpoint.Work == nil {
+		return nil
+	}
+	manifest, err := reproducer.Load(worktreePath)
+	if err != nil {
+		return reproductionFailure(err)
+	}
+	if checkpoint.Work.Reproduction != nil {
+		if manifest == nil {
+			return reproductionFailure(errors.New("reproduction manifest is missing"))
+		}
+		if !checkpoint.Work.Reproduction.Equal(*manifest) {
+			return reproductionFailure(errors.New("reproduction manifest changed during run"))
+		}
+		if err := checkpoint.Work.Reproduction.Verify(worktreePath); err != nil {
+			return reproductionFailure(err)
+		}
+		return nil
+	}
+	if manifest != nil {
+		if !workerReproductionManifestAppliesToTask(*manifest, *checkpoint.Work) {
+			return nil
+		}
+		checkpoint.Work.Reproduction = manifest
+	}
+	return nil
+}
+
+// workerReproductionManifestAppliesToTask reports whether a manifest loaded
+// from the checkout is the reproduction authority for this Worker task. A
+// manifest scoped to a different issue is treated as already-fixed history.
+func workerReproductionManifestAppliesToTask(manifest reproducer.Manifest, work workerInput) bool {
+	return manifest.AppliesToIssue(work.IssueNumber, firstNonEmpty(work.IssueRepo, work.Repo))
+}
+
+func verifyWorkerReproduction(checkpoint workerCheckpoint, worktreePath string) error {
+	if checkpoint.Work == nil || checkpoint.Work.Reproduction == nil {
+		return nil
+	}
+	if err := checkpoint.Work.Reproduction.Verify(worktreePath); err != nil {
+		return reproductionFailure(err)
+	}
+	return nil
+}
+
+// reproductionBaselineScope controls whether a baseline gate may observe new
+// red evidence or may only reuse evidence captured before the Worker agent
+// edited the worktree.
+type reproductionBaselineScope int
+
+const (
+	// reproductionBaselineScopeCreate may run the reproduction command and
+	// record a fresh red observation. It is used only before the Worker agent
+	// is allowed to edit the worktree (prepare-worktree and pre-execution
+	// execute).
+	reproductionBaselineScopeCreate reproductionBaselineScope = iota
+	// reproductionBaselineScopeReuseOnly never creates new evidence. It is
+	// used after the Worker agent may have edited or committed the worktree
+	// (post-execution execute, validate, open-pr). A missing baseline fails
+	// closed instead of manufacturing red evidence from a possibly mutated
+	// checkout, because a reproduction observed after execution says nothing
+	// about the original state the agent started from.
+	reproductionBaselineScopeReuseOnly
+)
+
+// ensureWorkerReproductionBaseline proves that the committed reproduction is
+// actually red before the Worker agent can edit the worktree. The manifest and
+// test hash remain the authority; this result is only the durable observation
+// that the named command failed. A passing command is not a reproduction, and
+// operational failures are not accepted as a red test.
+//
+// A persisted baseline is only reused when it is an ordinary failing-test
+// result bound to the checkout that produced it. A rejected observation
+// (immediate pass or operational failure) is discarded so a retry re-derives
+// instead of accepting evidence that is not a red test, and a checkout that
+// drifted from the recorded head is re-derived before execution. In a
+// reuse-only scope a missing baseline fails closed rather than running the
+// reproduction against a worktree the agent may already have changed.
+func (r *Runner) ensureWorkerReproductionBaseline(ctx context.Context, checkpoint *workerCheckpoint, worktreePath, repoPath, worktreeRoot string, scope reproductionBaselineScope) error {
+	if checkpoint == nil || checkpoint.Work == nil || checkpoint.Work.Reproduction == nil {
+		return nil
+	}
+	if err := verifyWorkerReproduction(*checkpoint, worktreePath); err != nil {
+		return err
+	}
+	if baseline := checkpoint.ReproductionBaseline; baseline != nil {
+		if workerReproductionBaselineAcceptable(*baseline) && r.workerReproductionBaselineCheckoutMatches(ctx, *baseline, checkpoint.Worktree, worktreePath, repoPath, worktreeRoot, scope) {
+			return nil
+		}
+		// The persisted observation is either not an ordinary red test or was
+		// captured against a different checkout. Discard it so a retry
+		// re-derives instead of accepting rejected or stale evidence.
+		checkpoint.ReproductionBaseline = nil
+	}
+	if scope == reproductionBaselineScopeReuseOnly {
+		return &loopError{message: "Reproduction baseline evidence is absent after Worker execution; refusing to manufacture red evidence from a possibly mutated worktree. Resume the run from the prepare step so the baseline is captured before the agent edits the checkout.", kind: FailureManualIntervention}
+	}
+	manifest := checkpoint.Work.Reproduction
+	result, err := r.runValidation(ctx, ValidationInput{CWD: worktreePath, Commands: []string{manifest.TestCommand}})
+	if err != nil {
+		return &loopError{message: fmt.Sprintf("Reproduction baseline verification failed: %v", err), kind: FailureRetryableTransient}
+	}
+	if strings.TrimSpace(result.HeadSHA) == "" && checkpoint.Worktree != nil {
+		// Worktree.HeadSHA is the immutable checkout head recorded by the
+		// prepare-worktree step. Keep it with the red observation when the
+		// validation runner does not provide its own head evidence.
+		result.HeadSHA = strings.TrimSpace(checkpoint.Worktree.HeadSHA)
+	}
+	// Reject filesystem changes made by the baseline command. The reproduction
+	// must fail without dirtying the worktree the Worker starts on; otherwise
+	// the agent begins on side effects and reconcileWorkerGitState can fold
+	// them into a fallback commit as if the agent produced them.
+	if dirty, derr := r.workerReproductionBaselineWorktreeDirty(ctx, checkpoint.Worktree, worktreePath, repoPath, worktreeRoot); derr != nil {
+		return &loopError{message: fmt.Sprintf("Reproduction baseline worktree cleanliness check failed: %v", derr), kind: FailureRetryableTransient}
+	} else if dirty {
+		return &loopError{message: "Reproduction baseline verification failed: reproduction command modified the worktree; refusing to start Worker on uncommitted side effects", kind: FailureManualIntervention}
+	}
+	checkpoint.ReproductionBaseline = &result
+	if result.Passed {
+		return &loopError{message: "Reproduction baseline verification failed: named test passed immediately; a reproduction must fail before Worker execution", kind: FailureManualIntervention}
+	}
+	if result.FailureCategory != validation.FailureNonZeroExit {
+		policy := validation.PolicyFor(result.FailureCategory)
+		kind := QueueFailureKind(policy.FailureKind)
+		if kind == "" {
+			kind = FailureManualIntervention
+		}
+		return &loopError{message: fmt.Sprintf("Reproduction baseline verification failed: named test did not produce an ordinary failing test result (category %q, summary %q)", result.FailureCategory, result.Summary), kind: kind}
+	}
+	return nil
+}
+
+// workerReproductionBaselineAcceptable reports whether a persisted baseline is
+// an ordinary failing-test result that can be reused as red evidence. An
+// immediate pass or an operational failure (timeout, etc.) is not a
+// reproduction and must not gate Worker execution.
+func workerReproductionBaselineAcceptable(result ValidationResult) bool {
+	return !result.Passed && result.FailureCategory == validation.FailureNonZeroExit
+}
+
+// workerReproductionBaselineCheckoutMatches reports whether the checkout being
+// acted on still matches the head recorded with the red evidence. Pre-execution
+// (create scope) the head must not have drifted: if the worktree was restored,
+// reset, or advanced while the manifest and test stayed unchanged, code outside
+// the hashed test can make the reproduction green and the old red observation
+// must not be trusted. Post-execution (reuse-only scope) the head legitimately
+// advances from agent commits, so the recorded head is not expected to match
+// and reuse trusts the pre-execution capture.
+func (r *Runner) workerReproductionBaselineCheckoutMatches(ctx context.Context, baseline ValidationResult, worktree *checkpointWorktree, worktreePath, repoPath, worktreeRoot string, scope reproductionBaselineScope) bool {
+	if scope == reproductionBaselineScopeReuseOnly {
+		return true
+	}
+	if r.git == nil {
+		return true
+	}
+	recorded := strings.TrimSpace(baseline.HeadSHA)
+	if recorded == "" {
+		return true
+	}
+	inspect, err := r.git.InspectHead(ctx, InspectHeadInput{RepoPath: repoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktreePath, BaseRef: workerReproductionBaseRef(worktree)})
+	if err != nil {
+		// If the checkout cannot be inspected, do not silently accept stale
+		// evidence; treat it as a mismatch so the caller re-derives or fails.
+		return false
+	}
+	return strings.TrimSpace(inspect.HeadSHA) == recorded
+}
+
+// workerReproductionBaselineWorktreeDirty reports whether the worktree has
+// uncommitted changes, used to reject filesystem side effects produced by the
+// reproduction command. When no git gateway is configured (unit tests) the
+// check is skipped.
+func (r *Runner) workerReproductionBaselineWorktreeDirty(ctx context.Context, worktree *checkpointWorktree, worktreePath, repoPath, worktreeRoot string) (bool, error) {
+	if r.git == nil {
+		return false, nil
+	}
+	inspect, err := r.git.InspectHead(ctx, InspectHeadInput{RepoPath: repoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktreePath, BaseRef: workerReproductionBaseRef(worktree)})
+	if err != nil {
+		return false, err
+	}
+	return inspect.HasUncommittedChanges, nil
+}
+
+func workerReproductionBaseRef(worktree *checkpointWorktree) string {
+	if worktree == nil {
+		return ""
+	}
+	return firstNonEmpty(worktree.HeadSHA, worktree.BaseBranch)
+}
+
+// persistWorkerReproductionBaseline closes the crash window between observing
+// a red reproduction and starting the next operation. Normal workflow steps
+// also persist their returned checkpoint, but execute/validate/open-pr can be
+// entered directly when resuming an older run, so the evidence must be written
+// before those operations proceed.
+func (r *Runner) persistWorkerReproductionBaseline(ctx context.Context, input stepInput, checkpoint workerCheckpoint, wasPresent bool) error {
+	if wasPresent || checkpoint.ReproductionBaseline == nil || strings.TrimSpace(input.Run.ID) == "" {
+		return nil
+	}
+	if err := r.persistCheckpoint(ctx, input.Run.ID, checkpoint); err != nil {
+		return &loopError{message: fmt.Sprintf("persist reproduction baseline checkpoint: %v", err), kind: FailureRetryableAfterResume}
+	}
+	return nil
+}
+
+func workerValidationCommands(base []string, work workerInput) []string {
+	commands := append([]string(nil), base...)
+	if work.Reproduction != nil && strings.TrimSpace(work.Reproduction.TestCommand) != "" && !containsWorkerCommand(commands, work.Reproduction.TestCommand) {
+		commands = append(commands, work.Reproduction.TestCommand)
+	}
+	return commands
+}
+
+func containsWorkerCommand(commands []string, target string) bool {
+	for _, command := range commands {
+		if command == target {
+			return true
+		}
+	}
+	return false
 }
 
 func sanitizePublicIssueClaimSummary(summary string) string {
@@ -1625,6 +1867,16 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (w
 			if err := worktreesafety.ClearFixerOwnerToken(checkpoint.Worktree.Path); err != nil {
 				return checkpoint, err
 			}
+			if err := captureWorkerReproduction(&checkpoint, checkpoint.Worktree.Path); err != nil {
+				return checkpoint, err
+			}
+			baselineWasPresent := checkpoint.ReproductionBaseline != nil
+			if err := r.ensureWorkerReproductionBaseline(ctx, &checkpoint, checkpoint.Worktree.Path, input.Project.RepoPath, worktreeRoot, reproductionBaselineScopeCreate); err != nil {
+				return checkpoint, err
+			}
+			if err := r.persistWorkerReproductionBaseline(ctx, input, checkpoint, baselineWasPresent); err != nil {
+				return checkpoint, err
+			}
 			return checkpoint, nil
 		} else {
 			// A checkpointed path may hold uncommitted progress even when the
@@ -1687,6 +1939,16 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (w
 	checkpoint.Worktree = &checkpointWorktree{ID: worktreeID, Path: created.WorktreePath, Branch: created.Branch, BaseBranch: baseBranch, HeadSHA: created.HeadSHA, CheckoutMode: "branch"}
 	checkpoint.Lifecycle = lifecycle.NewState(lifecycle.AgentManagedWithFallbackPolicy("worker", work.ExecutionMode == "create-pr"), created.Branch, baseBranch)
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
+	if err := captureWorkerReproduction(&checkpoint, created.WorktreePath); err != nil {
+		return checkpoint, err
+	}
+	baselineWasPresent := checkpoint.ReproductionBaseline != nil
+	if err := r.ensureWorkerReproductionBaseline(ctx, &checkpoint, created.WorktreePath, input.Project.RepoPath, worktreeRoot, reproductionBaselineScopeCreate); err != nil {
+		return checkpoint, err
+	}
+	if err := r.persistWorkerReproductionBaseline(ctx, input, checkpoint, baselineWasPresent); err != nil {
+		return checkpoint, err
+	}
 	return checkpoint, nil
 }
 
@@ -1834,18 +2096,40 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 	if err != nil {
 		return checkpoint, err
 	}
+	worktreeRoot, err := workerWorktreeRoot(input.Project)
+	if err != nil {
+		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableTransient}
+	}
+	if err := captureWorkerReproduction(&checkpoint, worktree.Path); err != nil {
+		return checkpoint, err
+	}
+	baselineWasPresent := checkpoint.ReproductionBaseline != nil
+	executeScope := reproductionBaselineScopeCreate
+	if executionCompleted {
+		executeScope = reproductionBaselineScopeReuseOnly
+	}
+	if err := r.ensureWorkerReproductionBaseline(ctx, &checkpoint, worktree.Path, input.Project.RepoPath, worktreeRoot, executeScope); err != nil {
+		return checkpoint, err
+	}
+	if err := r.persistWorkerReproductionBaseline(ctx, input, checkpoint, baselineWasPresent); err != nil {
+		return checkpoint, err
+	}
+	work = *checkpoint.Work
 	if !executionCompleted {
 		agentVendor, agentModel, _, useSnapshot, err := r.identityFromRun(input.Run)
 		if err != nil {
 			return checkpoint, fmt.Errorf("resolve run agent identity: %w", err)
 		}
-		validationCommands := r.validationCommandsForProject(input.Project.ID)
+		validationCommands := workerValidationCommands(r.validationCommandsForProject(input.Project.ID), work)
 		prompt, instructionBlock, err := buildWorkerPromptWithInstructions(worktree.Path, input.Project.ID, r.customInstructions, work, checkpoint.Plan, r.canAgentCreatePR(ctx, input.Project.ID, work, input.Project.RepoPath), r.disclosure, agentVendor, derefString(agentModel))
 		if err != nil {
 			return checkpoint, err
 		}
 		if len(validationCommands) > 0 {
 			prompt += validationGatedLocalOnlyPrompt
+		}
+		if work.Reproduction != nil {
+			prompt += "\n\n" + work.Reproduction.PromptInstruction()
 		}
 		// HITL (gated): let the agent pause to ask a human, and on resume feed the
 		// human's answer back into the same agent session.
@@ -1961,6 +2245,9 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 		}
 		checkpoint.Execution = checkpointExecutionFromAgentResult(result)
 		checkpoint.ensureLifecycle("worker", worktree.Branch, worktree.BaseBranch, work.ExecutionMode == "create-pr")
+		if err := verifyWorkerReproduction(checkpoint, worktree.Path); err != nil {
+			return checkpoint, err
+		}
 		if result.Lifecycle != nil {
 			checkpoint.Lifecycle.MergeAgent(result.Lifecycle, r.nowISO())
 		} else if len(result.Commits) > 0 {
@@ -1973,6 +2260,9 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 	}
 	if _, err := r.reconcileWorkerGitState(ctx, &checkpoint, input.Project, work, worktree, input.Run); err != nil {
+		return checkpoint, err
+	}
+	if err := verifyWorkerReproduction(checkpoint, worktree.Path); err != nil {
 		return checkpoint, err
 	}
 	checkpoint.Execution.GitReconciled = true
@@ -2046,7 +2336,7 @@ func (r *Runner) reconcileWorkerGitState(ctx context.Context, checkpoint *worker
 
 func (r *Runner) runValidateStep(ctx context.Context, input stepInput) (workerCheckpoint, error) {
 	checkpoint := input.Checkpoint
-	validationCommands := r.validationCommandsForProject(input.Project.ID)
+	var validationCommands []string
 	work, err := requireWork(checkpoint)
 	if err != nil {
 		return checkpoint, err
@@ -2059,8 +2349,27 @@ func (r *Runner) runValidateStep(ctx context.Context, input stepInput) (workerCh
 	if err != nil {
 		return checkpoint, err
 	}
+	worktreeRoot, err := workerWorktreeRoot(input.Project)
+	if err != nil {
+		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableTransient}
+	}
+	if err := captureWorkerReproduction(&checkpoint, worktree.Path); err != nil {
+		return checkpoint, err
+	}
+	baselineWasPresent := checkpoint.ReproductionBaseline != nil
+	if err := r.ensureWorkerReproductionBaseline(ctx, &checkpoint, worktree.Path, input.Project.RepoPath, worktreeRoot, reproductionBaselineScopeReuseOnly); err != nil {
+		return checkpoint, err
+	}
+	if err := r.persistWorkerReproductionBaseline(ctx, input, checkpoint, baselineWasPresent); err != nil {
+		return checkpoint, err
+	}
+	work = *checkpoint.Work
+	validationCommands = workerValidationCommands(r.validationCommandsForProject(input.Project.ID), work)
 	result, err := r.runValidation(ctx, ValidationInput{CWD: worktree.Path, Commands: validationCommands})
 	if err != nil {
+		return checkpoint, err
+	}
+	if err := verifyWorkerReproduction(checkpoint, worktree.Path); err != nil {
 		return checkpoint, err
 	}
 	checkpoint.Validation = &result
@@ -2083,6 +2392,9 @@ func (r *Runner) runValidateStep(ctx context.Context, input stepInput) (workerCh
 			failure := classifyValidationFailure(result)
 			checkpoint.ResumePolicy = failure.resumePolicy
 			return checkpoint, &loopError{message: failure.message, kind: failure.kind}
+		}
+		if err := verifyWorkerReproduction(checkpoint, worktree.Path); err != nil {
+			return checkpoint, err
 		}
 		worktreeRoot, rootErr := workerWorktreeRoot(input.Project)
 		if rootErr != nil {
@@ -2117,7 +2429,7 @@ func (r *Runner) runValidateStep(ctx context.Context, input stepInput) (workerCh
 
 func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerCheckpoint, error) {
 	checkpoint := input.Checkpoint
-	validationCommands := r.validationCommandsForProject(input.Project.ID)
+	var validationCommands []string
 	work, err := requireWork(checkpoint)
 	if err != nil {
 		return checkpoint, err
@@ -2139,6 +2451,25 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 	}
 	worktree, err = r.ensureWorkerWorktreeUsable(ctx, input, &checkpoint, work, worktree)
 	if err != nil {
+		return checkpoint, err
+	}
+	worktreeRoot, err := workerWorktreeRoot(input.Project)
+	if err != nil {
+		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableTransient}
+	}
+	if err := captureWorkerReproduction(&checkpoint, worktree.Path); err != nil {
+		return checkpoint, err
+	}
+	baselineWasPresent := checkpoint.ReproductionBaseline != nil
+	if err := r.ensureWorkerReproductionBaseline(ctx, &checkpoint, worktree.Path, input.Project.RepoPath, worktreeRoot, reproductionBaselineScopeReuseOnly); err != nil {
+		return checkpoint, err
+	}
+	if err := r.persistWorkerReproductionBaseline(ctx, input, checkpoint, baselineWasPresent); err != nil {
+		return checkpoint, err
+	}
+	work = *checkpoint.Work
+	validationCommands = workerValidationCommands(r.validationCommandsForProject(input.Project.ID), work)
+	if err := verifyWorkerReproduction(checkpoint, worktree.Path); err != nil {
 		return checkpoint, err
 	}
 	if err := r.validateWorkerIssueStillOpen(ctx, input.Project.RepoPath, work); err != nil {
@@ -2692,7 +3023,7 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 		resumedCheckpoint = rewindCheckpointForExecuteRetry(checkpoint)
 	}
 	nowISO := r.nowISO()
-	encoded := mustMarshalJSON(workerCheckpoint{ResumePolicy: ternary(resumed, "advance_from_checkpoint", "replay_step"), Work: resumedCheckpoint.Work, ClaimedLockKey: resumedCheckpoint.ClaimedLockKey, Worktree: resumedCheckpoint.Worktree, Plan: resumedCheckpoint.Plan, Execution: resumedCheckpoint.Execution, Lifecycle: resumedCheckpoint.Lifecycle, Validation: resumedCheckpoint.Validation, PullRequest: resumedCheckpoint.PullRequest, SkipReason: resumedCheckpoint.SkipReason})
+	encoded := mustMarshalJSON(workerCheckpoint{ResumePolicy: ternary(resumed, "advance_from_checkpoint", "replay_step"), Work: resumedCheckpoint.Work, ClaimedLockKey: resumedCheckpoint.ClaimedLockKey, Worktree: resumedCheckpoint.Worktree, Plan: resumedCheckpoint.Plan, Execution: resumedCheckpoint.Execution, Lifecycle: resumedCheckpoint.Lifecycle, ReproductionBaseline: resumedCheckpoint.ReproductionBaseline, Validation: resumedCheckpoint.Validation, PullRequest: resumedCheckpoint.PullRequest, SkipReason: resumedCheckpoint.SkipReason})
 	run := storage.RunRecord{ID: eventlog.NewEventID("run"), LoopID: loop.ID, Status: "running", CurrentStep: stringPtr(string(startStep)), LastCompletedStep: nil, CheckpointJSON: &encoded, StartedAt: nowISO, LastHeartbeatAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
 	snapshotJSON, err := r.agentSnapshotJSONForNewRun(latestRun, stickySnapshot)
 	if err != nil {
@@ -2896,6 +3227,9 @@ func (r *Runner) getLatestCheckpoint(ctx context.Context, run storage.RunRecord,
 	}
 	if fallback.Validation != nil {
 		checkpoint.Validation = fallback.Validation
+	}
+	if fallback.ReproductionBaseline != nil {
+		checkpoint.ReproductionBaseline = fallback.ReproductionBaseline
 	}
 	if fallback.PullRequest != nil {
 		checkpoint.PullRequest = fallback.PullRequest
@@ -4066,6 +4400,9 @@ func buildPullRequestBody(work workerInput, plan *checkpointPlan, execution *che
 	}
 	if work.SpecPath != "" {
 		lines = append(lines, "", fmt.Sprintf("Spec: %s", work.SpecPath))
+	}
+	if work.Reproduction != nil {
+		lines = append(lines, "", "Reproduction manifest: "+reproducer.ManifestPath, "Reproduction test: "+work.Reproduction.TestName+" ("+work.Reproduction.TestPath+")")
 	}
 	if work.Prompt != "" {
 		lines = append(lines, "", fmt.Sprintf("Prompt: %s", work.Prompt))
