@@ -785,8 +785,10 @@ func rollback(journalPath string, journal restoreJournal, operations fileOperati
 					continue
 				}
 			}
-			if err := operations.rename(entry.UndoPath, entry.TargetPath); err != nil {
-				rollbackErrors = append(rollbackErrors, fmt.Errorf("restore original %s: %w", entry.Name, err))
+			// Install undo with no-replace so a recreate that landed after detach
+			// is not silently overwritten by os.Rename.
+			if err := installNoReplace(entry.UndoPath, entry.TargetPath, "original "+entry.Name); err != nil {
+				rollbackErrors = append(rollbackErrors, err)
 			}
 			continue
 		}
@@ -894,9 +896,10 @@ func detachAndRemoveOwnedRestoreTarget(entry journalEntry, description string) e
 	}
 	hash2, size2, err := fileContentIdentity(trashPath)
 	if err != nil || hash2 != wantHash || size2 != wantSize {
-		// Put the detached file back; do not delete a non-owned target.
-		if renameErr := os.Rename(trashPath, entry.TargetPath); renameErr != nil {
-			return fmt.Errorf("detach verify failed for %s and restore failed: verify=%v restore=%w", description, err, renameErr)
+		// Put the detached file back only if the path is still empty — never
+		// replace a concurrent recreate (os.Rename would clobber it).
+		if putBackErr := installNoReplace(trashPath, entry.TargetPath, description+" (detach put-back)"); putBackErr != nil {
+			return fmt.Errorf("detach verify failed for %s; trash kept at %s: verify=%v put-back=%w", description, trashPath, err, putBackErr)
 		}
 		if err != nil {
 			return err
@@ -905,6 +908,52 @@ func detachAndRemoveOwnedRestoreTarget(entry journalEntry, description string) e
 	}
 	if err := os.Remove(trashPath); err != nil {
 		return fmt.Errorf("remove detached %s: %w", description, err)
+	}
+	return nil
+}
+
+// installNoReplace moves source onto dest only when dest is absent. Uses link
+// then remove so a concurrent create at dest is not replaced (os.Rename would).
+func installNoReplace(source, dest, description string) error {
+	if _, err := os.Lstat(dest); err == nil {
+		return fmt.Errorf("refusing to install %s: target %s already exists", description, dest)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("inspect %s destination: %w", description, err)
+	}
+	if err := os.Link(source, dest); err != nil {
+		// Fallback when link is unsupported (cross-device): exclusive create+copy.
+		if linkErr := copyFileExclusive(source, dest); linkErr != nil {
+			return fmt.Errorf("install %s: link=%v copy=%w", description, err, linkErr)
+		}
+	}
+	if err := os.Remove(source); err != nil {
+		return fmt.Errorf("remove source after installing %s: %w", description, err)
+	}
+	return nil
+}
+
+func copyFileExclusive(source, dest string) error {
+	in, err := os.Open(source)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	info, err := in.Stat()
+	if err != nil {
+		return err
+	}
+	out, err := os.OpenFile(dest, os.O_CREATE|os.O_EXCL|os.O_WRONLY, info.Mode().Perm())
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		_ = out.Close()
+		_ = os.Remove(dest)
+		return err
+	}
+	if err := out.Close(); err != nil {
+		_ = os.Remove(dest)
+		return err
 	}
 	return nil
 }

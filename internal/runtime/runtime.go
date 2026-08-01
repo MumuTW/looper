@@ -718,6 +718,10 @@ func (r *Runtime) joinWorkProducersForDrain() {
 	r.stopSchedulerLoop()
 	r.stopDeferredReviewerRecovery()
 	r.stopWorktreeCleanupLoop()
+	// Cancel scheduled webhook reconcile retries and wait for in-flight
+	// reconcile work so drained:true cannot race a late Reconcile that mutates
+	// forwarder/tunnel state after the final backup.
+	r.joinWebhookReconcileForDrain()
 	// Drain join must not record discovery wait timeouts on shutdownDrainErr;
 	// that flag retains SQLite on later Stop even after discovery eventually exits.
 	r.waitProjectDiscoveryForDrain()
@@ -823,15 +827,27 @@ func (r *Runtime) countActiveWorkProducers() int {
 	if r == nil {
 		return 0
 	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.countActiveWorkProducersLocked()
+}
+
+// countActiveWorkProducersLocked counts producers while the caller already holds
+// r.mu for reading (or writing). Do not call DrainSnapshot from under r.mu —
+// use this helper instead to avoid recursive RWMutex RLock deadlocks when a
+// writer is pending.
+func (r *Runtime) countActiveWorkProducersLocked() int {
+	if r == nil {
+		return 0
+	}
 	active := 0
 	if r.workProducerJoinActive.Load() {
 		active++
 	}
-	r.mu.RLock()
 	active += len(r.drainResidualDones)
 	discovery := r.projectDiscovery
 	forwarder := r.webhookForwarder
-	r.mu.RUnlock()
+	webhook := r.webhook
 	if discovery != nil && discovery.Busy() {
 		active++
 	}
@@ -840,6 +856,9 @@ func (r *Runtime) countActiveWorkProducers() int {
 	if forwarder != nil {
 		stats := forwarder.Stats()
 		active += stats.Queued + stats.InFlight
+	}
+	if webhook != nil && webhook.ReconcileWorkActive() {
+		active++
 	}
 	active += int(r.admittedHTTPMutations.Load())
 	return active
@@ -896,9 +915,14 @@ func (r *Runtime) BeginBackupMutationIfAllowed() (func(), error) {
 			// online pre-cutover backup
 		case AdmissionDraining, AdmissionStopping:
 			// Final cutover backup: require the supervisor work set drained.
-			// Nested RLock in DrainSnapshot is safe; we already hold r.mu so
-			// BeginDrain (which takes r.mu.Lock first) cannot reverse the order.
-			if !r.DrainSnapshot().Drained() {
+			// Snapshot under the outer r.mu.RLock without re-locking (a pending
+			// BeginDrain writer would otherwise deadlock recursive RLock).
+			snapshot := DrainSnapshot{}
+			if r.activeExecutions != nil {
+				snapshot = r.activeExecutions.DrainSnapshot()
+			}
+			snapshot.WorkProducersActive = r.countActiveWorkProducersLocked()
+			if !snapshot.Drained() {
 				return fmt.Errorf("Upgrade backup after drain requires a drained supervisor work set")
 			}
 		default:
@@ -1156,6 +1180,18 @@ func (r *Runtime) stopWebhookRuntime() {
 	r.mu.RUnlock()
 	if webhook != nil {
 		webhook.Stop()
+	}
+}
+
+// joinWebhookReconcileForDrain cancels pending reconcile retries and waits for
+// in-flight webhook reconcile work without tearing down live forwarders (those
+// remain visible via DrainSnapshot until they exit).
+func (r *Runtime) joinWebhookReconcileForDrain() {
+	r.mu.RLock()
+	webhook := r.webhook
+	r.mu.RUnlock()
+	if webhook != nil {
+		webhook.JoinReconcileForDrain()
 	}
 }
 
@@ -1438,10 +1474,10 @@ func (r *Runtime) CompleteStartup(ctx context.Context) error {
 		r.ownershipAcquired = true
 		r.mu.Unlock()
 		upgradeHold := strings.TrimSpace(os.Getenv("LOOPER_UPGRADE_VERIFY_HOLD")) == "1"
-		// Cutover verify-hold must be selected before webhook reconciliation or
-		// producer loops: webhook.Start runs Reconcile immediately and can
-		// persist tunnel/hook state and launch forwarders. Those mutations
-		// post-date ROLLBACK_BUNDLE and are not undone by DB restore.
+		// Cutover verify-hold must select draining before any work-producing
+		// reconcile. Still exercise network/webhook *startup gates* so a
+		// candidate that cannot boot those components fails under hold rather
+		// than only after the unheld restart — without running Reconcile.
 		if upgradeHold {
 			if err := r.admission.Transition(AdmissionDraining, "upgrade-verify-hold"); err != nil {
 				r.startupReadyErr = err
@@ -1450,6 +1486,18 @@ func (r *Runtime) CompleteStartup(ctx context.Context) error {
 				}
 				return
 			}
+			if r.networkManager != nil {
+				if err := r.networkManager.Start(ctx); err != nil {
+					r.startupReadyErr = err
+					return
+				}
+			}
+			if r.webhook != nil {
+				if err := r.webhook.ValidateStartup(); err != nil {
+					r.startupReadyErr = err
+					return
+				}
+			}
 			if r.logger != nil {
 				r.logger.Info("looperd upgrade verify hold active", map[string]any{
 					"env":    "LOOPER_UPGRADE_VERIFY_HOLD=1",
@@ -1457,8 +1505,6 @@ func (r *Runtime) CompleteStartup(ctx context.Context) error {
 					"note":   "webhook reconcile, scheduler, and discovery deferred until unheld restart",
 				})
 			}
-			// Hold path: no network webhook reconcile, no work producers, no
-			// discovery resume. Status/API stay up with admission draining.
 			return
 		}
 

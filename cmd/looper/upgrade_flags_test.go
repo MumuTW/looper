@@ -37,7 +37,7 @@ func TestSplitGlobalFlagsPreservesUpgradeOwnedFlags(t *testing.T) {
 	for _, args := range [][]string{
 		{"upgrade", "stage-release", "--release-root", "/r", "--target-looper", "/l", "--target-looperd", "/d"},
 		{"upgrade", "activate-release", "--release-root", "/r", "--release", "id"},
-		{"upgrade", "verify-start", "--release-root", "/r", "--release", "id"},
+		{"upgrade", "verify-start", "--release-root", "/r", "--release", "id", "--bundle", "/b"},
 		{"upgrade", "verify", "--bundle", "/b"},
 		{"upgrade", "restore", "--bundle", "/b", "--confirm"},
 	} {

@@ -1638,8 +1638,8 @@ Usage:
                                Close admission and wait for in-flight supervisor work
   looper upgrade stage-release --release-root <dir> --target-looper <path> --target-looperd <path>
   looper upgrade activate-release --release-root <dir> --release <id>
-  looper upgrade verify-start --release-root <dir> --release <id>
-                               Atomic paired release switch (see docs/installation.md)
+  looper upgrade verify-start --release-root <dir> --release <id> --bundle <dir>
+                               Post-start cutover verify (requires held admission + rollback bundle)
   looper upgrade restore-preflight --bundle <dir>
   looper upgrade restore --bundle <dir> --confirm
                                Matching rollback restore after failed cutover

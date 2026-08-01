@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/MumuTW/looper/internal/upgradebackup"
@@ -36,6 +37,7 @@ func TestUpgradeCutoverContractRestoresMatchingSnapshotAfterFailedStart(t *testi
 	drainRequested := false
 	// Set after stage/activate so version reports the supervised current path.
 	runningExecutable := ""
+	looperPath := ""
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/v1/upgrade/backup":
@@ -56,7 +58,10 @@ func TestUpgradeCutoverContractRestoresMatchingSnapshotAfterFailedStart(t *testi
 			versionBody.Binary.Path = runningExecutable
 			writeEnvelope(w, http.StatusOK, versionBody)
 		case "/api/v1/status":
-			writeEnvelope(w, http.StatusOK, upgradeCutoverStatus(current, healthy))
+			status := upgradeCutoverStatus(current, healthy)
+			status["storage"].(map[string]any)["dbPath"] = source.DatabasePath
+			status["tools"] = map[string]any{"looperPath": looperPath}
+			writeEnvelope(w, http.StatusOK, status)
 		case "/api/v1/projects":
 			writeEnvelope(w, http.StatusOK, map[string]any{"items": []map[string]any{{"id": "project_1"}}})
 		case "/api/v1/events/notification/looperd":
@@ -70,6 +75,7 @@ func TestUpgradeCutoverContractRestoresMatchingSnapshotAfterFailedStart(t *testi
 
 	releaseRoot, previousReleaseID := stageReleaseForUpgradeTest(t, previous)
 	runningExecutable = upgraderelease.CurrentDaemonExecutable(releaseRoot)
+	looperPath = filepath.Join(releaseRoot, "current", "looper")
 	stdout := &bytes.Buffer{}
 	if err := runUpgrade(context.Background(), nil, []string{"backup"}, stdout); err != nil {
 		t.Fatal(err)
@@ -95,7 +101,7 @@ func TestUpgradeCutoverContractRestoresMatchingSnapshotAfterFailedStart(t *testi
 	}
 	current = candidate
 	stdout.Reset()
-	if err := runUpgrade(context.Background(), nil, []string{"verify-start", "--release-root", releaseRoot, "--release", candidateReleaseID}, stdout); err != nil {
+	if err := runUpgrade(context.Background(), nil, []string{"verify-start", "--release-root", releaseRoot, "--release", candidateReleaseID, "--bundle", bundle}, stdout); err != nil {
 		t.Fatalf("verify candidate start: %v", err)
 	}
 
@@ -103,7 +109,7 @@ func TestUpgradeCutoverContractRestoresMatchingSnapshotAfterFailedStart(t *testi
 	// before returning the release pointer to the binary that made it.
 	healthy = false
 	stdout.Reset()
-	if err := runUpgrade(context.Background(), nil, []string{"verify-start", "--release-root", releaseRoot, "--release", candidateReleaseID}, stdout); err == nil {
+	if err := runUpgrade(context.Background(), nil, []string{"verify-start", "--release-root", releaseRoot, "--release", candidateReleaseID, "--bundle", bundle}, stdout); err == nil {
 		t.Fatal("verify failed candidate start = nil, want health failure")
 	}
 	if err := os.WriteFile(source.ConfigPath, []byte("candidate config\n"), 0o600); err != nil {
@@ -125,7 +131,7 @@ func TestUpgradeCutoverContractRestoresMatchingSnapshotAfterFailedStart(t *testi
 	current = previous
 	healthy = true
 	stdout.Reset()
-	if err := runUpgrade(context.Background(), nil, []string{"verify-start", "--release-root", releaseRoot, "--release", previousReleaseID}, stdout); err != nil {
+	if err := runUpgrade(context.Background(), nil, []string{"verify-start", "--release-root", releaseRoot, "--release", previousReleaseID, "--bundle", bundle}, stdout); err != nil {
 		t.Fatalf("verify restored previous release: %v", err)
 	}
 

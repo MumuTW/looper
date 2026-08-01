@@ -107,12 +107,16 @@ type webhookRuntime struct {
 	ghPath             string
 	status             WebhookStatus
 	stopCh             chan struct{}
+	drainCh            chan struct{}
+	drainOnce          sync.Once
 	forwarderStopCh    map[string]chan struct{}
 	mu                 sync.RWMutex
 	bootstrapMu        sync.Mutex
 	wg                 sync.WaitGroup
 	stopped            bool
+	drainJoined        bool
 	reconcileRetry     bool
+	reconcileInFlight  int
 	daemonID           string
 	probe              processProbe
 	forwarderStore     *storage.WebhookForwardersRepository
@@ -148,7 +152,7 @@ func newWebhookRuntime(cfg config.Config, logger bootstrap.Logger, now func() ti
 		Forwarders:                  []WebhookForwarderState{},
 		TunnelHooks:                 []WebhookTunnelState{},
 	}
-	rt := &webhookRuntime{cfg: cfg, logger: logger, now: now, ghPath: strings.TrimSpace(derefString(cfg.Tools.GHPath)), status: status, stopCh: make(chan struct{}), forwarderStopCh: map[string]chan struct{}{}, allowedTunnelRepos: map[string]struct{}{}, daemonID: newDaemonID(), probe: defaultProcessProbe{}}
+	rt := &webhookRuntime{cfg: cfg, logger: logger, now: now, ghPath: strings.TrimSpace(derefString(cfg.Tools.GHPath)), status: status, stopCh: make(chan struct{}), drainCh: make(chan struct{}), forwarderStopCh: map[string]chan struct{}{}, allowedTunnelRepos: map[string]struct{}{}, daemonID: newDaemonID(), probe: defaultProcessProbe{}}
 	if !cfg.Webhook.Enabled {
 		return rt
 	}
@@ -203,6 +207,23 @@ func (w *webhookRuntime) RecordDelivery(eventType, deliveryID string) {
 func (w *webhookRuntime) Start(repos *storage.Repositories) error {
 	w.Bootstrap(context.Background(), repos)
 	return w.Reconcile(repos)
+}
+
+// ValidateStartup checks that webhook tooling required for a later unheld
+// Start is present, without bootstrap/reconcile mutations (used under
+// LOOPER_UPGRADE_VERIFY_HOLD so cutover verify fails closed on misconfig).
+func (w *webhookRuntime) ValidateStartup() error {
+	if w == nil || !w.status.Enabled {
+		return nil
+	}
+	cfg := w.configSnapshot()
+	if (wModeNeedsGHForward(cfg) || wModeNeedsTunnel(cfg)) && strings.TrimSpace(w.ghPath) == "" {
+		return fmt.Errorf("webhook is enabled but gh is not configured or could not be resolved")
+	}
+	if wModeNeedsGHForward(cfg) && !isLoopbackHost(cfg.Server.Host) {
+		return fmt.Errorf("webhook forwarders require a loopback server.host, got %q", cfg.Server.Host)
+	}
+	return nil
 }
 
 func (w *webhookRuntime) Bootstrap(ctx context.Context, repos *storage.Repositories) {
@@ -288,6 +309,21 @@ func (w *webhookRuntime) canLaunchForwarders() bool {
 }
 
 func (w *webhookRuntime) Reconcile(repos *storage.Repositories) error {
+	if w == nil {
+		return nil
+	}
+	w.mu.Lock()
+	if w.stopped || w.drainJoined {
+		w.mu.Unlock()
+		return nil
+	}
+	w.reconcileInFlight++
+	w.mu.Unlock()
+	defer func() {
+		w.mu.Lock()
+		w.reconcileInFlight--
+		w.mu.Unlock()
+	}()
 	cfg := w.configSnapshot()
 	return w.reconcileSnapshot(repos, cfg)
 }
@@ -1146,7 +1182,7 @@ func (w *webhookRuntime) scheduleReconcileRetry(repos *storage.Repositories) {
 		return
 	}
 	w.mu.Lock()
-	if w.stopped || w.reconcileRetry {
+	if w.stopped || w.drainJoined || w.reconcileRetry {
 		w.mu.Unlock()
 		return
 	}
@@ -1163,10 +1199,15 @@ func (w *webhookRuntime) scheduleReconcileRetry(repos *storage.Repositories) {
 			w.reconcileRetry = false
 			w.mu.Unlock()
 			return
+		case <-w.drainCh:
+			w.mu.Lock()
+			w.reconcileRetry = false
+			w.mu.Unlock()
+			return
 		case <-timer.C:
 		}
 		w.mu.Lock()
-		if w.stopped {
+		if w.stopped || w.drainJoined {
 			w.reconcileRetry = false
 			w.mu.Unlock()
 			return
@@ -1175,6 +1216,39 @@ func (w *webhookRuntime) scheduleReconcileRetry(repos *storage.Repositories) {
 		w.mu.Unlock()
 		w.Reconcile(repos)
 	}()
+}
+
+// ReconcileWorkActive reports pending retry or in-flight reconcile for drain.
+func (w *webhookRuntime) ReconcileWorkActive() bool {
+	if w == nil {
+		return false
+	}
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	return w.reconcileRetry || w.reconcileInFlight > 0
+}
+
+// JoinReconcileForDrain cancels further reconcile retries and waits for any
+// in-flight reconcile (including retry timers) without stopping forwarders.
+func (w *webhookRuntime) JoinReconcileForDrain() {
+	if w == nil {
+		return
+	}
+	w.drainOnce.Do(func() {
+		w.mu.Lock()
+		w.drainJoined = true
+		if w.drainCh != nil {
+			close(w.drainCh)
+		}
+		w.mu.Unlock()
+	})
+	deadline := time.Now().Add(w.shutdownTimeout())
+	for time.Now().Before(deadline) {
+		if !w.ReconcileWorkActive() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 func webhookBaseURL(cfg config.Config) string {
