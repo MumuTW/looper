@@ -99,7 +99,7 @@ type ActiveExecutionRegistry struct {
 	// allowSpawn, when set, projects daemon Admission.AllowClaim so spawns
 	// refuse while starting/stopping/degraded. Nil means registry-local only
 	// (tests that do not wire Runtime admission).
-	allowSpawn func() error
+	allowSpawn func(*agent.SpawnMeta) error
 
 	// onHardPersistFailure maps hard agent_executions write failures into the
 	// single sticky admission degraded state (ADR-0015 R5 / #578). Also used
@@ -153,7 +153,7 @@ func NewActiveExecutionRegistry() *ActiveExecutionRegistry {
 }
 
 // SetAllowSpawn wires the daemon Admission projection for spawn decisions.
-func (r *ActiveExecutionRegistry) SetAllowSpawn(fn func() error) {
+func (r *ActiveExecutionRegistry) SetAllowSpawn(fn func(*agent.SpawnMeta) error) {
 	if r == nil {
 		return
 	}
@@ -222,10 +222,11 @@ type spawnLease struct {
 	ctx      context.Context
 	cancel   context.CancelCauseFunc
 
-	mu       sync.Mutex
-	released bool
-	handle   *processcontainment.Handle
-	softKill agent.SoftKillFunc
+	mu            sync.Mutex
+	released      bool
+	handle        *processcontainment.Handle
+	softKill      agent.SoftKillFunc
+	brownoutProbe bool
 
 	// spawnDone is closed when the lease leaves pending (BindHandle or Release).
 	// BeginLoopStop/BeginShutdown wait on it so stop cannot return while a
@@ -263,6 +264,13 @@ func (l *spawnLease) Context() context.Context {
 		return context.Background()
 	}
 	return l.ctx
+}
+
+func (l *spawnLease) BrownoutProbe() bool {
+	if l == nil {
+		return false
+	}
+	return l.brownoutProbe
 }
 
 func (l *spawnLease) BindHandle(handle *processcontainment.Handle, softKill agent.SoftKillFunc) error {
@@ -550,7 +558,7 @@ func (r *ActiveExecutionRegistry) AdmitSpawn(ctx context.Context, meta agent.Spa
 	r.mu.Unlock()
 
 	if allow != nil {
-		if err := allow(); err != nil {
+		if err := allow(&meta); err != nil {
 			return nil, errors.Join(agent.ErrSpawnAdmissionClosed, err)
 		}
 	}
@@ -575,12 +583,13 @@ func (r *ActiveExecutionRegistry) AdmitSpawn(ctx context.Context, meta agent.Spa
 	id := r.nextLeaseID
 	leaseCtx, cancel := context.WithCancelCause(ctx)
 	lease := &spawnLease{
-		registry:  r,
-		id:        id,
-		meta:      meta,
-		ctx:       leaseCtx,
-		cancel:    cancel,
-		spawnDone: make(chan struct{}),
+		registry:      r,
+		id:            id,
+		meta:          meta,
+		ctx:           leaseCtx,
+		cancel:        cancel,
+		spawnDone:     make(chan struct{}),
+		brownoutProbe: meta.BrownoutProbe,
 	}
 	r.pending[id] = lease
 	r.mu.Unlock()

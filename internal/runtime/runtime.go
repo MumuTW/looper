@@ -243,8 +243,8 @@ type Runtime struct {
 	// agentHealth suspends work production while looper's own agent runs are
 	// failing. It is deliberately not part of Admission: admission states are
 	// operator/lifecycle transitions that never recover on their own, and this
-	// one must.
-	agentHealth *brownout.Breaker
+	// one must. Breakers are partitioned by effective provider identity.
+	agentHealth *agentHealthRegistry
 	// daemonBinary answers whether the executable file this daemon was launched
 	// from still holds the image it is running (#154).
 	daemonBinary *daemonBinaryWatcher
@@ -353,16 +353,16 @@ func New(options Options) *Runtime {
 		admission:                   NewAdmission(),
 		daemonBinary:                newDaemonBinaryWatcher(options.Logger),
 	}
-	rt.agentHealth = brownout.New(agentBrownoutConfig(options.Config), now, rt.onAgentBrownoutTransition)
+	rt.agentHealth = newAgentHealthRegistry(agentBrownoutConfig(options.Config), options.Config, now, rt.onAgentBrownoutTransition)
 	// Every terminal agent outcome feeds the health gate. This is the only
 	// input it has: looper does not read provider status pages or parse their
 	// rate-limit messages, it counts its own results.
 	rt.activeExecutions.SetOnAgentOutcome(func(outcome agent.Outcome) {
-		rt.agentHealth.Record(outcome.StartedAt, outcome.Succeeded)
+		rt.agentHealth.Record(outcome.Vendor, outcome.StartedAt, outcome.Succeeded, outcome.BrownoutProbe)
 	})
 	// Project daemon Admission onto agent spawn leases so cmd.Start is refused
 	// while starting/stopping/degraded (#576 + #575).
-	rt.activeExecutions.SetAllowSpawn(rt.AllowClaim)
+	rt.activeExecutions.SetAllowSpawn(rt.allowAgentSpawn)
 	// Hard agent_executions observation failures close admission until process
 	// restart (#578 / ADR-0015 R5). Prefer split-brain stop over silent continue.
 	rt.activeExecutions.SetOnHardPersistFailure(func(err error) {
@@ -713,7 +713,25 @@ func (r *Runtime) AllowClaim() error {
 	if err := r.AllowLifecycleWork(); err != nil {
 		return err
 	}
-	return r.agentHealth.Allow()
+	return r.agentHealth.AllowAny()
+}
+
+func (r *Runtime) allowAgentSpawn(meta *agent.SpawnMeta) error {
+	if r == nil || r.admission == nil {
+		return ErrAdmissionStopping
+	}
+	// Operation leases already run inside the scheduler's lifecycle admission
+	// section. Re-entering Admission here would deadlock that critical section;
+	// provider health is only meaningful for the execution spawn metadata.
+	if meta == nil {
+		return nil
+	}
+	if err := r.admission.AllowClaim(); err != nil {
+		return err
+	}
+	probe, err := r.agentHealth.AllowAdmission(meta.Vendor)
+	meta.BrownoutProbe = probe
+	return err
 }
 
 // AllowLifecycleWork is claim admission without the agent-health gate, for work
@@ -756,11 +774,12 @@ func agentBrownoutConfig(cfg config.Config) brownout.Config {
 // when work stops and when it resumes. Notifying is the point: the incident this
 // gate exists for ran for hours, and the only thing the operator could observe
 // was disk and fan noise.
-func (r *Runtime) onAgentBrownoutTransition(transition brownout.Transition) {
+func (r *Runtime) onAgentBrownoutTransition(vendor string, transition brownout.Transition) {
 	if r == nil {
 		return
 	}
 	fields := map[string]any{
+		"vendor":   vendor,
 		"from":     string(transition.From),
 		"to":       string(transition.To),
 		"reason":   transition.Reason,
@@ -787,10 +806,10 @@ func (r *Runtime) onAgentBrownoutTransition(transition brownout.Transition) {
 		r.notifyAgentBrownout("failure", "Looper Paused: Agents Keep Failing",
 			fmt.Sprintf("%d of %d recent agent runs failed", transition.Failures, transition.Total),
 			fmt.Sprintf("Looper stopped starting new work because its own agent runs keep failing — usually a provider that is rate limiting, down, or out of quota. It will retry by itself in %s. Nothing is lost; queued work resumes when a probe run succeeds.", transition.Cooldown.Round(time.Second)),
-			"open")
+			vendor+".open")
 	case brownout.StateClosed:
 		r.notifyAgentBrownout("action_required", "Looper Resumed", "a probe agent run succeeded",
-			"Agent runs are working again. Looper has resumed starting new work.", "closed")
+			"Agent runs are working again. Looper has resumed starting new work.", vendor+".closed")
 	}
 }
 
@@ -875,10 +894,27 @@ func (r *Runtime) WithAllowClaim(fn func()) error {
 	// would order agent-outcome recording behind admission. The residual window
 	// is one accept already in flight when the gate opens, which enqueues an
 	// item the scheduler then refuses to claim — a delay, not a spend.
-	if err := r.agentHealth.Allow(); err != nil {
+	if err := r.agentHealth.AllowAny(); err != nil {
 		return err
 	}
 	return r.admission.WithAllowWork(fn)
+}
+
+// WithAllowAgentClaim holds lifecycle admission and the provider-health gate
+// across a work-producing critical section. Cleanup deliberately uses
+// WithAllowClaim instead: it is lifecycle work but does not consume an agent
+// provider call.
+func (r *Runtime) WithAllowAgentClaim(fn func()) error {
+	if r == nil || r.admission == nil {
+		return ErrAdmissionStopping
+	}
+	var brownoutErr error
+	if err := r.admission.WithAllowWork(func() {
+		brownoutErr = r.agentHealth.WithAny(fn)
+	}); err != nil {
+		return err
+	}
+	return brownoutErr
 }
 
 // MarkDegraded sticks admission until process restart and cancels work-producing
@@ -1261,7 +1297,7 @@ func (r *Runtime) start(ctx context.Context) error {
 			r.mu.RLock()
 			defer r.mu.RUnlock()
 			return r.schedulerTasks
-		}, r.TriggerSchedulerClaim, r.now, r.reconcileLiveStaleRunningRuns, r.AllowClaim, r.WithAllowClaim, r.hostAdmission)
+		}, r.TriggerSchedulerClaim, r.now, r.reconcileLiveStaleRunningRuns, r.AllowClaim, r.WithAllowAgentClaim)
 		if !r.customSchedulerTick {
 			r.defaultSchedulerTick = handlers.tick
 			if !r.customWebhookForwarder {
@@ -1580,7 +1616,7 @@ func (r *Runtime) publishCatalogConsumers(next config.Config) {
 	// Reconfiguring the health gate must not clear an open one: an operator
 	// editing config during an outage would otherwise release the cooldown and
 	// resume the exact hammering the gate is there to stop.
-	r.agentHealth.SetConfig(agentBrownoutConfig(next))
+	r.agentHealth.SetConfig(agentBrownoutConfig(next), next)
 }
 
 // afterProjectsPublished deliberately runs outside configBoundary. Webhook

@@ -82,6 +82,108 @@ func TestRepeatedAgentFailuresCloseClaimAdmission(t *testing.T) {
 	}
 }
 
+func TestAgentBrownoutIsolatedByEffectiveVendor(t *testing.T) {
+	rt, _ := brownoutRuntime(t, func(cfg *config.AgentBrownoutConfig) {
+		cfg.MinFailures = 3
+	})
+	base := rt.Config()
+	codex := config.AgentVendorCodex
+	claude := config.AgentVendorClaudeCode
+	base.Agent.Vendor = &codex
+	base.Roles.Worker.Agent = &config.RoleAgentConfig{Vendor: &claude}
+	rt.projectCatalog.PublishGlobals(base)
+	rt.publishCatalogConsumers(base)
+
+	for i := 0; i < 3; i++ {
+		rt.activeExecutions.ReportAgentOutcome(agent.Outcome{Vendor: string(codex), Status: "failed"})
+	}
+	if err := rt.agentHealth.Allow(string(codex)); !errors.Is(err, brownout.ErrOpen) {
+		t.Fatalf("codex breaker error = %v, want brownout open", err)
+	}
+	if err := rt.agentHealth.Allow(string(claude)); err != nil {
+		t.Fatalf("healthy Claude breaker refused work: %v", err)
+	}
+	if err := rt.AllowClaim(); err != nil {
+		t.Fatalf("healthy provider should keep scheduler admission open: %v", err)
+	}
+	if err := rt.allowAgentSpawn(&agent.SpawnMeta{Vendor: string(codex)}); !errors.Is(err, brownout.ErrOpen) {
+		t.Fatalf("Codex spawn admission = %v, want brownout open", err)
+	}
+	if err := rt.allowAgentSpawn(&agent.SpawnMeta{Vendor: string(claude)}); err != nil {
+		t.Fatalf("Claude spawn admission = %v, want allowed", err)
+	}
+	for i := 0; i < 3; i++ {
+		rt.activeExecutions.ReportAgentOutcome(agent.Outcome{Vendor: string(claude), Status: "failed"})
+	}
+	// An unattributed legacy callback must not recreate a healthy default bucket
+	// once all configured providers are open.
+	rt.activeExecutions.ReportAgentOutcome(agent.Outcome{Status: "completed", Succeeded: true})
+	if err := rt.AllowClaim(); !errors.Is(err, brownout.ErrOpen) {
+		t.Fatalf("unattributed outcome bypassed configured provider breakers: %v", err)
+	}
+}
+
+func TestAgentBrownoutGateCoversClaimCriticalSection(t *testing.T) {
+	rt, clock := brownoutRuntime(t, func(cfg *config.AgentBrownoutConfig) {
+		cfg.MinFailures = 3
+	})
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- rt.WithAllowAgentClaim(func() {
+			close(entered)
+			<-release
+		})
+	}()
+	<-entered
+	// Terminal outcomes use the same gate mutex. If it were only a point-in-
+	// time check, this lock would be available while the claim section is held.
+	if rt.agentHealth.gateMu.TryLock() {
+		rt.agentHealth.gateMu.Unlock()
+		t.Fatal("brownout gate was not held across the claim critical section")
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatalf("WithAllowAgentClaim() = %v", err)
+	}
+	failAgent(rt, clock, 3)
+	if !errors.Is(rt.AllowClaim(), brownout.ErrOpen) {
+		t.Fatal("outcomes after the critical section did not open the provider breaker")
+	}
+}
+
+func TestAgentBrownoutIgnoresPreCooldownOutcomesAsProbes(t *testing.T) {
+	rt, clock := brownoutRuntime(t, func(cfg *config.AgentBrownoutConfig) {
+		cfg.MinFailures = 3
+		cfg.CooldownSeconds = 60
+		cfg.MaxCooldownSeconds = 120
+	})
+	vendor := "codex"
+	startedBefore := clock.now()
+	for i := 0; i < 3; i++ {
+		rt.activeExecutions.ReportAgentOutcome(agent.Outcome{Vendor: vendor, StartedAt: startedBefore, Status: "failed"})
+	}
+	if err := rt.agentHealth.Allow(vendor); !errors.Is(err, brownout.ErrOpen) {
+		t.Fatalf("breaker error = %v, want open", err)
+	}
+	clock.advance(time.Minute)
+	probe, err := rt.agentHealth.AllowAdmission(vendor)
+	if err != nil || !probe {
+		t.Fatalf("half-open admission = (%v, %v), want probe=true and nil error", probe, err)
+	}
+	// This execution started before half-open; it must not close or re-trip the
+	// breaker merely because it completed after the cooldown elapsed.
+	rt.activeExecutions.ReportAgentOutcome(agent.Outcome{Vendor: vendor, StartedAt: startedBefore, Status: "completed", Succeeded: true})
+	if got := rt.agentHealth.breaker(vendor).Snapshot().State; got != brownout.StateHalfOpen {
+		t.Fatalf("pre-cooldown outcome changed state to %s, want half_open", got)
+	}
+	rt.activeExecutions.ReportAgentOutcome(agent.Outcome{Vendor: vendor, BrownoutProbe: true, StartedAt: clock.now(), Status: "completed", Succeeded: true})
+	if got := rt.agentHealth.breaker(vendor).Snapshot().State; got != brownout.StateClosed {
+		t.Fatalf("probe outcome left state %s, want closed", got)
+	}
+}
+
 func TestWorktreeCleanupContinuesDuringAgentBrownout(t *testing.T) {
 	fixture := newWorktreeCleanupFixture(t)
 	for i := 0; i < fixture.config.Scheduler.AgentBrownout.MinFailures; i++ {

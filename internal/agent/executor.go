@@ -150,6 +150,12 @@ type Outcome struct {
 	LoopID      string
 	RunID       string
 	ExecutionID string
+	// Vendor is the effective provider identity for this execution. Runtime
+	// health is partitioned by this value so one provider outage does not pause
+	// independent providers.
+	Vendor string
+	// BrownoutProbe is true only when the spawn was admitted during half-open.
+	BrownoutProbe bool
 	// Status is the executor's terminal status ("completed", "failed",
 	// "timeout").
 	Status string
@@ -251,6 +257,8 @@ type RunInput struct {
 	// SnapshotReasoningEffort is used only when UseSnapshot is true. nil means
 	// no reasoning-effort override.
 	SnapshotReasoningEffort *config.ReasoningEffort
+	// BrownoutProbe is populated by the common spawn admission lease.
+	BrownoutProbe bool
 }
 
 // TimeoutObservation identifies the timeout that is about to terminate an
@@ -586,9 +594,13 @@ func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Executi
 			LoopID:      input.LoopID,
 			RunID:       input.RunID,
 			ExecutionID: executionID,
+			Vendor:      string(cfg.Vendor),
 		})
 		if err != nil {
 			return nil, err
+		}
+		if probeLease, ok := lease.(interface{ BrownoutProbe() bool }); ok {
+			input.BrownoutProbe = probeLease.BrownoutProbe()
 		}
 	}
 	releaseLease := func() {
@@ -1293,11 +1305,13 @@ func (x *execution) reportOutcome(status, parseStatus, completionPayload string)
 		return
 	}
 	x.executor.onOutcome(Outcome{
-		ProjectID:   x.input.ProjectID,
-		LoopID:      x.input.LoopID,
-		RunID:       x.input.RunID,
-		ExecutionID: x.executionID,
-		Status:      status,
+		ProjectID:     x.input.ProjectID,
+		LoopID:        x.input.LoopID,
+		RunID:         x.input.RunID,
+		ExecutionID:   x.executionID,
+		Vendor:        string(x.executor.effectiveConfig(x.input).Vendor),
+		BrownoutProbe: x.input.BrownoutProbe,
+		Status:        status,
 		// A zero exit code is not a valid agent completion by itself. The
 		// structured marker is the executor's completion authority; missing or
 		// malformed output must feed the health gate as a failure so brownout

@@ -246,7 +246,7 @@ func (r *ActiveExecutionRegistry) AdmitOperation(ctx context.Context, meta Opera
 
 	// Project the same admission Authority as spawns/claims (starting/stopping/degraded).
 	if allow != nil {
-		if err := allow(); err != nil {
+		if err := allow(nil); err != nil {
 			return nil, errors.Join(ErrOperationAdmissionClosed, err)
 		}
 	}

@@ -25,6 +25,10 @@ type SpawnMeta struct {
 	LoopID      string
 	RunID       string
 	ExecutionID string
+	Vendor      string
+	// BrownoutProbe is set by the daemon's provider-health admission when the
+	// spawn is allowed during a half-open recovery window.
+	BrownoutProbe bool
 }
 
 // SoftKillFunc notifies a running agent execution of an external stop so status

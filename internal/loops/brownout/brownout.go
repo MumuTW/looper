@@ -137,18 +137,27 @@ func New(cfg Config, now func() time.Time, onChange func(Transition)) *Breaker {
 // scheduler calls, and it advances open -> half-open when the cooldown expires,
 // so no separate timer owns recovery.
 func (b *Breaker) Allow() error {
+	_, err := b.AllowAdmission()
+	return err
+}
+
+// AllowAdmission reports whether work may proceed and whether it was admitted
+// while half-open. The probe bit travels with the execution so an outcome from
+// an older closed/open admission cannot be mistaken for a recovery probe.
+func (b *Breaker) AllowAdmission() (bool, error) {
 	if b == nil {
-		return nil
+		return false, nil
 	}
 	b.mu.Lock()
 	// cfg is read under the mutex because SetConfig writes it from the config
 	// reload path while the scheduler is calling this from its own goroutines.
 	if !b.cfg.Enabled {
 		b.mu.Unlock()
-		return nil
+		return false, nil
 	}
 	transition, ok := b.refreshLocked()
 	state := b.state
+	probe := state == StateHalfOpen
 	remaining := b.openUntil.Sub(b.now())
 	b.mu.Unlock()
 
@@ -159,20 +168,39 @@ func (b *Breaker) Allow() error {
 		if remaining < 0 {
 			remaining = 0
 		}
-		return fmt.Errorf("%w: retrying in %s", ErrOpen, remaining.Round(time.Second))
+		return probe, fmt.Errorf("%w: retrying in %s", ErrOpen, remaining.Round(time.Second))
 	}
-	return nil
+	return probe, nil
 }
 
 // Record observes one agent outcome. Callers pass only outcomes attributable to
 // the agent boundary; a failed git push or a rejected policy check is looper's
 // own problem and must not open a gate meant for provider trouble.
 func (b *Breaker) Record(startedAt time.Time, ok bool) {
+	// Direct callers carry their admission timestamp. A non-zero timestamp is
+	// the legacy attribution authority; provider-aware runtime callers use
+	// RecordAdmission below so an explicit half-open admission token travels
+	// with the execution as well.
+	b.RecordAdmission(startedAt, ok, !startedAt.IsZero())
+}
+
+// RecordAdmission observes an outcome together with the admission posture
+// that allowed its process to start. Outcomes admitted before a cooldown
+// cannot satisfy ProbeSuccesses or double the backoff after a later trip.
+func (b *Breaker) RecordAdmission(startedAt time.Time, ok, probe bool) {
 	if b == nil {
 		return
 	}
 	b.mu.Lock()
 	if !b.cfg.Enabled {
+		b.mu.Unlock()
+		return
+	}
+	if b.state == StateOpen {
+		b.mu.Unlock()
+		return
+	}
+	if b.state == StateHalfOpen && (!probe || startedAt.IsZero() || startedAt.Before(b.halfOpenAt)) {
 		b.mu.Unlock()
 		return
 	}

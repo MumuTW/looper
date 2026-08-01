@@ -147,14 +147,9 @@ type defaultSchedulerTickInput struct {
 	// scheduler activity: the full default tick (discovery, HITL, claims,
 	// stale-reconcile) and each durable ClaimNext*. Nil means ungated (tests).
 	AllowClaim func() error
-	// HostAdmission, when set, reports whether the host can carry more work.
-	// Nil means ungated (tests, and any platform whose signals are unreadable).
-	HostAdmission func() *hostresources.Decision
-	// HostAdmissionLog, when set, reports whether a hold decision should be
-	// logged now (and records it so a repeated hold on the same sample is
-	// logged once). Nil means log every hold, preserving the test behavior of
-	// an ungated admission closure.
-	HostAdmissionLog func(*hostresources.Decision) bool
+	// WithAllowClaim holds provider-health and lifecycle admission across a
+	// durable claim/enqueue section. Nil means no critical-section gate (tests).
+	WithAllowClaim func(func()) error
 	// OperationOwner, when set, admits a Supervisor operation lease before each
 	// durable ClaimNext* and holds it until durable complete/cancel/requeue
 	// (ADR-0015 R6 / #579). Nil means ungated claim ownership (unit tests).
@@ -1965,6 +1960,7 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *
 	attachClaimGate := func(input defaultSchedulerTickInput, services Services) defaultSchedulerTickInput {
 		input.ClaimBoundary = claimBoundary
 		input.AllowClaim = allowClaim
+		input.WithAllowClaim = withAllowClaim
 		// Wire Supervisor operation leases for claim ownership span (#579).
 		// Prefer the live registry from Services when present (daemon path).
 		if services.ActiveExecutions != nil {
@@ -1979,6 +1975,7 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *
 				stopped.MaxConcurrentRuns = 0
 				stopped.RefreshForClaim = nil
 				stopped.AllowClaim = allowClaim
+				stopped.WithAllowClaim = withAllowClaim
 				if services.ActiveExecutions != nil {
 					stopped.OperationOwner = services.ActiveExecutions
 				} else if activeExecutions != nil {
@@ -1989,6 +1986,7 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *
 			latest := latestSnapshot.input(services)
 			latest.ClaimBoundary = claimBoundary
 			latest.AllowClaim = allowClaim
+			latest.WithAllowClaim = withAllowClaim
 			if services.ActiveExecutions != nil {
 				latest.OperationOwner = services.ActiveExecutions
 			} else if activeExecutions != nil {
@@ -3477,96 +3475,109 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 		if err := admitClaim(); err != nil {
 			return claimStop, nil
 		}
-		var lease OperationLease
-		if input.OperationOwner != nil {
-			var admitErr error
-			lease, admitErr = input.OperationOwner.AdmitOperation(ctx, OperationMeta{ClaimedBy: "scheduler"})
-			if admitErr != nil {
-				// Admission closed between AllowClaim and AdmitOperation.
-				return claimStop, nil
-			}
-		}
-		item, err := claimFn(ctx, nowISO, "scheduler")
-		if testAfterClaimHook != nil {
-			item, err = testAfterClaimHook(item, err)
-		}
-		if err != nil {
-			// Context cancel mid-ClaimNext can leave UPDATE...RETURNING committed
-			// without a returned item. Recover (or retain/degrade) before Release
-			// so a durable running claim is never left unowned (#579 / ADR-0015 R6).
-			if lease != nil && claimErrorIsAmbiguousCancel(ctx, err) {
-				recovered, recErr := recoverAmbiguousCancelledClaim(ctx, input, nowISO, owned)
-				if recErr != nil {
-					if input.OperationOwner != nil {
-						input.OperationOwner.ReportHardPersistFailure(recErr)
-					}
-					// Retain lease — do not Release; BeginShutdown still observes it.
-					return claimStop, errors.Join(ErrOperationFinalizeFailed, recErr)
-				}
-				if recovered != nil {
-					item = recovered
-					err = nil
-				} else {
-					// Confirmed no durable claim under this tick — safe to drop lease.
-					lease.Release()
-					// BeginShutdown may cancel mid-ClaimNext after earlier slots
-					// succeeded. Stop claiming; dispatch already-durable claims.
+		execute := func() (int, error) {
+			var lease OperationLease
+			if input.OperationOwner != nil {
+				var admitErr error
+				lease, admitErr = input.OperationOwner.AdmitOperation(ctx, OperationMeta{ClaimedBy: "scheduler"})
+				if admitErr != nil {
+					// Admission closed between AllowClaim and AdmitOperation.
 					return claimStop, nil
 				}
 			}
-		}
-		if err != nil {
-			if lease != nil {
-				lease.Release()
+			item, err := claimFn(ctx, nowISO, "scheduler")
+			if testAfterClaimHook != nil {
+				item, err = testAfterClaimHook(item, err)
 			}
-			// BeginShutdown may cancel mid-ClaimNext after earlier slots succeeded.
-			// Stop claiming and dispatch already-durable claims instead of stranding.
-			if ctx.Err() != nil {
-				return claimStop, nil
-			}
-			return claimStop, err
-		}
-		if item == nil {
-			if lease != nil {
-				lease.Release()
-			}
-			// No candidate in this lane (e.g. non-long-term exhausted); caller may
-			// continue with long-term retry lane.
-			return claimEmpty, nil
-		}
-		if lease != nil {
-			permit, bindErr := lease.BindClaim(*item)
-			if bindErr != nil {
-				// Cancelled lease never starts the processor. Durable-requeue
-				// under retained ownership; Release only after requeue commits.
-				if finErr := finalizeCancelledClaim(ctx, *item, input, now); finErr != nil {
-					if input.OperationOwner != nil {
-						input.OperationOwner.ReportHardPersistFailure(finErr)
+			if err != nil {
+				// Context cancel mid-ClaimNext can leave UPDATE...RETURNING committed
+				// without a returned item. Recover (or retain/degrade) before Release
+				// so a durable running claim is never left unowned (#579 / ADR-0015 R6).
+				if lease != nil && claimErrorIsAmbiguousCancel(ctx, err) {
+					recovered, recErr := recoverAmbiguousCancelledClaim(ctx, input, nowISO, owned)
+					if recErr != nil {
+						if input.OperationOwner != nil {
+							input.OperationOwner.ReportHardPersistFailure(recErr)
+						}
+						// Retain lease — do not Release; BeginShutdown still observes it.
+						return claimStop, errors.Join(ErrOperationFinalizeFailed, recErr)
 					}
-					// Retain ownership — do not Release; do not dispatch.
-					return claimContinue, errors.Join(ErrOperationFinalizeFailed, finErr)
-				}
-				lease.Release()
-				return claimContinue, nil
-			}
-			if !permit.Valid() {
-				// Defensive: BindClaim must return a valid permit or error.
-				if finErr := finalizeCancelledClaim(ctx, *item, input, now); finErr != nil {
-					if input.OperationOwner != nil {
-						input.OperationOwner.ReportHardPersistFailure(finErr)
+					if recovered != nil {
+						item = recovered
+						err = nil
+					} else {
+						// Confirmed no durable claim under this tick — safe to drop lease.
+						lease.Release()
+						// BeginShutdown may cancel mid-ClaimNext after earlier slots
+						// succeeded. Stop claiming; dispatch already-durable claims.
+						return claimStop, nil
 					}
-					return claimContinue, errors.Join(ErrOperationFinalizeFailed, finErr)
 				}
-				lease.Release()
-				return claimContinue, nil
 			}
-			owned = append(owned, ownedQueueClaim{item: *item, lease: lease, permit: permit})
-		} else {
-			// Tests without OperationOwner: claim without lease ownership.
-			owned = append(owned, ownedQueueClaim{item: *item})
+			if err != nil {
+				if lease != nil {
+					lease.Release()
+				}
+				// BeginShutdown may cancel mid-ClaimNext after earlier slots succeeded.
+				// Stop claiming and dispatch already-durable claims instead of stranding.
+				if ctx.Err() != nil {
+					return claimStop, nil
+				}
+				return claimStop, err
+			}
+			if item == nil {
+				if lease != nil {
+					lease.Release()
+				}
+				// No candidate in this lane (e.g. non-long-term exhausted); caller may
+				// continue with long-term retry lane.
+				return claimEmpty, nil
+			}
+			if lease != nil {
+				permit, bindErr := lease.BindClaim(*item)
+				if bindErr != nil {
+					// Cancelled lease never starts the processor. Durable-requeue
+					// under retained ownership; Release only after requeue commits.
+					if finErr := finalizeCancelledClaim(ctx, *item, input, now); finErr != nil {
+						if input.OperationOwner != nil {
+							input.OperationOwner.ReportHardPersistFailure(finErr)
+						}
+						// Retain ownership — do not Release; do not dispatch.
+						return claimContinue, errors.Join(ErrOperationFinalizeFailed, finErr)
+					}
+					lease.Release()
+					return claimContinue, nil
+				}
+				if !permit.Valid() {
+					// Defensive: BindClaim must return a valid permit or error.
+					if finErr := finalizeCancelledClaim(ctx, *item, input, now); finErr != nil {
+						if input.OperationOwner != nil {
+							input.OperationOwner.ReportHardPersistFailure(finErr)
+						}
+						return claimContinue, errors.Join(ErrOperationFinalizeFailed, finErr)
+					}
+					lease.Release()
+					return claimContinue, nil
+				}
+				owned = append(owned, ownedQueueClaim{item: *item, lease: lease, permit: permit})
+			} else {
+				// Tests without OperationOwner: claim without lease ownership.
+				owned = append(owned, ownedQueueClaim{item: *item})
+			}
+			queueItems = append(queueItems, *item)
+			return claimContinue, nil
 		}
-		queueItems = append(queueItems, *item)
-		return claimContinue, nil
+		if input.WithAllowClaim == nil {
+			return execute()
+		}
+		var executeResult int
+		var executeErr error
+		if gateErr := input.WithAllowClaim(func() {
+			executeResult, executeErr = execute()
+		}); gateErr != nil {
+			return claimStop, nil
+		}
+		return executeResult, executeErr
 	}
 
 	quarantinedIDs, err := quarantinedProjectIDsForClaim(ctx, input)
