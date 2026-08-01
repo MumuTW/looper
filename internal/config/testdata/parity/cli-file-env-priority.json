@@ -194,6 +194,12 @@
           "maxPerTick": 10,
           "includeOrphans": true,
           "dryRun": false
+        },
+        "resourceGuard": {
+          "enabled": true,
+          "minDiskFreePercent": 5,
+          "minDiskFreeGb": 10,
+          "maxLoadPerCpu": 2
         }
       },
       "package": {

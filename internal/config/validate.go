@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"net/url"
 	"os"
@@ -602,6 +603,7 @@ func validateDaemonConfig(daemon DaemonConfig, issues *[]ValidationIssue) {
 		*issues = append(*issues, ValidationIssue{Path: "daemon.workingDirectory", Message: "must be a non-empty path"})
 	}
 	validateWorktreeCleanupConfig(daemon.WorktreeCleanup, "daemon.worktreeCleanup", issues)
+	validateResourceGuardConfig(daemon.ResourceGuard, "daemon.resourceGuard", issues)
 }
 
 // ValidateProjectValidationPolicies is the startup/catalog/reload gate. Generic
@@ -979,6 +981,31 @@ func validateWebhookTunnelConfig(config WebhookConfig, path string, issues *[]Va
 	parsed, err := url.Parse(config.PublicBaseURL)
 	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.RawQuery != "" || parsed.Fragment != "" {
 		*issues = append(*issues, ValidationIssue{Path: path + ".publicBaseUrl", Message: "must be a valid https URL with a host when webhook mode is tunnel"})
+	}
+}
+
+// validateResourceGuardConfig rejects thresholds that would refuse all work.
+// A percentage at or above 100 admits nothing, and a negative threshold is
+// meaningless; both would halt the scheduler with no obvious cause. Non-finite
+// values (NaN, Inf) are rejected explicitly: every range check below is a
+// strict comparison that is false for NaN, so validation would otherwise accept
+// it, the guard would silently skip the check (NaN > 0 is false), and JSON
+// projections such as /config cannot encode the value.
+func validateResourceGuardConfig(config ResourceGuardConfig, path string, issues *[]ValidationIssue) {
+	if math.IsNaN(config.MinDiskFreePercent) || math.IsInf(config.MinDiskFreePercent, 0) {
+		*issues = append(*issues, ValidationIssue{Path: path + ".minDiskFreePercent", Message: "must be a finite number in [0, 100)"})
+	} else if config.MinDiskFreePercent < 0 || config.MinDiskFreePercent >= 100 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".minDiskFreePercent", Message: "must be a number in [0, 100)"})
+	}
+	if math.IsNaN(config.MinDiskFreeGB) || math.IsInf(config.MinDiskFreeGB, 0) {
+		*issues = append(*issues, ValidationIssue{Path: path + ".minDiskFreeGb", Message: "must be a finite number >= 0"})
+	} else if config.MinDiskFreeGB < 0 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".minDiskFreeGb", Message: "must be a number >= 0"})
+	}
+	if math.IsNaN(config.MaxLoadPerCPU) || math.IsInf(config.MaxLoadPerCPU, 0) {
+		*issues = append(*issues, ValidationIssue{Path: path + ".maxLoadPerCpu", Message: "must be a finite number >= 0"})
+	} else if config.MaxLoadPerCPU < 0 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".maxLoadPerCpu", Message: "must be a number >= 0"})
 	}
 }
 

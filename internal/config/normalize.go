@@ -982,8 +982,26 @@ func mergeDaemonConfig(config *DaemonConfig, partial PartialDaemonConfig) {
 		config.Environment = mergeStringMap(config.Environment, partial.Environment)
 	}
 
+	if partial.ResourceGuard != nil {
+		mergeResourceGuardConfig(&config.ResourceGuard, *partial.ResourceGuard)
+	}
 	if partial.WorktreeCleanup != nil {
 		mergeWorktreeCleanupConfig(&config.WorktreeCleanup, *partial.WorktreeCleanup)
+	}
+}
+
+func mergeResourceGuardConfig(config *ResourceGuardConfig, partial PartialResourceGuardConfig) {
+	if partial.Enabled != nil {
+		config.Enabled = *partial.Enabled
+	}
+	if partial.MinDiskFreePercent != nil {
+		config.MinDiskFreePercent = *partial.MinDiskFreePercent
+	}
+	if partial.MinDiskFreeGB != nil {
+		config.MinDiskFreeGB = *partial.MinDiskFreeGB
+	}
+	if partial.MaxLoadPerCPU != nil {
+		config.MaxLoadPerCPU = *partial.MaxLoadPerCPU
 	}
 }
 

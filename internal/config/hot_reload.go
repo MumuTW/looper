@@ -37,6 +37,16 @@ var hotEditablePaths = map[string]struct{}{
 	"daemon.worktreeCleanup.includeOrphans": {},
 	"daemon.worktreeCleanup.dryRun":         {},
 
+	// The host admission gate re-evaluates the cached sample against the live
+	// thresholds on every claim tick, so an operator can disable or relax a
+	// guard that is currently withholding work without restarting the daemon.
+	// Only the leaves are hot; the daemon.resourceGuard object itself stays
+	// restart-bound.
+	"daemon.resourceGuard.enabled":            {},
+	"daemon.resourceGuard.minDiskFreePercent": {},
+	"daemon.resourceGuard.minDiskFreeGb":      {},
+	"daemon.resourceGuard.maxLoadPerCpu":      {},
+
 	"notifications.inApp":                           {},
 	"notifications.osascript.enabled":               {},
 	"notifications.osascript.soundForLevels":        {},

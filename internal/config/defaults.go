@@ -194,6 +194,25 @@ func DefaultConfig(cwd string) (Config, error) {
 				IncludeOrphans: true,
 				DryRun:         false,
 			},
+			ResourceGuard: ResourceGuardConfig{
+				Enabled: true,
+				// Disk is the load-bearing signal: running the state
+				// filesystem dry does not merely slow looper down, it turns
+				// SQLite write failures into corruption. 5% and 10 GB are
+				// applied as the looser of the two: admission requires only one
+				// to be satisfied, so the percentage keeps the guard satisfiable
+				// on a filesystem smaller than the absolute floor (common for
+				// containers and small dedicated volumes) and the absolute floor
+				// caps percentage slack on a multi-terabyte filesystem.
+				MinDiskFreePercent: 5,
+				MinDiskFreeGB:      10,
+				// Load is a coarse backstop, defaulted conservatively so it
+				// does not refuse work on a healthy build machine. 2.0 per CPU
+				// is the conventional "genuinely oversubscribed" line; an
+				// operator who wants dispatch to back off as soon as the host
+				// saturates should set this nearer 1.0.
+				MaxLoadPerCPU: 2,
+			},
 		},
 		Package: PackageConfig{
 			Distribution:               "github-release",

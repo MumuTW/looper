@@ -24,6 +24,7 @@ import (
 	"github.com/MumuTW/looper/internal/fixer"
 	"github.com/MumuTW/looper/internal/forge"
 	"github.com/MumuTW/looper/internal/gatekeeper"
+	"github.com/MumuTW/looper/internal/hostresources"
 	gitinfra "github.com/MumuTW/looper/internal/infra/git"
 	githubinfra "github.com/MumuTW/looper/internal/infra/github"
 	"github.com/MumuTW/looper/internal/infra/notify"
@@ -106,6 +107,14 @@ type defaultSchedulerTickInput struct {
 	// scheduler activity: the full default tick (discovery, HITL, claims,
 	// stale-reconcile) and each durable ClaimNext*. Nil means ungated (tests).
 	AllowClaim func() error
+	// HostAdmission, when set, reports whether the host can carry more work.
+	// Nil means ungated (tests, and any platform whose signals are unreadable).
+	HostAdmission func() *hostresources.Decision
+	// HostAdmissionLog, when set, reports whether a hold decision should be
+	// logged now (and records it so a repeated hold on the same sample is
+	// logged once). Nil means log every hold, preserving the test behavior of
+	// an ungated admission closure.
+	HostAdmissionLog func(*hostresources.Decision) bool
 	// OperationOwner, when set, admits a Supervisor operation lease before each
 	// durable ClaimNext* and holds it until durable complete/cancel/requeue
 	// (ADR-0015 R6 / #579). Nil means ungated claim ownership (unit tests).
@@ -1692,7 +1701,7 @@ func (f *schedulerNotificationGatewayFactory) New(options notify.Options) *notif
 	return notify.NewGateway(options)
 }
 
-func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *sync.RWMutex, configPath string, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error), allowClaim func() error, withAllowClaim func(fn func()) error) defaultSchedulerHandlers {
+func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *sync.RWMutex, configPath string, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error), allowClaim func() error, withAllowClaim func(fn func()) error, hostGate *hostAdmissionGate) defaultSchedulerHandlers {
 	if source == nil {
 		fail := func(context.Context, Services) error { return fmt.Errorf("project catalog is not configured") }
 		return defaultSchedulerHandlers{tick: fail, claim: fail}
@@ -1719,7 +1728,7 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *
 	// transport continuity while retaining config-specific policy.
 	buildSnapshot := func() defaultSchedulerHandlers {
 		cfg := source.Snapshot()
-		return buildDefaultSchedulerHandlersWithOptions(cfg, configPath, logger, coordinator, repos, gitGateway, githubGateway, activeExecutions, asyncRunner, requestWake, now, reconcileStaleRuns, false, claimMu, nil, notificationGateways, coordinatorState)
+		return buildDefaultSchedulerHandlersWithOptions(cfg, configPath, logger, coordinator, repos, gitGateway, githubGateway, activeExecutions, asyncRunner, requestWake, now, reconcileStaleRuns, false, claimMu, nil, notificationGateways, coordinatorState, hostGate)
 	}
 	handlers := defaultSchedulerHandlers{
 		snapshot:             buildSnapshot,
@@ -1803,7 +1812,7 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *
 	return handlers
 }
 
-func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath string, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error), includeWebhook bool, claimMu *sync.Mutex, configSource projects.ConfigSource, notificationGateways *schedulerNotificationGatewayFactory, coordinatorState *coordinatorrole.RuntimeState) defaultSchedulerHandlers {
+func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath string, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error), includeWebhook bool, claimMu *sync.Mutex, configSource projects.ConfigSource, notificationGateways *schedulerNotificationGatewayFactory, coordinatorState *coordinatorrole.RuntimeState, hostGate *hostAdmissionGate) defaultSchedulerHandlers {
 	if now == nil {
 		now = time.Now
 	}
@@ -2331,6 +2340,8 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		claimMu = &sync.Mutex{}
 	}
 
+	hostAdmission, hostAdmissionLog := hostAdmissionFor(cfg, hostGate)
+
 	inputForServices := func(services Services) defaultSchedulerTickInput {
 		var runner schedulerAsyncRunner
 		if asyncRunner != nil {
@@ -2349,6 +2360,8 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			Logger:               logger,
 			Now:                  now,
 			MaxConcurrentRuns:    cfg.Scheduler.MaxConcurrentRuns,
+			HostAdmission:        hostAdmission,
+			HostAdmissionLog:     hostAdmissionLog,
 			ClaimMu:              claimMu,
 			ReconcileStaleRuns:   reconcileStaleRuns,
 			AsyncRunner:          runner,
@@ -2637,6 +2650,17 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 				break
 			}
 			label := lane.laneLabel()
+			// Host pressure must gate discovery lanes, not only claims: the
+			// Coordinator lane starts agent processes directly during Discover
+			// (decide → ConfiguredExecutor.Start), bypassing the claim/slot
+			// chokepoint that executeClaimPhase guards. A hold here stops the
+			// lane before it can launch a new process on the pressured host.
+			if held := hostAdmissionHeld(input, label); held != nil {
+				if input.Logger != nil {
+					input.Logger.Debug("scheduler skipped discovery lane under host pressure", map[string]any{"lane": label, "projectId": project.ID, "repo": repo, "reasons": held.Reasons})
+				}
+				break
+			}
 			appendErr(runSchedulerLane(input, label, project.ID, repo, func() error {
 				items, err := lane.Discover(ctx, project.ID, repo, snapshot)
 				trackRunnableDiscovery(items)
@@ -2864,6 +2888,23 @@ func executeClaimPhase(ctx context.Context, phase string, input defaultScheduler
 		logClaimPhase(input.Logger, phase, 0, 0, time.Since(start), err)
 		return 0, 0, err
 	}
+	// Host pressure withholds slots rather than stopping anything: claims below
+	// this point start new agent processes, and everything already running is
+	// untouched. Killing in-flight work to relieve pressure would discard its
+	// progress and leave exactly the orphaned executions and quarantine debt
+	// that recovery then has to reconcile — paying for capacity with debt.
+	// The hold warning is throttled to one entry per decision transition and
+	// per fresh sample: the claim pass runs several times per second, and a
+	// sustained hold (even on an empty queue) would otherwise churn the log on
+	// every call and consume the disk the guard protects.
+	if availableSlots > 0 && input.HostAdmission != nil {
+		if held := input.HostAdmission(); held != nil && !held.Admit {
+			if input.HostAdmissionLog == nil || input.HostAdmissionLog(held) {
+				logHostAdmissionHold(input.Logger, phase, availableSlots, *held)
+			}
+			return 0, 0, nil
+		}
+	}
 	claimedItems := make([]storage.QueueItemRecord, 0)
 	if availableSlots > 0 && input.Repos != nil && input.Repos.Queue != nil {
 		claimedItems, err = claimAndRunScheduledQueueItems(ctx, availableSlots, input)
@@ -2876,6 +2917,62 @@ func executeClaimPhase(ctx context.Context, phase string, input defaultScheduler
 		logClaimPhase(input.Logger, phase, availableSlots, claimedCount, time.Since(start), err)
 	}
 	return claimedCount, availableSlots, err
+}
+
+// hostAdmissionFor binds the shared gate to this snapshot's thresholds, so a
+// config reload changes the gate on the next tick without restarting anything.
+// The second return value throttles hold logging to one entry per decision
+// transition and per fresh sample, so a sustained hold does not churn the log
+// on every claim pass.
+func hostAdmissionFor(cfg config.Config, gate *hostAdmissionGate) (func() *hostresources.Decision, func(*hostresources.Decision) bool) {
+	if gate == nil {
+		return nil, nil
+	}
+	guard := cfg.Daemon.ResourceGuard
+	decide := func() *hostresources.Decision { return gate.Decide(guard) }
+	report := func(decision *hostresources.Decision) bool { return gate.ShouldLogHold(decision) }
+	return decide, report
+}
+
+// logHostAdmissionHold names the tripped signal and the slots it withheld. A
+// hold that only showed up as an idle queue would be indistinguishable from
+// having no work, which is the failure mode this log exists to prevent.
+func logHostAdmissionHold(logger bootstrap.Logger, phase string, withheldSlots int, decision hostresources.Decision) {
+	if logger == nil {
+		return
+	}
+	logger.Warn("looperd withheld scheduler slots under host pressure", map[string]any{
+		"phase":         phase,
+		"withheldSlots": withheldSlots,
+		"reasons":       decision.Reasons,
+		"detail":        decision.Summary(),
+	})
+}
+
+// hostAdmissionHeld returns a non-nil, non-admitting Decision when host pressure
+// refuses new work, logging the hold through the throttle so a sustained
+// condition surfaces once per transition/sample rather than on every lane. Nil
+// means admit or no opinion — proceed.
+//
+// The discovery lanes call this before Discover because the Coordinator lane
+// starts agent processes directly during discovery (decide →
+// ConfiguredExecutor.Start), bypassing the claim/slot chokepoint that
+// executeClaimPhase guards. A hold that only withholds claims while discovery
+// keeps launching defeats the guard: pressure on the host is the same whether
+// the new process comes from a queue claim or a Coordinator decide, so the hold
+// must stop both.
+func hostAdmissionHeld(input defaultSchedulerTickInput, phase string) *hostresources.Decision {
+	if input.HostAdmission == nil {
+		return nil
+	}
+	held := input.HostAdmission()
+	if held == nil || held.Admit {
+		return nil
+	}
+	if input.HostAdmissionLog == nil || input.HostAdmissionLog(held) {
+		logHostAdmissionHold(input.Logger, phase, 0, *held)
+	}
+	return held
 }
 
 func logClaimPhase(logger bootstrap.Logger, phase string, availableSlots, claimedCount int, duration time.Duration, err error) {
