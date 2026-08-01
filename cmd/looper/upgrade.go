@@ -7,13 +7,13 @@ import (
 	"os/exec"
 	"strings"
 
+	"github.com/MumuTW/looper/internal/upgradebackup"
 	"github.com/MumuTW/looper/internal/version"
 )
 
 // upgradePreflight is deliberately a read-only report. The current daemon is
 // the authority for its live storage/work state, while each target binary is
-// the authority for its own embedded build identity. Incomplete identities
-// never count as a matching pair (aligned with version.Info.SameBuild).
+// the authority for its own embedded build identity.
 type upgradePreflight struct {
 	Current struct {
 		CLI    version.Info  `json:"cli"`
@@ -61,8 +61,36 @@ type upgradeDaemonVersion struct {
 }
 
 func runUpgrade(ctx context.Context, global, operands []string, stdout interface{ Write([]byte) (int, error) }) error {
-	if len(operands) == 0 || operands[0] != "preflight" {
-		return badUsage("upgrade requires the preflight subcommand")
+	if len(operands) == 0 {
+		return badUsage("upgrade requires backup, preflight, or verify")
+	}
+	if operands[0] == "backup" {
+		if len(operands) != 1 {
+			return badUsage("upgrade backup accepts no operands")
+		}
+		cfg, err := loadConfig(global)
+		if err != nil {
+			return err
+		}
+		result, err := requestJSON[upgradeBackupResult](ctx, cfg, "POST", "/api/v1/upgrade/backup", nil)
+		if err != nil {
+			return err
+		}
+		return writeVersionJSON(stdout, result)
+	}
+	if operands[0] == "verify" {
+		bundle, err := parseUpgradeVerifyArgs(operands[1:])
+		if err != nil {
+			return err
+		}
+		result, err := upgradebackup.Verify(bundle)
+		if err != nil {
+			return err
+		}
+		return writeVersionJSON(stdout, result)
+	}
+	if operands[0] != "preflight" {
+		return badUsage("upgrade requires backup, preflight, or verify")
 	}
 	targetLooper, targetLooperd, jsonOutput, err := parseUpgradePreflightArgs(operands[1:])
 	if err != nil {
@@ -72,8 +100,6 @@ func runUpgrade(ctx context.Context, global, operands []string, stdout interface
 	if err != nil {
 		return err
 	}
-	// Read-only: GET-only version and status. Never starts a second daemon or
-	// mutates production storage.
 	remote, err := requestJSON[upgradeDaemonVersion](ctx, cfg, "GET", "/api/v1/version", nil)
 	if err != nil {
 		return err
@@ -92,13 +118,7 @@ func runUpgrade(ctx context.Context, global, operands []string, stdout interface
 		return err
 	}
 	configCompatible, configErr := targetConfigCompatibility(ctx, targetLooperd, global)
-	report := upgradePreflight{
-		CurrentPairMatches:     version.Current().SameBuild(currentDaemon),
-		TargetPairMatches:      targetCLI.SameBuild(targetDaemon),
-		TargetIdentityValid:    targetCLI.Complete() && targetDaemon.Complete(),
-		TargetConfigCompatible: configCompatible,
-		TargetConfigError:      configErr,
-	}
+	report := upgradePreflight{CurrentPairMatches: version.Current().SameBuild(currentDaemon), TargetPairMatches: targetCLI.SameBuild(targetDaemon), TargetIdentityValid: targetCLI.Complete() && targetDaemon.Complete(), TargetConfigCompatible: configCompatible, TargetConfigError: configErr}
 	report.Current.CLI, report.Current.Daemon, report.Current.Status = version.Current(), currentDaemon, status
 	report.Target.CLI, report.Target.Daemon = targetCLI, targetDaemon
 	report.Relationship = buildRelationship(currentDaemon, targetDaemon)
@@ -111,6 +131,11 @@ func runUpgrade(ctx context.Context, global, operands []string, stdout interface
 	}
 	_, _ = fmt.Fprintln(stdout, string(encoded))
 	return nil
+}
+
+type upgradeBackupResult struct {
+	Directory string `json:"directory"`
+	Manifest  any    `json:"manifest"`
 }
 
 func targetConfigCompatibility(ctx context.Context, binary string, global []string) (bool, string) {
@@ -154,6 +179,13 @@ func parseUpgradePreflightArgs(args []string) (string, string, bool, error) {
 		return "", "", false, badUsage("upgrade preflight requires --target-looper and --target-looperd")
 	}
 	return looper, looperd, jsonOutput, nil
+}
+
+func parseUpgradeVerifyArgs(args []string) (string, error) {
+	if len(args) != 2 || args[0] != "--bundle" || strings.TrimSpace(args[1]) == "" {
+		return "", badUsage("upgrade verify requires --bundle <directory>")
+	}
+	return args[1], nil
 }
 
 func targetBuildIdentity(ctx context.Context, binary string, args ...string) (version.Info, error) {

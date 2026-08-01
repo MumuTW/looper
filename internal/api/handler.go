@@ -354,6 +354,17 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request) {
 
 		h.writeSuccess(w, requestID, h.buildVersionResponse())
 		return
+	case apiBasePath + "/upgrade/backup":
+		if !assertMethod(r.Method, http.MethodPost, path, w, requestID, h.writeError) {
+			return
+		}
+		result, err := h.createUpgradeBackup(r.Context())
+		if err != nil {
+			h.writeError(w, requestID, internalServerError(err))
+			return
+		}
+		h.writeSuccess(w, requestID, result)
+		return
 	case apiBasePath + "/config":
 		h.handleConfigRoute(w, r, requestID)
 		return

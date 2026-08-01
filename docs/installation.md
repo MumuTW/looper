@@ -152,6 +152,15 @@ looper upgrade preflight --target-looper /path/to/candidate/looper --target-loop
 
 Preflight only calls `GET /api/v1/version` and `GET /api/v1/status` on the running daemon and executes the candidate binaries' identity (and optional `--check-config`) commands. It does not start a second production daemon or mutate the production database. Incomplete build identities never count as a matching CLI/daemon pair.
 
+After a clean preflight, create an explicit rollback bundle (daemon-owned SQLite online backup + config + matching binaries + checksums):
+
+```bash
+looper upgrade backup
+looper upgrade verify --bundle <directory>
+```
+
+`upgrade verify` is offline and fail-closed on missing files, bad checksums, or manifest problems.
+
 Manual cutover after a clean preflight: replace the binaries from matching release artifacts. Download the newer `looper-<target>.tar.gz` and `looperd-<target>.tar.gz` release artifacts (or re-run the install script for the CLI), put them back on your `PATH`, and restart `looperd`. There is no self-upgrade, version check, rollback, or channel switching.
 
 ## Compatibility and version policy
