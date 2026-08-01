@@ -12,10 +12,11 @@ import (
 const reviewerReviewPostedEventType = "pr.review.posted"
 
 type reviewerReviewPostedPayload struct {
-	Repo     string `json:"repo"`
-	PRNumber int64  `json:"prNumber"`
-	Event    string `json:"event"`
-	HeadSHA  string `json:"headSha"`
+	Repo           string `json:"repo"`
+	PRNumber       int64  `json:"prNumber"`
+	Event          string `json:"event"`
+	HeadSHA        string `json:"headSha"`
+	MarkerVerified bool   `json:"markerVerified"`
 }
 
 // latestCodexReviewForHead projects the latest durable Reviewer review event
@@ -47,6 +48,13 @@ func latestCodexReviewForHead(ctx context.Context, repos *storage.Repositories, 
 		}
 		reviewedHead := strings.TrimSpace(payload.HeadSHA)
 		if reviewedHead == "" {
+			continue
+		}
+		// A markerless event (clean COMMENT no-op) records that the Reviewer
+		// processed the head without publishing a structured GitHub review, so
+		// it must not satisfy the current-head gate. Only a marker-verified
+		// event proves a structured review was published for this head.
+		if !payload.MarkerVerified {
 			continue
 		}
 		reviewEvent := strings.ToUpper(strings.TrimSpace(payload.Event))

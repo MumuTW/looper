@@ -270,7 +270,18 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		fingerprint := sourceFingerprint(pullRequest, budgetEnabled) + fmt.Sprintf("\x1fdiff-budget=%d,%d", diffBudget.MaxChangedFiles, diffBudget.MaxDeletions)
 		entityID := fmt.Sprintf("%s#%d", input.Repo, pullRequest.Number)
 		previous, hasPrevious := previousReports[entityID]
-		if reused, ok := skipUnchanged(previous, hasPrevious, fingerprint, r.now()); ok {
+		// When the previous report is waiting on a current-head review, check
+		// the local event log cheaply before deciding to skip. This avoids a
+		// full forge evaluation every tick for PRs that may never receive a
+		// Reviewer review (unrequested, self-authored), while still observing
+		// a review the moment its durable event appears.
+		reviewEvidenceAppeared := false
+		if hasPrevious && previous.SourceFingerprint == fingerprint && reportAwaitsCurrentHeadReview(previous) {
+			if evidence, err := latestCodexReviewForHead(ctx, r.repos, input.ProjectID, input.Repo, pullRequest.Number, pullRequest.HeadSHA); err == nil && evidence.CurrentHeadValid {
+				reviewEvidenceAppeared = true
+			}
+		}
+		if reused, ok := skipUnchanged(previous, hasPrevious, fingerprint, r.now(), reviewEvidenceAppeared); ok {
 			result.Skipped++
 			result.Reports = append(result.Reports, reused)
 			continue

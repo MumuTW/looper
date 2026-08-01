@@ -77,7 +77,16 @@ var checkReasonCodes = map[ReasonCode]struct{}{
 	ReasonCheckPending: {},
 }
 
+// reportAwaitsCurrentHeadReview reports whether a gate report is blocked on a
+// current-head Reviewer review. It inspects both the reason and the persisted
+// evidence: a provider block after the review check replaces the reason but
+// leaves Evidence.CodexReview.CurrentHeadValid false, so checking the evidence
+// alone would miss that case and checking the reason alone would miss a
+// provider-blocked report. Both signals are authoritative.
 func reportAwaitsCurrentHeadReview(report Report) bool {
+	if report.Evidence.CodexReview != nil && !report.Evidence.CodexReview.CurrentHeadValid {
+		return true
+	}
 	for _, reason := range report.Reasons {
 		if reason.Code == ReasonCodexReviewMissing {
 			return true
@@ -132,8 +141,15 @@ func latestGateReports(ctx context.Context, repos *storage.Repositories, project
 //
 // Skipping is refused unless every one of these holds: a previous report exists,
 // it recorded a fingerprint, the fingerprint still matches, the gate is not
-// waiting on check state, and the report is younger than maxSkipAge.
-func skipUnchanged(previous Report, hasPrevious bool, fingerprint string, now time.Time) (Report, bool) {
+// waiting on check state, the gate is not waiting on a review event that has
+// since appeared, and the report is younger than maxSkipAge.
+//
+// reviewEvidenceAppeared is the result of a cheap local event-log check made by
+// the caller for reports awaiting a current-head review. When the review event
+// has not appeared, the PR is skipped because re-evaluating would reach the same
+// conclusion without the event and would pay forge round trips every tick; when
+// it has appeared, the PR is re-evaluated so the new evidence is observed.
+func skipUnchanged(previous Report, hasPrevious bool, fingerprint string, now time.Time, reviewEvidenceAppeared bool) (Report, bool) {
 	if !hasPrevious || strings.TrimSpace(previous.SourceFingerprint) == "" {
 		return Report{}, false
 	}
@@ -143,7 +159,7 @@ func skipUnchanged(previous Report, hasPrevious bool, fingerprint string, now ti
 	if reportAwaitsCheckState(previous) {
 		return Report{}, false
 	}
-	if reportAwaitsCurrentHeadReview(previous) {
+	if reportAwaitsCurrentHeadReview(previous) && reviewEvidenceAppeared {
 		return Report{}, false
 	}
 	evaluatedAt, err := time.Parse(time.RFC3339Nano, previous.EvaluatedAt)

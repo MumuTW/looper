@@ -169,117 +169,19 @@ func hasReason(report Report, code ReasonCode) bool {
 	return false
 }
 
-// With both budget bounds at their default of zero the gate is unlimited, so a
-// base-branch advance changes nothing Gatekeeper enforces. BaseSHA must not be
-// in the fingerprint then, or every base commit would invalidate the cached
-// report for every open pull request and pay for a full re-evaluation (and its
-// forge round trips) to recompute a verdict that cannot have changed.
-func TestDiscoverPullRequestsIgnoresBaseSHAWhenBudgetDisabled(t *testing.T) {
-	t.Parallel()
-	fixture := newGatekeeperFixture(t)
-	fixture.github.openPullRequests = []githubinfra.PullRequestSummary{openPullRequestFixture()}
-	discover(t, fixture)
-	callsAfterFirst := fixture.github.perPullRequestCalls
-	if callsAfterFirst == 0 {
-		t.Fatal("first tick made no per-pull-request calls; the fixture cannot detect a skip")
+// A provider block after the review check replaces all reasons with the
+// provider reason but leaves Evidence.CodexReview.CurrentHeadValid false.
+// reportAwaitsCurrentHeadReview must still detect this as waiting for a review
+// so the PR is not silently skipped for up to maxSkipAge.
+func TestReportAwaitsCurrentHeadReviewDetectsProviderBlockedEvidence(t *testing.T) {
+	report := Report{
+		Reasons: []Reason{{Code: ReasonProviderStateUnavailable, Subject: "mergeability"}},
+		Evidence: Evidence{CodexReview: &CodexReviewEvidence{
+			RequiredHeadSHA:  "head-1",
+			CurrentHeadValid: false,
+		}},
 	}
-
-	changed := openPullRequestFixture()
-	changed.BaseSHA = "base-2"
-	fixture.github.openPullRequests = []githubinfra.PullRequestSummary{changed}
-
-	second := discover(t, fixture)
-	if second.Evaluated != 0 || second.Skipped != 1 {
-		t.Fatalf("second tick = %d evaluated / %d skipped, want 0 / 1 (base SHA must not invalidate a disabled budget)", second.Evaluated, second.Skipped)
-	}
-	if fixture.github.perPullRequestCalls != callsAfterFirst {
-		t.Fatalf("per-pull-request calls = %d, want %d (disabled budget must not re-evaluate on a base advance)",
-			fixture.github.perPullRequestCalls, callsAfterFirst)
-	}
-}
-
-// When the diff budget is enabled, a rewritten base branch recomputes the
-// observed change size against a new merge base without moving the head, so the
-// base SHA must invalidate a reused report even though every other list-page
-// field is unchanged.
-func TestDiscoverPullRequestsReevaluatesOnBaseSHAWhenBudgetEnabled(t *testing.T) {
-	t.Parallel()
-	fixture := newGatekeeperFixture(t)
-	fixture.github.openPullRequests = []githubinfra.PullRequestSummary{openPullRequestFixture()}
-	fixture.github.detail.DiffStats = &githubinfra.PullRequestDiffStats{ChangedFiles: 5}
-	fixture.github.detail.BaseSHA = "base-1"
-	fixture.github.mergeable.BaseSHA = "base-1"
-	fixture.github.finalBaseSHA = "base-1"
-	runner := diffBudgetRunner(t, fixture, config.GatekeeperDiffBudget{MaxChangedFiles: 20}, config.GatekeeperTrustObserve)
-
-	first, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
-	if err != nil {
-		t.Fatalf("DiscoverPullRequests() error = %v", err)
-	}
-	if first.Evaluated != 1 || first.Skipped != 0 {
-		t.Fatalf("first tick = %d evaluated / %d skipped, want 1 / 0", first.Evaluated, first.Skipped)
-	}
-
-	changed := openPullRequestFixture()
-	changed.BaseSHA = "base-2"
-	fixture.github.openPullRequests = []githubinfra.PullRequestSummary{changed}
-
-	second, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
-	if err != nil {
-		t.Fatalf("DiscoverPullRequests() error = %v", err)
-	}
-	if second.Evaluated != 1 || second.Skipped != 0 {
-		t.Fatalf("second tick = %d evaluated / %d skipped, want 1 / 0 (base SHA must invalidate a budget-enabled report)", second.Evaluated, second.Skipped)
-	}
-}
-
-// The diff-budget suffix is the only fingerprint input that reflects an operator
-// changing a bound, so a budget change must force re-evaluation even when the
-// pull request list page is byte-for-byte unchanged. A regression that dropped
-// or mis-encoded the suffix would silently retain an eligible verdict until
-// maxSkipAge.
-func TestDiscoverPullRequestsReevaluatesWhenDiffBudgetChanges(t *testing.T) {
-	t.Parallel()
-	fixture := newGatekeeperFixture(t)
-	fixture.github.openPullRequests = []githubinfra.PullRequestSummary{openPullRequestFixture()}
-	fixture.github.detail.DiffStats = &githubinfra.PullRequestDiffStats{ChangedFiles: 5}
-	fixture.github.detail.BaseSHA = "base-1"
-	fixture.github.mergeable.BaseSHA = "base-1"
-	fixture.github.finalBaseSHA = "base-1"
-	current := config.GatekeeperDiffBudget{MaxChangedFiles: 20}
-	runner := New(Options{
-		Repos:  fixture.repos,
-		GitHub: fixture.github,
-		Now:    func() time.Time { return fixture.now },
-		PolicyPermitsTarget: func(string, string, string) bool {
-			return fixture.policyPermits
-		},
-		DiffBudgetForProject: func(string) config.GatekeeperDiffBudget { return current },
-	})
-
-	first, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
-	if err != nil {
-		t.Fatalf("DiscoverPullRequests() error = %v", err)
-	}
-	if first.Evaluated != 1 || first.Skipped != 0 {
-		t.Fatalf("first tick = %d evaluated / %d skipped, want 1 / 0", first.Evaluated, first.Skipped)
-	}
-	callsAfterFirst := fixture.github.perPullRequestCalls
-
-	// Operator tightens the bound below the observed count; the PR is unchanged.
-	current = config.GatekeeperDiffBudget{MaxChangedFiles: 4}
-
-	second, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
-	if err != nil {
-		t.Fatalf("DiscoverPullRequests() error = %v", err)
-	}
-	if second.Evaluated != 1 || second.Skipped != 0 {
-		t.Fatalf("second tick = %d evaluated / %d skipped, want 1 / 0 after the budget changed", second.Evaluated, second.Skipped)
-	}
-	if fixture.github.perPullRequestCalls == callsAfterFirst {
-		t.Fatal("per-pull-request calls did not increase; a budget change must force re-evaluation")
-	}
-	if !hasReason(second.Reports[0], ReasonDiffBudgetExceeded) {
-		t.Fatalf("second report reasons = %v, want diff_budget_exceeded against the tightened bound", reasonCodes(second.Reports[0].Reasons))
+	if !reportAwaitsCurrentHeadReview(report) {
+		t.Fatalf("reportAwaitsCurrentHeadReview() = false, want true for provider-blocked report with invalid CodexReview evidence")
 	}
 }

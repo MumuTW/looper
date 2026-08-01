@@ -2808,7 +2808,7 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 		if criteriaResult, err := r.maybePublishCriteriaAnchoredCleanReview(ctx, input, checkpoint, pending, detail); err != nil {
 			return checkpoint, err
 		} else if criteriaResult != nil {
-			if err := r.recordPublishedReviewProgress(ctx, input, pending, criteriaResult.reviewEvent); err != nil {
+			if err := r.recordPublishedReviewProgress(ctx, input, pending, criteriaResult.reviewEvent, !criteriaResult.recordOnly); err != nil {
 				return checkpoint, err
 			}
 			return checkpoint, nil
@@ -2834,7 +2834,7 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 			if err := r.applyVerifiedReviewSideEffects(ctx, input, checkpoint, detail, found); err != nil {
 				return checkpoint, err
 			}
-			if err := r.recordPublishedReviewProgress(ctx, input, pending, pendingReviewEvent(pending)); err != nil {
+			if err := r.recordPublishedReviewProgress(ctx, input, pending, pendingReviewEvent(pending), true); err != nil {
 				return checkpoint, err
 			}
 			return checkpoint, nil
@@ -2842,7 +2842,7 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 		if err := r.applyCleanNoopReviewSideEffects(ctx, input, checkpoint, detail); err != nil {
 			return checkpoint, err
 		}
-		if err := r.recordPublishedReviewProgress(ctx, input, pending, ReviewEventComment); err != nil {
+		if err := r.recordPublishedReviewProgress(ctx, input, pending, ReviewEventComment, false); err != nil {
 			return checkpoint, err
 		}
 		return checkpoint, nil
@@ -2950,7 +2950,7 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 	if err := r.applyVerifiedReviewSideEffects(ctx, input, checkpoint, detail, markerResult); err != nil {
 		return checkpoint, err
 	}
-	if err := r.recordPublishedReviewProgress(ctx, input, pending, pendingReviewEvent(pending)); err != nil {
+	if err := r.recordPublishedReviewProgress(ctx, input, pending, pendingReviewEvent(pending), true); err != nil {
 		return checkpoint, err
 	}
 	return checkpoint, nil
@@ -3848,7 +3848,16 @@ func isValidBlockingReviewEvent(value string) bool {
 	}
 }
 
-func (r *Runner) recordPublishedReviewProgress(ctx context.Context, input stepInput, pending pendingReviewCheckpoint, reviewEvent ReviewEvent) error {
+func (r *Runner) recordPublishedReviewProgress(ctx context.Context, input stepInput, pending pendingReviewCheckpoint, reviewEvent ReviewEvent, markerVerified bool) error {
+	// The pr.review.posted event is the sole authority Gatekeeper accepts for
+	// the current-head review gate, so it must be durable before the head is
+	// marked as published. Appending first and propagating the error ensures
+	// that a failed write leaves lastPublishedHeadSha unset: the next run
+	// retries the publish step, which finds the already-posted review marker
+	// and re-emits the event rather than silently stranding the head.
+	if err := r.appendEventChecked(ctx, eventInput{eventType: "pr.review.posted", projectID: input.Project.ID, loopID: input.Loop.ID, runID: input.Run.ID, entityType: "pull_request", entityID: fmt.Sprintf("%s#%d", input.Repo, input.PRNumber), payload: map[string]any{"repo": input.Repo, "prNumber": input.PRNumber, "event": string(reviewEvent), "headSha": pending.HeadSHA, "markerVerified": markerVerified}}); err != nil {
+		return fmt.Errorf("record published review progress: append pr.review.posted: %w", err)
+	}
 	var mergeErr error
 	if _, err := r.updateLoop(ctx, input.Loop, func(updated *storage.LoopRecord) {
 		metadataJSON, err := mergeLoopMetadataJSON(updated.MetadataJSON, map[string]any{"lastPublishedHeadSha": pending.HeadSHA, "lastReviewEvent": string(reviewEvent), "lastReviewSummary": pending.Summary, "lastPublishedAt": r.nowISO()})
@@ -3861,12 +3870,12 @@ func (r *Runner) recordPublishedReviewProgress(ctx context.Context, input stepIn
 		return err
 	}
 	if mergeErr != nil {
-		// The review was already published externally; failing here keeps the
-		// idempotency fields' absence loud so the operator sees why a later
-		// discovery may re-run this head instead of silently double-publishing.
+		// The review was already published externally and the event is durable;
+		// failing here keeps the idempotency fields' absence loud so the
+		// operator sees why a later discovery may re-run this head instead of
+		// silently double-publishing.
 		return fmt.Errorf("record published review progress: %w", mergeErr)
 	}
-	r.appendEvent(ctx, eventInput{eventType: "pr.review.posted", projectID: input.Project.ID, loopID: input.Loop.ID, runID: input.Run.ID, entityType: "pull_request", entityID: fmt.Sprintf("%s#%d", input.Repo, input.PRNumber), payload: map[string]any{"repo": input.Repo, "prNumber": input.PRNumber, "event": string(reviewEvent), "headSha": pending.HeadSHA}})
 	return nil
 }
 
@@ -3881,10 +3890,22 @@ type eventInput struct {
 }
 
 func (r *Runner) appendEvent(ctx context.Context, input eventInput) {
+	// Observability events (loop/run lifecycle, thread resolution) are
+	// best-effort: a failed append is logged downstream by the caller's
+	// own error handling but must not abort the run. Authority events
+	// that downstream gates depend on use appendEventChecked instead.
+	_ = r.appendEventChecked(ctx, input)
+}
+
+// appendEventChecked appends a durable event and returns the error so the
+// caller can fail the run when the event is authority for a downstream gate.
+// The pr.review.posted event is the sole authority Gatekeeper accepts for the
+// current-head review gate, so a failed append must not be silently discarded.
+func (r *Runner) appendEventChecked(ctx context.Context, input eventInput) error {
 	if r.repos == nil || r.repos.Events == nil {
-		return
+		return nil
 	}
-	_ = eventlog.Append(ctx, r.repos, eventlog.AppendInput{EventType: input.eventType, ProjectID: optionalString(input.projectID), LoopID: optionalString(input.loopID), RunID: optionalString(input.runID), EntityType: optionalString(input.entityType), EntityID: optionalString(input.entityID), ActorType: optionalString("system"), ActorID: optionalString("reviewer-loop"), ActorDisplayName: optionalString("reviewer-loop"), Payload: input.payload, CreatedAt: r.now()})
+	return eventlog.Append(ctx, r.repos, eventlog.AppendInput{EventType: input.eventType, ProjectID: optionalString(input.projectID), LoopID: optionalString(input.loopID), RunID: optionalString(input.runID), EntityType: optionalString(input.entityType), EntityID: optionalString(input.entityID), ActorType: optionalString("system"), ActorID: optionalString("reviewer-loop"), ActorDisplayName: optionalString("reviewer-loop"), Payload: input.payload, CreatedAt: r.now()})
 }
 
 func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) (resumedRunContext, error) {

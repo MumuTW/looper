@@ -3992,6 +3992,30 @@ func TestProcessClaimedItemRecordsCleanNoopWithoutReviewMarkerForCommentPolicy(t
 	if contains(*updatedLoop.MetadataJSON, `"lastOutputFingerprint"`) {
 		t.Fatalf("loop metadata = %s, want clean no-op excluded from output fingerprinting", *updatedLoop.MetadataJSON)
 	}
+	// The pr.review.posted event is the sole authority Gatekeeper accepts for
+	// the current-head review gate. A clean no-op publishes no structured
+	// GitHub review, so the event must carry markerVerified=false so
+	// Gatekeeper does not treat it as provenance.
+	events, err := fixture.repos.Events.ListByEntity(ctx, "pull_request", "acme/looper#42")
+	if err != nil {
+		t.Fatalf("Events.ListByEntity() error = %v", err)
+	}
+	foundReviewPosted := false
+	for _, event := range events {
+		if event.EventType != "pr.review.posted" {
+			continue
+		}
+		foundReviewPosted = true
+		if !strings.Contains(event.PayloadJSON, `"markerVerified":false`) {
+			t.Fatalf("pr.review.posted payload = %s, want markerVerified:false for clean no-op", event.PayloadJSON)
+		}
+		if !strings.Contains(event.PayloadJSON, `"event":"COMMENT"`) {
+			t.Fatalf("pr.review.posted payload = %s, want event COMMENT", event.PayloadJSON)
+		}
+	}
+	if !foundReviewPosted {
+		t.Fatalf("no pr.review.posted event in %d events, want the authority event written", len(events))
+	}
 }
 
 func TestProcessClaimedItemRejectsCleanNoopWithoutApprovedMarkerForApprovePolicy(t *testing.T) {
@@ -4063,6 +4087,25 @@ func TestProcessClaimedItemAcceptsCleanNoopWithApprovedMarkerForApprovePolicy(t 
 	}
 	if contains(*updatedLoop.MetadataJSON, `"lastOutputFingerprint"`) {
 		t.Fatalf("loop metadata = %s, want accepted clean no-op excluded from output fingerprinting", *updatedLoop.MetadataJSON)
+	}
+	// A marker-verified review must emit pr.review.posted with markerVerified
+	// true so Gatekeeper accepts it as current-head review authority.
+	events, err := fixture.repos.Events.ListByEntity(context.Background(), "pull_request", "acme/looper#42")
+	if err != nil {
+		t.Fatalf("Events.ListByEntity() error = %v", err)
+	}
+	foundReviewPosted := false
+	for _, event := range events {
+		if event.EventType != "pr.review.posted" {
+			continue
+		}
+		foundReviewPosted = true
+		if !strings.Contains(event.PayloadJSON, `"markerVerified":true`) {
+			t.Fatalf("pr.review.posted payload = %s, want markerVerified:true for marker-verified review", event.PayloadJSON)
+		}
+	}
+	if !foundReviewPosted {
+		t.Fatalf("no pr.review.posted event in %d events, want the authority event written", len(events))
 	}
 }
 
