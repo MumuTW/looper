@@ -1803,7 +1803,7 @@ func TestHandlerPullRequestRouteReturnsInternalErrorWhenLoopLookupFails(t *testi
 
 	services := fixture.runtime.Services()
 	services.Repositories = storage.NewRepositories(errorInjectingQuerier{db: services.Coordinator.DB(), queryError: func(query string) error {
-		if strings.Contains(query, "SELECT * FROM loops WHERE repo = ? COLLATE NOCASE AND pr_number = ?") {
+		if strings.Contains(query, "FROM loops WHERE repo = ? COLLATE NOCASE AND pr_number = ?") {
 			return errors.New("database is locked")
 		}
 		return nil
@@ -1927,7 +1927,7 @@ func TestHandlerPullRequestStatusReturnsInternalErrorWhenLoopLookupFails(t *test
 
 	services := fixture.runtime.Services()
 	services.Repositories = storage.NewRepositories(errorInjectingQuerier{db: services.Coordinator.DB(), queryError: func(query string) error {
-		if strings.Contains(query, "SELECT * FROM loops WHERE repo = ? COLLATE NOCASE AND pr_number = ?") {
+		if strings.Contains(query, "FROM loops WHERE repo = ? COLLATE NOCASE AND pr_number = ?") {
 			return errors.New("database is locked")
 		}
 		return nil
@@ -1977,7 +1977,7 @@ func TestHandlerPullRequestStatusReturnsInternalErrorWhenRunLookupFails(t *testi
 
 	services := fixture.runtime.Services()
 	services.Repositories = storage.NewRepositories(errorInjectingQuerier{db: services.Coordinator.DB(), queryError: func(query string) error {
-		if strings.Contains(query, "SELECT * FROM runs WHERE loop_id = ? ORDER BY started_at DESC") {
+		if strings.Contains(query, "FROM runs WHERE loop_id = ? ORDER BY started_at DESC") {
 			return errors.New("database is locked")
 		}
 		return nil
@@ -3474,6 +3474,50 @@ func TestHandlerLoopStatusMutationsReconcileQueueItems(t *testing.T) {
 	}
 	if startedQueue == nil || startedQueue.Status != "queued" || startedQueue.FinishedAt != nil || startedQueue.LastError != nil {
 		t.Fatalf("started queue = %#v, want requeued item", startedQueue)
+	}
+}
+
+// Pausing a loop whose current state cannot transition to paused is a
+// deterministic client conflict, not an internal error: the adapter must map
+// the lifecycle service's ErrInvalidLoopStatusTransition to 409 LOOP_CONFLICT
+// so callers do not retry a server fault that does not exist.
+func TestHandlerLoopPauseMapsInvalidTransitionToConflict(t *testing.T) {
+	fixture := newTestFixture(t)
+	services := fixture.runtime.Services()
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+	repo := "acme/looper"
+	prNumber := int64(42)
+	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: "/tmp/repos/looper", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	terminalStatuses := []string{"completed", "terminated", "failed", "interrupted"}
+	for i, status := range terminalStatuses {
+		loopID := "loop_pause_" + status
+		if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: int64(i + 100), ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: status, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+			t.Fatalf("Loops.Upsert(%s) error = %v", loopID, err)
+		}
+	}
+
+	h := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now.Add(time.Minute) }})
+	for _, status := range terminalStatuses {
+		loopID := "loop_pause_" + status
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/"+loopID+"/pause", nil)
+		recorder := httptest.NewRecorder()
+		h.ServeHTTP(recorder, req)
+		if recorder.Code != http.StatusConflict {
+			t.Fatalf("pause %s status = %d, want 409", status, recorder.Code)
+		}
+		body := parseJSONMap(t, recorder.Body.Bytes())
+		errorMap, ok := body["error"].(map[string]any)
+		if !ok {
+			t.Fatalf("pause %s response = %#v, want error envelope", status, body)
+		}
+		assertEqual(t, errorMap["code"], "LOOP_CONFLICT")
+		// The loop must be left in its original terminal state.
+		unchanged, err := services.Repositories.Loops.GetByID(context.Background(), loopID)
+		if err != nil || unchanged == nil || unchanged.Status != status {
+			t.Fatalf("loop %s after pause = %#v, want unchanged %s", loopID, unchanged, status)
+		}
 	}
 }
 

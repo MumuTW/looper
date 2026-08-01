@@ -389,7 +389,7 @@ func (r *NotificationsRepository) Upsert(ctx context.Context, record Notificatio
 }
 
 func (r *NotificationsRepository) GetByID(ctx context.Context, id string) (*NotificationRecord, error) {
-	row := r.q.QueryRowContext(ctx, `SELECT * FROM notifications WHERE id = ?`, id)
+	row := r.q.QueryRowContext(ctx, `SELECT `+notificationColumns+` FROM notifications WHERE id = ?`, id)
 	record, err := scanNotification(row)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -406,7 +406,7 @@ func (r *NotificationsRepository) List(ctx context.Context, limit int64) ([]Noti
 		limit = 100
 	}
 
-	rows, err := r.q.QueryContext(ctx, `SELECT * FROM notifications ORDER BY created_at DESC LIMIT ?`, limit)
+	rows, err := r.q.QueryContext(ctx, `SELECT `+notificationColumns+` FROM notifications ORDER BY created_at DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, fmt.Errorf("list notifications: %w", err)
 	}
@@ -416,7 +416,7 @@ func (r *NotificationsRepository) List(ctx context.Context, limit int64) ([]Noti
 }
 
 func (r *NotificationsRepository) GetLatestByDedupe(ctx context.Context, channel, dedupeKey string) (*NotificationRecord, error) {
-	row := r.q.QueryRowContext(ctx, `SELECT * FROM notifications WHERE channel = ? AND dedupe_key = ? ORDER BY created_at DESC LIMIT 1`, channel, dedupeKey)
+	row := r.q.QueryRowContext(ctx, `SELECT `+notificationColumns+` FROM notifications WHERE channel = ? AND dedupe_key = ? ORDER BY created_at DESC LIMIT 1`, channel, dedupeKey)
 	record, err := scanNotification(row)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -496,7 +496,7 @@ func (r *EventsRepository) List(ctx context.Context, limit int64) ([]EventLogRec
 		limit = 100
 	}
 
-	rows, err := r.q.QueryContext(ctx, `SELECT * FROM event_logs ORDER BY created_at DESC LIMIT ?`, limit)
+	rows, err := r.q.QueryContext(ctx, `SELECT `+eventLogColumns+` FROM event_logs ORDER BY created_at DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, fmt.Errorf("list event logs: %w", err)
 	}
@@ -506,7 +506,7 @@ func (r *EventsRepository) List(ctx context.Context, limit int64) ([]EventLogRec
 }
 
 func (r *EventsRepository) ListSince(ctx context.Context, sinceISO string) ([]EventLogRecord, error) {
-	rows, err := r.q.QueryContext(ctx, `SELECT * FROM event_logs WHERE created_at >= ? ORDER BY created_at DESC`, sinceISO)
+	rows, err := r.q.QueryContext(ctx, `SELECT `+eventLogColumns+` FROM event_logs WHERE created_at >= ? ORDER BY created_at DESC`, sinceISO)
 	if err != nil {
 		return nil, fmt.Errorf("list event logs since: %w", err)
 	}
@@ -516,7 +516,7 @@ func (r *EventsRepository) ListSince(ctx context.Context, sinceISO string) ([]Ev
 }
 
 func (r *EventsRepository) ListByEntity(ctx context.Context, entityType, entityID string) ([]EventLogRecord, error) {
-	rows, err := r.q.QueryContext(ctx, `SELECT * FROM event_logs WHERE entity_type = ? AND entity_id = ? ORDER BY created_at ASC`, entityType, entityID)
+	rows, err := r.q.QueryContext(ctx, `SELECT `+eventLogColumns+` FROM event_logs WHERE entity_type = ? AND entity_id = ? ORDER BY created_at ASC`, entityType, entityID)
 	if err != nil {
 		return nil, fmt.Errorf("list event logs by entity: %w", err)
 	}
@@ -538,7 +538,7 @@ func (r *EventsRepository) ListByEntityTypeAndEventTypes(ctx context.Context, en
 	for _, eventType := range eventTypes {
 		args = append(args, eventType)
 	}
-	rows, err := r.q.QueryContext(ctx, `SELECT * FROM event_logs WHERE entity_type = ? AND event_type IN (`+sqlPlaceholders(len(eventTypes))+`) ORDER BY created_at ASC, id ASC`, args...)
+	rows, err := r.q.QueryContext(ctx, `SELECT `+eventLogColumns+` FROM event_logs WHERE entity_type = ? AND event_type IN (`+sqlPlaceholders(len(eventTypes))+`) ORDER BY created_at ASC, id ASC`, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list event logs by entity type and event types: %w", err)
 	}
@@ -593,7 +593,7 @@ func (r *EventsRepository) ListFirstEventTimestampsByType(ctx context.Context, e
 }
 
 func (r *EventsRepository) ListByProjectAndEntityType(ctx context.Context, projectID, entityType string) ([]EventLogRecord, error) {
-	rows, err := r.q.QueryContext(ctx, `SELECT * FROM event_logs WHERE project_id = ? AND entity_type = ? ORDER BY created_at ASC, id ASC`, projectID, entityType)
+	rows, err := r.q.QueryContext(ctx, `SELECT `+eventLogColumns+` FROM event_logs WHERE project_id = ? AND entity_type = ? ORDER BY created_at ASC, id ASC`, projectID, entityType)
 	if err != nil {
 		return nil, fmt.Errorf("list event logs by project and entity type: %w", err)
 	}
@@ -624,7 +624,7 @@ func (r *ProjectsRepository) Upsert(ctx context.Context, record ProjectRecord) e
 }
 
 func (r *ProjectsRepository) GetByID(ctx context.Context, id string) (*ProjectRecord, error) {
-	row := r.q.QueryRowContext(ctx, `SELECT * FROM projects WHERE id = ?`, id)
+	row := r.q.QueryRowContext(ctx, `SELECT `+projectColumns+` FROM projects WHERE id = ?`, id)
 	record, err := scanProject(row)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -637,7 +637,7 @@ func (r *ProjectsRepository) GetByID(ctx context.Context, id string) (*ProjectRe
 }
 
 func (r *ProjectsRepository) List(ctx context.Context) ([]ProjectRecord, error) {
-	rows, err := r.q.QueryContext(ctx, `SELECT * FROM projects ORDER BY updated_at DESC`)
+	rows, err := r.q.QueryContext(ctx, `SELECT `+projectColumns+` FROM projects ORDER BY updated_at DESC`)
 	if err != nil {
 		return nil, fmt.Errorf("list projects: %w", err)
 	}
@@ -823,7 +823,7 @@ func (r *LoopsRepository) upsert(ctx context.Context, record LoopRecord, changeH
 }
 
 func (r *LoopsRepository) GetByID(ctx context.Context, id string) (*LoopRecord, error) {
-	row := r.q.QueryRowContext(ctx, `SELECT * FROM loops WHERE id = ?`, id)
+	row := r.q.QueryRowContext(ctx, `SELECT `+loopColumns+` FROM loops WHERE id = ?`, id)
 	record, err := scanLoop(row)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -836,7 +836,7 @@ func (r *LoopsRepository) GetByID(ctx context.Context, id string) (*LoopRecord, 
 }
 
 func (r *LoopsRepository) GetBySeq(ctx context.Context, seq int64) (*LoopRecord, error) {
-	row := r.q.QueryRowContext(ctx, `SELECT * FROM loops WHERE seq = ?`, seq)
+	row := r.q.QueryRowContext(ctx, `SELECT `+loopColumns+` FROM loops WHERE seq = ?`, seq)
 	record, err := scanLoop(row)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -888,7 +888,7 @@ func (r *LoopsRepository) List(ctx context.Context) ([]LoopRecord, error) {
 }
 
 func (r *LoopsRepository) ListFiltered(ctx context.Context, opts ListLoopsOptions) ([]LoopRecord, error) {
-	query, args := buildLoopsListQuery(`SELECT * FROM loops`, opts, true)
+	query, args := buildLoopsListQuery(`SELECT `+loopColumns+` FROM loops`, opts, true)
 	rows, err := r.q.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list loops filtered: %w", err)
@@ -942,7 +942,7 @@ func buildLoopsListQuery(base string, opts ListLoopsOptions, withOrderAndLimit b
 }
 
 func (r *LoopsRepository) ListByRepoAndPR(ctx context.Context, repo string, prNumber int64) ([]LoopRecord, error) {
-	rows, err := r.q.QueryContext(ctx, `SELECT * FROM loops WHERE repo = ? COLLATE NOCASE AND pr_number = ? ORDER BY updated_at DESC, seq DESC`, repo, prNumber)
+	rows, err := r.q.QueryContext(ctx, `SELECT `+loopColumns+` FROM loops WHERE repo = ? COLLATE NOCASE AND pr_number = ? ORDER BY updated_at DESC, seq DESC`, repo, prNumber)
 	if err != nil {
 		return nil, fmt.Errorf("list loops by repository and pull request: %w", err)
 	}
@@ -1005,7 +1005,7 @@ func (r *LoopsRepository) AssertIssueClaimAdmission(ctx context.Context, candida
 	for _, status := range statuses {
 		args = append(args, string(status))
 	}
-	rows, err := r.q.QueryContext(ctx, `SELECT * FROM loops
+	rows, err := r.q.QueryContext(ctx, `SELECT `+loopColumns+` FROM loops
 		WHERE project_id = ?
 		  AND type IN (?, ?, ?)
 		  AND status IN (`+sqlPlaceholders(len(statuses))+`)
@@ -1102,7 +1102,7 @@ func (r *LoopsRepository) sourceWorkerForPullRequest(ctx context.Context, loop L
 		}
 		return worker, nil
 	}
-	rows, err := r.q.QueryContext(ctx, `SELECT * FROM loops
+	rows, err := r.q.QueryContext(ctx, `SELECT `+loopColumns+` FROM loops
 		WHERE project_id = ? AND type = ? AND target_type = ?
 		  AND repo = ? COLLATE NOCASE AND pr_number = ?
 		ORDER BY updated_at DESC, seq DESC`, loop.ProjectID, string(domain.LoopTypeWorker), string(domain.LoopTargetTypePullRequest), repo, prNumber)
@@ -1201,7 +1201,7 @@ func (r *LoopsRepository) ListByStatuses(ctx context.Context, statuses []string)
 	for _, status := range statuses {
 		args = append(args, status)
 	}
-	rows, err := r.q.QueryContext(ctx, `SELECT * FROM loops WHERE status IN (`+sqlPlaceholders(len(statuses))+`) ORDER BY updated_at DESC, seq DESC`, args...)
+	rows, err := r.q.QueryContext(ctx, `SELECT `+loopColumns+` FROM loops WHERE status IN (`+sqlPlaceholders(len(statuses))+`) ORDER BY updated_at DESC, seq DESC`, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list loops by statuses: %w", err)
 	}
@@ -1221,7 +1221,7 @@ func (r *LoopsRepository) ListByIDs(ctx context.Context, ids []string) ([]LoopRe
 		for _, id := range chunk {
 			args = append(args, id)
 		}
-		rows, err := r.q.QueryContext(ctx, `SELECT * FROM loops WHERE id IN (`+sqlPlaceholders(len(chunk))+`) ORDER BY updated_at DESC, seq DESC`, args...)
+		rows, err := r.q.QueryContext(ctx, `SELECT `+loopColumns+` FROM loops WHERE id IN (`+sqlPlaceholders(len(chunk))+`) ORDER BY updated_at DESC, seq DESC`, args...)
 		if err != nil {
 			return nil, fmt.Errorf("list loops by ids: %w", err)
 		}
@@ -1308,8 +1308,6 @@ type LocksRepository struct {
 	q   sqliteQuerier
 	now func() time.Time
 }
-
-const agentExecutionColumns = `id, project_id, loop_id, run_id, vendor, status, pid, command_json, cwd, summary, parse_status, completion_signal, heartbeat_count, last_heartbeat_at, output_json, error_message, native_session_id, native_resume_mode, native_resume_status, native_resume_error, started_at, ended_at, metadata_json, created_at, updated_at`
 
 func (r *RunsRepository) Upsert(ctx context.Context, record RunRecord) error {
 	// agent_snapshot_json and seq are insert-only: ON CONFLICT must not overwrite
@@ -1475,7 +1473,7 @@ func (r *RunsRepository) MergeWorktreeCleanupTimestamps(ctx context.Context, id,
 }
 
 func (r *RunsRepository) GetByID(ctx context.Context, id string) (*RunRecord, error) {
-	row := r.q.QueryRowContext(ctx, `SELECT * FROM runs WHERE id = ?`, id)
+	row := r.q.QueryRowContext(ctx, `SELECT `+runColumns+` FROM runs WHERE id = ?`, id)
 	record, err := scanRun(row)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -1497,7 +1495,7 @@ func (r *RunsRepository) ListByIDs(ctx context.Context, ids []string) ([]RunReco
 		for _, id := range chunk {
 			args = append(args, id)
 		}
-		rows, err := r.q.QueryContext(ctx, `SELECT * FROM runs WHERE id IN (`+sqlPlaceholders(len(chunk))+`)`, args...)
+		rows, err := r.q.QueryContext(ctx, `SELECT `+runColumns+` FROM runs WHERE id IN (`+sqlPlaceholders(len(chunk))+`)`, args...)
 		if err != nil {
 			return nil, fmt.Errorf("list runs by ids: %w", err)
 		}
@@ -1558,7 +1556,7 @@ func (r *RunsRepository) TouchHeartbeat(ctx context.Context, id, heartbeatAtISO 
 }
 
 func (r *RunsRepository) GetLatestByLoopID(ctx context.Context, loopID string) (*RunRecord, error) {
-	row := r.q.QueryRowContext(ctx, `SELECT * FROM runs WHERE loop_id = ? ORDER BY `+latestRunOrder("runs")+` LIMIT 1`, loopID)
+	row := r.q.QueryRowContext(ctx, `SELECT `+runColumns+` FROM runs WHERE loop_id = ? ORDER BY `+latestRunOrder("runs")+` LIMIT 1`, loopID)
 	record, err := scanRun(row)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -1582,7 +1580,7 @@ func (r *RunsRepository) ListLatestByLoopIDs(ctx context.Context, loopIDs []stri
 			args = append(args, loopID)
 		}
 		rows, err := r.q.QueryContext(ctx, `
-			SELECT r.*
+			SELECT `+qualifiedColumns("r", runColumns)+`
 			FROM runs r
 			WHERE r.id IN (
 				SELECT (
@@ -1625,7 +1623,7 @@ func (r *RunsRepository) ListLatestByLoopStatusesAndResumePolicy(ctx context.Con
 	}
 	args = append(args, resumePolicy)
 	rows, err := r.q.QueryContext(ctx, `
-		SELECT r.*
+		SELECT `+qualifiedColumns("r", runColumns)+`
 		FROM runs r
 		WHERE r.id IN (
 			SELECT (
@@ -1659,7 +1657,7 @@ func (r *RunsRepository) HasRunningByLoopID(ctx context.Context, loopID string) 
 }
 
 func (r *RunsRepository) List(ctx context.Context) ([]RunRecord, error) {
-	rows, err := r.q.QueryContext(ctx, `SELECT * FROM runs ORDER BY started_at DESC`)
+	rows, err := r.q.QueryContext(ctx, `SELECT `+runColumns+` FROM runs ORDER BY started_at DESC`)
 	if err != nil {
 		return nil, fmt.Errorf("list runs: %w", err)
 	}
@@ -1692,7 +1690,7 @@ func (r *RunsRepository) CountByStatus(ctx context.Context) (map[string]int64, e
 }
 
 func (r *RunsRepository) ListSince(ctx context.Context, sinceISO string) ([]RunRecord, error) {
-	rows, err := r.q.QueryContext(ctx, `SELECT * FROM runs WHERE started_at >= ? ORDER BY started_at DESC, id DESC`, sinceISO)
+	rows, err := r.q.QueryContext(ctx, `SELECT `+runColumns+` FROM runs WHERE started_at >= ? ORDER BY started_at DESC, id DESC`, sinceISO)
 	if err != nil {
 		return nil, fmt.Errorf("list runs since: %w", err)
 	}
@@ -1702,7 +1700,7 @@ func (r *RunsRepository) ListSince(ctx context.Context, sinceISO string) ([]RunR
 }
 
 func (r *RunsRepository) ListByStatus(ctx context.Context, status string) ([]RunRecord, error) {
-	rows, err := r.q.QueryContext(ctx, `SELECT * FROM runs WHERE status = ? ORDER BY started_at DESC, id DESC`, status)
+	rows, err := r.q.QueryContext(ctx, `SELECT `+runColumns+` FROM runs WHERE status = ? ORDER BY started_at DESC, id DESC`, status)
 	if err != nil {
 		return nil, fmt.Errorf("list runs by status: %w", err)
 	}
@@ -1712,7 +1710,7 @@ func (r *RunsRepository) ListByStatus(ctx context.Context, status string) ([]Run
 }
 
 func (r *RunsRepository) ListByLoop(ctx context.Context, loopID string) ([]RunRecord, error) {
-	rows, err := r.q.QueryContext(ctx, `SELECT * FROM runs WHERE loop_id = ? ORDER BY started_at DESC`, loopID)
+	rows, err := r.q.QueryContext(ctx, `SELECT `+runColumns+` FROM runs WHERE loop_id = ? ORDER BY started_at DESC`, loopID)
 	if err != nil {
 		return nil, fmt.Errorf("list runs by loop: %w", err)
 	}
@@ -1893,7 +1891,7 @@ func (r *PullRequestSnapshotsRepository) Upsert(ctx context.Context, record Pull
 }
 
 func (r *PullRequestSnapshotsRepository) List(ctx context.Context) ([]PullRequestSnapshotRecord, error) {
-	rows, err := r.q.QueryContext(ctx, `SELECT * FROM pull_request_snapshots ORDER BY captured_at DESC, created_at DESC`)
+	rows, err := r.q.QueryContext(ctx, `SELECT `+pullRequestSnapshotColumns+` FROM pull_request_snapshots ORDER BY captured_at DESC, created_at DESC`)
 	if err != nil {
 		return nil, fmt.Errorf("list pull request snapshots: %w", err)
 	}
@@ -1912,7 +1910,7 @@ func (r *PullRequestSnapshotsRepository) ListLatestByRepoAndPR(ctx context.Conte
 			FROM pull_request_snapshots
 			WHERE repo = ? COLLATE NOCASE AND pr_number = ?
 		)
-		SELECT snapshots.*
+		SELECT `+qualifiedColumns("snapshots", pullRequestSnapshotColumns)+`
 		FROM pull_request_snapshots snapshots
 		JOIN ranked ON ranked.id = snapshots.id
 		WHERE ranked.row_number = 1
@@ -1944,7 +1942,7 @@ func (r *PullRequestSnapshotsRepository) GetLatest(ctx context.Context, repo str
 }
 
 func (r *PullRequestSnapshotsRepository) GetLatestByProject(ctx context.Context, projectID, repo string, prNumber int64) (*PullRequestSnapshotRecord, error) {
-	row := r.q.QueryRowContext(ctx, `SELECT * FROM pull_request_snapshots WHERE project_id = ? AND repo = ? COLLATE NOCASE AND pr_number = ? ORDER BY captured_at DESC, created_at DESC LIMIT 1`, projectID, repo, prNumber)
+	row := r.q.QueryRowContext(ctx, `SELECT `+pullRequestSnapshotColumns+` FROM pull_request_snapshots WHERE project_id = ? AND repo = ? COLLATE NOCASE AND pr_number = ? ORDER BY captured_at DESC, created_at DESC LIMIT 1`, projectID, repo, prNumber)
 	record, err := scanPullRequestSnapshot(row)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -2029,7 +2027,7 @@ func (r *LocksRepository) Release(ctx context.Context, key string) error {
 }
 
 func (r *LocksRepository) Get(ctx context.Context, key string) (*LockRecord, error) {
-	row := r.q.QueryRowContext(ctx, `SELECT * FROM locks WHERE key = ?`, key)
+	row := r.q.QueryRowContext(ctx, `SELECT `+lockColumns+` FROM locks WHERE key = ?`, key)
 	record, err := scanLock(row)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -2060,7 +2058,7 @@ func (r *LocksRepository) Refresh(ctx context.Context, record LockRecord) (bool,
 }
 
 func (r *LocksRepository) ListExpired(ctx context.Context, nowISO string) ([]LockRecord, error) {
-	rows, err := r.q.QueryContext(ctx, `SELECT * FROM locks WHERE expires_at <= ? ORDER BY expires_at ASC`, nowISO)
+	rows, err := r.q.QueryContext(ctx, `SELECT `+lockColumns+` FROM locks WHERE expires_at <= ? ORDER BY expires_at ASC`, nowISO)
 	if err != nil {
 		return nil, fmt.Errorf("list expired locks: %w", err)
 	}
@@ -2162,7 +2160,7 @@ func (r *QueueRepository) Upsert(ctx context.Context, record QueueItemRecord) er
 }
 
 func (r *QueueRepository) GetByID(ctx context.Context, id string) (*QueueItemRecord, error) {
-	row := r.q.QueryRowContext(ctx, `SELECT * FROM queue_items WHERE id = ?`, id)
+	row := r.q.QueryRowContext(ctx, `SELECT `+queueItemColumns+` FROM queue_items WHERE id = ?`, id)
 	record, err := scanQueueItem(row)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -2176,7 +2174,7 @@ func (r *QueueRepository) GetByID(ctx context.Context, id string) (*QueueItemRec
 
 func (r *QueueRepository) GetLatestByLoopID(ctx context.Context, loopID string) (*QueueItemRecord, error) {
 	row := r.q.QueryRowContext(ctx, `
-		SELECT * FROM queue_items
+		SELECT `+queueItemColumns+` FROM queue_items
 		WHERE loop_id = ?
 		ORDER BY updated_at DESC, created_at DESC, id DESC
 		LIMIT 1
@@ -2213,7 +2211,7 @@ func (r *QueueRepository) ListLatestByLoopIDs(ctx context.Context, loopIDs []str
 				created_at, updated_at
 			FROM (
 				SELECT
-					queue_items.*,
+					`+queueItemColumns+`,
 					ROW_NUMBER() OVER (
 						PARTITION BY loop_id
 						ORDER BY updated_at DESC, created_at DESC, id DESC
@@ -2241,7 +2239,7 @@ func (r *QueueRepository) ListLatestByLoopIDs(ctx context.Context, loopIDs []str
 }
 
 func (r *QueueRepository) List(ctx context.Context) ([]QueueItemRecord, error) {
-	rows, err := r.q.QueryContext(ctx, `SELECT * FROM queue_items ORDER BY created_at DESC`)
+	rows, err := r.q.QueryContext(ctx, `SELECT `+queueItemColumns+` FROM queue_items ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, fmt.Errorf("list queue items: %w", err)
 	}
@@ -2258,7 +2256,7 @@ func (r *QueueRepository) ListByStatuses(ctx context.Context, statuses []string)
 	for _, status := range statuses {
 		args = append(args, status)
 	}
-	rows, err := r.q.QueryContext(ctx, `SELECT * FROM queue_items WHERE status IN (`+sqlPlaceholders(len(statuses))+`) ORDER BY created_at DESC, id DESC`, args...)
+	rows, err := r.q.QueryContext(ctx, `SELECT `+queueItemColumns+` FROM queue_items WHERE status IN (`+sqlPlaceholders(len(statuses))+`) ORDER BY created_at DESC, id DESC`, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list queue items by statuses: %w", err)
 	}
@@ -2283,7 +2281,7 @@ func (r *QueueRepository) ListLatestByLoopStatuses(ctx context.Context, statuses
 			created_at, updated_at
 		FROM (
 			SELECT
-				queue_items.*,
+				`+queueItemColumns+`,
 				ROW_NUMBER() OVER (
 					PARTITION BY loop_id
 					ORDER BY updated_at DESC, created_at DESC, id DESC
@@ -2331,7 +2329,7 @@ func (r *QueueRepository) ListQueued(ctx context.Context, limit int64) ([]QueueI
 	}
 
 	rows, err := r.q.QueryContext(ctx, `
-		SELECT *
+		SELECT `+queueItemColumns+`
 		FROM queue_items
 		WHERE status = 'queued'
 		ORDER BY priority ASC, available_at ASC, created_at ASC
@@ -2374,7 +2372,7 @@ func (r *QueueRepository) CountByLoopIDAndStatus(ctx context.Context, loopID, st
 
 func (r *QueueRepository) FindActiveByDedupe(ctx context.Context, dedupeKey string) (*QueueItemRecord, error) {
 	row := r.q.QueryRowContext(ctx, `
-		SELECT * FROM queue_items
+		SELECT `+queueItemColumns+` FROM queue_items
 		WHERE dedupe_key = ? AND status IN ('queued', 'running')
 		ORDER BY created_at DESC
 		LIMIT 1
@@ -2392,7 +2390,7 @@ func (r *QueueRepository) FindActiveByDedupe(ctx context.Context, dedupeKey stri
 
 func (r *QueueRepository) FindActiveByLoopID(ctx context.Context, loopID string) (*QueueItemRecord, error) {
 	row := r.q.QueryRowContext(ctx, `
-		SELECT * FROM queue_items
+		SELECT `+queueItemColumns+` FROM queue_items
 		WHERE loop_id = ? AND status IN ('queued', 'running')
 		ORDER BY created_at DESC
 		LIMIT 1
@@ -2696,7 +2694,7 @@ func (r *QueueRepository) claimNextMatching(ctx context.Context, nowISO, claimed
 			updated_at = ?
 		WHERE id = (SELECT id FROM candidate)
 			AND status = 'queued'
-		RETURNING *
+		RETURNING `+queueItemColumns+`
 	`, append([]any{nowISO}, append(extraArgs, claimedBy, nowISO, nowISO, nowISO)...)...)
 
 	record, err := scanQueueItem(row)
@@ -2731,7 +2729,7 @@ func (r *QueueRepository) ClaimNextOfType(ctx context.Context, nowISO, claimedBy
 			updated_at = ?
 		WHERE id = (SELECT id FROM candidate)
 			AND status = 'queued'
-		RETURNING *
+		RETURNING `+queueItemColumns+`
 	`, nowISO, queueType, claimedBy, nowISO, nowISO, nowISO)
 
 	record, err := scanQueueItem(row)
@@ -2754,7 +2752,7 @@ func (r *QueueRepository) ListRunningClaimedBy(ctx context.Context, claimedBy, c
 		return []QueueItemRecord{}, nil
 	}
 	rows, err := r.q.QueryContext(ctx, `
-		SELECT * FROM queue_items
+		SELECT `+queueItemColumns+` FROM queue_items
 		WHERE status = 'running'
 			AND claimed_by = ?
 			AND claimed_at = ?
@@ -3290,7 +3288,7 @@ func (r *WorktreesRepository) RetireByProject(ctx context.Context, projectID, up
 }
 
 func (r *WorktreesRepository) GetByID(ctx context.Context, id string) (*WorktreeRecord, error) {
-	row := r.q.QueryRowContext(ctx, `SELECT * FROM worktrees WHERE id = ?`, id)
+	row := r.q.QueryRowContext(ctx, `SELECT `+worktreeColumns+` FROM worktrees WHERE id = ?`, id)
 	record, err := scanWorktree(row)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -3303,7 +3301,7 @@ func (r *WorktreesRepository) GetByID(ctx context.Context, id string) (*Worktree
 }
 
 func (r *WorktreesRepository) GetByBranch(ctx context.Context, projectID, branch string) (*WorktreeRecord, error) {
-	row := r.q.QueryRowContext(ctx, `SELECT * FROM worktrees WHERE project_id = ? AND branch = ? LIMIT 1`, projectID, branch)
+	row := r.q.QueryRowContext(ctx, `SELECT `+worktreeColumns+` FROM worktrees WHERE project_id = ? AND branch = ? LIMIT 1`, projectID, branch)
 	record, err := scanWorktree(row)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -3317,10 +3315,10 @@ func (r *WorktreesRepository) GetByBranch(ctx context.Context, projectID, branch
 
 func (r *WorktreesRepository) GetByPath(ctx context.Context, worktreePath string) (*WorktreeRecord, error) {
 	paths := equivalentWorktreePaths(worktreePath)
-	query := `SELECT * FROM worktrees WHERE worktree_path = ? LIMIT 1`
+	query := `SELECT ` + worktreeColumns + ` FROM worktrees WHERE worktree_path = ? LIMIT 1`
 	args := []any{paths[0]}
 	if len(paths) == 2 {
-		query = `SELECT * FROM worktrees WHERE worktree_path IN (?, ?) LIMIT 1`
+		query = `SELECT ` + worktreeColumns + ` FROM worktrees WHERE worktree_path IN (?, ?) LIMIT 1`
 		args = []any{paths[0], paths[1]}
 	}
 	row := r.q.QueryRowContext(ctx, query, args...)
@@ -3348,7 +3346,7 @@ func equivalentWorktreePaths(path string) []string {
 }
 
 func (r *WorktreesRepository) ListByProject(ctx context.Context, projectID string) ([]WorktreeRecord, error) {
-	rows, err := r.q.QueryContext(ctx, `SELECT * FROM worktrees WHERE project_id = ? ORDER BY updated_at DESC`, projectID)
+	rows, err := r.q.QueryContext(ctx, `SELECT `+worktreeColumns+` FROM worktrees WHERE project_id = ? ORDER BY updated_at DESC`, projectID)
 	if err != nil {
 		return nil, fmt.Errorf("list worktrees by project: %w", err)
 	}
@@ -3362,7 +3360,7 @@ func (r *WorktreesRepository) ListCleanupCandidates(ctx context.Context, limit i
 		limit = 10
 	}
 	rows, err := r.q.QueryContext(ctx, `
-		SELECT *
+		SELECT `+worktreeColumns+`
 		FROM worktrees
 		WHERE status NOT IN ('cleaned', 'retired')
 		ORDER BY updated_at ASC
@@ -3377,7 +3375,7 @@ func (r *WorktreesRepository) ListCleanupCandidates(ctx context.Context, limit i
 }
 
 func (r *WorktreesRepository) ListActive(ctx context.Context) ([]WorktreeRecord, error) {
-	rows, err := r.q.QueryContext(ctx, `SELECT * FROM worktrees WHERE cleaned_at IS NULL AND status != 'retired' ORDER BY updated_at ASC, created_at ASC`)
+	rows, err := r.q.QueryContext(ctx, `SELECT `+worktreeColumns+` FROM worktrees WHERE cleaned_at IS NULL AND status != 'retired' ORDER BY updated_at ASC, created_at ASC`)
 	if err != nil {
 		return nil, fmt.Errorf("list active worktrees: %w", err)
 	}
@@ -3496,8 +3494,8 @@ const humanHoldClaimPredicate = `NOT EXISTS (
 				)
 		)`
 
-const scheduledQueueBaseQuery = `
-	SELECT qi.*
+var scheduledQueueBaseQuery = `
+	SELECT ` + qualifiedColumns("qi", queueItemColumns) + `
 	FROM queue_items qi
 	LEFT JOIN loops l ON l.id = qi.loop_id
 	LEFT JOIN projects p ON p.id = qi.project_id
@@ -3541,7 +3539,7 @@ const scheduledQueueOrderBy = `
 const longTermRetryPredicateLiteral = `qi.attempts >= 5 AND COALESCE(qi.last_error_kind, '') IN ('retryable_transient', 'retryable_after_resume', 'non_retryable')`
 const longTermRetryPredicateParam = `qi.attempts >= ? AND COALESCE(qi.last_error_kind, '') IN ('retryable_transient', 'retryable_after_resume', 'non_retryable')`
 
-const scheduledQueueQuery = scheduledQueueBaseQuery + scheduledQueueOrderBy
+var scheduledQueueQuery = scheduledQueueBaseQuery + scheduledQueueOrderBy
 
 const staleQueuedIDsQuery = `
 	SELECT qi.id
