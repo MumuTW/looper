@@ -403,7 +403,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 				}
 			}
 		}
-		if reused, ok := skipUnchanged(previous, hasPrevious, fingerprint, r.now(), convergenceRevisions[entityID], reviewEvidenceRefreshRequired); ok {
+		if reused, ok := skipUnchanged(previous, hasPrevious, fingerprint, r.trustFor(input.ProjectID), r.now(), convergenceRevisions[entityID], reviewEvidenceRefreshRequired); ok {
 			result.Skipped++
 			result.Reports = append(result.Reports, reused)
 			continue

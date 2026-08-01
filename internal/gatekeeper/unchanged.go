@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/MumuTW/looper/internal/config"
 	githubinfra "github.com/MumuTW/looper/internal/infra/github"
 	"github.com/MumuTW/looper/internal/storage"
 )
@@ -185,7 +186,8 @@ func latestGateReports(ctx context.Context, repos *storage.Repositories, project
 // it recorded a fingerprint, the fingerprint still matches, the gate is not
 // waiting on check or convergence state, the convergence blocker (if any) has
 // not advanced, the gate is not waiting on a review event that has since
-// appeared, and the report is younger than maxSkipAge.
+// appeared, the report is younger than maxSkipAge, and — at auto trust — the
+// report does not carry a failed required check.
 //
 // currentConvergenceRevision is the newest persisted convergence revision for
 // this pull request, read locally by the discovery lane. A blocked convergence
@@ -200,7 +202,7 @@ func latestGateReports(ctx context.Context, repos *storage.Repositories, project
 // same conclusion without the event and would pay forge round trips every tick;
 // when evidence appears — or the lookup fails — it is re-evaluated so a stale
 // success is never reused while the evidence source is uncertain.
-func skipUnchanged(previous Report, hasPrevious bool, fingerprint string, now time.Time, currentConvergenceRevision string, reviewEvidenceRefreshRequired bool) (Report, bool) {
+func skipUnchanged(previous Report, hasPrevious bool, fingerprint string, trust config.GatekeeperTrustLevel, now time.Time, currentConvergenceRevision string, reviewEvidenceRefreshRequired bool) (Report, bool) {
 	if !hasPrevious || strings.TrimSpace(previous.SourceFingerprint) == "" {
 		return Report{}, false
 	}
@@ -223,6 +225,14 @@ func skipUnchanged(previous Report, hasPrevious bool, fingerprint string, now ti
 	if reviewEvidenceRefreshRequired {
 		return Report{}, false
 	}
+	// At auto trust the merge route is applied only during an evaluation. A
+	// failed check that is manually rerun to success turns the gate green
+	// without moving any field the list page can observe, so reusing the
+	// failed report would leave a now-eligible PR unqueued until maxSkipAge.
+	// Re-evaluate instead so the route is published promptly.
+	if trust == config.GatekeeperTrustAuto && reportHasFailedCheck(previous) {
+		return Report{}, false
+	}
 	evaluatedAt, err := time.Parse(time.RFC3339Nano, previous.EvaluatedAt)
 	if err != nil {
 		return Report{}, false
@@ -233,6 +243,7 @@ func skipUnchanged(previous Report, hasPrevious bool, fingerprint string, now ti
 	return previous, true
 }
 
+
 // previousConvergenceRevision is the convergence revision recorded on a prior
 // gate report. An empty result means the report carried no convergence evidence
 // (and therefore no convergence blocker), so it cannot match a non-empty live
@@ -242,4 +253,13 @@ func previousConvergenceRevision(report Report) string {
 		return ""
 	}
 	return convergenceRevision(*report.Evidence.ReviewerConvergence)
+}
+
+func reportHasFailedCheck(report Report) bool {
+	for _, reason := range report.Reasons {
+		if reason.Code == ReasonCheckFailed {
+			return true
+		}
+	}
+	return false
 }
