@@ -346,6 +346,7 @@ type fakeGatekeeperGitHub struct {
 	// beforeView, when set, runs before each pull-request read, so a test can
 	// change forge state between the primary and confirming evaluations.
 	beforeView    func(*fakeGatekeeperGitHub)
+	beforeThreads func(*fakeGatekeeperGitHub)
 	listCalls     int
 	loginCalls    int
 	comments      []githubinfra.CommentInfo
@@ -420,6 +421,9 @@ func (f *fakeGatekeeperGitHub) ListPullRequestCheckRuns(context.Context, githubi
 }
 func (f *fakeGatekeeperGitHub) ListReviewThreads(context.Context, githubinfra.ListReviewThreadsInput) ([]githubinfra.ReviewThread, error) {
 	f.perPullRequestCalls++
+	if f.beforeThreads != nil {
+		f.beforeThreads(f)
+	}
 	return f.threads, nil
 }
 func (f *fakeGatekeeperGitHub) GetPullRequestHeadSHA(context.Context, githubinfra.ViewPullRequestInput) (string, error) {
