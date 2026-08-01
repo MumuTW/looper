@@ -27,13 +27,25 @@ const (
 )
 
 // Available verifies that the pinned runtime and its pre-sandbox support
-// executables are installed outside caller-writable storage.
+// executables are installed outside caller-writable storage, relative to the
+// current working directory of this process.
 func Available() error {
 	cwd, err := os.Getwd()
 	if err != nil {
 		return fmt.Errorf("process sandbox: resolve current directory: %w", err)
 	}
-	_, err = installedRuntime(cwd)
+	return AvailableInDirectory(cwd)
+}
+
+// AvailableInDirectory is Available evaluated against cwd. Supervised daemons
+// start in daemon.workingDirectory; preflight/--check-config must use that
+// directory so sandbox trust matches real startup rather than the operator shell.
+func AvailableInDirectory(cwd string) error {
+	cwd = strings.TrimSpace(cwd)
+	if cwd == "" {
+		return fmt.Errorf("process sandbox: working directory is required")
+	}
+	_, err := installedRuntime(cwd)
 	return err
 }
 

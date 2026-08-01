@@ -49,6 +49,41 @@ func TestCreateBundlesOneSnapshotWithManifestedInputs(t *testing.T) {
 	}
 }
 
+func TestCreatePinsConfigContentsAcrossSnapshotWindow(t *testing.T) {
+	// Regression for the backup race: validated bytes must be what lands in the
+	// bundle even if ConfigPath is rewritten while Snapshot runs.
+	root := t.TempDir()
+	configPath := writeBundleFile(t, root, "config.toml", "revision-checked\n")
+	cli := writeBundleFile(t, root, "looper-bin", "cli")
+	daemon := writeBundleFile(t, root, "looperd-bin", "daemon")
+	pinned := []byte("revision-checked\n")
+	result, err := Create(context.Background(), Input{
+		RootDir:          filepath.Join(root, "backups"),
+		ConfigPath:       configPath,
+		ConfigContents:   pinned,
+		DatabasePath:     filepath.Join(root, "looper.sqlite"),
+		CLIBinaryPath:    cli,
+		DaemonBinaryPath: daemon,
+		Now:              func() time.Time { return time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC) },
+		Snapshot: func(context.Context) (string, error) {
+			if err := os.WriteFile(configPath, []byte("mutated-after-check\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			return writeBundleFile(t, root, "snapshot.sqlite", "sqlite"), nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(filepath.Join(result.Directory, "config.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(pinned) {
+		t.Fatalf("bundle config = %q, want pinned %q (not on-disk mutation)", got, pinned)
+	}
+}
+
 func TestCreateRemovesPartialBundleOnCopyFailure(t *testing.T) {
 	root := t.TempDir()
 	snapshot := writeBundleFile(t, root, "snapshot.sqlite", "sqlite")

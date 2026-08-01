@@ -239,25 +239,42 @@ pointer exists, so `activate-release` switches the next supervised start
 without rewriting unit files. Activation returns `serviceExecutable` with that
 path; restart the supervised unit after activate so the new image is loaded.
 
+Also point `tools.looperPath` at `release-root/current/looper` as part of
+cutover (and restore the prior value on rollback). Agents publish reviews
+through that path; leaving it on a pre-cutover binary breaks the paired release.
+
 
 ### Rollback restore
 
-When post-start verification fails, restore the matching pre-cutover config and SQLite snapshot from a v2 backup bundle (fail-closed if targets are still open):
+When post-start verification fails, **stop the candidate daemon first** (it still
+holds SQLite open). Then restore the matching pre-cutover config and SQLite
+snapshot from a v2 backup bundle (fail-closed if targets are still open):
 
 ```bash
+# stop supervised looperd (launchctl unload / systemctl --user stop looperd)
 looper upgrade restore-preflight --bundle <directory>
 looper upgrade restore --bundle <directory> --confirm
 ```
 
 Supported sequence:
 
-1. `preflight` (read-only compatibility)
-2. **Stage the current live pair into `release-root` first** (so rollback has a prior release id to re-activate). On a brand-new release root this is mandatory before any candidate cutover: `stage-release` with the running CLI/daemon, then keep that release id as `previous`.
-3. `backup` (matching config + SQLite + binary evidence)
-4. `drain` (and optional final `backup` while drained)
-5. `stage-release` the **candidate** pair
-6. `activate-release` (switches `current` only — does not restart the process)
-7. **Restart the supervised daemon** so it loads `release-root/current/looperd` (e.g. unload/load launchd or `systemctl --user restart looperd`)
-8. `verify-start`
+1. `preflight` (read-only compatibility; sandbox probe uses `daemon.workingDirectory`)
+2. **Stage the current live pair** into `release-root` (`stage-release` with the running CLI/daemon). Keep that release id as `previous`.
+3. **`activate-release` the prior (live) release** so `current` exists, then **reinstall/update the service** so the unit launches `release-root/current/looperd` (not a concrete old path). Set `tools.looperPath` to `release-root/current/looper` and restart once to confirm the service follows `current`.
+4. `backup` (matching config + SQLite + binary evidence)
+5. `drain` (and optional final `backup` while drained)
+6. `stage-release` the **candidate** pair
+7. `activate-release` the candidate (switches `current` only — does not restart)
+8. Point `tools.looperPath` at `release-root/current/looper` if not already
+9. **Restart the supervised daemon** so it loads `current/looperd`
+10. `verify-start`
 
-On failure after restart: `restore-preflight` → `restore` (config + SQLite only), then `activate-release` the **prior** release id and restart again. Backup-copied binaries are evidence, not an executable release; binary rollback is always via a previously staged release under the same `release-root`.
+On failure after restart:
+
+1. **Stop** the candidate daemon (required — restore fails closed while SQLite is open)
+2. `restore-preflight` → `restore` (config + SQLite only)
+3. `activate-release` the **prior** release id
+4. Restore prior `tools.looperPath` if you changed it
+5. Restart the supervised daemon again
+
+Backup-copied binaries are evidence, not an executable release; binary rollback is always via a previously staged release under the same `release-root`.

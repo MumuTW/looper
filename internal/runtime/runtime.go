@@ -218,7 +218,13 @@ type Runtime struct {
 	worktreeCleanupStatus       WorktreeCleanupStatus
 	// workProducerJoinActive is set while BeginDrain's background join is
 	// stopping scheduler/recovery/cleanup/project-discovery producers.
-	workProducerJoinActive   atomic.Bool
+	workProducerJoinActive atomic.Bool
+	// workProducerJoinDone is closed when the drain join goroutine finishes
+	// stop* and registers residual done-channels. Stop waits on this first.
+	workProducerJoinDone chan struct{}
+	// drainResidualDones holds producer done-channels still open after a
+	// bounded stop* timeout so DrainSnapshot keeps WorkProducersActive>0.
+	drainResidualDones       []<-chan struct{}
 	projectDiscovery         *projectDiscoveryRunner
 	resumeProjectDiscoveries func(context.Context, *projects.Service) error
 	recoveryCancel           context.CancelFunc
@@ -434,6 +440,11 @@ func (r *Runtime) Stop(reason string) {
 		if r.logger != nil {
 			r.logger.Info("looperd runtime stopping", map[string]any{"reason": reason})
 		}
+
+		// If BeginDrain already started a background producer join, wait for it
+		// before we stop again or close storage. Concurrent stop* on the same
+		// loops would race, and closing SQLite under a join-owned wait is unsafe.
+		r.waitForDrainProducerJoin()
 
 		// Close admission and cancel work-producing contexts before draining
 		// producers (ADR-0015 shutdown order). Use BeginShutdown so direct
@@ -652,7 +663,8 @@ func (r *Runtime) AdmissionState() AdmissionState {
 // processes. Scheduler/recovery/cleanup/project-discovery producers are
 // stopped and joined in the background so DrainSnapshot stays non-empty until
 // they can no longer mutate storage; agents and tracked non-agent shells remain
-// owned by DrainSnapshot until they exit.
+// owned by DrainSnapshot until they exit. Accepted webhook deliveries keep
+// running (no CancelExecute) but count toward WorkProducersActive via Queued/InFlight.
 func (r *Runtime) BeginDrain(reason string) error {
 	if r == nil || r.admission == nil {
 		return ErrAdmissionNotReady
@@ -663,30 +675,109 @@ func (r *Runtime) BeginDrain(reason string) error {
 	// Join once: idempotent re-POST during drain must not start a second stop
 	// pass while the first is still waiting on producer done channels.
 	if r.workProducerJoinActive.CompareAndSwap(false, true) {
+		r.mu.Lock()
+		r.workProducerJoinDone = make(chan struct{})
+		r.mu.Unlock()
 		go r.joinWorkProducersForDrain()
 	}
 	return nil
 }
 
 // joinWorkProducersForDrain stops the same producer set sticky degrade cancels,
-// then waits for each loop to exit. DrainSnapshot reports WorkProducersActive
-// until this returns so cutover cannot race in-flight discovery/ticks.
+// then waits for each loop to exit. Timed-out producers remain visible via
+// drainResidualDones so DrainSnapshot does not report drained early.
 func (r *Runtime) joinWorkProducersForDrain() {
-	defer r.workProducerJoinActive.Store(false)
 	if r == nil {
 		return
 	}
+	// Snapshot done channels before stop* nils the runtime fields, so a
+	// shutdownTimeout still leaves residual producers countable.
+	r.mu.RLock()
+	residual := make([]<-chan struct{}, 0, 3)
+	for _, done := range []<-chan struct{}{r.schedulerDone, r.recoveryDone, r.worktreeCleanupDone} {
+		if done != nil {
+			residual = append(residual, done)
+		}
+	}
+	r.mu.RUnlock()
+
 	// stop* helpers cancel contexts, close stop channels, and wait (bounded by
 	// shutdownTimeout) so in-flight producer work is joined, not only canceled.
 	r.stopSchedulerLoop()
 	r.stopDeferredReviewerRecovery()
 	r.stopWorktreeCleanupLoop()
 	r.stopProjectDiscovery()
+
+	stillOpen := make([]<-chan struct{}, 0, len(residual))
+	for _, done := range residual {
+		if channelStillOpen(done) {
+			stillOpen = append(stillOpen, done)
+		}
+	}
+	r.mu.Lock()
+	r.drainResidualDones = stillOpen
+	joinDone := r.workProducerJoinDone
+	r.mu.Unlock()
+	r.workProducerJoinActive.Store(false)
+	if joinDone != nil {
+		close(joinDone)
+	}
+	// Keep watching residual producers so WorkProducersActive clears when they exit.
+	for _, done := range stillOpen {
+		go r.watchResidualProducerDone(done)
+	}
+}
+
+func (r *Runtime) watchResidualProducerDone(done <-chan struct{}) {
+	if r == nil || done == nil {
+		return
+	}
+	<-done
+	r.mu.Lock()
+	next := r.drainResidualDones[:0]
+	for _, ch := range r.drainResidualDones {
+		if ch != done && channelStillOpen(ch) {
+			next = append(next, ch)
+		}
+	}
+	r.drainResidualDones = next
+	r.mu.Unlock()
+}
+
+func (r *Runtime) waitForDrainProducerJoin() {
+	if r == nil {
+		return
+	}
+	r.mu.RLock()
+	joinDone := r.workProducerJoinDone
+	active := r.workProducerJoinActive.Load()
+	r.mu.RUnlock()
+	if joinDone == nil && !active {
+		return
+	}
+	if joinDone != nil {
+		<-joinDone
+	}
+	// Join finished registering residuals; wait a bounded time for residuals
+	// that stop* already timed out on, without blocking forever.
+	deadline := time.Now().Add(r.shutdownTimeout)
+	if r.shutdownTimeout <= 0 {
+		deadline = time.Now().Add(20 * time.Second)
+	}
+	for time.Now().Before(deadline) {
+		r.mu.RLock()
+		n := len(r.drainResidualDones)
+		r.mu.RUnlock()
+		if n == 0 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }
 
 // DrainSnapshot reports Supervisor-owned work still in flight after BeginDrain.
 // It includes work producers still being joined so cutover cannot proceed while
-// discovery/scheduler/recovery still mutate storage.
+// discovery/scheduler/recovery/accepted-webhook work still mutate storage.
 func (r *Runtime) DrainSnapshot() DrainSnapshot {
 	if r == nil {
 		return DrainSnapshot{}
@@ -707,15 +798,34 @@ func (r *Runtime) countActiveWorkProducers() int {
 	if r.workProducerJoinActive.Load() {
 		active++
 	}
-	// Discovery can still be mid-flight for a brief window before
-	// stopProjectDiscovery runs on the join goroutine.
 	r.mu.RLock()
+	active += len(r.drainResidualDones)
 	discovery := r.projectDiscovery
+	forwarder := r.webhookForwarder
 	r.mu.RUnlock()
 	if discovery != nil && discovery.Busy() {
 		active++
 	}
+	// Accepted webhook deliveries deliberately keep running after drain; count
+	// their outstanding work so final backup cannot race their storage writes.
+	if forwarder != nil {
+		stats := forwarder.Stats()
+		active += stats.Queued + stats.InFlight
+	}
 	return active
+}
+
+// channelStillOpen reports whether a done channel has not yet been closed.
+func channelStillOpen(done <-chan struct{}) bool {
+	if done == nil {
+		return false
+	}
+	select {
+	case <-done:
+		return false
+	default:
+		return true
+	}
 }
 
 // WaitForDrain blocks until DrainSnapshot reports no in-flight work or ctx ends.

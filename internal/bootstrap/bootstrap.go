@@ -230,10 +230,23 @@ func ValidateConfiguredToolPaths(cfg config.Config, detection map[string]config.
 
 // ValidateSandboxRuntime is the read-only sandbox readiness check shared by
 // Bootstrap and looperd --check-config. check defaults to the process sandbox
-// Available probe when nil.
+// Available probe when nil. Prefer ValidateSandboxRuntimeForConfig when the
+// daemon working directory is known so the probe matches service startup.
 func ValidateSandboxRuntime(cfg config.Config, check func() error) error {
 	if check == nil {
 		check = processsandbox.Available
+	}
+	return validateSandboxRuntime(cfg, check)
+}
+
+// ValidateSandboxRuntimeForConfig runs the sandbox readiness check in the
+// configured daemon working directory (service environment), falling back to
+// the process cwd only when workingDirectory is unset.
+func ValidateSandboxRuntimeForConfig(cfg config.Config) error {
+	cwd := strings.TrimSpace(cfg.Daemon.WorkingDirectory)
+	check := processsandbox.Available
+	if cwd != "" {
+		check = func() error { return processsandbox.AvailableInDirectory(cwd) }
 	}
 	return validateSandboxRuntime(cfg, check)
 }

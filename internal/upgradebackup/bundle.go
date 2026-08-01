@@ -109,10 +109,9 @@ func Create(ctx context.Context, input Input) (Result, error) {
 			return Result{}, err
 		}
 	} else {
-		// Materialized-from-defaults: no durable source path; restore must
-		// still refuse to invent one. Operators using no-file configs cannot
-		// auto-restore config placement from the bundle alone.
-		configPath = ""
+		// ConfigContents without a restore destination cannot produce a usable
+		// v2 Source.ConfigPath; refuse rather than writing a pathless bundle.
+		return Result{}, fmt.Errorf("config path is required when recording restore source metadata")
 	}
 	databasePath, err := absoluteFilesystemDatabasePath(input.DatabasePath)
 	if err != nil {

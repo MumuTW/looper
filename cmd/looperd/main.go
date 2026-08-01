@@ -1322,7 +1322,9 @@ func runConfigCheck(args []string, stdout, stderr io.Writer, deps runDeps) int {
 	if err := bootstrap.ValidateConfiguredToolPaths(loaded.Config, loaded.Metadata.ToolDetection); err != nil {
 		return writeConfigCheckError(stderr, err)
 	}
-	if err := bootstrap.ValidateSandboxRuntime(loaded.Config, nil); err != nil {
+	// Probe sandbox readiness in daemon.workingDirectory so preflight matches
+	// the supervised service environment rather than the operator shell cwd.
+	if err := bootstrap.ValidateSandboxRuntimeForConfig(loaded.Config); err != nil {
 		return writeConfigCheckError(stderr, err)
 	}
 	_, _ = fmt.Fprintln(stdout, "configuration is compatible")
