@@ -1160,6 +1160,74 @@ func (a fixerGitHubAdapter) ViewPullRequest(ctx context.Context, input fixer.Vie
 	return fixer.PullRequestDetail{Number: detail.Number, State: detail.State, IsDraft: detail.IsDraft, Labels: detail.Labels, HeadSHA: detail.HeadSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, BaseSHA: detail.BaseSHA, ReviewDecision: detail.ReviewDecision, Comments: detail.Comments, IssueComments: commentInfosToObjects(detail.IssueComments), Checks: detail.Checks, HasConflicts: detail.HasConflicts, Author: detail.Author}, nil
 }
 
+func (a fixerGitHubAdapter) ViewIssue(ctx context.Context, input fixer.ViewIssueInput) (fixer.IssueDetail, error) {
+	repo, err := reviewThreadRepo(a.config, input.Repo, input.CWD)
+	if err != nil {
+		return fixer.IssueDetail{}, err
+	}
+	detail, err := a.gateway.ViewIssue(ctx, githubinfra.ViewIssueInput{Repo: repo, IssueNumber: input.IssueNumber, CWD: input.CWD})
+	if err != nil {
+		return fixer.IssueDetail{}, err
+	}
+	return fixer.IssueDetail{Number: detail.Number, Title: detail.Title, Body: detail.Body, URL: detail.URL, State: detail.State, Labels: detail.Labels, Assignees: detail.Assignees}, nil
+}
+
+func (a fixerGitHubAdapter) ListIssueComments(ctx context.Context, input fixer.ViewIssueInput) ([]fixer.IssueComment, error) {
+	repo, err := reviewThreadRepo(a.config, input.Repo, input.CWD)
+	if err != nil {
+		return nil, err
+	}
+	comments, err := a.gateway.ListIssueComments(ctx, githubinfra.ViewIssueInput{Repo: repo, IssueNumber: input.IssueNumber, CWD: input.CWD})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]fixer.IssueComment, 0, len(comments))
+	for _, comment := range comments {
+		out = append(out, fixer.IssueComment{ID: comment.ID, Body: comment.Body})
+	}
+	return out, nil
+}
+
+func (a fixerGitHubAdapter) ClosePullRequest(ctx context.Context, input fixer.ClosePullRequestInput) error {
+	repo, err := reviewThreadRepo(a.config, input.Repo, input.CWD)
+	if err != nil {
+		return err
+	}
+	return a.gateway.ClosePullRequest(ctx, githubinfra.ClosePullRequestInput{Repo: repo, PRNumber: input.PRNumber, DeleteBranch: input.DeleteBranch, CWD: input.CWD})
+}
+
+func (a fixerGitHubAdapter) AddIssueLabels(ctx context.Context, input fixer.IssueLabelsInput) error {
+	repo, err := reviewThreadRepo(a.config, input.Repo, input.CWD)
+	if err != nil {
+		return err
+	}
+	return a.gateway.AddIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: repo, IssueNumber: input.IssueNumber, Labels: input.Labels, CWD: input.CWD})
+}
+
+func (a fixerGitHubAdapter) RemoveIssueLabels(ctx context.Context, input fixer.IssueLabelsInput) error {
+	repo, err := reviewThreadRepo(a.config, input.Repo, input.CWD)
+	if err != nil {
+		return err
+	}
+	return a.gateway.RemoveIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: repo, IssueNumber: input.IssueNumber, Labels: input.Labels, CWD: input.CWD})
+}
+
+func (a fixerGitHubAdapter) ListPullRequestCommits(ctx context.Context, input fixer.ViewPullRequestInput) ([]fixer.PullRequestCommit, error) {
+	repo, err := reviewThreadRepo(a.config, input.Repo, input.CWD)
+	if err != nil {
+		return nil, err
+	}
+	commits, err := a.gateway.ListPullRequestCommits(ctx, githubinfra.ViewPullRequestInput{Repo: repo, PRNumber: input.PRNumber, CWD: input.CWD})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]fixer.PullRequestCommit, 0, len(commits))
+	for _, commit := range commits {
+		out = append(out, fixer.PullRequestCommit{SHA: commit.SHA, AuthorLogin: commit.AuthorLogin, CommitterLogin: commit.CommitterLogin})
+	}
+	return out, nil
+}
+
 func commentInfosToObjects(items []githubinfra.CommentInfo) []map[string]any {
 	out := make([]map[string]any, 0, len(items))
 	for _, item := range items {
@@ -2315,6 +2383,41 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			RetryMaxAttempts:            int64(cfg.Scheduler.RetryMaxAttempts),
 			MaxConsecutiveFixerFailures: cfg.Scheduler.ConsecutiveFailureThreshold,
 			OnQueueItemEnqueued:         requestWake,
+			DeleteBranchOnRegeneration: func(projectID string) bool {
+				effective := config.ProjectRoleConfigs(cfg, projectID).Fixer.Regeneration
+				return effective == nil || effective.DeleteBranch
+			},
+			RegenerationAvailability: func(_ string) string {
+				return fixerRegenerationUnavailableReason(cfg, plannerConfigured, plannerRoleRunner != nil)
+			},
+			OnRegenerateIssue: func(ctx context.Context, input fixer.RegenerateIssueInput) error {
+				if !plannerConfigured || plannerRoleRunner == nil {
+					return fmt.Errorf("planner agent is not configured for fixer regeneration")
+				}
+				issueRepo := firstNonEmpty(strings.TrimSpace(input.IssueRepo), strings.TrimSpace(input.Repo))
+				result, err := plannerRoleRunner.RouteIssue(ctx, planner.RouteIssueInput{
+					ProjectID: input.ProjectID,
+					Repo:      issueRepo,
+					Authority: input.Authority,
+					Issue: planner.IssueSummary{
+						Number: input.IssueNumber, Title: input.IssueTitle, Body: input.IssueBody, URL: input.IssueURL,
+						Labels: append([]string(nil), input.IssueLabels...), Assignees: append([]string(nil), input.IssueAssignees...), FailureContext: input.FailureContext,
+					},
+				})
+				if err != nil {
+					return err
+				}
+				if !result.ProjectionAccepted {
+					// Distinguish permanent projection rejection (skipped) from transient routing errors.
+					// When the planner skips the issue (e.g., archived project, held lane), this is a
+					// permanent condition that should escalate to human intervention rather than retry.
+					if result.Skipped > 0 {
+						return &fixer.RegenerationPermanentRejectionError{Reason: "planner route projection was permanently rejected (skipped)"}
+					}
+					return fmt.Errorf("planner route projection was not accepted")
+				}
+				return nil
+			},
 			OnAgentExecutionStarted: func(ctx context.Context, input fixer.AgentExecutionStartedInput) error {
 				return notifyAgentExecutionStarted(ctx, agentExecutionNotificationInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Title: "Looper Fixer", Subtitle: input.Subtitle, Body: input.Body, DedupeKey: input.DedupeKey})
 			},
@@ -2503,6 +2606,21 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		})
 	}
 	return handlers
+}
+
+// fixerRegenerationUnavailableReason is checked before Fixer closes an
+// exhausted PR. A Planner that cannot publish (for example because
+// defaults.allowAutoPush is false) is not a safe regeneration target: closing
+// the implementation first would destroy the only runnable artifact and leave
+// the issue parked for manual work.
+func fixerRegenerationUnavailableReason(cfg config.Config, plannerConfigured, plannerAvailable bool) string {
+	if !plannerConfigured || !plannerAvailable {
+		return "Planner agent is not configured for fixer regeneration"
+	}
+	if !cfg.Defaults.AllowAutoPush {
+		return "Planner automatic publication is disabled (defaults.allowAutoPush=false)"
+	}
+	return ""
 }
 
 func githubCLIAutoPROpeningAvailable(ctx context.Context, cfg config.Config, githubGateway *githubinfra.Gateway, logger bootstrap.Logger, repo, cwd string) bool {

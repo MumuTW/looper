@@ -625,10 +625,18 @@ type ReviewerRoleConfig struct {
 }
 
 type FixerRoleConfig struct {
-	AutoDiscovery bool                    `json:"autoDiscovery"`
-	Triggers      FixerRoleTriggersConfig `json:"triggers"`
-	Instructions  string                  `json:"instructions,omitempty"`
-	Agent         *RoleAgentConfig        `json:"agent,omitempty"`
+	AutoDiscovery bool                     `json:"autoDiscovery"`
+	Triggers      FixerRoleTriggersConfig  `json:"triggers"`
+	Regeneration  *FixerRegenerationConfig `json:"regeneration,omitempty"`
+	Instructions  string                   `json:"instructions,omitempty"`
+	Agent         *RoleAgentConfig         `json:"agent,omitempty"`
+}
+
+// FixerRegenerationConfig controls cleanup after a retry-exhausted fixer loop.
+// A nil section uses the safe default: delete a Looper-authored PR branch after
+// the PR is closed. Human-authored branches are never deleted by this policy.
+type FixerRegenerationConfig struct {
+	DeleteBranch bool `json:"deleteBranch"`
 }
 
 type CoordinatorTriageDispositionConfig struct {
@@ -1322,8 +1330,13 @@ type PartialReviewerRoleConfig struct {
 type PartialFixerRoleConfig struct {
 	AutoDiscovery *bool                           `json:"autoDiscovery,omitempty"`
 	Triggers      *PartialFixerRoleTriggersConfig `json:"triggers,omitempty"`
+	Regeneration  *PartialFixerRegenerationConfig `json:"regeneration,omitempty"`
 	Instructions  *string                         `json:"instructions,omitempty"`
 	Agent         *RoleAgentConfig                `json:"agent,omitempty"`
+}
+
+type PartialFixerRegenerationConfig struct {
+	DeleteBranch *bool `json:"deleteBranch,omitempty"`
 }
 
 // PartialRoleDiscoveryConfig is the authorable form of RoleDiscoveryConfig:

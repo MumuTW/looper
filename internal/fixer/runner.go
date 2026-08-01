@@ -159,6 +159,12 @@ type ViewPullRequestInput struct {
 	CWD      string
 }
 
+type ViewIssueInput struct {
+	Repo        string
+	IssueNumber int64
+	CWD         string
+}
+
 type PullRequestReviewersInput struct {
 	Repo      string
 	PRNumber  int64
@@ -263,6 +269,83 @@ type PullRequestLabelsInput struct {
 	PRNumber int64
 	Labels   []string
 	CWD      string
+}
+
+// RegenerateIssueInput is the durable handoff from an exhausted Fixer loop
+// back to Planner.  The authority is stable for the loop, so a replay after a
+// crash can safely project the same route again.
+type RegenerateIssueInput struct {
+	ProjectID      string
+	Repo           string
+	IssueRepo      string
+	IssueNumber    int64
+	IssueTitle     string
+	IssueBody      string
+	IssueURL       string
+	IssueLabels    []string
+	IssueAssignees []string
+	FailureSummary string
+	FailureContext string
+	Attempts       int64
+	MaxAttempts    int64
+	Authority      string
+}
+
+// RegenerateIssueFunc is the explicit Planner route authority.  Fixer owns
+// the ordered PR side effects; runtime owns the Planner projection.
+type RegenerateIssueFunc func(context.Context, RegenerateIssueInput) error
+
+// RegenerationAvailabilityFunc is checked before any close-and-regenerate
+// side effect. A non-empty reason escalates the exhausted PR instead of
+// closing it when the downstream Planner authority is unavailable.
+type RegenerationAvailabilityFunc func(projectID string) string
+
+// RegenerationGateway is deliberately separate from GitHubGateway.  Existing
+// fixer fakes and integrations remain source-compatible while terminal
+// exhaustion opts into the stronger close-and-regenerate capability.
+type RegenerationGateway interface {
+	ViewIssue(context.Context, ViewIssueInput) (IssueDetail, error)
+	ListIssueComments(context.Context, ViewIssueInput) ([]IssueComment, error)
+	ClosePullRequest(context.Context, ClosePullRequestInput) error
+	AddIssueLabels(context.Context, IssueLabelsInput) error
+	RemoveIssueLabels(context.Context, IssueLabelsInput) error
+	ListPullRequestCommits(context.Context, ViewPullRequestInput) ([]PullRequestCommit, error)
+	AddPullRequestLabels(context.Context, PullRequestLabelsInput) error
+}
+
+type IssueDetail struct {
+	Number    int64
+	Title     string
+	Body      string
+	URL       string
+	State     string
+	Labels    []string
+	Assignees []string
+}
+
+type IssueComment struct {
+	ID   int64
+	Body string
+}
+
+type IssueLabelsInput struct {
+	Repo        string
+	IssueNumber int64
+	Labels      []string
+	CWD         string
+}
+
+type ClosePullRequestInput struct {
+	Repo         string
+	PRNumber     int64
+	DeleteBranch bool
+	CWD          string
+}
+
+type PullRequestCommit struct {
+	SHA            string
+	AuthorLogin    string
+	CommitterLogin string
 }
 
 type GitHubGateway interface {
@@ -502,6 +585,9 @@ type Options struct {
 	MaxFixerRoundsPerPullRequest int
 	OnAgentExecutionStarted      AgentExecutionStartedFunc
 	OnQueueItemEnqueued          func()
+	OnRegenerateIssue            RegenerateIssueFunc
+	RegenerationAvailability     RegenerationAvailabilityFunc
+	DeleteBranchOnRegeneration   func(projectID string) bool
 }
 
 type DiscoveryPolicy struct {
@@ -547,6 +633,9 @@ type Runner struct {
 	maxFixerRounds              int
 	onAgentExecutionStarted     AgentExecutionStartedFunc
 	onQueueItemEnqueued         func()
+	onRegenerateIssue           RegenerateIssueFunc
+	regenerationAvailability    RegenerationAvailabilityFunc
+	deleteBranchOnRegeneration  func(projectID string) bool
 }
 
 type DiscoveryInput struct {
@@ -1704,6 +1793,9 @@ func New(options Options) *Runner {
 		maxFixerRounds:              maxFixerRounds,
 		onAgentExecutionStarted:     options.OnAgentExecutionStarted,
 		onQueueItemEnqueued:         options.OnQueueItemEnqueued,
+		onRegenerateIssue:           options.OnRegenerateIssue,
+		regenerationAvailability:    options.RegenerationAvailability,
+		deleteBranchOnRegeneration:  options.DeleteBranchOnRegeneration,
 	}
 }
 
@@ -2221,6 +2313,12 @@ func (r *Runner) ProcessNext(ctx context.Context, claimedBy string) (*ProcessRes
 func (r *Runner) ProcessClaimedQueueItem(ctx context.Context, queueItem storage.QueueItemRecord) (*ProcessResult, error) {
 	result, err := r.ProcessClaimedItem(ctx, queueItem)
 	if err != nil {
+		var handoffErr *regenerationHandoffError
+		if errors.As(err, &handoffErr) && r.repos != nil && r.repos.Queue != nil {
+			if replay, getErr := r.repos.Queue.GetByID(ctx, queueItem.ID); getErr == nil && replay != nil && replay.Status == "queued" {
+				return &ProcessResult{LoopID: derefString(queueItem.LoopID), QueueItemID: queueItem.ID, Status: "queued", Summary: handoffErr.Error(), FailureKind: FailureRetryableTransient}, nil
+			}
+		}
 		return r.recoverClaimedItem(ctx, queueItem, err)
 	}
 	return &result, nil
@@ -2237,6 +2335,8 @@ func (r *Runner) recoverClaimedItem(ctx context.Context, queueItem storage.Queue
 	defer cancel()
 	ctx = recoveryCtx
 	failure := r.classifyFailure(err)
+	var regenerationErr *regenerationHandoffError
+	_ = errors.As(err, &regenerationErr)
 	var activeErr *activeRunError
 	var runFailure *claimedRunFailureError
 	var failedQueue *storage.QueueItemRecord
@@ -2295,27 +2395,48 @@ func (r *Runner) recoverClaimedItem(ctx context.Context, queueItem storage.Queue
 			return nil, err
 		}
 		if loop != nil {
+			project, projectErr := r.repos.Projects.GetByID(ctx, loop.ProjectID)
+			if projectErr != nil {
+				return nil, projectErr
+			}
+			if project == nil {
+				return nil, fmt.Errorf("project not found: %s", loop.ProjectID)
+			}
+			resumed := false
 			if runFailure != nil {
-				project, projectErr := r.repos.Projects.GetByID(ctx, loop.ProjectID)
-				if projectErr != nil {
-					return nil, projectErr
-				}
-				if project != nil {
-					if breakerStreak > 0 && breakerPause != nil {
-						resumed, resumeErr := r.finishFailureStreakBreaker(ctx, *project, *breakerPause, queueItem, runFailure.runID, &runFailure.checkpoint)
-						if resumeErr != nil {
-							return nil, resumeErr
-						}
-						if resumed {
-							return &ProcessResult{LoopID: derefString(queueItem.LoopID), QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
-						}
-					} else {
-						r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, runFailure.runID, &runFailure.checkpoint)
+				if breakerStreak > 0 && breakerPause != nil {
+					var resumeErr error
+					resumed, resumeErr = r.finishFailureStreakBreaker(ctx, *project, *breakerPause, queueItem, runFailure.runID, &runFailure.checkpoint)
+					if resumeErr != nil {
+						return nil, resumeErr
+					}
+					if resumed {
+						return &ProcessResult{LoopID: derefString(queueItem.LoopID), QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
 					}
 				}
+				if !resumed {
+					r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, runFailure.runID, &runFailure.checkpoint)
+				}
 			}
-			if _, err := r.schedulePendingRediscoveryAfterRun(ctx, *loop, *queueItem.Repo, *queueItem.PRNumber); err != nil {
+			scheduled, err := r.schedulePendingRediscoveryAfterRun(ctx, *loop, *queueItem.Repo, *queueItem.PRNumber)
+			if err != nil {
 				return nil, err
+			}
+			if !scheduled && (runFailure != nil || regenerationErr != nil) {
+				checkpoint := fixerCheckpoint{}
+				handoffFailure := failure
+				if runFailure != nil {
+					checkpoint = runFailure.checkpoint
+				}
+				if regenerationErr != nil {
+					checkpoint = regenerationErr.checkpoint
+					handoffFailure = regenerationErr.failure
+				}
+				if queueResultAllowsRegeneration(failedQueue, handoffFailure) {
+					if _, _, err := r.applyTerminalRegeneration(ctx, *project, *loop, queueItem, checkpoint, handoffFailure); err != nil {
+						return nil, err
+					}
+				}
 			}
 		}
 	}
@@ -2374,6 +2495,29 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	}
 	if loop == nil {
 		return ProcessResult{}, fmt.Errorf("loop not found: %s", *queueItem.LoopID)
+	}
+	// A terminal handoff is itself durable work. If the daemon was restarted
+	// after the PR comment/close but before Planner accepted the route, replay
+	// that suffix instead of treating the paused/failed loop as an ordinary
+	// fixer item (which would strand the closed PR forever).
+	if r.onRegenerateIssue != nil {
+		if state, ok := parseRegenerationState(parseJSONObject(loop.MetadataJSON)); ok && !state.Routed {
+			project, projectErr := r.repos.Projects.GetByID(ctx, loop.ProjectID)
+			if projectErr != nil {
+				return ProcessResult{}, projectErr
+			}
+			if project == nil {
+				return ProcessResult{}, fmt.Errorf("project not found: %s", loop.ProjectID)
+			}
+			replayFailure := regenerationFailureFromState(state)
+			_, action, replayErr := r.applyTerminalRegeneration(ctx, *project, *loop, queueItem, fixerCheckpoint{}, replayFailure)
+			if replayErr != nil {
+				return ProcessResult{}, replayErr
+			}
+			if action == regenerationCompleted || action == regenerationEscalated {
+				return ProcessResult{LoopID: loop.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: replayFailure.message, FailureKind: replayFailure.kind}, nil
+			}
+		}
 	}
 	// A pending-rediscovery queue row can become visible while its resume
 	// handoff is still clearing metadata and changing the loop to queued.
@@ -2547,8 +2691,14 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		}
 		if breakerStreak > 0 {
 			r.appendFailureStreakPausedEvent(ctx, pausedLoop, run.ID, latest, breakerStreak)
-			if _, err := r.finishFailureStreakBreaker(ctx, *project, pausedLoop, queueItem, run.ID, &latest); err != nil {
+			resumed, err := r.finishFailureStreakBreaker(ctx, *project, pausedLoop, queueItem, run.ID, &latest)
+			if err != nil {
 				return ProcessResult{}, err
+			}
+			if !resumed && queueResultAllowsRegeneration(failedQueue, failure) {
+				if _, _, err := r.applyTerminalRegeneration(ctx, *project, pausedLoop, queueItem, latest, failure); err != nil {
+					return ProcessResult{}, err
+				}
 			}
 			return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
 		}
@@ -2558,6 +2708,11 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			} else if scheduled {
 				r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, run.ID, &latest)
 				return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
+			}
+		}
+		if queueResultAllowsRegeneration(failedQueue, failure) {
+			if _, _, err := r.applyTerminalRegeneration(ctx, *project, pausedLoop, queueItem, latest, failure); err != nil {
+				return ProcessResult{}, err
 			}
 		}
 		if queueResultIsTerminalForCleanup(failedQueue) {
@@ -2688,8 +2843,14 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			}
 			if breakerStreak > 0 {
 				r.appendFailureStreakPausedEvent(ctx, pausedLoop, run.ID, latest, breakerStreak)
-				if _, err := r.finishFailureStreakBreaker(ctx, *project, pausedLoop, queueItem, run.ID, &latest); err != nil {
+				resumed, err := r.finishFailureStreakBreaker(ctx, *project, pausedLoop, queueItem, run.ID, &latest)
+				if err != nil {
 					return ProcessResult{}, err
+				}
+				if !resumed && queueResultAllowsRegeneration(failedQueue, failure) {
+					if _, _, err := r.applyTerminalRegeneration(ctx, *project, pausedLoop, queueItem, latest, failure); err != nil {
+						return ProcessResult{}, err
+					}
 				}
 				return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
 			}
@@ -2699,6 +2860,11 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 				} else if scheduled {
 					r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, run.ID, &latest)
 					return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
+				}
+			}
+			if queueResultAllowsRegeneration(failedQueue, failure) {
+				if _, _, err := r.applyTerminalRegeneration(ctx, *project, pausedLoop, queueItem, latest, failure); err != nil {
+					return ProcessResult{}, err
 				}
 			}
 			if queueResultIsTerminalForCleanup(failedQueue) {
@@ -7202,7 +7368,31 @@ func clearUnusableFixerWorktreePath(path string) error {
 }
 
 func queueResultIsTerminalForCleanup(queue *storage.QueueItemRecord) bool {
-	return queue == nil || (queue.Status != "queued" && queue.Status != "manual_intervention")
+	if queue == nil || queue.Status == "queued" {
+		return queue == nil
+	}
+	// Queue.Fail uses manual_intervention for every terminal failure kind. Keep
+	// the worktree for an explicit manual-intervention park, but retryable
+	// exhaustion is terminal cleanup just like the legacy failed status.
+	if queue.Status == "manual_intervention" {
+		return strings.TrimSpace(derefString(queue.LastErrorKind)) != string(FailureManualIntervention)
+	}
+	return true
+}
+
+// queueResultAllowsRegeneration identifies a durable terminal queue outcome
+// that should enter close-and-regenerate. Queue.Fail persists
+// manual_intervention for retryable exhaustion as well as explicit manual
+// parks, so the failure kind—not the status string alone—is the authority. The
+// legacy failed status remains accepted for old rows and focused callers.
+func queueResultAllowsRegeneration(queue *storage.QueueItemRecord, failure *loopError) bool {
+	if queue == nil || failure == nil || failure.kind == FailureManualIntervention {
+		return false
+	}
+	if persistedKind := strings.TrimSpace(derefString(queue.LastErrorKind)); persistedKind != "" && persistedKind == string(FailureManualIntervention) {
+		return false
+	}
+	return queue.Status == "failed" || queue.Status == "manual_intervention"
 }
 
 type waitForPullRequestHeadSHAInput struct {

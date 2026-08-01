@@ -1566,6 +1566,22 @@ func mergeFixerRoleConfig(config *FixerRoleConfig, partial PartialFixerRoleConfi
 	if partial.Triggers != nil {
 		mergeFixerRoleTriggersConfig(&config.Triggers, *partial.Triggers)
 	}
+	if partial.Regeneration != nil {
+		regeneration := config.Regeneration
+		if regeneration == nil {
+			// A materialized section must inherit the same safe default as an
+			// omitted section.  Partial config is field-wise: an empty table is
+			// not an explicit request to turn branch deletion off.
+			regeneration = &FixerRegenerationConfig{DeleteBranch: true}
+		} else {
+			cloned := *regeneration
+			regeneration = &cloned
+		}
+		if partial.Regeneration.DeleteBranch != nil {
+			regeneration.DeleteBranch = *partial.Regeneration.DeleteBranch
+		}
+		config.Regeneration = regeneration
+	}
 	if partial.Instructions != nil {
 		config.Instructions = *partial.Instructions
 	}
@@ -2282,6 +2298,14 @@ func clonePartialRoleConfigs(configs *PartialRoleConfigs) *PartialRoleConfigs {
 				triggers.Labels = &labels
 			}
 			fixer.Triggers = &triggers
+		}
+		if configs.Fixer.Regeneration != nil {
+			regeneration := *configs.Fixer.Regeneration
+			fixer.Regeneration = &PartialFixerRegenerationConfig{}
+			if regeneration.DeleteBranch != nil {
+				deleteBranch := *regeneration.DeleteBranch
+				fixer.Regeneration.DeleteBranch = &deleteBranch
+			}
 		}
 		fixer.Agent = cloneRoleAgentConfig(configs.Fixer.Agent)
 		cloned.Fixer = &fixer
