@@ -91,7 +91,34 @@ func (r *Runner) reconcileRoutingLabels(ctx context.Context, report Report, prev
 	if strings.TrimSpace(currentHead) != expectedHead {
 		return fmt.Errorf("skip routing labels because pull request head moved from %s to %s", expectedHead, strings.TrimSpace(currentHead))
 	}
+	// Review threads are Gatekeeper-owned policy input, not part of the
+	// Mergify queue contract. Re-read them immediately before projecting
+	// auto-merge so a thread opened after EvaluatePullRequest's initial
+	// snapshot cannot slip through the label boundary.
+	if plan.autoMerge {
+		if err := r.revalidateUnresolvedReviewThreads(ctx, report); err != nil {
+			return err
+		}
+	}
 	return r.applyRoutingLabelPlan(ctx, report, plan)
+}
+
+func (r *Runner) revalidateUnresolvedReviewThreads(ctx context.Context, report Report) error {
+	threads, err := r.github.ListReviewThreads(ctx, githubinfra.ListReviewThreadsInput{
+		Repo: report.Repo, PRNumber: report.PRNumber, CWD: r.projectCWD(ctx, report.ProjectID), Limit: 1000,
+	})
+	if err != nil {
+		return fmt.Errorf("revalidate review threads before routing labels: %w", err)
+	}
+	if len(threads) == 1000 {
+		return fmt.Errorf("revalidate review threads before routing labels: result is truncated")
+	}
+	for _, thread := range threads {
+		if !thread.IsResolved {
+			return fmt.Errorf("skip routing labels because review thread %s is unresolved", strings.TrimSpace(thread.ID))
+		}
+	}
+	return nil
 }
 
 func (r *Runner) revalidateRoutingState(ctx context.Context, report Report, expectedHead string) error {
