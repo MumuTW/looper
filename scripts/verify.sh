@@ -66,6 +66,19 @@ echo "  clean"
 step "Hermes/Devin helper tests"
 python3 -m unittest discover -s tools/hermes-devin -p 'test_*.py'
 
+# Mirrors ci.yml's `semantic-prefix` job. AGENTS.md requires a semantic prefix
+# on every commit subject and PR title; Mergify merges (not squashes) into
+# main, so every non-merge commit subject on the branch lands verbatim. Merge
+# commits are skipped (their subjects are not authored semantic messages).
+step "semantic prefix (commit subjects vs origin/main)"
+scripts/check-semantic-prefix.test.sh
+if git rev-parse --verify origin/main >/dev/null 2>&1; then
+  git log --no-merges --format=%s origin/main..HEAD \
+    | scripts/check-semantic-prefix.sh --stdin
+else
+  echo "  origin/main not found; skipping range check (no remote configured)"
+fi
+
 step "gofmt"
 unformatted="$(gofmt -l .)"
 if [ -n "$unformatted" ]; then
