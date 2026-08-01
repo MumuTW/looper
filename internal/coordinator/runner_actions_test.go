@@ -18,6 +18,7 @@ import (
 	githubinfra "github.com/MumuTW/looper/internal/infra/github"
 	"github.com/MumuTW/looper/internal/labels"
 	"github.com/MumuTW/looper/internal/network/protocol"
+	"github.com/MumuTW/looper/internal/networkpolicy"
 	"github.com/MumuTW/looper/internal/storage"
 )
 
@@ -1041,6 +1042,268 @@ func TestRunnerAutonomousDispatchPreemptionIsPerTick(t *testing.T) {
 	assertAssignedIssueNumbers(t, fixture.github.assigned, []int64{1, 2})
 }
 
+func TestRunnerAutonomousDispatchScansEligibleBacklogOutsideRecentIssues(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Roles.Coordinator.PollInterval = "0s"
+		cfg.Roles.Coordinator.Dispatch.Mode = "autonomous"
+		cfg.Roles.Coordinator.Dispatch.AssignTo = "octocat"
+		cfg.Scheduler.MaxConcurrentRuns = 1
+	})
+	seedDispatchIssueWithLabels(fixture, 1, []string{"triaged", "dispatch/implement"})
+	seedDispatchIssueWithLabels(fixture, 200, []string{"triaged", "dispatch/implement"})
+	backlogIssue := fixture.github.issues[0]
+	recentIssue := fixture.github.issues[1]
+	fixture.github.issues = nil
+	fixture.github.listIssues = func(input githubinfra.ListOpenIssuesInput) []githubinfra.IssueSummary {
+		if containsAllLabels(input.Labels, "triaged", "dispatch/implement") &&
+			strings.Contains(input.Search, `-label:"`+labels.DefaultWorkerReadyTrigger+`"`) {
+			return []githubinfra.IssueSummary{backlogIssue}
+		}
+		if len(input.Labels) == 0 {
+			return []githubinfra.IssueSummary{recentIssue}
+		}
+		return nil
+	}
+
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+
+	assertAssignedIssueNumbers(t, fixture.github.assigned, []int64{1})
+	if got := countAddedIssueOperations(fixture.github.addedLabels, 1, labels.DefaultWorkerReadyTrigger); got != 1 {
+		t.Fatalf("issue 1 worker-ready add count = %d, want 1", got)
+	}
+}
+
+func TestRunnerAutonomousDispatchDeduplicatesRecentAndBacklogCandidates(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Roles.Coordinator.PollInterval = "0s"
+		cfg.Roles.Coordinator.Dispatch.Mode = "autonomous"
+		cfg.Roles.Coordinator.Dispatch.AssignTo = "octocat"
+		cfg.Scheduler.MaxConcurrentRuns = 2
+	})
+	seedDispatchIssueWithLabels(fixture, 1, []string{"triaged", "dispatch/implement"})
+	fixture.github.listIssues = func(input githubinfra.ListOpenIssuesInput) []githubinfra.IssueSummary {
+		if len(input.Labels) == 0 ||
+			(containsAllLabels(input.Labels, "triaged", "dispatch/implement") &&
+				strings.Contains(input.Search, `-label:"`+labels.DefaultWorkerReadyTrigger+`"`)) {
+			return fixture.github.issues
+		}
+		return nil
+	}
+
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+
+	assertAssignedIssueNumbers(t, fixture.github.assigned, []int64{1})
+	if got := countAddedIssueOperations(fixture.github.addedLabels, 1, labels.DefaultWorkerReadyTrigger); got != 1 {
+		t.Fatalf("issue 1 worker-ready add count = %d, want 1", got)
+	}
+}
+
+func TestRunnerAutonomousDispatchRotatesPastBlockedBacklogPage(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Roles.Coordinator.PollInterval = "0s"
+		cfg.Roles.Coordinator.Dispatch.Mode = "autonomous"
+		cfg.Roles.Coordinator.Dispatch.AssignTo = "octocat"
+		cfg.Roles.Coordinator.Dispatch.Autonomous.DelayMinutes = 60
+		cfg.Scheduler.MaxConcurrentRuns = 1
+	})
+	for int(fixture.now.Unix()/int64((5*time.Minute).Seconds()))%4 != 2 {
+		fixture.now = fixture.now.Add(5 * time.Minute)
+	}
+	fixture.runner.now = func() time.Time { return fixture.now }
+
+	backlog := make([]githubinfra.IssueSummary, 0, 101)
+	for issueNumber := int64(1); issueNumber <= 101; issueNumber++ {
+		seedDispatchIssueWithLabels(fixture, issueNumber, []string{"triaged", "dispatch/implement"})
+		backlog = append(backlog, githubinfra.IssueSummary{Number: issueNumber, Labels: []string{"triaged", "dispatch/implement"}})
+	}
+	// The first oldest page cannot dispatch this hour; the 101st row is the
+	// first eligible one on the next page.
+	for issueNumber := int64(1); issueNumber <= 100; issueNumber++ {
+		fixture.github.details[issueNumber] = githubinfra.IssueDetail{Number: issueNumber, Title: "Blocked", Author: "octo", CreatedAt: fixture.now.Format(time.RFC3339), Labels: []string{"triaged", "dispatch/implement"}, State: "open"}
+		fixture.github.timeline[issueNumber] = []map[string]any{{"event": "labeled", "created_at": fixture.now.Format(time.RFC3339), "label": map[string]any{"name": "triaged"}}}
+	}
+	fixture.github.issues = nil
+	var backlogLimits []int
+	fixture.github.listIssues = func(input githubinfra.ListOpenIssuesInput) []githubinfra.IssueSummary {
+		if !containsAllLabels(input.Labels, "triaged", "dispatch/implement") || !strings.Contains(input.Search, `-label:"`+labels.DefaultWorkerReadyTrigger+`"`) {
+			return nil
+		}
+		backlogLimits = append(backlogLimits, input.Limit)
+		return append([]githubinfra.IssueSummary(nil), backlog[:min(input.Limit, len(backlog))]...)
+	}
+
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() first tick error = %v", err)
+	}
+	if len(fixture.github.assigned) != 0 {
+		t.Fatalf("assigned on blocked first page = %v, want none", assignedIssueNumbers(fixture.github.assigned))
+	}
+	if got := fixture.github.viewIssueReads; got != 1 {
+		t.Fatalf("hydrated issues on first page = %d, want 1 available dispatch slot", got)
+	}
+
+	fixture.now = fixture.now.Add(5 * time.Minute)
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() second tick error = %v", err)
+	}
+	assertAssignedIssueNumbers(t, fixture.github.assigned, []int64{101})
+	if got := fixture.github.viewIssueReads; got != 2 {
+		t.Fatalf("hydrated issues after two ticks = %d, want only one candidate per tick", got)
+	}
+	if len(backlogLimits) != 2 || backlogLimits[0] != backlogPageSize || backlogLimits[1] != 2*backlogPageSize {
+		t.Fatalf("backlog query limits = %v, want [%d %d]", backlogLimits, backlogPageSize, 2*backlogPageSize)
+	}
+}
+
+func TestRunnerAutonomousDispatchRotatesWithinBacklogPage(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Roles.Coordinator.PollInterval = "0s"
+		cfg.Roles.Coordinator.Dispatch.Mode = "autonomous"
+		cfg.Roles.Coordinator.Dispatch.AssignTo = "octocat"
+		cfg.Roles.Coordinator.Dispatch.Autonomous.DelayMinutes = 60
+		cfg.Scheduler.MaxConcurrentRuns = 1
+	})
+	const scanInterval = 5 * time.Minute
+	targetCount := len(backlogScanTargets([]backlogLane{
+		{dispatchLabel: dispatch.DispatchPlan, triggerLabels: []string{labels.DefaultPlanTrigger}},
+		{dispatchLabel: dispatch.DispatchImplement, triggerLabels: []string{labels.DefaultWorkerReadyTrigger}},
+	}, false))
+	for {
+		targetStart, page, candidateStart := fixture.runner.backlogScanPosition(fixture.projectID, targetCount)
+		if targetStart == 1 && page == 0 && candidateStart == 0 {
+			break
+		}
+		fixture.now = fixture.now.Add(scanInterval)
+		fixture.runner.now = func() time.Time { return fixture.now }
+	}
+
+	for issueNumber := int64(1); issueNumber <= 2; issueNumber++ {
+		seedDispatchIssueWithLabels(fixture, issueNumber, []string{"triaged", "dispatch/implement"})
+	}
+	fixture.github.details[1] = githubinfra.IssueDetail{Number: 1, Title: "Blocked", Author: "octo", CreatedAt: fixture.now.Format(time.RFC3339), Labels: []string{"triaged", "dispatch/implement"}, State: "open"}
+	fixture.github.timeline[1] = []map[string]any{{"event": "labeled", "created_at": fixture.now.Format(time.RFC3339), "label": map[string]any{"name": "triaged"}}}
+	backlog := append([]githubinfra.IssueSummary(nil), fixture.github.issues...)
+	fixture.github.issues = nil
+	fixture.github.listIssues = func(input githubinfra.ListOpenIssuesInput) []githubinfra.IssueSummary {
+		if containsAllLabels(input.Labels, "triaged", "dispatch/implement") &&
+			strings.Contains(input.Search, `-label:"`+labels.DefaultWorkerReadyTrigger+`"`) {
+			return backlog
+		}
+		return nil
+	}
+
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() first tick error = %v", err)
+	}
+	if len(fixture.github.assigned) != 0 {
+		t.Fatalf("assigned on blocked first candidate = %v, want none", assignedIssueNumbers(fixture.github.assigned))
+	}
+
+	fixture.now = fixture.now.Add(time.Duration(backlogPageCount*targetCount) * scanInterval)
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() second tick error = %v", err)
+	}
+	assertAssignedIssueNumbers(t, fixture.github.assigned, []int64{2})
+	if got := fixture.github.viewIssueReads; got != 2 {
+		t.Fatalf("issue-detail reads after two ticks = %d, want one candidate per tick", got)
+	}
+}
+
+func TestRunnerRoutedBacklogRecoversTriggeredWorkerWithoutTarget(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Roles.Coordinator.PollInterval = "0s"
+		cfg.Roles.Coordinator.Dispatch.Mode = "autonomous"
+		cfg.Scheduler.MaxConcurrentRuns = 1
+		cfg.Projects[0].Network = config.ProjectNetworkConfig{Mode: config.ProjectNetworkModeRouted}
+	})
+	fixture.network.status = protocol.NodeStatusResponse{
+		Membership: protocol.Membership{NodeID: "coord-1", NodeName: "coord-1", GitHub: protocol.GitHubIdentity{NumericID: 1, Login: "coord"}},
+		Memberships: []protocol.Membership{
+			{NodeID: "coord-1", NodeName: "coord-1", GitHub: protocol.GitHubIdentity{NumericID: 1, Login: "coord"}, Capabilities: protocol.NodeCapabilities{Roles: []string{"coordinator"}}},
+			{NodeID: "worker-1", NodeName: "worker-1", GitHub: protocol.GitHubIdentity{NumericID: 101, Login: "worker-bot"}, TargetLabels: []string{protocol.TargetLabelForNode("worker-1")}, Capabilities: protocol.NodeCapabilities{Roles: []string{"worker"}}, LastHeartbeatAt: timePtr(fixture.now)},
+		},
+		Lease: protocol.CoordinatorLease{HolderNodeID: "coord-1", FencingToken: 12, ExpiresAt: timePtr(fixture.now.Add(time.Minute))},
+	}
+	issueLabels := []string{"triaged", "dispatch/implement", labels.DefaultWorkerReadyTrigger}
+	seedDispatchIssueWithLabels(fixture, 42, issueLabels)
+	detail := fixture.github.details[42]
+	detail.URL = "https://github.com/acme/looper/issues/42"
+	fixture.github.details[42] = detail
+	backlogIssue := fixture.github.issues[0]
+	fixture.github.issues = nil
+	fixture.github.listIssues = func(input githubinfra.ListOpenIssuesInput) []githubinfra.IssueSummary {
+		if containsAllLabels(input.Labels, "triaged", "dispatch/implement", labels.DefaultWorkerReadyTrigger) {
+			return []githubinfra.IssueSummary{backlogIssue}
+		}
+		return nil
+	}
+
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+
+	assertOrderedOps(t, fixture.github.ops, []string{"assign:worker-bot", "add:looper:target:worker-1"})
+	claimLabels := append(append([]string(nil), issueLabels...), protocol.TargetLabelForNode("worker-1"))
+	decision := networkpolicy.EvaluateWorker(
+		networkpolicy.ProjectPolicy{Mode: config.NetworkModeRouted, NodeName: "worker-1", GitHubLogin: "worker-bot", GitHubUserID: 101},
+		claimLabels,
+		[]networkpolicy.GitHubUser{{Login: "worker-bot", ID: 101}},
+	)
+	if !decision.Allowed {
+		t.Fatalf("worker claim after coordinator recovery denied: %s", decision.Reason)
+	}
+}
+
+func TestRunnerBacklogHydrationMatchesAvailableDispatchCapacity(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Roles.Coordinator.PollInterval = "0s"
+		cfg.Roles.Coordinator.Dispatch.Mode = "autonomous"
+		cfg.Roles.Coordinator.Dispatch.AssignTo = "octocat"
+		cfg.Scheduler.MaxConcurrentRuns = 5
+	})
+	for issueNumber := int64(1); issueNumber <= 50; issueNumber++ {
+		seedDispatchIssueWithLabels(fixture, issueNumber, []string{"triaged", "dispatch/implement"})
+	}
+	fixture.github.listIssues = func(input githubinfra.ListOpenIssuesInput) []githubinfra.IssueSummary {
+		if len(input.Labels) == 0 {
+			return nil
+		}
+		if containsAllLabels(input.Labels, "triaged", "dispatch/implement") {
+			return fixture.github.issues
+		}
+		return nil
+	}
+	seedRunningQueueItems(t, fixture, 3)
+
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+
+	if fixture.github.viewIssueReads != 2 {
+		t.Fatalf("issue-detail reads = %d, want 2 available scheduler slots", fixture.github.viewIssueReads)
+	}
+	if fixture.github.timelineReads != 2 {
+		t.Fatalf("timeline reads = %d, want 2 available scheduler slots", fixture.github.timelineReads)
+	}
+	assertAssignedIssueNumbers(t, fixture.github.assigned, []int64{1, 2})
+}
+
 // TestReconfigurePreservesRuntimeStateThrottle verifies that reconfigure
 // carries the previous runner's RuntimeState into the replacement, so the
 // per-project throttle timestamp survives a config-snapshot rebuild. This
@@ -1324,6 +1587,7 @@ func (stubCoordinatorInspector) Inspect(context.Context, string, triage.Issue) (
 
 type stubCoordinatorGitHub struct {
 	issues                   []githubinfra.IssueSummary
+	listIssues               func(githubinfra.ListOpenIssuesInput) []githubinfra.IssueSummary
 	details                  map[int64]githubinfra.IssueDetail
 	comments                 map[int64][][]githubinfra.CommentInfo
 	timeline                 map[int64][]map[string]any
@@ -1357,9 +1621,14 @@ type stubCoordinatorGitHub struct {
 	currentLogin             string
 	currentLoginErr          error
 	currentLoginForRepoCalls int
+	viewIssueReads           int
+	timelineReads            int
 }
 
-func (s *stubCoordinatorGitHub) ListOpenIssues(context.Context, githubinfra.ListOpenIssuesInput) ([]githubinfra.IssueSummary, error) {
+func (s *stubCoordinatorGitHub) ListOpenIssues(_ context.Context, input githubinfra.ListOpenIssuesInput) ([]githubinfra.IssueSummary, error) {
+	if s.listIssues != nil {
+		return append([]githubinfra.IssueSummary(nil), s.listIssues(input)...), nil
+	}
 	return append([]githubinfra.IssueSummary(nil), s.issues...), nil
 }
 func (s *stubCoordinatorGitHub) ListOpenPullRequests(context.Context, githubinfra.ListOpenPullRequestsInput) ([]githubinfra.PullRequestSummary, error) {
@@ -1370,6 +1639,7 @@ func (s *stubCoordinatorGitHub) ListOpenPullRequests(context.Context, githubinfr
 	return result, nil
 }
 func (s *stubCoordinatorGitHub) ViewIssue(_ context.Context, input githubinfra.ViewIssueInput) (githubinfra.IssueDetail, error) {
+	s.viewIssueReads++
 	return s.details[input.IssueNumber], nil
 }
 func (s *stubCoordinatorGitHub) ViewPullRequest(_ context.Context, input githubinfra.ViewPullRequestInput) (githubinfra.PullRequestDetail, error) {
@@ -1422,6 +1692,7 @@ func (s *stubCoordinatorGitHub) GetCurrentUserLoginForRepo(context.Context, stri
 	return "looper", nil
 }
 func (s *stubCoordinatorGitHub) ListIssueTimeline(_ context.Context, input githubinfra.IssueTimelineInput) ([]map[string]any, error) {
+	s.timelineReads++
 	return s.timeline[input.IssueNumber], nil
 }
 func (s *stubCoordinatorGitHub) GetRepositoryPermission(_ context.Context, input githubinfra.RepositoryPermissionInput) (string, error) {
@@ -2270,6 +2541,22 @@ func TestRunnerDispatchSkipsDependencyAPIsWhenDisabled(t *testing.T) {
 
 func joinLabels(labels []string) string {
 	return strings.Join(labels, ",")
+}
+
+func containsAllLabels(actual []string, expected ...string) bool {
+	for _, want := range expected {
+		found := false
+		for _, got := range actual {
+			if strings.EqualFold(strings.TrimSpace(got), strings.TrimSpace(want)) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
 }
 
 func seedParentIssue(fixture coordinatorFixture, issueNumber int64) {
