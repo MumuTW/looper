@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
@@ -1696,3 +1697,28 @@ func stopAllItemTypes(items []stopAllItem) []string {
 }
 
 func stringPtr(value string) *string { return &value }
+
+func TestRunCheckConfigDoesNotBootstrap(t *testing.T) {
+	stdout, stderr := &bytes.Buffer{}, &bytes.Buffer{}
+	bootstrapCalled := false
+	configPath := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(configPath, []byte("[server]\nhost = \"127.0.0.1\"\nport = 4050\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	exitCode := runWithDeps([]string{"--check-config"}, stdout, stderr, runDeps{
+		env: map[string]string{"LOOPER_CONFIG": configPath},
+		bootstrapImpl: func(context.Context, bootstrap.Options) (bootstrap.Result, error) {
+			bootstrapCalled = true
+			return bootstrap.Result{}, errors.New("bootstrap should not be called")
+		},
+	})
+	if exitCode != 0 {
+		t.Fatalf("run([--check-config]) exit = %d, stderr = %q", exitCode, stderr.String())
+	}
+	if bootstrapCalled {
+		t.Fatal("bootstrapImpl was called for --check-config")
+	}
+	if got := stdout.String(); got != "configuration is compatible\n" {
+		t.Fatalf("stdout = %q", got)
+	}
+}
