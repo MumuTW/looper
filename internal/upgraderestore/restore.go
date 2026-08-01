@@ -841,7 +841,7 @@ func rollback(journalPath string, journal restoreJournal, operations fileOperati
 	var rollbackErrors []error
 	for index := len(journal.Entries) - 1; index >= 0; index-- {
 		entry := journal.Entries[index]
-		_, undoPresent, err := inspectRegularArtifact(entry.UndoPath, "undo file for "+entry.Name)
+		undoInfo, undoPresent, err := inspectRegularArtifact(entry.UndoPath, "undo file for "+entry.Name)
 		if err != nil {
 			rollbackErrors = append(rollbackErrors, err)
 			continue
@@ -850,12 +850,29 @@ func rollback(journalPath string, journal restoreJournal, operations fileOperati
 			// Undo holds the pre-restore original. Detach-and-verify before
 			// deleting the current target so a recreated file cannot be removed
 			// after a stale ownership hash (check-then-act race).
-			_, targetPresent, err := inspectRegularArtifact(entry.TargetPath, "current target for "+entry.Name)
+			targetInfo, targetPresent, err := inspectRegularArtifact(entry.TargetPath, "current target for "+entry.Name)
 			if err != nil {
 				rollbackErrors = append(rollbackErrors, err)
 				continue
 			}
 			if targetPresent {
+				// Recovery may have been interrupted after publishing the undo
+				// file back to its target but before removing the undo artifact.
+				// If both paths already contain the same original, keep the live
+				// target and only remove the duplicate artifact; treating it as a
+				// staged target would make an otherwise successful rollback fail
+				// forever on every retry.
+				alreadyRestored, compareErr := sameRestoredOriginal(targetInfo, undoInfo, entry.TargetPath, entry.UndoPath)
+				if compareErr != nil {
+					rollbackErrors = append(rollbackErrors, compareErr)
+					continue
+				}
+				if alreadyRestored {
+					if err := os.Remove(entry.UndoPath); err != nil {
+						rollbackErrors = append(rollbackErrors, fmt.Errorf("remove duplicate undo for %s: %w", entry.Name, err))
+					}
+					continue
+				}
 				if err := detachAndRemoveOwnedRestoreTarget(entry, "current target for "+entry.Name); err != nil {
 					rollbackErrors = append(rollbackErrors, err)
 					continue
@@ -903,6 +920,23 @@ func rollback(journalPath string, journal restoreJournal, operations fileOperati
 		return fmt.Errorf("clean rolled-back restore transaction: %w", err)
 	}
 	return nil
+}
+
+func sameRestoredOriginal(targetInfo, undoInfo os.FileInfo, targetPath, undoPath string) (bool, error) {
+	if targetInfo == nil || undoInfo == nil {
+		return false, nil
+	}
+	if targetInfo.Mode().Perm() != undoInfo.Mode().Perm() {
+		return false, nil
+	}
+	if os.SameFile(targetInfo, undoInfo) {
+		return true, nil
+	}
+	same, err := sameRegularFileContent(targetPath, undoPath)
+	if err != nil {
+		return false, fmt.Errorf("compare restored target %s with undo %s: %w", targetPath, undoPath, err)
+	}
+	return same, nil
 }
 
 func inspectRegularArtifact(path, description string) (os.FileInfo, bool, error) {

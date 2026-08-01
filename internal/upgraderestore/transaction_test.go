@@ -239,6 +239,53 @@ func TestRecoverRollsBackUncommittedRestore(t *testing.T) {
 	}
 }
 
+func TestRecoverCleansUndoAlreadyInstalledBeforeSourceRemoval(t *testing.T) {
+	fixture := newRestoreFixture(t, true)
+	type targetSpec struct {
+		name string
+		path string
+		old  string
+		mode os.FileMode
+	}
+	specs := []targetSpec{
+		{name: entryDatabase, path: fixture.databasePath, old: "old database", mode: 0o660},
+		{name: entryWAL, path: fixture.databasePath + "-wal", old: "old wal", mode: 0o604},
+		{name: entrySHM, path: fixture.databasePath + "-shm", old: "old shm", mode: 0o620},
+		{name: entryConfig, path: fixture.configPath, old: "old config", mode: 0o640},
+	}
+	entries := make([]journalEntry, 0, len(specs))
+	for _, spec := range specs {
+		undo := filepath.Join(filepath.Dir(spec.path), "."+filepath.Base(spec.path)+".looper-restore-undo-retry")
+		if err := os.Rename(spec.path, undo); err != nil {
+			t.Fatal(err)
+		}
+		entry := journalEntry{Name: spec.name, TargetPath: spec.path, UndoPath: undo, HadOriginal: true}
+		if spec.name == entryDatabase || spec.name == entryConfig {
+			stage := filepath.Join(filepath.Dir(spec.path), "."+filepath.Base(spec.path)+".looper-restore-stage-retry")
+			writeTestFile(t, stage, "staged", 0o600)
+			entry.StagedPath = stage
+			entry.StagedSHA256, entry.StagedSize, _ = fileContentIdentity(stage)
+			// Simulate an interruption after the undo was already copied back
+			// but before the old source was removed.
+			writeTestFile(t, spec.path, spec.old, spec.mode)
+		}
+		entries = append(entries, entry)
+	}
+	journalPath := JournalPath(fixture.databasePath)
+	journal := restoreJournal{Version: journalVersion, Phase: phaseOriginalsMoved, Entries: entries}
+	if err := createJournal(journalPath, journal); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := Recover(journalPath); err != nil {
+		t.Fatalf("Recover() error = %v", err)
+	}
+	fixture.assertOriginalTargets(t)
+	assertPathMissing(t, journalPath)
+	assertNoRestoreArtifacts(t, filepath.Dir(fixture.configPath))
+	assertNoRestoreArtifacts(t, filepath.Dir(fixture.databasePath))
+}
+
 func TestRecoverCleansCommittedRestoreWithoutRollingItBack(t *testing.T) {
 	fixture := newRestoreFixture(t, true)
 	crashed := false
