@@ -958,6 +958,12 @@ func captureFixerReproduction(checkpoint *fixerCheckpoint, worktreePath string) 
 			// would let the agent invent the testCommand the daemon executes.
 			return fixerReproductionFailure(errors.New("reproduction manifest appeared after run start without a prior contract"))
 		}
+		// Legacy checkpoints (pre-reproductionAbsent) that already advanced
+		// past the first capture opportunity are fail-closed: a newly visible
+		// manifest after upgrade may be agent-authored and is not authority.
+		if checkpoint.Reproduction == nil && fixerPastInitialReproductionCapture(*checkpoint) {
+			return fixerReproductionFailure(errors.New("legacy checkpoint has unknown reproduction absence; refusing to adopt a mid-run manifest"))
+		}
 		if err := manifest.Verify(worktreePath); err != nil {
 			return fixerReproductionFailure(err)
 		}
@@ -968,6 +974,19 @@ func captureFixerReproduction(checkpoint *fixerCheckpoint, worktreePath string) 
 	// newly written manifest as the original contract.
 	checkpoint.ReproductionAbsent = true
 	return nil
+}
+
+// fixerPastInitialReproductionCapture reports whether the run already advanced
+// past the first durable capture opportunity. Used to fail closed for legacy
+// checkpoints that lack ReproductionAbsent after an upgrade.
+func fixerPastInitialReproductionCapture(checkpoint fixerCheckpoint) bool {
+	return checkpoint.Repair != nil ||
+		checkpoint.Validation != nil ||
+		checkpoint.Push != nil ||
+		checkpoint.ReconcileCommits != nil ||
+		checkpoint.ResolvedComments != nil ||
+		checkpoint.SummaryComment != nil ||
+		checkpoint.Recheck != nil
 }
 
 func verifyFixerReproduction(checkpoint fixerCheckpoint, worktreePath string) error {
@@ -6706,11 +6725,26 @@ func (r *Runner) cleanupFixerWorktreeIfTerminal(ctx context.Context, project sto
 			r.logError("fixer worktree cleanup skipped", map[string]any{"runId": runID, "worktreePath": checkpoint.Worktree.Path, "message": message})
 			return
 		}
+		// Per-loop lock first, then shared PR target lock (same order as API
+		// discard+retry) so cleanup serializes with sibling takeover on the
+		// shared managed checkout.
 		unlockLoop := loops.LockLoopRequeue(run.LoopID)
 		defer unlockLoop()
 		loop, err := r.repos.Loops.GetByID(ctx, run.LoopID)
 		if err != nil || loop == nil {
 			message := "loop not found"
+			if err != nil {
+				message = err.Error()
+			}
+			r.logError("fixer worktree cleanup skipped", map[string]any{"runId": runID, "loopId": run.LoopID, "worktreePath": checkpoint.Worktree.Path, "message": message})
+			return
+		}
+		unlockTarget := loops.LockLoopTarget(loops.LoopTargetGuardKeyFromRecord(*loop))
+		defer unlockTarget()
+		// Re-read ownership under both locks.
+		loop, err = r.repos.Loops.GetByID(ctx, run.LoopID)
+		if err != nil || loop == nil {
+			message := "loop not found after target lock"
 			if err != nil {
 				message = err.Error()
 			}
@@ -6738,7 +6772,8 @@ func (r *Runner) cleanupFixerWorktreeIfTerminal(ctx context.Context, project sto
 		}
 		// Shared PR checkouts: a sibling loop in human_takeover for the same
 		// project+PR owns the detached path even when this Fixer loop is
-		// terminal.
+		// terminal. Re-check under the PR target lock so takeover cannot
+		// commit human_takeover between the lookup and CleanupWorktree.
 		if skip, reason := r.siblingHumanTakeoverOwnsWorktree(ctx, *loop); skip {
 			cause := errors.New(reason)
 			r.appendEvent(ctx, eventInput{eventType: "fixer.worktree.cleanup_skipped", projectID: project.ID, loopID: loop.ID, runID: runID, entityType: "loop", entityID: loop.ID, payload: map[string]any{"path": checkpoint.Worktree.Path, "branch": checkpoint.Worktree.Branch, "reason": cause.Error()}})

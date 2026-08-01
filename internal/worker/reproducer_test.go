@@ -73,6 +73,32 @@ func TestWorkerValidationCommandsIncludeReproductionCommand(t *testing.T) {
 	}
 }
 
+func TestWorkerReproductionAbsentBlocksPreExecutionAdoption(t *testing.T) {
+	root, expected := writeWorkerReproductionFixture(t)
+	// First empty capture records absence.
+	emptyRoot := t.TempDir()
+	checkpoint := workerCheckpoint{Work: &workerInput{IssueNumber: 1, Repo: "acme/app"}}
+	if err := captureWorkerReproduction(&checkpoint, emptyRoot); err != nil {
+		t.Fatalf("empty capture error = %v", err)
+	}
+	if !checkpoint.ReproductionAbsent {
+		t.Fatal("want ReproductionAbsent after empty capture")
+	}
+	// Pre-execution resume must not adopt agent-authored manifest.
+	err := captureWorkerReproduction(&checkpoint, root)
+	if err == nil || !strings.Contains(err.Error(), "before agent execution completed") {
+		t.Fatalf("capture = %v, want pre-execution refusal", err)
+	}
+	// After completed execution, worker-authored adoption is allowed.
+	checkpoint.Execution = &checkpointExecution{Status: "completed"}
+	if err := captureWorkerReproduction(&checkpoint, root); err != nil {
+		t.Fatalf("post-execution capture error = %v", err)
+	}
+	if checkpoint.Work.Reproduction == nil || !checkpoint.Work.Reproduction.Equal(*expected) {
+		t.Fatalf("captured = %#v, want %#v", checkpoint.Work.Reproduction, expected)
+	}
+}
+
 func TestWorkerReproductionCaptureVerifiesOnFirstAdopt(t *testing.T) {
 	root, expected := writeWorkerReproductionFixture(t)
 	bad := []byte(`{"version":1,"testPath":"internal/bug_test.go","testName":"TestBug","testCommand":"go test ./internal -run '^TestBug$'","testSha256":"` + strings.Repeat("0", 64) + `"}`)

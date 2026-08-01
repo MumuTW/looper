@@ -1891,3 +1891,35 @@ func TestGatewayWorktreeScopedExcludesProtectAgentCommits(t *testing.T) {
 		t.Fatalf("readStatus lost source entry; entries = %q", joined)
 	}
 }
+
+func TestVerifyWorktreeIdentityAcceptsSymlinkedRepoPath(t *testing.T) {
+	// RepoPath may be a symlink (operator convenience). git-common-dir for the
+	// symlink is .git relative to the link, while linked worktrees report the
+	// physical common dir; EvalSymlinks must make them compare equal.
+	ctx := context.Background()
+	fixture := newFixture(t)
+	fixture.createMainOnlyRepo(t)
+
+	linkParent := t.TempDir()
+	repoLink := filepath.Join(linkParent, "repo-link")
+	if err := os.Symlink(fixture.repoPath, repoLink); err != nil {
+		t.Fatalf("os.Symlink(repo) error = %v", err)
+	}
+
+	gateway := fixture.gateway()
+	// Create the worktree via the physical repo path, then verify identity
+	// using the symlinked RepoPath spelling.
+	worktree, err := gateway.CreateWorktree(ctx, CreateWorktreeInput{
+		ProjectID: fixture.projectID, RepoPath: fixture.repoPath, WorktreeRoot: fixture.worktreeRoot,
+		Branch: "feature/symlink-identity", BaseBranch: "main",
+	})
+	if err != nil {
+		t.Fatalf("CreateWorktree() error = %v", err)
+	}
+	if err := gateway.VerifyWorktreeIdentity(ctx, VerifyWorktreeIdentityInput{
+		RepoPath: repoLink, WorktreeRoot: fixture.worktreeRoot, WorktreePath: worktree.WorktreePath,
+		ExpectedBranch: "feature/symlink-identity", CheckoutMode: CheckoutModeBranch,
+	}); err != nil {
+		t.Fatalf("VerifyWorktreeIdentity(symlinked RepoPath) error = %v", err)
+	}
+}

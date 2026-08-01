@@ -646,6 +646,11 @@ type workerCheckpoint struct {
 	Plan           *checkpointPlan       `json:"plan,omitempty"`
 	Execution      *checkpointExecution  `json:"execution,omitempty"`
 	Lifecycle      *lifecycle.State      `json:"gitPrLifecycle,omitempty"`
+	// ReproductionAbsent is set when capture first observes no applicable
+	// manifest. A later manifest is only adopted after a completed agent
+	// execution (intentional worker-authored reproduction); pre-execution
+	// resume must not treat a mid-crash agent file as the contract.
+	ReproductionAbsent bool `json:"reproductionAbsent,omitempty"`
 	// ReproductionBaseline is the durable red evidence captured before the
 	// Worker agent is allowed to edit the worktree. It is separate from
 	// Validation because a non-zero reproduction test is expected here while
@@ -783,12 +788,27 @@ func captureWorkerReproduction(checkpoint *workerCheckpoint, worktreePath string
 		if !workerReproductionManifestAppliesToTask(*manifest, *checkpoint.Work) {
 			return nil
 		}
+		if checkpoint.ReproductionAbsent {
+			// Negative observation was durable. Only a completed agent execution
+			// may introduce the reproduction contract (worker-authored test).
+			// Pre-execution resume must not adopt a mid-crash agent file.
+			if checkpoint.Execution == nil || checkpoint.Execution.Status != "completed" {
+				return reproductionFailure(errors.New("reproduction manifest appeared before agent execution completed"))
+			}
+		}
 		// First capture must Verify the test hash before the daemon will
 		// execute testCommand or treat the manifest as the run authority.
 		if err := manifest.Verify(worktreePath); err != nil {
 			return reproductionFailure(err)
 		}
 		checkpoint.Work.Reproduction = manifest
+		checkpoint.ReproductionAbsent = false
+		return nil
+	}
+	// Durable negative observation so crash-resume cannot treat a later
+	// agent-authored file as the original contract.
+	if checkpoint.Work.Reproduction == nil {
+		checkpoint.ReproductionAbsent = true
 	}
 	return nil
 }

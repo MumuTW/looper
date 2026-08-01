@@ -100,6 +100,23 @@ func TestFixerReproductionCaptureVerifiesOnFirstAdopt(t *testing.T) {
 	}
 }
 
+func TestFixerReproductionFailsClosedForLegacyUnknownAbsence(t *testing.T) {
+	// Pre-reproductionAbsent checkpoint that already advanced past first capture
+	// must not adopt a newly visible manifest after upgrade.
+	root, expected := writeFixerReproductionFixture(t)
+	checkpoint := fixerCheckpoint{
+		Repair: &checkpointRepair{Status: "completed", Summary: "legacy interrupted"},
+	}
+	err := captureFixerReproduction(&checkpoint, root)
+	if err == nil || !strings.Contains(err.Error(), "legacy checkpoint") {
+		t.Fatalf("captureFixerReproduction() = %v, want legacy unknown absence refusal", err)
+	}
+	if checkpoint.Reproduction != nil {
+		t.Fatalf("Reproduction = %#v, want nil", checkpoint.Reproduction)
+	}
+	_ = expected
+}
+
 func TestFixerReproductionRefusesAgentAuthoredManifestAfterAbsentStart(t *testing.T) {
 	root := t.TempDir()
 	checkpoint := fixerCheckpoint{}
