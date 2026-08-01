@@ -36,6 +36,14 @@ STOCK_ACP_CLIENT = Path(__file__).with_name("testdata") / "copilot_acp_client.v2
 
 
 class HermesDevinHelperTests(unittest.TestCase):
+    def test_documented_mcp_setup_exports_the_selected_profile_and_install(self):
+        spike = (REPO_ROOT / "docs" / "research" / "hermes-devin-acp-spike.md").read_text(encoding="utf-8")
+        setup = spike.split("### Setup\n", 1)[1].split("```", 2)[1]
+        self.assertIn('export HERMES_HOME="$(scripts/hermes-profile.sh --print)"', setup)
+        self.assertIn('export HERMES_INSTALL_DIR="${HERMES_INSTALL_DIR:-$HOME/.hermes/hermes-agent}"', setup)
+        self.assertIn('-e HERMES_HOME="$HERMES_HOME"', setup)
+        self.assertIn('-e HERMES_INSTALL_DIR="$HERMES_INSTALL_DIR"', setup)
+
     def test_pinned_patch_applies_to_the_checked_in_stock_fixture_and_reverts(self):
         stock = STOCK_ACP_CLIENT.read_bytes()
         self.assertEqual(
