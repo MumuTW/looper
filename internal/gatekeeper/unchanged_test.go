@@ -5,7 +5,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/MumuTW/looper/internal/config"
 	githubinfra "github.com/MumuTW/looper/internal/infra/github"
 	"github.com/MumuTW/looper/internal/labels"
 )

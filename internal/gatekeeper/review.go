@@ -28,7 +28,7 @@ func latestCodexReviewForHead(ctx context.Context, repos *storage.Repositories, 
 	if repos == nil || repos.Events == nil {
 		return evidence, fmt.Errorf("events repository is not configured")
 	}
-	events, err := repos.Events.ListByEntity(ctx, "pull_request", fmt.Sprintf("%s#%d", repo, prNumber))
+	events, err := repos.Events.ListByEntityAndEventTypes(ctx, "pull_request", fmt.Sprintf("%s#%d", repo, prNumber), []string{reviewerReviewPostedEventType})
 	if err != nil {
 		return evidence, fmt.Errorf("list Reviewer review events: %w", err)
 	}

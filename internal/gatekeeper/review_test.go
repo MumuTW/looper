@@ -173,3 +173,81 @@ func seedReviewerReviewEventWithMarkerVerified(t *testing.T, fixture *gatekeeper
 		t.Fatalf("append reviewer review event: %v", err)
 	}
 }
+
+// seedGateReport appends a gate report event so discovery's latestGateReports
+// picks it up as the previous report for the pull request.
+func seedGateReport(t *testing.T, fixture *gatekeeperFixture, report Report) {
+	t.Helper()
+	projectID := "project_1"
+	entityType := "pull_request"
+	entityID := fmt.Sprintf("%s#%d", report.Repo, report.PRNumber)
+	if err := eventlog.Append(context.Background(), fixture.repos, eventlog.AppendInput{
+		ID: fmt.Sprintf("gate-report-%d", time.Now().UnixNano()), EventType: GateReportEventType,
+		ProjectID: &projectID, EntityType: &entityType, EntityID: &entityID,
+		Payload: report, CreatedAt: fixture.now,
+	}); err != nil {
+		t.Fatalf("append gate report: %v", err)
+	}
+}
+
+// A codex_review provider block (transient event-store read failure) must
+// persist an invalid CodexReview placeholder so reportAwaitsCurrentHeadReview
+// recognises the report as waiting on review evidence. Without the placeholder
+// the report carries only the provider reason and a nil projection, which
+// neither signal detects, so unchanged discovery would reuse the failed report
+// for up to maxSkipAge even after the review event appears.
+func TestDiscoverPullRequestsReevaluatesAfterCodexReviewProviderBlock(t *testing.T) {
+	fixture := newGatekeeperFixtureWithoutReview(t)
+	pr := githubinfra.PullRequestSummary{Number: 42, HeadSHA: "head-1", State: "OPEN", UpdatedAt: "2026-07-30T10:00:00Z", BaseRefName: "main", ReviewDecision: "APPROVED"}
+	fixture.github.openPullRequests = []githubinfra.PullRequestSummary{pr}
+	runner := New(Options{Repos: fixture.repos, GitHub: fixture.github, Now: func() time.Time { return fixture.now }})
+
+	// Seed a provider-block report matching the shape EvaluatePullRequest now
+	// produces when the codex_review read fails: the provider reason plus an
+	// invalid CodexReview placeholder (CurrentHeadValid=false).
+	fingerprint := sourceFingerprint(pr, false) + "\x1fdiff-budget=0,0"
+	seedGateReport(t, fixture, Report{
+		Version: reportVersion, Status: StatusBlocked, ProjectID: "project_1",
+		Repo: "acme/looper", PRNumber: 42, ObservedHeadSHA: "head-1",
+		ExpectedHeadSHA: "head-1", SourceFingerprint: fingerprint,
+		Reasons: []Reason{{Code: ReasonProviderStateUnavailable, Subject: "codex_review"}},
+		Evidence: Evidence{
+			CodexReview: &CodexReviewEvidence{RequiredHeadSHA: "head-1", CurrentHeadValid: false},
+		},
+		EvaluatedAt: fixture.now.Format(time.RFC3339Nano),
+	})
+
+	// While no review event has appeared, discovery skips cheaply (no forge
+	// round trips) because re-evaluating would reach the same conclusion.
+	first, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("first DiscoverPullRequests() error = %v", err)
+	}
+	if first.Evaluated != 0 || first.Skipped != 1 {
+		t.Fatalf("first discovery = %d evaluated / %d skipped, want 0 / 1 (skip while waiting for review)", first.Evaluated, first.Skipped)
+	}
+
+	// Once the durable review event appears, discovery must re-evaluate rather
+	// than reuse the provider-block report for up to maxSkipAge.
+	seedReviewerReviewEvent(t, fixture, "head-1", "APPROVE", "reviewer-loop", 1)
+	second, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("second DiscoverPullRequests() error = %v", err)
+	}
+	if second.Evaluated != 1 || second.Skipped != 0 || !second.Reports[0].Eligible {
+		t.Fatalf("second discovery = %#v, want re-evaluated eligible report", second)
+	}
+}
+
+// A provider-block report with a nil CodexReview projection (the pre-fix shape)
+// is not recognised as awaiting review. This documents why the placeholder is
+// necessary: without it, the report is cached for up to maxSkipAge.
+func TestReportAwaitsCurrentHeadReviewMissesNilProjectionProviderBlock(t *testing.T) {
+	report := Report{
+		Reasons:  []Reason{{Code: ReasonProviderStateUnavailable, Subject: "codex_review"}},
+		Evidence: Evidence{CodexReview: nil},
+	}
+	if reportAwaitsCurrentHeadReview(report) {
+		t.Fatalf("reportAwaitsCurrentHeadReview() = true for nil-projection provider block, want false (placeholder required)")
+	}
+}

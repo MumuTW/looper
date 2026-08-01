@@ -548,6 +548,27 @@ func (r *EventsRepository) ListByEntity(ctx context.Context, entityType, entityI
 	return scanEventLogs(rows)
 }
 
+// ListByEntityAndEventTypes reads only the requested event types for one entity.
+// Callers that project a single durable event (e.g. the Reviewer review marker)
+// use this to avoid loading the entity's entire event history on every poll.
+func (r *EventsRepository) ListByEntityAndEventTypes(ctx context.Context, entityType, entityID string, eventTypes []string) ([]EventLogRecord, error) {
+	if len(eventTypes) == 0 {
+		return []EventLogRecord{}, nil
+	}
+	args := make([]any, 0, len(eventTypes)+2)
+	args = append(args, entityType, entityID)
+	for _, eventType := range eventTypes {
+		args = append(args, eventType)
+	}
+	rows, err := r.q.QueryContext(ctx, `SELECT `+eventLogColumns+` FROM event_logs WHERE entity_type = ? AND entity_id = ? AND event_type IN (`+sqlPlaceholders(len(eventTypes))+`) ORDER BY created_at ASC, id ASC`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list event logs by entity and event types: %w", err)
+	}
+	defer rows.Close()
+
+	return scanEventLogs(rows)
+}
+
 // ListByEntityTypeAndEventTypes reads the complete lifecycle for one entity
 // family without imposing an arbitrary status-page limit. Callers derive live
 // projections from the returned durable events; this query does not record a

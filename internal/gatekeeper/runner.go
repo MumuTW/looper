@@ -77,6 +77,20 @@ type CheckEvidence struct {
 	Conclusion string `json:"conclusion,omitempty"`
 }
 
+// DiffBudgetEvidence records the provider-observed change size and the
+// configured bounds that were applied. See config.GatekeeperDiffBudget for the
+// gate's semantics and the blind spots it does not catch (no additions or
+// per-file bound, generated files not excluded, whole-PR totals against the
+// current merge base, and the merge action binding only the head — see
+// MergePullRequest — so a base advance between the final revalidation read and
+// the merge is not atomically refused).
+type DiffBudgetEvidence struct {
+	ChangedFiles    int `json:"changedFiles"`
+	Deletions       int `json:"deletions"`
+	MaxChangedFiles int `json:"maxChangedFiles"`
+	MaxDeletions    int `json:"maxDeletions"`
+}
+
 // CodexReviewEvidence is the durable Reviewer review signal considered by the
 // current-head gate. The event log is the authority because Reviewer appends
 // it only after its structured review marker has been verified.
@@ -101,6 +115,7 @@ type Evidence struct {
 	CodexReview                  *CodexReviewEvidence `json:"codexReview,omitempty"`
 	UnresolvedReviewThreadIDs    []string             `json:"unresolvedReviewThreadIds"`
 	HoldLabels                   []string             `json:"holdLabels"`
+	DiffBudget                   *DiffBudgetEvidence  `json:"diffBudget,omitempty"`
 	ProjectPolicyPermitsTarget   bool                 `json:"projectPolicyPermitsTarget"`
 	FinalObservedHeadSHA         string               `json:"finalObservedHeadSha,omitempty"`
 }
@@ -352,6 +367,14 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 	}
 	codexReview, err := latestCodexReviewForHead(ctx, r.repos, input.ProjectID, input.Repo, input.PRNumber, report.ObservedHeadSHA)
 	if err != nil {
+		// Persist the invalid projection so reportAwaitsCurrentHeadReview
+		// recognizes this report as waiting on review evidence. Without it the
+		// report carries only the provider reason and a nil CodexReview
+		// projection, which neither signal detects, so unchanged discovery
+		// would reuse this transient read failure for up to maxSkipAge even
+		// after the event store recovers or the review event appears. The
+		// placeholder carries RequiredHeadSHA and CurrentHeadValid=false.
+		report.Evidence.CodexReview = &codexReview
 		return r.persistProviderBlock(ctx, report, ReasonProviderStateUnavailable, "codex_review")
 	}
 	report.Evidence.CodexReview = &codexReview
