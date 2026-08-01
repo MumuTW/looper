@@ -318,12 +318,19 @@ func restore(bundleDirectory string, source upgradebackup.Source, operations fil
 		return operationErr
 	}
 
-	for _, entry := range journal.Entries {
+	for index, entry := range journal.Entries {
 		if !entry.HadOriginal {
 			continue
 		}
+		// Detach then re-verify inode content so a concurrent atomic replace
+		// between confirmTargetUnchanged and rename is not adopted as undo.
 		if err := operations.rename(entry.TargetPath, entry.UndoPath); err != nil {
 			return fail(fmt.Errorf("move original %s to undo path: %w", entry.Name, err))
+		}
+		if err := confirmUndoMatchesInspectedOriginal(states[index], entry); err != nil {
+			// Put the detached file back without replacing a recreate at target.
+			_ = installNoReplace(entry.UndoPath, entry.TargetPath, "original "+entry.Name+" (undo put-back)")
+			return fail(err)
 		}
 	}
 	if err := syncEntryDirectories(journal.Entries); err != nil {
@@ -445,6 +452,22 @@ func confirmTargetUnchanged(state targetState, description string) error {
 	}
 	if !state.present || !os.SameFile(state.info, current) || state.info.Mode().Perm() != current.Mode().Perm() {
 		return fmt.Errorf("existing %s changed while restore was staged", description)
+	}
+	return nil
+}
+
+// confirmUndoMatchesInspectedOriginal ensures the file renamed to undo is still
+// the same inode inspected before the move (not a concurrent replacement).
+func confirmUndoMatchesInspectedOriginal(state targetState, entry journalEntry) error {
+	if !state.present || state.info == nil {
+		return nil
+	}
+	undoInfo, err := os.Lstat(entry.UndoPath)
+	if err != nil {
+		return fmt.Errorf("inspect undo for %s after move: %w", entry.Name, err)
+	}
+	if !os.SameFile(state.info, undoInfo) {
+		return fmt.Errorf("undo for %s is not the inspected original (target was replaced during move)", entry.Name)
 	}
 	return nil
 }
