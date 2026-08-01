@@ -50,6 +50,25 @@ func TestEvaluatePullRequestPersistsEligibleReportBoundToHead(t *testing.T) {
 	}
 }
 
+func TestEvaluatePullRequestPreservesUnrecognizedMergeabilityEvidence(t *testing.T) {
+	t.Parallel()
+	fixture := newGatekeeperFixture(t)
+	fixture.github.mergeable.MergeableState = "future_state"
+
+	report, err := fixture.runner().EvaluatePullRequest(context.Background(), EvaluationInput{
+		ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, ExpectedHeadSHA: "head-1",
+	})
+	if err != nil {
+		t.Fatalf("EvaluatePullRequest() error = %v", err)
+	}
+	if report.Eligible || !slices.Equal(reasonCodes(report.Reasons), []ReasonCode{ReasonProviderStateAmbiguous}) {
+		t.Fatalf("report = %#v, want an ambiguous provider-state block", report)
+	}
+	if report.Evidence.MergeableState != "future_state" {
+		t.Fatalf("MergeableState evidence = %q, want future_state", report.Evidence.MergeableState)
+	}
+}
+
 func TestEvaluatePullRequestBlocksEachSafetyCondition(t *testing.T) {
 	tests := []struct {
 		name   string

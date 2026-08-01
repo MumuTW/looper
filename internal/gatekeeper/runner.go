@@ -334,16 +334,17 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 		return r.persist(ctx, report)
 	}
 	report.Evidence.Mergeable = mergeability.Mergeable
-	report.Evidence.MergeableState = strings.ToLower(strings.TrimSpace(mergeability.MergeableState))
-	if mergeability.Mergeable == nil || report.Evidence.MergeableState == "" || report.Evidence.MergeableState == "unknown" {
+	mergeabilityState := mergeability.MergeableState
+	report.Evidence.MergeableState = mergeabilityState.Raw()
+	if mergeability.Mergeable == nil || mergeabilityState.IsUnknown() {
 		return r.persistProviderBlock(ctx, report, ReasonProviderStateAmbiguous, "mergeability")
 	}
-	if !*mergeability.Mergeable || report.Evidence.MergeableState == "dirty" {
+	if !*mergeability.Mergeable || mergeabilityState.HasConflict() {
 		report.Reasons = append(report.Reasons, Reason{Code: ReasonMergeConflict})
-	} else if providerPolicyStateIsAmbiguous(report.Evidence.MergeableState) {
-		report.Reasons = append(report.Reasons, Reason{Code: ReasonProviderStateAmbiguous, Subject: "mergeability:" + report.Evidence.MergeableState})
-	} else if report.Evidence.MergeableState != "clean" {
-		report.Reasons = append(report.Reasons, Reason{Code: ReasonMergeabilityNotClean, Subject: report.Evidence.MergeableState})
+	} else if mergeabilityState.IsAmbiguousPolicyState() {
+		report.Reasons = append(report.Reasons, Reason{Code: ReasonProviderStateAmbiguous, Subject: "mergeability:" + mergeabilityState.Raw()})
+	} else if !mergeabilityState.IsClean() {
+		report.Reasons = append(report.Reasons, Reason{Code: ReasonMergeabilityNotClean, Subject: mergeabilityState.Raw()})
 	}
 
 	protection, err := r.github.GetBranchProtection(ctx, githubinfra.BranchProtectionInput{Repo: input.Repo, Branch: report.Evidence.BaseRefName, CWD: input.CWD})
@@ -638,13 +639,4 @@ func sortReasons(reasons []Reason) {
 		}
 		return reasons[i].Subject < reasons[j].Subject
 	})
-}
-
-func providerPolicyStateIsAmbiguous(state string) bool {
-	switch state {
-	case "blocked", "unstable", "has_hooks":
-		return true
-	default:
-		return false
-	}
 }

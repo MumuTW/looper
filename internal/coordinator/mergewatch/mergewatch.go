@@ -1,6 +1,10 @@
 package mergewatch
 
-import "time"
+import (
+	"time"
+
+	githubinfra "github.com/MumuTW/looper/internal/infra/github"
+)
 
 type WatchActionKind string
 
@@ -56,7 +60,7 @@ type PRSnapshot struct {
 	AutoMergeOwnedByLooper bool
 	HasLooperLabel         bool
 	Mergeable              *bool
-	MergeableState         string
+	MergeableState         githubinfra.MergeabilityState
 	RequiredChecks         RequiredCheckSummary
 	TemporaryError         *TemporaryError
 }
@@ -87,7 +91,7 @@ func Classify(snapshot PRSnapshot, prior *PriorWatchMarker, budget RetryBudget) 
 	if prior != nil && prior.PRNumber == snapshot.PRNumber && !snapshot.AutoMergeEnabled {
 		return WatchAction{Kind: ActionHumanDisabledAutoMerge}
 	}
-	if snapshot.Mergeable == nil || snapshot.MergeableState == "unknown" {
+	if snapshot.Mergeable == nil || snapshot.MergeableState.IsUnknown() {
 		firstUnknownAt := normalized.FirstUnknownAt
 		if firstUnknownAt == nil {
 			now := budget.Now.UTC()
@@ -99,7 +103,7 @@ func Classify(snapshot PRSnapshot, prior *PriorWatchMarker, budget RetryBudget) 
 		}
 		return WatchAction{Kind: ActionIndeterminate, FirstUnknownAt: firstUnknownAt}
 	}
-	if snapshot.MergeableState == "dirty" {
+	if snapshot.MergeableState.HasConflict() {
 		return WatchAction{Kind: ActionConflict}
 	}
 	if len(snapshot.RequiredChecks.Failed) > 0 {

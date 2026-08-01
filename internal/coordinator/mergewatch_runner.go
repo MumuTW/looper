@@ -181,7 +181,7 @@ func (r *Runner) mergeWatchSnapshot(ctx context.Context, repo, cwd string, issue
 		return mergewatch.PRSnapshot{}, nil, err
 	}
 	checks := mergewatch.RequiredCheckSummary{}
-	mergeableState := strings.ToLower(strings.TrimSpace(detail.MergeableState))
+	mergeableState := detail.MergeableState
 	protection, err := r.github.GetBranchProtection(ctx, githubinfra.BranchProtectionInput{Repo: repo, Branch: detail.BaseRefName, CWD: cwd})
 	if err != nil {
 		if isTransientMergeWatchError(err) {
@@ -202,7 +202,7 @@ func (r *Runner) mergeWatchSnapshot(ctx context.Context, repo, cwd string, issue
 		switch {
 		case status != "completed" && requiredCheck(requiredChecks, nameKey):
 			checks.Pending = append(checks.Pending, checkRun.Name)
-		case mergeableState == "unstable" && requiredCheck(requiredChecks, nameKey) && (conclusion == "failure" || conclusion == "timed_out" || conclusion == "cancelled" || conclusion == "action_required" || conclusion == "startup_failure" || conclusion == "stale"):
+		case mergeableState.IsUnstable() && requiredCheck(requiredChecks, nameKey) && (conclusion == "failure" || conclusion == "timed_out" || conclusion == "cancelled" || conclusion == "action_required" || conclusion == "startup_failure" || conclusion == "stale"):
 			checks.Failed = append(checks.Failed, checkRun.Name)
 		}
 	}
@@ -213,7 +213,7 @@ func (r *Runner) mergeWatchSnapshot(ctx context.Context, repo, cwd string, issue
 		switch {
 		case requiredCheck(requiredChecks, contextKey) && state == "pending":
 			checks.Pending = append(checks.Pending, status.Context)
-		case mergeableState == "unstable" && requiredCheck(requiredChecks, contextKey) && (state == "failure" || state == "error"):
+		case mergeableState.IsUnstable() && requiredCheck(requiredChecks, contextKey) && (state == "failure" || state == "error"):
 			checks.Failed = append(checks.Failed, status.Context)
 		}
 	}
@@ -250,7 +250,7 @@ func mergeWatchPartialSnapshot(repo string, issueNumber, prNumber int64, detail 
 		AutoMergeOwnedByLooper: detail.AutoMerge != nil && strings.EqualFold(strings.TrimSpace(detail.AutoMerge.EnabledBy), strings.TrimSpace(currentLogin)),
 		HasLooperLabel:         labels.AnyLooperOwned(detail.Labels),
 		Mergeable:              detail.Mergeable,
-		MergeableState:         strings.ToLower(strings.TrimSpace(detail.MergeableState)),
+		MergeableState:         detail.MergeableState,
 	}
 }
 

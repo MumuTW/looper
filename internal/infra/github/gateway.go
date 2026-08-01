@@ -159,7 +159,7 @@ type PullRequestDetail struct {
 	Reviews            []map[string]any
 	Checks             []map[string]any
 	Mergeable          *bool
-	MergeableState     string
+	MergeableState     MergeabilityState
 	MergedAt           string
 	AutoMerge          *PullRequestAutoMerge
 }
@@ -1683,7 +1683,7 @@ func pullRequestDetailFromViewRow(row map[string]any, threads []map[string]any, 
 		Reviews:            toObjectSlice(row["reviews"]),
 		Checks:             toObjectSlice(row["statusCheckRollup"]),
 		Mergeable:          boolPtrFromValue(row["mergeable"]),
-		MergeableState:     asString(row["mergeable_state"]),
+		MergeableState:     ParseMergeabilityState(firstNonEmpty(asString(row["mergeable_state"]), asString(row["mergeStateStatus"]))),
 		MergedAt:           asString(row["merged_at"]),
 		AutoMerge:          extractAutoMerge(row["auto_merge"]),
 	}
@@ -1728,7 +1728,7 @@ func (g *Gateway) ViewPullRequestMergeWatch(ctx context.Context, input ViewPullR
 		HeadSHA:        nestedString(row, "head", "sha"),
 		BaseSHA:        nestedString(row, "base", "sha"),
 		Mergeable:      boolPtrFromValue(row["mergeable"]),
-		MergeableState: firstNonEmpty(asString(row["mergeable_state"]), asString(row["mergeStateStatus"])),
+		MergeableState: ParseMergeabilityState(firstNonEmpty(asString(row["mergeable_state"]), asString(row["mergeStateStatus"]))),
 		AutoMerge:      extractAutoMerge(row["auto_merge"]),
 	}, nil
 }
