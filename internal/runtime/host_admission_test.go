@@ -1,6 +1,8 @@
 package runtime
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -142,6 +144,39 @@ func TestHostAdmissionStatePathFollowsTheDatabase(t *testing.T) {
 	cfg.Storage.DBPath = "/var/looper/state/looper.sqlite"
 	if got := hostAdmissionStatePath(cfg); got != "/var/looper/state" {
 		t.Fatalf("hostAdmissionStatePath() = %q, want the database's directory", got)
+	}
+}
+
+// A symlinked database file is followed to its target before the parent
+// directory is selected. SQLite writes to the target, so the disk signal must
+// measure the target's filesystem, not the one that merely holds the link;
+// taking filepath.Dir before resolving would admit work based on the link's
+// filesystem while the real database volume is full.
+func TestHostAdmissionStatePathResolvesSymlinkedDatabase(t *testing.T) {
+	t.Parallel()
+
+	linkDir := t.TempDir()
+	targetDir := t.TempDir()
+	target := filepath.Join(targetDir, "looper.sqlite")
+	if err := os.WriteFile(target, []byte{}, 0o600); err != nil {
+		t.Fatalf("create target database: %v", err)
+	}
+	link := filepath.Join(linkDir, "looper.sqlite")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatalf("create database symlink: %v", err)
+	}
+
+	// TempDir may itself sit behind a symlink (e.g. /var -> /private/var on
+	// macOS), so compare against the resolved target directory, not the raw one.
+	want, err := filepath.EvalSymlinks(targetDir)
+	if err != nil {
+		t.Fatalf("resolve target directory: %v", err)
+	}
+
+	cfg := config.Config{}
+	cfg.Storage.DBPath = link
+	if got := hostAdmissionStatePath(cfg); got != want {
+		t.Fatalf("hostAdmissionStatePath() = %q, want target directory %q (not the link's %q)", got, want, linkDir)
 	}
 }
 

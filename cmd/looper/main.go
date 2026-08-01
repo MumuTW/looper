@@ -897,8 +897,9 @@ type healthResponse struct {
 // daemonStatusResponse is the subset of GET /api/v1/status that `looper status`
 // prints for ops readiness. Unknown fields are ignored.
 type daemonStatusResponse struct {
-	Service statusServiceView `json:"service"`
-	Tools   statusToolsView   `json:"tools"`
+	Service       statusServiceView       `json:"service"`
+	Tools         statusToolsView         `json:"tools"`
+	ResourceGuard statusResourceGuardView `json:"resourceGuard"`
 }
 
 type statusServiceView struct {
@@ -963,6 +964,17 @@ type statusReviewPublishView struct {
 	Capability         string `json:"capability"`
 	PublishingDisabled bool   `json:"publishingDisabled"`
 	Reason             string `json:"reason"`
+}
+
+// statusResourceGuardView is the resource-guard slice of GET /api/v1/status.
+// The daemon publishes the structured admission decision so a deliberately idle
+// scheduler is distinguishable from an empty queue; `looper status` prints the
+// hold so an operator sees why no new work is starting.
+type statusResourceGuardView struct {
+	Enabled bool     `json:"enabled"`
+	Admit   bool     `json:"admit"`
+	Reasons []string `json:"reasons"`
+	Detail  string   `json:"detail"`
 }
 
 func writeStatusOpsLines(stdout io.Writer, status daemonStatusResponse) {
@@ -1033,6 +1045,22 @@ func writeStatusOpsLines(stdout io.Writer, status daemonStatusResponse) {
 	}
 	if len(status.Service.DegradedReasons) > 0 {
 		_, _ = fmt.Fprintf(stdout, "degraded: %s\n", strings.Join(status.Service.DegradedReasons, ", "))
+	}
+
+	// A resource-guard hold explains why the scheduler is deliberately idle:
+	// under low disk or high load the daemon withholds slots, and without this
+	// line a guarded daemon and an idle one look identical from `looper status`.
+	// Only a holding guard prints; an admitting or disabled one is not an
+	// anomaly worth a line.
+	if guard := status.ResourceGuard; guard.Enabled && !guard.Admit {
+		detail := strings.TrimSpace(guard.Detail)
+		if detail == "" {
+			detail = strings.Join(guard.Reasons, ", ")
+		}
+		if detail == "" {
+			detail = "host pressure"
+		}
+		_, _ = fmt.Fprintf(stdout, "resources: scheduler held (%s)\n", singleLine(detail))
 	}
 }
 

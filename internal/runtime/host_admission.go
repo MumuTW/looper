@@ -167,16 +167,42 @@ func thresholdsFromConfig(cfg config.ResourceGuardConfig) hostresources.Threshol
 // has no filesystem to measure; SQLiteFilesystemPath reports that as !isFile, and
 // the path falls through to the default home so the disk signal still reads a
 // real volume rather than a URI prefix.
+//
+// The filesystem path is resolved through filepath.EvalSymlinks before its
+// parent is selected. SQLite follows a symlinked database file to its target and
+// writes there, so taking filepath.Dir of the link would measure the filesystem
+// that holds the link while the database lives on the target's filesystem — the
+// guard could admit work based on ample space beside the symlink even when the
+// real database volume is full. A database that does not yet exist falls back to
+// the unresolved directory; statfs follows any symlink in that directory itself,
+// so only the file-level symlink needs resolving here.
 func hostAdmissionStatePath(cfg config.Config) string {
 	if path := strings.TrimSpace(cfg.Storage.DBPath); path != "" {
 		if fsPath, isFile, err := storage.SQLiteFilesystemPath(path); err == nil && isFile {
-			return filepath.Dir(fsPath)
+			return databaseDirForAdmission(fsPath)
 		}
 	}
 	if home, err := config.DefaultLooperHome(); err == nil {
 		return home
 	}
 	return "."
+}
+
+// databaseDirForAdmission resolves symlinks in the database path before
+// selecting its parent directory, so the disk signal measures the filesystem
+// SQLite writes to rather than the one that merely holds the link. See
+// hostAdmissionStatePath for why the file-level symlink must be resolved before
+// filepath.Dir is taken.
+func databaseDirForAdmission(dbPath string) string {
+	if resolved, err := filepath.EvalSymlinks(dbPath); err == nil {
+		return filepath.Dir(resolved)
+	}
+	// A database that has not been created yet cannot be resolved at the file
+	// level. Fall back to its directory as-is: statfs follows directory symlinks
+	// itself, so a symlinked parent directory still measures the target
+	// filesystem. Any other resolution error is treated as an absent signal,
+	// which Evaluate admits on, matching the guard's fail-open posture.
+	return filepath.Dir(dbPath)
 }
 
 // HostAdmissionStatus publishes the last host reading for the status surface.
