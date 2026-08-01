@@ -2411,10 +2411,10 @@ func (r *Runner) recoverClaimedItem(ctx context.Context, queueItem storage.Queue
 			if project == nil {
 				return nil, fmt.Errorf("project not found: %s", loop.ProjectID)
 			}
-			resumed := false
 			if runFailure != nil {
 				if breakerStreak > 0 && breakerPause != nil {
 					var resumeErr error
+					var resumed bool
 					resumed, resumeErr = r.finishFailureStreakBreaker(ctx, *project, *breakerPause, queueItem, runFailure.runID, &runFailure.checkpoint)
 					if resumeErr != nil {
 						return nil, resumeErr
@@ -2423,9 +2423,7 @@ func (r *Runner) recoverClaimedItem(ctx context.Context, queueItem storage.Queue
 						return &runpipe.ProcessResult{LoopID: derefString(queueItem.LoopID), QueueItemID: queueItem.ID, Status: "failed", Summary: failure.Message, FailureKind: failure.Kind}, nil
 					}
 				}
-				if !resumed {
-					r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, runFailure.runID, &runFailure.checkpoint)
-				}
+				r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, runFailure.runID, &runFailure.checkpoint)
 			}
 			scheduled, err := r.schedulePendingRediscoveryAfterRun(ctx, *loop, *queueItem.Repo, *queueItem.PRNumber)
 			if err != nil {
@@ -5602,15 +5600,19 @@ func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.P
 	if r.db == nil {
 		return loopUpsertResult{}, fmt.Errorf("fixer runner database is not configured")
 	}
-	var metadataJSON *string
-	if sourceWorkerID := fixerSourceWorkerIDForPullRequest(existingLoops, project.ID, repo, prNumber); sourceWorkerID != "" {
-		metadata, err := json.Marshal(map[string]any{"sourceWorkerId": sourceWorkerID})
-		if err != nil {
-			return loopUpsertResult{}, err
-		}
-		text := string(metadata)
-		metadataJSON = &text
+	metadata := map[string]any{}
+	if seededHead := strings.TrimSpace(headSHA); seededHead != "" {
+		metadata["fixerRoundBudget"] = roundBudgetState{Rounds: 0, LastHeadSHA: seededHead, FirstRoundAt: nowISO, RecordedAt: nowISO}
+		metadata["fixerRoundBudgetSeeded"] = true
 	}
+	if sourceWorkerID := fixerSourceWorkerIDForPullRequest(existingLoops, project.ID, repo, prNumber); sourceWorkerID != "" {
+		metadata["sourceWorkerId"] = sourceWorkerID
+	}
+	metadataEncoded, err := json.Marshal(metadata)
+	if err != nil {
+		return loopUpsertResult{}, err
+	}
+	metadataJSON := runpipe.StringPtr(string(metadataEncoded))
 	var loop storage.LoopRecord
 	if err := storage.WithTransaction(ctx, r.db, nil, func(tx *sql.Tx) error {
 		repos := storage.NewRepositories(tx)

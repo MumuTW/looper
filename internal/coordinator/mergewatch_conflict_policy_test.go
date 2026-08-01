@@ -2,6 +2,7 @@ package coordinator
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -81,7 +82,10 @@ func TestMergeWatchConflictRepairsSurviveHeadChangesAndRegenerateAtBoundary(t *t
 	if calls != 1 || got.ConflictRepairs != 2 {
 		t.Fatalf("regeneration calls/input = %d/%#v, want one call at repair 2", calls, got)
 	}
-	if !containsString(fixture.github.ops, "delete-comment") {
+	if got.ProjectID != fixture.projectID || got.Repo != "acme/looper" || got.IssueRepo != "acme/looper" || got.IssueNumber != 1 || got.PRNumber != 77 {
+		t.Fatalf("regeneration input = %#v, want project/repo/issue/PR routing preserved", got)
+	}
+	if !slices.Contains(fixture.github.ops, "delete-comment") {
 		t.Fatalf("ops = %v, want merge-watch marker cleanup after regeneration", fixture.github.ops)
 	}
 }
@@ -98,7 +102,7 @@ func TestMergeWatchConflictEscalationRemainsDurable(t *testing.T) {
 	if len(fixture.github.updatedBodies) != 2 || !strings.Contains(fixture.github.updatedBodies[0], "conflict_regen_pending=1") || !strings.Contains(fixture.github.updatedBodies[1], "conflict_regen_escalated=1") {
 		t.Fatalf("updatedBodies = %v, want pending fence followed by durable escalation marker", fixture.github.updatedBodies)
 	}
-	if containsString(fixture.github.ops, "delete-comment") {
+	if slices.Contains(fixture.github.ops, "delete-comment") {
 		t.Fatalf("ops = %v, want marker retained for human escalation", fixture.github.ops)
 	}
 }
@@ -120,6 +124,9 @@ func TestMergeWatchConflictPollDoesNotConsumeSameHeadRepairBudget(t *testing.T) 
 	}
 	if len(fixture.github.updatedBodies) != 2 || !strings.Contains(fixture.github.updatedBodies[1], "conflict_repairs=1") {
 		t.Fatalf("updatedBodies = %v, want same-head poll to retain one dispatched repair", fixture.github.updatedBodies)
+	}
+	if len(fixture.github.addedPRLabels) != 1 {
+		t.Fatalf("addedPRLabels = %#v, want no additional Fixer dispatch for the same head", fixture.github.addedPRLabels)
 	}
 }
 
@@ -158,13 +165,4 @@ func TestMergeWatchEscalationReevaluatesAfterHeadChanges(t *testing.T) {
 	if routes != 1 {
 		t.Fatalf("regeneration routes = %d, want one re-evaluation after head change", routes)
 	}
-}
-
-func containsString(values []string, want string) bool {
-	for _, value := range values {
-		if value == want {
-			return true
-		}
-	}
-	return false
 }

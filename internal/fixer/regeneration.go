@@ -59,20 +59,21 @@ func (e *RegenerationPermanentRejectionError) Error() string {
 // field is written after its remote action, so a crash can replay only the
 // missing suffix of comment -> close -> Planner route.
 type fixerRegenerationState struct {
-	Authority      string `json:"authority,omitempty"`
-	IssueRepo      string `json:"issueRepo,omitempty"`
-	IssueNumber    int64  `json:"issueNumber,omitempty"`
-	CommentID      int64  `json:"commentId,omitempty"`
-	Commented      bool   `json:"commented,omitempty"`
-	Closed         bool   `json:"closed,omitempty"`
-	Routed         bool   `json:"routed,omitempty"`
-	Escalated      bool   `json:"escalated,omitempty"`
-	EscalationWhy  string `json:"escalationWhy,omitempty"`
-	FailureSummary string `json:"failureSummary,omitempty"`
-	FailureKind    string `json:"failureKind,omitempty"`
-	Attempts       int64  `json:"attempts,omitempty"`
-	MaxAttempts    int64  `json:"maxAttempts,omitempty"`
-	FailureContext string `json:"failureContext,omitempty"`
+	Authority           string `json:"authority,omitempty"`
+	IssueRepo           string `json:"issueRepo,omitempty"`
+	IssueNumber         int64  `json:"issueNumber,omitempty"`
+	CommentID           int64  `json:"commentId,omitempty"`
+	Commented           bool   `json:"commented,omitempty"`
+	EscalationCommented bool   `json:"escalationCommented,omitempty"`
+	Closed              bool   `json:"closed,omitempty"`
+	Routed              bool   `json:"routed,omitempty"`
+	Escalated           bool   `json:"escalated,omitempty"`
+	EscalationWhy       string `json:"escalationWhy,omitempty"`
+	FailureSummary      string `json:"failureSummary,omitempty"`
+	FailureKind         string `json:"failureKind,omitempty"`
+	Attempts            int64  `json:"attempts,omitempty"`
+	MaxAttempts         int64  `json:"maxAttempts,omitempty"`
+	FailureContext      string `json:"failureContext,omitempty"`
 }
 
 func parseRegenerationState(metadata map[string]any) (fixerRegenerationState, bool) {
@@ -237,9 +238,6 @@ func (r *Runner) handleTerminalExhaustion(ctx context.Context, project storage.P
 			return regenerationNone, err
 		}
 		return regenerationEscalated, nil
-	}
-	if strings.EqualFold(strings.TrimSpace(pr.State), "merged") {
-		return r.persistRegenerationAbort(ctx, current, state, "pull request was merged concurrently; regeneration aborted")
 	}
 	if r.regenerationAvailability != nil {
 		if reason := strings.TrimSpace(r.regenerationAvailability(project.ID)); reason != "" {
@@ -491,6 +489,9 @@ func (r *Runner) RegenerateConflict(ctx context.Context, input ConflictRegenerat
 	}
 	if !strings.EqualFold(strings.TrimSpace(pr.State), "closed") && !strings.EqualFold(strings.TrimSpace(pr.State), "merged") {
 		if err := bridge.ClosePullRequest(ctx, ClosePullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, DeleteBranch: deleteBranch, CWD: input.CWD}); err != nil {
+			if errors.Is(err, githubinfra.ErrPullRequestAlreadyMerged) {
+				return ConflictRegenerationResult{Completed: true}, nil
+			}
 			return ConflictRegenerationResult{}, fmt.Errorf("close conflicted PR: %w", err)
 		}
 	}
@@ -558,7 +559,7 @@ func regenerationCommentOwnedBy(comment IssueComment, login, authority, outcome 
 	if login == "" || strings.TrimSpace(comment.Author) == "" || !strings.EqualFold(strings.TrimSpace(comment.Author), login) {
 		return false
 	}
-	if !strings.Contains(comment.Body, regenerationCommentMarker) || !strings.Contains(comment.Body, "authority="+authority) {
+	if !strings.Contains(comment.Body, regenerationCommentMarker) || !strings.Contains(comment.Body, "authority="+authority+" ") {
 		return false
 	}
 	return outcome == "" || strings.Contains(comment.Body, "outcome="+outcome)
@@ -577,6 +578,9 @@ func (r *Runner) regenerationDiscoveryLabels(projectID, role, fallback string) [
 	}
 	if len(configured.Discovery.Labels) == 0 {
 		return nil
+	}
+	if role == config.CodingRoleWorker {
+		return append([]string(nil), configured.Discovery.Labels...)
 	}
 	return []string{configured.Discovery.Labels[0]}
 }
@@ -622,7 +626,10 @@ func (r *Runner) persistRegenerationEscalation(ctx context.Context, loop storage
 		return fmt.Errorf("human escalation gateway is unavailable")
 	}
 	contextWithheld := false
-	if !state.Commented {
+	if !state.EscalationCommented {
+		// A pending marker also sets Commented. Inspect comments for a distinct
+		// escalation marker so a replay can publish the reason instead of
+		// mistaking the pending comment for the terminal outcome.
 		var err error
 		contextWithheld, err = r.hasContextWithheldEvent(ctx, loop.ID, repo, prNumber, reason)
 		if err != nil {
@@ -642,17 +649,17 @@ func (r *Runner) persistRegenerationEscalation(ctx context.Context, loop storage
 			}
 			for _, comment := range comments {
 				if strings.Contains(comment.Body, regenerationCommentMarker) && strings.Contains(comment.Body, "authority="+state.Authority) && strings.Contains(comment.Body, "outcome=escalated") {
-					state.CommentID, state.Commented = comment.ID, true
+					state.CommentID, state.EscalationCommented = comment.ID, true
 					break
 				}
 			}
 		}
 	}
-	if !state.Commented && !contextWithheld {
+	if !state.EscalationCommented && !contextWithheld {
 		comment, err := r.github.CreateIssueComment(ctx, IssueCommentInput{Repo: repo, IssueNumber: prNumber, Body: body, CWD: cwd, DisclosureAgent: r.agentRuntime, DisclosureModel: derefString(r.agentModel)})
 		switch {
 		case err == nil:
-			state.CommentID, state.Commented = comment.ID, true
+			state.CommentID, state.EscalationCommented = comment.ID, true
 		case outboundguard.IsRejection(err):
 			// The body embeds the durable FailureContext, so every retry would
 			// compose the byte-identical comment and hit the identical gate
@@ -668,8 +675,15 @@ func (r *Runner) persistRegenerationEscalation(ctx context.Context, loop storage
 			return fmt.Errorf("comment human escalation: %w", err)
 		}
 	}
-	// Checkpoint the comment before the label mutation. If labeling fails, a
-	// replay finds the same authority marker instead of posting a duplicate.
+		}
+	}
+	if contextWithheld {
+		state.EscalationCommented = true
+	}
+	state.Commented = true
+	// Checkpoint the escalation marker before the label mutation. If labeling
+	// fails, a replay finds the same authority marker instead of posting a
+	// duplicate, while a prior pending marker cannot suppress this escalation.
 	if _, err := r.mergeLoopMetadata(ctx, loop, map[string]any{"fixerRegeneration": state}); err != nil {
 		return err
 	}
@@ -677,8 +691,8 @@ func (r *Runner) persistRegenerationEscalation(ctx context.Context, loop storage
 		return fmt.Errorf("label human escalation: %w", err)
 	}
 	state.Escalated = true
-	_, err := r.mergeLoopMetadata(ctx, loop, map[string]any{"fixerRegeneration": state})
-	return err
+	_, mergeErr := r.mergeLoopMetadata(ctx, loop, map[string]any{"fixerRegeneration": state})
+	return mergeErr
 }
 
 // escalateWithoutFailureContext completes a human escalation after the content

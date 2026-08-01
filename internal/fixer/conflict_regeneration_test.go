@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	githubinfra "github.com/MumuTW/looper/internal/infra/github"
 	"github.com/MumuTW/looper/internal/labels"
 )
 
@@ -100,6 +101,25 @@ func TestRegenerateConflictReplaysCompletedMarkerWithoutSideEffects(t *testing.T
 	}
 }
 
+func TestRegenerateConflictReplaysPendingMarkerOnClosedPR(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	gateway := &regenerationFakeGateway{
+		fakeGitHubGateway: &fakeGitHubGateway{currentUser: "looper", viewResponses: []PullRequestDetail{{Number: 42, State: "CLOSED", HeadRefName: "looper/fix-42", HeadSHA: "head-42"}}},
+		issue:             IssueDetail{Number: 7, State: "OPEN"},
+		comments:          []IssueComment{{Author: "looper", Body: regenerationCommentMarker + " authority=coordinator-conflict:acme/looper#42 outcome=pending -->"}},
+	}
+	routes := 0
+	runner := newRegenerationRunner(t, fixture, gateway, func(_ context.Context, _ RegenerateIssueInput) error { routes++; return nil })
+	project, _ := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	result, err := runner.RegenerateConflict(context.Background(), ConflictRegenerationInput{ProjectID: "project_1", Repo: "acme/looper", IssueRepo: "acme/looper", IssueNumber: 7, PRNumber: 42, ConflictRepairs: 2, CWD: project.RepoPath})
+	if err != nil {
+		t.Fatalf("RegenerateConflict() error = %v", err)
+	}
+	if !result.Completed || routes != 1 || len(gateway.closeCalls) != 0 || len(gateway.fakeGitHubGateway.createIssueComments) != 1 {
+		t.Fatalf("pending replay result/routes/closes/comments = %#v/%d/%d/%d, want completed/one route/no close/completed marker", result, routes, len(gateway.closeCalls), len(gateway.fakeGitHubGateway.createIssueComments))
+	}
+}
+
 func TestRegenerateConflictSkipsFreshlyMergedPR(t *testing.T) {
 	fixture := newRunnerFixture(t)
 	gateway := &regenerationFakeGateway{
@@ -163,5 +183,23 @@ func TestRegenerateConflictLabelsBeforeWritingEscalationMarker(t *testing.T) {
 	}
 	if len(gateway.fakeGitHubGateway.createIssueComments) != 0 {
 		t.Fatalf("escalation comments = %d, want no terminal marker before label succeeds", len(gateway.fakeGitHubGateway.createIssueComments))
+	}
+}
+
+func TestRegenerateConflictTreatsConcurrentMergeAsCompleted(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	gateway := &regenerationFakeGateway{
+		fakeGitHubGateway: &fakeGitHubGateway{
+			currentUser:   "looper",
+			viewResponses: []PullRequestDetail{{Number: 42, State: "OPEN", HeadRefName: "looper/fix-42", HeadSHA: "head-42"}},
+		},
+		issue: IssueDetail{Number: 7, State: "OPEN"}, commits: []PullRequestCommit{{AuthorLogin: "looper", CommitterLogin: "looper"}}, closeErr: githubinfra.ErrPullRequestAlreadyMerged,
+	}
+	routes := 0
+	runner := newRegenerationRunner(t, fixture, gateway, func(context.Context, RegenerateIssueInput) error { routes++; return nil })
+	project, _ := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	result, err := runner.RegenerateConflict(context.Background(), ConflictRegenerationInput{ProjectID: "project_1", Repo: "acme/looper", IssueRepo: "acme/looper", IssueNumber: 7, PRNumber: 42, ConflictRepairs: 2, CWD: project.RepoPath})
+	if err != nil || !result.Completed || routes != 0 {
+		t.Fatalf("RegenerateConflict() = (%#v, %v), routes=%d; want completed no-op", result, err, routes)
 	}
 }

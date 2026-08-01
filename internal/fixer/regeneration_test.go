@@ -41,6 +41,8 @@ func (f *regenerationFakeGateway) CreateIssueComment(ctx context.Context, input 
 	return f.fakeGitHubGateway.CreateIssueComment(ctx, input)
 }
 
+var _ RegenerationGateway = (*regenerationFakeGateway)(nil)
+
 func (f *regenerationFakeGateway) ViewIssue(context.Context, ViewIssueInput) (IssueDetail, error) {
 	return f.issue, nil
 }
@@ -295,10 +297,10 @@ func TestRegenerationDiscoveryLabelsUseProjectRoleOverrides(t *testing.T) {
 	}
 	planLabels := []string{"project-plan"}
 	workerLabels := []string{"project-worker"}
-	any := config.LabelModeAny
+	anyMode := config.LabelModeAny
 	cfg.Projects = []config.ProjectRefConfig{{ID: "project_1", Roles: &config.PartialRoleConfigs{
-		Planner: &config.PartialPlannerRoleConfig{Triggers: &config.PartialIssueRoleTriggersConfig{Labels: &planLabels, LabelMode: &any}},
-		Worker:  &config.PartialWorkerRoleConfig{Triggers: &config.PartialIssueRoleTriggersConfig{Labels: &workerLabels, LabelMode: &any}},
+		Planner: &config.PartialPlannerRoleConfig{Triggers: &config.PartialIssueRoleTriggersConfig{Labels: &planLabels, LabelMode: &anyMode}},
+		Worker:  &config.PartialWorkerRoleConfig{Triggers: &config.PartialIssueRoleTriggersConfig{Labels: &workerLabels, LabelMode: &anyMode}},
 	}}}
 	runner := New(Options{CustomInstructions: &cfg})
 	if got := runner.regenerationDiscoveryLabels("project_1", config.CodingRolePlanner, labels.DefaultPlanTrigger); len(got) != 1 || got[0] != "project-plan" {

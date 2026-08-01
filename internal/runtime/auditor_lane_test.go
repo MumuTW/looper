@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -21,13 +22,17 @@ type fakeAuditorGateway struct {
 	checks           githubinfra.PullRequestCheckRuns
 	annotations      map[int64][]githubinfra.CheckRunAnnotation
 	annotationErrors map[int64]error
+	headCalls        int
+	checkCalls       int
 }
 
-func (f fakeAuditorGateway) GetBranchHeadSHA(context.Context, githubinfra.BranchHeadInput) (string, error) {
+func (f *fakeAuditorGateway) GetBranchHeadSHA(context.Context, githubinfra.BranchHeadInput) (string, error) {
+	f.headCalls++
 	return f.head, nil
 }
 
-func (f fakeAuditorGateway) ListPullRequestCheckRuns(context.Context, githubinfra.PullRequestCheckRunsInput) (githubinfra.PullRequestCheckRuns, error) {
+func (f *fakeAuditorGateway) ListPullRequestCheckRuns(context.Context, githubinfra.PullRequestCheckRunsInput) (githubinfra.PullRequestCheckRuns, error) {
+	f.checkCalls++
 	return f.checks, nil
 }
 
@@ -101,13 +106,48 @@ func TestObservePostMergeFailureSkipsDisabledProject(t *testing.T) {
 	coordinator := openMigratedCoordinator(t, filepath.Join(t.TempDir(), "auditor.sqlite"), t.TempDir())
 	repos := storage.NewRepositories(coordinator.DB())
 	project := storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()}
-	gateway := fakeAuditorGateway{head: "base", checks: githubinfra.PullRequestCheckRuns{}}
+	gateway := &fakeAuditorGateway{head: "base", checks: githubinfra.PullRequestCheckRuns{}}
 	if err := observePostMergeFailure(ctx, repos, gateway, project, "acme/looper", "main", config.AuditorRoleConfig{}, time.Now); err != nil {
 		t.Fatalf("disabled observe error = %v", err)
 	}
 	events, err := repos.Events.List(ctx, 10)
 	if err != nil || len(events) != 0 {
 		t.Fatalf("events after disabled observer = %#v, %v", events, err)
+	}
+}
+
+func TestObservePostMergeFailureSkipsProviderWhenNoMergeCandidate(t *testing.T) {
+	ctx := context.Background()
+	coordinator := openMigratedCoordinator(t, filepath.Join(t.TempDir(), "auditor.sqlite"), t.TempDir())
+	repos := storage.NewRepositories(coordinator.DB())
+	project := storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()}
+	gateway := &fakeAuditorGateway{head: "base", checks: githubinfra.PullRequestCheckRuns{CheckRuns: []githubinfra.PullRequestCheckRun{{Name: "ci", Status: "completed", Conclusion: "failure"}}}}
+	if err := observePostMergeFailure(ctx, repos, gateway, project, "acme/looper", "main", config.AuditorRoleConfig{Enabled: true, WindowMinutes: 60}, time.Now); err != nil {
+		t.Fatalf("observe without merge candidate error = %v", err)
+	}
+	if gateway.headCalls != 0 || gateway.checkCalls != 0 {
+		t.Fatalf("provider calls = head:%d checks:%d, want none without a local merge candidate", gateway.headCalls, gateway.checkCalls)
+	}
+}
+
+func TestObservePostMergeFailureRejectsTruncatedChecks(t *testing.T) {
+	ctx := context.Background()
+	workdir := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(workdir, "auditor.sqlite"), t.TempDir())
+	repos := storage.NewRepositories(coordinator.DB())
+	projectID, repo, base := "project_1", "acme/looper", "main"
+	project := storage.ProjectRecord{ID: projectID, RepoPath: workdir}
+	now := time.Now().UTC()
+	if err := repos.Projects.Upsert(ctx, project); err != nil {
+		t.Fatal(err)
+	}
+	if err := eventlog.Append(ctx, repos, eventlog.AppendInput{EventType: gatekeeper.MergeOutcomeEventType, ProjectID: &projectID, Payload: gatekeeper.MergeOutcome{Version: 1, ProjectID: projectID, Repo: repo, PRNumber: 42, HeadSHA: "pr-sha", Merged: true}, CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	gateway := &fakeAuditorGateway{head: "base-sha", checks: githubinfra.PullRequestCheckRuns{TotalCount: 2, CheckRuns: []githubinfra.PullRequestCheckRun{{Name: "ci", Status: "completed", Conclusion: "failure"}}}}
+	err := observePostMergeFailure(ctx, repos, gateway, project, repo, base, config.AuditorRoleConfig{Enabled: true, WindowMinutes: 60}, func() time.Time { return now.Add(time.Minute) })
+	if err == nil || !strings.Contains(err.Error(), "truncated check-run snapshot") {
+		t.Fatalf("observe truncated checks error = %v, want fail-closed truncation error", err)
 	}
 }
 

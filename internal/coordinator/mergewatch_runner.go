@@ -21,6 +21,10 @@ import (
 var mergeWatchPRURLPattern = regexp.MustCompile(`/pull/(\d+)(?:/|$)`)
 var mergeWatchClosingReferencePattern = regexp.MustCompile(`(?i)(?:close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved)\s+((?:https?://[^\s)]+/issues/\d+)|(?:[\w.-]+/[\w.-]+#\d+)|#\d+)`)
 
+// defaultConflictMaxRepairs mirrors the validated config default used when a
+// zero-value RoleConfigs is supplied by an embedder or test fixture.
+const defaultConflictMaxRepairs = 2
+
 type mergeWatchComment struct {
 	ID      int64
 	Summary string
@@ -141,14 +145,14 @@ func (r *Runner) applyMergeWatchLocked(ctx context.Context, projectID, repo, cwd
 		repairAttempt := false
 		if action.Kind == mergewatch.ActionConflict {
 			repairAttempt = newConflictRepairAttempt(marker, snapshot)
-			maxRepairs := 2
+			maxRepairs := defaultConflictMaxRepairs
 			if roles.Coordinator.ConflictPolicy != nil {
 				maxRepairs = roles.Coordinator.ConflictPolicy.MaxRepairs
 			}
 			if maxRepairs <= 0 {
 				// Keep zero-value RoleConfigs source-compatible for embedders and
 				// unit fixtures; validated runtime configs always carry the default.
-				maxRepairs = 2
+				maxRepairs = defaultConflictMaxRepairs
 			}
 			// ConflictRepairs counts repair dispatches, not the observation that
 			// follows a dispatch. Check the existing count before dispatching so a
@@ -171,6 +175,9 @@ func (r *Runner) applyMergeWatchLocked(ctx context.Context, projectID, repo, cwd
 		baseMarker.NextRetryAt = nil
 		baseMarker.Retries = roles.Coordinator.MergeWatch.TransientRetries
 		summary := fmt.Sprintf("Coordinator merge-watch routed PR #%d to Fixer for %s.", snapshot.PRNumber, strings.ToLower(string(action.Kind)))
+		if action.Kind == mergewatch.ActionConflict && !repairAttempt {
+			summary = fmt.Sprintf("Coordinator merge-watch is waiting on the existing Fixer repair for PR #%d.", snapshot.PRNumber)
+		}
 		return false, r.upsertMergeWatchComment(ctx, repo, cwd, issue.detail.Number, marker, baseMarker, summary)
 	case mergewatch.ActionTransientError:
 		if action.Exhausted {
