@@ -91,6 +91,15 @@ func (r *Runner) reconcileRoutingLabels(ctx context.Context, report Report, prev
 			return err
 		}
 	}
+	// Reviewer convergence is local durable policy input, not part of the forge
+	// state read above. Re-read it at the same authority boundary so a newly
+	// persisted floor-qualified item cannot arrive between evaluation and an
+	// auto-merge projection unnoticed.
+	if report.Evidence.ReviewerConvergence != nil || plan.autoMerge {
+		if err := r.revalidateReviewerConvergence(ctx, report, expectedHead); err != nil {
+			return err
+		}
+	}
 	// The final head (and, when applicable, merge-base) read must happen after
 	// thread revalidation. A push during that provider call otherwise leaves the
 	// label write bound to a head that Gatekeeper never confirmed at the end of
@@ -124,6 +133,27 @@ func (r *Runner) reconcileRoutingLabels(ctx context.Context, report Report, prev
 		return fmt.Errorf("skip routing labels because pull request head moved from %s to %s", expectedHead, strings.TrimSpace(currentHead))
 	}
 	return r.applyRoutingLabelPlan(ctx, report, plan)
+}
+
+func (r *Runner) revalidateReviewerConvergence(ctx context.Context, report Report, expectedHead string) error {
+	current, hasCurrent, err := latestReviewerConvergence(ctx, r.repos, report.ProjectID, report.Repo, report.PRNumber, expectedHead)
+	if err != nil {
+		return fmt.Errorf("revalidate Reviewer convergence before routing labels: %w", err)
+	}
+	previous := report.Evidence.ReviewerConvergence
+	if previous == nil {
+		if hasCurrent && reviewerConvergenceBlocks(current) {
+			return fmt.Errorf("skip routing labels because Reviewer convergence now blocks: %s", reviewerConvergenceReasonSubject(current))
+		}
+		return nil
+	}
+	if !hasCurrent {
+		return fmt.Errorf("skip routing labels because Reviewer convergence evidence disappeared")
+	}
+	if convergenceRevision(current) != convergenceRevision(*previous) || current.HeadStale != previous.HeadStale {
+		return fmt.Errorf("skip routing labels because Reviewer convergence advanced")
+	}
+	return nil
 }
 
 func (r *Runner) revalidateUnresolvedReviewThreads(ctx context.Context, report Report) error {
