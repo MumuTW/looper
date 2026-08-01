@@ -75,28 +75,6 @@ type configResponse struct {
 	Metadata      ConfigMetadata            `json:"metadata"`
 }
 
-// redactProjectSecrets copies projects with their deploy credentials removed.
-//
-// projects[].roles.deployer.environment holds the values a deploy authenticates
-// with — the same class of secret as daemon.environment, which this response
-// already withholds. The copy is deep through Roles because the slice copy shares
-// that pointer with the live configuration.
-func redactProjectSecrets(projects []config.ProjectRefConfig) []config.ProjectRefConfig {
-	redacted := append([]config.ProjectRefConfig{}, projects...)
-	for i := range redacted {
-		roles := redacted[i].Roles
-		if roles == nil || roles.Deployer == nil || roles.Deployer.Environment == nil {
-			continue
-		}
-		deployer := *roles.Deployer
-		deployer.Environment = nil
-		clonedRoles := *roles
-		clonedRoles.Deployer = &deployer
-		redacted[i].Roles = &clonedRoles
-	}
-	return redacted
-}
-
 type configRolesResponse struct {
 	Coding      map[string]config.CodingRoleConfig `json:"coding"`
 	Planner     config.PlannerRoleConfig           `json:"planner"`
@@ -201,7 +179,7 @@ func (h *Handler) buildConfigResponse() configResponse {
 			Coordinator: cfg.Roles.Coordinator,
 		},
 		Providers: append([]config.ProviderConfig{}, cfg.Providers...),
-		Projects:  redactProjectSecrets(cfg.Projects),
+		Projects:  config.RedactProjectSecrets(cfg.Projects),
 		Metadata:  h.buildConfigMetadata(),
 	}
 }
