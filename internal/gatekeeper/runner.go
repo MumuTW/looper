@@ -5,6 +5,7 @@ package gatekeeper
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -363,6 +364,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		}
 	}
 	reviewThreshold := r.requiredReviewChangedLinesFor(input.ProjectID)
+	var evaluationErrs []error
 	stillOpen := make(map[string]struct{}, len(pullRequests))
 	for _, pullRequest := range pullRequests {
 		fingerprint := r.sourceFingerprintForProject(pullRequest, input.ProjectID, input.Repo)
@@ -411,8 +413,16 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 			CWD: input.CWD, ExpectedHeadSHA: pullRequest.HeadSHA, SourceFingerprint: fingerprint,
 		})
 		if err != nil {
-			publishDeferredStatuses()
-			return result, err
+			// Evaluation persists a durable report before a routing projection
+			// failure is returned. Keep that report in the result, then continue
+			// through the stable list so one PR's forge failure cannot strand
+			// stale routes on every later PR.
+			if report.PRNumber == pullRequest.Number {
+				result.Evaluated++
+				result.Reports = append(result.Reports, report)
+			}
+			evaluationErrs = append(evaluationErrs, fmt.Errorf("evaluate pull request %s#%d: %w", input.Repo, pullRequest.Number, err))
+			continue
 		}
 		result.Evaluated++
 		result.Reports = append(result.Reports, report)
@@ -423,8 +433,8 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 			ProjectID: input.ProjectID, Repo: input.Repo, PRNumber: previousReports[entityID].PRNumber, CWD: input.CWD,
 		})
 		if err != nil {
-			publishDeferredStatuses()
-			return result, err
+			evaluationErrs = append(evaluationErrs, fmt.Errorf("evaluate departed pull request %s#%d: %w", input.Repo, previousReports[entityID].PRNumber, err))
+			continue
 		}
 		result.Reconciled++
 		result.Reports = append(result.Reports, report)
@@ -445,6 +455,9 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		}
 	}
 	publishDeferredStatuses()
+	if len(evaluationErrs) > 0 {
+		return result, errors.Join(evaluationErrs...)
+	}
 	return result, nil
 }
 

@@ -24,6 +24,7 @@ import (
 	"github.com/MumuTW/looper/internal/labels"
 	"github.com/MumuTW/looper/internal/outboundguard"
 	"github.com/MumuTW/looper/internal/storage"
+	"gopkg.in/yaml.v3"
 )
 
 const javaScriptISOStringLayout = "2006-01-02T15:04:05.000Z"
@@ -2514,25 +2515,41 @@ func (g *Gateway) ValidateMergifyRouting(ctx context.Context, input ValidateMerg
 	if err != nil {
 		return fmt.Errorf("decode .mergify.yml: %w", err)
 	}
-	text := string(content)
-	queueStart := strings.Index(text, "queue_conditions:")
-	if queueStart < 0 {
-		return fmt.Errorf(".mergify.yml has no queue_conditions")
+	var contract struct {
+		QueueRules []struct {
+			QueueConditions []string `yaml:"queue_conditions"`
+		} `yaml:"queue_rules"`
+		MergeProtectionsSettings struct {
+			AutoMergeConditions []string `yaml:"auto_merge_conditions"`
+		} `yaml:"merge_protections_settings"`
 	}
-	queueEnd := strings.Index(text[queueStart+len("queue_conditions:"):], "\nmerge_protections:")
-	if queueEnd < 0 {
-		queueEnd = len(text) - queueStart - len("queue_conditions:")
+	if err := yaml.Unmarshal(content, &contract); err != nil {
+		return fmt.Errorf("parse .mergify.yml: %w", err)
 	}
-	queue := text[queueStart : queueStart+len("queue_conditions:")+queueEnd]
-	for _, fragment := range []string{"- label != needs-human-review", "- label != do-not-merge"} {
-		if !strings.Contains(queue, fragment) {
-			return fmt.Errorf(".mergify.yml queue_conditions missing %q", fragment)
+	if len(contract.QueueRules) == 0 {
+		return fmt.Errorf(".mergify.yml has no queue_rules")
+	}
+	for index, rule := range contract.QueueRules {
+		for _, condition := range []string{"label != needs-human-review", "label != do-not-merge"} {
+			if !hasMergifyCondition(rule.QueueConditions, condition) {
+				return fmt.Errorf(".mergify.yml queue_rules[%d] queue_conditions missing %q", index, condition)
+			}
 		}
 	}
-	if !strings.Contains(text, "merge_protections_settings:") || !strings.Contains(text, "label = auto-merge") {
+	if !hasMergifyCondition(contract.MergeProtectionsSettings.AutoMergeConditions, "label = auto-merge") {
 		return fmt.Errorf(".mergify.yml has no auto-merge label contract")
 	}
 	return nil
+}
+
+func hasMergifyCondition(conditions []string, expected string) bool {
+	want := strings.Join(strings.Fields(expected), " ")
+	for _, condition := range conditions {
+		if strings.Join(strings.Fields(condition), " ") == want {
+			return true
+		}
+	}
+	return false
 }
 
 func (g *Gateway) ResolveReviewThread(ctx context.Context, input ResolveReviewThreadInput) error {
