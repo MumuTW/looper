@@ -23,7 +23,7 @@ For source development:
 
 Looper uses Go binaries as the default supported implementation. Installing is manual: you place two binaries, write a config, and run the daemon yourself.
 
-> **There is no managed daemon install and no setup wizard.** `looper bootstrap`, `looper daemon install|start|status|logs|restart`, and `looper upgrade` were removed along with the old CLI ahead of the role-model rewrite. Nothing installs, supervises, or upgrades `looperd` for you.
+> **There is no managed daemon install and no setup wizard.** `looper bootstrap`, `looper daemon install|start|status|logs|restart`, remain out of the managed-install path. Controlled upgrade starts with read-only `looper upgrade preflight`; nothing silently self-upgrades `looperd` for you.
 
 ### 1. Install the CLI
 
@@ -144,7 +144,15 @@ looper stop <selector>   # fails loudly if looperd is down or the loop is unknow
 
 ## Upgrade
 
-Manual: replace the binaries. Download the newer `looper-<target>.tar.gz` and `looperd-<target>.tar.gz` release artifacts (or re-run the install script for the CLI), put them back on your `PATH`, and restart `looperd`. There is no self-upgrade, version check, rollback, or channel switching.
+Before replacing binaries, run a read-only preflight against explicit candidate paths:
+
+```bash
+looper upgrade preflight --target-looper /path/to/candidate/looper --target-looperd /path/to/candidate/looperd --json
+```
+
+Preflight only calls `GET /api/v1/version` and `GET /api/v1/status` on the running daemon and executes the candidate binaries' identity (and optional `--check-config`) commands. It does not start a second production daemon or mutate the production database. Incomplete build identities never count as a matching CLI/daemon pair.
+
+Manual cutover after a clean preflight: replace the binaries from matching release artifacts. Download the newer `looper-<target>.tar.gz` and `looperd-<target>.tar.gz` release artifacts (or re-run the install script for the CLI), put them back on your `PATH`, and restart `looperd`. There is no self-upgrade, version check, rollback, or channel switching.
 
 ## Compatibility and version policy
 
