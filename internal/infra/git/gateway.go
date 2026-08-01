@@ -93,7 +93,7 @@ type InspectHeadInput struct {
 }
 
 type InspectHeadResult struct {
-	HeadSHA               string
+	HeadSHA string
 	// Branch is the attached branch name, or "HEAD" when detached.
 	Branch                string
 	NewCommitSHAs         []string
