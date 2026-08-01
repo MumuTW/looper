@@ -244,7 +244,11 @@ func (r *ActiveExecutionRegistry) AdmitOperation(ctx context.Context, meta Opera
 	closed := r.admissionClosed
 	r.mu.Unlock()
 
-	// Project the same admission Authority as spawns/claims (starting/stopping/degraded).
+	// The scheduler's outer WithAllowAgentClaim already holds the lifecycle and
+	// provider gates across this operation lease. Do not call AllowClaim through
+	// allowAgentSpawn(nil) here: that would re-enter the non-reentrant admission
+	// mutex and deadlock. The registry's local admissionClosed check below still
+	// closes a lease that races with shutdown.
 	if allow != nil {
 		if err := allow(nil); err != nil {
 			return nil, errors.Join(ErrOperationAdmissionClosed, err)

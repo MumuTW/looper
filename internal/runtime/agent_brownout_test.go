@@ -117,7 +117,12 @@ func TestAgentBrownoutIsolatedByEffectiveVendor(t *testing.T) {
 	}
 	// An unattributed legacy callback must not recreate a healthy default bucket
 	// once all configured providers are open.
+	logger := &recordingLogger{}
+	rt.logger = logger
 	rt.activeExecutions.ReportAgentOutcome(agent.Outcome{Status: "completed", Succeeded: true})
+	if !logger.sawWarn("agent outcome missing effective provider attribution; outcome ignored") {
+		t.Fatal("unattributed outcome was dropped without a warning")
+	}
 	if err := rt.AllowClaim(); !errors.Is(err, brownout.ErrOpen) {
 		t.Fatalf("unattributed outcome bypassed configured provider breakers: %v", err)
 	}
@@ -153,6 +158,37 @@ func TestAgentBrownoutGateCoversClaimCriticalSection(t *testing.T) {
 	}
 }
 
+func TestAgentBrownoutGateBlocksRecursiveSpawnUntilSectionEnds(t *testing.T) {
+	rt, _ := brownoutRuntime(t, nil)
+	type spawnResult struct {
+		lease agent.SpawnLease
+		err   error
+	}
+	result := make(chan spawnResult, 1)
+	if err := rt.WithAllowAgentClaim(func() {
+		go func() {
+			lease, err := rt.activeExecutions.AdmitSpawn(context.Background(), agent.SpawnMeta{Vendor: "_default"})
+			result <- spawnResult{lease: lease, err: err}
+		}()
+		select {
+		case <-result:
+			t.Fatal("recursive spawn admission completed while the non-reentrant gate was held")
+		case <-time.After(20 * time.Millisecond):
+		}
+	}); err != nil {
+		t.Fatalf("WithAllowAgentClaim() = %v", err)
+	}
+	select {
+	case got := <-result:
+		if got.err != nil {
+			t.Fatalf("spawn admission after critical section = %v", got.err)
+		}
+		got.lease.Release()
+	case <-time.After(time.Second):
+		t.Fatal("recursive spawn admission stayed blocked after the critical section ended")
+	}
+}
+
 func TestAgentBrownoutIgnoresPreCooldownOutcomesAsProbes(t *testing.T) {
 	rt, clock := brownoutRuntime(t, func(cfg *config.AgentBrownoutConfig) {
 		cfg.MinFailures = 3
@@ -178,6 +214,7 @@ func TestAgentBrownoutIgnoresPreCooldownOutcomesAsProbes(t *testing.T) {
 	if got := rt.agentHealth.breaker(vendor).Snapshot().State; got != brownout.StateHalfOpen {
 		t.Fatalf("pre-cooldown outcome changed state to %s, want half_open", got)
 	}
+	clock.advance(time.Nanosecond)
 	rt.activeExecutions.ReportAgentOutcome(agent.Outcome{Vendor: vendor, BrownoutProbe: true, StartedAt: clock.now(), Status: "completed", Succeeded: true})
 	if got := rt.agentHealth.breaker(vendor).Snapshot().State; got != brownout.StateClosed {
 		t.Fatalf("probe outcome left state %s, want closed", got)
@@ -200,6 +237,9 @@ func TestWorktreeCleanupContinuesDuringAgentBrownout(t *testing.T) {
 	summary := fixture.runtime.runWorktreeCleanupPass(context.Background(), fixture.repos, git, fixture.config)
 	if summary.LastStatus != "completed" {
 		t.Fatalf("cleanup status = %#v, want completed while brownout is open", summary)
+	}
+	if events := fixture.events(t); !containsWorktreeCleanupEvent(events, "worktree.cleanup.completed") {
+		t.Fatalf("events = %#v, want durable completion event while brownout is open", events)
 	}
 }
 
@@ -260,6 +300,22 @@ func TestAdmissionOutranksAgentBrownout(t *testing.T) {
 	}
 	if err == nil {
 		t.Fatal("AllowClaim() allowed work while stopping")
+	}
+}
+
+func TestWithAllowClaimAdmissionOutranksAgentBrownout(t *testing.T) {
+	rt, clock := brownoutRuntime(t, nil)
+	failAgent(rt, clock, 3)
+	if err := rt.admission.BeginShutdown("test"); err != nil {
+		t.Fatalf("BeginShutdown() error = %v", err)
+	}
+	ran := false
+	err := rt.WithAllowClaim(func() { ran = true })
+	if errors.Is(err, brownout.ErrOpen) {
+		t.Fatalf("WithAllowClaim() reported brownout while stopping: %v", err)
+	}
+	if err == nil || ran {
+		t.Fatalf("WithAllowClaim() = %v ran=%t, want admission refusal", err, ran)
 	}
 }
 

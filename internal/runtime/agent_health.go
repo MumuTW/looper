@@ -15,22 +15,26 @@ const defaultAgentHealthVendor = "_default"
 // agentHealthRegistry keeps provider health independent while retaining one
 // lifecycle gate for scheduler work. The gateMu is held across a durable claim
 // or enqueue section so an outcome cannot open a provider breaker between its
-// admission check and the mutation it authorizes.
+// admission check and the mutation it authorizes; removing it reintroduces the
+// exact point-in-time race the brownout gate is meant to close. It is deliberately
+// non-reentrant: callbacks must not spawn or consult provider health while the
+// section is held, and operation leases use the outer scheduler admission.
 type agentHealthRegistry struct {
 	mu         sync.Mutex
 	gateMu     sync.Mutex
 	now        func() time.Time
 	onChange   func(string, brownout.Transition)
+	onWarning  func(string)
 	cfg        brownout.Config
 	configured bool
 	breakers   map[string]*brownout.Breaker
 }
 
-func newAgentHealthRegistry(cfg brownout.Config, daemonCfg config.Config, now func() time.Time, onChange func(string, brownout.Transition)) *agentHealthRegistry {
+func newAgentHealthRegistry(cfg brownout.Config, daemonCfg config.Config, now func() time.Time, onChange func(string, brownout.Transition), onWarning func(string)) *agentHealthRegistry {
 	if now == nil {
 		now = time.Now
 	}
-	r := &agentHealthRegistry{now: now, onChange: onChange, cfg: cfg, breakers: make(map[string]*brownout.Breaker)}
+	r := &agentHealthRegistry{now: now, onChange: onChange, onWarning: onWarning, cfg: cfg, breakers: make(map[string]*brownout.Breaker)}
 	r.ensureConfiguredVendorsLocked(daemonCfg)
 	if len(r.breakers) == 0 {
 		r.ensureBreakerLocked(defaultAgentHealthVendor)
@@ -155,6 +159,9 @@ func (r *agentHealthRegistry) Record(vendor string, startedAt time.Time, ok, pro
 		r.mu.Unlock()
 		if configured {
 			r.gateMu.Unlock()
+			if r.onWarning != nil {
+				r.onWarning("agent outcome missing effective provider attribution; outcome ignored")
+			}
 			return
 		}
 	}
@@ -247,6 +254,7 @@ func (r *agentHealthRegistry) Snapshot() brownout.Summary {
 		summary.State = brownout.StateOpen
 	} else if hasHalfOpen && !hasClosed {
 		summary.State = brownout.StateHalfOpen
+		summary.OpenUntil = nil
 	} else {
 		summary.State = brownout.StateClosed
 		summary.OpenUntil = nil

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -1235,7 +1236,10 @@ func parseInteger(value string) (*int, error) {
 
 func parseFloat(value string) (*float64, error) {
 	parsed, err := strconv.ParseFloat(strings.TrimSpace(value), 64)
-	if err != nil {
+	if err != nil || math.IsNaN(parsed) || math.IsInf(parsed, 0) {
+		if err == nil {
+			err = fmt.Errorf("value must be finite")
+		}
 		return nil, err
 	}
 	return &parsed, nil

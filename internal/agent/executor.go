@@ -196,6 +196,15 @@ func declaresRetryableBlock(completionPayload string) bool {
 	return !strings.EqualFold(strings.TrimSpace(parsed.FailureKind), "manual_intervention")
 }
 
+func validRawJSONObject(stdout string) bool {
+	message := strings.TrimSpace(FinalMessage(stdout))
+	if message == "" {
+		return false
+	}
+	var object map[string]any
+	return json.Unmarshal([]byte(message), &object) == nil && object != nil
+}
+
 // ProgressUpdate is a throttled snapshot of a running agent's activity: the last
 // few lines it has emitted, plus how long it has been running.
 type ProgressUpdate struct {
@@ -257,9 +266,20 @@ type RunInput struct {
 	// SnapshotReasoningEffort is used only when UseSnapshot is true. nil means
 	// no reasoning-effort override.
 	SnapshotReasoningEffort *config.ReasoningEffort
+	// CompletionContract selects the output contract that determines health
+	// success. Coding agents use the marker contract; coordinator and triager
+	// classifiers use raw JSON and intentionally emit no generic marker.
+	CompletionContract CompletionContract
 	// BrownoutProbe is populated by the common spawn admission lease.
 	BrownoutProbe bool
 }
+
+type CompletionContract string
+
+const (
+	CompletionContractMarker  CompletionContract = "marker"
+	CompletionContractRawJSON CompletionContract = "raw_json"
+)
 
 // TimeoutObservation identifies the timeout that is about to terminate an
 // agent process. LastProgressAt is the executor's own observed activity time.
@@ -560,8 +580,6 @@ func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Executi
 	if executionID == "" {
 		executionID = eventlog.NewEventID("agentexec")
 	}
-	startedAt := e.now().UTC()
-	startedAtISO := eventlog.FormatJavaScriptISOString(startedAt)
 	cfg := e.effectiveConfig(input)
 	if input.Assessment {
 		if err := validateAssessmentExecution(cfg, input); err != nil {
@@ -603,6 +621,11 @@ func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Executi
 			input.BrownoutProbe = probeLease.BrownoutProbe()
 		}
 	}
+	// The health admission timestamp must be captured after AdmitSpawn returns:
+	// a half-open breaker may transition during that call, and a timestamp from
+	// before it would make a genuine probe look like a stale execution.
+	startedAt := e.now().UTC()
+	startedAtISO := eventlog.FormatJavaScriptISOString(startedAt)
 	releaseLease := func() {
 		if lease != nil {
 			lease.Release()
@@ -1279,7 +1302,7 @@ func (x *execution) run(ctx context.Context) {
 		}, endedAtISO)
 	}
 
-	x.reportOutcome(status, result.ParseStatus, result.CompletionPayload)
+	x.reportOutcome(status, result.ParseStatus, result.CompletionPayload, result.Stdout)
 	x.doneCh <- execOutcome{result: result, err: persistErr}
 }
 
@@ -1300,9 +1323,15 @@ func (x *execution) finalizeNativeResumeStatus(status, errorMessage, stderr stri
 // reportOutcome feeds the daemon's agent-health gate. "killed" is excluded on
 // purpose: it means looper stopped the agent (operator stop, shutdown drain),
 // which says nothing about whether the provider is answering.
-func (x *execution) reportOutcome(status, parseStatus, completionPayload string) {
+func (x *execution) reportOutcome(status, parseStatus, completionPayload, stdout string) {
 	if x.executor == nil || x.executor.onOutcome == nil || status == "killed" {
 		return
+	}
+	succeeded := status == "completed"
+	if x.input.CompletionContract == CompletionContractRawJSON {
+		succeeded = succeeded && validRawJSONObject(stdout)
+	} else {
+		succeeded = succeeded && parseStatus == "parsed"
 	}
 	x.executor.onOutcome(Outcome{
 		ProjectID:     x.input.ProjectID,
@@ -1312,11 +1341,11 @@ func (x *execution) reportOutcome(status, parseStatus, completionPayload string)
 		Vendor:        string(x.executor.effectiveConfig(x.input).Vendor),
 		BrownoutProbe: x.input.BrownoutProbe,
 		Status:        status,
-		// A zero exit code is not a valid agent completion by itself. The
-		// structured marker is the executor's completion authority; missing or
-		// malformed output must feed the health gate as a failure so brownout
-		// backs off from agents that exit cleanly without doing the work contract.
-		Succeeded: status == "completed" && parseStatus == "parsed" && !declaresRetryableBlock(completionPayload),
+		// A zero exit code is not a valid agent completion by itself. The selected
+		// structured output contract is the executor's completion authority;
+		// missing or malformed output must feed the health gate as a failure so
+		// brownout backs off from agents that exit cleanly without doing the work.
+		Succeeded: succeeded && !declaresRetryableBlock(completionPayload),
 		StartedAt: x.startedAt,
 	})
 }

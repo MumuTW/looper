@@ -34,11 +34,12 @@ func (l agentLLM) Complete(ctx context.Context, req triage.Request) (string, err
 		return "", fmt.Errorf("coordinator triage working directory is required")
 	}
 	execHandle, err := l.executor.Start(ctx, agent.RunInput{
-		ExecutionID:      eventlog.NewEventID("coordtriage"),
-		Prompt:           req.Prompt,
-		WorkingDirectory: workingDir,
-		Timeout:          l.timeout,
-		HeartbeatTimeout: l.idleTimeout,
+		ExecutionID:        eventlog.NewEventID("coordtriage"),
+		Prompt:             req.Prompt,
+		WorkingDirectory:   workingDir,
+		CompletionContract: agent.CompletionContractRawJSON,
+		Timeout:            l.timeout,
+		HeartbeatTimeout:   l.idleTimeout,
 	})
 	if err != nil {
 		return "", err

@@ -3,6 +3,8 @@ package agent
 import (
 	"testing"
 	"time"
+
+	"github.com/MumuTW/looper/internal/config"
 )
 
 func outcomeExecution(sink *[]Outcome) *execution {
@@ -46,7 +48,8 @@ func TestReportOutcomeMapsTerminalStatus(t *testing.T) {
 		tt := tt
 		t.Run(tt.status, func(t *testing.T) {
 			outcomes := make([]Outcome, 0, 1)
-			outcomeExecution(&outcomes).reportOutcome(tt.status, tt.parseStatus, tt.completionPayload)
+			exec := outcomeExecution(&outcomes)
+			exec.reportOutcome(tt.status, tt.parseStatus, tt.completionPayload, "")
 
 			if !tt.wantReported {
 				if len(outcomes) != 0 {
@@ -63,8 +66,8 @@ func TestReportOutcomeMapsTerminalStatus(t *testing.T) {
 			}
 			// The health gate needs this to tell a probe from a long-running
 			// execution admitted before the gate opened.
-			if got.StartedAt.IsZero() {
-				t.Fatalf("outcome carried no StartedAt: %+v", got)
+			if !got.StartedAt.Equal(exec.startedAt) {
+				t.Fatalf("outcome StartedAt = %s, want %s", got.StartedAt, exec.startedAt)
 			}
 			if got.Status != tt.status || got.LoopID != "loop_1" || got.RunID != "run_1" || got.ExecutionID != "exec_1" || got.ProjectID != "proj" {
 				t.Fatalf("outcome identity not carried through: %+v", got)
@@ -75,5 +78,34 @@ func TestReportOutcomeMapsTerminalStatus(t *testing.T) {
 
 func TestReportOutcomeWithoutSinkIsSafe(t *testing.T) {
 	execution := &execution{executor: &ConfiguredExecutor{}, input: RunInput{}}
-	execution.reportOutcome("failed", "missing", "")
+	execution.reportOutcome("failed", "missing", "", "")
+}
+
+func TestReportOutcomeCarriesEffectiveVendor(t *testing.T) {
+	outcomes := make([]Outcome, 0, 1)
+	exec := outcomeExecution(&outcomes)
+	exec.executor.config.Vendor = config.AgentVendorClaudeCode
+	exec.reportOutcome("failed", "missing", "", "")
+	if len(outcomes) != 1 {
+		t.Fatalf("reported %d outcomes, want 1", len(outcomes))
+	}
+	if got := outcomes[0].Vendor; got != string(config.AgentVendorClaudeCode) {
+		t.Fatalf("outcome Vendor = %q, want %q", got, config.AgentVendorClaudeCode)
+	}
+}
+
+func TestReportOutcomeAcceptsRawJSONContract(t *testing.T) {
+	outcomes := make([]Outcome, 0, 1)
+	exec := outcomeExecution(&outcomes)
+	exec.input.CompletionContract = CompletionContractRawJSON
+	exec.reportOutcome("completed", "missing", "", `{"disposition":"valid"}`)
+	if len(outcomes) != 1 || !outcomes[0].Succeeded {
+		t.Fatalf("raw JSON outcome = %#v, want one successful outcome", outcomes)
+	}
+
+	outcomes = outcomes[:0]
+	exec.reportOutcome("completed", "missing", "", "not json")
+	if len(outcomes) != 1 || outcomes[0].Succeeded {
+		t.Fatalf("invalid raw JSON outcome = %#v, want one failed outcome", outcomes)
+	}
 }

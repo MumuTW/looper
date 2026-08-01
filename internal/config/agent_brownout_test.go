@@ -82,6 +82,12 @@ func TestValidateAgentBrownout(t *testing.T) {
 			wantMsg:  "must be a number in (0, 1]",
 		},
 		{
+			name:     "Inf ratio rejected",
+			mutate:   func(b *AgentBrownoutConfig) { b.FailureRatio = math.Inf(1) },
+			wantPath: "scheduler.agentBrownout.failureRatio",
+			wantMsg:  "must be a number in (0, 1]",
+		},
+		{
 			name:     "zero cooldown rejected",
 			mutate:   func(b *AgentBrownoutConfig) { b.CooldownSeconds = 0 },
 			wantPath: "scheduler.agentBrownout.cooldownSeconds",
@@ -239,6 +245,27 @@ func TestAgentBrownoutCLIRejectsInvalidValues(t *testing.T) {
 	}
 	if got := err.Error(); got != `invalid value for --scheduler-agent-brownout-failure-ratio: "oops" is not a number` {
 		t.Fatalf("error = %q, want precise CLI flag error", got)
+	}
+}
+
+func TestAgentBrownoutRejectsNonFiniteRatiosFromEnvironmentAndCLI(t *testing.T) {
+	t.Parallel()
+	for _, value := range []string{"NaN", "Inf", "-Inf", "Infinity"} {
+		value := value
+		t.Run("env_"+value, func(t *testing.T) {
+			t.Parallel()
+			if _, err := buildEnvOverrides(mapEnvLookup(map[string]string{
+				"LOOPER_SCHEDULER_AGENT_BROWNOUT_FAILURE_RATIO": value,
+			})); err == nil {
+				t.Fatalf("buildEnvOverrides() accepted non-finite ratio %q", value)
+			}
+		})
+		t.Run("cli_"+value, func(t *testing.T) {
+			t.Parallel()
+			if _, err := parseCLIArgs([]string{"--scheduler-agent-brownout-failure-ratio=" + value}); err == nil {
+				t.Fatalf("parseCLIArgs() accepted non-finite ratio %q", value)
+			}
+		})
 	}
 }
 

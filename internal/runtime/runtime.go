@@ -353,7 +353,11 @@ func New(options Options) *Runtime {
 		admission:                   NewAdmission(),
 		daemonBinary:                newDaemonBinaryWatcher(options.Logger),
 	}
-	rt.agentHealth = newAgentHealthRegistry(agentBrownoutConfig(options.Config), options.Config, now, rt.onAgentBrownoutTransition)
+	rt.agentHealth = newAgentHealthRegistry(agentBrownoutConfig(options.Config), options.Config, now, rt.onAgentBrownoutTransition, func(message string) {
+		if rt.logger != nil {
+			rt.logger.Warn(message, map[string]any{"authority": "agent.Outcome.Vendor"})
+		}
+	})
 	// Every terminal agent outcome feeds the health gate. This is the only
 	// input it has: looper does not read provider status pages or parse their
 	// rate-limit messages, it counts its own results.
@@ -749,6 +753,17 @@ func (r *Runtime) AllowLifecycleWork() error {
 	return r.admission.AllowClaim()
 }
 
+// WithAllowLifecycleWork holds lifecycle admission across a cleanup mutation
+// without consulting provider health. Cleanup consumes no agent call and must
+// continue during a provider brownout, while the admission mutex still keeps
+// shutdown/degraded transitions from interleaving with its durable writes.
+func (r *Runtime) WithAllowLifecycleWork(fn func()) error {
+	if r == nil || r.admission == nil {
+		return ErrAdmissionStopping
+	}
+	return r.admission.WithAllowWork(fn)
+}
+
 // AgentHealth reports the agent-health gate's posture for status endpoints.
 func (r *Runtime) AgentHealth() brownout.Summary {
 	if r == nil {
@@ -796,9 +811,6 @@ func (r *Runtime) onAgentBrownoutTransition(vendor string, transition brownout.T
 			r.logger.Info("agent brownout state changed", fields)
 		}
 	}
-	if !r.Config().Scheduler.AgentBrownout.Notify {
-		return
-	}
 	// half_open is a probe, not news. Telling the operator about it would make
 	// every outage a stream of notifications instead of two.
 	switch transition.To {
@@ -814,39 +826,39 @@ func (r *Runtime) onAgentBrownoutTransition(vendor string, transition brownout.T
 }
 
 func (r *Runtime) notifyAgentBrownout(level, title, subtitle, body, dedupeSuffix string) {
-	r.mu.RLock()
-	gateways := r.notificationGateways
-	services := r.services
-	notificationCtx := r.notificationCtx
-	r.mu.RUnlock()
-	if gateways == nil || services.Repositories == nil || notificationCtx == nil {
-		return
-	}
-	cfg := r.Config()
-	payload := notify.SystemNotificationPayload{
-		Level:      level,
-		Title:      title,
-		Subtitle:   subtitle,
-		Body:       body,
-		EntityType: "agent_brownout",
-		EntityID:   "looperd-agent-brownout",
-		DedupeKey:  fmt.Sprintf("runtime.agentBrownout.%s", dedupeSuffix),
-	}
-
-	// The transition callback runs on an agent terminal path. Notification
-	// persistence and webhook delivery must not hold that path behind a slow
-	// provider or osascript invocation. Add under r.mu so Stop can close the
-	// admission for new deliveries before waiting for the existing bounded set.
+	// The transition callback runs on an agent terminal path while the provider
+	// gate is held. Keep that path to lifecycle bookkeeping only; all gateway,
+	// config, payload, and repository work belongs in the bounded goroutine.
 	r.mu.Lock()
 	if r.notificationsStopping || r.stopped || r.notificationCtx == nil {
 		r.mu.Unlock()
 		return
 	}
 	r.notificationWG.Add(1)
-	notificationCtx = r.notificationCtx
+	notificationCtx := r.notificationCtx
 	r.mu.Unlock()
 	go func() {
 		defer r.notificationWG.Done()
+		r.mu.RLock()
+		gateways := r.notificationGateways
+		services := r.services
+		r.mu.RUnlock()
+		if gateways == nil || services.Repositories == nil {
+			return
+		}
+		cfg := r.Config()
+		if !cfg.Scheduler.AgentBrownout.Notify {
+			return
+		}
+		payload := notify.SystemNotificationPayload{
+			Level:      level,
+			Title:      title,
+			Subtitle:   subtitle,
+			Body:       body,
+			EntityType: "agent_brownout",
+			EntityID:   "looperd-agent-brownout",
+			DedupeKey:  fmt.Sprintf("runtime.agentBrownout.%s", dedupeSuffix),
+		}
 		ctx, cancel := context.WithTimeout(notificationCtx, agentBrownoutNotificationTimeout)
 		defer cancel()
 		gateways.New(notify.Options{
@@ -888,6 +900,9 @@ func (r *Runtime) WithAllowClaim(fn func()) error {
 	if r == nil || r.admission == nil {
 		return ErrAdmissionStopping
 	}
+	if err := r.AllowLifecycleWork(); err != nil {
+		return err
+	}
 	// Webhook acceptance spends agent budget downstream, so it sees the health
 	// gate too. Checked before the critical section rather than under
 	// admission.mu: the two locks protect different things, and nesting them
@@ -901,9 +916,11 @@ func (r *Runtime) WithAllowClaim(fn func()) error {
 }
 
 // WithAllowAgentClaim holds lifecycle admission and the provider-health gate
-// across a work-producing critical section. Cleanup deliberately uses
-// WithAllowClaim instead: it is lifecycle work but does not consume an agent
-// provider call.
+// across a work-producing critical section. The callback must not spawn an
+// agent or consult provider health: agentHealthRegistry.WithAny holds the
+// non-reentrant gateMu for the whole callback, and recursive admission would
+// deadlock. Cleanup deliberately uses WithAllowLifecycleWork because it does
+// not consume an agent provider call.
 func (r *Runtime) WithAllowAgentClaim(fn func()) error {
 	if r == nil || r.admission == nil {
 		return ErrAdmissionStopping
