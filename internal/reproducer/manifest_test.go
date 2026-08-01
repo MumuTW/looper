@@ -91,3 +91,34 @@ func TestLoadMissingManifestIsBackwardCompatible(t *testing.T) {
 		t.Fatalf("Load() = %#v, %v, want nil manifest without error", manifest, err)
 	}
 }
+
+func TestParseAcceptsOptionalIssueScopeAndAppliesToIssue(t *testing.T) {
+	testHash := strings.Repeat("a", 64)
+	manifest, err := Parse([]byte(`{"version":1,"testPath":"internal/foo_test.go","testName":"TestBug","testCommand":"go test","testSha256":"` + testHash + `","issueNumber":113,"issueRepo":"MumuTW/looper"}`))
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	if manifest.IssueNumber != 113 || manifest.IssueRepo != "mumutw/looper" {
+		t.Fatalf("Parse() = %#v, want normalized issue scope", manifest)
+	}
+	if !manifest.AppliesToIssue(113, "MumuTW/looper") {
+		t.Fatal("AppliesToIssue() = false for matching issue, want true")
+	}
+	if manifest.AppliesToIssue(200, "MumuTW/looper") {
+		t.Fatal("AppliesToIssue() = true for a different issue, want false")
+	}
+	if manifest.AppliesToIssue(113, "other/repo") {
+		t.Fatal("AppliesToIssue() = true for a different repo, want false")
+	}
+}
+
+func TestAppliesToIssueUnscopedManifestMatchesAnyTask(t *testing.T) {
+	testHash := strings.Repeat("a", 64)
+	manifest, err := Parse([]byte(`{"version":1,"testPath":"internal/foo_test.go","testName":"TestBug","testCommand":"go test","testSha256":"` + testHash + `"}`))
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	if !manifest.AppliesToIssue(0, "") || !manifest.AppliesToIssue(113, "MumuTW/looper") {
+		t.Fatal("AppliesToIssue() unscoped manifest must match any task")
+	}
+}
