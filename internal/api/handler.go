@@ -365,6 +365,22 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		h.writeSuccess(w, requestID, result)
 		return
+	case apiBasePath + "/upgrade/drain":
+		if r.Method != http.MethodGet && r.Method != http.MethodPost {
+			h.writeError(w, requestID, apiError{code: "method_not_allowed", status: http.StatusMethodNotAllowed, message: "Unsupported method for /api/v1/upgrade/drain"})
+			return
+		}
+		result, err := h.upgradeDrainStatus(r.Method == http.MethodPost)
+		if err != nil {
+			var typed apiError
+			if !asAPIError(err, &typed) {
+				typed = internalServerError(err)
+			}
+			h.writeError(w, requestID, typed)
+			return
+		}
+		h.writeSuccess(w, requestID, result)
+		return
 	case apiBasePath + "/config":
 		h.handleConfigRoute(w, r, requestID)
 		return

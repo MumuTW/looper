@@ -206,3 +206,8 @@ In another shell, run the CLI from source:
 go run ./cmd/looper version
 go run ./cmd/looper stop 12
 ```
+
+
+### Graceful drain before cutover
+
+`looper upgrade drain --deadline <duration>` moves admission to `draining` (no new claims/mutations) and waits for in-flight supervisor work without hard-killing agents as the routine path.
