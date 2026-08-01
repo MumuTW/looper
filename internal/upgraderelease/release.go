@@ -252,6 +252,10 @@ func Activate(rootDir, releaseID string) (ActivationResult, error) {
 	}
 	serviceExecutable := CurrentDaemonExecutable(staged.RootDir)
 	if previous == releaseID {
+		// Idempotent activate: still ensure the durability barrier for current.
+		if err := syncDirectory(staged.RootDir); err != nil {
+			return ActivationResult{}, fmt.Errorf("sync already-active release pointer: %w", err)
+		}
 		return ActivationResult{RootDir: staged.RootDir, PreviousReleaseID: previous, CurrentReleaseID: releaseID, ServiceExecutable: serviceExecutable}, nil
 	}
 	temporary, err := os.CreateTemp(staged.RootDir, ".current-")
@@ -275,7 +279,17 @@ func Activate(rootDir, releaseID string) (ActivationResult, error) {
 		return ActivationResult{}, fmt.Errorf("atomically switch current release: %w", err)
 	}
 	if err := syncDirectory(staged.RootDir); err != nil {
-		return ActivationResult{}, err
+		// current already points at the candidate; restore previous and sync so
+		// the operator is not left with an unreported successful activation.
+		if previous != "" {
+			_ = os.Remove(currentPath)
+			_ = os.Symlink(filepath.Join("releases", previous), currentPath)
+			_ = syncDirectory(staged.RootDir)
+		} else {
+			_ = os.Remove(currentPath)
+			_ = syncDirectory(staged.RootDir)
+		}
+		return ActivationResult{}, fmt.Errorf("sync current release pointer after activate (restored previous %q): %w", previous, err)
 	}
 	return ActivationResult{RootDir: staged.RootDir, PreviousReleaseID: previous, CurrentReleaseID: releaseID, ServiceExecutable: serviceExecutable}, nil
 }

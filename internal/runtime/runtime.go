@@ -1370,19 +1370,21 @@ func (r *Runtime) CompleteStartup(ctx context.Context) error {
 
 		// Open admission only after recovery and producer loops are assembled.
 		// HTTP mutations and scheduler claims are projections of this state.
-		if err := r.admission.MarkReady("complete startup"); err != nil {
-			r.startupReadyErr = err
-			return
-		}
-		// After cutover restart, hold admission closed until verify-start succeeds
-		// and the operator restarts without the hold. Prevents queued work from
-		// completing before verification and being discarded by rollback restore.
+		//
+		// Cutover verify-hold goes starting → draining without an intervening
+		// ready window so a scheduler tick cannot claim between MarkReady and
+		// BeginDrain (that write would be discarded by rollback restore).
 		if strings.TrimSpace(os.Getenv("LOOPER_UPGRADE_VERIFY_HOLD")) == "1" {
-			if err := r.BeginDrain("upgrade-verify-hold"); err != nil {
+			if err := r.admission.Transition(AdmissionDraining, "upgrade-verify-hold"); err != nil {
 				r.startupReadyErr = err
 				if r.logger != nil {
-					r.logger.Error("looperd upgrade verify hold failed to begin drain", map[string]any{"error": err.Error()})
+					r.logger.Error("looperd upgrade verify hold failed", map[string]any{"error": err.Error()})
 				}
+				return
+			}
+			// Still cancel work producers so discovery cannot mutate under hold.
+			if err := r.BeginDrain("upgrade-verify-hold"); err != nil {
+				r.startupReadyErr = err
 				return
 			}
 			if r.logger != nil {
@@ -1391,11 +1393,15 @@ func (r *Runtime) CompleteStartup(ctx context.Context) error {
 					"action": "run verify-start then restart without this env",
 				})
 			}
+		} else if err := r.admission.MarkReady("complete startup"); err != nil {
+			r.startupReadyErr = err
+			return
 		}
+		upgradeHold := strings.TrimSpace(os.Getenv("LOOPER_UPGRADE_VERIFY_HOLD")) == "1"
 		// Persisted discovery is runtime-owned work. Launch it only after
 		// dependency validation, recovery, ownership, producer assembly, and
-		// admission readiness have all succeeded.
-		if projectService != nil {
+		// admission readiness have all succeeded — not under verify-hold.
+		if !upgradeHold && projectService != nil {
 			resume := r.resumeProjectDiscoveries
 			if resume == nil {
 				resume = func(ctx context.Context, service *projects.Service) error {
@@ -1413,7 +1419,9 @@ func (r *Runtime) CompleteStartup(ctx context.Context) error {
 		// admission remains ready (startDeferredReviewerRecovery rechecks under
 		// the shutdown race where BeginShutdown may have already missed a nil
 		// recoveryCancel between MarkReady and registration).
-		r.startDeferredReviewerRecovery(githubGateway)
+		if !upgradeHold {
+			r.startDeferredReviewerRecovery(githubGateway)
+		}
 		// startSchedulerLoop already fired an immediate full tick while admission
 		// was still starting (gate no-op). Wake full + claim pumps now that
 		// admission is ready so discovery/HITL do not wait a full poll interval.

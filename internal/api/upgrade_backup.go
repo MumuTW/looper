@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -76,30 +77,64 @@ func (h *Handler) createUpgradeBackup(ctx context.Context) (upgradebackup.Result
 		Now:              h.now,
 		Snapshot:         services.Coordinator.Backup,
 	}
-	// Always record the configured path as the restore destination.
-	input.ConfigPath = metadata.ConfigPath
 	if !metadata.FilePresent {
 		// Refuse to materialize effective config: env/CLI overrides (including
 		// LOOPER_TOKEN → server.localToken) must not be persisted into a
 		// rollback bundle. Operators need an on-disk applied config file.
 		return upgradebackup.Result{}, fmt.Errorf("refusing upgrade backup: applied config file is not present at %s; write the applied generation to disk before backup", metadata.ConfigPath)
 	}
-	raw, err := os.ReadFile(metadata.ConfigPath)
+	// Resolve destination and pin bytes from the same open: a leaf/parent
+	// symlink retarget between ReadFile and Create must not leave Source
+	// pointing at a different file than ConfigContents.
+	configPath, raw, err := pinConfigPathAndBytes(metadata.ConfigPath)
 	if err != nil {
-		return upgradebackup.Result{}, fmt.Errorf("refusing upgrade backup: cannot read applied config path %s: %w", metadata.ConfigPath, err)
+		return upgradebackup.Result{}, err
 	}
 	if len(raw) == 0 {
-		return upgradebackup.Result{}, fmt.Errorf("refusing upgrade backup: config file at %s is empty", metadata.ConfigPath)
+		return upgradebackup.Result{}, fmt.Errorf("refusing upgrade backup: config file at %s is empty", configPath)
 	}
 	if strings.TrimSpace(metadata.Revision) != "" {
 		if got := config.ConfigFileRevision(raw, true); got != metadata.Revision {
 			return upgradebackup.Result{}, fmt.Errorf("refusing upgrade backup: on-disk config revision %q does not match applied revision %q", got, metadata.Revision)
 		}
 	}
-	// Pin the validated bytes so Create cannot re-read a different generation
-	// while the SQLite snapshot runs.
+	input.ConfigPath = configPath
 	input.ConfigContents = raw
 	return upgradebackup.Create(ctx, input)
+}
+
+// pinConfigPathAndBytes freezes the restore destination and the bytes together.
+// Leaf symlinks are refused; parent symlinks are resolved once before read.
+func pinConfigPathAndBytes(configPath string) (string, []byte, error) {
+	path := strings.TrimSpace(configPath)
+	if path == "" {
+		return "", nil, fmt.Errorf("configured config path is unavailable")
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", nil, fmt.Errorf("resolve config path: %w", err)
+	}
+	abs = filepath.Clean(abs)
+	info, err := os.Lstat(abs)
+	if err != nil {
+		return "", nil, fmt.Errorf("refusing upgrade backup: cannot stat config path %s: %w", abs, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return "", nil, fmt.Errorf("refusing upgrade backup: config path %s is a leaf symlink; point tools at the real applied file so restore metadata cannot diverge", abs)
+	}
+	if info.IsDir() {
+		return "", nil, fmt.Errorf("refusing upgrade backup: config path %s is a directory", abs)
+	}
+	// Resolve parent symlink components once, then read that frozen path.
+	resolved := abs
+	if r, err := filepath.EvalSymlinks(abs); err == nil {
+		resolved = filepath.Clean(r)
+	}
+	raw, err := os.ReadFile(resolved)
+	if err != nil {
+		return "", nil, fmt.Errorf("refusing upgrade backup: cannot read applied config path %s: %w", resolved, err)
+	}
+	return resolved, raw, nil
 }
 
 func (h *Handler) upgradeConfigAndMetadata() (config.Config, ConfigMetadata) {

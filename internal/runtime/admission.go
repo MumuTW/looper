@@ -107,7 +107,9 @@ func legalAdmissionTransition(from, to AdmissionState) bool {
 	}
 	switch from {
 	case AdmissionStarting:
-		return to == AdmissionReady || to == AdmissionStopping || to == AdmissionDegraded
+		// draining is allowed without an intervening ready window so cutover
+		// verify-hold can open producers while keeping claims/mutations closed.
+		return to == AdmissionReady || to == AdmissionDraining || to == AdmissionStopping || to == AdmissionDegraded
 	case AdmissionReady:
 		return to == AdmissionDraining || to == AdmissionStopping || to == AdmissionDegraded
 	case AdmissionDraining:
