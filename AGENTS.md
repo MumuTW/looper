@@ -65,11 +65,17 @@ If the honest answer is "the agent's output, but we don't trust it", make the ag
 
 ### A second fix to the same subsystem is a design signal
 
-If a subsystem receives a second `fix:` PR shortly after the first, the second PR's description must answer, in one sentence:
+Near-identical `fix:` titles on the same area, or a second patch to the mechanism the first fix introduced, mean this PR's description must say which of these it is:
 
-> Is this patching the first fix's own mechanism, or a different path through the same subsystem?
+- **The abstraction.** The mechanism needs a new special case for every situation it meets. The patches are growing outward rather than converging.
+- **The execution.** The design was right and a branch it already implied was missed — often because the first PR was too large to hold at once, or was scoped past what the agent writing it could cover.
+- **Something upstream.** The first fix was a local patch to a systemic defect, and this is another symptom of the same defect.
 
-Near-identical `fix:` titles on the same area, or a patch to a guard the previous fix introduced, mean the underlying abstraction is wrong — stacking a third patch is not an option. Revert the first fix and redesign when reverting does not reopen a bug someone is still hitting; otherwise redesign forward and land the replacement in one diff. Say which one you chose and why.
+Only the first is a revert signal. The second is finished by completing it — reverting there discards a correct design and reopens the original bug, and the thing to correct is the scope of the next task, not the code. The third means the redesign target sits *above* the fix being blamed; reverting it moves nothing.
+
+When it is the abstraction: revert the first fix and redesign if reverting does not reopen a bug someone is still hitting, otherwise redesign forward and land the replacement in one diff.
+
+Stacking a third patch without naming which of the three this is, is not an option.
 
 ### Prefer deletion over another layer
 
