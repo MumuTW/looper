@@ -35,8 +35,12 @@ type PriorWatchMarker struct {
 	ConflictRepairs               int
 	ConflictRegenerationPending   bool
 	ConflictRegenerationEscalated bool
-	FirstUnknownAt                *time.Time
-	NextRetryAt                   *time.Time
+	// ConflictRegenerationEscalatedState records the fresh PR observation at
+	// the human-escalation boundary so later ticks can distinguish an unchanged
+	// pause from a pushed head, restored auto-merge, or resolved conflict.
+	ConflictRegenerationEscalatedState string
+	FirstUnknownAt                     *time.Time
+	NextRetryAt                        *time.Time
 }
 
 type RetryBudget struct {

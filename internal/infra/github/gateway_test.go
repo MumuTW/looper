@@ -453,7 +453,7 @@ func TestGatewayPullRequestProfilesAvoidUnboundedHistoryFields(t *testing.T) {
 			if !strings.Contains(fields, "statusCheckRollup") || !strings.Contains(fields, "reviewRequests") {
 				t.Fatalf("fixer profile fields = %q, want checks and review requests", fields)
 			}
-			return shell.Result{Stdout: `{"number":43,"title":"Fix me","body":"Body","url":"https://example.test/pull/43","state":"OPEN","headRefName":"feature","baseRefName":"main","headRefOid":"abc123","baseRefOid":"def456","mergeStateStatus":"CLEAN","author":{"login":"octocat"},"reviewRequests":[{"requestedReviewer":{"login":"reviewer"}}],"statusCheckRollup":[]}`}, nil
+			return shell.Result{Stdout: `{"number":43,"title":"Fix me","body":"Body","url":"https://example.test/pull/43","state":"OPEN","mergedAt":"2026-04-11T12:00:00Z","headRefName":"feature","baseRefName":"main","headRefOid":"abc123","baseRefOid":"def456","mergeStateStatus":"CLEAN","author":{"login":"octocat"},"reviewRequests":[{"requestedReviewer":{"login":"reviewer"}}],"statusCheckRollup":[]}`}, nil
 		case strings.HasPrefix(args, "pr view 44 --repo acme/looper --json "):
 			fields := strings.TrimPrefix(args, "pr view 44 --repo acme/looper --json ")
 			if strings.Contains(fields, "comments") {
@@ -479,8 +479,12 @@ func TestGatewayPullRequestProfilesAvoidUnboundedHistoryFields(t *testing.T) {
 	if _, err := gateway.ViewPullRequest(context.Background(), ViewPullRequestInput{Repo: "acme/looper", PRNumber: 42}); err != nil {
 		t.Fatalf("ViewPullRequest() error = %v", err)
 	}
-	if _, err := gateway.ViewPullRequestForFixer(context.Background(), ViewPullRequestInput{Repo: "acme/looper", PRNumber: 43}); err != nil {
+	detail, err := gateway.ViewPullRequestForFixer(context.Background(), ViewPullRequestInput{Repo: "acme/looper", PRNumber: 43})
+	if err != nil {
 		t.Fatalf("ViewPullRequestForFixer() error = %v", err)
+	}
+	if detail.MergedAt != "2026-04-11T12:00:00Z" {
+		t.Fatalf("ViewPullRequestForFixer().MergedAt = %q, want mergedAt timestamp", detail.MergedAt)
 	}
 	if _, err := gateway.ViewPullRequestForReviewer(context.Background(), ViewPullRequestInput{Repo: "acme/looper", PRNumber: 44}); err != nil {
 		t.Fatalf("ViewPullRequestForReviewer() error = %v", err)

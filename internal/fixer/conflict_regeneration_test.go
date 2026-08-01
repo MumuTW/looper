@@ -2,6 +2,7 @@ package fixer
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -85,7 +86,7 @@ func TestRegenerateConflictReplaysCompletedMarkerWithoutSideEffects(t *testing.T
 	gateway := &regenerationFakeGateway{
 		fakeGitHubGateway: &fakeGitHubGateway{currentUser: "looper", viewResponses: []PullRequestDetail{{Number: 42, State: "CLOSED", HeadRefName: "looper/fix-42", HeadSHA: "head-42"}}},
 		issue:             IssueDetail{Number: 7, State: "OPEN"},
-		comments:          []IssueComment{{Body: regenerationCommentMarker + " authority=coordinator-conflict:acme/looper#42 outcome=completed -->"}},
+		comments:          []IssueComment{{Author: "looper", Body: regenerationCommentMarker + " authority=coordinator-conflict:acme/looper#42 outcome=completed -->"}},
 	}
 	routes := 0
 	runner := newRegenerationRunner(t, fixture, gateway, func(_ context.Context, _ RegenerateIssueInput) error { routes++; return nil })
@@ -96,5 +97,71 @@ func TestRegenerateConflictReplaysCompletedMarkerWithoutSideEffects(t *testing.T
 	}
 	if !result.Completed || routes != 0 || len(gateway.closeCalls) != 0 || len(gateway.fakeGitHubGateway.createIssueComments) != 0 {
 		t.Fatalf("replay result/routes/closes/comments = %#v/%d/%d/%d, want completed/no side effects", result, routes, len(gateway.closeCalls), len(gateway.fakeGitHubGateway.createIssueComments))
+	}
+}
+
+func TestRegenerateConflictSkipsFreshlyMergedPR(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	gateway := &regenerationFakeGateway{
+		fakeGitHubGateway: &fakeGitHubGateway{currentUser: "looper", viewResponses: []PullRequestDetail{{Number: 42, State: "CLOSED", MergedAt: "2026-04-11T12:00:00Z", HeadRefName: "looper/fix-42", HeadSHA: "head-42"}}},
+		issue:             IssueDetail{Number: 7, State: "OPEN"},
+		commits:           []PullRequestCommit{{AuthorLogin: "looper", CommitterLogin: "looper"}},
+	}
+	routes := 0
+	runner := newRegenerationRunner(t, fixture, gateway, func(_ context.Context, _ RegenerateIssueInput) error { routes++; return nil })
+	project, _ := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	result, err := runner.RegenerateConflict(context.Background(), ConflictRegenerationInput{ProjectID: "project_1", Repo: "acme/looper", IssueRepo: "acme/looper", IssueNumber: 7, PRNumber: 42, ConflictRepairs: 2, CWD: project.RepoPath})
+	if err != nil {
+		t.Fatalf("RegenerateConflict() error = %v", err)
+	}
+	if result.Completed || result.Escalated || routes != 0 || len(gateway.closeCalls) != 0 || len(gateway.fakeGitHubGateway.createIssueComments) != 0 {
+		t.Fatalf("merged result/routes/closes/comments = %#v/%d/%d/%d, want no regeneration side effects", result, routes, len(gateway.closeCalls), len(gateway.fakeGitHubGateway.createIssueComments))
+	}
+}
+
+func TestRegenerateConflictHonorsGlobalHoldLabels(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	gateway := &regenerationFakeGateway{
+		fakeGitHubGateway: &fakeGitHubGateway{currentUser: "looper", viewResponses: []PullRequestDetail{{Number: 42, State: "OPEN", Labels: []string{labels.HoldGlobal}, HeadRefName: "looper/fix-42", HeadSHA: "head-42"}}},
+		issue:             IssueDetail{Number: 7, State: "OPEN"},
+		commits:           []PullRequestCommit{{AuthorLogin: "looper", CommitterLogin: "looper"}},
+	}
+	routes := 0
+	runner := newRegenerationRunner(t, fixture, gateway, func(_ context.Context, _ RegenerateIssueInput) error { routes++; return nil })
+	project, _ := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	result, err := runner.RegenerateConflict(context.Background(), ConflictRegenerationInput{ProjectID: "project_1", Repo: "acme/looper", IssueRepo: "acme/looper", IssueNumber: 7, PRNumber: 42, ConflictRepairs: 2, CWD: project.RepoPath})
+	if err != nil {
+		t.Fatalf("RegenerateConflict() error = %v", err)
+	}
+	if result.Completed || result.Escalated || routes != 0 || len(gateway.closeCalls) != 0 || len(gateway.fakeGitHubGateway.createIssueComments) != 0 {
+		t.Fatalf("held result/routes/closes/comments = %#v/%d/%d/%d, want no regeneration side effects", result, routes, len(gateway.closeCalls), len(gateway.fakeGitHubGateway.createIssueComments))
+	}
+}
+
+func TestConflictRegenerationMarkerRequiresAuthenticatedAuthor(t *testing.T) {
+	comments := []IssueComment{{Author: "attacker", Body: regenerationCommentMarker + " authority=coordinator-conflict:acme/looper#42 outcome=completed -->"}}
+	if got := conflictRegenerationMarkerStatus(comments, "coordinator-conflict:acme/looper#42", "looper"); got != "" {
+		t.Fatalf("conflictRegenerationMarkerStatus() = %q, want unauthenticated marker ignored", got)
+	}
+}
+
+func TestRegenerateConflictLabelsBeforeWritingEscalationMarker(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	gateway := &regenerationFakeGateway{
+		fakeGitHubGateway: &fakeGitHubGateway{
+			currentUser:            "looper",
+			addPullRequestLabelErr: errors.New("label unavailable"),
+			viewResponses:          []PullRequestDetail{{Number: 42, State: "OPEN", HeadRefName: "looper/fix-42", HeadSHA: "head-42"}},
+		},
+		issue:   IssueDetail{Number: 7, State: "OPEN"},
+		commits: []PullRequestCommit{{AuthorLogin: "alice", CommitterLogin: "alice"}},
+	}
+	runner := newRegenerationRunner(t, fixture, gateway, func(_ context.Context, _ RegenerateIssueInput) error { return nil })
+	project, _ := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if _, err := runner.RegenerateConflict(context.Background(), ConflictRegenerationInput{ProjectID: "project_1", Repo: "acme/looper", IssueRepo: "acme/looper", IssueNumber: 7, PRNumber: 42, ConflictRepairs: 2, CWD: project.RepoPath}); err == nil {
+		t.Fatal("RegenerateConflict() error = nil, want label failure")
+	}
+	if len(gateway.fakeGitHubGateway.createIssueComments) != 0 {
+		t.Fatalf("escalation comments = %d, want no terminal marker before label succeeds", len(gateway.fakeGitHubGateway.createIssueComments))
 	}
 }

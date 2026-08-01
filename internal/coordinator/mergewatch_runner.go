@@ -71,13 +71,33 @@ func (r *Runner) applyMergeWatchLocked(ctx context.Context, projectID, repo, cwd
 		return false, err
 	}
 	if marker != nil && marker.Marker.ConflictRegenerationPending && !marker.Marker.ConflictRegenerationEscalated {
-		return r.runConflictRegeneration(ctx, projectID, repo, cwd, issue, watchedPR, marker, marker.Marker)
+		snapshot, temporaryErr, snapshotErr := r.mergeWatchSnapshot(ctx, repo, cwd, issue.detail.Number, watchedPR, currentLogin)
+		if snapshotErr != nil {
+			return false, snapshotErr
+		}
+		if temporaryErr != nil {
+			return r.runConflictRegeneration(ctx, projectID, repo, cwd, issue, watchedPR, marker, marker.Marker, nil)
+		}
+		return r.runConflictRegeneration(ctx, projectID, repo, cwd, issue, watchedPR, marker, marker.Marker, &snapshot)
 	}
 	if marker != nil && marker.Marker.ConflictRegenerationEscalated {
-		// Keep the durable human-escalation marker in place until an operator
-		// changes the PR state; ordinary merge-watch classification must not
-		// restart the automatic repair loop.
-		return false, nil
+		// Escalation is a durable pause, not a permanent tombstone. Re-read the
+		// PR so a pushed head, re-enabled auto-merge, label change, or resolved
+		// conflict can explicitly reopen classification; an unchanged conflict
+		// remains parked without invoking Planner again.
+		escalationSnapshot, temporaryErr, snapshotErr := r.mergeWatchSnapshot(ctx, repo, cwd, issue.detail.Number, watchedPR, currentLogin)
+		if snapshotErr != nil {
+			return false, snapshotErr
+		}
+		if temporaryErr != nil || !mergeWatchEscalationChanged(marker, escalationSnapshot) {
+			return false, nil
+		}
+		marker.Marker.ConflictRegenerationEscalated = false
+		marker.Marker.ConflictRegenerationPending = false
+		marker.Marker.ConflictRegenerationEscalatedState = ""
+		if escalationSnapshot.Merged || !escalationSnapshot.Open || !escalationSnapshot.HasLooperLabel {
+			return false, r.deleteMergeWatchComment(ctx, repo, cwd, marker)
+		}
 	}
 	if marker != nil && marker.Marker.NextRetryAt != nil && r.now().UTC().Before(marker.Marker.NextRetryAt.UTC()) {
 		return false, nil
@@ -119,19 +139,20 @@ func (r *Runner) applyMergeWatchLocked(ctx context.Context, projectID, repo, cwd
 		return false, r.upsertMergeWatchComment(ctx, repo, cwd, issue.detail.Number, marker, baseMarker, "")
 	case mergewatch.ActionConflict, mergewatch.ActionRedCI:
 		if action.Kind == mergewatch.ActionConflict {
-			baseMarker.ConflictRepairs++
-			maxRepairs := 2
-			if roles.Coordinator.ConflictPolicy != nil {
-				maxRepairs = roles.Coordinator.ConflictPolicy.MaxRepairs
-			}
-			if maxRepairs <= 0 {
-				// Keep zero-value RoleConfigs source-compatible for embedders and
-				// unit fixtures; validated runtime configs always carry the default.
-				maxRepairs = 2
-			}
-			if baseMarker.ConflictRepairs >= maxRepairs {
-				baseMarker.ConflictRegenerationPending = true
-				return r.runConflictRegeneration(ctx, projectID, repo, cwd, issue, snapshot.PRNumber, marker, baseMarker)
+			if newConflictRepairAttempt(marker, snapshot) {
+				baseMarker.ConflictRepairs++
+				maxRepairs := 2
+				if roles.Coordinator.ConflictPolicy != nil {
+					maxRepairs = roles.Coordinator.ConflictPolicy.MaxRepairs
+				}
+				if maxRepairs <= 0 {
+					// Keep zero-value RoleConfigs source-compatible for embedders and
+					// unit fixtures; validated runtime configs always carry the default.
+					maxRepairs = 2
+				}
+				if baseMarker.ConflictRepairs >= maxRepairs {
+					return r.runConflictRegeneration(ctx, projectID, repo, cwd, issue, snapshot.PRNumber, marker, baseMarker, &snapshot)
+				}
 			}
 		}
 		fixer := config.EffectiveCodingRoles(roles)[config.CodingRoleFixer]
@@ -213,12 +234,37 @@ func nilIfBlank(value string) *string {
 	return &value
 }
 
-func (r *Runner) runConflictRegeneration(ctx context.Context, projectID, repo, cwd string, issue loadedIssue, prNumber int64, existing *mergeWatchComment, marker mergewatch.PriorWatchMarker) (bool, error) {
+func (r *Runner) runConflictRegeneration(ctx context.Context, projectID, repo, cwd string, issue loadedIssue, prNumber int64, existing *mergeWatchComment, marker mergewatch.PriorWatchMarker, escalationSnapshot *mergewatch.PRSnapshot) (bool, error) {
 	if marker.ConflictRegenerationEscalated {
 		return false, nil
 	}
-	if r.regenerateConflict == nil {
+	// The pending Issue marker is the coordinator-side transaction fence. Write
+	// it before invoking the close-and-regenerate authority so a crash after
+	// remote PR side effects but before Planner routing resumes the handoff.
+	if existing == nil || !existing.Marker.ConflictRegenerationPending {
 		marker.ConflictRegenerationPending = true
+		if err := r.upsertMergeWatchComment(ctx, repo, cwd, issue.detail.Number, existing, marker, fmt.Sprintf("Coordinator merge-watch is preparing to close and regenerate PR #%d after %d conflict repairs.", prNumber, marker.ConflictRepairs)); err != nil {
+			return false, err
+		}
+		if existing == nil {
+			login, loginErr := r.github.GetCurrentUserLoginForRepo(ctx, repo, cwd)
+			if loginErr != nil {
+				return false, fmt.Errorf("pending merge-watch marker persisted but coordinator identity is unavailable: %w", loginErr)
+			}
+			if strings.TrimSpace(login) == "" {
+				return false, fmt.Errorf("pending merge-watch marker persisted but coordinator identity is empty")
+			}
+			comments, listErr := r.github.ListIssueComments(ctx, githubinfra.ViewIssueInput{Repo: repo, IssueNumber: issue.detail.Number, CWD: cwd})
+			if listErr != nil {
+				return false, fmt.Errorf("pending merge-watch marker persisted but cannot reload it: %w", listErr)
+			}
+			existing = findMergeWatchComment(comments, login)
+			if existing == nil {
+				return false, fmt.Errorf("pending merge-watch marker persisted but was not found")
+			}
+		}
+	}
+	if r.regenerateConflict == nil {
 		if err := r.upsertMergeWatchComment(ctx, repo, cwd, issue.detail.Number, existing, marker, fmt.Sprintf("Coordinator merge-watch reached the conflict-repair limit for PR #%d, but no regeneration authority is configured.", prNumber)); err != nil {
 			return false, err
 		}
@@ -234,7 +280,6 @@ func (r *Runner) runConflictRegeneration(ctx context.Context, projectID, repo, c
 		CWD:             cwd,
 	})
 	if err != nil {
-		marker.ConflictRegenerationPending = true
 		if persistErr := r.upsertMergeWatchComment(ctx, repo, cwd, issue.detail.Number, existing, marker, fmt.Sprintf("Coordinator merge-watch is retrying close-and-regenerate for PR #%d after an error: %s", prNumber, err)); persistErr != nil {
 			return false, fmt.Errorf("conflict regeneration failed: %v (persist marker: %w)", err, persistErr)
 		}
@@ -246,7 +291,17 @@ func (r *Runner) runConflictRegeneration(ctx context.Context, projectID, repo, c
 	if outcome.Escalated {
 		marker.ConflictRegenerationPending = false
 		marker.ConflictRegenerationEscalated = true
+		if escalationSnapshot != nil {
+			marker.ConflictRegenerationEscalatedState = mergeWatchEscalationFingerprint(*escalationSnapshot)
+		}
 		return false, r.upsertMergeWatchComment(ctx, repo, cwd, issue.detail.Number, existing, marker, fmt.Sprintf("Coordinator merge-watch escalated PR #%d after %d conflict repairs; the PR remains open for human review.", prNumber, marker.ConflictRepairs))
+	}
+	// A fresh fixer read can observe a merge that happened after the
+	// coordinator's snapshot. Clear the pending fence in that race instead of
+	// leaving the Issue parked forever on a PR that has already landed.
+	fresh, freshErr := r.github.ViewPullRequestMergeWatch(ctx, githubinfra.ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
+	if freshErr == nil && (strings.EqualFold(strings.TrimSpace(fresh.State), "merged") || strings.TrimSpace(fresh.MergedAt) != "") {
+		return false, r.deleteMergeWatchComment(ctx, repo, cwd, existing)
 	}
 	marker.ConflictRegenerationPending = true
 	return false, r.upsertMergeWatchComment(ctx, repo, cwd, issue.detail.Number, existing, marker, fmt.Sprintf("Coordinator merge-watch is waiting to close and regenerate PR #%d after %d conflict repairs.", prNumber, marker.ConflictRepairs))
@@ -513,6 +568,39 @@ func markerState(marker *mergeWatchComment) *mergewatch.PriorWatchMarker {
 	return &copy
 }
 
+func newConflictRepairAttempt(marker *mergeWatchComment, snapshot mergewatch.PRSnapshot) bool {
+	if marker == nil || marker.Marker.PRNumber != snapshot.PRNumber || marker.Marker.HeadSHA != snapshot.HeadSHA {
+		return true
+	}
+	// A legacy marker can predate the conflict counter. Treat its first
+	// observed conflict as the initial dispatch, then keep subsequent polls on
+	// the same head from consuming more of the bounded repair budget.
+	return marker.Marker.ConflictRepairs == 0
+}
+
+func mergeWatchEscalationChanged(marker *mergeWatchComment, snapshot mergewatch.PRSnapshot) bool {
+	if marker == nil {
+		return true
+	}
+	if marker.Marker.PRNumber != snapshot.PRNumber || marker.Marker.HeadSHA != snapshot.HeadSHA {
+		return true
+	}
+	if marker.Marker.ConflictRegenerationEscalatedState != "" {
+		return marker.Marker.ConflictRegenerationEscalatedState != mergeWatchEscalationFingerprint(snapshot)
+	}
+	if snapshot.Merged || !snapshot.Open || !snapshot.HasLooperLabel || snapshot.AutoMergeEnabled {
+		return true
+	}
+	// An escalated conflict is parked only while the same head remains in a
+	// conflict state. Any different mergeability result is operator progress
+	// that deserves a fresh classification.
+	return !snapshot.MergeableState.HasConflict()
+}
+
+func mergeWatchEscalationFingerprint(snapshot mergewatch.PRSnapshot) string {
+	return fmt.Sprintf("head=%s;merged=%t;open=%t;auto=%t;owned=%t;looper=%t;mergeable=%s", snapshot.HeadSHA, snapshot.Merged, snapshot.Open, snapshot.AutoMergeEnabled, snapshot.AutoMergeOwnedByLooper, snapshot.HasLooperLabel, snapshot.MergeableState)
+}
+
 func retriageCleanupPatterns(roles config.RoleConfigs, triagedLabel string, namespace labels.Namespace) []string {
 	patterns := append([]string{triagedLabel}, namespace.DispatchLabels()...)
 	registry := config.EffectiveCodingRoles(roles)
@@ -626,6 +714,8 @@ func parseMergeWatchComment(comment githubinfra.CommentInfo) (mergeWatchComment,
 				marker.ConflictRegenerationPending = parts[1] == "1"
 			case "conflict_regen_escalated":
 				marker.ConflictRegenerationEscalated = parts[1] == "1"
+			case "conflict_regen_escalated_state":
+				marker.ConflictRegenerationEscalatedState = parts[1]
 			case "first_unknown_at":
 				if when, err := time.Parse(time.RFC3339, parts[1]); err == nil {
 					marker.FirstUnknownAt = &when
@@ -651,7 +741,7 @@ func mergeWatchCommentNeedsUpdate(existing *mergeWatchComment, next mergewatch.P
 }
 
 func mergeWatchMarkerLine(marker mergewatch.PriorWatchMarker) string {
-	return fmt.Sprintf("<!-- looper:coordinator:merge-watch pr=%d head_sha=%s retries=%d conflict_repairs=%d conflict_regen_pending=%d conflict_regen_escalated=%d first_unknown_at=%s next_retry_at=%s -->", marker.PRNumber, marker.HeadSHA, marker.Retries, marker.ConflictRepairs, boolInt(marker.ConflictRegenerationPending), boolInt(marker.ConflictRegenerationEscalated), mergeWatchTime(marker.FirstUnknownAt), mergeWatchTime(marker.NextRetryAt))
+	return fmt.Sprintf("<!-- looper:coordinator:merge-watch pr=%d head_sha=%s retries=%d conflict_repairs=%d conflict_regen_pending=%d conflict_regen_escalated=%d conflict_regen_escalated_state=%s first_unknown_at=%s next_retry_at=%s -->", marker.PRNumber, marker.HeadSHA, marker.Retries, marker.ConflictRepairs, boolInt(marker.ConflictRegenerationPending), boolInt(marker.ConflictRegenerationEscalated), marker.ConflictRegenerationEscalatedState, mergeWatchTime(marker.FirstUnknownAt), mergeWatchTime(marker.NextRetryAt))
 }
 
 func boolInt(value bool) int {

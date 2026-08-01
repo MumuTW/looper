@@ -70,11 +70,68 @@ func TestMergeWatchConflictEscalationRemainsDurable(t *testing.T) {
 	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
 		t.Fatalf("DiscoverIssues() error = %v", err)
 	}
-	if len(fixture.github.updatedBodies) != 1 || !strings.Contains(fixture.github.updatedBodies[0], "conflict_regen_escalated=1") {
-		t.Fatalf("updatedBodies = %v, want durable escalation marker", fixture.github.updatedBodies)
+	if len(fixture.github.updatedBodies) != 2 || !strings.Contains(fixture.github.updatedBodies[0], "conflict_regen_pending=1") || !strings.Contains(fixture.github.updatedBodies[1], "conflict_regen_escalated=1") {
+		t.Fatalf("updatedBodies = %v, want pending fence followed by durable escalation marker", fixture.github.updatedBodies)
 	}
 	if containsString(fixture.github.ops, "delete-comment") {
 		t.Fatalf("ops = %v, want marker retained for human escalation", fixture.github.ops)
+	}
+}
+
+func TestMergeWatchConflictPollDoesNotConsumeSameHeadRepairBudget(t *testing.T) {
+	fixture := configureConflictWatchFixture(t, 0)
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
+		t.Fatalf("first DiscoverIssues() error = %v", err)
+	}
+	detail := fixture.github.details[1]
+	detail.Comments = []githubinfra.CommentInfo{{
+		ID: 44, Author: "looper", Body: stampedCoordinatorBody(fixture.cfg, mergeWatchMarkerLine(mergewatch.PriorWatchMarker{PRNumber: 77, HeadSHA: "new-head", Retries: 3, ConflictRepairs: 1})), CreatedAt: fixture.now.Format(time.RFC3339),
+	}}
+	fixture.github.details[1] = detail
+	fixture.now = fixture.now.Add(6 * time.Minute)
+	fixture.reconfigure(func(*config.Config) {})
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
+		t.Fatalf("same-head DiscoverIssues() error = %v", err)
+	}
+	if len(fixture.github.updatedBodies) != 2 || !strings.Contains(fixture.github.updatedBodies[1], "conflict_repairs=1") {
+		t.Fatalf("updatedBodies = %v, want same-head poll to retain one dispatched repair", fixture.github.updatedBodies)
+	}
+}
+
+func TestMergeWatchEscalationReevaluatesAfterHeadChanges(t *testing.T) {
+	fixture := configureConflictWatchFixture(t, 1)
+	detail := fixture.github.details[1]
+	detail.Comments = []githubinfra.CommentInfo{{
+		ID: 44, Author: "looper", Body: stampedCoordinatorBody(fixture.cfg, mergeWatchMarkerLine(mergewatch.PriorWatchMarker{PRNumber: 77, HeadSHA: "new-head", Retries: 3, ConflictRepairs: 2, ConflictRegenerationEscalated: true})), CreatedAt: fixture.now.Format(time.RFC3339),
+	}}
+	fixture.github.details[1] = detail
+	routes := 0
+	fixture.runner.regenerateConflict = func(_ context.Context, _ ConflictRegenerationInput) (ConflictRegenerationResult, error) {
+		routes++
+		return ConflictRegenerationResult{Completed: true}, nil
+	}
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
+		t.Fatalf("initial DiscoverIssues() error = %v", err)
+	}
+	detail = fixture.github.details[1]
+	detail.Comments = []githubinfra.CommentInfo{{
+		ID: 44, Author: "looper", Body: stampedCoordinatorBody(fixture.cfg, mergeWatchMarkerLine(mergewatch.PriorWatchMarker{PRNumber: 77, HeadSHA: "new-head", Retries: 3, ConflictRepairs: 2, ConflictRegenerationEscalated: true})), CreatedAt: fixture.now.Format(time.RFC3339),
+	}}
+	fixture.github.details[1] = detail
+	pr := fixture.github.prDetails[77]
+	pr.HeadSHA = "next-head"
+	fixture.github.prDetails[77] = pr
+	fixture.now = fixture.now.Add(6 * time.Minute)
+	fixture.reconfigure(func(*config.Config) {})
+	fixture.runner.regenerateConflict = func(_ context.Context, _ ConflictRegenerationInput) (ConflictRegenerationResult, error) {
+		routes++
+		return ConflictRegenerationResult{Completed: true}, nil
+	}
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
+		t.Fatalf("changed-head DiscoverIssues() error = %v", err)
+	}
+	if routes != 1 {
+		t.Fatalf("regeneration routes = %d, want one re-evaluation after head change", routes)
 	}
 }
 

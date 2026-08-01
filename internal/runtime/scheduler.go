@@ -1210,7 +1210,7 @@ func (a fixerGitHubAdapter) ViewPullRequest(ctx context.Context, input fixer.Vie
 	if err != nil {
 		return fixer.PullRequestDetail{}, err
 	}
-	return fixer.PullRequestDetail{Number: detail.Number, State: detail.State, IsDraft: detail.IsDraft, Labels: detail.Labels, HeadSHA: detail.HeadSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, BaseSHA: detail.BaseSHA, ReviewDecision: detail.ReviewDecision, Comments: detail.Comments, IssueComments: commentInfosToObjects(detail.IssueComments), Checks: detail.Checks, HasConflicts: detail.HasConflicts, Author: detail.Author}, nil
+	return fixer.PullRequestDetail{Number: detail.Number, State: detail.State, MergedAt: detail.MergedAt, IsDraft: detail.IsDraft, Labels: detail.Labels, HeadSHA: detail.HeadSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, BaseSHA: detail.BaseSHA, ReviewDecision: detail.ReviewDecision, Comments: detail.Comments, IssueComments: commentInfosToObjects(detail.IssueComments), Checks: detail.Checks, HasConflicts: detail.HasConflicts, Author: detail.Author}, nil
 }
 
 // ViewPullRequestForDiscovery is the lightweight metadata tier: no
@@ -1254,7 +1254,7 @@ func (a fixerGitHubAdapter) ListIssueComments(ctx context.Context, input fixer.V
 	}
 	out := make([]fixer.IssueComment, 0, len(comments))
 	for _, comment := range comments {
-		out = append(out, fixer.IssueComment{ID: comment.ID, Body: comment.Body})
+		out = append(out, fixer.IssueComment{ID: comment.ID, Author: comment.Author, Body: comment.Body})
 	}
 	return out, nil
 }

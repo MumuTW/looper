@@ -122,6 +122,7 @@ type PullRequestSummary struct {
 type PullRequestDetail struct {
 	Number         int64
 	State          string
+	MergedAt       string
 	IsDraft        bool
 	Labels         []string
 	HeadSHA        string
@@ -337,8 +338,9 @@ type IssueDetail struct {
 }
 
 type IssueComment struct {
-	ID   int64
-	Body string
+	ID     int64
+	Author string
+	Body   string
 }
 
 type IssueLabelsInput struct {
@@ -595,6 +597,11 @@ type Options struct {
 	RetryBaseDelay              time.Duration
 	RetryMaxAttempts            int64
 	MaxConsecutiveFixerFailures int
+	// PlannerRegenerationAvailable is nil for standalone/test runners, which
+	// retain the historical assumption that their callback is authoritative. A
+	// daemon passes the resolved Planner availability explicitly so an
+	// unconfigured Planner cannot be reached after a destructive PR close.
+	PlannerRegenerationAvailable *bool
 	// MaxFixerRoundsPerPullRequest bounds how many pushes this fixer may draw
 	// review on for one pull request before the loop is parked for a human.
 	MaxFixerRoundsPerPullRequest int
@@ -652,6 +659,7 @@ type Runner struct {
 	onRegenerateIssue           RegenerateIssueFunc
 	regenerationAvailability    RegenerationAvailabilityFunc
 	deleteBranchOnRegeneration  func(projectID string) bool
+	plannerRegenerationAvailable bool
 }
 
 type DiscoveryInput struct {
@@ -1793,6 +1801,7 @@ func New(options Options) *Runner {
 		onRegenerateIssue:           options.OnRegenerateIssue,
 		regenerationAvailability:    options.RegenerationAvailability,
 		deleteBranchOnRegeneration:  options.DeleteBranchOnRegeneration,
+		plannerRegenerationAvailable: options.PlannerRegenerationAvailable == nil || *options.PlannerRegenerationAvailable,
 	}
 }
 
