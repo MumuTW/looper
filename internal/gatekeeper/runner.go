@@ -76,6 +76,11 @@ type CheckEvidence struct {
 	Conclusion string `json:"conclusion,omitempty"`
 }
 
+// DiffBudgetEvidence records the provider-observed change size and the
+// configured bounds that were applied. See config.GatekeeperDiffBudget for the
+// gate's semantics and the blind spots it does not catch (no additions or
+// per-file bound, generated files not excluded, whole-PR totals against the
+// current merge base).
 type DiffBudgetEvidence struct {
 	ChangedFiles    int `json:"changedFiles"`
 	Deletions       int `json:"deletions"`

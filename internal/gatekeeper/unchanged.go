@@ -28,11 +28,19 @@ const maxSkipAge = 30 * time.Minute
 // check completing moves neither UpdatedAt nor any field here — which is why
 // pull requests whose gate is waiting on a check are never skipped (see
 // reportAwaitsCheckState).
+//
+// BaseSHA is included even though it does not move on an ordinary push: when the
+// base branch is force-pushed or otherwise rewritten, GitHub recomputes
+// changedFiles and deletions against a different merge base without moving the
+// head or any other list-page field. Omitting it would let a stale diff-budget
+// verdict be reused for up to maxSkipAge after the observed counts crossed a
+// configured limit.
 func sourceFingerprint(pullRequest githubinfra.PullRequestSummary) string {
 	labels := append([]string(nil), pullRequest.Labels...)
 	sort.Strings(labels)
 	return strings.Join([]string{
 		pullRequest.HeadSHA,
+		pullRequest.BaseSHA,
 		pullRequest.UpdatedAt,
 		pullRequest.State,
 		pullRequest.ReviewDecision,
