@@ -476,9 +476,6 @@ func upgradePostStartBlocks(report upgradePostStartReport) []string {
 	if len(report.Status.Storage.PendingMigrations) > 0 {
 		blocks = append(blocks, "daemon storage has pending migrations")
 	}
-	if report.Status.Scheduler.ActiveRuns > 0 || report.Status.Scheduler.RunningItems > 0 {
-		blocks = append(blocks, "scheduler still owns active work after cutover")
-	}
 	if report.Status.Service.Recovery.Outstanding.QuarantinedActiveExecutions > 0 || report.Status.Service.Recovery.Outstanding.QuarantinedRunningRuns > 0 {
 		blocks = append(blocks, "daemon has outstanding quarantine debt")
 	}

@@ -102,6 +102,32 @@ func TestTargetBuildIdentityRejectsIncompleteJSON(t *testing.T) {
 	}
 }
 
+func TestUpgradePostStartBlocksIgnoresResumedWork(t *testing.T) {
+	// CompleteStartup marks admission ready and wakes the scheduler before
+	// verify-start can observe status, so queued work left in the drained
+	// database can legitimately be running here; it must not fail the cutover.
+	build := completeUpgradeIdentity("commit-a")
+	started := "2026-08-01T12:00:00Z"
+	report := upgradePostStartReport{
+		ExpectedBuild:   build,
+		ExpectedRelease: "release-b",
+		DaemonBuild:     build,
+		CurrentRelease:  "release-b",
+		StartedEvent:    true,
+	}
+	report.Status.Service.Healthy = true
+	report.Status.Service.Version = build.Version
+	report.Status.Service.Build = build.Metadata
+	report.Status.Service.AdmissionState = "ready"
+	report.Status.Service.StartedAt = &started
+	report.Status.Storage.Healthy = true
+	report.Status.Scheduler.ActiveRuns = 2
+	report.Status.Scheduler.RunningItems = 1
+	if blocks := upgradePostStartBlocks(report); len(blocks) != 0 {
+		t.Fatalf("blocks = %v, want none for a healthy cutover with resumed work", blocks)
+	}
+}
+
 func completeUpgradeIdentity(commit string) version.Info {
 	ts := "2026-07-31T12:00:00Z"
 	dirty := false
