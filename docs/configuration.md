@@ -744,7 +744,7 @@ decides what it may do with that judgement.
 | Level | Behaviour |
 | --- | --- |
 | `observe` (default) | Gate report only. Nothing is published, nothing is merged. |
-| `advise` | Publishes the verdict and reconciles the Mergify routing labels. Eligible PRs receive `auto-merge`; escalations receive `needs-human-review`; the human still controls whether the queue may act. |
+| `advise` | Publishes the verdict and reconciles the human-review route. Escalations receive `needs-human-review`; eligible PRs do not receive the queue-activating `auto-merge` label, so a human still decides whether to queue them. |
 | `auto` | Uses the same routing labels without a daemon-side merge call. Mergify's serialized queue rechecks branch protection and performs the merge. |
 
 ### How `auto` reaches the merge queue

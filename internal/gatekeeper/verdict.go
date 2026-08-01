@@ -62,15 +62,18 @@ func decideVerdictAction(trust config.GatekeeperTrustLevel, previous *Report, ne
 }
 
 // previousPublished reports whether a stored report was written at a level that
-// publishes. Reports predating the trust ladder carry the historical mode and
-// never published.
+// publishes. A routing-projection retry marker is also treated as published:
+// it is emitted only after the underlying report was persisted and the owned
+// label/comment projection failed, so the next evaluation must keep retiring or
+// retrying that projection even if the current trust level is observe.
+// Reports predating the trust ladder carry the historical mode and never
+// published.
 func previousPublished(report Report) bool {
 	switch config.GatekeeperTrustLevel(strings.TrimSpace(report.Mode)) {
 	case config.GatekeeperTrustAdvise, config.GatekeeperTrustAuto:
 		return true
-	default:
-		return false
 	}
+	return hasReasonCode(report.Reasons, ReasonRoutingProjectionFailed)
 }
 
 // reasonExplanations turn a reason code into something a human can act on. The
