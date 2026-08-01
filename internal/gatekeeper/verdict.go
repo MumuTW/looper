@@ -87,6 +87,7 @@ var reasonExplanations = map[ReasonCode]string{
 	ReasonCheckCancelled:           "a required check was cancelled",
 	ReasonReviewRequired:           "a required review is missing",
 	ReasonReviewChangesRequested:   "a reviewer requested changes",
+	ReasonCodexReviewMissing:       "a completed Codex review for the current head is required",
 	ReasonUnresolvedReviewThread:   "a review thread is unresolved",
 	ReasonProjectPolicyDenied:      "project policy does not permit merging this target",
 	ReasonHold:                     "a hold label is applied",
