@@ -694,6 +694,67 @@ func (r *Runner) departedFromOpenSet(
 		departed = departed[:maxReconciledDepartures]
 	}
 	return departed
+||||||| parent of 7c2a672f (fix(gatekeeper): bind routing labels to fresh authority)
+// maxReconciledDepartures bounds how many departed pull requests one tick gives
+// a final report. A burst — a release day that merges sixty pull requests, a
+// project whose discovery scope was just narrowed — must not turn one tick into
+// an unbounded run of forge reads. The remainder is picked up by later ticks,
+// because a pull request that is still recorded OPEN and still absent from the
+// open list stays a candidate until it is reconciled.
+const maxReconciledDepartures = 20
+
+// departedFromOpenSet names the pull requests whose latest report still says
+// OPEN but which are no longer in the open list — they merged or were closed
+// since the last tick.
+//
+// This is the lifecycle path that makes the merged state durable with webhooks
+// off, which is the default. Polling discovery lists only open pull requests, so
+// without this a pull request's last report is forever the one written while it
+// was still open, and `state=merged` answers empty on a default install.
+//
+// It is not a poller over merged history, and three things bound it:
+//
+//   - Only pull requests Looper itself last recorded as OPEN are candidates.
+//     Anything that merged before this ran, or that Looper never saw, is never
+//     revisited — there is no backfill.
+//   - The transition is one-way and self-clearing. Reconciling rewrites the
+//     state to MERGED or CLOSED, so the same pull request is never a candidate
+//     twice and the steady-state count is zero.
+//   - A truncated open list is not evidence of departure. When the list came
+//     back at the limit, a pull request may simply have fallen off the page, so
+//     nothing is reconciled at all rather than churning the overflow every tick.
+func (r *Runner) departedFromOpenSet(
+	repo string,
+	pullRequests []githubinfra.PullRequestSummary,
+	limit int,
+	previousReports map[string]Report,
+	stillOpen map[string]struct{},
+) []string {
+	if len(pullRequests) >= limit {
+		return nil
+	}
+	departed := make([]string, 0)
+	for entityID, previous := range previousReports {
+		if previous.Repo != repo || previous.PRNumber <= 0 {
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSpace(previous.Evidence.PullRequestState), "OPEN") {
+			continue
+		}
+		if _, open := stillOpen[entityID]; open {
+			continue
+		}
+		departed = append(departed, entityID)
+	}
+	// Sorted so the cap takes a deterministic prefix rather than whichever
+	// entries Go's map iteration happened to yield first.
+	sort.Slice(departed, func(i, j int) bool {
+		return previousReports[departed[i]].PRNumber < previousReports[departed[j]].PRNumber
+	})
+	if len(departed) > maxReconciledDepartures {
+		departed = departed[:maxReconciledDepartures]
+	}
+	return departed
 }
 
 // sourceFingerprintForProject includes the local authority inputs that the
@@ -1496,11 +1557,6 @@ func (r *Runner) persist(ctx context.Context, report Report) (Report, error) {
 	if err := r.appendGateReportAt(ctx, report, entityType, entityID, r.now().Add(time.Millisecond)); err != nil {
 		return Report{}, fmt.Errorf("persist gate report: %w", err)
 	}
-	if err := r.reconcileRoutingLabels(ctx, report, previous); err != nil && r.logWarn != nil {
-		r.logWarn("gatekeeper: could not reconcile routing labels", map[string]any{
-			"repo": report.Repo, "pr": report.PRNumber, "error": err.Error(),
-		})
-	}
 	// The owned comment is reconciled after the durable report: the report is the
 	// record, the comment is a convenience for whoever is deciding. A forge that
 	// refuses the write must not discard an evaluation already stored.
@@ -1530,6 +1586,50 @@ func gatekeeperCommitStatus(report Report) (string, string) {
 		if report.Mode == string(config.GatekeeperTrustAuto) && !report.Evidence.ReviewRequiredByPolicy {
 			return "success", "Merge gates passed; review threshold not met"
 		}
+		return "success", "Current-head Codex review and merge gates passed"
+	}
+	for _, reason := range report.Reasons {
+		if reason.Code == ReasonProviderStateUnavailable || reason.Code == ReasonProviderStateAmbiguous {
+			return "error", "Gatekeeper could not verify current merge state"
+		}
+	}
+	return "failure", "Gatekeeper found blocking merge state"
+}
+
+func containsRequiredCheck(checks []string, want string) bool {
+	for _, check := range checks {
+		if strings.EqualFold(strings.TrimSpace(check), strings.TrimSpace(want)) {
+			return true
+		}
+	}
+	return false
+}
+
+func withoutRequiredCheck(rules []githubinfra.RequiredCheckRule, name string) []githubinfra.RequiredCheckRule {
+	out := make([]githubinfra.RequiredCheckRule, 0, len(rules))
+	for _, rule := range rules {
+		if strings.EqualFold(strings.TrimSpace(rule.Context), strings.TrimSpace(name)) && rule.AppID == 0 {
+			continue
+		}
+		out = append(out, rule)
+	}
+	return out
+||||||| parent of 7c2a672f (fix(gatekeeper): bind routing labels to fresh authority)
+func gatekeeperCommitStatus(report Report) (string, string) {
+	for _, reason := range report.Reasons {
+		if reason.Code == ReasonGatekeeperCheckRequired {
+			return "error", "Looper Gatekeeper is not configured as a required status on the target branch"
+		}
+	}
+	for _, reason := range report.Reasons {
+		if reason.Code == ReasonCodexReviewRequired {
+			return "pending", "Waiting for Codex review of this commit"
+		}
+		if reason.Code == ReasonHeadStale {
+			return "pending", "Waiting for Gatekeeper evaluation of the current head"
+		}
+	}
+	if report.Eligible {
 		return "success", "Current-head Codex review and merge gates passed"
 	}
 	for _, reason := range report.Reasons {
