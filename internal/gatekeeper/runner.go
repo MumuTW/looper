@@ -256,11 +256,14 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 	}
 	result := DiscoveryResult{Reports: make([]Report, 0, len(pullRequests))}
 	diffBudget := r.diffBudget(input.ProjectID)
+	budgetEnabled := diffBudget.MaxChangedFiles > 0 || diffBudget.MaxDeletions > 0
 	for _, pullRequest := range pullRequests {
 		// A budget change is a gate-input change even when the PR list page is
 		// otherwise unchanged; include it so enabling or disabling the gate does
-		// not wait for the periodic maxSkipAge backstop.
-		fingerprint := sourceFingerprint(pullRequest) + fmt.Sprintf("\x1fdiff-budget=%d,%d", diffBudget.MaxChangedFiles, diffBudget.MaxDeletions)
+		// not wait for the periodic maxSkipAge backstop. BaseSHA is folded into
+		// the fingerprint only while the budget is enabled, so a base advance on
+		// a repo with no configured limit does not invalidate every open report.
+		fingerprint := sourceFingerprint(pullRequest, budgetEnabled) + fmt.Sprintf("\x1fdiff-budget=%d,%d", diffBudget.MaxChangedFiles, diffBudget.MaxDeletions)
 		entityID := fmt.Sprintf("%s#%d", input.Repo, pullRequest.Number)
 		previous, hasPrevious := previousReports[entityID]
 		if reused, ok := skipUnchanged(previous, hasPrevious, fingerprint, r.now()); ok {
@@ -288,10 +291,15 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 	if r.repos == nil || r.repos.Events == nil {
 		return Report{}, fmt.Errorf("gatekeeper event repository is not configured")
 	}
-	input.ProjectID = strings.TrimSpace(input.ProjectID)
+	// The project ID is matched by exact equality against configured IDs, which
+	// validation accepts with surrounding whitespace. Trimming it here would
+	// diverge from the discovery path (which fingerprints the project override
+	// using the caller's original key), so the report would fall back to the
+	// global budget and default trust while the fingerprint claimed the override.
+	// Only the emptiness check is trimmed; the original key is preserved.
 	input.Repo = strings.TrimSpace(input.Repo)
 	input.ExpectedHeadSHA = strings.TrimSpace(input.ExpectedHeadSHA)
-	if input.ProjectID == "" || input.Repo == "" || input.PRNumber <= 0 {
+	if strings.TrimSpace(input.ProjectID) == "" || input.Repo == "" || input.PRNumber <= 0 {
 		return Report{}, fmt.Errorf("gatekeeper project, repository, and pull request number are required")
 	}
 	if strings.TrimSpace(input.CWD) == "" {
@@ -346,22 +354,6 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 		report.Reasons = append(report.Reasons, Reason{Code: ReasonProjectPolicyDenied})
 	}
 
-	diffBudget := r.diffBudget(input.ProjectID)
-	if diffBudget.MaxChangedFiles > 0 || diffBudget.MaxDeletions > 0 {
-		if detail.DiffStats == nil {
-			return r.persistProviderBlock(ctx, report, ReasonProviderStateUnavailable, "diff_stats")
-		}
-		report.Evidence.DiffBudget = &DiffBudgetEvidence{
-			ChangedFiles:    detail.DiffStats.ChangedFiles,
-			Deletions:       detail.DiffStats.Deletions,
-			MaxChangedFiles: diffBudget.MaxChangedFiles,
-			MaxDeletions:    diffBudget.MaxDeletions,
-		}
-		if subject := diffBudgetExceededSubject(*detail.DiffStats, diffBudget); subject != "" {
-			report.Reasons = append(report.Reasons, Reason{Code: ReasonDiffBudgetExceeded, Subject: subject})
-		}
-	}
-
 	mergeability, err := r.github.ViewPullRequestMergeWatch(ctx, viewInput)
 	if err != nil {
 		return r.persistProviderBlock(ctx, report, ReasonProviderStateUnavailable, "mergeability")
@@ -382,6 +374,33 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 		report.Reasons = append(report.Reasons, Reason{Code: ReasonProviderStateAmbiguous, Subject: "mergeability:" + report.Evidence.MergeableState})
 	} else if report.Evidence.MergeableState != "clean" {
 		report.Reasons = append(report.Reasons, Reason{Code: ReasonMergeabilityNotClean, Subject: report.Evidence.MergeableState})
+	}
+
+	// The diff statistics were observed against detail.BaseSHA. If the base
+	// branch advanced between the detail read and the merge-watch read, GitHub
+	// recomputes changedFiles and deletions against a new merge base without
+	// moving the head, so the original counts no longer describe the diff this
+	// merge would produce. Revalidate against the merge-watch's current base
+	// before accepting the budget verdict; fail closed when those stats are
+	// unavailable.
+	diffBudget := r.diffBudget(input.ProjectID)
+	if diffBudget.MaxChangedFiles > 0 || diffBudget.MaxDeletions > 0 {
+		stats := detail.DiffStats
+		if strings.TrimSpace(mergeability.BaseSHA) != strings.TrimSpace(detail.BaseSHA) {
+			stats = mergeability.DiffStats
+		}
+		if stats == nil {
+			return r.persistProviderBlock(ctx, report, ReasonProviderStateUnavailable, "diff_stats")
+		}
+		report.Evidence.DiffBudget = &DiffBudgetEvidence{
+			ChangedFiles:    stats.ChangedFiles,
+			Deletions:       stats.Deletions,
+			MaxChangedFiles: diffBudget.MaxChangedFiles,
+			MaxDeletions:    diffBudget.MaxDeletions,
+		}
+		if subject := diffBudgetExceededSubject(*stats, diffBudget); subject != "" {
+			report.Reasons = append(report.Reasons, Reason{Code: ReasonDiffBudgetExceeded, Subject: subject})
+		}
 	}
 
 	protection, err := r.github.GetBranchProtection(ctx, githubinfra.BranchProtectionInput{Repo: input.Repo, Branch: report.Evidence.BaseRefName, CWD: input.CWD})
