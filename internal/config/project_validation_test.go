@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -151,5 +152,133 @@ func TestNormalizeProjectValidationKeepsDistinctProjectPolicies(t *testing.T) {
 	}
 	if got := cfg.Projects[1].Validation; got == nil || !got.OptOut || len(got.Commands) != 0 {
 		t.Fatalf("fluenx validation = %#v", got)
+	}
+}
+
+func TestValidateProjectValidationRequiresVendorWithToolNetworkDenial(t *testing.T) {
+	t.Parallel()
+
+	for _, testCase := range []struct {
+		name       string
+		vendor     AgentVendor
+		validation *ProjectValidationConfig
+		wantIssue  bool
+	}{
+		{name: "commands with unsupported vendor", vendor: AgentVendorClaudeCode, validation: &ProjectValidationConfig{Commands: []string{"go test ./..."}}, wantIssue: true},
+		{name: "commands with codex", vendor: AgentVendorCodex, validation: &ProjectValidationConfig{Commands: []string{"go test ./..."}}},
+		{name: "commands with devin", vendor: AgentVendorDevinExperimental, validation: &ProjectValidationConfig{Commands: []string{"go test ./..."}}, wantIssue: true},
+		{name: "opt out with unsupported vendor", vendor: AgentVendorClaudeCode, validation: &ProjectValidationConfig{OptOut: true}},
+	} {
+		testCase := testCase
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			cfg, err := DefaultConfig(t.TempDir())
+			if err != nil {
+				t.Fatalf("DefaultConfig() error = %v", err)
+			}
+			vendor := testCase.vendor
+			cfg.Agent.Vendor = &vendor
+			cfg.Projects = []ProjectRefConfig{{ID: "demo", Name: "Demo", RepoPath: t.TempDir(), Validation: testCase.validation}}
+
+			err = ValidateWithOptions(cfg, ValidateOptions{DefaultWorktreeRoot: t.TempDir()})
+			var validationErr *ConfigValidationError
+			hasIssue := errors.As(err, &validationErr) && validationIssuesContainPath(validationErr.Issues, "projects[0].validation.commands")
+			if hasIssue != testCase.wantIssue {
+				t.Fatalf("ValidateWithOptions() error = %v, want vendor issue = %t", err, testCase.wantIssue)
+			}
+			if !testCase.wantIssue {
+				return
+			}
+			messages := []string{}
+			for _, issue := range validationErr.Issues {
+				if issue.Path == "projects[0].validation.commands" {
+					messages = append(messages, issue.Message)
+				}
+			}
+			if len(messages) != 2 {
+				t.Fatalf("issues = %#v, want one per coding role", messages)
+			}
+			message := strings.Join(messages, "\n")
+			for _, want := range []string{"demo", "roles.worker.agent.vendor", "roles.fixer.agent.vendor", "optOut=true", string(AgentVendorCodex)} {
+				if !strings.Contains(message, want) {
+					t.Fatalf("issue message = %q, missing %q", message, want)
+				}
+			}
+			// The supported-vendor list must be codex only; devin must not be
+			// advertised as supported even though it appears as the rejected
+			// vendor value in the roles.<role>.agent.vendor= clause.
+			if !strings.Contains(message, "which only codex support") {
+				t.Fatalf("issue message = %q, want supported list to be codex only", message)
+			}
+		})
+	}
+}
+
+// TestValidateProjectValidationAppliesVendorCheckToLegacyDefaults covers the
+// case a project with no authored validation policy inherits the deprecated
+// defaults.validationCommands fallback. Worker/fixer still resolve those
+// commands and run with RestrictToolNetwork, so an unsupported vendor must be
+// rejected at startup rather than passing validation and failing at every spawn.
+func TestValidateProjectValidationAppliesVendorCheckToLegacyDefaults(t *testing.T) {
+	t.Parallel()
+
+	for _, testCase := range []struct {
+		name      string
+		vendor    AgentVendor
+		optOut    bool
+		wantIssue bool
+	}{
+		{name: "legacy defaults with unsupported vendor", vendor: AgentVendorClaudeCode, wantIssue: true},
+		{name: "legacy defaults with devin", vendor: AgentVendorDevinExperimental, wantIssue: true},
+		{name: "legacy defaults with codex", vendor: AgentVendorCodex},
+		{name: "legacy defaults with unsupported vendor and explicit opt out", vendor: AgentVendorClaudeCode, optOut: true},
+	} {
+		testCase := testCase
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			cfg, err := DefaultConfig(t.TempDir())
+			if err != nil {
+				t.Fatalf("DefaultConfig() error = %v", err)
+			}
+			cfg.Defaults.ValidationCommands = []string{"make check"}
+			vendor := testCase.vendor
+			cfg.Agent.Vendor = &vendor
+			project := ProjectRefConfig{ID: "demo", Name: "Demo", RepoPath: t.TempDir()}
+			if testCase.optOut {
+				project.Validation = &ProjectValidationConfig{OptOut: true}
+			}
+			cfg.Projects = []ProjectRefConfig{project}
+
+			err = ValidateWithOptions(cfg, ValidateOptions{DefaultWorktreeRoot: t.TempDir()})
+			var validationErr *ConfigValidationError
+			hasIssue := errors.As(err, &validationErr) && validationIssuesContainPath(validationErr.Issues, "projects[0].validation.commands")
+			if hasIssue != testCase.wantIssue {
+				t.Fatalf("ValidateWithOptions() error = %v, want vendor issue = %t", err, testCase.wantIssue)
+			}
+			if !testCase.wantIssue {
+				return
+			}
+			messages := []string{}
+			for _, issue := range validationErr.Issues {
+				if issue.Path == "projects[0].validation.commands" {
+					messages = append(messages, issue.Message)
+				}
+			}
+			if len(messages) != 2 {
+				t.Fatalf("issues = %#v, want one per coding role", messages)
+			}
+			message := strings.Join(messages, "\n")
+			for _, want := range []string{"demo", "roles.worker.agent.vendor", "roles.fixer.agent.vendor", "optOut=true", string(AgentVendorCodex)} {
+				if !strings.Contains(message, want) {
+					t.Fatalf("issue message = %q, missing %q", message, want)
+				}
+			}
+			// The supported-vendor list must be codex only; devin must not be
+			// advertised as supported even though it appears as the rejected
+			// vendor value in the roles.<role>.agent.vendor= clause.
+			if !strings.Contains(message, "which only codex support") {
+				t.Fatalf("issue message = %q, want supported list to be codex only", message)
+			}
+		})
 	}
 }

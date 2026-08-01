@@ -3189,8 +3189,28 @@ func TestProcessClaimedItemRunsExistingLoopFollowUpOnNewHeadWithoutReviewRequest
 	if err != nil || updatedLoop == nil || updatedLoop.MetadataJSON == nil {
 		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop metadata", updatedLoop, err)
 	}
+	// The COMMENT clean-noop path records markerVerified=true and sets
+	// lastPublishedHeadSha to the new head so discovery does not re-run the
+	// same clean-noop path indefinitely.
 	if !contains(*updatedLoop.MetadataJSON, `"lastPublishedHeadSha":"abc123"`) {
-		t.Fatalf("loop metadata = %s, want new head recorded", *updatedLoop.MetadataJSON)
+		t.Fatalf("loop metadata = %s, want lastPublishedHeadSha abc123 for COMMENT clean no-op on new head", *updatedLoop.MetadataJSON)
+	}
+	events, err := fixture.repos.Events.ListByEntity(ctx, "pull_request", "acme/looper#42")
+	if err != nil {
+		t.Fatalf("Events.ListByEntity() error = %v", err)
+	}
+	foundReviewPosted := false
+	for _, event := range events {
+		if event.EventType != "pr.review.posted" {
+			continue
+		}
+		if !strings.Contains(event.PayloadJSON, `"headSha":"abc123"`) {
+			t.Fatalf("pr.review.posted payload = %s, want headSha abc123 for new head", event.PayloadJSON)
+		}
+		foundReviewPosted = true
+	}
+	if !foundReviewPosted {
+		t.Fatalf("no pr.review.posted event in %d events, want the authority event written for new head", len(events))
 	}
 }
 
@@ -3986,11 +4006,84 @@ func TestProcessClaimedItemRecordsCleanNoopWithoutReviewMarkerForCommentPolicy(t
 	if err != nil || updatedLoop == nil || updatedLoop.MetadataJSON == nil {
 		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop metadata", updatedLoop, err)
 	}
-	if !contains(*updatedLoop.MetadataJSON, `"lastPublishedHeadSha":"abc123"`) {
-		t.Fatalf("loop metadata = %s, want clean no-op recorded as published for head", *updatedLoop.MetadataJSON)
+	// The COMMENT clean-noop path is the configured clean signal: the runner
+	// validated that no structured review marker was required for this policy
+	// and reconciled the +1 reaction. The event must carry markerVerified=true
+	// so Gatekeeper accepts it, and lastPublishedHeadSha must be set so
+	// discovery does not re-run the same clean-noop path indefinitely.
+	if !contains(*updatedLoop.MetadataJSON, `"lastPublishedHeadSha"`) {
+		t.Fatalf("loop metadata = %s, want lastPublishedHeadSha for COMMENT clean no-op", *updatedLoop.MetadataJSON)
 	}
 	if contains(*updatedLoop.MetadataJSON, `"lastOutputFingerprint"`) {
 		t.Fatalf("loop metadata = %s, want clean no-op excluded from output fingerprinting", *updatedLoop.MetadataJSON)
+	}
+	// The pr.review.posted event is the sole authority Gatekeeper accepts for
+	// the current-head review gate. A clean no-op under the COMMENT policy
+	// publishes no structured GitHub review, but the runner validated the
+	// configured clean signal, so the event must carry markerVerified=true.
+	events, err := fixture.repos.Events.ListByEntity(ctx, "pull_request", "acme/looper#42")
+	if err != nil {
+		t.Fatalf("Events.ListByEntity() error = %v", err)
+	}
+	foundReviewPosted := false
+	for _, event := range events {
+		if event.EventType != "pr.review.posted" {
+			continue
+		}
+		foundReviewPosted = true
+		if !strings.Contains(event.PayloadJSON, `"markerVerified":true`) {
+			t.Fatalf("pr.review.posted payload = %s, want markerVerified:true for COMMENT clean no-op", event.PayloadJSON)
+		}
+		if !strings.Contains(event.PayloadJSON, `"event":"COMMENT"`) {
+			t.Fatalf("pr.review.posted payload = %s, want event COMMENT", event.PayloadJSON)
+		}
+	}
+	if !foundReviewPosted {
+		t.Fatalf("no pr.review.posted event in %d events, want the authority event written", len(events))
+	}
+}
+
+// A COMMENT clean no-op publishes markerVerified=true evidence because the
+// runner validated the configured clean signal (+1 reaction). lastPublishedHeadSha
+// is set so discovery does not re-enqueue the same head, preventing the
+// permanently-ineligible loop where the markerless path is re-run indefinitely.
+func TestProcessClaimedItemMarksHeadPublishedAfterCommentCleanNoop(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{reviewRequests: []string{"octocat"}, reviewMarkerMissing: true}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "No actionable findings; added clean signal", Stdout: `__LOOPER_RESULT__={"summary":"No actionable findings; added clean signal"}`, ParseStatus: "parsed"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, LoopConfig: config.ReviewerLoopConfig{EnabledByDefault: true, QuietPeriodSeconds: 120, MaxIterationsPerPR: 20, MaxIterationsPerHead: 2, MaxWallClockSeconds: 14400, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25}})
+	ctx := context.Background()
+	nowISO := fixture.nowISO()
+	repo := "acme/looper"
+	prNumber := int64(42)
+	metadata := `{"followUpdates":true,"loop":{"enabled":true}}`
+	loop := storage.LoopRecord{ID: "loop_clean_noop_rediscovery", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "queued", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(ctx, loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	queue, err := runner.enqueue(ctx, enqueueInput{ProjectID: "project_1", LoopID: loop.ID, Repo: repo, PRNumber: prNumber})
+	if err != nil {
+		t.Fatalf("enqueue() error = %v", err)
+	}
+	claimed, err := fixture.repos.Queue.ClaimNextOfType(ctx, fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || claimed == nil || claimed.ID != queue.ID {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want queued item %s", claimed, err, queue.ID)
+	}
+	if _, err := runner.ProcessClaimedItem(ctx, *claimed); err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	// Discovery must not re-enqueue the same head because lastPublishedHeadSha
+	// was set for the markerVerified=true event. The head is marked as
+	// published and Gatekeeper accepts the configured clean signal.
+	discovery, err := runner.DiscoverPullRequests(ctx, DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	for _, item := range discovery.QueueItems {
+		if item.PRNumber != nil && *item.PRNumber == prNumber {
+			t.Fatalf("discovery QueueItems = %#v, want PR %d not re-enqueued after COMMENT clean no-op", discovery.QueueItems, prNumber)
+		}
 	}
 }
 
@@ -4063,6 +4156,25 @@ func TestProcessClaimedItemAcceptsCleanNoopWithApprovedMarkerForApprovePolicy(t 
 	}
 	if contains(*updatedLoop.MetadataJSON, `"lastOutputFingerprint"`) {
 		t.Fatalf("loop metadata = %s, want accepted clean no-op excluded from output fingerprinting", *updatedLoop.MetadataJSON)
+	}
+	// A marker-verified review must emit pr.review.posted with markerVerified
+	// true so Gatekeeper accepts it as current-head review authority.
+	events, err := fixture.repos.Events.ListByEntity(context.Background(), "pull_request", "acme/looper#42")
+	if err != nil {
+		t.Fatalf("Events.ListByEntity() error = %v", err)
+	}
+	foundReviewPosted := false
+	for _, event := range events {
+		if event.EventType != "pr.review.posted" {
+			continue
+		}
+		foundReviewPosted = true
+		if !strings.Contains(event.PayloadJSON, `"markerVerified":true`) {
+			t.Fatalf("pr.review.posted payload = %s, want markerVerified:true for marker-verified review", event.PayloadJSON)
+		}
+	}
+	if !foundReviewPosted {
+		t.Fatalf("no pr.review.posted event in %d events, want the authority event written", len(events))
 	}
 }
 

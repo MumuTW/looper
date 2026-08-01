@@ -637,7 +637,17 @@ func ValidateProjectValidationPolicy(validation *ProjectValidationConfig) error 
 func validateProjectValidationConfig(config Config, project ProjectRefConfig, prefix string, requirePresence bool, issues *[]ValidationIssue) {
 	validation := project.Validation
 	if validation == nil {
-		if requirePresence && len(ResolveValidationCommands(config)) == 0 {
+		if len(ResolveValidationCommands(config)) > 0 {
+			// The project has no authored policy but inherits the deprecated
+			// defaults.validationCommands fallback, so the gate is active:
+			// worker/fixer resolve these commands and run with
+			// RestrictToolNetwork. The same vendor capability check applies, or
+			// an unsupported vendor passes startup and fails at every spawn
+			// instead of failing fast here.
+			validateValidationVendorSupport(config, project, prefix, issues)
+			return
+		}
+		if requirePresence {
 			*issues = append(*issues, ValidationIssue{
 				Path:    prefix + ".validation",
 				Message: "must configure commands or set optOut=true; defaults.validationCommands is only a legacy migration fallback",
@@ -661,6 +671,46 @@ func validateProjectValidationConfig(config Config, project ProjectRefConfig, pr
 			*issues = append(*issues, ValidationIssue{Path: fmt.Sprintf("%s.validation.commands[%d]", prefix, index), Message: "must be a non-empty string"})
 		}
 	}
+	validateValidationVendorSupport(config, project, prefix, issues)
+}
+
+// validateValidationVendorSupport rejects a project whose validation gate can
+// never run: the gate spawns the worker/fixer agent with its tool subprocesses
+// denied network access, and a vendor whose CLI cannot express that is refused
+// at spawn time on every attempt. Catching it here turns a repeating runtime
+// failure into one startup error naming the fix.
+//
+// Agent bindings are global-only (validateProjectRoleAgentBindings rejects
+// projects[].roles.<role>.agent), so the effective vendor comes from
+// roles.<role>.agent / agent.vendor and is the same for every project.
+func validateValidationVendorSupport(config Config, project ProjectRefConfig, prefix string, issues *[]ValidationIssue) {
+	supported := make([]string, 0, len(ToolNetworkDenialVendors()))
+	for _, vendor := range ToolNetworkDenialVendors() {
+		supported = append(supported, string(vendor))
+	}
+	for _, role := range []string{CodingRoleWorker, CodingRoleFixer} {
+		resolved, ok := ResolveAgent(config, project.ID, role)
+		if !ok || VendorSupportsToolNetworkDenial(resolved.Vendor) {
+			continue
+		}
+		*issues = append(*issues, ValidationIssue{
+			Path: fmt.Sprintf("%s.validation.commands", prefix),
+			Message: fmt.Sprintf(
+				"cannot be enforced for project %q with roles.%s.agent.vendor=%s: the validation gate runs the agent with tool network access denied, which only %s support; set roles.%s.agent.vendor to one of them or set %s.validation.optOut=true",
+				firstNonEmptyProjectName(project), role, resolved.Vendor, strings.Join(supported, ", "), role, prefix,
+			),
+		})
+	}
+}
+
+func firstNonEmptyProjectName(project ProjectRefConfig) string {
+	if id := strings.TrimSpace(project.ID); id != "" {
+		return id
+	}
+	if repo := strings.TrimSpace(project.Repo); repo != "" {
+		return repo
+	}
+	return strings.TrimSpace(project.RepoPath)
 }
 
 func validatePackageAndDefaultsConfig(config Config, issues *[]ValidationIssue) {

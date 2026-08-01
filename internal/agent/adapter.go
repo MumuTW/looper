@@ -1,9 +1,11 @@
 package agent
 
 import (
+	"sort"
 	"strings"
 
 	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/validationcmd"
 )
 
 // runtimeAdapter owns the CLI-shaped parts of an agent runtime. Process
@@ -14,6 +16,12 @@ type runtimeAdapter struct {
 	resolveStartArgs         func(ExecutorConfig, []string, string, string) []string
 	resolveNativeResumeArgs  func(ExecutorConfig, []string, string, string, string) []string
 	resolveInteractiveResume func(string, string) string
+	// enforceToolNetworkDenied rewrites spawn args for a validation-gated run so
+	// the agent's tool subprocesses cannot reach the network while the parent
+	// agent keeps the connection it needs for model transport. A nil hook means
+	// the vendor cannot express that capability, and Start refuses the run
+	// rather than executing it unrestricted.
+	enforceToolNetworkDenied func(args []string, prompt string, sandbox *validationcmd.Sandbox) ([]string, error)
 }
 
 var runtimeAdapters = map[config.AgentVendor]runtimeAdapter{
@@ -45,6 +53,9 @@ var runtimeAdapters = map[config.AgentVendor]runtimeAdapter{
 		resolveNativeResumeArgs: resolveCodexNativeResumeArgs,
 		resolveInteractiveResume: func(command, sessionID string) string {
 			return command + " resume " + shellSingleQuote(sessionID)
+		},
+		enforceToolNetworkDenied: func(args []string, prompt string, sandbox *validationcmd.Sandbox) ([]string, error) {
+			return enforceCodexToolNetworkDenied(args, prompt, sandbox), nil
 		},
 	},
 	config.AgentVendorOpenCode: {
@@ -78,12 +89,42 @@ var runtimeAdapters = map[config.AgentVendor]runtimeAdapter{
 		resolveStartArgs: func(cfg ExecutorConfig, args []string, _ string, prompt string) []string {
 			return resolveDevinArgs(cfg, args, prompt)
 		},
+		// enforceToolNetworkDenied is intentionally absent: the captured Devin
+		// CLI 3000.3.22 evidence (docs/research/devin-cli-3000.3.22.md) lists
+		// strict tool-network containment as a no-go, and no integration check
+		// has demonstrated that a supported CLI version actually denies a
+		// network probe from an exec tool. Leaving the hook unregistered keeps
+		// the validation gate fail-closed for devin rather than asserting an
+		// unverified security boundary from generated argument/config shapes.
 	},
 }
 
 func runtimeAdapterFor(vendor config.AgentVendor) (runtimeAdapter, bool) {
 	adapter, ok := runtimeAdapters[vendor]
 	return adapter, ok
+}
+
+// VendorSupportsToolNetworkDenial reports whether a vendor's adapter can run a
+// validation-gated execution with its tool subprocesses cut off from the
+// network. Unknown vendors report false so the gate fails closed.
+func VendorSupportsToolNetworkDenial(vendor config.AgentVendor) bool {
+	adapter, ok := runtimeAdapterFor(vendor)
+	return ok && adapter.enforceToolNetworkDenied != nil
+}
+
+// ToolNetworkDenialVendors returns the vendors whose adapters implement
+// tool-network denial, sorted for stable messages. This adapter table is the
+// source of truth; config.ToolNetworkDenialVendors mirrors it for validation
+// and a drift test keeps the two identical.
+func ToolNetworkDenialVendors() []config.AgentVendor {
+	vendors := make([]config.AgentVendor, 0, len(runtimeAdapters))
+	for vendor, adapter := range runtimeAdapters {
+		if adapter.enforceToolNetworkDenied != nil {
+			vendors = append(vendors, vendor)
+		}
+	}
+	sort.Slice(vendors, func(i, j int) bool { return vendors[i] < vendors[j] })
+	return vendors
 }
 
 func resolveClaudeNativeResumeArgs(cfg ExecutorConfig, args []string, _ string, sessionID string, prompt string) []string {

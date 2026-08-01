@@ -4,8 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net/http"
-	"net/http/httptest"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -93,7 +92,7 @@ func TestRunRejectsBroadReadRoot(t *testing.T) {
 	}
 }
 
-func TestRunReadOnlyContainsMaliciousProcessTree(t *testing.T) {
+func TestRunAssessmentReadOnlyContainsMaliciousProcessTree(t *testing.T) {
 	srt, err := exec.LookPath("srt")
 	if err != nil {
 		t.Skip("srt is not installed")
@@ -109,14 +108,11 @@ func TestRunReadOnlyContainsMaliciousProcessTree(t *testing.T) {
 		}
 		git = strings.TrimSpace(string(output))
 	}
-	curl, err := exec.LookPath("curl")
-	if err != nil {
-		t.Skip("curl is not installed")
-	}
-
 	root := t.TempDir()
 	repo := filepath.Join(root, "repo")
-	remote := filepath.Join(root, "remote.git")
+	worktree := filepath.Join(root, "assessment-worktree")
+	fileRemote := filepath.Join(root, "file-remote.git")
+	loopbackRemote := filepath.Join(root, "loopback-remote.git")
 	absoluteSentinel := filepath.Join(root, "absolute-sentinel")
 	siblingSentinel := filepath.Join(root, "sibling-sentinel")
 	outsideSecret := filepath.Join(root, "outside-secret")
@@ -132,25 +128,37 @@ func TestRunReadOnlyContainsMaliciousProcessTree(t *testing.T) {
 	if err := os.WriteFile(outsideSecret, []byte("outside-secret-marker\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Symlink(outsideSecret, filepath.Join(repo, "outside-link")); err != nil {
-		t.Fatal(err)
-	}
-	runGit(t, root, "init", "--bare", remote)
+	runGit(t, root, "init", "--bare", fileRemote)
+	runGit(t, root, "init", "--bare", loopbackRemote)
 	runGit(t, repo, "init")
 	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("safe\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.Symlink(outsideSecret, filepath.Join(repo, "outside-link")); err != nil {
+		t.Fatal(err)
+	}
 	runGit(t, repo, "-c", "user.name=Looper Test", "-c", "user.email=test@example.invalid", "add", "README.md")
+	runGit(t, repo, "-c", "user.name=Looper Test", "-c", "user.email=test@example.invalid", "add", "outside-link")
 	runGit(t, repo, "-c", "user.name=Looper Test", "-c", "user.email=test@example.invalid", "commit", "-m", "initial")
-	runGit(t, repo, "remote", "add", "origin", "file://"+remote)
-	runGit(t, repo, "push", "origin", "HEAD:refs/heads/main")
-	before := strings.TrimSpace(runGit(t, remote, "rev-parse", "refs/heads/main"))
-
-	model := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte("model-ok"))
-	}))
-	defer model.Close()
-	modelURL := strings.Replace(model.URL, "127.0.0.1", "localhost", 1)
+	loopbackURL := startGitDaemon(t, git, root)
+	runGit(t, repo, "remote", "add", "file", "file://"+fileRemote)
+	runGit(t, repo, "remote", "add", "loopback", loopbackURL+"/loopback-remote.git")
+	runGit(t, repo, "push", "file", "HEAD:refs/heads/main")
+	runGit(t, repo, "push", "loopback", "HEAD:refs/heads/main")
+	runGit(t, repo, "worktree", "add", "--detach", worktree, "HEAD")
+	privateGitDir := absoluteGitPath(t, worktree, "--git-dir")
+	commonGitDir := absoluteGitPath(t, worktree, "--git-common-dir")
+	beforeHead := strings.TrimSpace(runGit(t, worktree, "rev-parse", "HEAD"))
+	beforeIndex, err := os.ReadFile(filepath.Join(privateGitDir, "index"))
+	if err != nil {
+		t.Fatalf("read linked-worktree index: %v", err)
+	}
+	beforeConfig, err := os.ReadFile(filepath.Join(commonGitDir, "config"))
+	if err != nil {
+		t.Fatalf("read linked-worktree common config: %v", err)
+	}
+	beforeFileRemote := gitRefs(t, fileRemote)
+	beforeLoopbackRemote := gitRefs(t, loopbackRemote)
 
 	t.Setenv("GH_TOKEN", "daemon-github-secret")
 	t.Setenv("GITHUB_TOKEN", "daemon-github-secret-2")
@@ -168,23 +176,26 @@ printf blocked > %q 2>/dev/null || true
 cat outside-link 2>/dev/null || true
 printf blocked > outside-link 2>/dev/null || true
 git status --porcelain && printf 'git-read:ok\n'
+git rev-parse --git-dir --git-common-dir >/dev/null && printf 'git-metadata-read:ok\n'
 git config credential.helper '!printf stolen' >/dev/null 2>&1 || true
+printf 'protocol=https\nhost=example.invalid\n\n' | git -c credential.helper='!printf stolen' credential fill >/dev/null 2>&1 || true
+git update-index --add --cacheinfo 100644,$(git hash-object -w README.md),index-attack.txt >/dev/null 2>&1 || true
+git update-ref refs/heads/assessment-attack HEAD >/dev/null 2>&1 || true
 git add README.md >/dev/null 2>&1 || true
 git -c user.name=Attacker -c user.email=attacker@example.invalid commit --allow-empty -m attack >/dev/null 2>&1 || true
-git push origin HEAD:refs/heads/attack >/dev/null 2>&1 || true
+git push file HEAD:refs/heads/attack-file >/dev/null 2>&1 || true
+git push loopback HEAD:refs/heads/attack-loopback >/dev/null 2>&1 || true
 (sleep 0.1; printf child-blocked > %q) >/dev/null 2>&1 &
 wait
-if curl -fsS %q >/dev/null 2>&1; then printf 'direct-network:open\n'; else printf 'direct-network:blocked\n'; fi
-curl --noproxy '' -fsS %q
-`, absoluteSentinel, srtDefaultSentinel, siblingSentinel, modelURL, modelURL)
+`, absoluteSentinel, srtDefaultSentinel, siblingSentinel)
 
 	options := Options{
-		CWD:         repo,
+		CWD:         worktree,
 		Command:     "/bin/sh",
 		Args:        []string{"-c", script},
-		Environment: ToolEnvironment{PrependPath: []string{filepath.Dir(git), filepath.Dir(curl)}},
+		Environment: ToolEnvironment{PrependPath: []string{filepath.Dir(git)}},
 		Timeout:     15 * time.Second,
-		Profile:     ReadOnlyProfile([]string{repo, filepath.Dir(git), filepath.Dir(curl)}, []string{"localhost"}),
+		Profile:     AssessmentProfile([]string{worktree, privateGitDir, commonGitDir, filepath.Dir(git)}),
 	}
 	// Local developer installs are commonly user-writable and are rejected by
 	// production lookup. CI installs the trusted pinned runtime and exercises
@@ -199,18 +210,15 @@ curl --noproxy '' -fsS %q
 	if err != nil {
 		t.Fatalf("Run() error = %v; stdout=%q stderr=%q", err, result.Stdout, result.Stderr)
 	}
-	if !strings.Contains(result.Stdout, "read:ok") || !strings.Contains(result.Stdout, "git-read:ok") {
+	if !strings.Contains(result.Stdout, "read:ok") || !strings.Contains(result.Stdout, "git-read:ok") || !strings.Contains(result.Stdout, "git-metadata-read:ok") {
 		t.Fatalf("stdout = %q stderr = %q, want repository and Git metadata reads", result.Stdout, result.Stderr)
-	}
-	if !strings.Contains(result.Stdout, "direct-network:blocked") || strings.Contains(result.Stdout, "direct-network:open") || !strings.Contains(result.Stdout, "model-ok") {
-		t.Fatalf("stdout = %q, want direct network denied and brokered model network allowed", result.Stdout)
 	}
 	for _, secret := range []string{"daemon-github-secret", "daemon-github-secret-2", "daemon-agent.sock", "daemon-config.toml", "outside-secret-marker"} {
 		if strings.Contains(result.Stdout, secret) || strings.Contains(result.Stderr, secret) {
 			t.Fatalf("sandbox output leaked %q: stdout=%q stderr=%q", secret, result.Stdout, result.Stderr)
 		}
 	}
-	for _, path := range []string{filepath.Join(repo, "cwd-sentinel"), siblingSentinel, absoluteSentinel, srtDefaultSentinel} {
+	for _, path := range []string{filepath.Join(worktree, "cwd-sentinel"), siblingSentinel, absoluteSentinel, srtDefaultSentinel} {
 		if _, err := os.Stat(path); !os.IsNotExist(err) {
 			t.Fatalf("malicious process wrote %s: %v", path, err)
 		}
@@ -218,18 +226,83 @@ curl --noproxy '' -fsS %q
 	if raw, err := os.ReadFile(outsideSecret); err != nil || string(raw) != "outside-secret-marker\n" {
 		t.Fatalf("symlink write changed outside secret: %q, %v", raw, err)
 	}
-	after := strings.TrimSpace(runGit(t, remote, "rev-parse", "refs/heads/main"))
-	if after != before {
-		t.Fatalf("remote main changed from %s to %s", before, after)
+	if afterIndex, readErr := os.ReadFile(filepath.Join(privateGitDir, "index")); readErr != nil || string(afterIndex) != string(beforeIndex) {
+		t.Fatalf("linked-worktree index changed: %v", readErr)
 	}
-	if output, err := exec.Command("git", "--git-dir", remote, "show-ref", "--verify", "refs/heads/attack").CombinedOutput(); err == nil {
-		t.Fatalf("malicious push created attack ref: %s", output)
+	if afterConfig, readErr := os.ReadFile(filepath.Join(commonGitDir, "config")); readErr != nil || string(afterConfig) != string(beforeConfig) {
+		t.Fatalf("linked-worktree common config changed: %v", readErr)
+	}
+	if afterHead := strings.TrimSpace(runGit(t, worktree, "rev-parse", "HEAD")); afterHead != beforeHead {
+		t.Fatalf("linked worktree HEAD changed: before=%s after=%s", beforeHead, afterHead)
+	}
+	if output, err := exec.Command("git", "--git-dir", commonGitDir, "show-ref", "--verify", "refs/heads/assessment-attack").CombinedOutput(); err == nil {
+		t.Fatalf("malicious process created common-dir ref: %s", output)
+	}
+	if got := strings.TrimSpace(runGit(t, worktree, "status", "--porcelain")); got != "" {
+		t.Fatalf("linked worktree status = %q, want clean", got)
+	}
+	if after := gitRefs(t, fileRemote); after != beforeFileRemote {
+		t.Fatalf("file remote changed:\nbefore=%s\nafter=%s", beforeFileRemote, after)
+	}
+	if after := gitRefs(t, loopbackRemote); after != beforeLoopbackRemote {
+		t.Fatalf("loopback remote changed:\nbefore=%s\nafter=%s", beforeLoopbackRemote, after)
 	}
 	credentialHelper := exec.Command("git", "config", "--local", "--get", "credential.helper")
-	credentialHelper.Dir = repo
+	credentialHelper.Dir = worktree
 	if output, err := credentialHelper.CombinedOutput(); err == nil {
 		t.Fatalf("malicious process installed credential helper: %s", output)
 	}
+}
+
+func startGitDaemon(t *testing.T, git, basePath string) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve loopback Git port: %v", err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	if err := listener.Close(); err != nil {
+		t.Fatalf("release loopback Git port: %v", err)
+	}
+	command := exec.Command(git, "daemon", "--reuseaddr", "--export-all", "--enable=receive-pack", "--base-path="+basePath, "--listen=127.0.0.1", fmt.Sprintf("--port=%d", port))
+	if err := command.Start(); err != nil {
+		t.Fatalf("start loopback Git daemon: %v", err)
+	}
+	t.Cleanup(func() {
+		if command.Process != nil {
+			_ = command.Process.Kill()
+		}
+		_ = command.Wait()
+	})
+	address := fmt.Sprintf("127.0.0.1:%d", port)
+	for attempt := 0; attempt < 20; attempt++ {
+		connection, dialErr := net.DialTimeout("tcp", address, 100*time.Millisecond)
+		if dialErr == nil {
+			_ = connection.Close()
+			return "git://" + address
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatalf("loopback Git daemon did not listen on %s", address)
+	return ""
+}
+
+func absoluteGitPath(t *testing.T, cwd, arg string) string {
+	t.Helper()
+	path := strings.TrimSpace(runGit(t, cwd, "rev-parse", arg))
+	if filepath.IsAbs(path) {
+		return filepath.Clean(path)
+	}
+	return filepath.Clean(filepath.Join(cwd, path))
+}
+
+func gitRefs(t *testing.T, gitDir string) string {
+	t.Helper()
+	output, err := exec.Command("git", "--git-dir", gitDir, "show-ref").CombinedOutput()
+	if err != nil && len(output) != 0 {
+		t.Fatalf("show refs for %s: %v\n%s", gitDir, err, output)
+	}
+	return string(output)
 }
 
 func contains(values []string, want string) bool {

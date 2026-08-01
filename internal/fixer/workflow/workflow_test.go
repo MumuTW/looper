@@ -115,6 +115,35 @@ func TestParse(t *testing.T) {
 	}
 }
 
+func TestReaches(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name   string
+		start  Step
+		target Step
+		want   bool
+	}{
+		{name: "fresh start reaches repair", start: StepDiscoverPR, target: StepRepair, want: true},
+		{name: "prepare-worktree start reaches repair", start: StepPrepareWorktree, target: StepRepair, want: true},
+		{name: "repair start reaches itself", start: StepRepair, target: StepRepair, want: true},
+		{name: "validate start does not reach repair", start: StepValidate, target: StepRepair, want: false},
+		{name: "push start does not reach repair", start: StepPush, target: StepRepair, want: false},
+		{name: "recheck start does not reach repair", start: StepRecheck, target: StepRepair, want: false},
+		{name: "empty start reaches every real step", start: "", target: StepRepair, want: true},
+		{name: "unknown start reaches every real step", start: Step("bogus"), target: StepRepair, want: true},
+		{name: "real start does not reach unknown target", start: StepDiscoverPR, target: Step("bogus"), want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := Reaches(tc.start, tc.target); got != tc.want {
+				t.Fatalf("Reaches(%q, %q) = %v, want %v", tc.start, tc.target, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestDecideResume(t *testing.T) {
 	t.Parallel()
 

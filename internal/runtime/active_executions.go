@@ -112,6 +112,28 @@ type ActiveExecutionRegistry struct {
 
 const defaultKillTimeout = 20 * time.Second
 
+// DrainSnapshot is the complete in-memory Supervisor-owned work set relevant
+// to a graceful drain.
+type DrainSnapshot struct {
+	LiveExecutions    int `json:"liveExecutions"`
+	PendingSpawns     int `json:"pendingSpawns"`
+	BoundOperations   int `json:"boundOperations"`
+	PendingOperations int `json:"pendingOperations"`
+}
+
+func (s DrainSnapshot) Drained() bool {
+	return s.LiveExecutions == 0 && s.PendingSpawns == 0 && s.BoundOperations == 0 && s.PendingOperations == 0
+}
+
+func (r *ActiveExecutionRegistry) DrainSnapshot() DrainSnapshot {
+	if r == nil {
+		return DrainSnapshot{}
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return DrainSnapshot{LiveExecutions: len(r.executions), PendingSpawns: len(r.pending), BoundOperations: len(r.boundOps), PendingOperations: len(r.pendingOps)}
+}
+
 func NewActiveExecutionRegistry() *ActiveExecutionRegistry {
 	return &ActiveExecutionRegistry{
 		executions:       make(map[string]*ownedExecution),

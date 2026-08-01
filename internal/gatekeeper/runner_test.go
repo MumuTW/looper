@@ -38,11 +38,17 @@ func TestEvaluatePullRequestPersistsEligibleReportBoundToHead(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Events.ListByEntity() error = %v", err)
 	}
-	if len(events) != 1 || events[0].EventType != GateReportEventType {
+	gateReports := make([]storage.EventLogRecord, 0, len(events))
+	for _, event := range events {
+		if event.EventType == GateReportEventType {
+			gateReports = append(gateReports, event)
+		}
+	}
+	if len(gateReports) != 1 {
 		t.Fatalf("events = %#v, want one durable gate report", events)
 	}
 	var persisted Report
-	if err := json.Unmarshal([]byte(events[0].PayloadJSON), &persisted); err != nil {
+	if err := json.Unmarshal([]byte(gateReports[0].PayloadJSON), &persisted); err != nil {
 		t.Fatalf("decode persisted report: %v", err)
 	}
 	if !persisted.Eligible || persisted.ObservedHeadSHA != "head-1" {
@@ -255,6 +261,14 @@ type gatekeeperFixture struct {
 }
 
 func newGatekeeperFixture(t *testing.T) *gatekeeperFixture {
+	return newGatekeeperFixtureWithReview(t, true)
+}
+
+func newGatekeeperFixtureWithoutReview(t *testing.T) *gatekeeperFixture {
+	return newGatekeeperFixtureWithReview(t, false)
+}
+
+func newGatekeeperFixtureWithReview(t *testing.T, seedReview bool) *gatekeeperFixture {
 	t.Helper()
 	coordinator, err := storage.OpenSQLiteCoordinator(context.Background(), filepath.Join(t.TempDir(), "gatekeeper.sqlite"), storage.SQLiteCoordinatorOptions{BackupDir: t.TempDir()})
 	if err != nil {
@@ -273,7 +287,7 @@ func newGatekeeperFixture(t *testing.T) *gatekeeperFixture {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
 	mergeable := true
-	return &gatekeeperFixture{
+	fixture := &gatekeeperFixture{
 		repos: repos,
 		now:   now,
 		github: &fakeGatekeeperGitHub{
@@ -289,6 +303,10 @@ func newGatekeeperFixture(t *testing.T) *gatekeeperFixture {
 		},
 		policyPermits: true,
 	}
+	if seedReview {
+		seedReviewerReviewEvent(t, fixture, "head-1", "APPROVE", "reviewer-loop", 0)
+	}
+	return fixture
 }
 
 func (f *gatekeeperFixture) runner() *Runner {

@@ -27,6 +27,9 @@ func ClassifyError(err error, boundary failureclass.Boundary) Decision {
 	}
 
 	message := err.Error()
+	if errors.Is(err, failureclass.ErrStaticConfigMismatch) {
+		return Decision{Kind: failureclass.ManualIntervention, Message: message}
+	}
 	if strings.Contains(strings.ToLower(message), "remote head changed") {
 		return Decision{Kind: failureclass.RetryableAfterResume, Message: message}
 	}

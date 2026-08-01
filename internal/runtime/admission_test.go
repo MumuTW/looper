@@ -91,6 +91,32 @@ func TestAdmissionStartingToDegradedAndStopping(t *testing.T) {
 	}
 }
 
+func TestAdmissionDrainRefusesNewWorkWithoutStopping(t *testing.T) {
+	t.Parallel()
+	a := NewAdmission()
+	if err := a.MarkReady("ready"); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.BeginDrain("upgrade"); err != nil {
+		t.Fatal(err)
+	}
+	if got := a.State(); got != AdmissionDraining {
+		t.Fatalf("State() = %q", got)
+	}
+	if err := a.AllowMutations(); !errors.Is(err, ErrAdmissionDraining) {
+		t.Fatalf("AllowMutations() = %v", err)
+	}
+	if err := a.AllowClaim(); !errors.Is(err, ErrAdmissionDraining) {
+		t.Fatalf("AllowClaim() = %v", err)
+	}
+	if err := a.BeginShutdown("cutover"); err != nil {
+		t.Fatal(err)
+	}
+	if got := a.State(); got != AdmissionStopping {
+		t.Fatalf("State() = %q", got)
+	}
+}
+
 // Contract (#592 review): TransitionThen holds a.mu across the state change and
 // then callback so cancelWorkProducers can run with no closed-before-cancel window.
 func TestAdmissionTransitionThenRunsCallbackUnderLock(t *testing.T) {

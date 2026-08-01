@@ -643,6 +643,44 @@ func (r *Runtime) AdmissionState() AdmissionState {
 }
 
 // AllowMutations is the HTTP mutation readiness projection of admission.
+
+// BeginDrain closes new-work admission without canceling existing producers or
+// active agent processes. Controlled cutover waits on DrainSnapshot.
+func (r *Runtime) BeginDrain(reason string) error {
+	if r == nil || r.admission == nil {
+		return ErrAdmissionNotReady
+	}
+	return r.admission.BeginDrain(reason)
+}
+
+// DrainSnapshot reports Supervisor-owned work still in flight after BeginDrain.
+func (r *Runtime) DrainSnapshot() DrainSnapshot {
+	if r == nil || r.activeExecutions == nil {
+		return DrainSnapshot{}
+	}
+	return r.activeExecutions.DrainSnapshot()
+}
+
+// WaitForDrain blocks until DrainSnapshot reports no in-flight work or ctx ends.
+func (r *Runtime) WaitForDrain(ctx context.Context, interval time.Duration) (DrainSnapshot, error) {
+	if interval <= 0 {
+		interval = 250 * time.Millisecond
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		snapshot := r.DrainSnapshot()
+		if snapshot.Drained() {
+			return snapshot, nil
+		}
+		select {
+		case <-ctx.Done():
+			return r.DrainSnapshot(), ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
 func (r *Runtime) AllowMutations() error {
 	if r == nil || r.admission == nil {
 		return ErrAdmissionStopping

@@ -1333,6 +1333,46 @@ func TestEventsListOrdersAndDefaults(t *testing.T) {
 	}
 }
 
+func TestEventsListByEntityAndEventTypesFiltersByType(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	ctx := context.Background()
+	repos := NewRepositories(coordinator.DB())
+
+	entityType := "pull_request"
+	entityID := "acme/looper#42"
+	for _, event := range []EventLogRecord{
+		{ID: "gate_1", EventType: "gate.report", EntityType: &entityType, EntityID: &entityID, PayloadJSON: `{}`, CreatedAt: "2026-04-11T12:00:00.000Z"},
+		{ID: "review_1", EventType: "pr.review.posted", EntityType: &entityType, EntityID: &entityID, PayloadJSON: `{}`, CreatedAt: "2026-04-11T12:01:00.000Z"},
+		{ID: "gate_2", EventType: "gate.report", EntityType: &entityType, EntityID: &entityID, PayloadJSON: `{}`, CreatedAt: "2026-04-11T12:02:00.000Z"},
+		{ID: "review_2", EventType: "pr.review.posted", EntityType: &entityType, EntityID: &entityID, PayloadJSON: `{}`, CreatedAt: "2026-04-11T12:03:00.000Z"},
+	} {
+		if err := repos.Events.Append(ctx, event); err != nil {
+			t.Fatalf("Events.Append(%s) error = %v", event.ID, err)
+		}
+	}
+
+	filtered, err := repos.Events.ListByEntityAndEventTypes(ctx, "pull_request", "acme/looper#42", []string{"pr.review.posted"})
+	if err != nil {
+		t.Fatalf("Events.ListByEntityAndEventTypes() error = %v", err)
+	}
+	if len(filtered) != 2 {
+		t.Fatalf("len(ListByEntityAndEventTypes) = %d, want 2 (only pr.review.posted)", len(filtered))
+	}
+	if filtered[0].ID != "review_1" || filtered[1].ID != "review_2" {
+		t.Fatalf("ListByEntityAndEventTypes() = %#v, want [review_1 review_2]", filtered)
+	}
+
+	empty, err := repos.Events.ListByEntityAndEventTypes(ctx, "pull_request", "acme/looper#42", nil)
+	if err != nil {
+		t.Fatalf("Events.ListByEntityAndEventTypes(nil types) error = %v", err)
+	}
+	if len(empty) != 0 {
+		t.Fatalf("len(ListByEntityAndEventTypes(nil)) = %d, want 0", len(empty))
+	}
+}
+
 func TestRunsListByStatusOrdersByStartedAtThenIDDesc(t *testing.T) {
 	t.Parallel()
 

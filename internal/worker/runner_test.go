@@ -11,11 +11,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MumuTW/looper/internal/agent"
 	"github.com/MumuTW/looper/internal/config"
 	"github.com/MumuTW/looper/internal/disclosure"
 	"github.com/MumuTW/looper/internal/labels"
 	"github.com/MumuTW/looper/internal/lifecycle"
 	"github.com/MumuTW/looper/internal/loops"
+	"github.com/MumuTW/looper/internal/loops/failureclass"
 	"github.com/MumuTW/looper/internal/network/protocol"
 	"github.com/MumuTW/looper/internal/networkpolicy"
 	"github.com/MumuTW/looper/internal/storage"
@@ -1281,6 +1283,46 @@ func TestProcessClaimedItemPersistsCheckpointWhenAgentReturnsNonCompleted(t *tes
 	}
 }
 
+// TestProcessClaimedItemHoldsCheckpointFallbackRestrictionForOperator verifies
+// that when the agent executor propagates a checkpoint-fallback tool-network
+// restriction refusal (ErrStaticConfigMismatch) through Wait, the worker
+// classifies it as manual intervention — not retryable_transient — so it does
+// not burn retry attempts or trip the failure-streak circuit breaker.
+func TestProcessClaimedItemHoldsCheckpointFallbackRestrictionForOperator(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	git := &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "looper/feature", BaseBranch: "main", HeadSHA: "abc123", WorktreeID: "worktree_1"}}
+	github := &fakeGitHubGateway{}
+	agent := &fakeAgentExecutor{waitErr: fmt.Errorf("agent vendor %q cannot deny tool network access: %w", config.AgentVendorClaudeCode, failureclass.ErrStaticConfigMismatch)}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true, OpenPRStrategy: config.OpenPRStrategyAllDone})
+
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-1", "worker")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed item", claim, err)
+	}
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "failed" || result.FailureKind != FailureManualIntervention {
+		t.Fatalf("result = %#v, want failed manual_intervention for checkpoint fallback restriction refusal", result)
+	}
+	queue, err := fixture.repos.Queue.GetByID(context.Background(), claim.ID)
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	if queue == nil || queue.Status != "manual_intervention" || queue.FinishedAt == nil {
+		t.Fatalf("queue = %#v, want terminal manual_intervention (no retry)", queue)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_1")
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if loop == nil || loop.Status != "paused" {
+		t.Fatalf("loop = %#v, want paused loop for manual intervention (no retry)", loop)
+	}
+}
+
 func TestRunExecuteStepFailsResumedCompletedCheckpointWithoutParsedResult(t *testing.T) {
 	t.Parallel()
 
@@ -1469,6 +1511,142 @@ func TestRunExecuteStepRechecksWorkerHoldAfterAgentCompletion(t *testing.T) {
 	}
 	if len(git.inspectCalls) != 0 || len(git.commitCalls) != 0 {
 		t.Fatalf("git reconciliation calls = inspect %d, commit %d; want none", len(git.inspectCalls), len(git.commitCalls))
+	}
+}
+
+func TestRunExecuteStepPersistsProgressBeforeTimeoutTermination(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_1")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", loop, err)
+	}
+	worktreeRoot, err := workerWorktreeRoot(*project)
+	if err != nil {
+		t.Fatalf("workerWorktreeRoot() error = %v", err)
+	}
+	if err := os.MkdirAll(project.RepoPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll(repo) error = %v", err)
+	}
+	worktreePath := filepath.Join(worktreeRoot, "worker-timeout")
+	if err := os.MkdirAll(worktreePath, 0o755); err != nil {
+		t.Fatalf("MkdirAll(worktree) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(worktreePath, ".git"), []byte("gitdir: /tmp/test\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile(.git) error = %v", err)
+	}
+	run := storage.RunRecord{ID: "run_timeout_progress", LoopID: loop.ID, Status: "running", CurrentStep: stringPtr(string(stepExecute)), StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Runs.Upsert(context.Background(), run); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	git := &fakeGitGateway{inspectResult: InspectHeadResult{
+		HeadSHA: "after-head", Branch: "looper/issue-27", HasUncommittedChanges: true,
+		ChangedFiles: []string{"modified.go", "staged.go", "new.txt"}, StagedFiles: []string{"staged.go"}, UntrackedFiles: []string{"new.txt"}, DiffFingerprint: "status-only-sha",
+	}}
+	agentExecutor := &timeoutObservingAgentExecutor{result: AgentResult{Status: "timeout", Summary: "agent became idle", TimeoutType: "idle", LastProgressAt: "2026-04-11T12:00:01.000Z"}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, AgentExecutor: agentExecutor, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true})
+
+	checkpoint, err := runner.runExecuteStep(context.Background(), stepInput{
+		Project: *project, Loop: *loop, Run: run,
+		Checkpoint: workerCheckpoint{
+			Work:     &workerInput{Title: "Implement worker loop", Repo: "acme/looper", IssueNumber: 27, BaseBranch: "main", ExecutionMode: "create-pr"},
+			Worktree: &checkpointWorktree{ID: "worktree_27", Path: worktreePath, Branch: "looper/issue-27", BaseBranch: "main", HeadSHA: "before-head"},
+			Plan:     &checkpointPlan{Summary: "Implement worker loop", Items: []string{"Do it"}},
+		},
+	})
+	var loopErr *loopError
+	if !errors.As(err, &loopErr) || loopErr.kind != FailureRetryableTransient {
+		t.Fatalf("runExecuteStep() error = %v, want retryable timeout", err)
+	}
+	progress := checkpoint.Execution.ProgressBeforeTimeout
+	if progress == nil {
+		t.Fatalf("checkpoint.Execution.ProgressBeforeTimeout = nil, want snapshot")
+	}
+	if progress.HeadSHA != "after-head" || progress.WorktreeID != "worktree_27" || progress.Branch != "looper/issue-27" || progress.TimeoutType != "idle" || progress.DiffFingerprint != "status-only-sha" || progress.ChangedFileCount != 3 || progress.StagedFileCount != 1 || progress.UntrackedFileCount != 1 {
+		t.Fatalf("progress = %#v, want captured timeout state", progress)
+	}
+	if got := progress.StagedFiles; len(got) != 1 || got[0] != "staged.go" {
+		t.Fatalf("progress.StagedFiles = %#v, want [staged.go]", got)
+	}
+	storedRun, err := fixture.repos.Runs.GetByID(context.Background(), run.ID)
+	if err != nil || storedRun == nil {
+		t.Fatalf("Runs.GetByID() = (%#v, %v), want stored run", storedRun, err)
+	}
+	storedCheckpoint, err := parseCheckpoint(storedRun.CheckpointJSON)
+	if err != nil {
+		t.Fatalf("parseCheckpoint() error = %v", err)
+	}
+	if storedCheckpoint.Execution == nil || storedCheckpoint.Execution.ProgressBeforeTimeout == nil || storedCheckpoint.Execution.ProgressBeforeTimeout.DiffFingerprint != "status-only-sha" {
+		t.Fatalf("stored timeout snapshot = %#v, want persisted progress", storedCheckpoint.Execution)
+	}
+	if len(git.inspectCalls) != 1 || git.inspectCalls[0].BaseRef != "" {
+		t.Fatalf("InspectHead calls = %#v, want one snapshot without unused history traversal", git.inspectCalls)
+	}
+}
+
+func TestRunExecuteStepStopsRetryWhenTimeoutProgressSnapshotFails(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_1")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", loop, err)
+	}
+	worktreeRoot, err := workerWorktreeRoot(*project)
+	if err != nil {
+		t.Fatalf("workerWorktreeRoot() error = %v", err)
+	}
+	if err := os.MkdirAll(project.RepoPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll(repo) error = %v", err)
+	}
+	worktreePath := filepath.Join(worktreeRoot, "worker-timeout-failed-snapshot")
+	if err := os.MkdirAll(worktreePath, 0o755); err != nil {
+		t.Fatalf("MkdirAll(worktree) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(worktreePath, ".git"), []byte("gitdir: /tmp/test\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile(.git) error = %v", err)
+	}
+	run := storage.RunRecord{ID: "run_timeout_progress_failure", LoopID: loop.ID, Status: "running", CurrentStep: stringPtr(string(stepExecute)), StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Runs.Upsert(context.Background(), run); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	git := &fakeGitGateway{inspectErrors: []error{errors.New("git status unavailable")}}
+	agentExecutor := &timeoutObservingAgentExecutor{result: AgentResult{Status: "timeout", Summary: "agent became idle", TimeoutType: "idle"}}
+	agentExecutor.afterObservation = func(observationErr error) {
+		if observationErr == nil {
+			t.Fatal("timeout observation error = nil, want Git inspection failure")
+		}
+		storedRun, getErr := fixture.repos.Runs.GetByID(context.Background(), run.ID)
+		if getErr != nil || storedRun == nil {
+			t.Fatalf("Runs.GetByID(during observation) = (%#v, %v), want stored run", storedRun, getErr)
+		}
+		storedCheckpoint, parseErr := parseCheckpoint(storedRun.CheckpointJSON)
+		if parseErr != nil {
+			t.Fatalf("parseCheckpoint(during observation) error = %v", parseErr)
+		}
+		if storedCheckpoint.ResumePolicy != loops.ResumePolicyManualIntervention || storedCheckpoint.Execution == nil || !strings.Contains(storedCheckpoint.Execution.ProgressSnapshotError, "git status unavailable") {
+			t.Fatalf("checkpoint during observation = %#v, want durable failure before Wait returns", storedCheckpoint)
+		}
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, AgentExecutor: agentExecutor, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true})
+
+	checkpoint, err := runner.runExecuteStep(context.Background(), stepInput{
+		Project: *project, Loop: *loop, Run: run,
+		Checkpoint: workerCheckpoint{Work: &workerInput{Title: "Implement worker loop", Repo: "acme/looper", IssueNumber: 27, BaseBranch: "main", ExecutionMode: "create-pr"}, Worktree: &checkpointWorktree{ID: "worktree_27", Path: worktreePath, Branch: "looper/issue-27", BaseBranch: "main", HeadSHA: "before-head"}, Plan: &checkpointPlan{Summary: "Implement worker loop"}},
+	})
+	var loopErr *loopError
+	if !errors.As(err, &loopErr) || loopErr.kind != FailureManualIntervention {
+		t.Fatalf("runExecuteStep() error = %v, want manual intervention", err)
+	}
+	if checkpoint.ResumePolicy != loops.ResumePolicyManualIntervention || checkpoint.Execution == nil || !strings.Contains(checkpoint.Execution.ProgressSnapshotError, "git status unavailable") {
+		t.Fatalf("checkpoint = %#v, want persisted snapshot failure and manual intervention", checkpoint)
 	}
 }
 
@@ -1788,6 +1966,247 @@ func TestCreateRunContextCopiesPredecessorAgentSnapshotOnFirstStepRetry(t *testi
 	}
 	if created.Run.AgentSnapshotJSON == nil || *created.Run.AgentSnapshotJSON != predecessorSnapshot {
 		t.Fatalf("AgentSnapshotJSON = %#v, want predecessor %q", created.Run.AgentSnapshotJSON, predecessorSnapshot)
+	}
+}
+
+func TestCreateRunContextRefreshesUnsupportedSnapshotWhenValidationGateEnabled(t *testing.T) {
+	t.Parallel()
+
+	// A failed run was created with a vendor that cannot serve the validation
+	// gate (claude-code). The operator then enabled validation commands and
+	// switched the role vendor to codex. The retry must refresh the stale
+	// snapshot to the current role vendor instead of copying the unsupported
+	// predecessor — otherwise the spawn refuses with a permanent manual-
+	// intervention hold regardless of the role switch.
+	fixture := newRunnerFixture(t)
+	predecessorSnapshot := `{"vendor":"claude-code","model":"sonnet","profileId":"sticky"}`
+	runner := New(Options{
+		DB:             fixture.coordinator.DB(),
+		Repos:          fixture.repos,
+		Logger:         fixture.logger,
+		Now:            fixture.now,
+		AgentRuntime:   string(config.AgentVendorCodex),
+		AgentModel:     stringPtr("gpt-5"),
+		AgentProfileID: "fast",
+		ValidationCommandsByProject: map[string][]string{
+			"project_1": {"go test ./..."},
+		},
+	})
+	checkpointJSON := mustMarshalJSON(workerCheckpoint{
+		Work:           &workerInput{Title: "Worker task"},
+		ClaimedLockKey: "worker:loop_worker_1",
+		Worktree:       &checkpointWorktree{ID: "wt_1", Path: filepath.Join(t.TempDir(), "wt"), Branch: "feature/test"},
+		Plan:           &checkpointPlan{Summary: "plan"},
+		Execution:      &checkpointExecution{Status: "completed", Summary: "upstream server_error"},
+	})
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{
+		ID:                "run_failed_unsupported_snapshot",
+		LoopID:            "loop_worker_1",
+		Status:            "failed",
+		CurrentStep:       stringPtr(string(stepValidate)),
+		LastCompletedStep: stringPtr(string(stepExecute)),
+		CheckpointJSON:    &checkpointJSON,
+		AgentSnapshotJSON: &predecessorSnapshot,
+		StartedAt:         fixture.nowISO(),
+		CreatedAt:         fixture.nowISO(),
+		UpdatedAt:         fixture.nowISO(),
+	}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_1")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v)", loop, err)
+	}
+
+	resumed, err := runner.createRunContext(context.Background(), *loop)
+	if err != nil {
+		t.Fatalf("createRunContext() error = %v", err)
+	}
+	if resumed.Run.AgentSnapshotJSON == nil {
+		t.Fatal("AgentSnapshotJSON = nil, want refreshed snapshot")
+	}
+	parsed, err := config.ParseAgentSnapshot(*resumed.Run.AgentSnapshotJSON)
+	if err != nil {
+		t.Fatalf("ParseAgentSnapshot() error = %v", err)
+	}
+	if parsed.Vendor != string(config.AgentVendorCodex) {
+		t.Fatalf("refreshed Vendor = %q, want codex (current role vendor)", parsed.Vendor)
+	}
+	if parsed.ProfileID != "fast" {
+		t.Fatalf("refreshed ProfileID = %q, want fast (current role identity)", parsed.ProfileID)
+	}
+	if parsed.Model == nil || *parsed.Model != "gpt-5" {
+		t.Fatalf("refreshed Model = %v, want gpt-5 (current role identity)", parsed.Model)
+	}
+	// The refreshed snapshot must be execution authority at spawn: identityFromRun
+	// resolves the codex vendor from it, not the live fallback.
+	vendor, _, _, useSnapshot, err := runner.identityFromRun(resumed.Run)
+	if err != nil {
+		t.Fatalf("identityFromRun() error = %v", err)
+	}
+	if !useSnapshot || vendor != string(config.AgentVendorCodex) {
+		t.Fatalf("identityFromRun() = (%q, %v), want codex from refreshed snapshot", vendor, useSnapshot)
+	}
+}
+
+func TestCreateRunContextPreservesAuthorSnapshotWhenResumingAfterExecute(t *testing.T) {
+	t.Parallel()
+
+	// A failed worker run already completed the agent step (execute) with a
+	// valid structured result, so the resume advances to validate — no agent
+	// process replays. The predecessor snapshot was authored by a vendor that
+	// cannot serve the validation gate (claude-code), and the operator has
+	// switched the role vendor to a supported one (codex). Because no agent
+	// will spawn under the gate, the snapshot must NOT be refreshed: refreshing
+	// would only rewrite disclosure identity, publishing the predecessor's
+	// Claude-authored changes stamped as Codex. The predecessor snapshot stays
+	// sticky so attribution follows the author that actually ran.
+	fixture := newRunnerFixture(t)
+	predecessorSnapshot := `{"vendor":"claude-code","model":"sonnet","profileId":"sticky"}`
+	runner := New(Options{
+		DB:             fixture.coordinator.DB(),
+		Repos:          fixture.repos,
+		Logger:         fixture.logger,
+		Now:            fixture.now,
+		AgentRuntime:   string(config.AgentVendorCodex),
+		AgentModel:     stringPtr("gpt-5"),
+		AgentProfileID: "fast",
+		ValidationCommandsByProject: map[string][]string{
+			"project_1": {"go test ./..."},
+		},
+	})
+	checkpointJSON := mustMarshalJSON(workerCheckpoint{
+		Work:           &workerInput{Title: "Worker task"},
+		ClaimedLockKey: "worker:loop_worker_1",
+		Worktree:       &checkpointWorktree{ID: "wt_1", Path: filepath.Join(t.TempDir(), "wt"), Branch: "feature/test"},
+		Plan:           &checkpointPlan{Summary: "plan"},
+		// A parsed completed execution means shouldReplayExecuteOnResume is false,
+		// so the resume advances to validate instead of replaying execute.
+		Execution: &checkpointExecution{Status: "completed", Summary: "done", ParseStatus: "parsed"},
+	})
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{
+		ID:                "run_failed_after_execute",
+		LoopID:            "loop_worker_1",
+		Status:            "failed",
+		CurrentStep:       stringPtr(string(stepValidate)),
+		LastCompletedStep: stringPtr(string(stepExecute)),
+		CheckpointJSON:    &checkpointJSON,
+		AgentSnapshotJSON: &predecessorSnapshot,
+		StartedAt:         fixture.nowISO(),
+		CreatedAt:         fixture.nowISO(),
+		UpdatedAt:         fixture.nowISO(),
+	}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_1")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v)", loop, err)
+	}
+
+	resumed, err := runner.createRunContext(context.Background(), *loop)
+	if err != nil {
+		t.Fatalf("createRunContext() error = %v", err)
+	}
+	if resumed.StartStep != stepValidate {
+		t.Fatalf("StartStep = %q, want validate (advance past execute, no replay)", resumed.StartStep)
+	}
+	if resumed.Run.AgentSnapshotJSON == nil {
+		t.Fatal("AgentSnapshotJSON = nil, want preserved predecessor snapshot")
+	}
+	if *resumed.Run.AgentSnapshotJSON != predecessorSnapshot {
+		t.Fatalf("AgentSnapshotJSON = %q, want preserved predecessor %q (no refresh when no agent replays)", *resumed.Run.AgentSnapshotJSON, predecessorSnapshot)
+	}
+	// Disclosure identity must follow the preserved author snapshot, not the
+	// current role vendor — otherwise Claude-authored changes get stamped as Codex.
+	agent, model := runner.disclosureIdentity(resumed.Run)
+	if agent != string(config.AgentVendorClaudeCode) {
+		t.Fatalf("disclosureIdentity agent = %q, want claude-code (preserved author)", agent)
+	}
+	if model != "sonnet" {
+		t.Fatalf("disclosureIdentity model = %q, want sonnet (preserved author)", model)
+	}
+}
+
+func TestCreateRunContextPreservesAuthorSnapshotWhenExecuteIsNoOp(t *testing.T) {
+	t.Parallel()
+
+	// A worker run completed execute with a valid structured result, then
+	// validation failed into a manual hold (status "failed" + manual_intervention
+	// resume policy). The retry restarts at prepare-work while retaining the
+	// completed execution checkpoint, so runExecuteStep detects the completed
+	// checkpoint and never launches an agent — execute is a no-op even though
+	// Reaches(prepare-work, execute) is true. The predecessor snapshot was
+	// authored by a vendor that cannot serve the validation gate (claude-code),
+	// and the operator has switched the role vendor to a supported one (codex).
+	// Because no agent will spawn under the gate, the snapshot must NOT be
+	// refreshed: refreshing would only rewrite disclosure identity, publishing
+	// the predecessor's Claude-authored changes stamped as Codex. The
+	// predecessor snapshot stays sticky so attribution follows the author.
+	fixture := newRunnerFixture(t)
+	predecessorSnapshot := `{"vendor":"claude-code","model":"sonnet","profileId":"sticky"}`
+	runner := New(Options{
+		DB:             fixture.coordinator.DB(),
+		Repos:          fixture.repos,
+		Logger:         fixture.logger,
+		Now:            fixture.now,
+		AgentRuntime:   string(config.AgentVendorCodex),
+		AgentModel:     stringPtr("gpt-5"),
+		AgentProfileID: "fast",
+		ValidationCommandsByProject: map[string][]string{
+			"project_1": {"go test ./..."},
+		},
+	})
+	checkpointJSON := mustMarshalJSON(workerCheckpoint{
+		Work:           &workerInput{Title: "Worker task"},
+		ClaimedLockKey: "worker:loop_worker_1",
+		Worktree:       &checkpointWorktree{ID: "wt_1", Path: filepath.Join(t.TempDir(), "wt"), Branch: "feature/test"},
+		Plan:           &checkpointPlan{Summary: "plan"},
+		// A parsed, git-reconciled completed execution means shouldReplayExecuteOnResume
+		// is false, so the manual-hold resume retains the checkpoint and restarts at
+		// prepare-work. runExecuteStep then sees the completed execution and is a no-op.
+		Execution:    &checkpointExecution{Status: "completed", Summary: "done", ParseStatus: "parsed", GitReconciled: true},
+		ResumePolicy: loops.ResumePolicyManualIntervention,
+	})
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{
+		ID:                "run_manual_hold_after_execute",
+		LoopID:            "loop_worker_1",
+		Status:            "failed",
+		CurrentStep:       stringPtr(string(stepValidate)),
+		LastCompletedStep: stringPtr(string(stepExecute)),
+		CheckpointJSON:    &checkpointJSON,
+		AgentSnapshotJSON: &predecessorSnapshot,
+		StartedAt:         fixture.nowISO(),
+		CreatedAt:         fixture.nowISO(),
+		UpdatedAt:         fixture.nowISO(),
+	}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_1")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v)", loop, err)
+	}
+
+	resumed, err := runner.createRunContext(context.Background(), *loop)
+	if err != nil {
+		t.Fatalf("createRunContext() error = %v", err)
+	}
+	if resumed.StartStep != stepPrepareWork {
+		t.Fatalf("StartStep = %q, want prepare-work (manual-hold restart, no replay)", resumed.StartStep)
+	}
+	if resumed.Run.AgentSnapshotJSON == nil {
+		t.Fatal("AgentSnapshotJSON = nil, want preserved predecessor snapshot")
+	}
+	if *resumed.Run.AgentSnapshotJSON != predecessorSnapshot {
+		t.Fatalf("AgentSnapshotJSON = %q, want preserved predecessor %q (no refresh when execute is a no-op)", *resumed.Run.AgentSnapshotJSON, predecessorSnapshot)
+	}
+	// Disclosure identity must follow the preserved author snapshot, not the
+	// current role vendor — otherwise Claude-authored changes get stamped as Codex.
+	agent, model := runner.disclosureIdentity(resumed.Run)
+	if agent != string(config.AgentVendorClaudeCode) {
+		t.Fatalf("disclosureIdentity agent = %q, want claude-code (preserved author)", agent)
+	}
+	if model != "sonnet" {
+		t.Fatalf("disclosureIdentity model = %q, want sonnet (preserved author)", model)
 	}
 }
 
@@ -5191,6 +5610,39 @@ func (f fakeAgentExecution) Wait(ctx context.Context) (AgentResult, error) {
 }
 
 func (f fakeAgentExecution) Kill(string) error { return nil }
+
+type timeoutObservingAgentExecutor struct {
+	starts           []AgentRunInput
+	result           AgentResult
+	afterObservation func(error)
+}
+
+func (f *timeoutObservingAgentExecutor) Start(_ context.Context, input AgentRunInput) (AgentExecution, error) {
+	f.starts = append(f.starts, input)
+	return timeoutObservingAgentExecution{input: input, result: f.result, afterObservation: f.afterObservation}, nil
+}
+
+type timeoutObservingAgentExecution struct {
+	input            AgentRunInput
+	result           AgentResult
+	afterObservation func(error)
+}
+
+func (f timeoutObservingAgentExecution) Wait(context.Context) (AgentResult, error) {
+	var observationErr error
+	if f.input.OnBeforeTimeout != nil {
+		observationErr = f.input.OnBeforeTimeout(context.Background(), agent.TimeoutObservation{TimeoutType: f.result.TimeoutType, LastProgressAt: f.result.LastProgressAt})
+		if observationErr != nil {
+			f.result.PreTimeoutError = observationErr.Error()
+		}
+	}
+	if f.afterObservation != nil {
+		f.afterObservation(observationErr)
+	}
+	return f.result, nil
+}
+
+func (timeoutObservingAgentExecution) Kill(string) error { return nil }
 
 type testLogger struct{}
 
