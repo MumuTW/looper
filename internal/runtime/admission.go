@@ -293,6 +293,22 @@ func (a *Admission) WithAllowWork(fn func()) error {
 	return nil
 }
 
+// WithState runs fn under the admission mutex with the current state. Callers
+// that combine a custom state gate with a side effect (e.g. backup lease) use
+// this so transitions cannot interleave between the decision and the effect.
+// fn must not call back into Admission methods that take a.mu (would deadlock).
+func (a *Admission) WithState(fn func(state AdmissionState) error) error {
+	if a == nil {
+		return ErrAdmissionStopping
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if fn == nil {
+		return nil
+	}
+	return fn(a.state)
+}
+
 func (a *Admission) allowWork() error {
 	if a == nil {
 		return ErrAdmissionStopping

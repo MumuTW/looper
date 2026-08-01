@@ -667,23 +667,32 @@ func (r *Runtime) BeginDrain(reason string) error {
 	if r == nil || r.admission == nil {
 		return ErrAdmissionNotReady
 	}
-	// Publish join visibility before exposing draining so a concurrent poll/Stop
-	// never sees admission=draining with WorkProducersActive=0 while producers
-	// are still live. Join start is process-lifetime single-shot under mu.
-	startJoin := false
+	// Reserve join visibility under r.mu, transition admission, then either
+	// launch the join or roll the latch back. Holding r.mu across the
+	// transition prevents waitForDrainProducerJoin from observing
+	// started=true with a never-closed Done when BeginDrain is rejected
+	// (stopping/degraded). On success, active is set before unlock so a
+	// concurrent DrainSnapshot cannot see draining with WorkProducersActive=0.
 	r.mu.Lock()
+	startJoin := false
 	if !r.workProducerJoinStarted {
 		r.workProducerJoinStarted = true
 		r.workProducerJoinDone = make(chan struct{})
 		startJoin = true
 	}
-	r.mu.Unlock()
+	err := r.admission.BeginDrain(reason)
+	if err != nil {
+		if startJoin {
+			r.workProducerJoinStarted = false
+			r.workProducerJoinDone = nil
+		}
+		r.mu.Unlock()
+		return err
+	}
 	if startJoin {
 		r.workProducerJoinActive.Store(true)
 	}
-	if err := r.admission.BeginDrain(reason); err != nil {
-		return err
-	}
+	r.mu.Unlock()
 	if startJoin {
 		go r.joinWorkProducersForDrain()
 	}
@@ -861,6 +870,41 @@ func (r *Runtime) BeginAdmittedMutationIfAllowed() (func(), error) {
 	err := r.admission.WithAllowWork(func() {
 		r.admittedHTTPMutations.Add(1)
 		release = func() { r.admittedHTTPMutations.Add(-1) }
+	})
+	if err != nil {
+		return nil, err
+	}
+	if release == nil {
+		release = func() {}
+	}
+	return release, nil
+}
+
+// BeginBackupMutationIfAllowed grants a mutation lease when online backup is
+// legal: ready admission, or a completed drain under draining/stopping.
+// Gate decision and lease acquisition share the admission mutex so drain
+// cannot observe empty admitted mutations between the two steps.
+func (r *Runtime) BeginBackupMutationIfAllowed() (func(), error) {
+	if r == nil || r.admission == nil {
+		return nil, ErrAdmissionStopping
+	}
+	var release func()
+	err := r.admission.WithState(func(state AdmissionState) error {
+		switch state {
+		case AdmissionReady:
+			// online pre-cutover backup
+		case AdmissionDraining, AdmissionStopping:
+			// Final cutover backup: require the supervisor work set drained.
+			// DrainSnapshot does not take admission.mu.
+			if !r.DrainSnapshot().Drained() {
+				return fmt.Errorf("Upgrade backup after drain requires a drained supervisor work set")
+			}
+		default:
+			return fmt.Errorf("Upgrade backup requires ready admission or a completed drain")
+		}
+		r.admittedHTTPMutations.Add(1)
+		release = func() { r.admittedHTTPMutations.Add(-1) }
+		return nil
 	})
 	if err != nil {
 		return nil, err
