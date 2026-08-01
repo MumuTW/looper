@@ -571,15 +571,14 @@ func (r *Runtime) appendWorktreeCleanupEvent(ctx context.Context, repos *storage
 		payload["worktreePath"] = candidate.WorktreePath
 		payload["branch"] = candidate.Branch
 	}
-	return appendSystemEvent(ctx, repos, storage.EventLogRecord{
-		ID:          newRuntimeEventID(),
-		EventType:   eventType,
-		ProjectID:   projectID,
-		EntityType:  stringPtr("worktree"),
-		EntityID:    entityID,
-		PayloadJSON: mustMarshalJSON(payload),
-		CreatedAt:   formatJavaScriptISOString(r.now().UTC()),
-	})
+	return appendSystemEventWithPayload(ctx, repos, storage.EventLogRecord{
+		ID:         newRuntimeEventID(),
+		EventType:  eventType,
+		ProjectID:  projectID,
+		EntityType: stringPtr("worktree"),
+		EntityID:   entityID,
+		CreatedAt:  formatJavaScriptISOString(r.now().UTC()),
+	}, payload)
 }
 
 func worktreeCleanupMaxPerTick(cfg config.Config) int {

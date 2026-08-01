@@ -1836,17 +1836,16 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 			return RecoverySummary{}, err
 		}
 		summary.ExpiredLocksReleased += 1
-		if err := appendSystemEvent(ctx, repositories, storage.EventLogRecord{
+		if err := appendSystemEventWithPayload(ctx, repositories, storage.EventLogRecord{
 			ID:         newRuntimeEventID(),
 			EventType:  "looperd.recovery.lock_released",
 			EntityType: stringPtr("lock"),
 			EntityID:   stringPtr(lock.Key),
-			PayloadJSON: mustMarshalJSON(map[string]any{
-				"owner":       lock.Owner,
-				"expiredAt":   lock.ExpiresAt,
-				"recoveredAt": nowISO,
-			}),
-			CreatedAt: nowISO,
+			CreatedAt:  nowISO,
+		}, map[string]any{
+			"owner":       lock.Owner,
+			"expiredAt":   lock.ExpiresAt,
+			"recoveredAt": nowISO,
 		}); err != nil {
 			return RecoverySummary{}, err
 		}
@@ -1923,18 +1922,17 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 			}
 			requeuedLoopIDs[loop.ID] = struct{}{}
 			summary.LoopsRequeued += 1
-			if err := appendSystemEvent(ctx, repositories, storage.EventLogRecord{
+			if err := appendSystemEventWithPayload(ctx, repositories, storage.EventLogRecord{
 				ID:         newRuntimeEventID(),
 				EventType:  "looperd.recovery.reviewer_auto_recovered",
 				LoopID:     stringPtr(loop.ID),
 				EntityType: stringPtr("loop"),
 				EntityID:   stringPtr(loop.ID),
-				PayloadJSON: mustMarshalJSON(map[string]any{
-					"previousStatus":      loop.Status,
-					"nextRunAt":           nowISO,
-					"recoveredQueueItems": recoveredQueueItems,
-				}),
-				CreatedAt: nowISO,
+				CreatedAt:  nowISO,
+			}, map[string]any{
+				"previousStatus":      loop.Status,
+				"nextRunAt":           nowISO,
+				"recoveredQueueItems": recoveredQueueItems,
 			}); err != nil {
 				return RecoverySummary{}, err
 			}
@@ -1962,18 +1960,17 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 				if latestRun != nil {
 					latestRunStatus = latestRun.Status
 				}
-				if err := appendSystemEvent(ctx, repositories, storage.EventLogRecord{
+				if err := appendSystemEventWithPayload(ctx, repositories, storage.EventLogRecord{
 					ID:         newRuntimeEventID(),
 					EventType:  "looperd.recovery.loop_queue_normalized",
 					LoopID:     stringPtr(loop.ID),
 					EntityType: stringPtr("loop"),
 					EntityID:   stringPtr(loop.ID),
-					PayloadJSON: mustMarshalJSON(map[string]any{
-						"previousStatus":  loop.Status,
-						"recoveredStatus": normalizedLoop.Status,
-						"latestRunStatus": latestRunStatus,
-					}),
-					CreatedAt: nowISO,
+					CreatedAt:  nowISO,
+				}, map[string]any{
+					"previousStatus":  loop.Status,
+					"recoveredStatus": normalizedLoop.Status,
+					"latestRunStatus": latestRunStatus,
 				}); err != nil {
 					return RecoverySummary{}, err
 				}
@@ -1995,19 +1992,18 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 				return RecoverySummary{}, err
 			}
 			requeuedLoopIDs[loop.ID] = struct{}{}
-			if err := appendSystemEvent(ctx, repositories, storage.EventLogRecord{
+			if err := appendSystemEventWithPayload(ctx, repositories, storage.EventLogRecord{
 				ID:         newRuntimeEventID(),
 				EventType:  "looperd.recovery.loop_manual_intervention_requeued",
 				LoopID:     stringPtr(loop.ID),
 				EntityType: stringPtr("loop"),
 				EntityID:   stringPtr(loop.ID),
-				PayloadJSON: mustMarshalJSON(map[string]any{
-					"previousStatus":  loop.Status,
-					"recoveredStatus": requeuedLoop.Status,
-					"queueItemId":     latestQueue.ID,
-					"lastErrorKind":   derefString(latestQueue.LastErrorKind),
-				}),
-				CreatedAt: nowISO,
+				CreatedAt:  nowISO,
+			}, map[string]any{
+				"previousStatus":  loop.Status,
+				"recoveredStatus": requeuedLoop.Status,
+				"queueItemId":     latestQueue.ID,
+				"lastErrorKind":   derefString(latestQueue.LastErrorKind),
 			}); err != nil {
 				return RecoverySummary{}, err
 			}
@@ -2036,18 +2032,17 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 				}
 			}
 			summary.LoopsRequeued += 1
-			if err := appendSystemEvent(ctx, repositories, storage.EventLogRecord{
+			if err := appendSystemEventWithPayload(ctx, repositories, storage.EventLogRecord{
 				ID:         newRuntimeEventID(),
 				EventType:  "looperd.recovery.loop_requeued",
 				LoopID:     stringPtr(loop.ID),
 				EntityType: stringPtr("loop"),
 				EntityID:   stringPtr(loop.ID),
-				PayloadJSON: mustMarshalJSON(map[string]any{
-					"previousStatus":      loop.Status,
-					"nextRunAt":           nowISO,
-					"recoveredQueueItems": recoveredQueueItems,
-				}),
-				CreatedAt: nowISO,
+				CreatedAt:  nowISO,
+			}, map[string]any{
+				"previousStatus":      loop.Status,
+				"nextRunAt":           nowISO,
+				"recoveredQueueItems": recoveredQueueItems,
 			}); err != nil {
 				return RecoverySummary{}, err
 			}
@@ -2097,18 +2092,17 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 		if err := repositories.Loops.Upsert(ctx, normalizedLoop); err != nil {
 			return RecoverySummary{}, err
 		}
-		if err := appendSystemEvent(ctx, repositories, storage.EventLogRecord{
+		if err := appendSystemEventWithPayload(ctx, repositories, storage.EventLogRecord{
 			ID:         newRuntimeEventID(),
 			EventType:  "looperd.recovery.loop_queue_normalized",
 			LoopID:     stringPtr(loop.ID),
 			EntityType: stringPtr("loop"),
 			EntityID:   stringPtr(loop.ID),
-			PayloadJSON: mustMarshalJSON(map[string]any{
-				"previousStatus":  loop.Status,
-				"recoveredStatus": normalizedLoop.Status,
-				"latestRunStatus": latestRun.Status,
-			}),
-			CreatedAt: nowISO,
+			CreatedAt:  nowISO,
+		}, map[string]any{
+			"previousStatus":  loop.Status,
+			"recoveredStatus": normalizedLoop.Status,
+			"latestRunStatus": latestRun.Status,
 		}); err != nil {
 			return RecoverySummary{}, err
 		}
@@ -2116,18 +2110,17 @@ func (r *Runtime) runRecoveryPipeline(ctx context.Context, repositories *storage
 	}
 
 	summary.CompletedAt = nowISO
-	if err := appendSystemEvent(ctx, repositories, storage.EventLogRecord{
+	if err := appendSystemEventWithPayload(ctx, repositories, storage.EventLogRecord{
 		ID:         newRuntimeEventID(),
 		EventType:  "looperd.recovery.completed",
 		EntityType: stringPtr("notification"),
 		EntityID:   stringPtr("looperd-recovery"),
-		PayloadJSON: mustMarshalJSON(map[string]any{
-			"expiredLocksReleased":  summary.ExpiredLocksReleased,
-			"interruptedRunsMarked": summary.InterruptedRunsMarked,
-			"loopsRequeued":         summary.LoopsRequeued,
-			"orphanAgentCleanup":    summary.OrphanAgentCleanup,
-		}),
-		CreatedAt: nowISO,
+		CreatedAt:  nowISO,
+	}, map[string]any{
+		"expiredLocksReleased":  summary.ExpiredLocksReleased,
+		"interruptedRunsMarked": summary.InterruptedRunsMarked,
+		"loopsRequeued":         summary.LoopsRequeued,
+		"orphanAgentCleanup":    summary.OrphanAgentCleanup,
 	}); err != nil {
 		return RecoverySummary{}, err
 	}
@@ -2316,19 +2309,18 @@ func (r *Runtime) runDeferredReviewerRecovery(ctx context.Context, repositories 
 			continue
 		}
 		requeued += 1
-		if err := appendSystemEvent(ctx, repositories, storage.EventLogRecord{
+		if err := appendSystemEventWithPayload(ctx, repositories, storage.EventLogRecord{
 			ID:         newRuntimeEventID(),
 			EventType:  "looperd.recovery.reviewer_auto_recovered",
 			LoopID:     stringPtr(loop.ID),
 			EntityType: stringPtr("loop"),
 			EntityID:   stringPtr(loop.ID),
-			PayloadJSON: mustMarshalJSON(map[string]any{
-				"previousStatus":      loop.Status,
-				"nextRunAt":           nowISO,
-				"recoveredQueueItems": recoveredQueueItems,
-				"deferred":            true,
-			}),
-			CreatedAt: nowISO,
+			CreatedAt:  nowISO,
+		}, map[string]any{
+			"previousStatus":      loop.Status,
+			"nextRunAt":           nowISO,
+			"recoveredQueueItems": recoveredQueueItems,
+			"deferred":            true,
 		}); err != nil {
 			return requeued, err
 		}
@@ -2342,18 +2334,17 @@ func (r *Runtime) appendStartedEvent(ctx context.Context, startedAt time.Time, r
 		return nil
 	}
 
-	return appendSystemEvent(ctx, services.Repositories, storage.EventLogRecord{
+	return appendSystemEventWithPayload(ctx, services.Repositories, storage.EventLogRecord{
 		ID:         newRuntimeEventID(),
 		EventType:  "looperd.started",
 		EntityType: stringPtr("notification"),
 		EntityID:   stringPtr("looperd"),
-		PayloadJSON: mustMarshalJSON(map[string]any{
-			"daemonMode": r.config.Daemon.Mode,
-			"host":       r.config.Server.Host,
-			"port":       r.config.Server.Port,
-			"recovery":   recoverySummary,
-		}),
-		CreatedAt: formatJavaScriptISOString(startedAt.Add(time.Millisecond)),
+		CreatedAt:  formatJavaScriptISOString(startedAt.Add(time.Millisecond)),
+	}, map[string]any{
+		"daemonMode": r.config.Daemon.Mode,
+		"host":       r.config.Server.Host,
+		"port":       r.config.Server.Port,
+		"recovery":   recoverySummary,
 	})
 }
 
@@ -2518,15 +2509,14 @@ func (r *Runtime) reconcileStaleRunningRunsWithMode(ctx context.Context, reposit
 }
 
 func (r *Runtime) appendStoppedEvent(ctx context.Context, repositories *storage.Repositories, reason string) error {
-	return appendSystemEvent(ctx, repositories, storage.EventLogRecord{
+	return appendSystemEventWithPayload(ctx, repositories, storage.EventLogRecord{
 		ID:         newRuntimeEventID(),
 		EventType:  "looperd.stopped",
 		EntityType: stringPtr("notification"),
 		EntityID:   stringPtr("looperd"),
-		PayloadJSON: mustMarshalJSON(map[string]any{
-			"reason": reason,
-		}),
-		CreatedAt: formatJavaScriptISOString(r.now()),
+		CreatedAt:  formatJavaScriptISOString(r.now()),
+	}, map[string]any{
+		"reason": reason,
 	})
 }
 
@@ -2778,18 +2768,17 @@ func (r *Runtime) repairStaleRunQueueState(ctx context.Context, repositories *st
 		summary.QueueItemsCancelled += repair.QueueItemsCancelled
 		summary.LoopsRequeued = 1
 		summary.QueueItemsRequeued = repair.QueueItemsRequeued
-		if err := appendSystemEvent(ctx, repositories, storage.EventLogRecord{
+		if err := appendSystemEventWithPayload(ctx, repositories, storage.EventLogRecord{
 			ID:         newRuntimeEventID(),
 			EventType:  "looperd.recovery.loop_requeued",
 			LoopID:     stringPtr(loop.ID),
 			EntityType: stringPtr("loop"),
 			EntityID:   stringPtr(loop.ID),
-			PayloadJSON: mustMarshalJSON(map[string]any{
-				"previousStatus":      loop.Status,
-				"nextRunAt":           nowISO,
-				"recoveredQueueItems": repair.QueueItemsRequeued,
-			}),
-			CreatedAt: nowISO,
+			CreatedAt:  nowISO,
+		}, map[string]any{
+			"previousStatus":      loop.Status,
+			"nextRunAt":           nowISO,
+			"recoveredQueueItems": repair.QueueItemsRequeued,
 		}); err != nil {
 			return staleRunQueueRepairSummary{}, err
 		}
@@ -2904,11 +2893,14 @@ func (r *Runtime) appendUncertainProcessIdentityEvent(ctx context.Context, repos
 	if r.logger != nil {
 		r.logger.Warn("recovery skipped due to uncertain process identity", map[string]any{"executionId": execution.ID, "pid": pid, "scope": scope})
 	}
-	payloadJSON := mustMarshalJSON(map[string]any{
+	payloadJSON, err := marshalJSON(map[string]any{
 		"pid":    pid,
 		"reason": "command_mismatch",
 		"scope":  scope,
 	})
+	if err != nil {
+		return false, fmt.Errorf("marshal uncertain process identity event: %w", err)
+	}
 	if repositories != nil && repositories.Events != nil {
 		events, err := repositories.Events.ListByEntity(ctx, "agent_execution", execution.ID)
 		if err != nil {
@@ -2947,7 +2939,10 @@ func (r *Runtime) appendContainmentClassificationEvent(ctx context.Context, repo
 	if classification.PID > 0 {
 		payload["pid"] = classification.PID
 	}
-	payloadJSON := mustMarshalJSON(payload)
+	payloadJSON, err := marshalJSON(payload)
+	if err != nil {
+		return false, fmt.Errorf("marshal containment classification event: %w", err)
+	}
 	if repositories != nil && repositories.Events != nil {
 		events, err := repositories.Events.ListByEntity(ctx, "agent_execution", execution.ID)
 		if err != nil {
@@ -3004,7 +2999,10 @@ func (r *Runtime) appendExecutionLivenessEvent(ctx context.Context, repositories
 	if assessment.Classification.PID > 0 {
 		payload["pid"] = assessment.Classification.PID
 	}
-	payloadJSON := mustMarshalJSON(payload)
+	payloadJSON, err := marshalJSON(payload)
+	if err != nil {
+		return false, fmt.Errorf("marshal execution liveness event: %w", err)
+	}
 	if repositories != nil && repositories.Events != nil {
 		events, err := repositories.Events.ListByEntity(ctx, "agent_execution", execution.ID)
 		if err != nil {
@@ -3127,17 +3125,16 @@ func (r *Runtime) quarantineRecoveryEvidence(ctx context.Context, repositories *
 			}
 		}
 	}
-	if err := appendSystemEvent(ctx, repositories, storage.EventLogRecord{
-		ID:          newRuntimeEventID(),
-		EventType:   recoveryExecutionQuarantinedEventType,
-		ProjectID:   execution.ProjectID,
-		LoopID:      execution.LoopID,
-		RunID:       execution.RunID,
-		EntityType:  stringPtr("agent_execution"),
-		EntityID:    stringPtr(execution.ID),
-		PayloadJSON: mustMarshalJSON(payload),
-		CreatedAt:   nowISO,
-	}); err != nil {
+	if err := appendSystemEventWithPayload(ctx, repositories, storage.EventLogRecord{
+		ID:         newRuntimeEventID(),
+		EventType:  recoveryExecutionQuarantinedEventType,
+		ProjectID:  execution.ProjectID,
+		LoopID:     execution.LoopID,
+		RunID:      execution.RunID,
+		EntityType: stringPtr("agent_execution"),
+		EntityID:   stringPtr(execution.ID),
+		CreatedAt:  nowISO,
+	}, payload); err != nil {
 		return did, false, err
 	}
 	wrote = true
@@ -3195,7 +3192,7 @@ func interruptRecoveryRun(ctx context.Context, repositories *storage.Repositorie
 	if err := repositories.Runs.Upsert(ctx, interrupted); err != nil {
 		return err
 	}
-	return appendSystemEvent(ctx, repositories, storage.EventLogRecord{
+	return appendSystemEventWithPayload(ctx, repositories, storage.EventLogRecord{
 		ID:         newRuntimeEventID(),
 		EventType:  "looperd.recovery.run_interrupted",
 		ProjectID:  stringPtr(loop.ProjectID),
@@ -3203,11 +3200,10 @@ func interruptRecoveryRun(ctx context.Context, repositories *storage.Repositorie
 		RunID:      stringPtr(run.ID),
 		EntityType: stringPtr("run"),
 		EntityID:   stringPtr(run.ID),
-		PayloadJSON: mustMarshalJSON(map[string]any{
-			"previousStatus":  "running",
-			"recoveredStatus": "interrupted",
-		}),
-		CreatedAt: nowISO,
+		CreatedAt:  nowISO,
+	}, map[string]any{
+		"previousStatus":  "running",
+		"recoveredStatus": "interrupted",
 	})
 }
 
@@ -3249,7 +3245,10 @@ func buildRecoveryQueueItem(loop storage.LoopRecord, nowISO string, maxAttempts 
 		lockKey := storage.IssueLockKey(loop.ProjectID, repo, issueNumber)
 		targetID := fmt.Sprintf("issue:%s:%d", repo, issueNumber)
 		payload := map[string]any{"issueNumber": issueNumber}
-		payloadJSON := mustMarshalJSON(payload)
+		payloadJSON, err := marshalJSON(payload)
+		if err != nil {
+			return storage.QueueItemRecord{}, false, fmt.Errorf("marshal planner recovery queue payload: %w", err)
+		}
 		queueRecord.TargetType = string(domain.LoopTargetTypeIssue)
 		queueRecord.TargetID = targetID
 		queueRecord.Repo = &repo
@@ -3378,6 +3377,15 @@ func appendSystemEvent(ctx context.Context, repositories *storage.Repositories, 
 	record.ActorID = stringPtr("looperd")
 	record.ActorDisplayName = stringPtr("looperd")
 	return repositories.Events.Append(ctx, record)
+}
+
+func appendSystemEventWithPayload(ctx context.Context, repositories *storage.Repositories, record storage.EventLogRecord, payload any) error {
+	encoded, err := marshalJSON(payload)
+	if err != nil {
+		return fmt.Errorf("marshal %s event payload: %w", record.EventType, err)
+	}
+	record.PayloadJSON = encoded
+	return appendSystemEvent(ctx, repositories, record)
 }
 
 func (r *Runtime) executionMatchesProcess(ctx context.Context, execution storage.AgentExecutionRecord, pid int) (matches bool, running bool, err error) {
@@ -3925,19 +3933,18 @@ func normalizeTerminalReviewerLoopForRecovery(ctx context.Context, repositories 
 		if latestRun != nil {
 			latestRunStatus = latestRun.Status
 		}
-		if err := appendSystemEvent(ctx, repositories, storage.EventLogRecord{
+		if err := appendSystemEventWithPayload(ctx, repositories, storage.EventLogRecord{
 			ID:         newRuntimeEventID(),
 			EventType:  "looperd.recovery.reviewer_terminal_metadata_normalized",
 			LoopID:     stringPtr(loop.ID),
 			EntityType: stringPtr("loop"),
 			EntityID:   stringPtr(loop.ID),
-			PayloadJSON: mustMarshalJSON(map[string]any{
-				"previousStatus":      loop.Status,
-				"recoveredStatus":     normalizedLoop.Status,
-				"latestRunStatus":     latestRunStatus,
-				"cancelledQueueItems": cancelledQueueItems,
-			}),
-			CreatedAt: nowISO,
+			CreatedAt:  nowISO,
+		}, map[string]any{
+			"previousStatus":      loop.Status,
+			"recoveredStatus":     normalizedLoop.Status,
+			"latestRunStatus":     latestRunStatus,
+			"cancelledQueueItems": cancelledQueueItems,
 		}); err != nil {
 			return true, false, err
 		}
@@ -3972,12 +3979,12 @@ func derefRunOrZero(run *storage.RunRecord) storage.RunRecord {
 	return *run
 }
 
-func mustMarshalJSON(value any) string {
+func marshalJSON(value any) (string, error) {
 	encoded, err := json.Marshal(value)
 	if err != nil {
-		panic(err)
+		return "", err
 	}
-	return string(encoded)
+	return string(encoded), nil
 }
 
 func stringPtr(value string) *string {
