@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -13,11 +14,12 @@ import (
 // authority for discovery state, while this runner supplies cancellation and a
 // shutdown drain boundary for work started after registration returns.
 type projectDiscoveryRunner struct {
-	mu     sync.Mutex
-	ctx    context.Context
-	cancel context.CancelFunc
-	closed bool
-	wg     sync.WaitGroup
+	mu       sync.Mutex
+	ctx      context.Context
+	cancel   context.CancelFunc
+	closed   bool
+	wg       sync.WaitGroup
+	inflight atomic.Int64
 }
 
 func newProjectDiscoveryRunner() *projectDiscoveryRunner {
@@ -46,12 +48,29 @@ func (r *projectDiscoveryRunner) Go(fn func()) bool {
 		return false
 	}
 	r.wg.Add(1)
+	r.inflight.Add(1)
 	r.mu.Unlock()
 	go func() {
+		defer r.inflight.Add(-1)
 		defer r.wg.Done()
 		fn()
 	}()
 	return true
+}
+
+// Busy reports whether the runner still accepts work or has in-flight
+// discoveries. Used by DrainSnapshot after BeginDrain cancels producers.
+func (r *projectDiscoveryRunner) Busy() bool {
+	if r == nil {
+		return false
+	}
+	r.mu.Lock()
+	closed := r.closed
+	r.mu.Unlock()
+	if !closed {
+		return true
+	}
+	return r.inflight.Load() > 0
 }
 
 func (r *projectDiscoveryRunner) Cancel() {

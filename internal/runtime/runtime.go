@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -216,20 +217,24 @@ type Runtime struct {
 	worktreeCleanupStatus       WorktreeCleanupStatus
 	worktreeCleanupSweepCursor  int
 	hostAdmission               *hostAdmissionGate
-	projectDiscovery            *projectDiscoveryRunner
-	resumeProjectDiscoveries    func(context.Context, *projects.Service) error
-	recoveryCancel              context.CancelFunc
-	recoveryDone                chan struct{}
-	activeExecutions            *ActiveExecutionRegistry
-	projectCatalog              *projects.Catalog
-	githubGateway               *githubinfra.Gateway
-	webhook                     *webhookRuntime
-	databaseDaemonLock          *storage.DatabaseLock
-	webhookForwarder            WebhookForwarder
-	notificationGateways        *schedulerNotificationGatewayFactory
-	schedulerDisabled           bool
-	startupReadyOnce            sync.Once
-	startupReadyErr             error
+	// workProducerJoinActive is set while BeginDrain's background join is
+	// stopping scheduler/recovery/cleanup/project-discovery producers.
+	workProducerJoinActive   atomic.Bool
+	projectDiscovery         *projectDiscoveryRunner
+	resumeProjectDiscoveries func(context.Context, *projects.Service) error
+	recoveryCancel           context.CancelFunc
+	recoveryDone             chan struct{}
+	activeExecutions         *ActiveExecutionRegistry
+	projectCatalog           *projects.Catalog
+	githubGateway            *githubinfra.Gateway
+	webhook                  *webhookRuntime
+	databaseDaemonLock       *storage.DatabaseLock
+	webhookForwarder         WebhookForwarder
+	notificationGateways     *schedulerNotificationGatewayFactory
+	networkManager           runtimeNetworkManager
+	schedulerDisabled        bool
+	startupReadyOnce         sync.Once
+	startupReadyErr          error
 	// ownershipAcquired remains true after CompleteStartup succeeds so stop
 	// still writes looperd.stopped. Admission is the sole ready Authority;
 	// this flag is not a mutation/claim gate.
@@ -635,29 +640,72 @@ func (r *Runtime) AdmissionState() AdmissionState {
 
 // BeginDrain closes new-work admission without canceling active agent
 // processes. Scheduler/recovery/cleanup/project-discovery producers are
-// canceled so they cannot keep mutating storage or enqueuing work after the
-// cutover gate closes; agents and tracked non-agent shells remain owned by
-// DrainSnapshot until they exit.
+// stopped and joined in the background so DrainSnapshot stays non-empty until
+// they can no longer mutate storage; agents and tracked non-agent shells remain
+// owned by DrainSnapshot until they exit.
 func (r *Runtime) BeginDrain(reason string) error {
 	if r == nil || r.admission == nil {
 		return ErrAdmissionNotReady
 	}
-	cancels := r.snapshotWorkProducerCancels()
 	if err := r.admission.BeginDrain(reason); err != nil {
 		return err
 	}
-	// Same producer set as sticky degrade: stop enqueuing work without
-	// aborting accepted webhook execute deliveries.
-	cancels.invokeForDegrade()
+	// Join once: idempotent re-POST during drain must not start a second stop
+	// pass while the first is still waiting on producer done channels.
+	if r.workProducerJoinActive.CompareAndSwap(false, true) {
+		go r.joinWorkProducersForDrain()
+	}
 	return nil
 }
 
+// joinWorkProducersForDrain stops the same producer set sticky degrade cancels,
+// then waits for each loop to exit. DrainSnapshot reports WorkProducersActive
+// until this returns so cutover cannot race in-flight discovery/ticks.
+func (r *Runtime) joinWorkProducersForDrain() {
+	defer r.workProducerJoinActive.Store(false)
+	if r == nil {
+		return
+	}
+	// stop* helpers cancel contexts, close stop channels, and wait (bounded by
+	// shutdownTimeout) so in-flight producer work is joined, not only canceled.
+	r.stopSchedulerLoop()
+	r.stopDeferredReviewerRecovery()
+	r.stopWorktreeCleanupLoop()
+	r.stopProjectDiscovery()
+}
+
 // DrainSnapshot reports Supervisor-owned work still in flight after BeginDrain.
+// It includes work producers still being joined so cutover cannot proceed while
+// discovery/scheduler/recovery still mutate storage.
 func (r *Runtime) DrainSnapshot() DrainSnapshot {
-	if r == nil || r.activeExecutions == nil {
+	if r == nil {
 		return DrainSnapshot{}
 	}
-	return r.activeExecutions.DrainSnapshot()
+	snapshot := DrainSnapshot{}
+	if r.activeExecutions != nil {
+		snapshot = r.activeExecutions.DrainSnapshot()
+	}
+	snapshot.WorkProducersActive = r.countActiveWorkProducers()
+	return snapshot
+}
+
+func (r *Runtime) countActiveWorkProducers() int {
+	if r == nil {
+		return 0
+	}
+	active := 0
+	if r.workProducerJoinActive.Load() {
+		active++
+	}
+	// Discovery can still be mid-flight for a brief window before
+	// stopProjectDiscovery runs on the join goroutine.
+	r.mu.RLock()
+	discovery := r.projectDiscovery
+	r.mu.RUnlock()
+	if discovery != nil && discovery.Busy() {
+		active++
+	}
+	return active
 }
 
 // WaitForDrain blocks until DrainSnapshot reports no in-flight work or ctx ends.

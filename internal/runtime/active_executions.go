@@ -123,10 +123,15 @@ type DrainSnapshot struct {
 	// tracked via processcontainment.LiveTracker. They are live cutover blockers
 	// even though they are not agent executions or operation leases.
 	NonAgentHandles int `json:"nonAgentHandles"`
+	// WorkProducersActive counts scheduler/recovery/cleanup/project-discovery
+	// producers that have not yet exited after BeginDrain canceled them. Empty
+	// agent/lease sets are not enough to cut over while a producer still mutates
+	// storage or enqueues work.
+	WorkProducersActive int `json:"workProducersActive"`
 }
 
 func (s DrainSnapshot) Drained() bool {
-	return s.LiveExecutions == 0 && s.PendingSpawns == 0 && s.BoundOperations == 0 && s.PendingOperations == 0 && s.NonAgentHandles == 0
+	return s.LiveExecutions == 0 && s.PendingSpawns == 0 && s.BoundOperations == 0 && s.PendingOperations == 0 && s.NonAgentHandles == 0 && s.WorkProducersActive == 0
 }
 
 func (r *ActiveExecutionRegistry) DrainSnapshot() DrainSnapshot {
