@@ -69,6 +69,7 @@ const (
 	ReasonDiffBudgetExceeded       ReasonCode = "diff_budget_exceeded"
 	ReasonProviderStateUnavailable ReasonCode = "provider_state_unavailable"
 	ReasonProviderStateAmbiguous   ReasonCode = "provider_state_ambiguous"
+	ReasonRoutingProjectionFailed  ReasonCode = "routing_projection_failed"
 )
 
 type Reason struct {
@@ -153,9 +154,10 @@ type Report struct {
 	Reasons                   []Reason `json:"reasons"`
 	Evidence                  Evidence `json:"evidence"`
 	EvaluatedAt               string   `json:"evaluatedAt"`
-	// SourceFingerprint is everything the shared discovery list page could observe
-	// about the pull request when this report was produced. The next tick compares
-	// it to decide whether re-evaluating would reach the same conclusion.
+	// SourceFingerprint is the shared discovery list observation plus the local
+	// trust and project-policy inputs used for routing when this report was
+	// produced. The next tick compares it to decide whether re-evaluating would
+	// reach the same conclusion.
 	SourceFingerprint string `json:"sourceFingerprint,omitempty"`
 }
 
@@ -221,6 +223,7 @@ type GitHubGateway interface {
 	SetCommitStatus(context.Context, githubinfra.CommitStatusInput) error
 	AddPullRequestLabels(context.Context, githubinfra.PullRequestLabelsInput) error
 	RemovePullRequestLabels(context.Context, githubinfra.PullRequestLabelsInput) error
+	ValidateMergifyRouting(context.Context, githubinfra.ValidateMergifyRoutingInput) error
 }
 
 // RequiredStatusContext is the GitHub status context an operator adds to branch
@@ -359,20 +362,10 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 			r.publishDiscoveryCommitStatuses(ctx, input.ProjectID, input.Repo, input.CWD, result.Reports)
 		}
 	}
-	diffBudget := r.diffBudget(input.ProjectID)
-	budgetEnabled := diffBudget.MaxChangedFiles > 0 || diffBudget.MaxDeletions > 0
-	configuredTarget := r.configuredTarget(input.ProjectID)
 	reviewThreshold := r.requiredReviewChangedLinesFor(input.ProjectID)
-	reviewPolicyEnabled := trust == config.GatekeeperTrustAuto && reviewThreshold > 0
 	stillOpen := make(map[string]struct{}, len(pullRequests))
 	for _, pullRequest := range pullRequests {
-		// A budget change is a gate-input change even when the PR list page is
-		// otherwise unchanged; include it so enabling or disabling the gate does
-		// not wait for the periodic maxSkipAge backstop. BaseSHA is folded into
-		// the fingerprint only while the budget is enabled, so a base advance on
-		// a repo with no configured limit does not invalidate every open report.
-		policyPermits := r.policyPermitsTarget(input.ProjectID, input.Repo, pullRequest.BaseRefName)
-		fingerprint := sourceFingerprint(pullRequest, budgetEnabled, reviewPolicyEnabled) + fmt.Sprintf("\x1fdiff-budget=%d,%d", diffBudget.MaxChangedFiles, diffBudget.MaxDeletions) + fmt.Sprintf("\x1fgatekeeper-trust=%s", trust) + fmt.Sprintf("\x1fconfigured-target=%s", configuredTarget) + fmt.Sprintf("\x1fpolicy-permits=%t", policyPermits) + fmt.Sprintf("\x1freview-threshold=%d", reviewThreshold)
+		fingerprint := r.sourceFingerprintForProject(pullRequest, input.ProjectID, input.Repo)
 		entityID := fmt.Sprintf("%s#%d", input.Repo, pullRequest.Number)
 		stillOpen[entityID] = struct{}{}
 		previous, hasPrevious := previousReports[entityID]
@@ -672,6 +665,21 @@ func (r *Runner) departedFromOpenSet(
 		departed = departed[:maxReconciledDepartures]
 	}
 	return departed
+}
+
+// sourceFingerprintForProject includes the local authority inputs that the
+// forge's pull-request list cannot expose. A trust, budget, or policy change
+// must not leave a previously published auto-merge label in place merely
+// because the pull request itself is unchanged.
+func (r *Runner) sourceFingerprintForProject(pullRequest githubinfra.PullRequestSummary, projectID, repo string) string {
+	diffBudget := r.diffBudget(projectID)
+	budgetEnabled := diffBudget.MaxChangedFiles > 0 || diffBudget.MaxDeletions > 0
+	configuredTarget := r.configuredTarget(projectID)
+	permitsTarget := r.policyPermitsTarget(projectID, repo, pullRequest.BaseRefName)
+	trust := r.trustFor(projectID)
+	reviewThreshold := r.requiredReviewChangedLinesFor(projectID)
+	reviewPolicyEnabled := trust == config.GatekeeperTrustAuto && reviewThreshold > 0
+	return sourceFingerprint(pullRequest, budgetEnabled, reviewPolicyEnabled) + fmt.Sprintf("\x1fdiff-budget=%d,%d", diffBudget.MaxChangedFiles, diffBudget.MaxDeletions) + fmt.Sprintf("\x1fgatekeeper-trust=%s", string(trust)) + fmt.Sprintf("\x1fconfigured-target=%s", configuredTarget) + fmt.Sprintf("\x1fpolicy-permits-target=%t", permitsTarget) + fmt.Sprintf("\x1freview-threshold=%d", reviewThreshold)
 }
 
 func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput) (Report, error) {
@@ -1439,17 +1447,30 @@ func (r *Runner) persist(ctx context.Context, report Report) (Report, error) {
 
 	entityType := "pull_request"
 	entityID := fmt.Sprintf("%s#%d", report.Repo, report.PRNumber)
-	projectID := report.ProjectID
-	if err := eventlog.Append(ctx, r.repos, eventlog.AppendInput{
-		EventType: GateReportEventType, ProjectID: &projectID, EntityType: &entityType, EntityID: &entityID,
-		Payload: report, CreatedAt: r.now(),
-	}); err != nil {
+	if err := r.appendGateReport(ctx, report, entityType, entityID); err != nil {
 		return Report{}, fmt.Errorf("persist gate report: %w", err)
 	}
-	if err := r.reconcileRoutingLabels(ctx, report, previous); err != nil && r.logWarn != nil {
-		r.logWarn("gatekeeper: could not reconcile routing labels", map[string]any{
-			"repo": report.Repo, "pr": report.PRNumber, "error": err.Error(),
-		})
+	if routingErr := r.reconcileRoutingLabels(ctx, report, previous); routingErr != nil {
+		if r.logWarn != nil {
+			r.logWarn("gatekeeper: could not reconcile routing labels", map[string]any{
+				"repo": report.Repo, "pr": report.PRNumber, "error": routingErr.Error(),
+			})
+		}
+		// Keep the successful gate evidence durable, but append a retry marker
+		// with an empty discovery fingerprint. The next tick must evaluate and
+		// retry the projection even when the pull request itself is unchanged.
+		retry := report
+		retry.Reasons = append([]Reason(nil), report.Reasons...)
+		retry.Reasons = append(retry.Reasons, Reason{Code: ReasonRoutingProjectionFailed, Subject: "routing_labels"})
+		sortReasons(retry.Reasons)
+		retry.Eligible = false
+		retry.Status = StatusBlocked
+		retry.SourceFingerprint = ""
+		retry.EvaluatedAt = r.now().UTC().Format(time.RFC3339Nano)
+		if markerErr := r.appendGateReportAt(ctx, retry, entityType, entityID, r.now().Add(time.Millisecond)); markerErr != nil {
+			return report, fmt.Errorf("%w (persist routing retry marker: %v)", routingErr, markerErr)
+		}
+		return report, routingErr
 	}
 	// The owned comment is reconciled after the durable report: the report is the
 	// record, the comment is a convenience for whoever is deciding. A forge that
@@ -1508,6 +1529,18 @@ func withoutRequiredCheck(rules []githubinfra.RequiredCheckRule, name string) []
 		out = append(out, rule)
 	}
 	return out
+}
+
+func (r *Runner) appendGateReport(ctx context.Context, report Report, entityType, entityID string) error {
+	return r.appendGateReportAt(ctx, report, entityType, entityID, r.now())
+}
+
+func (r *Runner) appendGateReportAt(ctx context.Context, report Report, entityType, entityID string, createdAt time.Time) error {
+	projectID := report.ProjectID
+	return eventlog.Append(ctx, r.repos, eventlog.AppendInput{
+		EventType: GateReportEventType, ProjectID: &projectID, EntityType: &entityType, EntityID: &entityID,
+		Payload: report, CreatedAt: createdAt,
+	})
 }
 
 func evaluateRequiredChecks(required []githubinfra.RequiredCheckRule, checks githubinfra.PullRequestCheckRuns) ([]Reason, []CheckEvidence) {

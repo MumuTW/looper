@@ -274,6 +274,36 @@ func TestSkipUnchangedReevaluatesWhenReviewEvidenceLookupFails(t *testing.T) {
 	}
 }
 
+func TestDiscoverPullRequestsReevaluatesWhenTrustIsDemoted(t *testing.T) {
+	fixture := newGatekeeperFixture(t)
+	fixture.github.openPullRequests = []githubinfra.PullRequestSummary{openPullRequestFixture()}
+	trust := config.GatekeeperTrustAuto
+	runner := func() *Runner {
+		return New(Options{
+			Repos: fixture.repos, GitHub: fixture.github, Now: func() time.Time { return fixture.now },
+			PolicyPermitsTarget: func(string, string, string) bool { return fixture.policyPermits },
+			TrustForProject:     func(string) config.GatekeeperTrustLevel { return trust },
+		})
+	}
+
+	first := runner().DiscoverPullRequests
+	if result, err := first(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+		t.Fatalf("auto discovery() error = %v", err)
+	} else if result.Evaluated != 1 || result.Skipped != 0 {
+		t.Fatalf("auto discovery = %d evaluated / %d skipped, want 1 / 0", result.Evaluated, result.Skipped)
+	}
+	trust = config.GatekeeperTrustObserve
+	second, err := runner().DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("observe discovery() error = %v", err)
+	}
+	if second.Evaluated != 1 || second.Skipped != 0 {
+		t.Fatalf("demotion discovery = %d evaluated / %d skipped, want 1 / 0", second.Evaluated, second.Skipped)
+	}
+	if len(fixture.github.labelRemoves) < 2 || fixture.github.labelRemoves[len(fixture.github.labelRemoves)-2].Labels[0] != labels.AutoMerge {
+		t.Fatalf("label removals after trust demotion = %#v, want auto-merge retirement", fixture.github.labelRemoves)
+	}
+}
 func hasReason(report Report, code ReasonCode) bool {
 	for _, reason := range report.Reasons {
 		if reason.Code == code {

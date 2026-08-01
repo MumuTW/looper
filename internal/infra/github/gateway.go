@@ -3,6 +3,7 @@ package github
 import (
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -650,6 +651,13 @@ type PullRequestLabelsInput struct {
 	Labels         []string
 	LabelNamespace labels.Namespace
 	CWD            string
+}
+
+// ValidateMergifyRoutingInput identifies the repository configuration whose
+// queue contract Gatekeeper relies on when it publishes the auto-merge label.
+type ValidateMergifyRoutingInput struct {
+	Repo string
+	CWD  string
 }
 
 type PullRequestReviewersInput struct {
@@ -2479,22 +2487,52 @@ func (g *Gateway) GetPullRequestHeadSHA(ctx context.Context, input ViewPullReque
 	return asString(row["headRefOid"]), nil
 }
 
-// GetPullRequestHeadAndBaseSHA is the final revalidation read for gates whose
-// verdict depends on the merge base, not only on the head. A base branch can
-// advance between the merge-watch read and this observation without moving the
-// head, so revalidating the head alone cannot detect that a diff-budget verdict
-// was computed against a stale base. It costs the same `gh pr view` call as
-// GetPullRequestHeadSHA with one additional JSON field.
-func (g *Gateway) GetPullRequestHeadAndBaseSHA(ctx context.Context, input ViewPullRequestInput) (string, string, error) {
-	result, err := g.runGh(ctx, input.CWD, "", "pr", "view", fmt.Sprintf("%d", input.PRNumber), "--repo", input.Repo, "--json", "headRefOid,baseRefOid")
-	if err != nil {
-		return "", "", err
+// ValidateMergifyRouting checks the repository-owned Mergify contract before
+// Gatekeeper publishes an auto-merge label. The repository file is the
+// authority for how that label is consumed; Gatekeeper must fail closed when
+// the file is absent or does not contain the vetoes that protect manual queue
+// entries as well as the automatic route.
+func (g *Gateway) ValidateMergifyRouting(ctx context.Context, input ValidateMergifyRoutingInput) error {
+	hostname, repo := splitRepoHostname(input.Repo)
+	args := []string{"api", fmt.Sprintf("repos/%s/contents/.mergify.yml", repo), "--jq", ".content", "-H", "Accept: application/vnd.github+json"}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
 	}
-	row, err := decodeJSONObject(result.Stdout)
+	result, err := g.runGh(ctx, input.CWD, "", args...)
 	if err != nil {
-		return "", "", err
+		return fmt.Errorf("read .mergify.yml: %w", err)
 	}
-	return asString(row["headRefOid"]), asString(row["baseRefOid"]), nil
+	encoded := strings.Map(func(r rune) rune {
+		switch r {
+		case ' ', '\t', '\r', '\n':
+			return -1
+		default:
+			return r
+		}
+	}, result.Stdout)
+	content, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return fmt.Errorf("decode .mergify.yml: %w", err)
+	}
+	text := string(content)
+	queueStart := strings.Index(text, "queue_conditions:")
+	if queueStart < 0 {
+		return fmt.Errorf(".mergify.yml has no queue_conditions")
+	}
+	queueEnd := strings.Index(text[queueStart+len("queue_conditions:"):], "\nmerge_protections:")
+	if queueEnd < 0 {
+		queueEnd = len(text) - queueStart - len("queue_conditions:")
+	}
+	queue := text[queueStart : queueStart+len("queue_conditions:")+queueEnd]
+	for _, fragment := range []string{"- label != needs-human-review", "- label != do-not-merge"} {
+		if !strings.Contains(queue, fragment) {
+			return fmt.Errorf(".mergify.yml queue_conditions missing %q", fragment)
+		}
+	}
+	if !strings.Contains(text, "merge_protections_settings:") || !strings.Contains(text, "label = auto-merge") {
+		return fmt.Errorf(".mergify.yml has no auto-merge label contract")
+	}
+	return nil
 }
 
 func (g *Gateway) ResolveReviewThread(ctx context.Context, input ResolveReviewThreadInput) error {
