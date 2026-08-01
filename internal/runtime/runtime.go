@@ -979,6 +979,28 @@ func (r *Runtime) start(ctx context.Context) error {
 		return err
 	}
 
+	// Compatibility barriers are no-op marker migrations that record themselves
+	// in schema_migrations so an older binary refuses to boot instead of
+	// silently ignoring durable payload fields a newer binary may have written.
+	// When auto-migration is enabled, RunPending applies them below. When it is
+	// disabled, RunPending is skipped, so a pending barrier would leave the
+	// daemon running blind: it initializes repositories and may write payloads,
+	// yet a subsequent pre-barrier binary sees no unknown applied migration and
+	// starts normally. Refuse startup while a barrier is pending so the operator
+	// must apply it (or enable auto-migration) before the daemon can run.
+	if !r.config.Package.AutoMigrateOnStartup {
+		pendingBarriers, err := coordinator.MigrationRunner().PendingBarriers(ctx)
+		if err != nil {
+			return err
+		}
+		if len(pendingBarriers) > 0 {
+			return fmt.Errorf(
+				"pending compatibility barrier migrations %s are not applied and package.autoMigrateOnStartup is false; apply them (run a looper binary with autoMigrateOnStartup=true or `looper migrate`) before starting the daemon so a downgraded binary cannot silently read payloads it does not understand",
+				strings.Join(pendingBarriers, ", "),
+			)
+		}
+	}
+
 	if r.config.Package.AutoMigrateOnStartup {
 		_, err = coordinator.MigrationRunner().RunPending(ctx, storage.RunPendingOptions{
 			RequireBackup: r.config.Package.RequireBackupBeforeMigrate,

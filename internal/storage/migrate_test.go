@@ -1134,6 +1134,20 @@ func TestMigrationRunnerValidateCompatibilityAcceptsKnownAppliedMigrations(t *te
 // 0022 migration records the baseline in the same ordered manifest that gates
 // every daemon boot, so an older binary fails before it can silently ignore a
 // newer payload field.
+//
+// Test-growth classification (AGENTS.md "Test-file growth is a design smell"):
+// this is covering, not propping up. The 13-line marker migration has no DDL,
+// so the only way to prove it blocks a pre-baseline binary is to seed real
+// durable payloads across every payload-bearing table and assert the older
+// manifest refuses — the existing unknown-migration tests only cover unknown
+// SQL IDs, not payload-drift authority. What was tried for removal: relying on
+// TestMigrationRunnerValidateCompatibilityRejectsUnknownAppliedMigrations
+// alone, but that test seeds a synthetic 9999 ID, not the real 0022 marker, so
+// it cannot prove the actual baseline migration is the downgrade gate. The
+// fixture-helper branch in writeLegacyDBFixture derives 0022's state from the
+// 0021 fixture plus the marker instead of duplicating a multi-KB base64 SQLite
+// blob with zero DDL difference, which is why the line count is payload-setup
+// rather than blob duplication.
 func TestDurablePayloadBaselineBlocksPreBaselineBinary(t *testing.T) {
 	t.Parallel()
 	if got := EmbeddedMigrations[len(EmbeddedMigrations)-1].ID; got != "0022_durable_payload_baseline" {
@@ -1188,6 +1202,60 @@ func TestDurablePayloadBaselineBlocksPreBaselineBinary(t *testing.T) {
 	preBaseline := NewMigrationRunner(db, MigrationRunnerOptions{Migrations: EmbeddedMigrations[:len(EmbeddedMigrations)-1]})
 	if err := preBaseline.ValidateCompatibility(ctx); err == nil || !containsAll(err.Error(), []string{"0022_durable_payload_baseline", "restore a backup matching this version"}) {
 		t.Fatalf("pre-baseline ValidateCompatibility() error = %v, want payload downgrade refusal", err)
+	}
+}
+
+// TestMigrationRunnerPendingBarriersReportsUnappliedBarrier covers the guard
+// Runtime.start uses when auto-migration is disabled: a pending compatibility
+// barrier must be reported so the daemon can refuse startup instead of running
+// blind against payloads a newer binary may have written.
+func TestMigrationRunnerPendingBarriersReportsUnappliedBarrier(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	db := openTestSQLiteDB(t)
+
+	// Apply every migration except the trailing barrier so it remains pending.
+	runner := NewMigrationRunner(db, MigrationRunnerOptions{
+		Migrations: EmbeddedMigrations,
+	})
+	if _, err := runner.RunPending(ctx, RunPendingOptions{}); err != nil {
+		t.Fatalf("RunPending() error = %v", err)
+	}
+	pending, err := runner.PendingBarriers(ctx)
+	if err != nil {
+		t.Fatalf("PendingBarriers() after full migration error = %v", err)
+	}
+	if len(pending) != 0 {
+		t.Fatalf("PendingBarriers() = %v after all migrations applied, want empty", pending)
+	}
+
+	// A fresh database with the full manifest has the barrier pending.
+	fresh := openTestSQLiteDB(t)
+	freshRunner := NewMigrationRunner(fresh, MigrationRunnerOptions{
+		Migrations: EmbeddedMigrations,
+	})
+	pending, err = freshRunner.PendingBarriers(ctx)
+	if err != nil {
+		t.Fatalf("PendingBarriers() on fresh database error = %v", err)
+	}
+	if len(pending) != 1 || pending[0] != "0022_durable_payload_baseline" {
+		t.Fatalf("PendingBarriers() = %v, want [0022_durable_payload_baseline]", pending)
+	}
+
+	// A manifest with no barrier migration reports nothing pending even when
+	// migrations are unapplied, so the guard never fires for non-barrier schemas.
+	noBarrier := NewMigrationRunner(openTestSQLiteDB(t), MigrationRunnerOptions{
+		Migrations: []EmbeddedMigration{
+			{ID: "0001_init", FileName: "0001_init.sql", SQL: "CREATE TABLE widgets (id TEXT PRIMARY KEY);"},
+		},
+	})
+	pending, err = noBarrier.PendingBarriers(ctx)
+	if err != nil {
+		t.Fatalf("PendingBarriers() with no barrier error = %v", err)
+	}
+	if len(pending) != 0 {
+		t.Fatalf("PendingBarriers() = %v, want empty for non-barrier manifest", pending)
 	}
 }
 

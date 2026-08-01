@@ -1,3 +1,5 @@
+-- looper:compatibility-barrier
+--
 -- The initial SQLite schema stored checkpoints, event payloads, PR snapshots,
 -- and agent retry snapshots as JSON without per-row version envelopes. Those
 -- payloads are durable execution authority, not incidental diagnostics: an
@@ -10,4 +12,29 @@
 -- backup rather than open the database and infer payload safety from SQL IDs.
 -- Future incompatible durable-payload changes must add a later marker
 -- migration in the same way.
+--
+-- Trade-off analysis (AGENTS.md "New concepts require an explicit trade-off"):
+--
+--   - Concrete failure prevented: a newer binary writes a checkpoint/event/
+--     snapshot field an older binary does not decode; the older binary silently
+--     drops it and resumes from a stale view of execution state. The marker
+--     makes the older binary fail at boot instead.
+--
+--   - Delete this six months from now: a pre-0022 binary would boot against a
+--     database a newer binary wrote and silently lose durable payload fields,
+--     so it cannot be deleted while any deployed binary predates it.
+--
+--   - Why a simpler fail-loud or deletion is insufficient: comparing only SQL
+--     table/column shapes misses JSON payload drift entirely, and deleting the
+--     marker removes the only ledger signal that distinguishes "this binary
+--     understands the durable payload baseline" from "this binary has not seen
+--     it yet". The marker is the authority because it is the binary's own
+--     ordered manifest, not inferred from schema shape.
+--
+--   - What it still cannot catch: a newer binary that adds a payload field and
+--     a same-baseline (>=0022) binary that strips it on read cannot be detected
+--     here — both know 0022, so neither refuses. It also does not protect
+--     payloads written before this binary first booted with the marker applied
+--     when auto-migration was disabled; Runtime.start refuses startup while a
+--     barrier is pending to close that gap.
 SELECT 1;

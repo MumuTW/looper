@@ -17,9 +17,21 @@ type EmbeddedMigration struct {
 	ID       string
 	FileName string
 	SQL      string
+	// Barrier marks a no-op compatibility-barrier migration (declared in the
+	// .sql file with a "-- looper:compatibility-barrier" directive). A barrier
+	// records itself in schema_migrations without changing any table, so an
+	// older binary that predates it refuses to boot instead of silently reading
+	// durable payloads it cannot fully understand. Barriers must be applied
+	// before the daemon initializes repositories even when auto-migration is
+	// disabled; Runtime.start enforces that invariant.
+	Barrier bool
 }
 
 var migrationFilePattern = regexp.MustCompile(`^(\d{4}_[a-zA-Z0-9_\-]+)\.sql$`)
+
+// compatibilityBarrierDirective marks a migration as a no-op compatibility
+// barrier. It must appear on its own line within the migration's SQL comments.
+const compatibilityBarrierDirective = "looper:compatibility-barrier"
 
 //go:embed migrations/*.sql
 var embeddedMigrationFiles embed.FS
@@ -107,7 +119,23 @@ func newEmbeddedMigration(fileName string, sql string) (EmbeddedMigration, error
 		ID:       strings.TrimSuffix(fileName, path.Ext(fileName)),
 		FileName: fileName,
 		SQL:      sql,
+		Barrier:  migrationDeclaresBarrier(sql),
 	}, nil
+}
+
+// migrationDeclaresBarrier reports whether the migration SQL contains the
+// compatibility-barrier directive on its own comment line.
+func migrationDeclaresBarrier(sql string) bool {
+	for _, line := range strings.Split(sql, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, "--") {
+			continue
+		}
+		if strings.TrimSpace(strings.TrimPrefix(trimmed, "--")) == compatibilityBarrierDirective {
+			return true
+		}
+	}
+	return false
 }
 
 func isMigrationFileName(fileName string) bool {

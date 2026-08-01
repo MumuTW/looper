@@ -352,6 +352,17 @@ jobs:
             exit 1
           fi
 
+      # Verify the complete JSON build identity of the looper CLI binary.
+      #
+      # Residual limitation (AGENTS.md "New concepts require an explicit
+      # trade-off"): this gate proves the binary's embedded identity matches the
+      # prepared release metadata at archive time. It cannot catch a binary that
+      # was rebuilt with the correct identity but against a source tree that
+      # diverged after the pinned commit (the gitCommitSha field is baked in at
+      # build time, not re-derived from the artifact on disk), nor a supply-chain
+      # substitution that swaps the archive after this step runs and before
+      # upload. Those are bounded by the preceding clean-tree check and the
+      # upload step's sha256, not by identity comparison alone.
       - name: Verify looper binary build identity
         env:
           EXPECTED_VERSION: ${{ needs.prepare-go-release.outputs.release-version }}
@@ -474,6 +485,20 @@ jobs:
             exit 1
           fi
 
+      # Verify the complete JSON build identity of the looperd daemon binary.
+      #
+      # Deletion-first alternative (AGENTS.md "Prefer deletion over another
+      # layer"): the existing layer considered for removal is the earlier
+      # `--version` string comparison step above. Deleting it and relying only on
+      # this JSON identity gate would still catch every mismatch the string
+      # comparison catches (version is a subset of the JSON identity), so the
+      # string comparison is retained solely as a fast, human-readable
+      # pre-filter — it cannot be the authority because it misses commit,
+      # channel, API version, timestamp, and dirty-tree drift. The reverse
+      # deletion (remove this JSON gate, keep only `--version`) was rejected
+      # because `--version` cannot detect the identity-drift failures this gate
+      # exists to prevent. Net result: the string comparison stays as a
+      # diagnostics aid, the JSON identity gate is the authority.
       - name: Verify looperd binary build identity
         env:
           EXPECTED_VERSION: ${{ needs.prepare-go-release.outputs.release-version }}

@@ -85,6 +85,34 @@ func (r *MigrationRunner) ListPending(ctx context.Context) ([]string, error) {
 	return pending, nil
 }
 
+// PendingBarriers returns the IDs of pending compatibility-barrier migrations
+// (no-op markers declared with the looper:compatibility-barrier directive).
+// Barriers must be applied before the daemon initializes repositories even
+// when auto-migration is disabled, so Runtime.start uses this to refuse startup
+// while a barrier remains unapplied instead of running blind against payloads
+// a newer binary may have written.
+func (r *MigrationRunner) PendingBarriers(ctx context.Context) ([]string, error) {
+	status, err := r.Status(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	appliedByID := make(map[string]bool, len(status.Applied))
+	for _, migration := range status.Applied {
+		appliedByID[migration.ID] = true
+	}
+
+	pending := make([]string, 0)
+	for _, migration := range r.migrations {
+		if !migration.Barrier || appliedByID[migration.ID] {
+			continue
+		}
+		pending = append(pending, migration.ID)
+	}
+
+	return pending, nil
+}
+
 func (r *MigrationRunner) Status(ctx context.Context) (MigrationStatus, error) {
 	conn, err := r.db.Conn(ctx)
 	if err != nil {

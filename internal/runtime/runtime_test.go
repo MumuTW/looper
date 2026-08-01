@@ -5051,6 +5051,80 @@ func TestRuntimeStartValidatesSchemaCompatibilityWhenAutoMigrationDisabled(t *te
 	}
 }
 
+// TestRuntimeStartRefusesStartupWhenCompatibilityBarrierPending covers the
+// boot path where package.autoMigrateOnStartup=false and a compatibility
+// barrier migration (0022) has not been applied. Previously Runtime.start
+// skipped RunPending entirely, so the barrier stayed pending while the daemon
+// initialized repositories and could write durable payloads; a subsequent
+// pre-0022 binary then saw no unknown applied migration and started normally,
+// silently losing payload fields. Runtime.start now refuses startup while a
+// barrier is pending so the operator must apply it before the daemon can run.
+func TestRuntimeStartRefusesStartupWhenCompatibilityBarrierPending(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	dbPath := filepath.Join(workingDir, "runtime.sqlite")
+	backupDir := filepath.Join(workingDir, "backups")
+
+	// Seed the database through 0021 only, leaving the 0022 barrier pending.
+	preBarrierManifest := storage.EmbeddedMigrations[:len(storage.EmbeddedMigrations)-1]
+	seedCoordinator, err := storage.OpenSQLiteCoordinator(context.Background(), dbPath, storage.SQLiteCoordinatorOptions{
+		BackupDir:  backupDir,
+		Migrations: preBarrierManifest,
+	})
+	if err != nil {
+		t.Fatalf("OpenSQLiteCoordinator() seed error = %v", err)
+	}
+	if _, err := seedCoordinator.MigrationRunner().RunPending(context.Background()); err != nil {
+		_ = seedCoordinator.Close()
+		t.Fatalf("seed RunPending() error = %v", err)
+	}
+	if err := seedCoordinator.Close(); err != nil {
+		t.Fatalf("seed coordinator Close() error = %v", err)
+	}
+
+	// Confirm the running binary's manifest actually declares a barrier, so
+	// this test exercises the guard rather than silently passing on a manifest
+	// with no barrier migration.
+	var hasBarrier bool
+	var barrierID string
+	for _, migration := range storage.EmbeddedMigrations {
+		if migration.Barrier {
+			hasBarrier = true
+			barrierID = migration.ID
+			break
+		}
+	}
+	if !hasBarrier {
+		t.Fatal("no compatibility-barrier migration in EmbeddedMigrations; test cannot exercise the guard")
+	}
+
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Storage.DBPath = dbPath
+	cfg.Storage.BackupDir = &backupDir
+	cfg.Package.AutoMigrateOnStartup = false
+
+	rt := New(Options{
+		Config: cfg,
+		Logger: &testLogger{},
+		OpenSQLiteCoordinator: func(ctx context.Context, dbPath string, options storage.SQLiteCoordinatorOptions) (*storage.SQLiteCoordinator, error) {
+			return storage.OpenSQLiteCoordinator(ctx, dbPath, options)
+		},
+	})
+
+	startErr := rt.Start(context.Background())
+	if startErr == nil {
+		rt.Stop("test cleanup")
+		t.Fatal("Start() error = nil, want pending-barrier refusal")
+	}
+	if !strings.Contains(startErr.Error(), barrierID) || !strings.Contains(startErr.Error(), "compatibility barrier") {
+		t.Fatalf("Start() error = %q, want it to name %s and the compatibility barrier refusal", startErr, barrierID)
+	}
+}
+
 // tableExists reports whether a table exists in the SQLite database at dbPath.
 func tableExists(t *testing.T, dbPath, tableName string) bool {
 	t.Helper()

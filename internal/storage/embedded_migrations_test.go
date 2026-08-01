@@ -88,3 +88,43 @@ func compareStrings(a string, b string) int {
 	}
 	return 0
 }
+
+func TestCompatibilityBarrierDirectiveIsDetected(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		sql  string
+		want bool
+	}{
+		{name: "directive on first line", sql: "-- looper:compatibility-barrier\nSELECT 1;", want: true},
+		{name: "directive after comments", sql: "-- some comment\n-- looper:compatibility-barrier\nSELECT 1;", want: true},
+		{name: "directive with surrounding spaces", sql: "--   looper:compatibility-barrier  \nSELECT 1;", want: true},
+		{name: "plain migration", sql: "-- no barrier here\nCREATE TABLE t (id TEXT);\n", want: false},
+		{name: "substring not matched", sql: "-- looper:compatibility-barrier-extra\nSELECT 1;", want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := migrationDeclaresBarrier(tc.sql); got != tc.want {
+				t.Fatalf("migrationDeclaresBarrier() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestEmbeddedDurablePayloadBaselineIsBarrier(t *testing.T) {
+	t.Parallel()
+
+	var found bool
+	for _, migration := range EmbeddedMigrations {
+		if migration.ID == "0022_durable_payload_baseline" {
+			found = true
+			if !migration.Barrier {
+				t.Fatalf("0022_durable_payload_baseline.Barrier = false, want true")
+			}
+		}
+	}
+	if !found {
+		t.Fatal("0022_durable_payload_baseline not in EmbeddedMigrations")
+	}
+}
