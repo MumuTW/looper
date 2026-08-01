@@ -2676,12 +2676,12 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		return checkpoint, &loopError{message: headChange.Reason, kind: FailureRetryableAfterResume, interrupted: true}
 	}
 	if err != nil {
-		r.appendReviewerAgentEvent(ctx, input, "reviewer.agent.failed", "review", executionID, reviewerAgentWaitErrorPayload(err, r.now().Sub(agentStartedAt)))
+		r.appendReviewerAgentEvent(context.Background(), input, "reviewer.agent.failed", "review", executionID, reviewerAgentWaitErrorPayload(err, r.now().Sub(agentStartedAt)))
 		r.logWarn("reviewer agent wait failed", map[string]any{"projectId": input.Project.ID, "loopId": input.Loop.ID, "runId": input.Run.ID, "repo": input.Repo, "prNumber": input.PRNumber, "phase": "review", "executionId": executionID, "elapsedSeconds": durationSeconds(r.now().Sub(agentStartedAt)), "error": err.Error()})
 		r.markAgentExecutionNativeResumePendingForTransientProvider(ctx, executionID, err.Error())
 		return checkpoint, err
 	}
-	r.appendReviewerAgentEvent(ctx, input, reviewerAgentTerminalEvent(result), "review", executionID, reviewerAgentResultPayload(result, r.now().Sub(agentStartedAt)))
+	r.appendReviewerAgentEvent(context.Background(), input, reviewerAgentTerminalEvent(result), "review", executionID, reviewerAgentResultPayload(result, r.now().Sub(agentStartedAt)))
 	r.logInfo("reviewer agent completed", map[string]any{"projectId": input.Project.ID, "loopId": input.Loop.ID, "runId": input.Run.ID, "repo": input.Repo, "prNumber": input.PRNumber, "phase": "review", "executionId": executionID, "status": result.Status, "timeoutType": result.TimeoutType, "elapsedSeconds": elapsedSeconds(result, r.now().Sub(agentStartedAt)), "parseStatus": result.ParseStatus})
 	if result.Status != "completed" {
 		if reason, ok := r.detectHeadChangeRequired(ctx, input, checkpoint); ok {

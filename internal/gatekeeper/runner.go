@@ -61,6 +61,7 @@ const (
 	ReasonReviewRequired            ReasonCode = "required_review_missing"
 	ReasonReviewChangesRequested    ReasonCode = "review_changes_requested"
 	ReasonCodexReviewMissing        ReasonCode = "codex_review_missing"
+	ReasonCodexReviewInProgress     ReasonCode = "codex_review_in_progress"
 	ReasonCodexBlockingFindings     ReasonCode = "codex_blocking_findings"
 	ReasonCodexReviewOutcomeUnknown ReasonCode = "codex_review_outcome_unknown"
 	ReasonUnresolvedReviewThread    ReasonCode = "unresolved_review_thread"
@@ -91,6 +92,9 @@ type CodexReviewEvidence struct {
 	Event            string `json:"event,omitempty"`
 	Outcome          string `json:"outcome,omitempty"`
 	OutcomeKnown     bool   `json:"outcomeKnown"`
+	InProgress       bool   `json:"inProgress"`
+	StartedAt        string `json:"startedAt,omitempty"`
+	ExecutionID      string `json:"executionId,omitempty"`
 	RecordedAt       string `json:"recordedAt,omitempty"`
 	CurrentHeadValid bool   `json:"currentHeadValid"`
 }
@@ -331,7 +335,9 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 		return r.persistProviderBlock(ctx, report, ReasonProviderStateUnavailable, "codex_review")
 	}
 	report.Evidence.CodexReview = &codexReview
-	if !codexReview.CurrentHeadValid {
+	if codexReview.InProgress {
+		report.Reasons = append(report.Reasons, Reason{Code: ReasonCodexReviewInProgress, Subject: codexReviewInProgressReasonSubject(codexReview)})
+	} else if !codexReview.CurrentHeadValid {
 		report.Reasons = append(report.Reasons, Reason{Code: ReasonCodexReviewMissing, Subject: codexReviewReasonSubject(codexReview)})
 	} else if !codexReview.OutcomeKnown {
 		report.Reasons = append(report.Reasons, Reason{Code: ReasonCodexReviewOutcomeUnknown, Subject: codexReviewOutcomeReasonSubject(codexReview)})

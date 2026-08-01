@@ -64,7 +64,7 @@ var checkReasonCodes = map[ReasonCode]struct{}{
 func reportAwaitsCurrentHeadReview(report Report) bool {
 	for _, reason := range report.Reasons {
 		switch reason.Code {
-		case ReasonCodexReviewMissing, ReasonCodexBlockingFindings, ReasonCodexReviewOutcomeUnknown:
+		case ReasonCodexReviewMissing, ReasonCodexReviewInProgress, ReasonCodexBlockingFindings, ReasonCodexReviewOutcomeUnknown:
 			return true
 		}
 	}
