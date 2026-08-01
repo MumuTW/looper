@@ -306,7 +306,7 @@ func validateCoreConfig(config Config, issues *[]ValidationIssue) {
 		validateAuditorRoleConfig(role, fmt.Sprintf("projects[%d].roles.auditor", i), issues)
 	}
 	for i, project := range config.Projects {
-		if project.Roles == nil || project.Roles.Gatekeeper == nil || (project.Roles.Gatekeeper.Trust == nil && project.Roles.Gatekeeper.DiffBudget == nil && project.Roles.Gatekeeper.ProtectedPaths == nil && project.Roles.Gatekeeper.RequiredReviewChangedLines == nil) {
+		if project.Roles == nil || (project.Roles.Gatekeeper == nil && project.Roles.Reviewer == nil) || (project.Roles.Gatekeeper != nil && project.Roles.Gatekeeper.Trust == nil && project.Roles.Gatekeeper.DiffBudget == nil && project.Roles.Gatekeeper.ProtectedPaths == nil && project.Roles.Gatekeeper.RequiredReviewChangedLines == nil) {
 			continue
 		}
 		roles := ProjectRoleConfigs(config, project.ID)
@@ -315,11 +315,13 @@ func validateCoreConfig(config Config, issues *[]ValidationIssue) {
 			reviewerAutoMerge = *project.Roles.Reviewer.AutoMerge.Enabled
 		}
 		role := config.Roles.Gatekeeper
-		mergeGatekeeperRoleConfig(&role, *project.Roles.Gatekeeper)
+		if project.Roles.Gatekeeper != nil {
+			mergeGatekeeperRoleConfig(&role, *project.Roles.Gatekeeper)
+			validatePartialGatekeeperDiffBudget(
+				project.Roles.Gatekeeper.DiffBudget,
+				fmt.Sprintf("projects[%d].roles.gatekeeper.diffBudget", i), issues)
+		}
 		validateGatekeeperRoleConfig(role, fmt.Sprintf("projects[%d].roles.gatekeeper", i), reviewerAutoMerge, issues)
-		validatePartialGatekeeperDiffBudget(
-			project.Roles.Gatekeeper.DiffBudget,
-			fmt.Sprintf("projects[%d].roles.gatekeeper.diffBudget", i), issues)
 	}
 	validateIntakeConfig(config, issues)
 	validateDaemonConfig(config.Daemon, issues)
@@ -741,6 +743,10 @@ func validateProtectedPathPatterns(patterns []string, pathPrefix string, issues 
 		// provider path never contains that segment and the accepted pattern
 		// silently matches nothing.
 		for _, segment := range strings.Split(normalized, "/") {
+			if segment == "" {
+				*issues = append(*issues, ValidationIssue{Path: itemPath, Message: "must not contain empty path segments or trailing separators"})
+				break
+			}
 			if segment == "." || segment == ".." {
 				*issues = append(*issues, ValidationIssue{Path: itemPath, Message: "must not contain \".\" or \"..\" path segments"})
 				break

@@ -2,7 +2,9 @@ package gatekeeper
 
 import (
 	"context"
+	"fmt"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 )
@@ -104,5 +106,19 @@ func TestEvaluatePullRequestProtectedPathGateKeepsBaseRaceBlocked(t *testing.T) 
 	}
 	if !hasReason(report, ReasonProtectedPathTouched) || !hasReason(report, ReasonBaseStale) {
 		t.Fatalf("report = %#v, want protected-path and base-race blockers", report)
+	}
+}
+
+func TestProtectedPathReasonSubjectIsBounded(t *testing.T) {
+	paths := make([]string, 0, 1000)
+	for index := range 1000 {
+		paths = append(paths, "internal/generated/"+strings.Repeat("x", 8)+fmt.Sprint(index)+".go")
+	}
+	subject := protectedPathReasonSubject(paths)
+	if len(subject) > maxProtectedPathReasonSubject {
+		t.Fatalf("subject length = %d, want <= %d", len(subject), maxProtectedPathReasonSubject)
+	}
+	if !strings.Contains(subject, "more") {
+		t.Fatalf("subject = %q, want omitted-path summary", subject)
 	}
 }

@@ -28,9 +28,10 @@ import (
 const javaScriptISOStringLayout = "2006-01-02T15:04:05.000Z"
 
 const (
-	defaultGhCommandTimeout = 60 * time.Second
-	prListGhCommandTimeout  = 15 * time.Second
-	prDiffGhCommandTimeout  = 180 * time.Second
+	defaultGhCommandTimeout   = 60 * time.Second
+	prListGhCommandTimeout    = 15 * time.Second
+	prDiffGhCommandTimeout    = 180 * time.Second
+	protectedPathCaptureLimit = 16 * 1024 * 1024
 )
 
 var (
@@ -1944,7 +1945,7 @@ func (g *Gateway) ViewPullRequestForGatekeeper(ctx context.Context, input ViewPu
 	// could mark the report eligible and merge it. Compare the fetched entry
 	// count with the PR's total changedFiles count and fail closed when they
 	// differ rather than trusting an incomplete authority.
-	if detail.ChangedFilesCount > 0 && fetchedCount != detail.ChangedFilesCount {
+	if fetchedCount != detail.ChangedFilesCount {
 		return PullRequestDetail{}, fmt.Errorf("pull request %d changed-file list incomplete: fetched %d of %d files", input.PRNumber, fetchedCount, detail.ChangedFilesCount)
 	}
 	// The file-list endpoint carries no head SHA, so a force-push between the
@@ -1991,7 +1992,7 @@ func (g *Gateway) listPullRequestFilePaths(ctx context.Context, input ViewPullRe
 	if hostname != "" {
 		args = append(args, "--hostname", hostname)
 	}
-	result, err := g.runGh(ctx, input.CWD, "", args...)
+	result, err := g.runGhWithTimeoutAndCaptureLimit(ctx, input.CWD, "", defaultGhCommandTimeout, protectedPathCaptureLimit, args...)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -4320,7 +4321,11 @@ func mergeIntoProcessEnv(overrides map[string]string) map[string]string {
 }
 
 func (g *Gateway) runGhWithTimeout(ctx context.Context, cwd, stdin string, timeout time.Duration, args ...string) (shell.Result, error) {
-	result, err := g.ghRun(ctx, shell.Options{Command: g.ghPath, Args: args, CWD: valueOr(strings.TrimSpace(cwd), g.cwd), Env: g.ghEnv, Stdin: stdin, Timeout: timeout})
+	return g.runGhWithTimeoutAndCaptureLimit(ctx, cwd, stdin, timeout, 0, args...)
+}
+
+func (g *Gateway) runGhWithTimeoutAndCaptureLimit(ctx context.Context, cwd, stdin string, timeout time.Duration, maxCapturedBytes int, args ...string) (shell.Result, error) {
+	result, err := g.ghRun(ctx, shell.Options{Command: g.ghPath, Args: args, CWD: valueOr(strings.TrimSpace(cwd), g.cwd), Env: g.ghEnv, Stdin: stdin, Timeout: timeout, MaxCapturedBytes: maxCapturedBytes})
 	if result.StdoutTruncated || result.StderrTruncated {
 		streams := make([]string, 0, 2)
 		if result.StdoutTruncated {

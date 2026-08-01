@@ -172,7 +172,6 @@ func TestDiscoverPullRequestsReevaluatesWhenTheListPageChanges(t *testing.T) {
 		{name: "draft", mutate: func(p *githubinfra.PullRequestSummary) { p.IsDraft = true }},
 		{name: "conflicts", mutate: func(p *githubinfra.PullRequestSummary) { p.HasConflicts = true }},
 		{name: "base branch", mutate: func(p *githubinfra.PullRequestSummary) { p.BaseRefName = "release" }},
-		{name: "base sha", mutate: func(p *githubinfra.PullRequestSummary) { p.BaseSHA = "base-2" }},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			fixture := newGatekeeperFixture(t)

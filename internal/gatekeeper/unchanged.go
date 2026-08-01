@@ -60,7 +60,6 @@ func sourceFingerprint(pullRequest githubinfra.PullRequestSummary, budgetEnabled
 	encodedPaths, _ := json.Marshal(paths)
 	fields := []string{
 		pullRequest.HeadSHA,
-		pullRequest.BaseSHA,
 		pullRequest.UpdatedAt,
 		pullRequest.State,
 		pullRequest.ReviewDecision,

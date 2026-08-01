@@ -568,6 +568,9 @@ func TestGatewayGatekeeperFailsClosedOnFileCap(t *testing.T) {
 		case strings.HasPrefix(args, "pr view 42 --repo acme/looper --json "):
 			return shell.Result{Stdout: `{"number":42,"state":"OPEN","isDraft":false,"headRefName":"feature","baseRefName":"main","headRefOid":"head-1","baseRefOid":"base-1","changedFiles":3500}`}, nil
 		case strings.HasPrefix(args, "api --paginate repos/acme/looper/pulls/42/files?per_page=100 --jq "):
+			if options.MaxCapturedBytes < protectedPathCaptureLimit {
+				t.Fatalf("MaxCapturedBytes = %d, want at least %d", options.MaxCapturedBytes, protectedPathCaptureLimit)
+			}
 			var b strings.Builder
 			for i := 0; i < 3000; i++ {
 				if i > 0 {

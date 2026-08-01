@@ -1,9 +1,12 @@
 package gatekeeper
 
 import (
+	"fmt"
 	"path"
 	"strings"
 )
+
+const maxProtectedPathReasonSubject = 2048
 
 // matchedProtectedPaths returns changed paths that match at least one
 // repository-relative protected glob. It preserves the provider's path order
@@ -47,22 +50,48 @@ func protectedPathMatch(pattern, changed string) bool {
 }
 
 func protectedPathSegments(pattern, changed []string) bool {
-	if len(pattern) == 0 {
-		return len(changed) == 0
-	}
-	if pattern[0] == "**" {
-		if protectedPathSegments(pattern[1:], changed) {
-			return true
+	type state struct{ pattern, changed int }
+	memo := make(map[state]bool)
+	seen := make(map[state]bool)
+	var match func(int, int) bool
+	match = func(patternIndex, changedIndex int) bool {
+		key := state{pattern: patternIndex, changed: changedIndex}
+		if seen[key] {
+			return memo[key]
 		}
-		return len(changed) > 0 && protectedPathSegments(pattern, changed[1:])
+		seen[key] = true
+		var result bool
+		switch {
+		case patternIndex == len(pattern):
+			result = changedIndex == len(changed)
+		case pattern[patternIndex] == "**":
+			result = match(patternIndex+1, changedIndex) || (changedIndex < len(changed) && match(patternIndex, changedIndex+1))
+		case changedIndex < len(changed):
+			matched, _ := path.Match(pattern[patternIndex], changed[changedIndex])
+			result = matched && match(patternIndex+1, changedIndex+1)
+		}
+		memo[key] = result
+		return result
 	}
-	if len(changed) == 0 {
-		return false
+	return match(0, 0)
+}
+
+func protectedPathReasonSubject(paths []string) string {
+	if len(paths) == 0 {
+		return ""
 	}
-	if ok, _ := path.Match(pattern[0], changed[0]); !ok {
-		return false
+	full := strings.Join(paths, ", ")
+	if len(full) <= maxProtectedPathReasonSubject {
+		return full
 	}
-	return protectedPathSegments(pattern[1:], changed[1:])
+	for included := len(paths); included > 0; included-- {
+		suffix := fmt.Sprintf(" … (+%d more)", len(paths)-included)
+		prefix := strings.Join(paths[:included], ", ")
+		if len(prefix)+len(suffix) <= maxProtectedPathReasonSubject {
+			return prefix + suffix
+		}
+	}
+	return fmt.Sprintf("%d protected paths", len(paths))
 }
 
 func normalizeRepositoryPath(value string) string {

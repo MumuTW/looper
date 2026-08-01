@@ -702,6 +702,8 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 	input.Repo = strings.TrimSpace(input.Repo)
 	input.ExpectedHeadSHA = strings.TrimSpace(input.ExpectedHeadSHA)
 	input.ExpectedBaseSHA = strings.TrimSpace(input.ExpectedBaseSHA)
+	diffBudget := r.diffBudget(input.ProjectID)
+	budgetEnabled := diffBudget.MaxChangedFiles > 0 || diffBudget.MaxDeletions > 0
 	if strings.TrimSpace(input.ProjectID) == "" || input.Repo == "" || input.PRNumber <= 0 {
 		return Report{}, fmt.Errorf("gatekeeper project, repository, and pull request number are required")
 	}
@@ -751,7 +753,7 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 		report.Reasons = []Reason{{Code: ReasonBaseStale}}
 		return r.persist(ctx, report)
 	}
-	if detail.Number != input.PRNumber || report.ObservedHeadSHA == "" || report.Evidence.BaseRefName == "" || report.Evidence.BaseSHA == "" {
+	if detail.Number != input.PRNumber || report.ObservedHeadSHA == "" || report.Evidence.BaseRefName == "" {
 		return r.persistProviderBlock(ctx, report, ReasonProviderStateAmbiguous, "pull_request")
 	}
 	codexReview, err := latestCodexReviewForHead(ctx, r.repos, input.ProjectID, input.Repo, input.PRNumber, report.ObservedHeadSHA)
@@ -788,7 +790,7 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 
 	if protectedPaths := matchedProtectedPaths(detail.ChangedFiles, r.protectedPaths(input.ProjectID)); len(protectedPaths) > 0 {
 		report.Evidence.ProtectedPaths = protectedPaths
-		report.Reasons = append(report.Reasons, Reason{Code: ReasonProtectedPathTouched, Subject: strings.Join(protectedPaths, ", ")})
+		report.Reasons = append(report.Reasons, Reason{Code: ReasonProtectedPathTouched, Subject: protectedPathReasonSubject(protectedPaths)})
 	}
 
 	if report.Evidence.PullRequestState != "OPEN" {
@@ -814,14 +816,8 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 	if err != nil {
 		return r.persistProviderBlock(ctx, report, ReasonProviderStateUnavailable, "mergeability")
 	}
-	if strings.TrimSpace(mergeability.HeadSHA) != report.ObservedHeadSHA || strings.TrimSpace(mergeability.BaseSHA) != report.Evidence.BaseSHA {
-		report.Reasons = []Reason{}
-		if strings.TrimSpace(mergeability.HeadSHA) != report.ObservedHeadSHA {
-			report.Reasons = append(report.Reasons, Reason{Code: ReasonHeadStale})
-		}
-		if strings.TrimSpace(mergeability.BaseSHA) != report.Evidence.BaseSHA {
-			report.Reasons = append(report.Reasons, Reason{Code: ReasonBaseStale})
-		}
+	if strings.TrimSpace(mergeability.HeadSHA) != report.ObservedHeadSHA {
+		report.Reasons = []Reason{{Code: ReasonHeadStale}}
 		report.Evidence.FinalObservedHeadSHA = strings.TrimSpace(mergeability.HeadSHA)
 		report.Evidence.FinalObservedBaseSHA = strings.TrimSpace(mergeability.BaseSHA)
 		return r.persist(ctx, report)
@@ -897,8 +893,6 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 	// before accepting the budget verdict; fail closed when those stats are
 	// unavailable. diffBudgetBaseSHA records the base the accepted counts were
 	// observed against so the final revalidation can detect a later advance.
-	diffBudget := r.diffBudget(input.ProjectID)
-	budgetEnabled := diffBudget.MaxChangedFiles > 0 || diffBudget.MaxDeletions > 0
 	diffBudgetBaseSHA := ""
 	if budgetEnabled {
 		stats := detail.DiffStats
@@ -1048,10 +1042,6 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 	if err != nil {
 		return r.persistProviderBlock(ctx, report, ReasonProviderStateUnavailable, "head_revalidation")
 	}
-	finalBase, err := r.github.GetPullRequestBaseSHA(ctx, viewInput)
-	if err != nil {
-		return r.persistProviderBlock(ctx, report, ReasonProviderStateUnavailable, "base_revalidation")
-	}
 	report.Evidence.FinalObservedHeadSHA = strings.TrimSpace(finalHead)
 	report.Evidence.FinalObservedBaseSHA = strings.TrimSpace(finalBase)
 	if report.Evidence.FinalObservedHeadSHA == "" {
@@ -1079,7 +1069,7 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 	if reviewPolicyEnabled && strings.TrimSpace(finalBase) != reviewCapacityBaseSHA {
 		return r.persistProviderBlock(ctx, report, ReasonProviderStateAmbiguous, "review_capacity_base")
 	}
-	if report.Evidence.FinalObservedBaseSHA != report.Evidence.BaseSHA {
+	if !budgetEnabled && len(r.protectedPaths(input.ProjectID)) > 0 && report.Evidence.FinalObservedBaseSHA != "" && report.Evidence.BaseSHA != "" && report.Evidence.FinalObservedBaseSHA != report.Evidence.BaseSHA {
 		report.Reasons = append(report.Reasons, Reason{Code: ReasonBaseStale})
 	}
 	return r.persist(ctx, report)

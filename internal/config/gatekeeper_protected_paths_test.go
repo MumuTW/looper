@@ -103,3 +103,32 @@ func TestGatekeeperProtectedPathsAllowReviewerAutoMergeWithoutPolicy(t *testing.
 		}
 	}
 }
+
+func TestGatekeeperInheritedProtectedPathsRejectProjectReviewerAutoMerge(t *testing.T) {
+	auto := GatekeeperTrustAuto
+	enabled := true
+	cfg := Config{
+		Roles: RoleConfigs{Gatekeeper: GatekeeperRoleConfig{Trust: auto, ProtectedPaths: []string{"internal/**"}}},
+		Projects: []ProjectRefConfig{{
+			ID:    "looper",
+			Roles: &PartialRoleConfigs{Reviewer: &PartialReviewerRoleConfig{AutoMerge: &PartialReviewerAutoMergeConfig{Enabled: &enabled}}},
+		}},
+	}
+
+	var issues []ValidationIssue
+	validateCoreConfig(cfg, &issues)
+	for _, issue := range issues {
+		if issue.Path == "projects[0].roles.gatekeeper.protectedPaths" {
+			return
+		}
+	}
+	t.Fatalf("issues = %#v, want inherited protected-path merge-authority conflict", issues)
+}
+
+func TestGatekeeperProtectedPathsRejectEmptySegments(t *testing.T) {
+	issues := []ValidationIssue{}
+	validateGatekeeperRoleConfig(GatekeeperRoleConfig{ProtectedPaths: []string{"internal/migrations/", "internal//generated/**"}}, "roles.gatekeeper", false, &issues)
+	if len(issues) != 2 {
+		t.Fatalf("issues = %#v, want one issue per empty-segment pattern", issues)
+	}
+}

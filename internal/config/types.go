@@ -911,7 +911,7 @@ type GatekeeperRoleConfig struct {
 // authoritative and is deliberately not built here.
 type GatekeeperDiffBudget struct {
 	MaxChangedFiles int `json:"maxChangedFiles"`
-	MaxDeletions    int `json:"maxDeletions"
+	MaxDeletions    int `json:"maxDeletions"`
 }
 
 // AuditorRoleConfig configures the opt-in Post-merge Auditor. It remains
