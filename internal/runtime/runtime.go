@@ -677,21 +677,26 @@ func (r *Runtime) BeginDrain(reason string) error {
 	if r == nil || r.admission == nil {
 		return ErrAdmissionNotReady
 	}
+	// Publish join visibility before exposing draining so a concurrent poll/Stop
+	// never sees admission=draining with WorkProducersActive=0 while producers
+	// are still live. Join start is process-lifetime single-shot under mu.
+	startJoin := false
+	r.mu.Lock()
+	if !r.workProducerJoinStarted {
+		r.workProducerJoinStarted = true
+		r.workProducerJoinDone = make(chan struct{})
+		startJoin = true
+	}
+	r.mu.Unlock()
+	if startJoin {
+		r.workProducerJoinActive.Store(true)
+	}
 	if err := r.admission.BeginDrain(reason); err != nil {
 		return err
 	}
-	// Process-lifetime single shot under mu: publish Started and Done together
-	// so Stop cannot observe started=true with a nil channel.
-	r.mu.Lock()
-	if r.workProducerJoinStarted {
-		r.mu.Unlock()
-		return nil
+	if startJoin {
+		go r.joinWorkProducersForDrain()
 	}
-	r.workProducerJoinStarted = true
-	r.workProducerJoinDone = make(chan struct{})
-	r.mu.Unlock()
-	r.workProducerJoinActive.Store(true)
-	go r.joinWorkProducersForDrain()
 	return nil
 }
 
@@ -853,6 +858,27 @@ func (r *Runtime) BeginAdmittedMutation() func() {
 	}
 	r.admittedHTTPMutations.Add(1)
 	return func() { r.admittedHTTPMutations.Add(-1) }
+}
+
+// BeginAdmittedMutationIfAllowed checks AllowMutations and increments the
+// admitted-mutation lease under one admission critical section so drain cannot
+// observe a gap between the gate and the counter.
+func (r *Runtime) BeginAdmittedMutationIfAllowed() (func(), error) {
+	if r == nil || r.admission == nil {
+		return nil, ErrAdmissionStopping
+	}
+	var release func()
+	err := r.admission.WithAllowWork(func() {
+		r.admittedHTTPMutations.Add(1)
+		release = func() { r.admittedHTTPMutations.Add(-1) }
+	})
+	if err != nil {
+		return nil, err
+	}
+	if release == nil {
+		release = func() {}
+	}
+	return release, nil
 }
 
 // channelStillOpen reports whether a done channel has not yet been closed.

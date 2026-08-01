@@ -300,21 +300,23 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	// (pre-cutover) or once drain has completed (final quiescent backup), not
 	// during starting/degraded recovery.
 	if isMutatingHTTPMethod(r.Method) && path == apiBasePath+"/upgrade/backup" {
-		if typed, denied := h.upgradeBackupMutationDenial(); denied {
+		release, denied, typed := h.beginTrackedAdmittedMutationForBackup()
+		if denied {
 			h.writeError(w, requestID, typed)
 			return
 		}
-		// Backup is a mutation for drain purposes once admitted.
-		if release := h.beginAdmittedMutation(); release != nil {
+		if release != nil {
 			defer release()
 		}
 	} else if isMutatingHTTPMethod(r.Method) && !isAdmissionExemptMutationPath(path) && path != apiBasePath+"/hitl/feishu" {
-		if typed, denied := h.admissionMutationDenial(); denied {
+		// AllowMutations + mutation lease under one runtime boundary so drain
+		// cannot observe empty admitted mutations between the two steps.
+		release, denied, typed := h.beginTrackedAdmittedMutation()
+		if denied {
 			h.writeError(w, requestID, typed)
 			return
 		}
-		// Track until the handler returns so drain waits for in-flight commits.
-		if release := h.beginAdmittedMutation(); release != nil {
+		if release != nil {
 			defer release()
 		}
 	}
@@ -835,15 +837,50 @@ func (h *Handler) upgradeBackupMutationDenial() (apiError, bool) {
 	}
 }
 
-func (h *Handler) beginAdmittedMutation() func() {
+func (h *Handler) beginTrackedAdmittedMutation() (release func(), denied bool, typed apiError) {
 	if h == nil || h.context.Runtime == nil {
-		return nil
+		return nil, false, apiError{}
 	}
-	tracker, ok := any(h.context.Runtime).(interface{ BeginAdmittedMutation() func() })
-	if !ok {
-		return nil
+	if tracker, ok := any(h.context.Runtime).(interface {
+		BeginAdmittedMutationIfAllowed() (func(), error)
+	}); ok {
+		rel, err := tracker.BeginAdmittedMutationIfAllowed()
+		if err != nil {
+			return nil, true, admissionDenialAPIError(err)
+		}
+		return rel, false, apiError{}
 	}
-	return tracker.BeginAdmittedMutation()
+	// Fallback: separate allow then track (older embeds).
+	if typed, denied := h.admissionMutationDenial(); denied {
+		return nil, true, typed
+	}
+	if tracker, ok := any(h.context.Runtime).(interface{ BeginAdmittedMutation() func() }); ok {
+		return tracker.BeginAdmittedMutation(), false, apiError{}
+	}
+	return nil, false, apiError{}
+}
+
+func (h *Handler) beginTrackedAdmittedMutationForBackup() (release func(), denied bool, typed apiError) {
+	// Backup has its own ready-or-drained gate; once allowed, still hold a lease.
+	if typed, denied := h.upgradeBackupMutationDenial(); denied {
+		return nil, true, typed
+	}
+	if h == nil || h.context.Runtime == nil {
+		return nil, false, apiError{}
+	}
+	if tracker, ok := any(h.context.Runtime).(interface{ BeginAdmittedMutation() func() }); ok {
+		return tracker.BeginAdmittedMutation(), false, apiError{}
+	}
+	return nil, false, apiError{}
+}
+
+func admissionDenialAPIError(err error) apiError {
+	// Match admissionMutationDenial mapping for service-unavailable gates.
+	return apiError{
+		code:    pkgapi.ErrorCodeServiceUnavailable,
+		status:  http.StatusServiceUnavailable,
+		message: err.Error(),
+	}
 }
 
 func (h *Handler) admissionMutationDenial() (apiError, bool) {
@@ -6220,10 +6257,15 @@ func (h *Handler) handleFeishuCardActionRoute(w http.ResponseWriter, r *http.Req
 		_ = json.NewEncoder(w).Encode(map[string]string{"challenge": envelope.Challenge})
 		return
 	}
-	// Real card actions and thread replies mutate HITL state; require admission.
-	if typed, denied := h.admissionMutationDenial(); denied {
+	// Real card actions and thread replies mutate HITL state; require admission
+	// and hold a drain lease through handler completion.
+	release, denied, typed := h.beginTrackedAdmittedMutation()
+	if denied {
 		h.writeError(w, requestID, typed)
 		return
+	}
+	if release != nil {
+		defer release()
 	}
 	if !h.context.Config.HITL.Enabled {
 		h.writeError(w, requestID, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusForbidden, message: "hitl.enabled is false"})

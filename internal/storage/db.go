@@ -91,11 +91,26 @@ func resolveOpenedDatabasePath(dbPath string) (string, error) {
 		return "", fmt.Errorf("resolve database path: %w", err)
 	}
 	abs = filepath.Clean(abs)
-	if info, err := os.Lstat(abs); err == nil && info.Mode()&os.ModeSymlink != 0 {
-		return "", fmt.Errorf("database path %s is a leaf symlink; open the real file path so restore metadata cannot diverge", abs)
+	if info, err := os.Lstat(abs); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			return "", fmt.Errorf("database path %s is a leaf symlink; open the real file path so restore metadata cannot diverge", abs)
+		}
+		if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+			return filepath.Clean(resolved), nil
+		}
+		return abs, nil
+	} else if !os.IsNotExist(err) {
+		return "", fmt.Errorf("stat database path: %w", err)
 	}
-	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
-		return filepath.Clean(resolved), nil
+	// Leaf does not exist yet (first start). Resolve existing parents so a
+	// retarget of e.g. .../current/ cannot rename the eventual open inode.
+	parent := filepath.Dir(abs)
+	base := filepath.Base(abs)
+	if parent == "" || parent == "." {
+		return abs, nil
+	}
+	if resolvedParent, err := filepath.EvalSymlinks(parent); err == nil {
+		return filepath.Join(filepath.Clean(resolvedParent), base), nil
 	}
 	return abs, nil
 }
