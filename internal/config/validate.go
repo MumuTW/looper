@@ -704,6 +704,16 @@ func validateGatekeeperRoleConfig(gatekeeper GatekeeperRoleConfig, path string, 
 	if gatekeeper.RequiredReviewChangedLines < 0 {
 		*issues = append(*issues, ValidationIssue{Path: path + ".requiredReviewChangedLines", Message: "must be zero (to disable the threshold) or a positive integer"})
 	}
+	// Reviewer's merge authority never consults the protected-path report, so a
+	// matching pull request could be auto-merged despite the documented
+	// requirement for human review. Reject Reviewer auto-merge whenever an
+	// effective protected-path policy exists, regardless of Gatekeeper trust.
+	if reviewerAutoMerge && len(gatekeeper.ProtectedPaths) > 0 {
+		*issues = append(*issues, ValidationIssue{
+			Path:    path + ".protectedPaths",
+			Message: "cannot be combined with roles.reviewer.autoMerge.enabled: Reviewer's merge path does not consult the protected-path report, so disable Reviewer auto-merge or remove the protected paths",
+		})
+	}
 	validateProtectedPathPatterns(gatekeeper.ProtectedPaths, path+".protectedPaths", issues)
 }
 
@@ -725,6 +735,16 @@ func validateProtectedPathPatterns(patterns []string, pathPrefix string, issues 
 		}
 		if cleaned == "." || cleaned == "" {
 			*issues = append(*issues, ValidationIssue{Path: itemPath, Message: "must contain a usable repository-relative path"})
+		}
+		// Reject any "." or ".." path component. path.Clean collapses them
+		// (foo/../bar -> bar), but matching uses the uncleaned pattern, so a
+		// provider path never contains that segment and the accepted pattern
+		// silently matches nothing.
+		for _, segment := range strings.Split(normalized, "/") {
+			if segment == "." || segment == ".." {
+				*issues = append(*issues, ValidationIssue{Path: itemPath, Message: "must not contain \".\" or \"..\" path segments"})
+				break
+			}
 		}
 		if _, err := path.Match(normalized, "example/path.go"); err != nil {
 			*issues = append(*issues, ValidationIssue{Path: itemPath, Message: "must be a valid glob"})

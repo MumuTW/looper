@@ -180,6 +180,10 @@ type PullRequestDetail struct {
 	Checks             []map[string]any
 	DiffStats          *PullRequestDiffStats `json:"diffStats,omitempty"`
 	ChangedFiles       []string
+	// ChangedFilesCount is the provider's total changed-file count for the pull
+	// request, independent of any paginated file-list ceiling. Gatekeeper uses
+	// it to detect when the REST file-list endpoint omitted files past its cap.
+	ChangedFilesCount int
 	Mergeable          *bool
 	MergeableState     MergeabilityState
 	MergedAt           string
@@ -749,6 +753,10 @@ type ViewPullRequestInput struct {
 	Repo     string
 	PRNumber int64
 	CWD      string
+	// ProtectedPaths is the effective protected-path policy for the requesting
+	// project. The gatekeeper file-list read is only performed when it is
+	// non-empty, so projects without protected paths never pay for it.
+	ProtectedPaths []string
 }
 
 type ResolveReviewThreadInput struct {
@@ -1917,13 +1925,41 @@ func (g *Gateway) ViewPullRequestForGatekeeper(ctx context.Context, input ViewPu
 			return PullRequestDetail{}, err
 		}
 	}
+	// Enumerate changed files only when an effective protected-path policy
+	// exists. With no patterns to apply the paginated file-list request is pure
+	// overhead, and a transient failure of that endpoint would otherwise block
+	// an otherwise provider-state-only evaluation.
+	if len(input.ProtectedPaths) == 0 {
+		return detail, nil
+	}
 	// `gh pr view --json files` is backed by a first-page GraphQL connection.
 	// Gatekeeper must never treat that bounded projection as complete: a
 	// protected file after the first page would otherwise be silently missed.
-	detail.ChangedFiles, err = g.listPullRequestFilePaths(ctx, input)
+	paths, fetchedCount, err := g.listPullRequestFilePaths(ctx, input)
 	if err != nil {
 		return PullRequestDetail{}, err
 	}
+	// The REST pulls/{n}/files endpoint returns at most 3,000 files even with
+	// --paginate. A protected file beyond that cap is omitted, so Gatekeeper
+	// could mark the report eligible and merge it. Compare the fetched entry
+	// count with the PR's total changedFiles count and fail closed when they
+	// differ rather than trusting an incomplete authority.
+	if detail.ChangedFilesCount > 0 && fetchedCount != detail.ChangedFilesCount {
+		return PullRequestDetail{}, fmt.Errorf("pull request %d changed-file list incomplete: fetched %d of %d files", input.PRNumber, fetchedCount, detail.ChangedFilesCount)
+	}
+	// The file-list endpoint carries no head SHA, so a force-push between the
+	// metadata read and this request can enumerate files from a different head
+	// while every later comparison still uses the metadata head. Re-read the
+	// head and fail closed when it moved, binding the file evidence to the same
+	// head the rest of the detail was observed against.
+	observedHead, err := g.GetPullRequestHeadSHA(ctx, input)
+	if err != nil {
+		return PullRequestDetail{}, err
+	}
+	if strings.TrimSpace(observedHead) != strings.TrimSpace(detail.HeadSHA) {
+		return PullRequestDetail{}, fmt.Errorf("pull request %d head moved during changed-file enumeration: expected %s, got %s", input.PRNumber, detail.HeadSHA, observedHead)
+	}
+	detail.ChangedFiles = paths
 	return detail, nil
 }
 
@@ -1943,21 +1979,27 @@ func isUnsupportedClosingIssuesFieldError(err error) bool {
 	return false
 }
 
-func (g *Gateway) listPullRequestFilePaths(ctx context.Context, input ViewPullRequestInput) ([]string, error) {
+func (g *Gateway) listPullRequestFilePaths(ctx context.Context, input ViewPullRequestInput) ([]string, int, error) {
 	hostname, repo := splitRepoHostname(input.Repo)
-	args := []string{"api", "--paginate", "--slurp", fmt.Sprintf("repos/%s/pulls/%d/files?per_page=100", repo, input.PRNumber), "-H", "Accept: application/vnd.github+json"}
+	// Project each page down to only the current and previous filenames before
+	// it reaches the bounded shell capture buffer. The full REST file objects
+	// include per-file patch text, so a moderately large diff would otherwise
+	// exceed the 256 KiB stdout cap and surface as a provider-state failure
+	// even when the filename list itself is small.
+	filter := `.[] | {filename, previous_filename}`
+	args := []string{"api", "--paginate", fmt.Sprintf("repos/%s/pulls/%d/files?per_page=100", repo, input.PRNumber), "--jq", filter, "-H", "Accept: application/vnd.github+json"}
 	if hostname != "" {
 		args = append(args, "--hostname", hostname)
 	}
 	result, err := g.runGh(ctx, input.CWD, "", args...)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	pages, err := decodeJSONArrayOrPages(result.Stdout)
+	rows, err := decodeJSONObjects(result.Stdout)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	return extractPullRequestFilePaths(pages), nil
+	return extractPullRequestFilePaths(rows), len(rows), nil
 }
 
 func (g *Gateway) viewPullRequestWithFields(ctx context.Context, input ViewPullRequestInput, fields []string, includeReviewThreads bool, includeIssueComments bool) (PullRequestDetail, error) {
@@ -2020,6 +2062,7 @@ func pullRequestDetailFromViewRow(row map[string]any, threads []map[string]any, 
 		Checks:             toObjectSlice(row["statusCheckRollup"]),
 		DiffStats:          pullRequestDiffStatsFromRow(row),
 		ChangedFiles:       extractPullRequestFilePaths(row["files"]),
+		ChangedFilesCount:  int(asInt64(row["changedFiles"])),
 		Mergeable:          boolPtrFromValue(row["mergeable"]),
 		MergeableState:     ParseMergeabilityState(firstNonEmpty(asString(row["mergeable_state"]), asString(row["mergeStateStatus"]))),
 		MergedAt:           firstNonEmpty(asString(row["mergedAt"]), asString(row["merged_at"])),

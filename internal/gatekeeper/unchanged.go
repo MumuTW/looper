@@ -52,6 +52,12 @@ func sourceFingerprint(pullRequest githubinfra.PullRequestSummary, budgetEnabled
 		paths = append(paths, normalizeRepositoryPath(protectedPath))
 	}
 	sort.Strings(paths)
+	// JSON-encode the policy entries so a comma (or any delimiter) inside one
+	// entry cannot make two distinct policies collide. Joining with "," would
+	// make {"a,b","c"} and {"a","b,c"} produce the same fingerprint, so a
+	// reload between them could reuse a report whose protected-path result no
+	// longer matches for up to maxSkipAge.
+	encodedPaths, _ := json.Marshal(paths)
 	fields := []string{
 		pullRequest.HeadSHA,
 		pullRequest.BaseSHA,
@@ -62,7 +68,7 @@ func sourceFingerprint(pullRequest githubinfra.PullRequestSummary, budgetEnabled
 		fmt.Sprintf("%t", pullRequest.IsDraft),
 		fmt.Sprintf("%t", pullRequest.HasConflicts),
 		strings.Join(labels, ","),
-		strings.Join(paths, ","),
+		string(encodedPaths),
 	}
 	reviewPolicy := len(reviewPolicyEnabled) > 0 && reviewPolicyEnabled[0]
 	if budgetEnabled || reviewPolicy {

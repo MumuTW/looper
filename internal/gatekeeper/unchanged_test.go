@@ -313,7 +313,6 @@ func hasReason(report Report, code ReasonCode) bool {
 	}
 	return false
 }
-
 // With both budget bounds at their default of zero the gate is unlimited, so a
 // base-branch advance changes nothing Gatekeeper enforces. BaseSHA must not be
 // in the fingerprint then, or every base commit would invalidate the cached
@@ -486,5 +485,26 @@ func TestDiscoverPullRequestsSkipsBlockedConvergenceUntilReviewerAdvances(t *tes
 	third := discover(t, fixture)
 	if third.Evaluated != 1 || third.Skipped != 0 || !third.Reports[0].Eligible {
 		t.Fatalf("third discovery = %#v, want reevaluated eligible report after convergence advanced", third)
+	}
+}
+
+// A comma inside a protected-path entry must not let two distinct policies
+// collide into the same fingerprint, or a reload between them could reuse a
+// report whose protected-path result no longer matches.
+func TestSourceFingerprintDistinguishesCommaContainingPolicies(t *testing.T) {
+	pr := openPullRequestFixture()
+	first := sourceFingerprint(pr, false, []string{"a,b", "c"})
+	second := sourceFingerprint(pr, false, []string{"a", "b,c"})
+	if first == second {
+		t.Fatalf("fingerprints collided for {a,b},{c} vs {a},{b,c}: %q", first)
+	}
+}
+
+func TestSourceFingerprintIsStableForSamePolicy(t *testing.T) {
+	pr := openPullRequestFixture()
+	a := sourceFingerprint(pr, false, []string{"internal/gatekeeper/**", ".github/workflows/*"})
+	b := sourceFingerprint(pr, false, []string{".github/workflows/*", "internal/gatekeeper/**"})
+	if a != b {
+		t.Fatalf("fingerprints differ for the same policy in different order: %q vs %q", a, b)
 	}
 }

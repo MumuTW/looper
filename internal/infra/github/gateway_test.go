@@ -494,12 +494,52 @@ func TestGatewayGatekeeperReadsChangedFiles(t *testing.T) {
 		args := strings.Join(options.Args, " ")
 		switch {
 		case strings.HasPrefix(args, "pr view 42 --repo acme/looper --json "):
-			if strings.Contains(args, "files") {
+			if strings.Contains(args, " files") {
 				t.Fatalf("gatekeeper metadata fields = %q, want files fetched through paginated REST", args)
 			}
-			return shell.Result{Stdout: `{"number":42,"state":"OPEN","isDraft":false,"headRefName":"feature","baseRefName":"main","headRefOid":"head-1","baseRefOid":"base-1"}`}, nil
-		case strings.HasPrefix(args, "api --paginate --slurp repos/acme/looper/pulls/42/files?per_page=100"):
-			return shell.Result{Stdout: `[[{"filename":"./internal/gatekeeper/runner.go"},{"filename":"docs/README.md","previous_filename":"internal/gatekeeper/old.go"},{"filename":"internal/gatekeeper/runner.go"}]]`}, nil
+			return shell.Result{Stdout: `{"number":42,"state":"OPEN","isDraft":false,"headRefName":"feature","baseRefName":"main","headRefOid":"head-1","baseRefOid":"base-1","changedFiles":3}`}, nil
+		case strings.HasPrefix(args, "api --paginate repos/acme/looper/pulls/42/files?per_page=100 --jq "):
+			if strings.Contains(args, "--slurp") {
+				t.Fatalf("file command = %q, want page-wise projection without --slurp", args)
+			}
+			if !strings.Contains(args, "{filename, previous_filename}") {
+				t.Fatalf("file command = %q, want filename projection", args)
+			}
+			return shell.Result{Stdout: `{"filename":"./internal/gatekeeper/runner.go"}` + "\n" +
+				`{"filename":"docs/README.md","previous_filename":"internal/gatekeeper/old.go"}` + "\n" +
+				`{"filename":"internal/gatekeeper/runner.go"}` + "\n"}, nil
+		default:
+			t.Fatalf("unexpected gh args: %q", args)
+			return shell.Result{}, nil
+		}
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	detail, err := gateway.ViewPullRequestForGatekeeper(context.Background(), ViewPullRequestInput{Repo: "acme/looper", PRNumber: 42, ProtectedPaths: []string{"internal/gatekeeper/**"}})
+	if err != nil {
+		t.Fatalf("ViewPullRequestForGatekeeper() error = %v", err)
+	}
+	want := []string{"internal/gatekeeper/runner.go", "docs/README.md", "internal/gatekeeper/old.go"}
+	if !slices.Equal(detail.ChangedFiles, want) {
+		t.Fatalf("ChangedFiles = %#v, want %#v", detail.ChangedFiles, want)
+	}
+	if detail.ChangedFilesCount != 3 {
+		t.Fatalf("ChangedFilesCount = %d, want 3", detail.ChangedFilesCount)
+	}
+}
+
+func TestGatewayGatekeeperSkipsFileListWhenNoProtectedPaths(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	listCalled := false
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		switch {
+		case strings.HasPrefix(args, "pr view 42 --repo acme/looper --json "):
+			return shell.Result{Stdout: `{"number":42,"state":"OPEN","isDraft":false,"headRefName":"feature","baseRefName":"main","headRefOid":"head-1","baseRefOid":"base-1","changedFiles":0}`}, nil
+		case strings.Contains(args, "pulls/42/files"):
+			listCalled = true
+			return shell.Result{}, nil
 		default:
 			t.Fatalf("unexpected gh args: %q", args)
 			return shell.Result{}, nil
@@ -511,9 +551,66 @@ func TestGatewayGatekeeperReadsChangedFiles(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ViewPullRequestForGatekeeper() error = %v", err)
 	}
-	want := []string{"internal/gatekeeper/runner.go", "docs/README.md", "internal/gatekeeper/old.go"}
-	if !slices.Equal(detail.ChangedFiles, want) {
-		t.Fatalf("ChangedFiles = %#v, want %#v", detail.ChangedFiles, want)
+	if listCalled {
+		t.Fatalf("file-list endpoint was called with no protected-path policy")
+	}
+	if len(detail.ChangedFiles) != 0 {
+		t.Fatalf("ChangedFiles = %#v, want empty when no protected paths", detail.ChangedFiles)
+	}
+}
+
+func TestGatewayGatekeeperFailsClosedOnFileCap(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		switch {
+		case strings.HasPrefix(args, "pr view 42 --repo acme/looper --json "):
+			return shell.Result{Stdout: `{"number":42,"state":"OPEN","isDraft":false,"headRefName":"feature","baseRefName":"main","headRefOid":"head-1","baseRefOid":"base-1","changedFiles":3500}`}, nil
+		case strings.HasPrefix(args, "api --paginate repos/acme/looper/pulls/42/files?per_page=100 --jq "):
+			var b strings.Builder
+			for i := 0; i < 3000; i++ {
+				if i > 0 {
+					b.WriteString("\n")
+				}
+				fmt.Fprintf(&b, `{"filename":"file_%d.go"}`, i)
+			}
+			return shell.Result{Stdout: b.String()}, nil
+		default:
+			t.Fatalf("unexpected gh args: %q", args)
+			return shell.Result{}, nil
+		}
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	_, err := gateway.ViewPullRequestForGatekeeper(context.Background(), ViewPullRequestInput{Repo: "acme/looper", PRNumber: 42, ProtectedPaths: []string{"**"}})
+	if err == nil {
+		t.Fatalf("ViewPullRequestForGatekeeper() error = nil, want fail-closed on 3,000-file cap")
+	}
+}
+
+func TestGatewayGatekeeperFailsClosedOnHeadMoveDuringFileList(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		switch {
+		case args == "pr view 42 --repo acme/looper --json headRefOid":
+			return shell.Result{Stdout: `{"headRefOid":"head-2"}`}, nil
+		case strings.HasPrefix(args, "pr view 42 --repo acme/looper --json "):
+			return shell.Result{Stdout: `{"number":42,"state":"OPEN","isDraft":false,"headRefName":"feature","baseRefName":"main","headRefOid":"head-1","baseRefOid":"base-1","changedFiles":1}`}, nil
+		case strings.HasPrefix(args, "api --paginate repos/acme/looper/pulls/42/files?per_page=100 --jq "):
+			return shell.Result{Stdout: `{"filename":"internal/gatekeeper/runner.go"}` + "\n"}, nil
+		default:
+			t.Fatalf("unexpected gh args: %q", args)
+			return shell.Result{}, nil
+		}
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	_, err := gateway.ViewPullRequestForGatekeeper(context.Background(), ViewPullRequestInput{Repo: "acme/looper", PRNumber: 42, ProtectedPaths: []string{"**"}})
+	if err == nil {
+		t.Fatalf("ViewPullRequestForGatekeeper() error = nil, want fail-closed on head move during file enumeration")
 	}
 }
 

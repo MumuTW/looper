@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 )
 
@@ -54,6 +55,51 @@ func TestGatekeeperProtectedPathsRejectNoOpPatterns(t *testing.T) {
 		}
 		if !found {
 			t.Fatalf("issues = %#v, want no-op pattern validation at %s", issues, want)
+		}
+	}
+}
+
+func TestGatekeeperProtectedPathsRejectDotSegments(t *testing.T) {
+	issues := []ValidationIssue{}
+	validateGatekeeperRoleConfig(GatekeeperRoleConfig{ProtectedPaths: []string{"foo/../bar", "a/./b", "x/.."}}, "roles.gatekeeper", false, &issues)
+	for _, index := range []int{0, 1, 2} {
+		want := fmt.Sprintf("roles.gatekeeper.protectedPaths[%d]", index)
+		found := false
+		for _, issue := range issues {
+			if issue.Path == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("issues = %#v, want dot-segment rejection at %s", issues, want)
+		}
+	}
+}
+
+func TestGatekeeperProtectedPathsRejectReviewerAutoMerge(t *testing.T) {
+	for _, trust := range []GatekeeperTrustLevel{"", GatekeeperTrustObserve, GatekeeperTrustAdvise, GatekeeperTrustAuto} {
+		issues := []ValidationIssue{}
+		validateGatekeeperRoleConfig(GatekeeperRoleConfig{Trust: trust, ProtectedPaths: []string{"internal/gatekeeper/**"}}, "roles.gatekeeper", true, &issues)
+		found := false
+		for _, issue := range issues {
+			if issue.Path == "roles.gatekeeper.protectedPaths" && strings.Contains(issue.Message, "roles.reviewer.autoMerge.enabled") {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("trust=%q issues = %#v, want protectedPaths/reviewer auto-merge conflict", trust, issues)
+		}
+	}
+}
+
+func TestGatekeeperProtectedPathsAllowReviewerAutoMergeWithoutPolicy(t *testing.T) {
+	issues := []ValidationIssue{}
+	validateGatekeeperRoleConfig(GatekeeperRoleConfig{Trust: GatekeeperTrustAdvise, ProtectedPaths: nil}, "roles.gatekeeper", true, &issues)
+	for _, issue := range issues {
+		if issue.Path == "roles.gatekeeper.protectedPaths" {
+			t.Fatalf("issues = %#v, want no protectedPaths conflict when policy is empty", issues)
 		}
 	}
 }
