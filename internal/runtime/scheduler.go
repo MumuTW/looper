@@ -1963,6 +1963,13 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			escalator.RunnerOptions{Now: now, MaxItems: cfg.Roles.Escalator.MaxItems},
 		)
 	}
+	digestConfig := postmergedigest.ConfigFromRole(cfg.Roles.Coordinator.PostMergeDigest)
+	var postMergeDigest *postmergedigest.Service
+	if digestConfig.Enabled {
+		postMergeDigest = postmergedigest.New(postmergedigest.Options{
+			Repos: repos, Config: digestConfig, Now: now, Deliver: notificationGateway.Notify,
+		})
+	}
 	var gatekeeperRunner gatekeeperScheduler
 	if githubGateway != nil {
 		gatekeeperRunner = gatekeeper.New(gatekeeper.Options{

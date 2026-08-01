@@ -51,7 +51,7 @@ func (r *Runner) applyMergeWatch(ctx context.Context, projectID, repo, cwd strin
 			lock.Lock()
 			defer lock.Unlock()
 			r.applyMarkReady(ctx, repo, cwd, issue, currentLogin, markReadyDrafts, roles.Coordinator.Triage.TriagedLabel)
-			return r.applyMergeWatchLocked(ctx, repo, cwd, issue, roles, currentLogin, budget)
+			return r.applyMergeWatchLocked(ctx, projectID, repo, cwd, issue, roles, currentLogin, budget)
 		}()
 		if applyErr != nil {
 			return nil, applyErr

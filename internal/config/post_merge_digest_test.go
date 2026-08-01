@@ -41,6 +41,7 @@ func TestPostMergeDigestConfigRejectsInvalidScheduleTimezoneAndLimit(t *testing.
 		Triage:          CoordinatorTriageConfig{TriagedLabel: "triaged", MaxIssueAgeDays: 1, MaxPerTick: 1, Disposition: CoordinatorTriageDispositionConfig{OutOfScopeLabel: "wontfix", UnclearLabel: "needs-info"}},
 		Dispatch:        CoordinatorDispatchConfig{Mode: "human-gated", HumanGate: CoordinatorDispatchHumanGateConfig{SlashCommands: []string{"/plan"}}, Autonomous: CoordinatorDispatchAutonomousConfig{DelayMinutes: 1, HoldLabel: labels.HoldGlobal}},
 		MergeWatch:      CoordinatorMergeWatchConfig{TransientRetries: 1, MaxIndeterminateDuration: "1m"},
+		MarkReady:      CoordinatorMarkReadyConfig{Scope: CoordinatorMarkReadyScopeLooperOnly},
 		PostMergeDigest: &CoordinatorPostMergeDigestConfig{Enabled: true, Schedule: "25:99", Timezone: "Not/AZone", MaxItems: 0},
 	}, "roles.coordinator", &issues)
 	for _, want := range []string{"roles.coordinator.postMergeDigest.schedule", "roles.coordinator.postMergeDigest.timezone", "roles.coordinator.postMergeDigest.maxItems"} {
@@ -64,6 +65,7 @@ func TestPostMergeDigestConfigAllowsExplicitDisabledOptOut(t *testing.T) {
 		Triage:          CoordinatorTriageConfig{TriagedLabel: "triaged", MaxIssueAgeDays: 1, MaxPerTick: 1, Disposition: CoordinatorTriageDispositionConfig{OutOfScopeLabel: "wontfix", UnclearLabel: "needs-info"}},
 		Dispatch:        CoordinatorDispatchConfig{Mode: "human-gated", HumanGate: CoordinatorDispatchHumanGateConfig{SlashCommands: []string{"/plan"}}, Autonomous: CoordinatorDispatchAutonomousConfig{DelayMinutes: 1, HoldLabel: labels.HoldGlobal}},
 		MergeWatch:      CoordinatorMergeWatchConfig{TransientRetries: 1, MaxIndeterminateDuration: "1m"},
+		MarkReady:      CoordinatorMarkReadyConfig{Scope: CoordinatorMarkReadyScopeLooperOnly},
 		PostMergeDigest: &CoordinatorPostMergeDigestConfig{Enabled: false},
 	}, "roles.coordinator", &issues)
 	if len(issues) != 0 {

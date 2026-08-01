@@ -1157,6 +1157,9 @@ func validateProjectRoleOverrides(roles *PartialRoleConfigs, prefix string, maxI
 		if roles.Coordinator.MarkReady != nil {
 			validatePartialCoordinatorMarkReady(*roles.Coordinator.MarkReady, prefix+".coordinator.markReady", issues)
 		}
+		if roles.Coordinator.PostMergeDigest != nil {
+			*issues = append(*issues, ValidationIssue{Path: prefix + ".coordinator.postMergeDigest", Message: "post-merge digest is global-only; configure it under roles.coordinator.postMergeDigest"})
+		}
 	}
 }
 
@@ -1718,6 +1721,17 @@ func validateCoordinatorRoleConfig(config CoordinatorRoleConfig, path string, is
 	}
 	if config.MarkReady.Scope != CoordinatorMarkReadyScopeLooperOnly {
 		*issues = append(*issues, ValidationIssue{Path: path + ".markReady.scope", Message: fmt.Sprintf("must be %s", CoordinatorMarkReadyScopeLooperOnly)})
+	}
+	if config.PostMergeDigest != nil && config.PostMergeDigest.Enabled {
+		if _, err := time.Parse("15:04", config.PostMergeDigest.Schedule); err != nil {
+			*issues = append(*issues, ValidationIssue{Path: path + ".postMergeDigest.schedule", Message: "must be a valid time string (HH:MM)"})
+		}
+		if _, err := time.LoadLocation(config.PostMergeDigest.Timezone); err != nil {
+			*issues = append(*issues, ValidationIssue{Path: path + ".postMergeDigest.timezone", Message: "must be a valid IANA timezone string"})
+		}
+		if config.PostMergeDigest.MaxItems <= 0 {
+			*issues = append(*issues, ValidationIssue{Path: path + ".postMergeDigest.maxItems", Message: "must be a positive integer"})
+		}
 	}
 	validateDistinctLabels([]labelPathValue{
 		{Path: path + ".triage.triagedLabel", Value: config.Triage.TriagedLabel},

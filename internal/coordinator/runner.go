@@ -306,7 +306,7 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 		}
 	}
 
-	mergeWatchRetriggers, err := r.applyMergeWatch(ctx, input.Repo, project.RepoPath, loaded, projectRoles)
+	mergeWatchRetriggers, err := r.applyMergeWatch(ctx, input.ProjectID, input.Repo, project.RepoPath, loaded, projectRoles)
 	if err != nil {
 		return DiscoveryResult{}, err
 	}

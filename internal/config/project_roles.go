@@ -17,6 +17,10 @@ func ProjectRoleConfigs(cfg Config, projectID string) RoleConfigs {
 		cloned := *roles.Reviewer.Behavior.Convergence
 		roles.Reviewer.Behavior.Convergence = &cloned
 	}
+	if roles.Coordinator.PostMergeDigest != nil {
+		cloned := *roles.Coordinator.PostMergeDigest
+		roles.Coordinator.PostMergeDigest = &cloned
+	}
 	project := findConfiguredProject(cfg.Projects, projectID)
 	if project == nil {
 		return roles

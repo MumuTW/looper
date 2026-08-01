@@ -1,8 +1,0 @@
-{
-  "dismissals": [
-    {
-      "reviewer": "chatgpt-codex-connector",
-      "reason": "The ClosedAndRegenerated section intentionally consumes the explicit durable coordinator.close_and_regenerate / fixer.close_and_regenerate event contract (constants added in internal/eventlog/eventlog.go), with the event producers owned by the #462/#464 regeneration workflows as documented in the PR body. Emitting a producer here would duplicate that work and expand scope beyond issue #466 (the digest), so the request is declined per the PR's documented trade-off rather than implemented in this PR."
-    }
-  ]
-}
