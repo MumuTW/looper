@@ -2027,8 +2027,8 @@ func TestSchedulePendingRediscoveryAfterRunChargesRoundBudget(t *testing.T) {
 	if err != nil {
 		t.Fatalf("schedulePendingRediscoveryAfterRun() error = %v", err)
 	}
-	if scheduled {
-		t.Fatal("schedulePendingRediscoveryAfterRun() = true, want parked at the budget limit")
+	if !scheduled {
+		t.Fatal("schedulePendingRediscoveryAfterRun() = false, want true after parking so success finalizers skip")
 	}
 	persisted, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
 	if err != nil || persisted == nil {

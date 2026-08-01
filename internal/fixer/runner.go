@@ -2032,9 +2032,22 @@ func (r *Runner) discoverPullRequestFromDetail(ctx context.Context, project stor
 		// head is still running; resetting then lets findings it publishes later
 		// start from an empty budget and recreates the unbounded loop this gate
 		// stops.
+		//
+		// The discovery snapshot can also be stale: lastReviewedHeadSha may match
+		// while detail is a pre-publication view with zero items. Re-fetch live
+		// PR detail before clearing so a race cannot wipe the budget under new
+		// findings that arrived after the snapshot was taken.
 		if r.reviewerHasReviewedHead(ctx, project.ID, repo, detail.Number, detail.HeadSHA) {
-			if err := r.clearRoundBudgetForPullRequest(ctx, project.ID, repo, detail.Number); err != nil {
-				return err
+			live := detail
+			if r.github != nil {
+				if refreshed, viewErr := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: repo, PRNumber: detail.Number, CWD: project.RepoPath}); viewErr == nil {
+					live = refreshed
+				}
+			}
+			if len(collectFixItems(live)) == 0 {
+				if err := r.clearRoundBudgetForPullRequest(ctx, project.ID, repo, detail.Number); err != nil {
+					return err
+				}
 			}
 		}
 		result.Skipped++
@@ -2702,7 +2715,10 @@ func (r *Runner) schedulePendingRediscoveryAfterRun(ctx context.Context, loop st
 		return false, err
 	}
 	if parked {
-		return false, nil
+		// Parked is a terminal handoff for this success path: report scheduled so
+		// ProcessClaimedItem does not fall through to follow-up enqueue or mark
+		// the loop completed (either would destroy the round-budget pause).
+		return true, nil
 	}
 	current = &charged
 	availableAt := r.now()

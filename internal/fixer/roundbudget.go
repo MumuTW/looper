@@ -58,7 +58,11 @@ func nextRoundBudget(previous roundBudgetState, hasPrevious bool, headSHA, nowIS
 		return previous, false
 	}
 	if !hasPrevious {
-		return roundBudgetState{Rounds: 1, LastHeadSHA: headSHA, FirstRoundAt: nowISO, RecordedAt: nowISO}, true
+		// Seed the observed head without spending a round. Loop creation is not
+		// charged; the first rediscovery of a still-queued never-run loop must
+		// also not spend a round, or a max of 1 parks before the first push.
+		// The first *moved* head after this seed is round 1 (a real push cycle).
+		return roundBudgetState{Rounds: 0, LastHeadSHA: headSHA, FirstRoundAt: nowISO, RecordedAt: nowISO}, true
 	}
 	if previous.LastHeadSHA == headSHA {
 		return previous, false
@@ -88,7 +92,8 @@ func parseRoundBudgetState(metadata map[string]any) (roundBudgetState, bool) {
 	if err := json.Unmarshal(encoded, &state); err != nil {
 		return roundBudgetState{}, false
 	}
-	if state.Rounds <= 0 {
+	// Rounds may be 0 for a seeded head observation (no push cycle yet).
+	if state.Rounds < 0 || strings.TrimSpace(state.LastHeadSHA) == "" {
 		return roundBudgetState{}, false
 	}
 	return state, true
@@ -118,7 +123,9 @@ func (r *Runner) chargeFixerRound(ctx context.Context, loop storage.LoopRecord, 
 		if err != nil {
 			return loop, false, err
 		}
-		if state.Rounds < r.maxFixerRounds {
+		// Seeded Rounds==0 never parks. Park once the count of moved-head
+		// rediscoveries reaches the configured maximum.
+		if state.Rounds == 0 || state.Rounds < r.maxFixerRounds {
 			return updated, false, nil
 		}
 		return r.parkLoopForRoundBudget(ctx, updated, state)
@@ -206,7 +213,10 @@ func (r *Runner) clearRoundBudgetForPullRequest(ctx context.Context, projectID, 
 // current head is evidence of convergence.
 //
 // When no reviewer loop exists there is no asynchronous reviewer whose findings
-// could still arrive, so zero fix items is authoritative and the reset proceeds.
+// could still arrive, so zero fix items is authoritative — but only when the
+// fixer itself is not mid-run or holding a pending rediscovery handoff. A
+// running fixer can push then still have work left; clearing under that window
+// resets the cap for the next human feedback cycle.
 func (r *Runner) reviewerHasReviewedHead(ctx context.Context, projectID, repo string, prNumber int64, headSHA string) bool {
 	headSHA = strings.TrimSpace(headSHA)
 	if headSHA == "" {
@@ -227,7 +237,23 @@ func (r *Runner) reviewerHasReviewedHead(ctx context.Context, projectID, repo st
 			return true
 		}
 	}
-	return !hasReviewerLoop
+	if hasReviewerLoop {
+		return false
+	}
+	// Fixer-only: zero fix items is authoritative only when no fixer activity
+	// is still in flight for this PR.
+	for _, loop := range loops {
+		if loop.Type != "fixer" || loop.ProjectID != projectID || derefString(loop.Repo) != repo || derefInt64(loop.PRNumber) != prNumber {
+			continue
+		}
+		if loop.Status == "running" {
+			return false
+		}
+		if _, ok := parsePendingFixerRediscoveryState(parseJSONObject(loop.MetadataJSON)); ok {
+			return false
+		}
+	}
+	return true
 }
 
 // clearRoundBudgetMetadata drops the budget and, only when the loop is parked for

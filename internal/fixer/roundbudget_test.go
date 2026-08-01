@@ -17,7 +17,7 @@ func TestNextRoundBudgetChargesOnlyMovedHead(t *testing.T) {
 		wantRounds  int
 		wantCharged bool
 	}{
-		{name: "first round", headSHA: "head-1", wantRounds: 1, wantCharged: true},
+		{name: "first observation seeds without spending a round", headSHA: "head-1", wantRounds: 0, wantCharged: true},
 		{
 			name:        "same head is the same round",
 			previous:    roundBudgetState{Rounds: 2, LastHeadSHA: "head-2", FirstRoundAt: "t0"},
@@ -91,10 +91,9 @@ func TestRoundBudgetParksProductiveNonConvergingLoop(t *testing.T) {
 
 	project := storage.ProjectRecord{ID: "project_1"}
 	fixItems := []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", ThreadFingerprint: "fingerprint-1"}}
-	// The seeded loop is the initial push (not charged). Two rediscovery rounds
-	// are within the budget of 3; the third rediscovery reaches the limit and
-	// parks, bounding the total pushes to the configured maximum.
-	heads := []string{"head-1", "head-2"}
+	// First rediscovery seeds the head (rounds=0). Two more moved-head
+	// rediscoveries stay within max=3; the fourth moved head reaches the limit.
+	heads := []string{"head-1", "head-2", "head-3"}
 	for _, head := range heads {
 		result, err := runner.ensureLoopForPullRequest(context.Background(), project, repo, prNumber, head, "fix-hash-"+head, "state-"+head, fixItems, []string{"t1"})
 		if err != nil {
@@ -105,7 +104,7 @@ func TestRoundBudgetParksProductiveNonConvergingLoop(t *testing.T) {
 		}
 	}
 
-	result, err := runner.ensureLoopForPullRequest(context.Background(), project, repo, prNumber, "head-3", "fix-hash-3", "state-3", fixItems, []string{"t1"})
+	result, err := runner.ensureLoopForPullRequest(context.Background(), project, repo, prNumber, "head-4", "fix-hash-4", "state-4", fixItems, []string{"t1"})
 	if err != nil {
 		t.Fatalf("over-budget ensureLoopForPullRequest() error = %v", err)
 	}
