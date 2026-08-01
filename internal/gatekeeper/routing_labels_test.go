@@ -257,6 +257,39 @@ func TestRoutingLabelsSkipWhenDiffBudgetBaseMovesBeforeProjection(t *testing.T) 
 	}
 }
 
+func TestRoutingLabelsSkipWhenReviewerConvergenceAdvancesBeforeProjection(t *testing.T) {
+	fixture := newGatekeeperFixture(t)
+	seedReviewerConvergenceLoop(t, fixture, `{"convergence":{"policy":{"maxConsecutiveUnproductive":3,"maxFixerAttemptsPerItem":4,"maxTotalRounds":40,"severityFloor":"blocking"},"state":{"totalRounds":4},"action":"complete","reason":"severity_floor_reached","status":"completed","updatedAt":"2026-07-30T10:00:00Z"},"loop":{"lastReviewedHeadSha":"head-1"}}`, 1)
+	var mutateErr error
+	views := 0
+	fixture.github.beforeView = func(_ *fakeGatekeeperGitHub) {
+		views++
+		if views != 2 {
+			return
+		}
+		loop, err := fixture.repos.Loops.GetByID(context.Background(), "reviewer-loop")
+		if err != nil {
+			mutateErr = err
+			return
+		}
+		metadata := `{"convergence":{"policy":{"maxConsecutiveUnproductive":3,"maxFixerAttemptsPerItem":4,"maxTotalRounds":40,"severityFloor":"blocking"},"state":{"totalRounds":5,"items":{"blocking-1":{"id":"blocking-1","severity":"blocking","status":"open"}}},"action":"continue","reason":"converging","status":"active","updatedAt":"2026-07-30T10:01:00Z"},"loop":{"lastReviewedHeadSha":"head-1"}}`
+		loop.MetadataJSON = &metadata
+		loop.UpdatedAt = fixture.now.Add(time.Second).Format(time.RFC3339Nano)
+		mutateErr = fixture.repos.Loops.Upsert(context.Background(), *loop)
+	}
+	if _, err := routingRunner(fixture, config.GatekeeperTrustAuto).EvaluatePullRequest(context.Background(), EvaluationInput{
+		ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, ExpectedHeadSHA: "head-1",
+	}); err == nil {
+		t.Fatal("EvaluatePullRequest() succeeded after Reviewer convergence advanced before projection")
+	}
+	if mutateErr != nil {
+		t.Fatalf("mutate Reviewer convergence state: %v", mutateErr)
+	}
+	if len(fixture.github.labelAdds) != 0 || len(fixture.github.labelRemoves) != 0 {
+		t.Fatalf("routing labels changed across a Reviewer convergence race: adds=%#v removes=%#v", fixture.github.labelAdds, fixture.github.labelRemoves)
+	}
+}
+
 func TestRoutingLabelsBindEmptyReviewEvidenceToCurrentState(t *testing.T) {
 	fixture := newGatekeeperFixture(t)
 	fixture.github.detail.ReviewDecision = ""
