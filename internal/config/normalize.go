@@ -1044,6 +1044,9 @@ func mergeWorktreeCleanupConfig(config *WorktreeCleanupConfig, partial PartialWo
 	if partial.DryRun != nil {
 		config.DryRun = *partial.DryRun
 	}
+	if partial.MaxDiskSweepPerTick != nil {
+		config.MaxDiskSweepPerTick = *partial.MaxDiskSweepPerTick
+	}
 }
 
 func mergePackageConfig(config *PackageConfig, partial PartialPackageConfig) {

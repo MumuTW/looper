@@ -1096,6 +1096,11 @@ func validateWorktreeCleanupConfig(config WorktreeCleanupConfig, path string, is
 	if config.MaxPerTick < 1 {
 		*issues = append(*issues, ValidationIssue{Path: path + ".maxPerTick", Message: "must be a positive integer"})
 	}
+	// Zero is the documented way to disable the disk sweep without disabling
+	// the record-driven pass, so only negatives are invalid.
+	if config.MaxDiskSweepPerTick < 0 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".maxDiskSweepPerTick", Message: "must be an integer >= 0"})
+	}
 }
 
 func webhookModeRequiresTunnelConfig(config Config, project *ProjectRefConfig) bool {

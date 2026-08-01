@@ -193,6 +193,15 @@ func DefaultConfig(cwd string) (Config, error) {
 				// skipped it regardless of age.
 				IncludeOrphans: true,
 				DryRun:         false,
+				// Removals are one RemoveAll each, so the budget is sized to
+				// drain a real backlog rather than to pace git commands. The
+				// backlog this has to survive is bursty, not steady: a single
+				// day of agents re-running a test suite that resolves the real
+				// worktree root can mint five figures of debris, and a budget
+				// in the tens or hundreds would never catch up at a 24h
+				// interval. It stays a cap, not a target — status reports what
+				// the budget left behind.
+				MaxDiskSweepPerTick: 2000,
 			},
 			ResourceGuard: ResourceGuardConfig{
 				Enabled: true,

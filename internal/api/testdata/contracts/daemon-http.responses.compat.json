@@ -151,7 +151,17 @@
             "candidates": 0,
             "cleaned": 0,
             "skipped": 0,
-            "failed": 0
+            "failed": 0,
+            "diskSweep": {
+              "scanned": 0,
+              "unregistered": 0,
+              "removed": 0,
+              "skipped": 0,
+              "failed": 0,
+              "containersScanned": 0,
+              "containersUnreachable": 0,
+              "containersRemoved": 0
+            }
           },
           "resourceGuard": {
             "enabled": true,
@@ -339,7 +349,8 @@
               "retentionDays": 7,
               "maxPerTick": 10,
               "includeOrphans": true,
-              "dryRun": false
+              "dryRun": false,
+              "maxDiskSweepPerTick": 2000
             },
             "resourceGuard": {
               "enabled": true,
@@ -696,7 +707,8 @@
               "retentionDays": 7,
               "maxPerTick": 10,
               "includeOrphans": true,
-              "dryRun": false
+              "dryRun": false,
+              "maxDiskSweepPerTick": 2000
             },
             "resourceGuard": {
               "enabled": true,
