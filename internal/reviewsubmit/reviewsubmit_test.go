@@ -469,12 +469,32 @@ func TestWriteReviewSubmitDiagnosticWritesStructuredJSON(t *testing.T) {
 
 func TestValidateReviewerReviewSubmitHoldRejectsHeldAutomaticReviewerFlow(t *testing.T) {
 	t.Parallel()
-	err := validateReviewerReviewSubmitHold(context.Background(), config.Config{}, "acme/looper", 42, false, "", []string{labels.HoldReviewer})
+	err := validateReviewerReviewSubmitHoldForNamespace(context.Background(), config.Config{}, labels.DefaultNamespace(), "acme/looper", 42, false, "", []string{labels.HoldReviewer})
 	if err == nil || !strings.Contains(err.Error(), "currently held") {
 		t.Fatalf("validateReviewerReviewSubmitHold() error = %v, want held automatic reviewer rejection", err)
 	}
-	if err := validateReviewerReviewSubmitHold(context.Background(), config.Config{}, "acme/looper", 42, false, "", nil); err != nil {
+	if err := validateReviewerReviewSubmitHoldForNamespace(context.Background(), config.Config{}, labels.DefaultNamespace(), "acme/looper", 42, false, "", nil); err != nil {
 		t.Fatalf("validateReviewerReviewSubmitHold(unheld) error = %v", err)
+	}
+}
+
+func TestValidateReviewerReviewSubmitHoldUsesConfiguredProjectNamespace(t *testing.T) {
+	t.Parallel()
+	cfg := config.Config{Projects: []config.ProjectRefConfig{{
+		ID: "project", Repo: "acme/looper", RepoPath: "/work/repo", LabelNamespace: "team.looper:",
+	}}}
+	namespace, err := reviewSubmitLabelNamespace(cfg, "acme/looper", "/work/repo")
+	if err != nil {
+		t.Fatalf("reviewSubmitLabelNamespace() error = %v", err)
+	}
+	if namespace.Prefix != "team.looper:" {
+		t.Fatalf("namespace = %q, want team.looper:", namespace.Prefix)
+	}
+	if err := validateReviewerReviewSubmitHoldForNamespace(context.Background(), cfg, namespace, "acme/looper", 42, false, "", []string{namespace.HoldReviewer()}); err == nil || !strings.Contains(err.Error(), "currently held") {
+		t.Fatalf("custom namespace hold validation error = %v, want held rejection", err)
+	}
+	if err := validateReviewerReviewSubmitHoldForNamespace(context.Background(), cfg, namespace, "acme/looper", 42, false, "", []string{labels.HoldReviewer}); err != nil {
+		t.Fatalf("custom namespace hold validation on foreign default hold = %v, want no false positive", err)
 	}
 }
 
@@ -482,9 +502,10 @@ func TestValidateReviewerReviewSubmitHoldDoesNotCreateMissingDatabase(t *testing
 	t.Parallel()
 
 	dbPath := filepath.Join(t.TempDir(), "missing.sqlite")
-	err := validateReviewerReviewSubmitHold(
+	err := validateReviewerReviewSubmitHoldForNamespace(
 		context.Background(),
 		config.Config{Storage: config.StorageConfig{DBPath: dbPath}},
+		labels.DefaultNamespace(),
 		"acme/looper",
 		42,
 		true,
@@ -512,7 +533,7 @@ func TestValidateReviewerReviewSubmitHoldAcceptsExistingFileURI(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatalf("Close() error = %v", err)
 	}
-	if err := validateReviewerReviewSubmitHold(context.Background(), config.Config{Storage: config.StorageConfig{DBPath: "file:" + dbPath}}, "acme/looper", 42, true, "run_manual", []string{labels.HoldReviewer}); err == nil || !strings.Contains(err.Error(), "currently held") {
+	if err := validateReviewerReviewSubmitHoldForNamespace(context.Background(), config.Config{Storage: config.StorageConfig{DBPath: "file:" + dbPath}}, labels.DefaultNamespace(), "acme/looper", 42, true, "run_manual", []string{labels.HoldReviewer}); err == nil || !strings.Contains(err.Error(), "currently held") {
 		t.Fatalf("validateReviewerReviewSubmitHold(file URI) error = %v, want normal held rejection after URI-aware stat", err)
 	}
 }

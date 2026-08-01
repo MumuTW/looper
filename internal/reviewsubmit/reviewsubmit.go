@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 
@@ -18,6 +19,7 @@ import (
 	"github.com/nexu-io/looper/internal/forge"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/shell"
+	"github.com/nexu-io/looper/internal/labels"
 	"github.com/nexu-io/looper/internal/outboundguard"
 	"github.com/nexu-io/looper/internal/storage"
 )
@@ -190,7 +192,11 @@ func Run(ctx context.Context, opts Options) error {
 	if err := validateExpectedHeadCommit(commitID, detail.HeadSHA); err != nil {
 		return err
 	}
-	if err := validateReviewerReviewSubmitHold(ctx, loaded.Config, repo, prNumber, opts.ReviewerManual, opts.ReviewerRunID, detail.Labels); err != nil {
+	namespace, err := reviewSubmitLabelNamespace(loaded.Config, repo, cwd)
+	if err != nil {
+		return err
+	}
+	if err := validateReviewerReviewSubmitHoldForNamespace(ctx, loaded.Config, namespace, repo, prNumber, opts.ReviewerManual, opts.ReviewerRunID, detail.Labels); err != nil {
 		return err
 	}
 	if err := validateReviewSubmitBody(payload.Body, payload.Comments, commitID, event, policy, detail.Author); err != nil {
@@ -487,8 +493,8 @@ func validateExpectedHeadCommit(expected string, actual string) error {
 	return nil
 }
 
-func validateReviewerReviewSubmitHold(ctx context.Context, cfg config.Config, repo string, prNumber int64, manual bool, runID string, labels []string) error {
-	if !domain.IsAutoLaneHeld(domain.LoopTypeReviewer, labels) {
+func validateReviewerReviewSubmitHoldForNamespace(ctx context.Context, cfg config.Config, namespace labels.Namespace, repo string, prNumber int64, manual bool, runID string, itemLabels []string) error {
+	if !domain.IsAutoLaneHeldForNamespace(domain.LoopTypeReviewer, itemLabels, namespace) {
 		return nil
 	}
 	if manual {
@@ -524,6 +530,44 @@ func validateReviewerReviewSubmitHold(ctx context.Context, cfg config.Config, re
 	return fmt.Errorf("reviewer review submit blocked because %s#%d is currently held", repo, prNumber)
 }
 
+// reviewSubmitLabelNamespace resolves the project-scoped label authority for
+// the trusted review-submit child. The proxy binds the child to the daemon's
+// working directory and PR, so matching the same configured project by repo or
+// path keeps the final hold check on the same namespace the reviewer used.
+// Refuse to fall back to the default namespace when a configured custom
+// namespace cannot be identified: missing a human veto is less safe than
+// declining publication.
+func reviewSubmitLabelNamespace(cfg config.Config, repo, cwd string) (labels.Namespace, error) {
+	repo = strings.TrimSpace(repo)
+	cwd = strings.TrimSpace(cwd)
+	for _, project := range cfg.Projects {
+		matchesRepo := strings.TrimSpace(project.Repo) != "" && strings.EqualFold(strings.TrimSpace(project.Repo), repo)
+		matchesPath := reviewSubmitPathsEqual(project.RepoPath, cwd)
+		if matchesRepo || matchesPath {
+			return labels.NewNamespace(project.LabelNamespace), nil
+		}
+	}
+	for _, project := range cfg.Projects {
+		if strings.TrimSpace(project.LabelNamespace) != "" {
+			return labels.Namespace{}, fmt.Errorf("resolve project label namespace for review submit %s: no configured project matches working directory %q or repository %q", repo, cwd, repo)
+		}
+	}
+	return labels.DefaultNamespace(), nil
+}
+
+func reviewSubmitPathsEqual(left, right string) bool {
+	left, right = strings.TrimSpace(left), strings.TrimSpace(right)
+	if left == "" || right == "" {
+		return false
+	}
+	if filepath.Clean(left) == filepath.Clean(right) {
+		return true
+	}
+	leftAbs, leftErr := filepath.Abs(left)
+	rightAbs, rightErr := filepath.Abs(right)
+	return leftErr == nil && rightErr == nil && filepath.Clean(leftAbs) == filepath.Clean(rightAbs)
+}
+
 // validateLatestReviewerReviewSubmitPublication re-reads the PR before mutation
 // and fails closed on head/base drift plus hold labels. Refreshed labels are
 // returned so publish authority uses the latest snapshot.
@@ -538,7 +582,11 @@ func validateLatestReviewerReviewSubmitPublication(ctx context.Context, gh revie
 	if err := validateExpectedBaseCommit(expectedBaseSHA, detail.BaseSHA); err != nil {
 		return nil, err
 	}
-	if err := validateReviewerReviewSubmitHold(ctx, cfg, repo, prNumber, manual, runID, detail.Labels); err != nil {
+	namespace, err := reviewSubmitLabelNamespace(cfg, repo, cwd)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateReviewerReviewSubmitHoldForNamespace(ctx, cfg, namespace, repo, prNumber, manual, runID, detail.Labels); err != nil {
 		return nil, err
 	}
 	return detail.Labels, nil

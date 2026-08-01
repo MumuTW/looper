@@ -22,6 +22,7 @@ package labels
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -29,6 +30,10 @@ import (
 // is the marker of Looper's involvement with an item, which is why Prefix — not
 // any single label — is what "did Looper touch this?" checks look for.
 const Prefix = "looper:"
+
+// maxNamespacePrefixLength leaves room for the longest standard suffix
+// ("dispatch:implement") within GitHub's 50-character label-name limit.
+const maxNamespacePrefixLength = 32
 
 // Namespace is the project-scoped label authority. The default namespace is
 // Prefix; a project may opt into another validated prefix so two Looper
@@ -49,8 +54,8 @@ func ValidatePrefix(prefix string) error {
 	if prefix == "" {
 		return nil
 	}
-	if len(prefix) < 2 || len(prefix) > 64 || !strings.HasSuffix(prefix, ":") {
-		return fmt.Errorf("label namespace must be 1-63 characters followed by ':'")
+	if len(prefix) < 2 || len(prefix) > maxNamespacePrefixLength || !strings.HasSuffix(prefix, ":") {
+		return fmt.Errorf("label namespace must be 1-%d characters followed by ':'", maxNamespacePrefixLength-1)
 	}
 	for _, r := range prefix[:len(prefix)-1] {
 		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '.' || r == '_' || r == '-' {
@@ -215,7 +220,13 @@ func (n Namespace) Standard() []Definition {
 // project's configuration type.
 func DefinitionFor(label string) (Definition, bool) {
 	normalized := Normalize(label)
-	for _, definition := range DefaultNamespace().Standard() {
+	definitions := DefaultNamespace().Standard()
+	sort.SliceStable(definitions, func(i, j int) bool {
+		iSuffix := strings.TrimPrefix(Normalize(definitions[i].Name), Prefix)
+		jSuffix := strings.TrimPrefix(Normalize(definitions[j].Name), Prefix)
+		return len(iSuffix) > len(jSuffix)
+	})
+	for _, definition := range definitions {
 		suffix := strings.TrimPrefix(Normalize(definition.Name), Prefix)
 		if !strings.HasSuffix(normalized, suffix) {
 			continue

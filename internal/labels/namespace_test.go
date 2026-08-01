@@ -31,6 +31,13 @@ func TestNamespaceRemapsBuiltInsButLeavesForeignLabelsUntouched(t *testing.T) {
 	}
 }
 
+func TestDefinitionForPrefersLongestStandardSuffix(t *testing.T) {
+	definition, ok := DefinitionFor("team.looper:dispatch:plan")
+	if !ok || definition.Name != "team.looper:dispatch:plan" || definition.Description != "Coordinator dispatches this issue to the planner" {
+		t.Fatalf("DefinitionFor(dispatch:plan) = %#v, %t, want the dispatch presentation", definition, ok)
+	}
+}
+
 func TestNamespaceRejectsUnsafePrefixes(t *testing.T) {
 	for _, prefix := range []string{"looper", "team looper:", "team/*:", ":"} {
 		if err := ValidatePrefix(prefix); err == nil {
@@ -39,5 +46,8 @@ func TestNamespaceRejectsUnsafePrefixes(t *testing.T) {
 	}
 	if got := NewNamespace("bad prefix:"); got.Prefix != Prefix {
 		t.Fatalf("invalid namespace fallback = %q, want %q", got.Prefix, Prefix)
+	}
+	if err := ValidatePrefix("abcdefghijklmnopqrstuvwxyz123456:"); err == nil {
+		t.Fatal("ValidatePrefix() accepted a prefix that makes standard labels exceed GitHub's 50-character limit")
 	}
 }

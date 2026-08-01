@@ -218,10 +218,12 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 	}
 	triageCfg := roleConfigToTriageConfig(roleCfg)
 	triageCfg.Namespace = r.projectLabelNamespace(input.ProjectID, project.MetadataJSON)
+	triageCfg.TriagedLabel = triageCompletionLabel(triageCfg.TriagedLabel, triageCfg.Namespace)
 	triageCfg.ProjectClassificationLabels = config.ProjectClassificationLabels(r.config, input.ProjectID)
 	projectRoles := config.ProjectRoleConfigs(*r.config, input.ProjectID)
 	dispatchCfg := roleConfigToDispatchConfig(roleCfg, projectRoles)
 	dispatchCfg.Namespace = triageCfg.Namespace
+	dispatchCfg.TriagedLabel = triageCfg.TriagedLabel
 	dispatchCfg.HoldLabel = triageCfg.Namespace.Remap(dispatchCfg.HoldLabel)
 	dispatchCfg.PlannerTriggerLabels = triageCfg.Namespace.RemapAll(dispatchCfg.PlannerTriggerLabels)
 	dispatchCfg.WorkerTriggerLabels = triageCfg.Namespace.RemapAll(dispatchCfg.WorkerTriggerLabels)
@@ -1795,6 +1797,22 @@ func roleConfigToTriageConfig(roleCfg config.CoordinatorRoleConfig) triage.Confi
 		UnclearLabel:          roleCfg.Triage.Disposition.UnclearLabel,
 		ReTriageOnAuthorReply: roleCfg.Triage.Disposition.ReTriageOnAuthorReply,
 	}
+}
+
+// triageCompletionLabel keeps the historical bare marker for the default
+// namespace while isolating custom-namespace coordinator instances from one
+// another. Unlike dispatch and role-trigger labels, the completion marker is
+// configured as a suffix ("triaged") in the role config, so it needs explicit
+// projection when a project opts into a custom namespace.
+func triageCompletionLabel(label string, namespace labels.Namespace) string {
+	label = strings.TrimSpace(label)
+	if label == "" {
+		return ""
+	}
+	if strings.TrimSpace(namespace.Prefix) == "" || strings.EqualFold(strings.TrimSpace(namespace.Prefix), labels.Prefix) {
+		return label
+	}
+	return namespace.Label(label)
 }
 
 func mightNeedCoordinatorAction(issue githubinfra.IssueSummary, cfg triage.Config) bool {
