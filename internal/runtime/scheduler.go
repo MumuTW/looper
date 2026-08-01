@@ -399,13 +399,13 @@ func (a plannerGitHubAdapter) ListOpenIssues(ctx context.Context, input planner.
 	if a.gateway == nil {
 		return nil, fmt.Errorf("github gateway is not configured")
 	}
-	issues, err := a.gateway.ListOpenIssues(ctx, githubinfra.ListOpenIssuesInput{Repo: input.Repo, CWD: input.CWD, Limit: input.Limit, Assignee: input.Assignee, Label: input.Label, Labels: input.Labels})
+	issues, err := a.gateway.ListOpenIssues(ctx, githubinfra.ListOpenIssuesInput{Repo: input.Repo, CWD: input.CWD, Limit: input.Limit, Assignee: input.Assignee, Label: input.Label, Labels: input.Labels, Search: input.Search})
 	if err != nil {
 		return nil, err
 	}
 	result := make([]planner.IssueSummary, 0, len(issues))
 	for _, issue := range issues {
-		result = append(result, planner.IssueSummary{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.URL, Assignees: issue.Assignees, Labels: issue.Labels})
+		result = append(result, planner.IssueSummary{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.URL, Author: issue.Author, Assignees: issue.Assignees, Labels: issue.Labels})
 	}
 	return result, nil
 }
@@ -1418,7 +1418,7 @@ func (a workerGitHubAdapter) ListOpenIssues(ctx context.Context, input worker.Li
 	if a.gateway == nil {
 		return nil, fmt.Errorf("github gateway is not configured")
 	}
-	issues, err := a.gateway.ListOpenIssues(ctx, githubinfra.ListOpenIssuesInput{Repo: input.Repo, CWD: input.CWD, Limit: input.Limit, Assignee: input.Assignee, Label: input.Label, Labels: input.Labels})
+	issues, err := a.gateway.ListOpenIssues(ctx, githubinfra.ListOpenIssuesInput{Repo: input.Repo, CWD: input.CWD, Limit: input.Limit, Assignee: input.Assignee, Label: input.Label, Labels: input.Labels, Search: input.Search})
 	if err != nil {
 		return nil, err
 	}

@@ -356,15 +356,16 @@ func TestConfiguredProjectMetadataRoundTripsRuntimePolicy(t *testing.T) {
 	t.Parallel()
 
 	project := config.ProjectRefConfig{
-		ID:       "odcrew",
-		Name:     "ODCrew",
-		Provider: "ghes-main",
-		Repo:     "core/odcrew",
-		RepoPath: "/repos/odcrew",
-		Path:     "nested/path",
-		Network:  config.ProjectNetworkConfig{Mode: config.NetworkModeRouted},
-		Webhook:  config.ProjectWebhookConfig{Mode: config.WebhookModeTunnel},
-		Roles:    &config.PartialRoleConfigs{},
+		ID:              "odcrew",
+		Name:            "ODCrew",
+		PersonalProject: true,
+		Provider:        "ghes-main",
+		Repo:            "core/odcrew",
+		RepoPath:        "/repos/odcrew",
+		Path:            "nested/path",
+		Network:         config.ProjectNetworkConfig{Mode: config.NetworkModeRouted},
+		Webhook:         config.ProjectWebhookConfig{Mode: config.WebhookModeTunnel},
+		Roles:           &config.PartialRoleConfigs{},
 	}
 	repo := project.Repo
 	metadata, err := buildProjectMetadataJSON(nil, project, &repo)
@@ -382,7 +383,7 @@ func TestConfiguredProjectMetadataRoundTripsRuntimePolicy(t *testing.T) {
 		t.Fatalf("len(MaterializeCatalog()) = %d, want 1", len(got))
 	}
 	materialized := got[0]
-	if materialized.Provider != project.Provider || materialized.Repo != project.Repo || materialized.Path != project.Path {
+	if materialized.Provider != project.Provider || materialized.Repo != project.Repo || materialized.Path != project.Path || !materialized.PersonalProject {
 		t.Fatalf("materialized binding = %#v, want %#v", materialized, project)
 	}
 	if materialized.Network.Mode != project.Network.Mode || materialized.Webhook.Mode != project.Webhook.Mode || materialized.Roles == nil {

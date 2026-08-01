@@ -1688,19 +1688,20 @@ func clonePartialProjects(projects []PartialProjectRefConfig) []PartialProjectRe
 	cloned := make([]PartialProjectRefConfig, len(projects))
 	for index, project := range projects {
 		cloned[index] = PartialProjectRefConfig{
-			ID:           project.ID,
-			Name:         project.Name,
-			Provider:     cloneStringPtr(project.Provider),
-			Repo:         cloneStringPtr(project.Repo),
-			RepoPath:     project.RepoPath,
-			Path:         project.Path,
-			BaseBranch:   cloneStringPtr(project.BaseBranch),
-			WorktreeRoot: cloneStringPtr(project.WorktreeRoot),
-			Network:      clonePartialProjectNetworkConfig(project.Network),
-			Webhook:      clonePartialProjectWebhookConfig(project.Webhook),
-			Validation:   clonePartialProjectValidationConfig(project.Validation),
-			Instructions: cloneStringMap(project.Instructions),
-			Roles:        clonePartialRoleConfigs(project.Roles),
+			ID:              project.ID,
+			Name:            project.Name,
+			PersonalProject: cloneBoolPtr(project.PersonalProject),
+			Provider:        cloneStringPtr(project.Provider),
+			Repo:            cloneStringPtr(project.Repo),
+			RepoPath:        project.RepoPath,
+			Path:            project.Path,
+			BaseBranch:      cloneStringPtr(project.BaseBranch),
+			WorktreeRoot:    cloneStringPtr(project.WorktreeRoot),
+			Network:         clonePartialProjectNetworkConfig(project.Network),
+			Webhook:         clonePartialProjectWebhookConfig(project.Webhook),
+			Validation:      clonePartialProjectValidationConfig(project.Validation),
+			Instructions:    cloneStringMap(project.Instructions),
+			Roles:           clonePartialRoleConfigs(project.Roles),
 		}
 	}
 	return cloned
@@ -1778,12 +1779,13 @@ func cloneProjects(projects []PartialProjectRefConfig) []ProjectRefConfig {
 		repoPath := firstNonEmpty(project.RepoPath, project.Path)
 
 		cloned[index] = ProjectRefConfig{
-			ID:       project.ID,
-			Name:     project.Name,
-			RepoPath: repoPath,
-			Path:     project.Path,
-			Network:  ProjectNetworkConfig{Mode: NetworkModeOff},
-			Roles:    roles,
+			ID:              project.ID,
+			Name:            project.Name,
+			PersonalProject: project.PersonalProject != nil && *project.PersonalProject,
+			RepoPath:        repoPath,
+			Path:            project.Path,
+			Network:         ProjectNetworkConfig{Mode: NetworkModeOff},
+			Roles:           roles,
 		}
 		if project.Validation != nil {
 			validation := &ProjectValidationConfig{}
@@ -2228,6 +2230,14 @@ func cloneStringMap(values map[string]string) map[string]string {
 		cloned[key] = value
 	}
 	return cloned
+}
+
+func cloneBoolPtr(value *bool) *bool {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
 }
 
 func firstNonEmpty(values ...string) string {

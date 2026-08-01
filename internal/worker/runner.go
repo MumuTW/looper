@@ -51,12 +51,13 @@ const (
 	FailureNonRetryable         QueueFailureKind = "non_retryable"
 	FailureManualIntervention   QueueFailureKind = "manual_intervention"
 
-	defaultAgentTimeout = time.Hour
-	defaultClaimTTL     = 10 * time.Minute
-	defaultRetryDelay   = 5 * time.Second
-	maxRetryDelay       = 300 * time.Second
-	defaultRetryMax     = 3
-	defaultIssueLimit   = 30
+	defaultAgentTimeout     = time.Hour
+	defaultClaimTTL         = 10 * time.Minute
+	defaultRetryDelay       = 5 * time.Second
+	maxRetryDelay           = 300 * time.Second
+	defaultRetryMax         = 3
+	defaultIssueLimit       = 30
+	personalIssueQueryLimit = 100
 
 	workerBranchSlugMaxLength        = 30
 	workerBranchSlugMaxWords         = 5
@@ -88,14 +89,15 @@ type PullRequestSummary struct {
 }
 
 type IssueSummary struct {
-	Number        int64
-	Title         string
-	Body          string
-	URL           string
-	Author        string
-	Assignees     []string
-	AssigneeUsers []networkpolicy.GitHubUser
-	Labels        []string
+	Number                       int64
+	Title                        string
+	Body                         string
+	URL                          string
+	Author                       string
+	Assignees                    []string
+	AssigneeUsers                []networkpolicy.GitHubUser
+	Labels                       []string
+	PersonalAssigneeAutoAssigned bool
 }
 
 type PullRequestDetail struct {
@@ -240,6 +242,7 @@ type ListOpenIssuesInput struct {
 	Assignee string
 	Label    string
 	Labels   []string
+	Search   string
 }
 
 type GitHubGateway interface {
@@ -617,12 +620,13 @@ type workerInput struct {
 	IssueURL      string `json:"issueUrl,omitempty"`
 	// TriggerLogin is who created/assigned the source issue (GitHub login), shown
 	// as attribution on the HITL ask card so a human knows whose task this is.
-	TriggerLogin   string `json:"triggerLogin,omitempty"`
-	PRNumber       int64  `json:"prNumber,omitempty"`
-	PRTitle        string `json:"prTitle,omitempty"`
-	Branch         string `json:"branch,omitempty"`
-	HeadSHA        string `json:"headSha,omitempty"`
-	AutoDiscovered bool   `json:"autoDiscovered,omitempty"`
+	TriggerLogin                 string `json:"triggerLogin,omitempty"`
+	PRNumber                     int64  `json:"prNumber,omitempty"`
+	PRTitle                      string `json:"prTitle,omitempty"`
+	Branch                       string `json:"branch,omitempty"`
+	HeadSHA                      string `json:"headSha,omitempty"`
+	AutoDiscovered               bool   `json:"autoDiscovered,omitempty"`
+	PersonalAssigneeAutoAssigned bool   `json:"personalAssigneeAutoAssigned,omitempty"`
 	// IssueClaimOverride is the durable operator authority from a force=true
 	// manual issue dispatch. It follows the worker through PR creation and
 	// adoption so source-issue admission is not re-applied mid-lifecycle.
@@ -905,6 +909,7 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 		return DiscoveryResult{Skipped: 1}, nil
 	}
 	login := ""
+	personalProject := r.isPersonalProject(project.ID) && !networkpolicy.IsRouted(policy.RoutedClaimPolicy)
 	if networkpolicy.IsRouted(policy.RoutedClaimPolicy) {
 		login, err = r.github.GetCurrentUserLogin(ctx, input.Repo, project.RepoPath)
 		if err != nil {
@@ -926,24 +931,35 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 		return DiscoveryResult{Skipped: 1}, nil
 	}
 	assigneeFilter := ""
-	if !networkpolicy.IsRouted(policy.RoutedClaimPolicy) && policy.RequireAssigneeCurrentUser {
+	if !networkpolicy.IsRouted(policy.RoutedClaimPolicy) && policy.RequireAssigneeCurrentUser && !personalProject {
 		assigneeFilter = login
+	}
+	resultLimit := effectiveIssueLimit(input.Limit)
+	queryLimit := input.Limit
+	if personalProject && policy.RequireAssigneeCurrentUser && queryLimit < personalIssueQueryLimit {
+		queryLimit = personalIssueQueryLimit
 	}
 	requiredTargetLabel, err := r.requiredTargetLabel(ctx, project.ID)
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
-	issues, err := r.listOpenIssuesForDiscovery(ctx, ListOpenIssuesInput{Repo: input.Repo, CWD: project.RepoPath, Limit: input.Limit, Assignee: assigneeFilter}, policy, requiredTargetLabel)
+	search := ""
+	if personalProject && policy.RequireAssigneeCurrentUser {
+		search = "author:" + login
+	}
+	issues, err := r.listOpenIssuesForDiscovery(ctx, ListOpenIssuesInput{Repo: input.Repo, CWD: project.RepoPath, Limit: queryLimit, Assignee: assigneeFilter, Search: search}, policy, requiredTargetLabel)
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
 	result := DiscoveryResult{}
+	eligible := 0
 	for _, issue := range issues {
 		if domain.IsAutoLaneHeld(domain.LoopTypeWorker, issue.Labels) {
 			result.Skipped++
 			continue
 		}
-		if !shouldClaimWorkerIssue(issue, login, policy) {
+		personalAssignmentCandidate := shouldConsiderPersonalAssignment(issue, login, personalProject, policy)
+		if !personalAssignmentCandidate && !shouldClaimWorkerIssue(issue, login, policy) {
 			result.Skipped++
 			continue
 		}
@@ -969,11 +985,45 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 			result.Skipped++
 			continue
 		}
+		assigned, err := r.assignPersonalIssueIfEligible(ctx, *project, input.Repo, issue, login, personalProject, policy.RequireAssigneeCurrentUser)
+		if err != nil {
+			// Surface personal-assignment failures so a persistent token
+			// permission gap does not silently stall the lane. The issue is
+			// skipped, but other candidates are still scanned and the error is
+			// logged for operator diagnosis.
+			if r.logger != nil {
+				r.logger.Warn("worker personal issue assignment failed", map[string]any{"projectId": project.ID, "repo": input.Repo, "issueNumber": issue.Number, "error": err.Error()})
+			}
+			result.Skipped++
+			continue
+		}
+		issue = assigned
+		// Reconcile the audit marker when a prior partial success left the
+		// daemon assigned but the durable marker was never persisted. The
+		// GitHub assignee is the source of truth for the assignment; the
+		// marker only records that the daemon owns this personal issue.
+		if !issue.PersonalAssigneeAutoAssigned && personalAssigneeAlreadyAssigned(issue, login, personalProject, policy) {
+			issue.PersonalAssigneeAutoAssigned = true
+		}
+		if issue.PersonalAssigneeAutoAssigned {
+			loopResult.record, err = r.markPersonalAssignment(ctx, loopResult.record)
+			if err != nil {
+				return DiscoveryResult{}, err
+			}
+		}
 		queueItem, err := r.enqueueDiscoveredIssue(ctx, *project, loopResult.record, input.Repo, issue, fingerprint)
 		if err != nil {
 			return DiscoveryResult{}, err
 		}
 		result.QueueItems = append(result.QueueItems, queueItem)
+		// Count only actionable (admitted, assigned, and queued) issues toward
+		// the personal limit so paused/completed/failed/awaiting-human loops
+		// and assignment failures do not exhaust the window before later
+		// unassigned work is reached.
+		eligible++
+		if eligible >= resultLimit {
+			break
+		}
 	}
 	return result, nil
 }
@@ -987,6 +1037,51 @@ func (r *Runner) discoveryPolicyForProject(projectID string) DiscoveryPolicy {
 		return r.discoveryPolicy
 	}
 	return DiscoveryPolicy{AutoDiscovery: role.Discovery.Enabled, Labels: append([]string(nil), role.Discovery.Labels...), LabelMode: role.Discovery.LabelMode, RequireAssigneeCurrentUser: role.Discovery.RequireAssigneeCurrentUser, RoutedClaimPolicy: networkpolicy.ProjectPolicyForProject(*r.projectRoleConfig, projectID)}
+}
+
+func (r *Runner) isPersonalProject(projectID string) bool {
+	return r.projectRoleConfig != nil && config.IsPersonalProject(*r.projectRoleConfig, projectID)
+}
+
+func shouldConsiderPersonalAssignment(issue IssueSummary, login string, personalProject bool, policy DiscoveryPolicy) bool {
+	return personalProject && policy.RequireAssigneeCurrentUser && normalizeLogin(login) != "" && strings.EqualFold(strings.TrimSpace(issue.Author), strings.TrimSpace(login)) && len(issue.Assignees) == 0 && len(issue.AssigneeUsers) == 0 && config.LabelsMatch(issue.Labels, policy.Labels, policy.LabelMode)
+}
+
+// personalAssigneeAlreadyAssigned reports whether the daemon is already an
+// assignee of a self-authored personal-project issue. This is the stale-state
+// left by a prior partial success (assignment persisted on GitHub, audit
+// marker not), and lets rediscovery reconcile the durable marker without a
+// second assignment mutation.
+func personalAssigneeAlreadyAssigned(issue IssueSummary, login string, personalProject bool, policy DiscoveryPolicy) bool {
+	return personalProject && policy.RequireAssigneeCurrentUser && normalizeLogin(login) != "" && strings.EqualFold(strings.TrimSpace(issue.Author), strings.TrimSpace(login)) && includesLogin(issue.Assignees, login) && config.LabelsMatch(issue.Labels, policy.Labels, policy.LabelMode)
+}
+
+func (r *Runner) assignPersonalIssueIfEligible(ctx context.Context, project storage.ProjectRecord, repo string, issue IssueSummary, login string, personalProject, requireAssignee bool) (IssueSummary, error) {
+	if !personalProject || !requireAssignee || normalizeLogin(login) == "" || !strings.EqualFold(strings.TrimSpace(issue.Author), strings.TrimSpace(login)) || len(issue.Assignees) > 0 || len(issue.AssigneeUsers) > 0 {
+		return issue, nil
+	}
+	if err := r.github.AddIssueAssignees(ctx, IssueAssigneesInput{Repo: repo, IssueNumber: issue.Number, Assignees: []string{login}, CWD: project.RepoPath}); err != nil {
+		return issue, fmt.Errorf("assign self-authored worker issue %s#%d: %w", repo, issue.Number, err)
+	}
+	issue.Assignees = append(issue.Assignees, login)
+	issue.PersonalAssigneeAutoAssigned = true
+	return issue, nil
+}
+
+func (r *Runner) markPersonalAssignment(ctx context.Context, loop storage.LoopRecord) (storage.LoopRecord, error) {
+	var mergeErr error
+	updated, err := r.updateLoop(ctx, loop, func(record *storage.LoopRecord) {
+		metadataJSON, err := mergeLoopMetadataJSON(record.MetadataJSON, map[string]any{"personalProjectAutoAssigned": true})
+		if err != nil {
+			mergeErr = err
+			return
+		}
+		record.MetadataJSON = &metadataJSON
+	})
+	if mergeErr != nil {
+		return storage.LoopRecord{}, fmt.Errorf("merge personal assignment metadata: %w", mergeErr)
+	}
+	return updated, err
 }
 
 func (r *Runner) requiredTargetLabel(ctx context.Context, projectID string) (string, error) {
@@ -3004,8 +3099,11 @@ func (r *Runner) ensureLoopForDiscoveredIssue(ctx context.Context, project stora
 	nowISO := r.nowISO()
 	targetID := buildIssueTargetID(repo, issue.Number)
 	baseBranch := firstNonEmpty(derefString(project.BaseBranch), "main")
-	work := workerInput{Title: firstNonEmpty(issue.Title, buildDefaultIssueWorkerTitle(repo, issue.Number)), Repo: repo, BaseBranch: baseBranch, ExecutionMode: "create-pr", IssueNumber: issue.Number, IssueURL: issue.URL, TriggerLogin: issue.Author, AutoDiscovered: true}
+	work := workerInput{Title: firstNonEmpty(issue.Title, buildDefaultIssueWorkerTitle(repo, issue.Number)), Repo: repo, BaseBranch: baseBranch, ExecutionMode: "create-pr", IssueNumber: issue.Number, IssueURL: issue.URL, TriggerLogin: issue.Author, AutoDiscovered: true, PersonalAssigneeAutoAssigned: issue.PersonalAssigneeAutoAssigned}
 	workerMeta := map[string]any{"worker": mergeWorkerMetadata(parseJSONObject(nil), work)}
+	if issue.PersonalAssigneeAutoAssigned {
+		workerMeta["personalProjectAutoAssigned"] = true
+	}
 	existingLoops, err := r.repos.Loops.List(ctx)
 	if err != nil {
 		return loopUpsertResult{}, err
@@ -3024,7 +3122,11 @@ func (r *Runner) ensureLoopForDiscoveredIssue(ctx context.Context, project stora
 				updated.Status = "queued"
 				updated.NextRunAt = &nowISO
 			}
-			metadataJSON, err := mergeLoopMetadataJSON(existing.MetadataJSON, map[string]any{"worker": mergeWorkerMetadata(parseJSONObject(existing.MetadataJSON), work)})
+			updates := map[string]any{"worker": mergeWorkerMetadata(parseJSONObject(existing.MetadataJSON), work)}
+			if issue.PersonalAssigneeAutoAssigned {
+				updates["personalProjectAutoAssigned"] = true
+			}
+			metadataJSON, err := mergeLoopMetadataJSON(existing.MetadataJSON, updates)
 			if err != nil {
 				// Do not revive/requeue a loop whose durable state could not
 				// be recorded.
@@ -3086,7 +3188,11 @@ func (r *Runner) enqueueDiscoveredIssue(ctx context.Context, project storage.Pro
 	}
 	nowISO := r.nowISO()
 	baseBranch := firstNonEmpty(derefString(project.BaseBranch), "main")
-	payload := mustMarshalJSON(map[string]any{"title": firstNonEmpty(issue.Title, buildDefaultIssueWorkerTitle(repo, issue.Number)), "repo": repo, "baseBranch": baseBranch, "executionMode": "create-pr", "issueNumber": issue.Number, "issueUrl": issue.URL, "triggerLogin": issue.Author, "autoDiscovered": true, "discoveryFingerprint": fingerprint})
+	payloadMap := map[string]any{"title": firstNonEmpty(issue.Title, buildDefaultIssueWorkerTitle(repo, issue.Number)), "repo": repo, "baseBranch": baseBranch, "executionMode": "create-pr", "issueNumber": issue.Number, "issueUrl": issue.URL, "triggerLogin": issue.Author, "autoDiscovered": true, "discoveryFingerprint": fingerprint}
+	if issue.PersonalAssigneeAutoAssigned {
+		payloadMap["personalProjectAutoAssigned"] = true
+	}
+	payload := mustMarshalJSON(payloadMap)
 	targetID := buildIssueTargetID(repo, issue.Number)
 	lockKey := storage.IssueLockKey(project.ID, repo, issue.Number)
 	projectID := project.ID

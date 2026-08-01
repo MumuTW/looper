@@ -1220,6 +1220,9 @@ func buildProjectMetadataJSON(existing *storage.ProjectRecord, project config.Pr
 	if err := setProjectMetadata("provider", strings.TrimSpace(project.Provider), strings.TrimSpace(project.Provider) != ""); err != nil {
 		return "", err
 	}
+	if err := setProjectMetadata("personalProject", project.PersonalProject, project.PersonalProject); err != nil {
+		return "", err
+	}
 	if err := setProjectMetadata("path", strings.TrimSpace(project.Path), strings.TrimSpace(project.Path) != ""); err != nil {
 		return "", err
 	}

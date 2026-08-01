@@ -37,12 +37,13 @@ const (
 
 	plannerPRDedupeLookupLimit = 1000
 
-	defaultAgentTimeout = 30 * time.Minute
-	defaultClaimTTL     = 10 * time.Minute
-	defaultRetryDelay   = 5 * time.Second
-	maxRetryDelay       = 300 * time.Second
-	defaultRetryMax     = 3
-	defaultIssueLimit   = 30
+	defaultAgentTimeout     = 30 * time.Minute
+	defaultClaimTTL         = 10 * time.Minute
+	defaultRetryDelay       = 5 * time.Second
+	maxRetryDelay           = 300 * time.Second
+	defaultRetryMax         = 3
+	defaultIssueLimit       = 30
+	personalIssueQueryLimit = 100
 )
 
 var plannerStepSequence = []PlannerStep{stepDiscoverIssues, stepPrepareWorktree, stepAssessSuitability, stepWriteSpec, stepPublish, stepNotify}
@@ -59,12 +60,14 @@ const (
 )
 
 type IssueSummary struct {
-	Number    int64
-	Title     string
-	Body      string
-	URL       string
-	Assignees []string
-	Labels    []string
+	Number                       int64
+	Title                        string
+	Body                         string
+	URL                          string
+	Author                       string
+	Assignees                    []string
+	Labels                       []string
+	PersonalAssigneeAutoAssigned bool
 	// Clarifications are answers a human gave to Triager's questions before this
 	// Issue was routed. They are carried explicitly rather than re-read from the
 	// Issue's comments so Planner sees exactly what was answered, without having
@@ -102,6 +105,7 @@ type ListOpenIssuesInput struct {
 	Assignee string
 	Label    string
 	Labels   []string
+	Search   string
 }
 
 type ViewIssueInput struct {
@@ -559,34 +563,163 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 	if policy.RequireAssigneeCurrentUser && login == "" {
 		return DiscoveryResult{Skipped: 1}, nil
 	}
+	personalProject := r.isPersonalProject(project.ID) && r.projectNetworkMode(project.ID) != config.ProjectNetworkModeRouted
 	assigneeFilter := ""
-	if policy.RequireAssigneeCurrentUser {
+	if policy.RequireAssigneeCurrentUser && !personalProject {
 		assigneeFilter = login
 	}
-	issues, err := r.listOpenIssuesForDiscovery(ctx, ListOpenIssuesInput{Repo: input.Repo, CWD: project.RepoPath, Limit: input.Limit, Assignee: assigneeFilter}, policy)
+	resultLimit := effectiveIssueLimit(input.Limit)
+	queryLimit := input.Limit
+	if personalProject && policy.RequireAssigneeCurrentUser && queryLimit < personalIssueQueryLimit {
+		queryLimit = personalIssueQueryLimit
+	}
+	search := ""
+	if personalProject && policy.RequireAssigneeCurrentUser {
+		search = "author:" + login
+	}
+	issues, err := r.listOpenIssuesForDiscovery(ctx, ListOpenIssuesInput{Repo: input.Repo, CWD: project.RepoPath, Limit: queryLimit, Assignee: assigneeFilter, Search: search}, policy)
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
 	result := DiscoveryResult{}
+	eligible := 0
 	for _, issue := range issues {
 		if domain.IsAutoLaneHeld(domain.LoopTypePlanner, issue.Labels) {
 			result.Skipped++
 			continue
 		}
-		if !shouldClaimIssue(issue, login, policy) {
+		personalAssignmentCandidate := shouldConsiderPersonalAssignment(issue, login, personalProject, policy)
+		if !personalAssignmentCandidate && !shouldClaimIssue(issue, login, policy) {
 			result.Skipped++
 			continue
 		}
 		fingerprint := buildPlannerDiscoveryFingerprint(input.Repo, r.now(), issue)
-		materialized, err := r.materializeIssue(ctx, *project, input.Repo, issue, login, fingerprint, "")
+		// Resolve the durable loop (admission) before any GitHub assignee
+		// mutation so an intentionally inactive loop (paused/completed/
+		// awaiting_human/failed) is skipped without assigning the daemon to
+		// work that will not be queued.
+		loopResult, skipped, err := r.admitPlannerIssue(ctx, *project, input.Repo, issue, fingerprint, "")
+		if err != nil {
+			return DiscoveryResult{}, err
+		}
+		if skipped {
+			result.Skipped++
+			continue
+		}
+		if loopResult.created {
+			result.CreatedLoopIDs = append(result.CreatedLoopIDs, loopResult.record.ID)
+		}
+		assigned, err := r.assignPersonalIssueIfEligible(ctx, *project, input.Repo, issue, login, personalProject, policy.RequireAssigneeCurrentUser)
+		if err != nil {
+			// Surface personal-assignment failures so a persistent token
+			// permission gap does not silently stall the lane. The issue is
+			// skipped, but other candidates are still scanned and the error is
+			// logged for operator diagnosis.
+			if r.logger != nil {
+				r.logger.Warn("planner personal issue assignment failed", map[string]any{"projectId": project.ID, "repo": input.Repo, "issueNumber": issue.Number, "error": err.Error()})
+			}
+			result.Skipped++
+			continue
+		}
+		issue = assigned
+		// Reconcile the audit marker when a prior partial success left the
+		// daemon assigned but the durable marker was never persisted. The
+		// GitHub assignee is the source of truth for the assignment; the
+		// marker only records that the daemon owns this personal issue.
+		if !issue.PersonalAssigneeAutoAssigned && personalAssigneeAlreadyAssigned(issue, login, personalProject, policy) {
+			issue.PersonalAssigneeAutoAssigned = true
+		}
+		if issue.PersonalAssigneeAutoAssigned {
+			loopResult.record, err = r.markPersonalAssignment(ctx, loopResult.record)
+			if err != nil {
+				return DiscoveryResult{}, err
+			}
+		}
+		materialized, err := r.enqueueAdmittedIssue(ctx, *project, input.Repo, issue, login, loopResult, fingerprint, "")
 		if err != nil {
 			return DiscoveryResult{}, err
 		}
 		result.QueueItems = append(result.QueueItems, materialized.QueueItems...)
-		result.CreatedLoopIDs = append(result.CreatedLoopIDs, materialized.CreatedLoopIDs...)
 		result.Skipped += materialized.Skipped
+		// Count only actionable (admitted, assigned, and queued) issues toward
+		// the personal limit so paused/completed/failed/awaiting-human loops
+		// and assignment failures do not exhaust the window before later
+		// unassigned work is reached.
+		eligible++
+		if eligible >= resultLimit {
+			break
+		}
 	}
 	return result, nil
+}
+
+func (r *Runner) isPersonalProject(projectID string) bool {
+	return r.projectRoleConfig != nil && config.IsPersonalProject(*r.projectRoleConfig, projectID)
+}
+
+func (r *Runner) projectNetworkMode(projectID string) config.ProjectNetworkMode {
+	if r == nil || r.projectRoleConfig == nil {
+		return config.ProjectNetworkModeOff
+	}
+	for _, project := range r.projectRoleConfig.Projects {
+		if project.ID != projectID {
+			continue
+		}
+		if project.Network.Mode != "" {
+			return project.Network.Mode
+		}
+		break
+	}
+	return config.ProjectNetworkModeOff
+}
+
+func (r *Runner) assignPersonalIssueIfEligible(ctx context.Context, project storage.ProjectRecord, repo string, issue IssueSummary, login string, personalProject, requireAssignee bool) (IssueSummary, error) {
+	if !shouldConsiderPersonalAssignment(issue, login, personalProject, DiscoveryPolicy{RequireAssigneeCurrentUser: requireAssignee, Labels: nil, LabelMode: ""}) {
+		return issue, nil
+	}
+	if err := r.github.AddIssueAssignees(ctx, IssueAssigneesInput{Repo: repo, IssueNumber: issue.Number, Assignees: []string{login}, CWD: project.RepoPath}); err != nil {
+		return issue, fmt.Errorf("assign self-authored planner issue %s#%d: %w", repo, issue.Number, err)
+	}
+	issue.Assignees = append(issue.Assignees, login)
+	issue.PersonalAssigneeAutoAssigned = true
+	return issue, nil
+}
+
+// shouldConsiderPersonalAssignment reports whether an issue is an unassigned,
+// self-authored candidate for personal-project auto-assignment. It mirrors the
+// Worker predicate so discovery can decide admission eligibility before any
+// GitHub mutation.
+func shouldConsiderPersonalAssignment(issue IssueSummary, login string, personalProject bool, policy DiscoveryPolicy) bool {
+	return personalProject && policy.RequireAssigneeCurrentUser && normalizeLogin(login) != "" && strings.EqualFold(strings.TrimSpace(issue.Author), strings.TrimSpace(login)) && len(issue.Assignees) == 0 && config.LabelsMatch(issue.Labels, policy.Labels, policy.LabelMode)
+}
+
+// personalAssigneeAlreadyAssigned reports whether the daemon is already an
+// assignee of a self-authored personal-project issue. This is the stale-state
+// left by a prior partial success (assignment persisted on GitHub, audit
+// marker not), and lets rediscovery reconcile the durable marker without a
+// second assignment mutation.
+func personalAssigneeAlreadyAssigned(issue IssueSummary, login string, personalProject bool, policy DiscoveryPolicy) bool {
+	return personalProject && policy.RequireAssigneeCurrentUser && normalizeLogin(login) != "" && strings.EqualFold(strings.TrimSpace(issue.Author), strings.TrimSpace(login)) && includesLogin(issue.Assignees, login) && config.LabelsMatch(issue.Labels, policy.Labels, policy.LabelMode)
+}
+
+// markPersonalAssignment persists the personalProjectAutoAssigned audit marker
+// on an admitted loop after the GitHub assignee mutation succeeds. It is the
+// Planner counterpart of Worker's markPersonalAssignment and is called after
+// admission so the marker is only recorded for work that will be queued.
+func (r *Runner) markPersonalAssignment(ctx context.Context, loop storage.LoopRecord) (storage.LoopRecord, error) {
+	var mergeErr error
+	updated, err := r.updateLoop(ctx, loop, func(record *storage.LoopRecord) {
+		metadataJSON, err := mergeLoopMetadataJSON(record.MetadataJSON, map[string]any{"personalProjectAutoAssigned": true})
+		if err != nil {
+			mergeErr = err
+			return
+		}
+		record.MetadataJSON = &metadataJSON
+	})
+	if mergeErr != nil {
+		return storage.LoopRecord{}, fmt.Errorf("merge personal assignment metadata: %w", mergeErr)
+	}
+	return updated, err
 }
 
 // RouteIssue projects a persisted routing authority into Planner's durable
@@ -619,24 +752,55 @@ func (r *Runner) RouteIssue(ctx context.Context, input RouteIssueInput) (Discove
 }
 
 func (r *Runner) materializeIssue(ctx context.Context, project storage.ProjectRecord, repo string, issue IssueSummary, currentUserLogin, fingerprint, authority string) (DiscoveryResult, error) {
-	loopResult, err := r.ensureLoopForIssueWithAuthority(ctx, project, repo, issue, fingerprint, authority)
+	loopResult, skipped, err := r.admitPlannerIssue(ctx, project, repo, issue, fingerprint, authority)
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
 	result := DiscoveryResult{}
-	if loopResult.blocked {
+	if skipped {
 		result.Skipped = 1
+		result.ProjectionAccepted = authority != "" && loopResult.authorityMatch
 		return result, nil
 	}
 	if loopResult.created {
 		result.CreatedLoopIDs = append(result.CreatedLoopIDs, loopResult.record.ID)
 	}
+	enqueued, err := r.enqueueAdmittedIssue(ctx, project, repo, issue, currentUserLogin, loopResult, fingerprint, authority)
+	if err != nil {
+		return DiscoveryResult{}, err
+	}
+	result.QueueItems = enqueued.QueueItems
+	result.ProjectionAccepted = enqueued.ProjectionAccepted
+	return result, nil
+}
+
+// admitPlannerIssue resolves the durable loop for a discovered issue and
+// reports whether discovery should skip it without queueing work. The loop
+// repository is the admission boundary: a blocked authority projection or an
+// intentionally inactive loop (paused/completed/awaiting_human/failed) is
+// skipped here so callers can avoid side effects (such as a GitHub assignee
+// mutation) for work that will not be queued.
+func (r *Runner) admitPlannerIssue(ctx context.Context, project storage.ProjectRecord, repo string, issue IssueSummary, fingerprint, authority string) (loopUpsertResult, bool, error) {
+	loopResult, err := r.ensureLoopForIssueWithAuthority(ctx, project, repo, issue, fingerprint, authority)
+	if err != nil {
+		return loopUpsertResult{}, false, err
+	}
+	if loopResult.blocked {
+		return loopResult, true, nil
+	}
 	switch loopResult.record.Status {
 	case "paused", "completed", "awaiting_human", "failed":
-		result.Skipped = 1
-		result.ProjectionAccepted = authority != "" && loopResult.authorityMatch
-		return result, nil
+		return loopResult, true, nil
 	}
+	return loopResult, false, nil
+}
+
+// enqueueAdmittedIssue builds the planner queue payload for an already-admitted
+// loop and enqueues it. The loop must be in an active (queueable) status.
+// Callers own recording CreatedLoopIDs so admission is reported even when a
+// post-admission step (such as personal assignment) skips the issue.
+func (r *Runner) enqueueAdmittedIssue(ctx context.Context, project storage.ProjectRecord, repo string, issue IssueSummary, currentUserLogin string, loopResult loopUpsertResult, fingerprint, authority string) (DiscoveryResult, error) {
+	result := DiscoveryResult{}
 	payload := map[string]any{
 		"issueNumber":            issue.Number,
 		"title":                  issue.Title,
@@ -649,6 +813,9 @@ func (r *Runner) materializeIssue(ctx context.Context, project storage.ProjectRe
 	}
 	if len(issue.Clarifications) > 0 {
 		payload["clarifications"] = issue.Clarifications
+	}
+	if issue.PersonalAssigneeAutoAssigned {
+		payload["personalProjectAutoAssigned"] = true
 	}
 	if authority != "" {
 		payload[plannerQueueRoutingAuthorityKey] = authority
@@ -1769,7 +1936,11 @@ func (r *Runner) ensureLoopForIssueWithAuthority(ctx context.Context, project st
 				updated.Status = "queued"
 				updated.NextRunAt = &nowISO
 			}
-			metadataJSON, err := mergeLoopMetadataJSON(existing.MetadataJSON, map[string]any{"issueTitle": issue.Title, "issueURL": issue.URL, "issueNumber": issue.Number, "specPath": buildSpecPath(r.now(), issue.Number, issue.Title)})
+			updates := map[string]any{"issueTitle": issue.Title, "issueURL": issue.URL, "issueNumber": issue.Number, "specPath": buildSpecPath(r.now(), issue.Number, issue.Title)}
+			if issue.PersonalAssigneeAutoAssigned {
+				updates["personalProjectAutoAssigned"] = true
+			}
+			metadataJSON, err := mergeLoopMetadataJSON(existing.MetadataJSON, updates)
 			if err != nil {
 				// Discovery must not report success and enqueue work without
 				// the refreshed issue metadata.
@@ -1788,6 +1959,9 @@ func (r *Runner) ensureLoopForIssueWithAuthority(ctx context.Context, project st
 		return loopUpsertResult{}, err
 	}
 	metadata := map[string]any{"issueTitle": issue.Title, "issueURL": issue.URL, "issueNumber": issue.Number, "specPath": buildSpecPath(r.now(), issue.Number, issue.Title)}
+	if issue.PersonalAssigneeAutoAssigned {
+		metadata["personalProjectAutoAssigned"] = true
+	}
 	if authority != "" {
 		metadata[plannerQueueRoutingAuthorityKey] = authority
 	}
@@ -1810,6 +1984,9 @@ func (r *Runner) refreshIssueLoop(ctx context.Context, existing storage.LoopReco
 		updated.NextRunAt = &nowISO
 	}
 	metadata := map[string]any{"issueTitle": issue.Title, "issueURL": issue.URL, "issueNumber": issue.Number, "specPath": buildSpecPath(r.now(), issue.Number, issue.Title)}
+	if issue.PersonalAssigneeAutoAssigned {
+		metadata["personalProjectAutoAssigned"] = true
+	}
 	if authority != "" {
 		metadata[plannerQueueRoutingAuthorityKey] = authority
 	}

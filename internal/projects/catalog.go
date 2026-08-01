@@ -139,12 +139,13 @@ func MaterializeCatalog(global config.Config, records []storage.ProjectRecord) (
 		metadata := parseMetadata(record.MetadataJSON)
 		provider := metadataString(metadata, "provider")
 		project := config.ProjectRefConfig{
-			ID:         record.ID,
-			Name:       record.Name,
-			RepoPath:   record.RepoPath,
-			BaseBranch: cloneStringPointer(record.BaseBranch),
-			Provider:   provider,
-			Repo:       metadataString(metadata, "repo"),
+			ID:              record.ID,
+			Name:            record.Name,
+			RepoPath:        record.RepoPath,
+			BaseBranch:      cloneStringPointer(record.BaseBranch),
+			Provider:        provider,
+			Repo:            metadataString(metadata, "repo"),
+			PersonalProject: metadataBool(metadata, "personalProject"),
 		}
 		if project.Provider != "" && !configuredProviderExists(global, project.Provider) {
 			// This is reachable on upgrade when a stored project was bound to a
@@ -210,6 +211,11 @@ func decodeMetadataValue(metadata map[string]any, key string, target any) error 
 func metadataString(metadata map[string]any, key string) string {
 	value, _ := metadata[key].(string)
 	return strings.TrimSpace(value)
+}
+
+func metadataBool(metadata map[string]any, key string) bool {
+	value, _ := metadata[key].(bool)
+	return value
 }
 
 func cloneStringPointer(value *string) *string {

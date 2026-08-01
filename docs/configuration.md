@@ -957,7 +957,7 @@ Project entries stay in `projects[]`, but any override-bearing config must mirro
 
 Project entries are split into:
 
-- **project metadata**: `id`, `name`, `repoPath`, `baseBranch`, `worktreeRoot`
+- **project metadata**: `id`, `name`, `repoPath`, `baseBranch`, `worktreeRoot`, `personalProject`
 - **project-scoped override config**: canonical override-bearing domains such as `roles.<role>...`
 - **project-local role instructions**: `projects[].roles.<role>.instructions`
 
@@ -968,6 +968,8 @@ Project override rules:
 - omitted project fields inherit the effective global value
 - project-local role instructions may be set to an empty string to clear inherited global role instructions for that project
 - legacy project reviewer discovery paths are compatibility-only; canonical reviewer project overrides live under `projects[].roles.reviewer.discovery.*`
+
+`projects[].personalProject = true` is an explicit opt-in for a personal repository. When Planner or Worker discovery requires the current-user assignee—including work reached through Coordinator dispatch—Looper lists the project's trigger-labelled issues and assigns the configured GitHub identity only when that identity authored the issue and no assignee exists. Coordinator itself only projects the configured trigger labels; the downstream Planner/Worker lane performs the same identity and no-existing-assignee checks and records the assignment in loop/queue audit metadata. Existing assignees and shared projects are left unchanged. Looper never infers this setting from repository ownership, and routed projects do not use this local self-assignment policy.
 
 Canonical project override example:
 
