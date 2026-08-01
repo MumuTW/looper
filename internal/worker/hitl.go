@@ -422,7 +422,12 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 	// concurrently by the enqueue path must not be overwritten by this upsert.
 	unlockRequeue := loops.LockLoopRequeue(input.Loop.ID)
 	_, updateErr := r.updateLoop(ctx, input.Loop, func(updated *storage.LoopRecord) {
-		meta, werr := loops.WriteHITLAsk(updated.MetadataJSON, ask)
+		// deliverAskToGitHub may have raced with the answer endpoint. Merge the
+		// freshly delivered correlation into the latest metadata instead of
+		// replacing a human answer that was persisted while the request was in
+		// flight.
+		toWrite := mergeHITLCorrelation(ask, updated.MetadataJSON)
+		meta, werr := loops.WriteHITLAsk(updated.MetadataJSON, toWrite)
 		if werr != nil {
 			// Without a stored ask the response paths can never resume this
 			// loop; abort the whole suspension instead of parking it stranded.

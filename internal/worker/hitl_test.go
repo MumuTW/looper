@@ -453,6 +453,19 @@ func TestSuspendForHumanDeliversAskToGitHub(t *testing.T) {
 	})
 
 	awaiting := &awaitingHumanError{question: "Redis or Postgres?", options: []string{"redis", "postgres"}, sessionID: "sess-1", vendor: "codex", recommendation: "Postgres keeps the existing transaction boundary."}
+	// Simulate the answer endpoint winning the race while the GitHub comment
+	// request is in flight. The correlation write must merge into this latest
+	// metadata rather than replacing the human's answer.
+	answeredMeta, err := loops.WriteHITLAsk(loop.MetadataJSON, loops.HITLAsk{
+		Question: "Redis or Postgres?", Status: "answered", Answer: "postgres", AnsweredAt: "2026-08-01T00:00:00.000Z",
+	})
+	if err != nil {
+		t.Fatalf("WriteHITLAsk() error = %v", err)
+	}
+	loop.MetadataJSON = &answeredMeta
+	if err := fixture.repos.Loops.Upsert(ctx, *loop); err != nil {
+		t.Fatalf("Loops.Upsert(answered) error = %v", err)
+	}
 	loopForStep, _ := fixture.repos.Loops.GetByID(ctx, "loop_worker_1")
 	result, err := runner.suspendForHuman(ctx, stepInput{Project: *project, Loop: *loopForStep, Run: run, QueueItem: *queueItem}, run, workerCheckpoint{PullRequest: &checkpointPullPR{Number: 42}}, awaiting)
 	if err != nil {
@@ -480,8 +493,8 @@ func TestSuspendForHumanDeliversAskToGitHub(t *testing.T) {
 	// Ask metadata records the github correlation.
 	got, _ := fixture.repos.Loops.GetByID(ctx, "loop_worker_1")
 	ask, ok := loops.ReadHITLAsk(got.MetadataJSON)
-	if !ok || ask.Transport != "github" || ask.PRNumber != 42 || ask.AskCommentID != 777 {
-		t.Fatalf("ask = %#v, want github transport + pr 42 + comment 777", ask)
+	if !ok || ask.Transport != "github" || ask.PRNumber != 42 || ask.AskCommentID != 777 || ask.Status != "answered" || ask.Answer != "postgres" {
+		t.Fatalf("ask = %#v, want github correlation plus preserved answer", ask)
 	}
 }
 
