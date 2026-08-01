@@ -369,7 +369,12 @@ func (r *Runner) listCoordinatorBacklog(ctx context.Context, projectID, repo, cw
 		pageIssues := backlog[pageStart:pageEnd]
 		for index := range pageIssues {
 			issue := pageIssues[(candidateStart+index)%len(pageIssues)]
-			if target.recovery && len(protocol.CollectTargetLabels(issue.Labels)) == 1 {
+			// Recovery scans re-route stuck worker work. A single exact target
+			// is usually healthy and can be skipped, but only when that target
+			// node still heartbeats — a dead sole target must be rehydrated so
+			// admission can reassign.
+			if target.recovery && len(protocol.CollectTargetLabels(issue.Labels)) == 1 &&
+				r.singleRoutedTargetStillLive(ctx, issue.Labels) {
 				continue
 			}
 			if _, ok := seen[issue.Number]; ok {
@@ -395,6 +400,42 @@ func (r *Runner) backlogHydrationBudget(ctx context.Context, triageCfg triage.Co
 		return 0, err
 	}
 	return min(limit, max(r.config.Scheduler.MaxConcurrentRuns-running, 0)), nil
+}
+
+// singleRoutedTargetStillLive reports whether the issue's sole looper:target:*
+// label still maps to a worker membership with a fresh heartbeat. Used to keep
+// healthy single-target issues out of recovery hydration while still
+// revalidating dead sole targets.
+func (r *Runner) singleRoutedTargetStillLive(ctx context.Context, issueLabels []string) bool {
+	if r == nil || r.network == nil {
+		return false
+	}
+	targets := protocol.CollectTargetLabels(issueLabels)
+	if len(targets) != 1 {
+		return false
+	}
+	nodeName, ok := protocol.ParseTargetLabel(targets[0])
+	if !ok {
+		return false
+	}
+	status, err := r.network.Status(ctx)
+	if err != nil {
+		return false
+	}
+	now := r.now().UTC()
+	for _, member := range status.Memberships {
+		if strings.TrimSpace(member.NodeName) != nodeName {
+			continue
+		}
+		if !memberHasRole(member, "worker") || member.DuplicateWarning || member.Capabilities.IdentityDrift {
+			return false
+		}
+		if member.LastHeartbeatAt == nil || member.LastHeartbeatAt.Before(now.Add(-2*protocol.DefaultLeaseTTL)) {
+			return false
+		}
+		return true
+	}
+	return false
 }
 
 func backlogScanTargets(lanes []backlogLane, includeWorkerRecovery bool) []backlogTarget {
