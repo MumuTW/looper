@@ -830,10 +830,10 @@ func requireSameFilesystemPath(running, expected string) error {
 	return nil
 }
 
-// requireExecutableGovernedByCurrent reports whether the launch path goes
-// through release-root/current/<binary>, not a concrete releases/<id>/ path.
-// Comparing only resolved inodes is insufficient: a unit that still ExecStart's
-// releases/<candidate>/looperd resolves to the same file as current/looperd.
+// requireExecutableGovernedByCurrent requires the launch path to be exactly the
+// release-root current pointer (after Abs/Clean), not a concrete releases/<id>
+// path and not a different tree's "current" alias that happens to resolve to
+// the same candidate bytes.
 func requireExecutableGovernedByCurrent(runningPath, expectedCurrentPath string) error {
 	runningPath = strings.TrimSpace(runningPath)
 	expectedCurrentPath = strings.TrimSpace(expectedCurrentPath)
@@ -843,54 +843,25 @@ func requireExecutableGovernedByCurrent(runningPath, expectedCurrentPath string)
 	if expectedCurrentPath == "" {
 		return fmt.Errorf("expected current daemon executable path is unavailable")
 	}
-	runningClean := filepath.Clean(runningPath)
-	expectedClean := filepath.Clean(expectedCurrentPath)
-	if !pathUsesCurrentPointer(expectedClean) {
-		return fmt.Errorf("expected executable path %s does not use the release current pointer", expectedClean)
-	}
-	if isConcreteReleaseBinaryPath(runningClean) {
-		return fmt.Errorf("running daemon executable %s is a concrete release path; require launch through %s", runningClean, expectedClean)
-	}
-	if runningClean == expectedClean {
-		return nil
-	}
-	// Absolute forms of the same current path (relative vs absolute argv).
-	runningAbs, err := filepath.Abs(runningClean)
+	runningAbs, err := filepath.Abs(filepath.Clean(runningPath))
 	if err != nil {
-		runningAbs = runningClean
+		runningAbs = filepath.Clean(runningPath)
+	} else {
+		runningAbs = filepath.Clean(runningAbs)
 	}
-	expectedAbs, err := filepath.Abs(expectedClean)
+	expectedAbs, err := filepath.Abs(filepath.Clean(expectedCurrentPath))
 	if err != nil {
-		expectedAbs = expectedClean
+		expectedAbs = filepath.Clean(expectedCurrentPath)
+	} else {
+		expectedAbs = filepath.Clean(expectedAbs)
 	}
-	if filepath.Clean(runningAbs) == filepath.Clean(expectedAbs) {
-		return nil
+	if isConcreteReleaseBinaryPath(runningAbs) {
+		return fmt.Errorf("running daemon executable %s is a concrete release path; require launch through %s", runningAbs, expectedAbs)
 	}
-	if pathUsesCurrentPointer(runningClean) || pathUsesCurrentPointer(runningAbs) {
-		// Launch path names current; also require the pointer selects the same bytes.
-		runningResolved, err := filepath.EvalSymlinks(runningAbs)
-		if err != nil {
-			runningResolved = filepath.Clean(runningAbs)
-		}
-		expectedResolved, err := filepath.EvalSymlinks(expectedAbs)
-		if err != nil {
-			expectedResolved = filepath.Clean(expectedAbs)
-		}
-		if filepath.Clean(runningResolved) == filepath.Clean(expectedResolved) {
-			return nil
-		}
+	if runningAbs != expectedAbs {
+		return fmt.Errorf("running daemon executable %s is not the release current pointer %s", runningAbs, expectedAbs)
 	}
-	return fmt.Errorf("running daemon executable %s is not governed by release current pointer %s", runningClean, expectedClean)
-}
-
-func pathUsesCurrentPointer(path string) bool {
-	parts := strings.Split(filepath.Clean(path), string(filepath.Separator))
-	for i := 0; i+1 < len(parts); i++ {
-		if parts[i] == "current" && (parts[i+1] == "looperd" || parts[i+1] == "looper") {
-			return true
-		}
-	}
-	return false
+	return nil
 }
 
 func isConcreteReleaseBinaryPath(path string) bool {

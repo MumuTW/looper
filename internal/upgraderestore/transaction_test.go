@@ -17,26 +17,30 @@ func TestRestoreRollsBackOrdinaryRenameFailure(t *testing.T) {
 	injectedErr := errors.New("injected config install failure")
 	failed := false
 	journalObserved := false
-	operations := fileOperations{rename: func(sourcePath, targetPath string) error {
-		if !failed && targetPath == fixture.configPath && strings.Contains(filepath.Base(sourcePath), ".looper-restore-stage-") {
-			failed = true
-			journalObserved = true
-			encoded, err := os.ReadFile(JournalPath(fixture.databasePath))
-			if err != nil {
-				t.Fatalf("read journal before config rename: %v", err)
+	operations := fileOperations{
+		// Force rename path so the inject below is reachable (link would succeed on same FS).
+		link: func(string, string) error { return errors.New("force rename path") },
+		rename: func(sourcePath, targetPath string) error {
+			if !failed && targetPath == fixture.configPath && strings.Contains(filepath.Base(sourcePath), ".looper-restore-stage-") {
+				failed = true
+				journalObserved = true
+				encoded, err := os.ReadFile(JournalPath(fixture.databasePath))
+				if err != nil {
+					t.Fatalf("read journal before config rename: %v", err)
+				}
+				var journal restoreJournal
+				if err := json.Unmarshal(encoded, &journal); err != nil {
+					t.Fatalf("decode journal before config rename: %v", err)
+				}
+				if journal.Phase != phaseDatabaseInstalled {
+					t.Fatalf("journal phase before config rename = %q, want %q", journal.Phase, phaseDatabaseInstalled)
+				}
+				assertJournalArtifactsBesideTargets(t, journal)
+				return injectedErr
 			}
-			var journal restoreJournal
-			if err := json.Unmarshal(encoded, &journal); err != nil {
-				t.Fatalf("decode journal before config rename: %v", err)
-			}
-			if journal.Phase != phaseDatabaseInstalled {
-				t.Fatalf("journal phase before config rename = %q, want %q", journal.Phase, phaseDatabaseInstalled)
-			}
-			assertJournalArtifactsBesideTargets(t, journal)
-			return injectedErr
-		}
-		return os.Rename(sourcePath, targetPath)
-	}}
+			return os.Rename(sourcePath, targetPath)
+		},
+	}
 
 	err := restore(fixture.bundleDirectory, fixture.source, operations)
 	if !errors.Is(err, injectedErr) {
@@ -102,12 +106,15 @@ func TestRestoreRollsBackMissingTargetUsingStagedIdentity(t *testing.T) {
 	// the durable staged content hash (staged path is already gone).
 	fixture := newRestoreFixture(t, false)
 	injectedErr := errors.New("injected config install failure")
-	operations := fileOperations{rename: func(sourcePath, targetPath string) error {
-		if targetPath == fixture.configPath && strings.Contains(filepath.Base(sourcePath), ".looper-restore-stage-") {
-			return injectedErr
-		}
-		return os.Rename(sourcePath, targetPath)
-	}}
+	operations := fileOperations{
+		link: func(string, string) error { return errors.New("force rename path") },
+		rename: func(sourcePath, targetPath string) error {
+			if targetPath == fixture.configPath && strings.Contains(filepath.Base(sourcePath), ".looper-restore-stage-") {
+				return injectedErr
+			}
+			return os.Rename(sourcePath, targetPath)
+		},
+	}
 	err := restore(fixture.bundleDirectory, fixture.source, operations)
 	if !errors.Is(err, injectedErr) {
 		t.Fatalf("restore() error = %v, want injected failure", err)
@@ -195,12 +202,15 @@ func TestRollbackRefusesRecreatedTargetWhenUndoPresent(t *testing.T) {
 func TestRecoverRollsBackUncommittedRestore(t *testing.T) {
 	fixture := newRestoreFixture(t, true)
 	crashed := false
-	operations := fileOperations{rename: func(sourcePath, targetPath string) error {
-		if targetPath == fixture.configPath && strings.Contains(filepath.Base(sourcePath), ".looper-restore-stage-") {
-			panic("simulated process interruption")
-		}
-		return os.Rename(sourcePath, targetPath)
-	}}
+	operations := fileOperations{
+		link: func(string, string) error { return errors.New("force rename path") },
+		rename: func(sourcePath, targetPath string) error {
+			if targetPath == fixture.configPath && strings.Contains(filepath.Base(sourcePath), ".looper-restore-stage-") {
+				panic("simulated process interruption")
+			}
+			return os.Rename(sourcePath, targetPath)
+		},
+	}
 	func() {
 		defer func() {
 			if recovered := recover(); recovered != nil {

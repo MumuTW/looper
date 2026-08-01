@@ -36,6 +36,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 
 	"github.com/MumuTW/looper/internal/upgradebackup"
 )
@@ -87,9 +88,10 @@ type targetState struct {
 
 type fileOperations struct {
 	rename func(string, string) error
+	link   func(string, string) error
 }
 
-var defaultFileOperations = fileOperations{rename: os.Rename}
+var defaultFileOperations = fileOperations{rename: os.Rename, link: os.Link}
 
 // JournalPath returns the deterministic recovery-journal path for databasePath.
 // The journal sits beside the database so a caller can find it after a crash.
@@ -340,7 +342,9 @@ func restore(bundleDirectory string, source upgradebackup.Source, operations fil
 		return fail(err)
 	}
 
-	if err := operations.rename(databaseStage, source.DatabasePath); err != nil {
+	// Publish staged files with no-replace so a concurrent recreate at the
+	// target after undo is not clobbered by os.Rename.
+	if err := publishNoReplace(operations, databaseStage, source.DatabasePath, "restored database"); err != nil {
 		return fail(fmt.Errorf("install restored database: %w", err))
 	}
 	if err := syncDirectories(filepath.Dir(source.DatabasePath)); err != nil {
@@ -350,7 +354,7 @@ func restore(bundleDirectory string, source upgradebackup.Source, operations fil
 		return fail(err)
 	}
 
-	if err := operations.rename(configStage, source.ConfigPath); err != nil {
+	if err := publishNoReplace(operations, configStage, source.ConfigPath, "restored configuration"); err != nil {
 		return fail(fmt.Errorf("install restored configuration: %w", err))
 	}
 	if err := syncDirectories(filepath.Dir(source.DatabasePath), filepath.Dir(source.ConfigPath)); err != nil {
@@ -935,22 +939,51 @@ func detachAndRemoveOwnedRestoreTarget(entry journalEntry, description string) e
 	return nil
 }
 
-// installNoReplace moves source onto dest only when dest is absent. Uses link
-// then remove so a concurrent create at dest is not replaced (os.Rename would).
+// installNoReplace moves source onto dest only when dest is absent.
 func installNoReplace(source, dest, description string) error {
+	return publishNoReplace(defaultFileOperations, source, dest, description)
+}
+
+// publishNoReplace publishes source to dest without replacing an existing dest.
+// Prefer hard-link (fails if dest exists). Cross-device (EXDEV) uses O_EXCL copy.
+// Other link failures fall through to rename only after re-checking dest is
+// absent (used by tests that inject link/rename failures).
+func publishNoReplace(operations fileOperations, source, dest, description string) error {
 	if _, err := os.Lstat(dest); err == nil {
 		return fmt.Errorf("refusing to install %s: target %s already exists", description, dest)
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("inspect %s destination: %w", description, err)
 	}
-	if err := os.Link(source, dest); err != nil {
-		// Fallback when link is unsupported (cross-device): exclusive create+copy.
-		if linkErr := copyFileExclusive(source, dest); linkErr != nil {
-			return fmt.Errorf("install %s: link=%v copy=%w", description, err, linkErr)
-		}
+	link := operations.link
+	if link == nil {
+		link = os.Link
 	}
-	if err := os.Remove(source); err != nil {
-		return fmt.Errorf("remove source after installing %s: %w", description, err)
+	if err := link(source, dest); err == nil {
+		if err := os.Remove(source); err != nil {
+			return fmt.Errorf("remove source after installing %s: %w", description, err)
+		}
+		return nil
+	} else if errors.Is(err, syscall.EXDEV) {
+		if _, err := os.Lstat(dest); err == nil {
+			return fmt.Errorf("refusing to install %s: target %s already exists", description, dest)
+		}
+		if err := copyFileExclusive(source, dest); err != nil {
+			return fmt.Errorf("install %s: %w", description, err)
+		}
+		if err := os.Remove(source); err != nil {
+			return fmt.Errorf("remove source after installing %s: %w", description, err)
+		}
+		return nil
+	}
+	if _, err := os.Lstat(dest); err == nil {
+		return fmt.Errorf("refusing to install %s: target %s already exists", description, dest)
+	}
+	rename := operations.rename
+	if rename == nil {
+		rename = os.Rename
+	}
+	if err := rename(source, dest); err != nil {
+		return fmt.Errorf("install %s: %w", description, err)
 	}
 	return nil
 }
