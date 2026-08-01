@@ -1971,6 +1971,13 @@ func (g *Gateway) ValidateMergifyRouting(ctx context.Context, input ValidateMerg
 		QueueRules []struct {
 			QueueConditions []string `yaml:"queue_conditions"`
 		} `yaml:"queue_rules"`
+		// merge_protections is the list of protection rules that activates
+		// auto_merge_conditions. Mergify does not honor auto_merge_conditions
+		// unless at least one merge_protections entry exists, so the validator
+		// must require it rather than accept an inactive contract.
+		MergeProtections []struct {
+			Name string `yaml:"name"`
+		} `yaml:"merge_protections"`
 		MergeProtectionsSettings struct {
 			AutoMergeConditions []string `yaml:"auto_merge_conditions"`
 		} `yaml:"merge_protections_settings"`
@@ -1987,6 +1994,9 @@ func (g *Gateway) ValidateMergifyRouting(ctx context.Context, input ValidateMerg
 				return fmt.Errorf(".mergify.yml queue_rules[%d] queue_conditions missing %q", index, condition)
 			}
 		}
+	}
+	if len(contract.MergeProtections) == 0 {
+		return fmt.Errorf(".mergify.yml has no merge_protections; auto_merge_conditions require at least one active merge-protection rule")
 	}
 	if !hasMergifyCondition(contract.MergeProtectionsSettings.AutoMergeConditions, "label = auto-merge") {
 		return fmt.Errorf(".mergify.yml has no auto-merge label contract")

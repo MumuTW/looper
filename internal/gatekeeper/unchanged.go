@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/MumuTW/looper/internal/config"
 	githubinfra "github.com/MumuTW/looper/internal/infra/github"
 	"github.com/MumuTW/looper/internal/storage"
 )
@@ -141,15 +142,9 @@ func latestGateReports(ctx context.Context, repos *storage.Repositories, project
 //
 // Skipping is refused unless every one of these holds: a previous report exists,
 // it recorded a fingerprint, the fingerprint still matches, the gate is not
-// waiting on check state, the gate is not waiting on a review event that has
-// since appeared, and the report is younger than maxSkipAge.
-//
-// reviewEvidenceAppeared is the result of a cheap local event-log check made by
-// the caller for reports awaiting a current-head review. When the review event
-// has not appeared, the PR is skipped because re-evaluating would reach the same
-// conclusion without the event and would pay forge round trips every tick; when
-// it has appeared, the PR is re-evaluated so the new evidence is observed.
-func skipUnchanged(previous Report, hasPrevious bool, fingerprint string, now time.Time, reviewEvidenceAppeared bool) (Report, bool) {
+// waiting on check state, the report is younger than maxSkipAge, and — at auto
+// trust — the report does not carry a failed required check.
+func skipUnchanged(previous Report, hasPrevious bool, fingerprint string, trust config.GatekeeperTrustLevel, now time.Time) (Report, bool) {
 	if !hasPrevious || strings.TrimSpace(previous.SourceFingerprint) == "" {
 		return Report{}, false
 	}
@@ -159,7 +154,12 @@ func skipUnchanged(previous Report, hasPrevious bool, fingerprint string, now ti
 	if reportAwaitsCheckState(previous) {
 		return Report{}, false
 	}
-	if reportAwaitsCurrentHeadReview(previous) && reviewEvidenceAppeared {
+	// At auto trust the merge route is applied only during an evaluation. A
+	// failed check that is manually rerun to success turns the gate green
+	// without moving any field the list page can observe, so reusing the
+	// failed report would leave a now-eligible PR unqueued until maxSkipAge.
+	// Re-evaluate instead so the route is published promptly.
+	if trust == config.GatekeeperTrustAuto && reportHasFailedCheck(previous) {
 		return Report{}, false
 	}
 	evaluatedAt, err := time.Parse(time.RFC3339Nano, previous.EvaluatedAt)
@@ -170,4 +170,13 @@ func skipUnchanged(previous Report, hasPrevious bool, fingerprint string, now ti
 		return Report{}, false
 	}
 	return previous, true
+}
+
+func reportHasFailedCheck(report Report) bool {
+	for _, reason := range report.Reasons {
+		if reason.Code == ReasonCheckFailed {
+			return true
+		}
+	}
+	return false
 }
