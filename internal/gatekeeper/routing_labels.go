@@ -25,9 +25,10 @@ type routingLabelPlan struct {
 }
 
 // reconcileRoutingLabels projects the durable Gate report onto the two labels
-// consumed by the Mergify queue. The report and the label mutation are bound to
-// the same fresh head read; a changed head causes the projection to be retried on
-// the next evaluation rather than routing a different commit.
+// consumed by the Mergify queue. A label is an authority-bearing projection, so
+// an automatic route is preceded by a fresh pull-request state read and a final
+// head read. Any state drift causes the projection to be retried on the next
+// evaluation rather than routing a different commit or policy state.
 func (r *Runner) reconcileRoutingLabels(ctx context.Context, report Report, previous *Report) error {
 	trust := r.trustFor(report.ProjectID)
 	if trust == config.GatekeeperTrustObserve && (previous == nil || !previousPublished(*previous)) {
@@ -35,10 +36,16 @@ func (r *Runner) reconcileRoutingLabels(ctx context.Context, report Report, prev
 	}
 
 	plan := routingLabelPlan{}
-	if trust != config.GatekeeperTrustObserve && report.Eligible {
+	if trust == config.GatekeeperTrustAuto && report.Eligible {
 		plan.autoMerge = true
 	} else if trust != config.GatekeeperTrustObserve && reportNeedsHumanReview(previous, report) {
 		plan.needsHumanReview = true
+	}
+	// Removal-only projections are fail-safe and do not need an authority read:
+	// deleting a stale route can never authorize a merge. This also lets observe
+	// demotion retire labels even when the provider no longer returns a head.
+	if !plan.autoMerge && !plan.needsHumanReview {
+		return r.applyRoutingLabelPlan(ctx, report, plan)
 	}
 
 	expectedHead := strings.TrimSpace(report.Evidence.FinalObservedHeadSHA)
@@ -54,6 +61,18 @@ func (r *Runner) reconcileRoutingLabels(ctx context.Context, report Report, prev
 		}
 		return r.applyRoutingLabelPlan(ctx, report, plan)
 	}
+	if plan.autoMerge {
+		if err := r.github.ValidateMergifyRouting(ctx, githubinfra.ValidateMergifyRoutingInput{
+			Repo: report.Repo, CWD: r.projectCWD(ctx, report.ProjectID),
+		}); err != nil {
+			return fmt.Errorf("validate Mergify routing contract: %w", err)
+		}
+	}
+	// Read the PR state after the configuration check so this authority read is
+	// immediately adjacent to the final head check and label mutation.
+	if err := r.revalidateRoutingState(ctx, report, expectedHead); err != nil {
+		return err
+	}
 
 	currentHead, err := r.github.GetPullRequestHeadSHA(ctx, githubinfra.ViewPullRequestInput{
 		Repo: report.Repo, PRNumber: report.PRNumber, CWD: r.projectCWD(ctx, report.ProjectID),
@@ -65,6 +84,46 @@ func (r *Runner) reconcileRoutingLabels(ctx context.Context, report Report, prev
 		return fmt.Errorf("skip routing labels because pull request head moved from %s to %s", expectedHead, strings.TrimSpace(currentHead))
 	}
 	return r.applyRoutingLabelPlan(ctx, report, plan)
+}
+
+func (r *Runner) revalidateRoutingState(ctx context.Context, report Report, expectedHead string) error {
+	input := githubinfra.ViewPullRequestInput{
+		Repo: report.Repo, PRNumber: report.PRNumber, CWD: r.projectCWD(ctx, report.ProjectID),
+	}
+	detail, err := r.github.ViewPullRequestForGatekeeper(ctx, input)
+	if err != nil {
+		return fmt.Errorf("revalidate pull-request state before routing labels: %w", err)
+	}
+	if detail.Number != 0 && detail.Number != report.PRNumber {
+		return fmt.Errorf("skip routing labels because pull request identity changed from %d to %d", report.PRNumber, detail.Number)
+	}
+	if strings.TrimSpace(detail.HeadSHA) != expectedHead {
+		return fmt.Errorf("skip routing labels because pull request head moved from %s to %s", expectedHead, strings.TrimSpace(detail.HeadSHA))
+	}
+	if state := strings.TrimSpace(report.Evidence.PullRequestState); state != "" && !strings.EqualFold(state, detail.State) {
+		return fmt.Errorf("skip routing labels because pull request state changed from %s to %s", state, strings.TrimSpace(detail.State))
+	}
+	if report.Evidence.PullRequestState != "" && report.Evidence.Draft != detail.IsDraft {
+		return fmt.Errorf("skip routing labels because draft state changed")
+	}
+	if report.Evidence.BaseRefName != "" && strings.TrimSpace(report.Evidence.BaseRefName) != strings.TrimSpace(detail.BaseRefName) {
+		return fmt.Errorf("skip routing labels because base branch changed from %s to %s", report.Evidence.BaseRefName, strings.TrimSpace(detail.BaseRefName))
+	}
+	if report.Evidence.ReviewDecision != "" && !strings.EqualFold(report.Evidence.ReviewDecision, detail.ReviewDecision) {
+		return fmt.Errorf("skip routing labels because review decision changed from %s to %s", report.Evidence.ReviewDecision, strings.TrimSpace(detail.ReviewDecision))
+	}
+	recordedHold := len(report.Evidence.HoldLabels) > 0
+	currentHold := labels.Has(detail.Labels, labels.HoldGlobal)
+	if recordedHold != currentHold {
+		return fmt.Errorf("skip routing labels because hold state changed")
+	}
+	if report.Evidence.BaseRefName != "" {
+		currentPolicy := r.policyPermitsTarget(report.ProjectID, report.Repo, report.Evidence.BaseRefName)
+		if currentPolicy != report.Evidence.ProjectPolicyPermitsTarget {
+			return fmt.Errorf("skip routing labels because project policy changed")
+		}
+	}
+	return nil
 }
 
 func (r *Runner) applyRoutingLabelPlan(ctx context.Context, report Report, plan routingLabelPlan) error {

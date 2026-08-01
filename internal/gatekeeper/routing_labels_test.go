@@ -2,12 +2,14 @@ package gatekeeper
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"slices"
 	"testing"
 	"time"
 
 	"github.com/MumuTW/looper/internal/config"
+	githubinfra "github.com/MumuTW/looper/internal/infra/github"
 	"github.com/MumuTW/looper/internal/labels"
 )
 
@@ -58,6 +60,21 @@ func TestAutoTrustRoutesEligiblePullRequestThroughMergify(t *testing.T) {
 				t.Fatalf("auto trust emitted obsolete direct-merge outcome: %#v", event)
 			}
 		}
+	}
+}
+
+func TestAdviseTrustDoesNotRouteEligiblePullRequestToAutoMerge(t *testing.T) {
+	fixture := newGatekeeperFixture(t)
+	report := evaluateRoutingReport(t, routingRunner(fixture, config.GatekeeperTrustAdvise))
+
+	if !report.Eligible {
+		t.Fatalf("report = %#v, want eligible", report)
+	}
+	if len(fixture.github.labelAdds) != 0 {
+		t.Fatalf("advise label adds = %#v, want no auto-merge route", fixture.github.labelAdds)
+	}
+	if fixture.github.validateMergifyCalls != 0 {
+		t.Fatalf("advise validated Mergify %d times, want no auto-route dependency", fixture.github.validateMergifyCalls)
 	}
 }
 
@@ -130,7 +147,7 @@ func TestRepeatedReviewChangesEscalatesOnSecondEvaluation(t *testing.T) {
 
 func TestEligibleThenMechanicalBlockRemovesAutoMergeWithoutEscalation(t *testing.T) {
 	fixture := newGatekeeperFixture(t)
-	runner := routingRunner(fixture, config.GatekeeperTrustAdvise)
+	runner := routingRunner(fixture, config.GatekeeperTrustAuto)
 	eligible := Report{ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, ObservedHeadSHA: "head-1", Evidence: Evidence{FinalObservedHeadSHA: "head-1"}}
 	if _, err := runner.persist(context.Background(), eligible); err != nil {
 		t.Fatalf("eligible persist() error = %v", err)
@@ -151,34 +168,108 @@ func TestEligibleThenMechanicalBlockRemovesAutoMergeWithoutEscalation(t *testing
 func TestRoutingLabelsSkipWhenHeadMovesBeforeProjection(t *testing.T) {
 	fixture := newGatekeeperFixture(t)
 	fixture.github.headSHAResponses = []string{"head-1", "head-2"}
-	evaluateRoutingReport(t, routingRunner(fixture, config.GatekeeperTrustAdvise))
+	if _, err := routingRunner(fixture, config.GatekeeperTrustAuto).EvaluatePullRequest(context.Background(), EvaluationInput{
+		ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, ExpectedHeadSHA: "head-1",
+	}); err == nil {
+		t.Fatal("EvaluatePullRequest() succeeded after the head moved before projection")
+	}
 
 	if len(fixture.github.labelAdds) != 0 || len(fixture.github.labelRemoves) != 0 {
 		t.Fatalf("routing labels changed across a head race: adds=%#v removes=%#v", fixture.github.labelAdds, fixture.github.labelRemoves)
 	}
 }
 
+func TestRoutingLabelsSkipWhenReviewStateChangesBeforeProjection(t *testing.T) {
+	fixture := newGatekeeperFixture(t)
+	views := 0
+	fixture.github.beforeView = func(github *fakeGatekeeperGitHub) {
+		views++
+		if views == 2 {
+			github.detail.ReviewDecision = "CHANGES_REQUESTED"
+		}
+	}
+	if _, err := routingRunner(fixture, config.GatekeeperTrustAuto).EvaluatePullRequest(context.Background(), EvaluationInput{
+		ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, ExpectedHeadSHA: "head-1",
+	}); err == nil {
+		t.Fatal("EvaluatePullRequest() succeeded after review state changed before projection")
+	}
+	if len(fixture.github.labelAdds) != 0 || len(fixture.github.labelRemoves) != 0 {
+		t.Fatalf("routing labels changed across a review-state race: adds=%#v removes=%#v", fixture.github.labelAdds, fixture.github.labelRemoves)
+	}
+}
+
+func TestAutoTrustRequiresMergifyRoutingContract(t *testing.T) {
+	fixture := newGatekeeperFixture(t)
+	fixture.github.validateMergifyErr = errors.New(".mergify.yml is missing")
+	if _, err := routingRunner(fixture, config.GatekeeperTrustAuto).EvaluatePullRequest(context.Background(), EvaluationInput{
+		ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, ExpectedHeadSHA: "head-1",
+	}); err == nil {
+		t.Fatal("EvaluatePullRequest() succeeded without a valid Mergify routing contract")
+	}
+	if len(fixture.github.labelAdds) != 0 {
+		t.Fatalf("label adds = %#v, want no route before dependency validation", fixture.github.labelAdds)
+	}
+}
+
 func TestRoutingLabelFailureDoesNotLoseDurableReport(t *testing.T) {
 	fixture := newGatekeeperFixture(t)
 	fixture.github.labelErr = errors.New("label permission denied")
-	report := evaluateRoutingReport(t, routingRunner(fixture, config.GatekeeperTrustAuto))
-
+	report, err := routingRunner(fixture, config.GatekeeperTrustAuto).EvaluatePullRequest(context.Background(), EvaluationInput{
+		ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, ExpectedHeadSHA: "head-1",
+	})
+	if err == nil {
+		t.Fatal("EvaluatePullRequest() succeeded despite label projection failure")
+	}
 	if !report.Eligible {
-		t.Fatalf("report = %#v, want eligible despite projection failure", report)
+		t.Fatalf("returned report = %#v, want the durable gate report despite projection failure", report)
 	}
 	events, err := fixture.repos.Events.List(context.Background(), 50)
 	if err != nil {
 		t.Fatalf("Events.List() error = %v", err)
 	}
-	found := false
+	found := 0
+	var retryMarker Report
 	for _, event := range events {
 		if event.EventType == GateReportEventType {
-			found = true
-			break
+			found++
+			var candidate Report
+			if err := json.Unmarshal([]byte(event.PayloadJSON), &candidate); err != nil {
+				t.Fatalf("decode gate report: %v", err)
+			}
+			if candidate.SourceFingerprint == "" && hasReason(candidate, ReasonRoutingProjectionFailed) {
+				retryMarker = candidate
+			}
 		}
 	}
-	if !found {
+	if found != 2 {
 		t.Fatal("label projection failure discarded the durable gate report")
+	}
+	if retryMarker.SourceFingerprint != "" || !hasReason(retryMarker, ReasonRoutingProjectionFailed) {
+		t.Fatalf("retry marker = %#v, want empty fingerprint and routing failure reason", retryMarker)
+	}
+}
+
+func TestRoutingLabelFailureForcesRetryOnUnchangedDiscovery(t *testing.T) {
+	fixture := newGatekeeperFixture(t)
+	fixture.github.openPullRequests = []githubinfra.PullRequestSummary{{
+		Number: 42, State: "OPEN", HeadSHA: "head-1", BaseRefName: "main", ReviewDecision: "APPROVED",
+		UpdatedAt: "2026-07-30T09:00:00Z",
+	}}
+	fixture.github.labelErr = errors.New("label permission denied")
+	runner := routingRunner(fixture, config.GatekeeperTrustAuto)
+	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err == nil {
+		t.Fatal("first discovery succeeded despite label projection failure")
+	}
+	fixture.github.labelErr = nil
+	second, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("second discovery() error = %v", err)
+	}
+	if second.Evaluated != 1 || second.Skipped != 0 {
+		t.Fatalf("second discovery = %d evaluated / %d skipped, want retry evaluation", second.Evaluated, second.Skipped)
+	}
+	if len(fixture.github.labelAdds) != 1 || !slices.Equal(fixture.github.labelAdds[0].Labels, []string{labels.AutoMerge}) {
+		t.Fatalf("label adds after retry = %#v, want auto-merge route", fixture.github.labelAdds)
 	}
 }
 
