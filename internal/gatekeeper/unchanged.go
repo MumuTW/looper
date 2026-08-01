@@ -98,6 +98,8 @@ var checkReasonCodes = map[ReasonCode]struct{}{
 // leaves Evidence.CodexReview.CurrentHeadValid false, so checking the evidence
 // alone would miss that case and checking the reason alone would miss a
 // provider-blocked report. Both signals are authoritative.
+var _ = reportAwaitsCurrentHeadReview
+
 func reportAwaitsCurrentHeadReview(report Report) bool {
 	// A provider-blocked report replaces its reasons, but retains the invalid
 	// review projection. It must remain retryable until evidence arrives. New

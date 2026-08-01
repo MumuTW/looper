@@ -882,6 +882,10 @@ func (f *fakeGatekeeperGitHub) GetPullRequestHeadSHA(context.Context, githubinfr
 	return f.finalHeadSHA, nil
 }
 
+func (f *fakeGatekeeperGitHub) GetPullRequestHeadAndBaseSHA(context.Context, githubinfra.ViewPullRequestInput) (string, string, error) {
+	return f.finalHeadSHA, f.finalBaseSHA, nil
+}
+
 func (f *fakeGatekeeperGitHub) AddPullRequestLabels(_ context.Context, input githubinfra.PullRequestLabelsInput) error {
 	if f.labelErr != nil {
 		return f.labelErr

@@ -214,6 +214,7 @@ type GitHubGateway interface {
 	// merge base (the diff budget) can detect a base advance that the head
 	// revalidation alone cannot.
 	GetPullRequestHeadAndBaseSHA(context.Context, githubinfra.ViewPullRequestInput) (string, string, error)
+	GetPullRequestHeadSHA(context.Context, githubinfra.ViewPullRequestInput) (string, error)
 	ListIssueComments(context.Context, githubinfra.ViewIssueInput) ([]githubinfra.CommentInfo, error)
 	ListIssueCommentsContaining(context.Context, githubinfra.ViewIssueInput, []string) ([]githubinfra.CommentInfo, error)
 	CreateIssueComment(context.Context, githubinfra.IssueCommentInput) (githubinfra.IssueCommentResult, error)
@@ -1035,7 +1036,18 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 		}
 	}
 
-	finalHead, finalBase, err := r.github.GetPullRequestHeadAndBaseSHA(ctx, viewInput)
+	// The final revalidation read confirms the head has not moved between the
+	// evaluation and persistence. When the diff budget is enabled it also
+	// returns the base ref OID so a gate whose verdict depends on the merge
+	// base can detect a base advance that the head revalidation alone cannot;
+	// when the budget is disabled a base advance is not a gate input, so the
+	// lighter head-only read is sufficient.
+	var finalHead, finalBase string
+	if budgetEnabled {
+		finalHead, finalBase, err = r.github.GetPullRequestHeadAndBaseSHA(ctx, viewInput)
+	} else {
+		finalHead, err = r.github.GetPullRequestHeadSHA(ctx, viewInput)
+	}
 	if err != nil {
 		return r.persistProviderBlock(ctx, report, ReasonProviderStateUnavailable, "head_revalidation")
 	}
@@ -1046,17 +1058,13 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 	if report.Evidence.FinalObservedHeadSHA != report.ObservedHeadSHA {
 		report.Reasons = append(report.Reasons, Reason{Code: ReasonHeadStale})
 	}
-	// The diff-budget verdict was captured against diffBudgetBaseSHA at the
-	// merge-watch read. The base branch can advance between that read and this
-	// final observation without moving the head, so the head revalidation above
-	// cannot catch it: GitHub would recompute the change size against a new
-	// merge base while the recorded counts still describe the previous one, and
-	// an eligible verdict would proceed toward auto-merge on stale evidence. Fail
-	// closed so the next tick (whose fingerprint folds in BaseSHA while the budget
-	// is enabled) re-evaluates against the current base. diffBudgetBaseSHA is
-	// guaranteed non-empty here because the budget block above fails closed when
-	// the provider omits it.
-	if budgetEnabled && strings.TrimSpace(finalBase) != diffBudgetBaseSHA {
+	// The diff-budget verdict was anchored to diffBudgetBaseSHA. A base branch
+	// can advance between the merge-watch read and this final revalidation
+	// without moving the head, so the head check above cannot detect that the
+	// recorded counts now describe a stale merge base. Fail closed so an
+	// eligible verdict is not persisted on counts GitHub would no longer
+	// produce.
+	if budgetEnabled && diffBudgetBaseSHA != "" && strings.TrimSpace(finalBase) != diffBudgetBaseSHA {
 		return r.persistProviderBlock(ctx, report, ReasonProviderStateAmbiguous, "diff_budget_base")
 	}
 	if reviewPolicyEnabled && strings.TrimSpace(finalBase) != reviewCapacityBaseSHA {
