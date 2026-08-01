@@ -233,9 +233,11 @@ already claimed queued work (drain leaves the queue intact). `package.autoUpgrad
 is not a supported managed upgrade path (legacy decode only).
 
 Supported service layouts must launch `looperd` through the activated
-`release-root/current` pointer (or an equivalent path that follows that
-pointer). Activation rewrites only the pointer; it does not rewrite unit files
-outside this tree.
+`release-root/current` pointer. `looperd service install` rewrites a binary
+path under `releases/<id>/` to `current/looperd` automatically when that
+pointer exists, so `activate-release` switches the next supervised start
+without rewriting unit files. Activation returns `serviceExecutable` with that
+path; restart the supervised unit after activate so the new image is loaded.
 
 
 ### Rollback restore

@@ -228,6 +228,16 @@ func ValidateConfiguredToolPaths(cfg config.Config, detection map[string]config.
 	return validateConfiguredToolPaths(cfg, detection)
 }
 
+// ValidateSandboxRuntime is the read-only sandbox readiness check shared by
+// Bootstrap and looperd --check-config. check defaults to the process sandbox
+// Available probe when nil.
+func ValidateSandboxRuntime(cfg config.Config, check func() error) error {
+	if check == nil {
+		check = processsandbox.Available
+	}
+	return validateSandboxRuntime(cfg, check)
+}
+
 func validateConfiguredToolPaths(cfg config.Config, detection map[string]config.ToolDetectionStatus) error {
 	checks := []struct {
 		statusKey string

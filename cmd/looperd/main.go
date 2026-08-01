@@ -1315,24 +1315,31 @@ func runConfigCheck(args []string, stdout, stderr io.Writer, deps runDeps) int {
 		_, _ = fmt.Fprintf(stderr, "looperd: validate configuration: %v\n", err)
 		return 1
 	}
-	// Reuse the non-destructive Bootstrap prerequisite that fails closed when
-	// an explicitly configured tool path is missing or not executable. Without
-	// this, preflight can report targetConfigCompatible while real startup
-	// fails in validateConfiguredToolPaths.
+	// Reuse the non-destructive Bootstrap prerequisites that fail closed when
+	// an explicitly configured tool path is missing or the sandbox runtime is
+	// required but unavailable. Without this, preflight can report
+	// targetConfigCompatible while real startup fails in Bootstrap.
 	if err := bootstrap.ValidateConfiguredToolPaths(loaded.Config, loaded.Metadata.ToolDetection); err != nil {
-		var validationErr *config.ConfigValidationError
-		if errors.As(err, &validationErr) {
-			_, _ = fmt.Fprintln(stderr, "looperd configuration is incompatible:")
-			for _, issue := range validationErr.Issues {
-				_, _ = fmt.Fprintf(stderr, "- %s: %s\n", issue.Path, issue.Message)
-			}
-			return 1
-		}
-		_, _ = fmt.Fprintf(stderr, "looperd: validate configuration: %v\n", err)
-		return 1
+		return writeConfigCheckError(stderr, err)
+	}
+	if err := bootstrap.ValidateSandboxRuntime(loaded.Config, nil); err != nil {
+		return writeConfigCheckError(stderr, err)
 	}
 	_, _ = fmt.Fprintln(stdout, "configuration is compatible")
 	return 0
+}
+
+func writeConfigCheckError(stderr io.Writer, err error) int {
+	var validationErr *config.ConfigValidationError
+	if errors.As(err, &validationErr) {
+		_, _ = fmt.Fprintln(stderr, "looperd configuration is incompatible:")
+		for _, issue := range validationErr.Issues {
+			_, _ = fmt.Fprintf(stderr, "- %s: %s\n", issue.Path, issue.Message)
+		}
+		return 1
+	}
+	_, _ = fmt.Fprintf(stderr, "looperd: validate configuration: %v\n", err)
+	return 1
 }
 
 func hasCheckConfigArg(args []string) bool {

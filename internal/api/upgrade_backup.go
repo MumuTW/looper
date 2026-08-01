@@ -2,15 +2,23 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"strings"
+	"time"
 
 	"github.com/MumuTW/looper/internal/config"
 	"github.com/MumuTW/looper/internal/daemonbinary"
 	"github.com/MumuTW/looper/internal/storage"
 	"github.com/MumuTW/looper/internal/upgradebackup"
+	"github.com/MumuTW/looper/internal/version"
 )
+
+// cliIdentityTimeout bounds the short-lived `looper version --json` probe used
+// to prove tools.looperPath matches the running daemon build before backup.
+const cliIdentityTimeout = 15 * time.Second
 
 func (h *Handler) createUpgradeBackup(ctx context.Context) (upgradebackup.Result, error) {
 	if h == nil || h.context.Runtime == nil {
@@ -34,6 +42,9 @@ func (h *Handler) createUpgradeBackup(ctx context.Context) (upgradebackup.Result
 	}
 	cliPath := strings.TrimSpace(*cfg.Tools.LooperPath)
 	if err := requireExecutableFile(cliPath, "CLI binary"); err != nil {
+		return upgradebackup.Result{}, err
+	}
+	if err := requireMatchingCLIBuild(ctx, cliPath); err != nil {
 		return upgradebackup.Result{}, err
 	}
 	services := h.context.Runtime.Services()
@@ -150,4 +161,37 @@ func requireExecutableFile(path, label string) error {
 		return fmt.Errorf("refusing upgrade backup: %s %s is a directory", label, path)
 	}
 	return nil
+}
+
+// requireMatchingCLIBuild ensures tools.looperPath is the matching pair for the
+// running daemon (version.Current). A mismatched CLI would produce a rollback
+// bundle that cannot restore the live build.
+func requireMatchingCLIBuild(ctx context.Context, cliPath string) error {
+	cli, err := readCLIBuildIdentity(ctx, cliPath)
+	if err != nil {
+		return fmt.Errorf("refusing upgrade backup: cannot read CLI build identity at %s: %w", cliPath, err)
+	}
+	daemon := version.Current()
+	if !cli.SameBuild(daemon) {
+		return fmt.Errorf("refusing upgrade backup: CLI at %s does not match the running daemon build (cli=%s daemon=%s)", cliPath, cli.Version, daemon.Version)
+	}
+	return nil
+}
+
+func readCLIBuildIdentity(ctx context.Context, cliPath string) (version.Info, error) {
+	probeCtx, cancel := context.WithTimeout(ctx, cliIdentityTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(probeCtx, cliPath, "version", "--json")
+	out, err := cmd.Output()
+	if err != nil {
+		return version.Info{}, err
+	}
+	var info version.Info
+	if err := json.Unmarshal(out, &info); err != nil {
+		return version.Info{}, fmt.Errorf("decode version --json: %w", err)
+	}
+	if !info.Complete() {
+		return version.Info{}, fmt.Errorf("CLI build identity is incomplete")
+	}
+	return info, nil
 }

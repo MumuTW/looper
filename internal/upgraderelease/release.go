@@ -55,6 +55,10 @@ type ActivationResult struct {
 	RootDir           string `json:"rootDir"`
 	PreviousReleaseID string `json:"previousReleaseId,omitempty"`
 	CurrentReleaseID  string `json:"currentReleaseId"`
+	// ServiceExecutable is the path a supervised unit must launch after
+	// activation (root/current/looperd). Install via looperd service install
+	// rewrites release-tree binaries onto this pointer automatically.
+	ServiceExecutable string `json:"serviceExecutable"`
 }
 
 // Stage copies both executable inputs into a new immutable release directory.
@@ -184,6 +188,8 @@ func Verify(rootDir, releaseID string) (StageResult, error) {
 
 // Activate switches root/current to a verified release through one atomic
 // rename of a relative symlink. It never starts, stops, or signals looperd.
+// The returned ServiceExecutable is root/current/looperd — the path supervised
+// installs must use so activation alone switches the next service start.
 func Activate(rootDir, releaseID string) (ActivationResult, error) {
 	staged, err := Verify(rootDir, releaseID)
 	if err != nil {
@@ -193,8 +199,9 @@ func Activate(rootDir, releaseID string) (ActivationResult, error) {
 	if err != nil {
 		return ActivationResult{}, err
 	}
+	serviceExecutable := CurrentDaemonExecutable(staged.RootDir)
 	if previous == releaseID {
-		return ActivationResult{RootDir: staged.RootDir, PreviousReleaseID: previous, CurrentReleaseID: releaseID}, nil
+		return ActivationResult{RootDir: staged.RootDir, PreviousReleaseID: previous, CurrentReleaseID: releaseID, ServiceExecutable: serviceExecutable}, nil
 	}
 	temporary, err := os.CreateTemp(staged.RootDir, ".current-")
 	if err != nil {
@@ -219,7 +226,17 @@ func Activate(rootDir, releaseID string) (ActivationResult, error) {
 	if err := syncDirectory(staged.RootDir); err != nil {
 		return ActivationResult{}, err
 	}
-	return ActivationResult{RootDir: staged.RootDir, PreviousReleaseID: previous, CurrentReleaseID: releaseID}, nil
+	return ActivationResult{RootDir: staged.RootDir, PreviousReleaseID: previous, CurrentReleaseID: releaseID, ServiceExecutable: serviceExecutable}, nil
+}
+
+// CurrentDaemonExecutable is the supervised-launch path for an activated
+// release tree (root/current/looperd).
+func CurrentDaemonExecutable(rootDir string) string {
+	root := strings.TrimSpace(rootDir)
+	if root == "" {
+		return ""
+	}
+	return filepath.Join(filepath.Clean(root), "current", "looperd")
 }
 
 func ReleaseIDs(rootDir string) ([]string, error) {
