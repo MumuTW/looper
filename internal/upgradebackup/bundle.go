@@ -177,12 +177,32 @@ func Create(ctx context.Context, input Input) (Result, error) {
 	if err := os.WriteFile(filepath.Join(bundle, "manifest.json"), append(encoded, '\n'), 0o600); err != nil {
 		return fail(fmt.Errorf("write backup manifest: %w", err))
 	}
-	// Durably publish the completed bundle before reporting success so a crash
-	// cannot leave a returned path with incomplete/torn contents.
+	// Durably publish every artifact and the parent directory before reporting
+	// success so a crash cannot leave a returned path with incomplete/torn files.
+	for _, name := range SortedFileNames(manifest) {
+		if err := syncFile(filepath.Join(bundle, name)); err != nil {
+			return fail(fmt.Errorf("sync backup file %s: %w", name, err))
+		}
+	}
+	if err := syncFile(filepath.Join(bundle, "manifest.json")); err != nil {
+		return fail(fmt.Errorf("sync backup manifest: %w", err))
+	}
 	if err := syncDirectory(bundle); err != nil {
 		return fail(fmt.Errorf("sync completed backup bundle: %w", err))
 	}
+	if err := syncDirectory(filepath.Dir(bundle)); err != nil {
+		return fail(fmt.Errorf("sync backup root: %w", err))
+	}
 	return Result{Directory: bundle, Manifest: manifest}, nil
+}
+
+func syncFile(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return f.Sync()
 }
 
 func syncDirectory(path string) error {
@@ -391,10 +411,8 @@ func absolutePath(path, description string) (string, error) {
 
 // absoluteFilesystemDatabasePath normalizes storage.dbPath (including file: URIs)
 // to an absolute filesystem path before it is recorded for restore.
-//
-// Leaf symlinks are refused: following a retargeted symlink after SQLite opened
-// the previous target would record Source.DatabasePath for a different file
-// than the coordinator snapshot, so restore would overwrite the wrong database.
+// Prefer the path frozen on the open coordinator when available; this fallback
+// rejects a leaf symlink and resolves remaining parent symlinks at Create time.
 func absoluteFilesystemDatabasePath(dbPath string) (string, error) {
 	path, isFile, err := storage.SQLiteFilesystemPath(dbPath)
 	if err != nil {
@@ -408,19 +426,16 @@ func absoluteFilesystemDatabasePath(dbPath string) (string, error) {
 		return "", fmt.Errorf("resolve database path: %w", err)
 	}
 	abs = filepath.Clean(abs)
-	info, err := os.Lstat(abs)
-	if err != nil {
-		if os.IsNotExist(err) {
-			// Destination may not exist yet for some operators; still record abs.
-			return abs, nil
+	if info, err := os.Lstat(abs); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			return "", fmt.Errorf("database path %s is a leaf symlink; refuse restore metadata that can diverge from the open SQLite inode", abs)
 		}
-		return "", fmt.Errorf("stat database path: %w", err)
-	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		return "", fmt.Errorf("database path %s is a symlink; refuse restore metadata that can diverge from the open SQLite inode — point storage.dbPath at the real file", abs)
-	}
-	if info.IsDir() {
-		return "", fmt.Errorf("database path %s is a directory", abs)
+		if info.IsDir() {
+			return "", fmt.Errorf("database path %s is a directory", abs)
+		}
+		if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+			return filepath.Clean(resolved), nil
+		}
 	}
 	return abs, nil
 }

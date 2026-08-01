@@ -24,7 +24,12 @@ type SQLiteCoordinatorOptions struct {
 }
 
 type SQLiteCoordinator struct {
-	db     *sql.DB
+	db *sql.DB
+	// path is the absolute filesystem path frozen at open (symlink parents
+	// resolved once). Upgrade backup records this as Source.DatabasePath so a
+	// later retarget of a path component cannot rename the restore destination
+	// away from the open inode.
+	path   string
 	runner *MigrationRunner
 }
 
@@ -37,9 +42,15 @@ func OpenSQLiteCoordinator(ctx context.Context, dbPath string, options SQLiteCoo
 	if err != nil {
 		return nil, err
 	}
+	openedPath, err := resolveOpenedDatabasePath(dbPath)
+	if err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 
 	coordinator := &SQLiteCoordinator{
-		db: db,
+		db:   db,
+		path: openedPath,
 		runner: NewMigrationRunner(db, MigrationRunnerOptions{
 			Migrations: options.Migrations,
 			BackupDir:  options.BackupDir,
@@ -48,6 +59,40 @@ func OpenSQLiteCoordinator(ctx context.Context, dbPath string, options SQLiteCoo
 	}
 
 	return coordinator, nil
+}
+
+// DatabasePath returns the absolute filesystem path bound when the coordinator
+// opened SQLite. Empty for non-filesystem databases.
+func (c *SQLiteCoordinator) DatabasePath() string {
+	if c == nil {
+		return ""
+	}
+	return c.path
+}
+
+// resolveOpenedDatabasePath freezes storage.dbPath for restore metadata: file:
+// URIs are unwrapped, the path is made absolute, and existing symlink parents
+// are resolved once at open so later retargets do not rename the open database.
+func resolveOpenedDatabasePath(dbPath string) (string, error) {
+	path, isFile, err := SQLiteFilesystemPath(dbPath)
+	if err != nil {
+		return "", err
+	}
+	if !isFile || strings.TrimSpace(path) == "" {
+		return "", nil
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("resolve database path: %w", err)
+	}
+	abs = filepath.Clean(abs)
+	if info, err := os.Lstat(abs); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		return "", fmt.Errorf("database path %s is a leaf symlink; open the real file path so restore metadata cannot diverge", abs)
+	}
+	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+		return filepath.Clean(resolved), nil
+	}
+	return abs, nil
 }
 
 func OpenSQLiteDB(ctx context.Context, dbPath string) (*sql.DB, error) {

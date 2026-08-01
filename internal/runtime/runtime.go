@@ -217,13 +217,14 @@ type Runtime struct {
 	worktreeCleanupInitialDelay time.Duration
 	worktreeCleanupStatus       WorktreeCleanupStatus
 	// workProducerJoinStarted latches the first BeginDrain producer join for
-	// the process lifetime. Never clear it: a second POST must not overwrite
-	// residual done-channels after the first join timed out.
-	workProducerJoinStarted atomic.Bool
+	// the process lifetime (under mu with workProducerJoinDone). Never clear:
+	// a second POST must not overwrite residual done-channels.
+	workProducerJoinStarted bool
 	// workProducerJoinActive is true only while the join goroutine is inside stop*.
 	workProducerJoinActive atomic.Bool
 	// workProducerJoinDone is closed when the drain join goroutine finishes
-	// stop* and registers residual done-channels. Stop waits on this first.
+	// stop* and registers residual done-channels. Published under the same mu
+	// critical section as workProducerJoinStarted.
 	workProducerJoinDone chan struct{}
 	// drainResidualDones holds producer done-channels still open after a
 	// bounded stop* timeout so DrainSnapshot keeps WorkProducersActive>0.
@@ -675,19 +676,18 @@ func (r *Runtime) BeginDrain(reason string) error {
 	if err := r.admission.BeginDrain(reason); err != nil {
 		return err
 	}
-	// Process-lifetime single shot: never re-run stop* after the first join
-	// started, even if residuals remain and workProducerJoinActive is false.
-	// A second join would snapshot nil producer fields and wipe residual dones.
-	if r.workProducerJoinStarted.CompareAndSwap(false, true) {
-		// Publish completion channel before Active so Stop cannot observe
-		// active=true with a nil channel and race into shutdown.
-		done := make(chan struct{})
-		r.mu.Lock()
-		r.workProducerJoinDone = done
+	// Process-lifetime single shot under mu: publish Started and Done together
+	// so Stop cannot observe started=true with a nil channel.
+	r.mu.Lock()
+	if r.workProducerJoinStarted {
 		r.mu.Unlock()
-		r.workProducerJoinActive.Store(true)
-		go r.joinWorkProducersForDrain()
+		return nil
 	}
+	r.workProducerJoinStarted = true
+	r.workProducerJoinDone = make(chan struct{})
+	r.mu.Unlock()
+	r.workProducerJoinActive.Store(true)
+	go r.joinWorkProducersForDrain()
 	return nil
 }
 
@@ -758,28 +758,22 @@ func (r *Runtime) waitForDrainProducerJoin() {
 	if r == nil {
 		return
 	}
-	r.mu.RLock()
-	joinDone := r.workProducerJoinDone
-	started := r.workProducerJoinStarted.Load()
-	r.mu.RUnlock()
-	if !started && joinDone == nil {
-		return
-	}
-	if joinDone != nil {
-		<-joinDone
-	} else {
-		// Join started but channel not yet published — spin briefly for it.
-		deadline := time.Now().Add(time.Second)
-		for time.Now().Before(deadline) {
-			r.mu.RLock()
-			joinDone = r.workProducerJoinDone
-			r.mu.RUnlock()
-			if joinDone != nil {
-				<-joinDone
-				break
-			}
-			time.Sleep(time.Millisecond)
+	// Started and Done are published atomically under mu; wait for Done if join
+	// started. Do not time out this publication gap (that would race SQLite close).
+	for {
+		r.mu.RLock()
+		started := r.workProducerJoinStarted
+		joinDone := r.workProducerJoinDone
+		r.mu.RUnlock()
+		if !started {
+			return
 		}
+		if joinDone != nil {
+			<-joinDone
+			break
+		}
+		// Should be unreachable given atomic publish; yield until visible.
+		time.Sleep(time.Millisecond)
 	}
 	// Join finished registering residuals; wait a bounded time for residuals
 	// that stop* already timed out on, without blocking forever.
@@ -1410,6 +1404,24 @@ func (r *Runtime) CompleteStartup(ctx context.Context) error {
 		if err := r.admission.MarkReady("complete startup"); err != nil {
 			r.startupReadyErr = err
 			return
+		}
+		// After cutover restart, hold admission closed until verify-start succeeds
+		// and the operator restarts without the hold. Prevents queued work from
+		// completing before verification and being discarded by rollback restore.
+		if strings.TrimSpace(os.Getenv("LOOPER_UPGRADE_VERIFY_HOLD")) == "1" {
+			if err := r.BeginDrain("upgrade-verify-hold"); err != nil {
+				r.startupReadyErr = err
+				if r.logger != nil {
+					r.logger.Error("looperd upgrade verify hold failed to begin drain", map[string]any{"error": err.Error()})
+				}
+				return
+			}
+			if r.logger != nil {
+				r.logger.Info("looperd upgrade verify hold active", map[string]any{
+					"env":    "LOOPER_UPGRADE_VERIFY_HOLD=1",
+					"action": "run verify-start then restart without this env",
+				})
+			}
 		}
 		// Persisted discovery is runtime-owned work. Launch it only after
 		// dependency validation, recovery, ownership, producer assembly, and
