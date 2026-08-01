@@ -97,6 +97,7 @@ type upgradeProjects struct {
 type upgradeConfigResponse struct {
 	Metadata struct {
 		ConfigPath string `json:"configPath"`
+		Revision   string `json:"revision"`
 	} `json:"metadata"`
 }
 
@@ -117,6 +118,8 @@ type upgradePostStartReport struct {
 	RunningDatabase    string        `json:"runningDatabase,omitempty"`
 	ExpectedConfig     string        `json:"expectedConfig,omitempty"`
 	RunningConfig      string        `json:"runningConfig,omitempty"`
+	ExpectedConfigHash string        `json:"expectedConfigHash,omitempty"`
+	RunningConfigRev   string        `json:"runningConfigRevision,omitempty"`
 	ExpectedCLI        string        `json:"expectedCLI,omitempty"`
 	ConfiguredCLI      string        `json:"configuredCLI,omitempty"`
 	Status             upgradeStatus `json:"status"`
@@ -690,6 +693,11 @@ func runUpgradeVerifyStart(ctx context.Context, global []string, root, releaseID
 	daemon := version.Info{Version: remote.Version, Metadata: remote.Build}
 	expectedExec := upgraderelease.CurrentDaemonExecutable(root)
 	expectedCLI := filepath.Join(filepath.Clean(root), "current", "looper")
+	configName, err := bundleConfigFileName(verifiedBundle.Manifest)
+	if err != nil {
+		return err
+	}
+	configArtifact := verifiedBundle.Manifest.Files[configName]
 	report := upgradePostStartReport{
 		ExpectedBuild:      staged.Manifest.Build,
 		ExpectedRelease:    releaseID,
@@ -701,6 +709,8 @@ func runUpgradeVerifyStart(ctx context.Context, global []string, root, releaseID
 		RunningDatabase:    strings.TrimSpace(status.Storage.DBPath),
 		ExpectedConfig:     source.ConfigPath,
 		RunningConfig:      strings.TrimSpace(configResp.Metadata.ConfigPath),
+		ExpectedConfigHash: strings.TrimSpace(configArtifact.SHA256),
+		RunningConfigRev:   strings.TrimSpace(configResp.Metadata.Revision),
 		ExpectedCLI:        expectedCLI,
 		ConfiguredCLI:      strings.TrimSpace(status.Tools.LooperPath),
 		Status:             status,
@@ -756,6 +766,10 @@ func upgradePostStartBlocks(report upgradePostStartReport) []string {
 	// rewrites the file the supervisor actually loads.
 	if err := requireSameFilesystemPath(report.RunningConfig, report.ExpectedConfig); err != nil {
 		blocks = append(blocks, "running config: "+err.Error())
+	}
+	// Same-path config must still be the generation captured in ROLLBACK_BUNDLE.
+	if err := requireConfigRevisionMatchesBundle(report.RunningConfigRev, report.ExpectedConfigHash); err != nil {
+		blocks = append(blocks, "running config generation: "+err.Error())
 	}
 	statusBuild := version.Info{Version: report.Status.Service.Version, Metadata: report.Status.Service.Build}
 	if !statusBuild.SameBuild(report.ExpectedBuild) {
@@ -815,6 +829,36 @@ func parseUpgradeVerifyStartArgs(args []string) (root, releaseID, bundle string,
 		return "", "", "", err
 	}
 	return values["--release-root"], values["--release"], values["--bundle"], nil
+}
+
+func bundleConfigFileName(manifest upgradebackup.Manifest) (string, error) {
+	for _, name := range upgradebackup.SortedFileNames(manifest) {
+		if name == "config" || strings.HasPrefix(name, "config.") {
+			return name, nil
+		}
+	}
+	return "", fmt.Errorf("backup manifest has no config artifact")
+}
+
+// requireConfigRevisionMatchesBundle compares /api/v1/config revision
+// (sha256:<hex> or raw hex) to the bundle config artifact hash.
+func requireConfigRevisionMatchesBundle(revision, bundleSHA256 string) error {
+	revision = strings.TrimSpace(revision)
+	bundleSHA256 = strings.ToLower(strings.TrimSpace(bundleSHA256))
+	if revision == "" {
+		return fmt.Errorf("applied config revision is unavailable")
+	}
+	if bundleSHA256 == "" || len(bundleSHA256) != 64 {
+		return fmt.Errorf("backup config hash is unavailable")
+	}
+	rev := strings.ToLower(revision)
+	if strings.HasPrefix(rev, "sha256:") {
+		rev = strings.TrimPrefix(rev, "sha256:")
+	}
+	if rev != bundleSHA256 {
+		return fmt.Errorf("revision %s does not match rollback bundle config hash %s", revision, bundleSHA256)
+	}
+	return nil
 }
 
 // requireSameFilesystemPath compares two paths after Abs + EvalSymlinks so a
