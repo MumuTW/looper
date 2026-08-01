@@ -433,6 +433,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		result.Reports = append(result.Reports, report)
 	}
 
+
 	for _, entityID := range r.departedFromOpenSet(input.Repo, pullRequests, limit, previousReports, stillOpen) {
 		report, err := r.EvaluatePullRequest(ctx, EvaluationInput{
 			ProjectID: input.ProjectID, Repo: input.Repo, PRNumber: previousReports[entityID].PRNumber, CWD: input.CWD,
