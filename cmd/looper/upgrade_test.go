@@ -419,9 +419,9 @@ func TestRequireExecutableGovernedByCurrent(t *testing.T) {
 	if err := requireExecutableGovernedByCurrent(current, current); err != nil {
 		t.Fatalf("current path: %v", err)
 	}
-	if err := requireExecutableGovernedByCurrent(daemon, current); err != nil {
-		// Resolved target of current equals the concrete release path.
-		t.Fatalf("resolved release path: %v", err)
+	// Concrete release path must fail even though it is the same inode as current.
+	if err := requireExecutableGovernedByCurrent(daemon, current); err == nil {
+		t.Fatal("concrete release path accepted")
 	}
 	other := filepath.Join(t.TempDir(), "other-looperd")
 	if err := os.WriteFile(other, []byte("x"), 0o700); err != nil {

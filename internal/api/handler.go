@@ -1180,26 +1180,35 @@ func (h *Handler) daemonBinaryStatus() daemonbinary.Status {
 }
 
 func daemonExecutablePath() string {
+	// Prefer argv[0] when the supervisor launched through release-root/current
+	// so verify-start can reject concrete releases/<id>/looperd units. Fall
+	// back to os.Executable (often already resolved on Linux).
+	if len(os.Args) > 0 {
+		arg0 := strings.TrimSpace(os.Args[0])
+		if arg0 != "" {
+			if abs, err := filepath.Abs(arg0); err == nil {
+				arg0 = abs
+			}
+			if pathHasCurrentBinary(arg0) {
+				return filepath.Clean(arg0)
+			}
+		}
+	}
 	executablePath, err := os.Executable()
 	if err != nil {
 		return ""
 	}
-	executablePath = strings.TrimSpace(executablePath)
-	if executablePath == "" {
-		return ""
-	}
+	return filepath.Clean(strings.TrimSpace(executablePath))
+}
 
-	resolvedPath, err := filepath.EvalSymlinks(executablePath)
-	if err != nil {
-		return executablePath
+func pathHasCurrentBinary(path string) bool {
+	parts := strings.Split(filepath.Clean(path), string(filepath.Separator))
+	for i := 0; i+1 < len(parts); i++ {
+		if parts[i] == "current" && (parts[i+1] == "looperd" || parts[i+1] == "looper") {
+			return true
+		}
 	}
-
-	resolvedPath = strings.TrimSpace(resolvedPath)
-	if resolvedPath == "" {
-		return executablePath
-	}
-
-	return resolvedPath
+	return false
 }
 
 type statusStorage struct {

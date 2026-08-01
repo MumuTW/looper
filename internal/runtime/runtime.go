@@ -923,10 +923,12 @@ func (r *Runtime) BeginBackupMutationIfAllowed() (func(), error) {
 		switch state {
 		case AdmissionReady:
 			// online pre-cutover backup
-		case AdmissionDraining, AdmissionStopping:
+		case AdmissionDraining:
 			// Final cutover backup: require the supervisor work set drained.
 			// Snapshot under the outer r.mu.RLock without re-locking (a pending
 			// BeginDrain writer would otherwise deadlock recursive RLock).
+			// Do not admit new backups once shutdown has moved to stopping —
+			// Stop does not join backup leases and may race a 15m CLI timeout.
 			snapshot := DrainSnapshot{}
 			if r.activeExecutions != nil {
 				snapshot = r.activeExecutions.DrainSnapshot()
@@ -1503,19 +1505,16 @@ func (r *Runtime) CompleteStartup(ctx context.Context) error {
 		// candidate that cannot boot those components fails under hold rather
 		// than only after the unheld restart — without running Reconcile.
 		if upgradeHold {
-			if err := r.admission.Transition(AdmissionDraining, "upgrade-verify-hold"); err != nil {
+			if err := r.admission.BeginVerifyHold("upgrade-verify-hold"); err != nil {
 				r.startupReadyErr = err
 				if r.logger != nil {
 					r.logger.Error("looperd upgrade verify hold failed", map[string]any{"error": err.Error()})
 				}
 				return
 			}
-			if r.networkManager != nil {
-				if err := r.networkManager.Start(ctx); err != nil {
-					r.startupReadyErr = err
-					return
-				}
-			}
+			// Do not Start network (heartbeats / lease mutations) or webhook
+			// Reconcile under hold — those are not undone by local DB restore.
+			// Only fail-closed validate local tooling so misconfig surfaces here.
 			if r.webhook != nil {
 				if err := r.webhook.ValidateStartup(); err != nil {
 					r.startupReadyErr = err
@@ -1526,7 +1525,7 @@ func (r *Runtime) CompleteStartup(ctx context.Context) error {
 				r.logger.Info("looperd upgrade verify hold active", map[string]any{
 					"env":    "LOOPER_UPGRADE_VERIFY_HOLD=1",
 					"action": "run verify-start then restart without this env",
-					"note":   "webhook reconcile, scheduler, and discovery deferred until unheld restart",
+					"note":   "network/webhook reconcile, scheduler, and discovery deferred until unheld restart",
 				})
 			}
 			return

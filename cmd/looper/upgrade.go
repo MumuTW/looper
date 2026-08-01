@@ -810,6 +810,10 @@ func requireSameFilesystemPath(running, expected string) error {
 		return fmt.Errorf("expected path is unavailable")
 	}
 	normalize := func(path string) string {
+		// Unwrap supported SQLite file: URIs before filesystem comparison.
+		if fs, isFile, err := storage.SQLiteFilesystemPath(path); err == nil && isFile {
+			path = fs
+		}
 		abs, err := filepath.Abs(path)
 		if err != nil {
 			abs = filepath.Clean(path)
@@ -826,9 +830,10 @@ func requireSameFilesystemPath(running, expected string) error {
 	return nil
 }
 
-// requireExecutableGovernedByCurrent reports whether the running daemon binary
-// is the release-root/current/looperd path (after symlink resolution), not a
-// same-build copy launched from elsewhere.
+// requireExecutableGovernedByCurrent reports whether the launch path goes
+// through release-root/current/<binary>, not a concrete releases/<id>/ path.
+// Comparing only resolved inodes is insufficient: a unit that still ExecStart's
+// releases/<candidate>/looperd resolves to the same file as current/looperd.
 func requireExecutableGovernedByCurrent(runningPath, expectedCurrentPath string) error {
 	runningPath = strings.TrimSpace(runningPath)
 	expectedCurrentPath = strings.TrimSpace(expectedCurrentPath)
@@ -838,22 +843,64 @@ func requireExecutableGovernedByCurrent(runningPath, expectedCurrentPath string)
 	if expectedCurrentPath == "" {
 		return fmt.Errorf("expected current daemon executable path is unavailable")
 	}
-	running, err := filepath.EvalSymlinks(runningPath)
+	runningClean := filepath.Clean(runningPath)
+	expectedClean := filepath.Clean(expectedCurrentPath)
+	if !pathUsesCurrentPointer(expectedClean) {
+		return fmt.Errorf("expected executable path %s does not use the release current pointer", expectedClean)
+	}
+	if isConcreteReleaseBinaryPath(runningClean) {
+		return fmt.Errorf("running daemon executable %s is a concrete release path; require launch through %s", runningClean, expectedClean)
+	}
+	if runningClean == expectedClean {
+		return nil
+	}
+	// Absolute forms of the same current path (relative vs absolute argv).
+	runningAbs, err := filepath.Abs(runningClean)
 	if err != nil {
-		running = filepath.Clean(runningPath)
-	} else {
-		running = filepath.Clean(running)
+		runningAbs = runningClean
 	}
-	expected, err := filepath.EvalSymlinks(expectedCurrentPath)
+	expectedAbs, err := filepath.Abs(expectedClean)
 	if err != nil {
-		expected = filepath.Clean(expectedCurrentPath)
-	} else {
-		expected = filepath.Clean(expected)
+		expectedAbs = expectedClean
 	}
-	if running != expected {
-		return fmt.Errorf("running daemon executable %s is not governed by release current pointer %s", running, expected)
+	if filepath.Clean(runningAbs) == filepath.Clean(expectedAbs) {
+		return nil
 	}
-	return nil
+	if pathUsesCurrentPointer(runningClean) || pathUsesCurrentPointer(runningAbs) {
+		// Launch path names current; also require the pointer selects the same bytes.
+		runningResolved, err := filepath.EvalSymlinks(runningAbs)
+		if err != nil {
+			runningResolved = filepath.Clean(runningAbs)
+		}
+		expectedResolved, err := filepath.EvalSymlinks(expectedAbs)
+		if err != nil {
+			expectedResolved = filepath.Clean(expectedAbs)
+		}
+		if filepath.Clean(runningResolved) == filepath.Clean(expectedResolved) {
+			return nil
+		}
+	}
+	return fmt.Errorf("running daemon executable %s is not governed by release current pointer %s", runningClean, expectedClean)
+}
+
+func pathUsesCurrentPointer(path string) bool {
+	parts := strings.Split(filepath.Clean(path), string(filepath.Separator))
+	for i := 0; i+1 < len(parts); i++ {
+		if parts[i] == "current" && (parts[i+1] == "looperd" || parts[i+1] == "looper") {
+			return true
+		}
+	}
+	return false
+}
+
+func isConcreteReleaseBinaryPath(path string) bool {
+	parts := strings.Split(filepath.Clean(path), string(filepath.Separator))
+	for i := 0; i+2 < len(parts); i++ {
+		if parts[i] == "releases" && parts[i+1] != "" && (parts[i+2] == "looperd" || parts[i+2] == "looper") {
+			return true
+		}
+	}
+	return false
 }
 
 func releaseCandidateAllowed(identity version.Info) error {
