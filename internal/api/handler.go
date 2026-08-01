@@ -322,7 +322,16 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	// (ADR-0015 / #575). Reads remain available while starting/stopping/degraded.
 	// Feishu url_verification is a non-mutating challenge echo and is gated
 	// inside handleFeishuCardActionRoute after the handshake branch.
-	if isMutatingHTTPMethod(r.Method) && !isAdmissionExemptMutationPath(path) && path != apiBasePath+"/hitl/feishu" {
+	//
+	// upgrade/backup is not unconditionally exempt: it is allowed while ready
+	// (pre-cutover) or once drain has completed (final quiescent backup), not
+	// during starting/degraded recovery.
+	if isMutatingHTTPMethod(r.Method) && path == apiBasePath+"/upgrade/backup" {
+		if typed, denied := h.upgradeBackupMutationDenial(); denied {
+			h.writeError(w, requestID, typed)
+			return
+		}
+	} else if isMutatingHTTPMethod(r.Method) && !isAdmissionExemptMutationPath(path) && path != apiBasePath+"/hitl/feishu" {
 		if typed, denied := h.admissionMutationDenial(); denied {
 			h.writeError(w, requestID, typed)
 			return
@@ -878,13 +887,45 @@ func isAdmissionExemptMutationPath(path string) bool {
 	switch path {
 	case dashboardBootstrapCodePath, dashboardBootstrapExchangePath:
 		return true
-	// Upgrade control-plane: not work-producing. Must stay available after
-	// BeginDrain so operators can resume drain polling and take a final
-	// quiescent backup before cutover.
-	case apiBasePath + "/upgrade/drain", apiBasePath + "/upgrade/backup":
+	// Drain must stay reachable after admission closes so operators can
+	// re-POST (idempotent) and poll.
+	case apiBasePath + "/upgrade/drain":
 		return true
 	default:
 		return false
+	}
+}
+
+// upgradeBackupMutationDenial allows backup only when admission is ready
+// (normal online backup) or when drain has completed (final cutover backup).
+func (h *Handler) upgradeBackupMutationDenial() (apiError, bool) {
+	if h == nil || h.context.Runtime == nil {
+		return apiError{}, false
+	}
+	rt, ok := any(h.context.Runtime).(upgradeDrainRuntime)
+	if !ok {
+		// Without drain capability, fall back to ordinary mutation readiness.
+		return h.admissionMutationDenial()
+	}
+	state := rt.AdmissionState()
+	switch state {
+	case looperdruntime.AdmissionReady:
+		return apiError{}, false
+	case looperdruntime.AdmissionDraining, looperdruntime.AdmissionStopping:
+		if rt.DrainSnapshot().Drained() {
+			return apiError{}, false
+		}
+		return apiError{
+			code:    pkgapi.ErrorCodeServiceUnavailable,
+			status:  http.StatusServiceUnavailable,
+			message: "Upgrade backup after drain requires a drained supervisor work set",
+		}, true
+	default:
+		return apiError{
+			code:    pkgapi.ErrorCodeServiceUnavailable,
+			status:  http.StatusServiceUnavailable,
+			message: "Upgrade backup requires ready admission or a completed drain",
+		}, true
 	}
 }
 

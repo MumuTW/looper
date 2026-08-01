@@ -26,6 +26,7 @@
 package upgraderestore
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -271,6 +272,10 @@ func restore(bundleDirectory string, source upgradebackup.Source, operations fil
 		return fail(fmt.Errorf("sync restored target directories: %w", err))
 	}
 	if err := persistPhase(journalPath, &journal, phaseCommitted, operations); err != nil {
+		// Committed may already be durable on disk; never rollback after that.
+		if journal.Phase == phaseCommitted {
+			return fmt.Errorf("restore committed with incomplete journal sync; run Recover(%q): %w", journalPath, err)
+		}
 		return fail(err)
 	}
 
@@ -548,10 +553,18 @@ func persistPhase(path string, journal *restoreJournal, phase journalPhase, oper
 		_ = os.Remove(temporaryPath)
 		return fmt.Errorf("publish restore journal phase %s: %w", phase, err)
 	}
+	// The durable journal now records phase. Update memory before directory
+	// sync so a later sync failure cannot leave callers rolling back against a
+	// journal that already says committed (or any later phase).
+	journal.Phase = phase
 	if err := syncDirectories(filepath.Dir(path)); err != nil {
+		if phase == phaseCommitted {
+			// Committed is durable; surface incomplete fsync without starting
+			// a rollback that would contradict Recover's committed handling.
+			return fmt.Errorf("restore journal phase %s published but directory sync failed; do not rollback — run Recover(%q) after fixing the filesystem: %w", phase, path, err)
+		}
 		return fmt.Errorf("sync restore journal phase %s: %w", phase, err)
 	}
-	journal.Phase = phase
 	return nil
 }
 
@@ -691,6 +704,43 @@ func rollback(journalPath string, journal restoreJournal, operations fileOperati
 			continue
 		}
 		if !entry.HadOriginal {
+			// Target was absent when the journal was prepared. If a file is now
+			// present, delete it only when it is provably this transaction's
+			// staged install; otherwise fail closed rather than destroying an
+			// operator/application file created after the interruption.
+			_, targetPresent, err := inspectRegularArtifact(entry.TargetPath, "new target for "+entry.Name)
+			if err != nil {
+				rollbackErrors = append(rollbackErrors, err)
+				continue
+			}
+			if !targetPresent {
+				continue
+			}
+			if strings.TrimSpace(entry.StagedPath) == "" {
+				rollbackErrors = append(rollbackErrors, fmt.Errorf("refusing to delete %s: target appeared after prepared journal with no staged identity", entry.Name))
+				continue
+			}
+			_, stagedPresent, err := inspectRegularArtifact(entry.StagedPath, "staged file for "+entry.Name)
+			if err != nil {
+				rollbackErrors = append(rollbackErrors, err)
+				continue
+			}
+			if !stagedPresent {
+				// Staged already consumed (installed). Only remove target if it
+				// still matches what we would have installed — compare to undo
+				// absence + phase is insufficient; refuse without content proof.
+				rollbackErrors = append(rollbackErrors, fmt.Errorf("refusing to delete %s: staged artifact is gone so target ownership cannot be proven", entry.Name))
+				continue
+			}
+			same, err := sameRegularFileContent(entry.StagedPath, entry.TargetPath)
+			if err != nil {
+				rollbackErrors = append(rollbackErrors, err)
+				continue
+			}
+			if !same {
+				rollbackErrors = append(rollbackErrors, fmt.Errorf("refusing to delete %s: target does not match staged restore artifact", entry.Name))
+				continue
+			}
 			if err := removeRegularIfExists(entry.TargetPath, "new target for "+entry.Name); err != nil {
 				rollbackErrors = append(rollbackErrors, err)
 			}
@@ -729,6 +779,42 @@ func inspectRegularArtifact(path, description string) (os.FileInfo, bool, error)
 		return nil, true, fmt.Errorf("%s must be a regular file and not a symlink", description)
 	}
 	return info, true, nil
+}
+
+func sameRegularFileContent(left, right string) (bool, error) {
+	leftInfo, err := os.Lstat(left)
+	if err != nil {
+		return false, fmt.Errorf("stat %s: %w", left, err)
+	}
+	rightInfo, err := os.Lstat(right)
+	if err != nil {
+		return false, fmt.Errorf("stat %s: %w", right, err)
+	}
+	if !leftInfo.Mode().IsRegular() || !rightInfo.Mode().IsRegular() {
+		return false, fmt.Errorf("content compare requires regular files")
+	}
+	if leftInfo.Size() != rightInfo.Size() {
+		return false, nil
+	}
+	leftFile, err := os.Open(left)
+	if err != nil {
+		return false, err
+	}
+	defer leftFile.Close()
+	rightFile, err := os.Open(right)
+	if err != nil {
+		return false, err
+	}
+	defer rightFile.Close()
+	leftHash := sha256.New()
+	rightHash := sha256.New()
+	if _, err := io.Copy(leftHash, leftFile); err != nil {
+		return false, err
+	}
+	if _, err := io.Copy(rightHash, rightFile); err != nil {
+		return false, err
+	}
+	return string(leftHash.Sum(nil)) == string(rightHash.Sum(nil)), nil
 }
 
 func removeRegularIfExists(path, description string) error {
