@@ -4,11 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"time"
 
 	"github.com/MumuTW/looper/internal/config"
 	"github.com/MumuTW/looper/internal/infra/github"
+	"github.com/MumuTW/looper/internal/storage"
+	pkgapi "github.com/MumuTW/looper/pkg/api"
 )
 
 // errIssueNotFound is the classified sentinel returned by the production
@@ -119,4 +122,51 @@ func classifyIssueLookupError(err error) error {
 		return fmt.Errorf("%w: %w", errIssueNotFound, err)
 	}
 	return err
+}
+
+// issueCollisionError translates a storage issue-claim conflict into the HTTP
+// 409 loop-conflict response shared by create and retry mutations. Keeping the
+// mapping here lets every issue-claim admission path report the same occupant
+// payload instead of each route handler reinventing the envelope.
+func issueCollisionError(issueNumber int64, loopID, loopType string) apiError {
+	return apiError{
+		code:    pkgapi.ErrorCodeLoopConflict,
+		status:  http.StatusConflict,
+		message: fmt.Sprintf("Issue #%d is occupied by active %s loop %s", issueNumber, loopType, loopID),
+		details: map[string]any{"occupiedBy": map[string]any{"loopId": loopID, "loopType": loopType}},
+	}
+}
+
+// mapIssueClaimAdmissionError converts a storage-layer issue-claim conflict
+// into the shared 409 apiError, passing through any non-conflict error so
+// operational failures surface as retryable server errors.
+func mapIssueClaimAdmissionError(err error) error {
+	if conflict, ok := storage.IsIssueClaimConflictError(err); ok {
+		return issueCollisionError(conflict.IssueNumber, conflict.LoopID, conflict.LoopType)
+	}
+	return err
+}
+
+// assertIssueClaimAdmission runs the storage issue-claim admission check for a
+// candidate loop and maps a conflict into the shared 409 apiError. force
+// overrides the claim check the same way as upsertLoopAfterIssueClaimAdmission.
+func assertIssueClaimAdmission(ctx context.Context, repos *storage.Repositories, candidate storage.LoopRecord, force bool) error {
+	err := repos.Loops.AssertIssueClaimAdmission(ctx, candidate, force)
+	if conflict, ok := storage.IsIssueClaimConflictError(err); ok {
+		return issueCollisionError(conflict.IssueNumber, conflict.LoopID, conflict.LoopType)
+	}
+	return err
+}
+
+// upsertLoopAfterIssueClaimAdmission persists the loop record, selecting the
+// force-override upsert path when force is set so a forced create/retry can
+// displace an existing issue claim. Any conflict surfaces as the shared 409.
+func upsertLoopAfterIssueClaimAdmission(ctx context.Context, loops *storage.LoopsRepository, record storage.LoopRecord, force bool) error {
+	var err error
+	if force {
+		err = loops.UpsertForcingIssueClaimAdmission(ctx, record)
+	} else {
+		err = loops.Upsert(ctx, record)
+	}
+	return mapIssueClaimAdmissionError(err)
 }

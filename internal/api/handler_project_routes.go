@@ -162,6 +162,7 @@ func (h *Handler) buildUpdateProjectResponse(r *http.Request, service projectSer
 	updated, err := service.UpdateProject(r.Context(), identifier, projects.UpdateInput{
 		Repo: updateProjectField(body.Repo), Name: updateProjectField(body.Name),
 		BaseBranch: updateProjectField(body.BaseBranch), WorktreeRoot: updateProjectField(body.WorktreeRoot),
+		Validation: body.Validation,
 	})
 	if err != nil {
 		var notFound projects.ProjectNotFoundError
@@ -226,8 +227,7 @@ func (h *Handler) buildCreateProjectResponse(r *http.Request, service projectSer
 		IDSource:     idSource,
 		WorktreeRoot: normalizeOptionalString(body.WorktreeRoot),
 		Repo:         normalizeOptionalString(body.Repo),
-		Provider:     normalizeOptionalString(body.Provider),
-		Validation:   cloneProjectValidation(body.Validation),
+		Validation:   body.Validation,
 		SnapshotMode: snapshotMode,
 	})
 	if err != nil {
@@ -296,13 +296,6 @@ func serializeProject(project storage.ProjectRecord, cfg config.Config, defaultB
 		response.Discovery = &serialized
 	}
 	return response
-}
-
-func cloneProjectValidation(source *config.ProjectValidationConfig) *config.ProjectValidationConfig {
-	if source == nil {
-		return nil
-	}
-	return &config.ProjectValidationConfig{Commands: append([]string(nil), source.Commands...), OptOut: source.OptOut}
 }
 
 func serializeProjectValidation(metadata map[string]any, cfg config.Config) *projectValidationResponse {
