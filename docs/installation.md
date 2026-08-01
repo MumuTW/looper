@@ -249,4 +249,15 @@ looper upgrade restore-preflight --bundle <directory>
 looper upgrade restore --bundle <directory> --confirm
 ```
 
-Supported sequence: preflight → backup → **drain** → (optional final backup while drained) → stage-release → activate-release → verify-start; on failure, restore-preflight → restore, then activate the prior release if needed. Drain and final backup stay available after admission closes.
+Supported sequence:
+
+1. `preflight` (read-only compatibility)
+2. **Stage the current live pair into `release-root` first** (so rollback has a prior release id to re-activate). On a brand-new release root this is mandatory before any candidate cutover: `stage-release` with the running CLI/daemon, then keep that release id as `previous`.
+3. `backup` (matching config + SQLite + binary evidence)
+4. `drain` (and optional final `backup` while drained)
+5. `stage-release` the **candidate** pair
+6. `activate-release` (switches `current` only — does not restart the process)
+7. **Restart the supervised daemon** so it loads `release-root/current/looperd` (e.g. unload/load launchd or `systemctl --user restart looperd`)
+8. `verify-start`
+
+On failure after restart: `restore-preflight` → `restore` (config + SQLite only), then `activate-release` the **prior** release id and restart again. Backup-copied binaries are evidence, not an executable release; binary rollback is always via a previously staged release under the same `release-root`.

@@ -70,33 +70,29 @@ func (h *Handler) createUpgradeBackup(ctx context.Context) (upgradebackup.Result
 		Now:              h.now,
 		Snapshot:         services.Coordinator.Backup,
 	}
-	// Always record the configured path as the restore destination even when
-	// contents are materialized (no on-disk file present at backup time).
+	// Always record the configured path as the restore destination.
 	input.ConfigPath = metadata.ConfigPath
 	if !metadata.FilePresent {
-		encoded, err := config.MarshalConfigFile(metadata.ConfigPath, cfg)
-		if err != nil {
-			// Path may not have an extension; force toml for materialization.
-			encoded, err = config.MarshalConfigFile("config.toml", cfg)
-			if err != nil {
-				return upgradebackup.Result{}, fmt.Errorf("materialize effective config for backup: %w", err)
-			}
-		}
-		input.ConfigContents = encoded
-	} else {
-		raw, err := os.ReadFile(metadata.ConfigPath)
-		if err != nil {
-			return upgradebackup.Result{}, fmt.Errorf("refusing upgrade backup: cannot read applied config path %s: %w", metadata.ConfigPath, err)
-		}
-		if len(raw) == 0 {
-			return upgradebackup.Result{}, fmt.Errorf("refusing upgrade backup: config file at %s is empty", metadata.ConfigPath)
-		}
-		if strings.TrimSpace(metadata.Revision) != "" {
-			if got := config.ConfigFileRevision(raw, true); got != metadata.Revision {
-				return upgradebackup.Result{}, fmt.Errorf("refusing upgrade backup: on-disk config revision %q does not match applied revision %q", got, metadata.Revision)
-			}
+		// Refuse to materialize effective config: env/CLI overrides (including
+		// LOOPER_TOKEN → server.localToken) must not be persisted into a
+		// rollback bundle. Operators need an on-disk applied config file.
+		return upgradebackup.Result{}, fmt.Errorf("refusing upgrade backup: applied config file is not present at %s; write the applied generation to disk before backup", metadata.ConfigPath)
+	}
+	raw, err := os.ReadFile(metadata.ConfigPath)
+	if err != nil {
+		return upgradebackup.Result{}, fmt.Errorf("refusing upgrade backup: cannot read applied config path %s: %w", metadata.ConfigPath, err)
+	}
+	if len(raw) == 0 {
+		return upgradebackup.Result{}, fmt.Errorf("refusing upgrade backup: config file at %s is empty", metadata.ConfigPath)
+	}
+	if strings.TrimSpace(metadata.Revision) != "" {
+		if got := config.ConfigFileRevision(raw, true); got != metadata.Revision {
+			return upgradebackup.Result{}, fmt.Errorf("refusing upgrade backup: on-disk config revision %q does not match applied revision %q", got, metadata.Revision)
 		}
 	}
+	// Pin the validated bytes so Create cannot re-read a different generation
+	// while the SQLite snapshot runs.
+	input.ConfigContents = raw
 	return upgradebackup.Create(ctx, input)
 }
 

@@ -1,5 +1,18 @@
 // Package upgradebackup creates self-describing rollback bundles from a
 // daemon-owned SQLite snapshot and explicitly supplied installation files.
+//
+// # Why Source metadata and a multi-phase restore journal exist
+//
+// A simpler design would copy files into a directory and let operators copy
+// them back by hand. That fails closed on crash mid-restore: half-moved
+// databases leave no durable record of which path is the original versus the
+// candidate. Manifest Source records the exact restore destinations so restore
+// cannot invent paths; the upgraderestore journal records phase transitions so
+// Recover can finish or undo without guessing.
+//
+// Deleting Source or the journal breaks re-entry after interruption. Failures
+// still outside this design: concurrent writers that ignore the database lock,
+// operators deleting staged/undo files by hand, and non-filesystem SQLite URIs.
 package upgradebackup
 
 import (
@@ -14,6 +27,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/MumuTW/looper/internal/storage"
 )
 
 const (
@@ -99,7 +114,7 @@ func Create(ctx context.Context, input Input) (Result, error) {
 		// auto-restore config placement from the bundle alone.
 		configPath = ""
 	}
-	databasePath, err := absolutePath(input.DatabasePath, "database")
+	databasePath, err := absoluteFilesystemDatabasePath(input.DatabasePath)
 	if err != nil {
 		return Result{}, err
 	}
@@ -339,7 +354,39 @@ func absolutePath(path, description string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("resolve %s path: %w", description, err)
 	}
-	return filepath.Clean(abs), nil
+	abs = filepath.Clean(abs)
+	// Only resolve a leaf symlink. Restore rejects symlink targets, so recording
+	// the link path would make the bundle unrestorable. Intermediate directory
+	// symlinks (e.g. macOS /var → /private/var) are left alone so source paths
+	// stay stable for operators.
+	info, err := os.Lstat(abs)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return abs, nil
+		}
+		return "", fmt.Errorf("stat %s path: %w", description, err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		return abs, nil
+	}
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return "", fmt.Errorf("resolve symlinked %s path: %w", description, err)
+	}
+	return filepath.Clean(resolved), nil
+}
+
+// absoluteFilesystemDatabasePath normalizes storage.dbPath (including file: URIs)
+// to an absolute filesystem path before it is recorded for restore.
+func absoluteFilesystemDatabasePath(dbPath string) (string, error) {
+	path, isFile, err := storage.SQLiteFilesystemPath(dbPath)
+	if err != nil {
+		return "", fmt.Errorf("resolve database path: %w", err)
+	}
+	if !isFile || strings.TrimSpace(path) == "" {
+		return "", fmt.Errorf("database path %q is not a filesystem SQLite database", dbPath)
+	}
+	return absolutePath(path, "database")
 }
 
 func (file File) valid() bool {

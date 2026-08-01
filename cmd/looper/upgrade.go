@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
@@ -247,7 +248,9 @@ func runUpgradeRestorePreflight(ctx context.Context, bundle string, stdout inter
 	if err != nil {
 		return err
 	}
-	paths := []string{source.ConfigPath, source.DatabasePath, source.DatabasePath + "-wal", source.DatabasePath + "-shm", source.CLIBinaryPath, source.DaemonBinaryPath}
+	// Only probe paths restore will mutate. Backup-copied binaries are evidence
+	// and are not restored; including tools.looperPath would self-block this CLI.
+	paths := []string{source.ConfigPath, source.DatabasePath, source.DatabasePath + "-wal", source.DatabasePath + "-shm"}
 	pids, probeErr := upgradeRestoreOpenPIDs(ctx, paths)
 	report := upgradeRestorePreflight{Bundle: verified.Directory, Source: source, OpenPIDs: pids}
 	if probeErr != nil {
@@ -333,12 +336,37 @@ func findUpgradeRestoreOpenPIDs(ctx context.Context, paths []string) ([]int, err
 	if err != nil {
 		return nil, fmt.Errorf("lsof is required to prove rollback targets are unused: %w", err)
 	}
-	output, err := exec.CommandContext(ctx, lsof, append([]string{"-t", "--"}, paths...)...).Output()
+	// Probe only paths that currently exist. Absent WAL/SHM is normal; asking
+	// lsof about them can exit 1 while still emitting PIDs for open targets,
+	// and Output would discard that evidence as a hard error.
+	existing := make([]string, 0, len(paths))
+	for _, path := range paths {
+		path = strings.TrimSpace(path)
+		if path == "" {
+			continue
+		}
+		if _, err := os.Lstat(path); err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return nil, fmt.Errorf("inspect rollback target %s: %w", path, err)
+		}
+		existing = append(existing, path)
+	}
+	if len(existing) == 0 {
+		return nil, nil
+	}
+	output, err := exec.CommandContext(ctx, lsof, append([]string{"-t", "--"}, existing...)...).Output()
 	if err != nil {
 		if exit, ok := err.(*exec.ExitError); ok && exit.ExitCode() == 1 {
-			return nil, nil
+			// lsof exits 1 when no process has the files open. Still parse any
+			// stdout in case a mixed lookup partially succeeded.
+			if len(output) == 0 {
+				return nil, nil
+			}
+		} else {
+			return nil, fmt.Errorf("inspect rollback target users: %w", err)
 		}
-		return nil, fmt.Errorf("inspect rollback target users: %w", err)
 	}
 	seen := map[int]bool{}
 	pids := make([]int, 0)
@@ -392,10 +420,12 @@ type upgradeBackupResult struct {
 }
 
 type upgradeDrainSnapshot struct {
-	LiveExecutions    int `json:"liveExecutions"`
-	PendingSpawns     int `json:"pendingSpawns"`
-	BoundOperations   int `json:"boundOperations"`
-	PendingOperations int `json:"pendingOperations"`
+	LiveExecutions      int `json:"liveExecutions"`
+	PendingSpawns       int `json:"pendingSpawns"`
+	BoundOperations     int `json:"boundOperations"`
+	PendingOperations   int `json:"pendingOperations"`
+	NonAgentHandles     int `json:"nonAgentHandles"`
+	WorkProducersActive int `json:"workProducersActive"`
 }
 
 type upgradeDrainResult struct {
@@ -429,7 +459,7 @@ func runUpgradeDrain(ctx context.Context, global []string, deadline time.Duratio
 			if err := writeVersionJSON(stdout, result); err != nil {
 				return err
 			}
-			return fmt.Errorf("upgrade drain deadline reached with %d live executions, %d pending spawns, %d bound operations, and %d pending operations", result.Snapshot.LiveExecutions, result.Snapshot.PendingSpawns, result.Snapshot.BoundOperations, result.Snapshot.PendingOperations)
+			return fmt.Errorf("upgrade drain deadline reached with %d live executions, %d pending spawns, %d bound operations, %d pending operations, %d non-agent handles, and %d work producers", result.Snapshot.LiveExecutions, result.Snapshot.PendingSpawns, result.Snapshot.BoundOperations, result.Snapshot.PendingOperations, result.Snapshot.NonAgentHandles, result.Snapshot.WorkProducersActive)
 		case <-ticker.C:
 			result, err = requestJSON[upgradeDrainResult](drainCtx, cfg, "GET", "/api/v1/upgrade/drain", nil)
 			if err != nil {
