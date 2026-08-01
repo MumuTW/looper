@@ -72,7 +72,14 @@ func latestCodexReviewForHead(ctx context.Context, repos *storage.Repositories, 
 }
 
 func reviewEventBelongsToProject(event storage.EventLogRecord, projectID string) bool {
-	return event.ProjectID != nil && strings.TrimSpace(*event.ProjectID) == strings.TrimSpace(projectID)
+	// Compare project IDs exactly, without trimming. EvaluatePullRequest
+	// deliberately preserves the caller's original project ID (only an
+	// emptiness check is trimmed) and ListByProjectAndEntityType matches it
+	// with an exact SQL equality. Trimming here would let a renamed project
+	// whose new ID trims to the old value (e.g. " foo " → "foo") authorize
+	// Gatekeeper under the new project using a review written under the old
+	// one, violating the same-project authority contract.
+	return event.ProjectID != nil && *event.ProjectID == projectID
 }
 
 func reviewEventActorIsReviewer(event storage.EventLogRecord) bool {

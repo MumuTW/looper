@@ -8,6 +8,7 @@ import (
 
 	"github.com/MumuTW/looper/internal/eventlog"
 	githubinfra "github.com/MumuTW/looper/internal/infra/github"
+	"github.com/MumuTW/looper/internal/storage"
 )
 
 func TestEvaluatePullRequestRequiresCodexReviewForCurrentHead(t *testing.T) {
@@ -120,6 +121,40 @@ func TestEvaluatePullRequestRejectsMarkerlessReviewEvent(t *testing.T) {
 	}
 }
 
+// Project IDs must be compared exactly, without trimming. A project renamed
+// from "foo" to the valid legacy ID " foo " retains old event rows in storage;
+// trimming would treat them as identical and let a review written under the
+// old project authorize Gatekeeper under the new one, violating the
+// same-project authority contract that EvaluatePullRequest preserves.
+func TestEvaluatePullRequestComparesProjectIDsExactly(t *testing.T) {
+	fixture := newGatekeeperFixtureWithoutReview(t)
+	// Create both the current project "foo" and the legacy project " foo "
+	// (with surrounding spaces) so events and gate reports can be stored.
+	nowISO := fixture.now.Format(time.RFC3339Nano)
+	for _, pid := range []string{"foo", " foo "} {
+		if err := fixture.repos.Projects.Upsert(context.Background(), storage.ProjectRecord{
+			ID: pid, Name: "Project " + pid, RepoPath: t.TempDir(), CreatedAt: nowISO, UpdatedAt: nowISO,
+		}); err != nil {
+			t.Fatalf("Projects.Upsert(%q) error = %v", pid, err)
+		}
+	}
+	// Seed a marker-verified review event under " foo " (with surrounding
+	// spaces, a valid legacy project ID that trims to "foo").
+	seedReviewerReviewEventWithProjectID(t, fixture, " foo ", "head-1", "APPROVE", "reviewer-loop", 1, true)
+
+	// Gatekeeper evaluates under "foo" (without spaces). The event must not
+	// satisfy the gate despite trimming to the same value.
+	report, err := New(Options{Repos: fixture.repos, GitHub: fixture.github, Now: func() time.Time { return fixture.now }}).EvaluatePullRequest(context.Background(), EvaluationInput{
+		ProjectID: "foo", Repo: "acme/looper", PRNumber: 42, ExpectedHeadSHA: "head-1",
+	})
+	if err != nil {
+		t.Fatalf("EvaluatePullRequest() error = %v", err)
+	}
+	if report.Eligible || !hasReason(report, ReasonCodexReviewMissing) {
+		t.Fatalf("report = %#v, want exact project ID mismatch rejected", report)
+	}
+}
+
 // While a pull request is waiting for a current-head review event that has not
 // yet appeared in the local event log, discovery must skip it cheaply rather
 // than re-evaluating every tick. This is the rate-limit protection for
@@ -159,7 +194,11 @@ func seedReviewerReviewEvent(t *testing.T, fixture *gatekeeperFixture, headSHA, 
 
 func seedReviewerReviewEventWithMarkerVerified(t *testing.T, fixture *gatekeeperFixture, headSHA, reviewEvent, actorID string, ordinal int, markerVerified bool) {
 	t.Helper()
-	projectID := "project_1"
+	seedReviewerReviewEventWithProjectID(t, fixture, "project_1", headSHA, reviewEvent, actorID, ordinal, markerVerified)
+}
+
+func seedReviewerReviewEventWithProjectID(t *testing.T, fixture *gatekeeperFixture, projectID, headSHA, reviewEvent, actorID string, ordinal int, markerVerified bool) {
+	t.Helper()
 	entityType := "pull_request"
 	entityID := "acme/looper#42"
 	actorType := "system"

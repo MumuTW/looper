@@ -3189,8 +3189,27 @@ func TestProcessClaimedItemRunsExistingLoopFollowUpOnNewHeadWithoutReviewRequest
 	if err != nil || updatedLoop == nil || updatedLoop.MetadataJSON == nil {
 		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop metadata", updatedLoop, err)
 	}
-	if !contains(*updatedLoop.MetadataJSON, `"lastPublishedHeadSha":"abc123"`) {
-		t.Fatalf("loop metadata = %s, want new head recorded", *updatedLoop.MetadataJSON)
+	// A markerless clean no-op must not update lastPublishedHeadSha to the new
+	// head; the head stays eligible for a future marker-backed review.
+	if contains(*updatedLoop.MetadataJSON, `"lastPublishedHeadSha":"abc123"`) {
+		t.Fatalf("loop metadata = %s, want no lastPublishedHeadSha for markerless clean no-op on new head", *updatedLoop.MetadataJSON)
+	}
+	events, err := fixture.repos.Events.ListByEntity(ctx, "pull_request", "acme/looper#42")
+	if err != nil {
+		t.Fatalf("Events.ListByEntity() error = %v", err)
+	}
+	foundReviewPosted := false
+	for _, event := range events {
+		if event.EventType != "pr.review.posted" {
+			continue
+		}
+		if !strings.Contains(event.PayloadJSON, `"headSha":"abc123"`) {
+			t.Fatalf("pr.review.posted payload = %s, want headSha abc123 for new head", event.PayloadJSON)
+		}
+		foundReviewPosted = true
+	}
+	if !foundReviewPosted {
+		t.Fatalf("no pr.review.posted event in %d events, want the authority event written for new head", len(events))
 	}
 }
 
@@ -3986,8 +4005,14 @@ func TestProcessClaimedItemRecordsCleanNoopWithoutReviewMarkerForCommentPolicy(t
 	if err != nil || updatedLoop == nil || updatedLoop.MetadataJSON == nil {
 		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop metadata", updatedLoop, err)
 	}
-	if !contains(*updatedLoop.MetadataJSON, `"lastPublishedHeadSha":"abc123"`) {
-		t.Fatalf("loop metadata = %s, want clean no-op recorded as published for head", *updatedLoop.MetadataJSON)
+	// A markerless clean no-op (COMMENT policy) must not set
+	// lastPublishedHeadSha: Gatekeeper rejects the markerVerified=false event,
+	// so marking the head as published would strand it — discovery would skip
+	// the unchanged head while Gatekeeper can never receive marker-backed
+	// evidence. Leaving lastPublishedHeadSha unset keeps the head eligible for
+	// a future marker-backed review.
+	if contains(*updatedLoop.MetadataJSON, `"lastPublishedHeadSha"`) {
+		t.Fatalf("loop metadata = %s, want no lastPublishedHeadSha for markerless clean no-op", *updatedLoop.MetadataJSON)
 	}
 	if contains(*updatedLoop.MetadataJSON, `"lastOutputFingerprint"`) {
 		t.Fatalf("loop metadata = %s, want clean no-op excluded from output fingerprinting", *updatedLoop.MetadataJSON)
@@ -4015,6 +4040,56 @@ func TestProcessClaimedItemRecordsCleanNoopWithoutReviewMarkerForCommentPolicy(t
 	}
 	if !foundReviewPosted {
 		t.Fatalf("no pr.review.posted event in %d events, want the authority event written", len(events))
+	}
+}
+
+// A markerless clean no-op (COMMENT policy) must not suppress rediscovery of
+// the same head. Gatekeeper rejects the markerVerified=false event, so if
+// lastPublishedHeadSha were set, discovery would skip the unchanged head and
+// the head would be stranded — Gatekeeper can never receive marker-backed
+// evidence. This test verifies the head stays eligible for rediscovery.
+func TestProcessClaimedItemKeepsHeadEligibleAfterMarkerlessCleanNoop(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{reviewRequests: []string{"octocat"}, reviewMarkerMissing: true}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "No actionable findings; added clean signal", Stdout: `__LOOPER_RESULT__={"summary":"No actionable findings; added clean signal"}`, ParseStatus: "parsed"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, LoopConfig: config.ReviewerLoopConfig{EnabledByDefault: true, QuietPeriodSeconds: 120, MaxIterationsPerPR: 20, MaxIterationsPerHead: 2, MaxWallClockSeconds: 14400, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25}})
+	ctx := context.Background()
+	nowISO := fixture.nowISO()
+	repo := "acme/looper"
+	prNumber := int64(42)
+	metadata := `{"followUpdates":true,"loop":{"enabled":true}}`
+	loop := storage.LoopRecord{ID: "loop_clean_noop_rediscovery", Seq: 1, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "queued", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(ctx, loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	queue, err := runner.enqueue(ctx, enqueueInput{ProjectID: "project_1", LoopID: loop.ID, Repo: repo, PRNumber: prNumber})
+	if err != nil {
+		t.Fatalf("enqueue() error = %v", err)
+	}
+	claimed, err := fixture.repos.Queue.ClaimNextOfType(ctx, fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || claimed == nil || claimed.ID != queue.ID {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want queued item %s", claimed, err, queue.ID)
+	}
+	if _, err := runner.ProcessClaimedItem(ctx, *claimed); err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	// Discovery must re-enqueue the same head because lastPublishedHeadSha was
+	// not set for the markerless event. The head stays eligible for a future
+	// marker-backed review.
+	discovery, err := runner.DiscoverPullRequests(ctx, DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	found := false
+	for _, item := range discovery.QueueItems {
+		if item.PRNumber != nil && *item.PRNumber == prNumber {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("discovery QueueItems = %#v, want PR %d re-enqueued after markerless clean no-op", discovery.QueueItems, prNumber)
 	}
 }
 
