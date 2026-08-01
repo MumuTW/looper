@@ -166,7 +166,11 @@ type RunInput struct {
 	// The agent process itself may still reach its model provider; the daemon
 	// remains the only authority that fetches or publishes repository state.
 	RestrictToolNetwork bool
-	NativeSessionID     string
+	// Assessment uses the daemon-owned, read-only Codex tool profile that is
+	// available before a human authorizes mutation. It is intentionally not a
+	// resumable or configurable variant of normal Planner execution.
+	Assessment      bool
+	NativeSessionID string
 	// UseSnapshot, when true with a non-empty SnapshotVendor, overrides the
 	// executor's configured vendor/model for this start only (spawn, native
 	// resume vendor checks, and persisted execution vendor). Env and
@@ -391,6 +395,12 @@ func stripModelFlags(args []string) []string {
 }
 
 func (e *ConfiguredExecutor) resolveNativeResume(ctx context.Context, input RunInput) (nativeResumeInfo, error) {
+	// Assessments are a fresh, read-only pre-authorization operation. They must
+	// not inherit repository execution state, even when a prior loop execution
+	// has a resumable native session.
+	if input.Assessment {
+		return nativeResumeInfo{Mode: "checkpoint_restart", Status: "disabled"}, nil
+	}
 	cfg := e.effectiveConfig(input)
 	if !cfg.NativeResumeEnabled {
 		return nativeResumeInfo{Mode: "checkpoint_restart", Status: "disabled"}, nil
@@ -464,6 +474,11 @@ func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Executi
 	startedAt := e.now().UTC()
 	startedAtISO := eventlog.FormatJavaScriptISOString(startedAt)
 	cfg := e.effectiveConfig(input)
+	if input.Assessment {
+		if err := validateAssessmentExecution(cfg, input); err != nil {
+			return nil, err
+		}
+	}
 	if input.RestrictToolNetwork && !VendorSupportsToolNetworkDenial(cfg.Vendor) {
 		return nil, unsupportedToolNetworkDenialError(cfg.Vendor)
 	}
@@ -515,7 +530,17 @@ func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Executi
 		spawnPrompt = input.NativeResumePrompt
 	}
 	var toolSandbox *validationcmd.Sandbox
-	if input.RestrictToolNetwork {
+	if input.Assessment {
+		toolSandbox, err = validationcmd.NewAssessmentSandbox(input.WorkingDirectory, "looper-assessment", "looper-assessment-")
+		if err != nil {
+			return nil, fmt.Errorf("prepare read-only assessment tool sandbox: %w", err)
+		}
+		defer func() {
+			if toolSandbox != nil {
+				toolSandbox.Cleanup()
+			}
+		}()
+	} else if input.RestrictToolNetwork {
 		toolSandbox, err = validationcmd.NewSandbox(input.WorkingDirectory, "looper-agent", "looper-agent-")
 		if err != nil {
 			return nil, fmt.Errorf("prepare credential-free agent tool sandbox: %w", err)
@@ -528,7 +553,9 @@ func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Executi
 		}()
 	}
 	command, args := ResolveSpawnWithNativeResume(cfg, input.WorkingDirectory, spawnPrompt, resume.SessionID, resume.Enabled)
-	if input.RestrictToolNetwork {
+	if input.Assessment {
+		command, args = resolveAssessmentSpawn(cfg, spawnPrompt, toolSandbox)
+	} else if input.RestrictToolNetwork {
 		args, err = enforceToolNetworkDenied(cfg.Vendor, args, spawnPrompt, toolSandbox)
 		if err != nil {
 			return nil, err
@@ -596,7 +623,9 @@ func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Executi
 				// best-effort marker only; command fallback is the important recovery behavior
 			}
 			command, args = ResolveSpawn(cfg, input.WorkingDirectory, input.Prompt)
-			if input.RestrictToolNetwork {
+			if input.Assessment {
+				command, args = resolveAssessmentSpawn(cfg, input.Prompt, toolSandbox)
+			} else if input.RestrictToolNetwork {
 				restricted, restrictErr := enforceToolNetworkDenied(cfg.Vendor, args, input.Prompt, toolSandbox)
 				if restrictErr != nil {
 					return nil, fmt.Errorf("%w (native resume fallback after: %v)", restrictErr, err)
@@ -984,7 +1013,8 @@ func (x *execution) run(ctx context.Context) {
 		tr := newCodexJSONLTranslator()
 		tr.ingestAll(stdout)
 		completion = parseCompletion(tr.combinedText(), stderr)
-		if tr.threadID != "" {
+		// Assessments must never become resumable native sessions.
+		if tr.threadID != "" && !x.input.Assessment {
 			x.nativeSessionID = tr.threadID
 		}
 	}
@@ -1172,7 +1202,9 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 
 	cfg := x.executor.effectiveConfig(x.input)
 	command, args := ResolveSpawn(cfg, x.input.WorkingDirectory, x.input.Prompt)
-	if x.input.RestrictToolNetwork {
+	if x.input.Assessment {
+		command, args = resolveAssessmentSpawn(cfg, x.input.Prompt, x.toolSandbox)
+	} else if x.input.RestrictToolNetwork {
 		restricted, restrictErr := enforceToolNetworkDenied(cfg.Vendor, args, x.input.Prompt, x.toolSandbox)
 		if restrictErr != nil {
 			// Fail closed: a restart that cannot re-apply the restriction must
@@ -1453,11 +1485,14 @@ func (x *execution) onOutput(stream string, chunk []byte) {
 	// late). Text-mode ids can stream in across chunks, so re-extract each time; the
 	// codex --json thread id arrives whole in a thread.started line, so capture it
 	// once (only when text extraction found nothing and it's not already known).
-	if nativeSessionID := extractNativeSessionID(stdout, stderr); nativeSessionID != "" {
-		x.nativeSessionID = nativeSessionID
-	} else if x.jsonMode() && strings.TrimSpace(x.nativeSessionID) == "" {
-		if threadID := extractCodexThreadID(stdout); threadID != "" {
-			x.nativeSessionID = threadID
+	// Assessments never capture a session id — they are not resumable.
+	if !x.input.Assessment {
+		if nativeSessionID := extractNativeSessionID(stdout, stderr); nativeSessionID != "" {
+			x.nativeSessionID = nativeSessionID
+		} else if x.jsonMode() && strings.TrimSpace(x.nativeSessionID) == "" {
+			if threadID := extractCodexThreadID(stdout); threadID != "" {
+				x.nativeSessionID = threadID
+			}
 		}
 	}
 	x.mu.Unlock()
@@ -1689,8 +1724,13 @@ func (x *execution) persistFinal(status string, result Result, errorMessage, end
 	pid := int64(pidOrZero(x.process.Process))
 	parseStatus := result.ParseStatus
 	completionSignal := emptyToNil(result.CompletionSignal)
-	if extractedNativeSessionID := extractNativeSessionID(embeddedStdout, embeddedStderr); extractedNativeSessionID != "" {
-		nativeSessionID = extractedNativeSessionID
+	if !x.input.Assessment {
+		if extractedNativeSessionID := extractNativeSessionID(embeddedStdout, embeddedStderr); extractedNativeSessionID != "" {
+			nativeSessionID = extractedNativeSessionID
+		}
+	} else {
+		// Fail closed: assessments never persist a resumable native session id.
+		nativeSessionID = ""
 	}
 	if nativeResumeMode == "native_resume" && status == "failed" {
 		nativeResumeStatus = "failed"
@@ -2244,6 +2284,61 @@ func enforceCodexToolNetworkDenied(args []string, prompt string, sandbox *valida
 		filtered = append(filtered, prompt)
 	}
 	return filtered
+}
+
+// validateAssessmentExecution keeps the pre-authorization capability boundary
+// independent of normal coding-agent configuration. The native Codex profile
+// and its allowlisted tool environment are the authority here, not a prompt or
+// a post-run cleanliness check.
+func validateAssessmentExecution(cfg ExecutorConfig, input RunInput) error {
+	if cfg.Vendor != config.AgentVendorCodex {
+		return fmt.Errorf("assessment profile is supported only for codex; refusing %s execution", cfg.Vendor)
+	}
+	if input.RestrictToolNetwork {
+		return fmt.Errorf("assessment profile owns its sandbox policy; RestrictToolNetwork must be false")
+	}
+	if strings.TrimSpace(input.NativeSessionID) != "" {
+		return fmt.Errorf("assessment profile does not permit native resume")
+	}
+	if command, ok := cfg.Params["command"].(string); ok && strings.TrimSpace(command) != "" {
+		return fmt.Errorf("assessment profile rejects configured command wrappers")
+	}
+	if rawArgs, ok := cfg.Params["args"]; ok && len(stringArgs(rawArgs)) > 0 {
+		return fmt.Errorf("assessment profile rejects configured argv overrides")
+	}
+	return nil
+}
+
+// resolveAssessmentSpawn deliberately does not reuse ResolveSpawn: that path
+// preserves normal operator args and grants a writable Codex workspace. An
+// assessment may inspect the repository, but only its disposable tool root is
+// writable and it receives no browser, Apps/MCP, computer-control, search,
+// network, or project-document capability.
+func resolveAssessmentSpawn(cfg ExecutorConfig, prompt string, sandbox *validationcmd.Sandbox) (string, []string) {
+	args := []string{"exec"}
+	if cfg.LiveToolEvents {
+		args = append(args, "--json")
+	}
+	args = prependModelFlag(args, cfg.Model, "--model", []string{"--model", "-m"})
+	args = append(args,
+		"--ignore-user-config",
+		"-c", "project_doc_max_bytes=0",
+		"--disable", "apps",
+		"--disable", "browser_use",
+		"--disable", "browser_use_external",
+		"--disable", "browser_use_full_cdp_access",
+		"--disable", "computer_use",
+		"--disable", "in_app_browser",
+		"--disable", "standalone_web_search",
+	)
+	if sandbox != nil {
+		args = append(args,
+			"-c", sandbox.PermissionConfig(),
+			"-c", "permission_profile="+strconv.Quote(sandbox.ProfileName),
+			"-c", sandbox.ShellEnvironmentConfig(),
+		)
+	}
+	return "codex", append(args, prompt)
 }
 
 func unsafeCodexSandboxConfig(value string) bool {
