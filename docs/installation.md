@@ -262,9 +262,9 @@ Supported sequence:
    - **First cutover:** `stage-release` the running CLI/daemon, then `activate-release` that id so `current` exists. Reinstall/update the service so the unit launches `release-root/current/looperd` (not a concrete old path). Set `tools.looperPath` to `release-root/current/looper` and restart once to confirm the service follows `current`. Keep that release id as `previous`.
    - **Later cutovers:** the live pair is already that release id (last successful candidate). Re-run `stage-release` with the same binaries — staging is **idempotent** when the destination already matches (same build + binary hashes). Or skip re-staging and reuse `looper upgrade` / `CurrentReleaseID` as `previous`.
 3. `backup` (initial matching config + SQLite + binary evidence; keep the path)
-4. `drain` until `drained: true`
-5. **`backup` again while drained (mandatory)** — this is the rollback bundle for cutover. Work may still commit between step 3 and drain completion; only the post-drain bundle is guaranteed to include that work. Record this bundle directory as `ROLLBACK_BUNDLE`.
-6. `stage-release` the **candidate** pair (new release id)
+4. `stage-release` the **candidate** pair (new release id) — offline; fail here before one-way drain
+5. `drain` until `drained: true`
+6. **`backup` again while drained (mandatory)** — this is the rollback bundle for cutover. Work may still commit between step 3 and drain completion; only the post-drain bundle is guaranteed to include that work. Record this bundle directory as `ROLLBACK_BUNDLE`.
 7. `activate-release` the candidate (switches `current` only — does not restart)
 8. Point `tools.looperPath` at `release-root/current/looper` if not already
 9. **Restart the supervised daemon with `LOOPER_UPGRADE_VERIFY_HOLD=1`** so it loads `current/looperd` but **keeps admission drained** (no claim/mutation) until verification finishes. Without this hold, the replacement scheduler can complete work before `verify-start`; a later failed verify + restore of `$ROLLBACK_BUNDLE` would discard those writes.

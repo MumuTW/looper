@@ -78,6 +78,10 @@ type upgradeStatus struct {
 type upgradeDaemonVersion struct {
 	Version string                `json:"version"`
 	Build   version.BuildMetadata `json:"build"`
+	Binary  struct {
+		Name string `json:"name"`
+		Path string `json:"path,omitempty"`
+	} `json:"binary"`
 }
 
 type upgradeProjects struct {
@@ -93,15 +97,17 @@ type upgradeEvents struct {
 }
 
 type upgradePostStartReport struct {
-	ExpectedBuild   version.Info  `json:"expectedBuild"`
-	ExpectedRelease string        `json:"expectedRelease"`
-	DaemonBuild     version.Info  `json:"daemonBuild"`
-	CurrentRelease  string        `json:"currentRelease"`
-	Status          upgradeStatus `json:"status"`
-	ProjectCount    int           `json:"projectCount"`
-	StartedEvent    bool          `json:"startedEvent"`
-	Verified        bool          `json:"verified"`
-	Blocks          []string      `json:"blocks"`
+	ExpectedBuild      version.Info  `json:"expectedBuild"`
+	ExpectedRelease    string        `json:"expectedRelease"`
+	DaemonBuild        version.Info  `json:"daemonBuild"`
+	CurrentRelease     string        `json:"currentRelease"`
+	RunningExecutable  string        `json:"runningExecutable,omitempty"`
+	ExpectedExecutable string        `json:"expectedExecutable,omitempty"`
+	Status             upgradeStatus `json:"status"`
+	ProjectCount       int           `json:"projectCount"`
+	StartedEvent       bool          `json:"startedEvent"`
+	Verified           bool          `json:"verified"`
+	Blocks             []string      `json:"blocks"`
 }
 
 type upgradeRestorePreflight struct {
@@ -383,7 +389,7 @@ func findUpgradeRestoreOpenPIDs(ctx context.Context, paths []string) ([]int, err
 }
 
 func upgradeStartDrainBlocks(report upgradePreflight) []string {
-	blocks := make([]string, 0, 8)
+	blocks := make([]string, 0, 9)
 	if !report.CurrentPairMatches {
 		blocks = append(blocks, "current CLI and daemon build identities differ")
 	}
@@ -392,6 +398,12 @@ func upgradeStartDrainBlocks(report upgradePreflight) []string {
 	}
 	if !report.TargetIdentityValid {
 		blocks = append(blocks, "target build identity is incomplete")
+	} else if err := releaseCandidateAllowed(report.Target.Daemon); err != nil {
+		// Same gate as stage-release: do not authorize one-way drain for a
+		// candidate that staging will reject (dev channel, dirty, incomplete).
+		blocks = append(blocks, err.Error())
+	} else if err := releaseCandidateAllowed(report.Target.CLI); err != nil {
+		blocks = append(blocks, err.Error())
 	}
 	if !report.TargetConfigCompatible {
 		blocks = append(blocks, "target daemon rejects the selected configuration")
@@ -648,7 +660,18 @@ func runUpgradeVerifyStart(ctx context.Context, global []string, root, releaseID
 		return err
 	}
 	daemon := version.Info{Version: remote.Version, Metadata: remote.Build}
-	report := upgradePostStartReport{ExpectedBuild: staged.Manifest.Build, ExpectedRelease: releaseID, DaemonBuild: daemon, CurrentRelease: currentRelease, Status: status, ProjectCount: len(projects.Items), StartedEvent: containsUpgradeEvent(events, "looperd.started")}
+	expectedExec := upgraderelease.CurrentDaemonExecutable(root)
+	report := upgradePostStartReport{
+		ExpectedBuild:      staged.Manifest.Build,
+		ExpectedRelease:    releaseID,
+		DaemonBuild:        daemon,
+		CurrentRelease:     currentRelease,
+		RunningExecutable:  strings.TrimSpace(remote.Binary.Path),
+		ExpectedExecutable: expectedExec,
+		Status:             status,
+		ProjectCount:       len(projects.Items),
+		StartedEvent:       containsUpgradeEvent(events, "looperd.started"),
+	}
 	report.Blocks = upgradePostStartBlocks(report)
 	report.Verified = len(report.Blocks) == 0
 	if err := writeVersionJSON(stdout, report); err != nil {
@@ -670,12 +693,18 @@ func containsUpgradeEvent(events upgradeEvents, eventType string) bool {
 }
 
 func upgradePostStartBlocks(report upgradePostStartReport) []string {
-	blocks := make([]string, 0, 9)
+	blocks := make([]string, 0, 10)
 	if !report.DaemonBuild.SameBuild(report.ExpectedBuild) {
 		blocks = append(blocks, "running daemon build does not match staged release")
 	}
 	if report.CurrentRelease == "" || report.CurrentRelease != report.ExpectedRelease {
 		blocks = append(blocks, "current release pointer does not select the verified release")
+	}
+	// Require the live process to be the current pointer, not merely a same-build
+	// copy elsewhere: activate-release only rewrites current, so a miswired unit
+	// would survive rollback of the pointer.
+	if err := requireExecutableGovernedByCurrent(report.RunningExecutable, report.ExpectedExecutable); err != nil {
+		blocks = append(blocks, err.Error())
 	}
 	statusBuild := version.Info{Version: report.Status.Service.Version, Metadata: report.Status.Service.Build}
 	if !statusBuild.SameBuild(report.ExpectedBuild) {
@@ -726,6 +755,36 @@ func verifyStagedReleaseIdentity(ctx context.Context, staged upgraderelease.Stag
 	}
 	if !cli.SameBuild(daemon) || !cli.SameBuild(staged.Manifest.Build) {
 		return fmt.Errorf("staged CLI and daemon do not match the release manifest build identity")
+	}
+	return nil
+}
+
+// requireExecutableGovernedByCurrent reports whether the running daemon binary
+// is the release-root/current/looperd path (after symlink resolution), not a
+// same-build copy launched from elsewhere.
+func requireExecutableGovernedByCurrent(runningPath, expectedCurrentPath string) error {
+	runningPath = strings.TrimSpace(runningPath)
+	expectedCurrentPath = strings.TrimSpace(expectedCurrentPath)
+	if runningPath == "" {
+		return fmt.Errorf("running daemon executable path is unavailable")
+	}
+	if expectedCurrentPath == "" {
+		return fmt.Errorf("expected current daemon executable path is unavailable")
+	}
+	running, err := filepath.EvalSymlinks(runningPath)
+	if err != nil {
+		running = filepath.Clean(runningPath)
+	} else {
+		running = filepath.Clean(running)
+	}
+	expected, err := filepath.EvalSymlinks(expectedCurrentPath)
+	if err != nil {
+		expected = filepath.Clean(expectedCurrentPath)
+	} else {
+		expected = filepath.Clean(expected)
+	}
+	if running != expected {
+		return fmt.Errorf("running daemon executable %s is not governed by release current pointer %s", running, expected)
 	}
 	return nil
 }
