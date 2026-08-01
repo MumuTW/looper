@@ -2,6 +2,7 @@ package reviewsubmit
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -9,7 +10,20 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/MumuTW/looper/internal/config"
 )
+
+func runTrustedForTest(ctx context.Context, opts Options) error {
+	loaded, err := config.LoadFile(config.LoadFileOptions{
+		CWD:  opts.CWD,
+		Args: append([]string(nil), opts.ConfigArgs...),
+	})
+	if err != nil {
+		return err
+	}
+	return RunTrusted(ctx, opts, loaded.Config, nil)
+}
 
 // reviewSubmitTestOptions is the invocation these contract tests share: a
 // COMMENT review for acme/looper#42, reading the payload from a file the way

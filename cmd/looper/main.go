@@ -1354,10 +1354,9 @@ Retry flags (after the selector):
 
 There is one more command, which is not for operators:
   looper review submit <repo>#<number> --event <event> --commit-id <sha>
-                               Publish a reviewer agent's pull request review.
-                               Reviewer agents reach it through a wrapper the
-                               daemon writes; run directly it has no provider
-                               credentials and will fail.
+				               Publish a reviewer agent's pull request review.
+				               Reviewer agents reach it through a wrapper the
+				               daemon writes; direct execution is refused.
 
 A selector is a loop sequence number (looper stop 12) or a loop id
 (looper stop loop_1cf3); those are what the daemon resolves.

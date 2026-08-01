@@ -295,6 +295,7 @@ func (g *Gateway) runGitForReviewAnchors(ctx context.Context, cwd string, args .
 		Command:          gitPath,
 		Args:             args,
 		CWD:              valueOr(strings.TrimSpace(cwd), g.cwd),
+		Env:              g.ghEnv,
 		Timeout:          reviewPathDiffCommandTimeout,
 		MaxCapturedBytes: reviewPathDiffMaxCapturedBytes,
 	})

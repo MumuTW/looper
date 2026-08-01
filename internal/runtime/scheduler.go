@@ -1,10 +1,12 @@
 package runtime
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -29,9 +31,9 @@ import (
 	"github.com/MumuTW/looper/internal/network/protocol"
 	"github.com/MumuTW/looper/internal/networkpolicy"
 	"github.com/MumuTW/looper/internal/planner"
-	"github.com/MumuTW/looper/internal/processcontainment"
 	"github.com/MumuTW/looper/internal/projects"
 	"github.com/MumuTW/looper/internal/reviewer"
+	"github.com/MumuTW/looper/internal/reviewsubmit"
 	"github.com/MumuTW/looper/internal/storage"
 	"github.com/MumuTW/looper/internal/triager"
 	"github.com/MumuTW/looper/internal/version"
@@ -346,18 +348,15 @@ func resolveTrustedLooperCLIPath(cfg config.Config, logger bootstrap.Logger) str
 	return configured
 }
 
-// mintTrustedReviewProxyForPR starts a daemon-side Unix socket that runs
-// `looper review submit` with captured credentials, bound exclusively to
+// mintTrustedReviewProxyForPR starts a daemon-side Unix socket that invokes the
+// in-process review submitter with captured credentials, bound exclusively to
 // allowedPRRef (owner/repo#N), allowedCwd (daemon-selected worktree), the
 // materialized run config snapshot, and the daemon-selected review-events
 // policy. Agents only receive the socket path (not tokens or snapshot path).
 // trustedEnv may be empty when ambient credential stores suffice. Setup fails
 // closed: callers must not fall back to direct review submit. cleanup stops the
 // listener and must run when the agent execution ends.
-//
-// tracker registers Supervisor-owned review-submit children for shutdown drain
-// / retain-storage (#577). Nil is allowed only in tests.
-func mintTrustedReviewProxyForPR(realLooper string, trustedEnv map[string]string, allowedPRRef, allowedCwd string, configSnapshot config.Config, policy forge.TrustedReviewProxyPolicy, tracker processcontainment.LiveTracker) (sockPath string, cleanup func(), err error) {
+func mintTrustedReviewProxyForPR(realLooper string, trustedEnv map[string]string, allowedPRRef, allowedCwd string, configSnapshot config.Config, policy forge.TrustedReviewProxyPolicy) (sockPath string, cleanup func(), err error) {
 	realLooper = strings.TrimSpace(realLooper)
 	allowedPRRef = strings.TrimSpace(allowedPRRef)
 	allowedCwd = strings.TrimSpace(allowedCwd)
@@ -374,11 +373,26 @@ func mintTrustedReviewProxyForPR(realLooper string, trustedEnv map[string]string
 	if err != nil {
 		return "", nil, fmt.Errorf("resolve trusted looper path %q: %w", realLooper, err)
 	}
-	resolvedLooper, err = filepath.Abs(resolvedLooper)
-	if err != nil {
+	if _, err := filepath.Abs(resolvedLooper); err != nil {
 		return "", nil, fmt.Errorf("make trusted looper path absolute: %w", err)
 	}
-	return forge.StartTrustedReviewProxy(resolvedLooper, trustedEnv, allowedPRRef, allowedCwd, configSnapshot, policy, tracker)
+	return forge.StartTrustedReviewProxy(runTrustedReviewSubmission, trustedEnv, allowedPRRef, allowedCwd, configSnapshot, policy)
+}
+
+func runTrustedReviewSubmission(ctx context.Context, input forge.TrustedReviewSubmission, stdout, stderr io.Writer) error {
+	return reviewsubmit.RunTrusted(ctx, reviewsubmit.Options{
+		PRRef:               input.PRRef,
+		Event:               input.Event,
+		CommitID:            input.CommitID,
+		CleanReviewEvent:    input.CleanReviewEvent,
+		BlockingReviewEvent: input.BlockingReviewEvent,
+		ReviewerManual:      input.ReviewerManual,
+		ReviewerRunID:       input.ReviewerRunID,
+		CWD:                 input.CWD,
+		Stdin:               bytes.NewReader(input.Stdin),
+		Stdout:              stdout,
+		Stderr:              stderr,
+	}, input.Config, input.CredentialEnv)
 }
 
 func (a plannerGitHubAdapter) ListOpenIssues(ctx context.Context, input planner.ListOpenIssuesInput) ([]planner.IssueSummary, error) {
@@ -790,9 +804,6 @@ type reviewerAgentExecutorAdapter struct {
 	// rather than the daemon's global agent.vendor.
 	agentVendor config.AgentVendor
 	agentModel  *string
-	// tracker registers Supervisor-owned review-submit children for shutdown
-	// drain / retain-storage (#577).
-	tracker processcontainment.LiveTracker
 }
 type reviewerAgentExecutionAdapter struct {
 	execution agent.Execution
@@ -956,7 +967,7 @@ func metadataInt64(value any) (int64, bool) {
 }
 
 // reviewerTrustedReviewAgentIdentity returns vendor/model for the trusted
-// review-submit config snapshot. Run snapshot fields are authority when
+// review-submit config. Run snapshot fields are authority when
 // UseSnapshot is set with a non-empty vendor; otherwise the role-resolved
 // adapter identity is used.
 func reviewerTrustedReviewAgentIdentity(input reviewer.AgentRunInput, fallbackVendor config.AgentVendor, fallbackModel *string) (config.AgentVendor, *string) {
@@ -969,7 +980,7 @@ func reviewerTrustedReviewAgentIdentity(input reviewer.AgentRunInput, fallbackVe
 }
 
 // materializeTrustedReviewAgentIdentity copies cfg and overwrites
-// Agent.Vendor/Model so disclosure.FromConfig in the trusted review child
+// Agent.Vendor/Model so disclosure.FromConfig in trusted review submission
 // matches the reviewer execution identity.
 func materializeTrustedReviewAgentIdentity(cfg config.Config, vendor config.AgentVendor, model *string) config.Config {
 	if strings.TrimSpace(string(vendor)) != "" {
@@ -1017,7 +1028,7 @@ func (a reviewerAgentExecutorAdapter) Start(ctx context.Context, input reviewer.
 		vendor, model := reviewerTrustedReviewAgentIdentity(input, a.agentVendor, a.agentModel)
 		configSnapshot := materializeTrustedReviewAgentIdentity(*a.config, vendor, model)
 		var err error
-		sock, proxyCleanup, err = mintTrustedReviewProxyForPR(a.realLooper, a.trustedEnv, allowedPR, allowedCwd, configSnapshot, policy, a.tracker)
+		sock, proxyCleanup, err = mintTrustedReviewProxyForPR(a.realLooper, a.trustedEnv, allowedPR, allowedCwd, configSnapshot, policy)
 		// Past the wrapper check a failure is the daemon's own — socket, binding
 		// or policy — and keeps the prefix, because it is not the condition the
 		// prompt describes and must not be searched for as if it were.
@@ -2149,7 +2160,6 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 				config:      &cfg,
 				agentVendor: resolved.Vendor,
 				agentModel:  agentModel,
-				tracker:     activeExecutions,
 			},
 			Logger:           logger,
 			Now:              now,

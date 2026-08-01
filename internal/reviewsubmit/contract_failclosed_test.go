@@ -31,7 +31,7 @@ func TestReviewSubmitOrchestrationFailsClosedOnBaseHeadMismatch(t *testing.T) {
 	opts := reviewSubmitTestOptions(t, payloadPath, configPath, repo, stdout, stderr)
 	opts.CommitID = strings.Repeat("a", 40)
 
-	err := Run(context.Background(), opts)
+	err := runTrustedForTest(context.Background(), opts)
 	if err == nil {
 		t.Fatal("Run() error = nil, want base/head mismatch fail-closed")
 	}
@@ -72,7 +72,7 @@ func TestReviewSubmitOrchestrationFailsClosedWhenRemoteOversizedAndLocalUnavaila
 	opts := reviewSubmitTestOptions(t, payloadPath, configPath, repo, stdout, stderr)
 	opts.CommitID = headSHA
 
-	err := Run(context.Background(), opts)
+	err := runTrustedForTest(context.Background(), opts)
 	if err == nil {
 		t.Fatal("Run() error = nil, want fail closed when authority unavailable")
 	}
@@ -123,7 +123,7 @@ func TestReviewSubmitOrchestrationRetryDoesNotDuplicateAfterAuthorityRecovery(t 
 	stderr := &bytes.Buffer{}
 	opts := reviewSubmitTestOptions(t, payloadPath, configPath, brokenRepo, stdout, stderr)
 	opts.CommitID = headSHA
-	firstErr := Run(context.Background(), opts)
+	firstErr := runTrustedForTest(context.Background(), opts)
 	if firstErr == nil {
 		t.Fatal("first Run() error = nil, want validation failure before publish")
 	}
@@ -139,7 +139,7 @@ func TestReviewSubmitOrchestrationRetryDoesNotDuplicateAfterAuthorityRecovery(t 
 	stderr.Reset()
 	opts = reviewSubmitTestOptions(t, payloadPath, configPath, repo, stdout, stderr)
 	opts.CommitID = headSHA
-	if err := Run(context.Background(), opts); err != nil {
+	if err := runTrustedForTest(context.Background(), opts); err != nil {
 		t.Fatalf("recovery Run() error = %v\nstderr=%s", err, stderr.String())
 	}
 	data, err := os.ReadFile(submitLog)
