@@ -20,8 +20,9 @@ type reviewerReviewPostedPayload struct {
 }
 
 // latestCodexReviewForHead projects the latest durable Reviewer review event
-// for one pull request. Reviewer writes this event only after verifying the
-// structured GitHub review marker, so Gatekeeper does not inspect prose or
+// for one pull request. Reviewer writes this event only after verifying a
+// clean signal — either a structured GitHub review marker or the configured
+// COMMENT clean-noop +1 reaction — so Gatekeeper does not inspect prose or
 // infer completion from a generic review decision.
 func latestCodexReviewForHead(ctx context.Context, repos *storage.Repositories, projectID, repo string, prNumber int64, requiredHeadSHA string) (CodexReviewEvidence, error) {
 	evidence := CodexReviewEvidence{RequiredHeadSHA: strings.TrimSpace(requiredHeadSHA)}
@@ -50,10 +51,13 @@ func latestCodexReviewForHead(ctx context.Context, repos *storage.Repositories, 
 		if reviewedHead == "" {
 			continue
 		}
-		// A markerless event (clean COMMENT no-op) records that the Reviewer
-		// processed the head without publishing a structured GitHub review, so
-		// it must not satisfy the current-head gate. Only a marker-verified
-		// event proves a structured review was published for this head.
+		// A markerless event (markerVerified=false) records that the Reviewer
+		// processed the head without publishing a verified clean signal, so it
+		// must not satisfy the current-head gate. The COMMENT clean-noop path
+		// records markerVerified=true because the runner validated the
+		// configured clean signal (+1 reaction) for that policy; a
+		// marker-verified event proves either a structured GitHub review or the
+		// configured COMMENT clean-noop signal was published for this head.
 		if !payload.MarkerVerified {
 			continue
 		}

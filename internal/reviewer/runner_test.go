@@ -3189,10 +3189,11 @@ func TestProcessClaimedItemRunsExistingLoopFollowUpOnNewHeadWithoutReviewRequest
 	if err != nil || updatedLoop == nil || updatedLoop.MetadataJSON == nil {
 		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop metadata", updatedLoop, err)
 	}
-	// A markerless clean no-op must not update lastPublishedHeadSha to the new
-	// head; the head stays eligible for a future marker-backed review.
-	if contains(*updatedLoop.MetadataJSON, `"lastPublishedHeadSha":"abc123"`) {
-		t.Fatalf("loop metadata = %s, want no lastPublishedHeadSha for markerless clean no-op on new head", *updatedLoop.MetadataJSON)
+	// The COMMENT clean-noop path records markerVerified=true and sets
+	// lastPublishedHeadSha to the new head so discovery does not re-run the
+	// same clean-noop path indefinitely.
+	if !contains(*updatedLoop.MetadataJSON, `"lastPublishedHeadSha":"abc123"`) {
+		t.Fatalf("loop metadata = %s, want lastPublishedHeadSha abc123 for COMMENT clean no-op on new head", *updatedLoop.MetadataJSON)
 	}
 	events, err := fixture.repos.Events.ListByEntity(ctx, "pull_request", "acme/looper#42")
 	if err != nil {
@@ -4005,22 +4006,21 @@ func TestProcessClaimedItemRecordsCleanNoopWithoutReviewMarkerForCommentPolicy(t
 	if err != nil || updatedLoop == nil || updatedLoop.MetadataJSON == nil {
 		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop metadata", updatedLoop, err)
 	}
-	// A markerless clean no-op (COMMENT policy) must not set
-	// lastPublishedHeadSha: Gatekeeper rejects the markerVerified=false event,
-	// so marking the head as published would strand it — discovery would skip
-	// the unchanged head while Gatekeeper can never receive marker-backed
-	// evidence. Leaving lastPublishedHeadSha unset keeps the head eligible for
-	// a future marker-backed review.
-	if contains(*updatedLoop.MetadataJSON, `"lastPublishedHeadSha"`) {
-		t.Fatalf("loop metadata = %s, want no lastPublishedHeadSha for markerless clean no-op", *updatedLoop.MetadataJSON)
+	// The COMMENT clean-noop path is the configured clean signal: the runner
+	// validated that no structured review marker was required for this policy
+	// and reconciled the +1 reaction. The event must carry markerVerified=true
+	// so Gatekeeper accepts it, and lastPublishedHeadSha must be set so
+	// discovery does not re-run the same clean-noop path indefinitely.
+	if !contains(*updatedLoop.MetadataJSON, `"lastPublishedHeadSha"`) {
+		t.Fatalf("loop metadata = %s, want lastPublishedHeadSha for COMMENT clean no-op", *updatedLoop.MetadataJSON)
 	}
 	if contains(*updatedLoop.MetadataJSON, `"lastOutputFingerprint"`) {
 		t.Fatalf("loop metadata = %s, want clean no-op excluded from output fingerprinting", *updatedLoop.MetadataJSON)
 	}
 	// The pr.review.posted event is the sole authority Gatekeeper accepts for
-	// the current-head review gate. A clean no-op publishes no structured
-	// GitHub review, so the event must carry markerVerified=false so
-	// Gatekeeper does not treat it as provenance.
+	// the current-head review gate. A clean no-op under the COMMENT policy
+	// publishes no structured GitHub review, but the runner validated the
+	// configured clean signal, so the event must carry markerVerified=true.
 	events, err := fixture.repos.Events.ListByEntity(ctx, "pull_request", "acme/looper#42")
 	if err != nil {
 		t.Fatalf("Events.ListByEntity() error = %v", err)
@@ -4031,8 +4031,8 @@ func TestProcessClaimedItemRecordsCleanNoopWithoutReviewMarkerForCommentPolicy(t
 			continue
 		}
 		foundReviewPosted = true
-		if !strings.Contains(event.PayloadJSON, `"markerVerified":false`) {
-			t.Fatalf("pr.review.posted payload = %s, want markerVerified:false for clean no-op", event.PayloadJSON)
+		if !strings.Contains(event.PayloadJSON, `"markerVerified":true`) {
+			t.Fatalf("pr.review.posted payload = %s, want markerVerified:true for COMMENT clean no-op", event.PayloadJSON)
 		}
 		if !strings.Contains(event.PayloadJSON, `"event":"COMMENT"`) {
 			t.Fatalf("pr.review.posted payload = %s, want event COMMENT", event.PayloadJSON)
@@ -4043,12 +4043,11 @@ func TestProcessClaimedItemRecordsCleanNoopWithoutReviewMarkerForCommentPolicy(t
 	}
 }
 
-// A markerless clean no-op (COMMENT policy) must not suppress rediscovery of
-// the same head. Gatekeeper rejects the markerVerified=false event, so if
-// lastPublishedHeadSha were set, discovery would skip the unchanged head and
-// the head would be stranded — Gatekeeper can never receive marker-backed
-// evidence. This test verifies the head stays eligible for rediscovery.
-func TestProcessClaimedItemKeepsHeadEligibleAfterMarkerlessCleanNoop(t *testing.T) {
+// A COMMENT clean no-op publishes markerVerified=true evidence because the
+// runner validated the configured clean signal (+1 reaction). lastPublishedHeadSha
+// is set so discovery does not re-enqueue the same head, preventing the
+// permanently-ineligible loop where the markerless path is re-run indefinitely.
+func TestProcessClaimedItemMarksHeadPublishedAfterCommentCleanNoop(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	github := &fakeGitHubGateway{reviewRequests: []string{"octocat"}, reviewMarkerMissing: true}
@@ -4074,22 +4073,17 @@ func TestProcessClaimedItemKeepsHeadEligibleAfterMarkerlessCleanNoop(t *testing.
 	if _, err := runner.ProcessClaimedItem(ctx, *claimed); err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
-	// Discovery must re-enqueue the same head because lastPublishedHeadSha was
-	// not set for the markerless event. The head stays eligible for a future
-	// marker-backed review.
+	// Discovery must not re-enqueue the same head because lastPublishedHeadSha
+	// was set for the markerVerified=true event. The head is marked as
+	// published and Gatekeeper accepts the configured clean signal.
 	discovery, err := runner.DiscoverPullRequests(ctx, DiscoveryInput{ProjectID: "project_1", Repo: repo})
 	if err != nil {
 		t.Fatalf("DiscoverPullRequests() error = %v", err)
 	}
-	found := false
 	for _, item := range discovery.QueueItems {
 		if item.PRNumber != nil && *item.PRNumber == prNumber {
-			found = true
-			break
+			t.Fatalf("discovery QueueItems = %#v, want PR %d not re-enqueued after COMMENT clean no-op", discovery.QueueItems, prNumber)
 		}
-	}
-	if !found {
-		t.Fatalf("discovery QueueItems = %#v, want PR %d re-enqueued after markerless clean no-op", discovery.QueueItems, prNumber)
 	}
 }
 

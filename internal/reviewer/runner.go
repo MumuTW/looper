@@ -2842,7 +2842,13 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 		if err := r.applyCleanNoopReviewSideEffects(ctx, input, checkpoint, detail); err != nil {
 			return checkpoint, err
 		}
-		if err := r.recordPublishedReviewProgress(ctx, input, pending, ReviewEventComment, false); err != nil {
+		// The COMMENT clean-noop path is the configured clean signal: the prompt
+		// tells the agent not to submit a structured review, and the runner
+		// reconciles the +1 reaction after validating that no marker was required
+		// for this policy. Recording markerVerified=true publishes evidence
+		// Gatekeeper accepts and marks the head as published so discovery does not
+		// re-run the same markerless path indefinitely.
+		if err := r.recordPublishedReviewProgress(ctx, input, pending, ReviewEventComment, true); err != nil {
 			return checkpoint, err
 		}
 		return checkpoint, nil
@@ -3858,14 +3864,13 @@ func (r *Runner) recordPublishedReviewProgress(ctx context.Context, input stepIn
 	if err := r.appendEventChecked(ctx, eventInput{eventType: "pr.review.posted", projectID: input.Project.ID, loopID: input.Loop.ID, runID: input.Run.ID, entityType: "pull_request", entityID: fmt.Sprintf("%s#%d", input.Repo, input.PRNumber), payload: map[string]any{"repo": input.Repo, "prNumber": input.PRNumber, "event": string(reviewEvent), "headSha": pending.HeadSHA, "markerVerified": markerVerified}}); err != nil {
 		return fmt.Errorf("record published review progress: append pr.review.posted: %w", err)
 	}
-	// A markerless event (clean COMMENT no-op) records that the Reviewer
-	// processed the head without publishing a structured GitHub review.
-	// Gatekeeper correctly rejects it, so lastPublishedHeadSha must not be
-	// set: otherwise discovery would skip the unchanged head and the head
-	// would be stranded — Gatekeeper can never receive marker-backed evidence
-	// while the Reviewer never re-evaluates. Leaving lastPublishedHeadSha unset
-	// keeps the head eligible for a future marker-backed review, with the
-	// min-publish-interval cadence rate-limiting re-runs.
+	// A markerless event (markerVerified=false) records that the Reviewer
+	// processed the head without publishing a verified clean signal. Gatekeeper
+	// rejects it, so lastPublishedHeadSha must not be set: otherwise discovery
+	// would skip the unchanged head and the head would be stranded. The COMMENT
+	// clean-noop path now records markerVerified=true because the runner has
+	// validated the configured clean signal (+1 reaction), so it sets
+	// lastPublishedHeadSha and the head is not re-run indefinitely.
 	metadata := map[string]any{"lastReviewEvent": string(reviewEvent), "lastReviewSummary": pending.Summary, "lastPublishedAt": r.nowISO()}
 	if markerVerified {
 		metadata["lastPublishedHeadSha"] = pending.HeadSHA
