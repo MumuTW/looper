@@ -235,6 +235,9 @@ func skipUnchanged(previous Report, hasPrevious bool, fingerprint string, trust 
 	if trust == config.GatekeeperTrustAuto && reportHasFailedCheck(previous) {
 		return Report{}, false
 	}
+	if reportAwaitsCurrentHeadReview(previous) && reviewEvidenceAppeared {
+		return Report{}, false
+	}
 	evaluatedAt, err := time.Parse(time.RFC3339Nano, previous.EvaluatedAt)
 	if err != nil {
 		return Report{}, false
