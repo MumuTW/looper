@@ -985,6 +985,13 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 			continue
 		}
 		issue = assigned
+		// Reconcile the audit marker when a prior partial success left the
+		// daemon assigned but the durable marker was never persisted. The
+		// GitHub assignee is the source of truth for the assignment; the
+		// marker only records that the daemon owns this personal issue.
+		if !issue.PersonalAssigneeAutoAssigned && personalAssigneeAlreadyAssigned(issue, login, personalProject, policy) {
+			issue.PersonalAssigneeAutoAssigned = true
+		}
 		if issue.PersonalAssigneeAutoAssigned {
 			loopResult.record, err = r.markPersonalAssignment(ctx, loopResult.record)
 			if err != nil {
@@ -1020,6 +1027,15 @@ func (r *Runner) isPersonalProject(projectID string) bool {
 
 func shouldConsiderPersonalAssignment(issue IssueSummary, login string, personalProject bool, policy DiscoveryPolicy) bool {
 	return personalProject && policy.RequireAssigneeCurrentUser && normalizeLogin(login) != "" && strings.EqualFold(strings.TrimSpace(issue.Author), strings.TrimSpace(login)) && len(issue.Assignees) == 0 && len(issue.AssigneeUsers) == 0 && config.LabelsMatch(issue.Labels, policy.Labels, policy.LabelMode)
+}
+
+// personalAssigneeAlreadyAssigned reports whether the daemon is already an
+// assignee of a self-authored personal-project issue. This is the stale-state
+// left by a prior partial success (assignment persisted on GitHub, audit
+// marker not), and lets rediscovery reconcile the durable marker without a
+// second assignment mutation.
+func personalAssigneeAlreadyAssigned(issue IssueSummary, login string, personalProject bool, policy DiscoveryPolicy) bool {
+	return personalProject && policy.RequireAssigneeCurrentUser && normalizeLogin(login) != "" && strings.EqualFold(strings.TrimSpace(issue.Author), strings.TrimSpace(login)) && includesLogin(issue.Assignees, login) && config.LabelsMatch(issue.Labels, policy.Labels, policy.LabelMode)
 }
 
 func (r *Runner) assignPersonalIssueIfEligible(ctx context.Context, project storage.ProjectRecord, repo string, issue IssueSummary, login string, personalProject, requireAssignee bool) (IssueSummary, error) {

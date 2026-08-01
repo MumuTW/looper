@@ -588,25 +588,53 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 			result.Skipped++
 			continue
 		}
+		personalAssignmentCandidate := shouldConsiderPersonalAssignment(issue, login, personalProject, policy)
+		if !personalAssignmentCandidate && !shouldClaimIssue(issue, login, policy) {
+			result.Skipped++
+			continue
+		}
+		fingerprint := buildPlannerDiscoveryFingerprint(input.Repo, r.now(), issue)
+		// Resolve the durable loop (admission) before any GitHub assignee
+		// mutation so an intentionally inactive loop (paused/completed/
+		// awaiting_human/failed) is skipped without assigning the daemon to
+		// work that will not be queued.
+		loopResult, skipped, err := r.admitPlannerIssue(ctx, *project, input.Repo, issue, fingerprint, "")
+		if err != nil {
+			return DiscoveryResult{}, err
+		}
+		if skipped {
+			result.Skipped++
+			continue
+		}
+		if loopResult.created {
+			result.CreatedLoopIDs = append(result.CreatedLoopIDs, loopResult.record.ID)
+		}
+		eligible++
 		assigned, err := r.assignPersonalIssueIfEligible(ctx, *project, input.Repo, issue, login, personalProject, policy.RequireAssigneeCurrentUser)
 		if err != nil {
 			result.Skipped++
 			continue
 		}
 		issue = assigned
-		if !shouldClaimIssue(issue, login, policy) {
-			result.Skipped++
-			continue
+		// Reconcile the audit marker when a prior partial success left the
+		// daemon assigned but the durable marker was never persisted. The
+		// GitHub assignee is the source of truth for the assignment; the
+		// marker only records that the daemon owns this personal issue.
+		if !issue.PersonalAssigneeAutoAssigned && personalAssigneeAlreadyAssigned(issue, login, personalProject, policy) {
+			issue.PersonalAssigneeAutoAssigned = true
 		}
-		fingerprint := buildPlannerDiscoveryFingerprint(input.Repo, r.now(), issue)
-		materialized, err := r.materializeIssue(ctx, *project, input.Repo, issue, login, fingerprint, "")
+		if issue.PersonalAssigneeAutoAssigned {
+			loopResult.record, err = r.markPersonalAssignment(ctx, loopResult.record)
+			if err != nil {
+				return DiscoveryResult{}, err
+			}
+		}
+		materialized, err := r.enqueueAdmittedIssue(ctx, *project, input.Repo, issue, login, loopResult, fingerprint, "")
 		if err != nil {
 			return DiscoveryResult{}, err
 		}
 		result.QueueItems = append(result.QueueItems, materialized.QueueItems...)
-		result.CreatedLoopIDs = append(result.CreatedLoopIDs, materialized.CreatedLoopIDs...)
 		result.Skipped += materialized.Skipped
-		eligible++
 		if eligible >= resultLimit {
 			break
 		}
@@ -635,7 +663,7 @@ func (r *Runner) projectNetworkMode(projectID string) config.ProjectNetworkMode 
 }
 
 func (r *Runner) assignPersonalIssueIfEligible(ctx context.Context, project storage.ProjectRecord, repo string, issue IssueSummary, login string, personalProject, requireAssignee bool) (IssueSummary, error) {
-	if !personalProject || !requireAssignee || normalizeLogin(login) == "" || !strings.EqualFold(strings.TrimSpace(issue.Author), strings.TrimSpace(login)) || len(issue.Assignees) > 0 {
+	if !shouldConsiderPersonalAssignment(issue, login, personalProject, DiscoveryPolicy{RequireAssigneeCurrentUser: requireAssignee, Labels: nil, LabelMode: ""}) {
 		return issue, nil
 	}
 	if err := r.github.AddIssueAssignees(ctx, IssueAssigneesInput{Repo: repo, IssueNumber: issue.Number, Assignees: []string{login}, CWD: project.RepoPath}); err != nil {
@@ -644,6 +672,43 @@ func (r *Runner) assignPersonalIssueIfEligible(ctx context.Context, project stor
 	issue.Assignees = append(issue.Assignees, login)
 	issue.PersonalAssigneeAutoAssigned = true
 	return issue, nil
+}
+
+// shouldConsiderPersonalAssignment reports whether an issue is an unassigned,
+// self-authored candidate for personal-project auto-assignment. It mirrors the
+// Worker predicate so discovery can decide admission eligibility before any
+// GitHub mutation.
+func shouldConsiderPersonalAssignment(issue IssueSummary, login string, personalProject bool, policy DiscoveryPolicy) bool {
+	return personalProject && policy.RequireAssigneeCurrentUser && normalizeLogin(login) != "" && strings.EqualFold(strings.TrimSpace(issue.Author), strings.TrimSpace(login)) && len(issue.Assignees) == 0 && config.LabelsMatch(issue.Labels, policy.Labels, policy.LabelMode)
+}
+
+// personalAssigneeAlreadyAssigned reports whether the daemon is already an
+// assignee of a self-authored personal-project issue. This is the stale-state
+// left by a prior partial success (assignment persisted on GitHub, audit
+// marker not), and lets rediscovery reconcile the durable marker without a
+// second assignment mutation.
+func personalAssigneeAlreadyAssigned(issue IssueSummary, login string, personalProject bool, policy DiscoveryPolicy) bool {
+	return personalProject && policy.RequireAssigneeCurrentUser && normalizeLogin(login) != "" && strings.EqualFold(strings.TrimSpace(issue.Author), strings.TrimSpace(login)) && includesLogin(issue.Assignees, login) && config.LabelsMatch(issue.Labels, policy.Labels, policy.LabelMode)
+}
+
+// markPersonalAssignment persists the personalProjectAutoAssigned audit marker
+// on an admitted loop after the GitHub assignee mutation succeeds. It is the
+// Planner counterpart of Worker's markPersonalAssignment and is called after
+// admission so the marker is only recorded for work that will be queued.
+func (r *Runner) markPersonalAssignment(ctx context.Context, loop storage.LoopRecord) (storage.LoopRecord, error) {
+	var mergeErr error
+	updated, err := r.updateLoop(ctx, loop, func(record *storage.LoopRecord) {
+		metadataJSON, err := mergeLoopMetadataJSON(record.MetadataJSON, map[string]any{"personalProjectAutoAssigned": true})
+		if err != nil {
+			mergeErr = err
+			return
+		}
+		record.MetadataJSON = &metadataJSON
+	})
+	if mergeErr != nil {
+		return storage.LoopRecord{}, fmt.Errorf("merge personal assignment metadata: %w", mergeErr)
+	}
+	return updated, err
 }
 
 // RouteIssue projects a persisted routing authority into Planner's durable
@@ -676,24 +741,55 @@ func (r *Runner) RouteIssue(ctx context.Context, input RouteIssueInput) (Discove
 }
 
 func (r *Runner) materializeIssue(ctx context.Context, project storage.ProjectRecord, repo string, issue IssueSummary, currentUserLogin, fingerprint, authority string) (DiscoveryResult, error) {
-	loopResult, err := r.ensureLoopForIssueWithAuthority(ctx, project, repo, issue, fingerprint, authority)
+	loopResult, skipped, err := r.admitPlannerIssue(ctx, project, repo, issue, fingerprint, authority)
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
 	result := DiscoveryResult{}
-	if loopResult.blocked {
+	if skipped {
 		result.Skipped = 1
+		result.ProjectionAccepted = authority != "" && loopResult.authorityMatch
 		return result, nil
 	}
 	if loopResult.created {
 		result.CreatedLoopIDs = append(result.CreatedLoopIDs, loopResult.record.ID)
 	}
+	enqueued, err := r.enqueueAdmittedIssue(ctx, project, repo, issue, currentUserLogin, loopResult, fingerprint, authority)
+	if err != nil {
+		return DiscoveryResult{}, err
+	}
+	result.QueueItems = enqueued.QueueItems
+	result.ProjectionAccepted = enqueued.ProjectionAccepted
+	return result, nil
+}
+
+// admitPlannerIssue resolves the durable loop for a discovered issue and
+// reports whether discovery should skip it without queueing work. The loop
+// repository is the admission boundary: a blocked authority projection or an
+// intentionally inactive loop (paused/completed/awaiting_human/failed) is
+// skipped here so callers can avoid side effects (such as a GitHub assignee
+// mutation) for work that will not be queued.
+func (r *Runner) admitPlannerIssue(ctx context.Context, project storage.ProjectRecord, repo string, issue IssueSummary, fingerprint, authority string) (loopUpsertResult, bool, error) {
+	loopResult, err := r.ensureLoopForIssueWithAuthority(ctx, project, repo, issue, fingerprint, authority)
+	if err != nil {
+		return loopUpsertResult{}, false, err
+	}
+	if loopResult.blocked {
+		return loopResult, true, nil
+	}
 	switch loopResult.record.Status {
 	case "paused", "completed", "awaiting_human", "failed":
-		result.Skipped = 1
-		result.ProjectionAccepted = authority != "" && loopResult.authorityMatch
-		return result, nil
+		return loopResult, true, nil
 	}
+	return loopResult, false, nil
+}
+
+// enqueueAdmittedIssue builds the planner queue payload for an already-admitted
+// loop and enqueues it. The loop must be in an active (queueable) status.
+// Callers own recording CreatedLoopIDs so admission is reported even when a
+// post-admission step (such as personal assignment) skips the issue.
+func (r *Runner) enqueueAdmittedIssue(ctx context.Context, project storage.ProjectRecord, repo string, issue IssueSummary, currentUserLogin string, loopResult loopUpsertResult, fingerprint, authority string) (DiscoveryResult, error) {
+	result := DiscoveryResult{}
 	payload := map[string]any{
 		"issueNumber":            issue.Number,
 		"title":                  issue.Title,

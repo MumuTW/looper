@@ -192,3 +192,48 @@ func TestDiscoverIssuesPersonalProjectAssignmentFailureSkipsIssue(t *testing.T) 
 		t.Fatalf("created loops=%#v, want both claim-admitted issues retained for retry", result.CreatedLoopIDs)
 	}
 }
+
+// TestDiscoverIssuesPersonalProjectReconcilesAssignmentMarker verifies that
+// rediscovery reconciles the personalProjectAutoAssigned audit marker after a
+// prior partial success: the GitHub assignee was persisted but the durable
+// marker was not. The daemon is already an assignee, so no second assignment
+// mutation occurs, yet the loop and queue markers are recorded.
+func TestDiscoverIssuesPersonalProjectReconcilesAssignmentMarker(t *testing.T) {
+	repo := "acme/looper"
+	target := buildIssueTargetID(repo, 610)
+	gateway := &fakeGitHubGateway{currentLogin: "octocat", issues: []IssueSummary{{Number: 610, Title: "Reconcile", Author: "octocat", Assignees: []string{"octocat"}, Labels: []string{labels.DefaultWorkerReadyTrigger}}}}
+	cfg := personalWorkerConfig(t)
+	fixture, runner := newPersonalWorkerRunner(t, gateway, &cfg)
+	nowISO := fixture.nowISO()
+	// Existing worker loop without the personalProjectAutoAssigned marker,
+	// simulating a prior run that assigned the daemon on GitHub but failed
+	// before the marker was persisted.
+	loopMetadata := `{"worker":{"title":"Reconcile","repo":"acme/looper","issueNumber":610,"baseBranch":"main"}}`
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_worker_marker", Seq: 2, ProjectID: "project_1", Type: "worker", TargetType: "issue", TargetID: &target, Repo: &repo, Status: "queued", MetadataJSON: &loopMetadata, NextRunAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("seed loop: %v", err)
+	}
+	result, err := runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	if len(gateway.addAssigneeCalls) != 0 {
+		t.Fatalf("addAssigneeCalls=%#v, want no second assignment for already-assigned issue", gateway.addAssigneeCalls)
+	}
+	if len(result.QueueItems) != 1 {
+		t.Fatalf("result=%#v, want one queue item for reconciled issue", result)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_marker")
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if loop == nil || !strings.Contains(derefString(loop.MetadataJSON), `"personalProjectAutoAssigned":true`) {
+		t.Fatalf("loop metadata = %#v, want reconciled personal assignment marker", loop)
+	}
+	queue, err := fixture.repos.Queue.GetByID(context.Background(), result.QueueItems[0].ID)
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	if queue == nil || !strings.Contains(derefString(queue.PayloadJSON), `"personalProjectAutoAssigned":true`) {
+		t.Fatalf("queue payload = %#v, want reconciled personal assignment marker", queue)
+	}
+}
