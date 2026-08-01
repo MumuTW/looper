@@ -884,10 +884,8 @@ func (f *fakeGatekeeperGitHub) ListPullRequestCheckRuns(context.Context, githubi
 }
 func (f *fakeGatekeeperGitHub) ListReviewThreads(context.Context, githubinfra.ListReviewThreadsInput) ([]githubinfra.ReviewThread, error) {
 	f.perPullRequestCalls++
-	if f.listReviewThreadsHook != nil {
-		if err := f.listReviewThreadsHook(f); err != nil {
-			return nil, err
-		}
+	if f.beforeThreads != nil {
+		f.beforeThreads(f)
 	}
 	if f.beforeThreads != nil {
 		f.beforeThreads(f)

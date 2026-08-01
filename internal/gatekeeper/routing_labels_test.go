@@ -218,6 +218,45 @@ func TestRoutingLabelsSkipWhenReviewThreadAppearsBeforeProjection(t *testing.T) 
 	}
 }
 
+func TestRoutingLabelsRecheckHeadAfterReviewThreadProjection(t *testing.T) {
+	fixture := newGatekeeperFixture(t)
+	threadReads := 0
+	fixture.github.beforeThreads = func(github *fakeGatekeeperGitHub) {
+		threadReads++
+		if threadReads == 2 {
+			github.finalHeadSHA = "head-2"
+		}
+	}
+	if _, err := routingRunner(fixture, config.GatekeeperTrustAuto).EvaluatePullRequest(context.Background(), EvaluationInput{
+		ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, ExpectedHeadSHA: "head-1",
+	}); err == nil {
+		t.Fatal("EvaluatePullRequest() succeeded after the head moved during review-thread revalidation")
+	}
+	if len(fixture.github.labelAdds) != 0 || len(fixture.github.labelRemoves) != 0 {
+		t.Fatalf("routing labels changed across a post-thread head race: adds=%#v removes=%#v", fixture.github.labelAdds, fixture.github.labelRemoves)
+	}
+}
+
+func TestRoutingLabelsSkipWhenDiffBudgetBaseMovesBeforeProjection(t *testing.T) {
+	fixture := newGatekeeperFixture(t)
+	fixture.github.finalBaseSHA = "base-2"
+	runner := routingRunner(fixture, config.GatekeeperTrustAuto)
+	report := Report{
+		ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, Eligible: true,
+		ObservedHeadSHA: "head-1",
+		Evidence: Evidence{
+			FinalObservedHeadSHA: "head-1",
+			DiffBudget:           &DiffBudgetEvidence{BaseSHA: "base-1", MaxChangedFiles: 20},
+		},
+	}
+	if _, err := runner.persist(context.Background(), report); err == nil {
+		t.Fatal("persist() succeeded after the diff-budget base moved before routing")
+	}
+	if len(fixture.github.labelAdds) != 0 || len(fixture.github.labelRemoves) != 0 {
+		t.Fatalf("routing labels changed across a diff-budget base race: adds=%#v removes=%#v", fixture.github.labelAdds, fixture.github.labelRemoves)
+	}
+}
+
 func TestRoutingLabelsBindEmptyReviewEvidenceToCurrentState(t *testing.T) {
 	fixture := newGatekeeperFixture(t)
 	fixture.github.detail.ReviewDecision = ""
