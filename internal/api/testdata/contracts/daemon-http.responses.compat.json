@@ -582,6 +582,10 @@
               "mergeWatch": {
                 "transientRetries": 3,
                 "maxIndeterminateDuration": "15m"
+              },
+              "markReady": {
+                "enabled": false,
+                "scope": "looper-only"
               }
             },
             "escalator": {
@@ -941,6 +945,10 @@
               "mergeWatch": {
                 "transientRetries": 3,
                 "maxIndeterminateDuration": "15m"
+              },
+              "markReady": {
+                "enabled": false,
+                "scope": "looper-only"
               }
             },
             "escalator": {

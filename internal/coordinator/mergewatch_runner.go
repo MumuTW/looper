@@ -3,6 +3,7 @@ package coordinator
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -17,7 +18,7 @@ import (
 )
 
 var mergeWatchPRURLPattern = regexp.MustCompile(`/pull/(\d+)(?:/|$)`)
-var mergeWatchClosingReferencePattern = regexp.MustCompile(`(?i)(?:close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved)\s+([\w.-]+/[\w.-]+#\d+|#\d+)`)
+var mergeWatchClosingReferencePattern = regexp.MustCompile(`(?i)(?:close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved)\s+((?:https?://[^\s)]+/issues/\d+)|(?:[\w.-]+/[\w.-]+#\d+)|#\d+)`)
 
 type mergeWatchComment struct {
 	ID      int64
@@ -39,14 +40,18 @@ func (r *Runner) applyMergeWatch(ctx context.Context, repo, cwd string, loaded [
 	if err != nil {
 		return nil, err
 	}
+	markReadyDrafts := r.markReadyCandidates(ctx, repo, cwd, roles)
 	for _, issue := range loaded {
 		if !issueHasCoordinatorTracking(issue.detail.Labels, roles.Coordinator.Triage.TriagedLabel) {
 			continue
 		}
-		lock := r.watchLock(repo, issue.detail.Number)
-		lock.Lock()
-		removed, applyErr := r.applyMergeWatchLocked(ctx, repo, cwd, issue, roles, currentLogin, budget)
-		lock.Unlock()
+		removed, applyErr := func() (bool, error) {
+			lock := r.watchLock(repo, issue.detail.Number)
+			lock.Lock()
+			defer lock.Unlock()
+			r.applyMarkReady(ctx, repo, cwd, issue, currentLogin, markReadyDrafts, roles.Coordinator.Triage.TriagedLabel)
+			return r.applyMergeWatchLocked(ctx, repo, cwd, issue, roles, currentLogin, budget)
+		}()
 		if applyErr != nil {
 			return nil, applyErr
 		}
@@ -180,7 +185,6 @@ func (r *Runner) mergeWatchSnapshot(ctx context.Context, repo, cwd string, issue
 		}
 		return mergewatch.PRSnapshot{}, nil, err
 	}
-	checks := mergewatch.RequiredCheckSummary{}
 	mergeableState := detail.MergeableState
 	protection, err := r.github.GetBranchProtection(ctx, githubinfra.BranchProtectionInput{Repo: repo, Branch: detail.BaseRefName, CWD: cwd})
 	if err != nil {
@@ -189,39 +193,7 @@ func (r *Runner) mergeWatchSnapshot(ctx context.Context, repo, cwd string, issue
 		}
 		return mergewatch.PRSnapshot{}, nil, err
 	}
-	requiredChecks := map[string]struct{}{}
-	for _, name := range protection.RequiredChecks {
-		requiredChecks[strings.ToLower(strings.TrimSpace(name))] = struct{}{}
-	}
-	seenChecks := map[string]struct{}{}
-	for _, checkRun := range checkRuns.CheckRuns {
-		status := strings.ToLower(strings.TrimSpace(checkRun.Status))
-		conclusion := strings.ToLower(strings.TrimSpace(checkRun.Conclusion))
-		nameKey := strings.ToLower(strings.TrimSpace(checkRun.Name))
-		seenChecks[nameKey] = struct{}{}
-		switch {
-		case status != "completed" && requiredCheck(requiredChecks, nameKey):
-			checks.Pending = append(checks.Pending, checkRun.Name)
-		case mergeableState.IsUnstable() && requiredCheck(requiredChecks, nameKey) && (conclusion == "failure" || conclusion == "timed_out" || conclusion == "cancelled" || conclusion == "action_required" || conclusion == "startup_failure" || conclusion == "stale"):
-			checks.Failed = append(checks.Failed, checkRun.Name)
-		}
-	}
-	for _, status := range checkRuns.Statuses {
-		contextKey := strings.ToLower(strings.TrimSpace(status.Context))
-		state := strings.ToLower(strings.TrimSpace(status.State))
-		seenChecks[contextKey] = struct{}{}
-		switch {
-		case requiredCheck(requiredChecks, contextKey) && state == "pending":
-			checks.Pending = append(checks.Pending, status.Context)
-		case mergeableState.IsUnstable() && requiredCheck(requiredChecks, contextKey) && (state == "failure" || state == "error"):
-			checks.Failed = append(checks.Failed, status.Context)
-		}
-	}
-	for requiredName := range requiredChecks {
-		if _, ok := seenChecks[requiredName]; !ok {
-			checks.Missing = append(checks.Missing, requiredName)
-		}
-	}
+	checks := summarizeRequiredChecks(requiredCheckRulesFor(protection), checkRuns, mergeableState.IsUnstable())
 	open := strings.EqualFold(detail.State, "open")
 	return mergewatch.PRSnapshot{
 		Repo:                   repo,
@@ -237,6 +209,153 @@ func (r *Runner) mergeWatchSnapshot(ctx context.Context, repo, cwd string, issue
 		MergeableState:         mergeableState,
 		RequiredChecks:         checks,
 	}, nil, nil
+}
+
+// requiredCheckRules is the set of checks that must be green, with GitHub's
+// optional App binding preserved.
+//
+// Branch protection can bind a required context to one GitHub App, and the
+// context alone does not identify it: any App may publish a check run named
+// "verify", so reducing the rules to their names lets a green check from the
+// wrong App satisfy a gate whose actual check never ran. The gatekeeper already
+// matches on the pair; this is the same matching for the merge-watch lanes.
+type requiredCheckRules struct {
+	rules []githubinfra.RequiredCheckRule
+	seen  map[string]struct{}
+}
+
+func (r *requiredCheckRules) add(context string, appID int64) {
+	key := strings.ToLower(strings.TrimSpace(context))
+	if key == "" {
+		return
+	}
+	if r.seen == nil {
+		r.seen = map[string]struct{}{}
+	}
+	identity := fmt.Sprintf("%s\x00%d", key, appID)
+	if _, ok := r.seen[identity]; ok {
+		return
+	}
+	r.seen[identity] = struct{}{}
+	r.rules = append(r.rules, githubinfra.RequiredCheckRule{Context: key, AppID: appID})
+}
+
+func (r requiredCheckRules) len() int { return len(r.rules) }
+
+// matchCheckRun names the rules a check run satisfies. An unbound rule accepts
+// any App's run of that name, which is what "no App binding" means.
+func (r requiredCheckRules) matchCheckRun(name string, appID int64) []int {
+	key := strings.ToLower(strings.TrimSpace(name))
+	matched := []int(nil)
+	for index, rule := range r.rules {
+		if rule.Context == key && (rule.AppID == 0 || rule.AppID == appID) {
+			matched = append(matched, index)
+		}
+	}
+	return matched
+}
+
+// matchStatus names the rules a commit status satisfies. A commit status
+// carries no App, so an App-bound rule can only ever be satisfied by a check
+// run — the same reading the gatekeeper applies.
+func (r requiredCheckRules) matchStatus(context string) []int {
+	key := strings.ToLower(strings.TrimSpace(context))
+	matched := []int(nil)
+	for index, rule := range r.rules {
+		if rule.Context == key && rule.AppID == 0 {
+			matched = append(matched, index)
+		}
+	}
+	return matched
+}
+
+func (r requiredCheckRules) subject(index int) string {
+	rule := r.rules[index]
+	if rule.AppID == 0 {
+		return rule.Context
+	}
+	return fmt.Sprintf("%s (app %d)", rule.Context, rule.AppID)
+}
+
+// requiredCheckRulesFor reads branch protection's required checks, preferring
+// the App-bound rules and falling back to the plain context list only when the
+// forge reported no rules at all.
+func requiredCheckRulesFor(protection githubinfra.BranchProtection) requiredCheckRules {
+	required := requiredCheckRules{}
+	for _, rule := range protection.RequiredCheckRules {
+		required.add(rule.Context, rule.AppID)
+	}
+	if required.len() > 0 {
+		return required
+	}
+	for _, name := range protection.RequiredChecks {
+		required.add(name, 0)
+	}
+	return required
+}
+
+// summarizeRequiredChecks folds check runs and commit statuses into the
+// required-check summary both merge-watch lanes read.
+//
+// countFailures is the one thing the two callers disagree about. Merge-watch
+// only believes a failing check run when GitHub also reports the Pull Request
+// as "unstable", because a stale check run on a clean PR is not a reason to
+// route work to the Fixer. A draft has no such corroboration available —
+// GitHub reports mergeable_state "draft" however CI went — so mark-ready reads
+// conclusions directly. Reading them directly can only add blockers, never
+// remove one, which is the safe direction for a guard whose failure mode is
+// leaving the draft alone.
+func summarizeRequiredChecks(required requiredCheckRules, checkRuns githubinfra.PullRequestCheckRuns, countFailures bool) mergewatch.RequiredCheckSummary {
+	checks := mergewatch.RequiredCheckSummary{}
+	satisfied := make([]bool, required.len())
+	for _, checkRun := range checkRuns.CheckRuns {
+		matched := required.matchCheckRun(checkRun.Name, checkRun.AppID)
+		if len(matched) == 0 {
+			continue
+		}
+		for _, index := range matched {
+			satisfied[index] = true
+		}
+		status := strings.ToLower(strings.TrimSpace(checkRun.Status))
+		conclusion := strings.ToLower(strings.TrimSpace(checkRun.Conclusion))
+		switch {
+		case status != "completed":
+			checks.Pending = append(checks.Pending, checkRun.Name)
+		case countFailures && failedCheckRunConclusion(conclusion):
+			checks.Failed = append(checks.Failed, checkRun.Name)
+		}
+	}
+	for _, status := range checkRuns.Statuses {
+		matched := required.matchStatus(status.Context)
+		if len(matched) == 0 {
+			continue
+		}
+		for _, index := range matched {
+			satisfied[index] = true
+		}
+		state := strings.ToLower(strings.TrimSpace(status.State))
+		switch {
+		case state == "pending":
+			checks.Pending = append(checks.Pending, status.Context)
+		case countFailures && (state == "failure" || state == "error"):
+			checks.Failed = append(checks.Failed, status.Context)
+		}
+	}
+	for index := range required.rules {
+		if !satisfied[index] {
+			checks.Missing = append(checks.Missing, required.subject(index))
+		}
+	}
+	return checks
+}
+
+func failedCheckRunConclusion(conclusion string) bool {
+	switch conclusion {
+	case "failure", "timed_out", "cancelled", "action_required", "startup_failure", "stale":
+		return true
+	default:
+		return false
+	}
 }
 
 func mergeWatchPartialSnapshot(repo string, issueNumber, prNumber int64, detail githubinfra.PullRequestDetail, currentLogin string) mergewatch.PRSnapshot {
@@ -447,8 +566,24 @@ func prLinksIssue(repo string, issueNumber int64, body string) bool {
 			continue
 		}
 		reference := strings.TrimSpace(match[1])
+		reference = strings.TrimRight(reference, ".,;:")
 		if strings.HasPrefix(reference, "#") && asInt64(reference[1:]) == issueNumber {
 			return true
+		}
+		if parsed, err := url.Parse(reference); err == nil && parsed.Scheme != "" && parsed.Host != "" {
+			path := strings.Trim(parsed.Path, "/")
+			segments := strings.Split(path, "/")
+			if len(segments) >= 4 && strings.EqualFold(segments[len(segments)-2], "issues") && asInt64(segments[len(segments)-1]) == issueNumber {
+				hostname, slug := githubinfra.SplitRepoHostname(repo)
+				if hostname == "" {
+					hostname = "github.com"
+				}
+				issuesIndex := len(segments) - 2
+				ownerRepo := strings.Join(segments[issuesIndex-2:issuesIndex], "/")
+				if strings.EqualFold(parsed.Hostname(), hostname) && strings.EqualFold(ownerRepo, slug) {
+					return true
+				}
+			}
 		}
 		parts := strings.Split(reference, "#")
 		if len(parts) == 2 && strings.EqualFold(strings.TrimSpace(parts[0]), strings.TrimSpace(repo)) && asInt64(parts[1]) == issueNumber {
@@ -456,14 +591,6 @@ func prLinksIssue(repo string, issueNumber int64, body string) bool {
 		}
 	}
 	return false
-}
-
-func requiredCheck(required map[string]struct{}, name string) bool {
-	if len(required) == 0 {
-		return false
-	}
-	_, ok := required[name]
-	return ok
 }
 
 func issueHasCoordinatorTracking(labels []string, triagedLabel string) bool {

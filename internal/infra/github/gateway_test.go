@@ -705,10 +705,10 @@ func TestListPullRequestCheckRunsIncludesStatusContexts(t *testing.T) {
 			}
 			return shell.Result{Stdout: `{"total_count":1,"check_runs":[{"name":"unit","status":"completed","conclusion":"success","app":{"id":15368},"check_suite":{"id":7654}}]}`}, nil
 		case 2:
-			if args != "api repos/acme/looper/commits/abc123/status -H Accept: application/vnd.github+json" {
+			if args != "api repos/acme/looper/commits/abc123/status?per_page=100 -H Accept: application/vnd.github+json" {
 				t.Fatalf("unexpected gh args: %q", args)
 			}
-			return shell.Result{Stdout: `{"statuses":[{"context":"legacy-ci","state":"success"},{"context":"legacy-ci","state":"failure"},{"context":"lint","state":"pending"}]}`}, nil
+			return shell.Result{Stdout: `{"total_count":2,"statuses":[{"context":"legacy-ci","state":"success"},{"context":"legacy-ci","state":"failure"},{"context":"lint","state":"pending"}]}`}, nil
 		default:
 			t.Fatalf("unexpected extra gh call: %q", args)
 			return shell.Result{}, nil
@@ -728,6 +728,9 @@ func TestListPullRequestCheckRunsIncludesStatusContexts(t *testing.T) {
 	}
 	if len(runs.Statuses) != 2 || runs.Statuses[0].Context != "legacy-ci" || runs.Statuses[1].Context != "lint" {
 		t.Fatalf("Statuses = %#v, want deduped status contexts in API order", runs.Statuses)
+	}
+	if runs.StatusesTotalCount != 2 {
+		t.Fatalf("StatusesTotalCount = %d, want 2", runs.StatusesTotalCount)
 	}
 }
 
@@ -2682,6 +2685,138 @@ func TestGatewayEnableAutoMergeRequiresHeadSHA(t *testing.T) {
 	err := gateway.EnableAutoMerge(context.Background(), EnableAutoMergeInput{Repo: "acme/looper", PRNumber: 42, Strategy: config.ReviewerAutoMergeStrategySquash})
 	if err == nil || err.Error() != "auto-merge head SHA is required" {
 		t.Fatalf("EnableAutoMerge() error = %v, want missing head SHA error", err)
+	}
+}
+
+func TestGatewayMarkPullRequestReady(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		if args != "pr ready 42 --repo acme/looper" {
+			t.Fatalf("unexpected gh args: %q", args)
+		}
+		return shell.Result{}, nil
+	}
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	if err := gateway.MarkPullRequestReady(context.Background(), MarkPullRequestReadyInput{Repo: "acme/looper", PRNumber: 42}); err != nil {
+		t.Fatalf("MarkPullRequestReady() error = %v", err)
+	}
+}
+
+func TestGatewayMarkPullRequestReadyTreatsConcurrentPublishAsSuccess(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		switch args {
+		case "pr ready 42 --repo acme/looper":
+			return shell.Result{}, errors.New("GraphQL: Pull request is not a draft")
+		case "pr view 42 --repo acme/looper --json isDraft --jq .isDraft":
+			return shell.Result{Stdout: "false\n"}, nil
+		default:
+			t.Fatalf("unexpected gh args: %q", args)
+			return shell.Result{}, nil
+		}
+	}
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	if err := gateway.MarkPullRequestReady(context.Background(), MarkPullRequestReadyInput{Repo: "acme/looper", PRNumber: 42}); err != nil {
+		t.Fatalf("MarkPullRequestReady() error = %v, want nil for already-published pull request", err)
+	}
+}
+
+func TestGatewayMarkPullRequestReadyReportsFailureWhileStillDraft(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		switch args {
+		case "pr ready 42 --repo acme/looper":
+			return shell.Result{}, errors.New("HTTP 403 forbidden")
+		case "pr view 42 --repo acme/looper --json isDraft --jq .isDraft":
+			return shell.Result{Stdout: "true\n"}, nil
+		default:
+			t.Fatalf("unexpected gh args: %q", args)
+			return shell.Result{}, nil
+		}
+	}
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	err := gateway.MarkPullRequestReady(context.Background(), MarkPullRequestReadyInput{Repo: "acme/looper", PRNumber: 42})
+	if err == nil || !strings.Contains(err.Error(), "HTTP 403") {
+		t.Fatalf("MarkPullRequestReady() error = %v, want forbidden error", err)
+	}
+}
+
+func TestGatewayListPullRequestCommitsReportsAuthorLogins(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		if args != "api --paginate --slurp repos/acme/looper/pulls/42/commits?per_page=100 -H Accept: application/vnd.github+json" {
+			t.Fatalf("unexpected gh args: %q", args)
+		}
+		return shell.Result{Stdout: `[{"sha":"abc123","author":{"login":"looper"},"committer":{"login":"looper"}},{"sha":"def456","author":null,"committer":null}]`}, nil
+	}
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	commits, err := gateway.ListPullRequestCommits(context.Background(), ListPullRequestCommitsInput{Repo: "acme/looper", PRNumber: 42})
+	if err != nil {
+		t.Fatalf("ListPullRequestCommits() error = %v", err)
+	}
+	if len(commits) != 2 {
+		t.Fatalf("commits = %#v, want two commits", commits)
+	}
+	if commits[0].OID != "abc123" || len(commits[0].Authors) != 1 || commits[0].Authors[0] != "looper" {
+		t.Fatalf("commits[0] = %#v, want looper-authored commit", commits[0])
+	}
+	if !commits[0].CommitterKnown || len(commits[0].Committers) != 1 || commits[0].Committers[0] != "looper" {
+		t.Fatalf("commits[0] committers = %#v, want looper committer", commits[0])
+	}
+	if commits[1].OID != "def456" || len(commits[1].Authors) != 0 || !commits[1].CommitterKnown || len(commits[1].Committers) != 0 {
+		t.Fatalf("commits[1] = %#v, want unattributed commit", commits[1])
+	}
+}
+
+func TestGatewayListPullRequestDraftEventsKeepsOnlyLifecycleEvents(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		if args != "api --paginate --slurp repos/acme/looper/issues/42/timeline -H Accept: application/vnd.github+json" {
+			t.Fatalf("unexpected gh args: %q", args)
+		}
+		return shell.Result{Stdout: `[[{"event":"commented","actor":{"login":"octo"}},{"event":"ready_for_review","actor":{"login":"looper"},"created_at":"2026-05-14T12:00:00Z"},{"event":"convert_to_draft","actor":{"login":"octo"},"created_at":"2026-05-14T12:05:00Z"}]]`}, nil
+	}
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	events, err := gateway.ListPullRequestDraftEvents(context.Background(), PullRequestDraftEventsInput{Repo: "acme/looper", PRNumber: 42})
+	if err != nil {
+		t.Fatalf("ListPullRequestDraftEvents() error = %v", err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("events = %#v, want the two draft-lifecycle events", events)
+	}
+	if events[0].Event != DraftEventReadyForReview || events[0].Actor != "looper" || events[0].CreatedAt != "2026-05-14T12:00:00Z" {
+		t.Fatalf("events[0] = %#v, want the daemon's publish", events[0])
+	}
+	if events[1].Event != DraftEventConvertToDraft || events[1].Actor != "octo" {
+		t.Fatalf("events[1] = %#v, want octo's conversion back to draft", events[1])
+	}
+}
+
+// The mark-ready lane compares the Pull Request's own author against the
+// account the daemon runs as, so this read has to carry it.
+func TestGatewayViewPullRequestMergeWatchReportsAuthor(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		return shell.Result{Stdout: `{"number":42,"state":"open","draft":true,"user":{"login":"looper"},"head":{"sha":"abc123","ref":"feat/x"},"base":{"ref":"main"}}`}, nil
+	}
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	detail, err := gateway.ViewPullRequestMergeWatch(context.Background(), ViewPullRequestInput{Repo: "acme/looper", PRNumber: 42})
+	if err != nil {
+		t.Fatalf("ViewPullRequestMergeWatch() error = %v", err)
+	}
+	if detail.Author != "looper" {
+		t.Fatalf("Author = %q, want looper", detail.Author)
 	}
 }
 

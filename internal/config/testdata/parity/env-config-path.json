@@ -265,6 +265,10 @@
             "maxIndeterminateDuration": "15m",
             "transientRetries": 3
           },
+          "markReady": {
+            "enabled": false,
+            "scope": "looper-only"
+          },
           "dispatch": {
             "mode": "human-gated",
             "humanGate": {

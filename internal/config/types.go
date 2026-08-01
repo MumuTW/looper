@@ -150,6 +150,17 @@ const (
 	ReviewerAutoMergeScopeLooperOnly ReviewerAutoMergeScope = "looper-only"
 )
 
+type CoordinatorMarkReadyScope string
+
+const (
+	// CoordinatorMarkReadyScopeLooperOnly is the Mark-ready scope: the
+	// Looper-only constraint identifying which draft Pull Requests Coordinator
+	// may promote out of draft — the looper: label AND a tracked-Issue link,
+	// both required. It is the only scope: a human's own draft is never
+	// Looper's to publish, so there is deliberately no wider value to author.
+	CoordinatorMarkReadyScopeLooperOnly CoordinatorMarkReadyScope = "looper-only"
+)
+
 type NotificationSoundLevel string
 
 const (
@@ -659,6 +670,16 @@ type CoordinatorMergeWatchConfig struct {
 	MaxIndeterminateDuration string `json:"maxIndeterminateDuration"`
 }
 
+// CoordinatorMarkReadyConfig configures the merge-watch lane's promotion of a
+// looper-authored draft Pull Request to ready-for-review once CI is green. It
+// is disabled by default: publishing a draft is a visible act on the forge that
+// requests other people's attention, so it stays an explicit operator opt-in
+// rather than something a daemon upgrade turns on.
+type CoordinatorMarkReadyConfig struct {
+	Enabled bool                      `json:"enabled"`
+	Scope   CoordinatorMarkReadyScope `json:"scope"`
+}
+
 type CoordinatorRoleConfig struct {
 	Enabled      bool                          `json:"enabled"`
 	PollInterval string                        `json:"pollInterval"`
@@ -666,6 +687,7 @@ type CoordinatorRoleConfig struct {
 	Dispatch     CoordinatorDispatchConfig     `json:"dispatch"`
 	Dependencies CoordinatorDependenciesConfig `json:"dependencies"`
 	MergeWatch   CoordinatorMergeWatchConfig   `json:"mergeWatch"`
+	MarkReady    CoordinatorMarkReadyConfig    `json:"markReady"`
 }
 
 type RoleConfigs struct {
@@ -1374,6 +1396,11 @@ type PartialCoordinatorMergeWatchConfig struct {
 	MaxIndeterminateDuration *string `json:"maxIndeterminateDuration,omitempty"`
 }
 
+type PartialCoordinatorMarkReadyConfig struct {
+	Enabled *bool                      `json:"enabled,omitempty"`
+	Scope   *CoordinatorMarkReadyScope `json:"scope,omitempty"`
+}
+
 type PartialCoordinatorRoleConfig struct {
 	Enabled      *bool                                 `json:"enabled,omitempty"`
 	PollInterval *string                               `json:"pollInterval,omitempty"`
@@ -1381,6 +1408,7 @@ type PartialCoordinatorRoleConfig struct {
 	Dispatch     *PartialCoordinatorDispatchConfig     `json:"dispatch,omitempty"`
 	Dependencies *PartialCoordinatorDependenciesConfig `json:"dependencies,omitempty"`
 	MergeWatch   *PartialCoordinatorMergeWatchConfig   `json:"mergeWatch,omitempty"`
+	MarkReady    *PartialCoordinatorMarkReadyConfig    `json:"markReady,omitempty"`
 }
 
 type PartialDeployerRoleConfig struct {
