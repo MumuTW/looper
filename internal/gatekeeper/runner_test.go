@@ -430,6 +430,7 @@ type fakeGatekeeperGitHub struct {
 	reviews          []githubinfra.ReviewSummary
 	reviewsErr       error
 	finalHeadSHA     string
+	finalBaseSHA     string
 	headSHAResponses []string
 	protectionErr    error
 	commentsErr      error
@@ -567,6 +568,10 @@ func (f *fakeGatekeeperGitHub) GetPullRequestHeadSHA(context.Context, githubinfr
 		return head, nil
 	}
 	return f.finalHeadSHA, nil
+}
+
+func (f *fakeGatekeeperGitHub) GetPullRequestHeadAndBaseSHA(context.Context, githubinfra.ViewPullRequestInput) (string, string, error) {
+	return f.finalHeadSHA, f.finalBaseSHA, nil
 }
 
 func (f *fakeGatekeeperGitHub) AddPullRequestLabels(_ context.Context, input githubinfra.PullRequestLabelsInput) error {
