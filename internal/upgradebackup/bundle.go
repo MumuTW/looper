@@ -22,8 +22,12 @@ const (
 )
 
 type Input struct {
-	RootDir          string
-	ConfigPath       string
+	RootDir    string
+	ConfigPath string
+	// ConfigContents, when non-nil, is written into the bundle as the config
+	// artifact instead of copying ConfigPath. Used when the daemon runs from
+	// defaults/env with no on-disk config file.
+	ConfigContents   []byte
 	DatabasePath     string
 	CLIBinaryPath    string
 	DaemonBinaryPath string
@@ -71,12 +75,29 @@ func Create(ctx context.Context, input Input) (Result, error) {
 	if strings.TrimSpace(input.RootDir) == "" || input.Snapshot == nil {
 		return Result{}, fmt.Errorf("backup root and snapshot operation are required")
 	}
-	if strings.TrimSpace(input.ConfigPath) == "" || strings.TrimSpace(input.DatabasePath) == "" || strings.TrimSpace(input.CLIBinaryPath) == "" || strings.TrimSpace(input.DaemonBinaryPath) == "" {
-		return Result{}, fmt.Errorf("config, database, CLI binary, and daemon binary paths are required")
+	if strings.TrimSpace(input.DatabasePath) == "" || strings.TrimSpace(input.CLIBinaryPath) == "" || strings.TrimSpace(input.DaemonBinaryPath) == "" {
+		return Result{}, fmt.Errorf("database, CLI binary, and daemon binary paths are required")
 	}
-	configPath, err := absolutePath(input.ConfigPath, "config")
-	if err != nil {
-		return Result{}, err
+	if input.ConfigContents == nil && strings.TrimSpace(input.ConfigPath) == "" {
+		return Result{}, fmt.Errorf("config path or materialized config contents are required")
+	}
+	var configPath string
+	var err error
+	if input.ConfigContents == nil {
+		configPath, err = absolutePath(input.ConfigPath, "config")
+		if err != nil {
+			return Result{}, err
+		}
+	} else if strings.TrimSpace(input.ConfigPath) != "" {
+		configPath, err = absolutePath(input.ConfigPath, "config")
+		if err != nil {
+			return Result{}, err
+		}
+	} else {
+		// Materialized-from-defaults: no durable source path; restore must
+		// still refuse to invent one. Operators using no-file configs cannot
+		// auto-restore config placement from the bundle alone.
+		configPath = ""
 	}
 	databasePath, err := absolutePath(input.DatabasePath, "database")
 	if err != nil {
@@ -110,11 +131,30 @@ func Create(ctx context.Context, input Input) (Result, error) {
 	if err := moveAndRecord(snapshot, filepath.Join(bundle, "database.sqlite"), files, "database.sqlite"); err != nil {
 		return fail(err)
 	}
-	for _, item := range []struct{ source, name string }{{configPath, "config" + filepath.Ext(configPath)}, {cliBinaryPath, "looper"}, {daemonBinaryPath, "looperd"}} {
+	configName := "config.toml"
+	if input.ConfigContents != nil {
+		if ext := filepath.Ext(configPath); ext != "" {
+			configName = "config" + ext
+		}
+		if err := writeAndRecord(input.ConfigContents, filepath.Join(bundle, configName), files, configName); err != nil {
+			return fail(err)
+		}
+	} else {
+		configName = "config" + filepath.Ext(configPath)
+		if configName == "config" {
+			configName = "config.toml"
+		}
+		if err := copyAndRecord(configPath, filepath.Join(bundle, configName), files, configName); err != nil {
+			return fail(err)
+		}
+	}
+	for _, item := range []struct{ source, name string }{{cliBinaryPath, "looper"}, {daemonBinaryPath, "looperd"}} {
 		if err := copyAndRecord(item.source, filepath.Join(bundle, item.name), files, item.name); err != nil {
 			return fail(err)
 		}
 	}
+	// Restore requires absolute source paths. Materialized-only configs leave
+	// ConfigPath empty so RestoreSource refuses rather than inventing a path.
 	manifest := Manifest{Version: ManifestVersion, CreatedAt: now().UTC().Format(time.RFC3339Nano), Files: files, Source: &Source{ConfigPath: configPath, DatabasePath: databasePath, CLIBinaryPath: cliBinaryPath, DaemonBinaryPath: daemonBinaryPath}}
 	encoded, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
@@ -160,17 +200,28 @@ func record(path string, files map[string]File, name string) error {
 	return nil
 }
 
-func describeFile(path, name string) (File, error) {
-	contents, err := os.ReadFile(path)
-	if err != nil {
-		return File{}, fmt.Errorf("read %s for checksum: %w", name, err)
+func writeAndRecord(contents []byte, destination string, files map[string]File, name string) error {
+	if err := os.WriteFile(destination, contents, 0o600); err != nil {
+		return fmt.Errorf("write %s: %w", name, err)
 	}
+	return record(destination, files, name)
+}
+
+func describeFile(path, name string) (File, error) {
 	info, err := os.Stat(path)
 	if err != nil {
 		return File{}, fmt.Errorf("stat %s: %w", name, err)
 	}
-	sum := sha256.Sum256(contents)
-	return File{SHA256: hex.EncodeToString(sum[:]), Size: info.Size()}, nil
+	f, err := os.Open(path)
+	if err != nil {
+		return File{}, fmt.Errorf("open %s for checksum: %w", name, err)
+	}
+	defer f.Close()
+	hasher := sha256.New()
+	if _, err := io.Copy(hasher, f); err != nil {
+		return File{}, fmt.Errorf("hash %s: %w", name, err)
+	}
+	return File{SHA256: hex.EncodeToString(hasher.Sum(nil)), Size: info.Size()}, nil
 }
 
 // Verify confirms that a bundle still has the exact small layout Create

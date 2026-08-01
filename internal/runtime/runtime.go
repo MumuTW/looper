@@ -644,13 +644,23 @@ func (r *Runtime) AdmissionState() AdmissionState {
 
 // AllowMutations is the HTTP mutation readiness projection of admission.
 
-// BeginDrain closes new-work admission without canceling existing producers or
-// active agent processes. Controlled cutover waits on DrainSnapshot.
+// BeginDrain closes new-work admission without canceling active agent
+// processes. Scheduler/recovery/cleanup/project-discovery producers are
+// canceled so they cannot keep mutating storage or enqueuing work after the
+// cutover gate closes; agents and tracked non-agent shells remain owned by
+// DrainSnapshot until they exit.
 func (r *Runtime) BeginDrain(reason string) error {
 	if r == nil || r.admission == nil {
 		return ErrAdmissionNotReady
 	}
-	return r.admission.BeginDrain(reason)
+	cancels := r.snapshotWorkProducerCancels()
+	if err := r.admission.BeginDrain(reason); err != nil {
+		return err
+	}
+	// Same producer set as sticky degrade: stop enqueuing work without
+	// aborting accepted webhook execute deliveries.
+	cancels.invokeForDegrade()
+	return nil
 }
 
 // DrainSnapshot reports Supervisor-owned work still in flight after BeginDrain.

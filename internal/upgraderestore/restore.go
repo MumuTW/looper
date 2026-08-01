@@ -1,5 +1,28 @@
 // Package upgraderestore restores the configuration and SQLite database from
 // a verified upgrade backup bundle using a crash-recoverable file transaction.
+//
+// # Why a durable multi-phase journal exists
+//
+// Restore swaps live config + database paths that the operator needs after a
+// failed cutover. A naive "copy then rename once" is insufficient: a crash
+// between moving the original database aside and installing the bundle copy
+// leaves both the old and new trees incomplete, and a pure fail-loud approach
+// cannot re-enter the half-finished state without an operator inventing which
+// of the partial files is authoritative.
+//
+// The journal (beside the database, named with journalSuffix) records each
+// phase and the staged/undo paths so Recover can either finish the install or
+// put originals back. Deleting the journal while a restore is mid-flight
+// breaks that re-entry: Recover has nothing to follow, and the operator must
+// manually reconcile staged/undo files under the database directory.
+//
+// Failures the journal still cannot catch:
+//   - Kernel/disk loss that corrupts both the journal and the staged files
+//   - Operators deleting staged/undo files by hand mid-restore
+//   - A second concurrent restore against the same database path
+//
+// Those remain fail-loud outside this package's guarantees. The journal exists
+// only for process interruption during an otherwise well-formed restore.
 package upgraderestore
 
 import (

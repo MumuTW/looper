@@ -215,15 +215,27 @@ go run ./cmd/looper stop 12
 
 ### Atomic release switch
 
-Stage a matching CLI/daemon pair, then activate via an atomic release pointer:
+Stage a matching CLI/daemon pair, then activate via an atomic release pointer.
+`stage-release` computes the release id from the target build identity (it does
+not accept an operator-supplied id). `activate-release` and `verify-start`
+require the staged release id returned by stage.
 
 ```bash
-looper upgrade stage-release --root <dir> --release-id <id> --target-looper <path> --target-looperd <path>
-looper upgrade activate-release --root <dir> --release-id <id>
-looper upgrade verify-start --root <dir>
+looper upgrade stage-release --release-root <dir> --target-looper <path> --target-looperd <path>
+looper upgrade activate-release --release-root <dir> --release <id>
+looper upgrade verify-start --release-root <dir> --release <id>
 ```
 
-`verify-start` must succeed before declaring cutover success. `package.autoUpgradeEnabled` is not a supported managed upgrade path (legacy decode only).
+`verify-start` must succeed before declaring cutover success. It checks build
+identity, the release pointer, admission readiness, storage health, and
+quarantine debt. It does **not** fail merely because the restarted daemon has
+already claimed queued work (drain leaves the queue intact). `package.autoUpgradeEnabled`
+is not a supported managed upgrade path (legacy decode only).
+
+Supported service layouts must launch `looperd` through the activated
+`release-root/current` pointer (or an equivalent path that follows that
+pointer). Activation rewrites only the pointer; it does not rewrite unit files
+outside this tree.
 
 
 ### Rollback restore
@@ -235,4 +247,4 @@ looper upgrade restore-preflight --bundle <directory>
 looper upgrade restore --bundle <directory> --confirm
 ```
 
-Supported sequence: preflight → backup → drain → stage-release → activate-release → verify-start; on failure, restore-preflight → restore, then activate the prior release if needed.
+Supported sequence: preflight → backup → **drain** → (optional final backup while drained) → stage-release → activate-release → verify-start; on failure, restore-preflight → restore, then activate the prior release if needed. Drain and final backup stay available after admission closes.

@@ -119,10 +119,14 @@ type DrainSnapshot struct {
 	PendingSpawns     int `json:"pendingSpawns"`
 	BoundOperations   int `json:"boundOperations"`
 	PendingOperations int `json:"pendingOperations"`
+	// NonAgentHandles counts Supervisor-owned validation/trusted-review shells
+	// tracked via processcontainment.LiveTracker. They are live cutover blockers
+	// even though they are not agent executions or operation leases.
+	NonAgentHandles int `json:"nonAgentHandles"`
 }
 
 func (s DrainSnapshot) Drained() bool {
-	return s.LiveExecutions == 0 && s.PendingSpawns == 0 && s.BoundOperations == 0 && s.PendingOperations == 0
+	return s.LiveExecutions == 0 && s.PendingSpawns == 0 && s.BoundOperations == 0 && s.PendingOperations == 0 && s.NonAgentHandles == 0
 }
 
 func (r *ActiveExecutionRegistry) DrainSnapshot() DrainSnapshot {
@@ -131,7 +135,13 @@ func (r *ActiveExecutionRegistry) DrainSnapshot() DrainSnapshot {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return DrainSnapshot{LiveExecutions: len(r.executions), PendingSpawns: len(r.pending), BoundOperations: len(r.boundOps), PendingOperations: len(r.pendingOps)}
+	return DrainSnapshot{
+		LiveExecutions:    len(r.executions),
+		PendingSpawns:     len(r.pending),
+		BoundOperations:   len(r.boundOps),
+		PendingOperations: len(r.pendingOps),
+		NonAgentHandles:   len(r.nonAgentHandles),
+	}
 }
 
 func NewActiveExecutionRegistry() *ActiveExecutionRegistry {

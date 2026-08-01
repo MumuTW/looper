@@ -776,6 +776,11 @@ func isAdmissionExemptMutationPath(path string) bool {
 	switch path {
 	case dashboardBootstrapCodePath, dashboardBootstrapExchangePath:
 		return true
+	// Upgrade control-plane: not work-producing. Must stay available after
+	// BeginDrain so operators can resume drain polling and take a final
+	// quiescent backup before cutover.
+	case apiBasePath + "/upgrade/drain", apiBasePath + "/upgrade/backup":
+		return true
 	default:
 		return false
 	}
