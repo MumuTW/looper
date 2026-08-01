@@ -915,7 +915,7 @@ func (x *execution) run(ctx context.Context) {
 			waiting = false
 		case <-timeoutTimer:
 			timeoutTimer = nil
-			if timedOut {
+			if timedOut || killed {
 				continue
 			}
 			select {
@@ -1414,7 +1414,7 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 			waiting = false
 		case <-timeoutTimer:
 			timeoutTimer = nil
-			if timedOut {
+			if timedOut || killed {
 				continue
 			}
 			select {

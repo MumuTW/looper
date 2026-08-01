@@ -15,6 +15,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/MumuTW/looper/internal/agent"
@@ -2227,9 +2228,14 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 			return checkpoint, &holdSkipError{summary: summary}
 		}
 		useSnap, snapVendor, snapModel := agentRunSnapshotFields(agentVendor, agentModel, useSnapshot)
-		var preTimeoutProgress *worktreeProgress
+		var (
+			preTimeoutProgress *worktreeProgress
+			progressMu         sync.Mutex
+		)
 		onBeforeTimeout := func(timeoutCtx context.Context, observation agent.TimeoutObservation) error {
 			progress, progressErr := r.captureWorktreeProgress(timeoutCtx, input.Project, work, worktree, observation)
+			progressMu.Lock()
+			defer progressMu.Unlock()
 			if progressErr != nil {
 				checkpoint.Execution = &checkpointExecution{Status: "timeout_observing", ProgressSnapshotError: progressErr.Error()}
 				checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
@@ -2262,6 +2268,8 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 			_ = r.onAgentExecutionStarted(ctx, AgentExecutionStartedInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Subtitle: work.Title, Body: "Worker started", DedupeKey: fmt.Sprintf("runtime.agent.started:worker:%s", input.Run.ID)})
 		}
 		result, err := execution.Wait(ctx)
+		progressMu.Lock()
+		defer progressMu.Unlock()
 		if err != nil {
 			return checkpoint, err
 		}
@@ -2350,13 +2358,31 @@ func (r *Runner) captureWorktreeProgress(ctx context.Context, project storage.Pr
 		return worktreeProgress{}, err
 	}
 	return worktreeProgress{
-		HeadSHA: inspect.HeadSHA, WorktreeID: worktree.ID, Branch: inspect.Branch,
-		ChangedFiles: append([]string(nil), inspect.ChangedFiles...), ChangedFileCount: len(inspect.ChangedFiles),
-		StagedFiles: append([]string(nil), inspect.StagedFiles...), StagedFileCount: len(inspect.StagedFiles),
-		UntrackedFiles: append([]string(nil), inspect.UntrackedFiles...), UntrackedFileCount: len(inspect.UntrackedFiles),
-		DiffFingerprint: inspect.DiffFingerprint,
-		TimeoutType:     observation.TimeoutType, LastProgressAt: observation.LastProgressAt, CapturedAt: r.nowISO(),
+		HeadSHA:            inspect.HeadSHA,
+		WorktreeID:         worktree.ID,
+		Branch:             inspect.Branch,
+		ChangedFiles:       boundPathList(inspect.ChangedFiles, worktreeProgressPathCap),
+		ChangedFileCount:   len(inspect.ChangedFiles),
+		StagedFiles:        boundPathList(inspect.StagedFiles, worktreeProgressPathCap),
+		StagedFileCount:    len(inspect.StagedFiles),
+		UntrackedFiles:     boundPathList(inspect.UntrackedFiles, worktreeProgressPathCap),
+		UntrackedFileCount: len(inspect.UntrackedFiles),
+		DiffFingerprint:    inspect.DiffFingerprint,
+		TimeoutType:        observation.TimeoutType,
+		LastProgressAt:     observation.LastProgressAt,
+		CapturedAt:         eventlog.FormatJavaScriptISOString(r.now().UTC()),
 	}, nil
+}
+
+// worktreeProgressPathCap bounds path lists stored in checkpoint_json. Counts
+// still reflect the full InspectHead result; only the sample is truncated.
+const worktreeProgressPathCap = 64
+
+func boundPathList(paths []string, capN int) []string {
+	if capN <= 0 || len(paths) <= capN {
+		return append([]string(nil), paths...)
+	}
+	return append([]string(nil), paths[:capN]...)
 }
 
 func (r *Runner) reconcileWorkerGitState(ctx context.Context, checkpoint *workerCheckpoint, project storage.ProjectRecord, work workerInput, worktree checkpointWorktree, run storage.RunRecord) (bool, error) {
