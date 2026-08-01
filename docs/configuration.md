@@ -212,14 +212,16 @@ in `:` and may contain only letters, numbers, `.`, `_`, or `-`; the default is
 `looper:`. Built-in dispatch and ownership checks use this namespace, and the
 legacy bare `dispatch/plan` and `dispatch/implement` labels are read-only
 compatibility inputs and are never emitted. Classification-label projection is
-kept as a separate opt-in policy; this setting does not make host-repository
-`kind/*`, `area/*`, or `complexity/*` labels Looper-owned.
+kept as a separate opt-in policy; set `projects[].classificationLabels = true`
+to project `kind/*`, `area/*`, and `complexity/*` into a custom namespace. This
+setting does not make host-repository classification labels Looper-owned.
 
 ```toml
 [[projects]]
 id = "client-app"
 repoPath = "/absolute/path/to/client-app"
 labelNamespace = "client.looper:"
+classificationLabels = true
 ```
 
 Legacy top-level `reviewer.*` input is compatibility-only. The canonical reviewer behavior home is `roles.reviewer.behavior.*`.

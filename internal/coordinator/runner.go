@@ -218,7 +218,7 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 	}
 	triageCfg := roleConfigToTriageConfig(roleCfg)
 	triageCfg.Namespace = r.projectLabelNamespace(input.ProjectID, project.MetadataJSON)
-	triageCfg.ProjectClassificationLabels = labels.Normalize(triageCfg.Namespace.Prefix) == labels.Prefix
+	triageCfg.ProjectClassificationLabels = config.ProjectClassificationLabels(r.config, input.ProjectID)
 	projectRoles := config.ProjectRoleConfigs(*r.config, input.ProjectID)
 	dispatchCfg := roleConfigToDispatchConfig(roleCfg, projectRoles)
 	dispatchCfg.Namespace = triageCfg.Namespace
@@ -851,7 +851,7 @@ func (r *Runner) applyAutonomousDispatches(ctx context.Context, projectID, repo,
 				}
 			}
 		}
-		ready = append(ready, autonomousDispatchCandidate{issue: item.issue, action: action, order: deps.parentOrderByIssue[item.issue.Number], worker: isWorkerDispatch(item.issue)})
+		ready = append(ready, autonomousDispatchCandidate{issue: item.issue, action: action, order: deps.parentOrderByIssue[item.issue.Number], worker: isWorkerDispatch(item.issue, triageCfg.Namespace)})
 	}
 	sortAutonomousDispatchCandidates(ready)
 	budget, preemptWorkers, err := r.dispatchBudget(ctx, projectID, repo, cwd, loaded, ready, downstreamLabels)
@@ -1057,8 +1057,19 @@ func queuePullRequestKey(repo string, prNumber int64) string {
 	return fmt.Sprintf("%s#%d", repo, prNumber)
 }
 
-func isWorkerDispatch(issue triage.Issue) bool {
-	return labels.Has(issue.Labels, dispatch.DispatchImplement)
+func isWorkerDispatch(issue triage.Issue, namespace labels.Namespace) bool {
+	if strings.TrimSpace(namespace.Prefix) == "" {
+		namespace = labels.DefaultNamespace()
+	}
+	for _, label := range issue.Labels {
+		if namespace.IsConfiguredDispatchImplement(label) {
+			return true
+		}
+		if (strings.EqualFold(strings.TrimSpace(namespace.Prefix), labels.Prefix)) && namespace.IsDispatchImplement(label) {
+			return true
+		}
+	}
+	return false
 }
 
 func normalizeLogin(login string) string {
@@ -1080,6 +1091,8 @@ func (r *Runner) applyReviewAssignments(ctx context.Context, projectID, repo, cw
 		return nil
 	}
 	trigger := reviewerDiscoveryTriggers(reviewerRole.Discovery)
+	namespace := config.ProjectLabelNamespace(r.config, projectID)
+	trigger.Labels = namespace.RemapAll(trigger.Labels)
 	policy := networkpolicy.ProjectPolicyForProject(*r.config, projectID)
 	routed := networkpolicy.IsRouted(policy)
 	if !reviewerRole.Discovery.Enabled && !routed {
@@ -1114,7 +1127,7 @@ func (r *Runner) applyReviewAssignments(ctx context.Context, projectID, repo, cw
 		}
 		authority := len(detail.ReviewRequests) > 0 || len(detail.ReviewRequestUsers) > 0
 		if routed {
-			authority = authority || routedReviewAssignmentAuthority(projectID, routedMemberships, detail)
+			authority = authority || routedReviewAssignmentAuthority(projectID, routedMemberships, detail, namespace)
 		} else {
 			authority = authority || reviewAssignmentMatchesTrigger(detail, trigger)
 		}
@@ -1122,7 +1135,7 @@ func (r *Runner) applyReviewAssignments(ctx context.Context, projectID, repo, cw
 			continue
 		}
 		if routed {
-			if err := r.applyRoutedReviewAssignment(ctx, projectID, repo, cwd, detail, trigger); err != nil {
+			if err := r.applyRoutedReviewAssignment(ctx, projectID, repo, cwd, detail, trigger, namespace); err != nil {
 				return err
 			}
 			continue
@@ -1169,7 +1182,7 @@ func (r *Runner) applyLocalReviewAssignment(ctx context.Context, repo, cwd strin
 	return r.github.AddPullRequestReviewers(ctx, githubinfra.PullRequestReviewersInput{Repo: repo, PRNumber: detail.Number, Reviewers: []string{candidate.Login}, CWD: cwd})
 }
 
-func (r *Runner) applyRoutedReviewAssignment(ctx context.Context, projectID, repo, cwd string, detail githubinfra.PullRequestDetail, trigger config.ReviewerRoleTriggersConfig) error {
+func (r *Runner) applyRoutedReviewAssignment(ctx context.Context, projectID, repo, cwd string, detail githubinfra.PullRequestDetail, trigger config.ReviewerRoleTriggersConfig, namespace labels.Namespace) error {
 	if r.network == nil {
 		return nil
 	}
@@ -1180,7 +1193,7 @@ func (r *Runner) applyRoutedReviewAssignment(ctx context.Context, projectID, rep
 	if status.Membership.NodeID == "" || status.Lease.HolderNodeID != status.Membership.NodeID {
 		return nil
 	}
-	candidate, ok := chooseReviewerCandidate(projectID, status.Memberships, detail, trigger)
+	candidate, ok := chooseReviewerCandidate(projectID, status.Memberships, detail, trigger, namespace)
 	if !ok {
 		if err := r.recordReviewAssignmentStatus(ctx, repo, detail.Number, "no-eligible-node"); err != nil {
 			return err
@@ -1226,7 +1239,7 @@ func (r *Runner) revalidatePullRequestLease(ctx context.Context, repo string, pr
 	return r.network.RevalidateLease(ctx, protocol.CoordinatorLeaseRevalidateRequest{FencingToken: fencingToken, URL: leaseProbeURL(repo, prNumber)})
 }
 
-func chooseReviewerCandidate(projectID string, memberships []protocol.Membership, detail githubinfra.PullRequestDetail, _ config.ReviewerRoleTriggersConfig) (reviewAssignmentCandidate, bool) {
+func chooseReviewerCandidate(projectID string, memberships []protocol.Membership, detail githubinfra.PullRequestDetail, _ config.ReviewerRoleTriggersConfig, namespace labels.Namespace) (reviewAssignmentCandidate, bool) {
 	requested := requestedReviewerAuthority(detail.ReviewRequests, detail.ReviewRequestUsers)
 	candidates := make([]reviewAssignmentCandidate, 0, len(memberships))
 	for _, member := range memberships {
@@ -1244,7 +1257,7 @@ func chooseReviewerCandidate(projectID string, memberships []protocol.Membership
 		if len(requested) > 0 && !requestedReviewerMatches(requested, candidate) {
 			continue
 		}
-		if !reviewAssignmentEligible(detail, reviewerTriggerFromCapability(projectCapability), candidate, protocol.TargetLabelForNode(candidate.NodeName)) {
+		if !reviewAssignmentEligible(detail, reviewerTriggerFromCapability(projectCapability, namespace), candidate, protocol.TargetLabelForNode(candidate.NodeName)) {
 			continue
 		}
 		candidates = append(candidates, candidate)
@@ -1270,7 +1283,7 @@ func reviewerProjectCapability(capabilities []protocol.ReviewerProjectCapability
 	return protocol.ReviewerProjectCapability{}, false
 }
 
-func routedReviewAssignmentAuthority(projectID string, memberships []protocol.Membership, detail githubinfra.PullRequestDetail) bool {
+func routedReviewAssignmentAuthority(projectID string, memberships []protocol.Membership, detail githubinfra.PullRequestDetail, namespace labels.Namespace) bool {
 	for _, member := range memberships {
 		if member.Capabilities.RoutedProjects <= 0 {
 			continue
@@ -1279,19 +1292,19 @@ func routedReviewAssignmentAuthority(projectID string, memberships []protocol.Me
 		if !ok {
 			continue
 		}
-		if reviewAssignmentMatchesTrigger(detail, reviewerTriggerFromCapability(projectCapability)) {
+		if reviewAssignmentMatchesTrigger(detail, reviewerTriggerFromCapability(projectCapability, namespace)) {
 			return true
 		}
 	}
 	return false
 }
 
-func reviewerTriggerFromCapability(capability protocol.ReviewerProjectCapability) config.ReviewerRoleTriggersConfig {
+func reviewerTriggerFromCapability(capability protocol.ReviewerProjectCapability, namespace labels.Namespace) config.ReviewerRoleTriggersConfig {
 	requireReviewRequest := true
 	if capability.RequireReviewRequest != nil {
 		requireReviewRequest = *capability.RequireReviewRequest
 	}
-	return config.ReviewerRoleTriggersConfig{IncludeDrafts: capability.IncludeDrafts, RequireReviewRequest: requireReviewRequest, EnableSelfReview: capability.EnableSelfReview, Labels: append([]string(nil), capability.Labels...), LabelMode: config.LabelMode(capability.LabelMode)}
+	return config.ReviewerRoleTriggersConfig{IncludeDrafts: capability.IncludeDrafts, RequireReviewRequest: requireReviewRequest, EnableSelfReview: capability.EnableSelfReview, Labels: namespace.RemapAll(capability.Labels), LabelMode: config.LabelMode(capability.LabelMode)}
 }
 
 func reviewAssignmentMatchesTrigger(detail githubinfra.PullRequestDetail, trigger config.ReviewerRoleTriggersConfig) bool {

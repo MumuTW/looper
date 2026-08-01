@@ -2,6 +2,7 @@ package triage
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -63,6 +64,21 @@ func TestDecideCustomNamespaceDoesNotProjectClassificationByDefault(t *testing.T
 		if pattern == "kind/*" || pattern == "area/*" || pattern == "complexity/*" {
 			t.Fatalf("classification cleanup pattern %q leaked into custom namespace decision", pattern)
 		}
+	}
+}
+
+func TestBuildPromptCustomNamespaceUsesNamespacedDispatchSchema(t *testing.T) {
+	cfg := testConfig()
+	cfg.Namespace = labels.NewNamespace("team.looper:")
+	prompt := BuildPrompt(Input{Config: cfg, Issue: Issue{Title: "custom labels"}})
+	if strings.Count(prompt, "Allowed dispatch labels:") != 1 {
+		t.Fatalf("prompt = %q, want one dispatch-label list", prompt)
+	}
+	if !strings.Contains(prompt, `"team.looper:dispatch:plan|team.looper:dispatch:implement"`) {
+		t.Fatalf("prompt schema = %q, want custom dispatch labels", prompt)
+	}
+	if strings.Contains(prompt, `"looper:dispatch:plan|looper:dispatch:implement"`) {
+		t.Fatalf("prompt schema leaked default dispatch labels: %q", prompt)
 	}
 }
 

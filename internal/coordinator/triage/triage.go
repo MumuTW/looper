@@ -185,10 +185,12 @@ func BuildPrompt(input Input) string {
 	b.WriteString(strings.Join(AllowedComplexities(), ", "))
 	b.WriteString("\nAllowed dispatch labels: ")
 	b.WriteString(strings.Join(AllowedDispatchesFor(input.Config.Namespace), ", "))
-	b.WriteString("\nAllowed dispatch labels: ")
-	b.WriteString(strings.Join(AllowedDispatches(), ", "))
+	namespace := input.Config.Namespace
+	if strings.TrimSpace(namespace.Prefix) == "" {
+		namespace = labels.DefaultNamespace()
+	}
 	b.WriteString("\nOutput schema:\n")
-	b.WriteString(fmt.Sprintf(`{"disposition":"valid|out-of-scope|unclear","comment":"string","labels":{"kind":["kind/..."],"area":["area/..."],"complexity":["complexity/..."],"dispatch":["%s|%s"]}}`, labels.DispatchPlan, labels.DispatchImplement))
+	b.WriteString(fmt.Sprintf(`{"disposition":"valid|out-of-scope|unclear","comment":"string","labels":{"kind":["kind/..."],"area":["area/..."],"complexity":["complexity/..."],"dispatch":["%s|%s"]}}`, namespace.DispatchPlan(), namespace.DispatchImplement()))
 	b.WriteString("\n\nIssue:\n")
 	b.WriteString(input.Issue.Title)
 	b.WriteString("\n\n")

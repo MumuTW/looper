@@ -13,8 +13,8 @@ func TestNamespaceDerivesOwnedLabelsAndReadsLegacyDispatch(t *testing.T) {
 	if !ns.IsOwned(" TEAM.LOOPER:worker-ready ") || ns.IsOwned("looper:worker-ready") {
 		t.Fatal("namespace ownership did not isolate the configured prefix")
 	}
-	if !ns.IsDispatch("dispatch/plan") || !ns.IsDispatch("team.looper:dispatch:plan") || ns.IsDispatch("looper:dispatch:plan") {
-		t.Fatal("dispatch compatibility did not honor the configured namespace")
+	if ns.IsDispatch("dispatch/plan") || !ns.IsDispatch("team.looper:dispatch:plan") || ns.IsDispatch("looper:dispatch:plan") {
+		t.Fatal("dispatch compatibility did not isolate the configured namespace")
 	}
 }
 

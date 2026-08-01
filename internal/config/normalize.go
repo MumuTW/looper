@@ -1662,20 +1662,21 @@ func clonePartialProjects(projects []PartialProjectRefConfig) []PartialProjectRe
 	cloned := make([]PartialProjectRefConfig, len(projects))
 	for index, project := range projects {
 		cloned[index] = PartialProjectRefConfig{
-			ID:             project.ID,
-			Name:           project.Name,
-			Provider:       cloneStringPtr(project.Provider),
-			Repo:           cloneStringPtr(project.Repo),
-			RepoPath:       project.RepoPath,
-			Path:           project.Path,
-			LabelNamespace: cloneStringPtr(project.LabelNamespace),
-			BaseBranch:     cloneStringPtr(project.BaseBranch),
-			WorktreeRoot:   cloneStringPtr(project.WorktreeRoot),
-			Network:        clonePartialProjectNetworkConfig(project.Network),
-			Webhook:        clonePartialProjectWebhookConfig(project.Webhook),
-			Validation:     clonePartialProjectValidationConfig(project.Validation),
-			Instructions:   cloneStringMap(project.Instructions),
-			Roles:          clonePartialRoleConfigs(project.Roles),
+			ID:                   project.ID,
+			Name:                 project.Name,
+			Provider:             cloneStringPtr(project.Provider),
+			Repo:                 cloneStringPtr(project.Repo),
+			RepoPath:             project.RepoPath,
+			Path:                 project.Path,
+			LabelNamespace:       cloneStringPtr(project.LabelNamespace),
+			ClassificationLabels: cloneBoolPtr(project.ClassificationLabels),
+			BaseBranch:           cloneStringPtr(project.BaseBranch),
+			WorktreeRoot:         cloneStringPtr(project.WorktreeRoot),
+			Network:              clonePartialProjectNetworkConfig(project.Network),
+			Webhook:              clonePartialProjectWebhookConfig(project.Webhook),
+			Validation:           clonePartialProjectValidationConfig(project.Validation),
+			Instructions:         cloneStringMap(project.Instructions),
+			Roles:                clonePartialRoleConfigs(project.Roles),
 		}
 	}
 	return cloned
@@ -1793,12 +1794,23 @@ func cloneProjects(projects []PartialProjectRefConfig) []ProjectRefConfig {
 		if project.LabelNamespace != nil && strings.TrimSpace(*project.LabelNamespace) != "" {
 			cloned[index].LabelNamespace = strings.ToLower(strings.TrimSpace(*project.LabelNamespace))
 		}
+		if project.ClassificationLabels != nil {
+			cloned[index].ClassificationLabels = *project.ClassificationLabels
+		}
 	}
 
 	return cloned
 }
 
 func cloneProviderKindPtr(value *ProviderKind) *ProviderKind {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
+}
+
+func cloneBoolPtr(value *bool) *bool {
 	if value == nil {
 		return nil
 	}

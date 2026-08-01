@@ -31,6 +31,19 @@ func TestEvaluateWorkerRequiresExactOneMatchingTargetAndCoarseAuthority(t *testi
 	}
 }
 
+func TestEvaluateWorkerUsesProjectNamespaceReadyLabel(t *testing.T) {
+	projectPrefix := "team.looper:"
+	cfg := config.Config{Network: config.NetworkConfig{NodeName: "red", GitHubLogin: "worker"}, Projects: []config.ProjectRefConfig{{ID: "project", LabelNamespace: projectPrefix, Network: config.ProjectNetworkConfig{Mode: config.ProjectNetworkModeRouted}}}}
+	policy := ProjectPolicyForProject(cfg, "project")
+	decision := EvaluateWorker(policy, []string{policy.WorkerReadyLabel, protocol.TargetLabelForNode("red")}, nil)
+	if decision.Allowed || !strings.Contains(decision.Reason, "local GitHub identity") {
+		t.Fatalf("decision = %#v, want target evaluation after namespaced ready label", decision)
+	}
+	if strings.Contains(decision.Reason, labels.DefaultWorkerReadyTrigger) {
+		t.Fatalf("decision = %#v, unexpectedly required default worker-ready label", decision)
+	}
+}
+
 func TestEvaluateReviewerFallsBackToLoginWhenNumericIDsUnavailable(t *testing.T) {
 	t.Parallel()
 	policy := ProjectPolicy{Mode: config.NetworkModeRouted, NodeName: "red", GitHubLogin: "reviewer", GitHubUserID: 42}

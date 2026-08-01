@@ -1677,7 +1677,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		return ProcessResult{}, err
 	}
 	updatedLoop, err = r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
-		metadataJSON, metaErr := r.recordLoopSuccessMetadata(updated.MetadataJSON, checkpoint, summary)
+		metadataJSON, metaErr := r.recordLoopSuccessMetadata(updated.MetadataJSON, checkpoint, summary, project.ID)
 		if metaErr == nil {
 			updated.MetadataJSON = &metadataJSON
 		}
@@ -1877,7 +1877,8 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 		checkpoint.Detail.CurrentLogin = currentLogin
 		return nil
 	}
-	if !isManualReviewerLoop(input.Loop) && r.loopConfig.StopOnReadyLabel && labels.Has(checkpoint.Detail.Labels, labels.SpecReady) {
+	specReadyLabel := config.ProjectLabelNamespaceForMetadata(r.projectRoleConfig, input.Project.ID, input.Project.MetadataJSON).SpecReady()
+	if !isManualReviewerLoop(input.Loop) && r.loopConfig.StopOnReadyLabel && labels.Has(checkpoint.Detail.Labels, specReadyLabel) {
 		checkpoint.SkipReason = fmt.Sprintf("Terminated reviewer loop for ready pull request %s#%d", input.Repo, input.PRNumber)
 		checkpoint.SkipKind = "ready_label"
 		if err := r.terminateLoop(ctx, input.Loop, "ready_label"); err != nil {
@@ -4177,7 +4178,8 @@ func (r *Runner) failedReviewerLoopRecoveryEligibility(ctx context.Context, loop
 	if !r.discoveryPolicyForProject(loop.ProjectID).IncludeDrafts && pr.IsDraft {
 		return false, "", "draft_pr", nil
 	}
-	if r.loopConfig.StopOnReadyLabel && labels.Has(pr.Labels, labels.SpecReady) {
+	specReadyLabel := config.ProjectLabelNamespace(r.projectRoleConfig, loop.ProjectID).SpecReady()
+	if r.loopConfig.StopOnReadyLabel && labels.Has(pr.Labels, specReadyLabel) {
 		return false, "", "ready_label", nil
 	}
 	meta := parseJSONObject(loop.MetadataJSON)
@@ -5448,7 +5450,11 @@ func (r *Runner) recordLoopFailureMetadata(current *string, message string) (str
 	return string(encoded), err
 }
 
-func (r *Runner) recordLoopSuccessMetadata(current *string, checkpoint reviewerCheckpoint, summary string) (string, error) {
+func (r *Runner) recordLoopSuccessMetadata(current *string, checkpoint reviewerCheckpoint, summary string, projectIDs ...string) (string, error) {
+	projectID := ""
+	if len(projectIDs) > 0 {
+		projectID = projectIDs[0]
+	}
 	meta := parseJSONObject(current)
 	loopMeta := reviewerLoopMetadata(meta)
 	head := ""
@@ -5498,7 +5504,8 @@ func (r *Runner) recordLoopSuccessMetadata(current *string, checkpoint reviewerC
 	removeDeprecatedReviewerLoopBudgetMetadata(loopMeta)
 	if checkpoint.SkipReason != "" {
 		delete(meta, "lastFilterSkip")
-		if skip := filterSkipMetadata(checkpoint, r.nowISO()); skip != nil {
+		specReadyLabel := config.ProjectLabelNamespace(r.projectRoleConfig, projectID).SpecReady()
+		if skip := filterSkipMetadata(checkpoint, r.nowISO(), specReadyLabel); skip != nil {
 			meta["lastFilterSkip"] = skip
 		}
 	} else {
@@ -5509,7 +5516,7 @@ func (r *Runner) recordLoopSuccessMetadata(current *string, checkpoint reviewerC
 	return string(encoded), err
 }
 
-func filterSkipMetadata(checkpoint reviewerCheckpoint, recordedAt string) map[string]any {
+func filterSkipMetadata(checkpoint reviewerCheckpoint, recordedAt string, requiredReadyLabel ...string) map[string]any {
 	if checkpoint.Detail == nil || !isDiscoverySuppressingSkipKind(checkpoint.SkipKind) {
 		return nil
 	}
@@ -5531,7 +5538,11 @@ func filterSkipMetadata(checkpoint reviewerCheckpoint, recordedAt string) map[st
 		metadata["hasConflicts"] = true
 	}
 	if checkpoint.SkipKind == "ready_label" {
-		metadata["requiredLabel"] = labels.SpecReady
+		requiredLabel := labels.SpecReady
+		if len(requiredReadyLabel) > 0 && strings.TrimSpace(requiredReadyLabel[0]) != "" {
+			requiredLabel = strings.TrimSpace(requiredReadyLabel[0])
+		}
+		metadata["requiredLabel"] = requiredLabel
 	}
 	if checkpoint.SkipKind == "already_reviewed_by_current_user" && checkpoint.SkipReviewerLogin != "" {
 		metadata["reviewerLogin"] = normalizeLogin(checkpoint.SkipReviewerLogin)

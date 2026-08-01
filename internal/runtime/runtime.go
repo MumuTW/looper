@@ -3427,6 +3427,7 @@ type runtimeReviewerRecoveryPolicy struct {
 	includeDrafts    bool
 	stopOnApproved   bool
 	stopOnReadyLabel bool
+	specReadyLabel   string
 	currentLogin     string
 	retry            config.ReviewerRetryConfig
 }
@@ -3438,10 +3439,12 @@ func (r *Runtime) reviewerRecoveryPolicyForProject(projectID string) runtimeRevi
 	if reviewerRole, ok := config.ProjectCodingRoleConfig(cfg, projectID, config.CodingRoleReviewer); ok {
 		includeDrafts = reviewerRole.Discovery.IncludeDrafts
 	}
+	specReadyLabel := config.ProjectLabelNamespace(&cfg, projectID).SpecReady()
 	return runtimeReviewerRecoveryPolicy{
 		includeDrafts:    includeDrafts,
 		stopOnApproved:   roles.Reviewer.Behavior.Loop.StopOnApproved,
 		stopOnReadyLabel: roles.Reviewer.Behavior.Loop.StopOnReadyLabel,
+		specReadyLabel:   specReadyLabel,
 		retry:            config.NormalizeReviewerRetryConfig(roles.Reviewer.Behavior.Retry),
 	}
 }
@@ -3539,7 +3542,11 @@ func shouldAutoRecoverFailedReviewerLoop(loop storage.LoopRecord, latestRun *sto
 	if policy.stopOnApproved && runtimeReviewerCheckpointApprovedForRecovery(checkpoint.Detail.Reviews, currentLogin, checkpoint.Detail.HeadSHA, checkpoint.Detail.ReviewDecision) {
 		return false
 	}
-	if policy.stopOnReadyLabel && labels.Has(checkpoint.Detail.Labels, labels.SpecReady) {
+	specReadyLabel := strings.TrimSpace(policy.specReadyLabel)
+	if specReadyLabel == "" {
+		specReadyLabel = labels.SpecReady
+	}
+	if policy.stopOnReadyLabel && labels.Has(checkpoint.Detail.Labels, specReadyLabel) {
 		return false
 	}
 	failureSummary := firstNonEmpty(derefString(latestRun.Summary), derefString(latestRun.ErrorMessage), queueMessage)

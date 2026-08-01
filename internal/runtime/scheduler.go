@@ -25,6 +25,7 @@ import (
 	gitinfra "github.com/nexu-io/looper/internal/infra/git"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/notify"
+	"github.com/nexu-io/looper/internal/labels"
 	networkclient "github.com/nexu-io/looper/internal/network/client"
 	"github.com/nexu-io/looper/internal/network/protocol"
 	"github.com/nexu-io/looper/internal/networkpolicy"
@@ -1705,6 +1706,12 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			Repos:  repos,
 			GitHub: githubGateway,
 			Now:    now,
+			LabelNamespaceForProject: func(projectID string) (labels.Namespace, bool) {
+				if _, ok := runtimeProjectBinding(cfg, projectID); !ok {
+					return labels.Namespace{}, false
+				}
+				return config.ProjectLabelNamespace(&cfg, projectID), true
+			},
 			TrustForProject: func(projectID string) config.GatekeeperTrustLevel {
 				return gatekeeperTrustForProject(cfg, projectID)
 			},

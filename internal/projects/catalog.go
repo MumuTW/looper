@@ -163,6 +163,9 @@ func MaterializeCatalog(global config.Config, records []storage.ProjectRecord) (
 		if err := decodeMetadataValue(metadata, "network", &project.Network); err != nil {
 			return nil, fmt.Errorf("decode project %q network policy: %w", project.ID, err)
 		}
+		if err := decodeMetadataValue(metadata, "classificationLabels", &project.ClassificationLabels); err != nil {
+			return nil, fmt.Errorf("decode project %q classification-label policy: %w", project.ID, err)
+		}
 		if err := decodeMetadataValue(metadata, "webhook", &project.Webhook); err != nil {
 			return nil, fmt.Errorf("decode project %q webhook policy: %w", project.ID, err)
 		}

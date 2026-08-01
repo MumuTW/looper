@@ -245,6 +245,7 @@ func isAllowedUser(comment Comment, allowedUsers []string) bool {
 }
 
 func singleDispatchLabelForNamespace(issueLabels []string, namespace labels.Namespace) (string, bool) {
+	allowLegacy := acceptsLegacyDispatchLabels(namespace)
 	configured := ""
 	legacy := ""
 	for _, label := range issueLabels {
@@ -256,6 +257,9 @@ func singleDispatchLabelForNamespace(issueLabels []string, namespace labels.Name
 				return "", false
 			}
 			configured = label
+			continue
+		}
+		if !allowLegacy {
 			continue
 		}
 		if legacy != "" {
@@ -275,13 +279,18 @@ func triggerLabelsForDispatch(dispatchLabel string, cfg Config) []string {
 		namespace = labels.DefaultNamespace()
 	}
 	switch {
-	case namespace.IsDispatchPlan(dispatchLabel):
+	case namespace.IsConfiguredDispatchPlan(dispatchLabel) || (acceptsLegacyDispatchLabels(namespace) && namespace.IsDispatchPlan(dispatchLabel)):
 		return compactLabels(cfg.PlannerTriggerLabels)
-	case namespace.IsDispatchImplement(dispatchLabel):
+	case namespace.IsConfiguredDispatchImplement(dispatchLabel) || (acceptsLegacyDispatchLabels(namespace) && namespace.IsDispatchImplement(dispatchLabel)):
 		return compactLabels(cfg.WorkerTriggerLabels)
 	default:
 		return nil
 	}
+}
+
+func acceptsLegacyDispatchLabels(namespace labels.Namespace) bool {
+	prefix := strings.ToLower(strings.TrimSpace(namespace.Prefix))
+	return prefix == "" || prefix == labels.Prefix
 }
 
 func compactLabels(labels []string) []string {

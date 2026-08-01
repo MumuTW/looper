@@ -39,6 +39,22 @@ func ProjectLabelNamespaceForMetadata(cfg *Config, projectID string, metadataJSO
 	return labels.DefaultNamespace()
 }
 
+// ProjectClassificationLabels reports the explicit project opt-in for
+// projecting kind/area/complexity labels. The default namespace keeps its
+// historical projection through triage's default policy; custom namespaces
+// must opt in here so isolation does not silently change classification scope.
+func ProjectClassificationLabels(cfg *Config, projectID string) bool {
+	if cfg == nil {
+		return false
+	}
+	for _, project := range cfg.Projects {
+		if strings.TrimSpace(project.ID) == strings.TrimSpace(projectID) {
+			return project.ClassificationLabels
+		}
+	}
+	return false
+}
+
 func configuredProjectLabelNamespace(cfg *Config, projectID string) (labels.Namespace, bool) {
 	if cfg != nil {
 		for _, project := range cfg.Projects {

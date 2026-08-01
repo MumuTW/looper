@@ -167,7 +167,7 @@ func ScanWith(cfg Config) ([]Violation, error) {
 				// are not writes by the package under test; production code still
 				// has to use the labels authority. Keep the repository audit useful
 				// without forcing every JSON fixture through string formatting.
-				if strings.HasSuffix(rel, "_test.go") && (normalized == labels.Normalize(labels.DispatchPlan) || normalized == labels.Normalize(labels.DispatchImplement)) {
+				if isLegacyDispatchFixture(rel, normalized) {
 					continue
 				}
 				if value, banned := protected[normalized]; banned {
@@ -202,6 +202,30 @@ func ScanWith(cfg Config) ([]Violation, error) {
 		return violations[i].Line < violations[j].Line
 	})
 	return violations, nil
+}
+
+// isLegacyDispatchFixture limits dispatch wire values to tests that explicitly
+// model forge payloads or compatibility cleanup. A blanket *_test.go exemption
+// would let any future fixture bypass the label authority audit and silently
+// drift from the canonical constants.
+func isLegacyDispatchFixture(path, normalized string) bool {
+	if normalized != "dispatch/plan" && normalized != "dispatch/implement" && normalized != labels.Normalize(labels.DispatchPlan) && normalized != labels.Normalize(labels.DispatchImplement) {
+		return false
+	}
+	switch filepath.ToSlash(path) {
+	case "internal/coordinator/dispatch/human_test.go",
+		"internal/coordinator/dispatch/namespace_test.go",
+		"internal/coordinator/namespace_test.go",
+		"internal/coordinator/runner_actions_test.go",
+		"internal/coordinator/triage/triage_decisions_test.go",
+		"internal/coordinator/triage/triage_guards_test.go",
+		"internal/e2e/dependency_gate_sandbox_test.go",
+		"internal/reviewer/runner_labels_test.go",
+		"internal/reviewer/runner_test.go":
+		return true
+	default:
+		return false
+	}
 }
 
 type protectedValue struct {

@@ -98,9 +98,9 @@ func (r *Runner) applyMergeWatchLocked(ctx context.Context, repo, cwd string, is
 		return false, r.upsertMergeWatchComment(ctx, repo, cwd, issue.detail.Number, marker, baseMarker, "")
 	case mergewatch.ActionConflict, mergewatch.ActionRedCI:
 		fixer := config.EffectiveCodingRoles(roles)[config.CodingRoleFixer]
-		labels := requiredDiscoveryLabels(fixer.Discovery.Labels, fixer.Discovery.LabelMode)
-		if len(labels) > 0 {
-			if err := r.github.AddPullRequestLabels(ctx, githubinfra.PullRequestLabelsInput{Repo: repo, PRNumber: snapshot.PRNumber, Labels: labels, CWD: cwd}); err != nil {
+		fixerLabels := namespace.RemapAll(requiredDiscoveryLabels(fixer.Discovery.Labels, fixer.Discovery.LabelMode))
+		if len(fixerLabels) > 0 {
+			if err := r.github.AddPullRequestLabels(ctx, githubinfra.PullRequestLabelsInput{Repo: repo, PRNumber: snapshot.PRNumber, Labels: fixerLabels, CWD: cwd}); err != nil {
 				return false, err
 			}
 		}

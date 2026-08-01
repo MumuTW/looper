@@ -27,6 +27,19 @@ func TestProjectLabelNamespaceReadsPersistedProjectMetadata(t *testing.T) {
 	}
 }
 
+func TestProjectClassificationLabelsIsExplicitForCustomNamespace(t *testing.T) {
+	prefix := "team.looper:"
+	enabled := true
+	projects := []PartialProjectRefConfig{{ID: "demo", LabelNamespace: &prefix, ClassificationLabels: &enabled}}
+	cfg, err := Normalize(t.TempDir(), PartialConfig{Projects: &projects})
+	if err != nil {
+		t.Fatalf("Normalize() error = %v", err)
+	}
+	if !ProjectClassificationLabels(&cfg, "demo") {
+		t.Fatal("ProjectClassificationLabels() = false, want explicit custom opt-in")
+	}
+}
+
 func TestValidateRejectsUnsafeProjectLabelNamespace(t *testing.T) {
 	prefix := "team looper:"
 	projects := []PartialProjectRefConfig{{ID: "demo", LabelNamespace: &prefix}}

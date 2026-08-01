@@ -151,7 +151,7 @@ func (n Namespace) AnyOwned(labels []string) bool {
 }
 
 func (n Namespace) IsDispatch(label string) bool {
-	return n.IsConfiguredDispatch(label) || Normalize(label) == "dispatch/plan" || Normalize(label) == "dispatch/implement"
+	return n.IsConfiguredDispatch(label) || (n.acceptsLegacyDispatch() && (Normalize(label) == "dispatch/plan" || Normalize(label) == "dispatch/implement"))
 }
 
 func (n Namespace) IsConfiguredDispatch(label string) bool {
@@ -164,7 +164,7 @@ func (n Namespace) IsConfiguredDispatch(label string) bool {
 }
 
 func (n Namespace) IsDispatchPlan(label string) bool {
-	return n.IsConfiguredDispatchPlan(label) || Normalize(label) == "dispatch/plan"
+	return n.IsConfiguredDispatchPlan(label) || (n.acceptsLegacyDispatch() && Normalize(label) == "dispatch/plan")
 }
 
 func (n Namespace) IsConfiguredDispatchPlan(label string) bool {
@@ -181,7 +181,11 @@ func (n Namespace) IsDispatchPlanForLabels(values []string) bool {
 }
 
 func (n Namespace) IsDispatchImplement(label string) bool {
-	return n.IsConfiguredDispatchImplement(label) || Normalize(label) == "dispatch/implement"
+	return n.IsConfiguredDispatchImplement(label) || (n.acceptsLegacyDispatch() && Normalize(label) == "dispatch/implement")
+}
+
+func (n Namespace) acceptsLegacyDispatch() bool {
+	return n.normalized().Prefix == Prefix
 }
 
 func (n Namespace) IsConfiguredDispatchImplement(label string) bool {

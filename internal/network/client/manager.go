@@ -311,8 +311,9 @@ func reviewerProjectCapabilities(cfg config.Config) []protocol.ReviewerProjectCa
 		if !ok || !reviewer.Discovery.Enabled {
 			continue
 		}
+		namespace := config.ProjectLabelNamespace(&cfg, project.ID)
 		requireReviewRequest := reviewer.Discovery.RequireReviewRequest
-		capabilities = append(capabilities, protocol.ReviewerProjectCapability{ProjectID: strings.TrimSpace(project.ID), IncludeDrafts: reviewer.Discovery.IncludeDrafts, RequireReviewRequest: &requireReviewRequest, EnableSelfReview: reviewer.Discovery.EnableSelfReview, Labels: append([]string(nil), reviewer.Discovery.Labels...), LabelMode: string(reviewer.Discovery.LabelMode)})
+		capabilities = append(capabilities, protocol.ReviewerProjectCapability{ProjectID: strings.TrimSpace(project.ID), IncludeDrafts: reviewer.Discovery.IncludeDrafts, RequireReviewRequest: &requireReviewRequest, EnableSelfReview: reviewer.Discovery.EnableSelfReview, Labels: namespace.RemapAll(reviewer.Discovery.Labels), LabelMode: string(reviewer.Discovery.LabelMode)})
 	}
 	slices.SortFunc(capabilities, func(a, b protocol.ReviewerProjectCapability) int {
 		return strings.Compare(a.ProjectID, b.ProjectID)

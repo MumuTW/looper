@@ -15,10 +15,11 @@ type GitHubUser struct {
 }
 
 type ProjectPolicy struct {
-	Mode         config.NetworkMode
-	NodeName     string
-	GitHubLogin  string
-	GitHubUserID int64
+	Mode             config.NetworkMode
+	NodeName         string
+	GitHubLogin      string
+	GitHubUserID     int64
+	WorkerReadyLabel string
 }
 
 type MatchMode string
@@ -37,12 +38,13 @@ type ClaimDecision struct {
 }
 
 func ProjectPolicyForProject(cfg config.Config, projectID string) ProjectPolicy {
-	policy := ProjectPolicy{Mode: config.NetworkModeOff, NodeName: strings.TrimSpace(cfg.Network.NodeName), GitHubLogin: normalizeLogin(cfg.Network.GitHubLogin), GitHubUserID: cfg.Network.GitHubUserID}
+	policy := ProjectPolicy{Mode: config.NetworkModeOff, NodeName: strings.TrimSpace(cfg.Network.NodeName), GitHubLogin: normalizeLogin(cfg.Network.GitHubLogin), GitHubUserID: cfg.Network.GitHubUserID, WorkerReadyLabel: labels.DefaultWorkerReadyTrigger}
 	for _, project := range cfg.Projects {
 		if project.ID != projectID {
 			continue
 		}
 		policy.Mode = normalizeMode(project.Network.Mode)
+		policy.WorkerReadyLabel = config.ProjectLabelNamespace(&cfg, projectID).WorkerReadyTrigger()
 		return policy
 	}
 	return policy
@@ -61,8 +63,12 @@ func EvaluateWorker(policy ProjectPolicy, itemLabels []string, assignees []GitHu
 	if !IsRouted(policy) {
 		return ClaimDecision{Allowed: true, MatchMode: MatchModeNone}
 	}
-	if !hasLabel(itemLabels, labels.DefaultWorkerReadyTrigger) {
-		return ClaimDecision{Reason: "missing " + labels.DefaultWorkerReadyTrigger + " label", MatchMode: MatchModeNone}
+	workerReadyLabel := strings.TrimSpace(policy.WorkerReadyLabel)
+	if workerReadyLabel == "" {
+		workerReadyLabel = labels.DefaultWorkerReadyTrigger
+	}
+	if !hasLabel(itemLabels, workerReadyLabel) {
+		return ClaimDecision{Reason: "missing " + workerReadyLabel + " label", MatchMode: MatchModeNone}
 	}
 	decision := evaluateTarget(policy, itemLabels)
 	if !decision.Allowed {
