@@ -211,3 +211,16 @@ go run ./cmd/looper stop 12
 ### Graceful drain before cutover
 
 `looper upgrade drain --deadline <duration>` moves admission to `draining` (no new claims/mutations) and waits for in-flight supervisor work without hard-killing agents as the routine path.
+
+
+### Atomic release switch
+
+Stage a matching CLI/daemon pair, then activate via an atomic release pointer:
+
+```bash
+looper upgrade stage-release --root <dir> --release-id <id> --target-looper <path> --target-looperd <path>
+looper upgrade activate-release --root <dir> --release-id <id>
+looper upgrade verify-start --root <dir>
+```
+
+`verify-start` must succeed before declaring cutover success. `package.autoUpgradeEnabled` is not a supported managed upgrade path (legacy decode only).
