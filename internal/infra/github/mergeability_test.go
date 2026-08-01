@@ -20,6 +20,7 @@ func TestParseMergeabilityStateNormalizesAndClassifiesProviderValues(t *testing.
 		{name: "blocked", raw: "blocked", want: MergeabilityStateBlocked, wantKnown: true, wantAmbiguous: true},
 		{name: "has hooks", raw: "has_hooks", want: MergeabilityStateHasHooks, wantKnown: true, wantAmbiguous: true},
 		{name: "behind", raw: "behind", want: MergeabilityStateBehind, wantKnown: true},
+		{name: "unblocked is not a GitHub enum value", raw: "unblocked", want: "unblocked"},
 		{name: "explicit unknown", raw: "unknown", want: MergeabilityStateUnknown},
 		{name: "empty", raw: "  ", want: ""},
 		{name: "future provider value", raw: " future_state ", want: "future_state"},

@@ -19,7 +19,6 @@ const (
 	MergeabilityStateDirty     MergeabilityState = "dirty"
 	MergeabilityStateDraft     MergeabilityState = "draft"
 	MergeabilityStateHasHooks  MergeabilityState = "has_hooks"
-	MergeabilityStateUnblocked MergeabilityState = "unblocked"
 	MergeabilityStateUnstable  MergeabilityState = "unstable"
 )
 
@@ -44,7 +43,6 @@ func (state MergeabilityState) IsUnknown() bool {
 		MergeabilityStateDirty,
 		MergeabilityStateDraft,
 		MergeabilityStateHasHooks,
-		MergeabilityStateUnblocked,
 		MergeabilityStateUnstable:
 		return false
 	default:
