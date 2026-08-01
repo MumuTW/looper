@@ -4,6 +4,8 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -12,6 +14,54 @@ import (
 	looperdruntime "github.com/MumuTW/looper/internal/runtime"
 	"github.com/MumuTW/looper/internal/storage"
 )
+
+func TestHandlerRespondConsumesPersistedMalformedGateIdentity(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	ctx := context.Background()
+	nowISO := "2026-04-11T12:00:00.000Z"
+	worktree := t.TempDir()
+	if err := os.Mkdir(filepath.Join(worktree, ".looper"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(worktree, ".looper", "ask.json"), []byte(`{"question":"truncated`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, evidence, err := loops.StageHITLGateEvidence(worktree, 4096)
+	if err != nil || evidence == nil {
+		t.Fatalf("StageHITLGateEvidence() = (%#v, %v)", evidence, err)
+	}
+	metadata, err := loops.WriteHITLAsk(nil, loops.HITLAsk{Question: "Discard malformed request?", Status: "awaiting", GateEvidence: evidence})
+	if err != nil {
+		t.Fatal(err)
+	}
+	projectID, loopID, targetID := "project_hitl_evidence", "loop_hitl_evidence", "project_hitl_evidence"
+	if err := services.Repositories.Projects.Upsert(ctx, storage.ProjectRecord{ID: projectID, Name: "Looper", RepoPath: worktree, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatal(err)
+	}
+	if err := services.Repositories.Loops.Upsert(ctx, storage.LoopRecord{ID: loopID, Seq: 701, ProjectID: projectID, Type: "worker", TargetType: "project", TargetID: &targetID, Status: "awaiting_human", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatal(err)
+	}
+	reason := "worker suspended awaiting human decision"
+	if err := services.Repositories.Queue.Upsert(ctx, storage.QueueItemRecord{ID: "queue_hitl_evidence", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: targetID, DedupeKey: "worker:hitl-evidence", Priority: storage.QueuePriorityWorker, Status: "cancelled", AvailableAt: nowISO, MaxAttempts: 3, LastError: &reason, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/701/respond", strings.NewReader(`{"answer":"discard and regenerate"}`))
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if _, err := os.Lstat(filepath.Join(worktree, ".looper", "ask.pending")); !os.IsNotExist(err) {
+		t.Fatalf("staged evidence still exists after authorized response: %v", err)
+	}
+	loop, err := services.Repositories.Loops.GetByID(ctx, loopID)
+	if err != nil || loop == nil || loop.Status != "running" {
+		t.Fatalf("loop = (%#v, %v), want running", loop, err)
+	}
+}
 
 func TestHandlerRespondResumesAwaitingHumanLoop(t *testing.T) {
 	rt, cfg := startTestRuntime(t)

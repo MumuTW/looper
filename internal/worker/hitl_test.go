@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -15,6 +14,8 @@ import (
 	"github.com/MumuTW/looper/internal/loops"
 	"github.com/MumuTW/looper/internal/storage"
 )
+
+const hitlSentinelRelPath = ".looper/ask.json"
 
 func TestConsumeAskSentinelReadsAndRemoves(t *testing.T) {
 	dir := t.TempDir()
@@ -451,7 +452,7 @@ func TestSuspendForHumanDeliversAskToGitHub(t *testing.T) {
 		GitHub:              gh,
 	})
 
-	awaiting := &awaitingHumanError{question: "Redis or Postgres?", options: []string{"redis", "postgres"}, sessionID: "sess-1", vendor: "codex"}
+	awaiting := &awaitingHumanError{question: "Redis or Postgres?", options: []string{"redis", "postgres"}, sessionID: "sess-1", vendor: "codex", recommendation: "Postgres keeps the existing transaction boundary."}
 	loopForStep, _ := fixture.repos.Loops.GetByID(ctx, "loop_worker_1")
 	result, err := runner.suspendForHuman(ctx, stepInput{Project: *project, Loop: *loopForStep, Run: run, QueueItem: *queueItem}, run, workerCheckpoint{PullRequest: &checkpointPullPR{Number: 42}}, awaiting)
 	if err != nil {
@@ -469,7 +470,7 @@ func TestSuspendForHumanDeliversAskToGitHub(t *testing.T) {
 	if c.IssueNumber != 42 || c.Repo != "acme/widgets" {
 		t.Fatalf("comment target = %s#%d, want acme/widgets#42", c.Repo, c.IssueNumber)
 	}
-	if !containsAll(c.Body, hitlGitHubAskMarkerPrefix, "Redis or Postgres?", "@lefarcen") {
+	if !containsAll(c.Body, hitlGitHubAskMarkerPrefix, "Redis or Postgres?", "Postgres keeps the existing transaction boundary.", "@lefarcen") {
 		t.Fatalf("comment body missing marker/question/mention: %s", c.Body)
 	}
 	// Labelled awaiting-human.
@@ -569,32 +570,24 @@ func TestConsumeAskSentinelFailsClosedAndQuarantines(t *testing.T) {
 		}
 		return dir
 	}
-	quarantinePathFromError := func(t *testing.T, err error) string {
+	assertPending := func(t *testing.T, dir string, err error, wantContent string) *askSentinelProtocolError {
 		t.Helper()
-		matches := regexp.MustCompile(`evidence quarantined at (\S+)`).FindStringSubmatch(err.Error())
-		if len(matches) != 2 {
-			t.Fatalf("error = %v, want it to name the quarantined path", err)
+		var protocol *askSentinelProtocolError
+		if !errors.As(err, &protocol) || protocol.evidence == nil {
+			t.Fatalf("error = %#v, want structured staged evidence", err)
 		}
-		return matches[1]
-	}
-	assertQuarantined := func(t *testing.T, dir string, err error, wantContent string) string {
-		t.Helper()
-		quarantined := quarantinePathFromError(t, err)
-		if strings.HasPrefix(quarantined, dir) {
-			t.Fatalf("quarantine path %s is inside the worktree %s; auto-commit reconciliation would commit it", quarantined, dir)
-		}
-		raw, readErr := os.ReadFile(quarantined)
+		pending := filepath.Join(dir, ".looper", "ask.pending")
+		raw, readErr := os.ReadFile(pending)
 		if readErr != nil {
-			t.Fatalf("quarantined evidence unreadable: %v", readErr)
+			t.Fatalf("pending evidence unreadable: %v", readErr)
 		}
-		t.Cleanup(func() { _ = os.RemoveAll(filepath.Dir(quarantined)) })
 		if string(raw) != wantContent {
-			t.Fatalf("quarantined evidence = %q, want original content preserved", raw)
+			t.Fatalf("pending evidence = %q, want original content preserved", raw)
 		}
 		if _, statErr := os.Stat(filepath.Join(dir, hitlSentinelRelPath)); !os.IsNotExist(statErr) {
-			t.Fatal("original sentinel still present; quarantine must move it out of the consume path")
+			t.Fatal("active sentinel still present; staging must move it out of the consume path")
 		}
-		return quarantined
+		return protocol
 	}
 
 	t.Run("truncated JSON fails closed with evidence quarantined", func(t *testing.T) {
@@ -606,7 +599,7 @@ func TestConsumeAskSentinelFailsClosedAndQuarantines(t *testing.T) {
 		if !strings.Contains(err.Error(), "not valid JSON") {
 			t.Fatalf("error = %v, want JSON diagnostic", err)
 		}
-		assertQuarantined(t, dir, err, `{"question":"delete prod?`)
+		assertPending(t, dir, err, `{"question":"delete prod?`)
 	})
 
 	t.Run("schema without question fails closed", func(t *testing.T) {
@@ -618,7 +611,7 @@ func TestConsumeAskSentinelFailsClosedAndQuarantines(t *testing.T) {
 		if !strings.Contains(err.Error(), "no question") {
 			t.Fatalf("error = %v, want no-question diagnostic", err)
 		}
-		assertQuarantined(t, dir, err, `{"options":["a","b"]}`)
+		assertPending(t, dir, err, `{"options":["a","b"]}`)
 	})
 
 	t.Run("unreadable sentinel fails closed without deleting evidence", func(t *testing.T) {
@@ -632,10 +625,10 @@ func TestConsumeAskSentinelFailsClosedAndQuarantines(t *testing.T) {
 		if err == nil || ask != nil {
 			t.Fatalf("consumeAskSentinel = (%#v, %v), want fail-closed error", ask, err)
 		}
-		if !strings.Contains(err.Error(), "cannot be read") {
+		if !strings.Contains(err.Error(), "permission denied") {
 			t.Fatalf("error = %v, want read diagnostic", err)
 		}
-		if _, statErr := os.Stat(path); statErr != nil {
+		if _, statErr := os.Stat(filepath.Join(dir, ".looper", "ask.pending")); statErr != nil {
 			t.Fatalf("evidence missing after read failure: %v", statErr)
 		}
 	})
@@ -651,13 +644,13 @@ func TestConsumeAskSentinelFailsClosedAndQuarantines(t *testing.T) {
 		}
 	})
 
-	t.Run("repeated malformed asks preserve every piece of evidence", func(t *testing.T) {
+	t.Run("pending evidence bounds repeated malformed asks", func(t *testing.T) {
 		dir := writeSentinel(t, `{"question":"first attempt`)
 		_, err1 := consumeAskSentinel(dir)
 		if err1 == nil {
 			t.Fatal("first consumeAskSentinel error = nil, want fail-closed error")
 		}
-		first := assertQuarantined(t, dir, err1, `{"question":"first attempt`)
+		assertPending(t, dir, err1, `{"question":"first attempt`)
 
 		if err := os.WriteFile(filepath.Join(dir, hitlSentinelRelPath), []byte(`{"question":"second attempt`), 0o644); err != nil {
 			t.Fatalf("WriteFile(second) error = %v", err)
@@ -666,12 +659,12 @@ func TestConsumeAskSentinelFailsClosedAndQuarantines(t *testing.T) {
 		if err2 == nil {
 			t.Fatal("second consumeAskSentinel error = nil, want fail-closed error")
 		}
-		second := assertQuarantined(t, dir, err2, `{"question":"second attempt`)
-		if first == second {
-			t.Fatalf("both quarantines landed on %s; earlier evidence was clobbered", first)
+		var second *askSentinelProtocolError
+		if errors.As(err2, &second) || !strings.Contains(err2.Error(), "different identities") {
+			t.Fatalf("second incident = %#v / %v, want collision rejection without replacing pending evidence", second, err2)
 		}
-		if raw, err := os.ReadFile(first); err != nil || string(raw) != `{"question":"first attempt` {
-			t.Fatalf("first evidence after second quarantine = (%q, %v), want preserved", raw, err)
+		if raw, err := os.ReadFile(filepath.Join(dir, ".looper", "ask.pending")); err != nil || string(raw) != `{"question":"first attempt` {
+			t.Fatalf("pending evidence after second ask = (%q, %v), want first preserved", raw, err)
 		}
 	})
 
@@ -707,13 +700,9 @@ func TestDetectHumanAskParksOnSentinelFailure(t *testing.T) {
 	if err != nil || loop == nil {
 		t.Fatalf("Loops.GetByID() = (%#v, %v)", loop, err)
 	}
-	_, awaitErr := runner.detectHumanAsk(context.Background(), stepInput{Loop: *loop}, dir, "exec-1")
-	if awaitErr == nil {
-		t.Fatal("detectHumanAsk error = nil, want parked gate failure")
-	}
-	var le *loopError
-	if !errors.As(awaitErr, &le) || le.kind != FailureManualIntervention {
-		t.Fatalf("detectHumanAsk error = %#v, want loopError with manual_intervention: a retryable kind auto-requeues and the retry, finding the sentinel quarantined, would publish the gated work", awaitErr)
+	awaiting, awaitErr := runner.detectHumanAsk(context.Background(), stepInput{Loop: *loop}, dir, "exec-1")
+	if awaitErr != nil || awaiting == nil || awaiting.gateEvidence == nil {
+		t.Fatalf("detectHumanAsk = (%#v, %v), want answerable malformed gate", awaiting, awaitErr)
 	}
 }
 
@@ -761,7 +750,18 @@ func TestSuspendForHumanAbortsOnMalformedMetadataInsteadOfStranding(t *testing.T
 		},
 	})
 
-	awaiting := &awaitingHumanError{question: "Which datastore?", sessionID: "sess-xyz", executionID: "agent-1", vendor: "codex"}
+	evidenceRoot := t.TempDir()
+	if err := os.Mkdir(filepath.Join(evidenceRoot, ".looper"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(evidenceRoot, hitlSentinelRelPath), []byte(`{"question":"truncated`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, gateEvidence, err := loops.StageHITLGateEvidence(evidenceRoot, 4096)
+	if err != nil || gateEvidence == nil {
+		t.Fatalf("StageHITLGateEvidence() = (%#v, %v)", gateEvidence, err)
+	}
+	awaiting := &awaitingHumanError{question: "Which datastore?", sessionID: "sess-xyz", executionID: "agent-1", vendor: "codex", gateEvidence: gateEvidence}
 	_, err = runner.suspendForHuman(ctx, stepInput{Project: *project, Loop: *loop, Run: run, QueueItem: *queueItem}, run, workerCheckpoint{}, awaiting)
 	if err == nil {
 		t.Fatal("suspendForHuman error = nil, want persist-ask failure: parking without a stored ask strands the loop")
@@ -788,6 +788,9 @@ func TestSuspendForHumanAbortsOnMalformedMetadataInsteadOfStranding(t *testing.T
 	}
 	if q.Status != "running" {
 		t.Fatalf("queue item status = %q, want running (not cancelled)", q.Status)
+	}
+	if _, err := os.Lstat(filepath.Join(evidenceRoot, ".looper", "ask.pending")); err != nil {
+		t.Fatalf("persist failure removed the only fail-closed gate evidence: %v", err)
 	}
 
 	// The run must be closed as failed so the retried claim resumes it instead

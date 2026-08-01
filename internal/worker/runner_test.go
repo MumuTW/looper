@@ -4733,6 +4733,7 @@ type fakeGitHubGateway struct {
 	viewPRCalls             []ViewPullRequestInput
 	viewIssueCalls          []ViewIssueInput
 	createIssueCommentCalls []IssueCommentInput
+	onCreateIssueComment    func(IssueCommentInput)
 	updateIssueCommentCalls []UpdateIssueCommentInput
 	issueCommentResult      IssueCommentResult
 	createPRResult          CreatePullRequestResult
@@ -4825,6 +4826,9 @@ func (f *fakeGitHubGateway) ViewIssue(_ context.Context, input ViewIssueInput) (
 
 func (f *fakeGitHubGateway) CreateIssueComment(_ context.Context, input IssueCommentInput) (IssueCommentResult, error) {
 	f.createIssueCommentCalls = append(f.createIssueCommentCalls, input)
+	if f.onCreateIssueComment != nil {
+		f.onCreateIssueComment(input)
+	}
 	if f.issueCommentResult.ID == 0 {
 		return IssueCommentResult{ID: 1}, nil
 	}

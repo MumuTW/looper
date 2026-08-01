@@ -46,6 +46,30 @@ Every transport below is just an adapter that (a) delivers the question and (b)
 feeds an answer into `deliverHumanAnswer`. The agent contract is unchanged: it
 writes `.looper/ask.json {question, options}` and stops.
 
+### 2.1 Malformed sentinel recovery
+
+The presence of `.looper/ask.json` is daemon-observed protocol evidence, not
+authority to infer what the agent wanted. Before reading it, Looper walks from
+the worktree root without following symlinks and stages the file as the single
+fixed `.looper/ask.pending` identity on the same filesystem. Regular-file reads
+are bounded; symlink targets, directories, FIFOs, and other special files are
+never read with daemon privilege.
+
+If the bytes do not decode, the loop parks in the existing `awaiting_human`
+state with bounded identity metadata (kind, inode, size, prefix hash), not a
+second quarantine lifecycle or an unbounded evidence copy. The staged name is
+crash evidence too: a retry after staging but before SQLite persistence sees it
+and remains fail-closed. An authenticated `/respond`, Feishu response, or
+authorized GitHub answer is the only authority that may verify and remove that
+exact identity before requeue. A changed identity or a new active ask leaves the
+loop parked.
+
+Malformed work is never pushed merely to create a GitHub question carrier. If
+the loop already has a PR, the diagnostic may be posted only after the ask and
+parked state are durable; otherwise the dashboard/API remains the recovery
+surface. This trades full raw-evidence retention for a strict one-file bound and
+keeps secrets behind symlinks out of daemon-owned storage and GitHub comments.
+
 ## 3. Transport A — GitHub PR comment (OSS default)
 
 **Out:** on suspend, ensure the loop has a (draft) PR, post an ask comment with a
