@@ -12,14 +12,14 @@ import "strings"
 type MergeabilityState string
 
 const (
-	MergeabilityStateUnknown   MergeabilityState = "unknown"
-	MergeabilityStateBehind    MergeabilityState = "behind"
-	MergeabilityStateBlocked   MergeabilityState = "blocked"
-	MergeabilityStateClean     MergeabilityState = "clean"
-	MergeabilityStateDirty     MergeabilityState = "dirty"
-	MergeabilityStateDraft     MergeabilityState = "draft"
-	MergeabilityStateHasHooks  MergeabilityState = "has_hooks"
-	MergeabilityStateUnstable  MergeabilityState = "unstable"
+	MergeabilityStateUnknown  MergeabilityState = "unknown"
+	MergeabilityStateBehind   MergeabilityState = "behind"
+	MergeabilityStateBlocked  MergeabilityState = "blocked"
+	MergeabilityStateClean    MergeabilityState = "clean"
+	MergeabilityStateDirty    MergeabilityState = "dirty"
+	MergeabilityStateDraft    MergeabilityState = "draft"
+	MergeabilityStateHasHooks MergeabilityState = "has_hooks"
+	MergeabilityStateUnstable MergeabilityState = "unstable"
 )
 
 // ParseMergeabilityState normalizes a raw GitHub value once at the gateway
