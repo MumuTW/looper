@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/MumuTW/looper/internal/upgradebackup"
+	"github.com/MumuTW/looper/internal/upgraderelease"
 	"github.com/MumuTW/looper/internal/version"
 )
 
@@ -33,6 +34,8 @@ func TestUpgradeCutoverContractRestoresMatchingSnapshotAfterFailedStart(t *testi
 	healthy := true
 	backupRequested := false
 	drainRequested := false
+	// Set after stage/activate so version reports the supervised current path.
+	runningExecutable := ""
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/v1/upgrade/backup":
@@ -48,7 +51,10 @@ func TestUpgradeCutoverContractRestoresMatchingSnapshotAfterFailedStart(t *testi
 			drainRequested = true
 			writeEnvelope(w, http.StatusOK, upgradeDrainResult{AdmissionState: "draining", Drained: true})
 		case "/api/v1/version":
-			writeEnvelope(w, http.StatusOK, upgradeDaemonVersion{Version: current.Version, Build: current.Metadata})
+			versionBody := upgradeDaemonVersion{Version: current.Version, Build: current.Metadata}
+			versionBody.Binary.Name = "looperd"
+			versionBody.Binary.Path = runningExecutable
+			writeEnvelope(w, http.StatusOK, versionBody)
 		case "/api/v1/status":
 			writeEnvelope(w, http.StatusOK, upgradeCutoverStatus(current, healthy))
 		case "/api/v1/projects":
@@ -63,6 +69,7 @@ func TestUpgradeCutoverContractRestoresMatchingSnapshotAfterFailedStart(t *testi
 	configForDaemon(t, server.URL)
 
 	releaseRoot, previousReleaseID := stageReleaseForUpgradeTest(t, previous)
+	runningExecutable = upgraderelease.CurrentDaemonExecutable(releaseRoot)
 	stdout := &bytes.Buffer{}
 	if err := runUpgrade(context.Background(), nil, []string{"backup"}, stdout); err != nil {
 		t.Fatal(err)

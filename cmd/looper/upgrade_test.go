@@ -82,7 +82,10 @@ func TestUpgradePreflightReportsTargetConfigFailure(t *testing.T) {
 }
 
 func TestUpgradeStartDrainBlocksReportsOnlyRealPreDrainConstraints(t *testing.T) {
+	eligible := releasedUpgradeIdentity("1.2.3", "release-a")
 	report := upgradePreflight{CurrentPairMatches: true, TargetPairMatches: true, TargetIdentityValid: true, TargetConfigCompatible: true}
+	report.Target.CLI = eligible
+	report.Target.Daemon = eligible
 	report.Current.Status.Service.Healthy = true
 	report.Current.Status.Service.AdmissionState = "ready"
 	report.Current.Status.Storage.Healthy = true
@@ -97,6 +100,15 @@ func TestUpgradeStartDrainBlocksReportsOnlyRealPreDrainConstraints(t *testing.T)
 	report.Current.Status.Storage.PendingMigrations = []string{"0022"}
 	if blocks := upgradeStartDrainBlocks(report); len(blocks) != 1 || blocks[0] != "current storage has pending migrations" {
 		t.Fatalf("migration blocks = %v", blocks)
+	}
+	// Stage-release rejects dev channel; preflight must not authorize drain.
+	dev := releasedUpgradeIdentity("1.2.4", "devcommit")
+	dev.Metadata.Channel = "dev"
+	report.Current.Status.Storage.PendingMigrations = nil
+	report.Target.Daemon = dev
+	report.Target.CLI = dev
+	if blocks := upgradeStartDrainBlocks(report); len(blocks) != 1 || !strings.Contains(blocks[0], "development snapshots are unsupported") {
+		t.Fatalf("dev channel blocks = %v", blocks)
 	}
 }
 
@@ -263,7 +275,7 @@ func TestUpgradeStageReleaseRejectsDevelopmentSnapshot(t *testing.T) {
 func TestUpgradeVerifyStartChecksRestartedDaemonEvidence(t *testing.T) {
 	identity := releasedUpgradeIdentity("1.2.3", "aaaaaaa")
 	root, releaseID := stageReleaseForUpgradeTest(t, identity)
-	server := upgradePostStartDaemon(t, identity, 0)
+	server := upgradePostStartDaemon(t, identity, 0, upgraderelease.CurrentDaemonExecutable(root))
 	configForDaemon(t, server.URL)
 	stdout := &bytes.Buffer{}
 	if err := runUpgrade(context.Background(), nil, []string{"verify-start", "--release-root", root, "--release", releaseID}, stdout); err != nil {
@@ -284,7 +296,7 @@ func TestUpgradeVerifyStartAllowsResumedSchedulerOwnership(t *testing.T) {
 	// must not be treated as a cutover failure.
 	identity := releasedUpgradeIdentity("1.2.3", "aaaaaaa")
 	root, releaseID := stageReleaseForUpgradeTest(t, identity)
-	server := upgradePostStartDaemon(t, identity, 1)
+	server := upgradePostStartDaemon(t, identity, 1, upgraderelease.CurrentDaemonExecutable(root))
 	configForDaemon(t, server.URL)
 	stdout := &bytes.Buffer{}
 	if err := runUpgrade(context.Background(), nil, []string{"verify-start", "--release-root", root, "--release", releaseID}, stdout); err != nil {
@@ -299,6 +311,75 @@ func TestUpgradeVerifyStartAllowsResumedSchedulerOwnership(t *testing.T) {
 	}
 	if report.Status.Scheduler.ActiveRuns != 1 {
 		t.Fatalf("ActiveRuns = %d, want fixture active work preserved as telemetry", report.Status.Scheduler.ActiveRuns)
+	}
+}
+
+func TestUpgradeVerifyStartRejectsDaemonNotGovernedByCurrent(t *testing.T) {
+	// Same build launched from outside the release tree must fail verify-start:
+	// activate-release only rewrites current, so rollback cannot reclaim a
+	// miswired unit that still points at a concrete copy.
+	identity := releasedUpgradeIdentity("1.2.3", "aaaaaaa")
+	root, releaseID := stageReleaseForUpgradeTest(t, identity)
+	foreign := filepath.Join(t.TempDir(), "looperd-copy")
+	if err := os.WriteFile(foreign, []byte("#!/bin/sh\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	server := upgradePostStartDaemon(t, identity, 0, foreign)
+	configForDaemon(t, server.URL)
+	stdout := &bytes.Buffer{}
+	err := runUpgrade(context.Background(), nil, []string{"verify-start", "--release-root", root, "--release", releaseID}, stdout)
+	if err == nil {
+		t.Fatal("verify-start error = nil, want miswired executable rejection")
+	}
+	var report upgradePostStartReport
+	if decodeErr := json.Unmarshal(stdout.Bytes(), &report); decodeErr != nil {
+		t.Fatal(decodeErr)
+	}
+	if report.Verified || len(report.Blocks) == 0 {
+		t.Fatalf("report = %#v, want blocks for non-current executable", report)
+	}
+	found := false
+	for _, block := range report.Blocks {
+		if strings.Contains(block, "not governed by release current pointer") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("blocks = %v, want governed-by-current failure", report.Blocks)
+	}
+}
+
+func TestRequireExecutableGovernedByCurrent(t *testing.T) {
+	root := t.TempDir()
+	releaseDir := filepath.Join(root, "releases", "rel-1")
+	if err := os.MkdirAll(releaseDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	daemon := filepath.Join(releaseDir, "looperd")
+	if err := os.WriteFile(daemon, []byte("x"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join("releases", "rel-1"), filepath.Join(root, "current")); err != nil {
+		t.Fatal(err)
+	}
+	current := upgraderelease.CurrentDaemonExecutable(root)
+	if err := requireExecutableGovernedByCurrent(current, current); err != nil {
+		t.Fatalf("current path: %v", err)
+	}
+	if err := requireExecutableGovernedByCurrent(daemon, current); err != nil {
+		// Resolved target of current equals the concrete release path.
+		t.Fatalf("resolved release path: %v", err)
+	}
+	other := filepath.Join(t.TempDir(), "other-looperd")
+	if err := os.WriteFile(other, []byte("x"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := requireExecutableGovernedByCurrent(other, current); err == nil {
+		t.Fatal("foreign path accepted")
+	}
+	if err := requireExecutableGovernedByCurrent("", current); err == nil {
+		t.Fatal("empty running path accepted")
 	}
 }
 
@@ -492,12 +573,15 @@ func createUpgradeRestoreBundle(t *testing.T) string {
 	return bundle.Directory
 }
 
-func upgradePostStartDaemon(t *testing.T, identity version.Info, activeRuns int) *httptest.Server {
+func upgradePostStartDaemon(t *testing.T, identity version.Info, activeRuns int, runningExecutable string) *httptest.Server {
 	t.Helper()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/v1/version":
-			writeEnvelope(w, http.StatusOK, upgradeDaemonVersion{Version: identity.Version, Build: identity.Metadata})
+			versionBody := upgradeDaemonVersion{Version: identity.Version, Build: identity.Metadata}
+			versionBody.Binary.Name = "looperd"
+			versionBody.Binary.Path = runningExecutable
+			writeEnvelope(w, http.StatusOK, versionBody)
 		case "/api/v1/status":
 			writeEnvelope(w, http.StatusOK, map[string]any{"service": map[string]any{"healthy": true, "version": identity.Version, "build": identity.Metadata, "admissionState": "ready", "startedAt": "2026-07-31T12:35:00.000Z", "recovery": map[string]any{"outstanding": map[string]any{"quarantinedActiveExecutions": 0, "quarantinedRunningRuns": 0}}}, "storage": map[string]any{"schemaVersion": "0022_durable_payload_baseline", "pendingMigrations": []string{}, "healthy": true}, "scheduler": map[string]any{"activeRuns": activeRuns, "runningItems": activeRuns}})
 		case "/api/v1/projects":
