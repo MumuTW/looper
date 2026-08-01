@@ -354,6 +354,7 @@
           },
           "package": {
             "distribution": "github-release",
+            "autoUpgradeEnabled": true,
             "autoMigrateOnStartup": true,
             "requireBackupBeforeMigrate": false
           },
