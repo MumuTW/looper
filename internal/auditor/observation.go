@@ -5,11 +5,12 @@ package auditor
 const ObservedFailureEventType = "post_merge_audit.observed_failure"
 
 type FailureObservation struct {
-	Version      int      `json:"version"`
-	ProjectID    string   `json:"projectId"`
-	Repo         string   `json:"repo"`
-	HeadSHA      string   `json:"headSha"`
-	FailedChecks []string `json:"failedChecks"`
-	CandidatePRs []int64  `json:"candidatePrs"`
-	ObservedAt   string   `json:"observedAt"`
+	Version       int      `json:"version"`
+	ProjectID     string   `json:"projectId"`
+	Repo          string   `json:"repo"`
+	HeadSHA       string   `json:"headSha"`
+	FailedChecks  []string `json:"failedChecks"`
+	CheckSuiteIDs []int64  `json:"checkSuiteIds"`
+	CandidatePRs  []int64  `json:"candidatePrs"`
+	ObservedAt    string   `json:"observedAt"`
 }
