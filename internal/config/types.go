@@ -686,9 +686,13 @@ const (
 	// GatekeeperTrustAdvise additionally publishes the verdict and its reasons on
 	// the pull request, so a human can decide without redoing the judgement.
 	GatekeeperTrustAdvise GatekeeperTrustLevel = "advise"
-	// GatekeeperTrustAuto lets Gatekeeper merge what it judges eligible. Not yet
-	// implemented; config validation rejects it rather than accepting a value that
-	// would silently behave as advise.
+	// GatekeeperTrustAuto lets Gatekeeper merge what it judges eligible. The
+	// value is accepted and implemented: on the primary evaluation pass, after
+	// the Gate report is persisted, the runner re-evaluates the pull request
+	// against the observed head and calls MergePullRequest only if it is still
+	// eligible. Config validation rejects it only when combined with
+	// roles.reviewer.autoMerge.enabled, because two merge authorities racing on
+	// the same pull request is not a configuration anyone can reason about.
 	GatekeeperTrustAuto GatekeeperTrustLevel = "auto"
 )
 
