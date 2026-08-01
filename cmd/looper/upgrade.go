@@ -6,11 +6,15 @@ import (
 	"fmt"
 	"os/exec"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/MumuTW/looper/internal/storage"
 	"github.com/MumuTW/looper/internal/upgradebackup"
 	"github.com/MumuTW/looper/internal/upgraderelease"
+	"github.com/MumuTW/looper/internal/upgraderestore"
 	"github.com/MumuTW/looper/internal/version"
 )
 
@@ -95,9 +99,26 @@ type upgradePostStartReport struct {
 	Blocks          []string      `json:"blocks"`
 }
 
+type upgradeRestorePreflight struct {
+	Bundle     string               `json:"bundle"`
+	Source     upgradebackup.Source `json:"source"`
+	OpenPIDs   []int                `json:"openPids"`
+	ProbeError string               `json:"probeError,omitempty"`
+	Ready      bool                 `json:"ready"`
+	Blocks     []string             `json:"blocks"`
+}
+
+type upgradeRestoreResult struct {
+	Bundle   string               `json:"bundle"`
+	Source   upgradebackup.Source `json:"source"`
+	Restored bool                 `json:"restored"`
+}
+
+var upgradeRestoreOpenPIDs = findUpgradeRestoreOpenPIDs
+
 func runUpgrade(ctx context.Context, global, operands []string, stdout interface{ Write([]byte) (int, error) }) error {
 	if len(operands) == 0 {
-		return badUsage("upgrade requires activate-release, backup, drain, preflight, stage-release, verify, or verify-start")
+		return badUsage("upgrade requires activate-release, backup, drain, preflight, restore, restore-preflight, stage-release, verify, or verify-start")
 	}
 	if operands[0] == "backup" {
 		if len(operands) != 1 {
@@ -152,8 +173,22 @@ func runUpgrade(ctx context.Context, global, operands []string, stdout interface
 		}
 		return runUpgradeVerifyStart(ctx, global, root, releaseID, stdout)
 	}
+	if operands[0] == "restore-preflight" {
+		bundle, err := parseUpgradeVerifyArgs(operands[1:])
+		if err != nil {
+			return badUsage("upgrade restore-preflight requires --bundle <directory>")
+		}
+		return runUpgradeRestorePreflight(ctx, bundle, stdout)
+	}
+	if operands[0] == "restore" {
+		bundle, err := parseUpgradeRestoreArgs(operands[1:])
+		if err != nil {
+			return err
+		}
+		return runUpgradeRestore(ctx, bundle, stdout)
+	}
 	if operands[0] != "preflight" {
-		return badUsage("upgrade requires activate-release, backup, drain, preflight, stage-release, verify, or verify-start")
+		return badUsage("upgrade requires activate-release, backup, drain, preflight, restore, restore-preflight, stage-release, verify, or verify-start")
 	}
 	targetLooper, targetLooperd, jsonOutput, err := parseUpgradePreflightArgs(operands[1:])
 	if err != nil {
@@ -197,6 +232,122 @@ func runUpgrade(ctx context.Context, global, operands []string, stdout interface
 	}
 	_, _ = fmt.Fprintln(stdout, string(encoded))
 	return nil
+}
+
+func runUpgradeRestorePreflight(ctx context.Context, bundle string, stdout interface{ Write([]byte) (int, error) }) error {
+	verified, err := upgradebackup.Verify(bundle)
+	if err != nil {
+		return err
+	}
+	source, err := upgradebackup.RestoreSource(verified.Manifest)
+	if err != nil {
+		return err
+	}
+	paths := []string{source.ConfigPath, source.DatabasePath, source.DatabasePath + "-wal", source.DatabasePath + "-shm", source.CLIBinaryPath, source.DaemonBinaryPath}
+	pids, probeErr := upgradeRestoreOpenPIDs(ctx, paths)
+	report := upgradeRestorePreflight{Bundle: verified.Directory, Source: source, OpenPIDs: pids}
+	if probeErr != nil {
+		report.ProbeError = probeErr.Error()
+		report.Blocks = append(report.Blocks, "cannot prove rollback targets are unused")
+	}
+	if len(pids) > 0 {
+		report.Blocks = append(report.Blocks, "rollback targets are still open by one or more processes")
+	}
+	report.Ready = len(report.Blocks) == 0
+	if err := writeVersionJSON(stdout, report); err != nil {
+		return err
+	}
+	if !report.Ready {
+		return fmt.Errorf("rollback restore preflight failed: %s", strings.Join(report.Blocks, "; "))
+	}
+	return nil
+}
+
+// runUpgradeRestore restores only the config and SQLite snapshot recorded by a
+// verified v2 rollback bundle. Binary selection remains the release pointer's
+// responsibility, because a backup's copied binaries are evidence, not a
+// supported executable release artifact.
+func runUpgradeRestore(ctx context.Context, bundle string, stdout interface{ Write([]byte) (int, error) }) error {
+	verified, err := upgradebackup.Verify(bundle)
+	if err != nil {
+		return err
+	}
+	source, err := upgradebackup.RestoreSource(verified.Manifest)
+	if err != nil {
+		return err
+	}
+	databasePath, filesystem, err := storage.SQLiteFilesystemPath(source.DatabasePath)
+	if err != nil {
+		return fmt.Errorf("resolve rollback database target: %w", err)
+	}
+	if !filesystem {
+		return fmt.Errorf("rollback restore requires an on-disk SQLite database target")
+	}
+	source.DatabasePath = databasePath
+	paths := []string{source.ConfigPath, source.DatabasePath, source.DatabasePath + "-wal", source.DatabasePath + "-shm"}
+	if err := ensureUpgradeRestoreTargetsUnused(ctx, paths); err != nil {
+		return err
+	}
+	lock, err := storage.AcquireDatabaseLock(source.DatabasePath, storage.DatabaseLockExclusive)
+	if err != nil {
+		return fmt.Errorf("acquire rollback database lock: %w", err)
+	}
+	defer lock.Release()
+	if err := ensureUpgradeRestoreTargetsUnused(ctx, paths); err != nil {
+		return err
+	}
+	if err := upgraderestore.Recover(upgraderestore.JournalPath(source.DatabasePath)); err != nil {
+		return fmt.Errorf("recover interrupted rollback restore: %w", err)
+	}
+	if err := upgraderestore.Restore(verified.Directory, source); err != nil {
+		return err
+	}
+	return writeVersionJSON(stdout, upgradeRestoreResult{Bundle: verified.Directory, Source: source, Restored: true})
+}
+
+func ensureUpgradeRestoreTargetsUnused(ctx context.Context, paths []string) error {
+	pids, err := upgradeRestoreOpenPIDs(ctx, paths)
+	if err != nil {
+		return fmt.Errorf("cannot prove rollback targets are unused: %w", err)
+	}
+	if len(pids) > 0 {
+		return fmt.Errorf("rollback restore refused because targets are open by processes: %s", formatUpgradeRestorePIDs(pids))
+	}
+	return nil
+}
+
+func formatUpgradeRestorePIDs(pids []int) string {
+	values := make([]string, 0, len(pids))
+	for _, pid := range pids {
+		values = append(values, strconv.Itoa(pid))
+	}
+	return strings.Join(values, ", ")
+}
+
+func findUpgradeRestoreOpenPIDs(ctx context.Context, paths []string) ([]int, error) {
+	lsof, err := exec.LookPath("lsof")
+	if err != nil {
+		return nil, fmt.Errorf("lsof is required to prove rollback targets are unused: %w", err)
+	}
+	output, err := exec.CommandContext(ctx, lsof, append([]string{"-t", "--"}, paths...)...).Output()
+	if err != nil {
+		if exit, ok := err.(*exec.ExitError); ok && exit.ExitCode() == 1 {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("inspect rollback target users: %w", err)
+	}
+	seen := map[int]bool{}
+	pids := make([]int, 0)
+	for _, line := range strings.Fields(string(output)) {
+		pid, err := strconv.Atoi(line)
+		if err != nil || pid <= 0 || seen[pid] {
+			continue
+		}
+		seen[pid] = true
+		pids = append(pids, pid)
+	}
+	sort.Ints(pids)
+	return pids, nil
 }
 
 func upgradeStartDrainBlocks(report upgradePreflight) []string {
@@ -346,6 +497,32 @@ func parseUpgradeVerifyArgs(args []string) (string, error) {
 		return "", badUsage("upgrade verify requires --bundle <directory>")
 	}
 	return args[1], nil
+}
+
+func parseUpgradeRestoreArgs(args []string) (string, error) {
+	var bundle string
+	confirmed := false
+	for index := 0; index < len(args); index++ {
+		switch args[index] {
+		case "--confirm":
+			if confirmed {
+				return "", badUsage("upgrade restore accepts --confirm at most once")
+			}
+			confirmed = true
+		case "--bundle":
+			if bundle != "" || index+1 >= len(args) || strings.HasPrefix(args[index+1], "--") || strings.TrimSpace(args[index+1]) == "" {
+				return "", badUsage("upgrade restore requires --bundle <directory> --confirm")
+			}
+			index++
+			bundle = args[index]
+		default:
+			return "", badUsage("upgrade restore requires --bundle <directory> --confirm")
+		}
+	}
+	if strings.TrimSpace(bundle) == "" || !confirmed {
+		return "", badUsage("upgrade restore requires --bundle <directory> --confirm")
+	}
+	return bundle, nil
 }
 
 func runUpgradeStageRelease(ctx context.Context, targetLooper, targetLooperd, root string, stdout interface{ Write([]byte) (int, error) }) error {

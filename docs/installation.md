@@ -224,3 +224,15 @@ looper upgrade verify-start --root <dir>
 ```
 
 `verify-start` must succeed before declaring cutover success. `package.autoUpgradeEnabled` is not a supported managed upgrade path (legacy decode only).
+
+
+### Rollback restore
+
+When post-start verification fails, restore the matching pre-cutover config and SQLite snapshot from a v2 backup bundle (fail-closed if targets are still open):
+
+```bash
+looper upgrade restore-preflight --bundle <directory>
+looper upgrade restore --bundle <directory> --confirm
+```
+
+Supported sequence: preflight → backup → drain → stage-release → activate-release → verify-start; on failure, restore-preflight → restore, then activate the prior release if needed.
