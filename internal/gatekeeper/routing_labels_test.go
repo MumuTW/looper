@@ -257,9 +257,14 @@ func TestRoutingLabelsSkipWhenDiffBudgetBaseMovesBeforeProjection(t *testing.T) 
 	}
 }
 
-func TestRoutingLabelsSkipWhenReviewerConvergenceAdvancesBeforeProjection(t *testing.T) {
+func TestRoutingLabelsRemoveStaleRouteWhenReviewerConvergenceAdvancesBeforeProjection(t *testing.T) {
 	fixture := newGatekeeperFixture(t)
 	seedReviewerConvergenceLoop(t, fixture, `{"convergence":{"policy":{"maxConsecutiveUnproductive":3,"maxFixerAttemptsPerItem":4,"maxTotalRounds":40,"severityFloor":"blocking"},"state":{"totalRounds":4},"action":"complete","reason":"severity_floor_reached","status":"completed","updatedAt":"2026-07-30T10:00:00Z"},"loop":{"lastReviewedHeadSha":"head-1"}}`, 1)
+	runner := routingRunner(fixture, config.GatekeeperTrustAuto)
+	evaluateRoutingReport(t, runner)
+	if len(fixture.github.labelAdds) != 1 || !slices.Equal(fixture.github.labelAdds[0].Labels, []string{labels.AutoMerge}) {
+		t.Fatalf("initial label adds = %#v, want auto-merge route", fixture.github.labelAdds)
+	}
 	var mutateErr error
 	views := 0
 	fixture.github.beforeView = func(_ *fakeGatekeeperGitHub) {
@@ -277,7 +282,7 @@ func TestRoutingLabelsSkipWhenReviewerConvergenceAdvancesBeforeProjection(t *tes
 		loop.UpdatedAt = fixture.now.Add(time.Second).Format(time.RFC3339Nano)
 		mutateErr = fixture.repos.Loops.Upsert(context.Background(), *loop)
 	}
-	if _, err := routingRunner(fixture, config.GatekeeperTrustAuto).EvaluatePullRequest(context.Background(), EvaluationInput{
+	if _, err := runner.EvaluatePullRequest(context.Background(), EvaluationInput{
 		ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, ExpectedHeadSHA: "head-1",
 	}); err == nil {
 		t.Fatal("EvaluatePullRequest() succeeded after Reviewer convergence advanced before projection")
@@ -285,8 +290,11 @@ func TestRoutingLabelsSkipWhenReviewerConvergenceAdvancesBeforeProjection(t *tes
 	if mutateErr != nil {
 		t.Fatalf("mutate Reviewer convergence state: %v", mutateErr)
 	}
-	if len(fixture.github.labelAdds) != 0 || len(fixture.github.labelRemoves) != 0 {
-		t.Fatalf("routing labels changed across a Reviewer convergence race: adds=%#v removes=%#v", fixture.github.labelAdds, fixture.github.labelRemoves)
+	if len(fixture.github.labelAdds) != 1 {
+		t.Fatalf("routing label adds across a Reviewer convergence race = %#v, want only initial route", fixture.github.labelAdds)
+	}
+	if len(fixture.github.labelRemoves) != 3 || !slices.Equal(fixture.github.labelRemoves[1].Labels, []string{labels.AutoMerge}) || !slices.Equal(fixture.github.labelRemoves[2].Labels, []string{labels.NeedsHumanReview}) {
+		t.Fatalf("routing label cleanup across a Reviewer convergence race = %#v, want both stale routes removed", fixture.github.labelRemoves)
 	}
 }
 
