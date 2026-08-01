@@ -324,7 +324,7 @@ func assembleForDate(ctx context.Context, repos *storage.Repositories, cfg Confi
 	}
 	for _, item := range mergedByEntity {
 		entity := mergeKey(item.Repo, item.PRNumber)
-		if report, ok := gateReportForHead(gateReports[entity], item.HeadSHA); ok {
+		if report, ok := gateReportForHead(gateReports[entity], item.HeadSHA, item.MergedAt); ok {
 			item.ReviewerVerdict = firstString(report, "status", "verdict")
 			item.GateReasons = reasonCodes(report)
 		} else {
@@ -433,14 +433,27 @@ func latestGateReports(events []storage.EventLogRecord) map[string][]gateReportO
 	return reports
 }
 
-func gateReportForHead(observations []gateReportObservation, headSHA string) (map[string]any, bool) {
+// gateReportForHead selects the latest durable gate report for the merged head
+// that was recorded before the merge. A same-head report written after the merge
+// (e.g. a `pull_request_not_open` blocked outcome from the closed webhook) is
+// not evidence for the revision that was actually evaluated, so it is skipped
+// along with reports for other heads. When no head-matching pre-merge report
+// exists the caller emits the missing/stale-gate-report anomaly.
+func gateReportForHead(observations []gateReportObservation, headSHA, mergedAt string) (map[string]any, bool) {
 	if len(observations) == 0 {
 		return nil, false
 	}
+	mergeTime, haveMergeTime := parseEventTime(mergedAt)
 	for i := len(observations) - 1; i >= 0; i-- {
-		if strings.TrimSpace(headSHA) == "" || strings.EqualFold(strings.TrimSpace(headSHA), gateReportHead(observations[i].payload)) {
-			return observations[i].payload, true
+		if head := strings.TrimSpace(headSHA); head != "" && !strings.EqualFold(head, gateReportHead(observations[i].payload)) {
+			continue
 		}
+		if haveMergeTime {
+			if reportAt, ok := parseEventTime(observations[i].createdAt); ok && !reportAt.Before(mergeTime) {
+				continue
+			}
+		}
+		return observations[i].payload, true
 	}
 	return nil, false
 }

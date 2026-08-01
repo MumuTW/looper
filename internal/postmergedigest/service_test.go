@@ -185,6 +185,35 @@ func TestAssembleUsesForgeMergeTimeAndHeadBoundEvidence(t *testing.T) {
 	}
 }
 
+func TestAssembleExcludesPostMergeSameHeadGateReport(t *testing.T) {
+	repos := openDigestRepos(t)
+	entityType, entityID := "pull_request", "acme/looper#11"
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_11", Name: "Looper", RepoPath: t.TempDir(), CreatedAt: "2026-07-31T08:00:00.000Z", UpdatedAt: "2026-07-31T08:00:00.000Z"}); err != nil {
+		t.Fatalf("project upsert error = %v", err)
+	}
+	mergedAt := "2026-07-31T08:30:00Z"
+	appendDigestEvent(t, repos, storage.EventLogRecord{ID: "merge", EventType: eventlog.CoordinatorPullRequestMergedEventType, EntityType: &entityType, EntityID: &entityID, PayloadJSON: `{"repo":"acme/looper","prNumber":11,"headSha":"final-head","mergedAt":"` + mergedAt + `"}`, CreatedAt: "2026-07-31T08:30:00.000Z"})
+	// Pre-merge eligible report for the merged head: the evidence the digest must keep.
+	appendDigestEvent(t, repos, storage.EventLogRecord{ID: "pre-gate", EventType: gatekeeper.GateReportEventType, EntityType: &entityType, EntityID: &entityID, PayloadJSON: `{"status":"eligible","observedHeadSha":"final-head","reasons":[]}`, CreatedAt: "2026-07-31T08:29:00.000Z"})
+	// Post-merge same-head blocked report written by the closed webhook: must not override the pre-merge verdict.
+	appendDigestEvent(t, repos, storage.EventLogRecord{ID: "post-gate", EventType: gatekeeper.GateReportEventType, EntityType: &entityType, EntityID: &entityID, PayloadJSON: `{"status":"blocked","observedHeadSha":"final-head","reasons":[{"code":"pull_request_not_open"}]}`, CreatedAt: "2026-07-31T08:31:00.000Z"})
+	digest, err := Assemble(context.Background(), repos, Config{Timezone: "UTC", MaxItems: 10}, time.Date(2026, 7, 31, 23, 59, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatalf("Assemble() error = %v", err)
+	}
+	if len(digest.Merged) != 1 {
+		t.Fatalf("merged = %#v, want one item", digest.Merged)
+	}
+	if digest.Merged[0].ReviewerVerdict != "eligible" || len(digest.Merged[0].GateReasons) != 0 {
+		t.Fatalf("merged gate evidence = %#v, want pre-merge eligible report", digest.Merged[0])
+	}
+	for _, anomaly := range digest.Anomalies {
+		if anomaly.Kind == "missing-gate-report" || anomaly.Kind == "stale-gate-report" {
+			t.Fatalf("unexpected gate anomaly = %#v, want the pre-merge report selected", anomaly)
+		}
+	}
+}
+
 func TestLoopReasonReadsHITLQuestionAndPauseReason(t *testing.T) {
 	hitl := `{"hitl":{"question":"Need approval","status":"awaiting"}}`
 	if reason, code := loopReason(&hitl); reason != "Need approval" || code != "awaiting" {
