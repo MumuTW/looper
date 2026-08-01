@@ -8007,6 +8007,54 @@ func TestProcessClaimedItemEmitsTerminalEventWhenReviewerAgentWaitFails(t *testi
 	}
 }
 
+func TestProcessClaimedItemRecordsTerminalEventAfterContextCancellation(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	agent := &fakeAgentExecutor{
+		results: []AgentResult{{Status: "completed"}},
+		wait: func(waitCtx context.Context) error {
+			cancel()
+			<-waitCtx.Done()
+			return waitCtx.Err()
+		},
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now})
+
+	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverPullRequests() error = %v", err)
+	}
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "reviewer-worker-1", "reviewer")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNext() = (%#v, %v), want claimed queue item", claim, err)
+	}
+	// ProcessClaimedItem may return an error because downstream cleanup
+	// (completeRun, failQueueItem, etc.) uses the now-canceled context.
+	// The invariant under test is that the terminal event is persisted
+	// before that cleanup runs, using a live context.
+	_, _ = runner.ProcessClaimedItem(ctx, *claim)
+
+	events, err := fixture.repos.Events.ListByEntity(context.Background(), "pull_request", "acme/looper#42")
+	if err != nil {
+		t.Fatalf("Events.ListByEntity() error = %v", err)
+	}
+	foundStarted := false
+	foundFailed := false
+	for _, event := range events {
+		switch event.EventType {
+		case "reviewer.agent.started":
+			foundStarted = true
+		case "reviewer.agent.failed":
+			if strings.Contains(event.PayloadJSON, `"status":"wait_error"`) {
+				foundFailed = true
+			}
+		}
+	}
+	if !foundStarted || !foundFailed {
+		t.Fatalf("events = %#v, want started and terminal failed events after context cancellation", events)
+	}
+}
+
 func TestNewDefaultsReviewerTimeoutToNinetyMinutes(t *testing.T) {
 	t.Parallel()
 	runner := New(Options{})
