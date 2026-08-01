@@ -2,13 +2,35 @@ package runtime
 
 import (
 	"context"
+	"database/sql"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/MumuTW/looper/internal/config"
 	"github.com/MumuTW/looper/internal/storage"
 )
+
+type projectListCountingQuerier struct {
+	db        *sql.DB
+	listCalls int
+}
+
+func (q *projectListCountingQuerier) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	return q.db.ExecContext(ctx, query, args...)
+}
+
+func (q *projectListCountingQuerier) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	if strings.Contains(strings.ToLower(query), "from projects") {
+		q.listCalls++
+	}
+	return q.db.QueryContext(ctx, query, args...)
+}
+
+func (q *projectListCountingQuerier) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
+	return q.db.QueryRowContext(ctx, query, args...)
+}
 
 // TestSchedulerProjectsForCapturedCatalogRecognizesAgentlessQuarantine
 // verifies the scheduler's quarantine predicate matches the agent-independent
@@ -145,6 +167,48 @@ func TestQuarantinedProjectIDsForClaimPreservesStickyRetryScope(t *testing.T) {
 	}
 	if len(notQuarantined) != 0 {
 		t.Fatalf("quarantinedProjectIDsForClaim(defaults) = %v, want empty: published legacy project is not quarantined", notQuarantined)
+	}
+}
+
+// TestQuarantinedProjectIDsForClaimReusesCapturedProjects ensures the
+// independent claim pass can carry the project table read used for catalog
+// validation into the sticky-only quarantine scope. A closed-over snapshot
+// must avoid a second Projects.List query on the scheduler hot path.
+func TestQuarantinedProjectIDsForClaimReusesCapturedProjects(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(root, "captured-projects.sqlite"), t.TempDir())
+	t.Cleanup(func() { _ = coordinator.Close() })
+	querier := &projectListCountingQuerier{db: coordinator.DB()}
+	repositories := storage.NewRepositories(querier)
+	cfg, err := config.DefaultConfig(root)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Agent.Vendor = nil
+	cfg.Defaults.ValidationCommands = nil
+	cfg.Projects = nil
+	snapshotCfg := cfg
+	legacyMetadata := `{"repo":null,"worktreeRoot":"/tmp/worktrees","source":"api","registrationDiscovery":{"status":"succeeded","snapshotMode":"off"}}`
+
+	quarantined, err := quarantinedProjectIDsForClaim(context.Background(), defaultSchedulerTickInput{
+		Repos:                 repositories,
+		Config:                &snapshotCfg,
+		CapturedProjectsReady: true,
+		CapturedProjects: []storage.ProjectRecord{{
+			ID: "legacy_inert", Name: "Legacy", RepoPath: filepath.Join(root, "legacy"),
+			MetadataJSON: &legacyMetadata,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("quarantinedProjectIDsForClaim(captured) error = %v", err)
+	}
+	if len(quarantined) != 1 || quarantined[0] != "legacy_inert" {
+		t.Fatalf("quarantinedProjectIDsForClaim(captured) = %v, want [legacy_inert]", quarantined)
+	}
+	if querier.listCalls != 0 {
+		t.Fatalf("Projects.List query count = %d, want 0 when snapshot is captured", querier.listCalls)
 	}
 }
 

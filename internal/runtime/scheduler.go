@@ -93,15 +93,22 @@ type schedulerAsyncRunner interface {
 }
 
 type defaultSchedulerTickInput struct {
-	Repos             *storage.Repositories
-	GitHubGateway     *githubinfra.Gateway
-	GitGateway        *gitinfra.Gateway
-	Logger            bootstrap.Logger
-	Now               func() time.Time
-	MaxConcurrentRuns int
-	ClaimMu           *sync.Mutex
-	ClaimBoundary     *sync.RWMutex
-	RefreshForClaim   func() defaultSchedulerTickInput
+	Repos *storage.Repositories
+	// CapturedProjects is the project-table snapshot already validated by the
+	// catalog pass immediately before an independent claim pass. Keeping it on
+	// the claim input lets the quarantine scope reuse that read instead of
+	// scanning Projects.List a second time on every tick. The explicit boolean
+	// distinguishes a captured empty table from an input that has no snapshot.
+	CapturedProjects      []storage.ProjectRecord
+	CapturedProjectsReady bool
+	GitHubGateway         *githubinfra.Gateway
+	GitGateway            *gitinfra.Gateway
+	Logger                bootstrap.Logger
+	Now                   func() time.Time
+	MaxConcurrentRuns     int
+	ClaimMu               *sync.Mutex
+	ClaimBoundary         *sync.RWMutex
+	RefreshForClaim       func() defaultSchedulerTickInput
 	// AllowClaim, when set, is the admission projection for all work-producing
 	// scheduler activity: the full default tick (discovery, HITL, claims,
 	// stale-reconcile) and each durable ClaimNext*. Nil means ungated (tests).
@@ -2804,18 +2811,35 @@ func runIndependentClaimPass(ctx context.Context, input defaultSchedulerTickInpu
 			return nil
 		}
 	}
-	_, catalogCurrent, err := schedulerProjectsForCapturedCatalog(ctx, input)
+	projectsList, catalogCurrent, err := schedulerProjectsForCapturedCatalog(ctx, input)
 	if err != nil || !catalogCurrent {
 		return err
+	}
+	input.CapturedProjects = projectsList
+	input.CapturedProjectsReady = true
+	if refresh := input.RefreshForClaim; refresh != nil {
+		// The live catalog path refreshes the runner/config snapshot while the
+		// claim boundary is held. Preserve the already-validated project table
+		// across that refresh so the quarantine scope does not re-read it.
+		input.RefreshForClaim = func() defaultSchedulerTickInput {
+			latest := refresh()
+			latest.CapturedProjects = projectsList
+			latest.CapturedProjectsReady = true
+			return latest
+		}
 	}
 	_, _, err = executeClaimPhase(ctx, "claim_pump", input, nil, false)
 	return err
 }
 
 func schedulerProjectsForCapturedCatalog(ctx context.Context, input defaultSchedulerTickInput) ([]storage.ProjectRecord, bool, error) {
-	projectsList, err := input.Repos.Projects.List(ctx)
-	if err != nil {
-		return nil, false, err
+	projectsList := input.CapturedProjects
+	if !input.CapturedProjectsReady {
+		var err error
+		projectsList, err = input.Repos.Projects.List(ctx)
+		if err != nil {
+			return nil, false, err
+		}
 	}
 	if input.Config == nil {
 		return projectsList, true, nil
@@ -3182,9 +3206,13 @@ func quarantinedProjectIDsForClaim(ctx context.Context, input defaultSchedulerTi
 	if len(config.ResolveValidationCommands(*input.Config)) > 0 {
 		return nil, nil
 	}
-	projectsList, err := input.Repos.Projects.List(ctx)
-	if err != nil {
-		return nil, err
+	projectsList := input.CapturedProjects
+	if !input.CapturedProjectsReady {
+		var err error
+		projectsList, err = input.Repos.Projects.List(ctx)
+		if err != nil {
+			return nil, err
+		}
 	}
 	ids := make([]string, 0)
 	for _, project := range projectsList {

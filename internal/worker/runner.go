@@ -1503,7 +1503,11 @@ func (r *Runner) reconcileRecoveredLoop(ctx context.Context, queueItem storage.Q
 	if err != nil {
 		return err
 	}
-	if loop == nil || loop.Status != "running" {
+	// A run may fail before the status flip to running commits. In that
+	// partial-transition case the loop is still queued, but the durable queue
+	// result still has to reconcile it instead of leaving a terminal queue item
+	// paired with a retryable loop.
+	if loop == nil || (loop.Status != "running" && loop.Status != "queued") {
 		return nil
 	}
 	_, err = r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
@@ -1562,7 +1566,8 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			message: fmt.Sprintf("project %s is quarantined without a validation policy; repair the project validation stance or configure defaults.validationCommands before retrying", project.ID),
 			kind:    FailureManualIntervention,
 		}
-		if _, err := r.failQueueItem(ctx, queueItem, failure.kind, failure.message); err != nil {
+		failedQueue, err := r.failQueueItem(ctx, queueItem, failure.kind, failure.message)
+		if err != nil {
 			return ProcessResult{}, err
 		}
 		if _, err := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
@@ -1572,6 +1577,14 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			updated.NextRunAt = nil
 		}); err != nil {
 			return ProcessResult{}, err
+		}
+		// This branch terminalizes a durable sticky retry before a run is
+		// created, so ProcessClaimedQueueItem sees a successful result and does
+		// not enter recoverClaimedItem. Preserve the same operator notification
+		// contract as every other manual-intervention failure after both durable
+		// queue and loop writes have committed.
+		if shouldNotifyCompletedRun(failure.kind, failedQueue) {
+			r.notifyRecoveredRunCompleted(ctx, queueItem, failure)
 		}
 		return ProcessResult{LoopID: loop.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
 	}
@@ -3782,16 +3795,40 @@ func (r *Runner) wakeSchedulerAfterEnqueue() {
 }
 
 func (r *Runner) failQueueItem(ctx context.Context, queueItem storage.QueueItemRecord, kind QueueFailureKind, message string) (*storage.QueueItemRecord, error) {
+	// Recovery can be entered after ProcessClaimedItem has already committed
+	// the queue transition but failed while reconciling the loop. Treat a
+	// terminal row as the durable result instead of trying to resurrect it (or
+	// surfacing ErrQueueItemNotActive from a stricter repository implementation).
+	// The queue row, rather than the stale claimed value passed by the caller,
+	// is the authority for whether this transition still needs to run.
+	current, err := r.repos.Queue.GetByID(ctx, queueItem.ID)
+	if err != nil {
+		return nil, err
+	}
+	// Cancellation is deliberately excluded: runner finalization owns the
+	// right to requeue a claim cancelled concurrently by a pause (see
+	// Queue.MarkRetry's contract). The already-finalized statuses below must
+	// remain terminal, while a cancelled row can still be reconciled according
+	// to the failure kind being finalized.
+	if current != nil && (current.Status == "manual_intervention" || current.Status == "completed" || current.Status == "failed") {
+		return current, nil
+	}
 	nextAttempts := queueItem.Attempts + 1
 	nowISO := r.nowISO()
 	if !shouldRetryQueueFailure(kind, nextAttempts, queueItem.MaxAttempts) {
 		if err := r.repos.Queue.Fail(ctx, storage.QueueFailInput{ID: queueItem.ID, Attempts: nextAttempts, FinishedAt: nowISO, ErrorMessage: optionalString(message), ErrorKind: string(kind), UpdatedAt: nowISO}); err != nil {
+			if recovered, getErr := r.repos.Queue.GetByID(ctx, queueItem.ID); getErr == nil && recovered != nil && (recovered.Status == "manual_intervention" || recovered.Status == "completed" || recovered.Status == "failed") {
+				return recovered, nil
+			}
 			return nil, err
 		}
 		return r.repos.Queue.GetByID(ctx, queueItem.ID)
 	}
 	retryAt := eventlog.FormatJavaScriptISOString(r.now().Add(backoffDelay(r.retryBaseDelay, cappedRetryDelayAttempt(nextAttempts, queueItem.MaxAttempts))))
 	if err := r.repos.Queue.MarkRetry(ctx, storage.QueueMarkRetryInput{ID: queueItem.ID, AvailableAt: retryAt, Attempts: nextAttempts, ErrorMessage: optionalString(message), ErrorKind: string(kind), UpdatedAt: nowISO}); err != nil {
+		if recovered, getErr := r.repos.Queue.GetByID(ctx, queueItem.ID); getErr == nil && recovered != nil && (recovered.Status == "manual_intervention" || recovered.Status == "completed" || recovered.Status == "failed") {
+			return recovered, nil
+		}
 		return nil, err
 	}
 	return r.repos.Queue.GetByID(ctx, queueItem.ID)

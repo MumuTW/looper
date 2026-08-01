@@ -879,19 +879,23 @@ func TestProcessClaimedItemCompletesCreatePRFlow(t *testing.T) {
 // ValidationCommandsByProject) has no entry for the project, the durable
 // sticky retry must fail closed before any agent work instead of falling back
 // to empty defaults and letting validation.RunCommands report success without
-// running anything. recoverClaimedItem terminal-fails the queue item and
-// pauses the loop; the agent never executes.
+// running anything. ProcessClaimedItem terminal-fails the queue item and
+// pauses the loop; the agent never executes, and emits the recovery notice.
 func TestProcessClaimedItemFailsClosedForQuarantinedProject(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	git := &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "looper/feature", BaseBranch: "main", HeadSHA: "abc123", WorktreeID: "worktree_1"}}
 	github := &fakeGitHubGateway{createPRResult: CreatePullRequestResult{Number: 101, URL: "https://example/pr/101"}}
 	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "done", Stdout: "ok", ParseStatus: "parsed"}}}
+	completed := make([]RunCompletedInput, 0, 1)
 	// Non-nil map with no entry for project_1 models a catalog that quarantined
 	// the unstanced legacy project (empty defaults.validationCommands, no
 	// validation stance). A nil map would mean "no catalog provided" and is
 	// intentionally treated as policy-known to preserve legacy/test behavior.
-	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true, OpenPRStrategy: config.OpenPRStrategyAllDone, ValidationCommandsByProject: map[string][]string{}})
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true, OpenPRStrategy: config.OpenPRStrategyAllDone, ValidationCommandsByProject: map[string][]string{}, OnRunCompleted: func(_ context.Context, input RunCompletedInput) error {
+		completed = append(completed, input)
+		return nil
+	}})
 
 	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-1", "worker")
 	if err != nil || claim == nil {
@@ -903,6 +907,9 @@ func TestProcessClaimedItemFailsClosedForQuarantinedProject(t *testing.T) {
 	}
 	if result.Status != "failed" || result.FailureKind != FailureManualIntervention {
 		t.Fatalf("result = %#v, want failed/manual_intervention fail-closed", result)
+	}
+	if len(completed) != 1 || completed[0].Status != "failed" || completed[0].FailureKind != FailureManualIntervention || !strings.Contains(completed[0].Summary, "quarantined without a validation policy") {
+		t.Fatalf("completed = %#v, want quarantine recovery notification", completed)
 	}
 	if len(agent.starts) != 0 {
 		t.Fatalf("agent starts = %d, want 0: quarantined retry must not execute the agent", len(agent.starts))
@@ -3777,6 +3784,50 @@ func TestRecoverClaimedItemReconcilesRunningLoopState(t *testing.T) {
 	}
 	if loop == nil || loop.Status != "paused" || loop.NextRunAt != nil {
 		t.Fatalf("loop = %#v, want paused loop", loop)
+	}
+}
+
+// TestRecoverClaimedItemFinishesAfterQueueFailureAlreadyCommitted models the
+// partial transition where ProcessClaimedItem terminalized the queue item but
+// failed while updating the loop. Recovery must reconcile the loop from the
+// durable terminal queue row and must not resurrect it as a retry merely
+// because the second error is classified as transient.
+func TestRecoverClaimedItemFinishesAfterQueueFailureAlreadyCommitted(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	nowISO := fixture.nowISO()
+	loopTarget := "project:project_1"
+	loopID := "loop_worker_partial_failure"
+	projectID := "project_1"
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 2, ProjectID: projectID, Type: "worker", TargetType: "project", TargetID: &loopTarget, Repo: stringPtr("acme/looper"), Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	payload := `{"title":"Recover worker loop","prompt":"Do the thing","repo":"acme/looper","baseBranch":"main"}`
+	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_worker_partial_failure", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: loopTarget, Repo: stringPtr("acme/looper"), DedupeKey: "worker:loop_worker_partial_failure", Priority: 1, Status: "manual_intervention", AvailableAt: nowISO, Attempts: 1, MaxAttempts: 3, PayloadJSON: &payload, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+	queueItem := storage.QueueItemRecord{ID: "queue_worker_partial_failure", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: loopTarget, Repo: stringPtr("acme/looper"), DedupeKey: "worker:loop_worker_partial_failure", Priority: 1, Status: "running", AvailableAt: nowISO, Attempts: 0, MaxAttempts: 3, PayloadJSON: &payload, CreatedAt: nowISO, UpdatedAt: nowISO}
+	result, err := runner.recoverClaimedItem(context.Background(), queueItem, &loopError{message: "loop reconciliation interrupted", kind: FailureRetryableTransient})
+	if err != nil {
+		t.Fatalf("recoverClaimedItem() error = %v", err)
+	}
+	if result == nil || result.Status != "failed" || result.FailureKind != FailureRetryableTransient {
+		t.Fatalf("result = %#v, want failed transient recovery", result)
+	}
+	queue, err := fixture.repos.Queue.GetByID(context.Background(), queueItem.ID)
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	if queue == nil || queue.Status != "manual_intervention" {
+		t.Fatalf("queue = %#v, want existing terminal manual_intervention row preserved", queue)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), loopID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if loop == nil || loop.Status != "paused" || loop.NextRunAt != nil {
+		t.Fatalf("loop = %#v, want paused loop after idempotent recovery", loop)
 	}
 }
 
