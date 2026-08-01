@@ -207,8 +207,10 @@ See [ADR-0012](adr/0012-sqlite-project-authority.md) for the Authority and lifec
 ### Project label namespace
 
 Each project may set `projects[].labelNamespace` to isolate Looper's forge
-labels from another Looper instance. It must be a 1–63 character prefix ending
-in `:` and may contain only letters, numbers, `.`, `_`, or `-`; the default is
+labels from another Looper instance. It must be a 1–31 character prefix ending
+in `:` and may contain only letters, numbers, `.`, `_`, or `-`; the limit leaves
+room for the longest standard suffix within GitHub's 50-character label-name
+limit. The default is
 `looper:`. Built-in dispatch and ownership checks use this namespace, and the
 legacy bare `dispatch/plan` and `dispatch/implement` labels are read-only
 compatibility inputs and are never emitted. Classification-label projection is
@@ -515,7 +517,7 @@ profile = "fast"
 
 ## Coordinator config reference
 
-Coordinator is the proactive, stateless issue-intake role. It owns both Triage and Dispatch. Triage writes `triaged` plus the coordinator-owned label namespace. Dispatch consumes `triaged` + `dispatch/*` and derives the actual trigger label from Planner or Worker config instead of redeclaring those labels.
+Coordinator is the proactive, stateless issue-intake role. It owns both Triage and Dispatch. Triage writes the project-scoped completion marker (`triaged` in the default namespace, `<namespace>triaged` for a custom namespace) plus the coordinator-owned label namespace. Dispatch consumes that same completion marker and `dispatch/*` and derives the actual trigger label from Planner or Worker config instead of redeclaring those labels.
 
 Triage LLM calls use the **global** `agent.vendor` / `agent.model` only (not coding-role profiles or `roles.*.agent` overlays). See [Multi-role agent vendor and model](#multi-role-agent-vendor-and-model).
 
@@ -534,7 +536,7 @@ Coordinator triage lives under `roles.coordinator.triage.*`:
 | `roles.coordinator.triage.disposition.unclearLabel` | Label used for `unclear` | `"needs-info"` |
 | `roles.coordinator.triage.disposition.reTriageOnAuthorReply` | Re-opens the triage loop when the original author clarifies a `needs-info` issue | `true` |
 
-Coordinator clears and rewrites its own label namespace on each successful triage pass: `kind/*`, `area/*`, `complexity/*`, `dispatch/*`, `wontfix`, and `needs-info`. It then posts or edits the marker comment and writes `triaged` last.
+Coordinator clears and rewrites its own label namespace on each successful triage pass: `kind/*`, `area/*`, `complexity/*`, `dispatch/*`, `wontfix`, and `needs-info`. It then posts or edits the marker comment and writes the project-scoped completion marker last.
 
 ### Dispatch settings
 
