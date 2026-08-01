@@ -3,6 +3,7 @@ package config
 import (
 	"encoding/json"
 	"errors"
+	"math"
 	"testing"
 )
 
@@ -71,6 +72,12 @@ func TestValidateAgentBrownout(t *testing.T) {
 		{
 			name:     "zero ratio rejected",
 			mutate:   func(b *AgentBrownoutConfig) { b.FailureRatio = 0 },
+			wantPath: "scheduler.agentBrownout.failureRatio",
+			wantMsg:  "must be a number in (0, 1]",
+		},
+		{
+			name:     "NaN ratio rejected",
+			mutate:   func(b *AgentBrownoutConfig) { b.FailureRatio = math.NaN() },
 			wantPath: "scheduler.agentBrownout.failureRatio",
 			wantMsg:  "must be a number in (0, 1]",
 		},
@@ -155,3 +162,84 @@ func TestPartialAgentBrownoutMergesFieldwise(t *testing.T) {
 		t.Fatalf("unset fields were clobbered: %+v", got)
 	}
 }
+
+func TestAgentBrownoutEnvironmentAndCLIPrecedence(t *testing.T) {
+	t.Parallel()
+
+	file := PartialConfig{Scheduler: &PartialSchedulerConfig{AgentBrownout: &PartialAgentBrownoutConfig{
+		Enabled:            boolPtr(false),
+		WindowSeconds:      intPtr(30),
+		MinFailures:        intPtr(2),
+		FailureRatio:       floatPtr(0.4),
+		CooldownSeconds:    intPtr(60),
+		MaxCooldownSeconds: intPtr(120),
+		ProbeSuccesses:     intPtr(1),
+		Notify:             boolPtr(false),
+	}}}
+	env, err := buildEnvOverrides(mapEnvLookup(map[string]string{
+		"LOOPER_SCHEDULER_AGENT_BROWNOUT_ENABLED":              "true",
+		"LOOPER_SCHEDULER_AGENT_BROWNOUT_WINDOW_SECONDS":       "300",
+		"LOOPER_SCHEDULER_AGENT_BROWNOUT_MIN_FAILURES":         "4",
+		"LOOPER_SCHEDULER_AGENT_BROWNOUT_FAILURE_RATIO":        "0.7",
+		"LOOPER_SCHEDULER_AGENT_BROWNOUT_COOLDOWN_SECONDS":     "90",
+		"LOOPER_SCHEDULER_AGENT_BROWNOUT_MAX_COOLDOWN_SECONDS": "600",
+		"LOOPER_SCHEDULER_AGENT_BROWNOUT_PROBE_SUCCESSES":      "2",
+		"LOOPER_SCHEDULER_AGENT_BROWNOUT_NOTIFY":               "true",
+	}))
+	if err != nil {
+		t.Fatalf("buildEnvOverrides() error = %v", err)
+	}
+	fromEnv, err := Normalize(t.TempDir(), file, env)
+	if err != nil {
+		t.Fatalf("Normalize(file, env) error = %v", err)
+	}
+	if got := fromEnv.Scheduler.AgentBrownout; got.WindowSeconds != 300 || got.MinFailures != 4 || got.FailureRatio != 0.7 || got.CooldownSeconds != 90 || got.MaxCooldownSeconds != 600 || got.ProbeSuccesses != 2 || !got.Enabled || !got.Notify {
+		t.Fatalf("environment overrides did not beat file values: %+v", got)
+	}
+
+	parsed, err := parseCLIArgs([]string{
+		"--scheduler-agent-brownout-enabled=false",
+		"--scheduler-agent-brownout-window-seconds=900",
+		"--scheduler-agent-brownout-min-failures=7",
+		"--scheduler-agent-brownout-failure-ratio=0.9",
+		"--scheduler-agent-brownout-cooldown-seconds=120",
+		"--scheduler-agent-brownout-max-cooldown-seconds=900",
+		"--scheduler-agent-brownout-probe-successes=3",
+		"--scheduler-agent-brownout-notify=false",
+	})
+	if err != nil {
+		t.Fatalf("parseCLIArgs() error = %v", err)
+	}
+	fromCLI, err := Normalize(t.TempDir(), file, env, parsed.overrides)
+	if err != nil {
+		t.Fatalf("Normalize(file, env, cli) error = %v", err)
+	}
+	got := fromCLI.Scheduler.AgentBrownout
+	if got.Enabled || got.Notify || got.WindowSeconds != 900 || got.MinFailures != 7 || got.FailureRatio != 0.9 || got.CooldownSeconds != 120 || got.MaxCooldownSeconds != 900 || got.ProbeSuccesses != 3 {
+		t.Fatalf("CLI overrides did not beat environment/file values: %+v", got)
+	}
+}
+
+func TestAgentBrownoutEnvironmentRejectsInvalidValues(t *testing.T) {
+	t.Parallel()
+	_, err := buildEnvOverrides(mapEnvLookup(map[string]string{"LOOPER_SCHEDULER_AGENT_BROWNOUT_FAILURE_RATIO": "not-a-number"}))
+	if err == nil {
+		t.Fatal("buildEnvOverrides() accepted invalid failure ratio")
+	}
+	if got := err.Error(); got != `invalid value for LOOPER_SCHEDULER_AGENT_BROWNOUT_FAILURE_RATIO: "not-a-number" is not a number` {
+		t.Fatalf("error = %q, want precise environment variable error", got)
+	}
+}
+
+func TestAgentBrownoutCLIRejectsInvalidValues(t *testing.T) {
+	t.Parallel()
+	_, err := parseCLIArgs([]string{"--scheduler-agent-brownout-failure-ratio=oops"})
+	if err == nil {
+		t.Fatal("parseCLIArgs() accepted invalid failure ratio")
+	}
+	if got := err.Error(); got != `invalid value for --scheduler-agent-brownout-failure-ratio: "oops" is not a number` {
+		t.Fatalf("error = %q, want precise CLI flag error", got)
+	}
+}
+
+func floatPtr(value float64) *float64 { return &value }

@@ -203,6 +203,10 @@ type Runtime struct {
 	startOnce                   sync.Once
 	shutdownOnce                sync.Once
 	shutdownCh                  chan struct{}
+	notificationCtx             context.Context
+	notificationCancel          context.CancelFunc
+	notificationWG              sync.WaitGroup
+	notificationsStopping       bool
 	schedulerStop               chan struct{}
 	schedulerDone               chan struct{}
 	schedulerWake               chan struct{}
@@ -312,6 +316,7 @@ func New(options Options) *Runtime {
 	if reloadInterval <= 0 {
 		reloadInterval = time.Second
 	}
+	notificationCtx, notificationCancel := context.WithCancel(context.Background())
 	rt := &Runtime{
 		config:                      options.Config,
 		configPath:                  strings.TrimSpace(options.ConfigPath),
@@ -340,6 +345,8 @@ func New(options Options) *Runtime {
 		deferRecovery:               options.DeferRecovery,
 		recovery:                    createEmptyRecoverySummary(),
 		shutdownCh:                  make(chan struct{}),
+		notificationCtx:             notificationCtx,
+		notificationCancel:          notificationCancel,
 		activeExecutions:            NewActiveExecutionRegistry(),
 		projectCatalog:              projectCatalog,
 		webhook:                     newWebhookRuntime(options.Config, options.Logger, now),
@@ -443,6 +450,11 @@ func (r *Runtime) Stop(reason string) {
 		// Runtime.Stop matches the daemon path: scheduler, deferred recovery,
 		// and in-flight webhook discovery are canceled before any waits.
 		r.BeginShutdown(reason)
+		// Brownout notifications are best-effort side effects. Stop accepting
+		// new ones and cancel/drain the bounded in-flight deliveries before
+		// repositories are closed, so an async notification cannot write into
+		// a coordinator that shutdown has already released.
+		r.stopAgentBrownoutNotifications()
 
 		r.stopConfigReloadLoop()
 		r.stopDeferredReviewerRecovery()
@@ -760,12 +772,12 @@ func (r *Runtime) onAgentBrownoutTransition(transition brownout.Transition) {
 	// every outage a stream of notifications instead of two.
 	switch transition.To {
 	case brownout.StateOpen:
-		r.notifyAgentBrownout("warn", "Looper Paused: Agents Keep Failing",
+		r.notifyAgentBrownout("failure", "Looper Paused: Agents Keep Failing",
 			fmt.Sprintf("%d of %d recent agent runs failed", transition.Failures, transition.Total),
 			fmt.Sprintf("Looper stopped starting new work because its own agent runs keep failing — usually a provider that is rate limiting, down, or out of quota. It will retry by itself in %s. Nothing is lost; queued work resumes when a probe run succeeds.", transition.Cooldown.Round(time.Second)),
 			"open")
 	case brownout.StateClosed:
-		r.notifyAgentBrownout("info", "Looper Resumed", "a probe agent run succeeded",
+		r.notifyAgentBrownout("action_required", "Looper Resumed", "a probe agent run succeeded",
 			"Agent runs are working again. Looper has resumed starting new work.", "closed")
 	}
 }
@@ -774,27 +786,64 @@ func (r *Runtime) notifyAgentBrownout(level, title, subtitle, body, dedupeSuffix
 	r.mu.RLock()
 	gateways := r.notificationGateways
 	services := r.services
+	notificationCtx := r.notificationCtx
 	r.mu.RUnlock()
-	if gateways == nil || services.Repositories == nil {
+	if gateways == nil || services.Repositories == nil || notificationCtx == nil {
 		return
 	}
 	cfg := r.Config()
-	gateway := gateways.New(notify.Options{
-		Config:        cfg.Notifications,
-		OsascriptPath: derefString(cfg.Tools.OsascriptPath),
-		LogFilePath:   filepath.Join(cfg.Daemon.LogDir, "looperd.log"),
-		Repositories:  services.Repositories,
-		Now:           r.now,
-	})
-	gateway.Notify(context.Background(), notify.SystemNotificationPayload{
+	payload := notify.SystemNotificationPayload{
 		Level:      level,
 		Title:      title,
 		Subtitle:   subtitle,
 		Body:       body,
 		EntityType: "agent_brownout",
 		EntityID:   "looperd-agent-brownout",
-		DedupeKey:  fmt.Sprintf("runtime.agentBrownout.%s:%s", dedupeSuffix, formatJavaScriptISOString(r.now())),
-	})
+		DedupeKey:  fmt.Sprintf("runtime.agentBrownout.%s", dedupeSuffix),
+	}
+
+	// The transition callback runs on an agent terminal path. Notification
+	// persistence and webhook delivery must not hold that path behind a slow
+	// provider or osascript invocation. Add under r.mu so Stop can close the
+	// admission for new deliveries before waiting for the existing bounded set.
+	r.mu.Lock()
+	if r.notificationsStopping || r.stopped || r.notificationCtx == nil {
+		r.mu.Unlock()
+		return
+	}
+	r.notificationWG.Add(1)
+	notificationCtx = r.notificationCtx
+	r.mu.Unlock()
+	go func() {
+		defer r.notificationWG.Done()
+		ctx, cancel := context.WithTimeout(notificationCtx, agentBrownoutNotificationTimeout)
+		defer cancel()
+		gateways.New(notify.Options{
+			Config:        cfg.Notifications,
+			OsascriptPath: derefString(cfg.Tools.OsascriptPath),
+			LogFilePath:   filepath.Join(cfg.Daemon.LogDir, "looperd.log"),
+			Repositories:  services.Repositories,
+			Now:           r.now,
+		}).Notify(ctx, payload)
+	}()
+}
+
+const agentBrownoutNotificationTimeout = 5 * time.Second
+
+func (r *Runtime) stopAgentBrownoutNotifications() {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	if !r.notificationsStopping {
+		r.notificationsStopping = true
+		if r.notificationCancel != nil {
+			r.notificationCancel()
+			r.notificationCancel = nil
+		}
+	}
+	r.mu.Unlock()
+	r.notificationWG.Wait()
 }
 
 // WithAllowClaim runs fn only while claim admission is open, holding the

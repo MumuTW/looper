@@ -14,13 +14,16 @@ func outcomeExecution(sink *[]Outcome) *execution {
 func TestReportOutcomeMapsTerminalStatus(t *testing.T) {
 	tests := []struct {
 		status        string
+		parseStatus   string
 		wantReported  bool
 		wantSucceeded bool
 	}{
-		{status: "completed", wantReported: true, wantSucceeded: true},
-		{status: "failed", wantReported: true},
+		{status: "completed", parseStatus: "parsed", wantReported: true, wantSucceeded: true},
+		{status: "completed", parseStatus: "missing", wantReported: true},
+		{status: "completed", parseStatus: "invalid_json", wantReported: true},
+		{status: "failed", parseStatus: "missing", wantReported: true},
 		// A hung agent and a refused one both mean work is not getting done.
-		{status: "timeout", wantReported: true},
+		{status: "timeout", parseStatus: "missing", wantReported: true},
 		// Looper killed it. That is looper's decision, not evidence about the
 		// provider, and counting it would let an operator stop trip the gate.
 		{status: "killed"},
@@ -30,7 +33,7 @@ func TestReportOutcomeMapsTerminalStatus(t *testing.T) {
 		tt := tt
 		t.Run(tt.status, func(t *testing.T) {
 			outcomes := make([]Outcome, 0, 1)
-			outcomeExecution(&outcomes).reportOutcome(tt.status)
+			outcomeExecution(&outcomes).reportOutcome(tt.status, tt.parseStatus)
 
 			if !tt.wantReported {
 				if len(outcomes) != 0 {
@@ -54,5 +57,5 @@ func TestReportOutcomeMapsTerminalStatus(t *testing.T) {
 
 func TestReportOutcomeWithoutSinkIsSafe(t *testing.T) {
 	execution := &execution{executor: &ConfiguredExecutor{}, input: RunInput{}}
-	execution.reportOutcome("failed")
+	execution.reportOutcome("failed", "missing")
 }

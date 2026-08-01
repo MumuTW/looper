@@ -1236,7 +1236,7 @@ func (x *execution) run(ctx context.Context) {
 		}, endedAtISO)
 	}
 
-	x.reportOutcome(status)
+	x.reportOutcome(status, result.ParseStatus)
 	x.doneCh <- execOutcome{result: result, err: persistErr}
 }
 
@@ -1257,7 +1257,7 @@ func (x *execution) finalizeNativeResumeStatus(status, errorMessage, stderr stri
 // reportOutcome feeds the daemon's agent-health gate. "killed" is excluded on
 // purpose: it means looper stopped the agent (operator stop, shutdown drain),
 // which says nothing about whether the provider is answering.
-func (x *execution) reportOutcome(status string) {
+func (x *execution) reportOutcome(status, parseStatus string) {
 	if x.executor == nil || x.executor.onOutcome == nil || status == "killed" {
 		return
 	}
@@ -1267,7 +1267,11 @@ func (x *execution) reportOutcome(status string) {
 		RunID:       x.input.RunID,
 		ExecutionID: x.executionID,
 		Status:      status,
-		Succeeded:   status == "completed",
+		// A zero exit code is not a valid agent completion by itself. The
+		// structured marker is the executor's completion authority; missing or
+		// malformed output must feed the health gate as a failure so brownout
+		// backs off from agents that exit cleanly without doing the work contract.
+		Succeeded: status == "completed" && parseStatus == "parsed",
 	})
 }
 func (x *execution) observeBeforeTimeout(timeoutType string) string {

@@ -922,7 +922,7 @@ func (h *Handler) admissionStateString() string {
 
 // agentHealthStatus projects the agent-health gate for status surfaces. A
 // runtime that does not expose it reports closed: an embedder without the gate
-// is not brownED out, it simply never opens one.
+// is not browned out, it simply never opens one.
 func (h *Handler) agentHealthStatus() *statusAgentHealth {
 	runtimeValue := h.context.Runtime
 	if runtimeValue == nil {

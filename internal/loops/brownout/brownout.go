@@ -111,6 +111,12 @@ type Breaker struct {
 	probeSuccesses int
 	// trips counts open transitions for the lifetime of the process.
 	trips int
+	// tripFailures and tripTotal retain the evidence that opened the current
+	// outage. The rolling window is cleared on open so it cannot re-trip from
+	// stale failures, but status surfaces still need to explain why the gate is
+	// open (or waiting for its first probe).
+	tripFailures int
+	tripTotal    int
 }
 
 // New builds a breaker. now and onChange may be nil.
@@ -193,6 +199,8 @@ func (b *Breaker) SetConfig(cfg Config) {
 		b.outcomes = nil
 		b.probeSuccesses = 0
 		b.cooldown = cfg.Cooldown
+		b.tripFailures = 0
+		b.tripTotal = 0
 		return
 	}
 	// A cooldown the operator shortened should take effect on the next round,
@@ -219,8 +227,20 @@ func (b *Breaker) Snapshot() Summary {
 	now := b.now()
 	b.pruneLocked(now)
 	failures, total := b.countLocked()
-	summary := Summary{State: b.state, Failures: failures, Total: total, Cooldown: b.cooldown, Trips: b.trips}
-	if b.state == StateOpen {
+	state := b.state
+	// Snapshot is intentionally observational: do not advance the breaker or
+	// emit a transition from a status read. Still, once the deadline elapsed,
+	// reporting open would claim work remains suspended even though the next
+	// Allow call may start a probe.
+	deadlineElapsed := b.state == StateOpen && !now.Before(b.openUntil)
+	if b.state == StateOpen || b.state == StateHalfOpen {
+		failures, total = b.tripFailures, b.tripTotal
+	}
+	if deadlineElapsed {
+		state = StateHalfOpen
+	}
+	summary := Summary{State: state, Failures: failures, Total: total, Cooldown: b.cooldown, Trips: b.trips}
+	if b.state == StateOpen && !deadlineElapsed {
 		openUntil := b.openUntil
 		summary.OpenUntil = &openUntil
 	}
@@ -287,6 +307,8 @@ func (b *Breaker) openLocked(now time.Time, reason string) Transition {
 	b.probeSuccesses = 0
 	b.trips++
 	failures, total := b.countLocked()
+	b.tripFailures = failures
+	b.tripTotal = total
 	// The window is cleared on the way into open so the breaker measures the
 	// recovery, not the outage that is already accounted for.
 	b.outcomes = nil

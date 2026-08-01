@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"context"
 	"errors"
 	"sync"
 	"testing"
@@ -8,6 +9,7 @@ import (
 
 	"github.com/MumuTW/looper/internal/agent"
 	"github.com/MumuTW/looper/internal/config"
+	gitinfra "github.com/MumuTW/looper/internal/infra/git"
 	"github.com/MumuTW/looper/internal/loops/brownout"
 )
 
@@ -71,6 +73,25 @@ func TestRepeatedAgentFailuresCloseClaimAdmission(t *testing.T) {
 	err := rt.AllowClaim()
 	if !errors.Is(err, brownout.ErrOpen) {
 		t.Fatalf("AllowClaim() = %v, want brownout.ErrOpen after sustained agent failures", err)
+	}
+}
+
+func TestWorktreeCleanupContinuesDuringAgentBrownout(t *testing.T) {
+	fixture := newWorktreeCleanupFixture(t)
+	for i := 0; i < fixture.config.Scheduler.AgentBrownout.MinFailures; i++ {
+		fixture.runtime.activeExecutions.ReportAgentOutcome(agent.Outcome{Status: "completed", Succeeded: false})
+	}
+	if !errors.Is(fixture.runtime.AllowClaim(), brownout.ErrOpen) {
+		t.Fatal("expected agent brownout to close work-producing admission")
+	}
+
+	git := &fakeWorktreeCleanupGit{
+		listed: map[string][]gitinfra.WorktreeListEntry{fixture.project.RepoPath: {}},
+		clean:  map[string]bool{},
+	}
+	summary := fixture.runtime.runWorktreeCleanupPass(context.Background(), fixture.repos, git, fixture.config)
+	if summary.LastStatus != "completed" {
+		t.Fatalf("cleanup status = %#v, want completed while brownout is open", summary)
 	}
 }
 

@@ -556,7 +556,7 @@ func validateAgentBrownoutConfig(brownout AgentBrownoutConfig, issues *[]Validat
 	if brownout.MinFailures < 1 {
 		*issues = append(*issues, ValidationIssue{Path: "scheduler.agentBrownout.minFailures", Message: "must be a positive integer"})
 	}
-	if brownout.FailureRatio <= 0 || brownout.FailureRatio > 1 {
+	if math.IsNaN(brownout.FailureRatio) || brownout.FailureRatio <= 0 || brownout.FailureRatio > 1 {
 		*issues = append(*issues, ValidationIssue{Path: "scheduler.agentBrownout.failureRatio", Message: "must be a number in (0, 1]"})
 	}
 	if brownout.CooldownSeconds < 1 {

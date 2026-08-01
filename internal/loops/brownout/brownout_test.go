@@ -193,7 +193,8 @@ func TestRecoveryResetsCooldownToConfigured(t *testing.T) {
 
 // The cooldown must be observable: entering half-open discards the window that
 // tripped the breaker, so the first Allow after a cooldown cannot be refused by
-// failures the operator already waited out.
+// failures the operator already waited out. Status still reports the last trip
+// evidence while the new evaluation window is empty.
 func TestHalfOpenDoesNotInheritTheTrippingWindow(t *testing.T) {
 	b, c, _ := newTestBreaker(t, testConfig())
 	for i := 0; i < 20; i++ {
@@ -203,8 +204,9 @@ func TestHalfOpenDoesNotInheritTheTrippingWindow(t *testing.T) {
 	if err := b.Allow(); err != nil {
 		t.Fatalf("half_open inherited the tripping window: %v", err)
 	}
-	if got := b.Snapshot().Failures; got != 0 {
-		t.Fatalf("expected an empty window in half_open, got %d failures", got)
+	snapshot := b.Snapshot()
+	if snapshot.Failures != 3 || snapshot.Total != 3 {
+		t.Fatalf("expected last trip evidence in half_open, got failures=%d total=%d", snapshot.Failures, snapshot.Total)
 	}
 }
 
@@ -245,38 +247,104 @@ func TestSnapshotReportsOpenUntilAndTrips(t *testing.T) {
 	}
 }
 
-// The scheduler calls Allow from its own goroutines while a config reload calls
-// SetConfig from another. Under -race this fails if any field of cfg is read
-// outside the mutex.
-func TestConcurrentAllowRecordAndSetConfigAreRaceFree(t *testing.T) {
-	cfg := testConfig()
-	b := New(cfg, time.Now, func(Transition) {})
-
-	var wg sync.WaitGroup
-	for i := 0; i < 8; i++ {
-		wg.Add(3)
-		go func() {
-			defer wg.Done()
-			for n := 0; n < 200; n++ {
-				_ = b.Allow()
-			}
-		}()
-		go func() {
-			defer wg.Done()
-			for n := 0; n < 200; n++ {
-				b.Record(n%2 == 0)
-			}
-		}()
-		go func() {
-			defer wg.Done()
-			for n := 0; n < 200; n++ {
-				next := cfg
-				next.Enabled = n%2 == 0
-				b.SetConfig(next)
-				_ = b.Snapshot()
-			}
-		}()
+func TestSnapshotReportsHalfOpenWhenCooldownElapsed(t *testing.T) {
+	b, c, _ := newTestBreaker(t, testConfig())
+	b.Record(false)
+	b.Record(false)
+	b.Record(false)
+	if got := b.Snapshot().State; got != StateOpen {
+		t.Fatalf("state = %s, want open", got)
 	}
+	c.add(10 * time.Minute)
+	snapshot := b.Snapshot()
+	if snapshot.State != StateHalfOpen {
+		t.Fatalf("state = %s, want half_open after deadline", snapshot.State)
+	}
+	if snapshot.OpenUntil != nil {
+		t.Fatalf("half_open snapshot reported openUntil %v", snapshot.OpenUntil)
+	}
+	if snapshot.Failures != 3 || snapshot.Total != 3 {
+		t.Fatalf("snapshot lost last trip evidence: %+v", snapshot)
+	}
+	if got := b.Snapshot().State; got != StateHalfOpen {
+		t.Fatalf("snapshot should not mutate breaker state, got %s", got)
+	}
+	if err := b.Allow(); err != nil {
+		t.Fatalf("Allow() after observed deadline = %v", err)
+	}
+}
+
+func TestSetConfigPreservesOpenStateAndClampsCooldown(t *testing.T) {
+	b, _, _ := newTestBreaker(t, testConfig())
+	b.Record(false)
+	b.Record(false)
+	b.Record(false)
+	if !errors.Is(b.Allow(), ErrOpen) {
+		t.Fatal("expected breaker to be open")
+	}
+	next := testConfig()
+	next.Cooldown = 5 * time.Minute
+	next.MaxCooldown = 2 * time.Minute
+	b.SetConfig(next)
+	snapshot := b.Snapshot()
+	if snapshot.State != StateOpen {
+		t.Fatalf("SetConfig() changed open state to %s", snapshot.State)
+	}
+	if snapshot.Cooldown != 2*time.Minute {
+		t.Fatalf("cooldown = %s, want max-capped 2m", snapshot.Cooldown)
+	}
+	if snapshot.Failures != 3 || snapshot.Total != 3 {
+		t.Fatalf("SetConfig() lost trip evidence: %+v", snapshot)
+	}
+}
+
+func TestSetConfigDisableResetsEvaluationState(t *testing.T) {
+	b, _, _ := newTestBreaker(t, testConfig())
+	b.Record(false)
+	b.Record(false)
+	b.Record(false)
+	if !errors.Is(b.Allow(), ErrOpen) {
+		t.Fatal("expected breaker to be open")
+	}
+	next := testConfig()
+	next.Enabled = false
+	b.SetConfig(next)
+	snapshot := b.Snapshot()
+	if snapshot.State != StateClosed || snapshot.Failures != 0 || snapshot.Total != 0 {
+		t.Fatalf("disabled breaker retained live state: %+v", snapshot)
+	}
+	if err := b.Allow(); err != nil {
+		t.Fatalf("disabled breaker refused work: %v", err)
+	}
+}
+
+func TestConcurrentUseAndConfigReloadIsRaceFree(t *testing.T) {
+	b := New(testConfig(), time.Now, nil)
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func(worker int) {
+			defer wg.Done()
+			for j := 0; j < 1000; j++ {
+				if worker%2 == 0 {
+					b.Record(j%3 != 0)
+				} else {
+					_ = b.Allow()
+					_ = b.Snapshot()
+				}
+			}
+		}(i)
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 1000; i++ {
+			cfg := testConfig()
+			cfg.Enabled = i%5 != 0
+			cfg.MaxCooldown = time.Duration(1+i%7) * time.Minute
+			b.SetConfig(cfg)
+		}
+	}()
 	wg.Wait()
 }
 

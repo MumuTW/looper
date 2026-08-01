@@ -896,6 +896,9 @@ func parseOperationalCLIArg(
 	takeValue cliValueTaker,
 ) (bool, int, error) {
 	arg := args[index]
+	if handled, nextIndex, err := parseAgentBrownoutCLIArg(args, index, parsed, takeValue); handled {
+		return true, nextIndex, err
+	}
 
 	switch {
 	case matchesFlag(arg, "--config"):
@@ -1109,6 +1112,67 @@ func parseOperationalCLIArg(
 	}
 }
 
+func parseAgentBrownoutCLIArg(args []string, index int, parsed *parsedCLIArgs, takeValue cliValueTaker) (bool, int, error) {
+	arg := args[index]
+	parseBool := func(flag string, set func(*bool)) (bool, int, error) {
+		value, nextIndex, err := takeValue(index, flag)
+		if err != nil {
+			return true, index, err
+		}
+		parsedValue, err := parseBoolean(value)
+		if err != nil {
+			return true, index, fmt.Errorf("invalid value for %s: %q is not a boolean", flag, value)
+		}
+		set(parsedValue)
+		return true, nextIndex, nil
+	}
+	parseInt := func(flag string, set func(*int)) (bool, int, error) {
+		value, nextIndex, err := takeValue(index, flag)
+		if err != nil {
+			return true, index, err
+		}
+		parsedValue, err := parseInteger(value)
+		if err != nil {
+			return true, index, fmt.Errorf("invalid value for %s: %q is not an integer", flag, value)
+		}
+		set(parsedValue)
+		return true, nextIndex, nil
+	}
+	parseFloatValue := func(flag string, set func(*float64)) (bool, int, error) {
+		value, nextIndex, err := takeValue(index, flag)
+		if err != nil {
+			return true, index, err
+		}
+		parsedValue, err := parseFloat(value)
+		if err != nil {
+			return true, index, fmt.Errorf("invalid value for %s: %q is not a number", flag, value)
+		}
+		set(parsedValue)
+		return true, nextIndex, nil
+	}
+
+	switch {
+	case matchesFlag(arg, "--scheduler-agent-brownout-enabled"):
+		return parseBool("--scheduler-agent-brownout-enabled", func(v *bool) { ensureAgentBrownoutConfig(&parsed.overrides).Enabled = v })
+	case matchesFlag(arg, "--scheduler-agent-brownout-window-seconds"):
+		return parseInt("--scheduler-agent-brownout-window-seconds", func(v *int) { ensureAgentBrownoutConfig(&parsed.overrides).WindowSeconds = v })
+	case matchesFlag(arg, "--scheduler-agent-brownout-min-failures"):
+		return parseInt("--scheduler-agent-brownout-min-failures", func(v *int) { ensureAgentBrownoutConfig(&parsed.overrides).MinFailures = v })
+	case matchesFlag(arg, "--scheduler-agent-brownout-failure-ratio"):
+		return parseFloatValue("--scheduler-agent-brownout-failure-ratio", func(v *float64) { ensureAgentBrownoutConfig(&parsed.overrides).FailureRatio = v })
+	case matchesFlag(arg, "--scheduler-agent-brownout-cooldown-seconds"):
+		return parseInt("--scheduler-agent-brownout-cooldown-seconds", func(v *int) { ensureAgentBrownoutConfig(&parsed.overrides).CooldownSeconds = v })
+	case matchesFlag(arg, "--scheduler-agent-brownout-max-cooldown-seconds"):
+		return parseInt("--scheduler-agent-brownout-max-cooldown-seconds", func(v *int) { ensureAgentBrownoutConfig(&parsed.overrides).MaxCooldownSeconds = v })
+	case matchesFlag(arg, "--scheduler-agent-brownout-probe-successes"):
+		return parseInt("--scheduler-agent-brownout-probe-successes", func(v *int) { ensureAgentBrownoutConfig(&parsed.overrides).ProbeSuccesses = v })
+	case matchesFlag(arg, "--scheduler-agent-brownout-notify"):
+		return parseBool("--scheduler-agent-brownout-notify", func(v *bool) { ensureAgentBrownoutConfig(&parsed.overrides).Notify = v })
+	default:
+		return false, index, nil
+	}
+}
+
 func collectDeprecatedCLIWarnings(args []string) []string {
 	deprecated := []deprecatedSurface{}
 	add := func(flag string, replacement string) {
@@ -1166,6 +1230,14 @@ func parseInteger(value string) (*int, error) {
 		return nil, err
 	}
 
+	return &parsed, nil
+}
+
+func parseFloat(value string) (*float64, error) {
+	parsed, err := strconv.ParseFloat(strings.TrimSpace(value), 64)
+	if err != nil {
+		return nil, err
+	}
 	return &parsed, nil
 }
 
@@ -1287,6 +1359,9 @@ func buildEnvOverrides(lookupEnv EnvLookupFunc) (PartialConfig, error) {
 		ensureOsascriptNotificationConfig(&overrides).Enabled = parsed
 	}
 	if err := applyAgentTimeoutEnvOverrides(&overrides, lookupEnv); err != nil {
+		return PartialConfig{}, err
+	}
+	if err := applyAgentBrownoutEnvOverrides(&overrides, lookupEnv); err != nil {
 		return PartialConfig{}, err
 	}
 	if value, ok := lookupEnv("LOOPER_ALLOW_AUTO_COMMIT"); ok {
@@ -1516,6 +1591,80 @@ func applyAgentTimeoutEnvOverrides(overrides *PartialConfig, lookupEnv EnvLookup
 	return nil
 }
 
+func applyAgentBrownoutEnvOverrides(overrides *PartialConfig, lookupEnv EnvLookupFunc) error {
+	brownout := func() *PartialAgentBrownoutConfig {
+		if overrides.Scheduler == nil {
+			overrides.Scheduler = &PartialSchedulerConfig{}
+		}
+		if overrides.Scheduler.AgentBrownout == nil {
+			overrides.Scheduler.AgentBrownout = &PartialAgentBrownoutConfig{}
+		}
+		return overrides.Scheduler.AgentBrownout
+	}
+	boolEnv := func(name string, set func(*bool)) error {
+		value, ok := lookupEnv(name)
+		if !ok {
+			return nil
+		}
+		parsed, err := parseBoolean(value)
+		if err != nil {
+			return fmt.Errorf("invalid value for %s: %q is not a boolean", name, value)
+		}
+		set(parsed)
+		return nil
+	}
+	intEnv := func(name string, set func(*int)) error {
+		value, ok := lookupEnv(name)
+		if !ok {
+			return nil
+		}
+		parsed, err := parseInteger(value)
+		if err != nil {
+			return fmt.Errorf("invalid value for %s: %q is not an integer", name, value)
+		}
+		set(parsed)
+		return nil
+	}
+	floatEnv := func(name string, set func(*float64)) error {
+		value, ok := lookupEnv(name)
+		if !ok {
+			return nil
+		}
+		parsed, err := parseFloat(value)
+		if err != nil {
+			return fmt.Errorf("invalid value for %s: %q is not a number", name, value)
+		}
+		set(parsed)
+		return nil
+	}
+
+	if err := boolEnv("LOOPER_SCHEDULER_AGENT_BROWNOUT_ENABLED", func(v *bool) { brownout().Enabled = v }); err != nil {
+		return err
+	}
+	if err := intEnv("LOOPER_SCHEDULER_AGENT_BROWNOUT_WINDOW_SECONDS", func(v *int) { brownout().WindowSeconds = v }); err != nil {
+		return err
+	}
+	if err := intEnv("LOOPER_SCHEDULER_AGENT_BROWNOUT_MIN_FAILURES", func(v *int) { brownout().MinFailures = v }); err != nil {
+		return err
+	}
+	if err := floatEnv("LOOPER_SCHEDULER_AGENT_BROWNOUT_FAILURE_RATIO", func(v *float64) { brownout().FailureRatio = v }); err != nil {
+		return err
+	}
+	if err := intEnv("LOOPER_SCHEDULER_AGENT_BROWNOUT_COOLDOWN_SECONDS", func(v *int) { brownout().CooldownSeconds = v }); err != nil {
+		return err
+	}
+	if err := intEnv("LOOPER_SCHEDULER_AGENT_BROWNOUT_MAX_COOLDOWN_SECONDS", func(v *int) { brownout().MaxCooldownSeconds = v }); err != nil {
+		return err
+	}
+	if err := intEnv("LOOPER_SCHEDULER_AGENT_BROWNOUT_PROBE_SUCCESSES", func(v *int) { brownout().ProbeSuccesses = v }); err != nil {
+		return err
+	}
+	if err := boolEnv("LOOPER_SCHEDULER_AGENT_BROWNOUT_NOTIFY", func(v *bool) { brownout().Notify = v }); err != nil {
+		return err
+	}
+	return nil
+}
+
 func applyRoleEnvOverrides(overrides *PartialConfig, lookupEnv EnvLookupFunc) error {
 	envValue := func(primary string, aliases ...string) (string, bool) {
 		if value, ok := lookupEnv(primary); ok {
@@ -1652,6 +1801,21 @@ func ensureStorageConfig(partial *PartialConfig) *PartialStorageConfig {
 	}
 
 	return partial.Storage
+}
+
+func ensureSchedulerConfig(partial *PartialConfig) *PartialSchedulerConfig {
+	if partial.Scheduler == nil {
+		partial.Scheduler = &PartialSchedulerConfig{}
+	}
+	return partial.Scheduler
+}
+
+func ensureAgentBrownoutConfig(partial *PartialConfig) *PartialAgentBrownoutConfig {
+	scheduler := ensureSchedulerConfig(partial)
+	if scheduler.AgentBrownout == nil {
+		scheduler.AgentBrownout = &PartialAgentBrownoutConfig{}
+	}
+	return scheduler.AgentBrownout
 }
 
 func ensureAgentConfig(partial *PartialConfig) *PartialAgentConfig {
