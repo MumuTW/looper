@@ -50,11 +50,36 @@ func TestMergeWatchConflictRepairsSurviveHeadChangesAndRegenerateAtBoundary(t *t
 	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
 		t.Fatalf("DiscoverIssues() error = %v", err)
 	}
+	if calls != 0 {
+		t.Fatalf("regeneration calls = %d, want no regeneration before the second repair dispatch", calls)
+	}
+	if len(fixture.github.addedPRLabels) != 1 {
+		t.Fatalf("addedPRLabels = %#v, want one Fixer dispatch", fixture.github.addedPRLabels)
+	}
+
+	// The first changed head consumed the second configured dispatch. A later
+	// changed head is therefore the regeneration boundary, not another Fixer
+	// dispatch opportunity.
+	detail := fixture.github.details[1]
+	detail.Comments = []githubinfra.CommentInfo{{
+		ID: 44, Author: "looper", Body: stampedCoordinatorBody(fixture.cfg, mergeWatchMarkerLine(mergewatch.PriorWatchMarker{PRNumber: 77, HeadSHA: "new-head", Retries: 3, ConflictRepairs: 2})), CreatedAt: fixture.now.Format(time.RFC3339),
+	}}
+	fixture.github.details[1] = detail
+	pr := fixture.github.prDetails[77]
+	pr.HeadSHA = "next-head"
+	fixture.github.prDetails[77] = pr
+	fixture.now = fixture.now.Add(6 * time.Minute)
+	fixture.reconfigure(func(*config.Config) {})
+	fixture.runner.regenerateConflict = func(_ context.Context, input ConflictRegenerationInput) (ConflictRegenerationResult, error) {
+		calls++
+		got = input
+		return ConflictRegenerationResult{Completed: true}, nil
+	}
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() at regeneration boundary error = %v", err)
+	}
 	if calls != 1 || got.ConflictRepairs != 2 {
 		t.Fatalf("regeneration calls/input = %d/%#v, want one call at repair 2", calls, got)
-	}
-	if len(fixture.github.addedPRLabels) != 0 {
-		t.Fatalf("addedPRLabels = %#v, want no further Fixer repair at boundary", fixture.github.addedPRLabels)
 	}
 	if !containsString(fixture.github.ops, "delete-comment") {
 		t.Fatalf("ops = %v, want merge-watch marker cleanup after regeneration", fixture.github.ops)
@@ -62,7 +87,7 @@ func TestMergeWatchConflictRepairsSurviveHeadChangesAndRegenerateAtBoundary(t *t
 }
 
 func TestMergeWatchConflictEscalationRemainsDurable(t *testing.T) {
-	fixture := configureConflictWatchFixture(t, 1)
+	fixture := configureConflictWatchFixture(t, 2)
 	fixture.runner.regenerateConflict = func(_ context.Context, _ ConflictRegenerationInput) (ConflictRegenerationResult, error) {
 		return ConflictRegenerationResult{Escalated: true}, nil
 	}

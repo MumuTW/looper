@@ -3909,7 +3909,7 @@ func (r *Runner) recordPublishedReviewProgress(ctx context.Context, input stepIn
 	if err := r.appendEventChecked(ctx, eventInput{
 		eventType: "pr.review.posted", projectID: input.Project.ID, loopID: input.Loop.ID, runID: input.Run.ID,
 		entityType: "pull_request", entityID: fmt.Sprintf("%s#%d", input.Repo, input.PRNumber),
-		payload: map[string]any{"repo": input.Repo, "prNumber": input.PRNumber, "event": string(reviewEvent), "headSha": pending.HeadSHA, "markerVerified": markerVerified},
+		payload: map[string]any{"repo": input.Repo, "prNumber": input.PRNumber, "event": string(reviewEvent), "outcome": strings.TrimSpace(pending.Outcome), "headSha": pending.HeadSHA, "markerVerified": markerVerified},
 	}); err != nil {
 		return fmt.Errorf("record published review progress: append pr.review.posted: %w", err)
 	}

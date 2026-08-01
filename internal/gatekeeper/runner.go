@@ -104,6 +104,7 @@ type CodexReviewEvidence struct {
 	RequiredHeadSHA  string `json:"requiredHeadSha"`
 	ReviewedHeadSHA  string `json:"reviewedHeadSha,omitempty"`
 	Event            string `json:"event,omitempty"`
+	Outcome          string `json:"outcome,omitempty"`
 	RecordedAt       string `json:"recordedAt,omitempty"`
 	CurrentHeadValid bool   `json:"currentHeadValid"`
 }

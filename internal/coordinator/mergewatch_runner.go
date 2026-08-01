@@ -138,29 +138,34 @@ func (r *Runner) applyMergeWatchLocked(ctx context.Context, projectID, repo, cwd
 		baseMarker.NextRetryAt = nil
 		return false, r.upsertMergeWatchComment(ctx, repo, cwd, issue.detail.Number, marker, baseMarker, "")
 	case mergewatch.ActionConflict, mergewatch.ActionRedCI:
+		repairAttempt := false
 		if action.Kind == mergewatch.ActionConflict {
-			if newConflictRepairAttempt(marker, snapshot) {
-				baseMarker.ConflictRepairs++
-				maxRepairs := 2
-				if roles.Coordinator.ConflictPolicy != nil {
-					maxRepairs = roles.Coordinator.ConflictPolicy.MaxRepairs
-				}
-				if maxRepairs <= 0 {
-					// Keep zero-value RoleConfigs source-compatible for embedders and
-					// unit fixtures; validated runtime configs always carry the default.
-					maxRepairs = 2
-				}
-				if baseMarker.ConflictRepairs >= maxRepairs {
-					return r.runConflictRegeneration(ctx, projectID, repo, cwd, issue, snapshot.PRNumber, marker, baseMarker, &snapshot)
-				}
+			repairAttempt = newConflictRepairAttempt(marker, snapshot)
+			maxRepairs := 2
+			if roles.Coordinator.ConflictPolicy != nil {
+				maxRepairs = roles.Coordinator.ConflictPolicy.MaxRepairs
+			}
+			if maxRepairs <= 0 {
+				// Keep zero-value RoleConfigs source-compatible for embedders and
+				// unit fixtures; validated runtime configs always carry the default.
+				maxRepairs = 2
+			}
+			// ConflictRepairs counts repair dispatches, not the observation that
+			// follows a dispatch. Check the existing count before dispatching so a
+			// maxRepairs=2 policy gets two Fixer labels before regeneration.
+			if repairAttempt && baseMarker.ConflictRepairs >= maxRepairs {
+				return r.runConflictRegeneration(ctx, projectID, repo, cwd, issue, snapshot.PRNumber, marker, baseMarker, &snapshot)
 			}
 		}
 		fixer := config.EffectiveCodingRoles(roles)[config.CodingRoleFixer]
 		fixerLabels := namespace.RemapAll(requiredDiscoveryLabels(fixer.Discovery.Labels, fixer.Discovery.LabelMode))
-		if len(fixerLabels) > 0 {
+		if len(fixerLabels) > 0 && (action.Kind != mergewatch.ActionConflict || repairAttempt) {
 			if err := r.github.AddPullRequestLabels(ctx, githubinfra.PullRequestLabelsInput{Repo: repo, PRNumber: snapshot.PRNumber, Labels: fixerLabels, LabelNamespace: namespace, CWD: cwd}); err != nil {
 				return false, err
 			}
+		}
+		if repairAttempt {
+			baseMarker.ConflictRepairs++
 		}
 		baseMarker.FirstUnknownAt = nil
 		baseMarker.NextRetryAt = nil
