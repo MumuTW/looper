@@ -161,6 +161,11 @@ type RunInput struct {
 	Metadata           map[string]any
 	IdempotencyKey     string
 	Env                map[string]string
+	// OnBeforeTimeout runs synchronously before this execution signals its
+	// process group for an idle or max-runtime timeout. It is for daemon-owned
+	// durability observations, never for business policy or process control.
+	// Its error is reported in Result but cannot prevent termination.
+	OnBeforeTimeout func(context.Context, TimeoutObservation) error
 	// RestrictToolNetwork forces supported coding agents to keep their tool
 	// subprocesses inside the writable worktree with network access disabled.
 	// The agent process itself may still reach its model provider; the daemon
@@ -185,6 +190,13 @@ type RunInput struct {
 	SnapshotModel *string
 }
 
+// TimeoutObservation identifies the timeout that is about to terminate an
+// agent process. LastProgressAt is the executor's own observed activity time.
+type TimeoutObservation struct {
+	TimeoutType    string
+	LastProgressAt string
+}
+
 type Result struct {
 	Status                       string
 	Summary                      string
@@ -203,6 +215,7 @@ type Result struct {
 	ConfiguredMaxRuntimeSeconds  int64
 	ElapsedRuntimeSeconds        int64
 	LastProgressAt               string
+	PreTimeoutError              string
 	PID                          int
 }
 
@@ -885,6 +898,7 @@ func (x *execution) run(ctx context.Context) {
 		timeoutType     string
 		killed          bool
 		killReason      string
+		preTimeoutError string
 		graceKillTimer  <-chan time.Time
 		timeoutTimer    <-chan time.Time
 		inactivityTimer *time.Ticker
@@ -930,19 +944,46 @@ func (x *execution) run(ctx context.Context) {
 			waiting = false
 		case <-timeoutTimer:
 			timeoutTimer = nil
+			if timedOut || killed {
+				continue
+			}
 			select {
 			case waitErr = <-waitCh:
 				waiting = false
 				continue
 			default:
 			}
-			if !timedOut {
-				timedOut = true
-				timeoutType = "max_runtime"
-			}
 			if killReason == "" {
 				killReason = fmt.Sprintf("agent max runtime timed out after %s", x.timeout)
 			}
+			preTimeoutError = x.observeBeforeTimeout("max_runtime")
+			select {
+			case reason := <-x.killCh:
+				preTimeoutError = ""
+				killed = true
+				killReason = reason
+				x.setStatus("killed")
+				terminateSignal()
+				continue
+			default:
+			}
+			if runCtx.Err() != nil {
+				preTimeoutError = ""
+				killed = true
+				killReason = runCtx.Err().Error()
+				x.setStatus("killed")
+				terminateSignal()
+				continue
+			}
+			select {
+			case waitErr = <-waitCh:
+				preTimeoutError = ""
+				waiting = false
+				continue
+			default:
+			}
+			timedOut = true
+			timeoutType = "max_runtime"
 			x.setStatus("timeout")
 			terminateSignal()
 		case <-tickerChan(inactivityTimer):
@@ -958,11 +999,41 @@ func (x *execution) run(ctx context.Context) {
 			if x.timeSinceLastOutput() < x.heartbeatTimeout {
 				continue
 			}
-			timedOut = true
-			timeoutType = "idle"
 			if killReason == "" {
 				killReason = fmt.Sprintf("agent idle timed out after %s without observable progress", x.heartbeatTimeout)
 			}
+			preTimeoutError = x.observeBeforeTimeout("idle")
+			select {
+			case reason := <-x.killCh:
+				preTimeoutError = ""
+				killed = true
+				killReason = reason
+				x.setStatus("killed")
+				terminateSignal()
+				continue
+			default:
+			}
+			if runCtx.Err() != nil {
+				preTimeoutError = ""
+				killed = true
+				killReason = runCtx.Err().Error()
+				x.setStatus("killed")
+				terminateSignal()
+				continue
+			}
+			select {
+			case waitErr = <-waitCh:
+				preTimeoutError = ""
+				waiting = false
+				continue
+			default:
+			}
+			if x.timeSinceLastOutput() < x.heartbeatTimeout {
+				preTimeoutError = ""
+				continue
+			}
+			timedOut = true
+			timeoutType = "idle"
 			x.setStatus("timeout")
 			terminateSignal()
 		case reason := <-x.killCh:
@@ -1047,6 +1118,7 @@ func (x *execution) run(ctx context.Context) {
 		ConfiguredMaxRuntimeSeconds:  durationSeconds(x.timeout),
 		ElapsedRuntimeSeconds:        durationSeconds(x.executor.now().UTC().Sub(x.startedAt)),
 		LastProgressAt:               lastProgressAt,
+		PreTimeoutError:              preTimeoutError,
 		PID:                          x.leaderPID(),
 	}
 	if x.shouldFallbackNativeResume(status, stdout, stderr) {
@@ -1118,6 +1190,19 @@ func (x *execution) run(ctx context.Context) {
 	}
 
 	x.doneCh <- execOutcome{result: result, err: persistErr}
+}
+
+func (x *execution) observeBeforeTimeout(timeoutType string) string {
+	callback := x.input.OnBeforeTimeout
+	if callback == nil {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := callback(ctx, TimeoutObservation{TimeoutType: timeoutType, LastProgressAt: x.lastProgressAtISO()}); err != nil {
+		return err.Error()
+	}
+	return ""
 }
 
 func (x *execution) cleanupToolSandbox() {
@@ -1317,15 +1402,16 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 	waitCh := make(chan error, 1)
 	go func() { waitCh <- handle.Wait(context.Background()) }()
 	var (
-		waitErr        error
-		timedOut       bool
-		killed         bool
-		timeoutType    string
-		killReason     string
-		timeoutTimer   <-chan time.Time
-		graceKillTimer <-chan time.Time
-		idleTicker     *time.Ticker
-		termDelivered  bool
+		waitErr         error
+		timedOut        bool
+		killed          bool
+		timeoutType     string
+		killReason      string
+		preTimeoutError string
+		timeoutTimer    <-chan time.Time
+		graceKillTimer  <-chan time.Time
+		idleTicker      *time.Ticker
+		termDelivered   bool
 	)
 	if x.timeout > 0 {
 		timeoutTimer = time.After(x.timeout)
@@ -1360,19 +1446,78 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 			waiting = false
 		case <-timeoutTimer:
 			timeoutTimer = nil
-			if !timedOut {
-				timedOut = true
-				timeoutType = "max_runtime"
-				killReason = fmt.Sprintf("agent max runtime timed out after %s", x.timeout)
+			if timedOut || killed {
+				continue
 			}
+			select {
+			case waitErr = <-waitCh:
+				waiting = false
+				continue
+			default:
+			}
+			killReason = fmt.Sprintf("agent max runtime timed out after %s", x.timeout)
+			preTimeoutError = x.observeBeforeTimeout("max_runtime")
+			select {
+			case reason := <-x.killCh:
+				preTimeoutError = ""
+				killed = true
+				killReason = reason
+				terminate()
+				continue
+			default:
+			}
+			if ctx.Err() != nil {
+				preTimeoutError = ""
+				killed = true
+				killReason = ctx.Err().Error()
+				terminate()
+				continue
+			}
+			select {
+			case waitErr = <-waitCh:
+				preTimeoutError = ""
+				waiting = false
+				continue
+			default:
+			}
+			timedOut = true
+			timeoutType = "max_runtime"
 			terminate()
 		case <-tickerChan(idleTicker):
 			if timedOut || killed || x.timeSinceLastOutput() < x.heartbeatTimeout {
 				continue
 			}
+			killReason = fmt.Sprintf("agent idle timed out after %s without observable progress", x.heartbeatTimeout)
+			preTimeoutError = x.observeBeforeTimeout("idle")
+			select {
+			case reason := <-x.killCh:
+				preTimeoutError = ""
+				killed = true
+				killReason = reason
+				terminate()
+				continue
+			default:
+			}
+			if ctx.Err() != nil {
+				preTimeoutError = ""
+				killed = true
+				killReason = ctx.Err().Error()
+				terminate()
+				continue
+			}
+			select {
+			case waitErr = <-waitCh:
+				preTimeoutError = ""
+				waiting = false
+				continue
+			default:
+			}
+			if x.timeSinceLastOutput() < x.heartbeatTimeout {
+				preTimeoutError = ""
+				continue
+			}
 			timedOut = true
 			timeoutType = "idle"
-			killReason = fmt.Sprintf("agent idle timed out after %s without observable progress", x.heartbeatTimeout)
 			terminate()
 		case reason := <-x.killCh:
 			killed = true
@@ -1455,6 +1600,7 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 		ConfiguredMaxRuntimeSeconds:  durationSeconds(x.timeout),
 		ElapsedRuntimeSeconds:        durationSeconds(x.executor.now().UTC().Sub(x.startedAt)),
 		LastProgressAt:               x.lastProgressAtISO(),
+		PreTimeoutError:              preTimeoutError,
 		PID:                          x.leaderPID(),
 	}, errorMessage, true, nil
 }

@@ -3,6 +3,7 @@ package git
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -12,6 +13,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -91,10 +93,20 @@ type InspectHeadInput struct {
 }
 
 type InspectHeadResult struct {
-	HeadSHA               string
+	HeadSHA string
+	// Branch is the attached branch name, or "HEAD" when detached.
+	Branch                string
 	NewCommitSHAs         []string
 	HasUncommittedChanges bool
 	ChangedFiles          []string
+	// StagedFiles lists paths with non-space index status (including renames
+	// as the destination path only).
+	StagedFiles []string
+	// UntrackedFiles lists paths with ?? status.
+	UntrackedFiles []string
+	// DiffFingerprint fingerprints porcelain status codes and paths only (not
+	// file contents), so content-only edits of untracked files stay stable.
+	DiffFingerprint string
 }
 
 type VerifyWorktreeIdentityInput struct {
@@ -834,6 +846,13 @@ func (g *Gateway) InspectHead(ctx context.Context, input InspectHeadInput) (Insp
 	if err != nil {
 		return InspectHeadResult{}, err
 	}
+	branch, err := g.getCurrentBranch(ctx, input.WorktreePath)
+	if err != nil {
+		return InspectHeadResult{}, err
+	}
+	if branch == "" {
+		branch = "HEAD"
+	}
 
 	newCommitSHAs := []string{}
 	if input.BaseRef != "" {
@@ -843,21 +862,46 @@ func (g *Gateway) InspectHead(ctx context.Context, input InspectHeadInput) (Insp
 		}
 	}
 
-	status, err := g.readStatus(ctx, input.WorktreePath)
+	statusResult, err := g.runGitResult(ctx, input.WorktreePath, nil, "status", "--porcelain", "--untracked-files=all", "--ignored=no")
+	if err != nil {
+		return InspectHeadResult{}, err
+	}
+	status, err := parseStatusResult(statusResult)
 	if err != nil {
 		return InspectHeadResult{}, err
 	}
 
 	changedFiles := make([]string, 0, len(status))
+	stagedFiles := make([]string, 0)
+	untrackedFiles := make([]string, 0)
+	fingerprintParts := make([]string, 0, len(status))
 	for _, entry := range status {
 		changedFiles = append(changedFiles, entry.Path)
+		fingerprintParts = append(fingerprintParts, entry.Code+"\t"+entry.Path)
+		if entry.Code == "??" {
+			untrackedFiles = append(untrackedFiles, entry.Path)
+			continue
+		}
+		// Index column non-space means staged (including rename/copy).
+		if len(entry.Code) > 0 && entry.Code[0] != ' ' && entry.Code[0] != '?' {
+			stagedFiles = append(stagedFiles, entry.Path)
+		}
+	}
+	diffFingerprint := ""
+	if len(fingerprintParts) > 0 {
+		sum := sha256.Sum256([]byte(strings.Join(fingerprintParts, "\n")))
+		diffFingerprint = hex.EncodeToString(sum[:])
 	}
 
 	return InspectHeadResult{
 		HeadSHA:               headSHA,
+		Branch:                branch,
 		NewCommitSHAs:         newCommitSHAs,
 		HasUncommittedChanges: len(status) > 0,
 		ChangedFiles:          changedFiles,
+		StagedFiles:           stagedFiles,
+		UntrackedFiles:        untrackedFiles,
+		DiffFingerprint:       diffFingerprint,
 	}, nil
 }
 
@@ -1479,7 +1523,15 @@ func (g *Gateway) readStatus(ctx context.Context, repoPath string) ([]statusEntr
 	if err != nil {
 		return nil, err
 	}
+	return parseStatusResult(result)
+}
 
+// parseStatusResult parses porcelain status output. Truncated captures fail
+// closed so timeout-progress fingerprints cannot silently drop dirt.
+func parseStatusResult(result shell.Result) ([]statusEntry, error) {
+	if result.StdoutTruncated {
+		return nil, fmt.Errorf("git status output exceeded capture limit")
+	}
 	entries := []statusEntry{}
 	for _, line := range strings.Split(result.Stdout, "\n") {
 		line = strings.TrimRight(line, "\r")
@@ -1493,6 +1545,16 @@ func (g *Gateway) readStatus(ctx context.Context, repoPath string) ([]statusEntr
 			continue
 		}
 		code, path := line[:2], strings.TrimSpace(line[3:])
+		// Renames/copies: "R  old -> new" — keep the destination path only.
+		if idx := strings.Index(path, " -> "); idx >= 0 {
+			path = strings.TrimSpace(path[idx+4:])
+		}
+		// Quoted paths from git for special characters.
+		if len(path) >= 2 && path[0] == '"' && path[len(path)-1] == '"' {
+			if unquoted, err := strconv.Unquote(path); err == nil {
+				path = unquoted
+			}
+		}
 		if code == "??" && isArtifactExcludedUntrackedPath(path) {
 			// Untracked build artifacts are invisible to looper's dirt
 			// decisions, mirroring the staging exclusion in Commit.

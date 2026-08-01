@@ -1611,7 +1611,7 @@ func (a workerGitAdapter) InspectHead(ctx context.Context, input worker.InspectH
 	if err != nil {
 		return worker.InspectHeadResult{}, err
 	}
-	return worker.InspectHeadResult{HeadSHA: result.HeadSHA, NewCommitSHAs: result.NewCommitSHAs, HasUncommittedChanges: result.HasUncommittedChanges, ChangedFiles: result.ChangedFiles}, nil
+	return worker.InspectHeadResult{HeadSHA: result.HeadSHA, Branch: result.Branch, NewCommitSHAs: result.NewCommitSHAs, HasUncommittedChanges: result.HasUncommittedChanges, ChangedFiles: result.ChangedFiles, StagedFiles: result.StagedFiles, UntrackedFiles: result.UntrackedFiles, DiffFingerprint: result.DiffFingerprint}, nil
 }
 
 func (a workerGitAdapter) VerifyWorktreeIdentity(ctx context.Context, input worker.VerifyWorktreeIdentityInput) error {
@@ -1654,6 +1654,7 @@ func (a workerAgentExecutorAdapter) Start(ctx context.Context, input worker.Agen
 		WorkingDirectory: input.WorkingDirectory, Timeout: input.Timeout, HeartbeatTimeout: input.HeartbeatTimeout,
 		Metadata: input.Metadata, IdempotencyKey: input.IdempotencyKey,
 		RestrictToolNetwork: input.RestrictToolNetwork,
+		OnBeforeTimeout:     input.OnBeforeTimeout,
 		UseSnapshot:         input.UseSnapshot, SnapshotVendor: input.SnapshotVendor, SnapshotModel: input.SnapshotModel,
 	})
 	if err != nil {
@@ -1667,7 +1668,7 @@ func (a workerAgentExecutionAdapter) Wait(ctx context.Context) (worker.AgentResu
 	if err != nil {
 		return worker.AgentResult{}, err
 	}
-	return worker.AgentResult{Status: result.Status, Summary: result.Summary, Stdout: result.Stdout, Stderr: result.Stderr, ParseStatus: result.ParseStatus, ChangedFiles: result.ChangedFiles, Commits: result.Commits, Lifecycle: result.Lifecycle, TimeoutType: result.TimeoutType, ConfiguredIdleTimeoutSeconds: result.ConfiguredIdleTimeoutSeconds, ConfiguredMaxRuntimeSeconds: result.ConfiguredMaxRuntimeSeconds, ElapsedRuntimeSeconds: result.ElapsedRuntimeSeconds, LastProgressAt: result.LastProgressAt}, nil
+	return worker.AgentResult{Status: result.Status, Summary: result.Summary, Stdout: result.Stdout, Stderr: result.Stderr, ParseStatus: result.ParseStatus, ChangedFiles: result.ChangedFiles, Commits: result.Commits, Lifecycle: result.Lifecycle, TimeoutType: result.TimeoutType, ConfiguredIdleTimeoutSeconds: result.ConfiguredIdleTimeoutSeconds, ConfiguredMaxRuntimeSeconds: result.ConfiguredMaxRuntimeSeconds, ElapsedRuntimeSeconds: result.ElapsedRuntimeSeconds, LastProgressAt: result.LastProgressAt, PreTimeoutError: result.PreTimeoutError}, nil
 }
 
 func (a workerAgentExecutionAdapter) Kill(reason string) error {
