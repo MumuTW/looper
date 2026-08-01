@@ -1,12 +1,16 @@
 package agent
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func outcomeExecution(sink *[]Outcome) *execution {
 	executor := &ConfiguredExecutor{onOutcome: func(o Outcome) { *sink = append(*sink, o) }}
 	return &execution{
 		executor:    executor,
 		executionID: "exec_1",
+		startedAt:   time.Date(2026, 8, 1, 22, 0, 0, 0, time.UTC),
 		input:       RunInput{ProjectID: "proj", LoopID: "loop_1", RunID: "run_1"},
 	}
 }
@@ -47,6 +51,11 @@ func TestReportOutcomeMapsTerminalStatus(t *testing.T) {
 			got := outcomes[0]
 			if got.Succeeded != tt.wantSucceeded {
 				t.Fatalf("status %q Succeeded = %v, want %v", tt.status, got.Succeeded, tt.wantSucceeded)
+			}
+			// The health gate needs this to tell a probe from a long-running
+			// execution admitted before the gate opened.
+			if got.StartedAt.IsZero() {
+				t.Fatalf("outcome carried no StartedAt: %+v", got)
 			}
 			if got.Status != tt.status || got.LoopID != "loop_1" || got.RunID != "run_1" || got.ExecutionID != "exec_1" || got.ProjectID != "proj" {
 				t.Fatalf("outcome identity not carried through: %+v", got)

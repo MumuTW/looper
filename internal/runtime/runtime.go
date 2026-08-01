@@ -358,7 +358,7 @@ func New(options Options) *Runtime {
 	// input it has: looper does not read provider status pages or parse their
 	// rate-limit messages, it counts its own results.
 	rt.activeExecutions.SetOnAgentOutcome(func(outcome agent.Outcome) {
-		rt.agentHealth.Record(outcome.Succeeded)
+		rt.agentHealth.Record(outcome.StartedAt, outcome.Succeeded)
 	})
 	// Project daemon Admission onto agent spawn leases so cmd.Start is refused
 	// while starting/stopping/degraded (#576 + #575).
@@ -710,13 +710,25 @@ func (r *Runtime) AllowMutations() error {
 // fresh queue items for loops that were just paused, which is how a tripped
 // per-loop breaker ended up producing new runs every few seconds (#533).
 func (r *Runtime) AllowClaim() error {
-	if r == nil || r.admission == nil {
-		return ErrAdmissionStopping
-	}
-	if err := r.admission.AllowClaim(); err != nil {
+	if err := r.AllowLifecycleWork(); err != nil {
 		return err
 	}
 	return r.agentHealth.Allow()
+}
+
+// AllowLifecycleWork is claim admission without the agent-health gate, for work
+// that consumes no agent call. Worktree cleanup is the case that matters: a
+// provider outage is exactly when worktree debt accumulates, because every
+// attempt prepares a worktree before failing at the agent step, so suspending
+// cleanup for the whole backoff would preserve the disk growth the gate is
+// meant to stop. It stays on AllowClaim's admission authority rather than
+// AllowMutations so cleanup keeps the #580 invariant of not running while
+// starting, degraded, or stopping.
+func (r *Runtime) AllowLifecycleWork() error {
+	if r == nil || r.admission == nil {
+		return ErrAdmissionStopping
+	}
+	return r.admission.AllowClaim()
 }
 
 // AgentHealth reports the agent-health gate's posture for status endpoints.
@@ -828,7 +840,11 @@ func (r *Runtime) notifyAgentBrownout(level, title, subtitle, body, dedupeSuffix
 	}()
 }
 
-const agentBrownoutNotificationTimeout = 5 * time.Second
+// agentBrownoutNotificationTimeout bounds one best-effort transition alert. It
+// exceeds the osascript transport's own 35s timeout so a slow-but-working local
+// notifier still delivers; shutdown does not pay for it, because Stop cancels
+// the notification context before waiting on the drain.
+const agentBrownoutNotificationTimeout = 45 * time.Second
 
 func (r *Runtime) stopAgentBrownoutNotifications() {
 	if r == nil {
@@ -852,6 +868,15 @@ func (r *Runtime) stopAgentBrownoutNotifications() {
 func (r *Runtime) WithAllowClaim(fn func()) error {
 	if r == nil || r.admission == nil {
 		return ErrAdmissionStopping
+	}
+	// Webhook acceptance spends agent budget downstream, so it sees the health
+	// gate too. Checked before the critical section rather than under
+	// admission.mu: the two locks protect different things, and nesting them
+	// would order agent-outcome recording behind admission. The residual window
+	// is one accept already in flight when the gate opens, which enqueues an
+	// item the scheduler then refuses to claim — a delay, not a spend.
+	if err := r.agentHealth.Allow(); err != nil {
+		return err
 	}
 	return r.admission.WithAllowWork(fn)
 }

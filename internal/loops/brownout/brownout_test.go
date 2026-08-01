@@ -35,9 +35,9 @@ func newTestBreaker(t *testing.T, cfg Config) (*Breaker, *clock, *[]Transition) 
 func TestDisabledBreakerNeverRefuses(t *testing.T) {
 	cfg := testConfig()
 	cfg.Enabled = false
-	b, _, _ := newTestBreaker(t, cfg)
+	b, c, _ := newTestBreaker(t, cfg)
 	for i := 0; i < 100; i++ {
-		b.Record(false)
+		b.Record(c.now(), false)
 	}
 	if err := b.Allow(); err != nil {
 		t.Fatalf("disabled breaker refused work: %v", err)
@@ -45,16 +45,16 @@ func TestDisabledBreakerNeverRefuses(t *testing.T) {
 }
 
 func TestTripsOnSustainedFailureRate(t *testing.T) {
-	b, _, transitions := newTestBreaker(t, testConfig())
+	b, c, transitions := newTestBreaker(t, testConfig())
 	if err := b.Allow(); err != nil {
 		t.Fatalf("healthy breaker refused work: %v", err)
 	}
-	b.Record(false)
-	b.Record(false)
+	b.Record(c.now(), false)
+	b.Record(c.now(), false)
 	if err := b.Allow(); err != nil {
 		t.Fatalf("breaker opened below MinFailures: %v", err)
 	}
-	b.Record(false)
+	b.Record(c.now(), false)
 	err := b.Allow()
 	if !errors.Is(err, ErrOpen) {
 		t.Fatalf("breaker did not open after sustained failures: %v", err)
@@ -70,13 +70,13 @@ func TestTripsOnSustainedFailureRate(t *testing.T) {
 // A mostly-healthy daemon that fails occasionally must keep working. This is
 // what makes the gate safe to enable by default: it is a rate, not a count.
 func TestDoesNotTripWhenFailuresAreDilutedBySuccess(t *testing.T) {
-	b, _, _ := newTestBreaker(t, testConfig())
+	b, c, _ := newTestBreaker(t, testConfig())
 	for i := 0; i < 10; i++ {
-		b.Record(true)
+		b.Record(c.now(), true)
 	}
-	b.Record(false)
-	b.Record(false)
-	b.Record(false)
+	b.Record(c.now(), false)
+	b.Record(c.now(), false)
+	b.Record(c.now(), false)
 	if err := b.Allow(); err != nil {
 		t.Fatalf("breaker opened on a 3/13 failure rate: %v", err)
 	}
@@ -84,10 +84,10 @@ func TestDoesNotTripWhenFailuresAreDilutedBySuccess(t *testing.T) {
 
 func TestStaleFailuresLeaveTheWindow(t *testing.T) {
 	b, c, _ := newTestBreaker(t, testConfig())
-	b.Record(false)
-	b.Record(false)
+	b.Record(c.now(), false)
+	b.Record(c.now(), false)
 	c.add(6 * time.Minute)
-	b.Record(false)
+	b.Record(c.now(), false)
 	if err := b.Allow(); err != nil {
 		t.Fatalf("breaker counted failures older than the window: %v", err)
 	}
@@ -95,9 +95,9 @@ func TestStaleFailuresLeaveTheWindow(t *testing.T) {
 
 func TestCooldownElapsesIntoHalfOpenThenCloses(t *testing.T) {
 	b, c, transitions := newTestBreaker(t, testConfig())
-	b.Record(false)
-	b.Record(false)
-	b.Record(false)
+	b.Record(c.now(), false)
+	b.Record(c.now(), false)
+	b.Record(c.now(), false)
 	if !errors.Is(b.Allow(), ErrOpen) {
 		t.Fatal("expected breaker to be open")
 	}
@@ -115,7 +115,7 @@ func TestCooldownElapsesIntoHalfOpenThenCloses(t *testing.T) {
 		t.Fatalf("expected half_open after cooldown, got %s", got)
 	}
 
-	b.Record(true)
+	b.Record(c.now(), true)
 	if got := b.Snapshot().State; got != StateClosed {
 		t.Fatalf("expected closed after a successful probe, got %s", got)
 	}
@@ -127,15 +127,15 @@ func TestCooldownElapsesIntoHalfOpenThenCloses(t *testing.T) {
 
 func TestFailedProbeReopensWithDoubledCooldown(t *testing.T) {
 	b, c, _ := newTestBreaker(t, testConfig())
-	b.Record(false)
-	b.Record(false)
-	b.Record(false)
+	b.Record(c.now(), false)
+	b.Record(c.now(), false)
+	b.Record(c.now(), false)
 
 	c.add(10 * time.Minute)
 	if err := b.Allow(); err != nil {
 		t.Fatalf("expected half_open: %v", err)
 	}
-	b.Record(false)
+	b.Record(c.now(), false)
 
 	snapshot := b.Snapshot()
 	if snapshot.State != StateOpen {
@@ -158,15 +158,15 @@ func TestFailedProbeReopensWithDoubledCooldown(t *testing.T) {
 
 func TestCooldownIsCappedAtMax(t *testing.T) {
 	b, c, _ := newTestBreaker(t, testConfig())
-	b.Record(false)
-	b.Record(false)
-	b.Record(false)
+	b.Record(c.now(), false)
+	b.Record(c.now(), false)
+	b.Record(c.now(), false)
 	for i := 0; i < 6; i++ {
 		c.add(b.Snapshot().Cooldown)
 		if err := b.Allow(); err != nil {
 			t.Fatalf("round %d: expected half_open: %v", i, err)
 		}
-		b.Record(false)
+		b.Record(c.now(), false)
 	}
 	if got := b.Snapshot().Cooldown; got != 40*time.Minute {
 		t.Fatalf("cooldown grew past MaxCooldown: %s", got)
@@ -175,16 +175,16 @@ func TestCooldownIsCappedAtMax(t *testing.T) {
 
 func TestRecoveryResetsCooldownToConfigured(t *testing.T) {
 	b, c, _ := newTestBreaker(t, testConfig())
-	b.Record(false)
-	b.Record(false)
-	b.Record(false)
+	b.Record(c.now(), false)
+	b.Record(c.now(), false)
+	b.Record(c.now(), false)
 	c.add(10 * time.Minute)
 	_ = b.Allow()
-	b.Record(false) // cooldown -> 20m
+	b.Record(c.now(), false) // cooldown -> 20m
 
 	c.add(20 * time.Minute)
 	_ = b.Allow()
-	b.Record(true)
+	b.Record(c.now(), true)
 
 	if got := b.Snapshot().Cooldown; got != 10*time.Minute {
 		t.Fatalf("recovery left the cooldown backed off at %s", got)
@@ -198,7 +198,7 @@ func TestRecoveryResetsCooldownToConfigured(t *testing.T) {
 func TestHalfOpenDoesNotInheritTheTrippingWindow(t *testing.T) {
 	b, c, _ := newTestBreaker(t, testConfig())
 	for i := 0; i < 20; i++ {
-		b.Record(false)
+		b.Record(c.now(), false)
 	}
 	c.add(10 * time.Minute)
 	if err := b.Allow(); err != nil {
@@ -214,30 +214,30 @@ func TestMultipleProbeSuccessesRequired(t *testing.T) {
 	cfg := testConfig()
 	cfg.ProbeSuccesses = 2
 	b, c, _ := newTestBreaker(t, cfg)
-	b.Record(false)
-	b.Record(false)
-	b.Record(false)
+	b.Record(c.now(), false)
+	b.Record(c.now(), false)
+	b.Record(c.now(), false)
 	c.add(10 * time.Minute)
 	_ = b.Allow()
 
-	b.Record(true)
+	b.Record(c.now(), true)
 	if got := b.Snapshot().State; got != StateHalfOpen {
 		t.Fatalf("closed after one probe when two were required, got %s", got)
 	}
-	b.Record(true)
+	b.Record(c.now(), true)
 	if got := b.Snapshot().State; got != StateClosed {
 		t.Fatalf("expected closed after two probes, got %s", got)
 	}
 }
 
 func TestSnapshotReportsOpenUntilAndTrips(t *testing.T) {
-	b, _, _ := newTestBreaker(t, testConfig())
+	b, c, _ := newTestBreaker(t, testConfig())
 	if snapshot := b.Snapshot(); snapshot.OpenUntil != nil {
 		t.Fatalf("closed breaker reported openUntil %v", snapshot.OpenUntil)
 	}
-	b.Record(false)
-	b.Record(false)
-	b.Record(false)
+	b.Record(c.now(), false)
+	b.Record(c.now(), false)
+	b.Record(c.now(), false)
 	snapshot := b.Snapshot()
 	if snapshot.OpenUntil == nil {
 		t.Fatal("open breaker did not report openUntil")
@@ -249,9 +249,9 @@ func TestSnapshotReportsOpenUntilAndTrips(t *testing.T) {
 
 func TestSnapshotReportsHalfOpenWhenCooldownElapsed(t *testing.T) {
 	b, c, _ := newTestBreaker(t, testConfig())
-	b.Record(false)
-	b.Record(false)
-	b.Record(false)
+	b.Record(c.now(), false)
+	b.Record(c.now(), false)
+	b.Record(c.now(), false)
 	if got := b.Snapshot().State; got != StateOpen {
 		t.Fatalf("state = %s, want open", got)
 	}
@@ -275,10 +275,10 @@ func TestSnapshotReportsHalfOpenWhenCooldownElapsed(t *testing.T) {
 }
 
 func TestSetConfigPreservesOpenStateAndClampsCooldown(t *testing.T) {
-	b, _, _ := newTestBreaker(t, testConfig())
-	b.Record(false)
-	b.Record(false)
-	b.Record(false)
+	b, c, _ := newTestBreaker(t, testConfig())
+	b.Record(c.now(), false)
+	b.Record(c.now(), false)
+	b.Record(c.now(), false)
 	if !errors.Is(b.Allow(), ErrOpen) {
 		t.Fatal("expected breaker to be open")
 	}
@@ -299,10 +299,10 @@ func TestSetConfigPreservesOpenStateAndClampsCooldown(t *testing.T) {
 }
 
 func TestSetConfigDisableResetsEvaluationState(t *testing.T) {
-	b, _, _ := newTestBreaker(t, testConfig())
-	b.Record(false)
-	b.Record(false)
-	b.Record(false)
+	b, c, _ := newTestBreaker(t, testConfig())
+	b.Record(c.now(), false)
+	b.Record(c.now(), false)
+	b.Record(c.now(), false)
 	if !errors.Is(b.Allow(), ErrOpen) {
 		t.Fatal("expected breaker to be open")
 	}
@@ -327,7 +327,7 @@ func TestConcurrentUseAndConfigReloadIsRaceFree(t *testing.T) {
 			defer wg.Done()
 			for j := 0; j < 1000; j++ {
 				if worker%2 == 0 {
-					b.Record(j%3 != 0)
+					b.Record(time.Now(), j%3 != 0)
 				} else {
 					_ = b.Allow()
 					_ = b.Snapshot()
@@ -353,8 +353,56 @@ func TestNilBreakerIsInert(t *testing.T) {
 	if err := b.Allow(); err != nil {
 		t.Fatalf("nil breaker refused work: %v", err)
 	}
-	b.Record(false)
+	b.Record(time.Now(), false)
 	if got := b.Snapshot().State; got != StateClosed {
 		t.Fatalf("nil breaker reported %s", got)
+	}
+}
+
+// A worker admitted before the gate opened can outlive the cooldown. Its result
+// says nothing about whether the provider recovered, so it must not decide the
+// probe in either direction.
+func TestOutcomesOlderThanHalfOpenAreNotProbes(t *testing.T) {
+	b, c, _ := newTestBreaker(t, testConfig())
+	admittedBeforeOpen := c.now()
+	b.Record(c.now(), false)
+	b.Record(c.now(), false)
+	b.Record(c.now(), false)
+	if !errors.Is(b.Allow(), ErrOpen) {
+		t.Fatal("expected the gate to be open")
+	}
+
+	c.add(10 * time.Minute)
+	if err := b.Allow(); err != nil {
+		t.Fatalf("expected half_open: %v", err)
+	}
+
+	b.Record(admittedBeforeOpen, true)
+	if got := b.Snapshot().State; got != StateHalfOpen {
+		t.Fatalf("a pre-open execution closed the gate without testing the provider; state = %s", got)
+	}
+
+	b.Record(admittedBeforeOpen, false)
+	if got := b.Snapshot().State; got != StateHalfOpen {
+		t.Fatalf("a pre-open execution reopened the gate and doubled the cooldown; state = %s", got)
+	}
+
+	b.Record(c.now(), true)
+	if got := b.Snapshot().State; got != StateClosed {
+		t.Fatalf("a genuine probe did not close the gate; state = %s", got)
+	}
+}
+
+func TestUnattributedOutcomesAreNotProbes(t *testing.T) {
+	b, c, _ := newTestBreaker(t, testConfig())
+	b.Record(c.now(), false)
+	b.Record(c.now(), false)
+	b.Record(c.now(), false)
+	c.add(10 * time.Minute)
+	_ = b.Allow()
+
+	b.Record(time.Time{}, true)
+	if got := b.Snapshot().State; got != StateHalfOpen {
+		t.Fatalf("an outcome with no start time was treated as a probe; state = %s", got)
 	}
 }

@@ -111,6 +111,12 @@ type Breaker struct {
 	probeSuccesses int
 	// trips counts open transitions for the lifetime of the process.
 	trips int
+	// halfOpenAt is when the current half-open period began. Outcomes from
+	// executions that started before it are not probes: a worker admitted
+	// before the gate opened can outlive a 15-minute cooldown, and letting its
+	// result decide recovery would close the gate without ever testing whether
+	// the provider recovered.
+	halfOpenAt time.Time
 	// tripFailures and tripTotal retain the evidence that opened the current
 	// outage. The rolling window is cleared on open so it cannot re-trip from
 	// stale failures, but status surfaces still need to explain why the gate is
@@ -161,7 +167,7 @@ func (b *Breaker) Allow() error {
 // Record observes one agent outcome. Callers pass only outcomes attributable to
 // the agent boundary; a failed git push or a rejected policy check is looper's
 // own problem and must not open a gate meant for provider trouble.
-func (b *Breaker) Record(ok bool) {
+func (b *Breaker) Record(startedAt time.Time, ok bool) {
 	if b == nil {
 		return
 	}
@@ -174,7 +180,7 @@ func (b *Breaker) Record(ok bool) {
 	b.outcomes = append(b.outcomes, outcome{at: now, ok: ok})
 	b.pruneLocked(now)
 
-	transition, changed := b.evaluateLocked(now, ok)
+	transition, changed := b.evaluateLocked(now, startedAt, ok)
 	b.mu.Unlock()
 
 	if changed {
@@ -258,6 +264,7 @@ func (b *Breaker) refreshLocked() (Transition, bool) {
 	}
 	b.state = StateHalfOpen
 	b.probeSuccesses = 0
+	b.halfOpenAt = now
 	// Drop the window that tripped the breaker. Keeping it would let stale
 	// failures re-trip the breaker on the first probe before any new outcome
 	// has been observed, which would make the cooldown unobservable.
@@ -265,9 +272,15 @@ func (b *Breaker) refreshLocked() (Transition, bool) {
 	return Transition{From: StateOpen, To: StateHalfOpen, Reason: "cooldown_elapsed"}, true
 }
 
-func (b *Breaker) evaluateLocked(now time.Time, ok bool) (Transition, bool) {
+func (b *Breaker) evaluateLocked(now time.Time, startedAt time.Time, ok bool) (Transition, bool) {
 	switch b.state {
 	case StateHalfOpen:
+		// Only executions admitted during this half-open period are probes. A
+		// zero startedAt means the caller could not attribute it, which counts
+		// as "not a probe" rather than being guessed at.
+		if startedAt.IsZero() || startedAt.Before(b.halfOpenAt) {
+			return Transition{}, false
+		}
 		if !ok {
 			// One failed probe is enough: the whole point of half-open is to
 			// spend a single round of calls, not to re-derive the failure rate.

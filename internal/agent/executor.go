@@ -157,6 +157,9 @@ type Outcome struct {
 	// failure here: an agent that hangs and one that is refused both mean work
 	// is not getting done, and both are worth backing off from.
 	Succeeded bool
+	// StartedAt is when this execution was admitted. A health gate needs it to
+	// tell a probe it admitted from a long-running execution that predates it.
+	StartedAt time.Time
 }
 
 // ProgressUpdate is a throttled snapshot of a running agent's activity: the last
@@ -1272,6 +1275,7 @@ func (x *execution) reportOutcome(status, parseStatus string) {
 		// malformed output must feed the health gate as a failure so brownout
 		// backs off from agents that exit cleanly without doing the work contract.
 		Succeeded: status == "completed" && parseStatus == "parsed",
+		StartedAt: x.startedAt,
 	})
 }
 func (x *execution) observeBeforeTimeout(timeoutType string) string {

@@ -52,10 +52,16 @@ func brownoutRuntime(t *testing.T, mutate func(*config.AgentBrownoutConfig)) (*R
 	return rt, clock
 }
 
-func failAgent(rt *Runtime, times int) {
+// Outcomes carry StartedAt because the breaker only treats executions admitted
+// during the current half-open period as probes.
+func failAgent(rt *Runtime, clock *testClock, times int) {
 	for i := 0; i < times; i++ {
-		rt.activeExecutions.ReportAgentOutcome(agent.Outcome{Status: "failed"})
+		rt.activeExecutions.ReportAgentOutcome(agent.Outcome{Status: "failed", StartedAt: clock.now()})
 	}
+}
+
+func succeedAgent(rt *Runtime, clock *testClock) {
+	rt.activeExecutions.ReportAgentOutcome(agent.Outcome{Status: "completed", Succeeded: true, StartedAt: clock.now()})
 }
 
 // The incident this gate exists for: agent runs failing over and over while the
@@ -63,12 +69,12 @@ func failAgent(rt *Runtime, times int) {
 // work-producing tick passes through, so closing it there stops discovery too —
 // not only claims.
 func TestRepeatedAgentFailuresCloseClaimAdmission(t *testing.T) {
-	rt, _ := brownoutRuntime(t, nil)
+	rt, clock := brownoutRuntime(t, nil)
 
 	if err := rt.AllowClaim(); err != nil {
 		t.Fatalf("healthy runtime refused claims: %v", err)
 	}
-	failAgent(rt, 3)
+	failAgent(rt, clock, 3)
 
 	err := rt.AllowClaim()
 	if !errors.Is(err, brownout.ErrOpen) {
@@ -98,11 +104,11 @@ func TestWorktreeCleanupContinuesDuringAgentBrownout(t *testing.T) {
 // An agent looper killed says nothing about the provider. Counting those would
 // let an operator stop or a shutdown drain trip the gate.
 func TestKilledAgentsDoNotCountAsFailures(t *testing.T) {
-	rt, _ := brownoutRuntime(t, nil)
+	rt, clock := brownoutRuntime(t, nil)
 	for i := 0; i < 10; i++ {
 		// The executor filters "killed" before it reaches the registry; assert
 		// the daemon-side contract by reporting only what it forwards.
-		rt.activeExecutions.ReportAgentOutcome(agent.Outcome{Status: "completed", Succeeded: true})
+		succeedAgent(rt, clock)
 	}
 	if err := rt.AllowClaim(); err != nil {
 		t.Fatalf("successful agents closed admission: %v", err)
@@ -111,7 +117,7 @@ func TestKilledAgentsDoNotCountAsFailures(t *testing.T) {
 
 func TestAgentBrownoutReopensAfterConfiguredCooldown(t *testing.T) {
 	rt, clock := brownoutRuntime(t, nil)
-	failAgent(rt, 3)
+	failAgent(rt, clock, 3)
 	if !errors.Is(rt.AllowClaim(), brownout.ErrOpen) {
 		t.Fatal("expected the gate to be open")
 	}
@@ -129,7 +135,7 @@ func TestAgentBrownoutReopensAfterConfiguredCooldown(t *testing.T) {
 		t.Fatalf("AgentHealth() state = %s, want half_open", got)
 	}
 
-	rt.activeExecutions.ReportAgentOutcome(agent.Outcome{Status: "completed", Succeeded: true})
+	succeedAgent(rt, clock)
 	if got := rt.AgentHealth().State; got != brownout.StateClosed {
 		t.Fatalf("AgentHealth() state = %s, want closed after a successful probe", got)
 	}
@@ -141,8 +147,8 @@ func TestAgentBrownoutReopensAfterConfiguredCooldown(t *testing.T) {
 // Admission is the stronger authority: a stopping daemon must report stopping,
 // not a brownout an operator might wait out.
 func TestAdmissionOutranksAgentBrownout(t *testing.T) {
-	rt, _ := brownoutRuntime(t, nil)
-	failAgent(rt, 3)
+	rt, clock := brownoutRuntime(t, nil)
+	failAgent(rt, clock, 3)
 	if err := rt.admission.BeginShutdown("test"); err != nil {
 		t.Fatalf("BeginShutdown() error = %v", err)
 	}
@@ -156,8 +162,8 @@ func TestAdmissionOutranksAgentBrownout(t *testing.T) {
 }
 
 func TestDisablingAgentBrownoutReleasesTheGate(t *testing.T) {
-	rt, _ := brownoutRuntime(t, nil)
-	failAgent(rt, 3)
+	rt, clock := brownoutRuntime(t, nil)
+	failAgent(rt, clock, 3)
 	if !errors.Is(rt.AllowClaim(), brownout.ErrOpen) {
 		t.Fatal("expected the gate to be open")
 	}
@@ -175,8 +181,8 @@ func TestDisablingAgentBrownoutReleasesTheGate(t *testing.T) {
 // silently cleared the open gate would turn "let me lengthen the cooldown" into
 // "start failing again immediately".
 func TestConfigReloadDoesNotClearAnOpenGate(t *testing.T) {
-	rt, _ := brownoutRuntime(t, nil)
-	failAgent(rt, 3)
+	rt, clock := brownoutRuntime(t, nil)
+	failAgent(rt, clock, 3)
 	if !errors.Is(rt.AllowClaim(), brownout.ErrOpen) {
 		t.Fatal("expected the gate to be open")
 	}
@@ -191,10 +197,10 @@ func TestConfigReloadDoesNotClearAnOpenGate(t *testing.T) {
 }
 
 func TestAgentBrownoutTransitionsAreLogged(t *testing.T) {
-	rt, _ := brownoutRuntime(t, nil)
+	rt, clock := brownoutRuntime(t, nil)
 	logger := &recordingLogger{}
 	rt.logger = logger
-	failAgent(rt, 3)
+	failAgent(rt, clock, 3)
 
 	if !logger.sawWarn("agent brownout opened: work production suspended") {
 		t.Fatalf("no warning logged when work production stopped; logged: %v", logger.messages())
@@ -241,4 +247,47 @@ func (l *recordingLogger) messages() []string {
 		out = append(out, entry.level+": "+entry.message)
 	}
 	return out
+}
+
+// A provider outage is exactly when worktree debt accumulates: every attempt
+// prepares a worktree before failing at the agent step. Suspending cleanup for
+// the whole backoff would preserve the disk growth that made the incident
+// visible in the first place.
+func TestWorktreeCleanupIsNotHeldBackByTheBrownoutGate(t *testing.T) {
+	rt, clock := brownoutRuntime(t, nil)
+	failAgent(rt, clock, 3)
+
+	if !errors.Is(rt.AllowClaim(), brownout.ErrOpen) {
+		t.Fatal("expected the gate to be open")
+	}
+	if err := rt.AllowLifecycleWork(); err != nil {
+		t.Fatalf("worktree cleanup was blocked by the agent-health gate: %v", err)
+	}
+}
+
+// Cleanup keeps claim admission's authority, so it still stops while the daemon
+// is shutting down. That is the #580 invariant the exemption must not weaken.
+func TestLifecycleWorkStillRespectsAdmission(t *testing.T) {
+	rt, _ := brownoutRuntime(t, nil)
+	if err := rt.admission.BeginShutdown("test"); err != nil {
+		t.Fatalf("BeginShutdown() error = %v", err)
+	}
+	if err := rt.AllowLifecycleWork(); err == nil {
+		t.Fatal("AllowLifecycleWork() allowed work while stopping")
+	}
+}
+
+// Webhook acceptance spends agent budget downstream, so it must see the gate.
+func TestWebhookAcceptanceIsHeldBackByTheBrownoutGate(t *testing.T) {
+	rt, clock := brownoutRuntime(t, nil)
+	failAgent(rt, clock, 3)
+
+	ran := false
+	err := rt.WithAllowClaim(func() { ran = true })
+	if !errors.Is(err, brownout.ErrOpen) {
+		t.Fatalf("WithAllowClaim() = %v, want brownout.ErrOpen", err)
+	}
+	if ran {
+		t.Fatal("WithAllowClaim() ran its critical section while the gate was open")
+	}
 }
