@@ -127,8 +127,9 @@ not a solution to it.
    kind constants it currently lacks (`FailureKindRetryableTransient`,
    `FailureKindNonRetryable`) so it owns all four string values, plus the typed
    `Kind` constants the runners consume via the `failureclass` alias, and the
-   umbrella `internal/loops` package re-exports those new names alongside its
-   existing ones to keep its "re-exports every name here" contract (Step 5);
+   umbrella `internal/loops` package keeps its existing compatibility aliases;
+   no new umbrella names are added because no current `loops.*` caller requires
+   them (Step 5);
    `failureclass.Kind` becomes `type Kind = policy.Kind` (a type alias, so
    `failureclass.Kind` and `policy.Kind` are the identical type) and
    `Classify`'s public API is unchanged, but each `failureclass` constant is now
@@ -336,14 +337,14 @@ behavior change).
 Preserve the fallback at the **classifier**, not at every production site or at
 each consumption boundary. Add `failureclass.Normalize(kind Kind) Kind` to
 `internal/loops/failureclass`, returning each inventoried pass-through kind
-unchanged (membership tested against a package-level `passThroughKinds` inventory
+unchanged (membership tested against the stdlib-only policy inventory
 — today the four known kinds — described below) and any unrecognized kind as
 `NonRetryable`, and normalize `failure.kind` **inside each runner's
-`classifyFailure*` functions** — the single choke point every failure-handling
-entry point flows through — before they return the `loopError`. The four runner
-paths converge at the classifier before retry decisions and persistence: each
-failure-handling entry point begins with `failure := r.classifyFailure*(...)`
-and then reads `failure.kind` for the retry predicates
+`classifyFailure*` functions** — the single choke point for outer failure
+handling and persistence — before they return the `loopError`. The four runner
+paths normally converge at the classifier before retry decisions and
+persistence: each failure-handling entry point begins with
+`failure := r.classifyFailure*(...)` and then reads `failure.kind` for the retry predicates
 (`isQueueRetryEligible`/`shouldRetryQueueFailure`), the resume-policy derivation
 (`NormalizeResumePolicy`/`NextResumePolicyOnFailure`), event logging, and the
 queue/checkpoint persistence (`failQueueItem`/`failQueueItemTerminal`/
@@ -361,7 +362,15 @@ resume-validation validators' returned errors and the carrier sites' returned
 errors) or a freshly classified dynamic error (the `Classify` branch) — is
 normalized once at the single point all entry points share. Normalizing inside
 the classifier covers every downstream read in each failure-handling block, so a
-single normalization per failure-handling path is sufficient.
+single normalization per failure-handling path is sufficient. One reviewer
+path is intentionally earlier than that choke point: the transient retry loop
+calls `isTransientExternalFailureForProject` between step attempts, and that
+predicate reads `loopError.kind` directly. The implementation must normalize
+that kind at this read (or through a small shared normalized-kind helper) before
+comparing it with `RetryableTransient`, and the reviewer contract test must
+cover an unknown kind through this pre-classifier retry decision as well. This
+is the only pre-classifier consumer; it is explicitly included rather than
+relying on the outer classifier to make the invariant true retroactively.
 
 Centralizing normalization in the classifier — rather than at each consumption
 boundary after `classifyFailure*` returns — is chosen because it makes the
@@ -429,7 +438,7 @@ status predicates support it is contained to `NonRetryable` — the safe default
 rather than passing through to predicates that fall through as unknown. To give
 a new kind distinct behavior, the implementer must perform a coordinated set of
 opt-in edits in the same change: (1) extend `Normalize` to preserve the new kind
-by adding it to the `passThroughKinds` inventory; (2) update every runner's
+by adding it to the policy pass-through inventory; (2) update every runner's
 retry, hold, notification, status, and persistence predicate to handle it rather
 than fall through; and (3) extend the persisted SQLite schema to accept the new
 value, because every runner persists `failure.kind` to
@@ -484,13 +493,18 @@ re-hard-coded here, so the contract test and the oracle consult one authority
 for which kinds each persisted-string predicate must recognize.
 
 The pass-through set is a single, named inventory so the first two edits cannot
-drift apart: `Normalize` consults a package-level `passThroughKinds []Kind`
-(today the four known kinds) and returns the input unchanged when it is a
-member, otherwise `NonRetryable`; an exported `failureclass.PassThroughKinds()
-[]Kind` returns a copy of that same inventory. The per-runner
-downstream-predicate contract cases (Validation step 6) do not hard-code the
-four kinds — they iterate over `failureclass.PassThroughKinds()`, so adding a
-kind to `passThroughKinds` is the single edit that simultaneously makes
+drift apart: the stdlib-only `internal/loops/policy` leaf owns a package-level
+`passThroughKinds []Kind`
+(today the four known kinds) and an exported `policy.PassThroughKinds() []Kind`
+copy. `failureclass.Normalize` consults that inventory, and
+`failureclass.PassThroughKinds()` forwards the same copy for runner tests.
+Keeping the source inventory in `policy` lets same-package `internal/storage`
+contract tests import the policy leaf without creating the
+`storage -> failureclass -> infra/github -> storage` cycle; those tests use
+`policy.PassThroughKinds()` directly. The per-runner downstream-predicate
+contract cases (Validation step 6) do not hard-code the four kinds — they
+iterate over `failureclass.PassThroughKinds()`, so adding a
+kind to the policy inventory is the single edit that simultaneously makes
 `Normalize` pass it through **and** enters a row for it in every runner's
 retry, hold, notification, status, and persistence predicate table — not only
 the `classifyFailure*` functions, which return the kind correctly while a
@@ -516,24 +530,27 @@ Add a focused test in `internal/loops/failureclass` that iterates over
 unchanged, and that an unknown `Kind` (a value outside that inventory)
 normalizes to `NonRetryable`. Deriving the pass-through cases from the same
 inventory `Normalize` consults keeps the unit test and the authority in one
-place: a kind added to `passThroughKinds` is automatically asserted as a
+place: a kind added to the policy pass-through inventory is automatically asserted as a
 fixed point here too, and a kind removed from the inventory is automatically
 asserted to fall back to `NonRetryable`. The inventory-derived loop alone
 cannot detect a *removal* of a currently supported kind: if an entry such as
-`ManualIntervention` is accidentally dropped from `passThroughKinds`,
+`ManualIntervention` is accidentally dropped from the policy inventory,
 `Normalize` starts converting that production value to `NonRetryable`, the
 inventory loop simply stops covering the removed kind, and the
 downstream-predicate cases (which also iterate `PassThroughKinds()`) drop its
 row — so retry, hold, and persistence behavior silently changes while every
 test stays green. The test therefore also asserts, independently of the
-inventory, that each of the four currently supported authority constants
-(`RetryableTransient`, `RetryableAfterResume`, `NonRetryable`, and
-`ManualIntervention`) is a fixed point of `Normalize` (`Normalize(c) == c`).
-This pins the currently supported pass-through set without requiring every
+inventory-derived normalization loop, that each of the four currently
+supported authority constants (`RetryableTransient`, `RetryableAfterResume`,
+`NonRetryable`, and `ManualIntervention`) is an explicit member of
+`policy.PassThroughKinds()` (and therefore of the forwarded
+`failureclass.PassThroughKinds()`), as well as a fixed point of `Normalize`
+(`Normalize(c) == c`). This pins the currently supported pass-through set
+without requiring every
 future authority constant to pass through: a constant added later is not
 asserted here until it is opted into the inventory, but removing one of the
-four currently supported kinds from `passThroughKinds` makes `Normalize`
-convert it to `NonRetryable` and fails this explicit pin, so the silent
+four currently supported kinds from the policy inventory makes `Normalize`
+convert it to `NonRetryable` and fails the explicit membership pin, so the silent
 behavior change is caught. The classifier normalization itself is
 **not**
 covered only by the four-kind per-runner classification tests and alias-identity
@@ -627,6 +644,14 @@ const (
 	NonRetryable         Kind = FailureKindNonRetryable
 	ManualIntervention   Kind = FailureKindManualIntervention
 )
+
+var passThroughKinds = []Kind{
+	RetryableTransient, RetryableAfterResume, NonRetryable, ManualIntervention,
+}
+
+func PassThroughKinds() []Kind {
+	return append([]Kind(nil), passThroughKinds...)
+}
 ```
 
 The typed constants derive from the untyped ones in the same package, so there
@@ -634,42 +659,16 @@ is one owner and one derivation direction — not a second ledger. The untyped
 constants exist only to feed the `string`-parameter predicates; the typed
 constants are the single `Kind` authority.
 
-The umbrella `internal/loops` package's documented compatibility contract
-(`internal/loops/policy.go:7`: "internal/loops re-exports every name here")
-covers every exported name in the leaf, so the two new untyped constants, the
-`Kind` type, and the four typed constants must be re-exported there too, not
-added to the leaf alone. `internal/loops/policy.go` gains the matching untyped
-aliases alongside the existing two, plus a `Kind` type alias and the four typed
-constant re-exports:
-
-```go
-package loops
-
-import "github.com/MumuTW/looper/internal/loops/policy"
-
-type Kind = policy.Kind
-
-const (
-	FailureKindRetryableTransient   = policy.FailureKindRetryableTransient
-	FailureKindRetryableAfterResume = policy.FailureKindRetryableAfterResume
-	FailureKindNonRetryable         = policy.FailureKindNonRetryable
-	FailureKindManualIntervention   = policy.FailureKindManualIntervention
-	// ... existing ResumePolicy* aliases unchanged ...
-)
-
-const (
-	RetryableTransient   = policy.RetryableTransient
-	RetryableAfterResume = policy.RetryableAfterResume
-	NonRetryable         = policy.NonRetryable
-	ManualIntervention   = policy.ManualIntervention
-)
-```
-
-Without these aliases, callers following the documented `loops.*` umbrella API
-cannot reach `loops.FailureKindRetryableTransient`, `loops.Kind`, or
-`loops.RetryableTransient` — the leaf gains names the umbrella promises to
-expose, breaking the contract the package doc asserts. Adding them is part of
-this step, not a follow-up.
+Do not add new umbrella aliases in `internal/loops/policy.go`. Its existing
+aliases are a compatibility surface for names with current `loops.*` callers;
+the file does not promise to re-export every future symbol added to the leaf,
+and no production caller requires `loops.Kind` or the new typed constants.
+Adding those aliases would create another supported namespace and a second
+synchronization surface solely for an unneeded compatibility claim. The new
+typed surface is intentionally `policy.Kind` (for stdlib-only consumers) and
+`failureclass.Kind` (for classifier consumers); if a real `loops.*` caller is
+introduced later, it should be a separate compatibility change with its own
+consumer evidence.
 
 `failureclass` imports `policy` and aliases the `Kind` type and re-exports the
 typed constants, so `failureclass.Kind` and `failureclass.RetryableTransient`
@@ -703,7 +702,7 @@ and 3, and Step 5 adds no further edit to them. `Policy.FailureKind` is typed
 `policy.Kind` (Step 1), which is the same type as `failureclass.Kind` via the
 alias, so the two consumers assign `policy.FailureKind` into `failureclass.Kind`
 fields with no cast. A rename of any `policy` constant propagates to
-`failureclass`, to the umbrella, and to every consumer at compile time, so no
+`failureclass` and every consumer at compile time, so no
 drift-detection test is added or needed. `policy`'s leaf property is preserved:
 it still imports only the standard library, so `reviewer/workflow` and
 `internal/validation` depending on `policy` still pull in no infra. Adding
@@ -1062,10 +1061,12 @@ the unknown-kind fallback explicitly.
 ### Pass-through inventory (`passThroughKinds` / `PassThroughKinds()`)
 
 Step 2 introduces a new runtime artifact — a package-level `passThroughKinds
-[]Kind` inventory in `internal/loops/failureclass` plus an exported
-`PassThroughKinds() []Kind` that returns a copy — solely to coordinate `Normalize`
-with the per-runner downstream-predicate tests in four packages and the
-`Normalize` unit test. Its own deletion trade-off, distinct from the
+[]Kind` inventory in the stdlib-only `internal/loops/policy` leaf plus an
+exported `policy.PassThroughKinds() []Kind` copy (forwarded by
+`failureclass.PassThroughKinds()`) — solely to coordinate `Normalize` with the
+per-runner downstream-predicate tests in four packages, the `Normalize` unit
+test, and same-package storage contracts without an import cycle. Its own
+deletion trade-off, distinct from the
 `QueueFailureKind` ledger above:
 
 > Delete this inventory six months from now — what breaks?
@@ -1231,17 +1232,16 @@ test):**
    constants derived from those untyped strings, and `failureclass` imports
    `policy` and aliases `type Kind = policy.Kind` and re-exports the four typed
    constants at compile time (Step 5). The umbrella `internal/loops` package
-   re-exports the two new untyped constants, the `Kind` type alias, and the four
-   typed constants alongside its existing ones, keeping its "re-exports every
-   name here" contract so the documented `loops.*` API exposes all of them
-   (Step 5). The dependency runs in that direction because `policy` is an
+   keeps only its existing aliases; no new `loops.*` consumer requires the new
+   names, so adding another namespace would create unsupported compatibility
+   surface. The dependency runs in that direction because `policy` is an
    intentional stdlib-only leaf (its package doc states this) so
    `reviewer/workflow` and `internal/validation` can depend on it without
    pulling in the `internal/infra/github` stack `failureclass` carries;
    `failureclass` importing `policy` adds no cycle (`policy` imports only the
    standard library) and no transitive dependency any `failureclass` importer
    did not already carry. A rename of any `policy` constant propagates to
-   `failureclass`, to the umbrella, and to every runner at compile time, so no
+   `failureclass` and every runner at compile time, so no
    drift-detection test is added. Resume-policy behavior is unchanged: the
    untyped `FailureKind*` constants stay untyped `string`, and
    `NormalizeResumePolicy` keeps its current signature and branches.
@@ -1409,9 +1409,9 @@ Infra signals remain for drift detection, not authority.
 - `internal/worker/runner.go` — delete `QueueFailureKind` + delete `workerFailureKind` + `s/QueueFailureKind/failureclass.Kind/` + call-site edits, including Step 2's classifier normalization inside `classifyFailureWithBoundary`.
 - `internal/planner/runner.go` — delete `QueueFailureKind` + delete `plannerFailureKind` + `s/QueueFailureKind/failureclass.Kind/` + call-site edits, including Step 2's classifier normalization inside `classifyFailureWithBoundary`.
 - `internal/runtime/scheduler.go` — `workerRunCompletedNotificationInput.FailureKind` becomes `failureclass.Kind` (the one `QueueFailureKind` reference here).
-- `internal/loops/failureclass/failureclass.go` — add `Normalize(kind Kind) Kind` (the authority for the unknown-kind fallback), backed by a package-level `passThroughKinds []Kind` inventory (today the four known kinds) that `Normalize` consults for membership, plus an exported `PassThroughKinds() []Kind` returning a copy of that inventory so the per-runner downstream-predicate tests and the `Normalize` unit test (Validation step 6) iterate over the single pass-through set rather than a hard-coded four-kind table; add an `ExpectedBehavior` struct and `ExpectedBehaviorFor(kind Kind, runner Runner, state RunnerState) ExpectedBehavior` oracle over the same inventory recording each pass-through kind's intended retry-eligibility and resume policy parameterized by the runner and decision-relevant state (attempt bound and current resume policy), so the per-runner downstream-predicate cases assert against the shared expected semantics — covering the bounded-vs-infinite retry divergence for `NonRetryable` and the reviewer-vs-other-runner resume-policy divergence for `RetryableAfterResume` — rather than only "did not fall through" (Validation step 6); add the `internal/loops/policy` import and alias `type Kind = policy.Kind` and re-export the four typed constants from `policy` at compile time (Step 5), deleting the second spelling rather than pinning it by test; `Classify` logic and public API unchanged.
+- `internal/loops/failureclass/failureclass.go` — add `Normalize(kind Kind) Kind` (the authority for the unknown-kind fallback), consume the `policy.PassThroughKinds()` inventory, and forward it through an exported `PassThroughKinds() []Kind` so the per-runner downstream-predicate tests and the `Normalize` unit test (Validation step 6) iterate over the single pass-through set rather than a hard-coded four-kind table; add an `ExpectedBehavior` struct and `ExpectedBehaviorFor(kind Kind, runner Runner, state RunnerState) ExpectedBehavior` oracle over the same inventory recording every promised downstream outcome (retry, resume, breaker, notification, issue status, and persistence) parameterized by runner and decision-relevant state, so the per-runner cases assert shared expected semantics rather than only "did not fall through" (Validation step 6); add the `internal/loops/policy` import and alias `type Kind = policy.Kind` and re-export the four typed constants from `policy` at compile time (Step 5), deleting the second spelling rather than pinning it by test; `Classify` logic and public API unchanged.
 - `internal/loops/policy/policy.go` — add the two missing untyped `FailureKind*` string constants so the leaf owns all four string values; add `type Kind string` and the four typed `Kind` constants derived from the untyped ones (Step 5); no predicate changes (the untyped constants stay for the `string`-parameter functions).
-- `internal/loops/policy.go` (umbrella) — re-export the two new untyped `FailureKind*` constants, the `Kind` type alias, and the four typed constants, keeping the "re-exports every name here" contract (Step 5).
+- `internal/loops/policy.go` (umbrella) — unchanged except for existing aliases; no new symbols are re-exported without a real `loops.*` consumer, avoiding an unsupported namespace.
 - `internal/validation/validation.go` — delete the three `FailureKind*`
   constants, type `Policy.FailureKind` as `policy.Kind`, have `PolicyFor`
   return the shared constants directly (no `string()` cast), and add the
@@ -1467,14 +1467,11 @@ Infra signals remain for drift detection, not authority.
   added: `failureclass` imports `policy` and aliases `type Kind = policy.Kind`
   and re-exports the typed constants at compile time (Step 5), so a rename
   propagates by import, not by a synchronization gate.
-- `internal/loops/policy.go` — the umbrella package re-exports the two new leaf
-  untyped constants (`FailureKindRetryableTransient`, `FailureKindNonRetryable`)
-  as aliases alongside the existing two, plus a `Kind` type alias and the four
-  typed constant re-exports, satisfying its own package-doc contract
-  ("internal/loops re-exports every name here", `policy.go:7`). Without this
-  edit the leaf gains names the documented `loops.*` API does not expose, so
-  callers using the umbrella path cannot reach the new constants or the `Kind`
-  type.
+- `internal/loops/policy.go` — no new umbrella aliases. Existing aliases remain
+  for their current callers; adding `Kind` and the new constants would create a
+  second supported namespace without consumer evidence. The new typed surface
+  is `policy.Kind` for leaf consumers and `failureclass.Kind` for classifier
+  consumers.
 
 **Test files:** Call sites in `*_test.go` that reference `FailureRetryable*`
 constants continue to compile unchanged (the constants are re-exported). The one
@@ -1733,7 +1730,7 @@ Per `AGENTS.md`, the root commands are the source of truth:
    The implementation therefore adds a schema-contract test (in
    `internal/storage`) that asserts the `last_error_kind` CHECK constraint —
    read from the migrated schema, not hard-coded — accepts exactly
-   `failureclass.PassThroughKinds()` (each pass-through kind inserts and
+   `policy.PassThroughKinds()` (each pass-through kind inserts and
    persists) and rejects a value outside that inventory (insert fails), so a
    kind added to `passThroughKinds` without a matching migration fails the
    contract test in the same change rather than failing at runtime on the first
@@ -1816,14 +1813,20 @@ Per `AGENTS.md`, the root commands are the source of truth:
    *expected* semantics into a shared authority the tests consume rather than
    hard-coding them per runner: `failureclass` gains an
    `ExpectedBehaviorFor(kind Kind, runner Runner, state RunnerState) ExpectedBehavior`
-   oracle (a small struct holding the intended retry-eligibility and resume
-   policy for a pass-through kind under a given runner and decision-relevant
-   state) backed by the same `passThroughKinds` inventory, and each per-runner
-   downstream-predicate case asserts the runner's retry predicate returns
-   `ExpectedBehaviorFor(kind, runner, state).RetryEligible` and the runner's
-   resume-policy derivation returns
-   `ExpectedBehaviorFor(kind, runner, state).ResumePolicy` — i.e. the test
-   compares the predicate's output to the shared expected value, not merely to
+   oracle backed by the same policy inventory. `ExpectedBehavior` includes every
+promised downstream outcome, not only the two values that happen to be easiest
+to table: `RetryEligible`, `ResumePolicy`, the fixer's breaker decision
+(`BreakerAction`), completion-notification decision (`NotifyCompleted`), issue
+claim status (`IssueClaimStatus`), and the queue/checkpoint persistence outcome
+(`PersistenceAction`/persisted kind). `RunnerState` supplies the attempt bound,
+current resume policy, queue/run/checkpoint context, and the terminal-vs-retry
+inputs each predicate actually reads. Each per-runner downstream-predicate case
+asserts every field applicable to that runner — including
+`failQueueItemWithBreaker`, `shouldNotifyCompletedRun`, and
+`issueClaimStatusForFailure` where those predicates exist — against
+`ExpectedBehaviorFor(kind, runner, state)`, not merely against a generic
+   "handled" marker. The test compares each predicate's output to the shared
+   expected value, not merely to
    "not the default." A runner whose predicate falls through to a value that
    differs from the oracle fails; a runner whose predicate falls through to a
    value that *matches* the oracle still passes, but the oracle now records that
@@ -1896,12 +1899,18 @@ Per `AGENTS.md`, the root commands are the source of truth:
    `validateWorkerResumeCheckpoint` failure, and ordinary step failure all begin
    with `r.classifyFailureWithBoundary`; the reviewer's
    `finalizeClaimSetupFailure` and ordinary step failure all begin with
-   `r.classifyFailureForProjectAndBoundary`; the planner's `recoverClaimedItem`
+   `r.classifyFailureForProjectAndBoundary`; the reviewer transient retry loop
+   additionally exercises `isTransientExternalFailureForProject` before that
+   outer classifier; the planner's `recoverClaimedItem`
    and ordinary step failure all begin with `r.classifyFailureWithBoundary`. The
-   test also passes a non-`loopError` error whose `Classify` result is an
-   unknown kind through `classifyFailure*` and asserts the same normalization on
-   the `Classify` branch, so both classifier branches (the `errors.As` return and
-   the `Classify` fallback) are covered.
+   test also passes a non-`loopError` error through `classifyFailure*` to cover
+   the ordinary `Classify` fallback for its currently produced known kinds.
+   `failureclass.Classify` has no injection seam and currently returns only the
+   four inventoried values, so an unknown kind cannot be manufactured on that
+   branch without adding a test-only or production classifier seam. The
+   unknown-kind assertion therefore targets the `errors.As` branch directly,
+   while the standalone `Normalize` test covers the unknown fallback itself;
+   the plan deliberately does not require impossible Classify-branch coverage.
 
    The resume-validation entry points cannot be injection-tested by driving the
    validator directly: `validateFixerResumeCheckpoint` and
@@ -2071,11 +2080,9 @@ string→kind casts deleted, since `policy.Kind` is the same type as
 `failureclass.Kind` via the Step 5 alias), `internal/loops/policy` owns the
 `Kind` type and all four kind string constants and `failureclass` imports
 `policy` and aliases `type Kind = policy.Kind` and re-exports the typed
-constants from it at compile time (no policy or validation drift test), the
-umbrella `internal/loops` package re-exports the two new untyped policy
-constants (`FailureKindRetryableTransient`, `FailureKindNonRetryable`), the
-`Kind` type alias, and the four typed constants alongside the existing ones so
-the documented `loops.*` API exposes all of them, the fixer
+constants from it at compile time (no policy or validation drift test), while
+the umbrella `internal/loops` package keeps only its existing aliases because
+no current `loops.*` caller requires the new names, the fixer
 prompt's advertised `failure_kind` tokens are derived from
 `policy.RetryableTransient` and `policy.ManualIntervention` inside
 `AppendFixerCompletionInstruction` (which imports the stdlib-only
@@ -2085,8 +2092,9 @@ synchronization test is added; the advertised-subset ⊆ parser-allowlist
 membership contract is retained as a fixer-package test, see step 9), the
 deleted-symbol absence check (step 7) passes, each runner normalizes
 `failure.kind` inside its `classifyFailure*` function via
-`failureclass.Normalize` before any retry, breaker, or persistence read (Step 2)
-— so every `loopError.kind` value that reaches a retry decision, the fixer
+`failureclass.Normalize` before any retry, breaker, or persistence read (Step 2),
+and the reviewer's pre-classifier `isTransientExternalFailureForProject` read
+normalizes its `loopError.kind` locally — so every `loopError.kind` value that reaches a retry decision, the fixer
 breaker's manual-kind check, a resume-policy derivation, or queue/checkpoint
 persistence is normalized, regardless of how the kind was produced, and the
 unknown-kind → `non_retryable` fallback holds for every producer including
