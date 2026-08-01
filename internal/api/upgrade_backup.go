@@ -54,9 +54,15 @@ func (h *Handler) createUpgradeBackup(ctx context.Context) (upgradebackup.Result
 	if cfg.Storage.BackupDir == nil || strings.TrimSpace(*cfg.Storage.BackupDir) == "" {
 		return upgradebackup.Result{}, fmt.Errorf("storage.backupDir is required")
 	}
-	databasePath, err := filesystemDatabasePath(cfg.Storage.DBPath)
-	if err != nil {
-		return upgradebackup.Result{}, err
+	// Prefer the path frozen when the coordinator opened SQLite so parent
+	// symlink retargets cannot rename restore destinations away from the open inode.
+	databasePath := strings.TrimSpace(services.Coordinator.DatabasePath())
+	if databasePath == "" {
+		var err error
+		databasePath, err = filesystemDatabasePath(cfg.Storage.DBPath)
+		if err != nil {
+			return upgradebackup.Result{}, err
+		}
 	}
 	daemonPath := daemonExecutablePath()
 	if err := requireExecutableFile(daemonPath, "daemon binary"); err != nil {

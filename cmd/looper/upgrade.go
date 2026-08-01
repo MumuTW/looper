@@ -684,7 +684,12 @@ func upgradePostStartBlocks(report upgradePostStartReport) []string {
 	if !report.Status.Service.Healthy {
 		blocks = append(blocks, "daemon service is unhealthy")
 	}
-	if report.Status.Service.AdmissionState != "ready" {
+	// ready = normal post-start. draining is allowed when the replacement
+	// daemon was started with LOOPER_UPGRADE_VERIFY_HOLD=1 so work cannot run
+	// until verification succeeds.
+	switch report.Status.Service.AdmissionState {
+	case "ready", "draining":
+	default:
 		blocks = append(blocks, "daemon admission is not ready")
 	}
 	if report.Status.Service.StartedAt == nil || strings.TrimSpace(*report.Status.Service.StartedAt) == "" {

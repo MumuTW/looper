@@ -267,15 +267,16 @@ Supported sequence:
 6. `stage-release` the **candidate** pair (new release id)
 7. `activate-release` the candidate (switches `current` only — does not restart)
 8. Point `tools.looperPath` at `release-root/current/looper` if not already
-9. **Restart the supervised daemon** so it loads `current/looperd`
-10. `verify-start`
+9. **Restart the supervised daemon with `LOOPER_UPGRADE_VERIFY_HOLD=1`** so it loads `current/looperd` but **keeps admission drained** (no claim/mutation) until verification finishes. Without this hold, the replacement scheduler can complete work before `verify-start`; a later failed verify + restore of `$ROLLBACK_BUNDLE` would discard those writes.
+10. `verify-start` (accepts `admissionState` ready **or** draining under the hold)
+11. On success: **restart again without `LOOPER_UPGRADE_VERIFY_HOLD`** so admission opens and normal work resumes
 
-On failure after restart:
+On failure after restart (while still held/drained):
 
 1. **Stop** the candidate daemon (required — restore fails closed while SQLite is open)
 2. `restore-preflight --bundle $ROLLBACK_BUNDLE` → `restore --bundle $ROLLBACK_BUNDLE --confirm` (use the **post-drain** bundle, not the pre-drain one)
 3. `activate-release` the **prior** release id
 4. Restore prior `tools.looperPath` if you changed it
-5. Restart the supervised daemon again
+5. Restart the supervised daemon **without** `LOOPER_UPGRADE_VERIFY_HOLD`
 
 Backup-copied binaries are evidence, not an executable release; binary rollback is always via a previously staged release under the same `release-root`.
