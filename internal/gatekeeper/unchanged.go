@@ -28,10 +28,22 @@ const maxSkipAge = 30 * time.Minute
 // check completing moves neither UpdatedAt nor any field here — which is why
 // pull requests whose gate is waiting on a check are never skipped (see
 // reportAwaitsCheckState).
-func sourceFingerprint(pullRequest githubinfra.PullRequestSummary) string {
+//
+// BaseSHA is included only when the diff budget is enabled. It does not move on
+// an ordinary push, but when the base branch is force-pushed or otherwise
+// rewritten GitHub recomputes changedFiles and deletions against a different
+// merge base without moving the head or any other list-page field. Omitting it
+// then would let a stale diff-budget verdict be reused for up to maxSkipAge
+// after the observed counts crossed a configured limit. With both bounds at
+// their default of zero the gate is unlimited, so a base advance changes
+// nothing Gatekeeper enforces; including BaseSHA unconditionally would make
+// every base-branch commit invalidate the cached report for every open pull
+// request, paying for a full re-evaluation (and its forge round trips) to
+// recompute a verdict that cannot have changed.
+func sourceFingerprint(pullRequest githubinfra.PullRequestSummary, budgetEnabled bool) string {
 	labels := append([]string(nil), pullRequest.Labels...)
 	sort.Strings(labels)
-	return strings.Join([]string{
+	fields := []string{
 		pullRequest.HeadSHA,
 		pullRequest.UpdatedAt,
 		pullRequest.State,
@@ -40,7 +52,11 @@ func sourceFingerprint(pullRequest githubinfra.PullRequestSummary) string {
 		fmt.Sprintf("%t", pullRequest.IsDraft),
 		fmt.Sprintf("%t", pullRequest.HasConflicts),
 		strings.Join(labels, ","),
-	}, "\x1f")
+	}
+	if budgetEnabled {
+		fields = append(fields, pullRequest.BaseSHA)
+	}
+	return strings.Join(fields, "\x1f")
 }
 
 // checkReasonCodes are the gate reasons that resolve on their own, without

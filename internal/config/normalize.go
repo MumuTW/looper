@@ -1229,8 +1229,26 @@ func mergeRoleConfigs(config *RoleConfigs, partial PartialRoleConfigs) {
 			config.Auditor.WindowMinutes = *partial.Auditor.WindowMinutes
 		}
 	}
-	if partial.Gatekeeper != nil && partial.Gatekeeper.Trust != nil {
-		config.Gatekeeper.Trust = GatekeeperTrustLevel(strings.TrimSpace(string(*partial.Gatekeeper.Trust)))
+	if partial.Gatekeeper != nil {
+		if partial.Gatekeeper.Trust != nil {
+			config.Gatekeeper.Trust = GatekeeperTrustLevel(strings.TrimSpace(string(*partial.Gatekeeper.Trust)))
+		}
+		if partial.Gatekeeper.DiffBudget != nil {
+			budget := config.Gatekeeper.DiffBudget
+			if budget == nil {
+				budget = &GatekeeperDiffBudget{}
+			} else {
+				cloned := *budget
+				budget = &cloned
+			}
+			if partial.Gatekeeper.DiffBudget.MaxChangedFiles != nil {
+				budget.MaxChangedFiles = *partial.Gatekeeper.DiffBudget.MaxChangedFiles
+			}
+			if partial.Gatekeeper.DiffBudget.MaxDeletions != nil {
+				budget.MaxDeletions = *partial.Gatekeeper.DiffBudget.MaxDeletions
+			}
+			config.Gatekeeper.DiffBudget = budget
+		}
 	}
 }
 
@@ -2015,6 +2033,9 @@ func clonePartialRoleConfigs(configs *PartialRoleConfigs) *PartialRoleConfigs {
 			trust := *configs.Gatekeeper.Trust
 			gatekeeper.Trust = &trust
 		}
+		if configs.Gatekeeper.DiffBudget != nil {
+			gatekeeper.DiffBudget = clonePartialGatekeeperDiffBudget(configs.Gatekeeper.DiffBudget)
+		}
 		cloned.Gatekeeper = &gatekeeper
 	}
 	if configs.Auditor != nil {
@@ -2134,6 +2155,22 @@ func clonePartialRoleConfigs(configs *PartialRoleConfigs) *PartialRoleConfigs {
 		}
 		fixer.Agent = cloneRoleAgentConfig(configs.Fixer.Agent)
 		cloned.Fixer = &fixer
+	}
+	return &cloned
+}
+
+func clonePartialGatekeeperDiffBudget(budget *PartialGatekeeperDiffBudget) *PartialGatekeeperDiffBudget {
+	if budget == nil {
+		return nil
+	}
+	cloned := *budget
+	if budget.MaxChangedFiles != nil {
+		maxChangedFiles := *budget.MaxChangedFiles
+		cloned.MaxChangedFiles = &maxChangedFiles
+	}
+	if budget.MaxDeletions != nil {
+		maxDeletions := *budget.MaxDeletions
+		cloned.MaxDeletions = &maxDeletions
 	}
 	return &cloned
 }

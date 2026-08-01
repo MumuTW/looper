@@ -811,6 +811,77 @@ conditions — notably **not** unresolved review threads or requested changes.
 ladder and retires `roles.reviewer.autoMerge`; until `auto` exists, Reviewer's
 setting remains the only way Looper merges anything.
 
+## Merge Gatekeeper diff budget (`roles.gatekeeper.diffBudget`)
+
+The diff budget is an optional boolean change-size guard. When configured,
+Gatekeeper reads GitHub's provider-observed `changedFiles` and `deletions` for
+the exact pull-request head during evaluation and blocks the verdict when either
+count exceeds its configured bound. GitHub's provider metadata is the authority
+for the counts; the agent's output is not used. The gate runs on both the primary
+evaluation and the confirming pass before an `auto` merge, and it fails closed
+(blocking with `provider_state_unavailable`) when the enabled stats cannot be
+read.
+
+| Path | Purpose | Default |
+| --- | --- | --- |
+| `roles.gatekeeper.diffBudget.maxChangedFiles` | Maximum number of changed files | `0` (unlimited) |
+| `roles.gatekeeper.diffBudget.maxDeletions` | Maximum number of deleted lines | `0` (unlimited) |
+
+A bound of `0` means **unlimited**: that dimension is not enforced. The two
+bounds are independent, so configuring only one leaves the other unlimited — for
+example, setting only `maxDeletions` still lets a very large purely-additive diff
+pass. Negative values are rejected at startup. The gate is boolean per bound, not
+a score: it records the observed counts and configured limits as evidence and
+does not model review effort or risk.
+
+```toml
+[roles.gatekeeper.diffBudget]
+maxChangedFiles = 20
+maxDeletions = 500
+```
+
+### Project overrides
+
+Project overrides use `projects[].roles.gatekeeper.diffBudget` and are
+**partial**: each bound is optional, and only the bounds present override the
+global value. A project that sets only `maxDeletions` keeps the global
+`maxChangedFiles`, and vice versa. Project IDs are matched exactly, the same as
+every other project lookup, so two IDs differing only by case or surrounding
+whitespace are distinct projects with distinct budgets.
+
+```toml
+[[projects]]
+id = "looper"
+repoPath = "/path/to/looper"
+
+[projects.roles.gatekeeper.diffBudget]
+maxDeletions = 100   # overrides the global bound; maxChangedFiles is inherited
+```
+
+### What this gate does not catch
+
+A cheap, deterministic, provider-authoritative guard is deliberately narrow.
+Reviewers should weigh these blind spots before relying on it:
+
+- Only changed-file count and deletion count are bounded. There is no
+  `maxAdditions` or total-line bound, so a massive purely-additive diff passes
+  whenever `maxDeletions` is the only configured bound.
+- Counts are whole-PR totals from GitHub, computed against the current merge
+  base. There is no per-file or per-path budget, so one very large file passes
+  whenever the file count is under limit, and generated or vendored files are not
+  excluded.
+- The counts move when the base branch is force-pushed or rewritten even though
+  the head does not. The discovery fingerprint includes the base SHA so a
+  rewritten merge base invalidates a reused verdict rather than serving a stale
+  one for up to the skip window.
+- At the `auto` trust level the merge action binds only the pull-request head
+  (`gh pr merge --match-head-commit`); GitHub's merge API accepts no parameter
+  that atomically pins the base. The confirming pass revalidates the base
+  immediately before the merge, but if the base branch advances in the window
+  between that final read and the merge call itself, the merge can still proceed
+  against a new base whose recomputed diff exceeds the budget. That window is
+  narrow but not closed — it is a documented blind spot, not a guarantee.
+
 ## Deploy on merge (`roles.deployer`)
 
 When a project's base branch moves, the deployer runs one configured command

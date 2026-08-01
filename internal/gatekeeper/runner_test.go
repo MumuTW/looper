@@ -310,6 +310,7 @@ type fakeGatekeeperGitHub struct {
 	checks           githubinfra.PullRequestCheckRuns
 	threads          []githubinfra.ReviewThread
 	finalHeadSHA     string
+	finalBaseSHA     string
 	protectionErr    error
 	// perPullRequestCalls counts the forge round trips that only a full evaluation
 	// makes, so a test can prove a pull request was skipped rather than evaluated.
@@ -407,8 +408,8 @@ func (f *fakeGatekeeperGitHub) ListReviewThreads(context.Context, githubinfra.Li
 	f.perPullRequestCalls++
 	return f.threads, nil
 }
-func (f *fakeGatekeeperGitHub) GetPullRequestHeadSHA(context.Context, githubinfra.ViewPullRequestInput) (string, error) {
-	return f.finalHeadSHA, nil
+func (f *fakeGatekeeperGitHub) GetPullRequestHeadAndBaseSHA(context.Context, githubinfra.ViewPullRequestInput) (string, string, error) {
+	return f.finalHeadSHA, f.finalBaseSHA, nil
 }
 
 func reasonCodes(reasons []Reason) []ReasonCode {

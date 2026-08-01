@@ -590,6 +590,27 @@ func TestGetPullRequestHeadSHA(t *testing.T) {
 	}
 }
 
+func TestGetPullRequestHeadAndBaseSHA(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		if args != "pr view 42 --repo acme/looper --json headRefOid,baseRefOid" {
+			t.Fatalf("unexpected gh args: %q", args)
+		}
+		return shell.Result{Stdout: `{"headRefOid":"abc123","baseRefOid":"def456"}`}, nil
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	headSHA, baseSHA, err := gateway.GetPullRequestHeadAndBaseSHA(context.Background(), ViewPullRequestInput{Repo: "acme/looper", PRNumber: 42})
+	if err != nil {
+		t.Fatalf("GetPullRequestHeadAndBaseSHA() error = %v", err)
+	}
+	if headSHA != "abc123" || baseSHA != "def456" {
+		t.Fatalf("GetPullRequestHeadAndBaseSHA() = (%q, %q), want (abc123, def456)", headSHA, baseSHA)
+	}
+}
+
 func TestGetRepositorySettings(t *testing.T) {
 	t.Parallel()
 	runner := &fakeGHRunner{t: t}

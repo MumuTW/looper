@@ -38,7 +38,7 @@ var (
 	prViewMetadataJSONFields   = []string{"number", "title", "body", "url", "state", "createdAt", "updatedAt", "closedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "mergeStateStatus"}
 	prViewFixerJSONFields      = []string{"number", "title", "body", "url", "state", "createdAt", "updatedAt", "closedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "statusCheckRollup", "mergeStateStatus"}
 	prViewReviewerJSONFields   = []string{"number", "title", "body", "url", "state", "createdAt", "updatedAt", "closedAt", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "author", "reviewRequests", "reviews", "statusCheckRollup", "mergeStateStatus"}
-	prViewGatekeeperJSONFields = []string{"number", "state", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "mergeStateStatus"}
+	prViewGatekeeperJSONFields = []string{"number", "state", "isDraft", "reviewDecision", "labels", "headRefName", "baseRefName", "headRefOid", "baseRefOid", "mergeStateStatus", "changedFiles", "deletions"}
 )
 
 var prNumberURLPattern = regexp.MustCompile(`/pull/(\d+)(?:/|$)`)
@@ -158,10 +158,18 @@ type PullRequestDetail struct {
 	IssueComments      []CommentInfo
 	Reviews            []map[string]any
 	Checks             []map[string]any
+	DiffStats          *PullRequestDiffStats `json:"diffStats,omitempty"`
 	Mergeable          *bool
 	MergeableState     MergeabilityState
 	MergedAt           string
 	AutoMerge          *PullRequestAutoMerge
+}
+
+// PullRequestDiffStats is the provider-observed change size for a pull request.
+// It is fetched with the same head metadata as Gatekeeper's other gates.
+type PullRequestDiffStats struct {
+	ChangedFiles int `json:"changedFiles"`
+	Deletions    int `json:"deletions"`
 }
 
 type PullRequestAutoMerge struct {
@@ -1682,11 +1690,34 @@ func pullRequestDetailFromViewRow(row map[string]any, threads []map[string]any, 
 		IssueComments:      issueComments,
 		Reviews:            toObjectSlice(row["reviews"]),
 		Checks:             toObjectSlice(row["statusCheckRollup"]),
+		DiffStats:          pullRequestDiffStatsFromRow(row),
 		Mergeable:          boolPtrFromValue(row["mergeable"]),
 		MergeableState:     ParseMergeabilityState(firstNonEmpty(asString(row["mergeable_state"]), asString(row["mergeStateStatus"]))),
 		MergedAt:           asString(row["merged_at"]),
 		AutoMerge:          extractAutoMerge(row["auto_merge"]),
 	}
+}
+
+func pullRequestDiffStatsFromRow(row map[string]any) *PullRequestDiffStats {
+	changedFiles, changedFilesOK := firstPresentRowValue(row, "changedFiles", "changed_files")
+	deletions, deletionsOK := firstPresentRowValue(row, "deletions")
+	if !changedFilesOK || !deletionsOK {
+		return nil
+	}
+	return &PullRequestDiffStats{
+		ChangedFiles: int(asInt64(changedFiles)),
+		Deletions:    int(asInt64(deletions)),
+	}
+}
+
+func firstPresentRowValue(row map[string]any, keys ...string) (any, bool) {
+	for _, key := range keys {
+		value, ok := row[key]
+		if ok && value != nil {
+			return value, true
+		}
+	}
+	return nil, false
 }
 
 func (g *Gateway) viewPullRequestRow(ctx context.Context, input ViewPullRequestInput, fields []string) (map[string]any, error) {
@@ -1727,6 +1758,7 @@ func (g *Gateway) ViewPullRequestMergeWatch(ctx context.Context, input ViewPullR
 		BaseRefName:    nestedString(row, "base", "ref"),
 		HeadSHA:        nestedString(row, "head", "sha"),
 		BaseSHA:        nestedString(row, "base", "sha"),
+		DiffStats:      pullRequestDiffStatsFromRow(row),
 		Mergeable:      boolPtrFromValue(row["mergeable"]),
 		MergeableState: ParseMergeabilityState(firstNonEmpty(asString(row["mergeable_state"]), asString(row["mergeStateStatus"]))),
 		AutoMerge:      extractAutoMerge(row["auto_merge"]),
@@ -1869,6 +1901,15 @@ func (g *Gateway) EnableAutoMerge(ctx context.Context, input EnableAutoMergeInpu
 // This deliberately does not pass --auto. Auto-merge hands the decision to
 // GitHub to apply later, by which time the evaluation behind it is stale — the
 // opposite of the guarantee an immediate merge makes.
+//
+// Only the head is bound here: GitHub's merge API (and `gh pr merge`) accepts no
+// parameter that atomically pins the base. A diff-budget verdict depends on the
+// merge base, so when the base branch advances between the confirming pass's
+// final revalidation read and this call, the merge can still proceed against a
+// new base whose recomputed diff exceeds the budget. The confirming pass narrows
+// that window to the calls between the final read and the merge, but it cannot
+// close it; this is a documented blind spot of the diff-budget gate, not a
+// property this command can enforce.
 func (g *Gateway) MergePullRequest(ctx context.Context, input EnableAutoMergeInput) error {
 	strategy := strings.TrimSpace(string(input.Strategy))
 	if strategy == "" {
@@ -1892,6 +1933,24 @@ func (g *Gateway) GetPullRequestHeadSHA(ctx context.Context, input ViewPullReque
 		return "", err
 	}
 	return asString(row["headRefOid"]), nil
+}
+
+// GetPullRequestHeadAndBaseSHA is the final revalidation read for gates whose
+// verdict depends on the merge base, not only on the head. A base branch can
+// advance between the merge-watch read and this observation without moving the
+// head, so revalidating the head alone cannot detect that a diff-budget verdict
+// was computed against a stale base. It costs the same `gh pr view` call as
+// GetPullRequestHeadSHA with one additional JSON field.
+func (g *Gateway) GetPullRequestHeadAndBaseSHA(ctx context.Context, input ViewPullRequestInput) (string, string, error) {
+	result, err := g.runGh(ctx, input.CWD, "", "pr", "view", fmt.Sprintf("%d", input.PRNumber), "--repo", input.Repo, "--json", "headRefOid,baseRefOid")
+	if err != nil {
+		return "", "", err
+	}
+	row, err := decodeJSONObject(result.Stdout)
+	if err != nil {
+		return "", "", err
+	}
+	return asString(row["headRefOid"]), asString(row["baseRefOid"]), nil
 }
 
 func (g *Gateway) ResolveReviewThread(ctx context.Context, input ResolveReviewThreadInput) error {

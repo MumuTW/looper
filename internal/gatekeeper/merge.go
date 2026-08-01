@@ -50,6 +50,15 @@ const (
 //
 // The confirming pass is a complete evaluation, not a head comparison. A cheaper
 // check would miss exactly the changes the invariant names.
+//
+// The merge that follows binds only the head (see MergePullRequest). GitHub's
+// merge API accepts no parameter that atomically pins the base, so when the diff
+// budget is enabled and the base branch advances between the confirming pass's
+// final revalidation read and the merge call, the merge can proceed against a
+// new base whose recomputed diff exceeds the budget. The confirming pass narrows
+// that window to the calls between the final read and the merge but cannot close
+// it; this is a documented blind spot of the diff-budget gate rather than a
+// property this path can enforce.
 func (r *Runner) confirmAndMerge(ctx context.Context, input EvaluationInput, report Report) error {
 	outcome := MergeOutcome{
 		Version: 1, ProjectID: report.ProjectID, Repo: report.Repo, PRNumber: report.PRNumber,
