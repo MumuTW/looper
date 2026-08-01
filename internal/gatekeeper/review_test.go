@@ -85,6 +85,72 @@ func TestDiscoverPullRequestsReevaluatesInProgressReviewAfterTerminalEvent(t *te
 	}
 }
 
+func TestEvaluatePullRequestReturnsMissingAfterReviewerInterruptedWithoutPublish(t *testing.T) {
+	fixture := newGatekeeperFixtureWithoutReview(t)
+	seedReviewerAgentEvent(t, fixture, reviewerAgentStartedEventType, "head-1", "execution-1", 1)
+	seedReviewerAgentEvent(t, fixture, reviewerAgentInterruptedEventType, "head-1", "execution-1", 2)
+
+	report, err := New(Options{Repos: fixture.repos, GitHub: fixture.github, Now: func() time.Time { return fixture.now }}).EvaluatePullRequest(context.Background(), EvaluationInput{
+		ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, ExpectedHeadSHA: "head-1",
+	})
+	if err != nil {
+		t.Fatalf("EvaluatePullRequest() error = %v", err)
+	}
+	if report.Eligible || !hasReason(report, ReasonCodexReviewMissing) || hasReason(report, ReasonCodexReviewInProgress) {
+		t.Fatalf("report = %#v, want terminal missing-review blocker after interruption", report)
+	}
+	evidence := report.Evidence.CodexReview
+	if evidence == nil || evidence.InProgress || evidence.ExecutionID != "" {
+		t.Fatalf("Codex review evidence = %#v, want no active execution after interruption", evidence)
+	}
+}
+
+func TestEvaluatePullRequestDoesNotReportInProgressAfterInterruptedExecutionForcePushedBack(t *testing.T) {
+	fixture := newGatekeeperFixtureWithoutReview(t)
+	seedReviewerAgentEvent(t, fixture, reviewerAgentStartedEventType, "head-1", "execution-1", 1)
+	seedReviewerAgentEvent(t, fixture, reviewerAgentInterruptedEventType, "head-1", "execution-1", 2)
+	seedReviewerAgentEvent(t, fixture, reviewerAgentStartedEventType, "head-2", "execution-2", 3)
+	seedReviewerAgentEvent(t, fixture, reviewerAgentCompletedEventType, "head-2", "execution-2", 4)
+
+	report, err := New(Options{Repos: fixture.repos, GitHub: fixture.github, Now: func() time.Time { return fixture.now }}).EvaluatePullRequest(context.Background(), EvaluationInput{
+		ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, ExpectedHeadSHA: "head-1",
+	})
+	if err != nil {
+		t.Fatalf("EvaluatePullRequest() error = %v", err)
+	}
+	if report.Eligible || !hasReason(report, ReasonCodexReviewMissing) || hasReason(report, ReasonCodexReviewInProgress) {
+		t.Fatalf("report = %#v, want missing-review blocker without abandoned in-progress execution", report)
+	}
+	evidence := report.Evidence.CodexReview
+	if evidence == nil || evidence.InProgress || evidence.ExecutionID != "" {
+		t.Fatalf("Codex review evidence = %#v, want interrupted execution removed from active projection", evidence)
+	}
+}
+
+func TestDiscoverPullRequestsReevaluatesInProgressReviewAfterInterruptedEvent(t *testing.T) {
+	fixture := newGatekeeperFixtureWithoutReview(t)
+	fixture.github.openPullRequests = []githubinfra.PullRequestSummary{{Number: 42, HeadSHA: "head-1", State: "OPEN", UpdatedAt: "2026-07-30T10:00:00Z", BaseRefName: "main", ReviewDecision: "APPROVED"}}
+	seedReviewerAgentEvent(t, fixture, reviewerAgentStartedEventType, "head-1", "execution-1", 1)
+	runner := New(Options{Repos: fixture.repos, GitHub: fixture.github, Now: func() time.Time { return fixture.now }})
+
+	first, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("first DiscoverPullRequests() error = %v", err)
+	}
+	if first.Evaluated != 1 || first.Skipped != 0 || !hasReason(first.Reports[0], ReasonCodexReviewInProgress) {
+		t.Fatalf("first discovery = %#v, want in-progress review report", first)
+	}
+
+	seedReviewerAgentEvent(t, fixture, reviewerAgentInterruptedEventType, "head-1", "execution-1", 2)
+	second, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("second DiscoverPullRequests() error = %v", err)
+	}
+	if second.Evaluated != 1 || second.Skipped != 0 || !hasReason(second.Reports[0], ReasonCodexReviewMissing) || hasReason(second.Reports[0], ReasonCodexReviewInProgress) {
+		t.Fatalf("second discovery = %#v, want terminal missing-review report after interruption", second)
+	}
+}
+
 func TestEvaluatePullRequestAcceptsDurableCodexReviewForCurrentHead(t *testing.T) {
 	fixture := newGatekeeperFixtureWithoutReview(t)
 	seedReviewerReviewEvent(t, fixture, "head-1", "APPROVE", "reviewer-loop", 1)

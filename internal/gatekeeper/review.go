@@ -10,11 +10,12 @@ import (
 )
 
 const (
-	reviewerReviewPostedEventType   = "pr.review.posted"
-	reviewerAgentStartedEventType   = "reviewer.agent.started"
-	reviewerAgentCompletedEventType = "reviewer.agent.completed"
-	reviewerAgentFailedEventType    = "reviewer.agent.failed"
-	reviewerAgentTimedOutEventType  = "reviewer.agent.timed_out"
+	reviewerReviewPostedEventType     = "pr.review.posted"
+	reviewerAgentStartedEventType     = "reviewer.agent.started"
+	reviewerAgentCompletedEventType   = "reviewer.agent.completed"
+	reviewerAgentFailedEventType      = "reviewer.agent.failed"
+	reviewerAgentTimedOutEventType    = "reviewer.agent.timed_out"
+	reviewerAgentInterruptedEventType = "reviewer.agent.interrupted"
 )
 
 type reviewerReviewPostedPayload struct {
@@ -127,7 +128,7 @@ func reviewerAgentProgressMatches(payload reviewerAgentProgressPayload, repo str
 
 func isReviewerAgentTerminalEvent(eventType string) bool {
 	switch eventType {
-	case reviewerAgentCompletedEventType, reviewerAgentFailedEventType, reviewerAgentTimedOutEventType:
+	case reviewerAgentCompletedEventType, reviewerAgentFailedEventType, reviewerAgentTimedOutEventType, reviewerAgentInterruptedEventType:
 		return true
 	default:
 		return false

@@ -4384,6 +4384,23 @@ func TestProcessClaimedItemInterruptsRunningReviewerWhenHeadChanges(t *testing.T
 	if requeued.Status != "queued" || requeued.LastErrorKind == nil || *requeued.LastErrorKind != string(FailureRetryableAfterResume) {
 		t.Fatalf("queue = %#v, want queued retryable-after-resume", requeued)
 	}
+	events, err := fixture.repos.Events.ListByEntity(context.Background(), "pull_request", "acme/looper#42")
+	if err != nil {
+		t.Fatalf("Events.ListByEntity() error = %v", err)
+	}
+	foundInterruptedEvent := false
+	for _, event := range events {
+		if event.EventType != "reviewer.agent.interrupted" {
+			continue
+		}
+		if !strings.Contains(event.PayloadJSON, `"phase":"review"`) || !strings.Contains(event.PayloadJSON, `"headSha":"abc123"`) || !strings.Contains(event.PayloadJSON, `"newHeadSha":"new-head"`) {
+			t.Fatalf("interrupted event payload = %s, want review phase with old and new head", event.PayloadJSON)
+		}
+		foundInterruptedEvent = true
+	}
+	if !foundInterruptedEvent {
+		t.Fatalf("events = %#v, want reviewer.agent.interrupted terminal event", events)
+	}
 }
 
 func TestProcessClaimedItemMarksNativeResumePendingWhenHeadChangesAndFlagEnabled(t *testing.T) {
