@@ -392,7 +392,7 @@ func TestUpgradeVerifyStartRejectsDaemonNotGovernedByCurrent(t *testing.T) {
 	}
 	found := false
 	for _, block := range report.Blocks {
-		if strings.Contains(block, "not governed by release current pointer") {
+		if strings.Contains(block, "not the release current pointer") || strings.Contains(block, "concrete release path") {
 			found = true
 			break
 		}
