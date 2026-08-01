@@ -44,10 +44,9 @@ func OpenSQLiteCoordinator(ctx context.Context, dbPath string, options SQLiteCoo
 	if err != nil {
 		return nil, err
 	}
-	openPath := dbPath
-	if openedPath != "" {
-		openPath = openedPath
-	}
+	// Open with frozen filesystem path but preserve original file: URI query
+	// options (cache, mode, _busy_timeout, …).
+	openPath := openPathWithPreservedURIOptions(dbPath, openedPath)
 	db, err := OpenSQLiteDB(ctx, openPath)
 	if err != nil {
 		return nil, err
@@ -73,6 +72,25 @@ func (c *SQLiteCoordinator) DatabasePath() string {
 		return ""
 	}
 	return c.path
+}
+
+// openPathWithPreservedURIOptions returns the DSN used to open SQLite: if
+// original was a file: URI, rebuild it with the frozen filesystem path and the
+// original query string; otherwise use the frozen path (or original if empty).
+func openPathWithPreservedURIOptions(original, frozenFS string) string {
+	if strings.TrimSpace(frozenFS) == "" {
+		return original
+	}
+	trimmed := strings.TrimSpace(original)
+	if len(trimmed) < 5 || !strings.EqualFold(trimmed[:5], "file:") {
+		return frozenFS
+	}
+	rest := trimmed[5:]
+	query := ""
+	if i := strings.Index(rest, "?"); i >= 0 {
+		query = rest[i:]
+	}
+	return "file:" + filepath.ToSlash(frozenFS) + query
 }
 
 // resolveOpenedDatabasePath freezes storage.dbPath for restore metadata: file:

@@ -139,6 +139,12 @@ func Recover(journalPath string) error {
 		return err
 	}
 	if journal.Phase == phaseCommitted {
+		// Before discarding undo files, prove committed targets still match the
+		// staged install identity. Missing or rewritten targets must fail loud
+		// so undo is not deleted while live data is absent/wrong.
+		if err := confirmCommittedTargetsIntact(journal); err != nil {
+			return err
+		}
 		if err := cleanupArtifactsAndJournal(journalPath, journal); err != nil {
 			return fmt.Errorf("clean committed restore transaction: %w", err)
 		}
@@ -468,6 +474,27 @@ func confirmTargetUnchanged(state targetState, description string) error {
 	}
 	if !state.present || !os.SameFile(state.info, current) || state.info.Mode().Perm() != current.Mode().Perm() {
 		return fmt.Errorf("existing %s changed while restore was staged", description)
+	}
+	return nil
+}
+
+// confirmCommittedTargetsIntact ensures database and config still match the
+// staged content hashes recorded in the journal before undo artifacts are removed.
+func confirmCommittedTargetsIntact(journal restoreJournal) error {
+	for _, entry := range journal.Entries {
+		if entry.Name != entryDatabase && entry.Name != entryConfig {
+			continue
+		}
+		if strings.TrimSpace(entry.StagedSHA256) == "" {
+			return fmt.Errorf("committed restore journal lacks staged identity for %s; refusing to discard undo files", entry.Name)
+		}
+		hash, size, err := fileContentIdentity(entry.TargetPath)
+		if err != nil {
+			return fmt.Errorf("committed restore target %s is missing or unreadable; undo preserved: %w", entry.Name, err)
+		}
+		if hash != entry.StagedSHA256 || size != entry.StagedSize {
+			return fmt.Errorf("committed restore target %s no longer matches staged identity; undo preserved", entry.Name)
+		}
 	}
 	return nil
 }

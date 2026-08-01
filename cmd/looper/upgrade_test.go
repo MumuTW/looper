@@ -332,7 +332,7 @@ func TestUpgradeVerifyStartRejectsUnheldReadyAdmission(t *testing.T) {
 		case "/api/v1/status":
 			writeEnvelope(w, http.StatusOK, map[string]any{"service": map[string]any{"healthy": true, "version": identity.Version, "build": identity.Metadata, "admissionState": "ready", "startedAt": "2026-07-31T12:35:00.000Z", "recovery": map[string]any{"outstanding": map[string]any{"quarantinedActiveExecutions": 0, "quarantinedRunningRuns": 0}}}, "storage": map[string]any{"schemaVersion": "0022_durable_payload_baseline", "pendingMigrations": []string{}, "healthy": true, "dbPath": dbPath}, "tools": map[string]any{"looperPath": filepath.Join(root, "current", "looper")}, "scheduler": map[string]any{"activeRuns": 0, "runningItems": 0}})
 		case "/api/v1/config":
-			writeEnvelope(w, http.StatusOK, map[string]any{"metadata": map[string]any{"configPath": configPath}})
+			writeEnvelope(w, http.StatusOK, map[string]any{"metadata": map[string]any{"configPath": configPath, "revision": upgradeTestConfigRevision}})
 		case "/api/v1/projects":
 			writeEnvelope(w, http.StatusOK, map[string]any{"items": []map[string]any{{"id": "project_1"}}})
 		case "/api/v1/events/notification/looperd":
@@ -647,7 +647,7 @@ func upgradePostStartDaemon(t *testing.T, identity version.Info, activeRuns int,
 			// verify-start requires held (draining) admission under LOOPER_UPGRADE_VERIFY_HOLD.
 			writeEnvelope(w, http.StatusOK, map[string]any{"service": map[string]any{"healthy": true, "version": identity.Version, "build": identity.Metadata, "admissionState": "draining", "startedAt": "2026-07-31T12:35:00.000Z", "recovery": map[string]any{"outstanding": map[string]any{"quarantinedActiveExecutions": 0, "quarantinedRunningRuns": 0}}}, "storage": map[string]any{"schemaVersion": "0022_durable_payload_baseline", "pendingMigrations": []string{}, "healthy": true, "dbPath": dbPath}, "tools": map[string]any{"looperPath": looperPath}, "scheduler": map[string]any{"activeRuns": activeRuns, "runningItems": activeRuns}})
 		case "/api/v1/config":
-			writeEnvelope(w, http.StatusOK, map[string]any{"metadata": map[string]any{"configPath": configPath}})
+			writeEnvelope(w, http.StatusOK, map[string]any{"metadata": map[string]any{"configPath": configPath, "revision": upgradeTestConfigRevision}})
 		case "/api/v1/projects":
 			writeEnvelope(w, http.StatusOK, map[string]any{"items": []map[string]any{{"id": "project_1"}}})
 		case "/api/v1/events/notification/looperd":
@@ -659,6 +659,9 @@ func upgradePostStartDaemon(t *testing.T, identity version.Info, activeRuns int,
 	t.Cleanup(server.Close)
 	return server
 }
+
+// upgradeTestConfigRevision is sha256 of the createUpgradeRestoreBundle fixture config "[server]\n".
+const upgradeTestConfigRevision = "sha256:0280a291e08088521c5132793496c4ebaffabd2237bd0b7eb1cd689525e30d16"
 
 func upgradeTestDaemon(t *testing.T, identity version.Info) *httptest.Server {
 	t.Helper()
