@@ -980,13 +980,21 @@ func captureFixerReproduction(checkpoint *fixerCheckpoint, worktreePath string) 
 // past the first durable capture opportunity. Used to fail closed for legacy
 // checkpoints that lack ReproductionAbsent after an upgrade.
 func fixerPastInitialReproductionCapture(checkpoint fixerCheckpoint) bool {
-	return checkpoint.Repair != nil ||
+	// In-progress repair (agent started but Repair not yet stored) still counts:
+	// FixItems + prepared worktree mean capture already had a chance to run.
+	if checkpoint.Repair != nil ||
 		checkpoint.Validation != nil ||
 		checkpoint.Push != nil ||
 		checkpoint.ReconcileCommits != nil ||
 		checkpoint.ResolvedComments != nil ||
 		checkpoint.SummaryComment != nil ||
-		checkpoint.Recheck != nil
+		checkpoint.Recheck != nil {
+		return true
+	}
+	if len(checkpoint.FixItems) > 0 && checkpoint.Worktree != nil && strings.TrimSpace(checkpoint.Worktree.PreparedAt) != "" {
+		return true
+	}
+	return false
 }
 
 func verifyFixerReproduction(checkpoint fixerCheckpoint, worktreePath string) error {
@@ -3295,10 +3303,6 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 			return checkpoint, err
 		}
 	}
-	if err := captureFixerReproduction(&checkpoint, worktree.Path); err != nil {
-		return checkpoint, err
-	}
-	validationCommands = fixerValidationCommands(validationCommands, checkpoint)
 	if held, summary, err := r.fixerHoldSummary(ctx, input.Project, input.Loop, input.Repo, input.PRNumber); err != nil {
 		return checkpoint, err
 	} else if held {
@@ -3318,6 +3322,17 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 			checkpoint.Pause = newCheckpointPause(checkpointPauseReasonRiskyConflict, true, detailHeadSHA(checkpoint.Detail), currentFixItemsStateHash(checkpoint), nil)
 			return checkpoint, &loopError{message: fmt.Sprintf("Could not merge base %q into %s#%d for conflict resolution: %v", base, input.Repo, input.PRNumber, mergeErr), kind: FailureManualIntervention}
 		}
+	}
+	// Capture after daemon-controlled merge so a base-introduced reproduction
+	// contract is accepted; later agent-authored files remain rejected via
+	// ReproductionAbsent. Persist before agent start so crash-resume sees the
+	// durable negative/positive observation.
+	if err := captureFixerReproduction(&checkpoint, worktree.Path); err != nil {
+		return checkpoint, err
+	}
+	validationCommands = fixerValidationCommands(validationCommands, checkpoint)
+	if err := r.persistCheckpoint(ctx, input.Run.ID, stepRepair, checkpoint); err != nil {
+		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 	}
 	executionID := eventlog.NewEventID("agent")
 	agentVendor, agentModel, _, useSnapshot, err := r.identityFromRun(input.Run)

@@ -457,14 +457,21 @@ func takeoverLoop(ctx context.Context, services looperdruntime.Services, loopID,
 	// with terminal Fixer cleanup on the managed PR worktree (siblings share
 	// looper-fix-<project>-pr-N). Empty target key is a no-op.
 	unlockLoop := looperdruntime.LockLoopRequeue(loopID)
-	var unlockTarget func()
+	var unlockTarget func() = func() {}
 	if services.Repositories != nil && services.Repositories.Loops != nil {
-		if loop, err := services.Repositories.Loops.GetByID(ctx, loopID); err == nil && loop != nil {
-			unlockTarget = loops.LockLoopTarget(loops.LoopTargetGuardKeyFromRecord(*loop))
+		loop, err := services.Repositories.Loops.GetByID(ctx, loopID)
+		if err != nil {
+			// Fail closed: a transient storage error must not proceed without
+			// the shared PR fence while sibling cleanup can still delete the
+			// checkout.
+			unlockLoop()
+			return result, fmt.Errorf("load loop before takeover target fence: %w", err)
 		}
-	}
-	if unlockTarget == nil {
-		unlockTarget = func() {}
+		if loop == nil {
+			unlockLoop()
+			return result, fmt.Errorf("loop not found before takeover target fence: %s", loopID)
+		}
+		unlockTarget = loops.LockLoopTarget(loops.LoopTargetGuardKeyFromRecord(*loop))
 	}
 	if services.Repositories != nil && services.Repositories.AgentExecutions != nil {
 		execution, err := services.Repositories.AgentExecutions.GetLatestByLoopID(ctx, loopID)
