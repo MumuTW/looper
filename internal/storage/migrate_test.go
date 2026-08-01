@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/base64"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -822,6 +823,20 @@ func writeLegacyDBFixture(t *testing.T, fixtureID string) string {
 
 	encodedFixture, err := os.ReadFile(filepath.Join("testdata", "ts-created-migration-versions", fixtureID+".sqlite.base64"))
 	if err != nil {
+		// 0022 changes only the compatibility ledger. Derive its exact database
+		// state from the final TypeScript-created schema fixture plus the marker,
+		// rather than duplicate a large base64 SQLite blob with no DDL difference.
+		if os.IsNotExist(err) && fixtureID == "0022_durable_payload_baseline" {
+			dbPath := writeLegacyDBFixture(t, "0021_worktree_path_unique")
+			db := openSQLiteDBAtPath(t, dbPath)
+			runner := NewMigrationRunner(db, MigrationRunnerOptions{Migrations: EmbeddedMigrations, Now: func() time.Time {
+				return time.Date(2026, time.April, 17, 12, 0, 0, 0, time.UTC)
+			}})
+			if _, applyErr := runner.RunPending(context.Background()); applyErr != nil {
+				t.Fatalf("apply durable payload baseline fixture: %v", applyErr)
+			}
+			return dbPath
+		}
 		t.Fatalf("os.ReadFile(%q) error = %v", fixtureID, err)
 	}
 
@@ -1111,6 +1126,68 @@ func TestMigrationRunnerValidateCompatibilityAcceptsKnownAppliedMigrations(t *te
 
 	if err := runner.ValidateCompatibility(ctx); err != nil {
 		t.Fatalf("runner.ValidateCompatibility() on known schema error = %v, want nil", err)
+	}
+}
+
+// SQL columns alone cannot prove an older binary understands durable JSON
+// checkpoints, events, agent retry snapshots, or pull-request snapshots. The
+// 0022 migration records the baseline in the same ordered manifest that gates
+// every daemon boot, so an older binary fails before it can silently ignore a
+// newer payload field.
+func TestDurablePayloadBaselineBlocksPreBaselineBinary(t *testing.T) {
+	t.Parallel()
+	if got := EmbeddedMigrations[len(EmbeddedMigrations)-1].ID; got != "0022_durable_payload_baseline" {
+		t.Fatalf("latest migration = %q, want durable payload baseline", got)
+	}
+	ctx := context.Background()
+	db := openTestSQLiteDB(t)
+	current := NewMigrationRunner(db, MigrationRunnerOptions{Migrations: EmbeddedMigrations})
+	if _, err := current.RunPending(ctx); err != nil {
+		t.Fatalf("current RunPending() error = %v", err)
+	}
+	const now = "2026-07-31T12:00:00.000Z"
+	checkpoint := `{"resumePolicy":"restart_from_discover","work":{"repo":"acme/looper","issueNumber":42}}`
+	agentSnapshot := `{"vendor":"codex","model":"gpt-5.6","profileId":"default"}`
+	eventPayload := `{"outcome":"completed","retryLineage":"run_previous"}`
+	pullRequestPayload := `{"diff":"diff --git a/a.go b/a.go","reviewThreads":[]}`
+	for name, payload := range map[string]string{"checkpoint": checkpoint, "agent snapshot": agentSnapshot, "event": eventPayload, "pull request snapshot": pullRequestPayload} {
+		if !json.Valid([]byte(payload)) {
+			t.Fatalf("%s fixture is not valid JSON", name)
+		}
+	}
+	statements := []struct {
+		query string
+		args  []any
+	}{
+		{`INSERT INTO projects (id, name, repo_path, archived, created_at, updated_at) VALUES ('project_payload', 'Payload', '/tmp/payload', 0, ?, ?)`, []any{now, now}},
+		{`INSERT INTO loops (id, seq, project_id, type, target_type, status, created_at, updated_at) VALUES ('loop_payload', 1, 'project_payload', 'worker', 'project', 'paused', ?, ?)`, []any{now, now}},
+		{`INSERT INTO runs (id, loop_id, status, checkpoint_json, started_at, created_at, updated_at, agent_snapshot_json, seq) VALUES ('run_payload', 'loop_payload', 'failed', ?, ?, ?, ?, ?, 1)`, []any{checkpoint, now, now, now, agentSnapshot}},
+		{`INSERT INTO event_logs (id, event_type, payload_json, created_at) VALUES ('event_payload', 'worker.completed', ?, ?)`, []any{eventPayload, now}},
+		{`INSERT INTO pull_request_snapshots (id, project_id, repo, pr_number, head_sha, payload_json, captured_at, created_at) VALUES ('snapshot_payload', 'project_payload', 'acme/looper', 42, 'head', ?, ?, ?)`, []any{pullRequestPayload, now, now}},
+	}
+	for _, statement := range statements {
+		if _, err := db.ExecContext(ctx, statement.query, statement.args...); err != nil {
+			t.Fatalf("seed durable payload: %v", err)
+		}
+	}
+	var storedCheckpoint, storedAgent, storedEvent, storedSnapshot string
+	if err := db.QueryRowContext(ctx, `SELECT checkpoint_json, agent_snapshot_json FROM runs WHERE id = 'run_payload'`).Scan(&storedCheckpoint, &storedAgent); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT payload_json FROM event_logs WHERE id = 'event_payload'`).Scan(&storedEvent); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT payload_json FROM pull_request_snapshots WHERE id = 'snapshot_payload'`).Scan(&storedSnapshot); err != nil {
+		t.Fatal(err)
+	}
+	for name, payload := range map[string]string{"checkpoint": storedCheckpoint, "agent snapshot": storedAgent, "event": storedEvent, "pull request snapshot": storedSnapshot} {
+		if !json.Valid([]byte(payload)) {
+			t.Fatalf("stored %s is not valid JSON", name)
+		}
+	}
+	preBaseline := NewMigrationRunner(db, MigrationRunnerOptions{Migrations: EmbeddedMigrations[:len(EmbeddedMigrations)-1]})
+	if err := preBaseline.ValidateCompatibility(ctx); err == nil || !containsAll(err.Error(), []string{"0022_durable_payload_baseline", "restore a backup matching this version"}) {
+		t.Fatalf("pre-baseline ValidateCompatibility() error = %v, want payload downgrade refusal", err)
 	}
 }
 

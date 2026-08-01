@@ -52,7 +52,7 @@ func TestUpgradePreflightReadsCurrentDaemonAndTargetPair(t *testing.T) {
 			if !slices.Equal(report.StartDrainBlocks, wantBlocks) {
 				t.Fatalf("start drain blocks = %v, want %v", report.StartDrainBlocks, wantBlocks)
 			}
-			if report.Current.Status.Storage.SchemaVersion != "0021" || report.Current.Status.Scheduler.ActiveRuns != 2 || report.Current.Status.Service.Recovery.Outstanding.QuarantinedActiveExecutions != 1 {
+			if report.Current.Status.Storage.SchemaVersion != "0022_durable_payload_baseline" || report.Current.Status.Scheduler.ActiveRuns != 2 || report.Current.Status.Service.Recovery.Outstanding.QuarantinedActiveExecutions != 1 {
 				t.Fatalf("current status missing from report: %#v", report.Current.Status)
 			}
 		})
@@ -488,7 +488,7 @@ func upgradePostStartDaemon(t *testing.T, identity version.Info, activeRuns int)
 		case "/api/v1/version":
 			writeEnvelope(w, http.StatusOK, upgradeDaemonVersion{Version: identity.Version, Build: identity.Metadata})
 		case "/api/v1/status":
-			writeEnvelope(w, http.StatusOK, map[string]any{"service": map[string]any{"healthy": true, "version": identity.Version, "build": identity.Metadata, "admissionState": "ready", "startedAt": "2026-07-31T12:35:00.000Z", "recovery": map[string]any{"outstanding": map[string]any{"quarantinedActiveExecutions": 0, "quarantinedRunningRuns": 0}}}, "storage": map[string]any{"schemaVersion": "0021", "pendingMigrations": []string{}, "healthy": true}, "scheduler": map[string]any{"activeRuns": activeRuns, "runningItems": activeRuns}})
+			writeEnvelope(w, http.StatusOK, map[string]any{"service": map[string]any{"healthy": true, "version": identity.Version, "build": identity.Metadata, "admissionState": "ready", "startedAt": "2026-07-31T12:35:00.000Z", "recovery": map[string]any{"outstanding": map[string]any{"quarantinedActiveExecutions": 0, "quarantinedRunningRuns": 0}}}, "storage": map[string]any{"schemaVersion": "0022_durable_payload_baseline", "pendingMigrations": []string{}, "healthy": true}, "scheduler": map[string]any{"activeRuns": activeRuns, "runningItems": activeRuns}})
 		case "/api/v1/projects":
 			writeEnvelope(w, http.StatusOK, map[string]any{"items": []map[string]any{{"id": "project_1"}}})
 		case "/api/v1/events/notification/looperd":
@@ -508,7 +508,7 @@ func upgradeTestDaemon(t *testing.T, identity version.Info) *httptest.Server {
 		case "/api/v1/version":
 			writeEnvelope(w, http.StatusOK, upgradeDaemonVersion{Version: identity.Version, Build: identity.Metadata})
 		case "/api/v1/status":
-			writeEnvelope(w, http.StatusOK, map[string]any{"service": map[string]any{"healthy": true, "admissionState": "ready", "build": identity.Metadata, "recovery": map[string]any{"outstanding": map[string]any{"quarantinedActiveExecutions": 1, "quarantinedRunningRuns": 0}}}, "storage": map[string]any{"schemaVersion": "0021", "pendingMigrations": []string{}, "healthy": true}, "scheduler": map[string]any{"activeRuns": 2, "runningItems": 2}})
+			writeEnvelope(w, http.StatusOK, map[string]any{"service": map[string]any{"healthy": true, "admissionState": "ready", "build": identity.Metadata, "recovery": map[string]any{"outstanding": map[string]any{"quarantinedActiveExecutions": 1, "quarantinedRunningRuns": 0}}}, "storage": map[string]any{"schemaVersion": "0022_durable_payload_baseline", "pendingMigrations": []string{}, "healthy": true}, "scheduler": map[string]any{"activeRuns": 2, "runningItems": 2}})
 		default:
 			t.Errorf("unexpected request %s", r.URL.Path)
 			w.WriteHeader(http.StatusNotFound)
