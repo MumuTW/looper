@@ -1,8 +1,10 @@
 package upgraderelease
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -91,6 +93,73 @@ func TestStageReusesIdenticalExistingRelease(t *testing.T) {
 	changed := writeExecutable(t, sources, "looper-changed", "changed")
 	if _, err := Stage(StageInput{RootDir: root, ReleaseID: first.ReleaseID, CLIBinaryPath: changed, DaemonBinaryPath: daemon, Build: build, Now: fixedNow}); err == nil {
 		t.Fatal("Stage() error = nil for conflicting existing release")
+	}
+}
+
+func TestActivateRestoresPreviousPointerAtomicallyWhenSyncFails(t *testing.T) {
+	root := t.TempDir()
+	sources := t.TempDir()
+	first, err := Stage(StageInput{RootDir: root, ReleaseID: "1.2.3-stable-aaaaaaa", CLIBinaryPath: writeExecutable(t, sources, "looper", "cli-v1"), DaemonBinaryPath: writeExecutable(t, sources, "looperd", "daemon-v1"), Build: testBuild("1.2.3", "aaaaaaa"), Now: fixedNow})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Activate(root, first.ReleaseID); err != nil {
+		t.Fatal(err)
+	}
+	second, err := Stage(StageInput{RootDir: root, ReleaseID: "1.2.4-stable-bbbbbbb", CLIBinaryPath: writeExecutable(t, sources, "looper-v2", "cli-v2"), DaemonBinaryPath: writeExecutable(t, sources, "looperd-v2", "daemon-v2"), Build: testBuild("1.2.4", "bbbbbbb"), Now: fixedNow})
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalSync := activateSyncDirectory
+	t.Cleanup(func() { activateSyncDirectory = originalSync })
+	calls := 0
+	activateSyncDirectory = func(string) error {
+		calls++
+		if calls == 1 {
+			return errors.New("injected current sync failure")
+		}
+		return nil
+	}
+	if _, err := Activate(root, second.ReleaseID); err == nil || !strings.Contains(err.Error(), "injected current sync failure") {
+		t.Fatalf("Activate() error = %v, want sync failure", err)
+	}
+	if current, err := CurrentReleaseID(root); err != nil || current != first.ReleaseID {
+		t.Fatalf("CurrentReleaseID() after failed activate = (%q, %v), want previous %q", current, err, first.ReleaseID)
+	}
+	if entries, err := os.ReadDir(root); err != nil {
+		t.Fatal(err)
+	} else {
+		for _, entry := range entries {
+			if strings.HasPrefix(entry.Name(), ".current-") {
+				t.Fatalf("temporary current pointer remains: %s", entry.Name())
+			}
+		}
+	}
+}
+
+func TestStageRejectsSymlinkedExistingReleaseDirectory(t *testing.T) {
+	root := t.TempDir()
+	sources := t.TempDir()
+	input := StageInput{
+		RootDir:          root,
+		ReleaseID:        "1.2.3-stable-aaaaaaa",
+		CLIBinaryPath:    writeExecutable(t, sources, "looper", "cli"),
+		DaemonBinaryPath: writeExecutable(t, sources, "looperd", "daemon"),
+		Build:            testBuild("1.2.3", "aaaaaaa"),
+		Now:              fixedNow,
+	}
+	if err := os.MkdirAll(filepath.Join(root, "releases"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	external := filepath.Join(t.TempDir(), "release")
+	if err := os.MkdirAll(external, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(external, filepath.Join(root, "releases", input.ReleaseID)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Stage(input); err == nil || !strings.Contains(err.Error(), "real directory") {
+		t.Fatalf("Stage() error = %v, want symlink destination rejection", err)
 	}
 }
 

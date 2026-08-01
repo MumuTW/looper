@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -21,6 +22,8 @@ import (
 const ManifestVersion = 1
 
 var releaseIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+
+var activateSyncDirectory = syncDirectory
 
 type File struct {
 	SHA256 string `json:"sha256"`
@@ -88,7 +91,10 @@ func Stage(input StageInput) (StageResult, error) {
 		return StageResult{}, fmt.Errorf("create releases directory: %w", err)
 	}
 	destination := filepath.Join(releasesDir, input.ReleaseID)
-	if _, err := os.Lstat(destination); err == nil {
+	if info, err := os.Lstat(destination); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+			return StageResult{}, fmt.Errorf("release destination %s must be a real directory, not a symlink or other file", destination)
+		}
 		// Idempotent restage: later cutovers re-stage the live pair that is
 		// already this release id from a prior candidate stage.
 		return reuseExistingRelease(root, input)
@@ -253,7 +259,7 @@ func Activate(rootDir, releaseID string) (ActivationResult, error) {
 	serviceExecutable := CurrentDaemonExecutable(staged.RootDir)
 	if previous == releaseID {
 		// Idempotent activate: still ensure the durability barrier for current.
-		if err := syncDirectory(staged.RootDir); err != nil {
+		if err := activateSyncDirectory(staged.RootDir); err != nil {
 			return ActivationResult{}, fmt.Errorf("sync already-active release pointer: %w", err)
 		}
 		return ActivationResult{RootDir: staged.RootDir, PreviousReleaseID: previous, CurrentReleaseID: releaseID, ServiceExecutable: serviceExecutable}, nil
@@ -278,20 +284,57 @@ func Activate(rootDir, releaseID string) (ActivationResult, error) {
 		_ = os.Remove(temporaryPath)
 		return ActivationResult{}, fmt.Errorf("atomically switch current release: %w", err)
 	}
-	if err := syncDirectory(staged.RootDir); err != nil {
-		// current already points at the candidate; restore previous and sync so
-		// the operator is not left with an unreported successful activation.
-		if previous != "" {
-			_ = os.Remove(currentPath)
-			_ = os.Symlink(filepath.Join("releases", previous), currentPath)
-			_ = syncDirectory(staged.RootDir)
-		} else {
-			_ = os.Remove(currentPath)
-			_ = syncDirectory(staged.RootDir)
+	if err := activateSyncDirectory(staged.RootDir); err != nil {
+		// current already points at the candidate; restore previous through an
+		// atomic temporary-symlink rename and surface every rollback failure.
+		var restoreErr error
+		selected, selectErr := currentReleaseID(staged.RootDir)
+		switch {
+		case selectErr != nil:
+			restoreErr = fmt.Errorf("inspect current pointer before rollback: %w", selectErr)
+		case selected != releaseID:
+			restoreErr = fmt.Errorf("current pointer changed to %q before rollback", selected)
+		default:
+			restoreErr = restoreCurrentPointer(staged.RootDir, currentPath, previous)
+		}
+		if restoreErr != nil {
+			return ActivationResult{}, fmt.Errorf("sync current release pointer after activate: %v; restore previous %q: %w", err, previous, restoreErr)
 		}
 		return ActivationResult{}, fmt.Errorf("sync current release pointer after activate (restored previous %q): %w", previous, err)
 	}
 	return ActivationResult{RootDir: staged.RootDir, PreviousReleaseID: previous, CurrentReleaseID: releaseID, ServiceExecutable: serviceExecutable}, nil
+}
+
+func restoreCurrentPointer(root, currentPath, previous string) error {
+	if previous == "" {
+		if err := os.Remove(currentPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove candidate current pointer: %w", err)
+		}
+		return activateSyncDirectory(root)
+	}
+	temporary, err := os.CreateTemp(root, ".current-restore-")
+	if err != nil {
+		return fmt.Errorf("reserve previous current pointer: %w", err)
+	}
+	temporaryPath := temporary.Name()
+	if err := temporary.Close(); err != nil {
+		_ = os.Remove(temporaryPath)
+		return fmt.Errorf("close previous current pointer reservation: %w", err)
+	}
+	if err := os.Remove(temporaryPath); err != nil {
+		return fmt.Errorf("prepare previous current pointer: %w", err)
+	}
+	if err := os.Symlink(filepath.Join("releases", previous), temporaryPath); err != nil {
+		return fmt.Errorf("create previous current pointer: %w", err)
+	}
+	if err := os.Rename(temporaryPath, currentPath); err != nil {
+		_ = os.Remove(temporaryPath)
+		return fmt.Errorf("atomically restore previous current pointer: %w", err)
+	}
+	if err := activateSyncDirectory(root); err != nil {
+		return fmt.Errorf("sync restored current pointer: %w", err)
+	}
+	return nil
 }
 
 // CurrentDaemonExecutable is the supervised-launch path for an activated
