@@ -2609,6 +2609,41 @@ func unsupportedToolNetworkDenialError(vendor config.AgentVendor) error {
 	)
 }
 
+// resolveHermesArgs makes the scheduler-owned prompt the only one-shot query.
+func resolveHermesArgs(cfg ExecutorConfig, args []string, prompt string) []string {
+	resolved := removeFlagsWithValues(args, []string{"-z", "--zen", "-q", "--query"})
+	resolved = prependModelFlag(resolved, cfg.Model, "--model", []string{"--model", "-m"})
+	if !hasAnyFlag(resolved, []string{"--yolo"}) {
+		resolved = append(resolved, "--yolo")
+	}
+	return append(resolved, "-z", prompt)
+}
+
+func removeFlagsWithValues(args []string, flags []string) []string {
+	result := make([]string, 0, len(args))
+	for index := 0; index < len(args); index++ {
+		arg := args[index]
+		remove := false
+		for _, flag := range flags {
+			if arg == flag {
+				remove = true
+				if index+1 < len(args) {
+					index++
+				}
+				break
+			}
+			if strings.HasPrefix(arg, flag+"=") {
+				remove = true
+				break
+			}
+		}
+		if !remove {
+			result = append(result, arg)
+		}
+	}
+	return result
+}
+
 func resolveNativeResumeArgs(cfg ExecutorConfig, workingDirectory string, args []string, sessionID string, prompt string) []string {
 	if adapter, ok := runtimeAdapterFor(cfg.Vendor); ok && adapter.resolveNativeResumeArgs != nil {
 		return adapter.resolveNativeResumeArgs(cfg, args, workingDirectory, sessionID, prompt)

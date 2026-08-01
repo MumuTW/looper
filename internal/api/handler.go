@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/MumuTW/looper/internal/agent"
+	"github.com/MumuTW/looper/internal/agentdiscovery"
 	"github.com/MumuTW/looper/internal/config"
 	"github.com/MumuTW/looper/internal/daemonbinary"
 	"github.com/MumuTW/looper/internal/domain"
@@ -126,6 +127,10 @@ type Context struct {
 	// preflight. Production leaves it nil and uses the configured GitHub gateway;
 	// embeddings and tests can inject the same freshness authority explicitly.
 	RefreshTargetLabels func(ctx context.Context, target domain.LoopTarget, cwd string) ([]string, error)
+	// DiscoverAgentProviders probes locally installed coding agents and
+	// returns a vendor suggestion. Optional: when nil, the endpoint reports
+	// discovery as unavailable.
+	DiscoverAgentProviders func(ctx context.Context, cfg config.Config) (agentdiscovery.Report, error)
 }
 
 // PullRequestTarget is the minimum a caller needs to decide whether a pull
@@ -259,7 +264,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// The config endpoint needs one coherent config-and-metadata snapshot.
 	// Other routes use the current in-memory runtime config for authorization
 	// and policy without constructing dashboard metadata.
-	if normalizePath(r.URL.Path) == apiBasePath+"/config" && h.context.ConfigSnapshot != nil {
+	if (normalizePath(r.URL.Path) == apiBasePath+"/config" || normalizePath(r.URL.Path) == apiBasePath+"/agent/providers/discovery") && h.context.ConfigSnapshot != nil {
 		cfg, metadata := h.context.ConfigSnapshot()
 		requestHandler.context.Config = cfg
 		requestHandler.context.ConfigMetadata = func() ConfigMetadata { return metadata }
@@ -384,6 +389,22 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	case apiBasePath + "/config":
 		h.handleConfigRoute(w, r, requestID)
+		return
+	case apiBasePath + "/agent/providers/discovery":
+		if !assertMethod(r.Method, http.MethodGet, path, w, requestID, h.writeError) {
+			return
+		}
+		if h.context.DiscoverAgentProviders == nil {
+			h.writeError(w, requestID, apiError{code: pkgapi.ErrorCodeServiceUnavailable, status: http.StatusServiceUnavailable, message: "Agent provider discovery is unavailable"})
+			return
+		}
+		report, err := h.context.DiscoverAgentProviders(r.Context(), h.context.Config)
+		if err != nil {
+			h.writeError(w, requestID, internalServerError(err))
+			return
+		}
+		report.ConfigRevision = h.buildConfigMetadata().Revision
+		h.writeSuccess(w, requestID, report)
 		return
 	case apiBasePath + "/webhook/status":
 		if !assertMethod(r.Method, http.MethodGet, path, w, requestID, h.writeError) {

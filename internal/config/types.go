@@ -9,6 +9,7 @@ const (
 	AgentVendorCursorCLI         AgentVendor = "cursor-cli"
 	AgentVendorGrokBuild         AgentVendor = "grok-build"
 	AgentVendorDevinExperimental AgentVendor = "devin-experimental"
+	AgentVendorHermes            AgentVendor = "hermes"
 )
 
 var supportedAgentVendors = []AgentVendor{
@@ -18,6 +19,7 @@ var supportedAgentVendors = []AgentVendor{
 	AgentVendorCursorCLI,
 	AgentVendorGrokBuild,
 	AgentVendorDevinExperimental,
+	AgentVendorHermes,
 }
 
 // ConfigurableAgentVendors returns the vendor identities accepted by
