@@ -879,7 +879,7 @@ func isMutatingHTTPMethod(method string) bool {
 // response is lost past the deadline.
 func isAdmissionExemptMutationPath(path string) bool {
 	switch path {
-	case dashboardBootstrapCodePath, dashboardBootstrapExchangePath, apiBasePath + "/upgrade/drain":
+	case dashboardBootstrapCodePath, dashboardBootstrapExchangePath, apiBasePath + "/upgrade/drain", apiBasePath + "/upgrade/backup":
 		return true
 	default:
 		return false
