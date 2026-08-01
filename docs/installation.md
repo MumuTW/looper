@@ -220,9 +220,9 @@ go run ./cmd/looper stop 12
 Stage a matching CLI/daemon pair, then activate via an atomic release pointer:
 
 ```bash
-looper upgrade stage-release --root <dir> --release-id <id> --target-looper <path> --target-looperd <path>
-looper upgrade activate-release --root <dir> --release-id <id>
-looper upgrade verify-start --root <dir>
+looper upgrade stage-release --release-root <dir> --target-looper <path> --target-looperd <path>
+looper upgrade activate-release --release-root <dir> --release <id>
+looper upgrade verify-start --release-root <dir> --release <id>
 ```
 
 `verify-start` must succeed before declaring cutover success. `package.autoUpgradeEnabled` is not a supported managed upgrade path (legacy decode only).

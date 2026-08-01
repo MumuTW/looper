@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 
 	"github.com/MumuTW/looper/internal/version"
@@ -92,6 +93,12 @@ func TestUpgradePreflightReportsTargetConfigFailure(t *testing.T) {
 	}
 	if report.TargetConfigCompatible || report.TargetConfigError != "configuration schema rejected" {
 		t.Fatalf("config result = (%v, %q)", report.TargetConfigCompatible, report.TargetConfigError)
+	}
+}
+
+func TestTargetConfigFlagsExcludeClientEndpointOverrides(t *testing.T) {
+	if got, want := targetConfigFlags([]string{"--host", "127.0.0.1", "--config", "/etc/looper.toml", "--port=9443"}), []string{"--config", "/etc/looper.toml"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("targetConfigFlags() = %#v, want %#v", got, want)
 	}
 }
 
