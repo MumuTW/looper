@@ -51,21 +51,24 @@ type hitlAsk struct {
 // an enormous file is not a decodable gate request.
 const maxAskSentinelBytes = 1 << 20
 
-// consumeAskSentinel reads and removes the agent's ask sentinel from the
+// consumeAskSentinel stages and reads the agent's ask sentinel from the
 // worktree, if present. A missing sentinel is the ONLY no-question case:
 // the sentinel is the agent's structured request for a human gate, so once
 // the file exists, inability to read or decode it fails closed with the
 // evidence quarantined for inspection — a truncated ask for a destructive
 // decision must not let the worker continue to validation and publication.
-// Consuming (deleting) a valid sentinel prevents the same question from
-// re-suspending on resume.
-func consumeAskSentinel(worktreePath string) (*hitlAsk, error) {
+//
+// A valid sentinel is NOT deleted here: the staged ask.pending remains until
+// suspendForHuman persists the ask to loop metadata, so a crash between detect
+// and persist can re-enter suspension from the filesystem copy. Callers must
+// consume the returned evidence after a durable write (or on deliberate discard).
+func consumeAskSentinel(worktreePath string) (*hitlAsk, *loops.HITLGateEvidence, error) {
 	raw, evidence, err := loops.StageHITLGateEvidence(worktreePath, maxAskSentinelBytes)
 	if evidence == nil {
-		return nil, err
+		return nil, nil, err
 	}
-	protocolError := func(cause error) (*hitlAsk, error) {
-		return nil, &askSentinelProtocolError{cause: cause, evidence: evidence}
+	protocolError := func(cause error) (*hitlAsk, *loops.HITLGateEvidence, error) {
+		return nil, nil, &askSentinelProtocolError{cause: cause, evidence: evidence}
 	}
 	if err != nil {
 		return protocolError(err)
@@ -83,10 +86,7 @@ func consumeAskSentinel(worktreePath string) (*hitlAsk, error) {
 	if strings.TrimSpace(ask.Question) == "" {
 		return protocolError(errors.New("ask sentinel has no question"))
 	}
-	if err := loops.ConsumeHITLGateEvidence(evidence); err != nil {
-		return protocolError(fmt.Errorf("decoded ask sentinel could not be consumed: %w", err))
-	}
-	return &ask, nil
+	return &ask, evidence, nil
 }
 
 type askSentinelProtocolError struct {
@@ -116,6 +116,9 @@ type awaitingHumanError struct {
 	consequences      map[string]string
 	confidence        string
 	gateEvidence      *loops.HITLGateEvidence
+	// stagedPending is the filesystem identity of a valid decoded ask.pending.
+	// It must remain until suspendForHuman persists the ask, then be consumed.
+	stagedPending *loops.HITLGateEvidence
 }
 
 func (e *awaitingHumanError) Error() string { return "worker paused awaiting human decision" }
@@ -182,6 +185,55 @@ func (r *Runner) latestNativeSessionID(ctx context.Context, loopID, agentVendor 
 		return ""
 	}
 	return strings.TrimSpace(*execution.NativeSessionID)
+}
+
+// mergeHITLCorrelation writes GitHub PR/comment correlation onto an ask without
+// clobbering a human answer that may have been persisted concurrently.
+func mergeHITLCorrelation(delivered loops.HITLAsk, currentMetadata *string) loops.HITLAsk {
+	existing, ok := loops.ReadHITLAsk(currentMetadata)
+	if !ok {
+		return delivered
+	}
+	merged := delivered
+	// Preserve human answer authority.
+	if strings.TrimSpace(existing.Answer) != "" {
+		merged.Answer = existing.Answer
+		merged.AnsweredAt = existing.AnsweredAt
+		if existing.Status == "answered" || existing.Status == "consumed" {
+			merged.Status = existing.Status
+		} else if merged.Status == "" || merged.Status == "awaiting" {
+			merged.Status = "answered"
+		}
+	} else if existing.Status == "answered" || existing.Status == "consumed" {
+		merged.Status = existing.Status
+		merged.AnsweredAt = existing.AnsweredAt
+	}
+	// Prefer non-zero correlation from either side.
+	if merged.PRNumber == 0 {
+		merged.PRNumber = existing.PRNumber
+	}
+	if merged.AskCommentID == 0 {
+		merged.AskCommentID = existing.AskCommentID
+	}
+	if strings.TrimSpace(merged.Transport) == "" {
+		merged.Transport = existing.Transport
+	}
+	if merged.GateEvidence == nil {
+		merged.GateEvidence = existing.GateEvidence
+	}
+	if strings.TrimSpace(merged.SessionID) == "" {
+		merged.SessionID = existing.SessionID
+	}
+	if strings.TrimSpace(merged.ExecutionID) == "" {
+		merged.ExecutionID = existing.ExecutionID
+	}
+	if strings.TrimSpace(merged.Vendor) == "" {
+		merged.Vendor = existing.Vendor
+	}
+	if strings.TrimSpace(merged.Question) == "" {
+		merged.Question = existing.Question
+	}
+	return merged
 }
 
 // acknowledgePostTurnMetadata serializes every post-turn metadata mutation
@@ -261,7 +313,7 @@ func (r *Runner) readFreshHITLAsk(ctx context.Context, loop *storage.LoopRecord)
 // returns a typed awaitingHumanError carrying the question, options, and the
 // agent's native session id (so the run can resume the same session).
 func (r *Runner) detectHumanAsk(ctx context.Context, input stepInput, worktreePath, executionID string) (*awaitingHumanError, error) {
-	ask, err := consumeAskSentinel(worktreePath)
+	ask, evidence, err := consumeAskSentinel(worktreePath)
 	if err != nil {
 		var protocol *askSentinelProtocolError
 		if errors.As(err, &protocol) {
@@ -299,6 +351,7 @@ func (r *Runner) detectHumanAsk(ctx context.Context, input stepInput, worktreePa
 		recommendedOption: ask.RecommendedOption,
 		consequences:      ask.Consequences,
 		confidence:        ask.Confidence,
+		stagedPending:     evidence,
 	}, nil
 }
 
@@ -373,7 +426,12 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 	// concurrently by the enqueue path must not be overwritten by this upsert.
 	unlockRequeue := loops.LockLoopRequeue(input.Loop.ID)
 	_, updateErr := r.updateLoop(ctx, input.Loop, func(updated *storage.LoopRecord) {
-		meta, werr := loops.WriteHITLAsk(updated.MetadataJSON, ask)
+		// deliverAskToGitHub may have raced with the answer endpoint. Merge the
+		// freshly delivered correlation into the latest metadata instead of
+		// replacing a human answer that was persisted while the request was in
+		// flight.
+		toWrite := mergeHITLCorrelation(ask, updated.MetadataJSON)
+		meta, werr := loops.WriteHITLAsk(updated.MetadataJSON, toWrite)
 		if werr != nil {
 			// Without a stored ask the response paths can never resume this
 			// loop; abort the whole suspension instead of parking it stranded.
@@ -398,6 +456,13 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 	if askWriteErr != nil {
 		return r.abortSuspension(ctx, run, checkpoint, askWriteErr)
 	}
+	// Ask is durable in loop metadata: safe to drop the staged filesystem copy
+	// of a valid sentinel so the next execute does not re-suspend on the same file.
+	if awaiting.stagedPending != nil {
+		if err := loops.ConsumeHITLGateEvidence(awaiting.stagedPending); err != nil && r.logger != nil {
+			r.logger.Warn("worker HITL staged pending was not consumed after ask persist", map[string]any{"loopId": input.Loop.ID, "error": err.Error()})
+		}
+	}
 	reason := "worker suspended awaiting human decision"
 	if _, err := r.repos.Queue.CancelByLoop(ctx, input.Loop.ID, nowISO, &reason); err != nil {
 		return ProcessResult{}, err
@@ -418,7 +483,14 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 			unlock := loops.LockLoopRequeue(input.Loop.ID)
 			var correlationWriteErr error
 			_, persistErr := r.updateLoop(ctx, input.Loop, func(updated *storage.LoopRecord) {
-				meta, err := loops.WriteHITLAsk(updated.MetadataJSON, ask)
+				// deliverAskToGitHub only adds PR/comment correlation. A human
+				// may have answered via API while that request was in flight;
+				// preserve Answer/Status/AnsweredAt from the freshest record.
+				// Re-merge under LockLoopRequeue (held for this whole update);
+				// deliverHumanAnswer takes the same lock so answer and
+				// correlation cannot overwrite each other.
+				toWrite := mergeHITLCorrelation(ask, updated.MetadataJSON)
+				meta, err := loops.WriteHITLAsk(updated.MetadataJSON, toWrite)
 				if err != nil {
 					correlationWriteErr = err
 					return

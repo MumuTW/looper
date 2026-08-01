@@ -2116,6 +2116,16 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 	}
 	work = *checkpoint.Work
 	if !executionCompleted {
+		// Crash recovery: if StageHITLGateEvidence left ask.pending before
+		// suspendForHuman persisted the ask, do not start another agent turn.
+		// Re-enter the suspension path from the staged evidence first.
+		if r.hitlEnabled {
+			if awaiting, awaitErr := r.detectHumanAsk(ctx, input, worktree.Path, ""); awaitErr != nil {
+				return checkpoint, awaitErr
+			} else if awaiting != nil {
+				return checkpoint, awaiting
+			}
+		}
 		agentVendor, agentModel, _, useSnapshot, err := r.identityFromRun(input.Run)
 		if err != nil {
 			return checkpoint, fmt.Errorf("resolve run agent identity: %w", err)

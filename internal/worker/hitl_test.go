@@ -27,7 +27,7 @@ func TestConsumeAskSentinelReadsAndRemoves(t *testing.T) {
 		t.Fatalf("WriteFile error = %v", err)
 	}
 
-	ask, err := consumeAskSentinel(dir)
+	ask, evidence, err := consumeAskSentinel(dir)
 	if err != nil {
 		t.Fatalf("consumeAskSentinel error = %v", err)
 	}
@@ -35,15 +35,25 @@ func TestConsumeAskSentinelReadsAndRemoves(t *testing.T) {
 		t.Fatalf("ask = %#v, want the parsed question + 2 options", ask)
 	}
 	if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
-		t.Fatal("sentinel file must be removed after consumption")
+		t.Fatal("active sentinel must be staged out of ask.json")
+	}
+	if evidence == nil {
+		t.Fatal("evidence = nil, want staged pending identity retained until suspend persists")
+	}
+	// Pending remains until explicit consume (after durable ask write).
+	if _, err := os.Lstat(filepath.Join(dir, ".looper", "ask.pending")); err != nil {
+		t.Fatalf("ask.pending missing after stage: %v", err)
+	}
+	if err := loops.ConsumeHITLGateEvidence(evidence); err != nil {
+		t.Fatalf("ConsumeHITLGateEvidence() error = %v", err)
 	}
 
 	// No sentinel -> nil, nil (both a missing file and an absent .looper dir).
-	if again, err := consumeAskSentinel(dir); err != nil || again != nil {
-		t.Fatalf("second consumeAskSentinel = (%#v, %v), want (nil, nil)", again, err)
+	if again, againEv, err := consumeAskSentinel(dir); err != nil || again != nil || againEv != nil {
+		t.Fatalf("second consumeAskSentinel = (%#v, %#v, %v), want (nil, nil, nil)", again, againEv, err)
 	}
-	if missing, err := consumeAskSentinel(t.TempDir()); err != nil || missing != nil {
-		t.Fatalf("consumeAskSentinel(empty dir) = (%#v, %v), want (nil, nil)", missing, err)
+	if missing, missingEv, err := consumeAskSentinel(t.TempDir()); err != nil || missing != nil || missingEv != nil {
+		t.Fatalf("consumeAskSentinel(empty dir) = (%#v, %#v, %v), want (nil, nil, nil)", missing, missingEv, err)
 	}
 }
 
@@ -453,6 +463,19 @@ func TestSuspendForHumanDeliversAskToGitHub(t *testing.T) {
 	})
 
 	awaiting := &awaitingHumanError{question: "Redis or Postgres?", options: []string{"redis", "postgres"}, sessionID: "sess-1", vendor: "codex", recommendation: "Postgres keeps the existing transaction boundary."}
+	// Simulate the answer endpoint winning the race while the GitHub comment
+	// request is in flight. The correlation write must merge into this latest
+	// metadata rather than replacing the human's answer.
+	answeredMeta, err := loops.WriteHITLAsk(loop.MetadataJSON, loops.HITLAsk{
+		Question: "Redis or Postgres?", Status: "answered", Answer: "postgres", AnsweredAt: "2026-08-01T00:00:00.000Z",
+	})
+	if err != nil {
+		t.Fatalf("WriteHITLAsk() error = %v", err)
+	}
+	loop.MetadataJSON = &answeredMeta
+	if err := fixture.repos.Loops.Upsert(ctx, *loop); err != nil {
+		t.Fatalf("Loops.Upsert(answered) error = %v", err)
+	}
 	loopForStep, _ := fixture.repos.Loops.GetByID(ctx, "loop_worker_1")
 	result, err := runner.suspendForHuman(ctx, stepInput{Project: *project, Loop: *loopForStep, Run: run, QueueItem: *queueItem}, run, workerCheckpoint{PullRequest: &checkpointPullPR{Number: 42}}, awaiting)
 	if err != nil {
@@ -480,8 +503,8 @@ func TestSuspendForHumanDeliversAskToGitHub(t *testing.T) {
 	// Ask metadata records the github correlation.
 	got, _ := fixture.repos.Loops.GetByID(ctx, "loop_worker_1")
 	ask, ok := loops.ReadHITLAsk(got.MetadataJSON)
-	if !ok || ask.Transport != "github" || ask.PRNumber != 42 || ask.AskCommentID != 777 {
-		t.Fatalf("ask = %#v, want github transport + pr 42 + comment 777", ask)
+	if !ok || ask.Transport != "github" || ask.PRNumber != 42 || ask.AskCommentID != 777 || ask.Status != "answered" || ask.Answer != "postgres" {
+		t.Fatalf("ask = %#v, want github correlation plus preserved answer", ask)
 	}
 }
 
@@ -595,7 +618,7 @@ func TestConsumeAskSentinelFailsClosedAndQuarantines(t *testing.T) {
 
 	t.Run("truncated JSON fails closed with evidence quarantined", func(t *testing.T) {
 		dir := writeSentinel(t, `{"question":"delete prod?`)
-		ask, err := consumeAskSentinel(dir)
+		ask, _, err := consumeAskSentinel(dir)
 		if err == nil || ask != nil {
 			t.Fatalf("consumeAskSentinel = (%#v, %v), want fail-closed error", ask, err)
 		}
@@ -607,7 +630,7 @@ func TestConsumeAskSentinelFailsClosedAndQuarantines(t *testing.T) {
 
 	t.Run("schema without question fails closed", func(t *testing.T) {
 		dir := writeSentinel(t, `{"options":["a","b"]}`)
-		ask, err := consumeAskSentinel(dir)
+		ask, _, err := consumeAskSentinel(dir)
 		if err == nil || ask != nil {
 			t.Fatalf("consumeAskSentinel = (%#v, %v), want fail-closed error", ask, err)
 		}
@@ -624,7 +647,7 @@ func TestConsumeAskSentinelFailsClosedAndQuarantines(t *testing.T) {
 			t.Fatalf("Chmod error = %v", err)
 		}
 		t.Cleanup(func() { _ = os.Chmod(path, 0o644) })
-		ask, err := consumeAskSentinel(dir)
+		ask, _, err := consumeAskSentinel(dir)
 		if err == nil || ask != nil {
 			t.Fatalf("consumeAskSentinel = (%#v, %v), want fail-closed error", ask, err)
 		}
@@ -638,7 +661,7 @@ func TestConsumeAskSentinelFailsClosedAndQuarantines(t *testing.T) {
 
 	t.Run("oversized sentinel fails closed", func(t *testing.T) {
 		dir := writeSentinel(t, `{"question":"`+strings.Repeat("x", maxAskSentinelBytes)+`"}`)
-		ask, err := consumeAskSentinel(dir)
+		ask, _, err := consumeAskSentinel(dir)
 		if err == nil || ask != nil {
 			t.Fatalf("consumeAskSentinel = (%#v, %v), want fail-closed error", ask, err)
 		}
@@ -649,7 +672,7 @@ func TestConsumeAskSentinelFailsClosedAndQuarantines(t *testing.T) {
 
 	t.Run("pending evidence bounds repeated malformed asks", func(t *testing.T) {
 		dir := writeSentinel(t, `{"question":"first attempt`)
-		_, err1 := consumeAskSentinel(dir)
+		_, _, err1 := consumeAskSentinel(dir)
 		if err1 == nil {
 			t.Fatal("first consumeAskSentinel error = nil, want fail-closed error")
 		}
@@ -658,7 +681,7 @@ func TestConsumeAskSentinelFailsClosedAndQuarantines(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(dir, hitlSentinelRelPath), []byte(`{"question":"second attempt`), 0o644); err != nil {
 			t.Fatalf("WriteFile(second) error = %v", err)
 		}
-		_, err2 := consumeAskSentinel(dir)
+		_, _, err2 := consumeAskSentinel(dir)
 		if err2 == nil {
 			t.Fatal("second consumeAskSentinel error = nil, want fail-closed error")
 		}
@@ -671,17 +694,28 @@ func TestConsumeAskSentinelFailsClosedAndQuarantines(t *testing.T) {
 		}
 	})
 
-	t.Run("valid ask still consumed, absent still no-question", func(t *testing.T) {
+	t.Run("valid ask staged until explicit consume", func(t *testing.T) {
 		dir := writeSentinel(t, `{"question":"Redis or Postgres?","options":["redis","postgres"]}`)
-		ask, err := consumeAskSentinel(dir)
+		ask, evidence, err := consumeAskSentinel(dir)
 		if err != nil || ask == nil || ask.Question != "Redis or Postgres?" {
 			t.Fatalf("consumeAskSentinel = (%#v, %v), want the parsed ask", ask, err)
 		}
 		if _, statErr := os.Stat(filepath.Join(dir, hitlSentinelRelPath)); !os.IsNotExist(statErr) {
-			t.Fatal("valid sentinel must be consumed")
+			t.Fatal("active ask.json must be staged away")
 		}
-		if again, err := consumeAskSentinel(dir); err != nil || again != nil {
-			t.Fatalf("second consumeAskSentinel = (%#v, %v), want (nil, nil)", again, err)
+		if evidence == nil {
+			t.Fatal("evidence = nil, want staged pending retained")
+		}
+		// Recovery can re-read pending until suspend consumes it.
+		again, againEv, err := consumeAskSentinel(dir)
+		if err != nil || again == nil || againEv == nil {
+			t.Fatalf("second consumeAskSentinel = (%#v, %#v, %v), want recoverable pending", again, againEv, err)
+		}
+		if err := loops.ConsumeHITLGateEvidence(evidence); err != nil {
+			t.Fatalf("ConsumeHITLGateEvidence() error = %v", err)
+		}
+		if gone, goneEv, err := consumeAskSentinel(dir); err != nil || gone != nil || goneEv != nil {
+			t.Fatalf("after consume = (%#v, %#v, %v), want empty", gone, goneEv, err)
 		}
 	})
 }
@@ -1071,5 +1105,64 @@ func TestMidRunHumanMessageSurvivesAndIsDeliveredNextTurn(t *testing.T) {
 	}
 	if len(agent.inner.starts) != 3 || !strings.Contains(agent.inner.starts[2].Prompt, "late arrival") {
 		t.Fatalf("third prompt missing survivor: %#v", agent.inner.starts)
+	}
+}
+
+func TestMergeHITLCorrelationPreservesHumanAnswer(t *testing.T) {
+	t.Parallel()
+	// Simulated post-park GitHub correlation payload (awaiting, no answer).
+	delivered := loops.HITLAsk{
+		Question: "Continue?", Status: "awaiting", Transport: "github",
+		PRNumber: 42, AskCommentID: 99, GateEvidence: &loops.HITLGateEvidence{WorktreeRoot: "/tmp/wt"},
+	}
+	// Concurrent API answer arrived first.
+	answeredMeta, err := loops.WriteHITLAsk(nil, loops.HITLAsk{
+		Question: "Continue?", Status: "answered", Answer: "yes ship it", AnsweredAt: "2026-08-01T00:00:00.000Z",
+		PRNumber: 0, AskCommentID: 0,
+	})
+	if err != nil {
+		t.Fatalf("WriteHITLAsk() error = %v", err)
+	}
+	metaPtr := &answeredMeta
+	merged := mergeHITLCorrelation(delivered, metaPtr)
+	if merged.Answer != "yes ship it" || merged.Status != "answered" {
+		t.Fatalf("merged = %#v, want human answer preserved", merged)
+	}
+	if merged.PRNumber != 42 || merged.AskCommentID != 99 {
+		t.Fatalf("merged correlation = pr=%d comment=%d, want delivery values", merged.PRNumber, merged.AskCommentID)
+	}
+	if merged.GateEvidence == nil || merged.GateEvidence.WorktreeRoot != "/tmp/wt" {
+		t.Fatalf("merged.GateEvidence = %#v, want delivery evidence kept", merged.GateEvidence)
+	}
+}
+
+func TestDetectHumanAskRecoversStagedPendingBeforeAgent(t *testing.T) {
+	// Crash recovery: ask.pending remains after Stage, no loop metadata ask yet.
+	// detectHumanAsk must re-enter suspension without requiring a new agent turn.
+	t.Parallel()
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, ".looper"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte(`{"question":"Ship the migration?","options":["yes","no"]}`)
+	if err := os.WriteFile(filepath.Join(root, ".looper", "ask.json"), payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := loops.StageHITLGateEvidence(root, 1<<20); err != nil {
+		t.Fatalf("StageHITLGateEvidence() error = %v", err)
+	}
+	// Active name must be gone; only pending remains.
+	if _, err := os.Lstat(filepath.Join(root, ".looper", "ask.json")); !os.IsNotExist(err) {
+		t.Fatalf("ask.json still present after staging: %v", err)
+	}
+
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now, HITLEnabled: true})
+	awaiting, err := runner.detectHumanAsk(context.Background(), stepInput{Loop: storage.LoopRecord{ID: "loop_worker_1"}}, root, "exec_1")
+	if err != nil {
+		t.Fatalf("detectHumanAsk() error = %v", err)
+	}
+	if awaiting == nil || awaiting.question != "Ship the migration?" {
+		t.Fatalf("detectHumanAsk() = %#v, want recovered question", awaiting)
 	}
 }
