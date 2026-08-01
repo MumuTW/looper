@@ -20,6 +20,20 @@ func TestProjectRoleConfigsMergesFixerRegenerationOverride(t *testing.T) {
 	}
 }
 
+func TestProjectRoleConfigsEmptyRegenerationSectionKeepsSafeDeleteDefault(t *testing.T) {
+	cfg := Config{
+		Roles: RoleConfigs{Fixer: FixerRoleConfig{}},
+		Projects: []ProjectRefConfig{{
+			ID:    "demo",
+			Roles: &PartialRoleConfigs{Fixer: &PartialFixerRoleConfig{Regeneration: &PartialFixerRegenerationConfig{}}},
+		}},
+	}
+	got := ProjectRoleConfigs(cfg, "demo").Fixer.Regeneration
+	if got == nil || !got.DeleteBranch {
+		t.Fatalf("effective fixer regeneration = %#v, want deleteBranch=true for an empty section", got)
+	}
+}
+
 func TestFixerRegenerationNilUsesSafeDeleteDefault(t *testing.T) {
 	roles := ProjectRoleConfigs(Config{Roles: RoleConfigs{Fixer: FixerRoleConfig{}}}, "missing")
 	if roles.Fixer.Regeneration != nil {

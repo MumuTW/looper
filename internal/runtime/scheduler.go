@@ -2323,12 +2323,18 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 				effective := config.ProjectRoleConfigs(cfg, projectID).Fixer.Regeneration
 				return effective == nil || effective.DeleteBranch
 			},
+			RegenerationAvailability: func(_ string) string {
+				if !plannerConfigured || plannerRoleRunner == nil {
+					return "Planner agent is not configured for fixer regeneration"
+				}
+				return ""
+			},
 			OnRegenerateIssue: func(ctx context.Context, input fixer.RegenerateIssueInput) error {
-				if plannerRoleRunner == nil {
-					return fmt.Errorf("planner runner is not configured for fixer regeneration")
+				if !plannerConfigured || plannerRoleRunner == nil {
+					return fmt.Errorf("planner agent is not configured for fixer regeneration")
 				}
 				issueRepo := firstNonEmpty(strings.TrimSpace(input.IssueRepo), strings.TrimSpace(input.Repo))
-				_, err := plannerRoleRunner.RouteIssue(ctx, planner.RouteIssueInput{
+				result, err := plannerRoleRunner.RouteIssue(ctx, planner.RouteIssueInput{
 					ProjectID: input.ProjectID,
 					Repo:      issueRepo,
 					Authority: input.Authority,
@@ -2337,7 +2343,13 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 						Labels: append([]string(nil), input.IssueLabels...), Assignees: append([]string(nil), input.IssueAssignees...), FailureContext: input.FailureContext,
 					},
 				})
-				return err
+				if err != nil {
+					return err
+				}
+				if !result.ProjectionAccepted {
+					return fmt.Errorf("planner route projection was not accepted")
+				}
+				return nil
 			},
 			OnAgentExecutionStarted: func(ctx context.Context, input fixer.AgentExecutionStartedInput) error {
 				return notifyAgentExecutionStarted(ctx, agentExecutionNotificationInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Title: "Looper Fixer", Subtitle: input.Subtitle, Body: input.Body, DedupeKey: input.DedupeKey})

@@ -2641,8 +2641,8 @@ func TestGatewayClosePullRequestIsIdempotent(t *testing.T) {
 	if err := gateway.ClosePullRequest(context.Background(), ClosePullRequestInput{Repo: "acme/looper", PRNumber: 43}); err != nil {
 		t.Fatalf("ClosePullRequest(closed) error = %v", err)
 	}
-	if err := gateway.ClosePullRequest(context.Background(), ClosePullRequestInput{Repo: "acme/looper", PRNumber: 44}); err != nil {
-		t.Fatalf("ClosePullRequest(merged) error = %v", err)
+	if err := gateway.ClosePullRequest(context.Background(), ClosePullRequestInput{Repo: "acme/looper", PRNumber: 44}); !errors.Is(err, ErrPullRequestAlreadyMerged) {
+		t.Fatalf("ClosePullRequest(merged) error = %v, want ErrPullRequestAlreadyMerged", err)
 	}
 	if err := gateway.ClosePullRequest(context.Background(), ClosePullRequestInput{Repo: "acme/looper", PRNumber: 45, DeleteBranch: true}); err != nil {
 		t.Fatalf("ClosePullRequest(delete branch) error = %v", err)

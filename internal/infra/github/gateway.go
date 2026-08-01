@@ -56,6 +56,10 @@ var (
 	// ErrReviewBaseHeadMismatch is returned when local git objects do not match the
 	// refreshed PR base/head SHAs required for path-targeted anchor authority.
 	ErrReviewBaseHeadMismatch = errors.New("local repository base/head does not match refreshed PR metadata")
+	// ErrPullRequestAlreadyMerged distinguishes a concurrent successful merge
+	// from an idempotent ordinary close. Callers that regenerate failed PRs must
+	// abort rather than create a replacement for work that already landed.
+	ErrPullRequestAlreadyMerged = errors.New("pull request already merged")
 )
 
 // Diagnostic / snapshot reason codes for diff capture and anchor authority.
@@ -1927,8 +1931,11 @@ func (g *Gateway) ClosePullRequest(ctx context.Context, input ClosePullRequestIn
 	if err != nil {
 		return err
 	}
-	if state == "closed" || state == "merged" {
+	if state == "closed" {
 		return nil
+	}
+	if state == "merged" {
+		return ErrPullRequestAlreadyMerged
 	}
 	args := []string{"pr", "close", strconv.FormatInt(input.PRNumber, 10), "--repo", input.Repo}
 	if input.DeleteBranch {
@@ -1939,8 +1946,11 @@ func (g *Gateway) ClosePullRequest(ctx context.Context, input ClosePullRequestIn
 		return nil
 	}
 	state, stateErr := g.viewPullRequestState(ctx, input.Repo, input.PRNumber, input.CWD)
-	if stateErr == nil && (state == "closed" || state == "merged") {
+	if stateErr == nil && state == "closed" {
 		return nil
+	}
+	if stateErr == nil && state == "merged" {
+		return ErrPullRequestAlreadyMerged
 	}
 	return err
 }

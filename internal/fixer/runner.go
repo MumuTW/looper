@@ -288,6 +288,11 @@ type RegenerateIssueInput struct {
 // the ordered PR side effects; runtime owns the Planner projection.
 type RegenerateIssueFunc func(context.Context, RegenerateIssueInput) error
 
+// RegenerationAvailabilityFunc is checked before any close-and-regenerate
+// side effect. A non-empty reason escalates the exhausted PR instead of
+// closing it when the downstream Planner authority is unavailable.
+type RegenerationAvailabilityFunc func(projectID string) string
+
 // RegenerationGateway is deliberately separate from GitHubGateway.  Existing
 // fixer fakes and integrations remain source-compatible while terminal
 // exhaustion opts into the stronger close-and-regenerate capability.
@@ -574,6 +579,7 @@ type Options struct {
 	OnAgentExecutionStarted      AgentExecutionStartedFunc
 	OnQueueItemEnqueued          func()
 	OnRegenerateIssue            RegenerateIssueFunc
+	RegenerationAvailability     RegenerationAvailabilityFunc
 	DeleteBranchOnRegeneration   func(projectID string) bool
 }
 
@@ -621,6 +627,7 @@ type Runner struct {
 	onAgentExecutionStarted     AgentExecutionStartedFunc
 	onQueueItemEnqueued         func()
 	onRegenerateIssue           RegenerateIssueFunc
+	regenerationAvailability    RegenerationAvailabilityFunc
 	deleteBranchOnRegeneration  func(projectID string) bool
 }
 
@@ -1780,6 +1787,7 @@ func New(options Options) *Runner {
 		onAgentExecutionStarted:     options.OnAgentExecutionStarted,
 		onQueueItemEnqueued:         options.OnQueueItemEnqueued,
 		onRegenerateIssue:           options.OnRegenerateIssue,
+		regenerationAvailability:    options.RegenerationAvailability,
 		deleteBranchOnRegeneration:  options.DeleteBranchOnRegeneration,
 	}
 }
@@ -2266,6 +2274,12 @@ func (r *Runner) ProcessNext(ctx context.Context, claimedBy string) (*ProcessRes
 func (r *Runner) ProcessClaimedQueueItem(ctx context.Context, queueItem storage.QueueItemRecord) (*ProcessResult, error) {
 	result, err := r.ProcessClaimedItem(ctx, queueItem)
 	if err != nil {
+		var handoffErr *regenerationHandoffError
+		if errors.As(err, &handoffErr) && r.repos != nil && r.repos.Queue != nil {
+			if replay, getErr := r.repos.Queue.GetByID(ctx, queueItem.ID); getErr == nil && replay != nil && replay.Status == "queued" {
+				return &ProcessResult{LoopID: derefString(queueItem.LoopID), QueueItemID: queueItem.ID, Status: "queued", Summary: handoffErr.Error(), FailureKind: FailureRetryableTransient}, nil
+			}
+		}
 		return r.recoverClaimedItem(ctx, queueItem, err)
 	}
 	return &result, nil
@@ -2422,6 +2436,29 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	}
 	if loop == nil {
 		return ProcessResult{}, fmt.Errorf("loop not found: %s", *queueItem.LoopID)
+	}
+	// A terminal handoff is itself durable work. If the daemon was restarted
+	// after the PR comment/close but before Planner accepted the route, replay
+	// that suffix instead of treating the paused/failed loop as an ordinary
+	// fixer item (which would strand the closed PR forever).
+	if r.onRegenerateIssue != nil {
+		if state, ok := parseRegenerationState(parseJSONObject(loop.MetadataJSON)); ok && !state.Routed {
+			project, projectErr := r.repos.Projects.GetByID(ctx, loop.ProjectID)
+			if projectErr != nil {
+				return ProcessResult{}, projectErr
+			}
+			if project == nil {
+				return ProcessResult{}, fmt.Errorf("project not found: %s", loop.ProjectID)
+			}
+			replayFailure := regenerationFailureFromState(state)
+			_, action, replayErr := r.applyTerminalRegeneration(ctx, *project, *loop, queueItem, fixerCheckpoint{}, replayFailure)
+			if replayErr != nil {
+				return ProcessResult{}, replayErr
+			}
+			if action == regenerationCompleted || action == regenerationEscalated {
+				return ProcessResult{LoopID: loop.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: replayFailure.message, FailureKind: replayFailure.kind}, nil
+			}
+		}
 	}
 	// A pending-rediscovery queue row can become visible while its resume
 	// handoff is still clearing metadata and changing the loop to queued.

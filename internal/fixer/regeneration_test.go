@@ -16,8 +16,12 @@ type regenerationFakeGateway struct {
 	comments              []IssueComment
 	commits               []PullRequestCommit
 	closeCalls            []ClosePullRequestInput
+	closeErr              error
 	issueLabelCalls       []IssueLabelsInput
+	issueLabelErr         error
 	removeIssueLabelCalls []IssueLabelsInput
+	removeIssueLabelErr   error
+	prLabelErr            error
 }
 
 func (f *regenerationFakeGateway) ViewIssue(context.Context, ViewIssueInput) (IssueDetail, error) {
@@ -30,17 +34,24 @@ func (f *regenerationFakeGateway) ListIssueComments(context.Context, ViewIssueIn
 
 func (f *regenerationFakeGateway) ClosePullRequest(_ context.Context, input ClosePullRequestInput) error {
 	f.closeCalls = append(f.closeCalls, input)
-	return nil
+	return f.closeErr
 }
 
 func (f *regenerationFakeGateway) AddIssueLabels(_ context.Context, input IssueLabelsInput) error {
 	f.issueLabelCalls = append(f.issueLabelCalls, input)
-	return nil
+	return f.issueLabelErr
 }
 
 func (f *regenerationFakeGateway) RemoveIssueLabels(_ context.Context, input IssueLabelsInput) error {
 	f.removeIssueLabelCalls = append(f.removeIssueLabelCalls, input)
-	return nil
+	return f.removeIssueLabelErr
+}
+
+func (f *regenerationFakeGateway) AddPullRequestLabels(ctx context.Context, input PullRequestLabelsInput) error {
+	if f.prLabelErr != nil {
+		return f.prLabelErr
+	}
+	return f.fakeGitHubGateway.AddPullRequestLabels(ctx, input)
 }
 
 func (f *regenerationFakeGateway) ListPullRequestCommits(context.Context, ViewPullRequestInput) ([]PullRequestCommit, error) {

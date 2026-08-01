@@ -1485,7 +1485,10 @@ func mergeFixerRoleConfig(config *FixerRoleConfig, partial PartialFixerRoleConfi
 	if partial.Regeneration != nil {
 		regeneration := config.Regeneration
 		if regeneration == nil {
-			regeneration = &FixerRegenerationConfig{}
+			// A materialized section must inherit the same safe default as an
+			// omitted section.  Partial config is field-wise: an empty table is
+			// not an explicit request to turn branch deletion off.
+			regeneration = &FixerRegenerationConfig{DeleteBranch: true}
 		} else {
 			cloned := *regeneration
 			regeneration = &cloned
