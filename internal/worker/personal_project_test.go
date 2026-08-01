@@ -9,6 +9,7 @@ import (
 	"github.com/MumuTW/looper/internal/config"
 	"github.com/MumuTW/looper/internal/labels"
 	"github.com/MumuTW/looper/internal/network/protocol"
+	"github.com/MumuTW/looper/internal/storage"
 )
 
 func personalWorkerConfig(t *testing.T) config.Config {
@@ -150,5 +151,25 @@ func TestDiscoverIssuesPersonalProjectHoldSkipsBeforeAssignment(t *testing.T) {
 	}
 	if len(result.QueueItems) != 0 || len(gateway.addAssigneeCalls) != 0 {
 		t.Fatalf("result=%#v calls=%#v, want held issue skipped before assignment", result, gateway.addAssigneeCalls)
+	}
+}
+
+func TestDiscoverIssuesPersonalProjectClaimConflictSkipsBeforeAssignment(t *testing.T) {
+	gateway := &fakeGitHubGateway{currentLogin: "octocat", issues: []IssueSummary{{Number: 607, Author: "octocat", Labels: []string{labels.DefaultWorkerReadyTrigger}}}}
+	cfg := personalWorkerConfig(t)
+	fixture, runner := newPersonalWorkerRunner(t, gateway, &cfg)
+	repo := "acme/looper"
+	prNumber := int64(707)
+	prTarget := "pr:acme/looper:707"
+	claimMetadata := `{"worker":{"repo":"acme/looper","issueNumber":607}}`
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_reviewer_claim", Seq: 2, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", TargetID: &prTarget, Repo: &repo, PRNumber: &prNumber, Status: "queued", MetadataJSON: &claimMetadata, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("seed reviewer claim: %v", err)
+	}
+	result, err := runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo})
+	if err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	if result.Skipped == 0 || len(result.QueueItems) != 0 || len(gateway.addAssigneeCalls) != 0 {
+		t.Fatalf("result=%#v calls=%#v, want claim conflict skipped before assignment", result, gateway.addAssigneeCalls)
 	}
 }

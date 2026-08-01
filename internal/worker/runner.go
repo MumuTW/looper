@@ -948,12 +948,8 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 			result.Skipped++
 			continue
 		}
-		assigned, err := r.assignPersonalIssueIfEligible(ctx, *project, input.Repo, issue, login, personalProject, policy.RequireAssigneeCurrentUser)
-		if err != nil {
-			return DiscoveryResult{}, err
-		}
-		issue = assigned
-		if !shouldClaimWorkerIssue(issue, login, policy) {
+		personalAssignmentCandidate := shouldConsiderPersonalAssignment(issue, login, personalProject, policy)
+		if !personalAssignmentCandidate && !shouldClaimWorkerIssue(issue, login, policy) {
 			result.Skipped++
 			continue
 		}
@@ -961,7 +957,6 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 			result.Skipped++
 			continue
 		}
-		eligible++
 		fingerprint := buildWorkerDiscoveryFingerprint(input.Repo, firstNonEmpty(derefString(project.BaseBranch), "main"), issue)
 		loopResult, err := r.ensureLoopForDiscoveredIssue(ctx, *project, input.Repo, issue, fingerprint)
 		if err != nil {
@@ -976,12 +971,24 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 		if loopResult.created {
 			result.CreatedLoopIDs = append(result.CreatedLoopIDs, loopResult.record.ID)
 		}
+		eligible++
 		if loopResult.skipEnqueue || loopResult.record.Status == "paused" || loopResult.record.Status == "human_takeover" || loopResult.record.Status == "completed" || loopResult.record.Status == "failed" || loopResult.record.Status == "awaiting_human" {
 			result.Skipped++
 			if eligible >= resultLimit {
 				break
 			}
 			continue
+		}
+		assigned, err := r.assignPersonalIssueIfEligible(ctx, *project, input.Repo, issue, login, personalProject, policy.RequireAssigneeCurrentUser)
+		if err != nil {
+			return DiscoveryResult{}, err
+		}
+		issue = assigned
+		if issue.PersonalAssigneeAutoAssigned {
+			loopResult.record, err = r.markPersonalAssignment(ctx, loopResult.record)
+			if err != nil {
+				return DiscoveryResult{}, err
+			}
 		}
 		queueItem, err := r.enqueueDiscoveredIssue(ctx, *project, loopResult.record, input.Repo, issue, fingerprint)
 		if err != nil {
@@ -1010,6 +1017,10 @@ func (r *Runner) isPersonalProject(projectID string) bool {
 	return r.projectRoleConfig != nil && config.IsPersonalProject(*r.projectRoleConfig, projectID)
 }
 
+func shouldConsiderPersonalAssignment(issue IssueSummary, login string, personalProject bool, policy DiscoveryPolicy) bool {
+	return personalProject && policy.RequireAssigneeCurrentUser && normalizeLogin(login) != "" && strings.EqualFold(strings.TrimSpace(issue.Author), strings.TrimSpace(login)) && len(issue.Assignees) == 0 && len(issue.AssigneeUsers) == 0 && config.LabelsMatch(issue.Labels, policy.Labels, policy.LabelMode)
+}
+
 func (r *Runner) assignPersonalIssueIfEligible(ctx context.Context, project storage.ProjectRecord, repo string, issue IssueSummary, login string, personalProject, requireAssignee bool) (IssueSummary, error) {
 	if !personalProject || !requireAssignee || normalizeLogin(login) == "" || !strings.EqualFold(strings.TrimSpace(issue.Author), strings.TrimSpace(login)) || len(issue.Assignees) > 0 || len(issue.AssigneeUsers) > 0 {
 		return issue, nil
@@ -1020,6 +1031,22 @@ func (r *Runner) assignPersonalIssueIfEligible(ctx context.Context, project stor
 	issue.Assignees = append(issue.Assignees, login)
 	issue.PersonalAssigneeAutoAssigned = true
 	return issue, nil
+}
+
+func (r *Runner) markPersonalAssignment(ctx context.Context, loop storage.LoopRecord) (storage.LoopRecord, error) {
+	var mergeErr error
+	updated, err := r.updateLoop(ctx, loop, func(record *storage.LoopRecord) {
+		metadataJSON, err := mergeLoopMetadataJSON(record.MetadataJSON, map[string]any{"personalProjectAutoAssigned": true})
+		if err != nil {
+			mergeErr = err
+			return
+		}
+		record.MetadataJSON = &metadataJSON
+	})
+	if mergeErr != nil {
+		return storage.LoopRecord{}, fmt.Errorf("merge personal assignment metadata: %w", mergeErr)
+	}
+	return updated, err
 }
 
 func (r *Runner) requiredTargetLabel(ctx context.Context, projectID string) (string, error) {
