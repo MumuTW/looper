@@ -141,7 +141,7 @@ func formatReasons(reasons []Reason) []string {
 			explanation = string(reason.Code)
 		}
 		if subject := strings.TrimSpace(reason.Subject); subject != "" {
-			lines = append(lines, fmt.Sprintf("%s — `%s`", explanation, escapeMarkdownCodeSpan(subject)))
+			lines = append(lines, fmt.Sprintf("%s — %s", explanation, formatCodeSpan(subject)))
 			continue
 		}
 		lines = append(lines, explanation)
@@ -150,14 +150,35 @@ func formatReasons(reasons []Reason) []string {
 	return lines
 }
 
-func escapeMarkdownCodeSpan(value string) string {
+// formatCodeSpan renders an untrusted string as a CommonMark inline code span
+// that cannot be closed early by a backtick in the content. Backslash escapes
+// do not work inside code spans, so the delimiter is always one backtick longer
+// than the longest backtick run in the (control-char-stripped) content, with
+// space padding when the content begins or ends with a backtick.
+func formatCodeSpan(value string) string {
 	value = strings.Map(func(r rune) rune {
 		if r == '\n' || r == '\r' || r == '\t' || r < 0x20 || r == 0x7f {
 			return ' '
 		}
 		return r
 	}, value)
-	return strings.NewReplacer("\\", "\\\\", "`", "\\`").Replace(value)
+	longestRun := 0
+	current := 0
+	for _, r := range value {
+		if r == '`' {
+			current++
+			if current > longestRun {
+				longestRun = current
+			}
+		} else {
+			current = 0
+		}
+	}
+	delimiter := strings.Repeat("`", longestRun+1)
+	if strings.HasPrefix(value, "`") || strings.HasSuffix(value, "`") {
+		return delimiter + " " + value + " " + delimiter
+	}
+	return delimiter + value + delimiter
 }
 
 func shortSHA(sha string) string {

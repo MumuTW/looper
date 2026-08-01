@@ -88,11 +88,21 @@ func TestBuildVerdictCommentFallsBackToTheRawCode(t *testing.T) {
 
 func TestBuildVerdictCommentEscapesProtectedPathSubject(t *testing.T) {
 	body := BuildVerdictComment(Report{Reasons: []Reason{{Code: ReasonProtectedPathTouched, Subject: "docs/`evil`\nnext"}}})
-	if strings.Contains(body, "`docs/`evil`") || strings.Contains(body, "\nnext`") {
-		t.Fatalf("verdict = %q, want protected path safely contained", body)
+	if strings.Contains(body, "evil`\nnext") {
+		t.Fatalf("verdict = %q, want control characters stripped from subject", body)
 	}
-	if !strings.Contains(body, "docs/\\`evil\\` next") {
-		t.Fatalf("verdict = %q, want escaped path subject", body)
+	// A backtick in the subject must not close a single-backtick code span.
+	// CommonMark ignores backslash escapes inside code spans, so the formatter
+	// wraps the content in a longer delimiter instead.
+	if !strings.Contains(body, "``docs/`evil` next``") {
+		t.Fatalf("verdict = %q, want subject in a backtick-safe code span", body)
+	}
+}
+
+func TestBuildVerdictCommentCodeSpanEscapesDoubleBackticks(t *testing.T) {
+	body := BuildVerdictComment(Report{Reasons: []Reason{{Code: ReasonProtectedPathTouched, Subject: "foo``bar`baz"}}})
+	if !strings.Contains(body, "```foo``bar`baz```") {
+		t.Fatalf("verdict = %q, want triple-backtick delimiter around double-backtick content", body)
 	}
 }
 
