@@ -16,6 +16,14 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+# go-sqlite3 ships a cgo-backed implementation and a !cgo static mock that
+# omits sqlite3.Error / sqlite3.ErrConstraintUnique. Pin CGO_ENABLED=1 so every
+# Go step (vet, staticcheck, test, build, generate, race, e2e) uses the real
+# driver regardless of the runner image's default, matching the production
+# Dockerfile build.
+env:
+  CGO_ENABLED: "1"
+
 jobs:
   verify:
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false

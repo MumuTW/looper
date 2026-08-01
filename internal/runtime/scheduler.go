@@ -124,15 +124,22 @@ type schedulerAsyncRunner interface {
 }
 
 type defaultSchedulerTickInput struct {
-	Repos             *storage.Repositories
-	GitHubGateway     *githubinfra.Gateway
-	GitGateway        *gitinfra.Gateway
-	Logger            bootstrap.Logger
-	Now               func() time.Time
-	MaxConcurrentRuns int
-	ClaimMu           *sync.Mutex
-	ClaimBoundary     *sync.RWMutex
-	RefreshForClaim   func() defaultSchedulerTickInput
+	Repos *storage.Repositories
+	// CapturedProjects is the project-table snapshot already validated by the
+	// catalog pass immediately before an independent claim pass. Keeping it on
+	// the claim input lets the quarantine scope reuse that read instead of
+	// scanning Projects.List a second time on every tick. The explicit boolean
+	// distinguishes a captured empty table from an input that has no snapshot.
+	CapturedProjects      []storage.ProjectRecord
+	CapturedProjectsReady bool
+	GitHubGateway         *githubinfra.Gateway
+	GitGateway            *gitinfra.Gateway
+	Logger                bootstrap.Logger
+	Now                   func() time.Time
+	MaxConcurrentRuns     int
+	ClaimMu               *sync.Mutex
+	ClaimBoundary         *sync.RWMutex
+	RefreshForClaim       func() defaultSchedulerTickInput
 	// AllowClaim, when set, is the admission projection for all work-producing
 	// scheduler activity: the full default tick (discovery, HITL, claims,
 	// stale-reconcile) and each durable ClaimNext*. Nil means ungated (tests).
@@ -2897,18 +2904,35 @@ func runIndependentClaimPass(ctx context.Context, input defaultSchedulerTickInpu
 			return nil
 		}
 	}
-	_, catalogCurrent, err := schedulerProjectsForCapturedCatalog(ctx, input)
+	projectsList, catalogCurrent, err := schedulerProjectsForCapturedCatalog(ctx, input)
 	if err != nil || !catalogCurrent {
 		return err
+	}
+	input.CapturedProjects = projectsList
+	input.CapturedProjectsReady = true
+	if refresh := input.RefreshForClaim; refresh != nil {
+		// The live catalog path refreshes the runner/config snapshot while the
+		// claim boundary is held. Preserve the already-validated project table
+		// across that refresh so the quarantine scope does not re-read it.
+		input.RefreshForClaim = func() defaultSchedulerTickInput {
+			latest := refresh()
+			latest.CapturedProjects = projectsList
+			latest.CapturedProjectsReady = true
+			return latest
+		}
 	}
 	_, _, err = executeClaimPhase(ctx, "claim_pump", input, nil, false)
 	return err
 }
 
 func schedulerProjectsForCapturedCatalog(ctx context.Context, input defaultSchedulerTickInput) ([]storage.ProjectRecord, bool, error) {
-	projectsList, err := input.Repos.Projects.List(ctx)
-	if err != nil {
-		return nil, false, err
+	projectsList := input.CapturedProjects
+	if !input.CapturedProjectsReady {
+		var err error
+		projectsList, err = input.Repos.Projects.List(ctx)
+		if err != nil {
+			return nil, false, err
+		}
 	}
 	if input.Config == nil {
 		return projectsList, true, nil
@@ -2918,8 +2942,14 @@ func schedulerProjectsForCapturedCatalog(ctx context.Context, input defaultSched
 			continue
 		}
 		binding, ok := runtimeProjectBinding(*input.Config, project.ID)
-		codingPolicyRequired := config.CodingRoleAgentConfigured(*input.Config, config.CodingRoleWorker) || config.CodingRoleAgentConfigured(*input.Config, config.CodingRoleFixer)
-		if !ok && codingPolicyRequired && projects.IsLegacyInertProject(project) && len(config.ResolveValidationCommands(*input.Config)) == 0 {
+		// validateCatalogValidationPolicies quarantines an unstanced legacy
+		// project whenever defaults.validationCommands is empty, independently
+		// of whether a coding agent is configured. The missing catalog binding
+		// is therefore intentional in the agentless case too; recognizing only
+		// the coding-policy-required case would report the catalog as stale and
+		// block every claim pass — including durable sticky Worker/Fixer retries
+		// — until the legacy record is repaired.
+		if !ok && projects.IsLegacyInertProject(project) && len(config.ResolveValidationCommands(*input.Config)) == 0 {
 			continue
 		}
 		if !ok || !catalogBindingMatchesProject(binding, project) {
@@ -3281,11 +3311,15 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 		return claimContinue, nil
 	}
 
-	projectScopedTypes, runnableProjectIDs := codingClaimProjectScope(input.Config)
+	quarantinedIDs, err := quarantinedProjectIDsForClaim(ctx, input)
+	if err != nil {
+		return queueItems, dispatchOwnedQueueClaims(ctx, owned, input, err)
+	}
+	projectScopedTypes, runnableProjectIDs, stickyOnlyProjectIDs := codingClaimProjectScope(input.Config, quarantinedIDs)
 	stopClaiming := false
 	for i := 0; i < availableSlots; i++ {
 		result, err := claimOne(func(ctx context.Context, nowISO, claimedBy string) (*storage.QueueItemRecord, error) {
-			return input.Repos.Queue.ClaimNextNonLongTermRetryAmongTypeSetsForProjects(ctx, nowISO, claimedBy, unrestrictedTypes, stickySnapshotTypes, projectScopedTypes, runnableProjectIDs)
+			return input.Repos.Queue.ClaimNextNonLongTermRetryAmongTypeSetsForProjects(ctx, nowISO, claimedBy, unrestrictedTypes, stickySnapshotTypes, projectScopedTypes, runnableProjectIDs, stickyOnlyProjectIDs)
 		})
 		if err != nil {
 			return queueItems, dispatchOwnedQueueClaims(ctx, owned, input, err)
@@ -3300,7 +3334,7 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 	}
 	for !stopClaiming && len(queueItems) < availableSlots {
 		result, err := claimOne(func(ctx context.Context, nowISO, claimedBy string) (*storage.QueueItemRecord, error) {
-			return input.Repos.Queue.ClaimNextLongTermRetryAmongTypeSetsForProjects(ctx, nowISO, claimedBy, unrestrictedTypes, stickySnapshotTypes, projectScopedTypes, runnableProjectIDs)
+			return input.Repos.Queue.ClaimNextLongTermRetryAmongTypeSetsForProjects(ctx, nowISO, claimedBy, unrestrictedTypes, stickySnapshotTypes, projectScopedTypes, runnableProjectIDs, stickyOnlyProjectIDs)
 		})
 		if err != nil {
 			return queueItems, dispatchOwnedQueueClaims(ctx, owned, input, err)
@@ -3312,15 +3346,53 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 	return queueItems, dispatchOwnedQueueClaims(ctx, owned, input, nil)
 }
 
-func codingClaimProjectScope(cfg *config.Config) ([]string, []string) {
+func codingClaimProjectScope(cfg *config.Config, quarantinedProjectIDs []string) (projectScopedTypes, runnableProjectIDs, stickyOnlyProjectIDs []string) {
 	if cfg == nil {
-		return nil, nil
+		return nil, nil, nil
 	}
 	projectIDs := make([]string, 0, len(cfg.Projects))
 	for _, project := range cfg.Projects {
 		projectIDs = append(projectIDs, project.ID)
 	}
-	return []string{"fixer", "worker"}, projectIDs
+	return []string{"fixer", "worker"}, projectIDs, quarantinedProjectIDs
+}
+
+// quarantinedProjectIDsForClaim returns the IDs of unstanced legacy projects
+// that validateCatalogValidationPolicies removed from the runtime catalog
+// because defaults.validationCommands is empty and they carry no validation
+// stance. The scheduler keeps these IDs in the claim scope for sticky-only
+// retries (the latest run is failed/interrupted with a recorded agent snapshot)
+// without admitting fresh work, mirroring the agent-independent quarantine
+// predicate in schedulerProjectsForCapturedCatalog so the catalog-to-claim
+// contract is covered end to end.
+func quarantinedProjectIDsForClaim(ctx context.Context, input defaultSchedulerTickInput) ([]string, error) {
+	if input.Config == nil || input.Repos == nil || input.Repos.Projects == nil {
+		return nil, nil
+	}
+	if len(config.ResolveValidationCommands(*input.Config)) > 0 {
+		return nil, nil
+	}
+	projectsList := input.CapturedProjects
+	if !input.CapturedProjectsReady {
+		var err error
+		projectsList, err = input.Repos.Projects.List(ctx)
+		if err != nil {
+			return nil, err
+		}
+	}
+	ids := make([]string, 0)
+	for _, project := range projectsList {
+		if project.Archived {
+			continue
+		}
+		if _, ok := runtimeProjectBinding(*input.Config, project.ID); ok {
+			continue
+		}
+		if projects.IsLegacyInertProject(project) {
+			ids = append(ids, project.ID)
+		}
+	}
+	return ids, nil
 }
 
 // claimErrorIsAmbiguousCancel reports whether a ClaimNext* error may have

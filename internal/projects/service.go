@@ -414,6 +414,19 @@ func (s *Service) addProjectLocked(ctx context.Context, input AddInput) (AddResu
 	} else if existing == nil {
 		delete(metadata, "validation")
 	}
+	// Re-registration is the only non-destructive repair path for an API
+	// project with missing repository metadata, but a legacy inert record that
+	// gains repository metadata leaves the repair exception, so it must carry
+	// an effective stance immediately — independently of whether a coding
+	// agent is currently configured. Otherwise enabling Worker or Fixer later
+	// turns the stored row into a startup failure with no running PATCH API
+	// left to repair it. Mirrors the UpdateProject gate at the shared
+	// materialization boundary.
+	if existing != nil && IsLegacyInertProject(*existing) && metadataString(metadata, "repo") != "" {
+		if _, hasValidation := metadata["validation"]; !hasValidation && len(config.ResolveValidationCommands(cfg)) == 0 {
+			return AddResult{}, nil, ProjectValidationError{Message: "adding repository metadata requires validation commands or optOut=true in the same request while defaults.validationCommands is empty"}
+		}
+	}
 	delete(metadata, "roles")
 	if input.WorktreeRoot != nil {
 		metadata["worktreeRoot"] = *input.WorktreeRoot
@@ -708,6 +721,16 @@ func (s *Service) UpdateProject(ctx context.Context, identifier string, input Up
 		metadata["validation"] = config.ProjectValidationConfig{
 			Commands: append([]string(nil), input.Validation.Commands...),
 			OptOut:   input.Validation.OptOut,
+		}
+	}
+	// A legacy inert record that gains repository metadata leaves the repair
+	// exception, so it must carry an effective stance immediately —
+	// independently of whether a coding agent is currently configured.
+	// Otherwise enabling Worker or Fixer later turns the stored row into a
+	// startup failure with no running PATCH API left to repair it.
+	if IsLegacyInertProject(*project) && metadataString(metadata, "repo") != "" {
+		if _, hasValidation := metadata["validation"]; !hasValidation && len(config.ResolveValidationCommands(s.currentConfig())) == 0 {
+			return storage.ProjectRecord{}, ProjectValidationError{Message: "adding repository metadata requires validation commands or optOut=true in the same request while defaults.validationCommands is empty"}
 		}
 	}
 
@@ -1666,7 +1689,12 @@ func validateCatalogValidationPolicies(global config.Config, materialized []conf
 	if err := config.ValidateProjectValidationPolicies(candidate); err != nil {
 		return nil, err
 	}
-	if (!config.CodingRoleAgentConfigured(global, config.CodingRoleWorker) && !config.CodingRoleAgentConfigured(global, config.CodingRoleFixer)) || len(config.ResolveValidationCommands(global)) > 0 {
+	// Durable Worker/Fixer work stays executable without a live coding agent:
+	// sticky snapshot retries re-run failed or interrupted items under their
+	// recorded agent identity. An unstanced legacy project therefore remains
+	// quarantined until it is repaired, independently of the currently
+	// configured agent; only legacy default commands provide the gate.
+	if len(config.ResolveValidationCommands(global)) > 0 {
 		return materialized, nil
 	}
 	runnable := make([]config.ProjectRefConfig, 0, len(materialized))

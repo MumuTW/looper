@@ -52,3 +52,36 @@ func TestValidateCatalogValidationPoliciesPreservesIndicesAndQuarantinesLegacyPr
 		t.Fatalf("runnable with legacy default = %#v, want both projects", runnable)
 	}
 }
+
+func TestValidateCatalogValidationPoliciesQuarantinesLegacyProjectWithoutAgent(t *testing.T) {
+	t.Parallel()
+
+	global, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	allowed := map[string]struct{}{"legacy": {}}
+	materialized := []config.ProjectRefConfig{
+		{ID: "legacy"},
+		{ID: "stanced", Validation: &config.ProjectValidationConfig{OptOut: true}},
+	}
+
+	// No coding agent resolves, yet durable sticky snapshot retries can still
+	// execute coding work, so the unstanced legacy project stays quarantined.
+	runnable, err := validateCatalogValidationPolicies(global, materialized, allowed)
+	if err != nil {
+		t.Fatalf("validateCatalogValidationPolicies() error = %v", err)
+	}
+	if len(runnable) != 1 || runnable[0].ID != "stanced" {
+		t.Fatalf("runnable = %#v, want legacy project quarantined without a live agent", runnable)
+	}
+
+	global.Defaults.ValidationCommands = []string{"go test ./..."}
+	runnable, err = validateCatalogValidationPolicies(global, materialized, allowed)
+	if err != nil {
+		t.Fatalf("validateCatalogValidationPolicies(default fallback) error = %v", err)
+	}
+	if len(runnable) != 2 {
+		t.Fatalf("runnable with legacy default = %#v, want both projects", runnable)
+	}
+}

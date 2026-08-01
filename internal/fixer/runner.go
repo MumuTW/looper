@@ -82,6 +82,11 @@ const (
 	defaultRetryDelay               = 5 * time.Second
 	maxRetryDelay                   = 300 * time.Second
 	defaultRetryMax                 = 3
+	// durableRecoveryTimeout bounds the detached context used after a claimed
+	// operation has already failed. Queue/loop reconciliation must survive the
+	// operation context being cancelled, but it must not wait indefinitely on a
+	// blocked SQLite call while the claim is held.
+	durableRecoveryTimeout = 5 * time.Second
 )
 
 type FixItem struct {
@@ -1720,6 +1725,27 @@ func (r *Runner) validationCommandsForProject(projectID string) []string {
 	return r.validationCommands
 }
 
+// projectValidationPolicyKnown reports whether projectID has a resolved
+// validation policy entry from the runtime catalog. The runtime always
+// supplies validationCommandsByProject (possibly empty) from
+// config.ResolveProjectValidationCommandsByID; a nil map means the runner was
+// constructed without catalog policy information (tests/legacy), so the legacy
+// global-defaults fallback in validationCommandsForProject is preserved. A
+// non-nil map without an entry for projectID means the project was removed from
+// the catalog — an unstanced legacy row quarantined because
+// defaults.validationCommands is empty and it carries no validation stance.
+// Its durable sticky retry must fail closed before any agent work so it cannot
+// modify or publish code without the project-owned validation gate that caused
+// it to be quarantined; validation.RunCommands otherwise reports success
+// without running anything against the empty defaults fallback.
+func (r *Runner) projectValidationPolicyKnown(projectID string) bool {
+	if r.validationCommandsByProject == nil {
+		return true
+	}
+	_, ok := r.validationCommandsByProject[projectID]
+	return ok
+}
+
 func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput) (DiscoveryResult, error) {
 	ctx = githubinfra.ContextWithDiscoverySnapshot(ctx, input.Snapshot)
 	if r.repos == nil || r.repos.Projects == nil || r.repos.Loops == nil || r.repos.Queue == nil || r.repos.Runs == nil || r.repos.Locks == nil {
@@ -2201,6 +2227,15 @@ func (r *Runner) ProcessClaimedQueueItem(ctx context.Context, queueItem storage.
 }
 
 func (r *Runner) recoverClaimedItem(ctx context.Context, queueItem storage.QueueItemRecord, err error) (*ProcessResult, error) {
+	// Processing may return an error after a durable queue write has committed,
+	// and shutdown/cancellation can arrive before the caller enters recovery.
+	// Recovery owns the durable queue/loop transition, so detach cancellation
+	// while preserving context values and bound the cleanup window. Otherwise a
+	// terminal queue row can be left paired with a queued loop when the next
+	// GetByID observes the cancelled operation context.
+	recoveryCtx, cancel := newDurableRecoveryContext(ctx)
+	defer cancel()
+	ctx = recoveryCtx
 	failure := r.classifyFailure(err)
 	var activeErr *activeRunError
 	var runFailure *claimedRunFailureError
@@ -2285,6 +2320,14 @@ func (r *Runner) recoverClaimedItem(ctx context.Context, queueItem storage.Queue
 		}
 	}
 	return &ProcessResult{LoopID: derefString(queueItem.LoopID), QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
+}
+
+func newDurableRecoveryContext(parent context.Context) (context.Context, context.CancelFunc) {
+	base := context.Background()
+	if parent != nil {
+		base = context.WithoutCancel(parent)
+	}
+	return context.WithTimeout(base, durableRecoveryTimeout)
 }
 
 func (r *Runner) reconcileRecoveredLoop(ctx context.Context, queueItem storage.QueueItemRecord, failedQueue *storage.QueueItemRecord) (*storage.LoopRecord, error) {
@@ -2378,6 +2421,19 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	}
 	if project == nil {
 		return ProcessResult{}, fmt.Errorf("project not found: %s", loop.ProjectID)
+	}
+	// A project removed from the runtime catalog (quarantined unstanced legacy
+	// row with empty defaults.validationCommands) has no resolved validation
+	// policy. Its durable sticky retry must fail closed before any agent work
+	// so it cannot modify or publish code without the project-owned validation
+	// gate. recoverClaimedItem terminal-fails the queue item and pauses the
+	// loop; the project becomes runnable again once repaired via PATCH or once
+	// defaults.validationCommands is configured.
+	if !r.projectValidationPolicyKnown(project.ID) {
+		return ProcessResult{}, &loopError{
+			message: fmt.Sprintf("project %s is quarantined without a validation policy; repair the project validation stance or configure defaults.validationCommands before retrying", project.ID),
+			kind:    FailureManualIntervention,
+		}
 	}
 	resumedRun, err := r.createRunContext(ctx, *loop)
 	if err != nil {

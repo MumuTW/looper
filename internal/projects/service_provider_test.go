@@ -202,6 +202,10 @@ func TestInertProjectWarningNeverAdvisesTheDestructivePath(t *testing.T) {
 // Explicit IDs must have the same non-destructive repair route as derived
 // IDs. The API labels a supplied id as explicit, so accepting only derived
 // IDs would make the warning's re-registration advice impossible to follow.
+// Adding repository metadata to a legacy inert record still requires an
+// effective stance in the same request when defaults.validationCommands is
+// empty, mirroring the UpdateProject gate; re-registration with a stance
+// remains non-destructive.
 func TestServiceAddProjectRepairsExplicitIDAtSameCheckout(t *testing.T) {
 	t.Parallel()
 
@@ -231,8 +235,15 @@ func TestServiceAddProjectRepairsExplicitIDAtSameCheckout(t *testing.T) {
 	}
 
 	repo := "owner/demo"
+	if _, err := service.AddProject(context.Background(), AddInput{
+		ID: "demo", IDSource: "explicit", Name: "Demo", RepoPath: repoPath, Repo: &repo,
+	}); err == nil || !strings.Contains(err.Error(), "validation commands or optOut=true") {
+		t.Fatalf("repo-only re-registration error = %v, want stance requirement", err)
+	}
+
 	repaired, err := service.AddProject(context.Background(), AddInput{
 		ID: "demo", IDSource: "explicit", Name: "Demo", RepoPath: repoPath, Repo: &repo,
+		Validation: &config.ProjectValidationConfig{OptOut: true},
 	})
 	if err != nil {
 		t.Fatalf("repair AddProject() error = %v", err)

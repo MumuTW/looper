@@ -94,6 +94,70 @@ func TestLegacyProjectRuntimeReloadKeepsQuarantine(t *testing.T) {
 	}
 }
 
+func TestHandlerProjectsPatchRequiresStanceForRepoMetadataWithoutAgent(t *testing.T) {
+	runtime, cfg := startLegacyProjectRuntimeWithAgent(t, false)
+	runtime.Services().Projects.ScheduleDiscovery = func(func()) {}
+	handler := legacyProjectHandler(runtime, cfg)
+	if got := runtime.Config().Projects; len(got) != 0 {
+		t.Fatalf("runtime catalog projects = %#v, want legacy inert project quarantined without a live agent", got)
+	}
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPatch, "/api/v1/projects/legacy_inert", bytes.NewReader([]byte(`{"repo":"acme/app"}`)))
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("repo-only patch without agent status = %d, want 400 body=%s", recorder.Code, recorder.Body.String())
+	}
+	stored, err := runtime.Services().Repositories.Projects.GetByID(context.Background(), "legacy_inert")
+	if err != nil || stored == nil || stored.MetadataJSON == nil {
+		t.Fatalf("Projects.GetByID() after rejected patch = %#v, %v", stored, err)
+	}
+	if strings.Contains(*stored.MetadataJSON, `"repo":"acme/app"`) {
+		t.Fatalf("metadata after rejected patch = %s, want legacy inert record unchanged", *stored.MetadataJSON)
+	}
+
+	recorder = httptest.NewRecorder()
+	request = httptest.NewRequest(http.MethodPatch, "/api/v1/projects/legacy_inert", bytes.NewReader([]byte(`{"repo":"acme/app","validation":{"optOut":true}}`)))
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("patch with stance status = %d, want 200 body=%s", recorder.Code, recorder.Body.String())
+	}
+	if got := runtime.Config().Projects; len(got) != 1 || got[0].ID != "legacy_inert" {
+		t.Fatalf("runtime catalog projects after repair = %#v, want repaired project published", got)
+	}
+}
+
+func TestLegacyProjectRuntimeReloadRevokingLastAgentKeepsCoherentCatalog(t *testing.T) {
+	runtime, loaded := startLegacyProjectRuntimeLoaded(t, true)
+	runtime.Services().Projects.ScheduleDiscovery = func(func()) {}
+	if got := runtime.Config().Projects; len(got) != 0 {
+		t.Fatalf("runtime catalog projects = %#v, want legacy inert project quarantined", got)
+	}
+
+	// A hot reload that revokes the last Worker/Fixer agent re-materializes
+	// stored projects under the new config. The unstanced row stays
+	// quarantined — durable sticky retries can still execute coding work — but
+	// it must remain repairable rather than stuck in a stale filtered slice.
+	loaded.Config.Agent.Vendor = nil
+	if err := runtime.ReloadConfig(context.Background()); err != nil {
+		t.Fatalf("ReloadConfig() error = %v", err)
+	}
+	if got := runtime.Config().Projects; len(got) != 0 {
+		t.Fatalf("runtime catalog projects after agent revocation = %#v, want quarantine preserved", got)
+	}
+
+	handler := legacyProjectHandler(runtime, loaded.Config)
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPatch, "/api/v1/projects/legacy_inert", bytes.NewReader([]byte(`{"repo":"acme/app","validation":{"optOut":true}}`)))
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("repair after agent revocation status = %d, want 200 body=%s", recorder.Code, recorder.Body.String())
+	}
+	if got := runtime.Config().Projects; len(got) != 1 || got[0].ID != "legacy_inert" {
+		t.Fatalf("runtime catalog projects after repair = %#v, want repaired project published", got)
+	}
+}
+
 func startLegacyProjectRuntime(t *testing.T) (*looperdruntime.Runtime, config.Config) {
 	return startLegacyProjectRuntimeWithAgent(t, true)
 }
@@ -109,6 +173,11 @@ func legacyProjectHandler(runtime *looperdruntime.Runtime, cfg config.Config) *H
 }
 
 func startLegacyProjectRuntimeWithAgent(t *testing.T, withAgent bool) (*looperdruntime.Runtime, config.Config) {
+	runtime, loaded := startLegacyProjectRuntimeLoaded(t, withAgent)
+	return runtime, loaded.Config
+}
+
+func startLegacyProjectRuntimeLoaded(t *testing.T, withAgent bool) (*looperdruntime.Runtime, *config.LoadedFileConfig) {
 	t.Helper()
 
 	rootDir := t.TempDir()
@@ -155,12 +224,12 @@ func startLegacyProjectRuntimeWithAgent(t *testing.T, withAgent bool) (*looperdr
 		t.Fatalf("SQLiteCoordinator.Close() error = %v", err)
 	}
 
-	loaded := config.LoadedFileConfig{Config: cfg}
+	loaded := &config.LoadedFileConfig{Config: cfg}
 	runtime := looperdruntime.New(looperdruntime.Options{
 		Config:        cfg,
-		InitialConfig: loaded,
+		InitialConfig: *loaded,
 		ReloadConfig: func() (config.LoadedFileConfig, error) {
-			return loaded, nil
+			return *loaded, nil
 		},
 		Logger: noopLogger{},
 		Now: func() time.Time {
@@ -176,5 +245,5 @@ func startLegacyProjectRuntimeWithAgent(t *testing.T, withAgent bool) (*looperdr
 		t.Fatalf("Runtime.CompleteStartup() error = %v", err)
 	}
 	t.Cleanup(func() { runtime.Stop("test cleanup") })
-	return runtime, cfg
+	return runtime, loaded
 }
