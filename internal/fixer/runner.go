@@ -2025,9 +2025,17 @@ func (r *Runner) discoverPullRequestFromDetail(ctx context.Context, project stor
 			return err
 		}
 		// Zero fix items is the only evidence this loop converged, so it is the
-		// only automatic budget reset.
-		if err := r.clearRoundBudgetForPullRequest(ctx, project.ID, repo, detail.Number); err != nil {
-			return err
+		// only automatic budget reset — but only once an authoritative review
+		// result for the current head exists. The reviewer runs before the fixer
+		// and dispatches asynchronously, so right after a fixer push the next
+		// fixer discovery commonly sees zero items while the reviewer for that
+		// head is still running; resetting then lets findings it publishes later
+		// start from an empty budget and recreates the unbounded loop this gate
+		// stops.
+		if r.reviewerHasReviewedHead(ctx, project.ID, repo, detail.Number, detail.HeadSHA) {
+			if err := r.clearRoundBudgetForPullRequest(ctx, project.ID, repo, detail.Number); err != nil {
+				return err
+			}
 		}
 		result.Skipped++
 		return nil
@@ -2684,6 +2692,19 @@ func (r *Runner) schedulePendingRediscoveryAfterRun(ctx context.Context, loop st
 	if current.Status == "paused" {
 		return false, nil
 	}
+	// Charge the handoff before enqueueing. A pending rediscovery is a moved head
+	// observed while the preceding run was active — the active-run branch in
+	// ensureLoopForPullRequest records it and returns without charging — so this
+	// is another round and must spend the budget. Without it, rediscovery that
+	// overlaps every active run bypasses the counter and the loop stays unbounded.
+	charged, parked, err := r.chargeFixerRound(ctx, *current, pending.HeadSHA)
+	if err != nil {
+		return false, err
+	}
+	if parked {
+		return false, nil
+	}
+	current = &charged
 	availableAt := r.now()
 	availableAtISO := eventlog.FormatJavaScriptISOString(availableAt.UTC())
 	queueItem, err := r.enqueue(ctx, enqueueInput{ProjectID: current.ProjectID, LoopID: current.ID, Repo: repo, PRNumber: prNumber, HeadSHA: pending.HeadSHA, FixItemsHash: pending.FixItemsStateHash, AvailableAt: availableAt})

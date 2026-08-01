@@ -99,21 +99,44 @@ func parseRoundBudgetState(metadata map[string]any) (roundBudgetState, bool) {
 //
 // A parked loop is returned so the caller can stop without enqueueing; the budget
 // is persisted either way so an operator reading the loop can see how it got here.
+//
+// Once the recorded count reaches maxFixerRounds the loop is parked rather than
+// queued for one more push: the initial creation is not charged (it has no prior
+// head to move from), so the first charged round is the first rediscovery after a
+// push, and parking at the limit bounds the total pushes to the configured maximum.
+//
+// An unchanged head is not another round, but a budget left exhausted by a partial
+// write — the charge persisted but the pause did not, or the daemon exited between
+// the two writes — is reasserted here so that stale intermediate state cannot be
+// queued past the limit on the next discovery of the same head.
 func (r *Runner) chargeFixerRound(ctx context.Context, loop storage.LoopRecord, headSHA string) (storage.LoopRecord, bool, error) {
 	metadata := parseJSONObject(loop.MetadataJSON)
 	previous, hasPrevious := parseRoundBudgetState(metadata)
 	state, charged := nextRoundBudget(previous, hasPrevious, headSHA, r.nowISO())
-	if !charged {
-		return loop, false, nil
+	if charged {
+		updated, err := r.mergeLoopMetadata(ctx, loop, map[string]any{"fixerRoundBudget": state})
+		if err != nil {
+			return loop, false, err
+		}
+		if state.Rounds < r.maxFixerRounds {
+			return updated, false, nil
+		}
+		return r.parkLoopForRoundBudget(ctx, updated, state)
 	}
-	updated, err := r.mergeLoopMetadata(ctx, loop, map[string]any{"fixerRoundBudget": state})
-	if err != nil {
-		return loop, false, err
+	if hasPrevious && previous.Rounds >= r.maxFixerRounds {
+		if pauseReason, _ := stringFromAny(metadata["pauseReason"]); pauseReason == roundBudgetPauseReason && loop.Status == "paused" {
+			return loop, true, nil
+		}
+		return r.parkLoopForRoundBudget(ctx, loop, previous)
 	}
-	if state.Rounds <= r.maxFixerRounds {
-		return updated, false, nil
-	}
-	updated, err = r.mergeLoopMetadata(ctx, updated, map[string]any{"pauseReason": roundBudgetPauseReason})
+	return loop, false, nil
+}
+
+// parkLoopForRoundBudget persists the pause reason and paused status for an
+// exhausted budget, emits the loop.paused event, and reports the loop as parked
+// so the caller skips enqueueing.
+func (r *Runner) parkLoopForRoundBudget(ctx context.Context, loop storage.LoopRecord, state roundBudgetState) (storage.LoopRecord, bool, error) {
+	updated, err := r.mergeLoopMetadata(ctx, loop, map[string]any{"pauseReason": roundBudgetPauseReason})
 	if err != nil {
 		return loop, false, err
 	}
@@ -170,8 +193,51 @@ func (r *Runner) clearRoundBudgetForPullRequest(ctx context.Context, projectID, 
 	return err
 }
 
+// reviewerHasReviewedHead reports whether an authoritative review result for
+// headSHA exists for this pull request.
+//
+// The reviewer loop records the head it last completed a review on under
+// loop.lastReviewedHeadSha. The default scheduler runs reviewer discovery before
+// fixer discovery and dispatches claimed runs asynchronously, so right after a
+// fixer push the next fixer discovery commonly sees zero fix items while the
+// reviewer for that head is still running; resetting the budget then lets any
+// findings the reviewer publishes later start from an empty budget, recreating
+// the unbounded productive loop this gate stops. Only a review result for the
+// current head is evidence of convergence.
+//
+// When no reviewer loop exists there is no asynchronous reviewer whose findings
+// could still arrive, so zero fix items is authoritative and the reset proceeds.
+func (r *Runner) reviewerHasReviewedHead(ctx context.Context, projectID, repo string, prNumber int64, headSHA string) bool {
+	headSHA = strings.TrimSpace(headSHA)
+	if headSHA == "" {
+		return true
+	}
+	loops, err := r.repos.Loops.List(ctx)
+	if err != nil {
+		return false
+	}
+	hasReviewerLoop := false
+	for _, loop := range loops {
+		if loop.Type != "reviewer" || loop.ProjectID != projectID || derefString(loop.Repo) != repo || derefInt64(loop.PRNumber) != prNumber {
+			continue
+		}
+		hasReviewerLoop = true
+		loopMeta, _ := parseJSONObject(loop.MetadataJSON)["loop"].(map[string]any)
+		if reviewed, _ := stringFromAny(loopMeta["lastReviewedHeadSha"]); reviewed == headSHA {
+			return true
+		}
+	}
+	return !hasReviewerLoop
+}
+
 // clearRoundBudgetMetadata drops the budget and, only when the loop is parked for
 // this reason, the pause with it. Another gate's pause is not ours to lift.
+//
+// A loop that converged has no executable work left (the caller reached zero fix
+// items), so it is marked completed with no next run rather than stranded as
+// queued with no queue item — clearFixerFollowupStateForPR already cancelled any
+// queued items, and discoverPullRequestFromDetail enqueues no replacement. A
+// foreign pause is left untouched.
 func (r *Runner) clearRoundBudgetMetadata(ctx context.Context, loop storage.LoopRecord) (storage.LoopRecord, error) {
 	apply := func(updated *storage.LoopRecord) error {
 		meta, err := loops.DecodeMetadataObjectForWrite(updated.MetadataJSON)
@@ -179,13 +245,20 @@ func (r *Runner) clearRoundBudgetMetadata(ctx context.Context, loop storage.Loop
 			return err
 		}
 		delete(meta, "fixerRoundBudget")
-		if pauseReason, _ := stringFromAny(meta["pauseReason"]); pauseReason == roundBudgetPauseReason {
+		pauseReason, _ := stringFromAny(meta["pauseReason"])
+		ownedPause := pauseReason == roundBudgetPauseReason
+		if ownedPause {
 			delete(meta, "pauseReason")
-			if updated.Status == "paused" {
-				updated.Status = "queued"
-				nextRunAt := r.nowISO()
-				updated.NextRunAt = &nextRunAt
-			}
+		}
+		// Completing applies only when the loop was parked for this gate, or when
+		// it was queued with no foreign pause holding it. A running loop or a loop
+		// paused by another gate keeps its status.
+		if ownedPause && updated.Status == "paused" {
+			updated.Status = "completed"
+			updated.NextRunAt = nil
+		} else if pauseReason == "" && updated.Status == "queued" {
+			updated.Status = "completed"
+			updated.NextRunAt = nil
 		}
 		encoded, err := json.Marshal(meta)
 		if err != nil {
