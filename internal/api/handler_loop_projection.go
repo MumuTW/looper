@@ -10,15 +10,29 @@ import (
 	pkgapi "github.com/MumuTW/looper/pkg/api"
 )
 
+func (h *Handler) logsRepositories() (*storage.Repositories, error) {
+	if h.context.Runtime == nil {
+		return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: "Storage is not configured"}
+	}
+	repos := h.context.Runtime.Services().Repositories
+	if repos == nil || repos.Loops == nil || repos.Runs == nil || repos.AgentExecutions == nil {
+		return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: "Storage is not configured"}
+	}
+	return repos, nil
+}
+
 func (h *Handler) buildLoopLogsResponse(ctx context.Context, loop storage.LoopRecord) (loopLogsResponse, error) {
-	services := h.context.Runtime.Services()
-	if latestLoop, err := services.Repositories.Loops.GetByID(ctx, loop.ID); err != nil {
+	repos, err := h.logsRepositories()
+	if err != nil {
+		return loopLogsResponse{}, err
+	}
+	if latestLoop, err := repos.Loops.GetByID(ctx, loop.ID); err != nil {
 		return loopLogsResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 	} else if latestLoop != nil {
 		loop = *latestLoop
 	}
 
-	latestRun, err := services.Repositories.Runs.GetLatestByLoopID(ctx, loop.ID)
+	latestRun, err := repos.Runs.GetLatestByLoopID(ctx, loop.ID)
 	if err != nil {
 		return loopLogsResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 	}
@@ -27,8 +41,11 @@ func (h *Handler) buildLoopLogsResponse(ctx context.Context, loop storage.LoopRe
 }
 
 func (h *Handler) buildRunLogsResponse(ctx context.Context, runID string) (loopLogsResponse, error) {
-	services := h.context.Runtime.Services()
-	run, err := services.Repositories.Runs.GetByID(ctx, runID)
+	repos, err := h.logsRepositories()
+	if err != nil {
+		return loopLogsResponse{}, err
+	}
+	run, err := repos.Runs.GetByID(ctx, runID)
 	if err != nil {
 		return loopLogsResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 	}
@@ -36,7 +53,7 @@ func (h *Handler) buildRunLogsResponse(ctx context.Context, runID string) (loopL
 		return loopLogsResponse{}, apiError{code: pkgapi.ErrorCodeRunNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Run not found: %s", runID)}
 	}
 
-	loop, err := services.Repositories.Loops.GetByID(ctx, run.LoopID)
+	loop, err := repos.Loops.GetByID(ctx, run.LoopID)
 	if err != nil {
 		return loopLogsResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 	}
@@ -57,7 +74,10 @@ func (h *Handler) buildLogsResponseForRun(ctx context.Context, loop storage.Loop
 // state refresh never rereads the bounded log history; their file cursors own
 // incremental bytes instead.
 func (h *Handler) buildLogsStateForRun(ctx context.Context, loop storage.LoopRecord, run *storage.RunRecord, readPersisted bool) (loopLogsResponse, agentOutputPayload, error) {
-	services := h.context.Runtime.Services()
+	repos, err := h.logsRepositories()
+	if err != nil {
+		return loopLogsResponse{}, agentOutputPayload{}, err
+	}
 	var runPayload *loopLogsRunResponse
 	var agentPayload *loopLogsAgentPayload
 	var output agentOutputPayload
@@ -72,7 +92,7 @@ func (h *Handler) buildLogsStateForRun(ctx context.Context, loop storage.LoopRec
 			ErrorMessage: run.ErrorMessage,
 		}
 
-		latestAgent, agentErr := services.Repositories.AgentExecutions.GetLatestByRunID(ctx, run.ID)
+		latestAgent, agentErr := repos.AgentExecutions.GetLatestByRunID(ctx, run.ID)
 		if agentErr != nil {
 			return loopLogsResponse{}, agentOutputPayload{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: agentErr.Error()}
 		}

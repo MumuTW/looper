@@ -1878,6 +1878,32 @@ func TestHandlerWebhookForwardAcceptsLoopbackWithoutDoubleScheduling(t *testing.
 	assertEqual(t, recorded, 1)
 }
 
+func TestHandlerWebhookForwardRejectsOversizePayload(t *testing.T) {
+	fixture := newTestFixture(t)
+	fixture.config.Webhook.Enabled = true
+	forwarder := &fakeWebhookForwarder{result: webhookforward.ForwardResult{Status: "accepted", WorkItems: 1}}
+	runtime := webhookForwardRuntime{Runtime: fixture.runtime, config: &fixture.config, status: func() looperdruntime.WebhookStatus {
+		return looperdruntime.WebhookStatus{Enabled: true}
+	}}
+	h := NewHandler(Context{Config: fixture.config, Runtime: runtime, WebhookForwarder: forwarder})
+
+	payload := bytes.Repeat([]byte("x"), (1<<20)+1)
+	req := httptest.NewRequest(http.MethodPost, "/webhook/forward", bytes.NewReader(payload))
+	req.RemoteAddr = "127.0.0.1:1234"
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want 413; body=%s", recorder.Code, recorder.Body.String())
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	errMap := body["error"].(map[string]any)
+	assertEqual(t, errMap["code"], "REQUEST_TOO_LARGE")
+	if forwarder.calls != 0 {
+		t.Fatalf("forwarder calls = %d, want 0 for oversize payload", forwarder.calls)
+	}
+}
+
 func TestHandlerWebhookForwardProcessesDeliveryWhenRuntimeIsDegraded(t *testing.T) {
 	fixture := newTestFixture(t)
 	fixture.config.Webhook.Enabled = true

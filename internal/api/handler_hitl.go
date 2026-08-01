@@ -31,6 +31,8 @@ type takeoverLoopResponse struct {
 	Message       string `json:"message,omitempty"`
 }
 
+const feishuCallbackMaxPayloadBytes = 1 << 20
+
 // takeoverLoop parks a loop for interactive human takeover and returns the exact
 // command a human runs to resume the loop's agent session (same native session id,
 // in the loop's worktree). The daemon's in-flight run is already stopped by the
@@ -93,7 +95,11 @@ func (h *Handler) handbackLoop(ctx context.Context, r *http.Request, loopID stri
 		if loop == nil {
 			return struct{}{}, apiError{code: pkgapi.ErrorCodeLoopNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Loop not found: %s", loopID)}
 		}
-		if execution, err := repos.AgentExecutions.GetLatestByLoopID(ctx, loopID); err == nil && execution != nil && execution.NativeSessionID != nil && strings.TrimSpace(*execution.NativeSessionID) != "" {
+		execution, err := repos.AgentExecutions.GetLatestByLoopID(ctx, loopID)
+		if err != nil {
+			return struct{}{}, fmt.Errorf("load latest agent execution: %w", err)
+		}
+		if execution != nil && execution.NativeSessionID != nil && strings.TrimSpace(*execution.NativeSessionID) != "" {
 			meta, werr := loops.WriteTakeoverResume(loop.MetadataJSON, loops.TakeoverResume{SessionID: strings.TrimSpace(*execution.NativeSessionID)})
 			if werr != nil {
 				// Without the resume marker the next worker run cannot attach
@@ -286,7 +292,16 @@ func (h *Handler) handleFeishuCardActionRoute(w http.ResponseWriter, r *http.Req
 	var raw []byte
 	if r.Body != nil {
 		defer r.Body.Close()
-		raw, _ = io.ReadAll(io.LimitReader(r.Body, 1<<20))
+		var readErr error
+		raw, readErr = io.ReadAll(io.LimitReader(r.Body, feishuCallbackMaxPayloadBytes+1))
+		if readErr != nil {
+			h.writeError(w, requestID, internalServerError(readErr))
+			return
+		}
+		if len(raw) > feishuCallbackMaxPayloadBytes {
+			h.writeError(w, requestID, apiError{code: pkgapi.ErrorCodeRequestTooLarge, status: http.StatusRequestEntityTooLarge, message: fmt.Sprintf("Feishu callback body exceeds %d bytes", feishuCallbackMaxPayloadBytes)})
+			return
+		}
 	}
 	var envelope feishuCardActionEnvelope
 	if err := json.Unmarshal(raw, &envelope); err != nil {
@@ -393,6 +408,10 @@ func (h *Handler) handleFeishuThreadReply(w http.ResponseWriter, r *http.Request
 		h.writeSuccess(w, requestID, map[string]any{"delivered": false, "reason": "non-text message"})
 		return
 	}
+	if !strings.EqualFold(strings.TrimSpace(envelope.Event.Sender.SenderType), "user") {
+		h.writeSuccess(w, requestID, map[string]any{"delivered": false, "reason": "non-human sender"})
+		return
+	}
 	rootID := strings.TrimSpace(msg.RootID)
 	if rootID == "" {
 		rootID = strings.TrimSpace(msg.ThreadID)
@@ -416,7 +435,11 @@ func (h *Handler) handleFeishuThreadReply(w http.ResponseWriter, r *http.Request
 		return
 	}
 	loopID, err := services.Repositories.FeishuThreads.LoopByRoot(r.Context(), rootID)
-	if err != nil || strings.TrimSpace(loopID) == "" {
+	if err != nil {
+		h.writeError(w, requestID, internalServerError(err))
+		return
+	}
+	if strings.TrimSpace(loopID) == "" {
 		h.writeSuccess(w, requestID, map[string]any{"delivered": false, "reason": "no loop for thread"})
 		return
 	}
@@ -424,7 +447,15 @@ func (h *Handler) handleFeishuThreadReply(w http.ResponseWriter, r *http.Request
 	// drops the bot's own thread posts, replies after the loop resumed, and any
 	// duplicate Feishu retries.
 	if _, err := h.deliverHumanAnswer(r.Context(), loopID, answer); err != nil {
-		h.writeSuccess(w, requestID, map[string]any{"loopId": loopID, "delivered": false, "reason": "loop not awaiting a human"})
+		var typed apiError
+		if asAPIError(err, &typed) && (typed.status == http.StatusBadRequest || typed.status == http.StatusNotFound) {
+			h.writeSuccess(w, requestID, map[string]any{"loopId": loopID, "delivered": false, "reason": "loop not awaiting a human"})
+			return
+		}
+		if !asAPIError(err, &typed) {
+			typed = internalServerError(err)
+		}
+		h.writeError(w, requestID, typed)
 		return
 	}
 	h.writeSuccess(w, requestID, map[string]any{"loopId": loopID, "delivered": true})

@@ -999,12 +999,9 @@ func issueWorkerMetadataJSON(metadataJSON *string, target domain.LoopTarget, for
 
 func forcedManualWorkerMetadataJSONCompat(metadataJSON *string) *string {
 	metadata := parseJSONObject(metadataJSON)
-	if len(metadata) == 0 {
-		return metadataJSON
-	}
-	worker, ok := metadata["worker"].(map[string]any)
-	if !ok {
-		return metadataJSON
+	worker, _ := metadata["worker"].(map[string]any)
+	if worker == nil {
+		worker = map[string]any{}
 	}
 	delete(worker, "autoDiscovered")
 	worker["issueClaimOverride"] = true
@@ -1422,8 +1419,9 @@ func (h *Handler) getPlannerPullRequestOpenState(ctx context.Context, projectID,
 
 func deriveWorkerTitle(prompt, specPath, repo *string, prNumber, issueNumber *int64) string {
 	if prompt != nil {
-		if len(*prompt) > 80 {
-			return (*prompt)[:80]
+		runes := []rune(*prompt)
+		if len(runes) > 80 {
+			return string(runes[:80])
 		}
 		return *prompt
 	}

@@ -14,13 +14,7 @@ import (
 )
 
 func (h *Handler) buildProjectsRouteResponse(r *http.Request) (any, error) {
-	service := h.context.ProjectsService
-	if service == nil {
-		runtimeProjects := h.context.Runtime.Services().Projects
-		if runtimeProjects != nil {
-			service = runtimeProjects
-		}
-	}
+	service := h.projectsRouteService()
 	if service == nil {
 		return nil, apiError{
 			code:    pkgapi.ErrorCodeProjectsUnavailable,
@@ -53,13 +47,7 @@ func (h *Handler) buildProjectsRouteResponse(r *http.Request) (any, error) {
 }
 
 func (h *Handler) buildProjectRouteResponse(r *http.Request, path string) (any, error) {
-	service := h.context.ProjectsService
-	if service == nil {
-		runtimeProjects := h.context.Runtime.Services().Projects
-		if runtimeProjects != nil {
-			service = runtimeProjects
-		}
-	}
+	service := h.projectsRouteService()
 	if service == nil {
 		return nil, apiError{
 			code:    pkgapi.ErrorCodeProjectsUnavailable,
@@ -114,6 +102,19 @@ func (h *Handler) buildProjectRouteResponse(r *http.Request, path string) (any, 
 		}
 	}
 	return serializeProject(removed, h.context.Config, h.context.Config.Defaults.BaseBranch), nil
+}
+
+func (h *Handler) projectsRouteService() projectService {
+	if h.context.ProjectsService != nil {
+		return h.context.ProjectsService
+	}
+	if h.context.Runtime != nil {
+		runtimeProjects := h.context.Runtime.Services().Projects
+		if runtimeProjects != nil {
+			return runtimeProjects
+		}
+	}
+	return nil
 }
 
 // buildProjectDiscoverResponse retries post-commit worktree/PR discovery for

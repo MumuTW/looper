@@ -462,6 +462,33 @@ func TestHandlerFeishuThreadReplyDeliversTypedAnswer(t *testing.T) {
 	}
 }
 
+func TestHandlerFeishuThreadReplyIgnoresNonHumanSender(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	cfg.HITL.Enabled = true
+	t.Setenv("LOOPER_TEST_FEISHU_VTOKEN5", "verify-tok-123")
+	cfg.Notifications.Webhook.VerificationTokenEnv = "LOOPER_TEST_FEISHU_VTOKEN5"
+	h := setupAwaitingCardLoop(t, cfg, rt, "project_thread_bot", "loop_thread_bot", 93)
+	services := rt.Services()
+	if err := services.Repositories.FeishuThreads.Upsert(context.Background(), "om_root_bot", "loop_thread_bot", "oc_group", "2026-04-11T12:00:00.000Z"); err != nil {
+		t.Fatalf("FeishuThreads.Upsert() error = %v", err)
+	}
+
+	body := `{"schema":"2.0","header":{"event_type":"im.message.receive_v1","token":"verify-tok-123"},"event":{"message":{"message_id":"om_bot_reply","root_id":"om_root_bot","chat_id":"oc_group","message_type":"text","content":"{\"text\":\"bot follow-up\"}"},"sender":{"sender_type":"app","sender_id":{"open_id":"ou_bot"}}}}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/hitl/feishu", strings.NewReader(body))
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), "non-human sender") {
+		t.Fatalf("status/body = %d/%s, want ignored non-human sender", recorder.Code, recorder.Body.String())
+	}
+	loop, err := services.Repositories.Loops.GetByID(context.Background(), "loop_thread_bot")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = %#v, %v", loop, err)
+	}
+	if loop.Status != "awaiting_human" {
+		t.Fatalf("loop.Status = %q, want unchanged awaiting_human", loop.Status)
+	}
+}
+
 func TestHandlerFeishuThreadReplyIgnoresUnknownThread(t *testing.T) {
 	rt, cfg := startTestRuntime(t)
 	cfg.HITL.Enabled = true

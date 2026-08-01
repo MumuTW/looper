@@ -138,13 +138,16 @@ var errLoopLogsClientWrite = errors.New("loop logs client write failed")
 
 func (h *Handler) buildLoopLogsCombinedState(ctx context.Context, loop storage.LoopRecord) (loopLogsCombinedState, error) {
 	h.observeLoopLogsFollow("state_refresh", 0)
-	services := h.context.Runtime.Services()
-	if latestLoop, err := services.Repositories.Loops.GetByID(ctx, loop.ID); err != nil {
+	repos, err := h.logsRepositories()
+	if err != nil {
+		return loopLogsCombinedState{}, err
+	}
+	if latestLoop, err := repos.Loops.GetByID(ctx, loop.ID); err != nil {
 		return loopLogsCombinedState{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 	} else if latestLoop != nil {
 		loop = *latestLoop
 	}
-	latestRun, err := services.Repositories.Runs.GetLatestByLoopID(ctx, loop.ID)
+	latestRun, err := repos.Runs.GetLatestByLoopID(ctx, loop.ID)
 	if err != nil {
 		return loopLogsCombinedState{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
 	}

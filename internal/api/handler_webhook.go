@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/MumuTW/looper/internal/config"
@@ -40,9 +41,13 @@ func (h *Handler) buildWebhookForwardResponse(r *http.Request) (webhookforward.F
 			return webhookforward.ForwardResult{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusServiceUnavailable, message: "webhook runtime is disabled; deliveries are not being processed"}
 		}
 	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	const maxWebhookPayloadBytes = 1 << 20
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxWebhookPayloadBytes+1))
 	if err != nil {
 		return webhookforward.ForwardResult{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+	}
+	if len(body) > maxWebhookPayloadBytes {
+		return webhookforward.ForwardResult{}, apiError{code: pkgapi.ErrorCodeRequestTooLarge, status: http.StatusRequestEntityTooLarge, message: fmt.Sprintf("Webhook payload exceeds %d bytes", maxWebhookPayloadBytes)}
 	}
 	deliveryID := r.Header.Get("X-GitHub-Delivery")
 	eventType := r.Header.Get("X-GitHub-Event")
@@ -63,6 +68,7 @@ func (h *Handler) buildWebhookForwardResponse(r *http.Request) (webhookforward.F
 				code = pkgapi.ErrorCodeInternalError
 			} else if strings.Contains(lower, "queue is full") {
 				status = http.StatusServiceUnavailable
+				code = pkgapi.ErrorCodeServiceUnavailable
 			}
 		}
 		return webhookforward.ForwardResult{}, apiError{code: code, status: status, message: message}
@@ -126,5 +132,5 @@ func serverBaseURL(cfg config.ServerConfig) string {
 	if cfg.BaseURL != nil && strings.TrimSpace(*cfg.BaseURL) != "" {
 		return strings.TrimSpace(*cfg.BaseURL)
 	}
-	return fmt.Sprintf("http://%s:%d", cfg.Host, cfg.Port)
+	return "http://" + net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port))
 }
