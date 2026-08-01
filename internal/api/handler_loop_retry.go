@@ -316,6 +316,7 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string,
 		return retryResult{loop: updated, queueItemID: &persisted.ID}, nil
 	})
 	if err != nil {
+		err = mapIssueClaimAdmissionError(err)
 		if restoreErr := restoreStopGate(); restoreErr != nil {
 			var typed apiError
 			if asAPIError(err, &typed) {

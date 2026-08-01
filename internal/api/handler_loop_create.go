@@ -840,10 +840,8 @@ func forcedManualWorkerQueuePayloadJSONCompat(payloadJSON *string) *string {
 	if len(payload) == 0 {
 		return payloadJSON
 	}
-	if payload["autoDiscovered"] != true {
-		return payloadJSON
-	}
 	delete(payload, "autoDiscovered")
+	payload["issueClaimOverride"] = true
 	encoded, err := json.Marshal(payload)
 	if err != nil {
 		return payloadJSON
@@ -885,11 +883,12 @@ func forcedManualWorkerMetadataJSONCompat(metadataJSON *string) *string {
 	if len(metadata) == 0 {
 		return metadataJSON
 	}
-	worker, _ := metadata["worker"].(map[string]any)
-	if worker["autoDiscovered"] != true {
+	worker, ok := metadata["worker"].(map[string]any)
+	if !ok {
 		return metadataJSON
 	}
 	delete(worker, "autoDiscovered")
+	worker["issueClaimOverride"] = true
 	metadata["worker"] = worker
 	encoded, err := json.Marshal(metadata)
 	if err != nil {
@@ -904,11 +903,12 @@ func forcedManualWorkerCheckpointJSONCompat(checkpointJSON *string) *string {
 	if len(checkpoint) == 0 {
 		return checkpointJSON
 	}
-	work, _ := checkpoint["work"].(map[string]any)
-	if work["autoDiscovered"] != true {
+	work, ok := checkpoint["work"].(map[string]any)
+	if !ok {
 		return checkpointJSON
 	}
 	delete(work, "autoDiscovered")
+	work["issueClaimOverride"] = true
 	checkpoint["work"] = work
 	encoded, err := json.Marshal(checkpoint)
 	if err != nil {

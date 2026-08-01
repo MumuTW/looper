@@ -514,6 +514,60 @@ func TestHandlerLoopRetryRejectsConflictingActiveLoop(t *testing.T) {
 	}
 }
 
+func TestHandlerLoopRetryMapsIssueClaimConflictToLoopConflict(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+	projectID := "project_retry_issue_claim"
+	repo := "acme/looper"
+	prNumber := int64(77)
+	prTarget := "pr:acme/looper:77"
+	issueTarget := "issue:acme/looper:19"
+	sourceWorkerMeta := `{"worker":{"repo":"acme/looper","issueNumber":19}}`
+	reviewerMeta := `{"sourceWorkerId":"source_worker_pr"}`
+
+	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Looper", RepoPath: "/tmp/repos/looper", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	// Completed source worker whose PR retargets from issue 19.
+	if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "source_worker_pr", Seq: 60, ProjectID: projectID, Type: "worker", TargetType: "pull_request", TargetID: &prTarget, Repo: &repo, PRNumber: &prNumber, Status: "completed", MetadataJSON: &sourceWorkerMeta, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert(source_worker_pr) error = %v", err)
+	}
+	// Active reviewer claiming issue 19 through the source worker.
+	if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "active_reviewer_pr", Seq: 61, ProjectID: projectID, Type: "reviewer", TargetType: "pull_request", TargetID: &prTarget, Repo: &repo, PRNumber: &prNumber, Status: "queued", MetadataJSON: &reviewerMeta, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert(active_reviewer_pr) error = %v", err)
+	}
+	// Dormant issue worker to retry — same-type preconditions pass (no other
+	// active worker on issue 19), but Loops.Upsert detects the cross-type claim.
+	dormantID := "dormant_issue_worker"
+	if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: dormantID, Seq: 62, ProjectID: projectID, Type: "worker", TargetType: "issue", TargetID: &issueTarget, Repo: &repo, Status: "failed", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert(dormant_issue_worker) error = %v", err)
+	}
+	lastErrorKind := "non_retryable"
+	if err := services.Repositories.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_dormant_issue_worker", ProjectID: &projectID, LoopID: &dormantID, Type: "worker", TargetType: "issue", TargetID: issueTarget, Repo: &repo, DedupeKey: "worker:project_retry_issue_claim:acme/looper:19", Priority: storage.QueuePriorityWorker, Status: "failed", AvailableAt: nowISO, Attempts: 1, MaxAttempts: 3, LastErrorKind: &lastErrorKind, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/62/retry", strings.NewReader(`{"mode":"auto","resetAttempts":true}`))
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409; body=%s", recorder.Code, recorder.Body.String())
+	}
+	body := parseJSONMap(t, recorder.Body.Bytes())
+	apiErr := body["error"].(map[string]any)
+	assertEqual(t, apiErr["code"], string(pkgapi.ErrorCodeLoopConflict))
+	// The dormant loop must remain failed, not partially queued.
+	loop, err := services.Repositories.Loops.GetByID(context.Background(), dormantID)
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = %#v, %v", loop, err)
+	}
+	if loop.Status != "failed" {
+		t.Fatalf("loop.Status = %q, want failed after conflict rejection", loop.Status)
+	}
+}
+
 func TestHandlerActiveRunsSurfacesManualInterventionStatus(t *testing.T) {
 	rt, cfg := startTestRuntime(t)
 	h := NewHandler(Context{Config: cfg, Runtime: rt})
@@ -6325,6 +6379,9 @@ func TestHandlerWorkersCreateForceClearsAutoDiscoveredPayloadWhenReusingIssueWor
 	if payload["autoDiscovered"] == true {
 		t.Fatalf("payload = %#v, want forced reused worker to bypass auto-discovered hold checks", payload)
 	}
+	if payload["issueClaimOverride"] != true {
+		t.Fatalf("payload = %#v, want forced reused worker payload to carry durable issueClaimOverride", payload)
+	}
 	loop, err := fixture.runtime.Services().Repositories.Loops.GetByID(context.Background(), loopID)
 	if err != nil {
 		t.Fatalf("Loops.GetByID() error = %v", err)
@@ -6334,6 +6391,12 @@ func TestHandlerWorkersCreateForceClearsAutoDiscoveredPayloadWhenReusingIssueWor
 	if workerMeta["autoDiscovered"] == true {
 		t.Fatalf("metadata = %#v, want forced reused worker metadata to bypass auto-discovered hold checks", metadata)
 	}
+	if workerMeta["issueClaimOverride"] != true {
+		t.Fatalf("metadata = %#v, want forced reused worker metadata to carry durable issueClaimOverride", metadata)
+	}
+	if !storage.LoopForcesIssueClaimAdmission(*loop) {
+		t.Fatalf("LoopForcesIssueClaimAdmission = false, want forced reused worker to retain operator override authority")
+	}
 	run, err := fixture.runtime.Services().Repositories.Runs.GetByID(context.Background(), "run_existing_held_issue_worker")
 	if err != nil {
 		t.Fatalf("Runs.GetByID() error = %v", err)
@@ -6342,6 +6405,9 @@ func TestHandlerWorkersCreateForceClearsAutoDiscoveredPayloadWhenReusingIssueWor
 	work, _ := checkpoint["work"].(map[string]any)
 	if work["autoDiscovered"] == true {
 		t.Fatalf("checkpoint = %#v, want forced reused worker checkpoint to bypass auto-discovered hold checks", checkpoint)
+	}
+	if work["issueClaimOverride"] != true {
+		t.Fatalf("checkpoint = %#v, want forced reused worker checkpoint to carry durable issueClaimOverride", checkpoint)
 	}
 }
 
