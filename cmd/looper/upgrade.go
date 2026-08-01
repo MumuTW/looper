@@ -94,6 +94,12 @@ type upgradeProjects struct {
 	} `json:"items"`
 }
 
+type upgradeConfigResponse struct {
+	Metadata struct {
+		ConfigPath string `json:"configPath"`
+	} `json:"metadata"`
+}
+
 type upgradeEvents struct {
 	Items []struct {
 		EventType string `json:"eventType"`
@@ -109,6 +115,8 @@ type upgradePostStartReport struct {
 	ExpectedExecutable string        `json:"expectedExecutable,omitempty"`
 	ExpectedDatabase   string        `json:"expectedDatabase,omitempty"`
 	RunningDatabase    string        `json:"runningDatabase,omitempty"`
+	ExpectedConfig     string        `json:"expectedConfig,omitempty"`
+	RunningConfig      string        `json:"runningConfig,omitempty"`
 	ExpectedCLI        string        `json:"expectedCLI,omitempty"`
 	ConfiguredCLI      string        `json:"configuredCLI,omitempty"`
 	Status             upgradeStatus `json:"status"`
@@ -675,6 +683,10 @@ func runUpgradeVerifyStart(ctx context.Context, global []string, root, releaseID
 	if err != nil {
 		return err
 	}
+	configResp, err := requestJSON[upgradeConfigResponse](ctx, cfg, "GET", "/api/v1/config", nil)
+	if err != nil {
+		return err
+	}
 	daemon := version.Info{Version: remote.Version, Metadata: remote.Build}
 	expectedExec := upgraderelease.CurrentDaemonExecutable(root)
 	expectedCLI := filepath.Join(filepath.Clean(root), "current", "looper")
@@ -687,6 +699,8 @@ func runUpgradeVerifyStart(ctx context.Context, global []string, root, releaseID
 		ExpectedExecutable: expectedExec,
 		ExpectedDatabase:   source.DatabasePath,
 		RunningDatabase:    strings.TrimSpace(status.Storage.DBPath),
+		ExpectedConfig:     source.ConfigPath,
+		RunningConfig:      strings.TrimSpace(configResp.Metadata.ConfigPath),
 		ExpectedCLI:        expectedCLI,
 		ConfiguredCLI:      strings.TrimSpace(status.Tools.LooperPath),
 		Status:             status,
@@ -737,6 +751,11 @@ func upgradePostStartBlocks(report upgradePostStartReport) []string {
 	// checks against an empty DB while all prior work remains in the old file.
 	if err := requireSameFilesystemPath(report.RunningDatabase, report.ExpectedDatabase); err != nil {
 		blocks = append(blocks, "running database: "+err.Error())
+	}
+	// Applied config path must match the bundle restore source so rollback
+	// rewrites the file the supervisor actually loads.
+	if err := requireSameFilesystemPath(report.RunningConfig, report.ExpectedConfig); err != nil {
+		blocks = append(blocks, "running config: "+err.Error())
 	}
 	statusBuild := version.Info{Version: report.Status.Service.Version, Metadata: report.Status.Service.Build}
 	if !statusBuild.SameBuild(report.ExpectedBuild) {
