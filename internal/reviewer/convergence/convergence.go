@@ -52,6 +52,28 @@ const (
 	ReasonAbsoluteCeiling      Reason = "absolute_round_ceiling"
 )
 
+// Status is the human-facing lifecycle label persisted alongside the
+// convergence record. It is distinct from ItemStatus, which tracks individual
+// review items.
+type Status string
+
+const (
+	StatusActive        Status = "active"
+	StatusAwaitingHuman Status = "awaiting_human"
+	StatusCompleted     Status = "completed"
+)
+
+// ValidStatus reports whether a persisted status string is a recognized value
+// or empty. Empty is permitted because the record may predate the status field.
+func ValidStatus(status string) bool {
+	switch Status(status) {
+	case "", StatusActive, StatusAwaitingHuman, StatusCompleted:
+		return true
+	default:
+		return false
+	}
+}
+
 type Policy struct {
 	MaxConsecutiveUnproductive int           `json:"maxConsecutiveUnproductive"`
 	MaxFixerAttemptsPerItem    int           `json:"maxFixerAttemptsPerItem"`
@@ -84,6 +106,79 @@ func (p Policy) Validate() error {
 	default:
 		return fmt.Errorf("unsupported severity floor %q", p.SeverityFloor)
 	}
+}
+
+// Valid reports whether an Action is a recognized value or empty. Empty is
+// permitted because the persisted record omits action until the first round.
+func (a Action) Valid() bool {
+	switch a {
+	case "", ActionContinue, ActionComplete, ActionEscalate:
+		return true
+	default:
+		return false
+	}
+}
+
+// Valid reports whether a Reason is a recognized value or empty.
+func (r Reason) Valid() bool {
+	switch r {
+	case "", ReasonConverging, ReasonSeverityFloorReached, ReasonStalled, ReasonAbsoluteCeiling:
+		return true
+	default:
+		return false
+	}
+}
+
+// Validate reports whether an item's persisted fields are internally coherent.
+// It mirrors normalizeItem but does not mutate, so a read-only projection can
+// reject malformed persisted or client-supplied state without re-running the
+// state machine.
+func (i Item) Validate() error {
+	if strings.TrimSpace(i.ID) == "" {
+		return fmt.Errorf("review item id is required")
+	}
+	if _, err := reviewitem.ParseSeverity(string(i.Severity)); err != nil {
+		return fmt.Errorf("review item %q: %w", i.ID, err)
+	}
+	switch i.Status {
+	case ItemStatusOpen, ItemStatusResolved, ItemStatusSuperseded, ItemStatusDeferred:
+	default:
+		return fmt.Errorf("review item %q has unsupported status %q", i.ID, i.Status)
+	}
+	switch i.FixerResult {
+	case "", FixerResultFixed, FixerResultDeclined, FixerResultDeferred:
+	default:
+		return fmt.Errorf("review item %q has unsupported fixer result %q", i.ID, i.FixerResult)
+	}
+	if i.FixerAttempts < 0 {
+		return fmt.Errorf("review item %q has negative fixer attempts %d", i.ID, i.FixerAttempts)
+	}
+	return nil
+}
+
+// Validate reports whether a persisted State is internally coherent: counters
+// are non-negative and every recorded item passes Item.Validate. It does not
+// re-derive productivity or action, so it cannot reject a logically stale but
+// syntactically valid record — only malformed metadata that json.Unmarshal
+// would otherwise accept silently.
+func (s State) Validate() error {
+	if s.TotalRounds < 0 {
+		return fmt.Errorf("total rounds must be non-negative")
+	}
+	if s.ConsecutiveUnproductive < 0 {
+		return fmt.Errorf("consecutive unproductive must be non-negative")
+	}
+	for _, item := range s.Items {
+		if err := item.Validate(); err != nil {
+			return err
+		}
+	}
+	for _, round := range s.History {
+		if round.Number < 0 {
+			return fmt.Errorf("round number must be non-negative")
+		}
+	}
+	return nil
 }
 
 type Item struct {

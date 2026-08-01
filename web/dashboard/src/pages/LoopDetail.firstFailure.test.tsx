@@ -213,7 +213,101 @@ describe("LoopDetail reviewer convergence", () => {
     expect(screen.getByText("5 / 40")).toBeTruthy();
     expect(screen.getByText("2 / 3")).toBeTruthy();
     expect(screen.getByText("review-1")).toBeTruthy();
+    // The full fixer-attempt budget is rendered, not just the current count.
+    expect(screen.getByText(/1 \/ 4 fixer attempts/)).toBeTruthy();
     expect(screen.getByText("#4 productive")).toBeTruthy();
     expect(screen.getByText("#5 unproductive")).toBeTruthy();
+  });
+
+  it("renders the fixer-attempt budget even when an item has zero attempts", async () => {
+    renderLoopDetail(
+      loopFixture({
+        type: "reviewer",
+        convergence: {
+          policy: {
+            maxConsecutiveUnproductive: 3,
+            maxFixerAttemptsPerItem: 4,
+            maxTotalRounds: 40,
+            severityFloor: "non_blocking",
+          },
+          state: {
+            totalRounds: 1,
+            consecutiveUnproductive: 0,
+            items: {
+              "review-fresh": {
+                id: "review-fresh",
+                severity: "blocking",
+                status: "open",
+                // fixerAttempts intentionally omitted: defaults to 0.
+              },
+            },
+            history: [
+              { number: 1, productive: true, openItemIds: ["review-fresh"] },
+            ],
+          },
+          action: "continue",
+          reason: "converging",
+          status: "active",
+          updatedAt: "2026-07-31T18:00:00.000Z",
+        },
+      }),
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText("Reviewer convergence")).toBeTruthy();
+    });
+    // Zero attempts must still surface alongside the configured maximum so
+    // operators can see how close an item is to forced deferral.
+    expect(screen.getByText(/0 \/ 4 fixer attempts/)).toBeTruthy();
+  });
+
+  it("excludes below-floor open items so completion and open work cannot coexist", async () => {
+    renderLoopDetail(
+      loopFixture({
+        type: "reviewer",
+        convergence: {
+          policy: {
+            maxConsecutiveUnproductive: 3,
+            maxFixerAttemptsPerItem: 4,
+            maxTotalRounds: 40,
+            // A blocking floor treats non_blocking/nit items as non-blocking.
+            severityFloor: "blocking",
+          },
+          state: {
+            totalRounds: 2,
+            consecutiveUnproductive: 0,
+            items: {
+              "review-blocking": {
+                id: "review-blocking",
+                severity: "blocking",
+                status: "open",
+                fixerAttempts: 0,
+              },
+              "review-nit": {
+                id: "review-nit",
+                severity: "nit",
+                status: "open",
+                fixerAttempts: 0,
+              },
+            },
+            history: [],
+          },
+          // Evaluate would record complete because no floor-scoped item is open.
+          action: "complete",
+          reason: "severity_floor_reached",
+          status: "active",
+          updatedAt: "2026-07-31T18:00:00.000Z",
+        },
+      }),
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText("Reviewer convergence")).toBeTruthy();
+    });
+    // The blocking item is at the floor and stays listed.
+    expect(screen.getByText("review-blocking")).toBeTruthy();
+    // The below-floor nit item must not appear under Open items even though
+    // it is still open, or the card would contradict the complete action.
+    expect(screen.queryByText("review-nit")).toBeNull();
   });
 });

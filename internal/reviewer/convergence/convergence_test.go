@@ -213,3 +213,60 @@ func TestEvaluateDoesNotCountRepeatedFixerEvidence(t *testing.T) {
 		t.Fatal("repeated fixer evidence marked item stuck")
 	}
 }
+
+func TestStateValidateRejectsMalformedPersistedState(t *testing.T) {
+	policy := DefaultPolicy()
+	validItem := Item{ID: "item-1", Severity: reviewitem.SeverityBlocking, Status: ItemStatusOpen, FixerAttempts: 1}
+	cases := map[string]State{
+		"negative total rounds":             {TotalRounds: -1, ConsecutiveUnproductive: 0},
+		"negative consecutive unproductive": {TotalRounds: 1, ConsecutiveUnproductive: -1},
+		"empty item id":                     {Items: map[string]Item{"": {ID: "", Severity: reviewitem.SeverityBlocking, Status: ItemStatusOpen}}},
+		"unknown severity":                  {Items: map[string]Item{"item-1": {ID: "item-1", Severity: "critical", Status: ItemStatusOpen}}},
+		"unknown item status":               {Items: map[string]Item{"item-1": {ID: "item-1", Severity: reviewitem.SeverityBlocking, Status: "wontfix"}}},
+		"unknown fixer result":              {Items: map[string]Item{"item-1": {ID: "item-1", Severity: reviewitem.SeverityBlocking, Status: ItemStatusOpen, FixerResult: "retry"}}},
+		"negative fixer attempts":           {Items: map[string]Item{"item-1": {ID: "item-1", Severity: reviewitem.SeverityBlocking, Status: ItemStatusOpen, FixerAttempts: -1}}},
+		"negative round number":             {History: []RoundSummary{{Number: -1}}},
+	}
+	for name, state := range cases {
+		t.Run(name, func(t *testing.T) {
+			if err := state.Validate(); err == nil {
+				t.Fatalf("State.Validate() = nil, want error for %s", name)
+			}
+		})
+	}
+	// A well-formed state (and the policy it pairs with) must still validate.
+	good := State{TotalRounds: 1, ConsecutiveUnproductive: 0, Items: map[string]Item{"item-1": validItem}, History: []RoundSummary{{Number: 1}}}
+	if err := good.Validate(); err != nil {
+		t.Fatalf("State.Validate() = %v, want nil for well-formed state", err)
+	}
+	if err := policy.Validate(); err != nil {
+		t.Fatalf("Policy.Validate() = %v, want nil", err)
+	}
+}
+
+func TestEnumValidity(t *testing.T) {
+	for _, a := range []Action{"", ActionContinue, ActionComplete, ActionEscalate} {
+		if !a.Valid() {
+			t.Fatalf("Action(%q).Valid() = false, want true", a)
+		}
+	}
+	if bad := Action("retry"); bad.Valid() {
+		t.Fatalf("Action(%q).Valid() = true, want false", bad)
+	}
+	for _, r := range []Reason{"", ReasonConverging, ReasonSeverityFloorReached, ReasonStalled, ReasonAbsoluteCeiling} {
+		if !r.Valid() {
+			t.Fatalf("Reason(%q).Valid() = false, want true", r)
+		}
+	}
+	if bad := Reason("bored"); bad.Valid() {
+		t.Fatalf("Reason(%q).Valid() = true, want false", bad)
+	}
+	for _, s := range []string{"", string(StatusActive), string(StatusAwaitingHuman), string(StatusCompleted)} {
+		if !ValidStatus(s) {
+			t.Fatalf("ValidStatus(%q) = false, want true", s)
+		}
+	}
+	if ValidStatus("paused") {
+		t.Fatal("ValidStatus(\"paused\") = true, want false")
+	}
+}

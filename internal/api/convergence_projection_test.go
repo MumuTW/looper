@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -75,5 +76,48 @@ func TestLoopRouteOmitsMalformedReviewerConvergence(t *testing.T) {
 	data := parseJSONMap(t, recorder.Body.Bytes())["data"].(map[string]any)
 	if _, ok := data["convergence"]; ok {
 		t.Fatalf("convergence = %#v, want omitted for malformed metadata", data["convergence"])
+	}
+}
+
+// TestLoopRouteOmitsConvergenceWithValidPolicyButMalformedState verifies the
+// projection validates the full record, not just the policy: a syntactically
+// valid policy paired with negative counters or unknown enums must be omitted
+// so the dashboard never surfaces nonsensical convergence progress.
+func TestLoopRouteOmitsConvergenceWithValidPolicyButMalformedState(t *testing.T) {
+	fixture := newTestFixture(t)
+	services := fixture.runtime.Services()
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+	projectID := "project_malformed_state"
+	loopID := "loop_malformed_state"
+	targetID := "pr:acme/looper:44"
+	repo := "acme/looper"
+	prNumber := int64(44)
+	cases := map[string]string{
+		"negative counter":     `{"convergence":{"policy":{"maxConsecutiveUnproductive":3,"maxFixerAttemptsPerItem":4,"maxTotalRounds":40,"severityFloor":"non_blocking"},"state":{"totalRounds":-1}}}`,
+		"unknown item status":  `{"convergence":{"policy":{"maxConsecutiveUnproductive":3,"maxFixerAttemptsPerItem":4,"maxTotalRounds":40,"severityFloor":"non_blocking"},"state":{"items":{"review-1":{"id":"review-1","severity":"blocking","status":"wontfix"}}}}}`,
+		"unknown action":       `{"convergence":{"policy":{"maxConsecutiveUnproductive":3,"maxFixerAttemptsPerItem":4,"maxTotalRounds":40,"severityFloor":"non_blocking"},"state":{"totalRounds":1},"action":"retry"}}`,
+		"unknown status label": `{"convergence":{"policy":{"maxConsecutiveUnproductive":3,"maxFixerAttemptsPerItem":4,"maxTotalRounds":40,"severityFloor":"non_blocking"},"state":{"totalRounds":1},"status":"paused"}}`,
+	}
+	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "MalformedState", RepoPath: "/tmp/malformed-state", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	seq := int64(100)
+	for name, metadata := range cases {
+		t.Run(name, func(t *testing.T) {
+			seq++
+			if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: seq, ProjectID: projectID, Type: "reviewer", TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber, Status: "waiting", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+				t.Fatalf("Loops.Upsert() error = %v", err)
+			}
+			h := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime})
+			recorder := httptest.NewRecorder()
+			h.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/v1/loops/%d", seq), nil))
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+			}
+			data := parseJSONMap(t, recorder.Body.Bytes())["data"].(map[string]any)
+			if _, ok := data["convergence"]; ok {
+				t.Fatalf("convergence = %#v, want omitted for %s", data["convergence"], name)
+			}
+		})
 	}
 }

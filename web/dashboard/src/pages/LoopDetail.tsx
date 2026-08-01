@@ -72,6 +72,31 @@ function Kv({ label, value }: { label: string; value: ReactNode }) {
   );
 }
 
+// severityFloorIncludes mirrors convergence.Policy.Includes on the runtime
+// side: an item counts toward convergence progress only when its severity is
+// at or above the configured floor. Keeping this in sync prevents the card
+// from listing below-floor items as open while the projection reports
+// completion.
+function severityFloorIncludes(
+  floor: string | null | undefined,
+  severity: string | null | undefined,
+): boolean {
+  switch (floor) {
+    case "blocking":
+      return severity === "blocking";
+    case "non_blocking":
+      return severity === "blocking" || severity === "non_blocking";
+    case "all":
+      return (
+        severity === "blocking" ||
+        severity === "non_blocking" ||
+        severity === "nit"
+      );
+    default:
+      return false;
+  }
+}
+
 function ReviewerConvergenceCard({
   convergence,
 }: {
@@ -80,8 +105,15 @@ function ReviewerConvergenceCard({
   const items = Object.values(convergence.state.items ?? {}).sort((a, b) =>
     a.id.localeCompare(b.id),
   );
+  // Mirror convergence.Policy.Includes: an item below the severity floor is
+  // non-blocking to progress even when still open, so listing it alongside
+  // floor-scoped open work would let the card report completion and apparent
+  // open convergence work at the same time.
   const openItems = items.filter(
-    (item) => item.status === "open" && !item.stuck,
+    (item) =>
+      item.status === "open" &&
+      !item.stuck &&
+      severityFloorIncludes(convergence.policy.severityFloor, item.severity),
   );
   const recentHistory = (convergence.state.history ?? []).slice(-8);
 
@@ -111,8 +143,9 @@ function ReviewerConvergenceCard({
               <li key={item.id} className="flex flex-wrap gap-x-2 gap-y-0.5">
                 <span className="mono">{item.id}</span>
                 <span className="text-[var(--text-muted)]">
-                  {item.severity} · {item.status}
-                  {item.fixerAttempts ? ` · ${item.fixerAttempts} fixer attempts` : ""}
+                  {item.severity} · {item.status} ·{" "}
+                  {(item.fixerAttempts ?? 0)} /{" "}
+                  {convergence.policy.maxFixerAttemptsPerItem} fixer attempts
                 </span>
               </li>
             ))}
