@@ -4093,6 +4093,9 @@ func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.P
 		if terminalReviewerLoopReason(*existing) != "" && budgetTerminationReason == "" {
 			return loopUpsertResult{record: *existing, created: false}, nil
 		}
+		if existing.Status == "human_takeover" {
+			return loopUpsertResult{record: *existing, created: false}, nil
+		}
 		updated := *existing
 		metadataJSONSource := updated.MetadataJSON
 		// Strict-decode the ORIGINAL value before any re-encoding: building the
@@ -4125,6 +4128,15 @@ func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.P
 			return loopUpsertResult{}, err
 		}
 		return loopUpsertResult{record: updated, created: false}, nil
+	}
+	allLoops, err := r.repos.Loops.List(ctx)
+	if err != nil {
+		return loopUpsertResult{}, err
+	}
+	for _, existingLoop := range allLoops {
+		if existingLoop.ProjectID == project.ID && derefString(existingLoop.Repo) == repo && derefInt64(existingLoop.PRNumber) == prNumber && existingLoop.Status == "human_takeover" {
+			return loopUpsertResult{}, fmt.Errorf("cannot create reviewer loop: PR #%d has an active human_takeover loop (%s)", prNumber, existingLoop.ID)
+		}
 	}
 	targetID := fmt.Sprintf("pr:%s:%d", repo, prNumber)
 	if r.db == nil {

@@ -1870,6 +1870,17 @@ func (r *Runner) DiscoverPullRequest(ctx context.Context, input TargetedDiscover
 		result.Skipped++
 		return result, nil
 	}
+	// Reject discovery if the PR has an active human_takeover loop on ANY lane
+	existingLoops, err := r.repos.Loops.List(ctx)
+	if err != nil {
+		return DiscoveryResult{}, err
+	}
+	for _, existing := range existingLoops {
+		if existing.ProjectID == project.ID && derefString(existing.Repo) == input.Repo && derefInt64(existing.PRNumber) == input.PRNumber && existing.Status == "human_takeover" {
+			result.Skipped++
+			return result, nil
+		}
+	}
 	if err := r.discoverPullRequestFromDetail(ctx, *project, input.Repo, detail, &result); err != nil {
 		return DiscoveryResult{}, err
 	}
@@ -5282,6 +5293,9 @@ func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.P
 			}
 			return loopUpsertResult{record: updatedLoop, created: false, pending: true}, nil
 		}
+		if updatedLoop.Status == "human_takeover" {
+			return loopUpsertResult{record: updatedLoop, created: false}, nil
+		}
 		// Charged after the pending-rediscovery branch above: a discovery that
 		// lands while a run is active is not another round, it is the same one.
 		charged, parked, err := r.chargeFixerRound(ctx, updatedLoop, headSHA)
@@ -5299,6 +5313,20 @@ func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.P
 			return loopUpsertResult{}, err
 		}
 		return loopUpsertResult{record: updatedLoop, created: false, availableAt: availableAt}, nil
+	}
+	for _, existing := range existingLoops {
+		if existing.ProjectID != project.ID {
+			continue
+		}
+		if derefString(existing.Repo) != repo {
+			continue
+		}
+		if derefInt64(existing.PRNumber) != prNumber {
+			continue
+		}
+		if existing.Status == "human_takeover" {
+			return loopUpsertResult{}, fmt.Errorf("cannot create fixer loop: PR #%d has an active human_takeover loop (%s)", prNumber, existing.ID)
+		}
 	}
 	targetID := buildPullRequestTargetID(repo, prNumber)
 	if r.db == nil {
