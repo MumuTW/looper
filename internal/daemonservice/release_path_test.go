@@ -72,3 +72,75 @@ func TestPreferReleaseCurrentExecutableUsesInnermostReleasesMarker(t *testing.T)
 		t.Fatalf("PreferReleaseCurrentExecutable() = %q, want innermost %q", got, want)
 	}
 }
+
+func TestPreferReleaseCurrentExecutableRequiresRegularExecutableLeaf(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		mode os.FileMode
+	}{
+		{name: "not executable", mode: 0o644},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			releaseDir := filepath.Join(root, "releases", "1.2.3")
+			if err := os.MkdirAll(releaseDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			daemon := filepath.Join(releaseDir, "looperd")
+			if err := os.WriteFile(daemon, []byte("bin"), test.mode); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(filepath.Join("releases", "1.2.3"), filepath.Join(root, "current")); err != nil {
+				t.Fatal(err)
+			}
+			if got := PreferReleaseCurrentExecutable(daemon); got != daemon {
+				t.Fatalf("got %q, want unchanged non-executable path", got)
+			}
+		})
+	}
+
+	root := t.TempDir()
+	releaseDir := filepath.Join(root, "releases", "1.2.3")
+	if err := os.MkdirAll(releaseDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	external := filepath.Join(t.TempDir(), "looperd")
+	if err := os.WriteFile(external, []byte("external"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	daemon := filepath.Join(releaseDir, "looperd")
+	if err := os.Symlink(external, daemon); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join("releases", "1.2.3"), filepath.Join(root, "current")); err != nil {
+		t.Fatal(err)
+	}
+	if got := PreferReleaseCurrentExecutable(daemon); got != daemon {
+		t.Fatalf("got %q, want unchanged leaf-symlink path", got)
+	}
+}
+
+func TestPreferReleaseCurrentExecutableRequiresMatchingCurrentRelease(t *testing.T) {
+	root := t.TempDir()
+	first := filepath.Join(root, "releases", "1.2.3")
+	second := filepath.Join(root, "releases", "1.2.4")
+	if err := os.MkdirAll(first, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(second, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	daemon := filepath.Join(first, "looperd")
+	if err := os.WriteFile(daemon, []byte("first"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(second, "looperd"), []byte("second"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join("releases", "1.2.4"), filepath.Join(root, "current")); err != nil {
+		t.Fatal(err)
+	}
+	if got := PreferReleaseCurrentExecutable(daemon); got != daemon {
+		t.Fatalf("got %q, want unchanged path when current selects another release", got)
+	}
+}

@@ -60,8 +60,16 @@ func PreferReleaseCurrentExecutable(executable string) string {
 	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return path
 	}
+	expectedRelease, err := filepath.EvalSymlinks(filepath.Join(root, "releases", parts[0]))
+	if err != nil || filepath.Clean(resolved) != filepath.Clean(expectedRelease) {
+		return path
+	}
+	releaseInfo, err := os.Lstat(filepath.Join(root, "releases", parts[0]))
+	if err != nil || releaseInfo.Mode()&os.ModeSymlink != 0 || !releaseInfo.IsDir() {
+		return path
+	}
 	candidate := filepath.Join(root, "current", parts[1])
-	if info, err := os.Stat(candidate); err != nil || info.IsDir() {
+	if info, err := os.Lstat(candidate); err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
 		return path
 	}
 	return candidate
