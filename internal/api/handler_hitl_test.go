@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/MumuTW/looper/internal/config"
 	"github.com/MumuTW/looper/internal/loops"
@@ -126,6 +127,53 @@ func TestHandlerRespondResumesAwaitingHumanLoop(t *testing.T) {
 	}
 	if !queued {
 		t.Fatalf("expected a queued queue item for the resumed loop; items=%#v", items)
+	}
+}
+
+func TestDeliverHumanAnswerSharesLoopRequeueGuard(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+	projectID := "project_hitl_guard"
+	loopID := "loop_hitl_guard"
+	targetID := projectID
+	metadata := `{"hitl":{"question":"Continue?","sessionId":"sess-guard","status":"awaiting"}}`
+
+	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Looper", RepoPath: "/tmp/repos/looper", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 711, ProjectID: projectID, Type: "worker", TargetType: "project", TargetID: &targetID, Status: "awaiting_human", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	cancelReason := "worker suspended awaiting human"
+	if err := services.Repositories.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_hitl_guard", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: targetID, DedupeKey: "worker:hitl-guard", Priority: storage.QueuePriorityWorker, Status: "cancelled", AvailableAt: nowISO, MaxAttempts: 3, LastError: &cancelReason, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	// The answer transaction must wait for the same guard used by worker-side
+	// post-park metadata reconciliation; otherwise stale worker writes can win.
+	unlock := loops.LockLoopRequeue(loopID)
+	result := make(chan error, 1)
+	go func() {
+		_, err := h.deliverHumanAnswer(context.Background(), loopID, "continue")
+		result <- err
+	}()
+	select {
+	case err := <-result:
+		unlock()
+		t.Fatalf("deliverHumanAnswer completed while requeue guard was held: %v", err)
+	case <-time.After(150 * time.Millisecond):
+	}
+	unlock()
+
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("deliverHumanAnswer() error = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("deliverHumanAnswer did not complete after requeue guard release")
 	}
 }
 

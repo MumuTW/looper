@@ -174,6 +174,11 @@ func (h *Handler) deliverHumanAnswer(ctx context.Context, loopID string, rawAnsw
 		return loopResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "respond requires a non-empty answer"}
 	}
 
+	// Serialize the answer transaction with worker-side post-park correlation
+	// writes. Both paths read-modify-write the same HITL metadata; without this
+	// guard a worker can persist a stale awaiting ask after the human answer has
+	// already been committed.
+	unlockRequeue := loops.LockLoopRequeue(loopID)
 	services := h.context.Runtime.Services()
 	nowISO := eventlog.FormatJavaScriptISOString(h.now().UTC())
 	_, err := storage.WithTransactionValue(ctx, services.Coordinator.DB(), nil, func(tx *sql.Tx) (storage.LoopRecord, error) {
@@ -211,6 +216,7 @@ func (h *Handler) deliverHumanAnswer(ctx context.Context, loopID string, rawAnsw
 		}
 		return updated, nil
 	})
+	unlockRequeue()
 	if err != nil {
 		var typed apiError
 		if asAPIError(err, &typed) {
