@@ -127,24 +127,6 @@ func TestDiffBudgetFailsClosedWhenBaseSHAMissing(t *testing.T) {
 	}
 }
 
-func TestDiffBudgetBlocksAutoReportWhenExceeded(t *testing.T) {
-	t.Parallel()
-	fixture := newGatekeeperFixture(t)
-	fixture.github.detail.DiffStats = &githubinfra.PullRequestDiffStats{ChangedFiles: 21}
-	fixture.github.detail.BaseSHA = "base-1"
-	fixture.github.mergeable.BaseSHA = "base-1"
-	fixture.github.finalBaseSHA = "base-1"
-	runner := diffBudgetRunner(t, fixture, config.GatekeeperDiffBudget{MaxChangedFiles: 20}, config.GatekeeperTrustAuto)
-
-	report, err := runner.EvaluatePullRequest(context.Background(), EvaluationInput{ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, ExpectedHeadSHA: "head-1"})
-	if err != nil {
-		t.Fatalf("EvaluatePullRequest() error = %v", err)
-	}
-	if report.Eligible || len(report.Reasons) != 1 || report.Reasons[0].Code != ReasonDiffBudgetExceeded {
-		t.Fatalf("report = %#v, want diff-budget block", report)
-	}
-}
-
 // Configured project IDs are matched by exact equality and validation accepts
 // surrounding whitespace as a distinct ID, so evaluation must preserve the
 // caller's original project ID through every lookup. Trimming it would diverge

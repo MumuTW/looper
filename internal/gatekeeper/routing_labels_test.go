@@ -360,6 +360,10 @@ func (g *perPullRequestRoutingGitHub) GetPullRequestHeadSHA(_ context.Context, i
 	return fmt.Sprintf("head-%d", input.PRNumber), nil
 }
 
+func (g *perPullRequestRoutingGitHub) GetPullRequestHeadAndBaseSHA(_ context.Context, input githubinfra.ViewPullRequestInput) (string, string, error) {
+	return fmt.Sprintf("head-%d", input.PRNumber), g.finalBaseSHA, nil
+}
+
 func (g *perPullRequestRoutingGitHub) AddPullRequestLabels(ctx context.Context, input githubinfra.PullRequestLabelsInput) error {
 	if input.PRNumber == g.failPR {
 		return errors.New("label permission denied for first PR")

@@ -269,6 +269,7 @@ type Options struct {
 	// invalidates reused success within the skip window.
 	ConfiguredTargetBranch func(projectID string) string
 	LogWarn                func(msg string, fields map[string]any)
+	LogWarn                 func(msg string, fields map[string]any)
 }
 
 // Runner is the Merge Gatekeeper: a reactive, agent-free policy Role that
@@ -291,6 +292,13 @@ type Runner struct {
 	logWarn                              func(msg string, fields map[string]any)
 	lastPublishedStatusMu                sync.Mutex
 	lastPublishedStatus                  map[string]string
+	repos                    *storage.Repositories
+	github                   GitHubGateway
+	now                      func() time.Time
+	labelNamespaceForProject func(projectID string) (labels.Namespace, bool)
+	policyPermitsTarget      func(projectID, repo, baseRefName string) bool
+	trustForProject          func(projectID string) config.GatekeeperTrustLevel
+	logWarn                  func(msg string, fields map[string]any)
 }
 
 // reviewEvidenceLookup is kept as a narrow seam around the local event-log
@@ -316,6 +324,11 @@ func New(options Options) *Runner {
 		labelNamespaceForProject:             options.LabelNamespaceForProject,
 		configuredTargetBranch:               options.ConfiguredTargetBranch,
 		logWarn:                              options.LogWarn,
+		repos: options.Repos, github: options.GitHub, now: now,
+		labelNamespaceForProject: options.LabelNamespaceForProject,
+		policyPermitsTarget:      policy,
+		trustForProject:          options.TrustForProject,
+		logWarn:                  options.LogWarn,
 	}
 }
 
@@ -695,7 +708,6 @@ func (r *Runner) departedFromOpenSet(
 		departed = departed[:maxReconciledDepartures]
 	}
 	return departed
-||||||| parent of 7c2a672f (fix(gatekeeper): bind routing labels to fresh authority)
 // maxReconciledDepartures bounds how many departed pull requests one tick gives
 // a final report. A burst — a release day that merges sixty pull requests, a
 // project whose discovery scope was just narrowed — must not turn one tick into
@@ -1082,9 +1094,17 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 	}
 	sort.Strings(report.Evidence.UnresolvedReviewThreadIDs)
 
-	convergenceEvidence, hasConvergence, err := latestReviewerConvergence(ctx, r.repos, input.ProjectID, input.Repo, input.PRNumber, report.ObservedHeadSHA)
-	if err != nil {
-		return r.persistProviderBlock(ctx, report, ReasonProviderStateUnavailable, "reviewer_convergence")
+	// The final revalidation read confirms the head has not moved between the
+	// evaluation and persistence. When the diff budget is enabled it also
+	// returns the base ref OID so a gate whose verdict depends on the merge
+	// base can detect a base advance that the head revalidation alone cannot;
+	// when the budget is disabled a base advance is not a gate input, so the
+	// lighter head-only read is sufficient.
+	var finalHead, finalBase string
+	if budgetEnabled {
+		finalHead, finalBase, err = r.github.GetPullRequestHeadAndBaseSHA(ctx, viewInput)
+	} else {
+		finalHead, err = r.github.GetPullRequestHeadSHA(ctx, viewInput)
 	}
 	if hasConvergence {
 		report.Evidence.ReviewerConvergence = &convergenceEvidence
@@ -1125,19 +1145,6 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 		} else if report.Evidence.ReviewRequiredByPolicy {
 			report.Reasons = append(report.Reasons, Reason{Code: ReasonCodexReviewRequired, Subject: "current_head"})
 		}
-	}
-
-	// The final revalidation read confirms the head has not moved between the
-	// evaluation and persistence. When the diff budget is enabled it also
-	// returns the base ref OID so a gate whose verdict depends on the merge
-	// base can detect a base advance that the head revalidation alone cannot;
-	// when the budget is disabled a base advance is not a gate input, so the
-	// lighter head-only read is sufficient.
-	var finalHead, finalBase string
-	if budgetEnabled {
-		finalHead, finalBase, err = r.github.GetPullRequestHeadAndBaseSHA(ctx, viewInput)
-	} else {
-		finalHead, err = r.github.GetPullRequestHeadSHA(ctx, viewInput)
 	}
 	if err != nil {
 		return r.persistProviderBlock(ctx, report, ReasonProviderStateUnavailable, "head_revalidation")
@@ -1587,50 +1594,6 @@ func gatekeeperCommitStatus(report Report) (string, string) {
 		if report.Mode == string(config.GatekeeperTrustAuto) && !report.Evidence.ReviewRequiredByPolicy {
 			return "success", "Merge gates passed; review threshold not met"
 		}
-		return "success", "Current-head Codex review and merge gates passed"
-	}
-	for _, reason := range report.Reasons {
-		if reason.Code == ReasonProviderStateUnavailable || reason.Code == ReasonProviderStateAmbiguous {
-			return "error", "Gatekeeper could not verify current merge state"
-		}
-	}
-	return "failure", "Gatekeeper found blocking merge state"
-}
-
-func containsRequiredCheck(checks []string, want string) bool {
-	for _, check := range checks {
-		if strings.EqualFold(strings.TrimSpace(check), strings.TrimSpace(want)) {
-			return true
-		}
-	}
-	return false
-}
-
-func withoutRequiredCheck(rules []githubinfra.RequiredCheckRule, name string) []githubinfra.RequiredCheckRule {
-	out := make([]githubinfra.RequiredCheckRule, 0, len(rules))
-	for _, rule := range rules {
-		if strings.EqualFold(strings.TrimSpace(rule.Context), strings.TrimSpace(name)) && rule.AppID == 0 {
-			continue
-		}
-		out = append(out, rule)
-	}
-	return out
-||||||| parent of 7c2a672f (fix(gatekeeper): bind routing labels to fresh authority)
-func gatekeeperCommitStatus(report Report) (string, string) {
-	for _, reason := range report.Reasons {
-		if reason.Code == ReasonGatekeeperCheckRequired {
-			return "error", "Looper Gatekeeper is not configured as a required status on the target branch"
-		}
-	}
-	for _, reason := range report.Reasons {
-		if reason.Code == ReasonCodexReviewRequired {
-			return "pending", "Waiting for Codex review of this commit"
-		}
-		if reason.Code == ReasonHeadStale {
-			return "pending", "Waiting for Gatekeeper evaluation of the current head"
-		}
-	}
-	if report.Eligible {
 		return "success", "Current-head Codex review and merge gates passed"
 	}
 	for _, reason := range report.Reasons {
