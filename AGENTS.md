@@ -65,17 +65,21 @@ If the honest answer is "the agent's output, but we don't trust it", make the ag
 
 ### A second fix to the same subsystem is a design signal
 
-Near-identical `fix:` titles on the same area, or a second patch to the mechanism the first fix introduced, mean this PR's description must say which of these it is:
+A subsystem that receives a second `fix:` PR shortly after the first — near-identical titles on the same area, or a patch to the mechanism the first fix introduced — means this PR's description must say which of these it is. Two fixes separated by ordinary maintenance intervals are not this signal; the trigger is proximity, not lifetime history.
 
 - **The abstraction.** The mechanism needs a new special case for every situation it meets. The patches are growing outward rather than converging.
 - **The execution.** The design was right and a branch it already implied was missed — often because the first PR was too large to hold at once, or was scoped past what the agent writing it could cover.
 - **Something upstream.** The first fix was a local patch to a systemic defect, and this is another symptom of the same defect.
+- **An unrelated path.** Two independent defects that happen to live in the same subsystem, and whose titles look alike because the subsystem is what titles name. This is the answer a busy subsystem produces honestly, and it carries no design conclusion at all.
 
-Only the first is a revert signal. The second is finished by completing it — reverting there discards a correct design and reopens the original bug, and the thing to correct is the scope of the next task, not the code. The third means the redesign target sits *above* the fix being blamed; reverting it moves nothing.
+Only the first is a revert signal. The second is finished by completing it — reverting there discards a correct design and reopens the original bug, and the thing to correct is the scope of the next task, not the code. The third means the redesign target sits *above* the fix being blamed; reverting it moves nothing. The fourth means there was no signal here, but say so rather than leaving the reader to assume it.
 
-When it is the abstraction: revert the first fix and redesign if reverting does not reopen a bug someone is still hitting, otherwise redesign forward and land the replacement in one diff.
+When it is the abstraction, choose an exit and record it in the description:
 
-Stacking a third patch without naming which of the three this is, is not an option.
+- **Revert the first fix and redesign** when reverting would not reintroduce a defect that is still reachable. The test is reproducibility, not whether anyone is currently complaining: a fix that works has no live victims *because it works*, and "nobody is hitting it" would license reverting exactly the load-bearing fixes that must not be reverted.
+- **Redesign forward** otherwise, landing the replacement in one diff.
+
+Say which of the four this is, and — when it is the abstraction — which exit you took and why. Stacking a third patch without that is not an option.
 
 ### Prefer deletion over another layer
 
