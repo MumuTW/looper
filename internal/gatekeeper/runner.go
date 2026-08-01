@@ -68,6 +68,7 @@ const (
 	ReasonDiffBudgetExceeded       ReasonCode = "diff_budget_exceeded"
 	ReasonProviderStateUnavailable ReasonCode = "provider_state_unavailable"
 	ReasonProviderStateAmbiguous   ReasonCode = "provider_state_ambiguous"
+	ReasonRoutingProjectionFailed  ReasonCode = "routing_projection_failed"
 )
 
 type Reason struct {
@@ -146,9 +147,10 @@ type Report struct {
 	Reasons                   []Reason `json:"reasons"`
 	Evidence                  Evidence `json:"evidence"`
 	EvaluatedAt               string   `json:"evaluatedAt"`
-	// SourceFingerprint is everything the shared discovery list page could observe
-	// about the pull request when this report was produced. The next tick compares
-	// it to decide whether re-evaluating would reach the same conclusion.
+	// SourceFingerprint is the shared discovery list observation plus the local
+	// trust and project-policy inputs used for routing when this report was
+	// produced. The next tick compares it to decide whether re-evaluating would
+	// reach the same conclusion.
 	SourceFingerprint string `json:"sourceFingerprint,omitempty"`
 }
 
@@ -208,6 +210,7 @@ type GitHubGateway interface {
 	DeleteIssueComment(context.Context, githubinfra.DeleteIssueCommentInput) error
 	AddPullRequestLabels(context.Context, githubinfra.PullRequestLabelsInput) error
 	RemovePullRequestLabels(context.Context, githubinfra.PullRequestLabelsInput) error
+	ValidateMergifyRouting(context.Context, githubinfra.ValidateMergifyRoutingInput) error
 }
 
 // RequiredStatusContext is the GitHub status context an operator adds to branch
@@ -311,12 +314,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 	configuredTarget := r.configuredTarget(input.ProjectID)
 	stillOpen := make(map[string]struct{}, len(pullRequests))
 	for _, pullRequest := range pullRequests {
-		// A budget change is a gate-input change even when the PR list page is
-		// otherwise unchanged; include it so enabling or disabling the gate does
-		// not wait for the periodic maxSkipAge backstop. BaseSHA is folded into
-		// the fingerprint only while the budget is enabled, so a base advance on
-		// a repo with no configured limit does not invalidate every open report.
-		fingerprint := sourceFingerprint(pullRequest, budgetEnabled) + fmt.Sprintf("\x1fdiff-budget=%d,%d", diffBudget.MaxChangedFiles, diffBudget.MaxDeletions) + fmt.Sprintf("\x1fgatekeeper-trust=%s", trust) + fmt.Sprintf("\x1fconfigured-target=%s", configuredTarget)
+		fingerprint := r.sourceFingerprintForProject(pullRequest, input.ProjectID, input.Repo)
 		entityID := fmt.Sprintf("%s#%d", input.Repo, pullRequest.Number)
 		stillOpen[entityID] = struct{}{}
 		previous, hasPrevious := previousReports[entityID]
@@ -363,66 +361,14 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 	return result, nil
 }
 
-// maxReconciledDepartures bounds how many departed pull requests one tick gives
-// a final report. A burst — a release day that merges sixty pull requests, a
-// project whose discovery scope was just narrowed — must not turn one tick into
-// an unbounded run of forge reads. The remainder is picked up by later ticks,
-// because a pull request that is still recorded OPEN and still absent from the
-// open list stays a candidate until it is reconciled.
-const maxReconciledDepartures = 20
-
-// departedFromOpenSet names the pull requests whose latest report still says
-// OPEN but which are no longer in the open list — they merged or were closed
-// since the last tick.
-//
-// This is the lifecycle path that makes the merged state durable with webhooks
-// off, which is the default. Polling discovery lists only open pull requests, so
-// without this a pull request's last report is forever the one written while it
-// was still open, and `state=merged` answers empty on a default install.
-//
-// It is not a poller over merged history, and three things bound it:
-//
-//   - Only pull requests Looper itself last recorded as OPEN are candidates.
-//     Anything that merged before this ran, or that Looper never saw, is never
-//     revisited — there is no backfill.
-//   - The transition is one-way and self-clearing. Reconciling rewrites the
-//     state to MERGED or CLOSED, so the same pull request is never a candidate
-//     twice and the steady-state count is zero.
-//   - A truncated open list is not evidence of departure. When the list came
-//     back at the limit, a pull request may simply have fallen off the page, so
-//     nothing is reconciled at all rather than churning the overflow every tick.
-func (r *Runner) departedFromOpenSet(
-	repo string,
-	pullRequests []githubinfra.PullRequestSummary,
-	limit int,
-	previousReports map[string]Report,
-	stillOpen map[string]struct{},
-) []string {
-	if len(pullRequests) >= limit {
-		return nil
-	}
-	departed := make([]string, 0)
-	for entityID, previous := range previousReports {
-		if previous.Repo != repo || previous.PRNumber <= 0 {
-			continue
-		}
-		if !strings.EqualFold(strings.TrimSpace(previous.Evidence.PullRequestState), "OPEN") {
-			continue
-		}
-		if _, open := stillOpen[entityID]; open {
-			continue
-		}
-		departed = append(departed, entityID)
-	}
-	// Sorted so the cap takes a deterministic prefix rather than whichever
-	// entries Go's map iteration happened to yield first.
-	sort.Slice(departed, func(i, j int) bool {
-		return previousReports[departed[i]].PRNumber < previousReports[departed[j]].PRNumber
-	})
-	if len(departed) > maxReconciledDepartures {
-		departed = departed[:maxReconciledDepartures]
-	}
-	return departed
+// sourceFingerprintForProject includes the local authority inputs that the
+// forge's pull-request list cannot expose. A trust or policy change must not
+// leave a previously published auto-merge label in place merely because the
+// pull request itself is unchanged.
+func (r *Runner) sourceFingerprintForProject(pullRequest githubinfra.PullRequestSummary, projectID, repo string) string {
+	base := sourceFingerprint(pullRequest)
+	permitsTarget := r.policyPermitsTarget(projectID, repo, pullRequest.BaseRefName)
+	return strings.Join([]string{base, string(r.trustFor(projectID)), fmt.Sprintf("%t", permitsTarget)}, "\x1f")
 }
 
 func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput) (Report, error) {
@@ -1030,17 +976,30 @@ func (r *Runner) persist(ctx context.Context, report Report) (Report, error) {
 
 	entityType := "pull_request"
 	entityID := fmt.Sprintf("%s#%d", report.Repo, report.PRNumber)
-	projectID := report.ProjectID
-	if err := eventlog.Append(ctx, r.repos, eventlog.AppendInput{
-		EventType: GateReportEventType, ProjectID: &projectID, EntityType: &entityType, EntityID: &entityID,
-		Payload: report, CreatedAt: r.now(),
-	}); err != nil {
+	if err := r.appendGateReport(ctx, report, entityType, entityID); err != nil {
 		return Report{}, fmt.Errorf("persist gate report: %w", err)
 	}
-	if err := r.reconcileRoutingLabels(ctx, report, previous); err != nil && r.logWarn != nil {
-		r.logWarn("gatekeeper: could not reconcile routing labels", map[string]any{
-			"repo": report.Repo, "pr": report.PRNumber, "error": err.Error(),
-		})
+	if routingErr := r.reconcileRoutingLabels(ctx, report, previous); routingErr != nil {
+		if r.logWarn != nil {
+			r.logWarn("gatekeeper: could not reconcile routing labels", map[string]any{
+				"repo": report.Repo, "pr": report.PRNumber, "error": routingErr.Error(),
+			})
+		}
+		// Keep the successful gate evidence durable, but append a retry marker
+		// with an empty discovery fingerprint. The next tick must evaluate and
+		// retry the projection even when the pull request itself is unchanged.
+		retry := report
+		retry.Reasons = append([]Reason(nil), report.Reasons...)
+		retry.Reasons = append(retry.Reasons, Reason{Code: ReasonRoutingProjectionFailed, Subject: "routing_labels"})
+		sortReasons(retry.Reasons)
+		retry.Eligible = false
+		retry.Status = StatusBlocked
+		retry.SourceFingerprint = ""
+		retry.EvaluatedAt = r.now().UTC().Format(time.RFC3339Nano)
+		if markerErr := r.appendGateReportAt(ctx, retry, entityType, entityID, r.now().Add(time.Millisecond)); markerErr != nil {
+			return report, fmt.Errorf("%w (persist routing retry marker: %v)", routingErr, markerErr)
+		}
+		return report, routingErr
 	}
 	// The owned comment is reconciled after the durable report: the report is the
 	// record, the comment is a convenience for whoever is deciding. A forge that
@@ -1053,49 +1012,16 @@ func (r *Runner) persist(ctx context.Context, report Report) (Report, error) {
 	return report, nil
 }
 
-func gatekeeperCommitStatus(report Report) (string, string) {
-	for _, reason := range report.Reasons {
-		if reason.Code == ReasonGatekeeperCheckRequired {
-			return "error", "Looper Gatekeeper is not configured as a required status on the target branch"
-		}
-	}
-	for _, reason := range report.Reasons {
-		if reason.Code == ReasonCodexReviewRequired {
-			return "pending", "Waiting for Codex review of this commit"
-		}
-		if reason.Code == ReasonHeadStale {
-			return "pending", "Waiting for Gatekeeper evaluation of the current head"
-		}
-	}
-	if report.Eligible {
-		return "success", "Current-head Codex review and merge gates passed"
-	}
-	for _, reason := range report.Reasons {
-		if reason.Code == ReasonProviderStateUnavailable || reason.Code == ReasonProviderStateAmbiguous {
-			return "error", "Gatekeeper could not verify current merge state"
-		}
-	}
-	return "failure", "Gatekeeper found blocking merge state"
+func (r *Runner) appendGateReport(ctx context.Context, report Report, entityType, entityID string) error {
+	return r.appendGateReportAt(ctx, report, entityType, entityID, r.now())
 }
 
-func containsRequiredCheck(checks []string, want string) bool {
-	for _, check := range checks {
-		if strings.EqualFold(strings.TrimSpace(check), strings.TrimSpace(want)) {
-			return true
-		}
-	}
-	return false
-}
-
-func withoutRequiredCheck(rules []githubinfra.RequiredCheckRule, name string) []githubinfra.RequiredCheckRule {
-	out := make([]githubinfra.RequiredCheckRule, 0, len(rules))
-	for _, rule := range rules {
-		if strings.EqualFold(strings.TrimSpace(rule.Context), strings.TrimSpace(name)) && rule.AppID == 0 {
-			continue
-		}
-		out = append(out, rule)
-	}
-	return out
+func (r *Runner) appendGateReportAt(ctx context.Context, report Report, entityType, entityID string, createdAt time.Time) error {
+	projectID := report.ProjectID
+	return eventlog.Append(ctx, r.repos, eventlog.AppendInput{
+		EventType: GateReportEventType, ProjectID: &projectID, EntityType: &entityType, EntityID: &entityID,
+		Payload: report, CreatedAt: createdAt,
+	})
 }
 
 func evaluateRequiredChecks(required []githubinfra.RequiredCheckRule, checks githubinfra.PullRequestCheckRuns) ([]Reason, []CheckEvidence) {

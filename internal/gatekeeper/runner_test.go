@@ -437,12 +437,14 @@ type fakeGatekeeperGitHub struct {
 	// makes, so a test can prove a pull request was skipped rather than evaluated.
 	perPullRequestCalls int
 
-	currentLogin string
-	commentErr   error
-	deletedIDs   []int64
-	labelAdds    []githubinfra.PullRequestLabelsInput
-	labelRemoves []githubinfra.PullRequestLabelsInput
-	labelErr     error
+	currentLogin         string
+	commentErr           error
+	deletedIDs           []int64
+	labelAdds            []githubinfra.PullRequestLabelsInput
+	labelRemoves         []githubinfra.PullRequestLabelsInput
+	labelErr             error
+	validateMergifyErr   error
+	validateMergifyCalls int
 	// beforeView, when set, runs before each pull-request read, so a test can
 	// change forge state between the primary and confirming evaluations.
 	beforeView    func(*fakeGatekeeperGitHub)
@@ -589,6 +591,11 @@ func (f *fakeGatekeeperGitHub) FindReviewMarker(_ context.Context, input githubi
 func (f *fakeGatekeeperGitHub) SetCommitStatus(_ context.Context, input githubinfra.CommitStatusInput) error {
 	f.statusCalls = append(f.statusCalls, input)
 	return f.statusErr
+}
+
+func (f *fakeGatekeeperGitHub) ValidateMergifyRouting(context.Context, githubinfra.ValidateMergifyRoutingInput) error {
+	f.validateMergifyCalls++
+	return f.validateMergifyErr
 }
 
 func reasonCodes(reasons []Reason) []ReasonCode {

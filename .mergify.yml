@@ -29,6 +29,8 @@ queue_rules:
       - base = main
       - -draft
       - -conflict
+      - label != needs-human-review
+      - label != do-not-merge
 
 # auto_merge_conditions only takes effect when at least one merge protection
 # rule exists. This rule deliberately asserts only what branch protection cannot
