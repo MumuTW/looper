@@ -231,11 +231,13 @@ func (r *Runner) handleConvergenceHumanAnswer(ctx context.Context, input stepInp
 		persisted.Action = ""
 		persisted.Reason = convergence.ReasonConverging
 		persisted.State.ConsecutiveUnproductive = 0
+		persisted.UpdatedAt = r.nowISO()
 		checkpoint.SkipReason = "Reviewer convergence loop resumed by human decision"
 	case "close", "stop", "terminate":
 		persisted.Status = "completed"
 		persisted.Action = convergence.ActionComplete
 		persisted.Reason = convergence.ReasonSeverityFloorReached
+		persisted.UpdatedAt = r.nowISO()
 		checkpoint.SkipReason = "Reviewer convergence loop closed by human decision"
 	default:
 		return false, &reviewerConvergenceAwaitingHumanError{Decision: convergence.Decision{Action: convergence.ActionEscalate, Reason: persisted.Reason, State: persisted.State}}

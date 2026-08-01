@@ -6673,7 +6673,23 @@ func parseReviewerConvergenceProjection(metadataJSON *string) *reviewerConvergen
 	if err := json.Unmarshal(encoded, &projection); err != nil {
 		return nil
 	}
+	// A valid policy alone is not enough: json.Unmarshal accepts malformed
+	// state (negative counters, unknown item statuses/severities, empty IDs)
+	// and unknown action/reason/status values. Validate the full record so the
+	// API and dashboard never surface nonsensical convergence progress.
 	if err := projection.Policy.Validate(); err != nil {
+		return nil
+	}
+	if err := projection.State.Validate(); err != nil {
+		return nil
+	}
+	if !projection.Action.Valid() {
+		return nil
+	}
+	if !projection.Reason.Valid() {
+		return nil
+	}
+	if !convergence.ValidStatus(projection.Status) {
 		return nil
 	}
 	return &projection
