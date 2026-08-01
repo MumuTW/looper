@@ -35,6 +35,10 @@ func TestGatewayRejectsRepoPathAsMutationWorktree(t *testing.T) {
 			_, err := gateway.Commit(ctx, CommitInput{RepoPath: fixture.repoPath, WorktreePath: fixture.repoPath, Message: "test"})
 			return err
 		}},
+		{name: "revert", run: func() error {
+			_, err := gateway.RevertCommit(ctx, RevertCommitInput{RepoPath: fixture.repoPath, WorktreePath: fixture.repoPath, CommitSHA: "deadbeef"})
+			return err
+		}},
 		{name: "push", run: func() error {
 			return gateway.Push(ctx, PushInput{RepoPath: fixture.repoPath, WorktreePath: fixture.repoPath, Branch: "feature/test"})
 		}},
@@ -50,6 +54,30 @@ func TestGatewayRejectsRepoPathAsMutationWorktree(t *testing.T) {
 				t.Fatalf("error = %v, want repo-path safety failure", err)
 			}
 		})
+	}
+}
+
+func TestGatewayRevertCommitCreatesOneInverseCommitInManagedWorktree(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t)
+	fixture.createMainOnlyRepo(t)
+	writeFile(t, filepath.Join(fixture.repoPath, "README.md"), "broken\n")
+	runGit(t, fixture.repoPath, "add", "README.md")
+	runGit(t, fixture.repoPath, "commit", "-m", "bad change")
+	badCommit := stringsTrimSpace(runGit(t, fixture.repoPath, "rev-parse", "HEAD"))
+	runGit(t, fixture.repoPath, "push", "origin", "main")
+
+	gateway := fixture.gateway()
+	worktree, err := gateway.CreateWorktree(ctx, CreateWorktreeInput{ProjectID: fixture.projectID, RepoPath: fixture.repoPath, WorktreeRoot: fixture.worktreeRoot, Branch: "looper/auditor/revert-bad", BaseBranch: "main", ProtectedBranches: []string{"main"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := gateway.RevertCommit(ctx, RevertCommitInput{RepoPath: fixture.repoPath, WorktreeRoot: fixture.worktreeRoot, WorktreePath: worktree.WorktreePath, CommitSHA: badCommit})
+	if err != nil || result.CommitSHA == "" {
+		t.Fatalf("RevertCommit() = %#v, %v", result, err)
+	}
+	if got := readFile(t, filepath.Join(worktree.WorktreePath, "README.md")); got != "hello\n" {
+		t.Fatalf("README after revert = %q, want original content", got)
 	}
 }
 

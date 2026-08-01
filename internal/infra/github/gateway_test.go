@@ -2749,6 +2749,35 @@ func TestGatewayCloseIssueUsesTypedReasonAndIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestGatewayReopenIssueIsIdempotent(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		switch args := strings.Join(options.Args, " "); args {
+		case "api repos/acme/looper/issues/8 --jq .state":
+			return shell.Result{Stdout: "closed\n"}, nil
+		case "issue reopen 8 --repo acme/looper":
+			return shell.Result{}, nil
+		case "api repos/acme/looper/issues/9 --jq .state":
+			return shell.Result{Stdout: "open\n"}, nil
+		default:
+			t.Fatalf("unexpected gh args: %q", args)
+			return shell.Result{}, nil
+		}
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	if err := gateway.ReopenIssue(context.Background(), ReopenIssueInput{Repo: "acme/looper", IssueNumber: 8}); err != nil {
+		t.Fatalf("ReopenIssue(closed) error = %v", err)
+	}
+	if err := gateway.ReopenIssue(context.Background(), ReopenIssueInput{Repo: "acme/looper", IssueNumber: 9}); err != nil {
+		t.Fatalf("ReopenIssue(open) error = %v", err)
+	}
+	if strings.Contains(strings.Join(runner.calls, "\n"), "issue reopen 9") {
+		t.Fatalf("reopened already-open issue: %#v", runner.calls)
+	}
+}
+
 func TestGatewayClosePullRequestIsIdempotent(t *testing.T) {
 	t.Parallel()
 	runner := &fakeGHRunner{t: t}

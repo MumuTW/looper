@@ -37,7 +37,10 @@ func runAuditorLane(ctx context.Context, input defaultSchedulerTickInput, projec
 	if err := observePostMergeFailure(ctx, input.Repos, input.GitHubGateway, project, repo, baseBranch, role, input.Now); err != nil {
 		return err
 	}
-	return progressAuditorConfirmation(ctx, input.Repos, input.GitHubGateway, project, repo, baseBranch, role, input.Now)
+	if err := progressAuditorConfirmation(ctx, input.Repos, input.GitHubGateway, project, repo, baseBranch, role, input.Now); err != nil {
+		return err
+	}
+	return progressAuditorRevertProposal(ctx, input.Repos, input.GitGateway, input.GitHubGateway, project, repo, baseBranch, input.Now)
 }
 
 func observePostMergeFailure(ctx context.Context, repos *storage.Repositories, gateway auditorGateway, project storage.ProjectRecord, repo, baseBranch string, role config.AuditorRoleConfig, now func() time.Time) error {

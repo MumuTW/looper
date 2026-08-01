@@ -475,6 +475,12 @@ type CloseIssueInput struct {
 	CWD         string
 }
 
+type ReopenIssueInput struct {
+	Repo        string
+	IssueNumber int64
+	CWD         string
+}
+
 type ClosePullRequestInput struct {
 	Repo         string
 	PRNumber     int64
@@ -1578,6 +1584,30 @@ func (g *Gateway) CloseIssue(ctx context.Context, input CloseIssueInput) error {
 	return err
 }
 
+// ReopenIssue is idempotent so a retry after creating a revert PR can safely
+// finish the source-issue transition without changing an already-open issue.
+func (g *Gateway) ReopenIssue(ctx context.Context, input ReopenIssueInput) error {
+	if input.IssueNumber <= 0 {
+		return fmt.Errorf("reopen issue: positive issue number is required")
+	}
+	state, err := g.viewIssueState(ctx, input.Repo, input.IssueNumber, input.CWD)
+	if err != nil {
+		return err
+	}
+	if state == "open" {
+		return nil
+	}
+	_, err = g.runGh(ctx, input.CWD, "", "issue", "reopen", strconv.FormatInt(input.IssueNumber, 10), "--repo", input.Repo)
+	if err == nil {
+		return nil
+	}
+	state, stateErr := g.viewIssueState(ctx, input.Repo, input.IssueNumber, input.CWD)
+	if stateErr == nil && state == "open" {
+		return nil
+	}
+	return err
+}
+
 func (g *Gateway) AddIssueAssignees(ctx context.Context, input IssueAssigneesInput) error {
 	assignees := compactIssueAssignees(input.Assignees)
 	if len(assignees) == 0 {
@@ -1849,7 +1879,9 @@ func (g *Gateway) viewPullRequestWithFields(ctx context.Context, input ViewPullR
 			return PullRequestDetail{}, err
 		}
 	}
-	return pullRequestDetailFromViewRow(row, threads, issueComments), nil
+	detail := pullRequestDetailFromViewRow(row, threads, issueComments)
+	detail.ClosingIssues = qualifyIssueReferences(input.Repo, detail.ClosingIssues)
+	return detail, nil
 }
 
 func pullRequestDetailFromViewRow(row map[string]any, threads []map[string]any, issueComments []CommentInfo) PullRequestDetail {
@@ -1976,6 +2008,20 @@ func extractIssueReferences(value any) []IssueReference {
 		return references[i].Number < references[j].Number
 	})
 	return references
+}
+
+func qualifyIssueReferences(projectRepo string, references []IssueReference) []IssueReference {
+	hostname, _ := splitRepoHostname(projectRepo)
+	if hostname == "" {
+		return references
+	}
+	qualified := append([]IssueReference(nil), references...)
+	for index := range qualified {
+		if referenceHostname, _ := splitRepoHostname(qualified[index].Repo); referenceHostname == "" {
+			qualified[index].Repo = hostname + "/" + qualified[index].Repo
+		}
+	}
+	return qualified
 }
 
 func (g *Gateway) ListPullRequestCheckRuns(ctx context.Context, input PullRequestCheckRunsInput) (PullRequestCheckRuns, error) {

@@ -129,6 +129,15 @@ type CommitResult struct {
 	CommitSHA string
 }
 
+type RevertCommitInput struct {
+	RepoPath     string
+	WorktreeRoot string
+	WorktreePath string
+	CommitSHA    string
+}
+
+var commitSHAPattern = regexp.MustCompile(`^[0-9a-fA-F]{7,64}$`)
+
 type CleanupWorktreeInput struct {
 	ProjectID         string
 	RepoPath          string
@@ -1026,6 +1035,31 @@ func (g *Gateway) Commit(ctx context.Context, input CommitInput) (CommitResult, 
 		return CommitResult{}, fmt.Errorf("commitSHA is required")
 	}
 
+	return CommitResult{CommitSHA: headSHA}, nil
+}
+
+// RevertCommit creates one inverse commit in a managed, non-protected
+// worktree. A failed revert is aborted before returning so retry never adopts
+// conflict markers or an incomplete index.
+func (g *Gateway) RevertCommit(ctx context.Context, input RevertCommitInput) (CommitResult, error) {
+	if err := g.validateMutationWorktree(input.WorktreePath, input.RepoPath, input.WorktreeRoot); err != nil {
+		return CommitResult{}, err
+	}
+	commitSHA := strings.TrimSpace(input.CommitSHA)
+	if !commitSHAPattern.MatchString(commitSHA) {
+		return CommitResult{}, fmt.Errorf("revert commit requires a commit SHA")
+	}
+	if err := g.runGit(ctx, input.WorktreePath, nil, "revert", "--no-edit", commitSHA); err != nil {
+		_ = g.runGit(ctx, input.WorktreePath, nil, "revert", "--abort")
+		return CommitResult{}, err
+	}
+	headSHA, err := g.getHeadSHA(ctx, input.WorktreePath)
+	if err != nil {
+		return CommitResult{}, err
+	}
+	if headSHA == "" {
+		return CommitResult{}, fmt.Errorf("revert commit did not produce a commit SHA")
+	}
 	return CommitResult{CommitSHA: headSHA}, nil
 }
 

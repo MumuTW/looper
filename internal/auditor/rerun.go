@@ -10,6 +10,11 @@ const RerunRequestedEventType = "post_merge_audit.rerun_requested"
 // a new status table.
 const ConfirmationEventType = "post_merge_audit.confirmation"
 
+// RevertProposalEventType records the draft PR and source-issue reopen after a
+// confirmed, provenance-complete regression. It is the idempotency record for
+// future scheduler ticks, not authority to merge the proposed revert.
+const RevertProposalEventType = "post_merge_audit.revert_proposed"
+
 type RerunRequest struct {
 	Version             int      `json:"version"`
 	ObservationEventID  string   `json:"observationEventId"`
@@ -40,4 +45,17 @@ type ConfirmedCandidate struct {
 	MergeCommitSHA    string `json:"mergeCommitSha"`
 	SourceIssueNumber int64  `json:"sourceIssueNumber"`
 	SourceIssueRepo   string `json:"sourceIssueRepo"`
+}
+
+type RevertProposal struct {
+	Version             int    `json:"version"`
+	ConfirmationEventID string `json:"confirmationEventId"`
+	Repo                string `json:"repo"`
+	HeadSHA             string `json:"headSha"`
+	MergeCommitSHA      string `json:"mergeCommitSha"`
+	SourceIssueNumber   int64  `json:"sourceIssueNumber"`
+	Branch              string `json:"branch"`
+	PRNumber            int64  `json:"prNumber"`
+	PRURL               string `json:"prUrl"`
+	ProposedAt          string `json:"proposedAt"`
 }
