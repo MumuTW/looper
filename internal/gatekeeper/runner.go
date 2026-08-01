@@ -80,7 +80,9 @@ type CheckEvidence struct {
 // configured bounds that were applied. See config.GatekeeperDiffBudget for the
 // gate's semantics and the blind spots it does not catch (no additions or
 // per-file bound, generated files not excluded, whole-PR totals against the
-// current merge base).
+// current merge base, and the merge action binding only the head — see
+// MergePullRequest — so a base advance between the final revalidation read and
+// the merge is not atomically refused).
 type DiffBudgetEvidence struct {
 	ChangedFiles    int `json:"changedFiles"`
 	Deletions       int `json:"deletions"`
@@ -401,6 +403,14 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 		if stats == nil {
 			return r.persistProviderBlock(ctx, report, ReasonProviderStateUnavailable, "diff_stats")
 		}
+		// The accepted counts are only meaningful against the base they were
+		// observed with. A provider that returns diff statistics but omits the
+		// base SHA leaves no way to establish which merge base produced them, so
+		// the final revalidation below could not detect a later advance. Fail
+		// closed rather than recording a verdict the gate cannot anchor.
+		if diffBudgetBaseSHA == "" {
+			return r.persistProviderBlock(ctx, report, ReasonProviderStateAmbiguous, "diff_budget_base")
+		}
 		report.Evidence.DiffBudget = &DiffBudgetEvidence{
 			ChangedFiles:    stats.ChangedFiles,
 			Deletions:       stats.Deletions,
@@ -481,8 +491,10 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 	// merge base while the recorded counts still describe the previous one, and
 	// an eligible verdict would proceed toward auto-merge on stale evidence. Fail
 	// closed so the next tick (whose fingerprint folds in BaseSHA while the budget
-	// is enabled) re-evaluates against the current base.
-	if budgetEnabled && diffBudgetBaseSHA != "" && strings.TrimSpace(finalBase) != diffBudgetBaseSHA {
+	// is enabled) re-evaluates against the current base. diffBudgetBaseSHA is
+	// guaranteed non-empty here because the budget block above fails closed when
+	// the provider omits it.
+	if budgetEnabled && strings.TrimSpace(finalBase) != diffBudgetBaseSHA {
 		return r.persistProviderBlock(ctx, report, ReasonProviderStateAmbiguous, "diff_budget_base")
 	}
 	persisted, err := r.persist(ctx, report)

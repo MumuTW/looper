@@ -1901,6 +1901,15 @@ func (g *Gateway) EnableAutoMerge(ctx context.Context, input EnableAutoMergeInpu
 // This deliberately does not pass --auto. Auto-merge hands the decision to
 // GitHub to apply later, by which time the evaluation behind it is stale — the
 // opposite of the guarantee an immediate merge makes.
+//
+// Only the head is bound here: GitHub's merge API (and `gh pr merge`) accepts no
+// parameter that atomically pins the base. A diff-budget verdict depends on the
+// merge base, so when the base branch advances between the confirming pass's
+// final revalidation read and this call, the merge can still proceed against a
+// new base whose recomputed diff exceeds the budget. The confirming pass narrows
+// that window to the calls between the final read and the merge, but it cannot
+// close it; this is a documented blind spot of the diff-budget gate, not a
+// property this command can enforce.
 func (g *Gateway) MergePullRequest(ctx context.Context, input EnableAutoMergeInput) error {
 	strategy := strings.TrimSpace(string(input.Strategy))
 	if strategy == "" {

@@ -207,6 +207,9 @@ func TestDiscoverPullRequestsReevaluatesOnBaseSHAWhenBudgetEnabled(t *testing.T)
 	fixture := newGatekeeperFixture(t)
 	fixture.github.openPullRequests = []githubinfra.PullRequestSummary{openPullRequestFixture()}
 	fixture.github.detail.DiffStats = &githubinfra.PullRequestDiffStats{ChangedFiles: 5}
+	fixture.github.detail.BaseSHA = "base-1"
+	fixture.github.mergeable.BaseSHA = "base-1"
+	fixture.github.finalBaseSHA = "base-1"
 	runner := diffBudgetRunner(t, fixture, config.GatekeeperDiffBudget{MaxChangedFiles: 20}, config.GatekeeperTrustObserve)
 
 	first, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
@@ -240,6 +243,9 @@ func TestDiscoverPullRequestsReevaluatesWhenDiffBudgetChanges(t *testing.T) {
 	fixture := newGatekeeperFixture(t)
 	fixture.github.openPullRequests = []githubinfra.PullRequestSummary{openPullRequestFixture()}
 	fixture.github.detail.DiffStats = &githubinfra.PullRequestDiffStats{ChangedFiles: 5}
+	fixture.github.detail.BaseSHA = "base-1"
+	fixture.github.mergeable.BaseSHA = "base-1"
+	fixture.github.finalBaseSHA = "base-1"
 	current := config.GatekeeperDiffBudget{MaxChangedFiles: 20}
 	runner := New(Options{
 		Repos:  fixture.repos,

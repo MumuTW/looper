@@ -874,6 +874,13 @@ Reviewers should weigh these blind spots before relying on it:
   the head does not. The discovery fingerprint includes the base SHA so a
   rewritten merge base invalidates a reused verdict rather than serving a stale
   one for up to the skip window.
+- At the `auto` trust level the merge action binds only the pull-request head
+  (`gh pr merge --match-head-commit`); GitHub's merge API accepts no parameter
+  that atomically pins the base. The confirming pass revalidates the base
+  immediately before the merge, but if the base branch advances in the window
+  between that final read and the merge call itself, the merge can still proceed
+  against a new base whose recomputed diff exceeds the budget. That window is
+  narrow but not closed — it is a documented blind spot, not a guarantee.
 
 ## Deploy on merge (`roles.deployer`)
 

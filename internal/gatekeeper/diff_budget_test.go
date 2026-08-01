@@ -31,6 +31,9 @@ func TestDiffBudgetAtLimitPassesAndRecordsEvidence(t *testing.T) {
 	t.Parallel()
 	fixture := newGatekeeperFixture(t)
 	fixture.github.detail.DiffStats = &githubinfra.PullRequestDiffStats{ChangedFiles: 20, Deletions: 500}
+	fixture.github.detail.BaseSHA = "base-1"
+	fixture.github.mergeable.BaseSHA = "base-1"
+	fixture.github.finalBaseSHA = "base-1"
 	runner := diffBudgetRunner(t, fixture, config.GatekeeperDiffBudget{MaxChangedFiles: 20, MaxDeletions: 500}, config.GatekeeperTrustObserve)
 
 	report, err := runner.EvaluatePullRequest(context.Background(), EvaluationInput{ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, ExpectedHeadSHA: "head-1"})
@@ -49,6 +52,9 @@ func TestDiffBudgetExceededBlocksAndExplainsObservedValues(t *testing.T) {
 	t.Parallel()
 	fixture := newGatekeeperFixture(t)
 	fixture.github.detail.DiffStats = &githubinfra.PullRequestDiffStats{ChangedFiles: 21, Deletions: 501}
+	fixture.github.detail.BaseSHA = "base-1"
+	fixture.github.mergeable.BaseSHA = "base-1"
+	fixture.github.finalBaseSHA = "base-1"
 	runner := diffBudgetRunner(t, fixture, config.GatekeeperDiffBudget{MaxChangedFiles: 20, MaxDeletions: 500}, config.GatekeeperTrustAdvise)
 
 	report, err := runner.EvaluatePullRequest(context.Background(), EvaluationInput{ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, ExpectedHeadSHA: "head-1"})
@@ -94,10 +100,41 @@ func TestDiffBudgetRequiresProviderStatsWhenEnabled(t *testing.T) {
 	}
 }
 
+// A provider that returns diff statistics but omits both base SHAs leaves no way
+// to establish which merge base produced the counts. The gate must fail closed
+// rather than record an eligible verdict it cannot anchor, because the final
+// revalidation would otherwise have no base to compare and would bypass the
+// stale-base check entirely.
+func TestDiffBudgetFailsClosedWhenBaseSHAMissing(t *testing.T) {
+	t.Parallel()
+	fixture := newGatekeeperFixture(t)
+	fixture.github.detail.DiffStats = &githubinfra.PullRequestDiffStats{ChangedFiles: 5}
+	// detail.BaseSHA and mergeable.BaseSHA are left empty (the fixture default),
+	// so the provider returns stats without a base to anchor them.
+	runner := diffBudgetRunner(t, fixture, config.GatekeeperDiffBudget{MaxChangedFiles: 20}, config.GatekeeperTrustAuto)
+
+	report, err := runner.EvaluatePullRequest(context.Background(), EvaluationInput{ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, ExpectedHeadSHA: "head-1"})
+	if err != nil {
+		t.Fatalf("EvaluatePullRequest() error = %v", err)
+	}
+	if report.Eligible || len(report.Reasons) != 1 || report.Reasons[0].Code != ReasonProviderStateAmbiguous || report.Reasons[0].Subject != "diff_budget_base" {
+		t.Fatalf("report = %#v, want a single diff_budget_base ambiguous block (base SHA missing while stats present)", report)
+	}
+	if report.Evidence.DiffBudget != nil {
+		t.Fatalf("diff budget evidence = %#v, want nil (no verdict recorded when the base cannot be established)", report.Evidence.DiffBudget)
+	}
+	if len(fixture.github.merges) != 0 {
+		t.Fatalf("merges = %#v, want no auto-merge when the diff-stat base SHA is missing", fixture.github.merges)
+	}
+}
+
 func TestDiffBudgetIsRecheckedBeforeAutoMerge(t *testing.T) {
 	t.Parallel()
 	fixture := newGatekeeperFixture(t)
 	fixture.github.detail.DiffStats = &githubinfra.PullRequestDiffStats{ChangedFiles: 20}
+	fixture.github.detail.BaseSHA = "base-1"
+	fixture.github.mergeable.BaseSHA = "base-1"
+	fixture.github.finalBaseSHA = "base-1"
 	views := 0
 	fixture.github.beforeView = func(github *fakeGatekeeperGitHub) {
 		views++
@@ -128,6 +165,9 @@ func TestDiffBudgetPreservesExactProjectIDThroughEvaluation(t *testing.T) {
 	t.Parallel()
 	fixture := newGatekeeperFixture(t)
 	fixture.github.detail.DiffStats = &githubinfra.PullRequestDiffStats{ChangedFiles: 5}
+	fixture.github.detail.BaseSHA = "base-1"
+	fixture.github.mergeable.BaseSHA = "base-1"
+	fixture.github.finalBaseSHA = "base-1"
 	nowISO := fixture.now.Format(time.RFC3339Nano)
 	if err := fixture.repos.Projects.Upsert(context.Background(), storage.ProjectRecord{
 		ID: " padded ", Name: "Padded", RepoPath: t.TempDir(), CreatedAt: nowISO, UpdatedAt: nowISO,
