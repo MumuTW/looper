@@ -28,8 +28,20 @@ func TestHandleTerminalExhaustionUsesDurableTerminalAttemptCount(t *testing.T) {
 	queue.Attempts = 2 // claimed snapshot; the durable terminal row is 3.
 	queue.Priority = storage.QueuePriorityFixer
 	queue.ID = "queue_exhausted_attempts"
-	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: queue.ID, ProjectID: queue.ProjectID, LoopID: queue.LoopID, Type: queue.Type, TargetType: queue.TargetType, TargetID: queue.TargetID, Repo: queue.Repo, PRNumber: queue.PRNumber, DedupeKey: "fixer:attempt-count", Priority: storage.QueuePriorityFixer, Status: "failed", Attempts: 3, MaxAttempts: 3, CreatedAt: queue.CreatedAt, UpdatedAt: queue.UpdatedAt}); err != nil {
-		t.Fatalf("Queue.Upsert(terminal) error = %v", err)
+	// Queue.Fail persists manual_intervention for every terminal failure kind;
+	// use the real transition so regeneration cannot accidentally key off the
+	// legacy "failed" status used by the focused unit fixtures.
+	queue.Status = "running"
+	queue.DedupeKey = "fixer:attempt-count"
+	if err := fixture.repos.Queue.Upsert(context.Background(), queue); err != nil {
+		t.Fatalf("Queue.Upsert(running) error = %v", err)
+	}
+	if _, err := runner.failQueueItemTerminal(context.Background(), queue, FailureRetryableTransient, "failed", 3); err != nil {
+		t.Fatalf("failQueueItemTerminal() error = %v", err)
+	}
+	persisted, err := fixture.repos.Queue.GetByID(context.Background(), queue.ID)
+	if err != nil || persisted == nil || persisted.Status != "manual_intervention" {
+		t.Fatalf("durable terminal queue = %#v err=%v, want manual_intervention", persisted, err)
 	}
 	project, _ := fixture.repos.Projects.GetByID(context.Background(), "project_1")
 	_, action, err := runner.applyTerminalRegeneration(context.Background(), *project, loop, queue, fixerCheckpoint{}, &loopError{message: "failed", kind: FailureRetryableTransient})

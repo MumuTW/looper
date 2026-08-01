@@ -2373,7 +2373,7 @@ func (r *Runner) recoverClaimedItem(ctx context.Context, queueItem storage.Queue
 			if err != nil {
 				return nil, err
 			}
-			if !scheduled && failedQueue != nil && failedQueue.Status == "failed" && (runFailure != nil || regenerationErr != nil) {
+			if !scheduled && (runFailure != nil || regenerationErr != nil) {
 				checkpoint := fixerCheckpoint{}
 				handoffFailure := failure
 				if runFailure != nil {
@@ -2383,8 +2383,10 @@ func (r *Runner) recoverClaimedItem(ctx context.Context, queueItem storage.Queue
 					checkpoint = regenerationErr.checkpoint
 					handoffFailure = regenerationErr.failure
 				}
-				if _, _, err := r.applyTerminalRegeneration(ctx, *project, *loop, queueItem, checkpoint, handoffFailure); err != nil {
-					return nil, err
+				if queueResultAllowsRegeneration(failedQueue, handoffFailure) {
+					if _, _, err := r.applyTerminalRegeneration(ctx, *project, *loop, queueItem, checkpoint, handoffFailure); err != nil {
+						return nil, err
+					}
 				}
 			}
 		}
@@ -2623,7 +2625,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			if err != nil {
 				return ProcessResult{}, err
 			}
-			if !resumed && failedQueue != nil && failedQueue.Status == "failed" {
+			if !resumed && queueResultAllowsRegeneration(failedQueue, failure) {
 				if _, _, err := r.applyTerminalRegeneration(ctx, *project, pausedLoop, queueItem, latest, failure); err != nil {
 					return ProcessResult{}, err
 				}
@@ -2638,7 +2640,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 				return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
 			}
 		}
-		if failedQueue != nil && failedQueue.Status == "failed" {
+		if queueResultAllowsRegeneration(failedQueue, failure) {
 			if _, _, err := r.applyTerminalRegeneration(ctx, *project, pausedLoop, queueItem, latest, failure); err != nil {
 				return ProcessResult{}, err
 			}
@@ -2775,7 +2777,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 				if err != nil {
 					return ProcessResult{}, err
 				}
-				if !resumed && failedQueue != nil && failedQueue.Status == "failed" {
+				if !resumed && queueResultAllowsRegeneration(failedQueue, failure) {
 					if _, _, err := r.applyTerminalRegeneration(ctx, *project, pausedLoop, queueItem, latest, failure); err != nil {
 						return ProcessResult{}, err
 					}
@@ -2790,7 +2792,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 					return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
 				}
 			}
-			if failedQueue != nil && failedQueue.Status == "failed" {
+			if queueResultAllowsRegeneration(failedQueue, failure) {
 				if _, _, err := r.applyTerminalRegeneration(ctx, *project, pausedLoop, queueItem, latest, failure); err != nil {
 					return ProcessResult{}, err
 				}
@@ -7202,7 +7204,31 @@ func clearUnusableFixerWorktreePath(path string) error {
 }
 
 func queueResultIsTerminalForCleanup(queue *storage.QueueItemRecord) bool {
-	return queue == nil || (queue.Status != "queued" && queue.Status != "manual_intervention")
+	if queue == nil || queue.Status == "queued" {
+		return queue == nil
+	}
+	// Queue.Fail uses manual_intervention for every terminal failure kind. Keep
+	// the worktree for an explicit manual-intervention park, but retryable
+	// exhaustion is terminal cleanup just like the legacy failed status.
+	if queue.Status == "manual_intervention" {
+		return strings.TrimSpace(derefString(queue.LastErrorKind)) != string(FailureManualIntervention)
+	}
+	return true
+}
+
+// queueResultAllowsRegeneration identifies a durable terminal queue outcome
+// that should enter close-and-regenerate. Queue.Fail persists
+// manual_intervention for retryable exhaustion as well as explicit manual
+// parks, so the failure kind—not the status string alone—is the authority. The
+// legacy failed status remains accepted for old rows and focused callers.
+func queueResultAllowsRegeneration(queue *storage.QueueItemRecord, failure *loopError) bool {
+	if queue == nil || failure == nil || failure.kind == FailureManualIntervention {
+		return false
+	}
+	if persistedKind := strings.TrimSpace(derefString(queue.LastErrorKind)); persistedKind != "" && persistedKind == string(FailureManualIntervention) {
+		return false
+	}
+	return queue.Status == "failed" || queue.Status == "manual_intervention"
 }
 
 type waitForPullRequestHeadSHAInput struct {

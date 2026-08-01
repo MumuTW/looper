@@ -2324,10 +2324,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 				return effective == nil || effective.DeleteBranch
 			},
 			RegenerationAvailability: func(_ string) string {
-				if !plannerConfigured || plannerRoleRunner == nil {
-					return "Planner agent is not configured for fixer regeneration"
-				}
-				return ""
+				return fixerRegenerationUnavailableReason(cfg, plannerConfigured, plannerRoleRunner != nil)
 			},
 			OnRegenerateIssue: func(ctx context.Context, input fixer.RegenerateIssueInput) error {
 				if !plannerConfigured || plannerRoleRunner == nil {
@@ -2539,6 +2536,21 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		})
 	}
 	return handlers
+}
+
+// fixerRegenerationUnavailableReason is checked before Fixer closes an
+// exhausted PR. A Planner that cannot publish (for example because
+// defaults.allowAutoPush is false) is not a safe regeneration target: closing
+// the implementation first would destroy the only runnable artifact and leave
+// the issue parked for manual work.
+func fixerRegenerationUnavailableReason(cfg config.Config, plannerConfigured, plannerAvailable bool) string {
+	if !plannerConfigured || !plannerAvailable {
+		return "Planner agent is not configured for fixer regeneration"
+	}
+	if !cfg.Defaults.AllowAutoPush {
+		return "Planner automatic publication is disabled (defaults.allowAutoPush=false)"
+	}
+	return ""
 }
 
 func githubCLIAutoPROpeningAvailable(ctx context.Context, cfg config.Config, githubGateway *githubinfra.Gateway, logger bootstrap.Logger, repo, cwd string) bool {

@@ -102,9 +102,6 @@ func (r *Runner) handleTerminalExhaustion(ctx context.Context, project storage.P
 	if r.onRegenerateIssue == nil || failure == nil || failure.kind == FailureManualIntervention {
 		return regenerationNone, nil
 	}
-	if queueItem.Status == "manual_intervention" {
-		return regenerationNone, nil
-	}
 	bridge, ok := r.github.(RegenerationGateway)
 	if !ok {
 		return regenerationNone, nil
