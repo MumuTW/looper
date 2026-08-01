@@ -97,6 +97,13 @@ func (r *Runner) reconcileRoutingLabels(ctx context.Context, report Report, prev
 	// auto-merge projection unnoticed.
 	if report.Evidence.ReviewerConvergence != nil || plan.autoMerge {
 		if err := r.revalidateReviewerConvergence(ctx, report, expectedHead); err != nil {
+			// A convergence change invalidates the route authority. Retire both
+			// labels before retrying so a previously published auto-merge label
+			// cannot keep queueing a pull request while the local evidence is stale.
+			cleanupErr := r.applyRoutingLabelPlan(ctx, report, routingLabelPlan{})
+			if cleanupErr != nil {
+				return fmt.Errorf("%w (remove stale routing labels: %v)", err, cleanupErr)
+			}
 			return err
 		}
 	}
