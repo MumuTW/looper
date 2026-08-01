@@ -125,10 +125,16 @@ func New(cfg Config, now func() time.Time, onChange func(Transition)) *Breaker {
 // scheduler calls, and it advances open -> half-open when the cooldown expires,
 // so no separate timer owns recovery.
 func (b *Breaker) Allow() error {
-	if b == nil || !b.cfg.Enabled {
+	if b == nil {
 		return nil
 	}
 	b.mu.Lock()
+	// cfg is read under the mutex because SetConfig writes it from the config
+	// reload path while the scheduler is calling this from its own goroutines.
+	if !b.cfg.Enabled {
+		b.mu.Unlock()
+		return nil
+	}
 	transition, ok := b.refreshLocked()
 	state := b.state
 	remaining := b.openUntil.Sub(b.now())
@@ -150,10 +156,14 @@ func (b *Breaker) Allow() error {
 // the agent boundary; a failed git push or a rejected policy check is looper's
 // own problem and must not open a gate meant for provider trouble.
 func (b *Breaker) Record(ok bool) {
-	if b == nil || !b.cfg.Enabled {
+	if b == nil {
 		return
 	}
 	b.mu.Lock()
+	if !b.cfg.Enabled {
+		b.mu.Unlock()
+		return
+	}
 	now := b.now()
 	b.outcomes = append(b.outcomes, outcome{at: now, ok: ok})
 	b.pruneLocked(now)

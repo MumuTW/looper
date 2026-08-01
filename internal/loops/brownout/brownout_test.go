@@ -2,6 +2,7 @@ package brownout
 
 import (
 	"errors"
+	"sync"
 	"testing"
 	"time"
 )
@@ -242,6 +243,41 @@ func TestSnapshotReportsOpenUntilAndTrips(t *testing.T) {
 	if snapshot.Trips != 1 {
 		t.Fatalf("expected 1 trip, got %d", snapshot.Trips)
 	}
+}
+
+// The scheduler calls Allow from its own goroutines while a config reload calls
+// SetConfig from another. Under -race this fails if any field of cfg is read
+// outside the mutex.
+func TestConcurrentAllowRecordAndSetConfigAreRaceFree(t *testing.T) {
+	cfg := testConfig()
+	b := New(cfg, time.Now, func(Transition) {})
+
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(3)
+		go func() {
+			defer wg.Done()
+			for n := 0; n < 200; n++ {
+				_ = b.Allow()
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			for n := 0; n < 200; n++ {
+				b.Record(n%2 == 0)
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			for n := 0; n < 200; n++ {
+				next := cfg
+				next.Enabled = n%2 == 0
+				b.SetConfig(next)
+				_ = b.Snapshot()
+			}
+		}()
+	}
+	wg.Wait()
 }
 
 func TestNilBreakerIsInert(t *testing.T) {
