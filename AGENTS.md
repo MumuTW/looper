@@ -63,9 +63,13 @@ Any PR that adds a gate, validation step, persisted field, or "verify before act
 
 If the honest answer is "the agent's output, but we don't trust it", make the agent's output more structured instead of building an inference layer on top of infra state. Infra signals are for drift detection, not for authority.
 
-### A second fix to the same subsystem is a revert signal
+### A second fix to the same subsystem is a design signal
 
-If a subsystem receives a second `fix:` PR shortly after the first, default to reverting the first and redesigning, not stacking another patch. Near-identical `fix:` titles on the same area are a hard signal that the underlying abstraction is wrong.
+If a subsystem receives a second `fix:` PR shortly after the first, the second PR's description must answer, in one sentence:
+
+> Is this patching the first fix's own mechanism, or a different path through the same subsystem?
+
+Near-identical `fix:` titles on the same area, or a patch to a guard the previous fix introduced, mean the underlying abstraction is wrong — stacking a third patch is not an option. Revert the first fix and redesign when reverting does not reopen a bug someone is still hitting; otherwise redesign forward and land the replacement in one diff. Say which one you chose and why.
 
 ### Prefer deletion over another layer
 
