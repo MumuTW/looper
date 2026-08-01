@@ -38,6 +38,7 @@ import (
 	"github.com/MumuTW/looper/internal/loops/failureclass"
 	"github.com/MumuTW/looper/internal/processcontainment"
 	"github.com/MumuTW/looper/internal/reproducer"
+	"github.com/MumuTW/looper/internal/reviewitem"
 	"github.com/MumuTW/looper/internal/storage"
 	"github.com/MumuTW/looper/internal/validation"
 	"github.com/MumuTW/looper/internal/worktreesafety"
@@ -88,21 +89,22 @@ type FixItem struct {
 	Source string `json:"source,omitempty"`
 	// ID identifies the item within its Source; only Source tells you which
 	// identity space an ID belongs to.
-	ID                  string   `json:"id,omitempty"`
-	ThreadID            string   `json:"threadId,omitempty"`
-	ThreadFingerprint   string   `json:"threadFingerprint,omitempty"`
-	ProviderCommentID   int64    `json:"providerCommentId,omitempty"`
-	ObservedFingerprint string   `json:"observedFingerprint,omitempty"`
-	ResolverPresent     bool     `json:"resolverPresent,omitempty"`
-	Name                string   `json:"name,omitempty"`
-	Summary             string   `json:"summary,omitempty"`
-	Body                string   `json:"body,omitempty"`
-	DiffHunk            string   `json:"diffHunk,omitempty"`
-	Files               []string `json:"files,omitempty"`
-	Author              string   `json:"author,omitempty"`
-	URL                 string   `json:"url,omitempty"`
-	Path                string   `json:"path,omitempty"`
-	Line                int64    `json:"line,omitempty"`
+	ID                  string              `json:"id,omitempty"`
+	ThreadID            string              `json:"threadId,omitempty"`
+	ThreadFingerprint   string              `json:"threadFingerprint,omitempty"`
+	ProviderCommentID   int64               `json:"providerCommentId,omitempty"`
+	ObservedFingerprint string              `json:"observedFingerprint,omitempty"`
+	ResolverPresent     bool                `json:"resolverPresent,omitempty"`
+	Name                string              `json:"name,omitempty"`
+	Summary             string              `json:"summary,omitempty"`
+	Body                string              `json:"body,omitempty"`
+	DiffHunk            string              `json:"diffHunk,omitempty"`
+	Files               []string            `json:"files,omitempty"`
+	Author              string              `json:"author,omitempty"`
+	URL                 string              `json:"url,omitempty"`
+	Path                string              `json:"path,omitempty"`
+	Line                int64               `json:"line,omitempty"`
+	Severity            reviewitem.Severity `json:"severity,omitempty"`
 }
 
 type PullRequestSummary struct {
@@ -4053,7 +4055,9 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 			continue
 		}
 		if normalizeReplyAction(decision.Action) == string(replyActionDeferred) {
-			upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Action: string(replyActionDeferred), Status: "deferred", Message: decision.Explanation, UpdatedAt: r.nowISO()})
+			deferredFingerprint := buildDeferredThreadFingerprint(item, liveDetail.HeadSHA)
+			replyState, replyError := r.replyToDeferredComment(ctx, input, item, deferredFingerprint, decision.Explanation, checkpoint.ResolvedComments.Items)
+			upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Action: string(replyActionDeferred), Status: "deferred", Message: decision.Explanation, UpdatedAt: r.nowISO(), ReplyState: replyState, ReplyError: replyError})
 			deferredThreadIDs = append(deferredThreadIDs, item.ThreadID)
 			if checkpoint.Outcome == nil {
 				checkpoint.Outcome = &FixerRunOutcome{}
@@ -4217,6 +4221,35 @@ func (r *Runner) replyToDeclinedComment(ctx context.Context, input stepInput, it
 	return "sent", ""
 }
 
+func (r *Runner) replyToDeferredComment(ctx context.Context, input stepInput, item FixItem, decisionFingerprint, explanation string, existing []checkpointResolvedComment) (string, string) {
+	if item.ThreadID == "" {
+		return "skipped_no_thread", ""
+	}
+	for _, entry := range existing {
+		if entry.Action != string(replyActionDeferred) {
+			continue
+		}
+		if entry.FixItemID == item.ID || (entry.ThreadID != "" && entry.ThreadID == item.ThreadID) {
+			if entry.ReplyState == "sent" || entry.ReplyState == "skipped_self_author" || entry.ReplyState == "skipped_no_thread" {
+				return entry.ReplyState, entry.ReplyError
+			}
+		}
+	}
+	body := buildFixerDeferredReplyBody(item, explanation, decisionFingerprint)
+	existingRemoteReply, err := r.hasExistingFixerDeferredReply(ctx, input, item, decisionFingerprint)
+	if err != nil {
+		return "failed", err.Error()
+	}
+	if existingRemoteReply {
+		return "sent", ""
+	}
+	disclosureAgent, disclosureModel := r.disclosureIdentity(input.Run)
+	if err := r.github.AddReviewThreadReply(ctx, AddReviewThreadReplyInput{Repo: input.Repo, ThreadID: item.ThreadID, Body: body, CWD: input.Project.RepoPath, DisclosureAgent: disclosureAgent, DisclosureModel: disclosureModel}); err != nil {
+		return "failed", err.Error()
+	}
+	return "sent", ""
+}
+
 func (r *Runner) hasExistingFixerReply(ctx context.Context, input stepInput, item FixItem, commitSHA string) (bool, error) {
 	marker := fixerReplyMarker(item.ThreadID, commitSHA)
 	if marker == "" {
@@ -4236,6 +4269,23 @@ func (r *Runner) hasExistingFixerReply(ctx context.Context, input stepInput, ite
 
 func (r *Runner) hasExistingFixerDeclinedReply(ctx context.Context, input stepInput, item FixItem, decisionFingerprint string) (bool, error) {
 	marker := fixerDeclinedReplyMarker(item.ThreadID, decisionFingerprint)
+	if marker == "" {
+		return false, nil
+	}
+	thread, err := r.github.ViewReviewThread(ctx, ViewReviewThreadInput{Repo: input.Repo, ThreadID: item.ThreadID, CWD: input.Project.RepoPath})
+	if err != nil {
+		return false, err
+	}
+	for _, comment := range thread.Comments {
+		if strings.Contains(comment.Body, marker) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (r *Runner) hasExistingFixerDeferredReply(ctx context.Context, input stepInput, item FixItem, decisionFingerprint string) (bool, error) {
+	marker := fixerDeferredReplyMarker(item.ThreadID, decisionFingerprint)
 	if marker == "" {
 		return false, nil
 	}
@@ -4491,6 +4541,26 @@ func buildFixerDeclinedReplyBody(item FixItem, explanation, decisionFingerprint 
 	return b.String()
 }
 
+func buildFixerDeferredReplyBody(item FixItem, explanation, decisionFingerprint string) string {
+	var b strings.Builder
+	mention := strings.TrimSpace(item.Author)
+	if mention != "" {
+		b.WriteString("@")
+		b.WriteString(mention)
+		b.WriteString(" ")
+	}
+	b.WriteString("This review item is deferred for human follow-up.")
+	if explanation = strings.TrimSpace(explanation); explanation != "" {
+		b.WriteString("\n\n")
+		b.WriteString(explanation)
+	}
+	if marker := fixerDeferredReplyMarker(item.ThreadID, decisionFingerprint); marker != "" {
+		b.WriteString("\n\n")
+		b.WriteString(marker)
+	}
+	return b.String()
+}
+
 func hasSubstantiveDeclineExplanation(explanation string) bool {
 	explanation = strings.TrimSpace(explanation)
 	if explanation == "" {
@@ -4520,6 +4590,15 @@ func fixerDeclinedReplyMarker(threadID, decisionFingerprint string) string {
 		return ""
 	}
 	return fmt.Sprintf("<!-- looper-fixer-reply-declined thread:%s fingerprint:%s -->", threadID, decisionFingerprint)
+}
+
+func fixerDeferredReplyMarker(threadID, decisionFingerprint string) string {
+	threadID = strings.TrimSpace(threadID)
+	decisionFingerprint = strings.TrimSpace(decisionFingerprint)
+	if threadID == "" || decisionFingerprint == "" {
+		return ""
+	}
+	return fmt.Sprintf("<!-- looper-fixer-reply-deferred thread:%s fingerprint:%s -->", threadID, decisionFingerprint)
 }
 
 func summarizeFixItem(item FixItem) string {
@@ -7375,7 +7454,8 @@ func normalizeFixItems(comments []map[string]any, checks []map[string]any, hasCo
 		case int:
 			line = int64(v)
 		}
-		result = append(result, FixItem{Type: "comment", Source: source, ID: id, ThreadID: threadID, ThreadFingerprint: threadFingerprint, ProviderCommentID: providerCommentID, ObservedFingerprint: observedFingerprint, ResolverPresent: resolverPresent, Summary: summary, Body: body, DiffHunk: diffHunk, Author: author, URL: url, Path: path, Line: line})
+		severity, _ := reviewitem.SeverityFromBody(body)
+		result = append(result, FixItem{Type: "comment", Source: source, ID: id, ThreadID: threadID, ThreadFingerprint: threadFingerprint, ProviderCommentID: providerCommentID, ObservedFingerprint: observedFingerprint, ResolverPresent: resolverPresent, Summary: summary, Body: body, DiffHunk: diffHunk, Author: author, URL: url, Path: path, Line: line, Severity: severity})
 	}
 	for _, check := range checks {
 		if !isFailingCheck(check) {
@@ -7465,6 +7545,17 @@ func hashFixItemsState(items []FixItem) string {
 
 func buildDeclinedThreadFingerprint(item FixItem, headSHA string) string {
 	payload := strings.Join([]string{
+		strings.TrimSpace(item.ThreadID),
+		normalizeThreadFingerprint(item.ThreadFingerprint, item.ThreadID, item.ID),
+		strings.TrimSpace(headSHA),
+	}, "|")
+	sum := sha1.Sum([]byte(payload))
+	return hex.EncodeToString(sum[:])
+}
+
+func buildDeferredThreadFingerprint(item FixItem, headSHA string) string {
+	payload := strings.Join([]string{
+		"deferred",
 		strings.TrimSpace(item.ThreadID),
 		normalizeThreadFingerprint(item.ThreadFingerprint, item.ThreadID, item.ID),
 		strings.TrimSpace(headSHA),

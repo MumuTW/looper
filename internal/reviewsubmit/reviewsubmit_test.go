@@ -200,12 +200,21 @@ func TestValidateReviewSubmitBodyRejectsApproveActionableMismatch(t *testing.T) 
 func TestValidateReviewSubmitBodyAllowsRequestChangesOnlyForBlocking(t *testing.T) {
 	t.Parallel()
 	body := "<!-- looper:review id=abc head=def outcome=blocking -->"
-	if err := validateReviewSubmitBody(body, []reviewSubmitComment{{Body: "blocking", Path: "main.go", Line: 10, Side: "RIGHT"}}, "def", "REQUEST_CHANGES", decisionReviewPolicy, "octocat"); err != nil {
+	if err := validateReviewSubmitBody(body, []reviewSubmitComment{{Body: "blocking", Severity: "blocking", Path: "main.go", Line: 10, Side: "RIGHT"}}, "def", "REQUEST_CHANGES", decisionReviewPolicy, "octocat"); err != nil {
 		t.Fatalf("validateReviewSubmitBody(REQUEST_CHANGES blocking) error = %v", err)
 	}
 	nonBlocking := "<!-- looper:review id=abc head=def outcome=non_blocking -->"
 	if err := validateReviewSubmitBody(nonBlocking, nil, "def", "REQUEST_CHANGES", decisionReviewPolicy, "octocat"); err == nil || !strings.Contains(err.Error(), "does not match REQUEST_CHANGES") {
 		t.Fatalf("validateReviewSubmitBody(REQUEST_CHANGES non_blocking) error = %v, want mismatch", err)
+	}
+}
+
+func TestValidateReviewSubmitBodyRejectsLegacyActionableBlockingUnderRequestChangesPolicy(t *testing.T) {
+	t.Parallel()
+	body := "<!-- looper:review id=abc head=def outcome=actionable -->"
+	err := validateReviewSubmitBody(body, []reviewSubmitComment{{Body: "blocking", Severity: "blocking", Path: "main.go", Line: 10, Side: "RIGHT"}}, "def", "COMMENT", decisionReviewPolicy, "octocat")
+	if err == nil || !strings.Contains(err.Error(), "requires REQUEST_CHANGES") {
+		t.Fatalf("validateReviewSubmitBody(legacy actionable blocker) error = %v, want policy rejection", err)
 	}
 }
 
@@ -215,6 +224,46 @@ func TestValidateReviewSubmitBodyRejectsCleanApproveWithInlineComments(t *testin
 	err := validateReviewSubmitBody(body, []reviewSubmitComment{{Body: "inline", Path: "main.go", Line: 10, Side: "RIGHT"}}, "def", "APPROVE", decisionReviewPolicy, "octocat")
 	if err == nil || !strings.Contains(err.Error(), "without inline comments") {
 		t.Fatalf("validateReviewSubmitBody(APPROVE with comments) error = %v, want inline rejection", err)
+	}
+}
+
+func TestValidateReviewSubmitBodyRejectsCleanCommentWithInlineComments(t *testing.T) {
+	t.Parallel()
+	body := "<!-- looper:review id=abc head=def outcome=clean -->"
+	err := validateReviewSubmitBody(body, []reviewSubmitComment{{Body: "nit", Severity: "nit", Path: "main.go", Line: 10, Side: "RIGHT"}}, "def", "COMMENT", commentOnlyReviewPolicy, "octocat")
+	if err == nil || !strings.Contains(err.Error(), "outcome=non_blocking or blocking") {
+		t.Fatalf("validateReviewSubmitBody(clean COMMENT with comments) error = %v, want outcome rejection", err)
+	}
+}
+
+func TestValidateReviewSubmitBodyRequiresStructuredItemSeverity(t *testing.T) {
+	t.Parallel()
+	body := "<!-- looper:review id=abc head=def outcome=non_blocking -->"
+	comment := reviewSubmitComment{Body: "merge-safe finding", Path: "main.go", Line: 10, Side: "RIGHT"}
+	err := validateReviewSubmitBody(body, []reviewSubmitComment{comment}, "def", "COMMENT", commentOnlyReviewPolicy, "octocat")
+	if err == nil || !strings.Contains(err.Error(), "unsupported review item severity") {
+		t.Fatalf("validateReviewSubmitBody() error = %v, want missing severity rejection", err)
+	}
+}
+
+func TestValidateReviewSubmitBodyRejectsBlockingItemUnderNonBlockingOutcome(t *testing.T) {
+	t.Parallel()
+	body := "<!-- looper:review id=abc head=def outcome=non_blocking -->"
+	comment := reviewSubmitComment{Body: "blocking finding", Severity: "blocking", Path: "main.go", Line: 10, Side: "RIGHT"}
+	err := validateReviewSubmitBody(body, []reviewSubmitComment{comment}, "def", "COMMENT", commentOnlyReviewPolicy, "octocat")
+	if err == nil || !strings.Contains(err.Error(), "exceeds review outcome=non_blocking") {
+		t.Fatalf("validateReviewSubmitBody() error = %v, want outcome mismatch", err)
+	}
+}
+
+func TestBuildReviewSubmitCommentsPersistsSeverityMarker(t *testing.T) {
+	t.Parallel()
+	comments, err := buildReviewSubmitComments([]reviewSubmitComment{{Body: "style cleanup", Severity: "nit", Path: "main.go", Line: 10, Side: "RIGHT"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(comments) != 1 || !strings.Contains(comments[0].Body, "<!-- looper:review-item severity=nit -->") {
+		t.Fatalf("comments = %#v, want persisted severity marker", comments)
 	}
 }
 

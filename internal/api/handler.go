@@ -33,6 +33,7 @@ import (
 	"github.com/MumuTW/looper/internal/loops"
 	networkclient "github.com/MumuTW/looper/internal/network/client"
 	"github.com/MumuTW/looper/internal/projects"
+	"github.com/MumuTW/looper/internal/reviewer/convergence"
 	looperdruntime "github.com/MumuTW/looper/internal/runtime"
 	"github.com/MumuTW/looper/internal/storage"
 	"github.com/MumuTW/looper/internal/triager"
@@ -1887,10 +1888,15 @@ type loopResponse struct {
 	Status       string  `json:"status"`
 	ConfigJSON   *string `json:"configJson"`
 	MetadataJSON *string `json:"metadataJson"`
-	LastRunAt    *string `json:"lastRunAt"`
-	NextRunAt    *string `json:"nextRunAt"`
-	CreatedAt    string  `json:"createdAt"`
-	UpdatedAt    string  `json:"updatedAt"`
+	// Convergence is a typed read-only projection of the reviewer loop's
+	// persisted semantic progress. The metadata blob remains the durable
+	// authority; this field prevents dashboard clients from parsing it or
+	// inferring state from review prose.
+	Convergence *reviewerConvergenceProjection `json:"convergence,omitempty"`
+	LastRunAt   *string                        `json:"lastRunAt"`
+	NextRunAt   *string                        `json:"nextRunAt"`
+	CreatedAt   string                         `json:"createdAt"`
+	UpdatedAt   string                         `json:"updatedAt"`
 	// Queue-derived diagnostics (latest queue item / run), matching looper describe / ps.
 	Attempts          *int64  `json:"attempts,omitempty"`
 	MaxAttempts       *int64  `json:"maxAttempts,omitempty"`
@@ -1899,6 +1905,15 @@ type loopResponse struct {
 	// Outcome is the latest run's derived outcome, so a loop view shows what that
 	// run actually accomplished rather than only that it failed.
 	Outcome *fixer.FixerRunOutcome `json:"outcome,omitempty"`
+}
+
+type reviewerConvergenceProjection struct {
+	Policy    convergence.Policy `json:"policy"`
+	State     convergence.State  `json:"state"`
+	Action    convergence.Action `json:"action,omitempty"`
+	Reason    convergence.Reason `json:"reason,omitempty"`
+	Status    string             `json:"status,omitempty"`
+	UpdatedAt string             `json:"updatedAt,omitempty"`
 }
 
 type loopLogsResponse struct {
@@ -6703,11 +6718,51 @@ func serializeLoop(loop storage.LoopRecord) loopResponse {
 		Status:       loop.Status,
 		ConfigJSON:   loop.ConfigJSON,
 		MetadataJSON: loop.MetadataJSON,
+		Convergence:  parseReviewerConvergenceProjection(loop.MetadataJSON),
 		LastRunAt:    loop.LastRunAt,
 		NextRunAt:    loop.NextRunAt,
 		CreatedAt:    loop.CreatedAt,
 		UpdatedAt:    loop.UpdatedAt,
 	}
+}
+
+// parseReviewerConvergenceProjection reads only the typed convergence object
+// already persisted by Reviewer. Invalid or legacy metadata is omitted from
+// the projection rather than making an otherwise readable loop unavailable.
+func parseReviewerConvergenceProjection(metadataJSON *string) *reviewerConvergenceProjection {
+	metadata := parseJSONObject(metadataJSON)
+	raw, ok := metadata["convergence"]
+	if !ok || raw == nil {
+		return nil
+	}
+	encoded, err := json.Marshal(raw)
+	if err != nil {
+		return nil
+	}
+	var projection reviewerConvergenceProjection
+	if err := json.Unmarshal(encoded, &projection); err != nil {
+		return nil
+	}
+	// A valid policy alone is not enough: json.Unmarshal accepts malformed
+	// state (negative counters, unknown item statuses/severities, empty IDs)
+	// and unknown action/reason/status values. Validate the full record so the
+	// API and dashboard never surface nonsensical convergence progress.
+	if err := projection.Policy.Validate(); err != nil {
+		return nil
+	}
+	if err := projection.State.Validate(); err != nil {
+		return nil
+	}
+	if !projection.Action.Valid() {
+		return nil
+	}
+	if !projection.Reason.Valid() {
+		return nil
+	}
+	if !convergence.ValidStatus(projection.Status) {
+		return nil
+	}
+	return &projection
 }
 
 // serializeLoopWithDiagnostics loads latest queue/run and attaches attempt/error fields.

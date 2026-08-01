@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/MumuTW/looper/internal/diffanchor"
+	"github.com/MumuTW/looper/internal/reviewitem"
 )
 
 func TestNormalizeReviewAnchorsPreservesValidAndDowngradesInvalid(t *testing.T) {
@@ -27,6 +28,29 @@ func TestNormalizeReviewAnchorsPreservesValidAndDowngradesInvalid(t *testing.T) 
 	if len(flags) != 0 {
 		t.Fatalf("unexpected quality flags: %#v", flags)
 	}
+}
+
+func TestNormalizeReviewAnchorsDropsUnanchorableStructuredReviewItem(t *testing.T) {
+	t.Parallel()
+	idx := diffanchor.Parse("diff --git a/app.go b/app.go\n@@ -1,2 +1,2 @@\n-old\n+new\n keep\n")
+	body, comments, flags, processing := normalizeReviewAnchors("Needs changes", []ReviewComment{
+		{Body: "Blocking issue\n\n" + mustReviewItemMarker(t, reviewitem.SeverityBlocking), Path: "app.go", Line: 99, Side: "RIGHT"},
+	}, &idx)
+	if len(comments) != 0 || strings.Contains(body, "Blocking issue") {
+		t.Fatalf("structured item was downgraded: body=%q comments=%#v", body, comments)
+	}
+	if len(flags) < 1 || flags[0].Kind != "review-item-anchor-missing" || processing.DroppedCount != 1 {
+		t.Fatalf("flags=%#v processing=%#v, want structured-anchor failure", flags, processing)
+	}
+}
+
+func mustReviewItemMarker(t *testing.T, severity reviewitem.Severity) string {
+	t.Helper()
+	marker, err := reviewitem.Marker(severity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return marker
 }
 
 func TestNormalizeReviewAnchorsMovesNearbyOutOfRangeAnchorToNearestHunk(t *testing.T) {

@@ -35,6 +35,10 @@ func TestIsHotEditablePathUsesExplicitAllowlist(t *testing.T) {
 		"defaults.allowAutoPush",
 		"instructions.enabled",
 		"roles.reviewer.behavior.scope",
+		"roles.reviewer.behavior.convergence.maxConsecutiveUnproductive",
+		"roles.reviewer.behavior.convergence.maxFixerAttemptsPerItem",
+		"roles.reviewer.behavior.convergence.maxTotalRounds",
+		"roles.reviewer.behavior.convergence.severityFloor",
 		"tools.looperPath",
 		"tools.osascriptPath",
 	}
