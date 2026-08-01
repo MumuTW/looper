@@ -23,11 +23,30 @@ type Sandbox struct {
 	CWD         string
 	ProfileName string
 	TempRoot    string
+	access      workspaceAccess
 }
+
+type workspaceAccess string
+
+const (
+	workspaceWritable workspaceAccess = "write"
+	workspaceReadOnly workspaceAccess = "read"
+)
 
 // NewSandbox creates the disposable filesystem used by one sandboxed run.
 // Call Cleanup after the owning process has terminated.
 func NewSandbox(cwd, profileName, prefix string) (*Sandbox, error) {
+	return newSandbox(cwd, profileName, prefix, workspaceWritable)
+}
+
+// NewAssessmentSandbox creates the Codex tool profile used before a human has
+// authorized repository mutation. The worktree and linked Git metadata remain
+// readable, while only the run-scoped temporary root is writable.
+func NewAssessmentSandbox(cwd, profileName, prefix string) (*Sandbox, error) {
+	return newSandbox(cwd, profileName, prefix, workspaceReadOnly)
+}
+
+func newSandbox(cwd, profileName, prefix string, access workspaceAccess) (*Sandbox, error) {
 	cwd = strings.TrimSpace(cwd)
 	if cwd == "" {
 		return nil, fmt.Errorf("validation sandbox: cwd is required")
@@ -43,7 +62,11 @@ func NewSandbox(cwd, profileName, prefix string) (*Sandbox, error) {
 	if err != nil {
 		return nil, fmt.Errorf("validation sandbox: create temporary root: %w", err)
 	}
-	sandbox := &Sandbox{CWD: filepath.Clean(cwd), ProfileName: profileName, TempRoot: tempRoot}
+	if access != workspaceWritable && access != workspaceReadOnly {
+		_ = os.RemoveAll(tempRoot)
+		return nil, fmt.Errorf("validation sandbox: unsupported workspace access %q", access)
+	}
+	sandbox := &Sandbox{CWD: filepath.Clean(cwd), ProfileName: profileName, TempRoot: tempRoot, access: access}
 	for _, dir := range []string{"home", "tmp", "xdg-config", "xdg-cache", "xdg-data", "go", "go-cache"} {
 		if err := os.MkdirAll(filepath.Join(tempRoot, dir), 0o700); err != nil {
 			sandbox.Cleanup()
@@ -61,7 +84,7 @@ func (s *Sandbox) Cleanup() {
 
 // PermissionConfig returns the inline Codex permission profile definition.
 func (s *Sandbox) PermissionConfig() string {
-	return buildPermissionProfile(s.CWD, s.TempRoot, s.ProfileName)
+	return buildPermissionProfileForAccess(s.CWD, s.TempRoot, s.ProfileName, s.access)
 }
 
 // Environment returns the allowlisted environment exposed to sandboxed tools.
@@ -177,7 +200,7 @@ func resolvedModuleCache() string {
 	return ""
 }
 
-func buildPermissionProfile(cwd, tempRoot, profileName string) string {
+func buildPermissionProfileForAccess(cwd, tempRoot, profileName string, access workspaceAccess) string {
 	readRoots := map[string]struct{}{}
 	for _, entry := range filepath.SplitList(os.Getenv("PATH")) {
 		entry = strings.TrimSpace(entry)
@@ -209,8 +232,11 @@ func buildPermissionProfile(cwd, tempRoot, profileName string) string {
 	}
 	sort.Strings(paths)
 
+	if access != workspaceWritable && access != workspaceReadOnly {
+		return ""
+	}
 	var filesystem strings.Builder
-	filesystem.WriteString(`":minimal" = "read", ":workspace_roots" = { "." = "write" }`)
+	fmt.Fprintf(&filesystem, `":minimal" = "read", ":workspace_roots" = { "." = %q }`, string(access))
 	fmt.Fprintf(&filesystem, ", %s = \"write\"", strconv.Quote(filepath.Clean(tempRoot)))
 	for _, path := range paths {
 		fmt.Fprintf(&filesystem, ", %s = \"read\"", strconv.Quote(path))
@@ -233,7 +259,8 @@ func resolvedGoRoot() string {
 }
 
 func linkedWorktreeReadRoots(cwd string) []string {
-	data, err := os.ReadFile(filepath.Join(cwd, ".git"))
+	worktreeGitFile := filepath.Join(filepath.Clean(cwd), ".git")
+	data, err := os.ReadFile(worktreeGitFile)
 	if err != nil {
 		return nil
 	}
@@ -246,17 +273,76 @@ func linkedWorktreeReadRoots(cwd string) []string {
 		gitDir = filepath.Join(cwd, gitDir)
 	}
 	gitDir = filepath.Clean(gitDir)
+	common, readErr := os.ReadFile(filepath.Join(gitDir, "commondir"))
+	if readErr != nil {
+		return nil
+	}
+	commonDir := strings.TrimSpace(string(common))
+	if commonDir == "" {
+		return nil
+	}
+	if !filepath.IsAbs(commonDir) {
+		commonDir = filepath.Join(gitDir, commonDir)
+	}
+	commonDir = filepath.Clean(commonDir)
+
+	// The worktree's .git file is repository-controlled input, so it cannot by
+	// itself authorize additional read roots. Git's reciprocal linked-worktree
+	// records are the authority: the private git dir must be a direct child of
+	// <common-dir>/worktrees and its gitdir record must point back to this
+	// worktree's .git file.
+	worktreesDir := filepath.Join(commonDir, "worktrees")
+	if filepath.Dir(gitDir) != worktreesDir || !sameFilesystemPath(filepath.Join(gitDir, "gitdir"), worktreeGitFile) {
+		return nil
+	}
+	// Grant only the Git metadata required for read-only inspection. The whole
+	// commonDir would expose .git/config (remote URLs with embedded credentials,
+	// credential.helper paths) to untrusted assessment prompts.
+	return assessmentSafeGitReadRoots(gitDir, commonDir)
+}
+
+// assessmentSafeGitReadRoots returns the private worktree git dir plus the
+// object/ref metadata under the common git dir, deliberately omitting config,
+// hooks, and other credential-bearing paths at the common root.
+func assessmentSafeGitReadRoots(gitDir, commonDir string) []string {
 	roots := []string{gitDir}
-	if common, readErr := os.ReadFile(filepath.Join(gitDir, "commondir")); readErr == nil {
-		commonDir := strings.TrimSpace(string(common))
-		if commonDir != "" {
-			if !filepath.IsAbs(commonDir) {
-				commonDir = filepath.Join(gitDir, commonDir)
-			}
-			roots = append(roots, filepath.Clean(commonDir))
+	for _, name := range []string{"objects", "refs", "info", "logs", "packed-refs", "HEAD", "shallow"} {
+		path := filepath.Join(commonDir, name)
+		if _, err := os.Stat(path); err == nil {
+			roots = append(roots, path)
 		}
 	}
 	return roots
+}
+
+func sameFilesystemPath(pathFile, want string) bool {
+	data, err := os.ReadFile(pathFile)
+	if err != nil {
+		return false
+	}
+	got := strings.TrimSpace(string(data))
+	if got == "" {
+		return false
+	}
+	if !filepath.IsAbs(got) {
+		got = filepath.Join(filepath.Dir(pathFile), got)
+	}
+	return samePath(got, want)
+}
+
+func samePath(a, b string) bool {
+	a = filepath.Clean(a)
+	b = filepath.Clean(b)
+	if a == b {
+		return true
+	}
+	// macOS TempDir is often /var/... while Git records /private/var/...
+	ra, errA := filepath.EvalSymlinks(a)
+	rb, errB := filepath.EvalSymlinks(b)
+	if errA != nil || errB != nil {
+		return false
+	}
+	return filepath.Clean(ra) == filepath.Clean(rb)
 }
 
 func isolatedEnvironment(cwd, tempRoot string) []string {
