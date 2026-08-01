@@ -5983,6 +5983,10 @@ func (h *Handler) deliverHumanAnswer(ctx context.Context, loopID string, rawAnsw
 
 	services := h.context.Runtime.Services()
 	nowISO := eventlog.FormatJavaScriptISOString(h.now().UTC())
+	// Serialize with worker HITL correlation writes (same per-loop requeue
+	// guard). Hold only around the metadata write — mutateLoopStatus(Running)
+	// acquires the same lock and would deadlock if we nested.
+	unlock := loops.LockLoopRequeue(loopID)
 	_, err := storage.WithTransactionValue(ctx, services.Coordinator.DB(), nil, func(tx *sql.Tx) (storage.LoopRecord, error) {
 		repos := storage.NewRepositories(tx)
 		loop, err := repos.Loops.GetByID(ctx, loopID)
@@ -6018,6 +6022,7 @@ func (h *Handler) deliverHumanAnswer(ctx context.Context, loopID string, rawAnsw
 		}
 		return updated, nil
 	})
+	unlock()
 	if err != nil {
 		var typed apiError
 		if asAPIError(err, &typed) {

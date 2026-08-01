@@ -27,7 +27,7 @@ func TestConsumeAskSentinelReadsAndRemoves(t *testing.T) {
 		t.Fatalf("WriteFile error = %v", err)
 	}
 
-	ask, err := consumeAskSentinel(dir)
+	ask, evidence, err := consumeAskSentinel(dir)
 	if err != nil {
 		t.Fatalf("consumeAskSentinel error = %v", err)
 	}
@@ -35,15 +35,25 @@ func TestConsumeAskSentinelReadsAndRemoves(t *testing.T) {
 		t.Fatalf("ask = %#v, want the parsed question + 2 options", ask)
 	}
 	if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
-		t.Fatal("sentinel file must be removed after consumption")
+		t.Fatal("active sentinel must be staged out of ask.json")
+	}
+	if evidence == nil {
+		t.Fatal("evidence = nil, want staged pending identity retained until suspend persists")
+	}
+	// Pending remains until explicit consume (after durable ask write).
+	if _, err := os.Lstat(filepath.Join(dir, ".looper", "ask.pending")); err != nil {
+		t.Fatalf("ask.pending missing after stage: %v", err)
+	}
+	if err := loops.ConsumeHITLGateEvidence(evidence); err != nil {
+		t.Fatalf("ConsumeHITLGateEvidence() error = %v", err)
 	}
 
 	// No sentinel -> nil, nil (both a missing file and an absent .looper dir).
-	if again, err := consumeAskSentinel(dir); err != nil || again != nil {
-		t.Fatalf("second consumeAskSentinel = (%#v, %v), want (nil, nil)", again, err)
+	if again, againEv, err := consumeAskSentinel(dir); err != nil || again != nil || againEv != nil {
+		t.Fatalf("second consumeAskSentinel = (%#v, %#v, %v), want (nil, nil, nil)", again, againEv, err)
 	}
-	if missing, err := consumeAskSentinel(t.TempDir()); err != nil || missing != nil {
-		t.Fatalf("consumeAskSentinel(empty dir) = (%#v, %v), want (nil, nil)", missing, err)
+	if missing, missingEv, err := consumeAskSentinel(t.TempDir()); err != nil || missing != nil || missingEv != nil {
+		t.Fatalf("consumeAskSentinel(empty dir) = (%#v, %#v, %v), want (nil, nil, nil)", missing, missingEv, err)
 	}
 }
 
@@ -608,7 +618,7 @@ func TestConsumeAskSentinelFailsClosedAndQuarantines(t *testing.T) {
 
 	t.Run("truncated JSON fails closed with evidence quarantined", func(t *testing.T) {
 		dir := writeSentinel(t, `{"question":"delete prod?`)
-		ask, err := consumeAskSentinel(dir)
+		ask, _, err := consumeAskSentinel(dir)
 		if err == nil || ask != nil {
 			t.Fatalf("consumeAskSentinel = (%#v, %v), want fail-closed error", ask, err)
 		}
@@ -620,7 +630,7 @@ func TestConsumeAskSentinelFailsClosedAndQuarantines(t *testing.T) {
 
 	t.Run("schema without question fails closed", func(t *testing.T) {
 		dir := writeSentinel(t, `{"options":["a","b"]}`)
-		ask, err := consumeAskSentinel(dir)
+		ask, _, err := consumeAskSentinel(dir)
 		if err == nil || ask != nil {
 			t.Fatalf("consumeAskSentinel = (%#v, %v), want fail-closed error", ask, err)
 		}
@@ -637,7 +647,7 @@ func TestConsumeAskSentinelFailsClosedAndQuarantines(t *testing.T) {
 			t.Fatalf("Chmod error = %v", err)
 		}
 		t.Cleanup(func() { _ = os.Chmod(path, 0o644) })
-		ask, err := consumeAskSentinel(dir)
+		ask, _, err := consumeAskSentinel(dir)
 		if err == nil || ask != nil {
 			t.Fatalf("consumeAskSentinel = (%#v, %v), want fail-closed error", ask, err)
 		}
@@ -651,7 +661,7 @@ func TestConsumeAskSentinelFailsClosedAndQuarantines(t *testing.T) {
 
 	t.Run("oversized sentinel fails closed", func(t *testing.T) {
 		dir := writeSentinel(t, `{"question":"`+strings.Repeat("x", maxAskSentinelBytes)+`"}`)
-		ask, err := consumeAskSentinel(dir)
+		ask, _, err := consumeAskSentinel(dir)
 		if err == nil || ask != nil {
 			t.Fatalf("consumeAskSentinel = (%#v, %v), want fail-closed error", ask, err)
 		}
@@ -662,7 +672,7 @@ func TestConsumeAskSentinelFailsClosedAndQuarantines(t *testing.T) {
 
 	t.Run("pending evidence bounds repeated malformed asks", func(t *testing.T) {
 		dir := writeSentinel(t, `{"question":"first attempt`)
-		_, err1 := consumeAskSentinel(dir)
+		_, _, err1 := consumeAskSentinel(dir)
 		if err1 == nil {
 			t.Fatal("first consumeAskSentinel error = nil, want fail-closed error")
 		}
@@ -671,7 +681,7 @@ func TestConsumeAskSentinelFailsClosedAndQuarantines(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(dir, hitlSentinelRelPath), []byte(`{"question":"second attempt`), 0o644); err != nil {
 			t.Fatalf("WriteFile(second) error = %v", err)
 		}
-		_, err2 := consumeAskSentinel(dir)
+		_, _, err2 := consumeAskSentinel(dir)
 		if err2 == nil {
 			t.Fatal("second consumeAskSentinel error = nil, want fail-closed error")
 		}
@@ -684,17 +694,28 @@ func TestConsumeAskSentinelFailsClosedAndQuarantines(t *testing.T) {
 		}
 	})
 
-	t.Run("valid ask still consumed, absent still no-question", func(t *testing.T) {
+	t.Run("valid ask staged until explicit consume", func(t *testing.T) {
 		dir := writeSentinel(t, `{"question":"Redis or Postgres?","options":["redis","postgres"]}`)
-		ask, err := consumeAskSentinel(dir)
+		ask, evidence, err := consumeAskSentinel(dir)
 		if err != nil || ask == nil || ask.Question != "Redis or Postgres?" {
 			t.Fatalf("consumeAskSentinel = (%#v, %v), want the parsed ask", ask, err)
 		}
 		if _, statErr := os.Stat(filepath.Join(dir, hitlSentinelRelPath)); !os.IsNotExist(statErr) {
-			t.Fatal("valid sentinel must be consumed")
+			t.Fatal("active ask.json must be staged away")
 		}
-		if again, err := consumeAskSentinel(dir); err != nil || again != nil {
-			t.Fatalf("second consumeAskSentinel = (%#v, %v), want (nil, nil)", again, err)
+		if evidence == nil {
+			t.Fatal("evidence = nil, want staged pending retained")
+		}
+		// Recovery can re-read pending until suspend consumes it.
+		again, againEv, err := consumeAskSentinel(dir)
+		if err != nil || again == nil || againEv == nil {
+			t.Fatalf("second consumeAskSentinel = (%#v, %#v, %v), want recoverable pending", again, againEv, err)
+		}
+		if err := loops.ConsumeHITLGateEvidence(evidence); err != nil {
+			t.Fatalf("ConsumeHITLGateEvidence() error = %v", err)
+		}
+		if gone, goneEv, err := consumeAskSentinel(dir); err != nil || gone != nil || goneEv != nil {
+			t.Fatalf("after consume = (%#v, %#v, %v), want empty", gone, goneEv, err)
 		}
 	})
 }
