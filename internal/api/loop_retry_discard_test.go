@@ -1312,6 +1312,8 @@ func TestHandlerLoopRetryDiscardRejectsCheckpointBranchMismatch(t *testing.T) {
 	}
 	statusError := parseJSONMap(t, statusRecorder.Body.Bytes())["error"].(map[string]any)
 	statusDetails := statusError["details"].(map[string]any)
+	// Worker revalidates the physical checkout before agent start, so plain
+	// retry remains available when identity fails.
 	assertEqual(t, statusDetails["retrySafe"], true)
 
 	retryReq := httptest.NewRequest(http.MethodPost, "/api/v1/loops/3137/retry", strings.NewReader(`{"mode":"auto","discardWorktreeChanges":true}`))
@@ -1360,6 +1362,54 @@ func TestHandlerLoopRetryDiscardRejectsCheckpointBranchMismatch(t *testing.T) {
 	if got := readTestFile(t, filepath.Join(fixture.WorktreePath, "dirty.txt")); got != "untracked\n" {
 		t.Fatalf("replacement branch progress changed during identity refusal: dirty.txt = %q", got)
 	}
+}
+
+func TestWorktreeStatusIdentityFailureRetrySafeFalseForPlanner(t *testing.T) {
+	// Planner does not revalidate physical identity before agent work the way
+	// Worker does, so a failed identity check must not advertise retrySafe.
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+	fixture := seedManagedWorktreeFixture(t, services.Repositories, managedWorktreeSeed{
+		ProjectID: "project_retry_planner_identity",
+		LoopID:    "loop_retry_planner_identity",
+		LoopSeq:   3147,
+		LoopType:  "planner",
+		Branch:    "feature/planner-checkpoint",
+		NowISO:    nowISO,
+		Dirty:     true,
+	})
+
+	runGitTest(t, fixture.WorktreePath, "switch", "-c", "feature/planner-replacement")
+	record, err := services.Repositories.Worktrees.GetByBranch(context.Background(), "project_retry_planner_identity", "feature/planner-checkpoint")
+	if err != nil || record == nil {
+		t.Fatalf("GetByBranch() = %#v, %v", record, err)
+	}
+	record.Branch = "feature/planner-replacement"
+	record.UpdatedAt = nowISO
+	if err := services.Repositories.Worktrees.Upsert(context.Background(), *record); err != nil {
+		t.Fatalf("Worktrees.Upsert() error = %v", err)
+	}
+	latestRun, err := services.Repositories.Runs.GetLatestByLoopID(context.Background(), fixture.LoopID)
+	if err != nil || latestRun == nil {
+		t.Fatalf("Runs.GetLatestByLoopID() = %#v, %v", latestRun, err)
+	}
+	checkpointJSON := fmt.Sprintf(`{"resumePolicy":"advance_from_checkpoint","worktree":{"id":%q,"path":%q,"branch":"feature/planner-checkpoint","baseBranch":"main"}}`, record.ID, fixture.WorktreePath)
+	latestRun.CheckpointJSON = &checkpointJSON
+	if err := services.Repositories.Runs.Upsert(context.Background(), *latestRun); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+
+	statusReq := httptest.NewRequest(http.MethodGet, "/api/v1/loops/3147/worktree", nil)
+	statusRecorder := httptest.NewRecorder()
+	h.ServeHTTP(statusRecorder, statusReq)
+	if statusRecorder.Code != http.StatusBadRequest {
+		t.Fatalf("worktree status = %d body=%s, want 400", statusRecorder.Code, statusRecorder.Body.String())
+	}
+	statusError := parseJSONMap(t, statusRecorder.Body.Bytes())["error"].(map[string]any)
+	statusDetails := statusError["details"].(map[string]any)
+	assertEqual(t, statusDetails["retrySafe"], false)
 }
 
 func TestHandlerLoopRetryDiscardRejectsPhysicalBranchMismatchBeforeReset(t *testing.T) {
