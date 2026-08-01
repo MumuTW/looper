@@ -669,10 +669,13 @@ func (r *Runtime) BeginDrain(reason string) error {
 	// started, even if residuals remain and workProducerJoinActive is false.
 	// A second join would snapshot nil producer fields and wipe residual dones.
 	if r.workProducerJoinStarted.CompareAndSwap(false, true) {
-		r.workProducerJoinActive.Store(true)
+		// Publish completion channel before Active so Stop cannot observe
+		// active=true with a nil channel and race into shutdown.
+		done := make(chan struct{})
 		r.mu.Lock()
-		r.workProducerJoinDone = make(chan struct{})
+		r.workProducerJoinDone = done
 		r.mu.Unlock()
+		r.workProducerJoinActive.Store(true)
 		go r.joinWorkProducersForDrain()
 	}
 	return nil
@@ -747,13 +750,26 @@ func (r *Runtime) waitForDrainProducerJoin() {
 	}
 	r.mu.RLock()
 	joinDone := r.workProducerJoinDone
-	active := r.workProducerJoinActive.Load()
+	started := r.workProducerJoinStarted.Load()
 	r.mu.RUnlock()
-	if joinDone == nil && !active {
+	if !started && joinDone == nil {
 		return
 	}
 	if joinDone != nil {
 		<-joinDone
+	} else {
+		// Join started but channel not yet published — spin briefly for it.
+		deadline := time.Now().Add(time.Second)
+		for time.Now().Before(deadline) {
+			r.mu.RLock()
+			joinDone = r.workProducerJoinDone
+			r.mu.RUnlock()
+			if joinDone != nil {
+				<-joinDone
+				break
+			}
+			time.Sleep(time.Millisecond)
+		}
 	}
 	// Join finished registering residuals; wait a bounded time for residuals
 	// that stop* already timed out on, without blocking forever.
@@ -770,6 +786,14 @@ func (r *Runtime) waitForDrainProducerJoin() {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
+	// Residuals still live after the bounded wait: retain storage on Stop so
+	// SQLite is not closed under those producers (first join already nilled
+	// the stop* fields, so a second wait cannot join them).
+	r.mu.Lock()
+	if len(r.drainResidualDones) > 0 {
+		r.shutdownDrainErr = errors.Join(r.shutdownDrainErr, fmt.Errorf("upgrade drain residual work producers still running after shutdown wait (%d)", len(r.drainResidualDones)))
+	}
+	r.mu.Unlock()
 }
 
 // DrainSnapshot reports Supervisor-owned work still in flight after BeginDrain.

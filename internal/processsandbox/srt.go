@@ -40,9 +40,37 @@ func Available() error {
 // start in daemon.workingDirectory; preflight/--check-config must use that
 // directory so sandbox trust matches real startup rather than the operator shell.
 func AvailableInDirectory(cwd string) error {
+	return availableInEnvironment(cwd, "")
+}
+
+// ServiceProbePATH is the PATH assumed when a launchd/systemd unit injects no
+// environment (typical supervised install). Preflight must not inherit the
+// operator shell PATH or it can authorize a candidate that fails at daemon boot.
+const ServiceProbePATH = "/usr/bin:/bin:/usr/sbin:/sbin"
+
+// AvailableInServiceEnvironment probes sandbox readiness with the supervised
+// daemon's working directory and a minimal service PATH.
+func AvailableInServiceEnvironment(cwd string) error {
+	return availableInEnvironment(cwd, ServiceProbePATH)
+}
+
+func availableInEnvironment(cwd, pathEnv string) error {
 	cwd = strings.TrimSpace(cwd)
 	if cwd == "" {
 		return fmt.Errorf("process sandbox: working directory is required")
+	}
+	if pathEnv != "" {
+		previous, had := os.LookupEnv("PATH")
+		if err := os.Setenv("PATH", pathEnv); err != nil {
+			return fmt.Errorf("process sandbox: set service PATH: %w", err)
+		}
+		defer func() {
+			if had {
+				_ = os.Setenv("PATH", previous)
+			} else {
+				_ = os.Unsetenv("PATH")
+			}
+		}()
 	}
 	_, err := installedRuntime(cwd, nil)
 	return err
