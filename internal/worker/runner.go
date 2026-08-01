@@ -783,6 +783,11 @@ func captureWorkerReproduction(checkpoint *workerCheckpoint, worktreePath string
 		if !workerReproductionManifestAppliesToTask(*manifest, *checkpoint.Work) {
 			return nil
 		}
+		// First capture must Verify the test hash before the daemon will
+		// execute testCommand or treat the manifest as the run authority.
+		if err := manifest.Verify(worktreePath); err != nil {
+			return reproductionFailure(err)
+		}
 		checkpoint.Work.Reproduction = manifest
 	}
 	return nil
@@ -2509,6 +2514,11 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 		}
 		result.HeadSHA = inspect.HeadSHA
 		checkpoint.Validation = &result
+		// Validation can rewrite reproduction files; re-check integrity at the
+		// head that is about to be published.
+		if err := verifyWorkerReproduction(checkpoint, worktree.Path); err != nil {
+			return checkpoint, err
+		}
 	}
 	if len(validationCommands) > 0 {
 		worktreeRoot, rootErr := workerWorktreeRoot(input.Project)

@@ -723,7 +723,11 @@ type fixerCheckpoint struct {
 	SummaryComment   *checkpointSummaryComment   `json:"summaryComment,omitempty"`
 	Recheck          *checkpointRecheck          `json:"recheck,omitempty"`
 	Reproduction     *reproducer.Manifest        `json:"reproduction,omitempty"`
-	SkipReason       string                      `json:"skipReason,omitempty"`
+	// ReproductionAbsent is set when the first capture observes no committed
+	// manifest. Later captures refuse to adopt an agent-authored manifest so
+	// the daemon cannot execute a testCommand that was not present at run start.
+	ReproductionAbsent bool   `json:"reproductionAbsent,omitempty"`
+	SkipReason         string `json:"skipReason,omitempty"`
 }
 
 type checkpointPause struct {
@@ -922,6 +926,11 @@ func fixerReproductionFailure(err error) *loopError {
 // captureFixerReproduction records the optional committed reproduction
 // manifest. Once captured, a retry cannot silently replace its test identity
 // or hash with a new agent-authored manifest.
+//
+// First capture always Verify()s the test hash before the daemon will run
+// testCommand. When the run begins without a manifest, ReproductionAbsent is
+// recorded so a later agent-authored manifest cannot silently become the
+// authority mid-run.
 func captureFixerReproduction(checkpoint *fixerCheckpoint, worktreePath string) error {
 	if checkpoint == nil {
 		return nil
@@ -943,8 +952,21 @@ func captureFixerReproduction(checkpoint *fixerCheckpoint, worktreePath string) 
 		return nil
 	}
 	if manifest != nil {
+		if checkpoint.ReproductionAbsent {
+			// The Fixer started without a committed reproduction contract. An
+			// agent-authored manifest mid-run is not authority: adopting it
+			// would let the agent invent the testCommand the daemon executes.
+			return fixerReproductionFailure(errors.New("reproduction manifest appeared after run start without a prior contract"))
+		}
+		if err := manifest.Verify(worktreePath); err != nil {
+			return fixerReproductionFailure(err)
+		}
 		checkpoint.Reproduction = manifest
+		return nil
 	}
+	// Persist the negative observation so a later capture cannot treat a
+	// newly written manifest as the original contract.
+	checkpoint.ReproductionAbsent = true
 	return nil
 }
 
@@ -3718,7 +3740,16 @@ func (r *Runner) adoptLifecyclePushEvidence(ctx context.Context, input stepInput
 		if !prepared.Clean {
 			return false, checkpoint, &loopError{message: fmt.Sprintf("Fixer worktree is dirty after adopting agent-pushed head %s", adoptedHead), kind: FailureRetryableAfterResume}
 		}
-		validationCommands := r.validationCommandsForProject(input.Project.ID)
+		// Re-verify after PrepareWorktree lands on the pushed head: the local
+		// tree may have been restored after a push that changed reproduction
+		// files on the remote tip.
+		if err := captureFixerReproduction(&checkpoint, checkpoint.Worktree.Path); err != nil {
+			return false, checkpoint, err
+		}
+		if err := verifyFixerReproduction(checkpoint, checkpoint.Worktree.Path); err != nil {
+			return false, checkpoint, err
+		}
+		validationCommands := fixerValidationCommands(r.validationCommandsForProject(input.Project.ID), checkpoint)
 		validation, err := r.runValidation(ctx, ValidationInput{CWD: checkpoint.Worktree.Path, Commands: validationCommands})
 		if err != nil {
 			return false, checkpoint, err
@@ -3740,7 +3771,15 @@ func (r *Runner) adoptLifecyclePushEvidence(ctx context.Context, input stepInput
 		if validation.HeadSHA != adoptedHead {
 			return false, checkpoint, &loopError{message: firstNonEmpty(validation.Summary, "Validation failed for adopted agent-pushed head"), kind: FailureRetryableAfterResume}
 		}
+		// Validation commands can rewrite files; re-check the contract at the
+		// head we are about to claim as pushed.
+		if err := verifyFixerReproduction(checkpoint, checkpoint.Worktree.Path); err != nil {
+			return false, checkpoint, err
+		}
 		checkpoint.Worktree.HeadSHA = adoptedHead
+	} else if err := verifyFixerReproduction(checkpoint, checkpoint.Worktree.Path); err != nil {
+		// Already-validated path still re-verifies at the adopted head.
+		return false, checkpoint, err
 	}
 	checkpoint.Detail = mergeCheckpointDetailPreservingLabels(checkpoint.Detail, liveDetail)
 	pushedAt := r.nowISO()
@@ -6689,6 +6728,28 @@ func (r *Runner) cleanupFixerWorktreeIfTerminal(ctx context.Context, project sto
 			r.logWarn("fixer worktree cleanup skipped for human takeover", map[string]any{"runId": runID, "loopId": loop.ID, "worktreePath": checkpoint.Worktree.Path, "branch": checkpoint.Worktree.Branch})
 			return
 		}
+		// Cancelled/interrupted runs that lost human_takeover via handback (or
+		// were pre-empted) must not delete a checkout the still-active loop
+		// owns. Ordinary terminal failures still clean while the loop is
+		// running/paused so breaker paths can free the tree.
+		if (run.Status == string(domain.RunStatusCancelled) || run.Status == string(domain.RunStatusInterrupted)) &&
+			domain.IsActiveLoopStatus(domain.LoopStatus(loop.Status)) {
+			cause := fmt.Errorf("run is %s while loop is %s; worktree ownership remains with the active loop", run.Status, loop.Status)
+			r.appendEvent(ctx, eventInput{eventType: "fixer.worktree.cleanup_skipped", projectID: project.ID, loopID: loop.ID, runID: runID, entityType: "loop", entityID: loop.ID, payload: map[string]any{"path": checkpoint.Worktree.Path, "branch": checkpoint.Worktree.Branch, "reason": cause.Error()}})
+			r.recordCleanupSecondaryIssue(ctx, runID, checkpoint, cause)
+			r.logWarn("fixer worktree cleanup skipped for cancelled run on active loop", map[string]any{"runId": runID, "loopId": loop.ID, "runStatus": run.Status, "loopStatus": loop.Status, "worktreePath": checkpoint.Worktree.Path})
+			return
+		}
+		// Shared PR checkouts: a sibling loop in human_takeover for the same
+		// project+PR owns the detached path even when this Fixer loop is
+		// terminal.
+		if skip, reason := r.siblingHumanTakeoverOwnsWorktree(ctx, *loop); skip {
+			cause := errors.New(reason)
+			r.appendEvent(ctx, eventInput{eventType: "fixer.worktree.cleanup_skipped", projectID: project.ID, loopID: loop.ID, runID: runID, entityType: "loop", entityID: loop.ID, payload: map[string]any{"path": checkpoint.Worktree.Path, "branch": checkpoint.Worktree.Branch, "reason": cause.Error()}})
+			r.recordCleanupSecondaryIssue(ctx, runID, checkpoint, cause)
+			r.logWarn("fixer worktree cleanup skipped for sibling human takeover", map[string]any{"runId": runID, "loopId": loop.ID, "worktreePath": checkpoint.Worktree.Path, "branch": checkpoint.Worktree.Branch, "message": reason})
+			return
+		}
 	}
 	// Unprepared rewind paths (PreparedAt cleared, path kept) may still hold
 	// interrupted-repair dirt that prepare never evaluated. Terminal queue
@@ -6721,6 +6782,39 @@ func (r *Runner) cleanupFixerWorktreeIfTerminal(ctx context.Context, project sto
 		})
 	}
 	r.appendEvent(ctx, eventInput{eventType: "fixer.worktree.cleaned", projectID: project.ID, entityType: "pull_request", entityID: project.ID, payload: map[string]any{"path": checkpoint.Worktree.Path, "branch": checkpoint.Worktree.Branch}})
+}
+
+// siblingHumanTakeoverOwnsWorktree reports whether another loop for the same
+// project+PR is in human_takeover and therefore owns the shared managed checkout.
+func (r *Runner) siblingHumanTakeoverOwnsWorktree(ctx context.Context, loop storage.LoopRecord) (bool, string) {
+	if r.repos == nil || r.repos.Loops == nil {
+		return false, ""
+	}
+	repo := strings.TrimSpace(derefString(loop.Repo))
+	prNumber := int64(0)
+	if loop.PRNumber != nil {
+		prNumber = *loop.PRNumber
+	}
+	if repo == "" || prNumber <= 0 {
+		return false, ""
+	}
+	siblings, err := r.repos.Loops.ListByRepoAndPR(ctx, repo, prNumber)
+	if err != nil {
+		// Fail closed: durable ownership cannot be read.
+		return true, "sibling human_takeover ownership is unavailable: " + err.Error()
+	}
+	for _, sibling := range siblings {
+		if sibling.ID == loop.ID {
+			continue
+		}
+		if sibling.ProjectID != loop.ProjectID {
+			continue
+		}
+		if sibling.Status == string(domain.LoopStatusHumanTakeover) {
+			return true, fmt.Sprintf("sibling loop %s is human_takeover for the same PR worktree", sibling.ID)
+		}
+	}
+	return false, ""
 }
 
 // recordCleanupSecondaryIssue records a refused removal on the run's outcome.

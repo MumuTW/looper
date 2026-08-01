@@ -73,6 +73,33 @@ func TestWorkerValidationCommandsIncludeReproductionCommand(t *testing.T) {
 	}
 }
 
+func TestWorkerReproductionCaptureVerifiesOnFirstAdopt(t *testing.T) {
+	root, expected := writeWorkerReproductionFixture(t)
+	bad := []byte(`{"version":1,"testPath":"internal/bug_test.go","testName":"TestBug","testCommand":"go test ./internal -run '^TestBug$'","testSha256":"` + strings.Repeat("0", 64) + `"}`)
+	if err := os.WriteFile(filepath.Join(root, reproducer.ManifestPath), bad, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	checkpoint := workerCheckpoint{Work: &workerInput{IssueNumber: 1, Repo: "acme/app"}}
+	err := captureWorkerReproduction(&checkpoint, root)
+	if err == nil {
+		t.Fatal("captureWorkerReproduction() error = nil, want hash verify failure")
+	}
+	if checkpoint.Work.Reproduction != nil {
+		t.Fatalf("Reproduction = %#v, want nil after failed first capture", checkpoint.Work.Reproduction)
+	}
+	good := []byte(`{"version":1,"testPath":"internal/bug_test.go","testName":"TestBug","testCommand":"go test ./internal -run '^TestBug$'","testSha256":"` + expected.TestSHA256 + `"}`)
+	if err := os.WriteFile(filepath.Join(root, reproducer.ManifestPath), good, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	checkpoint = workerCheckpoint{Work: &workerInput{IssueNumber: 1, Repo: "acme/app"}}
+	if err := captureWorkerReproduction(&checkpoint, root); err != nil {
+		t.Fatalf("captureWorkerReproduction() error = %v", err)
+	}
+	if checkpoint.Work.Reproduction == nil || !checkpoint.Work.Reproduction.Equal(*expected) {
+		t.Fatalf("captured = %#v, want %#v", checkpoint.Work.Reproduction, expected)
+	}
+}
+
 func TestWorkerReproductionBaselineRequiresOrdinaryTestFailure(t *testing.T) {
 	root, manifest := writeWorkerReproductionFixture(t)
 	checkpoint := workerCheckpoint{Work: &workerInput{Reproduction: manifest}}
