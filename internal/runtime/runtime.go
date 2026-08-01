@@ -449,16 +449,12 @@ func (r *Runtime) Stop(reason string) {
 			r.logger.Info("looperd runtime stopping", map[string]any{"reason": reason})
 		}
 
-		// If BeginDrain already started a background producer join, wait for it
-		// before we stop again or close storage. Concurrent stop* on the same
-		// loops would race, and closing SQLite under a join-owned wait is unsafe.
-		r.waitForDrainProducerJoin()
-
-		// Close admission and cancel work-producing contexts before draining
-		// producers (ADR-0015 shutdown order). Use BeginShutdown so direct
-		// Runtime.Stop matches the daemon path: scheduler, deferred recovery,
-		// and in-flight webhook discovery are canceled before any waits.
+		// Close admission before waiting on a drain join so a concurrent
+		// BeginDrain cannot publish started=true after we observe false and
+		// then race stop* / SQLite close. BeginShutdown makes late BeginDrain
+		// fail and roll back its latch; an already-published join is waited.
 		r.BeginShutdown(reason)
+		r.waitForDrainProducerJoin()
 
 		r.stopConfigReloadLoop()
 		r.stopDeferredReviewerRecovery()
@@ -894,10 +890,15 @@ func (r *Runtime) BeginAdmittedMutationIfAllowed() (func(), error) {
 // legal: ready admission, or a completed drain under draining/stopping.
 // Gate decision and lease acquisition share the admission mutex so drain
 // cannot observe empty admitted mutations between the two steps.
+//
+// Lock order is r.mu then admission.mu (same as BeginDrain) so a concurrent
+// final-backup and repeat-drain cannot deadlock.
 func (r *Runtime) BeginBackupMutationIfAllowed() (func(), error) {
 	if r == nil || r.admission == nil {
 		return nil, ErrAdmissionStopping
 	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	var release func()
 	err := r.admission.WithState(func(state AdmissionState) error {
 		switch state {
@@ -905,7 +906,8 @@ func (r *Runtime) BeginBackupMutationIfAllowed() (func(), error) {
 			// online pre-cutover backup
 		case AdmissionDraining, AdmissionStopping:
 			// Final cutover backup: require the supervisor work set drained.
-			// DrainSnapshot does not take admission.mu.
+			// Nested RLock in DrainSnapshot is safe; we already hold r.mu so
+			// BeginDrain (which takes r.mu.Lock first) cannot reverse the order.
 			if !r.DrainSnapshot().Drained() {
 				return fmt.Errorf("Upgrade backup after drain requires a drained supervisor work set")
 			}
@@ -1459,6 +1461,31 @@ func (r *Runtime) CompleteStartup(ctx context.Context) error {
 		r.recovery = recoverySummary
 		r.ownershipAcquired = true
 		r.mu.Unlock()
+		upgradeHold := strings.TrimSpace(os.Getenv("LOOPER_UPGRADE_VERIFY_HOLD")) == "1"
+		// Cutover verify-hold must be selected before webhook reconciliation or
+		// producer loops: webhook.Start runs Reconcile immediately and can
+		// persist tunnel/hook state and launch forwarders. Those mutations
+		// post-date ROLLBACK_BUNDLE and are not undone by DB restore.
+		if upgradeHold {
+			if err := r.admission.Transition(AdmissionDraining, "upgrade-verify-hold"); err != nil {
+				r.startupReadyErr = err
+				if r.logger != nil {
+					r.logger.Error("looperd upgrade verify hold failed", map[string]any{"error": err.Error()})
+				}
+				return
+			}
+			if r.logger != nil {
+				r.logger.Info("looperd upgrade verify hold active", map[string]any{
+					"env":    "LOOPER_UPGRADE_VERIFY_HOLD=1",
+					"action": "run verify-start then restart without this env",
+					"note":   "webhook reconcile, scheduler, and discovery deferred until unheld restart",
+				})
+			}
+			// Hold path: no network webhook reconcile, no work producers, no
+			// discovery resume. Status/API stay up with admission draining.
+			return
+		}
+
 		if r.networkManager != nil {
 			if err := r.networkManager.Start(ctx); err != nil {
 				r.startupReadyErr = err
@@ -1486,38 +1513,14 @@ func (r *Runtime) CompleteStartup(ctx context.Context) error {
 
 		// Open admission only after recovery and producer loops are assembled.
 		// HTTP mutations and scheduler claims are projections of this state.
-		//
-		// Cutover verify-hold goes starting → draining without an intervening
-		// ready window so a scheduler tick cannot claim between MarkReady and
-		// BeginDrain (that write would be discarded by rollback restore).
-		if strings.TrimSpace(os.Getenv("LOOPER_UPGRADE_VERIFY_HOLD")) == "1" {
-			if err := r.admission.Transition(AdmissionDraining, "upgrade-verify-hold"); err != nil {
-				r.startupReadyErr = err
-				if r.logger != nil {
-					r.logger.Error("looperd upgrade verify hold failed", map[string]any{"error": err.Error()})
-				}
-				return
-			}
-			// Still cancel work producers so discovery cannot mutate under hold.
-			if err := r.BeginDrain("upgrade-verify-hold"); err != nil {
-				r.startupReadyErr = err
-				return
-			}
-			if r.logger != nil {
-				r.logger.Info("looperd upgrade verify hold active", map[string]any{
-					"env":    "LOOPER_UPGRADE_VERIFY_HOLD=1",
-					"action": "run verify-start then restart without this env",
-				})
-			}
-		} else if err := r.admission.MarkReady("complete startup"); err != nil {
+		if err := r.admission.MarkReady("complete startup"); err != nil {
 			r.startupReadyErr = err
 			return
 		}
-		upgradeHold := strings.TrimSpace(os.Getenv("LOOPER_UPGRADE_VERIFY_HOLD")) == "1"
 		// Persisted discovery is runtime-owned work. Launch it only after
 		// dependency validation, recovery, ownership, producer assembly, and
 		// admission readiness have all succeeded — not under verify-hold.
-		if !upgradeHold && projectService != nil {
+		if projectService != nil {
 			resume := r.resumeProjectDiscoveries
 			if resume == nil {
 				resume = func(ctx context.Context, service *projects.Service) error {

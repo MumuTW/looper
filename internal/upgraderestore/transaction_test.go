@@ -117,6 +117,35 @@ func TestRestoreRollsBackMissingTargetUsingStagedIdentity(t *testing.T) {
 	assertPathMissing(t, JournalPath(fixture.databasePath))
 }
 
+func TestDetachAndRemoveOwnedRestoreTargetRejectsContentSwapDuringDetach(t *testing.T) {
+	// Ownership is re-checked after rename-aside so a TOCTOU recreate cannot
+	// be deleted: rename a non-owned file, fail verify, put it back.
+	dir := t.TempDir()
+	target := filepath.Join(dir, "looper.sqlite")
+	staged := filepath.Join(dir, "stage.sqlite")
+	writeTestFile(t, staged, "staged-bytes", 0o660)
+	writeTestFile(t, target, "staged-bytes", 0o660)
+	hash, size, err := fileContentIdentity(staged)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := journalEntry{Name: entryDatabase, TargetPath: target, StagedPath: staged, StagedSHA256: hash, StagedSize: size}
+	// Replace target after identity is known but exercise detach on wrong content
+	// by calling with a journal that expects staged while target was swapped.
+	writeTestFile(t, target, "external-write", 0o660)
+	err = detachAndRemoveOwnedRestoreTarget(entry, "database")
+	if err == nil {
+		t.Fatal("detachAndRemoveOwnedRestoreTarget() error = nil, want refuse external content")
+	}
+	assertFileContents(t, target, "external-write")
+	// Owned path: matching content is detached and removed.
+	writeTestFile(t, target, "staged-bytes", 0o660)
+	if err := detachAndRemoveOwnedRestoreTarget(entry, "database"); err != nil {
+		t.Fatal(err)
+	}
+	assertPathMissing(t, target)
+}
+
 func TestRollbackRefusesRecreatedTargetWhenUndoPresent(t *testing.T) {
 	fixture := newRestoreFixture(t, true)
 	// Build a prepared journal as if originals were moved to undo, then a new
