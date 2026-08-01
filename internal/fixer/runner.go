@@ -2018,10 +2018,6 @@ func (r *Runner) discoverPullRequestFromDetail(ctx context.Context, project stor
 		result.Skipped++
 		return nil
 	}
-	if len(allFixItems) == 0 {
-		result.Skipped++
-		return nil
-	}
 	allFixItemsStateHash := hashFixItemsState(allFixItems)
 	fixItems := suppressDeclinedFixItems(loopMetadataForPR(ctx, r, project.ID, repo, detail.Number), detail.HeadSHA, allFixItems)
 	if len(fixItems) == 0 {
