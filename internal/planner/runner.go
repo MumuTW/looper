@@ -609,9 +609,15 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 		if loopResult.created {
 			result.CreatedLoopIDs = append(result.CreatedLoopIDs, loopResult.record.ID)
 		}
-		eligible++
 		assigned, err := r.assignPersonalIssueIfEligible(ctx, *project, input.Repo, issue, login, personalProject, policy.RequireAssigneeCurrentUser)
 		if err != nil {
+			// Surface personal-assignment failures so a persistent token
+			// permission gap does not silently stall the lane. The issue is
+			// skipped, but other candidates are still scanned and the error is
+			// logged for operator diagnosis.
+			if r.logger != nil {
+				r.logger.Warn("planner personal issue assignment failed", map[string]any{"projectId": project.ID, "repo": input.Repo, "issueNumber": issue.Number, "error": err.Error()})
+			}
 			result.Skipped++
 			continue
 		}
@@ -635,6 +641,11 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 		}
 		result.QueueItems = append(result.QueueItems, materialized.QueueItems...)
 		result.Skipped += materialized.Skipped
+		// Count only actionable (admitted, assigned, and queued) issues toward
+		// the personal limit so paused/completed/failed/awaiting-human loops
+		// and assignment failures do not exhaust the window before later
+		// unassigned work is reached.
+		eligible++
 		if eligible >= resultLimit {
 			break
 		}

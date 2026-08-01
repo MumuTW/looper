@@ -214,3 +214,80 @@ func TestDiscoverIssuesPersonalProjectReconcilesAssignmentMarker(t *testing.T) {
 		t.Fatalf("queue payload = %#v, want reconciled personal assignment marker", queue)
 	}
 }
+
+// personalWarnLogger records Warn messages so tests can assert that personal
+// assignment failures are surfaced to operators rather than silently skipped.
+type personalWarnLogger struct {
+	warnings []personalLogEntry
+}
+
+type personalLogEntry struct {
+	message string
+	context map[string]any
+}
+
+func (l *personalWarnLogger) Debug(string, map[string]any) {}
+func (l *personalWarnLogger) Info(string, map[string]any)  {}
+func (l *personalWarnLogger) Warn(message string, context map[string]any) {
+	l.warnings = append(l.warnings, personalLogEntry{message: message, context: context})
+}
+func (l *personalWarnLogger) Error(string, map[string]any) {}
+
+// TestDiscoverIssuesPersonalProjectInactiveLoopDoesNotExhaustLimit verifies
+// that an inactive (completed) personal-project loop does not count toward the
+// personal result limit. With a tight limit, discovery must continue past the
+// completed-loop issue and reach the later actionable, unassigned issue.
+func TestDiscoverIssuesPersonalProjectInactiveLoopDoesNotExhaustLimit(t *testing.T) {
+	repo := "acme/looper"
+	cfg := personalPlannerConfig(t)
+	fixture := newRunnerFixture(t)
+	nowISO := fixture.nowISO()
+	completedTarget := buildIssueTargetID(repo, 511)
+	metadata := `{"issueNumber":511,"repo":"acme/looper"}`
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_planner_completed", Seq: 1, ProjectID: "project_1", Type: "planner", TargetType: "issue", TargetID: &completedTarget, Repo: &repo, Status: "completed", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("seed completed loop: %v", err)
+	}
+	github := &fakeGitHubGateway{login: "octocat", issues: []IssueSummary{
+		{Number: 511, Title: "Done", Author: "octocat", Labels: []string{labels.DefaultPlanTrigger}},
+		{Number: 512, Title: "Fresh work", Author: "octocat", Labels: []string{labels.DefaultPlanTrigger}},
+	}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Logger: fixture.logger, Now: fixture.now, CustomInstructions: &cfg, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, Labels: []string{labels.DefaultPlanTrigger}, LabelMode: config.LabelModeAll, RequireAssigneeCurrentUser: true}})
+	result, err := runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo, Limit: 1})
+	if err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	if len(result.QueueItems) != 1 || result.QueueItems[0].TargetID != buildIssueTargetID(repo, 512) {
+		t.Fatalf("result=%#v, want the later actionable issue #512 queued past the completed loop", result)
+	}
+}
+
+// TestDiscoverIssuesPersonalProjectAssignmentFailureLogsError verifies that a
+// persistent personal-assignment failure is logged for operator diagnosis
+// rather than silently skipped, while discovery continues scanning other
+// candidates.
+func TestDiscoverIssuesPersonalProjectAssignmentFailureLogsError(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{login: "octocat", addAssigneeErr: errors.New("assignment unavailable"), issues: []IssueSummary{
+		{Number: 521, Author: "octocat", Labels: []string{labels.DefaultPlanTrigger}},
+		{Number: 522, Author: "octocat", Labels: []string{labels.DefaultPlanTrigger}},
+	}}
+	cfg := personalPlannerConfig(t)
+	logger := &personalWarnLogger{}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Logger: logger, Now: fixture.now, CustomInstructions: &cfg, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, Labels: []string{labels.DefaultPlanTrigger}, LabelMode: config.LabelModeAll, RequireAssigneeCurrentUser: true}})
+	result, err := runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("DiscoverIssues() error = %v, want per-issue assignment failure to be skipped", err)
+	}
+	if result.Skipped != 2 || len(result.QueueItems) != 0 || len(github.addAssigneeCalls) != 2 {
+		t.Fatalf("result=%#v calls=%#v, want both failed assignments skipped", result, github.addAssigneeCalls)
+	}
+	if len(logger.warnings) != 2 {
+		t.Fatalf("warnings=%#v, want one logged warning per failed assignment", logger.warnings)
+	}
+	if logger.warnings[0].message != "planner personal issue assignment failed" {
+		t.Fatalf("first warning message = %q, want planner personal issue assignment failed", logger.warnings[0].message)
+	}
+	if errStr, _ := logger.warnings[0].context["error"].(string); !strings.Contains(errStr, "assignment unavailable") {
+		t.Fatalf("first warning error = %#v, want it to contain assignment unavailable", logger.warnings[0].context["error"])
+	}
+}

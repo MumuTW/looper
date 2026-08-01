@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/MumuTW/looper/internal/bootstrap"
 	"github.com/MumuTW/looper/internal/config"
 	"github.com/MumuTW/looper/internal/labels"
 	"github.com/MumuTW/looper/internal/network/protocol"
@@ -235,5 +236,102 @@ func TestDiscoverIssuesPersonalProjectReconcilesAssignmentMarker(t *testing.T) {
 	}
 	if queue == nil || !strings.Contains(derefString(queue.PayloadJSON), `"personalProjectAutoAssigned":true`) {
 		t.Fatalf("queue payload = %#v, want reconciled personal assignment marker", queue)
+	}
+}
+
+// personalWarnLogger records Warn messages so tests can assert that personal
+// assignment failures are surfaced to operators rather than silently skipped.
+type personalWarnLogger struct {
+	warnings []personalLogEntry
+}
+
+type personalLogEntry struct {
+	message string
+	context map[string]any
+}
+
+func (l *personalWarnLogger) Debug(string, map[string]any) {}
+func (l *personalWarnLogger) Info(string, map[string]any)  {}
+func (l *personalWarnLogger) Warn(message string, context map[string]any) {
+	l.warnings = append(l.warnings, personalLogEntry{message: message, context: context})
+}
+func (l *personalWarnLogger) Error(string, map[string]any) {}
+
+func newPersonalWorkerRunnerWithLogger(t *testing.T, github *fakeGitHubGateway, cfg *config.Config, logger bootstrap.Logger) (*runnerFixture, *Runner) {
+	t.Helper()
+	fixture := newRunnerFixture(t)
+	runner := New(Options{
+		DB:                 fixture.coordinator.DB(),
+		Repos:              fixture.repos,
+		GitHub:             github,
+		Git:                &fakeGitGateway{},
+		AgentExecutor:      &fakeAgentExecutor{},
+		Logger:             logger,
+		Now:                fixture.now,
+		CustomInstructions: cfg,
+		DiscoveryPolicy: DiscoveryPolicy{
+			AutoDiscovery:              true,
+			Labels:                     []string{labels.DefaultWorkerReadyTrigger},
+			LabelMode:                  config.LabelModeAll,
+			RequireAssigneeCurrentUser: true,
+		},
+	})
+	return fixture, runner
+}
+
+// TestDiscoverIssuesPersonalProjectInactiveLoopDoesNotExhaustLimit verifies
+// that an inactive (completed) personal-project loop does not count toward the
+// personal result limit. With a tight limit, discovery must continue past the
+// completed-loop issue and reach the later actionable, unassigned issue.
+func TestDiscoverIssuesPersonalProjectInactiveLoopDoesNotExhaustLimit(t *testing.T) {
+	repo := "acme/looper"
+	cfg := personalWorkerConfig(t)
+	github := &fakeGitHubGateway{currentLogin: "octocat", issues: []IssueSummary{
+		{Number: 701, Title: "Done", Author: "octocat", Labels: []string{labels.DefaultWorkerReadyTrigger}},
+		{Number: 702, Title: "Fresh work", Author: "octocat", Labels: []string{labels.DefaultWorkerReadyTrigger}},
+	}}
+	fixture, runner := newPersonalWorkerRunnerWithLogger(t, github, &cfg, &testLogger{})
+	nowISO := fixture.nowISO()
+	completedTarget := buildIssueTargetID(repo, 701)
+	completedMetadata := `{"worker":{"title":"Done","repo":"acme/looper","issueNumber":701,"baseBranch":"main"}}`
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_worker_completed", Seq: 2, ProjectID: "project_1", Type: "worker", TargetType: "issue", TargetID: &completedTarget, Repo: &repo, Status: "completed", MetadataJSON: &completedMetadata, NextRunAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("seed completed loop: %v", err)
+	}
+	result, err := runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: repo, Limit: 1})
+	if err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	if len(result.QueueItems) != 1 || result.QueueItems[0].TargetID != buildIssueTargetID(repo, 702) {
+		t.Fatalf("result=%#v, want the later actionable issue #702 queued past the completed loop", result)
+	}
+}
+
+// TestDiscoverIssuesPersonalProjectAssignmentFailureLogsError verifies that a
+// persistent personal-assignment failure is logged for operator diagnosis
+// rather than silently skipped, while discovery continues scanning other
+// candidates.
+func TestDiscoverIssuesPersonalProjectAssignmentFailureLogsError(t *testing.T) {
+	github := &fakeGitHubGateway{currentLogin: "octocat", addAssigneeErr: errors.New("assignment unavailable"), issues: []IssueSummary{
+		{Number: 711, Author: "octocat", Labels: []string{labels.DefaultWorkerReadyTrigger}},
+		{Number: 712, Author: "octocat", Labels: []string{labels.DefaultWorkerReadyTrigger}},
+	}}
+	cfg := personalWorkerConfig(t)
+	logger := &personalWarnLogger{}
+	_, runner := newPersonalWorkerRunnerWithLogger(t, github, &cfg, logger)
+	result, err := runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("DiscoverIssues() error = %v, want per-issue assignment failure to be skipped", err)
+	}
+	if result.Skipped != 2 || len(result.QueueItems) != 0 || len(github.addAssigneeCalls) != 2 {
+		t.Fatalf("result=%#v calls=%#v, want both failed assignments skipped", result, github.addAssigneeCalls)
+	}
+	if len(logger.warnings) != 2 {
+		t.Fatalf("warnings=%#v, want one logged warning per failed assignment", logger.warnings)
+	}
+	if logger.warnings[0].message != "worker personal issue assignment failed" {
+		t.Fatalf("first warning message = %q, want worker personal issue assignment failed", logger.warnings[0].message)
+	}
+	if errStr, _ := logger.warnings[0].context["error"].(string); !strings.Contains(errStr, "assignment unavailable") {
+		t.Fatalf("first warning error = %#v, want it to contain assignment unavailable", logger.warnings[0].context["error"])
 	}
 }
