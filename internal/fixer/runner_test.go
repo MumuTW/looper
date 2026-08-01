@@ -2001,6 +2001,105 @@ func TestSchedulePendingRediscoveryAfterRunPreservesPausedHardHold(t *testing.T)
 	}
 }
 
+// TestSchedulePendingRediscoveryAfterRunChargesRoundBudget pins fix item 1: a
+// pending rediscovery is a moved head observed while the preceding run was
+// active, so scheduling it after the run must charge the round budget. At the
+// limit the handoff parks the loop instead of enqueueing another round.
+func TestSchedulePendingRediscoveryAfterRunChargesRoundBudget(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(503)
+	loopTarget := buildPullRequestTargetID(repo, prNumber)
+	nowISO := fixture.nowISO()
+	projectID := "project_1"
+	metadata := mustMarshalJSON(map[string]any{
+		"fixerRoundBudget":        map[string]any{"rounds": 2, "lastHeadSha": "head-prev", "firstRoundAt": nowISO, "recordedAt": nowISO},
+		"pendingFixerRediscovery": map[string]any{"headSha": "head-moved", "fixItemsStateHash": "state-moved", "unresolvedThreadIds": []string{"t1"}, "recordedAt": nowISO},
+	})
+	loop := storage.LoopRecord{ID: "loop_pending_budget_charge", Seq: 99, ProjectID: projectID, Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "queued", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, MaxFixerRoundsPerPullRequest: 3, Logger: fixture.logger, Now: fixture.now})
+
+	scheduled, err := runner.schedulePendingRediscoveryAfterRun(context.Background(), loop, repo, prNumber)
+	if err != nil {
+		t.Fatalf("schedulePendingRediscoveryAfterRun() error = %v", err)
+	}
+	if !scheduled {
+		t.Fatal("schedulePendingRediscoveryAfterRun() = false, want true after parking so success finalizers skip")
+	}
+	persisted, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil || persisted == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", persisted, err)
+	}
+	if persisted.Status != "paused" {
+		t.Fatalf("status = %q, want paused at budget limit", persisted.Status)
+	}
+	meta := parseJSONObject(persisted.MetadataJSON)
+	state, ok := parseRoundBudgetState(meta)
+	if !ok || state.Rounds != 3 || state.LastHeadSHA != "head-moved" {
+		t.Fatalf("round budget = (%#v, %v), want 3 rounds charged for head-moved", state, ok)
+	}
+	if reason, _ := stringFromAny(meta["pauseReason"]); reason != roundBudgetPauseReason {
+		t.Fatalf("pauseReason = %q, want %q", reason, roundBudgetPauseReason)
+	}
+	activeQueue, err := fixture.repos.Queue.FindActiveByLoopID(context.Background(), loop.ID)
+	if err != nil {
+		t.Fatalf("Queue.FindActiveByLoopID() error = %v", err)
+	}
+	if activeQueue != nil {
+		t.Fatalf("activeQueue = %#v, want no enqueued item when parked at the limit", activeQueue)
+	}
+}
+
+// TestSchedulePendingRediscoveryAfterRunChargesWithinBudget confirms the handoff
+// is charged even when it does not park: the budget increments and the follow-up
+// round is enqueued.
+func TestSchedulePendingRediscoveryAfterRunChargesWithinBudget(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	prNumber := int64(504)
+	loopTarget := buildPullRequestTargetID(repo, prNumber)
+	nowISO := fixture.nowISO()
+	projectID := "project_1"
+	metadata := mustMarshalJSON(map[string]any{
+		"fixerRoundBudget":        map[string]any{"rounds": 1, "lastHeadSha": "head-prev", "firstRoundAt": nowISO, "recordedAt": nowISO},
+		"pendingFixerRediscovery": map[string]any{"headSha": "head-moved", "fixItemsStateHash": "state-moved", "unresolvedThreadIds": []string{"t1"}, "recordedAt": nowISO},
+	})
+	loop := storage.LoopRecord{ID: "loop_pending_budget_within", Seq: 100, ProjectID: projectID, Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "queued", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, MaxFixerRoundsPerPullRequest: 3, Logger: fixture.logger, Now: fixture.now})
+
+	scheduled, err := runner.schedulePendingRediscoveryAfterRun(context.Background(), loop, repo, prNumber)
+	if err != nil {
+		t.Fatalf("schedulePendingRediscoveryAfterRun() error = %v", err)
+	}
+	if !scheduled {
+		t.Fatal("schedulePendingRediscoveryAfterRun() = false, want enqueued within budget")
+	}
+	persisted, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil || persisted == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", persisted, err)
+	}
+	meta := parseJSONObject(persisted.MetadataJSON)
+	state, ok := parseRoundBudgetState(meta)
+	if !ok || state.Rounds != 2 || state.LastHeadSHA != "head-moved" {
+		t.Fatalf("round budget = (%#v, %v), want 2 rounds charged for head-moved", state, ok)
+	}
+	activeQueue, err := fixture.repos.Queue.FindActiveByLoopID(context.Background(), loop.ID)
+	if err != nil {
+		t.Fatalf("Queue.FindActiveByLoopID() error = %v", err)
+	}
+	if activeQueue == nil || activeQueue.Status != "queued" {
+		t.Fatalf("activeQueue = %#v, want queued follow-up item", activeQueue)
+	}
+}
+
 func TestDiscoverPullRequestsPreservesPendingRediscoveryForMidRunCIFailure(t *testing.T) {
 	t.Parallel()
 

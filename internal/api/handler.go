@@ -7209,6 +7209,14 @@ func resetFixerLoopRetryMetadata(current *string) (*string, error) {
 	if pauseReason, _ := metadata["pauseReason"].(string); pauseReason == "agent_failure_streak" {
 		delete(metadata, "pauseReason")
 	}
+	// An operator retry must also clear the round-budget gate. Otherwise a
+	// budget-paused loop permits at most the directly requeued run: once that run
+	// moves the head, discovery increments the already-exhausted budget and parks
+	// the loop again, so the operator cannot actually restart it.
+	delete(metadata, "fixerRoundBudget")
+	if pauseReason, _ := metadata["pauseReason"].(string); pauseReason == "fixer_non_converging" {
+		delete(metadata, "pauseReason")
+	}
 	encoded, err := json.Marshal(metadata)
 	if err != nil {
 		return nil, err

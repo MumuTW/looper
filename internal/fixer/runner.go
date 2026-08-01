@@ -490,8 +490,11 @@ type Options struct {
 	RetryBaseDelay              time.Duration
 	RetryMaxAttempts            int64
 	MaxConsecutiveFixerFailures int
-	OnAgentExecutionStarted     AgentExecutionStartedFunc
-	OnQueueItemEnqueued         func()
+	// MaxFixerRoundsPerPullRequest bounds how many pushes this fixer may draw
+	// review on for one pull request before the loop is parked for a human.
+	MaxFixerRoundsPerPullRequest int
+	OnAgentExecutionStarted      AgentExecutionStartedFunc
+	OnQueueItemEnqueued          func()
 }
 
 type DiscoveryPolicy struct {
@@ -534,6 +537,7 @@ type Runner struct {
 	retryBaseDelay              time.Duration
 	retryMaxAttempts            int64
 	consecutiveFailureThreshold int
+	maxFixerRounds              int
 	onAgentExecutionStarted     AgentExecutionStartedFunc
 	onQueueItemEnqueued         func()
 }
@@ -1641,6 +1645,10 @@ func New(options Options) *Runner {
 	if consecutiveFailureThreshold <= 0 {
 		consecutiveFailureThreshold = maxConsecutiveFixerFailures
 	}
+	maxFixerRounds := options.MaxFixerRoundsPerPullRequest
+	if maxFixerRounds <= 0 {
+		maxFixerRounds = maxFixerRoundsPerPullRequest
+	}
 	sleep := options.Sleep
 	if sleep == nil {
 		sleep = time.Sleep
@@ -1686,6 +1694,7 @@ func New(options Options) *Runner {
 		retryBaseDelay:              retryBaseDelay,
 		retryMaxAttempts:            retryMax,
 		consecutiveFailureThreshold: consecutiveFailureThreshold,
+		maxFixerRounds:              maxFixerRounds,
 		onAgentExecutionStarted:     options.OnAgentExecutionStarted,
 		onQueueItemEnqueued:         options.OnQueueItemEnqueued,
 	}
@@ -2068,6 +2077,32 @@ func (r *Runner) discoverPullRequestFromDetail(ctx context.Context, project stor
 	if len(allFixItems) == 0 {
 		if err := r.clearFixerFollowupStateForPR(ctx, project.ID, repo, detail.Number); err != nil {
 			return err
+		}
+		// Zero fix items is the only evidence this loop converged, so it is the
+		// only automatic budget reset — but only once an authoritative review
+		// result for the current head exists. The reviewer runs before the fixer
+		// and dispatches asynchronously, so right after a fixer push the next
+		// fixer discovery commonly sees zero items while the reviewer for that
+		// head is still running; resetting then lets findings it publishes later
+		// start from an empty budget and recreates the unbounded loop this gate
+		// stops.
+		//
+		// The discovery snapshot can also be stale: lastReviewedHeadSha may match
+		// while detail is a pre-publication view with zero items. Re-fetch live
+		// PR detail before clearing so a race cannot wipe the budget under new
+		// findings that arrived after the snapshot was taken.
+		if r.reviewerHasReviewedHead(ctx, project.ID, repo, detail.Number, detail.HeadSHA) {
+			live := detail
+			if r.github != nil {
+				if refreshed, viewErr := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: repo, PRNumber: detail.Number, CWD: project.RepoPath}); viewErr == nil {
+					live = refreshed
+				}
+			}
+			if len(collectFixItems(live)) == 0 {
+				if err := r.clearRoundBudgetForPullRequest(ctx, project.ID, repo, detail.Number); err != nil {
+					return err
+				}
+			}
 		}
 		result.Skipped++
 		return nil
@@ -2724,6 +2759,22 @@ func (r *Runner) schedulePendingRediscoveryAfterRun(ctx context.Context, loop st
 	if current.Status == "paused" {
 		return false, nil
 	}
+	// Charge the handoff before enqueueing. A pending rediscovery is a moved head
+	// observed while the preceding run was active — the active-run branch in
+	// ensureLoopForPullRequest records it and returns without charging — so this
+	// is another round and must spend the budget. Without it, rediscovery that
+	// overlaps every active run bypasses the counter and the loop stays unbounded.
+	charged, parked, err := r.chargeFixerRound(ctx, *current, pending.HeadSHA)
+	if err != nil {
+		return false, err
+	}
+	if parked {
+		// Parked is a terminal handoff for this success path: report scheduled so
+		// ProcessClaimedItem does not fall through to follow-up enqueue or mark
+		// the loop completed (either would destroy the round-budget pause).
+		return true, nil
+	}
+	current = &charged
 	availableAt := r.now()
 	availableAtISO := eventlog.FormatJavaScriptISOString(availableAt.UTC())
 	queueItem, err := r.enqueue(ctx, enqueueInput{ProjectID: current.ProjectID, LoopID: current.ID, Repo: repo, PRNumber: prNumber, HeadSHA: pending.HeadSHA, FixItemsHash: pending.FixItemsStateHash, AvailableAt: availableAt})
@@ -5152,6 +5203,16 @@ func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.P
 			}
 			return loopUpsertResult{record: updatedLoop, created: false, pending: true}, nil
 		}
+		// Charged after the pending-rediscovery branch above: a discovery that
+		// lands while a run is active is not another round, it is the same one.
+		charged, parked, err := r.chargeFixerRound(ctx, updatedLoop, headSHA)
+		if err != nil {
+			return loopUpsertResult{}, err
+		}
+		if parked {
+			return loopUpsertResult{record: charged, created: false, skipped: true}, nil
+		}
+		updatedLoop = charged
 		updatedLoop.Status = "queued"
 		updatedLoop.NextRunAt = &availableAtISO
 		updatedLoop.UpdatedAt = eventlog.NextJavaScriptISOString(now, updatedLoop.UpdatedAt)
