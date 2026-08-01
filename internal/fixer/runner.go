@@ -2531,6 +2531,29 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			}
 		}
 	}
+	// A terminal handoff is itself durable work. If the daemon was restarted
+	// after the PR comment/close but before Planner accepted the route, replay
+	// that suffix instead of treating the paused/failed loop as an ordinary
+	// fixer item (which would strand the closed PR forever).
+	if r.onRegenerateIssue != nil {
+		if state, ok := parseRegenerationState(parseJSONObject(loop.MetadataJSON)); ok && !state.Routed {
+			project, projectErr := r.repos.Projects.GetByID(ctx, loop.ProjectID)
+			if projectErr != nil {
+				return runpipe.ProcessResult{}, projectErr
+			}
+			if project == nil {
+				return runpipe.ProcessResult{}, fmt.Errorf("project not found: %s", loop.ProjectID)
+			}
+			replayFailure := regenerationFailureFromState(state)
+			_, action, replayErr := r.applyTerminalRegeneration(ctx, *project, *loop, queueItem, fixerCheckpoint{}, replayFailure)
+			if replayErr != nil {
+				return runpipe.ProcessResult{}, replayErr
+			}
+			if action == regenerationCompleted || action == regenerationEscalated {
+				return runpipe.ProcessResult{LoopID: loop.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: replayFailure.Message, FailureKind: replayFailure.Kind}, nil
+			}
+		}
+	}
 	// A pending-rediscovery queue row can become visible while its resume
 	// handoff is still clearing metadata and changing the loop to queued.
 	// Requeue only that row without spending an attempt; other paused loops
