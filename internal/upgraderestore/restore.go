@@ -1023,6 +1023,13 @@ func copyFileExclusive(source, dest string) error {
 		_ = os.Remove(dest)
 		return err
 	}
+	// Durability: journal may reach "committed" and undo deleted; torn copy
+	// after crash would be treated as a successful restore.
+	if err := out.Sync(); err != nil {
+		_ = out.Close()
+		_ = os.Remove(dest)
+		return err
+	}
 	if err := out.Close(); err != nil {
 		_ = os.Remove(dest)
 		return err
