@@ -240,15 +240,20 @@ func ValidateSandboxRuntime(cfg config.Config, check func() error) error {
 }
 
 // ValidateSandboxRuntimeForConfig runs the sandbox readiness check in the
-// configured daemon working directory (service environment), falling back to
-// the process cwd only when workingDirectory is unset.
+// supervised service environment: daemon.workingDirectory and a minimal PATH
+// (not the operator shell PATH), so preflight matches real daemon boot.
 func ValidateSandboxRuntimeForConfig(cfg config.Config) error {
 	cwd := strings.TrimSpace(cfg.Daemon.WorkingDirectory)
-	check := processsandbox.Available
-	if cwd != "" {
-		check = func() error { return processsandbox.AvailableInDirectory(cwd) }
+	if cwd == "" {
+		var err error
+		cwd, err = os.Getwd()
+		if err != nil {
+			return fmt.Errorf("determine working directory for sandbox check: %w", err)
+		}
 	}
-	return validateSandboxRuntime(cfg, check)
+	return validateSandboxRuntime(cfg, func() error {
+		return processsandbox.AvailableInServiceEnvironment(cwd)
+	})
 }
 
 func validateConfiguredToolPaths(cfg config.Config, detection map[string]config.ToolDetectionStatus) error {

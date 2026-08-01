@@ -261,18 +261,19 @@ Supported sequence:
 2. **Ensure the live pair is staged under `release-root`** as the prior release:
    - **First cutover:** `stage-release` the running CLI/daemon, then `activate-release` that id so `current` exists. Reinstall/update the service so the unit launches `release-root/current/looperd` (not a concrete old path). Set `tools.looperPath` to `release-root/current/looper` and restart once to confirm the service follows `current`. Keep that release id as `previous`.
    - **Later cutovers:** the live pair is already that release id (last successful candidate). Re-run `stage-release` with the same binaries — staging is **idempotent** when the destination already matches (same build + binary hashes). Or skip re-staging and reuse `looper upgrade` / `CurrentReleaseID` as `previous`.
-3. `backup` (matching config + SQLite + binary evidence)
-4. `drain` (and optional final `backup` while drained)
-5. `stage-release` the **candidate** pair (new release id)
-6. `activate-release` the candidate (switches `current` only — does not restart)
-7. Point `tools.looperPath` at `release-root/current/looper` if not already
-8. **Restart the supervised daemon** so it loads `current/looperd`
-9. `verify-start`
+3. `backup` (initial matching config + SQLite + binary evidence; keep the path)
+4. `drain` until `drained: true`
+5. **`backup` again while drained (mandatory)** — this is the rollback bundle for cutover. Work may still commit between step 3 and drain completion; only the post-drain bundle is guaranteed to include that work. Record this bundle directory as `ROLLBACK_BUNDLE`.
+6. `stage-release` the **candidate** pair (new release id)
+7. `activate-release` the candidate (switches `current` only — does not restart)
+8. Point `tools.looperPath` at `release-root/current/looper` if not already
+9. **Restart the supervised daemon** so it loads `current/looperd`
+10. `verify-start`
 
 On failure after restart:
 
 1. **Stop** the candidate daemon (required — restore fails closed while SQLite is open)
-2. `restore-preflight` → `restore` (config + SQLite only)
+2. `restore-preflight --bundle $ROLLBACK_BUNDLE` → `restore --bundle $ROLLBACK_BUNDLE --confirm` (use the **post-drain** bundle, not the pre-drain one)
 3. `activate-release` the **prior** release id
 4. Restore prior `tools.looperPath` if you changed it
 5. Restart the supervised daemon again
