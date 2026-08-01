@@ -111,6 +111,41 @@ func CodingRoleAgentConfigured(cfg Config, role string) bool {
 	return ok
 }
 
+// toolNetworkDenialVendors lists the agent vendors whose CLI can run with
+// their tool subprocesses cut off from the network while the parent agent
+// keeps its model transport. Looper's publish validation gate requires that,
+// so a project with validation.commands can only be served by these vendors.
+//
+// internal/agent's runtimeAdapters table (the enforceToolNetworkDenied hook)
+// is the source of truth. internal/agent imports internal/config, so the
+// predicate cannot live there and be used here; instead
+// TestToolNetworkDenialVendorsMatchAdapterTable in internal/agent fails if
+// this list and that table ever drift apart.
+//
+// devin-experimental is deliberately excluded: the captured Devin CLI
+// 3000.3.22 evidence marks strict tool-network containment a no-go, and no
+// integration check has verified a supported CLI version denies a network
+// probe from an exec tool. Adding it back requires that integration evidence.
+var toolNetworkDenialVendors = []AgentVendor{
+	AgentVendorCodex,
+}
+
+// VendorSupportsToolNetworkDenial reports whether vendor can serve a
+// validation-gated run. Unknown vendors report false so the gate fails closed.
+func VendorSupportsToolNetworkDenial(vendor AgentVendor) bool {
+	for _, candidate := range toolNetworkDenialVendors {
+		if candidate == vendor {
+			return true
+		}
+	}
+	return false
+}
+
+// ToolNetworkDenialVendors returns the supported vendors in a stable order.
+func ToolNetworkDenialVendors() []AgentVendor {
+	return append([]AgentVendor(nil), toolNetworkDenialVendors...)
+}
+
 func codingRoleAgentBinding(roles RoleConfigs, role string) *RoleAgentConfig {
 	entry, ok := EffectiveCodingRoles(roles)[role]
 	if !ok || !isCodingRole(role) {

@@ -2,6 +2,7 @@ package failureclass
 
 import (
 	"errors"
+	"fmt"
 	"testing"
 )
 
@@ -141,5 +142,14 @@ func TestClassifyPermanentExternalDenialsStayTerminal(t *testing.T) {
 				t.Fatalf("Classify() = %s, want %s", got, NonRetryable)
 			}
 		})
+	}
+}
+
+func TestClassifyStaticConfigMismatchNeverRetries(t *testing.T) {
+	err := fmt.Errorf("agent vendor %q cannot deny tool network access: %w", "claude-code", ErrStaticConfigMismatch)
+	for _, boundary := range []Boundary{BoundaryUnknown, BoundaryModelProvider, BoundaryAgentProcess} {
+		if got := Classify(err, Context{Runner: RunnerFixer, Boundary: boundary}); got != ManualIntervention {
+			t.Fatalf("Classify(%s) = %q, want %q", boundary, got, ManualIntervention)
+		}
 	}
 }

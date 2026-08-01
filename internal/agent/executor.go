@@ -22,6 +22,7 @@ import (
 	"github.com/MumuTW/looper/internal/eventlog"
 	"github.com/MumuTW/looper/internal/forge"
 	"github.com/MumuTW/looper/internal/lifecycle"
+	"github.com/MumuTW/looper/internal/loops/failureclass"
 	"github.com/MumuTW/looper/internal/processcontainment"
 	"github.com/MumuTW/looper/internal/processidentity"
 	"github.com/MumuTW/looper/internal/storage"
@@ -463,8 +464,8 @@ func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Executi
 	startedAt := e.now().UTC()
 	startedAtISO := eventlog.FormatJavaScriptISOString(startedAt)
 	cfg := e.effectiveConfig(input)
-	if input.RestrictToolNetwork && !runtimeCapabilitySupported(cfg.Vendor, CapabilityToolNetworkRestriction) {
-		return nil, fmt.Errorf("tool-network restriction is supported only for codex; refusing validation-gated %s execution", cfg.Vendor)
+	if input.RestrictToolNetwork && !VendorSupportsToolNetworkDenial(cfg.Vendor) {
+		return nil, unsupportedToolNetworkDenialError(cfg.Vendor)
 	}
 	if input.RestrictToolNetwork {
 		input.Env = maps.Clone(input.Env)
@@ -528,7 +529,10 @@ func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Executi
 	}
 	command, args := ResolveSpawnWithNativeResume(cfg, input.WorkingDirectory, spawnPrompt, resume.SessionID, resume.Enabled)
 	if input.RestrictToolNetwork {
-		args = enforceCodexToolNetworkDenied(args, spawnPrompt, toolSandbox)
+		args, err = enforceToolNetworkDenied(cfg.Vendor, args, spawnPrompt, toolSandbox)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	cmd := exec.Command(command, args...)
@@ -593,7 +597,11 @@ func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Executi
 			}
 			command, args = ResolveSpawn(cfg, input.WorkingDirectory, input.Prompt)
 			if input.RestrictToolNetwork {
-				args = enforceCodexToolNetworkDenied(args, input.Prompt, toolSandbox)
+				restricted, restrictErr := enforceToolNetworkDenied(cfg.Vendor, args, input.Prompt, toolSandbox)
+				if restrictErr != nil {
+					return nil, fmt.Errorf("%w (native resume fallback after: %v)", restrictErr, err)
+				}
+				args = restricted
 			}
 			cmd = exec.Command(command, args...)
 			cmd.Dir = input.WorkingDirectory
@@ -1021,8 +1029,11 @@ func (x *execution) run(ctx context.Context) {
 				errorMessage = fallbackErrorMessage
 				endedAtISO = eventlog.FormatJavaScriptISOString(x.executor.now().UTC())
 			} else if fallbackErr != nil {
-				// Fallback ownership persist failed; process reaped only when
-				// Kill confirmed dead (releaseLease keeps ownership otherwise).
+				// Fallback refused or ownership persist failed. A restriction
+				// refusal (ErrStaticConfigMismatch) surfaces as the execution
+				// error so the runner classifies it as manual intervention; an
+				// ownership persist failure reaps the process only when Kill
+				// confirmed dead (releaseLease keeps ownership otherwise).
 				x.doneCh <- execOutcome{result: result, err: fallbackErr}
 				return
 			}
@@ -1162,7 +1173,21 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 	cfg := x.executor.effectiveConfig(x.input)
 	command, args := ResolveSpawn(cfg, x.input.WorkingDirectory, x.input.Prompt)
 	if x.input.RestrictToolNetwork {
-		args = enforceCodexToolNetworkDenied(args, x.input.Prompt, x.toolSandbox)
+		restricted, restrictErr := enforceToolNetworkDenied(cfg.Vendor, args, x.input.Prompt, x.toolSandbox)
+		if restrictErr != nil {
+			// Fail closed: a restart that cannot re-apply the restriction must
+			// not spawn an unrestricted process. Propagate the original error
+			// (wrapped in ErrStaticConfigMismatch) so the runner classifies
+			// this as manual intervention instead of burning retries on a
+			// static config mismatch — matching the native-resume fallback.
+			x.mu.Lock()
+			x.status = "failed"
+			x.nativeResumeStatus = "fallback_failed"
+			x.nativeResumeError = firstNonEmpty(restrictErr.Error(), nativeError)
+			x.mu.Unlock()
+			return Result{}, "", false, restrictErr
+		}
+		args = restricted
 	}
 	cmd := exec.Command(command, args...)
 	cmd.Dir = x.input.WorkingDirectory
@@ -2318,6 +2343,29 @@ func resolveDevinArgs(cfg ExecutorConfig, args []string, prompt string) []string
 		resolved = append(resolved, "--print")
 	}
 	return append(resolved, prompt)
+}
+
+// enforceToolNetworkDenied applies the resolved vendor's tool-network denial.
+// A vendor without an implementation is refused rather than run unrestricted.
+func enforceToolNetworkDenied(vendor config.AgentVendor, args []string, prompt string, sandbox *validationcmd.Sandbox) ([]string, error) {
+	adapter, ok := runtimeAdapterFor(vendor)
+	if !ok || adapter.enforceToolNetworkDenied == nil {
+		return nil, unsupportedToolNetworkDenialError(vendor)
+	}
+	return adapter.enforceToolNetworkDenied(args, prompt, sandbox)
+}
+
+// unsupportedToolNetworkDenialError is a static configuration mismatch, not a
+// transient one: retrying the same vendor can only fail the same way.
+func unsupportedToolNetworkDenialError(vendor config.AgentVendor) error {
+	supported := make([]string, 0, 4)
+	for _, candidate := range ToolNetworkDenialVendors() {
+		supported = append(supported, string(candidate))
+	}
+	return fmt.Errorf(
+		"agent vendor %q cannot deny tool network access; validation-gated execution requires one of: %s. Switch roles.worker.agent.vendor / roles.fixer.agent.vendor, or set the project's validation.optOut=true: %w",
+		vendor, strings.Join(supported, ", "), failureclass.ErrStaticConfigMismatch,
+	)
 }
 
 func resolveNativeResumeArgs(cfg ExecutorConfig, workingDirectory string, args []string, sessionID string, prompt string) []string {
