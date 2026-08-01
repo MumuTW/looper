@@ -15,6 +15,7 @@ func TestForcedManualWorkerMetadataInitializesNestedOverride(t *testing.T) {
 		{name: "empty object", in: stringPtr("{}")},
 		{name: "missing worker", in: stringPtr(`{"source":"manual"}`)},
 		{name: "non-object worker", in: stringPtr(`{"worker":"legacy","source":"manual"}`)},
+		{name: "auto discovered worker", in: stringPtr(`{"worker":{"autoDiscovered":true},"source":"manual"}`)},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
