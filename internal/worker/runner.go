@@ -57,7 +57,7 @@ const (
 	maxRetryDelay           = 300 * time.Second
 	defaultRetryMax         = 3
 	defaultIssueLimit       = 30
-	personalIssueQueryLimit = 1000
+	personalIssueQueryLimit = 100
 
 	workerBranchSlugMaxLength        = 30
 	workerBranchSlugMaxWords         = 5
@@ -981,7 +981,8 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 		}
 		assigned, err := r.assignPersonalIssueIfEligible(ctx, *project, input.Repo, issue, login, personalProject, policy.RequireAssigneeCurrentUser)
 		if err != nil {
-			return DiscoveryResult{}, err
+			result.Skipped++
+			continue
 		}
 		issue = assigned
 		if issue.PersonalAssigneeAutoAssigned {

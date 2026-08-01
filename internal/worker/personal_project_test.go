@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
@@ -129,9 +130,8 @@ func TestDiscoverIssuesPersonalProjectRoutedNetworkDoesNotAssign(t *testing.T) {
 	gateway := &fakeGitHubGateway{currentLogin: "octocat", issues: []IssueSummary{{Number: 605, Author: "octocat", Labels: []string{labels.DefaultWorkerReadyTrigger}}}}
 	cfg := personalWorkerConfig(t)
 	cfg.Projects[0].Network.Mode = config.NetworkModeRouted
-	fixture, runner := newPersonalWorkerRunner(t, gateway, &cfg)
+	_, runner := newPersonalWorkerRunner(t, gateway, &cfg)
 	runner.network = &stubWorkerNetwork{status: protocol.NodeStatusResponse{Membership: protocol.Membership{NodeName: "worker-1"}}}
-	_ = fixture
 	result, err := runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
 	if err != nil {
 		t.Fatalf("DiscoverIssues() error = %v", err)
@@ -171,5 +171,24 @@ func TestDiscoverIssuesPersonalProjectClaimConflictSkipsBeforeAssignment(t *test
 	}
 	if result.Skipped == 0 || len(result.QueueItems) != 0 || len(gateway.addAssigneeCalls) != 0 {
 		t.Fatalf("result=%#v calls=%#v, want claim conflict skipped before assignment", result, gateway.addAssigneeCalls)
+	}
+}
+
+func TestDiscoverIssuesPersonalProjectAssignmentFailureSkipsIssue(t *testing.T) {
+	gateway := &fakeGitHubGateway{currentLogin: "octocat", addAssigneeErr: errors.New("assignment unavailable"), issues: []IssueSummary{
+		{Number: 608, Author: "octocat", Labels: []string{labels.DefaultWorkerReadyTrigger}},
+		{Number: 609, Author: "octocat", Labels: []string{labels.DefaultWorkerReadyTrigger}},
+	}}
+	cfg := personalWorkerConfig(t)
+	_, runner := newPersonalWorkerRunner(t, gateway, &cfg)
+	result, err := runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("DiscoverIssues() error = %v, want per-issue assignment failure to be skipped", err)
+	}
+	if result.Skipped != 2 || len(result.QueueItems) != 0 || len(gateway.addAssigneeCalls) != 2 {
+		t.Fatalf("result=%#v calls=%#v, want both failed assignments skipped", result, gateway.addAssigneeCalls)
+	}
+	if len(result.CreatedLoopIDs) != 2 {
+		t.Fatalf("created loops=%#v, want both claim-admitted issues retained for retry", result.CreatedLoopIDs)
 	}
 }

@@ -2,6 +2,7 @@ package planner
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -112,5 +113,22 @@ func TestDiscoverIssuesPersonalProjectHoldSkipsBeforeAssignment(t *testing.T) {
 	}
 	if len(result.QueueItems) != 0 || len(gateway.addAssigneeCalls) != 0 {
 		t.Fatalf("result=%#v calls=%#v, want held issue skipped before assignment", result, gateway.addAssigneeCalls)
+	}
+}
+
+func TestDiscoverIssuesPersonalProjectAssignmentFailureSkipsIssue(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{login: "octocat", addAssigneeErr: errors.New("assignment unavailable"), issues: []IssueSummary{
+		{Number: 507, Author: "octocat", Labels: []string{labels.DefaultPlanTrigger}},
+		{Number: 508, Author: "octocat", Labels: []string{labels.DefaultPlanTrigger}},
+	}}
+	cfg := personalPlannerConfig(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Logger: fixture.logger, Now: fixture.now, CustomInstructions: &cfg, DiscoveryPolicy: DiscoveryPolicy{AutoDiscovery: true, Labels: []string{labels.DefaultPlanTrigger}, LabelMode: config.LabelModeAll, RequireAssigneeCurrentUser: true}})
+	result, err := runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("DiscoverIssues() error = %v, want per-issue assignment failure to be skipped", err)
+	}
+	if result.Skipped != 2 || len(result.QueueItems) != 0 || len(github.addAssigneeCalls) != 2 {
+		t.Fatalf("result=%#v calls=%#v, want both failed assignments skipped", result, github.addAssigneeCalls)
 	}
 }
