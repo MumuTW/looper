@@ -445,6 +445,14 @@ func takeoverLoop(ctx context.Context, services looperdruntime.Services, loopID,
 	if services.Loops == nil {
 		return result, fmt.Errorf("loops service is not configured")
 	}
+	// Terminal Fixer cleanup takes the same guard before inspecting the loop and
+	// removing its worktree. Acquire it before the preflight reads (latest
+	// execution + halt preflight) so cleanup cannot observe the loop before
+	// human_takeover, delete the checkout, and leave takeover holding a loop
+	// whose worktree path is now missing. Release immediately after the durable
+	// Hold fence: holding across process drain can deadlock when the cancelled
+	// Fixer reaches its own terminal cleanup and needs this lock.
+	unlockLoop := looperdruntime.LockLoopRequeue(loopID)
 	if services.Repositories != nil && services.Repositories.AgentExecutions != nil {
 		execution, err := services.Repositories.AgentExecutions.GetLatestByLoopID(ctx, loopID)
 		if err != nil {
@@ -453,6 +461,7 @@ func takeoverLoop(ctx context.Context, services looperdruntime.Services, loopID,
 			// needs to resume the exact session. Abort before any lifecycle
 			// mutation; a genuinely absent execution (nil, no error) still
 			// takes over with empty ownership fields.
+			unlockLoop()
 			return result, fmt.Errorf("load latest agent execution before takeover: %w", err)
 		}
 		if execution != nil {
@@ -470,14 +479,10 @@ func takeoverLoop(ctx context.Context, services looperdruntime.Services, loopID,
 	// tick; Hold commits human_takeover and cancellation together.
 	preflight, err := loadHaltPreflight(ctx, services, loopID)
 	if err != nil {
+		unlockLoop()
 		return result, err
 	}
 	reasonCopy := reason
-	// Terminal Fixer cleanup takes the same guard before inspecting the loop and
-	// removing its worktree. Hold the guard only across the durable takeover
-	// fence: releasing it before process drain avoids a deadlock when the
-	// cancelled Fixer reaches its own terminal cleanup and needs this lock.
-	unlockLoop := looperdruntime.LockLoopRequeue(loopID)
 	_, holdErr := services.Loops.Hold(ctx, loopID, &reasonCopy)
 	unlockLoop()
 	if holdErr != nil {
