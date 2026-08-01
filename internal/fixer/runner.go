@@ -702,27 +702,31 @@ type FixerOutcomeFailure struct {
 }
 
 type fixerCheckpoint struct {
-	ResumePolicy     string                      `json:"resumePolicy,omitempty"`
-	Outcome          *FixerRunOutcome            `json:"outcome,omitempty"`
-	Pause            *checkpointPause            `json:"pause,omitempty"`
-	RunStartedAt     string                      `json:"runStartedAt,omitempty"`
-	RunStartedRunID  string                      `json:"runStartedRunId,omitempty"`
-	RunPreStartAt    string                      `json:"runPreStartAt,omitempty"`
-	RunPreStartRunID string                      `json:"runPreStartRunId,omitempty"`
-	Detail           *checkpointDetail           `json:"detail,omitempty"`
-	ClaimedLockKey   string                      `json:"claimedLockKey,omitempty"`
-	FixItems         []FixItem                   `json:"fixItems,omitempty"`
-	FixItemsHash     string                      `json:"fixItemsHash,omitempty"`
-	Worktree         *checkpointWorktree         `json:"worktree,omitempty"`
-	Repair           *checkpointRepair           `json:"repair,omitempty"`
-	Lifecycle        *lifecycle.State            `json:"gitPrLifecycle,omitempty"`
-	ReconcileCommits *checkpointReconcileCommits `json:"reconcileCommits,omitempty"`
-	Validation       *ValidationResult           `json:"validation,omitempty"`
-	Push             *checkpointPush             `json:"push,omitempty"`
-	ResolvedComments *checkpointResolvedComments `json:"resolvedComments,omitempty"`
-	SummaryComment   *checkpointSummaryComment   `json:"summaryComment,omitempty"`
-	Recheck          *checkpointRecheck          `json:"recheck,omitempty"`
-	Reproduction     *reproducer.Manifest        `json:"reproduction,omitempty"`
+	ResumePolicy     string              `json:"resumePolicy,omitempty"`
+	Outcome          *FixerRunOutcome    `json:"outcome,omitempty"`
+	Pause            *checkpointPause    `json:"pause,omitempty"`
+	RunStartedAt     string              `json:"runStartedAt,omitempty"`
+	RunStartedRunID  string              `json:"runStartedRunId,omitempty"`
+	RunPreStartAt    string              `json:"runPreStartAt,omitempty"`
+	RunPreStartRunID string              `json:"runPreStartRunId,omitempty"`
+	Detail           *checkpointDetail   `json:"detail,omitempty"`
+	ClaimedLockKey   string              `json:"claimedLockKey,omitempty"`
+	FixItems         []FixItem           `json:"fixItems,omitempty"`
+	FixItemsHash     string              `json:"fixItemsHash,omitempty"`
+	Worktree         *checkpointWorktree `json:"worktree,omitempty"`
+	Repair           *checkpointRepair   `json:"repair,omitempty"`
+	// PendingAgentExecutionID is set after agent Start and persisted before
+	// Wait so a crash mid-repair is durable evidence that first reproduction
+	// capture already ran. Repair is only assigned after Wait returns.
+	PendingAgentExecutionID string                      `json:"pendingAgentExecutionId,omitempty"`
+	Lifecycle               *lifecycle.State            `json:"gitPrLifecycle,omitempty"`
+	ReconcileCommits        *checkpointReconcileCommits `json:"reconcileCommits,omitempty"`
+	Validation              *ValidationResult           `json:"validation,omitempty"`
+	Push                    *checkpointPush             `json:"push,omitempty"`
+	ResolvedComments        *checkpointResolvedComments `json:"resolvedComments,omitempty"`
+	SummaryComment          *checkpointSummaryComment   `json:"summaryComment,omitempty"`
+	Recheck                 *checkpointRecheck          `json:"recheck,omitempty"`
+	Reproduction            *reproducer.Manifest        `json:"reproduction,omitempty"`
 	// ReproductionAbsent is set when the first capture observes no committed
 	// manifest. Later captures refuse to adopt an agent-authored manifest so
 	// the daemon cannot execute a testCommand that was not present at run start.
@@ -985,9 +989,11 @@ func captureFixerReproduction(checkpoint *fixerCheckpoint, worktreePath string) 
 // captureFixerReproduction call, so treating that as "already captured" would
 // refuse every base-branch manifest on a brand-new Fixer run.
 func fixerPastInitialReproductionCapture(checkpoint fixerCheckpoint) bool {
-	// Steps after the initial capture opportunity. Repair may be set once the
-	// agent has started even if it has not completed.
+	// Steps after the initial capture opportunity. Repair is assigned only
+	// after Wait returns; PendingAgentExecutionID covers the active-agent
+	// window so a crash mid-Wait fails closed for legacy adoption.
 	return checkpoint.Repair != nil ||
+		strings.TrimSpace(checkpoint.PendingAgentExecutionID) != "" ||
 		checkpoint.Validation != nil ||
 		checkpoint.Push != nil ||
 		checkpoint.ReconcileCommits != nil ||
@@ -3370,6 +3376,13 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 			return checkpoint, err
 		}
 	}
+	// Durable "agent is live" marker before Wait. Repair is only written after
+	// Wait; without this, a crash mid-Wait leaves no past-initial evidence and
+	// resume could adopt an agent-authored reproduction manifest.
+	checkpoint.PendingAgentExecutionID = executionID
+	if err := r.persistCheckpoint(ctx, input.Run.ID, stepRepair, checkpoint); err != nil {
+		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+	}
 	result, err := execution.Wait(ctx)
 	if err != nil {
 		return checkpoint, err
@@ -3380,6 +3393,7 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 		return checkpoint, &holdSkipError{summary: summary}
 	}
 	if !strings.EqualFold(result.Status, "completed") {
+		checkpoint.PendingAgentExecutionID = ""
 		checkpoint.Repair = checkpointRepairFromAgentResult(executionID, detailHeadSHA(checkpoint.Detail), result, r.nowISO())
 		checkpoint.ResumePolicy = "retry_from_timeout_context"
 		if err := r.persistCheckpoint(ctx, input.Run.ID, stepRepair, checkpoint); err != nil {
@@ -3396,6 +3410,7 @@ func (r *Runner) runRepairStep(ctx context.Context, input stepInput) (fixerCheck
 	// same evidence, including the transcript scan that only the live result
 	// carries.
 	repair := checkpointRepairFromAgentResult(executionID, detailHeadSHA(checkpoint.Detail), result, r.nowISO())
+	checkpoint.PendingAgentExecutionID = ""
 	if err := validateCompletedRepairCheckpoint(repair, checkpoint.Worktree); err != nil {
 		checkpoint.Repair = repair
 		checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
