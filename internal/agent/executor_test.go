@@ -17,6 +17,7 @@ import (
 
 	"github.com/MumuTW/looper/internal/config"
 	"github.com/MumuTW/looper/internal/forge"
+	"github.com/MumuTW/looper/internal/loops/failureclass"
 	"github.com/MumuTW/looper/internal/processcontainment"
 	"github.com/MumuTW/looper/internal/processidentity"
 	"github.com/MumuTW/looper/internal/storage"
@@ -190,13 +191,54 @@ func TestRestrictedAgentSandboxConfigIsAcceptedByCodexExec(t *testing.T) {
 	}
 }
 
-func TestConfiguredExecutorRejectsRestrictedNonCodexAgent(t *testing.T) {
+func TestConfiguredExecutorRejectsRestrictedUnsupportedVendor(t *testing.T) {
 	t.Parallel()
 
-	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendorClaudeCode}})
-	_, err := executor.Start(context.Background(), RunInput{Prompt: "hello", WorkingDirectory: t.TempDir(), RestrictToolNetwork: true})
-	if err == nil || !strings.Contains(err.Error(), "supported only for codex") {
-		t.Fatalf("Start() error = %v, want fail-closed unsupported-vendor error", err)
+	for _, vendor := range []config.AgentVendor{config.AgentVendorClaudeCode, config.AgentVendor("not-a-vendor")} {
+		vendor := vendor
+		t.Run(string(vendor), func(t *testing.T) {
+			t.Parallel()
+			executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: vendor}})
+			_, err := executor.Start(context.Background(), RunInput{Prompt: "hello", WorkingDirectory: t.TempDir(), RestrictToolNetwork: true})
+			if err == nil {
+				t.Fatal("Start() error = nil, want fail-closed unsupported-vendor error")
+			}
+			if !strings.Contains(err.Error(), string(vendor)) {
+				t.Fatalf("Start() error = %v, want the vendor named", err)
+			}
+			for _, supported := range ToolNetworkDenialVendors() {
+				if !strings.Contains(err.Error(), string(supported)) {
+					t.Fatalf("Start() error = %v, want supported vendor %q named", err, supported)
+				}
+			}
+			// A vendor that cannot express the restriction is a static config
+			// mismatch: retrying it burns attempts and trips the breaker.
+			if !errors.Is(err, failureclass.ErrStaticConfigMismatch) {
+				t.Fatalf("Start() error = %v, want a static-config-mismatch classification", err)
+			}
+			if kind := failureclass.Classify(err, failureclass.Context{Runner: failureclass.RunnerFixer, Boundary: failureclass.BoundaryModelProvider}); kind != failureclass.ManualIntervention {
+				t.Fatalf("Classify() = %q, want %q", kind, failureclass.ManualIntervention)
+			}
+		})
+	}
+}
+
+// TestToolNetworkDenialVendorsMatchAdapterTable is the drift guard between the
+// adapter table (source of truth) and the allowlist internal/config carries so
+// startup validation can reject the mismatch without importing internal/agent.
+func TestToolNetworkDenialVendorsMatchAdapterTable(t *testing.T) {
+	t.Parallel()
+
+	got := ToolNetworkDenialVendors()
+	want := config.ToolNetworkDenialVendors()
+	slices.Sort(want)
+	if !slices.Equal(got, want) {
+		t.Fatalf("adapter vendors %#v differ from config.ToolNetworkDenialVendors() %#v; update internal/config/agent_resolve.go", got, want)
+	}
+	for _, vendor := range config.ConfigurableAgentVendors() {
+		if VendorSupportsToolNetworkDenial(vendor) != config.VendorSupportsToolNetworkDenial(vendor) {
+			t.Fatalf("vendor %q: adapter support = %v, config support = %v", vendor, VendorSupportsToolNetworkDenial(vendor), config.VendorSupportsToolNetworkDenial(vendor))
+		}
 	}
 }
 
@@ -1676,6 +1718,41 @@ func TestCheckpointFallbackReapsSpawnWhenOwnershipPersistenceFails(t *testing.T)
 	}
 	if !strings.Contains(err.Error(), "persist fallback agent execution ownership") {
 		t.Fatalf("runCheckpointFallback() error = %v, want ownership persistence message", err)
+	}
+}
+
+// TestCheckpointFallbackPropagatesToolNetworkRestrictionRefusal verifies that a
+// checkpoint-restart fallback which cannot re-apply the tool-network restriction
+// returns the original ErrStaticConfigMismatch error instead of swallowing it.
+// Without propagation, both runners see only a non-completed Result and classify
+// the static config mismatch as retryable_transient, burning retries and tripping
+// the failure-streak circuit breaker.
+func TestCheckpointFallbackPropagatesToolNetworkRestrictionRefusal(t *testing.T) {
+	executor := New(ExecutorOptions{Config: ExecutorConfig{Vendor: config.AgentVendorClaudeCode}})
+	x := &execution{
+		executor:       executor,
+		input:          RunInput{WorkingDirectory: t.TempDir(), Prompt: "retry", RestrictToolNetwork: true},
+		executionID:    "agent_fallback_restriction_refusal",
+		startedAt:      time.Now(),
+		startedAtISO:   time.Now().UTC().Format("2006-01-02T15:04:05.000Z"),
+		maxOutputBytes: defaultMaxOutputBytes,
+	}
+
+	_, _, ok, err := x.runCheckpointFallback(context.Background(), "resume failed")
+	if ok {
+		t.Fatal("runCheckpointFallback() ok = true, want restriction refusal")
+	}
+	if err == nil {
+		t.Fatal("runCheckpointFallback() error = nil, want fail-closed restriction error")
+	}
+	if !errors.Is(err, failureclass.ErrStaticConfigMismatch) {
+		t.Fatalf("runCheckpointFallback() error = %v, want ErrStaticConfigMismatch", err)
+	}
+	if !strings.Contains(err.Error(), string(config.AgentVendorClaudeCode)) {
+		t.Fatalf("runCheckpointFallback() error = %v, want the vendor named", err)
+	}
+	if kind := failureclass.Classify(err, failureclass.Context{Runner: failureclass.RunnerFixer, Boundary: failureclass.BoundaryModelProvider}); kind != failureclass.ManualIntervention {
+		t.Fatalf("Classify() = %q, want %q", kind, failureclass.ManualIntervention)
 	}
 }
 

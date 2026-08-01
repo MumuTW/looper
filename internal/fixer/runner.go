@@ -2040,10 +2040,6 @@ func (r *Runner) discoverPullRequestFromDetail(ctx context.Context, project stor
 		result.Skipped++
 		return nil
 	}
-	if len(allFixItems) == 0 {
-		result.Skipped++
-		return nil
-	}
 	allFixItemsStateHash := hashFixItemsState(allFixItems)
 	fixItems := suppressDeclinedFixItems(loopMetadataForPR(ctx, r, project.ID, repo, detail.Number), detail.HeadSHA, allFixItems)
 	if len(fixItems) == 0 {
@@ -4791,7 +4787,7 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 	initialCheckpoint.RunStartedRunID = ""
 	nowISO := r.nowISO()
 	run := storage.RunRecord{ID: eventlog.NewEventID("run"), LoopID: loop.ID, Status: "running", CurrentStep: stringPtr(string(startStep)), StartedAt: nowISO, LastHeartbeatAt: stringPtr(nowISO), CreatedAt: nowISO, UpdatedAt: nowISO}
-	snapshotJSON, err := r.agentSnapshotJSONForNewRun(latestRun, stickySnapshot)
+	snapshotJSON, err := r.agentSnapshotJSONForNewRun(latestRun, stickySnapshot, len(r.validationCommandsForProject(loop.ProjectID)) > 0, workflow.Reaches(startStep, stepRepair))
 	if err != nil {
 		return resumedRunContext{}, err
 	}
@@ -8839,14 +8835,23 @@ func optionalString(value string) *string {
 	return &value
 }
 
-func (r *Runner) agentSnapshotJSONForNewRun(previous *storage.RunRecord, sticky bool) (*string, error) {
+func (r *Runner) agentSnapshotJSONForNewRun(previous *storage.RunRecord, sticky, requireToolNetworkDenial, replaysAgentStep bool) (*string, error) {
 	var previousSnapshot *string
 	if previous != nil {
 		previousSnapshot = previous.AgentSnapshotJSON
 	}
-	snapshotJSON, legacyResume, err := config.ResolveRunAgentSnapshotJSON(previousSnapshot, sticky, r.agentRuntime, r.agentModel, r.agentProfileID)
+	snapshotJSON, refreshed, legacyResume, err := config.ResolveRunAgentSnapshotJSONForValidationGate(previousSnapshot, sticky, requireToolNetworkDenial, replaysAgentStep, r.agentRuntime, r.agentModel, r.agentProfileID)
 	if err != nil {
 		return nil, err
+	}
+	if refreshed && r.logger != nil && previous != nil {
+		r.logger.Warn("refreshed stale agent snapshot whose vendor cannot serve the validation gate; using current runner agent identity", map[string]any{
+			"loopId":   previous.LoopID,
+			"runId":    previous.ID,
+			"vendor":   r.agentRuntime,
+			"model":    derefString(r.agentModel),
+			"previous": derefString(previousSnapshot),
+		})
 	}
 	if legacyResume && r.logger != nil && previous != nil {
 		r.logger.Warn("resuming run without agent_snapshot_json; using current runner agent identity", map[string]any{
