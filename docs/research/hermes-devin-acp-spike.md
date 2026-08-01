@@ -184,8 +184,7 @@ constraints found along the way:
   ([#L125-L134](https://github.com/NousResearch/hermes-agent/blob/v2026.7.20/agent/copilot_acp_client.py#L125-L134)),
   so a registered, discovered tool still gets rejected at call time. Devin
   offers `allow_once` / `allow_session` / `allow_always` (plus server-scoped
-  variants); the carried patch selects only `allow_once` and denies if it is
-  unavailable.
+  variants); selecting one is what turned the probe green.
 
 So a Hermes patch to make Hermes-side tools reachable is smaller and less
 invasive than "map Hermes tools onto Devin's tool surface": expose the
@@ -304,32 +303,12 @@ Two components, plus profile wiring:
   replaces the shim's blanket denial with an allow-list gate. Deny is still
   the default and the list is empty unless `HERMES_ACP_ALLOWED_MCP_TOOLS` is
   set, so an unconfigured install behaves exactly like stock Hermes. Only
-  `allow_once` can ever be selected: `allow_session` and every broader option
-  outlive the call, `switch_bypass` drops the gate entirely, and the
+  `allow_once` can ever be selected: every other offered approval option
+  outlives that call, `switch_bypass` drops the gate entirely, and the
   `allow_server_*` options approve *every* tool on that server — including
   ones never allow-listed, which would defeat the per-tool list. The apply
   script pins both stock and patched checksums and refuses to touch a Hermes
   that has moved underneath it.
-
-  **Checksum-gate trade-off:** delete the hashes and `patch` can still apply
-  its small hunks to a changed shim when their local context happens to match,
-  while leaving all unexamined surrounding behavior from an unsupported Hermes
-  release in place. The concrete failure prevented is an operator believing
-  that the reviewed `allow_once` gate was installed when only a textual hunk
-  applied to an incompatible implementation; `patch` succeeding is not
-  authority that the whole target is the version the capture exercised. The
-  hashes still do not catch a runtime or protocol change outside that file,
-  nor prove that the pinned file is safe against a hostile backend — live
-  replay and the disposable-workspace boundary remain necessary.
-
-  **Authority:** the action authority is the operator's exact
-  `HERMES_ACP_ALLOWED_MCP_TOOLS` configuration, not the ACP backend's
-  `_meta`. The backend's earlier `_meta` tool name only correlates its later
-  `toolCallId` request to that already-authorized name; absent either an exact
-  allow-list match or an offered `allow_once`, the patch denies. This does not
-  authenticate a hostile backend — the metadata and request are both vendor
-  output — so the allow-list constrains model tool choice under an honest
-  backend, while the disposable workspace remains the containment boundary.
 
 ### Two defects the e2e caught
 
@@ -348,18 +327,22 @@ recorded here because the wire shapes are not documented anywhere:
    server"), which would mean gating security on UI copy — rejected.
    Using the fully-qualified name also pins the server, so another server
    exposing a same-named tool does not inherit the grant.
-2. **Devin spawns the MCP server, so `HERMES_HOME` does not propagate.**
-   The server correctly refused to write rather than guessing a profile.
-   Register it with the profile baked in: `devin mcp add <name> -e
-   HERMES_HOME=<profile> -- <path to memory_mcp_server.py>`.
+2. **Devin spawns the MCP server, so shell environment does not propagate.**
+   The server correctly refused to write rather than guessing a profile, and
+   a non-default Hermes install cannot be imported unless its
+   `HERMES_INSTALL_DIR` is also registered. Register both values with the
+   profile baked in: `devin mcp add <name> -e HERMES_HOME=<profile> -e
+   HERMES_INSTALL_DIR=<hermes-agent root> -- <path to memory_mcp_server.py>`.
 
 ### Setup
 
 ```bash
+export HERMES_HOME="$(scripts/hermes-profile.sh --print)"
+export HERMES_INSTALL_DIR="${HERMES_INSTALL_DIR:-$HOME/.hermes/hermes-agent}"
 tools/hermes-devin/apply-hermes-patch.sh          # once; --revert to undo
 devin mcp add hermes-memory \
-  -e HERMES_HOME="$HOME/.hermes/profiles/looper" \
-  -e HERMES_INSTALL_DIR="$HOME/.hermes/hermes-agent" \
+  -e HERMES_HOME="$HERMES_HOME" \
+  -e HERMES_INSTALL_DIR="$HERMES_INSTALL_DIR" \
   -- "$PWD/tools/hermes-devin/memory_mcp_server.py"
 ```
 
@@ -392,21 +375,17 @@ selection, so every clone drives the same profile and the same backend:
 
 ```bash
 scripts/hermes-profile.sh --bootstrap   # create/repair the profile (once)
-export HERMES_HOME="$(scripts/hermes-profile.sh --print)" # any shell
+export HERMES_HOME="$(scripts/hermes-profile.sh --print)"
 hermes
 ```
 
-`source scripts/hermes-profile.sh` is a Bash-only convenience. Do not source
-it from zsh, fish, dash, or another shell: the script intentionally uses Bash
-arrays. The `--print`/`export` form above executes its Bash shebang and works
-from any shell that supports command substitution.
-
 The profile directory itself (config.yaml, .env, SOUL.md, memories/) is user
-state and is not checked in. `--bootstrap` creates missing config files,
-leaves matching files alone, and skips differing ones unless `--force` is
-given; forced replacement first writes a timestamped backup. Repo-scoped
-memory is a real benefit here: the looper profile's memory stays separate from
-the default profile's.
+state and is not checked in. On a new profile, `--bootstrap` replaces the
+generated defaults with this repo's `config.yaml` and `.env` templates. On an
+existing profile it preserves either file when it differs, reports the skip,
+and requires an explicit `--force` (which first backs up the file) to replace
+it; `memories/` is always untouched. Repo-scoped memory is a real benefit
+here: the looper profile's memory stays separate from the default profile's.
 
 ## Reproduce (without the profile script)
 
