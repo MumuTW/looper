@@ -475,6 +475,28 @@ func (r *FeishuThreadsRepository) LoopByRoot(ctx context.Context, rootMessageID 
 
 type EventsRepository struct{ q sqliteQuerier }
 
+// TriageSourceStateRecord is a bounded projection of authoritative triage
+// lifecycle payloads. Projected and Retired mean that at least one terminal
+// event exists for SourceKey; event timestamps do not establish terminality.
+type TriageSourceStateRecord struct {
+	SourceKey      string
+	EnrollmentJSON *string
+	ReportJSON     *string
+	Projected      bool
+	Retired        bool
+}
+
+const triageSourceKeySQL = `CASE event_type
+	WHEN 'triage.enrolled' THEN json_extract(payload_json, '$.idempotencyKey')
+	WHEN 'triage.report' THEN json_extract(payload_json, '$.idempotencyKey')
+	WHEN 'triage.confirmed' THEN json_extract(payload_json, '$.reportKey')
+	WHEN 'triage.routed' THEN json_extract(payload_json, '$.reportKey')
+	WHEN 'triage.retired' THEN json_extract(payload_json, '$.enrollmentKey')
+END`
+
+const triageLifecyclePredicateSQL = `entity_type = 'github_issue'
+	AND event_type IN ('triage.enrolled', 'triage.report', 'triage.confirmed', 'triage.routed', 'triage.retired')`
+
 func (r *EventsRepository) Append(ctx context.Context, record EventLogRecord) error {
 	_, err := r.q.ExecContext(ctx, `
 		INSERT INTO event_logs (
@@ -600,6 +622,116 @@ func (r *EventsRepository) ListByProjectAndEntityType(ctx context.Context, proje
 	defer rows.Close()
 
 	return scanEventLogs(rows)
+}
+
+// ListTriageSourceStates returns lifecycle state for the requested source
+// keys. The JSON payload key is the source identity authority; the expression
+// index only makes that authority directly addressable.
+func (r *EventsRepository) ListTriageSourceStates(ctx context.Context, projectID string, sourceKeys []string) ([]TriageSourceStateRecord, error) {
+	if len(sourceKeys) == 0 {
+		return []TriageSourceStateRecord{}, nil
+	}
+	records := make([]TriageSourceStateRecord, 0, len(sourceKeys))
+	for _, chunk := range chunkStrings(sourceKeys, sqliteMaxVariables-1) {
+		args := make([]any, 0, len(chunk)+1)
+		args = append(args, projectID)
+		for _, sourceKey := range chunk {
+			args = append(args, sourceKey)
+		}
+		rows, err := r.q.QueryContext(ctx, `
+			SELECT `+triageSourceKeySQL+` AS source_key,
+				MIN(CASE WHEN event_type = 'triage.enrolled' THEN payload_json END),
+				MIN(CASE WHEN event_type = 'triage.report' THEN payload_json END),
+				MAX(event_type = 'triage.routed'),
+				MAX(event_type = 'triage.retired')
+			FROM event_logs INDEXED BY idx_event_logs_triage_source_key
+			WHERE project_id = ? AND `+triageLifecyclePredicateSQL+`
+				AND `+triageSourceKeySQL+` IN (`+sqlPlaceholders(len(chunk))+`)
+			GROUP BY source_key
+		`, args...)
+		if err != nil {
+			return nil, fmt.Errorf("list triage source states: %w", err)
+		}
+		chunkRecords, err := scanTriageSourceStates(rows)
+		if err != nil {
+			return nil, err
+		}
+		records = append(records, chunkRecords...)
+	}
+	return records, nil
+}
+
+// ListTriageSourceStateWindow returns at most limit source lifecycles, rotating
+// after afterSourceKey and wrapping once. Terminal sources intentionally count
+// against the window: asking SQL to skip unbounded terminal history until it
+// found limit pending rows would leave each tick's database work unbounded.
+func (r *EventsRepository) ListTriageSourceStateWindow(ctx context.Context, projectID, afterSourceKey string, limit int) ([]TriageSourceStateRecord, error) {
+	if limit <= 0 {
+		return []TriageSourceStateRecord{}, nil
+	}
+	records, err := r.listTriageSourceStateRange(ctx, projectID, afterSourceKey, ">", limit)
+	if err != nil {
+		return nil, err
+	}
+	if afterSourceKey == "" || len(records) == limit {
+		return records, nil
+	}
+	wrapped, err := r.listTriageSourceStateRange(ctx, projectID, afterSourceKey, "<=", limit-len(records))
+	if err != nil {
+		return nil, err
+	}
+	return append(records, wrapped...), nil
+}
+
+func (r *EventsRepository) listTriageSourceStateRange(ctx context.Context, projectID, cursor, comparison string, limit int) ([]TriageSourceStateRecord, error) {
+	if comparison != ">" && comparison != "<=" {
+		return nil, fmt.Errorf("unsupported triage source cursor comparison %q", comparison)
+	}
+	rows, err := r.q.QueryContext(ctx, `
+		SELECT `+triageSourceKeySQL+` AS source_key,
+			MIN(CASE WHEN event_type = 'triage.enrolled' THEN payload_json END),
+			MIN(CASE WHEN event_type = 'triage.report' THEN payload_json END),
+			MAX(event_type = 'triage.routed'),
+			MAX(event_type = 'triage.retired')
+		FROM event_logs INDEXED BY idx_event_logs_triage_source_key
+		WHERE project_id = ? AND `+triageLifecyclePredicateSQL+`
+			AND `+triageSourceKeySQL+` `+comparison+` ?
+		GROUP BY source_key
+		ORDER BY source_key
+		LIMIT ?
+	`, projectID, cursor, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list triage source state window: %w", err)
+	}
+	return scanTriageSourceStates(rows)
+}
+
+func scanTriageSourceStates(rows *sql.Rows) ([]TriageSourceStateRecord, error) {
+	defer rows.Close()
+	records := []TriageSourceStateRecord{}
+	for rows.Next() {
+		var record TriageSourceStateRecord
+		var enrollmentJSON, reportJSON sql.NullString
+		var projected, retired int
+		if err := rows.Scan(&record.SourceKey, &enrollmentJSON, &reportJSON, &projected, &retired); err != nil {
+			return nil, fmt.Errorf("scan triage source state: %w", err)
+		}
+		if enrollmentJSON.Valid {
+			value := enrollmentJSON.String
+			record.EnrollmentJSON = &value
+		}
+		if reportJSON.Valid {
+			value := reportJSON.String
+			record.ReportJSON = &value
+		}
+		record.Projected = projected != 0
+		record.Retired = retired != 0
+		records = append(records, record)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate triage source states: %w", err)
+	}
+	return records, nil
 }
 
 type ProjectsRepository struct{ q sqliteQuerier }

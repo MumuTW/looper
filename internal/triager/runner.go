@@ -9,10 +9,12 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/MumuTW/looper/internal/domain"
@@ -62,16 +64,21 @@ const (
 	NextRolePlanner NextRole = "planner"
 	NextRoleHuman   NextRole = "human"
 
-	defaultIssueLimit                     = 100
-	defaultDecisionLimit                  = 1
-	defaultSourceLookback                 = 5 * time.Minute
-	autoRouteConfidence                   = 0.8
-	reportEntityType                      = "github_issue"
-	sourceEventNew        SourceEventKind = "new"
-	sourceEventReopened   SourceEventKind = "reopened"
+	defaultIssueLimit                      = 100
+	defaultDecisionLimit                   = 1
+	pendingForgeReadLimit                  = 12
+	pendingSourceScanLimit                 = 64
+	defaultSourceLookback                  = 5 * time.Minute
+	autoRouteConfidence                    = 0.8
+	reportEntityType                       = "github_issue"
+	sourceEventNew         SourceEventKind = "new"
+	sourceEventReopened    SourceEventKind = "reopened"
 )
 
-const DefaultDecisionLimit = defaultDecisionLimit
+const (
+	DefaultDecisionLimit         = defaultDecisionLimit
+	DefaultPendingForgeReadLimit = pendingForgeReadLimit
+)
 
 type Classification string
 type Scope string
@@ -194,13 +201,17 @@ type Options struct {
 // Stateful: it persists enrollment, report, confirmation, and projection
 // events in the local SQLite event log.
 type Runner struct {
-	repos          *storage.Repositories
-	github         GitHubGateway
-	llm            LLM
-	planner        PlannerRouter
-	now            func() time.Time
-	sourceLookback time.Duration
-	decisionLimit  int
+	repos                *storage.Repositories
+	github               GitHubGateway
+	llm                  LLM
+	planner              PlannerRouter
+	now                  func() time.Time
+	sourceLookback       time.Duration
+	decisionLimit        int
+	awaitingMu           sync.Mutex
+	awaitingCursor       map[string]awaitingRecheckCursor
+	pendingCursor        map[string]string
+	pendingProjectOffset int
 }
 
 type DiscoveryInput struct {
@@ -210,18 +221,23 @@ type DiscoveryInput struct {
 	// DecisionBudget is the tick-wide decision cap shared by every project in the
 	// tick. Nil means uncapped.
 	DecisionBudget *DecisionBudget
+	// PendingForgeReadBudget is shared by all projects in one scheduler tick.
+	// Nil keeps direct Runner calls bounded by the local default.
+	PendingForgeReadBudget *PendingForgeReadBudget
 }
 
 type DiscoveryResult struct {
-	Enrolled             int
-	DecisionsAttempted   int
-	ReportsPersisted     int
-	Routed               int
-	AwaitingConfirmation int
-	Confirmed            int
-	Skipped              int
-	Retired              int
-	QueueItems           []storage.QueueItemRecord
+	Enrolled               int
+	DecisionsAttempted     int
+	ReportsPersisted       int
+	Routed                 int
+	AwaitingConfirmation   int
+	Confirmed              int
+	Skipped                int
+	Retired                int
+	PendingForgeReads      int
+	PendingSourcesDeferred int
+	QueueItems             []storage.QueueItemRecord
 }
 
 func New(options Options) *Runner {
@@ -240,7 +256,22 @@ func New(options Options) *Runner {
 	return &Runner{
 		repos: options.Repos, github: options.GitHub, llm: options.LLM,
 		planner: options.Planner, now: now, sourceLookback: sourceLookback, decisionLimit: decisionLimit,
+		awaitingCursor: map[string]awaitingRecheckCursor{},
+		pendingCursor:  map[string]string{},
 	}
+}
+
+// BeginPendingForgeReadTick creates the single actual-call budget for a lane
+// tick. When more projects exist than can receive a useful two-read turn, the
+// starting project rotates in memory across ticks. Restarting resets to the
+// configured first project; the cursor is only a scheduling hint, not durable
+// lifecycle authority.
+func (r *Runner) BeginPendingForgeReadTick(projectIDs []string) *PendingForgeReadBudget {
+	r.awaitingMu.Lock()
+	defer r.awaitingMu.Unlock()
+	budget, next := newFairPendingForgeReadBudget(pendingForgeReadLimit, projectIDs, r.pendingProjectOffset)
+	r.pendingProjectOffset = next
+	return budget
 }
 
 func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (DiscoveryResult, error) {
@@ -261,7 +292,7 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 	if project.Archived {
 		return DiscoveryResult{Skipped: 1}, nil
 	}
-	states, err := r.loadSourceStates(ctx, input.ProjectID, input.Repo)
+	states, err := r.loadPendingSourceStates(ctx, input.ProjectID, input.Repo)
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
@@ -306,6 +337,14 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 		if _, exists := states[key]; exists {
 			continue
 		}
+		existing, err := r.loadSourceStatesByKeys(ctx, input.ProjectID, []string{key})
+		if err != nil {
+			return result, err
+		}
+		if state := existing[key]; state != nil {
+			states[key] = state
+			continue
+		}
 		enrollment := Enrollment{
 			Version: 1, IdempotencyKey: key, ProjectID: input.ProjectID, Repo: input.Repo,
 			IssueNumber: detail.Number, Source: source, CommentID: latestCommentID(detail.Comments),
@@ -323,7 +362,7 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 	// re-verifying it costs a ViewIssue and a ListIssueTimeline every tick. Left
 	// uncapped that grows without bound, because nothing ever removes an awaiting
 	// entry: the oldest here had been re-verified every tick for over seven hours.
-	awaitingRechecks := selectAwaitingRechecks(pending, touched, awaitingRecheckBudget)
+	awaitingRechecks := r.selectAwaitingRechecks(input.ProjectID, input.Repo, pending, touched, awaitingRecheckBudget)
 	for _, state := range pending {
 		if awaitingExpired(state, r.now()) {
 			// Bound the set. A retired source re-enrolls if its issue sees new activity,
@@ -337,7 +376,12 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 			result.Skipped++
 			continue
 		}
-		if err := r.processSourceState(ctx, *project, input.Repo, state, input.DecisionBudget, &result); err != nil {
+		if err := r.processSourceState(ctx, *project, input.Repo, state, input.DecisionBudget, input.PendingForgeReadBudget, &result); err != nil {
+			if errors.Is(err, errPendingForgeReadBudgetExhausted) {
+				result.PendingSourcesDeferred++
+				result.Skipped++
+				continue
+			}
 			return result, err
 		}
 	}
@@ -351,78 +395,65 @@ type sourceState struct {
 	retired    bool
 }
 
-func (r *Runner) loadSourceStates(ctx context.Context, projectID, repo string) (map[string]*sourceState, error) {
-	events, err := r.repos.Events.ListByProjectAndEntityType(ctx, projectID, reportEntityType)
+func (r *Runner) loadPendingSourceStates(ctx context.Context, projectID, repo string) (map[string]*sourceState, error) {
+	cursorKey := strings.ToLower(strings.TrimSpace(projectID)) + "\x00" + strings.ToLower(strings.TrimSpace(repo))
+	r.awaitingMu.Lock()
+	cursor := r.pendingCursor[cursorKey]
+	r.awaitingMu.Unlock()
+	records, err := r.repos.Events.ListTriageSourceStateWindow(ctx, projectID, cursor, pendingSourceScanLimit)
 	if err != nil {
 		return nil, err
 	}
+	if len(records) > 0 {
+		r.awaitingMu.Lock()
+		r.pendingCursor[cursorKey] = records[len(records)-1].SourceKey
+		r.awaitingMu.Unlock()
+	}
+	return sourceStatesFromRecords(records, projectID, repo)
+}
+
+func (r *Runner) loadSourceStatesByKeys(ctx context.Context, projectID string, sourceKeys []string) (map[string]*sourceState, error) {
+	records, err := r.repos.Events.ListTriageSourceStates(ctx, projectID, sourceKeys)
+	if err != nil {
+		return nil, err
+	}
+	return sourceStatesFromRecords(records, projectID, "")
+}
+
+func sourceStatesFromRecords(records []storage.TriageSourceStateRecord, projectID, repo string) (map[string]*sourceState, error) {
 	states := map[string]*sourceState{}
-	for _, event := range events {
-		switch event.EventType {
-		case EnrollmentEventType:
+	for _, record := range records {
+		state := &sourceState{projected: record.Projected, retired: record.Retired}
+		if record.EnrollmentJSON != nil {
 			var enrollment Enrollment
-			if err := json.Unmarshal([]byte(event.PayloadJSON), &enrollment); err != nil {
+			if err := json.Unmarshal([]byte(*record.EnrollmentJSON), &enrollment); err != nil {
 				return nil, fmt.Errorf("decode triage enrollment: %w", err)
 			}
-			if enrollment.ProjectID != projectID || !strings.EqualFold(strings.TrimSpace(enrollment.Repo), strings.TrimSpace(repo)) {
-				continue
+			if enrollment.ProjectID == projectID && (repo == "" || strings.EqualFold(strings.TrimSpace(enrollment.Repo), strings.TrimSpace(repo))) {
+				state.enrollment = enrollment
 			}
-			state := states[enrollment.IdempotencyKey]
-			if state == nil {
-				state = &sourceState{}
-				states[enrollment.IdempotencyKey] = state
-			}
-			state.enrollment = enrollment
-		case ReportEventType:
+		}
+		if record.ReportJSON != nil {
 			var report Report
-			if err := json.Unmarshal([]byte(event.PayloadJSON), &report); err != nil {
+			if err := json.Unmarshal([]byte(*record.ReportJSON), &report); err != nil {
 				return nil, fmt.Errorf("decode persisted triage report: %w", err)
 			}
-			if report.ProjectID != projectID || !strings.EqualFold(strings.TrimSpace(report.Repo), strings.TrimSpace(repo)) {
-				continue
-			}
-			state := states[report.IdempotencyKey]
-			if state == nil {
-				state = &sourceState{}
-				states[report.IdempotencyKey] = state
-			}
-			copy := report
-			state.report = &copy
-			if state.enrollment.IdempotencyKey == "" {
-				state.enrollment = Enrollment{
-					Version: 1, IdempotencyKey: report.IdempotencyKey, ProjectID: report.ProjectID,
-					Repo: report.Repo, IssueNumber: report.IssueNumber, Source: report.Source,
-					EnrolledAt: report.CreatedAt,
+			if report.ProjectID == projectID && (repo == "" || strings.EqualFold(strings.TrimSpace(report.Repo), strings.TrimSpace(repo))) {
+				copy := report
+				state.report = &copy
+				if state.enrollment.IdempotencyKey == "" {
+					state.enrollment = Enrollment{
+						Version: 1, IdempotencyKey: report.IdempotencyKey, ProjectID: report.ProjectID,
+						Repo: report.Repo, IssueNumber: report.IssueNumber, Source: report.Source,
+						EnrolledAt: report.CreatedAt,
+					}
 				}
 			}
-		case ProjectionEventType:
-			var projection Projection
-			if err := json.Unmarshal([]byte(event.PayloadJSON), &projection); err != nil {
-				return nil, fmt.Errorf("decode triage projection: %w", err)
-			}
-			state := states[projection.ReportKey]
-			if state == nil {
-				state = &sourceState{}
-				states[projection.ReportKey] = state
-			}
-			state.projected = true
-		case RetirementEventType:
-			var retirement Retirement
-			if err := json.Unmarshal([]byte(event.PayloadJSON), &retirement); err != nil {
-				return nil, fmt.Errorf("decode triage retirement: %w", err)
-			}
-			state := states[retirement.EnrollmentKey]
-			if state == nil {
-				state = &sourceState{}
-				states[retirement.EnrollmentKey] = state
-			}
-			state.retired = true
 		}
-	}
-	for key, state := range states {
 		if state.enrollment.IdempotencyKey == "" {
-			delete(states, key)
+			continue
 		}
+		states[record.SourceKey] = state
 	}
 	return states, nil
 }
@@ -444,8 +475,11 @@ func pendingSourceStates(states map[string]*sourceState) []*sourceState {
 	return pending
 }
 
-func (r *Runner) processSourceState(ctx context.Context, project storage.ProjectRecord, repo string, state *sourceState, decisionBudget *DecisionBudget, result *DiscoveryResult) error {
+func (r *Runner) processSourceState(ctx context.Context, project storage.ProjectRecord, repo string, state *sourceState, decisionBudget *DecisionBudget, readBudget *PendingForgeReadBudget, result *DiscoveryResult) error {
 	enrollment := state.enrollment
+	if !reservePendingForgeRead(readBudget, project.ID, result) {
+		return errPendingForgeReadBudgetExhausted
+	}
 	detail, err := r.github.ViewIssue(ctx, githubinfra.ViewIssueInput{Repo: repo, IssueNumber: enrollment.IssueNumber, CWD: project.RepoPath})
 	if err != nil {
 		return err
@@ -457,7 +491,7 @@ func (r *Runner) processSourceState(ctx context.Context, project storage.Project
 		result.Skipped++
 		return nil
 	}
-	_, matches, err := r.sourceStillCurrent(ctx, repo, project.RepoPath, detail, enrollment)
+	_, matches, err := r.sourceStillCurrent(ctx, repo, project.RepoPath, detail, enrollment, readBudget, result)
 	if err != nil {
 		return err
 	}
@@ -481,6 +515,9 @@ func (r *Runner) processSourceState(ctx context.Context, project storage.Project
 		if err != nil {
 			return err
 		}
+		if !reservePendingForgeRead(readBudget, project.ID, result) {
+			return errPendingForgeReadBudgetExhausted
+		}
 		refreshed, err := r.github.ViewIssue(ctx, githubinfra.ViewIssueInput{Repo: repo, IssueNumber: enrollment.IssueNumber, CWD: project.RepoPath})
 		if err != nil {
 			return err
@@ -492,7 +529,7 @@ func (r *Runner) processSourceState(ctx context.Context, project storage.Project
 			result.Skipped++
 			return nil
 		}
-		refreshedSource, matches, err := r.sourceStillCurrent(ctx, repo, project.RepoPath, refreshed, enrollment)
+		refreshedSource, matches, err := r.sourceStillCurrent(ctx, repo, project.RepoPath, refreshed, enrollment, readBudget, result)
 		if err != nil {
 			return err
 		}
@@ -523,7 +560,7 @@ func (r *Runner) processSourceState(ctx context.Context, project storage.Project
 	action := report.Policy.Action
 	var clarifications []string
 	if action == ActionAwaitHuman {
-		confirmed, created, err := r.confirmedByHuman(ctx, repo, project.RepoPath, detail, *report)
+		confirmed, created, err := r.confirmedByHuman(ctx, project.ID, repo, project.RepoPath, detail, *report, readBudget, result)
 		if err != nil {
 			return err
 		}
@@ -573,7 +610,10 @@ func (r *Runner) processSourceState(ctx context.Context, project storage.Project
 	return nil
 }
 
-func (r *Runner) sourceStillCurrent(ctx context.Context, repo, cwd string, detail githubinfra.IssueDetail, enrollment Enrollment) (SourceEvent, bool, error) {
+func (r *Runner) sourceStillCurrent(ctx context.Context, repo, cwd string, detail githubinfra.IssueDetail, enrollment Enrollment, readBudget *PendingForgeReadBudget, result *DiscoveryResult) (SourceEvent, bool, error) {
+	if !reservePendingForgeRead(readBudget, enrollment.ProjectID, result) {
+		return SourceEvent{}, false, errPendingForgeReadBudgetExhausted
+	}
 	timeline, err := r.github.ListIssueTimeline(ctx, githubinfra.IssueTimelineInput{Repo: repo, IssueNumber: detail.Number, CWD: cwd})
 	if err != nil {
 		return SourceEvent{}, false, err
@@ -597,7 +637,7 @@ func (r *Runner) retireSource(ctx context.Context, state *sourceState, reason st
 	return nil
 }
 
-func (r *Runner) confirmedByHuman(ctx context.Context, repo, cwd string, issue githubinfra.IssueDetail, report Report) (confirmed, created bool, err error) {
+func (r *Runner) confirmedByHuman(ctx context.Context, projectID, repo, cwd string, issue githubinfra.IssueDetail, report Report, readBudget *PendingForgeReadBudget, result *DiscoveryResult) (confirmed, created bool, err error) {
 	events, err := r.repos.Events.ListByEntity(ctx, reportEntityType, reportEntityID(report.ProjectID, report.Repo, report.IssueNumber))
 	if err != nil {
 		return false, false, err
@@ -623,6 +663,9 @@ func (r *Runner) confirmedByHuman(ctx context.Context, repo, cwd string, issue g
 		if !confirms || strings.TrimSpace(comment.Author) == "" {
 			continue
 		}
+		if !reservePendingForgeRead(readBudget, projectID, result) {
+			return false, false, errPendingForgeReadBudgetExhausted
+		}
 		permission, err := r.github.GetRepositoryPermission(ctx, githubinfra.RepositoryPermissionInput{
 			Repo: repo, User: comment.Author, CWD: cwd,
 		})
@@ -642,6 +685,23 @@ func (r *Runner) confirmedByHuman(ctx context.Context, repo, cwd string, issue g
 		return true, true, nil
 	}
 	return false, false, nil
+}
+
+var errPendingForgeReadBudgetExhausted = errors.New("triager pending forge read budget exhausted")
+
+func reservePendingForgeRead(budget *PendingForgeReadBudget, projectID string, result *DiscoveryResult) bool {
+	if result == nil {
+		return false
+	}
+	if budget == nil {
+		if result.PendingForgeReads >= pendingForgeReadLimit {
+			return false
+		}
+	} else if !budget.Reserve(projectID) {
+		return false
+	}
+	result.PendingForgeReads++
+	return true
 }
 
 func newConfirmationToken() (string, error) {

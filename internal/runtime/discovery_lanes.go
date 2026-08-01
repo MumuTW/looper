@@ -140,9 +140,24 @@ func coordinatorLane(input defaultSchedulerTickInput) discoveryLane {
 // triagerLane is an internal issue-source role. Its persisted report is the
 // routing authority; the lane does not need a label-gated CodingRoleConfig.
 func triagerLane(input defaultSchedulerTickInput) discoveryLane {
-	// One budget per tick, shared by every project this lane discovers. Projects
-	// are discovered concurrently, so the budget synchronizes its own reservation.
+	// One budget per tick, shared by every project this lane discovers. Budget
+	// reservations remain atomic for direct concurrent lane callers as well.
 	decisionBudget := triager.NewDecisionBudget(triager.DefaultDecisionLimit)
+	projectIDs := []string{}
+	if input.Config != nil {
+		for _, project := range input.Config.Projects {
+			if input.TriagerEnabled == nil || !input.TriagerEnabled(project.ID) {
+				continue
+			}
+			projectIDs = append(projectIDs, project.ID)
+		}
+	}
+	readBudget := triager.NewPendingForgeReadBudget(triager.DefaultPendingForgeReadLimit)
+	if factory, ok := input.Triager.(interface {
+		BeginPendingForgeReadTick([]string) *triager.PendingForgeReadBudget
+	}); ok {
+		readBudget = factory.BeginPendingForgeReadTick(projectIDs)
+	}
 	return discoveryLane{
 		Name:     "triager",
 		Priority: config.PriorityTriager,
@@ -151,7 +166,19 @@ func triagerLane(input defaultSchedulerTickInput) discoveryLane {
 			return input.TriagerEnabled != nil && input.TriagerEnabled(projectID)
 		},
 		Discover: func(ctx context.Context, projectID, repo string, snapshot *githubinfra.DiscoverySnapshot) ([]storage.QueueItemRecord, error) {
-			result, err := input.Triager.DiscoverIssues(ctx, triager.DiscoveryInput{ProjectID: projectID, Repo: repo, Snapshot: snapshot, DecisionBudget: decisionBudget})
+			result, err := input.Triager.DiscoverIssues(ctx, triager.DiscoveryInput{
+				ProjectID: projectID, Repo: repo, Snapshot: snapshot,
+				DecisionBudget: decisionBudget, PendingForgeReadBudget: readBudget,
+			})
+			if input.Logger != nil && result.PendingSourcesDeferred > 0 {
+				input.Logger.Info("triager pending forge reads exhausted", map[string]any{
+					"projectId": projectID,
+					"repo":      repo,
+					"reads":     result.PendingForgeReads,
+					"deferred":  result.PendingSourcesDeferred,
+					"remaining": readBudget.Remaining(),
+				})
+			}
 			return result.QueueItems, err
 		},
 	}

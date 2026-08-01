@@ -52,21 +52,33 @@ func awaitingExpired(state *sourceState, now time.Time) bool {
 	return now.UTC().Sub(createdAt.UTC()) >= awaitingConfirmationTTL
 }
 
+type awaitingRecheckCursor struct {
+	enrolledAt string
+	key        string
+}
+
+func (r *Runner) selectAwaitingRechecks(projectID, repo string, pending []*sourceState, touched map[int64]struct{}, budget int) map[string]struct{} {
+	cursorKey := strings.TrimSpace(projectID) + "\x00" + strings.ToLower(strings.TrimSpace(repo))
+	r.awaitingMu.Lock()
+	defer r.awaitingMu.Unlock()
+	selected, next := selectAwaitingRechecks(pending, touched, budget, r.awaitingCursor[cursorKey])
+	if len(selected) > 0 {
+		r.awaitingCursor[cursorKey] = next
+	}
+	return selected
+}
+
 // selectAwaitingRechecks decides which quiet awaiting-confirmation sources to
-// re-verify this tick.
-//
-// pending arrives oldest-first, so taking from the front round-robins over the
-// backlog: every source is eventually re-verified even if its issue never appears
-// in the update window, and no tick pays more than the budget.
-func selectAwaitingRechecks(pending []*sourceState, touched map[int64]struct{}, budget int) map[string]struct{} {
+// re-verify this tick and advances after the last source actually selected.
+// The cursor is only a scheduling hint: event-log lifecycle remains authority,
+// and a daemon restart safely begins another pass from the oldest source.
+func selectAwaitingRechecks(pending []*sourceState, touched map[int64]struct{}, budget int, after awaitingRecheckCursor) (map[string]struct{}, awaitingRecheckCursor) {
 	selected := make(map[string]struct{})
 	if budget <= 0 {
-		return selected
+		return selected, after
 	}
+	candidates := make([]*sourceState, 0, len(pending))
 	for _, state := range pending {
-		if len(selected) >= budget {
-			break
-		}
 		if !awaitsHumanConfirmation(state) {
 			continue
 		}
@@ -75,9 +87,33 @@ func selectAwaitingRechecks(pending []*sourceState, touched map[int64]struct{}, 
 			// budget meant for the quiet ones.
 			continue
 		}
-		selected[state.enrollment.IdempotencyKey] = struct{}{}
+		candidates = append(candidates, state)
 	}
-	return selected
+	if len(candidates) == 0 {
+		return selected, after
+	}
+	start := 0
+	for index, state := range candidates {
+		candidate := awaitingRecheckCursor{enrolledAt: state.enrollment.EnrolledAt, key: state.enrollment.IdempotencyKey}
+		if candidate.enrolledAt > after.enrolledAt || (candidate.enrolledAt == after.enrolledAt && candidate.key > after.key) {
+			start = index
+			break
+		}
+		if index == len(candidates)-1 {
+			start = 0
+		}
+	}
+	count := budget
+	if count > len(candidates) {
+		count = len(candidates)
+	}
+	next := after
+	for offset := 0; offset < count; offset++ {
+		state := candidates[(start+offset)%len(candidates)]
+		selected[state.enrollment.IdempotencyKey] = struct{}{}
+		next = awaitingRecheckCursor{enrolledAt: state.enrollment.EnrolledAt, key: state.enrollment.IdempotencyKey}
+	}
+	return selected, next
 }
 
 // shouldProcessAwaiting reports whether an awaiting-confirmation source is worth a
