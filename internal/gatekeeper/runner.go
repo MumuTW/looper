@@ -167,7 +167,11 @@ type GitHubGateway interface {
 	GetBranchProtection(context.Context, githubinfra.BranchProtectionInput) (githubinfra.BranchProtection, error)
 	ListPullRequestCheckRuns(context.Context, githubinfra.PullRequestCheckRunsInput) (githubinfra.PullRequestCheckRuns, error)
 	ListReviewThreads(context.Context, githubinfra.ListReviewThreadsInput) ([]githubinfra.ReviewThread, error)
-	GetPullRequestHeadSHA(context.Context, githubinfra.ViewPullRequestInput) (string, error)
+	// GetPullRequestHeadAndBaseSHA is the final revalidation read. It returns
+	// both the head and base ref OIDs so a gate whose verdict depends on the
+	// merge base (the diff budget) can detect a base advance that the head
+	// revalidation alone cannot.
+	GetPullRequestHeadAndBaseSHA(context.Context, githubinfra.ViewPullRequestInput) (string, string, error)
 	ListIssueComments(context.Context, githubinfra.ViewIssueInput) ([]githubinfra.CommentInfo, error)
 	CreateIssueComment(context.Context, githubinfra.IssueCommentInput) (githubinfra.IssueCommentResult, error)
 	UpdateIssueComment(context.Context, githubinfra.UpdateIssueCommentInput) error
@@ -382,12 +386,17 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 	// moving the head, so the original counts no longer describe the diff this
 	// merge would produce. Revalidate against the merge-watch's current base
 	// before accepting the budget verdict; fail closed when those stats are
-	// unavailable.
+	// unavailable. diffBudgetBaseSHA records the base the accepted counts were
+	// observed against so the final revalidation can detect a later advance.
 	diffBudget := r.diffBudget(input.ProjectID)
-	if diffBudget.MaxChangedFiles > 0 || diffBudget.MaxDeletions > 0 {
+	budgetEnabled := diffBudget.MaxChangedFiles > 0 || diffBudget.MaxDeletions > 0
+	diffBudgetBaseSHA := ""
+	if budgetEnabled {
 		stats := detail.DiffStats
+		diffBudgetBaseSHA = strings.TrimSpace(detail.BaseSHA)
 		if strings.TrimSpace(mergeability.BaseSHA) != strings.TrimSpace(detail.BaseSHA) {
 			stats = mergeability.DiffStats
+			diffBudgetBaseSHA = strings.TrimSpace(mergeability.BaseSHA)
 		}
 		if stats == nil {
 			return r.persistProviderBlock(ctx, report, ReasonProviderStateUnavailable, "diff_stats")
@@ -454,7 +463,7 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 	}
 	sort.Strings(report.Evidence.UnresolvedReviewThreadIDs)
 
-	finalHead, err := r.github.GetPullRequestHeadSHA(ctx, viewInput)
+	finalHead, finalBase, err := r.github.GetPullRequestHeadAndBaseSHA(ctx, viewInput)
 	if err != nil {
 		return r.persistProviderBlock(ctx, report, ReasonProviderStateUnavailable, "head_revalidation")
 	}
@@ -464,6 +473,17 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 	}
 	if report.Evidence.FinalObservedHeadSHA != report.ObservedHeadSHA {
 		report.Reasons = append(report.Reasons, Reason{Code: ReasonHeadStale})
+	}
+	// The diff-budget verdict was captured against diffBudgetBaseSHA at the
+	// merge-watch read. The base branch can advance between that read and this
+	// final observation without moving the head, so the head revalidation above
+	// cannot catch it: GitHub would recompute the change size against a new
+	// merge base while the recorded counts still describe the previous one, and
+	// an eligible verdict would proceed toward auto-merge on stale evidence. Fail
+	// closed so the next tick (whose fingerprint folds in BaseSHA while the budget
+	// is enabled) re-evaluates against the current base.
+	if budgetEnabled && diffBudgetBaseSHA != "" && strings.TrimSpace(finalBase) != diffBudgetBaseSHA {
+		return r.persistProviderBlock(ctx, report, ReasonProviderStateAmbiguous, "diff_budget_base")
 	}
 	persisted, err := r.persist(ctx, report)
 	if err != nil {
@@ -483,7 +503,14 @@ func (r *Runner) projectCWD(ctx context.Context, projectID string) string {
 	if r == nil || r.repos == nil || r.repos.Projects == nil || strings.TrimSpace(projectID) == "" {
 		return ""
 	}
-	project, err := r.repos.Projects.GetByID(ctx, strings.TrimSpace(projectID))
+	// Project IDs are matched by exact equality against configured IDs, which
+	// validation accepts with surrounding whitespace. Trimming here would diverge
+	// from the discovery and evaluation paths (which preserve the caller's
+	// original key), so a whitespace-padded configured ID would no longer resolve
+	// to its repo path. On GitHub Enterprise that empty CWD strands
+	// ListReviewThreads on the wrong provider hostname. Only the emptiness check
+	// above is trimmed; the lookup uses the original key.
+	project, err := r.repos.Projects.GetByID(ctx, projectID)
 	if err != nil || project == nil {
 		return ""
 	}

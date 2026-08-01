@@ -169,6 +169,31 @@ func TestDiffBudgetPreservesExactProjectIDThroughEvaluation(t *testing.T) {
 	}
 }
 
+// projectCWD resolves a configured project ID to its repo path with an exact
+// SQLite lookup. A whitespace-padded configured ID is a distinct, valid ID, so
+// trimming it before the lookup would return no path. On GitHub Enterprise that
+// empty CWD strands ListReviewThreads on the wrong provider hostname, so the
+// exact (padded) key must be preserved through the lookup.
+func TestProjectCDWPreservesPaddedProjectID(t *testing.T) {
+	t.Parallel()
+	fixture := newGatekeeperFixture(t)
+	nowISO := fixture.now.Format(time.RFC3339Nano)
+	repoPath := t.TempDir()
+	if err := fixture.repos.Projects.Upsert(context.Background(), storage.ProjectRecord{
+		ID: " padded ", Name: "Padded", RepoPath: repoPath, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	runner := New(Options{Repos: fixture.repos, GitHub: fixture.github, Now: func() time.Time { return fixture.now }})
+
+	if got := runner.projectCWD(context.Background(), " padded "); got != repoPath {
+		t.Fatalf("projectCWD(\" padded \") = %q, want %q (exact padded ID must resolve)", got, repoPath)
+	}
+	if got := runner.projectCWD(context.Background(), "padded"); got != "" {
+		t.Fatalf("projectCWD(\"padded\") = %q, want empty (trimmed key is a different ID with no project)", got)
+	}
+}
+
 // The diff statistics are observed against the detail read's base SHA. When the
 // base branch advances before the merge-watch read, GitHub recomputes the change
 // size against a new merge base without moving the head, so the budget verdict
@@ -181,6 +206,7 @@ func TestDiffBudgetRevalidatesAgainstObservedBaseSHA(t *testing.T) {
 	fixture.github.detail.BaseSHA = "base-1"
 	fixture.github.mergeable.BaseSHA = "base-2"
 	fixture.github.mergeable.DiffStats = &githubinfra.PullRequestDiffStats{ChangedFiles: 21}
+	fixture.github.finalBaseSHA = "base-2"
 	runner := diffBudgetRunner(t, fixture, config.GatekeeperDiffBudget{MaxChangedFiles: 20}, config.GatekeeperTrustAdvise)
 
 	report, err := runner.EvaluatePullRequest(context.Background(), EvaluationInput{ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, ExpectedHeadSHA: "head-1"})
@@ -204,6 +230,7 @@ func TestDiffBudgetKeepsDetailStatsWhenBaseUnchanged(t *testing.T) {
 	fixture.github.detail.BaseSHA = "base-1"
 	fixture.github.mergeable.BaseSHA = "base-1"
 	fixture.github.mergeable.DiffStats = &githubinfra.PullRequestDiffStats{ChangedFiles: 21}
+	fixture.github.finalBaseSHA = "base-1"
 	runner := diffBudgetRunner(t, fixture, config.GatekeeperDiffBudget{MaxChangedFiles: 20}, config.GatekeeperTrustAdvise)
 
 	report, err := runner.EvaluatePullRequest(context.Background(), EvaluationInput{ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, ExpectedHeadSHA: "head-1"})
@@ -215,5 +242,53 @@ func TestDiffBudgetKeepsDetailStatsWhenBaseUnchanged(t *testing.T) {
 	}
 	if report.Evidence.DiffBudget == nil || report.Evidence.DiffBudget.ChangedFiles != 5 {
 		t.Fatalf("diff budget evidence = %#v, want changedFiles=5 from the detail read (base unchanged)", report.Evidence.DiffBudget)
+	}
+}
+
+// The diff-budget verdict is captured at the merge-watch read, but several
+// provider queries (branch protection, checks, review threads) and the final
+// head revalidation run after it. When the base branch advances in that window
+// without moving the head, the head revalidation alone cannot detect it: the
+// recorded counts still describe the previous merge base while GitHub would
+// merge against the new one. The final revalidation must revalidate the base
+// too and fail closed, so an eligible verdict is not persisted on stale counts.
+func TestDiffBudgetFailsClosedWhenBaseAdvancesBeforeFinalRevalidation(t *testing.T) {
+	t.Parallel()
+	fixture := newGatekeeperFixture(t)
+	fixture.github.detail.DiffStats = &githubinfra.PullRequestDiffStats{ChangedFiles: 5}
+	fixture.github.detail.BaseSHA = "base-1"
+	fixture.github.mergeable.BaseSHA = "base-1"
+	fixture.github.finalBaseSHA = "base-2"
+	runner := diffBudgetRunner(t, fixture, config.GatekeeperDiffBudget{MaxChangedFiles: 20}, config.GatekeeperTrustAuto)
+
+	report, err := runner.EvaluatePullRequest(context.Background(), EvaluationInput{ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, ExpectedHeadSHA: "head-1"})
+	if err != nil {
+		t.Fatalf("EvaluatePullRequest() error = %v", err)
+	}
+	if report.Eligible || len(report.Reasons) != 1 || report.Reasons[0].Code != ReasonProviderStateAmbiguous || report.Reasons[0].Subject != "diff_budget_base" {
+		t.Fatalf("report = %#v, want a single diff_budget_base ambiguous block (base advanced after merge-watch)", report)
+	}
+	if len(fixture.github.merges) != 0 {
+		t.Fatalf("merges = %#v, want no auto-merge on a stale-base budget verdict", fixture.github.merges)
+	}
+}
+
+// When the budget is disabled, a base advance between the merge-watch read and
+// the final revalidation is not a gate input, so the final revalidation must not
+// fail closed on it.
+func TestDiffBudgetBaseRevalidationSkippedWhenBudgetDisabled(t *testing.T) {
+	t.Parallel()
+	fixture := newGatekeeperFixture(t)
+	fixture.github.detail.BaseSHA = "base-1"
+	fixture.github.mergeable.BaseSHA = "base-1"
+	fixture.github.finalBaseSHA = "base-2"
+	runner := diffBudgetRunner(t, fixture, config.GatekeeperDiffBudget{}, config.GatekeeperTrustObserve)
+
+	report, err := runner.EvaluatePullRequest(context.Background(), EvaluationInput{ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, ExpectedHeadSHA: "head-1"})
+	if err != nil {
+		t.Fatalf("EvaluatePullRequest() error = %v", err)
+	}
+	if !report.Eligible {
+		t.Fatalf("report = %#v, want eligible (base advance is not a gate input when the budget is disabled)", report)
 	}
 }
