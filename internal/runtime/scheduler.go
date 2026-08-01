@@ -2917,9 +2917,6 @@ func executeClaimPhase(ctx context.Context, phase string, input defaultScheduler
 	return claimedCount, availableSlots, err
 }
 
-// logHostAdmissionHold names the tripped signal and the slots it withheld. A
-// hold that only showed up as an idle queue would be indistinguishable from
-// having no work, which is the failure mode this log exists to prevent.
 // hostAdmissionFor binds the shared gate to this snapshot's thresholds, so a
 // config reload changes the gate on the next tick without restarting anything.
 // The second return value throttles hold logging to one entry per decision
@@ -2935,6 +2932,9 @@ func hostAdmissionFor(cfg config.Config, gate *hostAdmissionGate) (func() *hostr
 	return decide, report
 }
 
+// logHostAdmissionHold names the tripped signal and the slots it withheld. A
+// hold that only showed up as an idle queue would be indistinguishable from
+// having no work, which is the failure mode this log exists to prevent.
 func logHostAdmissionHold(logger bootstrap.Logger, phase string, withheldSlots int, decision hostresources.Decision) {
 	if logger == nil {
 		return

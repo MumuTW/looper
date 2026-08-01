@@ -11,8 +11,8 @@
 // Thresholds are relative on purpose. A free-space floor in gigabytes or a load
 // ceiling as a bare number encodes one machine; the same config has to behave
 // on a laptop and on a 64-core runner. Disk uses a percentage and an absolute
-// floor together (whichever is stricter), and load is a multiple of
-// runtime.NumCPU().
+// floor together (whichever is looser satisfies admission), and load is a
+// multiple of runtime.NumCPU().
 package hostresources
 
 import (
