@@ -36,7 +36,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"syscall"
 
 	"github.com/MumuTW/looper/internal/upgradebackup"
 )
@@ -84,11 +83,14 @@ type targetState struct {
 	path    string
 	present bool
 	info    os.FileInfo
+	hash    string
+	size    int64
 }
 
 type fileOperations struct {
-	rename func(string, string) error
-	link   func(string, string) error
+	rename           func(string, string) error
+	link             func(string, string) error
+	exclusivePublish func(source, dest string) error
 }
 
 var defaultFileOperations = fileOperations{rename: os.Rename, link: os.Link}
@@ -150,7 +152,10 @@ func Recover(journalPath string) error {
 
 func restore(bundleDirectory string, source upgradebackup.Source, operations fileOperations) error {
 	if operations.rename == nil {
-		return fmt.Errorf("rename operation is required")
+		operations.rename = os.Rename
+	}
+	if operations.link == nil {
+		operations.link = os.Link
 	}
 	bundleDirectory, source, err := normalizeInput(bundleDirectory, source)
 	if err != nil {
@@ -437,6 +442,13 @@ func inspectTarget(path, description string) (targetState, error) {
 	}
 	state.present = true
 	state.info = info
+	// Content identity catches in-place rewrites that keep the same inode.
+	hash, size, err := fileContentIdentity(path)
+	if err != nil {
+		return targetState{}, fmt.Errorf("hash existing %s: %w", description, err)
+	}
+	state.hash = hash
+	state.size = size
 	return state, nil
 }
 
@@ -461,7 +473,8 @@ func confirmTargetUnchanged(state targetState, description string) error {
 }
 
 // confirmUndoMatchesInspectedOriginal ensures the file renamed to undo is still
-// the same inode inspected before the move (not a concurrent replacement).
+// the same inode and content inspected before the move (not a concurrent
+// replace or in-place rewrite).
 func confirmUndoMatchesInspectedOriginal(state targetState, entry journalEntry) error {
 	if !state.present || state.info == nil {
 		return nil
@@ -472,6 +485,15 @@ func confirmUndoMatchesInspectedOriginal(state targetState, entry journalEntry) 
 	}
 	if !os.SameFile(state.info, undoInfo) {
 		return fmt.Errorf("undo for %s is not the inspected original (target was replaced during move)", entry.Name)
+	}
+	if state.hash != "" {
+		hash, size, err := fileContentIdentity(entry.UndoPath)
+		if err != nil {
+			return fmt.Errorf("hash undo for %s after move: %w", entry.Name, err)
+		}
+		if hash != state.hash || size != state.size {
+			return fmt.Errorf("undo for %s content changed after inspect (in-place rewrite before move)", entry.Name)
+		}
 	}
 	return nil
 }
@@ -945,9 +967,8 @@ func installNoReplace(source, dest, description string) error {
 }
 
 // publishNoReplace publishes source to dest without replacing an existing dest.
-// Prefer hard-link (fails if dest exists). Cross-device (EXDEV) uses O_EXCL copy.
-// Other link failures fall through to rename only after re-checking dest is
-// absent (used by tests that inject link/rename failures).
+// Prefer hard-link (fails if dest exists). Any non-success falls back only to
+// exclusive O_EXCL copy — never plain rename (which can replace a concurrent create).
 func publishNoReplace(operations fileOperations, source, dest, description string) error {
 	if _, err := os.Lstat(dest); err == nil {
 		return fmt.Errorf("refusing to install %s: target %s already exists", description, dest)
@@ -963,27 +984,22 @@ func publishNoReplace(operations fileOperations, source, dest, description strin
 			return fmt.Errorf("remove source after installing %s: %w", description, err)
 		}
 		return nil
-	} else if errors.Is(err, syscall.EXDEV) {
-		if _, err := os.Lstat(dest); err == nil {
-			return fmt.Errorf("refusing to install %s: target %s already exists", description, dest)
-		}
-		if err := copyFileExclusive(source, dest); err != nil {
-			return fmt.Errorf("install %s: %w", description, err)
-		}
-		if err := os.Remove(source); err != nil {
-			return fmt.Errorf("remove source after installing %s: %w", description, err)
-		}
-		return nil
 	}
 	if _, err := os.Lstat(dest); err == nil {
 		return fmt.Errorf("refusing to install %s: target %s already exists", description, dest)
 	}
-	rename := operations.rename
-	if rename == nil {
-		rename = os.Rename
+	if operations.exclusivePublish != nil {
+		if err := operations.exclusivePublish(source, dest); err != nil {
+			return fmt.Errorf("install %s: %w", description, err)
+		}
+		_ = os.Remove(source)
+		return nil
 	}
-	if err := rename(source, dest); err != nil {
+	if err := copyFileExclusive(source, dest); err != nil {
 		return fmt.Errorf("install %s: %w", description, err)
+	}
+	if err := os.Remove(source); err != nil {
+		return fmt.Errorf("remove source after installing %s: %w", description, err)
 	}
 	return nil
 }

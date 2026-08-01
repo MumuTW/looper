@@ -62,6 +62,8 @@ func TestUpgradeCutoverContractRestoresMatchingSnapshotAfterFailedStart(t *testi
 			status["storage"].(map[string]any)["dbPath"] = source.DatabasePath
 			status["tools"] = map[string]any{"looperPath": looperPath}
 			writeEnvelope(w, http.StatusOK, status)
+		case "/api/v1/config":
+			writeEnvelope(w, http.StatusOK, map[string]any{"metadata": map[string]any{"configPath": source.ConfigPath}})
 		case "/api/v1/projects":
 			writeEnvelope(w, http.StatusOK, map[string]any{"items": []map[string]any{{"id": "project_1"}}})
 		case "/api/v1/events/notification/looperd":

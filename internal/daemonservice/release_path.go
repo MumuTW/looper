@@ -45,5 +45,24 @@ func PreferReleaseCurrentExecutable(executable string) string {
 		// Prefer a real current symlink; a plain directory is ambiguous.
 		return path
 	}
-	return filepath.Join(root, "current", parts[1])
+	// Require current to resolve inside this release tree and name an existing
+	// executable before rewriting the unit — dangling or external targets must
+	// not produce a service that cannot boot.
+	resolved, err := filepath.EvalSymlinks(currentLink)
+	if err != nil {
+		return path
+	}
+	releasesRoot, err := filepath.EvalSymlinks(filepath.Join(root, "releases"))
+	if err != nil {
+		releasesRoot = filepath.Clean(filepath.Join(root, "releases"))
+	}
+	rel, err := filepath.Rel(filepath.Clean(releasesRoot), filepath.Clean(resolved))
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return path
+	}
+	candidate := filepath.Join(root, "current", parts[1])
+	if info, err := os.Stat(candidate); err != nil || info.IsDir() {
+		return path
+	}
+	return candidate
 }
