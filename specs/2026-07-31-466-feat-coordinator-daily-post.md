@@ -54,13 +54,15 @@ Out of scope:
 - #117's stall digest (sibling issue, separate work).
 - #118's auditor agent (consumes the same attention surface but is its own
   feature).
-- New persisted tables, ledgers, status columns, or migrations. The only
-  storage changes are a new bounded range query on the existing `event_logs`
-  table (see Digest window) and a small payload extension to the existing
-  `pr.review.posted` event (see Sources and assembly). No new index or other
-  migration is added: the PR objective prohibits migrations, so the range
-  query uses the existing `event_logs` indexes and documents its cost (see
-  Digest window and Risks) rather than adding a `created_at`-leading index.
+- New persisted tables or delivery ledgers. The storage changes are a bounded
+  range query on the existing `event_logs` table, a small payload extension to
+  `pr.review.posted`, and one additive storage-owned monotonic `event_logs.seq`
+  column migration used only to make equal-millisecond ordering survive
+  VACUUM/backup restore. The sequence is not a digest state machine or a second
+  authority; it is the insertion-order key already used by other durable
+  records. The migration backfills existing rows once and assigns the next
+  value transactionally on append. No `created_at`-leading index or other
+  optimization is added; the bounded query documents its existing-index cost.
 - Cron expressions; a fixed daily schedule plus timezone is sufficient.
 - Per-PR re-reads from GitHub at digest time.
 - Merges that no durable record observes. Only the gatekeeper
@@ -116,6 +118,15 @@ transition until the first valid instant whose local date is `D` (the start of
 that calendar date). `end(D)` is computed as the same helper for `D+1`, so both
 bounds are valid date boundaries even on a midnight transition.
 
+If an IANA zone skips an entire civil date (for example `Pacific/Apia` on
+2011-12-30), no instant can satisfy the requested local date. The boundary
+helper must search only a bounded interval (at most 48 hours) and return a
+typed nonexistent-date error when the date is absent, rather than looping
+forever. The dashboard maps that error to its existing 4xx invalid-date
+response; the scheduled job records the skipped date as an anomaly and does
+not invent a zero-width or overlapping window. Tests cover both a midnight
+transition and a wholly skipped date.
+
 A fixed date-derived boundary is required so the date-only dashboard route
 can reconstruct the exact window the job pushed: the window is a pure
 function of the digest date and the configured timezone, both of which the
@@ -129,13 +140,14 @@ Assembly reads:
 - `EventsRepository.ListBetween(ctx, sinceISO, untilISO)` for the window
   (`internal/storage/repositories.go`), a new bounded range query with an
   **exclusive end bound**:
-  `SELECT * FROM event_logs WHERE created_at >= ? AND created_at < ? ORDER BY created_at ASC, rowid ASC`.
-  The implicit SQLite `rowid` is the insertion-order tie-breaker; random event
-  IDs are not causal and must not be used for this purpose. Every
-  latest/consecutive-event query used by the digest (`ListBetween`,
-  `ListByEntity`, and latest-per-entity enumeration) applies the same
-  `created_at, rowid` ordering, and validation inserts equal-millisecond events
-  to prove the backward scan selects the actual insertion order.
+  `SELECT * FROM event_logs WHERE created_at >= ? AND created_at < ? ORDER BY created_at ASC, seq ASC`.
+  The explicit storage-owned `seq` is the insertion-order tie-breaker; random
+  event IDs and SQLite's implicit `rowid` are not causal and are not durable
+  across VACUUM/restore. Every latest/consecutive-event query used by the digest
+  (`ListBetween`, `ListByEntity`, and latest-per-entity enumeration) applies the
+  same `created_at, seq` ordering, and validation inserts equal-millisecond
+  events before and after backup/restore to prove the backward scan selects the
+  actual durable insertion order.
   The existing `ListSince` applies only `created_at >= since` and is not
   used: an unbounded historical scan would let a `/api/v1/digest?date=`
   request for an old date read every event from that date through the
@@ -143,15 +155,13 @@ Assembly reads:
   with database history. `ListBetween` bounds the scan on both sides for
   both the job and the dashboard route. The existing `event_logs` indexes
   are `(entity_type, entity_id, created_at)` and `(event_type,
-  created_at)`; neither has a `created_at` leading column, and the PR
-  objective prohibits migrations, so no `created_at`-leading index is
-  added. The range predicate therefore scans rows from `since` forward and
-  sorts in memory; the cost grows with total `event_logs` history rather
-  than with the one-day window. This is an accepted, documented trade-off
-  for a derived projection that adds no storage: the daily job scans once
-  per day, and the dashboard route is on-demand (non-polled). A
-  `created_at`-leading index is a future optimization outside this PR's
-  no-migration scope (see Risks).
+  created_at)`; neither has a `created_at` leading column, and no
+  `created_at`-leading index is added in this slice. The range predicate
+  therefore scans rows from `since` forward and sorts in memory; the cost grows
+  with total `event_logs` history rather than with the one-day window. This is
+  an accepted, documented trade-off for a derived projection: the daily job
+  scans once per day, and the dashboard route is on-demand (non-polled). A
+  `created_at`-leading index remains a future optimization (see Risks).
 - `PullRequestSnapshotsRepository.GetLatestByProjectAndHead` for current PR
   title, review state, and diff metadata, selected by `projectID`, `repo`,
   `prNumber`, **and the merge event's `HeadSHA`**. The existing
@@ -196,6 +206,8 @@ For each `pull_request.merge_gate.merge_attempted` event with
   review state, diff metadata) are rendered unavailable — the digest can
   still identify and link the merged PR from the merge event. The title
   is never read from a newer snapshot for a different head.
+  Validation includes a host-qualified repository fixture and asserts that the
+  rendered link uses that repository's hostname rather than `github.com`.
 - Originating issue: resolved via a project-scoped loop lookup using the
   merge event's `ProjectID`, `Repo`, and `PRNumber` — the loop's source
   issue is the originating issue. A source issue is identified by the
@@ -207,14 +219,14 @@ For each `pull_request.merge_gate.merge_attempted` event with
   issue rather than guessing the merge repository. The merge event is appended by
   `persistMergeOutcome` with `ProjectID`, `EntityType`, and `EntityID`;
   it carries no `LoopID`, so a `merge event → LoopRecord` join on
-  `LoopID` is not possible. The existing
+  `LoopID` is not possible. The pre-existing unscoped
   `LoopsRepository.ListByRepoAndPR(repo, prNumber)`
-  (`internal/storage/repositories.go`) has **no project predicate**, and
-  the repository explicitly supports the same `repo`/`prNumber` appearing
-  under multiple projects; in that configuration the most recently
-  updated loop returned by `ListByRepoAndPR` can belong to another
-  project, causing the digest to attribute that other project's source
-  issue to this merge. The assembly therefore uses a new
+  (`internal/storage/repositories.go`) has **no project predicate**. If
+  the assembly used it, the repository's support for the same
+  `repo`/`prNumber` under multiple projects would let the most recently
+  updated loop belong to another project, causing the digest to attribute
+  that other project's source issue to this merge. The assembly therefore
+  uses a new
   `LoopsRepository.ListByProjectRepoAndPR(projectID, repo, prNumber)`
   that adds a `project_id` predicate to the same `updated_at DESC, seq
   DESC` ordering, so only loops belonging to the merge event's
@@ -228,7 +240,10 @@ For each `pull_request.merge_gate.merge_attempted` event with
   recent loop first cannot establish whether a second project-scoped loop
   names a different source issue, so the conflict check precedes
   selection. If no candidate has a source issue, the issue is omitted
-  rather than guessed.
+  rather than guessed. The collected identity key is the canonical
+  `(IssueRepo, IssueNumber)` pair (including the host when present), and a
+  fixture with `owner/a#42` plus `owner/b#42` must render two distinct issues,
+  never collapse them by number alone.
 - Reviewer verdict summary: the most recent `pr.review.posted` at or before
   the merge attempt for the same PR **whose `headSha` equals the merge
   event's `HeadSHA`** and **whose event record's `ProjectID` equals the
@@ -243,7 +258,7 @@ For each `pull_request.merge_gate.merge_attempted` event with
   A's clean verdict for B. This per-PR verdict is read from the PR's full
   `pr.review.posted` history via
   `EventsRepository.ListByEntity(ctx, "pull_request", entityID)` (ordered
-  `created_at ASC, rowid ASC`), **not** from the digest date's `ListBetween` result:
+  `created_at ASC, seq ASC`), **not** from the digest date's `ListBetween` result:
   a merge at 00:05 whose head-matched review was posted at 23:55 the
   previous day lies outside the digest's `ListBetween` window, so a
   window-bounded lookup would render the verdict unavailable despite a
@@ -263,7 +278,13 @@ For each `pull_request.merge_gate.merge_attempted` event with
   digest requires that exact correlation match in addition to project and
   head. Generate it once for the confirming pass and thread it through the
   existing `EvaluationInput`/event-log fields; no new table or persisted
-  authority is introduced. `MergeOutcome.AttemptedAt` is stamped **before**
+  authority is introduced. The producer contract is explicit: `confirmAndMerge`
+  allocates the correlation before the confirming evaluation, passes it into
+  `EvaluationInput`, the confirming `GateReport` event and `merge_attempted`
+  copy that exact value, and every unrelated webhook evaluation receives a
+  distinct correlation. A producer-path integration test interleaves such a
+  webhook evaluation between confirmation and outcome persistence and asserts
+  that only the correlated report is selected. `MergeOutcome.AttemptedAt` is stamped **before**
   `confirmAndMerge` calls `EvaluatePullRequest` for the confirming pass
   (`internal/gatekeeper/merge.go`), and that confirming evaluation
   persists the `GateReport` that proves the merge was eligible, so the
@@ -281,7 +302,7 @@ For each `pull_request.merge_gate.merge_attempted` event with
   outcome is appended). This confirming report is read from the merge
   PR's full gate-report history via
   `EventsRepository.ListByEntity(ctx, "pull_request", entityID)` (ordered
-  `created_at ASC, rowid ASC`), **not**
+  `created_at ASC, seq ASC`), **not**
   from the digest date's `ListBetween` result: when confirmation starts
   just before midnight and the forge merge finishes just after midnight,
   the successful `MergeOutcome` belongs to the new digest window while
@@ -446,9 +467,9 @@ follow-up completion event:
     emitted with `succeeded` or `failed`.
   - `closedAt` (RFC3339 string) — the transition timestamp (carried by
     both events so the completion event joins back to its transition).
-- Deduplication: one transition event per `(entity_id,
+- Deduplication: one transition event per `(ProjectID, entity_id,
   discoveryFingerprint, closedAt)` transition and one completion event
-  per `(entity_id, discoveryFingerprint, closedAt)` transition;
+  per `(ProjectID, entity_id, discoveryFingerprint, closedAt)` transition;
   #462/#464 are responsible for not emitting duplicates for the same
   transition (the digest does not dedupe producer output). The two event
   types dedupe independently, so the terminal completion event is not
@@ -466,8 +487,8 @@ attach a newer fingerprint or outcome to an older close event. The
 lifecycle events carry both values observed at the transition and at
 retry termination; the digest reads `discoveryFingerprint` directly and
 selects `retryOutcome` as the **latest** outcome for the
-`(entity_id, discoveryFingerprint, closedAt)` triple: if a
-`retry_completed` event exists for that triple, its terminal
+`(ProjectID, entity_id, discoveryFingerprint, closedAt)` triple: if a
+`retry_completed` event exists for that project-scoped triple, its terminal
 `succeeded`/`failed` outcome is used; otherwise the transition event's
 `pending` is used and the section renders the retry as "in progress
 (pending)". This lets a `pending` observation reach a terminal state
@@ -488,12 +509,12 @@ the next digest has no in-window transition to attach the late
 completion to. After discovering transition events in the date window,
 the assembly therefore queries each transition's matching completion
 event through the **assembly instant**, not the window: for every
-discovered transition triple `(entity_id, discoveryFingerprint,
-closedAt)`, it reads the PR's full lifecycle via
+discovered transition triple `(ProjectID, entity_id, discoveryFingerprint,
+  closedAt)`, it reads the project-scoped PR lifecycle via
 `EventsRepository.ListByEntity(ctx, "pull_request", entityID)` (ordered
-`created_at ASC, rowid ASC`) and selects the latest
+`created_at ASC, seq ASC`) and selects the latest
 `pull_request.closed_and_regenerated.retry_completed` event whose
-`(entity_id, discoveryFingerprint, closedAt)` matches the transition,
+`(ProjectID, entity_id, discoveryFingerprint, closedAt)` matches the transition,
 regardless of whether that completion event falls inside or outside the
 digest window. The completion's terminal outcome then supersedes the
 transition's `pending`. This mirrors the cross-boundary reads the Merged
@@ -541,18 +562,18 @@ new reason codes are introduced. The triager's
 *issue* triage awaiting confirmation and is a separate surface; this
 section is PR-scoped and reads gate reports, not triage reports.
 
-**Exclude PRs with durable close evidence after the last blocked report.**
+**Exclude PRs with any durable successful merge.**
 Using the latest gate report as the current-state authority leaves a PR
 listed forever when a maintainer closes or manually merges it after a
 blocked report: those paths emit no durable merge event, the closed PR
 disappears from gatekeeper discovery, and no later eligible report
 replaces the blocked one. To keep the actionable section from presenting
 work that no longer exists, membership additionally requires that **no
-durable merge event for the PR exists after its last blocked report**:
-the assembly checks the PR's lifecycle (read via `ListByEntity`, see
-below) for a `MergeOutcomeEventType` event with `Merged == true` whose
-`created_at` is after the latest blocked report's `EvaluatedAt`; if one
-exists, the PR was merged through the gatekeeper path and is excluded.
+durable successful merge event for the project-scoped PR exists**:
+the assembly checks the PR's lifecycle (read via `ListByProjectAndEntity`,
+see below) for any `MergeOutcomeEventType` event with `Merged == true`; if
+one exists, the PR was merged through the gatekeeper path and is excluded,
+even when a racing stale blocked report was appended after the merge.
 PRs closed or merged via paths that emit **no** durable event (manual
 maintainer merge, reviewer auto-merge — see Merge authority coverage)
 have no durable close evidence, so they remain listed until a subsequent
@@ -608,7 +629,7 @@ report falls after the window's `until` is still discovered.
 
 The backward walk and the membership check both read the PR's full
 lifecycle via `EventsRepository.ListByProjectAndEntity(ctx, "pull_request",
-projectID, entityID)` (ordered `created_at ASC, rowid ASC`), not the windowed
+projectID, entityID)` (ordered `created_at ASC, seq ASC`), not the windowed
 `ListBetween`
 result: the latest report as of the assembly instant may lie after the
 window's `until`, and the transition into the blocked state may lie before
@@ -634,19 +655,21 @@ and a reviewer cannot resolve them. Listing any of these under "Awaiting
 human" while the responsible role's loop is actively handling the PR
 would report ordinary in-progress automation as human-actionable. Before
 classifying a reason as human-actionable, the assembly correlates the
-gate report with the **role that owns that reason** via
-`LoopsRepository.ListByRepoAndPR(repo, prNumber)`:
+gate report with the **role that owns that reason** via a project-scoped
+`LoopsRepository.ListByProjectRepoAndPR(projectID, repo, prNumber)`:
 `ReasonReviewRequired` is suppressed only when a returned loop has an
-active **reviewer** status (queued or running) for the PR, and
+active **reviewer** status (queued, waiting, or running) for the PR, and
 `ReasonReviewChangesRequested` / `ReasonUnresolvedReviewThread` are
 suppressed only when a returned loop has an active **fixer** status
-(queued or running) for the PR. The previous "any active reviewer or
+(queued, waiting, or running) for the PR. The previous "any active reviewer or
 fixer" condition omitted a PR when *either* role was active for *any* of
 the three reasons, so an unrelated queued fixer would suppress a
 missing-approval item even though a fixer cannot supply that approval;
 matching each reason to its responsible role avoids that. Only
 `ReasonHold` — an explicit human-applied hold label — is human-actionable
-regardless of active automation.
+regardless of active automation. A cross-project fixture with the same
+repository/PR and a waiting loop in the other project must not suppress this
+project's item.
 
 ### Anomalies
 
@@ -789,57 +812,62 @@ the regular schedule. For each eligible date `d` in that range it queries
 `NotificationsRepository.GetLatestByDedupe(ctx, "in_app",
 "digest:<d>:<configFingerprint>")` (see Same-date delivery idempotence
 for the key and why the check is a single date-wide invocation marker,
-not a per-channel check). Any date with no delivered record is pushed, in
-chronological order, before the regular schedule resumes. The horizon is
+not a per-channel check). Any date with no invocation marker is processed in
+chronological order before the regular schedule resumes: a non-empty digest
+calls `Notify`, while a quiet empty-day digest writes its marker directly.
+The horizon is
 bounded so a long outage does not flood the channel on restart; dates
 older than the horizon are accepted as lost (an audit surface, not a
-retry queue). The in-memory `lastDigestDate` is then set to the newest
-pushed date so the regular schedule does not re-fire it.
+retry queue). The in-memory `lastDigestDate` is then set to the newest date
+whose invocation marker was successfully recorded (whether by `Notify` or
+quiet mode), so the regular schedule does not re-invoke it.
 
 **Activation boundary — first enablement is not a backfill.** Absence of
-a delivered notification is not evidence that a digest was scheduled and
+an invocation marker is not evidence that a digest was scheduled and
 missed: on the first startup with this disabled-by-default feature
 enabled, notification history contains no digest keys for any prior
-date, so a naive "any date with no delivered record is missed" rule
+date, so a naive "any date with no invocation marker is missed" rule
 would classify all seven dates in the horizon as missed and push seven
 historical digests, flooding configured channels on first enablement.
 The catch-up therefore treats a date `d` as missed **only if there is
 durable evidence the feature was already active on or before `d`**:
-specifically, a delivered digest record at some date `e <= d` proves the
-feature was active by `e`, so `d` is a candidate only when `d` is **at
-or after the oldest delivered digest date** in the horizon. The boundary
-is the *oldest* delivered record, not the newest: evidence that the
+specifically, a delivered digest record **or a quiet invocation marker**
+at some date `e <= d` proves the feature was active by `e`, so `d` is a
+candidate only when `d` is **at or after the oldest invocation-marker date**
+in the horizon. The boundary is the *oldest* marker, not the newest:
+evidence that the
 feature was active on `F−2` must make *later* closed dates within the
 horizon (`F−1`, `F`) eligible for catch-up, not earlier dates. When the
-daemon last delivered `F−2`, then remains down for the `F−1` and `F`
-fires and restarts on `F+1`, the oldest delivered record is `F−2`, so
-`F−1` and `F` (at or after `F−2`, within the horizon, with no delivery
-of their own) are pushed in chronological order; a "at or before the
-newest delivered" predicate would consider only dates at or before
-`F−2` and never push the two trailing missed dates. If no delivered
-digest record exists anywhere in the horizon (first enablement, or an
-outage longer than the horizon with no prior delivery), no `d` satisfies
+daemon last recorded an invocation for `F−2`, then remains down for the
+`F−1` and `F` fires and restarts on `F+1`, the oldest marker is `F−2`, so
+`F−1` and `F` (at or after `F−2`, within the horizon, with no invocation
+marker of their own) are pushed in chronological order; an "at or before the
+newest marker" predicate would consider only dates at or before
+`F−2` and never push the two trailing missed dates. If no invocation
+marker exists anywhere in the horizon (first enablement, or an outage
+longer than the horizon with no prior invocation), no `d` satisfies
 the boundary, the catch-up pushes nothing, and the regular schedule
 begins from its next configured fire. This uses already-persisted
-notification records as the activation boundary — no new "first enabled
-at" timestamp is introduced — so enabling the feature never produces a
-historical backfill unless the operator explicitly requests one
+delivered/quiet invocation records as the activation boundary — no new
+"first enabled at" timestamp is introduced — so enabling the feature never
+produces a historical backfill unless the operator explicitly requests one
 (operator-triggered historical backfill is out of scope for this PR).
 
-**Guard initialization reflects actual delivery, not window closure.**
-The in-memory `lastDigestDate` is set to the **newest date actually
-pushed** during catch-up (a date that was delivered), not to the most
-recent closed `D`. Setting it to a closed `D` that was never delivered
+**Guard initialization reflects actual invocation, not window closure.**
+The in-memory `lastDigestDate` is set to the **newest date whose invocation
+marker was actually recorded** during catch-up (a date that was delivered or
+quietly completed), not to the most recent closed `D`. Setting it to a closed
+`D` that was never invoked
 suppresses the legitimate first scheduled fire: if the feature is first
 enabled at 08:00 with the default 09:00 fire time, there is correctly no
 historical backfill, but the most recent closed `D` is `F−1` (yesterday)
 and setting `lastDigestDate = F−1` would make the regular 09:00 run for
 `D = F−1` look like a same-process duplicate, permanently skipping the
 first scheduled digest. The guard is therefore initialized according to
-whether a delivery actually happened, not merely whether the window is
-closed: when catch-up pushed at least one date, `lastDigestDate` is the
-newest pushed date; when catch-up pushed nothing (first enablement, or
-every in-horizon date already delivered), `lastDigestDate` stays empty
+whether an invocation actually completed, not merely whether the window is
+closed: when catch-up recorded at least one new marker, `lastDigestDate` is
+the newest such date; when catch-up recorded nothing (first enablement, or
+every in-horizon date already delivered/quiet), `lastDigestDate` stays empty
 so the regular schedule's first fire for its selected `D` is not
 pre-suppressed. Whether today's fire has already passed is handled by
 the schedule's next-fire computation (the schedule sleeps until the next
@@ -851,7 +879,7 @@ before the 09:00 fire lets the regular schedule fire 09:00 for `F−1`
 fire for `D = F` (the date function never re-selects `F−1` tomorrow).
 The durable `in_app` notification-log check (see Same-date delivery
 idempotence) remains the backstop that prevents a restart re-fire of a
-date that *was* delivered.
+date whose invocation marker was recorded.
 
 ### Same-date delivery idempotence across restarts
 
@@ -906,8 +934,9 @@ fingerprint exists to prevent. The hash is therefore preferable to a
 versioned key for the runtime-config-distinction purpose, with the two
 residual cases above accepted and guarded.
 
-The idempotence unit is the **single `Gateway.Notify` invocation**, not
-each channel: one `Notify` call fans out to every configured channel, so
+The idempotence unit is the **single digest invocation** (one
+`Gateway.Notify` fan-out or one quiet marker write), not each channel: one
+`Notify` call fans out to every configured channel, so
 a per-channel durable check is incoherent with the all-channel operation
 — skipping when any delivered record exists permanently abandons a
 channel that failed, while requiring every channel to have succeeded
@@ -920,9 +949,10 @@ date-wide invocation marker: the job queries
 "digest:<D>:<configFingerprint>")` and skips the push when that record
 exists, regardless of age. The gateway persists an `in_app`
 `NotificationRecord` for every `Notify` call regardless of push-channel
-outcome (`recordInApp` in `internal/infra/notify/gateway.go`), so the
-`in_app` record is the durable proof that the invocation already
-happened; a push channel that failed on the first call is not retried,
+outcome (`recordInApp` in `internal/infra/notify/gateway.go`), and quiet
+mode writes the same channel/key directly, so the `in_app` record is the
+durable proof that the invocation already happened; a push channel that
+failed on the first call is not retried,
 and the human pulls the digest from the dashboard (see Delivery). This
 bounds restart re-fires using already-persisted state — no new "last
 digest delivered at" timestamp is introduced.
@@ -1005,9 +1035,22 @@ emptyDayMode = "quiet"
 verdictFlipWindowMinutes = 120
 ```
 
+**Configuration-loader wiring contract.** Adding `Digest` to `Config` and
+`PartialConfig` is not sufficient: the implementation must register the
+top-level `digest` section in the decoder's `topLevelConfigSections`/section
+map, include `Digest` in `mergeConfig` so file, environment, and CLI values
+retain the repository's existing precedence, and include the section in
+serialization/round-trip handling. A file-load test through both `Load` and
+`LoadAt` must prove that `[digest]` values reach the daemon's effective
+`Config` (and therefore the scheduler), while a malformed `[digest]` value
+reaches the same fail-fast validation path rather than being silently ignored.
+The test suite must cover TOML round-trip/serialization and file-load
+precedence, plus rejection of malformed `FireTime`, `Timezone`,
+`EmptyDayMode`, and `VerdictFlipWindowMinutes` values.
+
 ## Delivery
 
-One `Gateway.Notify(ctx, payload)` call per digest
+One `Gateway.Notify(ctx, payload)` call per non-quiet digest
 (`internal/infra/notify/gateway.go:191`), with a `SystemNotificationPayload`
 whose `Body` carries the rendered digest and whose `DedupeKey` is
 `digest:<D>:<configFingerprint>` (the digest date plus the effective-config
@@ -1039,6 +1082,19 @@ a deployment that wants a less alarming level must extend the level
 vocabulary and allow-list (out of scope for this derived projection). The
 gateway persists an in-app `NotificationRecord` regardless of push-channel
 success, so the digest content survives a webhook/osascript failure.
+
+When `EmptyDayMode = "quiet"` and the assembled window has no qualifying
+events, the job does **not** call `Gateway.Notify`: it writes the same
+date/config-fingerprinted key directly through the existing
+`NotificationsRepository` as an `in_app` invocation marker (for example,
+`Status: "quiet"`, with the empty-day result in `PayloadJSON`). This marker
+is durable evidence that the scheduled invocation completed even though no
+push was requested, and it is consumed by the catch-up and activation-boundary
+checks below exactly like the marker produced by a non-quiet `Notify` call.
+The marker write is required to succeed before the job advances
+`lastDigestDate`; a storage error leaves the date eligible for a later retry
+and never fabricates activation evidence. This reuses the existing
+notifications record rather than adding a digest table or delivery ledger.
 
 The dashboard section is backed by a new HTTP route
 `GET /api/v1/digest?date=YYYY-MM-DD` (default: the most recent digest date
@@ -1143,9 +1199,12 @@ does not influence merge, dispatch, or routing. There is no new authority
 to name because the digest does not act. The storage changes — a bounded
 range query on `event_logs` and a payload extension on `pr.review.posted`
 — read and record existing evidence; they do not create a new authority
-surface. No migration is added (the PR objective prohibits migrations);
-the range query uses the existing `event_logs` indexes (see Digest
-window).
+surface. The additive `event_logs.seq` migration is storage ordering metadata
+only; it does not become a digest authority or materialized state. The range
+query uses the existing `event_logs` indexes (see Digest window). The migration
+does add a backfill and append-allocation cost; the simpler implicit `rowid`
+alternative was rejected because VACUUM/backup restore can renumber it and
+change which equal-timestamp event a backward scan treats as latest.
 
 ## Risks
 
@@ -1189,12 +1248,11 @@ window).
 - **Dashboard re-assembly cost.** Re-running the assembly on every
   `/api/v1/digest` request scans `EventsRepository.ListBetween` for the
   date's fixed calendar-day window. The scan is bounded on both sides by
-  the date, but without a `created_at`-leading index (no migration is
-  added) the range predicate scans rows from `since` forward and sorts in
-  memory, so cost grows with total `event_logs` history rather than with
-  the one-day window. Accepted for an on-demand (non-polled) endpoint on
-  small/medium histories; a `created_at`-leading index is a future
-  optimization outside this PR's no-migration scope. No caching layer is
+  the date, but without a `created_at`-leading index the range predicate scans
+  rows from `since` forward and sorts in memory, so cost grows with total
+  `event_logs` history rather than with the one-day window. Accepted for an
+  on-demand (non-polled) endpoint on small/medium histories; a
+  `created_at`-leading index is a future optimization. No caching layer is
   added.
 - **Routine digest labeled `action_required`.** The default webhook/Feishu
   allow-list admits only `action_required` and `failure`, so the digest
@@ -1234,8 +1292,8 @@ Regression coverage (Go tests, fixture-based, no network):
   it is.
 - Event ordering tie-breaker: append successive gate/review/lifecycle events
   with the same millisecond `created_at`; assert every latest/consecutive
-  selection follows SQLite insertion (`rowid`) order rather than random event
-  IDs, including `ListBetween`, `ListByEntity`, and latest-per-project/entity
+  selection follows the durable storage sequence (`seq`) rather than random
+  event IDs or implicit `rowid`, including `ListBetween`, `ListByEntity`, and latest-per-project/entity
   enumeration.
 - Originating issue resolution: seed a merge event with no `LoopID` and a
   matching `LoopRecord` reachable by `ListByProjectRepoAndPR` for the
@@ -1393,8 +1451,10 @@ Regression coverage (Go tests, fixture-based, no network):
   attempted again. A surfaced error without rollback is not sufficient because
   the committed head marker would suppress that retry.
 - Empty-day behavior: no qualifying events in the window → `quiet` mode
-  produces no `Notify` call; `notice` mode produces one payload with the
-  "nothing merged" body.
+  produces no `Notify` call but persists one `in_app` invocation marker with
+  the date/config key; a marker-write failure leaves the date retryable.
+  `notice` mode produces one payload with the "nothing merged" body and its
+  `Notify` call persists the equivalent marker before fan-out.
 - Delivery level: assert the payload uses `Level: action_required` with
   `Sound: ""`; assert webhook/Feishu channels deliver (not `level
   filtered`) and osascript does not play a sound.
@@ -1440,36 +1500,37 @@ Regression coverage (Go tests, fixture-based, no network):
   first valid instant on the requested local date rather than a normalized
   instant on the prior date, and that the adjacent date windows do not
   overlap.
-- Catch-up from durable history: with no delivered digest for `F−1` and a
-  delivered record for `F`, restart the daemon after midnight on `F+1`;
-  assert the startup catch-up pushes `F−1` (missed) in chronological order
-  before resuming the regular schedule, and does not re-push `F` (already
-  delivered). Also restart at 00:01 on `F`, before the configured 09:00 fire,
+- Catch-up from durable history: with no invocation marker for `F−1` and an
+  invocation marker for `F` (delivered or quiet), restart the daemon after
+  midnight on `F+1`; assert the startup catch-up pushes `F−1` (missed) in
+  chronological order before resuming the regular schedule, and does not
+  re-push `F` (already invoked). Also restart at 00:01 on `F`, before the
+  configured 09:00 fire,
   and assert `F−1` is not pushed early; the regular schedule later delivers
   it at 09:00. Assert dates older than the 7-day horizon are not pushed.
-- Catch-up trailing missed dates: with a delivered record for `F−2` only
-  and no delivered record for `F−1` or `F`, restart the daemon after
+- Catch-up trailing missed dates: with an invocation marker for `F−2` only
+  and no marker for `F−1` or `F`, restart the daemon after
   midnight on `F+1`; assert the startup catch-up pushes both `F−1` and
-  `F` (the trailing missed dates at or after the oldest delivered record
+  `F` (the trailing missed dates at or after the oldest invocation marker
   `F−2`), in chronological order — a predicate that considers only dates
-  at or before the newest delivered record would never push them.
-- Catch-up activation boundary: on first enablement with no delivered
-  digest record anywhere in the 7-day horizon, restart/start the daemon
+  at or before the newest marker would never push them.
+- Catch-up activation boundary: on first enablement with no invocation
+  marker anywhere in the 7-day horizon, restart/start the daemon
   and assert the catch-up pushes **nothing** (no historical backfill) and
-  `lastDigestDate` stays empty. Then seed a delivered digest record for
-  `F−1` only and restart after `F`'s scheduled fire has passed, with no
-  record for `F`; assert `F` is pushed (the `F−1` record is the activation
-  boundary proving the feature was active) but dates before the oldest
-  delivered record are not treated as missed. A record for `F` alone must
+-  `lastDigestDate` stays empty. Then seed an invocation marker for `F−1`
+  only and restart after `F`'s scheduled fire has passed, with no marker for
+  `F`; assert `F` is pushed (the `F−1` marker is the activation boundary
+  proving the feature was active) but dates before the oldest marker are not
+  treated as missed. A marker for `F` alone must
   not make `F−1` eligible, because it cannot prove activation for that
   earlier date.
 - First scheduled fire not suppressed: on first enablement at 08:00 with
-  the default 09:00 fire time and no delivered records, start the daemon
+  the default 09:00 fire time and no invocation markers, start the daemon
   and assert the regular schedule fires 09:00 for `D = F − 1` (the guard
   is not pre-seeded with the closed-but-undelivered `F − 1`), so the
   first scheduled digest is delivered rather than permanently skipped.
   Start a second daemon at 10:00 (after the 09:00 fire has passed) with
-  no delivered records and assert it waits for tomorrow's 09:00 fire for
+  no invocation markers and assert it waits for tomorrow's 09:00 fire for
   `D = F` without pre-seeding the guard.
 - Completed-window selection: under defaults (`FireTime = "09:00"`), fire
   the job on day `F` and assert it selects `D = F − 1` and queries
