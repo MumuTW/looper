@@ -81,6 +81,11 @@ const (
 	defaultRetryDelay               = 5 * time.Second
 	maxRetryDelay                   = 300 * time.Second
 	defaultRetryMax                 = 3
+	// durableRecoveryTimeout bounds the detached context used after a claimed
+	// operation has already failed. Queue/loop reconciliation must survive the
+	// operation context being cancelled, but it must not wait indefinitely on a
+	// blocked SQLite call while the claim is held.
+	durableRecoveryTimeout = 5 * time.Second
 )
 
 type FixItem struct {
@@ -2209,6 +2214,15 @@ func (r *Runner) ProcessClaimedQueueItem(ctx context.Context, queueItem storage.
 }
 
 func (r *Runner) recoverClaimedItem(ctx context.Context, queueItem storage.QueueItemRecord, err error) (*ProcessResult, error) {
+	// Processing may return an error after a durable queue write has committed,
+	// and shutdown/cancellation can arrive before the caller enters recovery.
+	// Recovery owns the durable queue/loop transition, so detach cancellation
+	// while preserving context values and bound the cleanup window. Otherwise a
+	// terminal queue row can be left paired with a queued loop when the next
+	// GetByID observes the cancelled operation context.
+	recoveryCtx, cancel := newDurableRecoveryContext(ctx)
+	defer cancel()
+	ctx = recoveryCtx
 	failure := r.classifyFailure(err)
 	var activeErr *activeRunError
 	var runFailure *claimedRunFailureError
@@ -2293,6 +2307,14 @@ func (r *Runner) recoverClaimedItem(ctx context.Context, queueItem storage.Queue
 		}
 	}
 	return &ProcessResult{LoopID: derefString(queueItem.LoopID), QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
+}
+
+func newDurableRecoveryContext(parent context.Context) (context.Context, context.CancelFunc) {
+	base := context.Background()
+	if parent != nil {
+		base = context.WithoutCancel(parent)
+	}
+	return context.WithTimeout(base, durableRecoveryTimeout)
 }
 
 func (r *Runner) reconcileRecoveredLoop(ctx context.Context, queueItem storage.QueueItemRecord, failedQueue *storage.QueueItemRecord) (*storage.LoopRecord, error) {

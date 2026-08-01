@@ -2,12 +2,14 @@ package fixer
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -4382,6 +4384,89 @@ func TestProcessClaimedItemFailsClosedForQuarantinedProject(t *testing.T) {
 	}
 	if persistedLoop == nil || persistedLoop.Status != "paused" {
 		t.Fatalf("loop = %#v, want paused after fail-closed", persistedLoop)
+	}
+}
+
+// cancelAfterQueueFailQuerier models the narrow crash/cancellation window in
+// which Queue.Fail commits the terminal row and the operation context is
+// cancelled before recovery reads that row back. Durable recovery must use its
+// detached bounded context and still reconcile the paired loop.
+type cancelAfterQueueFailQuerier struct {
+	db     *sql.DB
+	cancel context.CancelFunc
+	once   sync.Once
+}
+
+func (q *cancelAfterQueueFailQuerier) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	result, err := q.db.ExecContext(ctx, query, args...)
+	if strings.Contains(query, "UPDATE queue_items") && strings.Contains(query, "SET status = ?") {
+		q.once.Do(q.cancel)
+	}
+	return result, err
+}
+
+func (q *cancelAfterQueueFailQuerier) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	return q.db.QueryContext(ctx, query, args...)
+}
+
+func (q *cancelAfterQueueFailQuerier) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
+	return q.db.QueryRowContext(ctx, query, args...)
+}
+
+func TestProcessClaimedQueueItemReconcilesQuarantineAfterContextCancellation(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	nowISO := fixture.nowISO()
+	loopID := "loop_fixer_quarantine_cancel"
+	projectID := "project_1"
+	repo := "acme/looper"
+	prNumber := int64(42)
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{
+		ID: loopID, Seq: 2, ProjectID: projectID, Type: "fixer", TargetType: "pull_request", Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{
+		ID: "queue_fixer_quarantine_cancel", ProjectID: &projectID, LoopID: &loopID, Type: "fixer", TargetType: "pull_request", TargetID: "42", Repo: &repo, PRNumber: &prNumber,
+		DedupeKey: "fixer:quarantine-cancel", Priority: 1, Status: "running", AvailableAt: nowISO, Attempts: 0, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	repos := storage.NewRepositories(&cancelAfterQueueFailQuerier{db: fixture.coordinator.DB(), cancel: cancel})
+	runner := New(Options{
+		DB: fixture.coordinator.DB(), Repos: repos, GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{},
+		Logger: fixture.logger, Now: fixture.now, ValidationCommandsByProject: map[string][]string{},
+	})
+	queueItem, err := repos.Queue.GetByID(context.Background(), "queue_fixer_quarantine_cancel")
+	if err != nil || queueItem == nil {
+		t.Fatalf("Queue.GetByID() = (%#v, %v), want seeded claim", queueItem, err)
+	}
+	result, err := runner.ProcessClaimedQueueItem(ctx, *queueItem)
+	if err != nil {
+		t.Fatalf("ProcessClaimedQueueItem() error = %v", err)
+	}
+	if result == nil || result.Status != "failed" || result.FailureKind != FailureManualIntervention {
+		t.Fatalf("result = %#v, want failed/manual_intervention", result)
+	}
+	if ctx.Err() != context.Canceled {
+		t.Fatalf("operation context err = %v, want cancellation injected after Queue.Fail", ctx.Err())
+	}
+	persistedQueue, err := repos.Queue.GetByID(context.Background(), queueItem.ID)
+	if err != nil {
+		t.Fatalf("Queue.GetByID(after) error = %v", err)
+	}
+	if persistedQueue == nil || persistedQueue.Status != "manual_intervention" {
+		t.Fatalf("queue = %#v, want terminal manual_intervention", persistedQueue)
+	}
+	persistedLoop, err := repos.Loops.GetByID(context.Background(), loopID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID(after) error = %v", err)
+	}
+	if persistedLoop == nil || persistedLoop.Status != "paused" || persistedLoop.NextRunAt != nil {
+		t.Fatalf("loop = %#v, want paused loop after durable recovery", persistedLoop)
 	}
 }
 
