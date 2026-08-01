@@ -232,6 +232,11 @@ repoPath = "/absolute/path/to/repo"
 
 Existing global-only configs remain zero-diff: a single `agent.vendor` / `agent.model` still applies to every coding role (planner, worker, reviewer, fixer) until you add profiles or per-role bindings.
 
+Configured vendors have an explicit [coding-agent runtime contract](agent-runtime-contract.md)
+covering continuation, event, supervision, and security behavior. A vendor name
+does not imply support for every capability; unsupported policy gates fail
+closed or use the documented fresh-session fallback.
+
 ## Multi-role agent vendor and model
 
 Coding roles can share one global agent or override vendor/model per role. Overrides are identity-only (vendor + model). Shared executor settings such as `agent.params`, `agent.env`, timeouts, and `agent.nativeResume` stay global.

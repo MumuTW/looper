@@ -10,7 +10,7 @@ import (
 // ownership, persistence, timeouts, checkpoints, and worktree authority remain
 // in ConfiguredExecutor.
 type runtimeAdapter struct {
-	command                  string
+	contract                 RuntimeContract
 	resolveStartArgs         func(ExecutorConfig, []string, string, string) []string
 	resolveNativeResumeArgs  func(ExecutorConfig, []string, string, string, string) []string
 	resolveInteractiveResume func(string, string) string
@@ -18,7 +18,11 @@ type runtimeAdapter struct {
 
 var runtimeAdapters = map[config.AgentVendor]runtimeAdapter{
 	config.AgentVendorClaudeCode: {
-		command: "claude",
+		contract: characterizedContract(config.AgentVendorClaudeCode, "claude", map[RuntimeCapability]CapabilityEvidence{
+			CapabilitySessionIdentity:     translatedEvidence("executor/session-id-extraction"),
+			CapabilityHeadlessResume:      nativeEvidence("claude/--resume-print"),
+			CapabilityInteractiveTakeover: nativeEvidence("claude/--resume-verified-2026-07"),
+		}),
 		resolveStartArgs: func(cfg ExecutorConfig, args []string, _ string, prompt string) []string {
 			return resolveClaudeArgs(cfg, args, prompt)
 		},
@@ -28,7 +32,13 @@ var runtimeAdapters = map[config.AgentVendor]runtimeAdapter{
 		},
 	},
 	config.AgentVendorCodex: {
-		command: "codex",
+		contract: characterizedContract(config.AgentVendorCodex, "codex", map[RuntimeCapability]CapabilityEvidence{
+			CapabilityStructuredLiveEvents:   nativeEvidence("codex/exec-jsonl"),
+			CapabilitySessionIdentity:        translatedEvidence("codex/thread-id-jsonl"),
+			CapabilityHeadlessResume:         nativeEvidence("codex/exec-resume"),
+			CapabilityInteractiveTakeover:    nativeEvidence("codex/resume-verified-2026-07"),
+			CapabilityToolNetworkRestriction: enforcedEvidence("codex/validation-sandbox"),
+		}),
 		resolveStartArgs: func(cfg ExecutorConfig, args []string, _ string, prompt string) []string {
 			return resolveCodexArgs(cfg, args, prompt)
 		},
@@ -38,23 +48,33 @@ var runtimeAdapters = map[config.AgentVendor]runtimeAdapter{
 		},
 	},
 	config.AgentVendorOpenCode: {
-		command:                 "opencode",
+		contract: characterizedContract(config.AgentVendorOpenCode, "opencode", map[RuntimeCapability]CapabilityEvidence{
+			CapabilitySessionIdentity: translatedEvidence("executor/session-id-extraction"),
+			CapabilityHeadlessResume:  nativeEvidence("opencode/run-session"),
+		}),
 		resolveStartArgs:        resolveOpenCodeArgs,
 		resolveNativeResumeArgs: resolveOpenCodeNativeResumeArgs,
 	},
 	config.AgentVendorCursorCLI: {
-		command: "agent",
+		contract: characterizedContract(config.AgentVendorCursorCLI, "agent", map[RuntimeCapability]CapabilityEvidence{
+			CapabilitySessionIdentity: translatedEvidence("cursor/chat-id-extraction"),
+			CapabilityHeadlessResume:  nativeEvidence("cursor/--resume-print"),
+		}),
 		resolveStartArgs: func(cfg ExecutorConfig, args []string, _ string, prompt string) []string {
 			return resolveCursorArgs(cfg, args, prompt)
 		},
 		resolveNativeResumeArgs: resolveCursorNativeResumeArgs,
 	},
 	config.AgentVendorGrokBuild: {
-		command:          "grok",
+		contract:         characterizedContract(config.AgentVendorGrokBuild, "grok", nil),
 		resolveStartArgs: resolveGrokArgs,
 	},
 	config.AgentVendorDevinExperimental: {
-		command: "devin",
+		contract: characterizedContract(config.AgentVendorDevinExperimental, "devin", map[RuntimeCapability]CapabilityEvidence{
+			CapabilityExecutableDiscovery:  experimentalEvidence("devin-3000.3.22", "devin/print-fixture"),
+			CapabilityNonInteractivePrompt: experimentalEvidence("devin-3000.3.22", "devin/--print"),
+			CapabilityModelSelection:       experimentalEvidence("devin-3000.3.22", "devin/--model"),
+		}),
 		resolveStartArgs: func(cfg ExecutorConfig, args []string, _ string, prompt string) []string {
 			return resolveDevinArgs(cfg, args, prompt)
 		},
