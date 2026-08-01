@@ -1803,7 +1803,7 @@ func TestHandlerPullRequestRouteReturnsInternalErrorWhenLoopLookupFails(t *testi
 
 	services := fixture.runtime.Services()
 	services.Repositories = storage.NewRepositories(errorInjectingQuerier{db: services.Coordinator.DB(), queryError: func(query string) error {
-		if strings.Contains(query, "SELECT * FROM loops WHERE repo = ? COLLATE NOCASE AND pr_number = ?") {
+		if strings.Contains(query, "FROM loops WHERE repo = ? COLLATE NOCASE AND pr_number = ?") {
 			return errors.New("database is locked")
 		}
 		return nil
@@ -1927,7 +1927,7 @@ func TestHandlerPullRequestStatusReturnsInternalErrorWhenLoopLookupFails(t *test
 
 	services := fixture.runtime.Services()
 	services.Repositories = storage.NewRepositories(errorInjectingQuerier{db: services.Coordinator.DB(), queryError: func(query string) error {
-		if strings.Contains(query, "SELECT * FROM loops WHERE repo = ? COLLATE NOCASE AND pr_number = ?") {
+		if strings.Contains(query, "FROM loops WHERE repo = ? COLLATE NOCASE AND pr_number = ?") {
 			return errors.New("database is locked")
 		}
 		return nil
@@ -1977,7 +1977,7 @@ func TestHandlerPullRequestStatusReturnsInternalErrorWhenRunLookupFails(t *testi
 
 	services := fixture.runtime.Services()
 	services.Repositories = storage.NewRepositories(errorInjectingQuerier{db: services.Coordinator.DB(), queryError: func(query string) error {
-		if strings.Contains(query, "SELECT * FROM runs WHERE loop_id = ? ORDER BY started_at DESC") {
+		if strings.Contains(query, "FROM runs WHERE loop_id = ? ORDER BY started_at DESC") {
 			return errors.New("database is locked")
 		}
 		return nil
