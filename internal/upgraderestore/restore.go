@@ -841,22 +841,6 @@ func inspectRegularArtifact(path, description string) (os.FileInfo, bool, error)
 	return info, true, nil
 }
 
-func targetOwnedByRestoreTransaction(entry journalEntry) (bool, error) {
-	wantHash, wantSize, err := expectedStagedIdentity(entry)
-	if err != nil {
-		return false, err
-	}
-	if wantHash == "" {
-		// WAL/SHM have no staged content; never claim ownership of a recreated file.
-		return false, nil
-	}
-	hash, size, err := fileContentIdentity(entry.TargetPath)
-	if err != nil {
-		return false, err
-	}
-	return hash == wantHash && size == wantSize, nil
-}
-
 // expectedStagedIdentity returns the content identity of the restore transaction's
 // staged install for entry (live staged file when present, else durable journal fields).
 func expectedStagedIdentity(entry journalEntry) (hash string, size int64, err error) {
