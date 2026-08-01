@@ -9,7 +9,44 @@ import (
 	"strings"
 )
 
-func numCPU() int { return runtime.NumCPU() }
+func numCPU() int {
+	if n := hostCPUCount(); n > 0 {
+		return n
+	}
+	return runtime.NumCPU()
+}
+
+// hostCPUCount returns the host-wide logical CPU count from /proc/cpuinfo.
+//
+// runtime.NumCPU() reports the CPUs in this process's scheduling affinity, which
+// a cgroup cpu.cfs_quota or taskset can pin to a subset of the host. /proc/loadavg
+// is always host-wide, so comparing it against a restricted NumCPU trips the load
+// ceiling on a busy host even when looper's own allocation is idle — on a 64-core
+// node with looper restricted to 2 CPUs, a node load above 4 exceeds the default
+// 2.0 ceiling and withholds every claim. The load average and the CPU count must
+// be the same scope; /proc/cpuinfo reports the host's processors regardless of
+// this process's affinity, so it matches /proc/loadavg's scope. A read failure
+// falls back to runtime.NumCPU() rather than disabling the signal.
+func hostCPUCount() int {
+	data, err := os.ReadFile("/proc/cpuinfo")
+	if err != nil {
+		return 0
+	}
+	return parseCPUCount(data)
+}
+
+// parseCPUCount counts the "processor" entries in /proc/cpuinfo, one per logical
+// CPU. Extracted from hostCPUCount so the count can be verified against a
+// synthetic payload rather than depending on the host's CPU topology.
+func parseCPUCount(data []byte) int {
+	count := 0
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(line, "processor") {
+			count++
+		}
+	}
+	return count
+}
 
 func readLoad(snapshot *Snapshot) {
 	data, err := os.ReadFile("/proc/loadavg")

@@ -8,6 +8,7 @@ import (
 
 	"github.com/MumuTW/looper/internal/config"
 	"github.com/MumuTW/looper/internal/hostresources"
+	"github.com/MumuTW/looper/internal/storage"
 )
 
 // HostAdmissionStatus is the operator-facing view of the last host reading.
@@ -155,9 +156,22 @@ func thresholdsFromConfig(cfg config.ResourceGuardConfig) hostresources.Threshol
 // hostAdmissionStatePath is the directory whose filesystem the disk signal
 // measures: the one holding the SQLite database, because that is the write that
 // turns a full disk into a corrupt daemon.
+//
+// The configured dbPath may be a SQLite file: URI (e.g.
+// "file:/var/lib/looper/looper.sqlite?cache=shared"), which filepath.Dir cannot
+// interpret — it would yield "file:/var/lib/looper", a path statfs cannot
+// resolve, so Read records a disk error and Evaluate admits on the absent disk
+// fields, silently disabling the guard for that configuration. Normalize through
+// storage.SQLiteFilesystemPath first so the URI form resolves to the real
+// filesystem directory. A memory database (":memory:" or "file:...?mode=memory")
+// has no filesystem to measure; SQLiteFilesystemPath reports that as !isFile, and
+// the path falls through to the default home so the disk signal still reads a
+// real volume rather than a URI prefix.
 func hostAdmissionStatePath(cfg config.Config) string {
 	if path := strings.TrimSpace(cfg.Storage.DBPath); path != "" {
-		return filepath.Dir(path)
+		if fsPath, isFile, err := storage.SQLiteFilesystemPath(path); err == nil && isFile {
+			return filepath.Dir(fsPath)
+		}
 	}
 	if home, err := config.DefaultLooperHome(); err == nil {
 		return home

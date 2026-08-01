@@ -2648,6 +2648,17 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 				break
 			}
 			label := lane.laneLabel()
+			// Host pressure must gate discovery lanes, not only claims: the
+			// Coordinator lane starts agent processes directly during Discover
+			// (decide → ConfiguredExecutor.Start), bypassing the claim/slot
+			// chokepoint that executeClaimPhase guards. A hold here stops the
+			// lane before it can launch a new process on the pressured host.
+			if held := hostAdmissionHeld(input, label); held != nil {
+				if input.Logger != nil {
+					input.Logger.Debug("scheduler skipped discovery lane under host pressure", map[string]any{"lane": label, "projectId": project.ID, "repo": repo, "reasons": held.Reasons})
+				}
+				break
+			}
 			appendErr(runSchedulerLane(input, label, project.ID, repo, func() error {
 				items, err := lane.Discover(ctx, project.ID, repo, snapshot)
 				trackRunnableDiscovery(items)
@@ -2934,6 +2945,32 @@ func logHostAdmissionHold(logger bootstrap.Logger, phase string, withheldSlots i
 		"reasons":       decision.Reasons,
 		"detail":        decision.Summary(),
 	})
+}
+
+// hostAdmissionHeld returns a non-nil, non-admitting Decision when host pressure
+// refuses new work, logging the hold through the throttle so a sustained
+// condition surfaces once per transition/sample rather than on every lane. Nil
+// means admit or no opinion — proceed.
+//
+// The discovery lanes call this before Discover because the Coordinator lane
+// starts agent processes directly during discovery (decide →
+// ConfiguredExecutor.Start), bypassing the claim/slot chokepoint that
+// executeClaimPhase guards. A hold that only withholds claims while discovery
+// keeps launching defeats the guard: pressure on the host is the same whether
+// the new process comes from a queue claim or a Coordinator decide, so the hold
+// must stop both.
+func hostAdmissionHeld(input defaultSchedulerTickInput, phase string) *hostresources.Decision {
+	if input.HostAdmission == nil {
+		return nil
+	}
+	held := input.HostAdmission()
+	if held == nil || held.Admit {
+		return nil
+	}
+	if input.HostAdmissionLog == nil || input.HostAdmissionLog(held) {
+		logHostAdmissionHold(input.Logger, phase, 0, *held)
+	}
+	return held
 }
 
 func logClaimPhase(logger bootstrap.Logger, phase string, availableSlots, claimedCount int, duration time.Duration, err error) {

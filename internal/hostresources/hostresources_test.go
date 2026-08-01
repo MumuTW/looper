@@ -155,7 +155,15 @@ func TestEvaluate(t *testing.T) {
 func TestReadReturnsPlausibleValues(t *testing.T) {
 	snapshot := Read(t.TempDir())
 
-	if snapshot.NumCPU != runtime.NumCPU() {
+	// On Linux numCPU() returns the host-wide CPU count (from /proc/cpuinfo) so
+	// it matches the host-wide /proc/loadavg scope; a cgroup or taskset can make
+	// that differ from runtime.NumCPU(), so only assert plausibility there. The
+	// exact count is verified deterministically by TestParseCPUCount.
+	if runtime.GOOS == "linux" {
+		if snapshot.NumCPU < 1 {
+			t.Fatalf("NumCPU = %d, want a positive host-wide CPU count", snapshot.NumCPU)
+		}
+	} else if snapshot.NumCPU != runtime.NumCPU() {
 		t.Fatalf("NumCPU = %d, want %d", snapshot.NumCPU, runtime.NumCPU())
 	}
 

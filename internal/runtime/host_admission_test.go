@@ -145,6 +145,53 @@ func TestHostAdmissionStatePathFollowsTheDatabase(t *testing.T) {
 	}
 }
 
+// A SQLite file: URI must resolve to the real filesystem directory, not the URI
+// prefix that filepath.Dir would produce. Without normalization the disk signal
+// stats "file:/var/lib/looper", statfs fails, and Evaluate admits on the absent
+// disk fields — silently disabling the guard for this configuration.
+func TestHostAdmissionStatePathResolvesSQLiteFileURI(t *testing.T) {
+	t.Parallel()
+
+	cfg := config.Config{}
+	cfg.Storage.DBPath = "file:/var/lib/looper/looper.sqlite?cache=shared"
+	if got := hostAdmissionStatePath(cfg); got != "/var/lib/looper" {
+		t.Fatalf("hostAdmissionStatePath() = %q, want /var/lib/looper", got)
+	}
+}
+
+// An opaque file: URI (no authority) resolves to the relative path SQLite writes.
+func TestHostAdmissionStatePathResolvesOpaqueFileURI(t *testing.T) {
+	t.Parallel()
+
+	cfg := config.Config{}
+	cfg.Storage.DBPath = "file:looper.sqlite?_busy_timeout=5000"
+	if got := hostAdmissionStatePath(cfg); got != "." {
+		t.Fatalf("hostAdmissionStatePath() = %q, want .", got)
+	}
+}
+
+// A memory database has no filesystem to measure. The path must fall through to
+// the default home rather than a URI prefix, so the disk signal still reads a
+// real volume instead of erroring on every sample.
+func TestHostAdmissionStatePathFallsThroughForMemoryDatabase(t *testing.T) {
+	t.Parallel()
+
+	cfg := config.Config{}
+	cfg.Storage.DBPath = ":memory:"
+	home, err := config.DefaultLooperHome()
+	if err != nil {
+		t.Fatalf("DefaultLooperHome() error = %v", err)
+	}
+	if got := hostAdmissionStatePath(cfg); got != home {
+		t.Fatalf("hostAdmissionStatePath() = %q, want default home %q for a memory database", got, home)
+	}
+
+	cfg.Storage.DBPath = "file:looper.sqlite?mode=memory"
+	if got := hostAdmissionStatePath(cfg); got != home {
+		t.Fatalf("hostAdmissionStatePath() = %q, want default home %q for a memory-mode URI", got, home)
+	}
+}
+
 func TestThresholdsFromConfigConvertsGigabytes(t *testing.T) {
 	t.Parallel()
 
