@@ -2718,9 +2718,12 @@ func stampedCoordinatorBody(cfg *config.Config, body string) string {
 	return disclosure.FromConfig(*cfg).Markdown(body, "coordinator", disclosure.ChannelIssueComment)
 }
 
-func TestRunnerRoutedBacklogRehydratesDeadSingleTarget(t *testing.T) {
-	// A sole target whose node has stopped heartbeating must not be skipped
-	// by recovery hydration; admission needs the issue detail to re-route.
+func TestRunnerRoutedBacklogLeavesStaleHeartbeatSingleTargetUntouched(t *testing.T) {
+	// A sole target whose node has stopped heartbeating is still an active
+	// claim: heartbeat staleness is infrastructure drift, not authority to
+	// revoke the assignment. The recovery scan must skip it (no hydration,
+	// no reroute) so a temporarily partitioned worker cannot run the same
+	// issue concurrently with a freshly routed live worker.
 	t.Parallel()
 	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
 		cfg.Roles.Coordinator.Enabled = true
@@ -2756,9 +2759,16 @@ func TestRunnerRoutedBacklogRehydratesDeadSingleTarget(t *testing.T) {
 	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
 		t.Fatalf("DiscoverIssues() error = %v", err)
 	}
-	if fixture.github.viewIssueReads < 1 {
-		t.Fatalf("viewIssueReads = %d, want dead single-target hydrated for recovery", fixture.github.viewIssueReads)
+	// The single-target recovery candidate is skipped, so the issue detail is
+	// never hydrated from the backlog scan.
+	if fixture.github.viewIssueReads != 0 {
+		t.Fatalf("viewIssueReads = %d, want stale single-target left untouched (not hydrated)", fixture.github.viewIssueReads)
 	}
-	// Live worker should receive the reassignment.
-	assertOrderedOps(t, fixture.github.ops, []string{"assign:live-bot", "add:looper:target:worker-live"})
+	// No reroute: the stale sole target must not move to the live worker.
+	if len(fixture.github.ops) != 0 {
+		t.Fatalf("ops = %v, want no dispatch ops for stale single-target", fixture.github.ops)
+	}
+	if got := countRemovedIssueOperations(fixture.github.removedLabels, 77, protocol.TargetLabelForNode("worker-dead")); got != 0 {
+		t.Fatalf("removed target label count = %d, want stale sole target untouched", got)
+	}
 }
