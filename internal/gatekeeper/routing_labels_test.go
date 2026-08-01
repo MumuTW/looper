@@ -199,6 +199,25 @@ func TestRoutingLabelsSkipWhenReviewStateChangesBeforeProjection(t *testing.T) {
 	}
 }
 
+func TestRoutingLabelsSkipWhenReviewThreadAppearsBeforeProjection(t *testing.T) {
+	fixture := newGatekeeperFixture(t)
+	views := 0
+	fixture.github.beforeView = func(github *fakeGatekeeperGitHub) {
+		views++
+		if views == 2 {
+			github.threads = []githubinfra.ReviewThread{{ID: "thread-new", IsResolved: false}}
+		}
+	}
+	if _, err := routingRunner(fixture, config.GatekeeperTrustAuto).EvaluatePullRequest(context.Background(), EvaluationInput{
+		ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, ExpectedHeadSHA: "head-1",
+	}); err == nil {
+		t.Fatal("EvaluatePullRequest() succeeded after an unresolved review thread appeared before projection")
+	}
+	if len(fixture.github.labelAdds) != 0 || len(fixture.github.labelRemoves) != 0 {
+		t.Fatalf("routing labels changed across a review-thread race: adds=%#v removes=%#v", fixture.github.labelAdds, fixture.github.labelRemoves)
+	}
+}
+
 func TestRoutingLabelsBindEmptyReviewEvidenceToCurrentState(t *testing.T) {
 	fixture := newGatekeeperFixture(t)
 	fixture.github.detail.ReviewDecision = ""
@@ -380,6 +399,8 @@ func TestDiscoverPullRequestsContinuesAfterRoutingFailure(t *testing.T) {
 		{Number: 42, State: "OPEN", HeadSHA: "head-42", BaseRefName: "main", ReviewDecision: "APPROVED", UpdatedAt: "2026-07-30T09:00:00Z"},
 		{Number: 43, State: "OPEN", HeadSHA: "head-43", BaseRefName: "main", ReviewDecision: "APPROVED", UpdatedAt: "2026-07-30T09:00:00Z"},
 	}
+	seedReviewerReviewEventForPR(t, fixture, "project_1", 42, "head-42", "APPROVE", "reviewer-loop", 1, true)
+	seedReviewerReviewEventForPR(t, fixture, "project_1", 43, "head-43", "APPROVE", "reviewer-loop", 2, true)
 	github := &perPullRequestRoutingGitHub{fakeGatekeeperGitHub: fixture.github, failPR: 42}
 	runner := New(Options{
 		Repos: fixture.repos, GitHub: github, Now: func() time.Time { return fixture.now },
