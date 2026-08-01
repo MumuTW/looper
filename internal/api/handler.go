@@ -874,9 +874,12 @@ func isMutatingHTTPMethod(method string) bool {
 
 // isAdmissionExemptMutationPath lists mutation routes that must stay available
 // before admission is ready (dashboard bootstrap) or are not work-producing.
+// The drain control route stays available while draining: BeginDrain is
+// idempotent, and a repeated POST is how the CLI resumes after its first
+// response is lost past the deadline.
 func isAdmissionExemptMutationPath(path string) bool {
 	switch path {
-	case dashboardBootstrapCodePath, dashboardBootstrapExchangePath:
+	case dashboardBootstrapCodePath, dashboardBootstrapExchangePath, apiBasePath + "/upgrade/drain":
 		return true
 	default:
 		return false

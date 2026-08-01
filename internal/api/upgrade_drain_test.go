@@ -33,6 +33,15 @@ func TestUpgradeDrainClosesAdmissionAndReportsSupervisorSnapshot(t *testing.T) {
 		t.Fatalf("ordinary POST after drain = %d body=%s, want 503", blocked.Code, blocked.Body.String())
 	}
 
+	// The drain control route itself stays available while draining: the CLI
+	// resends this POST when its first response was lost past the deadline,
+	// and BeginDrain is idempotent.
+	repeat := httptest.NewRecorder()
+	handler.ServeHTTP(repeat, httptest.NewRequest(http.MethodPost, "/api/v1/upgrade/drain", nil))
+	if repeat.Code != http.StatusOK {
+		t.Fatalf("repeated POST after drain = %d body=%s, want 200", repeat.Code, repeat.Body.String())
+	}
+
 	get := httptest.NewRecorder()
 	handler.ServeHTTP(get, httptest.NewRequest(http.MethodGet, "/api/v1/upgrade/drain", nil))
 	if get.Code != http.StatusOK {
