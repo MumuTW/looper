@@ -33,12 +33,23 @@ const (
 // Manifest is the durable reproduction authority. TestSHA256 binds the
 // named test file to the reproduction commit; it is not an agent-produced
 // assertion that the bug was fixed.
+//
+// IssueNumber and IssueRepo optionally scope a manifest to the task that
+// originated it. The manifest is otherwise repository-global: once a
+// reproduction fix merges, the committed manifest and immutable test remain in
+// the base branch. Without a task scope, a later unrelated Worker run would
+// treat that green manifest as its own failed reproduction and block on an
+// immediate pass. When a manifest declares its originating issue, a Worker run
+// for a different issue ignores it as already-fixed history instead of gating
+// on a test that is no longer red.
 type Manifest struct {
 	Version     int    `json:"version"`
 	TestPath    string `json:"testPath"`
 	TestName    string `json:"testName"`
 	TestCommand string `json:"testCommand"`
 	TestSHA256  string `json:"testSha256"`
+	IssueNumber int64  `json:"issueNumber,omitempty"`
+	IssueRepo   string `json:"issueRepo,omitempty"`
 }
 
 // Parse decodes and validates a manifest without accepting unknown fields or
@@ -118,6 +129,7 @@ func (m Manifest) normalized() Manifest {
 	m.TestName = strings.TrimSpace(m.TestName)
 	m.TestCommand = strings.TrimSpace(m.TestCommand)
 	m.TestSHA256 = strings.ToLower(strings.TrimSpace(m.TestSHA256))
+	m.IssueRepo = strings.ToLower(strings.TrimSpace(m.IssueRepo))
 	return m
 }
 
@@ -125,6 +137,25 @@ func (m Manifest) normalized() Manifest {
 // replacing the manifest with a different test or hash during a run.
 func (m Manifest) Equal(other Manifest) bool {
 	return m.normalized() == other.normalized()
+}
+
+// AppliesToIssue reports whether this manifest is the reproduction authority
+// for the given issue. A manifest with no declared issue is unscoped and
+// applies to any task (preserving the prior contract for legacy manifests).
+// When IssueNumber is set, both the number and the issue repository must
+// match; IssueRepo is matched case-insensitively because GitHub repositories
+// are case-insensitive.
+func (m Manifest) AppliesToIssue(issueNumber int64, issueRepo string) bool {
+	if m.IssueNumber == 0 {
+		return true
+	}
+	if m.IssueNumber != issueNumber {
+		return false
+	}
+	if m.IssueRepo == "" {
+		return true
+	}
+	return strings.EqualFold(m.IssueRepo, strings.TrimSpace(issueRepo))
 }
 
 // Load reads the optional manifest from a repository root. A missing manifest
