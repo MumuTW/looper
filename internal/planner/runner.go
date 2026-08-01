@@ -37,12 +37,13 @@ const (
 
 	plannerPRDedupeLookupLimit = 1000
 
-	defaultAgentTimeout = 30 * time.Minute
-	defaultClaimTTL     = 10 * time.Minute
-	defaultRetryDelay   = 5 * time.Second
-	maxRetryDelay       = 300 * time.Second
-	defaultRetryMax     = 3
-	defaultIssueLimit   = 30
+	defaultAgentTimeout     = 30 * time.Minute
+	defaultClaimTTL         = 10 * time.Minute
+	defaultRetryDelay       = 5 * time.Second
+	maxRetryDelay           = 300 * time.Second
+	defaultRetryMax         = 3
+	defaultIssueLimit       = 30
+	personalIssueQueryLimit = 1000
 )
 
 var plannerStepSequence = []PlannerStep{stepDiscoverIssues, stepPrepareWorktree, stepAssessSuitability, stepWriteSpec, stepPublish, stepNotify}
@@ -561,26 +562,32 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 	if policy.RequireAssigneeCurrentUser && login == "" {
 		return DiscoveryResult{Skipped: 1}, nil
 	}
-	personalProject := r.isPersonalProject(project.ID)
+	personalProject := r.isPersonalProject(project.ID) && r.projectNetworkMode(project.ID) != config.ProjectNetworkModeRouted
 	assigneeFilter := ""
 	if policy.RequireAssigneeCurrentUser && !personalProject {
 		assigneeFilter = login
 	}
-	issues, err := r.listOpenIssuesForDiscovery(ctx, ListOpenIssuesInput{Repo: input.Repo, CWD: project.RepoPath, Limit: input.Limit, Assignee: assigneeFilter}, policy)
+	resultLimit := effectiveIssueLimit(input.Limit)
+	queryLimit := input.Limit
+	if personalProject && policy.RequireAssigneeCurrentUser && queryLimit < personalIssueQueryLimit {
+		queryLimit = personalIssueQueryLimit
+	}
+	issues, err := r.listOpenIssuesForDiscovery(ctx, ListOpenIssuesInput{Repo: input.Repo, CWD: project.RepoPath, Limit: queryLimit, Assignee: assigneeFilter}, policy)
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
 	result := DiscoveryResult{}
+	eligible := 0
 	for _, issue := range issues {
+		if domain.IsAutoLaneHeld(domain.LoopTypePlanner, issue.Labels) {
+			result.Skipped++
+			continue
+		}
 		assigned, err := r.assignPersonalIssueIfEligible(ctx, *project, input.Repo, issue, login, personalProject, policy.RequireAssigneeCurrentUser)
 		if err != nil {
 			return DiscoveryResult{}, err
 		}
 		issue = assigned
-		if domain.IsAutoLaneHeld(domain.LoopTypePlanner, issue.Labels) {
-			result.Skipped++
-			continue
-		}
 		if !shouldClaimIssue(issue, login, policy) {
 			result.Skipped++
 			continue
@@ -593,12 +600,32 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 		result.QueueItems = append(result.QueueItems, materialized.QueueItems...)
 		result.CreatedLoopIDs = append(result.CreatedLoopIDs, materialized.CreatedLoopIDs...)
 		result.Skipped += materialized.Skipped
+		eligible++
+		if eligible >= resultLimit {
+			break
+		}
 	}
 	return result, nil
 }
 
 func (r *Runner) isPersonalProject(projectID string) bool {
 	return r.projectRoleConfig != nil && config.IsPersonalProject(*r.projectRoleConfig, projectID)
+}
+
+func (r *Runner) projectNetworkMode(projectID string) config.ProjectNetworkMode {
+	if r == nil || r.projectRoleConfig == nil {
+		return config.ProjectNetworkModeOff
+	}
+	for _, project := range r.projectRoleConfig.Projects {
+		if project.ID != projectID {
+			continue
+		}
+		if project.Network.Mode != "" {
+			return project.Network.Mode
+		}
+		break
+	}
+	return config.ProjectNetworkModeOff
 }
 
 func (r *Runner) assignPersonalIssueIfEligible(ctx context.Context, project storage.ProjectRecord, repo string, issue IssueSummary, login string, personalProject, requireAssignee bool) (IssueSummary, error) {

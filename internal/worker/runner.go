@@ -51,12 +51,13 @@ const (
 	FailureNonRetryable         QueueFailureKind = "non_retryable"
 	FailureManualIntervention   QueueFailureKind = "manual_intervention"
 
-	defaultAgentTimeout = time.Hour
-	defaultClaimTTL     = 10 * time.Minute
-	defaultRetryDelay   = 5 * time.Second
-	maxRetryDelay       = 300 * time.Second
-	defaultRetryMax     = 3
-	defaultIssueLimit   = 30
+	defaultAgentTimeout     = time.Hour
+	defaultClaimTTL         = 10 * time.Minute
+	defaultRetryDelay       = 5 * time.Second
+	maxRetryDelay           = 300 * time.Second
+	defaultRetryMax         = 3
+	defaultIssueLimit       = 30
+	personalIssueQueryLimit = 1000
 
 	workerBranchSlugMaxLength        = 30
 	workerBranchSlugMaxWords         = 5
@@ -922,25 +923,31 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 	if !networkpolicy.IsRouted(policy.RoutedClaimPolicy) && policy.RequireAssigneeCurrentUser && !personalProject {
 		assigneeFilter = login
 	}
+	resultLimit := effectiveIssueLimit(input.Limit)
+	queryLimit := input.Limit
+	if personalProject && policy.RequireAssigneeCurrentUser && queryLimit < personalIssueQueryLimit {
+		queryLimit = personalIssueQueryLimit
+	}
 	requiredTargetLabel, err := r.requiredTargetLabel(ctx, project.ID)
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
-	issues, err := r.listOpenIssuesForDiscovery(ctx, ListOpenIssuesInput{Repo: input.Repo, CWD: project.RepoPath, Limit: input.Limit, Assignee: assigneeFilter}, policy, requiredTargetLabel)
+	issues, err := r.listOpenIssuesForDiscovery(ctx, ListOpenIssuesInput{Repo: input.Repo, CWD: project.RepoPath, Limit: queryLimit, Assignee: assigneeFilter}, policy, requiredTargetLabel)
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
 	result := DiscoveryResult{}
+	eligible := 0
 	for _, issue := range issues {
+		if domain.IsAutoLaneHeld(domain.LoopTypeWorker, issue.Labels) {
+			result.Skipped++
+			continue
+		}
 		assigned, err := r.assignPersonalIssueIfEligible(ctx, *project, input.Repo, issue, login, personalProject, policy.RequireAssigneeCurrentUser)
 		if err != nil {
 			return DiscoveryResult{}, err
 		}
 		issue = assigned
-		if domain.IsAutoLaneHeld(domain.LoopTypeWorker, issue.Labels) {
-			result.Skipped++
-			continue
-		}
 		if !shouldClaimWorkerIssue(issue, login, policy) {
 			result.Skipped++
 			continue
@@ -949,6 +956,7 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 			result.Skipped++
 			continue
 		}
+		eligible++
 		fingerprint := buildWorkerDiscoveryFingerprint(input.Repo, firstNonEmpty(derefString(project.BaseBranch), "main"), issue)
 		loopResult, err := r.ensureLoopForDiscoveredIssue(ctx, *project, input.Repo, issue, fingerprint)
 		if err != nil {
@@ -965,6 +973,9 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 		}
 		if loopResult.skipEnqueue || loopResult.record.Status == "paused" || loopResult.record.Status == "human_takeover" || loopResult.record.Status == "completed" || loopResult.record.Status == "failed" || loopResult.record.Status == "awaiting_human" {
 			result.Skipped++
+			if eligible >= resultLimit {
+				break
+			}
 			continue
 		}
 		queueItem, err := r.enqueueDiscoveredIssue(ctx, *project, loopResult.record, input.Repo, issue, fingerprint)
@@ -972,6 +983,9 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 			return DiscoveryResult{}, err
 		}
 		result.QueueItems = append(result.QueueItems, queueItem)
+		if eligible >= resultLimit {
+			break
+		}
 	}
 	return result, nil
 }

@@ -8,6 +8,7 @@ import (
 
 	"github.com/MumuTW/looper/internal/config"
 	"github.com/MumuTW/looper/internal/labels"
+	"github.com/MumuTW/looper/internal/network/protocol"
 )
 
 func personalWorkerConfig(t *testing.T) config.Config {
@@ -51,7 +52,7 @@ func TestDiscoverIssuesPersonalProjectAssignsSelfAuthoredIssueIdempotently(t *te
 	if err != nil {
 		t.Fatalf("first DiscoverIssues() error = %v", err)
 	}
-	if len(first.QueueItems) != 1 || len(github.addAssigneeCalls) != 1 {
+	if len(first.QueueItems) != 1 || len(github.addAssigneeCalls) != 1 || github.listIssueCalls[0].Limit != personalIssueQueryLimit {
 		t.Fatalf("first result = %#v, assignee calls = %#v, want one queue and one assignment", first, github.addAssigneeCalls)
 	}
 	if got := github.listIssueCalls[0].Assignee; got != "" {
@@ -120,5 +121,34 @@ func TestDiscoverIssuesPersonalProjectDisabledAssigneePolicyDoesNotAssign(t *tes
 	}
 	if len(result.QueueItems) != 1 || len(github.addAssigneeCalls) != 0 {
 		t.Fatalf("result = %#v, assignee calls = %#v, want queue without assignment", result, github.addAssigneeCalls)
+	}
+}
+
+func TestDiscoverIssuesPersonalProjectRoutedNetworkDoesNotAssign(t *testing.T) {
+	gateway := &fakeGitHubGateway{currentLogin: "octocat", issues: []IssueSummary{{Number: 605, Author: "octocat", Labels: []string{labels.DefaultWorkerReadyTrigger}}}}
+	cfg := personalWorkerConfig(t)
+	cfg.Projects[0].Network.Mode = config.NetworkModeRouted
+	fixture, runner := newPersonalWorkerRunner(t, gateway, &cfg)
+	runner.network = &stubWorkerNetwork{status: protocol.NodeStatusResponse{Membership: protocol.Membership{NodeName: "worker-1"}}}
+	_ = fixture
+	result, err := runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	if len(result.QueueItems) != 0 || len(gateway.addAssigneeCalls) != 0 || gateway.listIssueCalls[0].Assignee != "" {
+		t.Fatalf("result=%#v calls=%#v query=%#v, want routed personal policy disabled", result, gateway.addAssigneeCalls, gateway.listIssueCalls)
+	}
+}
+
+func TestDiscoverIssuesPersonalProjectHoldSkipsBeforeAssignment(t *testing.T) {
+	gateway := &fakeGitHubGateway{currentLogin: "octocat", issues: []IssueSummary{{Number: 606, Author: "octocat", Labels: []string{labels.DefaultWorkerReadyTrigger, labels.HoldGlobal}}}}
+	cfg := personalWorkerConfig(t)
+	_, runner := newPersonalWorkerRunner(t, gateway, &cfg)
+	result, err := runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	if len(result.QueueItems) != 0 || len(gateway.addAssigneeCalls) != 0 {
+		t.Fatalf("result=%#v calls=%#v, want held issue skipped before assignment", result, gateway.addAssigneeCalls)
 	}
 }
