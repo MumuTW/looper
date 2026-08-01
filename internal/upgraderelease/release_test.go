@@ -69,6 +69,31 @@ func TestStageVerifyAndActivateSwitchesOneCurrentPointer(t *testing.T) {
 	}
 }
 
+func TestStageReusesIdenticalExistingRelease(t *testing.T) {
+	root := t.TempDir()
+	sources := t.TempDir()
+	cli := writeExecutable(t, sources, "looper-source", "cli-v1")
+	daemon := writeExecutable(t, sources, "looperd-source", "daemon-v1")
+	build := testBuild("1.2.3", "aaaaaaa")
+	first, err := Stage(StageInput{RootDir: root, ReleaseID: "1.2.3-stable-aaaaaaa", CLIBinaryPath: cli, DaemonBinaryPath: daemon, Build: build, Now: fixedNow})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Later cutover re-stages the live pair (same id + bytes).
+	again, err := Stage(StageInput{RootDir: root, ReleaseID: first.ReleaseID, CLIBinaryPath: cli, DaemonBinaryPath: daemon, Build: build, Now: fixedNow})
+	if err != nil {
+		t.Fatalf("idempotent Stage() error = %v", err)
+	}
+	if again.Directory != first.Directory || again.ReleaseID != first.ReleaseID {
+		t.Fatalf("reuse = %#v, want %#v", again, first)
+	}
+	// Different bytes must still fail.
+	changed := writeExecutable(t, sources, "looper-changed", "changed")
+	if _, err := Stage(StageInput{RootDir: root, ReleaseID: first.ReleaseID, CLIBinaryPath: changed, DaemonBinaryPath: daemon, Build: build, Now: fixedNow}); err == nil {
+		t.Fatal("Stage() error = nil for conflicting existing release")
+	}
+}
+
 func TestVerifyRejectsChangedOrUnexpectedReleaseContents(t *testing.T) {
 	root := t.TempDir()
 	sources := t.TempDir()
@@ -93,7 +118,7 @@ func TestVerifyRejectsChangedOrUnexpectedReleaseContents(t *testing.T) {
 	}
 }
 
-func TestStageRejectsDuplicateReleaseAndNonExecutableInput(t *testing.T) {
+func TestStageRejectsConflictingExistingReleaseAndNonExecutableInput(t *testing.T) {
 	root := t.TempDir()
 	sources := t.TempDir()
 	cli := writeExecutable(t, sources, "looper", "cli")
@@ -102,8 +127,15 @@ func TestStageRejectsDuplicateReleaseAndNonExecutableInput(t *testing.T) {
 	if _, err := Stage(input); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Stage(input); err == nil {
-		t.Fatal("duplicate Stage() error = nil")
+	// Identical re-stage is allowed (later cutovers). Conflicting bytes are not.
+	if _, err := Stage(input); err != nil {
+		t.Fatalf("identical restage error = %v", err)
+	}
+	otherCLI := writeExecutable(t, sources, "looper-other", "other")
+	conflict := input
+	conflict.CLIBinaryPath = otherCLI
+	if _, err := Stage(conflict); err == nil {
+		t.Fatal("conflicting Stage() error = nil")
 	}
 	notExecutable := filepath.Join(sources, "not-executable")
 	if err := os.WriteFile(notExecutable, []byte("plain"), 0o600); err != nil {

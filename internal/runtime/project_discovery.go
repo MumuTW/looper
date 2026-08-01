@@ -151,3 +151,19 @@ func (r *Runtime) stopProjectDiscovery() {
 		}
 	}
 }
+
+// waitProjectDiscoveryForDrain waits for discovery during upgrade drain without
+// stamping shutdownDrainErr. A bounded timeout here is not a containment failure
+// for later Stop/storage close; DrainSnapshot already tracks residual work.
+func (r *Runtime) waitProjectDiscoveryForDrain() {
+	if r == nil {
+		return
+	}
+	r.mu.RLock()
+	runner := r.projectDiscovery
+	timeout := r.shutdownTimeout
+	r.mu.RUnlock()
+	if err := runner.Wait(timeout); err != nil && r.logger != nil {
+		r.logger.Warn("upgrade drain timed out waiting for post-commit project discovery", map[string]any{"timeoutMs": timeout.Milliseconds()})
+	}
+}
