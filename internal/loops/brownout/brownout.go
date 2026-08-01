@@ -216,6 +216,17 @@ func (b *Breaker) SetConfig(cfg Config) {
 		b.cooldown = cfg.Cooldown
 	}
 	if cfg.MaxCooldown > 0 && b.cooldown > cfg.MaxCooldown {
+		// Move the deadline with the duration. Lowering the maximum while an
+		// exponentially backed-off interval is being served must actually
+		// shorten the wait; leaving openUntil alone would keep refusing work
+		// for the old hour after the operator lowered the ceiling to fifteen
+		// minutes, which reads as the reload having been ignored.
+		if b.state == StateOpen {
+			shortened := b.openUntil.Add(cfg.MaxCooldown - b.cooldown)
+			if shortened.Before(b.openUntil) {
+				b.openUntil = shortened
+			}
+		}
 		b.cooldown = cfg.MaxCooldown
 	}
 	if b.cooldown <= 0 {

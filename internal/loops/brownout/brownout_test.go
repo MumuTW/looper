@@ -406,3 +406,28 @@ func TestUnattributedOutcomesAreNotProbes(t *testing.T) {
 		t.Fatalf("an outcome with no start time was treated as a probe; state = %s", got)
 	}
 }
+
+// Lowering the ceiling during a backed-off outage must actually shorten the
+// wait. Clamping only the duration would keep refusing work for the old hour
+// and read as the reload having been ignored.
+func TestLoweringMaxCooldownShortensTheOpenDeadline(t *testing.T) {
+	b, c, _ := newTestBreaker(t, testConfig())
+	b.Record(c.now(), false)
+	b.Record(c.now(), false)
+	b.Record(c.now(), false)
+	c.add(10 * time.Minute)
+	_ = b.Allow()
+	b.Record(c.now(), false) // cooldown -> 20m, openUntil = now + 20m
+
+	lowered := testConfig()
+	lowered.MaxCooldown = 12 * time.Minute
+	b.SetConfig(lowered)
+
+	if got := b.Snapshot().Cooldown; got != 12*time.Minute {
+		t.Fatalf("cooldown = %s, want 12m", got)
+	}
+	c.add(13 * time.Minute)
+	if err := b.Allow(); err != nil {
+		t.Fatalf("gate still refused work past the lowered ceiling: %v", err)
+	}
+}

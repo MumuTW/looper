@@ -17,12 +17,21 @@ func outcomeExecution(sink *[]Outcome) *execution {
 
 func TestReportOutcomeMapsTerminalStatus(t *testing.T) {
 	tests := []struct {
-		status        string
-		parseStatus   string
-		wantReported  bool
-		wantSucceeded bool
+		status            string
+		parseStatus       string
+		completionPayload string
+		wantReported      bool
+		wantSucceeded     bool
 	}{
-		{status: "completed", parseStatus: "parsed", wantReported: true, wantSucceeded: true},
+		{status: "completed", parseStatus: "parsed", completionPayload: `{"outcome":"completed","summary":"done"}`, wantReported: true, wantSucceeded: true},
+		// A parsed marker that declares a retryable block is a failed run to
+		// every role runner. Recording it as a success would let a provider
+		// that politely reports "rate limited" dilute the ratio on every
+		// attempt while the runner keeps retrying.
+		{status: "completed", parseStatus: "parsed", completionPayload: `{"outcome":"blocked","failure_kind":"retryable_transient","summary":"rate limited"}`, wantReported: true},
+		// A block needing a human is not the provider failing, and backing off
+		// from the provider would not help.
+		{status: "completed", parseStatus: "parsed", completionPayload: `{"outcome":"blocked","failure_kind":"manual_intervention","summary":"needs a decision"}`, wantReported: true, wantSucceeded: true},
 		{status: "completed", parseStatus: "missing", wantReported: true},
 		{status: "completed", parseStatus: "invalid_json", wantReported: true},
 		{status: "failed", parseStatus: "missing", wantReported: true},
@@ -37,7 +46,7 @@ func TestReportOutcomeMapsTerminalStatus(t *testing.T) {
 		tt := tt
 		t.Run(tt.status, func(t *testing.T) {
 			outcomes := make([]Outcome, 0, 1)
-			outcomeExecution(&outcomes).reportOutcome(tt.status, tt.parseStatus)
+			outcomeExecution(&outcomes).reportOutcome(tt.status, tt.parseStatus, tt.completionPayload)
 
 			if !tt.wantReported {
 				if len(outcomes) != 0 {
@@ -66,5 +75,5 @@ func TestReportOutcomeMapsTerminalStatus(t *testing.T) {
 
 func TestReportOutcomeWithoutSinkIsSafe(t *testing.T) {
 	execution := &execution{executor: &ConfiguredExecutor{}, input: RunInput{}}
-	execution.reportOutcome("failed", "missing")
+	execution.reportOutcome("failed", "missing", "")
 }

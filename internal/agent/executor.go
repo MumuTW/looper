@@ -162,6 +162,34 @@ type Outcome struct {
 	StartedAt time.Time
 }
 
+// declaresRetryableBlock reports whether a parsed completion marker says the
+// agent was blocked by something a retry might clear. The role runners turn
+// that into a failed, replayable run, so health accounting must agree: a
+// provider that answers "blocked: retryable_transient, rate limited" would
+// otherwise be recorded as a success on every attempt while the runner keeps
+// retrying — diluting the very ratio meant to notice it.
+//
+// manual_intervention is deliberately excluded. That is looper or the repo
+// needing a human, not the provider failing, and backing off from the provider
+// would not help.
+func declaresRetryableBlock(completionPayload string) bool {
+	payload := strings.TrimSpace(completionPayload)
+	if payload == "" {
+		return false
+	}
+	var parsed struct {
+		Outcome     string `json:"outcome"`
+		FailureKind string `json:"failure_kind"`
+	}
+	if err := json.Unmarshal([]byte(payload), &parsed); err != nil {
+		return false
+	}
+	if !strings.EqualFold(strings.TrimSpace(parsed.Outcome), "blocked") {
+		return false
+	}
+	return !strings.EqualFold(strings.TrimSpace(parsed.FailureKind), "manual_intervention")
+}
+
 // ProgressUpdate is a throttled snapshot of a running agent's activity: the last
 // few lines it has emitted, plus how long it has been running.
 type ProgressUpdate struct {
@@ -1239,7 +1267,7 @@ func (x *execution) run(ctx context.Context) {
 		}, endedAtISO)
 	}
 
-	x.reportOutcome(status, result.ParseStatus)
+	x.reportOutcome(status, result.ParseStatus, result.CompletionPayload)
 	x.doneCh <- execOutcome{result: result, err: persistErr}
 }
 
@@ -1260,7 +1288,7 @@ func (x *execution) finalizeNativeResumeStatus(status, errorMessage, stderr stri
 // reportOutcome feeds the daemon's agent-health gate. "killed" is excluded on
 // purpose: it means looper stopped the agent (operator stop, shutdown drain),
 // which says nothing about whether the provider is answering.
-func (x *execution) reportOutcome(status, parseStatus string) {
+func (x *execution) reportOutcome(status, parseStatus, completionPayload string) {
 	if x.executor == nil || x.executor.onOutcome == nil || status == "killed" {
 		return
 	}
@@ -1274,7 +1302,7 @@ func (x *execution) reportOutcome(status, parseStatus string) {
 		// structured marker is the executor's completion authority; missing or
 		// malformed output must feed the health gate as a failure so brownout
 		// backs off from agents that exit cleanly without doing the work contract.
-		Succeeded: status == "completed" && parseStatus == "parsed",
+		Succeeded: status == "completed" && parseStatus == "parsed" && !declaresRetryableBlock(completionPayload),
 		StartedAt: x.startedAt,
 	})
 }
