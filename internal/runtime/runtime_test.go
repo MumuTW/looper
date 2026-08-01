@@ -5123,6 +5123,64 @@ func TestRuntimeStartRefusesStartupWhenCompatibilityBarrierPending(t *testing.T)
 	if !strings.Contains(startErr.Error(), barrierID) || !strings.Contains(startErr.Error(), "compatibility barrier") {
 		t.Fatalf("Start() error = %q, want it to name %s and the compatibility barrier refusal", startErr, barrierID)
 	}
+	// The recovery instructions must point to a supported migration path
+	// (starting looperd with autoMigrateOnStartup=true), not the nonexistent
+	// `looper migrate` CLI verb.
+	if strings.Contains(startErr.Error(), "looper migrate") {
+		t.Fatalf("Start() error = %q references nonexistent `looper migrate` command", startErr)
+	}
+	if !strings.Contains(startErr.Error(), "autoMigrateOnStartup=true") {
+		t.Fatalf("Start() error = %q, want it to direct operators to autoMigrateOnStartup=true", startErr)
+	}
+}
+
+// TestRuntimeStartPendingBarrierCheckDoesNotCreateSchemaMigrationsTable
+// covers the read-only boot invariant at the runtime boundary: when
+// package.autoMigrateOnStartup=false and the database has never been migrated
+// (no schema_migrations table), Runtime.start must refuse startup because the
+// barrier is pending, but the pending-barrier check itself must not create the
+// ledger table. Previously PendingBarriers called Status, whose
+// ensureSchemaMigrationsTable created the table before startup returned the
+// pending-barrier error, so merely attempting a boot with migration
+// application disabled mutated the database.
+func TestRuntimeStartPendingBarrierCheckDoesNotCreateSchemaMigrationsTable(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	dbPath := filepath.Join(workingDir, "runtime.sqlite")
+	backupDir := filepath.Join(workingDir, "backups")
+
+	// A completely fresh database: no coordinator seed, no schema_migrations.
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	cfg.Storage.DBPath = dbPath
+	cfg.Storage.BackupDir = &backupDir
+	cfg.Package.AutoMigrateOnStartup = false
+
+	rt := New(Options{
+		Config: cfg,
+		Logger: &testLogger{},
+		OpenSQLiteCoordinator: func(ctx context.Context, dbPath string, options storage.SQLiteCoordinatorOptions) (*storage.SQLiteCoordinator, error) {
+			return storage.OpenSQLiteCoordinator(ctx, dbPath, options)
+		},
+	})
+
+	startErr := rt.Start(context.Background())
+	if startErr == nil {
+		rt.Stop("test cleanup")
+		t.Fatal("Start() error = nil, want pending-barrier refusal on fresh database")
+	}
+	if !strings.Contains(startErr.Error(), "compatibility barrier") {
+		t.Fatalf("Start() error = %q, want pending-barrier refusal", startErr)
+	}
+
+	// The pending-barrier check must not have created schema_migrations as a
+	// side effect of the failed boot.
+	if tableExists(t, dbPath, "schema_migrations") {
+		t.Fatalf("schema_migrations table exists after failed boot with autoMigrateOnStartup=false; the pending-barrier check must be read-only")
+	}
 }
 
 // tableExists reports whether a table exists in the SQLite database at dbPath.

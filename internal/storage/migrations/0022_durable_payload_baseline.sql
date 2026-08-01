@@ -36,5 +36,15 @@
 --     here — both know 0022, so neither refuses. It also does not protect
 --     payloads written before this binary first booted with the marker applied
 --     when auto-migration was disabled; Runtime.start refuses startup while a
---     barrier is pending to close that gap.
+--     barrier is pending to close that gap. Finally, the barrier relies on
+--     ValidateCompatibility to refuse boot when it sees 0022 as an unknown
+--     applied ID; binaries built before that check existed (commit 62251ff)
+--     simply ignore unknown applied IDs and start normally, so downgrading a
+--     database carrying 0022 to one of those pre-validation binaries silently
+--     discards the newer durable payload fields this barrier claims to protect.
+--     The upgrade preflight's build-identity gate — not the barrier — is what
+--     prevents activating those binaries: a pre-validation binary cannot
+--     produce the JSON build identity the gate requires, so preflight fails
+--     closed. Operators must not bypass preflight and point a release symlink
+--     at a pre-validation binary by hand; that path is unsupported.
 SELECT 1;

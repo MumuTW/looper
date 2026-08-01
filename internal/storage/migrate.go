@@ -91,15 +91,36 @@ func (r *MigrationRunner) ListPending(ctx context.Context) ([]string, error) {
 // when auto-migration is disabled, so Runtime.start uses this to refuse startup
 // while a barrier remains unapplied instead of running blind against payloads
 // a newer binary may have written.
+//
+// This check is read-only: it must not create the schema_migrations ledger,
+// because Runtime.start calls it on the boot path where
+// package.autoMigrateOnStartup=false and the database may not have been
+// migrated yet. Creating the table here would mutate the schema on every boot
+// despite migration being disabled, defeating the read-only boot invariant
+// documented by ValidateCompatibility. An absent ledger means no migration has
+// been applied, so every barrier is pending; the ledger is read only when it
+// already exists.
 func (r *MigrationRunner) PendingBarriers(ctx context.Context) ([]string, error) {
-	status, err := r.Status(ctx)
+	conn, err := r.db.Conn(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("open sqlite connection: %w", err)
+	}
+	defer conn.Close()
+
+	exists, err := schemaMigrationsTableExists(ctx, conn)
 	if err != nil {
 		return nil, err
 	}
 
-	appliedByID := make(map[string]bool, len(status.Applied))
-	for _, migration := range status.Applied {
-		appliedByID[migration.ID] = true
+	appliedByID := make(map[string]bool)
+	if exists {
+		applied, err := readAppliedMigrations(ctx, conn)
+		if err != nil {
+			return nil, err
+		}
+		for _, migration := range applied {
+			appliedByID[migration.ID] = true
+		}
 	}
 
 	pending := make([]string, 0)

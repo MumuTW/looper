@@ -995,7 +995,7 @@ func (r *Runtime) start(ctx context.Context) error {
 		}
 		if len(pendingBarriers) > 0 {
 			return fmt.Errorf(
-				"pending compatibility barrier migrations %s are not applied and package.autoMigrateOnStartup is false; apply them (run a looper binary with autoMigrateOnStartup=true or `looper migrate`) before starting the daemon so a downgraded binary cannot silently read payloads it does not understand",
+				"pending compatibility barrier migrations %s are not applied and package.autoMigrateOnStartup is false; apply them by starting a looperd binary with package.autoMigrateOnStartup=true (temporarily set it in the config) before starting the daemon so a downgraded binary cannot silently read payloads it does not understand",
 				strings.Join(pendingBarriers, ", "),
 			)
 		}

@@ -1259,6 +1259,57 @@ func TestMigrationRunnerPendingBarriersReportsUnappliedBarrier(t *testing.T) {
 	}
 }
 
+// TestMigrationRunnerPendingBarriersDoesNotCreateSchemaMigrationsTable
+// covers the read-only contract of the pending-barrier check: when the
+// database has not been migrated yet (no schema_migrations table), checking
+// for pending barriers must not perform DDL. This matters when
+// package.autoMigrateOnStartup=false, where Runtime.start calls
+// PendingBarriers on every boot but must not mutate the schema. An absent
+// ledger means no migration has been applied, so every barrier is pending —
+// but the table must not be created as a side effect of the check.
+func TestMigrationRunnerPendingBarriersDoesNotCreateSchemaMigrationsTable(t *testing.T) {
+	t.Parallel()
+
+	db := openTestSQLiteDB(t)
+	ctx := context.Background()
+	runner := NewMigrationRunner(db, MigrationRunnerOptions{
+		Migrations: []EmbeddedMigration{
+			{ID: "0001_init", FileName: "0001_init.sql", SQL: "CREATE TABLE widgets (id TEXT PRIMARY KEY);"},
+			{ID: "0002_barrier", FileName: "0002_barrier.sql", SQL: "SELECT 1;", Barrier: true},
+		},
+	})
+
+	pending, err := runner.PendingBarriers(ctx)
+	if err != nil {
+		t.Fatalf("PendingBarriers() on fresh database error = %v", err)
+	}
+	if len(pending) != 1 || pending[0] != "0002_barrier" {
+		t.Fatalf("PendingBarriers() = %v, want [0002_barrier] (absent ledger means every barrier pending)", pending)
+	}
+
+	var name string
+	err = db.QueryRow(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations' LIMIT 1`).Scan(&name)
+	if err == nil {
+		t.Fatalf("schema_migrations table exists after PendingBarriers (%q), want the check to be read-only and not create it", name)
+	}
+	if err != sql.ErrNoRows {
+		t.Fatalf("sqlite_master lookup for schema_migrations error = %v, want sql.ErrNoRows", err)
+	}
+
+	// Repeated checks must remain read-only and stable across boots.
+	pending, err = runner.PendingBarriers(ctx)
+	if err != nil {
+		t.Fatalf("second PendingBarriers() error = %v", err)
+	}
+	if len(pending) != 1 || pending[0] != "0002_barrier" {
+		t.Fatalf("second PendingBarriers() = %v, want [0002_barrier]", pending)
+	}
+	err = db.QueryRow(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations' LIMIT 1`).Scan(&name)
+	if err != sql.ErrNoRows {
+		t.Fatalf("second lookup error = %v, want sql.ErrNoRows (table still must not exist)", err)
+	}
+}
+
 func TestMigrationRunnerValidateCompatibilityAcceptsFreshDatabase(t *testing.T) {
 	t.Parallel()
 
