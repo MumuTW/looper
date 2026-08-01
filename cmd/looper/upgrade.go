@@ -18,6 +18,10 @@ import (
 	"github.com/MumuTW/looper/internal/version"
 )
 
+// upgradeBackupRequestTimeout bounds CLI wait for daemon-owned SQLite snapshot
+// + file copies/checksums. The generic requestTimeout is too short for large DBs.
+const upgradeBackupRequestTimeout = 15 * time.Minute
+
 // upgradePreflight is deliberately a read-only report. The current daemon is
 // the authority for its live storage/work state, while each target binary is
 // the authority for its own embedded build identity.
@@ -128,7 +132,7 @@ func runUpgrade(ctx context.Context, global, operands []string, stdout interface
 		if err != nil {
 			return err
 		}
-		result, err := requestJSON[upgradeBackupResult](ctx, cfg, "POST", "/api/v1/upgrade/backup", nil)
+		result, err := requestJSONWithin[upgradeBackupResult](ctx, upgradeBackupRequestTimeout, cfg, "POST", "/api/v1/upgrade/backup", nil)
 		if err != nil {
 			return err
 		}
@@ -653,9 +657,11 @@ func upgradePostStartBlocks(report upgradePostStartReport) []string {
 	if len(report.Status.Storage.PendingMigrations) > 0 {
 		blocks = append(blocks, "daemon storage has pending migrations")
 	}
-	if report.Status.Scheduler.ActiveRuns > 0 || report.Status.Scheduler.RunningItems > 0 {
-		blocks = append(blocks, "scheduler still owns active work after cutover")
-	}
+	// Do not treat normal scheduler ownership as a startup failure. Drain
+	// leaves queued work intact; once the replacement daemon is ready it may
+	// claim that work before a separately invoked verify-start runs. Identity,
+	// admission readiness, storage health, and quarantine debt remain the
+	// cutover gates; active/running counts are operator telemetry only.
 	if report.Status.Service.Recovery.Outstanding.QuarantinedActiveExecutions > 0 || report.Status.Service.Recovery.Outstanding.QuarantinedRunningRuns > 0 {
 		blocks = append(blocks, "daemon has outstanding quarantine debt")
 	}

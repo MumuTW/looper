@@ -220,6 +220,14 @@ func signalNotifierOrDefault(notifier SignalNotifier) SignalNotifier {
 	return osSignalNotifier{}
 }
 
+// ValidateConfiguredToolPaths is the read-only tool-path prerequisite check
+// shared by Bootstrap and looperd --check-config. It only inspects paths the
+// operator explicitly configured; detected/default paths are not required to
+// exist for a config-compatibility report.
+func ValidateConfiguredToolPaths(cfg config.Config, detection map[string]config.ToolDetectionStatus) error {
+	return validateConfiguredToolPaths(cfg, detection)
+}
+
 func validateConfiguredToolPaths(cfg config.Config, detection map[string]config.ToolDetectionStatus) error {
 	checks := []struct {
 		statusKey string

@@ -46,3 +46,28 @@ func TestUpgradeDrainClosesAdmissionAndReportsSupervisorSnapshot(t *testing.T) {
 		t.Fatalf("GET response = %#v", observed.Data)
 	}
 }
+
+
+func TestUpgradeDrainAllowsRetryAfterAdmissionCloses(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	handler := NewHandler(Context{Config: cfg, Runtime: rt})
+
+	first := httptest.NewRecorder()
+	handler.ServeHTTP(first, httptest.NewRequest(http.MethodPost, "/api/v1/upgrade/drain", nil))
+	if first.Code != http.StatusOK {
+		t.Fatalf("first POST status = %d body=%s", first.Code, first.Body.String())
+	}
+	// Lost-response retry: POST must remain available after admission is draining.
+	retry := httptest.NewRecorder()
+	handler.ServeHTTP(retry, httptest.NewRequest(http.MethodPost, "/api/v1/upgrade/drain", nil))
+	if retry.Code != http.StatusOK {
+		t.Fatalf("retry POST status = %d body=%s", retry.Code, retry.Body.String())
+	}
+	var body pkgapi.Envelope[upgradeDrainResponse]
+	if err := json.Unmarshal(retry.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body.Data.AdmissionState != string(looperdruntime.AdmissionDraining) {
+		t.Fatalf("retry response = %#v", body.Data)
+	}
+}

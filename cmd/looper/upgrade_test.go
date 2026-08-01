@@ -278,22 +278,27 @@ func TestUpgradeVerifyStartChecksRestartedDaemonEvidence(t *testing.T) {
 	}
 }
 
-func TestUpgradeVerifyStartRefusesActiveSchedulerOwnership(t *testing.T) {
+func TestUpgradeVerifyStartAllowsResumedSchedulerOwnership(t *testing.T) {
+	// Drain leaves queued work intact. After activate, the replacement daemon
+	// may claim that work before a separately invoked verify-start runs; that
+	// must not be treated as a cutover failure.
 	identity := releasedUpgradeIdentity("1.2.3", "aaaaaaa")
 	root, releaseID := stageReleaseForUpgradeTest(t, identity)
 	server := upgradePostStartDaemon(t, identity, 1)
 	configForDaemon(t, server.URL)
 	stdout := &bytes.Buffer{}
-	err := runUpgrade(context.Background(), nil, []string{"verify-start", "--release-root", root, "--release", releaseID}, stdout)
-	if err == nil || !strings.Contains(err.Error(), "scheduler still owns active work") {
+	if err := runUpgrade(context.Background(), nil, []string{"verify-start", "--release-root", root, "--release", releaseID}, stdout); err != nil {
 		t.Fatalf("runUpgrade() error = %v", err)
 	}
 	var report upgradePostStartReport
 	if err := json.Unmarshal(stdout.Bytes(), &report); err != nil {
 		t.Fatal(err)
 	}
-	if report.Verified || len(report.Blocks) != 1 || report.Blocks[0] != "scheduler still owns active work after cutover" {
-		t.Fatalf("report = %#v", report)
+	if !report.Verified || len(report.Blocks) != 0 {
+		t.Fatalf("report = %#v, want verified with no blocks despite active scheduler work", report)
+	}
+	if report.Status.Scheduler.ActiveRuns != 1 {
+		t.Fatalf("ActiveRuns = %d, want fixture active work preserved as telemetry", report.Status.Scheduler.ActiveRuns)
 	}
 }
 

@@ -1360,7 +1360,24 @@ func runConfigCheck(args []string, stdout, stderr io.Writer, deps runDeps) int {
 			filtered = append(filtered, arg)
 		}
 	}
-	if _, err := config.LoadFile(config.LoadFileOptions{CWD: cwd, Args: filtered, LookupEnv: lookupEnv}); err != nil {
+	loaded, err := config.LoadFile(config.LoadFileOptions{CWD: cwd, Args: filtered, LookupEnv: lookupEnv})
+	if err != nil {
+		var validationErr *config.ConfigValidationError
+		if errors.As(err, &validationErr) {
+			_, _ = fmt.Fprintln(stderr, "looperd configuration is incompatible:")
+			for _, issue := range validationErr.Issues {
+				_, _ = fmt.Fprintf(stderr, "- %s: %s\n", issue.Path, issue.Message)
+			}
+			return 1
+		}
+		_, _ = fmt.Fprintf(stderr, "looperd: validate configuration: %v\n", err)
+		return 1
+	}
+	// Reuse the non-destructive Bootstrap prerequisite that fails closed when
+	// an explicitly configured tool path is missing or not executable. Without
+	// this, preflight can report targetConfigCompatible while real startup
+	// fails in validateConfiguredToolPaths.
+	if err := bootstrap.ValidateConfiguredToolPaths(loaded.Config, loaded.Metadata.ToolDetection); err != nil {
 		var validationErr *config.ConfigValidationError
 		if errors.As(err, &validationErr) {
 			_, _ = fmt.Fprintln(stderr, "looperd configuration is incompatible:")
