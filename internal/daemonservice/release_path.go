@@ -12,7 +12,8 @@ import (
 // activate-release can switch binaries without rewriting unit files.
 //
 // Paths outside a release tree, or trees without a current pointer yet, are
-// returned unchanged.
+// returned unchanged. When multiple "releases" path segments exist, the
+// innermost releases/<id>/<binary> suffix wins (e.g. /srv/releases/looper/...).
 func PreferReleaseCurrentExecutable(executable string) string {
 	path := strings.TrimSpace(executable)
 	if path == "" || !filepath.IsAbs(path) {
@@ -20,7 +21,8 @@ func PreferReleaseCurrentExecutable(executable string) string {
 	}
 	cleaned := filepath.Clean(path)
 	releasesMarker := string(filepath.Separator) + "releases" + string(filepath.Separator)
-	idx := strings.Index(cleaned, releasesMarker)
+	// Innermost marker: avoid treating an ancestor .../releases/... as the tree root.
+	idx := strings.LastIndex(cleaned, releasesMarker)
 	if idx < 0 {
 		return path
 	}
@@ -35,9 +37,12 @@ func PreferReleaseCurrentExecutable(executable string) string {
 		return path
 	}
 	currentLink := filepath.Join(root, "current")
-	if _, err := os.Lstat(currentLink); err != nil {
+	if info, err := os.Lstat(currentLink); err != nil {
 		// No current pointer yet (first install before any activate). Keep the
 		// concrete release path rather than inventing a missing current.
+		return path
+	} else if info.Mode()&os.ModeSymlink == 0 {
+		// Prefer a real current symlink; a plain directory is ambiguous.
 		return path
 	}
 	return filepath.Join(root, "current", parts[1])

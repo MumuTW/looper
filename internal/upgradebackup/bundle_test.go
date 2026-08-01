@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -178,4 +179,26 @@ func writeBundleFile(t *testing.T, dir, name, contents string) string {
 		t.Fatal(err)
 	}
 	return path
+}
+
+func TestCreateRefusesSymlinkedDatabasePath(t *testing.T) {
+	root := t.TempDir()
+	realDB := writeBundleFile(t, root, "real.sqlite", "db")
+	link := filepath.Join(root, "link.sqlite")
+	if err := os.Symlink(realDB, link); err != nil {
+		t.Fatal(err)
+	}
+	config := writeBundleFile(t, root, "config.toml", "[server]\n")
+	cli := writeBundleFile(t, root, "looper", "cli")
+	daemon := writeBundleFile(t, root, "looperd", "daemon")
+	_, err := Create(context.Background(), Input{
+		RootDir: filepath.Join(root, "backups"), ConfigPath: config, DatabasePath: link,
+		CLIBinaryPath: cli, DaemonBinaryPath: daemon,
+		Snapshot: func(context.Context) (string, error) {
+			return writeBundleFile(t, root, "snap.sqlite", "snap"), nil
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("Create() error = %v, want symlink refusal", err)
+	}
 }

@@ -155,11 +155,41 @@ func restore(bundleDirectory string, source upgradebackup.Source, operations fil
 		return err
 	}
 
-	configSource := filepath.Join(bundleDirectory, "config"+filepath.Ext(source.ConfigPath))
-	databaseSource := filepath.Join(bundleDirectory, "database.sqlite")
 	if err := requireRegularSource(bundleDirectory, "backup bundle directory", true); err != nil {
 		return err
 	}
+	// Production bundles carry a v2 manifest; re-verify before staging. Hand-
+	// built fixtures without a manifest still stage, but compare staged bytes
+	// to the source files before moving originals.
+	var verified *upgradebackup.Verification
+	if _, err := os.Lstat(filepath.Join(bundleDirectory, "manifest.json")); err == nil {
+		v, err := upgradebackup.Verify(bundleDirectory)
+		if err != nil {
+			return fmt.Errorf("re-verify backup bundle before restore: %w", err)
+		}
+		verified = &v
+	}
+	configName := "config" + filepath.Ext(source.ConfigPath)
+	if verified != nil {
+		name, err := bundleConfigFileName(verified.Manifest)
+		if err != nil {
+			return err
+		}
+		configName = name
+	} else if configName == "config" {
+		configName = "config.toml"
+	}
+	// Prefer an existing config.* in the bundle when Ext(source) doesn't match.
+	if _, err := os.Lstat(filepath.Join(bundleDirectory, configName)); err != nil {
+		for _, candidate := range []string{"config.toml", "config.json", "config.yaml", "config.yml", "config"} {
+			if _, err := os.Lstat(filepath.Join(bundleDirectory, candidate)); err == nil {
+				configName = candidate
+				break
+			}
+		}
+	}
+	configSource := filepath.Join(bundleDirectory, configName)
+	databaseSource := filepath.Join(bundleDirectory, "database.sqlite")
 	for _, item := range []struct {
 		path        string
 		description string
@@ -220,6 +250,34 @@ func restore(bundleDirectory string, source upgradebackup.Source, operations fil
 	if err != nil {
 		cleanupBeforeJournal()
 		return fmt.Errorf("hash staged configuration: %w", err)
+	}
+	// Fail closed if the bundle was mutated after Verify (including during PID
+	// probes / lock acquisition): staged bytes must still match the manifest.
+	if verified != nil {
+		if err := requireStagedMatchesManifest(dbHash, dbSize, verified.Manifest.Files["database.sqlite"], "database.sqlite"); err != nil {
+			cleanupBeforeJournal()
+			return err
+		}
+		if err := requireStagedMatchesManifest(cfgHash, cfgSize, verified.Manifest.Files[configName], configName); err != nil {
+			cleanupBeforeJournal()
+			return err
+		}
+	} else {
+		// No manifest: still require staged bytes equal the source files now.
+		if same, err := sameRegularFileContent(databaseStage, databaseSource); err != nil || !same {
+			cleanupBeforeJournal()
+			if err != nil {
+				return err
+			}
+			return fmt.Errorf("staged database does not match bundle source after copy")
+		}
+		if same, err := sameRegularFileContent(configStage, configSource); err != nil || !same {
+			cleanupBeforeJournal()
+			if err != nil {
+				return err
+			}
+			return fmt.Errorf("staged configuration does not match bundle source after copy")
+		}
 	}
 	entries := []journalEntry{
 		{Name: entryDatabase, TargetPath: states[0].path, StagedPath: databaseStage, HadOriginal: states[0].present, StagedSHA256: dbHash, StagedSize: dbSize},
@@ -816,6 +874,25 @@ func targetOwnedByRestoreTransaction(entry journalEntry) (bool, error) {
 		return false, err
 	}
 	return hash == entry.StagedSHA256 && size == entry.StagedSize, nil
+}
+
+func bundleConfigFileName(manifest upgradebackup.Manifest) (string, error) {
+	for _, name := range upgradebackup.SortedFileNames(manifest) {
+		if name == "config" || strings.HasPrefix(name, "config.") {
+			return name, nil
+		}
+	}
+	return "", fmt.Errorf("backup manifest has no config artifact")
+}
+
+func requireStagedMatchesManifest(hash string, size int64, expected upgradebackup.File, name string) error {
+	if expected.Size < 0 || len(expected.SHA256) != 64 || strings.ToLower(expected.SHA256) != expected.SHA256 {
+		return fmt.Errorf("backup manifest entry for %s is invalid", name)
+	}
+	if hash != expected.SHA256 || size != expected.Size {
+		return fmt.Errorf("staged %s does not match verified manifest (hash/size changed after verify)", name)
+	}
+	return nil
 }
 
 func fileContentIdentity(path string) (string, int64, error) {
