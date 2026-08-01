@@ -1102,10 +1102,19 @@ type daemonStatusResponse struct {
 }
 
 type statusServiceView struct {
-	DegradedReasons []string           `json:"degradedReasons"`
-	Recovery        statusRecoveryView `json:"recovery"`
-	Triage          statusTriageView   `json:"triage"`
-	Binary          statusBinaryView   `json:"binary"`
+	DegradedReasons []string               `json:"degradedReasons"`
+	Recovery        statusRecoveryView     `json:"recovery"`
+	Triage          statusTriageView       `json:"triage"`
+	Binary          statusBinaryView       `json:"binary"`
+	AgentHealth     *statusAgentHealthView `json:"agentHealth"`
+}
+
+type statusAgentHealthView struct {
+	State     string  `json:"state"`
+	Failures  int     `json:"failures"`
+	Total     int     `json:"total"`
+	OpenUntil *string `json:"openUntil"`
+	Trips     int     `json:"trips"`
 }
 
 type statusTriageView struct {
@@ -1242,6 +1251,11 @@ func writeStatusOpsLines(stdout io.Writer, status daemonStatusResponse) {
 			_, _ = fmt.Fprintf(stdout, "  - %s\n", awaitingConfirmationLine(source))
 		}
 	}
+	// An idle daemon that is waiting out a bad provider looks exactly like a
+	// stuck one. Say which it is, and when it will try again.
+	if health := status.Service.AgentHealth; health != nil {
+		_, _ = fmt.Fprintf(stdout, "agents:   %s\n", agentHealthLine(*health))
+	}
 	if len(status.Service.DegradedReasons) > 0 {
 		_, _ = fmt.Fprintf(stdout, "degraded: %s\n", strings.Join(status.Service.DegradedReasons, ", "))
 	}
@@ -1260,6 +1274,24 @@ func writeStatusOpsLines(stdout io.Writer, status daemonStatusResponse) {
 			detail = "host pressure"
 		}
 		_, _ = fmt.Fprintf(stdout, "resources: scheduler held (%s)\n", singleLine(detail))
+	}
+}
+
+func agentHealthLine(health statusAgentHealthView) string {
+	switch health.State {
+	case "open":
+		line := fmt.Sprintf("work paused: %d of %d recent agent runs failed", health.Failures, health.Total)
+		if health.OpenUntil != nil && strings.TrimSpace(*health.OpenUntil) != "" {
+			line += fmt.Sprintf("; retrying at %s", strings.TrimSpace(*health.OpenUntil))
+		}
+		if health.Trips > 1 {
+			line += fmt.Sprintf(" (%d trips)", health.Trips)
+		}
+		return line
+	case "half_open":
+		return "probing: one agent run decides whether work resumes"
+	default:
+		return health.State
 	}
 }
 

@@ -114,7 +114,17 @@
         "consecutiveFailureThreshold": 3,
         "retryBaseDelayMs": 1500,
         "slowLaneWarnThresholdMs": 5000,
-        "discoveryCacheTtlSeconds": 30
+        "discoveryCacheTtlSeconds": 30,
+        "agentBrownout": {
+          "enabled": true,
+          "windowSeconds": 600,
+          "minFailures": 5,
+          "failureRatio": 0.8,
+          "cooldownSeconds": 900,
+          "maxCooldownSeconds": 3600,
+          "probeSuccesses": 1,
+          "notify": true
+        }
       },
       "webhook": {
         "enabled": false,

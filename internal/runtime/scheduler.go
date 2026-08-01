@@ -2230,6 +2230,14 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			activeExecutions.ReportHardPersistFailure(err)
 		}
 	}
+	// Terminal agent outcomes feed the agent-health gate (#533). Routed through
+	// the registry for the same reason as onHardPersistFailure: it outlives the
+	// per-config executor snapshots this function builds.
+	onAgentOutcome := func(outcome agent.Outcome) {
+		if activeExecutions != nil {
+			activeExecutions.ReportAgentOutcome(outcome)
+		}
+	}
 	newRoleAgentExecutor := func(resolved config.ResolvedAgent) *agent.ConfiguredExecutor {
 		// agent.params (especially command/args) belong to the global agent
 		// vendor. Keep the unstripped map and the owner vendor on the executor
@@ -2256,6 +2264,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			Owner:                activeExecutions,
 			OnHardPersistFailure: onHardPersistFailure,
 			OnProgress:           onAgentProgress,
+			OnOutcome:            onAgentOutcome,
 		})
 	}
 	retryBaseDelay := time.Duration(cfg.Scheduler.RetryBaseDelayMS) * time.Millisecond
@@ -2376,6 +2385,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			Owner:                activeExecutions,
 			OnHardPersistFailure: onHardPersistFailure,
 			OnProgress:           onAgentProgress,
+			OnOutcome:            onAgentOutcome,
 		})
 		coordinatorOpts.TriageLLM = coordinatorrole.NewAgentLLM(globalExecutor, now,
 			time.Duration(cfg.Agent.Timeouts.PlannerMaxRuntimeSeconds)*time.Second,

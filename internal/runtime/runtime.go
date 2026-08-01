@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/MumuTW/looper/internal/agent"
 	"github.com/MumuTW/looper/internal/bootstrap"
 	"github.com/MumuTW/looper/internal/config"
 	"github.com/MumuTW/looper/internal/domain"
@@ -25,6 +26,7 @@ import (
 	"github.com/MumuTW/looper/internal/infra/notify"
 	"github.com/MumuTW/looper/internal/labels"
 	"github.com/MumuTW/looper/internal/loops"
+	"github.com/MumuTW/looper/internal/loops/brownout"
 	"github.com/MumuTW/looper/internal/processidentity"
 	"github.com/MumuTW/looper/internal/projects"
 	"github.com/MumuTW/looper/internal/storage"
@@ -234,6 +236,11 @@ type Runtime struct {
 	// this flag is not a mutation/claim gate.
 	ownershipAcquired bool
 	admission         *Admission
+	// agentHealth suspends work production while looper's own agent runs are
+	// failing. It is deliberately not part of Admission: admission states are
+	// operator/lifecycle transitions that never recover on their own, and this
+	// one must.
+	agentHealth *brownout.Breaker
 	// daemonBinary answers whether the executable file this daemon was launched
 	// from still holds the image it is running (#154).
 	daemonBinary *daemonBinaryWatcher
@@ -339,6 +346,13 @@ func New(options Options) *Runtime {
 		admission:                   NewAdmission(),
 		daemonBinary:                newDaemonBinaryWatcher(options.Logger),
 	}
+	rt.agentHealth = brownout.New(agentBrownoutConfig(options.Config), now, rt.onAgentBrownoutTransition)
+	// Every terminal agent outcome feeds the health gate. This is the only
+	// input it has: looper does not read provider status pages or parse their
+	// rate-limit messages, it counts its own results.
+	rt.activeExecutions.SetOnAgentOutcome(func(outcome agent.Outcome) {
+		rt.agentHealth.Record(outcome.Succeeded)
+	})
 	// Project daemon Admission onto agent spawn leases so cmd.Start is refused
 	// while starting/stopping/degraded (#576 + #575).
 	rt.activeExecutions.SetAllowSpawn(rt.AllowClaim)
@@ -677,12 +691,110 @@ func (r *Runtime) AllowMutations() error {
 }
 
 // AllowClaim is the scheduler work-producing projection of admission
-// (full tick + durable claims).
+// (full tick + durable claims), plus the agent-health gate.
+//
+// The health gate belongs here rather than at the claim pump because discovery
+// is what re-enqueues work: gating claims alone leaves discovery free to create
+// fresh queue items for loops that were just paused, which is how a tripped
+// per-loop breaker ended up producing new runs every few seconds (#533).
 func (r *Runtime) AllowClaim() error {
 	if r == nil || r.admission == nil {
 		return ErrAdmissionStopping
 	}
-	return r.admission.AllowClaim()
+	if err := r.admission.AllowClaim(); err != nil {
+		return err
+	}
+	return r.agentHealth.Allow()
+}
+
+// AgentHealth reports the agent-health gate's posture for status endpoints.
+func (r *Runtime) AgentHealth() brownout.Summary {
+	if r == nil {
+		return brownout.Summary{State: brownout.StateClosed}
+	}
+	return r.agentHealth.Snapshot()
+}
+
+func agentBrownoutConfig(cfg config.Config) brownout.Config {
+	settings := cfg.Scheduler.AgentBrownout
+	return brownout.Config{
+		Enabled:        settings.Enabled,
+		Window:         time.Duration(settings.WindowSeconds) * time.Second,
+		MinFailures:    settings.MinFailures,
+		FailureRatio:   settings.FailureRatio,
+		Cooldown:       time.Duration(settings.CooldownSeconds) * time.Second,
+		MaxCooldown:    time.Duration(settings.MaxCooldownSeconds) * time.Second,
+		ProbeSuccesses: settings.ProbeSuccesses,
+	}
+}
+
+// onAgentBrownoutTransition logs every state change and notifies the operator
+// when work stops and when it resumes. Notifying is the point: the incident this
+// gate exists for ran for hours, and the only thing the operator could observe
+// was disk and fan noise.
+func (r *Runtime) onAgentBrownoutTransition(transition brownout.Transition) {
+	if r == nil {
+		return
+	}
+	fields := map[string]any{
+		"from":     string(transition.From),
+		"to":       string(transition.To),
+		"reason":   transition.Reason,
+		"failures": transition.Failures,
+		"total":    transition.Total,
+	}
+	if transition.Cooldown > 0 {
+		fields["cooldownSeconds"] = int(transition.Cooldown.Seconds())
+	}
+	if r.logger != nil {
+		if transition.To == brownout.StateOpen {
+			r.logger.Warn("agent brownout opened: work production suspended", fields)
+		} else {
+			r.logger.Info("agent brownout state changed", fields)
+		}
+	}
+	if !r.Config().Scheduler.AgentBrownout.Notify {
+		return
+	}
+	// half_open is a probe, not news. Telling the operator about it would make
+	// every outage a stream of notifications instead of two.
+	switch transition.To {
+	case brownout.StateOpen:
+		r.notifyAgentBrownout("warn", "Looper Paused: Agents Keep Failing",
+			fmt.Sprintf("%d of %d recent agent runs failed", transition.Failures, transition.Total),
+			fmt.Sprintf("Looper stopped starting new work because its own agent runs keep failing — usually a provider that is rate limiting, down, or out of quota. It will retry by itself in %s. Nothing is lost; queued work resumes when a probe run succeeds.", transition.Cooldown.Round(time.Second)),
+			"open")
+	case brownout.StateClosed:
+		r.notifyAgentBrownout("info", "Looper Resumed", "a probe agent run succeeded",
+			"Agent runs are working again. Looper has resumed starting new work.", "closed")
+	}
+}
+
+func (r *Runtime) notifyAgentBrownout(level, title, subtitle, body, dedupeSuffix string) {
+	r.mu.RLock()
+	gateways := r.notificationGateways
+	services := r.services
+	r.mu.RUnlock()
+	if gateways == nil || services.Repositories == nil {
+		return
+	}
+	cfg := r.Config()
+	gateway := gateways.New(notify.Options{
+		Config:        cfg.Notifications,
+		OsascriptPath: derefString(cfg.Tools.OsascriptPath),
+		LogFilePath:   filepath.Join(cfg.Daemon.LogDir, "looperd.log"),
+		Repositories:  services.Repositories,
+		Now:           r.now,
+	})
+	gateway.Notify(context.Background(), notify.SystemNotificationPayload{
+		Level:      level,
+		Title:      title,
+		Subtitle:   subtitle,
+		Body:       body,
+		EntityType: "agent_brownout",
+		EntityID:   "looperd-agent-brownout",
+		DedupeKey:  fmt.Sprintf("runtime.agentBrownout.%s:%s", dedupeSuffix, formatJavaScriptISOString(r.now())),
+	})
 }
 
 // WithAllowClaim runs fn only while claim admission is open, holding the
@@ -1391,6 +1503,10 @@ func (r *Runtime) publishCatalogConsumers(next config.Config) {
 	if webhook != nil {
 		webhook.updateConfig(next)
 	}
+	// Reconfiguring the health gate must not clear an open one: an operator
+	// editing config during an outage would otherwise release the cooldown and
+	// resume the exact hammering the gate is there to stop.
+	r.agentHealth.SetConfig(agentBrownoutConfig(next))
 }
 
 // afterProjectsPublished deliberately runs outside configBoundary. Webhook

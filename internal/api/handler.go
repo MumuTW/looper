@@ -35,6 +35,7 @@ import (
 	githubinfra "github.com/MumuTW/looper/internal/infra/github"
 	"github.com/MumuTW/looper/internal/infra/shell"
 	"github.com/MumuTW/looper/internal/loops"
+	"github.com/MumuTW/looper/internal/loops/brownout"
 	"github.com/MumuTW/looper/internal/postmergedigest"
 	"github.com/MumuTW/looper/internal/projects"
 	"github.com/MumuTW/looper/internal/reviewer/convergence"
@@ -919,6 +920,34 @@ func (h *Handler) admissionStateString() string {
 	return string(looperdruntime.AdmissionReady)
 }
 
+// agentHealthStatus projects the agent-health gate for status surfaces. A
+// runtime that does not expose it reports closed: an embedder without the gate
+// is not brownED out, it simply never opens one.
+func (h *Handler) agentHealthStatus() *statusAgentHealth {
+	runtimeValue := h.context.Runtime
+	if runtimeValue == nil {
+		return nil
+	}
+	typed, ok := any(runtimeValue).(interface {
+		AgentHealth() brownout.Summary
+	})
+	if !ok {
+		return nil
+	}
+	summary := typed.AgentHealth()
+	// Only report a gate that is actually holding work back. A closed gate on a
+	// healthy daemon is noise in every status output.
+	if summary.State == brownout.StateClosed {
+		return nil
+	}
+	view := &statusAgentHealth{State: string(summary.State), Failures: summary.Failures, Total: summary.Total, Trips: summary.Trips}
+	if summary.OpenUntil != nil {
+		openUntil := eventlog.FormatJavaScriptISOString(summary.OpenUntil.UTC())
+		view.OpenUntil = &openUntil
+	}
+	return view
+}
+
 func authorizeRequest(r *http.Request, path string, cfg config.Config) error {
 	if path == webhookForwardPath && cfg.Webhook.Enabled && isLoopbackRemoteAddr(r.RemoteAddr) {
 		if !hasForwardingProxyHeaders(r.Header) {
@@ -1122,6 +1151,20 @@ type statusService struct {
 	// quarantine orphan debt). Empty when none apply.
 	DegradedReasons []string     `json:"degradedReasons,omitempty"`
 	Binary          statusBinary `json:"binary"`
+	// AgentHealth is present only while the agent-health gate is holding work
+	// back, so a healthy daemon's status stays unchanged.
+	AgentHealth *statusAgentHealth `json:"agentHealth,omitempty"`
+}
+
+// statusAgentHealth reports why work production is suspended and when it will
+// be retried, so an operator seeing an idle daemon can tell "waiting out a bad
+// provider" from "stuck".
+type statusAgentHealth struct {
+	State     string  `json:"state"`
+	Failures  int     `json:"failures"`
+	Total     int     `json:"total"`
+	OpenUntil *string `json:"openUntil,omitempty"`
+	Trips     int     `json:"trips"`
 }
 
 type statusTriage struct {
@@ -1620,6 +1663,7 @@ func (h *Handler) buildStatusResponse(ctx context.Context) (statusResponse, erro
 				SupportedTargets: []string{"darwin-arm64", "linux-amd64"},
 				Identity:         binaryIdentity,
 			},
+			AgentHealth: h.agentHealthStatus(),
 		},
 		Storage: statusStorage{
 			Mode:              h.context.Config.Storage.Mode,

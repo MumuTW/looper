@@ -135,6 +135,28 @@ type ExecutorOptions struct {
 	// output, so a transport can surface live progress. Vendor-agnostic: it works
 	// off the subprocess's stdout tail, whatever agent (codex/opencode/claude) runs.
 	OnProgress func(context.Context, ProgressUpdate)
+	// OnOutcome, when set, is called once per execution that reached a terminal
+	// state the agent itself produced. It is the daemon's provider-agnostic view
+	// of "did the agent work", and exists so a health gate can be built without
+	// any component having to recognize a specific provider's rate-limit or
+	// outage message. Executions looper killed are not reported: shutting an
+	// agent down is looper's decision, not evidence about the provider.
+	OnOutcome func(Outcome)
+}
+
+// Outcome is one terminal agent execution, reduced to whether it worked.
+type Outcome struct {
+	ProjectID   string
+	LoopID      string
+	RunID       string
+	ExecutionID string
+	// Status is the executor's terminal status ("completed", "failed",
+	// "timeout").
+	Status string
+	// Succeeded is true only for a clean completion. A timeout counts as a
+	// failure here: an agent that hangs and one that is refused both mean work
+	// is not getting done, and both are worth backing off from.
+	Succeeded bool
 }
 
 // ProgressUpdate is a throttled snapshot of a running agent's activity: the last
@@ -256,6 +278,7 @@ type ConfiguredExecutor struct {
 	owner                SpawnOwner
 	onHardPersistFailure func(error)
 	onProgress           func(context.Context, ProgressUpdate)
+	onOutcome            func(Outcome)
 }
 
 func New(options ExecutorOptions) *ConfiguredExecutor {
@@ -272,6 +295,7 @@ func New(options ExecutorOptions) *ConfiguredExecutor {
 		owner:                options.Owner,
 		onHardPersistFailure: options.OnHardPersistFailure,
 		onProgress:           options.OnProgress,
+		onOutcome:            options.OnOutcome,
 	}
 }
 
@@ -1212,6 +1236,7 @@ func (x *execution) run(ctx context.Context) {
 		}, endedAtISO)
 	}
 
+	x.reportOutcome(status)
 	x.doneCh <- execOutcome{result: result, err: persistErr}
 }
 
@@ -1229,6 +1254,22 @@ func (x *execution) finalizeNativeResumeStatus(status, errorMessage, stderr stri
 	x.nativeResumeError = firstNonEmpty(x.nativeResumeError, errorMessage, strings.TrimSpace(stderr))
 }
 
+// reportOutcome feeds the daemon's agent-health gate. "killed" is excluded on
+// purpose: it means looper stopped the agent (operator stop, shutdown drain),
+// which says nothing about whether the provider is answering.
+func (x *execution) reportOutcome(status string) {
+	if x.executor == nil || x.executor.onOutcome == nil || status == "killed" {
+		return
+	}
+	x.executor.onOutcome(Outcome{
+		ProjectID:   x.input.ProjectID,
+		LoopID:      x.input.LoopID,
+		RunID:       x.input.RunID,
+		ExecutionID: x.executionID,
+		Status:      status,
+		Succeeded:   status == "completed",
+	})
+}
 func (x *execution) observeBeforeTimeout(timeoutType string) string {
 	callback := x.input.OnBeforeTimeout
 	if callback == nil {

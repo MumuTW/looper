@@ -574,6 +574,44 @@ func mergeSchedulerConfig(config *SchedulerConfig, partial PartialSchedulerConfi
 	if partial.DiscoveryCacheTTLSeconds != nil {
 		config.DiscoveryCacheTTLSeconds = *partial.DiscoveryCacheTTLSeconds
 	}
+
+	if partial.AgentBrownout != nil {
+		mergeAgentBrownoutConfig(&config.AgentBrownout, *partial.AgentBrownout)
+	}
+}
+
+func mergeAgentBrownoutConfig(config *AgentBrownoutConfig, partial PartialAgentBrownoutConfig) {
+	if partial.Enabled != nil {
+		config.Enabled = *partial.Enabled
+	}
+
+	if partial.WindowSeconds != nil {
+		config.WindowSeconds = *partial.WindowSeconds
+	}
+
+	if partial.MinFailures != nil {
+		config.MinFailures = *partial.MinFailures
+	}
+
+	if partial.FailureRatio != nil {
+		config.FailureRatio = *partial.FailureRatio
+	}
+
+	if partial.CooldownSeconds != nil {
+		config.CooldownSeconds = *partial.CooldownSeconds
+	}
+
+	if partial.MaxCooldownSeconds != nil {
+		config.MaxCooldownSeconds = *partial.MaxCooldownSeconds
+	}
+
+	if partial.ProbeSuccesses != nil {
+		config.ProbeSuccesses = *partial.ProbeSuccesses
+	}
+
+	if partial.Notify != nil {
+		config.Notify = *partial.Notify
+	}
 }
 
 func mergeWebhookConfig(config *WebhookConfig, partial PartialWebhookConfig) {

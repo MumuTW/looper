@@ -105,6 +105,10 @@ type ActiveExecutionRegistry struct {
 	// single sticky admission degraded state (ADR-0015 R5 / #578). Also used
 	// for queue finalize persistence failures that retain operation ownership.
 	onHardPersistFailure func(error)
+	// onAgentOutcome receives every terminal agent execution the agent itself
+	// produced, so the daemon can gate work production on its own success rate
+	// without recognizing any provider's error format.
+	onAgentOutcome func(agent.Outcome)
 
 	// killTimeout bounds handle.Kill during stop. Zero uses defaultKillTimeout.
 	killTimeout time.Duration
@@ -181,6 +185,32 @@ func (r *ActiveExecutionRegistry) ReportHardPersistFailure(err error) {
 	r.mu.Unlock()
 	if fn != nil {
 		fn(err)
+	}
+}
+
+// SetOnAgentOutcome wires the daemon's agent-health observer. It is set once by
+// the runtime and read by every executor snapshot, so the observation survives
+// the config reloads that rebuild scheduler handlers — a health signal that
+// reset whenever config changed would never accumulate enough evidence to act.
+func (r *ActiveExecutionRegistry) SetOnAgentOutcome(fn func(agent.Outcome)) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	r.onAgentOutcome = fn
+	r.mu.Unlock()
+}
+
+// ReportAgentOutcome forwards one terminal agent outcome to the observer.
+func (r *ActiveExecutionRegistry) ReportAgentOutcome(outcome agent.Outcome) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	fn := r.onAgentOutcome
+	r.mu.Unlock()
+	if fn != nil {
+		fn(outcome)
 	}
 }
 
