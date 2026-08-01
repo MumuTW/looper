@@ -265,14 +265,5 @@ func previousConvergenceRevision(report Report) string {
 	if report.Evidence.ReviewerConvergence == nil {
 		return ""
 	}
-	return convergenceRevision(*report.Evidence.ReviewerConvergence)
-}
-
-func reportHasFailedCheck(report Report) bool {
-	for _, reason := range report.Reasons {
-		if reason.Code == ReasonCheckFailed {
-			return true
-		}
-	}
 	return false
 }
