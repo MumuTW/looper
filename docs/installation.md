@@ -259,15 +259,16 @@ looper upgrade restore --bundle <directory> --confirm
 Supported sequence:
 
 1. `preflight` (read-only compatibility; sandbox probe uses `daemon.workingDirectory`)
-2. **Stage the current live pair** into `release-root` (`stage-release` with the running CLI/daemon). Keep that release id as `previous`.
-3. **`activate-release` the prior (live) release** so `current` exists, then **reinstall/update the service** so the unit launches `release-root/current/looperd` (not a concrete old path). Set `tools.looperPath` to `release-root/current/looper` and restart once to confirm the service follows `current`.
-4. `backup` (matching config + SQLite + binary evidence)
-5. `drain` (and optional final `backup` while drained)
-6. `stage-release` the **candidate** pair
-7. `activate-release` the candidate (switches `current` only — does not restart)
-8. Point `tools.looperPath` at `release-root/current/looper` if not already
-9. **Restart the supervised daemon** so it loads `current/looperd`
-10. `verify-start`
+2. **Ensure the live pair is staged under `release-root`** as the prior release:
+   - **First cutover:** `stage-release` the running CLI/daemon, then `activate-release` that id so `current` exists. Reinstall/update the service so the unit launches `release-root/current/looperd` (not a concrete old path). Set `tools.looperPath` to `release-root/current/looper` and restart once to confirm the service follows `current`. Keep that release id as `previous`.
+   - **Later cutovers:** the live pair is already that release id (last successful candidate). Re-run `stage-release` with the same binaries — staging is **idempotent** when the destination already matches (same build + binary hashes). Or skip re-staging and reuse `looper upgrade` / `CurrentReleaseID` as `previous`.
+3. `backup` (matching config + SQLite + binary evidence)
+4. `drain` (and optional final `backup` while drained)
+5. `stage-release` the **candidate** pair (new release id)
+6. `activate-release` the candidate (switches `current` only — does not restart)
+7. Point `tools.looperPath` at `release-root/current/looper` if not already
+8. **Restart the supervised daemon** so it loads `current/looperd`
+9. `verify-start`
 
 On failure after restart:
 

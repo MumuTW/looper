@@ -216,8 +216,11 @@ type Runtime struct {
 	worktreeCleanupRunning      bool
 	worktreeCleanupInitialDelay time.Duration
 	worktreeCleanupStatus       WorktreeCleanupStatus
-	// workProducerJoinActive is set while BeginDrain's background join is
-	// stopping scheduler/recovery/cleanup/project-discovery producers.
+	// workProducerJoinStarted latches the first BeginDrain producer join for
+	// the process lifetime. Never clear it: a second POST must not overwrite
+	// residual done-channels after the first join timed out.
+	workProducerJoinStarted atomic.Bool
+	// workProducerJoinActive is true only while the join goroutine is inside stop*.
 	workProducerJoinActive atomic.Bool
 	// workProducerJoinDone is closed when the drain join goroutine finishes
 	// stop* and registers residual done-channels. Stop waits on this first.
@@ -672,9 +675,11 @@ func (r *Runtime) BeginDrain(reason string) error {
 	if err := r.admission.BeginDrain(reason); err != nil {
 		return err
 	}
-	// Join once: idempotent re-POST during drain must not start a second stop
-	// pass while the first is still waiting on producer done channels.
-	if r.workProducerJoinActive.CompareAndSwap(false, true) {
+	// Process-lifetime single shot: never re-run stop* after the first join
+	// started, even if residuals remain and workProducerJoinActive is false.
+	// A second join would snapshot nil producer fields and wipe residual dones.
+	if r.workProducerJoinStarted.CompareAndSwap(false, true) {
+		r.workProducerJoinActive.Store(true)
 		r.mu.Lock()
 		r.workProducerJoinDone = make(chan struct{})
 		r.mu.Unlock()
@@ -706,7 +711,9 @@ func (r *Runtime) joinWorkProducersForDrain() {
 	r.stopSchedulerLoop()
 	r.stopDeferredReviewerRecovery()
 	r.stopWorktreeCleanupLoop()
-	r.stopProjectDiscovery()
+	// Drain join must not record discovery wait timeouts on shutdownDrainErr;
+	// that flag retains SQLite on later Stop even after discovery eventually exits.
+	r.waitProjectDiscoveryForDrain()
 
 	stillOpen := make([]<-chan struct{}, 0, len(residual))
 	for _, done := range residual {

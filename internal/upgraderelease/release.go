@@ -89,7 +89,9 @@ func Stage(input StageInput) (StageResult, error) {
 	}
 	destination := filepath.Join(releasesDir, input.ReleaseID)
 	if _, err := os.Lstat(destination); err == nil {
-		return StageResult{}, fmt.Errorf("release %s already exists", input.ReleaseID)
+		// Idempotent restage: later cutovers re-stage the live pair that is
+		// already this release id from a prior candidate stage.
+		return reuseExistingRelease(root, input)
 	} else if !os.IsNotExist(err) {
 		return StageResult{}, fmt.Errorf("inspect release destination: %w", err)
 	}
@@ -130,6 +132,55 @@ func Stage(input StageInput) (StageResult, error) {
 		return StageResult{}, err
 	}
 	return StageResult{RootDir: root, ReleaseID: input.ReleaseID, Directory: destination, Manifest: manifest}, nil
+}
+
+// reuseExistingRelease returns a verified existing release when the operator
+// re-stages the same build (normal on the second+ cutover). Rejects a
+// same-id directory whose build or binary bytes differ.
+func reuseExistingRelease(root string, input StageInput) (StageResult, error) {
+	existing, err := Verify(root, input.ReleaseID)
+	if err != nil {
+		return StageResult{}, fmt.Errorf("release %s already exists but is not a valid immutable stage: %w", input.ReleaseID, err)
+	}
+	if !releaseBuildMatches(existing.Manifest.Build, input.Build) {
+		return StageResult{}, fmt.Errorf("release %s already exists with a different build identity", input.ReleaseID)
+	}
+	for _, item := range []struct {
+		source string
+		name   string
+	}{{input.CLIBinaryPath, "looper"}, {input.DaemonBinaryPath, "looperd"}} {
+		want, ok := existing.Manifest.Files[item.name]
+		if !ok {
+			return StageResult{}, fmt.Errorf("release %s is missing staged %s", input.ReleaseID, item.name)
+		}
+		got, err := describeFile(item.source, item.name)
+		if err != nil {
+			return StageResult{}, fmt.Errorf("hash input %s for existing release %s: %w", item.name, input.ReleaseID, err)
+		}
+		if got.SHA256 != want.SHA256 || got.Size != want.Size {
+			return StageResult{}, fmt.Errorf("release %s already exists but %s bytes differ from the staged copy", input.ReleaseID, item.name)
+		}
+	}
+	return existing, nil
+}
+
+func releaseBuildMatches(existing, input version.Info) bool {
+	if existing.Complete() && input.Complete() {
+		return existing.SameBuild(input)
+	}
+	// Incomplete identities (tests, partial metadata) still require the fields
+	// Stage already validated plus matching optional commit when both present.
+	if existing.Version != input.Version ||
+		existing.Metadata.VersionSource != input.Metadata.VersionSource ||
+		existing.Metadata.Channel != input.Metadata.Channel ||
+		existing.Metadata.APIVersion != input.Metadata.APIVersion {
+		return false
+	}
+	if existing.Metadata.GitCommitSHA != nil && input.Metadata.GitCommitSHA != nil &&
+		*existing.Metadata.GitCommitSHA != *input.Metadata.GitCommitSHA {
+		return false
+	}
+	return true
 }
 
 // Verify confirms a staged release has the exact immutable layout Stage
