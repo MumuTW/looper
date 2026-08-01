@@ -91,6 +91,16 @@ else
   fail=$((fail + 1))
 fi
 
+# --- stdin mode: an invalid final line without a trailing newline is still validated ---
+no_trailing_newline_rc=0
+printf 'feat: ok\nno prefix here' | "$script" --stdin >/dev/null 2>&1 || no_trailing_newline_rc=$?
+if [ $no_trailing_newline_rc -ne 0 ]; then
+  pass=$((pass + 1))
+else
+  echo "FAIL (invalid final line without trailing newline should exit non-zero)" >&2
+  fail=$((fail + 1))
+fi
+
 # --- `--` forces a literal subject that looks like the --stdin flag ---
 if ! "$script" -- "--stdin" >/dev/null 2>&1; then
   pass=$((pass + 1))

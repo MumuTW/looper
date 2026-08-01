@@ -53,7 +53,7 @@ main() {
     # An empty line is a commit with a blank subject, not a separator to
     # skip: validate it so a blank subject fails the check instead of
     # being silently ignored.
-    while IFS= read -r line; do
+    while IFS= read -r line || [ -n "$line" ]; do
       validate_one "$line" || rc=1
     done
   elif [ $# -ge 1 ]; then
