@@ -29,7 +29,7 @@ func TestDiscoverIssuesPersonalProjectAssignsSelfAuthoredIssueIdempotently(t *te
 	if err != nil {
 		t.Fatalf("first DiscoverIssues() error = %v", err)
 	}
-	if len(first.QueueItems) != 1 || len(github.addAssigneeCalls) != 1 || github.listOpenIssueCalls[0].Limit != personalIssueQueryLimit {
+	if len(first.QueueItems) != 1 || len(github.addAssigneeCalls) != 1 || github.listOpenIssueCalls[0].Limit != personalIssueQueryLimit || github.listOpenIssueCalls[0].Search != "author:octocat" {
 		t.Fatalf("first result = %#v, assignee calls = %#v, want one queue and one assignment", first, github.addAssigneeCalls)
 	}
 	loop, err := fixture.repos.Loops.GetByID(context.Background(), derefString(first.QueueItems[0].LoopID))

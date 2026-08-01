@@ -105,6 +105,7 @@ type ListOpenIssuesInput struct {
 	Assignee string
 	Label    string
 	Labels   []string
+	Search   string
 }
 
 type ViewIssueInput struct {
@@ -572,7 +573,11 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 	if personalProject && policy.RequireAssigneeCurrentUser && queryLimit < personalIssueQueryLimit {
 		queryLimit = personalIssueQueryLimit
 	}
-	issues, err := r.listOpenIssuesForDiscovery(ctx, ListOpenIssuesInput{Repo: input.Repo, CWD: project.RepoPath, Limit: queryLimit, Assignee: assigneeFilter}, policy)
+	search := ""
+	if personalProject && policy.RequireAssigneeCurrentUser {
+		search = "author:" + login
+	}
+	issues, err := r.listOpenIssuesForDiscovery(ctx, ListOpenIssuesInput{Repo: input.Repo, CWD: project.RepoPath, Limit: queryLimit, Assignee: assigneeFilter, Search: search}, policy)
 	if err != nil {
 		return DiscoveryResult{}, err
 	}

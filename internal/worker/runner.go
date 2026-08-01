@@ -242,6 +242,7 @@ type ListOpenIssuesInput struct {
 	Assignee string
 	Label    string
 	Labels   []string
+	Search   string
 }
 
 type GitHubGateway interface {
@@ -932,7 +933,11 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
-	issues, err := r.listOpenIssuesForDiscovery(ctx, ListOpenIssuesInput{Repo: input.Repo, CWD: project.RepoPath, Limit: queryLimit, Assignee: assigneeFilter}, policy, requiredTargetLabel)
+	search := ""
+	if personalProject && policy.RequireAssigneeCurrentUser {
+		search = "author:" + login
+	}
+	issues, err := r.listOpenIssuesForDiscovery(ctx, ListOpenIssuesInput{Repo: input.Repo, CWD: project.RepoPath, Limit: queryLimit, Assignee: assigneeFilter, Search: search}, policy, requiredTargetLabel)
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
