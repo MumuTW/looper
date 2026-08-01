@@ -168,7 +168,10 @@ func TestServiceUpdateProjectRereadsMetadataAfterProjectLock(t *testing.T) {
 	updated := make(chan error, 1)
 	repo := "acme/looper"
 	go func() {
-		_, err := service.UpdateProject(context.Background(), "looper", UpdateInput{Repo: UpdateStringField{Set: true, Value: &repo}})
+		_, err := service.UpdateProject(context.Background(), "looper", UpdateInput{
+			Repo:       UpdateStringField{Set: true, Value: &repo},
+			Validation: &config.ProjectValidationConfig{OptOut: true},
+		})
 		updated <- err
 	}()
 

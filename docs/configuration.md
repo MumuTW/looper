@@ -107,7 +107,7 @@ Profile and role agent vendor/model fields are hot-safe curated identity fields:
 
 `agent.vendor` can switch from one configured vendor to another when `agent.params` is empty and no explicit model is being silently carried across vendors. If `agent.model` is set, change or unset it in the same candidate; an unchanged explicit model blocks that vendor-to-vendor switch. Clearing a configured vendor uses the same guard, so a retained profile cannot be laundered through an intermediate `null`. The same leave/switch guards apply to each coding role's *resolved* vendor after global → profile → role overlay. Configuring the first vendor may use an already prepared model/params profile. Continuations of failed or interrupted runs copy the predecessor's durable `agent_snapshot_json` (sticky identity across the retry lineage) while retaining checkpoint, worktree, HITL answer, and queued human instructions. Only legacy predecessors with a null snapshot adopt the runner's current resolved identity. Looper never sends an old vendor's native session ID to a different CLI.
 
-Notably, `agent.nativeResume`, `agent.params`, `roles.coordinator.enabled`, `instructions.maxBytes`, all `hitl.*`, all `intake.*`, all `notifications.webhook.*`, `roles.reviewer.autoMerge.*`, `roles.reviewer.behavior.loop.quietPeriodSeconds`, `roles.reviewer.behavior.loop.minPublishIntervalSeconds`, `roles.reviewer.behavior.retry.maxDelayMs`, `roles.coordinator.mergeWatch.transientRetries`, and `roles.coordinator.dependencies.*` require restart. `agent.params` stay global, file-only, and restart-bound; the dashboard does not edit params. The scheduler retry budget/base delay and these Reviewer timing fields are durable queue-scheduling inputs; Coordinator transient retries are persisted as a remaining budget, so they are also restart-bound. Listener, storage, daemon, logging, webhook/network topology, providers/projects, scheduler polling/cache, and `tools.gitPath`/`tools.ghPath` also require restart. New fields are restart-bound until explicitly classified.
+Notably, `agent.nativeResume`, `agent.params`, `roles.coordinator.enabled`, `instructions.maxBytes`, all `hitl.*`, all `intake.*`, all `notifications.webhook.*`, `roles.reviewer.autoMerge.*`, `roles.reviewer.behavior.loop.quietPeriodSeconds`, `roles.reviewer.behavior.loop.minPublishIntervalSeconds`, `roles.reviewer.behavior.retry.maxDelayMs`, `roles.coordinator.mergeWatch.transientRetries`, and `roles.coordinator.dependencies.*` require restart. `roles.reviewer.behavior.convergence.*` is the exception for new claims: its four leaves are hot-safe and an active loop keeps its captured policy snapshot. `agent.params` stay global, file-only, and restart-bound; the dashboard does not edit params. The scheduler retry budget/base delay and these Reviewer timing fields are durable queue-scheduling inputs; Coordinator transient retries are persisted as a remaining budget, so they are also restart-bound. Listener, storage, daemon, logging, webhook/network topology, providers/projects, scheduler polling/cache, and `tools.gitPath`/`tools.ghPath` also require restart. New fields are restart-bound until explicitly classified.
 
 Deprecated file-layer aliases for `agent.timeouts.{planner,worker,reviewer,fixer}Seconds`, `defaults.allowAutoApprove`, and `defaults.fixAllPullRequests` are normalized into their canonical hot-safe fields so existing files can still reload without a restart. They remain file-only compatibility syntax: the dashboard exposes and writes only canonical paths, and a canonical dashboard edit removes the corresponding alias leaf so a later unset cannot resurrect the old value.
 
@@ -544,6 +544,39 @@ Behavior notes:
 - Coordinator never stores its own dispatch state; the authority chain stays on GitHub labels, comments, and timeline events
 - `roles.coordinator.dispatch.autonomous.holdLabel` is compatibility-only for coordinator autonomous dispatch; the official global hold contract is `looper:hold`
 
+## Coordinator mark-ready
+
+Coordinator can take a looper-authored draft PR out of draft once CI is green, so review starts without a human clicking "Ready for review". It lives under `roles.coordinator.markReady.*` and runs inside the merge-watch lane:
+
+| Path | Purpose | Default |
+| --- | --- | --- |
+| `roles.coordinator.markReady.enabled` | Publishes eligible looper-authored drafts | `false` |
+| `roles.coordinator.markReady.scope` | Which drafts Looper may publish; `looper-only` is the only accepted value | `"looper-only"` |
+
+A draft is published only when every one of these holds. Any one failing leaves the draft exactly as it is, and the next tick looks again:
+
+- `looper-only` scope: the PR carries a `looper:` label **and** links the tracked issue with a closing reference
+- the PR itself is authored by the account the daemon runs as — a maintainer's own draft over machine-written commits is theirs to publish
+- nobody has converted the PR back to draft: a `convert_to_draft` timeline event performed by anyone but the daemon is an explicit "not ready" and skips the PR for good
+- all required checks on the head are green — branch protection names them (matching the required GitHub App where protection binds one), and where it names none, every check observed on the head counts
+- at least one check is known. A head with no required checks *and* no observed checks says nothing about CI, so the draft waits rather than publishing seconds before the first workflow registers
+- GitHub reports the branch as mergeable and not conflicting
+- no `looper:hold` and no `do-not-merge` label
+- every commit on the branch is attributed to the account the daemon runs as
+
+Immediately before publishing, the PR is read once more and every guard above that does not depend on the head is re-evaluated, with the head compared against the one the checks and commits were read from. A push, a new hold label, or a human publishing first between the decision and the mutation leaves the draft alone; `gh pr ready` takes no head argument, so making the evidence true again is the only conditional mutation available.
+
+The lane only ever considers open drafts: it lists them once per tick and intersects that with the issue's linked PRs, so a merged or already-published reference costs nothing on later ticks.
+
+Marking ready is idempotent: a human clicking "Ready for review" first is success, not an error.
+
+**Publishing alone does not start a review.** It emits `ready_for_review`, and that delivery does wake the reviewer lane — but the reviewer refuses a PR authored by the account it runs as unless `roles.reviewer.discovery.triggers.enableSelfReview` is true, and GitHub will not let anyone request review from a PR's own author. So with the shipped defaults (`requireReviewRequest = true`, `enableSelfReview = false`) and a single daemon identity, mark-ready produces drafts that publish and then sit. Make review actually happen with one of:
+
+- a **distinct reviewer identity** — a second daemon, or a routed reviewer node, running under its own GitHub login. The PR is not self-authored from its point of view, so the default reviewer configuration applies unchanged.
+- `roles.reviewer.discovery.triggers.enableSelfReview = true`, accepting that the same account both writes and reviews, and set `triggers.requireReviewRequest = false` so discovery has a non-request path.
+
+Coordinator logs a warning at startup when `markReady.enabled` is true and the effective reviewer configuration can never claim a looper-authored PR. Mark-ready does not change any reviewer default on your behalf.
+
 ## Hold labels
 
 Official hold labels are fixed:
@@ -634,6 +667,12 @@ enabledByDefault = true
 quietPeriodSeconds = 60
 minPublishIntervalSeconds = 300
 
+[roles.reviewer.behavior.convergence]
+maxConsecutiveUnproductive = 3
+maxFixerAttemptsPerItem = 4
+maxTotalRounds = 40
+severityFloor = "non_blocking"
+
 [roles.reviewer.behavior.reviewEvents]
 clean = "APPROVE"
 blocking = "REQUEST_CHANGES"
@@ -644,6 +683,34 @@ reReviewPromptOnHeadChange = false
 ```
 
 The reviewer defaults above are intentionally aggressive: clean reviews publish `APPROVE`, blocking reviews publish `REQUEST_CHANGES`, and `enableSelfReview` still defaults to `false`.
+
+### Reviewer convergence settings
+
+`roles.reviewer.behavior.convergence.*` is the per-project authority for
+semantic Reviewer↔Fixer loop bounds. The structured `looper:review-item`
+severity marker remains the forge authority; the reviewer persists only the
+observed round history and decision in the existing loop metadata.
+
+| Path | Purpose | Default | Valid values |
+| --- | --- | --- | --- |
+| `roles.reviewer.behavior.convergence.maxConsecutiveUnproductive` | Consecutive rounds with no new item or explicit resolution before human escalation | `3` | positive integers |
+| `roles.reviewer.behavior.convergence.maxFixerAttemptsPerItem` | Distinct structured Fixer attempts allowed for one open item before it is deferred | `4` | positive integers |
+| `roles.reviewer.behavior.convergence.maxTotalRounds` | Absolute runaway backstop, reported separately from a stall | `40` | positive integers |
+| `roles.reviewer.behavior.convergence.severityFloor` | Lowest severity that continues the loop and blocks progress | `"non_blocking"` | `"blocking"`, `"non_blocking"`, `"all"` |
+
+When a stall or absolute ceiling fires, Reviewer records the reason, round
+history, and open item IDs in loop metadata and parks the loop as
+`awaiting_human`; the HITL answer `resume` resets only the stall counter,
+while `close` ends that reviewer loop. Global role leaves are hot-reloadable
+for new claims; project catalog changes retain the normal project restart
+boundary. An already-started loop keeps the policy snapshot stored with its
+convergence state.
+
+The loop API projects this stored state as `loop.convergence`. The dashboard's
+Loop Detail view shows the round budget, consecutive-unproductive counter,
+current open items, and recent productive/unproductive round history. This is
+an observation of the persisted metadata; it does not infer status from review
+prose or change merge eligibility.
 
 ### Reviewer auto-merge settings
 
@@ -894,6 +961,39 @@ Reviewers should weigh these blind spots before relying on it:
   between that final read and the merge call itself, the merge can still proceed
   against a new base whose recomputed diff exceeds the budget. That window is
   narrow but not closed — it is a documented blind spot, not a guarantee.
+
+## Pipeline digest (`roles.escalator`)
+
+Escalator is an agent-free, global Role that periodically derives one attention
+digest from durable loop, queue, Triage, Gatekeeper, and pull-request snapshot
+state. It uses the existing notification gateway; it does not start an agent,
+claim work, change forge state, or add another delivery transport.
+
+```toml
+[roles.escalator]
+enabled = true
+cadenceSeconds = 3600
+retryAttemptThreshold = 2
+unroutedAfterSeconds = 3600
+staleHeadAfterSeconds = 86400
+maxItems = 500
+```
+
+| Path | Purpose | Default |
+| --- | --- | --- |
+| `roles.escalator.enabled` | Enables the global digest | `false` |
+| `roles.escalator.cadenceSeconds` | Minimum interval between successful census attempts | `3600` |
+| `roles.escalator.retryAttemptThreshold` | Queue attempts at which an item is reported as repeatedly retrying | `2` |
+| `roles.escalator.unroutedAfterSeconds` | Age before an enrolled/unprojected Triage source is stuck | `3600` |
+| `roles.escalator.staleHeadAfterSeconds` | Age before current-head evidence is stale | `86400` |
+| `roles.escalator.maxItems` | Hard bound on one durable delta baseline | `500` |
+
+The role is global-only: `projects[].roles.escalator` is rejected because one
+digest intentionally aggregates all active projects. An unchanged digest is
+suppressed, an empty digest advances the baseline without sending a content-free
+notification, and a failed census retries on the next scheduler tick. A daemon
+restart may run an immediate census; durable delta comparison still prevents an
+unchanged notification.
 
 ## Deploy on merge (`roles.deployer`)
 

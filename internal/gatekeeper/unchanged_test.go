@@ -258,3 +258,46 @@ func TestReportAwaitsCurrentHeadReviewDetectsProviderBlockedEvidence(t *testing.
 		t.Fatalf("reportAwaitsCurrentHeadReview() = false, want true for provider-blocked report with invalid CodexReview evidence")
 	}
 }
+
+// A blocked convergence report used to disable unchanged-report reuse
+// indefinitely, so the default scheduler re-ran the full EvaluatePullRequest
+// sequence every tick even though the changing input is local SQLite metadata.
+// The convergence revision is now compared locally: while the Reviewer state is
+// unchanged the blocked report is reused without forge round trips, and only an
+// actual advance (Reviewer progress) forces a re-evaluation.
+func TestDiscoverPullRequestsSkipsBlockedConvergenceUntilReviewerAdvances(t *testing.T) {
+	fixture := newGatekeeperFixture(t)
+	fixture.github.openPullRequests = []githubinfra.PullRequestSummary{openPullRequestFixture()}
+	seedReviewerConvergenceLoop(t, fixture, `{"convergence":{"policy":{"maxConsecutiveUnproductive":3,"maxFixerAttemptsPerItem":4,"maxTotalRounds":40,"severityFloor":"non_blocking"},"state":{"totalRounds":3,"items":{"blocking-1":{"id":"blocking-1","severity":"blocking","status":"open"}}},"action":"continue","reason":"converging","status":"active","updatedAt":"2026-07-30T10:00:00Z"},"loop":{"lastReviewedHeadSha":"head-1"}}`, 1)
+
+	first := discover(t, fixture)
+	if first.Evaluated != 1 || first.Skipped != 0 || first.Reports[0].Eligible {
+		t.Fatalf("first discovery = %#v, want evaluated convergence blocker", first)
+	}
+	if !hasReason(first.Reports[0], ReasonReviewerConvergence) {
+		t.Fatalf("first report reasons = %v, want convergence blocker", reasonCodes(first.Reports[0].Reasons))
+	}
+	callsAfterFirst := fixture.github.perPullRequestCalls
+	if callsAfterFirst == 0 {
+		t.Fatal("first tick made no per-pull-request calls; the fixture cannot detect a skip")
+	}
+
+	// No Reviewer progress: the convergence revision is unchanged, so the
+	// blocked report is reused and the second tick makes no forge round trips.
+	second := discover(t, fixture)
+	if second.Evaluated != 0 || second.Skipped != 1 {
+		t.Fatalf("second tick = %d evaluated / %d skipped, want 0 / 1 (unchanged convergence revision)", second.Evaluated, second.Skipped)
+	}
+	if fixture.github.perPullRequestCalls != callsAfterFirst {
+		t.Fatalf("per-pull-request calls = %d, want %d (unchanged convergence must not re-poll forge)",
+			fixture.github.perPullRequestCalls, callsAfterFirst)
+	}
+
+	// Reviewer progress advances the convergence revision, so the third tick
+	// re-evaluates and picks up the resolved state.
+	seedReviewerConvergenceLoop(t, fixture, `{"convergence":{"policy":{"maxConsecutiveUnproductive":3,"maxFixerAttemptsPerItem":4,"maxTotalRounds":40,"severityFloor":"non_blocking"},"state":{"totalRounds":4,"items":{"blocking-1":{"id":"blocking-1","severity":"blocking","status":"resolved"}}},"action":"complete","reason":"severity_floor_reached","status":"active","updatedAt":"2026-07-30T10:05:00Z"},"loop":{"lastReviewedHeadSha":"head-1"}}`, 1)
+	third := discover(t, fixture)
+	if third.Evaluated != 1 || third.Skipped != 0 || !third.Reports[0].Eligible {
+		t.Fatalf("third discovery = %#v, want reevaluated eligible report after convergence advanced", third)
+	}
+}

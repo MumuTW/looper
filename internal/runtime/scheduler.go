@@ -21,9 +21,11 @@ import (
 	"github.com/MumuTW/looper/internal/config"
 	coordinatorrole "github.com/MumuTW/looper/internal/coordinator"
 	"github.com/MumuTW/looper/internal/disclosure"
+	"github.com/MumuTW/looper/internal/escalator"
 	"github.com/MumuTW/looper/internal/fixer"
 	"github.com/MumuTW/looper/internal/forge"
 	"github.com/MumuTW/looper/internal/gatekeeper"
+	"github.com/MumuTW/looper/internal/hostresources"
 	gitinfra "github.com/MumuTW/looper/internal/infra/git"
 	githubinfra "github.com/MumuTW/looper/internal/infra/github"
 	"github.com/MumuTW/looper/internal/infra/notify"
@@ -49,6 +51,35 @@ type plannerScheduler interface {
 
 type triagerScheduler interface {
 	DiscoverIssues(context.Context, triager.DiscoveryInput) (triager.DiscoveryResult, error)
+}
+
+type escalatorScheduler interface {
+	Run(context.Context) (escalator.RunResult, error)
+}
+
+type schedulerEscalatorCadence struct {
+	mu      sync.Mutex
+	lastRun time.Time
+	running bool
+}
+
+func (s *schedulerEscalatorCadence) start(now time.Time, cadence time.Duration) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.running || (!s.lastRun.IsZero() && now.Before(s.lastRun.Add(cadence))) {
+		return false
+	}
+	s.running = true
+	return true
+}
+
+func (s *schedulerEscalatorCadence) finish(now time.Time, succeeded bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.running = false
+	if succeeded {
+		s.lastRun = now
+	}
 }
 
 type coordinatorScheduler interface {
@@ -93,19 +124,34 @@ type schedulerAsyncRunner interface {
 }
 
 type defaultSchedulerTickInput struct {
-	Repos             *storage.Repositories
-	GitHubGateway     *githubinfra.Gateway
-	GitGateway        *gitinfra.Gateway
-	Logger            bootstrap.Logger
-	Now               func() time.Time
-	MaxConcurrentRuns int
-	ClaimMu           *sync.Mutex
-	ClaimBoundary     *sync.RWMutex
-	RefreshForClaim   func() defaultSchedulerTickInput
+	Repos *storage.Repositories
+	// CapturedProjects is the project-table snapshot already validated by the
+	// catalog pass immediately before an independent claim pass. Keeping it on
+	// the claim input lets the quarantine scope reuse that read instead of
+	// scanning Projects.List a second time on every tick. The explicit boolean
+	// distinguishes a captured empty table from an input that has no snapshot.
+	CapturedProjects      []storage.ProjectRecord
+	CapturedProjectsReady bool
+	GitHubGateway         *githubinfra.Gateway
+	GitGateway            *gitinfra.Gateway
+	Logger                bootstrap.Logger
+	Now                   func() time.Time
+	MaxConcurrentRuns     int
+	ClaimMu               *sync.Mutex
+	ClaimBoundary         *sync.RWMutex
+	RefreshForClaim       func() defaultSchedulerTickInput
 	// AllowClaim, when set, is the admission projection for all work-producing
 	// scheduler activity: the full default tick (discovery, HITL, claims,
 	// stale-reconcile) and each durable ClaimNext*. Nil means ungated (tests).
 	AllowClaim func() error
+	// HostAdmission, when set, reports whether the host can carry more work.
+	// Nil means ungated (tests, and any platform whose signals are unreadable).
+	HostAdmission func() *hostresources.Decision
+	// HostAdmissionLog, when set, reports whether a hold decision should be
+	// logged now (and records it so a repeated hold on the same sample is
+	// logged once). Nil means log every hold, preserving the test behavior of
+	// an ungated admission closure.
+	HostAdmissionLog func(*hostresources.Decision) bool
 	// OperationOwner, when set, admits a Supervisor operation lease before each
 	// durable ClaimNext* and holds it until durable complete/cancel/requeue
 	// (ADR-0015 R6 / #579). Nil means ungated claim ownership (unit tests).
@@ -114,6 +160,8 @@ type defaultSchedulerTickInput struct {
 	AsyncRunner              schedulerAsyncRunner
 	RequestSchedulerWake     func()
 	Triager                  triagerScheduler
+	Escalator                escalatorScheduler
+	EscalatorCadence         *schedulerEscalatorCadence
 	Planner                  plannerScheduler
 	Coordinator              coordinatorScheduler
 	Reviewer                 reviewerScheduler
@@ -1112,6 +1160,81 @@ func (a fixerGitHubAdapter) ViewPullRequest(ctx context.Context, input fixer.Vie
 	return fixer.PullRequestDetail{Number: detail.Number, State: detail.State, IsDraft: detail.IsDraft, Labels: detail.Labels, HeadSHA: detail.HeadSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, BaseSHA: detail.BaseSHA, ReviewDecision: detail.ReviewDecision, Comments: detail.Comments, IssueComments: commentInfosToObjects(detail.IssueComments), Checks: detail.Checks, HasConflicts: detail.HasConflicts, Author: detail.Author}, nil
 }
 
+func (a fixerGitHubAdapter) ViewIssue(ctx context.Context, input fixer.ViewIssueInput) (fixer.IssueDetail, error) {
+	repo, err := reviewThreadRepo(a.config, input.Repo, input.CWD)
+	if err != nil {
+		return fixer.IssueDetail{}, err
+	}
+	detail, err := a.gateway.ViewIssue(ctx, githubinfra.ViewIssueInput{Repo: repo, IssueNumber: input.IssueNumber, CWD: input.CWD})
+	if err != nil {
+		return fixer.IssueDetail{}, err
+	}
+	return fixer.IssueDetail{Number: detail.Number, Title: detail.Title, Body: detail.Body, URL: detail.URL, State: detail.State, Labels: detail.Labels, Assignees: detail.Assignees}, nil
+}
+
+func (a fixerGitHubAdapter) ListIssueComments(ctx context.Context, input fixer.ViewIssueInput) ([]fixer.IssueComment, error) {
+	repo, err := reviewThreadRepo(a.config, input.Repo, input.CWD)
+	if err != nil {
+		return nil, err
+	}
+	comments, err := a.gateway.ListIssueComments(ctx, githubinfra.ViewIssueInput{Repo: repo, IssueNumber: input.IssueNumber, CWD: input.CWD})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]fixer.IssueComment, 0, len(comments))
+	for _, comment := range comments {
+		out = append(out, fixer.IssueComment{ID: comment.ID, Body: comment.Body})
+	}
+	return out, nil
+}
+
+func (a fixerGitHubAdapter) ClosePullRequest(ctx context.Context, input fixer.ClosePullRequestInput) error {
+	repo, err := reviewThreadRepo(a.config, input.Repo, input.CWD)
+	if err != nil {
+		return err
+	}
+	return a.gateway.ClosePullRequest(ctx, githubinfra.ClosePullRequestInput{Repo: repo, PRNumber: input.PRNumber, DeleteBranch: input.DeleteBranch, CWD: input.CWD})
+}
+
+func (a fixerGitHubAdapter) AddIssueLabels(ctx context.Context, input fixer.IssueLabelsInput) error {
+	repo, err := reviewThreadRepo(a.config, input.Repo, input.CWD)
+	if err != nil {
+		return err
+	}
+	return a.gateway.AddIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: repo, IssueNumber: input.IssueNumber, Labels: input.Labels, CWD: input.CWD})
+}
+
+func (a fixerGitHubAdapter) RemoveIssueLabels(ctx context.Context, input fixer.IssueLabelsInput) error {
+	repo, err := reviewThreadRepo(a.config, input.Repo, input.CWD)
+	if err != nil {
+		return err
+	}
+	return a.gateway.RemoveIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: repo, IssueNumber: input.IssueNumber, Labels: input.Labels, CWD: input.CWD})
+}
+
+func (a fixerGitHubAdapter) ListPullRequestCommits(ctx context.Context, input fixer.ViewPullRequestInput) ([]fixer.PullRequestCommit, error) {
+	repo, err := reviewThreadRepo(a.config, input.Repo, input.CWD)
+	if err != nil {
+		return nil, err
+	}
+	commits, err := a.gateway.ListPullRequestCommits(ctx, githubinfra.ListPullRequestCommitsInput{Repo: repo, PRNumber: input.PRNumber, CWD: input.CWD})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]fixer.PullRequestCommit, 0, len(commits))
+	for _, commit := range commits {
+		var author, committer string
+		if len(commit.Authors) > 0 {
+			author = commit.Authors[0]
+		}
+		if len(commit.Committers) > 0 {
+			committer = commit.Committers[0]
+		}
+		out = append(out, fixer.PullRequestCommit{SHA: commit.OID, AuthorLogin: author, CommitterLogin: committer})
+	}
+	return out, nil
+}
+
 func commentInfosToObjects(items []githubinfra.CommentInfo) []map[string]any {
 	out := make([]map[string]any, 0, len(items))
 	for _, item := range items {
@@ -1692,7 +1815,7 @@ func (f *schedulerNotificationGatewayFactory) New(options notify.Options) *notif
 	return notify.NewGateway(options)
 }
 
-func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *sync.RWMutex, configPath string, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error), allowClaim func() error, withAllowClaim func(fn func()) error) defaultSchedulerHandlers {
+func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *sync.RWMutex, configPath string, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error), allowClaim func() error, withAllowClaim func(fn func()) error, hostGate *hostAdmissionGate) defaultSchedulerHandlers {
 	if source == nil {
 		fail := func(context.Context, Services) error { return fmt.Errorf("project catalog is not configured") }
 		return defaultSchedulerHandlers{tick: fail, claim: fail}
@@ -1700,6 +1823,7 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *
 	claimMu := &sync.Mutex{}
 	notificationGateways := newSchedulerNotificationGatewayFactory()
 	coordinatorState := coordinatorrole.NewRuntimeState()
+	escalatorCadence := &schedulerEscalatorCadence{}
 	initialConfig := source.Snapshot()
 	if logger != nil {
 		if len(initialConfig.Projects) == 0 && !config.HasEffectiveValidationCommands(initialConfig) {
@@ -1719,7 +1843,7 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *
 	// transport continuity while retaining config-specific policy.
 	buildSnapshot := func() defaultSchedulerHandlers {
 		cfg := source.Snapshot()
-		return buildDefaultSchedulerHandlersWithOptions(cfg, configPath, logger, coordinator, repos, gitGateway, githubGateway, activeExecutions, asyncRunner, requestWake, now, reconcileStaleRuns, false, claimMu, nil, notificationGateways, coordinatorState)
+		return buildDefaultSchedulerHandlersWithOptions(cfg, configPath, logger, coordinator, repos, gitGateway, githubGateway, activeExecutions, asyncRunner, requestWake, now, reconcileStaleRuns, false, claimMu, nil, notificationGateways, coordinatorState, hostGate, escalatorCadence)
 	}
 	handlers := defaultSchedulerHandlers{
 		snapshot:             buildSnapshot,
@@ -1803,7 +1927,7 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *
 	return handlers
 }
 
-func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath string, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error), includeWebhook bool, claimMu *sync.Mutex, configSource projects.ConfigSource, notificationGateways *schedulerNotificationGatewayFactory, coordinatorState *coordinatorrole.RuntimeState) defaultSchedulerHandlers {
+func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath string, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error), includeWebhook bool, claimMu *sync.Mutex, configSource projects.ConfigSource, notificationGateways *schedulerNotificationGatewayFactory, coordinatorState *coordinatorrole.RuntimeState, hostGate *hostAdmissionGate, escalatorCadence *schedulerEscalatorCadence) defaultSchedulerHandlers {
 	if now == nil {
 		now = time.Now
 	}
@@ -1829,6 +1953,20 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		Repositories:  repos,
 		Now:           now,
 	})
+	var escalatorRunner escalatorScheduler
+	if cfg.Roles.Escalator.Enabled {
+		escalatorRunner = escalator.NewRunner(
+			escalator.NewCollector(repos, newRuntimeEscalatorLinker(cfg), escalator.CollectorOptions{
+				Now:                   now,
+				RetryAttemptThreshold: cfg.Roles.Escalator.RetryAttemptThreshold,
+				UnroutedAfter:         time.Duration(cfg.Roles.Escalator.UnroutedAfterSeconds) * time.Second,
+				StaleHeadAfter:        time.Duration(cfg.Roles.Escalator.StaleHeadAfterSeconds) * time.Second,
+			}),
+			notificationGateway,
+			repos,
+			escalator.RunnerOptions{Now: now, MaxItems: cfg.Roles.Escalator.MaxItems},
+		)
+	}
 	var gatekeeperRunner gatekeeperScheduler
 	if githubGateway != nil {
 		gatekeeperRunner = gatekeeper.New(gatekeeper.Options{
@@ -2167,6 +2305,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			AllowAutoApprove: cfg.Defaults.AllowAutoApprove,
 			ReviewEvents:     cfg.Roles.Reviewer.Behavior.ReviewEvents,
 			LoopConfig:       cfg.Roles.Reviewer.Behavior.Loop,
+			Convergence:      convergenceConfigValue(cfg.Roles.Reviewer.Behavior.Convergence),
 			DiscoveryPolicy: reviewer.DiscoveryPolicy{
 				AutoDiscovery:             reviewerAutoDiscovery,
 				IncludeDrafts:             reviewerRole.Discovery.IncludeDrafts,
@@ -2248,6 +2387,41 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			RetryMaxAttempts:            int64(cfg.Scheduler.RetryMaxAttempts),
 			MaxConsecutiveFixerFailures: cfg.Scheduler.ConsecutiveFailureThreshold,
 			OnQueueItemEnqueued:         requestWake,
+			DeleteBranchOnRegeneration: func(projectID string) bool {
+				effective := config.ProjectRoleConfigs(cfg, projectID).Fixer.Regeneration
+				return effective == nil || effective.DeleteBranch
+			},
+			RegenerationAvailability: func(_ string) string {
+				return fixerRegenerationUnavailableReason(cfg, plannerConfigured, plannerRoleRunner != nil)
+			},
+			OnRegenerateIssue: func(ctx context.Context, input fixer.RegenerateIssueInput) error {
+				if !plannerConfigured || plannerRoleRunner == nil {
+					return fmt.Errorf("planner agent is not configured for fixer regeneration")
+				}
+				issueRepo := firstNonEmpty(strings.TrimSpace(input.IssueRepo), strings.TrimSpace(input.Repo))
+				result, err := plannerRoleRunner.RouteIssue(ctx, planner.RouteIssueInput{
+					ProjectID: input.ProjectID,
+					Repo:      issueRepo,
+					Authority: input.Authority,
+					Issue: planner.IssueSummary{
+						Number: input.IssueNumber, Title: input.IssueTitle, Body: input.IssueBody, URL: input.IssueURL,
+						Labels: append([]string(nil), input.IssueLabels...), Assignees: append([]string(nil), input.IssueAssignees...), FailureContext: input.FailureContext,
+					},
+				})
+				if err != nil {
+					return err
+				}
+				if !result.ProjectionAccepted {
+					// Distinguish permanent projection rejection (skipped) from transient routing errors.
+					// When the planner skips the issue (e.g., archived project, held lane), this is a
+					// permanent condition that should escalate to human intervention rather than retry.
+					if result.Skipped > 0 {
+						return &fixer.RegenerationPermanentRejectionError{Reason: "planner route projection was permanently rejected (skipped)"}
+					}
+					return fmt.Errorf("planner route projection was not accepted")
+				}
+				return nil
+			},
 			OnAgentExecutionStarted: func(ctx context.Context, input fixer.AgentExecutionStartedInput) error {
 				return notifyAgentExecutionStarted(ctx, agentExecutionNotificationInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Title: "Looper Fixer", Subtitle: input.Subtitle, Body: input.Body, DedupeKey: input.DedupeKey})
 			},
@@ -2327,6 +2501,8 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		claimMu = &sync.Mutex{}
 	}
 
+	hostAdmission, hostAdmissionLog := hostAdmissionFor(cfg, hostGate)
+
 	inputForServices := func(services Services) defaultSchedulerTickInput {
 		var runner schedulerAsyncRunner
 		if asyncRunner != nil {
@@ -2345,11 +2521,15 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			Logger:               logger,
 			Now:                  now,
 			MaxConcurrentRuns:    cfg.Scheduler.MaxConcurrentRuns,
+			HostAdmission:        hostAdmission,
+			HostAdmissionLog:     hostAdmissionLog,
 			ClaimMu:              claimMu,
 			ReconcileStaleRuns:   reconcileStaleRuns,
 			AsyncRunner:          runner,
 			RequestSchedulerWake: requestWake,
 			Triager:              triagerRunner,
+			Escalator:            escalatorRunner,
+			EscalatorCadence:     escalatorCadence,
 			Planner:              plannerRunner,
 			Coordinator:          coordinatorRunner,
 			Reviewer:             reviewerRunner,
@@ -2430,6 +2610,21 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		})
 	}
 	return handlers
+}
+
+// fixerRegenerationUnavailableReason is checked before Fixer closes an
+// exhausted PR. A Planner that cannot publish (for example because
+// defaults.allowAutoPush is false) is not a safe regeneration target: closing
+// the implementation first would destroy the only runnable artifact and leave
+// the issue parked for manual work.
+func fixerRegenerationUnavailableReason(cfg config.Config, plannerConfigured, plannerAvailable bool) string {
+	if !plannerConfigured || !plannerAvailable {
+		return "Planner agent is not configured for fixer regeneration"
+	}
+	if !cfg.Defaults.AllowAutoPush {
+		return "Planner automatic publication is disabled (defaults.allowAutoPush=false)"
+	}
+	return ""
 }
 
 func githubCLIAutoPROpeningAvailable(ctx context.Context, cfg config.Config, githubGateway *githubinfra.Gateway, logger bootstrap.Logger, repo, cwd string) bool {
@@ -2633,6 +2828,17 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 				break
 			}
 			label := lane.laneLabel()
+			// Host pressure must gate discovery lanes, not only claims: the
+			// Coordinator lane starts agent processes directly during Discover
+			// (decide → ConfiguredExecutor.Start), bypassing the claim/slot
+			// chokepoint that executeClaimPhase guards. A hold here stops the
+			// lane before it can launch a new process on the pressured host.
+			if held := hostAdmissionHeld(input, label); held != nil {
+				if input.Logger != nil {
+					input.Logger.Debug("scheduler skipped discovery lane under host pressure", map[string]any{"lane": label, "projectId": project.ID, "repo": repo, "reasons": held.Reasons})
+				}
+				break
+			}
 			appendErr(runSchedulerLane(input, label, project.ID, repo, func() error {
 				items, err := lane.Discover(ctx, project.ID, repo, snapshot)
 				trackRunnableDiscovery(items)
@@ -2684,6 +2890,11 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 		runTelegramIntakePoll(ctx, input)
 	}
 
+	// Escalator is one global, read-only census across all active projects. It
+	// runs after per-project discovery so the digest sees this tick's durable
+	// state, but never claims or mutates workflow work.
+	appendErr(runEscalatorIfDue(ctx, input, now()))
+
 	claimedCount, availableSlots, err = executeClaimPhase(ctx, "post_discovery", input, discoveredRunnableIDs, true)
 	recordClaim(claimedCount, availableSlots, err)
 
@@ -2692,6 +2903,20 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 	}
 	retErr = errors.Join(errs...)
 	return retErr
+}
+
+func runEscalatorIfDue(ctx context.Context, input defaultSchedulerTickInput, runAt time.Time) error {
+	if input.Escalator == nil || input.EscalatorCadence == nil || input.Config == nil || !input.Config.Roles.Escalator.Enabled {
+		return nil
+	}
+	cadence := time.Duration(input.Config.Roles.Escalator.CadenceSeconds) * time.Second
+	runAt = runAt.UTC()
+	if !input.EscalatorCadence.start(runAt, cadence) {
+		return nil
+	}
+	_, err := input.Escalator.Run(ctx)
+	input.EscalatorCadence.finish(runAt, err == nil)
+	return err
 }
 
 // admissionRefuseWork rechecks the admission projection mid-tick. Nil AllowClaim
@@ -2801,18 +3026,35 @@ func runIndependentClaimPass(ctx context.Context, input defaultSchedulerTickInpu
 			return nil
 		}
 	}
-	_, catalogCurrent, err := schedulerProjectsForCapturedCatalog(ctx, input)
+	projectsList, catalogCurrent, err := schedulerProjectsForCapturedCatalog(ctx, input)
 	if err != nil || !catalogCurrent {
 		return err
+	}
+	input.CapturedProjects = projectsList
+	input.CapturedProjectsReady = true
+	if refresh := input.RefreshForClaim; refresh != nil {
+		// The live catalog path refreshes the runner/config snapshot while the
+		// claim boundary is held. Preserve the already-validated project table
+		// across that refresh so the quarantine scope does not re-read it.
+		input.RefreshForClaim = func() defaultSchedulerTickInput {
+			latest := refresh()
+			latest.CapturedProjects = projectsList
+			latest.CapturedProjectsReady = true
+			return latest
+		}
 	}
 	_, _, err = executeClaimPhase(ctx, "claim_pump", input, nil, false)
 	return err
 }
 
 func schedulerProjectsForCapturedCatalog(ctx context.Context, input defaultSchedulerTickInput) ([]storage.ProjectRecord, bool, error) {
-	projectsList, err := input.Repos.Projects.List(ctx)
-	if err != nil {
-		return nil, false, err
+	projectsList := input.CapturedProjects
+	if !input.CapturedProjectsReady {
+		var err error
+		projectsList, err = input.Repos.Projects.List(ctx)
+		if err != nil {
+			return nil, false, err
+		}
 	}
 	if input.Config == nil {
 		return projectsList, true, nil
@@ -2822,8 +3064,14 @@ func schedulerProjectsForCapturedCatalog(ctx context.Context, input defaultSched
 			continue
 		}
 		binding, ok := runtimeProjectBinding(*input.Config, project.ID)
-		codingPolicyRequired := config.CodingRoleAgentConfigured(*input.Config, config.CodingRoleWorker) || config.CodingRoleAgentConfigured(*input.Config, config.CodingRoleFixer)
-		if !ok && codingPolicyRequired && projects.IsLegacyInertProject(project) && len(config.ResolveValidationCommands(*input.Config)) == 0 {
+		// validateCatalogValidationPolicies quarantines an unstanced legacy
+		// project whenever defaults.validationCommands is empty, independently
+		// of whether a coding agent is configured. The missing catalog binding
+		// is therefore intentional in the agentless case too; recognizing only
+		// the coding-policy-required case would report the catalog as stale and
+		// block every claim pass — including durable sticky Worker/Fixer retries
+		// — until the legacy record is repaired.
+		if !ok && projects.IsLegacyInertProject(project) && len(config.ResolveValidationCommands(*input.Config)) == 0 {
 			continue
 		}
 		if !ok || !catalogBindingMatchesProject(binding, project) {
@@ -2860,6 +3108,23 @@ func executeClaimPhase(ctx context.Context, phase string, input defaultScheduler
 		logClaimPhase(input.Logger, phase, 0, 0, time.Since(start), err)
 		return 0, 0, err
 	}
+	// Host pressure withholds slots rather than stopping anything: claims below
+	// this point start new agent processes, and everything already running is
+	// untouched. Killing in-flight work to relieve pressure would discard its
+	// progress and leave exactly the orphaned executions and quarantine debt
+	// that recovery then has to reconcile — paying for capacity with debt.
+	// The hold warning is throttled to one entry per decision transition and
+	// per fresh sample: the claim pass runs several times per second, and a
+	// sustained hold (even on an empty queue) would otherwise churn the log on
+	// every call and consume the disk the guard protects.
+	if availableSlots > 0 && input.HostAdmission != nil {
+		if held := input.HostAdmission(); held != nil && !held.Admit {
+			if input.HostAdmissionLog == nil || input.HostAdmissionLog(held) {
+				logHostAdmissionHold(input.Logger, phase, availableSlots, *held)
+			}
+			return 0, 0, nil
+		}
+	}
 	claimedItems := make([]storage.QueueItemRecord, 0)
 	if availableSlots > 0 && input.Repos != nil && input.Repos.Queue != nil {
 		claimedItems, err = claimAndRunScheduledQueueItems(ctx, availableSlots, input)
@@ -2872,6 +3137,62 @@ func executeClaimPhase(ctx context.Context, phase string, input defaultScheduler
 		logClaimPhase(input.Logger, phase, availableSlots, claimedCount, time.Since(start), err)
 	}
 	return claimedCount, availableSlots, err
+}
+
+// hostAdmissionFor binds the shared gate to this snapshot's thresholds, so a
+// config reload changes the gate on the next tick without restarting anything.
+// The second return value throttles hold logging to one entry per decision
+// transition and per fresh sample, so a sustained hold does not churn the log
+// on every claim pass.
+func hostAdmissionFor(cfg config.Config, gate *hostAdmissionGate) (func() *hostresources.Decision, func(*hostresources.Decision) bool) {
+	if gate == nil {
+		return nil, nil
+	}
+	guard := cfg.Daemon.ResourceGuard
+	decide := func() *hostresources.Decision { return gate.Decide(guard) }
+	report := func(decision *hostresources.Decision) bool { return gate.ShouldLogHold(decision) }
+	return decide, report
+}
+
+// logHostAdmissionHold names the tripped signal and the slots it withheld. A
+// hold that only showed up as an idle queue would be indistinguishable from
+// having no work, which is the failure mode this log exists to prevent.
+func logHostAdmissionHold(logger bootstrap.Logger, phase string, withheldSlots int, decision hostresources.Decision) {
+	if logger == nil {
+		return
+	}
+	logger.Warn("looperd withheld scheduler slots under host pressure", map[string]any{
+		"phase":         phase,
+		"withheldSlots": withheldSlots,
+		"reasons":       decision.Reasons,
+		"detail":        decision.Summary(),
+	})
+}
+
+// hostAdmissionHeld returns a non-nil, non-admitting Decision when host pressure
+// refuses new work, logging the hold through the throttle so a sustained
+// condition surfaces once per transition/sample rather than on every lane. Nil
+// means admit or no opinion — proceed.
+//
+// The discovery lanes call this before Discover because the Coordinator lane
+// starts agent processes directly during discovery (decide →
+// ConfiguredExecutor.Start), bypassing the claim/slot chokepoint that
+// executeClaimPhase guards. A hold that only withholds claims while discovery
+// keeps launching defeats the guard: pressure on the host is the same whether
+// the new process comes from a queue claim or a Coordinator decide, so the hold
+// must stop both.
+func hostAdmissionHeld(input defaultSchedulerTickInput, phase string) *hostresources.Decision {
+	if input.HostAdmission == nil {
+		return nil
+	}
+	held := input.HostAdmission()
+	if held == nil || held.Admit {
+		return nil
+	}
+	if input.HostAdmissionLog == nil || input.HostAdmissionLog(held) {
+		logHostAdmissionHold(input.Logger, phase, 0, *held)
+	}
+	return held
 }
 
 func logClaimPhase(logger bootstrap.Logger, phase string, availableSlots, claimedCount int, duration time.Duration, err error) {
@@ -3112,11 +3433,15 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 		return claimContinue, nil
 	}
 
-	projectScopedTypes, runnableProjectIDs := codingClaimProjectScope(input.Config)
+	quarantinedIDs, err := quarantinedProjectIDsForClaim(ctx, input)
+	if err != nil {
+		return queueItems, dispatchOwnedQueueClaims(ctx, owned, input, err)
+	}
+	projectScopedTypes, runnableProjectIDs, stickyOnlyProjectIDs := codingClaimProjectScope(input.Config, quarantinedIDs)
 	stopClaiming := false
 	for i := 0; i < availableSlots; i++ {
 		result, err := claimOne(func(ctx context.Context, nowISO, claimedBy string) (*storage.QueueItemRecord, error) {
-			return input.Repos.Queue.ClaimNextNonLongTermRetryAmongTypeSetsForProjects(ctx, nowISO, claimedBy, unrestrictedTypes, stickySnapshotTypes, projectScopedTypes, runnableProjectIDs)
+			return input.Repos.Queue.ClaimNextNonLongTermRetryAmongTypeSetsForProjects(ctx, nowISO, claimedBy, unrestrictedTypes, stickySnapshotTypes, projectScopedTypes, runnableProjectIDs, stickyOnlyProjectIDs)
 		})
 		if err != nil {
 			return queueItems, dispatchOwnedQueueClaims(ctx, owned, input, err)
@@ -3131,7 +3456,7 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 	}
 	for !stopClaiming && len(queueItems) < availableSlots {
 		result, err := claimOne(func(ctx context.Context, nowISO, claimedBy string) (*storage.QueueItemRecord, error) {
-			return input.Repos.Queue.ClaimNextLongTermRetryAmongTypeSetsForProjects(ctx, nowISO, claimedBy, unrestrictedTypes, stickySnapshotTypes, projectScopedTypes, runnableProjectIDs)
+			return input.Repos.Queue.ClaimNextLongTermRetryAmongTypeSetsForProjects(ctx, nowISO, claimedBy, unrestrictedTypes, stickySnapshotTypes, projectScopedTypes, runnableProjectIDs, stickyOnlyProjectIDs)
 		})
 		if err != nil {
 			return queueItems, dispatchOwnedQueueClaims(ctx, owned, input, err)
@@ -3143,15 +3468,53 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 	return queueItems, dispatchOwnedQueueClaims(ctx, owned, input, nil)
 }
 
-func codingClaimProjectScope(cfg *config.Config) ([]string, []string) {
+func codingClaimProjectScope(cfg *config.Config, quarantinedProjectIDs []string) (projectScopedTypes, runnableProjectIDs, stickyOnlyProjectIDs []string) {
 	if cfg == nil {
-		return nil, nil
+		return nil, nil, nil
 	}
 	projectIDs := make([]string, 0, len(cfg.Projects))
 	for _, project := range cfg.Projects {
 		projectIDs = append(projectIDs, project.ID)
 	}
-	return []string{"fixer", "worker"}, projectIDs
+	return []string{"fixer", "worker"}, projectIDs, quarantinedProjectIDs
+}
+
+// quarantinedProjectIDsForClaim returns the IDs of unstanced legacy projects
+// that validateCatalogValidationPolicies removed from the runtime catalog
+// because defaults.validationCommands is empty and they carry no validation
+// stance. The scheduler keeps these IDs in the claim scope for sticky-only
+// retries (the latest run is failed/interrupted with a recorded agent snapshot)
+// without admitting fresh work, mirroring the agent-independent quarantine
+// predicate in schedulerProjectsForCapturedCatalog so the catalog-to-claim
+// contract is covered end to end.
+func quarantinedProjectIDsForClaim(ctx context.Context, input defaultSchedulerTickInput) ([]string, error) {
+	if input.Config == nil || input.Repos == nil || input.Repos.Projects == nil {
+		return nil, nil
+	}
+	if len(config.ResolveValidationCommands(*input.Config)) > 0 {
+		return nil, nil
+	}
+	projectsList := input.CapturedProjects
+	if !input.CapturedProjectsReady {
+		var err error
+		projectsList, err = input.Repos.Projects.List(ctx)
+		if err != nil {
+			return nil, err
+		}
+	}
+	ids := make([]string, 0)
+	for _, project := range projectsList {
+		if project.Archived {
+			continue
+		}
+		if _, ok := runtimeProjectBinding(*input.Config, project.ID); ok {
+			continue
+		}
+		if projects.IsLegacyInertProject(project) {
+			ids = append(ids, project.ID)
+		}
+	}
+	return ids, nil
 }
 
 // claimErrorIsAmbiguousCancel reports whether a ClaimNext* error may have
@@ -3769,6 +4132,13 @@ func runtimeFirstNonEmpty(values ...string) string {
 
 func boolPtr(value bool) *bool {
 	return &value
+}
+
+func convergenceConfigValue(value *config.ReviewerConvergenceConfig) config.ReviewerConvergenceConfig {
+	if value == nil {
+		return config.ReviewerConvergenceConfig{}
+	}
+	return *value
 }
 
 func summarizeCheckStates(checks []map[string]any) string {

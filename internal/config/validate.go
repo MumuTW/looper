@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"net/url"
 	"os"
@@ -61,6 +62,7 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 	if config.Roles.Reviewer.Behavior.Loop.MinPublishIntervalSeconds < 0 {
 		issues = append(issues, ValidationIssue{Path: "roles.reviewer.behavior.loop.minPublishIntervalSeconds", Message: "must be an integer >= 0"})
 	}
+	validateReviewerConvergence(config.Roles.Reviewer.Behavior.Convergence, "roles.reviewer.behavior.convergence", &issues)
 	if config.Roles.Reviewer.Behavior.Retry.AutoRecoveryMaxAttempts < 1 {
 		issues = append(issues, ValidationIssue{Path: "roles.reviewer.behavior.retry.autoRecoveryMaxAttempts", Message: "must be a positive integer"})
 	}
@@ -268,6 +270,7 @@ func validateCoreConfig(config Config, issues *[]ValidationIssue) {
 	validateGatekeeperRoleConfig(config.Roles.Gatekeeper, "roles.gatekeeper", config.Roles.Reviewer.AutoMerge.Enabled, issues)
 	validateAuditorRoleConfig(config.Roles.Auditor, "roles.auditor", issues)
 	validateDeployerRoleConfig(config.Roles.Deployer, "roles.deployer", issues)
+	validateEscalatorRoleConfig(config.Roles.Escalator, "roles.escalator", issues)
 	for i, project := range config.Projects {
 		if project.Roles == nil || project.Roles.Deployer == nil {
 			continue
@@ -309,6 +312,24 @@ func validateCoreConfig(config Config, issues *[]ValidationIssue) {
 	validateIntakeConfig(config, issues)
 	validateDaemonConfig(config.Daemon, issues)
 	validatePackageAndDefaultsConfig(config, issues)
+}
+
+func validateEscalatorRoleConfig(role EscalatorRoleConfig, path string, issues *[]ValidationIssue) {
+	if role.CadenceSeconds < 60 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".cadenceSeconds", Message: "must be an integer >= 60"})
+	}
+	if role.RetryAttemptThreshold < 1 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".retryAttemptThreshold", Message: "must be an integer >= 1"})
+	}
+	if role.UnroutedAfterSeconds < 60 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".unroutedAfterSeconds", Message: "must be an integer >= 60"})
+	}
+	if role.StaleHeadAfterSeconds < 60 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".staleHeadAfterSeconds", Message: "must be an integer >= 60"})
+	}
+	if role.MaxItems < 1 || role.MaxItems > 5000 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".maxItems", Message: "must be an integer between 1 and 5000"})
+	}
 }
 
 func validateAuditorRoleConfig(auditor AuditorRoleConfig, path string, issues *[]ValidationIssue) {
@@ -601,6 +622,7 @@ func validateDaemonConfig(daemon DaemonConfig, issues *[]ValidationIssue) {
 		*issues = append(*issues, ValidationIssue{Path: "daemon.workingDirectory", Message: "must be a non-empty path"})
 	}
 	validateWorktreeCleanupConfig(daemon.WorktreeCleanup, "daemon.worktreeCleanup", issues)
+	validateResourceGuardConfig(daemon.ResourceGuard, "daemon.resourceGuard", issues)
 }
 
 // ValidateProjectValidationPolicies is the startup/catalog/reload gate. Generic
@@ -981,6 +1003,31 @@ func validateWebhookTunnelConfig(config WebhookConfig, path string, issues *[]Va
 	}
 }
 
+// validateResourceGuardConfig rejects thresholds that would refuse all work.
+// A percentage at or above 100 admits nothing, and a negative threshold is
+// meaningless; both would halt the scheduler with no obvious cause. Non-finite
+// values (NaN, Inf) are rejected explicitly: every range check below is a
+// strict comparison that is false for NaN, so validation would otherwise accept
+// it, the guard would silently skip the check (NaN > 0 is false), and JSON
+// projections such as /config cannot encode the value.
+func validateResourceGuardConfig(config ResourceGuardConfig, path string, issues *[]ValidationIssue) {
+	if math.IsNaN(config.MinDiskFreePercent) || math.IsInf(config.MinDiskFreePercent, 0) {
+		*issues = append(*issues, ValidationIssue{Path: path + ".minDiskFreePercent", Message: "must be a finite number in [0, 100)"})
+	} else if config.MinDiskFreePercent < 0 || config.MinDiskFreePercent >= 100 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".minDiskFreePercent", Message: "must be a number in [0, 100)"})
+	}
+	if math.IsNaN(config.MinDiskFreeGB) || math.IsInf(config.MinDiskFreeGB, 0) {
+		*issues = append(*issues, ValidationIssue{Path: path + ".minDiskFreeGb", Message: "must be a finite number >= 0"})
+	} else if config.MinDiskFreeGB < 0 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".minDiskFreeGb", Message: "must be a number >= 0"})
+	}
+	if math.IsNaN(config.MaxLoadPerCPU) || math.IsInf(config.MaxLoadPerCPU, 0) {
+		*issues = append(*issues, ValidationIssue{Path: path + ".maxLoadPerCpu", Message: "must be a finite number >= 0"})
+	} else if config.MaxLoadPerCPU < 0 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".maxLoadPerCpu", Message: "must be a number >= 0"})
+	}
+}
+
 func validateWorktreeCleanupConfig(config WorktreeCleanupConfig, path string, issues *[]ValidationIssue) {
 	if strings.TrimSpace(config.Interval) == "" {
 		*issues = append(*issues, ValidationIssue{Path: path + ".interval", Message: "must be a non-empty duration string"})
@@ -1068,6 +1115,11 @@ func validateProjectRoleOverrides(roles *PartialRoleConfigs, prefix string, maxI
 	}
 	if roles.Reviewer != nil {
 		validateProjectRoleInstruction(prefix+".reviewer.instructions", "reviewer", roles.Reviewer.Instructions, maxInstructionBytes, issues)
+		if roles.Reviewer.Behavior != nil && roles.Reviewer.Behavior.Convergence != nil {
+			candidate := DefaultReviewerConvergenceConfig()
+			mergeReviewerConvergenceConfig(&candidate, *roles.Reviewer.Behavior.Convergence)
+			validateReviewerConvergence(&candidate, prefix+".reviewer.behavior.convergence", issues)
+		}
 		if roles.Reviewer.Discovery != nil {
 			if roles.Reviewer.Discovery.Triggers != nil {
 				validateReviewerRoleTriggers(partialReviewerRoleTriggers(*roles.Reviewer.Discovery.Triggers), prefix+".reviewer.discovery.triggers", issues)
@@ -1102,6 +1154,9 @@ func validateProjectRoleOverrides(roles *PartialRoleConfigs, prefix string, maxI
 		if roles.Coordinator.PollInterval != nil && strings.TrimSpace(*roles.Coordinator.PollInterval) == "" {
 			*issues = append(*issues, ValidationIssue{Path: prefix + ".coordinator.pollInterval", Message: "must be a non-empty duration string"})
 		}
+		if roles.Coordinator.MarkReady != nil {
+			validatePartialCoordinatorMarkReady(*roles.Coordinator.MarkReady, prefix+".coordinator.markReady", issues)
+		}
 	}
 }
 
@@ -1114,6 +1169,26 @@ func validatePlannerEscalation(escalation *PlannerEscalationConfig, path string,
 	}
 	if escalation.MaxEstimatedPackages < 0 {
 		*issues = append(*issues, ValidationIssue{Path: path + ".maxEstimatedPackages", Message: "must be an integer >= 0"})
+	}
+}
+
+func validateReviewerConvergence(convergence *ReviewerConvergenceConfig, path string, issues *[]ValidationIssue) {
+	if convergence == nil {
+		return
+	}
+	if convergence.MaxConsecutiveUnproductive < 1 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".maxConsecutiveUnproductive", Message: "must be a positive integer"})
+	}
+	if convergence.MaxFixerAttemptsPerItem < 1 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".maxFixerAttemptsPerItem", Message: "must be a positive integer"})
+	}
+	if convergence.MaxTotalRounds < 1 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".maxTotalRounds", Message: "must be a positive integer"})
+	}
+	switch convergence.SeverityFloor {
+	case ReviewerSeverityFloorBlocking, ReviewerSeverityFloorNonBlocking, ReviewerSeverityFloorAll:
+	default:
+		*issues = append(*issues, ValidationIssue{Path: path + ".severityFloor", Message: fmt.Sprintf("must be one of: %s, %s, %s", ReviewerSeverityFloorBlocking, ReviewerSeverityFloorNonBlocking, ReviewerSeverityFloorAll)})
 	}
 }
 
@@ -1557,6 +1632,12 @@ func validatePartialReviewerAutoMerge(partial PartialReviewerAutoMergeConfig, pa
 	}
 }
 
+func validatePartialCoordinatorMarkReady(partial PartialCoordinatorMarkReadyConfig, path string, issues *[]ValidationIssue) {
+	if partial.Scope != nil && *partial.Scope != CoordinatorMarkReadyScopeLooperOnly {
+		*issues = append(*issues, ValidationIssue{Path: path + ".scope", Message: fmt.Sprintf("must be %s", CoordinatorMarkReadyScopeLooperOnly)})
+	}
+}
+
 func validateIssueRoleTriggers(triggers IssueRoleTriggersConfig, path string, issues *[]ValidationIssue) {
 	validateLabelTriggers(triggers.Labels, triggers.LabelMode, path, issues)
 }
@@ -1634,6 +1715,9 @@ func validateCoordinatorRoleConfig(config CoordinatorRoleConfig, path string, is
 		*issues = append(*issues, ValidationIssue{Path: path + ".mergeWatch.maxIndeterminateDuration", Message: "must be a valid time.Duration string"})
 	} else if duration <= 0 {
 		*issues = append(*issues, ValidationIssue{Path: path + ".mergeWatch.maxIndeterminateDuration", Message: "must be greater than 0"})
+	}
+	if config.MarkReady.Scope != CoordinatorMarkReadyScopeLooperOnly {
+		*issues = append(*issues, ValidationIssue{Path: path + ".markReady.scope", Message: fmt.Sprintf("must be %s", CoordinatorMarkReadyScopeLooperOnly)})
 	}
 	validateDistinctLabels([]labelPathValue{
 		{Path: path + ".triage.triagedLabel", Value: config.Triage.TriagedLabel},

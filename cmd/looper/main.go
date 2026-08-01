@@ -35,6 +35,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/MumuTW/looper/internal/agentdiscovery"
 	"github.com/MumuTW/looper/internal/config"
 	"github.com/MumuTW/looper/internal/version"
 )
@@ -118,6 +119,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return reportError(stderr, runDashboard(ctx, parsed.Global, parsed.Operands, stdout))
 	case "project":
 		return reportError(stderr, runProject(ctx, parsed.Global, parsed.Operands, stdout))
+	case "provider":
+		return reportError(stderr, runProvider(ctx, parsed.Global, parsed.Operands, stdout))
 	}
 
 	request, err := routeForVerb(parsed.Verb, parsed.Operands)
@@ -278,7 +281,7 @@ func splitGlobalFlags(args []string) (parsedArgs, error) {
 			parsed.Verb = arg
 			continue
 		}
-		if strings.HasPrefix(arg, "-") && arg != "-" && parsed.Verb != "review" && parsed.Verb != "retry" && parsed.Verb != "version" && parsed.Verb != "--version" {
+		if strings.HasPrefix(arg, "-") && arg != "-" && parsed.Verb != "review" && parsed.Verb != "retry" && parsed.Verb != "version" && parsed.Verb != "--version" && parsed.Verb != "provider" {
 			return parsedArgs{}, fmt.Errorf("unknown flag %q", name)
 		}
 		if parsed.Verb == "" {
@@ -455,6 +458,90 @@ func applyEndpointOverrides(cfg config.Config, global []string) config.Config {
 	value := base.String()
 	cfg.Server.BaseURL = &value
 	return cfg
+}
+
+// --- provider discovery ----------------------------------------------------
+
+type providerConfigPatch struct {
+	Revision string                     `json:"revision"`
+	Set      map[string]json.RawMessage `json:"set"`
+	Unset    []string                   `json:"unset"`
+}
+
+func runProvider(ctx context.Context, global, operands []string, stdout io.Writer) error {
+	if len(operands) == 0 || operands[0] != "discover" {
+		return badUsage("provider requires discover")
+	}
+	apply := false
+	confirm := false
+	for _, operand := range operands[1:] {
+		switch operand {
+		case "--apply":
+			apply = true
+		case "--confirm":
+			confirm = true
+		default:
+			return badUsage("provider discover accepts only --apply and --confirm")
+		}
+	}
+	if confirm && !apply {
+		return badUsage("provider discover --confirm requires --apply")
+	}
+
+	cfg, err := loadConfig(global)
+	if err != nil {
+		return err
+	}
+	report, err := requestJSON[agentdiscovery.Report](ctx, cfg, http.MethodGet, "/api/v1/agent/providers/discovery", nil)
+	if err != nil {
+		return err
+	}
+	for _, candidate := range report.Candidates {
+		line := fmt.Sprintf("%s: %s", candidate.Vendor, candidate.Status)
+		if candidate.Executable != "" {
+			line += " path=" + candidate.Executable
+		}
+		if candidate.Version != "" {
+			line += " version=" + strconv.Quote(candidate.Version)
+		}
+		if candidate.Diagnostic != "" {
+			line += " (" + singleLine(candidate.Diagnostic) + ")"
+		}
+		_, _ = fmt.Fprintln(stdout, line)
+	}
+	if report.Suggestion == nil || len(report.Suggestion.Set) == 0 {
+		_, _ = fmt.Fprintln(stdout, "suggestion: none")
+		return nil
+	}
+	suggestionJSON, err := json.Marshal(report.Suggestion)
+	if err != nil {
+		return fmt.Errorf("encode provider suggestion: %w", err)
+	}
+	_, _ = fmt.Fprintf(stdout, "suggestion: %s\n", suggestionJSON)
+	if !apply {
+		_, _ = fmt.Fprintln(stdout, "not applied; review the suggestion and rerun with --apply --confirm")
+		return nil
+	}
+	if !confirm {
+		_, _ = fmt.Fprintln(stdout, "not applied; --confirm is required after reviewing the suggestion")
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("provider discovery cancelled before apply: %w", err)
+	}
+	if strings.TrimSpace(report.ConfigRevision) == "" {
+		return fmt.Errorf("provider discovery response carried no config revision; refusing mutation")
+	}
+	patch := providerConfigPatch{Revision: report.ConfigRevision, Set: report.Suggestion.Set, Unset: []string{}}
+	body, err := json.Marshal(patch)
+	if err != nil {
+		return fmt.Errorf("encode provider config patch: %w", err)
+	}
+	if _, err := doHTTP(ctx, cfg, http.MethodPatch, "/api/v1/config", body); err != nil {
+		return err
+	}
+	_, _ = fmt.Fprintln(stdout, "applied the reviewed provider suggestion")
+	return nil
 }
 
 // --- init ------------------------------------------------------------------
@@ -900,8 +987,9 @@ type healthResponse struct {
 // daemonStatusResponse is the subset of GET /api/v1/status that `looper status`
 // prints for ops readiness. Unknown fields are ignored.
 type daemonStatusResponse struct {
-	Service statusServiceView `json:"service"`
-	Tools   statusToolsView   `json:"tools"`
+	Service       statusServiceView       `json:"service"`
+	Tools         statusToolsView         `json:"tools"`
+	ResourceGuard statusResourceGuardView `json:"resourceGuard"`
 }
 
 type statusServiceView struct {
@@ -966,6 +1054,17 @@ type statusReviewPublishView struct {
 	Capability         string `json:"capability"`
 	PublishingDisabled bool   `json:"publishingDisabled"`
 	Reason             string `json:"reason"`
+}
+
+// statusResourceGuardView is the resource-guard slice of GET /api/v1/status.
+// The daemon publishes the structured admission decision so a deliberately idle
+// scheduler is distinguishable from an empty queue; `looper status` prints the
+// hold so an operator sees why no new work is starting.
+type statusResourceGuardView struct {
+	Enabled bool     `json:"enabled"`
+	Admit   bool     `json:"admit"`
+	Reasons []string `json:"reasons"`
+	Detail  string   `json:"detail"`
 }
 
 func writeStatusOpsLines(stdout io.Writer, status daemonStatusResponse) {
@@ -1036,6 +1135,22 @@ func writeStatusOpsLines(stdout io.Writer, status daemonStatusResponse) {
 	}
 	if len(status.Service.DegradedReasons) > 0 {
 		_, _ = fmt.Fprintf(stdout, "degraded: %s\n", strings.Join(status.Service.DegradedReasons, ", "))
+	}
+
+	// A resource-guard hold explains why the scheduler is deliberately idle:
+	// under low disk or high load the daemon withholds slots, and without this
+	// line a guarded daemon and an idle one look identical from `looper status`.
+	// Only a holding guard prints; an admitting or disabled one is not an
+	// anomaly worth a line.
+	if guard := status.ResourceGuard; guard.Enabled && !guard.Admit {
+		detail := strings.TrimSpace(guard.Detail)
+		if detail == "" {
+			detail = strings.Join(guard.Reasons, ", ")
+		}
+		if detail == "" {
+			detail = "host pressure"
+		}
+		_, _ = fmt.Fprintf(stdout, "resources: scheduler held (%s)\n", singleLine(detail))
 	}
 }
 

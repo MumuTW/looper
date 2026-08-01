@@ -59,6 +59,7 @@ const (
 	ReasonReviewChangesRequested   ReasonCode = "review_changes_requested"
 	ReasonCodexReviewMissing       ReasonCode = "codex_review_missing"
 	ReasonUnresolvedReviewThread   ReasonCode = "unresolved_review_thread"
+	ReasonReviewerConvergence      ReasonCode = "reviewer_convergence_blocked"
 	ReasonProjectPolicyDenied      ReasonCode = "project_policy_denied"
 	ReasonHold                     ReasonCode = "hold"
 	ReasonDiffBudgetExceeded       ReasonCode = "diff_budget_exceeded"
@@ -105,21 +106,22 @@ type CodexReviewEvidence struct {
 }
 
 type Evidence struct {
-	PullRequestState             string               `json:"pullRequestState,omitempty"`
-	Draft                        bool                 `json:"draft"`
-	BaseRefName                  string               `json:"baseRefName,omitempty"`
-	Mergeable                    *bool                `json:"mergeable,omitempty"`
-	MergeableState               string               `json:"mergeableState,omitempty"`
-	RequiredChecks               []string             `json:"requiredChecks"`
-	Checks                       []CheckEvidence      `json:"checks"`
-	RequiredApprovingReviewCount int                  `json:"requiredApprovingReviewCount"`
-	ReviewDecision               string               `json:"reviewDecision,omitempty"`
-	CodexReview                  *CodexReviewEvidence `json:"codexReview,omitempty"`
-	UnresolvedReviewThreadIDs    []string             `json:"unresolvedReviewThreadIds"`
-	HoldLabels                   []string             `json:"holdLabels"`
-	DiffBudget                   *DiffBudgetEvidence  `json:"diffBudget,omitempty"`
-	ProjectPolicyPermitsTarget   bool                 `json:"projectPolicyPermitsTarget"`
-	FinalObservedHeadSHA         string               `json:"finalObservedHeadSha,omitempty"`
+	PullRequestState             string                       `json:"pullRequestState,omitempty"`
+	Draft                        bool                         `json:"draft"`
+	BaseRefName                  string                       `json:"baseRefName,omitempty"`
+	Mergeable                    *bool                        `json:"mergeable,omitempty"`
+	MergeableState               string                       `json:"mergeableState,omitempty"`
+	RequiredChecks               []string                     `json:"requiredChecks"`
+	Checks                       []CheckEvidence              `json:"checks"`
+	RequiredApprovingReviewCount int                          `json:"requiredApprovingReviewCount"`
+	ReviewDecision               string                       `json:"reviewDecision,omitempty"`
+	CodexReview                  *CodexReviewEvidence         `json:"codexReview,omitempty"`
+	UnresolvedReviewThreadIDs    []string                     `json:"unresolvedReviewThreadIds"`
+	HoldLabels                   []string                     `json:"holdLabels"`
+	DiffBudget                   *DiffBudgetEvidence          `json:"diffBudget,omitempty"`
+	ReviewerConvergence          *ReviewerConvergenceEvidence `json:"reviewerConvergence,omitempty"`
+	ProjectPolicyPermitsTarget   bool                         `json:"projectPolicyPermitsTarget"`
+	FinalObservedHeadSHA         string                       `json:"finalObservedHeadSha,omitempty"`
 }
 
 type Report struct {
@@ -277,6 +279,15 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
+	// Convergence state is durable Reviewer metadata in SQLite, so a blocked
+	// report can be reused unless that metadata advanced. Reading the current
+	// convergence revision per pull request in one local query lets the
+	// unchanged path detect Reviewer progress without re-polling the forge on
+	// every tick.
+	convergenceRevisions, err := latestConvergenceRevisions(ctx, r.repos, input.ProjectID)
+	if err != nil {
+		return DiscoveryResult{}, err
+	}
 	result := DiscoveryResult{Reports: make([]Report, 0, len(pullRequests))}
 	var evaluationErrs []error
 	for _, pullRequest := range pullRequests {
@@ -293,7 +304,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 				reviewEvidenceAppeared = true
 			}
 		}
-		if reused, ok := skipUnchanged(previous, hasPrevious, fingerprint, r.trustFor(input.ProjectID), r.now(), reviewEvidenceAppeared); ok {
+		if reused, ok := skipUnchanged(previous, hasPrevious, fingerprint, r.trustFor(input.ProjectID), r.now(), convergenceRevisions[entityID], reviewEvidenceAppeared); ok {
 			result.Skipped++
 			result.Reports = append(result.Reports, reused)
 			continue
@@ -534,6 +545,17 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 		}
 	}
 	sort.Strings(report.Evidence.UnresolvedReviewThreadIDs)
+
+	convergenceEvidence, hasConvergence, err := latestReviewerConvergence(ctx, r.repos, input.ProjectID, input.Repo, input.PRNumber, report.ObservedHeadSHA)
+	if err != nil {
+		return r.persistProviderBlock(ctx, report, ReasonProviderStateUnavailable, "reviewer_convergence")
+	}
+	if hasConvergence {
+		report.Evidence.ReviewerConvergence = &convergenceEvidence
+		if reviewerConvergenceBlocks(convergenceEvidence) {
+			report.Reasons = append(report.Reasons, Reason{Code: ReasonReviewerConvergence, Subject: reviewerConvergenceReasonSubject(convergenceEvidence)})
+		}
+	}
 
 	// The final revalidation read confirms the head has not moved between the
 	// evaluation and persistence. When the diff budget is enabled it also

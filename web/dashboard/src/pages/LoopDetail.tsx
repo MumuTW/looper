@@ -23,6 +23,7 @@ import {
   type Loop,
   type LoopLogsChunk,
   type LoopLogsSnapshot,
+  type ReviewerConvergence,
 } from "@/lib/api";
 import { useDashboardData } from "@/lib/DashboardDataContext";
 import { formatAttempts, formatTs } from "@/lib/format";
@@ -68,6 +69,111 @@ function Kv({ label, value }: { label: string; value: ReactNode }) {
       <dt className="text-[var(--text-muted)]">{label}</dt>
       <dd className="m-0 break-all mono">{value}</dd>
     </div>
+  );
+}
+
+// severityFloorIncludes mirrors convergence.Policy.Includes on the runtime
+// side: an item counts toward convergence progress only when its severity is
+// at or above the configured floor. Keeping this in sync prevents the card
+// from listing below-floor items as open while the projection reports
+// completion.
+function severityFloorIncludes(
+  floor: string | null | undefined,
+  severity: string | null | undefined,
+): boolean {
+  switch (floor) {
+    case "blocking":
+      return severity === "blocking";
+    case "non_blocking":
+      return severity === "blocking" || severity === "non_blocking";
+    case "all":
+      return (
+        severity === "blocking" ||
+        severity === "non_blocking" ||
+        severity === "nit"
+      );
+    default:
+      return false;
+  }
+}
+
+function ReviewerConvergenceCard({
+  convergence,
+}: {
+  convergence: ReviewerConvergence;
+}) {
+  const items = Object.values(convergence.state.items ?? {}).sort((a, b) =>
+    a.id.localeCompare(b.id),
+  );
+  // Mirror convergence.Policy.Includes: an item below the severity floor is
+  // non-blocking to progress even when still open, so listing it alongside
+  // floor-scoped open work would let the card report completion and apparent
+  // open convergence work at the same time.
+  const openItems = items.filter(
+    (item) =>
+      item.status === "open" &&
+      !item.stuck &&
+      severityFloorIncludes(convergence.policy.severityFloor, item.severity),
+  );
+  const recentHistory = (convergence.state.history ?? []).slice(-8);
+
+  return (
+    <Card title="Reviewer convergence">
+      <dl className="m-0 columns-1 gap-x-6 md:columns-2">
+        <Kv label="Status" value={convergence.status ?? "active"} />
+        <Kv label="Action" value={convergence.action ?? "—"} />
+        <Kv label="Reason" value={convergence.reason ?? "—"} />
+        <Kv
+          label="Rounds"
+          value={`${convergence.state.totalRounds} / ${convergence.policy.maxTotalRounds}`}
+        />
+        <Kv
+          label="Unproductive"
+          value={`${convergence.state.consecutiveUnproductive} / ${convergence.policy.maxConsecutiveUnproductive}`}
+        />
+        <Kv label="Severity floor" value={convergence.policy.severityFloor} />
+        <Kv label="Updated" value={formatTs(convergence.updatedAt)} />
+      </dl>
+
+      <div className="mt-2 border-t border-[var(--border)] pt-2 text-[12px]">
+        <p className="m-0 mb-1 font-medium">Open items</p>
+        {openItems.length > 0 ? (
+          <ul className="m-0 list-none space-y-0.5 p-0">
+            {openItems.map((item) => (
+              <li key={item.id} className="flex flex-wrap gap-x-2 gap-y-0.5">
+                <span className="mono">{item.id}</span>
+                <span className="text-[var(--text-muted)]">
+                  {item.severity} · {item.status} ·{" "}
+                  {(item.fixerAttempts ?? 0)} /{" "}
+                  {convergence.policy.maxFixerAttemptsPerItem} fixer attempts
+                </span>
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <p className="m-0 text-[var(--text-muted)]">None</p>
+        )}
+      </div>
+
+      <div className="mt-2 border-t border-[var(--border)] pt-2 text-[12px]">
+        <p className="m-0 mb-1 font-medium">Productivity trend</p>
+        {recentHistory.length > 0 ? (
+          <div className="flex flex-wrap gap-1.5">
+            {recentHistory.map((round) => (
+              <span
+                key={round.number}
+                className="rounded border border-[var(--border)] px-1.5 py-0.5 mono text-[11px]"
+                title={`open items: ${(round.openItemIds ?? []).join(", ") || "none"}`}
+              >
+                #{round.number} {round.productive ? "productive" : "unproductive"}
+              </span>
+            ))}
+          </div>
+        ) : (
+          <p className="m-0 text-[var(--text-muted)]">No rounds recorded.</p>
+        )}
+      </div>
+    </Card>
   );
 }
 
@@ -580,6 +686,10 @@ export function LoopDetailPage() {
           <p className="m-0 text-[12px] text-[var(--text-muted)]">No data</p>
         )}
       </Card>
+
+      {data?.convergence ? (
+        <ReviewerConvergenceCard convergence={data.convergence} />
+      ) : null}
 
       {/* Remount on selector change so log buffer/stream state never leaks. */}
       <LogsPane key={selector} selector={selector} />

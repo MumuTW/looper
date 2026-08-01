@@ -19,6 +19,7 @@ import (
 	githubinfra "github.com/MumuTW/looper/internal/infra/github"
 	"github.com/MumuTW/looper/internal/infra/shell"
 	"github.com/MumuTW/looper/internal/outboundguard"
+	"github.com/MumuTW/looper/internal/reviewitem"
 	"github.com/MumuTW/looper/internal/storage"
 )
 
@@ -29,6 +30,7 @@ type reviewSubmitPayload struct {
 
 type reviewSubmitComment struct {
 	Body      string `json:"body"`
+	Severity  string `json:"severity"`
 	Path      string `json:"path"`
 	Line      int64  `json:"line"`
 	Side      string `json:"side"`
@@ -237,9 +239,9 @@ func RunTrusted(ctx context.Context, opts Options, cfg config.Config, credential
 		return fmt.Errorf("resolve PR diff anchor authority for review submit: %w", githubinfra.ErrAnchorValidationUnavailable)
 	}
 
-	comments := make([]githubinfra.ReviewComment, 0, len(payload.Comments))
-	for _, comment := range payload.Comments {
-		comments = append(comments, githubinfra.ReviewComment{Body: comment.Body, Path: comment.Path, Line: comment.Line, Side: comment.Side, StartLine: comment.StartLine, StartSide: comment.StartSide})
+	comments, err := buildReviewSubmitComments(payload.Comments)
+	if err != nil {
+		return err
 	}
 	// Fail closed on base/head drift between anchor resolution and mutation.
 	if _, err := validateLatestReviewerReviewSubmitPublication(ctx, gateway, cfg, repo, prNumber, commitID, detail.BaseSHA, opts.ReviewerManual, opts.ReviewerRunID, cwd); err != nil {
@@ -415,6 +417,9 @@ func validateReviewSubmitBody(body string, comments []reviewSubmitComment, commi
 			return fmt.Errorf("review marker outcome=%s does not match REQUEST_CHANGES event", outcome)
 		}
 	case "COMMENT":
+		if outcome == "clean" && len(comments) > 0 {
+			return fmt.Errorf("clean reviews require outcome=non_blocking or blocking when inline comments are present")
+		}
 		if outcome == "clean" && policy.Clean == config.ReviewerReviewEventApprove {
 			return fmt.Errorf("review marker outcome=clean requires APPROVE under effective policy")
 		}
@@ -422,7 +427,45 @@ func validateReviewSubmitBody(body string, comments []reviewSubmitComment, commi
 			return fmt.Errorf("review marker outcome=blocking requires REQUEST_CHANGES under effective policy")
 		}
 	}
+	if err := validateReviewItemSeverities(outcome, comments, policy); err != nil {
+		return err
+	}
 	return nil
+}
+
+func validateReviewItemSeverities(outcome string, comments []reviewSubmitComment, policy config.ReviewerReviewEventsConfig) error {
+	for index, comment := range comments {
+		severity, err := reviewitem.ParseSeverity(comment.Severity)
+		if err != nil {
+			return fmt.Errorf("review comment %d: %w", index+1, err)
+		}
+		if severity == reviewitem.SeverityBlocking && outcome == "actionable" && policy.Blocking == config.ReviewerReviewEventRequestChanges {
+			return fmt.Errorf("review comment %d severity=blocking requires REQUEST_CHANGES under effective policy", index+1)
+		}
+		if severity == reviewitem.SeverityBlocking && outcome != "blocking" && outcome != "actionable" {
+			return fmt.Errorf("review comment %d severity=blocking exceeds review outcome=%s", index+1, outcome)
+		}
+		if _, err := reviewitem.AttachMarker(comment.Body, severity); err != nil {
+			return fmt.Errorf("review comment %d: %w", index+1, err)
+		}
+	}
+	return nil
+}
+
+func buildReviewSubmitComments(input []reviewSubmitComment) ([]githubinfra.ReviewComment, error) {
+	comments := make([]githubinfra.ReviewComment, 0, len(input))
+	for index, comment := range input {
+		severity, err := reviewitem.ParseSeverity(comment.Severity)
+		if err != nil {
+			return nil, fmt.Errorf("review comment %d: %w", index+1, err)
+		}
+		body, err := reviewitem.AttachMarker(comment.Body, severity)
+		if err != nil {
+			return nil, fmt.Errorf("review comment %d: %w", index+1, err)
+		}
+		comments = append(comments, githubinfra.ReviewComment{Body: body, Path: comment.Path, Line: comment.Line, Side: comment.Side, StartLine: comment.StartLine, StartSide: comment.StartSide})
+	}
+	return comments, nil
 }
 
 func validateCleanApproveBody(body string, authorLogin string) error {
@@ -732,6 +775,11 @@ func reviewSubmitPayloadComments(comments []reviewSubmitComment, redactPaths boo
 	summary := make([]map[string]any, 0, len(comments))
 	for idx, comment := range comments {
 		entry := map[string]any{"index": idx}
+		if severity, err := reviewitem.ParseSeverity(comment.Severity); err == nil {
+			entry["severity"] = string(severity)
+		} else if strings.TrimSpace(comment.Severity) != "" {
+			entry["severity_present"] = true
+		}
 		if comment.Path != "" {
 			if redactPaths {
 				entry["path_present"] = true

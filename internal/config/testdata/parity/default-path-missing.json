@@ -127,6 +127,12 @@
           "maxPerTick": 10,
           "includeOrphans": true,
           "dryRun": false
+        },
+        "resourceGuard": {
+          "enabled": true,
+          "minDiskFreePercent": 5,
+          "minDiskFreeGb": 10,
+          "maxLoadPerCpu": 2
         }
       },
       "package": {
@@ -180,6 +186,10 @@
             "maxIndeterminateDuration": "15m",
             "transientRetries": 3
           },
+          "markReady": {
+            "enabled": false,
+            "scope": "looper-only"
+          },
           "dispatch": {
             "mode": "human-gated",
             "humanGate": {
@@ -199,6 +209,14 @@
         "gatekeeper": {},
         "deployer": {
           "enabled": false
+        },
+        "escalator": {
+          "cadenceSeconds": 3600,
+          "enabled": false,
+          "maxItems": 500,
+          "retryAttemptThreshold": 2,
+          "staleHeadAfterSeconds": 86400,
+          "unroutedAfterSeconds": 3600
         },
         "planner": {
           "autoDiscovery": true,

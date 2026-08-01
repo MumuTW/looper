@@ -181,10 +181,10 @@ func (r *Runtime) ReloadConfig(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return r.rejectConfigReloadLocked("canceled", nil, err)
 	}
-	return r.applyLoadedConfigLocked(loaded, now)
+	return r.applyLoadedConfigLocked(ctx, loaded, now)
 }
 
-func (r *Runtime) applyLoadedConfigLocked(loaded config.LoadedFileConfig, now time.Time) error {
+func (r *Runtime) applyLoadedConfigLocked(ctx context.Context, loaded config.LoadedFileConfig, now time.Time) error {
 	restartRequired, err := config.RestartRequiredChangesChecked(r.loadedConfig.Config, loaded.Config)
 	if err != nil {
 		return r.rejectConfigReloadLocked("invalid", nil, fmt.Errorf("compare effective configuration: %w", err))
@@ -195,13 +195,13 @@ func (r *Runtime) applyLoadedConfigLocked(loaded config.LoadedFileConfig, now ti
 	}
 	r.configBoundary.Lock()
 	defer r.configBoundary.Unlock()
-	return r.applyLoadedConfigBoundaryLocked(loaded, now)
+	return r.applyLoadedConfigBoundaryLocked(ctx, loaded, now)
 }
 
 // applyLoadedConfigBoundaryLocked requires configBoundary's write lock. It is
 // split out so a dashboard patch can hold the same publication boundary across
 // final validation, rename, and publication.
-func (r *Runtime) applyLoadedConfigBoundaryLocked(loaded config.LoadedFileConfig, now time.Time) error {
+func (r *Runtime) applyLoadedConfigBoundaryLocked(ctx context.Context, loaded config.LoadedFileConfig, now time.Time) error {
 	runtimeCandidate := loaded.Config
 	if r.projectCatalog != nil {
 		runtimeCandidate.Projects = r.projectCatalog.Snapshot().Projects
@@ -213,7 +213,8 @@ func (r *Runtime) applyLoadedConfigBoundaryLocked(loaded config.LoadedFileConfig
 		return r.rejectConfigReloadLocked("invalid", configValidationPaths(err), err)
 	}
 
-	changed := !reflect.DeepEqual(r.loadedConfig.Config, loaded.Config)
+	previous := r.loadedConfig.Config
+	changed := !reflect.DeepEqual(previous, loaded.Config)
 	cleanupChanged := r.loadedConfig.Config.Daemon.WorktreeCleanup != loaded.Config.Daemon.WorktreeCleanup
 	r.loadedConfig = loaded
 	r.configReloadStatus.ConfigPath = loaded.Metadata.ConfigPath
@@ -228,6 +229,16 @@ func (r *Runtime) applyLoadedConfigBoundaryLocked(loaded config.LoadedFileConfig
 	}
 
 	if r.projectCatalog != nil {
+		// PublishGlobals atomically installs the new global configuration while
+		// preserving the currently materialized SQLite Projects view. A hot
+		// reload cannot change that filtered catalog membership: the only policy
+		// input that does is defaults.validationCommands, which is restart-bound
+		// and rejected before this boundary, and validateCatalogValidationPolicies
+		// quarantines an unstanced legacy project independently of agent
+		// configuration. Re-materializing on every agent.vendor flip would only
+		// add a SQLite scan and run post-publication hooks under the config
+		// boundary; the preserved slice is already coherent, so publish globals
+		// alone.
 		r.projectCatalog.PublishGlobals(loaded.Config)
 		r.publishCatalogConsumers(r.projectCatalog.Snapshot())
 	}
@@ -421,7 +432,7 @@ func (r *Runtime) PatchConfig(ctx context.Context, patch ConfigPatch) error {
 	candidate.Metadata.ConfigFilePresent = true
 	now := r.now().UTC()
 	r.configReloadStatus.LastAttemptAt = timePointer(now)
-	if err := r.applyLoadedConfigBoundaryLocked(candidate, now); err != nil {
+	if err := r.applyLoadedConfigBoundaryLocked(ctx, candidate, now); err != nil {
 		return &ConfigPatchError{Kind: "validation", Message: err.Error(), Err: err}
 	}
 	return nil

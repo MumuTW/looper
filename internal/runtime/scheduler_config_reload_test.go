@@ -114,6 +114,7 @@ func TestCatalogSchedulerStartsUsingVendorPublishedAfterDaemonStartup(t *testing
 		nil,
 		nil,
 		nil,
+		nil,
 	)
 	if handlers.webhook != nil {
 		t.Cleanup(handlers.webhook.Close)
@@ -207,6 +208,8 @@ func TestBuildDefaultSchedulerHandlers_PerRoleAgentVendors(t *testing.T) {
 		nil,
 		newSchedulerNotificationGatewayFactory(),
 		coordinatorrole.NewRuntimeState(),
+		nil,
+		&schedulerEscalatorCadence{},
 	)
 	if handlers.input == nil {
 		t.Fatal("handlers.input = nil")
@@ -297,6 +300,7 @@ func TestCatalogSchedulerPreservesCoordinatorThrottleAcrossConfigSnapshots(t *te
 		nil,
 		nil,
 		func() time.Time { return now },
+		nil,
 		nil,
 		nil,
 		nil,

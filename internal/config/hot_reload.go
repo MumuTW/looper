@@ -37,6 +37,16 @@ var hotEditablePaths = map[string]struct{}{
 	"daemon.worktreeCleanup.includeOrphans": {},
 	"daemon.worktreeCleanup.dryRun":         {},
 
+	// The host admission gate re-evaluates the cached sample against the live
+	// thresholds on every claim tick, so an operator can disable or relax a
+	// guard that is currently withholding work without restarting the daemon.
+	// Only the leaves are hot; the daemon.resourceGuard object itself stays
+	// restart-bound.
+	"daemon.resourceGuard.enabled":            {},
+	"daemon.resourceGuard.minDiskFreePercent": {},
+	"daemon.resourceGuard.minDiskFreeGb":      {},
+	"daemon.resourceGuard.maxLoadPerCpu":      {},
+
 	"notifications.inApp":                           {},
 	"notifications.osascript.enabled":               {},
 	"notifications.osascript.soundForLevels":        {},
@@ -89,6 +99,10 @@ var hotEditablePaths = map[string]struct{}{
 	"roles.reviewer.behavior.loop.stopOnApproved":                          {},
 	"roles.reviewer.behavior.loop.stopOnReadyLabel":                        {},
 	"roles.reviewer.behavior.loop.stopOnIdenticalOutput":                   {},
+	"roles.reviewer.behavior.convergence.maxConsecutiveUnproductive":       {},
+	"roles.reviewer.behavior.convergence.maxFixerAttemptsPerItem":          {},
+	"roles.reviewer.behavior.convergence.maxTotalRounds":                   {},
+	"roles.reviewer.behavior.convergence.severityFloor":                    {},
 	"roles.reviewer.behavior.retry.enhancedTransientClassification":        {},
 	"roles.reviewer.behavior.retry.extraTransientErrorPatterns":            {},
 	"roles.reviewer.behavior.retry.recoverExistingMatchedFailures":         {},

@@ -55,6 +55,10 @@ type fakeDaemon struct {
 	awaitingConfirmationCount   int
 	awaitingConfirmationSources []map[string]any
 	degradedReasons             []string
+	// resourceGuardHeld makes the fake daemon report a holding resource guard
+	// on /api/v1/status so `looper status` has a hold line to print.
+	resourceGuardHeld   bool
+	resourceGuardDetail string
 }
 
 func newFakeDaemon(t *testing.T) *fakeDaemon {
@@ -76,6 +80,10 @@ func newFakeDaemon(t *testing.T) *fakeDaemon {
 					"reason":             daemon.reviewReason,
 				}
 			}
+			resourceGuard := map[string]any{"enabled": true, "admit": !daemon.resourceGuardHeld, "detail": daemon.resourceGuardDetail}
+			if daemon.resourceGuardHeld {
+				resourceGuard["reasons"] = []string{"disk: free space below floor"}
+			}
 			writeEnvelope(w, http.StatusOK, map[string]any{
 				"service": map[string]any{
 					"healthy":         daemon.healthy,
@@ -93,7 +101,8 @@ func newFakeDaemon(t *testing.T) *fakeDaemon {
 						},
 					},
 				},
-				"tools": tools,
+				"tools":         tools,
+				"resourceGuard": resourceGuard,
 			})
 		case r.URL.Path == "/api/v1/projects" && r.Method == http.MethodGet:
 			writeEnvelope(w, http.StatusOK, map[string]any{"items": daemon.projects})
@@ -529,6 +538,54 @@ func TestStatusReportsKnownIncapableReviewPublishReadiness(t *testing.T) {
 	}})
 	if got := stdout.String(); got != "review:   publish not ready (unsupported capability)\n" {
 		t.Fatalf("status output = %q, want known-incapable readiness line", got)
+	}
+}
+
+func TestStatusReportsResourceGuardHold(t *testing.T) {
+	daemon := newFakeDaemon(t)
+	daemon.resourceGuardHeld = true
+	daemon.resourceGuardDetail = "disk free 2.0 GiB below 10 GiB floor"
+	configForDaemon(t, daemon.server.URL)
+
+	code, stdout, stderr := runCLI(t, "status")
+	if code != 0 {
+		t.Fatalf("exit code = %d (stderr %q), want 0", code, stderr)
+	}
+	for _, want := range []string{
+		"resources: scheduler held",
+		"disk free 2.0 GiB below 10 GiB floor",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("status output missing %q\n%s", want, stdout)
+		}
+	}
+}
+
+// An admitting or disabled guard is not an anomaly and must not print a line:
+// the daemon is reachable and healthy, and a spurious hold line would imply the
+// scheduler is idle when it is not.
+func TestStatusOmitsResourceGuardLineWhenAdmitting(t *testing.T) {
+	daemon := newFakeDaemon(t)
+	configForDaemon(t, daemon.server.URL)
+
+	code, stdout, stderr := runCLI(t, "status")
+	if code != 0 {
+		t.Fatalf("exit code = %d (stderr %q), want 0", code, stderr)
+	}
+	if strings.Contains(stdout, "resources:") {
+		t.Fatalf("status output should not include a resources line when the guard admits\n%s", stdout)
+	}
+}
+
+func TestStatusPrintsResourceGuardHoldFromReasonsWhenDetailAbsent(t *testing.T) {
+	var stdout bytes.Buffer
+	writeStatusOpsLines(&stdout, daemonStatusResponse{ResourceGuard: statusResourceGuardView{
+		Enabled: true,
+		Admit:   false,
+		Reasons: []string{"disk: free space below floor", "load: 4.2/CPU exceeds 2.0/CPU"},
+	}})
+	if !strings.Contains(stdout.String(), "resources: scheduler held (disk: free space below floor, load: 4.2/CPU exceeds 2.0/CPU)") {
+		t.Fatalf("status output = %q, want a resources hold line built from reasons", stdout.String())
 	}
 }
 

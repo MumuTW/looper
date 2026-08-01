@@ -1209,6 +1209,27 @@ func (r *Runner) validationCommandsForProject(projectID string) []string {
 	return r.validationCommands
 }
 
+// projectValidationPolicyKnown reports whether projectID has a resolved
+// validation policy entry from the runtime catalog. The runtime always
+// supplies validationCommandsByProject (possibly empty) from
+// config.ResolveProjectValidationCommandsByID; a nil map means the runner was
+// constructed without catalog policy information (tests/legacy), so the legacy
+// global-defaults fallback in validationCommandsForProject is preserved. A
+// non-nil map without an entry for projectID means the project was removed from
+// the catalog — an unstanced legacy row quarantined because
+// defaults.validationCommands is empty and it carries no validation stance.
+// Its durable sticky retry must fail closed rather than fall back to the empty
+// defaults, which would let validation.RunCommands report success without
+// running anything and let the retry modify or publish code without the
+// project-owned validation gate that caused it to be quarantined.
+func (r *Runner) projectValidationPolicyKnown(projectID string) bool {
+	if r.validationCommandsByProject == nil {
+		return true
+	}
+	_, ok := r.validationCommandsByProject[projectID]
+	return ok
+}
+
 func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (DiscoveryResult, error) {
 	ctx = githubinfra.ContextWithDiscoverySnapshot(ctx, input.Snapshot)
 	if r.repos == nil || r.repos.Projects == nil || r.repos.Loops == nil || r.repos.Queue == nil || r.github == nil {
@@ -1482,7 +1503,11 @@ func (r *Runner) reconcileRecoveredLoop(ctx context.Context, queueItem storage.Q
 	if err != nil {
 		return err
 	}
-	if loop == nil || loop.Status != "running" {
+	// A run may fail before the status flip to running commits. In that
+	// partial-transition case the loop is still queued, but the durable queue
+	// result still has to reconcile it instead of leaving a terminal queue item
+	// paired with a retryable loop.
+	if loop == nil || (loop.Status != "running" && loop.Status != "queued") {
 		return nil
 	}
 	_, err = r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
@@ -1527,6 +1552,41 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	}
 	if err := r.revalidateRoutedWorkerClaim(ctx, *project, *loop, queueItem); err != nil {
 		return ProcessResult{}, err
+	}
+	// A project removed from the runtime catalog (quarantined unstanced legacy
+	// row with empty defaults.validationCommands) has no resolved validation
+	// policy. Its durable sticky retry must fail closed before any agent work
+	// so it cannot modify or publish code without the project-owned validation
+	// gate. No run exists yet, so terminal-fail the queue item and pause the
+	// loop inline (recoverClaimedItem only reconciles loops already flipped to
+	// running, which this check precedes). The project becomes runnable again
+	// once repaired via PATCH or once defaults.validationCommands is configured.
+	if !r.projectValidationPolicyKnown(project.ID) {
+		failure := &loopError{
+			message: fmt.Sprintf("project %s is quarantined without a validation policy; repair the project validation stance or configure defaults.validationCommands before retrying", project.ID),
+			kind:    FailureManualIntervention,
+		}
+		failedQueue, err := r.failQueueItem(ctx, queueItem, failure.kind, failure.message)
+		if err != nil {
+			return ProcessResult{}, err
+		}
+		if _, err := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
+			updated.LastRunAt = stringPtr(r.nowISO())
+			updated.Status = "paused"
+			stampWorkerFailedDiscoveryFingerprint(updated, queueItem)
+			updated.NextRunAt = nil
+		}); err != nil {
+			return ProcessResult{}, err
+		}
+		// This branch terminalizes a durable sticky retry before a run is
+		// created, so ProcessClaimedQueueItem sees a successful result and does
+		// not enter recoverClaimedItem. Preserve the same operator notification
+		// contract as every other manual-intervention failure after both durable
+		// queue and loop writes have committed.
+		if shouldNotifyCompletedRun(failure.kind, failedQueue) {
+			r.notifyRecoveredRunCompleted(ctx, queueItem, failure)
+		}
+		return ProcessResult{LoopID: loop.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
 	}
 	resumedRun, err := r.createRunContext(ctx, *loop)
 	if err != nil {
@@ -3635,6 +3695,9 @@ func (r *Runner) ensureLoopForDiscoveredIssue(ctx context.Context, project stora
 			if prLinked {
 				return loopUpsertResult{record: existing, skipEnqueue: true}, nil
 			}
+			if existing.Status == "human_takeover" {
+				return loopUpsertResult{}, fmt.Errorf("cannot create worker loop: issue #%d has an active human_takeover loop (%s)", issue.Number, existing.ID)
+			}
 			updated := existing
 			updated.Repo = &repo
 			suppressFailedRevival := loops.ShouldSuppressFailedRediscovery(existing.Status, loops.LastFailedDiscoveryFingerprint(existing.MetadataJSON), currentFingerprint)
@@ -3659,6 +3722,11 @@ func (r *Runner) ensureLoopForDiscoveredIssue(ctx context.Context, project stora
 				return loopUpsertResult{}, err
 			}
 			return loopUpsertResult{record: published}, nil
+		}
+	}
+	for _, existing := range existingLoops {
+		if existing.ProjectID == project.ID && derefString(existing.Repo) == repo && existing.TargetType == "issue" && derefString(existing.TargetID) == targetID && existing.Status == "human_takeover" {
+			return loopUpsertResult{}, fmt.Errorf("cannot create worker loop: issue #%d has an active human_takeover loop (%s)", issue.Number, existing.ID)
 		}
 	}
 	metadataJSON := mustMarshalJSON(workerMeta)
@@ -3735,16 +3803,40 @@ func (r *Runner) wakeSchedulerAfterEnqueue() {
 }
 
 func (r *Runner) failQueueItem(ctx context.Context, queueItem storage.QueueItemRecord, kind QueueFailureKind, message string) (*storage.QueueItemRecord, error) {
+	// Recovery can be entered after ProcessClaimedItem has already committed
+	// the queue transition but failed while reconciling the loop. Treat a
+	// terminal row as the durable result instead of trying to resurrect it (or
+	// surfacing ErrQueueItemNotActive from a stricter repository implementation).
+	// The queue row, rather than the stale claimed value passed by the caller,
+	// is the authority for whether this transition still needs to run.
+	current, err := r.repos.Queue.GetByID(ctx, queueItem.ID)
+	if err != nil {
+		return nil, err
+	}
+	// Cancellation is deliberately excluded: runner finalization owns the
+	// right to requeue a claim cancelled concurrently by a pause (see
+	// Queue.MarkRetry's contract). The already-finalized statuses below must
+	// remain terminal, while a cancelled row can still be reconciled according
+	// to the failure kind being finalized.
+	if current != nil && (current.Status == "manual_intervention" || current.Status == "completed" || current.Status == "failed") {
+		return current, nil
+	}
 	nextAttempts := queueItem.Attempts + 1
 	nowISO := r.nowISO()
 	if !shouldRetryQueueFailure(kind, nextAttempts, queueItem.MaxAttempts) {
 		if err := r.repos.Queue.Fail(ctx, storage.QueueFailInput{ID: queueItem.ID, Attempts: nextAttempts, FinishedAt: nowISO, ErrorMessage: optionalString(message), ErrorKind: string(kind), UpdatedAt: nowISO}); err != nil {
+			if recovered, getErr := r.repos.Queue.GetByID(ctx, queueItem.ID); getErr == nil && recovered != nil && (recovered.Status == "manual_intervention" || recovered.Status == "completed" || recovered.Status == "failed") {
+				return recovered, nil
+			}
 			return nil, err
 		}
 		return r.repos.Queue.GetByID(ctx, queueItem.ID)
 	}
 	retryAt := eventlog.FormatJavaScriptISOString(r.now().Add(backoffDelay(r.retryBaseDelay, cappedRetryDelayAttempt(nextAttempts, queueItem.MaxAttempts))))
 	if err := r.repos.Queue.MarkRetry(ctx, storage.QueueMarkRetryInput{ID: queueItem.ID, AvailableAt: retryAt, Attempts: nextAttempts, ErrorMessage: optionalString(message), ErrorKind: string(kind), UpdatedAt: nowISO}); err != nil {
+		if recovered, getErr := r.repos.Queue.GetByID(ctx, queueItem.ID); getErr == nil && recovered != nil && (recovered.Status == "manual_intervention" || recovered.Status == "completed" || recovered.Status == "failed") {
+			return recovered, nil
+		}
 		return nil, err
 	}
 	return r.repos.Queue.GetByID(ctx, queueItem.ID)

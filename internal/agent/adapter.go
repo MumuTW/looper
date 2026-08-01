@@ -97,6 +97,12 @@ var runtimeAdapters = map[config.AgentVendor]runtimeAdapter{
 		// the validation gate fail-closed for devin rather than asserting an
 		// unverified security boundary from generated argument/config shapes.
 	},
+	config.AgentVendorHermes: {
+		contract: characterizedContract(config.AgentVendorHermes, "hermes", nil),
+		resolveStartArgs: func(cfg ExecutorConfig, args []string, _ string, prompt string) []string {
+			return resolveHermesArgs(cfg, args, prompt)
+		},
+	},
 }
 
 func runtimeAdapterFor(vendor config.AgentVendor) (runtimeAdapter, bool) {

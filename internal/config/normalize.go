@@ -78,13 +78,21 @@ func validateProjectCodingRoleSections(partial PartialConfig) []ValidationIssue 
 }
 
 func validateProjectCodingRoleOverrides(roles *PartialRoleConfigs, prefix string, issues *[]ValidationIssue) {
-	if roles == nil || len(roles.Coding) == 0 {
+	if roles == nil {
 		return
 	}
-	*issues = append(*issues, ValidationIssue{
-		Path:    prefix + ".coding",
-		Message: "coding roles are global-only; author roles.coding.* at the top level",
-	})
+	if len(roles.Coding) > 0 {
+		*issues = append(*issues, ValidationIssue{
+			Path:    prefix + ".coding",
+			Message: "coding roles are global-only; author roles.coding.* at the top level",
+		})
+	}
+	if roles.Escalator != nil {
+		*issues = append(*issues, ValidationIssue{
+			Path:    prefix + ".escalator",
+			Message: "escalator is global-only because one digest aggregates all active projects; author roles.escalator at the top level",
+		})
+	}
 }
 
 func CanonicalizePartialForMigration(partial PartialConfig) PartialConfig {
@@ -982,8 +990,26 @@ func mergeDaemonConfig(config *DaemonConfig, partial PartialDaemonConfig) {
 		config.Environment = mergeStringMap(config.Environment, partial.Environment)
 	}
 
+	if partial.ResourceGuard != nil {
+		mergeResourceGuardConfig(&config.ResourceGuard, *partial.ResourceGuard)
+	}
 	if partial.WorktreeCleanup != nil {
 		mergeWorktreeCleanupConfig(&config.WorktreeCleanup, *partial.WorktreeCleanup)
+	}
+}
+
+func mergeResourceGuardConfig(config *ResourceGuardConfig, partial PartialResourceGuardConfig) {
+	if partial.Enabled != nil {
+		config.Enabled = *partial.Enabled
+	}
+	if partial.MinDiskFreePercent != nil {
+		config.MinDiskFreePercent = *partial.MinDiskFreePercent
+	}
+	if partial.MinDiskFreeGB != nil {
+		config.MinDiskFreeGB = *partial.MinDiskFreeGB
+	}
+	if partial.MaxLoadPerCPU != nil {
+		config.MaxLoadPerCPU = *partial.MaxLoadPerCPU
 	}
 }
 
@@ -1068,6 +1094,13 @@ func mergeReviewerConfig(config *ReviewerConfig, partial PartialReviewerConfig) 
 	if partial.Loop != nil {
 		mergeReviewerLoopConfig(&config.Loop, *partial.Loop)
 	}
+	if partial.Convergence != nil {
+		if config.Convergence == nil {
+			defaults := DefaultReviewerConvergenceConfig()
+			config.Convergence = &defaults
+		}
+		mergeReviewerConvergenceConfig(config.Convergence, *partial.Convergence)
+	}
 	if partial.Retry != nil {
 		mergeReviewerRetryConfig(&config.Retry, *partial.Retry)
 	}
@@ -1090,6 +1123,21 @@ func mergeReviewerConfig(config *ReviewerConfig, partial PartialReviewerConfig) 
 	}
 	if partial.ThreadResolution != nil {
 		mergeReviewerThreadResolutionConfig(&config.ThreadResolution, *partial.ThreadResolution)
+	}
+}
+
+func mergeReviewerConvergenceConfig(config *ReviewerConvergenceConfig, partial PartialReviewerConvergenceConfig) {
+	if partial.MaxConsecutiveUnproductive != nil {
+		config.MaxConsecutiveUnproductive = *partial.MaxConsecutiveUnproductive
+	}
+	if partial.MaxFixerAttemptsPerItem != nil {
+		config.MaxFixerAttemptsPerItem = *partial.MaxFixerAttemptsPerItem
+	}
+	if partial.MaxTotalRounds != nil {
+		config.MaxTotalRounds = *partial.MaxTotalRounds
+	}
+	if partial.SeverityFloor != nil {
+		config.SeverityFloor = *partial.SeverityFloor
 	}
 }
 
@@ -1250,6 +1298,30 @@ func mergeRoleConfigs(config *RoleConfigs, partial PartialRoleConfigs) {
 			config.Gatekeeper.DiffBudget = budget
 		}
 	}
+	if partial.Escalator != nil {
+		mergeEscalatorRoleConfig(&config.Escalator, *partial.Escalator)
+	}
+}
+
+func mergeEscalatorRoleConfig(config *EscalatorRoleConfig, partial PartialEscalatorRoleConfig) {
+	if partial.Enabled != nil {
+		config.Enabled = *partial.Enabled
+	}
+	if partial.CadenceSeconds != nil {
+		config.CadenceSeconds = *partial.CadenceSeconds
+	}
+	if partial.RetryAttemptThreshold != nil {
+		config.RetryAttemptThreshold = *partial.RetryAttemptThreshold
+	}
+	if partial.UnroutedAfterSeconds != nil {
+		config.UnroutedAfterSeconds = *partial.UnroutedAfterSeconds
+	}
+	if partial.StaleHeadAfterSeconds != nil {
+		config.StaleHeadAfterSeconds = *partial.StaleHeadAfterSeconds
+	}
+	if partial.MaxItems != nil {
+		config.MaxItems = *partial.MaxItems
+	}
 }
 
 func mergeCoordinatorRoleConfig(config *CoordinatorRoleConfig, partial PartialCoordinatorRoleConfig) {
@@ -1270,6 +1342,9 @@ func mergeCoordinatorRoleConfig(config *CoordinatorRoleConfig, partial PartialCo
 	}
 	if partial.MergeWatch != nil {
 		mergeCoordinatorMergeWatchConfig(&config.MergeWatch, *partial.MergeWatch)
+	}
+	if partial.MarkReady != nil {
+		mergeCoordinatorMarkReadyConfig(&config.MarkReady, *partial.MarkReady)
 	}
 }
 
@@ -1351,6 +1426,15 @@ func mergeCoordinatorMergeWatchConfig(config *CoordinatorMergeWatchConfig, parti
 	}
 	if partial.MaxIndeterminateDuration != nil {
 		config.MaxIndeterminateDuration = *partial.MaxIndeterminateDuration
+	}
+}
+
+func mergeCoordinatorMarkReadyConfig(config *CoordinatorMarkReadyConfig, partial PartialCoordinatorMarkReadyConfig) {
+	if partial.Enabled != nil {
+		config.Enabled = *partial.Enabled
+	}
+	if partial.Scope != nil {
+		config.Scope = CoordinatorMarkReadyScope(strings.TrimSpace(string(*partial.Scope)))
 	}
 }
 
@@ -1481,6 +1565,22 @@ func mergeFixerRoleConfig(config *FixerRoleConfig, partial PartialFixerRoleConfi
 	}
 	if partial.Triggers != nil {
 		mergeFixerRoleTriggersConfig(&config.Triggers, *partial.Triggers)
+	}
+	if partial.Regeneration != nil {
+		regeneration := config.Regeneration
+		if regeneration == nil {
+			// A materialized section must inherit the same safe default as an
+			// omitted section.  Partial config is field-wise: an empty table is
+			// not an explicit request to turn branch deletion off.
+			regeneration = &FixerRegenerationConfig{DeleteBranch: true}
+		} else {
+			cloned := *regeneration
+			regeneration = &cloned
+		}
+		if partial.Regeneration.DeleteBranch != nil {
+			regeneration.DeleteBranch = *partial.Regeneration.DeleteBranch
+		}
+		config.Regeneration = regeneration
 	}
 	if partial.Instructions != nil {
 		config.Instructions = *partial.Instructions
@@ -1743,6 +1843,10 @@ func clonePartialReviewerConfig(config *PartialReviewerConfig) *PartialReviewerC
 	if config.Loop != nil {
 		loop := *config.Loop
 		cloned.Loop = &loop
+	}
+	if config.Convergence != nil {
+		convergence := *config.Convergence
+		cloned.Convergence = &convergence
 	}
 	if config.Retry != nil {
 		retry := *config.Retry
@@ -2052,6 +2156,34 @@ func clonePartialRoleConfigs(configs *PartialRoleConfigs) *PartialRoleConfigs {
 		}
 		cloned.Auditor = &auditor
 	}
+	if configs.Escalator != nil {
+		escalator := *configs.Escalator
+		if configs.Escalator.Enabled != nil {
+			value := *configs.Escalator.Enabled
+			escalator.Enabled = &value
+		}
+		if configs.Escalator.CadenceSeconds != nil {
+			value := *configs.Escalator.CadenceSeconds
+			escalator.CadenceSeconds = &value
+		}
+		if configs.Escalator.RetryAttemptThreshold != nil {
+			value := *configs.Escalator.RetryAttemptThreshold
+			escalator.RetryAttemptThreshold = &value
+		}
+		if configs.Escalator.UnroutedAfterSeconds != nil {
+			value := *configs.Escalator.UnroutedAfterSeconds
+			escalator.UnroutedAfterSeconds = &value
+		}
+		if configs.Escalator.StaleHeadAfterSeconds != nil {
+			value := *configs.Escalator.StaleHeadAfterSeconds
+			escalator.StaleHeadAfterSeconds = &value
+		}
+		if configs.Escalator.MaxItems != nil {
+			value := *configs.Escalator.MaxItems
+			escalator.MaxItems = &value
+		}
+		cloned.Escalator = &escalator
+	}
 	if configs.Coordinator != nil {
 		coordinator := *configs.Coordinator
 		if configs.Coordinator.Triage != nil {
@@ -2081,6 +2213,18 @@ func clonePartialRoleConfigs(configs *PartialRoleConfigs) *PartialRoleConfigs {
 				dispatch.Autonomous = &autonomous
 			}
 			coordinator.Dispatch = &dispatch
+		}
+		if configs.Coordinator.MarkReady != nil {
+			markReady := *configs.Coordinator.MarkReady
+			if configs.Coordinator.MarkReady.Enabled != nil {
+				enabled := *configs.Coordinator.MarkReady.Enabled
+				markReady.Enabled = &enabled
+			}
+			if configs.Coordinator.MarkReady.Scope != nil {
+				scope := *configs.Coordinator.MarkReady.Scope
+				markReady.Scope = &scope
+			}
+			coordinator.MarkReady = &markReady
 		}
 		cloned.Coordinator = &coordinator
 	}
@@ -2154,6 +2298,14 @@ func clonePartialRoleConfigs(configs *PartialRoleConfigs) *PartialRoleConfigs {
 				triggers.Labels = &labels
 			}
 			fixer.Triggers = &triggers
+		}
+		if configs.Fixer.Regeneration != nil {
+			regeneration := *configs.Fixer.Regeneration
+			fixer.Regeneration = &PartialFixerRegenerationConfig{}
+			if regeneration.DeleteBranch != nil {
+				deleteBranch := *regeneration.DeleteBranch
+				fixer.Regeneration.DeleteBranch = &deleteBranch
+			}
 		}
 		fixer.Agent = cloneRoleAgentConfig(configs.Fixer.Agent)
 		cloned.Fixer = &fixer

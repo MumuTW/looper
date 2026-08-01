@@ -93,6 +93,7 @@ var reasonExplanations = map[ReasonCode]string{
 	ReasonReviewChangesRequested:   "a reviewer requested changes",
 	ReasonCodexReviewMissing:       "a completed Codex review for the current head is required",
 	ReasonUnresolvedReviewThread:   "a review thread is unresolved",
+	ReasonReviewerConvergence:      "reviewer convergence has not reached its configured severity floor",
 	ReasonProjectPolicyDenied:      "project policy does not permit merging this target",
 	ReasonHold:                     "a hold label is applied",
 	ReasonDiffBudgetExceeded:       "the pull request exceeds the configured diff budget",

@@ -46,6 +46,12 @@ var (
 var prNumberURLPattern = regexp.MustCompile(`/pull/(\d+)(?:/|$)`)
 
 var (
+	fixerReplyEvidencePattern    = regexp.MustCompile(`(?i)<!--\s*looper-fixer-reply\s+thread:\S+\s+commit:([^\s]+)\s*-->`)
+	fixerDeclinedEvidencePattern = regexp.MustCompile(`(?i)<!--\s*looper-fixer-reply-declined\s+thread:\S+\s+fingerprint:([^\s]+)\s*-->`)
+	fixerDeferredEvidencePattern = regexp.MustCompile(`(?i)<!--\s*looper-fixer-reply-deferred\s+thread:\S+\s+fingerprint:([^\s]+)\s*-->`)
+)
+
+var (
 	// ErrDiffTooLarge is returned when GitHub itself refuses a PR diff as oversized
 	// (for example HTTP 406 too_large / 20k-line limit).
 	ErrDiffTooLarge = errors.New("github pull request diff is too large")
@@ -58,6 +64,10 @@ var (
 	// ErrReviewBaseHeadMismatch is returned when local git objects do not match the
 	// refreshed PR base/head SHAs required for path-targeted anchor authority.
 	ErrReviewBaseHeadMismatch = errors.New("local repository base/head does not match refreshed PR metadata")
+	// ErrPullRequestAlreadyMerged distinguishes a concurrent successful merge
+	// from an idempotent ordinary close. Callers that regenerate failed PRs must
+	// abort rather than create a replacement for work that already landed.
+	ErrPullRequestAlreadyMerged = errors.New("pull request already merged")
 )
 
 // Diagnostic / snapshot reason codes for diff capture and anchor authority.
@@ -180,9 +190,10 @@ type PullRequestAutoMerge struct {
 }
 
 type PullRequestCheckRuns struct {
-	TotalCount int
-	CheckRuns  []PullRequestCheckRun
-	Statuses   []PullRequestStatus
+	TotalCount         int
+	CheckRuns          []PullRequestCheckRun
+	StatusesTotalCount int
+	Statuses           []PullRequestStatus
 }
 
 type PullRequestCheckRun struct {
@@ -438,9 +449,10 @@ type CloseIssueInput struct {
 }
 
 type ClosePullRequestInput struct {
-	Repo     string
-	PRNumber int64
-	CWD      string
+	Repo         string
+	PRNumber     int64
+	DeleteBranch bool
+	CWD          string
 }
 
 type EnableAutoMergeInput struct {
@@ -449,6 +461,57 @@ type EnableAutoMergeInput struct {
 	Strategy config.ReviewerAutoMergeStrategy
 	HeadSHA  string
 	CWD      string
+}
+
+type MarkPullRequestReadyInput struct {
+	Repo     string
+	PRNumber int64
+	CWD      string
+}
+
+type ListPullRequestCommitsInput struct {
+	Repo     string
+	PRNumber int64
+	CWD      string
+}
+
+type PullRequestDraftEventsInput struct {
+	Repo     string
+	PRNumber int64
+	CWD      string
+}
+
+// PullRequestDraftEvent is one draft-lifecycle event on a Pull Request's
+// timeline: who took it out of draft, or who put it back, and when.
+//
+// It is the only durable record of that distinction. A draft the machine
+// opened and a published Pull Request a human converted back to draft look
+// identical on the Pull Request itself; only the timeline says which one is in
+// front of you, and it says so across daemon restarts.
+type PullRequestDraftEvent struct {
+	Event     string
+	Actor     string
+	CreatedAt string
+}
+
+const (
+	// DraftEventConvertToDraft and DraftEventReadyForReview are GitHub's own
+	// names for the two timeline events that move a Pull Request across the
+	// draft boundary.
+	DraftEventConvertToDraft = "convert_to_draft"
+	DraftEventReadyForReview = "ready_for_review"
+)
+
+// PullRequestCommit is one commit on a Pull Request branch together with the
+// forge accounts GitHub attributes to its author and committer. CommitterKnown
+// distinguishes a current REST response (where a missing committer is
+// authoritative unattribution) from an older gateway implementation that only
+// supplied Authors.
+type PullRequestCommit struct {
+	OID            string
+	Authors        []string
+	Committers     []string
+	CommitterKnown bool
 }
 
 type PullRequestCheckRunsInput struct {
@@ -1770,6 +1833,7 @@ func (g *Gateway) ViewPullRequestMergeWatch(ctx context.Context, input ViewPullR
 		UpdatedAt:      firstNonEmpty(asString(row["updated_at"]), asString(row["updatedAt"])),
 		ClosedAt:       firstNonEmpty(asString(row["closed_at"]), asString(row["closedAt"])),
 		IsDraft:        asBool(row["draft"]),
+		Author:         extractAuthor(row["user"]),
 		MergedAt:       firstNonEmpty(asString(row["merged_at"]), asString(row["mergedAt"])),
 		Labels:         extractLabelNames(row["labels"]),
 		HeadRefName:    nestedString(row, "head", "ref"),
@@ -1797,7 +1861,7 @@ func (g *Gateway) ListPullRequestCheckRuns(ctx context.Context, input PullReques
 	if err != nil {
 		return PullRequestCheckRuns{}, err
 	}
-	statusArgs := []string{"api", fmt.Sprintf("repos/%s/commits/%s/status", repo, encodeURIComponent(input.Ref)), "-H", "Accept: application/vnd.github+json"}
+	statusArgs := []string{"api", fmt.Sprintf("repos/%s/commits/%s/status?per_page=100", repo, encodeURIComponent(input.Ref)), "-H", "Accept: application/vnd.github+json"}
 	if hostname != "" {
 		statusArgs = append(statusArgs, "--hostname", hostname)
 	}
@@ -1815,6 +1879,7 @@ func (g *Gateway) ListPullRequestCheckRuns(ctx context.Context, input PullReques
 		out.CheckRuns = append(out.CheckRuns, PullRequestCheckRun{Name: asString(checkRun["name"]), Status: asString(checkRun["status"]), Conclusion: asString(checkRun["conclusion"]), AppID: nestedInt64(checkRun, "app", "id"), CheckSuiteID: nestedInt64(checkRun, "check_suite", "id")})
 	}
 	statuses := toObjectSlice(statusRow["statuses"])
+	out.StatusesTotalCount = int(asInt64(statusRow["total_count"]))
 	out.Statuses = make([]PullRequestStatus, 0, len(statuses))
 	seenContexts := map[string]struct{}{}
 	for _, status := range statuses {
@@ -1901,16 +1966,26 @@ func (g *Gateway) ClosePullRequest(ctx context.Context, input ClosePullRequestIn
 	if err != nil {
 		return err
 	}
-	if state == "closed" || state == "merged" {
+	if state == "closed" {
 		return nil
 	}
-	_, err = g.runGh(ctx, input.CWD, "", "pr", "close", strconv.FormatInt(input.PRNumber, 10), "--repo", input.Repo)
+	if state == "merged" {
+		return ErrPullRequestAlreadyMerged
+	}
+	args := []string{"pr", "close", strconv.FormatInt(input.PRNumber, 10), "--repo", input.Repo}
+	if input.DeleteBranch {
+		args = append(args, "--delete-branch")
+	}
+	_, err = g.runGh(ctx, input.CWD, "", args...)
 	if err == nil {
 		return nil
 	}
 	state, stateErr := g.viewPullRequestState(ctx, input.Repo, input.PRNumber, input.CWD)
-	if stateErr == nil && (state == "closed" || state == "merged") {
+	if stateErr == nil && state == "closed" {
 		return nil
+	}
+	if stateErr == nil && state == "merged" {
+		return ErrPullRequestAlreadyMerged
 	}
 	return err
 }
@@ -1928,6 +2003,132 @@ func (g *Gateway) EnableAutoMerge(ctx context.Context, input EnableAutoMergeInpu
 	return err
 }
 
+// MergePullRequest merges now, refusing if the head has moved.
+//
+// --match-head-commit is what closes the gap between deciding a pull request is
+// eligible and acting on it: the forge rejects the merge if anything was pushed
+// in between, so the decision cannot be applied to a different commit than the
+// one it was made about.
+//
+// This deliberately does not pass --auto. Auto-merge hands the decision to
+// GitHub to apply later, by which time the evaluation behind it is stale — the
+// opposite of the guarantee an immediate merge makes.
+//
+// Only the head is bound here: GitHub's merge API (and `gh pr merge`) accepts no
+// parameter that atomically pins the base. A diff-budget verdict depends on the
+// merge base, so when the base branch advances between the confirming pass's
+// final revalidation read and this call, the merge can still proceed against a
+// new base whose recomputed diff exceeds the budget. The confirming pass narrows
+// that window to the calls between the final read and the merge, but it cannot
+// close it; this is a documented blind spot of the diff-budget gate, not a
+// property this command can enforce.
+func (g *Gateway) MergePullRequest(ctx context.Context, input EnableAutoMergeInput) error {
+	strategy := strings.TrimSpace(string(input.Strategy))
+	if strategy == "" {
+		return fmt.Errorf("merge strategy is required")
+	}
+	headSHA := strings.TrimSpace(input.HeadSHA)
+	if headSHA == "" {
+		return fmt.Errorf("merge head SHA is required")
+	}
+	_, err := g.runGh(ctx, input.CWD, "", "pr", "merge", strconv.FormatInt(input.PRNumber, 10), "--repo", input.Repo, "--"+strategy, "--match-head-commit", headSHA)
+	return err
+}
+
+// MarkPullRequestReady takes a draft Pull Request out of draft.
+//
+// It is idempotent by re-reading rather than by pre-checking: a human clicking
+// "Ready for review" between the caller's decision and this call makes gh fail
+// with a "not a draft" error, which is the outcome the caller wanted, not a
+// failure. Only a PR that is still a draft after a failed attempt is reported
+// as an error. GitHub offers no --match-head-commit equivalent for this
+// mutation, so the caller — not the gateway — is responsible for re-reading the
+// Pull Request immediately beforehand and confirming the head its evidence was
+// gathered against is still the head being published.
+func (g *Gateway) MarkPullRequestReady(ctx context.Context, input MarkPullRequestReadyInput) error {
+	_, err := g.runGh(ctx, input.CWD, "", "pr", "ready", strconv.FormatInt(input.PRNumber, 10), "--repo", input.Repo)
+	if err == nil {
+		return nil
+	}
+	draft, draftErr := g.viewPullRequestDraft(ctx, input.Repo, input.PRNumber, input.CWD)
+	if draftErr == nil && !draft {
+		return nil
+	}
+	return err
+}
+
+// ListPullRequestCommits returns every commit on a Pull Request branch with the
+// forge accounts each is attributed to. The REST endpoint is paginated because
+// authorship is a safety gate: silently dropping a later commit can turn a
+// human-pushed branch into an apparently daemon-only branch.
+func (g *Gateway) ListPullRequestCommits(ctx context.Context, input ListPullRequestCommitsInput) ([]PullRequestCommit, error) {
+	hostname, repo := splitRepoHostname(input.Repo)
+	args := []string{"api", "--paginate", "--slurp", fmt.Sprintf("repos/%s/pulls/%d/commits?per_page=100", repo, input.PRNumber), "-H", "Accept: application/vnd.github+json"}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGh(ctx, input.CWD, "", args...)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := decodeJSONArrayOrPages(result.Stdout)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]PullRequestCommit, 0, len(rows))
+	for _, commitRow := range rows {
+		commit := PullRequestCommit{OID: firstNonEmpty(asString(commitRow["sha"]), asString(commitRow["oid"]))}
+		if author := strings.TrimSpace(extractAuthor(commitRow["author"])); author != "" {
+			commit.Authors = append(commit.Authors, author)
+		}
+		if _, present := commitRow["committer"]; present {
+			commit.CommitterKnown = true
+			if committer := strings.TrimSpace(extractAuthor(commitRow["committer"])); committer != "" {
+				commit.Committers = append(commit.Committers, committer)
+			}
+		}
+		out = append(out, commit)
+	}
+	return out, nil
+}
+
+// ListPullRequestDraftEvents returns a Pull Request's convert_to_draft and
+// ready_for_review timeline events, oldest first, each with the account that
+// performed it.
+//
+// A Pull Request is an Issue to this endpoint, which is why it reads the same
+// path ListIssueTimeline does with the Pull Request number. Everything that is
+// not a draft-lifecycle event is dropped here rather than by the caller: the
+// timeline of a long-lived Pull Request is mostly commits and comments, and
+// this is the only question the gateway is being asked.
+func (g *Gateway) ListPullRequestDraftEvents(ctx context.Context, input PullRequestDraftEventsInput) ([]PullRequestDraftEvent, error) {
+	hostname, repo := splitRepoHostname(input.Repo)
+	args := []string{"api", "--paginate", "--slurp", fmt.Sprintf("repos/%s/issues/%d/timeline", repo, input.PRNumber), "-H", "Accept: application/vnd.github+json"}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGh(ctx, input.CWD, "", args...)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := decodeJSONArrayOrPages(result.Stdout)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]PullRequestDraftEvent, 0, 4)
+	for _, row := range rows {
+		event := strings.ToLower(strings.TrimSpace(asString(row["event"])))
+		if event != DraftEventConvertToDraft && event != DraftEventReadyForReview {
+			continue
+		}
+		out = append(out, PullRequestDraftEvent{
+			Event:     event,
+			Actor:     extractAuthor(row["actor"]),
+			CreatedAt: firstNonEmpty(asString(row["created_at"]), asString(row["createdAt"])),
+		})
+	}
+	return out, nil
+}
 func (g *Gateway) GetPullRequestHeadSHA(ctx context.Context, input ViewPullRequestInput) (string, error) {
 	result, err := g.runGh(ctx, input.CWD, "", "pr", "view", fmt.Sprintf("%d", input.PRNumber), "--repo", input.Repo, "--json", "headRefOid")
 	if err != nil {
@@ -3404,6 +3605,10 @@ func (g *Gateway) fetchReviewThreads(ctx context.Context, repo string, prNumber 
 				if fingerprint := reviewThreadFingerprintFromNodes(allCommentNodes); fingerprint != "" {
 					normalized["threadFingerprint"] = fingerprint
 				}
+				if result, key := fixerResultFromReviewThreadNodes(allCommentNodes); result != "" {
+					normalized["fixerResult"] = result
+					normalized["fixerAttemptKey"] = key
+				}
 				out = append(out, normalized)
 			}
 		}
@@ -3904,6 +4109,7 @@ func normalizeReviewThread(value any) (map[string]any, bool) {
 	out := map[string]any{
 		"id":         commentID,
 		"threadId":   threadID,
+		"source":     "review_thread",
 		"state":      ternary(isResolved, "RESOLVED", "UNRESOLVED"),
 		"isResolved": isResolved,
 	}
@@ -3930,6 +4136,27 @@ func normalizeReviewThread(value any) (map[string]any, bool) {
 		out["threadFingerprint"] = fingerprint
 	}
 	return out, true
+}
+
+// fixerResultFromReviewThreadNodes projects only explicit Looper reply
+// markers into the reviewer/fixer handoff. Visible prose is never treated as
+// a fixer outcome; the marker's commit/fingerprint is the attempt identity so
+// retries do not increment a convergence budget by re-observing one result.
+func fixerResultFromReviewThreadNodes(nodes []any) (string, string) {
+	for _, raw := range nodes {
+		row, _ := raw.(map[string]any)
+		body := asString(row["body"])
+		if match := fixerDeclinedEvidencePattern.FindStringSubmatch(body); len(match) == 2 {
+			return "declined", match[1]
+		}
+		if match := fixerDeferredEvidencePattern.FindStringSubmatch(body); len(match) == 2 {
+			return "deferred", match[1]
+		}
+		if match := fixerReplyEvidencePattern.FindStringSubmatch(body); len(match) == 2 {
+			return "fixed", match[1]
+		}
+	}
+	return "", ""
 }
 
 func reviewThreadFingerprintFromNodes(nodes []any) string {
@@ -3976,6 +4203,14 @@ func (g *Gateway) viewIssueState(ctx context.Context, repo string, issueNumber i
 		return "", err
 	}
 	return strings.ToLower(strings.TrimSpace(result.Stdout)), nil
+}
+
+func (g *Gateway) viewPullRequestDraft(ctx context.Context, repo string, prNumber int64, cwd string) (bool, error) {
+	result, err := g.runGh(ctx, cwd, "", "pr", "view", strconv.FormatInt(prNumber, 10), "--repo", repo, "--json", "isDraft", "--jq", ".isDraft")
+	if err != nil {
+		return false, err
+	}
+	return strings.EqualFold(strings.TrimSpace(result.Stdout), "true"), nil
 }
 
 func (g *Gateway) viewPullRequestState(ctx context.Context, repo string, prNumber int64, cwd string) (string, error) {

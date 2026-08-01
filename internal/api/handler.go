@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/MumuTW/looper/internal/agent"
+	"github.com/MumuTW/looper/internal/agentdiscovery"
 	"github.com/MumuTW/looper/internal/config"
 	"github.com/MumuTW/looper/internal/daemonbinary"
 	"github.com/MumuTW/looper/internal/domain"
@@ -33,6 +34,7 @@ import (
 	"github.com/MumuTW/looper/internal/loops"
 	networkclient "github.com/MumuTW/looper/internal/network/client"
 	"github.com/MumuTW/looper/internal/projects"
+	"github.com/MumuTW/looper/internal/reviewer/convergence"
 	looperdruntime "github.com/MumuTW/looper/internal/runtime"
 	"github.com/MumuTW/looper/internal/storage"
 	"github.com/MumuTW/looper/internal/triager"
@@ -125,6 +127,10 @@ type Context struct {
 	// preflight. Production leaves it nil and uses the configured GitHub gateway;
 	// embeddings and tests can inject the same freshness authority explicitly.
 	RefreshTargetLabels func(ctx context.Context, target domain.LoopTarget, cwd string) ([]string, error)
+	// DiscoverAgentProviders probes locally installed coding agents and
+	// returns a vendor suggestion. Optional: when nil, the endpoint reports
+	// discovery as unavailable.
+	DiscoverAgentProviders func(ctx context.Context, cfg config.Config) (agentdiscovery.Report, error)
 }
 
 // PullRequestTarget is the minimum a caller needs to decide whether a pull
@@ -258,7 +264,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// The config endpoint needs one coherent config-and-metadata snapshot.
 	// Other routes use the current in-memory runtime config for authorization
 	// and policy without constructing dashboard metadata.
-	if normalizePath(r.URL.Path) == apiBasePath+"/config" && h.context.ConfigSnapshot != nil {
+	if (normalizePath(r.URL.Path) == apiBasePath+"/config" || normalizePath(r.URL.Path) == apiBasePath+"/agent/providers/discovery") && h.context.ConfigSnapshot != nil {
 		cfg, metadata := h.context.ConfigSnapshot()
 		requestHandler.context.Config = cfg
 		requestHandler.context.ConfigMetadata = func() ConfigMetadata { return metadata }
@@ -383,6 +389,22 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	case apiBasePath + "/config":
 		h.handleConfigRoute(w, r, requestID)
+		return
+	case apiBasePath + "/agent/providers/discovery":
+		if !assertMethod(r.Method, http.MethodGet, path, w, requestID, h.writeError) {
+			return
+		}
+		if h.context.DiscoverAgentProviders == nil {
+			h.writeError(w, requestID, apiError{code: pkgapi.ErrorCodeServiceUnavailable, status: http.StatusServiceUnavailable, message: "Agent provider discovery is unavailable"})
+			return
+		}
+		report, err := h.context.DiscoverAgentProviders(r.Context(), h.context.Config)
+		if err != nil {
+			h.writeError(w, requestID, internalServerError(err))
+			return
+		}
+		report.ConfigRevision = h.buildConfigMetadata().Revision
+		h.writeSuccess(w, requestID, report)
 		return
 	case apiBasePath + "/webhook/status":
 		if !assertMethod(r.Method, http.MethodGet, path, w, requestID, h.writeError) {
@@ -993,6 +1015,7 @@ type statusResponse struct {
 	Scheduler       statusScheduler     `json:"scheduler"`
 	Agent           statusAgent         `json:"agent"`
 	WorktreeCleanup any                 `json:"worktreeCleanup"`
+	ResourceGuard   any                 `json:"resourceGuard"`
 	Webhook         statusWebhook       `json:"webhook"`
 	Loops           statusLoops         `json:"loops"`
 	Network         any                 `json:"network,omitempty"`
@@ -1247,6 +1270,7 @@ type configRolesResponse struct {
 	Fixer       config.FixerRoleConfig             `json:"fixer"`
 	Worker      config.WorkerRoleConfig            `json:"worker"`
 	Coordinator config.CoordinatorRoleConfig       `json:"coordinator"`
+	Escalator   config.EscalatorRoleConfig         `json:"escalator"`
 }
 
 type configServerResponse struct {
@@ -1276,6 +1300,7 @@ type configDaemonResponse struct {
 	WorkingDirectory       string                       `json:"workingDirectory"`
 	Environment            map[string]string            `json:"environment"`
 	WorktreeCleanup        config.WorktreeCleanupConfig `json:"worktreeCleanup"`
+	ResourceGuard          config.ResourceGuardConfig   `json:"resourceGuard"`
 }
 
 type configPackageResponse struct {
@@ -1324,6 +1349,7 @@ func (h *Handler) buildConfigResponse() configResponse {
 			WorkingDirectory:       cfg.Daemon.WorkingDirectory,
 			Environment:            map[string]string{},
 			WorktreeCleanup:        cfg.Daemon.WorktreeCleanup,
+			ResourceGuard:          cfg.Daemon.ResourceGuard,
 		},
 		Package: configPackageResponse{
 			Distribution:               cfg.Package.Distribution,
@@ -1341,6 +1367,7 @@ func (h *Handler) buildConfigResponse() configResponse {
 			Fixer:       cfg.Roles.Fixer,
 			Worker:      cfg.Roles.Worker,
 			Coordinator: cfg.Roles.Coordinator,
+			Escalator:   cfg.Roles.Escalator,
 		},
 		Providers: append([]config.ProviderConfig{}, cfg.Providers...),
 		Projects:  config.RedactProjectSecrets(cfg.Projects),
@@ -1539,6 +1566,7 @@ func (h *Handler) buildStatusResponse(ctx context.Context) (statusResponse, erro
 			},
 		},
 		WorktreeCleanup: h.buildWorktreeCleanupStatusResponse(),
+		ResourceGuard:   h.buildResourceGuardStatusResponse(),
 		Webhook:         summarizeWebhookStatus(h.buildWebhookStatusResponse()),
 		Loops:           loopCounts,
 		Network:         h.buildNetworkStatusResponse(),
@@ -1574,6 +1602,21 @@ func (h *Handler) buildWorktreeCleanupStatusResponse() any {
 		Enabled:    h.context.Config.Daemon.WorktreeCleanup.Enabled,
 		DryRun:     h.context.Config.Daemon.WorktreeCleanup.DryRun,
 		LastStatus: "idle",
+	}
+}
+
+// buildResourceGuardStatusResponse surfaces the last host reading. A scheduler
+// that is withholding slots must be able to say so: without this, a guarded
+// daemon and an idle one look identical from the outside.
+func (h *Handler) buildResourceGuardStatusResponse() any {
+	if runtimeWithGuard, ok := any(h.context.Runtime).(interface {
+		HostAdmissionStatus() looperdruntime.HostAdmissionStatus
+	}); ok {
+		return runtimeWithGuard.HostAdmissionStatus()
+	}
+	return looperdruntime.HostAdmissionStatus{
+		Enabled: h.context.Config.Daemon.ResourceGuard.Enabled,
+		Admit:   true,
 	}
 }
 
@@ -1887,10 +1930,15 @@ type loopResponse struct {
 	Status       string  `json:"status"`
 	ConfigJSON   *string `json:"configJson"`
 	MetadataJSON *string `json:"metadataJson"`
-	LastRunAt    *string `json:"lastRunAt"`
-	NextRunAt    *string `json:"nextRunAt"`
-	CreatedAt    string  `json:"createdAt"`
-	UpdatedAt    string  `json:"updatedAt"`
+	// Convergence is a typed read-only projection of the reviewer loop's
+	// persisted semantic progress. The metadata blob remains the durable
+	// authority; this field prevents dashboard clients from parsing it or
+	// inferring state from review prose.
+	Convergence *reviewerConvergenceProjection `json:"convergence,omitempty"`
+	LastRunAt   *string                        `json:"lastRunAt"`
+	NextRunAt   *string                        `json:"nextRunAt"`
+	CreatedAt   string                         `json:"createdAt"`
+	UpdatedAt   string                         `json:"updatedAt"`
 	// Queue-derived diagnostics (latest queue item / run), matching looper describe / ps.
 	Attempts          *int64  `json:"attempts,omitempty"`
 	MaxAttempts       *int64  `json:"maxAttempts,omitempty"`
@@ -1899,6 +1947,15 @@ type loopResponse struct {
 	// Outcome is the latest run's derived outcome, so a loop view shows what that
 	// run actually accomplished rather than only that it failed.
 	Outcome *fixer.FixerRunOutcome `json:"outcome,omitempty"`
+}
+
+type reviewerConvergenceProjection struct {
+	Policy    convergence.Policy `json:"policy"`
+	State     convergence.State  `json:"state"`
+	Action    convergence.Action `json:"action,omitempty"`
+	Reason    convergence.Reason `json:"reason,omitempty"`
+	Status    string             `json:"status,omitempty"`
+	UpdatedAt string             `json:"updatedAt,omitempty"`
 }
 
 type loopLogsResponse struct {
@@ -6703,11 +6760,51 @@ func serializeLoop(loop storage.LoopRecord) loopResponse {
 		Status:       loop.Status,
 		ConfigJSON:   loop.ConfigJSON,
 		MetadataJSON: loop.MetadataJSON,
+		Convergence:  parseReviewerConvergenceProjection(loop.MetadataJSON),
 		LastRunAt:    loop.LastRunAt,
 		NextRunAt:    loop.NextRunAt,
 		CreatedAt:    loop.CreatedAt,
 		UpdatedAt:    loop.UpdatedAt,
 	}
+}
+
+// parseReviewerConvergenceProjection reads only the typed convergence object
+// already persisted by Reviewer. Invalid or legacy metadata is omitted from
+// the projection rather than making an otherwise readable loop unavailable.
+func parseReviewerConvergenceProjection(metadataJSON *string) *reviewerConvergenceProjection {
+	metadata := parseJSONObject(metadataJSON)
+	raw, ok := metadata["convergence"]
+	if !ok || raw == nil {
+		return nil
+	}
+	encoded, err := json.Marshal(raw)
+	if err != nil {
+		return nil
+	}
+	var projection reviewerConvergenceProjection
+	if err := json.Unmarshal(encoded, &projection); err != nil {
+		return nil
+	}
+	// A valid policy alone is not enough: json.Unmarshal accepts malformed
+	// state (negative counters, unknown item statuses/severities, empty IDs)
+	// and unknown action/reason/status values. Validate the full record so the
+	// API and dashboard never surface nonsensical convergence progress.
+	if err := projection.Policy.Validate(); err != nil {
+		return nil
+	}
+	if err := projection.State.Validate(); err != nil {
+		return nil
+	}
+	if !projection.Action.Valid() {
+		return nil
+	}
+	if !projection.Reason.Valid() {
+		return nil
+	}
+	if !convergence.ValidStatus(projection.Status) {
+		return nil
+	}
+	return &projection
 }
 
 // serializeLoopWithDiagnostics loads latest queue/run and attaches attempt/error fields.

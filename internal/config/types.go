@@ -9,6 +9,7 @@ const (
 	AgentVendorCursorCLI         AgentVendor = "cursor-cli"
 	AgentVendorGrokBuild         AgentVendor = "grok-build"
 	AgentVendorDevinExperimental AgentVendor = "devin-experimental"
+	AgentVendorHermes            AgentVendor = "hermes"
 )
 
 var supportedAgentVendors = []AgentVendor{
@@ -18,6 +19,7 @@ var supportedAgentVendors = []AgentVendor{
 	AgentVendorCursorCLI,
 	AgentVendorGrokBuild,
 	AgentVendorDevinExperimental,
+	AgentVendorHermes,
 }
 
 // ConfigurableAgentVendors returns the vendor identities accepted by
@@ -148,6 +150,17 @@ const (
 	// Looper-only constraint identifying which PRs Looper may opt into
 	// auto-merge — the looper: label AND a tracked-Issue link, both required.
 	ReviewerAutoMergeScopeLooperOnly ReviewerAutoMergeScope = "looper-only"
+)
+
+type CoordinatorMarkReadyScope string
+
+const (
+	// CoordinatorMarkReadyScopeLooperOnly is the Mark-ready scope: the
+	// Looper-only constraint identifying which draft Pull Requests Coordinator
+	// may promote out of draft — the looper: label AND a tracked-Issue link,
+	// both required. It is the only scope: a human's own draft is never
+	// Looper's to publish, so there is deliberately no wider value to author.
+	CoordinatorMarkReadyScopeLooperOnly CoordinatorMarkReadyScope = "looper-only"
 )
 
 type NotificationSoundLevel string
@@ -360,6 +373,29 @@ type DaemonConfig struct {
 	WorkingDirectory       string                `json:"workingDirectory"`
 	Environment            map[string]string     `json:"environment"`
 	WorktreeCleanup        WorktreeCleanupConfig `json:"worktreeCleanup"`
+	ResourceGuard          ResourceGuardConfig   `json:"resourceGuard"`
+}
+
+// ResourceGuardConfig gates the start of new work on host pressure.
+//
+// maxConcurrentRuns counts runs, but a run expands into an agent process plus
+// whatever that agent spawns, and that fan-out is neither bounded nor known.
+// These thresholds measure the host instead of the queue.
+//
+// Every threshold is relative so one config behaves on a laptop and on a
+// 64-core runner: disk as a percentage and an absolute floor together
+// (whichever is looser — admission requires only one to be satisfied), load as
+// a multiple of the host's CPU count. There is deliberately no memory threshold
+// — see internal/hostresources.
+type ResourceGuardConfig struct {
+	Enabled bool `json:"enabled"`
+	// MinDiskFreePercent and MinDiskFreeGB both guard the filesystem holding
+	// the daemon's state directory. Zero disables that half of the check.
+	MinDiskFreePercent float64 `json:"minDiskFreePercent"`
+	MinDiskFreeGB      float64 `json:"minDiskFreeGb"`
+	// MaxLoadPerCPU refuses new work above NumCPU x this. Zero disables the
+	// load signal, leaving disk as the only gate.
+	MaxLoadPerCPU float64 `json:"maxLoadPerCpu"`
 }
 
 type WorktreeCleanupConfig struct {
@@ -446,8 +482,27 @@ type ReviewerLoopConfig struct {
 	StopOnIdenticalOutput     bool `json:"stopOnIdenticalOutput"`
 }
 
+// ReviewerConvergenceConfig bounds semantic Reviewer↔Fixer progress. A nil
+// pointer on ReviewerConfig means the documented defaults; keeping the field
+// optional preserves canonical config output for existing installations.
+type ReviewerConvergenceConfig struct {
+	MaxConsecutiveUnproductive int                   `json:"maxConsecutiveUnproductive"`
+	MaxFixerAttemptsPerItem    int                   `json:"maxFixerAttemptsPerItem"`
+	MaxTotalRounds             int                   `json:"maxTotalRounds"`
+	SeverityFloor              ReviewerSeverityFloor `json:"severityFloor"`
+}
+
+type ReviewerSeverityFloor string
+
+const (
+	ReviewerSeverityFloorBlocking    ReviewerSeverityFloor = "blocking"
+	ReviewerSeverityFloorNonBlocking ReviewerSeverityFloor = "non_blocking"
+	ReviewerSeverityFloorAll         ReviewerSeverityFloor = "all"
+)
+
 type ReviewerConfig struct {
 	Loop                    ReviewerLoopConfig             `json:"loop"`
+	Convergence             *ReviewerConvergenceConfig     `json:"convergence,omitempty"`
 	Retry                   ReviewerRetryConfig            `json:"retry"`
 	Scope                   ReviewerScope                  `json:"scope"`
 	PublishMode             ReviewerPublishMode            `json:"publishMode"`
@@ -570,10 +625,18 @@ type ReviewerRoleConfig struct {
 }
 
 type FixerRoleConfig struct {
-	AutoDiscovery bool                    `json:"autoDiscovery"`
-	Triggers      FixerRoleTriggersConfig `json:"triggers"`
-	Instructions  string                  `json:"instructions,omitempty"`
-	Agent         *RoleAgentConfig        `json:"agent,omitempty"`
+	AutoDiscovery bool                     `json:"autoDiscovery"`
+	Triggers      FixerRoleTriggersConfig  `json:"triggers"`
+	Regeneration  *FixerRegenerationConfig `json:"regeneration,omitempty"`
+	Instructions  string                   `json:"instructions,omitempty"`
+	Agent         *RoleAgentConfig         `json:"agent,omitempty"`
+}
+
+// FixerRegenerationConfig controls cleanup after a retry-exhausted fixer loop.
+// A nil section uses the safe default: delete a Looper-authored PR branch after
+// the PR is closed. Human-authored branches are never deleted by this policy.
+type FixerRegenerationConfig struct {
+	DeleteBranch bool `json:"deleteBranch"`
 }
 
 type CoordinatorTriageDispositionConfig struct {
@@ -617,6 +680,16 @@ type CoordinatorMergeWatchConfig struct {
 	MaxIndeterminateDuration string `json:"maxIndeterminateDuration"`
 }
 
+// CoordinatorMarkReadyConfig configures the merge-watch lane's promotion of a
+// looper-authored draft Pull Request to ready-for-review once CI is green. It
+// is disabled by default: publishing a draft is a visible act on the forge that
+// requests other people's attention, so it stays an explicit operator opt-in
+// rather than something a daemon upgrade turns on.
+type CoordinatorMarkReadyConfig struct {
+	Enabled bool                      `json:"enabled"`
+	Scope   CoordinatorMarkReadyScope `json:"scope"`
+}
+
 type CoordinatorRoleConfig struct {
 	Enabled      bool                          `json:"enabled"`
 	PollInterval string                        `json:"pollInterval"`
@@ -624,6 +697,7 @@ type CoordinatorRoleConfig struct {
 	Dispatch     CoordinatorDispatchConfig     `json:"dispatch"`
 	Dependencies CoordinatorDependenciesConfig `json:"dependencies"`
 	MergeWatch   CoordinatorMergeWatchConfig   `json:"mergeWatch"`
+	MarkReady    CoordinatorMarkReadyConfig    `json:"markReady"`
 }
 
 type RoleConfigs struct {
@@ -655,6 +729,18 @@ type RoleConfigs struct {
 	Gatekeeper  GatekeeperRoleConfig  `json:"gatekeeper"`
 	Auditor     AuditorRoleConfig     `json:"auditor"`
 	Deployer    DeployerRoleConfig    `json:"deployer"`
+	Escalator   EscalatorRoleConfig   `json:"escalator"`
+}
+
+// EscalatorRoleConfig configures the agent-free, global pipeline digest. It
+// reads durable state across all active projects and never claims queue work.
+type EscalatorRoleConfig struct {
+	Enabled               bool  `json:"enabled"`
+	CadenceSeconds        int   `json:"cadenceSeconds"`
+	RetryAttemptThreshold int64 `json:"retryAttemptThreshold"`
+	UnroutedAfterSeconds  int   `json:"unroutedAfterSeconds"`
+	StaleHeadAfterSeconds int   `json:"staleHeadAfterSeconds"`
+	MaxItems              int   `json:"maxItems"`
 }
 
 // DeployerRoleConfig configures the agent-free Role that runs a project's deploy
@@ -1010,6 +1096,14 @@ type PartialDaemonConfig struct {
 	WorkingDirectory       *string                       `json:"workingDirectory,omitempty"`
 	Environment            map[string]string             `json:"environment,omitempty"`
 	WorktreeCleanup        *PartialWorktreeCleanupConfig `json:"worktreeCleanup,omitempty"`
+	ResourceGuard          *PartialResourceGuardConfig   `json:"resourceGuard,omitempty"`
+}
+
+type PartialResourceGuardConfig struct {
+	Enabled            *bool    `json:"enabled,omitempty"`
+	MinDiskFreePercent *float64 `json:"minDiskFreePercent,omitempty"`
+	MinDiskFreeGB      *float64 `json:"minDiskFreeGb,omitempty"`
+	MaxLoadPerCPU      *float64 `json:"maxLoadPerCpu,omitempty"`
 }
 
 type PartialWorktreeCleanupConfig struct {
@@ -1065,8 +1159,16 @@ type PartialReviewerLoopConfig struct {
 	StopOnIdenticalOutput     *bool `json:"stopOnIdenticalOutput,omitempty"`
 }
 
+type PartialReviewerConvergenceConfig struct {
+	MaxConsecutiveUnproductive *int                   `json:"maxConsecutiveUnproductive,omitempty"`
+	MaxFixerAttemptsPerItem    *int                   `json:"maxFixerAttemptsPerItem,omitempty"`
+	MaxTotalRounds             *int                   `json:"maxTotalRounds,omitempty"`
+	SeverityFloor              *ReviewerSeverityFloor `json:"severityFloor,omitempty"`
+}
+
 type PartialReviewerConfig struct {
 	Loop                    *PartialReviewerLoopConfig             `json:"loop,omitempty"`
+	Convergence             *PartialReviewerConvergenceConfig      `json:"convergence,omitempty"`
 	Retry                   *PartialReviewerRetryConfig            `json:"retry,omitempty"`
 	Scope                   *ReviewerScope                         `json:"scope,omitempty"`
 	PublishMode             *ReviewerPublishMode                   `json:"publishMode,omitempty"`
@@ -1228,8 +1330,13 @@ type PartialReviewerRoleConfig struct {
 type PartialFixerRoleConfig struct {
 	AutoDiscovery *bool                           `json:"autoDiscovery,omitempty"`
 	Triggers      *PartialFixerRoleTriggersConfig `json:"triggers,omitempty"`
+	Regeneration  *PartialFixerRegenerationConfig `json:"regeneration,omitempty"`
 	Instructions  *string                         `json:"instructions,omitempty"`
 	Agent         *RoleAgentConfig                `json:"agent,omitempty"`
+}
+
+type PartialFixerRegenerationConfig struct {
+	DeleteBranch *bool `json:"deleteBranch,omitempty"`
 }
 
 // PartialRoleDiscoveryConfig is the authorable form of RoleDiscoveryConfig:
@@ -1304,6 +1411,11 @@ type PartialCoordinatorMergeWatchConfig struct {
 	MaxIndeterminateDuration *string `json:"maxIndeterminateDuration,omitempty"`
 }
 
+type PartialCoordinatorMarkReadyConfig struct {
+	Enabled *bool                      `json:"enabled,omitempty"`
+	Scope   *CoordinatorMarkReadyScope `json:"scope,omitempty"`
+}
+
 type PartialCoordinatorRoleConfig struct {
 	Enabled      *bool                                 `json:"enabled,omitempty"`
 	PollInterval *string                               `json:"pollInterval,omitempty"`
@@ -1311,6 +1423,7 @@ type PartialCoordinatorRoleConfig struct {
 	Dispatch     *PartialCoordinatorDispatchConfig     `json:"dispatch,omitempty"`
 	Dependencies *PartialCoordinatorDependenciesConfig `json:"dependencies,omitempty"`
 	MergeWatch   *PartialCoordinatorMergeWatchConfig   `json:"mergeWatch,omitempty"`
+	MarkReady    *PartialCoordinatorMarkReadyConfig    `json:"markReady,omitempty"`
 }
 
 type PartialDeployerRoleConfig struct {
@@ -1328,6 +1441,15 @@ type PartialGatekeeperRoleConfig struct {
 type PartialGatekeeperDiffBudget struct {
 	MaxChangedFiles *int `json:"maxChangedFiles,omitempty"`
 	MaxDeletions    *int `json:"maxDeletions,omitempty"`
+}
+
+type PartialEscalatorRoleConfig struct {
+	Enabled               *bool  `json:"enabled,omitempty"`
+	CadenceSeconds        *int   `json:"cadenceSeconds,omitempty"`
+	RetryAttemptThreshold *int64 `json:"retryAttemptThreshold,omitempty"`
+	UnroutedAfterSeconds  *int   `json:"unroutedAfterSeconds,omitempty"`
+	StaleHeadAfterSeconds *int   `json:"staleHeadAfterSeconds,omitempty"`
+	MaxItems              *int   `json:"maxItems,omitempty"`
 }
 
 type PartialAuditorRoleConfig struct {
@@ -1350,6 +1472,7 @@ type PartialRoleConfigs struct {
 	Gatekeeper  *PartialGatekeeperRoleConfig       `json:"gatekeeper,omitempty"`
 	Auditor     *PartialAuditorRoleConfig          `json:"auditor,omitempty"`
 	Deployer    *PartialDeployerRoleConfig         `json:"deployer,omitempty"`
+	Escalator   *PartialEscalatorRoleConfig        `json:"escalator,omitempty"`
 	// Deprecated: sweeper was retired and is ignored when present in older configs.
 	Sweeper *map[string]any `json:"sweeper,omitempty"`
 }

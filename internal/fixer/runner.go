@@ -38,6 +38,7 @@ import (
 	"github.com/MumuTW/looper/internal/loops/failureclass"
 	"github.com/MumuTW/looper/internal/processcontainment"
 	"github.com/MumuTW/looper/internal/reproducer"
+	"github.com/MumuTW/looper/internal/reviewitem"
 	"github.com/MumuTW/looper/internal/storage"
 	"github.com/MumuTW/looper/internal/validation"
 	"github.com/MumuTW/looper/internal/worktreesafety"
@@ -81,6 +82,11 @@ const (
 	defaultRetryDelay               = 5 * time.Second
 	maxRetryDelay                   = 300 * time.Second
 	defaultRetryMax                 = 3
+	// durableRecoveryTimeout bounds the detached context used after a claimed
+	// operation has already failed. Queue/loop reconciliation must survive the
+	// operation context being cancelled, but it must not wait indefinitely on a
+	// blocked SQLite call while the claim is held.
+	durableRecoveryTimeout = 5 * time.Second
 )
 
 type FixItem struct {
@@ -88,21 +94,22 @@ type FixItem struct {
 	Source string `json:"source,omitempty"`
 	// ID identifies the item within its Source; only Source tells you which
 	// identity space an ID belongs to.
-	ID                  string   `json:"id,omitempty"`
-	ThreadID            string   `json:"threadId,omitempty"`
-	ThreadFingerprint   string   `json:"threadFingerprint,omitempty"`
-	ProviderCommentID   int64    `json:"providerCommentId,omitempty"`
-	ObservedFingerprint string   `json:"observedFingerprint,omitempty"`
-	ResolverPresent     bool     `json:"resolverPresent,omitempty"`
-	Name                string   `json:"name,omitempty"`
-	Summary             string   `json:"summary,omitempty"`
-	Body                string   `json:"body,omitempty"`
-	DiffHunk            string   `json:"diffHunk,omitempty"`
-	Files               []string `json:"files,omitempty"`
-	Author              string   `json:"author,omitempty"`
-	URL                 string   `json:"url,omitempty"`
-	Path                string   `json:"path,omitempty"`
-	Line                int64    `json:"line,omitempty"`
+	ID                  string              `json:"id,omitempty"`
+	ThreadID            string              `json:"threadId,omitempty"`
+	ThreadFingerprint   string              `json:"threadFingerprint,omitempty"`
+	ProviderCommentID   int64               `json:"providerCommentId,omitempty"`
+	ObservedFingerprint string              `json:"observedFingerprint,omitempty"`
+	ResolverPresent     bool                `json:"resolverPresent,omitempty"`
+	Name                string              `json:"name,omitempty"`
+	Summary             string              `json:"summary,omitempty"`
+	Body                string              `json:"body,omitempty"`
+	DiffHunk            string              `json:"diffHunk,omitempty"`
+	Files               []string            `json:"files,omitempty"`
+	Author              string              `json:"author,omitempty"`
+	URL                 string              `json:"url,omitempty"`
+	Path                string              `json:"path,omitempty"`
+	Line                int64               `json:"line,omitempty"`
+	Severity            reviewitem.Severity `json:"severity,omitempty"`
 }
 
 type PullRequestSummary struct {
@@ -150,6 +157,12 @@ type ViewPullRequestInput struct {
 	Repo     string
 	PRNumber int64
 	CWD      string
+}
+
+type ViewIssueInput struct {
+	Repo        string
+	IssueNumber int64
+	CWD         string
 }
 
 type PullRequestReviewersInput struct {
@@ -256,6 +269,83 @@ type PullRequestLabelsInput struct {
 	PRNumber int64
 	Labels   []string
 	CWD      string
+}
+
+// RegenerateIssueInput is the durable handoff from an exhausted Fixer loop
+// back to Planner.  The authority is stable for the loop, so a replay after a
+// crash can safely project the same route again.
+type RegenerateIssueInput struct {
+	ProjectID      string
+	Repo           string
+	IssueRepo      string
+	IssueNumber    int64
+	IssueTitle     string
+	IssueBody      string
+	IssueURL       string
+	IssueLabels    []string
+	IssueAssignees []string
+	FailureSummary string
+	FailureContext string
+	Attempts       int64
+	MaxAttempts    int64
+	Authority      string
+}
+
+// RegenerateIssueFunc is the explicit Planner route authority.  Fixer owns
+// the ordered PR side effects; runtime owns the Planner projection.
+type RegenerateIssueFunc func(context.Context, RegenerateIssueInput) error
+
+// RegenerationAvailabilityFunc is checked before any close-and-regenerate
+// side effect. A non-empty reason escalates the exhausted PR instead of
+// closing it when the downstream Planner authority is unavailable.
+type RegenerationAvailabilityFunc func(projectID string) string
+
+// RegenerationGateway is deliberately separate from GitHubGateway.  Existing
+// fixer fakes and integrations remain source-compatible while terminal
+// exhaustion opts into the stronger close-and-regenerate capability.
+type RegenerationGateway interface {
+	ViewIssue(context.Context, ViewIssueInput) (IssueDetail, error)
+	ListIssueComments(context.Context, ViewIssueInput) ([]IssueComment, error)
+	ClosePullRequest(context.Context, ClosePullRequestInput) error
+	AddIssueLabels(context.Context, IssueLabelsInput) error
+	RemoveIssueLabels(context.Context, IssueLabelsInput) error
+	ListPullRequestCommits(context.Context, ViewPullRequestInput) ([]PullRequestCommit, error)
+	AddPullRequestLabels(context.Context, PullRequestLabelsInput) error
+}
+
+type IssueDetail struct {
+	Number    int64
+	Title     string
+	Body      string
+	URL       string
+	State     string
+	Labels    []string
+	Assignees []string
+}
+
+type IssueComment struct {
+	ID   int64
+	Body string
+}
+
+type IssueLabelsInput struct {
+	Repo        string
+	IssueNumber int64
+	Labels      []string
+	CWD         string
+}
+
+type ClosePullRequestInput struct {
+	Repo         string
+	PRNumber     int64
+	DeleteBranch bool
+	CWD          string
+}
+
+type PullRequestCommit struct {
+	SHA            string
+	AuthorLogin    string
+	CommitterLogin string
 }
 
 type GitHubGateway interface {
@@ -495,6 +585,9 @@ type Options struct {
 	MaxFixerRoundsPerPullRequest int
 	OnAgentExecutionStarted      AgentExecutionStartedFunc
 	OnQueueItemEnqueued          func()
+	OnRegenerateIssue            RegenerateIssueFunc
+	RegenerationAvailability     RegenerationAvailabilityFunc
+	DeleteBranchOnRegeneration   func(projectID string) bool
 }
 
 type DiscoveryPolicy struct {
@@ -540,6 +633,9 @@ type Runner struct {
 	maxFixerRounds              int
 	onAgentExecutionStarted     AgentExecutionStartedFunc
 	onQueueItemEnqueued         func()
+	onRegenerateIssue           RegenerateIssueFunc
+	regenerationAvailability    RegenerationAvailabilityFunc
+	deleteBranchOnRegeneration  func(projectID string) bool
 }
 
 type DiscoveryInput struct {
@@ -1697,6 +1793,9 @@ func New(options Options) *Runner {
 		maxFixerRounds:              maxFixerRounds,
 		onAgentExecutionStarted:     options.OnAgentExecutionStarted,
 		onQueueItemEnqueued:         options.OnQueueItemEnqueued,
+		onRegenerateIssue:           options.OnRegenerateIssue,
+		regenerationAvailability:    options.RegenerationAvailability,
+		deleteBranchOnRegeneration:  options.DeleteBranchOnRegeneration,
 	}
 }
 
@@ -1716,6 +1815,27 @@ func (r *Runner) validationCommandsForProject(projectID string) []string {
 		return commands
 	}
 	return r.validationCommands
+}
+
+// projectValidationPolicyKnown reports whether projectID has a resolved
+// validation policy entry from the runtime catalog. The runtime always
+// supplies validationCommandsByProject (possibly empty) from
+// config.ResolveProjectValidationCommandsByID; a nil map means the runner was
+// constructed without catalog policy information (tests/legacy), so the legacy
+// global-defaults fallback in validationCommandsForProject is preserved. A
+// non-nil map without an entry for projectID means the project was removed from
+// the catalog — an unstanced legacy row quarantined because
+// defaults.validationCommands is empty and it carries no validation stance.
+// Its durable sticky retry must fail closed before any agent work so it cannot
+// modify or publish code without the project-owned validation gate that caused
+// it to be quarantined; validation.RunCommands otherwise reports success
+// without running anything against the empty defaults fallback.
+func (r *Runner) projectValidationPolicyKnown(projectID string) bool {
+	if r.validationCommandsByProject == nil {
+		return true
+	}
+	_, ok := r.validationCommandsByProject[projectID]
+	return ok
 }
 
 func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput) (DiscoveryResult, error) {
@@ -1867,6 +1987,17 @@ func (r *Runner) DiscoverPullRequest(ctx context.Context, input TargetedDiscover
 		}
 		result.Skipped++
 		return result, nil
+	}
+	// Reject discovery if the PR has an active human_takeover loop on ANY lane
+	existingLoops, err := r.repos.Loops.List(ctx)
+	if err != nil {
+		return DiscoveryResult{}, err
+	}
+	for _, existing := range existingLoops {
+		if existing.ProjectID == project.ID && derefString(existing.Repo) == input.Repo && derefInt64(existing.PRNumber) == input.PRNumber && existing.Status == "human_takeover" {
+			result.Skipped++
+			return result, nil
+		}
 	}
 	if err := r.discoverPullRequestFromDetail(ctx, *project, input.Repo, detail, &result); err != nil {
 		return DiscoveryResult{}, err
@@ -2182,13 +2313,30 @@ func (r *Runner) ProcessNext(ctx context.Context, claimedBy string) (*ProcessRes
 func (r *Runner) ProcessClaimedQueueItem(ctx context.Context, queueItem storage.QueueItemRecord) (*ProcessResult, error) {
 	result, err := r.ProcessClaimedItem(ctx, queueItem)
 	if err != nil {
+		var handoffErr *regenerationHandoffError
+		if errors.As(err, &handoffErr) && r.repos != nil && r.repos.Queue != nil {
+			if replay, getErr := r.repos.Queue.GetByID(ctx, queueItem.ID); getErr == nil && replay != nil && replay.Status == "queued" {
+				return &ProcessResult{LoopID: derefString(queueItem.LoopID), QueueItemID: queueItem.ID, Status: "queued", Summary: handoffErr.Error(), FailureKind: FailureRetryableTransient}, nil
+			}
+		}
 		return r.recoverClaimedItem(ctx, queueItem, err)
 	}
 	return &result, nil
 }
 
 func (r *Runner) recoverClaimedItem(ctx context.Context, queueItem storage.QueueItemRecord, err error) (*ProcessResult, error) {
+	// Processing may return an error after a durable queue write has committed,
+	// and shutdown/cancellation can arrive before the caller enters recovery.
+	// Recovery owns the durable queue/loop transition, so detach cancellation
+	// while preserving context values and bound the cleanup window. Otherwise a
+	// terminal queue row can be left paired with a queued loop when the next
+	// GetByID observes the cancelled operation context.
+	recoveryCtx, cancel := newDurableRecoveryContext(ctx)
+	defer cancel()
+	ctx = recoveryCtx
 	failure := r.classifyFailure(err)
+	var regenerationErr *regenerationHandoffError
+	_ = errors.As(err, &regenerationErr)
 	var activeErr *activeRunError
 	var runFailure *claimedRunFailureError
 	var failedQueue *storage.QueueItemRecord
@@ -2247,31 +2395,60 @@ func (r *Runner) recoverClaimedItem(ctx context.Context, queueItem storage.Queue
 			return nil, err
 		}
 		if loop != nil {
+			project, projectErr := r.repos.Projects.GetByID(ctx, loop.ProjectID)
+			if projectErr != nil {
+				return nil, projectErr
+			}
+			if project == nil {
+				return nil, fmt.Errorf("project not found: %s", loop.ProjectID)
+			}
+			resumed := false
 			if runFailure != nil {
-				project, projectErr := r.repos.Projects.GetByID(ctx, loop.ProjectID)
-				if projectErr != nil {
-					return nil, projectErr
-				}
-				if project != nil {
-					if breakerStreak > 0 && breakerPause != nil {
-						resumed, resumeErr := r.finishFailureStreakBreaker(ctx, *project, *breakerPause, queueItem, runFailure.runID, &runFailure.checkpoint)
-						if resumeErr != nil {
-							return nil, resumeErr
-						}
-						if resumed {
-							return &ProcessResult{LoopID: derefString(queueItem.LoopID), QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
-						}
-					} else {
-						r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, runFailure.runID, &runFailure.checkpoint)
+				if breakerStreak > 0 && breakerPause != nil {
+					var resumeErr error
+					resumed, resumeErr = r.finishFailureStreakBreaker(ctx, *project, *breakerPause, queueItem, runFailure.runID, &runFailure.checkpoint)
+					if resumeErr != nil {
+						return nil, resumeErr
+					}
+					if resumed {
+						return &ProcessResult{LoopID: derefString(queueItem.LoopID), QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
 					}
 				}
+				if !resumed {
+					r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, runFailure.runID, &runFailure.checkpoint)
+				}
 			}
-			if _, err := r.schedulePendingRediscoveryAfterRun(ctx, *loop, *queueItem.Repo, *queueItem.PRNumber); err != nil {
+			scheduled, err := r.schedulePendingRediscoveryAfterRun(ctx, *loop, *queueItem.Repo, *queueItem.PRNumber)
+			if err != nil {
 				return nil, err
+			}
+			if !scheduled && (runFailure != nil || regenerationErr != nil) {
+				checkpoint := fixerCheckpoint{}
+				handoffFailure := failure
+				if runFailure != nil {
+					checkpoint = runFailure.checkpoint
+				}
+				if regenerationErr != nil {
+					checkpoint = regenerationErr.checkpoint
+					handoffFailure = regenerationErr.failure
+				}
+				if queueResultAllowsRegeneration(failedQueue, handoffFailure) {
+					if _, _, err := r.applyTerminalRegeneration(ctx, *project, *loop, queueItem, checkpoint, handoffFailure); err != nil {
+						return nil, err
+					}
+				}
 			}
 		}
 	}
 	return &ProcessResult{LoopID: derefString(queueItem.LoopID), QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
+}
+
+func newDurableRecoveryContext(parent context.Context) (context.Context, context.CancelFunc) {
+	base := context.Background()
+	if parent != nil {
+		base = context.WithoutCancel(parent)
+	}
+	return context.WithTimeout(base, durableRecoveryTimeout)
 }
 
 func (r *Runner) reconcileRecoveredLoop(ctx context.Context, queueItem storage.QueueItemRecord, failedQueue *storage.QueueItemRecord) (*storage.LoopRecord, error) {
@@ -2319,6 +2496,29 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	if loop == nil {
 		return ProcessResult{}, fmt.Errorf("loop not found: %s", *queueItem.LoopID)
 	}
+	// A terminal handoff is itself durable work. If the daemon was restarted
+	// after the PR comment/close but before Planner accepted the route, replay
+	// that suffix instead of treating the paused/failed loop as an ordinary
+	// fixer item (which would strand the closed PR forever).
+	if r.onRegenerateIssue != nil {
+		if state, ok := parseRegenerationState(parseJSONObject(loop.MetadataJSON)); ok && !state.Routed {
+			project, projectErr := r.repos.Projects.GetByID(ctx, loop.ProjectID)
+			if projectErr != nil {
+				return ProcessResult{}, projectErr
+			}
+			if project == nil {
+				return ProcessResult{}, fmt.Errorf("project not found: %s", loop.ProjectID)
+			}
+			replayFailure := regenerationFailureFromState(state)
+			_, action, replayErr := r.applyTerminalRegeneration(ctx, *project, *loop, queueItem, fixerCheckpoint{}, replayFailure)
+			if replayErr != nil {
+				return ProcessResult{}, replayErr
+			}
+			if action == regenerationCompleted || action == regenerationEscalated {
+				return ProcessResult{LoopID: loop.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: replayFailure.message, FailureKind: replayFailure.kind}, nil
+			}
+		}
+	}
 	// A pending-rediscovery queue row can become visible while its resume
 	// handoff is still clearing metadata and changing the loop to queued.
 	// Requeue only that row without spending an attempt; other paused loops
@@ -2365,6 +2565,19 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	}
 	if project == nil {
 		return ProcessResult{}, fmt.Errorf("project not found: %s", loop.ProjectID)
+	}
+	// A project removed from the runtime catalog (quarantined unstanced legacy
+	// row with empty defaults.validationCommands) has no resolved validation
+	// policy. Its durable sticky retry must fail closed before any agent work
+	// so it cannot modify or publish code without the project-owned validation
+	// gate. recoverClaimedItem terminal-fails the queue item and pauses the
+	// loop; the project becomes runnable again once repaired via PATCH or once
+	// defaults.validationCommands is configured.
+	if !r.projectValidationPolicyKnown(project.ID) {
+		return ProcessResult{}, &loopError{
+			message: fmt.Sprintf("project %s is quarantined without a validation policy; repair the project validation stance or configure defaults.validationCommands before retrying", project.ID),
+			kind:    FailureManualIntervention,
+		}
 	}
 	resumedRun, err := r.createRunContext(ctx, *loop)
 	if err != nil {
@@ -2478,8 +2691,14 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		}
 		if breakerStreak > 0 {
 			r.appendFailureStreakPausedEvent(ctx, pausedLoop, run.ID, latest, breakerStreak)
-			if _, err := r.finishFailureStreakBreaker(ctx, *project, pausedLoop, queueItem, run.ID, &latest); err != nil {
+			resumed, err := r.finishFailureStreakBreaker(ctx, *project, pausedLoop, queueItem, run.ID, &latest)
+			if err != nil {
 				return ProcessResult{}, err
+			}
+			if !resumed && queueResultAllowsRegeneration(failedQueue, failure) {
+				if _, _, err := r.applyTerminalRegeneration(ctx, *project, pausedLoop, queueItem, latest, failure); err != nil {
+					return ProcessResult{}, err
+				}
 			}
 			return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
 		}
@@ -2489,6 +2708,11 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			} else if scheduled {
 				r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, run.ID, &latest)
 				return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
+			}
+		}
+		if queueResultAllowsRegeneration(failedQueue, failure) {
+			if _, _, err := r.applyTerminalRegeneration(ctx, *project, pausedLoop, queueItem, latest, failure); err != nil {
+				return ProcessResult{}, err
 			}
 		}
 		if queueResultIsTerminalForCleanup(failedQueue) {
@@ -2619,8 +2843,14 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			}
 			if breakerStreak > 0 {
 				r.appendFailureStreakPausedEvent(ctx, pausedLoop, run.ID, latest, breakerStreak)
-				if _, err := r.finishFailureStreakBreaker(ctx, *project, pausedLoop, queueItem, run.ID, &latest); err != nil {
+				resumed, err := r.finishFailureStreakBreaker(ctx, *project, pausedLoop, queueItem, run.ID, &latest)
+				if err != nil {
 					return ProcessResult{}, err
+				}
+				if !resumed && queueResultAllowsRegeneration(failedQueue, failure) {
+					if _, _, err := r.applyTerminalRegeneration(ctx, *project, pausedLoop, queueItem, latest, failure); err != nil {
+						return ProcessResult{}, err
+					}
 				}
 				return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
 			}
@@ -2630,6 +2860,11 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 				} else if scheduled {
 					r.cleanupFixerWorktreeIfTerminal(context.Background(), *project, run.ID, &latest)
 					return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
+				}
+			}
+			if queueResultAllowsRegeneration(failedQueue, failure) {
+				if _, _, err := r.applyTerminalRegeneration(ctx, *project, pausedLoop, queueItem, latest, failure); err != nil {
+					return ProcessResult{}, err
 				}
 			}
 			if queueResultIsTerminalForCleanup(failedQueue) {
@@ -4053,7 +4288,9 @@ func (r *Runner) runResolveCommentsStep(ctx context.Context, input stepInput) (f
 			continue
 		}
 		if normalizeReplyAction(decision.Action) == string(replyActionDeferred) {
-			upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Action: string(replyActionDeferred), Status: "deferred", Message: decision.Explanation, UpdatedAt: r.nowISO()})
+			deferredFingerprint := buildDeferredThreadFingerprint(item, liveDetail.HeadSHA)
+			replyState, replyError := r.replyToDeferredComment(ctx, input, item, deferredFingerprint, decision.Explanation, checkpoint.ResolvedComments.Items)
+			upsertResolvedComment(&checkpoint.ResolvedComments.Items, checkpointResolvedComment{FixItemID: item.ID, ThreadID: item.ThreadID, Action: string(replyActionDeferred), Status: "deferred", Message: decision.Explanation, UpdatedAt: r.nowISO(), ReplyState: replyState, ReplyError: replyError})
 			deferredThreadIDs = append(deferredThreadIDs, item.ThreadID)
 			if checkpoint.Outcome == nil {
 				checkpoint.Outcome = &FixerRunOutcome{}
@@ -4217,6 +4454,35 @@ func (r *Runner) replyToDeclinedComment(ctx context.Context, input stepInput, it
 	return "sent", ""
 }
 
+func (r *Runner) replyToDeferredComment(ctx context.Context, input stepInput, item FixItem, decisionFingerprint, explanation string, existing []checkpointResolvedComment) (string, string) {
+	if item.ThreadID == "" {
+		return "skipped_no_thread", ""
+	}
+	for _, entry := range existing {
+		if entry.Action != string(replyActionDeferred) {
+			continue
+		}
+		if entry.FixItemID == item.ID || (entry.ThreadID != "" && entry.ThreadID == item.ThreadID) {
+			if entry.ReplyState == "sent" || entry.ReplyState == "skipped_self_author" || entry.ReplyState == "skipped_no_thread" {
+				return entry.ReplyState, entry.ReplyError
+			}
+		}
+	}
+	body := buildFixerDeferredReplyBody(item, explanation, decisionFingerprint)
+	existingRemoteReply, err := r.hasExistingFixerDeferredReply(ctx, input, item, decisionFingerprint)
+	if err != nil {
+		return "failed", err.Error()
+	}
+	if existingRemoteReply {
+		return "sent", ""
+	}
+	disclosureAgent, disclosureModel := r.disclosureIdentity(input.Run)
+	if err := r.github.AddReviewThreadReply(ctx, AddReviewThreadReplyInput{Repo: input.Repo, ThreadID: item.ThreadID, Body: body, CWD: input.Project.RepoPath, DisclosureAgent: disclosureAgent, DisclosureModel: disclosureModel}); err != nil {
+		return "failed", err.Error()
+	}
+	return "sent", ""
+}
+
 func (r *Runner) hasExistingFixerReply(ctx context.Context, input stepInput, item FixItem, commitSHA string) (bool, error) {
 	marker := fixerReplyMarker(item.ThreadID, commitSHA)
 	if marker == "" {
@@ -4236,6 +4502,23 @@ func (r *Runner) hasExistingFixerReply(ctx context.Context, input stepInput, ite
 
 func (r *Runner) hasExistingFixerDeclinedReply(ctx context.Context, input stepInput, item FixItem, decisionFingerprint string) (bool, error) {
 	marker := fixerDeclinedReplyMarker(item.ThreadID, decisionFingerprint)
+	if marker == "" {
+		return false, nil
+	}
+	thread, err := r.github.ViewReviewThread(ctx, ViewReviewThreadInput{Repo: input.Repo, ThreadID: item.ThreadID, CWD: input.Project.RepoPath})
+	if err != nil {
+		return false, err
+	}
+	for _, comment := range thread.Comments {
+		if strings.Contains(comment.Body, marker) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (r *Runner) hasExistingFixerDeferredReply(ctx context.Context, input stepInput, item FixItem, decisionFingerprint string) (bool, error) {
+	marker := fixerDeferredReplyMarker(item.ThreadID, decisionFingerprint)
 	if marker == "" {
 		return false, nil
 	}
@@ -4491,6 +4774,26 @@ func buildFixerDeclinedReplyBody(item FixItem, explanation, decisionFingerprint 
 	return b.String()
 }
 
+func buildFixerDeferredReplyBody(item FixItem, explanation, decisionFingerprint string) string {
+	var b strings.Builder
+	mention := strings.TrimSpace(item.Author)
+	if mention != "" {
+		b.WriteString("@")
+		b.WriteString(mention)
+		b.WriteString(" ")
+	}
+	b.WriteString("This review item is deferred for human follow-up.")
+	if explanation = strings.TrimSpace(explanation); explanation != "" {
+		b.WriteString("\n\n")
+		b.WriteString(explanation)
+	}
+	if marker := fixerDeferredReplyMarker(item.ThreadID, decisionFingerprint); marker != "" {
+		b.WriteString("\n\n")
+		b.WriteString(marker)
+	}
+	return b.String()
+}
+
 func hasSubstantiveDeclineExplanation(explanation string) bool {
 	explanation = strings.TrimSpace(explanation)
 	if explanation == "" {
@@ -4520,6 +4823,15 @@ func fixerDeclinedReplyMarker(threadID, decisionFingerprint string) string {
 		return ""
 	}
 	return fmt.Sprintf("<!-- looper-fixer-reply-declined thread:%s fingerprint:%s -->", threadID, decisionFingerprint)
+}
+
+func fixerDeferredReplyMarker(threadID, decisionFingerprint string) string {
+	threadID = strings.TrimSpace(threadID)
+	decisionFingerprint = strings.TrimSpace(decisionFingerprint)
+	if threadID == "" || decisionFingerprint == "" {
+		return ""
+	}
+	return fmt.Sprintf("<!-- looper-fixer-reply-deferred thread:%s fingerprint:%s -->", threadID, decisionFingerprint)
 }
 
 func summarizeFixItem(item FixItem) string {
@@ -5203,6 +5515,9 @@ func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.P
 			}
 			return loopUpsertResult{record: updatedLoop, created: false, pending: true}, nil
 		}
+		if updatedLoop.Status == "human_takeover" {
+			return loopUpsertResult{record: updatedLoop, created: false}, nil
+		}
 		// Charged after the pending-rediscovery branch above: a discovery that
 		// lands while a run is active is not another round, it is the same one.
 		charged, parked, err := r.chargeFixerRound(ctx, updatedLoop, headSHA)
@@ -5220,6 +5535,20 @@ func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.P
 			return loopUpsertResult{}, err
 		}
 		return loopUpsertResult{record: updatedLoop, created: false, availableAt: availableAt}, nil
+	}
+	for _, existing := range existingLoops {
+		if existing.ProjectID != project.ID {
+			continue
+		}
+		if derefString(existing.Repo) != repo {
+			continue
+		}
+		if derefInt64(existing.PRNumber) != prNumber {
+			continue
+		}
+		if existing.Status == "human_takeover" {
+			return loopUpsertResult{}, fmt.Errorf("cannot create fixer loop: PR #%d has an active human_takeover loop (%s)", prNumber, existing.ID)
+		}
 	}
 	targetID := buildPullRequestTargetID(repo, prNumber)
 	if r.db == nil {
@@ -7039,7 +7368,31 @@ func clearUnusableFixerWorktreePath(path string) error {
 }
 
 func queueResultIsTerminalForCleanup(queue *storage.QueueItemRecord) bool {
-	return queue == nil || (queue.Status != "queued" && queue.Status != "manual_intervention")
+	if queue == nil || queue.Status == "queued" {
+		return queue == nil
+	}
+	// Queue.Fail uses manual_intervention for every terminal failure kind. Keep
+	// the worktree for an explicit manual-intervention park, but retryable
+	// exhaustion is terminal cleanup just like the legacy failed status.
+	if queue.Status == "manual_intervention" {
+		return strings.TrimSpace(derefString(queue.LastErrorKind)) != string(FailureManualIntervention)
+	}
+	return true
+}
+
+// queueResultAllowsRegeneration identifies a durable terminal queue outcome
+// that should enter close-and-regenerate. Queue.Fail persists
+// manual_intervention for retryable exhaustion as well as explicit manual
+// parks, so the failure kind—not the status string alone—is the authority. The
+// legacy failed status remains accepted for old rows and focused callers.
+func queueResultAllowsRegeneration(queue *storage.QueueItemRecord, failure *loopError) bool {
+	if queue == nil || failure == nil || failure.kind == FailureManualIntervention {
+		return false
+	}
+	if persistedKind := strings.TrimSpace(derefString(queue.LastErrorKind)); persistedKind != "" && persistedKind == string(FailureManualIntervention) {
+		return false
+	}
+	return queue.Status == "failed" || queue.Status == "manual_intervention"
 }
 
 type waitForPullRequestHeadSHAInput struct {
@@ -7375,7 +7728,8 @@ func normalizeFixItems(comments []map[string]any, checks []map[string]any, hasCo
 		case int:
 			line = int64(v)
 		}
-		result = append(result, FixItem{Type: "comment", Source: source, ID: id, ThreadID: threadID, ThreadFingerprint: threadFingerprint, ProviderCommentID: providerCommentID, ObservedFingerprint: observedFingerprint, ResolverPresent: resolverPresent, Summary: summary, Body: body, DiffHunk: diffHunk, Author: author, URL: url, Path: path, Line: line})
+		severity, _ := reviewitem.SeverityFromBody(body)
+		result = append(result, FixItem{Type: "comment", Source: source, ID: id, ThreadID: threadID, ThreadFingerprint: threadFingerprint, ProviderCommentID: providerCommentID, ObservedFingerprint: observedFingerprint, ResolverPresent: resolverPresent, Summary: summary, Body: body, DiffHunk: diffHunk, Author: author, URL: url, Path: path, Line: line, Severity: severity})
 	}
 	for _, check := range checks {
 		if !isFailingCheck(check) {
@@ -7465,6 +7819,17 @@ func hashFixItemsState(items []FixItem) string {
 
 func buildDeclinedThreadFingerprint(item FixItem, headSHA string) string {
 	payload := strings.Join([]string{
+		strings.TrimSpace(item.ThreadID),
+		normalizeThreadFingerprint(item.ThreadFingerprint, item.ThreadID, item.ID),
+		strings.TrimSpace(headSHA),
+	}, "|")
+	sum := sha1.Sum([]byte(payload))
+	return hex.EncodeToString(sum[:])
+}
+
+func buildDeferredThreadFingerprint(item FixItem, headSHA string) string {
+	payload := strings.Join([]string{
+		"deferred",
 		strings.TrimSpace(item.ThreadID),
 		normalizeThreadFingerprint(item.ThreadFingerprint, item.ThreadID, item.ID),
 		strings.TrimSpace(headSHA),

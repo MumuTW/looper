@@ -337,6 +337,18 @@ func startDeployLane(ctx context.Context, input defaultSchedulerTickInput, proje
 	if !role.Enabled || strings.TrimSpace(role.Command) == "" {
 		return
 	}
+	// Host pressure must gate the deploy lane too: the discovery-lane hold
+	// only breaks the inner lane loop, so without a gate here a tick that
+	// skipped discovery still reaches startDeployLane and launches an
+	// operator shell command that runs for up to the deploy timeout. A deploy
+	// is the most resource-intensive action a tick takes, so the same host
+	// admission decision that withholds claims and discovery must withhold it.
+	if held := hostAdmissionHeld(input, "deploy"); held != nil {
+		if input.Logger != nil {
+			input.Logger.Debug("deployer: skipped deploy lane under host pressure", map[string]any{"projectId": project.ID, "repo": repo, "reasons": held.Reasons})
+		}
+		return
+	}
 	if _, running := deployInFlight.LoadOrStore(project.ID, struct{}{}); running {
 		if input.Logger != nil {
 			input.Logger.Debug("deployer: a deploy is already running for this project", map[string]any{"projectId": project.ID})

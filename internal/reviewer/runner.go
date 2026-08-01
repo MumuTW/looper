@@ -419,6 +419,7 @@ type Options struct {
 	AllowAutoApprove        bool
 	ReviewEvents            config.ReviewerReviewEventsConfig
 	LoopConfig              config.ReviewerLoopConfig
+	Convergence             config.ReviewerConvergenceConfig
 	DiscoveryPolicy         DiscoveryPolicy
 	Scope                   config.ReviewerScope
 	DetectDuplicateFindings bool
@@ -469,6 +470,7 @@ type Runner struct {
 	allowAutoApprove        bool
 	reviewEvents            config.ReviewerReviewEventsConfig
 	loopConfig              config.ReviewerLoopConfig
+	convergence             config.ReviewerConvergenceConfig
 	discoveryPolicy         DiscoveryPolicy
 	scope                   config.ReviewerScope
 	detectDuplicateFindings bool
@@ -693,6 +695,7 @@ func New(options Options) *Runner {
 		allowAutoApprove:        options.AllowAutoApprove,
 		reviewEvents:            reviewEvents,
 		loopConfig:              loopConfig,
+		convergence:             options.Convergence,
 		discoveryPolicy:         policy,
 		scope:                   scope,
 		detectDuplicateFindings: options.DetectDuplicateFindings,
@@ -1560,6 +1563,10 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		r.appendEvent(ctx, eventInput{eventType: "loop.step.started", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"step": string(step), "startedAt": eventlog.FormatJavaScriptISOString(stepStartedAt.UTC())}})
 		checkpoint, err = r.executeStep(ctx, step, stepInput{Project: *project, Loop: *loop, Run: run, QueueItem: queueItem, Repo: *queueItem.Repo, PRNumber: *queueItem.PRNumber, Checkpoint: checkpoint})
 		if err != nil {
+			var convergenceErr *reviewerConvergenceAwaitingHumanError
+			if errors.As(err, &convergenceErr) {
+				return r.suspendReviewerForConvergence(ctx, *loop, run, queueItem, checkpoint, convergenceErr)
+			}
 			var holdErr *holdSkipError
 			if errors.As(err, &holdErr) {
 				return r.finishHeldReviewerQueueItem(ctx, *loop, &run, queueItem, checkpoint, holdErr.summary)
@@ -2768,6 +2775,9 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 		return checkpoint, &loopError{message: "Missing pending review checkpoint for publish step", kind: FailureRetryableAfterResume}
 	}
 	pending := *checkpoint.PendingReview
+	if handled, err := r.handleConvergenceHumanAnswer(ctx, input, &checkpoint); handled || err != nil {
+		return checkpoint, err
+	}
 	meta := parseJSONObject(input.Loop.MetadataJSON)
 	if last, ok := stringFromAny(meta["lastPublishedHeadSha"]); ok && last == pending.HeadSHA {
 		checkpoint.SkipReason = fmt.Sprintf("Skipped already-published review for head %s", pending.HeadSHA)
@@ -2808,7 +2818,7 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 		if criteriaResult, err := r.maybePublishCriteriaAnchoredCleanReview(ctx, input, checkpoint, pending, detail); err != nil {
 			return checkpoint, err
 		} else if criteriaResult != nil {
-			if err := r.recordPublishedReviewProgress(ctx, input, pending, criteriaResult.reviewEvent, !criteriaResult.recordOnly); err != nil {
+			if err := r.recordPublishedReviewAndConvergence(ctx, input, pending, criteriaResult.reviewEvent, detail, !criteriaResult.recordOnly); err != nil {
 				return checkpoint, err
 			}
 			return checkpoint, nil
@@ -2834,7 +2844,7 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 			if err := r.applyVerifiedReviewSideEffects(ctx, input, checkpoint, detail, found); err != nil {
 				return checkpoint, err
 			}
-			if err := r.recordPublishedReviewProgress(ctx, input, pending, pendingReviewEvent(pending), true); err != nil {
+			if err := r.recordPublishedReviewAndConvergence(ctx, input, pending, pendingReviewEvent(pending), detail, true); err != nil {
 				return checkpoint, err
 			}
 			return checkpoint, nil
@@ -2848,7 +2858,7 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 		// for this policy. Recording markerVerified=true publishes evidence
 		// Gatekeeper accepts and marks the head as published so discovery does not
 		// re-run the same markerless path indefinitely.
-		if err := r.recordPublishedReviewProgress(ctx, input, pending, ReviewEventComment, true); err != nil {
+		if err := r.recordPublishedReviewAndConvergence(ctx, input, pending, ReviewEventComment, detail, true); err != nil {
 			return checkpoint, err
 		}
 		return checkpoint, nil
@@ -2956,7 +2966,7 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 	if err := r.applyVerifiedReviewSideEffects(ctx, input, checkpoint, detail, markerResult); err != nil {
 		return checkpoint, err
 	}
-	if err := r.recordPublishedReviewProgress(ctx, input, pending, pendingReviewEvent(pending), true); err != nil {
+	if err := r.recordPublishedReviewAndConvergence(ctx, input, pending, pendingReviewEvent(pending), detail, true); err != nil {
 		return checkpoint, err
 	}
 	return checkpoint, nil
@@ -4083,6 +4093,9 @@ func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.P
 		if terminalReviewerLoopReason(*existing) != "" && budgetTerminationReason == "" {
 			return loopUpsertResult{record: *existing, created: false}, nil
 		}
+		if existing.Status == "human_takeover" {
+			return loopUpsertResult{record: *existing, created: false}, nil
+		}
 		updated := *existing
 		metadataJSONSource := updated.MetadataJSON
 		// Strict-decode the ORIGINAL value before any re-encoding: building the
@@ -4115,6 +4128,15 @@ func (r *Runner) ensureLoopForPullRequest(ctx context.Context, project storage.P
 			return loopUpsertResult{}, err
 		}
 		return loopUpsertResult{record: updated, created: false}, nil
+	}
+	allLoops, err := r.repos.Loops.List(ctx)
+	if err != nil {
+		return loopUpsertResult{}, err
+	}
+	for _, existingLoop := range allLoops {
+		if existingLoop.ProjectID == project.ID && derefString(existingLoop.Repo) == repo && derefInt64(existingLoop.PRNumber) == prNumber && existingLoop.Status == "human_takeover" {
+			return loopUpsertResult{}, fmt.Errorf("cannot create reviewer loop: PR #%d has an active human_takeover loop (%s)", prNumber, existingLoop.ID)
+		}
 	}
 	targetID := fmt.Sprintf("pr:%s:%d", repo, prNumber)
 	if r.db == nil {
@@ -5489,6 +5511,9 @@ func (r *Runner) recordLoopRunStartMetadata(current *string, projectID string) (
 			"blocking": string(reviewEvents.Blocking),
 		}
 	}
+	if err := r.snapshotConvergencePolicy(meta, projectID); err != nil {
+		return "", err
+	}
 	meta["loop"] = loopMeta
 	encoded, err := json.Marshal(meta)
 	return string(encoded), err
@@ -5513,6 +5538,9 @@ func (r *Runner) recordAgentExecutionStarted(ctx context.Context, loopID string)
 }
 
 func (r *Runner) loopSuccessStatus(currentStatus string, metadataJSON *string, skipReason string) string {
+	if convergenceStatus := r.convergenceLoopStatus(metadataJSON); convergenceStatus != "" {
+		return convergenceStatus
+	}
 	meta := parseJSONObject(metadataJSON)
 	loopMeta := reviewerLoopMetadata(meta)
 	if status, ok := loopMeta["status"].(string); ok && isTerminalReviewerLoopStatus(status) {
@@ -5917,10 +5945,10 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 	if looperCLIPath == "" {
 		publishInstruction = "The trusted Looper review-submit capability is unavailable for this run, so fail closed: do not publish any GitHub review, do not add or remove any GitHub reaction, and exit non-zero with the exact message `trusted looper review submit capability unavailable`."
 	}
-	outcomeInstruction := "Use outcome=clean only when there are no blocking or non-blocking findings, outcome=non_blocking for actionable feedback that should not block merge, and outcome=blocking for findings that should block merge. Legacy outcome=actionable may be treated as comment-only compatibility, but prefer non_blocking or blocking. For no-actionable-finding results, follow the clean-result instructions for this run and finish with a completion summary that starts with `No actionable findings`."
+	outcomeInstruction := "Use outcome=clean only when there are no inline comments. Use outcome=non_blocking for any published inline feedback that should not block merge, including nit-only findings, and outcome=blocking for findings that should block merge. Legacy outcome=actionable may be treated as comment-only compatibility, but prefer non_blocking or blocking. For no-actionable-finding results, follow the clean-result instructions for this run and finish with a completion summary that starts with `No actionable findings`."
 	cleanResultCompletionInstruction := "Prefer 3 deeply specific comments over 10 shallow comments. Group related findings by file, subsystem, function, or rule in a single review round instead of splitting adjacent concerns across multiple small reviews. If there is no concrete actionable feedback, follow the clean-result instructions for this run and finish successfully with a summary beginning `No actionable findings`. Do not invent feedback."
 	if looperCLIPath == "" {
-		outcomeInstruction = "Use outcome=clean only when there are no blocking or non-blocking findings, outcome=non_blocking for actionable feedback that should not block merge, and outcome=blocking for findings that should block merge. Legacy outcome=actionable may be treated as comment-only compatibility, but prefer non_blocking or blocking. For no-actionable-finding results, do not report clean success because the trusted review-submit capability is unavailable; exit non-zero with the exact message `trusted looper review submit capability unavailable`."
+		outcomeInstruction = "Use outcome=clean only when there are no inline comments. Use outcome=non_blocking for any published inline feedback that should not block merge, including nit-only findings, and outcome=blocking for findings that should block merge. Legacy outcome=actionable may be treated as comment-only compatibility, but prefer non_blocking or blocking. For no-actionable-finding results, do not report clean success because the trusted review-submit capability is unavailable; exit non-zero with the exact message `trusted looper review submit capability unavailable`."
 		cleanResultCompletionInstruction = "Prefer 3 deeply specific comments over 10 shallow comments. Group related findings by file, subsystem, function, or rule in a single review round instead of splitting adjacent concerns across multiple small reviews. If there is no concrete actionable feedback, do not finish successfully or add a clean signal because the trusted review-submit capability is unavailable; exit non-zero with the exact message `trusted looper review submit capability unavailable`. Do not invent feedback."
 	}
 	fetchContract := reviewerAgentSideGitHubFetchContract()
@@ -5979,7 +6007,7 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 		reviewRequestInstruction = "This reviewer configuration does not require a current-user review request before posting."
 	}
 	githubOperationContract := fmt.Sprintf("GitHub operation contract: when there are actionable findings, submit exactly one PR review for this run through the trusted Looper capability at %s, with the review JSON on stdin. The capability validates inline anchors against the live PR diff before it calls GitHub; do not use PATH-based `looper`, repository-local `go run ./cmd/looper`, `gh api repos/%s/pulls/%d/reviews`, or `gh pr review` directly for the review submission.", actionableReviewSubmitCommand, repo, prNumber)
-	submitPayloadInstruction := fmt.Sprintf("When submitting through `%s review submit`, pass stdin JSON with `body` and optional `comments` entries using GitHub's review comment fields: `path`, `line`, `side` (`RIGHT` for new diff lines, `LEFT` for old diff lines), optional `start_line` and `start_side` for multiline ranges, and `body` for the actionable feedback.", looperCLICommand)
+	submitPayloadInstruction := fmt.Sprintf("When submitting through `%s review submit`, pass stdin JSON with `body` and optional `comments` entries using GitHub's review comment fields: `path`, `line`, `side` (`RIGHT` for new diff lines, `LEFT` for old diff lines), optional `start_line` and `start_side` for multiline ranges, `body` for the actionable feedback, and a required `severity` of `blocking`, `non_blocking`, or `nit`. The trusted submit capability rejects missing or invalid per-item severity and persists the validated value as review-item evidence.", looperCLICommand)
 	idempotencyInstruction := "Idempotency requirement: before posting anything, use `gh api` to list existing PR reviews for this PR. Only treat an existing marker as satisfying this run when the review body contains the exact idempotency id and expected head SHA, and the review state matches the required outcome-specific policy for this run. If such a matching review already exists, do not post another review. Instead, rely on Looper to validate that marker after the agent exits and to reconcile clean-signal reactions/spec label transitions as needed. If the marker exists but the outcome/review-state combination does not satisfy this run, ignore it and publish the correct review for this run instead."
 	freshnessInstruction := "Before posting, use `gh` to confirm the PR is still open and the head SHA still matches the expected head SHA. If it changed, do not post a review and exit non-zero with the exact message `PR head changed before publish`."
 	anchorInstruction := "Before posting, validate every inline review comment's `path`, `line`, `side`, `start_line`, and `start_side` against the live PR diff fetched with `gh pr diff`. Preserve exact anchors that fit the live diff. If an otherwise useful comment is outside the live diff's anchorable locations, safely downgrade it to top-level review body feedback that starts with clear fallback location text instead of submitting an invalid inline anchor."
@@ -6023,7 +6051,7 @@ func buildReviewPromptWithInstructions(projectID string, instructionConfig confi
 		"Write substantially more detail than a brief summary; every comment should explain the problem, why it matters, and the concrete change to make.",
 		"A comment is invalid if it only names a category (for example, 'gaps around X', 'issues with Y', or 'concerns about Z'), says only 'add tests' without naming the behavior and where the test belongs, lacks a concrete location or section reference, asks a question without proposing a resolution path, or compresses multiple unrelated concerns into one vague summary.",
 		"Bad comment example: 'Spec review found actionable gaps around role-specific trigger schema, auto-discovery gating boundaries, and exact env/config-source behavior.' This is bad because it has no file, line, section, concrete missing requirement, evidence, or suggested wording.",
-		"Good spec/docs comment example: {\"severity\":\"major\",\"category\":\"spec\",\"body\":\"Define the role trigger schema before implementation starts\",\"problem\":\"The spec introduces role-specific triggers but does not define the schema fields or validation rules.\",\"why\":\"Implementers cannot know which fields are required, how defaults behave, or how invalid trigger definitions should fail.\",\"evidence\":\"The Role triggers section describes behavior but does not list fields, defaults, or invalid examples.\",\"suggestedChange\":\"Add a schema table defining role, event, enabled, conditions, defaults, and validation errors, plus one valid and one invalid example.\",\"path\":\"docs/reviewer.md\",\"line\":42,\"side\":\"RIGHT\"}",
+		"Good spec/docs comment example: {\"severity\":\"blocking\",\"category\":\"spec\",\"body\":\"Define the role trigger schema before implementation starts\",\"problem\":\"The spec introduces role-specific triggers but does not define the schema fields or validation rules.\",\"why\":\"Implementers cannot know which fields are required, how defaults behave, or how invalid trigger definitions should fail.\",\"evidence\":\"The Role triggers section describes behavior but does not list fields, defaults, or invalid examples.\",\"suggestedChange\":\"Add a schema table defining role, event, enabled, conditions, defaults, and validation errors, plus one valid and one invalid example.\",\"path\":\"docs/reviewer.md\",\"line\":42,\"side\":\"RIGHT\"}",
 		"Implementation review rubric: check correctness, error handling, tests, concurrency, config compatibility, security, resource lifecycle, observability, migrations, and backward compatibility. Only report issues that are concrete and actionable.",
 		"Spec/docs review rubric: check whether every requirement is testable, schemas are typed/defaulted/validated, config precedence is explicit, failure modes are defined, rollout/backward compatibility is covered, acceptance criteria are present, and ambiguous terms are resolved. For missing spec details, suggest exact wording, section, table, or example content.",
 		"If the review is clean, do not write or publish a bare LGTM review body. For clean COMMENT policy, avoid adding PR conversation noise for no-actionable-finding outcomes. For clean APPROVE policy, the APPROVE review must include the required author mention, concise summary, and friendly acknowledgement.",

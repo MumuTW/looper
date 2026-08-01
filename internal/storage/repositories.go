@@ -2719,18 +2719,21 @@ func (r *QueueRepository) ClaimNextLongTermRetryAmongTypes(ctx context.Context, 
 // failed/interrupted with a non-empty agent_snapshot_json vendor). Both type
 // slices empty claims nothing.
 func (r *QueueRepository) ClaimNextNonLongTermRetryAmongTypeSets(ctx context.Context, nowISO, claimedBy string, unrestrictedTypes, stickySnapshotTypes []string) (*QueueItemRecord, error) {
-	return r.ClaimNextNonLongTermRetryAmongTypeSetsForProjects(ctx, nowISO, claimedBy, unrestrictedTypes, stickySnapshotTypes, nil, nil)
+	return r.ClaimNextNonLongTermRetryAmongTypeSetsForProjects(ctx, nowISO, claimedBy, unrestrictedTypes, stickySnapshotTypes, nil, nil, nil)
 }
 
 // ClaimNextNonLongTermRetryAmongTypeSetsForProjects additionally restricts
 // projectScopedTypes to queue items whose project_id is in projectIDs. Other
-// queue types remain eligible.
-func (r *QueueRepository) ClaimNextNonLongTermRetryAmongTypeSetsForProjects(ctx context.Context, nowISO, claimedBy string, unrestrictedTypes, stickySnapshotTypes, projectScopedTypes, projectIDs []string) (*QueueItemRecord, error) {
+// queue types remain eligible. stickyOnlyProjectIDs extends the scope for
+// projectScopedTypes to quarantined projects, but only for items whose latest
+// run is a sticky snapshot (failed/interrupted with a non-empty agent snapshot
+// vendor), so fresh work for quarantined projects is never admitted.
+func (r *QueueRepository) ClaimNextNonLongTermRetryAmongTypeSetsForProjects(ctx context.Context, nowISO, claimedBy string, unrestrictedTypes, stickySnapshotTypes, projectScopedTypes, projectIDs, stickyOnlyProjectIDs []string) (*QueueItemRecord, error) {
 	typePred, typeArgs := queueClaimTypePredicate(unrestrictedTypes, stickySnapshotTypes)
 	if typePred == "" {
 		return nil, nil
 	}
-	projectPred, projectArgs := queueClaimProjectPredicate(projectScopedTypes, projectIDs)
+	projectPred, projectArgs := queueClaimProjectPredicate(projectScopedTypes, projectIDs, stickyOnlyProjectIDs)
 	extraArgs := append([]any{QueueLongTermRetryAttemptThreshold}, typeArgs...)
 	extraArgs = append(extraArgs, projectArgs...)
 	return r.claimNextMatching(ctx, nowISO, claimedBy, `
@@ -2743,17 +2746,17 @@ func (r *QueueRepository) ClaimNextNonLongTermRetryAmongTypeSetsForProjects(ctx 
 // ClaimNextLongTermRetryAmongTypeSets is the long-term-retry counterpart of
 // ClaimNextNonLongTermRetryAmongTypeSets.
 func (r *QueueRepository) ClaimNextLongTermRetryAmongTypeSets(ctx context.Context, nowISO, claimedBy string, unrestrictedTypes, stickySnapshotTypes []string) (*QueueItemRecord, error) {
-	return r.ClaimNextLongTermRetryAmongTypeSetsForProjects(ctx, nowISO, claimedBy, unrestrictedTypes, stickySnapshotTypes, nil, nil)
+	return r.ClaimNextLongTermRetryAmongTypeSetsForProjects(ctx, nowISO, claimedBy, unrestrictedTypes, stickySnapshotTypes, nil, nil, nil)
 }
 
 // ClaimNextLongTermRetryAmongTypeSetsForProjects is the long-term-retry
 // counterpart of ClaimNextNonLongTermRetryAmongTypeSetsForProjects.
-func (r *QueueRepository) ClaimNextLongTermRetryAmongTypeSetsForProjects(ctx context.Context, nowISO, claimedBy string, unrestrictedTypes, stickySnapshotTypes, projectScopedTypes, projectIDs []string) (*QueueItemRecord, error) {
+func (r *QueueRepository) ClaimNextLongTermRetryAmongTypeSetsForProjects(ctx context.Context, nowISO, claimedBy string, unrestrictedTypes, stickySnapshotTypes, projectScopedTypes, projectIDs, stickyOnlyProjectIDs []string) (*QueueItemRecord, error) {
 	typePred, typeArgs := queueClaimTypePredicate(unrestrictedTypes, stickySnapshotTypes)
 	if typePred == "" {
 		return nil, nil
 	}
-	projectPred, projectArgs := queueClaimProjectPredicate(projectScopedTypes, projectIDs)
+	projectPred, projectArgs := queueClaimProjectPredicate(projectScopedTypes, projectIDs, stickyOnlyProjectIDs)
 	extraArgs := append([]any{QueueLongTermRetryAttemptThreshold}, typeArgs...)
 	extraArgs = append(extraArgs, projectArgs...)
 	return r.claimNextMatching(ctx, nowISO, claimedBy, `
@@ -2787,23 +2790,7 @@ func queueClaimTypePredicate(unrestrictedTypes, stickySnapshotTypes []string) (p
 	}
 	if len(stickySnapshotTypes) > 0 {
 		placeholders, typeArgs := queueTypeInClause(stickySnapshotTypes)
-		// EXISTS over the single latest run row for the queue item's loop.
-		parts = append(parts, `(qi.type IN (`+placeholders+`)
-			AND qi.loop_id IS NOT NULL
-			AND EXISTS (
-				SELECT 1
-				FROM (
-					SELECT status, agent_snapshot_json
-					FROM runs
-					WHERE loop_id = qi.loop_id
-					ORDER BY `+latestRunOrder("runs")+`
-					LIMIT 1
-				) latest
-				WHERE latest.status IN ('failed', 'interrupted')
-					AND latest.agent_snapshot_json IS NOT NULL
-					AND length(trim(latest.agent_snapshot_json)) > 0
-					AND length(trim(coalesce(json_extract(latest.agent_snapshot_json, '$.vendor'), ''))) > 0
-			))`)
+		parts = append(parts, `(qi.type IN (`+placeholders+`) AND `+stickySnapshotExistsSQL()+`)`)
 		args = append(args, typeArgs...)
 	}
 	if len(parts) == 0 {
@@ -2812,21 +2799,61 @@ func queueClaimTypePredicate(unrestrictedTypes, stickySnapshotTypes []string) (p
 	return "AND (" + strings.Join(parts, " OR ") + ")", args
 }
 
-func queueClaimProjectPredicate(projectScopedTypes, projectIDs []string) (predicate string, args []any) {
+// stickySnapshotExistsSQL returns the reusable SQL fragment that reports whether
+// the queue item's loop has a sticky-snapshot latest run: failed or interrupted
+// with a non-empty agent_snapshot_json vendor. It is shared by the type
+// predicate (sticky-snapshot-only roles) and the project predicate (sticky-only
+// scope for quarantined projects) so the two cannot drift on what "sticky" means.
+func stickySnapshotExistsSQL() string {
+	return `qi.loop_id IS NOT NULL
+			AND EXISTS (
+				SELECT 1
+				FROM (
+					SELECT status, agent_snapshot_json
+					FROM runs
+					WHERE loop_id = qi.loop_id
+					ORDER BY ` + latestRunOrder("runs") + `
+					LIMIT 1
+				) latest
+				WHERE latest.status IN ('failed', 'interrupted')
+					AND latest.agent_snapshot_json IS NOT NULL
+					AND length(trim(latest.agent_snapshot_json)) > 0
+					AND length(trim(coalesce(json_extract(latest.agent_snapshot_json, '$.vendor'), ''))) > 0
+			)`
+}
+
+// queueClaimProjectPredicate scopes projectScopedTypes to queue items whose
+// project_id is in projectIDs. stickyOnlyProjectIDs additionally admits those
+// types for quarantined projects, but only when the loop's latest run is a
+// sticky snapshot, so fresh work for quarantined projects is never claimed
+// while durable sticky retries still are. Other queue types remain eligible.
+func queueClaimProjectPredicate(projectScopedTypes, projectIDs, stickyOnlyProjectIDs []string) (predicate string, args []any) {
 	if len(projectScopedTypes) == 0 {
 		return "", nil
 	}
 	typePlaceholders, typeArgs := queueTypeInClause(projectScopedTypes)
 	args = append(args, typeArgs...)
-	if len(projectIDs) == 0 {
+	if len(projectIDs) == 0 && len(stickyOnlyProjectIDs) == 0 {
 		return "AND qi.type NOT IN (" + typePlaceholders + ")", args
 	}
-	projectPlaceholders := make([]string, 0, len(projectIDs))
-	for _, projectID := range projectIDs {
-		projectPlaceholders = append(projectPlaceholders, "?")
-		args = append(args, projectID)
+	scopeClauses := make([]string, 0, 2)
+	if len(projectIDs) > 0 {
+		projectPlaceholders := make([]string, 0, len(projectIDs))
+		for _, projectID := range projectIDs {
+			projectPlaceholders = append(projectPlaceholders, "?")
+			args = append(args, projectID)
+		}
+		scopeClauses = append(scopeClauses, "qi.project_id IN ("+strings.Join(projectPlaceholders, ", ")+")")
 	}
-	return "AND (qi.type NOT IN (" + typePlaceholders + ") OR qi.project_id IN (" + strings.Join(projectPlaceholders, ", ") + "))", args
+	if len(stickyOnlyProjectIDs) > 0 {
+		stickyPlaceholders := make([]string, 0, len(stickyOnlyProjectIDs))
+		for _, projectID := range stickyOnlyProjectIDs {
+			stickyPlaceholders = append(stickyPlaceholders, "?")
+			args = append(args, projectID)
+		}
+		scopeClauses = append(scopeClauses, "(qi.project_id IN ("+strings.Join(stickyPlaceholders, ", ")+") AND "+stickySnapshotExistsSQL()+")")
+	}
+	return "AND (qi.type NOT IN (" + typePlaceholders + ") OR " + strings.Join(scopeClauses, " OR ") + ")", args
 }
 
 func (r *QueueRepository) claimNextMatching(ctx context.Context, nowISO, claimedBy, extraPredicate string, extraArgs []any) (*QueueItemRecord, error) {

@@ -93,6 +93,8 @@ func buildValidationCommandHandlers(t *testing.T, cfg config.Config, logger *cap
 		nil,
 		newSchedulerNotificationGatewayFactory(),
 		coordinatorrole.NewRuntimeState(),
+		nil,
+		&schedulerEscalatorCadence{},
 	)
 }
 
@@ -178,7 +180,7 @@ func TestCatalogSchedulerWarnsOnceWhenValidationGateIsEmpty(t *testing.T) {
 	}
 	repositories := storage.NewRepositories(coordinator.DB())
 	logger := &capturingSchedulerLogger{}
-	handlers := buildCatalogSchedulerHandlers(projects.NewCatalog(cfg), nil, "", logger, coordinator, repositories, nil, nil, NewActiveExecutionRegistry(), nil, nil, time.Now, nil, nil, nil)
+	handlers := buildCatalogSchedulerHandlers(projects.NewCatalog(cfg), nil, "", logger, coordinator, repositories, nil, nil, NewActiveExecutionRegistry(), nil, nil, time.Now, nil, nil, nil, nil)
 	if handlers.snapshot == nil {
 		t.Fatal("handlers.snapshot = nil")
 	}

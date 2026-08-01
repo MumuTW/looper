@@ -45,7 +45,7 @@ func TestObservePostMergeFailureRecordsOneOptInDefaultBranchObservation(t *testi
 		t.Fatalf("Append merge outcome error = %v", err)
 	}
 	role := config.AuditorRoleConfig{Enabled: true, WindowMinutes: 60}
-	gateway := fakeAuditorGateway{head: head, checks: githubinfra.PullRequestCheckRuns{CheckRuns: []githubinfra.PullRequestCheckRun{{Name: "ci", Status: "completed", Conclusion: "failure"}}}}
+	gateway := fakeAuditorGateway{head: head, checks: githubinfra.PullRequestCheckRuns{CheckRuns: []githubinfra.PullRequestCheckRun{{Name: "ci", Status: "completed", Conclusion: "failure", CheckSuiteID: 7654}}}}
 	if err := observePostMergeFailure(ctx, repos, gateway, project, repo, base, role, func() time.Time { return now }); err != nil {
 		t.Fatalf("observePostMergeFailure() error = %v", err)
 	}
@@ -58,7 +58,7 @@ func TestObservePostMergeFailureRecordsOneOptInDefaultBranchObservation(t *testi
 	if err := json.Unmarshal([]byte(events[0].PayloadJSON), &observation); err != nil {
 		t.Fatal(err)
 	}
-	if observation.ProjectID != projectID || observation.HeadSHA != head || len(observation.CandidatePRs) != 1 || observation.CandidatePRs[0] != 42 || len(observation.FailedChecks) != 1 || observation.FailedChecks[0] != "ci" {
+	if observation.Version != 2 || observation.ProjectID != projectID || observation.HeadSHA != head || len(observation.CandidatePRs) != 1 || observation.CandidatePRs[0] != 42 || len(observation.FailedChecks) != 1 || observation.FailedChecks[0] != "ci" || len(observation.CheckSuiteIDs) != 1 || observation.CheckSuiteIDs[0] != 7654 {
 		t.Fatalf("observation = %#v", observation)
 	}
 	if err := observePostMergeFailure(ctx, repos, gateway, project, repo, base, role, func() time.Time { return now }); err != nil {
@@ -88,11 +88,11 @@ func TestObservePostMergeFailureSkipsDisabledProject(t *testing.T) {
 func TestFailedAuditorChecksKeepsOnlyCompletedFailures(t *testing.T) {
 	checks := githubinfra.PullRequestCheckRuns{
 		CheckRuns: []githubinfra.PullRequestCheckRun{
-			{Name: "unit", Status: "completed", Conclusion: "failure"},
+			{Name: "unit", Status: "completed", Conclusion: "failure", CheckSuiteID: 8},
 			{Name: "pending", Status: "in_progress", Conclusion: "failure"},
 			{Name: "lint", Status: "completed", Conclusion: "success"},
-			{Name: "duplicate", Status: "completed", Conclusion: "timed_out"},
-			{Name: "duplicate", Status: "completed", Conclusion: "cancelled"},
+			{Name: "duplicate", Status: "completed", Conclusion: "timed_out", CheckSuiteID: 3},
+			{Name: "duplicate", Status: "completed", Conclusion: "cancelled", CheckSuiteID: 3},
 		},
 		Statuses: []githubinfra.PullRequestStatus{
 			{Context: "legacy", State: "error"},
@@ -102,6 +102,21 @@ func TestFailedAuditorChecksKeepsOnlyCompletedFailures(t *testing.T) {
 
 	if got, want := failedAuditorChecks(checks), []string{"duplicate", "legacy", "unit"}; !equalStringSlices(got, want) {
 		t.Fatalf("failedAuditorChecks() = %#v, want %#v", got, want)
+	}
+}
+
+func TestFailedAuditorCheckEvidenceKeepsExactFailedSuiteIDs(t *testing.T) {
+	evidence := failedAuditorCheckEvidence(githubinfra.PullRequestCheckRuns{CheckRuns: []githubinfra.PullRequestCheckRun{
+		{Name: "ignored-pending", Status: "in_progress", Conclusion: "failure", CheckSuiteID: 1},
+		{Name: "failed", Status: "completed", Conclusion: "failure", CheckSuiteID: 4},
+		{Name: "also-failed", Status: "completed", Conclusion: "timed_out", CheckSuiteID: 2},
+		{Name: "missing-suite", Status: "completed", Conclusion: "failure"},
+	}})
+	if !equalStringSlices(evidence.Names, []string{"also-failed", "failed", "missing-suite"}) {
+		t.Fatalf("Names = %#v", evidence.Names)
+	}
+	if len(evidence.SuiteIDs) != 2 || evidence.SuiteIDs[0] != 2 || evidence.SuiteIDs[1] != 4 {
+		t.Fatalf("SuiteIDs = %#v, want exact sorted failed-suite IDs", evidence.SuiteIDs)
 	}
 }
 

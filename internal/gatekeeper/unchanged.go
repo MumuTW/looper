@@ -14,10 +14,11 @@ import (
 )
 
 // maxSkipAge bounds how long a pull request may be skipped on an unchanged
-// fingerprint. Branch protection rules and project policy are inputs to the gate
-// that the list page cannot observe at all, so an unchanged pull request is
-// re-evaluated periodically regardless. This is the backstop for every
-// invalidator this fingerprint does not model.
+// fingerprint. Branch protection rules, project policy, and Reviewer
+// convergence metadata are inputs to the gate that the list page cannot
+// observe at all, so an unchanged pull request is re-evaluated periodically
+// regardless. This is the backstop for every invalidator this fingerprint does
+// not model.
 const maxSkipAge = 30 * time.Minute
 
 // sourceFingerprint summarises everything about a pull request that the shared
@@ -107,6 +108,16 @@ func reportAwaitsCheckState(report Report) bool {
 	return false
 }
 
+// reportAwaitsConvergenceState reports whether the durable Reviewer state can
+// change merge eligibility without changing the forge list fingerprint. A
+// blocked convergence report must be re-read until its floor-qualified items
+// are closed or deferred; otherwise unchanged discovery could retain a stale
+// blocker after the Reviewer makes progress.
+func reportAwaitsConvergenceState(report Report) bool {
+	evidence := report.Evidence.ReviewerConvergence
+	return evidence != nil && reviewerConvergenceBlocks(*evidence)
+}
+
 // latestGateReports returns the most recent gate report per pull request for one
 // project, keyed by the report's entity id (`repo#number`).
 //
@@ -144,13 +155,25 @@ func latestGateReports(ctx context.Context, repos *storage.Repositories, project
 //
 // Skipping is refused unless every one of these holds: a previous report exists,
 // it recorded a fingerprint, the fingerprint still matches, the gate is not
-// waiting on check state, a newly posted current-head review has not appeared,
-// the report is younger than maxSkipAge, and — at auto trust — the report does
-// not carry a failed required check.
+// waiting on check or convergence state, the convergence blocker (if any) has
+// not advanced, the gate is not waiting on a review event that has since
+// appeared, and the report is younger than maxSkipAge. At auto trust, reports
+// carrying a failed required check are also re-evaluated so a manual rerun can
+// publish a newly eligible route without waiting for maxSkipAge.
 //
-// reviewEvidenceAppeared is a cheap local event-log result supplied by the
-// discovery caller for reports waiting on a current-head review.
-func skipUnchanged(previous Report, hasPrevious bool, fingerprint string, trust config.GatekeeperTrustLevel, now time.Time, reviewEvidenceAppeared bool) (Report, bool) {
+// currentConvergenceRevision is the newest persisted convergence revision for
+// this pull request, read locally by the discovery lane. A blocked convergence
+// report is reused when that revision is unchanged — the durable Reviewer state
+// has not moved, so the blocker is still valid and a local SQLite read is
+// enough — and re-evaluated only when it advances, instead of re-polling the
+// forge on every tick while a PR awaits human or reviewer progress.
+//
+// reviewEvidenceAppeared is the result of a cheap local event-log check made by
+// the caller for reports awaiting a current-head review. When the review event
+// has not appeared, the PR is skipped because re-evaluating would reach the same
+// conclusion without the event and would pay forge round trips every tick; when
+// it has appeared, the PR is re-evaluated so the new evidence is observed.
+func skipUnchanged(previous Report, hasPrevious bool, fingerprint string, trust config.GatekeeperTrustLevel, now time.Time, currentConvergenceRevision string, reviewEvidenceAppeared bool) (Report, bool) {
 	if !hasPrevious || strings.TrimSpace(previous.SourceFingerprint) == "" {
 		return Report{}, false
 	}
@@ -167,6 +190,16 @@ func skipUnchanged(previous Report, hasPrevious bool, fingerprint string, trust 
 	// Re-evaluate instead so the route is published promptly.
 	if trust == config.GatekeeperTrustAuto && reportHasFailedCheck(previous) {
 		return Report{}, false
+	}
+	if reportAwaitsConvergenceState(previous) {
+		// The durable Reviewer state can change merge eligibility without moving
+		// any field the forge list fingerprint observes. Re-evaluate when the
+		// convergence revision has advanced (the Reviewer recorded progress, or
+		// its loop was superseded); otherwise the persisted blocker is still
+		// valid and the report can be reused without re-polling the forge.
+		if previousConvergenceRevision(previous) != currentConvergenceRevision {
+			return Report{}, false
+		}
 	}
 	if reportAwaitsCurrentHeadReview(previous) && reviewEvidenceAppeared {
 		return Report{}, false
@@ -188,4 +221,15 @@ func reportHasFailedCheck(report Report) bool {
 		}
 	}
 	return false
+}
+
+// previousConvergenceRevision is the convergence revision recorded on a prior
+// gate report. An empty result means the report carried no convergence evidence
+// (and therefore no convergence blocker), so it cannot match a non-empty live
+// revision and forces re-evaluation if one appears.
+func previousConvergenceRevision(report Report) string {
+	if report.Evidence.ReviewerConvergence == nil {
+		return ""
+	}
+	return convergenceRevision(*report.Evidence.ReviewerConvergence)
 }
