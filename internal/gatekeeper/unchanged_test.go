@@ -17,6 +17,27 @@ func openPullRequestFixture() githubinfra.PullRequestSummary {
 	}
 }
 
+func TestSourceFingerprintIncludesExactDiffBudgetBounds(t *testing.T) {
+	fixture := newGatekeeperFixture(t)
+	pullRequest := openPullRequestFixture()
+	runner := New(Options{
+		Repos: fixture.repos, GitHub: fixture.github,
+		PolicyPermitsTarget: func(string, string, string) bool { return true },
+		TrustForProject:     func(string) config.GatekeeperTrustLevel { return config.GatekeeperTrustAuto },
+		DiffBudgetForProject: func(string) config.GatekeeperDiffBudget {
+			return config.GatekeeperDiffBudget{MaxChangedFiles: 20, MaxDeletions: 100}
+		},
+	})
+	first := runner.sourceFingerprintForProject(pullRequest, "project_1", "acme/looper")
+	runner.diffBudgetForProject = func(string) config.GatekeeperDiffBudget {
+		return config.GatekeeperDiffBudget{MaxChangedFiles: 4, MaxDeletions: 100}
+	}
+	second := runner.sourceFingerprintForProject(pullRequest, "project_1", "acme/looper")
+	if first == second {
+		t.Fatalf("fingerprint unchanged after tightening diff budget: %q", first)
+	}
+}
+
 func discover(t *testing.T, fixture *gatekeeperFixture) DiscoveryResult {
 	t.Helper()
 	result, err := fixture.runner().DiscoverPullRequests(context.Background(), DiscoveryInput{
