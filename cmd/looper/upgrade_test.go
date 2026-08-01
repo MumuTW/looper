@@ -275,10 +275,11 @@ func TestUpgradeStageReleaseRejectsDevelopmentSnapshot(t *testing.T) {
 func TestUpgradeVerifyStartChecksRestartedDaemonEvidence(t *testing.T) {
 	identity := releasedUpgradeIdentity("1.2.3", "aaaaaaa")
 	root, releaseID := stageReleaseForUpgradeTest(t, identity)
-	server := upgradePostStartDaemon(t, identity, 0, upgraderelease.CurrentDaemonExecutable(root))
+	bundle, dbPath := createUpgradeRestoreBundleWithSource(t)
+	server := upgradePostStartDaemon(t, identity, 0, upgraderelease.CurrentDaemonExecutable(root), dbPath, filepath.Join(root, "current", "looper"))
 	configForDaemon(t, server.URL)
 	stdout := &bytes.Buffer{}
-	if err := runUpgrade(context.Background(), nil, []string{"verify-start", "--release-root", root, "--release", releaseID}, stdout); err != nil {
+	if err := runUpgrade(context.Background(), nil, []string{"verify-start", "--release-root", root, "--release", releaseID, "--bundle", bundle}, stdout); err != nil {
 		t.Fatal(err)
 	}
 	var report upgradePostStartReport
@@ -296,10 +297,11 @@ func TestUpgradeVerifyStartAllowsHeldAdmissionWithFinishingWork(t *testing.T) {
 	// cutover failure — only identity, hold, health, and quarantine are gates.
 	identity := releasedUpgradeIdentity("1.2.3", "aaaaaaa")
 	root, releaseID := stageReleaseForUpgradeTest(t, identity)
-	server := upgradePostStartDaemon(t, identity, 1, upgraderelease.CurrentDaemonExecutable(root))
+	bundle, dbPath := createUpgradeRestoreBundleWithSource(t)
+	server := upgradePostStartDaemon(t, identity, 1, upgraderelease.CurrentDaemonExecutable(root), dbPath, filepath.Join(root, "current", "looper"))
 	configForDaemon(t, server.URL)
 	stdout := &bytes.Buffer{}
-	if err := runUpgrade(context.Background(), nil, []string{"verify-start", "--release-root", root, "--release", releaseID}, stdout); err != nil {
+	if err := runUpgrade(context.Background(), nil, []string{"verify-start", "--release-root", root, "--release", releaseID, "--bundle", bundle}, stdout); err != nil {
 		t.Fatalf("runUpgrade() error = %v", err)
 	}
 	var report upgradePostStartReport
@@ -319,6 +321,7 @@ func TestUpgradeVerifyStartRejectsUnheldReadyAdmission(t *testing.T) {
 	// verify-start; that must fail so restore cannot discard post-restart writes.
 	identity := releasedUpgradeIdentity("1.2.3", "aaaaaaa")
 	root, releaseID := stageReleaseForUpgradeTest(t, identity)
+	bundle, dbPath := createUpgradeRestoreBundleWithSource(t)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/v1/version":
@@ -327,7 +330,7 @@ func TestUpgradeVerifyStartRejectsUnheldReadyAdmission(t *testing.T) {
 			versionBody.Binary.Path = upgraderelease.CurrentDaemonExecutable(root)
 			writeEnvelope(w, http.StatusOK, versionBody)
 		case "/api/v1/status":
-			writeEnvelope(w, http.StatusOK, map[string]any{"service": map[string]any{"healthy": true, "version": identity.Version, "build": identity.Metadata, "admissionState": "ready", "startedAt": "2026-07-31T12:35:00.000Z", "recovery": map[string]any{"outstanding": map[string]any{"quarantinedActiveExecutions": 0, "quarantinedRunningRuns": 0}}}, "storage": map[string]any{"schemaVersion": "0022_durable_payload_baseline", "pendingMigrations": []string{}, "healthy": true}, "scheduler": map[string]any{"activeRuns": 0, "runningItems": 0}})
+			writeEnvelope(w, http.StatusOK, map[string]any{"service": map[string]any{"healthy": true, "version": identity.Version, "build": identity.Metadata, "admissionState": "ready", "startedAt": "2026-07-31T12:35:00.000Z", "recovery": map[string]any{"outstanding": map[string]any{"quarantinedActiveExecutions": 0, "quarantinedRunningRuns": 0}}}, "storage": map[string]any{"schemaVersion": "0022_durable_payload_baseline", "pendingMigrations": []string{}, "healthy": true, "dbPath": dbPath}, "tools": map[string]any{"looperPath": filepath.Join(root, "current", "looper")}, "scheduler": map[string]any{"activeRuns": 0, "runningItems": 0}})
 		case "/api/v1/projects":
 			writeEnvelope(w, http.StatusOK, map[string]any{"items": []map[string]any{{"id": "project_1"}}})
 		case "/api/v1/events/notification/looperd":
@@ -339,7 +342,7 @@ func TestUpgradeVerifyStartRejectsUnheldReadyAdmission(t *testing.T) {
 	t.Cleanup(server.Close)
 	configForDaemon(t, server.URL)
 	stdout := &bytes.Buffer{}
-	err := runUpgrade(context.Background(), nil, []string{"verify-start", "--release-root", root, "--release", releaseID}, stdout)
+	err := runUpgrade(context.Background(), nil, []string{"verify-start", "--release-root", root, "--release", releaseID, "--bundle", bundle}, stdout)
 	if err == nil {
 		t.Fatal("verify-start error = nil, want unheld ready rejection")
 	}
@@ -368,14 +371,15 @@ func TestUpgradeVerifyStartRejectsDaemonNotGovernedByCurrent(t *testing.T) {
 	// miswired unit that still points at a concrete copy.
 	identity := releasedUpgradeIdentity("1.2.3", "aaaaaaa")
 	root, releaseID := stageReleaseForUpgradeTest(t, identity)
+	bundle, dbPath := createUpgradeRestoreBundleWithSource(t)
 	foreign := filepath.Join(t.TempDir(), "looperd-copy")
 	if err := os.WriteFile(foreign, []byte("#!/bin/sh\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	server := upgradePostStartDaemon(t, identity, 0, foreign)
+	server := upgradePostStartDaemon(t, identity, 0, foreign, dbPath, filepath.Join(root, "current", "looper"))
 	configForDaemon(t, server.URL)
 	stdout := &bytes.Buffer{}
-	err := runUpgrade(context.Background(), nil, []string{"verify-start", "--release-root", root, "--release", releaseID}, stdout)
+	err := runUpgrade(context.Background(), nil, []string{"verify-start", "--release-root", root, "--release", releaseID, "--bundle", bundle}, stdout)
 	if err == nil {
 		t.Fatal("verify-start error = nil, want miswired executable rejection")
 	}
@@ -608,20 +612,27 @@ func stageReleaseForUpgradeTest(t *testing.T, identity version.Info) (string, st
 
 func createUpgradeRestoreBundle(t *testing.T) string {
 	t.Helper()
+	bundle, _ := createUpgradeRestoreBundleWithSource(t)
+	return bundle
+}
+
+func createUpgradeRestoreBundleWithSource(t *testing.T) (bundleDir, databasePath string) {
+	t.Helper()
 	root := t.TempDir()
 	config := writeUpgradeBundleFile(t, root, "config.toml", "[server]\n")
 	cli := writeUpgradeBundleFile(t, root, "looper", "cli")
 	daemon := writeUpgradeBundleFile(t, root, "looperd", "daemon")
-	bundle, err := upgradebackup.Create(context.Background(), upgradebackup.Input{RootDir: filepath.Join(root, "backups"), ConfigPath: config, DatabasePath: filepath.Join(root, "looper.sqlite"), CLIBinaryPath: cli, DaemonBinaryPath: daemon, Snapshot: func(context.Context) (string, error) {
+	databasePath = filepath.Join(root, "looper.sqlite")
+	bundle, err := upgradebackup.Create(context.Background(), upgradebackup.Input{RootDir: filepath.Join(root, "backups"), ConfigPath: config, DatabasePath: databasePath, CLIBinaryPath: cli, DaemonBinaryPath: daemon, Snapshot: func(context.Context) (string, error) {
 		return writeUpgradeBundleFile(t, root, "snapshot.sqlite", "sqlite"), nil
 	}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	return bundle.Directory
+	return bundle.Directory, databasePath
 }
 
-func upgradePostStartDaemon(t *testing.T, identity version.Info, activeRuns int, runningExecutable string) *httptest.Server {
+func upgradePostStartDaemon(t *testing.T, identity version.Info, activeRuns int, runningExecutable, dbPath, looperPath string) *httptest.Server {
 	t.Helper()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -632,7 +643,7 @@ func upgradePostStartDaemon(t *testing.T, identity version.Info, activeRuns int,
 			writeEnvelope(w, http.StatusOK, versionBody)
 		case "/api/v1/status":
 			// verify-start requires held (draining) admission under LOOPER_UPGRADE_VERIFY_HOLD.
-			writeEnvelope(w, http.StatusOK, map[string]any{"service": map[string]any{"healthy": true, "version": identity.Version, "build": identity.Metadata, "admissionState": "draining", "startedAt": "2026-07-31T12:35:00.000Z", "recovery": map[string]any{"outstanding": map[string]any{"quarantinedActiveExecutions": 0, "quarantinedRunningRuns": 0}}}, "storage": map[string]any{"schemaVersion": "0022_durable_payload_baseline", "pendingMigrations": []string{}, "healthy": true}, "scheduler": map[string]any{"activeRuns": activeRuns, "runningItems": activeRuns}})
+			writeEnvelope(w, http.StatusOK, map[string]any{"service": map[string]any{"healthy": true, "version": identity.Version, "build": identity.Metadata, "admissionState": "draining", "startedAt": "2026-07-31T12:35:00.000Z", "recovery": map[string]any{"outstanding": map[string]any{"quarantinedActiveExecutions": 0, "quarantinedRunningRuns": 0}}}, "storage": map[string]any{"schemaVersion": "0022_durable_payload_baseline", "pendingMigrations": []string{}, "healthy": true, "dbPath": dbPath}, "tools": map[string]any{"looperPath": looperPath}, "scheduler": map[string]any{"activeRuns": activeRuns, "runningItems": activeRuns}})
 		case "/api/v1/projects":
 			writeEnvelope(w, http.StatusOK, map[string]any{"items": []map[string]any{{"id": "project_1"}}})
 		case "/api/v1/events/notification/looperd":

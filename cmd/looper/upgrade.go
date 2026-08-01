@@ -68,11 +68,15 @@ type upgradeStatus struct {
 		SchemaVersion     string   `json:"schemaVersion"`
 		PendingMigrations []string `json:"pendingMigrations"`
 		Healthy           bool     `json:"healthy"`
+		DBPath            string   `json:"dbPath"`
 	} `json:"storage"`
 	Scheduler struct {
 		ActiveRuns   int `json:"activeRuns"`
 		RunningItems int `json:"runningItems"`
 	} `json:"scheduler"`
+	Tools struct {
+		LooperPath string `json:"looperPath,omitempty"`
+	} `json:"tools"`
 }
 
 type upgradeDaemonVersion struct {
@@ -103,6 +107,10 @@ type upgradePostStartReport struct {
 	CurrentRelease     string        `json:"currentRelease"`
 	RunningExecutable  string        `json:"runningExecutable,omitempty"`
 	ExpectedExecutable string        `json:"expectedExecutable,omitempty"`
+	ExpectedDatabase   string        `json:"expectedDatabase,omitempty"`
+	RunningDatabase    string        `json:"runningDatabase,omitempty"`
+	ExpectedCLI        string        `json:"expectedCLI,omitempty"`
+	ConfiguredCLI      string        `json:"configuredCLI,omitempty"`
 	Status             upgradeStatus `json:"status"`
 	ProjectCount       int           `json:"projectCount"`
 	StartedEvent       bool          `json:"startedEvent"`
@@ -178,11 +186,11 @@ func runUpgrade(ctx context.Context, global, operands []string, stdout interface
 		return runUpgradeActivateRelease(ctx, root, releaseID, stdout)
 	}
 	if operands[0] == "verify-start" {
-		root, releaseID, err := parseUpgradeActivateReleaseArgs(operands[1:])
+		root, releaseID, bundle, err := parseUpgradeVerifyStartArgs(operands[1:])
 		if err != nil {
 			return err
 		}
-		return runUpgradeVerifyStart(ctx, global, root, releaseID, stdout)
+		return runUpgradeVerifyStart(ctx, global, root, releaseID, bundle, stdout)
 	}
 	if operands[0] == "restore-preflight" {
 		bundle, err := parseUpgradeVerifyArgs(operands[1:])
@@ -624,7 +632,7 @@ func runUpgradeActivateRelease(ctx context.Context, root, releaseID string, stdo
 	return writeVersionJSON(stdout, result)
 }
 
-func runUpgradeVerifyStart(ctx context.Context, global []string, root, releaseID string, stdout interface{ Write([]byte) (int, error) }) error {
+func runUpgradeVerifyStart(ctx context.Context, global []string, root, releaseID, bundle string, stdout interface{ Write([]byte) (int, error) }) error {
 	staged, err := upgraderelease.Verify(root, releaseID)
 	if err != nil {
 		return err
@@ -638,6 +646,14 @@ func runUpgradeVerifyStart(ctx context.Context, global []string, root, releaseID
 	currentRelease, err := upgraderelease.CurrentReleaseID(root)
 	if err != nil {
 		return err
+	}
+	verifiedBundle, err := upgradebackup.Verify(bundle)
+	if err != nil {
+		return fmt.Errorf("verify-start rollback bundle: %w", err)
+	}
+	source, err := upgradebackup.RestoreSource(verifiedBundle.Manifest)
+	if err != nil {
+		return fmt.Errorf("verify-start rollback bundle source: %w", err)
 	}
 	cfg, err := loadConfig(global)
 	if err != nil {
@@ -661,6 +677,7 @@ func runUpgradeVerifyStart(ctx context.Context, global []string, root, releaseID
 	}
 	daemon := version.Info{Version: remote.Version, Metadata: remote.Build}
 	expectedExec := upgraderelease.CurrentDaemonExecutable(root)
+	expectedCLI := filepath.Join(filepath.Clean(root), "current", "looper")
 	report := upgradePostStartReport{
 		ExpectedBuild:      staged.Manifest.Build,
 		ExpectedRelease:    releaseID,
@@ -668,6 +685,10 @@ func runUpgradeVerifyStart(ctx context.Context, global []string, root, releaseID
 		CurrentRelease:     currentRelease,
 		RunningExecutable:  strings.TrimSpace(remote.Binary.Path),
 		ExpectedExecutable: expectedExec,
+		ExpectedDatabase:   source.DatabasePath,
+		RunningDatabase:    strings.TrimSpace(status.Storage.DBPath),
+		ExpectedCLI:        expectedCLI,
+		ConfiguredCLI:      strings.TrimSpace(status.Tools.LooperPath),
 		Status:             status,
 		ProjectCount:       len(projects.Items),
 		StartedEvent:       containsUpgradeEvent(events, "looperd.started"),
@@ -705,6 +726,17 @@ func upgradePostStartBlocks(report upgradePostStartReport) []string {
 	// would survive rollback of the pointer.
 	if err := requireExecutableGovernedByCurrent(report.RunningExecutable, report.ExpectedExecutable); err != nil {
 		blocks = append(blocks, err.Error())
+	}
+	// tools.looperPath must also follow current/looper so post-cutover review
+	// publish and agent workflows use the paired candidate CLI.
+	if err := requireExecutableGovernedByCurrent(report.ConfiguredCLI, report.ExpectedCLI); err != nil {
+		blocks = append(blocks, "configured tools.looperPath: "+err.Error())
+	}
+	// Candidate must open the same database the rollback bundle was taken from;
+	// otherwise a config edit that retargets storage.dbPath can pass identity
+	// checks against an empty DB while all prior work remains in the old file.
+	if err := requireSameFilesystemPath(report.RunningDatabase, report.ExpectedDatabase); err != nil {
+		blocks = append(blocks, "running database: "+err.Error())
 	}
 	statusBuild := version.Info{Version: report.Status.Service.Version, Metadata: report.Status.Service.Build}
 	if !statusBuild.SameBuild(report.ExpectedBuild) {
@@ -754,6 +786,42 @@ func verifyStagedReleaseIdentity(ctx context.Context, staged upgraderelease.Stag
 	}
 	if !cli.SameBuild(daemon) || !cli.SameBuild(staged.Manifest.Build) {
 		return fmt.Errorf("staged CLI and daemon do not match the release manifest build identity")
+	}
+	return nil
+}
+
+func parseUpgradeVerifyStartArgs(args []string) (root, releaseID, bundle string, err error) {
+	values, err := parseUpgradeNamedArgs(args, "verify-start", []string{"--release-root", "--release", "--bundle"})
+	if err != nil {
+		return "", "", "", err
+	}
+	return values["--release-root"], values["--release"], values["--bundle"], nil
+}
+
+// requireSameFilesystemPath compares two paths after Abs + EvalSymlinks so a
+// candidate dbPath cannot silently diverge from the rollback-bundle source.
+func requireSameFilesystemPath(running, expected string) error {
+	running = strings.TrimSpace(running)
+	expected = strings.TrimSpace(expected)
+	if running == "" {
+		return fmt.Errorf("path is unavailable")
+	}
+	if expected == "" {
+		return fmt.Errorf("expected path is unavailable")
+	}
+	normalize := func(path string) string {
+		abs, err := filepath.Abs(path)
+		if err != nil {
+			abs = filepath.Clean(path)
+		}
+		resolved, err := filepath.EvalSymlinks(abs)
+		if err != nil {
+			return filepath.Clean(abs)
+		}
+		return filepath.Clean(resolved)
+	}
+	if normalize(running) != normalize(expected) {
+		return fmt.Errorf("%s does not match rollback bundle source %s", running, expected)
 	}
 	return nil
 }

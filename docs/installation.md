@@ -222,7 +222,7 @@ require the staged release id returned by stage.
 ```bash
 looper upgrade stage-release --release-root <dir> --target-looper <path> --target-looperd <path>
 looper upgrade activate-release --release-root <dir> --release <id>
-looper upgrade verify-start --release-root <dir> --release <id>
+looper upgrade verify-start --release-root <dir> --release <id> --bundle <ROLLBACK_BUNDLE>
 ```
 
 `verify-start` must succeed before declaring cutover success. It checks build
@@ -268,7 +268,7 @@ Supported sequence:
 7. `activate-release` the candidate (switches `current` only — does not restart)
 8. Point `tools.looperPath` at `release-root/current/looper` if not already
 9. **Restart the supervised daemon with `LOOPER_UPGRADE_VERIFY_HOLD=1`** so it loads `current/looperd` but **keeps admission drained** (no claim/mutation) until verification finishes. Without this hold, the replacement scheduler can complete work before `verify-start`; a later failed verify + restore of `$ROLLBACK_BUNDLE` would discard those writes.
-10. `verify-start` (requires `admissionState: draining` — proof the hold was applied; ordinary `ready` fails so unheld restarts cannot claim work before verification)
+10. `verify-start --bundle $ROLLBACK_BUNDLE` (requires `admissionState: draining`, daemon/`tools.looperPath` governed by `current`, and the candidate's `storage.dbPath` matching the rollback bundle source)
 11. On success: **restart again without `LOOPER_UPGRADE_VERIFY_HOLD`** so admission opens and normal work resumes
 
 On failure after restart (while still held/drained):
