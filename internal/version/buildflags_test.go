@@ -142,6 +142,12 @@ func trackedLegacyModuleImports(root, legacyModulePath string) ([]string, error)
 		path := filepath.Join(root, filepath.FromSlash(relativePath))
 		file, err := parser.ParseFile(token.NewFileSet(), path, nil, parser.ImportsOnly)
 		if err != nil {
+			// git ls-files --cached still lists index entries after a working-tree
+			// deletion is left unstaged; skip those missing paths so the migration
+			// scan does not fail on staging state.
+			if os.IsNotExist(err) {
+				continue
+			}
 			return nil, err
 		}
 		for _, imported := range file.Imports {
@@ -198,6 +204,24 @@ func TestTrackedModulePathScanFindsTrackedLegacyImport(t *testing.T) {
 	}
 	if len(legacyImports) != 1 || legacyImports[0] != "tracked.go" {
 		t.Fatalf("trackedLegacyModuleImports() = %v, want [tracked.go]", legacyImports)
+	}
+}
+
+func TestTrackedModulePathScanSkipsUnstagedDeletedFiles(t *testing.T) {
+	t.Parallel()
+	root := initModulePathTestRepo(t)
+	writeModulePathTestFile(t, root, "tracked.go", "package tracked\n", true)
+	writeModulePathTestFile(t, root, "deleted.go", "package deleted\nimport _ \"github.com/nexu-io/looper/internal/version\"\n", true)
+	if err := os.Remove(filepath.Join(root, "deleted.go")); err != nil {
+		t.Fatalf("remove deleted.go: %v", err)
+	}
+
+	legacyImports, err := trackedLegacyModuleImports(root, "github.com/nexu-io/looper")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(legacyImports) != 0 {
+		t.Fatalf("trackedLegacyModuleImports() = %v, want unstaged deletion skipped", legacyImports)
 	}
 }
 
