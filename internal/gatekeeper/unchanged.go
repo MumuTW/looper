@@ -54,6 +54,7 @@ func sourceFingerprint(pullRequest githubinfra.PullRequestSummary, budgetEnabled
 	sort.Strings(paths)
 	fields := []string{
 		pullRequest.HeadSHA,
+		pullRequest.BaseSHA,
 		pullRequest.UpdatedAt,
 		pullRequest.State,
 		pullRequest.ReviewDecision,

@@ -884,6 +884,10 @@ func (f *fakeGatekeeperGitHub) SetCommitStatus(_ context.Context, input githubin
 	return f.statusErr
 }
 
+func (f *fakeGatekeeperGitHub) GetPullRequestBaseSHA(context.Context, githubinfra.ViewPullRequestInput) (string, error) {
+	return f.finalBaseSHA, nil
+}
+
 func reasonCodes(reasons []Reason) []ReasonCode {
 	out := make([]ReasonCode, 0, len(reasons))
 	for _, reason := range reasons {

@@ -77,6 +77,7 @@ func previousPublished(report Report) bool {
 // deciding whether to merge.
 var reasonExplanations = map[ReasonCode]string{
 	ReasonHeadStale:                "the head commit moved while this was being evaluated",
+	ReasonBaseStale:                "the pull request base commit moved while this was being evaluated",
 	ReasonPullRequestNotOpen:       "the pull request is not open",
 	ReasonPullRequestDraft:         "the pull request is a draft",
 	ReasonMergeConflict:            "the branch conflicts with its base",
@@ -140,13 +141,23 @@ func formatReasons(reasons []Reason) []string {
 			explanation = string(reason.Code)
 		}
 		if subject := strings.TrimSpace(reason.Subject); subject != "" {
-			lines = append(lines, fmt.Sprintf("%s — `%s`", explanation, subject))
+			lines = append(lines, fmt.Sprintf("%s — `%s`", explanation, escapeMarkdownCodeSpan(subject)))
 			continue
 		}
 		lines = append(lines, explanation)
 	}
 	sort.Strings(lines)
 	return lines
+}
+
+func escapeMarkdownCodeSpan(value string) string {
+	value = strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\r' || r == '\t' || r < 0x20 || r == 0x7f {
+			return ' '
+		}
+		return r
+	}, value)
+	return strings.NewReplacer("\\", "\\\\", "`", "\\`").Replace(value)
 }
 
 func shortSHA(sha string) string {

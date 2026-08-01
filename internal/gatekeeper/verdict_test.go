@@ -86,6 +86,16 @@ func TestBuildVerdictCommentFallsBackToTheRawCode(t *testing.T) {
 	}
 }
 
+func TestBuildVerdictCommentEscapesProtectedPathSubject(t *testing.T) {
+	body := BuildVerdictComment(Report{Reasons: []Reason{{Code: ReasonProtectedPathTouched, Subject: "docs/`evil`\nnext"}}})
+	if strings.Contains(body, "`docs/`evil`") || strings.Contains(body, "\nnext`") {
+		t.Fatalf("verdict = %q, want protected path safely contained", body)
+	}
+	if !strings.Contains(body, "docs/\\`evil\\` next") {
+		t.Fatalf("verdict = %q, want escaped path subject", body)
+	}
+}
+
 // newVerdictRunner reuses the package fixture's storage so persist writes a real
 // event, then swaps in the GitHub fake this test needs.
 func newVerdictRunner(t *testing.T, trust config.GatekeeperTrustLevel, github *fakeGatekeeperGitHub) *Runner {

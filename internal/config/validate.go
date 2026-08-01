@@ -723,6 +723,9 @@ func validateProtectedPathPatterns(patterns []string, pathPrefix string, issues 
 		if strings.HasPrefix(normalized, "/") || cleaned == ".." || strings.HasPrefix(cleaned, "../") {
 			*issues = append(*issues, ValidationIssue{Path: itemPath, Message: "must be repository-relative"})
 		}
+		if cleaned == "." || cleaned == "" {
+			*issues = append(*issues, ValidationIssue{Path: itemPath, Message: "must contain a usable repository-relative path"})
+		}
 		if _, err := path.Match(normalized, "example/path.go"); err != nil {
 			*issues = append(*issues, ValidationIssue{Path: itemPath, Message: "must be a valid glob"})
 		}

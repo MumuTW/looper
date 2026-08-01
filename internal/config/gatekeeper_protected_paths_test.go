@@ -1,6 +1,9 @@
 package config
 
-import "testing"
+import (
+	"fmt"
+	"testing"
+)
 
 func TestGatekeeperProtectedPathsNormalizeAndClone(t *testing.T) {
 	paths := []string{"internal/gatekeeper/**", ".github/workflows/*"}
@@ -33,6 +36,24 @@ func TestGatekeeperProtectedPathsValidation(t *testing.T) {
 		}
 		if !found {
 			t.Fatalf("issues = %#v, want validation at %s", issues, path)
+		}
+	}
+}
+
+func TestGatekeeperProtectedPathsRejectNoOpPatterns(t *testing.T) {
+	issues := []ValidationIssue{}
+	validateGatekeeperRoleConfig(GatekeeperRoleConfig{ProtectedPaths: []string{"./", ".", "foo/.."}}, "roles.gatekeeper", false, &issues)
+	for _, index := range []int{0, 1, 2} {
+		want := fmt.Sprintf("roles.gatekeeper.protectedPaths[%d]", index)
+		found := false
+		for _, issue := range issues {
+			if issue.Path == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("issues = %#v, want no-op pattern validation at %s", issues, want)
 		}
 	}
 }

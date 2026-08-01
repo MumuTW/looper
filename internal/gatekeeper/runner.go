@@ -48,6 +48,7 @@ type ReasonCode string
 
 const (
 	ReasonHeadStale                ReasonCode = "head_stale"
+	ReasonBaseStale                ReasonCode = "base_stale"
 	ReasonPullRequestNotOpen       ReasonCode = "pull_request_not_open"
 	ReasonPullRequestDraft         ReasonCode = "pull_request_draft"
 	ReasonMergeConflict            ReasonCode = "merge_conflict"
@@ -115,6 +116,7 @@ type Evidence struct {
 	MergedAt                     string                       `json:"mergedAt,omitempty"`
 	Draft                        bool                         `json:"draft"`
 	BaseRefName                  string                       `json:"baseRefName,omitempty"`
+	BaseSHA                      string                       `json:"baseSha,omitempty"`
 	Mergeable                    *bool                        `json:"mergeable,omitempty"`
 	MergeableState               string                       `json:"mergeableState,omitempty"`
 	RequiredChecks               []string                     `json:"requiredChecks"`
@@ -129,6 +131,7 @@ type Evidence struct {
 	ReviewerConvergence          *ReviewerConvergenceEvidence `json:"reviewerConvergence,omitempty"`
 	ProjectPolicyPermitsTarget   bool                         `json:"projectPolicyPermitsTarget"`
 	FinalObservedHeadSHA         string                       `json:"finalObservedHeadSha,omitempty"`
+	FinalObservedBaseSHA         string                       `json:"finalObservedBaseSha,omitempty"`
 	CodexReviewOutcome           string                       `json:"codexReviewOutcome,omitempty"`
 	ReviewProvenance             ReviewProvenance             `json:"reviewProvenance,omitempty"`
 	Additions                    int                          `json:"additions,omitempty"`
@@ -167,6 +170,7 @@ type EvaluationInput struct {
 	PRNumber        int64
 	CWD             string
 	ExpectedHeadSHA string
+	ExpectedBaseSHA string
 	// SourceFingerprint is recorded on the resulting report. Empty means the caller
 	// had no list-page observation, in which case the report can never be skipped.
 	SourceFingerprint string
@@ -213,6 +217,7 @@ type GitHubGateway interface {
 	// merge base (the diff budget) can detect a base advance that the head
 	// revalidation alone cannot.
 	GetPullRequestHeadAndBaseSHA(context.Context, githubinfra.ViewPullRequestInput) (string, string, error)
+	GetPullRequestBaseSHA(context.Context, githubinfra.ViewPullRequestInput) (string, error)
 	ListIssueComments(context.Context, githubinfra.ViewIssueInput) ([]githubinfra.CommentInfo, error)
 	ListIssueCommentsContaining(context.Context, githubinfra.ViewIssueInput, []string) ([]githubinfra.CommentInfo, error)
 	CreateIssueComment(context.Context, githubinfra.IssueCommentInput) (githubinfra.IssueCommentResult, error)
@@ -696,6 +701,7 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 	// Only the emptiness check is trimmed; the original key is preserved.
 	input.Repo = strings.TrimSpace(input.Repo)
 	input.ExpectedHeadSHA = strings.TrimSpace(input.ExpectedHeadSHA)
+	input.ExpectedBaseSHA = strings.TrimSpace(input.ExpectedBaseSHA)
 	if strings.TrimSpace(input.ProjectID) == "" || input.Repo == "" || input.PRNumber <= 0 {
 		return Report{}, fmt.Errorf("gatekeeper project, repository, and pull request number are required")
 	}
@@ -729,6 +735,7 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 	report.Evidence.MergedAt = strings.TrimSpace(detail.MergedAt)
 	report.Evidence.Draft = detail.IsDraft
 	report.Evidence.BaseRefName = strings.TrimSpace(detail.BaseRefName)
+	report.Evidence.BaseSHA = strings.TrimSpace(detail.BaseSHA)
 	report.Evidence.ReviewDecision = strings.ToUpper(strings.TrimSpace(detail.ReviewDecision))
 	reviewThreshold := r.requiredReviewChangedLinesFor(input.ProjectID)
 	reviewPolicyEnabled := r.trustFor(input.ProjectID) == config.GatekeeperTrustAuto && reviewThreshold > 0
@@ -740,7 +747,11 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 		report.Reasons = []Reason{{Code: ReasonHeadStale}}
 		return r.persist(ctx, report)
 	}
-	if detail.Number != input.PRNumber || report.ObservedHeadSHA == "" || report.Evidence.BaseRefName == "" {
+	if input.ExpectedBaseSHA != "" && report.Evidence.BaseSHA != input.ExpectedBaseSHA {
+		report.Reasons = []Reason{{Code: ReasonBaseStale}}
+		return r.persist(ctx, report)
+	}
+	if detail.Number != input.PRNumber || report.ObservedHeadSHA == "" || report.Evidence.BaseRefName == "" || report.Evidence.BaseSHA == "" {
 		return r.persistProviderBlock(ctx, report, ReasonProviderStateAmbiguous, "pull_request")
 	}
 	codexReview, err := latestCodexReviewForHead(ctx, r.repos, input.ProjectID, input.Repo, input.PRNumber, report.ObservedHeadSHA)
@@ -803,9 +814,16 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 	if err != nil {
 		return r.persistProviderBlock(ctx, report, ReasonProviderStateUnavailable, "mergeability")
 	}
-	if strings.TrimSpace(mergeability.HeadSHA) != report.ObservedHeadSHA {
-		report.Reasons = []Reason{{Code: ReasonHeadStale}}
+	if strings.TrimSpace(mergeability.HeadSHA) != report.ObservedHeadSHA || strings.TrimSpace(mergeability.BaseSHA) != report.Evidence.BaseSHA {
+		report.Reasons = []Reason{}
+		if strings.TrimSpace(mergeability.HeadSHA) != report.ObservedHeadSHA {
+			report.Reasons = append(report.Reasons, Reason{Code: ReasonHeadStale})
+		}
+		if strings.TrimSpace(mergeability.BaseSHA) != report.Evidence.BaseSHA {
+			report.Reasons = append(report.Reasons, Reason{Code: ReasonBaseStale})
+		}
 		report.Evidence.FinalObservedHeadSHA = strings.TrimSpace(mergeability.HeadSHA)
+		report.Evidence.FinalObservedBaseSHA = strings.TrimSpace(mergeability.BaseSHA)
 		return r.persist(ctx, report)
 	}
 	report.Evidence.Mergeable = mergeability.Mergeable
@@ -1030,9 +1048,17 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 	if err != nil {
 		return r.persistProviderBlock(ctx, report, ReasonProviderStateUnavailable, "head_revalidation")
 	}
+	finalBase, err := r.github.GetPullRequestBaseSHA(ctx, viewInput)
+	if err != nil {
+		return r.persistProviderBlock(ctx, report, ReasonProviderStateUnavailable, "base_revalidation")
+	}
 	report.Evidence.FinalObservedHeadSHA = strings.TrimSpace(finalHead)
+	report.Evidence.FinalObservedBaseSHA = strings.TrimSpace(finalBase)
 	if report.Evidence.FinalObservedHeadSHA == "" {
 		return r.persistProviderBlock(ctx, report, ReasonProviderStateAmbiguous, "head_revalidation")
+	}
+	if report.Evidence.FinalObservedBaseSHA == "" {
+		return r.persistProviderBlock(ctx, report, ReasonProviderStateAmbiguous, "base_revalidation")
 	}
 	if report.Evidence.FinalObservedHeadSHA != report.ObservedHeadSHA {
 		report.Reasons = append(report.Reasons, Reason{Code: ReasonHeadStale})
@@ -1052,6 +1078,9 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 	}
 	if reviewPolicyEnabled && strings.TrimSpace(finalBase) != reviewCapacityBaseSHA {
 		return r.persistProviderBlock(ctx, report, ReasonProviderStateAmbiguous, "review_capacity_base")
+	}
+	if report.Evidence.FinalObservedBaseSHA != report.Evidence.BaseSHA {
+		report.Reasons = append(report.Reasons, Reason{Code: ReasonBaseStale})
 	}
 	return r.persist(ctx, report)
 }

@@ -172,6 +172,7 @@ func TestDiscoverPullRequestsReevaluatesWhenTheListPageChanges(t *testing.T) {
 		{name: "draft", mutate: func(p *githubinfra.PullRequestSummary) { p.IsDraft = true }},
 		{name: "conflicts", mutate: func(p *githubinfra.PullRequestSummary) { p.HasConflicts = true }},
 		{name: "base branch", mutate: func(p *githubinfra.PullRequestSummary) { p.BaseRefName = "release" }},
+		{name: "base sha", mutate: func(p *githubinfra.PullRequestSummary) { p.BaseSHA = "base-2" }},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			fixture := newGatekeeperFixture(t)
@@ -188,6 +189,36 @@ func TestDiscoverPullRequestsReevaluatesWhenTheListPageChanges(t *testing.T) {
 					testCase.name, second.Evaluated, second.Skipped)
 			}
 		})
+	}
+}
+
+func TestDiscoverPullRequestsReevaluatesWhenProtectedPathPolicyChanges(t *testing.T) {
+	fixture := newGatekeeperFixture(t)
+	fixture.github.openPullRequests = []githubinfra.PullRequestSummary{openPullRequestFixture()}
+	fixture.github.detail.ChangedFiles = []string{"internal/gatekeeper/runner.go"}
+	protectedPaths := []string(nil)
+	runner := New(Options{
+		Repos: fixture.repos, GitHub: fixture.github, Now: func() time.Time { return fixture.now },
+		PolicyPermitsTarget: func(string, string, string) bool { return fixture.policyPermits },
+		ProtectedPathsForProject: func(string) []string {
+			return append([]string(nil), protectedPaths...)
+		},
+	})
+	discoverWith := func() DiscoveryResult {
+		result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+		if err != nil {
+			t.Fatalf("DiscoverPullRequests() error = %v", err)
+		}
+		return result
+	}
+	first := discoverWith()
+	if first.Evaluated != 1 || first.Skipped != 0 {
+		t.Fatalf("first tick = %#v, want one evaluation", first)
+	}
+	protectedPaths = []string{"internal/gatekeeper/**"}
+	second := discoverWith()
+	if second.Evaluated != 1 || second.Skipped != 0 || !hasReason(second.Reports[0], ReasonProtectedPathTouched) {
+		t.Fatalf("policy change result = %#v, want re-evaluation with protected-path blocker", second)
 	}
 }
 

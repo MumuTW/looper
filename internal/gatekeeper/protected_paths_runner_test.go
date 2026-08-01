@@ -82,3 +82,27 @@ func TestEvaluatePullRequestProtectedPathGateKeepsHeadRaceBlocked(t *testing.T) 
 		t.Fatalf("report = %#v, want protected-path and head-race blockers", report)
 	}
 }
+
+func TestEvaluatePullRequestProtectedPathGateKeepsBaseRaceBlocked(t *testing.T) {
+	fixture := newGatekeeperFixture(t)
+	fixture.github.detail.ChangedFiles = []string{"internal/gatekeeper/runner.go"}
+	fixture.github.finalBaseSHA = "base-2"
+	runner := New(Options{
+		Repos:  fixture.repos,
+		GitHub: fixture.github,
+		Now:    func() time.Time { return fixture.now },
+		ProtectedPathsForProject: func(string) []string {
+			return []string{"internal/gatekeeper/**"}
+		},
+	})
+
+	report, err := runner.EvaluatePullRequest(context.Background(), EvaluationInput{
+		ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, ExpectedHeadSHA: "head-1",
+	})
+	if err != nil {
+		t.Fatalf("EvaluatePullRequest() error = %v", err)
+	}
+	if !hasReason(report, ReasonProtectedPathTouched) || !hasReason(report, ReasonBaseStale) {
+		t.Fatalf("report = %#v, want protected-path and base-race blockers", report)
+	}
+}

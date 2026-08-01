@@ -492,13 +492,18 @@ func TestGatewayGatekeeperReadsChangedFiles(t *testing.T) {
 	runner := &fakeGHRunner{t: t}
 	runner.respond = func(options shell.Options) (shell.Result, error) {
 		args := strings.Join(options.Args, " ")
-		if !strings.HasPrefix(args, "pr view 42 --repo acme/looper --json ") {
+		switch {
+		case strings.HasPrefix(args, "pr view 42 --repo acme/looper --json "):
+			if strings.Contains(args, "files") {
+				t.Fatalf("gatekeeper metadata fields = %q, want files fetched through paginated REST", args)
+			}
+			return shell.Result{Stdout: `{"number":42,"state":"OPEN","isDraft":false,"headRefName":"feature","baseRefName":"main","headRefOid":"head-1","baseRefOid":"base-1"}`}, nil
+		case strings.HasPrefix(args, "api --paginate --slurp repos/acme/looper/pulls/42/files?per_page=100"):
+			return shell.Result{Stdout: `[[{"filename":"./internal/gatekeeper/runner.go"},{"filename":"docs/README.md","previous_filename":"internal/gatekeeper/old.go"},{"filename":"internal/gatekeeper/runner.go"}]]`}, nil
+		default:
 			t.Fatalf("unexpected gh args: %q", args)
+			return shell.Result{}, nil
 		}
-		if !strings.Contains(args, "files") {
-			t.Fatalf("gatekeeper fields = %q, want files", args)
-		}
-		return shell.Result{Stdout: `{"number":42,"state":"OPEN","isDraft":false,"headRefName":"feature","baseRefName":"main","headRefOid":"head-1","baseRefOid":"base-1","files":[{"path":"./internal/gatekeeper/runner.go"},{"filename":"docs/README.md"},{"path":"internal/gatekeeper/runner.go"}]}`}, nil
 	}
 
 	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
@@ -506,7 +511,7 @@ func TestGatewayGatekeeperReadsChangedFiles(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ViewPullRequestForGatekeeper() error = %v", err)
 	}
-	want := []string{"internal/gatekeeper/runner.go", "docs/README.md"}
+	want := []string{"internal/gatekeeper/runner.go", "docs/README.md", "internal/gatekeeper/old.go"}
 	if !slices.Equal(detail.ChangedFiles, want) {
 		t.Fatalf("ChangedFiles = %#v, want %#v", detail.ChangedFiles, want)
 	}
@@ -641,6 +646,47 @@ func TestGetPullRequestHeadAndBaseSHA(t *testing.T) {
 	}
 }
 
+func TestGetPullRequestBaseSHA(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		if args != "pr view 42 --repo acme/looper --json baseRefOid" {
+			t.Fatalf("unexpected gh args: %q", args)
+		}
+		return shell.Result{Stdout: `{"baseRefOid":"base123"}`}, nil
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	baseSHA, err := gateway.GetPullRequestBaseSHA(context.Background(), ViewPullRequestInput{Repo: "acme/looper", PRNumber: 42})
+	if err != nil {
+		t.Fatalf("GetPullRequestBaseSHA() error = %v", err)
+	}
+	if baseSHA != "base123" {
+		t.Fatalf("GetPullRequestBaseSHA() = %q, want base123", baseSHA)
+	}
+}
+
+func TestGatewayMergePullRequestRevalidatesExpectedBaseSHA(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		switch args {
+		case "pr view 42 --repo acme/looper --json baseRefOid":
+			return shell.Result{Stdout: `{"baseRefOid":"base123"}`}, nil
+		case "pr merge 42 --repo acme/looper --squash --match-head-commit head123":
+			return shell.Result{}, nil
+		default:
+			t.Fatalf("unexpected gh args: %q", args)
+			return shell.Result{}, nil
+		}
+	}
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	if err := gateway.MergePullRequest(context.Background(), EnableAutoMergeInput{Repo: "acme/looper", PRNumber: 42, Strategy: config.ReviewerAutoMergeStrategySquash, HeadSHA: "head123", BaseSHA: "base123"}); err != nil {
+		t.Fatalf("MergePullRequest() error = %v", err)
+	}
+}
 func TestGetRepositorySettings(t *testing.T) {
 	t.Parallel()
 	runner := &fakeGHRunner{t: t}
