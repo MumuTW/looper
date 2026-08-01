@@ -23,6 +23,11 @@ type Service struct {
 // parsing an error string emitted by the lifecycle service.
 var ErrLoopNotFound = errors.New("loop not found")
 
+// ErrInvalidLoopStatusTransition lets transport adapters map a deterministic
+// lifecycle transition rejection (for example pausing a loop in a terminal
+// state) as a client-side conflict instead of an internal error.
+var ErrInvalidLoopStatusTransition = errors.New("invalid loop status transition")
+
 type CreateInput struct {
 	ProjectID    string
 	Type         domain.LoopType
@@ -219,7 +224,7 @@ func (s *Service) Pause(ctx context.Context, loopID string, reason *string) (Pau
 		currentStatus := domain.LoopStatus(loop.Status)
 		if currentStatus != domain.LoopStatusPaused {
 			if err := domain.AssertLoopStatusTransition(currentStatus, domain.LoopStatusPaused); err != nil {
-				return PauseResult{}, err
+				return PauseResult{}, fmt.Errorf("%w: %s -> %s: %v", ErrInvalidLoopStatusTransition, currentStatus, domain.LoopStatusPaused, err)
 			}
 		}
 		updated := *loop

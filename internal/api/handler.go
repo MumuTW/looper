@@ -5617,6 +5617,9 @@ func (h *Handler) mutateLoopStatus(ctx context.Context, loopID string, status do
 			if errors.Is(err, loops.ErrLoopNotFound) {
 				return loopResponse{}, apiError{code: pkgapi.ErrorCodeLoopNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Loop not found: %s", loopID)}
 			}
+			if errors.Is(err, loops.ErrInvalidLoopStatusTransition) {
+				return loopResponse{}, apiError{code: pkgapi.ErrorCodeLoopConflict, status: http.StatusConflict, message: err.Error()}
+			}
 			var typed apiError
 			if asAPIError(err, &typed) {
 				return loopResponse{}, typed
