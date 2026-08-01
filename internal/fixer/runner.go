@@ -2357,7 +2357,8 @@ func (r *Runner) recoverClaimedItem(ctx context.Context, queueItem storage.Queue
 			resumed := false
 			if runFailure != nil {
 				if breakerStreak > 0 && breakerPause != nil {
-					resumed, resumeErr := r.finishFailureStreakBreaker(ctx, *project, *breakerPause, queueItem, runFailure.runID, &runFailure.checkpoint)
+					var resumeErr error
+					resumed, resumeErr = r.finishFailureStreakBreaker(ctx, *project, *breakerPause, queueItem, runFailure.runID, &runFailure.checkpoint)
 					if resumeErr != nil {
 						return nil, resumeErr
 					}

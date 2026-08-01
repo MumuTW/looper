@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/MumuTW/looper/internal/domain"
 	"github.com/MumuTW/looper/internal/eventlog"
 	githubinfra "github.com/MumuTW/looper/internal/infra/github"
 	"github.com/MumuTW/looper/internal/labels"
@@ -264,7 +265,10 @@ func (r *Runner) handleTerminalExhaustion(ctx context.Context, project storage.P
 	}
 
 	branchOwned := strings.HasPrefix(strings.ToLower(strings.TrimSpace(pr.HeadRefName)), "looper/")
-	deleteBranch := branchOwned
+	// Branch deletion is destructive.  The runtime supplies the effective
+	// project policy (including the documented default); an unconfigured runner
+	// must not infer permission from branch ownership alone.
+	deleteBranch := false
 	if r.deleteBranchOnRegeneration != nil {
 		deleteBranch = branchOwned && r.deleteBranchOnRegeneration(project.ID)
 	}
@@ -497,7 +501,7 @@ func (r *Runner) requeueRegenerationHandoff(ctx context.Context, loop storage.Lo
 		return nil
 	}
 	if _, err := r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
-		if updated.Status != "terminated" {
+		if updated.Status != "terminated" && updated.Status != string(domain.LoopStatusHumanTakeover) {
 			updated.Status = "queued"
 			updated.NextRunAt = stringPtr(queuedAt)
 		}

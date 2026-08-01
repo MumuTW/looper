@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MumuTW/looper/internal/domain"
 	githubinfra "github.com/MumuTW/looper/internal/infra/github"
 	"github.com/MumuTW/looper/internal/labels"
 	"github.com/MumuTW/looper/internal/storage"
@@ -100,6 +101,37 @@ func TestTerminalRegenerationReplayRequeuesAndClaimsAfterHandoffFailure(t *testi
 	}
 	if result.Status != "failed" || routes != 2 || len(gateway.closeCalls) != 1 {
 		t.Fatalf("replay result=%#v routes=%d closes=%d, want failed/2/1", result, routes, len(gateway.closeCalls))
+	}
+}
+
+func TestTerminalRegenerationReplayDoesNotRequeueHumanTakeoverLoop(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	runner := newRegenerationRunner(t, fixture, &regenerationFakeGateway{}, func(context.Context, RegenerateIssueInput) error {
+		return nil
+	})
+	loop, queue := setupRegenerationRecords(t, fixture)
+	loop.Status = string(domain.LoopStatusHumanTakeover)
+	if _, err := fixture.coordinator.DB().ExecContext(context.Background(), `UPDATE loops SET status = ?, next_run_at = NULL WHERE id = ?`, domain.LoopStatusHumanTakeover, loop.ID); err != nil {
+		t.Fatalf("mark loop human takeover error = %v", err)
+	}
+	queue.Priority = storage.QueuePriorityFixer
+	if err := fixture.repos.Queue.Upsert(context.Background(), queue); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	if err := runner.requeueRegenerationHandoff(context.Background(), loop, queue); err != nil {
+		t.Fatalf("requeueRegenerationHandoff() error = %v", err)
+	}
+	persisted, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil || persisted == nil {
+		t.Fatalf("Loops.GetByID() = %#v err=%v", persisted, err)
+	}
+	if persisted.Status != string(domain.LoopStatusHumanTakeover) || persisted.NextRunAt != nil {
+		t.Fatalf("replayed loop = %#v, want unchanged human takeover", persisted)
+	}
+	queued, err := fixture.repos.Queue.GetByID(context.Background(), queue.ID)
+	if err != nil || queued == nil || queued.Status != "queued" {
+		t.Fatalf("replay queue = %#v err=%v, want queued handoff", queued, err)
 	}
 }
 

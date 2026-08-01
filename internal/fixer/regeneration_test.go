@@ -129,6 +129,29 @@ func TestHandleTerminalExhaustionOrdersCommentCloseAndPlannerRoute(t *testing.T)
 	}
 }
 
+func TestHandleTerminalExhaustionHonorsDeleteBranchPolicy(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	gateway := &regenerationFakeGateway{
+		fakeGitHubGateway: &fakeGitHubGateway{currentUser: "looper", viewResponses: []PullRequestDetail{{Number: 42, State: "OPEN", HeadRefName: "looper/fix-42", HeadSHA: "head-42"}}},
+		issue:             IssueDetail{Number: 7, State: "OPEN"},
+		commits:           []PullRequestCommit{{AuthorLogin: "looper", CommitterLogin: "looper"}},
+	}
+	runner := New(Options{
+		DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: gateway,
+		Now: fixture.now, Logger: fixture.logger,
+		OnRegenerateIssue:          func(context.Context, RegenerateIssueInput) error { return nil },
+		DeleteBranchOnRegeneration: func(string) bool { return false },
+	})
+	loop, queue := setupRegenerationRecords(t, fixture)
+	project, _ := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if _, action, err := runner.applyTerminalRegeneration(context.Background(), *project, loop, queue, fixerCheckpoint{}, &loopError{message: "failed", kind: FailureRetryableTransient}); err != nil || action != regenerationCompleted {
+		t.Fatalf("applyTerminalRegeneration() = action %q err %v, want completed", action, err)
+	}
+	if len(gateway.closeCalls) != 1 || gateway.closeCalls[0].DeleteBranch {
+		t.Fatalf("ClosePullRequest calls = %#v, want one call with DeleteBranch=false", gateway.closeCalls)
+	}
+}
+
 func TestHandleTerminalExhaustionReplaysAfterRouteFailureWithoutDuplicateClose(t *testing.T) {
 	fixture := newRunnerFixture(t)
 	gateway := &regenerationFakeGateway{
