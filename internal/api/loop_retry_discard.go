@@ -169,15 +169,16 @@ func (h *Handler) loopWorktreeStatus(ctx context.Context, loop storage.LoopRecor
 				ExpectedHeadSHA: resolved.ExpectedHeadSHA,
 				CheckoutMode:    resolved.CheckoutMode,
 			}); identityErr != nil {
+				// Plain retry is only safe for Worker: it revalidates the
+				// physical checkout before agent start. Planner/Fixer/Reviewer
+				// do not run that gate, so a failed identity check must block
+				// automatic requeue (operator can still discard after repair).
+				retrySafe := loop.Type == string(domain.LoopTypeWorker)
 				return loopWorktreeStatusResponse{}, apiError{
 					code:    pkgapi.ErrorCodeValidationFailed,
 					status:  http.StatusBadRequest,
 					message: fmt.Sprintf("Checkpoint worktree for loop %s is not retry-safe: %v", loop.ID, identityErr),
-					// This denies destructive discard, not a plain retry. The runner
-					// verifies the checkpoint checkout again before it starts an
-					// agent, so requeueing remains safe and lets it record the
-					// manual-intervention outcome.
-					details: map[string]any{"retrySafe": true, "reason": resolved.UnsafeReason},
+					details: map[string]any{"retrySafe": retrySafe, "reason": resolved.UnsafeReason},
 				}
 			}
 		}

@@ -3704,18 +3704,52 @@ func TestDefaultPathHelpersMatchTSLayout(t *testing.T) {
 		t.Fatalf("DefaultConfigPath() = %q, want %q", configPath, filepath.Join(homeDir, ".looper", "config.toml"))
 	}
 
+	// The worktree-root layout is asserted under an explicit LOOPER_HOME: with
+	// none set, this helper refuses to answer in a test binary at all. See
+	// TestDefaultProjectWorktreeRootRefusesUnisolatedTestBinary.
+	looperHome := t.TempDir()
+	t.Setenv("LOOPER_HOME", looperHome)
+
 	worktreeRoot, err := DefaultProjectWorktreeRoot("example-project", "/tmp/example-repo")
 	if err != nil {
 		t.Fatalf("DefaultProjectWorktreeRoot() error = %v", err)
 	}
 
-	wantPrefix := filepath.Join(homeDir, ".looper", "worktrees", ToRepoWorktreeDirectoryName("/tmp/example-repo"))
+	wantPrefix := filepath.Join(looperHome, "worktrees", ToRepoWorktreeDirectoryName("/tmp/example-repo"))
 	if filepath.Dir(worktreeRoot) != wantPrefix {
 		t.Fatalf("filepath.Dir(DefaultProjectWorktreeRoot()) = %q, want %q", filepath.Dir(worktreeRoot), wantPrefix)
 	}
 
 	if filepath.Base(worktreeRoot) != "example-project" {
 		t.Fatalf("filepath.Base(DefaultProjectWorktreeRoot()) = %q, want %q", filepath.Base(worktreeRoot), "example-project")
+	}
+}
+
+// The guard is the whole point of the change: a package that reaches this
+// fallback without an isolated LOOPER_HOME writes directories into the
+// operator's real ~/.looper that nothing ever collects.
+func TestDefaultProjectWorktreeRootRefusesUnisolatedTestBinary(t *testing.T) {
+	t.Setenv("LOOPER_HOME", "")
+
+	if _, err := DefaultProjectWorktreeRoot("example-project", "/tmp/example-repo"); !errors.Is(err, ErrUnisolatedWorktreeRoot) {
+		t.Fatalf("DefaultProjectWorktreeRoot() error = %v, want ErrUnisolatedWorktreeRoot", err)
+	}
+
+	// Sibling helpers stay usable: they only compose paths, and refusing them
+	// would break every CLI test that resolves a config path.
+	if _, err := DefaultConfigPath(); err != nil {
+		t.Fatalf("DefaultConfigPath() error = %v, want nil", err)
+	}
+	if _, err := DefaultWorktreeRoot(); err != nil {
+		t.Fatalf("DefaultWorktreeRoot() error = %v, want nil", err)
+	}
+}
+
+func TestDefaultProjectWorktreeRootAllowsIsolatedTestBinary(t *testing.T) {
+	t.Setenv("LOOPER_HOME", t.TempDir())
+
+	if _, err := DefaultProjectWorktreeRoot("example-project", "/tmp/example-repo"); err != nil {
+		t.Fatalf("DefaultProjectWorktreeRoot() error = %v, want nil", err)
 	}
 }
 

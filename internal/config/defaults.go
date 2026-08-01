@@ -1,10 +1,12 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"testing"
 
 	"github.com/MumuTW/looper/internal/labels"
 )
@@ -55,7 +57,32 @@ func DefaultWorktreeRoot() (string, error) {
 	return filepath.Join(looperHome, "worktrees"), nil
 }
 
+// ErrUnisolatedWorktreeRoot is returned when a test binary resolves this
+// fallback without an explicit LOOPER_HOME.
+//
+// This is the one fallback that creates directories in the operator's real
+// ~/.looper. A fixture whose project record carries no worktreeRoot lands here,
+// and the resulting directories are never registered in the worktrees table, so
+// no cleanup pass has a record to plan from. They accumulate for as long as the
+// suite keeps running — one container per distinct temporary repo path, which
+// is one per test run.
+//
+// A doc comment asking test authors to call testenv.RunTestMain did not hold:
+// the packages that reach this fallback are not the packages whose names
+// suggest worktrees, so the ones that leak are exactly the ones nobody thought
+// to annotate. Failing closed makes the invariant checkable instead of
+// remembered — a leaking package now fails its own tests, in its own build,
+// with the fix in the error text.
+var ErrUnisolatedWorktreeRoot = fmt.Errorf(
+	"refusing to resolve the default worktree root in a test binary without LOOPER_HOME: " +
+		"add `func TestMain(m *testing.M) { os.Exit(testenv.RunTestMain(m)) }` to this package, " +
+		"or set an explicit worktreeRoot on the project fixture")
+
 func DefaultProjectWorktreeRoot(projectID string, repoIdentity string) (string, error) {
+	if testing.Testing() && strings.TrimSpace(os.Getenv("LOOPER_HOME")) == "" {
+		return "", ErrUnisolatedWorktreeRoot
+	}
+
 	worktreeRoot, err := DefaultWorktreeRoot()
 	if err != nil {
 		return "", err

@@ -2717,3 +2717,58 @@ func mergeWatchCommentBody(cfg *config.Config, prNumber int64, headSHA string, r
 func stampedCoordinatorBody(cfg *config.Config, body string) string {
 	return disclosure.FromConfig(*cfg).Markdown(body, "coordinator", disclosure.ChannelIssueComment)
 }
+
+func TestRunnerRoutedBacklogLeavesStaleHeartbeatSingleTargetUntouched(t *testing.T) {
+	// A sole target whose node has stopped heartbeating is still an active
+	// claim: heartbeat staleness is infrastructure drift, not authority to
+	// revoke the assignment. The recovery scan must skip it (no hydration,
+	// no reroute) so a temporarily partitioned worker cannot run the same
+	// issue concurrently with a freshly routed live worker.
+	t.Parallel()
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Roles.Coordinator.PollInterval = "0s"
+		cfg.Roles.Coordinator.Dispatch.Mode = "autonomous"
+		cfg.Scheduler.MaxConcurrentRuns = 1
+		cfg.Projects[0].Network = config.ProjectNetworkConfig{Mode: config.ProjectNetworkModeRouted}
+	})
+	deadHB := fixture.now.Add(-24 * time.Hour)
+	fixture.network.status = protocol.NodeStatusResponse{
+		Membership: protocol.Membership{NodeID: "coord-1", NodeName: "coord-1", GitHub: protocol.GitHubIdentity{NumericID: 1, Login: "coord"}},
+		Memberships: []protocol.Membership{
+			{NodeID: "coord-1", NodeName: "coord-1", GitHub: protocol.GitHubIdentity{NumericID: 1, Login: "coord"}, Capabilities: protocol.NodeCapabilities{Roles: []string{"coordinator"}}},
+			{NodeID: "worker-dead", NodeName: "worker-dead", GitHub: protocol.GitHubIdentity{NumericID: 101, Login: "dead-bot"}, TargetLabels: []string{protocol.TargetLabelForNode("worker-dead")}, Capabilities: protocol.NodeCapabilities{Roles: []string{"worker"}}, LastHeartbeatAt: &deadHB},
+			{NodeID: "worker-live", NodeName: "worker-live", GitHub: protocol.GitHubIdentity{NumericID: 102, Login: "live-bot"}, TargetLabels: []string{protocol.TargetLabelForNode("worker-live")}, Capabilities: protocol.NodeCapabilities{Roles: []string{"worker"}}, LastHeartbeatAt: timePtr(fixture.now)},
+		},
+		Lease: protocol.CoordinatorLease{HolderNodeID: "coord-1", FencingToken: 12, ExpiresAt: timePtr(fixture.now.Add(time.Minute))},
+	}
+	issueLabels := []string{"triaged", "dispatch/implement", labels.DefaultWorkerReadyTrigger, protocol.TargetLabelForNode("worker-dead")}
+	seedDispatchIssueWithLabels(fixture, 77, issueLabels)
+	detail := fixture.github.details[77]
+	detail.URL = "https://github.com/acme/looper/issues/77"
+	fixture.github.details[77] = detail
+	backlogIssue := fixture.github.issues[0]
+	fixture.github.issues = nil
+	fixture.github.listIssues = func(input githubinfra.ListOpenIssuesInput) []githubinfra.IssueSummary {
+		if containsAllLabels(input.Labels, "triaged", "dispatch/implement", labels.DefaultWorkerReadyTrigger) {
+			return []githubinfra.IssueSummary{backlogIssue}
+		}
+		return nil
+	}
+
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	// The single-target recovery candidate is skipped, so the issue detail is
+	// never hydrated from the backlog scan.
+	if fixture.github.viewIssueReads != 0 {
+		t.Fatalf("viewIssueReads = %d, want stale single-target left untouched (not hydrated)", fixture.github.viewIssueReads)
+	}
+	// No reroute: the stale sole target must not move to the live worker.
+	if len(fixture.github.ops) != 0 {
+		t.Fatalf("ops = %v, want no dispatch ops for stale single-target", fixture.github.ops)
+	}
+	if got := countRemovedIssueOperations(fixture.github.removedLabels, 77, protocol.TargetLabelForNode("worker-dead")); got != 0 {
+		t.Fatalf("removed target label count = %d, want stale sole target untouched", got)
+	}
+}
