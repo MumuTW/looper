@@ -228,7 +228,11 @@ type Runtime struct {
 	workProducerJoinDone chan struct{}
 	// drainResidualDones holds producer done-channels still open after a
 	// bounded stop* timeout so DrainSnapshot keeps WorkProducersActive>0.
-	drainResidualDones       []<-chan struct{}
+	drainResidualDones []<-chan struct{}
+	// admittedHTTPMutations counts mutating API handlers that already passed
+	// AllowMutations and have not finished. Drain must wait for them so a
+	// final backup cannot race a commit that started before BeginDrain.
+	admittedHTTPMutations    atomic.Int64
 	projectDiscovery         *projectDiscoveryRunner
 	resumeProjectDiscoveries func(context.Context, *projects.Service) error
 	recoveryCancel           context.CancelFunc
@@ -837,7 +841,18 @@ func (r *Runtime) countActiveWorkProducers() int {
 		stats := forwarder.Stats()
 		active += stats.Queued + stats.InFlight
 	}
+	active += int(r.admittedHTTPMutations.Load())
 	return active
+}
+
+// BeginAdmittedMutation registers a mutating HTTP request that already passed
+// AllowMutations. The returned release must run when the handler returns.
+func (r *Runtime) BeginAdmittedMutation() func() {
+	if r == nil {
+		return func() {}
+	}
+	r.admittedHTTPMutations.Add(1)
+	return func() { r.admittedHTTPMutations.Add(-1) }
 }
 
 // channelStillOpen reports whether a done channel has not yet been closed.

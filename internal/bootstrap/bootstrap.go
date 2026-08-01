@@ -240,8 +240,7 @@ func ValidateSandboxRuntime(cfg config.Config, check func() error) error {
 }
 
 // ValidateSandboxRuntimeForConfig runs the sandbox readiness check in the
-// supervised service environment: daemon.workingDirectory and a minimal PATH
-// (not the operator shell PATH), so preflight matches real daemon boot.
+// environment the configured daemon mode actually boots with.
 func ValidateSandboxRuntimeForConfig(cfg config.Config) error {
 	cwd := strings.TrimSpace(cfg.Daemon.WorkingDirectory)
 	if cwd == "" {
@@ -252,7 +251,16 @@ func ValidateSandboxRuntimeForConfig(cfg config.Config) error {
 		}
 	}
 	return validateSandboxRuntime(cfg, func() error {
-		return processsandbox.AvailableInServiceEnvironment(cwd)
+		// foreground inherits the invoking shell PATH; supervised units use a
+		// manager-default PATH (see processsandbox.ServiceProbePATH*).
+		switch cfg.Daemon.Mode {
+		case config.DaemonModeLaunchd:
+			return processsandbox.AvailableInServiceEnvironment(cwd, processsandbox.ServiceProbePATHLaunchd)
+		case config.DaemonModeSystemd:
+			return processsandbox.AvailableInServiceEnvironment(cwd, processsandbox.ServiceProbePATHSystemd)
+		default:
+			return processsandbox.AvailableInDirectory(cwd)
+		}
 	})
 }
 

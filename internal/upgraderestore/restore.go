@@ -167,6 +167,11 @@ func restore(bundleDirectory string, source upgradebackup.Source, operations fil
 		if err != nil {
 			return fmt.Errorf("re-verify backup bundle before restore: %w", err)
 		}
+		// Reject a replaced manifest that re-authorizes different artifacts for
+		// the destinations extracted from an earlier Verify in the CLI.
+		if err := requireRestoreSourceMatchesManifest(source, v.Manifest); err != nil {
+			return err
+		}
 		verified = &v
 	}
 	configName := "config" + filepath.Ext(source.ConfigPath)
@@ -874,6 +879,19 @@ func targetOwnedByRestoreTransaction(entry journalEntry) (bool, error) {
 		return false, err
 	}
 	return hash == entry.StagedSHA256 && size == entry.StagedSize, nil
+}
+
+func requireRestoreSourceMatchesManifest(source upgradebackup.Source, manifest upgradebackup.Manifest) error {
+	manifestSource, err := upgradebackup.RestoreSource(manifest)
+	if err != nil {
+		// Legacy/v1 has no Source; production restore already requires v2 via CLI.
+		return nil
+	}
+	if filepath.Clean(source.ConfigPath) != filepath.Clean(manifestSource.ConfigPath) ||
+		filepath.Clean(source.DatabasePath) != filepath.Clean(manifestSource.DatabasePath) {
+		return fmt.Errorf("re-verified backup manifest source destinations do not match the restore request (config/database paths diverged after initial verify)")
+	}
+	return nil
 }
 
 func bundleConfigFileName(manifest upgradebackup.Manifest) (string, error) {
