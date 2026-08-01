@@ -22,6 +22,15 @@ func TestNormalizeAndHas(t *testing.T) {
 	}
 }
 
+func TestDoNotMergeMatchesSeparatorVariants(t *testing.T) {
+	t.Parallel()
+	for _, candidate := range []string{"do-not-merge", "do not merge", "DO NOT MERGE", "do_not_merge", "  Do   Not   Merge  "} {
+		if !Has([]string{candidate}, DoNotMerge) {
+			t.Fatalf("Has(%q, DoNotMerge) = false, want true", candidate)
+		}
+	}
+}
+
 // A per-role hold must not satisfy the global hold and vice versa: they are
 // different vetoes, and conflating them would either over- or under-block a
 // Role. The shared prefix makes that an easy mistake, so pin it.

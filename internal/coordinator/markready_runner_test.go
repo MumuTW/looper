@@ -40,6 +40,7 @@ func newMarkReadyFixture(t *testing.T, mutate ...func(*githubinfra.PullRequestDe
 	fixture.github.details[1] = githubinfra.IssueDetail{
 		Number:    1,
 		Title:     "Bug",
+		State:     "open",
 		Author:    "octo",
 		Labels:    []string{"triaged"},
 		CreatedAt: fixture.now.Add(-time.Hour).Format(time.RFC3339),
@@ -263,6 +264,77 @@ func TestRunnerMarkReadyLeavesDraftAloneWhenHeldBeforeMutation(t *testing.T) {
 	assertDraftUntouched(t, fixture)
 }
 
+func TestRunnerMarkReadyLeavesDraftAloneWhenSameHeadCheckTurnsPending(t *testing.T) {
+	t.Parallel()
+	fixture := newMarkReadyFixture(t)
+	fixture.github.prCheckRunRevalidations["abc123"] = githubinfra.PullRequestCheckRuns{
+		CheckRuns: []githubinfra.PullRequestCheckRun{{Name: "verify", Status: "in_progress"}},
+	}
+	runMarkReadyTick(t, fixture)
+	assertDraftUntouched(t, fixture)
+}
+
+func TestRunnerMarkReadyLeavesDraftAloneWhenDraftHistoryChangesBeforeMutation(t *testing.T) {
+	t.Parallel()
+	fixture := newMarkReadyFixture(t)
+	fixture.github.prDraftEventRevalidations[77] = []githubinfra.PullRequestDraftEvent{
+		{Event: githubinfra.DraftEventConvertToDraft, Actor: "octo", CreatedAt: "2026-05-14T12:05:00Z"},
+	}
+	runMarkReadyTick(t, fixture)
+	assertDraftUntouched(t, fixture)
+}
+
+func TestRunnerMarkReadyLeavesDraftAloneWhenBaseChangesBeforeMutation(t *testing.T) {
+	t.Parallel()
+	fixture := newMarkReadyFixture(t)
+	retargeted := fixture.github.prDetails[77]
+	retargeted.BaseRefName = "release"
+	fixture.github.prDetailRevalidations[77] = retargeted
+	fixture.github.branchProtection["release"] = fixture.github.branchProtection["main"]
+	runMarkReadyTick(t, fixture)
+	assertDraftUntouched(t, fixture)
+}
+
+func TestRunnerMarkReadyLeavesDraftAloneWhenCommitterChangesBeforeMutation(t *testing.T) {
+	t.Parallel()
+	fixture := newMarkReadyFixture(t)
+	fixture.github.prCommits[77] = []githubinfra.PullRequestCommit{{OID: "abc123", Authors: []string{"looper"}, Committers: []string{"looper"}, CommitterKnown: true}}
+	fixture.github.prCommitRevalidations[77] = []githubinfra.PullRequestCommit{{OID: "abc123", Authors: []string{"looper"}, Committers: []string{"octo"}, CommitterKnown: true}}
+	runMarkReadyTick(t, fixture)
+	assertDraftUntouched(t, fixture)
+}
+
+func TestRunnerMarkReadyLeavesDraftAloneWhenChecksAreTruncated(t *testing.T) {
+	t.Parallel()
+	fixture := newMarkReadyFixture(t)
+	fixture.github.prCheckRuns["abc123"] = githubinfra.PullRequestCheckRuns{
+		TotalCount: 101,
+		CheckRuns:  []githubinfra.PullRequestCheckRun{{Name: "verify", Status: "completed", Conclusion: "success"}},
+	}
+	runMarkReadyTick(t, fixture)
+	assertDraftUntouched(t, fixture)
+}
+
+func TestRunnerMarkReadyLeavesDraftAloneWhenIssueClosesBeforeMutation(t *testing.T) {
+	t.Parallel()
+	fixture := newMarkReadyFixture(t)
+	closed := fixture.github.details[1]
+	closed.State = "closed"
+	fixture.github.details[1] = closed
+	runMarkReadyTick(t, fixture)
+	assertDraftUntouched(t, fixture)
+}
+
+func TestRunnerMarkReadyLeavesDraftAloneWhenIssueClosesDuringEvidenceReads(t *testing.T) {
+	t.Parallel()
+	fixture := newMarkReadyFixture(t)
+	closed := fixture.github.details[1]
+	closed.State = "closed"
+	fixture.github.issueRevalidations[1] = closed
+	runMarkReadyTick(t, fixture)
+	assertDraftUntouched(t, fixture)
+}
+
 // Converting a published PR back to draft is an explicit "not ready". The
 // timeline is what makes that durable: nothing on the Pull Request itself
 // distinguishes it from the draft the machine opened, and an in-memory flag
@@ -427,6 +499,7 @@ func TestNewWarnsWhenMarkReadyPublishesForANonReviewingReviewer(t *testing.T) {
 	}
 
 	cfg.Roles.Reviewer.Discovery.Triggers.EnableSelfReview = true
+	cfg.Roles.Reviewer.Discovery.Triggers.RequireReviewRequest = false
 	cfg.Roles.Coding = config.CodingRolesFromLegacy(cfg.Roles)
 	reviewing := &recordingCoordinatorLogger{}
 	New(Options{Config: &cfg, Logger: reviewing})
@@ -448,5 +521,12 @@ func TestForeignCommitAuthorsIgnoresDaemonCaseAndDuplicates(t *testing.T) {
 	}
 	if unattributed != 2 {
 		t.Fatalf("unattributed = %d, want 2", unattributed)
+	}
+}
+
+func TestPRLinksIssueAcceptsFullGitHubURL(t *testing.T) {
+	t.Parallel()
+	if !prLinksIssue("acme/looper", 42, "Closes https://github.com/acme/looper/issues/42") {
+		t.Fatal("prLinksIssue() = false, want full GitHub issue URL to link the issue")
 	}
 }

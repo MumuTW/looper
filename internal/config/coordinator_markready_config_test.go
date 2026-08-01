@@ -44,8 +44,13 @@ func TestMarkReadyReviewerUnreachableProjects(t *testing.T) {
 	selfReviewing := base
 	selfReviewing.Roles.Reviewer.Discovery.Triggers.EnableSelfReview = true
 	selfReviewing.Roles.Coding = CodingRolesFromLegacy(selfReviewing.Roles)
+	if got := MarkReadyReviewerUnreachableProjects(selfReviewing); len(got) != 1 {
+		t.Fatalf("unreachable projects = %#v, want [demo] while review requests remain required", got)
+	}
+	selfReviewing.Roles.Reviewer.Discovery.Triggers.RequireReviewRequest = false
+	selfReviewing.Roles.Coding = CodingRolesFromLegacy(selfReviewing.Roles)
 	if got := MarkReadyReviewerUnreachableProjects(selfReviewing); len(got) != 0 {
-		t.Fatalf("unreachable projects = %#v, want none once the reviewer reviews its own pull requests", got)
+		t.Fatalf("unreachable projects = %#v, want none once self-review has a non-request path", got)
 	}
 
 	disabled := base

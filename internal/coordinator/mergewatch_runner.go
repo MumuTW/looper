@@ -3,6 +3,7 @@ package coordinator
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -17,7 +18,7 @@ import (
 )
 
 var mergeWatchPRURLPattern = regexp.MustCompile(`/pull/(\d+)(?:/|$)`)
-var mergeWatchClosingReferencePattern = regexp.MustCompile(`(?i)(?:close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved)\s+([\w.-]+/[\w.-]+#\d+|#\d+)`)
+var mergeWatchClosingReferencePattern = regexp.MustCompile(`(?i)(?:close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved)\s+((?:https?://[^\s)]+/issues/\d+)|(?:[\w.-]+/[\w.-]+#\d+)|#\d+)`)
 
 type mergeWatchComment struct {
 	ID      int64
@@ -44,11 +45,13 @@ func (r *Runner) applyMergeWatch(ctx context.Context, repo, cwd string, loaded [
 		if !issueHasCoordinatorTracking(issue.detail.Labels, roles.Coordinator.Triage.TriagedLabel) {
 			continue
 		}
-		lock := r.watchLock(repo, issue.detail.Number)
-		lock.Lock()
-		r.applyMarkReady(ctx, repo, cwd, issue, currentLogin, markReadyDrafts)
-		removed, applyErr := r.applyMergeWatchLocked(ctx, repo, cwd, issue, roles, currentLogin, budget)
-		lock.Unlock()
+		removed, applyErr := func() (bool, error) {
+			lock := r.watchLock(repo, issue.detail.Number)
+			lock.Lock()
+			defer lock.Unlock()
+			r.applyMarkReady(ctx, repo, cwd, issue, currentLogin, markReadyDrafts, roles.Coordinator.Triage.TriagedLabel)
+			return r.applyMergeWatchLocked(ctx, repo, cwd, issue, roles, currentLogin, budget)
+		}()
 		if applyErr != nil {
 			return nil, applyErr
 		}
@@ -563,8 +566,24 @@ func prLinksIssue(repo string, issueNumber int64, body string) bool {
 			continue
 		}
 		reference := strings.TrimSpace(match[1])
+		reference = strings.TrimRight(reference, ".,;:")
 		if strings.HasPrefix(reference, "#") && asInt64(reference[1:]) == issueNumber {
 			return true
+		}
+		if parsed, err := url.Parse(reference); err == nil && parsed.Scheme != "" && parsed.Host != "" {
+			path := strings.Trim(parsed.Path, "/")
+			segments := strings.Split(path, "/")
+			if len(segments) >= 4 && strings.EqualFold(segments[len(segments)-2], "issues") && asInt64(segments[len(segments)-1]) == issueNumber {
+				hostname, slug := githubinfra.SplitRepoHostname(repo)
+				if hostname == "" {
+					hostname = "github.com"
+				}
+				issuesIndex := len(segments) - 2
+				ownerRepo := strings.Join(segments[issuesIndex-2:issuesIndex], "/")
+				if strings.EqualFold(parsed.Hostname(), hostname) && strings.EqualFold(ownerRepo, slug) {
+					return true
+				}
+			}
 		}
 		parts := strings.Split(reference, "#")
 		if len(parts) == 2 && strings.EqualFold(strings.TrimSpace(parts[0]), strings.TrimSpace(repo)) && asInt64(parts[1]) == issueNumber {

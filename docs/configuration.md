@@ -570,10 +570,10 @@ The lane only ever considers open drafts: it lists them once per tick and inters
 
 Marking ready is idempotent: a human clicking "Ready for review" first is success, not an error.
 
-**Publishing alone does not start a review.** It emits `ready_for_review`, and that delivery does wake the reviewer lane — but the reviewer refuses a PR authored by the account it runs as unless `roles.reviewer.discovery.enableSelfReview` is true, and GitHub will not let anyone request review from a PR's own author. So with the shipped defaults (`requireReviewRequest = true`, `enableSelfReview = false`) and a single daemon identity, mark-ready produces drafts that publish and then sit. Make review actually happen with one of:
+**Publishing alone does not start a review.** It emits `ready_for_review`, and that delivery does wake the reviewer lane — but the reviewer refuses a PR authored by the account it runs as unless `roles.reviewer.discovery.triggers.enableSelfReview` is true, and GitHub will not let anyone request review from a PR's own author. So with the shipped defaults (`requireReviewRequest = true`, `enableSelfReview = false`) and a single daemon identity, mark-ready produces drafts that publish and then sit. Make review actually happen with one of:
 
 - a **distinct reviewer identity** — a second daemon, or a routed reviewer node, running under its own GitHub login. The PR is not self-authored from its point of view, so the default reviewer configuration applies unchanged.
-- `roles.reviewer.discovery.enableSelfReview = true`, accepting that the same account both writes and reviews.
+- `roles.reviewer.discovery.triggers.enableSelfReview = true`, accepting that the same account both writes and reviews, and set `triggers.requireReviewRequest = false` so discovery has a non-request path.
 
 Coordinator logs a warning at startup when `markReady.enabled` is true and the effective reviewer configuration can never claim a looper-authored PR. Mark-ready does not change any reviewer default on your behalf.
 

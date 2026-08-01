@@ -10,10 +10,11 @@ import (
 	"github.com/MumuTW/looper/internal/labels"
 )
 
-// markReadyOpenPullRequestLimit caps the per-tick open-Pull-Request listing.
-// Beyond it a draft is simply not considered this tick, which is the same
-// direction every other guard in this lane fails: leave the draft alone.
-const markReadyOpenPullRequestLimit = 100
+// markReadyOpenPullRequestLimit is deliberately larger than the default
+// GitHub CLI page. `gh pr list --limit` follows its pagination until this
+// bound, so a repository with more than one page of open PRs does not starve
+// linked drafts at the prefix boundary.
+const markReadyOpenPullRequestLimit = 1000
 
 // markReadyCandidates lists the repository's open drafts once per tick.
 //
@@ -63,19 +64,31 @@ func (r *Runner) markReadyCandidates(ctx context.Context, repo, cwd string, role
 // on top of a pipeline that works without it, so a forge hiccup leaves the
 // draft alone and the next tick tries again rather than aborting discovery and
 // stalling triage and dispatch behind an optional lane.
-func (r *Runner) applyMarkReady(ctx context.Context, repo, cwd string, issue loadedIssue, currentLogin string, candidates map[int64]struct{}) {
+func (r *Runner) applyMarkReady(ctx context.Context, repo, cwd string, issue loadedIssue, currentLogin string, candidates map[int64]struct{}, triagedLabel string) {
 	if len(candidates) == 0 {
 		return
 	}
+	// The issue list/detail read happens before the merge-watch lock and can go
+	// stale while the coordinator is doing other work. Refresh the tracking
+	// authority immediately before touching any linked PR.
+	freshIssue, err := r.github.ViewIssue(ctx, githubinfra.ViewIssueInput{Repo: repo, IssueNumber: issue.detail.Number, CWD: cwd})
+	if err != nil {
+		r.logMarkReadySkip(repo, issue.detail.Number, 0, "revalidate issue", err)
+		return
+	}
+	if !strings.EqualFold(strings.TrimSpace(freshIssue.State), "open") || !issueHasCoordinatorTracking(freshIssue.Labels, triagedLabel) {
+		return
+	}
+	issue.detail = freshIssue
 	for _, prNumber := range linkedPullRequestNumbers(issue.rawTimeline) {
 		if _, ok := candidates[prNumber]; !ok {
 			continue
 		}
-		r.applyMarkReadyForPullRequest(ctx, repo, cwd, issue.detail.Number, prNumber, currentLogin)
+		r.applyMarkReadyForPullRequest(ctx, repo, cwd, issue.detail.Number, prNumber, currentLogin, triagedLabel)
 	}
 }
 
-func (r *Runner) applyMarkReadyForPullRequest(ctx context.Context, repo, cwd string, issueNumber, prNumber int64, currentLogin string) {
+func (r *Runner) applyMarkReadyForPullRequest(ctx context.Context, repo, cwd string, issueNumber, prNumber int64, currentLogin, triagedLabel string) {
 	detail, err := r.github.ViewPullRequestMergeWatch(ctx, githubinfra.ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
 	if err != nil {
 		r.logMarkReadySkip(repo, issueNumber, prNumber, "read pull request", err)
@@ -140,8 +153,52 @@ func (r *Runner) applyMarkReadyForPullRequest(ctx context.Context, repo, cwd str
 		return
 	}
 	confirming := markReadySnapshot(repo, issueNumber, prNumber, confirmDetail, currentLogin)
+	if !strings.EqualFold(strings.TrimSpace(detail.HeadSHA), strings.TrimSpace(confirmDetail.HeadSHA)) {
+		if decision := mergewatch.ConfirmMarkReady(snapshot, confirming); !decision.MarkReady {
+			r.logMarkReadyBlocked(repo, issueNumber, prNumber, decision.Blocker)
+		}
+		return
+	}
+	// A same-head revalidation still needs fresh check, protection, commit, and
+	// lifecycle evidence: every one of those can change without a new commit.
+	confirmDraftEvents, err := r.github.ListPullRequestDraftEvents(ctx, githubinfra.PullRequestDraftEventsInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
+	if err != nil {
+		r.logMarkReadySkip(repo, issueNumber, prNumber, "revalidate draft history", err)
+		return
+	}
+	confirming.HumanConvertedToDraft = mergewatch.HumanConvertedToDraft(markReadyDraftEvents(confirmDraftEvents), currentLogin)
+	confirmCheckRuns, err := r.github.ListPullRequestCheckRuns(ctx, githubinfra.PullRequestCheckRunsInput{Repo: repo, Ref: confirmDetail.HeadSHA, CWD: cwd})
+	if err != nil {
+		r.logMarkReadySkip(repo, issueNumber, prNumber, "revalidate check runs", err)
+		return
+	}
+	confirmProtection, err := r.github.GetBranchProtection(ctx, githubinfra.BranchProtectionInput{Repo: repo, Branch: confirmDetail.BaseRefName, CWD: cwd})
+	if err != nil {
+		r.logMarkReadySkip(repo, issueNumber, prNumber, "revalidate branch protection", err)
+		return
+	}
+	confirmRequired, confirmKnown := markReadyRequiredChecks(confirmProtection, confirmCheckRuns)
+	confirming.ChecksUnknown = !confirmKnown
+	confirming.RequiredChecks = summarizeRequiredChecks(confirmRequired, confirmCheckRuns, true)
+	confirmCommits, err := r.github.ListPullRequestCommits(ctx, githubinfra.ListPullRequestCommitsInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
+	if err != nil {
+		r.logMarkReadySkip(repo, issueNumber, prNumber, "revalidate branch commits", err)
+		return
+	}
+	confirming.ForeignCommitAuthors, confirming.UnattributedCommits = foreignCommitAuthors(confirmCommits, currentLogin)
 	if decision := mergewatch.ConfirmMarkReady(snapshot, confirming); !decision.MarkReady {
 		r.logMarkReadyBlocked(repo, issueNumber, prNumber, decision.Blocker)
+		return
+	}
+	// The Issue is the tracking authority as well as the PR's scope input. A
+	// closure or triage-label removal during the evidence reads must win over a
+	// green PR, so re-read it adjacent to the mutation too.
+	finalIssue, err := r.github.ViewIssue(ctx, githubinfra.ViewIssueInput{Repo: repo, IssueNumber: issueNumber, CWD: cwd})
+	if err != nil {
+		r.logMarkReadySkip(repo, issueNumber, prNumber, "revalidate issue before mutation", err)
+		return
+	}
+	if (finalIssue.Number != 0 && finalIssue.Number != issueNumber) || !strings.EqualFold(strings.TrimSpace(finalIssue.State), "open") || !issueHasCoordinatorTracking(finalIssue.Labels, triagedLabel) {
 		return
 	}
 	if err := r.github.MarkPullRequestReady(ctx, githubinfra.MarkPullRequestReadyInput{Repo: repo, PRNumber: prNumber, CWD: cwd}); err != nil {
@@ -160,6 +217,7 @@ func markReadySnapshot(repo string, issueNumber, prNumber int64, detail githubin
 		PRNumber:         prNumber,
 		IssueNumber:      issueNumber,
 		HeadSHA:          detail.HeadSHA,
+		BaseRefName:      detail.BaseRefName,
 		Draft:            detail.IsDraft,
 		Open:             strings.EqualFold(strings.TrimSpace(detail.State), "open") && detail.MergedAt == "",
 		InScope:          labels.AnyLooperOwned(detail.Labels) && prLinksIssue(repo, issueNumber, detail.Body),
@@ -193,6 +251,13 @@ func markReadyDraftEvents(events []githubinfra.PullRequestDraftEvent) []mergewat
 // before a workflow appears would read that emptiness as success. It is not
 // evidence of anything, so it is reported as unknown and the draft waits.
 func markReadyRequiredChecks(protection githubinfra.BranchProtection, checkRuns githubinfra.PullRequestCheckRuns) (requiredCheckRules, bool) {
+	// A successful prefix of a truncated provider response is not evidence that
+	// every check is green. Keep the draft in draft until both collections are
+	// complete; this is especially important on unprotected branches where every
+	// observed check becomes a requirement.
+	if checkRuns.TotalCount > len(checkRuns.CheckRuns) || checkRuns.StatusesTotalCount > len(checkRuns.Statuses) {
+		return requiredCheckRulesFor(protection), false
+	}
 	if required := requiredCheckRulesFor(protection); required.len() > 0 {
 		return required, true
 	}
@@ -206,8 +271,11 @@ func markReadyRequiredChecks(protection githubinfra.BranchProtection, checkRuns 
 	return observed, observed.len() > 0
 }
 
-// foreignCommitAuthors splits a branch's commits into the logins that are not
-// the daemon's and the count of commits GitHub could attribute to nobody.
+// foreignCommitAuthors splits a branch's commits into the forge-attributed
+// committers that are not the daemon's and the count of commits GitHub could
+// attribute to nobody. The author field is retained as compatibility evidence
+// for older gateway implementations, but a current gateway marks the
+// committer authority explicitly.
 //
 // Commit authorship as the forge reports it is the only authority available
 // here that a pushing human cannot accidentally omit — a commit-message
@@ -221,11 +289,18 @@ func foreignCommitAuthors(commits []githubinfra.PullRequestCommit, currentLogin 
 	seen := map[string]struct{}{}
 	unattributed := 0
 	for _, commit := range commits {
-		if len(commit.Authors) == 0 {
+		identities := commit.Authors
+		if commit.CommitterKnown {
+			// The forge-attributed committer is the authority for who pushed the
+			// branch. Author metadata is user-controlled and can survive a
+			// cherry-pick by a different human.
+			identities = commit.Committers
+		}
+		if len(identities) == 0 {
 			unattributed++
 			continue
 		}
-		for _, author := range commit.Authors {
+		for _, author := range identities {
 			login := strings.ToLower(strings.TrimSpace(author))
 			if login == "" {
 				unattributed++

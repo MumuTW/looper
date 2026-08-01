@@ -220,7 +220,9 @@ func MarkReadyReviewerUnreachableProjects(cfg Config) []string {
 			continue
 		}
 		reviewer, ok := ProjectCodingRoleConfig(cfg, project.ID, CodingRoleReviewer)
-		if !ok || reviewer.Discovery.EnableSelfReview {
+		canClaimWithoutRequest := ok && reviewer.Discovery.Enabled && reviewer.Discovery.EnableSelfReview &&
+			!reviewer.Discovery.RequireReviewRequest && len(reviewer.Discovery.Labels) == 0
+		if !ok || canClaimWithoutRequest {
 			continue
 		}
 		unreachable = append(unreachable, project.ID)

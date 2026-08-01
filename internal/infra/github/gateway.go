@@ -178,9 +178,10 @@ type PullRequestAutoMerge struct {
 }
 
 type PullRequestCheckRuns struct {
-	TotalCount int
-	CheckRuns  []PullRequestCheckRun
-	Statuses   []PullRequestStatus
+	TotalCount         int
+	CheckRuns          []PullRequestCheckRun
+	StatusesTotalCount int
+	Statuses           []PullRequestStatus
 }
 
 type PullRequestCheckRun struct {
@@ -489,12 +490,15 @@ const (
 )
 
 // PullRequestCommit is one commit on a Pull Request branch together with the
-// forge accounts GitHub attributes it to. Authors is what makes a commit
-// attributable: a commit whose author email matches no account resolves to an
-// empty list, which callers must read as unattributable rather than as Looper's.
+// forge accounts GitHub attributes to its author and committer. CommitterKnown
+// distinguishes a current REST response (where a missing committer is
+// authoritative unattribution) from an older gateway implementation that only
+// supplied Authors.
 type PullRequestCommit struct {
-	OID     string
-	Authors []string
+	OID            string
+	Authors        []string
+	Committers     []string
+	CommitterKnown bool
 }
 
 type PullRequestCheckRunsInput struct {
@@ -1837,7 +1841,7 @@ func (g *Gateway) ListPullRequestCheckRuns(ctx context.Context, input PullReques
 	if err != nil {
 		return PullRequestCheckRuns{}, err
 	}
-	statusArgs := []string{"api", fmt.Sprintf("repos/%s/commits/%s/status", repo, encodeURIComponent(input.Ref)), "-H", "Accept: application/vnd.github+json"}
+	statusArgs := []string{"api", fmt.Sprintf("repos/%s/commits/%s/status?per_page=100", repo, encodeURIComponent(input.Ref)), "-H", "Accept: application/vnd.github+json"}
 	if hostname != "" {
 		statusArgs = append(statusArgs, "--hostname", hostname)
 	}
@@ -1855,6 +1859,7 @@ func (g *Gateway) ListPullRequestCheckRuns(ctx context.Context, input PullReques
 		out.CheckRuns = append(out.CheckRuns, PullRequestCheckRun{Name: asString(checkRun["name"]), Status: asString(checkRun["status"]), Conclusion: asString(checkRun["conclusion"]), AppID: nestedInt64(checkRun, "app", "id"), CheckSuiteID: nestedInt64(checkRun, "check_suite", "id")})
 	}
 	statuses := toObjectSlice(statusRow["statuses"])
+	out.StatusesTotalCount = int(asInt64(statusRow["total_count"]))
 	out.Statuses = make([]PullRequestStatus, 0, len(statuses))
 	seenContexts := map[string]struct{}{}
 	for _, status := range statuses {
@@ -2022,25 +2027,34 @@ func (g *Gateway) MarkPullRequestReady(ctx context.Context, input MarkPullReques
 	return err
 }
 
-// ListPullRequestCommits returns the commits on a Pull Request branch with the
-// forge accounts each is attributed to, newest page limits aside. It exists so
-// callers can ask who wrote a branch without cloning it.
+// ListPullRequestCommits returns every commit on a Pull Request branch with the
+// forge accounts each is attributed to. The REST endpoint is paginated because
+// authorship is a safety gate: silently dropping a later commit can turn a
+// human-pushed branch into an apparently daemon-only branch.
 func (g *Gateway) ListPullRequestCommits(ctx context.Context, input ListPullRequestCommitsInput) ([]PullRequestCommit, error) {
-	result, err := g.runGh(ctx, input.CWD, "", "pr", "view", strconv.FormatInt(input.PRNumber, 10), "--repo", input.Repo, "--json", "commits")
+	hostname, repo := splitRepoHostname(input.Repo)
+	args := []string{"api", "--paginate", "--slurp", fmt.Sprintf("repos/%s/pulls/%d/commits?per_page=100", repo, input.PRNumber), "-H", "Accept: application/vnd.github+json"}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGh(ctx, input.CWD, "", args...)
 	if err != nil {
 		return nil, err
 	}
-	row, err := decodeJSONObject(result.Stdout)
+	rows, err := decodeJSONArrayOrPages(result.Stdout)
 	if err != nil {
 		return nil, err
 	}
-	rows := toObjectSlice(row["commits"])
 	out := make([]PullRequestCommit, 0, len(rows))
 	for _, commitRow := range rows {
-		commit := PullRequestCommit{OID: asString(commitRow["oid"])}
-		for _, author := range toObjectSlice(commitRow["authors"]) {
-			if login := strings.TrimSpace(asString(author["login"])); login != "" {
-				commit.Authors = append(commit.Authors, login)
+		commit := PullRequestCommit{OID: firstNonEmpty(asString(commitRow["sha"]), asString(commitRow["oid"]))}
+		if author := strings.TrimSpace(extractAuthor(commitRow["author"])); author != "" {
+			commit.Authors = append(commit.Authors, author)
+		}
+		if _, present := commitRow["committer"]; present {
+			commit.CommitterKnown = true
+			if committer := strings.TrimSpace(extractAuthor(commitRow["committer"])); committer != "" {
+				commit.Committers = append(commit.Committers, committer)
 			}
 		}
 		out = append(out, commit)

@@ -705,10 +705,10 @@ func TestListPullRequestCheckRunsIncludesStatusContexts(t *testing.T) {
 			}
 			return shell.Result{Stdout: `{"total_count":1,"check_runs":[{"name":"unit","status":"completed","conclusion":"success","app":{"id":15368},"check_suite":{"id":7654}}]}`}, nil
 		case 2:
-			if args != "api repos/acme/looper/commits/abc123/status -H Accept: application/vnd.github+json" {
+			if args != "api repos/acme/looper/commits/abc123/status?per_page=100 -H Accept: application/vnd.github+json" {
 				t.Fatalf("unexpected gh args: %q", args)
 			}
-			return shell.Result{Stdout: `{"statuses":[{"context":"legacy-ci","state":"success"},{"context":"legacy-ci","state":"failure"},{"context":"lint","state":"pending"}]}`}, nil
+			return shell.Result{Stdout: `{"total_count":2,"statuses":[{"context":"legacy-ci","state":"success"},{"context":"legacy-ci","state":"failure"},{"context":"lint","state":"pending"}]}`}, nil
 		default:
 			t.Fatalf("unexpected extra gh call: %q", args)
 			return shell.Result{}, nil
@@ -728,6 +728,9 @@ func TestListPullRequestCheckRunsIncludesStatusContexts(t *testing.T) {
 	}
 	if len(runs.Statuses) != 2 || runs.Statuses[0].Context != "legacy-ci" || runs.Statuses[1].Context != "lint" {
 		t.Fatalf("Statuses = %#v, want deduped status contexts in API order", runs.Statuses)
+	}
+	if runs.StatusesTotalCount != 2 {
+		t.Fatalf("StatusesTotalCount = %d, want 2", runs.StatusesTotalCount)
 	}
 }
 
@@ -2749,10 +2752,10 @@ func TestGatewayListPullRequestCommitsReportsAuthorLogins(t *testing.T) {
 	runner := &fakeGHRunner{t: t}
 	runner.respond = func(options shell.Options) (shell.Result, error) {
 		args := strings.Join(options.Args, " ")
-		if args != "pr view 42 --repo acme/looper --json commits" {
+		if args != "api --paginate --slurp repos/acme/looper/pulls/42/commits?per_page=100 -H Accept: application/vnd.github+json" {
 			t.Fatalf("unexpected gh args: %q", args)
 		}
-		return shell.Result{Stdout: `{"commits":[{"oid":"abc123","authors":[{"login":"looper"}]},{"oid":"def456","authors":[{"login":""}]}]}`}, nil
+		return shell.Result{Stdout: `[{"sha":"abc123","author":{"login":"looper"},"committer":{"login":"looper"}},{"sha":"def456","author":null,"committer":null}]`}, nil
 	}
 	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
 	commits, err := gateway.ListPullRequestCommits(context.Background(), ListPullRequestCommitsInput{Repo: "acme/looper", PRNumber: 42})
@@ -2765,7 +2768,10 @@ func TestGatewayListPullRequestCommitsReportsAuthorLogins(t *testing.T) {
 	if commits[0].OID != "abc123" || len(commits[0].Authors) != 1 || commits[0].Authors[0] != "looper" {
 		t.Fatalf("commits[0] = %#v, want looper-authored commit", commits[0])
 	}
-	if commits[1].OID != "def456" || len(commits[1].Authors) != 0 {
+	if !commits[0].CommitterKnown || len(commits[0].Committers) != 1 || commits[0].Committers[0] != "looper" {
+		t.Fatalf("commits[0] committers = %#v, want looper committer", commits[0])
+	}
+	if commits[1].OID != "def456" || len(commits[1].Authors) != 0 || !commits[1].CommitterKnown || len(commits[1].Committers) != 0 {
 		t.Fatalf("commits[1] = %#v, want unattributed commit", commits[1])
 	}
 }

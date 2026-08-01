@@ -96,6 +96,8 @@ func TestConfirmMarkReady(t *testing.T) {
 		{name: "unchanged pull request is published", confirming: snapshot(), wantReady: true},
 		{name: "push landed after the evidence", confirming: snapshot(func(s *MarkReadySnapshot) { s.HeadSHA = "def456" }), wantBlocker: MarkReadyBlockerHeadMoved},
 		{name: "head unreadable", confirming: snapshot(func(s *MarkReadySnapshot) { s.HeadSHA = "" }), wantBlocker: MarkReadyBlockerHeadMoved},
+		{name: "base branch retargeted", confirming: snapshot(func(s *MarkReadySnapshot) { s.BaseRefName = "release" }), wantBlocker: MarkReadyBlockerHeadMoved},
+		{name: "same-head checks are freshly blocked", confirming: snapshot(func(s *MarkReadySnapshot) { s.RequiredChecks.Pending = []string{"verify"} }), wantBlocker: MarkReadyBlockerChecksNotGreen},
 		{name: "hold label landed after the evidence", confirming: snapshot(func(s *MarkReadySnapshot) { s.Held = true }), wantBlocker: MarkReadyBlockerHeld},
 		{name: "looper label removed after the evidence", confirming: snapshot(func(s *MarkReadySnapshot) { s.InScope = false }), wantBlocker: MarkReadyBlockerOutOfScope},
 		{name: "human published it first", confirming: snapshot(func(s *MarkReadySnapshot) { s.Draft = false }), wantBlocker: MarkReadyBlockerNotDraft},
@@ -122,7 +124,7 @@ func TestConfirmMarkReadyChecksHeadBeforeCarriedEvidence(t *testing.T) {
 	t.Parallel()
 	mergeable := true
 	evidence := MarkReadySnapshot{
-		HeadSHA: "abc123", Draft: true, Open: true, InScope: true, AuthoredByDaemon: true,
+		HeadSHA: "abc123", BaseRefName: "main", Draft: true, Open: true, InScope: true, AuthoredByDaemon: true,
 		Mergeable: &mergeable, MergeableState: "draft",
 	}
 	confirming := evidence

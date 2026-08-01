@@ -37,6 +37,7 @@ type MarkReadySnapshot struct {
 	PRNumber    int64
 	IssueNumber int64
 	HeadSHA     string
+	BaseRefName string
 	Draft       bool
 	Open        bool
 
@@ -138,22 +139,18 @@ func DecideMarkReady(snapshot MarkReadySnapshot) MarkReadyDecision {
 // ConfirmMarkReady re-runs the decision against a Pull Request read again
 // immediately before the mutation.
 //
-// The evidence gathered per head — required checks, commit authorship, draft
-// history — is carried over rather than re-read, which is sound only because
-// the head is compared first: a push that landed since the evidence was
-// gathered invalidates all of it, and this reports HeadMoved without consulting
-// any of it. Everything the confirming read does carry — draft state, open
-// state, scope, ownership, hold labels, mergeability — is re-evaluated in full,
-// because each of those can change without moving the head.
+// The caller must refresh every head-dependent input before calling this
+// function: required checks, check-run status, commit authorship, and draft
+// history can all change while the head stays the same. The confirming snapshot
+// therefore carries no stale evidence from the first pass. A head or base
+// mismatch is rejected before any of that evidence can authorize publication.
 func ConfirmMarkReady(evidence, confirming MarkReadySnapshot) MarkReadyDecision {
 	if !sameHead(evidence.HeadSHA, confirming.HeadSHA) {
 		return MarkReadyDecision{Blocker: MarkReadyBlockerHeadMoved}
 	}
-	confirming.RequiredChecks = evidence.RequiredChecks
-	confirming.ChecksUnknown = evidence.ChecksUnknown
-	confirming.ForeignCommitAuthors = evidence.ForeignCommitAuthors
-	confirming.UnattributedCommits = evidence.UnattributedCommits
-	confirming.HumanConvertedToDraft = evidence.HumanConvertedToDraft
+	if !strings.EqualFold(strings.TrimSpace(evidence.BaseRefName), strings.TrimSpace(confirming.BaseRefName)) {
+		return MarkReadyDecision{Blocker: MarkReadyBlockerHeadMoved}
+	}
 	return DecideMarkReady(confirming)
 }
 

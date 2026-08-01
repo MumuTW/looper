@@ -1545,7 +1545,7 @@ func newCoordinatorFixture(t *testing.T, configure ...func(*config.Config)) coor
 	for _, fn := range configure {
 		fn(&cfg)
 	}
-	github := &stubCoordinatorGitHub{details: map[int64]githubinfra.IssueDetail{}, comments: map[int64][][]githubinfra.CommentInfo{}, timeline: map[int64][]map[string]any{}, blockedBy: map[int64][]githubinfra.DependencyIssue{}, subIssues: map[int64][]githubinfra.DependencyIssue{}, linkedPullRequests: map[int64][]githubinfra.LinkedPullRequest{}, pullRequests: map[int64]githubinfra.PullRequestDetail{}, subIssueErr: map[int64]error{}, prDetails: map[int64]githubinfra.PullRequestDetail{}, prCheckRuns: map[string]githubinfra.PullRequestCheckRuns{}, branchProtection: map[string]githubinfra.BranchProtection{}, prDetailRevalidations: map[int64]githubinfra.PullRequestDetail{}, prDetailReads: map[int64]int{}, prCommits: map[int64][]githubinfra.PullRequestCommit{}, failPRCommits: map[int64]error{}, prDraftEvents: map[int64][]githubinfra.PullRequestDraftEvent{}, failPRDraftEvents: map[int64]error{}, failMarkReady: map[int64]error{}}
+	github := &stubCoordinatorGitHub{details: map[int64]githubinfra.IssueDetail{}, issueRevalidations: map[int64]githubinfra.IssueDetail{}, issueDetailReads: map[int64]int{}, comments: map[int64][][]githubinfra.CommentInfo{}, timeline: map[int64][]map[string]any{}, blockedBy: map[int64][]githubinfra.DependencyIssue{}, subIssues: map[int64][]githubinfra.DependencyIssue{}, linkedPullRequests: map[int64][]githubinfra.LinkedPullRequest{}, pullRequests: map[int64]githubinfra.PullRequestDetail{}, subIssueErr: map[int64]error{}, prDetails: map[int64]githubinfra.PullRequestDetail{}, prCheckRuns: map[string]githubinfra.PullRequestCheckRuns{}, prCheckRunRevalidations: map[string]githubinfra.PullRequestCheckRuns{}, prCheckRunReads: map[string]int{}, branchProtection: map[string]githubinfra.BranchProtection{}, branchProtectionRevalidations: map[string]githubinfra.BranchProtection{}, branchProtectionReads: map[string]int{}, prDetailRevalidations: map[int64]githubinfra.PullRequestDetail{}, prDetailReads: map[int64]int{}, prCommits: map[int64][]githubinfra.PullRequestCommit{}, prCommitRevalidations: map[int64][]githubinfra.PullRequestCommit{}, prCommitReads: map[int64]int{}, failPRCommits: map[int64]error{}, prDraftEvents: map[int64][]githubinfra.PullRequestDraftEvent{}, prDraftEventRevalidations: map[int64][]githubinfra.PullRequestDraftEvent{}, prDraftEventReads: map[int64]int{}, failPRDraftEvents: map[int64]error{}, failMarkReady: map[int64]error{}}
 	network := &stubCoordinatorNetwork{}
 	runner := New(Options{Repos: repos, GitHub: github, Config: &cfg, Now: func() time.Time { return now }, TriageLLM: stubCoordinatorLLM{}, Inspector: stubCoordinatorInspector{}, Network: network})
 	return coordinatorFixture{runner: runner, github: github, network: network, cfg: &cfg, projectID: projectID, now: now, coord: coord}
@@ -1586,51 +1586,61 @@ func (stubCoordinatorInspector) Inspect(context.Context, string, triage.Issue) (
 }
 
 type stubCoordinatorGitHub struct {
-	issues                   []githubinfra.IssueSummary
-	listIssues               func(githubinfra.ListOpenIssuesInput) []githubinfra.IssueSummary
-	details                  map[int64]githubinfra.IssueDetail
-	comments                 map[int64][][]githubinfra.CommentInfo
-	timeline                 map[int64][]map[string]any
-	blockedBy                map[int64][]githubinfra.DependencyIssue
-	subIssues                map[int64][]githubinfra.DependencyIssue
-	linkedPullRequests       map[int64][]githubinfra.LinkedPullRequest
-	pullRequests             map[int64]githubinfra.PullRequestDetail
-	subIssueErr              map[int64]error
-	blockedByReads           int
-	blockedByIssueReads      int
-	permissionCalls          int
-	permissionErr            error
-	ops                      []string
-	createdBodies            []string
-	updatedBodies            []string
-	commentReads             map[int64]int
-	failAddLabels            map[string]error
-	failBlockedByIssues      map[int64][]error
-	addedLabels              []githubinfra.IssueLabelsInput
-	removedLabels            []githubinfra.IssueLabelsInput
-	assigned                 []githubinfra.IssueAssigneesInput
-	prDetails                map[int64]githubinfra.PullRequestDetail
-	prDetailRevalidations    map[int64]githubinfra.PullRequestDetail
-	prDetailReads            map[int64]int
-	failPRDetails            map[int64][]error
-	prCheckRuns              map[string]githubinfra.PullRequestCheckRuns
-	failPRCheckRuns          map[string]error
-	branchProtection         map[string]githubinfra.BranchProtection
-	failBranchProtection     map[string]error
-	prCommits                map[int64][]githubinfra.PullRequestCommit
-	failPRCommits            map[int64]error
-	prDraftEvents            map[int64][]githubinfra.PullRequestDraftEvent
-	failPRDraftEvents        map[int64]error
-	failMarkReady            map[int64]error
-	markedReady              []githubinfra.MarkPullRequestReadyInput
-	addedPRLabels            []githubinfra.PullRequestLabelsInput
-	removedPRLabels          []githubinfra.PullRequestLabelsInput
-	addedReviewers           []githubinfra.PullRequestReviewersInput
-	currentLogin             string
-	currentLoginErr          error
-	currentLoginForRepoCalls int
-	viewIssueReads           int
-	timelineReads            int
+	issues                        []githubinfra.IssueSummary
+	listIssues                    func(githubinfra.ListOpenIssuesInput) []githubinfra.IssueSummary
+	details                       map[int64]githubinfra.IssueDetail
+	comments                      map[int64][][]githubinfra.CommentInfo
+	timeline                      map[int64][]map[string]any
+	blockedBy                     map[int64][]githubinfra.DependencyIssue
+	subIssues                     map[int64][]githubinfra.DependencyIssue
+	linkedPullRequests            map[int64][]githubinfra.LinkedPullRequest
+	pullRequests                  map[int64]githubinfra.PullRequestDetail
+	subIssueErr                   map[int64]error
+	blockedByReads                int
+	blockedByIssueReads           int
+	permissionCalls               int
+	permissionErr                 error
+	ops                           []string
+	createdBodies                 []string
+	updatedBodies                 []string
+	commentReads                  map[int64]int
+	failAddLabels                 map[string]error
+	failBlockedByIssues           map[int64][]error
+	addedLabels                   []githubinfra.IssueLabelsInput
+	removedLabels                 []githubinfra.IssueLabelsInput
+	assigned                      []githubinfra.IssueAssigneesInput
+	prDetails                     map[int64]githubinfra.PullRequestDetail
+	prDetailRevalidations         map[int64]githubinfra.PullRequestDetail
+	prDetailReads                 map[int64]int
+	failPRDetails                 map[int64][]error
+	prCheckRuns                   map[string]githubinfra.PullRequestCheckRuns
+	failPRCheckRuns               map[string]error
+	branchProtection              map[string]githubinfra.BranchProtection
+	failBranchProtection          map[string]error
+	prCommits                     map[int64][]githubinfra.PullRequestCommit
+	failPRCommits                 map[int64]error
+	prDraftEvents                 map[int64][]githubinfra.PullRequestDraftEvent
+	failPRDraftEvents             map[int64]error
+	failMarkReady                 map[int64]error
+	markedReady                   []githubinfra.MarkPullRequestReadyInput
+	addedPRLabels                 []githubinfra.PullRequestLabelsInput
+	removedPRLabels               []githubinfra.PullRequestLabelsInput
+	addedReviewers                []githubinfra.PullRequestReviewersInput
+	currentLogin                  string
+	currentLoginErr               error
+	currentLoginForRepoCalls      int
+	viewIssueReads                int
+	timelineReads                 int
+	issueRevalidations            map[int64]githubinfra.IssueDetail
+	issueDetailReads              map[int64]int
+	prCheckRunRevalidations       map[string]githubinfra.PullRequestCheckRuns
+	prCheckRunReads               map[string]int
+	branchProtectionRevalidations map[string]githubinfra.BranchProtection
+	branchProtectionReads         map[string]int
+	prCommitRevalidations         map[int64][]githubinfra.PullRequestCommit
+	prCommitReads                 map[int64]int
+	prDraftEventRevalidations     map[int64][]githubinfra.PullRequestDraftEvent
+	prDraftEventReads             map[int64]int
 }
 
 func (s *stubCoordinatorGitHub) ListOpenIssues(_ context.Context, input githubinfra.ListOpenIssuesInput) ([]githubinfra.IssueSummary, error) {
@@ -1665,6 +1675,13 @@ func (s *stubCoordinatorGitHub) ListOpenPullRequests(context.Context, githubinfr
 }
 func (s *stubCoordinatorGitHub) ViewIssue(_ context.Context, input githubinfra.ViewIssueInput) (githubinfra.IssueDetail, error) {
 	s.viewIssueReads++
+	if s.issueDetailReads == nil {
+		s.issueDetailReads = map[int64]int{}
+	}
+	s.issueDetailReads[input.IssueNumber]++
+	if revalidated, ok := s.issueRevalidations[input.IssueNumber]; ok && s.issueDetailReads[input.IssueNumber] > 2 {
+		return revalidated, nil
+	}
 	return s.details[input.IssueNumber], nil
 }
 func (s *stubCoordinatorGitHub) ViewPullRequest(_ context.Context, input githubinfra.ViewPullRequestInput) (githubinfra.PullRequestDetail, error) {
@@ -1829,6 +1846,10 @@ func (s *stubCoordinatorGitHub) ListPullRequestCheckRuns(_ context.Context, inpu
 	if err := s.failPRCheckRuns[input.Ref]; err != nil {
 		return githubinfra.PullRequestCheckRuns{}, err
 	}
+	s.prCheckRunReads[input.Ref]++
+	if revalidated, ok := s.prCheckRunRevalidations[input.Ref]; ok && s.prCheckRunReads[input.Ref] > 1 {
+		return revalidated, nil
+	}
 	if s.prCheckRuns == nil {
 		return githubinfra.PullRequestCheckRuns{}, nil
 	}
@@ -1838,13 +1859,23 @@ func (s *stubCoordinatorGitHub) ListPullRequestCommits(_ context.Context, input 
 	if err := s.failPRCommits[input.PRNumber]; err != nil {
 		return nil, err
 	}
-	return append([]githubinfra.PullRequestCommit(nil), s.prCommits[input.PRNumber]...), nil
+	s.prCommitReads[input.PRNumber]++
+	commits := s.prCommits[input.PRNumber]
+	if revalidated, ok := s.prCommitRevalidations[input.PRNumber]; ok && s.prCommitReads[input.PRNumber] > 1 {
+		commits = revalidated
+	}
+	return append([]githubinfra.PullRequestCommit(nil), commits...), nil
 }
 func (s *stubCoordinatorGitHub) ListPullRequestDraftEvents(_ context.Context, input githubinfra.PullRequestDraftEventsInput) ([]githubinfra.PullRequestDraftEvent, error) {
 	if err := s.failPRDraftEvents[input.PRNumber]; err != nil {
 		return nil, err
 	}
-	return append([]githubinfra.PullRequestDraftEvent(nil), s.prDraftEvents[input.PRNumber]...), nil
+	s.prDraftEventReads[input.PRNumber]++
+	events := s.prDraftEvents[input.PRNumber]
+	if revalidated, ok := s.prDraftEventRevalidations[input.PRNumber]; ok && s.prDraftEventReads[input.PRNumber] > 1 {
+		events = revalidated
+	}
+	return append([]githubinfra.PullRequestDraftEvent(nil), events...), nil
 }
 func (s *stubCoordinatorGitHub) MarkPullRequestReady(_ context.Context, input githubinfra.MarkPullRequestReadyInput) error {
 	if err := s.failMarkReady[input.PRNumber]; err != nil {
@@ -1860,6 +1891,10 @@ func (s *stubCoordinatorGitHub) GetBranchProtection(_ context.Context, input git
 	}
 	if s.branchProtection == nil {
 		return githubinfra.BranchProtection{}, nil
+	}
+	s.branchProtectionReads[input.Branch]++
+	if revalidated, ok := s.branchProtectionRevalidations[input.Branch]; ok && s.branchProtectionReads[input.Branch] > 1 {
+		return revalidated, nil
 	}
 	return s.branchProtection[input.Branch], nil
 }

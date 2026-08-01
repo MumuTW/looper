@@ -142,9 +142,18 @@ func Normalize(label string) string {
 func Has(labels []string, target string) bool {
 	normalizedTarget := Normalize(target)
 	for _, label := range labels {
-		if Normalize(label) == normalizedTarget {
+		normalized := Normalize(label)
+		if normalizedTarget == DoNotMerge {
+			normalized = normalizeDoNotMerge(label)
+		}
+		if normalized == normalizedTarget {
 			return true
 		}
 	}
 	return false
+}
+
+func normalizeDoNotMerge(label string) string {
+	parts := strings.Fields(strings.NewReplacer("_", " ", "-", " ").Replace(label))
+	return strings.ToLower(strings.Join(parts, "-"))
 }
