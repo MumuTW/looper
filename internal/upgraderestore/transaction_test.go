@@ -1,12 +1,15 @@
 package upgraderestore
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/MumuTW/looper/internal/upgradebackup"
 )
 
 func TestRestoreRollsBackOrdinaryRenameFailure(t *testing.T) {
@@ -48,6 +51,49 @@ func TestRestoreRollsBackOrdinaryRenameFailure(t *testing.T) {
 	assertPathMissing(t, JournalPath(fixture.databasePath))
 	assertNoRestoreArtifacts(t, filepath.Dir(fixture.configPath))
 	assertNoRestoreArtifacts(t, filepath.Dir(fixture.databasePath))
+}
+
+func TestRestoreRefusesBundleMutatedAfterVerify(t *testing.T) {
+	root := t.TempDir()
+	configPath := filepath.Join(root, "config.toml")
+	cli := filepath.Join(root, "looper")
+	daemon := filepath.Join(root, "looperd")
+	writeTestFile(t, configPath, "[server]\n", 0o600)
+	writeTestFile(t, cli, "cli", 0o755)
+	writeTestFile(t, daemon, "daemon", 0o755)
+	result, err := upgradebackup.Create(context.Background(), upgradebackup.Input{
+		RootDir: filepath.Join(root, "backups"), ConfigPath: configPath, DatabasePath: filepath.Join(root, "db.sqlite"),
+		CLIBinaryPath: cli, DaemonBinaryPath: daemon,
+		Snapshot: func(context.Context) (string, error) {
+			path := filepath.Join(root, "snap.sqlite")
+			writeTestFile(t, path, "sqlite-v1", 0o600)
+			return path, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := upgradebackup.Verify(result.Directory); err != nil {
+		t.Fatalf("Verify before mutate: %v", err)
+	}
+	// Mutate after verify: restore must refuse rather than install torn bytes.
+	if err := os.WriteFile(filepath.Join(result.Directory, "database.sqlite"), []byte("sqlite-MUTATED"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	source, err := upgradebackup.RestoreSource(result.Manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source.ConfigPath = filepath.Join(root, "live-config.toml")
+	source.DatabasePath = filepath.Join(root, "live.sqlite")
+	err = Restore(result.Directory, source)
+	if err == nil {
+		t.Fatal("Restore() error = nil, want failure after bundle mutation")
+	}
+	// Verify may fail first, or staging may fail the manifest match — either is fail-closed.
+	if !strings.Contains(err.Error(), "manifest") && !strings.Contains(err.Error(), "match") {
+		t.Fatalf("Restore() error = %v, want manifest/match failure", err)
+	}
 }
 
 func TestRestoreRollsBackMissingTargetUsingStagedIdentity(t *testing.T) {

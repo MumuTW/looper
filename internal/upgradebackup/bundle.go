@@ -377,6 +377,10 @@ func absolutePath(path, description string) (string, error) {
 
 // absoluteFilesystemDatabasePath normalizes storage.dbPath (including file: URIs)
 // to an absolute filesystem path before it is recorded for restore.
+//
+// Leaf symlinks are refused: following a retargeted symlink after SQLite opened
+// the previous target would record Source.DatabasePath for a different file
+// than the coordinator snapshot, so restore would overwrite the wrong database.
 func absoluteFilesystemDatabasePath(dbPath string) (string, error) {
 	path, isFile, err := storage.SQLiteFilesystemPath(dbPath)
 	if err != nil {
@@ -385,7 +389,26 @@ func absoluteFilesystemDatabasePath(dbPath string) (string, error) {
 	if !isFile || strings.TrimSpace(path) == "" {
 		return "", fmt.Errorf("database path %q is not a filesystem SQLite database", dbPath)
 	}
-	return absolutePath(path, "database")
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("resolve database path: %w", err)
+	}
+	abs = filepath.Clean(abs)
+	info, err := os.Lstat(abs)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// Destination may not exist yet for some operators; still record abs.
+			return abs, nil
+		}
+		return "", fmt.Errorf("stat database path: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return "", fmt.Errorf("database path %s is a symlink; refuse restore metadata that can diverge from the open SQLite inode — point storage.dbPath at the real file", abs)
+	}
+	if info.IsDir() {
+		return "", fmt.Errorf("database path %s is a directory", abs)
+	}
+	return abs, nil
 }
 
 func (file File) valid() bool {

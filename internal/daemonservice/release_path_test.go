@@ -49,3 +49,26 @@ func TestPreferReleaseCurrentExecutableWithoutCurrentKeepsReleasePath(t *testing
 		t.Fatalf("got %q, want concrete release path when current is missing", got)
 	}
 }
+
+func TestPreferReleaseCurrentExecutableUsesInnermostReleasesMarker(t *testing.T) {
+	t.Parallel()
+	// /tmp/.../releases/host/releases/1.2.3/looperd — outer "releases" is not the tree.
+	outer := t.TempDir()
+	root := filepath.Join(outer, "releases", "host")
+	releaseDir := filepath.Join(root, "releases", "1.2.3")
+	if err := os.MkdirAll(releaseDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	daemon := filepath.Join(releaseDir, "looperd")
+	if err := os.WriteFile(daemon, []byte("bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join("releases", "1.2.3"), filepath.Join(root, "current")); err != nil {
+		t.Fatal(err)
+	}
+	got := PreferReleaseCurrentExecutable(daemon)
+	want := filepath.Join(root, "current", "looperd")
+	if got != want {
+		t.Fatalf("PreferReleaseCurrentExecutable() = %q, want innermost %q", got, want)
+	}
+}

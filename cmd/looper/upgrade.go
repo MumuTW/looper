@@ -452,19 +452,28 @@ func runUpgradeDrain(ctx context.Context, global []string, deadline time.Duratio
 	defer cancel()
 	ticker := time.NewTicker(250 * time.Millisecond)
 	defer ticker.Stop()
+	reportDeadline := func(last upgradeDrainResult) error {
+		last.DeadlineExceeded = true
+		if err := writeVersionJSON(stdout, last); err != nil {
+			return err
+		}
+		return fmt.Errorf("upgrade drain deadline reached with %d live executions, %d pending spawns, %d bound operations, %d pending operations, %d non-agent handles, and %d work producers", last.Snapshot.LiveExecutions, last.Snapshot.PendingSpawns, last.Snapshot.BoundOperations, last.Snapshot.PendingOperations, last.Snapshot.NonAgentHandles, last.Snapshot.WorkProducersActive)
+	}
 	for {
 		select {
 		case <-drainCtx.Done():
-			result.DeadlineExceeded = true
-			if err := writeVersionJSON(stdout, result); err != nil {
-				return err
-			}
-			return fmt.Errorf("upgrade drain deadline reached with %d live executions, %d pending spawns, %d bound operations, %d pending operations, %d non-agent handles, and %d work producers", result.Snapshot.LiveExecutions, result.Snapshot.PendingSpawns, result.Snapshot.BoundOperations, result.Snapshot.PendingOperations, result.Snapshot.NonAgentHandles, result.Snapshot.WorkProducersActive)
+			return reportDeadline(result)
 		case <-ticker.C:
-			result, err = requestJSON[upgradeDrainResult](drainCtx, cfg, "GET", "/api/v1/upgrade/drain", nil)
+			next, err := requestJSON[upgradeDrainResult](drainCtx, cfg, "GET", "/api/v1/upgrade/drain", nil)
 			if err != nil {
+				// A poll that loses the race with --deadline must still emit
+				// deadlineExceeded and the last known blocker counts.
+				if drainCtx.Err() != nil {
+					return reportDeadline(result)
+				}
 				return err
 			}
+			result = next
 			if result.Drained {
 				return writeVersionJSON(stdout, result)
 			}
