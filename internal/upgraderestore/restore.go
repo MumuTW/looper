@@ -771,25 +771,16 @@ func rollback(journalPath string, journal restoreJournal, operations fileOperati
 			continue
 		}
 		if undoPresent {
-			// Undo holds the pre-restore original. Only remove the current target
-			// when it is provably this transaction's install (matches staged
-			// identity). A recreated app file must not be deleted.
+			// Undo holds the pre-restore original. Detach-and-verify before
+			// deleting the current target so a recreated file cannot be removed
+			// after a stale ownership hash (check-then-act race).
 			_, targetPresent, err := inspectRegularArtifact(entry.TargetPath, "current target for "+entry.Name)
 			if err != nil {
 				rollbackErrors = append(rollbackErrors, err)
 				continue
 			}
 			if targetPresent {
-				owned, err := targetOwnedByRestoreTransaction(entry)
-				if err != nil {
-					rollbackErrors = append(rollbackErrors, err)
-					continue
-				}
-				if !owned {
-					rollbackErrors = append(rollbackErrors, fmt.Errorf("refusing to replace %s: target was recreated outside this restore transaction (undo preserved at %s)", entry.Name, entry.UndoPath))
-					continue
-				}
-				if err := removeRegularIfExists(entry.TargetPath, "current target for "+entry.Name); err != nil {
+				if err := detachAndRemoveOwnedRestoreTarget(entry, "current target for "+entry.Name); err != nil {
 					rollbackErrors = append(rollbackErrors, err)
 					continue
 				}
@@ -800,9 +791,8 @@ func rollback(journalPath string, journal restoreJournal, operations fileOperati
 			continue
 		}
 		if !entry.HadOriginal {
-			// Target was absent when the journal was prepared. If a file is now
-			// present, delete it only when it is provably this transaction's
-			// staged install (live staged path or durable staged content hash).
+			// Target was absent when the journal was prepared. Detach-and-verify
+			// before delete so an external recreate after ownership proof is kept.
 			_, targetPresent, err := inspectRegularArtifact(entry.TargetPath, "new target for "+entry.Name)
 			if err != nil {
 				rollbackErrors = append(rollbackErrors, err)
@@ -811,16 +801,7 @@ func rollback(journalPath string, journal restoreJournal, operations fileOperati
 			if !targetPresent {
 				continue
 			}
-			owned, err := targetOwnedByRestoreTransaction(entry)
-			if err != nil {
-				rollbackErrors = append(rollbackErrors, err)
-				continue
-			}
-			if !owned {
-				rollbackErrors = append(rollbackErrors, fmt.Errorf("refusing to delete %s: target is not proven to belong to this restore transaction", entry.Name))
-				continue
-			}
-			if err := removeRegularIfExists(entry.TargetPath, "new target for "+entry.Name); err != nil {
+			if err := detachAndRemoveOwnedRestoreTarget(entry, "new target for "+entry.Name); err != nil {
 				rollbackErrors = append(rollbackErrors, err)
 			}
 			continue
@@ -861,16 +842,11 @@ func inspectRegularArtifact(path, description string) (os.FileInfo, bool, error)
 }
 
 func targetOwnedByRestoreTransaction(entry journalEntry) (bool, error) {
-	// Prefer live staged path when still present (normal-error rollback before rename).
-	if strings.TrimSpace(entry.StagedPath) != "" {
-		if _, stagedPresent, err := inspectRegularArtifact(entry.StagedPath, "staged file for "+entry.Name); err != nil {
-			return false, err
-		} else if stagedPresent {
-			return sameRegularFileContent(entry.StagedPath, entry.TargetPath)
-		}
+	wantHash, wantSize, err := expectedStagedIdentity(entry)
+	if err != nil {
+		return false, err
 	}
-	// Staged path consumed (renamed into target): prove with durable identity.
-	if strings.TrimSpace(entry.StagedSHA256) == "" {
+	if wantHash == "" {
 		// WAL/SHM have no staged content; never claim ownership of a recreated file.
 		return false, nil
 	}
@@ -878,7 +854,75 @@ func targetOwnedByRestoreTransaction(entry journalEntry) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	return hash == entry.StagedSHA256 && size == entry.StagedSize, nil
+	return hash == wantHash && size == wantSize, nil
+}
+
+// expectedStagedIdentity returns the content identity of the restore transaction's
+// staged install for entry (live staged file when present, else durable journal fields).
+func expectedStagedIdentity(entry journalEntry) (hash string, size int64, err error) {
+	if strings.TrimSpace(entry.StagedPath) != "" {
+		if _, stagedPresent, err := inspectRegularArtifact(entry.StagedPath, "staged file for "+entry.Name); err != nil {
+			return "", 0, err
+		} else if stagedPresent {
+			return fileContentIdentity(entry.StagedPath)
+		}
+	}
+	if strings.TrimSpace(entry.StagedSHA256) == "" {
+		return "", 0, nil
+	}
+	return entry.StagedSHA256, entry.StagedSize, nil
+}
+
+// detachAndRemoveOwnedRestoreTarget renames the target aside, re-verifies it is
+// still this transaction's staged content, then deletes the detached file.
+// A concurrent recreate at the original path is left alone; a race that renames
+// a non-owned file is restored to the path.
+func detachAndRemoveOwnedRestoreTarget(entry journalEntry, description string) error {
+	wantHash, wantSize, err := expectedStagedIdentity(entry)
+	if err != nil {
+		return err
+	}
+	if wantHash == "" {
+		return fmt.Errorf("refusing to delete %s: target is not proven to belong to this restore transaction", entry.Name)
+	}
+	hash, size, err := fileContentIdentity(entry.TargetPath)
+	if err != nil {
+		return err
+	}
+	if hash != wantHash || size != wantSize {
+		return fmt.Errorf("refusing to replace %s: target was recreated outside this restore transaction", entry.Name)
+	}
+	dir := filepath.Dir(entry.TargetPath)
+	trash, err := os.CreateTemp(dir, ".restore-rm-*")
+	if err != nil {
+		return fmt.Errorf("reserve detach path for %s: %w", description, err)
+	}
+	trashPath := trash.Name()
+	if err := trash.Close(); err != nil {
+		_ = os.Remove(trashPath)
+		return fmt.Errorf("close detach path for %s: %w", description, err)
+	}
+	if err := os.Remove(trashPath); err != nil {
+		return fmt.Errorf("prepare detach path for %s: %w", description, err)
+	}
+	if err := os.Rename(entry.TargetPath, trashPath); err != nil {
+		return fmt.Errorf("detach %s: %w", description, err)
+	}
+	hash2, size2, err := fileContentIdentity(trashPath)
+	if err != nil || hash2 != wantHash || size2 != wantSize {
+		// Put the detached file back; do not delete a non-owned target.
+		if renameErr := os.Rename(trashPath, entry.TargetPath); renameErr != nil {
+			return fmt.Errorf("detach verify failed for %s and restore failed: verify=%v restore=%w", description, err, renameErr)
+		}
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("refusing to replace %s: target content changed during detach", entry.Name)
+	}
+	if err := os.Remove(trashPath); err != nil {
+		return fmt.Errorf("remove detached %s: %w", description, err)
+	}
+	return nil
 }
 
 func requireRestoreSourceMatchesManifest(source upgradebackup.Source, manifest upgradebackup.Manifest) error {
