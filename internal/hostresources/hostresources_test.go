@@ -178,13 +178,15 @@ func TestReadReturnsPlausibleValues(t *testing.T) {
 	if snapshot.Load1 == nil {
 		t.Fatal("load is unset on a supported platform")
 	}
-	// Strictly greater than zero, not merely non-negative. A wrong fixed-point
-	// scale — the first version of the darwin reader took fscale from the
-	// padding before it — divides by a garbage denominator and yields exactly
-	// 0.00, which is indistinguishable from an idle host under a >= 0 bound
-	// and would leave the load gate permanently open. A machine running its own
-	// test suite is never at exactly zero load.
-	if *snapshot.Load1 <= 0 || *snapshot.Load1 > 1024 {
+	// Finite and nonnegative. A wrong fixed-point scale — the first version
+	// of the darwin reader took fscale from the padding before it — divides by
+	// a garbage denominator and yields exactly 0.00; that offset/scale bug is
+	// now caught deterministically by TestParseLoadavg against a synthetic
+	// payload, so this live reading only needs to confirm the reader produced
+	// a finite nonnegative value. A recently booted or genuinely idle host can
+	// legitimately report exactly 0.00, so requiring the host to be busy would
+	// make this test environment-dependent.
+	if *snapshot.Load1 < 0 || *snapshot.Load1 > 1024 {
 		t.Fatalf("implausible load reading: %v", *snapshot.Load1)
 	}
 	if snapshot.SwapTotalBytes != nil && snapshot.SwapUsedBytes != nil && *snapshot.SwapUsedBytes > *snapshot.SwapTotalBytes {

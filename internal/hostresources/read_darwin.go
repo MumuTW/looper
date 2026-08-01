@@ -22,14 +22,29 @@ func readLoad(snapshot *Snapshot) {
 		snapshot.Errors = append(snapshot.Errors, "load: "+err.Error())
 		return
 	}
-	// struct loadavg { fixpt_t ldavg[3]; long fscale; }
-	//
-	// fixpt_t is uint32, so ldavg occupies [0,12). fscale is a long, which
-	// needs 8-byte alignment on every darwin target, so the compiler inserts
-	// four bytes of padding and fscale lands at 16 — not at 12. Reading it at
-	// 12 yields a garbage scale and a load that rounds to zero, which looks
-	// exactly like a quiet machine and would leave the load gate permanently
-	// open. Verified against `uptime` on arm64: 6957/2048 = 3.40.
+	load, parseErr := parseLoadavg(raw)
+	if parseErr != "" {
+		snapshot.Errors = append(snapshot.Errors, parseErr)
+		return
+	}
+	snapshot.Load1 = &load
+}
+
+// parseLoadavg decodes a vm.loadavg payload into the 1-minute load average.
+// Extracted from readLoad so the struct offset and fixed-point scale can be
+// verified against a synthetic payload rather than depending on the host being
+// busy enough to report a nonzero reading — a recently booted or genuinely idle
+// host can legitimately return 0.00.
+//
+// struct loadavg { fixpt_t ldavg[3]; long fscale; }
+//
+// fixpt_t is uint32, so ldavg occupies [0,12). fscale is a long, which needs
+// 8-byte alignment on every darwin target, so the compiler inserts four bytes
+// of padding and fscale lands at 16 — not at 12. Reading it at 12 yields a
+// garbage scale and a load that rounds to zero, which looks exactly like a
+// quiet machine and would leave the load gate permanently open. Verified
+// against `uptime` on arm64: 6957/2048 = 3.40.
+func parseLoadavg(raw []byte) (load float64, parseErr string) {
 	const (
 		loadavgSize  = 24
 		fscaleOffset = 16
@@ -37,19 +52,16 @@ func readLoad(snapshot *Snapshot) {
 		maxPlausible = 1 << 24
 	)
 	if len(raw) < loadavgSize {
-		snapshot.Errors = append(snapshot.Errors, "load: short vm.loadavg payload")
-		return
+		return 0, "load: short vm.loadavg payload"
 	}
 	scale := binary.LittleEndian.Uint64(raw[fscaleOffset : fscaleOffset+8])
 	// Range-check rather than trust the offset: if a future darwin changes the
 	// layout, report the signal as unreadable instead of publishing a load that
 	// is wrong by orders of magnitude.
 	if scale < minPlausible || scale > maxPlausible {
-		snapshot.Errors = append(snapshot.Errors, "load: implausible vm.loadavg scale")
-		return
+		return 0, "load: implausible vm.loadavg scale"
 	}
-	load := float64(binary.LittleEndian.Uint32(raw[0:4])) / float64(scale)
-	snapshot.Load1 = &load
+	return float64(binary.LittleEndian.Uint32(raw[0:4])) / float64(scale), ""
 }
 
 // readSwap is advisory only; see Thresholds for why memory never gates.
