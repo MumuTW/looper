@@ -991,7 +991,14 @@ func (g *Gateway) gitCommonDir(ctx context.Context, path string) (string, error)
 	if err != nil {
 		return "", fmt.Errorf("make git common directory absolute: %w", err)
 	}
-	return filepath.Clean(abs), nil
+	// Resolve symlinks so a project.RepoPath that is a symlink compares equal
+	// to worktrees whose --git-common-dir is the physical path.
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		// The path may not exist yet during prepare; fall back to the absolute form.
+		return filepath.Clean(abs), nil
+	}
+	return filepath.Clean(resolved), nil
 }
 
 func (g *Gateway) Commit(ctx context.Context, input CommitInput) (CommitResult, error) {

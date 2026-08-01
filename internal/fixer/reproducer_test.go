@@ -69,3 +69,130 @@ func TestFixerValidationCommandsIncludeReproductionCommand(t *testing.T) {
 		t.Fatalf("fixerValidationCommands() duplicated command: %#v", commands)
 	}
 }
+
+func TestFixerReproductionCaptureVerifiesOnFirstAdopt(t *testing.T) {
+	root, expected := writeFixerReproductionFixture(t)
+	// Stale hash in the committed manifest: first capture must refuse before the
+	// daemon can execute testCommand.
+	bad := []byte(`{"version":1,"testPath":"internal/bug_test.go","testName":"TestBug","testCommand":"go test ./internal -run '^TestBug$'","testSha256":"` + strings.Repeat("0", 64) + `"}`)
+	if err := os.WriteFile(filepath.Join(root, reproducer.ManifestPath), bad, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	checkpoint := fixerCheckpoint{}
+	err := captureFixerReproduction(&checkpoint, root)
+	if err == nil || !strings.Contains(err.Error(), "integrity check failed") {
+		t.Fatalf("captureFixerReproduction() = %v, want hash verify failure", err)
+	}
+	if checkpoint.Reproduction != nil {
+		t.Fatalf("Reproduction = %#v, want nil after failed first capture", checkpoint.Reproduction)
+	}
+	// Restore a valid manifest and confirm Verify-on-capture succeeds.
+	good := []byte(`{"version":1,"testPath":"internal/bug_test.go","testName":"TestBug","testCommand":"go test ./internal -run '^TestBug$'","testSha256":"` + expected.TestSHA256 + `"}`)
+	if err := os.WriteFile(filepath.Join(root, reproducer.ManifestPath), good, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	checkpoint = fixerCheckpoint{}
+	if err := captureFixerReproduction(&checkpoint, root); err != nil {
+		t.Fatalf("captureFixerReproduction() error = %v", err)
+	}
+	if checkpoint.Reproduction == nil || !checkpoint.Reproduction.Equal(*expected) {
+		t.Fatalf("captured = %#v, want %#v", checkpoint.Reproduction, expected)
+	}
+}
+
+func TestFixerReproductionFailsClosedForLegacyUnknownAbsence(t *testing.T) {
+	// Pre-reproductionAbsent checkpoint that already advanced past first capture
+	// must not adopt a newly visible manifest after upgrade.
+	root, expected := writeFixerReproductionFixture(t)
+	checkpoint := fixerCheckpoint{
+		Repair: &checkpointRepair{Status: "completed", Summary: "legacy interrupted"},
+	}
+	err := captureFixerReproduction(&checkpoint, root)
+	if err == nil || !strings.Contains(err.Error(), "legacy checkpoint") {
+		t.Fatalf("captureFixerReproduction() = %v, want legacy unknown absence refusal", err)
+	}
+	if checkpoint.Reproduction != nil {
+		t.Fatalf("Reproduction = %#v, want nil", checkpoint.Reproduction)
+	}
+	_ = expected
+}
+
+func TestFixerReproductionRefusesAgentAuthoredManifestAfterAbsentStart(t *testing.T) {
+	root := t.TempDir()
+	checkpoint := fixerCheckpoint{}
+	if err := captureFixerReproduction(&checkpoint, root); err != nil {
+		t.Fatalf("capture with no manifest error = %v", err)
+	}
+	if !checkpoint.ReproductionAbsent || checkpoint.Reproduction != nil {
+		t.Fatalf("checkpoint = %#v, want ReproductionAbsent and nil Reproduction", checkpoint)
+	}
+	// Agent later writes a manifest; Fixer must not adopt it as the contract.
+	if err := os.MkdirAll(filepath.Join(root, "internal"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	testContent := []byte("func TestBug(t *testing.T) {}\n")
+	if err := os.WriteFile(filepath.Join(root, "internal", "bug_test.go"), testContent, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	hash := sha256.Sum256(testContent)
+	if err := os.MkdirAll(filepath.Join(root, ".looper"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	data := []byte(`{"version":1,"testPath":"internal/bug_test.go","testName":"TestBug","testCommand":"go test ./internal -run '^TestBug$'","testSha256":"` + hex.EncodeToString(hash[:]) + `"}`)
+	if err := os.WriteFile(filepath.Join(root, reproducer.ManifestPath), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err := captureFixerReproduction(&checkpoint, root)
+	if err == nil || !strings.Contains(err.Error(), "appeared after run start") {
+		t.Fatalf("capture after agent-authored manifest = %v, want refusal", err)
+	}
+}
+
+func TestFixerReproductionFirstCaptureWithPreparedWorktreeAdoptsManifest(t *testing.T) {
+	// Fresh Fixer runs always have FixItems and PreparedAt before the first
+	// capture; that must not be treated as "already past first capture".
+	root, expected := writeFixerReproductionFixture(t)
+	checkpoint := fixerCheckpoint{
+		FixItems: []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", Summary: "bug"}},
+		Worktree: &checkpointWorktree{Path: root, Branch: "fix/pr-1", PreparedAt: "2026-08-01T00:00:00.000Z"},
+	}
+	if err := captureFixerReproduction(&checkpoint, root); err != nil {
+		t.Fatalf("captureFixerReproduction() error = %v", err)
+	}
+	if checkpoint.Reproduction == nil || !checkpoint.Reproduction.Equal(*expected) {
+		t.Fatalf("captured = %#v, want %#v", checkpoint.Reproduction, expected)
+	}
+	if checkpoint.ReproductionAbsent {
+		t.Fatal("ReproductionAbsent = true, want false after successful first capture")
+	}
+}
+
+func TestFixerReproductionPendingAgentIsPastInitial(t *testing.T) {
+	// Crash mid-Wait leaves Repair nil but PendingAgentExecutionID set.
+	// Resume must not adopt an agent-authored manifest as first capture.
+	root, _ := writeFixerReproductionFixture(t)
+	checkpoint := fixerCheckpoint{
+		FixItems:                []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", Summary: "bug"}},
+		Worktree:                &checkpointWorktree{Path: root, Branch: "fix/pr-1", PreparedAt: "2026-08-01T00:00:00.000Z"},
+		PendingAgentExecutionID: "agent_live_1",
+	}
+	err := captureFixerReproduction(&checkpoint, root)
+	if err == nil || !strings.Contains(err.Error(), "legacy checkpoint") {
+		t.Fatalf("captureFixerReproduction() = %v, want legacy refusal while agent pending", err)
+	}
+	if checkpoint.Reproduction != nil {
+		t.Fatalf("Reproduction = %#v, want nil", checkpoint.Reproduction)
+	}
+}
+
+func TestFixerPastInitialIncludesPendingAgentExecution(t *testing.T) {
+	if !fixerPastInitialReproductionCapture(fixerCheckpoint{PendingAgentExecutionID: "agent_1"}) {
+		t.Fatal("pending agent execution must count as past initial capture")
+	}
+	if fixerPastInitialReproductionCapture(fixerCheckpoint{
+		FixItems: []FixItem{{Type: "comment", ID: "c1"}},
+		Worktree: &checkpointWorktree{Path: "/tmp/wt", PreparedAt: "t"},
+	}) {
+		t.Fatal("prepared worktree alone must not count as past initial capture")
+	}
+}

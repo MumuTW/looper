@@ -70,6 +70,77 @@ func (g *observingCleanupGitGateway) CleanupWorktree(ctx context.Context, input 
 	return g.fakeGitGateway.CleanupWorktree(ctx, input)
 }
 
+func TestTerminalCleanupSkipsCancelledRunOnQueuedLoopAfterHandback(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	git := &fakeGitGateway{}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, Logger: fixture.logger, Now: fixture.now})
+	checkpoint := seedTerminalCleanupRun(t, fixture, "run_cleanup_post_handback", filepath.Join(t.TempDir(), "wt-handback"))
+
+	// Mark the run cancelled (takeover/handback path) and the loop queued
+	// (post-handback). Cleanup must not delete the operator-returned checkout.
+	run, err := fixture.repos.Runs.GetByID(context.Background(), "run_cleanup_post_handback")
+	if err != nil || run == nil {
+		t.Fatalf("Runs.GetByID() = (%#v, %v)", run, err)
+	}
+	run.Status = "cancelled"
+	if err := fixture.repos.Runs.Upsert(context.Background(), *run); err != nil {
+		t.Fatalf("Runs.Upsert(cancelled) error = %v", err)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_run_cleanup_post_handback")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v)", loop, err)
+	}
+	loop.Status = "queued"
+	if err := fixture.repos.Loops.Upsert(context.Background(), *loop); err != nil {
+		t.Fatalf("Loops.Upsert(queued) error = %v", err)
+	}
+
+	runner.cleanupFixerWorktreeIfTerminal(context.Background(), storage.ProjectRecord{
+		ID: "project_1", RepoPath: t.TempDir(), BaseBranch: stringPtr("main"),
+	}, "run_cleanup_post_handback", &checkpoint)
+
+	if len(git.cleanupCalls) != 0 {
+		t.Fatalf("len(git.cleanupCalls) = %d, want 0 for cancelled run on queued loop", len(git.cleanupCalls))
+	}
+	if checkpoint.Outcome == nil || len(checkpoint.Outcome.SecondaryIssues) != 1 || !strings.Contains(checkpoint.Outcome.SecondaryIssues[0].Message, "cancelled") {
+		t.Fatalf("Outcome = %#v, want cancelled-run skip", checkpoint.Outcome)
+	}
+}
+
+func TestTerminalCleanupSkipsSiblingHumanTakeoverOnSamePR(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	git := &fakeGitGateway{}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, Logger: fixture.logger, Now: fixture.now})
+	checkpoint := seedTerminalCleanupRun(t, fixture, "run_cleanup_sibling", filepath.Join(t.TempDir(), "wt-sibling"))
+
+	// Terminal Fixer loop stays completed; a reviewer sibling holds human_takeover
+	// on the same PR (shared managed checkout).
+	nowISO := fixture.nowISO()
+	repo := "acme/looper"
+	prNumber := int64(42)
+	target := "pr:acme/looper:42"
+	if err := fixture.repos.Loops.UpsertChangingHumanHold(context.Background(), storage.LoopRecord{
+		ID: "loop_reviewer_takeover", Seq: 99, ProjectID: "project_1", Type: "reviewer",
+		TargetType: "pull_request", TargetID: &target, Repo: &repo, PRNumber: &prNumber,
+		Status: "human_takeover", CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Loops.Upsert(sibling) error = %v", err)
+	}
+
+	runner.cleanupFixerWorktreeIfTerminal(context.Background(), storage.ProjectRecord{
+		ID: "project_1", RepoPath: t.TempDir(), BaseBranch: stringPtr("main"),
+	}, "run_cleanup_sibling", &checkpoint)
+
+	if len(git.cleanupCalls) != 0 {
+		t.Fatalf("len(git.cleanupCalls) = %d, want 0 while sibling is human_takeover", len(git.cleanupCalls))
+	}
+	if checkpoint.Outcome == nil || len(checkpoint.Outcome.SecondaryIssues) != 1 || !strings.Contains(checkpoint.Outcome.SecondaryIssues[0].Message, "sibling") {
+		t.Fatalf("Outcome = %#v, want sibling human_takeover skip", checkpoint.Outcome)
+	}
+}
+
 func TestTerminalCleanupPersistsSuccessTimestamps(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

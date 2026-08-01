@@ -62,10 +62,13 @@ func TestTakeoverLoopAbortsWhenExecutionLookupFails(t *testing.T) {
 
 	_, err = takeoverLoop(ctx, services, loop.ID, "Interactive takeover", func() time.Time { return now }, nil, nil)
 	if err == nil {
-		t.Fatal("takeoverLoop() error = nil, want execution lookup failure")
+		t.Fatal("takeoverLoop() error = nil, want preflight lookup failure")
 	}
-	if !strings.Contains(err.Error(), "load latest agent execution before takeover") {
-		t.Fatalf("takeoverLoop() error = %v, want the lookup failure distinguished from an absent execution", err)
+	// Closed DB fails either the target-fence loop load or the later execution
+	// load; both abort before lifecycle mutation.
+	if !strings.Contains(err.Error(), "load latest agent execution before takeover") &&
+		!strings.Contains(err.Error(), "load loop before takeover target fence") {
+		t.Fatalf("takeoverLoop() error = %v, want a distinguished preflight lookup failure", err)
 	}
 
 	// No stop or lifecycle mutation may have happened: the live lease is not

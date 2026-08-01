@@ -20,6 +20,7 @@ import (
 	"github.com/MumuTW/looper/internal/dashboard"
 	"github.com/MumuTW/looper/internal/domain"
 	"github.com/MumuTW/looper/internal/eventlog"
+	"github.com/MumuTW/looper/internal/loops"
 	looperdruntime "github.com/MumuTW/looper/internal/runtime"
 	"github.com/MumuTW/looper/internal/storage"
 	"github.com/MumuTW/looper/internal/version"
@@ -455,7 +456,26 @@ func takeoverLoop(ctx context.Context, services looperdruntime.Services, loopID,
 	// whose worktree path is now missing. Release immediately after the durable
 	// Hold fence: holding across process drain can deadlock when the cancelled
 	// Fixer reaches its own terminal cleanup and needs this lock.
+	// Per-loop lock first, then shared PR target lock so takeover serializes
+	// with terminal Fixer cleanup on the managed PR worktree (siblings share
+	// looper-fix-<project>-pr-N). Empty target key is a no-op.
 	unlockLoop := looperdruntime.LockLoopRequeue(loopID)
+	var unlockTarget func() = func() {}
+	if services.Repositories != nil && services.Repositories.Loops != nil {
+		loop, err := services.Repositories.Loops.GetByID(ctx, loopID)
+		if err != nil {
+			// Fail closed: a transient storage error must not proceed without
+			// the shared PR fence while sibling cleanup can still delete the
+			// checkout.
+			unlockLoop()
+			return result, fmt.Errorf("load loop before takeover target fence: %w", err)
+		}
+		if loop == nil {
+			unlockLoop()
+			return result, fmt.Errorf("loop not found before takeover target fence: %s", loopID)
+		}
+		unlockTarget = loops.LockLoopTarget(loops.LoopTargetGuardKeyFromRecord(*loop))
+	}
 	if services.Repositories != nil && services.Repositories.AgentExecutions != nil {
 		execution, err := services.Repositories.AgentExecutions.GetLatestByLoopID(ctx, loopID)
 		if err != nil {
@@ -464,6 +484,7 @@ func takeoverLoop(ctx context.Context, services looperdruntime.Services, loopID,
 			// needs to resume the exact session. Abort before any lifecycle
 			// mutation; a genuinely absent execution (nil, no error) still
 			// takes over with empty ownership fields.
+			unlockTarget()
 			unlockLoop()
 			return result, fmt.Errorf("load latest agent execution before takeover: %w", err)
 		}
@@ -482,11 +503,13 @@ func takeoverLoop(ctx context.Context, services looperdruntime.Services, loopID,
 	// tick; Hold commits human_takeover and cancellation together.
 	preflight, err := loadHaltPreflight(ctx, services, loopID)
 	if err != nil {
+		unlockTarget()
 		unlockLoop()
 		return result, err
 	}
 	reasonCopy := reason
 	_, holdErr := services.Loops.Hold(ctx, loopID, &reasonCopy)
+	unlockTarget()
 	unlockLoop()
 	if holdErr != nil {
 		return result, holdErr
