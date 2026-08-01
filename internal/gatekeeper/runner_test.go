@@ -760,7 +760,9 @@ type fakeGatekeeperGitHub struct {
 	listReviewThreadsHook func(*fakeGatekeeperGitHub) error
 	// beforeView, when set, runs before each pull-request read, so a test can
 	// inject a state change between the first evaluation and a later one.
-	beforeView func(*fakeGatekeeperGitHub)
+	beforeView    func(*fakeGatekeeperGitHub)
+	beforeThreads func(*fakeGatekeeperGitHub)
+}
 }
 
 func (f *fakeGatekeeperGitHub) GetCurrentUserLoginForRepo(context.Context, string, string) (string, error) {
@@ -870,6 +872,9 @@ func (f *fakeGatekeeperGitHub) ListReviewThreads(context.Context, githubinfra.Li
 		if err := f.listReviewThreadsHook(f); err != nil {
 			return nil, err
 		}
+	}
+	if f.beforeThreads != nil {
+		f.beforeThreads(f)
 	}
 	return f.threads, nil
 }

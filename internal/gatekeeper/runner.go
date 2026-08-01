@@ -85,18 +85,20 @@ type CheckEvidence struct {
 	Conclusion string `json:"conclusion,omitempty"`
 }
 
-// DiffBudgetEvidence records the provider-observed change size and the
-// configured bounds that were applied. See config.GatekeeperDiffBudget for the
+// DiffBudgetEvidence records the provider-observed change size, the merge base
+// those counts were measured against, and the configured bounds that were
+// applied. See config.GatekeeperDiffBudget for the
 // gate's semantics and the blind spots it does not catch (no additions or
 // per-file bound, generated files not excluded, whole-PR totals against the
 // current merge base, and the merge action binding only the head — see
 // MergePullRequest — so a base advance between the final revalidation read and
 // the merge is not atomically refused).
 type DiffBudgetEvidence struct {
-	ChangedFiles    int `json:"changedFiles"`
-	Deletions       int `json:"deletions"`
-	MaxChangedFiles int `json:"maxChangedFiles"`
-	MaxDeletions    int `json:"maxDeletions"`
+	ChangedFiles    int    `json:"changedFiles"`
+	Deletions       int    `json:"deletions"`
+	BaseSHA         string `json:"baseSha"`
+	MaxChangedFiles int    `json:"maxChangedFiles"`
+	MaxDeletions    int    `json:"maxDeletions"`
 }
 
 // CodexReviewEvidence is the durable Reviewer review signal considered by the
@@ -913,6 +915,7 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 		report.Evidence.DiffBudget = &DiffBudgetEvidence{
 			ChangedFiles:    stats.ChangedFiles,
 			Deletions:       stats.Deletions,
+			BaseSHA:         diffBudgetBaseSHA,
 			MaxChangedFiles: diffBudget.MaxChangedFiles,
 			MaxDeletions:    diffBudget.MaxDeletions,
 		}

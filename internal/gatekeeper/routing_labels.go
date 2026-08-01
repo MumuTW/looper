@@ -82,15 +82,6 @@ func (r *Runner) reconcileRoutingLabels(ctx context.Context, report Report, prev
 		return err
 	}
 
-	currentHead, err := r.github.GetPullRequestHeadSHA(ctx, githubinfra.ViewPullRequestInput{
-		Repo: report.Repo, PRNumber: report.PRNumber, CWD: r.projectCWD(ctx, report.ProjectID),
-	})
-	if err != nil {
-		return fmt.Errorf("revalidate head before routing labels: %w", err)
-	}
-	if strings.TrimSpace(currentHead) != expectedHead {
-		return fmt.Errorf("skip routing labels because pull request head moved from %s to %s", expectedHead, strings.TrimSpace(currentHead))
-	}
 	// Review threads are Gatekeeper-owned policy input, not part of the
 	// Mergify queue contract. Re-read them immediately before projecting
 	// auto-merge so a thread opened after EvaluatePullRequest's initial
@@ -99,6 +90,38 @@ func (r *Runner) reconcileRoutingLabels(ctx context.Context, report Report, prev
 		if err := r.revalidateUnresolvedReviewThreads(ctx, report); err != nil {
 			return err
 		}
+	}
+	// The final head (and, when applicable, merge-base) read must happen after
+	// thread revalidation. A push during that provider call otherwise leaves the
+	// label write bound to a head that Gatekeeper never confirmed at the end of
+	// its authority sequence. Diff-budget counts are also only valid for the
+	// persisted base SHA, so a changed base fails closed before projection.
+	var currentHead, currentBase string
+	viewInput := githubinfra.ViewPullRequestInput{
+		Repo: report.Repo, PRNumber: report.PRNumber, CWD: r.projectCWD(ctx, report.ProjectID),
+	}
+	if report.Evidence.DiffBudget != nil {
+		expectedBase := strings.TrimSpace(report.Evidence.DiffBudget.BaseSHA)
+		if expectedBase == "" {
+			return fmt.Errorf("skip routing labels because diff-budget evidence has no base SHA")
+		}
+		var err error
+		currentHead, currentBase, err = r.github.GetPullRequestHeadAndBaseSHA(ctx, viewInput)
+		if err != nil {
+			return fmt.Errorf("revalidate head and diff-budget base before routing labels: %w", err)
+		}
+		if strings.TrimSpace(currentBase) != expectedBase {
+			return fmt.Errorf("skip routing labels because diff-budget base moved from %s to %s", expectedBase, strings.TrimSpace(currentBase))
+		}
+	} else {
+		var err error
+		currentHead, err = r.github.GetPullRequestHeadSHA(ctx, viewInput)
+		if err != nil {
+			return fmt.Errorf("revalidate head before routing labels: %w", err)
+		}
+	}
+	if strings.TrimSpace(currentHead) != expectedHead {
+		return fmt.Errorf("skip routing labels because pull request head moved from %s to %s", expectedHead, strings.TrimSpace(currentHead))
 	}
 	return r.applyRoutingLabelPlan(ctx, report, plan)
 }

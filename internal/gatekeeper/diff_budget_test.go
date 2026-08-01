@@ -43,8 +43,8 @@ func TestDiffBudgetAtLimitPassesAndRecordsEvidence(t *testing.T) {
 	if !report.Eligible || len(report.Reasons) != 0 {
 		t.Fatalf("report = %#v, want eligible at both limits", report)
 	}
-	if report.Evidence.DiffBudget == nil || report.Evidence.DiffBudget.ChangedFiles != 20 || report.Evidence.DiffBudget.Deletions != 500 {
-		t.Fatalf("diff budget evidence = %#v, want observed counts", report.Evidence.DiffBudget)
+	if report.Evidence.DiffBudget == nil || report.Evidence.DiffBudget.ChangedFiles != 20 || report.Evidence.DiffBudget.Deletions != 500 || report.Evidence.DiffBudget.BaseSHA != "base-1" {
+		t.Fatalf("diff budget evidence = %#v, want observed counts anchored to base-1", report.Evidence.DiffBudget)
 	}
 }
 
