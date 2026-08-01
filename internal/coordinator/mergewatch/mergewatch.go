@@ -54,6 +54,7 @@ type PRSnapshot struct {
 	PRNumber               int64
 	IssueNumber            int64
 	HeadSHA                string
+	MergedAt               string
 	Merged                 bool
 	Open                   bool
 	AutoMergeEnabled       bool

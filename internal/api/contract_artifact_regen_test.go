@@ -85,6 +85,7 @@ var responseArtifactOrder = []responseArtifactEntry{
 	{id: "config.patch"},
 	{id: "events.list"},
 	{id: "events.entity"},
+	{id: "postMergeDigest.get"},
 	{id: "pullRequests.list"},
 	{id: "pullRequests.detail"},
 	{id: "pullRequests.status"},
@@ -569,6 +570,7 @@ func captureEventAndPullRequestResponses(t *testing.T, out map[string]capturedRe
 	}{
 		{id: "events.list", path: "/api/v1/events?limit=1"},
 		{id: "events.entity", path: "/api/v1/events/loop/loop_1"},
+		{id: "postMergeDigest.get", path: "/api/v1/post-merge-digest"},
 		{id: "pullRequests.list", path: "/api/v1/pull-requests"},
 		{id: "pullRequests.detail", path: "/api/v1/pull-requests/acme%2Flooper/42"},
 		{id: "pullRequests.status", path: "/api/v1/pull-requests/acme%2Flooper/42/status"},

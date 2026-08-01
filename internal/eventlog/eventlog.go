@@ -15,8 +15,10 @@ import (
 // digest consumes these durable observations instead of querying GitHub at
 // report time, so a daily report has one local source of truth.
 const (
-	CoordinatorPullRequestMergedEventType = "coordinator.pull_request.merged"
-	PostMergeDigestSentEventType          = "coordinator.post_merge_digest.sent"
+	CoordinatorPullRequestMergedEventType  = "coordinator.pull_request.merged"
+	CoordinatorCloseAndRegenerateEventType = "coordinator.close_and_regenerate"
+	FixerCloseAndRegenerateEventType       = "fixer.close_and_regenerate"
+	PostMergeDigestSentEventType           = "coordinator.post_merge_digest.sent"
 )
 
 type AppendInput struct {

@@ -59,7 +59,7 @@ func TestAssembleUsesDurableEventsSnapshotsAndLoops(t *testing.T) {
 	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_human", Seq: 1, ProjectID: projectID, Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &pr, Status: "awaiting_human", MetadataJSON: &metadata, CreatedAt: when, UpdatedAt: when}); err != nil {
 		t.Fatalf("loop upsert error = %v", err)
 	}
-	appendDigestEvent(t, repos, storage.EventLogRecord{ID: "regen", EventType: "coordinator.close_and_regenerate", EntityType: &entityType, EntityID: &entityID, PayloadJSON: `{"repo":"acme/looper","prNumber":42,"failureFingerprint":"fp-1","retrySuccess":true}`, CreatedAt: "2026-07-31T09:00:00.000Z"})
+	appendDigestEvent(t, repos, storage.EventLogRecord{ID: "regen", EventType: eventlog.CoordinatorCloseAndRegenerateEventType, EntityType: &entityType, EntityID: &entityID, PayloadJSON: `{"repo":"acme/looper","prNumber":42,"failureFingerprint":"fp-1","retrySuccess":true}`, CreatedAt: "2026-07-31T09:00:00.000Z"})
 
 	digest, err := Assemble(context.Background(), repos, Config{Enabled: true, Timezone: "UTC", MaxItems: 10}, now)
 	if err != nil {
@@ -89,14 +89,14 @@ func TestRunEmptyDayMarksOnceWithoutDelivery(t *testing.T) {
 	if deliveries != 0 {
 		t.Fatalf("deliveries = %d, want 0 for quiet day", deliveries)
 	}
-	markers, err := repos.Events.ListByEntity(context.Background(), digestEntityType, "2026-07-31")
+	markers, err := repos.Events.ListByEntity(context.Background(), digestEntityType, "2026-07-30")
 	if err != nil || len(markers) != 1 || markers[0].EventType != eventlog.PostMergeDigestSentEventType {
 		t.Fatalf("markers = %#v, err=%v, want one sent marker", markers, err)
 	}
 	if err := service.Run(context.Background()); err != nil {
 		t.Fatalf("second Run() error = %v", err)
 	}
-	markers, _ = repos.Events.ListByEntity(context.Background(), digestEntityType, "2026-07-31")
+	markers, _ = repos.Events.ListByEntity(context.Background(), digestEntityType, "2026-07-30")
 	if len(markers) != 1 {
 		t.Fatalf("markers after second run = %d, want one", len(markers))
 	}
@@ -110,7 +110,7 @@ func TestRunDeliveryFailureLeavesRetryableDay(t *testing.T) {
 		t.Fatalf("project upsert error = %v", err)
 	}
 	appendDigestEvent(t, repos, storage.EventLogRecord{ID: "merge", EventType: eventlog.CoordinatorPullRequestMergedEventType, ProjectID: &projectID, EntityType: &entityType, EntityID: &entityID, PayloadJSON: `{"repo":"acme/looper","prNumber":7}`, CreatedAt: "2026-07-31T08:30:00.000Z"})
-	now := time.Date(2026, 7, 31, 9, 0, 0, 0, time.UTC)
+	now := time.Date(2026, 8, 1, 9, 0, 0, 0, time.UTC)
 	deliveries := 0
 	service := New(Options{Repos: repos, Config: Config{Enabled: true, Schedule: "08:00", Timezone: "UTC", IncludeEmpty: true, MaxItems: 10}, Now: func() time.Time { return now }, Deliver: func(context.Context, notify.SystemNotificationPayload) []storage.NotificationRecord {
 		deliveries++
@@ -133,6 +133,66 @@ func TestRunDeliveryFailureLeavesRetryableDay(t *testing.T) {
 	markers, _ = repos.Events.ListByEntity(context.Background(), digestEntityType, "2026-07-31")
 	if len(markers) != 1 || deliveries != 2 {
 		t.Fatalf("markers=%d deliveries=%d, want one marker and two deliveries", len(markers), deliveries)
+	}
+}
+
+func TestRunRecoversDurableDeliveryWhenSentMarkerWasLost(t *testing.T) {
+	repos := openDigestRepos(t)
+	dedupe := "post-merge-digest:2026-07-31"
+	status := "success"
+	if err := repos.Notifications.Upsert(context.Background(), storage.NotificationRecord{ID: "delivery", Channel: "telegram", Status: status, DedupeKey: &dedupe, CreatedAt: "2026-08-01T08:01:00.000Z", UpdatedAt: "2026-08-01T08:01:00.000Z"}); err != nil {
+		t.Fatalf("notification upsert error = %v", err)
+	}
+	deliveries := 0
+	service := New(Options{Repos: repos, Config: Config{Enabled: true, Schedule: "08:00", Timezone: "UTC", IncludeEmpty: true}, Now: func() time.Time { return time.Date(2026, 8, 1, 9, 0, 0, 0, time.UTC) }, Deliver: func(context.Context, notify.SystemNotificationPayload) []storage.NotificationRecord {
+		deliveries++
+		return []storage.NotificationRecord{{Status: "success"}}
+	}})
+	if err := service.Run(context.Background()); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if deliveries != 0 {
+		t.Fatalf("deliveries = %d, want durable success recovery", deliveries)
+	}
+	markers, err := repos.Events.ListByEntity(context.Background(), digestEntityType, "2026-07-31")
+	if err != nil || len(markers) != 1 {
+		t.Fatalf("markers = %#v, err=%v, want recovered marker", markers, err)
+	}
+}
+
+func TestAssembleUsesForgeMergeTimeAndHeadBoundEvidence(t *testing.T) {
+	repos := openDigestRepos(t)
+	entityType, entityID := "pull_request", "acme/looper#9"
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_9", Name: "Looper", RepoPath: t.TempDir(), CreatedAt: "2026-07-31T08:00:00.000Z", UpdatedAt: "2026-07-31T08:00:00.000Z"}); err != nil {
+		t.Fatalf("project upsert error = %v", err)
+	}
+	appendDigestEvent(t, repos, storage.EventLogRecord{ID: "delayed-merge", EventType: eventlog.CoordinatorPullRequestMergedEventType, EntityType: &entityType, EntityID: &entityID, PayloadJSON: `{"repo":"acme/looper","prNumber":9,"headSha":"new-head","mergedAt":"2026-07-31T23:30:00Z"}`, CreatedAt: "2026-08-01T08:30:00.000Z"})
+	appendDigestEvent(t, repos, storage.EventLogRecord{ID: "stale-gate", EventType: gatekeeper.GateReportEventType, EntityType: &entityType, EntityID: &entityID, PayloadJSON: `{"status":"blocked","observedHeadSha":"old-head","reasons":[{"code":"stale"}]}`, CreatedAt: "2026-08-01T08:31:00.000Z"})
+	title := "stale snapshot"
+	payload := `{"diff":"diff --git a/stale b/stale\n+wrong"}`
+	if err := repos.PullRequestSnapshots.Upsert(context.Background(), storage.PullRequestSnapshotRecord{ID: "stale-snapshot", ProjectID: "project_9", Repo: "acme/looper", PRNumber: 9, HeadSHA: "old-head", Title: &title, PayloadJSON: &payload, CapturedAt: "2026-08-01T08:32:00.000Z", CreatedAt: "2026-08-01T08:32:00.000Z"}); err != nil {
+		t.Fatalf("snapshot upsert error = %v", err)
+	}
+	digest, err := Assemble(context.Background(), repos, Config{Timezone: "UTC", MaxItems: 10}, time.Date(2026, 7, 31, 23, 59, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatalf("Assemble() error = %v", err)
+	}
+	if len(digest.Merged) != 1 || digest.Merged[0].ReviewerVerdict != "" || digest.Merged[0].Title != "" || digest.Merged[0].Diff.Available {
+		t.Fatalf("merged = %#v, want no stale gate/snapshot evidence", digest.Merged)
+	}
+	if len(digest.Anomalies) != 2 {
+		t.Fatalf("anomalies = %#v, want gate and snapshot mismatch", digest.Anomalies)
+	}
+}
+
+func TestLoopReasonReadsHITLQuestionAndPauseReason(t *testing.T) {
+	hitl := `{"hitl":{"question":"Need approval","status":"awaiting"}}`
+	if reason, code := loopReason(&hitl); reason != "Need approval" || code != "awaiting" {
+		t.Fatalf("HITL reason=(%q,%q), want question/status", reason, code)
+	}
+	pause := `{"pauseReason":"manual review","pauseReasonCode":"conflict"}`
+	if reason, code := loopReason(&pause); reason != "manual review" || code != "conflict" {
+		t.Fatalf("pause reason=(%q,%q), want pause fields", reason, code)
 	}
 }
 

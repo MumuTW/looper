@@ -429,6 +429,19 @@ func (r *NotificationsRepository) GetLatestByDedupe(ctx context.Context, channel
 	return &record, nil
 }
 
+// ListByDedupe returns every durable delivery attempt for a dedupe key. The
+// digest retry path uses the complete history so a successful provider write
+// remains authoritative even when the following sent-marker append failed.
+func (r *NotificationsRepository) ListByDedupe(ctx context.Context, dedupeKey string) ([]NotificationRecord, error) {
+	rows, err := r.q.QueryContext(ctx, `SELECT * FROM notifications WHERE dedupe_key = ? ORDER BY created_at ASC`, dedupeKey)
+	if err != nil {
+		return nil, fmt.Errorf("list notifications by dedupe: %w", err)
+	}
+	defer rows.Close()
+
+	return scanNotifications(rows)
+}
+
 // FeishuThreadsRepository maps a Feishu message thread root to the loop whose
 // notifications thread under it, in both directions.
 type FeishuThreadsRepository struct{ q sqliteQuerier }
@@ -522,6 +535,19 @@ func (r *EventsRepository) List(ctx context.Context, limit int64) ([]EventLogRec
 	rows, err := r.q.QueryContext(ctx, `SELECT `+eventLogColumns+` FROM event_logs ORDER BY created_at DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, fmt.Errorf("list event logs: %w", err)
+	}
+	defer rows.Close()
+
+	return scanEventLogs(rows)
+}
+
+// ListAll returns the complete durable event stream in insertion order. Audit
+// projections must not silently lose evidence because an unrelated busy period
+// filled an arbitrary recent-event window.
+func (r *EventsRepository) ListAll(ctx context.Context) ([]EventLogRecord, error) {
+	rows, err := r.q.QueryContext(ctx, `SELECT * FROM event_logs ORDER BY created_at ASC, id ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("list all event logs: %w", err)
 	}
 	defer rows.Close()
 

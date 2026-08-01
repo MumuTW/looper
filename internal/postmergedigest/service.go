@@ -145,7 +145,11 @@ func (s *Service) Run(ctx context.Context) error {
 		return nil
 	}
 	localNow := now.In(location)
-	dayKey := localNow.Format("2006-01-02")
+	// A scheduled run closes the previous local calendar day. Using a complete
+	// day avoids silently dropping events that occur after the delivery time;
+	// delayed observations still retain their forge merge timestamp below.
+	reportDay := localNow.AddDate(0, 0, -1)
+	dayKey := reportDay.Format("2006-01-02")
 	sent, err := s.repos.Events.ListByEntity(ctx, digestEntityType, dayKey)
 	if err != nil {
 		return fmt.Errorf("check post-merge digest marker: %w", err)
@@ -155,7 +159,19 @@ func (s *Service) Run(ctx context.Context) error {
 			return nil
 		}
 	}
-	digest, err := Assemble(ctx, s.repos, s.config, now)
+	dedupeKey := "post-merge-digest:" + dayKey
+	if s.repos.Notifications != nil {
+		records, listErr := s.repos.Notifications.ListByDedupe(ctx, dedupeKey)
+		if listErr != nil {
+			return fmt.Errorf("check post-merge digest delivery history: %w", listErr)
+		}
+		if notificationSucceeded(records) {
+			// A provider can succeed while the following event-log append fails.
+			// Recover the durable marker instead of delivering the same digest twice.
+			return s.markSent(ctx, dayKey, Digest{Date: dayKey}, "recovered")
+		}
+	}
+	digest, err := assembleForDate(ctx, s.repos, s.config, now, reportDay)
 	if err != nil {
 		return fmt.Errorf("assemble post-merge digest: %w", err)
 	}
@@ -173,7 +189,7 @@ func (s *Service) Run(ctx context.Context) error {
 		Body:       Format(digest),
 		EntityType: digestEntityType,
 		EntityID:   dayKey,
-		DedupeKey:  "post-merge-digest:" + dayKey,
+		DedupeKey:  dedupeKey,
 	})
 	if !notificationSucceeded(records) {
 		return errors.New("post-merge digest notification delivery failed")
@@ -245,15 +261,21 @@ func Assemble(ctx context.Context, repos *storage.Repositories, cfg Config, now 
 	if err != nil {
 		return Digest{}, fmt.Errorf("load post-merge digest timezone: %w", err)
 	}
-	localNow := now.In(location)
-	dayStart := time.Date(localNow.Year(), localNow.Month(), localNow.Day(), 0, 0, 0, 0, location)
-	dayEnd := dayStart.AddDate(0, 0, 1)
-	fromISO := eventlog.FormatJavaScriptISOString(dayStart.UTC())
-	events, err := repos.Events.ListSince(ctx, fromISO)
-	if err != nil {
-		return Digest{}, err
+	return assembleForDate(ctx, repos, cfg, now, now.In(location))
+}
+
+func assembleForDate(ctx context.Context, repos *storage.Repositories, cfg Config, now, reportDay time.Time) (Digest, error) {
+	if repos == nil || repos.Events == nil || repos.Loops == nil {
+		return Digest{}, errors.New("post-merge digest repositories are not configured")
 	}
-	allEvents, err := repos.Events.List(ctx, 10000)
+	location, err := time.LoadLocation(strings.TrimSpace(cfg.Timezone))
+	if err != nil {
+		return Digest{}, fmt.Errorf("load post-merge digest timezone: %w", err)
+	}
+	localDay := reportDay.In(location)
+	dayStart := time.Date(localDay.Year(), localDay.Month(), localDay.Day(), 0, 0, 0, 0, location)
+	dayEnd := dayStart.AddDate(0, 0, 1)
+	allEvents, err := repos.Events.ListAll(ctx)
 	if err != nil {
 		return Digest{}, err
 	}
@@ -261,15 +283,11 @@ func Assemble(ctx context.Context, repos *storage.Repositories, cfg Config, now 
 	if maxItems <= 0 {
 		maxItems = defaultMaxItems
 	}
-	digest := Digest{Date: localNow.Format("2006-01-02"), GeneratedAt: now.UTC().Format(time.RFC3339Nano), Merged: []MergedItem{}, ClosedAndRegenerated: []RegeneratedItem{}, AwaitingHuman: []AwaitingHumanItem{}, Anomalies: []Anomaly{}}
+	digest := Digest{Date: localDay.Format("2006-01-02"), GeneratedAt: now.UTC().Format(time.RFC3339Nano), Merged: []MergedItem{}, ClosedAndRegenerated: []RegeneratedItem{}, AwaitingHuman: []AwaitingHumanItem{}, Anomalies: []Anomaly{}}
 	gateReports := latestGateReports(allEvents)
 	reviews := reviewObservations(allEvents)
 	mergedByEntity := map[string]MergedItem{}
-	for _, event := range events {
-		created, ok := parseEventTime(event.CreatedAt)
-		if !ok || !created.Before(dayEnd.UTC()) {
-			continue
-		}
+	for _, event := range allEvents {
 		if isMergedEvent(event) {
 			item, merged, err := parseMerged(event)
 			if err != nil {
@@ -278,15 +296,27 @@ func Assemble(ctx context.Context, repos *storage.Repositories, cfg Config, now 
 			if !merged || item.PRNumber <= 0 {
 				continue
 			}
-			if item.MergedAt == "" {
-				item.MergedAt = event.CreatedAt
+			mergeAt := item.MergedAt
+			if _, ok := parseEventTime(mergeAt); !ok {
+				mergeAt = event.CreatedAt
 			}
-			key := mergeKey(item.Repo, item.PRNumber)
-			if prior, exists := mergedByEntity[key]; exists && prior.MergedAt >= item.MergedAt {
+			mergedTime, ok := parseEventTime(mergeAt)
+			if !ok || mergedTime.Before(dayStart.UTC()) || !mergedTime.Before(dayEnd.UTC()) {
 				continue
+			}
+			item.MergedAt = mergeAt
+			key := mergeKey(item.Repo, item.PRNumber)
+			if prior, exists := mergedByEntity[key]; exists {
+				if prior.MergedAt > item.MergedAt || (prior.MergedAt == item.MergedAt && prior.HeadSHA != "" && item.HeadSHA == "") {
+					continue
+				}
 			}
 			mergedByEntity[key] = item
 		} else if isRegenerationEvent(event.EventType) {
+			created, ok := parseEventTime(event.CreatedAt)
+			if !ok || created.Before(dayStart.UTC()) || !created.Before(dayEnd.UTC()) {
+				continue
+			}
 			if item, ok := parseRegenerated(event); ok {
 				digest.ClosedAndRegenerated = append(digest.ClosedAndRegenerated, item)
 			}
@@ -294,11 +324,15 @@ func Assemble(ctx context.Context, repos *storage.Repositories, cfg Config, now 
 	}
 	for _, item := range mergedByEntity {
 		entity := mergeKey(item.Repo, item.PRNumber)
-		if report, ok := gateReports[entity]; ok {
+		if report, ok := gateReportForHead(gateReports[entity], item.HeadSHA); ok {
 			item.ReviewerVerdict = firstString(report, "status", "verdict")
 			item.GateReasons = reasonCodes(report)
 		} else {
-			digest.Anomalies = append(digest.Anomalies, Anomaly{Repo: item.Repo, PRNumber: item.PRNumber, Kind: "missing-gate-report", Reasons: []string{"no durable gate report for merged head"}, ObservedAt: item.MergedAt})
+			kind, reason := "missing-gate-report", "no durable gate report for merged head"
+			if len(gateReports[entity]) > 0 {
+				kind, reason = "stale-gate-report", "durable gate reports do not match merged head"
+			}
+			digest.Anomalies = append(digest.Anomalies, Anomaly{Repo: item.Repo, PRNumber: item.PRNumber, Kind: kind, Reasons: []string{reason}, ObservedAt: item.MergedAt})
 		}
 		if review, ok := latestReviewAtOrBefore(reviews[entity], item.MergedAt, item.HeadSHA); ok {
 			item.ReviewerVerdict = review.Verdict
@@ -311,7 +345,7 @@ func Assemble(ctx context.Context, repos *storage.Repositories, cfg Config, now 
 		}
 		if repos.PullRequestSnapshots != nil {
 			var snapshot *storage.PullRequestSnapshotRecord
-			if projectID := projectIDForMergedEvent(events, item.Repo, item.PRNumber); projectID != "" {
+			if projectID := projectIDForMergedEvent(allEvents, item.Repo, item.PRNumber); projectID != "" {
 				snapshot, err = repos.PullRequestSnapshots.GetLatestByProject(ctx, projectID, item.Repo, item.PRNumber)
 			} else {
 				var snapshots []storage.PullRequestSnapshotRecord
@@ -324,11 +358,16 @@ func Assemble(ctx context.Context, repos *storage.Repositories, cfg Config, now 
 				return Digest{}, err
 			}
 			if snapshot != nil {
-				item.Title = stringValue(snapshot.Title)
-				if item.HeadSHA == "" {
-					item.HeadSHA = snapshot.HeadSHA
+				snapshotHead := strings.TrimSpace(snapshot.HeadSHA)
+				if item.HeadSHA != "" && snapshotHead != "" && !strings.EqualFold(item.HeadSHA, snapshotHead) {
+					digest.Anomalies = append(digest.Anomalies, Anomaly{Repo: item.Repo, PRNumber: item.PRNumber, Kind: "snapshot-head-mismatch", Reasons: []string{"latest snapshot is for a different head"}, ObservedAt: item.MergedAt})
+				} else {
+					item.Title = stringValue(snapshot.Title)
+					if item.HeadSHA == "" {
+						item.HeadSHA = snapshotHead
+					}
+					item.Diff = diffSummary(snapshot.PayloadJSON)
 				}
-				item.Diff = diffSummary(snapshot.PayloadJSON)
 			}
 		}
 		digest.Merged = append(digest.Merged, item)
@@ -370,8 +409,13 @@ func isMergedEvent(event storage.EventLogRecord) bool {
 	return strings.Contains(t, "merged") || strings.Contains(t, "merge.completed")
 }
 
-func latestGateReports(events []storage.EventLogRecord) map[string]map[string]any {
-	reports := make(map[string]map[string]any)
+type gateReportObservation struct {
+	payload   map[string]any
+	createdAt string
+}
+
+func latestGateReports(events []storage.EventLogRecord) map[string][]gateReportObservation {
+	reports := make(map[string][]gateReportObservation)
 	for _, event := range events {
 		if event.EventType != gatekeeper.GateReportEventType || event.EntityID == nil {
 			continue
@@ -381,17 +425,33 @@ func latestGateReports(events []storage.EventLogRecord) map[string]map[string]an
 			continue
 		}
 		key := strings.TrimSpace(*event.EntityID)
-		if existing, ok := reports[key]; ok {
-			existingAt, _ := parseEventTime(existing["_createdAt"].(string))
-			currentAt, _ := parseEventTime(event.CreatedAt)
-			if !currentAt.After(existingAt) {
-				continue
-			}
-		}
-		payload["_createdAt"] = event.CreatedAt
-		reports[key] = payload
+		reports[key] = append(reports[key], gateReportObservation{payload: payload, createdAt: event.CreatedAt})
+	}
+	for key := range reports {
+		sort.SliceStable(reports[key], func(i, j int) bool { return reports[key][i].createdAt < reports[key][j].createdAt })
 	}
 	return reports
+}
+
+func gateReportForHead(observations []gateReportObservation, headSHA string) (map[string]any, bool) {
+	if len(observations) == 0 {
+		return nil, false
+	}
+	for i := len(observations) - 1; i >= 0; i-- {
+		if strings.TrimSpace(headSHA) == "" || strings.EqualFold(strings.TrimSpace(headSHA), gateReportHead(observations[i].payload)) {
+			return observations[i].payload, true
+		}
+	}
+	return nil, false
+}
+
+func gateReportHead(payload map[string]any) string {
+	if evidence, ok := payload["evidence"].(map[string]any); ok {
+		if head := firstString(evidence, "finalObservedHeadSha", "finalObservedHeadSHA", "observedHeadSha", "observedHeadSHA", "headSha", "headSHA"); head != "" {
+			return head
+		}
+	}
+	return firstString(payload, "observedHeadSha", "observedHeadSHA", "finalObservedHeadSha", "finalObservedHeadSHA", "headSha", "headSHA", "head")
 }
 
 type reviewObservation struct {
@@ -493,8 +553,11 @@ func parseRegenerated(event storage.EventLogRecord) (RegeneratedItem, bool) {
 }
 
 func isRegenerationEvent(eventType string) bool {
+	if eventType == eventlog.CoordinatorCloseAndRegenerateEventType || eventType == eventlog.FixerCloseAndRegenerateEventType {
+		return true
+	}
 	t := strings.ToLower(eventType)
-	return (strings.Contains(t, "regenerat") || strings.Contains(t, "close_and")) && (strings.HasPrefix(t, "coordinator.") || strings.HasPrefix(t, "pull_request."))
+	return (strings.Contains(t, "regenerat") || strings.Contains(t, "close_and")) && (strings.HasPrefix(t, "coordinator.") || strings.HasPrefix(t, "fixer.") || strings.HasPrefix(t, "pull_request."))
 }
 
 func projectIDForMergedEvent(events []storage.EventLogRecord, repo string, pr int64) string {
@@ -586,14 +649,22 @@ func loopReason(metadata *string) (string, string) {
 	if json.Unmarshal([]byte(*metadata), &payload) != nil {
 		return "", ""
 	}
-	reason := firstString(payload, "reason", "failureReason", "humanReason", "message")
-	code := firstString(payload, "reasonCode", "failureKind", "kind")
+	reason := firstString(payload, "reason", "failureReason", "humanReason", "message", "pauseReason")
+	code := firstString(payload, "reasonCode", "failureKind", "kind", "pauseReasonCode")
 	if human, ok := payload["human"].(map[string]any); ok {
 		if reason == "" {
 			reason = firstString(human, "reason", "message")
 		}
 		if code == "" {
 			code = firstString(human, "reasonCode", "kind")
+		}
+	}
+	if hitl, ok := payload["hitl"].(map[string]any); ok {
+		if reason == "" {
+			reason = firstString(hitl, "question", "reason", "message")
+		}
+		if code == "" {
+			code = firstString(hitl, "reasonCode", "kind", "status")
 		}
 	}
 	return reason, code

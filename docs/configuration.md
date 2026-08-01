@@ -544,7 +544,8 @@ dashboard. It is disabled by default. The digest reads only durable local
 `event_logs`, pull-request snapshots, and loop records; it does not make a
 GitHub read or ask an agent to supply evidence. A successful notification (or a
 quiet-day marker when `includeEmpty = false`) is recorded locally so a tick
-retry cannot duplicate the day.
+retry cannot duplicate the day. Each scheduled run reports the previous
+completed local calendar day, so activity after the delivery time is not lost.
 
 | Path | Purpose | Default |
 | --- | --- | --- |
@@ -558,6 +559,11 @@ Sections are `Merged`, `Closed-and-regenerated`, `Awaiting human`, and
 `Anomalies`. Gate/reviewer summaries, retry fingerprints, and diff sizes are
 included only when corresponding durable records exist; missing evidence is
 reported as an anomaly rather than inferred from live GitHub state.
+
+The digest block is global-only; project role overrides reject
+`projects[].roles.coordinator.postMergeDigest` because the scheduler has one
+process-wide daily delivery and cannot safely run a different schedule per
+project.
 
 Behavior notes:
 

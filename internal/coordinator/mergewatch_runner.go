@@ -164,8 +164,12 @@ func (r *Runner) recordPostMergeEvent(ctx context.Context, projectID, repo strin
 		"prNumber":    snapshot.PRNumber,
 		"issueNumber": issueNumber,
 		"headSha":     snapshot.HeadSHA,
-		"mergedAt":    r.now().UTC().Format(time.RFC3339Nano),
 	}
+	mergedAt := strings.TrimSpace(snapshot.MergedAt)
+	if mergedAt == "" {
+		mergedAt = r.now().UTC().Format(time.RFC3339Nano)
+	}
+	payload["mergedAt"] = mergedAt
 	if err := eventlog.Append(ctx, r.repos, eventlog.AppendInput{
 		EventType: eventlog.CoordinatorPullRequestMergedEventType,
 		ProjectID: nilIfBlank(projectID), EntityType: &entityType, EntityID: &entityID,
@@ -226,7 +230,7 @@ func (r *Runner) mergeWatchSnapshot(ctx context.Context, repo, cwd string, issue
 	checkRuns, err := r.github.ListPullRequestCheckRuns(ctx, githubinfra.PullRequestCheckRunsInput{Repo: repo, Ref: detail.HeadSHA, CWD: cwd})
 	if err != nil {
 		if isTransientMergeWatchError(err) {
-			return mergewatch.PRSnapshot{Repo: repo, PRNumber: prNumber, IssueNumber: issueNumber, HeadSHA: detail.HeadSHA, AutoMergeEnabled: detail.AutoMerge != nil, AutoMergeOwnedByLooper: detail.AutoMerge != nil && strings.EqualFold(detail.AutoMerge.EnabledBy, currentLogin), Mergeable: detail.Mergeable, MergeableState: detail.MergeableState}, &mergewatch.TemporaryError{SuggestedDelay: time.Minute}, nil
+			return mergewatch.PRSnapshot{Repo: repo, PRNumber: prNumber, IssueNumber: issueNumber, HeadSHA: detail.HeadSHA, MergedAt: detail.MergedAt, AutoMergeEnabled: detail.AutoMerge != nil, AutoMergeOwnedByLooper: detail.AutoMerge != nil && strings.EqualFold(detail.AutoMerge.EnabledBy, currentLogin), Mergeable: detail.Mergeable, MergeableState: detail.MergeableState}, &mergewatch.TemporaryError{SuggestedDelay: time.Minute}, nil
 		}
 		return mergewatch.PRSnapshot{}, nil, err
 	}
@@ -245,6 +249,7 @@ func (r *Runner) mergeWatchSnapshot(ctx context.Context, repo, cwd string, issue
 		PRNumber:               prNumber,
 		IssueNumber:            issueNumber,
 		HeadSHA:                detail.HeadSHA,
+		MergedAt:               detail.MergedAt,
 		Merged:                 detail.MergedAt != "" || strings.EqualFold(detail.State, "merged"),
 		Open:                   open,
 		AutoMergeEnabled:       detail.AutoMerge != nil,
@@ -409,6 +414,7 @@ func mergeWatchPartialSnapshot(repo string, issueNumber, prNumber int64, detail 
 		PRNumber:               prNumber,
 		IssueNumber:            issueNumber,
 		HeadSHA:                detail.HeadSHA,
+		MergedAt:               detail.MergedAt,
 		Open:                   strings.EqualFold(detail.State, "open"),
 		AutoMergeEnabled:       detail.AutoMerge != nil,
 		AutoMergeOwnedByLooper: detail.AutoMerge != nil && strings.EqualFold(strings.TrimSpace(detail.AutoMerge.EnabledBy), strings.TrimSpace(currentLogin)),

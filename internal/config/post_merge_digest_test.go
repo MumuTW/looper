@@ -57,6 +57,42 @@ func TestPostMergeDigestConfigRejectsInvalidScheduleTimezoneAndLimit(t *testing.
 	}
 }
 
+func TestPostMergeDigestConfigAllowsExplicitDisabledOptOut(t *testing.T) {
+	issues := []ValidationIssue{}
+	validateCoordinatorRoleConfig(CoordinatorRoleConfig{
+		PollInterval:    "1m",
+		Triage:          CoordinatorTriageConfig{TriagedLabel: "triaged", MaxIssueAgeDays: 1, MaxPerTick: 1, Disposition: CoordinatorTriageDispositionConfig{OutOfScopeLabel: "wontfix", UnclearLabel: "needs-info"}},
+		Dispatch:        CoordinatorDispatchConfig{Mode: "human-gated", HumanGate: CoordinatorDispatchHumanGateConfig{SlashCommands: []string{"/plan"}}, Autonomous: CoordinatorDispatchAutonomousConfig{DelayMinutes: 1, HoldLabel: labels.HoldGlobal}},
+		MergeWatch:      CoordinatorMergeWatchConfig{TransientRetries: 1, MaxIndeterminateDuration: "1m"},
+		PostMergeDigest: &CoordinatorPostMergeDigestConfig{Enabled: false},
+	}, "roles.coordinator", &issues)
+	if len(issues) != 0 {
+		t.Fatalf("disabled digest validation issues = %#v, want none", issues)
+	}
+}
+
+func TestProjectRoleConfigsClonesGlobalPostMergeDigest(t *testing.T) {
+	global := &CoordinatorPostMergeDigestConfig{Enabled: true, Schedule: "08:00", Timezone: "UTC", MaxItems: 10}
+	cfg := Config{Roles: RoleConfigs{Coordinator: CoordinatorRoleConfig{PostMergeDigest: global}}}
+	got := ProjectRoleConfigs(cfg, "missing")
+	if got.Coordinator.PostMergeDigest == nil {
+		t.Fatal("effective digest is nil")
+	}
+	got.Coordinator.PostMergeDigest.MaxItems = 25
+	if global.MaxItems != 10 {
+		t.Fatalf("global digest mutated through effective copy: %#v", global)
+	}
+}
+
+func TestProjectRoleOverridesRejectPostMergeDigest(t *testing.T) {
+	enabled := true
+	issues := []ValidationIssue{}
+	validateProjectRoleOverrides(&PartialRoleConfigs{Coordinator: &PartialCoordinatorRoleConfig{PostMergeDigest: &PartialCoordinatorPostMergeDigestConfig{Enabled: &enabled}}}, "projects[0].roles", 1024, &issues)
+	if len(issues) != 1 || issues[0].Path != "projects[0].roles.coordinator.postMergeDigest" {
+		t.Fatalf("project digest issues = %#v, want global-only validation", issues)
+	}
+}
+
 func TestClonePartialRoleConfigsPreservesPostMergeDigest(t *testing.T) {
 	enabled, maxItems := true, 10
 	schedule, timezone := "09:00", "UTC"
