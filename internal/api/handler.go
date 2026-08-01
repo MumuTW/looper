@@ -5598,6 +5598,37 @@ func (h *Handler) resolveLoop(ctx context.Context, selector string) (storage.Loo
 }
 
 func (h *Handler) mutateLoopStatus(ctx context.Context, loopID string, status domain.LoopStatus) (loopResponse, error) {
+	// Pause is a durable loop/queue transition owned by the loops service. Keep
+	// the HTTP adapter responsible only for selecting the operation and mapping
+	// its errors; running remains here because reactivation also owns API-side
+	// locks, stop-gate restoration, and scheduler wake-up.
+	if status == domain.LoopStatusPaused {
+		services := h.context.Runtime.Services()
+		if services.Coordinator == nil {
+			return loopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: "Storage is not configured"}
+		}
+		reason := "loop paused"
+		paused, err := (&loops.Service{
+			DB:    services.Coordinator.DB(),
+			Repos: storage.NewRepositories(services.Coordinator.DB()),
+			Now:   h.now,
+		}).Pause(ctx, loopID, &reason)
+		if err != nil {
+			if errors.Is(err, loops.ErrLoopNotFound) {
+				return loopResponse{}, apiError{code: pkgapi.ErrorCodeLoopNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Loop not found: %s", loopID)}
+			}
+			if errors.Is(err, loops.ErrInvalidLoopStatusTransition) {
+				return loopResponse{}, apiError{code: pkgapi.ErrorCodeLoopConflict, status: http.StatusConflict, message: err.Error()}
+			}
+			var typed apiError
+			if asAPIError(err, &typed) {
+				return loopResponse{}, typed
+			}
+			return loopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+		}
+		return serializeLoop(paused.Loop), nil
+	}
+
 	// Running requeues from the latest failed/cancelled/manual_intervention item
 	// and can start replacement work. Share the per-loop retry lock and the
 	// same-target lock so this cannot race discard+retry between preflight and

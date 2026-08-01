@@ -2,6 +2,7 @@ package loops
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -85,6 +86,66 @@ func TestServiceRepeatedPauseAdvancesLoopRevisionAtFixedClock(t *testing.T) {
 	secondTime, secondErr := time.Parse(time.RFC3339Nano, second.Loop.UpdatedAt)
 	if firstErr != nil || secondErr != nil || !secondTime.After(firstTime) {
 		t.Fatalf("pause revisions parse as (%v, %v), want increasing timestamps", firstErr, secondErr)
+	}
+}
+
+func TestServicePauseMissingLoopReturnsErrLoopNotFound(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openCoordinator(t)
+	repos := storage.NewRepositories(coordinator.DB())
+	service := &Service{DB: coordinator.DB(), Repos: repos, Now: func() time.Time {
+		return time.Date(2026, time.April, 17, 12, 34, 56, 0, time.UTC)
+	}}
+
+	_, err := service.Pause(context.Background(), "missing-loop", nil)
+	if !errors.Is(err, ErrLoopNotFound) {
+		t.Fatalf("Pause() error = %v, want ErrLoopNotFound", err)
+	}
+}
+
+// Pausing a loop in a state with no path to paused (terminal/failed/interrupted)
+// is a deterministic client error, not a server fault: the service surfaces a
+// typed ErrInvalidLoopStatusTransition so the HTTP adapter can map it to 409.
+func TestServicePauseNonPausableLoopReturnsErrInvalidLoopStatusTransition(t *testing.T) {
+	t.Parallel()
+
+	nonPausable := []domain.LoopStatus{
+		domain.LoopStatusCompleted,
+		domain.LoopStatusTerminated,
+		domain.LoopStatusFailed,
+		domain.LoopStatusInterrupted,
+	}
+	for _, initialStatus := range nonPausable {
+		t.Run(string(initialStatus), func(t *testing.T) {
+			t.Parallel()
+
+			coordinator := openCoordinator(t)
+			ctx := context.Background()
+			repos := storage.NewRepositories(coordinator.DB())
+			now := time.Date(2026, time.April, 17, 12, 34, 56, 0, time.UTC)
+			seedProject(t, repos, now)
+			service := &Service{DB: coordinator.DB(), Repos: repos, Now: func() time.Time { return now }}
+			loop, err := service.Create(ctx, CreateInput{
+				ProjectID: "project_1",
+				Type:      domain.LoopTypeReviewer,
+				Target:    domain.LoopTarget{TargetType: domain.LoopTargetTypePullRequest, Repo: "acme/looper", PRNumber: 42},
+				Status:    domain.LoopStatusQueued,
+			})
+			if err != nil {
+				t.Fatalf("Create() error = %v", err)
+			}
+			updated := loop
+			updated.Status = string(initialStatus)
+			if err := repos.Loops.Upsert(ctx, updated); err != nil {
+				t.Fatalf("Loops.Upsert() error = %v", err)
+			}
+
+			reason := "pause terminal loop"
+			if _, err := service.Pause(ctx, loop.ID, &reason); !errors.Is(err, ErrInvalidLoopStatusTransition) {
+				t.Fatalf("Pause(%s) error = %v, want ErrInvalidLoopStatusTransition", initialStatus, err)
+			}
+		})
 	}
 }
 
