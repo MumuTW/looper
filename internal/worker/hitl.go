@@ -184,6 +184,55 @@ func (r *Runner) latestNativeSessionID(ctx context.Context, loopID, agentVendor 
 	return strings.TrimSpace(*execution.NativeSessionID)
 }
 
+// mergeHITLCorrelation writes GitHub PR/comment correlation onto an ask without
+// clobbering a human answer that may have been persisted concurrently.
+func mergeHITLCorrelation(delivered loops.HITLAsk, currentMetadata *string) loops.HITLAsk {
+	existing, ok := loops.ReadHITLAsk(currentMetadata)
+	if !ok {
+		return delivered
+	}
+	merged := delivered
+	// Preserve human answer authority.
+	if strings.TrimSpace(existing.Answer) != "" {
+		merged.Answer = existing.Answer
+		merged.AnsweredAt = existing.AnsweredAt
+		if existing.Status == "answered" || existing.Status == "consumed" {
+			merged.Status = existing.Status
+		} else if merged.Status == "" || merged.Status == "awaiting" {
+			merged.Status = "answered"
+		}
+	} else if existing.Status == "answered" || existing.Status == "consumed" {
+		merged.Status = existing.Status
+		merged.AnsweredAt = existing.AnsweredAt
+	}
+	// Prefer non-zero correlation from either side.
+	if merged.PRNumber == 0 {
+		merged.PRNumber = existing.PRNumber
+	}
+	if merged.AskCommentID == 0 {
+		merged.AskCommentID = existing.AskCommentID
+	}
+	if strings.TrimSpace(merged.Transport) == "" {
+		merged.Transport = existing.Transport
+	}
+	if merged.GateEvidence == nil {
+		merged.GateEvidence = existing.GateEvidence
+	}
+	if strings.TrimSpace(merged.SessionID) == "" {
+		merged.SessionID = existing.SessionID
+	}
+	if strings.TrimSpace(merged.ExecutionID) == "" {
+		merged.ExecutionID = existing.ExecutionID
+	}
+	if strings.TrimSpace(merged.Vendor) == "" {
+		merged.Vendor = existing.Vendor
+	}
+	if strings.TrimSpace(merged.Question) == "" {
+		merged.Question = existing.Question
+	}
+	return merged
+}
+
 // acknowledgePostTurnMetadata serializes every post-turn metadata mutation
 // with free-text enqueue. A single fresh read and upsert avoids one mutation
 // restoring metadata that an earlier mutation had just preserved.
@@ -418,7 +467,11 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 			unlock := loops.LockLoopRequeue(input.Loop.ID)
 			var correlationWriteErr error
 			_, persistErr := r.updateLoop(ctx, input.Loop, func(updated *storage.LoopRecord) {
-				meta, err := loops.WriteHITLAsk(updated.MetadataJSON, ask)
+				// deliverAskToGitHub only adds PR/comment correlation. A human
+				// may have answered via API while that request was in flight;
+				// preserve Answer/Status/AnsweredAt from the freshest record.
+				toWrite := mergeHITLCorrelation(ask, updated.MetadataJSON)
+				meta, err := loops.WriteHITLAsk(updated.MetadataJSON, toWrite)
 				if err != nil {
 					correlationWriteErr = err
 					return

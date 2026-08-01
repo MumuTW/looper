@@ -1073,3 +1073,62 @@ func TestMidRunHumanMessageSurvivesAndIsDeliveredNextTurn(t *testing.T) {
 		t.Fatalf("third prompt missing survivor: %#v", agent.inner.starts)
 	}
 }
+
+func TestMergeHITLCorrelationPreservesHumanAnswer(t *testing.T) {
+	t.Parallel()
+	// Simulated post-park GitHub correlation payload (awaiting, no answer).
+	delivered := loops.HITLAsk{
+		Question: "Continue?", Status: "awaiting", Transport: "github",
+		PRNumber: 42, AskCommentID: 99, GateEvidence: &loops.HITLGateEvidence{WorktreeRoot: "/tmp/wt"},
+	}
+	// Concurrent API answer arrived first.
+	answeredMeta, err := loops.WriteHITLAsk(nil, loops.HITLAsk{
+		Question: "Continue?", Status: "answered", Answer: "yes ship it", AnsweredAt: "2026-08-01T00:00:00.000Z",
+		PRNumber: 0, AskCommentID: 0,
+	})
+	if err != nil {
+		t.Fatalf("WriteHITLAsk() error = %v", err)
+	}
+	metaPtr := &answeredMeta
+	merged := mergeHITLCorrelation(delivered, metaPtr)
+	if merged.Answer != "yes ship it" || merged.Status != "answered" {
+		t.Fatalf("merged = %#v, want human answer preserved", merged)
+	}
+	if merged.PRNumber != 42 || merged.AskCommentID != 99 {
+		t.Fatalf("merged correlation = pr=%d comment=%d, want delivery values", merged.PRNumber, merged.AskCommentID)
+	}
+	if merged.GateEvidence == nil || merged.GateEvidence.WorktreeRoot != "/tmp/wt" {
+		t.Fatalf("merged.GateEvidence = %#v, want delivery evidence kept", merged.GateEvidence)
+	}
+}
+
+func TestDetectHumanAskRecoversStagedPendingBeforeAgent(t *testing.T) {
+	// Crash recovery: ask.pending remains after Stage, no loop metadata ask yet.
+	// detectHumanAsk must re-enter suspension without requiring a new agent turn.
+	t.Parallel()
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, ".looper"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte(`{"question":"Ship the migration?","options":["yes","no"]}`)
+	if err := os.WriteFile(filepath.Join(root, ".looper", "ask.json"), payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := loops.StageHITLGateEvidence(root, 1<<20); err != nil {
+		t.Fatalf("StageHITLGateEvidence() error = %v", err)
+	}
+	// Active name must be gone; only pending remains.
+	if _, err := os.Lstat(filepath.Join(root, ".looper", "ask.json")); !os.IsNotExist(err) {
+		t.Fatalf("ask.json still present after staging: %v", err)
+	}
+
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now, HITLEnabled: true})
+	awaiting, err := runner.detectHumanAsk(context.Background(), stepInput{Loop: storage.LoopRecord{ID: "loop_worker_1"}}, root, "exec_1")
+	if err != nil {
+		t.Fatalf("detectHumanAsk() error = %v", err)
+	}
+	if awaiting == nil || awaiting.question != "Ship the migration?" {
+		t.Fatalf("detectHumanAsk() = %#v, want recovered question", awaiting)
+	}
+}
