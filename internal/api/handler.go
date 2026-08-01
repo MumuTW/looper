@@ -2015,12 +2015,15 @@ type projectResponse struct {
 	BaseBranch string `json:"baseBranch"`
 	Archived   bool   `json:"archived"`
 	// Provider is the resolved provider kind for display.
-	Provider     string                     `json:"provider"`
-	Repo         *string                    `json:"repo"`
-	WorktreeRoot *string                    `json:"worktreeRoot"`
-	Validation   *projectValidationResponse `json:"validation,omitempty"`
-	CreatedAt    string                     `json:"createdAt"`
-	UpdatedAt    string                     `json:"updatedAt"`
+	Provider     string  `json:"provider"`
+	Repo         *string `json:"repo"`
+	WorktreeRoot *string `json:"worktreeRoot"`
+	// GatekeeperTrust is omitted for the default observe level; absence means
+	// observe while non-default levels remain visible to operators.
+	GatekeeperTrust string                     `json:"gatekeeperTrust,omitempty"`
+	Validation      *projectValidationResponse `json:"validation,omitempty"`
+	CreatedAt       string                     `json:"createdAt"`
+	UpdatedAt       string                     `json:"updatedAt"`
 	// Discovery reports post-commit worktree/PR discovery status when the
 	// project record carries it; omitted for records that predate it.
 	Discovery *discoveryResponse `json:"discovery,omitempty"`
@@ -7874,10 +7877,11 @@ func (f *updateProjectStringField) UnmarshalJSON(raw []byte) error {
 }
 
 type updateProjectRequest struct {
-	Repo         updateProjectStringField `json:"repo"`
-	Name         updateProjectStringField `json:"name"`
-	BaseBranch   updateProjectStringField `json:"baseBranch"`
-	WorktreeRoot updateProjectStringField `json:"worktreeRoot"`
+	Repo            updateProjectStringField `json:"repo"`
+	Name            updateProjectStringField `json:"name"`
+	BaseBranch      updateProjectStringField `json:"baseBranch"`
+	WorktreeRoot    updateProjectStringField `json:"worktreeRoot"`
+	GatekeeperTrust updateProjectStringField `json:"gatekeeperTrust"`
 }
 
 func updateProjectField(field updateProjectStringField) projects.UpdateStringField {
@@ -7890,8 +7894,11 @@ func (h *Handler) buildUpdateProjectResponse(r *http.Request, service projectSer
 		return nil, *aerr
 	}
 	updated, err := service.UpdateProject(r.Context(), identifier, projects.UpdateInput{
-		Repo: updateProjectField(body.Repo), Name: updateProjectField(body.Name),
-		BaseBranch: updateProjectField(body.BaseBranch), WorktreeRoot: updateProjectField(body.WorktreeRoot),
+		Repo:            updateProjectField(body.Repo),
+		Name:            updateProjectField(body.Name),
+		BaseBranch:      updateProjectField(body.BaseBranch),
+		WorktreeRoot:    updateProjectField(body.WorktreeRoot),
+		GatekeeperTrust: updateProjectField(body.GatekeeperTrust),
 	})
 	if err != nil {
 		var notFound projects.ProjectNotFoundError
@@ -8021,11 +8028,33 @@ func serializeProject(project storage.ProjectRecord, cfg config.Config, defaultB
 		CreatedAt:    project.CreatedAt,
 		UpdatedAt:    project.UpdatedAt,
 	}
+	if trust := projectGatekeeperTrust(project, cfg); trust != config.GatekeeperTrustObserve {
+		response.GatekeeperTrust = string(trust)
+	}
 	if state := projects.DiscoveryStateFromRecord(project); state.Status != "" {
 		serialized := serializeDiscovery(state)
 		response.Discovery = &serialized
 	}
 	return response
+}
+
+// projectGatekeeperTrust reads the effective catalog policy while allowing a
+// freshly updated API-managed record to be reflected before the caller's
+// handler snapshot is refreshed. Empty trust is the documented observe level.
+func projectGatekeeperTrust(project storage.ProjectRecord, cfg config.Config) config.GatekeeperTrustLevel {
+	trust := config.ProjectRoleConfigs(cfg, project.ID).Gatekeeper.Trust
+	metadata := parseProjectMetadata(project.MetadataJSON)
+	if roles, ok := metadata["roles"].(map[string]any); ok {
+		if gatekeeper, ok := roles["gatekeeper"].(map[string]any); ok {
+			if value, ok := gatekeeper["trust"].(string); ok && strings.TrimSpace(value) != "" {
+				trust = config.GatekeeperTrustLevel(strings.ToLower(strings.TrimSpace(value)))
+			}
+		}
+	}
+	if strings.TrimSpace(string(trust)) == "" {
+		return config.GatekeeperTrustObserve
+	}
+	return trust
 }
 
 func cloneProjectValidation(source *config.ProjectValidationConfig) *config.ProjectValidationConfig {

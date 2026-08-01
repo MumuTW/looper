@@ -237,6 +237,7 @@ func TestUsageListsEveryImplementedVerb(t *testing.T) {
 		"looper init", "looper status", "looper dashboard", "looper project add", "looper project list",
 		"looper gatekeeper agreements",
 		"looper gatekeeper verdicts",
+		"looper gatekeeper promote",
 		"looper stop", "looper close", "looper takeover", "looper handback",
 		"looper retry", "looper start", "looper pause", "looper respond",
 		"looper version",
