@@ -177,7 +177,21 @@ func Create(ctx context.Context, input Input) (Result, error) {
 	if err := os.WriteFile(filepath.Join(bundle, "manifest.json"), append(encoded, '\n'), 0o600); err != nil {
 		return fail(fmt.Errorf("write backup manifest: %w", err))
 	}
+	// Durably publish the completed bundle before reporting success so a crash
+	// cannot leave a returned path with incomplete/torn contents.
+	if err := syncDirectory(bundle); err != nil {
+		return fail(fmt.Errorf("sync completed backup bundle: %w", err))
+	}
 	return Result{Directory: bundle, Manifest: manifest}, nil
+}
+
+func syncDirectory(path string) error {
+	dir, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	return dir.Sync()
 }
 
 func moveAndRecord(source, destination string, files map[string]File, name string) error {
