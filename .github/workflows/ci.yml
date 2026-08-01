@@ -175,6 +175,8 @@ jobs:
     if: github.event_name == 'pull_request'
     name: Semantic prefix
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
 
     steps:
       - name: Check out repository
@@ -182,6 +184,9 @@ jobs:
         with:
           # Full history so the base..HEAD range and its merge-base resolve.
           fetch-depth: 0
+          # The job runs pull-request-controlled shell scripts; do not leave a
+          # write-capable token on disk for them to access.
+          persist-credentials: false
 
       - name: Test the semantic-prefix validator
         run: scripts/check-semantic-prefix.test.sh
