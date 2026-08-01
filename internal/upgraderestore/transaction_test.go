@@ -50,6 +50,73 @@ func TestRestoreRollsBackOrdinaryRenameFailure(t *testing.T) {
 	assertNoRestoreArtifacts(t, filepath.Dir(fixture.databasePath))
 }
 
+func TestRestoreRollsBackMissingTargetUsingStagedIdentity(t *testing.T) {
+	// Database target was absent; after it is installed from stage, config
+	// install fails. Rollback must still remove the installed database using
+	// the durable staged content hash (staged path is already gone).
+	fixture := newRestoreFixture(t, false)
+	injectedErr := errors.New("injected config install failure")
+	operations := fileOperations{rename: func(sourcePath, targetPath string) error {
+		if targetPath == fixture.configPath && strings.Contains(filepath.Base(sourcePath), ".looper-restore-stage-") {
+			return injectedErr
+		}
+		return os.Rename(sourcePath, targetPath)
+	}}
+	err := restore(fixture.bundleDirectory, fixture.source, operations)
+	if !errors.Is(err, injectedErr) {
+		t.Fatalf("restore() error = %v, want injected failure", err)
+	}
+	assertPathMissing(t, fixture.databasePath)
+	assertPathMissing(t, fixture.configPath)
+	assertPathMissing(t, JournalPath(fixture.databasePath))
+}
+
+func TestRollbackRefusesRecreatedTargetWhenUndoPresent(t *testing.T) {
+	fixture := newRestoreFixture(t, true)
+	// Build a prepared journal as if originals were moved to undo, then a new
+	// file was created at the target before recovery.
+	dbHash, dbSize, err := fileContentIdentity(filepath.Join(fixture.bundleDirectory, "database.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfgHash, cfgSize, err := fileContentIdentity(filepath.Join(fixture.bundleDirectory, "config.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbUndo := fixture.databasePath + ".looper-restore-undo-test"
+	cfgUndo := fixture.configPath + ".looper-restore-undo-test"
+	if err := os.Rename(fixture.databasePath, dbUndo); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(fixture.configPath, cfgUndo); err != nil {
+		t.Fatal(err)
+	}
+	// Recreated targets that are NOT the staged restore content.
+	writeTestFile(t, fixture.databasePath, "recreated by app", 0o660)
+	writeTestFile(t, fixture.configPath, "recreated by app", 0o640)
+	journal := restoreJournal{
+		Version: journalVersion,
+		Phase:   phaseOriginalsMoved,
+		Entries: []journalEntry{
+			{Name: entryDatabase, TargetPath: fixture.databasePath, UndoPath: dbUndo, HadOriginal: true, StagedSHA256: dbHash, StagedSize: dbSize, StagedPath: filepath.Join(fixture.bundleDirectory, "database.sqlite")},
+			{Name: entryConfig, TargetPath: fixture.configPath, UndoPath: cfgUndo, HadOriginal: true, StagedSHA256: cfgHash, StagedSize: cfgSize, StagedPath: filepath.Join(fixture.bundleDirectory, "config.toml")},
+		},
+	}
+	journalPath := JournalPath(fixture.databasePath)
+	if err := createJournal(journalPath, journal); err != nil {
+		t.Fatal(err)
+	}
+	err = rollback(journalPath, journal, defaultFileOperations)
+	if err == nil {
+		t.Fatal("rollback() error = nil, want refuse recreated targets")
+	}
+	// Recreated files must remain; undo files must remain for operator recovery.
+	assertFileContents(t, fixture.databasePath, "recreated by app")
+	assertFileContents(t, fixture.configPath, "recreated by app")
+	assertFileContents(t, dbUndo, "old database")
+	assertFileContents(t, cfgUndo, "old config")
+}
+
 func TestRecoverRollsBackUncommittedRestore(t *testing.T) {
 	fixture := newRestoreFixture(t, true)
 	crashed := false

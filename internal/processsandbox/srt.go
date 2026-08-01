@@ -33,7 +33,18 @@ func Available() error {
 	if err != nil {
 		return fmt.Errorf("process sandbox: resolve current directory: %w", err)
 	}
-	_, err = installedRuntime(cwd, nil)
+	return AvailableInDirectory(cwd)
+}
+
+// AvailableInDirectory is Available evaluated against cwd. Supervised daemons
+// start in daemon.workingDirectory; preflight/--check-config must use that
+// directory so sandbox trust matches real startup rather than the operator shell.
+func AvailableInDirectory(cwd string) error {
+	cwd = strings.TrimSpace(cwd)
+	if cwd == "" {
+		return fmt.Errorf("process sandbox: working directory is required")
+	}
+	_, err := installedRuntime(cwd, nil)
 	return err
 }
 

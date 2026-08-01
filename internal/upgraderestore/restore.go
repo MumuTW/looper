@@ -27,6 +27,7 @@ package upgraderestore
 
 import (
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -72,6 +73,10 @@ type journalEntry struct {
 	StagedPath  string `json:"stagedPath"`
 	UndoPath    string `json:"undoPath"`
 	HadOriginal bool   `json:"hadOriginal"`
+	// StagedSHA256/StagedSize identify the staged bytes so rollback can prove
+	// ownership after the staged file has been renamed into the target path.
+	StagedSHA256 string `json:"stagedSha256,omitempty"`
+	StagedSize   int64  `json:"stagedSize,omitempty"`
 }
 
 type targetState struct {
@@ -206,11 +211,21 @@ func restore(bundleDirectory string, source upgradebackup.Source, operations fil
 	}
 	staged = append(staged, configStage)
 
+	dbHash, dbSize, err := fileContentIdentity(databaseStage)
+	if err != nil {
+		cleanupBeforeJournal()
+		return fmt.Errorf("hash staged database: %w", err)
+	}
+	cfgHash, cfgSize, err := fileContentIdentity(configStage)
+	if err != nil {
+		cleanupBeforeJournal()
+		return fmt.Errorf("hash staged configuration: %w", err)
+	}
 	entries := []journalEntry{
-		{Name: entryDatabase, TargetPath: states[0].path, StagedPath: databaseStage, HadOriginal: states[0].present},
+		{Name: entryDatabase, TargetPath: states[0].path, StagedPath: databaseStage, HadOriginal: states[0].present, StagedSHA256: dbHash, StagedSize: dbSize},
 		{Name: entryWAL, TargetPath: states[1].path, HadOriginal: states[1].present},
 		{Name: entrySHM, TargetPath: states[2].path, HadOriginal: states[2].present},
-		{Name: entryConfig, TargetPath: states[3].path, StagedPath: configStage, HadOriginal: states[3].present},
+		{Name: entryConfig, TargetPath: states[3].path, StagedPath: configStage, HadOriginal: states[3].present, StagedSHA256: cfgHash, StagedSize: cfgSize},
 	}
 	for index := range entries {
 		undoPath, err := reserveUndoPath(entries[index].TargetPath)
@@ -687,16 +702,34 @@ func rollback(journalPath string, journal restoreJournal, operations fileOperati
 	var rollbackErrors []error
 	for index := len(journal.Entries) - 1; index >= 0; index-- {
 		entry := journal.Entries[index]
-		undoInfo, undoPresent, err := inspectRegularArtifact(entry.UndoPath, "undo file for "+entry.Name)
+		_, undoPresent, err := inspectRegularArtifact(entry.UndoPath, "undo file for "+entry.Name)
 		if err != nil {
 			rollbackErrors = append(rollbackErrors, err)
 			continue
 		}
 		if undoPresent {
-			_ = undoInfo
-			if err := removeRegularIfExists(entry.TargetPath, "current target for "+entry.Name); err != nil {
+			// Undo holds the pre-restore original. Only remove the current target
+			// when it is provably this transaction's install (matches staged
+			// identity). A recreated app file must not be deleted.
+			_, targetPresent, err := inspectRegularArtifact(entry.TargetPath, "current target for "+entry.Name)
+			if err != nil {
 				rollbackErrors = append(rollbackErrors, err)
 				continue
+			}
+			if targetPresent {
+				owned, err := targetOwnedByRestoreTransaction(entry)
+				if err != nil {
+					rollbackErrors = append(rollbackErrors, err)
+					continue
+				}
+				if !owned {
+					rollbackErrors = append(rollbackErrors, fmt.Errorf("refusing to replace %s: target was recreated outside this restore transaction (undo preserved at %s)", entry.Name, entry.UndoPath))
+					continue
+				}
+				if err := removeRegularIfExists(entry.TargetPath, "current target for "+entry.Name); err != nil {
+					rollbackErrors = append(rollbackErrors, err)
+					continue
+				}
 			}
 			if err := operations.rename(entry.UndoPath, entry.TargetPath); err != nil {
 				rollbackErrors = append(rollbackErrors, fmt.Errorf("restore original %s: %w", entry.Name, err))
@@ -706,8 +739,7 @@ func rollback(journalPath string, journal restoreJournal, operations fileOperati
 		if !entry.HadOriginal {
 			// Target was absent when the journal was prepared. If a file is now
 			// present, delete it only when it is provably this transaction's
-			// staged install; otherwise fail closed rather than destroying an
-			// operator/application file created after the interruption.
+			// staged install (live staged path or durable staged content hash).
 			_, targetPresent, err := inspectRegularArtifact(entry.TargetPath, "new target for "+entry.Name)
 			if err != nil {
 				rollbackErrors = append(rollbackErrors, err)
@@ -716,29 +748,13 @@ func rollback(journalPath string, journal restoreJournal, operations fileOperati
 			if !targetPresent {
 				continue
 			}
-			if strings.TrimSpace(entry.StagedPath) == "" {
-				rollbackErrors = append(rollbackErrors, fmt.Errorf("refusing to delete %s: target appeared after prepared journal with no staged identity", entry.Name))
-				continue
-			}
-			_, stagedPresent, err := inspectRegularArtifact(entry.StagedPath, "staged file for "+entry.Name)
+			owned, err := targetOwnedByRestoreTransaction(entry)
 			if err != nil {
 				rollbackErrors = append(rollbackErrors, err)
 				continue
 			}
-			if !stagedPresent {
-				// Staged already consumed (installed). Only remove target if it
-				// still matches what we would have installed — compare to undo
-				// absence + phase is insufficient; refuse without content proof.
-				rollbackErrors = append(rollbackErrors, fmt.Errorf("refusing to delete %s: staged artifact is gone so target ownership cannot be proven", entry.Name))
-				continue
-			}
-			same, err := sameRegularFileContent(entry.StagedPath, entry.TargetPath)
-			if err != nil {
-				rollbackErrors = append(rollbackErrors, err)
-				continue
-			}
-			if !same {
-				rollbackErrors = append(rollbackErrors, fmt.Errorf("refusing to delete %s: target does not match staged restore artifact", entry.Name))
+			if !owned {
+				rollbackErrors = append(rollbackErrors, fmt.Errorf("refusing to delete %s: target is not proven to belong to this restore transaction", entry.Name))
 				continue
 			}
 			if err := removeRegularIfExists(entry.TargetPath, "new target for "+entry.Name); err != nil {
@@ -781,40 +797,57 @@ func inspectRegularArtifact(path, description string) (os.FileInfo, bool, error)
 	return info, true, nil
 }
 
-func sameRegularFileContent(left, right string) (bool, error) {
-	leftInfo, err := os.Lstat(left)
-	if err != nil {
-		return false, fmt.Errorf("stat %s: %w", left, err)
+func targetOwnedByRestoreTransaction(entry journalEntry) (bool, error) {
+	// Prefer live staged path when still present (normal-error rollback before rename).
+	if strings.TrimSpace(entry.StagedPath) != "" {
+		if _, stagedPresent, err := inspectRegularArtifact(entry.StagedPath, "staged file for "+entry.Name); err != nil {
+			return false, err
+		} else if stagedPresent {
+			return sameRegularFileContent(entry.StagedPath, entry.TargetPath)
+		}
 	}
-	rightInfo, err := os.Lstat(right)
-	if err != nil {
-		return false, fmt.Errorf("stat %s: %w", right, err)
-	}
-	if !leftInfo.Mode().IsRegular() || !rightInfo.Mode().IsRegular() {
-		return false, fmt.Errorf("content compare requires regular files")
-	}
-	if leftInfo.Size() != rightInfo.Size() {
+	// Staged path consumed (renamed into target): prove with durable identity.
+	if strings.TrimSpace(entry.StagedSHA256) == "" {
+		// WAL/SHM have no staged content; never claim ownership of a recreated file.
 		return false, nil
 	}
-	leftFile, err := os.Open(left)
+	hash, size, err := fileContentIdentity(entry.TargetPath)
 	if err != nil {
 		return false, err
 	}
-	defer leftFile.Close()
-	rightFile, err := os.Open(right)
+	return hash == entry.StagedSHA256 && size == entry.StagedSize, nil
+}
+
+func fileContentIdentity(path string) (string, int64, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return "", 0, err
+	}
+	if !info.Mode().IsRegular() {
+		return "", 0, fmt.Errorf("%s must be a regular file", path)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return "", 0, err
+	}
+	defer f.Close()
+	hasher := sha256.New()
+	if _, err := io.Copy(hasher, f); err != nil {
+		return "", 0, err
+	}
+	return hex.EncodeToString(hasher.Sum(nil)), info.Size(), nil
+}
+
+func sameRegularFileContent(left, right string) (bool, error) {
+	leftHash, leftSize, err := fileContentIdentity(left)
 	if err != nil {
 		return false, err
 	}
-	defer rightFile.Close()
-	leftHash := sha256.New()
-	rightHash := sha256.New()
-	if _, err := io.Copy(leftHash, leftFile); err != nil {
+	rightHash, rightSize, err := fileContentIdentity(right)
+	if err != nil {
 		return false, err
 	}
-	if _, err := io.Copy(rightHash, rightFile); err != nil {
-		return false, err
-	}
-	return string(leftHash.Sum(nil)) == string(rightHash.Sum(nil)), nil
+	return leftHash == rightHash && leftSize == rightSize, nil
 }
 
 func removeRegularIfExists(path, description string) error {
