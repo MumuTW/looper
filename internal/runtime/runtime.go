@@ -215,6 +215,7 @@ type Runtime struct {
 	worktreeCleanupRunning      bool
 	worktreeCleanupInitialDelay time.Duration
 	worktreeCleanupStatus       WorktreeCleanupStatus
+	hostAdmission               *hostAdmissionGate
 	projectDiscovery            *projectDiscoveryRunner
 	resumeProjectDiscoveries    func(context.Context, *projects.Service) error
 	recoveryCancel              context.CancelFunc
@@ -337,6 +338,7 @@ func New(options Options) *Runtime {
 		shutdownTimeout:             shutdownTimeout,
 		worktreeCleanupInitialDelay: options.WorktreeCleanupInitialDelay,
 		projectDiscovery:            newProjectDiscoveryRunner(),
+		hostAdmission:               newHostAdmissionGate(hostAdmissionStatePath(options.Config), now),
 		deferRecovery:               options.DeferRecovery,
 		recovery:                    createEmptyRecoverySummary(),
 		shutdownCh:                  make(chan struct{}),
@@ -1059,7 +1061,7 @@ func (r *Runtime) start(ctx context.Context) error {
 			r.mu.RLock()
 			defer r.mu.RUnlock()
 			return r.schedulerTasks
-		}, r.TriggerSchedulerClaim, r.now, r.reconcileLiveStaleRunningRuns, r.AllowClaim, r.WithAllowClaim)
+		}, r.TriggerSchedulerClaim, r.now, r.reconcileLiveStaleRunningRuns, r.AllowClaim, r.WithAllowClaim, r.hostAdmission)
 		if !r.customSchedulerTick {
 			r.defaultSchedulerTick = handlers.tick
 			if !r.customWebhookForwarder {

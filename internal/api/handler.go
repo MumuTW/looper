@@ -966,6 +966,7 @@ type statusResponse struct {
 	Scheduler       statusScheduler     `json:"scheduler"`
 	Agent           statusAgent         `json:"agent"`
 	WorktreeCleanup any                 `json:"worktreeCleanup"`
+	ResourceGuard   any                 `json:"resourceGuard"`
 	Webhook         statusWebhook       `json:"webhook"`
 	Loops           statusLoops         `json:"loops"`
 	Network         any                 `json:"network,omitempty"`
@@ -1249,6 +1250,7 @@ type configDaemonResponse struct {
 	WorkingDirectory       string                       `json:"workingDirectory"`
 	Environment            map[string]string            `json:"environment"`
 	WorktreeCleanup        config.WorktreeCleanupConfig `json:"worktreeCleanup"`
+	ResourceGuard          config.ResourceGuardConfig   `json:"resourceGuard"`
 }
 
 type configPackageResponse struct {
@@ -1297,6 +1299,7 @@ func (h *Handler) buildConfigResponse() configResponse {
 			WorkingDirectory:       cfg.Daemon.WorkingDirectory,
 			Environment:            map[string]string{},
 			WorktreeCleanup:        cfg.Daemon.WorktreeCleanup,
+			ResourceGuard:          cfg.Daemon.ResourceGuard,
 		},
 		Package: configPackageResponse{
 			Distribution:               cfg.Package.Distribution,
@@ -1512,6 +1515,7 @@ func (h *Handler) buildStatusResponse(ctx context.Context) (statusResponse, erro
 			},
 		},
 		WorktreeCleanup: h.buildWorktreeCleanupStatusResponse(),
+		ResourceGuard:   h.buildResourceGuardStatusResponse(),
 		Webhook:         summarizeWebhookStatus(h.buildWebhookStatusResponse()),
 		Loops:           loopCounts,
 		Network:         h.buildNetworkStatusResponse(),
@@ -1547,6 +1551,21 @@ func (h *Handler) buildWorktreeCleanupStatusResponse() any {
 		Enabled:    h.context.Config.Daemon.WorktreeCleanup.Enabled,
 		DryRun:     h.context.Config.Daemon.WorktreeCleanup.DryRun,
 		LastStatus: "idle",
+	}
+}
+
+// buildResourceGuardStatusResponse surfaces the last host reading. A scheduler
+// that is withholding slots must be able to say so: without this, a guarded
+// daemon and an idle one look identical from the outside.
+func (h *Handler) buildResourceGuardStatusResponse() any {
+	if runtimeWithGuard, ok := any(h.context.Runtime).(interface {
+		HostAdmissionStatus() looperdruntime.HostAdmissionStatus
+	}); ok {
+		return runtimeWithGuard.HostAdmissionStatus()
+	}
+	return looperdruntime.HostAdmissionStatus{
+		Enabled: h.context.Config.Daemon.ResourceGuard.Enabled,
+		Admit:   true,
 	}
 }
 

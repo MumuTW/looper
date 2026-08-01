@@ -360,6 +360,28 @@ type DaemonConfig struct {
 	WorkingDirectory       string                `json:"workingDirectory"`
 	Environment            map[string]string     `json:"environment"`
 	WorktreeCleanup        WorktreeCleanupConfig `json:"worktreeCleanup"`
+	ResourceGuard          ResourceGuardConfig   `json:"resourceGuard"`
+}
+
+// ResourceGuardConfig gates the start of new work on host pressure.
+//
+// maxConcurrentRuns counts runs, but a run expands into an agent process plus
+// whatever that agent spawns, and that fan-out is neither bounded nor known.
+// These thresholds measure the host instead of the queue.
+//
+// Every threshold is relative so one config behaves on a laptop and on a
+// 64-core runner: disk as a percentage and an absolute floor together
+// (whichever is stricter), load as a multiple of the host's CPU count. There is
+// deliberately no memory threshold — see internal/hostresources.
+type ResourceGuardConfig struct {
+	Enabled bool `json:"enabled"`
+	// MinDiskFreePercent and MinDiskFreeGB both guard the filesystem holding
+	// the daemon's state directory. Zero disables that half of the check.
+	MinDiskFreePercent float64 `json:"minDiskFreePercent"`
+	MinDiskFreeGB      float64 `json:"minDiskFreeGb"`
+	// MaxLoadPerCPU refuses new work above NumCPU x this. Zero disables the
+	// load signal, leaving disk as the only gate.
+	MaxLoadPerCPU float64 `json:"maxLoadPerCpu"`
 }
 
 type WorktreeCleanupConfig struct {
@@ -1010,6 +1032,14 @@ type PartialDaemonConfig struct {
 	WorkingDirectory       *string                       `json:"workingDirectory,omitempty"`
 	Environment            map[string]string             `json:"environment,omitempty"`
 	WorktreeCleanup        *PartialWorktreeCleanupConfig `json:"worktreeCleanup,omitempty"`
+	ResourceGuard          *PartialResourceGuardConfig   `json:"resourceGuard,omitempty"`
+}
+
+type PartialResourceGuardConfig struct {
+	Enabled            *bool    `json:"enabled,omitempty"`
+	MinDiskFreePercent *float64 `json:"minDiskFreePercent,omitempty"`
+	MinDiskFreeGB      *float64 `json:"minDiskFreeGb,omitempty"`
+	MaxLoadPerCPU      *float64 `json:"maxLoadPerCpu,omitempty"`
 }
 
 type PartialWorktreeCleanupConfig struct {
