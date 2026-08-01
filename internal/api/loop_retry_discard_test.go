@@ -1412,7 +1412,6 @@ func TestWorktreeStatusIdentityFailureRetrySafeFalseForPlanner(t *testing.T) {
 	assertEqual(t, statusDetails["retrySafe"], false)
 }
 
-
 func TestHandlerLoopRetryDiscardRejectsPhysicalBranchMismatchBeforeReset(t *testing.T) {
 	rt, cfg := startTestRuntime(t)
 	h := NewHandler(Context{Config: cfg, Runtime: rt})
