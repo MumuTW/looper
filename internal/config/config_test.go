@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -3328,6 +3329,46 @@ func TestValidateWorktreeCleanupConfig(t *testing.T) {
 	assertValidationIssue(t, validationErr, "daemon.worktreeCleanup.interval", "must be a positive duration")
 	assertValidationIssue(t, validationErr, "daemon.worktreeCleanup.retentionDays", "must be an integer >= 0")
 	assertValidationIssue(t, validationErr, "daemon.worktreeCleanup.maxPerTick", "must be a positive integer")
+}
+
+// NaN and Inf defeat the strict range comparisons in validateResourceGuardConfig
+// (NaN < 0 and NaN >= 100 are both false), so without an explicit finite check
+// they would be accepted, silently skip the guard, and break JSON projections.
+func TestValidateResourceGuardConfigRejectsNonFiniteThresholds(t *testing.T) {
+	cases := []struct {
+		name    string
+		set     func(*ResourceGuardConfig)
+		path    string
+		message string
+	}{
+		{name: "percent NaN", set: func(c *ResourceGuardConfig) { c.MinDiskFreePercent = math.NaN() }, path: "daemon.resourceGuard.minDiskFreePercent", message: "must be a finite number in [0, 100)"},
+		{name: "percent +Inf", set: func(c *ResourceGuardConfig) { c.MinDiskFreePercent = math.Inf(1) }, path: "daemon.resourceGuard.minDiskFreePercent", message: "must be a finite number in [0, 100)"},
+		{name: "gb NaN", set: func(c *ResourceGuardConfig) { c.MinDiskFreeGB = math.NaN() }, path: "daemon.resourceGuard.minDiskFreeGb", message: "must be a finite number >= 0"},
+		{name: "gb -Inf", set: func(c *ResourceGuardConfig) { c.MinDiskFreeGB = math.Inf(-1) }, path: "daemon.resourceGuard.minDiskFreeGb", message: "must be a finite number >= 0"},
+		{name: "load NaN", set: func(c *ResourceGuardConfig) { c.MaxLoadPerCPU = math.NaN() }, path: "daemon.resourceGuard.maxLoadPerCpu", message: "must be a finite number >= 0"},
+		{name: "load +Inf", set: func(c *ResourceGuardConfig) { c.MaxLoadPerCPU = math.Inf(1) }, path: "daemon.resourceGuard.maxLoadPerCpu", message: "must be a finite number >= 0"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := DefaultConfig(t.TempDir())
+			if err != nil {
+				t.Fatalf("DefaultConfig() error = %v", err)
+			}
+			cfg.Daemon.LogDir = t.TempDir()
+			cfg.Daemon.WorkingDirectory = t.TempDir()
+			tc.set(&cfg.Daemon.ResourceGuard)
+
+			err = ValidateWithOptions(cfg, ValidateOptions{DefaultWorktreeRoot: t.TempDir()})
+			if err == nil {
+				t.Fatal("ValidateWithOptions() error = nil, want validation error")
+			}
+			validationErr, ok := err.(*ConfigValidationError)
+			if !ok {
+				t.Fatalf("ValidateWithOptions() error = %T, want *ConfigValidationError", err)
+			}
+			assertValidationIssue(t, validationErr, tc.path, tc.message)
+		})
+	}
 }
 
 func TestNormalizeAppliesOverridesWithoutDroppingDefaults(t *testing.T) {

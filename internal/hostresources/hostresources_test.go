@@ -26,16 +26,64 @@ func TestEvaluate(t *testing.T) {
 			wantAdmit:  true,
 		},
 		{
-			name:        "absolute disk floor refuses even at a healthy percentage",
-			snapshot:    Snapshot{DiskFreeBytes: bytesPtr(3 * gib), DiskTotalBytes: bytesPtr(4000 * gib), NumCPU: 8},
-			thresholds:  Thresholds{MinDiskFreePercent: 0.01, MinDiskFreeBytes: 10 * gib},
+			// Looser of two: a healthy percentage admits even when the absolute
+			// floor fails, so an absolute floor alone cannot withhold work on a
+			// filesystem that satisfies the percentage.
+			name:       "absolute floor alone does not refuse when the percentage is healthy",
+			snapshot:   Snapshot{DiskFreeBytes: bytesPtr(3 * gib), DiskTotalBytes: bytesPtr(4000 * gib), NumCPU: 8},
+			thresholds: Thresholds{MinDiskFreePercent: 0.01, MinDiskFreeBytes: 10 * gib},
+			wantAdmit:  true,
+		},
+		{
+			// Looser of two: a satisfied absolute floor admits even when the
+			// percentage would reserve excessive slack, so a percentage alone
+			// cannot withhold work on a multi-terabyte filesystem.
+			name:       "percentage floor alone does not refuse when the absolute floor is satisfied",
+			snapshot:   Snapshot{DiskFreeBytes: bytesPtr(12 * gib), DiskTotalBytes: bytesPtr(1000 * gib), NumCPU: 8},
+			thresholds: Thresholds{MinDiskFreePercent: 5, MinDiskFreeBytes: 10 * gib},
+			wantAdmit:  true,
+		},
+		{
+			// The P1 case: a 10 GB default floor is impossible on an 8 GiB
+			// container volume. The percentage must keep the guard satisfiable
+			// so an upgrade does not withhold every claim on a small disk.
+			name:       "small filesystem admits when the absolute floor is impossible but the percentage is met",
+			snapshot:   Snapshot{DiskFreeBytes: bytesPtr(600 * 1024 * 1024), DiskTotalBytes: bytesPtr(8 * gib), NumCPU: 8},
+			thresholds: Thresholds{MinDiskFreePercent: 5, MinDiskFreeBytes: 10 * gib},
+			wantAdmit:  true,
+		},
+		{
+			// The large-disk case: 5% of 4 TiB is 200 GiB of slack nobody needs.
+			// The absolute floor must cap that, admitting once it is satisfied.
+			name:       "large filesystem admits when the absolute floor is satisfied despite a low percentage",
+			snapshot:   Snapshot{DiskFreeBytes: bytesPtr(50 * gib), DiskTotalBytes: bytesPtr(4000 * gib), NumCPU: 8},
+			thresholds: Thresholds{MinDiskFreePercent: 5, MinDiskFreeBytes: 10 * gib},
+			wantAdmit:  true,
+		},
+		{
+			// Refuse only when every configured threshold fails: free space
+			// below both the absolute floor and the percentage floor.
+			name:        "both configured disk thresholds must fail to refuse",
+			snapshot:    Snapshot{DiskFreeBytes: bytesPtr(3 * gib), DiskTotalBytes: bytesPtr(100 * gib), NumCPU: 8},
+			thresholds:  Thresholds{MinDiskFreePercent: 5, MinDiskFreeBytes: 10 * gib},
 			wantAdmit:   false,
 			wantReasons: []string{ReasonDiskLow},
 		},
 		{
-			name:        "percentage floor refuses even above the absolute floor",
+			// A single configured threshold decides on its own: with only the
+			// absolute floor set, failing it refuses regardless of percentage.
+			name:        "a lone absolute floor refuses when it fails",
+			snapshot:    Snapshot{DiskFreeBytes: bytesPtr(3 * gib), DiskTotalBytes: bytesPtr(4000 * gib), NumCPU: 8},
+			thresholds:  Thresholds{MinDiskFreeBytes: 10 * gib},
+			wantAdmit:   false,
+			wantReasons: []string{ReasonDiskLow},
+		},
+		{
+			// A single configured threshold decides on its own: with only the
+			// percentage set, failing it refuses regardless of the absolute floor.
+			name:        "a lone percentage floor refuses when it fails",
 			snapshot:    Snapshot{DiskFreeBytes: bytesPtr(12 * gib), DiskTotalBytes: bytesPtr(1000 * gib), NumCPU: 8},
-			thresholds:  Thresholds{MinDiskFreePercent: 5, MinDiskFreeBytes: 10 * gib},
+			thresholds:  Thresholds{MinDiskFreePercent: 5},
 			wantAdmit:   false,
 			wantReasons: []string{ReasonDiskLow},
 		},

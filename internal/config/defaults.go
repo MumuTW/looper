@@ -172,9 +172,11 @@ func DefaultConfig(cwd string) (Config, error) {
 				// Disk is the load-bearing signal: running the state
 				// filesystem dry does not merely slow looper down, it turns
 				// SQLite write failures into corruption. 5% and 10 GB are
-				// applied together so the check is meaningful on both a small
-				// disk (where 5% is nothing) and a large one (where 5% is tens
-				// of gigabytes of slack nobody needs).
+				// applied as the looser of the two: admission requires only one
+				// to be satisfied, so the percentage keeps the guard satisfiable
+				// on a filesystem smaller than the absolute floor (common for
+				// containers and small dedicated volumes) and the absolute floor
+				// caps percentage slack on a multi-terabyte filesystem.
 				MinDiskFreePercent: 5,
 				MinDiskFreeGB:      10,
 				// Load is a coarse backstop, defaulted conservatively so it

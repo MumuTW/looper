@@ -9,6 +9,7 @@ import (
 )
 
 func freeBytes(value uint64) *uint64 { return &value }
+func loadPtr(value float64) *float64 { return &value }
 
 func guardConfig() config.ResourceGuardConfig {
 	return config.ResourceGuardConfig{Enabled: true, MinDiskFreePercent: 5, MinDiskFreeGB: 10, MaxLoadPerCPU: 2}
@@ -150,5 +151,71 @@ func TestThresholdsFromConfigConvertsGigabytes(t *testing.T) {
 	thresholds := thresholdsFromConfig(config.ResourceGuardConfig{MinDiskFreeGB: 2.5})
 	if want := uint64(2.5 * float64(1<<30)); thresholds.MinDiskFreeBytes != want {
 		t.Fatalf("MinDiskFreeBytes = %d, want %d", thresholds.MinDiskFreeBytes, want)
+	}
+}
+
+// The claim pass runs several times per second. A sustained hold must log once
+// per decision transition and once per fresh sample, not on every call, or it
+// churns the log and consumes the disk the guard protects.
+func TestHostAdmissionGateThrottlesRepeatedHoldWarnings(t *testing.T) {
+	t.Parallel()
+
+	const gib = uint64(1) << 30
+	current := time.Unix(0, 0)
+	// Both signals trip under the default config: disk is below both floors and
+	// load exceeds 2/CPU. This lets a threshold edit transition the decision on
+	// the cached sample without waiting for a fresh read.
+	pressure := hostresources.Snapshot{DiskFreeBytes: freeBytes(2 * gib), DiskTotalBytes: freeBytes(500 * gib), Load1: loadPtr(40), NumCPU: 10}
+	gate := newHostAdmissionGate("/state", func() time.Time { return current })
+	gate.read = func(string) hostresources.Snapshot { return pressure }
+
+	hold := gate.Decide(guardConfig())
+	if hold == nil || hold.Admit {
+		t.Fatalf("Decide() = %#v, want a hold", hold)
+	}
+	if !gate.ShouldLogHold(hold) {
+		t.Fatal("ShouldLogHold() = false on the first hold, want true")
+	}
+	if gate.ShouldLogHold(hold) {
+		t.Fatal("ShouldLogHold() = true on a repeated hold on the same sample, want false")
+	}
+
+	// A decision transition on the cached sample logs immediately: an operator
+	// relaxing the disk floor sees the load-only hold at once, not after the
+	// sample expires. This is the hot-edit path the gate exists to support.
+	relaxDisk := guardConfig()
+	relaxDisk.MinDiskFreeGB = 0
+	relaxDisk.MinDiskFreePercent = 0
+	transition := gate.Decide(relaxDisk)
+	if transition == nil || transition.Admit {
+		t.Fatalf("Decide() = %#v, want a load-only hold", transition)
+	}
+	if !gate.ShouldLogHold(transition) {
+		t.Fatal("ShouldLogHold() = false on a decision transition, want true")
+	}
+	if gate.ShouldLogHold(transition) {
+		t.Fatal("ShouldLogHold() = true on a repeated transition, want false")
+	}
+
+	// A fresh sample re-logs the same hold: the operator still sees pressure
+	// at the sample cadence rather than once on the first sample only.
+	current = current.Add(hostAdmissionSampleInterval + time.Second)
+	hold = gate.Decide(relaxDisk)
+	if !gate.ShouldLogHold(hold) {
+		t.Fatal("ShouldLogHold() = false on a fresh sample, want true")
+	}
+
+	// An admitting decision resets the memory, so the next hold logs at once.
+	admit := gate.Decide(config.ResourceGuardConfig{Enabled: true, MinDiskFreePercent: 1, MinDiskFreeGB: 1, MaxLoadPerCPU: 0})
+	if admit == nil || !admit.Admit {
+		t.Fatalf("Decide() = %#v, want admission", admit)
+	}
+	if gate.ShouldLogHold(admit) {
+		t.Fatal("ShouldLogHold() = true on an admitting decision, want false")
+	}
+	current = current.Add(time.Second)
+	nextHold := gate.Decide(guardConfig())
+	if !gate.ShouldLogHold(nextHold) {
+		t.Fatal("ShouldLogHold() = false on the first hold after an admit, want true")
 	}
 }

@@ -57,9 +57,14 @@ type Thresholds struct {
 	// MinDiskFreePercent refuses new work below this share of the filesystem.
 	MinDiskFreePercent float64
 	// MinDiskFreeBytes refuses new work below this absolute floor. Applied
-	// together with the percentage; whichever is stricter wins. A percentage
-	// alone is useless on a 4 TB disk (1% is 40 GB of slack nobody needs) and
-	// an absolute floor alone is useless on a small one.
+	// together with the percentage: each threshold covers the regime the other
+	// cannot, so admission requires only one of them to be satisfied. A
+	// percentage alone is useless on a 4 TB disk (1% is 40 GB of slack nobody
+	// needs) and an absolute floor alone is useless on a small one (a 10 GB
+	// floor can never be met on an 8 GB volume). Taking the looser of the two
+	// lets the absolute floor cap percentage slack on large filesystems while
+	// the percentage keeps the guard satisfiable on small ones; refusing only
+	// when both fail keeps a portable default from withholding every claim.
 	MinDiskFreeBytes uint64
 	// MaxLoadPerCPU refuses new work above NumCPU * this. Zero disables the
 	// load signal.
@@ -95,17 +100,36 @@ func Evaluate(snapshot Snapshot, thresholds Thresholds) Decision {
 
 	if snapshot.DiskFreeBytes != nil {
 		free := *snapshot.DiskFreeBytes
+		// Each configured threshold covers the regime the other cannot (see
+		// Thresholds). Admission requires only one configured threshold to be
+		// satisfied, so refuse only when every configured threshold fails: a
+		// default absolute floor can never be met on a filesystem smaller than
+		// it, and a default percentage reserves excessive slack on a large one,
+		// so the looser-of-two combination keeps the guard portable.
+		var tripped []string
 		if thresholds.MinDiskFreeBytes > 0 && free < thresholds.MinDiskFreeBytes {
-			decision.refuse(ReasonDiskLow, fmt.Sprintf(
+			tripped = append(tripped, fmt.Sprintf(
 				"%s free on the state filesystem is below the %s floor",
 				formatBytes(free), formatBytes(thresholds.MinDiskFreeBytes)))
-		} else if thresholds.MinDiskFreePercent > 0 && snapshot.DiskTotalBytes != nil && *snapshot.DiskTotalBytes > 0 {
+		}
+		configuredPercent := thresholds.MinDiskFreePercent > 0 && snapshot.DiskTotalBytes != nil && *snapshot.DiskTotalBytes > 0
+		if configuredPercent {
 			percent := 100 * float64(free) / float64(*snapshot.DiskTotalBytes)
 			if percent < thresholds.MinDiskFreePercent {
-				decision.refuse(ReasonDiskLow, fmt.Sprintf(
+				tripped = append(tripped, fmt.Sprintf(
 					"%.1f%% free on the state filesystem is below the %.1f%% floor",
 					percent, thresholds.MinDiskFreePercent))
 			}
+		}
+		configured := 0
+		if thresholds.MinDiskFreeBytes > 0 {
+			configured++
+		}
+		if configuredPercent {
+			configured++
+		}
+		if configured > 0 && len(tripped) == configured {
+			decision.refuse(ReasonDiskLow, strings.Join(tripped, "; "))
 		}
 	}
 

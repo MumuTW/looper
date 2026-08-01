@@ -37,6 +37,14 @@ type hostAdmissionGate struct {
 	sampledAt time.Time
 	snapshot  hostresources.Snapshot
 	hasSample bool
+
+	// Throttle state for hold logging. The claim path runs several times per
+	// second and a sustained hold would otherwise emit the same warning on
+	// every call. A hold is logged once per decision transition and once per
+	// fresh sample, so a sustained low-disk condition surfaces at the sample
+	// cadence rather than the tick cadence.
+	lastLoggedHoldKey      string
+	lastLoggedHoldSampleAt time.Time
 }
 
 func newHostAdmissionGate(statePath string, now func() time.Time) *hostAdmissionGate {
@@ -94,6 +102,43 @@ func (g *hostAdmissionGate) sample() hostresources.Snapshot {
 	g.sampledAt = now
 	g.hasSample = true
 	return g.snapshot
+}
+
+// ShouldLogHold reports whether a hold decision should be logged now, recording
+// the decision so a repeated hold on the same sample is logged once. The claim
+// pass invokes this on every tick; without it a sustained hold would emit the
+// same warning several times per second (and on an empty queue, since admission
+// is computed from running-count capacity alone), churning logs and consuming
+// the disk the guard protects. A hold logs once per decision transition and
+// once per fresh sample; an admitting or absent decision resets the memory so
+// the next hold logs immediately.
+func (g *hostAdmissionGate) ShouldLogHold(decision *hostresources.Decision) bool {
+	if g == nil {
+		return true
+	}
+	if decision == nil || decision.Admit {
+		g.mu.Lock()
+		g.lastLoggedHoldKey = ""
+		g.lastLoggedHoldSampleAt = time.Time{}
+		g.mu.Unlock()
+		return false
+	}
+	key := holdLogKey(decision)
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if key == g.lastLoggedHoldKey && g.sampledAt.Equal(g.lastLoggedHoldSampleAt) {
+		return false
+	}
+	g.lastLoggedHoldKey = key
+	g.lastLoggedHoldSampleAt = g.sampledAt
+	return true
+}
+
+// holdLogKey is the stable signature of a hold decision: the tripped reasons
+// and their operator-facing detail. A change in either is a transition worth
+// logging; identical key on the same sample is the repeated warning to suppress.
+func holdLogKey(decision *hostresources.Decision) string {
+	return strings.Join(decision.Reasons, ",") + "|" + decision.Summary()
 }
 
 func thresholdsFromConfig(cfg config.ResourceGuardConfig) hostresources.Thresholds {

@@ -110,6 +110,11 @@ type defaultSchedulerTickInput struct {
 	// HostAdmission, when set, reports whether the host can carry more work.
 	// Nil means ungated (tests, and any platform whose signals are unreadable).
 	HostAdmission func() *hostresources.Decision
+	// HostAdmissionLog, when set, reports whether a hold decision should be
+	// logged now (and records it so a repeated hold on the same sample is
+	// logged once). Nil means log every hold, preserving the test behavior of
+	// an ungated admission closure.
+	HostAdmissionLog func(*hostresources.Decision) bool
 	// OperationOwner, when set, admits a Supervisor operation lease before each
 	// durable ClaimNext* and holds it until durable complete/cancel/requeue
 	// (ADR-0015 R6 / #579). Nil means ungated claim ownership (unit tests).
@@ -2333,6 +2338,8 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		claimMu = &sync.Mutex{}
 	}
 
+	hostAdmission, hostAdmissionLog := hostAdmissionFor(cfg, hostGate)
+
 	inputForServices := func(services Services) defaultSchedulerTickInput {
 		var runner schedulerAsyncRunner
 		if asyncRunner != nil {
@@ -2351,7 +2358,8 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			Logger:               logger,
 			Now:                  now,
 			MaxConcurrentRuns:    cfg.Scheduler.MaxConcurrentRuns,
-			HostAdmission:        hostAdmissionFor(cfg, hostGate),
+			HostAdmission:        hostAdmission,
+			HostAdmissionLog:     hostAdmissionLog,
 			ClaimMu:              claimMu,
 			ReconcileStaleRuns:   reconcileStaleRuns,
 			AsyncRunner:          runner,
@@ -2872,9 +2880,15 @@ func executeClaimPhase(ctx context.Context, phase string, input defaultScheduler
 	// untouched. Killing in-flight work to relieve pressure would discard its
 	// progress and leave exactly the orphaned executions and quarantine debt
 	// that recovery then has to reconcile — paying for capacity with debt.
+	// The hold warning is throttled to one entry per decision transition and
+	// per fresh sample: the claim pass runs several times per second, and a
+	// sustained hold (even on an empty queue) would otherwise churn the log on
+	// every call and consume the disk the guard protects.
 	if availableSlots > 0 && input.HostAdmission != nil {
 		if held := input.HostAdmission(); held != nil && !held.Admit {
-			logHostAdmissionHold(input.Logger, phase, availableSlots, *held)
+			if input.HostAdmissionLog == nil || input.HostAdmissionLog(held) {
+				logHostAdmissionHold(input.Logger, phase, availableSlots, *held)
+			}
 			return 0, 0, nil
 		}
 	}
@@ -2897,12 +2911,17 @@ func executeClaimPhase(ctx context.Context, phase string, input defaultScheduler
 // having no work, which is the failure mode this log exists to prevent.
 // hostAdmissionFor binds the shared gate to this snapshot's thresholds, so a
 // config reload changes the gate on the next tick without restarting anything.
-func hostAdmissionFor(cfg config.Config, gate *hostAdmissionGate) func() *hostresources.Decision {
+// The second return value throttles hold logging to one entry per decision
+// transition and per fresh sample, so a sustained hold does not churn the log
+// on every claim pass.
+func hostAdmissionFor(cfg config.Config, gate *hostAdmissionGate) (func() *hostresources.Decision, func(*hostresources.Decision) bool) {
 	if gate == nil {
-		return nil
+		return nil, nil
 	}
 	guard := cfg.Daemon.ResourceGuard
-	return func() *hostresources.Decision { return gate.Decide(guard) }
+	decide := func() *hostresources.Decision { return gate.Decide(guard) }
+	report := func(decision *hostresources.Decision) bool { return gate.ShouldLogHold(decision) }
+	return decide, report
 }
 
 func logHostAdmissionHold(logger bootstrap.Logger, phase string, withheldSlots int, decision hostresources.Decision) {

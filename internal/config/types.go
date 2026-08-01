@@ -371,8 +371,9 @@ type DaemonConfig struct {
 //
 // Every threshold is relative so one config behaves on a laptop and on a
 // 64-core runner: disk as a percentage and an absolute floor together
-// (whichever is stricter), load as a multiple of the host's CPU count. There is
-// deliberately no memory threshold — see internal/hostresources.
+// (whichever is looser — admission requires only one to be satisfied), load as
+// a multiple of the host's CPU count. There is deliberately no memory threshold
+// — see internal/hostresources.
 type ResourceGuardConfig struct {
 	Enabled bool `json:"enabled"`
 	// MinDiskFreePercent and MinDiskFreeGB both guard the filesystem holding
