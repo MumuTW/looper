@@ -316,7 +316,6 @@ func (b *Breaker) SetConfig(cfg Config) {
 		return
 	}
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	previous := b.cfg
 	b.cfg = cfg
 	if !cfg.Enabled {
@@ -329,6 +328,7 @@ func (b *Breaker) SetConfig(cfg Config) {
 		b.halfOpenAt = time.Time{}
 		b.tripFailures = 0
 		b.tripTotal = 0
+		b.mu.Unlock()
 		return
 	}
 	// A cooldown the operator shortened should take effect on the next round,
@@ -354,6 +354,27 @@ func (b *Breaker) SetConfig(cfg Config) {
 	if b.cooldown <= 0 {
 		b.cooldown = cfg.Cooldown
 	}
+	// A reload may lower the recovery-round threshold below the successes
+	// already observed in half-open. Leaving that progress untouched makes
+	// AllowAdmission reject every new probe forever because the completed count
+	// already fills the new capacity. The operator's explicit policy change is
+	// the authority here: close the round once the reduced threshold is met and
+	// ignore any stale sibling outcomes that were still in flight.
+	if b.state == StateHalfOpen {
+		limit := cfg.ProbeSuccesses
+		if limit <= 0 {
+			limit = 1
+		}
+		if b.probeSuccesses >= limit {
+			b.state = StateClosed
+			b.cooldown = cfg.Cooldown
+			b.probeSuccesses = 0
+			b.probeInFlight = 0
+			b.outcomes = nil
+			b.halfOpenAt = time.Time{}
+		}
+	}
+	b.mu.Unlock()
 }
 
 // Snapshot reports the current posture.

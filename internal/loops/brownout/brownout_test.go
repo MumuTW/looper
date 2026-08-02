@@ -572,3 +572,34 @@ func TestLoweringMaxCooldownShortensTheOpenDeadline(t *testing.T) {
 		t.Fatalf("gate still refused work past the lowered ceiling: %v", err)
 	}
 }
+
+func TestLoweringProbeSuccessThresholdClosesCompletedHalfOpenRound(t *testing.T) {
+	cfg := testConfig()
+	cfg.ProbeSuccesses = 3
+	b, c, _ := newTestBreaker(t, cfg)
+	b.Record(c.now(), false)
+	b.Record(c.now(), false)
+	b.Record(c.now(), false)
+	c.add(10 * time.Minute)
+
+	for i := 0; i < 2; i++ {
+		probe, err := b.AllowAdmission()
+		if err != nil || !probe {
+			t.Fatalf("probe admission %d = (%t, %v), want reserved probe", i+1, probe, err)
+		}
+		b.RecordAdmission(c.now(), true, true)
+	}
+	if got := b.Snapshot().State; got != StateHalfOpen {
+		t.Fatalf("state before reload = %s, want half-open", got)
+	}
+
+	lowered := cfg
+	lowered.ProbeSuccesses = 2
+	b.SetConfig(lowered)
+	if got := b.Snapshot().State; got != StateClosed {
+		t.Fatalf("state after lowering threshold = %s, want closed", got)
+	}
+	if probe, err := b.AllowAdmission(); err != nil || probe {
+		t.Fatalf("admission after reconciled reload = (%t, %v), want ordinary closed admission", probe, err)
+	}
+}
