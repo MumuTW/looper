@@ -440,7 +440,7 @@ func TestSetConfigPreservesOpenStateAndClampsCooldown(t *testing.T) {
 }
 
 func TestSetConfigDisableResetsEvaluationState(t *testing.T) {
-	b, c, _ := newTestBreaker(t, testConfig())
+	b, c, transitions := newTestBreaker(t, testConfig())
 	b.Record(c.now(), false)
 	b.Record(c.now(), false)
 	b.Record(c.now(), false)
@@ -456,6 +456,9 @@ func TestSetConfigDisableResetsEvaluationState(t *testing.T) {
 	}
 	if err := b.Allow(); err != nil {
 		t.Fatalf("disabled breaker refused work: %v", err)
+	}
+	if len(*transitions) != 2 || (*transitions)[1].From != StateOpen || (*transitions)[1].To != StateClosed || (*transitions)[1].Reason != "disabled_override" {
+		t.Fatalf("disable transition = %+v, want open-to-closed disabled_override", *transitions)
 	}
 }
 

@@ -319,6 +319,7 @@ func (b *Breaker) SetConfig(cfg Config) {
 	var transition Transition
 	changed := false
 	previous := b.cfg
+	previousState := b.state
 	b.cfg = cfg
 	if !cfg.Enabled {
 		b.state = StateClosed
@@ -331,6 +332,9 @@ func (b *Breaker) SetConfig(cfg Config) {
 		b.tripFailures = 0
 		b.tripTotal = 0
 		b.mu.Unlock()
+		if previousState != StateClosed {
+			b.emit(Transition{From: previousState, To: StateClosed, Reason: "disabled_override"})
+		}
 		return
 	}
 	// A cooldown the operator shortened should take effect on the next round,
