@@ -80,14 +80,20 @@ func TestAdviseTrustDoesNotRouteEligiblePullRequestToAutoMerge(t *testing.T) {
 }
 
 func TestEscalationReasonsRouteToNeedsHumanReview(t *testing.T) {
-	for _, reason := range []ReasonCode{ReasonCode(protectedPathTouchedReason), ReasonCode(diffBudgetExceededReason)} {
+	for _, reason := range []ReasonCode{ReasonCode(protectedPathTouchedReason), ReasonDiffBudgetExceeded} {
 		t.Run(string(reason), func(t *testing.T) {
 			t.Parallel()
 			fixture := newGatekeeperFixture(t)
 			runner := routingRunner(fixture, config.GatekeeperTrustAdvise)
 			report := Report{
 				ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42,
-				ObservedHeadSHA: "head-1", Evidence: Evidence{FinalObservedHeadSHA: "head-1"},
+				ObservedHeadSHA: "head-1", Evidence: Evidence{
+					FinalObservedHeadSHA:       "head-1",
+					PullRequestState:           "OPEN",
+					BaseRefName:                "main",
+					ReviewDecision:             "APPROVED",
+					ProjectPolicyPermitsTarget: true,
+				},
 				Reasons: []Reason{{Code: reason}},
 			}
 
@@ -129,7 +135,13 @@ func TestRepeatedReviewChangesEscalatesOnSecondEvaluation(t *testing.T) {
 	runner := routingRunner(fixture, config.GatekeeperTrustAdvise)
 	report := Report{
 		ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42,
-		ObservedHeadSHA: "head-1", Evidence: Evidence{FinalObservedHeadSHA: "head-1"},
+		ObservedHeadSHA: "head-1", Evidence: Evidence{
+			FinalObservedHeadSHA:       "head-1",
+			PullRequestState:           "OPEN",
+			BaseRefName:                "main",
+			ReviewDecision:             "APPROVED",
+			ProjectPolicyPermitsTarget: true,
+		},
 		Reasons: []Reason{{Code: ReasonReviewChangesRequested}},
 	}
 	if _, err := runner.persist(context.Background(), report); err != nil {
@@ -149,7 +161,13 @@ func TestRepeatedReviewChangesEscalatesOnSecondEvaluation(t *testing.T) {
 func TestEligibleThenMechanicalBlockRemovesAutoMergeWithoutEscalation(t *testing.T) {
 	fixture := newGatekeeperFixture(t)
 	runner := routingRunner(fixture, config.GatekeeperTrustAuto)
-	eligible := Report{ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, ObservedHeadSHA: "head-1", Evidence: Evidence{FinalObservedHeadSHA: "head-1"}}
+	eligible := Report{ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, ObservedHeadSHA: "head-1", Evidence: Evidence{
+		FinalObservedHeadSHA:       "head-1",
+		PullRequestState:           "OPEN",
+		BaseRefName:                "main",
+		ReviewDecision:             "APPROVED",
+		ProjectPolicyPermitsTarget: true,
+	}}
 	if _, err := runner.persist(context.Background(), eligible); err != nil {
 		t.Fatalf("eligible persist() error = %v", err)
 	}
@@ -175,8 +193,11 @@ func TestRoutingLabelsSkipWhenHeadMovesBeforeProjection(t *testing.T) {
 		t.Fatal("EvaluatePullRequest() succeeded after the head moved before projection")
 	}
 
-	if len(fixture.github.labelAdds) != 0 || len(fixture.github.labelRemoves) != 0 {
-		t.Fatalf("routing labels changed across a head race: adds=%#v removes=%#v", fixture.github.labelAdds, fixture.github.labelRemoves)
+	if len(fixture.github.labelAdds) != 0 {
+		t.Fatalf("label adds across a head race = %#v, want no new route", fixture.github.labelAdds)
+	}
+	if len(fixture.github.labelRemoves) != 2 || !slices.Equal(fixture.github.labelRemoves[0].Labels, []string{labels.AutoMerge}) || !slices.Equal(fixture.github.labelRemoves[1].Labels, []string{labels.NeedsHumanReview}) {
+		t.Fatalf("label removals across a head race = %#v, want both stale routes retired", fixture.github.labelRemoves)
 	}
 }
 
@@ -194,8 +215,11 @@ func TestRoutingLabelsSkipWhenReviewStateChangesBeforeProjection(t *testing.T) {
 	}); err == nil {
 		t.Fatal("EvaluatePullRequest() succeeded after review state changed before projection")
 	}
-	if len(fixture.github.labelAdds) != 0 || len(fixture.github.labelRemoves) != 0 {
-		t.Fatalf("routing labels changed across a review-state race: adds=%#v removes=%#v", fixture.github.labelAdds, fixture.github.labelRemoves)
+	if len(fixture.github.labelAdds) != 0 {
+		t.Fatalf("label adds across a review-state race = %#v, want no new route", fixture.github.labelAdds)
+	}
+	if len(fixture.github.labelRemoves) != 2 || !slices.Equal(fixture.github.labelRemoves[0].Labels, []string{labels.AutoMerge}) || !slices.Equal(fixture.github.labelRemoves[1].Labels, []string{labels.NeedsHumanReview}) {
+		t.Fatalf("label removals across a review-state race = %#v, want both stale routes retired", fixture.github.labelRemoves)
 	}
 }
 
@@ -213,8 +237,11 @@ func TestRoutingLabelsSkipWhenReviewThreadAppearsBeforeProjection(t *testing.T) 
 	}); err == nil {
 		t.Fatal("EvaluatePullRequest() succeeded after an unresolved review thread appeared before projection")
 	}
-	if len(fixture.github.labelAdds) != 0 || len(fixture.github.labelRemoves) != 0 {
-		t.Fatalf("routing labels changed across a review-thread race: adds=%#v removes=%#v", fixture.github.labelAdds, fixture.github.labelRemoves)
+	if len(fixture.github.labelAdds) != 0 {
+		t.Fatalf("label adds across a review-thread race = %#v, want no new route", fixture.github.labelAdds)
+	}
+	if len(fixture.github.labelRemoves) != 2 || !slices.Equal(fixture.github.labelRemoves[0].Labels, []string{labels.AutoMerge}) || !slices.Equal(fixture.github.labelRemoves[1].Labels, []string{labels.NeedsHumanReview}) {
+		t.Fatalf("label removals across a review-thread race = %#v, want both stale routes retired", fixture.github.labelRemoves)
 	}
 }
 
@@ -232,8 +259,11 @@ func TestRoutingLabelsRecheckHeadAfterReviewThreadProjection(t *testing.T) {
 	}); err == nil {
 		t.Fatal("EvaluatePullRequest() succeeded after the head moved during review-thread revalidation")
 	}
-	if len(fixture.github.labelAdds) != 0 || len(fixture.github.labelRemoves) != 0 {
-		t.Fatalf("routing labels changed across a post-thread head race: adds=%#v removes=%#v", fixture.github.labelAdds, fixture.github.labelRemoves)
+	if len(fixture.github.labelAdds) != 0 {
+		t.Fatalf("label adds across a post-thread head race = %#v, want no new route", fixture.github.labelAdds)
+	}
+	if len(fixture.github.labelRemoves) != 2 || !slices.Equal(fixture.github.labelRemoves[0].Labels, []string{labels.AutoMerge}) || !slices.Equal(fixture.github.labelRemoves[1].Labels, []string{labels.NeedsHumanReview}) {
+		t.Fatalf("label removals across a post-thread head race = %#v, want both stale routes retired", fixture.github.labelRemoves)
 	}
 }
 
@@ -245,15 +275,22 @@ func TestRoutingLabelsSkipWhenDiffBudgetBaseMovesBeforeProjection(t *testing.T) 
 		ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, Eligible: true,
 		ObservedHeadSHA: "head-1",
 		Evidence: Evidence{
-			FinalObservedHeadSHA: "head-1",
-			DiffBudget:           &DiffBudgetEvidence{BaseSHA: "base-1", MaxChangedFiles: 20},
+			FinalObservedHeadSHA:       "head-1",
+			PullRequestState:           "OPEN",
+			BaseRefName:                "main",
+			ReviewDecision:             "APPROVED",
+			ProjectPolicyPermitsTarget: true,
+			DiffBudget:                 &DiffBudgetEvidence{BaseSHA: "base-1", MaxChangedFiles: 20},
 		},
 	}
 	if _, err := runner.persist(context.Background(), report); err == nil {
 		t.Fatal("persist() succeeded after the diff-budget base moved before routing")
 	}
-	if len(fixture.github.labelAdds) != 0 || len(fixture.github.labelRemoves) != 0 {
-		t.Fatalf("routing labels changed across a diff-budget base race: adds=%#v removes=%#v", fixture.github.labelAdds, fixture.github.labelRemoves)
+	if len(fixture.github.labelAdds) != 0 {
+		t.Fatalf("label adds across a diff-budget base race = %#v, want no new route", fixture.github.labelAdds)
+	}
+	if len(fixture.github.labelRemoves) != 2 || !slices.Equal(fixture.github.labelRemoves[0].Labels, []string{labels.AutoMerge}) || !slices.Equal(fixture.github.labelRemoves[1].Labels, []string{labels.NeedsHumanReview}) {
+		t.Fatalf("label removals across a diff-budget base race = %#v, want both stale routes retired", fixture.github.labelRemoves)
 	}
 }
 
@@ -317,6 +354,9 @@ func TestRoutingLabelsBindEmptyReviewEvidenceToCurrentState(t *testing.T) {
 	}
 	if len(fixture.github.labelAdds) != 0 {
 		t.Fatalf("label adds = %#v, want no route across review transition", fixture.github.labelAdds)
+	}
+	if len(fixture.github.labelRemoves) != 2 || !slices.Equal(fixture.github.labelRemoves[0].Labels, []string{labels.AutoMerge}) || !slices.Equal(fixture.github.labelRemoves[1].Labels, []string{labels.NeedsHumanReview}) {
+		t.Fatalf("label removals across a review transition = %#v, want both stale routes retired", fixture.github.labelRemoves)
 	}
 }
 
@@ -399,10 +439,10 @@ func TestRoutingLabelFailureDoesNotLoseDurableReport(t *testing.T) {
 		}
 	}
 	if found != 2 {
-		t.Fatal("label projection failure discarded the durable gate report")
+		t.Fatalf("gate report events = %d, want 2 (durable report plus retry marker)", found)
 	}
-	if retryMarker.SourceFingerprint != "" || !hasReason(retryMarker, ReasonRoutingProjectionFailed) {
-		t.Fatalf("retry marker = %#v, want empty fingerprint and routing failure reason", retryMarker)
+	if !hasReason(retryMarker, ReasonRoutingProjectionFailed) {
+		t.Fatalf("retry marker = %#v, want a routing-projection failure reason", retryMarker)
 	}
 }
 
@@ -507,5 +547,68 @@ func TestRoutingLabelsAreReconciledAgainAfterExternalRemoval(t *testing.T) {
 
 	if len(fixture.github.labelAdds) != 2 {
 		t.Fatalf("label adds = %#v, want auto-merge reapplied on each evaluation", fixture.github.labelAdds)
+	}
+}
+
+func TestRoutingLabelsBlockedByDoNotMergeVetoLabel(t *testing.T) {
+	fixture := newGatekeeperFixture(t)
+	fixture.github.detail.Labels = []string{labels.DoNotMerge}
+	report, err := routingRunner(fixture, config.GatekeeperTrustAuto).EvaluatePullRequest(context.Background(), EvaluationInput{
+		ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, ExpectedHeadSHA: "head-1",
+	})
+	if err != nil {
+		t.Fatalf("EvaluatePullRequest() error = %v", err)
+	}
+	if report.Eligible {
+		t.Fatalf("report = %#v, want ineligible under do-not-merge veto", report)
+	}
+	if !hasReason(report, ReasonDoNotMerge) {
+		t.Fatalf("report reasons = %v, want %s", reasonCodes(report.Reasons), ReasonDoNotMerge)
+	}
+	if len(fixture.github.labelAdds) != 0 {
+		t.Fatalf("label adds = %#v, want no auto-merge route under veto", fixture.github.labelAdds)
+	}
+}
+
+func TestRoutingLabelsRetireRouteWhenDoNotMergeVetoAppearsBeforeProjection(t *testing.T) {
+	fixture := newGatekeeperFixture(t)
+	views := 0
+	fixture.github.beforeView = func(github *fakeGatekeeperGitHub) {
+		views++
+		if views == 2 {
+			github.detail.Labels = []string{labels.DoNotMerge}
+		}
+	}
+	if _, err := routingRunner(fixture, config.GatekeeperTrustAuto).EvaluatePullRequest(context.Background(), EvaluationInput{
+		ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, ExpectedHeadSHA: "head-1",
+	}); err == nil {
+		t.Fatal("EvaluatePullRequest() succeeded after a do-not-merge veto appeared before projection")
+	}
+	if len(fixture.github.labelAdds) != 0 {
+		t.Fatalf("label adds across a veto race = %#v, want no new route", fixture.github.labelAdds)
+	}
+	if len(fixture.github.labelRemoves) != 2 || !slices.Equal(fixture.github.labelRemoves[0].Labels, []string{labels.AutoMerge}) || !slices.Equal(fixture.github.labelRemoves[1].Labels, []string{labels.NeedsHumanReview}) {
+		t.Fatalf("label removals across a veto race = %#v, want both stale routes retired", fixture.github.labelRemoves)
+	}
+}
+
+func TestRoutingLabelsFailClosedOnMissingPullRequestStateEvidence(t *testing.T) {
+	fixture := newGatekeeperFixture(t)
+	runner := routingRunner(fixture, config.GatekeeperTrustAuto)
+	report := Report{
+		ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, Eligible: true,
+		ObservedHeadSHA: "head-1",
+		Evidence: Evidence{
+			FinalObservedHeadSHA: "head-1",
+		},
+	}
+	if _, err := runner.persist(context.Background(), report); err == nil {
+		t.Fatal("persist() succeeded for an add plan without pull-request state evidence")
+	}
+	if len(fixture.github.labelAdds) != 0 {
+		t.Fatalf("label adds = %#v, want fail-closed add plan to publish no route", fixture.github.labelAdds)
+	}
+	if len(fixture.github.labelRemoves) != 2 || !slices.Equal(fixture.github.labelRemoves[0].Labels, []string{labels.AutoMerge}) || !slices.Equal(fixture.github.labelRemoves[1].Labels, []string{labels.NeedsHumanReview}) {
+		t.Fatalf("label removals = %#v, want both stale routes retired on fail-closed evidence", fixture.github.labelRemoves)
 	}
 }

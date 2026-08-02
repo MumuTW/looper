@@ -10,14 +10,13 @@ import (
 	"github.com/MumuTW/looper/internal/labels"
 )
 
-// These reason values are owned by the independent policy-gate issues. The
-// routing layer deliberately matches their stable wire values instead of
-// re-declaring their Go constants, so #460 can merge independently of #458 and
-// #459 without creating a second reason-code authority.
-const (
-	protectedPathTouchedReason = "protected_path_touched"
-	diffBudgetExceededReason   = "diff_budget_exceeded"
-)
+// protectedPathTouchedReason is owned by the independent protected-path gate
+// (#458), whose Go constant is not yet in this package. The routing layer
+// deliberately matches its stable wire value so #460 can merge independently of
+// #458 without creating a second reason-code authority. The diff-budget reason
+// has no such constraint: ReasonDiffBudgetExceeded already lives in this
+// package, so reportNeedsHumanReview uses it directly.
+const protectedPathTouchedReason = "protected_path_touched"
 
 type routingLabelPlan struct {
 	autoMerge        bool
@@ -69,26 +68,30 @@ func (r *Runner) reconcileRoutingLabels(ctx context.Context, report Report, prev
 			// route before returning. Leaving auto-merge in place while the
 			// contract is invalid is the fail-open state this validation is
 			// intended to prevent.
-			cleanupErr := r.applyRoutingLabelPlan(ctx, report, routingLabelPlan{})
-			if cleanupErr != nil {
-				return fmt.Errorf("validate Mergify routing contract: %w (remove stale routing labels: %v)", err, cleanupErr)
-			}
-			return fmt.Errorf("validate Mergify routing contract: %w", err)
+			return fmt.Errorf("validate Mergify routing contract: %w", r.retireRoutingLabels(ctx, report, err))
 		}
 	}
 	// Read the PR state after the configuration check so this authority read is
-	// immediately adjacent to the final head check and label mutation.
+	// immediately adjacent to the final head check and label mutation. A
+	// revalidation failure means the evidence the existing route was published
+	// on is no longer current: a hold or policy change can happen without moving
+	// the head, and leaving auto-merge in place would let Mergify keep the pull
+	// request queued on stale authority. Fail closed by retiring both routing
+	// labels before returning; removal is fail-safe and the next evaluation
+	// re-applies the route if the pull request is eligible again.
 	if err := r.revalidateRoutingState(ctx, report, expectedHead); err != nil {
-		return err
+		return r.retireRoutingLabels(ctx, report, err)
 	}
 
 	// Review threads are Gatekeeper-owned policy input, not part of the
 	// Mergify queue contract. Re-read them immediately before projecting
 	// auto-merge so a thread opened after EvaluatePullRequest's initial
-	// snapshot cannot slip through the label boundary.
+	// snapshot cannot slip through the label boundary. An unresolved thread is
+	// an explicit Gatekeeper blocker, so the previously published route must be
+	// retired rather than left authorizing a queue.
 	if plan.autoMerge {
 		if err := r.revalidateUnresolvedReviewThreads(ctx, report); err != nil {
-			return err
+			return r.retireRoutingLabels(ctx, report, err)
 		}
 	}
 	// Reviewer convergence is local durable policy input, not part of the forge
@@ -100,11 +103,7 @@ func (r *Runner) reconcileRoutingLabels(ctx context.Context, report Report, prev
 			// A convergence change invalidates the route authority. Retire both
 			// labels before retrying so a previously published auto-merge label
 			// cannot keep queueing a pull request while the local evidence is stale.
-			cleanupErr := r.applyRoutingLabelPlan(ctx, report, routingLabelPlan{})
-			if cleanupErr != nil {
-				return fmt.Errorf("%w (remove stale routing labels: %v)", err, cleanupErr)
-			}
-			return err
+			return r.retireRoutingLabels(ctx, report, err)
 		}
 	}
 	// The final head (and, when applicable, merge-base) read must happen after
@@ -124,20 +123,20 @@ func (r *Runner) reconcileRoutingLabels(ctx context.Context, report Report, prev
 		var err error
 		currentHead, currentBase, err = r.github.GetPullRequestHeadAndBaseSHA(ctx, viewInput)
 		if err != nil {
-			return fmt.Errorf("revalidate head and diff-budget base before routing labels: %w", err)
+			return r.retireRoutingLabels(ctx, report, fmt.Errorf("revalidate head and diff-budget base before routing labels: %w", err))
 		}
 		if strings.TrimSpace(currentBase) != expectedBase {
-			return fmt.Errorf("skip routing labels because diff-budget base moved from %s to %s", expectedBase, strings.TrimSpace(currentBase))
+			return r.retireRoutingLabels(ctx, report, fmt.Errorf("skip routing labels because diff-budget base moved from %s to %s", expectedBase, strings.TrimSpace(currentBase)))
 		}
 	} else {
 		var err error
 		currentHead, err = r.github.GetPullRequestHeadSHA(ctx, viewInput)
 		if err != nil {
-			return fmt.Errorf("revalidate head before routing labels: %w", err)
+			return r.retireRoutingLabels(ctx, report, fmt.Errorf("revalidate head before routing labels: %w", err))
 		}
 	}
 	if strings.TrimSpace(currentHead) != expectedHead {
-		return fmt.Errorf("skip routing labels because pull request head moved from %s to %s", expectedHead, strings.TrimSpace(currentHead))
+		return r.retireRoutingLabels(ctx, report, fmt.Errorf("skip routing labels because pull request head moved from %s to %s", expectedHead, strings.TrimSpace(currentHead)))
 	}
 	return r.applyRoutingLabelPlan(ctx, report, plan)
 }
@@ -195,28 +194,39 @@ func (r *Runner) revalidateRoutingState(ctx context.Context, report Report, expe
 	if strings.TrimSpace(detail.HeadSHA) != expectedHead {
 		return fmt.Errorf("skip routing labels because pull request head moved from %s to %s", expectedHead, strings.TrimSpace(detail.HeadSHA))
 	}
-	// Reports produced by EvaluatePullRequest always carry PullRequestState;
-	// hand-built/legacy reports in storage may omit the full authority evidence,
-	// so retain their compatibility fallback while enforcing every field on
-	// current state-bound reports.
-	if state := strings.TrimSpace(report.Evidence.PullRequestState); state != "" {
-		if !strings.EqualFold(state, strings.TrimSpace(detail.State)) {
-			return fmt.Errorf("skip routing labels because pull request state changed from %s to %s", state, strings.TrimSpace(detail.State))
-		}
-		if report.Evidence.Draft != detail.IsDraft {
-			return fmt.Errorf("skip routing labels because draft state changed")
-		}
-		if strings.TrimSpace(report.Evidence.BaseRefName) != strings.TrimSpace(detail.BaseRefName) {
-			return fmt.Errorf("skip routing labels because base branch changed from %s to %s", report.Evidence.BaseRefName, strings.TrimSpace(detail.BaseRefName))
-		}
-		if !strings.EqualFold(strings.TrimSpace(report.Evidence.ReviewDecision), strings.TrimSpace(detail.ReviewDecision)) {
-			return fmt.Errorf("skip routing labels because review decision changed from %s to %s", report.Evidence.ReviewDecision, strings.TrimSpace(detail.ReviewDecision))
-		}
+	// Reports produced by EvaluatePullRequest always carry PullRequestState.
+	// A report without it cannot be bound to a verified pull-request state, and
+	// this routing path only runs for plans that would add a routing label
+	// (auto-merge or needs-human-review). Fail closed on the legacy fallback:
+	// an add plan must not project from evidence that never observed the
+	// pull-request state, because that is exactly the path where the authority
+	// read matters most.
+	state := strings.TrimSpace(report.Evidence.PullRequestState)
+	if state == "" {
+		return fmt.Errorf("skip routing labels because the report carries no pull-request state evidence")
+	}
+	if !strings.EqualFold(state, strings.TrimSpace(detail.State)) {
+		return fmt.Errorf("skip routing labels because pull request state changed from %s to %s", state, strings.TrimSpace(detail.State))
+	}
+	if report.Evidence.Draft != detail.IsDraft {
+		return fmt.Errorf("skip routing labels because draft state changed")
+	}
+	if strings.TrimSpace(report.Evidence.BaseRefName) != strings.TrimSpace(detail.BaseRefName) {
+		return fmt.Errorf("skip routing labels because base branch changed from %s to %s", report.Evidence.BaseRefName, strings.TrimSpace(detail.BaseRefName))
+	}
+	if !strings.EqualFold(strings.TrimSpace(report.Evidence.ReviewDecision), strings.TrimSpace(detail.ReviewDecision)) {
+		return fmt.Errorf("skip routing labels because review decision changed from %s to %s", report.Evidence.ReviewDecision, strings.TrimSpace(detail.ReviewDecision))
 	}
 	recordedHold := len(report.Evidence.HoldLabels) > 0
 	currentHold := labels.Has(detail.Labels, labels.HoldGlobal)
 	if recordedHold != currentHold {
 		return fmt.Errorf("skip routing labels because hold state changed")
+	}
+	// A do-not-merge veto applied between evaluation and projection must also
+	// fail closed: the veto is human authority that overrides auto trust, and
+	// the label state is not part of the final head read.
+	if report.Evidence.DoNotMergeVeto != labels.Has(detail.Labels, labels.DoNotMerge) {
+		return fmt.Errorf("skip routing labels because do-not-merge veto state changed")
 	}
 	if strings.TrimSpace(report.Evidence.BaseRefName) != "" {
 		currentPolicy := r.policyPermitsTarget(report.ProjectID, report.Repo, report.Evidence.BaseRefName)
@@ -225,6 +235,20 @@ func (r *Runner) revalidateRoutingState(ctx context.Context, report Report, expe
 		}
 	}
 	return nil
+}
+
+// retireRoutingLabels removes both routing labels before returning err. A
+// revalidation failure means the evidence the route was published on is no
+// longer current, and leaving auto-merge in place would let Mergify keep the
+// pull request queued on stale authority. Removal is fail-safe (it can never
+// authorize a merge); the next evaluation re-applies the route if the pull
+// request is eligible again.
+func (r *Runner) retireRoutingLabels(ctx context.Context, report Report, err error) error {
+	cleanupErr := r.applyRoutingLabelPlan(ctx, report, routingLabelPlan{})
+	if cleanupErr != nil {
+		return fmt.Errorf("%w (remove stale routing labels: %v)", err, cleanupErr)
+	}
+	return err
 }
 
 func (r *Runner) applyRoutingLabelPlan(ctx context.Context, report Report, plan routingLabelPlan) error {
@@ -271,7 +295,7 @@ func reportNeedsHumanReview(previous *Report, report Report) bool {
 	hasRepeatedReviewChanges := previous != nil && hasReasonCode(previous.Reasons, ReasonReviewChangesRequested) && hasReasonCode(report.Reasons, ReasonReviewChangesRequested)
 	for _, reason := range report.Reasons {
 		switch string(reason.Code) {
-		case protectedPathTouchedReason, diffBudgetExceededReason:
+		case protectedPathTouchedReason, string(ReasonDiffBudgetExceeded):
 			return true
 		}
 	}
