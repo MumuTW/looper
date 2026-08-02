@@ -782,7 +782,11 @@ func digestEntryMetadata(path string, kind EntryKind, expectedSize int64) (strin
 			_ = file.Close()
 			return "", 0, 0, err
 		}
-		if info.Size() != limit {
+		after, err := file.Stat()
+		if err != nil {
+			return "", 0, 0, err
+		}
+		if info.Size() != limit || after.Size() != info.Size() || sealedMode(after.Mode()) != sealedMode(info.Mode()) {
 			return "", 0, 0, fmt.Errorf("digest mismatch: file size changed while hashing")
 		}
 		return hex.EncodeToString(hash.Sum(nil)), sealedMode(info.Mode()), info.Size(), nil
