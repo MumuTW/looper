@@ -55,7 +55,7 @@ func (r *agentHealthRegistry) ensureConfiguredVendorsLocked(cfg config.Config) {
 	// Coordinator triage is daemon-owned and uses the global agent directly,
 	// even when every coding role overrides that vendor through a role/profile
 	// binding. It is therefore an active provider for spawn admission too.
-	if cfg.Agent.Vendor != nil && strings.TrimSpace(string(*cfg.Agent.Vendor)) != "" {
+	if cfg.Agent.Vendor != nil && strings.TrimSpace(string(*cfg.Agent.Vendor)) != "" && config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "coordinator") {
 		configured = true
 		vendor := string(*cfg.Agent.Vendor)
 		activeVendors[vendor] = struct{}{}

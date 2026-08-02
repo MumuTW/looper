@@ -139,6 +139,7 @@ func TestAgentHealthRegistersGlobalCoordinatorProvider(t *testing.T) {
 	next.Roles.Worker.Agent = roleAgent
 	next.Roles.Reviewer.Agent = roleAgent
 	next.Roles.Fixer.Agent = roleAgent
+	next.Roles.Coordinator.Enabled = true
 	rt.publishCatalogConsumers(next)
 
 	if err := rt.agentHealth.Allow(string(codex)); err != nil {
@@ -151,6 +152,33 @@ func TestAgentHealthRegistersGlobalCoordinatorProvider(t *testing.T) {
 		t.Fatalf("coordinator global-provider spawn = %v, want admitted", err)
 	}
 	lease.Release()
+}
+
+func TestAgentHealthExcludesDisabledCoordinatorProvider(t *testing.T) {
+	rt, _ := brownoutRuntime(t, func(cfg *config.AgentBrownoutConfig) {
+		cfg.MinFailures = 3
+	})
+	codex := config.AgentVendorCodex
+	claude := config.AgentVendorClaudeCode
+	next := rt.Config()
+	next.Agent.Vendor = &codex
+	roleAgent := &config.RoleAgentConfig{Vendor: &claude}
+	next.Roles.Planner.Agent = roleAgent
+	next.Roles.Worker.Agent = roleAgent
+	next.Roles.Reviewer.Agent = roleAgent
+	next.Roles.Fixer.Agent = roleAgent
+	next.Roles.Coordinator.Enabled = false
+	rt.publishCatalogConsumers(next)
+
+	for i := 0; i < 3; i++ {
+		rt.activeExecutions.ReportAgentOutcome(agent.Outcome{Vendor: string(claude), Status: "failed"})
+	}
+	if err := rt.agentHealth.AllowAny(); !errors.Is(err, brownout.ErrOpen) {
+		t.Fatalf("AllowAny() with disabled coordinator provider = %v, want open from Claude", err)
+	}
+	if err := rt.agentHealth.Allow(string(codex)); !errors.Is(err, brownout.ErrOpen) {
+		t.Fatalf("disabled coordinator provider admission = %v, want fail-closed", err)
+	}
 }
 
 func TestAgentBrownoutGateCoversClaimCriticalSection(t *testing.T) {
