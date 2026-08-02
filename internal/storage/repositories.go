@@ -3303,10 +3303,11 @@ func queueClaimTypePredicateWithSnapshotVendor(unrestrictedTypes, stickySnapshot
 }
 
 func stickySnapshotQueuePredicate(vendor string) string {
+	safeSnapshot := "CASE WHEN json_valid(latest.agent_snapshot_json) THEN latest.agent_snapshot_json ELSE '{}' END"
 	vendorFilter := ""
 	if strings.TrimSpace(vendor) != "" {
 		vendorFilter = `
-					AND trim(json_extract(latest.agent_snapshot_json, '$.vendor')) = ?`
+					AND trim(json_extract(` + safeSnapshot + `, '$.vendor')) = ?`
 	}
 	return `(qi.loop_id IS NOT NULL
 		AND EXISTS (
@@ -3321,7 +3322,8 @@ func stickySnapshotQueuePredicate(vendor string) string {
 			WHERE latest.status IN ('failed', 'interrupted')
 				AND latest.agent_snapshot_json IS NOT NULL
 				AND length(trim(latest.agent_snapshot_json)) > 0
-				AND length(trim(coalesce(json_extract(latest.agent_snapshot_json, '$.vendor'), ''))) > 0` + vendorFilter + `
+				AND json_valid(latest.agent_snapshot_json)
+				AND length(trim(coalesce(json_extract(` + safeSnapshot + `, '$.vendor'), ''))) > 0` + vendorFilter + `
 		))`
 }
 
@@ -3334,14 +3336,14 @@ func (r *QueueRepository) ListQueuedSnapshotVendors(ctx context.Context, types [
 		return []string{}, nil
 	}
 	placeholders, typeArgs := queueTypeInClause(types)
-	rows, err := r.q.QueryContext(ctx, `
-		SELECT DISTINCT trim(json_extract((
-			SELECT agent_snapshot_json
+	latestSnapshot := `(SELECT agent_snapshot_json
 			FROM runs
 			WHERE loop_id = qi.loop_id
-			ORDER BY `+latestRunOrder("runs")+`
-			LIMIT 1
-		), '$.vendor'))
+			ORDER BY ` + latestRunOrder("runs") + `
+			LIMIT 1)`
+	safeSnapshot := "CASE WHEN json_valid(" + latestSnapshot + ") THEN " + latestSnapshot + " ELSE '{}' END"
+	rows, err := r.q.QueryContext(ctx, `
+		SELECT DISTINCT trim(json_extract(`+safeSnapshot+`, '$.vendor'))
 		FROM queue_items qi
 		WHERE qi.status = 'queued'
 			AND qi.type IN (`+placeholders+`)
