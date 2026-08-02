@@ -858,9 +858,23 @@ func (r *Runtime) onAgentBrownoutTransition(vendor string, transition brownout.T
 			fmt.Sprintf("Looper stopped starting new %s work because its own %s agent runs keep failing. It will retry by itself in %s. Other healthy providers may continue; queued %s work resumes when recovery probes succeed.", provider, provider, transition.Cooldown.Round(time.Second), provider),
 			vendor+".open")
 	case brownout.StateClosed:
-		r.notifyAgentBrownout("action_required", fmt.Sprintf("Looper Resumed: %s", provider), fmt.Sprintf("a %s probe agent run succeeded", provider),
-			fmt.Sprintf("%s agent runs are working again. Looper has resumed starting %s work.", provider, provider), vendor+".closed")
+		title, subtitle, body, dedupeSuffix := agentBrownoutResumeMessage(provider, transition.Reason)
+		r.notifyAgentBrownout("action_required", title, subtitle, body, vendor+dedupeSuffix)
 	}
+}
+
+// agentBrownoutResumeMessage keeps operator overrides distinct from breaker
+// recovery. The transition reason is the brownout state machine's authority;
+// an operator disabling the policy is not evidence that a provider probe ran.
+func agentBrownoutResumeMessage(provider, reason string) (title, subtitle, body, dedupeSuffix string) {
+	if reason == "disabled_override" {
+		return fmt.Sprintf("Looper Resumed: %s (override)", provider),
+			fmt.Sprintf("%s brownout disabled by operator override", provider),
+			fmt.Sprintf("The %s agent brownout override was disabled by the operator. Looper resumed starting %s work; no recovery probe was observed.", provider, provider),
+			".disabled_override"
+	}
+	return fmt.Sprintf("Looper Resumed: %s", provider), fmt.Sprintf("a %s probe agent run succeeded", provider),
+		fmt.Sprintf("%s agent runs are working again. Looper has resumed starting %s work.", provider, provider), ".closed"
 }
 
 func (r *Runtime) notifyAgentBrownout(level, title, subtitle, body, dedupeSuffix string) {

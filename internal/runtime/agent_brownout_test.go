@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -574,6 +575,26 @@ func TestAgentBrownoutTransitionsAreLogged(t *testing.T) {
 
 	if !logger.sawWarn("agent brownout opened: work production suspended") {
 		t.Fatalf("no warning logged when work production stopped; logged: %v", logger.messages())
+	}
+}
+
+func TestAgentBrownoutResumeMessageDistinguishesDisabledOverride(t *testing.T) {
+	t.Parallel()
+
+	title, subtitle, body, dedupe := agentBrownoutResumeMessage("codex", "disabled_override")
+	if title != "Looper Resumed: codex (override)" || subtitle != "codex brownout disabled by operator override" {
+		t.Fatalf("override notice title/subtitle = %q / %q", title, subtitle)
+	}
+	if !strings.Contains(body, "operator") || !strings.Contains(body, "no recovery probe was observed") || strings.Contains(body, "probe agent run succeeded") {
+		t.Fatalf("override notice body = %q, want operator override without probe recovery claim", body)
+	}
+	if dedupe != ".disabled_override" {
+		t.Fatalf("override dedupe suffix = %q, want distinct transition", dedupe)
+	}
+
+	recoveryTitle, recoverySubtitle, recoveryBody, recoveryDedupe := agentBrownoutResumeMessage("codex", "probe_success")
+	if recoveryTitle != "Looper Resumed: codex" || recoverySubtitle != "a codex probe agent run succeeded" || !strings.Contains(recoveryBody, "working again") || recoveryDedupe != ".closed" {
+		t.Fatalf("recovery notice = %q / %q / %q / %q", recoveryTitle, recoverySubtitle, recoveryBody, recoveryDedupe)
 	}
 }
 
