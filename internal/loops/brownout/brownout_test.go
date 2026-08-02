@@ -576,7 +576,7 @@ func TestLoweringMaxCooldownShortensTheOpenDeadline(t *testing.T) {
 func TestLoweringProbeSuccessThresholdClosesCompletedHalfOpenRound(t *testing.T) {
 	cfg := testConfig()
 	cfg.ProbeSuccesses = 3
-	b, c, _ := newTestBreaker(t, cfg)
+	b, c, transitions := newTestBreaker(t, cfg)
 	b.Record(c.now(), false)
 	b.Record(c.now(), false)
 	b.Record(c.now(), false)
@@ -598,6 +598,9 @@ func TestLoweringProbeSuccessThresholdClosesCompletedHalfOpenRound(t *testing.T)
 	b.SetConfig(lowered)
 	if got := b.Snapshot().State; got != StateClosed {
 		t.Fatalf("state after lowering threshold = %s, want closed", got)
+	}
+	if len(*transitions) != 3 || (*transitions)[2].Reason != "probe_threshold_reduced" {
+		t.Fatalf("transitions after threshold reload = %+v, want explicit recovery transition", *transitions)
 	}
 	if probe, err := b.AllowAdmission(); err != nil || probe {
 		t.Fatalf("admission after reconciled reload = (%t, %v), want ordinary closed admission", probe, err)

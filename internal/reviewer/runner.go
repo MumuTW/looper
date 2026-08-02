@@ -2461,7 +2461,7 @@ func (r *Runner) classifyReviewThreads(ctx context.Context, input stepInput, che
 		Metadata:       map[string]any{"loopType": "reviewer", "phase": "thread_resolution", "repo": input.Repo, "prNumber": input.PRNumber},
 		IdempotencyKey: idempotencyKey,
 		UseSnapshot:    useSnap, SnapshotVendor: snapVendor, SnapshotModel: snapModel, SnapshotReasoningEffort: snapReasoningEffort,
-		CompletionContract: agent.CompletionContractRawJSON,
+		CompletionContract: agent.CompletionContractRawJSONEnvelope,
 	})
 	if err != nil {
 		return nil, err

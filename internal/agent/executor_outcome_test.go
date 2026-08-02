@@ -111,6 +111,16 @@ func TestReportOutcomeAcceptsRawJSONContract(t *testing.T) {
 	}
 }
 
+func TestReportOutcomeAcceptsRawJSONEnvelopeContract(t *testing.T) {
+	outcomes := make([]Outcome, 0, 1)
+	exec := outcomeExecution(&outcomes)
+	exec.input.CompletionContract = CompletionContractRawJSONEnvelope
+	exec.reportOutcome("completed", "missing", "", "classifier result:\n{\"decisions\":[]}\n")
+	if len(outcomes) != 1 || !outcomes[0].Succeeded {
+		t.Fatalf("raw JSON envelope outcome = %#v, want one successful outcome", outcomes)
+	}
+}
+
 func TestReportOutcomeRequiresFixerOutcomeContract(t *testing.T) {
 	outcomes := make([]Outcome, 0, 1)
 	exec := outcomeExecution(&outcomes)

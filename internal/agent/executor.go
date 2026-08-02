@@ -210,6 +210,21 @@ func validRawJSONObject(stdout string) bool {
 	return json.Unmarshal([]byte(message), &object) == nil && object != nil
 }
 
+// validRawJSONObjectEnvelope matches callers whose parser extracts the first
+// JSON object from otherwise harmless surrounding prose (for example reviewer
+// thread reconciliation). The caller still owns semantic schema validation;
+// this only keeps health accounting aligned with its accepted transport shape.
+func validRawJSONObjectEnvelope(stdout string) bool {
+	message := strings.TrimSpace(FinalMessage(stdout))
+	start := strings.Index(message, "{")
+	end := strings.LastIndex(message, "}")
+	if start < 0 || end < start {
+		return false
+	}
+	var object map[string]any
+	return json.Unmarshal([]byte(message[start:end+1]), &object) == nil && object != nil
+}
+
 // validMarkerOutcome rejects a marker that advertises an outcome outside the
 // shared completion contract. Generic workers still use the summary-only
 // marker, so an absent outcome remains valid; once an agent supplies the key,
@@ -336,9 +351,10 @@ type RunInput struct {
 type CompletionContract string
 
 const (
-	CompletionContractMarker      CompletionContract = "marker"
-	CompletionContractRawJSON     CompletionContract = "raw_json"
-	CompletionContractFixerMarker CompletionContract = "fixer_marker"
+	CompletionContractMarker          CompletionContract = "marker"
+	CompletionContractRawJSON         CompletionContract = "raw_json"
+	CompletionContractRawJSONEnvelope CompletionContract = "raw_json_envelope"
+	CompletionContractFixerMarker     CompletionContract = "fixer_marker"
 )
 
 // TimeoutObservation identifies the timeout that is about to terminate an
@@ -1394,6 +1410,8 @@ func (x *execution) reportOutcome(status, parseStatus, completionPayload, stdout
 	succeeded := status == "completed"
 	if x.input.CompletionContract == CompletionContractRawJSON {
 		succeeded = succeeded && validRawJSONObject(stdout)
+	} else if x.input.CompletionContract == CompletionContractRawJSONEnvelope {
+		succeeded = succeeded && validRawJSONObjectEnvelope(stdout)
 	} else if x.input.CompletionContract == CompletionContractFixerMarker {
 		succeeded = succeeded && parseStatus == "parsed" && validFixerMarkerOutcome(completionPayload)
 	} else {

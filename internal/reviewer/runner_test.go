@@ -9336,7 +9336,7 @@ func TestRunThreadResolutionStepIgnoresProviderWordsInSuccessfulSummaryJSON(t *t
 	if checkpoint.ThreadResolution == nil || checkpoint.ThreadResolution.Commented != 1 {
 		t.Fatalf("ThreadResolution = %#v, want one comment", checkpoint.ThreadResolution)
 	}
-	if len(agent.starts) != 1 || agent.starts[0].CompletionContract != agentpkg.CompletionContractRawJSON {
+	if len(agent.starts) != 1 || agent.starts[0].CompletionContract != agentpkg.CompletionContractRawJSONEnvelope {
 		t.Fatalf("agent starts = %#v, want raw JSON completion contract", agent.starts)
 	}
 	if len(github.addThreadReplyCalls) != 1 || !strings.Contains(github.addThreadReplyCalls[0].Body, "service unavailable") {

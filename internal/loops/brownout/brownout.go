@@ -316,6 +316,8 @@ func (b *Breaker) SetConfig(cfg Config) {
 		return
 	}
 	b.mu.Lock()
+	var transition Transition
+	changed := false
 	previous := b.cfg
 	b.cfg = cfg
 	if !cfg.Enabled {
@@ -372,9 +374,14 @@ func (b *Breaker) SetConfig(cfg Config) {
 			b.probeInFlight = 0
 			b.outcomes = nil
 			b.halfOpenAt = time.Time{}
+			transition = Transition{From: StateHalfOpen, To: StateClosed, Reason: "probe_threshold_reduced"}
+			changed = true
 		}
 	}
 	b.mu.Unlock()
+	if changed {
+		b.emit(transition)
+	}
 }
 
 // Snapshot reports the current posture.
