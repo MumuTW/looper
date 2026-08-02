@@ -1,6 +1,7 @@
 package projects
 
 import (
+	"encoding/json"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -367,9 +368,18 @@ func TestConfiguredProjectMetadataRoundTripsRuntimePolicy(t *testing.T) {
 		Roles:           &config.PartialRoleConfigs{},
 	}
 	repo := project.Repo
-	metadata, err := buildProjectMetadataJSON(nil, project, &repo)
+	existingMetadata := `{"network":{"mode":"routed"},"legacy":"preserve"}`
+	existing := storage.ProjectRecord{MetadataJSON: &existingMetadata}
+	metadata, err := buildProjectMetadataJSON(&existing, project, &repo)
 	if err != nil {
 		t.Fatalf("buildProjectMetadataJSON() error = %v", err)
+	}
+	var rebuilt map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(metadata), &rebuilt); err != nil {
+		t.Fatalf("rebuilt metadata is invalid JSON: %v", err)
+	}
+	if _, ok := rebuilt["network"]; ok {
+		t.Fatalf("rebuilt metadata = %s, want legacy network key removed", metadata)
 	}
 	global := config.Config{Providers: []config.ProviderConfig{{ID: "ghes-main", Kind: config.ProviderKindGitHub, BaseURL: "https://ghe.example.test"}}}
 	got, err := MaterializeCatalog(global, []storage.ProjectRecord{{
