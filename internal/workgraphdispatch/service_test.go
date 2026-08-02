@@ -2,6 +2,7 @@ package workgraphdispatch
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"path/filepath"
 	"reflect"
@@ -11,6 +12,35 @@ import (
 	"github.com/MumuTW/looper/internal/planner/workgraph"
 	"github.com/MumuTW/looper/internal/storage"
 )
+
+func TestCreateDefersRootDispatchUntilActivate(t *testing.T) {
+	t.Parallel()
+	fixture := newFixture(t)
+	graph := mustGraph(t,
+		workgraph.Node{Key: "storage", Goal: "Persist records", AcceptanceCriteria: []string{"migration"}, ExpectedPRScope: "storage"},
+	)
+	created, err := fixture.service.Create(fixture.ctx, CreateInput{ProjectID: fixture.projectID, ParentRepo: "acme/looper", ParentIssueNumber: 339, PlannerLoopID: fixture.plannerLoopID, BaseBranch: "main", Graph: graph})
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	if len(created.QueuedNodeKeys) != 0 {
+		t.Fatalf("Create().QueuedNodeKeys = %v, want none before activation", created.QueuedNodeKeys)
+	}
+	queued, err := fixture.repos.Queue.ListQueued(fixture.ctx, 10)
+	if err != nil {
+		t.Fatalf("ListQueued() error = %v", err)
+	}
+	if len(queued) != 0 {
+		t.Fatalf("queued before activate = %#v, want none", queued)
+	}
+	activated, err := fixture.service.Activate(fixture.ctx, created.GraphID)
+	if err != nil {
+		t.Fatalf("Activate() error = %v", err)
+	}
+	if got, want := activated, []string{"storage"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("Activate() = %v, want %v", got, want)
+	}
+}
 
 func TestCreateAndCompleteQueuesOnlyReadyNodesOnce(t *testing.T) {
 	t.Parallel()
@@ -23,8 +53,8 @@ func TestCreateAndCompleteQueuesOnlyReadyNodesOnce(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Create() error = %v", err)
 	}
-	if got, want := created.QueuedNodeKeys, []string{"storage"}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("Create().QueuedNodeKeys = %v, want %v", got, want)
+	if _, err := fixture.service.Activate(fixture.ctx, created.GraphID); err != nil {
+		t.Fatalf("Activate() error = %v", err)
 	}
 	nodes, err := fixture.repos.PlannerWorkGraphs.ListNodes(fixture.ctx, created.GraphID)
 	if err != nil {
@@ -81,6 +111,58 @@ func TestCreateAndCompleteQueuesOnlyReadyNodesOnce(t *testing.T) {
 	}
 }
 
+func TestCompleteWorkerNodePersistsAdoptedBranchForChildren(t *testing.T) {
+	t.Parallel()
+	fixture := newFixture(t)
+	graph := mustGraph(t,
+		workgraph.Node{Key: "storage", Goal: "Persist records", AcceptanceCriteria: []string{"migration"}, ExpectedPRScope: "storage"},
+		workgraph.Node{Key: "api", Goal: "Expose records", AcceptanceCriteria: []string{"route"}, ExpectedPRScope: "api", Dependencies: []string{"storage"}},
+	)
+	created, err := fixture.service.Create(fixture.ctx, CreateInput{ProjectID: fixture.projectID, ParentRepo: "acme/looper", ParentIssueNumber: 339, PlannerLoopID: fixture.plannerLoopID, BaseBranch: "main", Graph: graph})
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	if _, err := fixture.service.Activate(fixture.ctx, created.GraphID); err != nil {
+		t.Fatalf("Activate() error = %v", err)
+	}
+	nodes, _ := fixture.repos.PlannerWorkGraphs.ListNodes(fixture.ctx, created.GraphID)
+	storageNode := nodeByKey(t, nodes, "storage")
+	apiNode := nodeByKey(t, nodes, "api")
+	if claimed, err := fixture.service.ClaimWorkerNode(fixture.ctx, storageNode.WorkerLoopID); err != nil || !claimed {
+		t.Fatalf("ClaimWorkerNode() = (%t, %v)", claimed, err)
+	}
+	adoptedBranch := "agent/migrated-storage"
+	if _, err := completeNodeInTx(fixture, storageNode.WorkerLoopID, adoptedBranch); err != nil {
+		t.Fatalf("CompleteWorkerNodeInTransaction() error = %v", err)
+	}
+	nodes, _ = fixture.repos.PlannerWorkGraphs.ListNodes(fixture.ctx, created.GraphID)
+	storageNode = nodeByKey(t, nodes, "storage")
+	if storageNode.Branch != adoptedBranch {
+		t.Fatalf("storage branch = %q, want %q", storageNode.Branch, adoptedBranch)
+	}
+	items, err := fixture.repos.Queue.List(fixture.ctx)
+	if err != nil {
+		t.Fatalf("Queue.List() error = %v", err)
+	}
+	var apiQueue storage.QueueItemRecord
+	for _, item := range items {
+		if item.LoopID != nil && *item.LoopID == apiNode.WorkerLoopID {
+			apiQueue = item
+			break
+		}
+	}
+	if apiQueue.ID == "" {
+		t.Fatalf("api queue item not found")
+	}
+	payload := map[string]any{}
+	if apiQueue.PayloadJSON != nil {
+		_ = json.Unmarshal([]byte(*apiQueue.PayloadJSON), &payload)
+	}
+	if payload["baseBranch"] != adoptedBranch {
+		t.Fatalf("child baseBranch = %v, want adopted %q", payload["baseBranch"], adoptedBranch)
+	}
+}
+
 func TestCompleteWorkerNodeHonorsTerminatedChildLoop(t *testing.T) {
 	t.Parallel()
 	fixture := newFixture(t)
@@ -91,6 +173,9 @@ func TestCompleteWorkerNodeHonorsTerminatedChildLoop(t *testing.T) {
 	created, err := fixture.service.Create(fixture.ctx, CreateInput{ProjectID: fixture.projectID, ParentRepo: "acme/looper", ParentIssueNumber: 339, PlannerLoopID: fixture.plannerLoopID, BaseBranch: "main", Graph: graph})
 	if err != nil {
 		t.Fatalf("Create() error = %v", err)
+	}
+	if _, err := fixture.service.Activate(fixture.ctx, created.GraphID); err != nil {
+		t.Fatalf("Activate() error = %v", err)
 	}
 	nodes, _ := fixture.repos.PlannerWorkGraphs.ListNodes(fixture.ctx, created.GraphID)
 	storageNode := nodeByKey(t, nodes, "storage")
@@ -108,10 +193,14 @@ func TestCompleteWorkerNodeHonorsTerminatedChildLoop(t *testing.T) {
 	if claimed, err := fixture.service.ClaimWorkerNode(fixture.ctx, storageNode.WorkerLoopID); err != nil || !claimed {
 		t.Fatalf("ClaimWorkerNode() = (%t, %v)", claimed, err)
 	}
-	if _, err := fixture.service.CompleteWorkerNode(fixture.ctx, storageNode.WorkerLoopID); err != nil {
-		t.Fatalf("CompleteWorkerNode() error = %v", err)
+	if _, err := completeNodeInTx(fixture, storageNode.WorkerLoopID, "agent/adopted-storage"); err != nil {
+		t.Fatalf("CompleteWorkerNodeInTransaction() error = %v", err)
 	}
 	nodes, _ = fixture.repos.PlannerWorkGraphs.ListNodes(fixture.ctx, created.GraphID)
+	storageNode = nodeByKey(t, nodes, "storage")
+	if storageNode.Branch != "agent/adopted-storage" {
+		t.Fatalf("storage branch = %q, want adopted prerequisite branch persisted", storageNode.Branch)
+	}
 	apiNode = nodeByKey(t, nodes, "api")
 	if apiNode.State != "closed" {
 		t.Fatalf("terminated child node = %#v, want closed without queueing", apiNode)
@@ -127,6 +216,68 @@ func TestCompleteWorkerNodeHonorsTerminatedChildLoop(t *testing.T) {
 	}
 }
 
+func TestReclaimWorkerNodeAllowsRecoveryDelivery(t *testing.T) {
+	t.Parallel()
+	fixture := newFixture(t)
+	graph := mustGraph(t,
+		workgraph.Node{Key: "storage", Goal: "Persist records", AcceptanceCriteria: []string{"migration"}, ExpectedPRScope: "storage"},
+	)
+	created, err := fixture.service.Create(fixture.ctx, CreateInput{ProjectID: fixture.projectID, ParentRepo: "acme/looper", ParentIssueNumber: 339, PlannerLoopID: fixture.plannerLoopID, BaseBranch: "main", Graph: graph})
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	if _, err := fixture.service.Activate(fixture.ctx, created.GraphID); err != nil {
+		t.Fatalf("Activate() error = %v", err)
+	}
+	nodes, _ := fixture.repos.PlannerWorkGraphs.ListNodes(fixture.ctx, created.GraphID)
+	storageNode := nodeByKey(t, nodes, "storage")
+	if claimed, err := fixture.service.ClaimWorkerNode(fixture.ctx, storageNode.WorkerLoopID); err != nil || !claimed {
+		t.Fatalf("ClaimWorkerNode() = (%t, %v)", claimed, err)
+	}
+	reclaimed, err := fixture.service.ReclaimWorkerNode(fixture.ctx, storageNode.WorkerLoopID)
+	if err != nil || !reclaimed {
+		t.Fatalf("ReclaimWorkerNode() = (%t, %v), want recovery reclaim", reclaimed, err)
+	}
+}
+
+func TestCreateSupersedesReplanRequiredGraph(t *testing.T) {
+	t.Parallel()
+	fixture := newFixture(t)
+	firstGraph := mustGraph(t,
+		workgraph.Node{Key: "storage", Goal: "Old plan", AcceptanceCriteria: []string{"migration"}, ExpectedPRScope: "storage"},
+	)
+	created, err := fixture.service.Create(fixture.ctx, CreateInput{ProjectID: fixture.projectID, ParentRepo: "acme/looper", ParentIssueNumber: 339, PlannerLoopID: fixture.plannerLoopID, BaseBranch: "main", Graph: firstGraph})
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	if err := fixture.repos.PlannerWorkGraphs.UpdateStatus(fixture.ctx, created.GraphID, "replan_required", stringPointer("validation failed"), "2026-07-31T08:00:00.000Z"); err != nil {
+		t.Fatalf("UpdateStatus() error = %v", err)
+	}
+	replacement := mustGraph(t,
+		workgraph.Node{Key: "api", Goal: "Replacement plan", AcceptanceCriteria: []string{"route"}, ExpectedPRScope: "api"},
+	)
+	replaced, err := fixture.service.Create(fixture.ctx, CreateInput{ProjectID: fixture.projectID, ParentRepo: "acme/looper", ParentIssueNumber: 339, PlannerLoopID: fixture.plannerLoopID, BaseBranch: "main", Graph: replacement})
+	if err != nil {
+		t.Fatalf("Create(replan) error = %v", err)
+	}
+	if replaced.Existing {
+		t.Fatalf("Create(replan) = Existing, want replacement graph")
+	}
+	if replaced.GraphID == created.GraphID {
+		t.Fatalf("Create(replan) reused graph id %q", replaced.GraphID)
+	}
+	nodes, err := fixture.repos.PlannerWorkGraphs.ListNodes(fixture.ctx, replaced.GraphID)
+	if err != nil {
+		t.Fatalf("ListNodes() error = %v", err)
+	}
+	if len(nodes) != 1 || nodes[0].NodeKey != "api" {
+		t.Fatalf("replacement nodes = %#v, want single api node", nodes)
+	}
+	if old, _ := fixture.repos.PlannerWorkGraphs.GetByID(fixture.ctx, created.GraphID); old != nil {
+		t.Fatalf("superseded graph still present: %#v", old)
+	}
+}
+
 func TestFailedNodeBlocksChildAndQueuesPlannerReplan(t *testing.T) {
 	t.Parallel()
 	fixture := newFixture(t)
@@ -137,6 +288,9 @@ func TestFailedNodeBlocksChildAndQueuesPlannerReplan(t *testing.T) {
 	created, err := fixture.service.Create(fixture.ctx, CreateInput{ProjectID: fixture.projectID, ParentRepo: "acme/looper", ParentIssueNumber: 339, PlannerLoopID: fixture.plannerLoopID, BaseBranch: "main", Graph: graph})
 	if err != nil {
 		t.Fatalf("Create() error = %v", err)
+	}
+	if _, err := fixture.service.Activate(fixture.ctx, created.GraphID); err != nil {
+		t.Fatalf("Activate() error = %v", err)
 	}
 	nodes, _ := fixture.repos.PlannerWorkGraphs.ListNodes(fixture.ctx, created.GraphID)
 	storageNode := nodeByKey(t, nodes, "storage")
@@ -159,13 +313,30 @@ func TestFailedNodeBlocksChildAndQueuesPlannerReplan(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListQueued() error = %v", err)
 	}
-	if len(queued) != 2 || queued[0].Type != "planner" && queued[1].Type != "planner" {
-		t.Fatalf("queued = %#v, want root worker plus planner replan", queued)
+	plannerQueued := 0
+	for _, item := range queued {
+		if item.Type == "planner" {
+			plannerQueued++
+		}
+	}
+	if plannerQueued != 1 {
+		t.Fatalf("queued = %#v, want exactly one planner replan", queued)
+	}
+	var replanPayload map[string]any
+	for _, item := range queued {
+		if item.Type != "planner" || item.PayloadJSON == nil {
+			continue
+		}
+		_ = json.Unmarshal([]byte(*item.PayloadJSON), &replanPayload)
+	}
+	if replanPayload["failedNodeKey"] != "storage" {
+		t.Fatalf("replan payload = %#v, want failedNodeKey storage", replanPayload)
 	}
 }
 
 type fixture struct {
 	ctx           context.Context
+	db            *sql.DB
 	repos         *storage.Repositories
 	service       *Service
 	projectID     string
@@ -200,7 +371,7 @@ func newFixture(t *testing.T) fixture {
 	if err := repos.Loops.Upsert(ctx, storage.LoopRecord{ID: loopID, Seq: seq, ProjectID: projectID, Type: "planner", TargetType: "issue", TargetID: &target, Repo: &repo, Status: "completed", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Upsert planner loop: %v", err)
 	}
-	return fixture{ctx: ctx, repos: repos, service: New(Options{DB: db, Repositories: repos, Now: func() time.Time { return now }}), projectID: projectID, plannerLoopID: loopID}
+	return fixture{ctx: ctx, db: db, repos: repos, service: New(Options{DB: db, Repositories: repos, Now: func() time.Time { return now }}), projectID: projectID, plannerLoopID: loopID}
 }
 
 func mustGraph(t *testing.T, nodes ...workgraph.Node) workgraph.Graph {
@@ -233,4 +404,15 @@ func countQueueItemsForLoop(items []storage.QueueItemRecord, loopID string) int 
 		}
 	}
 	return count
+}
+
+func completeNodeInTx(fixture fixture, workerLoopID, completedBranch string) ([]string, error) {
+	var queued []string
+	err := storage.WithTransaction(fixture.ctx, fixture.db, nil, func(tx *sql.Tx) error {
+		repos := storage.NewRepositories(tx)
+		var err error
+		queued, err = fixture.service.CompleteWorkerNodeInTransaction(fixture.ctx, repos, workerLoopID, completedBranch)
+		return err
+	})
+	return queued, err
 }

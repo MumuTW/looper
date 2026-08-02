@@ -8,6 +8,19 @@ import (
 	"github.com/MumuTW/looper/internal/storage"
 )
 
+func TestMergePlannerFailureContextIncludesReplanReason(t *testing.T) {
+	got := mergePlannerFailureContext("prior context", map[string]any{
+		"replanReason":  "validation failed",
+		"workGraphID":   "workgraph_1",
+		"failedNodeKey": "storage",
+	})
+	for _, want := range []string{"prior context", "Work graph replan context", "validation failed", "workgraph_1", "Failed node: storage"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("mergePlannerFailureContext() missing %q:\n%s", want, got)
+		}
+	}
+}
+
 func TestBuildPlannerPromptIncludesPriorFixerFailureContext(t *testing.T) {
 	prompt, _ := buildPlannerPrompt(
 		storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()},

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -833,8 +834,15 @@ func TestRunWriteSpecStepPersistsStructuredWorkGraphAndQueuesOnlyRoot(t *testing
 	if err != nil {
 		t.Fatalf("ListNodes() error = %v", err)
 	}
-	if len(nodes) != 2 || nodeState(nodes, "storage") != "queued" || nodeState(nodes, "api") != "pending" {
-		t.Fatalf("nodes = %#v, want only root queued", nodes)
+	if len(nodes) != 2 || nodeState(nodes, "storage") != "pending" || nodeState(nodes, "api") != "pending" {
+		t.Fatalf("nodes = %#v, want both pending before planner publish activates the graph", nodes)
+	}
+	queued, err := runner.workGraphs.Activate(context.Background(), checkpoint.WriteSpec.WorkGraphID)
+	if err != nil {
+		t.Fatalf("Activate() error = %v", err)
+	}
+	if got, want := queued, []string{"storage"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("Activate() = %v, want %v", got, want)
 	}
 }
 

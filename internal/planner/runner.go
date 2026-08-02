@@ -1095,7 +1095,7 @@ func (r *Runner) runDiscoverIssueStep(ctx context.Context, input stepInput) (pla
 		return input.Checkpoint, err
 	}
 	currentLogin := firstNonEmpty(normalizeLogin(stringFromAnyDefault(payload["currentUserLogin"])), input.CheckpointIssueLogin())
-	failureContext := stringFromAnyDefault(payload["failureContext"])
+	failureContext := mergePlannerFailureContext(stringFromAnyDefault(payload["failureContext"]), payload)
 	lockKey := firstNonEmpty(derefString(input.QueueItem.LockKey), storage.IssueLockKey(input.Project.ID, repo, issueNumber))
 	nowISO := r.nowISO()
 	reason := "planner-run"
@@ -1534,7 +1534,31 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (plannerCh
 		}
 	}
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
+	if checkpoint.WriteSpec != nil && strings.TrimSpace(checkpoint.WriteSpec.WorkGraphID) != "" {
+		if _, err := r.workGraphs.Activate(ctx, checkpoint.WriteSpec.WorkGraphID); err != nil {
+			return checkpoint, &runpipe.LoopError{Message: "activate planner work graph: " + err.Error(), Kind: runpipe.FailureRetryableAfterResume}
+		}
+	}
 	return checkpoint, nil
+}
+
+func mergePlannerFailureContext(existing string, payload map[string]any) string {
+	replanReason := strings.TrimSpace(stringFromAnyDefault(payload["replanReason"]))
+	if replanReason == "" {
+		return existing
+	}
+	parts := []string{"Work graph replan context:", "- Reason: " + replanReason}
+	if graphID := strings.TrimSpace(stringFromAnyDefault(payload["workGraphID"])); graphID != "" {
+		parts = append(parts, "- Graph: "+graphID)
+	}
+	if nodeKey := strings.TrimSpace(stringFromAnyDefault(payload["failedNodeKey"])); nodeKey != "" {
+		parts = append(parts, "- Failed node: "+nodeKey)
+	}
+	replanContext := strings.Join(parts, "\n")
+	if strings.TrimSpace(existing) == "" {
+		return replanContext
+	}
+	return existing + "\n\n" + replanContext
 }
 
 func (r *Runner) plannerHoldSummary(ctx context.Context, project storage.ProjectRecord, queueItem storage.QueueItemRecord, loop storage.LoopRecord) (bool, string, error) {

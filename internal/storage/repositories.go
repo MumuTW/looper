@@ -918,6 +918,25 @@ func (r *PlannerWorkGraphsRepository) UpdateStatus(ctx context.Context, graphID,
 	return nil
 }
 
+func (r *PlannerWorkGraphsRepository) DeleteByID(ctx context.Context, graphID string) error {
+	_, err := r.q.ExecContext(ctx, `DELETE FROM planner_work_graphs WHERE id = ?`, graphID)
+	if err != nil {
+		return fmt.Errorf("delete planner work graph: %w", err)
+	}
+	return nil
+}
+
+func (r *PlannerWorkGraphsRepository) UpdateNodeBranch(ctx context.Context, graphID, nodeKey, branch, updatedAt string) error {
+	_, err := r.q.ExecContext(ctx, `
+		UPDATE planner_work_graph_nodes SET branch = ?, updated_at = ?
+		WHERE graph_id = ? AND node_key = ?
+	`, branch, updatedAt, graphID, nodeKey)
+	if err != nil {
+		return fmt.Errorf("update planner work graph node branch: %w", err)
+	}
+	return nil
+}
+
 func (r *PlannerWorkGraphsRepository) CreateNode(ctx context.Context, record PlannerWorkGraphNodeRecord) error {
 	_, err := r.q.ExecContext(ctx, `
 		INSERT INTO planner_work_graph_nodes (

@@ -57,11 +57,13 @@ type CreateResult struct {
 	GraphID        string
 	QueuedNodeKeys []string
 	Existing       bool
+	Activated      bool
 }
 
-// Create persists a validated graph and materializes its root nodes as normal
-// Worker queues in one transaction. A Planner replay returns the graph already
-// bound to its loop rather than emitting duplicate Worker loops.
+// Create persists a validated graph and its worker loops without dispatching
+// roots. Call Activate after the owning Planner run reaches its publish
+// boundary. A Planner replay returns the graph already bound to its loop;
+// graphs marked replan_required are superseded before a replacement is stored.
 func (s *Service) Create(ctx context.Context, input CreateInput) (CreateResult, error) {
 	if s.db == nil || s.repos == nil {
 		return CreateResult{}, fmt.Errorf("work graph storage is not configured")
@@ -81,8 +83,13 @@ func (s *Service) Create(ctx context.Context, input CreateInput) (CreateResult, 
 			return err
 		}
 		if existing != nil {
-			result = CreateResult{GraphID: existing.ID, Existing: true}
-			return nil
+			if existing.Status != "replan_required" {
+				result = CreateResult{GraphID: existing.ID, Existing: true}
+				return nil
+			}
+			if err := s.retireGraph(ctx, repos, existing.ID, s.nowISO()); err != nil {
+				return err
+			}
 		}
 		nowISO := s.nowISO()
 		graphID := eventlog.NewEventID("workgraph")
@@ -98,14 +105,15 @@ func (s *Service) Create(ctx context.Context, input CreateInput) (CreateResult, 
 		}
 		for _, node := range nodes {
 			baseBranch := input.BaseBranch
-			state := "queued"
-			loopStatus := "queued"
+			state := "pending"
+			loopStatus := "paused"
 			var blockedReason *string
 			if len(node.Dependencies) == 1 {
 				baseBranch = branches[node.Dependencies[0]]
-				state = "pending"
-				loopStatus = "paused"
 				reason := "blocked by " + node.Dependencies[0]
+				blockedReason = &reason
+			} else {
+				reason := "awaiting planner publish"
 				blockedReason = &reason
 			}
 			criteria, err := json.Marshal(node.AcceptanceCriteria)
@@ -123,20 +131,11 @@ func (s *Service) Create(ctx context.Context, input CreateInput) (CreateResult, 
 			}
 			targetID := "project:" + input.ProjectID
 			loop := storage.LoopRecord{ID: loopIDs[node.Key], Seq: seq, ProjectID: input.ProjectID, Type: "worker", TargetType: "project", TargetID: &targetID, Repo: &input.ParentRepo, Status: loopStatus, MetadataJSON: stringPtr(string(metadata)), CreatedAt: nowISO, UpdatedAt: nowISO}
-			if loopStatus == "queued" {
-				loop.NextRunAt = &nowISO
-			}
 			if err := repos.Loops.Upsert(ctx, loop); err != nil {
 				return err
 			}
 			if err := repos.PlannerWorkGraphs.CreateNode(ctx, storage.PlannerWorkGraphNodeRecord{GraphID: graphID, NodeKey: node.Key, Goal: node.Goal, AcceptanceCriteriaJSON: string(criteria), ExpectedPRScope: node.ExpectedPRScope, WorkerLoopID: loop.ID, Branch: branches[node.Key], State: state, BlockedReason: blockedReason, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 				return err
-			}
-			if state == "queued" {
-				if err := enqueueNode(ctx, repos, input.ProjectID, input.ParentRepo, graphID, node.Key, loop.ID, targetID, workerPayload, s.retryMaxAttempts, nowISO); err != nil {
-					return err
-				}
-				result.QueuedNodeKeys = append(result.QueuedNodeKeys, node.Key)
 			}
 		}
 		// Insert dependency edges only after every referenced node exists. SQLite
@@ -161,6 +160,94 @@ func (s *Service) Create(ctx context.Context, input CreateInput) (CreateResult, 
 	return result, nil
 }
 
+// Activate queues dependency-ready root nodes after the owning Planner run has
+// reached its publish boundary. Replays are idempotent.
+func (s *Service) Activate(ctx context.Context, graphID string) ([]string, error) {
+	if s.db == nil || strings.TrimSpace(graphID) == "" {
+		return nil, nil
+	}
+	queued := []string{}
+	err := storage.WithTransaction(ctx, s.db, nil, func(tx *sql.Tx) error {
+		var err error
+		queued, err = s.activateGraph(ctx, storage.NewRepositories(tx), graphID)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	if len(queued) > 0 && s.onEnqueued != nil {
+		s.onEnqueued()
+	}
+	return queued, nil
+}
+
+func (s *Service) activateGraph(ctx context.Context, repos *storage.Repositories, graphID string) ([]string, error) {
+	graph, err := repos.PlannerWorkGraphs.GetByID(ctx, graphID)
+	if err != nil || graph == nil {
+		if err != nil {
+			return nil, err
+		}
+		return nil, fmt.Errorf("work graph not found: %s", graphID)
+	}
+	if graph.Status != "active" {
+		return nil, fmt.Errorf("work graph %s is %s and cannot be activated", graphID, graph.Status)
+	}
+	nodes, err := repos.PlannerWorkGraphs.ListNodes(ctx, graphID)
+	if err != nil {
+		return nil, err
+	}
+	queued := []string{}
+	for _, node := range nodes {
+		if node.State != "pending" {
+			continue
+		}
+		deps, err := repos.PlannerWorkGraphs.ListDependencies(ctx, node.GraphID, node.NodeKey)
+		if err != nil {
+			return nil, err
+		}
+		if len(deps) > 0 {
+			continue
+		}
+		if added, err := s.queuePendingNode(ctx, repos, graph, node); err != nil {
+			return nil, err
+		} else if added {
+			queued = append(queued, node.NodeKey)
+		}
+	}
+	return queued, nil
+}
+
+func (s *Service) retireGraph(ctx context.Context, repos *storage.Repositories, graphID, nowISO string) error {
+	nodes, err := repos.PlannerWorkGraphs.ListNodes(ctx, graphID)
+	if err != nil {
+		return err
+	}
+	reason := "work graph superseded"
+	for _, node := range nodes {
+		if _, err := repos.Queue.CancelByLoop(ctx, node.WorkerLoopID, nowISO, &reason); err != nil {
+			return err
+		}
+		loop, err := repos.Loops.GetByID(ctx, node.WorkerLoopID)
+		if err != nil {
+			return err
+		}
+		if loop == nil {
+			continue
+		}
+		switch loop.Status {
+		case "completed", "terminated":
+			continue
+		}
+		loop.Status = "terminated"
+		loop.NextRunAt = nil
+		loop.UpdatedAt = nowISO
+		if err := repos.Loops.Upsert(ctx, *loop); err != nil {
+			return err
+		}
+	}
+	return repos.PlannerWorkGraphs.DeleteByID(ctx, graphID)
+}
+
 // ClaimWorkerNode is the graph's second, shared claim fence. Queue claiming
 // selects one row atomically; this transition prevents a duplicate or stale
 // queue delivery from executing the same graph node again.
@@ -179,6 +266,25 @@ func (s *Service) ClaimWorkerNode(ctx context.Context, workerLoopID string) (boo
 		return err
 	})
 	return claimed, err
+}
+
+// ReclaimWorkerNode allows a recovered queue delivery to resume a graph node
+// whose queue was requeued while the node remained running.
+func (s *Service) ReclaimWorkerNode(ctx context.Context, workerLoopID string) (bool, error) {
+	if s.db == nil || strings.TrimSpace(workerLoopID) == "" {
+		return false, nil
+	}
+	reclaimed := false
+	err := storage.WithTransaction(ctx, s.db, nil, func(tx *sql.Tx) error {
+		repos := storage.NewRepositories(tx)
+		node, err := repos.PlannerWorkGraphs.GetNodeByWorkerLoopID(ctx, workerLoopID)
+		if err != nil || node == nil {
+			return err
+		}
+		reclaimed = node.State == "running"
+		return nil
+	})
+	return reclaimed, err
 }
 
 // ReleaseWorkerNode makes the same logical node available for a normal queue
@@ -220,7 +326,7 @@ func (s *Service) CompleteWorkerNode(ctx context.Context, workerLoopID string) (
 	queued := []string{}
 	err := storage.WithTransaction(ctx, s.db, nil, func(tx *sql.Tx) error {
 		var err error
-		queued, err = s.completeWorkerNode(ctx, storage.NewRepositories(tx), workerLoopID)
+		queued, err = s.completeWorkerNode(ctx, storage.NewRepositories(tx), workerLoopID, "")
 		return err
 	})
 	if err != nil {
@@ -234,12 +340,13 @@ func (s *Service) CompleteWorkerNode(ctx context.Context, workerLoopID string) (
 
 // CompleteWorkerNodeInTransaction is the storage callback counterpart of
 // CompleteWorkerNode. Its caller owns the surrounding transaction and must
-// wake the scheduler only after that transaction commits.
-func (s *Service) CompleteWorkerNodeInTransaction(ctx context.Context, repos *storage.Repositories, workerLoopID string) ([]string, error) {
+// wake the scheduler only after that transaction commits. completedBranch, when
+// non-empty, records the prerequisite branch children should stack on.
+func (s *Service) CompleteWorkerNodeInTransaction(ctx context.Context, repos *storage.Repositories, workerLoopID, completedBranch string) ([]string, error) {
 	if repos == nil || strings.TrimSpace(workerLoopID) == "" {
 		return nil, nil
 	}
-	return s.completeWorkerNode(ctx, repos, workerLoopID)
+	return s.completeWorkerNode(ctx, repos, workerLoopID, completedBranch)
 }
 
 func (s *Service) Wake() {
@@ -248,11 +355,17 @@ func (s *Service) Wake() {
 	}
 }
 
-func (s *Service) completeWorkerNode(ctx context.Context, repos *storage.Repositories, workerLoopID string) ([]string, error) {
+func (s *Service) completeWorkerNode(ctx context.Context, repos *storage.Repositories, workerLoopID, completedBranch string) ([]string, error) {
 	queued := []string{}
 	node, err := repos.PlannerWorkGraphs.GetNodeByWorkerLoopID(ctx, workerLoopID)
 	if err != nil || node == nil {
 		return nil, err
+	}
+	if completedBranch = strings.TrimSpace(completedBranch); completedBranch != "" && !strings.EqualFold(completedBranch, node.Branch) {
+		if err := repos.PlannerWorkGraphs.UpdateNodeBranch(ctx, node.GraphID, node.NodeKey, completedBranch, s.nowISO()); err != nil {
+			return nil, err
+		}
+		node.Branch = completedBranch
 	}
 	if node.State == "completed" {
 		return queued, nil
@@ -264,6 +377,7 @@ func (s *Service) completeWorkerNode(ctx context.Context, repos *storage.Reposit
 	if !changed {
 		return queued, nil
 	}
+	node.State = "completed"
 	graph, err := repos.PlannerWorkGraphs.GetByID(ctx, node.GraphID)
 	if err != nil || graph == nil {
 		if err != nil {
@@ -279,6 +393,7 @@ func (s *Service) completeWorkerNode(ctx context.Context, repos *storage.Reposit
 	for _, candidate := range nodes {
 		byKey[candidate.NodeKey] = candidate
 	}
+	byKey[node.NodeKey] = *node
 	for _, candidate := range nodes {
 		if candidate.State != "pending" {
 			continue
@@ -290,6 +405,7 @@ func (s *Service) completeWorkerNode(ctx context.Context, repos *storage.Reposit
 		if len(deps) != 1 || deps[0] != node.NodeKey || byKey[deps[0]].State != "completed" {
 			continue
 		}
+		prereq := byKey[deps[0]]
 		loop, err := repos.Loops.GetByID(ctx, candidate.WorkerLoopID)
 		if err != nil || loop == nil {
 			if err != nil {
@@ -317,6 +433,7 @@ func (s *Service) completeWorkerNode(ctx context.Context, repos *storage.Reposit
 			return nil, err
 		}
 		payload := parseWorkerPayload(loop.MetadataJSON)
+		payload["baseBranch"] = prereq.Branch
 		targetID := "project:" + graph.ProjectID
 		if err := enqueueNode(ctx, repos, graph.ProjectID, graph.ParentRepo, graph.ID, candidate.NodeKey, candidate.WorkerLoopID, targetID, payload, s.retryMaxAttempts, nowISO); err != nil {
 			return nil, err
@@ -422,7 +539,7 @@ func (s *Service) failWorkerNode(ctx context.Context, repos *storage.Repositorie
 	if err := repos.Loops.Upsert(ctx, *plannerLoop); err != nil {
 		return false, err
 	}
-	payload, _ := json.Marshal(map[string]any{"issueNumber": graph.ParentIssueNumber, "replanReason": reason, "workGraphID": graph.ID})
+	payload, _ := json.Marshal(map[string]any{"issueNumber": graph.ParentIssueNumber, "replanReason": reason, "workGraphID": graph.ID, "failedNodeKey": node.NodeKey})
 	targetID := fmt.Sprintf("issue:%s:%d", graph.ParentRepo, graph.ParentIssueNumber)
 	lockKey := storage.IssueLockKey(graph.ProjectID, graph.ParentRepo, graph.ParentIssueNumber)
 	queue := storage.QueueItemRecord{ID: eventlog.NewEventID("queue"), ProjectID: &graph.ProjectID, LoopID: &graph.PlannerLoopID, Type: "planner", TargetType: "issue", TargetID: targetID, Repo: &graph.ParentRepo, DedupeKey: "planner:workgraph-replan:" + graph.ID, Priority: storage.QueuePriorityPlanner, Status: "queued", AvailableAt: nowISO, MaxAttempts: s.retryMaxAttempts, LockKey: &lockKey, PayloadJSON: stringPtr(string(payload)), CreatedAt: nowISO, UpdatedAt: nowISO}
@@ -440,6 +557,39 @@ func enqueueNode(ctx context.Context, repos *storage.Repositories, projectID, re
 	lockKey := "workgraph:" + graphID + ":" + nodeKey
 	queue := storage.QueueItemRecord{ID: eventlog.NewEventID("queue"), ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: targetID, Repo: &repo, DedupeKey: "workgraph:" + graphID + ":" + nodeKey, Priority: storage.QueuePriorityWorker, Status: "queued", AvailableAt: nowISO, MaxAttempts: maxAttempts, LockKey: &lockKey, PayloadJSON: stringPtr(string(encoded)), CreatedAt: nowISO, UpdatedAt: nowISO}
 	return repos.Queue.Upsert(ctx, queue)
+}
+
+func (s *Service) queuePendingNode(ctx context.Context, repos *storage.Repositories, graph *storage.PlannerWorkGraphRecord, node storage.PlannerWorkGraphNodeRecord) (bool, error) {
+	if node.State != "pending" {
+		return false, nil
+	}
+	loop, err := repos.Loops.GetByID(ctx, node.WorkerLoopID)
+	if err != nil || loop == nil {
+		if err != nil {
+			return false, err
+		}
+		return false, fmt.Errorf("worker loop not found: %s", node.WorkerLoopID)
+	}
+	if loop.Status == "terminated" {
+		nowISO := s.nowISO()
+		_, err := repos.PlannerWorkGraphs.TransitionNode(ctx, node.GraphID, node.NodeKey, "pending", "closed", stringPtr("worker loop terminated"), nowISO)
+		return false, err
+	}
+	nowISO := s.nowISO()
+	changed, err := repos.PlannerWorkGraphs.TransitionNode(ctx, node.GraphID, node.NodeKey, "pending", "queued", nil, nowISO)
+	if err != nil || !changed {
+		return false, err
+	}
+	loop.Status, loop.NextRunAt, loop.UpdatedAt = "queued", &nowISO, nowISO
+	if err := repos.Loops.Upsert(ctx, *loop); err != nil {
+		return false, err
+	}
+	payload := parseWorkerPayload(loop.MetadataJSON)
+	targetID := "project:" + graph.ProjectID
+	if err := enqueueNode(ctx, repos, graph.ProjectID, graph.ParentRepo, graph.ID, node.NodeKey, node.WorkerLoopID, targetID, payload, s.retryMaxAttempts, nowISO); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func workerPayload(graphID string, node workgraph.Node, repo, baseBranch, branch string) map[string]any {

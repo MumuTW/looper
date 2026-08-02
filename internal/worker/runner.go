@@ -1532,7 +1532,13 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			return runpipe.ProcessResult{}, err
 		}
 		if !claimed {
-			return r.finishDuplicateGraphQueueItem(ctx, *loop, queueItem)
+			reclaimed, err := r.workGraphs.ReclaimWorkerNode(ctx, loop.ID)
+			if err != nil {
+				return runpipe.ProcessResult{}, err
+			}
+			if !reclaimed {
+				return r.finishDuplicateGraphQueueItem(ctx, *loop, queueItem)
+			}
 		}
 	}
 	if err := r.revalidateRoutedWorkerClaim(ctx, *project, *loop, queueItem); err != nil {
@@ -3357,7 +3363,7 @@ func (r *Runner) finalizeSuccessfulClaim(ctx context.Context, run storage.RunRec
 	unlocked := false
 	finalizeInput := storage.WorkerSuccessFinalizationInput{Run: completed, QueueItemID: queueItem.ID, LoopID: loop.ID, LoopStatus: "completed", FinishedAt: finishedAt, RequeueForHumanInbox: requeueForHumanInbox}
 	if checkpoint.SkipReason == "" {
-		finalizeInput.AfterFinalize = r.workGraphFinalizationHook(loop.ID, &unlocked)
+		finalizeInput.AfterFinalize = r.workGraphFinalizationHook(loop.ID, checkpoint, &unlocked)
 	} else if graphQueueItem(queueItem) {
 		if err := r.workGraphs.SettleSkippedWorkerNode(ctx, loop.ID, checkpoint.SkipReason); err != nil {
 			return storage.RunRecord{}, err
@@ -3372,14 +3378,29 @@ func (r *Runner) finalizeSuccessfulClaim(ctx context.Context, run storage.RunRec
 	return completed, nil
 }
 
-func (r *Runner) workGraphFinalizationHook(loopID string, unlocked *bool) func(context.Context, *storage.Repositories) error {
+func (r *Runner) workGraphFinalizationHook(loopID string, checkpoint workerCheckpoint, unlocked *bool) func(context.Context, *storage.Repositories) error {
 	return func(ctx context.Context, repos *storage.Repositories) error {
-		queued, err := r.workGraphs.CompleteWorkerNodeInTransaction(ctx, repos, loopID)
+		queued, err := r.workGraphs.CompleteWorkerNodeInTransaction(ctx, repos, loopID, graphWorkerCompletedBranch(checkpoint))
 		if err == nil && unlocked != nil && len(queued) > 0 {
 			*unlocked = true
 		}
 		return err
 	}
+}
+
+func graphWorkerCompletedBranch(checkpoint workerCheckpoint) string {
+	if checkpoint.Lifecycle != nil {
+		if branch := firstNonEmpty(checkpoint.Lifecycle.ActiveBranch, checkpoint.Lifecycle.AgentBranch, checkpoint.Lifecycle.Branch); branch != "" {
+			return branch
+		}
+	}
+	if checkpoint.Work != nil && strings.TrimSpace(checkpoint.Work.Branch) != "" {
+		return checkpoint.Work.Branch
+	}
+	if checkpoint.Worktree != nil && strings.TrimSpace(checkpoint.Worktree.Branch) != "" {
+		return checkpoint.Worktree.Branch
+	}
+	return ""
 }
 
 func (r *Runner) finalizePriorSuccessfulClaim(ctx context.Context, loop storage.LoopRecord, queueItem storage.QueueItemRecord) (runpipe.ProcessResult, bool, error) {
