@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -32,6 +33,10 @@ func TestNormalizeInputRejectsUnsafeExecutableRoots(t *testing.T) {
 			mutate: func(roots map[string]string) { roots[closureResolverRoot] = roots["node"] },
 			want:   "reserved",
 		},
+		"relative launch PATH": {
+			mutate: func(roots map[string]string) {},
+			want:   "launch PATH entry",
+		},
 	}
 	for name, test := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -39,6 +44,9 @@ func TestNormalizeInputRejectsUnsafeExecutableRoots(t *testing.T) {
 			test.mutate(roots)
 			input := fixture.input()
 			input.Roots = roots
+			if name == "relative launch PATH" {
+				input.LaunchPath = []string{"relative-bin"}
+			}
 			_, err := normalizeInput(input)
 			if err == nil || !strings.Contains(err.Error(), test.want) {
 				t.Fatalf("normalizeInput() error = %v, want %q", err, test.want)
@@ -96,6 +104,41 @@ func TestScriptInterpreterResolvesEnvAndChainedShebangs(t *testing.T) {
 	}
 }
 
+func TestScriptInterpreterRejectsRelativeDirectShebang(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "script")
+	resolved, ok, err := scriptInterpreterBytes(path, []byte("#!node\n"), nil)
+	if err == nil || ok || !strings.Contains(err.Error(), "non-absolute direct interpreter") {
+		t.Fatalf("scriptInterpreterBytes() = (%q, %v, %v), want direct relative rejection", resolved, ok, err)
+	}
+}
+
+func TestVerifyRecordedContentRejectsModeDrift(t *testing.T) {
+	fixture := newFixture(t)
+	sealed, err := Build(fixture.input())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(fixture.roots["node"], 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyRecordedContent(sealed); err == nil || !strings.Contains(err.Error(), "digest mismatch") {
+		t.Fatalf("verifyRecordedContent() error = %v, want mode mismatch", err)
+	}
+}
+
+func TestDigestEntryRejectsSpecialFile(t *testing.T) {
+	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
+		t.Skip("fixture requires a Unix FIFO")
+	}
+	path := filepath.Join(t.TempDir(), "fifo")
+	if err := syscall.Mkfifo(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := digestEntryMetadata(path, EntryTreeFile, -1); err == nil || !strings.Contains(err.Error(), "regular file") {
+		t.Fatalf("digestEntryMetadata() error = %v, want special-file rejection", err)
+	}
+}
+
 func TestCompareManifestsRejectsClosureEntryDrift(t *testing.T) {
 	fixture := newFixture(t)
 	sealed, err := Build(fixture.input())
@@ -142,7 +185,7 @@ func TestMachODependenciesSupportsDarwinSystemLibraries(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skip("fixture requires a Darwin Mach-O executable")
 	}
-	if _, err := machoDependencies("/bin/sh"); err != nil {
+	if _, err := machoDependenciesForExecutable("/bin/sh", "/bin/sh"); err != nil {
 		t.Fatalf("machoDependencies(/bin/sh) error = %v", err)
 	}
 }

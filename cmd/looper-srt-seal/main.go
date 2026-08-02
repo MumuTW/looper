@@ -42,8 +42,18 @@ func run(args []string) error {
 	if !filepath.IsAbs(*manifestPath) || !filepath.IsAbs(*packageRoot) {
 		return fmt.Errorf("manifest and package-root must be absolute")
 	}
-	if filepath.Clean(*manifestPath) != filepath.Clean(trustmanifest.ManifestPath(*packageRoot)) {
-		return fmt.Errorf("manifest path must be %s", trustmanifest.ManifestPath(*packageRoot))
+	canonicalPackageRoot, err := filepath.EvalSymlinks(filepath.Clean(*packageRoot))
+	if err != nil {
+		return fmt.Errorf("resolve package-root: %w", err)
+	}
+	expectedManifest := trustmanifest.ManifestPath(canonicalPackageRoot)
+	providedManifest := filepath.Clean(*manifestPath)
+	providedParent, err := filepath.EvalSymlinks(filepath.Dir(providedManifest))
+	if err != nil {
+		return fmt.Errorf("resolve manifest parent: %w", err)
+	}
+	if filepath.Base(providedManifest) != filepath.Base(expectedManifest) || providedParent != filepath.Dir(expectedManifest) {
+		return fmt.Errorf("manifest path must resolve to %s", expectedManifest)
 	}
 	roots := map[string]string{"srt": *srt, "node": *node, "rg": *rg}
 	if runtime.GOOS == "linux" {
@@ -59,10 +69,17 @@ func run(args []string) error {
 			return fmt.Errorf("%s path must be absolute", name)
 		}
 	}
-	if err := trustmanifest.Write(*manifestPath, trustmanifest.Input{PackageRoot: *packageRoot, Roots: roots}); err != nil {
+	if err := trustmanifest.Write(expectedManifest, trustmanifest.Input{
+		PackageRoot: canonicalPackageRoot,
+		Roots:       roots,
+		LaunchPath:  filepath.SplitList(os.Getenv("PATH")),
+	}); err != nil {
 		return err
 	}
-	info, err := os.Stat(*manifestPath)
+	if err := trustmanifest.VerifyRootOwnership(expectedManifest); err != nil {
+		return err
+	}
+	info, err := os.Stat(expectedManifest)
 	if err != nil {
 		return err
 	}

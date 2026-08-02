@@ -17,9 +17,7 @@ import (
 	"io/fs"
 	"os"
 	"os/exec"
-	"os/user"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -28,7 +26,7 @@ import (
 )
 
 const (
-	manifestVersion     = 1
+	manifestVersion     = 2
 	ManifestFileName    = ".looper-srt-trust.json"
 	closureResolverRoot = "closure-resolver"
 	lddTimeout          = 10 * time.Second
@@ -60,6 +58,8 @@ type Entry struct {
 	Path   string    `json:"path"`
 	Kind   EntryKind `json:"kind"`
 	SHA256 string    `json:"sha256"`
+	Mode   uint32    `json:"mode"`
+	Size   int64     `json:"size"`
 }
 
 // Manifest is the canonical, content-addressed trust authority installed for
@@ -77,6 +77,10 @@ type Manifest struct {
 type Input struct {
 	PackageRoot string
 	Roots       map[string]string
+	// LaunchPath is the exact PATH suffix used after the sealed support-tool
+	// directories. A nil value uses the current process PATH for library users
+	// that do not have a separately constructed launch environment.
+	LaunchPath []string
 }
 
 // ManifestPath returns the fixed manifest location for a node_modules root.
@@ -98,7 +102,7 @@ func Build(input Input) (Manifest, error) {
 		entries:             make(map[string]Entry),
 		visitedELF:          make(map[string]struct{}),
 		visitedInterpreters: make(map[string]struct{}),
-		interpreterPaths:    executableSearchPaths(normalized.Roots),
+		interpreterPaths:    executableSearchPaths(normalized.Roots, normalized.LaunchPath),
 		visitedMachO:        make(map[string]struct{}),
 	}
 	if err := collector.addPackageTree(normalized.PackageRoot, normalized.Roots["srt"]); err != nil {
@@ -175,6 +179,28 @@ func Write(path string, input Input) error {
 		return fmt.Errorf("install trust manifest: %w", err)
 	}
 	removeTemp = false
+	return nil
+}
+
+// VerifyRootOwnership checks the final manifest through a no-follow descriptor
+// so installers fail immediately on root-squashed or otherwise anonymous
+// filesystems instead of producing an unusable manifest.
+func VerifyRootOwnership(path string) error {
+	file, info, err := openSealedFile(path)
+	if err != nil {
+		return fmt.Errorf("read trust manifest metadata: %w", err)
+	}
+	defer file.Close()
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("trust manifest %s is not a regular file", path)
+	}
+	owner, err := fileOwnerUID(info)
+	if err != nil {
+		return err
+	}
+	if owner != 0 {
+		return fmt.Errorf("trust manifest %s is not owned by root", path)
+	}
 	return nil
 }
 
@@ -279,9 +305,12 @@ func loadRootSealed(path string) (Manifest, error) {
 
 func verifyRecordedContent(manifest Manifest) error {
 	for _, entry := range manifest.Entries {
-		digest, err := digestEntry(entry.Path, entry.Kind)
+		digest, mode, size, err := digestEntryMetadata(entry.Path, entry.Kind, entry.Size)
 		if err != nil {
 			return fmt.Errorf("verify %s: %w", entry.Path, err)
+		}
+		if mode != entry.Mode || size != entry.Size {
+			return fmt.Errorf("executable closure digest mismatch for %s (metadata changed)", entry.Path)
 		}
 		if digest != entry.SHA256 {
 			return fmt.Errorf("executable closure digest mismatch for %s", entry.Path)
@@ -345,7 +374,7 @@ func validateManifest(manifest Manifest) error {
 	}
 	seenEntries := make(map[string]struct{}, len(manifest.Entries))
 	for _, entry := range manifest.Entries {
-		if !filepath.IsAbs(entry.Path) || !validEntryKind(entry.Kind) || len(entry.SHA256) != sha256.Size*2 {
+		if !filepath.IsAbs(entry.Path) || !validEntryKind(entry.Kind) || len(entry.SHA256) != sha256.Size*2 || entry.Size < 0 || entry.Mode > 0o777 {
 			return fmt.Errorf("trust manifest has an invalid closure entry for %s", entry.Path)
 		}
 		if _, err := hex.DecodeString(entry.SHA256); err != nil {
@@ -371,6 +400,7 @@ func validEntryKind(kind EntryKind) bool {
 type normalizedInput struct {
 	PackageRoot string
 	Roots       map[string]string
+	LaunchPath  []string
 }
 
 func normalizeInput(input Input) (normalizedInput, error) {
@@ -412,17 +442,25 @@ func normalizeInput(input Input) (normalizedInput, error) {
 		}
 		roots[name] = resolved
 	}
-	if runtime.GOOS == "linux" {
-		resolver, err := lddExecutable()
-		if err != nil {
-			return normalizedInput{}, err
+	launchPath := input.LaunchPath
+	if launchPath == nil {
+		launchPath = filepath.SplitList(os.Getenv("PATH"))
+	}
+	normalizedLaunchPath := make([]string, 0, len(launchPath))
+	for _, dir := range launchPath {
+		dir = strings.TrimSpace(dir)
+		if dir == "" {
+			continue
 		}
-		roots[closureResolverRoot] = resolver
+		if !filepath.IsAbs(dir) {
+			return normalizedInput{}, fmt.Errorf("launch PATH entry %q must be absolute", dir)
+		}
+		normalizedLaunchPath = append(normalizedLaunchPath, dir)
 	}
 	if _, ok := roots["srt"]; !ok {
 		return normalizedInput{}, fmt.Errorf("srt executable root is required")
 	}
-	return normalizedInput{PackageRoot: packageRoot, Roots: roots}, nil
+	return normalizedInput{PackageRoot: packageRoot, Roots: roots, LaunchPath: normalizedLaunchPath}, nil
 }
 
 func resolveExistingPath(path string) (string, error) {
@@ -440,9 +478,9 @@ func resolveExistingPath(path string) (string, error) {
 // executableSearchPaths mirrors the isolated runtime PATH precedence: the
 // sealed Node directory wins for env-style shebangs, followed by the other
 // sealed support-tool directories and the fixed system fallbacks.
-func executableSearchPaths(roots map[string]string) []string {
-	orderedNames := []string{"node", "srt", "rg", "bwrap", "socat", closureResolverRoot}
-	paths := make([]string, 0, len(orderedNames)+3)
+func executableSearchPaths(roots map[string]string, launchPath []string) []string {
+	orderedNames := []string{"node", "srt", "rg", "bwrap", "socat"}
+	paths := make([]string, 0, len(orderedNames)+len(launchPath)+3)
 	seen := make(map[string]struct{})
 	for _, name := range orderedNames {
 		path := strings.TrimSpace(roots[name])
@@ -456,7 +494,17 @@ func executableSearchPaths(roots map[string]string) []string {
 		seen[dir] = struct{}{}
 		paths = append(paths, dir)
 	}
-	for _, dir := range []string{"/usr/local/bin", "/usr/bin", "/bin"} {
+	for _, dir := range launchPath {
+		if dir = strings.TrimSpace(dir); dir == "" {
+			continue
+		}
+		if _, ok := seen[dir]; ok {
+			continue
+		}
+		seen[dir] = struct{}{}
+		paths = append(paths, dir)
+	}
+	for _, dir := range []string{"/usr/bin", "/bin"} {
 		if _, ok := seen[dir]; ok {
 			continue
 		}
@@ -635,11 +683,11 @@ func (c *closureCollector) add(path string, kind EntryKind) error {
 		}
 		return nil
 	}
-	digest, err := digestEntry(absolute, kind)
+	digest, mode, size, err := digestEntryMetadata(absolute, kind, -1)
 	if err != nil {
 		return err
 	}
-	c.entries[absolute] = Entry{Path: absolute, Kind: kind, SHA256: digest}
+	c.entries[absolute] = Entry{Path: absolute, Kind: kind, SHA256: digest, Mode: mode, Size: size}
 	return nil
 }
 
@@ -655,8 +703,18 @@ func (c *closureCollector) addContent(path string, kind EntryKind, raw []byte) e
 		}
 		return nil
 	}
+	info, err := os.Lstat(absolute)
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("closure entry %s is not a regular file", absolute)
+	}
+	if info.Size() != int64(len(raw)) {
+		return fmt.Errorf("closure entry %s changed while sealing", absolute)
+	}
 	digest := sha256.Sum256(raw)
-	c.entries[absolute] = Entry{Path: absolute, Kind: kind, SHA256: hex.EncodeToString(digest[:])}
+	c.entries[absolute] = Entry{Path: absolute, Kind: kind, SHA256: hex.EncodeToString(digest[:]), Mode: sealedMode(info.Mode()), Size: info.Size()}
 	return nil
 }
 
@@ -681,31 +739,58 @@ func entryKindPriority(kind EntryKind) int {
 	}
 }
 
-func digestEntry(path string, kind EntryKind) (string, error) {
+// digestEntryMetadata hashes one recorded object while keeping the file
+// descriptor and metadata from the same no-follow open. expectedSize is -1
+// while sealing; verification supplies the sealed size to bound the read.
+func digestEntryMetadata(path string, kind EntryKind, expectedSize int64) (string, uint32, int64, error) {
 	hash := sha256.New()
 	if kind == EntryTreeSymlink {
+		info, err := os.Lstat(path)
+		if err != nil {
+			return "", 0, 0, err
+		}
+		if info.Mode()&os.ModeSymlink == 0 {
+			return "", 0, 0, fmt.Errorf("expected symlink")
+		}
 		target, err := os.Readlink(path)
 		if err != nil {
-			return "", err
+			return "", 0, 0, err
+		}
+		size := int64(len(target))
+		if expectedSize >= 0 && size != expectedSize {
+			return "", 0, 0, fmt.Errorf("digest mismatch: symlink size changed")
 		}
 		_, err = io.WriteString(hash, target)
 		if err != nil {
-			return "", err
+			return "", 0, 0, err
 		}
+		return hex.EncodeToString(hash.Sum(nil)), 0, size, nil
 	} else {
-		file, err := os.Open(path)
+		file, info, err := openRegularFile(path)
 		if err != nil {
-			return "", err
+			return "", 0, 0, err
 		}
-		if _, err := io.Copy(hash, file); err != nil {
+		defer file.Close()
+		if expectedSize >= 0 && info.Size() != expectedSize {
+			return "", 0, 0, fmt.Errorf("digest mismatch: file size changed")
+		}
+		limit := info.Size()
+		if expectedSize >= 0 {
+			limit = expectedSize
+		}
+		if _, err := io.CopyN(hash, file, limit); err != nil {
 			_ = file.Close()
-			return "", err
+			return "", 0, 0, err
 		}
-		if err := file.Close(); err != nil {
-			return "", err
+		if info.Size() != limit {
+			return "", 0, 0, fmt.Errorf("digest mismatch: file size changed while hashing")
 		}
+		return hex.EncodeToString(hash.Sum(nil)), sealedMode(info.Mode()), info.Size(), nil
 	}
-	return hex.EncodeToString(hash.Sum(nil)), nil
+}
+
+func sealedMode(mode os.FileMode) uint32 {
+	return uint32(mode.Perm())
 }
 
 func isELFBytes(raw []byte) bool {
@@ -752,11 +837,15 @@ func elfInterpreter(path string) (string, bool, error) {
 }
 
 func (c *closureCollector) addMachOClosure(path string) error {
+	return c.addMachOClosureFrom(path, path)
+}
+
+func (c *closureCollector) addMachOClosureFrom(path, executablePath string) error {
 	if _, ok := c.visitedMachO[path]; ok {
 		return nil
 	}
 	c.visitedMachO[path] = struct{}{}
-	dependencies, err := machoDependencies(path)
+	dependencies, err := machoDependenciesForExecutable(path, executablePath)
 	if err != nil {
 		return err
 	}
@@ -769,7 +858,7 @@ func (c *closureCollector) addMachOClosure(path string) error {
 			return err
 		}
 		if isMachOBytes(raw) {
-			if err := c.addMachOClosure(dependency); err != nil {
+			if err := c.addMachOClosureFrom(dependency, executablePath); err != nil {
 				return err
 			}
 		}
@@ -777,11 +866,11 @@ func (c *closureCollector) addMachOClosure(path string) error {
 	return nil
 }
 
-func machoDependencies(path string) ([]string, error) {
+func machoDependenciesForExecutable(path, executablePath string) ([]string, error) {
 	file, err := macho.Open(path)
 	if err == nil {
 		defer file.Close()
-		return machoFileDependencies(file, path)
+		return machoFileDependencies(file, path, executablePath)
 	}
 	fat, fatErr := macho.OpenFat(path)
 	if fatErr != nil {
@@ -790,7 +879,7 @@ func machoDependencies(path string) ([]string, error) {
 	defer fat.Close()
 	paths := make(map[string]struct{})
 	for _, arch := range fat.Arches {
-		dependencies, archErr := machoFileDependencies(arch.File, path)
+		dependencies, archErr := machoFileDependencies(arch.File, path, executablePath)
 		if archErr != nil {
 			return nil, archErr
 		}
@@ -806,20 +895,28 @@ func machoDependencies(path string) ([]string, error) {
 	return result, nil
 }
 
-func machoFileDependencies(file *macho.File, path string) ([]string, error) {
+func machoFileDependencies(file *macho.File, path string, executablePaths ...string) ([]string, error) {
+	executablePath := path
+	if len(executablePaths) > 0 && strings.TrimSpace(executablePaths[0]) != "" {
+		executablePath = executablePaths[0]
+	}
 	libraries, err := file.ImportedLibraries()
 	if err != nil {
 		return nil, err
 	}
+	libraries = append(libraries, rawMachOLibraries(file)...)
 	rpaths := []string{}
 	for _, load := range file.Loads {
 		if rpath, ok := load.(*macho.Rpath); ok {
+			if err := validateMachORpath(rpath.Path); err != nil {
+				return nil, fmt.Errorf("Mach-O %s: %w", path, err)
+			}
 			rpaths = append(rpaths, rpath.Path)
 		}
 	}
 	resolved := make(map[string]struct{}, len(libraries))
 	for _, library := range libraries {
-		candidate, err := resolveMachOLibrary(path, library, rpaths)
+		candidate, err := resolveMachOLibraryFrom(path, executablePath, library, rpaths)
 		if err != nil {
 			if isMachOSystemLibrary(library) {
 				// Modern macOS stores these immutable libraries in the dyld
@@ -840,31 +937,85 @@ func machoFileDependencies(file *macho.File, path string) ([]string, error) {
 	return result, nil
 }
 
+const (
+	machoLoadWeakDylib macho.LoadCmd = 0x80000018
+	machoLazyLoadDylib macho.LoadCmd = 0x00000020
+	machoReexportDylib macho.LoadCmd = 0x8000001f
+	machoUpwardDylib   macho.LoadCmd = 0x80000023
+)
+
+func rawMachOLibraries(file *macho.File) []string {
+	known := map[macho.LoadCmd]struct{}{
+		machoLoadWeakDylib: {},
+		machoLazyLoadDylib: {},
+		machoReexportDylib: {},
+		machoUpwardDylib:   {},
+	}
+	var libraries []string
+	for _, load := range file.Loads {
+		raw := load.Raw()
+		if len(raw) < 12 {
+			continue
+		}
+		cmd := file.ByteOrder.Uint32(raw[:4])
+		if _, ok := known[macho.LoadCmd(cmd)]; !ok {
+			continue
+		}
+		nameOffset := file.ByteOrder.Uint32(raw[8:12])
+		if nameOffset >= uint32(len(raw)) {
+			continue
+		}
+		name := raw[nameOffset:]
+		if end := bytes.IndexByte(name, 0); end >= 0 {
+			name = name[:end]
+		}
+		if len(name) > 0 {
+			libraries = append(libraries, string(name))
+		}
+	}
+	return libraries
+}
+
+func validateMachORpath(rpath string) error {
+	rpath = strings.TrimSpace(rpath)
+	if rpath == "" {
+		return fmt.Errorf("empty LC_RPATH")
+	}
+	if filepath.IsAbs(rpath) || strings.HasPrefix(rpath, "@loader_path/") || strings.HasPrefix(rpath, "@executable_path/") {
+		return nil
+	}
+	return fmt.Errorf("relative LC_RPATH %q is not allowed", rpath)
+}
+
 func isMachOSystemLibrary(path string) bool {
 	return strings.HasPrefix(path, "/usr/lib/") || strings.HasPrefix(path, "/System/Library/")
 }
 
-func resolveMachOLibrary(binaryPath, library string, rpaths []string) (string, error) {
+func resolveMachOLibraryFrom(binaryPath, executablePath, library string, rpaths []string) (string, error) {
 	library = strings.TrimSpace(library)
 	if library == "" {
 		return "", fmt.Errorf("Mach-O %s has an empty library dependency", binaryPath)
 	}
 	candidates := []string{}
-	baseDir := filepath.Dir(binaryPath)
+	loaderDir := filepath.Dir(binaryPath)
+	executableDir := filepath.Dir(executablePath)
 	switch {
 	case filepath.IsAbs(library):
 		candidates = append(candidates, library)
-	case strings.HasPrefix(library, "@loader_path/") || strings.HasPrefix(library, "@executable_path/"):
-		candidates = append(candidates, filepath.Join(baseDir, strings.SplitN(library, "/", 2)[1]))
+	case strings.HasPrefix(library, "@loader_path/"):
+		candidates = append(candidates, filepath.Join(loaderDir, strings.SplitN(library, "/", 2)[1]))
+	case strings.HasPrefix(library, "@executable_path/"):
+		candidates = append(candidates, filepath.Join(executableDir, strings.SplitN(library, "/", 2)[1]))
 	case strings.HasPrefix(library, "@rpath/"):
 		relative := strings.SplitN(library, "/", 2)[1]
 		for _, rpath := range rpaths {
-			rpath = strings.ReplaceAll(rpath, "@loader_path", baseDir)
+			rpath = strings.ReplaceAll(rpath, "@loader_path", loaderDir)
+			rpath = strings.ReplaceAll(rpath, "@executable_path", executableDir)
 			candidates = append(candidates, filepath.Join(rpath, relative))
 		}
 		candidates = append(candidates, filepath.Join("/usr/lib", relative), filepath.Join("/System/Library", relative))
 	default:
-		candidates = append(candidates, filepath.Join(baseDir, library), filepath.Join("/usr/lib", library), filepath.Join("/System/Library/Frameworks", library))
+		candidates = append(candidates, filepath.Join(loaderDir, library), filepath.Join("/usr/lib", library), filepath.Join("/System/Library/Frameworks", library))
 	}
 	for _, candidate := range candidates {
 		resolved, err := resolveExistingPath(candidate)
@@ -893,6 +1044,8 @@ func scriptInterpreterBytes(path string, raw []byte, searchPaths []string) (stri
 			return "", false, fmt.Errorf("script %s uses unsupported env interpreter form", path)
 		}
 		interpreter = fields[1]
+	} else if !filepath.IsAbs(interpreter) {
+		return "", false, fmt.Errorf("script %s has a non-absolute direct interpreter %q", path, interpreter)
 	}
 	resolved, err := resolveExecutablePath(interpreter, searchPaths)
 	if err != nil {
@@ -938,31 +1091,25 @@ func validateExecutablePath(path string) (string, error) {
 }
 
 func lddDependencies(path string) ([]string, error) {
-	lddPath, err := lddExecutable()
+	interpreter, ok, err := elfInterpreter(path)
 	if err != nil {
 		return nil, err
 	}
+	if !ok {
+		return []string{}, nil
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), lddTimeout)
 	defer cancel()
-	command := exec.CommandContext(ctx, lddPath, path)
-	// The sandbox process receives a closed environment. Resolve the closure
-	// under the same no-loader-override assumption rather than inheriting a
-	// daemon LD_LIBRARY_PATH or LD_PRELOAD into the authority calculation.
+	// Invoke the exact PT_INTERP loader with its non-executing --list mode. This
+	// avoids /usr/bin/ldd's shell wrapper and its RTLDLIST probe loop, while
+	// matching the loader the kernel will use for this binary.
+	command := exec.CommandContext(ctx, interpreter, "--list", path)
+	// Resolve the closure under the same no-loader-override assumption rather
+	// than inheriting a daemon LD_LIBRARY_PATH or LD_PRELOAD into the authority
+	// calculation.
 	command.Env = []string{"PATH=/usr/bin:/bin", "LC_ALL=C"}
-	if os.Geteuid() == 0 {
-		nobody, err := user.Lookup("nobody")
-		if err != nil {
-			return nil, fmt.Errorf("resolve non-root ldd user: %w", err)
-		}
-		uid, err := strconv.ParseUint(nobody.Uid, 10, 32)
-		if err != nil {
-			return nil, fmt.Errorf("parse non-root ldd uid: %w", err)
-		}
-		gid, err := strconv.ParseUint(nobody.Gid, 10, 32)
-		if err != nil {
-			return nil, fmt.Errorf("parse non-root ldd gid: %w", err)
-		}
-		command.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid)}}
+	if credential, ok := resolverCredential(); ok {
+		command.SysProcAttr = &syscall.SysProcAttr{Credential: credential}
 	}
 	var stderr bytes.Buffer
 	command.Stderr = &stderr
@@ -975,23 +1122,24 @@ func lddDependencies(path string) ([]string, error) {
 		if ctx.Err() != nil {
 			return nil, fmt.Errorf("ldd %s: %w", path, ctx.Err())
 		}
-		return nil, fmt.Errorf("ldd %s: %w: %s", path, err, strings.TrimSpace(stderr.String()))
+		return nil, fmt.Errorf("resolve ELF dependencies for %s: %w: %s", path, err, strings.TrimSpace(stderr.String()))
 	}
 	return parseLDDOutput(string(output))
 }
 
-func lddExecutable() (string, error) {
-	candidate, err := exec.LookPath("ldd")
-	if err != nil {
-		return "", fmt.Errorf("ldd is required to resolve ELF closure: %w", err)
+func resolverCredential() (*syscall.Credential, bool) {
+	if os.Geteuid() != 0 {
+		return nil, false
 	}
-	if !filepath.IsAbs(candidate) {
-		candidate, err = filepath.Abs(candidate)
-		if err != nil {
-			return "", err
-		}
+	uid, uidErr := strconv.ParseUint(strings.TrimSpace(os.Getenv("SUDO_UID")), 10, 32)
+	gid, gidErr := strconv.ParseUint(strings.TrimSpace(os.Getenv("SUDO_GID")), 10, 32)
+	if uidErr != nil || gidErr != nil {
+		// A root-only installer may not have an intended daemon identity in its
+		// environment. Do not guess an unrelated account; the direct loader
+		// resolver only reads metadata and Verify still runs as the daemon user.
+		return nil, false
 	}
-	return resolveExecutablePath(candidate, nil)
+	return &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid)}, true
 }
 
 func parseLDDOutput(output string) ([]string, error) {

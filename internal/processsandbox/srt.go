@@ -33,7 +33,7 @@ func Available() error {
 	if err != nil {
 		return fmt.Errorf("process sandbox: resolve current directory: %w", err)
 	}
-	_, err = installedRuntime(cwd)
+	_, err = installedRuntime(cwd, nil)
 	return err
 }
 
@@ -144,7 +144,7 @@ func Run(ctx context.Context, options Options) (shell.Result, error) {
 	runtimePaths := runtimePaths{command: strings.TrimSpace(options.runtimeCommand)}
 	if runtimePaths.command == "" {
 		var runtimeErr error
-		runtimePaths, runtimeErr = installedRuntime(cwd)
+		runtimePaths, runtimeErr = installedRuntime(cwd, options.Environment.PrependPath)
 		if runtimeErr != nil {
 			return shell.Result{}, runtimeErr
 		}
@@ -285,7 +285,7 @@ func (p runtimePaths) executableDirectories() []string {
 	return result
 }
 
-func installedRuntime(cwd string) (runtimePaths, error) {
+func installedRuntime(cwd string, prependPath []string) (runtimePaths, error) {
 	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
 		return runtimePaths{}, fmt.Errorf("process sandbox: unsupported platform %s", runtime.GOOS)
 	}
@@ -371,7 +371,13 @@ func installedRuntime(cwd string) (runtimePaths, error) {
 	if pathContains(cwd, resolved) {
 		return runtimePaths{}, fmt.Errorf("process sandbox: srt runtime resolves inside cwd")
 	}
-	if err := trustmanifest.Verify(trustmanifest.ManifestPath(moduleRoot), trustmanifest.Input{PackageRoot: moduleRoot, Roots: resolvedRoots}); err != nil {
+	launchPath := append([]string(nil), prependPath...)
+	launchPath = append(launchPath, filepath.SplitList(os.Getenv("PATH"))...)
+	if err := trustmanifest.Verify(trustmanifest.ManifestPath(moduleRoot), trustmanifest.Input{
+		PackageRoot: moduleRoot,
+		Roots:       resolvedRoots,
+		LaunchPath:  launchPath,
+	}); err != nil {
 		return runtimePaths{}, fmt.Errorf("process sandbox: untrusted srt installation: %w", err)
 	}
 	return paths, nil
