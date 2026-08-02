@@ -92,7 +92,7 @@ func (r *Runner) applyMergeWatchLocked(ctx context.Context, projectID, repo, cwd
 	// route, and if the human-owned route wins the merge, recording it as
 	// Looper merge evidence would let the Auditor attribute a regression — and
 	// eventually propose a revert — to a merge Looper did not perform.
-	if action.Kind != mergewatch.ActionTransientError && (!snapshot.HasLooperLabel || (snapshot.AutoMergeEnabled && !snapshot.AutoMergeOwnedByLooper)) {
+	if action.Kind != mergewatch.ActionTransientError && (!snapshot.HasLooperLabel || (snapshot.AutoMergeEnabled && !snapshot.AutoMergeOwnedByLooper && !snapshot.AutoMergeRouteEnabled)) {
 		return false, r.deleteMergeWatchComment(ctx, repo, cwd, marker)
 	}
 	switch action.Kind {
@@ -413,6 +413,7 @@ func (r *Runner) mergeWatchSnapshot(ctx context.Context, repo, cwd string, issue
 	}
 	checks := summarizeRequiredChecks(requiredCheckRulesFor(protection), checkRuns, mergeableState.IsUnstable())
 	open := strings.EqualFold(detail.State, "open")
+	autoMergeOwnedByLooper := detail.AutoMerge != nil && strings.EqualFold(strings.TrimSpace(detail.AutoMerge.EnabledBy), strings.TrimSpace(currentLogin))
 	return mergewatch.PRSnapshot{
 		Repo:                   repo,
 		PRNumber:               prNumber,
