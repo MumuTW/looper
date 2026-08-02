@@ -1039,6 +1039,26 @@
       }
     },
     {
+      "id": "postMergeDigest.get",
+      "status": 200,
+      "body": {
+        "ok": true,
+        "data": {
+          "enabled": false,
+          "digest": {
+            "date": "2026-04-11",
+            "generatedAt": "2026-04-11T12:00:00Z",
+            "empty": true,
+            "merged": [],
+            "closedAndRegenerated": [],
+            "awaitingHuman": [],
+            "anomalies": []
+          }
+        },
+        "requestId": "fixture-request-id"
+      }
+    },
+    {
       "id": "pullRequests.list",
       "status": 200,
       "body": {

@@ -33,6 +33,7 @@ import (
 	"github.com/MumuTW/looper/internal/infra/shell"
 	"github.com/MumuTW/looper/internal/loops"
 	networkclient "github.com/MumuTW/looper/internal/network/client"
+	"github.com/MumuTW/looper/internal/postmergedigest"
 	"github.com/MumuTW/looper/internal/projects"
 	"github.com/MumuTW/looper/internal/reviewer/convergence"
 	looperdruntime "github.com/MumuTW/looper/internal/runtime"
@@ -424,6 +425,17 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		h.writeSuccess(w, requestID, payload)
+		return
+	case apiBasePath + "/post-merge-digest":
+		if !assertMethod(r.Method, http.MethodGet, path, w, requestID, h.writeError) {
+			return
+		}
+		payload, err := h.buildPostMergeDigestResponse(r.Context())
+		if err != nil {
+			h.writeError(w, requestID, internalServerError(err))
+			return
+		}
 		h.writeSuccess(w, requestID, payload)
 		return
 	case apiBasePath + "/pull-requests":
@@ -1850,6 +1862,13 @@ type eventsListResponse struct {
 	Items []eventResponse `json:"items"`
 }
 
+type postMergeDigestResponse struct {
+	Enabled  bool                   `json:"enabled"`
+	Schedule string                 `json:"schedule,omitempty"`
+	Timezone string                 `json:"timezone,omitempty"`
+	Digest   postmergedigest.Digest `json:"digest"`
+}
+
 type entityEventsResponse struct {
 	EntityType string          `json:"entityType"`
 	EntityID   string          `json:"entityId"`
@@ -2456,6 +2475,30 @@ func (h *Handler) buildEventsRouteResponse(r *http.Request) (eventsListResponse,
 	}
 
 	return eventsListResponse{Items: responseItems}, nil
+}
+
+func (h *Handler) buildPostMergeDigestResponse(ctx context.Context) (postMergeDigestResponse, error) {
+	services := h.context.Runtime.Services()
+	if services.Repositories == nil {
+		return postMergeDigestResponse{}, errors.New("repositories are not configured")
+	}
+	effective := h.effectiveConfig()
+	digestConfig := postmergedigest.ConfigFromRole(effective.Roles.Coordinator.PostMergeDigest)
+	response := postMergeDigestResponse{Enabled: digestConfig.Enabled, Schedule: digestConfig.Schedule, Timezone: digestConfig.Timezone}
+	if !digestConfig.Enabled {
+		now := h.now().UTC()
+		response.Digest = postmergedigest.Digest{
+			Date: now.Format("2006-01-02"), GeneratedAt: now.Format(time.RFC3339Nano), Empty: true,
+			Merged: []postmergedigest.MergedItem{}, ClosedAndRegenerated: []postmergedigest.RegeneratedItem{}, AwaitingHuman: []postmergedigest.AwaitingHumanItem{}, Anomalies: []postmergedigest.Anomaly{},
+		}
+		return response, nil
+	}
+	digest, err := postmergedigest.Assemble(ctx, services.Repositories, digestConfig, h.now())
+	if err != nil {
+		return postMergeDigestResponse{}, err
+	}
+	response.Digest = digest
+	return response, nil
 }
 
 func (h *Handler) buildEntityEventsRouteResponse(r *http.Request, path string) (entityEventsResponse, error) {

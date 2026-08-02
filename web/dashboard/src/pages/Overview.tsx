@@ -15,10 +15,12 @@ import { StatusChip } from "@/components/StatusChip";
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import {
+  fetchPostMergeDigest,
   fetchStatus,
   type ActiveRun,
   type LoopRoleCounts,
   type StatusData,
+  type PostMergeDigestData,
 } from "@/lib/api";
 import { useDashboardData } from "@/lib/DashboardDataContext";
 import {
@@ -132,6 +134,36 @@ export function OverviewPage({
   const [statusLoading, setStatusLoading] = useState(true);
   const statusAbort = useRef<AbortController | null>(null);
   const statusInFlight = useRef(false);
+  const [postMergeDigest, setPostMergeDigest] = useState<PostMergeDigestData | null>(null);
+  const [postMergeDigestError, setPostMergeDigestError] = useState<string | null>(null);
+  const [postMergeDigestLoading, setPostMergeDigestLoading] = useState(true);
+  const digestAbort = useRef<AbortController | null>(null);
+  const digestInFlight = useRef(false);
+
+  const loadPostMergeDigest = useCallback(async () => {
+    if (digestInFlight.current) return;
+    if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
+    digestInFlight.current = true;
+    digestAbort.current?.abort();
+    const controller = new AbortController();
+    digestAbort.current = controller;
+    setPostMergeDigestLoading(true);
+    try {
+      const next = await fetchPostMergeDigest(controller.signal);
+      if (controller.signal.aborted) return;
+      setPostMergeDigest(next);
+      setPostMergeDigestError(null);
+    } catch (err) {
+      if (controller.signal.aborted) return;
+      if (err instanceof Error && err.name === "AbortError") return;
+      if (err instanceof DOMException && err.name === "AbortError") return;
+      setPostMergeDigestError(err instanceof Error ? err.message : String(err));
+      setPostMergeDigest(null);
+    } finally {
+      if (digestAbort.current === controller) digestInFlight.current = false;
+      if (!controller.signal.aborted) setPostMergeDigestLoading(false);
+    }
+  }, []);
 
   const loadStatus = useCallback(async () => {
     if (statusInFlight.current) return;
@@ -204,6 +236,28 @@ export function OverviewPage({
       statusAbort.current?.abort();
     };
   }, [loadStatus]);
+
+  useEffect(() => {
+    void loadPostMergeDigest();
+    const id = window.setInterval(() => {
+      void loadPostMergeDigest();
+    }, STATUS_SLOW_MS);
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") {
+        void loadPostMergeDigest();
+      } else {
+        digestAbort.current?.abort();
+        digestAbort.current = null;
+        digestInFlight.current = false;
+      }
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      window.clearInterval(id);
+      document.removeEventListener("visibilitychange", onVisibility);
+      digestAbort.current?.abort();
+    };
+  }, [loadPostMergeDigest]);
 
   useEffect(() => {
     onHealthChange?.(sharedHealthy, status?.service?.version);
@@ -378,6 +432,7 @@ export function OverviewPage({
           onClick={() => {
             health.refresh();
             void loadStatus();
+            void loadPostMergeDigest();
           }}
         >
           Refresh
@@ -543,6 +598,35 @@ export function OverviewPage({
                 ),
               )}
             </>
+          )}
+        </Card>
+
+        <Card title="Post-merge digest">
+          {postMergeDigestError && !postMergeDigest ? (
+            <p className="m-0 text-[12px] text-[var(--danger)]">
+              Unavailable: {postMergeDigestError}
+            </p>
+          ) : postMergeDigestLoading && !postMergeDigest ? (
+            <p className="m-0 text-[12px] text-[var(--text-muted)]">
+              Loading digest…
+            </p>
+          ) : postMergeDigest?.enabled === false ? (
+            <p className="m-0 text-[12px] text-[var(--text-muted)]">
+              Disabled (enable <code className="mono">roles.coordinator.postMergeDigest</code>)
+            </p>
+          ) : (
+            <div className="flex flex-col gap-2 text-[12px]">
+              <dl className="m-0">
+                <Kv label="Date" value={postMergeDigest?.digest?.date ?? "—"} />
+                <Kv label="Merged" value={postMergeDigest?.digest?.merged?.length ?? 0} />
+                <Kv label="Regenerated" value={postMergeDigest?.digest?.closedAndRegenerated?.length ?? 0} />
+                <Kv label="Awaiting human" value={postMergeDigest?.digest?.awaitingHuman?.length ?? 0} />
+                <Kv label="Anomalies" value={postMergeDigest?.digest?.anomalies?.length ?? 0} />
+              </dl>
+              {postMergeDigest?.digest?.empty ? (
+                <p className="m-0 text-[var(--text-muted)]">No activity for this day.</p>
+              ) : null}
+            </div>
           )}
         </Card>
       </div>

@@ -690,14 +690,26 @@ type CoordinatorMarkReadyConfig struct {
 	Scope   CoordinatorMarkReadyScope `json:"scope"`
 }
 
+// CoordinatorPostMergeDigestConfig controls the optional, agent-free daily
+// digest of durable post-merge workflow evidence. A nil value means disabled;
+// this keeps the default config/API projection backward-compatible.
+type CoordinatorPostMergeDigestConfig struct {
+	Enabled      bool   `json:"enabled"`
+	Schedule     string `json:"schedule"`
+	Timezone     string `json:"timezone"`
+	IncludeEmpty bool   `json:"includeEmpty"`
+	MaxItems     int    `json:"maxItems"`
+}
+
 type CoordinatorRoleConfig struct {
-	Enabled      bool                          `json:"enabled"`
-	PollInterval string                        `json:"pollInterval"`
-	Triage       CoordinatorTriageConfig       `json:"triage"`
-	Dispatch     CoordinatorDispatchConfig     `json:"dispatch"`
-	Dependencies CoordinatorDependenciesConfig `json:"dependencies"`
-	MergeWatch   CoordinatorMergeWatchConfig   `json:"mergeWatch"`
-	MarkReady    CoordinatorMarkReadyConfig    `json:"markReady"`
+	Enabled         bool                              `json:"enabled"`
+	PollInterval    string                            `json:"pollInterval"`
+	Triage          CoordinatorTriageConfig           `json:"triage"`
+	Dispatch        CoordinatorDispatchConfig         `json:"dispatch"`
+	Dependencies    CoordinatorDependenciesConfig     `json:"dependencies"`
+	MergeWatch      CoordinatorMergeWatchConfig       `json:"mergeWatch"`
+	MarkReady       CoordinatorMarkReadyConfig        `json:"markReady"`
+	PostMergeDigest *CoordinatorPostMergeDigestConfig `json:"postMergeDigest,omitempty"`
 }
 
 type RoleConfigs struct {
@@ -1416,14 +1428,23 @@ type PartialCoordinatorMarkReadyConfig struct {
 	Scope   *CoordinatorMarkReadyScope `json:"scope,omitempty"`
 }
 
+type PartialCoordinatorPostMergeDigestConfig struct {
+	Enabled      *bool   `json:"enabled,omitempty"`
+	Schedule     *string `json:"schedule,omitempty"`
+	Timezone     *string `json:"timezone,omitempty"`
+	IncludeEmpty *bool   `json:"includeEmpty,omitempty"`
+	MaxItems     *int    `json:"maxItems,omitempty"`
+}
+
 type PartialCoordinatorRoleConfig struct {
-	Enabled      *bool                                 `json:"enabled,omitempty"`
-	PollInterval *string                               `json:"pollInterval,omitempty"`
-	Triage       *PartialCoordinatorTriageConfig       `json:"triage,omitempty"`
-	Dispatch     *PartialCoordinatorDispatchConfig     `json:"dispatch,omitempty"`
-	Dependencies *PartialCoordinatorDependenciesConfig `json:"dependencies,omitempty"`
-	MergeWatch   *PartialCoordinatorMergeWatchConfig   `json:"mergeWatch,omitempty"`
-	MarkReady    *PartialCoordinatorMarkReadyConfig    `json:"markReady,omitempty"`
+	Enabled         *bool                                    `json:"enabled,omitempty"`
+	PollInterval    *string                                  `json:"pollInterval,omitempty"`
+	Triage          *PartialCoordinatorTriageConfig          `json:"triage,omitempty"`
+	Dispatch        *PartialCoordinatorDispatchConfig        `json:"dispatch,omitempty"`
+	Dependencies    *PartialCoordinatorDependenciesConfig    `json:"dependencies,omitempty"`
+	MergeWatch      *PartialCoordinatorMergeWatchConfig      `json:"mergeWatch,omitempty"`
+	MarkReady       *PartialCoordinatorMarkReadyConfig       `json:"markReady,omitempty"`
+	PostMergeDigest *PartialCoordinatorPostMergeDigestConfig `json:"postMergeDigest,omitempty"`
 }
 
 type PartialDeployerRoleConfig struct {

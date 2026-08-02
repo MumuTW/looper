@@ -33,6 +33,7 @@ import (
 	"github.com/MumuTW/looper/internal/network/protocol"
 	"github.com/MumuTW/looper/internal/networkpolicy"
 	"github.com/MumuTW/looper/internal/planner"
+	"github.com/MumuTW/looper/internal/postmergedigest"
 	"github.com/MumuTW/looper/internal/projects"
 	"github.com/MumuTW/looper/internal/reviewer"
 	"github.com/MumuTW/looper/internal/reviewsubmit"
@@ -186,6 +187,8 @@ type defaultSchedulerTickInput struct {
 	// OnDeployFinished, when set, reports a completed deploy so the person who
 	// asked for the change learns it shipped.
 	OnDeployFinished func(context.Context, DeployNotification)
+	// PostMergeDigest is the optional agent-free daily audit lane.
+	PostMergeDigest *postmergedigest.Service
 }
 
 type defaultSchedulerHandlers struct {
@@ -1217,13 +1220,20 @@ func (a fixerGitHubAdapter) ListPullRequestCommits(ctx context.Context, input fi
 	if err != nil {
 		return nil, err
 	}
-	commits, err := a.gateway.ListPullRequestCommits(ctx, githubinfra.ViewPullRequestInput{Repo: repo, PRNumber: input.PRNumber, CWD: input.CWD})
+	commits, err := a.gateway.ListPullRequestCommits(ctx, githubinfra.ListPullRequestCommitsInput{Repo: repo, PRNumber: input.PRNumber, CWD: input.CWD})
 	if err != nil {
 		return nil, err
 	}
 	out := make([]fixer.PullRequestCommit, 0, len(commits))
 	for _, commit := range commits {
-		out = append(out, fixer.PullRequestCommit{SHA: commit.SHA, AuthorLogin: commit.AuthorLogin, CommitterLogin: commit.CommitterLogin})
+		var authorLogin, committerLogin string
+		if len(commit.Authors) > 0 {
+			authorLogin = commit.Authors[0]
+		}
+		if len(commit.Committers) > 0 {
+			committerLogin = commit.Committers[0]
+		}
+		out = append(out, fixer.PullRequestCommit{SHA: commit.OID, AuthorLogin: authorLogin, CommitterLogin: committerLogin})
 	}
 	return out, nil
 }
@@ -1960,6 +1970,13 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			escalator.RunnerOptions{Now: now, MaxItems: cfg.Roles.Escalator.MaxItems},
 		)
 	}
+	digestConfig := postmergedigest.ConfigFromRole(cfg.Roles.Coordinator.PostMergeDigest)
+	var postMergeDigest *postmergedigest.Service
+	if digestConfig.Enabled {
+		postMergeDigest = postmergedigest.New(postmergedigest.Options{
+			Repos: repos, Config: digestConfig, Now: now, Deliver: notificationGateway.Notify,
+		})
+	}
 	var gatekeeperRunner gatekeeperScheduler
 	if githubGateway != nil {
 		gatekeeperRunner = gatekeeper.New(gatekeeper.Options{
@@ -2567,6 +2584,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 					DedupeKey: fmt.Sprintf("deploy:%s:%s", notification.Repo, notification.Outcome.SHA),
 				})
 			},
+			PostMergeDigest: postMergeDigest,
 		}
 	}
 
@@ -2893,6 +2911,13 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 
 	claimedCount, availableSlots, err = executeClaimPhase(ctx, "post_discovery", input, discoveredRunnableIDs, true)
 	recordClaim(claimedCount, availableSlots, err)
+	// The digest is a read/notification lane, but it still respects the tick's
+	// admission fence so shutdown cannot append a sent marker after stopping.
+	if input.PostMergeDigest != nil {
+		if err := admissionRefuseWork(input); err == nil {
+			appendErr(input.PostMergeDigest.Run(ctx))
+		}
+	}
 
 	if len(errs) == 0 {
 		return nil

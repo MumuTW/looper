@@ -174,6 +174,46 @@ export type StatusData = {
   };
 };
 
+export type PostMergeDigestData = {
+  enabled?: boolean;
+  schedule?: string;
+  timezone?: string;
+  digest?: {
+    date?: string;
+    generatedAt?: string;
+    empty?: boolean;
+    merged?: Array<{
+      repo?: string;
+      prNumber?: number;
+      title?: string;
+      reviewerVerdict?: string;
+      gateReasons?: string[];
+      diff?: { files?: number; additions?: number; deletions?: number; available?: boolean };
+    }>;
+    closedAndRegenerated?: Array<{
+      repo?: string;
+      prNumber?: number;
+      fingerprint?: string;
+      retrySuccess?: boolean;
+      summary?: string;
+    }>;
+    awaitingHuman?: Array<{
+      loopId?: string;
+      repo?: string;
+      prNumber?: number;
+      reason?: string;
+      reasonCode?: string;
+      ageSeconds?: number;
+    }>;
+    anomalies?: Array<{
+      repo?: string;
+      prNumber?: number;
+      kind?: string;
+      reasons?: string[];
+    }>;
+  };
+};
+
 export type BootstrapExchangeData = {
   token?: string;
   accessToken?: string;
@@ -507,6 +547,12 @@ export function fetchHealthz(signal?: AbortSignal): Promise<HealthzData> {
 
 export function fetchStatus(signal?: AbortSignal): Promise<StatusData> {
   return apiFetch<StatusData>("/api/v1/status", { signal });
+}
+
+export function fetchPostMergeDigest(
+  signal?: AbortSignal,
+): Promise<PostMergeDigestData> {
+  return apiFetch<PostMergeDigestData>("/api/v1/post-merge-digest", { signal });
 }
 
 export function fetchActiveRuns(signal?: AbortSignal): Promise<ActiveRunsList> {

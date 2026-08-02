@@ -1346,6 +1346,30 @@ func mergeCoordinatorRoleConfig(config *CoordinatorRoleConfig, partial PartialCo
 	if partial.MarkReady != nil {
 		mergeCoordinatorMarkReadyConfig(&config.MarkReady, *partial.MarkReady)
 	}
+	if partial.PostMergeDigest != nil {
+		mergeCoordinatorPostMergeDigestConfig(&config.PostMergeDigest, *partial.PostMergeDigest)
+	}
+}
+
+func mergeCoordinatorPostMergeDigestConfig(config **CoordinatorPostMergeDigestConfig, partial PartialCoordinatorPostMergeDigestConfig) {
+	if *config == nil {
+		*config = &CoordinatorPostMergeDigestConfig{}
+	}
+	if partial.Enabled != nil {
+		(*config).Enabled = *partial.Enabled
+	}
+	if partial.Schedule != nil {
+		(*config).Schedule = strings.TrimSpace(*partial.Schedule)
+	}
+	if partial.Timezone != nil {
+		(*config).Timezone = strings.TrimSpace(*partial.Timezone)
+	}
+	if partial.IncludeEmpty != nil {
+		(*config).IncludeEmpty = *partial.IncludeEmpty
+	}
+	if partial.MaxItems != nil {
+		(*config).MaxItems = *partial.MaxItems
+	}
 }
 
 func mergeCoordinatorTriageConfig(config *CoordinatorTriageConfig, partial PartialCoordinatorTriageConfig) {

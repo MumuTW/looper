@@ -13,6 +13,7 @@ import (
 	"github.com/MumuTW/looper/internal/config"
 	"github.com/MumuTW/looper/internal/coordinator/mergewatch"
 	"github.com/MumuTW/looper/internal/disclosure"
+	"github.com/MumuTW/looper/internal/eventlog"
 	githubinfra "github.com/MumuTW/looper/internal/infra/github"
 	"github.com/MumuTW/looper/internal/labels"
 )
@@ -27,7 +28,7 @@ type mergeWatchComment struct {
 	Body    string
 }
 
-func (r *Runner) applyMergeWatch(ctx context.Context, repo, cwd string, loaded []loadedIssue, roles config.RoleConfigs) (map[int64]struct{}, error) {
+func (r *Runner) applyMergeWatch(ctx context.Context, projectID, repo, cwd string, loaded []loadedIssue, roles config.RoleConfigs) (map[int64]struct{}, error) {
 	result := map[int64]struct{}{}
 	if r.github == nil {
 		return result, nil
@@ -50,7 +51,7 @@ func (r *Runner) applyMergeWatch(ctx context.Context, repo, cwd string, loaded [
 			lock.Lock()
 			defer lock.Unlock()
 			r.applyMarkReady(ctx, repo, cwd, issue, currentLogin, markReadyDrafts, roles.Coordinator.Triage.TriagedLabel)
-			return r.applyMergeWatchLocked(ctx, repo, cwd, issue, roles, currentLogin, budget)
+			return r.applyMergeWatchLocked(ctx, projectID, repo, cwd, issue, roles, currentLogin, budget)
 		}()
 		if applyErr != nil {
 			return nil, applyErr
@@ -62,7 +63,7 @@ func (r *Runner) applyMergeWatch(ctx context.Context, repo, cwd string, loaded [
 	return result, nil
 }
 
-func (r *Runner) applyMergeWatchLocked(ctx context.Context, repo, cwd string, issue loadedIssue, roles config.RoleConfigs, currentLogin string, maxIndeterminateDuration time.Duration) (bool, error) {
+func (r *Runner) applyMergeWatchLocked(ctx context.Context, projectID, repo, cwd string, issue loadedIssue, roles config.RoleConfigs, currentLogin string, maxIndeterminateDuration time.Duration) (bool, error) {
 	marker := findMergeWatchComment(issue.detail.Comments, currentLogin)
 	watchedPR, ok, err := r.resolveWatchedPR(ctx, repo, cwd, issue, marker, currentLogin)
 	if err != nil || !ok {
@@ -88,6 +89,11 @@ func (r *Runner) applyMergeWatchLocked(ctx context.Context, repo, cwd string, is
 	}
 	switch action.Kind {
 	case mergewatch.ActionMerged, mergewatch.ActionHumanDisabledAutoMerge:
+		if action.Kind == mergewatch.ActionMerged {
+			if err := r.recordPostMergeEvent(ctx, projectID, repo, issue.detail.Number, snapshot); err != nil {
+				return false, err
+			}
+		}
 		return false, r.deleteMergeWatchComment(ctx, repo, cwd, marker)
 	case mergewatch.ActionStillPending:
 		baseMarker.FirstUnknownAt = nil
@@ -138,6 +144,49 @@ func (r *Runner) applyMergeWatchLocked(ctx context.Context, repo, cwd string, is
 	}
 }
 
+// recordPostMergeEvent turns the merge-watch observation into durable local
+// evidence before the forge marker is removed. The event is idempotent by
+// pull-request entity so repeated polling cannot inflate a daily digest.
+func (r *Runner) recordPostMergeEvent(ctx context.Context, projectID, repo string, issueNumber int64, snapshot mergewatch.PRSnapshot) error {
+	entityType := "pull_request"
+	entityID := fmt.Sprintf("%s#%d", repo, snapshot.PRNumber)
+	existing, err := r.repos.Events.ListByEntity(ctx, entityType, entityID)
+	if err != nil {
+		return fmt.Errorf("check post-merge event: %w", err)
+	}
+	for _, event := range existing {
+		if event.EventType == eventlog.CoordinatorPullRequestMergedEventType {
+			return nil
+		}
+	}
+	payload := map[string]any{
+		"repo":        repo,
+		"prNumber":    snapshot.PRNumber,
+		"issueNumber": issueNumber,
+		"headSha":     snapshot.HeadSHA,
+	}
+	mergedAt := strings.TrimSpace(snapshot.MergedAt)
+	if mergedAt == "" {
+		mergedAt = r.now().UTC().Format(time.RFC3339Nano)
+	}
+	payload["mergedAt"] = mergedAt
+	if err := eventlog.Append(ctx, r.repos, eventlog.AppendInput{
+		EventType: eventlog.CoordinatorPullRequestMergedEventType,
+		ProjectID: nilIfBlank(projectID), EntityType: &entityType, EntityID: &entityID,
+		Payload: payload, CreatedAt: r.now(),
+	}); err != nil {
+		return fmt.Errorf("record post-merge event: %w", err)
+	}
+	return nil
+}
+
+func nilIfBlank(value string) *string {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+	return &value
+}
+
 func (r *Runner) resolveWatchedPR(ctx context.Context, repo, cwd string, issue loadedIssue, marker *mergeWatchComment, currentLogin string) (int64, bool, error) {
 	linked := linkedPullRequestNumbers(issue.rawTimeline)
 	if marker != nil && marker.Marker.PRNumber > 0 {
@@ -181,7 +230,7 @@ func (r *Runner) mergeWatchSnapshot(ctx context.Context, repo, cwd string, issue
 	checkRuns, err := r.github.ListPullRequestCheckRuns(ctx, githubinfra.PullRequestCheckRunsInput{Repo: repo, Ref: detail.HeadSHA, CWD: cwd})
 	if err != nil {
 		if isTransientMergeWatchError(err) {
-			return mergewatch.PRSnapshot{Repo: repo, PRNumber: prNumber, IssueNumber: issueNumber, HeadSHA: detail.HeadSHA, AutoMergeEnabled: detail.AutoMerge != nil, AutoMergeOwnedByLooper: detail.AutoMerge != nil && strings.EqualFold(detail.AutoMerge.EnabledBy, currentLogin), Mergeable: detail.Mergeable, MergeableState: detail.MergeableState}, &mergewatch.TemporaryError{SuggestedDelay: time.Minute}, nil
+			return mergewatch.PRSnapshot{Repo: repo, PRNumber: prNumber, IssueNumber: issueNumber, HeadSHA: detail.HeadSHA, MergedAt: detail.MergedAt, AutoMergeEnabled: detail.AutoMerge != nil, AutoMergeOwnedByLooper: detail.AutoMerge != nil && strings.EqualFold(detail.AutoMerge.EnabledBy, currentLogin), Mergeable: detail.Mergeable, MergeableState: detail.MergeableState}, &mergewatch.TemporaryError{SuggestedDelay: time.Minute}, nil
 		}
 		return mergewatch.PRSnapshot{}, nil, err
 	}
@@ -200,6 +249,7 @@ func (r *Runner) mergeWatchSnapshot(ctx context.Context, repo, cwd string, issue
 		PRNumber:               prNumber,
 		IssueNumber:            issueNumber,
 		HeadSHA:                detail.HeadSHA,
+		MergedAt:               detail.MergedAt,
 		Merged:                 detail.MergedAt != "" || strings.EqualFold(detail.State, "merged"),
 		Open:                   open,
 		AutoMergeEnabled:       detail.AutoMerge != nil,
@@ -364,6 +414,7 @@ func mergeWatchPartialSnapshot(repo string, issueNumber, prNumber int64, detail 
 		PRNumber:               prNumber,
 		IssueNumber:            issueNumber,
 		HeadSHA:                detail.HeadSHA,
+		MergedAt:               detail.MergedAt,
 		Open:                   strings.EqualFold(detail.State, "open"),
 		AutoMergeEnabled:       detail.AutoMerge != nil,
 		AutoMergeOwnedByLooper: detail.AutoMerge != nil && strings.EqualFold(strings.TrimSpace(detail.AutoMerge.EnabledBy), strings.TrimSpace(currentLogin)),
