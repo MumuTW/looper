@@ -11,6 +11,9 @@
 | `looper project add <path>` | Register a git repository **root** with the running daemon. Refuses a non-root path or an already-registered checkout. Discovery runs as post-commit work. |
 | `looper project list` | List registered projects |
 | `looper project discover <id>` | Retry post-commit worktree/PR discovery for a registered project. |
+| `looper gatekeeper agreements [projectId]` | List durable advise agreement outcomes. |
+| `looper gatekeeper verdicts [projectId]` | List the latest durable Gatekeeper verdict per pull request. |
+| `looper gatekeeper promote <projectId> <advise|auto>` | Explicitly promote a project through the Gatekeeper trust ladder. |
 | `looper stop <selector>` | Stop the active run (`all` = every run) |
 | `looper close <selector>` | Stop and close the loop |
 | `looper start <selector>` | Start a known loop now |

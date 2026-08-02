@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MumuTW/looper/internal/config"
 	"github.com/MumuTW/looper/internal/eventlog"
 	githubinfra "github.com/MumuTW/looper/internal/infra/github"
 	"github.com/MumuTW/looper/internal/storage"
@@ -247,6 +248,7 @@ func TestDiscoverPullRequestsReevaluatesAfterCodexReviewProviderBlock(t *testing
 	fingerprint := sourceFingerprint(pr, false) + "\x1fdiff-budget=0,0" + "\x1fgatekeeper-trust=observe" + "\x1fconfigured-target="
 	seedGateReport(t, fixture, Report{
 		Version: reportVersion, Status: StatusBlocked, ProjectID: "project_1",
+		Mode: string(config.GatekeeperTrustObserve),
 		Repo: "acme/looper", PRNumber: 42, ObservedHeadSHA: "head-1",
 		ExpectedHeadSHA: "head-1", SourceFingerprint: fingerprint,
 		Reasons: []Reason{{Code: ReasonProviderStateUnavailable, Subject: "codex_review"}},

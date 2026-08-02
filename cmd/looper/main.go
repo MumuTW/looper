@@ -892,7 +892,9 @@ func runGatekeeper(ctx context.Context, global []string, operands []string, stdo
 	}
 	path := "/api/v1/gatekeeper/" + operands[0]
 	if len(operands) == 2 {
-		path += "?projectId=" + url.QueryEscape(strings.TrimSpace(operands[1]))
+		// Project IDs are exact configuration keys; only the all-whitespace
+		// validation above treats surrounding whitespace as insignificant.
+		path += "?projectId=" + url.QueryEscape(operands[1])
 	}
 	if operands[0] == "agreements" {
 		agreements, err := requestJSON[gatekeeperAgreementsResponse](ctx, cfg, http.MethodGet, path, nil)
@@ -912,7 +914,7 @@ func runGatekeeper(ctx context.Context, global []string, operands []string, stdo
 			if agreement.Agreement {
 				agreementLabel = "agreement"
 			}
-			_, _ = fmt.Fprintf(stdout, "%s#%d  %s  %s  %s  verdict=%s\n", agreement.Repo, agreement.PRNumber, outcome, agreementLabel, agreement.RecordedAt, agreement.VerdictEventID)
+			_, _ = fmt.Fprintf(stdout, "%s  %s#%d  %s  %s  %s  verdict=%s\n", agreement.ProjectID, agreement.Repo, agreement.PRNumber, outcome, agreementLabel, agreement.RecordedAt, agreement.VerdictEventID)
 		}
 		return nil
 	}
@@ -942,7 +944,7 @@ func runGatekeeper(ctx context.Context, global []string, operands []string, stdo
 		if len(reasons) > 0 {
 			reasonText = strings.Join(reasons, ",")
 		}
-		_, _ = fmt.Fprintf(stdout, "%s#%d  %s  head=%s  evaluated=%s  reasons=%s\n", verdict.Repo, verdict.PRNumber, status, verdict.ObservedHeadSHA, verdict.EvaluatedAt, reasonText)
+		_, _ = fmt.Fprintf(stdout, "%s  %s#%d  %s  head=%s  evaluated=%s  reasons=%s\n", verdict.ProjectID, verdict.Repo, verdict.PRNumber, status, verdict.ObservedHeadSHA, verdict.EvaluatedAt, reasonText)
 	}
 	return nil
 }
@@ -1346,6 +1348,7 @@ type gatekeeperVerdictsResponse struct {
 
 type gatekeeperAgreement struct {
 	Repo           string `json:"repo"`
+	ProjectID      string `json:"projectId"`
 	PRNumber       int64  `json:"prNumber"`
 	VerdictEventID string `json:"verdictEventId"`
 	Outcome        string `json:"outcome"`
@@ -1360,6 +1363,7 @@ type gatekeeperVerdictReason struct {
 
 type gatekeeperVerdict struct {
 	Repo            string                    `json:"repo"`
+	ProjectID       string                    `json:"projectId"`
 	PRNumber        int64                     `json:"prNumber"`
 	Status          string                    `json:"status"`
 	Eligible        bool                      `json:"eligible"`

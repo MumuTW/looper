@@ -2630,7 +2630,7 @@ func (h *Handler) buildGatekeeperAgreementsRouteResponse(r *http.Request) (gatek
 		limit = parsed
 	}
 
-	projectID := strings.TrimSpace(r.URL.Query().Get("projectId"))
+	projectID := exactOptionalQueryValue(r.URL.Query().Get("projectId"))
 	events, err := services.Repositories.Events.ListByEventType(r.Context(), gatekeeper.AdviceAgreementEventType, projectID, limit)
 	if err != nil {
 		return gatekeeperAgreementsResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
@@ -2694,7 +2694,7 @@ func (h *Handler) buildGatekeeperVerdictsRouteResponse(r *http.Request) (gatekee
 		limit = parsed
 	}
 
-	projectID := strings.TrimSpace(r.URL.Query().Get("projectId"))
+	projectID := exactOptionalQueryValue(r.URL.Query().Get("projectId"))
 	events, err := services.Repositories.Events.ListLatestByEventType(r.Context(), gatekeeper.GateReportEventType, projectID, limit)
 	if err != nil {
 		return gatekeeperVerdictsResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
@@ -8442,18 +8442,25 @@ func projectGatekeeperTrust(project storage.ProjectRecord, cfg config.Config) co
 			}
 		}
 	}
-	if strings.TrimSpace(string(trust)) == "" {
+	switch normalized := config.GatekeeperTrustLevel(strings.ToLower(strings.TrimSpace(string(trust)))); normalized {
+	case config.GatekeeperTrustAdvise, config.GatekeeperTrustAuto:
+		return normalized
+	default:
 		return config.GatekeeperTrustObserve
 	}
-	return trust
 }
 
-func cloneProjectValidation(source *config.ProjectValidationConfig) *config.ProjectValidationConfig {
-	if source == nil {
-		return nil
+// exactOptionalQueryValue preserves a configured project ID verbatim for the
+// repository filter. Whitespace-only input is treated as omitted, but valid
+// IDs with intentional surrounding whitespace must not be rewritten before the
+// exact SQLite equality check.
+func exactOptionalQueryValue(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return ""
 	}
-	return &config.ProjectValidationConfig{Commands: append([]string(nil), source.Commands...), OptOut: source.OptOut}
+	return value
 }
+
 func serializeProjectValidation(metadata map[string]any, cfg config.Config) *projectValidationResponse {
 	if raw, ok := metadata["validation"]; ok && raw != nil {
 		encoded, err := json.Marshal(raw)

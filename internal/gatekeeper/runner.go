@@ -293,7 +293,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 	// review-thread query each — so this lane was O(open PRs) in forge round trips
 	// every tick, and grew with the repo. Most of those pull requests are unchanged
 	// since their last evaluation, and the list call already made above can prove it.
-	previousReports, err := latestGateReports(ctx, r.repos, input.ProjectID)
+	previousReports, err := latestGateReports(ctx, r.repos, input.ProjectID, int64(len(pullRequests)))
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
@@ -331,6 +331,12 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		entityID := fmt.Sprintf("%s#%d", input.Repo, pullRequest.Number)
 		stillOpen[entityID] = struct{}{}
 		previous, hasPrevious := previousReports[entityID]
+		if hasPrevious && strings.ToLower(strings.TrimSpace(previous.Mode)) != strings.ToLower(strings.TrimSpace(string(r.trustFor(input.ProjectID)))) {
+			// Trust promotion is a gate input even when the forge-visible PR
+			// fingerprint is unchanged; do not reuse an observe/advise report
+			// after the project policy moves up the ladder.
+			hasPrevious = false
+		}
 		// When the previous report is waiting on a current-head review, check
 		// the local event log cheaply before deciding to skip. This avoids a
 		// full forge evaluation every tick for PRs that may never receive a
@@ -1111,14 +1117,21 @@ func (r *Runner) persist(ctx context.Context, report Report) (Report, error) {
 	entityID := fmt.Sprintf("%s#%d", report.Repo, report.PRNumber)
 	projectID := report.ProjectID
 	reportEventID := eventlog.NewEventID("event")
-	if err := eventlog.Append(ctx, r.repos, eventlog.AppendInput{
-		ID:        reportEventID,
-		EventType: GateReportEventType, ProjectID: &projectID, EntityType: &entityType, EntityID: &entityID,
-		Payload: report, CreatedAt: r.now(),
+	if err := r.repos.WithTransaction(ctx, func(txRepos *storage.Repositories) error {
+		if err := eventlog.Append(ctx, txRepos, eventlog.AppendInput{
+			ID:        reportEventID,
+			EventType: GateReportEventType, ProjectID: &projectID, EntityType: &entityType, EntityID: &entityID,
+			Payload: report, CreatedAt: r.now(),
+		}); err != nil {
+			return fmt.Errorf("persist gate report: %w", err)
+		}
+		txRunner := *r
+		txRunner.repos = txRepos
+		if err := txRunner.recordTerminalAdviceOutcomes(ctx, report, reportEventID); err != nil {
+			return err
+		}
+		return nil
 	}); err != nil {
-		return Report{}, fmt.Errorf("persist gate report: %w", err)
-	}
-	if err := r.recordTerminalAdviceOutcomes(ctx, report, reportEventID); err != nil {
 		return Report{}, err
 	}
 	// The owned comment is reconciled after the durable report: the report is the

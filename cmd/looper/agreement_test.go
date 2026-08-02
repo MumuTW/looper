@@ -19,7 +19,8 @@ func TestGatekeeperAgreementsCLIUsesProjectFilterAndPrintsEvidence(t *testing.T)
 		seenProjectID = r.URL.Query().Get("projectId")
 		writeEnvelope(w, http.StatusOK, map[string]any{
 			"items": []map[string]any{{
-				"repo": "acme/looper", "prNumber": 42, "verdictEventId": "verdict_42",
+				"projectId": "project_a",
+				"repo":      "acme/looper", "prNumber": 42, "verdictEventId": "verdict_42",
 				"outcome": "merged_as_is", "agreement": true, "recordedAt": "2026-04-11T12:00:00Z",
 			}},
 		})
@@ -34,7 +35,7 @@ func TestGatekeeperAgreementsCLIUsesProjectFilterAndPrintsEvidence(t *testing.T)
 	if seenProjectID != "project_a" {
 		t.Fatalf("projectId = %q, want project_a", seenProjectID)
 	}
-	if !strings.Contains(stdout, "acme/looper#42  merged_as_is  agreement") || !strings.Contains(stdout, "verdict=verdict_42") {
+	if !strings.Contains(stdout, "project_a  acme/looper#42  merged_as_is  agreement") || !strings.Contains(stdout, "verdict=verdict_42") {
 		t.Fatalf("stdout = %q, want formatted agreement evidence", stdout)
 	}
 	if stderr != "" {
@@ -61,7 +62,8 @@ func TestGatekeeperVerdictsCLIUsesProjectFilterAndPrintsReasons(t *testing.T) {
 		seenProjectID = r.URL.Query().Get("projectId")
 		writeEnvelope(w, http.StatusOK, map[string]any{
 			"items": []map[string]any{{
-				"repo": "acme/looper", "prNumber": 42, "status": "blocked", "eligible": false,
+				"projectId": "project_a",
+				"repo":      "acme/looper", "prNumber": 42, "status": "blocked", "eligible": false,
 				"observedHeadSha": "head-42", "evaluatedAt": "2026-04-11T12:00:00Z",
 				"reasons": []map[string]any{{"code": "hold", "subject": labels.HoldGlobal}},
 			}},
@@ -77,7 +79,7 @@ func TestGatekeeperVerdictsCLIUsesProjectFilterAndPrintsReasons(t *testing.T) {
 	if seenProjectID != "project_a" {
 		t.Fatalf("projectId = %q, want project_a", seenProjectID)
 	}
-	if !strings.Contains(stdout, "acme/looper#42  blocked") || !strings.Contains(stdout, "head=head-42") || !strings.Contains(stdout, "reasons=hold("+labels.HoldGlobal+")") {
+	if !strings.Contains(stdout, "project_a  acme/looper#42  blocked") || !strings.Contains(stdout, "head=head-42") || !strings.Contains(stdout, "reasons=hold("+labels.HoldGlobal+")") {
 		t.Fatalf("stdout = %q, want formatted verdict evidence", stdout)
 	}
 	if stderr != "" {

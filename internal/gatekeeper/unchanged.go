@@ -129,17 +129,14 @@ func reportAwaitsConvergenceState(report Report) bool {
 // It is a single local query for the whole project rather than one per pull
 // request: the point of this path is to spend microseconds of SQLite to avoid
 // seconds of forge round trips, so it must not reintroduce per-PR work of its own.
-func latestGateReports(ctx context.Context, repos *storage.Repositories, projectID string) (map[string]Report, error) {
+func latestGateReports(ctx context.Context, repos *storage.Repositories, projectID string, limit int64) (map[string]Report, error) {
 	if repos == nil || repos.Events == nil {
 		return nil, nil
 	}
-	records, err := repos.Events.ListLatestByEntityTypeAndEventTypes(ctx, projectID, "pull_request", []string{GateReportEventType})
+	records, err := repos.Events.ListLatestByEventType(ctx, GateReportEventType, projectID, limit)
 	if err != nil {
 		return nil, fmt.Errorf("list gate reports: %w", err)
 	}
-	// One record per pull request already: SQLite selected the newest, so this
-	// pass decodes exactly what the caller uses. The query is scoped to one
-	// project, so the entity id alone is an unambiguous key here.
 	reports := make(map[string]Report)
 	for _, record := range records {
 		if record.EntityID == nil {
