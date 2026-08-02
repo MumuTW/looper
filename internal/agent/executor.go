@@ -340,8 +340,12 @@ type RunInput struct {
 	SnapshotReasoningEffort *config.ReasoningEffort
 	// CompletionContract selects the output contract that determines health
 	// success. Coding agents use the marker contract; coordinator and triager
-	// classifiers use raw JSON and intentionally emit no generic marker.
+	// classifiers use raw JSON; file-backed callers provide a semantic validator.
 	CompletionContract CompletionContract
+	// CompletionValidator is the daemon-owned caller validator for contracts
+	// whose authority is not the executor's stdout (for example planner's
+	// assessment file). It is evaluated only at terminal outcome reporting.
+	CompletionValidator func() bool
 	// BrownoutProbe is populated by the common spawn admission lease.
 	BrownoutProbe bool
 	// BrownoutProbeGeneration is copied from the common spawn admission lease.
@@ -355,6 +359,7 @@ const (
 	CompletionContractRawJSON         CompletionContract = "raw_json"
 	CompletionContractRawJSONEnvelope CompletionContract = "raw_json_envelope"
 	CompletionContractFixerMarker     CompletionContract = "fixer_marker"
+	CompletionContractFile            CompletionContract = "file"
 )
 
 // TimeoutObservation identifies the timeout that is about to terminate an
@@ -1408,7 +1413,9 @@ func (x *execution) reportOutcome(status, parseStatus, completionPayload, stdout
 		return
 	}
 	succeeded := status == "completed"
-	if x.input.CompletionContract == CompletionContractRawJSON {
+	if x.input.CompletionContract == CompletionContractFile {
+		succeeded = succeeded && x.input.CompletionValidator != nil && x.input.CompletionValidator()
+	} else if x.input.CompletionContract == CompletionContractRawJSON {
 		succeeded = succeeded && validRawJSONObject(stdout)
 	} else if x.input.CompletionContract == CompletionContractRawJSONEnvelope {
 		succeeded = succeeded && validRawJSONObjectEnvelope(stdout)

@@ -633,6 +633,7 @@ func (a plannerAgentExecutorAdapter) Start(ctx context.Context, input planner.Ag
 		Prompt: input.Prompt, WorkingDirectory: input.WorkingDirectory, Timeout: input.Timeout, HeartbeatTimeout: input.HeartbeatTimeout,
 		Metadata: input.Metadata, IdempotencyKey: input.IdempotencyKey,
 		UseSnapshot: input.UseSnapshot, SnapshotVendor: input.SnapshotVendor, SnapshotModel: input.SnapshotModel, SnapshotReasoningEffort: input.SnapshotReasoningEffort,
+		CompletionContract: input.CompletionContract, CompletionValidator: input.CompletionValidator,
 	})
 	if err != nil {
 		return nil, err
