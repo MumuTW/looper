@@ -310,6 +310,15 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
+	// Observe routed merges independently of issue discovery. A Mergify merge
+	// whose PR body closes its tracked issue closes that issue as part of the
+	// merge, so the open-issue loop above can never see the merged PR on the
+	// next tick; routed PRs without a Coordinator-tracked issue are missed the
+	// same way. The routed registry records their terminal merge as Auditor
+	// evidence.
+	if err := r.applyRoutedMergeWatch(ctx, input.ProjectID, input.Repo, project.RepoPath); err != nil {
+		return DiscoveryResult{}, err
+	}
 	activeLoaded := filterLoadedIssues(loaded, mergeWatchRetriggers)
 
 	deps, err := r.buildDependencyState(ctx, input.Repo, project.RepoPath, activeLoaded, triageCfg, dispatchCfg, roleCfg.Dependencies)
