@@ -176,6 +176,27 @@ func TestCooldownIsCappedAtMax(t *testing.T) {
 	}
 }
 
+func TestCooldownDoublingSaturatesBeforeDurationOverflow(t *testing.T) {
+	cfg := testConfig()
+	cfg.Cooldown = 5_000_000_000 * time.Second
+	cfg.MaxCooldown = 9_000_000_000 * time.Second
+	b, c, _ := newTestBreaker(t, cfg)
+	b.Record(c.now(), false)
+	b.Record(c.now(), false)
+	b.Record(c.now(), false)
+	if !errors.Is(b.Allow(), ErrOpen) {
+		t.Fatal("expected breaker to open")
+	}
+	c.add(cfg.Cooldown)
+	if err := b.Allow(); err != nil {
+		t.Fatalf("expected half_open admission: %v", err)
+	}
+	b.Record(c.now(), false)
+	if got := b.Snapshot().Cooldown; got != cfg.MaxCooldown {
+		t.Fatalf("overflowed cooldown = %s, want max-capped %s", got, cfg.MaxCooldown)
+	}
+}
+
 func TestRecoveryResetsCooldownToConfigured(t *testing.T) {
 	b, c, _ := newTestBreaker(t, testConfig())
 	b.Record(c.now(), false)

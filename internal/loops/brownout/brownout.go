@@ -506,14 +506,23 @@ func (b *Breaker) openLocked(now time.Time, reason string) Transition {
 }
 
 func (b *Breaker) nextCooldown() time.Duration {
-	next := b.cooldown * 2
-	if b.cfg.MaxCooldown > 0 && next > b.cfg.MaxCooldown {
-		next = b.cfg.MaxCooldown
+	current := b.cooldown
+	if current <= 0 {
+		return b.cfg.Cooldown
 	}
-	if next <= 0 {
-		next = b.cfg.Cooldown
+	if max := b.cfg.MaxCooldown; max > 0 {
+		// Compare before multiplying: individually valid durations can still
+		// overflow time.Duration when doubled.
+		if current >= max || current > max/2 {
+			return max
+		}
+		return current * 2
 	}
-	return next
+	const maxDuration = time.Duration(1<<63 - 1)
+	if current > maxDuration/2 {
+		return maxDuration
+	}
+	return current * 2
 }
 
 func (b *Breaker) pruneLocked(now time.Time) {
