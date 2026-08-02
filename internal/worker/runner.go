@@ -58,7 +58,7 @@ const (
 	// Keep in lockstep with internal/infra/git.WorktreeFingerprintVersion; this
 	// package owns the persisted checkpoint comparison without importing the
 	// concrete gateway implementation.
-	worktreeFingerprintVersion = "v2"
+	worktreeFingerprintVersion = "v3"
 	personalIssueQueryLimit = 100
 
 	workerBranchSlugMaxLength        = 30

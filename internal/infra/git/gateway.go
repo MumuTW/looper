@@ -129,7 +129,7 @@ type VerifyWorktreeIdentityInput struct {
 // WorktreeFingerprintVersion is persisted alongside timeout evidence. A daemon
 // upgrade must never compare a new content/index digest with an older algorithm
 // and silently authorize a replacement agent on incompatible evidence.
-const WorktreeFingerprintVersion = "v2"
+const WorktreeFingerprintVersion = "v3"
 
 type CommitInput struct {
 	RepoPath     string
@@ -1057,6 +1057,13 @@ func rejectTruncatedGitStdout(result shell.Result, operation string) error {
 	return nil
 }
 
+// submoduleContentFingerprint records the submodule's checked-out tree rather
+// than its commit/status labels. A dirty edit and the same edit committed in
+// the submodule have different HEAD/status values but the same durable files;
+// hashing the tree lets the superproject's ancestry check authorize that
+// legitimate dirty-to-committed transition. The superproject index fingerprint
+// separately covers the staged gitlink SHA and mode plus the submodule's own
+// staged entries.
 func (g *Gateway) submoduleContentFingerprint(ctx context.Context, path string) (string, error) {
 	result, err := g.runGitResult(ctx, path, nil, "ls-files", "--cached", "--others", "--exclude-standard", "-z")
 	if err != nil {
@@ -1173,7 +1180,9 @@ func (g *Gateway) isAncestor(ctx context.Context, repoPath, ancestor, descendant
 // indexFingerprint records the staged blob, mode, stage, and exact path for
 // every tracked path participating in a timeout observation. Working-tree bytes
 // alone cannot detect an MM transition where the index is replaced while the
-// checkout contents stay unchanged.
+// checkout contents stay unchanged. Gitlink entries are followed into the
+// submodule so an index-only edit inside a dirty submodule is evidence too. Gitlink entries are followed into the
+// submodule so an index-only edit inside a dirty submodule is evidence too.
 func (g *Gateway) indexFingerprint(ctx context.Context, worktreePath string, paths []string) (string, error) {
 	unique := make(map[string]struct{}, len(paths))
 	for _, path := range paths {
@@ -1203,7 +1212,41 @@ func (g *Gateway) indexFingerprint(ctx context.Context, worktreePath string, pat
 	_, _ = fingerprint.Write([]byte(WorktreeFingerprintVersion))
 	_, _ = fingerprint.Write([]byte{0})
 	_, _ = fingerprint.Write([]byte(result.Stdout))
+	for _, path := range stagedGitlinkPaths(result.Stdout) {
+		if !filepath.IsLocal(path) {
+			return "", fmt.Errorf("unsafe submodule index path %q", path)
+		}
+		nested, err := g.indexFingerprint(ctx, filepath.Join(worktreePath, path), nil)
+		if err != nil {
+			return "", fmt.Errorf("fingerprint submodule index %q: %w", path, err)
+		}
+		_, _ = fingerprint.Write([]byte("submodule-index"))
+		_, _ = fingerprint.Write([]byte{0})
+		_, _ = fingerprint.Write([]byte(path))
+		_, _ = fingerprint.Write([]byte{0})
+		_, _ = fingerprint.Write([]byte(nested))
+		_, _ = fingerprint.Write([]byte{0})
+	}
 	return fmt.Sprintf("%x", fingerprint.Sum(nil)), nil
+}
+
+func stagedGitlinkPaths(output string) []string {
+	paths := make([]string, 0)
+	for _, record := range strings.Split(output, "\x00") {
+		separator := strings.IndexByte(record, '\t')
+		if separator < 0 {
+			continue
+		}
+		metadata := strings.Fields(record[:separator])
+		if len(metadata) == 0 || metadata[0] != "160000" {
+			continue
+		}
+		path := record[separator+1:]
+		if path != "" {
+			paths = append(paths, path)
+		}
+	}
+	return paths
 }
 
 func (g *Gateway) currentBranch(ctx context.Context, repoPath string) (string, error) {

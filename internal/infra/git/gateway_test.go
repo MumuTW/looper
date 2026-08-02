@@ -392,6 +392,47 @@ func TestGatewayInspectHeadFingerprintsDirtySubmodule(t *testing.T) {
 	}
 }
 
+func TestGatewayInspectHeadFingerprintsStagedSubmoduleIndex(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	fixture := newFixture(t)
+	fixture.createMainOnlyRepo(t)
+	gateway := fixture.gateway()
+
+	submoduleSource := filepath.Join(fixture.rootDir, "submodule-index-source")
+	mustMkdirAll(t, submoduleSource)
+	runGit(t, submoduleSource, "init", "-b", "main")
+	configureRepo(t, submoduleSource)
+	writeFile(t, filepath.Join(submoduleSource, "nested.txt"), "base\n")
+	runGit(t, submoduleSource, "add", "nested.txt")
+	runGit(t, submoduleSource, "commit", "-m", "init nested")
+	runGit(t, fixture.repoPath, "-c", "protocol.file.allow=always", "submodule", "add", submoduleSource, "modules/nested-index")
+	runGit(t, fixture.repoPath, "commit", "-am", "add nested module")
+
+	submodulePath := filepath.Join(fixture.repoPath, "modules", "nested-index")
+	nestedPath := filepath.Join(submodulePath, "nested.txt")
+	writeFile(t, nestedPath, "working-tree-content\n")
+	runGit(t, submodulePath, "add", "nested.txt")
+	first, err := gateway.InspectHead(ctx, InspectHeadInput{WorktreePath: fixture.repoPath})
+	if err != nil {
+		t.Fatalf("InspectHead(first staged submodule index) error = %v", err)
+	}
+	alternate := filepath.Join(fixture.rootDir, "alternate-submodule-index-content")
+	writeFile(t, alternate, "replacement-staged-content\n")
+	indexObject := stringsTrimSpace(runGit(t, submodulePath, "hash-object", "-w", alternate))
+	runGit(t, submodulePath, "update-index", "--cacheinfo", "100644,"+indexObject+",nested.txt")
+	second, err := gateway.InspectHead(ctx, InspectHeadInput{WorktreePath: fixture.repoPath})
+	if err != nil {
+		t.Fatalf("InspectHead(second staged submodule index) error = %v", err)
+	}
+	if first.ContentFingerprint != second.ContentFingerprint {
+		t.Fatalf("content fingerprint changed for staged-index-only submodule edit: first=%q second=%q", first.ContentFingerprint, second.ContentFingerprint)
+	}
+	if first.IndexFingerprint == second.IndexFingerprint {
+		t.Fatalf("index fingerprint unchanged for staged submodule blob drift: first=%q second=%q", first.IndexFingerprint, second.IndexFingerprint)
+	}
+}
+
 func TestGatewayInspectHeadPreservesDirtySubmoduleCommitTransition(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
