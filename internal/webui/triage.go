@@ -287,6 +287,8 @@ func Classify(in Input) Board {
 	loopsByPR, loopLinks := indexLoops(in.Loops, in.Links)
 	queueByPR := indexQueue(in.Queue)
 	pullRequestLinks := prLinks(pullRequests, in.Links)
+	pullRequestLinkFallback := uniqueLinkFallback(pullRequestLinks)
+	loopLinkFallback := uniqueLoopLinkFallback(loopLinks)
 
 	// Escalator items reach a row through the link the collector already wrote
 	// for them. A loop item lands on the pull request its loop is working.
@@ -298,10 +300,20 @@ func Classify(in Input) Board {
 			identity := linkIdentity{ProjectID: item.ProjectID, Link: link}
 			if candidate, ok := pullRequestLinks[identity]; ok {
 				key, matched = candidate, true
+			} else if item.ProjectID == "" {
+				key, matched = pullRequestLinkFallback[link]
 			} else if loop, ok := loopLinks[identity]; ok && loop.Repo != nil && loop.PRNumber != nil {
 				candidate := newPRKey(loop.ProjectID, *loop.Repo, *loop.PRNumber)
 				if _, known := pullRequests[candidate]; known {
 					key, matched = candidate, true
+				}
+			}
+			if !matched && item.ProjectID == "" {
+				if loop, ok := loopLinkFallback[link]; ok && loop.Repo != nil && loop.PRNumber != nil {
+					candidate := newPRKey(loop.ProjectID, *loop.Repo, *loop.PRNumber)
+					if _, known := pullRequests[candidate]; known {
+						key, matched = candidate, true
+					}
 				}
 			}
 		}
@@ -1007,6 +1019,41 @@ func prLinks(pullRequests map[PRKey]storage.PullRequestSnapshotRecord, links esc
 	for key, snapshot := range pullRequests {
 		if link := strings.TrimSpace(links.PullRequest(key.ProjectID, snapshot.Repo, key.Number)); link != "" {
 			out[linkIdentity{ProjectID: key.ProjectID, Link: link}] = key
+		}
+	}
+	return out
+}
+
+// uniqueLinkFallback preserves compatibility with older digest payloads that
+// omitted ProjectID without reintroducing cross-project collisions. An
+// unscoped link is usable only when exactly one project owns it.
+func uniqueLinkFallback(links map[linkIdentity]PRKey) map[string]PRKey {
+	out := make(map[string]PRKey)
+	ambiguous := make(map[string]struct{})
+	for identity, key := range links {
+		if previous, ok := out[identity.Link]; ok && previous != key {
+			delete(out, identity.Link)
+			ambiguous[identity.Link] = struct{}{}
+			continue
+		}
+		if _, blocked := ambiguous[identity.Link]; !blocked {
+			out[identity.Link] = key
+		}
+	}
+	return out
+}
+
+func uniqueLoopLinkFallback(links map[linkIdentity]storage.LoopRecord) map[string]storage.LoopRecord {
+	out := make(map[string]storage.LoopRecord)
+	ambiguous := make(map[string]struct{})
+	for identity, loop := range links {
+		if previous, ok := out[identity.Link]; ok && previous.ProjectID != loop.ProjectID {
+			delete(out, identity.Link)
+			ambiguous[identity.Link] = struct{}{}
+			continue
+		}
+		if _, blocked := ambiguous[identity.Link]; !blocked {
+			out[identity.Link] = loop
 		}
 	}
 	return out
