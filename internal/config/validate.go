@@ -351,27 +351,31 @@ const auditorGatekeeperAutoConflictMessage = "requires Gatekeeper merge-outcome 
 // status-only; Auditor still reads MergeOutcome events Gatekeeper no longer
 // emits.
 func validateAuditorGatekeeperCompatibility(config Config, issues *[]ValidationIssue) {
-	if config.Roles.Auditor.Enabled && gatekeeperTrustIsAuto(config.Roles.Gatekeeper.Trust) {
+	globalConflict := config.Roles.Auditor.Enabled && gatekeeperTrustIsAuto(config.Roles.Gatekeeper.Trust)
+	if globalConflict {
 		*issues = append(*issues, ValidationIssue{
 			Path:    "roles.auditor.enabled",
 			Message: auditorGatekeeperAutoConflictMessage,
 		})
 	}
 	for i, project := range config.Projects {
+		overridesAuto := project.Roles != nil && project.Roles.Gatekeeper != nil && project.Roles.Gatekeeper.Trust != nil && gatekeeperTrustIsAuto(*project.Roles.Gatekeeper.Trust)
+		overridesAuditorOn := project.Roles != nil && project.Roles.Auditor != nil && project.Roles.Auditor.Enabled != nil && *project.Roles.Auditor.Enabled
+		// Inherited global roles are already covered by the global issue; only
+		// project overrides can introduce a distinct conflict path.
+		if !overridesAuto && !overridesAuditorOn {
+			continue
+		}
 		roles := ProjectRoleConfigs(config, project.ID)
 		if !roles.Auditor.Enabled || !gatekeeperTrustIsAuto(roles.Gatekeeper.Trust) {
 			continue
 		}
-		var path string
-		switch {
-		case project.Roles != nil && project.Roles.Gatekeeper != nil && project.Roles.Gatekeeper.Trust != nil && gatekeeperTrustIsAuto(*project.Roles.Gatekeeper.Trust):
+		if globalConflict {
+			continue
+		}
+		path := fmt.Sprintf("projects[%d].roles.auditor.enabled", i)
+		if overridesAuto {
 			path = fmt.Sprintf("projects[%d].roles.gatekeeper.trust", i)
-		case project.Roles != nil && project.Roles.Auditor != nil && project.Roles.Auditor.Enabled != nil && *project.Roles.Auditor.Enabled:
-			path = fmt.Sprintf("projects[%d].roles.auditor.enabled", i)
-		case gatekeeperTrustIsAuto(config.Roles.Gatekeeper.Trust):
-			path = "roles.gatekeeper.trust"
-		default:
-			path = fmt.Sprintf("projects[%d].roles.auditor.enabled", i)
 		}
 		*issues = append(*issues, ValidationIssue{Path: path, Message: auditorGatekeeperAutoConflictMessage})
 	}
@@ -386,28 +390,32 @@ func postMergeDigestEnabled(digest *CoordinatorPostMergeDigestConfig) bool {
 // validatePostMergeDigestGatekeeperCompatibility rejects post-merge digest enabled
 // together with gatekeeper auto on the same effective project scope. Auto trust
 // is status-only and does not emit merge-outcome events the digest still reads.
+// Post-merge digest is global-only, so the project loop only looks for an
+// explicit gatekeeper trust override into auto.
 func validatePostMergeDigestGatekeeperCompatibility(config Config, issues *[]ValidationIssue) {
-	if postMergeDigestEnabled(config.Roles.Coordinator.PostMergeDigest) && gatekeeperTrustIsAuto(config.Roles.Gatekeeper.Trust) {
+	globalConflict := postMergeDigestEnabled(config.Roles.Coordinator.PostMergeDigest) && gatekeeperTrustIsAuto(config.Roles.Gatekeeper.Trust)
+	if globalConflict {
 		*issues = append(*issues, ValidationIssue{
 			Path:    "roles.coordinator.postMergeDigest.enabled",
 			Message: postMergeDigestGatekeeperAutoConflictMessage,
 		})
 	}
 	for i, project := range config.Projects {
+		overridesAuto := project.Roles != nil && project.Roles.Gatekeeper != nil && project.Roles.Gatekeeper.Trust != nil && gatekeeperTrustIsAuto(*project.Roles.Gatekeeper.Trust)
+		if !overridesAuto {
+			continue
+		}
 		roles := ProjectRoleConfigs(config, project.ID)
 		if !postMergeDigestEnabled(roles.Coordinator.PostMergeDigest) || !gatekeeperTrustIsAuto(roles.Gatekeeper.Trust) {
 			continue
 		}
-		var path string
-		switch {
-		case project.Roles != nil && project.Roles.Gatekeeper != nil && project.Roles.Gatekeeper.Trust != nil && gatekeeperTrustIsAuto(*project.Roles.Gatekeeper.Trust):
-			path = fmt.Sprintf("projects[%d].roles.gatekeeper.trust", i)
-		case gatekeeperTrustIsAuto(config.Roles.Gatekeeper.Trust):
-			path = "roles.gatekeeper.trust"
-		default:
-			path = "roles.coordinator.postMergeDigest.enabled"
+		if globalConflict {
+			continue
 		}
-		*issues = append(*issues, ValidationIssue{Path: path, Message: postMergeDigestGatekeeperAutoConflictMessage})
+		*issues = append(*issues, ValidationIssue{
+			Path:    fmt.Sprintf("projects[%d].roles.gatekeeper.trust", i),
+			Message: postMergeDigestGatekeeperAutoConflictMessage,
+		})
 	}
 }
 
