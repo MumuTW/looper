@@ -4,23 +4,34 @@ package trustmanifest
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
+	"debug/elf"
+	"debug/macho"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
+	"syscall"
+	"time"
 )
 
 const (
-	manifestVersion  = 1
-	ManifestFileName = ".looper-srt-trust.json"
+	manifestVersion     = 1
+	ManifestFileName    = ".looper-srt-trust.json"
+	closureResolverRoot = "closure-resolver"
+	lddTimeout          = 10 * time.Second
 )
 
 type EntryKind string
@@ -30,6 +41,7 @@ const (
 	EntryTreeSymlink       EntryKind = "tree-symlink"
 	EntryRuntimeScript     EntryKind = "runtime-script"
 	EntryELFBinary         EntryKind = "elf-binary"
+	EntryMachOBinary       EntryKind = "mach-o-binary"
 	EntrySharedLibrary     EntryKind = "shared-library"
 	EntryELFInterpreter    EntryKind = "elf-interpreter"
 	EntryScriptInterpreter EntryKind = "script-interpreter"
@@ -82,7 +94,13 @@ func Build(input Input) (Manifest, error) {
 	if err != nil {
 		return Manifest{}, err
 	}
-	collector := closureCollector{entries: make(map[string]Entry), visitedELF: make(map[string]struct{})}
+	collector := closureCollector{
+		entries:             make(map[string]Entry),
+		visitedELF:          make(map[string]struct{}),
+		visitedInterpreters: make(map[string]struct{}),
+		interpreterPaths:    executableSearchPaths(normalized.Roots),
+		visitedMachO:        make(map[string]struct{}),
+	}
 	if err := collector.addPackageTree(normalized.PackageRoot, normalized.Roots["srt"]); err != nil {
 		return Manifest{}, err
 	}
@@ -247,7 +265,7 @@ func loadRootSealed(path string) (Manifest, error) {
 		return Manifest{}, fmt.Errorf("decode sealed trust manifest: %w", err)
 	}
 	var trailing any
-	if err := decoder.Decode(&trailing); err != io.EOF {
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
 		if err == nil {
 			return Manifest{}, fmt.Errorf("decode sealed trust manifest: trailing JSON value")
 		}
@@ -343,7 +361,7 @@ func validateManifest(manifest Manifest) error {
 
 func validEntryKind(kind EntryKind) bool {
 	switch kind {
-	case EntryTreeFile, EntryTreeSymlink, EntryRuntimeScript, EntryELFBinary, EntrySharedLibrary, EntryELFInterpreter, EntryScriptInterpreter:
+	case EntryTreeFile, EntryTreeSymlink, EntryRuntimeScript, EntryELFBinary, EntryMachOBinary, EntrySharedLibrary, EntryELFInterpreter, EntryScriptInterpreter:
 		return true
 	default:
 		return false
@@ -373,12 +391,24 @@ func normalizeInput(input Input) (normalizedInput, error) {
 		if name == "" {
 			return normalizedInput{}, fmt.Errorf("executable root name is required")
 		}
+		if name == closureResolverRoot {
+			return normalizedInput{}, fmt.Errorf("executable root name %s is reserved", closureResolverRoot)
+		}
+		path = strings.TrimSpace(path)
+		if path == "" {
+			return normalizedInput{}, fmt.Errorf("executable root %s path is required", name)
+		}
+		if !filepath.IsAbs(path) {
+			return normalizedInput{}, fmt.Errorf("executable root %s path must be absolute", name)
+		}
 		resolved, err := resolveExistingPath(path)
 		if err != nil {
 			return normalizedInput{}, fmt.Errorf("resolve executable root %s: %w", name, err)
 		}
 		if info, err := os.Stat(resolved); err != nil || !info.Mode().IsRegular() {
 			return normalizedInput{}, fmt.Errorf("executable root %s is not a regular file", name)
+		} else if info.Mode().Perm()&0o111 == 0 {
+			return normalizedInput{}, fmt.Errorf("executable root %s is not executable", name)
 		}
 		roots[name] = resolved
 	}
@@ -387,7 +417,7 @@ func normalizeInput(input Input) (normalizedInput, error) {
 		if err != nil {
 			return normalizedInput{}, err
 		}
-		roots["closure-resolver"] = resolver
+		roots[closureResolverRoot] = resolver
 	}
 	if _, ok := roots["srt"]; !ok {
 		return normalizedInput{}, fmt.Errorf("srt executable root is required")
@@ -407,9 +437,41 @@ func resolveExistingPath(path string) (string, error) {
 	return filepath.EvalSymlinks(absolute)
 }
 
+// executableSearchPaths mirrors the isolated runtime PATH precedence: the
+// sealed Node directory wins for env-style shebangs, followed by the other
+// sealed support-tool directories and the fixed system fallbacks.
+func executableSearchPaths(roots map[string]string) []string {
+	orderedNames := []string{"node", "srt", "rg", "bwrap", "socat", closureResolverRoot}
+	paths := make([]string, 0, len(orderedNames)+3)
+	seen := make(map[string]struct{})
+	for _, name := range orderedNames {
+		path := strings.TrimSpace(roots[name])
+		if path == "" {
+			continue
+		}
+		dir := filepath.Dir(path)
+		if _, ok := seen[dir]; ok {
+			continue
+		}
+		seen[dir] = struct{}{}
+		paths = append(paths, dir)
+	}
+	for _, dir := range []string{"/usr/local/bin", "/usr/bin", "/bin"} {
+		if _, ok := seen[dir]; ok {
+			continue
+		}
+		seen[dir] = struct{}{}
+		paths = append(paths, dir)
+	}
+	return paths
+}
+
 type closureCollector struct {
-	entries    map[string]Entry
-	visitedELF map[string]struct{}
+	entries             map[string]Entry
+	visitedELF          map[string]struct{}
+	visitedInterpreters map[string]struct{}
+	interpreterPaths    []string
+	visitedMachO        map[string]struct{}
 }
 
 func (c *closureCollector) addPackageTree(root, runtimePath string) error {
@@ -437,32 +499,36 @@ func (c *closureCollector) addPackageTree(root, runtimePath string) error {
 			if resolveErr == nil && resolved == runtimePath {
 				kind = EntryRuntimeScript
 			}
-			if err := c.add(path, kind); err != nil {
+			raw, err := os.ReadFile(path)
+			if err != nil {
 				return err
 			}
-			if isELF(path) {
-				if err := c.add(path, EntryELFBinary); err != nil {
+			if err := c.addContent(path, kind, raw); err != nil {
+				return err
+			}
+			if isELFBytes(raw) {
+				if err := c.addContent(path, EntryELFBinary, raw); err != nil {
 					return err
 				}
 				return c.addELFClosure(path)
 			}
+			if isMachOBytes(raw) {
+				if err := c.addContent(path, EntryMachOBinary, raw); err != nil {
+					return err
+				}
+				return c.addMachOClosure(path)
+			}
 			if info.Mode().Perm()&0o111 == 0 {
 				return nil
 			}
-			interpreter, ok, err := scriptInterpreter(path)
+			interpreter, ok, err := scriptInterpreterBytes(path, raw, c.interpreterPaths)
 			if err != nil {
 				return err
 			}
 			if !ok {
 				return nil
 			}
-			if err := c.add(interpreter, EntryScriptInterpreter); err != nil {
-				return err
-			}
-			if isELF(interpreter) {
-				return c.addELFClosure(interpreter)
-			}
-			return nil
+			return c.addInterpreterClosure(interpreter)
 		default:
 			return nil
 		}
@@ -470,13 +536,23 @@ func (c *closureCollector) addPackageTree(root, runtimePath string) error {
 }
 
 func (c *closureCollector) addExecutable(path string, runtimeScript bool) error {
-	if isELF(path) {
-		if err := c.add(path, EntryELFBinary); err != nil {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	if isELFBytes(raw) {
+		if err := c.addContent(path, EntryELFBinary, raw); err != nil {
 			return err
 		}
 		return c.addELFClosure(path)
 	}
-	interpreter, ok, err := scriptInterpreter(path)
+	if isMachOBytes(raw) {
+		if err := c.addContent(path, EntryMachOBinary, raw); err != nil {
+			return err
+		}
+		return c.addMachOClosure(path)
+	}
+	interpreter, ok, err := scriptInterpreterBytes(path, raw, c.interpreterPaths)
 	if err != nil {
 		return err
 	}
@@ -487,16 +563,10 @@ func (c *closureCollector) addExecutable(path string, runtimeScript bool) error 
 	if runtimeScript {
 		kind = EntryRuntimeScript
 	}
-	if err := c.add(path, kind); err != nil {
+	if err := c.addContent(path, kind, raw); err != nil {
 		return err
 	}
-	if err := c.add(interpreter, EntryScriptInterpreter); err != nil {
-		return err
-	}
-	if isELF(interpreter) {
-		return c.addELFClosure(interpreter)
-	}
-	return nil
+	return c.addInterpreterClosure(interpreter)
 }
 
 func (c *closureCollector) addELFClosure(path string) error {
@@ -504,25 +574,53 @@ func (c *closureCollector) addELFClosure(path string) error {
 		return nil
 	}
 	c.visitedELF[path] = struct{}{}
+	interpreter, ok, err := elfInterpreter(path)
+	if err != nil {
+		return err
+	}
+	if ok {
+		if err := c.add(interpreter, EntryELFInterpreter); err != nil {
+			return err
+		}
+	}
 	dependencies, err := lddDependencies(path)
 	if err != nil {
 		return err
 	}
 	for _, dependency := range dependencies {
-		kind := EntrySharedLibrary
-		if strings.Contains(filepath.Base(dependency), "ld-linux") || strings.HasPrefix(filepath.Base(dependency), "ld-") {
-			kind = EntryELFInterpreter
-		}
-		if err := c.add(dependency, kind); err != nil {
+		if err := c.add(dependency, EntrySharedLibrary); err != nil {
 			return err
-		}
-		if isELF(dependency) {
-			if err := c.addELFClosure(dependency); err != nil {
-				return err
-			}
 		}
 	}
 	return nil
+}
+
+func (c *closureCollector) addInterpreterClosure(path string) error {
+	if _, ok := c.visitedInterpreters[path]; ok {
+		return nil
+	}
+	c.visitedInterpreters[path] = struct{}{}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	if err := c.addContent(path, EntryScriptInterpreter, raw); err != nil {
+		return err
+	}
+	if isELFBytes(raw) {
+		return c.addELFClosure(path)
+	}
+	if isMachOBytes(raw) {
+		return c.addMachOClosure(path)
+	}
+	next, ok, err := scriptInterpreterBytes(path, raw, c.interpreterPaths)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return nil
+	}
+	return c.addInterpreterClosure(next)
 }
 
 func (c *closureCollector) add(path string, kind EntryKind) error {
@@ -545,6 +643,23 @@ func (c *closureCollector) add(path string, kind EntryKind) error {
 	return nil
 }
 
+func (c *closureCollector) addContent(path string, kind EntryKind, raw []byte) error {
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return err
+	}
+	if existing, ok := c.entries[absolute]; ok {
+		if entryKindPriority(kind) > entryKindPriority(existing.Kind) {
+			existing.Kind = kind
+			c.entries[absolute] = existing
+		}
+		return nil
+	}
+	digest := sha256.Sum256(raw)
+	c.entries[absolute] = Entry{Path: absolute, Kind: kind, SHA256: hex.EncodeToString(digest[:])}
+	return nil
+}
+
 func entryKindPriority(kind EntryKind) int {
 	switch kind {
 	case EntryRuntimeScript:
@@ -554,6 +669,8 @@ func entryKindPriority(kind EntryKind) int {
 	case EntryScriptInterpreter:
 		return 5
 	case EntryELFBinary:
+		return 4
+	case EntryMachOBinary:
 		return 4
 	case EntrySharedLibrary:
 		return 3
@@ -565,51 +682,259 @@ func entryKindPriority(kind EntryKind) int {
 }
 
 func digestEntry(path string, kind EntryKind) (string, error) {
-	var raw []byte
-	var err error
+	hash := sha256.New()
 	if kind == EntryTreeSymlink {
-		var target string
-		target, err = os.Readlink(path)
-		raw = []byte(target)
+		target, err := os.Readlink(path)
+		if err != nil {
+			return "", err
+		}
+		_, err = io.WriteString(hash, target)
+		if err != nil {
+			return "", err
+		}
 	} else {
-		raw, err = os.ReadFile(path)
+		file, err := os.Open(path)
+		if err != nil {
+			return "", err
+		}
+		if _, err := io.Copy(hash, file); err != nil {
+			_ = file.Close()
+			return "", err
+		}
+		if err := file.Close(); err != nil {
+			return "", err
+		}
 	}
-	if err != nil {
-		return "", err
-	}
-	digest := sha256.Sum256(raw)
-	return hex.EncodeToString(digest[:]), nil
+	return hex.EncodeToString(hash.Sum(nil)), nil
 }
 
-func isELF(path string) bool {
-	file, err := os.Open(path)
-	if err != nil {
+func isELFBytes(raw []byte) bool {
+	return len(raw) >= 4 && bytes.Equal(raw[:4], []byte{0x7f, 'E', 'L', 'F'})
+}
+
+func isMachOBytes(raw []byte) bool {
+	if len(raw) < 4 {
 		return false
 	}
-	defer file.Close()
-	var magic [4]byte
-	_, err = file.Read(magic[:])
-	return err == nil && magic == [4]byte{0x7f, 'E', 'L', 'F'}
+	be := binary.BigEndian.Uint32(raw[:4])
+	le := binary.LittleEndian.Uint32(raw[:4])
+	return be == macho.MagicFat || be == macho.Magic32 || be == macho.Magic64 || le == macho.Magic32 || le == macho.Magic64
 }
 
-func scriptInterpreter(path string) (string, bool, error) {
-	raw, err := os.ReadFile(path)
+func elfInterpreter(path string) (string, bool, error) {
+	file, err := elf.Open(path)
 	if err != nil {
 		return "", false, err
 	}
+	defer file.Close()
+	for _, program := range file.Progs {
+		if program.Type != elf.PT_INTERP {
+			continue
+		}
+		if program.Filesz > uint64(^uint64(0)>>1) {
+			return "", false, fmt.Errorf("ELF interpreter segment is too large")
+		}
+		raw, err := io.ReadAll(io.LimitReader(program.Open(), int64(program.Filesz)))
+		if err != nil {
+			return "", false, fmt.Errorf("read ELF interpreter: %w", err)
+		}
+		name := strings.TrimRight(string(raw), "\x00\n")
+		if !filepath.IsAbs(name) {
+			return "", false, fmt.Errorf("ELF interpreter %q is not absolute", name)
+		}
+		resolved, err := resolveExecutablePath(name, nil)
+		if err != nil {
+			return "", false, fmt.Errorf("resolve ELF interpreter: %w", err)
+		}
+		return resolved, true, nil
+	}
+	return "", false, nil
+}
+
+func (c *closureCollector) addMachOClosure(path string) error {
+	if _, ok := c.visitedMachO[path]; ok {
+		return nil
+	}
+	c.visitedMachO[path] = struct{}{}
+	dependencies, err := machoDependencies(path)
+	if err != nil {
+		return err
+	}
+	for _, dependency := range dependencies {
+		if err := c.add(dependency, EntrySharedLibrary); err != nil {
+			return err
+		}
+		raw, err := os.ReadFile(dependency)
+		if err != nil {
+			return err
+		}
+		if isMachOBytes(raw) {
+			if err := c.addMachOClosure(dependency); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func machoDependencies(path string) ([]string, error) {
+	file, err := macho.Open(path)
+	if err == nil {
+		defer file.Close()
+		return machoFileDependencies(file, path)
+	}
+	fat, fatErr := macho.OpenFat(path)
+	if fatErr != nil {
+		return nil, err
+	}
+	defer fat.Close()
+	paths := make(map[string]struct{})
+	for _, arch := range fat.Arches {
+		dependencies, archErr := machoFileDependencies(arch.File, path)
+		if archErr != nil {
+			return nil, archErr
+		}
+		for _, dependency := range dependencies {
+			paths[dependency] = struct{}{}
+		}
+	}
+	result := make([]string, 0, len(paths))
+	for dependency := range paths {
+		result = append(result, dependency)
+	}
+	sort.Strings(result)
+	return result, nil
+}
+
+func machoFileDependencies(file *macho.File, path string) ([]string, error) {
+	libraries, err := file.ImportedLibraries()
+	if err != nil {
+		return nil, err
+	}
+	rpaths := []string{}
+	for _, load := range file.Loads {
+		if rpath, ok := load.(*macho.Rpath); ok {
+			rpaths = append(rpaths, rpath.Path)
+		}
+	}
+	resolved := make(map[string]struct{}, len(libraries))
+	for _, library := range libraries {
+		candidate, err := resolveMachOLibrary(path, library, rpaths)
+		if err != nil {
+			if isMachOSystemLibrary(library) {
+				// Modern macOS stores these immutable libraries in the dyld
+				// shared cache instead of exposing regular files at their load
+				// paths. The platform owns that cache; package-local dylibs
+				// still fail closed above.
+				continue
+			}
+			return nil, err
+		}
+		resolved[candidate] = struct{}{}
+	}
+	result := make([]string, 0, len(resolved))
+	for dependency := range resolved {
+		result = append(result, dependency)
+	}
+	sort.Strings(result)
+	return result, nil
+}
+
+func isMachOSystemLibrary(path string) bool {
+	return strings.HasPrefix(path, "/usr/lib/") || strings.HasPrefix(path, "/System/Library/")
+}
+
+func resolveMachOLibrary(binaryPath, library string, rpaths []string) (string, error) {
+	library = strings.TrimSpace(library)
+	if library == "" {
+		return "", fmt.Errorf("Mach-O %s has an empty library dependency", binaryPath)
+	}
+	candidates := []string{}
+	baseDir := filepath.Dir(binaryPath)
+	switch {
+	case filepath.IsAbs(library):
+		candidates = append(candidates, library)
+	case strings.HasPrefix(library, "@loader_path/") || strings.HasPrefix(library, "@executable_path/"):
+		candidates = append(candidates, filepath.Join(baseDir, strings.SplitN(library, "/", 2)[1]))
+	case strings.HasPrefix(library, "@rpath/"):
+		relative := strings.SplitN(library, "/", 2)[1]
+		for _, rpath := range rpaths {
+			rpath = strings.ReplaceAll(rpath, "@loader_path", baseDir)
+			candidates = append(candidates, filepath.Join(rpath, relative))
+		}
+		candidates = append(candidates, filepath.Join("/usr/lib", relative), filepath.Join("/System/Library", relative))
+	default:
+		candidates = append(candidates, filepath.Join(baseDir, library), filepath.Join("/usr/lib", library), filepath.Join("/System/Library/Frameworks", library))
+	}
+	for _, candidate := range candidates {
+		resolved, err := resolveExistingPath(candidate)
+		if err != nil {
+			continue
+		}
+		if info, err := os.Stat(resolved); err == nil && info.Mode().IsRegular() {
+			return resolved, nil
+		}
+	}
+	return "", fmt.Errorf("resolve Mach-O dependency %s for %s: file not found", library, binaryPath)
+}
+
+func scriptInterpreterBytes(path string, raw []byte, searchPaths []string) (string, bool, error) {
 	line, _, _ := bytes.Cut(raw, []byte{'\n'})
 	if !bytes.HasPrefix(line, []byte("#!")) {
 		return "", false, nil
 	}
 	fields := strings.Fields(strings.TrimSpace(string(bytes.TrimPrefix(line, []byte("#!")))))
-	if len(fields) == 0 || !filepath.IsAbs(fields[0]) {
+	if len(fields) == 0 {
 		return "", false, fmt.Errorf("script %s has no absolute interpreter", path)
 	}
-	resolved, err := resolveExistingPath(fields[0])
+	interpreter := fields[0]
+	if filepath.Base(interpreter) == "env" {
+		if len(fields) != 2 || strings.HasPrefix(fields[1], "-") {
+			return "", false, fmt.Errorf("script %s uses unsupported env interpreter form", path)
+		}
+		interpreter = fields[1]
+	}
+	resolved, err := resolveExecutablePath(interpreter, searchPaths)
 	if err != nil {
 		return "", false, fmt.Errorf("resolve script interpreter: %w", err)
 	}
 	return resolved, true, nil
+}
+
+func resolveExecutablePath(path string, searchPaths []string) (string, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return "", fmt.Errorf("interpreter path is required")
+	}
+	if filepath.IsAbs(path) {
+		resolved, err := resolveExistingPath(path)
+		if err != nil {
+			return "", err
+		}
+		return validateExecutablePath(resolved)
+	}
+	for _, dir := range searchPaths {
+		candidate := filepath.Join(dir, path)
+		resolved, err := resolveExistingPath(candidate)
+		if err != nil {
+			continue
+		}
+		if validated, err := validateExecutablePath(resolved); err == nil {
+			return validated, nil
+		}
+	}
+	return "", fmt.Errorf("interpreter %q was not found in the sealed PATH", path)
+}
+
+func validateExecutablePath(path string) (string, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", err
+	}
+	if !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
+		return "", fmt.Errorf("%s is not an executable regular file", path)
+	}
+	return path, nil
 }
 
 func lddDependencies(path string) ([]string, error) {
@@ -617,29 +942,56 @@ func lddDependencies(path string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	command := exec.Command(lddPath, path)
+	ctx, cancel := context.WithTimeout(context.Background(), lddTimeout)
+	defer cancel()
+	command := exec.CommandContext(ctx, lddPath, path)
 	// The sandbox process receives a closed environment. Resolve the closure
 	// under the same no-loader-override assumption rather than inheriting a
 	// daemon LD_LIBRARY_PATH or LD_PRELOAD into the authority calculation.
 	command.Env = []string{"PATH=/usr/bin:/bin", "LC_ALL=C"}
-	output, err := command.CombinedOutput()
+	if os.Geteuid() == 0 {
+		nobody, err := user.Lookup("nobody")
+		if err != nil {
+			return nil, fmt.Errorf("resolve non-root ldd user: %w", err)
+		}
+		uid, err := strconv.ParseUint(nobody.Uid, 10, 32)
+		if err != nil {
+			return nil, fmt.Errorf("parse non-root ldd uid: %w", err)
+		}
+		gid, err := strconv.ParseUint(nobody.Gid, 10, 32)
+		if err != nil {
+			return nil, fmt.Errorf("parse non-root ldd gid: %w", err)
+		}
+		command.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid)}}
+	}
+	var stderr bytes.Buffer
+	command.Stderr = &stderr
+	output, err := command.Output()
 	if err != nil {
-		return nil, fmt.Errorf("ldd %s: %w: %s", path, err, strings.TrimSpace(string(output)))
+		combined := strings.ToLower(strings.TrimSpace(string(output) + "\n" + stderr.String()))
+		if strings.Contains(combined, "statically linked") {
+			return []string{}, nil
+		}
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("ldd %s: %w", path, ctx.Err())
+		}
+		return nil, fmt.Errorf("ldd %s: %w: %s", path, err, strings.TrimSpace(stderr.String()))
 	}
 	return parseLDDOutput(string(output))
 }
 
 func lddExecutable() (string, error) {
-	for _, candidate := range []string{"/usr/bin/ldd", "/bin/ldd"} {
-		if info, err := os.Stat(candidate); err == nil && info.Mode().IsRegular() {
-			resolved, resolveErr := resolveExistingPath(candidate)
-			if resolveErr != nil {
-				return "", resolveErr
-			}
-			return resolved, nil
+	candidate, err := exec.LookPath("ldd")
+	if err != nil {
+		return "", fmt.Errorf("ldd is required to resolve ELF closure: %w", err)
+	}
+	if !filepath.IsAbs(candidate) {
+		candidate, err = filepath.Abs(candidate)
+		if err != nil {
+			return "", err
 		}
 	}
-	return "", fmt.Errorf("ldd is required to resolve ELF closure")
+	return resolveExecutablePath(candidate, nil)
 }
 
 func parseLDDOutput(output string) ([]string, error) {
@@ -667,7 +1019,7 @@ func parseLDDOutput(output string) ([]string, error) {
 			candidate = strings.TrimSpace(fields[0])
 		}
 		if !filepath.IsAbs(candidate) {
-			continue
+			return nil, fmt.Errorf("non-absolute ELF dependency: %s", line)
 		}
 		resolved, err := resolveExistingPath(candidate)
 		if err != nil {

@@ -234,7 +234,7 @@ func Run(ctx context.Context, options Options) (shell.Result, error) {
 		Command: runtimePaths.command,
 		Args:    args,
 		CWD:     cwd,
-		Env:     isolatedEnvironment(tempRoot, options.Environment, runtimePaths.directories()),
+		Env:     isolatedEnvironment(tempRoot, options.Environment, runtimePaths.executableDirectories()),
 		Timeout: options.Timeout,
 		Tracker: options.Tracker,
 	})
@@ -261,6 +261,28 @@ func (p runtimePaths) directories() []string {
 		}
 	}
 	return compact(result)
+}
+
+// executableDirectories preserves the sealed Node directory as the first PATH
+// entry. SRT and package scripts commonly use #!/usr/bin/env node; sorting all
+// support directories would let a different node binary win lookup.
+func (p runtimePaths) executableDirectories() []string {
+	ordered := []string{p.node, p.command, p.ripgrep, p.bwrap, p.socat}
+	seen := make(map[string]struct{})
+	result := make([]string, 0, len(ordered))
+	for _, path := range ordered {
+		path = strings.TrimSpace(path)
+		if path == "" {
+			continue
+		}
+		dir := filepath.Dir(path)
+		if _, ok := seen[dir]; ok {
+			continue
+		}
+		seen[dir] = struct{}{}
+		result = append(result, dir)
+	}
+	return result
 }
 
 func installedRuntime(cwd string) (runtimePaths, error) {

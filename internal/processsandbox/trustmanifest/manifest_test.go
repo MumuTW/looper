@@ -73,7 +73,7 @@ func TestVerifyRecordedContentRejectsSubstitution(t *testing.T) {
 	}
 }
 
-func TestCompareManifestsRejectsMissingClosureEntry(t *testing.T) {
+func TestCompareManifestsRejectsExecutableRootDrift(t *testing.T) {
 	fixture := newFixture(t)
 	sealed, err := Build(fixture.input())
 	if err != nil {

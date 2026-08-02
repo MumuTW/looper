@@ -42,14 +42,21 @@ func run(args []string) error {
 	if !filepath.IsAbs(*manifestPath) || !filepath.IsAbs(*packageRoot) {
 		return fmt.Errorf("manifest and package-root must be absolute")
 	}
+	if filepath.Clean(*manifestPath) != filepath.Clean(trustmanifest.ManifestPath(*packageRoot)) {
+		return fmt.Errorf("manifest path must be %s", trustmanifest.ManifestPath(*packageRoot))
+	}
 	roots := map[string]string{"srt": *srt, "node": *node, "rg": *rg}
 	if runtime.GOOS == "linux" {
 		roots["bwrap"] = *bwrap
 		roots["socat"] = *socat
 	}
 	for name, path := range roots {
-		if strings.TrimSpace(path) == "" {
+		path = strings.TrimSpace(path)
+		if path == "" {
 			return fmt.Errorf("%s path is required", name)
+		}
+		if !filepath.IsAbs(path) {
+			return fmt.Errorf("%s path must be absolute", name)
 		}
 	}
 	if err := trustmanifest.Write(*manifestPath, trustmanifest.Input{PackageRoot: *packageRoot, Roots: roots}); err != nil {
