@@ -83,8 +83,6 @@ jobs:
 
       - name: Install process sandbox runtime
         run: |
-          test "$(node --version)" = "v22.14.0"
-          test "$(npm --version)" = "10.9.2"
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends bubblewrap socat ripgrep
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0

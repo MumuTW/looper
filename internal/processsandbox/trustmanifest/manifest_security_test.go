@@ -137,3 +137,12 @@ func TestELFInterpreterReadsPTInterp(t *testing.T) {
 		t.Fatalf("elfInterpreter(/bin/sh) = (%q, %v, %v), want absolute PT_INTERP", interpreter, ok, err)
 	}
 }
+
+func TestMachODependenciesSupportsDarwinSystemLibraries(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("fixture requires a Darwin Mach-O executable")
+	}
+	if _, err := machoDependencies("/bin/sh"); err != nil {
+		t.Fatalf("machoDependencies(/bin/sh) error = %v", err)
+	}
+}
