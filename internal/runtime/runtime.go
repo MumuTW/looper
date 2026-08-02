@@ -2090,8 +2090,11 @@ func (r *Runtime) executeDefaultSchedulerTick(ctx context.Context, services Serv
 }
 
 func (r *Runtime) executeSchedulerClaimPass(ctx context.Context) {
-	// Claim is a projection of admission — refuse before any durable claim.
-	if err := r.AllowClaim(); err != nil {
+	// The outer pump only gates lifecycle admission. Provider-specific queue
+	// lanes (and the common spawn boundary) own agent-health admission; using
+	// AllowClaim here would prevent agent-free snapshots and healthy sticky
+	// retries from reaching that partitioned logic during a full brownout.
+	if err := r.AllowLifecycleWork(); err != nil {
 		return
 	}
 	r.mu.RLock()

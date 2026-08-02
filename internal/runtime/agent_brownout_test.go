@@ -12,6 +12,7 @@ import (
 	"github.com/MumuTW/looper/internal/config"
 	gitinfra "github.com/MumuTW/looper/internal/infra/git"
 	"github.com/MumuTW/looper/internal/loops/brownout"
+	"github.com/MumuTW/looper/internal/storage"
 )
 
 type testClock struct {
@@ -80,6 +81,25 @@ func TestRepeatedAgentFailuresCloseClaimAdmission(t *testing.T) {
 	err := rt.AllowClaim()
 	if !errors.Is(err, brownout.ErrOpen) {
 		t.Fatalf("AllowClaim() = %v, want brownout.ErrOpen after sustained agent failures", err)
+	}
+}
+
+func TestSchedulerClaimPumpUsesLifecycleAdmissionDuringBrownout(t *testing.T) {
+	rt, clock := brownoutRuntime(t, nil)
+	rt.services.Repositories = &storage.Repositories{}
+	claimCalls := 0
+	rt.defaultSchedulerClaim = func(context.Context, Services) error {
+		claimCalls++
+		return nil
+	}
+	failAgent(rt, clock, 3)
+	if !errors.Is(rt.AllowClaim(), brownout.ErrOpen) {
+		t.Fatal("AllowClaim() = nil, want provider brownout open")
+	}
+
+	rt.executeSchedulerClaimPass(context.Background())
+	if claimCalls != 1 {
+		t.Fatalf("claim calls = %d, want lifecycle-only outer pump to reach partitioned claim logic", claimCalls)
 	}
 }
 
