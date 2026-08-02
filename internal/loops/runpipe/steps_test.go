@@ -29,7 +29,9 @@ func (tr *stepTrace) runner(failOn string, handleFailure bool, stopAfter string)
 		Execute: func(_ context.Context, step string, _ storage.RunRecord, c int) (int, error) {
 			tr.events = append(tr.events, "execute:"+step)
 			if step == failOn {
-				return c, errors.New("boom at " + step)
+				// Steps mutate their checkpoint on error paths too (resume
+				// policy, pause state); the engine must adopt it.
+				return c + 100, errors.New("boom at " + step)
 			}
 			return c + 1, nil
 		},
@@ -80,8 +82,8 @@ func TestStepRunnerHandledFailureBecomesTerminal(t *testing.T) {
 	if terminal == nil || terminal.Status != "failed" || !strings.Contains(terminal.Summary, "boom at b") {
 		t.Fatalf("terminal = %+v, want the dispatched failure result", terminal)
 	}
-	if checkpoint != 1 {
-		t.Fatalf("checkpoint = %d, want the pre-failure value (failed step's checkpoint not adopted)", checkpoint)
+	if checkpoint != 101 {
+		t.Fatalf("checkpoint = %d, want the failed step's returned checkpoint adopted (error-path mutations must reach the failure dispatch)", checkpoint)
 	}
 	joined := strings.Join(tr.events, "|")
 	if strings.Contains(joined, "persist-done:b") || strings.Contains(joined, "persist-start:c") {

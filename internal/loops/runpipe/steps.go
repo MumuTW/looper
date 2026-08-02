@@ -52,7 +52,11 @@ func (s StepRunner[S, C]) Run(ctx context.Context, steps []S, run storage.RunRec
 		if s.EmitStepEvent != nil {
 			s.EmitStepEvent(ctx, "loop.step.started", step, run)
 		}
-		next, err := s.Execute(ctx, step, run, checkpoint)
+		// The step's returned checkpoint is adopted even on error: steps
+		// mutate resume policy and pause state on their error paths, and
+		// the failure dispatch must see those mutations (this mirrors the
+		// runners' historical `checkpoint, err = executeStep(...)`).
+		checkpoint, err = s.Execute(ctx, step, run, checkpoint)
 		if err != nil {
 			result, handled, failErr := s.OnFailure(ctx, step, run, checkpoint, err)
 			if failErr != nil {
@@ -63,7 +67,6 @@ func (s StepRunner[S, C]) Run(ctx context.Context, steps []S, run storage.RunRec
 			}
 			return run, checkpoint, nil, err
 		}
-		checkpoint = next
 		run, err = s.PersistCompleted(ctx, run, step, checkpoint)
 		if err != nil {
 			return run, checkpoint, nil, err
