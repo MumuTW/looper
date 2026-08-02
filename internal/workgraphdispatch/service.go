@@ -73,12 +73,6 @@ func (s *Service) Create(ctx context.Context, input CreateInput) (CreateResult, 
 	if len(nodes) == 0 {
 		return CreateResult{}, fmt.Errorf("work graph must contain at least one node")
 	}
-	for _, node := range nodes {
-		if len(node.Dependencies) > 1 {
-			return CreateResult{}, fmt.Errorf("node %q has multiple dependencies and no unambiguous pull-request base", node.Key)
-		}
-	}
-
 	result := CreateResult{}
 	err := storage.WithTransaction(ctx, s.db, nil, func(tx *sql.Tx) error {
 		repos := storage.NewRepositories(tx)
@@ -195,14 +189,26 @@ func (s *Service) ReleaseWorkerNode(ctx context.Context, workerLoopID string) er
 		return nil
 	}
 	return storage.WithTransaction(ctx, s.db, nil, func(tx *sql.Tx) error {
-		repos := storage.NewRepositories(tx)
-		node, err := repos.PlannerWorkGraphs.GetNodeByWorkerLoopID(ctx, workerLoopID)
-		if err != nil || node == nil {
-			return err
-		}
-		_, err = repos.PlannerWorkGraphs.TransitionNode(ctx, node.GraphID, node.NodeKey, "running", "queued", nil, s.nowISO())
-		return err
+		return s.releaseWorkerNode(ctx, storage.NewRepositories(tx), workerLoopID)
 	})
+}
+
+// ReleaseWorkerNodeInTransaction is the storage callback counterpart of
+// ReleaseWorkerNode. Its caller owns the surrounding transaction.
+func (s *Service) ReleaseWorkerNodeInTransaction(ctx context.Context, repos *storage.Repositories, workerLoopID string) error {
+	if repos == nil || strings.TrimSpace(workerLoopID) == "" {
+		return nil
+	}
+	return s.releaseWorkerNode(ctx, repos, workerLoopID)
+}
+
+func (s *Service) releaseWorkerNode(ctx context.Context, repos *storage.Repositories, workerLoopID string) error {
+	node, err := repos.PlannerWorkGraphs.GetNodeByWorkerLoopID(ctx, workerLoopID)
+	if err != nil || node == nil {
+		return err
+	}
+	_, err = repos.PlannerWorkGraphs.TransitionNode(ctx, node.GraphID, node.NodeKey, "running", "queued", nil, s.nowISO())
+	return err
 }
 
 // CompleteWorkerNode settles one running node and queues exactly the children
@@ -284,13 +290,6 @@ func (s *Service) completeWorkerNode(ctx context.Context, repos *storage.Reposit
 		if len(deps) != 1 || deps[0] != node.NodeKey || byKey[deps[0]].State != "completed" {
 			continue
 		}
-		changed, err := repos.PlannerWorkGraphs.TransitionNode(ctx, candidate.GraphID, candidate.NodeKey, "pending", "queued", nil, s.nowISO())
-		if err != nil || !changed {
-			if err != nil {
-				return nil, err
-			}
-			continue
-		}
 		loop, err := repos.Loops.GetByID(ctx, candidate.WorkerLoopID)
 		if err != nil || loop == nil {
 			if err != nil {
@@ -299,6 +298,20 @@ func (s *Service) completeWorkerNode(ctx context.Context, repos *storage.Reposit
 			return nil, fmt.Errorf("worker loop not found: %s", candidate.WorkerLoopID)
 		}
 		nowISO := s.nowISO()
+		if loop.Status == "terminated" {
+			reason := "worker loop terminated"
+			if _, err := repos.PlannerWorkGraphs.TransitionNode(ctx, candidate.GraphID, candidate.NodeKey, "pending", "closed", stringPtr(reason), nowISO); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		changed, err := repos.PlannerWorkGraphs.TransitionNode(ctx, candidate.GraphID, candidate.NodeKey, "pending", "queued", nil, nowISO)
+		if err != nil || !changed {
+			if err != nil {
+				return nil, err
+			}
+			continue
+		}
 		loop.Status, loop.NextRunAt, loop.UpdatedAt = "queued", &nowISO, nowISO
 		if err := repos.Loops.Upsert(ctx, *loop); err != nil {
 			return nil, err
@@ -331,61 +344,9 @@ func (s *Service) FailWorkerNode(ctx context.Context, workerLoopID, reason strin
 	}
 	replanned := false
 	err := storage.WithTransaction(ctx, s.db, nil, func(tx *sql.Tx) error {
-		repos := storage.NewRepositories(tx)
-		node, err := repos.PlannerWorkGraphs.GetNodeByWorkerLoopID(ctx, workerLoopID)
-		if err != nil || node == nil {
-			return err
-		}
-		if node.State == "failed" {
-			return nil
-		}
-		changed, err := repos.PlannerWorkGraphs.TransitionNode(ctx, node.GraphID, node.NodeKey, "running", "failed", stringPtr(reason), s.nowISO())
-		if err != nil {
-			return err
-		}
-		if !changed {
-			return nil
-		}
-		graph, err := repos.PlannerWorkGraphs.GetByID(ctx, node.GraphID)
-		if err != nil || graph == nil {
-			if err != nil {
-				return err
-			}
-			return fmt.Errorf("work graph not found: %s", node.GraphID)
-		}
-		if err := repos.PlannerWorkGraphs.UpdateStatus(ctx, graph.ID, "replan_required", stringPtr(reason), s.nowISO()); err != nil {
-			return err
-		}
-		_, err = tx.ExecContext(ctx, `
-			UPDATE planner_work_graph_nodes SET blocked_reason = ?, updated_at = ?
-			WHERE graph_id = ? AND state = 'pending' AND node_key IN (
-				SELECT node_key FROM planner_work_graph_dependencies WHERE graph_id = ? AND depends_on_key = ?
-			)
-		`, "blocked by failed prerequisite "+node.NodeKey, s.nowISO(), graph.ID, graph.ID, node.NodeKey)
-		if err != nil {
-			return fmt.Errorf("record blocked graph children: %w", err)
-		}
-		plannerLoop, err := repos.Loops.GetByID(ctx, graph.PlannerLoopID)
-		if err != nil || plannerLoop == nil {
-			if err != nil {
-				return err
-			}
-			return fmt.Errorf("planner loop not found: %s", graph.PlannerLoopID)
-		}
-		nowISO := s.nowISO()
-		plannerLoop.Status, plannerLoop.NextRunAt, plannerLoop.UpdatedAt = "queued", &nowISO, nowISO
-		if err := repos.Loops.Upsert(ctx, *plannerLoop); err != nil {
-			return err
-		}
-		payload, _ := json.Marshal(map[string]any{"issueNumber": graph.ParentIssueNumber, "replanReason": reason, "workGraphID": graph.ID})
-		targetID := fmt.Sprintf("issue:%s:%d", graph.ParentRepo, graph.ParentIssueNumber)
-		lockKey := storage.IssueLockKey(graph.ProjectID, graph.ParentRepo, graph.ParentIssueNumber)
-		queue := storage.QueueItemRecord{ID: eventlog.NewEventID("queue"), ProjectID: &graph.ProjectID, LoopID: &graph.PlannerLoopID, Type: "planner", TargetType: "issue", TargetID: targetID, Repo: &graph.ParentRepo, DedupeKey: "planner:workgraph-replan:" + graph.ID, Priority: storage.QueuePriorityPlanner, Status: "queued", AvailableAt: nowISO, MaxAttempts: s.retryMaxAttempts, LockKey: &lockKey, PayloadJSON: stringPtr(string(payload)), CreatedAt: nowISO, UpdatedAt: nowISO}
-		if err := repos.Queue.Upsert(ctx, queue); err != nil {
-			return err
-		}
-		replanned = true
-		return nil
+		var err error
+		replanned, err = s.failWorkerNode(ctx, storage.NewRepositories(tx), workerLoopID, reason, true)
+		return err
 	})
 	if err != nil {
 		return false, err
@@ -394,6 +355,81 @@ func (s *Service) FailWorkerNode(ctx context.Context, workerLoopID, reason strin
 		s.onEnqueued()
 	}
 	return replanned, nil
+}
+
+// FailWorkerNodeInTransaction is the storage callback counterpart of
+// FailWorkerNode. Its caller owns the surrounding transaction.
+func (s *Service) FailWorkerNodeInTransaction(ctx context.Context, repos *storage.Repositories, workerLoopID, reason string) (bool, error) {
+	if repos == nil || strings.TrimSpace(workerLoopID) == "" {
+		return false, nil
+	}
+	return s.failWorkerNode(ctx, repos, workerLoopID, reason, true)
+}
+
+// SettleSkippedWorkerNode records a non-success Worker outcome without
+// unlocking dependents or queueing Planner replan.
+func (s *Service) SettleSkippedWorkerNode(ctx context.Context, workerLoopID, reason string) error {
+	if s.db == nil || strings.TrimSpace(workerLoopID) == "" {
+		return nil
+	}
+	return storage.WithTransaction(ctx, s.db, nil, func(tx *sql.Tx) error {
+		_, err := s.failWorkerNode(ctx, storage.NewRepositories(tx), workerLoopID, reason, false)
+		return err
+	})
+}
+
+func (s *Service) failWorkerNode(ctx context.Context, repos *storage.Repositories, workerLoopID, reason string, replan bool) (bool, error) {
+	node, err := repos.PlannerWorkGraphs.GetNodeByWorkerLoopID(ctx, workerLoopID)
+	if err != nil || node == nil {
+		return false, err
+	}
+	if node.State == "failed" || node.State == "closed" {
+		return false, nil
+	}
+	changed, err := repos.PlannerWorkGraphs.TransitionNode(ctx, node.GraphID, node.NodeKey, "running", "failed", stringPtr(reason), s.nowISO())
+	if err != nil {
+		return false, err
+	}
+	if !changed {
+		return false, nil
+	}
+	graph, err := repos.PlannerWorkGraphs.GetByID(ctx, node.GraphID)
+	if err != nil || graph == nil {
+		if err != nil {
+			return false, err
+		}
+		return false, fmt.Errorf("work graph not found: %s", node.GraphID)
+	}
+	blockReason := "blocked by failed prerequisite " + node.NodeKey
+	if err := repos.PlannerWorkGraphs.BlockPendingChildrenAfterFailure(ctx, graph.ID, node.NodeKey, blockReason, s.nowISO()); err != nil {
+		return false, err
+	}
+	if !replan {
+		return false, nil
+	}
+	if err := repos.PlannerWorkGraphs.UpdateStatus(ctx, graph.ID, "replan_required", stringPtr(reason), s.nowISO()); err != nil {
+		return false, err
+	}
+	plannerLoop, err := repos.Loops.GetByID(ctx, graph.PlannerLoopID)
+	if err != nil || plannerLoop == nil {
+		if err != nil {
+			return false, err
+		}
+		return false, fmt.Errorf("planner loop not found: %s", graph.PlannerLoopID)
+	}
+	nowISO := s.nowISO()
+	plannerLoop.Status, plannerLoop.NextRunAt, plannerLoop.UpdatedAt = "queued", &nowISO, nowISO
+	if err := repos.Loops.Upsert(ctx, *plannerLoop); err != nil {
+		return false, err
+	}
+	payload, _ := json.Marshal(map[string]any{"issueNumber": graph.ParentIssueNumber, "replanReason": reason, "workGraphID": graph.ID})
+	targetID := fmt.Sprintf("issue:%s:%d", graph.ParentRepo, graph.ParentIssueNumber)
+	lockKey := storage.IssueLockKey(graph.ProjectID, graph.ParentRepo, graph.ParentIssueNumber)
+	queue := storage.QueueItemRecord{ID: eventlog.NewEventID("queue"), ProjectID: &graph.ProjectID, LoopID: &graph.PlannerLoopID, Type: "planner", TargetType: "issue", TargetID: targetID, Repo: &graph.ParentRepo, DedupeKey: "planner:workgraph-replan:" + graph.ID, Priority: storage.QueuePriorityPlanner, Status: "queued", AvailableAt: nowISO, MaxAttempts: s.retryMaxAttempts, LockKey: &lockKey, PayloadJSON: stringPtr(string(payload)), CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := repos.Queue.Upsert(ctx, queue); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func enqueueNode(ctx context.Context, repos *storage.Repositories, projectID, repo, graphID, nodeKey, loopID, targetID string, payload map[string]any, maxAttempts int64, nowISO string) error {
@@ -412,7 +448,7 @@ func workerPayload(graphID string, node workgraph.Node, repo, baseBranch, branch
 		criteria = append(criteria, "- "+criterion)
 	}
 	prompt := strings.Join([]string{"Goal: " + node.Goal, "Acceptance criteria:", strings.Join(criteria, "\n"), "Expected pull-request scope: " + node.ExpectedPRScope}, "\n")
-	return map[string]any{"title": node.Goal, "prompt": prompt, "repo": repo, "baseBranch": baseBranch, "branch": branch, "executionMode": "create-pr", "workGraphID": graphID, "workGraphNodeKey": node.Key}
+	return map[string]any{"title": node.Goal, "prompt": prompt, "repo": repo, "baseBranch": baseBranch, "branch": branch, "executionMode": "create-pr", "autoDiscovered": true, "workGraphID": graphID, "workGraphNodeKey": node.Key}
 }
 
 func parseWorkerPayload(metadataJSON *string) map[string]any {

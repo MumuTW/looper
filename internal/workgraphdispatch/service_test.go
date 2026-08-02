@@ -81,6 +81,52 @@ func TestCreateAndCompleteQueuesOnlyReadyNodesOnce(t *testing.T) {
 	}
 }
 
+func TestCompleteWorkerNodeHonorsTerminatedChildLoop(t *testing.T) {
+	t.Parallel()
+	fixture := newFixture(t)
+	graph := mustGraph(t,
+		workgraph.Node{Key: "storage", Goal: "Persist records", AcceptanceCriteria: []string{"migration"}, ExpectedPRScope: "storage"},
+		workgraph.Node{Key: "api", Goal: "Expose records", AcceptanceCriteria: []string{"route"}, ExpectedPRScope: "api", Dependencies: []string{"storage"}},
+	)
+	created, err := fixture.service.Create(fixture.ctx, CreateInput{ProjectID: fixture.projectID, ParentRepo: "acme/looper", ParentIssueNumber: 339, PlannerLoopID: fixture.plannerLoopID, BaseBranch: "main", Graph: graph})
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	nodes, _ := fixture.repos.PlannerWorkGraphs.ListNodes(fixture.ctx, created.GraphID)
+	storageNode := nodeByKey(t, nodes, "storage")
+	apiNode := nodeByKey(t, nodes, "api")
+	nowISO := "2026-07-31T08:00:00.000Z"
+	apiLoop, err := fixture.repos.Loops.GetByID(fixture.ctx, apiNode.WorkerLoopID)
+	if err != nil || apiLoop == nil {
+		t.Fatalf("GetByID(api loop) = %#v, %v", apiLoop, err)
+	}
+	apiLoop.Status = "terminated"
+	apiLoop.UpdatedAt = nowISO
+	if err := fixture.repos.Loops.Upsert(fixture.ctx, *apiLoop); err != nil {
+		t.Fatalf("terminate api loop: %v", err)
+	}
+	if claimed, err := fixture.service.ClaimWorkerNode(fixture.ctx, storageNode.WorkerLoopID); err != nil || !claimed {
+		t.Fatalf("ClaimWorkerNode() = (%t, %v)", claimed, err)
+	}
+	if _, err := fixture.service.CompleteWorkerNode(fixture.ctx, storageNode.WorkerLoopID); err != nil {
+		t.Fatalf("CompleteWorkerNode() error = %v", err)
+	}
+	nodes, _ = fixture.repos.PlannerWorkGraphs.ListNodes(fixture.ctx, created.GraphID)
+	apiNode = nodeByKey(t, nodes, "api")
+	if apiNode.State != "closed" {
+		t.Fatalf("terminated child node = %#v, want closed without queueing", apiNode)
+	}
+	queued, err := fixture.repos.Queue.ListQueued(fixture.ctx, 10)
+	if err != nil {
+		t.Fatalf("ListQueued() error = %v", err)
+	}
+	for _, item := range queued {
+		if item.LoopID != nil && *item.LoopID == apiNode.WorkerLoopID {
+			t.Fatalf("terminated child was queued: %#v", item)
+		}
+	}
+}
+
 func TestFailedNodeBlocksChildAndQueuesPlannerReplan(t *testing.T) {
 	t.Parallel()
 	fixture := newFixture(t)

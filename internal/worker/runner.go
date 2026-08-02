@@ -3071,6 +3071,11 @@ func workerWorkForPullRequest(work workerInput, pr PullRequestSummary) workerInp
 func (r *Runner) finishHeldWorkerQueueItem(ctx context.Context, project storage.ProjectRecord, loop storage.LoopRecord, run *storage.RunRecord, queueItem storage.QueueItemRecord, checkpoint workerCheckpoint, summary string) (runpipe.ProcessResult, error) {
 	checkpoint.SkipReason = summary
 	checkpoint.ResumePolicy = loops.ResumePolicyAdvanceFromCheckpoint
+	if graphQueueItem(queueItem) && queueItem.LoopID != nil {
+		if err := r.workGraphs.ReleaseWorkerNode(ctx, *queueItem.LoopID); err != nil {
+			return runpipe.ProcessResult{}, err
+		}
+	}
 	if run != nil {
 		finishedAt := r.nowISO()
 		completed := completedRunRecord(*run, "success", summary, "", checkpoint, finishedAt)
@@ -3350,7 +3355,15 @@ func (r *Runner) finalizeSuccessfulClaim(ctx context.Context, run storage.RunRec
 	finishedAt := r.nowISO()
 	completed := completedRunRecord(run, "success", summary, "", checkpoint, finishedAt)
 	unlocked := false
-	if err := storage.FinalizeWorkerSuccess(ctx, r.db, storage.WorkerSuccessFinalizationInput{Run: completed, QueueItemID: queueItem.ID, LoopID: loop.ID, LoopStatus: "completed", FinishedAt: finishedAt, RequeueForHumanInbox: requeueForHumanInbox, AfterFinalize: r.workGraphFinalizationHook(loop.ID, &unlocked)}); err != nil {
+	finalizeInput := storage.WorkerSuccessFinalizationInput{Run: completed, QueueItemID: queueItem.ID, LoopID: loop.ID, LoopStatus: "completed", FinishedAt: finishedAt, RequeueForHumanInbox: requeueForHumanInbox}
+	if checkpoint.SkipReason == "" {
+		finalizeInput.AfterFinalize = r.workGraphFinalizationHook(loop.ID, &unlocked)
+	} else if graphQueueItem(queueItem) {
+		if err := r.workGraphs.SettleSkippedWorkerNode(ctx, loop.ID, checkpoint.SkipReason); err != nil {
+			return storage.RunRecord{}, err
+		}
+	}
+	if err := storage.FinalizeWorkerSuccess(ctx, r.db, finalizeInput); err != nil {
 		return storage.RunRecord{}, errors.Join(ErrSuccessfulClaimFinalization, err)
 	}
 	if unlocked {
@@ -3814,37 +3827,62 @@ func (r *Runner) failQueueItem(ctx context.Context, queueItem storage.QueueItemR
 	}
 	nextAttempts := queueItem.Attempts + 1
 	nowISO := r.nowISO()
+	isGraph := graphQueueItem(queueItem) && queueItem.LoopID != nil
 	if !runpipe.ShouldRetryQueueFailure(kind, nextAttempts, queueItem.MaxAttempts) {
+		if isGraph {
+			replanned := false
+			err := storage.WithTransaction(ctx, r.db, nil, func(tx *sql.Tx) error {
+				repos := storage.NewRepositories(tx)
+				if err := repos.Queue.Fail(ctx, storage.QueueFailInput{ID: queueItem.ID, Attempts: nextAttempts, FinishedAt: nowISO, ErrorMessage: runpipe.OptionalString(message), ErrorKind: string(kind), UpdatedAt: nowISO}); err != nil {
+					return err
+				}
+				var failErr error
+				replanned, failErr = r.workGraphs.FailWorkerNodeInTransaction(ctx, repos, *queueItem.LoopID, message)
+				return failErr
+			})
+			if err != nil {
+				if recovered, getErr := r.repos.Queue.GetByID(ctx, queueItem.ID); getErr == nil && recovered != nil && (recovered.Status == "manual_intervention" || recovered.Status == "completed" || recovered.Status == "failed") {
+					return recovered, nil
+				}
+				return nil, err
+			}
+			if replanned {
+				r.workGraphs.Wake()
+			}
+			return r.repos.Queue.GetByID(ctx, queueItem.ID)
+		}
 		if err := r.repos.Queue.Fail(ctx, storage.QueueFailInput{ID: queueItem.ID, Attempts: nextAttempts, FinishedAt: nowISO, ErrorMessage: runpipe.OptionalString(message), ErrorKind: string(kind), UpdatedAt: nowISO}); err != nil {
 			if recovered, getErr := r.repos.Queue.GetByID(ctx, queueItem.ID); getErr == nil && recovered != nil && (recovered.Status == "manual_intervention" || recovered.Status == "completed" || recovered.Status == "failed") {
 				return recovered, nil
 			}
 			return nil, err
 		}
-		if graphQueueItem(queueItem) && queueItem.LoopID != nil {
-			if _, err := r.workGraphs.FailWorkerNode(ctx, *queueItem.LoopID, message); err != nil {
-				return nil, err
-			}
-		}
 		return r.repos.Queue.GetByID(ctx, queueItem.ID)
 	}
 	retryAt := eventlog.FormatJavaScriptISOString(r.now().Add(runpipe.BackoffDelayLinear(r.retryBaseDelay, runpipe.CappedRetryDelayAttempt(nextAttempts, queueItem.MaxAttempts))))
+	if isGraph {
+		err := storage.WithTransaction(ctx, r.db, nil, func(tx *sql.Tx) error {
+			repos := storage.NewRepositories(tx)
+			if err := repos.Queue.MarkRetry(ctx, storage.QueueMarkRetryInput{ID: queueItem.ID, AvailableAt: retryAt, Attempts: nextAttempts, ErrorMessage: runpipe.OptionalString(message), ErrorKind: string(kind), UpdatedAt: nowISO}); err != nil {
+				return err
+			}
+			return r.workGraphs.ReleaseWorkerNodeInTransaction(ctx, repos, *queueItem.LoopID)
+		})
+		if err != nil {
+			if recovered, getErr := r.repos.Queue.GetByID(ctx, queueItem.ID); getErr == nil && recovered != nil && (recovered.Status == "manual_intervention" || recovered.Status == "completed" || recovered.Status == "failed") {
+				return recovered, nil
+			}
+			return nil, err
+		}
+		return r.repos.Queue.GetByID(ctx, queueItem.ID)
+	}
 	if err := r.repos.Queue.MarkRetry(ctx, storage.QueueMarkRetryInput{ID: queueItem.ID, AvailableAt: retryAt, Attempts: nextAttempts, ErrorMessage: runpipe.OptionalString(message), ErrorKind: string(kind), UpdatedAt: nowISO}); err != nil {
 		if recovered, getErr := r.repos.Queue.GetByID(ctx, queueItem.ID); getErr == nil && recovered != nil && (recovered.Status == "manual_intervention" || recovered.Status == "completed" || recovered.Status == "failed") {
 			return recovered, nil
 		}
 		return nil, err
 	}
-	persisted, err := r.repos.Queue.GetByID(ctx, queueItem.ID)
-	if err != nil {
-		return nil, err
-	}
-	if persisted != nil && persisted.Status == "queued" && graphQueueItem(queueItem) && queueItem.LoopID != nil {
-		if err := r.workGraphs.ReleaseWorkerNode(ctx, *queueItem.LoopID); err != nil {
-			return nil, err
-		}
-	}
-	return persisted, nil
+	return r.repos.Queue.GetByID(ctx, queueItem.ID)
 }
 
 func (r *Runner) updateLoop(ctx context.Context, loop storage.LoopRecord, mutate func(*storage.LoopRecord)) (storage.LoopRecord, error) {

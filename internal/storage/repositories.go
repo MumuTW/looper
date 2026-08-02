@@ -1001,6 +1001,19 @@ func (r *PlannerWorkGraphsRepository) TransitionNode(ctx context.Context, graphI
 	return affected == 1, nil
 }
 
+func (r *PlannerWorkGraphsRepository) BlockPendingChildrenAfterFailure(ctx context.Context, graphID, dependsOnKey, reason, updatedAt string) error {
+	_, err := r.q.ExecContext(ctx, `
+		UPDATE planner_work_graph_nodes SET blocked_reason = ?, updated_at = ?
+		WHERE graph_id = ? AND state = 'pending' AND node_key IN (
+			SELECT node_key FROM planner_work_graph_dependencies WHERE graph_id = ? AND depends_on_key = ?
+		)
+	`, reason, updatedAt, graphID, graphID, dependsOnKey)
+	if err != nil {
+		return fmt.Errorf("record blocked graph children: %w", err)
+	}
+	return nil
+}
+
 func (r *ProjectsRepository) Upsert(ctx context.Context, record ProjectRecord) error {
 	_, err := r.q.ExecContext(ctx, `
 		INSERT INTO projects (id, name, repo_path, base_branch, archived, metadata_json, created_at, updated_at)

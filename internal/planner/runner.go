@@ -830,6 +830,14 @@ func (r *Runner) discoveryPolicyForProject(projectID string) DiscoveryPolicy {
 	return DiscoveryPolicy{AutoDiscovery: role.Discovery.Enabled, Labels: append([]string(nil), role.Discovery.Labels...), LabelMode: role.Discovery.LabelMode, RequireAssigneeCurrentUser: role.Discovery.RequireAssigneeCurrentUser}
 }
 
+func (r *Runner) workerRoleConfigured(projectID string) bool {
+	if r.projectRoleConfig == nil {
+		return true
+	}
+	_, ok := config.ResolveAgent(*r.projectRoleConfig, projectID, config.CodingRoleWorker)
+	return ok
+}
+
 func (r *Runner) ProcessNext(ctx context.Context, claimedBy string) (*runpipe.ProcessResult, error) {
 	if r.repos == nil || r.repos.Queue == nil {
 		return nil, fmt.Errorf("planner queue repository is not configured")
@@ -1241,7 +1249,7 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 		if err != nil {
 			return checkpoint, fmt.Errorf("resolve run agent identity: %w", err)
 		}
-		prompt, instructionBlock := buildPlannerPrompt(input.Project, r.customInstructions, issue, worktree, r.allowAutoPush, r.disclosure, agentVendor, derefString(agentModel))
+		prompt, instructionBlock := buildPlannerPrompt(input.Project, r.customInstructions, issue, worktree, r.allowAutoPush, r.disclosure, agentVendor, derefString(agentModel), r.workerRoleConfigured(input.Project.ID))
 		metadata := map[string]any{"loopType": "planner", "repo": issue.Repo, "issueNumber": issue.IssueNumber, "specPath": issue.SpecPath}
 		for key, value := range config.CustomInstructionMetadata(instructionBlock, prompt) {
 			metadata[key] = value
@@ -1299,6 +1307,9 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 				return checkpoint, &runpipe.LoopError{Message: "planner work graph: " + graphErr.Error(), Kind: runpipe.FailureNonRetryable}
 			}
 			if graph != nil {
+				if !r.workerRoleConfigured(input.Project.ID) {
+					return checkpoint, &runpipe.LoopError{Message: "work graph requires a configured worker agent", Kind: runpipe.FailureNonRetryable}
+				}
 				created, createErr := r.workGraphs.Create(ctx, workgraphdispatch.CreateInput{ProjectID: input.Project.ID, ParentRepo: issue.Repo, ParentIssueNumber: issue.IssueNumber, PlannerLoopID: input.Loop.ID, BaseBranch: worktree.BaseBranch, Graph: *graph})
 				if createErr != nil {
 					return checkpoint, &runpipe.LoopError{Message: "persist planner work graph: " + createErr.Error(), Kind: runpipe.FailureRetryableAfterResume}
@@ -2167,7 +2178,7 @@ func (c *plannerCheckpoint) ensureLifecycle(runner, branch, baseBranch string, e
 	}
 }
 
-func buildPlannerPrompt(project storage.ProjectRecord, instructionConfig config.Config, issue *checkpointIssue, worktree *checkpointWorktree, allowAutoPush bool, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string) (string, config.CustomInstructionBlock) {
+func buildPlannerPrompt(project storage.ProjectRecord, instructionConfig config.Config, issue *checkpointIssue, worktree *checkpointWorktree, allowAutoPush bool, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string, workGraphAllowed bool) (string, config.CustomInstructionBlock) {
 	parts := []string{
 		fmt.Sprintf("Write a planning spec for GitHub issue %s#%d.", issue.Repo, issue.IssueNumber),
 		"Repository: " + issue.Repo,
@@ -2205,7 +2216,11 @@ func buildPlannerPrompt(project storage.ProjectRecord, instructionConfig config.
 		"- Create or update the spec at " + issue.SpecPath,
 		"- Use Markdown with clear problem, goals, approach, risks, and validation sections",
 		"- Keep the implementation scope aligned to the issue",
-		"- For work that benefits from dependency-ordered child pull requests, include workGraph in the final __LOOPER_RESULT__ JSON: {\"nodes\":[{\"key\":\"stable-key\",\"goal\":\"...\",\"acceptanceCriteria\":[\"...\"],\"dependencies\":[\"prerequisite-key\"],\"expectedPrScope\":\"...\"}]}; omit workGraph for one cohesive implementation",
+	}
+	if workGraphAllowed {
+		requirements = append(requirements,
+			"- For work that benefits from dependency-ordered child pull requests, include workGraph in the final __LOOPER_RESULT__ JSON: {\"nodes\":[{\"key\":\"stable-key\",\"goal\":\"...\",\"acceptanceCriteria\":[\"...\"],\"dependencies\":[\"prerequisite-key\"],\"expectedPrScope\":\"...\"}]}; each node may depend on at most one prerequisite; omit workGraph for one cohesive implementation",
+		)
 	}
 	if allowAutoPush {
 		requirements = append(requirements, "- Commit the spec changes on the current branch so the PR can be opened")

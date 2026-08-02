@@ -30,12 +30,24 @@ func TestBuildRejectsMissingNodesAndCycles(t *testing.T) {
 	}
 }
 
+func TestBuildRejectsMultipleDependencies(t *testing.T) {
+	t.Parallel()
+	_, err := Build([]Node{
+		{Key: "api", Goal: "API", AcceptanceCriteria: []string{"endpoint"}, ExpectedPRScope: "api"},
+		{Key: "storage", Goal: "Storage", AcceptanceCriteria: []string{"table"}, ExpectedPRScope: "storage"},
+		{Key: "worker", Goal: "Worker", AcceptanceCriteria: []string{"handoff"}, ExpectedPRScope: "worker", Dependencies: []string{"api", "storage"}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "multiple dependencies") {
+		t.Fatalf("Build() error = %v, want multiple dependencies rejection", err)
+	}
+}
+
 func TestEvaluateQueuesOnlyDependencyFreeNodes(t *testing.T) {
 	t.Parallel()
 	graph, err := Build([]Node{
 		{Key: "api", Goal: "API", AcceptanceCriteria: []string{"endpoint"}, ExpectedPRScope: "api"},
 		{Key: "storage", Goal: "Storage", AcceptanceCriteria: []string{"table"}, ExpectedPRScope: "storage"},
-		{Key: "worker", Goal: "Worker", AcceptanceCriteria: []string{"handoff"}, ExpectedPRScope: "worker", Dependencies: []string{"api", "storage"}},
+		{Key: "worker", Goal: "Worker", AcceptanceCriteria: []string{"handoff"}, ExpectedPRScope: "worker", Dependencies: []string{"storage"}},
 	})
 	if err != nil {
 		t.Fatalf("Build() error = %v", err)

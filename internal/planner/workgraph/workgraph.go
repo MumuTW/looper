@@ -14,6 +14,11 @@ import (
 
 var keyPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]*$`)
 
+const (
+	// MaxNodes caps how many child workers one Planner decomposition may spawn.
+	MaxNodes = 32
+)
+
 // Node is one independently implementable child item emitted by Planner.
 // Key is stable within a graph revision and dependencies name other keys in
 // that revision.
@@ -86,9 +91,15 @@ func Build(nodes []Node) (Graph, error) {
 	if len(nodes) == 0 {
 		return Graph{}, fmt.Errorf("work graph must contain at least one node")
 	}
+	if len(nodes) > MaxNodes {
+		return Graph{}, fmt.Errorf("work graph must contain at most %d nodes", MaxNodes)
+	}
 	graph := Graph{nodes: make(map[string]Node, len(nodes))}
 	for _, raw := range nodes {
 		node := normalizeNode(raw)
+		if len(node.Dependencies) > 1 {
+			return Graph{}, fmt.Errorf("node %q has multiple dependencies; work graphs support at most one prerequisite per node", node.Key)
+		}
 		if !keyPattern.MatchString(node.Key) {
 			return Graph{}, fmt.Errorf("invalid node key %q", raw.Key)
 		}
