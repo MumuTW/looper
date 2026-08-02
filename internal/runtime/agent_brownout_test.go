@@ -311,6 +311,37 @@ func TestAgentBrownoutAdmitsStickySnapshotAfterVendorRemoval(t *testing.T) {
 	}
 }
 
+func TestAgentHealthPromotesRetainedBreakerWhenVendorReturns(t *testing.T) {
+	rt, _ := brownoutRuntime(t, func(cfg *config.AgentBrownoutConfig) {
+		cfg.MinFailures = 3
+		cfg.CooldownSeconds = 600
+		cfg.MaxCooldownSeconds = 3600
+	})
+	codex := config.AgentVendorCodex
+	claude := config.AgentVendorClaudeCode
+	configured := rt.Config()
+	configured.Agent.Vendor = &codex
+	configured.Roles.Worker.Agent = &config.RoleAgentConfig{Vendor: &claude}
+	rt.publishCatalogConsumers(configured)
+	for i := 0; i < 3; i++ {
+		rt.activeExecutions.ReportAgentOutcome(agent.Outcome{Vendor: string(codex), Status: "failed"})
+	}
+	if err := rt.agentHealth.Allow(string(codex)); !errors.Is(err, brownout.ErrOpen) {
+		t.Fatalf("codex breaker = %v, want open before removal", err)
+	}
+
+	removed := configured
+	removed.Agent.Vendor = nil
+	rt.publishCatalogConsumers(removed)
+
+	reactivated := removed
+	reactivated.Agent.Vendor = &codex
+	rt.publishCatalogConsumers(reactivated)
+	if err := rt.agentHealth.Allow(string(codex)); !errors.Is(err, brownout.ErrOpen) {
+		t.Fatalf("reactivated codex breaker = %v, want retained open state", err)
+	}
+}
+
 func TestWorktreeCleanupContinuesDuringAgentBrownout(t *testing.T) {
 	fixture := newWorktreeCleanupFixture(t)
 	for i := 0; i < fixture.config.Scheduler.AgentBrownout.MinFailures; i++ {

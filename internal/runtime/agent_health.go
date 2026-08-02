@@ -100,6 +100,14 @@ func (r *agentHealthRegistry) ensureBreakerLocked(vendor string) *brownout.Break
 	if breaker := r.breakers[key]; breaker != nil {
 		return breaker
 	}
+	// A vendor can leave live configuration while sticky snapshot retries still
+	// retain its breaker. Promote that exact bucket when the vendor returns so an
+	// open outage cannot be bypassed by replacing it with a fresh closed breaker.
+	if breaker := r.stickyBreakers[key]; breaker != nil {
+		delete(r.stickyBreakers, key)
+		r.breakers[key] = breaker
+		return breaker
+	}
 	keyCopy := key
 	breaker := brownout.New(r.cfg, r.now, func(transition brownout.Transition) {
 		if r.onChange != nil {
