@@ -68,6 +68,13 @@ func (c *LoadCache) Wrap(inner Loader) Loader {
 		c.mu.Unlock()
 
 		input := inner(ctx)
+		// A request-owned cancellation must not poison the shared cache with the
+		// partial/noticed input produced by that canceled read. The next healthy
+		// request should retry the durable sources instead of serving the failed
+		// projection for the whole TTL.
+		if ctx != nil && ctx.Err() != nil {
+			return input
+		}
 		c.mu.Lock()
 		c.input, c.loadedAt, c.loaded = input, now, true
 		c.mu.Unlock()
@@ -152,7 +159,7 @@ func NewRepositoryLoader(repos *storage.Repositories, collector *escalator.Colle
 // arrives — one pull request can hold more than one entity id across renames —
 // because it also has to reconcile the verdict with the snapshot.
 func loadGateReports(ctx context.Context, events *storage.EventsRepository) ([]gatekeeper.Report, error) {
-	records, err := events.ListLatestByEntityTypeAndEventTypes(ctx, "pull_request", []string{gatekeeper.GateReportEventType})
+	records, err := events.ListLatestByEntityTypeAndEventTypes(ctx, "", "pull_request", []string{gatekeeper.GateReportEventType})
 	if err != nil {
 		return nil, err
 	}

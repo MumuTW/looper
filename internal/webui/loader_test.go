@@ -60,6 +60,30 @@ func TestLoadCacheReloadsAfterTheWindow(t *testing.T) {
 	}
 }
 
+func TestLoadCacheDoesNotPublishCanceledLoad(t *testing.T) {
+	t.Parallel()
+
+	calls := 0
+	cache := NewLoadCache(RefreshInterval, func() time.Time { return testNow })
+	load := cache.Wrap(func(ctx context.Context) Input {
+		calls++
+		if calls == 1 {
+			return Input{Notices: []string{"partial"}}
+		}
+		return Input{Notices: []string{"healthy"}}
+	})
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	load(canceled)
+	healthy := load(context.Background())
+	if calls != 2 {
+		t.Fatalf("underlying loads = %d, want canceled load excluded from cache", calls)
+	}
+	if len(healthy.Notices) != 1 || healthy.Notices[0] != "healthy" {
+		t.Fatalf("healthy load = %#v, want uncached retry", healthy)
+	}
+}
+
 func TestLoadCacheWithoutTTLAlwaysReadsThrough(t *testing.T) {
 	t.Parallel()
 

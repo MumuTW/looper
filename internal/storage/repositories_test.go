@@ -3284,7 +3284,7 @@ func TestEventsListLatestByEntityTypeAndEventTypesKeepsNewestPerEntity(t *testin
 		}
 	}
 
-	latest, err := repos.Events.ListLatestByEntityTypeAndEventTypes(ctx, "pull_request", []string{"pull_request.merge_gate.evaluated"})
+	latest, err := repos.Events.ListLatestByEntityTypeAndEventTypes(ctx, "", "pull_request", []string{"pull_request.merge_gate.evaluated"})
 	if err != nil {
 		t.Fatalf("Events.ListLatestByEntityTypeAndEventTypes() error = %v", err)
 	}
@@ -3295,7 +3295,7 @@ func TestEventsListLatestByEntityTypeAndEventTypesKeepsNewestPerEntity(t *testin
 		t.Fatalf("Events.ListLatestByEntityTypeAndEventTypes() = [%s %s], want [gate_1_new gate_2_a]", latest[0].ID, latest[1].ID)
 	}
 
-	empty, err := repos.Events.ListLatestByEntityTypeAndEventTypes(ctx, "pull_request", nil)
+	empty, err := repos.Events.ListLatestByEntityTypeAndEventTypes(ctx, "", "pull_request", nil)
 	if err != nil {
 		t.Fatalf("Events.ListLatestByEntityTypeAndEventTypes(no types) error = %v", err)
 	}
@@ -3327,7 +3327,7 @@ func TestEventsListLatestPartitionsByProjectAndEntity(t *testing.T) {
 		}
 	}
 
-	latest, err := repos.Events.ListLatestByEntityTypeAndEventTypes(ctx, pullRequest, []string{"pull_request.merge_gate.evaluated"})
+	latest, err := repos.Events.ListLatestByEntityTypeAndEventTypes(ctx, "", pullRequest, []string{"pull_request.merge_gate.evaluated"})
 	if err != nil {
 		t.Fatalf("ListLatestByEntityTypeAndEventTypes() error = %v", err)
 	}

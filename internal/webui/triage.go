@@ -11,6 +11,8 @@
 package webui
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"sort"
@@ -167,6 +169,10 @@ type Row struct {
 	Summary bool
 
 	group Group
+	// identity is the lossless source identity used only when two display slugs
+	// collide. Keeping common keys readable preserves stable DOM IDs while the
+	// disambiguator makes distinct project contexts collision-free.
+	identity string
 	// collapsible marks a row that is only ever one instance of a repeated
 	// digest reason — a standalone escalator item. A row backed by a pull
 	// request is never folded: it is a distinct thing an operator acts on.
@@ -263,7 +269,7 @@ func Classify(in Input) Board {
 	}
 	now = now.UTC()
 
-	pullRequests := latestSnapshotPerPR(in.Snapshots, in.ActiveProjects)
+	pullRequests, terminalPRs := latestSnapshotPerPR(in.Snapshots, in.ActiveProjects)
 	for _, loop := range in.Loops {
 		if loop.Repo == nil || loop.PRNumber == nil || !domain.IsActiveLoopStatus(domain.LoopStatus(loop.Status)) {
 			continue
@@ -273,6 +279,9 @@ func Classify(in Input) Board {
 		}
 		key := newPRKey(loop.ProjectID, *loop.Repo, *loop.PRNumber)
 		if _, exists := pullRequests[key]; exists {
+			continue
+		}
+		if _, terminal := terminalPRs[key]; terminal {
 			continue
 		}
 		capturedAt := loop.UpdatedAt
@@ -339,6 +348,7 @@ func Classify(in Input) Board {
 	for _, item := range standalone {
 		rows = append(rows, escalatorRow(now, item))
 	}
+	disambiguateRowKeys(rows)
 
 	sections := make([]Section, 0, len(Groups))
 	for _, group := range Groups {
@@ -602,7 +612,13 @@ func pullRequestRow(now time.Time, key PRKey, snapshot storage.PullRequestSnapsh
 	capturedAt := parseTimestamp(snapshot.CapturedAt)
 	changedAt := capturedAt
 	if report != nil {
-		changedAt = later(changedAt, parseTimestamp(report.EvaluatedAt))
+		// A repeated capture is an observation, not a blocker transition. Once
+		// Gatekeeper has a verdict, its evaluation timestamp is the durable
+		// state-change authority; otherwise the capture time is the only signal
+		// available for the pre-report fallback path.
+		if evaluatedAt := parseTimestamp(report.EvaluatedAt); !evaluatedAt.IsZero() {
+			changedAt = evaluatedAt
+		}
 	}
 
 	working := false
@@ -651,6 +667,7 @@ func pullRequestRow(now time.Time, key PRKey, snapshot storage.PullRequestSnapsh
 		Diff:      payload.diff,
 		ChangedAt: changedAt,
 		group:     group,
+		identity:  fmt.Sprintf("pr\x00%s\x00%s\x00%d", key.ProjectID, key.Repo, key.Number),
 		sortSize:  payload.diff.Total(),
 		hasSize:   payload.diff.Known,
 	}
@@ -676,11 +693,28 @@ func escalatorRow(now time.Time, item escalator.Item) Row {
 		Blocker:     blocker,
 		ChangedAt:   now.Add(-time.Duration(item.AgeSeconds) * time.Second),
 		group:       group,
+		identity:    "item\x00" + item.ID,
 		collapsible: true,
 	}
 	row.Blocker.Tone = toneFor(row.Blocker, group)
 	applyAge(&row, now)
 	return row
+}
+
+func disambiguateRowKeys(rows []Row) {
+	positions := map[string][]int{}
+	for index, row := range rows {
+		positions[row.Key] = append(positions[row.Key], index)
+	}
+	for key, indexes := range positions {
+		if len(indexes) < 2 {
+			continue
+		}
+		for _, index := range indexes {
+			digest := sha256.Sum256([]byte(rows[index].identity))
+			rows[index].Key = key + "-" + hex.EncodeToString(digest[:4])
+		}
+	}
 }
 
 func applyAge(row *Row, now time.Time) {
@@ -1097,24 +1131,49 @@ func checksPending(summary *string) bool {
 		strings.Contains(lower, "queued") || strings.Contains(lower, "expected")
 }
 
-// latestSnapshotPerPR keeps the newest capture per pull request and drops
-// everything that is not an open pull request.
-func latestSnapshotPerPR(records []storage.PullRequestSnapshotRecord, activeProjects map[string]bool) map[PRKey]storage.PullRequestSnapshotRecord {
-	out := map[PRKey]storage.PullRequestSnapshotRecord{}
+// latestSnapshotPerPR keeps the newest capture per pull request. It returns
+// open rows plus the latest terminal keys separately so loop synthesis cannot
+// resurrect a closed/merged PR while cleanup is still in progress.
+func latestSnapshotPerPR(records []storage.PullRequestSnapshotRecord, activeProjects map[string]bool) (map[PRKey]storage.PullRequestSnapshotRecord, map[PRKey]struct{}) {
+	latest := map[PRKey]storage.PullRequestSnapshotRecord{}
 	for _, record := range records {
 		if activeProjects != nil && !activeProjects[record.ProjectID] {
 			continue
 		}
-		if !openPullRequest(record) {
-			continue
-		}
 		key := newPRKey(record.ProjectID, record.Repo, record.PRNumber)
-		if existing, ok := out[key]; ok && !parseTimestamp(record.CapturedAt).After(parseTimestamp(existing.CapturedAt)) {
+		if existing, ok := latest[key]; ok && !newerSnapshot(record, existing) {
 			continue
 		}
-		out[key] = record
+		latest[key] = record
 	}
-	return out
+	out := map[PRKey]storage.PullRequestSnapshotRecord{}
+	terminal := map[PRKey]struct{}{}
+	for key, record := range latest {
+		if openPullRequest(record) {
+			out[key] = record
+		} else {
+			terminal[key] = struct{}{}
+		}
+	}
+	return out, terminal
+}
+
+func newerSnapshot(candidate, existing storage.PullRequestSnapshotRecord) bool {
+	candidateAt, existingAt := parseTimestamp(candidate.CapturedAt), parseTimestamp(existing.CapturedAt)
+	if candidateAt.After(existingAt) {
+		return true
+	}
+	if !candidateAt.Equal(existingAt) {
+		return false
+	}
+	candidateCreated, existingCreated := parseTimestamp(candidate.CreatedAt), parseTimestamp(existing.CreatedAt)
+	if candidateCreated.After(existingCreated) {
+		return true
+	}
+	if !candidateCreated.Equal(existingCreated) {
+		return false
+	}
+	return candidate.ID > existing.ID
 }
 
 // openPullRequest treats an unstated state as open: a snapshot exists because

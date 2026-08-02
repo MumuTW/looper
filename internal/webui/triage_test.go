@@ -649,6 +649,50 @@ func TestClassifyIncludesActivePullRequestLoopWithoutSnapshot(t *testing.T) {
 	}
 }
 
+func TestClassifyDoesNotResurrectTerminalSnapshotDuringLoopCleanup(t *testing.T) {
+	t.Parallel()
+
+	old := snapshot(t, 8, payloadOptions{})
+	old.CapturedAt = iso(testNow.Add(-2 * time.Hour))
+	closed := snapshot(t, 8, payloadOptions{state: "MERGED"})
+	closed.ID = "snapshot-8-merged"
+	closed.CapturedAt = iso(testNow.Add(-time.Minute))
+	loop := activeLoop(8)
+	board := Classify(Input{
+		Now: testNow, Snapshots: []storage.PullRequestSnapshotRecord{old, closed},
+		Loops: []storage.LoopRecord{loop}, Links: testLinker{},
+	})
+	if board.Total() != 0 {
+		t.Fatalf("terminal snapshot with active loop total = %d, want 0", board.Total())
+	}
+}
+
+func TestClassifyDisambiguatesCollidingProjectSlugs(t *testing.T) {
+	t.Parallel()
+
+	first := snapshot(t, 9, payloadOptions{})
+	first.ProjectID = "team.a"
+	second := snapshot(t, 9, payloadOptions{})
+	second.ID = "snapshot-team-dash"
+	second.ProjectID = "team-a"
+	board := Classify(Input{Now: testNow, Snapshots: []storage.PullRequestSnapshotRecord{first, second}, Links: testLinker{}})
+	keys := map[string]struct{}{}
+	for _, section := range board.Sections {
+		for _, row := range section.Rows {
+			if row.Summary {
+				continue
+			}
+			if _, exists := keys[row.Key]; exists {
+				t.Fatalf("duplicate row key %q", row.Key)
+			}
+			keys[row.Key] = struct{}{}
+		}
+	}
+	if len(keys) != 2 {
+		t.Fatalf("row keys = %#v, want two project rows", keys)
+	}
+}
+
 func TestClassifyExcludesArchivedProjects(t *testing.T) {
 	t.Parallel()
 
@@ -710,6 +754,26 @@ func TestClassifyHighlightsOnlyStateThatMovedInsideTheRefreshWindow(t *testing.T
 	}
 	if row, _ := rowFor(t, board, 2); row.Changed {
 		t.Fatalf("row 2 changed = true, want false outside the window")
+	}
+}
+
+func TestClassifyKeepsBlockerAgeAcrossRepeatedSnapshotCaptures(t *testing.T) {
+	t.Parallel()
+
+	current := snapshot(t, 1, payloadOptions{conflicts: true})
+	current.CapturedAt = iso(testNow.Add(-3 * time.Second))
+	gate := report(1, false, gatekeeper.ReasonMergeConflict)
+	gate.EvaluatedAt = iso(testNow.Add(-2 * time.Hour))
+	board := Classify(Input{
+		Now: testNow, Snapshots: []storage.PullRequestSnapshotRecord{current},
+		Reports: []gatekeeper.Report{gate}, Links: testLinker{},
+	})
+	row, _ := rowFor(t, board, 1)
+	if row.Changed {
+		t.Fatalf("unchanged blocker row = changed, want age from gate report rather than capture")
+	}
+	if !row.ChangedAt.Equal(testNow.Add(-2 * time.Hour)) {
+		t.Fatalf("ChangedAt = %v, want gate evaluation time", row.ChangedAt)
 	}
 }
 

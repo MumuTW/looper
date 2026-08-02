@@ -294,7 +294,7 @@ func (c *Collector) nextTriageSourceWindow(ctx context.Context, projectID string
 }
 
 func (c *Collector) collectEligibleAdvise(ctx context.Context, now time.Time, activeProjects map[string]struct{}, snapshot *Snapshot) error {
-	events, err := c.repositories.Events.ListLatestByEntityTypeAndEventTypes(ctx, "pull_request", []string{gatekeeper.GateReportEventType})
+	events, err := c.repositories.Events.ListLatestByEntityTypeAndEventTypes(ctx, "", "pull_request", []string{gatekeeper.GateReportEventType})
 	if err != nil {
 		return fmt.Errorf("list Gatekeeper reports: %w", err)
 	}
