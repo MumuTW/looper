@@ -1410,8 +1410,9 @@ func (r *Runtime) start(ctx context.Context) error {
 			defer r.mu.RUnlock()
 			return r.schedulerTasks
 		}, r.TriggerSchedulerClaim, r.now, r.reconcileLiveStaleRunningRuns, r.AllowClaim, r.WithAllowAgentClaim, schedulerProviderGate{
-			lifecycle: r.AllowLifecycleWork,
-			allow:     r.AllowClaimForVendor, with: r.WithAllowAgentClaimForVendor,
+			lifecycle:     r.AllowLifecycleWork,
+			lifecycleWith: r.WithAllowLifecycleWork,
+			allow:         r.AllowClaimForVendor, with: r.WithAllowAgentClaimForVendor,
 			snapshotAllow: r.AllowSnapshotClaimForVendor, snapshotWith: r.WithAllowSnapshotAgentClaimForVendor,
 		})
 		if !r.customSchedulerTick {
