@@ -398,7 +398,7 @@ func validatePostMergeDigestGatekeeperCompatibility(config Config, issues *[]Val
 		if !postMergeDigestEnabled(roles.Coordinator.PostMergeDigest) || !gatekeeperTrustIsAuto(roles.Gatekeeper.Trust) {
 			continue
 		}
-		path := fmt.Sprintf("projects[%d]", i)
+		var path string
 		switch {
 		case project.Roles != nil && project.Roles.Gatekeeper != nil && project.Roles.Gatekeeper.Trust != nil && gatekeeperTrustIsAuto(*project.Roles.Gatekeeper.Trust):
 			path = fmt.Sprintf("projects[%d].roles.gatekeeper.trust", i)

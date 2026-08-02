@@ -971,10 +971,6 @@ func (r *Runner) publishDiscoveryCommitStatuses(ctx context.Context, projectID, 
 	}
 }
 
-func (r *Runner) publishAggregatedCommitStatusForReport(ctx context.Context, report Report) {
-	_ = r.tryPublishAggregatedCommitStatus(ctx, report)
-}
-
 func (r *Runner) tryPublishAggregatedCommitStatus(ctx context.Context, report Report) bool {
 	if r.trustFor(report.ProjectID) != config.GatekeeperTrustAuto {
 		return true
