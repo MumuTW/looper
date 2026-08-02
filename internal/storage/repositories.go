@@ -596,6 +596,58 @@ func (r *EventsRepository) ListSince(ctx context.Context, sinceISO string) ([]Ev
 	return scanEventLogs(rows)
 }
 
+// LatestByProjectAndEventType returns the newest event for one project and
+// event type. The event-type index keeps maintenance callers from rescanning
+// an entire project's immutable history just to decide whether a watermark
+// changed. The SQLite rowid tie-breaker preserves append order when two events
+// share the same millisecond timestamp.
+func (r *EventsRepository) LatestByProjectAndEventType(ctx context.Context, projectID, eventType string) (*EventLogRecord, error) {
+	row := r.q.QueryRowContext(ctx, `
+		SELECT * FROM event_logs
+		WHERE project_id = ? AND event_type = ?
+		ORDER BY rowid DESC
+		LIMIT 1
+	`, projectID, eventType)
+	record, err := scanEventLog(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("latest event log by project and type: %w", err)
+	}
+	return &record, nil
+}
+
+// ListProjectIDsByEventType lists project IDs that have at least one event of
+// eventType.  It includes archived or deleted-from-catalog projects whose
+// historical reports still require migration maintenance.
+func (r *EventsRepository) ListProjectIDsByEventType(ctx context.Context, eventType string) ([]string, error) {
+	rows, err := r.q.QueryContext(ctx, `
+		SELECT DISTINCT project_id
+		FROM event_logs
+		WHERE event_type = ? AND project_id IS NOT NULL
+		ORDER BY project_id
+	`, eventType)
+	if err != nil {
+		return nil, fmt.Errorf("list project ids by event type: %w", err)
+	}
+	defer rows.Close()
+	ids := make([]string, 0)
+	for rows.Next() {
+		var projectID string
+		if err := rows.Scan(&projectID); err != nil {
+			return nil, fmt.Errorf("scan project id by event type: %w", err)
+		}
+		if strings.TrimSpace(projectID) != "" {
+			ids = append(ids, projectID)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate project ids by event type: %w", err)
+	}
+	return ids, nil
+}
+
 func (r *EventsRepository) ListByEntity(ctx context.Context, entityType, entityID string) ([]EventLogRecord, error) {
 	rows, err := r.q.QueryContext(ctx, `SELECT `+eventLogColumns+` FROM event_logs WHERE entity_type = ? AND entity_id = ? ORDER BY created_at ASC`, entityType, entityID)
 	if err != nil {

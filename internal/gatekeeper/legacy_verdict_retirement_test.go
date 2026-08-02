@@ -34,6 +34,9 @@ func TestDiscoverPullRequestsRetiresLegacyAdviseVerdictEvenWhenEvaluationIsSkipp
 		t.Fatalf("append legacy Gatekeeper report: %v", err)
 	}
 
+	if err := fixture.runner().ReconcileLegacyVerdictComments(context.Background()); err != nil {
+		t.Fatalf("ReconcileLegacyVerdictComments() error = %v", err)
+	}
 	result, err := fixture.runner().DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
 	if err != nil {
 		t.Fatalf("DiscoverPullRequests() error = %v", err)
@@ -51,6 +54,9 @@ func TestDiscoverPullRequestsRetiresLegacyAdviseVerdictEvenWhenEvaluationIsSkipp
 		t.Fatalf("human marker comment = %q, want unchanged", got)
 	}
 
+	if err := fixture.runner().ReconcileLegacyVerdictComments(context.Background()); err != nil {
+		t.Fatalf("second ReconcileLegacyVerdictComments() error = %v", err)
+	}
 	if _, err := fixture.runner().DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
 		t.Fatalf("second DiscoverPullRequests() error = %v", err)
 	}
@@ -59,6 +65,13 @@ func TestDiscoverPullRequestsRetiresLegacyAdviseVerdictEvenWhenEvaluationIsSkipp
 	}
 	if got := fixture.github.commentsCalls; got != 1 {
 		t.Fatalf("retired comment reads = %d, want no second-tick forge read", got)
+	}
+	scanEvents, err := fixture.repos.Events.ListByEntity(context.Background(), "project", "project_1")
+	if err != nil {
+		t.Fatalf("scan completion events: %v", err)
+	}
+	if len(scanEvents) != 1 || scanEvents[0].EventType != legacyVerdictRetirementScanEventType {
+		t.Fatalf("scan completion events = %#v, want one project watermark", scanEvents)
 	}
 }
 
@@ -84,6 +97,9 @@ func TestDiscoverPullRequestsPersistsObserveReportWhenLegacyRetirementFails(t *t
 		t.Fatalf("append legacy Gatekeeper report: %v", err)
 	}
 
+	if err := fixture.runner().ReconcileLegacyVerdictComments(context.Background()); err != nil {
+		t.Fatalf("ReconcileLegacyVerdictComments() error = %v, want warning-only failure", err)
+	}
 	result, err := fixture.runner().DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
 	if err != nil {
 		t.Fatalf("DiscoverPullRequests() error = %v, want current report despite retirement failure", err)
@@ -111,6 +127,9 @@ func TestDiscoverPullRequestsRetiresHistoricalAdviseOutsideOpenPage(t *testing.T
 		t.Fatalf("append legacy Gatekeeper report: %v", err)
 	}
 
+	if err := fixture.runner().ReconcileLegacyVerdictComments(context.Background()); err != nil {
+		t.Fatalf("ReconcileLegacyVerdictComments() error = %v", err)
+	}
 	result, err := fixture.runner().DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
 	if err != nil {
 		t.Fatalf("DiscoverPullRequests() error = %v", err)

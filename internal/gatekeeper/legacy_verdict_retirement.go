@@ -21,6 +21,7 @@ const retiredLegacyVerdictBody = legacyVerdictCommentMarker + "\n" +
 	"⚪ **Merge gate advice withdrawn.** This project now runs Gatekeeper in observe-only mode, so this verdict must not be used to decide whether to merge.\n"
 
 const legacyVerdictRetirementEventType = "pull_request.merge_gate.legacy_verdict_retired"
+const legacyVerdictRetirementScanEventType = "pull_request.merge_gate.legacy_verdict_retirement_scan_completed"
 
 type legacyVerdictRetirement struct {
 	Version           int    `json:"version"`
@@ -37,6 +38,13 @@ type legacyVerdictRetirement struct {
 type legacyAdviseReport struct {
 	Report  Report
 	EventID string
+}
+
+type legacyVerdictRetirementScan struct {
+	Version           int    `json:"version"`
+	ProjectID         string `json:"projectId"`
+	LastReportEventID string `json:"lastReportEventId"`
+	CompletedAt       string `json:"completedAt"`
 }
 
 // legacyVerdictCommentGateway is deliberately optional. The rollback never
@@ -113,7 +121,10 @@ func (r *Runner) retireLegacyVerdictComments(ctx context.Context, candidate lega
 // absence of a completion event causes the next tick to retry the failed
 // retirement.
 func (r *Runner) ReconcileLegacyVerdictComments(ctx context.Context) error {
-	reports, err := r.historicalLegacyAdviseReports(ctx)
+	if r == nil || r.repos == nil || r.repos.Events == nil {
+		return fmt.Errorf("gatekeeper event repository is not configured")
+	}
+	projectIDs, err := r.repos.Events.ListProjectIDsByEventType(ctx, GateReportEventType)
 	if err != nil {
 		return err
 	}
@@ -127,38 +138,63 @@ func (r *Runner) ReconcileLegacyVerdictComments(ctx context.Context) error {
 			projectCWD[project.ID] = project.RepoPath
 		}
 	}
-	sort.Slice(reports, func(i, j int) bool {
-		if reports[i].Report.ProjectID != reports[j].Report.ProjectID {
-			return reports[i].Report.ProjectID < reports[j].Report.ProjectID
+	for _, projectID := range projectIDs {
+		latestReport, err := r.repos.Events.LatestByProjectAndEventType(ctx, projectID, GateReportEventType)
+		if err != nil {
+			return err
 		}
-		if reports[i].Report.PRNumber != reports[j].Report.PRNumber {
-			return reports[i].Report.PRNumber < reports[j].Report.PRNumber
+		if latestReport == nil {
+			continue
 		}
-		return reports[i].EventID < reports[j].EventID
-	})
-	for _, report := range reports {
-		if err := r.retireLegacyVerdictComments(ctx, report, projectCWD[report.Report.ProjectID]); err != nil {
-			if r.logWarn != nil {
-				r.logWarn("gatekeeper: legacy verdict retirement deferred", map[string]any{
-					"repo": report.Report.Repo, "pr": report.Report.PRNumber, "error": err.Error(),
-				})
+		scanComplete, err := r.retirementScanComplete(ctx, projectID, latestReport.ID)
+		if err != nil {
+			return err
+		}
+		if scanComplete {
+			continue
+		}
+		reports, err := r.historicalLegacyAdviseReports(ctx, projectID)
+		if err != nil {
+			return err
+		}
+		sort.Slice(reports, func(i, j int) bool {
+			if reports[i].Report.PRNumber != reports[j].Report.PRNumber {
+				return reports[i].Report.PRNumber < reports[j].Report.PRNumber
 			}
+			return reports[i].EventID < reports[j].EventID
+		})
+		retirementFailed := false
+		for _, report := range reports {
+			if err := r.retireLegacyVerdictComments(ctx, report, projectCWD[projectID]); err != nil {
+				retirementFailed = true
+				if r.logWarn != nil {
+					r.logWarn("gatekeeper: legacy verdict retirement deferred", map[string]any{
+						"projectId": projectID, "repo": report.Report.Repo, "pr": report.Report.PRNumber, "error": err.Error(),
+					})
+				}
+			}
+		}
+		if retirementFailed {
+			continue
+		}
+		if err := r.persistRetirementScan(ctx, projectID, latestReport.ID); err != nil {
+			return err
 		}
 	}
 	return nil
 }
 
-func (r *Runner) historicalLegacyAdviseReports(ctx context.Context) ([]legacyAdviseReport, error) {
+func (r *Runner) historicalLegacyAdviseReports(ctx context.Context, projectID string) ([]legacyAdviseReport, error) {
 	if r == nil || r.repos == nil || r.repos.Events == nil {
 		return nil, fmt.Errorf("gatekeeper event repository is not configured")
 	}
-	events, err := r.repos.Events.ListByEntityTypeAndEventTypes(ctx, "pull_request", []string{GateReportEventType})
+	events, err := r.repos.Events.ListByProjectAndEntityType(ctx, projectID, "pull_request")
 	if err != nil {
 		return nil, fmt.Errorf("list Gatekeeper reports: %w", err)
 	}
 	reports := make([]legacyAdviseReport, 0)
 	for _, event := range events {
-		if event.EntityID == nil || event.ProjectID == nil {
+		if event.EntityID == nil {
 			continue
 		}
 		var report Report
@@ -170,6 +206,34 @@ func (r *Runner) historicalLegacyAdviseReports(ctx context.Context) ([]legacyAdv
 		}
 	}
 	return reports, nil
+}
+
+func (r *Runner) retirementScanComplete(ctx context.Context, projectID, latestReportEventID string) (bool, error) {
+	record, err := r.repos.Events.LatestByProjectAndEventType(ctx, projectID, legacyVerdictRetirementScanEventType)
+	if err != nil || record == nil {
+		return false, err
+	}
+	var scan legacyVerdictRetirementScan
+	if err := json.Unmarshal([]byte(record.PayloadJSON), &scan); err != nil {
+		return false, nil
+	}
+	return scan.LastReportEventID == latestReportEventID, nil
+}
+
+func (r *Runner) persistRetirementScan(ctx context.Context, projectID, latestReportEventID string) error {
+	entityType := "project"
+	entityID := projectID
+	if err := eventlog.Append(ctx, r.repos, eventlog.AppendInput{
+		EventType: legacyVerdictRetirementScanEventType, ProjectID: &projectID,
+		EntityType: &entityType, EntityID: &entityID,
+		Payload: legacyVerdictRetirementScan{
+			Version: 1, ProjectID: projectID, LastReportEventID: latestReportEventID,
+			CompletedAt: r.now().UTC().Format(time.RFC3339Nano),
+		}, CreatedAt: r.now(),
+	}); err != nil {
+		return fmt.Errorf("persist Gatekeeper retirement scan: %w", err)
+	}
+	return nil
 }
 
 func (r *Runner) legacyVerdictRetired(ctx context.Context, candidate legacyAdviseReport) (bool, error) {

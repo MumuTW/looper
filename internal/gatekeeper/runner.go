@@ -241,9 +241,6 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 	if strings.TrimSpace(input.CWD) == "" {
 		input.CWD = r.projectCWD(ctx, input.ProjectID)
 	}
-	if err := r.ReconcileLegacyVerdictComments(ctx); err != nil {
-		return DiscoveryResult{}, err
-	}
 	listCtx := ctx
 	if input.Snapshot != nil {
 		listCtx = githubinfra.ContextWithDiscoverySnapshot(ctx, input.Snapshot)
