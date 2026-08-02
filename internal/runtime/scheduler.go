@@ -3790,12 +3790,23 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 	stopClaiming := false
 	var claimFailure error
 	claimLanes := func(longTerm bool) {
-		for _, typeSet := range providerTypeSets {
-			if stopClaiming || len(queueItems) >= availableSlots {
-				return
-			}
-		lane:
-			for len(queueItems) < availableSlots {
+		// A provider group can contain several role types. Draining that group
+		// before looking at its siblings lets a lower-priority role consume every
+		// slot and starve a higher-priority item assigned to another provider.
+		// Round-robin is the claim-level fairness authority: each admitted group
+		// gets one durable candidate per round, while the repository still orders
+		// candidates within that group by priority.
+		active := make([]bool, len(providerTypeSets))
+		remaining := len(providerTypeSets)
+		for i := range active {
+			active[i] = true
+		}
+		for remaining > 0 && !stopClaiming && len(queueItems) < availableSlots {
+			progressed := false
+			for index, typeSet := range providerTypeSets {
+				if !active[index] || stopClaiming || len(queueItems) >= availableSlots {
+					continue
+				}
 				result, err := claimOne(typeSet.vendor, typeSet.providerScoped, typeSet.snapshotScoped, typeSet.lifecycleOnly, func(ctx context.Context, nowISO, claimedBy string) (*storage.QueueItemRecord, error) {
 					if longTerm {
 						return input.Repos.Queue.ClaimNextLongTermRetryAmongTypeSetsForProjectsWithSnapshotVendor(ctx, nowISO, claimedBy, typeSet.unrestricted, typeSet.stickyOnly, typeSet.vendor, typeSet.excludeStickySnapshots, projectScopedTypes, runnableProjectIDs)
@@ -3805,19 +3816,22 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 				if err != nil {
 					claimFailure = err
 					stopClaiming = true
-					return
+					break
 				}
 				switch result {
 				case claimContinue:
-					continue
+					progressed = true
 				case claimEmpty, claimSkip:
-					// Try the next provider lane; no more candidates or an open
-					// provider must not block healthy lanes.
-					break lane
+					// No more candidates or an open provider removes this group
+					// from the current phase; healthy siblings continue.
+					active[index] = false
+					remaining--
 				case claimStop:
 					stopClaiming = true
-					return
 				}
+			}
+			if !progressed && !stopClaiming {
+				return
 			}
 		}
 	}

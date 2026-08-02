@@ -915,6 +915,60 @@ func TestClaimAndRunScheduledQueueItemsGatesEachProviderLane(t *testing.T) {
 	}
 }
 
+func TestClaimAndRunScheduledQueueItemsRoundRobinsProviderLanes(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "claim-provider-priority.sqlite"), t.TempDir())
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 21, 8, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+	insertSchedulerProject(t, repos, workingDir, nowISO)
+
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	codex := config.AgentVendorCodex
+	claude := config.AgentVendorClaudeCode
+	cfg.Agent.Vendor = &codex
+	cfg.Roles.Reviewer.Agent = &config.RoleAgentConfig{Vendor: &claude}
+	cfg.Projects = []config.ProjectRefConfig{{ID: "looper", Validation: &config.ProjectValidationConfig{OptOut: true}}}
+
+	workerOne := schedulerTestQueueItem("worker_low_1", "worker", nowISO)
+	workerTwo := schedulerTestQueueItem("worker_low_2", "worker", nowISO)
+	workerOne.Priority = storage.QueuePriorityWorker
+	workerTwo.Priority = storage.QueuePriorityWorker
+	reviewer := schedulerTestQueueItem("reviewer_high", "reviewer", nowISO)
+	reviewer.Priority = storage.QueuePriorityReviewer
+	for _, item := range []storage.QueueItemRecord{workerOne, workerTwo, reviewer} {
+		if err := repos.Queue.Upsert(context.Background(), item); err != nil {
+			t.Fatalf("Queue.Upsert(%s) error = %v", item.ID, err)
+		}
+	}
+
+	claimed, err := claimAndRunScheduledQueueItems(context.Background(), 2, defaultSchedulerTickInput{
+		Repos: repos, Config: &cfg, Now: func() time.Time { return now }, AsyncRunner: immediateSchedulerRunner{},
+		Planner: &stubPlannerScheduler{}, Reviewer: &stubReviewerScheduler{}, Worker: &stubWorkerScheduler{},
+	})
+	if err != nil {
+		t.Fatalf("claimAndRunScheduledQueueItems() error = %v", err)
+	}
+	if len(claimed) != 2 {
+		t.Fatalf("claimed = %#v, want two items", claimed)
+	}
+	claimedIDs := map[string]bool{}
+	for _, item := range claimed {
+		claimedIDs[item.ID] = true
+	}
+	if !claimedIDs[reviewer.ID] {
+		t.Fatalf("claimed = %#v, want the higher-priority reviewer lane represented", claimed)
+	}
+	if claimedIDs[workerOne.ID] == claimedIDs[workerTwo.ID] {
+		t.Fatalf("claimed = %#v, want exactly one of the two lower-priority workers", claimed)
+	}
+}
+
 func TestExecuteClaimPhaseAllowsAgentFreeSnapshotDuringProviderBrownout(t *testing.T) {
 	t.Parallel()
 
