@@ -820,7 +820,10 @@ func elfInterpreter(path string) (string, bool, error) {
 		if program.Type != elf.PT_INTERP {
 			continue
 		}
-		if program.Filesz > uint64(^uint64(0)>>1) {
+		// A kernel interpreter path is bounded by PATH_MAX; do not let a
+		// package-controlled ELF header drive an unbounded allocation here.
+		const maxInterpreterSize = 4096
+		if program.Filesz > maxInterpreterSize {
 			return "", false, fmt.Errorf("ELF interpreter segment is too large")
 		}
 		raw, err := io.ReadAll(io.LimitReader(program.Open(), int64(program.Filesz)))
