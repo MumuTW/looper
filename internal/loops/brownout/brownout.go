@@ -10,9 +10,11 @@
 // work when enough of them are not. The provider's identity, error format, and
 // stated reset window are all outside the model on purpose.
 //
-// The breaker is global rather than per-loop because provider quota is
+// Each breaker is global rather than per-loop because provider quota is
 // account-wide: a per-loop breaker sees one loop's failures and lets the other
-// nine keep spending the same exhausted budget.
+// nine keep spending the same exhausted budget. The runtime registry owns one
+// such breaker per effective provider so an outage does not suspend a healthy
+// sibling provider.
 package brownout
 
 import (
@@ -117,6 +119,10 @@ type Breaker struct {
 	// result decide recovery would close the gate without ever testing whether
 	// the provider recovered.
 	halfOpenAt time.Time
+	// probeInFlight reserves half-open admissions before their outcomes arrive.
+	// Without a reservation every concurrent caller can observe half-open and
+	// spend a full scheduler batch against a provider that has not recovered.
+	probeInFlight int
 	// tripFailures and tripTotal retain the evidence that opened the current
 	// outage. The rolling window is cleared on open so it cannot re-trip from
 	// stale failures, but status surfaces still need to explain why the gate is
@@ -137,7 +143,11 @@ func New(cfg Config, now func() time.Time, onChange func(Transition)) *Breaker {
 // scheduler calls, and it advances open -> half-open when the cooldown expires,
 // so no separate timer owns recovery.
 func (b *Breaker) Allow() error {
-	_, err := b.AllowAdmission()
+	// Scheduler and queue gates only need a point-in-time health check. They do
+	// not own an execution outcome, so they must not consume a half-open probe
+	// reservation. The token-bearing AllowAdmission call is reserved for the
+	// common spawn boundary that can later report RecordAdmission.
+	_, err := b.allowAdmission(false)
 	return err
 }
 
@@ -145,6 +155,10 @@ func (b *Breaker) Allow() error {
 // while half-open. The probe bit travels with the execution so an outcome from
 // an older closed/open admission cannot be mistaken for a recovery probe.
 func (b *Breaker) AllowAdmission() (bool, error) {
+	return b.allowAdmission(true)
+}
+
+func (b *Breaker) allowAdmission(reserveProbe bool) (bool, error) {
 	if b == nil {
 		return false, nil
 	}
@@ -157,12 +171,28 @@ func (b *Breaker) AllowAdmission() (bool, error) {
 	}
 	transition, ok := b.refreshLocked()
 	state := b.state
-	probe := state == StateHalfOpen
+	probe := false
+	var admissionErr error
+	if reserveProbe && state == StateHalfOpen {
+		limit := b.cfg.ProbeSuccesses
+		if limit <= 0 {
+			limit = 1
+		}
+		if b.probeInFlight >= limit {
+			admissionErr = fmt.Errorf("%w: recovery probe capacity exhausted", ErrOpen)
+		} else {
+			b.probeInFlight++
+			probe = true
+		}
+	}
 	remaining := b.openUntil.Sub(b.now())
 	b.mu.Unlock()
 
 	if ok {
 		b.emit(transition)
+	}
+	if admissionErr != nil {
+		return false, admissionErr
 	}
 	if state == StateOpen {
 		if remaining < 0 {
@@ -200,9 +230,14 @@ func (b *Breaker) RecordAdmission(startedAt time.Time, ok, probe bool) {
 		b.mu.Unlock()
 		return
 	}
-	if b.state == StateHalfOpen && (!probe || startedAt.IsZero() || startedAt.Before(b.halfOpenAt)) {
-		b.mu.Unlock()
-		return
+	if b.state == StateHalfOpen {
+		if probe && b.probeInFlight > 0 {
+			b.probeInFlight--
+		}
+		if !probe || startedAt.IsZero() || startedAt.Before(b.halfOpenAt) {
+			b.mu.Unlock()
+			return
+		}
 	}
 	now := b.now()
 	b.outcomes = append(b.outcomes, outcome{at: now, ok: ok})
@@ -232,7 +267,10 @@ func (b *Breaker) SetConfig(cfg Config) {
 		b.state = StateClosed
 		b.outcomes = nil
 		b.probeSuccesses = 0
+		b.probeInFlight = 0
 		b.cooldown = cfg.Cooldown
+		b.openUntil = time.Time{}
+		b.halfOpenAt = time.Time{}
 		b.tripFailures = 0
 		b.tripTotal = 0
 		return
@@ -303,6 +341,7 @@ func (b *Breaker) refreshLocked() (Transition, bool) {
 	}
 	b.state = StateHalfOpen
 	b.probeSuccesses = 0
+	b.probeInFlight = 0
 	b.halfOpenAt = now
 	// Drop the window that tripped the breaker. Keeping it would let stale
 	// failures re-trip the breaker on the first probe before any new outcome
@@ -333,6 +372,7 @@ func (b *Breaker) evaluateLocked(now time.Time, startedAt time.Time, ok bool) (T
 		b.state = StateClosed
 		b.cooldown = b.cfg.Cooldown
 		b.probeSuccesses = 0
+		b.probeInFlight = 0
 		b.outcomes = nil
 		return Transition{From: StateHalfOpen, To: StateClosed, Reason: "probes_succeeded"}, true
 	case StateClosed:
@@ -357,6 +397,7 @@ func (b *Breaker) openLocked(now time.Time, reason string) Transition {
 	b.state = StateOpen
 	b.openUntil = now.Add(b.cooldown)
 	b.probeSuccesses = 0
+	b.probeInFlight = 0
 	b.trips++
 	failures, total := b.countLocked()
 	b.tripFailures = failures

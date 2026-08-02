@@ -207,6 +207,7 @@ type Runtime struct {
 	notificationCancel          context.CancelFunc
 	notificationWG              sync.WaitGroup
 	notificationsStopping       bool
+	brownoutNotificationTails   map[string]chan struct{}
 	schedulerStop               chan struct{}
 	schedulerDone               chan struct{}
 	schedulerWake               chan struct{}
@@ -347,6 +348,7 @@ func New(options Options) *Runtime {
 		shutdownCh:                  make(chan struct{}),
 		notificationCtx:             notificationCtx,
 		notificationCancel:          notificationCancel,
+		brownoutNotificationTails:   make(map[string]chan struct{}),
 		activeExecutions:            NewActiveExecutionRegistry(),
 		projectCatalog:              projectCatalog,
 		webhook:                     newWebhookRuntime(options.Config, options.Logger, now),
@@ -720,6 +722,16 @@ func (r *Runtime) AllowClaim() error {
 	return r.agentHealth.AllowAny()
 }
 
+// AllowClaimForVendor is the scheduler admission projection for a queue lane
+// whose effective agent provider is already known. A healthy sibling provider
+// must not authorize durable claims for a provider whose breaker is open.
+func (r *Runtime) AllowClaimForVendor(vendor string) error {
+	if err := r.AllowLifecycleWork(); err != nil {
+		return err
+	}
+	return r.agentHealth.Allow(vendor)
+}
+
 func (r *Runtime) allowAgentSpawn(meta *agent.SpawnMeta) error {
 	if r == nil || r.admission == nil {
 		return ErrAdmissionStopping
@@ -813,15 +825,19 @@ func (r *Runtime) onAgentBrownoutTransition(vendor string, transition brownout.T
 	}
 	// half_open is a probe, not news. Telling the operator about it would make
 	// every outage a stream of notifications instead of two.
+	provider := strings.TrimSpace(vendor)
+	if provider == "" {
+		provider = "agent provider"
+	}
 	switch transition.To {
 	case brownout.StateOpen:
-		r.notifyAgentBrownout("failure", "Looper Paused: Agents Keep Failing",
+		r.notifyAgentBrownout("failure", fmt.Sprintf("Looper Paused: %s Agents Keep Failing", provider),
 			fmt.Sprintf("%d of %d recent agent runs failed", transition.Failures, transition.Total),
-			fmt.Sprintf("Looper stopped starting new work because its own agent runs keep failing — usually a provider that is rate limiting, down, or out of quota. It will retry by itself in %s. Nothing is lost; queued work resumes when a probe run succeeds.", transition.Cooldown.Round(time.Second)),
+			fmt.Sprintf("Looper stopped starting new %s work because its own %s agent runs keep failing. It will retry by itself in %s. Other healthy providers may continue; queued %s work resumes when recovery probes succeed.", provider, provider, transition.Cooldown.Round(time.Second), provider),
 			vendor+".open")
 	case brownout.StateClosed:
-		r.notifyAgentBrownout("action_required", "Looper Resumed", "a probe agent run succeeded",
-			"Agent runs are working again. Looper has resumed starting new work.", vendor+".closed")
+		r.notifyAgentBrownout("action_required", fmt.Sprintf("Looper Resumed: %s", provider), fmt.Sprintf("a %s probe agent run succeeded", provider),
+			fmt.Sprintf("%s agent runs are working again. Looper has resumed starting %s work.", provider, provider), vendor+".closed")
 	}
 }
 
@@ -836,9 +852,35 @@ func (r *Runtime) notifyAgentBrownout(level, title, subtitle, body, dedupeSuffix
 	}
 	r.notificationWG.Add(1)
 	notificationCtx := r.notificationCtx
+	providerKey := strings.TrimSuffix(strings.TrimSuffix(dedupeSuffix, ".open"), ".closed")
+	var previous chan struct{}
+	if r.brownoutNotificationTails == nil {
+		r.brownoutNotificationTails = make(map[string]chan struct{})
+	}
+	previous = r.brownoutNotificationTails[providerKey]
+	done := make(chan struct{})
+	r.brownoutNotificationTails[providerKey] = done
 	r.mu.Unlock()
 	go func() {
 		defer r.notificationWG.Done()
+		defer func() {
+			r.mu.Lock()
+			if r.brownoutNotificationTails[providerKey] == done {
+				delete(r.brownoutNotificationTails, providerKey)
+			}
+			r.mu.Unlock()
+		}()
+		// Close before removing the tail. A transition arriving in the small
+		// cleanup window must either wait for this notification or observe its
+		// completed channel, never start a second delivery concurrently.
+		defer close(done)
+		if previous != nil {
+			select {
+			case <-previous:
+			case <-notificationCtx.Done():
+				return
+			}
+		}
 		r.mu.RLock()
 		gateways := r.notificationGateways
 		services := r.services
@@ -928,6 +970,22 @@ func (r *Runtime) WithAllowAgentClaim(fn func()) error {
 	var brownoutErr error
 	if err := r.admission.WithAllowWork(func() {
 		brownoutErr = r.agentHealth.WithAny(fn)
+	}); err != nil {
+		return err
+	}
+	return brownoutErr
+}
+
+// WithAllowAgentClaimForVendor holds lifecycle admission and one provider's
+// health gate across a durable claim. The callback must not spawn an agent or
+// consult provider health; the provider gate is non-reentrant.
+func (r *Runtime) WithAllowAgentClaimForVendor(vendor string, fn func()) error {
+	if r == nil || r.admission == nil {
+		return ErrAdmissionStopping
+	}
+	var brownoutErr error
+	if err := r.admission.WithAllowWork(func() {
+		brownoutErr = r.agentHealth.With(vendor, fn)
 	}); err != nil {
 		return err
 	}
@@ -1314,7 +1372,7 @@ func (r *Runtime) start(ctx context.Context) error {
 			r.mu.RLock()
 			defer r.mu.RUnlock()
 			return r.schedulerTasks
-		}, r.TriggerSchedulerClaim, r.now, r.reconcileLiveStaleRunningRuns, r.AllowClaim, r.WithAllowAgentClaim)
+		}, r.TriggerSchedulerClaim, r.now, r.reconcileLiveStaleRunningRuns, r.AllowClaim, r.WithAllowAgentClaim, schedulerProviderGate{allow: r.AllowClaimForVendor, with: r.WithAllowAgentClaimForVendor})
 		if !r.customSchedulerTick {
 			r.defaultSchedulerTick = handlers.tick
 			if !r.customWebhookForwarder {

@@ -34,6 +34,7 @@ func TestReportOutcomeMapsTerminalStatus(t *testing.T) {
 		// A block needing a human is not the provider failing, and backing off
 		// from the provider would not help.
 		{status: "completed", parseStatus: "parsed", completionPayload: `{"outcome":"blocked","failure_kind":"manual_intervention","summary":"needs a decision"}`, wantReported: true, wantSucceeded: true},
+		{status: "completed", parseStatus: "parsed", completionPayload: `{"outcome":"mostly-done","summary":"partial"}`, wantReported: true},
 		{status: "completed", parseStatus: "missing", wantReported: true},
 		{status: "completed", parseStatus: "invalid_json", wantReported: true},
 		{status: "failed", parseStatus: "missing", wantReported: true},

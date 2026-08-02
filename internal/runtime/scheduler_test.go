@@ -18,7 +18,7 @@ import (
 	"github.com/MumuTW/looper/internal/coordinator"
 	"github.com/MumuTW/looper/internal/fixer"
 	githubinfra "github.com/MumuTW/looper/internal/infra/github"
-	"github.com/MumuTW/looper/internal/loops/runpipe"
+	"github.com/MumuTW/looper/internal/loops/brownout"
 	"github.com/MumuTW/looper/internal/planner"
 	"github.com/MumuTW/looper/internal/projects"
 	"github.com/MumuTW/looper/internal/reviewer"
@@ -801,6 +801,103 @@ func TestClaimAndRunScheduledQueueItemsSkipsUnconfiguredRoles(t *testing.T) {
 	}
 	if reviewerItem == nil || reviewerItem.Status != "queued" {
 		t.Fatalf("reviewer item = %#v, want still queued", reviewerItem)
+	}
+}
+
+func TestClaimAndRunScheduledQueueItemsGatesEachProviderLane(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "claim-provider-lanes.sqlite"), t.TempDir())
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 21, 8, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	codex := config.AgentVendorCodex
+	claude := config.AgentVendorClaudeCode
+	cfg.Agent.Vendor = &codex
+	cfg.Roles.Reviewer.Agent = &config.RoleAgentConfig{Vendor: &claude}
+	cfg.Projects = []config.ProjectRefConfig{{ID: "provider_lanes", Validation: &config.ProjectValidationConfig{OptOut: true}}}
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "provider_lanes", Name: "Provider lanes", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	workerLoopID := "loop_worker_codex"
+	reviewerLoopID := "loop_reviewer_claude"
+	for _, loop := range []storage.LoopRecord{
+		{ID: workerLoopID, Seq: 1, ProjectID: "provider_lanes", Type: "worker", TargetType: "project", Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO},
+		{ID: reviewerLoopID, Seq: 2, ProjectID: "provider_lanes", Type: "reviewer", TargetType: "pull_request", Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO},
+	} {
+		if err := repos.Loops.Upsert(context.Background(), loop); err != nil {
+			t.Fatalf("Loops.Upsert(%s) error = %v", loop.ID, err)
+		}
+	}
+	projectID := "provider_lanes"
+	repo := "acme/looper"
+	prNumber := int64(42)
+	for _, item := range []storage.QueueItemRecord{
+		{ID: "worker_codex", ProjectID: &projectID, LoopID: &workerLoopID, Type: "worker", TargetType: "project", TargetID: "project:provider_lanes", DedupeKey: "d_worker_codex", Priority: storage.QueuePriorityWorker, Status: "queued", AvailableAt: nowISO, MaxAttempts: -1, CreatedAt: nowISO, UpdatedAt: nowISO},
+		{ID: "reviewer_claude", ProjectID: &projectID, LoopID: &reviewerLoopID, Type: "reviewer", TargetType: "pull_request", TargetID: "pr:42", Repo: &repo, PRNumber: &prNumber, DedupeKey: "d_reviewer_claude", Priority: storage.QueuePriorityReviewer, Status: "queued", AvailableAt: nowISO, MaxAttempts: -1, CreatedAt: nowISO, UpdatedAt: nowISO},
+	} {
+		if err := repos.Queue.Upsert(context.Background(), item); err != nil {
+			t.Fatalf("Queue.Upsert(%s) error = %v", item.ID, err)
+		}
+	}
+
+	var allowVendors []string
+	var withVendors []string
+	allowVendor := func(vendor string) error {
+		allowVendors = append(allowVendors, vendor)
+		if vendor == string(codex) {
+			return fmt.Errorf("%w: codex provider is open", brownout.ErrOpen)
+		}
+		return nil
+	}
+	withVendor := func(vendor string, fn func()) error {
+		withVendors = append(withVendors, vendor)
+		fn()
+		return nil
+	}
+	claimed, err := claimAndRunScheduledQueueItems(context.Background(), 2, defaultSchedulerTickInput{
+		Repos:                   repos,
+		Now:                     func() time.Time { return now },
+		Config:                  &cfg,
+		Worker:                  &stubWorkerScheduler{},
+		Reviewer:                &stubReviewerScheduler{},
+		AllowClaimForVendor:     allowVendor,
+		WithAllowClaimForVendor: withVendor,
+	})
+	if err != nil {
+		t.Fatalf("claimAndRunScheduledQueueItems() error = %v", err)
+	}
+	if len(claimed) != 1 || claimed[0].ID != "reviewer_claude" {
+		t.Fatalf("claimed = %#v, want only Claude reviewer work", claimed)
+	}
+	seenCodex := false
+	for _, vendor := range allowVendors {
+		if vendor == string(codex) {
+			seenCodex = true
+		}
+	}
+	if len(allowVendors) == 0 || allowVendors[0] != string(claude) || !seenCodex {
+		t.Fatalf("provider admission calls = %#v, want Claude first and Codex lane checked", allowVendors)
+	}
+	if len(withVendors) == 0 {
+		t.Fatal("provider critical sections = empty, want Claude claim section")
+	}
+	for _, vendor := range withVendors {
+		if vendor != string(claude) {
+			t.Fatalf("provider critical sections = %#v, want only Claude", withVendors)
+		}
+	}
+	workerItem, err := repos.Queue.GetByID(context.Background(), "worker_codex")
+	if err != nil {
+		t.Fatalf("Queue.GetByID(worker_codex) error = %v", err)
+	}
+	if workerItem == nil || workerItem.Status != "queued" {
+		t.Fatalf("worker item = %#v, want queued while Codex is open", workerItem)
 	}
 }
 

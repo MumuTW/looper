@@ -205,6 +205,33 @@ func validRawJSONObject(stdout string) bool {
 	return json.Unmarshal([]byte(message), &object) == nil && object != nil
 }
 
+// validMarkerOutcome rejects a marker that advertises an outcome outside the
+// shared completion contract. Generic workers still use the summary-only
+// marker, so an absent outcome remains valid; once an agent supplies the key,
+// only completed or blocked is recognized. This keeps health accounting aligned
+// with fixerRepairTaskOutcome instead of treating an unknown role result as a
+// provider success.
+func validMarkerOutcome(payload string) bool {
+	var raw map[string]json.RawMessage
+	if strings.TrimSpace(payload) == "" || json.Unmarshal([]byte(payload), &raw) != nil {
+		return false
+	}
+	encoded, ok := raw["outcome"]
+	if !ok {
+		return true
+	}
+	var outcome string
+	if json.Unmarshal(encoded, &outcome) != nil {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(outcome)) {
+	case "completed", "blocked":
+		return true
+	default:
+		return false
+	}
+}
+
 // ProgressUpdate is a throttled snapshot of a running agent's activity: the last
 // few lines it has emitted, plus how long it has been running.
 type ProgressUpdate struct {
@@ -1331,7 +1358,7 @@ func (x *execution) reportOutcome(status, parseStatus, completionPayload, stdout
 	if x.input.CompletionContract == CompletionContractRawJSON {
 		succeeded = succeeded && validRawJSONObject(stdout)
 	} else {
-		succeeded = succeeded && parseStatus == "parsed"
+		succeeded = succeeded && parseStatus == "parsed" && validMarkerOutcome(completionPayload)
 	}
 	x.executor.onOutcome(Outcome{
 		ProjectID:     x.input.ProjectID,

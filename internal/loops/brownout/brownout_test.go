@@ -230,6 +230,62 @@ func TestMultipleProbeSuccessesRequired(t *testing.T) {
 	}
 }
 
+func TestHalfOpenAdmissionReservesProbeSlots(t *testing.T) {
+	cfg := testConfig()
+	cfg.ProbeSuccesses = 2
+	b, c, _ := newTestBreaker(t, cfg)
+	b.Record(c.now(), false)
+	b.Record(c.now(), false)
+	b.Record(c.now(), false)
+	c.add(10 * time.Minute)
+
+	probe, err := b.AllowAdmission()
+	if err != nil || !probe {
+		t.Fatalf("first half-open admission = (%t, %v), want probe", probe, err)
+	}
+	probe, err = b.AllowAdmission()
+	if err != nil || !probe {
+		t.Fatalf("second half-open admission = (%t, %v), want probe", probe, err)
+	}
+	if _, err := b.AllowAdmission(); !errors.Is(err, ErrOpen) {
+		t.Fatalf("third half-open admission = %v, want probe-capacity refusal", err)
+	}
+
+	b.Record(c.now(), true)
+	if got := b.Snapshot().State; got != StateHalfOpen {
+		t.Fatalf("state after first reserved probe = %s, want half_open", got)
+	}
+	b.Record(c.now(), true)
+	if got := b.Snapshot().State; got != StateClosed {
+		t.Fatalf("state after all reserved probes = %s, want closed", got)
+	}
+}
+
+func TestNonTokenAdmissionDoesNotConsumeProbeSlot(t *testing.T) {
+	cfg := testConfig()
+	cfg.ProbeSuccesses = 1
+	b, c, _ := newTestBreaker(t, cfg)
+	b.Record(c.now(), false)
+	b.Record(c.now(), false)
+	b.Record(c.now(), false)
+	c.add(10 * time.Minute)
+
+	if err := b.Allow(); err != nil {
+		t.Fatalf("non-token half-open admission = %v, want nil", err)
+	}
+	probe, err := b.AllowAdmission()
+	if err != nil || !probe {
+		t.Fatalf("token admission after health check = (%t, %v), want reserved probe", probe, err)
+	}
+	if _, err := b.AllowAdmission(); !errors.Is(err, ErrOpen) {
+		t.Fatalf("second token admission = %v, want probe-capacity refusal", err)
+	}
+	b.RecordAdmission(c.now(), true, true)
+	if got := b.Snapshot().State; got != StateClosed {
+		t.Fatalf("state after reserved probe = %s, want closed", got)
+	}
+}
+
 func TestSnapshotReportsOpenUntilAndTrips(t *testing.T) {
 	b, c, _ := newTestBreaker(t, testConfig())
 	if snapshot := b.Snapshot(); snapshot.OpenUntil != nil {

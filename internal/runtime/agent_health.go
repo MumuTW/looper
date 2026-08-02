@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"fmt"
 	"sort"
 	"strings"
 	"sync"
@@ -20,21 +21,22 @@ const defaultAgentHealthVendor = "_default"
 // non-reentrant: callbacks must not spawn or consult provider health while the
 // section is held, and operation leases use the outer scheduler admission.
 type agentHealthRegistry struct {
-	mu         sync.Mutex
-	gateMu     sync.Mutex
-	now        func() time.Time
-	onChange   func(string, brownout.Transition)
-	onWarning  func(string)
-	cfg        brownout.Config
-	configured bool
-	breakers   map[string]*brownout.Breaker
+	mu                sync.Mutex
+	gateMu            sync.Mutex
+	now               func() time.Time
+	onChange          func(string, brownout.Transition)
+	onWarning         func(string)
+	cfg               brownout.Config
+	configured        bool
+	configuredVendors map[string]struct{}
+	breakers          map[string]*brownout.Breaker
 }
 
 func newAgentHealthRegistry(cfg brownout.Config, daemonCfg config.Config, now func() time.Time, onChange func(string, brownout.Transition), onWarning func(string)) *agentHealthRegistry {
 	if now == nil {
 		now = time.Now
 	}
-	r := &agentHealthRegistry{now: now, onChange: onChange, onWarning: onWarning, cfg: cfg, breakers: make(map[string]*brownout.Breaker)}
+	r := &agentHealthRegistry{now: now, onChange: onChange, onWarning: onWarning, cfg: cfg, configuredVendors: make(map[string]struct{}), breakers: make(map[string]*brownout.Breaker)}
 	r.ensureConfiguredVendorsLocked(daemonCfg)
 	if len(r.breakers) == 0 {
 		r.ensureBreakerLocked(defaultAgentHealthVendor)
@@ -44,13 +46,24 @@ func newAgentHealthRegistry(cfg brownout.Config, daemonCfg config.Config, now fu
 
 func (r *agentHealthRegistry) ensureConfiguredVendorsLocked(cfg config.Config) {
 	configured := false
+	activeVendors := make(map[string]struct{})
 	for _, role := range []string{config.CodingRolePlanner, config.CodingRoleWorker, config.CodingRoleReviewer, config.CodingRoleFixer} {
 		if resolved, ok := config.ResolveAgent(cfg, "", role); ok {
 			configured = true
+			activeVendors[string(resolved.Vendor)] = struct{}{}
 			r.ensureBreakerLocked(string(resolved.Vendor))
 		}
 	}
+	for vendor := range r.breakers {
+		if vendor == defaultAgentHealthVendor {
+			continue
+		}
+		if _, ok := activeVendors[vendor]; !ok {
+			delete(r.breakers, vendor)
+		}
+	}
 	r.configured = configured
+	r.configuredVendors = activeVendors
 	if configured {
 		// The default bucket is only for embedders/legacy configs with no
 		// effective vendor. Once a real provider is configured it must not keep
@@ -87,8 +100,42 @@ func (r *agentHealthRegistry) breaker(vendor string) *brownout.Breaker {
 }
 
 func (r *agentHealthRegistry) Allow(vendor string) error {
-	_, err := r.AllowAdmission(vendor)
-	return err
+	if r == nil {
+		return nil
+	}
+	r.gateMu.Lock()
+	defer r.gateMu.Unlock()
+	breaker, err := r.admissionBreaker(vendor)
+	if err != nil {
+		return err
+	}
+	return breaker.Allow()
+}
+
+// With runs a provider-scoped durable mutation only while that provider is
+// admitted. It is intentionally separate from WithAny: a healthy provider
+// must not authorize a queue claim that will later be routed to another
+// provider whose breaker is open.
+func (r *agentHealthRegistry) With(vendor string, fn func()) error {
+	if r == nil {
+		if fn != nil {
+			fn()
+		}
+		return nil
+	}
+	r.gateMu.Lock()
+	defer r.gateMu.Unlock()
+	breaker, err := r.admissionBreaker(vendor)
+	if err != nil {
+		return err
+	}
+	if err := breaker.Allow(); err != nil {
+		return err
+	}
+	if fn != nil {
+		fn()
+	}
+	return nil
 }
 
 func (r *agentHealthRegistry) AllowAdmission(vendor string) (bool, error) {
@@ -97,7 +144,11 @@ func (r *agentHealthRegistry) AllowAdmission(vendor string) (bool, error) {
 	}
 	r.gateMu.Lock()
 	defer r.gateMu.Unlock()
-	return r.breaker(vendor).AllowAdmission()
+	breaker, err := r.admissionBreaker(vendor)
+	if err != nil {
+		return false, err
+	}
+	return breaker.AllowAdmission()
 }
 
 // AllowAny admits work when at least one configured provider is healthy. A
@@ -165,6 +216,13 @@ func (r *agentHealthRegistry) Record(vendor string, startedAt time.Time, ok, pro
 			return
 		}
 	}
+	if !r.vendorActive(vendor) {
+		r.gateMu.Unlock()
+		if r.onWarning != nil {
+			r.onWarning("agent outcome used a provider no longer configured; outcome ignored")
+		}
+		return
+	}
 	breaker := r.breaker(vendor)
 	// Legacy/default outcomes may carry a timestamp but no spawn token. Let the
 	// breaker validate that timestamp against its half-open boundary; configured
@@ -211,6 +269,39 @@ func (r *agentHealthRegistry) snapshotBreakers() []*brownout.Breaker {
 	}
 	r.mu.Unlock()
 	return breakers
+}
+
+func (r *agentHealthRegistry) vendorActive(vendor string) bool {
+	key := strings.TrimSpace(vendor)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.configured {
+		return true
+	}
+	_, ok := r.configuredVendors[key]
+	return ok
+}
+
+// admissionBreaker resolves legacy empty/default spawn metadata only when the
+// daemon has exactly one active provider. That keeps older embedders and
+// lifecycle tests working without creating a fallback bucket that could bypass
+// a multi-provider brownout; ambiguous metadata remains fail-closed.
+func (r *agentHealthRegistry) admissionBreaker(vendor string) (*brownout.Breaker, error) {
+	key := strings.TrimSpace(vendor)
+	r.mu.Lock()
+	if r.configured {
+		if _, ok := r.configuredVendors[key]; !ok && (key == "" || key == defaultAgentHealthVendor) && len(r.configuredVendors) == 1 {
+			for active := range r.configuredVendors {
+				key = active
+			}
+		}
+		if _, ok := r.configuredVendors[key]; !ok {
+			r.mu.Unlock()
+			return nil, fmt.Errorf("%w: provider %q is no longer configured", brownout.ErrOpen, strings.TrimSpace(vendor))
+		}
+	}
+	r.mu.Unlock()
+	return r.breaker(key), nil
 }
 
 func (r *agentHealthRegistry) Snapshot() brownout.Summary {

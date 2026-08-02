@@ -30,6 +30,7 @@ import (
 	githubinfra "github.com/MumuTW/looper/internal/infra/github"
 	"github.com/MumuTW/looper/internal/infra/notify"
 	"github.com/MumuTW/looper/internal/labels"
+	"github.com/MumuTW/looper/internal/loops/brownout"
 	"github.com/MumuTW/looper/internal/loops/runpipe"
 	networkclient "github.com/MumuTW/looper/internal/network/client"
 	"github.com/MumuTW/looper/internal/network/protocol"
@@ -150,6 +151,11 @@ type defaultSchedulerTickInput struct {
 	// WithAllowClaim holds provider-health and lifecycle admission across a
 	// durable claim/enqueue section. Nil means no critical-section gate (tests).
 	WithAllowClaim func(func()) error
+	// AllowClaimForVendor and WithAllowClaimForVendor apply the same gates to a
+	// queue lane whose effective provider is known before ClaimNext*. Nil keeps
+	// legacy/unit-test scheduler inputs ungated.
+	AllowClaimForVendor     func(string) error
+	WithAllowClaimForVendor func(string, func()) error
 	// OperationOwner, when set, admits a Supervisor operation lease before each
 	// durable ClaimNext* and holds it until durable complete/cancel/requeue
 	// (ADR-0015 R6 / #579). Nil means ungated claim ownership (unit tests).
@@ -1886,6 +1892,11 @@ type schedulerNotificationGatewayFactory struct {
 	feishuAppHTTP notify.FeishuAppHTTPFunc
 }
 
+type schedulerProviderGate struct {
+	allow func(string) error
+	with  func(string, func()) error
+}
+
 func newSchedulerNotificationGatewayFactory() *schedulerNotificationGatewayFactory {
 	return &schedulerNotificationGatewayFactory{state: notify.NewGatewayState()}
 }
@@ -1898,7 +1909,13 @@ func (f *schedulerNotificationGatewayFactory) New(options notify.Options) *notif
 	return notify.NewGateway(options)
 }
 
-func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *sync.RWMutex, configPath string, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error), allowClaim func() error, withAllowClaim func(fn func()) error, hostGate *hostAdmissionGate) defaultSchedulerHandlers {
+func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *sync.RWMutex, configPath string, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error), allowClaim func() error, withAllowClaim func(fn func()) error, providerGates ...schedulerProviderGate) defaultSchedulerHandlers {
+	var allowClaimForVendor func(string) error
+	var withAllowClaimForVendor func(string, func()) error
+	if len(providerGates) > 0 {
+		allowClaimForVendor = providerGates[0].allow
+		withAllowClaimForVendor = providerGates[0].with
+	}
 	if source == nil {
 		fail := func(context.Context, Services) error { return fmt.Errorf("project catalog is not configured") }
 		return defaultSchedulerHandlers{tick: fail, claim: fail}
@@ -1961,6 +1978,8 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *
 		input.ClaimBoundary = claimBoundary
 		input.AllowClaim = allowClaim
 		input.WithAllowClaim = withAllowClaim
+		input.AllowClaimForVendor = allowClaimForVendor
+		input.WithAllowClaimForVendor = withAllowClaimForVendor
 		// Wire Supervisor operation leases for claim ownership span (#579).
 		// Prefer the live registry from Services when present (daemon path).
 		if services.ActiveExecutions != nil {
@@ -1976,6 +1995,8 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *
 				stopped.RefreshForClaim = nil
 				stopped.AllowClaim = allowClaim
 				stopped.WithAllowClaim = withAllowClaim
+				stopped.AllowClaimForVendor = allowClaimForVendor
+				stopped.WithAllowClaimForVendor = withAllowClaimForVendor
 				if services.ActiveExecutions != nil {
 					stopped.OperationOwner = services.ActiveExecutions
 				} else if activeExecutions != nil {
@@ -1987,6 +2008,8 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *
 			latest.ClaimBoundary = claimBoundary
 			latest.AllowClaim = allowClaim
 			latest.WithAllowClaim = withAllowClaim
+			latest.AllowClaimForVendor = allowClaimForVendor
+			latest.WithAllowClaimForVendor = withAllowClaimForVendor
 			if services.ActiveExecutions != nil {
 				latest.OperationOwner = services.ActiveExecutions
 			} else if activeExecutions != nil {
@@ -3427,12 +3450,62 @@ func claimTypeSetsFromInput(input defaultSchedulerTickInput) (unrestricted, stic
 	return unrestricted, stickySnapshotOnly
 }
 
+type providerClaimTypeSet struct {
+	vendor         string
+	providerScoped bool
+	unrestricted   []string
+	stickyOnly     []string
+}
+
+// claimTypeSetsByProvider partitions queue lanes by the provider resolved for
+// their role. The queue repository must receive this partition before
+// ClaimNext* so a healthy provider cannot authorize a durable claim routed to a
+// different provider whose breaker is open. Sticky retries without a live role
+// binding remain in an unscoped lane and use the existing AllowAny policy.
+func claimTypeSetsByProvider(input defaultSchedulerTickInput) []providerClaimTypeSet {
+	unrestricted, stickyOnly := claimTypeSetsFromInput(input)
+	if input.Config == nil {
+		return []providerClaimTypeSet{{unrestricted: unrestricted, stickyOnly: stickyOnly}}
+	}
+	groups := make([]providerClaimTypeSet, 0, 4)
+	groupFor := func(vendor string, scoped bool) *providerClaimTypeSet {
+		for i := range groups {
+			if groups[i].vendor == vendor && groups[i].providerScoped == scoped {
+				return &groups[i]
+			}
+		}
+		groups = append(groups, providerClaimTypeSet{vendor: vendor, providerScoped: scoped})
+		return &groups[len(groups)-1]
+	}
+	add := func(queueType string, sticky bool) {
+		vendor := ""
+		scoped := false
+		if resolved, ok := config.ResolveAgent(*input.Config, "", queueType); ok {
+			vendor = string(resolved.Vendor)
+			scoped = vendor != ""
+		}
+		group := groupFor(vendor, scoped)
+		if sticky {
+			group.stickyOnly = append(group.stickyOnly, queueType)
+		} else {
+			group.unrestricted = append(group.unrestricted, queueType)
+		}
+	}
+	for _, queueType := range unrestricted {
+		add(queueType, false)
+	}
+	for _, queueType := range stickyOnly {
+		add(queueType, true)
+	}
+	return groups
+}
+
 func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, input defaultSchedulerTickInput) ([]storage.QueueItemRecord, error) {
 	if availableSlots <= 0 || input.Repos == nil || input.Repos.Queue == nil {
 		return nil, nil
 	}
-	unrestrictedTypes, stickySnapshotTypes := claimTypeSetsFromInput(input)
-	if len(unrestrictedTypes) == 0 && len(stickySnapshotTypes) == 0 {
+	providerTypeSets := claimTypeSetsByProvider(input)
+	if len(providerTypeSets) == 0 {
 		return nil, nil
 	}
 	now := input.Now
@@ -3455,26 +3528,42 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 	// When OperationOwner is set (#579): AdmitOperation before each ClaimNext*,
 	// BindClaim after success (explicit permit), Release immediately on miss/
 	// error, and never start a processor without a valid permit.
-	admitClaim := func() error {
-		if input.AllowClaim == nil {
-			return nil
+	admitClaim := func(vendor string, providerScoped bool) (skip, stop bool) {
+		var err error
+		if providerScoped && input.AllowClaimForVendor != nil {
+			err = input.AllowClaimForVendor(vendor)
+		} else if input.AllowClaim != nil {
+			err = input.AllowClaim()
 		}
-		return input.AllowClaim()
+		if err == nil {
+			return false, false
+		}
+		if providerScoped && errors.Is(err, brownout.ErrOpen) {
+			// An open provider lane is skipped while healthy provider lanes may
+			// still claim work in the same scheduler tick.
+			return true, false
+		}
+		return false, true
 	}
-	// claimOne result: empty means this lane has no more candidates (try next
-	// lane); stop means halt all further ClaimNext*; err is a hard claim failure.
+	// claimOne result: empty means this lane has no more candidates; skip means
+	// its provider is brownout-open and the next provider lane may proceed; stop
+	// means halt all further ClaimNext*; err is a hard claim failure.
 	const (
 		claimContinue = iota
 		claimEmpty
+		claimSkip
 		claimStop
 	)
-	claimOne := func(claimFn func(context.Context, string, string) (*storage.QueueItemRecord, error)) (result int, claimErr error) {
+	claimOne := func(vendor string, providerScoped bool, claimFn func(context.Context, string, string) (*storage.QueueItemRecord, error)) (result int, claimErr error) {
 		if err := ctx.Err(); err != nil {
 			return claimStop, nil
 		}
-		if err := admitClaim(); err != nil {
+		if skip, stop := admitClaim(vendor, providerScoped); skip {
+			return claimSkip, nil
+		} else if stop {
 			return claimStop, nil
 		}
+		var deferredHardPersist error
 		execute := func() (int, error) {
 			var lease OperationLease
 			if input.OperationOwner != nil {
@@ -3496,9 +3585,7 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 				if lease != nil && claimErrorIsAmbiguousCancel(ctx, err) {
 					recovered, recErr := recoverAmbiguousCancelledClaim(ctx, input, nowISO, owned)
 					if recErr != nil {
-						if input.OperationOwner != nil {
-							input.OperationOwner.ReportHardPersistFailure(recErr)
-						}
+						deferredHardPersist = recErr
 						// Retain lease — do not Release; BeginShutdown still observes it.
 						return claimStop, errors.Join(ErrOperationFinalizeFailed, recErr)
 					}
@@ -3539,9 +3626,7 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 					// Cancelled lease never starts the processor. Durable-requeue
 					// under retained ownership; Release only after requeue commits.
 					if finErr := finalizeCancelledClaim(ctx, *item, input, now); finErr != nil {
-						if input.OperationOwner != nil {
-							input.OperationOwner.ReportHardPersistFailure(finErr)
-						}
+						deferredHardPersist = finErr
 						// Retain ownership — do not Release; do not dispatch.
 						return claimContinue, errors.Join(ErrOperationFinalizeFailed, finErr)
 					}
@@ -3551,9 +3636,7 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 				if !permit.Valid() {
 					// Defensive: BindClaim must return a valid permit or error.
 					if finErr := finalizeCancelledClaim(ctx, *item, input, now); finErr != nil {
-						if input.OperationOwner != nil {
-							input.OperationOwner.ReportHardPersistFailure(finErr)
-						}
+						deferredHardPersist = finErr
 						return claimContinue, errors.Join(ErrOperationFinalizeFailed, finErr)
 					}
 					lease.Release()
@@ -3567,14 +3650,39 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 			queueItems = append(queueItems, *item)
 			return claimContinue, nil
 		}
-		if input.WithAllowClaim == nil {
-			return execute()
+		executeAndReport := func() (int, error) {
+			result, err := execute()
+			if deferredHardPersist != nil && input.OperationOwner != nil {
+				// Report after the provider/lifecycle critical section is released;
+				// MarkDegraded takes admission.mu and would deadlock in the wrapper.
+				input.OperationOwner.ReportHardPersistFailure(deferredHardPersist)
+				deferredHardPersist = nil
+			}
+			return result, err
+		}
+		if input.WithAllowClaim == nil && !(providerScoped && input.WithAllowClaimForVendor != nil) {
+			return executeAndReport()
 		}
 		var executeResult int
 		var executeErr error
-		if gateErr := input.WithAllowClaim(func() {
-			executeResult, executeErr = execute()
-		}); gateErr != nil {
+		var gateErr error
+		if providerScoped && input.WithAllowClaimForVendor != nil {
+			gateErr = input.WithAllowClaimForVendor(vendor, func() {
+				executeResult, executeErr = execute()
+			})
+		} else {
+			gateErr = input.WithAllowClaim(func() {
+				executeResult, executeErr = execute()
+			})
+		}
+		if deferredHardPersist != nil && input.OperationOwner != nil {
+			input.OperationOwner.ReportHardPersistFailure(deferredHardPersist)
+			deferredHardPersist = nil
+		}
+		if gateErr != nil {
+			if providerScoped && errors.Is(gateErr, brownout.ErrOpen) {
+				return claimSkip, nil
+			}
 			return claimStop, nil
 		}
 		return executeResult, executeErr
@@ -3586,33 +3694,44 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 	}
 	projectScopedTypes, runnableProjectIDs, stickyOnlyProjectIDs := codingClaimProjectScope(input.Config, quarantinedIDs)
 	stopClaiming := false
-	for i := 0; i < availableSlots; i++ {
-		result, err := claimOne(func(ctx context.Context, nowISO, claimedBy string) (*storage.QueueItemRecord, error) {
-			return input.Repos.Queue.ClaimNextNonLongTermRetryAmongTypeSetsForProjects(ctx, nowISO, claimedBy, unrestrictedTypes, stickySnapshotTypes, projectScopedTypes, runnableProjectIDs, stickyOnlyProjectIDs)
-		})
-		if err != nil {
-			return queueItems, dispatchOwnedQueueClaims(ctx, owned, input, err)
-		}
-		if result == claimEmpty {
-			break
-		}
-		if result == claimStop {
-			stopClaiming = true
-			break
+	var claimFailure error
+	claimLanes := func(longTerm bool) {
+		for _, typeSet := range providerTypeSets {
+			if stopClaiming || len(queueItems) >= availableSlots {
+				return
+			}
+		lane:
+			for len(queueItems) < availableSlots {
+				result, err := claimOne(typeSet.vendor, typeSet.providerScoped, func(ctx context.Context, nowISO, claimedBy string) (*storage.QueueItemRecord, error) {
+					if longTerm {
+						return input.Repos.Queue.ClaimNextLongTermRetryAmongTypeSetsForProjects(ctx, nowISO, claimedBy, typeSet.unrestricted, typeSet.stickyOnly, projectScopedTypes, runnableProjectIDs)
+					}
+					return input.Repos.Queue.ClaimNextNonLongTermRetryAmongTypeSetsForProjects(ctx, nowISO, claimedBy, typeSet.unrestricted, typeSet.stickyOnly, projectScopedTypes, runnableProjectIDs)
+				})
+				if err != nil {
+					claimFailure = err
+					stopClaiming = true
+					return
+				}
+				switch result {
+				case claimContinue:
+					continue
+				case claimEmpty, claimSkip:
+					// Try the next provider lane; no more candidates or an open
+					// provider must not block healthy lanes.
+					break lane
+				case claimStop:
+					stopClaiming = true
+					return
+				}
+			}
 		}
 	}
-	for !stopClaiming && len(queueItems) < availableSlots {
-		result, err := claimOne(func(ctx context.Context, nowISO, claimedBy string) (*storage.QueueItemRecord, error) {
-			return input.Repos.Queue.ClaimNextLongTermRetryAmongTypeSetsForProjects(ctx, nowISO, claimedBy, unrestrictedTypes, stickySnapshotTypes, projectScopedTypes, runnableProjectIDs, stickyOnlyProjectIDs)
-		})
-		if err != nil {
-			return queueItems, dispatchOwnedQueueClaims(ctx, owned, input, err)
-		}
-		if result == claimEmpty || result == claimStop {
-			break
-		}
+	claimLanes(false)
+	if !stopClaiming {
+		claimLanes(true)
 	}
-	return queueItems, dispatchOwnedQueueClaims(ctx, owned, input, nil)
+	return queueItems, dispatchOwnedQueueClaims(ctx, owned, input, claimFailure)
 }
 
 func codingClaimProjectScope(cfg *config.Config, quarantinedProjectIDs []string) (projectScopedTypes, runnableProjectIDs, stickyOnlyProjectIDs []string) {

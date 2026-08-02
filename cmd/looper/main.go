@@ -1289,7 +1289,7 @@ func agentHealthLine(health statusAgentHealthView) string {
 		}
 		return line
 	case "half_open":
-		return "probing: one agent run decides whether work resumes"
+		return "probing: recovery checks must succeed before work resumes"
 	default:
 		return health.State
 	}

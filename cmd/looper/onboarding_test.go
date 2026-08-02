@@ -1145,3 +1145,17 @@ func TestStatusOmitsBinaryLineWhenUnchanged(t *testing.T) {
 		t.Fatalf("status output = %q, want nothing for an unchanged binary", got)
 	}
 }
+
+func TestStatusReportsRecoveryProbeWithoutClaimingOneRunIsEnough(t *testing.T) {
+	var stdout bytes.Buffer
+	writeStatusOpsLines(&stdout, daemonStatusResponse{Service: statusServiceView{
+		AgentHealth: &statusAgentHealthView{State: "half_open"},
+	}})
+	got := stdout.String()
+	if !strings.Contains(got, "probing: recovery checks must succeed before work resumes") {
+		t.Fatalf("status output = %q, want recovery-check wording", got)
+	}
+	if strings.Contains(got, "one agent run") {
+		t.Fatalf("status output = %q, must not claim one run is sufficient", got)
+	}
+}
