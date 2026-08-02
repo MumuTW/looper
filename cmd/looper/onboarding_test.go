@@ -1159,3 +1159,22 @@ func TestStatusReportsRecoveryProbeWithoutClaimingOneRunIsEnough(t *testing.T) {
 		t.Fatalf("status output = %q, must not claim one run is sufficient", got)
 	}
 }
+
+func TestStatusReportsPartialProviderBrownout(t *testing.T) {
+	var stdout bytes.Buffer
+	retryAt := "2026-08-01T22:10:00.000Z"
+	writeStatusOpsLines(&stdout, daemonStatusResponse{Service: statusServiceView{
+		AgentHealth: &statusAgentHealthView{
+			State:   "closed",
+			Partial: true,
+			Providers: []statusAgentProviderHealthView{
+				{Provider: "claude", State: "closed"},
+				{Provider: "codex", State: "open", OpenUntil: &retryAt},
+			},
+		},
+	}})
+	got := stdout.String()
+	if !strings.Contains(got, "agents:   partially paused: claude=closed, codex=open (retrying at 2026-08-01T22:10:00.000Z)") {
+		t.Fatalf("status output = %q, want provider-scoped partial brownout line", got)
+	}
+}

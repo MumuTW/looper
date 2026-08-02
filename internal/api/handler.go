@@ -935,15 +935,27 @@ func (h *Handler) agentHealthStatus() *statusAgentHealth {
 		return nil
 	}
 	summary := typed.AgentHealth()
-	// Only report a gate that is actually holding work back. A closed gate on a
-	// healthy daemon is noise in every status output.
-	if summary.State == brownout.StateClosed {
+	// Only report a gate that is actually holding work back. A closed aggregate
+	// can still be partial when one provider is open and a healthy sibling keeps
+	// AllowAny admitted, so retain that provider-scoped evidence.
+	if summary.State == brownout.StateClosed && !summary.Partial && len(summary.Providers) == 0 {
 		return nil
 	}
-	view := &statusAgentHealth{State: string(summary.State), Failures: summary.Failures, Total: summary.Total, Trips: summary.Trips}
+	view := &statusAgentHealth{State: string(summary.State), Partial: summary.Partial, Failures: summary.Failures, Total: summary.Total, Trips: summary.Trips}
 	if summary.OpenUntil != nil {
 		openUntil := eventlog.FormatJavaScriptISOString(summary.OpenUntil.UTC())
 		view.OpenUntil = &openUntil
+	}
+	if len(summary.Providers) > 0 {
+		view.Providers = make([]statusAgentProviderHealth, 0, len(summary.Providers))
+		for _, provider := range summary.Providers {
+			item := statusAgentProviderHealth{Provider: provider.Provider, State: string(provider.State), Failures: provider.Failures, Total: provider.Total, Trips: provider.Trips}
+			if provider.OpenUntil != nil {
+				openUntil := eventlog.FormatJavaScriptISOString(provider.OpenUntil.UTC())
+				item.OpenUntil = &openUntil
+			}
+			view.Providers = append(view.Providers, item)
+		}
 	}
 	return view
 }
@@ -1160,6 +1172,17 @@ type statusService struct {
 // be retried, so an operator seeing an idle daemon can tell "waiting out a bad
 // provider" from "stuck".
 type statusAgentHealth struct {
+	State     string                      `json:"state"`
+	Partial   bool                        `json:"partial,omitempty"`
+	Failures  int                         `json:"failures"`
+	Total     int                         `json:"total"`
+	OpenUntil *string                     `json:"openUntil,omitempty"`
+	Trips     int                         `json:"trips"`
+	Providers []statusAgentProviderHealth `json:"providers,omitempty"`
+}
+
+type statusAgentProviderHealth struct {
+	Provider  string  `json:"provider"`
 	State     string  `json:"state"`
 	Failures  int     `json:"failures"`
 	Total     int     `json:"total"`

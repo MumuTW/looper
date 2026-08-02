@@ -149,6 +149,35 @@ func TestAgentBrownoutIsolatedByEffectiveVendor(t *testing.T) {
 	}
 }
 
+func TestAgentHealthSnapshotExposesPartialProviderBrownout(t *testing.T) {
+	rt, _ := brownoutRuntime(t, nil)
+	codex := config.AgentVendorCodex
+	claude := config.AgentVendorClaudeCode
+	base := rt.Config()
+	base.Agent.Vendor = &codex
+	base.Roles.Worker.Agent = &config.RoleAgentConfig{Vendor: &claude}
+	rt.projectCatalog.PublishGlobals(base)
+	rt.publishCatalogConsumers(base)
+
+	for i := 0; i < 3; i++ {
+		rt.activeExecutions.ReportAgentOutcome(agent.Outcome{Vendor: string(codex), Status: "failed"})
+	}
+	summary := rt.AgentHealth()
+	if summary.State != brownout.StateClosed || !summary.Partial {
+		t.Fatalf("AgentHealth() = %#v, want closed aggregate with partial=true", summary)
+	}
+	if len(summary.Providers) != 2 {
+		t.Fatalf("provider summaries = %#v, want codex and claude", summary.Providers)
+	}
+	states := make(map[string]brownout.State, len(summary.Providers))
+	for _, provider := range summary.Providers {
+		states[provider.Provider] = provider.State
+	}
+	if states[string(codex)] != brownout.StateOpen || states[string(claude)] != brownout.StateClosed {
+		t.Fatalf("provider states = %#v, want codex open and claude closed", states)
+	}
+}
+
 func TestAgentHealthRegistersGlobalCoordinatorProvider(t *testing.T) {
 	rt, _ := brownoutRuntime(t, nil)
 	codex := config.AgentVendorCodex

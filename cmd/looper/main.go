@@ -1110,6 +1110,17 @@ type statusServiceView struct {
 }
 
 type statusAgentHealthView struct {
+	State     string                          `json:"state"`
+	Partial   bool                            `json:"partial"`
+	Failures  int                             `json:"failures"`
+	Total     int                             `json:"total"`
+	OpenUntil *string                         `json:"openUntil"`
+	Trips     int                             `json:"trips"`
+	Providers []statusAgentProviderHealthView `json:"providers"`
+}
+
+type statusAgentProviderHealthView struct {
+	Provider  string  `json:"provider"`
 	State     string  `json:"state"`
 	Failures  int     `json:"failures"`
 	Total     int     `json:"total"`
@@ -1278,6 +1289,20 @@ func writeStatusOpsLines(stdout io.Writer, status daemonStatusResponse) {
 }
 
 func agentHealthLine(health statusAgentHealthView) string {
+	if health.Partial {
+		if len(health.Providers) == 0 {
+			return "partially paused: one or more agent providers are unavailable"
+		}
+		parts := make([]string, 0, len(health.Providers))
+		for _, provider := range health.Providers {
+			line := fmt.Sprintf("%s=%s", provider.Provider, provider.State)
+			if provider.State == "open" && provider.OpenUntil != nil && strings.TrimSpace(*provider.OpenUntil) != "" {
+				line += fmt.Sprintf(" (retrying at %s)", strings.TrimSpace(*provider.OpenUntil))
+			}
+			parts = append(parts, line)
+		}
+		return "partially paused: " + strings.Join(parts, ", ")
+	}
 	switch health.State {
 	case "open":
 		line := fmt.Sprintf("work paused: %d of %d recent agent runs failed", health.Failures, health.Total)

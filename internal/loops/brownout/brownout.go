@@ -92,6 +92,27 @@ type Summary struct {
 	OpenUntil *time.Time    `json:"openUntil,omitempty"`
 	Cooldown  time.Duration `json:"-"`
 	Trips     int           `json:"trips"`
+	// Partial is true when the aggregate scheduler gate remains open because
+	// at least one provider is healthy while another provider is not. The
+	// aggregate State intentionally remains closed in that case: it is the
+	// AllowAny admission posture, not a claim that every provider is healthy.
+	Partial bool `json:"partial,omitempty"`
+	// Providers carries the per-provider posture when at least one provider is
+	// not closed. It is populated by the runtime registry, while a standalone
+	// Breaker leaves it empty.
+	Providers []ProviderSummary `json:"providers,omitempty"`
+}
+
+// ProviderSummary identifies one provider's live breaker posture for status
+// surfaces. Provider names belong to the runtime registry; the breaker package
+// only carries the common health fields.
+type ProviderSummary struct {
+	Provider  string     `json:"provider"`
+	State     State      `json:"state"`
+	Failures  int        `json:"failures"`
+	Total     int        `json:"total"`
+	OpenUntil *time.Time `json:"openUntil,omitempty"`
+	Trips     int        `json:"trips"`
 }
 
 type outcome struct {

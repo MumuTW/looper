@@ -483,16 +483,41 @@ func (r *agentHealthRegistry) Snapshot() brownout.Summary {
 	r.gateMu.Lock()
 	defer r.gateMu.Unlock()
 	summary := brownout.Summary{State: brownout.StateClosed}
-	breakers := r.snapshotBreakers()
-	allOpen := len(breakers) > 0
+	r.mu.Lock()
+	keys := make([]string, 0, len(r.breakers))
+	for key := range r.breakers {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	entries := make([]struct {
+		provider string
+		breaker  *brownout.Breaker
+	}, 0, len(keys))
+	for _, key := range keys {
+		entries = append(entries, struct {
+			provider string
+			breaker  *brownout.Breaker
+		}{provider: key, breaker: r.breakers[key]})
+	}
+	r.mu.Unlock()
+	allOpen := len(entries) > 0
 	hasHalfOpen := false
 	hasClosed := false
-	for _, breaker := range breakers {
-		current := breaker.Snapshot()
+	hasNonClosed := false
+	providerSummaries := make([]brownout.ProviderSummary, 0, len(entries))
+	for _, entry := range entries {
+		current := entry.breaker.Snapshot()
 		summary.Failures += current.Failures
 		summary.Total += current.Total
 		summary.Trips += current.Trips
+		provider := brownout.ProviderSummary{Provider: entry.provider, State: current.State, Failures: current.Failures, Total: current.Total, Trips: current.Trips}
+		if current.OpenUntil != nil {
+			openUntil := *current.OpenUntil
+			provider.OpenUntil = &openUntil
+		}
+		providerSummaries = append(providerSummaries, provider)
 		if current.State == brownout.StateOpen {
+			hasNonClosed = true
 			if current.OpenUntil != nil && (summary.OpenUntil == nil || current.OpenUntil.Before(*summary.OpenUntil)) {
 				until := *current.OpenUntil
 				summary.OpenUntil = &until
@@ -503,6 +528,7 @@ func (r *agentHealthRegistry) Snapshot() brownout.Summary {
 		allOpen = false
 		switch current.State {
 		case brownout.StateHalfOpen:
+			hasNonClosed = true
 			hasHalfOpen = true
 			summary.Cooldown = maxDuration(summary.Cooldown, current.Cooldown)
 		case brownout.StateClosed:
@@ -521,6 +547,10 @@ func (r *agentHealthRegistry) Snapshot() brownout.Summary {
 	} else {
 		summary.State = brownout.StateClosed
 		summary.OpenUntil = nil
+	}
+	if hasNonClosed {
+		summary.Providers = providerSummaries
+		summary.Partial = hasClosed
 	}
 	return summary
 }
