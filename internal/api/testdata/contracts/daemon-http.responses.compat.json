@@ -620,12 +620,6 @@
             "publicBaseUrl": "",
             "fallbackPollIntervalSeconds": 300
           },
-          "network": {
-            "enrolled": false,
-            "loopernetBaseUrl": "",
-            "nodeName": "",
-            "githubLogin": ""
-          },
           "agent": {
             "vendor": "opencode",
             "params": {},
