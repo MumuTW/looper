@@ -11,15 +11,24 @@ import (
 	"github.com/MumuTW/looper/internal/storage"
 )
 
-// Post-merge digest events are intentionally ordinary EventLog records. The
-// digest consumes these durable observations instead of querying GitHub at
-// report time, so a daily report has one local source of truth.
-const (
-	CoordinatorPullRequestMergedEventType  = "coordinator.pull_request.merged"
-	CoordinatorCloseAndRegenerateEventType = "coordinator.close_and_regenerate"
-	FixerCloseAndRegenerateEventType       = "fixer.close_and_regenerate"
-	PostMergeDigestSentEventType           = "coordinator.post_merge_digest.sent"
-)
+// CoordinatorPullRequestMergedEventType records a merge-watch observation of
+// a pull request merged by the forge (including Mergify). The forge's
+// MergedAt value in the payload is the merge-time authority; CreatedAt is only
+// when the daemon observed it.
+const CoordinatorPullRequestMergedEventType = "coordinator.pull_request.merged"
+
+// CoordinatorPullRequestMerged is the durable payload for a merge-watch merge
+// observation. It carries the identity needed by downstream audit consumers
+// without requiring another forge read.
+type CoordinatorPullRequestMerged struct {
+	Version     int    `json:"version"`
+	ProjectID   string `json:"projectId"`
+	Repo        string `json:"repo"`
+	PRNumber    int64  `json:"prNumber"`
+	IssueNumber int64  `json:"issueNumber,omitempty"`
+	HeadSHA     string `json:"headSha"`
+	MergedAt    string `json:"mergedAt"`
+}
 
 type AppendInput struct {
 	ID               string
