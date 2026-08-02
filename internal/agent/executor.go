@@ -237,6 +237,31 @@ func validMarkerOutcome(payload string) bool {
 	}
 }
 
+// validFixerMarkerOutcome is the stricter marker contract used by the fixer.
+// Unlike generic coding roles, the fixer runner requires an explicit outcome
+// before it may advance to validation or publish; a summary-only marker is not
+// evidence that repair completed.
+func validFixerMarkerOutcome(payload string) bool {
+	var raw map[string]json.RawMessage
+	if strings.TrimSpace(payload) == "" || json.Unmarshal([]byte(payload), &raw) != nil {
+		return false
+	}
+	encoded, ok := raw["outcome"]
+	if !ok {
+		return false
+	}
+	var outcome string
+	if json.Unmarshal(encoded, &outcome) != nil {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(outcome)) {
+	case "completed", "blocked":
+		return true
+	default:
+		return false
+	}
+}
+
 // ProgressUpdate is a throttled snapshot of a running agent's activity: the last
 // few lines it has emitted, plus how long it has been running.
 type ProgressUpdate struct {
@@ -311,8 +336,9 @@ type RunInput struct {
 type CompletionContract string
 
 const (
-	CompletionContractMarker  CompletionContract = "marker"
-	CompletionContractRawJSON CompletionContract = "raw_json"
+	CompletionContractMarker      CompletionContract = "marker"
+	CompletionContractRawJSON     CompletionContract = "raw_json"
+	CompletionContractFixerMarker CompletionContract = "fixer_marker"
 )
 
 // TimeoutObservation identifies the timeout that is about to terminate an
@@ -1368,6 +1394,8 @@ func (x *execution) reportOutcome(status, parseStatus, completionPayload, stdout
 	succeeded := status == "completed"
 	if x.input.CompletionContract == CompletionContractRawJSON {
 		succeeded = succeeded && validRawJSONObject(stdout)
+	} else if x.input.CompletionContract == CompletionContractFixerMarker {
+		succeeded = succeeded && parseStatus == "parsed" && validFixerMarkerOutcome(completionPayload)
 	} else {
 		succeeded = succeeded && parseStatus == "parsed" && validMarkerOutcome(completionPayload)
 	}

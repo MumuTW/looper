@@ -110,3 +110,19 @@ func TestReportOutcomeAcceptsRawJSONContract(t *testing.T) {
 		t.Fatalf("invalid raw JSON outcome = %#v, want one failed outcome", outcomes)
 	}
 }
+
+func TestReportOutcomeRequiresFixerOutcomeContract(t *testing.T) {
+	outcomes := make([]Outcome, 0, 1)
+	exec := outcomeExecution(&outcomes)
+	exec.input.CompletionContract = CompletionContractFixerMarker
+	exec.reportOutcome("completed", "parsed", `{"summary":"applied fixes"}`, "")
+	if len(outcomes) != 1 || outcomes[0].Succeeded {
+		t.Fatalf("summary-only fixer outcome = %#v, want one failed outcome", outcomes)
+	}
+
+	outcomes = outcomes[:0]
+	exec.reportOutcome("completed", "parsed", `{"outcome":"completed","summary":"applied fixes"}`, "")
+	if len(outcomes) != 1 || !outcomes[0].Succeeded {
+		t.Fatalf("declared fixer outcome = %#v, want one successful outcome", outcomes)
+	}
+}
