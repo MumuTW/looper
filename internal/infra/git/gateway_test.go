@@ -1477,6 +1477,44 @@ exit 0
 	}
 }
 
+func TestInspectHeadRejectsTruncatedStatusEvidence(t *testing.T) {
+	gitPath := writeFakeGit(t, `#!/bin/sh
+if [ "$1" = "rev-parse" ] && [ "$2" = "HEAD" ]; then
+  printf 'head-sha\n'
+  exit 0
+fi
+if [ "$1" = "rev-parse" ] && [ "$2" = "--abbrev-ref" ]; then
+  printf 'main\n'
+  exit 0
+fi
+if [ "$1" = "status" ]; then
+  awk 'BEGIN { for (i = 0; i < 300000; i++) printf "x" }'
+  exit 0
+fi
+exit 0
+`)
+	gateway := New(Options{GitPath: gitPath})
+	_, err := gateway.InspectHead(context.Background(), InspectHeadInput{WorktreePath: t.TempDir()})
+	if err == nil || !strings.Contains(err.Error(), "truncated") {
+		t.Fatalf("InspectHead() error = %v, want truncated Git evidence failure", err)
+	}
+}
+
+func TestIndexFingerprintRejectsTruncatedStageEvidence(t *testing.T) {
+	gitPath := writeFakeGit(t, `#!/bin/sh
+if [ "$1" = "ls-files" ] && [ "$2" = "--stage" ]; then
+  awk 'BEGIN { for (i = 0; i < 300000; i++) printf "x" }'
+  exit 0
+fi
+exit 0
+`)
+	gateway := New(Options{GitPath: gitPath})
+	_, err := gateway.indexFingerprint(context.Background(), t.TempDir(), []string{"tracked.txt"})
+	if err == nil || !strings.Contains(err.Error(), "truncated") {
+		t.Fatalf("indexFingerprint() error = %v, want truncated Git evidence failure", err)
+	}
+}
+
 func TestGatewayRemoteBranchExistsTreatsOnlyExitCode1AsMissing(t *testing.T) {
 	t.Parallel()
 

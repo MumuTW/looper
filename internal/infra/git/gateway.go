@@ -879,6 +879,9 @@ func (g *Gateway) InspectHead(ctx context.Context, input InspectHeadInput) (Insp
 	if err != nil {
 		return InspectHeadResult{}, err
 	}
+	if err := rejectTruncatedGitStdout(statusResult, "status --porcelain"); err != nil {
+		return InspectHeadResult{}, err
+	}
 	status, err := parseStatusResult(statusResult)
 	if err != nil {
 		return InspectHeadResult{}, err
@@ -1191,6 +1194,9 @@ func (g *Gateway) indexFingerprint(ctx context.Context, worktreePath string, pat
 	args = append(args, sortedPaths...)
 	result, err := g.runGitResult(ctx, worktreePath, nil, args...)
 	if err != nil {
+		return "", err
+	}
+	if err := rejectTruncatedGitStdout(result, "ls-files --stage"); err != nil {
 		return "", err
 	}
 	fingerprint := sha256.New()
@@ -1703,6 +1709,9 @@ func (g *Gateway) listCommitsSince(ctx context.Context, repoPath, baseRef string
 	if err != nil {
 		return nil, err
 	}
+	if err := rejectTruncatedGitStdout(result, "rev-list"); err != nil {
+		return nil, err
+	}
 
 	lines := strings.Split(result.Stdout, "\n")
 	commits := make([]string, 0, len(lines))
@@ -1724,6 +1733,9 @@ type statusEntry struct {
 func (g *Gateway) readStatus(ctx context.Context, repoPath string) ([]statusEntry, error) {
 	result, err := g.runGitResult(ctx, repoPath, nil, "status", "--porcelain", "--untracked-files=all", "--ignored=no")
 	if err != nil {
+		return nil, err
+	}
+	if err := rejectTruncatedGitStdout(result, "status --porcelain"); err != nil {
 		return nil, err
 	}
 	return parseStatusResult(result)
@@ -1798,6 +1810,7 @@ func (g *Gateway) runGitResult(ctx context.Context, cwd string, env map[string]s
 		}
 	}
 }
+
 
 func (g *Gateway) runGitResultOnce(ctx context.Context, cwd string, env map[string]string, args ...string) (shell.Result, error) {
 	return g.runGitResultOnceWithStartGate(ctx, cwd, env, nil, args...)
