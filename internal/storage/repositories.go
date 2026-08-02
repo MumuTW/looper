@@ -3207,12 +3207,19 @@ func (r *QueueRepository) ClaimNextNonLongTermRetryAmongTypeSets(ctx context.Con
 
 // ClaimNextNonLongTermRetryAmongTypeSetsForProjects additionally restricts
 // projectScopedTypes to queue items whose project_id is in projectIDs. Other
-// queue types remain eligible. stickyOnlyProjectIDs extends the scope for
-// projectScopedTypes to quarantined projects, but only for items whose latest
-// run is a sticky snapshot (failed/interrupted with a non-empty agent snapshot
-// vendor), so fresh work for quarantined projects is never admitted.
-func (r *QueueRepository) ClaimNextNonLongTermRetryAmongTypeSetsForProjects(ctx context.Context, nowISO, claimedBy string, unrestrictedTypes, stickySnapshotTypes, projectScopedTypes, projectIDs, stickyOnlyProjectIDs []string) (*QueueItemRecord, error) {
-	typePred, typeArgs := queueClaimTypePredicate(unrestrictedTypes, stickySnapshotTypes)
+// queue types remain eligible.
+func (r *QueueRepository) ClaimNextNonLongTermRetryAmongTypeSetsForProjects(ctx context.Context, nowISO, claimedBy string, unrestrictedTypes, stickySnapshotTypes, projectScopedTypes, projectIDs []string) (*QueueItemRecord, error) {
+	return r.ClaimNextNonLongTermRetryAmongTypeSetsForProjectsWithSnapshotVendor(ctx, nowISO, claimedBy, unrestrictedTypes, stickySnapshotTypes, "", false, projectScopedTypes, projectIDs)
+}
+
+// ClaimNextNonLongTermRetryAmongTypeSetsForProjectsWithSnapshotVendor is the
+// provider-aware claim variant. When excludeStickySnapshots is true,
+// unrestricted types match only rows whose latest failed/interrupted run does
+// not carry a durable agent snapshot. stickySnapshotTypes then match only the
+// supplied snapshot vendor, so a live role provider cannot claim a retry that
+// will restore a different vendor at spawn.
+func (r *QueueRepository) ClaimNextNonLongTermRetryAmongTypeSetsForProjectsWithSnapshotVendor(ctx context.Context, nowISO, claimedBy string, unrestrictedTypes, stickySnapshotTypes []string, stickySnapshotVendor string, excludeStickySnapshots bool, projectScopedTypes, projectIDs []string) (*QueueItemRecord, error) {
+	typePred, typeArgs := queueClaimTypePredicateWithSnapshotVendor(unrestrictedTypes, stickySnapshotTypes, stickySnapshotVendor, excludeStickySnapshots)
 	if typePred == "" {
 		return nil, nil
 	}
@@ -3234,8 +3241,14 @@ func (r *QueueRepository) ClaimNextLongTermRetryAmongTypeSets(ctx context.Contex
 
 // ClaimNextLongTermRetryAmongTypeSetsForProjects is the long-term-retry
 // counterpart of ClaimNextNonLongTermRetryAmongTypeSetsForProjects.
-func (r *QueueRepository) ClaimNextLongTermRetryAmongTypeSetsForProjects(ctx context.Context, nowISO, claimedBy string, unrestrictedTypes, stickySnapshotTypes, projectScopedTypes, projectIDs, stickyOnlyProjectIDs []string) (*QueueItemRecord, error) {
-	typePred, typeArgs := queueClaimTypePredicate(unrestrictedTypes, stickySnapshotTypes)
+func (r *QueueRepository) ClaimNextLongTermRetryAmongTypeSetsForProjects(ctx context.Context, nowISO, claimedBy string, unrestrictedTypes, stickySnapshotTypes, projectScopedTypes, projectIDs []string) (*QueueItemRecord, error) {
+	return r.ClaimNextLongTermRetryAmongTypeSetsForProjectsWithSnapshotVendor(ctx, nowISO, claimedBy, unrestrictedTypes, stickySnapshotTypes, "", false, projectScopedTypes, projectIDs)
+}
+
+// ClaimNextLongTermRetryAmongTypeSetsForProjectsWithSnapshotVendor is the
+// long-term-retry counterpart of the provider-aware non-long-term claim.
+func (r *QueueRepository) ClaimNextLongTermRetryAmongTypeSetsForProjectsWithSnapshotVendor(ctx context.Context, nowISO, claimedBy string, unrestrictedTypes, stickySnapshotTypes []string, stickySnapshotVendor string, excludeStickySnapshots bool, projectScopedTypes, projectIDs []string) (*QueueItemRecord, error) {
+	typePred, typeArgs := queueClaimTypePredicateWithSnapshotVendor(unrestrictedTypes, stickySnapshotTypes, stickySnapshotVendor, excludeStickySnapshots)
 	if typePred == "" {
 		return nil, nil
 	}
@@ -3264,17 +3277,24 @@ func queueTypeInClause(types []string) (placeholders string, args []any) {
 // (started_at DESC, created_at DESC — matching Runs.GetLatestByLoopID) to be
 // failed/interrupted with a non-empty agent_snapshot_json vendor so fresh work
 // for unconfigured roles is never claimed while sticky retries still are.
-func queueClaimTypePredicate(unrestrictedTypes, stickySnapshotTypes []string) (predicate string, args []any) {
+func queueClaimTypePredicateWithSnapshotVendor(unrestrictedTypes, stickySnapshotTypes []string, stickySnapshotVendor string, excludeStickySnapshots bool) (predicate string, args []any) {
 	parts := make([]string, 0, 2)
 	if len(unrestrictedTypes) > 0 {
 		placeholders, typeArgs := queueTypeInClause(unrestrictedTypes)
-		parts = append(parts, "qi.type IN ("+placeholders+")")
+		part := "qi.type IN (" + placeholders + ")"
+		if excludeStickySnapshots {
+			part += " AND NOT " + stickySnapshotQueuePredicate("")
+		}
+		parts = append(parts, part)
 		args = append(args, typeArgs...)
 	}
 	if len(stickySnapshotTypes) > 0 {
 		placeholders, typeArgs := queueTypeInClause(stickySnapshotTypes)
-		parts = append(parts, `(qi.type IN (`+placeholders+`) AND `+stickySnapshotExistsSQL()+`)`)
+		parts = append(parts, "(qi.type IN ("+placeholders+") AND "+stickySnapshotQueuePredicate(stickySnapshotVendor)+")")
 		args = append(args, typeArgs...)
+		if strings.TrimSpace(stickySnapshotVendor) != "" {
+			args = append(args, strings.TrimSpace(stickySnapshotVendor))
+		}
 	}
 	if len(parts) == 0 {
 		return "", nil
@@ -3282,35 +3302,74 @@ func queueClaimTypePredicate(unrestrictedTypes, stickySnapshotTypes []string) (p
 	return "AND (" + strings.Join(parts, " OR ") + ")", args
 }
 
-// stickySnapshotExistsSQL returns the reusable SQL fragment that reports whether
-// the queue item's loop has a sticky-snapshot latest run: failed or interrupted
-// with a non-empty agent_snapshot_json vendor. It is shared by the type
-// predicate (sticky-snapshot-only roles) and the project predicate (sticky-only
-// scope for quarantined projects) so the two cannot drift on what "sticky" means.
-func stickySnapshotExistsSQL() string {
-	return `qi.loop_id IS NOT NULL
-			AND EXISTS (
-				SELECT 1
-				FROM (
-					SELECT status, agent_snapshot_json
-					FROM runs
-					WHERE loop_id = qi.loop_id
-					ORDER BY ` + latestRunOrder("runs") + `
-					LIMIT 1
-				) latest
-				WHERE latest.status IN ('failed', 'interrupted')
-					AND latest.agent_snapshot_json IS NOT NULL
-					AND length(trim(latest.agent_snapshot_json)) > 0
-					AND length(trim(coalesce(json_extract(latest.agent_snapshot_json, '$.vendor'), ''))) > 0
-			)`
+func stickySnapshotQueuePredicate(vendor string) string {
+	vendorFilter := ""
+	if strings.TrimSpace(vendor) != "" {
+		vendorFilter = `
+					AND trim(json_extract(latest.agent_snapshot_json, '$.vendor')) = ?`
+	}
+	return `(qi.loop_id IS NOT NULL
+		AND EXISTS (
+			SELECT 1
+			FROM (
+				SELECT status, agent_snapshot_json
+				FROM runs
+				WHERE loop_id = qi.loop_id
+				ORDER BY ` + latestRunOrder("runs") + `
+				LIMIT 1
+			) latest
+			WHERE latest.status IN ('failed', 'interrupted')
+				AND latest.agent_snapshot_json IS NOT NULL
+				AND length(trim(latest.agent_snapshot_json)) > 0
+				AND length(trim(coalesce(json_extract(latest.agent_snapshot_json, '$.vendor'), ''))) > 0` + vendorFilter + `
+		))`
 }
 
-// queueClaimProjectPredicate scopes projectScopedTypes to queue items whose
-// project_id is in projectIDs. stickyOnlyProjectIDs additionally admits those
-// types for quarantined projects, but only when the loop's latest run is a
-// sticky snapshot, so fresh work for quarantined projects is never claimed
-// while durable sticky retries still are. Other queue types remain eligible.
-func queueClaimProjectPredicate(projectScopedTypes, projectIDs, stickyOnlyProjectIDs []string) (predicate string, args []any) {
+// ListQueuedSnapshotVendors returns distinct vendors carried by queued coding
+// retries. The result is a discovery hint for provider-scoped claim lanes; the
+// subsequent claim predicate remains the durable authority and rechecks the
+// same latest-run snapshot under its admission critical section.
+func (r *QueueRepository) ListQueuedSnapshotVendors(ctx context.Context, types []string) ([]string, error) {
+	if len(types) == 0 {
+		return []string{}, nil
+	}
+	placeholders, typeArgs := queueTypeInClause(types)
+	rows, err := r.q.QueryContext(ctx, `
+		SELECT DISTINCT trim(json_extract((
+			SELECT agent_snapshot_json
+			FROM runs
+			WHERE loop_id = qi.loop_id
+			ORDER BY `+latestRunOrder("runs")+`
+			LIMIT 1
+		), '$.vendor'))
+		FROM queue_items qi
+		WHERE qi.status = 'queued'
+			AND qi.type IN (`+placeholders+`)
+			AND `+stickySnapshotQueuePredicate("")+`
+		ORDER BY 1 ASC
+	`, typeArgs...)
+	if err != nil {
+		return nil, fmt.Errorf("list queued snapshot vendors: %w", err)
+	}
+	defer rows.Close()
+	vendors := make([]string, 0)
+	for rows.Next() {
+		var vendor string
+		if err := rows.Scan(&vendor); err != nil {
+			return nil, fmt.Errorf("scan queued snapshot vendor: %w", err)
+		}
+		vendor = strings.TrimSpace(vendor)
+		if vendor != "" {
+			vendors = append(vendors, vendor)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate queued snapshot vendors: %w", err)
+	}
+	return vendors, nil
+}
+
+func queueClaimProjectPredicate(projectScopedTypes, projectIDs []string) (predicate string, args []any) {
 	if len(projectScopedTypes) == 0 {
 		return "", nil
 	}

@@ -901,6 +901,75 @@ func TestClaimAndRunScheduledQueueItemsGatesEachProviderLane(t *testing.T) {
 	}
 }
 
+func TestClaimAndRunScheduledQueueItemsRoutesStickyRetryBySnapshotVendor(t *testing.T) {
+	t.Parallel()
+	workingDir := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "claim-sticky-provider.sqlite"), t.TempDir())
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 21, 8, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	codex := config.AgentVendorCodex
+	claude := config.AgentVendorClaudeCode
+	cfg.Agent.Vendor = &codex
+	cfg.Roles.Reviewer.Agent = &config.RoleAgentConfig{Vendor: &claude}
+	cfg.Projects = []config.ProjectRefConfig{{ID: "sticky_provider", Validation: &config.ProjectValidationConfig{OptOut: true}}}
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "sticky_provider", Name: "Sticky provider", RepoPath: filepath.Join(workingDir, "repo"), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	loopID := "loop_sticky_provider"
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 1, ProjectID: "sticky_provider", Type: "reviewer", TargetType: "pull_request", Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	snapshot := `{"vendor":"codex","model":"frozen-reviewer"}`
+	if err := repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_sticky_provider", LoopID: loopID, Status: "failed", StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO, AgentSnapshotJSON: &snapshot}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	if err := repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "sticky_provider_item", LoopID: &loopID, Type: "reviewer", TargetType: "pull_request", TargetID: "pr:1", DedupeKey: "sticky-provider", Priority: storage.QueuePriorityReviewer, Status: "queued", AvailableAt: nowISO, MaxAttempts: -1, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	var ordinaryVendors []string
+	var snapshotVendors []string
+	allowOrdinary := func(vendor string) error {
+		ordinaryVendors = append(ordinaryVendors, vendor)
+		return fmt.Errorf("%w: live provider is open", brownout.ErrOpen)
+	}
+	allowSnapshot := func(vendor string) error {
+		snapshotVendors = append(snapshotVendors, vendor)
+		return nil
+	}
+	withSnapshot := func(vendor string, fn func()) error {
+		snapshotVendors = append(snapshotVendors, vendor)
+		fn()
+		return nil
+	}
+	claimed, err := claimAndRunScheduledQueueItems(context.Background(), 1, defaultSchedulerTickInput{
+		Repos:                           repos,
+		Now:                             func() time.Time { return now },
+		Config:                          &cfg,
+		Reviewer:                        &stubReviewerScheduler{},
+		AllowClaimForVendor:             allowOrdinary,
+		AllowSnapshotClaimForVendor:     allowSnapshot,
+		WithAllowSnapshotClaimForVendor: withSnapshot,
+	})
+	if err != nil {
+		t.Fatalf("claimAndRunScheduledQueueItems() error = %v", err)
+	}
+	if len(claimed) != 1 || claimed[0].ID != "sticky_provider_item" {
+		t.Fatalf("claimed = %#v, want sticky retry", claimed)
+	}
+	if len(ordinaryVendors) != 1 || ordinaryVendors[0] != string(claude) {
+		t.Fatalf("ordinary provider admissions = %#v, want only current Claude lane", ordinaryVendors)
+	}
+	if len(snapshotVendors) != 2 || snapshotVendors[0] != string(codex) || snapshotVendors[1] != string(codex) {
+		t.Fatalf("snapshot provider admissions = %#v, want Codex point and critical gates", snapshotVendors)
+	}
+}
+
 func TestClaimAndRunScheduledQueueItemsSkipsCodingWorkOutsideRunnableCatalog(t *testing.T) {
 	t.Parallel()
 

@@ -732,6 +732,16 @@ func (r *Runtime) AllowClaimForVendor(vendor string) error {
 	return r.agentHealth.Allow(vendor)
 }
 
+// AllowSnapshotClaimForVendor admits a sticky retry using the provider stored
+// in its durable run snapshot, including a vendor removed from live config.
+func (r *Runtime) AllowSnapshotClaimForVendor(vendor string) error {
+	if err := r.AllowLifecycleWork(); err != nil {
+		return err
+	}
+	_, err := r.agentHealth.AllowSnapshotAdmission(vendor)
+	return err
+}
+
 func (r *Runtime) allowAgentSpawn(meta *agent.SpawnMeta) error {
 	if r == nil || r.admission == nil {
 		return ErrAdmissionStopping
@@ -998,6 +1008,21 @@ func (r *Runtime) WithAllowAgentClaimForVendor(vendor string, fn func()) error {
 	var brownoutErr error
 	if err := r.admission.WithAllowWork(func() {
 		brownoutErr = r.agentHealth.With(vendor, fn)
+	}); err != nil {
+		return err
+	}
+	return brownoutErr
+}
+
+// WithAllowSnapshotAgentClaimForVendor holds lifecycle admission and the
+// sticky snapshot provider breaker across a durable retry claim.
+func (r *Runtime) WithAllowSnapshotAgentClaimForVendor(vendor string, fn func()) error {
+	if r == nil || r.admission == nil {
+		return ErrAdmissionStopping
+	}
+	var brownoutErr error
+	if err := r.admission.WithAllowWork(func() {
+		brownoutErr = r.agentHealth.WithSnapshot(vendor, fn)
 	}); err != nil {
 		return err
 	}
@@ -1384,7 +1409,10 @@ func (r *Runtime) start(ctx context.Context) error {
 			r.mu.RLock()
 			defer r.mu.RUnlock()
 			return r.schedulerTasks
-		}, r.TriggerSchedulerClaim, r.now, r.reconcileLiveStaleRunningRuns, r.AllowClaim, r.WithAllowAgentClaim, schedulerProviderGate{allow: r.AllowClaimForVendor, with: r.WithAllowAgentClaimForVendor})
+		}, r.TriggerSchedulerClaim, r.now, r.reconcileLiveStaleRunningRuns, r.AllowClaim, r.WithAllowAgentClaim, schedulerProviderGate{
+			allow: r.AllowClaimForVendor, with: r.WithAllowAgentClaimForVendor,
+			snapshotAllow: r.AllowSnapshotClaimForVendor, snapshotWith: r.WithAllowSnapshotAgentClaimForVendor,
+		})
 		if !r.customSchedulerTick {
 			r.defaultSchedulerTick = handlers.tick
 			if !r.customWebhookForwarder {

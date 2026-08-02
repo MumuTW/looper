@@ -187,6 +187,30 @@ func (r *agentHealthRegistry) With(vendor string, fn func()) error {
 	return nil
 }
 
+// WithSnapshot runs a provider-scoped durable mutation through a sticky
+// snapshot breaker. Active vendors reuse their live breaker; removed vendors
+// use the retained snapshot-only bucket without entering AllowAny's aggregate.
+func (r *agentHealthRegistry) WithSnapshot(vendor string, fn func()) error {
+	if r == nil {
+		if fn != nil {
+			fn()
+		}
+		return nil
+	}
+	r.gateMu.Lock()
+	defer r.gateMu.Unlock()
+	r.mu.Lock()
+	breaker := r.ensureSnapshotBreakerLocked(vendor)
+	r.mu.Unlock()
+	if err := breaker.Allow(); err != nil {
+		return err
+	}
+	if fn != nil {
+		fn()
+	}
+	return nil
+}
+
 func (r *agentHealthRegistry) AllowAdmission(vendor string) (bool, error) {
 	probe, _, err := r.AllowAdmissionWithGeneration(vendor)
 	return probe, err
