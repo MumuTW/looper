@@ -89,6 +89,17 @@ func NewRepositoryLoader(repos *storage.Repositories, collector *escalator.Colle
 			input.Notices = append(input.Notices, "Storage is not available.")
 			return input
 		}
+		if repos.Projects != nil {
+			projects, err := repos.Projects.List(ctx)
+			if err != nil {
+				input.Notices = append(input.Notices, "Projects could not be read.")
+			} else {
+				input.ActiveProjects = make(map[string]bool, len(projects))
+				for _, project := range projects {
+					input.ActiveProjects[project.ID] = !project.Archived
+				}
+			}
+		}
 
 		if repos.PullRequestSnapshots != nil {
 			snapshots, err := repos.PullRequestSnapshots.ListLatest(ctx)

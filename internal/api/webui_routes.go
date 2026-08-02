@@ -2,6 +2,8 @@ package api
 
 import (
 	"net/http"
+	"net/url"
+	"strings"
 
 	looperdruntime "github.com/MumuTW/looper/internal/runtime"
 	"github.com/MumuTW/looper/internal/storage"
@@ -29,8 +31,15 @@ func (h *Handler) handleWebUIRoute(w http.ResponseWriter, r *http.Request) {
 
 	collector := looperdruntime.NewEscalatorCollector(cfg, repositories, h.now)
 	links := looperdruntime.NewEscalatorLinker(cfg)
+	pathPrefix := ""
+	if cfg.Server.BaseURL != nil {
+		if parsed, err := url.Parse(strings.TrimSpace(*cfg.Server.BaseURL)); err == nil {
+			pathPrefix = parsed.Path
+		}
+	}
 	webui.Handler(webui.Options{
-		Load: h.webUICache.Wrap(webui.NewRepositoryLoader(repositories, collector, links, h.now)),
-		Now:  h.now,
+		Load:       h.webUICache.Wrap(webui.NewRepositoryLoader(repositories, collector, links, h.now)),
+		Now:        h.now,
+		PathPrefix: pathPrefix,
 	}).ServeHTTP(w, r)
 }

@@ -173,6 +173,22 @@ func TestHandlerRedirectsMountPointToTriage(t *testing.T) {
 	}
 }
 
+func TestHandlerPreservesPublicBasePathPrefix(t *testing.T) {
+	t.Parallel()
+
+	handler := Handler(Options{Now: func() time.Time { return testNow }, PathPrefix: "/looper"})
+	redirect := get(t, handler, BasePath)
+	if got := redirect.Header().Get("Location"); got != "/looper/ui/triage" {
+		t.Fatalf("prefixed redirect = %q, want /looper/ui/triage", got)
+	}
+	body := get(t, handler, TriagePath).Body.String()
+	assertContains(t, body,
+		`href="/looper/ui/static/app.css"`,
+		`hx-get="/looper/ui/triage/board"`,
+		`href="/looper/dashboard/"`,
+	)
+}
+
 func TestHandlerServesVendoredStaticAssets(t *testing.T) {
 	t.Parallel()
 

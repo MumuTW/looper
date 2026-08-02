@@ -513,6 +513,26 @@ func TestClassifyUnknownGateReasonIsStillBlocking(t *testing.T) {
 	}
 }
 
+func TestClassifyAutoEligibleReportIsMachineOwned(t *testing.T) {
+	t.Parallel()
+
+	auto := report(1, true)
+	auto.Mode = "auto"
+	board := Classify(Input{
+		Now:       testNow,
+		Snapshots: []storage.PullRequestSnapshotRecord{snapshot(t, 1, payloadOptions{})},
+		Reports:   []gatekeeper.Report{auto},
+		Links:     testLinker{},
+	})
+	row, group := rowFor(t, board, 1)
+	if row.Blocker.Code != "eligible_auto" || row.Blocker.Label != "auto merge pending" {
+		t.Fatalf("auto eligible blocker = %#v, want machine-owned auto merge", row.Blocker)
+	}
+	if group != GroupMachine {
+		t.Fatalf("auto eligible group = %v, want machine", group)
+	}
+}
+
 func TestClassifyFallbackRecognizesReviewAndActionRequired(t *testing.T) {
 	t.Parallel()
 
@@ -553,6 +573,62 @@ func TestClassifyDoesNotCallPausedOrManualHeldWorkMachineActive(t *testing.T) {
 	_, group := rowFor(t, board, 1)
 	if group != GroupActionable {
 		t.Fatalf("paused/manual-held row group = %v, want actionable rather than machine", group)
+	}
+}
+
+func TestClassifyIncludesActivePullRequestLoopWithoutSnapshot(t *testing.T) {
+	t.Parallel()
+
+	loop := activeLoop(7)
+	board := Classify(Input{Now: testNow, Loops: []storage.LoopRecord{loop}, Links: testLinker{}})
+	row, group := rowFor(t, board, 7)
+	if row.Ref != "#7" || row.Link != "https://github.com/acme/widgets/pull/7" {
+		t.Fatalf("unsnapshotted PR row = %#v, want loop-derived identity", row)
+	}
+	if group != GroupMachine {
+		t.Fatalf("unsnapshotted active loop group = %v, want machine", group)
+	}
+}
+
+func TestClassifyExcludesArchivedProjects(t *testing.T) {
+	t.Parallel()
+
+	board := Classify(Input{
+		Now:            testNow,
+		ActiveProjects: map[string]bool{"proj": false, "other": true},
+		Snapshots:      []storage.PullRequestSnapshotRecord{snapshot(t, 1, payloadOptions{})},
+		Links:          testLinker{},
+	})
+	if board.Total() != 0 {
+		t.Fatalf("archived project board total = %d, want 0", board.Total())
+	}
+}
+
+func TestClassifyMatchesEscalatorLinksByProjectIdentity(t *testing.T) {
+	t.Parallel()
+
+	first := snapshot(t, 42, payloadOptions{})
+	first.ProjectID = "project-one"
+	second := snapshot(t, 42, payloadOptions{})
+	second.ID = "snapshot-two"
+	second.ProjectID = "project-two"
+	item := escalator.Item{
+		ID: "triage_confirmation:project-two:42", ProjectID: "project-two",
+		Kind: escalator.KindWaiting, Reason: escalator.ReasonTriageConfirmation,
+		Title: "Confirm project two", Link: testLinker{}.PullRequest("project-two", second.Repo, second.PRNumber),
+		AgeSeconds: 60,
+	}
+	board := Classify(Input{Now: testNow, Snapshots: []storage.PullRequestSnapshotRecord{first, second}, Escalator: escalator.Snapshot{Items: []escalator.Item{item}}, Links: testLinker{}})
+	var projectTwo Row
+	for _, section := range board.Sections {
+		for _, row := range section.Rows {
+			if strings.HasPrefix(row.Key, "pr-project-two-") {
+				projectTwo = row
+			}
+		}
+	}
+	if projectTwo.Key == "" || projectTwo.Blocker.Code != string(escalator.ReasonTriageConfirmation) {
+		t.Fatalf("project-two row = %#v, want its own escalator item", projectTwo)
 	}
 }
 

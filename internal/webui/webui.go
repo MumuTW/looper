@@ -56,6 +56,10 @@ type Options struct {
 	Load Loader
 	// Now stamps the "last updated" line. Defaults to time.Now.
 	Now func() time.Time
+	// PathPrefix is the public reverse-proxy path before /ui. The daemon may
+	// receive stripped /ui requests while links still need to point back through
+	// e.g. /looper/ui.
+	PathPrefix string
 }
 
 // Handler serves the hypermedia UI. It answers GET and HEAD only: this surface
@@ -83,17 +87,29 @@ func Handler(options Options) http.Handler {
 		requestPath := NormalizePath(r.URL.Path)
 		switch {
 		case requestPath == BasePath:
-			http.Redirect(w, r, TriagePath, http.StatusFound)
+			http.Redirect(w, r, prefixedPath(options.PathPrefix, TriagePath), http.StatusFound)
 		case requestPath == TriagePath:
-			renderPage(w, r, "page.html", load, now)
+			renderPage(w, r, "page.html", load, now, options.PathPrefix)
 		case requestPath == boardPath:
-			renderPage(w, r, "board.html", load, now)
+			renderPage(w, r, "board.html", load, now, options.PathPrefix)
 		case strings.HasPrefix(requestPath, staticPrefix):
 			serveStatic(w, r, strings.TrimPrefix(requestPath, staticPrefix))
 		default:
 			http.NotFound(w, r)
 		}
 	})
+}
+
+func prefixedPath(prefix, route string) string {
+	prefix = strings.TrimSpace(prefix)
+	if prefix == "" || prefix == "/" {
+		return route
+	}
+	prefix = path.Clean("/" + strings.Trim(prefix, "/"))
+	if prefix == "/" {
+		return route
+	}
+	return prefix + route
 }
 
 // view is what the templates render. Board carries the rows; the rest is the
@@ -109,7 +125,7 @@ type view struct {
 	DashboardPath  string
 }
 
-func renderPage(w http.ResponseWriter, r *http.Request, name string, load Loader, now func() time.Time) {
+func renderPage(w http.ResponseWriter, r *http.Request, name string, load Loader, now func() time.Time, pathPrefix string) {
 	input := load(r.Context())
 	if input.Now.IsZero() {
 		input.Now = now().UTC()
@@ -121,10 +137,10 @@ func renderPage(w http.ResponseWriter, r *http.Request, name string, load Loader
 		Updated:        board.GeneratedAt.Local().Format("15:04:05"),
 		RefreshSeconds: int(RefreshInterval / time.Second),
 		RefreshEnabled: !strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("refresh")), "off"),
-		BoardPath:      boardPath,
-		TriagePath:     TriagePath,
-		StaticPrefix:   staticPrefix,
-		DashboardPath:  "/dashboard/",
+		BoardPath:      prefixedPath(pathPrefix, boardPath),
+		TriagePath:     prefixedPath(pathPrefix, TriagePath),
+		StaticPrefix:   prefixedPath(pathPrefix, staticPrefix),
+		DashboardPath:  prefixedPath(pathPrefix, "/dashboard/"),
 	}
 
 	// Render to a buffer so a template failure cannot leave a half-written 200

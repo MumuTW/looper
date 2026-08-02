@@ -222,6 +222,11 @@ type PRKey struct {
 	Number    int64
 }
 
+type linkIdentity struct {
+	ProjectID string
+	Link      string
+}
+
 func newPRKey(projectID, repo string, number int64) PRKey {
 	return PRKey{ProjectID: projectID, Repo: strings.ToLower(strings.TrimSpace(repo)), Number: number}
 }
@@ -233,6 +238,10 @@ type Input struct {
 	Now time.Time
 	// Snapshots holds the latest snapshot per pull request, in any order.
 	Snapshots []storage.PullRequestSnapshotRecord
+	// ActiveProjects is the daemon-owned project lifecycle projection. A nil
+	// map keeps pure callers backwards-compatible; a non-nil map excludes
+	// archived/removed projects from the board.
+	ActiveProjects map[string]bool
 	// Reports holds the latest merge-gate report per pull request.
 	Reports []gatekeeper.Report
 	Loops   []storage.LoopRecord
@@ -253,7 +262,27 @@ func Classify(in Input) Board {
 	}
 	now = now.UTC()
 
-	pullRequests := latestSnapshotPerPR(in.Snapshots)
+	pullRequests := latestSnapshotPerPR(in.Snapshots, in.ActiveProjects)
+	for _, loop := range in.Loops {
+		if loop.Repo == nil || loop.PRNumber == nil || !domain.IsActiveLoopStatus(domain.LoopStatus(loop.Status)) {
+			continue
+		}
+		if in.ActiveProjects != nil && !in.ActiveProjects[loop.ProjectID] {
+			continue
+		}
+		key := newPRKey(loop.ProjectID, *loop.Repo, *loop.PRNumber)
+		if _, exists := pullRequests[key]; exists {
+			continue
+		}
+		capturedAt := loop.UpdatedAt
+		if strings.TrimSpace(capturedAt) == "" {
+			capturedAt = loop.CreatedAt
+		}
+		pullRequests[key] = storage.PullRequestSnapshotRecord{
+			ID: loop.ID + ":unsnapshotted", ProjectID: loop.ProjectID, Repo: *loop.Repo,
+			PRNumber: *loop.PRNumber, CapturedAt: capturedAt, CreatedAt: loop.CreatedAt,
+		}
+	}
 	reports := latestReportPerPR(in.Reports)
 	loopsByPR, loopLinks := indexLoops(in.Loops, in.Links)
 	queueByPR := indexQueue(in.Queue)
@@ -266,9 +295,10 @@ func Classify(in Input) Board {
 	for _, item := range in.Escalator.Items {
 		key, matched := PRKey{}, false
 		if link := strings.TrimSpace(item.Link); link != "" {
-			if candidate, ok := pullRequestLinks[link]; ok {
+			identity := linkIdentity{ProjectID: item.ProjectID, Link: link}
+			if candidate, ok := pullRequestLinks[identity]; ok {
 				key, matched = candidate, true
-			} else if loop, ok := loopLinks[link]; ok && loop.Repo != nil && loop.PRNumber != nil {
+			} else if loop, ok := loopLinks[identity]; ok && loop.Repo != nil && loop.PRNumber != nil {
 				candidate := newPRKey(loop.ProjectID, *loop.Repo, *loop.PRNumber)
 				if _, known := pullRequests[candidate]; known {
 					key, matched = candidate, true
@@ -486,7 +516,6 @@ func pullRequestRow(now time.Time, key PRKey, snapshot storage.PullRequestSnapsh
 			changedAt = later(changedAt, parseTimestamp(item.UpdatedAt))
 		}
 	}
-
 	blocker := primaryBlocker(report, payload, snapshot, items)
 	group := groupFor(blocker, working)
 	stuck := false
@@ -570,6 +599,9 @@ func groupFor(blocker Blocker, working bool) Group {
 	case ownerMachine:
 		return GroupMachine
 	case ownerHuman:
+		if working && blocker.rank == rankClear {
+			return GroupMachine
+		}
 		return GroupActionable
 	default:
 		if working {
@@ -607,7 +639,11 @@ func primaryBlocker(report *gatekeeper.Report, payload snapshotPayload, snapshot
 
 	if report != nil {
 		if report.Eligible {
-			consider(Blocker{Code: "eligible", Label: "awaiting merge OK", rank: rankEligible, owner: ownerHuman})
+			if strings.EqualFold(strings.TrimSpace(report.Mode), "auto") {
+				consider(Blocker{Code: "eligible_auto", Label: "auto merge pending", rank: rankEligible, owner: ownerMachine})
+			} else {
+				consider(Blocker{Code: "eligible", Label: "awaiting merge OK", rank: rankEligible, owner: ownerHuman})
+			}
 		}
 		for _, reason := range report.Reasons {
 			if candidate, ok := gatekeeperBlocker(reason.Code); ok {
@@ -875,9 +911,12 @@ func checksPending(summary *string) bool {
 
 // latestSnapshotPerPR keeps the newest capture per pull request and drops
 // everything that is not an open pull request.
-func latestSnapshotPerPR(records []storage.PullRequestSnapshotRecord) map[PRKey]storage.PullRequestSnapshotRecord {
+func latestSnapshotPerPR(records []storage.PullRequestSnapshotRecord, activeProjects map[string]bool) map[PRKey]storage.PullRequestSnapshotRecord {
 	out := map[PRKey]storage.PullRequestSnapshotRecord{}
 	for _, record := range records {
+		if activeProjects != nil && !activeProjects[record.ProjectID] {
+			continue
+		}
 		if !openPullRequest(record) {
 			continue
 		}
@@ -931,9 +970,9 @@ func latestReportPerPR(reports []gatekeeper.Report) map[PRKey]*gatekeeper.Report
 	return out
 }
 
-func indexLoops(records []storage.LoopRecord, links escalator.Linker) (map[PRKey][]storage.LoopRecord, map[string]storage.LoopRecord) {
+func indexLoops(records []storage.LoopRecord, links escalator.Linker) (map[PRKey][]storage.LoopRecord, map[linkIdentity]storage.LoopRecord) {
 	byPR := map[PRKey][]storage.LoopRecord{}
-	byLink := map[string]storage.LoopRecord{}
+	byLink := map[linkIdentity]storage.LoopRecord{}
 	for _, loop := range records {
 		if loop.Repo != nil && loop.PRNumber != nil {
 			key := newPRKey(loop.ProjectID, *loop.Repo, *loop.PRNumber)
@@ -941,7 +980,7 @@ func indexLoops(records []storage.LoopRecord, links escalator.Linker) (map[PRKey
 		}
 		if links != nil {
 			if link := strings.TrimSpace(links.Loop(loop.ProjectID, loop.Seq)); link != "" {
-				byLink[link] = loop
+				byLink[linkIdentity{ProjectID: loop.ProjectID, Link: link}] = loop
 			}
 		}
 	}
@@ -960,14 +999,14 @@ func indexQueue(records []storage.QueueItemRecord) map[PRKey][]storage.QueueItem
 	return out
 }
 
-func prLinks(pullRequests map[PRKey]storage.PullRequestSnapshotRecord, links escalator.Linker) map[string]PRKey {
-	out := make(map[string]PRKey, len(pullRequests))
+func prLinks(pullRequests map[PRKey]storage.PullRequestSnapshotRecord, links escalator.Linker) map[linkIdentity]PRKey {
+	out := make(map[linkIdentity]PRKey, len(pullRequests))
 	if links == nil {
 		return out
 	}
 	for key, snapshot := range pullRequests {
 		if link := strings.TrimSpace(links.PullRequest(key.ProjectID, snapshot.Repo, key.Number)); link != "" {
-			out[link] = key
+			out[linkIdentity{ProjectID: key.ProjectID, Link: link}] = key
 		}
 	}
 	return out

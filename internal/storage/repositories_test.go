@@ -3303,3 +3303,35 @@ func TestEventsListLatestByEntityTypeAndEventTypesKeepsNewestPerEntity(t *testin
 		t.Fatalf("Events.ListLatestByEntityTypeAndEventTypes(no types) = %#v, want none", empty)
 	}
 }
+
+func TestEventsListLatestPartitionsByProjectAndEntity(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	ctx := context.Background()
+	repos := NewRepositories(coordinator.DB())
+	pullRequest, entityID := "pull_request", "acme/widgets#42"
+	projectOne, projectTwo := "project-one", "project-two"
+	for _, projectID := range []string{projectOne, projectTwo} {
+		if err := repos.Projects.Upsert(ctx, ProjectRecord{ID: projectID, Name: projectID, RepoPath: "/tmp/" + projectID, CreatedAt: "2026-08-02T09:00:00.000Z", UpdatedAt: "2026-08-02T09:00:00.000Z"}); err != nil {
+			t.Fatalf("Projects.Upsert(%s) error = %v", projectID, err)
+		}
+	}
+	for _, event := range []EventLogRecord{
+		{ID: "project_one_old", EventType: "pull_request.merge_gate.evaluated", ProjectID: &projectOne, EntityType: &pullRequest, EntityID: &entityID, PayloadJSON: `{"project":"one-old"}`, CreatedAt: "2026-08-02T10:00:00.000Z"},
+		{ID: "project_one_new", EventType: "pull_request.merge_gate.evaluated", ProjectID: &projectOne, EntityType: &pullRequest, EntityID: &entityID, PayloadJSON: `{"project":"one-new"}`, CreatedAt: "2026-08-02T10:05:00.000Z"},
+		{ID: "project_two_new", EventType: "pull_request.merge_gate.evaluated", ProjectID: &projectTwo, EntityType: &pullRequest, EntityID: &entityID, PayloadJSON: `{"project":"two-new"}`, CreatedAt: "2026-08-02T10:06:00.000Z"},
+	} {
+		if err := repos.Events.Append(ctx, event); err != nil {
+			t.Fatalf("Events.Append(%s) error = %v", event.ID, err)
+		}
+	}
+
+	latest, err := repos.Events.ListLatestByEntityTypeAndEventTypes(ctx, pullRequest, []string{"pull_request.merge_gate.evaluated"})
+	if err != nil {
+		t.Fatalf("ListLatestByEntityTypeAndEventTypes() error = %v", err)
+	}
+	if len(latest) != 2 || latest[0].ID != "project_one_new" || latest[1].ID != "project_two_new" {
+		t.Fatalf("latest project/entity events = %#v, want one newest row per project", latest)
+	}
+}
