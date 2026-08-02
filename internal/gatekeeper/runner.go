@@ -120,6 +120,7 @@ type Evidence struct {
 	ReviewerConvergence          *ReviewerConvergenceEvidence `json:"reviewerConvergence,omitempty"`
 	ProjectPolicyPermitsTarget   bool                         `json:"projectPolicyPermitsTarget"`
 	FinalObservedHeadSHA         string                       `json:"finalObservedHeadSha,omitempty"`
+	ReviewProvenance             ReviewProvenance             `json:"reviewProvenance,omitempty"`
 }
 
 type Report struct {
@@ -174,7 +175,11 @@ type DiscoveryResult struct {
 	// Skipped counts pull requests that reused their previous report because
 	// nothing the list page can observe had changed.
 	Skipped int
-	Reports []Report
+	// Reconciled counts pull requests that left the open set since the last tick
+	// and were given a final report. It is separate from Evaluated because it is
+	// the count that must sit at zero in steady state.
+	Reconciled int
+	Reports    []Report
 }
 
 type GitHubGateway interface {
@@ -184,12 +189,14 @@ type GitHubGateway interface {
 	GetBranchProtection(context.Context, githubinfra.BranchProtectionInput) (githubinfra.BranchProtection, error)
 	ListPullRequestCheckRuns(context.Context, githubinfra.PullRequestCheckRunsInput) (githubinfra.PullRequestCheckRuns, error)
 	ListReviewThreads(context.Context, githubinfra.ListReviewThreadsInput) ([]githubinfra.ReviewThread, error)
+	ListPullRequestReviews(context.Context, githubinfra.ViewPullRequestInput) ([]githubinfra.ReviewSummary, error)
 	// GetPullRequestHeadAndBaseSHA is the final revalidation read. It returns
 	// both the head and base ref OIDs so a gate whose verdict depends on the
 	// merge base (the diff budget) can detect a base advance that the head
 	// revalidation alone cannot.
 	GetPullRequestHeadAndBaseSHA(context.Context, githubinfra.ViewPullRequestInput) (string, string, error)
 	ListIssueComments(context.Context, githubinfra.ViewIssueInput) ([]githubinfra.CommentInfo, error)
+	ListIssueCommentsContaining(context.Context, githubinfra.ViewIssueInput, []string) ([]githubinfra.CommentInfo, error)
 	CreateIssueComment(context.Context, githubinfra.IssueCommentInput) (githubinfra.IssueCommentResult, error)
 	UpdateIssueComment(context.Context, githubinfra.UpdateIssueCommentInput) error
 	GetCurrentUserLoginForRepo(context.Context, string, string) (string, error)
@@ -287,6 +294,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 	result := DiscoveryResult{Reports: make([]Report, 0, len(pullRequests))}
 	diffBudget := r.diffBudget(input.ProjectID)
 	budgetEnabled := diffBudget.MaxChangedFiles > 0 || diffBudget.MaxDeletions > 0
+	stillOpen := make(map[string]struct{}, len(pullRequests))
 	for _, pullRequest := range pullRequests {
 		// A budget change is a gate-input change even when the PR list page is
 		// otherwise unchanged; include it so enabling or disabling the gate does
@@ -295,6 +303,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		// a repo with no configured limit does not invalidate every open report.
 		fingerprint := sourceFingerprint(pullRequest, budgetEnabled) + fmt.Sprintf("\x1fdiff-budget=%d,%d", diffBudget.MaxChangedFiles, diffBudget.MaxDeletions)
 		entityID := fmt.Sprintf("%s#%d", input.Repo, pullRequest.Number)
+		stillOpen[entityID] = struct{}{}
 		previous, hasPrevious := previousReports[entityID]
 		// When the previous report is waiting on a current-head review, check
 		// the local event log cheaply before deciding to skip. This avoids a
@@ -322,7 +331,80 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		result.Evaluated++
 		result.Reports = append(result.Reports, report)
 	}
+
+	for _, entityID := range r.departedFromOpenSet(input.Repo, pullRequests, limit, previousReports, stillOpen) {
+		report, err := r.EvaluatePullRequest(ctx, EvaluationInput{
+			ProjectID: input.ProjectID, Repo: input.Repo, PRNumber: previousReports[entityID].PRNumber, CWD: input.CWD,
+		})
+		if err != nil {
+			return result, err
+		}
+		result.Reconciled++
+		result.Reports = append(result.Reports, report)
+	}
 	return result, nil
+}
+
+// maxReconciledDepartures bounds how many departed pull requests one tick gives
+// a final report. A burst — a release day that merges sixty pull requests, a
+// project whose discovery scope was just narrowed — must not turn one tick into
+// an unbounded run of forge reads. The remainder is picked up by later ticks,
+// because a pull request that is still recorded OPEN and still absent from the
+// open list stays a candidate until it is reconciled.
+const maxReconciledDepartures = 20
+
+// departedFromOpenSet names the pull requests whose latest report still says
+// OPEN but which are no longer in the open list — they merged or were closed
+// since the last tick.
+//
+// This is the lifecycle path that makes the merged state durable with webhooks
+// off, which is the default. Polling discovery lists only open pull requests, so
+// without this a pull request's last report is forever the one written while it
+// was still open, and `state=merged` answers empty on a default install.
+//
+// It is not a poller over merged history, and three things bound it:
+//
+//   - Only pull requests Looper itself last recorded as OPEN are candidates.
+//     Anything that merged before this ran, or that Looper never saw, is never
+//     revisited — there is no backfill.
+//   - The transition is one-way and self-clearing. Reconciling rewrites the
+//     state to MERGED or CLOSED, so the same pull request is never a candidate
+//     twice and the steady-state count is zero.
+//   - A truncated open list is not evidence of departure. When the list came
+//     back at the limit, a pull request may simply have fallen off the page, so
+//     nothing is reconciled at all rather than churning the overflow every tick.
+func (r *Runner) departedFromOpenSet(
+	repo string,
+	pullRequests []githubinfra.PullRequestSummary,
+	limit int,
+	previousReports map[string]Report,
+	stillOpen map[string]struct{},
+) []string {
+	if len(pullRequests) >= limit {
+		return nil
+	}
+	departed := make([]string, 0)
+	for entityID, previous := range previousReports {
+		if previous.Repo != repo || previous.PRNumber <= 0 {
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSpace(previous.Evidence.PullRequestState), "OPEN") {
+			continue
+		}
+		if _, open := stillOpen[entityID]; open {
+			continue
+		}
+		departed = append(departed, entityID)
+	}
+	// Sorted so the cap takes a deterministic prefix rather than whichever
+	// entries Go's map iteration happened to yield first.
+	sort.Slice(departed, func(i, j int) bool {
+		return previousReports[departed[i]].PRNumber < previousReports[departed[j]].PRNumber
+	})
+	if len(departed) > maxReconciledDepartures {
+		departed = departed[:maxReconciledDepartures]
+	}
+	return departed
 }
 
 func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput) (Report, error) {
@@ -355,7 +437,10 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 		Version: reportVersion, Status: StatusBlocked,
 		ProjectID: input.ProjectID, Repo: input.Repo, PRNumber: input.PRNumber,
 		ExpectedHeadSHA: input.ExpectedHeadSHA, RequiresFreshRevalidation: true,
-		Reasons: []Reason{}, Evidence: Evidence{RequiredChecks: []string{}, Checks: []CheckEvidence{}, UnresolvedReviewThreadIDs: []string{}, HoldLabels: []string{}},
+		Reasons: []Reason{}, Evidence: Evidence{
+			RequiredChecks: []string{}, Checks: []CheckEvidence{}, UnresolvedReviewThreadIDs: []string{}, HoldLabels: []string{},
+			ReviewProvenance: ReviewProvenance{Reviewers: []ReviewerObservation{}, Refusals: []ReviewRefusal{}},
+		},
 		EvaluatedAt:       r.now().UTC().Format(time.RFC3339Nano),
 		SourceFingerprint: input.SourceFingerprint,
 	}
@@ -392,6 +477,16 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 	if !codexReview.CurrentHeadValid {
 		report.Reasons = append(report.Reasons, Reason{Code: ReasonCodexReviewMissing, Subject: codexReviewReasonSubject(codexReview)})
 	}
+
+	// Recorded here, before every gate branch and every early return below,
+	// because provenance is an observation about the pull request rather than a
+	// step in the eligibility decision — and because the reports that matter most
+	// never reach the review branch at all. A merged pull request answers the
+	// mergeability read ambiguously, and that returns long before the review
+	// branch — yet the closed-webhook evaluation that follows a merge is exactly
+	// the report an operator later reads to ask whether the merged change was
+	// ever reviewed.
+	report.Evidence.ReviewProvenance = r.observeReviewProvenance(ctx, input)
 
 	if report.Evidence.PullRequestState != "OPEN" {
 		report.Reasons = append(report.Reasons, Reason{Code: ReasonPullRequestNotOpen})
@@ -572,6 +667,59 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 		}
 	}
 	return persisted, nil
+}
+
+// observeReviewProvenance reads who reviewed this pull request and who refused
+// to.
+//
+// It never returns an error, and that is deliberate rather than lax: Gatekeeper
+// is observe-only, so an observation must not be able to move a pull request
+// from eligible to blocked. A forge that will not answer yields
+// ReviewProvenanceUnknown, which the enumeration excludes — the record says it
+// does not know instead of saying nobody reviewed.
+//
+// It costs two forge reads per full evaluation. The review list is REST because
+// only REST classifies the reviewer's account, and the comment list is where a
+// refusal lives, because a refusal is not a review and the forge files it
+// nowhere else. Both are skipped entirely for a pull request whose fingerprint
+// is unchanged.
+//
+// The two reads fail differently, because they answer different questions. The
+// review list is the whole of `reviewed`; comments only separate `refused` from
+// `absent`, and only when nothing was reviewed. So a comment read that fails
+// after the reviews came back keeps what those reviews already settled —
+// discarding a list of named reviewers because a later call timed out would
+// throw away evidence Looper is holding.
+func (r *Runner) observeReviewProvenance(ctx context.Context, input EvaluationInput) ReviewProvenance {
+	unknown := ReviewProvenance{Status: ReviewProvenanceUnknown, Reviewers: []ReviewerObservation{}, Refusals: []ReviewRefusal{}}
+	reviews, err := r.github.ListPullRequestReviews(ctx, githubinfra.ViewPullRequestInput{
+		Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD,
+	})
+	if err != nil {
+		r.warnReviewProvenance(input, "reviews", err)
+		return unknown
+	}
+	observed := reviewsObservedFrom(reviews)
+	comments, err := r.github.ListIssueCommentsContaining(ctx, githubinfra.ViewIssueInput{
+		Repo: input.Repo, IssueNumber: input.PRNumber, CWD: input.CWD,
+	}, RefusalCommentMarkers())
+	if err != nil {
+		r.warnReviewProvenance(input, "comments", err)
+		if observed.CompletedReviews > 0 {
+			return observed
+		}
+		return unknown
+	}
+	return withRefusalsFrom(observed, comments)
+}
+
+func (r *Runner) warnReviewProvenance(input EvaluationInput, subject string, err error) {
+	if r.logWarn == nil {
+		return
+	}
+	r.logWarn("gatekeeper: could not observe review provenance", map[string]any{
+		"repo": input.Repo, "pr": input.PRNumber, "subject": subject, "error": err.Error(),
+	})
 }
 
 func (r *Runner) projectCWD(ctx context.Context, projectID string) string {

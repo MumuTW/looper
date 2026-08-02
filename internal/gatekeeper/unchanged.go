@@ -125,15 +125,16 @@ func latestGateReports(ctx context.Context, repos *storage.Repositories, project
 	if repos == nil || repos.Events == nil {
 		return nil, nil
 	}
-	records, err := repos.Events.ListByProjectAndEntityType(ctx, projectID, "pull_request")
+	records, err := repos.Events.ListLatestByEntityTypeAndEventTypes(ctx, projectID, "pull_request", []string{GateReportEventType})
 	if err != nil {
 		return nil, fmt.Errorf("list gate reports: %w", err)
 	}
-	// Records arrive oldest first, so a later gate report for the same entity
-	// overwrites an earlier one and the map ends up holding the newest.
+	// One record per pull request already: SQLite selected the newest, so this
+	// pass decodes exactly what the caller uses. The query is scoped to one
+	// project, so the entity id alone is an unambiguous key here.
 	reports := make(map[string]Report)
 	for _, record := range records {
-		if record.EventType != GateReportEventType || record.EntityID == nil {
+		if record.EntityID == nil {
 			continue
 		}
 		var report Report
