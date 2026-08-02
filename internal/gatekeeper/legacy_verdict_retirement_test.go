@@ -3,11 +3,13 @@ package gatekeeper
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/nexu-io/looper/internal/eventlog"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
+	"github.com/nexu-io/looper/internal/storage"
 )
 
 func TestDiscoverPullRequestsRetiresLegacyAdviseVerdictEvenWhenEvaluationIsSkipped(t *testing.T) {
@@ -173,5 +175,126 @@ func TestLegacyVerdictRetirementCompletionInvalidatesForNewerAdvice(t *testing.T
 	}
 	if len(fixture.github.updateCommentCalls) != 2 {
 		t.Fatalf("retirement updates = %d, want newer advice to invalidate stale completion", len(fixture.github.updateCommentCalls))
+	}
+}
+
+func TestLegacyVerdictRetirementRechecksAbsentCommentBeforeCompletion(t *testing.T) {
+	fixture := newGatekeeperFixture(t)
+	fixture.github.currentUserLogin = "looper-bot"
+	appendReport := func(projectID string, linked bool) {
+		report := Report{
+			Version: 2, Mode: "advise", ProjectID: projectID, Repo: "acme/looper", PRNumber: 42,
+			Status: StatusEligible, Eligible: true, EvaluatedAt: fixture.now.Format(time.RFC3339Nano), SourceFingerprint: "race",
+		}
+		entityType, entityID := "pull_request", "acme/looper#42"
+		var projectRef *string
+		if linked {
+			projectRef = &projectID
+		}
+		if err := eventlog.Append(context.Background(), fixture.repos, eventlog.AppendInput{
+			EventType: GateReportEventType, ProjectID: projectRef, EntityType: &entityType, EntityID: &entityID,
+			Payload: report, CreatedAt: fixture.now,
+		}); err != nil {
+			t.Fatalf("append advise report: %v", err)
+		}
+	}
+	appendReport("project_1", true)
+
+	if err := fixture.runner().ReconcileLegacyVerdictComments(context.Background()); err != nil {
+		t.Fatalf("first ReconcileLegacyVerdictComments() error = %v", err)
+	}
+	scans, err := fixture.repos.Events.ListByEntity(context.Background(), "project", "project_1")
+	if err != nil {
+		t.Fatalf("scan events: %v", err)
+	}
+	if len(scans) != 0 {
+		t.Fatalf("scan events after provisional absence = %#v, want none", scans)
+	}
+
+	fixture.github.comments = []githubinfra.CommentInfo{{ID: 7, Author: "looper-bot", Body: legacyVerdictCommentMarker + "\n✅ old advice"}}
+	if err := fixture.runner().ReconcileLegacyVerdictComments(context.Background()); err != nil {
+		t.Fatalf("second ReconcileLegacyVerdictComments() error = %v", err)
+	}
+	if len(fixture.github.updateCommentCalls) != 1 {
+		t.Fatalf("comment updates = %d, want the late-published comment retired", len(fixture.github.updateCommentCalls))
+	}
+	scans, err = fixture.repos.Events.ListByEntity(context.Background(), "project", "project_1")
+	if err != nil {
+		t.Fatalf("scan events after confirmation: %v", err)
+	}
+	if len(scans) != 1 || scans[0].EventType != legacyVerdictRetirementScanEventType {
+		t.Fatalf("scan events after confirmation = %#v, want one completion", scans)
+	}
+}
+
+func TestLegacyVerdictRetirementCollapsesHistoricalReportsPerPullRequest(t *testing.T) {
+	fixture := newGatekeeperFixture(t)
+	fixture.github.currentUserLogin = "looper-bot"
+	fixture.github.comments = []githubinfra.CommentInfo{{ID: 8, Author: "looper-bot", Body: legacyVerdictCommentMarker + "\n✅ old advice"}}
+	for index, fingerprint := range []string{"old", "new"} {
+		report := Report{
+			Version: 2, Mode: "advise", ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42,
+			Status: StatusEligible, Eligible: true, EvaluatedAt: fixture.now.Add(time.Duration(index) * time.Minute).Format(time.RFC3339Nano), SourceFingerprint: fingerprint,
+		}
+		projectID, entityType, entityID := report.ProjectID, "pull_request", "acme/looper#42"
+		if err := eventlog.Append(context.Background(), fixture.repos, eventlog.AppendInput{
+			EventType: GateReportEventType, ProjectID: &projectID, EntityType: &entityType, EntityID: &entityID,
+			Payload: report, CreatedAt: fixture.now.Add(time.Duration(index) * time.Minute),
+		}); err != nil {
+			t.Fatalf("append advise report %d: %v", index, err)
+		}
+	}
+	if err := fixture.runner().ReconcileLegacyVerdictComments(context.Background()); err != nil {
+		t.Fatalf("ReconcileLegacyVerdictComments() error = %v", err)
+	}
+	if fixture.github.commentsCalls != 1 || len(fixture.github.updateCommentCalls) != 1 {
+		t.Fatalf("forge retirement calls = comments %d updates %d, want one each", fixture.github.commentsCalls, len(fixture.github.updateCommentCalls))
+	}
+}
+
+func TestLegacyVerdictRetirementUsesFallbackCWDForRemovedCheckout(t *testing.T) {
+	fixture := newGatekeeperFixture(t)
+	fixture.github.currentUserLogin = "looper-bot"
+	fixture.github.comments = []githubinfra.CommentInfo{{ID: 9, Author: "looper-bot", Body: legacyVerdictCommentMarker + "\n✅ old advice"}}
+	missingPath := filepath.Join(t.TempDir(), "removed-checkout")
+	if err := fixture.repos.Projects.Upsert(context.Background(), storage.ProjectRecord{
+		ID: "project_1", Name: "Looper", RepoPath: missingPath, CreatedAt: fixture.now.Format(time.RFC3339Nano), UpdatedAt: fixture.now.Format(time.RFC3339Nano),
+	}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	report := Report{Version: 2, Mode: "advise", ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, Status: StatusEligible, Eligible: true, EvaluatedAt: fixture.now.Format(time.RFC3339Nano)}
+	projectID, entityType, entityID := report.ProjectID, "pull_request", "acme/looper#42"
+	if err := eventlog.Append(context.Background(), fixture.repos, eventlog.AppendInput{EventType: GateReportEventType, ProjectID: &projectID, EntityType: &entityType, EntityID: &entityID, Payload: report, CreatedAt: fixture.now}); err != nil {
+		t.Fatalf("append advise report: %v", err)
+	}
+	if err := fixture.runner().ReconcileLegacyVerdictComments(context.Background()); err != nil {
+		t.Fatalf("ReconcileLegacyVerdictComments() error = %v", err)
+	}
+	if len(fixture.github.updateCommentCalls) != 1 || fixture.github.updateCommentCalls[0].CWD != "" {
+		t.Fatalf("comment update = %#v, want empty fallback CWD", fixture.github.updateCommentCalls)
+	}
+}
+
+func TestLegacyVerdictRetirementProcessesOrphanedReportEvents(t *testing.T) {
+	fixture := newGatekeeperFixture(t)
+	fixture.github.currentUserLogin = "looper-bot"
+	fixture.github.comments = []githubinfra.CommentInfo{{ID: 10, Author: "looper-bot", Body: legacyVerdictCommentMarker + "\n✅ old advice"}}
+	report := Report{Version: 2, Mode: "advise", ProjectID: "deleted-project", Repo: "acme/looper", PRNumber: 42, Status: StatusEligible, Eligible: true, EvaluatedAt: fixture.now.Format(time.RFC3339Nano)}
+	entityType, entityID := "pull_request", "acme/looper#42"
+	if err := eventlog.Append(context.Background(), fixture.repos, eventlog.AppendInput{EventType: GateReportEventType, EntityType: &entityType, EntityID: &entityID, Payload: report, CreatedAt: fixture.now}); err != nil {
+		t.Fatalf("append orphan advise report: %v", err)
+	}
+	if err := fixture.runner().ReconcileLegacyVerdictComments(context.Background()); err != nil {
+		t.Fatalf("ReconcileLegacyVerdictComments() error = %v", err)
+	}
+	if len(fixture.github.updateCommentCalls) != 1 {
+		t.Fatalf("comment updates = %d, want orphaned report retired", len(fixture.github.updateCommentCalls))
+	}
+	scans, err := fixture.repos.Events.ListByEntity(context.Background(), "project", "deleted-project")
+	if err != nil {
+		t.Fatalf("orphan scan events: %v", err)
+	}
+	if len(scans) != 1 || scans[0].EventType != legacyVerdictRetirementScanEventType {
+		t.Fatalf("orphan scan events = %#v, want one completion", scans)
 	}
 }

@@ -75,7 +75,7 @@ func validateDeprecatedGatekeeperTrust(partial PartialConfig) []ValidationIssue 
 			return
 		}
 		switch strings.ToLower(strings.TrimSpace(*value)) {
-		case "observe", "advise":
+		case "", "observe", "advise":
 		default:
 			issues = append(issues, ValidationIssue{Path: path, Message: "must be one of: observe, advise"})
 		}

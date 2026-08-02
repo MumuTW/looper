@@ -1102,7 +1102,7 @@ func TestNormalizeRejectsUnsupportedDeprecatedGatekeeperTrust(t *testing.T) {
 }
 
 func TestNormalizeAcceptsHistoricalDeprecatedGatekeeperTrustValues(t *testing.T) {
-	for _, value := range []string{"observe", "advise", " ADVISE "} {
+	for _, value := range []string{"", "observe", "advise", " ADVISE "} {
 		value := value
 		if _, err := Normalize(t.TempDir(), PartialConfig{Roles: &PartialRoleConfigs{
 			Gatekeeper: &DeprecatedGatekeeperRoleConfig{Trust: &value},

@@ -618,6 +618,78 @@ func (r *EventsRepository) LatestByProjectAndEventType(ctx context.Context, proj
 	return &record, nil
 }
 
+// LatestByProjectAndEventTypeAndPayloadMode returns the newest event for each
+// project whose JSON payload carries the requested mode. The query is shared
+// across projects so migration maintenance does not repeat a history scan for
+// every project on every scheduler tick.
+func (r *EventsRepository) LatestByProjectAndEventTypeAndPayloadMode(ctx context.Context, eventType, mode string) (map[string]EventLogRecord, error) {
+	rows, err := r.q.QueryContext(ctx, `
+		SELECT * FROM event_logs
+		WHERE event_type = ?
+		  AND project_id IS NOT NULL
+		  AND CAST(COALESCE(json_extract(payload_json, '$.version'), 0) AS INTEGER) >= 2
+		  AND lower(trim(COALESCE(json_extract(payload_json, '$.mode'), ''))) = lower(trim(?))
+		ORDER BY rowid DESC
+	`, eventType, mode)
+	if err != nil {
+		return nil, fmt.Errorf("list latest event logs by project and payload mode: %w", err)
+	}
+	defer rows.Close()
+
+	latest := make(map[string]EventLogRecord)
+	for rows.Next() {
+		record, err := scanEventLog(rows)
+		if err != nil {
+			return nil, err
+		}
+		if record.ProjectID == nil || strings.TrimSpace(*record.ProjectID) == "" {
+			continue
+		}
+		if _, exists := latest[*record.ProjectID]; !exists {
+			latest[*record.ProjectID] = record
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate latest event logs by project and payload mode: %w", err)
+	}
+	return latest, nil
+}
+
+// LatestByEntityAndEventType returns the newest event for an entity without
+// relying on a project foreign key. This is also usable for events whose
+// project row was deleted and SQLite set project_id to NULL.
+func (r *EventsRepository) LatestByEntityAndEventType(ctx context.Context, entityType, entityID, eventType string) (*EventLogRecord, error) {
+	row := r.q.QueryRowContext(ctx, `
+		SELECT * FROM event_logs
+		WHERE entity_type = ? AND entity_id = ? AND event_type = ?
+		ORDER BY rowid DESC
+		LIMIT 1
+	`, entityType, entityID, eventType)
+	record, err := scanEventLog(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("latest event log by entity and type: %w", err)
+	}
+	return &record, nil
+}
+
+// ListOrphanedByEventType returns events whose project row was removed after
+// append. Their payload/entity metadata remains available for migration work.
+func (r *EventsRepository) ListOrphanedByEventType(ctx context.Context, eventType string) ([]EventLogRecord, error) {
+	rows, err := r.q.QueryContext(ctx, `
+		SELECT * FROM event_logs
+		WHERE event_type = ? AND project_id IS NULL
+		ORDER BY rowid ASC
+	`, eventType)
+	if err != nil {
+		return nil, fmt.Errorf("list orphaned event logs by type: %w", err)
+	}
+	defer rows.Close()
+	return scanEventLogs(rows)
+}
+
 // ListProjectIDsByEventType lists project IDs that have at least one event of
 // eventType.  It includes archived or deleted-from-catalog projects whose
 // historical reports still require migration maintenance.
@@ -809,114 +881,17 @@ func (r *EventsRepository) ListByProjectAndEntityType(ctx context.Context, proje
 	return scanEventLogs(rows)
 }
 
-// ListTriageSourceStates returns lifecycle state for the requested source
-// keys. The JSON payload key is the source identity authority; the expression
-// index only makes that authority directly addressable.
-func (r *EventsRepository) ListTriageSourceStates(ctx context.Context, projectID string, sourceKeys []string) ([]TriageSourceStateRecord, error) {
-	if len(sourceKeys) == 0 {
-		return []TriageSourceStateRecord{}, nil
-	}
-	records := make([]TriageSourceStateRecord, 0, len(sourceKeys))
-	for _, chunk := range chunkStrings(sourceKeys, sqliteMaxVariables-1) {
-		args := make([]any, 0, len(chunk)+1)
-		args = append(args, projectID)
-		for _, sourceKey := range chunk {
-			args = append(args, sourceKey)
-		}
-		rows, err := r.q.QueryContext(ctx, `
-			SELECT `+triageSourceKeySQL+` AS source_key,
-				MIN(CASE WHEN event_type = 'triage.enrolled' THEN payload_json END),
-				MIN(CASE WHEN event_type = 'triage.report' THEN payload_json END),
-				MAX(event_type = 'triage.routed'),
-				MAX(event_type = 'triage.retired')
-			FROM event_logs INDEXED BY idx_event_logs_triage_source_key
-			WHERE project_id = ? AND `+triageLifecyclePredicateSQL+`
-				AND `+triageSourceKeySQL+` IN (`+sqlPlaceholders(len(chunk))+`)
-			GROUP BY source_key
-		`, args...)
-		if err != nil {
-			return nil, fmt.Errorf("list triage source states: %w", err)
-		}
-		chunkRecords, err := scanTriageSourceStates(rows)
-		if err != nil {
-			return nil, err
-		}
-		records = append(records, chunkRecords...)
-	}
-	return records, nil
-}
-
-// ListTriageSourceStateWindow returns at most limit source lifecycles, rotating
-// after afterSourceKey and wrapping once. Terminal sources intentionally count
-// against the window: asking SQL to skip unbounded terminal history until it
-// found limit pending rows would leave each tick's database work unbounded.
-func (r *EventsRepository) ListTriageSourceStateWindow(ctx context.Context, projectID, afterSourceKey string, limit int) ([]TriageSourceStateRecord, error) {
-	if limit <= 0 {
-		return []TriageSourceStateRecord{}, nil
-	}
-	records, err := r.listTriageSourceStateRange(ctx, projectID, afterSourceKey, ">", limit)
+// ListByProjectAndEntityTypeAppendOrder preserves SQLite append order for
+// callers that must choose the newest event when timestamps and IDs are not a
+// trustworthy tie-breaker.
+func (r *EventsRepository) ListByProjectAndEntityTypeAppendOrder(ctx context.Context, projectID, entityType string) ([]EventLogRecord, error) {
+	rows, err := r.q.QueryContext(ctx, `SELECT * FROM event_logs WHERE project_id = ? AND entity_type = ? ORDER BY rowid ASC`, projectID, entityType)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("list event logs by project and entity type in append order: %w", err)
 	}
-	if afterSourceKey == "" || len(records) == limit {
-		return records, nil
-	}
-	wrapped, err := r.listTriageSourceStateRange(ctx, projectID, afterSourceKey, "<=", limit-len(records))
-	if err != nil {
-		return nil, err
-	}
-	return append(records, wrapped...), nil
-}
-
-func (r *EventsRepository) listTriageSourceStateRange(ctx context.Context, projectID, cursor, comparison string, limit int) ([]TriageSourceStateRecord, error) {
-	if comparison != ">" && comparison != "<=" {
-		return nil, fmt.Errorf("unsupported triage source cursor comparison %q", comparison)
-	}
-	rows, err := r.q.QueryContext(ctx, `
-		SELECT `+triageSourceKeySQL+` AS source_key,
-			MIN(CASE WHEN event_type = 'triage.enrolled' THEN payload_json END),
-			MIN(CASE WHEN event_type = 'triage.report' THEN payload_json END),
-			MAX(event_type = 'triage.routed'),
-			MAX(event_type = 'triage.retired')
-		FROM event_logs INDEXED BY idx_event_logs_triage_source_key
-		WHERE project_id = ? AND `+triageLifecyclePredicateSQL+`
-			AND `+triageSourceKeySQL+` `+comparison+` ?
-		GROUP BY source_key
-		ORDER BY source_key
-		LIMIT ?
-	`, projectID, cursor, limit)
-	if err != nil {
-		return nil, fmt.Errorf("list triage source state window: %w", err)
-	}
-	return scanTriageSourceStates(rows)
-}
-
-func scanTriageSourceStates(rows *sql.Rows) ([]TriageSourceStateRecord, error) {
 	defer rows.Close()
-	records := []TriageSourceStateRecord{}
-	for rows.Next() {
-		var record TriageSourceStateRecord
-		var enrollmentJSON, reportJSON sql.NullString
-		var projected, retired int
-		if err := rows.Scan(&record.SourceKey, &enrollmentJSON, &reportJSON, &projected, &retired); err != nil {
-			return nil, fmt.Errorf("scan triage source state: %w", err)
-		}
-		if enrollmentJSON.Valid {
-			value := enrollmentJSON.String
-			record.EnrollmentJSON = &value
-		}
-		if reportJSON.Valid {
-			value := reportJSON.String
-			record.ReportJSON = &value
-		}
-		record.Projected = projected != 0
-		record.Retired = retired != 0
-		records = append(records, record)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate triage source states: %w", err)
-	}
-	return records, nil
+
+	return scanEventLogs(rows)
 }
 
 type ProjectsRepository struct{ q sqliteQuerier }
