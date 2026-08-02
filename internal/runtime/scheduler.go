@@ -2224,6 +2224,13 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			RetryBaseDelay:      retryBaseDelay,
 			RetryMaxAttempts:    int64(cfg.Scheduler.RetryMaxAttempts),
 			OnQueueItemEnqueued: requestWake,
+			StopWorkGraphLoop: func(ctx context.Context, loopID, reason string) error {
+				if activeExecutions == nil {
+					return nil
+				}
+				_, err := activeExecutions.BeginLoopStop(loopID, reason)
+				return err
+			},
 			OnAgentExecutionStarted: func(ctx context.Context, input planner.AgentExecutionStartedInput) error {
 				return notifyAgentExecutionStarted(ctx, agentExecutionNotificationInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Title: "Looper Planner", Subtitle: input.Subtitle, Body: input.Body, DedupeKey: input.DedupeKey})
 			},

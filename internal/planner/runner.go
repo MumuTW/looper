@@ -318,6 +318,9 @@ type Options struct {
 	OnAgentExecutionStarted AgentExecutionStartedFunc
 	OnQueueItemEnqueued     func()
 	DiscoveryPolicy         DiscoveryPolicy
+	// StopWorkGraphLoop drains live graph worker executions before supersede
+	// retires their queue rows. Wired from the runtime ActiveExecution registry.
+	StopWorkGraphLoop func(ctx context.Context, loopID, reason string) error
 }
 
 type DiscoveryPolicy struct {
@@ -509,7 +512,7 @@ func New(options Options) *Runner {
 		policy = DiscoveryPolicy{AutoDiscovery: true, Labels: []string{labels.DefaultPlanTrigger}, LabelMode: config.LabelModeAll, RequireAssigneeCurrentUser: true}
 	}
 	runner := &Runner{db: options.DB, repos: options.Repos, github: options.GitHub, git: options.Git, agentExecutor: options.AgentExecutor, logger: options.Logger, now: now, agentTimeout: agentTimeout, agentIdleTimeout: agentIdleTimeout, claimTTL: claimTTL, allowAutoPush: allowAutoPush, disclosure: disclosureCfg, agentRuntime: strings.TrimSpace(options.AgentRuntime), agentProfileID: strings.TrimSpace(options.AgentProfileID), customInstructions: customInstructionConfig(options.CustomInstructions), projectRoleConfig: options.CustomInstructions, agentModel: cloneStringPtr(options.AgentModel), retryBaseDelay: retryBaseDelay, retryMaxAttempts: retryMax, onAgentExecutionStarted: options.OnAgentExecutionStarted, onQueueItemEnqueued: options.OnQueueItemEnqueued, discoveryPolicy: policy}
-	runner.workGraphs = workgraphdispatch.New(workgraphdispatch.Options{DB: options.DB, Repositories: options.Repos, Now: now, RetryMaxAttempts: retryMax, OnEnqueued: options.OnQueueItemEnqueued})
+	runner.workGraphs = workgraphdispatch.New(workgraphdispatch.Options{DB: options.DB, Repositories: options.Repos, Now: now, RetryMaxAttempts: retryMax, OnEnqueued: options.OnQueueItemEnqueued, StopLoop: options.StopWorkGraphLoop})
 	return runner
 }
 
@@ -836,6 +839,10 @@ func (r *Runner) workerRoleConfigured(projectID string) bool {
 	}
 	_, ok := config.ResolveAgent(*r.projectRoleConfig, projectID, config.CodingRoleWorker)
 	return ok
+}
+
+func (r *Runner) workGraphAllowed(projectID string) bool {
+	return r.allowAutoPush && r.workerRoleConfigured(projectID)
 }
 
 func (r *Runner) ProcessNext(ctx context.Context, claimedBy string) (*runpipe.ProcessResult, error) {
@@ -1249,7 +1256,7 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 		if err != nil {
 			return checkpoint, fmt.Errorf("resolve run agent identity: %w", err)
 		}
-		prompt, instructionBlock := buildPlannerPrompt(input.Project, r.customInstructions, issue, worktree, r.allowAutoPush, r.disclosure, agentVendor, derefString(agentModel), r.workerRoleConfigured(input.Project.ID))
+		prompt, instructionBlock := buildPlannerPrompt(input.Project, r.customInstructions, issue, worktree, r.allowAutoPush, r.disclosure, agentVendor, derefString(agentModel), r.workGraphAllowed(input.Project.ID))
 		metadata := map[string]any{"loopType": "planner", "repo": issue.Repo, "issueNumber": issue.IssueNumber, "specPath": issue.SpecPath}
 		for key, value := range config.CustomInstructionMetadata(instructionBlock, prompt) {
 			metadata[key] = value
@@ -1307,8 +1314,14 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 				return checkpoint, &runpipe.LoopError{Message: "planner work graph: " + graphErr.Error(), Kind: runpipe.FailureNonRetryable}
 			}
 			if graph != nil {
-				if !r.workerRoleConfigured(input.Project.ID) {
-					return checkpoint, &runpipe.LoopError{Message: "work graph requires a configured worker agent", Kind: runpipe.FailureNonRetryable}
+				if !r.workGraphAllowed(input.Project.ID) {
+					message := "work graph requires automatic planner publishing and a configured worker agent"
+					if !r.allowAutoPush {
+						message = "work graph requires automatic planner publishing (allowAutoPush=false)"
+					} else if !r.workerRoleConfigured(input.Project.ID) {
+						message = "work graph requires a configured worker agent"
+					}
+					return checkpoint, &runpipe.LoopError{Message: message, Kind: runpipe.FailureNonRetryable}
 				}
 				created, createErr := r.workGraphs.Create(ctx, workgraphdispatch.CreateInput{ProjectID: input.Project.ID, ParentRepo: issue.Repo, ParentIssueNumber: issue.IssueNumber, PlannerLoopID: input.Loop.ID, BaseBranch: worktree.BaseBranch, Graph: *graph})
 				if createErr != nil {

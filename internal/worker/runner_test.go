@@ -140,6 +140,49 @@ func TestDiscoverIssuesSkipsWorkerHoldLabel(t *testing.T) {
 	}
 }
 
+func TestFinishHeldGraphWorkerPreservesResumableQueue(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	nowISO := fixture.nowISO()
+	projectID := "project_1"
+	repo := "acme/looper"
+	loopID := "loop_graph_hold"
+	targetID := "project:" + projectID
+	payloadJSON := runpipe.MustMarshalJSON(map[string]any{"workGraphID": "workgraph_1", "workGraphNodeKey": "storage", "repo": repo, "executionMode": "create-pr"})
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 201, ProjectID: projectID, Type: "worker", TargetType: "project", TargetID: &targetID, Repo: &repo, Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	queue := storage.QueueItemRecord{ID: "queue_graph_hold", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: targetID, Repo: &repo, DedupeKey: "workgraph:workgraph_1:storage", Priority: storage.QueuePriorityWorker, Status: "running", AvailableAt: nowISO, MaxAttempts: 3, PayloadJSON: &payloadJSON, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Queue.Upsert(context.Background(), queue); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	run := storage.RunRecord{ID: "run_graph_hold", LoopID: loopID, Status: "running", StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Runs.Upsert(context.Background(), run); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), loopID)
+	if err != nil || loop == nil {
+		t.Fatalf("GetByID(loop) = %#v, %v", loop, err)
+	}
+
+	result, err := runner.finishHeldWorkerQueueItem(context.Background(), storage.ProjectRecord{ID: projectID}, *loop, &run, queue, workerCheckpoint{}, "held for manual review")
+	if err != nil {
+		t.Fatalf("finishHeldWorkerQueueItem() error = %v", err)
+	}
+	if result.Status != "skipped" {
+		t.Fatalf("result.Status = %q, want skipped", result.Status)
+	}
+	updatedQueue, err := fixture.repos.Queue.GetByID(context.Background(), queue.ID)
+	if err != nil || updatedQueue == nil || updatedQueue.Status != "queued" {
+		t.Fatalf("queue = %#v, %v, want requeued delivery", updatedQueue, err)
+	}
+	updatedLoop, err := fixture.repos.Loops.GetByID(context.Background(), loopID)
+	if err != nil || updatedLoop == nil || updatedLoop.Status != "queued" || updatedLoop.NextRunAt == nil {
+		t.Fatalf("loop = %#v, %v, want queued with NextRunAt", updatedLoop, err)
+	}
+}
+
 func TestProcessClaimedItemSkipsHeldAutoDiscoveredWorkerIssue(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
