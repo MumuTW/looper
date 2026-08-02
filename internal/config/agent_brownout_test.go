@@ -58,6 +58,12 @@ func TestValidateAgentBrownout(t *testing.T) {
 			wantMsg:  "must be a positive integer",
 		},
 		{
+			name:     "window duration overflow rejected",
+			mutate:   func(b *AgentBrownoutConfig) { b.WindowSeconds = int(maxAgentBrownoutDurationSeconds + 1) },
+			wantPath: "scheduler.agentBrownout.windowSeconds",
+			wantMsg:  "must not exceed time.Duration maximum in seconds",
+		},
+		{
 			name:     "zero minFailures rejected",
 			mutate:   func(b *AgentBrownoutConfig) { b.MinFailures = 0 },
 			wantPath: "scheduler.agentBrownout.minFailures",
@@ -94,10 +100,22 @@ func TestValidateAgentBrownout(t *testing.T) {
 			wantMsg:  "must be a positive integer",
 		},
 		{
+			name:     "cooldown duration overflow rejected",
+			mutate:   func(b *AgentBrownoutConfig) { b.CooldownSeconds = int(maxAgentBrownoutDurationSeconds + 1) },
+			wantPath: "scheduler.agentBrownout.cooldownSeconds",
+			wantMsg:  "must not exceed time.Duration maximum in seconds",
+		},
+		{
 			name:     "max below base rejected",
 			mutate:   func(b *AgentBrownoutConfig) { b.MaxCooldownSeconds = b.CooldownSeconds - 1 },
 			wantPath: "scheduler.agentBrownout.maxCooldownSeconds",
 			wantMsg:  "must be an integer >= scheduler.agentBrownout.cooldownSeconds",
+		},
+		{
+			name:     "max cooldown duration overflow rejected",
+			mutate:   func(b *AgentBrownoutConfig) { b.MaxCooldownSeconds = int(maxAgentBrownoutDurationSeconds + 1) },
+			wantPath: "scheduler.agentBrownout.maxCooldownSeconds",
+			wantMsg:  "must not exceed time.Duration maximum in seconds",
 		},
 		{
 			name:     "zero probeSuccesses rejected",
