@@ -128,22 +128,18 @@ type schedulerAsyncRunner interface {
 }
 
 type defaultSchedulerTickInput struct {
-	Repos *storage.Repositories
-	// CapturedProjects is the project-table snapshot already validated by the
-	// catalog pass immediately before an independent claim pass. Keeping it on
-	// the claim input lets the quarantine scope reuse that read instead of
-	// scanning Projects.List a second time on every tick. The explicit boolean
-	// distinguishes a captured empty table from an input that has no snapshot.
-	CapturedProjects      []storage.ProjectRecord
-	CapturedProjectsReady bool
-	GitHubGateway         *githubinfra.Gateway
-	GitGateway            *gitinfra.Gateway
-	Logger                bootstrap.Logger
-	Now                   func() time.Time
-	MaxConcurrentRuns     int
-	ClaimMu               *sync.Mutex
-	ClaimBoundary         *sync.RWMutex
-	RefreshForClaim       func() defaultSchedulerTickInput
+	Repos             *storage.Repositories
+	GitHubGateway     *githubinfra.Gateway
+	GitGateway        *gitinfra.Gateway
+	Logger            bootstrap.Logger
+	Now               func() time.Time
+	MaxConcurrentRuns int
+	ClaimMu           *sync.Mutex
+	ClaimBoundary     *sync.RWMutex
+	// ClaimLaneCursor preserves provider-group rotation across independent
+	// claim-pump passes. Nil keeps direct/unit-test inputs deterministic.
+	ClaimLaneCursor *schedulerClaimLaneCursor
+	RefreshForClaim func() defaultSchedulerTickInput
 	// AllowClaim, when set, is the admission projection for all work-producing
 	// durable ClaimNext* activity. Nil means ungated (tests).
 	AllowClaim func() error
@@ -1947,6 +1943,7 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *
 		return defaultSchedulerHandlers{tick: fail, claim: fail}
 	}
 	claimMu := &sync.Mutex{}
+	claimLaneCursor := &schedulerClaimLaneCursor{}
 	notificationGateways := newSchedulerNotificationGatewayFactory()
 	coordinatorState := coordinatorrole.NewRuntimeState()
 	escalatorCadence := &schedulerEscalatorCadence{}
@@ -2002,6 +1999,7 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *
 	}
 	attachClaimGate := func(input defaultSchedulerTickInput, services Services) defaultSchedulerTickInput {
 		input.ClaimBoundary = claimBoundary
+		input.ClaimLaneCursor = claimLaneCursor
 		input.AllowClaim = allowClaim
 		input.AllowLifecycleWork = allowLifecycleWork
 		input.WithAllowLifecycleWork = withAllowLifecycleWork
@@ -2023,6 +2021,7 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *
 				stopped := input
 				stopped.MaxConcurrentRuns = 0
 				stopped.RefreshForClaim = nil
+				stopped.ClaimLaneCursor = claimLaneCursor
 				stopped.AllowClaim = allowClaim
 				stopped.AllowLifecycleWork = allowLifecycleWork
 				stopped.WithAllowLifecycleWork = withAllowLifecycleWork
@@ -2040,6 +2039,7 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *
 			}
 			latest := latestSnapshot.input(services)
 			latest.ClaimBoundary = claimBoundary
+			latest.ClaimLaneCursor = claimLaneCursor
 			latest.AllowClaim = allowClaim
 			latest.AllowLifecycleWork = allowLifecycleWork
 			latest.WithAllowLifecycleWork = withAllowLifecycleWork
@@ -3222,6 +3222,25 @@ type schedulerClaimStats struct {
 	availableSlots int
 }
 
+// schedulerClaimLaneCursor rotates the first provider group between claim
+// passes. The lock keeps the fairness state coherent when the one-second claim
+// pump and a discovery-triggered wake race through the same handler.
+type schedulerClaimLaneCursor struct {
+	mu   sync.Mutex
+	next int
+}
+
+func (c *schedulerClaimLaneCursor) start(groupCount int) int {
+	if c == nil || groupCount <= 0 {
+		return 0
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	start := c.next % groupCount
+	c.next = (start + 1) % groupCount
+	return start
+}
+
 func (s *schedulerClaimStats) record(claimedCount, availableSlots int) {
 	s.claimedCount += claimedCount
 	s.availableSlots = availableSlots
@@ -3596,6 +3615,7 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 	if len(providerTypeSets) == 0 {
 		return nil, nil
 	}
+	laneStart := input.ClaimLaneCursor.start(len(providerTypeSets))
 	owned := make([]ownedQueueClaim, 0, availableSlots)
 	queueItems := make([]storage.QueueItemRecord, 0, availableSlots)
 	// Recheck admission at each durable claim so BeginShutdown cannot race past
@@ -3803,7 +3823,9 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 		}
 		for remaining > 0 && !stopClaiming && len(queueItems) < availableSlots {
 			progressed := false
-			for index, typeSet := range providerTypeSets {
+			for offset := range providerTypeSets {
+				index := (laneStart + offset) % len(providerTypeSets)
+				typeSet := providerTypeSets[index]
 				if !active[index] || stopClaiming || len(queueItems) >= availableSlots {
 					continue
 				}

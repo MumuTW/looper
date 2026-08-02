@@ -969,6 +969,54 @@ func TestClaimAndRunScheduledQueueItemsRoundRobinsProviderLanes(t *testing.T) {
 	}
 }
 
+func TestClaimAndRunScheduledQueueItemsRotatesProviderLaneAcrossPasses(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "claim-provider-cursor.sqlite"), t.TempDir())
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 21, 8, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+	insertSchedulerProject(t, repos, workingDir, nowISO)
+
+	cfg, err := config.DefaultConfig(workingDir)
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	codex := config.AgentVendorCodex
+	claude := config.AgentVendorClaudeCode
+	cfg.Agent.Vendor = &codex
+	cfg.Roles.Reviewer.Agent = &config.RoleAgentConfig{Vendor: &claude}
+	cfg.Projects = []config.ProjectRefConfig{{ID: "looper", Validation: &config.ProjectValidationConfig{OptOut: true}}}
+	worker := schedulerTestQueueItem("worker_cursor", "worker", nowISO)
+	reviewer := schedulerTestQueueItem("reviewer_cursor", "reviewer", nowISO)
+	reviewer.Priority = storage.QueuePriorityReviewer
+	for _, item := range []storage.QueueItemRecord{worker, reviewer} {
+		if err := repos.Queue.Upsert(context.Background(), item); err != nil {
+			t.Fatalf("Queue.Upsert(%s) error = %v", item.ID, err)
+		}
+	}
+	cursor := &schedulerClaimLaneCursor{}
+	base := defaultSchedulerTickInput{
+		Repos: repos, Config: &cfg, Now: func() time.Time { return now }, AsyncRunner: immediateSchedulerRunner{},
+		ClaimLaneCursor: cursor, Planner: &stubPlannerScheduler{}, Reviewer: &stubReviewerScheduler{}, Worker: &stubWorkerScheduler{},
+	}
+	first, err := claimAndRunScheduledQueueItems(context.Background(), 1, base)
+	if err != nil {
+		t.Fatalf("first claim pass error = %v", err)
+	}
+	if len(first) != 1 || first[0].ID != worker.ID {
+		t.Fatalf("first claim pass = %#v, want Codex worker before cursor rotates", first)
+	}
+	second, err := claimAndRunScheduledQueueItems(context.Background(), 1, base)
+	if err != nil {
+		t.Fatalf("second claim pass error = %v", err)
+	}
+	if len(second) != 1 || second[0].ID != reviewer.ID {
+		t.Fatalf("second claim pass = %#v, want Claude reviewer after cursor rotates", second)
+	}
+}
+
 func TestExecuteClaimPhaseAllowsAgentFreeSnapshotDuringProviderBrownout(t *testing.T) {
 	t.Parallel()
 
