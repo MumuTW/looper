@@ -763,6 +763,9 @@ func (r *Runtime) allowAgentSpawn(meta *agent.SpawnMeta) error {
 	} else {
 		probe, generation, err = r.agentHealth.AllowAdmissionWithGeneration(meta.Vendor)
 	}
+	if err != nil && errors.Is(err, brownout.ErrOpen) {
+		return errors.Join(agent.ErrProviderBrownout, err)
+	}
 	meta.BrownoutProbe = probe
 	meta.BrownoutProbeGeneration = generation
 	if err == nil && probe {

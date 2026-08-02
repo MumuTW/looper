@@ -127,8 +127,8 @@ func TestAgentBrownoutIsolatedByEffectiveVendor(t *testing.T) {
 	if err := rt.AllowClaim(); err != nil {
 		t.Fatalf("healthy provider should keep scheduler admission open: %v", err)
 	}
-	if err := rt.allowAgentSpawn(&agent.SpawnMeta{Vendor: string(codex)}); !errors.Is(err, brownout.ErrOpen) {
-		t.Fatalf("Codex spawn admission = %v, want brownout open", err)
+	if err := rt.allowAgentSpawn(&agent.SpawnMeta{Vendor: string(codex)}); !errors.Is(err, agent.ErrProviderBrownout) || !errors.Is(err, brownout.ErrOpen) {
+		t.Fatalf("Codex spawn admission = %v, want provider brownout marker and open cause", err)
 	}
 	if err := rt.allowAgentSpawn(&agent.SpawnMeta{Vendor: string(claude)}); err != nil {
 		t.Fatalf("Claude spawn admission = %v, want allowed", err)

@@ -1405,7 +1405,13 @@ func (r *Runner) ProcessClaimedQueueItem(ctx context.Context, queueItem storage.
 
 func (r *Runner) finalizeClaimSetupFailure(ctx context.Context, queueItem storage.QueueItemRecord, cause error) error {
 	failure := r.classifyFailureForProject(derefString(queueItem.ProjectID), cause)
-	failedQueue, err := r.failQueueItem(ctx, queueItem, failure.Kind, failure.Message)
+	var failedQueue *storage.QueueItemRecord
+	var err error
+	if errors.Is(cause, agent.ErrProviderBrownout) {
+		failedQueue, err = r.requeueClaimedItemWithoutAttempt(ctx, queueItem, failure.kind, failure.message)
+	} else {
+		failedQueue, err = r.failQueueItem(ctx, queueItem, failure.kind, failure.message)
+	}
 	if err != nil {
 		return err
 	}
@@ -1589,7 +1595,13 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			} else {
 				r.logError("reviewer run failed", map[string]any{"projectId": project.ID, "loopId": loop.ID, "runId": run.ID, "queueItemId": queueItem.ID, "currentStep": derefString(run.CurrentStep), "elapsedSeconds": stepElapsedSeconds, "failureKind": string(failure.Kind), "summary": failure.Message})
 			}
-			failedQueue, queueErr := r.failQueueItem(ctx, queueItem, failure.Kind, failure.Message)
+			var failedQueue *storage.QueueItemRecord
+			var queueErr error
+			if errors.Is(err, agent.ErrProviderBrownout) {
+				failedQueue, queueErr = r.requeueClaimedItemWithoutAttempt(ctx, queueItem, failure.kind, failure.message)
+			} else {
+				failedQueue, queueErr = r.failQueueItem(ctx, queueItem, failure.kind, failure.message)
+			}
 			if queueErr != nil {
 				return runpipe.ProcessResult{}, queueErr
 			}
@@ -4606,6 +4618,29 @@ func (r *Runner) failQueueItem(ctx context.Context, queueItem storage.QueueItemR
 		return nil, err
 	}
 	return updated, nil
+}
+
+// requeueClaimedItemWithoutAttempt returns a claim refused by provider
+// brownout to queued without charging an attempt: no agent run reached the
+// executor after the durable claim.
+func (r *Runner) requeueClaimedItemWithoutAttempt(ctx context.Context, queueItem storage.QueueItemRecord, kind QueueFailureKind, message string) (*storage.QueueItemRecord, error) {
+	nowISO := r.nowISO()
+	delay := backoffDelay(r.retryBaseDelay, cappedRetryDelayAttempt(queueItem.Attempts+1, queueItem.MaxAttempts), r.retryMaxDelayForProject(derefString(queueItem.ProjectID)))
+	retryAt := eventlog.FormatJavaScriptISOString(r.now().Add(delay))
+	if err := r.repos.Queue.MarkRetry(ctx, storage.QueueMarkRetryInput{ID: queueItem.ID, AvailableAt: retryAt, Attempts: queueItem.Attempts, ErrorMessage: optionalString(message), ErrorKind: string(kind), UpdatedAt: nowISO}); err != nil {
+		return nil, err
+	}
+	return r.repos.Queue.GetByID(ctx, queueItem.ID)
+}
+
+func cappedRetryDelayAttempt(attempts, maxAttempts int64) int64 {
+	if attempts <= 0 {
+		return 1
+	}
+	if maxAttempts > 0 && attempts > maxAttempts {
+		return maxAttempts
+	}
+	return attempts
 }
 
 func (r *Runner) updateLoop(ctx context.Context, loop storage.LoopRecord, mutate func(*storage.LoopRecord)) (storage.LoopRecord, error) {

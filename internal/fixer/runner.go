@@ -2324,8 +2324,10 @@ func (r *Runner) recoverClaimedItem(ctx context.Context, queueItem storage.Queue
 	var breakerLoop *storage.LoopRecord
 	breakerStreak := 0
 	var failErr error
-	if errors.As(err, &activeErr) {
-		failedQueue, failErr = r.requeueQueueItem(ctx, queueItem, failure.Kind, failure.Message, queueItem.Attempts)
+	if errors.Is(err, agent.ErrProviderBrownout) {
+		failedQueue, failErr = r.requeueQueueItem(ctx, queueItem, failure.kind, failure.message, queueItem.Attempts)
+	} else if errors.As(err, &activeErr) {
+		failedQueue, failErr = r.requeueQueueItem(ctx, queueItem, failure.kind, failure.message, queueItem.Attempts)
 	} else if errors.As(err, &runFailure) && queueItem.LoopID != nil {
 		loop, loopErr := r.repos.Loops.GetByID(ctx, *queueItem.LoopID)
 		if loopErr != nil {
@@ -2807,7 +2809,16 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			// Consecutive-failure circuit breaker: once the same step/fix-items
 			// state has failed r.consecutiveFailureThreshold runs in a row, stop
 			// requeueing and park the loop until discovery sees new feedback.
-			failedQueue, breakerStreak, err := r.failQueueItemWithBreaker(ctx, *loop, queueItem, run.ID, latest, step, failure)
+			var failedQueue *storage.QueueItemRecord
+			breakerStreak := 0
+			if errors.Is(err, agent.ErrProviderBrownout) {
+				// The common executor refused before starting an agent. Requeue the
+				// durable claim without charging an attempt or the fixer failure
+				// streak; no fixer work reached the provider.
+				failedQueue, err = r.requeueQueueItem(ctx, queueItem, failure.kind, failure.message, queueItem.Attempts)
+			} else {
+				failedQueue, breakerStreak, err = r.failQueueItemWithBreaker(ctx, *loop, queueItem, run.ID, latest, step, failure)
+			}
 			if err != nil {
 				return runpipe.ProcessResult{}, err
 			}

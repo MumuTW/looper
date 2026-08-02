@@ -1552,7 +1552,13 @@ func (r *Runner) ProcessClaimedQueueItem(ctx context.Context, queueItem storage.
 
 func (r *Runner) recoverClaimedItem(ctx context.Context, queueItem storage.QueueItemRecord, err error) (*runpipe.ProcessResult, error) {
 	failure := r.classifyFailure(err)
-	failedQueue, failErr := r.failQueueItem(ctx, queueItem, failure.Kind, failure.Message)
+	var failedQueue *storage.QueueItemRecord
+	var failErr error
+	if errors.Is(err, agent.ErrProviderBrownout) {
+		failedQueue, failErr = r.requeueClaimedItemWithoutAttempt(ctx, queueItem, failure.kind, failure.message)
+	} else {
+		failedQueue, failErr = r.failQueueItem(ctx, queueItem, failure.kind, failure.message)
+	}
 	if failErr != nil {
 		return nil, failErr
 	}
@@ -1787,7 +1793,12 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			if _, err := r.completeRun(ctx, run, "failed", failure.Message, failure.Message, latest); err != nil {
 				return runpipe.ProcessResult{}, err
 			}
-			failedQueue, err := r.failQueueItem(ctx, queueItem, failure.Kind, failure.Message)
+			var failedQueue *storage.QueueItemRecord
+			if errors.Is(err, agent.ErrProviderBrownout) {
+				failedQueue, err = r.requeueClaimedItemWithoutAttempt(ctx, queueItem, failure.kind, failure.message)
+			} else {
+				failedQueue, err = r.failQueueItem(ctx, queueItem, failure.kind, failure.message)
+			}
 			if err != nil {
 				return runpipe.ProcessResult{}, err
 			}
@@ -4336,6 +4347,18 @@ func (r *Runner) failQueueItem(ctx context.Context, queueItem storage.QueueItemR
 		if recovered, getErr := r.repos.Queue.GetByID(ctx, queueItem.ID); getErr == nil && recovered != nil && (recovered.Status == "manual_intervention" || recovered.Status == "completed" || recovered.Status == "failed") {
 			return recovered, nil
 		}
+		return nil, err
+	}
+	return r.repos.Queue.GetByID(ctx, queueItem.ID)
+}
+
+// requeueClaimedItemWithoutAttempt returns a claim refused by provider
+// brownout to queued without charging an attempt: no agent run reached the
+// executor after the durable claim.
+func (r *Runner) requeueClaimedItemWithoutAttempt(ctx context.Context, queueItem storage.QueueItemRecord, kind QueueFailureKind, message string) (*storage.QueueItemRecord, error) {
+	nowISO := r.nowISO()
+	retryAt := eventlog.FormatJavaScriptISOString(r.now().Add(backoffDelay(r.retryBaseDelay, cappedRetryDelayAttempt(queueItem.Attempts+1, queueItem.MaxAttempts))))
+	if err := r.repos.Queue.MarkRetry(ctx, storage.QueueMarkRetryInput{ID: queueItem.ID, AvailableAt: retryAt, Attempts: queueItem.Attempts, ErrorMessage: optionalString(message), ErrorKind: string(kind), UpdatedAt: nowISO}); err != nil {
 		return nil, err
 	}
 	return r.repos.Queue.GetByID(ctx, queueItem.ID)

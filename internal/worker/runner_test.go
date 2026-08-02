@@ -4340,6 +4340,40 @@ func TestProcessClaimedItemTreatsWorkerSetupFailureAsRetryable(t *testing.T) {
 	}
 }
 
+func TestProcessClaimedQueueItemRequeuesProviderBrownoutWithoutAttempt(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	git := &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "looper/feature", BaseBranch: "main", HeadSHA: "abc123", WorktreeID: "worktree_1"}}
+	agentExec := &fakeAgentExecutor{startErr: agent.ErrProviderBrownout}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: git, AgentExecutor: agentExec, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true, OpenPRStrategy: config.OpenPRStrategyAllDone})
+
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-1", "worker")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed worker", claim, err)
+	}
+	result, err := runner.ProcessClaimedQueueItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedQueueItem() error = %v", err)
+	}
+	if result == nil || result.Status != "failed" || result.FailureKind != FailureRetryableTransient {
+		t.Fatalf("result = %#v, want retryable recovered failed result", result)
+	}
+	queue, err := fixture.repos.Queue.GetByID(context.Background(), claim.ID)
+	if err != nil {
+		t.Fatalf("Queue.GetByID() error = %v", err)
+	}
+	if queue == nil || queue.Status != "queued" || queue.Attempts != claim.Attempts || queue.FinishedAt != nil || queue.LastErrorKind == nil || *queue.LastErrorKind != string(FailureRetryableTransient) {
+		t.Fatalf("queue = %#v, want retryable queued item with attempts=%d and no terminal timestamp", queue, claim.Attempts)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), result.LoopID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if loop == nil || loop.Status != "queued" {
+		t.Fatalf("loop = %#v, want queued after provider brownout refusal", loop)
+	}
+}
+
 func TestProcessClaimedItemRestartsFromDiscoverAfterStaleValidationFailure(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -4637,47 +4671,43 @@ func TestRecoverClaimedItemReconcilesRunningLoopState(t *testing.T) {
 	}
 }
 
-// TestRecoverClaimedItemFinishesAfterQueueFailureAlreadyCommitted models the
-// partial transition where ProcessClaimedItem terminalized the queue item but
-// failed while updating the loop. Recovery must reconcile the loop from the
-// durable terminal queue row and must not resurrect it as a retry merely
-// because the second error is classified as transient.
-func TestRecoverClaimedItemFinishesAfterQueueFailureAlreadyCommitted(t *testing.T) {
+func TestRecoverClaimedItemRequeuesProviderBrownoutWithoutAttempt(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
 	nowISO := fixture.nowISO()
 	loopTarget := "project:project_1"
-	loopID := "loop_worker_partial_failure"
-	projectID := "project_1"
-	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 2, ProjectID: projectID, Type: "worker", TargetType: "project", TargetID: &loopTarget, Repo: runpipe.StringPtr("acme/looper"), Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+	loopID := "loop_worker_brownout_requeue"
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 3, ProjectID: "project_1", Type: "worker", TargetType: "project", TargetID: &loopTarget, Repo: stringPtr("acme/looper"), Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
-	payload := `{"title":"Recover worker loop","prompt":"Do the thing","repo":"acme/looper","baseBranch":"main"}`
-	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_worker_partial_failure", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: loopTarget, Repo: runpipe.StringPtr("acme/looper"), DedupeKey: "worker:loop_worker_partial_failure", Priority: 1, Status: "manual_intervention", AvailableAt: nowISO, Attempts: 1, MaxAttempts: 3, PayloadJSON: &payload, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+	projectID := "project_1"
+	payload := `{"title":"Brownout retry","prompt":"Do the thing","repo":"acme/looper","baseBranch":"main"}`
+	queue := storage.QueueItemRecord{ID: "queue_worker_brownout_requeue", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: loopTarget, Repo: stringPtr("acme/looper"), DedupeKey: "worker:loop_worker_brownout_requeue", Priority: 1, Status: "running", AvailableAt: nowISO, Attempts: 2, MaxAttempts: 3, PayloadJSON: &payload, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := fixture.repos.Queue.Upsert(context.Background(), queue); err != nil {
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
-	queueItem := storage.QueueItemRecord{ID: "queue_worker_partial_failure", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: loopTarget, Repo: runpipe.StringPtr("acme/looper"), DedupeKey: "worker:loop_worker_partial_failure", Priority: 1, Status: "running", AvailableAt: nowISO, Attempts: 0, MaxAttempts: 3, PayloadJSON: &payload, CreatedAt: nowISO, UpdatedAt: nowISO}
-	result, err := runner.recoverClaimedItem(context.Background(), queueItem, &runpipe.LoopError{Message: "loop reconciliation interrupted", Kind: runpipe.FailureRetryableTransient})
+
+	result, err := runner.recoverClaimedItem(context.Background(), queue, agent.ErrProviderBrownout)
 	if err != nil {
 		t.Fatalf("recoverClaimedItem() error = %v", err)
 	}
-	if result == nil || result.Status != "failed" || result.FailureKind != runpipe.FailureRetryableTransient {
-		t.Fatalf("result = %#v, want failed transient recovery", result)
+	if result == nil || result.Status != "failed" {
+		t.Fatalf("result = %#v, want recovered result", result)
 	}
-	queue, err := fixture.repos.Queue.GetByID(context.Background(), queueItem.ID)
+	got, err := fixture.repos.Queue.GetByID(context.Background(), queue.ID)
 	if err != nil {
 		t.Fatalf("Queue.GetByID() error = %v", err)
 	}
-	if queue == nil || queue.Status != "manual_intervention" {
-		t.Fatalf("queue = %#v, want existing terminal manual_intervention row preserved", queue)
+	if got == nil || got.Status != "queued" || got.Attempts != queue.Attempts || got.FinishedAt != nil {
+		t.Fatalf("queue = %#v, want queued with attempts=%d and no terminal timestamp", got, queue.Attempts)
 	}
 	loop, err := fixture.repos.Loops.GetByID(context.Background(), loopID)
 	if err != nil {
 		t.Fatalf("Loops.GetByID() error = %v", err)
 	}
-	if loop == nil || loop.Status != "paused" || loop.NextRunAt != nil {
-		t.Fatalf("loop = %#v, want paused loop after idempotent recovery", loop)
+	if loop == nil || loop.Status != "queued" {
+		t.Fatalf("loop = %#v, want queued after provider brownout refusal", loop)
 	}
 }
 
@@ -6529,15 +6559,19 @@ func (f *fakeGitGateway) Push(_ context.Context, input PushInput) error {
 }
 
 type fakeAgentExecutor struct {
-	starts  []AgentRunInput
-	results []AgentResult
-	index   int
-	waitErr error
-	wait    func(context.Context) error
+	starts   []AgentRunInput
+	results  []AgentResult
+	index    int
+	startErr error
+	waitErr  error
+	wait     func(context.Context) error
 }
 
 func (f *fakeAgentExecutor) Start(_ context.Context, input AgentRunInput) (AgentExecution, error) {
 	f.starts = append(f.starts, input)
+	if f.startErr != nil {
+		return nil, f.startErr
+	}
 	result := AgentResult{Status: "completed", Summary: "done", ParseStatus: "parsed"}
 	if f.index < len(f.results) {
 		result = f.results[f.index]
