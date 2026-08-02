@@ -139,11 +139,14 @@ func coordinatorLane(input defaultSchedulerTickInput) discoveryLane {
 		Enabled:  func(projectID string) bool { return coordinatorEnabledForProject(input, projectID) },
 		Discover: func(ctx context.Context, projectID, repo string, snapshot *githubinfra.DiscoverySnapshot) ([]storage.QueueItemRecord, error) {
 			var triageAdmission func(func() error) error
-			if input.Config != nil && input.Config.Agent.Vendor != nil && input.WithAllowClaimForVendor != nil {
+			if input.Config != nil && input.Config.Agent.Vendor != nil && input.AllowClaimForVendor != nil {
 				vendor := string(*input.Config.Agent.Vendor)
 				triageAdmission = func(fn func() error) error {
-					var fnErr error
-					gateErr := input.WithAllowClaimForVendor(vendor, func() { fnErr = fn() })
+					// This is only an early point-in-time filter. Holding the
+					// provider gate across LLM completion would deadlock when the
+					// executor reports its terminal outcome before Complete returns;
+					// the common spawn boundary remains the authority.
+					gateErr := input.AllowClaimForVendor(vendor)
 					if errors.Is(gateErr, brownout.ErrOpen) {
 						// A provider brownout suppresses only the LLM decision. The
 						// coordinator runner has already completed its non-agent
@@ -153,7 +156,7 @@ func coordinatorLane(input defaultSchedulerTickInput) discoveryLane {
 					if gateErr != nil {
 						return gateErr
 					}
-					return fnErr
+					return fn()
 				}
 			}
 			_, err := input.Coordinator.DiscoverIssues(ctx, coordinator.DiscoveryInput{ProjectID: projectID, Repo: repo, Snapshot: snapshot, TriageAdmission: triageAdmission})

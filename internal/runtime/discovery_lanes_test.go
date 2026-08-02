@@ -206,10 +206,9 @@ func TestCoordinatorLanePassesProviderAdmissionToTriageOnly(t *testing.T) {
 	lane := coordinatorLane(defaultSchedulerTickInput{
 		Config:      &cfg,
 		Coordinator: coordinatorLaneProbe{triageCalls: &triageCalls},
-		WithAllowClaimForVendor: func(provider string, fn func()) error {
+		AllowClaimForVendor: func(provider string) error {
 			admittedProvider = provider
 			admissionCalls++
-			fn()
 			return nil
 		},
 	})
