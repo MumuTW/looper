@@ -189,7 +189,11 @@ func TestHandlerLoopRetryDiscardClearsWorkerTimeoutEvidence(t *testing.T) {
 	if err != nil || previous == nil {
 		t.Fatalf("Runs.GetLatestByLoopID() = (%#v, %v)", previous, err)
 	}
-	checkpoint := fmt.Sprintf(`{"worktree":{"id":"worktree-timeout","path":%q,"branch":"feature/discard-worker-timeout"},"execution":{"status":"timeout","progressBeforeTimeout":{"headSha":"before","contentFingerprint":"preserve-me"},"progressSnapshotError":"operator action required"}}`, fixture.WorktreePath)
+	worktree, err := services.Repositories.Worktrees.GetByPath(context.Background(), fixture.WorktreePath)
+	if err != nil || worktree == nil {
+		t.Fatalf("Worktrees.GetByPath() = (%#v, %v)", worktree, err)
+	}
+	checkpoint := fmt.Sprintf(`{"worktree":{"id":%q,"path":%q,"branch":"feature/discard-worker-timeout"},"execution":{"status":"timeout","progressBeforeTimeout":{"headSha":"before","contentFingerprint":"preserve-me"},"progressSnapshotError":"operator action required"}}`, worktree.ID, fixture.WorktreePath)
 	previous.CheckpointJSON = &checkpoint
 	if err := services.Repositories.Runs.Upsert(context.Background(), *previous); err != nil {
 		t.Fatalf("Runs.Upsert(timeout checkpoint) error = %v", err)

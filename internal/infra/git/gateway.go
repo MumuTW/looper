@@ -110,9 +110,11 @@ type InspectHeadResult struct {
 	UntrackedFiles []string
 	// DiffFingerprint fingerprints porcelain status codes and paths only (not
 	// file contents), so content-only edits of untracked files stay stable.
-	DiffFingerprint         string
-	ContentFingerprint      string
-	HeadDescendsFromCompare bool
+	DiffFingerprint           string
+	ContentFingerprint        string
+	ContentFingerprintVersion string
+	IndexFingerprint          string
+	HeadDescendsFromCompare   bool
 }
 
 type VerifyWorktreeIdentityInput struct {
@@ -123,6 +125,11 @@ type VerifyWorktreeIdentityInput struct {
 	ExpectedHeadSHA string
 	CheckoutMode    CheckoutMode
 }
+
+// WorktreeFingerprintVersion is persisted alongside timeout evidence. A daemon
+// upgrade must never compare a new content/index digest with an older algorithm
+// and silently authorize a replacement agent on incompatible evidence.
+const WorktreeFingerprintVersion = "v2"
 
 type CommitInput struct {
 	RepoPath     string
@@ -912,6 +919,10 @@ func (g *Gateway) InspectHead(ctx context.Context, input InspectHeadInput) (Insp
 	if err != nil {
 		return InspectHeadResult{}, err
 	}
+	indexFingerprint, err := g.indexFingerprint(ctx, input.WorktreePath, contentPaths)
+	if err != nil {
+		return InspectHeadResult{}, err
+	}
 
 	headDescendsFromCompare := false
 	if input.CompareHeadSHA != "" {
@@ -922,16 +933,18 @@ func (g *Gateway) InspectHead(ctx context.Context, input InspectHeadInput) (Insp
 	}
 
 	return InspectHeadResult{
-		HeadSHA:                 headSHA,
-		Branch:                  branch,
-		NewCommitSHAs:           newCommitSHAs,
-		HasUncommittedChanges:   len(status) > 0,
-		ChangedFiles:            changedFiles,
-		StagedFiles:             stagedFiles,
-		UntrackedFiles:          untrackedFiles,
-		DiffFingerprint:         diffFingerprint,
-		ContentFingerprint:      contentFingerprint,
-		HeadDescendsFromCompare: headDescendsFromCompare,
+		HeadSHA:                   headSHA,
+		Branch:                    branch,
+		NewCommitSHAs:             newCommitSHAs,
+		HasUncommittedChanges:     len(status) > 0,
+		ChangedFiles:              changedFiles,
+		StagedFiles:               stagedFiles,
+		UntrackedFiles:            untrackedFiles,
+		DiffFingerprint:           diffFingerprint,
+		ContentFingerprint:        contentFingerprint,
+		ContentFingerprintVersion: WorktreeFingerprintVersion,
+		IndexFingerprint:          indexFingerprint,
+		HeadDescendsFromCompare:   headDescendsFromCompare,
 	}, nil
 }
 
@@ -1061,7 +1074,9 @@ func (g *Gateway) submoduleContentFingerprint(ctx context.Context, path string) 
 func (g *Gateway) contentFingerprint(ctx context.Context, worktreePath string, paths []string) (string, error) {
 	unique := make(map[string]struct{}, len(paths))
 	for _, path := range paths {
-		path = strings.TrimSpace(path)
+		// Git permits leading/trailing whitespace in a filename. Preserve the
+		// exact NUL-delimited path; trimming would hash a different (usually
+		// missing) path and make content loss look preserved.
 		if path == "" {
 			continue
 		}
@@ -1150,6 +1165,47 @@ func (g *Gateway) isAncestor(ctx context.Context, repoPath, ancestor, descendant
 		return false, nil
 	}
 	return false, fmt.Errorf("git merge-base --is-ancestor %s %s: %w", ancestor, descendant, err)
+}
+
+// indexFingerprint records the staged blob, mode, stage, and exact path for
+// every tracked path participating in a timeout observation. Working-tree bytes
+// alone cannot detect an MM transition where the index is replaced while the
+// checkout contents stay unchanged.
+func (g *Gateway) indexFingerprint(ctx context.Context, worktreePath string, paths []string) (string, error) {
+	unique := make(map[string]struct{}, len(paths))
+	for _, path := range paths {
+		if path == "" {
+			continue
+		}
+		if !filepath.IsLocal(path) {
+			return "", fmt.Errorf("unsafe worktree index path %q", path)
+		}
+		unique[path] = struct{}{}
+	}
+	sortedPaths := make([]string, 0, len(unique))
+	for path := range unique {
+		sortedPaths = append(sortedPaths, path)
+	}
+	sort.Strings(sortedPaths)
+	args := []string{"ls-files", "--stage", "-z", "--"}
+	args = append(args, sortedPaths...)
+	result, err := g.runGitResult(ctx, worktreePath, nil, args...)
+	if err != nil {
+		return "", err
+	}
+	fingerprint := sha256.New()
+	_, _ = fingerprint.Write([]byte(WorktreeFingerprintVersion))
+	_, _ = fingerprint.Write([]byte{0})
+	_, _ = fingerprint.Write([]byte(result.Stdout))
+	return fmt.Sprintf("%x", fingerprint.Sum(nil)), nil
+}
+
+func (g *Gateway) currentBranch(ctx context.Context, repoPath string) (string, error) {
+	result, err := g.runGitResult(ctx, repoPath, nil, "rev-parse", "--abbrev-ref", "HEAD")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(result.Stdout), nil
 }
 
 func (g *Gateway) Commit(ctx context.Context, input CommitInput) (CommitResult, error) {

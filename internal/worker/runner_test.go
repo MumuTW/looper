@@ -1606,7 +1606,7 @@ func TestRunExecuteStepPersistsProgressBeforeTimeoutTermination(t *testing.T) {
 	}
 	progressInspect := InspectHeadResult{
 		HeadSHA: "after-head", Branch: "looper/issue-27", HasUncommittedChanges: true,
-		ChangedFiles: []string{"modified.go", "staged.go", "new.txt"}, StagedFiles: []string{"staged.go"}, UntrackedFiles: []string{"new.txt"}, DiffFingerprint: "status-only-sha",
+		ChangedFiles: []string{"modified.go", "staged.go", "new.txt"}, StagedFiles: []string{"staged.go"}, UntrackedFiles: []string{"new.txt"}, DiffFingerprint: "status-only-sha", ContentFingerprint: "content-sha", ContentFingerprintVersion: worktreeFingerprintVersion, IndexFingerprint: "index-sha",
 	}
 	git := &fakeGitGateway{inspectResults: []InspectHeadResult{progressInspect, progressInspect}}
 	agentExecutor := &timeoutObservingAgentExecutor{result: AgentResult{Status: "timeout", Summary: "agent became idle", TimeoutType: "idle", LastProgressAt: "2026-04-11T12:00:01.000Z"}}
@@ -1679,7 +1679,7 @@ func TestRunExecuteStepStopsBeforeReplacementWhenTimeoutProgressDrifts(t *testin
 	if err := fixture.repos.Runs.Upsert(context.Background(), run); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
-	git := &fakeGitGateway{inspectResult: InspectHeadResult{HeadSHA: "same-head", Branch: "looper/issue-27", DiffFingerprint: "different-status"}}
+	git := &fakeGitGateway{inspectResult: InspectHeadResult{HeadSHA: "same-head", Branch: "looper/issue-27", ChangedFiles: []string{"tracked.go"}, DiffFingerprint: "different-status", ContentFingerprint: "after-content", ContentFingerprintVersion: worktreeFingerprintVersion, IndexFingerprint: "after-index"}}
 	agentExecutor := &fakeAgentExecutor{}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, AgentExecutor: agentExecutor, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true})
 
@@ -1689,7 +1689,7 @@ func TestRunExecuteStepStopsBeforeReplacementWhenTimeoutProgressDrifts(t *testin
 			Work:      &workerInput{Title: "Implement worker loop", Repo: "acme/looper", IssueNumber: 27, BaseBranch: "main", ExecutionMode: "create-pr"},
 			Worktree:  &checkpointWorktree{ID: "worktree_27", Path: worktreePath, Branch: "looper/issue-27", BaseBranch: "main", HeadSHA: "same-head"},
 			Plan:      &checkpointPlan{Summary: "Implement worker loop"},
-			Execution: &checkpointExecution{Status: "timeout", ProgressBeforeTimeout: &worktreeProgress{HeadSHA: "same-head", Branch: "looper/issue-27", DiffFingerprint: "before-status"}},
+			Execution: &checkpointExecution{Status: "timeout", ProgressBeforeTimeout: &worktreeProgress{HeadSHA: "same-head", Branch: "looper/issue-27", ChangedFileCount: 1, DiffFingerprint: "before-status", ContentFingerprint: "before-content", ContentFingerprintVersion: worktreeFingerprintVersion, IndexFingerprint: "before-index"}},
 		},
 	})
 	var loopErr *runpipe.LoopError
@@ -1722,7 +1722,7 @@ func TestPreservesWorktreeProgressRequiresContentAndCommitEvidence(t *testing.T)
 	t.Parallel()
 
 	before := worktreeProgress{
-		HeadSHA: "before-head", Branch: "feature/test", ChangedFiles: []string{"tracked.go", "new.txt"}, StagedFiles: []string{"tracked.go"}, UntrackedFiles: []string{"new.txt"}, ChangedFileCount: 2, DiffFingerprint: "before-status", ContentFingerprint: "before-content",
+		HeadSHA: "before-head", Branch: "feature/test", ChangedFiles: []string{"tracked.go", "new.txt"}, StagedFiles: []string{"tracked.go"}, UntrackedFiles: []string{"new.txt"}, ChangedFileCount: 2, DiffFingerprint: "before-status", ContentFingerprint: "before-content", ContentFingerprintVersion: worktreeFingerprintVersion, IndexFingerprint: "before-index",
 	}
 	for _, tc := range []struct {
 		name  string
@@ -1731,13 +1731,13 @@ func TestPreservesWorktreeProgressRequiresContentAndCommitEvidence(t *testing.T)
 	}{
 		{
 			name:  "preserves identical content and status at the same head",
-			after: worktreeProgress{HeadSHA: "before-head", Branch: "feature/test", ChangedFiles: []string{"tracked.go", "new.txt"}, StagedFiles: []string{"tracked.go"}, UntrackedFiles: []string{"new.txt"}, ChangedFileCount: 2, DiffFingerprint: "before-status", ContentFingerprint: "before-content"},
+			after: worktreeProgress{HeadSHA: "before-head", Branch: "feature/test", ChangedFiles: []string{"tracked.go", "new.txt"}, StagedFiles: []string{"tracked.go"}, UntrackedFiles: []string{"new.txt"}, ChangedFileCount: 2, DiffFingerprint: "before-status", ContentFingerprint: "before-content", ContentFingerprintVersion: worktreeFingerprintVersion, IndexFingerprint: "before-index"},
 			want:  true,
 		},
 		{
-			name:  "preserves an unchanged legacy status-only checkpoint after upgrade",
+			name:  "rejects an unchanged legacy status-only checkpoint after upgrade",
 			after: worktreeProgress{HeadSHA: "before-head", Branch: "feature/test", ChangedFiles: []string{"tracked.go", "new.txt"}, StagedFiles: []string{"tracked.go"}, UntrackedFiles: []string{"new.txt"}, ChangedFileCount: 2, DiffFingerprint: "before-status", ContentFingerprint: "new-content-fingerprint"},
-			want:  true,
+			want:  false,
 		},
 		{
 			name:  "rejects content replacement with unchanged status",
@@ -1756,16 +1756,39 @@ func TestPreservesWorktreeProgressRequiresContentAndCommitEvidence(t *testing.T)
 		},
 		{
 			name:  "accepts a clean descendant containing the recorded contents",
-			after: worktreeProgress{HeadSHA: "committed-head", Branch: "feature/test", ContentFingerprint: "before-content", HeadDescendsFromCompare: true},
+			after: worktreeProgress{HeadSHA: "committed-head", Branch: "feature/test", ContentFingerprint: "before-content", ContentFingerprintVersion: worktreeFingerprintVersion, HeadDescendsFromCompare: true},
 			want:  true,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			progress := before
-			if tc.name == "preserves an unchanged legacy status-only checkpoint after upgrade" {
+			if tc.name == "rejects an unchanged legacy status-only checkpoint after upgrade" {
 				progress.ContentFingerprint = ""
+				progress.ContentFingerprintVersion = ""
 			}
 			if got := preservesWorktreeProgress(progress, tc.after); got != tc.want {
+				t.Fatalf("preservesWorktreeProgress() = %t, want %t", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestPreservesWorktreeProgressRequiresCleanHeadEvidence(t *testing.T) {
+	t.Parallel()
+	before := worktreeProgress{HeadSHA: "before-head", Branch: "feature/test", ContentFingerprint: "clean-content", ContentFingerprintVersion: worktreeFingerprintVersion, IndexFingerprint: "clean-index"}
+	for _, tc := range []struct {
+		name  string
+		after worktreeProgress
+		want  bool
+	}{
+		{name: "same clean head", after: worktreeProgress{HeadSHA: "before-head", Branch: "feature/test", ContentFingerprint: "clean-content", ContentFingerprintVersion: worktreeFingerprintVersion, IndexFingerprint: "clean-index"}, want: true},
+		{name: "same clean head rejects legacy evidence", after: worktreeProgress{HeadSHA: "before-head", Branch: "feature/test"}, want: false},
+		{name: "unrelated clean head", after: worktreeProgress{HeadSHA: "other-head", Branch: "feature/test", ContentFingerprint: "clean-content", ContentFingerprintVersion: worktreeFingerprintVersion, IndexFingerprint: "clean-index"}, want: false},
+		{name: "descendant clean head", after: worktreeProgress{HeadSHA: "descendant-head", Branch: "feature/test", ContentFingerprint: "different-clean-content", ContentFingerprintVersion: worktreeFingerprintVersion, IndexFingerprint: "different-clean-index", HeadDescendsFromCompare: true}, want: true},
+		{name: "different branch descendant", after: worktreeProgress{HeadSHA: "descendant-head", Branch: "other-branch", HeadDescendsFromCompare: true}, want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := preservesWorktreeProgress(before, tc.after); got != tc.want {
 				t.Fatalf("preservesWorktreeProgress() = %t, want %t", got, tc.want)
 			}
 		})

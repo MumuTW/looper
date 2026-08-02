@@ -55,6 +55,10 @@ const (
 	defaultRetryDelay       = 5 * time.Second
 	defaultRetryMax         = 3
 	defaultIssueLimit       = 30
+	// Keep in lockstep with internal/infra/git.WorktreeFingerprintVersion; this
+	// package owns the persisted checkpoint comparison without importing the
+	// concrete gateway implementation.
+	worktreeFingerprintVersion = "v2"
 	personalIssueQueryLimit = 100
 
 	workerBranchSlugMaxLength        = 30
@@ -313,16 +317,18 @@ type InspectHeadInput struct {
 }
 
 type InspectHeadResult struct {
-	HeadSHA               string
-	Branch                string
-	NewCommitSHAs         []string
-	HasUncommittedChanges bool
-	ChangedFiles          []string
-	StagedFiles           []string
-	UntrackedFiles        []string
-	DiffFingerprint       string
-	ContentFingerprint    string
-	HeadDescendsFromCompare bool
+	HeadSHA                  string
+	Branch                   string
+	NewCommitSHAs            []string
+	HasUncommittedChanges    bool
+	ChangedFiles             []string
+	StagedFiles              []string
+	UntrackedFiles           []string
+	DiffFingerprint          string
+	ContentFingerprint       string
+	ContentFingerprintVersion string
+	IndexFingerprint         string
+	HeadDescendsFromCompare  bool
 }
 
 type VerifyWorktreeIdentityInput struct {
@@ -701,21 +707,23 @@ type checkpointExecution struct {
 // content. It is captured immediately before an executor timeout terminates
 // the process group, so a retry can prove what it inherited.
 type worktreeProgress struct {
-	HeadSHA            string   `json:"headSha,omitempty"`
-	WorktreeID         string   `json:"worktreeId,omitempty"`
-	Branch             string   `json:"branch,omitempty"`
-	ChangedFiles       []string `json:"changedFiles,omitempty"`
-	ChangedFileCount   int      `json:"changedFileCount"`
-	StagedFiles        []string `json:"stagedFiles,omitempty"`
-	StagedFileCount    int      `json:"stagedFileCount"`
-	UntrackedFiles     []string `json:"untrackedFiles,omitempty"`
-	UntrackedFileCount int      `json:"untrackedFileCount"`
-	DiffFingerprint    string   `json:"diffFingerprint,omitempty"`
-	ContentFingerprint      string   `json:"contentFingerprint,omitempty"`
-	HeadDescendsFromCompare bool     `json:"-"`
-	TimeoutType        string   `json:"timeoutType,omitempty"`
-	LastProgressAt     string   `json:"lastProgressAt,omitempty"`
-	CapturedAt         string   `json:"capturedAt,omitempty"`
+	HeadSHA                   string   `json:"headSha,omitempty"`
+	WorktreeID                string   `json:"worktreeId,omitempty"`
+	Branch                    string   `json:"branch,omitempty"`
+	ChangedFiles              []string `json:"changedFiles,omitempty"`
+	ChangedFileCount          int      `json:"changedFileCount"`
+	StagedFiles               []string `json:"stagedFiles,omitempty"`
+	StagedFileCount           int      `json:"stagedFileCount"`
+	UntrackedFiles            []string `json:"untrackedFiles,omitempty"`
+	UntrackedFileCount        int      `json:"untrackedFileCount"`
+	DiffFingerprint           string   `json:"diffFingerprint,omitempty"`
+	ContentFingerprint        string   `json:"contentFingerprint,omitempty"`
+	ContentFingerprintVersion string   `json:"contentFingerprintVersion,omitempty"`
+	IndexFingerprint          string   `json:"indexFingerprint,omitempty"`
+	HeadDescendsFromCompare   bool     `json:"-"`
+	TimeoutType               string   `json:"timeoutType,omitempty"`
+	LastProgressAt            string   `json:"lastProgressAt,omitempty"`
+	CapturedAt                string   `json:"capturedAt,omitempty"`
 }
 
 type checkpointPullPR struct {
@@ -2499,7 +2507,9 @@ func (r *Runner) captureWorktreeProgress(ctx context.Context, project storage.Pr
 		StagedFileCount:    len(inspect.StagedFiles),
 		UntrackedFiles:     boundPathList(inspect.UntrackedFiles, worktreeProgressPathCap),
 		UntrackedFileCount: len(inspect.UntrackedFiles),
-		DiffFingerprint:    inspect.DiffFingerprint, ContentFingerprint: inspect.ContentFingerprint, HeadDescendsFromCompare: inspect.HeadDescendsFromCompare,
+		DiffFingerprint: inspect.DiffFingerprint, ContentFingerprint: inspect.ContentFingerprint,
+		ContentFingerprintVersion: firstNonEmpty(inspect.ContentFingerprintVersion, worktreeFingerprintVersion),
+		IndexFingerprint:          inspect.IndexFingerprint, HeadDescendsFromCompare: inspect.HeadDescendsFromCompare,
 		TimeoutType:        observation.TimeoutType,
 		LastProgressAt:     observation.LastProgressAt,
 		CapturedAt:         eventlog.FormatJavaScriptISOString(r.now().UTC()),
@@ -2548,28 +2558,34 @@ func (r *Runner) verifyTimeoutProgressBeforeReplacement(ctx context.Context, pro
 }
 
 func sameWorktreeProgress(before, after worktreeProgress) bool {
-	return before.HeadSHA == after.HeadSHA && before.Branch == after.Branch && before.DiffFingerprint == after.DiffFingerprint
+	return before.HeadSHA == after.HeadSHA && before.Branch == after.Branch && before.DiffFingerprint == after.DiffFingerprint && before.ContentFingerprintVersion == after.ContentFingerprintVersion && before.ContentFingerprint != "" && before.ContentFingerprint == after.ContentFingerprint && before.IndexFingerprint == after.IndexFingerprint && equalStringSlices(before.ChangedFiles, after.ChangedFiles) && equalStringSlices(before.StagedFiles, after.StagedFiles) && equalStringSlices(before.UntrackedFiles, after.UntrackedFiles)
 }
 
 func preservesWorktreeProgress(before, after worktreeProgress) bool {
 	if before.ChangedFileCount == 0 {
-		return true
+		if before.Branch != after.Branch || before.HeadSHA == "" || after.HeadSHA == "" {
+			return false
+		}
+		if before.HeadSHA == after.HeadSHA {
+			// A clean snapshot still needs a same-head proof. A stale clean
+			// checkout must not be treated as preserved merely because it has no
+			// changed paths to hash.
+			return before.ContentFingerprintVersion == worktreeFingerprintVersion && after.ContentFingerprintVersion == worktreeFingerprintVersion && before.ContentFingerprint != "" && before.ContentFingerprint == after.ContentFingerprint && before.IndexFingerprint != "" && before.IndexFingerprint == after.IndexFingerprint
+		}
+		// A clean timeout snapshot may have been committed before retry. Accept
+		// only a descendant of the recorded head on the same branch.
+		return before.ContentFingerprintVersion == worktreeFingerprintVersion && after.ContentFingerprintVersion == worktreeFingerprintVersion && before.ContentFingerprint != "" && after.ContentFingerprint != "" && after.HeadDescendsFromCompare
 	}
-	// Checkpoints written before content fingerprints existed retain the
-	// established status-based comparison for this retry. A later timeout
-	// overwrites that legacy snapshot with content evidence; rejecting it here
-	// would turn a daemon upgrade into a false lost-progress intervention.
-	if before.ContentFingerprint == "" {
-		return sameLegacyWorktreeProgress(before, after)
+	// Checkpoints written before the versioned content/index evidence existed
+	// cannot prove that predecessor edits survived. Stop for operator review
+	// rather than authorizing a replacement from status-only equality.
+	if before.ContentFingerprintVersion != worktreeFingerprintVersion || before.ContentFingerprint == "" {
+		return false
 	}
 	if sameWorktreeProgress(before, after) {
 		return true
 	}
-	return before.HeadSHA != "" && after.HeadSHA != "" && before.HeadSHA != after.HeadSHA && after.ChangedFileCount == 0 && after.HeadDescendsFromCompare && before.ContentFingerprint == after.ContentFingerprint
-}
-
-func sameLegacyWorktreeProgress(before, after worktreeProgress) bool {
-	return before.HeadSHA == after.HeadSHA && before.Branch == after.Branch && before.DiffFingerprint == after.DiffFingerprint && equalStringSlices(before.ChangedFiles, after.ChangedFiles) && equalStringSlices(before.StagedFiles, after.StagedFiles) && equalStringSlices(before.UntrackedFiles, after.UntrackedFiles)
+	return before.HeadSHA != "" && after.HeadSHA != "" && before.HeadSHA != after.HeadSHA && before.Branch == after.Branch && after.ChangedFileCount == 0 && after.HeadDescendsFromCompare && after.ContentFingerprintVersion == worktreeFingerprintVersion && before.ContentFingerprint == after.ContentFingerprint
 }
 
 func equalStringSlices(left, right []string) bool {

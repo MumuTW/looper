@@ -7283,8 +7283,18 @@ func assertNoActiveSiblingPRWorktreeLoops(existing []storage.LoopRecord, candida
 // local changes without creating a replacement queue item.
 func (h *Handler) assertLoopRetryPreconditions(ctx context.Context, repos *storage.Repositories, loop storage.LoopRecord, nowISO string) error {
 	if strings.TrimSpace(loop.ProjectID) != "" {
-		if _, err := requireActiveProjectRecord(ctx, repos.Projects, loop.ProjectID); err != nil {
+		project, err := requireActiveProjectRecord(ctx, repos.Projects, loop.ProjectID)
+		if err != nil {
 			return err
+		}
+		if project != nil {
+			// A legacy project can remain in SQLite while config validation has
+			// quarantined it from scheduler claims. Explicit retry must enforce the
+			// same coding-role admission or it would publish a queue item no worker
+			// can claim.
+			if err := h.validateCodingProjectRunnable(*project, domain.LoopType(loop.Type)); err != nil {
+				return err
+			}
 		}
 	}
 	if loop.Status == string(domain.LoopStatusStopped) || loop.Status == string(domain.LoopStatusTerminated) || loop.Status == string(domain.LoopStatusCompleted) {

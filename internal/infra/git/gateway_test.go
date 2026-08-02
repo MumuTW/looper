@@ -263,6 +263,213 @@ func TestParseStatusResultRejectsTruncatedOutput(t *testing.T) {
 	}
 }
 
+func TestGatewayInspectHeadContentFingerprintIncludesExecutableMode(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	fixture := newFixture(t)
+	fixture.createMainOnlyRepo(t)
+	gateway := fixture.gateway()
+
+	scriptPath := filepath.Join(fixture.repoPath, "script.sh")
+	writeFile(t, scriptPath, "#!/bin/sh\necho base\n")
+	runGit(t, fixture.repoPath, "add", "script.sh")
+	runGit(t, fixture.repoPath, "commit", "-m", "add script")
+	writeFile(t, scriptPath, "#!/bin/sh\necho changed\n")
+	if err := os.Chmod(scriptPath, 0o755); err != nil {
+		t.Fatalf("Chmod(executable) error = %v", err)
+	}
+	before, err := gateway.InspectHead(ctx, InspectHeadInput{WorktreePath: fixture.repoPath})
+	if err != nil {
+		t.Fatalf("InspectHead(before) error = %v", err)
+	}
+	if err := os.Chmod(scriptPath, 0o644); err != nil {
+		t.Fatalf("Chmod(non-executable) error = %v", err)
+	}
+	after, err := gateway.InspectHead(ctx, InspectHeadInput{WorktreePath: fixture.repoPath})
+	if err != nil {
+		t.Fatalf("InspectHead(after) error = %v", err)
+	}
+	if before.DiffFingerprint != after.DiffFingerprint {
+		t.Fatalf("status fingerprint changed for mode-only drift: before=%q after=%q", before.DiffFingerprint, after.DiffFingerprint)
+	}
+	if before.ContentFingerprint == after.ContentFingerprint {
+		t.Fatalf("content fingerprint ignored executable mode: before=%q after=%q", before.ContentFingerprint, after.ContentFingerprint)
+	}
+}
+
+func TestGatewayInspectHeadIndexFingerprintDetectsStagedBlobDrift(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	fixture := newFixture(t)
+	fixture.createMainOnlyRepo(t)
+	gateway := fixture.gateway()
+
+	path := filepath.Join(fixture.repoPath, "staged.txt")
+	writeFile(t, path, "base\n")
+	runGit(t, fixture.repoPath, "add", "staged.txt")
+	runGit(t, fixture.repoPath, "commit", "-m", "add staged file")
+	writeFile(t, path, "worktree\n")
+	runGit(t, fixture.repoPath, "add", "staged.txt")
+	writeFile(t, path, "worktree-dirty\n")
+	first, err := gateway.InspectHead(ctx, InspectHeadInput{WorktreePath: fixture.repoPath})
+	if err != nil {
+		t.Fatalf("InspectHead(first) error = %v", err)
+	}
+	// Replace only the index blob; the worktree bytes and MM status remain the
+	// same. A status/content-only digest must not authorize this transition.
+	indexFile := filepath.Join(fixture.rootDir, "alternate-index-content")
+	writeFile(t, indexFile, "index-only\n")
+	indexObject := stringsTrimSpace(runGit(t, fixture.repoPath, "hash-object", "-w", indexFile))
+	runGit(t, fixture.repoPath, "update-index", "--cacheinfo", "100644,"+indexObject+",staged.txt")
+	second, err := gateway.InspectHead(ctx, InspectHeadInput{WorktreePath: fixture.repoPath})
+	if err != nil {
+		t.Fatalf("InspectHead(second) error = %v", err)
+	}
+	if first.DiffFingerprint != second.DiffFingerprint || first.ContentFingerprint != second.ContentFingerprint {
+		t.Fatalf("status/content fingerprints changed for index-only drift: first=%#v second=%#v", first, second)
+	}
+	if first.IndexFingerprint == second.IndexFingerprint {
+		t.Fatalf("index fingerprint unchanged for staged blob drift: first=%q second=%q", first.IndexFingerprint, second.IndexFingerprint)
+	}
+}
+
+func TestGatewayInspectHeadContentFingerprintPreservesWhitespacePaths(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	fixture := newFixture(t)
+	fixture.createMainOnlyRepo(t)
+	gateway := fixture.gateway()
+
+	path := filepath.Join(fixture.repoPath, " leading.txt ")
+	writeFile(t, path, "first\n")
+	first, err := gateway.InspectHead(ctx, InspectHeadInput{WorktreePath: fixture.repoPath})
+	if err != nil {
+		t.Fatalf("InspectHead(first) error = %v", err)
+	}
+	writeFile(t, path, "second\n")
+	second, err := gateway.InspectHead(ctx, InspectHeadInput{WorktreePath: fixture.repoPath})
+	if err != nil {
+		t.Fatalf("InspectHead(second) error = %v", err)
+	}
+	if first.ContentFingerprint == second.ContentFingerprint {
+		t.Fatalf("content fingerprint ignored content change in whitespace path: first=%q second=%q", first.ContentFingerprint, second.ContentFingerprint)
+	}
+}
+
+func TestGatewayInspectHeadFingerprintsDirtySubmodule(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	fixture := newFixture(t)
+	fixture.createMainOnlyRepo(t)
+	gateway := fixture.gateway()
+
+	submoduleSource := filepath.Join(fixture.rootDir, "submodule-source")
+	mustMkdirAll(t, submoduleSource)
+	runGit(t, submoduleSource, "init", "-b", "main")
+	configureRepo(t, submoduleSource)
+	writeFile(t, filepath.Join(submoduleSource, "nested.txt"), "base\n")
+	runGit(t, submoduleSource, "add", "nested.txt")
+	runGit(t, submoduleSource, "commit", "-m", "init nested")
+	runGit(t, fixture.repoPath, "-c", "protocol.file.allow=always", "submodule", "add", submoduleSource, "modules/nested")
+	runGit(t, fixture.repoPath, "commit", "-am", "add nested module")
+
+	nestedPath := filepath.Join(fixture.repoPath, "modules", "nested", "nested.txt")
+	writeFile(t, nestedPath, "first dirty state\n")
+	first, err := gateway.InspectHead(ctx, InspectHeadInput{WorktreePath: fixture.repoPath})
+	if err != nil {
+		t.Fatalf("InspectHead(first dirty submodule) error = %v", err)
+	}
+	writeFile(t, nestedPath, "second dirty state\n")
+	second, err := gateway.InspectHead(ctx, InspectHeadInput{WorktreePath: fixture.repoPath})
+	if err != nil {
+		t.Fatalf("InspectHead(second dirty submodule) error = %v", err)
+	}
+	if got := first.ChangedFiles; len(got) != 1 || got[0] != "modules/nested" {
+		t.Fatalf("InspectHead().ChangedFiles = %#v, want dirty submodule path", got)
+	}
+	if first.ContentFingerprint == second.ContentFingerprint {
+		t.Fatalf("dirty submodule content fingerprint did not change: first=%q second=%q", first.ContentFingerprint, second.ContentFingerprint)
+	}
+}
+
+func TestGatewayInspectHeadPreservesDirtySubmoduleCommitTransition(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	fixture := newFixture(t)
+	fixture.createMainOnlyRepo(t)
+	gateway := fixture.gateway()
+
+	submoduleSource := filepath.Join(fixture.rootDir, "submodule-commit-source")
+	mustMkdirAll(t, submoduleSource)
+	runGit(t, submoduleSource, "init", "-b", "main")
+	configureRepo(t, submoduleSource)
+	nestedFile := filepath.Join(submoduleSource, "nested.txt")
+	writeFile(t, nestedFile, "base\n")
+	runGit(t, submoduleSource, "add", "nested.txt")
+	runGit(t, submoduleSource, "commit", "-m", "init nested")
+	runGit(t, fixture.repoPath, "-c", "protocol.file.allow=always", "submodule", "add", submoduleSource, "modules/nested-commit")
+	runGit(t, fixture.repoPath, "commit", "-am", "add nested module")
+
+	nestedPath := filepath.Join(fixture.repoPath, "modules", "nested-commit", "nested.txt")
+	writeFile(t, nestedPath, "committed progress\n")
+	before, err := gateway.InspectHead(ctx, InspectHeadInput{WorktreePath: fixture.repoPath})
+	if err != nil {
+		t.Fatalf("InspectHead(before dirty submodule) error = %v", err)
+	}
+	if len(before.ChangedFiles) != 1 || before.ChangedFiles[0] != "modules/nested-commit" {
+		t.Fatalf("InspectHead(before).ChangedFiles = %#v, want dirty submodule path", before.ChangedFiles)
+	}
+
+	runGit(t, filepath.Join(fixture.repoPath, "modules", "nested-commit"), "add", "nested.txt")
+	runGit(t, filepath.Join(fixture.repoPath, "modules", "nested-commit"), "commit", "-m", "persist nested progress")
+	runGit(t, fixture.repoPath, "add", "modules/nested-commit")
+	runGit(t, fixture.repoPath, "commit", "-m", "record nested progress")
+	after, err := gateway.InspectHead(ctx, InspectHeadInput{
+		WorktreePath:   fixture.repoPath,
+		ContentPaths:   before.ChangedFiles,
+		CompareHeadSHA: before.HeadSHA,
+	})
+	if err != nil {
+		t.Fatalf("InspectHead(after committed submodule) error = %v", err)
+	}
+	if after.HasUncommittedChanges {
+		t.Fatalf("InspectHead(after).HasUncommittedChanges = true, want clean descendant")
+	}
+	if !after.HeadDescendsFromCompare {
+		t.Fatalf("InspectHead(after).HeadDescendsFromCompare = false, want descendant")
+	}
+	if before.ContentFingerprint != after.ContentFingerprint {
+		t.Fatalf("submodule content fingerprint changed across dirty-to-committed transition: before=%q after=%q", before.ContentFingerprint, after.ContentFingerprint)
+	}
+}
+
+func TestGatewayInspectHeadHashesChangedFilesWithoutGitHashObjectProcesses(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	fixture := newFixture(t)
+	fixture.createMainOnlyRepo(t)
+	for _, name := range []string{"one.txt", "two.txt", "three.txt"} {
+		writeFile(t, filepath.Join(fixture.repoPath, name), name+"\n")
+	}
+	gitPath, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatalf("LookPath(git) error = %v", err)
+	}
+	wrapperPath := filepath.Join(fixture.rootDir, "git-without-hash-object")
+	wrapper := fmt.Sprintf("#!/bin/sh\nif [ \"$1\" = hash-object ]; then exit 99; fi\nexec %q \"$@\"\n", gitPath)
+	if err := os.WriteFile(wrapperPath, []byte(wrapper), 0o755); err != nil {
+		t.Fatalf("WriteFile(git wrapper) error = %v", err)
+	}
+	gateway := New(Options{GitPath: wrapperPath, Repos: fixture.repos, Now: fixture.now})
+	inspect, err := gateway.InspectHead(ctx, InspectHeadInput{WorktreePath: fixture.repoPath})
+	if err != nil {
+		t.Fatalf("InspectHead() error = %v; content hashing must not launch git hash-object per file", err)
+	}
+	if len(inspect.ChangedFiles) != 3 || inspect.ContentFingerprint == "" {
+		t.Fatalf("InspectHead() = %#v, want three hashed files", inspect)
+	}
+}
+
 func TestGatewayDetachedPRWorktreeReusesRecordAcrossBranches(t *testing.T) {
 	ctx := context.Background()
 	fixture := newFixture(t)
