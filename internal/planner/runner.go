@@ -950,33 +950,37 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	r.appendEvent(ctx, eventInput{eventType: "loop.started", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "loop", entityID: loop.ID, payload: map[string]any{"queueItemId": queueItem.ID, "resumed": resumedRun.Resumed, "startStep": string(resumedRun.StartStep)}})
 	r.appendEvent(ctx, eventInput{eventType: "run.started", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"queueItemId": queueItem.ID, "currentStep": string(resumedRun.StartStep)}})
 
-	for _, step := range stepsFrom(resumedRun.StartStep) {
-		run, err = r.persistStepStarted(ctx, run, step, checkpoint)
-		if err != nil {
-			return runpipe.ProcessResult{}, err
-		}
-		r.appendEvent(ctx, eventInput{eventType: "loop.step.started", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"step": string(step)}})
-		checkpoint, err = r.executeStep(ctx, step, stepInput{Project: *project, Loop: *loop, Run: run, QueueItem: queueItem, Checkpoint: checkpoint})
-		if err != nil {
+	engine := runpipe.StepRunner[PlannerStep, plannerCheckpoint]{
+		PersistStarted:   r.persistStepStarted,
+		PersistCompleted: r.persistStepCompleted,
+		EmitStepEvent: func(ctx context.Context, eventType string, step PlannerStep, run storage.RunRecord) {
+			r.appendEvent(ctx, eventInput{eventType: eventType, projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"step": string(step)}})
+		},
+		Execute: func(ctx context.Context, step PlannerStep, run storage.RunRecord, checkpoint plannerCheckpoint) (plannerCheckpoint, error) {
+			return r.executeStep(ctx, step, stepInput{Project: *project, Loop: *loop, Run: run, QueueItem: queueItem, Checkpoint: checkpoint})
+		},
+		OnFailure: func(ctx context.Context, step PlannerStep, run storage.RunRecord, checkpoint plannerCheckpoint, stepErr error) (runpipe.ProcessResult, bool, error) {
 			var awaiting *plannerAwaitingHumanError
-			if errors.As(err, &awaiting) {
-				return r.suspendPlannerForHuman(ctx, *loop, run, queueItem, checkpoint, awaiting)
+			if errors.As(stepErr, &awaiting) {
+				result, err := r.suspendPlannerForHuman(ctx, *loop, run, queueItem, checkpoint, awaiting)
+				return result, err == nil, err
 			}
 			var holdErr *runpipe.HoldSkipError
-			if errors.As(err, &holdErr) {
-				return r.finishHeldPlannerQueueItem(ctx, *loop, &run, queueItem, checkpoint, holdErr.Summary)
+			if errors.As(stepErr, &holdErr) {
+				result, err := r.finishHeldPlannerQueueItem(ctx, *loop, &run, queueItem, checkpoint, holdErr.Summary)
+				return result, err == nil, err
 			}
-			failure := r.classifyFailureWithBoundary(err, plannerFailureBoundaryForStep(step))
+			failure := r.classifyFailureWithBoundary(stepErr, plannerFailureBoundaryForStep(step))
 			latest := r.getLatestCheckpoint(ctx, run, checkpoint)
 			latest.ResumePolicy = loops.NormalizeResumePolicy(string(failure.Kind), latest.ResumePolicy)
 			if _, err := r.completeRun(ctx, run, "failed", failure.Message, failure.Message, latest); err != nil {
-				return runpipe.ProcessResult{}, err
+				return runpipe.ProcessResult{}, false, err
 			}
 			r.appendEvent(ctx, eventInput{eventType: "loop.step.failed", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"message": failure.Message, "failureKind": string(failure.Kind), "currentStep": derefString(run.CurrentStep)}})
 			r.appendEvent(ctx, eventInput{eventType: "run.failed", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"summary": failure.Message, "failureKind": string(failure.Kind)}})
 			failedQueue, err := r.failQueueItem(ctx, queueItem, failure.Kind, failure.Message)
 			if err != nil {
-				return runpipe.ProcessResult{}, err
+				return runpipe.ProcessResult{}, false, err
 			}
 			if _, err := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
 				updated.LastRunAt = runpipe.StringPtr(r.nowISO())
@@ -991,22 +995,25 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 					updated.NextRunAt = nil
 				}
 			}); err != nil {
-				return runpipe.ProcessResult{}, err
+				return runpipe.ProcessResult{}, false, err
 			}
-			return runpipe.ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.Message, FailureKind: failure.Kind}, nil
-		}
-		if step == stepDiscoverIssues {
-			claimedLockKey = checkpoint.ClaimedLockKey
-			acquiredClaimedLock = claimedLockKey != ""
-		}
-		run, err = r.persistStepCompleted(ctx, run, step, checkpoint)
-		if err != nil {
-			return runpipe.ProcessResult{}, err
-		}
-		r.appendEvent(ctx, eventInput{eventType: "loop.step.completed", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"step": string(step)}})
-		if checkpoint.SkipReason != "" {
-			break
-		}
+			return runpipe.ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.Message, FailureKind: failure.Kind}, true, nil
+		},
+		AfterCompleted: func(_ context.Context, step PlannerStep, checkpoint plannerCheckpoint) bool {
+			if step == stepDiscoverIssues {
+				claimedLockKey = checkpoint.ClaimedLockKey
+				acquiredClaimedLock = claimedLockKey != ""
+			}
+			return checkpoint.SkipReason != ""
+		},
+	}
+	var terminal *runpipe.ProcessResult
+	run, checkpoint, terminal, err = engine.Run(ctx, stepsFrom(resumedRun.StartStep), run, checkpoint)
+	if err != nil {
+		return runpipe.ProcessResult{}, err
+	}
+	if terminal != nil {
+		return *terminal, nil
 	}
 
 	summary := checkpoint.SkipReason
