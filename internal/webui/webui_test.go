@@ -177,9 +177,9 @@ func TestHandlerPreservesPublicBasePathPrefix(t *testing.T) {
 	t.Parallel()
 
 	handler := Handler(Options{Now: func() time.Time { return testNow }, PathPrefix: "/looper"})
-	redirect := get(t, handler, BasePath)
-	if got := redirect.Header().Get("Location"); got != "/looper/ui/triage" {
-		t.Fatalf("prefixed redirect = %q, want /looper/ui/triage", got)
+	redirect := get(t, handler, BasePath+"?refresh=off")
+	if got := redirect.Header().Get("Location"); got != "/looper/ui/triage?refresh=off" {
+		t.Fatalf("prefixed redirect = %q, want /looper/ui/triage?refresh=off", got)
 	}
 	body := get(t, handler, TriagePath).Body.String()
 	assertContains(t, body,

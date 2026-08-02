@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/MumuTW/looper/internal/domain"
@@ -38,7 +39,11 @@ type Collector struct {
 	retryAfter    int64
 	unroutedAfter time.Duration
 	staleAfter    time.Duration
+	triageMu      sync.Mutex
+	triageCursor  map[string]string
 }
+
+const triageSourceScanLimit = 64
 
 func NewCollector(repositories *storage.Repositories, links Linker, options CollectorOptions) *Collector {
 	now := options.Now
@@ -57,7 +62,7 @@ func NewCollector(repositories *storage.Repositories, links Linker, options Coll
 	if staleAfter <= 0 {
 		staleAfter = 24 * time.Hour
 	}
-	return &Collector{repositories: repositories, links: links, now: now, retryAfter: retryAfter, unroutedAfter: unroutedAfter, staleAfter: staleAfter}
+	return &Collector{repositories: repositories, links: links, now: now, retryAfter: retryAfter, unroutedAfter: unroutedAfter, staleAfter: staleAfter, triageCursor: map[string]string{}}
 }
 
 func (c *Collector) Collect(ctx context.Context) (Snapshot, error) {
@@ -215,87 +220,81 @@ func (c *Collector) collectQueue(now time.Time, records []storage.QueueItemRecor
 }
 
 func (c *Collector) collectUnroutedTriage(ctx context.Context, now time.Time, activeProjects map[string]struct{}, snapshot *Snapshot) error {
-	events, err := c.repositories.Events.ListByEntityTypeAndEventTypes(ctx, "github_issue", []string{triager.EnrollmentEventType, triager.ReportEventType, triager.ProjectionEventType, triager.RetirementEventType})
-	if err != nil {
-		return fmt.Errorf("list triage routing lifecycle: %w", err)
-	}
-	type state struct {
-		enrollment         *triager.Enrollment
-		report             *triager.Report
-		projected, retired bool
-	}
-	states := map[string]*state{}
-	stateFor := func(key string) *state {
-		if states[key] == nil {
-			states[key] = &state{}
+	for projectID := range activeProjects {
+		records, err := c.nextTriageSourceWindow(ctx, projectID)
+		if err != nil {
+			return fmt.Errorf("list triage routing lifecycle: %w", err)
 		}
-		return states[key]
-	}
-	for _, event := range events {
-		switch event.EventType {
-		case triager.EnrollmentEventType:
+		for _, record := range records {
+			if record.EnrollmentJSON == nil {
+				continue
+			}
 			var enrollment triager.Enrollment
-			if err := json.Unmarshal([]byte(event.PayloadJSON), &enrollment); err != nil {
+			if err := json.Unmarshal([]byte(*record.EnrollmentJSON), &enrollment); err != nil {
 				return fmt.Errorf("decode triage enrollment for escalator: %w", err)
 			}
-			copy := enrollment
-			stateFor(enrollment.IdempotencyKey).enrollment = &copy
-		case triager.ReportEventType:
-			var report triager.Report
-			if err := json.Unmarshal([]byte(event.PayloadJSON), &report); err != nil {
-				return fmt.Errorf("decode triage report for escalator: %w", err)
+			if enrollment.ProjectID != projectID || record.Projected || record.Retired {
+				continue
 			}
-			copy := report
-			stateFor(report.IdempotencyKey).report = &copy
-		case triager.ProjectionEventType:
-			var projection triager.Projection
-			if err := json.Unmarshal([]byte(event.PayloadJSON), &projection); err != nil {
-				return fmt.Errorf("decode triage projection for escalator: %w", err)
+			var report *triager.Report
+			if record.ReportJSON != nil {
+				var decoded triager.Report
+				if err := json.Unmarshal([]byte(*record.ReportJSON), &decoded); err != nil {
+					return fmt.Errorf("decode triage report for escalator: %w", err)
+				}
+				report = &decoded
 			}
-			stateFor(projection.ReportKey).projected = true
-		case triager.RetirementEventType:
-			var retirement triager.Retirement
-			if err := json.Unmarshal([]byte(event.PayloadJSON), &retirement); err != nil {
-				return fmt.Errorf("decode triage retirement for escalator: %w", err)
+			// Human-confirmation reports are already represented by the dedicated
+			// waiting item above. This category is specifically work that has no ask.
+			if report != nil && report.Policy.Action == triager.ActionAwaitHuman {
+				continue
 			}
-			stateFor(retirement.EnrollmentKey).retired = true
+			age, err := ageSeconds(now, enrollment.EnrolledAt)
+			if err != nil {
+				return fmt.Errorf("parse triage enrollment %s: %w", enrollment.IdempotencyKey, err)
+			}
+			if time.Duration(age)*time.Second < c.unroutedAfter {
+				continue
+			}
+			link, err := requiredLink(c.links.Issue(enrollment.ProjectID, enrollment.Repo, enrollment.IssueNumber))
+			if err != nil {
+				return fmt.Errorf("triage enrollment %s: %w", enrollment.IdempotencyKey, err)
+			}
+			detail := "No Triage report or route was persisted"
+			if report != nil {
+				detail = "A Triage report exists, but no Planner route was persisted"
+			}
+			snapshot.Items = append(snapshot.Items, newItem(itemID(ReasonTriageNotRouted, enrollment.ProjectID, enrollment.IdempotencyKey), KindStuck, ReasonTriageNotRouted, enrollment.ProjectID, "triager", fmt.Sprintf("%s#%d was enrolled but never routed", enrollment.Repo, enrollment.IssueNumber), detail, link, age, 1, enrollment.EnrolledAt, detail))
 		}
-	}
-	for key, state := range states {
-		if state.enrollment == nil || state.projected || state.retired {
-			continue
-		}
-		// Human-confirmation reports are already represented by the dedicated
-		// waiting item above. This category is specifically work that has no ask.
-		if state.report != nil && state.report.Policy.Action == triager.ActionAwaitHuman {
-			continue
-		}
-		enrollment := state.enrollment
-		if _, active := activeProjects[enrollment.ProjectID]; !active {
-			continue
-		}
-		age, err := ageSeconds(now, enrollment.EnrolledAt)
-		if err != nil {
-			return fmt.Errorf("parse triage enrollment %s: %w", key, err)
-		}
-		if time.Duration(age)*time.Second < c.unroutedAfter {
-			continue
-		}
-		link, err := requiredLink(c.links.Issue(enrollment.ProjectID, enrollment.Repo, enrollment.IssueNumber))
-		if err != nil {
-			return fmt.Errorf("triage enrollment %s: %w", key, err)
-		}
-		detail := "No Triage report or route was persisted"
-		if state.report != nil {
-			detail = "A Triage report exists, but no Planner route was persisted"
-		}
-		snapshot.Items = append(snapshot.Items, newItem(itemID(ReasonTriageNotRouted, enrollment.ProjectID, key), KindStuck, ReasonTriageNotRouted, enrollment.ProjectID, "triager", fmt.Sprintf("%s#%d was enrolled but never routed", enrollment.Repo, enrollment.IssueNumber), detail, link, age, 1, enrollment.EnrolledAt, detail))
 	}
 	return nil
 }
 
+// nextTriageSourceWindow rotates through the current triage projection. The
+// SQL aggregation retains only the enrollment/report payload and terminal
+// flags needed by this collector, so a busy repository cannot make every
+// Escalator poll reread an ever-growing event history.
+func (c *Collector) nextTriageSourceWindow(ctx context.Context, projectID string) ([]storage.TriageSourceStateRecord, error) {
+	c.triageMu.Lock()
+	if c.triageCursor == nil {
+		c.triageCursor = map[string]string{}
+	}
+	cursor := c.triageCursor[projectID]
+	c.triageMu.Unlock()
+	records, err := c.repositories.Events.ListTriageSourceStateWindow(ctx, projectID, cursor, triageSourceScanLimit)
+	if err != nil {
+		return nil, err
+	}
+	if len(records) > 0 {
+		c.triageMu.Lock()
+		c.triageCursor[projectID] = records[len(records)-1].SourceKey
+		c.triageMu.Unlock()
+	}
+	return records, nil
+}
+
 func (c *Collector) collectEligibleAdvise(ctx context.Context, now time.Time, activeProjects map[string]struct{}, snapshot *Snapshot) error {
-	events, err := c.repositories.Events.ListByEntityTypeAndEventTypes(ctx, "pull_request", []string{gatekeeper.GateReportEventType})
+	events, err := c.repositories.Events.ListLatestByEntityTypeAndEventTypes(ctx, "pull_request", []string{gatekeeper.GateReportEventType})
 	if err != nil {
 		return fmt.Errorf("list Gatekeeper reports: %w", err)
 	}

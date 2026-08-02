@@ -10,6 +10,7 @@ import (
 	"github.com/MumuTW/looper/internal/domain"
 	"github.com/MumuTW/looper/internal/escalator"
 	"github.com/MumuTW/looper/internal/gatekeeper"
+	githubinfra "github.com/MumuTW/looper/internal/infra/github"
 	"github.com/MumuTW/looper/internal/storage"
 )
 
@@ -479,6 +480,48 @@ func TestClassifyMarksGateReportForOlderHeadAsStale(t *testing.T) {
 	}
 }
 
+func TestClassifyMarksSameHeadSnapshotEvidenceAsStale(t *testing.T) {
+	t.Parallel()
+
+	const capturedAt = "2026-08-02T10:00:00.000Z"
+	summary := githubinfra.PullRequestSummary{
+		HeadSHA: "abc123", UpdatedAt: capturedAt, State: "OPEN", ReviewDecision: "APPROVED",
+		BaseRefName: "main", Labels: []string{}, BaseSHA: "base123",
+	}
+	report := report(1, true)
+	report.ObservedHeadSHA = summary.HeadSHA
+	report.SourceFingerprint = gatekeeper.SourceFingerprint(summary, false) + "\x1fdiff-budget=0,0"
+	report.Evidence.ReviewDecision = "APPROVED"
+	report.Evidence.Checks = []gatekeeper.CheckEvidence{{Name: "CI", Status: "COMPLETED", Conclusion: "SUCCESS"}}
+	report.Evidence.UnresolvedReviewThreadIDs = []string{}
+	reviewState := "CHANGES_REQUESTED"
+	detail := map[string]any{
+		"HeadSHA": "abc123", "UpdatedAt": capturedAt, "State": "OPEN", "ReviewDecision": reviewState,
+		"BaseRefName": "main", "IsDraft": false, "HasConflicts": false, "Labels": []string{},
+		"Checks": []map[string]any{{"Name": "CI", "Status": "COMPLETED", "Conclusion": "SUCCESS"}},
+	}
+	payloadJSON, err := json.Marshal(map[string]any{"detail": detail})
+	if err != nil {
+		t.Fatalf("marshal snapshot payload: %v", err)
+	}
+	current := snapshot(t, 1, payloadOptions{})
+	current.PayloadJSON = ptr(string(payloadJSON))
+	current.ReviewState = &reviewState
+	current.UnresolvedThreadCount = ptrInt64(0)
+
+	board := Classify(Input{
+		Now: testNow, Snapshots: []storage.PullRequestSnapshotRecord{current},
+		Reports: []gatekeeper.Report{report}, Links: testLinker{},
+	})
+	row, group := rowFor(t, board, 1)
+	if row.Blocker.Code != string(gatekeeper.ReasonHeadStale) || row.Blocker.Label != "evidence refreshing" {
+		t.Fatalf("same-head changed evidence blocker = %#v, want stale evidence", row.Blocker)
+	}
+	if group != GroupMachine {
+		t.Fatalf("same-head changed evidence group = %v, want machine", group)
+	}
+}
+
 func TestClassifyDropsRowWhenGatekeeperSaysPullRequestIsClosed(t *testing.T) {
 	t.Parallel()
 
@@ -573,6 +616,22 @@ func TestClassifyDoesNotCallPausedOrManualHeldWorkMachineActive(t *testing.T) {
 	_, group := rowFor(t, board, 1)
 	if group != GroupActionable {
 		t.Fatalf("paused/manual-held row group = %v, want actionable rather than machine", group)
+	}
+}
+
+func TestClassifyDoesNotCallPassiveReviewerWaitingMachineActive(t *testing.T) {
+	t.Parallel()
+
+	waiting := activeLoop(1)
+	waiting.Type = string(domain.LoopTypeReviewer)
+	waiting.Status = string(domain.LoopStatusWaiting)
+	board := Classify(Input{
+		Now: testNow, Snapshots: []storage.PullRequestSnapshotRecord{snapshot(t, 1, payloadOptions{})},
+		Loops: []storage.LoopRecord{waiting}, Links: testLinker{},
+	})
+	_, group := rowFor(t, board, 1)
+	if group != GroupActionable {
+		t.Fatalf("waiting reviewer row group = %v, want actionable rather than machine", group)
 	}
 }
 
@@ -684,6 +743,16 @@ func TestClassifySurvivesUnreadableSnapshotPayload(t *testing.T) {
 	board := Classify(Input{Now: testNow, Snapshots: []storage.PullRequestSnapshotRecord{record}, Links: testLinker{}})
 	if board.Total() != 1 {
 		t.Fatalf("row count = %d, want the row to survive an unreadable payload", board.Total())
+	}
+}
+
+func TestCountDiffCountsPlusAndMinusContentAfterFileHeaders(t *testing.T) {
+	t.Parallel()
+
+	diff := "--- a/file.go\n+++ b/file.go\n@@ -1,2 +1,2 @@\n++literal plus\n--literal minus\n+added\n-removed\n"
+	got := countDiff(diff)
+	if got.Additions != 2 || got.Deletions != 2 || !got.Known {
+		t.Fatalf("countDiff() = %#v, want 2 additions and 2 deletions", got)
 	}
 }
 

@@ -87,7 +87,11 @@ func Handler(options Options) http.Handler {
 		requestPath := NormalizePath(r.URL.Path)
 		switch {
 		case requestPath == BasePath:
-			http.Redirect(w, r, prefixedPath(options.PathPrefix, TriagePath), http.StatusFound)
+			location := prefixedPath(options.PathPrefix, TriagePath)
+			if r.URL.RawQuery != "" {
+				location += "?" + r.URL.RawQuery
+			}
+			http.Redirect(w, r, location, http.StatusFound)
 		case requestPath == TriagePath:
 			renderPage(w, r, "page.html", load, now, options.PathPrefix)
 		case requestPath == boardPath:

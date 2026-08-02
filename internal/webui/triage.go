@@ -20,6 +20,7 @@ import (
 	"github.com/MumuTW/looper/internal/domain"
 	"github.com/MumuTW/looper/internal/escalator"
 	"github.com/MumuTW/looper/internal/gatekeeper"
+	githubinfra "github.com/MumuTW/looper/internal/infra/github"
 	"github.com/MumuTW/looper/internal/storage"
 )
 
@@ -366,14 +367,103 @@ func reportForSnapshot(report *gatekeeper.Report, snapshot storage.PullRequestSn
 		return nil
 	}
 	observed, current := strings.TrimSpace(report.ObservedHeadSHA), strings.TrimSpace(snapshot.HeadSHA)
-	if observed == "" || current == "" || strings.EqualFold(observed, current) {
-		return report
+	if observed != "" && current != "" && !strings.EqualFold(observed, current) {
+		return staleSnapshotReport(report)
 	}
+
+	// A snapshot can keep the same head while reviews, holds, checks, or
+	// unresolved threads change. SourceFingerprint is Gatekeeper's authority
+	// for the list-page fields; the remaining snapshot evidence is reconciled
+	// below so an equal-head report cannot make an unevaluated state look ready.
+	payload := decodeSnapshotPayload(snapshot.PayloadJSON)
+	if reportSnapshotFingerprintChanged(*report, payload) || reportSnapshotEvidenceChanged(*report, payload, snapshot) {
+		return staleSnapshotReport(report)
+	}
+	return report
+}
+
+func staleSnapshotReport(report *gatekeeper.Report) *gatekeeper.Report {
 	stale := *report
 	stale.Status = gatekeeper.StatusBlocked
 	stale.Eligible = false
 	stale.Reasons = []gatekeeper.Reason{{Code: gatekeeper.ReasonHeadStale}}
 	return &stale
+}
+
+func reportSnapshotFingerprintChanged(report gatekeeper.Report, payload snapshotPayload) bool {
+	previous := strings.TrimSpace(report.SourceFingerprint)
+	if previous == "" || !payload.sourceFingerprintReady {
+		return false
+	}
+	budgetEnabled := sourceFingerprintIncludesBaseSHA(previous)
+	current := gatekeeper.SourceFingerprint(payload.summary, budgetEnabled)
+	return current != sourceFingerprintPrefix(previous)
+}
+
+func reportSnapshotEvidenceChanged(report gatekeeper.Report, payload snapshotPayload, snapshot storage.PullRequestSnapshotRecord) bool {
+	// Reports without the discovery fingerprint predate this reconciliation
+	// contract. Keep their existing projection semantics; a fresh Gatekeeper
+	// report carries the fingerprint and is safe to compare against captures.
+	if strings.TrimSpace(report.SourceFingerprint) == "" {
+		return false
+	}
+	if snapshot.ReviewState != nil && strings.TrimSpace(report.Evidence.ReviewDecision) != "" &&
+		!strings.EqualFold(strings.TrimSpace(*snapshot.ReviewState), strings.TrimSpace(report.Evidence.ReviewDecision)) {
+		return true
+	}
+	if snapshot.UnresolvedThreadCount != nil && int64(len(report.Evidence.UnresolvedReviewThreadIDs)) != *snapshot.UnresolvedThreadCount {
+		return true
+	}
+	return requiredChecksChanged(report.Evidence.Checks, payload.checks)
+}
+
+func requiredChecksChanged(expected []gatekeeper.CheckEvidence, observed []map[string]any) bool {
+	if len(expected) == 0 || len(observed) == 0 {
+		return false
+	}
+	for _, want := range expected {
+		found := false
+		for _, check := range observed {
+			name := payloadString(check, "name", "Name", "context", "Context")
+			if !strings.EqualFold(strings.TrimSpace(name), strings.TrimSpace(want.Name)) {
+				continue
+			}
+			if want.AppID != 0 {
+				appID := payloadInt64(check, "appId", "AppID", "appID")
+				if appID != 0 && appID != want.AppID {
+					continue
+				}
+			}
+			found = true
+			status := payloadString(check, "status", "Status", "state", "State")
+			conclusion := payloadString(check, "conclusion", "Conclusion")
+			if want.Status != "" && !strings.EqualFold(strings.TrimSpace(want.Status), strings.TrimSpace(status)) {
+				return true
+			}
+			if want.Conclusion != "" && !strings.EqualFold(strings.TrimSpace(want.Conclusion), strings.TrimSpace(conclusion)) {
+				return true
+			}
+			break
+		}
+		// A missing check is the same evidence as a report whose required check
+		// has no matching provider run; only a previously observed run becoming
+		// absent invalidates the report here.
+		if !found && (strings.TrimSpace(want.Status) != "" || strings.TrimSpace(want.Conclusion) != "") {
+			return true
+		}
+	}
+	return false
+}
+
+func sourceFingerprintPrefix(value string) string {
+	if index := strings.Index(value, "\x1fdiff-budget="); index >= 0 {
+		return value[:index]
+	}
+	return value
+}
+
+func sourceFingerprintIncludesBaseSHA(value string) bool {
+	return len(strings.Split(sourceFingerprintPrefix(value), "\x1f")) >= 9
 }
 
 func reportHasReason(report *gatekeeper.Report, code gatekeeper.ReasonCode) bool {
@@ -830,9 +920,12 @@ func (d DiffSize) Detail() string {
 }
 
 type snapshotPayload struct {
-	draft     bool
-	conflicts bool
-	diff      DiffSize
+	draft                  bool
+	conflicts              bool
+	diff                   DiffSize
+	summary                githubinfra.PullRequestSummary
+	sourceFingerprintReady bool
+	checks                 []map[string]any
 }
 
 // decodeSnapshotPayload reads the capture payload written by the GitHub
@@ -854,9 +947,30 @@ func decodeSnapshotPayload(raw *string) snapshotPayload {
 	out := snapshotPayload{
 		draft:     payloadBool(parsed.Detail, "isDraft", "IsDraft"),
 		conflicts: payloadBool(parsed.Detail, "hasConflicts", "HasConflicts"),
+		checks:    payloadObjects(parsed.Detail, "checks", "Checks"),
 	}
+	out.summary = githubinfra.PullRequestSummary{
+		HeadSHA:        payloadString(parsed.Detail, "headSHA", "HeadSHA", "headRefOid", "HeadRefOid"),
+		UpdatedAt:      payloadString(parsed.Detail, "updatedAt", "UpdatedAt"),
+		State:          payloadString(parsed.Detail, "state", "State"),
+		ReviewDecision: payloadString(parsed.Detail, "reviewDecision", "ReviewDecision"),
+		BaseRefName:    payloadString(parsed.Detail, "baseRefName", "BaseRefName"),
+		IsDraft:        out.draft,
+		HasConflicts:   out.conflicts,
+		Labels:         payloadStrings(parsed.Detail, "labels", "Labels"),
+		BaseSHA:        payloadString(parsed.Detail, "baseSHA", "BaseSHA", "baseRefOid", "BaseRefOid"),
+	}
+	out.sourceFingerprintReady = payloadHas(parsed.Detail, "headSHA", "HeadSHA", "headRefOid", "HeadRefOid") &&
+		payloadHas(parsed.Detail, "updatedAt", "UpdatedAt") &&
+		payloadHas(parsed.Detail, "state", "State") &&
+		payloadHas(parsed.Detail, "reviewDecision", "ReviewDecision") &&
+		payloadHas(parsed.Detail, "baseRefName", "BaseRefName") &&
+		payloadHas(parsed.Detail, "isDraft", "IsDraft") &&
+		payloadHas(parsed.Detail, "hasConflicts", "HasConflicts") &&
+		payloadHas(parsed.Detail, "labels", "Labels")
 	if !out.conflicts && strings.EqualFold(payloadString(parsed.Detail, "mergeStateStatus", "MergeableState"), "DIRTY") {
 		out.conflicts = true
+		out.summary.HasConflicts = true
 	}
 	if parsed.Diff != "" {
 		out.diff = countDiff(parsed.Diff)
@@ -869,6 +983,7 @@ func decodeSnapshotPayload(raw *string) snapshotPayload {
 // the file headers (+++/---) are the only ambiguity worth excluding.
 func countDiff(diff string) DiffSize {
 	size := DiffSize{Known: true}
+	inHunk := false
 	for len(diff) > 0 {
 		line := diff
 		if index := strings.IndexByte(diff, '\n'); index >= 0 {
@@ -876,8 +991,12 @@ func countDiff(diff string) DiffSize {
 		} else {
 			diff = ""
 		}
+		if strings.HasPrefix(line, "@@") {
+			inHunk = true
+			continue
+		}
 		switch {
-		case strings.HasPrefix(line, "+++"), strings.HasPrefix(line, "---"):
+		case !inHunk && (strings.HasPrefix(line, "+++") || strings.HasPrefix(line, "---")):
 		case strings.HasPrefix(line, "+"):
 			size.Additions++
 		case strings.HasPrefix(line, "-"):
@@ -894,6 +1013,63 @@ func payloadBool(detail map[string]any, keys ...string) bool {
 		}
 	}
 	return false
+}
+
+func payloadHas(detail map[string]any, keys ...string) bool {
+	for _, key := range keys {
+		if _, ok := detail[key]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func payloadInt64(detail map[string]any, keys ...string) int64 {
+	for _, key := range keys {
+		switch value := detail[key].(type) {
+		case float64:
+			return int64(value)
+		case int64:
+			return value
+		case int:
+			return int64(value)
+		}
+	}
+	return 0
+}
+
+func payloadStrings(detail map[string]any, keys ...string) []string {
+	for _, key := range keys {
+		values, ok := detail[key].([]any)
+		if !ok {
+			continue
+		}
+		out := make([]string, 0, len(values))
+		for _, value := range values {
+			if text, ok := value.(string); ok {
+				out = append(out, text)
+			}
+		}
+		return out
+	}
+	return nil
+}
+
+func payloadObjects(detail map[string]any, keys ...string) []map[string]any {
+	for _, key := range keys {
+		values, ok := detail[key].([]any)
+		if !ok {
+			continue
+		}
+		out := make([]map[string]any, 0, len(values))
+		for _, value := range values {
+			if object, ok := value.(map[string]any); ok {
+				out = append(out, object)
+			}
+		}
+		return out
+	}
+	return nil
 }
 
 func payloadString(detail map[string]any, keys ...string) string {
@@ -1073,7 +1249,7 @@ func queueSettled(status string) bool {
 // must not make the board claim that the machine is advancing it.
 func machineLoopStatus(status string) bool {
 	switch domain.LoopStatus(status) {
-	case domain.LoopStatusIdle, domain.LoopStatusQueued, domain.LoopStatusRunning, domain.LoopStatusWaiting:
+	case domain.LoopStatusIdle, domain.LoopStatusQueued, domain.LoopStatusRunning:
 		return true
 	default:
 		return false
