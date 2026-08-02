@@ -156,6 +156,9 @@ type Outcome struct {
 	Vendor string
 	// BrownoutProbe is true only when the spawn was admitted during half-open.
 	BrownoutProbe bool
+	// BrownoutStickySnapshot is true when this outcome belongs to a retry using
+	// a persisted vendor snapshot rather than the current live role config.
+	BrownoutStickySnapshot bool
 	// Status is the executor's terminal status ("completed", "failed",
 	// "timeout").
 	Status string
@@ -636,10 +639,11 @@ func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Executi
 	var lease SpawnLease
 	if e.owner != nil {
 		lease, err = e.owner.AdmitSpawn(ctx, SpawnMeta{
-			LoopID:      input.LoopID,
-			RunID:       input.RunID,
-			ExecutionID: executionID,
-			Vendor:      string(cfg.Vendor),
+			LoopID:                 input.LoopID,
+			RunID:                  input.RunID,
+			ExecutionID:            executionID,
+			Vendor:                 string(cfg.Vendor),
+			BrownoutStickySnapshot: input.UseSnapshot && strings.TrimSpace(input.SnapshotVendor) != "",
 		})
 		if err != nil {
 			return nil, err
@@ -1361,13 +1365,14 @@ func (x *execution) reportOutcome(status, parseStatus, completionPayload, stdout
 		succeeded = succeeded && parseStatus == "parsed" && validMarkerOutcome(completionPayload)
 	}
 	x.executor.onOutcome(Outcome{
-		ProjectID:     x.input.ProjectID,
-		LoopID:        x.input.LoopID,
-		RunID:         x.input.RunID,
-		ExecutionID:   x.executionID,
-		Vendor:        string(x.executor.effectiveConfig(x.input).Vendor),
-		BrownoutProbe: x.input.BrownoutProbe,
-		Status:        status,
+		ProjectID:              x.input.ProjectID,
+		LoopID:                 x.input.LoopID,
+		RunID:                  x.input.RunID,
+		ExecutionID:            x.executionID,
+		Vendor:                 string(x.executor.effectiveConfig(x.input).Vendor),
+		BrownoutProbe:          x.input.BrownoutProbe,
+		BrownoutStickySnapshot: x.input.UseSnapshot && strings.TrimSpace(x.input.SnapshotVendor) != "",
+		Status:                 status,
 		// A zero exit code is not a valid agent completion by itself. The selected
 		// structured output contract is the executor's completion authority;
 		// missing or malformed output must feed the health gate as a failure so

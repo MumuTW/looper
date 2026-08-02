@@ -34,6 +34,9 @@ type SpawnMeta struct {
 	// released before an outcome can be reported, such as cmd.Start failure or
 	// an operator kill.
 	BrownoutProbeRelease func()
+	// BrownoutStickySnapshot marks a retry that must use its persisted agent
+	// snapshot even when that vendor is no longer in live configuration.
+	BrownoutStickySnapshot bool
 }
 
 // SoftKillFunc notifies a running agent execution of an external stop so status

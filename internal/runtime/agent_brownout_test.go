@@ -257,6 +257,35 @@ func TestAgentBrownoutReleasesProbeWhenSpawnLeaseEndsWithoutOutcome(t *testing.T
 	replacement.Release()
 }
 
+func TestAgentBrownoutAdmitsStickySnapshotAfterVendorRemoval(t *testing.T) {
+	rt, _ := brownoutRuntime(t, nil)
+	codex := config.AgentVendorCodex
+	claude := config.AgentVendorClaudeCode
+	configured := rt.Config()
+	configured.Agent.Vendor = &codex
+	configured.Roles.Worker.Agent = &config.RoleAgentConfig{Vendor: &claude}
+	rt.publishCatalogConsumers(configured)
+
+	removed := configured
+	removed.Agent.Vendor = nil
+	rt.publishCatalogConsumers(removed)
+
+	sticky, err := rt.activeExecutions.AdmitSpawn(context.Background(), agent.SpawnMeta{
+		LoopID: "sticky-loop", RunID: "sticky-run", ExecutionID: "sticky-exec", Vendor: string(codex),
+		BrownoutStickySnapshot: true,
+	})
+	if err != nil {
+		t.Fatalf("sticky snapshot spawn = %v, want old vendor admitted through its preserved health bucket", err)
+	}
+	sticky.Release()
+
+	if _, err := rt.activeExecutions.AdmitSpawn(context.Background(), agent.SpawnMeta{
+		LoopID: "live-loop", RunID: "live-run", ExecutionID: "live-exec", Vendor: string(codex),
+	}); !errors.Is(err, brownout.ErrOpen) {
+		t.Fatalf("ordinary spawn for removed vendor = %v, want provider admission refusal", err)
+	}
+}
+
 func TestWorktreeCleanupContinuesDuringAgentBrownout(t *testing.T) {
 	fixture := newWorktreeCleanupFixture(t)
 	for i := 0; i < fixture.config.Scheduler.AgentBrownout.MinFailures; i++ {

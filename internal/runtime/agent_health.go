@@ -30,13 +30,18 @@ type agentHealthRegistry struct {
 	configured        bool
 	configuredVendors map[string]struct{}
 	breakers          map[string]*brownout.Breaker
+	// stickyBreakers retain health state for vendors referenced by a sticky
+	// retry after live configuration removes them. They are never included in
+	// AllowAny or aggregate status, so an obsolete vendor cannot bypass the
+	// active-provider brownout gate.
+	stickyBreakers map[string]*brownout.Breaker
 }
 
 func newAgentHealthRegistry(cfg brownout.Config, daemonCfg config.Config, now func() time.Time, onChange func(string, brownout.Transition), onWarning func(string)) *agentHealthRegistry {
 	if now == nil {
 		now = time.Now
 	}
-	r := &agentHealthRegistry{now: now, onChange: onChange, onWarning: onWarning, cfg: cfg, configuredVendors: make(map[string]struct{}), breakers: make(map[string]*brownout.Breaker)}
+	r := &agentHealthRegistry{now: now, onChange: onChange, onWarning: onWarning, cfg: cfg, configuredVendors: make(map[string]struct{}), breakers: make(map[string]*brownout.Breaker), stickyBreakers: make(map[string]*brownout.Breaker)}
 	r.ensureConfiguredVendorsLocked(daemonCfg)
 	if len(r.breakers) == 0 {
 		r.ensureBreakerLocked(defaultAgentHealthVendor)
@@ -59,7 +64,13 @@ func (r *agentHealthRegistry) ensureConfiguredVendorsLocked(cfg config.Config) {
 			continue
 		}
 		if _, ok := activeVendors[vendor]; !ok {
+			r.stickyBreakers[vendor] = r.breakers[vendor]
 			delete(r.breakers, vendor)
+		}
+	}
+	for vendor := range r.stickyBreakers {
+		if _, ok := activeVendors[vendor]; ok {
+			delete(r.stickyBreakers, vendor)
 		}
 	}
 	r.configured = configured
@@ -87,6 +98,27 @@ func (r *agentHealthRegistry) ensureBreakerLocked(vendor string) *brownout.Break
 		}
 	})
 	r.breakers[key] = breaker
+	return breaker
+}
+
+func (r *agentHealthRegistry) ensureSnapshotBreakerLocked(vendor string) *brownout.Breaker {
+	key := strings.TrimSpace(vendor)
+	if key == "" {
+		key = defaultAgentHealthVendor
+	}
+	if breaker := r.breakers[key]; breaker != nil {
+		return breaker
+	}
+	if breaker := r.stickyBreakers[key]; breaker != nil {
+		return breaker
+	}
+	keyCopy := key
+	breaker := brownout.New(r.cfg, r.now, func(transition brownout.Transition) {
+		if r.onChange != nil {
+			r.onChange(keyCopy, transition)
+		}
+	})
+	r.stickyBreakers[key] = breaker
 	return breaker
 }
 
@@ -151,6 +183,22 @@ func (r *agentHealthRegistry) AllowAdmission(vendor string) (bool, error) {
 	return breaker.AllowAdmission()
 }
 
+// AllowSnapshotAdmission admits a sticky retry through the breaker that owns
+// its persisted vendor, even when that vendor is no longer live-configured.
+// Snapshot-only breakers stay outside the active-provider aggregate so this
+// exception cannot make AllowAny bypass an outage in current providers.
+func (r *agentHealthRegistry) AllowSnapshotAdmission(vendor string) (bool, error) {
+	if r == nil {
+		return false, nil
+	}
+	r.gateMu.Lock()
+	defer r.gateMu.Unlock()
+	r.mu.Lock()
+	breaker := r.ensureSnapshotBreakerLocked(vendor)
+	r.mu.Unlock()
+	return breaker.AllowAdmission()
+}
+
 // ReleaseAdmission returns a half-open reservation whose spawn lease ended
 // before a terminal outcome. It is intentionally a no-op for a provider that
 // was removed during a config reload: that breaker is no longer an admission
@@ -175,6 +223,9 @@ func (r *agentHealthRegistry) releaseAdmissionLocked(vendor string) {
 		}
 	}
 	breaker := r.breakers[key]
+	if breaker == nil {
+		breaker = r.stickyBreakers[key]
+	}
 	r.mu.Unlock()
 	if breaker != nil {
 		breaker.ReleaseProbe()
@@ -226,7 +277,7 @@ func (r *agentHealthRegistry) WithAny(fn func()) error {
 	return firstErr
 }
 
-func (r *agentHealthRegistry) Record(vendor string, startedAt time.Time, ok, probe bool) {
+func (r *agentHealthRegistry) Record(vendor string, startedAt time.Time, ok, probe, stickySnapshot bool) {
 	if r == nil {
 		return
 	}
@@ -249,7 +300,7 @@ func (r *agentHealthRegistry) Record(vendor string, startedAt time.Time, ok, pro
 			return
 		}
 	}
-	if !r.vendorActive(vendor) {
+	if !stickySnapshot && !r.vendorActive(vendor) {
 		if probe {
 			r.releaseAdmissionLocked(vendor)
 		}
@@ -259,7 +310,14 @@ func (r *agentHealthRegistry) Record(vendor string, startedAt time.Time, ok, pro
 		}
 		return
 	}
-	breaker := r.breaker(vendor)
+	r.mu.Lock()
+	var breaker *brownout.Breaker
+	if stickySnapshot {
+		breaker = r.ensureSnapshotBreakerLocked(vendor)
+	} else {
+		breaker = r.ensureBreakerLocked(vendor)
+	}
+	r.mu.Unlock()
 	// Legacy/default outcomes may carry a timestamp but no spawn token. Let the
 	// breaker validate that timestamp against its half-open boundary; configured
 	// providers must carry the explicit token from the common spawn lease.
@@ -284,6 +342,9 @@ func (r *agentHealthRegistry) SetConfig(cfg brownout.Config, daemonCfg config.Co
 	}
 	breakers := make([]*brownout.Breaker, 0, len(r.breakers))
 	for _, breaker := range r.breakers {
+		breakers = append(breakers, breaker)
+	}
+	for _, breaker := range r.stickyBreakers {
 		breakers = append(breakers, breaker)
 	}
 	r.mu.Unlock()
