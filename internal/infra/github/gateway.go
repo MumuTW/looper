@@ -578,7 +578,10 @@ type VerifyReviewMarkerInput struct {
 	AllowedReviewEvents []string
 	AuthorLogin         string
 	AllowCleanComment   bool
-	CWD                 string
+	// SkipInlineComments skips the review-comments fetch when the caller only
+	// needs marker presence and outcome (Gatekeeper auto mode).
+	SkipInlineComments bool
+	CWD                string
 }
 
 type ReviewMarkerResult struct {
@@ -2898,7 +2901,7 @@ func (g *Gateway) FindReviewMarker(ctx context.Context, input VerifyReviewMarker
 		return ReviewMarkerResult{}, err
 	}
 	marker := findAllowedReviewMarker(reviewsResult.Stdout, input.Marker, input.AllowedReviewEvents, input.AuthorLogin, input.AllowCleanComment)
-	if marker.Found && marker.ReviewID != "" {
+	if marker.Found && marker.ReviewID != "" && !input.SkipInlineComments {
 		comments, err := g.fetchReviewCommentBodies(ctx, input.Repo, input.PRNumber, marker.ReviewID, input.CWD)
 		if err != nil {
 			return ReviewMarkerResult{}, err

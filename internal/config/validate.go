@@ -269,6 +269,7 @@ func validateCoreConfig(config Config, issues *[]ValidationIssue) {
 	validateHITLConfig(config.HITL, issues)
 	validateGatekeeperRoleConfig(config.Roles.Gatekeeper, "roles.gatekeeper", config.Roles.Reviewer.AutoMerge.Enabled, issues)
 	validateAuditorRoleConfig(config.Roles.Auditor, "roles.auditor", issues)
+	validateAuditorGatekeeperCompatibility(config, issues)
 	validateDeployerRoleConfig(config.Roles.Deployer, "roles.deployer", issues)
 	validateEscalatorRoleConfig(config.Roles.Escalator, "roles.escalator", issues)
 	for i, project := range config.Projects {
@@ -335,6 +336,43 @@ func validateEscalatorRoleConfig(role EscalatorRoleConfig, path string, issues *
 func validateAuditorRoleConfig(auditor AuditorRoleConfig, path string, issues *[]ValidationIssue) {
 	if auditor.Enabled && auditor.WindowMinutes <= 0 {
 		*issues = append(*issues, ValidationIssue{Path: path + ".windowMinutes", Message: "must be a positive integer when auditor is enabled"})
+	}
+}
+
+func gatekeeperTrustIsAuto(trust GatekeeperTrustLevel) bool {
+	return GatekeeperTrustLevel(strings.ToLower(strings.TrimSpace(string(trust)))) == GatekeeperTrustAuto
+}
+
+const auditorGatekeeperAutoConflictMessage = "requires Gatekeeper merge-outcome events or forge-observed merges; gatekeeper trust auto publishes commit status only and does not emit merge outcomes — disable auditor or use gatekeeper trust observe/advise until forge-observed merge evidence is implemented"
+
+// validateAuditorGatekeeperCompatibility rejects auditor enabled together with
+// gatekeeper auto on the same effective project scope. Auto trust is
+// status-only; Auditor still reads MergeOutcome events Gatekeeper no longer
+// emits.
+func validateAuditorGatekeeperCompatibility(config Config, issues *[]ValidationIssue) {
+	if config.Roles.Auditor.Enabled && gatekeeperTrustIsAuto(config.Roles.Gatekeeper.Trust) {
+		*issues = append(*issues, ValidationIssue{
+			Path:    "roles.auditor.enabled",
+			Message: auditorGatekeeperAutoConflictMessage,
+		})
+	}
+	for i, project := range config.Projects {
+		roles := ProjectRoleConfigs(config, project.ID)
+		if !roles.Auditor.Enabled || !gatekeeperTrustIsAuto(roles.Gatekeeper.Trust) {
+			continue
+		}
+		path := fmt.Sprintf("projects[%d]", i)
+		switch {
+		case project.Roles != nil && project.Roles.Gatekeeper != nil && project.Roles.Gatekeeper.Trust != nil && gatekeeperTrustIsAuto(*project.Roles.Gatekeeper.Trust):
+			path = fmt.Sprintf("projects[%d].roles.gatekeeper.trust", i)
+		case project.Roles != nil && project.Roles.Auditor != nil && project.Roles.Auditor.Enabled != nil && *project.Roles.Auditor.Enabled:
+			path = fmt.Sprintf("projects[%d].roles.auditor.enabled", i)
+		case gatekeeperTrustIsAuto(config.Roles.Gatekeeper.Trust):
+			path = "roles.gatekeeper.trust"
+		default:
+			path = fmt.Sprintf("projects[%d].roles.auditor.enabled", i)
+		}
+		*issues = append(*issues, ValidationIssue{Path: path, Message: auditorGatekeeperAutoConflictMessage})
 	}
 }
 
@@ -512,11 +550,8 @@ func validateIntakeConfig(config Config, issues *[]ValidationIssue) {
 	*issues = append(*issues, ValidationIssue{Path: "intake.telegram.defaultProjectId", Message: fmt.Sprintf("must name a configured project; %q is not in projects[]", defaultProject)})
 }
 
-// validateGatekeeperRoleConfig rejects a trust level Looper cannot honour.
+// validateGatekeeperRoleConfig rejects unknown Gatekeeper trust levels.
 //
-// "auto" is rejected rather than accepted-and-ignored on purpose: a merge
-// authority that silently behaves one level below what the operator configured
-// is the worst possible failure for this setting.
 // validateDeployerRoleConfig fails startup rather than at deploy time. A project
 // configured to deploy but unable to is otherwise only discovered on the first
 // merge, which is the worst moment to learn it.

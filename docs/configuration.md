@@ -848,14 +848,29 @@ decides what it may do with that judgement.
 | --- | --- |
 | `observe` (default) | Gate report only. Nothing is published, nothing is merged. |
 | `advise` | Additionally publishes the verdict and every blocking reason on the pull request, so the decision costs one read instead of a re-investigation. The human still merges. |
-| `auto` | Requires a completed Looper/Codex review for the current head, then publishes the `Looper Gatekeeper` status for that exact SHA. GitHub branch protection consumes the status; Gatekeeper never calls merge itself. |
+| `auto` | Requires a completed Looper/Codex review for the current head, then publishes the `Looper Gatekeeper` status for that exact **pull request head SHA**. GitHub branch protection consumes the status; Gatekeeper never calls merge itself. |
 
 `auto` has one required external authority: GitHub branch protection must require
 the `Looper Gatekeeper` status context on the target branch. The status is the
-enforcement point for both direct merges and Mergify's branch-protection queue
-injection; the local Gate report remains audit evidence only. If protection does
-not require that context, Gatekeeper publishes a failing status rather than
+enforcement point for Mergify's branch-protection queue injection on the PR head;
+the local Gate report remains audit evidence only. If protection does not
+require that context, Gatekeeper publishes a failing status rather than
 claiming the PR is eligible.
+
+**Known limitations at `auto`:**
+
+- Status is keyed by commit SHA, not pull request. If two open pull requests share
+  the same head commit, discovery aggregates their verdicts before publishing
+  success — any blocked open PR on that head keeps the status non-successful.
+- Status is published on the pull request head only. GitHub's native merge queue
+  evaluates required checks on merge-group commits; `auto` does not publish
+  status for those SHAs and cannot satisfy branch protection bound to merge-group
+  heads. Use observe/advise, or require the status only on PR heads with a merge
+  path that does not depend on merge-group checks.
+- `roles.auditor` cannot be enabled on the same project scope while gatekeeper
+  trust is `auto`. Auditor still reads Gatekeeper `MergeOutcome` events that
+  status-only auto no longer emits; forge-observed merge evidence is not yet
+  implemented.
 
 ```toml
 [roles.gatekeeper]
@@ -964,13 +979,9 @@ Reviewers should weigh these blind spots before relying on it:
   the head does not. The discovery fingerprint includes the base SHA so a
   rewritten merge base invalidates a reused verdict rather than serving a stale
   one for up to the skip window.
-- At the `auto` trust level the merge action binds only the pull-request head
-  (`gh pr merge --match-head-commit`); GitHub's merge API accepts no parameter
-  that atomically pins the base. The confirming pass revalidates the base
-  immediately before the merge, but if the base branch advances in the window
-  between that final read and the merge call itself, the merge can still proceed
-  against a new base whose recomputed diff exceeds the budget. That window is
-  narrow but not closed — it is a documented blind spot, not a guarantee.
+- At the `auto` trust level Gatekeeper publishes commit status only; it never
+  merges. The diff-budget gate still runs on evaluation and fails closed when
+  the enabled stats cannot be read or the merge base advances between reads.
 
 ## Pipeline digest (`roles.escalator`)
 

@@ -298,6 +298,8 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
+	ctx = withDeferCommitStatus(ctx)
+	trust := r.trustFor(input.ProjectID)
 	result := DiscoveryResult{Reports: make([]Report, 0, len(pullRequests))}
 	diffBudget := r.diffBudget(input.ProjectID)
 	budgetEnabled := diffBudget.MaxChangedFiles > 0 || diffBudget.MaxDeletions > 0
@@ -308,7 +310,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		// not wait for the periodic maxSkipAge backstop. BaseSHA is folded into
 		// the fingerprint only while the budget is enabled, so a base advance on
 		// a repo with no configured limit does not invalidate every open report.
-		fingerprint := sourceFingerprint(pullRequest, budgetEnabled) + fmt.Sprintf("\x1fdiff-budget=%d,%d", diffBudget.MaxChangedFiles, diffBudget.MaxDeletions)
+		fingerprint := sourceFingerprint(pullRequest, budgetEnabled) + fmt.Sprintf("\x1fdiff-budget=%d,%d", diffBudget.MaxChangedFiles, diffBudget.MaxDeletions) + fmt.Sprintf("\x1fgatekeeper-trust=%s", trust)
 		entityID := fmt.Sprintf("%s#%d", input.Repo, pullRequest.Number)
 		stillOpen[entityID] = struct{}{}
 		previous, hasPrevious := previousReports[entityID]
@@ -348,6 +350,9 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		}
 		result.Reconciled++
 		result.Reports = append(result.Reports, report)
+	}
+	if trust == config.GatekeeperTrustAuto {
+		r.publishDiscoveryCommitStatuses(ctx, input.ProjectID, input.Repo, input.CWD, result.Reports)
 	}
 	return result, nil
 }
@@ -606,9 +611,16 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 		if !containsRequiredCheck(report.Evidence.RequiredChecks, RequiredStatusContext) {
 			report.Reasons = append(report.Reasons, Reason{Code: ReasonGatekeeperCheckRequired, Subject: RequiredStatusContext})
 		}
+		for _, rule := range requiredCheckRules {
+			if strings.EqualFold(strings.TrimSpace(rule.Context), RequiredStatusContext) && rule.AppID != 0 {
+				report.Reasons = append(report.Reasons, Reason{Code: ReasonGatekeeperCheckRequired, Subject: requiredCheckSubject(rule.Context, rule.AppID)})
+			}
+		}
 		// The Gatekeeper status is this evaluation's output, not an input. Reading
 		// its prior value would turn the first run on a new SHA into a permanent
-		// self-failure instead of letting this run publish the replacement.
+		// self-failure instead of letting this run publish the replacement. Only
+		// strip the unscoped name match; app-bound rules remain so misconfigured
+		// protection fails closed instead of being silently ignored.
 		requiredCheckRules = withoutRequiredCheck(requiredCheckRules, RequiredStatusContext)
 	}
 	checkReasons, checkEvidence := evaluateRequiredChecks(requiredCheckRules, checks)
@@ -661,7 +673,7 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 			Repo: input.Repo, PRNumber: input.PRNumber,
 			Marker:              "looper:review id_prefix=reviewer: head=" + report.ObservedHeadSHA,
 			AllowedReviewEvents: []string{"COMMENT", "APPROVE", "REQUEST_CHANGES"},
-			AuthorLogin:         login, AllowCleanComment: true, CWD: input.CWD,
+			AuthorLogin: login, AllowCleanComment: true, SkipInlineComments: true, CWD: input.CWD,
 		})
 		if markerErr != nil {
 			return r.persistProviderBlock(ctx, report, ReasonProviderStateUnavailable, "codex_review")
@@ -831,6 +843,117 @@ func isConfirming(ctx context.Context) bool {
 	return confirming
 }
 
+type deferCommitStatusKey struct{}
+
+func withDeferCommitStatus(ctx context.Context) context.Context {
+	return context.WithValue(ctx, deferCommitStatusKey{}, true)
+}
+
+func deferCommitStatus(ctx context.Context) bool {
+	deferred, _ := ctx.Value(deferCommitStatusKey{}).(bool)
+	return deferred
+}
+
+func reportCommitSHA(report Report) string {
+	sha := strings.TrimSpace(report.ObservedHeadSHA)
+	if sha == "" {
+		sha = strings.TrimSpace(report.ExpectedHeadSHA)
+	}
+	return sha
+}
+
+func reportIsOpenForStatusAggregation(report Report) bool {
+	state := strings.ToUpper(strings.TrimSpace(report.Evidence.PullRequestState))
+	return state == "" || state == "OPEN"
+}
+
+func commitStatusSeverity(state string) int {
+	switch state {
+	case "failure":
+		return 3
+	case "error":
+		return 2
+	case "pending":
+		return 1
+	default:
+		return 0
+	}
+}
+
+func aggregatedCommitStatus(reports []Report) (string, string) {
+	if len(reports) == 0 {
+		return "error", "Gatekeeper could not verify current merge state"
+	}
+	blocked := make([]Report, 0, len(reports))
+	for _, report := range reports {
+		if !report.Eligible {
+			blocked = append(blocked, report)
+		}
+	}
+	if len(blocked) > 0 {
+		state, description := gatekeeperCommitStatus(blocked[0])
+		for _, report := range blocked[1:] {
+			nextState, nextDescription := gatekeeperCommitStatus(report)
+			if commitStatusSeverity(nextState) > commitStatusSeverity(state) {
+				state, description = nextState, nextDescription
+			}
+		}
+		if len(blocked) < len(reports) {
+			description = "Another open pull request on this commit failed Gatekeeper"
+		}
+		return state, description
+	}
+	return gatekeeperCommitStatus(reports[0])
+}
+
+func (r *Runner) publishDiscoveryCommitStatuses(ctx context.Context, projectID, repo, cwd string, reports []Report) {
+	bySHA := make(map[string][]Report)
+	for _, report := range reports {
+		if !reportIsOpenForStatusAggregation(report) {
+			continue
+		}
+		sha := reportCommitSHA(report)
+		if sha == "" {
+			continue
+		}
+		bySHA[sha] = append(bySHA[sha], report)
+	}
+	for sha, group := range bySHA {
+		state, description := aggregatedCommitStatus(group)
+		if err := r.github.SetCommitStatus(ctx, githubinfra.CommitStatusInput{
+			Repo: repo, SHA: sha, Context: RequiredStatusContext,
+			State: state, Description: description, CWD: cwd,
+		}); err != nil {
+			if r.logWarn != nil {
+				r.logWarn("gatekeeper: could not publish aggregated commit status", map[string]any{
+					"repo": repo, "sha": sha, "error": err.Error(),
+				})
+			}
+			for _, report := range group {
+				if strings.TrimSpace(report.SourceFingerprint) == "" {
+					continue
+				}
+				if err := r.clearReportCacheability(ctx, report); err != nil && r.logWarn != nil {
+					r.logWarn("gatekeeper: could not mark report non-cacheable after status failure", map[string]any{
+						"repo": report.Repo, "pr": report.PRNumber, "error": err.Error(),
+					})
+				}
+			}
+		}
+	}
+}
+
+func (r *Runner) clearReportCacheability(ctx context.Context, report Report) error {
+	report.SourceFingerprint = ""
+	entityType := "pull_request"
+	entityID := fmt.Sprintf("%s#%d", report.Repo, report.PRNumber)
+	projectID := report.ProjectID
+	return eventlog.Append(ctx, r.repos, eventlog.AppendInput{
+		EventType: GateReportEventType, ProjectID: &projectID, EntityType: &entityType, EntityID: &entityID,
+		Payload: report, CreatedAt: r.now(),
+	})
+}
+
 // persist records a report. The confirming pass writes its report — the evidence
 // behind a merge has to be durable — but publishes no verdict, because it
 // describes the same head as the verdict already on the pull request.
@@ -865,7 +988,7 @@ func (r *Runner) persist(ctx context.Context, report Report) (Report, error) {
 	if statusSHA == "" {
 		statusSHA = strings.TrimSpace(report.ExpectedHeadSHA)
 	}
-	if !confirming && r.trustFor(report.ProjectID) == config.GatekeeperTrustAuto && statusSHA != "" {
+	if !confirming && r.trustFor(report.ProjectID) == config.GatekeeperTrustAuto && statusSHA != "" && !deferCommitStatus(ctx) {
 		state, description := gatekeeperCommitStatus(report)
 		if err := r.github.SetCommitStatus(ctx, githubinfra.CommitStatusInput{
 			Repo: report.Repo, SHA: statusSHA, Context: RequiredStatusContext,
@@ -905,8 +1028,16 @@ func (r *Runner) persist(ctx context.Context, report Report) (Report, error) {
 
 func gatekeeperCommitStatus(report Report) (string, string) {
 	for _, reason := range report.Reasons {
+		if reason.Code == ReasonGatekeeperCheckRequired {
+			return "failure", "Looper Gatekeeper is not configured as a required status on the target branch"
+		}
+	}
+	for _, reason := range report.Reasons {
 		if reason.Code == ReasonCodexReviewRequired {
 			return "pending", "Waiting for Codex review of this commit"
+		}
+		if reason.Code == ReasonHeadStale {
+			return "pending", "Waiting for Gatekeeper evaluation of the current head"
 		}
 	}
 	if report.Eligible {
@@ -932,7 +1063,7 @@ func containsRequiredCheck(checks []string, want string) bool {
 func withoutRequiredCheck(rules []githubinfra.RequiredCheckRule, name string) []githubinfra.RequiredCheckRule {
 	out := make([]githubinfra.RequiredCheckRule, 0, len(rules))
 	for _, rule := range rules {
-		if strings.EqualFold(strings.TrimSpace(rule.Context), strings.TrimSpace(name)) {
+		if strings.EqualFold(strings.TrimSpace(rule.Context), strings.TrimSpace(name)) && rule.AppID == 0 {
 			continue
 		}
 		out = append(out, rule)

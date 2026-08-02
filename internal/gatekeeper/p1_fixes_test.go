@@ -87,8 +87,8 @@ func TestAutoGatekeeperDoesNotCacheReportAfterStatusPublishFailure(t *testing.T)
 	if err != nil {
 		t.Fatalf("first DiscoverPullRequests() error = %v", err)
 	}
-	if first.Evaluated != 1 || first.Reports[0].SourceFingerprint != "" {
-		t.Fatalf("first discovery = %#v, want evaluated report with cleared fingerprint after status failure", first)
+	if first.Evaluated != 1 {
+		t.Fatalf("first discovery = %#v, want one evaluated pull request", first)
 	}
 
 	fixture.github.statusErr = nil
@@ -139,5 +139,57 @@ func TestAutoGatekeeperNeverMerges(t *testing.T) {
 	}
 	if !report.Eligible {
 		t.Fatalf("report = %#v, want eligible status-only auto evaluation", report)
+	}
+}
+
+func TestAggregatedCommitStatusFailsClosedForSharedHead(t *testing.T) {
+	state, description := aggregatedCommitStatus([]Report{
+		{Eligible: true, Reasons: []Reason{}},
+		{Eligible: false, Reasons: []Reason{{Code: ReasonHold, Subject: "looper:hold"}}},
+	})
+	if state != "failure" {
+		t.Fatalf("state = %q, want failure when any open PR on the head is blocked", state)
+	}
+	if description != "Another open pull request on this commit failed Gatekeeper" {
+		t.Fatalf("description = %q, want shared-head aggregation message", description)
+	}
+}
+
+func TestGatekeeperCommitStatusPrefersMissingContextOverCodexReview(t *testing.T) {
+	state, _ := gatekeeperCommitStatus(Report{
+		Reasons: []Reason{
+			{Code: ReasonGatekeeperCheckRequired, Subject: RequiredStatusContext},
+			{Code: ReasonCodexReviewRequired, Subject: "current_head"},
+		},
+	})
+	if state != "failure" {
+		t.Fatalf("state = %q, want failure for missing required context", state)
+	}
+}
+
+func TestGatekeeperCommitStatusPublishesPendingForStaleHead(t *testing.T) {
+	state, _ := gatekeeperCommitStatus(Report{Reasons: []Reason{{Code: ReasonHeadStale}}})
+	if state != "pending" {
+		t.Fatalf("state = %q, want pending for stale head", state)
+	}
+}
+
+func TestAutoGatekeeperRejectsAppBoundRequiredStatusContext(t *testing.T) {
+	fixture := newGatekeeperFixture(t)
+	fixture.github.protection.RequiredChecks = []string{"ci", RequiredStatusContext}
+	fixture.github.protection.RequiredCheckRules = []githubinfra.RequiredCheckRule{
+		{Context: "ci", AppID: 15368},
+		{Context: RequiredStatusContext, AppID: 99999},
+	}
+	fixture.github.reviewMarker = githubinfra.ReviewMarkerResult{Found: true, Outcome: "clean", Event: "APPROVE", AuthorLogin: "looper-bot"}
+
+	report, err := fixture.autoRunner().EvaluatePullRequest(context.Background(), EvaluationInput{
+		ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, ExpectedHeadSHA: "head-1",
+	})
+	if err != nil {
+		t.Fatalf("EvaluatePullRequest() error = %v", err)
+	}
+	if report.Eligible || !hasReason(report, ReasonGatekeeperCheckRequired) {
+		t.Fatalf("report = %#v, want app-bound gatekeeper context failure", report)
 	}
 }
