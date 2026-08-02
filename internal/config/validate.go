@@ -1729,8 +1729,8 @@ func validateCoordinatorRoleConfig(config CoordinatorRoleConfig, path string, is
 		if _, err := time.LoadLocation(config.PostMergeDigest.Timezone); err != nil {
 			*issues = append(*issues, ValidationIssue{Path: path + ".postMergeDigest.timezone", Message: "must be a valid IANA timezone string"})
 		}
-		if config.PostMergeDigest.MaxItems <= 0 {
-			*issues = append(*issues, ValidationIssue{Path: path + ".postMergeDigest.maxItems", Message: "must be a positive integer"})
+		if config.PostMergeDigest.MaxItems < 1 || config.PostMergeDigest.MaxItems > 200 {
+			*issues = append(*issues, ValidationIssue{Path: path + ".postMergeDigest.maxItems", Message: "must be an integer between 1 and 200"})
 		}
 	}
 	validateDistinctLabels([]labelPathValue{

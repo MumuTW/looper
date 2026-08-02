@@ -41,7 +41,7 @@ func TestPostMergeDigestConfigRejectsInvalidScheduleTimezoneAndLimit(t *testing.
 		Triage:          CoordinatorTriageConfig{TriagedLabel: "triaged", MaxIssueAgeDays: 1, MaxPerTick: 1, Disposition: CoordinatorTriageDispositionConfig{OutOfScopeLabel: "wontfix", UnclearLabel: "needs-info"}},
 		Dispatch:        CoordinatorDispatchConfig{Mode: "human-gated", HumanGate: CoordinatorDispatchHumanGateConfig{SlashCommands: []string{"/plan"}}, Autonomous: CoordinatorDispatchAutonomousConfig{DelayMinutes: 1, HoldLabel: labels.HoldGlobal}},
 		MergeWatch:      CoordinatorMergeWatchConfig{TransientRetries: 1, MaxIndeterminateDuration: "1m"},
-		MarkReady:      CoordinatorMarkReadyConfig{Scope: CoordinatorMarkReadyScopeLooperOnly},
+		MarkReady:       CoordinatorMarkReadyConfig{Scope: CoordinatorMarkReadyScopeLooperOnly},
 		PostMergeDigest: &CoordinatorPostMergeDigestConfig{Enabled: true, Schedule: "25:99", Timezone: "Not/AZone", MaxItems: 0},
 	}, "roles.coordinator", &issues)
 	for _, want := range []string{"roles.coordinator.postMergeDigest.schedule", "roles.coordinator.postMergeDigest.timezone", "roles.coordinator.postMergeDigest.maxItems"} {
@@ -58,6 +58,24 @@ func TestPostMergeDigestConfigRejectsInvalidScheduleTimezoneAndLimit(t *testing.
 	}
 }
 
+func TestPostMergeDigestConfigRejectsMaxItemsAboveDocumentedCeiling(t *testing.T) {
+	issues := []ValidationIssue{}
+	validateCoordinatorRoleConfig(CoordinatorRoleConfig{
+		PollInterval:    "1m",
+		Triage:          CoordinatorTriageConfig{TriagedLabel: "triaged", MaxIssueAgeDays: 1, MaxPerTick: 1, Disposition: CoordinatorTriageDispositionConfig{OutOfScopeLabel: "wontfix", UnclearLabel: "needs-info"}},
+		Dispatch:        CoordinatorDispatchConfig{Mode: "human-gated", HumanGate: CoordinatorDispatchHumanGateConfig{SlashCommands: []string{"/plan"}}, Autonomous: CoordinatorDispatchAutonomousConfig{DelayMinutes: 1, HoldLabel: labels.HoldGlobal}},
+		MergeWatch:      CoordinatorMergeWatchConfig{TransientRetries: 1, MaxIndeterminateDuration: "1m"},
+		MarkReady:       CoordinatorMarkReadyConfig{Scope: CoordinatorMarkReadyScopeLooperOnly},
+		PostMergeDigest: &CoordinatorPostMergeDigestConfig{Enabled: true, Schedule: "08:00", Timezone: "UTC", MaxItems: 201},
+	}, "roles.coordinator", &issues)
+	for _, issue := range issues {
+		if issue.Path == "roles.coordinator.postMergeDigest.maxItems" {
+			return
+		}
+	}
+	t.Fatalf("issues = %#v, want maxItems ceiling validation", issues)
+}
+
 func TestPostMergeDigestConfigAllowsExplicitDisabledOptOut(t *testing.T) {
 	issues := []ValidationIssue{}
 	validateCoordinatorRoleConfig(CoordinatorRoleConfig{
@@ -65,7 +83,7 @@ func TestPostMergeDigestConfigAllowsExplicitDisabledOptOut(t *testing.T) {
 		Triage:          CoordinatorTriageConfig{TriagedLabel: "triaged", MaxIssueAgeDays: 1, MaxPerTick: 1, Disposition: CoordinatorTriageDispositionConfig{OutOfScopeLabel: "wontfix", UnclearLabel: "needs-info"}},
 		Dispatch:        CoordinatorDispatchConfig{Mode: "human-gated", HumanGate: CoordinatorDispatchHumanGateConfig{SlashCommands: []string{"/plan"}}, Autonomous: CoordinatorDispatchAutonomousConfig{DelayMinutes: 1, HoldLabel: labels.HoldGlobal}},
 		MergeWatch:      CoordinatorMergeWatchConfig{TransientRetries: 1, MaxIndeterminateDuration: "1m"},
-		MarkReady:      CoordinatorMarkReadyConfig{Scope: CoordinatorMarkReadyScopeLooperOnly},
+		MarkReady:       CoordinatorMarkReadyConfig{Scope: CoordinatorMarkReadyScopeLooperOnly},
 		PostMergeDigest: &CoordinatorPostMergeDigestConfig{Enabled: false},
 	}, "roles.coordinator", &issues)
 	if len(issues) != 0 {
