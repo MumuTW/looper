@@ -607,6 +607,10 @@ func mergeAgentConfig(config *AgentConfig, partial PartialAgentConfig) {
 	if partial.Model != nil {
 		config.Model = stringPtr(*partial.Model)
 	}
+	if partial.ReasoningEffort != nil {
+		effort := *partial.ReasoningEffort
+		config.ReasoningEffort = &effort
+	}
 
 	if partial.Profiles != nil {
 		config.Profiles = mergeAgentProfiles(config.Profiles, partial.Profiles)
@@ -646,6 +650,10 @@ func mergeAgentProfiles(base map[string]AgentBindingConfig, override map[string]
 		if binding.Model != nil {
 			existing.Model = stringPtr(*binding.Model)
 		}
+		if binding.ReasoningEffort != nil {
+			effort := *binding.ReasoningEffort
+			existing.ReasoningEffort = &effort
+		}
 		merged[id] = existing
 	}
 	if len(merged) == 0 {
@@ -662,6 +670,10 @@ func cloneAgentBindingConfig(binding AgentBindingConfig) AgentBindingConfig {
 	}
 	if binding.Model != nil {
 		cloned.Model = stringPtr(*binding.Model)
+	}
+	if binding.ReasoningEffort != nil {
+		effort := *binding.ReasoningEffort
+		cloned.ReasoningEffort = &effort
 	}
 	return cloned
 }
@@ -683,6 +695,10 @@ func mergeRoleAgentConfig(config **RoleAgentConfig, partial *RoleAgentConfig) {
 	if partial.Model != nil {
 		(*config).Model = stringPtr(*partial.Model)
 	}
+	if partial.ReasoningEffort != nil {
+		effort := *partial.ReasoningEffort
+		(*config).ReasoningEffort = &effort
+	}
 	if isEmptyRoleAgentConfig(*config) {
 		*config = nil
 	}
@@ -696,7 +712,7 @@ func isEmptyRoleAgentConfig(agent *RoleAgentConfig) bool {
 		return true
 	}
 	profileEmpty := agent.Profile == nil || strings.TrimSpace(*agent.Profile) == ""
-	return profileEmpty && agent.Vendor == nil && agent.Model == nil
+	return profileEmpty && agent.Vendor == nil && agent.Model == nil && agent.ReasoningEffort == nil
 }
 
 // canonicalizePartialRoleAgentBindings nils empty agent objects on coding roles
@@ -730,14 +746,23 @@ func cloneRoleAgentConfig(agent *RoleAgentConfig) *RoleAgentConfig {
 		return nil
 	}
 	cloned := &RoleAgentConfig{
-		Profile: cloneStringPtr(agent.Profile),
-		Model:   cloneStringPtr(agent.Model),
+		Profile:         cloneStringPtr(agent.Profile),
+		Model:           cloneStringPtr(agent.Model),
+		ReasoningEffort: cloneReasoningEffortPtr(agent.ReasoningEffort),
 	}
 	if agent.Vendor != nil {
 		vendor := *agent.Vendor
 		cloned.Vendor = &vendor
 	}
 	return cloned
+}
+
+func cloneReasoningEffortPtr(effort *ReasoningEffort) *ReasoningEffort {
+	if effort == nil {
+		return nil
+	}
+	cloned := *effort
+	return &cloned
 }
 
 func mergeAgentTimeoutConfig(config *AgentTimeoutConfig, partial PartialAgentTimeoutConfig) {
@@ -2041,6 +2066,7 @@ func clonePartialAgentConfig(agent *PartialAgentConfig) *PartialAgentConfig {
 		cloned.Vendor = &vendor
 	}
 	cloned.Model = cloneStringPtr(agent.Model)
+	cloned.ReasoningEffort = cloneReasoningEffortPtr(agent.ReasoningEffort)
 	cloned.Profiles = cloneAgentProfiles(agent.Profiles)
 	if agent.Params != nil {
 		cloned.Params = mergeAnyMap(nil, agent.Params)

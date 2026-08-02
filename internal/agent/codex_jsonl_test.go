@@ -1,6 +1,11 @@
 package agent
 
-import "testing"
+import (
+	"strings"
+	"testing"
+
+	"github.com/MumuTW/looper/internal/config"
+)
 
 func TestCodexJSONLTranslator(t *testing.T) {
 	tr := newCodexJSONLTranslator()
@@ -82,6 +87,72 @@ func TestResolveCodexArgsJSONFlag(t *testing.T) {
 	got = resolveCodexArgs(on, []string{"-c", "model=gpt-5.4"}, "do it")
 	if got[0] != "exec" || !containsArg(got, "--json") || got[len(got)-1] != "do it" {
 		t.Fatalf("expected exec … --json … prompt: %v", got)
+	}
+}
+
+func TestResolveCodexArgs_ReasoningEffort(t *testing.T) {
+	base := ExecutorConfig{Vendor: "codex"}
+	effort := config.ReasoningEffortHigh
+	base.ReasoningEffort = &effort
+	got := resolveCodexArgs(base, []string{}, "do it")
+	found := false
+	for i, arg := range got {
+		if arg == "-c" && i+1 < len(got) && got[i+1] == "model_reasoning_effort=high" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("resolveCodexArgs() = %v, want -c model_reasoning_effort=high", got)
+	}
+}
+
+func TestResolveCodexArgs_ReasoningEffortNone(t *testing.T) {
+	base := ExecutorConfig{Vendor: "codex"}
+	effort := config.ReasoningEffortNone
+	base.ReasoningEffort = &effort
+	got := resolveCodexArgs(base, []string{}, "do it")
+	found := false
+	for i, arg := range got {
+		if arg == "-c" && i+1 < len(got) && got[i+1] == "model_reasoning_effort=none" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("resolveCodexArgs() = %v, want -c model_reasoning_effort=none", got)
+	}
+}
+
+func TestResolveCodexArgs_ReasoningEffortUnset(t *testing.T) {
+	base := ExecutorConfig{Vendor: "codex"}
+	got := resolveCodexArgs(base, []string{}, "do it")
+	for _, arg := range got {
+		if strings.HasPrefix(arg, "model_reasoning_effort=") {
+			t.Fatalf("resolveCodexArgs() = %v, should not contain reasoning effort", got)
+		}
+	}
+}
+
+func TestResolveCodexArgs_ReasoningEffortWithStdinPrompt(t *testing.T) {
+	effort := config.ReasoningEffortVeryHigh
+	got := resolveCodexArgs(ExecutorConfig{Vendor: "codex", ReasoningEffort: &effort}, []string{"-"}, "ignored")
+	if !containsArg(got, "model_reasoning_effort=xhigh") {
+		t.Fatalf("resolveCodexArgs() = %v, want xhigh reasoning effort", got)
+	}
+	for i, arg := range got {
+		if arg == "-" && i > 0 && got[i-1] == "model_reasoning_effort=xhigh" {
+			return
+		}
+	}
+	t.Fatalf("resolveCodexArgs() = %v, want reasoning effort before stdin marker", got)
+}
+
+func TestResolveCodexNativeResumeArgs_ReasoningEffort(t *testing.T) {
+	effort := config.ReasoningEffortVeryHigh
+	got := resolveCodexNativeResumeArgs(ExecutorConfig{Vendor: "codex", ReasoningEffort: &effort}, nil, "", "thread-1", "continue")
+	if !containsArg(got, "model_reasoning_effort=xhigh") {
+		t.Fatalf("resolveCodexNativeResumeArgs() = %v, want xhigh reasoning effort", got)
 	}
 }
 

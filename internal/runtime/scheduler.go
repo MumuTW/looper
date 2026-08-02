@@ -262,6 +262,20 @@ func (f catalogWebhookFixer) DiscoverPullRequestsForBaseBranchUpdate(ctx context
 
 type schedulerTaskTracker struct{ wg sync.WaitGroup }
 
+func canonicalReasoningEffort(effort *config.ReasoningEffort) *config.ReasoningEffort {
+	if effort == nil {
+		return nil
+	}
+	normalized, ok := config.ParseReasoningEffort(string(*effort))
+	if !ok {
+		// Startup validation is the authority for rejecting unsupported values.
+		// Preserve an invalid direct Config value here so the validation error is
+		// not hidden by scheduler construction in tests or embedders.
+		return effort
+	}
+	return &normalized
+}
+
 func (t *schedulerTaskTracker) Go(fn func()) {
 	t.wg.Add(1)
 	go func() {
@@ -608,7 +622,7 @@ func (a plannerAgentExecutorAdapter) Start(ctx context.Context, input planner.Ag
 		ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID,
 		Prompt: input.Prompt, WorkingDirectory: input.WorkingDirectory, Timeout: input.Timeout, HeartbeatTimeout: input.HeartbeatTimeout,
 		Metadata: input.Metadata, IdempotencyKey: input.IdempotencyKey,
-		UseSnapshot: input.UseSnapshot, SnapshotVendor: input.SnapshotVendor, SnapshotModel: input.SnapshotModel,
+		UseSnapshot: input.UseSnapshot, SnapshotVendor: input.SnapshotVendor, SnapshotModel: input.SnapshotModel, SnapshotReasoningEffort: input.SnapshotReasoningEffort,
 	})
 	if err != nil {
 		return nil, err
@@ -1120,21 +1134,22 @@ func (a reviewerAgentExecutorAdapter) Start(ctx context.Context, input reviewer.
 		}
 	}
 	execution, err := a.executor.Start(ctx, agent.RunInput{
-		ExecutionID:        input.ExecutionID,
-		ProjectID:          input.ProjectID,
-		LoopID:             input.LoopID,
-		RunID:              input.RunID,
-		Prompt:             input.Prompt,
-		NativeResumePrompt: input.NativeResumePrompt,
-		WorkingDirectory:   input.WorkingDirectory,
-		Timeout:            input.Timeout,
-		HeartbeatTimeout:   input.HeartbeatTimeout,
-		Metadata:           input.Metadata,
-		IdempotencyKey:     input.IdempotencyKey,
-		Env:                reviewerTrustedReviewEnv(sock),
-		UseSnapshot:        input.UseSnapshot,
-		SnapshotVendor:     input.SnapshotVendor,
-		SnapshotModel:      input.SnapshotModel,
+		ExecutionID:             input.ExecutionID,
+		ProjectID:               input.ProjectID,
+		LoopID:                  input.LoopID,
+		RunID:                   input.RunID,
+		Prompt:                  input.Prompt,
+		NativeResumePrompt:      input.NativeResumePrompt,
+		WorkingDirectory:        input.WorkingDirectory,
+		Timeout:                 input.Timeout,
+		HeartbeatTimeout:        input.HeartbeatTimeout,
+		Metadata:                input.Metadata,
+		IdempotencyKey:          input.IdempotencyKey,
+		Env:                     reviewerTrustedReviewEnv(sock),
+		UseSnapshot:             input.UseSnapshot,
+		SnapshotVendor:          input.SnapshotVendor,
+		SnapshotModel:           input.SnapshotModel,
+		SnapshotReasoningEffort: input.SnapshotReasoningEffort,
 	})
 	if err != nil {
 		proxyCleanup()
@@ -1553,7 +1568,7 @@ func (a fixerAgentExecutorAdapter) Start(ctx context.Context, input fixer.AgentR
 		Prompt: input.Prompt, WorkingDirectory: input.WorkingDirectory, Timeout: input.Timeout, HeartbeatTimeout: input.HeartbeatTimeout,
 		Metadata: input.Metadata, IdempotencyKey: input.IdempotencyKey,
 		RestrictToolNetwork: input.RestrictToolNetwork,
-		UseSnapshot:         input.UseSnapshot, SnapshotVendor: input.SnapshotVendor, SnapshotModel: input.SnapshotModel,
+		UseSnapshot:         input.UseSnapshot, SnapshotVendor: input.SnapshotVendor, SnapshotModel: input.SnapshotModel, SnapshotReasoningEffort: input.SnapshotReasoningEffort,
 	})
 	if err != nil {
 		return nil, err
@@ -1848,7 +1863,7 @@ func (a workerAgentExecutorAdapter) Start(ctx context.Context, input worker.Agen
 		Metadata:                 input.Metadata, IdempotencyKey: input.IdempotencyKey,
 		RestrictToolNetwork: input.RestrictToolNetwork,
 		OnBeforeTimeout:     input.OnBeforeTimeout,
-		UseSnapshot:         input.UseSnapshot, SnapshotVendor: input.SnapshotVendor, SnapshotModel: input.SnapshotModel,
+		UseSnapshot:         input.UseSnapshot, SnapshotVendor: input.SnapshotVendor, SnapshotModel: input.SnapshotModel, SnapshotReasoningEffort: input.SnapshotReasoningEffort,
 	})
 	if err != nil {
 		return nil, err
@@ -2222,6 +2237,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			Config: agent.ExecutorConfig{
 				Vendor:              resolved.Vendor,
 				Model:               resolved.Model,
+				ReasoningEffort:     resolved.ReasoningEffort,
 				Params:              cfg.Agent.Params,
 				Env:                 cfg.Agent.Env,
 				NativeResumeEnabled: cfg.Agent.NativeResume.Enabled,
@@ -2274,21 +2290,22 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			plannerAutoDiscovery = false
 		}
 		plannerRoleRunner = planner.New(planner.Options{
-			DB:                 coordinator.DB(),
-			Repos:              repos,
-			GitHub:             plannerGitHubAdapter{gateway: githubGateway, stamper: plannerStamper, config: &cfg},
-			Git:                plannerGitAdapter{gateway: gitGateway, stamper: plannerStamper},
-			AgentExecutor:      plannerAgentExecutorAdapter{executor: plannerExecutor},
-			Logger:             logger,
-			Now:                now,
-			AllowAutoPush:      boolPtr(cfg.Defaults.AllowAutoPush),
-			Disclosure:         &cfg.Disclosure,
-			AgentRuntime:       string(resolved.Vendor),
-			AgentProfileID:     resolved.ProfileID,
-			CustomInstructions: &cfg,
-			AgentModel:         agentModel,
-			AgentTimeout:       time.Duration(cfg.Agent.Timeouts.PlannerMaxRuntimeSeconds) * time.Second,
-			AgentIdleTimeout:   time.Duration(cfg.Agent.Timeouts.PlannerIdleTimeoutSeconds) * time.Second,
+			DB:                   coordinator.DB(),
+			Repos:                repos,
+			GitHub:               plannerGitHubAdapter{gateway: githubGateway, stamper: plannerStamper, config: &cfg},
+			Git:                  plannerGitAdapter{gateway: gitGateway, stamper: plannerStamper},
+			AgentExecutor:        plannerAgentExecutorAdapter{executor: plannerExecutor},
+			Logger:               logger,
+			Now:                  now,
+			AllowAutoPush:        boolPtr(cfg.Defaults.AllowAutoPush),
+			Disclosure:           &cfg.Disclosure,
+			AgentRuntime:         string(resolved.Vendor),
+			AgentProfileID:       resolved.ProfileID,
+			AgentReasoningEffort: resolved.ReasoningEffort,
+			CustomInstructions:   &cfg,
+			AgentModel:           agentModel,
+			AgentTimeout:         time.Duration(cfg.Agent.Timeouts.PlannerMaxRuntimeSeconds) * time.Second,
+			AgentIdleTimeout:     time.Duration(cfg.Agent.Timeouts.PlannerIdleTimeoutSeconds) * time.Second,
 			DiscoveryPolicy: planner.DiscoveryPolicy{
 				AutoDiscovery:              plannerAutoDiscovery,
 				Labels:                     append([]string(nil), plannerRole.Discovery.Labels...),
@@ -2342,6 +2359,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			Config: agent.ExecutorConfig{
 				Vendor:              *cfg.Agent.Vendor,
 				Model:               cfg.Agent.Model,
+				ReasoningEffort:     canonicalReasoningEffort(cfg.Agent.ReasoningEffort),
 				Params:              cfg.Agent.Params,
 				Env:                 cfg.Agent.Env,
 				NativeResumeEnabled: cfg.Agent.NativeResume.Enabled,
@@ -2414,6 +2432,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			Disclosure:              &cfg.Disclosure,
 			AgentRuntime:            string(resolved.Vendor),
 			AgentProfileID:          resolved.ProfileID,
+			AgentReasoningEffort:    resolved.ReasoningEffort,
 			CustomInstructions:      &cfg,
 			LooperCLIPath:           looperCLIPath,
 			AgentModel:              agentModel,
@@ -2470,6 +2489,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			Disclosure:                  &cfg.Disclosure,
 			AgentRuntime:                string(resolved.Vendor),
 			AgentProfileID:              resolved.ProfileID,
+			AgentReasoningEffort:        resolved.ReasoningEffort,
 			CustomInstructions:          &cfg,
 			AgentModel:                  agentModel,
 			AgentTimeout:                time.Duration(cfg.Agent.Timeouts.FixerMaxRuntimeSeconds) * time.Second,
@@ -2568,17 +2588,18 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 				LabelMode:                  workerRole.Discovery.LabelMode,
 				RequireAssigneeCurrentUser: workerRole.Discovery.RequireAssigneeCurrentUser,
 			},
-			Disclosure:          &cfg.Disclosure,
-			AgentRuntime:        string(resolved.Vendor),
-			AgentProfileID:      resolved.ProfileID,
-			CustomInstructions:  &cfg,
-			Network:             coordinatorNetworkGateway{statePath: networkclient.DefaultStatePath(runtimeHomeDirOrEmpty()), client: &http.Client{Timeout: 10 * time.Second}},
-			AgentModel:          agentModel,
-			AgentTimeout:        time.Duration(cfg.Agent.Timeouts.WorkerMaxRuntimeSeconds) * time.Second,
-			AgentIdleTimeout:    time.Duration(cfg.Agent.Timeouts.WorkerIdleTimeoutSeconds) * time.Second,
-			RetryBaseDelay:      retryBaseDelay,
-			RetryMaxAttempts:    int64(cfg.Scheduler.RetryMaxAttempts),
-			OnQueueItemEnqueued: requestWake,
+			Disclosure:           &cfg.Disclosure,
+			AgentRuntime:         string(resolved.Vendor),
+			AgentProfileID:       resolved.ProfileID,
+			AgentReasoningEffort: resolved.ReasoningEffort,
+			CustomInstructions:   &cfg,
+			Network:              coordinatorNetworkGateway{statePath: networkclient.DefaultStatePath(runtimeHomeDirOrEmpty()), client: &http.Client{Timeout: 10 * time.Second}},
+			AgentModel:           agentModel,
+			AgentTimeout:         time.Duration(cfg.Agent.Timeouts.WorkerMaxRuntimeSeconds) * time.Second,
+			AgentIdleTimeout:     time.Duration(cfg.Agent.Timeouts.WorkerIdleTimeoutSeconds) * time.Second,
+			RetryBaseDelay:       retryBaseDelay,
+			RetryMaxAttempts:     int64(cfg.Scheduler.RetryMaxAttempts),
+			OnQueueItemEnqueued:  requestWake,
 			OnRunCompleted: func(ctx context.Context, input worker.RunCompletedInput) error {
 				return notifyWorkerRunCompleted(ctx, workerRunCompletedNotificationInput{ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Subtitle: input.Subtitle, Status: input.Status, Summary: input.Summary, FailureKind: input.FailureKind, PullRequestNumber: input.PullRequestNumber, PullRequestURL: input.PullRequestURL})
 			},

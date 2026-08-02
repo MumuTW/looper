@@ -60,6 +60,38 @@ func TestLoadFileUsesDefaultsWhenConfigMissing(t *testing.T) {
 	}
 }
 
+func TestLoadFileNormalizesReasoningEffortAcrossGlobalProfileAndRole(t *testing.T) {
+	loaded := loadConfigFixture(t, "config.toml", `
+[agent]
+vendor = "codex"
+reasoningEffort = " High "
+
+[agent.profiles.performance]
+reasoningEffort = " XHIGH "
+
+[roles.coding.reviewer.agent]
+profile = "performance"
+
+[roles.coding.fixer.agent]
+reasoningEffort = " LoW "
+`, nil, nil)
+
+	assertResolvedEffort := func(role string, want ReasoningEffort) {
+		t.Helper()
+		resolved, ok := ResolveAgent(loaded.Config, "", role)
+		if !ok || resolved.ReasoningEffort == nil || *resolved.ReasoningEffort != want {
+			got := ReasoningEffort("")
+			if resolved.ReasoningEffort != nil {
+				got = *resolved.ReasoningEffort
+			}
+			t.Fatalf("ResolveAgent(%q) effort = %q, ok=%v; want %q", role, got, ok, want)
+		}
+	}
+	assertResolvedEffort(CodingRolePlanner, ReasoningEffortHigh)
+	assertResolvedEffort(CodingRoleReviewer, ReasoningEffortVeryHigh)
+	assertResolvedEffort(CodingRoleFixer, ReasoningEffortLow)
+}
+
 func TestLoadFileAcceptsIgnoredDeprecatedPackageAutoUpgradeEnabledAcrossFormats(t *testing.T) {
 	tests := []struct {
 		name string

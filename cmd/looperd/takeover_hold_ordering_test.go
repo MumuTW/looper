@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MumuTW/looper/internal/config"
 	"github.com/MumuTW/looper/internal/loops"
 	looperdruntime "github.com/MumuTW/looper/internal/runtime"
 	"github.com/MumuTW/looper/internal/storage"
@@ -65,7 +66,8 @@ func newTakeoverFixture(t *testing.T) *takeoverFixture {
 		t.Fatalf("Queue.Upsert(reviewer) error = %v", err)
 	}
 
-	run := storage.RunRecord{ID: "run_1", LoopID: held.ID, Status: "running", StartedAt: takeoverNowISO, LastHeartbeatAt: stringRef(takeoverNowISO), CreatedAt: takeoverNowISO, UpdatedAt: takeoverNowISO}
+	snapshot := `{"vendor":"codex","reasoningEffort":"high"}`
+	run := storage.RunRecord{ID: "run_1", LoopID: held.ID, Status: "running", AgentSnapshotJSON: &snapshot, StartedAt: takeoverNowISO, LastHeartbeatAt: stringRef(takeoverNowISO), CreatedAt: takeoverNowISO, UpdatedAt: takeoverNowISO}
 	if err := repos.Runs.Upsert(ctx, run); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
@@ -87,6 +89,18 @@ func newTakeoverFixture(t *testing.T) *takeoverFixture {
 			Loops: &loops.Service{DB: coordinator.DB(), Repos: repos, Now: func() time.Time { return now }},
 		},
 		now: now, loopID: held.ID,
+	}
+}
+
+func TestTakeoverLoopReturnsPersistedReasoningEffort(t *testing.T) {
+	ctx := context.Background()
+	f := newTakeoverFixture(t)
+	result, err := takeoverLoop(ctx, f.services, f.loopID, "Taken over by test", func() time.Time { return f.now }, func(int, syscall.Signal) error { return nil }, nil)
+	if err != nil {
+		t.Fatalf("takeoverLoop() error = %v", err)
+	}
+	if result.ReasoningEffort == nil || *result.ReasoningEffort != config.ReasoningEffortHigh {
+		t.Fatalf("ReasoningEffort = %v, want high from persisted run snapshot", result.ReasoningEffort)
 	}
 }
 

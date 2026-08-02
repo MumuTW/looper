@@ -390,12 +390,12 @@ func appendResolvedVendorRestartGuards(oldConfig Config, newConfig Config, seen 
 	appendGlobalVendorLeaveSwitchGuard(oldConfig, newConfig, mark)
 
 	for _, role := range []string{CodingRolePlanner, CodingRoleWorker, CodingRoleReviewer, CodingRoleFixer} {
-		oldVendor, oldModel, _, oldOK := overlayAgentIdentity(oldConfig, role)
+		oldVendor, oldModel, _, _, oldOK := overlayAgentIdentity(oldConfig, role)
 		if !oldOK || oldVendor == nil {
 			// First activation (no prior vendor) remains hot, including prepared models.
 			continue
 		}
-		newVendor, newModel, _, newOK := overlayAgentIdentity(newConfig, role)
+		newVendor, newModel, _, _, newOK := overlayAgentIdentity(newConfig, role)
 		if !newOK {
 			continue
 		}

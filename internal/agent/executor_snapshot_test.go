@@ -12,13 +12,16 @@ func TestEffectiveConfigUsesSnapshotOverrides(t *testing.T) {
 
 	configModel := "config-model"
 	snapshotModel := "snapshot-model"
+	configEffort := config.ReasoningEffortLow
+	snapshotEffort := config.ReasoningEffortVeryHigh
 	owner := config.AgentVendorClaudeCode
 	executor := New(ExecutorOptions{
 		Config: ExecutorConfig{
-			Vendor: config.AgentVendorClaudeCode,
-			Model:  &configModel,
-			Params: map[string]any{"args": []any{"--print"}},
-			Env:    map[string]string{"KEEP": "1"},
+			Vendor:          config.AgentVendorClaudeCode,
+			Model:           &configModel,
+			ReasoningEffort: &configEffort,
+			Params:          map[string]any{"args": []any{"--print"}},
+			Env:             map[string]string{"KEEP": "1"},
 		},
 		ParamsOwnerVendor: &owner,
 	})
@@ -31,15 +34,19 @@ func TestEffectiveConfigUsesSnapshotOverrides(t *testing.T) {
 
 	// Snapshot overrides vendor/model for spawn only; env stays from config.
 	got = executor.effectiveConfig(RunInput{
-		UseSnapshot:    true,
-		SnapshotVendor: string(config.AgentVendorCodex),
-		SnapshotModel:  &snapshotModel,
+		UseSnapshot:             true,
+		SnapshotVendor:          string(config.AgentVendorCodex),
+		SnapshotModel:           &snapshotModel,
+		SnapshotReasoningEffort: &snapshotEffort,
 	})
 	if got.Vendor != config.AgentVendorCodex {
 		t.Fatalf("Vendor = %q, want codex", got.Vendor)
 	}
 	if got.Model == nil || *got.Model != snapshotModel {
 		t.Fatalf("Model = %v, want %q", got.Model, snapshotModel)
+	}
+	if got.ReasoningEffort == nil || *got.ReasoningEffort != snapshotEffort {
+		t.Fatalf("ReasoningEffort = %v, want %q", got.ReasoningEffort, snapshotEffort)
 	}
 	if got.Env["KEEP"] != "1" {
 		t.Fatalf("Env not preserved: %#v", got.Env)
