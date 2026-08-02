@@ -104,6 +104,33 @@ func TestTakeoverLoopReturnsPersistedReasoningEffort(t *testing.T) {
 	}
 }
 
+func TestTakeoverLoopCorrelatesReasoningEffortWithSelectedExecutionRun(t *testing.T) {
+	ctx := context.Background()
+	f := newTakeoverFixture(t)
+
+	// A retry can create a newer run after the agent execution row was
+	// recorded. The takeover response must keep the selected execution's
+	// snapshot instead of pairing that execution with the newer run.
+	newerSnapshot := `{"vendor":"codex","reasoningEffort":"low"}`
+	if err := f.repos.Runs.Upsert(ctx, storage.RunRecord{
+		ID: "run_newer", LoopID: f.loopID, Status: "failed", AgentSnapshotJSON: &newerSnapshot,
+		StartedAt: "2026-04-21T12:00:01.000Z", CreatedAt: "2026-04-21T12:00:01.000Z", UpdatedAt: "2026-04-21T12:00:01.000Z",
+	}); err != nil {
+		t.Fatalf("Runs.Upsert(newer) error = %v", err)
+	}
+
+	result, err := takeoverLoop(ctx, f.services, f.loopID, "Taken over by test", func() time.Time { return f.now }, func(int, syscall.Signal) error { return nil }, nil)
+	if err != nil {
+		t.Fatalf("takeoverLoop() error = %v", err)
+	}
+	if result.SessionID != "session_human" {
+		t.Fatalf("SessionID = %q, want selected execution session", result.SessionID)
+	}
+	if result.ReasoningEffort == nil || *result.ReasoningEffort != config.ReasoningEffortHigh {
+		t.Fatalf("ReasoningEffort = %v, want high from the selected execution's run", result.ReasoningEffort)
+	}
+}
+
 func stringRef(value string) *string { return &value }
 
 // TestTakeoverFencesSiblingBeforeStoppingTheRun probes the stop window: a

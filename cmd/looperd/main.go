@@ -461,21 +461,26 @@ func takeoverLoop(ctx context.Context, services looperdruntime.Services, loopID,
 	// looper-fix-<project>-pr-N). Empty target key is a no-op.
 	unlockLoop := looperdruntime.LockLoopRequeue(loopID)
 	var unlockTarget func() = func() {}
+	releaseLocks := func() {
+		unlockTarget()
+		unlockLoop()
+	}
 	if services.Repositories != nil && services.Repositories.Loops != nil {
 		loop, err := services.Repositories.Loops.GetByID(ctx, loopID)
 		if err != nil {
 			// Fail closed: a transient storage error must not proceed without
 			// the shared PR fence while sibling cleanup can still delete the
 			// checkout.
-			unlockLoop()
+			releaseLocks()
 			return result, fmt.Errorf("load loop before takeover target fence: %w", err)
 		}
 		if loop == nil {
-			unlockLoop()
+			releaseLocks()
 			return result, fmt.Errorf("loop not found before takeover target fence: %s", loopID)
 		}
 		unlockTarget = loops.LockLoopTarget(loops.LoopTargetGuardKeyFromRecord(*loop))
 	}
+	var selectedExecution *storage.AgentExecutionRecord
 	if services.Repositories != nil && services.Repositories.AgentExecutions != nil {
 		execution, err := services.Repositories.AgentExecutions.GetLatestByLoopID(ctx, loopID)
 		if err != nil {
@@ -484,11 +489,11 @@ func takeoverLoop(ctx context.Context, services looperdruntime.Services, loopID,
 			// needs to resume the exact session. Abort before any lifecycle
 			// mutation; a genuinely absent execution (nil, no error) still
 			// takes over with empty ownership fields.
-			unlockTarget()
-			unlockLoop()
+			releaseLocks()
 			return result, fmt.Errorf("load latest agent execution before takeover: %w", err)
 		}
 		if execution != nil {
+			selectedExecution = execution
 			result.Vendor = execution.Vendor
 			if execution.NativeSessionID != nil {
 				result.SessionID = strings.TrimSpace(*execution.NativeSessionID)
@@ -499,14 +504,28 @@ func takeoverLoop(ctx context.Context, services looperdruntime.Services, loopID,
 		}
 	}
 	if services.Repositories != nil && services.Repositories.Runs != nil {
-		run, err := services.Repositories.Runs.GetLatestByLoopID(ctx, loopID)
+		var run *storage.RunRecord
+		var err error
+		switch {
+		case selectedExecution != nil && selectedExecution.RunID != nil && strings.TrimSpace(*selectedExecution.RunID) != "":
+			// The execution owns the session/worktree identity. Correlate its
+			// reasoning snapshot by RunID so a newer run inserted between these
+			// reads cannot be paired with the older execution.
+			run, err = services.Repositories.Runs.GetByID(ctx, strings.TrimSpace(*selectedExecution.RunID))
+		case selectedExecution == nil:
+			// A loop can be taken over without an execution (for example while
+			// paused). In that case the latest run is the only available identity.
+			run, err = services.Repositories.Runs.GetLatestByLoopID(ctx, loopID)
+		}
 		if err != nil {
-			return result, fmt.Errorf("load latest run before takeover: %w", err)
+			releaseLocks()
+			return result, fmt.Errorf("load agent run before takeover: %w", err)
 		}
 		if run != nil && run.AgentSnapshotJSON != nil && strings.TrimSpace(*run.AgentSnapshotJSON) != "" {
 			snapshot, err := config.ParseAgentSnapshot(*run.AgentSnapshotJSON)
 			if err != nil {
-				return result, fmt.Errorf("parse latest run agent snapshot before takeover: %w", err)
+				releaseLocks()
+				return result, fmt.Errorf("parse agent run snapshot before takeover: %w", err)
 			}
 			result.ReasoningEffort = snapshot.ReasoningEffort
 		}
@@ -516,14 +535,12 @@ func takeoverLoop(ctx context.Context, services looperdruntime.Services, loopID,
 	// tick; Hold commits human_takeover and cancellation together.
 	preflight, err := loadHaltPreflight(ctx, services, loopID)
 	if err != nil {
-		unlockTarget()
-		unlockLoop()
+		releaseLocks()
 		return result, err
 	}
 	reasonCopy := reason
 	_, holdErr := services.Loops.Hold(ctx, loopID, &reasonCopy)
-	unlockTarget()
-	unlockLoop()
+	releaseLocks()
 	if holdErr != nil {
 		return result, holdErr
 	}

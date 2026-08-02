@@ -11,16 +11,19 @@ func TestIsHotEditablePathUsesExplicitAllowlist(t *testing.T) {
 	allowed := []string{
 		"agent.vendor",
 		"agent.model",
+		"agent.reasoningEffort",
 		"agent.env",
 		"agent.env.OPENAI_API_KEY",
 		"agent.timeouts.workerMaxRuntimeSeconds",
 		"agent.profiles.fast",
 		"agent.profiles.fast.vendor",
 		"agent.profiles.fast.model",
+		"agent.profiles.fast.reasoningEffort",
 		"agent.profiles.my-profile_1.vendor",
 		"roles.planner.agent.profile",
 		"roles.worker.agent.vendor",
 		"roles.reviewer.agent.model",
+		"roles.fixer.agent.reasoningEffort",
 		"roles.fixer.agent.profile",
 		"scheduler.maxConcurrentRuns",
 		"scheduler.slowLaneWarnThresholdMs",
@@ -289,6 +292,33 @@ func TestRestartRequiredChangesRoleAgentModelIsHot(t *testing.T) {
 
 	if got := RestartRequiredChanges(oldConfig, newConfig); len(got) != 0 {
 		t.Fatalf("RestartRequiredChanges() = %#v, want no restart-bound changes for role model-only edit", got)
+	}
+}
+
+func TestRestartRequiredChangesReasoningEffortIsHotAtEveryScope(t *testing.T) {
+	t.Parallel()
+
+	oldConfig, err := DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	low := ReasoningEffortLow
+	oldConfig.Agent.ReasoningEffort = &low
+	oldConfig.Agent.Profiles = map[string]AgentBindingConfig{
+		"fast": {ReasoningEffort: &low},
+	}
+	oldConfig.Roles.Worker.Agent = &RoleAgentConfig{ReasoningEffort: &low}
+
+	newConfig := CloneConfig(oldConfig)
+	high := ReasoningEffortHigh
+	newConfig.Agent.ReasoningEffort = &high
+	profile := newConfig.Agent.Profiles["fast"]
+	profile.ReasoningEffort = &high
+	newConfig.Agent.Profiles["fast"] = profile
+	newConfig.Roles.Worker.Agent.ReasoningEffort = &high
+
+	if got := RestartRequiredChanges(oldConfig, newConfig); len(got) != 0 {
+		t.Fatalf("RestartRequiredChanges() = %#v, want no restart-bound reasoning effort changes", got)
 	}
 }
 

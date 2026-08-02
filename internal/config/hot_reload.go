@@ -12,9 +12,10 @@ import (
 )
 
 var hotEditablePaths = map[string]struct{}{
-	"agent.vendor": {},
-	"agent.model":  {},
-	"agent.env":    {},
+	"agent.vendor":          {},
+	"agent.model":           {},
+	"agent.reasoningEffort": {},
+	"agent.env":             {},
 	"agent.timeouts.plannerIdleTimeoutSeconds":  {},
 	"agent.timeouts.plannerMaxRuntimeSeconds":   {},
 	"agent.timeouts.workerIdleTimeoutSeconds":   {},
@@ -183,6 +184,7 @@ func IsHotEditablePath(path string) bool {
 //   - agent.profiles.<id>           (whole profile set/unset)
 //   - agent.profiles.<id>.vendor
 //   - agent.profiles.<id>.model
+//   - agent.profiles.<id>.reasoningEffort
 //
 // Whole-map agent.profiles and unknown nested fields are rejected.
 func isHotAgentProfilePath(path string) bool {
@@ -201,7 +203,7 @@ func isHotAgentProfilePath(path string) bool {
 		return true
 	}
 	switch segments[3] {
-	case "vendor", "model":
+	case "vendor", "model", "reasoningEffort":
 		return true
 	default:
 		return false
@@ -209,7 +211,7 @@ func isHotAgentProfilePath(path string) bool {
 }
 
 // isHotRoleAgentPath allows coding-role agent binding leaves:
-// roles.{planner,worker,reviewer,fixer}.agent.{profile,vendor,model}
+// roles.{planner,worker,reviewer,fixer}.agent.{profile,vendor,model,reasoningEffort}
 func isHotRoleAgentPath(path string) bool {
 	segments := strings.Split(path, ".")
 	if len(segments) != 4 {
@@ -222,7 +224,7 @@ func isHotRoleAgentPath(path string) bool {
 		return false
 	}
 	switch segments[3] {
-	case "profile", "vendor", "model":
+	case "profile", "vendor", "model", "reasoningEffort":
 		return true
 	default:
 		return false
