@@ -854,8 +854,9 @@ decides what it may do with that judgement.
 the `Looper Gatekeeper` status context on the target branch. The status is the
 enforcement point for Mergify's branch-protection queue injection on the PR head;
 the local Gate report remains audit evidence only. If protection does not
-require that context, Gatekeeper publishes a failing status rather than
-claiming the PR is eligible.
+require that context, Gatekeeper publishes a failing status and marks the PR
+ineligible — but an *unrequired* failing status cannot stop merge, so operators
+must add the required check before relying on `auto`.
 
 **Known limitations at `auto`:**
 
@@ -871,6 +872,11 @@ claiming the PR is eligible.
   trust is `auto`. Auditor still reads Gatekeeper `MergeOutcome` events that
   status-only auto no longer emits; forge-observed merge evidence is not yet
   implemented.
+- `roles.coordinator.postMergeDigest` still classifies merges from Coordinator
+  merge-watch events and historical Gatekeeper `MergeOutcome` rows. Status-only
+  `auto` does not emit new merge-outcome events, so Mergify or manual merges
+  without a linked Coordinator merge-watch are absent from the daily digest
+  until forge-observed merge evidence exists.
 
 ```toml
 [roles.gatekeeper]

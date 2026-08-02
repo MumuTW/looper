@@ -258,6 +258,9 @@ type gatekeeperFixture struct {
 	github        *fakeGatekeeperGitHub
 	now           time.Time
 	policyPermits bool
+	// closeDB closes the underlying SQLite coordinator so a test can force a
+	// persistence failure mid-discovery.
+	closeDB func() error
 }
 
 func newGatekeeperFixture(t *testing.T) *gatekeeperFixture {
@@ -303,6 +306,7 @@ func newGatekeeperFixtureWithReview(t *testing.T, seedReview bool) *gatekeeperFi
 			reviewMarker: githubinfra.ReviewMarkerResult{Found: true, Outcome: "clean", Event: "APPROVE", AuthorLogin: "looper-bot"},
 		},
 		policyPermits: true,
+		closeDB:       coordinator.Close,
 	}
 	if seedReview {
 		seedReviewerReviewEvent(t, fixture, "head-1", "APPROVE", "reviewer-loop", 0)

@@ -301,6 +301,14 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 	ctx = withDeferCommitStatus(ctx)
 	trust := r.trustFor(input.ProjectID)
 	result := DiscoveryResult{Reports: make([]Report, 0, len(pullRequests))}
+	// Deferred commit statuses must still publish on abort: a blocked report that
+	// was already evaluated this tick is durable in result.Reports, and leaving
+	// without publishing would keep a prior success visible to branch protection.
+	publishDeferredStatuses := func() {
+		if trust == config.GatekeeperTrustAuto {
+			r.publishDiscoveryCommitStatuses(ctx, input.ProjectID, input.Repo, input.CWD, result.Reports)
+		}
+	}
 	diffBudget := r.diffBudget(input.ProjectID)
 	budgetEnabled := diffBudget.MaxChangedFiles > 0 || diffBudget.MaxDeletions > 0
 	stillOpen := make(map[string]struct{}, len(pullRequests))
@@ -335,6 +343,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 			CWD: input.CWD, ExpectedHeadSHA: pullRequest.HeadSHA, SourceFingerprint: fingerprint,
 		})
 		if err != nil {
+			publishDeferredStatuses()
 			return result, err
 		}
 		result.Evaluated++
@@ -346,14 +355,13 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 			ProjectID: input.ProjectID, Repo: input.Repo, PRNumber: previousReports[entityID].PRNumber, CWD: input.CWD,
 		})
 		if err != nil {
+			publishDeferredStatuses()
 			return result, err
 		}
 		result.Reconciled++
 		result.Reports = append(result.Reports, report)
 	}
-	if trust == config.GatekeeperTrustAuto {
-		r.publishDiscoveryCommitStatuses(ctx, input.ProjectID, input.Repo, input.CWD, result.Reports)
-	}
+	publishDeferredStatuses()
 	return result, nil
 }
 

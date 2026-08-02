@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	githubinfra "github.com/MumuTW/looper/internal/infra/github"
+	"github.com/MumuTW/looper/internal/labels"
 )
 
 func TestAutoGatekeeperIgnoresBlockedMergeabilityWhilePublishingOwnStatus(t *testing.T) {
@@ -191,5 +192,50 @@ func TestAutoGatekeeperRejectsAppBoundRequiredStatusContext(t *testing.T) {
 	}
 	if report.Eligible || !hasReason(report, ReasonGatekeeperCheckRequired) {
 		t.Fatalf("report = %#v, want app-bound gatekeeper context failure", report)
+	}
+}
+
+func TestDiscoverPullRequestsPublishesKnownHeadsOnAbort(t *testing.T) {
+	fixture := newGatekeeperFixture(t)
+	fixture.github.protection.RequiredChecks = []string{"ci", RequiredStatusContext}
+	fixture.github.protection.RequiredCheckRules = append(fixture.github.protection.RequiredCheckRules, githubinfra.RequiredCheckRule{Context: RequiredStatusContext})
+	fixture.github.reviewMarker = githubinfra.ReviewMarkerResult{Found: true, Outcome: "clean", Event: "APPROVE", AuthorLogin: "looper-bot"}
+	mergeable := true
+	fixture.github.openPullRequests = []githubinfra.PullRequestSummary{
+		{Number: 41, HeadSHA: "head-a", State: "OPEN", UpdatedAt: "2026-07-30T10:00:00Z", BaseRefName: "main", ReviewDecision: "APPROVED", Labels: []string{labels.HoldGlobal}},
+		{Number: 42, HeadSHA: "head-b", State: "OPEN", UpdatedAt: "2026-07-30T10:00:00Z", BaseRefName: "main", ReviewDecision: "APPROVED"},
+	}
+	views := 0
+	fixture.github.beforeView = func(f *fakeGatekeeperGitHub) {
+		views++
+		switch views {
+		case 1:
+			f.detail = githubinfra.PullRequestDetail{
+				Number: 41, State: "OPEN", HeadSHA: "head-a", BaseRefName: "main",
+				ReviewDecision: "APPROVED", Labels: []string{labels.HoldGlobal},
+			}
+			f.mergeable = githubinfra.PullRequestDetail{Number: 41, HeadSHA: "head-a", Mergeable: &mergeable, MergeableState: "clean"}
+			f.finalHeadSHA = "head-a"
+		default:
+			if fixture.closeDB != nil {
+				_ = fixture.closeDB()
+			}
+			f.detail = githubinfra.PullRequestDetail{
+				Number: 42, State: "OPEN", HeadSHA: "head-b", BaseRefName: "main", ReviewDecision: "APPROVED",
+			}
+			f.mergeable = githubinfra.PullRequestDetail{Number: 42, HeadSHA: "head-b", Mergeable: &mergeable, MergeableState: "clean"}
+			f.finalHeadSHA = "head-b"
+		}
+	}
+
+	result, err := fixture.autoRunner().DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err == nil {
+		t.Fatalf("DiscoverPullRequests() error = nil, want persistence abort after the first evaluation")
+	}
+	if result.Evaluated != 1 || len(result.Reports) != 1 || result.Reports[0].Eligible {
+		t.Fatalf("result = %#v, want one blocked report retained before abort", result)
+	}
+	if len(fixture.github.statusCalls) != 1 || fixture.github.statusCalls[0].SHA != "head-a" || fixture.github.statusCalls[0].State != "failure" {
+		t.Fatalf("status calls = %#v, want fail-closed status for the known blocked head on abort", fixture.github.statusCalls)
 	}
 }
