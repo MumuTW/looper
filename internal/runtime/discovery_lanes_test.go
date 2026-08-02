@@ -182,8 +182,8 @@ func TestInternalDiscoveryLanesResolveAgentProviders(t *testing.T) {
 	for _, lane := range lanes {
 		byName[lane.Name] = lane
 	}
-	if got := byName["triager"].Provider("project"); got != string(claude) {
-		t.Fatalf("triager provider = %q, want planner provider %q", got, claude)
+	if byName["triager"].Provider != nil {
+		t.Fatal("triager lane should not gate enrollment and state processing")
 	}
 	if byName["coordinator"].Provider != nil {
 		t.Fatal("coordinator lane should not gate the entire maintenance pass")

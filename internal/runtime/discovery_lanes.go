@@ -195,9 +195,23 @@ func triagerLane(input defaultSchedulerTickInput) discoveryLane {
 			return input.TriagerEnabled != nil && input.TriagerEnabled(projectID)
 		},
 		Discover: func(ctx context.Context, projectID, repo string, snapshot *githubinfra.DiscoverySnapshot) ([]storage.QueueItemRecord, error) {
+			var decisionAdmission func() (bool, error)
+			if input.Config != nil && input.AllowClaimForVendor != nil {
+				if resolved, ok := config.ResolveAgent(*input.Config, projectID, config.CodingRolePlanner); ok {
+					vendor := string(resolved.Vendor)
+					decisionAdmission = func() (bool, error) {
+						err := input.AllowClaimForVendor(vendor)
+						if errors.Is(err, brownout.ErrOpen) {
+							return false, nil
+						}
+						return err == nil, err
+					}
+				}
+			}
 			result, err := input.Triager.DiscoverIssues(ctx, triager.DiscoveryInput{
 				ProjectID: projectID, Repo: repo, Snapshot: snapshot,
 				DecisionBudget: decisionBudget, PendingForgeReadBudget: readBudget,
+				DecisionAdmission: decisionAdmission,
 			})
 			if input.Logger != nil && result.PendingSourcesDeferred > 0 {
 				input.Logger.Info("triager pending forge reads exhausted", map[string]any{
@@ -210,15 +224,6 @@ func triagerLane(input defaultSchedulerTickInput) discoveryLane {
 			}
 			return result.QueueItems, err
 		},
-	}
-	if input.Config != nil {
-		lane.Provider = func(projectID string) string {
-			resolved, ok := config.ResolveAgent(*input.Config, projectID, config.CodingRolePlanner)
-			if !ok {
-				return ""
-			}
-			return string(resolved.Vendor)
-		}
 	}
 	return lane
 }

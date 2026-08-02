@@ -238,6 +238,10 @@ type DiscoveryInput struct {
 	ProjectID string
 	Repo      string
 	Snapshot  *githubinfra.DiscoverySnapshot
+	// DecisionAdmission is a non-holding point check for the LLM decision.
+	// Enrollment, retirement, and confirmation processing must continue when
+	// the provider is brownout-open; the common executor owns spawn admission.
+	DecisionAdmission func() (bool, error)
 	// DecisionBudget is the tick-wide decision cap shared by every project in the
 	// tick. Nil means uncapped.
 	DecisionBudget *DecisionBudget
@@ -427,7 +431,7 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 			result.Skipped++
 			continue
 		}
-		if err := r.processSourceState(ctx, *project, input.Repo, state, repositoryVisibility, input.DecisionBudget, input.PendingForgeReadBudget, &result); err != nil {
+		if err := r.processSourceState(ctx, *project, input.Repo, state, input.DecisionBudget, input.PendingForgeReadBudget, input.DecisionAdmission, &result); err != nil {
 			if errors.Is(err, errPendingForgeReadBudgetExhausted) {
 				result.PendingSourcesDeferred++
 				result.Skipped++
@@ -535,7 +539,7 @@ func pendingSourceStates(states map[string]*sourceState) []*sourceState {
 	return pending
 }
 
-func (r *Runner) processSourceState(ctx context.Context, project storage.ProjectRecord, repo string, state *sourceState, repositoryVisibility string, decisionBudget *DecisionBudget, readBudget *PendingForgeReadBudget, result *DiscoveryResult) error {
+func (r *Runner) processSourceState(ctx context.Context, project storage.ProjectRecord, repo string, state *sourceState, decisionBudget *DecisionBudget, readBudget *PendingForgeReadBudget, decisionAdmission func() (bool, error), result *DiscoveryResult) error {
 	enrollment := state.enrollment
 	if !reservePendingForgeRead(readBudget, project.ID, result) {
 		return errPendingForgeReadBudgetExhausted
@@ -572,21 +576,22 @@ func (r *Runner) processSourceState(ctx context.Context, project storage.Project
 				Visibility: visibility, Held: domain.IsAutoLaneHeldForNamespace(domain.LoopTypePlanner, detail.Labels, namespace),
 			})
 		}
-		var decision Decision
-		if admissionDecision.Outcome == admission.OutcomeLegacy || admissionDecision.Classify {
-			// Only model classification consumes the shared tick budget. Deterministic
-			// auto/ignore decisions cannot starve another project's assessment.
-			if result.DecisionsAttempted >= r.decisionLimit {
-				return nil
-			}
-			if !decisionBudget.Reserve() {
-				return nil
-			}
-			result.DecisionsAttempted++
-			decision, err = r.decide(ctx, project, repo, detail)
+		if decisionAdmission != nil {
+			admitted, err := decisionAdmission()
 			if err != nil {
 				return err
 			}
+			if !admitted {
+				return nil
+			}
+		}
+		if !decisionBudget.Reserve() {
+			return nil
+		}
+		result.DecisionsAttempted++
+		decision, err := r.decide(ctx, project, repo, detail)
+		if err != nil {
+			return err
 		}
 		if !reservePendingForgeRead(readBudget, project.ID, result) {
 			return errPendingForgeReadBudgetExhausted
