@@ -38,6 +38,7 @@ import (
 	"github.com/MumuTW/looper/internal/storage"
 	"github.com/MumuTW/looper/internal/validation"
 	"github.com/MumuTW/looper/internal/worker/workflow"
+	"github.com/MumuTW/looper/internal/workgraphdispatch"
 	"github.com/MumuTW/looper/internal/worktreesafety"
 )
 
@@ -583,6 +584,7 @@ type Runner struct {
 	hitlNotify                  HITLNotifyFunc
 	hitlAnswerTransport         string
 	hitlGitHub                  HITLGitHubSettings
+	workGraphs                  *workgraphdispatch.Service
 }
 
 type DiscoveryInput struct {
@@ -1123,7 +1125,7 @@ func New(options Options) *Runner {
 	if policy.LabelMode == "" {
 		policy = DiscoveryPolicy{AutoDiscovery: true, Labels: []string{labels.DefaultWorkerReadyTrigger}, LabelMode: config.LabelModeAll, RequireAssigneeCurrentUser: true}
 	}
-	return &Runner{
+	runner := &Runner{
 		db:                          options.DB,
 		repos:                       options.Repos,
 		github:                      options.GitHub,
@@ -1161,6 +1163,8 @@ func New(options Options) *Runner {
 		hitlAnswerTransport:         options.HITLAnswerTransport,
 		hitlGitHub:                  options.HITLGitHub,
 	}
+	runner.workGraphs = workgraphdispatch.New(workgraphdispatch.Options{DB: options.DB, Repositories: options.Repos, Now: now, RetryMaxAttempts: retryMaxAttempts, OnEnqueued: options.OnQueueItemEnqueued})
+	return runner
 }
 
 func cloneValidationCommandsByProject(source map[string][]string) map[string][]string {
@@ -1521,6 +1525,21 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	}
 	if result, finalized, err := r.finalizePriorSuccessfulClaim(ctx, *loop, queueItem); err != nil || finalized {
 		return result, err
+	}
+	if graphQueueItem(queueItem) {
+		claimed, err := r.workGraphs.ClaimWorkerNode(ctx, loop.ID)
+		if err != nil {
+			return runpipe.ProcessResult{}, err
+		}
+		if !claimed {
+			reclaimed, err := r.workGraphs.ReclaimWorkerNode(ctx, loop.ID)
+			if err != nil {
+				return runpipe.ProcessResult{}, err
+			}
+			if !reclaimed {
+				return r.finishDuplicateGraphQueueItem(ctx, *loop, queueItem)
+			}
+		}
 	}
 	if err := r.revalidateRoutedWorkerClaim(ctx, *project, *loop, queueItem); err != nil {
 		return runpipe.ProcessResult{}, err
@@ -3058,6 +3077,11 @@ func workerWorkForPullRequest(work workerInput, pr PullRequestSummary) workerInp
 func (r *Runner) finishHeldWorkerQueueItem(ctx context.Context, project storage.ProjectRecord, loop storage.LoopRecord, run *storage.RunRecord, queueItem storage.QueueItemRecord, checkpoint workerCheckpoint, summary string) (runpipe.ProcessResult, error) {
 	checkpoint.SkipReason = summary
 	checkpoint.ResumePolicy = loops.ResumePolicyAdvanceFromCheckpoint
+	if graphQueueItem(queueItem) && queueItem.LoopID != nil {
+		if err := r.workGraphs.ReleaseWorkerNode(ctx, *queueItem.LoopID); err != nil {
+			return runpipe.ProcessResult{}, err
+		}
+	}
 	if run != nil {
 		finishedAt := r.nowISO()
 		completed := completedRunRecord(*run, "success", summary, "", checkpoint, finishedAt)
@@ -3336,10 +3360,47 @@ func (r *Runner) finalizeSuccessfulClaim(ctx context.Context, run storage.RunRec
 	}
 	finishedAt := r.nowISO()
 	completed := completedRunRecord(run, "success", summary, "", checkpoint, finishedAt)
-	if err := storage.FinalizeWorkerSuccess(ctx, r.db, storage.WorkerSuccessFinalizationInput{Run: completed, QueueItemID: queueItem.ID, LoopID: loop.ID, LoopStatus: "completed", FinishedAt: finishedAt, RequeueForHumanInbox: requeueForHumanInbox}); err != nil {
+	unlocked := false
+	finalizeInput := storage.WorkerSuccessFinalizationInput{Run: completed, QueueItemID: queueItem.ID, LoopID: loop.ID, LoopStatus: "completed", FinishedAt: finishedAt, RequeueForHumanInbox: requeueForHumanInbox}
+	if checkpoint.SkipReason == "" {
+		finalizeInput.AfterFinalize = r.workGraphFinalizationHook(loop.ID, checkpoint, &unlocked)
+	} else if graphQueueItem(queueItem) {
+		if err := r.workGraphs.SettleSkippedWorkerNode(ctx, loop.ID, checkpoint.SkipReason); err != nil {
+			return storage.RunRecord{}, err
+		}
+	}
+	if err := storage.FinalizeWorkerSuccess(ctx, r.db, finalizeInput); err != nil {
 		return storage.RunRecord{}, errors.Join(ErrSuccessfulClaimFinalization, err)
 	}
+	if unlocked {
+		r.workGraphs.Wake()
+	}
 	return completed, nil
+}
+
+func (r *Runner) workGraphFinalizationHook(loopID string, checkpoint workerCheckpoint, unlocked *bool) func(context.Context, *storage.Repositories) error {
+	return func(ctx context.Context, repos *storage.Repositories) error {
+		queued, err := r.workGraphs.CompleteWorkerNodeInTransaction(ctx, repos, loopID, graphWorkerCompletedBranch(checkpoint))
+		if err == nil && unlocked != nil && len(queued) > 0 {
+			*unlocked = true
+		}
+		return err
+	}
+}
+
+func graphWorkerCompletedBranch(checkpoint workerCheckpoint) string {
+	if checkpoint.Lifecycle != nil {
+		if branch := firstNonEmpty(checkpoint.Lifecycle.ActiveBranch, checkpoint.Lifecycle.AgentBranch, checkpoint.Lifecycle.Branch); branch != "" {
+			return branch
+		}
+	}
+	if checkpoint.Work != nil && strings.TrimSpace(checkpoint.Work.Branch) != "" {
+		return checkpoint.Work.Branch
+	}
+	if checkpoint.Worktree != nil && strings.TrimSpace(checkpoint.Worktree.Branch) != "" {
+		return checkpoint.Worktree.Branch
+	}
+	return ""
 }
 
 func (r *Runner) finalizePriorSuccessfulClaim(ctx context.Context, loop storage.LoopRecord, queueItem storage.QueueItemRecord) (runpipe.ProcessResult, bool, error) {
@@ -3361,6 +3422,27 @@ func (r *Runner) finalizePriorSuccessfulClaim(ctx context.Context, loop storage.
 	}
 	status := statusForCheckpoint(checkpoint)
 	return runpipe.ProcessResult{LoopID: loop.ID, RunID: completed.ID, QueueItemID: queueItem.ID, Status: status, Summary: summary, PullRequestNumber: pullRequestNumber(checkpoint.PullRequest)}, true, nil
+}
+
+func (r *Runner) finishDuplicateGraphQueueItem(ctx context.Context, loop storage.LoopRecord, queueItem storage.QueueItemRecord) (runpipe.ProcessResult, error) {
+	finishedAt := r.nowISO()
+	if err := r.repos.Queue.Complete(ctx, queueItem.ID, finishedAt); err != nil && !errors.Is(err, storage.ErrQueueItemNotActive) {
+		return runpipe.ProcessResult{}, err
+	}
+	if _, err := r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
+		updated.Status = "completed"
+		updated.LastRunAt = &finishedAt
+		updated.NextRunAt = nil
+	}); err != nil {
+		return runpipe.ProcessResult{}, err
+	}
+	return runpipe.ProcessResult{LoopID: loop.ID, QueueItemID: queueItem.ID, Status: "skipped", Summary: "Work graph node already claimed or settled"}, nil
+}
+
+func graphQueueItem(queueItem storage.QueueItemRecord) bool {
+	payload := parseJSONObject(queueItem.PayloadJSON)
+	_, ok := payload["workGraphID"].(string)
+	return ok
 }
 
 // CanFinalizeSuccessfulClaim prevents a later queue generation from being
@@ -3766,7 +3848,30 @@ func (r *Runner) failQueueItem(ctx context.Context, queueItem storage.QueueItemR
 	}
 	nextAttempts := queueItem.Attempts + 1
 	nowISO := r.nowISO()
+	isGraph := graphQueueItem(queueItem) && queueItem.LoopID != nil
 	if !runpipe.ShouldRetryQueueFailure(kind, nextAttempts, queueItem.MaxAttempts) {
+		if isGraph {
+			replanned := false
+			err := storage.WithTransaction(ctx, r.db, nil, func(tx *sql.Tx) error {
+				repos := storage.NewRepositories(tx)
+				if err := repos.Queue.Fail(ctx, storage.QueueFailInput{ID: queueItem.ID, Attempts: nextAttempts, FinishedAt: nowISO, ErrorMessage: runpipe.OptionalString(message), ErrorKind: string(kind), UpdatedAt: nowISO}); err != nil {
+					return err
+				}
+				var failErr error
+				replanned, failErr = r.workGraphs.FailWorkerNodeInTransaction(ctx, repos, *queueItem.LoopID, message)
+				return failErr
+			})
+			if err != nil {
+				if recovered, getErr := r.repos.Queue.GetByID(ctx, queueItem.ID); getErr == nil && recovered != nil && (recovered.Status == "manual_intervention" || recovered.Status == "completed" || recovered.Status == "failed") {
+					return recovered, nil
+				}
+				return nil, err
+			}
+			if replanned {
+				r.workGraphs.Wake()
+			}
+			return r.repos.Queue.GetByID(ctx, queueItem.ID)
+		}
 		if err := r.repos.Queue.Fail(ctx, storage.QueueFailInput{ID: queueItem.ID, Attempts: nextAttempts, FinishedAt: nowISO, ErrorMessage: runpipe.OptionalString(message), ErrorKind: string(kind), UpdatedAt: nowISO}); err != nil {
 			if recovered, getErr := r.repos.Queue.GetByID(ctx, queueItem.ID); getErr == nil && recovered != nil && (recovered.Status == "manual_intervention" || recovered.Status == "completed" || recovered.Status == "failed") {
 				return recovered, nil
@@ -3776,6 +3881,22 @@ func (r *Runner) failQueueItem(ctx context.Context, queueItem storage.QueueItemR
 		return r.repos.Queue.GetByID(ctx, queueItem.ID)
 	}
 	retryAt := eventlog.FormatJavaScriptISOString(r.now().Add(runpipe.BackoffDelayLinear(r.retryBaseDelay, runpipe.CappedRetryDelayAttempt(nextAttempts, queueItem.MaxAttempts))))
+	if isGraph {
+		err := storage.WithTransaction(ctx, r.db, nil, func(tx *sql.Tx) error {
+			repos := storage.NewRepositories(tx)
+			if err := repos.Queue.MarkRetry(ctx, storage.QueueMarkRetryInput{ID: queueItem.ID, AvailableAt: retryAt, Attempts: nextAttempts, ErrorMessage: runpipe.OptionalString(message), ErrorKind: string(kind), UpdatedAt: nowISO}); err != nil {
+				return err
+			}
+			return r.workGraphs.ReleaseWorkerNodeInTransaction(ctx, repos, *queueItem.LoopID)
+		})
+		if err != nil {
+			if recovered, getErr := r.repos.Queue.GetByID(ctx, queueItem.ID); getErr == nil && recovered != nil && (recovered.Status == "manual_intervention" || recovered.Status == "completed" || recovered.Status == "failed") {
+				return recovered, nil
+			}
+			return nil, err
+		}
+		return r.repos.Queue.GetByID(ctx, queueItem.ID)
+	}
 	if err := r.repos.Queue.MarkRetry(ctx, storage.QueueMarkRetryInput{ID: queueItem.ID, AvailableAt: retryAt, Attempts: nextAttempts, ErrorMessage: runpipe.OptionalString(message), ErrorKind: string(kind), UpdatedAt: nowISO}); err != nil {
 		if recovered, getErr := r.repos.Queue.GetByID(ctx, queueItem.ID); getErr == nil && recovered != nil && (recovered.Status == "manual_intervention" || recovered.Status == "completed" || recovered.Status == "failed") {
 			return recovered, nil

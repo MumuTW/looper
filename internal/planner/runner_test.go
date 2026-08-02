@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -26,7 +27,7 @@ func TestBuildPlannerPromptUsesConcreteDisclosureMetadata(t *testing.T) {
 	t.Parallel()
 
 	repoPath := t.TempDir()
-	prompt, _ := buildPlannerPrompt(storage.ProjectRecord{ID: "project_1", RepoPath: repoPath}, customInstructionConfig(nil), &checkpointIssue{Repo: "acme/looper", IssueNumber: 156, Title: "fix disclosure", SpecPath: "docs/spec.md"}, &checkpointWorktree{Branch: "looper/fix", BaseBranch: "main"}, true, config.DefaultDisclosureConfig(), "opencode", "openai/gpt-5.5")
+	prompt, _ := buildPlannerPrompt(storage.ProjectRecord{ID: "project_1", RepoPath: repoPath}, customInstructionConfig(nil), &checkpointIssue{Repo: "acme/looper", IssueNumber: 156, Title: "fix disclosure", SpecPath: "docs/spec.md"}, &checkpointWorktree{Branch: "looper/fix", BaseBranch: "main"}, true, config.DefaultDisclosureConfig(), "opencode", "openai/gpt-5.5", true)
 	for _, want := range []string{"agent=opencode"} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("prompt missing %q:\n%s", want, prompt)
@@ -43,7 +44,7 @@ func TestBuildPlannerPromptOmitsMissingAgentRuntime(t *testing.T) {
 	t.Parallel()
 
 	repoPath := t.TempDir()
-	prompt, _ := buildPlannerPrompt(storage.ProjectRecord{ID: "project_1", RepoPath: repoPath}, customInstructionConfig(nil), &checkpointIssue{Repo: "acme/looper", IssueNumber: 156, Title: "fix disclosure", SpecPath: "docs/spec.md"}, &checkpointWorktree{Branch: "looper/fix", BaseBranch: "main"}, true, config.DefaultDisclosureConfig(), "", "openai/gpt-5.5")
+	prompt, _ := buildPlannerPrompt(storage.ProjectRecord{ID: "project_1", RepoPath: repoPath}, customInstructionConfig(nil), &checkpointIssue{Repo: "acme/looper", IssueNumber: 156, Title: "fix disclosure", SpecPath: "docs/spec.md"}, &checkpointWorktree{Branch: "looper/fix", BaseBranch: "main"}, true, config.DefaultDisclosureConfig(), "", "openai/gpt-5.5", true)
 	if strings.Contains(prompt, "agent=") {
 		t.Fatalf("prompt should omit missing agent runtime:\n%s", prompt)
 	}
@@ -792,6 +793,66 @@ func TestRunWriteSpecStepRechecksPlannerHoldBeforeStartingAgent(t *testing.T) {
 	if len(agent.starts) != 0 {
 		t.Fatalf("len(agent.starts) = %d, want agent not started", len(agent.starts))
 	}
+}
+
+func TestRunWriteSpecStepPersistsStructuredWorkGraphAndQueuesOnlyRoot(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	worktreeRoot := t.TempDir()
+	worktreePath := filepath.Join(worktreeRoot, "wt")
+	if err := os.MkdirAll(worktreePath, 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	metadata := fmt.Sprintf(`{"worktreeRoot":%q}`, worktreeRoot)
+	issue := &checkpointIssue{Repo: "acme/looper", IssueNumber: 339, Title: "Stack work", SpecPath: "specs/339.md"}
+	loopResult, err := (&Runner{repos: fixture.repos, now: fixture.now}).ensureLoopForIssue(context.Background(), storage.ProjectRecord{ID: "project_1"}, issue.Repo, IssueSummary{Number: issue.IssueNumber, Title: issue.Title}, buildPlannerDiscoveryFingerprint(issue.Repo, fixture.now(), IssueSummary{Number: issue.IssueNumber, Title: issue.Title}))
+	if err != nil {
+		t.Fatalf("ensureLoopForIssue() error = %v", err)
+	}
+	runID := "run_write_spec_graph"
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: runID, LoopID: loopResult.record.ID, Status: "running", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	payload := `{"summary":"decomposed","workGraph":{"nodes":[{"key":"storage","goal":"Persist graph","acceptanceCriteria":["migration"],"expectedPrScope":"storage"},{"key":"api","goal":"Expose graph","acceptanceCriteria":["route"],"dependencies":["storage"],"expectedPrScope":"api"}]}}`
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "decomposed", CompletionPayload: payload}}}, Logger: fixture.logger, Now: fixture.now})
+
+	checkpoint, err := runner.runWriteSpecStep(context.Background(), stepInput{
+		Project: storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir(), MetadataJSON: &metadata},
+		Loop:    loopResult.record,
+		Run:     storage.RunRecord{ID: runID, LoopID: loopResult.record.ID},
+		Checkpoint: plannerCheckpoint{
+			Issue: issue, Worktree: &checkpointWorktree{Path: worktreePath, Branch: "looper/planner/339-stack", BaseBranch: "main"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("runWriteSpecStep() error = %v", err)
+	}
+	if checkpoint.WriteSpec == nil || checkpoint.WriteSpec.WorkGraphID == "" {
+		t.Fatalf("checkpoint.WriteSpec = %#v, want persisted graph id", checkpoint.WriteSpec)
+	}
+	nodes, err := fixture.repos.PlannerWorkGraphs.ListNodes(context.Background(), checkpoint.WriteSpec.WorkGraphID)
+	if err != nil {
+		t.Fatalf("ListNodes() error = %v", err)
+	}
+	if len(nodes) != 2 || nodeState(nodes, "storage") != "pending" || nodeState(nodes, "api") != "pending" {
+		t.Fatalf("nodes = %#v, want both pending before planner publish activates the graph", nodes)
+	}
+	queued, err := runner.workGraphs.Activate(context.Background(), checkpoint.WriteSpec.WorkGraphID)
+	if err != nil {
+		t.Fatalf("Activate() error = %v", err)
+	}
+	if got, want := queued, []string{"storage"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("Activate() = %v, want %v", got, want)
+	}
+}
+
+func nodeState(nodes []storage.PlannerWorkGraphNodeRecord, key string) string {
+	for _, node := range nodes {
+		if node.NodeKey == key {
+			return node.State
+		}
+	}
+	return ""
 }
 
 func TestRunWriteSpecStepRechecksPlannerHoldAfterAgentCompletion(t *testing.T) {

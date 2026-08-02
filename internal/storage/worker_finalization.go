@@ -15,6 +15,10 @@ type WorkerSuccessFinalizationInput struct {
 	LoopStatus           string
 	FinishedAt           string
 	RequeueForHumanInbox bool
+	// AfterFinalize joins a successful terminal worker result to another
+	// storage-owned transition (for example, unlocking a Planner work-graph
+	// child) before this transaction commits.
+	AfterFinalize func(context.Context, *Repositories) error
 }
 
 // FinalizeWorkerSuccess atomically records run success, consumes the queue
@@ -80,6 +84,11 @@ func FinalizeWorkerSuccess(ctx context.Context, db *sql.DB, input WorkerSuccessF
 			loop.UpdatedAt = input.FinishedAt
 			if err := repos.Loops.Upsert(ctx, *loop); err != nil {
 				return err
+			}
+		}
+		if input.AfterFinalize != nil {
+			if err := input.AfterFinalize(ctx, repos); err != nil {
+				return fmt.Errorf("finalize worker success follow-up: %w", err)
 			}
 		}
 		return nil

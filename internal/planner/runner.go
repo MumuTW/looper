@@ -24,7 +24,9 @@ import (
 	"github.com/MumuTW/looper/internal/loops"
 	"github.com/MumuTW/looper/internal/loops/failureclass"
 	"github.com/MumuTW/looper/internal/loops/runpipe"
+	"github.com/MumuTW/looper/internal/planner/workgraph"
 	"github.com/MumuTW/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/workgraphdispatch"
 	"github.com/MumuTW/looper/internal/worktreesafety"
 )
 
@@ -264,6 +266,7 @@ type AgentResult struct {
 	Summary                      string
 	Stdout                       string
 	Stderr                       string
+	CompletionPayload            string
 	Commits                      []string
 	Lifecycle                    *lifecycle.State
 	TimeoutType                  string
@@ -349,6 +352,7 @@ type Runner struct {
 	onAgentExecutionStarted AgentExecutionStartedFunc
 	onQueueItemEnqueued     func()
 	discoveryPolicy         DiscoveryPolicy
+	workGraphs              *workgraphdispatch.Service
 }
 
 type DiscoveryInput struct {
@@ -417,6 +421,7 @@ type checkpointWriteSpec struct {
 	Status                       string           `json:"status,omitempty"`
 	Summary                      string           `json:"summary,omitempty"`
 	Stdout                       string           `json:"stdout,omitempty"`
+	WorkGraphID                  string           `json:"workGraphId,omitempty"`
 	Commits                      []string         `json:"commits,omitempty"`
 	Lifecycle                    *lifecycle.State `json:"gitPrLifecycle,omitempty"`
 	GitReconciled                bool             `json:"gitReconciled,omitempty"`
@@ -503,7 +508,9 @@ func New(options Options) *Runner {
 	if policy.LabelMode == "" {
 		policy = DiscoveryPolicy{AutoDiscovery: true, Labels: []string{labels.DefaultPlanTrigger}, LabelMode: config.LabelModeAll, RequireAssigneeCurrentUser: true}
 	}
-	return &Runner{db: options.DB, repos: options.Repos, github: options.GitHub, git: options.Git, agentExecutor: options.AgentExecutor, logger: options.Logger, now: now, agentTimeout: agentTimeout, agentIdleTimeout: agentIdleTimeout, claimTTL: claimTTL, allowAutoPush: allowAutoPush, disclosure: disclosureCfg, agentRuntime: strings.TrimSpace(options.AgentRuntime), agentProfileID: strings.TrimSpace(options.AgentProfileID), customInstructions: customInstructionConfig(options.CustomInstructions), projectRoleConfig: options.CustomInstructions, agentModel: cloneStringPtr(options.AgentModel), retryBaseDelay: retryBaseDelay, retryMaxAttempts: retryMax, onAgentExecutionStarted: options.OnAgentExecutionStarted, onQueueItemEnqueued: options.OnQueueItemEnqueued, discoveryPolicy: policy}
+	runner := &Runner{db: options.DB, repos: options.Repos, github: options.GitHub, git: options.Git, agentExecutor: options.AgentExecutor, logger: options.Logger, now: now, agentTimeout: agentTimeout, agentIdleTimeout: agentIdleTimeout, claimTTL: claimTTL, allowAutoPush: allowAutoPush, disclosure: disclosureCfg, agentRuntime: strings.TrimSpace(options.AgentRuntime), agentProfileID: strings.TrimSpace(options.AgentProfileID), customInstructions: customInstructionConfig(options.CustomInstructions), projectRoleConfig: options.CustomInstructions, agentModel: cloneStringPtr(options.AgentModel), retryBaseDelay: retryBaseDelay, retryMaxAttempts: retryMax, onAgentExecutionStarted: options.OnAgentExecutionStarted, onQueueItemEnqueued: options.OnQueueItemEnqueued, discoveryPolicy: policy}
+	runner.workGraphs = workgraphdispatch.New(workgraphdispatch.Options{DB: options.DB, Repositories: options.Repos, Now: now, RetryMaxAttempts: retryMax, OnEnqueued: options.OnQueueItemEnqueued})
+	return runner
 }
 
 func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (DiscoveryResult, error) {
@@ -823,6 +830,14 @@ func (r *Runner) discoveryPolicyForProject(projectID string) DiscoveryPolicy {
 	return DiscoveryPolicy{AutoDiscovery: role.Discovery.Enabled, Labels: append([]string(nil), role.Discovery.Labels...), LabelMode: role.Discovery.LabelMode, RequireAssigneeCurrentUser: role.Discovery.RequireAssigneeCurrentUser}
 }
 
+func (r *Runner) workerRoleConfigured(projectID string) bool {
+	if r.projectRoleConfig == nil {
+		return true
+	}
+	_, ok := config.ResolveAgent(*r.projectRoleConfig, projectID, config.CodingRoleWorker)
+	return ok
+}
+
 func (r *Runner) ProcessNext(ctx context.Context, claimedBy string) (*runpipe.ProcessResult, error) {
 	if r.repos == nil || r.repos.Queue == nil {
 		return nil, fmt.Errorf("planner queue repository is not configured")
@@ -1092,7 +1107,7 @@ func (r *Runner) runDiscoverIssueStep(ctx context.Context, input stepInput) (pla
 		return input.Checkpoint, err
 	}
 	currentLogin := firstNonEmpty(normalizeLogin(stringFromAnyDefault(payload["currentUserLogin"])), input.CheckpointIssueLogin())
-	failureContext := stringFromAnyDefault(payload["failureContext"])
+	failureContext := mergePlannerFailureContext(stringFromAnyDefault(payload["failureContext"]), payload)
 	lockKey := firstNonEmpty(derefString(input.QueueItem.LockKey), storage.IssueLockKey(input.Project.ID, repo, issueNumber))
 	nowISO := r.nowISO()
 	reason := "planner-run"
@@ -1246,7 +1261,7 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 		if err != nil {
 			return checkpoint, fmt.Errorf("resolve run agent identity: %w", err)
 		}
-		prompt, instructionBlock := buildPlannerPrompt(input.Project, r.customInstructions, issue, worktree, r.allowAutoPush, r.disclosure, agentVendor, derefString(agentModel))
+		prompt, instructionBlock := buildPlannerPrompt(input.Project, r.customInstructions, issue, worktree, r.allowAutoPush, r.disclosure, agentVendor, derefString(agentModel), r.workerRoleConfigured(input.Project.ID))
 		metadata := map[string]any{"loopType": "planner", "repo": issue.Repo, "issueNumber": issue.IssueNumber, "specPath": issue.SpecPath}
 		for key, value := range config.CustomInstructionMetadata(instructionBlock, prompt) {
 			metadata[key] = value
@@ -1298,6 +1313,22 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 			}
 		}
 		checkpoint.WriteSpec = checkpointWriteSpecFromAgentResult(result)
+		if result.CompletionPayload != "" {
+			graph, graphErr := workgraph.ParseResult([]byte(result.CompletionPayload))
+			if graphErr != nil {
+				return checkpoint, &runpipe.LoopError{Message: "planner work graph: " + graphErr.Error(), Kind: runpipe.FailureNonRetryable}
+			}
+			if graph != nil {
+				if !r.workerRoleConfigured(input.Project.ID) {
+					return checkpoint, &runpipe.LoopError{Message: "work graph requires a configured worker agent", Kind: runpipe.FailureNonRetryable}
+				}
+				created, createErr := r.workGraphs.Create(ctx, workgraphdispatch.CreateInput{ProjectID: input.Project.ID, ParentRepo: issue.Repo, ParentIssueNumber: issue.IssueNumber, PlannerLoopID: input.Loop.ID, BaseBranch: worktree.BaseBranch, Graph: *graph})
+				if createErr != nil {
+					return checkpoint, &runpipe.LoopError{Message: "persist planner work graph: " + createErr.Error(), Kind: runpipe.FailureRetryableAfterResume}
+				}
+				checkpoint.WriteSpec.WorkGraphID = created.GraphID
+			}
+		}
 		checkpoint.ensureLifecycle("planner", worktree.Branch, worktree.BaseBranch, true)
 		if result.Lifecycle != nil {
 			checkpoint.Lifecycle.MergeAgent(result.Lifecycle, r.nowISO())
@@ -1515,7 +1546,31 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (plannerCh
 		}
 	}
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
+	if checkpoint.WriteSpec != nil && strings.TrimSpace(checkpoint.WriteSpec.WorkGraphID) != "" {
+		if _, err := r.workGraphs.Activate(ctx, checkpoint.WriteSpec.WorkGraphID); err != nil {
+			return checkpoint, &runpipe.LoopError{Message: "activate planner work graph: " + err.Error(), Kind: runpipe.FailureRetryableAfterResume}
+		}
+	}
 	return checkpoint, nil
+}
+
+func mergePlannerFailureContext(existing string, payload map[string]any) string {
+	replanReason := strings.TrimSpace(stringFromAnyDefault(payload["replanReason"]))
+	if replanReason == "" {
+		return existing
+	}
+	parts := []string{"Work graph replan context:", "- Reason: " + replanReason}
+	if graphID := strings.TrimSpace(stringFromAnyDefault(payload["workGraphID"])); graphID != "" {
+		parts = append(parts, "- Graph: "+graphID)
+	}
+	if nodeKey := strings.TrimSpace(stringFromAnyDefault(payload["failedNodeKey"])); nodeKey != "" {
+		parts = append(parts, "- Failed node: "+nodeKey)
+	}
+	replanContext := strings.Join(parts, "\n")
+	if strings.TrimSpace(existing) == "" {
+		return replanContext
+	}
+	return existing + "\n\n" + replanContext
 }
 
 func (r *Runner) plannerHoldSummary(ctx context.Context, project storage.ProjectRecord, queueItem storage.QueueItemRecord, loop storage.LoopRecord) (bool, string, error) {
@@ -2159,7 +2214,7 @@ func (c *plannerCheckpoint) ensureLifecycle(runner, branch, baseBranch string, e
 	}
 }
 
-func buildPlannerPrompt(project storage.ProjectRecord, instructionConfig config.Config, issue *checkpointIssue, worktree *checkpointWorktree, allowAutoPush bool, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string) (string, config.CustomInstructionBlock) {
+func buildPlannerPrompt(project storage.ProjectRecord, instructionConfig config.Config, issue *checkpointIssue, worktree *checkpointWorktree, allowAutoPush bool, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string, workGraphAllowed bool) (string, config.CustomInstructionBlock) {
 	parts := []string{
 		fmt.Sprintf("Write a planning spec for GitHub issue %s#%d.", issue.Repo, issue.IssueNumber),
 		"Repository: " + issue.Repo,
@@ -2197,6 +2252,11 @@ func buildPlannerPrompt(project storage.ProjectRecord, instructionConfig config.
 		"- Create or update the spec at " + issue.SpecPath,
 		"- Use Markdown with clear problem, goals, approach, risks, and validation sections",
 		"- Keep the implementation scope aligned to the issue",
+	}
+	if workGraphAllowed {
+		requirements = append(requirements,
+			"- For work that benefits from dependency-ordered child pull requests, include workGraph in the final __LOOPER_RESULT__ JSON: {\"nodes\":[{\"key\":\"stable-key\",\"goal\":\"...\",\"acceptanceCriteria\":[\"...\"],\"dependencies\":[\"prerequisite-key\"],\"expectedPrScope\":\"...\"}]}; each node may depend on at most one prerequisite; omit workGraph for one cohesive implementation",
+		)
 	}
 	if allowAutoPush {
 		requirements = append(requirements, "- Commit the spec changes on the current branch so the PR can be opened")
