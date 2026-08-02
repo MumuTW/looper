@@ -235,13 +235,13 @@ type Options struct {
 // Stateful: agent-free but not database-free — it persists Gate reports in
 // the local SQLite event log.
 type Runner struct {
-	repos                   *storage.Repositories
-	github                  GitHubGateway
-	now                     func() time.Time
-	policyPermitsTarget     func(projectID, repo, baseRefName string) bool
+	repos                *storage.Repositories
+	github               GitHubGateway
+	now                  func() time.Time
+	policyPermitsTarget  func(projectID, repo, baseRefName string) bool
 	trustForProject      func(projectID string) config.GatekeeperTrustLevel
 	diffBudgetForProject func(projectID string) config.GatekeeperDiffBudget
-	logWarn                 func(msg string, fields map[string]any)
+	logWarn              func(msg string, fields map[string]any)
 }
 
 func New(options Options) *Runner {
@@ -673,7 +673,7 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 			Repo: input.Repo, PRNumber: input.PRNumber,
 			Marker:              "looper:review id_prefix=reviewer: head=" + report.ObservedHeadSHA,
 			AllowedReviewEvents: []string{"COMMENT", "APPROVE", "REQUEST_CHANGES"},
-			AuthorLogin: login, AllowCleanComment: true, SkipInlineComments: true, CWD: input.CWD,
+			AuthorLogin:         login, AllowCleanComment: true, SkipInlineComments: true, CWD: input.CWD,
 		})
 		if markerErr != nil {
 			return r.persistProviderBlock(ctx, report, ReasonProviderStateUnavailable, "codex_review")
