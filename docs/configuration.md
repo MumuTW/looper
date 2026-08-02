@@ -928,10 +928,9 @@ The diff budget is an optional boolean change-size guard. When configured,
 Gatekeeper reads GitHub's provider-observed `changedFiles` and `deletions` for
 the exact pull-request head during evaluation and blocks the verdict when either
 count exceeds its configured bound. GitHub's provider metadata is the authority
-for the counts; the agent's output is not used. The gate runs on both the primary
-evaluation and the confirming pass before an `auto` merge, and it fails closed
-(blocking with `provider_state_unavailable`) when the enabled stats cannot be
-read.
+for the counts; the agent's output is not used. The gate runs during periodic
+Gatekeeper evaluation and fails closed (blocking with `provider_state_unavailable`)
+when the enabled stats cannot be read.
 
 | Path | Purpose | Default |
 | --- | --- | --- |
@@ -986,7 +985,7 @@ Reviewers should weigh these blind spots before relying on it:
   rewritten merge base invalidates a reused verdict rather than serving a stale
   one for up to the skip window.
 - At the `auto` trust level Gatekeeper publishes commit status only; it never
-  merges. The diff-budget gate still runs on evaluation and fails closed when
+  merges. The diff-budget gate still runs on each evaluation and fails closed when
   the enabled stats cannot be read or the merge base advances between reads.
 
 ## Pipeline digest (`roles.escalator`)

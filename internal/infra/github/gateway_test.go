@@ -1767,6 +1767,34 @@ func TestGatewayFindReviewMarkerFetchesMatchedReviewComments(t *testing.T) {
 	}
 }
 
+func TestGatewayFindReviewMarkerSkipsInlineCommentsWhenRequested(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		switch strings.Join(options.Args, " ") {
+		case "api --paginate --slurp repos/acme/looper/pulls/42/reviews":
+			return shell.Result{Stdout: `[
+				{"id":202,"state":"COMMENTED","body":"<!-- looper:review id=abc head=def outcome=clean -->"}
+			]`}, nil
+		default:
+			t.Fatalf("unexpected gh args: %q", strings.Join(options.Args, " "))
+			return shell.Result{}, nil
+		}
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	marker, err := gateway.FindReviewMarker(context.Background(), VerifyReviewMarkerInput{
+		Repo: "acme/looper", PRNumber: 42, Marker: "looper:review id=abc head=def",
+		AllowedReviewEvents: []string{"COMMENT"}, SkipInlineComments: true,
+	})
+	if err != nil {
+		t.Fatalf("FindReviewMarker() error = %v", err)
+	}
+	if !marker.Found || marker.ReviewID != "202" || len(marker.InlineCommentBodies) != 0 {
+		t.Fatalf("FindReviewMarker() = %#v, want marker without inline comment fetch", marker)
+	}
+}
+
 func TestGatewayRemovePullRequestReactionReadsSlurpedPaginatedReactions(t *testing.T) {
 	t.Parallel()
 	runner := &fakeGHRunner{t: t}

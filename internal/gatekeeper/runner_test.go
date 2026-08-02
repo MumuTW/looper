@@ -415,8 +415,8 @@ func TestAutoGatekeeperRefusesToReportSuccessWithoutProtectedContext(t *testing.
 	if report.Eligible || !slices.Contains(reasonCodes(report.Reasons), ReasonGatekeeperCheckRequired) {
 		t.Fatalf("report = %#v, want missing protected context", report)
 	}
-	if got := fixture.github.statusCalls; len(got) != 1 || got[0].State != "failure" {
-		t.Fatalf("status calls = %#v, want failure", got)
+	if got := fixture.github.statusCalls; len(got) != 1 || got[0].State != "error" {
+		t.Fatalf("status calls = %#v, want error", got)
 	}
 }
 
@@ -437,20 +437,21 @@ type fakeGatekeeperGitHub struct {
 	// makes, so a test can prove a pull request was skipped rather than evaluated.
 	perPullRequestCalls int
 
-	currentLogin      string
-	commentErr        error
-	deletedIDs        []int64
-	listCalls         int
-	loginCalls        int
-	comments          []githubinfra.CommentInfo
-	createdBodies     []string
-	updatedBodies     []string
-	reviewMarker      githubinfra.ReviewMarkerResult
-	reviewMarkerErr   error
-	reviewMarkerCalls []githubinfra.VerifyReviewMarkerInput
-	statusCalls       []githubinfra.CommitStatusInput
-	statusErr         error
-	viewErr           error
+	currentLogin          string
+	commentErr            error
+	deletedIDs            []int64
+	listCalls             int
+	loginCalls            int
+	comments              []githubinfra.CommentInfo
+	createdBodies         []string
+	updatedBodies         []string
+	reviewMarker          githubinfra.ReviewMarkerResult
+	reviewMarkerErr       error
+	reviewMarkerCalls     []githubinfra.VerifyReviewMarkerInput
+	statusCalls           []githubinfra.CommitStatusInput
+	statusErr             error
+	viewErr               error
+	listReviewThreadsHook func(*fakeGatekeeperGitHub) error
 	// beforeView, when set, runs before each pull-request read, so a test can
 	// inject a state change between the first evaluation and a later one.
 	beforeView func(*fakeGatekeeperGitHub)
@@ -554,6 +555,11 @@ func (f *fakeGatekeeperGitHub) ListPullRequestCheckRuns(context.Context, githubi
 }
 func (f *fakeGatekeeperGitHub) ListReviewThreads(context.Context, githubinfra.ListReviewThreadsInput) ([]githubinfra.ReviewThread, error) {
 	f.perPullRequestCalls++
+	if f.listReviewThreadsHook != nil {
+		if err := f.listReviewThreadsHook(f); err != nil {
+			return nil, err
+		}
+	}
 	return f.threads, nil
 }
 func (f *fakeGatekeeperGitHub) GetPullRequestHeadAndBaseSHA(context.Context, githubinfra.ViewPullRequestInput) (string, string, error) {

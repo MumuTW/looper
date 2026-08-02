@@ -64,6 +64,20 @@ func TestAuditorRejectsProjectGatekeeperAutoOverride(t *testing.T) {
 
 func ptrBool(v bool) *bool { return &v }
 
+func TestPostMergeDigestRejectsGatekeeperAutoTrust(t *testing.T) {
+	t.Parallel()
+	var issues []ValidationIssue
+	validatePostMergeDigestGatekeeperCompatibility(Config{
+		Roles: RoleConfigs{
+			Gatekeeper:  GatekeeperRoleConfig{Trust: GatekeeperTrustAuto},
+			Coordinator: CoordinatorRoleConfig{PostMergeDigest: &CoordinatorPostMergeDigestConfig{Enabled: true, Schedule: "08:00", Timezone: "UTC", MaxItems: 20}},
+		},
+	}, &issues)
+	if len(issues) != 1 || issues[0].Path != "roles.coordinator.postMergeDigest.enabled" {
+		t.Fatalf("issues = %#v, want global post-merge digest/auto conflict", issues)
+	}
+}
+
 func TestClonePartialRoleConfigsPreservesAuditorFields(t *testing.T) {
 	enabled, window := true, 20
 	original := &PartialRoleConfigs{Auditor: &PartialAuditorRoleConfig{Enabled: &enabled, WindowMinutes: &window}}

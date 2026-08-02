@@ -2009,6 +2009,17 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 				}
 				return strings.EqualFold(strings.TrimSpace(configuredBase), strings.TrimSpace(baseRefName))
 			},
+			ConfiguredTargetBranch: func(projectID string) string {
+				project, ok := runtimeProjectBinding(cfg, projectID)
+				if !ok {
+					return ""
+				}
+				configuredBase := cfg.Defaults.BaseBranch
+				if project.BaseBranch != nil && strings.TrimSpace(*project.BaseBranch) != "" {
+					configuredBase = strings.TrimSpace(*project.BaseBranch)
+				}
+				return strings.TrimSpace(configuredBase)
+			},
 		})
 	}
 	// refreshFeishuAnchor re-renders a loop's thread-anchor card to reflect its

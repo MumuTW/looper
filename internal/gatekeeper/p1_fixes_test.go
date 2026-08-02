@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	githubinfra "github.com/MumuTW/looper/internal/infra/github"
 	"github.com/MumuTW/looper/internal/labels"
@@ -163,8 +164,8 @@ func TestGatekeeperCommitStatusPrefersMissingContextOverCodexReview(t *testing.T
 			{Code: ReasonCodexReviewRequired, Subject: "current_head"},
 		},
 	})
-	if state != "failure" {
-		t.Fatalf("state = %q, want failure for missing required context", state)
+	if state != "error" {
+		t.Fatalf("state = %q, want error for missing required context", state)
 	}
 }
 
@@ -237,5 +238,97 @@ func TestDiscoverPullRequestsPublishesKnownHeadsOnAbort(t *testing.T) {
 	}
 	if len(fixture.github.statusCalls) != 1 || fixture.github.statusCalls[0].SHA != "head-a" || fixture.github.statusCalls[0].State != "failure" {
 		t.Fatalf("status calls = %#v, want fail-closed status for the known blocked head on abort", fixture.github.statusCalls)
+	}
+}
+
+func TestDiscoverPullRequestsSkipsUnchangedCommitStatusPublication(t *testing.T) {
+	fixture := newGatekeeperFixture(t)
+	fixture.github.protection.RequiredChecks = []string{"ci", RequiredStatusContext}
+	fixture.github.protection.RequiredCheckRules = append(fixture.github.protection.RequiredCheckRules, githubinfra.RequiredCheckRule{Context: RequiredStatusContext})
+	fixture.github.reviewMarker = githubinfra.ReviewMarkerResult{Found: true, Outcome: "clean", Event: "APPROVE", AuthorLogin: "looper-bot"}
+	pr := githubinfra.PullRequestSummary{
+		Number: 42, HeadSHA: "head-1", State: "OPEN", UpdatedAt: "2026-07-30T10:00:00Z",
+		BaseRefName: "main", ReviewDecision: "APPROVED",
+	}
+	fixture.github.openPullRequests = []githubinfra.PullRequestSummary{pr}
+	runner := fixture.autoRunner()
+
+	first, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("first DiscoverPullRequests() error = %v", err)
+	}
+	if first.Evaluated != 1 || len(fixture.github.statusCalls) != 1 {
+		t.Fatalf("first discovery = %#v status calls = %d, want one evaluation and one status write", first, len(fixture.github.statusCalls))
+	}
+
+	second, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("second DiscoverPullRequests() error = %v", err)
+	}
+	if second.Skipped != 1 || len(fixture.github.statusCalls) != 1 {
+		t.Fatalf("second discovery = %#v status calls = %d, want skip without another status write", second, len(fixture.github.statusCalls))
+	}
+}
+
+func TestPublishDiscoveryCommitStatusesOnPartialDiscoveryResult(t *testing.T) {
+	fixture := newGatekeeperFixture(t)
+	fixture.github.protection.RequiredChecks = []string{"ci", RequiredStatusContext}
+	fixture.github.protection.RequiredCheckRules = append(fixture.github.protection.RequiredCheckRules, githubinfra.RequiredCheckRule{Context: RequiredStatusContext})
+	runner := fixture.autoRunner()
+	reports := []Report{{
+		ProjectID: "project_1", Repo: "acme/looper", PRNumber: 41,
+		ObservedHeadSHA: "head-a", ExpectedHeadSHA: "head-a",
+		Reasons:  []Reason{{Code: ReasonHold, Subject: labels.HoldGlobal}},
+		Evidence: Evidence{PullRequestState: "OPEN", HoldLabels: []string{labels.HoldGlobal}},
+	}}
+	runner.publishDiscoveryCommitStatuses(context.Background(), "project_1", "acme/looper", "", reports)
+	if len(fixture.github.statusCalls) != 1 || fixture.github.statusCalls[0].SHA != "head-a" || fixture.github.statusCalls[0].State != "failure" {
+		t.Fatalf("status calls = %#v, want blocked head-a published for partial discovery result", fixture.github.statusCalls)
+	}
+}
+
+func TestAutoGatekeeperAuthenticatedMarkerClearsMissingReviewReason(t *testing.T) {
+	fixture := newGatekeeperFixtureWithoutReview(t)
+	fixture.github.protection.RequiredChecks = []string{"ci", RequiredStatusContext}
+	fixture.github.protection.RequiredCheckRules = append(fixture.github.protection.RequiredCheckRules, githubinfra.RequiredCheckRule{Context: RequiredStatusContext})
+	fixture.github.reviewMarker = githubinfra.ReviewMarkerResult{Found: true, Outcome: "clean", Event: "APPROVE", AuthorLogin: "looper-bot"}
+
+	report, err := fixture.autoRunner().EvaluatePullRequest(context.Background(), EvaluationInput{
+		ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, ExpectedHeadSHA: "head-1",
+	})
+	if err != nil {
+		t.Fatalf("EvaluatePullRequest() error = %v", err)
+	}
+	if !report.Eligible || hasReason(report, ReasonCodexReviewMissing) {
+		t.Fatalf("report = %#v, want authenticated marker sufficient without missing-review reason", report)
+	}
+}
+
+func TestTargetedEvaluationAggregatesSharedHeadStatus(t *testing.T) {
+	fixture := newGatekeeperFixture(t)
+	fixture.github.protection.RequiredChecks = []string{"ci", RequiredStatusContext}
+	fixture.github.protection.RequiredCheckRules = append(fixture.github.protection.RequiredCheckRules, githubinfra.RequiredCheckRule{Context: RequiredStatusContext})
+	fixture.github.reviewMarker = githubinfra.ReviewMarkerResult{Found: true, Outcome: "clean", Event: "APPROVE", AuthorLogin: "looper-bot"}
+	sharedSHA := "shared-head"
+	fixture.github.detail.HeadSHA = sharedSHA
+	fixture.github.mergeable.HeadSHA = sharedSHA
+	fixture.github.finalHeadSHA = sharedSHA
+	seedGateReport(t, fixture, Report{
+		Version: reportVersion, Status: StatusBlocked, ProjectID: "project_1",
+		Repo: "acme/looper", PRNumber: 41, ObservedHeadSHA: sharedSHA, ExpectedHeadSHA: sharedSHA,
+		Reasons:     []Reason{{Code: ReasonHold, Subject: labels.HoldGlobal}},
+		Evidence:    Evidence{PullRequestState: "OPEN", HoldLabels: []string{labels.HoldGlobal}},
+		EvaluatedAt: fixture.now.Format(time.RFC3339Nano),
+	})
+	runner := fixture.autoRunner()
+
+	_, err := runner.EvaluatePullRequest(context.Background(), EvaluationInput{
+		ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, ExpectedHeadSHA: sharedSHA,
+	})
+	if err != nil {
+		t.Fatalf("EvaluatePullRequest() error = %v", err)
+	}
+	if len(fixture.github.statusCalls) != 1 || fixture.github.statusCalls[0].SHA != sharedSHA || fixture.github.statusCalls[0].State != "failure" {
+		t.Fatalf("status calls = %#v, want aggregated failure for shared head", fixture.github.statusCalls)
 	}
 }
