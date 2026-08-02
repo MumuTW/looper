@@ -596,21 +596,36 @@ func (r *EventsRepository) ListSince(ctx context.Context, sinceISO string) ([]Ev
 	return scanEventLogs(rows)
 }
 
-// LatestByProjectAndEventTypeAndPayloadMode returns the newest event for each
-// project whose JSON payload carries the requested mode. The query is shared
-// across projects so migration maintenance does not repeat a history scan for
-// every project on every scheduler tick.
-func (r *EventsRepository) LatestByProjectAndEventTypeAndPayloadMode(ctx context.Context, eventType, mode string) (map[string]EventLogRecord, error) {
+// LatestByLogicalProjectAndEventTypeAndPayloadMode returns the newest event
+// for each logical project, using project_id when it is still linked and the
+// report payload's projectId after a project row has been deleted. The grouped
+// query keeps orphaned migration state cheap on steady-state scheduler ticks.
+func (r *EventsRepository) LatestByLogicalProjectAndEventTypeAndPayloadMode(ctx context.Context, eventType, mode string) (map[string]EventLogRecord, error) {
 	rows, err := r.q.QueryContext(ctx, `
-		SELECT * FROM event_logs
-		WHERE event_type = ?
-		  AND project_id IS NOT NULL
-		  AND CAST(COALESCE(json_extract(payload_json, '$.version'), 0) AS INTEGER) >= 2
-		  AND lower(trim(COALESCE(json_extract(payload_json, '$.mode'), ''))) = lower(trim(?))
-		ORDER BY rowid DESC
+		SELECT e.*
+		FROM event_logs e
+		JOIN (
+			SELECT
+				CASE
+					WHEN project_id IS NOT NULL THEN project_id
+					WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.projectId')
+					ELSE NULL
+				END AS logical_project_id,
+				MAX(rowid) AS latest_rowid
+			FROM event_logs
+			WHERE event_type = ?
+			  AND CASE WHEN json_valid(payload_json) THEN CAST(COALESCE(json_extract(payload_json, '$.version'), 0) AS INTEGER) ELSE 0 END >= 2
+			  AND CASE WHEN json_valid(payload_json) THEN lower(trim(COALESCE(json_extract(payload_json, '$.mode'), ''))) ELSE '' END = lower(trim(?))
+			  AND CASE
+					WHEN project_id IS NOT NULL THEN project_id
+					WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.projectId')
+					ELSE NULL
+				END IS NOT NULL
+			GROUP BY logical_project_id
+		) latest ON latest.latest_rowid = e.rowid
 	`, eventType, mode)
 	if err != nil {
-		return nil, fmt.Errorf("list latest event logs by project and payload mode: %w", err)
+		return nil, fmt.Errorf("list latest logical project event logs by payload mode: %w", err)
 	}
 	defer rows.Close()
 
@@ -620,15 +635,24 @@ func (r *EventsRepository) LatestByProjectAndEventTypeAndPayloadMode(ctx context
 		if err != nil {
 			return nil, err
 		}
-		if record.ProjectID == nil || strings.TrimSpace(*record.ProjectID) == "" {
+		projectID := ""
+		if record.ProjectID != nil {
+			projectID = strings.TrimSpace(*record.ProjectID)
+		} else {
+			var payload struct {
+				ProjectID string `json:"projectId"`
+			}
+			if err := json.Unmarshal([]byte(record.PayloadJSON), &payload); err == nil {
+				projectID = strings.TrimSpace(payload.ProjectID)
+			}
+		}
+		if projectID == "" {
 			continue
 		}
-		if _, exists := latest[*record.ProjectID]; !exists {
-			latest[*record.ProjectID] = record
-		}
+		latest[projectID] = record
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate latest event logs by project and payload mode: %w", err)
+		return nil, fmt.Errorf("iterate latest logical project event logs by payload mode: %w", err)
 	}
 	return latest, nil
 }
@@ -651,21 +675,6 @@ func (r *EventsRepository) LatestByEntityAndEventType(ctx context.Context, entit
 		return nil, fmt.Errorf("latest event log by entity and type: %w", err)
 	}
 	return &record, nil
-}
-
-// ListOrphanedByEventType returns events whose project row was removed after
-// append. Their payload/entity metadata remains available for migration work.
-func (r *EventsRepository) ListOrphanedByEventType(ctx context.Context, eventType string) ([]EventLogRecord, error) {
-	rows, err := r.q.QueryContext(ctx, `
-		SELECT * FROM event_logs
-		WHERE event_type = ? AND project_id IS NULL
-		ORDER BY rowid ASC
-	`, eventType)
-	if err != nil {
-		return nil, fmt.Errorf("list orphaned event logs by type: %w", err)
-	}
-	defer rows.Close()
-	return scanEventLogs(rows)
 }
 
 // ListProjectIDsByEventType lists project IDs that have at least one event of
@@ -859,13 +868,25 @@ func (r *EventsRepository) ListByProjectAndEntityType(ctx context.Context, proje
 	return scanEventLogs(rows)
 }
 
-// ListByProjectAndEntityTypeAppendOrder preserves SQLite append order for
-// callers that must choose the newest event when timestamps and IDs are not a
-// trustworthy tie-breaker.
-func (r *EventsRepository) ListByProjectAndEntityTypeAppendOrder(ctx context.Context, projectID, entityType string) ([]EventLogRecord, error) {
-	rows, err := r.q.QueryContext(ctx, `SELECT * FROM event_logs WHERE project_id = ? AND entity_type = ? ORDER BY rowid ASC`, projectID, entityType)
+// ListByProjectOrPayloadProjectAndEntityTypeAppendOrder returns linked and
+// orphaned events for one logical project in SQLite append order. It is only
+// used after the caller has found a stale migration watermark, so deleted
+// projects do not reload their entire history on every tick.
+func (r *EventsRepository) ListByProjectOrPayloadProjectAndEntityTypeAppendOrder(ctx context.Context, projectID, entityType string) ([]EventLogRecord, error) {
+	rows, err := r.q.QueryContext(ctx, `
+		SELECT * FROM event_logs
+		WHERE entity_type = ?
+		  AND (
+			project_id = ?
+			OR (
+				project_id IS NULL
+				AND CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.projectId') ELSE NULL END = ?
+			)
+		  )
+		ORDER BY rowid ASC
+	`, entityType, projectID, projectID)
 	if err != nil {
-		return nil, fmt.Errorf("list event logs by project and entity type in append order: %w", err)
+		return nil, fmt.Errorf("list event logs by logical project and entity type in append order: %w", err)
 	}
 	defer rows.Close()
 

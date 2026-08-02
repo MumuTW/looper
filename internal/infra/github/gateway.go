@@ -1316,9 +1316,28 @@ func (g *Gateway) ListIssueComments(ctx context.Context, input ViewIssueInput) (
 	return extractCommentInfos(rows), nil
 }
 
-// ListPullRequestCommits returns provider-authored commit identities for the
-// PR.  The GitHub commit list is the authority for the human-commit guard;
-// local lifecycle metadata cannot detect a later human push.
+// ListLegacyVerdictComments projects only comments carrying the withdrawn
+// Gatekeeper marker before gh writes output into the bounded shell capture.
+// The rollback needs marker/body/author/ID, not the full issue conversation;
+// filtering at the forge boundary keeps large human discussions retryable.
+func (g *Gateway) ListLegacyVerdictComments(ctx context.Context, input ViewIssueInput) ([]CommentInfo, error) {
+	hostname, repo := splitRepoHostname(input.Repo)
+	filter := `.[] | select((.body // "") | contains("looper:gatekeeper:verdict")) | {id,body,html_url,updated_at,user:{login:.user.login}}`
+	args := []string{"api", "--paginate", fmt.Sprintf("repos/%s/issues/%d/comments", repo, input.IssueNumber), "--jq", filter}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGh(ctx, input.CWD, "", args...)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := decodeJSONObjects(result.Stdout)
+	if err != nil {
+		return nil, err
+	}
+	return extractCommentInfos(rows), nil
+}
+
 // listPullRequestAutomationComments keeps PR discovery independent of the size
 // of the full issue conversation. gh applies this projection to each page
 // before writing to the shell capture buffer, so only comments consumed by the

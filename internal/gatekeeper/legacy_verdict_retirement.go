@@ -3,6 +3,7 @@ package gatekeeper
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"sort"
@@ -25,6 +26,8 @@ const retiredLegacyVerdictBody = legacyVerdictCommentMarker + "\n" +
 const legacyVerdictRetirementEventType = "pull_request.merge_gate.legacy_verdict_retired"
 const legacyVerdictRetirementScanEventType = "pull_request.merge_gate.legacy_verdict_retirement_scan_completed"
 
+var errLegacyVerdictForeignOwner = errors.New("legacy Gatekeeper verdict belongs to another GitHub account")
+
 type legacyVerdictRetirement struct {
 	Version           int    `json:"version"`
 	ProjectID         string `json:"projectId"`
@@ -34,6 +37,7 @@ type legacyVerdictRetirement struct {
 	ReportEvaluatedAt string `json:"reportEvaluatedAt"`
 	ReportFingerprint string `json:"reportFingerprint,omitempty"`
 	UpdatedComments   int    `json:"updatedComments"`
+	OwnerLogin        string `json:"ownerLogin,omitempty"`
 	// AbsenceChecks records consecutive passes that confirmed there is no
 	// owned active comment. The first absence is deliberately provisional: an
 	// older daemon may have persisted its report and still be about to publish
@@ -66,6 +70,17 @@ type legacyVerdictCommentGateway interface {
 	GetCurrentUserLoginForRepo(context.Context, string, string) (string, error)
 }
 
+type legacyVerdictFilteredCommentGateway interface {
+	ListLegacyVerdictComments(context.Context, githubinfra.ViewIssueInput) ([]githubinfra.CommentInfo, error)
+}
+
+func listLegacyVerdictComments(ctx context.Context, gateway legacyVerdictCommentGateway, input githubinfra.ViewIssueInput) ([]githubinfra.CommentInfo, error) {
+	if filtered, ok := gateway.(legacyVerdictFilteredCommentGateway); ok {
+		return filtered.ListLegacyVerdictComments(ctx, input)
+	}
+	return gateway.ListIssueComments(ctx, input)
+}
+
 // retireLegacyVerdictComments withdraws one historical advise verdict. A
 // successful update is final immediately. An absent owned comment requires
 // two consecutive observations before completion is recorded, closing the
@@ -77,27 +92,41 @@ func (r *Runner) retireLegacyVerdictComments(ctx context.Context, candidate lega
 	if err != nil {
 		return false, err
 	}
-	if previous != nil && (previous.UpdatedComments > 0 || previous.AbsenceChecks >= 2) {
-		return true, nil
-	}
 
 	github, ok := r.github.(legacyVerdictCommentGateway)
 	if !ok {
 		return false, fmt.Errorf("gatekeeper GitHub gateway cannot retire legacy verdict comments")
 	}
-	login, err := github.GetCurrentUserLoginForRepo(ctx, report.Repo, cwd)
-	if err != nil {
-		return false, fmt.Errorf("get Gatekeeper comment owner: %w", err)
+	login := ""
+	if previous != nil && (previous.UpdatedComments > 0 || previous.AbsenceChecks >= 2) {
+		login, err = github.GetCurrentUserLoginForRepo(ctx, report.Repo, cwd)
+		if err != nil {
+			return false, fmt.Errorf("get Gatekeeper comment owner: %w", err)
+		}
+		if owner := strings.TrimSpace(previous.OwnerLogin); owner != "" && strings.EqualFold(owner, strings.TrimSpace(login)) {
+			return true, nil
+		}
 	}
-	comments, err := github.ListIssueComments(ctx, githubinfra.ViewIssueInput{
+	if login == "" {
+		login, err = github.GetCurrentUserLoginForRepo(ctx, report.Repo, cwd)
+		if err != nil {
+			return false, fmt.Errorf("get Gatekeeper comment owner: %w", err)
+		}
+	}
+	comments, err := listLegacyVerdictComments(ctx, github, githubinfra.ViewIssueInput{
 		Repo: report.Repo, IssueNumber: report.PRNumber, CWD: cwd,
 	})
 	if err != nil {
 		return false, fmt.Errorf("list Gatekeeper verdict comments: %w", err)
 	}
 	updatedComments := 0
+	foreignOwnerMarker := false
 	for _, comment := range comments {
-		if !strings.Contains(comment.Body, legacyVerdictCommentMarker) || !strings.EqualFold(strings.TrimSpace(comment.Author), strings.TrimSpace(login)) {
+		if !strings.Contains(comment.Body, legacyVerdictCommentMarker) {
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSpace(comment.Author), strings.TrimSpace(login)) {
+			foreignOwnerMarker = true
 			continue
 		}
 		if strings.TrimSpace(comment.Body) == strings.TrimSpace(retiredLegacyVerdictBody) {
@@ -109,6 +138,9 @@ func (r *Runner) retireLegacyVerdictComments(ctx context.Context, candidate lega
 			return false, fmt.Errorf("retire Gatekeeper verdict comment %d: %w", comment.ID, err)
 		}
 		updatedComments++
+	}
+	if foreignOwnerMarker {
+		return false, errLegacyVerdictForeignOwner
 	}
 	var projectID *string
 	if candidate.PersistProjectID {
@@ -131,7 +163,7 @@ func (r *Runner) retireLegacyVerdictComments(ctx context.Context, candidate lega
 			Version: 1, ProjectID: report.ProjectID, Repo: report.Repo, PRNumber: report.PRNumber,
 			ReportEventID:     candidate.EventID,
 			ReportEvaluatedAt: report.EvaluatedAt, ReportFingerprint: report.SourceFingerprint,
-			UpdatedComments: updatedComments, AbsenceChecks: absenceChecks,
+			UpdatedComments: updatedComments, OwnerLogin: strings.TrimSpace(login), AbsenceChecks: absenceChecks,
 			RetiredAt: r.now().UTC().Format(time.RFC3339Nano),
 		}, CreatedAt: r.now(),
 	}); err != nil {
@@ -157,21 +189,11 @@ func (r *Runner) ReconcileLegacyVerdictComments(ctx context.Context) error {
 	for _, projectID := range projectIDs {
 		linkedProjectIDs[projectID] = true
 	}
-	latestAdvise, err := r.repos.Events.LatestByProjectAndEventTypeAndPayloadMode(ctx, GateReportEventType, "advise")
+	latestAdvise, err := r.repos.Events.LatestByLogicalProjectAndEventTypeAndPayloadMode(ctx, GateReportEventType, "advise")
 	if err != nil {
 		return err
 	}
-	orphanEvents, err := r.repos.Events.ListOrphanedByEventType(ctx, GateReportEventType)
-	if err != nil {
-		return err
-	}
-	orphanReports, orphanLatest := legacyAdviseReportsFromEvents(orphanEvents, false)
-	for projectID, latest := range orphanLatest {
-		if current, exists := latestAdvise[projectID]; !exists || eventRecordIsNewer(latest, current) {
-			latestAdvise[projectID] = latest
-		}
-	}
-	for projectID := range orphanReports {
+	for projectID := range latestAdvise {
 		if !linkedProjectIDs[projectID] {
 			projectIDs = append(projectIDs, projectID)
 		}
@@ -203,13 +225,9 @@ func (r *Runner) ReconcileLegacyVerdictComments(ctx context.Context) error {
 		if scanComplete {
 			continue
 		}
-		reports := orphanReports[projectID]
-		if linkedProjectIDs[projectID] {
-			linkedReports, historyErr := r.historicalLegacyAdviseReports(ctx, projectID, true)
-			if historyErr != nil {
-				return historyErr
-			}
-			reports = mergeLegacyAdviseReports(reports, linkedReports)
+		reports, err := r.historicalLegacyAdviseReports(ctx, projectID, linkedProjectIDs[projectID])
+		if err != nil {
+			return err
 		}
 		sort.Slice(reports, func(i, j int) bool {
 			if reports[i].Report.PRNumber != reports[j].Report.PRNumber {
@@ -247,28 +265,11 @@ func (r *Runner) ReconcileLegacyVerdictComments(ctx context.Context) error {
 	return nil
 }
 
-func mergeLegacyAdviseReports(groups ...[]legacyAdviseReport) []legacyAdviseReport {
-	byPullRequest := make(map[string]legacyAdviseReport)
-	for _, group := range groups {
-		for _, candidate := range group {
-			key := fmt.Sprintf("%s#%d", strings.ToLower(strings.TrimSpace(candidate.Report.Repo)), candidate.Report.PRNumber)
-			if previous, exists := byPullRequest[key]; !exists || legacyAdviseReportIsNewer(candidate, previous) {
-				byPullRequest[key] = candidate
-			}
-		}
-	}
-	reports := make([]legacyAdviseReport, 0, len(byPullRequest))
-	for _, candidate := range byPullRequest {
-		reports = append(reports, candidate)
-	}
-	return reports
-}
-
 func (r *Runner) historicalLegacyAdviseReports(ctx context.Context, projectID string, persistProjectID bool) ([]legacyAdviseReport, error) {
 	if r == nil || r.repos == nil || r.repos.Events == nil {
 		return nil, fmt.Errorf("gatekeeper event repository is not configured")
 	}
-	events, err := r.repos.Events.ListByProjectAndEntityTypeAppendOrder(ctx, projectID, "pull_request")
+	events, err := r.repos.Events.ListByProjectOrPayloadProjectAndEntityTypeAppendOrder(ctx, projectID, "pull_request")
 	if err != nil {
 		return nil, fmt.Errorf("list Gatekeeper reports: %w", err)
 	}
@@ -291,17 +292,16 @@ func legacyAdviseReportsFromEvents(events []storage.EventLogRecord, persistProje
 		if projectID == "" || report.Version < 2 || !strings.EqualFold(strings.TrimSpace(report.Mode), "advise") {
 			continue
 		}
-		if latestEvent, exists := latest[projectID]; !exists || eventRecordIsNewer(event, latestEvent) {
-			latest[projectID] = event
-		}
+		latest[projectID] = event
 		entityID := fmt.Sprintf("%s#%d", strings.ToLower(strings.TrimSpace(report.Repo)), report.PRNumber)
 		if _, ok := byProject[projectID]; !ok {
 			byProject[projectID] = make(map[string]legacyAdviseReport)
 		}
 		candidate := legacyAdviseReport{Report: report, EventID: event.ID, CreatedAt: event.CreatedAt, PersistProjectID: persistProjectID}
-		if previous, exists := byProject[projectID][entityID]; !exists || legacyAdviseReportIsNewer(candidate, previous) {
-			byProject[projectID][entityID] = candidate
-		}
+		// The repository query is ordered by SQLite rowid, the append-order
+		// authority. Overwrite rather than comparing random event IDs when
+		// timestamps share the same millisecond.
+		byProject[projectID][entityID] = candidate
 	}
 	reports := make(map[string][]legacyAdviseReport, len(byProject))
 	for projectID, candidates := range byProject {
@@ -311,20 +311,6 @@ func legacyAdviseReportsFromEvents(events []storage.EventLogRecord, persistProje
 		}
 	}
 	return reports, latest
-}
-
-func eventRecordIsNewer(candidate, previous storage.EventLogRecord) bool {
-	if candidate.CreatedAt != previous.CreatedAt {
-		return candidate.CreatedAt > previous.CreatedAt
-	}
-	return candidate.ID > previous.ID
-}
-
-func legacyAdviseReportIsNewer(candidate, previous legacyAdviseReport) bool {
-	if candidate.CreatedAt != previous.CreatedAt {
-		return candidate.CreatedAt > previous.CreatedAt
-	}
-	return candidate.EventID > previous.EventID
 }
 
 func (r *Runner) retirementScanComplete(ctx context.Context, projectID, latestReportEventID string) (bool, error) {

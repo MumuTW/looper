@@ -66,15 +66,15 @@ func TestDiscoverPullRequestsRetiresLegacyAdviseVerdictEvenWhenEvaluationIsSkipp
 	if got := len(fixture.github.updateCommentCalls); got != 1 {
 		t.Fatalf("retired comment updates = %d, want 1", got)
 	}
-	if got := fixture.github.commentsCalls; got != 1 {
-		t.Fatalf("retired comment reads = %d, want no second-tick forge read", got)
+	if got := fixture.github.commentsCalls; got != 2 {
+		t.Fatalf("retired comment reads = %d, want retry while human marker remains unresolved", got)
 	}
 	scanEvents, err := fixture.repos.Events.ListByEntity(context.Background(), "project", "project_1")
 	if err != nil {
 		t.Fatalf("scan completion events: %v", err)
 	}
-	if len(scanEvents) != 1 || scanEvents[0].EventType != legacyVerdictRetirementScanEventType {
-		t.Fatalf("scan completion events = %#v, want one project watermark", scanEvents)
+	if len(scanEvents) != 0 {
+		t.Fatalf("scan completion events = %#v, want no watermark while human marker remains unresolved", scanEvents)
 	}
 }
 
@@ -340,5 +340,53 @@ func TestLegacyVerdictRetirementMergesLinkedAndOrphanedHistory(t *testing.T) {
 	}
 	if retirement.ReportEventID != latestEventID {
 		t.Fatalf("retirement report event = %q, want newest orphan event %q", retirement.ReportEventID, latestEventID)
+	}
+}
+
+func TestLegacyVerdictRetirementDefersForeignOwnerMarker(t *testing.T) {
+	fixture := newGatekeeperFixture(t)
+	fixture.github.currentUserLogin = "new-bot"
+	fixture.github.comments = []githubinfra.CommentInfo{{ID: 12, Author: "old-bot", Body: legacyVerdictCommentMarker + "\n✅ old advice"}}
+	report := Report{Version: 2, Mode: "advise", ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, Status: StatusEligible, Eligible: true, EvaluatedAt: fixture.now.Format(time.RFC3339Nano)}
+	projectID, entityType, entityID := report.ProjectID, "pull_request", "acme/looper#42"
+	if err := eventlog.Append(context.Background(), fixture.repos, eventlog.AppendInput{EventType: GateReportEventType, ProjectID: &projectID, EntityType: &entityType, EntityID: &entityID, Payload: report, CreatedAt: fixture.now}); err != nil {
+		t.Fatalf("append advise report: %v", err)
+	}
+	for pass := 0; pass < 2; pass++ {
+		if err := fixture.runner().ReconcileLegacyVerdictComments(context.Background()); err != nil {
+			t.Fatalf("ReconcileLegacyVerdictComments() pass %d error = %v", pass+1, err)
+		}
+	}
+	if len(fixture.github.updateCommentCalls) != 0 {
+		t.Fatalf("foreign owner comment updates = %#v, want none", fixture.github.updateCommentCalls)
+	}
+	scans, err := fixture.repos.Events.ListByEntity(context.Background(), "project", "project_1")
+	if err != nil {
+		t.Fatalf("scan events: %v", err)
+	}
+	if len(scans) != 0 {
+		t.Fatalf("scan events = %#v, want no completion for foreign owner", scans)
+	}
+}
+
+func TestLegacyVerdictRetirementSkipsMalformedGlobalReportPayload(t *testing.T) {
+	fixture := newGatekeeperFixture(t)
+	fixture.github.currentUserLogin = "looper-bot"
+	fixture.github.comments = []githubinfra.CommentInfo{{ID: 13, Author: "looper-bot", Body: legacyVerdictCommentMarker + "\n✅ old advice"}}
+	valid := Report{Version: 2, Mode: "advise", ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, Status: StatusEligible, Eligible: true, EvaluatedAt: fixture.now.Format(time.RFC3339Nano)}
+	projectID, entityType, entityID := valid.ProjectID, "pull_request", "acme/looper#42"
+	if err := eventlog.Append(context.Background(), fixture.repos, eventlog.AppendInput{EventType: GateReportEventType, ProjectID: &projectID, EntityType: &entityType, EntityID: &entityID, Payload: valid, CreatedAt: fixture.now}); err != nil {
+		t.Fatalf("append valid report: %v", err)
+	}
+	malformedEntity := "acme/looper#99"
+	malformed := "not-json"
+	if err := eventlog.Append(context.Background(), fixture.repos, eventlog.AppendInput{EventType: GateReportEventType, ProjectID: &projectID, EntityType: &entityType, EntityID: &malformedEntity, PayloadJSON: &malformed, CreatedAt: fixture.now.Add(time.Millisecond)}); err != nil {
+		t.Fatalf("append malformed report: %v", err)
+	}
+	if err := fixture.runner().ReconcileLegacyVerdictComments(context.Background()); err != nil {
+		t.Fatalf("ReconcileLegacyVerdictComments() error = %v, want malformed row skipped", err)
+	}
+	if len(fixture.github.updateCommentCalls) != 1 {
+		t.Fatalf("comment updates = %d, want valid report retired", len(fixture.github.updateCommentCalls))
 	}
 }

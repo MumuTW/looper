@@ -552,6 +552,34 @@ func TestGatewayReportsTruncatedOutputBeforeJSONParsing(t *testing.T) {
 	}
 }
 
+func TestGatewayListLegacyVerdictCommentsProjectsBeforeCapture(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		args := strings.Join(options.Args, " ")
+		if !strings.HasPrefix(args, "api --paginate repos/acme/looper/issues/42/comments --jq ") {
+			t.Fatalf("legacy comment command = %q, want paginated jq projection", args)
+		}
+		if strings.Contains(args, "--slurp") || !strings.Contains(args, `contains("looper:gatekeeper:verdict")`) {
+			t.Fatalf("legacy comment command = %q, want marker filter before capture", args)
+		}
+		for _, required := range []string{"{id,body,html_url,updated_at,user:{login:.user.login}}"} {
+			if !strings.Contains(args, required) {
+				t.Fatalf("legacy comment command = %q, want projection %q", args, required)
+			}
+		}
+		return shell.Result{Stdout: `{"id":7,"body":"<!-- looper:gatekeeper:verdict v=1 -->\n✅ old advice","html_url":"https://example.test/issues/42#issuecomment-7","updated_at":"2026-05-04T13:00:00Z","user":{"login":"looper-bot"}}` + "\n"}, nil
+	}
+	gateway := New(Options{GHPath: "gh", GHRun: runner.run})
+	comments, err := gateway.ListLegacyVerdictComments(context.Background(), ViewIssueInput{Repo: "acme/looper", IssueNumber: 42})
+	if err != nil {
+		t.Fatalf("ListLegacyVerdictComments() error = %v", err)
+	}
+	if len(comments) != 1 || comments[0].ID != 7 || comments[0].Author != "looper-bot" {
+		t.Fatalf("legacy comments = %#v, want projected marker comment", comments)
+	}
+}
+
 func TestGatewayListOpenPullRequestsDoesNotFallbackForUnrelatedAccessError(t *testing.T) {
 	t.Parallel()
 	runner := &fakeGHRunner{t: t}
