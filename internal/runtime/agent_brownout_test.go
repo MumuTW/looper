@@ -618,6 +618,18 @@ func TestAgentBrownoutResumeMessageDistinguishesDisabledOverride(t *testing.T) {
 	}
 }
 
+func TestBrownoutNotificationProviderKeySerializesOverrideTail(t *testing.T) {
+	t.Parallel()
+	for _, suffix := range []string{".open", ".closed", ".disabled_override"} {
+		if got := brownoutNotificationProviderKey("codex" + suffix); got != "codex" {
+			t.Fatalf("brownoutNotificationProviderKey(%q) = %q, want codex", suffix, got)
+		}
+	}
+	if got := brownoutNotificationProviderKey("codex.other"); got != "codex.other" {
+		t.Fatalf("brownoutNotificationProviderKey(non-transition) = %q, want unchanged suffix", got)
+	}
+}
+
 type recordingLogger struct {
 	mu      sync.Mutex
 	entries []loggedEntry

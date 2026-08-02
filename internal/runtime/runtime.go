@@ -888,7 +888,7 @@ func (r *Runtime) notifyAgentBrownout(level, title, subtitle, body, dedupeSuffix
 	}
 	r.notificationWG.Add(1)
 	notificationCtx := r.notificationCtx
-	providerKey := strings.TrimSuffix(strings.TrimSuffix(dedupeSuffix, ".open"), ".closed")
+	providerKey := brownoutNotificationProviderKey(dedupeSuffix)
 	var previous chan struct{}
 	if r.brownoutNotificationTails == nil {
 		r.brownoutNotificationTails = make(map[string]chan struct{})
@@ -947,6 +947,15 @@ func (r *Runtime) notifyAgentBrownout(level, title, subtitle, body, dedupeSuffix
 			Now:           r.now,
 		}).Notify(ctx, payload)
 	}()
+}
+
+func brownoutNotificationProviderKey(dedupeSuffix string) string {
+	for _, suffix := range []string{".open", ".closed", ".disabled_override"} {
+		if strings.HasSuffix(dedupeSuffix, suffix) {
+			return strings.TrimSuffix(dedupeSuffix, suffix)
+		}
+	}
+	return dedupeSuffix
 }
 
 // agentBrownoutNotificationTimeout bounds one best-effort transition alert. It
