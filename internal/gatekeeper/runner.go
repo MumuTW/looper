@@ -964,4 +964,3 @@ func sortReasons(reasons []Reason) {
 		return reasons[i].Subject < reasons[j].Subject
 	})
 }
-// trigger
