@@ -444,6 +444,17 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		result.Reconciled++
 		result.Reports = append(result.Reports, report)
 	}
+	// Reconcile previously published routes whose pull requests are absent from
+	// the bounded discovery page: retire routes whose routing inputs no longer
+	// permit them, and preserve durable merge evidence for the Auditor when a
+	// routed pull request merged through the Mergify route.
+	pageEntityIDs := make(map[string]struct{}, len(pullRequests))
+	for _, pullRequest := range pullRequests {
+		pageEntityIDs[fmt.Sprintf("%s#%d", input.Repo, pullRequest.Number)] = struct{}{}
+	}
+	if reconcileErr := r.reconcileRoutedReportsOutsideDiscoveryPage(ctx, input, pageEntityIDs, previousReports); reconcileErr != nil {
+		evaluationErrs = append(evaluationErrs, reconcileErr)
+	}
 	// Publish the current open-PR verdicts before the best-effort historical
 	// scan. Marker lookups for up to one page of merged PRs may be slow or
 	// rate-limited; branch protection must not keep an older success visible
@@ -1486,8 +1497,17 @@ func (r *Runner) persist(ctx context.Context, report Report) (Report, error) {
 
 	entityType := "pull_request"
 	entityID := fmt.Sprintf("%s#%d", report.Repo, report.PRNumber)
-	if err := r.appendGateReport(ctx, report, entityType, entityID); err != nil {
-		return Report{}, fmt.Errorf("persist gate report: %w", err)
+	// Crash boundary: persist a pending projection with an empty discovery
+	// fingerprint before mutating routing labels. If the process dies between
+	// the durable append and the label reconciliation, the next tick sees an
+	// unreusable fingerprint and re-evaluates instead of skipping the stale
+	// route. The final report (with the real fingerprint) is appended only
+	// after the routing projection succeeds.
+	pending := report
+	pending.SourceFingerprint = ""
+	pending.EvaluatedAt = r.now().UTC().Format(time.RFC3339Nano)
+	if err := r.appendGateReportAt(ctx, pending, entityType, entityID, r.now()); err != nil {
+		return Report{}, fmt.Errorf("persist pending gate report: %w", err)
 	}
 	if routingErr := r.reconcileRoutingLabels(ctx, report, previous); routingErr != nil {
 		if r.logWarn != nil {
@@ -1495,9 +1515,10 @@ func (r *Runner) persist(ctx context.Context, report Report) (Report, error) {
 				"repo": report.Repo, "pr": report.PRNumber, "error": routingErr.Error(),
 			})
 		}
-		// Keep the successful gate evidence durable, but append a retry marker
-		// with an empty discovery fingerprint. The next tick must evaluate and
-		// retry the projection even when the pull request itself is unchanged.
+		// Replace the bare pending with a retry marker that keeps the
+		// routing-projection-failed reason. previousPublished treats that reason
+		// as published, so an observe demotion keeps retiring the stale route
+		// even though the current trust level would otherwise skip label work.
 		retry := report
 		retry.Reasons = append([]Reason(nil), report.Reasons...)
 		retry.Reasons = append(retry.Reasons, Reason{Code: ReasonRoutingProjectionFailed, Subject: "routing_labels"})
@@ -1510,6 +1531,13 @@ func (r *Runner) persist(ctx context.Context, report Report) (Report, error) {
 			return report, fmt.Errorf("%w (persist routing retry marker: %v)", routingErr, markerErr)
 		}
 		return report, routingErr
+	}
+	// The final report is appended strictly after the pending projection so
+	// latestGateReports (which keeps the newest record for an entity) always
+	// resolves to the report with the real discovery fingerprint, never the
+	// empty-fingerprint pending record.
+	if err := r.appendGateReportAt(ctx, report, entityType, entityID, r.now().Add(time.Millisecond)); err != nil {
+		return Report{}, fmt.Errorf("persist gate report: %w", err)
 	}
 	// The owned comment is reconciled after the durable report: the report is the
 	// record, the comment is a convenience for whoever is deciding. A forge that

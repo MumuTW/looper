@@ -45,11 +45,20 @@ func TestEvaluatePullRequestPersistsEligibleReportBoundToHead(t *testing.T) {
 			gateReports = append(gateReports, event)
 		}
 	}
-	if len(gateReports) != 1 {
-		t.Fatalf("events = %#v, want one durable gate report", events)
+	// Persist writes a crash-boundary pending projection (empty discovery
+	// fingerprint) before the routing projection, then the final report with the
+	// real fingerprint after the projection succeeds. The final report is the
+	// newest record and must be the one latestGateReports resolves to.
+	// Persist writes a crash-boundary pending projection (empty discovery
+	// fingerprint) before the routing projection, then the final report after
+	// the projection succeeds. A direct EvaluatePullRequest carries no discovery
+	// fingerprint, so both records here have empty fingerprints; the contract
+	// under test is the two-append ordering, not the fingerprint value.
+	if len(gateReports) != 2 {
+		t.Fatalf("gate report events = %d, want 2 (pending projection plus final report)", len(gateReports))
 	}
 	var persisted Report
-	if err := json.Unmarshal([]byte(gateReports[0].PayloadJSON), &persisted); err != nil {
+	if err := json.Unmarshal([]byte(gateReports[len(gateReports)-1].PayloadJSON), &persisted); err != nil {
 		t.Fatalf("decode persisted report: %v", err)
 	}
 	if !persisted.Eligible || persisted.ObservedHeadSHA != "head-1" {
@@ -722,6 +731,10 @@ type fakeGatekeeperGitHub struct {
 	mergedListCalls    int
 	detail             githubinfra.PullRequestDetail
 	mergeable          githubinfra.PullRequestDetail
+	// mergeWatch is returned by ViewPullRequestMergeWatch when its state or
+	// merge timestamp is set; the default detail keeps the pre-reconcile
+	// behavior of returning the mergeable view.
+	mergeWatch         githubinfra.PullRequestDetail
 	protection         githubinfra.BranchProtection
 	checks             githubinfra.PullRequestCheckRuns
 	threads            []githubinfra.ReviewThread
@@ -856,6 +869,9 @@ func (f *fakeGatekeeperGitHub) ViewPullRequestForGatekeeper(context.Context, git
 	return f.detail, nil
 }
 func (f *fakeGatekeeperGitHub) ViewPullRequestMergeWatch(context.Context, githubinfra.ViewPullRequestInput) (githubinfra.PullRequestDetail, error) {
+	if f.mergeWatch.State != "" || f.mergeWatch.MergedAt != "" {
+		return f.mergeWatch, nil
+	}
 	return f.mergeable, nil
 }
 func (f *fakeGatekeeperGitHub) GetBranchProtection(context.Context, githubinfra.BranchProtectionInput) (githubinfra.BranchProtection, error) {
