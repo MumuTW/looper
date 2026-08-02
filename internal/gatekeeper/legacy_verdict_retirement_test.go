@@ -2,6 +2,7 @@ package gatekeeper
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"path/filepath"
 	"testing"
@@ -148,19 +149,19 @@ func TestLegacyVerdictRetirementCompletionInvalidatesForNewerAdvice(t *testing.T
 	fixture := newGatekeeperFixture(t)
 	fixture.github.currentUserLogin = "looper-bot"
 	fixture.github.comments = []githubinfra.CommentInfo{{ID: 10, Author: "looper-bot", Body: legacyVerdictCommentMarker + "\nold advice"}}
-	appendReport := func(fingerprint string) {
+	appendReport := func(fingerprint string, offset time.Duration) {
 		report := Report{
 			Version: 2, Mode: "advise", ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42,
-			Status: StatusEligible, Eligible: true, EvaluatedAt: fixture.now.Format(time.RFC3339Nano), SourceFingerprint: fingerprint,
+			Status: StatusEligible, Eligible: true, EvaluatedAt: fixture.now.Add(offset).Format(time.RFC3339Nano), SourceFingerprint: fingerprint,
 		}
 		projectID, entityType, entityID := report.ProjectID, "pull_request", "acme/looper#42"
 		if err := eventlog.Append(context.Background(), fixture.repos, eventlog.AppendInput{
-			EventType: GateReportEventType, ProjectID: &projectID, EntityType: &entityType, EntityID: &entityID, Payload: report, CreatedAt: fixture.now,
+			EventType: GateReportEventType, ProjectID: &projectID, EntityType: &entityType, EntityID: &entityID, Payload: report, CreatedAt: fixture.now.Add(offset),
 		}); err != nil {
 			t.Fatalf("append advise report: %v", err)
 		}
 	}
-	appendReport("fingerprint-one")
+	appendReport("fingerprint-one", 0)
 	if err := fixture.runner().ReconcileLegacyVerdictComments(context.Background()); err != nil {
 		t.Fatalf("first reconciliation error = %v", err)
 	}
@@ -169,7 +170,7 @@ func TestLegacyVerdictRetirementCompletionInvalidatesForNewerAdvice(t *testing.T
 	}
 
 	fixture.github.comments[0].Body = legacyVerdictCommentMarker + "\nnew advice"
-	appendReport("fingerprint-two")
+	appendReport("fingerprint-two", time.Minute)
 	if err := fixture.runner().ReconcileLegacyVerdictComments(context.Background()); err != nil {
 		t.Fatalf("second reconciliation error = %v", err)
 	}
@@ -296,5 +297,48 @@ func TestLegacyVerdictRetirementProcessesOrphanedReportEvents(t *testing.T) {
 	}
 	if len(scans) != 1 || scans[0].EventType != legacyVerdictRetirementScanEventType {
 		t.Fatalf("orphan scan events = %#v, want one completion", scans)
+	}
+}
+
+func TestLegacyVerdictRetirementMergesLinkedAndOrphanedHistory(t *testing.T) {
+	fixture := newGatekeeperFixture(t)
+	fixture.github.currentUserLogin = "looper-bot"
+	fixture.github.comments = []githubinfra.CommentInfo{{ID: 11, Author: "looper-bot", Body: legacyVerdictCommentMarker + "\n✅ old advice"}}
+	appendReport := func(eventProjectID *string, evaluatedAt, fingerprint string) string {
+		report := Report{Version: 2, Mode: "advise", ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, Status: StatusEligible, Eligible: true, EvaluatedAt: evaluatedAt, SourceFingerprint: fingerprint}
+		entityType, entityID := "pull_request", "acme/looper#42"
+		if err := eventlog.Append(context.Background(), fixture.repos, eventlog.AppendInput{EventType: GateReportEventType, ProjectID: eventProjectID, EntityType: &entityType, EntityID: &entityID, Payload: report, CreatedAt: fixture.now}); err != nil {
+			t.Fatalf("append advise report: %v", err)
+		}
+		events, err := fixture.repos.Events.ListByEntity(context.Background(), "pull_request", entityID)
+		if err != nil {
+			t.Fatalf("list report events: %v", err)
+		}
+		return events[len(events)-1].ID
+	}
+	linkedProjectID := "project_1"
+	appendReport(&linkedProjectID, fixture.now.Format(time.RFC3339Nano), "linked")
+	latestEventID := appendReport(nil, fixture.now.Add(time.Minute).Format(time.RFC3339Nano), "orphan")
+
+	if err := fixture.runner().ReconcileLegacyVerdictComments(context.Background()); err != nil {
+		t.Fatalf("ReconcileLegacyVerdictComments() error = %v", err)
+	}
+	if fixture.github.commentsCalls != 1 || len(fixture.github.updateCommentCalls) != 1 {
+		t.Fatalf("forge retirement calls = comments %d updates %d, want one newest candidate", fixture.github.commentsCalls, len(fixture.github.updateCommentCalls))
+	}
+	retirements, err := fixture.repos.Events.ListByEntity(context.Background(), "pull_request", "acme/looper#42")
+	if err != nil {
+		t.Fatalf("retirement events: %v", err)
+	}
+	var retirement legacyVerdictRetirement
+	for _, event := range retirements {
+		if event.EventType == legacyVerdictRetirementEventType {
+			if err := json.Unmarshal([]byte(event.PayloadJSON), &retirement); err != nil {
+				t.Fatalf("decode retirement event: %v", err)
+			}
+		}
+	}
+	if retirement.ReportEventID != latestEventID {
+		t.Fatalf("retirement report event = %q, want newest orphan event %q", retirement.ReportEventID, latestEventID)
 	}
 }

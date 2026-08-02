@@ -2855,7 +2855,11 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 	}
 	if maintenance, ok := input.Gatekeeper.(gatekeeperLegacyRetirementScheduler); ok {
 		if err := admissionRefuseWork(input); err != nil {
-			return err
+			if len(errs) == 0 {
+				return nil
+			}
+			retErr = errors.Join(errs...)
+			return retErr
 		}
 		appendErr(runSchedulerLane(input, "gatekeeper legacy verdict retirement", "", "", func() error {
 			return maintenance.ReconcileLegacyVerdictComments(ctx)

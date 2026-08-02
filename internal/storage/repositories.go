@@ -596,28 +596,6 @@ func (r *EventsRepository) ListSince(ctx context.Context, sinceISO string) ([]Ev
 	return scanEventLogs(rows)
 }
 
-// LatestByProjectAndEventType returns the newest event for one project and
-// event type. The event-type index keeps maintenance callers from rescanning
-// an entire project's immutable history just to decide whether a watermark
-// changed. The SQLite rowid tie-breaker preserves append order when two events
-// share the same millisecond timestamp.
-func (r *EventsRepository) LatestByProjectAndEventType(ctx context.Context, projectID, eventType string) (*EventLogRecord, error) {
-	row := r.q.QueryRowContext(ctx, `
-		SELECT * FROM event_logs
-		WHERE project_id = ? AND event_type = ?
-		ORDER BY rowid DESC
-		LIMIT 1
-	`, projectID, eventType)
-	record, err := scanEventLog(row)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("latest event log by project and type: %w", err)
-	}
-	return &record, nil
-}
-
 // LatestByProjectAndEventTypeAndPayloadMode returns the newest event for each
 // project whose JSON payload carries the requested mode. The query is shared
 // across projects so migration maintenance does not repeat a history scan for

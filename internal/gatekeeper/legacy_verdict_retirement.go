@@ -167,7 +167,9 @@ func (r *Runner) ReconcileLegacyVerdictComments(ctx context.Context) error {
 	}
 	orphanReports, orphanLatest := legacyAdviseReportsFromEvents(orphanEvents, false)
 	for projectID, latest := range orphanLatest {
-		latestAdvise[projectID] = latest
+		if current, exists := latestAdvise[projectID]; !exists || eventRecordIsNewer(latest, current) {
+			latestAdvise[projectID] = latest
+		}
 	}
 	for projectID := range orphanReports {
 		if !linkedProjectIDs[projectID] {
@@ -203,10 +205,11 @@ func (r *Runner) ReconcileLegacyVerdictComments(ctx context.Context) error {
 		}
 		reports := orphanReports[projectID]
 		if linkedProjectIDs[projectID] {
-			reports, err = r.historicalLegacyAdviseReports(ctx, projectID, true)
-			if err != nil {
-				return err
+			linkedReports, historyErr := r.historicalLegacyAdviseReports(ctx, projectID, true)
+			if historyErr != nil {
+				return historyErr
 			}
+			reports = mergeLegacyAdviseReports(reports, linkedReports)
 		}
 		sort.Slice(reports, func(i, j int) bool {
 			if reports[i].Report.PRNumber != reports[j].Report.PRNumber {
@@ -242,6 +245,23 @@ func (r *Runner) ReconcileLegacyVerdictComments(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+func mergeLegacyAdviseReports(groups ...[]legacyAdviseReport) []legacyAdviseReport {
+	byPullRequest := make(map[string]legacyAdviseReport)
+	for _, group := range groups {
+		for _, candidate := range group {
+			key := fmt.Sprintf("%s#%d", strings.ToLower(strings.TrimSpace(candidate.Report.Repo)), candidate.Report.PRNumber)
+			if previous, exists := byPullRequest[key]; !exists || legacyAdviseReportIsNewer(candidate, previous) {
+				byPullRequest[key] = candidate
+			}
+		}
+	}
+	reports := make([]legacyAdviseReport, 0, len(byPullRequest))
+	for _, candidate := range byPullRequest {
+		reports = append(reports, candidate)
+	}
+	return reports
 }
 
 func (r *Runner) historicalLegacyAdviseReports(ctx context.Context, projectID string, persistProjectID bool) ([]legacyAdviseReport, error) {
