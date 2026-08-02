@@ -180,16 +180,21 @@ func (r *agentHealthRegistry) With(vendor string, fn func()) error {
 }
 
 func (r *agentHealthRegistry) AllowAdmission(vendor string) (bool, error) {
+	probe, _, err := r.AllowAdmissionWithGeneration(vendor)
+	return probe, err
+}
+
+func (r *agentHealthRegistry) AllowAdmissionWithGeneration(vendor string) (bool, uint64, error) {
 	if r == nil {
-		return false, nil
+		return false, 0, nil
 	}
 	r.gateMu.Lock()
 	defer r.gateMu.Unlock()
 	breaker, err := r.admissionBreaker(vendor)
 	if err != nil {
-		return false, err
+		return false, 0, err
 	}
-	return breaker.AllowAdmission()
+	return breaker.AllowAdmissionWithGeneration()
 }
 
 // AllowSnapshotAdmission admits a sticky retry through the breaker that owns
@@ -197,31 +202,36 @@ func (r *agentHealthRegistry) AllowAdmission(vendor string) (bool, error) {
 // Snapshot-only breakers stay outside the active-provider aggregate so this
 // exception cannot make AllowAny bypass an outage in current providers.
 func (r *agentHealthRegistry) AllowSnapshotAdmission(vendor string) (bool, error) {
+	probe, _, err := r.AllowSnapshotAdmissionWithGeneration(vendor)
+	return probe, err
+}
+
+func (r *agentHealthRegistry) AllowSnapshotAdmissionWithGeneration(vendor string) (bool, uint64, error) {
 	if r == nil {
-		return false, nil
+		return false, 0, nil
 	}
 	r.gateMu.Lock()
 	defer r.gateMu.Unlock()
 	r.mu.Lock()
 	breaker := r.ensureSnapshotBreakerLocked(vendor)
 	r.mu.Unlock()
-	return breaker.AllowAdmission()
+	return breaker.AllowAdmissionWithGeneration()
 }
 
 // ReleaseAdmission returns a half-open reservation whose spawn lease ended
 // before a terminal outcome. It is intentionally a no-op for a provider that
 // was removed during a config reload: that breaker is no longer an admission
 // authority, and the replacement bucket starts with no reservations.
-func (r *agentHealthRegistry) ReleaseAdmission(vendor string) {
+func (r *agentHealthRegistry) ReleaseAdmission(vendor string, generation uint64) {
 	if r == nil {
 		return
 	}
 	r.gateMu.Lock()
 	defer r.gateMu.Unlock()
-	r.releaseAdmissionLocked(vendor)
+	r.releaseAdmissionLocked(vendor, generation)
 }
 
-func (r *agentHealthRegistry) releaseAdmissionLocked(vendor string) {
+func (r *agentHealthRegistry) releaseAdmissionLocked(vendor string, generation uint64) {
 	key := strings.TrimSpace(vendor)
 	r.mu.Lock()
 	if r.configured {
@@ -237,7 +247,7 @@ func (r *agentHealthRegistry) releaseAdmissionLocked(vendor string) {
 	}
 	r.mu.Unlock()
 	if breaker != nil {
-		breaker.ReleaseProbe()
+		breaker.ReleaseProbeGeneration(generation)
 	}
 }
 
@@ -286,7 +296,7 @@ func (r *agentHealthRegistry) WithAny(fn func()) error {
 	return firstErr
 }
 
-func (r *agentHealthRegistry) Record(vendor string, startedAt time.Time, ok, probe, stickySnapshot bool) {
+func (r *agentHealthRegistry) Record(vendor string, startedAt time.Time, ok, probe, stickySnapshot bool, generation uint64) {
 	if r == nil {
 		return
 	}
@@ -300,7 +310,7 @@ func (r *agentHealthRegistry) Record(vendor string, startedAt time.Time, ok, pro
 		r.mu.Unlock()
 		if configured {
 			if probe {
-				r.releaseAdmissionLocked(vendor)
+				r.releaseAdmissionLocked(vendor, generation)
 			}
 			r.gateMu.Unlock()
 			if r.onWarning != nil {
@@ -311,7 +321,7 @@ func (r *agentHealthRegistry) Record(vendor string, startedAt time.Time, ok, pro
 	}
 	if !stickySnapshot && !r.vendorActive(vendor) {
 		if probe {
-			r.releaseAdmissionLocked(vendor)
+			r.releaseAdmissionLocked(vendor, generation)
 		}
 		r.gateMu.Unlock()
 		if r.onWarning != nil {
@@ -333,7 +343,7 @@ func (r *agentHealthRegistry) Record(vendor string, startedAt time.Time, ok, pro
 	if !probe && strings.TrimSpace(vendor) == "" && !startedAt.IsZero() {
 		probe = true
 	}
-	breaker.RecordAdmission(startedAt, ok, probe)
+	breaker.RecordAdmissionGeneration(startedAt, ok, probe, generation)
 	r.gateMu.Unlock()
 }
 

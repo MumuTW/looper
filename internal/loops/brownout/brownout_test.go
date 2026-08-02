@@ -131,7 +131,7 @@ func TestFailedProbeReopensWithDoubledCooldown(t *testing.T) {
 	b.Record(c.now(), false)
 	b.Record(c.now(), false)
 
-	c.add(10 * time.Minute)
+	c.add(20 * time.Minute)
 	if err := b.Allow(); err != nil {
 		t.Fatalf("expected half_open: %v", err)
 	}
@@ -306,6 +306,43 @@ func TestHalfOpenAdmissionCountsCompletedProbesAgainstCapacity(t *testing.T) {
 	b.RecordAdmission(c.now(), true, true)
 	if got := b.Snapshot().State; got != StateClosed {
 		t.Fatalf("state after configured probe successes = %s, want closed", got)
+	}
+}
+
+func TestStaleProbeGenerationCannotConsumeCurrentCapacity(t *testing.T) {
+	cfg := testConfig()
+	cfg.ProbeSuccesses = 2
+	b, c, _ := newTestBreaker(t, cfg)
+	b.Record(c.now(), false)
+	b.Record(c.now(), false)
+	b.Record(c.now(), false)
+	c.add(10 * time.Minute)
+
+	firstProbe, generationOne, err := b.AllowAdmissionWithGeneration()
+	if err != nil || !firstProbe || generationOne == 0 {
+		t.Fatalf("first generation admission = (%t, %d, %v), want token", firstProbe, generationOne, err)
+	}
+	secondProbe, generationOneAgain, err := b.AllowAdmissionWithGeneration()
+	if err != nil || !secondProbe || generationOneAgain != generationOne {
+		t.Fatalf("sibling generation admission = (%t, %d, %v), want generation %d", secondProbe, generationOneAgain, err, generationOne)
+	}
+	// One failed probe reopens the breaker while the sibling remains active.
+	b.RecordAdmissionGeneration(c.now(), false, true, generationOne)
+	c.add(20 * time.Minute)
+
+	probe, generationTwo, err := b.AllowAdmissionWithGeneration()
+	if err != nil || !probe || generationTwo == generationOne {
+		t.Fatalf("next generation admission = (%t, %d, %v), want a new token", probe, generationTwo, err)
+	}
+	// The old sibling finishes and is abandoned after the new round begins.
+	b.RecordAdmissionGeneration(c.now(), true, true, generationOne)
+	b.ReleaseProbeGeneration(generationOne)
+
+	if probe, _, err := b.AllowAdmissionWithGeneration(); err != nil || !probe {
+		t.Fatalf("second current-generation admission = (%t, %v), want capacity available", probe, err)
+	}
+	if _, _, err := b.AllowAdmissionWithGeneration(); !errors.Is(err, ErrOpen) {
+		t.Fatalf("third current-generation admission = %v, want stale token not to free capacity", err)
 	}
 }
 

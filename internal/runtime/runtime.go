@@ -364,7 +364,7 @@ func New(options Options) *Runtime {
 	// input it has: looper does not read provider status pages or parse their
 	// rate-limit messages, it counts its own results.
 	rt.activeExecutions.SetOnAgentOutcome(func(outcome agent.Outcome) {
-		rt.agentHealth.Record(outcome.Vendor, outcome.StartedAt, outcome.Succeeded, outcome.BrownoutProbe, outcome.BrownoutStickySnapshot)
+		rt.agentHealth.Record(outcome.Vendor, outcome.StartedAt, outcome.Succeeded, outcome.BrownoutProbe, outcome.BrownoutStickySnapshot, outcome.BrownoutProbeGeneration)
 	})
 	// Project daemon Admission onto agent spawn leases so cmd.Start is refused
 	// while starting/stopping/degraded (#576 + #575).
@@ -746,16 +746,18 @@ func (r *Runtime) allowAgentSpawn(meta *agent.SpawnMeta) error {
 		return err
 	}
 	var probe bool
+	var generation uint64
 	var err error
 	if meta.BrownoutStickySnapshot {
-		probe, err = r.agentHealth.AllowSnapshotAdmission(meta.Vendor)
+		probe, generation, err = r.agentHealth.AllowSnapshotAdmissionWithGeneration(meta.Vendor)
 	} else {
-		probe, err = r.agentHealth.AllowAdmission(meta.Vendor)
+		probe, generation, err = r.agentHealth.AllowAdmissionWithGeneration(meta.Vendor)
 	}
 	meta.BrownoutProbe = probe
+	meta.BrownoutProbeGeneration = generation
 	if err == nil && probe {
 		vendor := meta.Vendor
-		meta.BrownoutProbeRelease = func() { r.agentHealth.ReleaseAdmission(vendor) }
+		meta.BrownoutProbeRelease = func() { r.agentHealth.ReleaseAdmission(vendor, generation) }
 	}
 	return err
 }

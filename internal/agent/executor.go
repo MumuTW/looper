@@ -156,6 +156,8 @@ type Outcome struct {
 	Vendor string
 	// BrownoutProbe is true only when the spawn was admitted during half-open.
 	BrownoutProbe bool
+	// BrownoutProbeGeneration identifies the half-open round for this outcome.
+	BrownoutProbeGeneration uint64
 	// BrownoutStickySnapshot is true when this outcome belongs to a retry using
 	// a persisted vendor snapshot rather than the current live role config.
 	BrownoutStickySnapshot bool
@@ -302,6 +304,8 @@ type RunInput struct {
 	CompletionContract CompletionContract
 	// BrownoutProbe is populated by the common spawn admission lease.
 	BrownoutProbe bool
+	// BrownoutProbeGeneration is copied from the common spawn admission lease.
+	BrownoutProbeGeneration uint64
 }
 
 type CompletionContract string
@@ -650,6 +654,9 @@ func (e *ConfiguredExecutor) Start(ctx context.Context, input RunInput) (Executi
 		}
 		if probeLease, ok := lease.(interface{ BrownoutProbe() bool }); ok {
 			input.BrownoutProbe = probeLease.BrownoutProbe()
+		}
+		if probeLease, ok := lease.(interface{ BrownoutProbeGeneration() uint64 }); ok {
+			input.BrownoutProbeGeneration = probeLease.BrownoutProbeGeneration()
 		}
 	}
 	// The health admission timestamp must be captured after AdmitSpawn returns:
@@ -1365,14 +1372,15 @@ func (x *execution) reportOutcome(status, parseStatus, completionPayload, stdout
 		succeeded = succeeded && parseStatus == "parsed" && validMarkerOutcome(completionPayload)
 	}
 	x.executor.onOutcome(Outcome{
-		ProjectID:              x.input.ProjectID,
-		LoopID:                 x.input.LoopID,
-		RunID:                  x.input.RunID,
-		ExecutionID:            x.executionID,
-		Vendor:                 string(x.executor.effectiveConfig(x.input).Vendor),
-		BrownoutProbe:          x.input.BrownoutProbe,
-		BrownoutStickySnapshot: x.input.UseSnapshot && strings.TrimSpace(x.input.SnapshotVendor) != "",
-		Status:                 status,
+		ProjectID:               x.input.ProjectID,
+		LoopID:                  x.input.LoopID,
+		RunID:                   x.input.RunID,
+		ExecutionID:             x.executionID,
+		Vendor:                  string(x.executor.effectiveConfig(x.input).Vendor),
+		BrownoutProbe:           x.input.BrownoutProbe,
+		BrownoutProbeGeneration: x.input.BrownoutProbeGeneration,
+		BrownoutStickySnapshot:  x.input.UseSnapshot && strings.TrimSpace(x.input.SnapshotVendor) != "",
+		Status:                  status,
 		// A zero exit code is not a valid agent completion by itself. The selected
 		// structured output contract is the executor's completion authority;
 		// missing or malformed output must feed the health gate as a failure so

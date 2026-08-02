@@ -123,6 +123,9 @@ type Breaker struct {
 	// Without a reservation every concurrent caller can observe half-open and
 	// spend a full scheduler batch against a provider that has not recovered.
 	probeInFlight int
+	// halfOpenGeneration scopes probe reservations to the recovery round that
+	// created them, so an old lease cannot consume a newer round's capacity.
+	halfOpenGeneration uint64
 	// tripFailures and tripTotal retain the evidence that opened the current
 	// outage. The rolling window is cleared on open so it cannot re-trip from
 	// stale failures, but status surfaces still need to explain why the gate is
@@ -147,7 +150,7 @@ func (b *Breaker) Allow() error {
 	// not own an execution outcome, so they must not consume a half-open probe
 	// reservation. The token-bearing AllowAdmission call is reserved for the
 	// common spawn boundary that can later report RecordAdmission.
-	_, err := b.allowAdmission(false)
+	_, _, err := b.allowAdmission(false)
 	return err
 }
 
@@ -155,25 +158,35 @@ func (b *Breaker) Allow() error {
 // while half-open. The probe bit travels with the execution so an outcome from
 // an older closed/open admission cannot be mistaken for a recovery probe.
 func (b *Breaker) AllowAdmission() (bool, error) {
+	probe, _, err := b.allowAdmission(true)
+	return probe, err
+}
+
+// AllowAdmissionWithGeneration is the token-bearing form used by the runtime
+// spawn boundary. The generation must travel with the lease so an old probe
+// cannot consume a reservation from a later half-open round.
+func (b *Breaker) AllowAdmissionWithGeneration() (bool, uint64, error) {
 	return b.allowAdmission(true)
 }
 
-func (b *Breaker) allowAdmission(reserveProbe bool) (bool, error) {
+func (b *Breaker) allowAdmission(reserveProbe bool) (bool, uint64, error) {
 	if b == nil {
-		return false, nil
+		return false, 0, nil
 	}
 	b.mu.Lock()
 	// cfg is read under the mutex because SetConfig writes it from the config
 	// reload path while the scheduler is calling this from its own goroutines.
 	if !b.cfg.Enabled {
 		b.mu.Unlock()
-		return false, nil
+		return false, 0, nil
 	}
 	transition, ok := b.refreshLocked()
 	state := b.state
 	probe := false
+	generation := uint64(0)
 	var admissionErr error
 	if reserveProbe && state == StateHalfOpen {
+		generation = b.halfOpenGeneration
 		limit := b.cfg.ProbeSuccesses
 		if limit <= 0 {
 			limit = 1
@@ -195,15 +208,15 @@ func (b *Breaker) allowAdmission(reserveProbe bool) (bool, error) {
 		b.emit(transition)
 	}
 	if admissionErr != nil {
-		return false, admissionErr
+		return false, generation, admissionErr
 	}
 	if state == StateOpen {
 		if remaining < 0 {
 			remaining = 0
 		}
-		return probe, fmt.Errorf("%w: retrying in %s", ErrOpen, remaining.Round(time.Second))
+		return probe, generation, fmt.Errorf("%w: retrying in %s", ErrOpen, remaining.Round(time.Second))
 	}
-	return probe, nil
+	return probe, generation, nil
 }
 
 // Record observes one agent outcome. Callers pass only outcomes attributable to
@@ -214,13 +227,20 @@ func (b *Breaker) Record(startedAt time.Time, ok bool) {
 	// the legacy attribution authority; provider-aware runtime callers use
 	// RecordAdmission below so an explicit half-open admission token travels
 	// with the execution as well.
-	b.RecordAdmission(startedAt, ok, !startedAt.IsZero())
+	b.RecordAdmissionGeneration(startedAt, ok, !startedAt.IsZero(), 0)
 }
 
 // RecordAdmission observes an outcome together with the admission posture
 // that allowed its process to start. Outcomes admitted before a cooldown
 // cannot satisfy ProbeSuccesses or double the backoff after a later trip.
 func (b *Breaker) RecordAdmission(startedAt time.Time, ok, probe bool) {
+	b.RecordAdmissionGeneration(startedAt, ok, probe, 0)
+}
+
+// RecordAdmissionGeneration observes an outcome with an optional half-open
+// generation token. A non-zero token is required to match the current round;
+// legacy zero tokens retain timestamp-based attribution for embedders/tests.
+func (b *Breaker) RecordAdmissionGeneration(startedAt time.Time, ok, probe bool, generation uint64) {
 	if b == nil {
 		return
 	}
@@ -233,11 +253,23 @@ func (b *Breaker) RecordAdmission(startedAt time.Time, ok, probe bool) {
 		b.mu.Unlock()
 		return
 	}
+	if b.state != StateHalfOpen && probe && generation != 0 {
+		// Another probe may already have closed this round. Do not let a
+		// late sibling outcome turn that completed recovery into a fresh
+		// closed-window failure.
+		b.mu.Unlock()
+		return
+	}
 	if b.state == StateHalfOpen {
-		if probe && b.probeInFlight > 0 {
+		if generation != 0 && generation != b.halfOpenGeneration {
+			b.mu.Unlock()
+			return
+		}
+		validProbe := probe && !startedAt.IsZero() && !startedAt.Before(b.halfOpenAt)
+		if validProbe && b.probeInFlight > 0 {
 			b.probeInFlight--
 		}
-		if !probe || startedAt.IsZero() || startedAt.Before(b.halfOpenAt) {
+		if !validProbe {
 			b.mu.Unlock()
 			return
 		}
@@ -259,11 +291,17 @@ func (b *Breaker) RecordAdmission(startedAt time.Time, ok, probe bool) {
 // by the supervisor; neither path calls RecordAdmission, so keeping the slot
 // would leave the breaker permanently half-open when ProbeSuccesses is one.
 func (b *Breaker) ReleaseProbe() {
+	b.ReleaseProbeGeneration(0)
+}
+
+// ReleaseProbeGeneration returns one reservation only when it belongs to the
+// current half-open round. A stale lease from an earlier round is ignored.
+func (b *Breaker) ReleaseProbeGeneration(generation uint64) {
 	if b == nil {
 		return
 	}
 	b.mu.Lock()
-	if b.probeInFlight > 0 {
+	if (generation == 0 || generation == b.halfOpenGeneration) && b.probeInFlight > 0 {
 		b.probeInFlight--
 	}
 	b.mu.Unlock()
@@ -360,6 +398,10 @@ func (b *Breaker) refreshLocked() (Transition, bool) {
 	b.state = StateHalfOpen
 	b.probeSuccesses = 0
 	b.probeInFlight = 0
+	b.halfOpenGeneration++
+	if b.halfOpenGeneration == 0 {
+		b.halfOpenGeneration++
+	}
 	b.halfOpenAt = now
 	// Drop the window that tripped the breaker. Keeping it would let stale
 	// failures re-trip the breaker on the first probe before any new outcome

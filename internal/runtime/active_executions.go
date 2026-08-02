@@ -283,6 +283,13 @@ func (l *spawnLease) BrownoutProbe() bool {
 	return l.brownoutProbe
 }
 
+func (l *spawnLease) BrownoutProbeGeneration() uint64 {
+	if l == nil {
+		return 0
+	}
+	return l.meta.BrownoutProbeGeneration
+}
+
 func (l *spawnLease) markBrownoutObserved() {
 	if l == nil {
 		return
