@@ -1,0 +1,73 @@
+{{define "board.html"}}
+    <section class="band" aria-label="Triage summary">
+      <div class="tiles">
+{{- range .Board.Sections}}
+        <div class="tile tile-{{.Group.Slug}}">
+          <span class="tile-count">{{.Count}}</span>
+          <span class="tile-label">{{.Group.Title}}</span>
+        </div>
+{{- end}}
+      </div>
+      <div class="band-foot">
+        <ul class="legend">
+{{- range .Board.Sections}}
+          <li class="legend-item"><span class="dot dot-{{.Group.Slug}}" aria-hidden="true"></span>{{.Group.Title}}</li>
+{{- end}}
+        </ul>
+        <p class="updated">last updated {{.Updated}} · auto-refresh {{.RefreshSeconds}}s</p>
+      </div>
+{{- if .Board.Notices}}
+      <ul class="notices">
+{{- range .Board.Notices}}
+        <li>{{.}}</li>
+{{- end}}
+      </ul>
+{{- end}}
+    </section>
+
+{{range $section := .Board.Sections}}
+    <section class="group group-{{.Group.Slug}}" id="group-{{.Group.Slug}}" aria-labelledby="heading-{{.Group.Slug}}">
+      <h2 class="group-head" id="heading-{{.Group.Slug}}">
+        <span class="dot dot-{{.Group.Slug}}" aria-hidden="true"></span>
+        <span class="group-name">{{.Group.Title}}</span>
+        <span class="group-count">{{.Count}}</span>
+      </h2>
+{{- if .Rows}}
+      <ul class="rows">
+{{- range .Rows}}
+        <li class="row{{if .Changed}} is-changed{{end}}" id="row-{{.Key}}">
+          <span class="dot dot-{{$section.Group.Slug}}" aria-hidden="true"></span>
+          <span class="row-main">
+{{- if .Link}}
+            <a class="row-link" href="{{.Link}}" rel="noreferrer noopener" target="_blank"><span class="row-ref">{{.Ref}}</span><span class="row-title">{{.Title}}</span></a>
+{{- else}}
+            <span class="row-link"><span class="row-ref">{{.Ref}}</span><span class="row-title">{{.Title}}</span></span>
+{{- end}}
+          </span>
+          <span class="chip chip-{{.Blocker.Tone}}" title="{{.Blocker.Code}}">{{.Blocker.Label}}</span>
+          <span class="row-meta">
+{{- if .HasThreads}}
+            <span class="meta meta-threads"><span class="meta-num">{{.Threads}}</span> {{.ThreadsLabel}}</span>
+{{- else}}
+            <span class="meta meta-threads meta-empty" aria-hidden="true"></span>
+{{- end}}
+{{- if .Diff.Known}}
+            <span class="meta meta-diff" title="{{.Diff.Detail}}">{{.Diff.Label}}</span>
+{{- else}}
+            <span class="meta meta-diff meta-empty" aria-hidden="true"></span>
+{{- end}}
+{{- if not .ChangedAt.IsZero}}
+            <span class="meta meta-age" title="{{stamp .ChangedAt}}">{{age .Age}}</span>
+{{- else}}
+            <span class="meta meta-age meta-empty" aria-hidden="true"></span>
+{{- end}}
+          </span>
+        </li>
+{{- end}}
+      </ul>
+{{- else}}
+      <p class="empty">{{.Group.Empty}}</p>
+{{- end}}
+    </section>
+{{end}}
+{{end}}

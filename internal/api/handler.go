@@ -310,6 +310,13 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// The hypermedia UI answers in HTML, so it is dispatched before the JSON
+	// route table — but only after the same authorization every JSON read runs.
+	if isWebUIPath(path) {
+		h.handleWebUIRoute(w, r)
+		return
+	}
+
 	switch path {
 	case dashboardBootstrapCodePath:
 		h.handleBootstrapMint(w, r, requestID)

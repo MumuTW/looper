@@ -1,0 +1,41 @@
+{{define "page.html"}}<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Triage · looper</title>
+<!-- htmx would otherwise inject its indicator stylesheet inline, which the
+     page's Content-Security-Policy forbids. The indicator styles live in
+     app.css instead. -->
+<meta name="htmx-config" content='{"includeIndicatorStyles":false}'>
+<link rel="stylesheet" href="{{.StaticPrefix}}app.css">
+<script src="{{.StaticPrefix}}htmx.min.js" defer></script>
+</head>
+<body>
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="wordmark" href="{{.TriagePath}}">looper</a>
+    <nav class="nav" aria-label="Sections">
+      <a class="nav-link is-active" href="{{.TriagePath}}" aria-current="page">Triage</a>
+    </nav>
+    <a class="nav-link nav-link-secondary" href="{{.DashboardPath}}">Dashboard</a>
+  </div>
+</header>
+
+<main class="page">
+  <div class="page-head">
+    <h1 class="page-title">Triage</h1>
+    <p class="page-sub">One primary blocker per pull request, grouped by who has to move next.</p>
+  </div>
+
+  <div id="triage-board"
+       class="board"
+       hx-get="{{.BoardPath}}"
+       hx-trigger="every {{.RefreshSeconds}}s"
+       hx-swap="innerHTML transition:true">
+{{template "board.html" .}}
+  </div>
+</main>
+</body>
+</html>
+{{end}}

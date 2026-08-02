@@ -1960,12 +1960,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 	var escalatorRunner escalatorScheduler
 	if cfg.Roles.Escalator.Enabled {
 		escalatorRunner = escalator.NewRunner(
-			escalator.NewCollector(repos, newRuntimeEscalatorLinker(cfg), escalator.CollectorOptions{
-				Now:                   now,
-				RetryAttemptThreshold: cfg.Roles.Escalator.RetryAttemptThreshold,
-				UnroutedAfter:         time.Duration(cfg.Roles.Escalator.UnroutedAfterSeconds) * time.Second,
-				StaleHeadAfter:        time.Duration(cfg.Roles.Escalator.StaleHeadAfterSeconds) * time.Second,
-			}),
+			NewEscalatorCollector(cfg, repos, now),
 			notificationGateway,
 			repos,
 			escalator.RunnerOptions{Now: now, MaxItems: cfg.Roles.Escalator.MaxItems},

@@ -6,12 +6,36 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/escalator"
+	"github.com/MumuTW/looper/internal/storage"
 )
 
 type runtimeEscalatorLinker struct {
 	dashboardBase string
+}
+
+// NewEscalatorLinker builds the action links every Escalator projection points
+// at. Exported because the operator web UI matches digest items back to the
+// pull requests and loops it renders by link identity, and a second link
+// builder would silently stop matching the moment either one changed.
+func NewEscalatorLinker(cfg config.Config) escalator.Linker {
+	return newRuntimeEscalatorLinker(cfg)
+}
+
+// NewEscalatorCollector builds the read-only digest collector from the same
+// role configuration the scheduler uses. The collector never mutates work, so
+// read surfaces may run it regardless of whether the Escalator role is enabled;
+// what roles.escalator gates is the notification cadence, not the detection.
+func NewEscalatorCollector(cfg config.Config, repos *storage.Repositories, now func() time.Time) *escalator.Collector {
+	return escalator.NewCollector(repos, NewEscalatorLinker(cfg), escalator.CollectorOptions{
+		Now:                   now,
+		RetryAttemptThreshold: cfg.Roles.Escalator.RetryAttemptThreshold,
+		UnroutedAfter:         time.Duration(cfg.Roles.Escalator.UnroutedAfterSeconds) * time.Second,
+		StaleHeadAfter:        time.Duration(cfg.Roles.Escalator.StaleHeadAfterSeconds) * time.Second,
+	})
 }
 
 func newRuntimeEscalatorLinker(cfg config.Config) runtimeEscalatorLinker {
