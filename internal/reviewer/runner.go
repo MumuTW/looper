@@ -2495,15 +2495,23 @@ func (r *Runner) classifyReviewThreads(ctx context.Context, input stepInput, che
 		r.markAgentExecutionNativeResumePendingForTransientProvider(ctx, executionID, message)
 		return nil, &runpipe.LoopError{Message: message, Kind: runpipe.FailureRetryableTransient}
 	}
-	parsed, err := resolution.ParseOutput(result.Stdout)
+	decisions, err := parseReviewerThreadResolutionOutput(result.Stdout)
 	if err == nil {
-		return parsed.Decisions, nil
+		return decisions, nil
 	}
 	if message := transientProviderMessageFromAgentResult(result); message != "" {
 		r.markAgentExecutionNativeResumePendingForTransientProvider(ctx, executionID, message)
 		return nil, &runpipe.LoopError{Message: message, Kind: runpipe.FailureRetryableTransient}
 	}
 	return nil, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureNonRetryable}
+}
+
+func parseReviewerThreadResolutionOutput(stdout string) ([]threadResolutionAgentDecision, error) {
+	parsed, err := resolution.ParseOutput(agent.FinalMessage(stdout))
+	if err != nil {
+		return nil, err
+	}
+	return parsed.Decisions, nil
 }
 
 type reviewerHeadChangeMonitor struct {

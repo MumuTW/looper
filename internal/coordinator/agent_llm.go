@@ -49,8 +49,13 @@ func (l agentLLM) Complete(ctx context.Context, req triage.Request) (string, err
 	if err != nil {
 		return "", err
 	}
-	if strings.TrimSpace(result.Stdout) == "" {
+	return coordinatorAgentMessage(result.Stdout)
+}
+
+func coordinatorAgentMessage(stdout string) (string, error) {
+	message := agent.FinalMessage(stdout)
+	if strings.TrimSpace(message) == "" {
 		return "", fmt.Errorf("coordinator triage returned empty stdout")
 	}
-	return strings.TrimSpace(result.Stdout), nil
+	return strings.TrimSpace(message), nil
 }
