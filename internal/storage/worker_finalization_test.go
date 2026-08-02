@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -63,5 +64,39 @@ func TestFinalizeWorkerSuccessRollsBackRunWhenQueueCompletionFails(t *testing.T)
 	}
 	if loop == nil || loop.Status != "running" {
 		t.Fatalf("loop after rollback = %#v, want running", loop)
+	}
+}
+
+func TestFinalizeWorkerSuccessRollsBackWhenFollowUpFails(t *testing.T) {
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	repos := NewRepositories(coordinator.DB())
+	ctx := context.Background()
+	startedAt := "2026-07-30T12:00:00.000Z"
+	finishedAt := "2026-07-30T12:01:00.000Z"
+	projectID, loopID, queueID := "project_follow_up", "loop_follow_up", "queue_follow_up"
+	if err := repos.Projects.Upsert(ctx, ProjectRecord{ID: projectID, Name: "Follow-up", RepoPath: t.TempDir(), CreatedAt: startedAt, UpdatedAt: startedAt}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := repos.Loops.Upsert(ctx, LoopRecord{ID: loopID, Seq: 1, ProjectID: projectID, Type: "worker", TargetType: "project", Status: "running", CreatedAt: startedAt, UpdatedAt: startedAt}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	if err := repos.Runs.Upsert(ctx, RunRecord{ID: "run_follow_up", LoopID: loopID, Status: "running", StartedAt: startedAt, CreatedAt: startedAt, UpdatedAt: startedAt}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	if err := repos.Queue.Upsert(ctx, QueueItemRecord{ID: queueID, ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: "project:" + projectID, DedupeKey: "worker:" + loopID, Priority: QueuePriorityWorker, Status: "running", AvailableAt: startedAt, Attempts: 1, MaxAttempts: 3, CreatedAt: startedAt, UpdatedAt: startedAt}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	run, _ := repos.Runs.GetByID(ctx, "run_follow_up")
+	completed := *run
+	completed.Status, completed.EndedAt, completed.UpdatedAt = "success", &finishedAt, finishedAt
+	err := FinalizeWorkerSuccess(ctx, coordinator.DB(), WorkerSuccessFinalizationInput{Run: completed, QueueItemID: queueID, LoopID: loopID, LoopStatus: "completed", FinishedAt: finishedAt, AfterFinalize: func(context.Context, *Repositories) error { return errors.New("injected graph follow-up failure") }})
+	if err == nil || !strings.Contains(err.Error(), "injected graph follow-up failure") {
+		t.Fatalf("FinalizeWorkerSuccess() error = %v", err)
+	}
+	run, _ = repos.Runs.GetByID(ctx, completed.ID)
+	queueItem, _ := repos.Queue.GetByID(ctx, queueID)
+	loop, _ := repos.Loops.GetByID(ctx, loopID)
+	if run.Status != "running" || queueItem.Status != "running" || loop.Status != "running" {
+		t.Fatalf("state after callback rollback = run=%#v queue=%#v loop=%#v", run, queueItem, loop)
 	}
 }
