@@ -134,6 +134,22 @@ func TestSQLiteFilesystemPathParsesOpaqueFileURI(t *testing.T) {
 	}
 }
 
+func TestSQLiteFilesystemPathTreatsSharedMemoryURIAsNonFilesystem(t *testing.T) {
+	for _, dbPath := range []string{
+		":memory:",
+		"file::memory:?cache=shared",
+		"file:memdb1?mode=memory&cache=shared",
+	} {
+		path, isFile, err := SQLiteFilesystemPath(dbPath)
+		if err != nil {
+			t.Fatalf("SQLiteFilesystemPath(%q) error = %v", dbPath, err)
+		}
+		if isFile || path != "" {
+			t.Fatalf("SQLiteFilesystemPath(%q) = (%q, %t), want empty non-filesystem path", dbPath, path, isFile)
+		}
+	}
+}
+
 func TestOpenSQLiteDBWithCompatibilityCheckHoldsMigrationFenceUntilClose(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "looper.sqlite")
 	db, err := OpenSQLiteDBWithCompatibilityCheck(context.Background(), dbPath)
