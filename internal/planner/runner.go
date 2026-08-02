@@ -999,11 +999,16 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			}
 			return runpipe.ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.Message, FailureKind: failure.Kind}, true, nil
 		},
-		AfterCompleted: func(_ context.Context, step PlannerStep, checkpoint plannerCheckpoint) bool {
+		AfterExecuted: func(_ context.Context, step PlannerStep, checkpoint plannerCheckpoint) {
+			// Rebind before completion persists: if PersistCompleted fails,
+			// the deferred release must already cover the lock discover
+			// acquired (its local error-release path is disabled by then).
 			if step == stepDiscoverIssues {
 				claimedLockKey = checkpoint.ClaimedLockKey
 				acquiredClaimedLock = claimedLockKey != ""
 			}
+		},
+		AfterCompleted: func(_ context.Context, _ PlannerStep, checkpoint plannerCheckpoint) bool {
 			return checkpoint.SkipReason != ""
 		},
 	}

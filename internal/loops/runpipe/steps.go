@@ -6,12 +6,16 @@ import (
 	"github.com/MumuTW/looper/internal/storage"
 )
 
-// StepRunner is the shared step-iteration engine behind every runner's
-// ProcessClaimedItem loop: the ordering of persist-started → started event
-// → execute → failure dispatch → persist-completed → completed event is
-// single-sourced here, so a fix to checkpoint-persistence order or event
-// timing lands once instead of four times (#537). Everything a runner does
-// differently rides in the hooks; the engine owns only the ordering.
+// StepRunner is the shared step-iteration engine that the runners'
+// ProcessClaimedItem loops migrate onto under #537 (planner adopted;
+// worker, reviewer, and fixer still own their historical copies until
+// their slices land). The ordering — persist-started → started event →
+// execute → adopt checkpoint → failure dispatch OR post-execute
+// bookkeeping → persist-completed → completed event → stop check — is
+// single-sourced here, so once a runner has migrated, a fix to
+// checkpoint-persistence order or event timing lands in one place.
+// Everything a runner does differently rides in the hooks; the engine
+// owns only the ordering.
 //
 // It is a struct of functions rather than an interface, matching the
 // package's function-first style and letting runners build it from
@@ -32,8 +36,14 @@ type StepRunner[S ~string, C any] struct {
 	// label-mismatch, or the runner's failure tail); handled=false with a
 	// non-nil error aborts the pipeline as an infrastructure failure.
 	OnFailure func(ctx context.Context, step S, run storage.RunRecord, checkpoint C, stepErr error) (ProcessResult, bool, error)
-	// AfterCompleted runs post-step bookkeeping (lock rebinding, skip
-	// detection) and reports whether iteration should stop early.
+	// AfterExecuted runs immediately after a successful execution and
+	// BEFORE the completion is persisted. Bookkeeping that must survive a
+	// persistence failure belongs here — the planner rebinds its claimed
+	// lock key so the deferred release still covers a lock the discover
+	// step just acquired even when PersistCompleted fails.
+	AfterExecuted func(ctx context.Context, step S, checkpoint C)
+	// AfterCompleted runs after the completion is persisted and reports
+	// whether iteration should stop early (skip detection).
 	AfterCompleted func(ctx context.Context, step S, checkpoint C) (stop bool)
 }
 
@@ -66,6 +76,9 @@ func (s StepRunner[S, C]) Run(ctx context.Context, steps []S, run storage.RunRec
 				return run, checkpoint, &result, nil
 			}
 			return run, checkpoint, nil, err
+		}
+		if s.AfterExecuted != nil {
+			s.AfterExecuted(ctx, step, checkpoint)
 		}
 		run, err = s.PersistCompleted(ctx, run, step, checkpoint)
 		if err != nil {

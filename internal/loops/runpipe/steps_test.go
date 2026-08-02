@@ -42,6 +42,9 @@ func (tr *stepTrace) runner(failOn string, handleFailure bool, stopAfter string)
 			}
 			return ProcessResult{}, false, nil
 		},
+		AfterExecuted: func(_ context.Context, step string, c int) {
+			tr.events = append(tr.events, "after-executed:"+step)
+		},
 		AfterCompleted: func(_ context.Context, step string, c int) bool {
 			tr.events = append(tr.events, "after:"+step)
 			return step == stopAfter
@@ -63,9 +66,11 @@ func TestStepRunnerOrderingContract(t *testing.T) {
 	if checkpoint != 2 {
 		t.Fatalf("checkpoint = %d, want advanced by both steps", checkpoint)
 	}
+	// after-executed sits BEFORE persist-done: bookkeeping that must
+	// survive a persistence failure (lock rebinding) happens there.
 	want := strings.Join([]string{
-		"persist-start:a", "loop.step.started:a", "execute:a", "persist-done:a", "loop.step.completed:a", "after:a",
-		"persist-start:b", "loop.step.started:b", "execute:b", "persist-done:b", "loop.step.completed:b", "after:b",
+		"persist-start:a", "loop.step.started:a", "execute:a", "after-executed:a", "persist-done:a", "loop.step.completed:a", "after:a",
+		"persist-start:b", "loop.step.started:b", "execute:b", "after-executed:b", "persist-done:b", "loop.step.completed:b", "after:b",
 	}, "|")
 	if got := strings.Join(tr.events, "|"); got != want {
 		t.Fatalf("ordering =\n%s\nwant\n%s", got, want)
