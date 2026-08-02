@@ -429,8 +429,12 @@ type fakeGatekeeperGitHub struct {
 	finalHeadSHA       string
 	protectionErr      error
 	currentUserLogin   string
+	currentUserErr     error
 	comments           []githubinfra.CommentInfo
+	commentsErr        error
+	commentsCalls      int
 	updateCommentCalls []githubinfra.UpdateIssueCommentInput
+	updateCommentErr   error
 	// perPullRequestCalls counts the forge round trips that only a full evaluation
 	// makes, so a test can prove a pull request was skipped rather than evaluated.
 	perPullRequestCalls int
@@ -482,14 +486,24 @@ func (f *fakeGatekeeperGitHub) SetCommitStatus(_ context.Context, input githubin
 }
 
 func (f *fakeGatekeeperGitHub) GetCurrentUserLoginForRepo(context.Context, string, string) (string, error) {
+	if f.currentUserErr != nil {
+		return "", f.currentUserErr
+	}
 	return f.currentUserLogin, nil
 }
 
 func (f *fakeGatekeeperGitHub) ListIssueComments(context.Context, githubinfra.ViewIssueInput) ([]githubinfra.CommentInfo, error) {
+	f.commentsCalls++
+	if f.commentsErr != nil {
+		return nil, f.commentsErr
+	}
 	return append([]githubinfra.CommentInfo(nil), f.comments...), nil
 }
 
 func (f *fakeGatekeeperGitHub) UpdateIssueComment(_ context.Context, input githubinfra.UpdateIssueCommentInput) error {
+	if f.updateCommentErr != nil {
+		return f.updateCommentErr
+	}
 	f.updateCommentCalls = append(f.updateCommentCalls, input)
 	for i := range f.comments {
 		if f.comments[i].ID == input.CommentID {

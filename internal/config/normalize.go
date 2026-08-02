@@ -21,6 +21,9 @@ func Normalize(cwd string, partials ...PartialConfig) (Config, error) {
 		if issues := validateProjectCodingRoleSections(partial); len(issues) > 0 {
 			return Config{}, &ConfigValidationError{Issues: issues}
 		}
+		if issues := validateDeprecatedGatekeeperTrust(partial); len(issues) > 0 {
+			return Config{}, &ConfigValidationError{Issues: issues}
+		}
 		normalized := normalizeLayerPartial(clonePartialConfig(partial))
 		mergeConfig(&config, normalized)
 		normalizedLayers = append(normalizedLayers, normalized)
@@ -58,6 +61,43 @@ func Normalize(cwd string, partials ...PartialConfig) (Config, error) {
 	}
 
 	return config, nil
+}
+
+// validateDeprecatedGatekeeperTrust keeps the parse-only compatibility field
+// strict about the values that were historically loadable.  The field has no
+// runtime authority, but silently accepting "auto" would make an unsupported
+// merge authority look like a valid configuration and then fall back to
+// observe-only behavior.
+func validateDeprecatedGatekeeperTrust(partial PartialConfig) []ValidationIssue {
+	issues := make([]ValidationIssue, 0)
+	validate := func(value *string, path string) {
+		if value == nil {
+			return
+		}
+		switch strings.ToLower(strings.TrimSpace(*value)) {
+		case "observe", "advise":
+		default:
+			issues = append(issues, ValidationIssue{Path: path, Message: "must be one of: observe, advise"})
+		}
+	}
+	if partial.Roles != nil {
+		validateDeprecatedGatekeeperRoleTrust(partial.Roles.Gatekeeper, "roles.gatekeeper.trust", validate)
+	}
+	if partial.Projects != nil {
+		for index, project := range *partial.Projects {
+			if project.Roles != nil {
+				validateDeprecatedGatekeeperRoleTrust(project.Roles.Gatekeeper, fmt.Sprintf("projects[%d].roles.gatekeeper.trust", index), validate)
+			}
+		}
+	}
+	return issues
+}
+
+func validateDeprecatedGatekeeperRoleTrust(role *DeprecatedGatekeeperRoleConfig, path string, validate func(*string, string)) {
+	if role == nil {
+		return
+	}
+	validate(role.Trust, path)
 }
 
 // validateProjectCodingRoleSections rejects roles.coding.* under a project:

@@ -201,6 +201,7 @@ type Options struct {
 	GitHub              GitHubGateway
 	Now                 func() time.Time
 	PolicyPermitsTarget func(projectID, repo, baseRefName string) bool
+	LogWarn             func(msg string, fields map[string]any)
 }
 
 // Runner is the Merge Gatekeeper: a reactive, agent-free policy Role that
@@ -214,6 +215,7 @@ type Runner struct {
 	github              GitHubGateway
 	now                 func() time.Time
 	policyPermitsTarget func(projectID, repo, baseRefName string) bool
+	logWarn             func(msg string, fields map[string]any)
 }
 
 func New(options Options) *Runner {
@@ -225,7 +227,7 @@ func New(options Options) *Runner {
 	if policy == nil {
 		policy = func(string, string, string) bool { return true }
 	}
-	return &Runner{repos: options.Repos, github: options.GitHub, now: now, policyPermitsTarget: policy}
+	return &Runner{repos: options.Repos, github: options.GitHub, now: now, policyPermitsTarget: policy, logWarn: options.LogWarn}
 }
 
 func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput) (DiscoveryResult, error) {
@@ -238,6 +240,9 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 	}
 	if strings.TrimSpace(input.CWD) == "" {
 		input.CWD = r.projectCWD(ctx, input.ProjectID)
+	}
+	if err := r.reconcileLegacyVerdictComments(ctx, input.ProjectID, input.Repo, input.CWD); err != nil {
+		return DiscoveryResult{}, err
 	}
 	listCtx := ctx
 	if input.Snapshot != nil {
@@ -292,9 +297,6 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 		stillOpen[entityID] = struct{}{}
 		previous, hasPrevious := previousReports[entityID]
 		if reused, ok := skipUnchanged(previous, hasPrevious, fingerprint, r.now()); ok {
-			if err := r.retireLegacyVerdictComments(ctx, reused, input.CWD); err != nil {
-				return result, err
-			}
 			result.Skipped++
 			result.Reports = append(result.Reports, reused)
 			continue
@@ -424,9 +426,6 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 		},
 		EvaluatedAt:       r.now().UTC().Format(time.RFC3339Nano),
 		SourceFingerprint: input.SourceFingerprint,
-	}
-	if err := r.retireLegacyVerdictComments(ctx, report, input.CWD); err != nil {
-		return Report{}, err
 	}
 	viewInput := githubinfra.ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD}
 	detail, err := r.github.ViewPullRequestForGatekeeper(ctx, viewInput)

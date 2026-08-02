@@ -4,8 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
+	"time"
 
+	"github.com/nexu-io/looper/internal/eventlog"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 )
 
@@ -17,6 +20,17 @@ const legacyVerdictCommentMarker = "<!-- looper:gatekeeper:verdict v=1 -->"
 const retiredLegacyVerdictBody = legacyVerdictCommentMarker + "\n" +
 	"⚪ **Merge gate advice withdrawn.** This project now runs Gatekeeper in observe-only mode, so this verdict must not be used to decide whether to merge.\n"
 
+const legacyVerdictRetirementEventType = "pull_request.merge_gate.legacy_verdict_retired"
+
+type legacyVerdictRetirement struct {
+	Version         int    `json:"version"`
+	ProjectID       string `json:"projectId"`
+	Repo            string `json:"repo"`
+	PRNumber        int64  `json:"prNumber"`
+	UpdatedComments int    `json:"updatedComments"`
+	RetiredAt       string `json:"retiredAt"`
+}
+
 // legacyVerdictCommentGateway is deliberately optional. The rollback never
 // publishes advice, but the production GitHub gateway can safely withdraw its
 // own old comments. Keeping this capability separate leaves ordinary Gatekeeper
@@ -27,13 +41,13 @@ type legacyVerdictCommentGateway interface {
 	GetCurrentUserLoginForRepo(context.Context, string, string) (string, error)
 }
 
-// retireLegacyVerdictComments withdraws legacy advise verdicts whenever their
-// v2 report remains in the event log. It intentionally rescans on later ticks:
-// a transient forge failure must not let the next observe-only report hide the
-// evidence needed to retry retirement.
+// retireLegacyVerdictComments withdraws one historical advise verdict. A
+// successful pass records a local completion event—even when the comment is
+// already absent—so subsequent ticks do not repeat the forge reads. Failures
+// leave that event absent and are therefore retried by the next pass.
 func (r *Runner) retireLegacyVerdictComments(ctx context.Context, report Report, cwd string) error {
-	legacy, err := r.hasLegacyAdviseReport(ctx, report.Repo, report.PRNumber)
-	if err != nil || !legacy {
+	completed, err := r.legacyVerdictRetired(ctx, report.Repo, report.PRNumber)
+	if err != nil || completed {
 		return err
 	}
 
@@ -51,6 +65,7 @@ func (r *Runner) retireLegacyVerdictComments(ctx context.Context, report Report,
 	if err != nil {
 		return fmt.Errorf("list Gatekeeper verdict comments: %w", err)
 	}
+	updatedComments := 0
 	for _, comment := range comments {
 		if !strings.Contains(comment.Body, legacyVerdictCommentMarker) || !strings.EqualFold(strings.TrimSpace(comment.Author), strings.TrimSpace(login)) {
 			continue
@@ -63,27 +78,84 @@ func (r *Runner) retireLegacyVerdictComments(ctx context.Context, report Report,
 		}); err != nil {
 			return fmt.Errorf("retire Gatekeeper verdict comment %d: %w", comment.ID, err)
 		}
+		updatedComments++
+	}
+	projectID := report.ProjectID
+	entityType := "pull_request"
+	entityID := fmt.Sprintf("%s#%d", report.Repo, report.PRNumber)
+	if err := eventlog.Append(ctx, r.repos, eventlog.AppendInput{
+		EventType: legacyVerdictRetirementEventType, ProjectID: &projectID,
+		EntityType: &entityType, EntityID: &entityID,
+		Payload: legacyVerdictRetirement{
+			Version: 1, ProjectID: report.ProjectID, Repo: report.Repo, PRNumber: report.PRNumber,
+			UpdatedComments: updatedComments, RetiredAt: r.now().UTC().Format(time.RFC3339Nano),
+		}, CreatedAt: r.now(),
+	}); err != nil {
+		return fmt.Errorf("persist Gatekeeper verdict retirement: %w", err)
 	}
 	return nil
 }
 
-func (r *Runner) hasLegacyAdviseReport(ctx context.Context, repo string, prNumber int64) (bool, error) {
+// reconcileLegacyVerdictComments scans the complete immutable report history,
+// not just the current open-PR page. Forge retirement failures are warnings,
+// not Gatekeeper evaluation failures; absence of a completion event causes the
+// next tick to retry the failed retirement.
+func (r *Runner) reconcileLegacyVerdictComments(ctx context.Context, projectID, repo, cwd string) error {
+	reports, err := r.historicalLegacyAdviseReports(ctx, projectID, repo)
+	if err != nil {
+		return err
+	}
+	sort.Slice(reports, func(i, j int) bool { return reports[i].PRNumber < reports[j].PRNumber })
+	for _, report := range reports {
+		if err := r.retireLegacyVerdictComments(ctx, report, cwd); err != nil {
+			if r.logWarn != nil {
+				r.logWarn("gatekeeper: legacy verdict retirement deferred", map[string]any{
+					"repo": report.Repo, "pr": report.PRNumber, "error": err.Error(),
+				})
+			}
+		}
+	}
+	return nil
+}
+
+func (r *Runner) historicalLegacyAdviseReports(ctx context.Context, projectID, repo string) ([]Report, error) {
+	if r == nil || r.repos == nil || r.repos.Events == nil {
+		return nil, fmt.Errorf("gatekeeper event repository is not configured")
+	}
+	events, err := r.repos.Events.ListByProjectAndEntityType(ctx, projectID, "pull_request")
+	if err != nil {
+		return nil, fmt.Errorf("list Gatekeeper reports: %w", err)
+	}
+	latestByEntity := map[string]Report{}
+	for _, event := range events {
+		if event.EventType != GateReportEventType || event.EntityID == nil {
+			continue
+		}
+		var report Report
+		if err := json.Unmarshal([]byte(event.PayloadJSON), &report); err != nil {
+			continue
+		}
+		if report.Version >= 2 && strings.EqualFold(strings.TrimSpace(report.Mode), "advise") && strings.EqualFold(strings.TrimSpace(report.Repo), strings.TrimSpace(repo)) {
+			latestByEntity[*event.EntityID] = report
+		}
+	}
+	reports := make([]Report, 0, len(latestByEntity))
+	for _, report := range latestByEntity {
+		reports = append(reports, report)
+	}
+	return reports, nil
+}
+
+func (r *Runner) legacyVerdictRetired(ctx context.Context, repo string, prNumber int64) (bool, error) {
 	if r == nil || r.repos == nil || r.repos.Events == nil {
 		return false, fmt.Errorf("gatekeeper event repository is not configured")
 	}
 	events, err := r.repos.Events.ListByEntity(ctx, "pull_request", fmt.Sprintf("%s#%d", repo, prNumber))
 	if err != nil {
-		return false, fmt.Errorf("list Gatekeeper reports: %w", err)
+		return false, fmt.Errorf("list Gatekeeper retirement events: %w", err)
 	}
 	for _, event := range events {
-		if event.EventType != GateReportEventType {
-			continue
-		}
-		var report Report
-		if err := json.Unmarshal([]byte(event.PayloadJSON), &report); err != nil {
-			return false, fmt.Errorf("decode Gatekeeper report: %w", err)
-		}
-		if report.Version >= 2 && strings.EqualFold(strings.TrimSpace(report.Mode), "advise") {
+		if event.EventType == legacyVerdictRetirementEventType {
 			return true, nil
 		}
 	}

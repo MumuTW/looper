@@ -2065,6 +2065,11 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			Repos:  repos,
 			GitHub: gatekeeperGitHubAdapter{Gateway: githubGateway, config: &cfg},
 			Now:    now,
+			LogWarn: func(msg string, fields map[string]any) {
+				if logger != nil {
+					logger.Warn(msg, fields)
+				}
+			},
 			PolicyPermitsTarget: func(projectID, repo, baseRefName string) bool {
 				project, ok := runtimeProjectBinding(cfg, projectID)
 				if !ok {
