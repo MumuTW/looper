@@ -3766,8 +3766,14 @@ func reviewCapacityRefusal(result AgentResult) (reviewRefusal, bool) {
 			Summary string `json:"summary"`
 			Message string `json:"message"`
 		}
-		if err := json.Unmarshal([]byte(payload), &parsed); err != nil || !strings.EqualFold(strings.TrimSpace(parsed.Type), "rate_limit") {
+		if err := json.Unmarshal([]byte(payload), &parsed); err != nil {
 			continue
+		}
+		// CompletionMarkerPayloads is newest-first. The first valid payload is
+		// the agent's final structured result; an older echoed rate-limit marker
+		// must not override a newer successful completion.
+		if !strings.EqualFold(strings.TrimSpace(parsed.Type), "rate_limit") {
+			return reviewRefusal{}, false
 		}
 		message := firstNonEmpty(strings.TrimSpace(parsed.Message), strings.TrimSpace(parsed.Summary), "Reviewer capacity is rate limited")
 		return reviewRefusal{reason: "rate_limit", message: message}, true

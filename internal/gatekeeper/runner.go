@@ -349,12 +349,11 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 	configuredTarget := r.configuredTarget(input.ProjectID)
 	stillOpen := make(map[string]struct{}, len(pullRequests))
 	for _, pullRequest := range pullRequests {
-		// A budget change is a gate-input change even when the PR list page is
-		// otherwise unchanged; include it so enabling or disabling the gate does
-		// not wait for the periodic maxSkipAge backstop. BaseSHA is folded into
-		// the fingerprint only while the budget is enabled, so a base advance on
-		// a repo with no configured limit does not invalidate every open report.
-		fingerprint := sourceFingerprint(pullRequest, budgetEnabled) + fmt.Sprintf("\x1fdiff-budget=%d,%d", diffBudget.MaxChangedFiles, diffBudget.MaxDeletions) + fmt.Sprintf("\x1fgatekeeper-trust=%s", trust) + fmt.Sprintf("\x1fconfigured-target=%s", configuredTarget)
+		// The list page cannot observe policy reloads. Include the effective
+		// review policy in the fingerprint so lowering a threshold (or changing
+		// trust) immediately re-evaluates an unchanged PR instead of reusing a
+		// success published under the old policy.
+		fingerprint := sourceFingerprint(pullRequest) + fmt.Sprintf("\x1freview-policy=%s\x1freview-threshold=%d", r.trustFor(input.ProjectID), r.requiredReviewChangedLinesFor(input.ProjectID))
 		entityID := fmt.Sprintf("%s#%d", input.Repo, pullRequest.Number)
 		stillOpen[entityID] = struct{}{}
 		previous, hasPrevious := previousReports[entityID]
@@ -411,6 +410,8 @@ func (r *Runner) recordRecentMergedReviewBacklog(ctx context.Context, input Disc
 	}
 	count := 0
 	threshold := r.requiredReviewChangedLinesFor(input.ProjectID)
+	reviewerLogin := ""
+	loginLoaded := false
 	for _, pullRequest := range merged {
 		changedLines := max(pullRequest.Additions, 0) + max(pullRequest.Deletions, 0)
 		if pullRequest.Number <= 0 || strings.TrimSpace(pullRequest.HeadSHA) == "" || changedLines < threshold {
@@ -421,18 +422,48 @@ func (r *Runner) recordRecentMergedReviewBacklog(ctx context.Context, input Disc
 		if err != nil {
 			return count, fmt.Errorf("list review evidence for %s: %w", entityID, err)
 		}
-		if mergedReviewEvidenceKnown(events, pullRequest.HeadSHA) {
+		definitive, unreviewed := mergedReviewEvidenceForHead(events, pullRequest.HeadSHA)
+		if definitive {
 			continue
 		}
-		projectID := input.ProjectID
-		entityType := "pull_request"
-		actorType := "system"
-		actorID := "gatekeeper"
-		if err := eventlog.Append(ctx, r.repos, eventlog.AppendInput{
-			EventType: "pr.review.unreviewed", ProjectID: &projectID, EntityType: &entityType, EntityID: &entityID,
-			ActorType: &actorType, ActorID: &actorID, ActorDisplayName: &actorID,
-			Payload: map[string]any{"repo": input.Repo, "prNumber": pullRequest.Number, "headSha": pullRequest.HeadSHA, "mergedAt": pullRequest.MergedAt, "additions": max(pullRequest.Additions, 0), "deletions": max(pullRequest.Deletions, 0), "changedLines": changedLines, "threshold": threshold}, CreatedAt: r.now(),
-		}); err != nil {
+		if !loginLoaded {
+			login, loginErr := r.github.GetCurrentUserLoginForRepo(ctx, input.Repo, input.CWD)
+			if loginErr != nil || strings.TrimSpace(login) == "" {
+				if loginErr == nil {
+					loginErr = fmt.Errorf("empty reviewer login")
+				}
+				return count, fmt.Errorf("resolve reviewer identity for merged review backlog: %w", loginErr)
+			}
+			reviewerLogin = strings.TrimSpace(login)
+			loginLoaded = true
+		}
+		marker, err := r.github.FindReviewMarker(ctx, githubinfra.VerifyReviewMarkerInput{
+			Repo: input.Repo, PRNumber: pullRequest.Number,
+			Marker:              "looper:review id_prefix=reviewer: head=" + strings.TrimSpace(pullRequest.HeadSHA),
+			AllowedReviewEvents: []string{"COMMENT", "APPROVE", "REQUEST_CHANGES"},
+			AuthorLogin:         reviewerLogin, AllowCleanComment: true, CWD: input.CWD,
+		})
+		if err != nil {
+			return count, fmt.Errorf("verify review evidence for %s: %w", entityID, err)
+		}
+		if marker.Found {
+			// A marker can predate the local event stream (for example, the first
+			// tick after upgrading). Append the authoritative positive evidence so
+			// an earlier false unreviewed row is superseded in event order.
+			if err := r.appendMergedReviewEvidence(ctx, input, pullRequest, "pr.review.completed", map[string]any{
+				"source": "gatekeeper-backlog-reconciliation", "outcome": marker.Outcome,
+				"event": marker.Event, "reviewerLogin": marker.AuthorLogin, "reviewId": marker.ReviewID,
+			}); err != nil {
+				return count, err
+			}
+			continue
+		}
+		// An existing negative row is retained as history, but is not duplicated
+		// on every tick while the marker remains absent.
+		if unreviewed {
+			continue
+		}
+		if err := r.appendMergedReviewEvidence(ctx, input, pullRequest, "pr.review.unreviewed", map[string]any{"threshold": threshold}); err != nil {
 			return count, fmt.Errorf("record unreviewed merged pull request %s: %w", entityID, err)
 		}
 		count++
@@ -440,7 +471,32 @@ func (r *Runner) recordRecentMergedReviewBacklog(ctx context.Context, input Disc
 	return count, nil
 }
 
-func mergedReviewEvidenceKnown(events []storage.EventLogRecord, headSHA string) bool {
+func (r *Runner) appendMergedReviewEvidence(ctx context.Context, input DiscoveryInput, pullRequest githubinfra.PullRequestSummary, eventType string, extra map[string]any) error {
+	projectID := input.ProjectID
+	entityType := "pull_request"
+	entityID := fmt.Sprintf("%s#%d", input.Repo, pullRequest.Number)
+	actorType := "system"
+	actorID := "gatekeeper"
+	payload := map[string]any{
+		"repo": input.Repo, "prNumber": pullRequest.Number, "headSha": pullRequest.HeadSHA,
+		"mergedAt": pullRequest.MergedAt, "additions": max(pullRequest.Additions, 0),
+		"deletions":    max(pullRequest.Deletions, 0),
+		"changedLines": max(pullRequest.Additions, 0) + max(pullRequest.Deletions, 0),
+	}
+	for key, value := range extra {
+		payload[key] = value
+	}
+	if err := eventlog.Append(ctx, r.repos, eventlog.AppendInput{
+		EventType: eventType, ProjectID: &projectID, EntityType: &entityType, EntityID: &entityID,
+		ActorType: &actorType, ActorID: &actorID, ActorDisplayName: &actorID,
+		Payload: payload, CreatedAt: r.now(),
+	}); err != nil {
+		return fmt.Errorf("record merged review evidence %s: %w", entityID, err)
+	}
+	return nil
+}
+
+func mergedReviewEvidenceForHead(events []storage.EventLogRecord, headSHA string) (definitive bool, unreviewed bool) {
 	for _, event := range events {
 		if event.EventType != "pr.review.completed" && event.EventType != "pr.review.refused" && event.EventType != "pr.review.unreviewed" {
 			continue
@@ -448,11 +504,17 @@ func mergedReviewEvidenceKnown(events []storage.EventLogRecord, headSHA string) 
 		var payload struct {
 			HeadSHA string `json:"headSha"`
 		}
-		if json.Unmarshal([]byte(event.PayloadJSON), &payload) == nil && strings.EqualFold(strings.TrimSpace(payload.HeadSHA), strings.TrimSpace(headSHA)) {
-			return true
+		if json.Unmarshal([]byte(event.PayloadJSON), &payload) != nil || !strings.EqualFold(strings.TrimSpace(payload.HeadSHA), strings.TrimSpace(headSHA)) {
+			continue
+		}
+		switch event.EventType {
+		case "pr.review.completed", "pr.review.refused":
+			definitive = true
+		case "pr.review.unreviewed":
+			unreviewed = true
 		}
 	}
-	return false
+	return definitive, unreviewed
 }
 
 func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput) (Report, error) {
@@ -689,7 +751,7 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 	}
 	sort.Strings(report.Evidence.UnresolvedReviewThreadIDs)
 
-	if report.Evidence.ReviewRequiredByPolicy {
+	if r.trustFor(input.ProjectID) == config.GatekeeperTrustAuto {
 		login, loginErr := r.github.GetCurrentUserLoginForRepo(ctx, input.Repo, input.CWD)
 		if loginErr != nil || strings.TrimSpace(login) == "" {
 			return r.persistProviderBlock(ctx, report, ReasonProviderStateUnavailable, "codex_reviewer_identity")
@@ -705,8 +767,14 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 		}
 		report.Evidence.CodexReviewOutcome = strings.ToLower(strings.TrimSpace(marker.Outcome))
 		if !marker.Found {
-			report.Reasons = append(report.Reasons, Reason{Code: ReasonCodexReviewRequired, Subject: "current_head"})
+			if report.Evidence.ReviewRequiredByPolicy {
+				report.Reasons = append(report.Reasons, Reason{Code: ReasonCodexReviewRequired, Subject: "current_head"})
+			}
 		} else if report.Evidence.CodexReviewOutcome == "blocking" || report.Evidence.CodexReviewOutcome == "actionable" {
+			// The threshold waives only the requirement to obtain a review. A
+			// blocking Looper review still vetoes a small PR, including when the
+			// configured blocking event is COMMENT and GitHub leaves
+			// reviewDecision unchanged.
 			report.Reasons = append(report.Reasons, Reason{Code: ReasonCodexReviewBlocked, Subject: report.Evidence.CodexReviewOutcome})
 		}
 	}

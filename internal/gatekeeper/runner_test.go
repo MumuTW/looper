@@ -491,11 +491,27 @@ func TestAutoGatekeeperAllowsSmallChangeWithoutCodexReview(t *testing.T) {
 	if !report.Eligible || report.Evidence.ReviewRequiredByPolicy || report.Evidence.ChangedLines != DefaultRequiredReviewChangedLines-1 {
 		t.Fatalf("report = %#v, want eligible below threshold", report)
 	}
-	if len(fixture.github.reviewMarkerCalls) != 0 {
-		t.Fatalf("review marker calls = %#v, want no review lookup below threshold", fixture.github.reviewMarkerCalls)
+	if len(fixture.github.reviewMarkerCalls) != 1 {
+		t.Fatalf("review marker calls = %#v, want one lookup to preserve blocking-review semantics below threshold", fixture.github.reviewMarkerCalls)
 	}
 	if got := fixture.github.statusCalls; len(got) != 1 || got[0].State != "success" {
 		t.Fatalf("status calls = %#v, want success", got)
+	}
+}
+
+func TestAutoGatekeeperBlocksSmallChangeWithBlockingCodexReview(t *testing.T) {
+	fixture := newGatekeeperFixture(t)
+	fixture.github.protection.RequiredChecks = []string{"ci", RequiredStatusContext}
+	fixture.github.protection.RequiredCheckRules = append(fixture.github.protection.RequiredCheckRules, githubinfra.RequiredCheckRule{Context: RequiredStatusContext})
+	fixture.github.reviewMarker = githubinfra.ReviewMarkerResult{Found: true, Outcome: "blocking", Event: "COMMENT", AuthorLogin: "looper-bot"}
+	fixture.github.detail.Additions = DefaultRequiredReviewChangedLines - 1
+
+	report, err := fixture.autoRunner().EvaluatePullRequest(context.Background(), EvaluationInput{ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, ExpectedHeadSHA: "head-1"})
+	if err != nil {
+		t.Fatalf("EvaluatePullRequest() error = %v", err)
+	}
+	if report.Eligible || !hasReason(report, ReasonCodexReviewBlocked) {
+		t.Fatalf("report = %#v, want blocking review to veto a small change", report)
 	}
 }
 
@@ -524,6 +540,62 @@ func TestAutoGatekeeperRecordsLargeMergedPRWithoutReviewOnce(t *testing.T) {
 	}
 	if second.UnreviewedMerged != 0 {
 		t.Fatalf("second result = %#v, want existing evidence to dedupe", second)
+	}
+}
+
+func TestAutoGatekeeperDoesNotRecordUnreviewedWhenHistoricalMarkerExists(t *testing.T) {
+	fixture := newGatekeeperFixture(t)
+	fixture.github.mergedPullRequests = []githubinfra.PullRequestSummary{{Number: 91, HeadSHA: "merged-head", MergedAt: "2026-07-30T12:00:00Z", Additions: 180, Deletions: 40}}
+	fixture.github.reviewMarker = githubinfra.ReviewMarkerResult{Found: true, Outcome: "clean", Event: "APPROVE", AuthorLogin: "looper-bot", ReviewID: "review-91"}
+
+	result, err := fixture.autoRunner().DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil || result.UnreviewedMerged != 0 {
+		t.Fatalf("DiscoverPullRequests() = %#v, error = %v, want marker-backed historical review without negative evidence", result, err)
+	}
+	events, err := fixture.repos.Events.ListByEntity(context.Background(), "pull_request", "acme/looper#91")
+	if err != nil {
+		t.Fatalf("Events.ListByEntity() error = %v", err)
+	}
+	if len(events) != 1 || events[0].EventType != "pr.review.completed" {
+		t.Fatalf("events = %#v, want one marker-backed completion event", events)
+	}
+}
+
+func TestAutoGatekeeperReconcilesHistoricalUnreviewedEvidenceWhenMarkerExists(t *testing.T) {
+	fixture := newGatekeeperFixture(t)
+	fixture.github.mergedPullRequests = []githubinfra.PullRequestSummary{{Number: 91, HeadSHA: "merged-head", MergedAt: "2026-07-30T12:00:00Z", Additions: 180, Deletions: 40}}
+
+	first, err := fixture.autoRunner().DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil || first.UnreviewedMerged != 1 {
+		t.Fatalf("first DiscoverPullRequests() = %#v, error = %v, want one unreviewed row", first, err)
+	}
+	fixture.github.reviewMarker = githubinfra.ReviewMarkerResult{Found: true, Outcome: "clean", Event: "COMMENT", AuthorLogin: "looper-bot", ReviewID: "review-91"}
+
+	second, err := fixture.autoRunner().DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("second DiscoverPullRequests() error = %v", err)
+	}
+	if second.UnreviewedMerged != 0 {
+		t.Fatalf("second result = %#v, want marker reconciliation without a new negative row", second)
+	}
+	events, err := fixture.repos.Events.ListByEntity(context.Background(), "pull_request", "acme/looper#91")
+	if err != nil {
+		t.Fatalf("Events.ListByEntity() error = %v", err)
+	}
+	if len(events) != 2 || events[0].EventType != "pr.review.unreviewed" || events[1].EventType != "pr.review.completed" || !strings.Contains(events[1].PayloadJSON, `"reviewId":"review-91"`) {
+		t.Fatalf("events = %#v, want historical negative evidence superseded by marker-backed completion", events)
+	}
+
+	third, err := fixture.autoRunner().DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil || third.UnreviewedMerged != 0 {
+		t.Fatalf("third result = %#v, error = %v, want definitive evidence to stop reconciliation writes", third, err)
+	}
+	events, err = fixture.repos.Events.ListByEntity(context.Background(), "pull_request", "acme/looper#91")
+	if err != nil {
+		t.Fatalf("Events.ListByEntity() after third tick error = %v", err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("events after third tick = %#v, want no duplicate completion evidence", events)
 	}
 }
 

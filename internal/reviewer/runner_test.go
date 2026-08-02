@@ -9582,6 +9582,10 @@ func TestReviewCapacityRefusalRequiresStructuredRateLimitResult(t *testing.T) {
 	if _, ok := reviewCapacityRefusal(AgentResult{Summary: "rate limit exceeded"}); ok {
 		t.Fatal("prose rate-limit message must not become durable refusal evidence")
 	}
+	newerSuccess := `__LOOPER_RESULT__={"type":"rate_limit","message":"old quota result"}` + "\n" + `__LOOPER_RESULT__={"type":"completed","summary":"review published"}`
+	if _, ok := reviewCapacityRefusal(AgentResult{Stdout: newerSuccess}); ok {
+		t.Fatal("an older rate-limit marker must not override the newest successful completion")
+	}
 }
 
 func TestAppendReviewEvidencePersistsPullRequestEntity(t *testing.T) {
