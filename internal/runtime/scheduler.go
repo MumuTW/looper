@@ -145,9 +145,12 @@ type defaultSchedulerTickInput struct {
 	ClaimBoundary         *sync.RWMutex
 	RefreshForClaim       func() defaultSchedulerTickInput
 	// AllowClaim, when set, is the admission projection for all work-producing
-	// scheduler activity: the full default tick (discovery, HITL, claims,
-	// stale-reconcile) and each durable ClaimNext*. Nil means ungated (tests).
+	// durable ClaimNext* activity. Nil means ungated (tests).
 	AllowClaim func() error
+	// AllowLifecycleWork admits scheduler phases that do not consume an agent
+	// call (HITL, deploy, stale reconciliation, and agent-free discovery). The
+	// daemon wires this separately so provider brownout does not stall them.
+	AllowLifecycleWork func() error
 	// WithAllowClaim holds provider-health and lifecycle admission across a
 	// durable claim/enqueue section. Nil means no critical-section gate (tests).
 	WithAllowClaim func(func()) error
@@ -1899,6 +1902,7 @@ type schedulerNotificationGatewayFactory struct {
 }
 
 type schedulerProviderGate struct {
+	lifecycle     func() error
 	allow         func(string) error
 	with          func(string, func()) error
 	snapshotAllow func(string) error
@@ -1918,11 +1922,13 @@ func (f *schedulerNotificationGatewayFactory) New(options notify.Options) *notif
 }
 
 func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *sync.RWMutex, configPath string, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error), allowClaim func() error, withAllowClaim func(fn func()) error, providerGates ...schedulerProviderGate) defaultSchedulerHandlers {
+	var allowLifecycleWork func() error
 	var allowClaimForVendor func(string) error
 	var withAllowClaimForVendor func(string, func()) error
 	var allowSnapshotClaimForVendor func(string) error
 	var withAllowSnapshotClaimForVendor func(string, func()) error
 	if len(providerGates) > 0 {
+		allowLifecycleWork = providerGates[0].lifecycle
 		allowClaimForVendor = providerGates[0].allow
 		withAllowClaimForVendor = providerGates[0].with
 		allowSnapshotClaimForVendor = providerGates[0].snapshotAllow
@@ -1989,6 +1995,7 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *
 	attachClaimGate := func(input defaultSchedulerTickInput, services Services) defaultSchedulerTickInput {
 		input.ClaimBoundary = claimBoundary
 		input.AllowClaim = allowClaim
+		input.AllowLifecycleWork = allowLifecycleWork
 		input.WithAllowClaim = withAllowClaim
 		input.AllowClaimForVendor = allowClaimForVendor
 		input.WithAllowClaimForVendor = withAllowClaimForVendor
@@ -2008,6 +2015,7 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *
 				stopped.MaxConcurrentRuns = 0
 				stopped.RefreshForClaim = nil
 				stopped.AllowClaim = allowClaim
+				stopped.AllowLifecycleWork = allowLifecycleWork
 				stopped.WithAllowClaim = withAllowClaim
 				stopped.AllowClaimForVendor = allowClaimForVendor
 				stopped.WithAllowClaimForVendor = withAllowClaimForVendor
@@ -2023,6 +2031,7 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *
 			latest := latestSnapshot.input(services)
 			latest.ClaimBoundary = claimBoundary
 			latest.AllowClaim = allowClaim
+			latest.AllowLifecycleWork = allowLifecycleWork
 			latest.WithAllowClaim = withAllowClaim
 			latest.AllowClaimForVendor = allowClaimForVendor
 			latest.WithAllowClaimForVendor = withAllowClaimForVendor
@@ -2837,9 +2846,9 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 	if input.Repos == nil || input.Repos.Projects == nil {
 		return nil
 	}
-	// Gate the entire work-producing tick (discovery, HITL, claims, stale
-	// reconcile), not only ClaimNext*. Admission closed during starting/stopping
-	// must not enqueue via CreateOrGetActiveByDedupe or requeue via reconcile.
+	// Gate scheduler lifecycle admission at tick entry. Provider health is
+	// applied only by agent-producing discovery lanes and durable claims, so
+	// agent-free HITL/deploy/reconcile work continues during a brownout.
 	if err := admissionRefuseWork(input); err != nil {
 		if input.Logger != nil {
 			input.Logger.Debug("scheduler tick skipped: admission closed", map[string]any{"error": err.Error()})
@@ -3084,26 +3093,23 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 	return retErr
 }
 
-func runEscalatorIfDue(ctx context.Context, input defaultSchedulerTickInput, runAt time.Time) error {
-	if input.Escalator == nil || input.EscalatorCadence == nil || input.Config == nil || !input.Config.Roles.Escalator.Enabled {
+// admissionRefuseWork rechecks lifecycle admission mid-tick. Nil gates mean
+// ungated (tests). Provider-specific discovery uses its own point-in-time gate;
+// durable claims use admissionRefuseClaim below.
+func admissionRefuseWork(input defaultSchedulerTickInput) error {
+	allow := input.AllowLifecycleWork
+	if allow == nil {
+		// Preserve direct/unit-test inputs that only provide the historical
+		// full-tick gate.
+		allow = input.AllowClaim
+	}
+	if allow == nil {
 		return nil
 	}
-	cadence := time.Duration(input.Config.Roles.Escalator.CadenceSeconds) * time.Second
-	runAt = runAt.UTC()
-	if !input.EscalatorCadence.start(runAt, cadence) {
-		return nil
-	}
-	result, err := input.Escalator.Run(ctx)
-	// A rotating census is intentionally not a successful cadence tick: its
-	// snapshot omits source rows and must be retried on the next scheduler tick.
-	input.EscalatorCadence.finish(runAt, err == nil && !result.Snapshot.Partial)
-	return err
+	return allow()
 }
 
-// admissionRefuseWork rechecks the admission projection mid-tick. Nil AllowClaim
-// means ungated (tests). A non-nil error means admission is closed and the
-// caller must not start further discovery/HITL enqueue work.
-func admissionRefuseWork(input defaultSchedulerTickInput) error {
+func admissionRefuseClaim(input defaultSchedulerTickInput) error {
 	if input.AllowClaim == nil {
 		return nil
 	}
@@ -3287,9 +3293,9 @@ func executeClaimPhase(ctx context.Context, phase string, input defaultScheduler
 		input = input.RefreshForClaim()
 	}
 	// Re-check after RefreshForClaim so a mid-tick catalog snapshot cannot open
-	// claims/reconcile after admission closed. Discovery/HITL recheck via
-	// admissionRefuseWork around each work-producing lane as well.
-	if err := admissionRefuseWork(input); err != nil {
+	// claims after lifecycle admission closed. Discovery/HITL recheck via
+	// admissionRefuseWork around each lifecycle phase as well.
+	if err := admissionRefuseClaim(input); err != nil {
 		return 0, 0, nil
 	}
 	start := time.Now()

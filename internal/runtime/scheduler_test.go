@@ -39,6 +39,20 @@ func allowedQueueTypesFromRunners(input defaultSchedulerTickInput) []string {
 	return append(unrestricted, stickySnapshotOnly...)
 }
 
+func TestSchedulerSeparatesLifecycleAndClaimAdmission(t *testing.T) {
+	t.Parallel()
+	input := defaultSchedulerTickInput{
+		AllowLifecycleWork: func() error { return nil },
+		AllowClaim:         func() error { return brownout.ErrOpen },
+	}
+	if err := admissionRefuseWork(input); err != nil {
+		t.Fatalf("lifecycle admission = %v, want allowed during provider brownout", err)
+	}
+	if err := admissionRefuseClaim(input); !errors.Is(err, brownout.ErrOpen) {
+		t.Fatalf("claim admission = %v, want brownout.ErrOpen", err)
+	}
+}
+
 func TestWorkerAgentExecutionAdapterPropagatesParseStatus(t *testing.T) {
 	t.Parallel()
 
