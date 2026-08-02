@@ -364,7 +364,8 @@ type AgentRunInput struct {
 	SnapshotReasoningEffort *config.ReasoningEffort
 	// CompletionContract selects the daemon-owned stdout contract used for
 	// agent-health success accounting. Thread-resolution classifiers emit raw
-	// JSON without the generic completion marker.
+	// JSON without the generic completion marker; review runs use the reviewer
+	// marker contract aligned with clean/non_blocking/blocking outcomes.
 	CompletionContract agent.CompletionContract
 }
 
@@ -2648,6 +2649,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		Prompt: prompt, NativeResumePrompt: nativeResumePrompt, WorkingDirectory: worktree.Path,
 		Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout, Metadata: metadata, IdempotencyKey: idempotencyKey,
 		UseSnapshot: useSnap, SnapshotVendor: snapVendor, SnapshotModel: snapModel, SnapshotReasoningEffort: snapReasoningEffort,
+		CompletionContract: agent.CompletionContractReviewerMarker,
 	})
 	if err != nil {
 		return checkpoint, err

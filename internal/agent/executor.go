@@ -277,6 +277,31 @@ func validFixerMarkerOutcome(payload string) bool {
 	}
 }
 
+// validReviewerMarkerOutcome aligns health accounting with the reviewer
+// runner's reviewCompletionOutcome contract. A reviewer may finish cleanly or
+// publish actionable feedback as blocking, non_blocking, or legacy actionable;
+// an absent outcome preserves the summary-only marker used by clean no-op runs.
+func validReviewerMarkerOutcome(payload string) bool {
+	var raw map[string]json.RawMessage
+	if strings.TrimSpace(payload) == "" || json.Unmarshal([]byte(payload), &raw) != nil {
+		return false
+	}
+	encoded, ok := raw["outcome"]
+	if !ok {
+		return true
+	}
+	var outcome string
+	if json.Unmarshal(encoded, &outcome) != nil {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(outcome)) {
+	case "clean", "non_blocking", "blocking", "actionable":
+		return true
+	default:
+		return false
+	}
+}
+
 // ProgressUpdate is a throttled snapshot of a running agent's activity: the last
 // few lines it has emitted, plus how long it has been running.
 type ProgressUpdate struct {
@@ -339,8 +364,9 @@ type RunInput struct {
 	// no reasoning-effort override.
 	SnapshotReasoningEffort *config.ReasoningEffort
 	// CompletionContract selects the output contract that determines health
-	// success. Coding agents use the marker contract; coordinator and triager
-	// classifiers use raw JSON; file-backed callers provide a semantic validator.
+	// success. Coding agents use the marker contract; reviewer runs use the
+	// reviewer outcome marker; coordinator and triager classifiers use raw JSON;
+	// file-backed callers provide a semantic validator.
 	CompletionContract CompletionContract
 	// CompletionValidator is the daemon-owned caller validator for contracts
 	// whose authority is not the executor's stdout (for example planner's
@@ -358,6 +384,7 @@ const (
 	CompletionContractMarker          CompletionContract = "marker"
 	CompletionContractRawJSON         CompletionContract = "raw_json"
 	CompletionContractRawJSONEnvelope CompletionContract = "raw_json_envelope"
+	CompletionContractReviewerMarker  CompletionContract = "reviewer_marker"
 	CompletionContractFixerMarker     CompletionContract = "fixer_marker"
 	CompletionContractFile            CompletionContract = "file"
 )
@@ -1419,6 +1446,8 @@ func (x *execution) reportOutcome(status, parseStatus, completionPayload, stdout
 		succeeded = succeeded && validRawJSONObject(stdout)
 	} else if x.input.CompletionContract == CompletionContractRawJSONEnvelope {
 		succeeded = succeeded && validRawJSONObjectEnvelope(stdout)
+	} else if x.input.CompletionContract == CompletionContractReviewerMarker {
+		succeeded = succeeded && parseStatus == "parsed" && validReviewerMarkerOutcome(completionPayload)
 	} else if x.input.CompletionContract == CompletionContractFixerMarker {
 		succeeded = succeeded && parseStatus == "parsed" && validFixerMarkerOutcome(completionPayload)
 	} else {

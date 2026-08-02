@@ -154,3 +154,26 @@ func TestReportOutcomeRequiresFixerOutcomeContract(t *testing.T) {
 		t.Fatalf("declared fixer outcome = %#v, want one successful outcome", outcomes)
 	}
 }
+
+func TestReportOutcomeAcceptsReviewerOutcomes(t *testing.T) {
+	for _, outcome := range []string{"clean", "non_blocking", "blocking", "actionable"} {
+		outcome := outcome
+		t.Run(outcome, func(t *testing.T) {
+			outcomes := make([]Outcome, 0, 1)
+			exec := outcomeExecution(&outcomes)
+			exec.input.CompletionContract = CompletionContractReviewerMarker
+			exec.reportOutcome("completed", "parsed", `{"outcome":"`+outcome+`","summary":"review complete"}`, "")
+			if len(outcomes) != 1 || !outcomes[0].Succeeded {
+				t.Fatalf("reviewer outcome %q = %#v, want one successful outcome", outcome, outcomes)
+			}
+		})
+	}
+
+	outcomes := make([]Outcome, 0, 1)
+	exec := outcomeExecution(&outcomes)
+	exec.input.CompletionContract = CompletionContractReviewerMarker
+	exec.reportOutcome("completed", "parsed", `{"outcome":"mostly-done","summary":"invalid review outcome"}`, "")
+	if len(outcomes) != 1 || outcomes[0].Succeeded {
+		t.Fatalf("invalid reviewer outcome = %#v, want one failed outcome", outcomes)
+	}
+}
