@@ -376,6 +376,43 @@ func TestDiscoverPullRequestsReevaluatesFailedCheckAtAutoTrust(t *testing.T) {
 	}
 }
 
+func TestDiscoverPullRequestsReevaluatesCancelledCheckAtAutoTrust(t *testing.T) {
+	fixture := newGatekeeperFixture(t)
+	fixture.github.openPullRequests = []githubinfra.PullRequestSummary{openPullRequestFixture()}
+	fixture.github.checks = githubinfra.PullRequestCheckRuns{
+		TotalCount: 1,
+		CheckRuns:  []githubinfra.PullRequestCheckRun{{Name: "ci", Status: "completed", Conclusion: "cancelled", AppID: 15368}},
+	}
+	trust := config.GatekeeperTrustAuto
+	runner := func() *Runner {
+		return New(Options{
+			Repos: fixture.repos, GitHub: fixture.github, Now: func() time.Time { return fixture.now },
+			PolicyPermitsTarget: func(string, string, string) bool { return fixture.policyPermits },
+			TrustForProject:     func(string) config.GatekeeperTrustLevel { return trust },
+		})
+	}
+
+	first, err := runner().DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("first discovery() error = %v", err)
+	}
+	if first.Evaluated != 1 || first.Skipped != 0 {
+		t.Fatalf("first tick = %d evaluated / %d skipped, want 1 / 0", first.Evaluated, first.Skipped)
+	}
+	if !hasReason(first.Reports[0], ReasonCheckCancelled) {
+		t.Fatalf("first report reasons = %v, want required_check_cancelled", reasonCodes(first.Reports[0].Reasons))
+	}
+
+	second, err := runner().DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("second discovery() error = %v", err)
+	}
+	if second.Evaluated != 1 || second.Skipped != 0 {
+		t.Fatalf("auto trust second tick = %d evaluated / %d skipped, want 1 / 0 (cancelled check must re-evaluate)",
+			second.Evaluated, second.Skipped)
+	}
+}
+
 // A provider block after the review check replaces all reasons with the
 // provider reason but leaves Evidence.CodexReview.CurrentHeadValid false.
 // reportAwaitsCurrentHeadReview must still detect this as waiting for a review

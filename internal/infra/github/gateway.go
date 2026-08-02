@@ -2555,7 +2555,7 @@ func (g *Gateway) ValidateMergifyRouting(ctx context.Context, input ValidateMerg
 		return fmt.Errorf(".mergify.yml has no queue_rules")
 	}
 	for index, rule := range contract.QueueRules {
-		for _, condition := range []string{"label != needs-human-review", "label != do-not-merge"} {
+		for _, condition := range []string{"label != " + labels.NeedsHumanReview, "label != " + labels.DoNotMerge} {
 			if !hasMergifyCondition(rule.QueueConditions, condition) {
 				return fmt.Errorf(".mergify.yml queue_rules[%d] queue_conditions missing %q", index, condition)
 			}
@@ -2564,7 +2564,7 @@ func (g *Gateway) ValidateMergifyRouting(ctx context.Context, input ValidateMerg
 	if len(contract.MergeProtections) == 0 {
 		return fmt.Errorf(".mergify.yml has no merge_protections; auto_merge_conditions require at least one active merge-protection rule")
 	}
-	if !hasMergifyCondition(contract.MergeProtectionsSettings.AutoMergeConditions, "label = auto-merge") {
+	if !hasMergifyCondition(contract.MergeProtectionsSettings.AutoMergeConditions, "label = "+labels.AutoMerge) {
 		return fmt.Errorf(".mergify.yml has no auto-merge label contract")
 	}
 	return nil
