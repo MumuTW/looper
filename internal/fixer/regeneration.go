@@ -607,11 +607,8 @@ func (r *Runner) regenerationHumanCommitGuard(ctx context.Context, project stora
 			if author == "" {
 				return "pull request commit identity is unavailable", nil
 			}
-			if strings.HasSuffix(strings.ToLower(author), "[bot]") {
-				continue
-			}
 			if login == "" || !strings.EqualFold(author, login) {
-				return "pull request contains a human-authored commit", nil
+				return "pull request contains a commit not authored by the Looper identity", nil
 			}
 		}
 	}

@@ -82,6 +82,36 @@ func TestRegenerateConflictEscalatesHumanCommitWithoutClosing(t *testing.T) {
 	}
 }
 
+func TestRegenerateConflictEscalatesForeignBotCommitWithoutClosing(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	gateway := &regenerationFakeGateway{
+		fakeGitHubGateway: &fakeGitHubGateway{
+			currentUser:   "looper",
+			viewResponses: []PullRequestDetail{{Number: 42, State: "OPEN", HeadRefName: "looper/fix-42", HeadSHA: "head-42"}},
+		},
+		issue:   IssueDetail{Number: 7, State: "OPEN"},
+		commits: []PullRequestCommit{{AuthorLogin: "dependabot[bot]", CommitterLogin: "dependabot[bot]"}},
+	}
+	routes := 0
+	runner := newRegenerationRunner(t, fixture, gateway, func(_ context.Context, _ RegenerateIssueInput) error { routes++; return nil })
+	project, _ := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	result, err := runner.RegenerateConflict(context.Background(), ConflictRegenerationInput{
+		ProjectID: "project_1", Repo: "acme/looper", IssueRepo: "acme/looper", IssueNumber: 7, PRNumber: 42, ConflictRepairs: 2, CWD: project.RepoPath,
+	})
+	if err != nil {
+		t.Fatalf("RegenerateConflict() error = %v", err)
+	}
+	if !result.Escalated || result.Completed || routes != 0 || len(gateway.closeCalls) != 0 {
+		t.Fatalf("result/routes/closes = %#v/%d/%d, want escalated/no route/no close", result, routes, len(gateway.closeCalls))
+	}
+	if len(gateway.addLabelCalls) != 1 || gateway.addLabelCalls[0].Labels[0] != labels.NeedsHuman {
+		t.Fatalf("PR labels = %#v, want needs-human", gateway.addLabelCalls)
+	}
+	if len(gateway.fakeGitHubGateway.createIssueComments) != 1 || !strings.Contains(gateway.fakeGitHubGateway.createIssueComments[0].Body, "outcome=escalated") {
+		t.Fatalf("escalation comments = %#v, want durable escalation marker", gateway.fakeGitHubGateway.createIssueComments)
+	}
+}
+
 func TestRegenerateConflictReplaysCompletedMarkerWithoutSideEffects(t *testing.T) {
 	fixture := newRunnerFixture(t)
 	gateway := &regenerationFakeGateway{
