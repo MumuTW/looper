@@ -339,6 +339,45 @@ func TestAgentBrownoutAdmitsStickySnapshotAfterVendorRemoval(t *testing.T) {
 	}
 }
 
+func TestStickySnapshotClaimCheckDoesNotConsumeHalfOpenProbe(t *testing.T) {
+	rt, clock := brownoutRuntime(t, func(cfg *config.AgentBrownoutConfig) {
+		cfg.MinFailures = 3
+		cfg.CooldownSeconds = 60
+		cfg.MaxCooldownSeconds = 120
+	})
+	codex := config.AgentVendorCodex
+	configured := rt.Config()
+	configured.Agent.Vendor = &codex
+	rt.publishCatalogConsumers(configured)
+	for i := 0; i < 3; i++ {
+		rt.activeExecutions.ReportAgentOutcome(agent.Outcome{Vendor: string(codex), Status: "failed"})
+	}
+	if err := rt.agentHealth.Allow(string(codex)); !errors.Is(err, brownout.ErrOpen) {
+		t.Fatalf("codex breaker = %v, want open before removal", err)
+	}
+	removed := configured
+	removed.Agent.Vendor = nil
+	rt.publishCatalogConsumers(removed)
+	clock.advance(time.Minute)
+
+	if err := rt.AllowSnapshotClaimForVendor(string(codex)); err != nil {
+		t.Fatalf("snapshot claim check = %v, want half-open point-in-time admission", err)
+	}
+	if err := rt.WithAllowSnapshotAgentClaimForVendor(string(codex), func() {}); err != nil {
+		t.Fatalf("snapshot claim critical section = %v, want allowed", err)
+	}
+	lease, err := rt.activeExecutions.AdmitSpawn(context.Background(), agent.SpawnMeta{
+		LoopID: "sticky-probe-loop", RunID: "sticky-probe-run", ExecutionID: "sticky-probe-exec", Vendor: string(codex), BrownoutStickySnapshot: true,
+	})
+	if err != nil {
+		t.Fatalf("sticky probe spawn = %v, want the unconsumed probe slot", err)
+	}
+	if probe, ok := lease.(interface{ BrownoutProbe() bool }); !ok || !probe.BrownoutProbe() {
+		t.Fatal("sticky probe spawn did not reserve the half-open probe")
+	}
+	lease.Release()
+}
+
 func TestAgentHealthPromotesRetainedBreakerWhenVendorReturns(t *testing.T) {
 	rt, _ := brownoutRuntime(t, func(cfg *config.AgentBrownoutConfig) {
 		cfg.MinFailures = 3

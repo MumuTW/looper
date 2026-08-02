@@ -211,6 +211,21 @@ func (r *agentHealthRegistry) WithSnapshot(vendor string, fn func()) error {
 	return nil
 }
 
+// AllowSnapshot is the non-reserving point-in-time check used before a sticky
+// retry is durably claimed. The spawn lease owns the half-open reservation;
+// claim admission must not consume a probe token that has no execution yet.
+func (r *agentHealthRegistry) AllowSnapshot(vendor string) error {
+	if r == nil {
+		return nil
+	}
+	r.gateMu.Lock()
+	defer r.gateMu.Unlock()
+	r.mu.Lock()
+	breaker := r.ensureSnapshotBreakerLocked(vendor)
+	r.mu.Unlock()
+	return breaker.Allow()
+}
+
 func (r *agentHealthRegistry) AllowAdmission(vendor string) (bool, error) {
 	probe, _, err := r.AllowAdmissionWithGeneration(vendor)
 	return probe, err

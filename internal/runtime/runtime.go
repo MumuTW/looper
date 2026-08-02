@@ -732,14 +732,14 @@ func (r *Runtime) AllowClaimForVendor(vendor string) error {
 	return r.agentHealth.Allow(vendor)
 }
 
-// AllowSnapshotClaimForVendor admits a sticky retry using the provider stored
-// in its durable run snapshot, including a vendor removed from live config.
+// AllowSnapshotClaimForVendor performs a non-reserving health check for a
+// sticky retry using the provider stored in its durable run snapshot, including
+// a vendor removed from live config. The spawn lease owns probe reservation.
 func (r *Runtime) AllowSnapshotClaimForVendor(vendor string) error {
 	if err := r.AllowLifecycleWork(); err != nil {
 		return err
 	}
-	_, err := r.agentHealth.AllowSnapshotAdmission(vendor)
-	return err
+	return r.agentHealth.AllowSnapshot(vendor)
 }
 
 func (r *Runtime) allowAgentSpawn(meta *agent.SpawnMeta) error {
