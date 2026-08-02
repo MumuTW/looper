@@ -18,6 +18,7 @@ import (
 	"github.com/MumuTW/looper/internal/coordinator"
 	"github.com/MumuTW/looper/internal/fixer"
 	githubinfra "github.com/MumuTW/looper/internal/infra/github"
+	"github.com/MumuTW/looper/internal/loops/runpipe"
 	"github.com/MumuTW/looper/internal/planner"
 	"github.com/MumuTW/looper/internal/projects"
 	"github.com/MumuTW/looper/internal/reviewer"
@@ -1712,11 +1713,11 @@ func (s *queueStatusCheckingPlannerScheduler) DiscoverIssues(ctx context.Context
 	return planner.DiscoveryResult{}, nil
 }
 
-func (s *queueStatusCheckingPlannerScheduler) ProcessNext(context.Context, string) (*planner.ProcessResult, error) {
+func (s *queueStatusCheckingPlannerScheduler) ProcessNext(context.Context, string) (*runpipe.ProcessResult, error) {
 	return nil, nil
 }
 
-func (s *queueStatusCheckingPlannerScheduler) ProcessClaimedQueueItem(context.Context, storage.QueueItemRecord) (*planner.ProcessResult, error) {
+func (s *queueStatusCheckingPlannerScheduler) ProcessClaimedQueueItem(context.Context, storage.QueueItemRecord) (*runpipe.ProcessResult, error) {
 	return nil, nil
 
 }
@@ -1728,18 +1729,18 @@ func (s *stubPlannerScheduler) DiscoverIssues(_ context.Context, input planner.D
 	return planner.DiscoveryResult{}, s.discoverErr
 }
 
-func (s *stubPlannerScheduler) ProcessNext(_ context.Context, claimedBy string) (*planner.ProcessResult, error) {
+func (s *stubPlannerScheduler) ProcessNext(_ context.Context, claimedBy string) (*runpipe.ProcessResult, error) {
 	s.mu.Lock()
 	s.processClaims = append(s.processClaims, claimedBy)
 	s.mu.Unlock()
 	return nil, s.processErr
 }
 
-func (s *stubPlannerScheduler) ProcessClaimedQueueItem(_ context.Context, queueItem storage.QueueItemRecord) (*planner.ProcessResult, error) {
+func (s *stubPlannerScheduler) ProcessClaimedQueueItem(_ context.Context, queueItem storage.QueueItemRecord) (*runpipe.ProcessResult, error) {
 	s.mu.Lock()
 	s.processedItems = append(s.processedItems, queueItem.ID)
 	s.mu.Unlock()
-	return &planner.ProcessResult{}, s.processErr
+	return &runpipe.ProcessResult{}, s.processErr
 }
 
 func (s *stubPlannerScheduler) processClaimCount() int {
@@ -1781,18 +1782,18 @@ func (s *stubReviewerScheduler) DiscoverPullRequest(_ context.Context, _ reviewe
 	return reviewer.DiscoveryResult{}, s.discoverErr
 }
 
-func (s *stubReviewerScheduler) ProcessNext(_ context.Context, claimedBy string) (*reviewer.ProcessResult, error) {
+func (s *stubReviewerScheduler) ProcessNext(_ context.Context, claimedBy string) (*runpipe.ProcessResult, error) {
 	s.mu.Lock()
 	s.processClaims = append(s.processClaims, claimedBy)
 	s.mu.Unlock()
 	return nil, s.processErr
 }
 
-func (s *stubReviewerScheduler) ProcessClaimedQueueItem(_ context.Context, queueItem storage.QueueItemRecord) (*reviewer.ProcessResult, error) {
+func (s *stubReviewerScheduler) ProcessClaimedQueueItem(_ context.Context, queueItem storage.QueueItemRecord) (*runpipe.ProcessResult, error) {
 	s.mu.Lock()
 	s.processedItems = append(s.processedItems, queueItem.ID)
 	s.mu.Unlock()
-	return &reviewer.ProcessResult{}, s.processErr
+	return &runpipe.ProcessResult{}, s.processErr
 }
 
 func (s *stubReviewerScheduler) processClaimCount() int {
@@ -1831,18 +1832,18 @@ func (s *stubFixerScheduler) DiscoverPullRequestsForBaseBranchUpdate(_ context.C
 	return fixer.DiscoveryResult{}, s.discoverErr
 }
 
-func (s *stubFixerScheduler) ProcessNext(_ context.Context, claimedBy string) (*fixer.ProcessResult, error) {
+func (s *stubFixerScheduler) ProcessNext(_ context.Context, claimedBy string) (*runpipe.ProcessResult, error) {
 	s.mu.Lock()
 	s.processClaims = append(s.processClaims, claimedBy)
 	s.mu.Unlock()
 	return nil, s.processErr
 }
 
-func (s *stubFixerScheduler) ProcessClaimedQueueItem(_ context.Context, queueItem storage.QueueItemRecord) (*fixer.ProcessResult, error) {
+func (s *stubFixerScheduler) ProcessClaimedQueueItem(_ context.Context, queueItem storage.QueueItemRecord) (*runpipe.ProcessResult, error) {
 	s.mu.Lock()
 	s.processedItems = append(s.processedItems, queueItem.ID)
 	s.mu.Unlock()
-	return &fixer.ProcessResult{}, s.processErr
+	return &runpipe.ProcessResult{}, s.processErr
 }
 
 func (s *stubFixerScheduler) processClaimCount() int {
@@ -1948,7 +1949,7 @@ type parallelWorkerScheduler struct {
 	secondStarted chan struct{}
 }
 
-func (s *parallelWorkerScheduler) ProcessNext(_ context.Context, _ string) (*worker.ProcessResult, error) {
+func (s *parallelWorkerScheduler) ProcessNext(_ context.Context, _ string) (*runpipe.ProcessResult, error) {
 	switch atomic.AddInt32(&s.calls, 1) {
 	case 1:
 		select {
@@ -1963,7 +1964,7 @@ func (s *parallelWorkerScheduler) ProcessNext(_ context.Context, _ string) (*wor
 	return nil, nil
 }
 
-func (s *parallelWorkerScheduler) ProcessClaimedQueueItem(ctx context.Context, _ storage.QueueItemRecord) (*worker.ProcessResult, error) {
+func (s *parallelWorkerScheduler) ProcessClaimedQueueItem(ctx context.Context, _ storage.QueueItemRecord) (*runpipe.ProcessResult, error) {
 	return s.ProcessNext(ctx, "")
 }
 
@@ -1973,7 +1974,7 @@ type blockingWorkerScheduler struct {
 	once    sync.Once
 }
 
-func (s *blockingWorkerScheduler) ProcessNext(_ context.Context, _ string) (*worker.ProcessResult, error) {
+func (s *blockingWorkerScheduler) ProcessNext(_ context.Context, _ string) (*runpipe.ProcessResult, error) {
 	s.once.Do(func() {
 		close(s.started)
 	})
@@ -1981,7 +1982,7 @@ func (s *blockingWorkerScheduler) ProcessNext(_ context.Context, _ string) (*wor
 	return nil, nil
 }
 
-func (s *blockingWorkerScheduler) ProcessClaimedQueueItem(ctx context.Context, _ storage.QueueItemRecord) (*worker.ProcessResult, error) {
+func (s *blockingWorkerScheduler) ProcessClaimedQueueItem(ctx context.Context, _ storage.QueueItemRecord) (*runpipe.ProcessResult, error) {
 	return s.ProcessNext(ctx, "")
 }
 
@@ -2001,18 +2002,18 @@ func (s *stubWorkerScheduler) DiscoverIssues(_ context.Context, input worker.Dis
 	return worker.DiscoveryResult{}, s.discoverErr
 }
 
-func (s *stubWorkerScheduler) ProcessNext(_ context.Context, claimedBy string) (*worker.ProcessResult, error) {
+func (s *stubWorkerScheduler) ProcessNext(_ context.Context, claimedBy string) (*runpipe.ProcessResult, error) {
 	s.mu.Lock()
 	s.processClaims = append(s.processClaims, claimedBy)
 	s.mu.Unlock()
 	return nil, s.processErr
 }
 
-func (s *stubWorkerScheduler) ProcessClaimedQueueItem(_ context.Context, queueItem storage.QueueItemRecord) (*worker.ProcessResult, error) {
+func (s *stubWorkerScheduler) ProcessClaimedQueueItem(_ context.Context, queueItem storage.QueueItemRecord) (*runpipe.ProcessResult, error) {
 	s.mu.Lock()
 	s.processedItems = append(s.processedItems, queueItem.ID)
 	s.mu.Unlock()
-	return &worker.ProcessResult{}, s.processErr
+	return &runpipe.ProcessResult{}, s.processErr
 }
 
 func (s *stubWorkerScheduler) processClaimCount() int {

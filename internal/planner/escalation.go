@@ -12,6 +12,7 @@ import (
 	"github.com/MumuTW/looper/internal/config"
 	"github.com/MumuTW/looper/internal/eventlog"
 	"github.com/MumuTW/looper/internal/loops"
+	"github.com/MumuTW/looper/internal/loops/runpipe"
 	"github.com/MumuTW/looper/internal/storage"
 )
 
@@ -138,11 +139,11 @@ func (r *Runner) runAssessSuitabilityStep(ctx context.Context, input stepInput) 
 		return checkpoint, err
 	}
 	if !strings.EqualFold(result.Status, "completed") {
-		return checkpoint, &loopError{message: firstNonEmpty(result.Summary, result.Stderr, "Planner assessment agent "+result.Status), kind: FailureRetryableTransient}
+		return checkpoint, &runpipe.LoopError{Message: firstNonEmpty(result.Summary, result.Stderr, "Planner assessment agent "+result.Status), Kind: runpipe.FailureRetryableTransient}
 	}
 	evidence, err := consumePlannerAssessment(worktree.Path)
 	if err != nil {
-		return checkpoint, &loopError{message: err.Error(), kind: FailureNonRetryable}
+		return checkpoint, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureNonRetryable}
 	}
 	if r.git != nil {
 		worktreeRoot, rootErr := plannerWorktreeRoot(input.Project)
@@ -154,12 +155,12 @@ func (r *Runner) runAssessSuitabilityStep(ctx context.Context, input stepInput) 
 			return checkpoint, inspectErr
 		}
 		if inspect.HasUncommittedChanges || len(inspect.NewCommitSHAs) > 0 {
-			return checkpoint, &loopError{message: "Planner suitability assessment modified the worktree before spec authoring", kind: FailureNonRetryable}
+			return checkpoint, &runpipe.LoopError{Message: "Planner suitability assessment modified the worktree before spec authoring", Kind: runpipe.FailureNonRetryable}
 		}
 	}
 	fired, err := evaluatePlannerEscalation(policy, evidence)
 	if err != nil {
-		return checkpoint, &loopError{message: err.Error(), kind: FailureNonRetryable}
+		return checkpoint, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureNonRetryable}
 	}
 	checkpoint.Assessment = &checkpointAssessment{Evidence: evidence, Fired: fired, AssessedAt: r.nowISO()}
 	if len(fired) == 0 {
@@ -276,7 +277,7 @@ func normalizePlannerEscalationAnswer(answer string) string {
 	}
 }
 
-func (r *Runner) suspendPlannerForHuman(ctx context.Context, loop storage.LoopRecord, run storage.RunRecord, queue storage.QueueItemRecord, checkpoint plannerCheckpoint, awaiting *plannerAwaitingHumanError) (ProcessResult, error) {
+func (r *Runner) suspendPlannerForHuman(ctx context.Context, loop storage.LoopRecord, run storage.RunRecord, queue storage.QueueItemRecord, checkpoint plannerCheckpoint, awaiting *plannerAwaitingHumanError) (runpipe.ProcessResult, error) {
 	nowISO := r.nowISO()
 	criteria := make([]string, 0, len(awaiting.fired))
 	consequences := map[string]string{"authorize proceed": "Planner writes and publishes the spec from the persisted assessment.", "close without a spec": "Planner completes this loop without writing or publishing a spec."}
@@ -297,21 +298,21 @@ func (r *Runner) suspendPlannerForHuman(ctx context.Context, loop storage.LoopRe
 		updated.NextRunAt = nil
 	})
 	if err != nil {
-		return ProcessResult{}, err
+		return runpipe.ProcessResult{}, err
 	}
 	if writeErr != nil {
-		return ProcessResult{}, writeErr
+		return runpipe.ProcessResult{}, writeErr
 	}
 	reason := "planner suspended awaiting human authority"
 	if _, err := r.repos.Queue.CancelByLoop(ctx, loop.ID, nowISO, &reason); err != nil {
-		return ProcessResult{}, err
+		return runpipe.ProcessResult{}, err
 	}
 	summary := "Awaiting human decision: " + awaiting.question
 	if _, err := r.completeRun(ctx, run, "interrupted", summary, "", checkpoint); err != nil {
-		return ProcessResult{}, err
+		return runpipe.ProcessResult{}, err
 	}
 	r.appendEvent(ctx, eventInput{eventType: "planner.awaiting_human", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "loop", entityID: loop.ID, payload: map[string]any{"criteria": criteria, "decisionRequest": awaiting.question}})
-	return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queue.ID, Status: "awaiting_human", Summary: summary}, nil
+	return runpipe.ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queue.ID, Status: "awaiting_human", Summary: summary}, nil
 }
 
 func (r *Runner) markPlannerAskConsumed(ctx context.Context, loop storage.LoopRecord, ask loops.HITLAsk) error {

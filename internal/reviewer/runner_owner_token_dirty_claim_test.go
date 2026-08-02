@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	gitinfra "github.com/MumuTW/looper/internal/infra/git"
+	"github.com/MumuTW/looper/internal/loops/runpipe"
 	"github.com/MumuTW/looper/internal/storage"
 	"github.com/MumuTW/looper/internal/worktreesafety"
 )
@@ -57,9 +58,9 @@ func TestRunPrepareWorktreeStepFreshReviewerRestoresCandidateFixerTokenOnDirty(t
 	if err == nil {
 		t.Fatal("expected dirty prepare error")
 	}
-	var loopErr *loopError
-	if !errors.As(err, &loopErr) || loopErr.kind != FailureManualIntervention {
-		t.Fatalf("error = %v, want dirty MI loopError", err)
+	var loopErr *runpipe.LoopError
+	if !errors.As(err, &loopErr) || loopErr.Kind != runpipe.FailureManualIntervention {
+		t.Fatalf("error = %v, want dirty MI runpipe.LoopError", err)
 	}
 	if len(git.createCalls) != 1 {
 		t.Fatalf("createCalls = %d, want 1", len(git.createCalls))
@@ -109,14 +110,14 @@ func TestRunPrepareWorktreeStepRestoresFixerTokenWhenCheckpointPersistFails(t *t
 	loopTarget := "pr:acme/looper:42"
 	if err := fixture.repos.Loops.Upsert(ctx, storage.LoopRecord{
 		ID: "loop_persist_fail_restore", Seq: 1, ProjectID: projectID, Type: "reviewer",
-		TargetType: "pull_request", TargetID: &loopTarget, Repo: stringPtr("acme/looper"), PRNumber: &prNumber,
+		TargetType: "pull_request", TargetID: &loopTarget, Repo: runpipe.StringPtr("acme/looper"), PRNumber: &prNumber,
 		Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO,
 	}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
 	run := storage.RunRecord{
 		ID: "run_persist_fail_restore", LoopID: "loop_persist_fail_restore", Status: "running",
-		CurrentStep: stringPtr(string(stepWorktree)), StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO,
+		CurrentStep: runpipe.StringPtr(string(stepWorktree)), StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO,
 	}
 	if err := fixture.repos.Runs.Upsert(ctx, run); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)

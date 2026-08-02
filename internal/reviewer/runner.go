@@ -31,6 +31,7 @@ import (
 	"github.com/MumuTW/looper/internal/labels"
 	"github.com/MumuTW/looper/internal/loops"
 	"github.com/MumuTW/looper/internal/loops/failureclass"
+	"github.com/MumuTW/looper/internal/loops/runpipe"
 	"github.com/MumuTW/looper/internal/networkpolicy"
 	"github.com/MumuTW/looper/internal/reviewer/automerge"
 	"github.com/MumuTW/looper/internal/reviewer/criteria"
@@ -88,21 +89,11 @@ const (
 	reviewEventAgentNative    ReviewEvent = "AGENT_NATIVE"
 )
 
-type QueueFailureKind string
-
-const (
-	FailureRetryableTransient   QueueFailureKind = "retryable_transient"
-	FailureRetryableAfterResume QueueFailureKind = "retryable_after_resume"
-	FailureNonRetryable         QueueFailureKind = "non_retryable"
-	FailureManualIntervention   QueueFailureKind = "manual_intervention"
-)
-
 const (
 	defaultAgentTimeout = 90 * time.Minute
 	defaultClaimTTL     = 5 * time.Minute
 	defaultRetryDelay   = 5 * time.Second
 	defaultRetryMax     = 5
-	maxRetryDelay       = 300 * time.Second
 	retryJitterDivisor  = 4
 
 	defaultHeadChangePollInterval = 15 * time.Second
@@ -514,15 +505,6 @@ type DiscoveryResult struct {
 	Skipped        int
 }
 
-type ProcessResult struct {
-	LoopID      string
-	RunID       string
-	QueueItemID string
-	Status      string
-	Summary     string
-	FailureKind QueueFailureKind
-}
-
 type reviewerCheckpoint struct {
 	ResumePolicy                 string                      `json:"resumePolicy,omitempty"`
 	Detail                       *checkpointDetail           `json:"detail,omitempty"`
@@ -605,18 +587,6 @@ type resumedRunContext struct {
 	Resumed    bool
 }
 
-type loopError struct {
-	message     string
-	kind        QueueFailureKind
-	interrupted bool
-}
-
-type holdSkipError struct{ summary string }
-
-func (e *holdSkipError) Error() string { return e.summary }
-
-func (e *loopError) Error() string { return e.message }
-
 func New(options Options) *Runner {
 	now := options.Now
 	if now == nil {
@@ -645,7 +615,7 @@ func New(options Options) *Runner {
 	retryPolicy := config.NormalizeReviewerRetryConfig(options.RetryPolicy)
 	retryMaxDelay := time.Duration(retryPolicy.MaxDelayMS) * time.Millisecond
 	if retryMaxDelay <= 0 {
-		retryMaxDelay = maxRetryDelay
+		retryMaxDelay = runpipe.MaxRetryDelay
 	}
 	headChangePollInterval := options.HeadChangePollInterval
 	if headChangePollInterval <= 0 {
@@ -1316,7 +1286,7 @@ func (r *Runner) retryMaxDelayForProject(projectID string) time.Duration {
 	policy := r.retryPolicyForProject(projectID)
 	delay := time.Duration(policy.MaxDelayMS) * time.Millisecond
 	if delay <= 0 {
-		return maxRetryDelay
+		return runpipe.MaxRetryDelay
 	}
 	return delay
 }
@@ -1388,7 +1358,7 @@ func prQueryLabels(labels []string) []string {
 	return result
 }
 
-func (r *Runner) ProcessNext(ctx context.Context, claimedBy string) (*ProcessResult, error) {
+func (r *Runner) ProcessNext(ctx context.Context, claimedBy string) (*runpipe.ProcessResult, error) {
 	if r.repos == nil || r.repos.Queue == nil {
 		return nil, fmt.Errorf("reviewer queue repository is not configured")
 	}
@@ -1402,7 +1372,7 @@ func (r *Runner) ProcessNext(ctx context.Context, claimedBy string) (*ProcessRes
 	return r.ProcessClaimedQueueItem(ctx, *item)
 }
 
-func (r *Runner) ProcessClaimedQueueItem(ctx context.Context, queueItem storage.QueueItemRecord) (*ProcessResult, error) {
+func (r *Runner) ProcessClaimedQueueItem(ctx context.Context, queueItem storage.QueueItemRecord) (*runpipe.ProcessResult, error) {
 	result, err := r.ProcessClaimedItem(ctx, queueItem)
 	if err != nil {
 		if cleanupErr := r.finalizeClaimSetupFailure(ctx, queueItem, err); cleanupErr != nil {
@@ -1415,7 +1385,7 @@ func (r *Runner) ProcessClaimedQueueItem(ctx context.Context, queueItem storage.
 
 func (r *Runner) finalizeClaimSetupFailure(ctx context.Context, queueItem storage.QueueItemRecord, cause error) error {
 	failure := r.classifyFailureForProject(derefString(queueItem.ProjectID), cause)
-	failedQueue, err := r.failQueueItem(ctx, queueItem, failure.kind, failure.message)
+	failedQueue, err := r.failQueueItem(ctx, queueItem, failure.Kind, failure.Message)
 	if err != nil {
 		return err
 	}
@@ -1430,12 +1400,12 @@ func (r *Runner) finalizeClaimSetupFailure(ctx context.Context, queueItem storag
 		return nil
 	}
 	_, err = r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
-		updated.LastRunAt = stringPtr(r.nowISO())
+		updated.LastRunAt = runpipe.StringPtr(r.nowISO())
 		if updated.Status == "paused" {
 			updated.NextRunAt = nil
 		} else if failedQueue != nil && failedQueue.Status == "queued" {
 			updated.Status = "queued"
-			updated.NextRunAt = stringPtr(failedQueue.AvailableAt)
+			updated.NextRunAt = runpipe.StringPtr(failedQueue.AvailableAt)
 		} else {
 			updated.Status = "paused"
 			updated.NextRunAt = nil
@@ -1444,45 +1414,45 @@ func (r *Runner) finalizeClaimSetupFailure(ctx context.Context, queueItem storag
 	return err
 }
 
-func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.QueueItemRecord) (ProcessResult, error) {
+func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.QueueItemRecord) (runpipe.ProcessResult, error) {
 	if queueItem.Type != "reviewer" {
-		return ProcessResult{}, fmt.Errorf("unsupported queue item type: %s", queueItem.Type)
+		return runpipe.ProcessResult{}, fmt.Errorf("unsupported queue item type: %s", queueItem.Type)
 	}
 	if queueItem.LoopID == nil || queueItem.Repo == nil || queueItem.PRNumber == nil {
-		return ProcessResult{}, fmt.Errorf("reviewer queue item requires loopId, repo, and prNumber")
+		return runpipe.ProcessResult{}, fmt.Errorf("reviewer queue item requires loopId, repo, and prNumber")
 	}
 	loop, err := r.repos.Loops.GetByID(ctx, *queueItem.LoopID)
 	if err != nil {
-		return ProcessResult{}, err
+		return runpipe.ProcessResult{}, err
 	}
 	if loop == nil {
-		return ProcessResult{}, fmt.Errorf("loop not found: %s", *queueItem.LoopID)
+		return runpipe.ProcessResult{}, fmt.Errorf("loop not found: %s", *queueItem.LoopID)
 	}
 	if reason := terminalReviewerLoopReason(*loop); reason != "" {
 		cancelReason := "loop_" + reason
 		if _, err := r.repos.Queue.CancelByLoop(ctx, loop.ID, r.nowISO(), &cancelReason); err != nil {
-			return ProcessResult{}, err
+			return runpipe.ProcessResult{}, err
 		}
 		summary := fmt.Sprintf("Skipped terminal reviewer loop %s: %s", loop.ID, reason)
-		return ProcessResult{LoopID: loop.ID, QueueItemID: queueItem.ID, Status: "skipped", Summary: summary}, nil
+		return runpipe.ProcessResult{LoopID: loop.ID, QueueItemID: queueItem.ID, Status: "skipped", Summary: summary}, nil
 	}
 	project, err := r.repos.Projects.GetByID(ctx, loop.ProjectID)
 	if err != nil {
-		return ProcessResult{}, err
+		return runpipe.ProcessResult{}, err
 	}
 	if project == nil {
-		return ProcessResult{}, fmt.Errorf("project not found: %s", loop.ProjectID)
+		return runpipe.ProcessResult{}, fmt.Errorf("project not found: %s", loop.ProjectID)
 	}
 	if err := r.revalidateRoutedReviewerClaim(ctx, *project, queueItem); err != nil {
-		var holdErr *holdSkipError
+		var holdErr *runpipe.HoldSkipError
 		if errors.As(err, &holdErr) {
-			return r.finishHeldReviewerQueueItem(ctx, *loop, nil, queueItem, reviewerCheckpoint{}, holdErr.summary)
+			return r.finishHeldReviewerQueueItem(ctx, *loop, nil, queueItem, reviewerCheckpoint{}, holdErr.Summary)
 		}
-		return ProcessResult{}, err
+		return runpipe.ProcessResult{}, err
 	}
 	resumedRun, err := r.createRunContext(ctx, *loop)
 	if err != nil {
-		return ProcessResult{}, err
+		return runpipe.ProcessResult{}, err
 	}
 	run := resumedRun.Run
 	checkpoint := resumedRun.Checkpoint
@@ -1501,10 +1471,10 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			reason := "reviewer-run-resume"
 			acquired, err := r.repos.Locks.Acquire(ctx, storage.LockRecord{Key: claimedLockKey, Owner: queueItem.ID, Reason: &reason, ExpiresAt: eventlog.FormatJavaScriptISOString(r.now().Add(r.claimTTL)), CreatedAt: nowISO, UpdatedAt: nowISO})
 			if err != nil {
-				return ProcessResult{}, err
+				return runpipe.ProcessResult{}, err
 			}
 			if !acquired {
-				return ProcessResult{}, &loopError{message: fmt.Sprintf("Pull request lock is already held for %s", claimedLockKey), kind: FailureRetryableTransient}
+				return runpipe.ProcessResult{}, &runpipe.LoopError{Message: fmt.Sprintf("Pull request lock is already held for %s", claimedLockKey), Kind: runpipe.FailureRetryableTransient}
 			}
 			acquiredClaimedLock = true
 		}
@@ -1536,16 +1506,16 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	}
 	metadataJSON, err := r.recordLoopRunStartMetadata(loop.MetadataJSON, project.ID)
 	if err != nil {
-		return ProcessResult{}, err
+		return runpipe.ProcessResult{}, err
 	}
 	updatedLoop, err := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
 		updated.Status = "running"
-		updated.LastRunAt = stringPtr(run.StartedAt)
+		updated.LastRunAt = runpipe.StringPtr(run.StartedAt)
 		updated.NextRunAt = nil
 		updated.MetadataJSON = &metadataJSON
 	})
 	if err != nil {
-		return ProcessResult{}, err
+		return runpipe.ProcessResult{}, err
 	}
 	// The runner is the immutable claim snapshot. Carry the just-persisted
 	// policy into every step so stale loop metadata from an earlier queued run
@@ -1558,7 +1528,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		stepStartedAt := r.now()
 		run, err = r.persistStepStarted(ctx, run, step, checkpoint)
 		if err != nil {
-			return ProcessResult{}, err
+			return runpipe.ProcessResult{}, err
 		}
 		r.appendEvent(ctx, eventInput{eventType: "loop.step.started", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"step": string(step), "startedAt": eventlog.FormatJavaScriptISOString(stepStartedAt.UTC())}})
 		checkpoint, err = r.executeStep(ctx, step, stepInput{Project: *project, Loop: *loop, Run: run, QueueItem: queueItem, Repo: *queueItem.Repo, PRNumber: *queueItem.PRNumber, Checkpoint: checkpoint})
@@ -1567,9 +1537,9 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			if errors.As(err, &convergenceErr) {
 				return r.suspendReviewerForConvergence(ctx, *loop, run, queueItem, checkpoint, convergenceErr)
 			}
-			var holdErr *holdSkipError
+			var holdErr *runpipe.HoldSkipError
 			if errors.As(err, &holdErr) {
-				return r.finishHeldReviewerQueueItem(ctx, *loop, &run, queueItem, checkpoint, holdErr.summary)
+				return r.finishHeldReviewerQueueItem(ctx, *loop, &run, queueItem, checkpoint, holdErr.Summary)
 			}
 			stepElapsedSeconds := durationSeconds(r.now().Sub(stepStartedAt))
 			failure := r.classifyFailureForProjectAndBoundary(project.ID, err, reviewerFailureBoundaryForStep(step))
@@ -1580,68 +1550,68 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			if workflow.CarryRestartFromDiscover(checkpoint.ResumePolicy) {
 				latest.ResumePolicy = checkpoint.ResumePolicy
 			}
-			latest.ResumePolicy = workflow.NextResumePolicyOnFailure(string(failure.kind), latest.ResumePolicy)
+			latest.ResumePolicy = workflow.NextResumePolicyOnFailure(string(failure.Kind), latest.ResumePolicy)
 			runStatus := "failed"
 			stepEventType := "loop.step.failed"
 			runEventType := "run.failed"
-			if failure.interrupted {
+			if failure.Interrupted {
 				runStatus = "interrupted"
 				stepEventType = "loop.step.interrupted"
 				runEventType = "run.interrupted"
 			}
-			if _, err := r.completeRun(ctx, run, runStatus, failure.message, failure.message, latest); err != nil {
-				return ProcessResult{}, err
+			if _, err := r.completeRun(ctx, run, runStatus, failure.Message, failure.Message, latest); err != nil {
+				return runpipe.ProcessResult{}, err
 			}
-			r.appendEvent(ctx, eventInput{eventType: stepEventType, projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"message": failure.message, "failureKind": string(failure.kind), "currentStep": derefString(run.CurrentStep), "elapsedSeconds": stepElapsedSeconds}})
-			r.appendEvent(ctx, eventInput{eventType: runEventType, projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"summary": failure.message, "failureKind": string(failure.kind)}})
-			if failure.interrupted {
-				r.logInfo("reviewer run interrupted", map[string]any{"projectId": project.ID, "loopId": loop.ID, "runId": run.ID, "queueItemId": queueItem.ID, "currentStep": derefString(run.CurrentStep), "elapsedSeconds": stepElapsedSeconds, "failureKind": string(failure.kind), "summary": failure.message})
+			r.appendEvent(ctx, eventInput{eventType: stepEventType, projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"message": failure.Message, "failureKind": string(failure.Kind), "currentStep": derefString(run.CurrentStep), "elapsedSeconds": stepElapsedSeconds}})
+			r.appendEvent(ctx, eventInput{eventType: runEventType, projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"summary": failure.Message, "failureKind": string(failure.Kind)}})
+			if failure.Interrupted {
+				r.logInfo("reviewer run interrupted", map[string]any{"projectId": project.ID, "loopId": loop.ID, "runId": run.ID, "queueItemId": queueItem.ID, "currentStep": derefString(run.CurrentStep), "elapsedSeconds": stepElapsedSeconds, "failureKind": string(failure.Kind), "summary": failure.Message})
 			} else {
-				r.logError("reviewer run failed", map[string]any{"projectId": project.ID, "loopId": loop.ID, "runId": run.ID, "queueItemId": queueItem.ID, "currentStep": derefString(run.CurrentStep), "elapsedSeconds": stepElapsedSeconds, "failureKind": string(failure.kind), "summary": failure.message})
+				r.logError("reviewer run failed", map[string]any{"projectId": project.ID, "loopId": loop.ID, "runId": run.ID, "queueItemId": queueItem.ID, "currentStep": derefString(run.CurrentStep), "elapsedSeconds": stepElapsedSeconds, "failureKind": string(failure.Kind), "summary": failure.Message})
 			}
-			failedQueue, queueErr := r.failQueueItem(ctx, queueItem, failure.kind, failure.message)
+			failedQueue, queueErr := r.failQueueItem(ctx, queueItem, failure.Kind, failure.Message)
 			if queueErr != nil {
-				return ProcessResult{}, queueErr
+				return runpipe.ProcessResult{}, queueErr
 			}
 			terminalFailure := false
 			_, loopErr := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
-				updated.LastRunAt = stringPtr(r.nowISO())
-				if !failure.interrupted {
-					metadataJSON, metaErr := r.recordLoopFailureMetadata(updated.MetadataJSON, failure.message)
+				updated.LastRunAt = runpipe.StringPtr(r.nowISO())
+				if !failure.Interrupted {
+					metadataJSON, metaErr := r.recordLoopFailureMetadata(updated.MetadataJSON, failure.Message)
 					if metaErr == nil {
 						updated.MetadataJSON = &metadataJSON
 					}
 				}
-				if !failure.interrupted && terminalReviewerLoopReason(*updated) == "failed" {
+				if !failure.Interrupted && terminalReviewerLoopReason(*updated) == "failed" {
 					terminalFailure = true
 					updated.Status = "failed"
 					updated.NextRunAt = nil
-				} else if failure.interrupted && terminalReviewerLoopReason(*updated) == "failed" {
+				} else if failure.Interrupted && terminalReviewerLoopReason(*updated) == "failed" {
 					updated.Status = "paused"
 					updated.NextRunAt = nil
 				} else if updated.Status == "paused" {
 					updated.NextRunAt = nil
 				} else if failedQueue != nil && failedQueue.Status == "queued" {
 					updated.Status = "queued"
-					updated.NextRunAt = stringPtr(failedQueue.AvailableAt)
+					updated.NextRunAt = runpipe.StringPtr(failedQueue.AvailableAt)
 				} else {
 					updated.Status = "paused"
 					updated.NextRunAt = nil
 				}
 			})
 			if loopErr != nil {
-				return ProcessResult{}, loopErr
+				return runpipe.ProcessResult{}, loopErr
 			}
 			if terminalFailure && failedQueue != nil && failedQueue.Status == "queued" {
-				if err := r.repos.Queue.Fail(ctx, storage.QueueFailInput{ID: failedQueue.ID, FinishedAt: r.nowISO(), ErrorMessage: optionalString(failure.message), ErrorKind: string(failure.kind), UpdatedAt: r.nowISO()}); err != nil {
-					return ProcessResult{}, err
+				if err := r.repos.Queue.Fail(ctx, storage.QueueFailInput{ID: failedQueue.ID, FinishedAt: r.nowISO(), ErrorMessage: runpipe.OptionalString(failure.Message), ErrorKind: string(failure.Kind), UpdatedAt: r.nowISO()}); err != nil {
+					return runpipe.ProcessResult{}, err
 				}
 				failedQueue.Status = "failed"
 			}
 			if queueResultIsTerminalForCleanup(failedQueue) {
 				r.cleanupReviewerWorktreeIfTerminal(context.Background(), *project, &latest)
 			}
-			return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: runStatus, Summary: failure.message, FailureKind: failure.kind}, nil
+			return runpipe.ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: runStatus, Summary: failure.Message, FailureKind: failure.Kind}, nil
 		}
 		if step == stepClaim {
 			claimedLockKey = checkpoint.ClaimedLockKey
@@ -1649,7 +1619,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		}
 		run, err = r.persistStepCompleted(ctx, run, step, checkpoint)
 		if err != nil {
-			return ProcessResult{}, err
+			return runpipe.ProcessResult{}, err
 		}
 		stepElapsedSeconds := durationSeconds(r.now().Sub(stepStartedAt))
 		r.appendEvent(ctx, eventInput{eventType: "loop.step.completed", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"step": string(step), "elapsedSeconds": stepElapsedSeconds}})
@@ -1663,7 +1633,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		summary = fmt.Sprintf("Published review for %s#%d", *queueItem.Repo, *queueItem.PRNumber)
 	}
 	if _, err := r.completeRun(ctx, run, "success", summary, "", checkpoint); err != nil {
-		return ProcessResult{}, err
+		return runpipe.ProcessResult{}, err
 	}
 	r.appendEvent(ctx, eventInput{eventType: "run.completed", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"summary": summary}})
 	status := "success"
@@ -1672,9 +1642,9 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	}
 	if err := r.repos.Queue.Complete(ctx, queueItem.ID, r.nowISO()); err != nil {
 		if errors.Is(err, storage.ErrQueueItemNotActive) {
-			return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: status, Summary: summary}, nil
+			return runpipe.ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: status, Summary: summary}, nil
 		}
-		return ProcessResult{}, err
+		return runpipe.ProcessResult{}, err
 	}
 	updatedLoop, err = r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
 		metadataJSON, metaErr := r.recordLoopSuccessMetadata(updated.MetadataJSON, checkpoint, summary)
@@ -1682,19 +1652,19 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			updated.MetadataJSON = &metadataJSON
 		}
 		updated.Status = r.loopSuccessStatus(updated.Status, updated.MetadataJSON, checkpoint.SkipReason)
-		updated.LastRunAt = stringPtr(r.nowISO())
+		updated.LastRunAt = runpipe.StringPtr(r.nowISO())
 		updated.NextRunAt = nil
 	})
 	if err != nil {
-		return ProcessResult{}, err
+		return runpipe.ProcessResult{}, err
 	}
 	if reason := terminalReviewerLoopReason(updatedLoop); reason != "" {
 		if _, err := r.repos.Queue.CancelByLoop(ctx, updatedLoop.ID, r.nowISO(), &reason); err != nil {
-			return ProcessResult{}, err
+			return runpipe.ProcessResult{}, err
 		}
 	}
 	r.cleanupReviewerWorktreeIfTerminal(context.Background(), *project, &checkpoint)
-	return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: status, Summary: summary}, nil
+	return runpipe.ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: status, Summary: summary}, nil
 }
 
 func (r *Runner) revalidateRoutedReviewerClaim(ctx context.Context, project storage.ProjectRecord, queueItem storage.QueueItemRecord) error {
@@ -1713,18 +1683,18 @@ func (r *Runner) revalidateRoutedReviewerClaim(ctx context.Context, project stor
 		return err
 	}
 	if domain.IsAutoLaneHeld(domain.LoopTypeReviewer, detail.Labels) {
-		return &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", *queueItem.Repo, *queueItem.PRNumber)}
+		return &runpipe.HoldSkipError{Summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", *queueItem.Repo, *queueItem.PRNumber)}
 	}
 	decision := routedReviewerClaimDecision(policy, "", detail.Author, detail.Labels, detail.ReviewRequestUsers)
 	if !decision.Allowed && policy.EnableSelfReview && decision.Reason == "local GitHub identity is not requested for review" {
 		currentLogin, lookupErr := r.github.GetCurrentUserLogin(ctx, *queueItem.Repo, project.RepoPath)
 		if lookupErr != nil {
-			return &loopError{message: lookupErr.Error(), kind: FailureRetryableTransient}
+			return &runpipe.LoopError{Message: lookupErr.Error(), Kind: runpipe.FailureRetryableTransient}
 		}
 		decision = routedReviewerClaimDecision(policy, currentLogin, detail.Author, detail.Labels, detail.ReviewRequestUsers)
 	}
 	if !decision.Allowed {
-		return &loopError{message: fmt.Sprintf("Skipped routed pull request %s#%d: %s", *queueItem.Repo, *queueItem.PRNumber, decision.Reason), kind: FailureManualIntervention}
+		return &runpipe.LoopError{Message: fmt.Sprintf("Skipped routed pull request %s#%d: %s", *queueItem.Repo, *queueItem.PRNumber, decision.Reason), Kind: runpipe.FailureManualIntervention}
 	}
 	return nil
 }
@@ -1845,7 +1815,7 @@ func checkpointDetailFromDetail(detail PullRequestDetail) *checkpointDetail {
 func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCheckpoint, error) {
 	checkpoint := input.Checkpoint
 	if checkpoint.Detail == nil {
-		return checkpoint, &loopError{message: "Missing PR detail checkpoint for filter step", kind: FailureRetryableTransient}
+		return checkpoint, &runpipe.LoopError{Message: "Missing PR detail checkpoint for filter step", Kind: runpipe.FailureRetryableTransient}
 	}
 	policy := r.discoveryPolicyForProject(input.Project.ID)
 	if !policy.IncludeDrafts && checkpoint.Detail.IsDraft {
@@ -1862,7 +1832,7 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 		return checkpoint, nil
 	}
 	if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeld(domain.LoopTypeReviewer, checkpoint.Detail.Labels) {
-		return checkpoint, &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
+		return checkpoint, &runpipe.HoldSkipError{Summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
 	}
 	currentLogin := ""
 	ensureCurrentLogin := func() error {
@@ -1895,7 +1865,7 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 	}
 	if !isManualReviewerLoop(input.Loop) && !policy.EnableSelfReview {
 		if err := ensureCurrentLogin(); err != nil {
-			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableTransient}
+			return checkpoint, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableTransient}
 		}
 		if isSelfAuthoredPR(checkpoint.Detail.Author, currentLogin, policy) {
 			checkpoint.SkipReason = fmt.Sprintf("Skipped self-authored pull request %s#%d for reviewer %s", input.Repo, input.PRNumber, currentLogin)
@@ -1906,7 +1876,7 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 	}
 	if !isManualReviewerLoop(input.Loop) && len(checkpoint.Detail.Reviews) > 0 && r.loopConfig.StopOnApproved {
 		if err := ensureCurrentLogin(); err != nil {
-			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableTransient}
+			return checkpoint, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableTransient}
 		}
 		if r.loopConfig.StopOnApproved && hasApprovedReviewByAuthorForHead(checkpoint.Detail.Reviews, currentLogin, checkpoint.Detail.HeadSHA) {
 			checkpoint.SkipReason = fmt.Sprintf("Terminated reviewer loop for approved pull request %s#%d", input.Repo, input.PRNumber)
@@ -1919,7 +1889,7 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 	}
 	if !isManualReviewerLoop(input.Loop) && len(checkpoint.Detail.Reviews) > 0 {
 		if err := ensureCurrentLogin(); err != nil {
-			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableTransient}
+			return checkpoint, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableTransient}
 		}
 		if hasReviewByAuthorForHead(checkpoint.Detail.Reviews, currentLogin, checkpoint.Detail.HeadSHA) {
 			checkpoint.SkipReason = fmt.Sprintf("Skipped pull request %s#%d because current user already reviewed head %s", input.Repo, input.PRNumber, checkpoint.Detail.HeadSHA)
@@ -1938,7 +1908,7 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 	if !isManualReviewerLoop(input.Loop) && networkpolicy.IsRouted(policy.RoutedClaimPolicy) {
 		decision, resolvedLogin, err := r.routedReviewerClaimDecisionWithCurrentLogin(ctx, input.Repo, input.Project.RepoPath, policy, currentLogin, checkpoint.Detail.Author, checkpoint.Detail.Labels, checkpoint.Detail.ReviewRequestUsers)
 		if err != nil {
-			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableTransient}
+			return checkpoint, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableTransient}
 		}
 		currentLogin = resolvedLogin
 		checkpoint.Detail.CurrentLogin = currentLogin
@@ -1951,7 +1921,7 @@ func (r *Runner) runFilterStep(ctx context.Context, input stepInput) (reviewerCh
 	}
 	if requireReviewRequest && !networkpolicy.IsRouted(policy.RoutedClaimPolicy) {
 		if err := ensureCurrentLogin(); err != nil {
-			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableTransient}
+			return checkpoint, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableTransient}
 		}
 		if reviewRequestsKnownAbsent(checkpoint.Detail.ReviewRequests, currentLogin) {
 			if r.hasThreadResolutionFollowUpCandidate(ctx, input.Project.RepoPath, input.Repo, input.PRNumber, checkpoint.Detail.HeadSHA, currentLogin) {
@@ -1977,7 +1947,7 @@ func (r *Runner) notifyConflictedPullRequest(ctx context.Context, input stepInpu
 	marker := conflictNoticeMarker(dedupeKey)
 	lockKey := "notification:" + dedupeKey
 	if r.repos.Locks != nil {
-		acquired, err := r.repos.Locks.Acquire(ctx, storage.LockRecord{Key: lockKey, Owner: firstNonEmpty(input.Run.ID, input.QueueItem.ID, "reviewer"), Reason: stringPtr("conflicted-pr-notification"), ExpiresAt: eventlog.FormatJavaScriptISOString(r.now().Add(5 * time.Minute)), CreatedAt: r.nowISO(), UpdatedAt: r.nowISO()})
+		acquired, err := r.repos.Locks.Acquire(ctx, storage.LockRecord{Key: lockKey, Owner: firstNonEmpty(input.Run.ID, input.QueueItem.ID, "reviewer"), Reason: runpipe.StringPtr("conflicted-pr-notification"), ExpiresAt: eventlog.FormatJavaScriptISOString(r.now().Add(5 * time.Minute)), CreatedAt: r.nowISO(), UpdatedAt: r.nowISO()})
 		if err != nil {
 			return err
 		}
@@ -2004,10 +1974,10 @@ func (r *Runner) notifyConflictedPullRequest(ctx context.Context, input stepInpu
 	title := "PR review skipped due to merge conflicts"
 	pending := storage.NotificationRecord{
 		ID:         notificationID,
-		ProjectID:  optionalString(input.Project.ID),
-		LoopID:     optionalString(input.Loop.ID),
-		RunID:      optionalString(input.Run.ID),
-		EntityType: stringPtr("pull_request"),
+		ProjectID:  runpipe.OptionalString(input.Project.ID),
+		LoopID:     runpipe.OptionalString(input.Loop.ID),
+		RunID:      runpipe.OptionalString(input.Run.ID),
+		EntityType: runpipe.StringPtr("pull_request"),
 		EntityID:   &entityID,
 		Channel:    conflictedPRNotificationChannel,
 		Level:      "action_required",
@@ -2027,7 +1997,7 @@ func (r *Runner) notifyConflictedPullRequest(ctx context.Context, input stepInpu
 		sentAt := r.now().UTC().Format(time.RFC3339Nano)
 		sent := pending
 		sent.Status = "sent"
-		sent.PayloadJSON = optionalString(string(payload))
+		sent.PayloadJSON = runpipe.OptionalString(string(payload))
 		sent.SentAt = &sentAt
 		sent.UpdatedAt = sentAt
 		return r.repos.Notifications.Upsert(ctx, sent)
@@ -2038,7 +2008,7 @@ func (r *Runner) notifyConflictedPullRequest(ctx context.Context, input stepInpu
 	if err != nil {
 		failed := pending
 		failed.Status = "failed"
-		failed.ErrorMessage = optionalString(err.Error())
+		failed.ErrorMessage = runpipe.OptionalString(err.Error())
 		failed.UpdatedAt = r.now().UTC().Format(time.RFC3339Nano)
 		_ = r.repos.Notifications.Upsert(ctx, failed)
 		return err
@@ -2047,7 +2017,7 @@ func (r *Runner) notifyConflictedPullRequest(ctx context.Context, input stepInpu
 	sentAt := r.now().UTC().Format(time.RFC3339Nano)
 	sent := pending
 	sent.Status = "sent"
-	sent.PayloadJSON = optionalString(string(payload))
+	sent.PayloadJSON = runpipe.OptionalString(string(payload))
 	sent.SentAt = &sentAt
 	sent.UpdatedAt = sentAt
 	if err := r.repos.Notifications.Upsert(ctx, sent); err != nil {
@@ -2109,7 +2079,7 @@ func (r *Runner) runClaimStep(ctx context.Context, input stepInput) (reviewerChe
 		return input.Checkpoint, err
 	}
 	if !acquired {
-		return input.Checkpoint, &loopError{message: fmt.Sprintf("Pull request lock is already held for %s", lockKey), kind: FailureRetryableTransient}
+		return input.Checkpoint, &runpipe.LoopError{Message: fmt.Sprintf("Pull request lock is already held for %s", lockKey), Kind: runpipe.FailureRetryableTransient}
 	}
 	checkpoint := input.Checkpoint
 	checkpoint.ClaimedLockKey = lockKey
@@ -2139,10 +2109,10 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (r
 		return checkpoint, fmt.Errorf("reviewer git gateway is not configured")
 	}
 	if checkpoint.Detail == nil {
-		return checkpoint, &loopError{message: "Missing PR detail checkpoint for worktree step", kind: FailureRetryableTransient}
+		return checkpoint, &runpipe.LoopError{Message: "Missing PR detail checkpoint for worktree step", Kind: runpipe.FailureRetryableTransient}
 	}
 	if checkpoint.Snapshot == nil {
-		return checkpoint, &loopError{message: "Missing PR snapshot checkpoint for worktree step", kind: FailureRetryableTransient}
+		return checkpoint, &runpipe.LoopError{Message: "Missing PR snapshot checkpoint for worktree step", Kind: runpipe.FailureRetryableTransient}
 	}
 	branch := reviewerWorktreeBranch(input.PRNumber, checkpoint)
 	baseBranch := firstNonEmpty(strings.TrimSpace(checkpoint.Detail.BaseRefName), derefString(input.Project.BaseBranch), "main")
@@ -2242,7 +2212,7 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (r
 		if restoreErr := restoreFixerOwnerToken(created.WorktreePath, priorFixerToken); restoreErr != nil {
 			return checkpoint, fmt.Errorf("restore fixer owner token after dirty prepare: %w", restoreErr)
 		}
-		return checkpoint, &loopError{message: fmt.Sprintf("Reviewer worktree is dirty for branch %s; manual intervention required", branch), kind: FailureManualIntervention}
+		return checkpoint, &runpipe.LoopError{Message: fmt.Sprintf("Reviewer worktree is dirty for branch %s; manual intervention required", branch), Kind: runpipe.FailureManualIntervention}
 	}
 	checkpoint.Worktree.HeadSHA = prepared.HeadSHA
 	checkpoint.Worktree.PreparedAt = r.nowISO()
@@ -2262,7 +2232,7 @@ func (r *Runner) runThreadResolutionStep(ctx context.Context, input stepInput) (
 		return checkpoint, nil
 	}
 	if checkpoint.Detail == nil || checkpoint.Snapshot == nil {
-		return checkpoint, &loopError{message: "Missing PR detail or snapshot checkpoint for thread resolution step", kind: FailureRetryableTransient}
+		return checkpoint, &runpipe.LoopError{Message: "Missing PR detail or snapshot checkpoint for thread resolution step", Kind: runpipe.FailureRetryableTransient}
 	}
 	if r.hasPendingHeadChangeNativeResume(ctx, input.Loop.ID) {
 		return checkpoint, nil
@@ -2272,7 +2242,7 @@ func (r *Runner) runThreadResolutionStep(ctx context.Context, input stepInput) (
 	}
 	currentLogin, err := r.github.GetCurrentUserLogin(ctx, input.Repo, input.Project.RepoPath)
 	if err != nil {
-		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableTransient}
+		return checkpoint, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableTransient}
 	}
 	currentLogin = normalizeLogin(currentLogin)
 	limit := policy.MaxThreadsPerRun
@@ -2285,7 +2255,7 @@ func (r *Runner) runThreadResolutionStep(ctx context.Context, input stepInput) (
 	}
 	threads, err := r.github.ListReviewThreads(ctx, ListReviewThreadsInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath, Limit: fetchLimit})
 	if err != nil {
-		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableTransient}
+		return checkpoint, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableTransient}
 	}
 	candidates := make([]ReviewThread, 0, len(threads))
 	for _, thread := range threads {
@@ -2331,13 +2301,13 @@ func (r *Runner) runThreadResolutionStep(ctx context.Context, input stepInput) (
 				continue
 			}
 			if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeld(domain.LoopTypeReviewer, refreshedDetail.Labels) {
-				return checkpoint, &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
+				return checkpoint, &runpipe.HoldSkipError{Summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
 			}
 			checkpoint.Detail.ReviewRequests = cloneStrings(refreshedDetail.ReviewRequests)
 			body := resolution.Reply(thread.ID, checkpoint.Snapshot.HeadSHA, decision, policy)
 			disclosureAgent, disclosureModel := r.disclosureIdentity(input.Run)
 			if err := r.github.AddReviewThreadReply(ctx, AddReviewThreadReplyInput{Repo: input.Repo, ThreadID: thread.ID, Body: body, CWD: input.Project.RepoPath, DisclosureAgent: disclosureAgent, DisclosureModel: disclosureModel}); err != nil {
-				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableTransient}
+				return checkpoint, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableTransient}
 			}
 			result.Commented++
 			commented = true
@@ -2353,7 +2323,7 @@ func (r *Runner) runThreadResolutionStep(ctx context.Context, input stepInput) (
 				continue
 			}
 			if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeld(domain.LoopTypeReviewer, refreshedDetail.Labels) {
-				return checkpoint, &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
+				return checkpoint, &runpipe.HoldSkipError{Summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
 			}
 			checkpoint.Detail.ReviewRequests = cloneStrings(refreshedDetail.ReviewRequests)
 			if !resolution.HasObjectiveAuditForHead(*latestThread, thread.ID, checkpoint.Snapshot.HeadSHA) && !commented {
@@ -2361,7 +2331,7 @@ func (r *Runner) runThreadResolutionStep(ctx context.Context, input stepInput) (
 				continue
 			}
 			if err := r.github.ResolveReviewThread(ctx, ResolveReviewThreadInput{Repo: input.Repo, ThreadID: thread.ID, CWD: input.Project.RepoPath}); err != nil {
-				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableTransient}
+				return checkpoint, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableTransient}
 			}
 			result.Resolved++
 			resolved = true
@@ -2382,8 +2352,8 @@ func (r *Runner) runThreadResolutionStep(ctx context.Context, input stepInput) (
 }
 
 func markThreadResolutionRediscoveryOnRefreshError(checkpoint reviewerCheckpoint, err error) reviewerCheckpoint {
-	var typed *loopError
-	if errors.As(err, &typed) && typed.kind == FailureRetryableAfterResume && strings.Contains(typed.message, "PR changed during thread reconciliation") {
+	var typed *runpipe.LoopError
+	if errors.As(err, &typed) && typed.Kind == runpipe.FailureRetryableAfterResume && strings.Contains(typed.Message, "PR changed during thread reconciliation") {
 		checkpoint.ResumePolicy = loops.ResumePolicyRestartFromDiscover
 	}
 	return checkpoint
@@ -2418,17 +2388,17 @@ func (r *Runner) hasThreadResolutionFollowUpCandidate(ctx context.Context, cwd, 
 func (r *Runner) refreshThreadResolutionCandidate(ctx context.Context, input stepInput, headSHA, currentLogin string, policy config.ReviewerThreadResolutionConfig, threadID string, limit int) (*ReviewThread, PullRequestDetail, error) {
 	detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
 	if err != nil {
-		return nil, PullRequestDetail{}, &loopError{message: err.Error(), kind: FailureRetryableTransient}
+		return nil, PullRequestDetail{}, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableTransient}
 	}
 	if normalizePRState(detail.State) != "open" || detail.HeadSHA != headSHA {
-		return nil, PullRequestDetail{}, &loopError{message: "PR changed during thread reconciliation", kind: FailureRetryableAfterResume}
+		return nil, PullRequestDetail{}, &runpipe.LoopError{Message: "PR changed during thread reconciliation", Kind: runpipe.FailureRetryableAfterResume}
 	}
 	if policy.RequireCurrentReviewRequest && reviewRequestsKnownAbsent(detail.ReviewRequests, currentLogin) {
 		return nil, detail, nil
 	}
 	latest, err := r.github.ListReviewThreads(ctx, ListReviewThreadsInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath, Limit: limit})
 	if err != nil {
-		return nil, detail, &loopError{message: err.Error(), kind: FailureRetryableTransient}
+		return nil, detail, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableTransient}
 	}
 	for i := range latest {
 		if latest[i].ID == threadID {
@@ -2443,7 +2413,7 @@ func (r *Runner) refreshThreadResolutionCandidate(ctx context.Context, input ste
 
 func (r *Runner) classifyReviewThreads(ctx context.Context, input stepInput, checkpoint reviewerCheckpoint, threads []ReviewThread) ([]threadResolutionAgentDecision, error) {
 	if r.agentExecutor == nil {
-		return nil, &loopError{message: "reviewer agent executor is not configured", kind: FailureRetryableTransient}
+		return nil, &runpipe.LoopError{Message: "reviewer agent executor is not configured", Kind: runpipe.FailureRetryableTransient}
 	}
 	worktree, err := requireWorktree(checkpoint)
 	if err != nil {
@@ -2489,7 +2459,7 @@ func (r *Runner) classifyReviewThreads(ctx context.Context, input stepInput, che
 	if result.Status != "completed" {
 		message := reviewerAgentFailureMessage("thread resolution", result, "thread resolution classifier failed")
 		r.markAgentExecutionNativeResumePendingForTransientProvider(ctx, executionID, message)
-		return nil, &loopError{message: message, kind: FailureRetryableTransient}
+		return nil, &runpipe.LoopError{Message: message, Kind: runpipe.FailureRetryableTransient}
 	}
 	parsed, err := resolution.ParseOutput(result.Stdout)
 	if err == nil {
@@ -2497,9 +2467,9 @@ func (r *Runner) classifyReviewThreads(ctx context.Context, input stepInput, che
 	}
 	if message := transientProviderMessageFromAgentResult(result); message != "" {
 		r.markAgentExecutionNativeResumePendingForTransientProvider(ctx, executionID, message)
-		return nil, &loopError{message: message, kind: FailureRetryableTransient}
+		return nil, &runpipe.LoopError{Message: message, Kind: runpipe.FailureRetryableTransient}
 	}
-	return nil, &loopError{message: err.Error(), kind: FailureNonRetryable}
+	return nil, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureNonRetryable}
 }
 
 type reviewerHeadChangeMonitor struct {
@@ -2586,7 +2556,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		return next, err
 	}
 	if checkpoint.Snapshot == nil {
-		return checkpoint, &loopError{message: "Missing PR snapshot checkpoint for review step", kind: FailureRetryableTransient}
+		return checkpoint, &runpipe.LoopError{Message: "Missing PR snapshot checkpoint for review step", Kind: runpipe.FailureRetryableTransient}
 	}
 	if reviewerWorktreePrepared(checkpoint) {
 		worktreeRoot, rootErr := reviewerWorktreeRoot(input.Project)
@@ -2644,11 +2614,11 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		metadata[key] = value
 	}
 	if freshDetail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath}); err != nil {
-		return checkpoint, &loopError{message: fmt.Sprintf("Failed to refresh pull request before starting reviewer agent: %v", err), kind: FailureRetryableAfterResume}
+		return checkpoint, &runpipe.LoopError{Message: fmt.Sprintf("Failed to refresh pull request before starting reviewer agent: %v", err), Kind: runpipe.FailureRetryableAfterResume}
 	} else {
 		checkpoint.Detail.Labels = cloneStrings(freshDetail.Labels)
 		if domain.IsAutomaticLoopHeld(domain.LoopTypeReviewer, isManualReviewerLoop(input.Loop), freshDetail.Labels) {
-			return checkpoint, &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
+			return checkpoint, &runpipe.HoldSkipError{Summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
 		}
 	}
 	useSnap, snapVendor, snapModel := agentRunSnapshotFields(agentVendor, agentModel, useSnapshot)
@@ -2680,7 +2650,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		}
 		checkpoint.PendingReview = nil
 		checkpoint.ResumePolicy = loops.ResumePolicyRestartFromDiscover
-		return checkpoint, &loopError{message: headChange.Reason, kind: FailureRetryableAfterResume, interrupted: true}
+		return checkpoint, &runpipe.LoopError{Message: headChange.Reason, Kind: runpipe.FailureRetryableAfterResume, Interrupted: true}
 	}
 	if err != nil {
 		r.appendReviewerAgentEvent(ctx, input, "reviewer.agent.failed", "review", executionID, reviewerAgentWaitErrorPayload(err, r.now().Sub(agentStartedAt)))
@@ -2695,7 +2665,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 			return markReviewerRunStale(checkpoint, reason), nil
 		}
 		if found, err := r.verifyAgentNativeReviewMarker(ctx, input, checkpoint.Snapshot.HeadSHA, idempotencyKey, cleanReviewAuthorLogin(checkpoint, PullRequestDetail{})); err != nil {
-			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+			return checkpoint, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
 		} else if found.Found {
 			checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, Outcome: normalizeCommentOnlyOutcome(found.Outcome), ContentFingerprint: reviewMarkerFingerprint(found)}
 			checkpoint.ResumePolicy = loops.ResumePolicyAdvanceFromCheckpoint
@@ -2705,20 +2675,20 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 			return markReviewerRunStale(checkpoint, reason), nil
 		}
 		message := reviewerAgentFailureMessage("review", result, fmt.Sprintf("Reviewer agent %s", result.Status))
-		kind := FailureRetryableTransient
+		kind := runpipe.FailureRetryableTransient
 		if isGitHubSelfApprovalFailure(message) {
-			kind = FailureNonRetryable
+			kind = runpipe.FailureNonRetryable
 		} else if agent.IsAgentSetupFailureMessage(message) {
-			kind = FailureRetryableTransient
+			kind = runpipe.FailureRetryableTransient
 		}
-		if kind == FailureRetryableTransient {
+		if kind == runpipe.FailureRetryableTransient {
 			r.markAgentExecutionNativeResumePendingForTransientProvider(ctx, executionID, message)
 		}
-		return checkpoint, &loopError{message: message, kind: kind}
+		return checkpoint, &runpipe.LoopError{Message: message, Kind: kind}
 	}
 	if result.ParseStatus != "parsed" {
 		if found, err := r.verifyAgentNativeReviewMarker(ctx, input, checkpoint.Snapshot.HeadSHA, idempotencyKey, cleanReviewAuthorLogin(checkpoint, PullRequestDetail{})); err != nil {
-			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+			return checkpoint, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
 		} else if found.Found {
 			checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, Outcome: normalizeCommentOnlyOutcome(found.Outcome), ContentFingerprint: reviewMarkerFingerprint(found)}
 			checkpoint.ResumePolicy = loops.ResumePolicyAdvanceFromCheckpoint
@@ -2732,11 +2702,11 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		}
 		if message := transientProviderMessageFromAgentResult(result); message != "" {
 			r.markAgentExecutionNativeResumePendingForTransientProvider(ctx, executionID, message)
-			return checkpoint, &loopError{message: message, kind: FailureRetryableTransient}
+			return checkpoint, &runpipe.LoopError{Message: message, Kind: runpipe.FailureRetryableTransient}
 		}
 		checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, Outcome: normalizeCommentOnlyOutcome(reviewCompletionOutcome(result)), MarkerVerificationMisses: 1}
 		checkpoint.ResumePolicy = loops.ResumePolicyAdvanceFromCheckpoint
-		return checkpoint, &loopError{message: "Reviewer agent did not report a valid completion marker after publishing review", kind: FailureRetryableAfterResume}
+		return checkpoint, &runpipe.LoopError{Message: "Reviewer agent did not report a valid completion marker after publishing review", Kind: runpipe.FailureRetryableAfterResume}
 	}
 	if cleanReviewNoopSummary(result.Summary) {
 		if reviewEvents.Clean == config.ReviewerReviewEventApprove && r.reviewerAutoMergeConfigForProject(input.Project.ID).Enabled && resolvePullRequestPhase(detailLabels(checkpoint.Detail)) != "spec" {
@@ -2746,16 +2716,16 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		}
 		if reviewEvents.Clean == config.ReviewerReviewEventApprove {
 			if found, err := r.verifyAgentNativeReviewMarker(ctx, input, checkpoint.Snapshot.HeadSHA, idempotencyKey, cleanReviewAuthorLogin(checkpoint, PullRequestDetail{})); err != nil {
-				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+				return checkpoint, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
 			} else if cleanReviewMarkerSatisfiesCleanPolicy(found, cleanReviewAuthorLogin(checkpoint, PullRequestDetail{})) {
 				if err := validateCleanApprovedReviewMarkerBody(found, cleanReviewAuthorLogin(checkpoint, PullRequestDetail{})); err != nil {
-					return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+					return checkpoint, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
 				}
 				checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, Outcome: "clean", ContentFingerprint: reviewMarkerFingerprint(found), CleanNoop: true}
 				checkpoint.ResumePolicy = loops.ResumePolicyAdvanceFromCheckpoint
 				return checkpoint, nil
 			}
-			return checkpoint, &loopError{message: "Reviewer agent reported a clean summary-only result, but clean review policy requires an APPROVED review marker; submit the APPROVE review through the trusted review-submit capability or exit non-zero", kind: FailureRetryableAfterResume}
+			return checkpoint, &runpipe.LoopError{Message: "Reviewer agent reported a clean summary-only result, but clean review policy requires an APPROVED review marker; submit the APPROVE review through the trusted review-submit capability or exit non-zero", Kind: runpipe.FailureRetryableAfterResume}
 		}
 		checkpoint.PendingReview = &pendingReviewCheckpoint{HeadSHA: checkpoint.Snapshot.HeadSHA, IdempotencyKey: idempotencyKey, Event: reviewEventAgentNative, Summary: result.Summary, Outcome: "clean", CleanNoop: true}
 		checkpoint.ResumePolicy = loops.ResumePolicyAdvanceFromCheckpoint
@@ -2772,7 +2742,7 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 		return checkpoint, nil
 	}
 	if checkpoint.PendingReview == nil {
-		return checkpoint, &loopError{message: "Missing pending review checkpoint for publish step", kind: FailureRetryableAfterResume}
+		return checkpoint, &runpipe.LoopError{Message: "Missing pending review checkpoint for publish step", Kind: runpipe.FailureRetryableAfterResume}
 	}
 	pending := *checkpoint.PendingReview
 	if handled, err := r.handleConvergenceHumanAnswer(ctx, input, &checkpoint); handled || err != nil {
@@ -2789,13 +2759,13 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 			if checkpoint, skipped, skipErr := r.skipMissingPullRequest(ctx, input, checkpoint, err); skipped || skipErr != nil {
 				return checkpoint, skipErr
 			}
-			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+			return checkpoint, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
 		}
 		if detail.HeadSHA != "" && pending.HeadSHA != "" && detail.HeadSHA != pending.HeadSHA {
 			return markReviewerRunStale(checkpoint, fmt.Sprintf("PR head changed before publish: expected %s, got %s", pending.HeadSHA, detail.HeadSHA)), nil
 		}
 		if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeld(domain.LoopTypeReviewer, detail.Labels) {
-			return checkpoint, &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
+			return checkpoint, &runpipe.HoldSkipError{Summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
 		}
 		if reason := reviewerPublishDriftReason(input, checkpoint, detail); reason != "" {
 			return markReviewerRunStale(checkpoint, reason), nil
@@ -2805,7 +2775,7 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 		if requireReviewRequest {
 			currentLogin, err := r.github.GetCurrentUserLogin(ctx, input.Repo, input.Project.RepoPath)
 			if err != nil {
-				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+				return checkpoint, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
 			}
 			if reviewRequestsKnownAbsent(detail.ReviewRequests, normalizeLogin(currentLogin)) {
 				checkpoint.SkipReason = fmt.Sprintf("Skipped pull request %s#%d because current user is not requested for review", input.Repo, input.PRNumber)
@@ -2813,7 +2783,7 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 			}
 		}
 		if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeld(domain.LoopTypeReviewer, detail.Labels) {
-			return checkpoint, &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
+			return checkpoint, &runpipe.HoldSkipError{Summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
 		}
 		if criteriaResult, err := r.maybePublishCriteriaAnchoredCleanReview(ctx, input, checkpoint, pending, detail); err != nil {
 			return checkpoint, err
@@ -2827,13 +2797,13 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 		if reviewEvents.Clean == config.ReviewerReviewEventApprove {
 			found, err := r.verifyAgentNativeReviewMarker(ctx, input, pending.HeadSHA, pending.IdempotencyKey, cleanReviewAuthorLogin(checkpoint, detail))
 			if err != nil {
-				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+				return checkpoint, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
 			}
 			if !cleanReviewMarkerSatisfiesCleanPolicy(found, cleanReviewAuthorLogin(checkpoint, detail)) {
-				return checkpoint, &loopError{message: "Reviewer agent reported a clean summary-only result, but clean review policy requires an APPROVED review marker or a self-authored clean COMMENT fallback with a valid human approval body; submit the APPROVE review through the trusted review-submit capability or exit non-zero", kind: FailureRetryableAfterResume}
+				return checkpoint, &runpipe.LoopError{Message: "Reviewer agent reported a clean summary-only result, but clean review policy requires an APPROVED review marker or a self-authored clean COMMENT fallback with a valid human approval body; submit the APPROVE review through the trusted review-submit capability or exit non-zero", Kind: runpipe.FailureRetryableAfterResume}
 			}
 			if err := validateCleanApprovedReviewMarkerBody(found, cleanReviewAuthorLogin(checkpoint, detail)); err != nil {
-				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+				return checkpoint, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
 			}
 			checkpoint.PendingReview = pending.clone()
 			if checkpoint.PendingReview.ContentFingerprint == "" {
@@ -2870,13 +2840,13 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 		if checkpoint, skipped, skipErr := r.skipMissingPullRequest(ctx, input, checkpoint, err); skipped || skipErr != nil {
 			return checkpoint, skipErr
 		}
-		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+		return checkpoint, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
 	}
 	if detail.HeadSHA != "" && pending.HeadSHA != "" && detail.HeadSHA != pending.HeadSHA {
 		return markReviewerRunStale(checkpoint, fmt.Sprintf("PR head changed before publish: expected %s, got %s", pending.HeadSHA, detail.HeadSHA)), nil
 	}
 	if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeld(domain.LoopTypeReviewer, detail.Labels) {
-		return checkpoint, &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
+		return checkpoint, &runpipe.HoldSkipError{Summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
 	}
 	if reason := reviewerPublishDriftReason(input, checkpoint, detail); reason != "" {
 		return markReviewerRunStale(checkpoint, reason), nil
@@ -2886,19 +2856,19 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 		return next, err
 	}
 	if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeld(domain.LoopTypeReviewer, detail.Labels) {
-		return checkpoint, &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
+		return checkpoint, &runpipe.HoldSkipError{Summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
 	}
 	markerResult := ReviewMarkerResult{}
 	if pending.Event == reviewEventAgentNative {
 		found, err := r.verifyAgentNativeReviewMarker(ctx, input, pending.HeadSHA, pending.IdempotencyKey, cleanReviewAuthorLogin(checkpoint, detail))
 		if err != nil {
-			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+			return checkpoint, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
 		}
 		markerResult = found
 	} else {
 		checkpoint.PendingReview = nil
 		checkpoint.ResumePolicy = workflow.ResumePolicyRerunReview
-		return checkpoint, &loopError{message: "Legacy pending review checkpoint cannot be verified; rerunning review before marking publish success", kind: FailureRetryableAfterResume}
+		return checkpoint, &runpipe.LoopError{Message: "Legacy pending review checkpoint cannot be verified; rerunning review before marking publish success", Kind: runpipe.FailureRetryableAfterResume}
 	}
 	policy := r.discoveryPolicyForProject(input.Project.ID)
 	requireReviewRequest := requireReviewRequestForLoop(input.Loop, reviewRequestRequiredForCandidate(policy, detail.Labels), pending.HeadSHA)
@@ -2917,7 +2887,7 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 		}
 		currentLogin, err := r.github.GetCurrentUserLogin(ctx, repo, input.Project.RepoPath)
 		if err != nil {
-			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+			return checkpoint, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
 		}
 		if reviewRequestsKnownAbsent(detail.ReviewRequests, normalizeLogin(currentLogin)) {
 			checkpoint.SkipReason = fmt.Sprintf("Skipped pull request %s#%d because current user is not requested for review", repo, prNumber)
@@ -2942,19 +2912,19 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 			pending.MarkerVerificationMisses = 1
 			checkpoint.PendingReview = pending.clone()
 			checkpoint.ResumePolicy = loops.ResumePolicyAdvanceFromCheckpoint
-			return checkpoint, &loopError{message: message + "; retrying marker verification before rerunning review", kind: FailureRetryableAfterResume}
+			return checkpoint, &runpipe.LoopError{Message: message + "; retrying marker verification before rerunning review", Kind: runpipe.FailureRetryableAfterResume}
 		}
 		checkpoint.PendingReview = nil
 		checkpoint.ResumePolicy = workflow.ResumePolicyRerunReview
-		return checkpoint, &loopError{message: message, kind: FailureRetryableAfterResume}
+		return checkpoint, &runpipe.LoopError{Message: message, Kind: runpipe.FailureRetryableAfterResume}
 	}
 	reviewPolicy := r.effectiveReviewEvents(input.Project.ID, input.Loop.MetadataJSON)
 	if cleanReviewNoopSummary(pending.Summary) && reviewPolicy.Clean == config.ReviewerReviewEventApprove && !cleanReviewMarkerSatisfiesCleanPolicy(markerResult, cleanReviewAuthorLogin(checkpoint, detail)) {
-		return checkpoint, &loopError{message: "Reviewer agent reported a clean summary-only result, but clean review policy requires an APPROVED review marker or a self-authored clean COMMENT fallback with a valid human approval body; submit the APPROVE review through the trusted review-submit capability or exit non-zero", kind: FailureRetryableAfterResume}
+		return checkpoint, &runpipe.LoopError{Message: "Reviewer agent reported a clean summary-only result, but clean review policy requires an APPROVED review marker or a self-authored clean COMMENT fallback with a valid human approval body; submit the APPROVE review through the trusted review-submit capability or exit non-zero", Kind: runpipe.FailureRetryableAfterResume}
 	}
 	if cleanApprovedReviewMarker(markerResult) || (reviewPolicy.Clean == config.ReviewerReviewEventApprove && cleanReviewMarkerSatisfiesCleanPolicy(markerResult, cleanReviewAuthorLogin(checkpoint, detail))) {
 		if err := validateCleanApprovedReviewMarkerBody(markerResult, cleanReviewAuthorLogin(checkpoint, detail)); err != nil {
-			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+			return checkpoint, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
 		}
 	}
 	checkpoint.PendingReview = pending.clone()
@@ -2972,25 +2942,25 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 	return checkpoint, nil
 }
 
-func (r *Runner) finishHeldReviewerQueueItem(ctx context.Context, loop storage.LoopRecord, run *storage.RunRecord, queueItem storage.QueueItemRecord, checkpoint reviewerCheckpoint, summary string) (ProcessResult, error) {
+func (r *Runner) finishHeldReviewerQueueItem(ctx context.Context, loop storage.LoopRecord, run *storage.RunRecord, queueItem storage.QueueItemRecord, checkpoint reviewerCheckpoint, summary string) (runpipe.ProcessResult, error) {
 	checkpoint.SkipReason = summary
 	checkpoint.ResumePolicy = loops.ResumePolicyAdvanceFromCheckpoint
 	if run != nil {
 		if _, err := r.completeRun(ctx, *run, "success", summary, "", checkpoint); err != nil {
-			return ProcessResult{}, err
+			return runpipe.ProcessResult{}, err
 		}
 	}
 	if err := r.repos.Queue.Complete(ctx, queueItem.ID, r.nowISO()); err != nil && !errors.Is(err, storage.ErrQueueItemNotActive) {
-		return ProcessResult{}, err
+		return runpipe.ProcessResult{}, err
 	}
 	if _, err := r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
 		updated.Status = "queued"
-		updated.LastRunAt = stringPtr(r.nowISO())
+		updated.LastRunAt = runpipe.StringPtr(r.nowISO())
 		updated.NextRunAt = nil
 	}); err != nil {
-		return ProcessResult{}, err
+		return runpipe.ProcessResult{}, err
 	}
-	result := ProcessResult{LoopID: loop.ID, QueueItemID: queueItem.ID, Status: "skipped", Summary: summary}
+	result := runpipe.ProcessResult{LoopID: loop.ID, QueueItemID: queueItem.ID, Status: "skipped", Summary: summary}
 	if run != nil {
 		result.RunID = run.ID
 	}
@@ -3009,7 +2979,7 @@ func (r *Runner) skipThreadResolutionFollowUpReview(ctx context.Context, input s
 	if currentLogin == "" {
 		lookupLogin, err := r.github.GetCurrentUserLogin(ctx, input.Repo, input.Project.RepoPath)
 		if err != nil {
-			return false, checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+			return false, checkpoint, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
 		}
 		currentLogin = normalizeLogin(lookupLogin)
 		checkpoint.Detail.CurrentLogin = currentLogin
@@ -3211,21 +3181,21 @@ func durationSeconds(duration time.Duration) int64 {
 
 func (r *Runner) applyVerifiedReviewSideEffects(ctx context.Context, input stepInput, checkpoint reviewerCheckpoint, detail PullRequestDetail, marker ReviewMarkerResult) error {
 	if !marker.Found {
-		return &loopError{message: "Cannot apply review side effects without a verified review marker", kind: FailureRetryableAfterResume}
+		return &runpipe.LoopError{Message: "Cannot apply review side effects without a verified review marker", Kind: runpipe.FailureRetryableAfterResume}
 	}
 	freshDetail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
 	if err != nil {
-		return &loopError{message: fmt.Sprintf("Failed to refresh pull request before applying review side effects: %v", err), kind: FailureRetryableAfterResume}
+		return &runpipe.LoopError{Message: fmt.Sprintf("Failed to refresh pull request before applying review side effects: %v", err), Kind: runpipe.FailureRetryableAfterResume}
 	}
 	if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeld(domain.LoopTypeReviewer, freshDetail.Labels) {
-		return &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
+		return &runpipe.HoldSkipError{Summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
 	}
 	outcome := strings.ToLower(strings.TrimSpace(marker.Outcome))
 	reaction := PullRequestReactionInput{Repo: input.Repo, PRNumber: input.PRNumber, Content: "+1", CWD: input.Project.RepoPath}
 	switch outcome {
 	case "clean":
 		if err := r.github.AddPullRequestReaction(ctx, reaction); err != nil {
-			return &loopError{message: fmt.Sprintf("Failed to add clean-review reaction before marking publish success: %v", err), kind: FailureRetryableAfterResume}
+			return &runpipe.LoopError{Message: fmt.Sprintf("Failed to add clean-review reaction before marking publish success: %v", err), Kind: runpipe.FailureRetryableAfterResume}
 		}
 		policy := r.effectiveReviewEvents(input.Project.ID, input.Loop.MetadataJSON)
 		shouldTransitionSpecLabels := cleanSpecLabelTransitionAllowed(policy, marker.Event, outcome)
@@ -3234,10 +3204,10 @@ func (r *Runner) applyVerifiedReviewSideEffects(ctx context.Context, input stepI
 		}
 	case "actionable", "non_blocking", "blocking":
 		if err := r.github.RemovePullRequestReaction(ctx, reaction); err != nil {
-			return &loopError{message: fmt.Sprintf("Failed to remove stale clean-review reaction before marking publish success: %v", err), kind: FailureRetryableAfterResume}
+			return &runpipe.LoopError{Message: fmt.Sprintf("Failed to remove stale clean-review reaction before marking publish success: %v", err), Kind: runpipe.FailureRetryableAfterResume}
 		}
 	default:
-		return &loopError{message: "Verified review marker is missing outcome=clean|non_blocking|blocking|actionable; cannot validate review side effects", kind: FailureRetryableAfterResume}
+		return &runpipe.LoopError{Message: "Verified review marker is missing outcome=clean|non_blocking|blocking|actionable; cannot validate review side effects", Kind: runpipe.FailureRetryableAfterResume}
 	}
 	return nil
 }
@@ -3245,14 +3215,14 @@ func (r *Runner) applyVerifiedReviewSideEffects(ctx context.Context, input stepI
 func (r *Runner) applyCleanNoopReviewSideEffects(ctx context.Context, input stepInput, checkpoint reviewerCheckpoint, detail PullRequestDetail) error {
 	freshDetail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
 	if err != nil {
-		return &loopError{message: fmt.Sprintf("Failed to refresh pull request before applying clean review side effects: %v", err), kind: FailureRetryableAfterResume}
+		return &runpipe.LoopError{Message: fmt.Sprintf("Failed to refresh pull request before applying clean review side effects: %v", err), Kind: runpipe.FailureRetryableAfterResume}
 	}
 	if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeld(domain.LoopTypeReviewer, freshDetail.Labels) {
-		return &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
+		return &runpipe.HoldSkipError{Summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
 	}
 	reaction := PullRequestReactionInput{Repo: input.Repo, PRNumber: input.PRNumber, Content: "+1", CWD: input.Project.RepoPath}
 	if err := r.github.AddPullRequestReaction(ctx, reaction); err != nil {
-		return &loopError{message: fmt.Sprintf("Failed to add clean-review reaction before marking publish success: %v", err), kind: FailureRetryableAfterResume}
+		return &runpipe.LoopError{Message: fmt.Sprintf("Failed to add clean-review reaction before marking publish success: %v", err), Kind: runpipe.FailureRetryableAfterResume}
 	}
 	policy := r.effectiveReviewEvents(input.Project.ID, input.Loop.MetadataJSON)
 	shouldTransitionSpecLabels := cleanSpecLabelTransitionAllowed(policy, cleanReviewEventForPolicy(policy), "clean")
@@ -3281,25 +3251,25 @@ func (r *Runner) applyCleanSpecLabelTransition(ctx context.Context, input stepIn
 	}
 	freshDetail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
 	if err != nil {
-		return &loopError{message: fmt.Sprintf("Failed to refresh pull request review state before spec-ready transition: %v", err), kind: FailureRetryableAfterResume}
+		return &runpipe.LoopError{Message: fmt.Sprintf("Failed to refresh pull request review state before spec-ready transition: %v", err), Kind: runpipe.FailureRetryableAfterResume}
 	}
 	if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeld(domain.LoopTypeReviewer, freshDetail.Labels) {
-		return &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
+		return &runpipe.HoldSkipError{Summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
 	}
 	if detail.HeadSHA != "" && freshDetail.HeadSHA != "" && detail.HeadSHA != freshDetail.HeadSHA {
-		return &loopError{message: fmt.Sprintf("PR head changed before spec-ready transition: expected %s, got %s", detail.HeadSHA, freshDetail.HeadSHA), kind: FailureRetryableAfterResume}
+		return &runpipe.LoopError{Message: fmt.Sprintf("PR head changed before spec-ready transition: expected %s, got %s", detail.HeadSHA, freshDetail.HeadSHA), Kind: runpipe.FailureRetryableAfterResume}
 	}
 	if !specpr.IsReviewClean(freshDetail.ReviewDecision, freshDetail.Comments) {
 		return nil
 	}
 	if labels.Has(freshDetail.Labels, specReviewingLabel) {
 		if err := r.github.RemovePullRequestLabels(ctx, PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: []string{specReviewingLabel}, CWD: input.Project.RepoPath}); err != nil {
-			return &loopError{message: fmt.Sprintf("Failed to remove spec-reviewing label before marking publish success: %v", err), kind: FailureRetryableAfterResume}
+			return &runpipe.LoopError{Message: fmt.Sprintf("Failed to remove spec-reviewing label before marking publish success: %v", err), Kind: runpipe.FailureRetryableAfterResume}
 		}
 	}
 	if !labels.Has(freshDetail.Labels, labels.SpecReady) {
 		if err := r.github.AddPullRequestLabels(ctx, PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: []string{labels.SpecReady}, CWD: input.Project.RepoPath}); err != nil {
-			return &loopError{message: fmt.Sprintf("Failed to add spec-ready label before marking publish success: %v", err), kind: FailureRetryableAfterResume}
+			return &runpipe.LoopError{Message: fmt.Sprintf("Failed to add spec-ready label before marking publish success: %v", err), Kind: runpipe.FailureRetryableAfterResume}
 		}
 	}
 	return nil
@@ -3308,10 +3278,10 @@ func (r *Runner) applyCleanSpecLabelTransition(ctx context.Context, input stepIn
 func (r *Runner) reviewerPublishFreshDetailForMutation(ctx context.Context, input stepInput, action string) (PullRequestDetail, error) {
 	freshDetail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.Project.RepoPath})
 	if err != nil {
-		return PullRequestDetail{}, &loopError{message: fmt.Sprintf("Failed to refresh pull request before %s: %v", action, err), kind: FailureRetryableAfterResume}
+		return PullRequestDetail{}, &runpipe.LoopError{Message: fmt.Sprintf("Failed to refresh pull request before %s: %v", action, err), Kind: runpipe.FailureRetryableAfterResume}
 	}
 	if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeld(domain.LoopTypeReviewer, freshDetail.Labels) {
-		return PullRequestDetail{}, &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
+		return PullRequestDetail{}, &runpipe.HoldSkipError{Summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
 	}
 	return freshDetail, nil
 }
@@ -3352,7 +3322,7 @@ func (r *Runner) maybePublishCriteriaAnchoredCleanReview(ctx context.Context, in
 	}
 	verification, err := r.verifyAcceptanceCriteria(criteriaVerificationDiff(checkpoint, detail), extracted)
 	if err != nil {
-		return nil, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+		return nil, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
 	}
 	if verification.Disposition != criteria.DispositionPass {
 		return r.publishCriteriaFailureReview(ctx, input, detail, pending, issueRef, issue, verification)
@@ -3400,7 +3370,7 @@ func (r *Runner) publishCriteriaApprovedReview(ctx context.Context, input stepIn
 			return nil, err
 		}
 		if err := r.github.EnableAutoMerge(ctx, githubinfra.EnableAutoMergeInput{Repo: input.Repo, PRNumber: input.PRNumber, Strategy: decision.Strategy, HeadSHA: pending.HeadSHA, CWD: input.Project.RepoPath}); err != nil && !isAlreadyEnabledAutoMergeError(err) {
-			return nil, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+			return nil, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
 		}
 		return &criteriaPublishResult{reviewEvent: marker.Event, marker: marker}, nil
 	}
@@ -3421,16 +3391,16 @@ func (r *Runner) publishCriteriaFailureReview(ctx context.Context, input stepInp
 	}
 	freshIssue, err := r.github.ViewIssue(ctx, githubinfra.ViewIssueInput{Repo: issueRef.Repo, IssueNumber: issueRef.Number, CWD: input.Project.RepoPath})
 	if err != nil {
-		return nil, &loopError{message: fmt.Sprintf("Failed to refresh linked issue before applying criteria failure side effects: %v", err), kind: FailureRetryableAfterResume}
+		return nil, &runpipe.LoopError{Message: fmt.Sprintf("Failed to refresh linked issue before applying criteria failure side effects: %v", err), Kind: runpipe.FailureRetryableAfterResume}
 	}
 	if !isManualReviewerLoop(input.Loop) && domain.IsAutoLaneHeld(domain.LoopTypeReviewer, freshIssue.Labels) {
-		return nil, &holdSkipError{summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", issueRef.Repo, issueRef.Number)}
+		return nil, &runpipe.HoldSkipError{Summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", issueRef.Repo, issueRef.Number)}
 	}
 	if err := r.github.RemoveIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: issueRef.Repo, IssueNumber: issueRef.Number, Labels: criteriaFailureLabels(freshIssue.Labels), CWD: input.Project.RepoPath}); err != nil {
-		return nil, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+		return nil, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
 	}
 	if err := r.github.RemovePullRequestReaction(ctx, PullRequestReactionInput{Repo: input.Repo, PRNumber: input.PRNumber, Content: "+1", CWD: input.Project.RepoPath}); err != nil {
-		return nil, &loopError{message: fmt.Sprintf("Failed to remove stale clean-review reaction before marking publish success: %v", err), kind: FailureRetryableAfterResume}
+		return nil, &runpipe.LoopError{Message: fmt.Sprintf("Failed to remove stale clean-review reaction before marking publish success: %v", err), Kind: runpipe.FailureRetryableAfterResume}
 	}
 	return &criteriaPublishResult{reviewEvent: ReviewEventComment, marker: marker}, nil
 }
@@ -3442,7 +3412,7 @@ func (r *Runner) resolveLinkedIssueForCriteria(ctx context.Context, input stepIn
 			if linkedIssueLookupUnavailable(err) {
 				return linkedIssueReference{}, githubinfra.IssueDetail{}, false, nil
 			}
-			return linkedIssueReference{}, githubinfra.IssueDetail{}, false, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+			return linkedIssueReference{}, githubinfra.IssueDetail{}, false, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
 		}
 		if issue.IsPullRequest {
 			return linkedIssueReference{}, githubinfra.IssueDetail{}, false, nil
@@ -3484,13 +3454,13 @@ func (r *Runner) decideAutoMerge(ctx context.Context, input stepInput, detail Pu
 	}
 	settings, err := r.github.GetRepositorySettings(ctx, githubinfra.RepositorySettingsInput{Repo: input.Repo, CWD: input.Project.RepoPath})
 	if err != nil {
-		return automerge.AutoMergeDecision{}, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+		return automerge.AutoMergeDecision{}, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
 	}
 	protection := githubinfra.BranchProtection{}
 	if autoMergeCfg.RequireBranchProtection {
 		protection, err = r.github.GetBranchProtection(ctx, githubinfra.BranchProtectionInput{Repo: input.Repo, Branch: firstNonEmpty(detail.BaseRefName, "main"), CWD: input.Project.RepoPath})
 		if err != nil {
-			return automerge.AutoMergeDecision{}, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+			return automerge.AutoMergeDecision{}, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
 		}
 	}
 	return automerge.Decide(
@@ -3505,12 +3475,12 @@ func (r *Runner) submitOrReuseReview(ctx context.Context, input stepInput, detai
 	body = appendReviewMarker(body, agentNativeReviewMarker(input.Loop.ID, pending.HeadSHA, pending.IdempotencyKey), outcome)
 	currentLogin, err := r.github.GetCurrentUserLogin(ctx, input.Repo, input.Project.RepoPath)
 	if err != nil {
-		return ReviewMarkerResult{}, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+		return ReviewMarkerResult{}, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
 	}
 	selfApprovalFallback := event == ReviewEventApprove && sameReviewAuthorLogin(detail.Author, currentLogin)
 	found, err := r.verifyAgentNativeReviewMarker(ctx, input, pending.HeadSHA, pending.IdempotencyKey, cleanReviewAuthorLogin(reviewerCheckpoint{Detail: checkpointDetailFromDetail(detail)}, detail))
 	if err != nil {
-		return ReviewMarkerResult{}, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+		return ReviewMarkerResult{}, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
 	}
 	if found.Found && strings.EqualFold(strings.TrimSpace(found.Outcome), strings.TrimSpace(outcome)) && (found.Event == event || (selfApprovalFallback && found.Event == ReviewEventComment)) {
 		return found, nil
@@ -3524,14 +3494,14 @@ func (r *Runner) submitOrReuseReview(ctx context.Context, input stepInput, detai
 	}
 	disclosureAgent, disclosureModel := r.disclosureIdentity(input.Run)
 	if err := r.github.SubmitReview(ctx, githubinfra.SubmitReviewInput{Repo: input.Repo, PRNumber: input.PRNumber, Event: string(submitEvent), Body: body, CommitID: pending.HeadSHA, Disclosure: r.disclosure, DisclosureAgent: disclosureAgent, DisclosureModel: disclosureModel, CWD: input.Project.RepoPath}); err != nil {
-		return ReviewMarkerResult{}, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+		return ReviewMarkerResult{}, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
 	}
 	marker, err := r.verifyAgentNativeReviewMarker(ctx, input, pending.HeadSHA, pending.IdempotencyKey, cleanReviewAuthorLogin(reviewerCheckpoint{Detail: checkpointDetailFromDetail(detail)}, detail))
 	if err != nil {
-		return ReviewMarkerResult{}, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+		return ReviewMarkerResult{}, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
 	}
 	if !marker.Found || !strings.EqualFold(strings.TrimSpace(marker.Outcome), strings.TrimSpace(outcome)) || (marker.Event != submitEvent && !(submitEvent == ReviewEventComment && event == ReviewEventApprove && sameReviewAuthorLogin(detail.Author, currentLogin))) {
-		return ReviewMarkerResult{}, &loopError{message: fmt.Sprintf("Reviewer submitted %s review for outcome=%s but could not verify the idempotency marker", submitEvent, outcome), kind: FailureRetryableAfterResume}
+		return ReviewMarkerResult{}, &runpipe.LoopError{Message: fmt.Sprintf("Reviewer submitted %s review for outcome=%s but could not verify the idempotency marker", submitEvent, outcome), Kind: runpipe.FailureRetryableAfterResume}
 	}
 	return marker, nil
 }
@@ -3558,7 +3528,7 @@ func (r *Runner) postStampedPRCommentIfMissing(ctx context.Context, input stepIn
 	body := stampIssueComment(r.disclosure, visible+"\n\n"+marker, "reviewer")
 	disclosureAgent, disclosureModel := r.disclosureIdentity(input.Run)
 	if _, err := r.github.CreateIssueComment(ctx, IssueCommentInput{Repo: input.Repo, IssueNumber: input.PRNumber, Body: body, CWD: input.Project.RepoPath, DisclosureAgent: disclosureAgent, DisclosureModel: disclosureModel}); err != nil {
-		return &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+		return &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
 	}
 	return nil
 }
@@ -3892,7 +3862,7 @@ func (r *Runner) recordPublishedReviewProgress(ctx context.Context, input stepIn
 			mergeErr = err
 			return
 		}
-		updated.MetadataJSON = stringPtr(metadataJSON)
+		updated.MetadataJSON = runpipe.StringPtr(metadataJSON)
 	}); err != nil {
 		return err
 	}
@@ -3932,7 +3902,7 @@ func (r *Runner) appendEventChecked(ctx context.Context, input eventInput) error
 	if r.repos == nil || r.repos.Events == nil {
 		return nil
 	}
-	return eventlog.Append(ctx, r.repos, eventlog.AppendInput{EventType: input.eventType, ProjectID: optionalString(input.projectID), LoopID: optionalString(input.loopID), RunID: optionalString(input.runID), EntityType: optionalString(input.entityType), EntityID: optionalString(input.entityID), ActorType: optionalString("system"), ActorID: optionalString("reviewer-loop"), ActorDisplayName: optionalString("reviewer-loop"), Payload: input.payload, CreatedAt: r.now()})
+	return eventlog.Append(ctx, r.repos, eventlog.AppendInput{EventType: input.eventType, ProjectID: runpipe.OptionalString(input.projectID), LoopID: runpipe.OptionalString(input.loopID), RunID: runpipe.OptionalString(input.runID), EntityType: runpipe.OptionalString(input.entityType), EntityID: runpipe.OptionalString(input.entityID), ActorType: runpipe.OptionalString("system"), ActorID: runpipe.OptionalString("reviewer-loop"), ActorDisplayName: runpipe.OptionalString("reviewer-loop"), Payload: input.payload, CreatedAt: r.now()})
 }
 
 func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) (resumedRunContext, error) {
@@ -3979,7 +3949,7 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 		// reacquisition fails and this reviewer never claims the checkout.
 	}
 	nowISO := r.nowISO()
-	run := storage.RunRecord{ID: eventlog.NewEventID("run"), LoopID: loop.ID, Status: "running", CurrentStep: stringPtr(string(startStep)), CheckpointJSON: stringPtr(mustMarshalJSON(initialCheckpoint)), StartedAt: nowISO, LastHeartbeatAt: stringPtr(nowISO), CreatedAt: nowISO, UpdatedAt: nowISO}
+	run := storage.RunRecord{ID: eventlog.NewEventID("run"), LoopID: loop.ID, Status: "running", CurrentStep: runpipe.StringPtr(string(startStep)), CheckpointJSON: runpipe.StringPtr(runpipe.MustMarshalJSON(initialCheckpoint)), StartedAt: nowISO, LastHeartbeatAt: runpipe.StringPtr(nowISO), CreatedAt: nowISO, UpdatedAt: nowISO}
 	snapshotJSON, err := r.agentSnapshotJSONForNewRun(latestRun, plan.StickySnapshot, false, false)
 	if err != nil {
 		return resumedRunContext{}, err
@@ -3989,7 +3959,7 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 	}
 	run.AgentSnapshotJSON = snapshotJSON
 	if plan.CarryLastCompletedStep {
-		run.LastCompletedStep = stringPtr(string(lastCompleted))
+		run.LastCompletedStep = runpipe.StringPtr(string(lastCompleted))
 	}
 	if err := r.repos.Runs.Upsert(ctx, run); err != nil {
 		return resumedRunContext{}, err
@@ -3998,58 +3968,16 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 }
 
 func (r *Runner) persistStepStarted(ctx context.Context, run storage.RunRecord, step ReviewerStep, checkpoint reviewerCheckpoint) (storage.RunRecord, error) {
-	updated := run
-	nowISO := r.nowISO()
-	updated.CurrentStep = stringPtr(string(step))
-	encoded := mustMarshalJSON(checkpoint)
-	updated.CheckpointJSON = &encoded
-	updated.LastHeartbeatAt = &nowISO
-	updated.UpdatedAt = nowISO
-	if err := r.repos.Runs.Upsert(ctx, updated); err != nil {
-		return storage.RunRecord{}, err
-	}
-	return updated, nil
+	return runpipe.PersistStepStarted(ctx, r.repos, r.nowISO(), run, string(step), checkpoint)
 }
 
 func (r *Runner) persistStepCompleted(ctx context.Context, run storage.RunRecord, step ReviewerStep, checkpoint reviewerCheckpoint) (storage.RunRecord, error) {
-	updated := run
-	nowISO := r.nowISO()
 	next := workflow.Next(step)
-	if next != "" {
-		updated.CurrentStep = stringPtr(string(next))
-	} else {
-		updated.CurrentStep = nil
-	}
-	updated.LastCompletedStep = stringPtr(string(step))
-	encoded := mustMarshalJSON(checkpoint)
-	updated.CheckpointJSON = &encoded
-	updated.LastHeartbeatAt = &nowISO
-	updated.UpdatedAt = nowISO
-	if err := r.repos.Runs.Upsert(ctx, updated); err != nil {
-		return storage.RunRecord{}, err
-	}
-	return updated, nil
+	return runpipe.PersistStepCompleted(ctx, r.repos, r.nowISO(), run, string(step), string(next), checkpoint)
 }
 
 func (r *Runner) completeRun(ctx context.Context, run storage.RunRecord, status, summary, errorMessage string, checkpoint reviewerCheckpoint) (storage.RunRecord, error) {
-	updated := run
-	endedAt := r.nowISO()
-	updated.Status = status
-	if summary != "" {
-		updated.Summary = stringPtr(summary)
-	}
-	if errorMessage != "" {
-		updated.ErrorMessage = stringPtr(errorMessage)
-	}
-	encoded := mustMarshalJSON(checkpoint)
-	updated.CheckpointJSON = &encoded
-	updated.EndedAt = &endedAt
-	updated.LastHeartbeatAt = &endedAt
-	updated.UpdatedAt = endedAt
-	if err := r.repos.Runs.Upsert(ctx, updated); err != nil {
-		return storage.RunRecord{}, err
-	}
-	return updated, nil
+	return runpipe.CompleteRun(ctx, r.repos, r.nowISO(), run, status, summary, errorMessage, checkpoint)
 }
 
 func (r *Runner) persistCheckpoint(ctx context.Context, runID string, step ReviewerStep, checkpoint reviewerCheckpoint) error {
@@ -4195,7 +4123,7 @@ func (r *Runner) recoverFailedReviewerLoop(ctx context.Context, loop storage.Loo
 
 		updated := *current
 		updated.Status = "queued"
-		updated.NextRunAt = stringPtr(nowISO)
+		updated.NextRunAt = runpipe.StringPtr(nowISO)
 		meta := parseJSONObject(updated.MetadataJSON)
 		loopMeta := reviewerLoopMetadata(meta)
 		loopMeta["status"] = "active"
@@ -4339,7 +4267,7 @@ func (r *Runner) failedReviewerLoopRecoveryEligibility(ctx context.Context, loop
 		}
 		return hasApprovedReviewByAuthorForHead(reviews, currentLogin, headSHA), nil
 	}
-	if queueKind == string(FailureRetryableAfterResume) && (resumePolicy == loops.ResumePolicyRestartFromDiscover || resumePolicy == workflow.ResumePolicyRerunReview) {
+	if queueKind == string(runpipe.FailureRetryableAfterResume) && (resumePolicy == loops.ResumePolicyRestartFromDiscover || resumePolicy == workflow.ResumePolicyRerunReview) {
 		approved, err := approvedByCurrentUser()
 		if err != nil {
 			return false, "", "", err
@@ -4387,7 +4315,7 @@ func (r *Runner) failedReviewerLoopRecoveryEligibility(ctx context.Context, loop
 }
 
 func isRetryableTransientWithRemainingAttempts(queue storage.QueueItemRecord) bool {
-	if derefString(queue.LastErrorKind) != string(FailureRetryableTransient) {
+	if derefString(queue.LastErrorKind) != string(runpipe.FailureRetryableTransient) {
 		return false
 	}
 	return queueHasRemainingAttempts(queue)
@@ -4614,18 +4542,18 @@ func buildReviewerDedupeKey(projectID, loopID, repo string, prNumber int64) stri
 	return fmt.Sprintf("reviewer:%s:%s:%s:%d", projectID, loopID, repo, prNumber)
 }
 
-func (r *Runner) failQueueItem(ctx context.Context, queueItem storage.QueueItemRecord, kind QueueFailureKind, message string) (*storage.QueueItemRecord, error) {
+func (r *Runner) failQueueItem(ctx context.Context, queueItem storage.QueueItemRecord, kind runpipe.QueueFailureKind, message string) (*storage.QueueItemRecord, error) {
 	nextAttempts := queueItem.Attempts + 1
 	nowISO := r.nowISO()
-	if !shouldRetryQueueFailure(kind, nextAttempts, queueItem.MaxAttempts) {
-		if err := r.repos.Queue.Fail(ctx, storage.QueueFailInput{ID: queueItem.ID, Attempts: nextAttempts, FinishedAt: nowISO, ErrorMessage: optionalString(message), ErrorKind: string(kind), UpdatedAt: nowISO}); err != nil {
+	if !runpipe.ShouldRetryQueueFailure(kind, nextAttempts, queueItem.MaxAttempts) {
+		if err := r.repos.Queue.Fail(ctx, storage.QueueFailInput{ID: queueItem.ID, Attempts: nextAttempts, FinishedAt: nowISO, ErrorMessage: runpipe.OptionalString(message), ErrorKind: string(kind), UpdatedAt: nowISO}); err != nil {
 			return nil, err
 		}
 		return r.repos.Queue.GetByID(ctx, queueItem.ID)
 	}
-	delay := backoffDelay(r.retryBaseDelay, cappedRetryDelayAttempt(nextAttempts, queueItem.MaxAttempts), r.retryMaxDelayForProject(derefString(queueItem.ProjectID)))
+	delay := backoffDelay(r.retryBaseDelay, runpipe.CappedRetryDelayAttempt(nextAttempts, queueItem.MaxAttempts), r.retryMaxDelayForProject(derefString(queueItem.ProjectID)))
 	retryAt := eventlog.FormatJavaScriptISOString(r.now().Add(delay))
-	if err := r.repos.Queue.MarkRetry(ctx, storage.QueueMarkRetryInput{ID: queueItem.ID, AvailableAt: retryAt, Attempts: nextAttempts, ErrorMessage: optionalString(message), ErrorKind: string(kind), UpdatedAt: nowISO}); err != nil {
+	if err := r.repos.Queue.MarkRetry(ctx, storage.QueueMarkRetryInput{ID: queueItem.ID, AvailableAt: retryAt, Attempts: nextAttempts, ErrorMessage: runpipe.OptionalString(message), ErrorKind: string(kind), UpdatedAt: nowISO}); err != nil {
 		return nil, err
 	}
 	updated, err := r.repos.Queue.GetByID(ctx, queueItem.ID)
@@ -4633,16 +4561,6 @@ func (r *Runner) failQueueItem(ctx context.Context, queueItem storage.QueueItemR
 		return nil, err
 	}
 	return updated, nil
-}
-
-func cappedRetryDelayAttempt(attempts, maxAttempts int64) int64 {
-	if attempts <= 0 {
-		return 1
-	}
-	if maxAttempts > 0 && attempts > maxAttempts {
-		return maxAttempts
-	}
-	return attempts
 }
 
 func (r *Runner) updateLoop(ctx context.Context, loop storage.LoopRecord, mutate func(*storage.LoopRecord)) (storage.LoopRecord, error) {
@@ -4671,33 +4589,33 @@ func (r *Runner) updateLoop(ctx context.Context, loop storage.LoopRecord, mutate
 	return updated, nil
 }
 
-func (r *Runner) classifyFailureForProject(projectID string, err error) *loopError {
+func (r *Runner) classifyFailureForProject(projectID string, err error) *runpipe.LoopError {
 	return r.classifyFailureForProjectAndBoundary(projectID, err, failureclass.BoundaryUnknown)
 }
 
-func (r *Runner) classifyFailureForProjectAndBoundary(projectID string, err error, boundary failureclass.Boundary) *loopError {
-	var typed *loopError
+func (r *Runner) classifyFailureForProjectAndBoundary(projectID string, err error, boundary failureclass.Boundary) *runpipe.LoopError {
+	var typed *runpipe.LoopError
 	if errors.As(err, &typed) {
 		return typed
 	}
 	var remoteHeadChanged *gitinfra.RemoteHeadChangedError
 	if errors.As(err, &remoteHeadChanged) {
-		return &loopError{message: remoteHeadChanged.Error(), kind: FailureRetryableAfterResume}
+		return &runpipe.LoopError{Message: remoteHeadChanged.Error(), Kind: runpipe.FailureRetryableAfterResume}
 	}
 	var transient transientFailure
 	if errors.As(err, &transient) && transient.Temporary() {
-		return &loopError{message: err.Error(), kind: FailureRetryableTransient}
+		return &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableTransient}
 	}
 	if githubinfra.IsTransientError(err) {
-		return &loopError{message: githubinfra.ErrorMessage(err), kind: FailureRetryableTransient}
+		return &runpipe.LoopError{Message: githubinfra.ErrorMessage(err), Kind: runpipe.FailureRetryableTransient}
 	}
 	if isTransientModelProviderError(err) {
-		return &loopError{message: err.Error(), kind: FailureRetryableTransient}
+		return &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableTransient}
 	}
 	if r.isEnhancedTransientFailureForPolicy(r.retryPolicyForProject(projectID), err) {
-		return &loopError{message: githubinfra.ErrorMessage(err), kind: FailureRetryableTransient}
+		return &runpipe.LoopError{Message: githubinfra.ErrorMessage(err), Kind: runpipe.FailureRetryableTransient}
 	}
-	return &loopError{message: err.Error(), kind: reviewerFailureKind(failureclass.Classify(err, failureclass.Context{Runner: failureclass.RunnerReviewer, Boundary: boundary}))}
+	return &runpipe.LoopError{Message: err.Error(), Kind: reviewerFailureKind(failureclass.Classify(err, failureclass.Context{Runner: failureclass.RunnerReviewer, Boundary: boundary}))}
 }
 
 func reviewerFailureBoundaryForStep(step ReviewerStep) failureclass.Boundary {
@@ -4713,16 +4631,16 @@ func reviewerFailureBoundaryForStep(step ReviewerStep) failureclass.Boundary {
 	}
 }
 
-func reviewerFailureKind(kind failureclass.Kind) QueueFailureKind {
+func reviewerFailureKind(kind failureclass.Kind) runpipe.QueueFailureKind {
 	switch kind {
 	case failureclass.RetryableTransient:
-		return FailureRetryableTransient
+		return runpipe.FailureRetryableTransient
 	case failureclass.RetryableAfterResume:
-		return FailureRetryableAfterResume
+		return runpipe.FailureRetryableAfterResume
 	case failureclass.ManualIntervention:
-		return FailureManualIntervention
+		return runpipe.FailureManualIntervention
 	default:
-		return FailureNonRetryable
+		return runpipe.FailureNonRetryable
 	}
 }
 
@@ -4737,9 +4655,9 @@ func (r *Runner) isTransientExternalFailureForProject(projectID string, err erro
 	if r.isEnhancedTransientFailureForPolicy(retryPolicy, err) {
 		return true
 	}
-	var loopErr *loopError
+	var loopErr *runpipe.LoopError
 	if errors.As(err, &loopErr) {
-		return loopErr.kind == FailureRetryableTransient && (isTransientModelProviderMessage(loopErr.message) || r.isEnhancedTransientMessageForPolicy(retryPolicy, loopErr.message))
+		return loopErr.Kind == runpipe.FailureRetryableTransient && (isTransientModelProviderMessage(loopErr.Message) || r.isEnhancedTransientMessageForPolicy(retryPolicy, loopErr.Message))
 	}
 	return false
 }
@@ -4770,9 +4688,9 @@ func (r *Runner) markAgentExecutionNativeResumePendingForTransientProvider(ctx c
 	if record.NativeResumeStatus != nil && *record.NativeResumeStatus == "pending" {
 		return true
 	}
-	record.NativeResumeMode = stringPtr("native_resume")
-	record.NativeResumeStatus = stringPtr("pending")
-	record.NativeResumeError = stringPtr(strings.TrimSpace(message))
+	record.NativeResumeMode = runpipe.StringPtr("native_resume")
+	record.NativeResumeStatus = runpipe.StringPtr("pending")
+	record.NativeResumeError = runpipe.StringPtr(strings.TrimSpace(message))
 	record.UpdatedAt = r.nowISO()
 	if err := r.repos.AgentExecutions.Upsert(ctx, *record); err != nil {
 		r.logWarn("reviewer native resume source mark failed", map[string]any{"executionId": executionID, "error": err.Error()})
@@ -4819,10 +4737,10 @@ func (r *Runner) markAgentExecutionNativeResumePendingForHeadChange(ctx context.
 		r.logWarn("reviewer native resume head-change metadata marshal failed", map[string]any{"executionId": executionID, "error": err.Error()})
 		return false
 	}
-	record.MetadataJSON = stringPtr(string(metadataJSON))
-	record.NativeResumeMode = stringPtr("native_resume")
-	record.NativeResumeStatus = stringPtr("pending")
-	record.NativeResumeError = stringPtr(strings.TrimSpace(signal.Reason))
+	record.MetadataJSON = runpipe.StringPtr(string(metadataJSON))
+	record.NativeResumeMode = runpipe.StringPtr("native_resume")
+	record.NativeResumeStatus = runpipe.StringPtr("pending")
+	record.NativeResumeError = runpipe.StringPtr(strings.TrimSpace(signal.Reason))
 	record.UpdatedAt = r.nowISO()
 	if err := r.repos.AgentExecutions.Upsert(ctx, *record); err != nil {
 		r.logWarn("reviewer native resume head-change source mark failed", map[string]any{"executionId": executionID, "error": err.Error()})
@@ -4884,9 +4802,9 @@ func isTransientModelProviderOverloadFailure(err error) bool {
 	if err == nil || githubinfra.IsTransientError(err) {
 		return false
 	}
-	var loopErr *loopError
+	var loopErr *runpipe.LoopError
 	if errors.As(err, &loopErr) {
-		return loopErr.kind == FailureRetryableTransient && isTransientModelProviderOverloadMessage(loopErr.message)
+		return loopErr.Kind == runpipe.FailureRetryableTransient && isTransientModelProviderOverloadMessage(loopErr.Message)
 	}
 	return isTransientModelProviderOverloadMessage(err.Error())
 }
@@ -6248,7 +6166,7 @@ func queueResultIsTerminalForCleanup(queue *storage.QueueItemRecord) bool {
 
 func requireWorktree(checkpoint reviewerCheckpoint) (*checkpointWorktree, error) {
 	if checkpoint.Worktree == nil {
-		return nil, &loopError{message: "Missing reviewer worktree checkpoint for review step", kind: FailureRetryableTransient}
+		return nil, &runpipe.LoopError{Message: "Missing reviewer worktree checkpoint for review step", Kind: runpipe.FailureRetryableTransient}
 	}
 	return checkpoint.Worktree, nil
 }
@@ -6308,7 +6226,7 @@ func (p pendingReviewCheckpoint) clone() *pendingReviewCheckpoint {
 
 func backoffDelay(base time.Duration, attempts int64, maxDelay time.Duration) time.Duration {
 	if maxDelay <= 0 {
-		maxDelay = maxRetryDelay
+		maxDelay = runpipe.MaxRetryDelay
 	}
 	delay := base
 	for i := int64(1); i < attempts; i++ {
@@ -6325,7 +6243,7 @@ func backoffDelay(base time.Duration, attempts int64, maxDelay time.Duration) ti
 
 func retryDelay(base time.Duration, attempts int64, err error, maxDelay time.Duration) time.Duration {
 	if maxDelay <= 0 {
-		maxDelay = maxRetryDelay
+		maxDelay = runpipe.MaxRetryDelay
 	}
 	if delay, ok := retryAfterDelay(err); ok {
 		if delay > maxDelay {
@@ -6338,7 +6256,7 @@ func retryDelay(base time.Duration, attempts int64, err error, maxDelay time.Dur
 
 func jitterDelay(delay time.Duration, maxDelay time.Duration) time.Duration {
 	if maxDelay <= 0 {
-		maxDelay = maxRetryDelay
+		maxDelay = runpipe.MaxRetryDelay
 	}
 	if delay <= 0 || delay >= maxDelay {
 		return delay
@@ -6454,10 +6372,6 @@ func sleepWithContext(ctx context.Context, delay time.Duration) error {
 // purpose — whether it actually retries is decided by the attempt bound in
 // shouldRetryQueueFailure, not here. The name says "eligible" rather than
 // "retryable" for exactly that reason.
-func isQueueRetryEligible(kind QueueFailureKind) bool {
-	return kind == FailureRetryableTransient || kind == FailureRetryableAfterResume || kind == FailureNonRetryable
-}
-
 // shouldRetryQueueFailure applies the two-tier retry rule from #508.
 //
 // With an infinite bound (scheduler.retryMaxAttempts = -1, the default)
@@ -6471,16 +6385,6 @@ func isQueueRetryEligible(kind QueueFailureKind) bool {
 // The asymmetry looks like an oversight and is not. Reintroducing the kind
 // check in the bounded branch breaks TestShouldRetryQueueFailureRespectsMaxAttempts
 // here and in the fixer, planner and worker copies.
-func shouldRetryQueueFailure(kind QueueFailureKind, nextAttempts, maxAttempts int64) bool {
-	if !isQueueRetryEligible(kind) {
-		return false
-	}
-	if maxAttempts < 0 {
-		return kind != FailureNonRetryable
-	}
-	return maxAttempts > 0 && nextAttempts < maxAttempts
-}
-
 func cloneStrings(values []string) []string {
 	if values == nil {
 		return nil
@@ -6514,14 +6418,6 @@ func cloneObjectSlice(values []map[string]any) []map[string]any {
 	return cloned
 }
 
-func mustMarshalJSON(value any) string {
-	encoded, err := json.Marshal(value)
-	if err != nil {
-		return "{}"
-	}
-	return string(encoded)
-}
-
 func stringFromAny(value any) (string, bool) {
 	text, ok := value.(string)
 	if !ok || strings.TrimSpace(text) == "" {
@@ -6537,13 +6433,6 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
-}
-
-func optionalString(value string) *string {
-	if value == "" {
-		return nil
-	}
-	return &value
 }
 
 func (r *Runner) agentSnapshotJSONForNewRun(previous *storage.RunRecord, sticky, requireToolNetworkDenial, replaysAgentStep bool) (*string, error) {
@@ -6602,8 +6491,6 @@ func agentRunSnapshotFields(vendor string, model *string, useSnapshot bool) (boo
 	// distinct from unset and ParamsForRoleVendor can strip params --model/-m.
 	return true, vendor, model
 }
-
-func stringPtr(value string) *string { return &value }
 
 func cloneStringPtr(value *string) *string {
 	if value == nil {

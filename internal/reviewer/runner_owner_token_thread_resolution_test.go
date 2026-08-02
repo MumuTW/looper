@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/MumuTW/looper/internal/loops/runpipe"
 	"github.com/MumuTW/looper/internal/storage"
 	"github.com/MumuTW/looper/internal/worktreesafety"
 )
@@ -46,7 +47,7 @@ func TestProcessClaimedItemThreadResolutionResumeRePreparesWhenFixerMarkerPresen
 	projectMeta := fmt.Sprintf(`{"worktreeRoot":%q}`, wtRoot)
 	if err := fixture.repos.Projects.Upsert(ctx, storage.ProjectRecord{
 		ID: projectID, Name: "Looper", RepoPath: filepath.Join(t.TempDir(), "repo"),
-		BaseBranch: stringPtr("main"), MetadataJSON: &projectMeta, CreatedAt: nowISO, UpdatedAt: nowISO,
+		BaseBranch: runpipe.StringPtr("main"), MetadataJSON: &projectMeta, CreatedAt: nowISO, UpdatedAt: nowISO,
 	}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
@@ -60,7 +61,7 @@ func TestProcessClaimedItemThreadResolutionResumeRePreparesWhenFixerMarkerPresen
 	}
 	// Failed during thread_resolution after a successful prepare. PreparedAt remains
 	// set; createRunContext resumes at stepThreadResolution without clearing it.
-	checkpointJSON := mustMarshalJSON(reviewerCheckpoint{
+	checkpointJSON := runpipe.MustMarshalJSON(reviewerCheckpoint{
 		Detail:   &checkpointDetail{Title: "Review me", State: "OPEN", HeadSHA: "abc123", BaseRefName: "main", ReviewRequests: []string{"octocat"}},
 		Snapshot: &checkpointSnapshot{HeadSHA: "abc123"},
 		Worktree: &checkpointWorktree{Path: wtPath, Branch: "pr-42-head", BaseBranch: "main", PreparedAt: nowISO},
@@ -74,7 +75,7 @@ func TestProcessClaimedItemThreadResolutionResumeRePreparesWhenFixerMarkerPresen
 	})
 	if err := fixture.repos.Runs.Upsert(ctx, storage.RunRecord{
 		ID: "run_failed_thread_resolution", LoopID: loopID, Status: "failed",
-		CurrentStep: stringPtr(string(stepThreadResolution)), LastCompletedStep: stringPtr(string(stepWorktree)),
+		CurrentStep: runpipe.StringPtr(string(stepThreadResolution)), LastCompletedStep: runpipe.StringPtr(string(stepWorktree)),
 		CheckpointJSON: &checkpointJSON, StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO,
 	}); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)

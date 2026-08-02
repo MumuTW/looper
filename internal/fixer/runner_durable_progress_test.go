@@ -3,6 +3,7 @@ package fixer
 import (
 	"testing"
 
+	"github.com/MumuTW/looper/internal/loops/runpipe"
 	"github.com/MumuTW/looper/internal/storage"
 )
 
@@ -137,8 +138,8 @@ func TestDeriveRunOutcomeReconstructsHistoricalProgress(t *testing.T) {
 		`"push":{"pushed":true,"pushedAt":"` + after + `"}}`
 	run := storage.RunRecord{
 		ID: "run_1", LoopID: "loop_1", Status: "failed",
-		CurrentStep: stringPtr(string(stepResolveComments)), CheckpointJSON: stringPtr(checkpointJSON),
-		ErrorMessage: stringPtr("resolve failed"),
+		CurrentStep: runpipe.StringPtr(string(stepResolveComments)), CheckpointJSON: runpipe.StringPtr(checkpointJSON),
+		ErrorMessage: runpipe.StringPtr("resolve failed"),
 	}
 
 	got := DeriveRunOutcome(run)

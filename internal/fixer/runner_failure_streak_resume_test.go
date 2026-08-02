@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/MumuTW/looper/internal/loops/runpipe"
 	"github.com/MumuTW/looper/internal/storage"
 )
 
@@ -40,7 +41,7 @@ func TestChangedFailureStateRestartsReplacementRunFromDiscover(t *testing.T) {
 	fixture := newRunnerFixture(t)
 	nowISO := fixture.nowISO()
 	oldStateHash := "old-fix-items-state"
-	metadata := mustMarshalJSON(map[string]any{
+	metadata := runpipe.MustMarshalJSON(map[string]any{
 		"pauseReason": failureStreakPauseReason,
 		"fixerFailureStreak": failureStreakState{
 			LastRunID:         "run-stale-checkpoint",
@@ -65,8 +66,8 @@ func TestChangedFailureStateRestartsReplacementRunFromDiscover(t *testing.T) {
 		FixItems:     []FixItem{{Type: "comment", ID: "old-comment", ThreadID: "old-thread", ThreadFingerprint: "old-fingerprint"}},
 		Repair:       &checkpointRepair{ParseStatus: "parsed", Summary: "old repair"},
 	}
-	checkpointJSON := mustMarshalJSON(staleCheckpoint)
-	failedRun := storage.RunRecord{ID: "run-stale-checkpoint", LoopID: loop.ID, Status: "failed", CurrentStep: stringPtr(string(stepRepair)), LastCompletedStep: stringPtr(string(stepCollectFixes)), CheckpointJSON: &checkpointJSON, StartedAt: nowISO, EndedAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
+	checkpointJSON := runpipe.MustMarshalJSON(staleCheckpoint)
+	failedRun := storage.RunRecord{ID: "run-stale-checkpoint", LoopID: loop.ID, Status: "failed", CurrentStep: runpipe.StringPtr(string(stepRepair)), LastCompletedStep: runpipe.StringPtr(string(stepCollectFixes)), CheckpointJSON: &checkpointJSON, StartedAt: nowISO, EndedAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
 	if err := fixture.repos.Runs.Upsert(context.Background(), failedRun); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
@@ -98,7 +99,7 @@ func TestChangedFailureStateRestartsReplacementRunFromDiscover(t *testing.T) {
 func TestFailureStreakUsesDiscoveryStateBeforeFilteredCheckpoint(t *testing.T) {
 	t.Parallel()
 	discoveryStateHash := "all-discovery-fix-items"
-	payload := mustMarshalJSON(map[string]any{"fixItemsStateHash": discoveryStateHash})
+	payload := runpipe.MustMarshalJSON(map[string]any{"fixItemsStateHash": discoveryStateHash})
 	queue := storage.QueueItemRecord{PayloadJSON: &payload}
 	checkpoint := fixerCheckpoint{FixItems: []FixItem{{Type: "comment", ID: "remaining-comment", ThreadID: "remaining-thread", ThreadFingerprint: "remaining-fingerprint"}}}
 

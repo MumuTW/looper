@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	gitinfra "github.com/MumuTW/looper/internal/infra/git"
+	"github.com/MumuTW/looper/internal/loops/runpipe"
 	"github.com/MumuTW/looper/internal/storage"
 	"github.com/MumuTW/looper/internal/worktreesafety"
 )
@@ -119,12 +120,12 @@ func assertPrepareDirtyManualIntervention(t *testing.T, checkpoint fixerCheckpoi
 	if err == nil {
 		t.Fatal("runPrepareWorktreeStep() error = nil, want manual intervention")
 	}
-	var loopErr *loopError
+	var loopErr *runpipe.LoopError
 	if !errors.As(err, &loopErr) {
-		t.Fatalf("error = %T, want *loopError", err)
+		t.Fatalf("error = %T, want *runpipe.LoopError", err)
 	}
-	if loopErr.kind != FailureManualIntervention {
-		t.Fatalf("loopErr.kind = %v, want %v", loopErr.kind, FailureManualIntervention)
+	if loopErr.Kind != runpipe.FailureManualIntervention {
+		t.Fatalf("loopErr.Kind = %v, want %v", loopErr.Kind, runpipe.FailureManualIntervention)
 	}
 	if checkpoint.ResumePolicy != "manual_intervention" {
 		t.Fatalf("checkpoint.ResumePolicy = %q, want manual_intervention", checkpoint.ResumePolicy)

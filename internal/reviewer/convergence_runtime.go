@@ -9,6 +9,7 @@ import (
 
 	"github.com/MumuTW/looper/internal/config"
 	"github.com/MumuTW/looper/internal/loops"
+	"github.com/MumuTW/looper/internal/loops/runpipe"
 	"github.com/MumuTW/looper/internal/reviewer/convergence"
 	"github.com/MumuTW/looper/internal/reviewitem"
 	"github.com/MumuTW/looper/internal/storage"
@@ -194,7 +195,7 @@ func (r *Runner) recordConvergenceProgress(ctx context.Context, input stepInput,
 			writeErr = marshalErr
 			return
 		}
-		updated.MetadataJSON = stringPtr(string(encoded))
+		updated.MetadataJSON = runpipe.StringPtr(string(encoded))
 	}); err != nil {
 		return err
 	}
@@ -259,7 +260,7 @@ func (r *Runner) handleConvergenceHumanAnswer(ctx context.Context, input stepInp
 			writeErr = err
 			return
 		}
-		currentJSON, err := loops.WriteHITLAsk(stringPtr(string(currentJSONBytes)), ask)
+		currentJSON, err := loops.WriteHITLAsk(runpipe.StringPtr(string(currentJSONBytes)), ask)
 		if err != nil {
 			writeErr = err
 			return
@@ -274,7 +275,7 @@ func (r *Runner) handleConvergenceHumanAnswer(ctx context.Context, input stepInp
 			writeErr = err
 			return
 		}
-		updated.MetadataJSON = stringPtr(string(encoded))
+		updated.MetadataJSON = runpipe.StringPtr(string(encoded))
 	}); err != nil {
 		return false, err
 	}
@@ -284,7 +285,7 @@ func (r *Runner) handleConvergenceHumanAnswer(ctx context.Context, input stepInp
 	return true, nil
 }
 
-func (r *Runner) suspendReviewerForConvergence(ctx context.Context, loop storage.LoopRecord, run storage.RunRecord, queue storage.QueueItemRecord, checkpoint reviewerCheckpoint, awaiting *reviewerConvergenceAwaitingHumanError) (ProcessResult, error) {
+func (r *Runner) suspendReviewerForConvergence(ctx context.Context, loop storage.LoopRecord, run storage.RunRecord, queue storage.QueueItemRecord, checkpoint reviewerCheckpoint, awaiting *reviewerConvergenceAwaitingHumanError) (runpipe.ProcessResult, error) {
 	decision := awaiting.Decision
 	question := fmt.Sprintf("Reviewer convergence escalated (%s). Continue the loop or close this PR review?", decision.Reason)
 	recommendation := fmt.Sprintf("round=%d, consecutive_unproductive=%d, open_items=%s", decision.State.TotalRounds, decision.State.ConsecutiveUnproductive, strings.Join(openConvergenceItemIDs(decision.State), ", "))
@@ -297,26 +298,26 @@ func (r *Runner) suspendReviewerForConvergence(ctx context.Context, loop storage
 			writeErr = err
 			return
 		}
-		updated.MetadataJSON = stringPtr(metadataJSON)
+		updated.MetadataJSON = runpipe.StringPtr(metadataJSON)
 		updated.Status = "awaiting_human"
-		updated.LastRunAt = stringPtr(r.nowISO())
+		updated.LastRunAt = runpipe.StringPtr(r.nowISO())
 		updated.NextRunAt = nil
 	}); err != nil {
-		return ProcessResult{}, err
+		return runpipe.ProcessResult{}, err
 	}
 	if writeErr != nil {
-		return ProcessResult{}, writeErr
+		return runpipe.ProcessResult{}, writeErr
 	}
 	reason := "reviewer convergence escalated"
 	if _, err := r.repos.Queue.CancelByLoop(ctx, loop.ID, r.nowISO(), &reason); err != nil {
-		return ProcessResult{}, err
+		return runpipe.ProcessResult{}, err
 	}
 	summary := "Awaiting human decision: " + question
 	if _, err := r.completeRun(ctx, run, "interrupted", summary, "", checkpoint); err != nil {
-		return ProcessResult{}, err
+		return runpipe.ProcessResult{}, err
 	}
 	r.appendEvent(ctx, eventInput{eventType: "reviewer.convergence.escalated", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "pull_request", entityID: fmt.Sprintf("%s#%d", derefString(loop.Repo), derefInt64(loop.PRNumber)), payload: map[string]any{"reason": string(decision.Reason), "round": decision.State.TotalRounds, "openItemIds": openConvergenceItemIDs(decision.State)}})
-	return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queue.ID, Status: "awaiting_human", Summary: summary}, nil
+	return runpipe.ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queue.ID, Status: "awaiting_human", Summary: summary}, nil
 }
 
 func openConvergenceItemIDs(state convergence.State) []string {

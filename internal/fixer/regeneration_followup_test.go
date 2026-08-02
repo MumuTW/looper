@@ -10,6 +10,7 @@ import (
 	"github.com/MumuTW/looper/internal/domain"
 	githubinfra "github.com/MumuTW/looper/internal/infra/github"
 	"github.com/MumuTW/looper/internal/labels"
+	"github.com/MumuTW/looper/internal/loops/runpipe"
 	"github.com/MumuTW/looper/internal/storage"
 )
 
@@ -37,7 +38,7 @@ func TestHandleTerminalExhaustionUsesDurableTerminalAttemptCount(t *testing.T) {
 	if err := fixture.repos.Queue.Upsert(context.Background(), queue); err != nil {
 		t.Fatalf("Queue.Upsert(running) error = %v", err)
 	}
-	if _, err := runner.failQueueItemTerminal(context.Background(), queue, FailureRetryableTransient, "failed", 3); err != nil {
+	if _, err := runner.failQueueItemTerminal(context.Background(), queue, runpipe.FailureRetryableTransient, "failed", 3); err != nil {
 		t.Fatalf("failQueueItemTerminal() error = %v", err)
 	}
 	persisted, err := fixture.repos.Queue.GetByID(context.Background(), queue.ID)
@@ -45,7 +46,7 @@ func TestHandleTerminalExhaustionUsesDurableTerminalAttemptCount(t *testing.T) {
 		t.Fatalf("durable terminal queue = %#v err=%v, want manual_intervention", persisted, err)
 	}
 	project, _ := fixture.repos.Projects.GetByID(context.Background(), "project_1")
-	_, action, err := runner.applyTerminalRegeneration(context.Background(), *project, loop, queue, fixerCheckpoint{}, &loopError{message: "failed", kind: FailureRetryableTransient})
+	_, action, err := runner.applyTerminalRegeneration(context.Background(), *project, loop, queue, fixerCheckpoint{}, &runpipe.LoopError{Message: "failed", Kind: runpipe.FailureRetryableTransient})
 	if err != nil || action != regenerationCompleted {
 		t.Fatalf("applyTerminalRegeneration() = action %q err %v", action, err)
 	}
@@ -79,7 +80,7 @@ func TestTerminalRegenerationReplayRequeuesAndClaimsAfterHandoffFailure(t *testi
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
 	project, _ := fixture.repos.Projects.GetByID(context.Background(), "project_1")
-	if _, _, err := runner.applyTerminalRegeneration(context.Background(), *project, loop, queue, fixerCheckpoint{}, &loopError{message: "failed", kind: FailureRetryableTransient}); err == nil {
+	if _, _, err := runner.applyTerminalRegeneration(context.Background(), *project, loop, queue, fixerCheckpoint{}, &runpipe.LoopError{Message: "failed", Kind: runpipe.FailureRetryableTransient}); err == nil {
 		t.Fatal("first applyTerminalRegeneration() error = nil, want route failure")
 	}
 	persistedQueue, err := fixture.repos.Queue.GetByID(context.Background(), queue.ID)
@@ -146,7 +147,7 @@ func TestEscalationCheckpointsCommentBeforeLabelRetry(t *testing.T) {
 	runner := newRegenerationRunner(t, fixture, gateway, func(_ context.Context, _ RegenerateIssueInput) error { return nil })
 	loop, queue := setupRegenerationRecords(t, fixture)
 	project, _ := fixture.repos.Projects.GetByID(context.Background(), "project_1")
-	if _, err := runner.handleTerminalExhaustion(context.Background(), *project, loop, queue, fixerCheckpoint{}, &loopError{message: "failed", kind: FailureRetryableTransient}); err == nil {
+	if _, err := runner.handleTerminalExhaustion(context.Background(), *project, loop, queue, fixerCheckpoint{}, &runpipe.LoopError{Message: "failed", Kind: runpipe.FailureRetryableTransient}); err == nil {
 		t.Fatal("handleTerminalExhaustion() error = nil, want label failure")
 	}
 	durable, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
@@ -157,7 +158,7 @@ func TestEscalationCheckpointsCommentBeforeLabelRetry(t *testing.T) {
 		t.Fatalf("comments=%d, want one before label retry", len(gateway.fakeGitHubGateway.createIssueComments))
 	}
 	gateway.prLabelErr = nil
-	if action, err := runner.handleTerminalExhaustion(context.Background(), *project, *durable, queue, fixerCheckpoint{}, &loopError{message: "failed", kind: FailureRetryableTransient}); err != nil || action != regenerationEscalated {
+	if action, err := runner.handleTerminalExhaustion(context.Background(), *project, *durable, queue, fixerCheckpoint{}, &runpipe.LoopError{Message: "failed", Kind: runpipe.FailureRetryableTransient}); err != nil || action != regenerationEscalated {
 		t.Fatalf("retry escalation = action %q err %v, want escalated", action, err)
 	}
 	if len(gateway.fakeGitHubGateway.createIssueComments) != 1 {
@@ -175,7 +176,7 @@ func TestRegenerationRefusesWhenPlannerUnavailable(t *testing.T) {
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: gateway, Now: fixture.now, Logger: fixture.logger, OnRegenerateIssue: func(context.Context, RegenerateIssueInput) error { return nil }, RegenerationAvailability: func(string) string { return "Planner agent is not configured" }})
 	loop, queue := setupRegenerationRecords(t, fixture)
 	project, _ := fixture.repos.Projects.GetByID(context.Background(), "project_1")
-	action, err := runner.handleTerminalExhaustion(context.Background(), *project, loop, queue, fixerCheckpoint{}, &loopError{message: "failed", kind: FailureRetryableTransient})
+	action, err := runner.handleTerminalExhaustion(context.Background(), *project, loop, queue, fixerCheckpoint{}, &runpipe.LoopError{Message: "failed", Kind: runpipe.FailureRetryableTransient})
 	if err != nil || action != regenerationEscalated {
 		t.Fatalf("planner unavailable = action %q err %v, want escalated", action, err)
 	}
@@ -196,7 +197,7 @@ func TestRegenerationAbortsWhenPullRequestMergesConcurrently(t *testing.T) {
 	runner := newRegenerationRunner(t, fixture, gateway, func(context.Context, RegenerateIssueInput) error { routes++; return nil })
 	loop, queue := setupRegenerationRecords(t, fixture)
 	project, _ := fixture.repos.Projects.GetByID(context.Background(), "project_1")
-	action, err := runner.handleTerminalExhaustion(context.Background(), *project, loop, queue, fixerCheckpoint{}, &loopError{message: "failed", kind: FailureRetryableTransient})
+	action, err := runner.handleTerminalExhaustion(context.Background(), *project, loop, queue, fixerCheckpoint{}, &runpipe.LoopError{Message: "failed", Kind: runpipe.FailureRetryableTransient})
 	if err != nil || action != regenerationEscalated {
 		t.Fatalf("merged concurrent = action %q err %v, want escalated", action, err)
 	}

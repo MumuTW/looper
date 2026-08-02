@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MumuTW/looper/internal/loops/runpipe"
 	"github.com/MumuTW/looper/internal/storage"
 )
 
@@ -19,7 +20,7 @@ func TestRecoveredPreStepBreakerFailureCleansPreparedWorktree(t *testing.T) {
 	loopID := "loop_recovered_pre_step_cleanup"
 	projectID := "project_1"
 	stateHash := "pre-step-failure-state"
-	metadata := mustMarshalJSON(map[string]any{
+	metadata := runpipe.MustMarshalJSON(map[string]any{
 		"fixerFailureStreak": failureStreakState{
 			LastRunID:         "run-pre-step-2",
 			FixItemsStateHash: stateHash,
@@ -33,7 +34,7 @@ func TestRecoveredPreStepBreakerFailureCleansPreparedWorktree(t *testing.T) {
 	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
-	payload := mustMarshalJSON(map[string]any{"fixItemsStateHash": stateHash})
+	payload := runpipe.MustMarshalJSON(map[string]any{"fixItemsStateHash": stateHash})
 	queue := storage.QueueItemRecord{ID: "queue_recovered_pre_step_cleanup", ProjectID: &projectID, LoopID: &loopID, Type: "fixer", TargetType: "pull_request", TargetID: loopTarget, Repo: &repo, PRNumber: &prNumber, Priority: storage.QueuePriorityFixer, Status: "running", AvailableAt: nowISO, Attempts: 2, MaxAttempts: -1, PayloadJSON: &payload, CreatedAt: nowISO, UpdatedAt: nowISO}
 	if err := fixture.repos.Queue.Upsert(context.Background(), queue); err != nil {
 		t.Fatalf("Queue.Upsert() error = %v", err)
@@ -41,9 +42,9 @@ func TestRecoveredPreStepBreakerFailureCleansPreparedWorktree(t *testing.T) {
 	git := &fakeGitGateway{}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, Logger: fixture.logger, Now: fixture.now})
 	checkpoint := fixerCheckpoint{Worktree: &checkpointWorktree{Path: filepath.Join(t.TempDir(), "wt-91"), Branch: "fix/pr-91", PreparedAt: nowISO}}
-	checkpointJSON := mustMarshalJSON(checkpoint)
+	checkpointJSON := runpipe.MustMarshalJSON(checkpoint)
 	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{
-		ID: "run-pre-step-3", LoopID: loopID, Status: "failed", CurrentStep: stringPtr(string(stepDiscoverPR)),
+		ID: "run-pre-step-3", LoopID: loopID, Status: "failed", CurrentStep: runpipe.StringPtr(string(stepDiscoverPR)),
 		CheckpointJSON: &checkpointJSON, StartedAt: nowISO, EndedAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO,
 	}); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
@@ -78,7 +79,7 @@ func TestInlineLateStepBreakerCleansAndImmediatelyQueuesPendingState(t *testing.
 	stateA := "failure-state-a"
 	stateB := "pending-state-b"
 	pending := pendingFixerRediscoveryState{HeadSHA: "head-b", FixItemsStateHash: stateB, UnresolvedThreadIDs: []string{"thread-b"}, RecordedAt: nowISO}
-	metadata := mustMarshalJSON(map[string]any{
+	metadata := runpipe.MustMarshalJSON(map[string]any{
 		"fixerFailureStreak":      failureStreakState{LastRunID: "run-inline-2", FixItemsStateHash: stateA, Step: string(stepValidate), ConsecutiveCount: 2, RecordedAt: nowISO},
 		"pendingFixerRediscovery": pending,
 	})
@@ -87,14 +88,14 @@ func TestInlineLateStepBreakerCleansAndImmediatelyQueuesPendingState(t *testing.
 	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
-	payloadA := mustMarshalJSON(map[string]any{"discoveryFingerprint": buildFixerDiscoveryFingerprint(repo, prNumber, "head-a", stateA), "fixItemsStateHash": stateA})
+	payloadA := runpipe.MustMarshalJSON(map[string]any{"discoveryFingerprint": buildFixerDiscoveryFingerprint(repo, prNumber, "head-a", stateA), "fixItemsStateHash": stateA})
 	queue := storage.QueueItemRecord{ID: "queue_inline_breaker_pending", ProjectID: &projectID, LoopID: &loopID, Type: "fixer", TargetType: "pull_request", TargetID: loopTarget, Repo: &repo, PRNumber: &prNumber, DedupeKey: buildFixerDedupeKey(projectID, loopID, repo, prNumber, "head-a", stateA), Priority: storage.QueuePriorityFixer, Status: "running", AvailableAt: nowISO, Attempts: 2, MaxAttempts: -1, PayloadJSON: &payloadA, CreatedAt: nowISO, UpdatedAt: nowISO}
 	if err := fixture.repos.Queue.Upsert(context.Background(), queue); err != nil {
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
 	checkpoint := fixerCheckpoint{ResumePolicy: "advance_from_checkpoint", Worktree: &checkpointWorktree{Path: filepath.Join(t.TempDir(), "wt-92"), Branch: "fix/pr-92", PreparedAt: nowISO}}
-	checkpointJSON := mustMarshalJSON(checkpoint)
-	failedRun := storage.RunRecord{ID: "run-inline-3", LoopID: loopID, Status: "failed", CurrentStep: stringPtr(string(stepValidate)), CheckpointJSON: &checkpointJSON, StartedAt: nowISO, EndedAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
+	checkpointJSON := runpipe.MustMarshalJSON(checkpoint)
+	failedRun := storage.RunRecord{ID: "run-inline-3", LoopID: loopID, Status: "failed", CurrentStep: runpipe.StringPtr(string(stepValidate)), CheckpointJSON: &checkpointJSON, StartedAt: nowISO, EndedAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
 	if err := fixture.repos.Runs.Upsert(context.Background(), failedRun); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
@@ -116,7 +117,7 @@ func TestInlineLateStepBreakerCleansAndImmediatelyQueuesPendingState(t *testing.
 		}
 	}})
 
-	failedQueue, breakerStreak, err := runner.failQueueItemWithBreaker(context.Background(), loop, queue, failedRun.ID, checkpoint, stepValidate, &loopError{message: "validation failed", kind: FailureRetryableTransient})
+	failedQueue, breakerStreak, err := runner.failQueueItemWithBreaker(context.Background(), loop, queue, failedRun.ID, checkpoint, stepValidate, &runpipe.LoopError{Message: "validation failed", Kind: runpipe.FailureRetryableTransient})
 	if err != nil || breakerStreak != maxConsecutiveFixerFailures || failedQueue == nil || failedQueue.Status != "manual_intervention" {
 		t.Fatalf("failQueueItemWithBreaker() = (%#v, %d, %v), want breaker terminal", failedQueue, breakerStreak, err)
 	}
@@ -183,7 +184,7 @@ func TestProcessClaimedItemDefersDuringPendingRediscoveryHandoff(t *testing.T) {
 	headSHA := "head-pending"
 	stateHash := "state-pending"
 	loopTarget := buildPullRequestTargetID(repo, prNumber)
-	metadata := mustMarshalJSON(map[string]any{
+	metadata := runpipe.MustMarshalJSON(map[string]any{
 		"pauseReason": failureStreakPauseReason,
 		"pendingFixerRediscovery": pendingFixerRediscoveryState{
 			HeadSHA:           headSHA,
@@ -226,7 +227,7 @@ func TestProcessClaimedItemCancelsDurablePause(t *testing.T) {
 	loopTarget := buildPullRequestTargetID(repo, prNumber)
 	headSHA := "head-quarantined"
 	stateHash := "state-quarantined"
-	metadata := mustMarshalJSON(map[string]any{
+	metadata := runpipe.MustMarshalJSON(map[string]any{
 		"pauseReason": "operator_quarantine",
 		"pendingFixerRediscovery": pendingFixerRediscoveryState{
 			HeadSHA:           headSHA,
@@ -264,7 +265,7 @@ func TestProcessClaimedItemResumeHandoffPreservesConcurrentStopCancellation(t *t
 	loopTarget := buildPullRequestTargetID(repo, prNumber)
 	headSHA := "head-96"
 	stateHash := "resume-stop-state"
-	metadata := mustMarshalJSON(map[string]any{
+	metadata := runpipe.MustMarshalJSON(map[string]any{
 		"pauseReason": failureStreakPauseReason,
 		"pendingFixerRediscovery": pendingFixerRediscoveryState{
 			HeadSHA:           headSHA,
@@ -312,12 +313,12 @@ func TestQueuedRetryStateReplacementRestartsFromDiscover(t *testing.T) {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
 	staleCheckpoint := fixerCheckpoint{ResumePolicy: "advance_from_checkpoint", FixItems: []FixItem{{Type: "comment", ID: "comment-a", ThreadID: "thread-a", ThreadFingerprint: "fingerprint-a"}}, Repair: &checkpointRepair{ParseStatus: "parsed", Summary: "state A repair"}}
-	checkpointJSON := mustMarshalJSON(staleCheckpoint)
-	failedRun := storage.RunRecord{ID: "run_queued_state_a", LoopID: loopID, Status: "failed", CurrentStep: stringPtr(string(stepRepair)), LastCompletedStep: stringPtr(string(stepCollectFixes)), CheckpointJSON: &checkpointJSON, StartedAt: nowISO, EndedAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
+	checkpointJSON := runpipe.MustMarshalJSON(staleCheckpoint)
+	failedRun := storage.RunRecord{ID: "run_queued_state_a", LoopID: loopID, Status: "failed", CurrentStep: runpipe.StringPtr(string(stepRepair)), LastCompletedStep: runpipe.StringPtr(string(stepCollectFixes)), CheckpointJSON: &checkpointJSON, StartedAt: nowISO, EndedAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
 	if err := fixture.repos.Runs.Upsert(context.Background(), failedRun); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
-	payloadA := mustMarshalJSON(map[string]any{"discoveryFingerprint": buildFixerDiscoveryFingerprint(repo, prNumber, "head-a", stateA), "fixItemsStateHash": stateA})
+	payloadA := runpipe.MustMarshalJSON(map[string]any{"discoveryFingerprint": buildFixerDiscoveryFingerprint(repo, prNumber, "head-a", stateA), "fixItemsStateHash": stateA})
 	queue := storage.QueueItemRecord{ID: "queue_queued_state_a", ProjectID: &projectID, LoopID: &loopID, Type: "fixer", TargetType: "pull_request", TargetID: loopTarget, Repo: &repo, PRNumber: &prNumber, DedupeKey: buildFixerDedupeKey(projectID, loopID, repo, prNumber, "head-a", stateA), Priority: storage.QueuePriorityFixer, Status: "queued", AvailableAt: nowISO, Attempts: 1, MaxAttempts: -1, PayloadJSON: &payloadA, CreatedAt: nowISO, UpdatedAt: nowISO}
 	if err := fixture.repos.Queue.Upsert(context.Background(), queue); err != nil {
 		t.Fatalf("Queue.Upsert() error = %v", err)

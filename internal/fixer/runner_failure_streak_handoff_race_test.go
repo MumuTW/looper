@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/MumuTW/looper/internal/loops"
+	"github.com/MumuTW/looper/internal/loops/runpipe"
 	"github.com/MumuTW/looper/internal/storage"
 )
 
@@ -23,7 +24,7 @@ func TestFailureStreakHandoffRejectsOperatorRepeatedPauseBeforeInitialRead(t *te
 	loopTarget := buildPullRequestTargetID(repo, prNumber)
 	failedState := "failed-state"
 	pendingState := "pending-state"
-	metadata := mustMarshalJSON(map[string]any{
+	metadata := runpipe.MustMarshalJSON(map[string]any{
 		"pauseReason":             failureStreakPauseReason,
 		"fixerFailureStreak":      failureStreakState{LastRunID: "run-failed", LastHeadSHA: "head-a", FixItemsStateHash: failedState, Step: string(stepValidate), ConsecutiveCount: maxConsecutiveFixerFailures, RecordedAt: nowISO},
 		"pendingFixerRediscovery": pendingFixerRediscoveryState{HeadSHA: "head-b", FixItemsStateHash: pendingState, UnresolvedThreadIDs: []string{"thread-b"}, RecordedAt: nowISO},
@@ -32,7 +33,7 @@ func TestFailureStreakHandoffRejectsOperatorRepeatedPauseBeforeInitialRead(t *te
 	if err := fixture.repos.Loops.Upsert(ctx, breakerPause); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
-	payload := mustMarshalJSON(map[string]any{"fixItemsStateHash": failedState})
+	payload := runpipe.MustMarshalJSON(map[string]any{"fixItemsStateHash": failedState})
 	queue := storage.QueueItemRecord{ID: "queue_failure_streak_handoff_repeated_pause", ProjectID: &projectID, LoopID: &loopID, Type: "fixer", TargetType: "pull_request", TargetID: loopTarget, Repo: &repo, PRNumber: &prNumber, DedupeKey: buildFixerDedupeKey(projectID, loopID, repo, prNumber, "head-a", failedState), Priority: storage.QueuePriorityFixer, Status: "manual_intervention", AvailableAt: nowISO, Attempts: 3, MaxAttempts: -1, PayloadJSON: &payload, CreatedAt: nowISO, UpdatedAt: nowISO}
 	if err := fixture.repos.Queue.Upsert(ctx, queue); err != nil {
 		t.Fatalf("Queue.Upsert() error = %v", err)
@@ -88,7 +89,7 @@ func TestFailureStreakHandoffRejectsOperatorTerminateBeforeInitialRead(t *testin
 	loopTarget := buildPullRequestTargetID(repo, prNumber)
 	failedState := "failed-state"
 	pendingState := "pending-state"
-	metadata := mustMarshalJSON(map[string]any{
+	metadata := runpipe.MustMarshalJSON(map[string]any{
 		"pauseReason":             failureStreakPauseReason,
 		"fixerFailureStreak":      failureStreakState{LastRunID: "run-failed", LastHeadSHA: "head-a", FixItemsStateHash: failedState, Step: string(stepValidate), ConsecutiveCount: maxConsecutiveFixerFailures, RecordedAt: nowISO},
 		"pendingFixerRediscovery": pendingFixerRediscoveryState{HeadSHA: "head-b", FixItemsStateHash: pendingState, UnresolvedThreadIDs: []string{"thread-b"}, RecordedAt: nowISO},
@@ -97,7 +98,7 @@ func TestFailureStreakHandoffRejectsOperatorTerminateBeforeInitialRead(t *testin
 	if err := fixture.repos.Loops.Upsert(ctx, breakerPause); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
-	payload := mustMarshalJSON(map[string]any{"fixItemsStateHash": failedState})
+	payload := runpipe.MustMarshalJSON(map[string]any{"fixItemsStateHash": failedState})
 	queue := storage.QueueItemRecord{ID: "queue_failure_streak_handoff_terminated", ProjectID: &projectID, LoopID: &loopID, Type: "fixer", TargetType: "pull_request", TargetID: loopTarget, Repo: &repo, PRNumber: &prNumber, DedupeKey: buildFixerDedupeKey(projectID, loopID, repo, prNumber, "head-a", failedState), Priority: storage.QueuePriorityFixer, Status: "manual_intervention", AvailableAt: nowISO, Attempts: 3, MaxAttempts: -1, PayloadJSON: &payload, CreatedAt: nowISO, UpdatedAt: nowISO}
 	if err := fixture.repos.Queue.Upsert(ctx, queue); err != nil {
 		t.Fatalf("Queue.Upsert() error = %v", err)

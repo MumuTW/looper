@@ -13,6 +13,7 @@ import (
 	"github.com/MumuTW/looper/internal/lifecycle"
 	"github.com/MumuTW/looper/internal/loops"
 	"github.com/MumuTW/looper/internal/loops/failureclass"
+	"github.com/MumuTW/looper/internal/loops/runpipe"
 	"github.com/MumuTW/looper/internal/storage"
 	"github.com/MumuTW/looper/internal/validation"
 )
@@ -165,9 +166,9 @@ func TestRunValidateStepPreservesFailedOutput(t *testing.T) {
 			Worktree: &checkpointWorktree{Path: worktree, Branch: "feature/fix"},
 		},
 	})
-	var loopErr *loopError
+	var loopErr *runpipe.LoopError
 	if !errors.As(err, &loopErr) {
-		t.Fatalf("runValidateStep() error = %v, want loopError", err)
+		t.Fatalf("runValidateStep() error = %v, want runpipe.LoopError", err)
 	}
 	if checkpoint.Validation == nil || checkpoint.Validation.Output != "expected 2, got 3" {
 		t.Fatalf("checkpoint.Validation = %#v, want failed diagnostics preserved", checkpoint.Validation)
@@ -201,8 +202,8 @@ func TestRunValidateStepParksValidationThatRepeatedlyDirtiesWorktree(t *testing.
 			ReconcileCommits: &checkpointReconcileCommits{BaseHeadSHA: "base-head", FinalHeadSHA: "repair-head", WorkingTreeClean: true, CompletedAt: "2026-07-29T00:00:00Z"},
 		},
 	})
-	var loopErr *loopError
-	if !errors.As(err, &loopErr) || loopErr.kind != FailureManualIntervention {
+	var loopErr *runpipe.LoopError
+	if !errors.As(err, &loopErr) || loopErr.Kind != runpipe.FailureManualIntervention {
 		t.Fatalf("runValidateStep() error = %v, want manual intervention", err)
 	}
 	if checkpoint.ResumePolicy != "manual_intervention" || checkpoint.Pause == nil || checkpoint.Pause.Reason != string(checkpointPauseReasonDirtyWorktree) {

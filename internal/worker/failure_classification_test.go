@@ -8,29 +8,30 @@ import (
 	"github.com/MumuTW/looper/internal/agent"
 	"github.com/MumuTW/looper/internal/config"
 	"github.com/MumuTW/looper/internal/loops/failureclass"
+	"github.com/MumuTW/looper/internal/loops/runpipe"
 )
 
 func TestClassifyFailureDoesNotRetryUnknownExternalLookingMessage(t *testing.T) {
 	runner := &Runner{}
 	got := runner.classifyFailure(errors.New("git fetch origin failed: broken pipe"))
-	if got.kind != FailureNonRetryable {
-		t.Fatalf("classifyFailure() kind = %s, want %s", got.kind, FailureNonRetryable)
+	if got.Kind != runpipe.FailureNonRetryable {
+		t.Fatalf("classifyFailure() kind = %s, want %s", got.Kind, runpipe.FailureNonRetryable)
 	}
 }
 
 func TestClassifyFailureRetriesBoundaryExternalTransport(t *testing.T) {
 	runner := &Runner{}
 	got := runner.classifyFailure(failureclass.WithBoundary(errors.New("git fetch origin failed: broken pipe"), failureclass.BoundaryGitRemote))
-	if got.kind != FailureRetryableTransient {
-		t.Fatalf("classifyFailure() kind = %s, want %s", got.kind, FailureRetryableTransient)
+	if got.Kind != runpipe.FailureRetryableTransient {
+		t.Fatalf("classifyFailure() kind = %s, want %s", got.Kind, runpipe.FailureRetryableTransient)
 	}
 }
 
 func TestClassifyFailurePreservesContextTransient(t *testing.T) {
 	runner := &Runner{}
 	got := runner.classifyFailure(context.DeadlineExceeded)
-	if got.kind != FailureRetryableTransient {
-		t.Fatalf("classifyFailure() kind = %s, want %s", got.kind, FailureRetryableTransient)
+	if got.Kind != runpipe.FailureRetryableTransient {
+		t.Fatalf("classifyFailure() kind = %s, want %s", got.Kind, runpipe.FailureRetryableTransient)
 	}
 }
 
@@ -44,7 +45,7 @@ func TestClassifyFailureHoldsUnsupportedToolNetworkVendorForOperator(t *testing.
 		t.Fatal("agent Start() error = nil, want fail-closed refusal")
 	}
 	got := runner.classifyFailureWithBoundary(err, workerFailureBoundaryForStep(stepExecute))
-	if got.kind != FailureManualIntervention {
-		t.Fatalf("classifyFailure() kind = %s, want %s", got.kind, FailureManualIntervention)
+	if got.Kind != runpipe.FailureManualIntervention {
+		t.Fatalf("classifyFailure() kind = %s, want %s", got.Kind, runpipe.FailureManualIntervention)
 	}
 }

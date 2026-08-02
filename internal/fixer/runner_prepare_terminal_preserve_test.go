@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/MumuTW/looper/internal/loops/runpipe"
 	"github.com/MumuTW/looper/internal/storage"
 )
 
@@ -23,7 +24,7 @@ func TestCleanupFixerWorktreeIfTerminalSkipsUnpreparedWorktree(t *testing.T) {
 		Worktree: &checkpointWorktree{Path: wtPath, Branch: "feature/fix-42"}, // PreparedAt empty
 	}
 	runner.cleanupFixerWorktreeIfTerminal(context.Background(), storage.ProjectRecord{
-		ID: "project_1", RepoPath: t.TempDir(), BaseBranch: stringPtr("main"),
+		ID: "project_1", RepoPath: t.TempDir(), BaseBranch: runpipe.StringPtr("main"),
 	}, "", checkpoint)
 	if len(git.cleanupCalls) != 0 {
 		t.Fatalf("len(git.cleanupCalls) = %d, want 0 for unprepared worktree", len(git.cleanupCalls))
@@ -35,7 +36,7 @@ func TestCleanupFixerWorktreeIfTerminalSkipsUnpreparedWorktree(t *testing.T) {
 	// Prepared worktrees still clean up on the terminal path.
 	checkpoint.Worktree.PreparedAt = "2026-04-11T12:00:00.000Z"
 	runner.cleanupFixerWorktreeIfTerminal(context.Background(), storage.ProjectRecord{
-		ID: "project_1", RepoPath: t.TempDir(), BaseBranch: stringPtr("main"),
+		ID: "project_1", RepoPath: t.TempDir(), BaseBranch: runpipe.StringPtr("main"),
 	}, "", checkpoint)
 	if len(git.cleanupCalls) != 1 {
 		t.Fatalf("len(git.cleanupCalls) = %d, want 1 for prepared worktree", len(git.cleanupCalls))
@@ -83,7 +84,7 @@ func TestProcessClaimedItemTerminalPrepareErrorPreservesDirtyWorktree(t *testing
 	}
 
 	// Prior repair failure with a prepared worktree so resume rewinds to prepare-worktree.
-	checkpointJSON := mustMarshalJSON(fixerCheckpoint{
+	checkpointJSON := runpipe.MustMarshalJSON(fixerCheckpoint{
 		ClaimedLockKey: "pr:acme/looper:42",
 		Detail:         &checkpointDetail{HeadSHA: f.headSHA, HeadRefName: f.branch, BaseRefName: "main", State: "OPEN"},
 		FixItems:       []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", Summary: "please fix"}},
@@ -103,8 +104,8 @@ func TestProcessClaimedItemTerminalPrepareErrorPreservesDirtyWorktree(t *testing
 		ID:                "run_failed_before_prepare_retry",
 		LoopID:            "loop_fixer_prepare_terminal_preserve",
 		Status:            "failed",
-		CurrentStep:       stringPtr(string(stepRepair)),
-		LastCompletedStep: stringPtr(string(stepPrepareWorktree)),
+		CurrentStep:       runpipe.StringPtr(string(stepRepair)),
+		LastCompletedStep: runpipe.StringPtr(string(stepPrepareWorktree)),
 		CheckpointJSON:    &checkpointJSON,
 		StartedAt:         nowISO,
 		CreatedAt:         nowISO,

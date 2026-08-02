@@ -7,6 +7,7 @@ import (
 
 	"github.com/MumuTW/looper/internal/config"
 	"github.com/MumuTW/looper/internal/loops"
+	"github.com/MumuTW/looper/internal/loops/runpipe"
 	"github.com/MumuTW/looper/internal/reviewer/convergence"
 	"github.com/MumuTW/looper/internal/storage"
 )
@@ -114,13 +115,13 @@ func TestHandleConvergenceHumanAnswerRefreshesUpdatedAt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	metadataJSON := stringPtr(string(encoded))
+	metadataJSON := runpipe.StringPtr(string(encoded))
 	// Attach an answered HITL ask so handleConvergenceHumanAnswer proceeds.
 	askJSON, err := loops.WriteHITLAsk(metadataJSON, loops.HITLAsk{Question: "resume?", Options: []string{"resume", "close"}, Status: "answered", Answer: "resume", AskedAt: escalatedAt, AnsweredAt: escalatedAt})
 	if err != nil {
 		t.Fatal(err)
 	}
-	loop.MetadataJSON = stringPtr(askJSON)
+	loop.MetadataJSON = runpipe.StringPtr(askJSON)
 	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
 		t.Fatal(err)
 	}

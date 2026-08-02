@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/MumuTW/looper/internal/loops/runpipe"
 	"github.com/MumuTW/looper/internal/storage"
 )
 
@@ -369,7 +370,7 @@ func TestRoundBudgetResetWaitsForReviewCompletion(t *testing.T) {
 	loopTarget := buildPullRequestTargetID(repo, prNumber)
 	nowISO := fixture.nowISO()
 
-	fixerMeta := mustMarshalJSON(map[string]any{
+	fixerMeta := runpipe.MustMarshalJSON(map[string]any{
 		"fixerRoundBudget": map[string]any{"rounds": 3, "lastHeadSha": "head-clean", "firstRoundAt": nowISO, "recordedAt": nowISO},
 		"pauseReason":      roundBudgetPauseReason,
 	})
@@ -379,7 +380,7 @@ func TestRoundBudgetResetWaitsForReviewCompletion(t *testing.T) {
 	}
 	// Reviewer loop exists but last reviewed an older head — the reviewer for
 	// head-clean is still in flight.
-	reviewerMeta := mustMarshalJSON(map[string]any{"loop": map[string]any{"lastReviewedHeadSha": "head-old"}})
+	reviewerMeta := runpipe.MustMarshalJSON(map[string]any{"loop": map[string]any{"lastReviewedHeadSha": "head-old"}})
 	reviewerLoop := storage.LoopRecord{ID: "loop_reviewer_wait", Seq: 96, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "waiting", MetadataJSON: &reviewerMeta, CreatedAt: nowISO, UpdatedAt: nowISO}
 	if err := fixture.repos.Loops.Upsert(context.Background(), reviewerLoop); err != nil {
 		t.Fatalf("Loops.Upsert() reviewer error = %v", err)
@@ -411,7 +412,7 @@ func TestRoundBudgetResetWaitsForReviewCompletion(t *testing.T) {
 	}
 
 	// The reviewer now records head-clean as reviewed and finds nothing.
-	reviewerReviewed := mustMarshalJSON(map[string]any{"loop": map[string]any{"lastReviewedHeadSha": "head-clean"}})
+	reviewerReviewed := runpipe.MustMarshalJSON(map[string]any{"loop": map[string]any{"lastReviewedHeadSha": "head-clean"}})
 	reviewerLoop.MetadataJSON = &reviewerReviewed
 	if err := fixture.repos.Loops.Upsert(context.Background(), reviewerLoop); err != nil {
 		t.Fatalf("Loops.Upsert() reviewer update error = %v", err)
@@ -448,7 +449,7 @@ func TestRoundBudgetResetsWithoutReviewerLoop(t *testing.T) {
 	loopTarget := buildPullRequestTargetID(repo, prNumber)
 	nowISO := fixture.nowISO()
 
-	fixerMeta := mustMarshalJSON(map[string]any{
+	fixerMeta := runpipe.MustMarshalJSON(map[string]any{
 		"fixerRoundBudget": map[string]any{"rounds": 2, "lastHeadSha": "head-clean", "firstRoundAt": nowISO, "recordedAt": nowISO},
 		"pauseReason":      roundBudgetPauseReason,
 	})

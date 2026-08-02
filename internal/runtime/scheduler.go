@@ -29,6 +29,7 @@ import (
 	gitinfra "github.com/MumuTW/looper/internal/infra/git"
 	githubinfra "github.com/MumuTW/looper/internal/infra/github"
 	"github.com/MumuTW/looper/internal/infra/notify"
+	"github.com/MumuTW/looper/internal/loops/runpipe"
 	networkclient "github.com/MumuTW/looper/internal/network/client"
 	"github.com/MumuTW/looper/internal/network/protocol"
 	"github.com/MumuTW/looper/internal/networkpolicy"
@@ -46,8 +47,8 @@ import (
 
 type plannerScheduler interface {
 	DiscoverIssues(context.Context, planner.DiscoveryInput) (planner.DiscoveryResult, error)
-	ProcessNext(context.Context, string) (*planner.ProcessResult, error)
-	ProcessClaimedQueueItem(context.Context, storage.QueueItemRecord) (*planner.ProcessResult, error)
+	ProcessNext(context.Context, string) (*runpipe.ProcessResult, error)
+	ProcessClaimedQueueItem(context.Context, storage.QueueItemRecord) (*runpipe.ProcessResult, error)
 }
 
 type triagerScheduler interface {
@@ -90,16 +91,16 @@ type coordinatorScheduler interface {
 type reviewerScheduler interface {
 	DiscoverPullRequests(context.Context, reviewer.DiscoveryInput) (reviewer.DiscoveryResult, error)
 	DiscoverPullRequest(context.Context, reviewer.TargetedDiscoveryInput) (reviewer.DiscoveryResult, error)
-	ProcessNext(context.Context, string) (*reviewer.ProcessResult, error)
-	ProcessClaimedQueueItem(context.Context, storage.QueueItemRecord) (*reviewer.ProcessResult, error)
+	ProcessNext(context.Context, string) (*runpipe.ProcessResult, error)
+	ProcessClaimedQueueItem(context.Context, storage.QueueItemRecord) (*runpipe.ProcessResult, error)
 }
 
 type fixerScheduler interface {
 	DiscoverPullRequests(context.Context, fixer.DiscoveryInput) (fixer.DiscoveryResult, error)
 	DiscoverPullRequest(context.Context, fixer.TargetedDiscoveryInput) (fixer.DiscoveryResult, error)
 	DiscoverPullRequestsForBaseBranchUpdate(context.Context, fixer.BaseBranchDiscoveryInput) (fixer.DiscoveryResult, error)
-	ProcessNext(context.Context, string) (*fixer.ProcessResult, error)
-	ProcessClaimedQueueItem(context.Context, storage.QueueItemRecord) (*fixer.ProcessResult, error)
+	ProcessNext(context.Context, string) (*runpipe.ProcessResult, error)
+	ProcessClaimedQueueItem(context.Context, storage.QueueItemRecord) (*runpipe.ProcessResult, error)
 }
 
 type gatekeeperScheduler interface {
@@ -108,8 +109,8 @@ type gatekeeperScheduler interface {
 }
 
 type workerScheduler interface {
-	ProcessNext(context.Context, string) (*worker.ProcessResult, error)
-	ProcessClaimedQueueItem(context.Context, storage.QueueItemRecord) (*worker.ProcessResult, error)
+	ProcessNext(context.Context, string) (*runpipe.ProcessResult, error)
+	ProcessClaimedQueueItem(context.Context, storage.QueueItemRecord) (*runpipe.ProcessResult, error)
 }
 
 type snapshotScheduler interface {
@@ -291,7 +292,7 @@ type workerRunCompletedNotificationInput struct {
 	Subtitle          string
 	Status            string
 	Summary           string
-	FailureKind       worker.QueueFailureKind
+	FailureKind       runpipe.QueueFailureKind
 	PullRequestNumber int64
 	PullRequestURL    string
 }
@@ -2054,7 +2055,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			EntityID:   input.RunID,
 		}
 		switch {
-		case input.Status == "failed" && input.FailureKind == worker.FailureManualIntervention:
+		case input.Status == "failed" && input.FailureKind == runpipe.FailureManualIntervention:
 			payload.Level = "action_required"
 			payload.Title = "Looper Worker Needs Attention"
 			payload.Body = input.Summary
@@ -2091,7 +2092,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 				} else {
 					notificationGateway.RecordMilestone(ctx, input.LoopID, fmt.Sprintf("🔀 已开 PR #%d", input.PullRequestNumber))
 				}
-			case input.Status == "failed" && input.FailureKind == worker.FailureManualIntervention:
+			case input.Status == "failed" && input.FailureKind == runpipe.FailureManualIntervention:
 				notificationGateway.RecordMilestone(ctx, input.LoopID, "⏸ 需要人处理")
 			case input.Status == "failed":
 				notificationGateway.RecordMilestone(ctx, input.LoopID, "⚠️ 本轮失败,重试中")

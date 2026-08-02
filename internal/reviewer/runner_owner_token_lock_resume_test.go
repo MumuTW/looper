@@ -11,6 +11,7 @@ import (
 
 	"github.com/MumuTW/looper/internal/config"
 	"github.com/MumuTW/looper/internal/eventlog"
+	"github.com/MumuTW/looper/internal/loops/runpipe"
 	"github.com/MumuTW/looper/internal/storage"
 	"github.com/MumuTW/looper/internal/worktreesafety"
 )
@@ -52,7 +53,7 @@ func TestProcessClaimedItemFailedLockResumePreservesFixerOwnerToken(t *testing.T
 	}
 	// Resume past worktree into publish with PendingReview so eligibility
 	// rediscovery does not force restart_from_discover.
-	checkpointJSON := mustMarshalJSON(reviewerCheckpoint{
+	checkpointJSON := runpipe.MustMarshalJSON(reviewerCheckpoint{
 		Detail:   &checkpointDetail{Title: "Review me", State: "OPEN", HeadSHA: "abc123", ReviewRequests: []string{"octocat"}},
 		Snapshot: &checkpointSnapshot{HeadSHA: "abc123"},
 		Worktree: &checkpointWorktree{Path: wtPath, Branch: "pr-42-head", BaseBranch: "main", PreparedAt: nowISO},
@@ -64,7 +65,7 @@ func TestProcessClaimedItemFailedLockResumePreservesFixerOwnerToken(t *testing.T
 	})
 	if err := fixture.repos.Runs.Upsert(ctx, storage.RunRecord{
 		ID: "run_failed_past_worktree", LoopID: loopID, Status: "failed",
-		CurrentStep: stringPtr(string(stepPublish)), LastCompletedStep: stringPtr(string(stepReview)),
+		CurrentStep: runpipe.StringPtr(string(stepPublish)), LastCompletedStep: runpipe.StringPtr(string(stepReview)),
 		CheckpointJSON: &checkpointJSON, StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO,
 	}); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
@@ -101,12 +102,12 @@ func TestProcessClaimedItemFailedLockResumePreservesFixerOwnerToken(t *testing.T
 	if err == nil {
 		t.Fatal("ProcessClaimedItem() error = nil, want lock-held failure")
 	}
-	var loopErr *loopError
-	if !errors.As(err, &loopErr) || loopErr.kind != FailureRetryableTransient {
-		t.Fatalf("ProcessClaimedItem() error = %v, want retryable transient loopError", err)
+	var loopErr *runpipe.LoopError
+	if !errors.As(err, &loopErr) || loopErr.Kind != runpipe.FailureRetryableTransient {
+		t.Fatalf("ProcessClaimedItem() error = %v, want retryable transient runpipe.LoopError", err)
 	}
-	if !contains(loopErr.message, "Pull request lock is already held") {
-		t.Fatalf("error message = %q, want lock-held", loopErr.message)
+	if !contains(loopErr.Message, "Pull request lock is already held") {
+		t.Fatalf("error message = %q, want lock-held", loopErr.Message)
 	}
 	got, err := worktreesafety.ReadFixerOwnerToken(wtPath)
 	if err != nil {
@@ -148,7 +149,7 @@ func TestProcessClaimedItemSuccessfulLockResumeRevokesFixerOwnerToken(t *testing
 	projectMeta := fmt.Sprintf(`{"worktreeRoot":%q}`, wtRoot)
 	if err := fixture.repos.Projects.Upsert(ctx, storage.ProjectRecord{
 		ID: projectID, Name: "Looper", RepoPath: filepath.Join(t.TempDir(), "repo"),
-		BaseBranch: stringPtr("main"), MetadataJSON: &projectMeta, CreatedAt: nowISO, UpdatedAt: nowISO,
+		BaseBranch: runpipe.StringPtr("main"), MetadataJSON: &projectMeta, CreatedAt: nowISO, UpdatedAt: nowISO,
 	}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
@@ -161,7 +162,7 @@ func TestProcessClaimedItemSuccessfulLockResumeRevokesFixerOwnerToken(t *testing
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
 	// Invalid approval body forces publish failure after lock + re-prepare reclaim.
-	checkpointJSON := mustMarshalJSON(reviewerCheckpoint{
+	checkpointJSON := runpipe.MustMarshalJSON(reviewerCheckpoint{
 		Detail:   &checkpointDetail{Title: "Review me", State: "OPEN", HeadSHA: "abc123", ReviewRequests: []string{"octocat"}},
 		Snapshot: &checkpointSnapshot{HeadSHA: "abc123"},
 		Worktree: &checkpointWorktree{Path: wtPath, Branch: "pr-42-head", BaseBranch: "main", PreparedAt: nowISO},
@@ -173,7 +174,7 @@ func TestProcessClaimedItemSuccessfulLockResumeRevokesFixerOwnerToken(t *testing
 	})
 	if err := fixture.repos.Runs.Upsert(ctx, storage.RunRecord{
 		ID: "run_failed_past_worktree_revoke", LoopID: loopID, Status: "failed",
-		CurrentStep: stringPtr(string(stepPublish)), LastCompletedStep: stringPtr(string(stepReview)),
+		CurrentStep: runpipe.StringPtr(string(stepPublish)), LastCompletedStep: runpipe.StringPtr(string(stepReview)),
 		CheckpointJSON: &checkpointJSON, StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO,
 	}); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)

@@ -3,6 +3,7 @@ package fixer
 import (
 	"testing"
 
+	"github.com/MumuTW/looper/internal/loops/runpipe"
 	"github.com/MumuTW/looper/internal/storage"
 )
 
@@ -14,9 +15,9 @@ func TestRecordFailureKeepsTheFirstCauseAsPrimary(t *testing.T) {
 	t.Parallel()
 	checkpoint := fixerCheckpoint{}
 
-	checkpoint.recordFailure(stepRepair, &loopError{message: "agent timed out", kind: FailureRetryableTransient})
-	checkpoint.recordFailure(stepPush, &loopError{message: "remote head changed", kind: FailureRetryableAfterResume})
-	checkpoint.recordFailure(stepRecheck, &loopError{message: "needs a human", kind: FailureManualIntervention})
+	checkpoint.recordFailure(stepRepair, &runpipe.LoopError{Message: "agent timed out", Kind: runpipe.FailureRetryableTransient})
+	checkpoint.recordFailure(stepPush, &runpipe.LoopError{Message: "remote head changed", Kind: runpipe.FailureRetryableAfterResume})
+	checkpoint.recordFailure(stepRecheck, &runpipe.LoopError{Message: "needs a human", Kind: runpipe.FailureManualIntervention})
 
 	if checkpoint.Outcome == nil || checkpoint.Outcome.PrimaryFailure == nil {
 		t.Fatalf("Outcome = %#v, want a recorded primary failure", checkpoint.Outcome)
@@ -54,13 +55,13 @@ func runWith(t *testing.T, status, currentStep, checkpointJSON, errorMessage str
 	t.Helper()
 	record := storage.RunRecord{ID: "run_1", LoopID: "loop_1", Status: status}
 	if currentStep != "" {
-		record.CurrentStep = stringPtr(currentStep)
+		record.CurrentStep = runpipe.StringPtr(currentStep)
 	}
 	if checkpointJSON != "" {
-		record.CheckpointJSON = stringPtr(checkpointJSON)
+		record.CheckpointJSON = runpipe.StringPtr(checkpointJSON)
 	}
 	if errorMessage != "" {
-		record.ErrorMessage = stringPtr(errorMessage)
+		record.ErrorMessage = runpipe.StringPtr(errorMessage)
 	}
 	return record
 }
@@ -111,7 +112,7 @@ func TestDeriveRunOutcomeBackfillsHistoricalFailures(t *testing.T) {
 		if got == nil || got.PrimaryFailure == nil {
 			t.Fatalf("DeriveRunOutcome() = %#v, want the gap backfilled", got)
 		}
-		if got.PrimaryFailure.Kind != FailureManualIntervention {
+		if got.PrimaryFailure.Kind != runpipe.FailureManualIntervention {
 			t.Fatalf("PrimaryFailure.Kind = %q, want manual_intervention from the parked policy", got.PrimaryFailure.Kind)
 		}
 		if got.PrimaryFailure.Retryable == nil || *got.PrimaryFailure.Retryable {

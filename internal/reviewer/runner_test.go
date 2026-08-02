@@ -18,6 +18,7 @@ import (
 	"github.com/MumuTW/looper/internal/infra/shell"
 	"github.com/MumuTW/looper/internal/labels"
 	"github.com/MumuTW/looper/internal/loops/failureclass"
+	"github.com/MumuTW/looper/internal/loops/runpipe"
 	"github.com/MumuTW/looper/internal/network/protocol"
 	"github.com/MumuTW/looper/internal/networkpolicy"
 	"github.com/MumuTW/looper/internal/reviewer/automerge"
@@ -272,17 +273,17 @@ func TestProcessClaimedItemSkipsHeldFreshAutomaticReviewerBeforeRoutedRevalidati
 func TestShouldRetryQueueFailureRespectsMaxAttempts(t *testing.T) {
 	t.Parallel()
 
-	if !shouldRetryQueueFailure(FailureRetryableTransient, 5, -1) {
-		t.Fatal("shouldRetryQueueFailure() = false, want true for infinite retries")
+	if !runpipe.ShouldRetryQueueFailure(runpipe.FailureRetryableTransient, 5, -1) {
+		t.Fatal("runpipe.ShouldRetryQueueFailure() = false, want true for infinite retries")
 	}
-	if shouldRetryQueueFailure(FailureNonRetryable, 5, -1) {
-		t.Fatal("shouldRetryQueueFailure() = true, want false for infinite non_retryable retries")
+	if runpipe.ShouldRetryQueueFailure(runpipe.FailureNonRetryable, 5, -1) {
+		t.Fatal("runpipe.ShouldRetryQueueFailure() = true, want false for infinite non_retryable retries")
 	}
-	if !shouldRetryQueueFailure(FailureNonRetryable, 1, 3) {
-		t.Fatal("shouldRetryQueueFailure() = false, want true for bounded non_retryable retries")
+	if !runpipe.ShouldRetryQueueFailure(runpipe.FailureNonRetryable, 1, 3) {
+		t.Fatal("runpipe.ShouldRetryQueueFailure() = false, want true for bounded non_retryable retries")
 	}
-	if shouldRetryQueueFailure(FailureRetryableTransient, 3, 3) {
-		t.Fatal("shouldRetryQueueFailure() = true, want false once nextAttempts reaches maxAttempts")
+	if runpipe.ShouldRetryQueueFailure(runpipe.FailureRetryableTransient, 3, 3) {
+		t.Fatal("runpipe.ShouldRetryQueueFailure() = true, want false once nextAttempts reaches maxAttempts")
 	}
 }
 
@@ -617,8 +618,8 @@ func TestRevalidateRoutedReviewerClaimTreatsLoginRefreshFailureAsTransient(t *te
 	repo := "acme/looper"
 	prNumber := int64(42)
 	err := runner.revalidateRoutedReviewerClaim(context.Background(), storage.ProjectRecord{ID: "project_1", RepoPath: "/tmp/repo"}, storage.QueueItemRecord{Repo: &repo, PRNumber: &prNumber})
-	var loopErr *loopError
-	if !errors.As(err, &loopErr) || loopErr.kind != FailureRetryableTransient || !strings.Contains(loopErr.message, "gh auth failed") {
+	var loopErr *runpipe.LoopError
+	if !errors.As(err, &loopErr) || loopErr.Kind != runpipe.FailureRetryableTransient || !strings.Contains(loopErr.Message, "gh auth failed") {
 		t.Fatalf("revalidateRoutedReviewerClaim() error = %v, want transient login refresh failure", err)
 	}
 	if github.currentLoginCalls != 1 {
@@ -751,7 +752,7 @@ func TestDiscoverPullRequestReusesExistingActiveQueueItem(t *testing.T) {
 func TestDiscoverPullRequestsRecoversRetryableAfterResumeRestartFromDiscover(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
-	loopID, queueID := seedFailedReviewerRecoveryLoop(t, fixture, failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish: expected old, got new"})
+	loopID, queueID := seedFailedReviewerRecoveryLoop(t, fixture, failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(runpipe.FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish: expected old, got new"})
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, LoopConfig: config.ReviewerLoopConfig{EnabledByDefault: true, QuietPeriodSeconds: 120, MaxIterationsPerPR: 20, MaxIterationsPerHead: 1, MaxWallClockSeconds: 14400, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25}})
 
 	result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
@@ -785,21 +786,21 @@ func TestReviewerFailedLoopRecoveryEligibilityWhitelist(t *testing.T) {
 		pr   PullRequestSummary
 		want bool
 	}{
-		{name: "retryable rerun review", seed: failedReviewerRecoverySeed{ResumePolicy: "rerun_review", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "marker missing"}, pr: PullRequestSummary{Number: 42, State: "OPEN"}, want: true},
-		{name: "retryable restart from discover", seed: failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish"}, pr: PullRequestSummary{Number: 42, State: "OPEN"}, want: true},
-		{name: "retryable transient attempts remaining", seed: failedReviewerRecoverySeed{ResumePolicy: "replay_step", QueueErrorKind: string(FailureRetryableTransient), ErrorMessage: "reviewer agent timed out", QueueAttempts: 3, QueueMaxAttempts: 5}, pr: PullRequestSummary{Number: 42, State: "OPEN"}, want: true},
-		{name: "historical guardrail non retryable", seed: failedReviewerRecoverySeed{ResumePolicy: "replay_step", QueueErrorKind: string(FailureNonRetryable), ErrorMessage: "review request removed before publish"}, pr: PullRequestSummary{Number: 42, State: "OPEN"}, want: true},
-		{name: "retryable transient ignores final allowed run", seed: failedReviewerRecoverySeed{ResumePolicy: "replay_step", QueueErrorKind: string(FailureRetryableTransient), ErrorMessage: "reviewer agent timed out", QueueAttempts: 4, QueueMaxAttempts: 5}, pr: PullRequestSummary{Number: 42, State: "OPEN"}, want: true},
-		{name: "manual intervention kind", seed: failedReviewerRecoverySeed{ResumePolicy: "replay_step", QueueErrorKind: string(FailureManualIntervention), ErrorMessage: "operator needed"}, pr: PullRequestSummary{Number: 42, State: "OPEN"}, want: false},
-		{name: "manual intervention resume policy", seed: failedReviewerRecoverySeed{ResumePolicy: "manual_intervention", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "operator needed"}, pr: PullRequestSummary{Number: 42, State: "OPEN"}, want: false},
-		{name: "closed pr", seed: failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish"}, pr: PullRequestSummary{Number: 42, State: "CLOSED"}, want: false},
-		{name: "approved by current user on head", seed: failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish"}, pr: PullRequestSummary{Number: 42, State: "OPEN", ReviewDecision: "APPROVED", HeadSHA: "abc123", Reviews: []map[string]any{{"author": map[string]any{"login": "octocat"}, "state": "APPROVED", "commit": map[string]any{"oid": "abc123"}}}}, want: false},
-		{name: "approved by another user", seed: failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish"}, pr: PullRequestSummary{Number: 42, State: "OPEN", ReviewDecision: "APPROVED", HeadSHA: "abc123", Reviews: []map[string]any{{"author": map[string]any{"login": "other"}, "state": "APPROVED", "commit": map[string]any{"oid": "abc123"}}}}, want: true},
-		{name: "ready label", seed: failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish"}, pr: PullRequestSummary{Number: 42, State: "OPEN", Labels: []string{labels.SpecReady}}, want: false},
-		{name: "follow updates disabled", seed: failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish", FollowUpdates: boolPtr(false)}, pr: PullRequestSummary{Number: 42, State: "OPEN"}, want: false},
-		{name: "loop disabled", seed: failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish", LoopEnabled: boolPtr(false)}, pr: PullRequestSummary{Number: 42, State: "OPEN"}, want: false},
-		{name: "legacy budget termination metadata", seed: failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish", TerminationReason: "max_wall_clock"}, pr: PullRequestSummary{Number: 42, State: "OPEN"}, want: true},
-		{name: "attempt cap", seed: failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish", AutoRecoveryAttempts: config.DefaultReviewerAutoRecoveryMaxAttempts}, pr: PullRequestSummary{Number: 42, State: "OPEN"}, want: false},
+		{name: "retryable rerun review", seed: failedReviewerRecoverySeed{ResumePolicy: "rerun_review", QueueErrorKind: string(runpipe.FailureRetryableAfterResume), ErrorMessage: "marker missing"}, pr: PullRequestSummary{Number: 42, State: "OPEN"}, want: true},
+		{name: "retryable restart from discover", seed: failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(runpipe.FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish"}, pr: PullRequestSummary{Number: 42, State: "OPEN"}, want: true},
+		{name: "retryable transient attempts remaining", seed: failedReviewerRecoverySeed{ResumePolicy: "replay_step", QueueErrorKind: string(runpipe.FailureRetryableTransient), ErrorMessage: "reviewer agent timed out", QueueAttempts: 3, QueueMaxAttempts: 5}, pr: PullRequestSummary{Number: 42, State: "OPEN"}, want: true},
+		{name: "historical guardrail non retryable", seed: failedReviewerRecoverySeed{ResumePolicy: "replay_step", QueueErrorKind: string(runpipe.FailureNonRetryable), ErrorMessage: "review request removed before publish"}, pr: PullRequestSummary{Number: 42, State: "OPEN"}, want: true},
+		{name: "retryable transient ignores final allowed run", seed: failedReviewerRecoverySeed{ResumePolicy: "replay_step", QueueErrorKind: string(runpipe.FailureRetryableTransient), ErrorMessage: "reviewer agent timed out", QueueAttempts: 4, QueueMaxAttempts: 5}, pr: PullRequestSummary{Number: 42, State: "OPEN"}, want: true},
+		{name: "manual intervention kind", seed: failedReviewerRecoverySeed{ResumePolicy: "replay_step", QueueErrorKind: string(runpipe.FailureManualIntervention), ErrorMessage: "operator needed"}, pr: PullRequestSummary{Number: 42, State: "OPEN"}, want: false},
+		{name: "manual intervention resume policy", seed: failedReviewerRecoverySeed{ResumePolicy: "manual_intervention", QueueErrorKind: string(runpipe.FailureRetryableAfterResume), ErrorMessage: "operator needed"}, pr: PullRequestSummary{Number: 42, State: "OPEN"}, want: false},
+		{name: "closed pr", seed: failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(runpipe.FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish"}, pr: PullRequestSummary{Number: 42, State: "CLOSED"}, want: false},
+		{name: "approved by current user on head", seed: failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(runpipe.FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish"}, pr: PullRequestSummary{Number: 42, State: "OPEN", ReviewDecision: "APPROVED", HeadSHA: "abc123", Reviews: []map[string]any{{"author": map[string]any{"login": "octocat"}, "state": "APPROVED", "commit": map[string]any{"oid": "abc123"}}}}, want: false},
+		{name: "approved by another user", seed: failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(runpipe.FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish"}, pr: PullRequestSummary{Number: 42, State: "OPEN", ReviewDecision: "APPROVED", HeadSHA: "abc123", Reviews: []map[string]any{{"author": map[string]any{"login": "other"}, "state": "APPROVED", "commit": map[string]any{"oid": "abc123"}}}}, want: true},
+		{name: "ready label", seed: failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(runpipe.FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish"}, pr: PullRequestSummary{Number: 42, State: "OPEN", Labels: []string{labels.SpecReady}}, want: false},
+		{name: "follow updates disabled", seed: failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(runpipe.FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish", FollowUpdates: boolPtr(false)}, pr: PullRequestSummary{Number: 42, State: "OPEN"}, want: false},
+		{name: "loop disabled", seed: failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(runpipe.FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish", LoopEnabled: boolPtr(false)}, pr: PullRequestSummary{Number: 42, State: "OPEN"}, want: false},
+		{name: "legacy budget termination metadata", seed: failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(runpipe.FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish", TerminationReason: "max_wall_clock"}, pr: PullRequestSummary{Number: 42, State: "OPEN"}, want: true},
+		{name: "attempt cap", seed: failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(runpipe.FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish", AutoRecoveryAttempts: config.DefaultReviewerAutoRecoveryMaxAttempts}, pr: PullRequestSummary{Number: 42, State: "OPEN"}, want: false},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -824,7 +825,7 @@ func TestReviewerFailedLoopRecoveryEligibilityUsesFreshDetailHeadForApproval(t *
 	t.Parallel()
 
 	fixture := newRunnerFixture(t)
-	loopID, _ := seedFailedReviewerRecoveryLoop(t, fixture, failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish"})
+	loopID, _ := seedFailedReviewerRecoveryLoop(t, fixture, failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(runpipe.FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish"})
 	github := &fakeGitHubGateway{
 		viewHeadSHA: "fresh-head",
 		reviews: []map[string]any{{
@@ -856,7 +857,7 @@ func TestReviewerFailedLoopRecoveryEnhancedTransientIsOptIn(t *testing.T) {
 	t.Run("default remains non recoverable", func(t *testing.T) {
 		t.Parallel()
 		fixture := newRunnerFixture(t)
-		loopID, _ := seedFailedReviewerRecoveryLoop(t, fixture, failedReviewerRecoverySeed{ResumePolicy: "replay_step", QueueErrorKind: string(FailureNonRetryable), ErrorMessage: message, QueueAttempts: 1, QueueMaxAttempts: 5})
+		loopID, _ := seedFailedReviewerRecoveryLoop(t, fixture, failedReviewerRecoverySeed{ResumePolicy: "replay_step", QueueErrorKind: string(runpipe.FailureNonRetryable), ErrorMessage: message, QueueAttempts: 1, QueueMaxAttempts: 5})
 		runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, LoopConfig: config.ReviewerLoopConfig{EnabledByDefault: true, QuietPeriodSeconds: 120, MaxIterationsPerPR: 20, MaxIterationsPerHead: 1, MaxWallClockSeconds: 14400, MaxConsecutiveFailures: 3, MaxAgentExecutionsPerPR: 25}})
 		loop, _ := fixture.repos.Loops.GetByID(context.Background(), loopID)
 		eligible, _, reason, err := runner.failedReviewerLoopRecoveryEligibility(context.Background(), *loop, pr)
@@ -871,7 +872,7 @@ func TestReviewerFailedLoopRecoveryEnhancedTransientIsOptIn(t *testing.T) {
 	t.Run("enabled recovers and preserves attempt count", func(t *testing.T) {
 		t.Parallel()
 		fixture := newRunnerFixture(t)
-		loopID, queueID := seedFailedReviewerRecoveryLoop(t, fixture, failedReviewerRecoverySeed{ResumePolicy: "replay_step", QueueErrorKind: string(FailureNonRetryable), ErrorMessage: message, QueueAttempts: 1, QueueMaxAttempts: 5})
+		loopID, queueID := seedFailedReviewerRecoveryLoop(t, fixture, failedReviewerRecoverySeed{ResumePolicy: "replay_step", QueueErrorKind: string(runpipe.FailureNonRetryable), ErrorMessage: message, QueueAttempts: 1, QueueMaxAttempts: 5})
 		runner := New(Options{
 			DB:            fixture.coordinator.DB(),
 			Repos:         fixture.repos,
@@ -940,20 +941,20 @@ func TestReviewerEnhancedTransientPersistsExtractedShellStderr(t *testing.T) {
 	})
 
 	classified := runner.classifyFailureForProject("", cause)
-	if classified == nil || classified.kind != FailureRetryableTransient {
+	if classified == nil || classified.Kind != runpipe.FailureRetryableTransient {
 		t.Fatalf("classifyFailureForProject() = %#v, want retryable transient", classified)
 	}
-	if !strings.Contains(classified.message, "EOF") || !strings.Contains(classified.message, "/graphql") {
-		t.Fatalf("classified.message = %q, want extracted stderr containing graphql EOF", classified.message)
+	if !strings.Contains(classified.Message, "EOF") || !strings.Contains(classified.Message, "/graphql") {
+		t.Fatalf("classified.Message = %q, want extracted stderr containing graphql EOF", classified.Message)
 	}
-	if !runner.isEnhancedTransientMessageForPolicy(runner.retryPolicyForProject(""), classified.message) {
-		t.Fatalf("persisted message %q should re-match enhanced transient pattern", classified.message)
+	if !runner.isEnhancedTransientMessageForPolicy(runner.retryPolicyForProject(""), classified.Message) {
+		t.Fatalf("persisted message %q should re-match enhanced transient pattern", classified.Message)
 	}
 
 	loopID, queueID := seedFailedReviewerRecoveryLoop(t, fixture, failedReviewerRecoverySeed{
 		ResumePolicy:     "replay_step",
-		QueueErrorKind:   string(FailureNonRetryable),
-		ErrorMessage:     classified.message,
+		QueueErrorKind:   string(runpipe.FailureNonRetryable),
+		ErrorMessage:     classified.Message,
 		QueueAttempts:    1,
 		QueueMaxAttempts: 5,
 	})
@@ -975,7 +976,7 @@ func TestReviewerFailedLoopRecoveryUsesProjectRetryOverride(t *testing.T) {
 
 	fixture := newRunnerFixture(t)
 	message := "project-only transient transport failure"
-	loopID, _ := seedFailedReviewerRecoveryLoop(t, fixture, failedReviewerRecoverySeed{ResumePolicy: "replay_step", QueueErrorKind: string(FailureNonRetryable), ErrorMessage: message, QueueAttempts: 1, QueueMaxAttempts: 5})
+	loopID, _ := seedFailedReviewerRecoveryLoop(t, fixture, failedReviewerRecoverySeed{ResumePolicy: "replay_step", QueueErrorKind: string(runpipe.FailureNonRetryable), ErrorMessage: message, QueueAttempts: 1, QueueMaxAttempts: 5})
 	cfg, err := config.DefaultConfig(t.TempDir())
 	if err != nil {
 		t.Fatalf("DefaultConfig() error = %v", err)
@@ -1018,7 +1019,7 @@ func TestReviewerFailedLoopRecoverySkipsOccupiedSourceIssueAtomically(t *testing
 	fixture := newRunnerFixture(t)
 	loopID, queueID := seedFailedReviewerRecoveryLoop(t, fixture, failedReviewerRecoverySeed{
 		ResumePolicy:   "restart_from_discover",
-		QueueErrorKind: string(FailureRetryableAfterResume),
+		QueueErrorKind: string(runpipe.FailureRetryableAfterResume),
 		ErrorMessage:   "PR head changed before publish: expected old, got new",
 	})
 	repo := "acme/looper"
@@ -1069,7 +1070,7 @@ func TestReviewerFailedLoopRecoveryEligibilityHonorsStopOnConfig(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			fixture := newRunnerFixture(t)
-			loopID, _ := seedFailedReviewerRecoveryLoop(t, fixture, failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish: expected old, got new"})
+			loopID, _ := seedFailedReviewerRecoveryLoop(t, fixture, failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(runpipe.FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish: expected old, got new"})
 			runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, LoopConfig: tt.loopConfig})
 			loop, _ := fixture.repos.Loops.GetByID(context.Background(), loopID)
 			eligible, _, _, err := runner.failedReviewerLoopRecoveryEligibility(context.Background(), *loop, tt.pr)
@@ -1090,8 +1091,8 @@ func TestReviewerFailedLoopRecoveryEligibilitySkipsCurrentLoginForLocalBlockers(
 		seed       failedReviewerRecoverySeed
 		wantReason string
 	}{
-		{name: "loop disabled", seed: failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish", LoopEnabled: boolPtr(false)}, wantReason: "loop_disabled"},
-		{name: "attempt cap", seed: failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish", AutoRecoveryAttempts: config.DefaultReviewerAutoRecoveryMaxAttempts}, wantReason: "auto_recovery_attempt_cap"},
+		{name: "loop disabled", seed: failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(runpipe.FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish", LoopEnabled: boolPtr(false)}, wantReason: "loop_disabled"},
+		{name: "attempt cap", seed: failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(runpipe.FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish", AutoRecoveryAttempts: config.DefaultReviewerAutoRecoveryMaxAttempts}, wantReason: "auto_recovery_attempt_cap"},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -1129,7 +1130,7 @@ func TestReviewerFailedLoopRecoveryEligibilitySkipsCurrentLoginForDeterministicB
 	}{
 		{
 			name:       "latest queue not failed",
-			seed:       failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish"},
+			seed:       failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(runpipe.FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish"},
 			wantReason: "latest_queue_not_failed",
 			mutate: func(t *testing.T, fixture *runnerFixture, loopID string) {
 				t.Helper()
@@ -1145,7 +1146,7 @@ func TestReviewerFailedLoopRecoveryEligibilitySkipsCurrentLoginForDeterministicB
 		},
 		{
 			name:       "latest run not failed",
-			seed:       failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish"},
+			seed:       failedReviewerRecoverySeed{ResumePolicy: "restart_from_discover", QueueErrorKind: string(runpipe.FailureRetryableAfterResume), ErrorMessage: "PR head changed before publish"},
 			wantReason: "latest_run_not_failed",
 			mutate: func(t *testing.T, fixture *runnerFixture, loopID string) {
 				t.Helper()
@@ -1159,9 +1160,9 @@ func TestReviewerFailedLoopRecoveryEligibilitySkipsCurrentLoginForDeterministicB
 				}
 			},
 		},
-		{name: "manual intervention kind", seed: failedReviewerRecoverySeed{ResumePolicy: "replay_step", QueueErrorKind: string(FailureManualIntervention), ErrorMessage: "operator needed"}, wantReason: "manual_intervention"},
-		{name: "manual intervention resume policy", seed: failedReviewerRecoverySeed{ResumePolicy: "manual_intervention", QueueErrorKind: string(FailureRetryableAfterResume), ErrorMessage: "operator needed"}, wantReason: "manual_intervention"},
-		{name: "not whitelisted", seed: failedReviewerRecoverySeed{ResumePolicy: "replay_step", QueueErrorKind: string(FailureNonRetryable), ErrorMessage: "marker missing"}, wantReason: "not_whitelisted"},
+		{name: "manual intervention kind", seed: failedReviewerRecoverySeed{ResumePolicy: "replay_step", QueueErrorKind: string(runpipe.FailureManualIntervention), ErrorMessage: "operator needed"}, wantReason: "manual_intervention"},
+		{name: "manual intervention resume policy", seed: failedReviewerRecoverySeed{ResumePolicy: "manual_intervention", QueueErrorKind: string(runpipe.FailureRetryableAfterResume), ErrorMessage: "operator needed"}, wantReason: "manual_intervention"},
+		{name: "not whitelisted", seed: failedReviewerRecoverySeed{ResumePolicy: "replay_step", QueueErrorKind: string(runpipe.FailureNonRetryable), ErrorMessage: "marker missing"}, wantReason: "not_whitelisted"},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -3591,7 +3592,7 @@ func TestProcessClaimedItemSkipsTerminalLoopWithoutStartingRun(t *testing.T) {
 	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
-	queue := storage.QueueItemRecord{ID: "queue_terminal", ProjectID: stringPtr("project_1"), LoopID: stringPtr(loop.ID), Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Priority: 2, Status: "running", AvailableAt: nowISO, Attempts: 1, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}
+	queue := storage.QueueItemRecord{ID: "queue_terminal", ProjectID: runpipe.StringPtr("project_1"), LoopID: runpipe.StringPtr(loop.ID), Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Priority: 2, Status: "running", AvailableAt: nowISO, Attempts: 1, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}
 	if err := fixture.repos.Queue.Upsert(context.Background(), queue); err != nil {
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
@@ -3637,7 +3638,7 @@ func TestProcessClaimedItemRetriesWhenCurrentUserLookupFails(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
-	if result.Status != "failed" || result.FailureKind != FailureRetryableTransient {
+	if result.Status != "failed" || result.FailureKind != runpipe.FailureRetryableTransient {
 		t.Fatalf("result = %#v, want retryable transient failure", result)
 	}
 	queueAfter, err := fixture.repos.Queue.GetByID(context.Background(), queue.ID)
@@ -4105,7 +4106,7 @@ func TestProcessClaimedItemRejectsCleanNoopWithoutApprovedMarkerForApprovePolicy
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
-	if result.Status != "failed" || result.FailureKind != FailureRetryableAfterResume || !contains(result.Summary, "requires an APPROVED review marker") {
+	if result.Status != "failed" || result.FailureKind != runpipe.FailureRetryableAfterResume || !contains(result.Summary, "requires an APPROVED review marker") {
 		t.Fatalf("result = %#v, want retryable approve-marker-required failure", result)
 	}
 	if github.reviewMarkerCalls == 0 {
@@ -4230,7 +4231,7 @@ func TestProcessClaimedItemRejectsCleanNoopWithInvalidApprovedMarkerBodyForAppro
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
-	if result.Status != "failed" || result.FailureKind != FailureRetryableAfterResume || !contains(result.Summary, "short human summary") {
+	if result.Status != "failed" || result.FailureKind != runpipe.FailureRetryableAfterResume || !contains(result.Summary, "short human summary") {
 		t.Fatalf("result = %#v, want retryable invalid approval body failure", result)
 	}
 	if github.reviewMarkerCalls == 0 {
@@ -4268,8 +4269,8 @@ func TestProcessClaimedItemRejectsCleanNoopResumeWithInvalidApprovedMarkerBodyFo
 		PendingReview: &pendingReviewCheckpoint{HeadSHA: "abc123", IdempotencyKey: "idem", Event: reviewEventAgentNative, Summary: "No actionable findings"},
 		ResumePolicy:  "advance_from_checkpoint",
 	}
-	checkpointJSON := mustMarshalJSON(checkpoint)
-	run := storage.RunRecord{ID: "run_clean_approve_resume", LoopID: loop.ID, Status: "failed", CurrentStep: stringPtr(string(stepPublish)), LastCompletedStep: stringPtr(string(stepReview)), CheckpointJSON: &checkpointJSON, StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	checkpointJSON := runpipe.MustMarshalJSON(checkpoint)
+	run := storage.RunRecord{ID: "run_clean_approve_resume", LoopID: loop.ID, Status: "failed", CurrentStep: runpipe.StringPtr(string(stepPublish)), LastCompletedStep: runpipe.StringPtr(string(stepReview)), CheckpointJSON: &checkpointJSON, StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
 	if err := fixture.repos.Runs.Upsert(ctx, run); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
@@ -4278,7 +4279,7 @@ func TestProcessClaimedItemRejectsCleanNoopResumeWithInvalidApprovedMarkerBodyFo
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
-	if result.Status != "failed" || result.FailureKind != FailureRetryableAfterResume || !contains(result.Summary, "short human summary") {
+	if result.Status != "failed" || result.FailureKind != runpipe.FailureRetryableAfterResume || !contains(result.Summary, "short human summary") {
 		t.Fatalf("result = %#v, want retryable invalid approval body failure", result)
 	}
 	if len(agent.starts) != 0 {
@@ -4460,7 +4461,7 @@ func TestProcessClaimedItemInterruptsRunningReviewerWhenHeadChanges(t *testing.T
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
-	if result.Status != "interrupted" || result.FailureKind != FailureRetryableAfterResume || !contains(result.Summary, "PR head changed while reviewer was running") {
+	if result.Status != "interrupted" || result.FailureKind != runpipe.FailureRetryableAfterResume || !contains(result.Summary, "PR head changed while reviewer was running") {
 		t.Fatalf("result = %#v, want interrupted retryable head change", result)
 	}
 	if len(agent.killedReasons) != 1 || !contains(agent.killedReasons[0], "new-head") {
@@ -4493,7 +4494,7 @@ func TestProcessClaimedItemInterruptsRunningReviewerWhenHeadChanges(t *testing.T
 	if err != nil || requeued == nil {
 		t.Fatalf("Queue.GetByID() = (%#v, %v), want queue", requeued, err)
 	}
-	if requeued.Status != "queued" || requeued.LastErrorKind == nil || *requeued.LastErrorKind != string(FailureRetryableAfterResume) {
+	if requeued.Status != "queued" || requeued.LastErrorKind == nil || *requeued.LastErrorKind != string(runpipe.FailureRetryableAfterResume) {
 		t.Fatalf("queue = %#v, want queued retryable-after-resume", requeued)
 	}
 }
@@ -4512,7 +4513,7 @@ func TestProcessClaimedItemMarksNativeResumePendingWhenHeadChangesAndFlagEnabled
 	}
 	agent.onStart = func(input AgentRunInput) {
 		nowISO := fixture.nowISO()
-		if err := fixture.repos.AgentExecutions.Upsert(ctx, storage.AgentExecutionRecord{ID: input.ExecutionID, ProjectID: stringPtr(input.ProjectID), LoopID: stringPtr(input.LoopID), RunID: stringPtr(input.RunID), Vendor: string(config.AgentVendorOpenCode), Status: "running", NativeSessionID: stringPtr("session-head-change"), StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		if err := fixture.repos.AgentExecutions.Upsert(ctx, storage.AgentExecutionRecord{ID: input.ExecutionID, ProjectID: runpipe.StringPtr(input.ProjectID), LoopID: runpipe.StringPtr(input.LoopID), RunID: runpipe.StringPtr(input.RunID), Vendor: string(config.AgentVendorOpenCode), Status: "running", NativeSessionID: runpipe.StringPtr("session-head-change"), StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 			t.Fatalf("AgentExecutions.Upsert() error = %v", err)
 		}
 	}
@@ -4571,7 +4572,7 @@ func TestProcessClaimedItemDoesNotMarkNativeResumePendingWhenHeadChangeFlagDisab
 	}
 	agent.onStart = func(input AgentRunInput) {
 		nowISO := fixture.nowISO()
-		if err := fixture.repos.AgentExecutions.Upsert(ctx, storage.AgentExecutionRecord{ID: input.ExecutionID, ProjectID: stringPtr(input.ProjectID), LoopID: stringPtr(input.LoopID), RunID: stringPtr(input.RunID), Vendor: string(config.AgentVendorOpenCode), Status: "running", NativeSessionID: stringPtr("session-head-change"), StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		if err := fixture.repos.AgentExecutions.Upsert(ctx, storage.AgentExecutionRecord{ID: input.ExecutionID, ProjectID: runpipe.StringPtr(input.ProjectID), LoopID: runpipe.StringPtr(input.LoopID), RunID: runpipe.StringPtr(input.RunID), Vendor: string(config.AgentVendorOpenCode), Status: "running", NativeSessionID: runpipe.StringPtr("session-head-change"), StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 			t.Fatalf("AgentExecutions.Upsert() error = %v", err)
 		}
 	}
@@ -4723,7 +4724,7 @@ func TestProcessClaimedItemDoesNotTreatCleanNoopAsApprovedTransitionForApprovePo
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
-	if result.Status != "failed" || result.FailureKind != FailureRetryableAfterResume || !contains(result.Summary, "requires an APPROVED review marker") {
+	if result.Status != "failed" || result.FailureKind != runpipe.FailureRetryableAfterResume || !contains(result.Summary, "requires an APPROVED review marker") {
 		t.Fatalf("result = %#v, want retryable approve-marker-required failure", result)
 	}
 	if len(github.removeLabelCalls) != 0 {
@@ -5080,7 +5081,7 @@ func TestProcessClaimedItemRetriesWhenLinkedIssueLookupIsTransient(t *testing.T)
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
-	if result.Status != "failed" || result.FailureKind != FailureRetryableAfterResume {
+	if result.Status != "failed" || result.FailureKind != runpipe.FailureRetryableAfterResume {
 		t.Fatalf("result = %#v, want retryable_after_resume failure", result)
 	}
 	if len(github.submitReviewCalls) != 0 {
@@ -5109,7 +5110,7 @@ func TestProcessClaimedItemDoesNotTreatActionableSummaryMentioningPriorCleanRevi
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
-	if result.Status != "failed" || result.FailureKind != FailureRetryableAfterResume || !contains(result.Summary, "no matching GitHub review marker") {
+	if result.Status != "failed" || result.FailureKind != runpipe.FailureRetryableAfterResume || !contains(result.Summary, "no matching GitHub review marker") {
 		t.Fatalf("result = %#v, want retryable missing-marker failure", result)
 	}
 	if github.reviewMarkerCalls == 0 {
@@ -5145,7 +5146,7 @@ func TestProcessClaimedItemStopsOnIdenticalReviewBodyWithDifferentMarkerHead(t *
 	if err != nil || claimed == nil || claimed.ID != queue.ID {
 		t.Fatalf("ClaimNextOfType() = (%#v, %v), want queued item %s", claimed, err, queue.ID)
 	}
-	extraQueue := storage.QueueItemRecord{ID: "queue_identical_marker_head_extra", ProjectID: stringPtr("project_1"), LoopID: stringPtr(loop.ID), Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, DedupeKey: "reviewer:extra", Priority: storage.QueuePriorityReviewer, Status: "queued", AvailableAt: nowISO, Attempts: 0, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}
+	extraQueue := storage.QueueItemRecord{ID: "queue_identical_marker_head_extra", ProjectID: runpipe.StringPtr("project_1"), LoopID: runpipe.StringPtr(loop.ID), Type: "reviewer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, DedupeKey: "reviewer:extra", Priority: storage.QueuePriorityReviewer, Status: "queued", AvailableAt: nowISO, Attempts: 0, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}
 	if err := fixture.repos.Queue.Upsert(ctx, extraQueue); err != nil {
 		t.Fatalf("Queue.Upsert(extra) error = %v", err)
 	}
@@ -5250,7 +5251,7 @@ func TestProcessClaimedItemRestartsAutomaticResumeFromDiscoverForFreshReviewRequ
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
 	legacyCheckpoint := reviewerCheckpoint{Detail: &checkpointDetail{Title: "Review me", State: "OPEN", HeadSHA: "abc123"}, ResumePolicy: "advance_from_checkpoint"}
-	legacyRun := storage.RunRecord{ID: "run_legacy", LoopID: loop.ID, Status: "failed", CurrentStep: stringPtr(string(stepClaim)), LastCompletedStep: stringPtr(string(stepFilter)), CheckpointJSON: stringPtr(mustMarshalJSON(legacyCheckpoint)), StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
+	legacyRun := storage.RunRecord{ID: "run_legacy", LoopID: loop.ID, Status: "failed", CurrentStep: runpipe.StringPtr(string(stepClaim)), LastCompletedStep: runpipe.StringPtr(string(stepFilter)), CheckpointJSON: runpipe.StringPtr(runpipe.MustMarshalJSON(legacyCheckpoint)), StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
 	if err := fixture.repos.Runs.Upsert(context.Background(), legacyRun); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
@@ -5418,7 +5419,7 @@ func TestProcessClaimedItemRequiresSideEffectsBeforeRecordingPublishSuccess(t *t
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
-	if result.Status != "failed" || result.FailureKind != FailureRetryableAfterResume || !contains(result.Summary, "Failed to add clean-review reaction") {
+	if result.Status != "failed" || result.FailureKind != runpipe.FailureRetryableAfterResume || !contains(result.Summary, "Failed to add clean-review reaction") {
 		t.Fatalf("result = %#v, want retryable side-effect failure", result)
 	}
 	loop, err := fixture.repos.Loops.GetByID(context.Background(), result.LoopID)
@@ -5448,7 +5449,7 @@ func TestProcessClaimedItemRequiresActionableSideEffectsBeforeRecordingPublishSu
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
-	if result.Status != "failed" || result.FailureKind != FailureRetryableAfterResume || !contains(result.Summary, "Failed to remove stale clean-review reaction") {
+	if result.Status != "failed" || result.FailureKind != runpipe.FailureRetryableAfterResume || !contains(result.Summary, "Failed to remove stale clean-review reaction") {
 		t.Fatalf("result = %#v, want retryable side-effect failure", result)
 	}
 	loop, err := fixture.repos.Loops.GetByID(context.Background(), result.LoopID)
@@ -5722,7 +5723,7 @@ func TestProcessClaimedItemFailsWhenAgentMissingCompletionMarker(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
-	if result.Status != "failed" || result.FailureKind != FailureRetryableAfterResume || !contains(result.Summary, "valid completion marker") {
+	if result.Status != "failed" || result.FailureKind != runpipe.FailureRetryableAfterResume || !contains(result.Summary, "valid completion marker") {
 		t.Fatalf("result = %#v, want retryable completion marker failure", result)
 	}
 	latestRun, err := fixture.repos.Runs.GetLatestByLoopID(context.Background(), result.LoopID)
@@ -5850,7 +5851,7 @@ func TestProcessClaimedItemRetriesWhenAgentReviewMarkerMissing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
-	if result.Status != "failed" || result.FailureKind != FailureRetryableAfterResume || !contains(result.Summary, "no matching GitHub review marker") {
+	if result.Status != "failed" || result.FailureKind != runpipe.FailureRetryableAfterResume || !contains(result.Summary, "no matching GitHub review marker") {
 		t.Fatalf("result = %#v, want retryable missing marker failure", result)
 	}
 	if len(agent.starts) != 1 {
@@ -5905,7 +5906,7 @@ func TestProcessClaimedItemPreservesTerminalReviewerFailureMetadata(t *testing.T
 		if err != nil || loop == nil {
 			t.Fatalf("Loops.GetByID() = (%#v, %v), want loop during agent start", loop, err)
 		}
-		metadata := mustMarshalJSON(map[string]any{"loop": map[string]any{"status": "failed"}})
+		metadata := runpipe.MustMarshalJSON(map[string]any{"loop": map[string]any{"status": "failed"}})
 		loop.MetadataJSON = &metadata
 		if err := fixture.repos.Loops.Upsert(ctx, *loop); err != nil {
 			t.Fatalf("Loops.Upsert() error = %v", err)
@@ -5916,14 +5917,14 @@ func TestProcessClaimedItemPreservesTerminalReviewerFailureMetadata(t *testing.T
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
-	if result.Status != "failed" || result.FailureKind != FailureRetryableAfterResume || !contains(result.Summary, "no matching GitHub review marker") {
+	if result.Status != "failed" || result.FailureKind != runpipe.FailureRetryableAfterResume || !contains(result.Summary, "no matching GitHub review marker") {
 		t.Fatalf("result = %#v, want retryable failed marker-miss result", result)
 	}
 	queue, err := fixture.repos.Queue.GetByID(ctx, claim.ID)
 	if err != nil || queue == nil {
 		t.Fatalf("Queue.GetByID() = (%#v, %v), want queue", queue, err)
 	}
-	if queue.Status != "manual_intervention" || queue.FinishedAt == nil || queue.LastErrorKind == nil || *queue.LastErrorKind != string(FailureRetryableAfterResume) {
+	if queue.Status != "manual_intervention" || queue.FinishedAt == nil || queue.LastErrorKind == nil || *queue.LastErrorKind != string(runpipe.FailureRetryableAfterResume) {
 		t.Fatalf("queue = %#v, want terminal manual_intervention queue preserving retryable failure", queue)
 	}
 	loop, err := fixture.repos.Loops.GetByID(ctx, result.LoopID)
@@ -5953,7 +5954,7 @@ func TestProcessClaimedItemRerunsReviewAfterRepeatedAgentReviewMarkerMisses(t *t
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
-	if result.Status != "failed" || result.FailureKind != FailureRetryableAfterResume || !contains(result.Summary, "retrying marker verification") {
+	if result.Status != "failed" || result.FailureKind != runpipe.FailureRetryableAfterResume || !contains(result.Summary, "retrying marker verification") {
 		t.Fatalf("result = %#v, want retryable marker recheck failure", result)
 	}
 	if len(agent.starts) != 1 {
@@ -5969,7 +5970,7 @@ func TestProcessClaimedItemRerunsReviewAfterRepeatedAgentReviewMarkerMisses(t *t
 	if err != nil {
 		t.Fatalf("retry ProcessClaimedItem() error = %v", err)
 	}
-	if result.Status != "failed" || result.FailureKind != FailureRetryableAfterResume || !contains(result.Summary, "no matching GitHub review marker") {
+	if result.Status != "failed" || result.FailureKind != runpipe.FailureRetryableAfterResume || !contains(result.Summary, "no matching GitHub review marker") {
 		t.Fatalf("retry result = %#v, want retryable missing marker failure", result)
 	}
 	if len(agent.starts) != 1 {
@@ -6006,7 +6007,7 @@ func TestProcessClaimedItemRecordsReviewWhenRequestRemovedAfterMarkerAppears(t *
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
-	if result.Status != "failed" || result.FailureKind != FailureRetryableAfterResume || !contains(result.Summary, "no matching GitHub review marker") {
+	if result.Status != "failed" || result.FailureKind != runpipe.FailureRetryableAfterResume || !contains(result.Summary, "no matching GitHub review marker") {
 		t.Fatalf("result = %#v, want retryable missing marker failure", result)
 	}
 	github.reviewMarkerMissing = false
@@ -6053,7 +6054,7 @@ func TestProcessClaimedItemSkipsRerunReviewWhenRequestRemovedAndMarkerMissing(t 
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
-	if result.Status != "failed" || result.FailureKind != FailureRetryableAfterResume || !contains(result.Summary, "no matching GitHub review marker") {
+	if result.Status != "failed" || result.FailureKind != runpipe.FailureRetryableAfterResume || !contains(result.Summary, "no matching GitHub review marker") {
 		t.Fatalf("result = %#v, want retryable missing marker failure", result)
 	}
 	github.reviewRequests = []string{"someoneelse"}
@@ -6103,8 +6104,8 @@ func TestProcessClaimedItemRejectsUnverifiableLegacyPendingReview(t *testing.T) 
 		PendingReview: &pendingReviewCheckpoint{HeadSHA: "abc123", Event: ReviewEventComment, Summary: "legacy review already posted"},
 		ResumePolicy:  "advance_from_checkpoint",
 	}
-	checkpointJSON := mustMarshalJSON(legacyCheckpoint)
-	run := storage.RunRecord{ID: "run_legacy", LoopID: loop.ID, Status: "failed", CurrentStep: stringPtr(string(stepPublish)), LastCompletedStep: stringPtr(string(stepReview)), CheckpointJSON: &checkpointJSON, StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	checkpointJSON := runpipe.MustMarshalJSON(legacyCheckpoint)
+	run := storage.RunRecord{ID: "run_legacy", LoopID: loop.ID, Status: "failed", CurrentStep: runpipe.StringPtr(string(stepPublish)), LastCompletedStep: runpipe.StringPtr(string(stepReview)), CheckpointJSON: &checkpointJSON, StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
 	if err := fixture.repos.Runs.Upsert(ctx, run); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
@@ -6113,7 +6114,7 @@ func TestProcessClaimedItemRejectsUnverifiableLegacyPendingReview(t *testing.T) 
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
-	if result.Status != "failed" || result.FailureKind != FailureRetryableAfterResume || !contains(result.Summary, "Legacy pending review checkpoint cannot be verified") {
+	if result.Status != "failed" || result.FailureKind != runpipe.FailureRetryableAfterResume || !contains(result.Summary, "Legacy pending review checkpoint cannot be verified") {
 		t.Fatalf("result = %#v, want retryable legacy verification failure", result)
 	}
 	if len(agent.starts) != 0 {
@@ -6149,7 +6150,7 @@ func TestProcessClaimedItemRetriesWhenAgentNativeReviewApprovesWithoutPermission
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
-	if result.Status != "failed" || result.FailureKind != FailureRetryableAfterResume || !contains(result.Summary, "no matching GitHub review marker") {
+	if result.Status != "failed" || result.FailureKind != runpipe.FailureRetryableAfterResume || !contains(result.Summary, "no matching GitHub review marker") {
 		t.Fatalf("result = %#v, want retryable disallowed approval marker failure", result)
 	}
 	loop, err := fixture.repos.Loops.GetByID(context.Background(), result.LoopID)
@@ -6698,7 +6699,7 @@ func TestRunReviewStepKeepsFullPromptForPendingNativeResumeFallback(t *testing.T
 	if err := fixture.repos.Runs.Upsert(ctx, run); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
-	if err := fixture.repos.AgentExecutions.Upsert(ctx, storage.AgentExecutionRecord{ID: "agent_previous_overload", ProjectID: stringPtr(project.ID), LoopID: stringPtr(loop.ID), RunID: stringPtr(run.ID), Vendor: string(config.AgentVendorOpenCode), Status: "completed", NativeSessionID: stringPtr("session-123"), NativeResumeStatus: stringPtr("pending"), StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+	if err := fixture.repos.AgentExecutions.Upsert(ctx, storage.AgentExecutionRecord{ID: "agent_previous_overload", ProjectID: runpipe.StringPtr(project.ID), LoopID: runpipe.StringPtr(loop.ID), RunID: runpipe.StringPtr(run.ID), Vendor: string(config.AgentVendorOpenCode), Status: "completed", NativeSessionID: runpipe.StringPtr("session-123"), NativeResumeStatus: runpipe.StringPtr("pending"), StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
 		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
 	}
 
@@ -6752,8 +6753,8 @@ func TestRunReviewStepUsesReReviewPromptForHeadChangeNativeResume(t *testing.T) 
 	if err := fixture.repos.Runs.Upsert(ctx, run); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
-	metadata := mustMarshalJSON(map[string]any{reviewerNativeResumeMetadataKey: map[string]any{"reason": reviewerNativeResumeReasonHeadChange, "phase": "review", "repo": repo, "prNumber": prNumber, "oldHeadSha": "old-head", "newHeadSha": "new-head"}})
-	if err := fixture.repos.AgentExecutions.Upsert(ctx, storage.AgentExecutionRecord{ID: "agent_previous_head_change", ProjectID: stringPtr(project.ID), LoopID: stringPtr(loop.ID), RunID: stringPtr(run.ID), Vendor: string(config.AgentVendorOpenCode), Status: "killed", NativeSessionID: stringPtr("session-123"), NativeResumeStatus: stringPtr("pending"), MetadataJSON: stringPtr(metadata), StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+	metadata := runpipe.MustMarshalJSON(map[string]any{reviewerNativeResumeMetadataKey: map[string]any{"reason": reviewerNativeResumeReasonHeadChange, "phase": "review", "repo": repo, "prNumber": prNumber, "oldHeadSha": "old-head", "newHeadSha": "new-head"}})
+	if err := fixture.repos.AgentExecutions.Upsert(ctx, storage.AgentExecutionRecord{ID: "agent_previous_head_change", ProjectID: runpipe.StringPtr(project.ID), LoopID: runpipe.StringPtr(loop.ID), RunID: runpipe.StringPtr(run.ID), Vendor: string(config.AgentVendorOpenCode), Status: "killed", NativeSessionID: runpipe.StringPtr("session-123"), NativeResumeStatus: runpipe.StringPtr("pending"), MetadataJSON: runpipe.StringPtr(metadata), StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
 		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
 	}
 
@@ -6809,8 +6810,8 @@ func TestRunReviewStepKeepsGenericPromptWhenReReviewPromptFlagDisabled(t *testin
 	if err := fixture.repos.Runs.Upsert(ctx, run); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
-	metadata := mustMarshalJSON(map[string]any{reviewerNativeResumeMetadataKey: map[string]any{"reason": reviewerNativeResumeReasonHeadChange, "phase": "review", "repo": repo, "prNumber": prNumber, "oldHeadSha": "old-head", "newHeadSha": "new-head"}})
-	if err := fixture.repos.AgentExecutions.Upsert(ctx, storage.AgentExecutionRecord{ID: "agent_previous_head_change_prompt_disabled", ProjectID: stringPtr(project.ID), LoopID: stringPtr(loop.ID), RunID: stringPtr(run.ID), Vendor: string(config.AgentVendorOpenCode), Status: "killed", NativeSessionID: stringPtr("session-123"), NativeResumeStatus: stringPtr("pending"), MetadataJSON: stringPtr(metadata), StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+	metadata := runpipe.MustMarshalJSON(map[string]any{reviewerNativeResumeMetadataKey: map[string]any{"reason": reviewerNativeResumeReasonHeadChange, "phase": "review", "repo": repo, "prNumber": prNumber, "oldHeadSha": "old-head", "newHeadSha": "new-head"}})
+	if err := fixture.repos.AgentExecutions.Upsert(ctx, storage.AgentExecutionRecord{ID: "agent_previous_head_change_prompt_disabled", ProjectID: runpipe.StringPtr(project.ID), LoopID: runpipe.StringPtr(loop.ID), RunID: runpipe.StringPtr(run.ID), Vendor: string(config.AgentVendorOpenCode), Status: "killed", NativeSessionID: runpipe.StringPtr("session-123"), NativeResumeStatus: runpipe.StringPtr("pending"), MetadataJSON: runpipe.StringPtr(metadata), StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
 		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
 	}
 
@@ -6860,7 +6861,7 @@ func TestRunReviewStepUsesFullPromptWhenPendingNativeResumeVendorDiffers(t *test
 	if err := fixture.repos.Runs.Upsert(ctx, run); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
-	if err := fixture.repos.AgentExecutions.Upsert(ctx, storage.AgentExecutionRecord{ID: "agent_previous_codex_overload", ProjectID: stringPtr(project.ID), LoopID: stringPtr(loop.ID), RunID: stringPtr(run.ID), Vendor: string(config.AgentVendorCodex), Status: "completed", NativeSessionID: stringPtr("session-123"), NativeResumeStatus: stringPtr("pending"), StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+	if err := fixture.repos.AgentExecutions.Upsert(ctx, storage.AgentExecutionRecord{ID: "agent_previous_codex_overload", ProjectID: runpipe.StringPtr(project.ID), LoopID: runpipe.StringPtr(loop.ID), RunID: runpipe.StringPtr(run.ID), Vendor: string(config.AgentVendorCodex), Status: "completed", NativeSessionID: runpipe.StringPtr("session-123"), NativeResumeStatus: runpipe.StringPtr("pending"), StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
 		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
 	}
 
@@ -6903,7 +6904,7 @@ func TestRunReviewStepPersistsRepreparedWorktreeBeforeAgentStart(t *testing.T) {
 	}
 	prNumber := int64(42)
 	loopTarget := "pr:42"
-	loop := storage.LoopRecord{ID: "loop_1", Seq: 1, ProjectID: project.ID, Type: "reviewer", TargetType: "pull_request", TargetID: &loopTarget, Repo: stringPtr("acme/looper"), PRNumber: &prNumber, Status: "running", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	loop := storage.LoopRecord{ID: "loop_1", Seq: 1, ProjectID: project.ID, Type: "reviewer", TargetType: "pull_request", TargetID: &loopTarget, Repo: runpipe.StringPtr("acme/looper"), PRNumber: &prNumber, Status: "running", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
 	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
@@ -6912,8 +6913,8 @@ func TestRunReviewStepPersistsRepreparedWorktreeBeforeAgentStart(t *testing.T) {
 		Snapshot: &checkpointSnapshot{HeadSHA: "abc123"},
 		Worktree: &checkpointWorktree{Path: filepath.Join(t.TempDir(), "deleted-worktree"), Branch: "feature/review-me", PreparedAt: fixture.nowISO()},
 	}
-	checkpointJSON := mustMarshalJSON(initialCheckpoint)
-	run := storage.RunRecord{ID: "run_1", LoopID: loop.ID, Status: "running", CurrentStep: stringPtr(string(stepReview)), CheckpointJSON: &checkpointJSON, StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	checkpointJSON := runpipe.MustMarshalJSON(initialCheckpoint)
+	run := storage.RunRecord{ID: "run_1", LoopID: loop.ID, Status: "running", CurrentStep: runpipe.StringPtr(string(stepReview)), CheckpointJSON: &checkpointJSON, StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
 	if err := fixture.repos.Runs.Upsert(context.Background(), run); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
@@ -6965,7 +6966,7 @@ func TestRunReviewStepRechecksHoldBeforeAgentStart(t *testing.T) {
 			Worktree: &checkpointWorktree{Path: t.TempDir(), Branch: "feature/review-me", PreparedAt: fixture.nowISO()},
 		},
 	})
-	var holdErr *holdSkipError
+	var holdErr *runpipe.HoldSkipError
 	if !errors.As(err, &holdErr) {
 		t.Fatalf("runReviewStep() error = %v, want hold skip", err)
 	}
@@ -6987,7 +6988,7 @@ func TestRunReviewStepStopsAfterStaleReprepareDuringReview(t *testing.T) {
 	}
 	prNumber := int64(42)
 	loopTarget := "pr:42"
-	loop := storage.LoopRecord{ID: "loop_1", Seq: 1, ProjectID: project.ID, Type: "reviewer", TargetType: "pull_request", TargetID: &loopTarget, Repo: stringPtr("acme/looper"), PRNumber: &prNumber, Status: "running", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	loop := storage.LoopRecord{ID: "loop_1", Seq: 1, ProjectID: project.ID, Type: "reviewer", TargetType: "pull_request", TargetID: &loopTarget, Repo: runpipe.StringPtr("acme/looper"), PRNumber: &prNumber, Status: "running", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
 	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
@@ -6996,8 +6997,8 @@ func TestRunReviewStepStopsAfterStaleReprepareDuringReview(t *testing.T) {
 		Snapshot: &checkpointSnapshot{HeadSHA: "abc123"},
 		Worktree: &checkpointWorktree{Path: filepath.Join(t.TempDir(), "deleted-worktree"), Branch: "feature/review-me", PreparedAt: fixture.nowISO()},
 	}
-	checkpointJSON := mustMarshalJSON(initialCheckpoint)
-	run := storage.RunRecord{ID: "run_1", LoopID: loop.ID, Status: "running", CurrentStep: stringPtr(string(stepReview)), CheckpointJSON: &checkpointJSON, StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	checkpointJSON := runpipe.MustMarshalJSON(initialCheckpoint)
+	run := storage.RunRecord{ID: "run_1", LoopID: loop.ID, Status: "running", CurrentStep: runpipe.StringPtr(string(stepReview)), CheckpointJSON: &checkpointJSON, StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
 	if err := fixture.repos.Runs.Upsert(context.Background(), run); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
@@ -7048,7 +7049,7 @@ func TestProcessClaimedItemRetryAfterReviewFailureRepreparesWorktree(t *testing.
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem(first) error = %v", err)
 	}
-	if firstResult.Status != "failed" || firstResult.FailureKind != FailureRetryableTransient {
+	if firstResult.Status != "failed" || firstResult.FailureKind != runpipe.FailureRetryableTransient {
 		t.Fatalf("first result = %#v, want retryable_transient failure", firstResult)
 	}
 
@@ -7092,14 +7093,14 @@ func TestProcessClaimedItemDoesNotRetryGitHubSelfApprovalFailure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
-	if result.Status != "failed" || result.FailureKind != FailureNonRetryable {
+	if result.Status != "failed" || result.FailureKind != runpipe.FailureNonRetryable {
 		t.Fatalf("result = %#v, want non_retryable self-approval failure", result)
 	}
 	queue, err := fixture.repos.Queue.GetByID(context.Background(), claim.ID)
 	if err != nil || queue == nil {
 		t.Fatalf("Queue.GetByID() = (%#v, %v), want queue", queue, err)
 	}
-	if queue.Status != "queued" || queue.LastErrorKind == nil || *queue.LastErrorKind != string(FailureNonRetryable) || queue.FinishedAt != nil {
+	if queue.Status != "queued" || queue.LastErrorKind == nil || *queue.LastErrorKind != string(runpipe.FailureNonRetryable) || queue.FinishedAt != nil {
 		t.Fatalf("queue = %#v, want requeued non_retryable queue item", queue)
 	}
 }
@@ -7178,14 +7179,14 @@ func TestProcessClaimedItemRequeuesTransientDiscoverShellFailureAfterMaxAttempts
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
-	if result.Status != "failed" || result.FailureKind != FailureRetryableTransient || !strings.Contains(result.Summary, "unexpected EOF") {
+	if result.Status != "failed" || result.FailureKind != runpipe.FailureRetryableTransient || !strings.Contains(result.Summary, "unexpected EOF") {
 		t.Fatalf("result = %#v, want retryable transient failure preserving GitHub error", result)
 	}
 	queue, err := fixture.repos.Queue.GetByID(context.Background(), claim.ID)
 	if err != nil || queue == nil {
 		t.Fatalf("Queue.GetByID() = (%#v, %v), want queue", queue, err)
 	}
-	if queue.Status != "manual_intervention" || queue.LastErrorKind == nil || *queue.LastErrorKind != string(FailureRetryableTransient) || queue.LastError == nil || !strings.Contains(*queue.LastError, "unexpected EOF") || queue.FinishedAt == nil {
+	if queue.Status != "manual_intervention" || queue.LastErrorKind == nil || *queue.LastErrorKind != string(runpipe.FailureRetryableTransient) || queue.LastError == nil || !strings.Contains(*queue.LastError, "unexpected EOF") || queue.FinishedAt == nil {
 		t.Fatalf("queue = %#v, want manual_intervention retryable transient item preserving GitHub error after max attempts", queue)
 	}
 }
@@ -7244,10 +7245,10 @@ func TestProcessClaimedItemTerminatesMissingPullRequestDuringPublishResume(t *te
 	if err := fixture.repos.Loops.Upsert(ctx, storage.LoopRecord{ID: loopID, Seq: 42, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber, Status: "queued", MetadataJSON: &metadataJSON, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
-	if err := fixture.repos.Queue.Upsert(ctx, storage.QueueItemRecord{ID: queueID, ProjectID: stringPtr("project_1"), LoopID: &loopID, Type: "reviewer", TargetType: "pull_request", TargetID: targetID, Repo: &repo, PRNumber: &prNumber, DedupeKey: "reviewer:project_1:loop_publish_pr_not_found:acme/looper:42", Priority: storage.QueuePriorityReviewer, Status: "running", AvailableAt: nowISO, Attempts: 2212, MaxAttempts: 5, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+	if err := fixture.repos.Queue.Upsert(ctx, storage.QueueItemRecord{ID: queueID, ProjectID: runpipe.StringPtr("project_1"), LoopID: &loopID, Type: "reviewer", TargetType: "pull_request", TargetID: targetID, Repo: &repo, PRNumber: &prNumber, DedupeKey: "reviewer:project_1:loop_publish_pr_not_found:acme/looper:42", Priority: storage.QueuePriorityReviewer, Status: "running", AvailableAt: nowISO, Attempts: 2212, MaxAttempts: 5, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
-	checkpointJSON := mustMarshalJSON(reviewerCheckpoint{
+	checkpointJSON := runpipe.MustMarshalJSON(reviewerCheckpoint{
 		ResumePolicy: "advance_from_checkpoint",
 		Detail:       &checkpointDetail{Title: "Deploy vela-web test sha-59e6fd8", State: "OPEN", HeadSHA: "abc123", HeadRefName: "feature", BaseRefName: "main", ReviewRequests: []string{"octocat"}, CurrentLogin: "octocat"},
 		Snapshot:     &checkpointSnapshot{HeadSHA: "abc123"},
@@ -7259,11 +7260,11 @@ func TestProcessClaimedItemTerminatesMissingPullRequestDuringPublishResume(t *te
 			Summary:        "posted review",
 		},
 	})
-	if err := fixture.repos.Runs.Upsert(ctx, storage.RunRecord{ID: "run_publish_pr_not_found_previous", LoopID: loopID, Status: "failed", CurrentStep: stringPtr("publish"), LastCompletedStep: stringPtr("review"), CheckpointJSON: &checkpointJSON, Summary: stringPtr("previous publish failure"), ErrorMessage: stringPtr("previous publish failure"), StartedAt: nowISO, EndedAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+	if err := fixture.repos.Runs.Upsert(ctx, storage.RunRecord{ID: "run_publish_pr_not_found_previous", LoopID: loopID, Status: "failed", CurrentStep: runpipe.StringPtr("publish"), LastCompletedStep: runpipe.StringPtr("review"), CheckpointJSON: &checkpointJSON, Summary: runpipe.StringPtr("previous publish failure"), ErrorMessage: runpipe.StringPtr("previous publish failure"), StartedAt: nowISO, EndedAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
 
-	result, err := runner.ProcessClaimedItem(ctx, storage.QueueItemRecord{ID: queueID, ProjectID: stringPtr("project_1"), LoopID: &loopID, Type: "reviewer", TargetType: "pull_request", TargetID: targetID, Repo: &repo, PRNumber: &prNumber, Status: "running"})
+	result, err := runner.ProcessClaimedItem(ctx, storage.QueueItemRecord{ID: queueID, ProjectID: runpipe.StringPtr("project_1"), LoopID: &loopID, Type: "reviewer", TargetType: "pull_request", TargetID: targetID, Repo: &repo, PRNumber: &prNumber, Status: "running"})
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
@@ -7337,7 +7338,7 @@ func TestExecuteStepPreservesFinalTransientFailureAfterRetryExhaustion(t *testin
 
 func TestIsTransientExternalFailureDetectsWrappedGitHubStatus(t *testing.T) {
 	runner := New(Options{})
-	err := &loopError{message: "GraphQL request failed with HTTP 504", kind: FailureRetryableTransient}
+	err := &runpipe.LoopError{Message: "GraphQL request failed with HTTP 504", Kind: runpipe.FailureRetryableTransient}
 	if !runner.isTransientExternalFailureForProject("", err) {
 		t.Fatal("isTransientExternalFailureForProject(wrapped HTTP 504) = false, want true")
 	}
@@ -7347,21 +7348,21 @@ func TestUnknownBoundaryDoesNotRetryExternalLookingCommandError(t *testing.T) {
 	err := &shell.CommandExecutionError{Message: "Command exited with code 1", Result: shell.Result{Stderr: `Post "https://api.github.com/graphql": EOF`}}
 
 	defaultRunner := New(Options{})
-	if got := defaultRunner.classifyFailureForProject("", err); got.kind != FailureNonRetryable {
-		t.Fatalf("default classifyFailureForProject() kind = %s, want %s", got.kind, FailureNonRetryable)
+	if got := defaultRunner.classifyFailureForProject("", err); got.Kind != runpipe.FailureNonRetryable {
+		t.Fatalf("default classifyFailureForProject() kind = %s, want %s", got.Kind, runpipe.FailureNonRetryable)
 	}
 	if defaultRunner.isTransientExternalFailureForProject("", err) {
 		t.Fatal("default isTransientExternalFailureForProject() = true, want false")
 	}
 
 	boundaryErr := failureclass.WithBoundary(err, failureclass.BoundaryGitHubAPI)
-	if got := defaultRunner.classifyFailureForProject("", boundaryErr); got.kind != FailureRetryableTransient {
-		t.Fatalf("boundary classifyFailureForProject() kind = %s, want %s", got.kind, FailureRetryableTransient)
+	if got := defaultRunner.classifyFailureForProject("", boundaryErr); got.Kind != runpipe.FailureRetryableTransient {
+		t.Fatalf("boundary classifyFailureForProject() kind = %s, want %s", got.Kind, runpipe.FailureRetryableTransient)
 	}
 
 	enabledRunner := New(Options{RetryPolicy: config.ReviewerRetryConfig{EnhancedTransientClassification: true}})
-	if got := enabledRunner.classifyFailureForProject("", err); got.kind != FailureRetryableTransient {
-		t.Fatalf("enabled classifyFailureForProject() kind = %s, want %s", got.kind, FailureRetryableTransient)
+	if got := enabledRunner.classifyFailureForProject("", err); got.Kind != runpipe.FailureRetryableTransient {
+		t.Fatalf("enabled classifyFailureForProject() kind = %s, want %s", got.Kind, runpipe.FailureRetryableTransient)
 	}
 	if !enabledRunner.isTransientExternalFailureForProject("", err) {
 		t.Fatal("enabled isTransientExternalFailureForProject() = false, want true")
@@ -7374,8 +7375,8 @@ func TestEnhancedTransientClassificationHonorsExtraPatterns(t *testing.T) {
 		EnhancedTransientClassification: true,
 		ExtraTransientErrorPatterns:     []string{"temporarily unavailable"},
 	}})
-	if got := runner.classifyFailureForProject("", err); got.kind != FailureRetryableTransient {
-		t.Fatalf("classifyFailureForProject() kind = %s, want %s", got.kind, FailureRetryableTransient)
+	if got := runner.classifyFailureForProject("", err); got.Kind != runpipe.FailureRetryableTransient {
+		t.Fatalf("classifyFailureForProject() kind = %s, want %s", got.Kind, runpipe.FailureRetryableTransient)
 	}
 }
 
@@ -7396,17 +7397,17 @@ func TestIsTransientExternalFailureDetectsModelProviderHTTPAndNetworkFailures(t 
 }
 
 func TestRetryDelayHonorsRetryAfterAndCapsBackoff(t *testing.T) {
-	if got := retryDelay(time.Second, 1, fmt.Errorf("anthropic overloaded; retry-after: 7"), maxRetryDelay); got != 7*time.Second {
+	if got := retryDelay(time.Second, 1, fmt.Errorf("anthropic overloaded; retry-after: 7"), runpipe.MaxRetryDelay); got != 7*time.Second {
 		t.Fatalf("retryDelay(retry-after) = %v, want 7s", got)
 	}
-	if got := retryDelay(time.Minute, 3, fmt.Errorf("anthropic overloaded; retry-after: 120"), maxRetryDelay); got != 120*time.Second {
+	if got := retryDelay(time.Minute, 3, fmt.Errorf("anthropic overloaded; retry-after: 120"), runpipe.MaxRetryDelay); got != 120*time.Second {
 		t.Fatalf("retryDelay(retry-after below cap) = %v, want 120s", got)
 	}
-	if got := retryDelay(time.Minute, 3, fmt.Errorf("anthropic overloaded; retry-after: 600"), maxRetryDelay); got != maxRetryDelay {
-		t.Fatalf("retryDelay(capped retry-after) = %v, want %v", got, maxRetryDelay)
+	if got := retryDelay(time.Minute, 3, fmt.Errorf("anthropic overloaded; retry-after: 600"), runpipe.MaxRetryDelay); got != runpipe.MaxRetryDelay {
+		t.Fatalf("retryDelay(capped retry-after) = %v, want %v", got, runpipe.MaxRetryDelay)
 	}
-	if got := retryDelay(time.Minute, 4, fmt.Errorf("anthropic overloaded"), maxRetryDelay); got != maxRetryDelay {
-		t.Fatalf("retryDelay(capped exponential) = %v, want %v", got, maxRetryDelay)
+	if got := retryDelay(time.Minute, 4, fmt.Errorf("anthropic overloaded"), runpipe.MaxRetryDelay); got != runpipe.MaxRetryDelay {
+		t.Fatalf("retryDelay(capped exponential) = %v, want %v", got, runpipe.MaxRetryDelay)
 	}
 	if got := retryDelay(time.Minute, 3, fmt.Errorf("anthropic overloaded; retry-after: 120"), 10*time.Second); got != 10*time.Second {
 		t.Fatalf("retryDelay(custom capped retry-after) = %v, want 10s", got)
@@ -7418,7 +7419,7 @@ func TestRetryDelayAddsBoundedJitter(t *testing.T) {
 	wantMin := 2 * base
 	wantMax := wantMin + wantMin/retryJitterDivisor
 	for i := 0; i < 20; i++ {
-		got := retryDelay(base, 2, fmt.Errorf("anthropic overloaded"), maxRetryDelay)
+		got := retryDelay(base, 2, fmt.Errorf("anthropic overloaded"), runpipe.MaxRetryDelay)
 		if got < wantMin || got > wantMax {
 			t.Fatalf("retryDelay(jittered) = %v, want between %v and %v", got, wantMin, wantMax)
 		}
@@ -7440,7 +7441,7 @@ func TestMarkAgentExecutionNativeResumePendingForTransientProvider(t *testing.T)
 	if err := fixture.repos.Runs.Upsert(ctx, storage.RunRecord{ID: runID, LoopID: loopID, Status: "running", StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
-	if err := fixture.repos.AgentExecutions.Upsert(ctx, storage.AgentExecutionRecord{ID: "agent_native_resume", ProjectID: stringPtr("project_1"), LoopID: stringPtr(loopID), RunID: stringPtr(runID), Vendor: string(config.AgentVendorOpenCode), Status: "completed", NativeSessionID: stringPtr("session-123"), StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+	if err := fixture.repos.AgentExecutions.Upsert(ctx, storage.AgentExecutionRecord{ID: "agent_native_resume", ProjectID: runpipe.StringPtr("project_1"), LoopID: runpipe.StringPtr(loopID), RunID: runpipe.StringPtr(runID), Vendor: string(config.AgentVendorOpenCode), Status: "completed", NativeSessionID: runpipe.StringPtr("session-123"), StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
 	}
 
@@ -7474,7 +7475,7 @@ func TestNativeResumeImmediateRetryRequiresCurrentProviderOverload(t *testing.T)
 	if err := fixture.repos.Runs.Upsert(ctx, storage.RunRecord{ID: runID, LoopID: loopID, Status: "running", StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
-	if err := fixture.repos.AgentExecutions.Upsert(ctx, storage.AgentExecutionRecord{ID: "agent_native_resume_delay", ProjectID: stringPtr("project_1"), LoopID: stringPtr(loopID), RunID: stringPtr(runID), Vendor: string(config.AgentVendorOpenCode), Status: "completed", NativeSessionID: stringPtr("session-123"), NativeResumeStatus: stringPtr("pending"), StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+	if err := fixture.repos.AgentExecutions.Upsert(ctx, storage.AgentExecutionRecord{ID: "agent_native_resume_delay", ProjectID: runpipe.StringPtr("project_1"), LoopID: runpipe.StringPtr(loopID), RunID: runpipe.StringPtr(runID), Vendor: string(config.AgentVendorOpenCode), Status: "completed", NativeSessionID: runpipe.StringPtr("session-123"), NativeResumeStatus: runpipe.StringPtr("pending"), StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
 	}
 
@@ -7484,7 +7485,7 @@ func TestNativeResumeImmediateRetryRequiresCurrentProviderOverload(t *testing.T)
 	if runner.shouldSkipTransientRetryDelayForNativeResume(ctx, loopID, &githubinfra.TransientError{Err: fmt.Errorf("GitHub GraphQL HTTP 504")}) {
 		t.Fatalf("GitHub transient failure should keep retry delay even with pending native resume")
 	}
-	if runner.shouldSkipTransientRetryDelayForNativeResume(ctx, loopID, &loopError{message: "GraphQL request failed with HTTP 504", kind: FailureRetryableTransient}) {
+	if runner.shouldSkipTransientRetryDelayForNativeResume(ctx, loopID, &runpipe.LoopError{Message: "GraphQL request failed with HTTP 504", Kind: runpipe.FailureRetryableTransient}) {
 		t.Fatalf("non-provider transient loop error should keep retry delay even with pending native resume")
 	}
 }
@@ -7504,13 +7505,13 @@ func TestMarkAgentExecutionNativeResumePendingRequiresSessionAndProviderError(t 
 	if err := fixture.repos.Runs.Upsert(ctx, storage.RunRecord{ID: runID, LoopID: loopID, Status: "running", StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
-	if err := fixture.repos.AgentExecutions.Upsert(ctx, storage.AgentExecutionRecord{ID: "agent_no_session", ProjectID: stringPtr("project_1"), LoopID: stringPtr(loopID), RunID: stringPtr(runID), Vendor: string(config.AgentVendorOpenCode), Status: "failed", StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+	if err := fixture.repos.AgentExecutions.Upsert(ctx, storage.AgentExecutionRecord{ID: "agent_no_session", ProjectID: runpipe.StringPtr("project_1"), LoopID: runpipe.StringPtr(loopID), RunID: runpipe.StringPtr(runID), Vendor: string(config.AgentVendorOpenCode), Status: "failed", StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
 	}
 	if runner.markAgentExecutionNativeResumePendingForTransientProvider(ctx, "agent_no_session", "server_is_overloaded") {
 		t.Fatalf("mark without native session = true, want false")
 	}
-	if err := fixture.repos.AgentExecutions.Upsert(ctx, storage.AgentExecutionRecord{ID: "agent_non_provider", ProjectID: stringPtr("project_1"), LoopID: stringPtr(loopID), RunID: stringPtr(runID), Vendor: string(config.AgentVendorOpenCode), Status: "failed", NativeSessionID: stringPtr("session-123"), StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+	if err := fixture.repos.AgentExecutions.Upsert(ctx, storage.AgentExecutionRecord{ID: "agent_non_provider", ProjectID: runpipe.StringPtr("project_1"), LoopID: runpipe.StringPtr(loopID), RunID: runpipe.StringPtr(runID), Vendor: string(config.AgentVendorOpenCode), Status: "failed", NativeSessionID: runpipe.StringPtr("session-123"), StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
 	}
 	if runner.markAgentExecutionNativeResumePendingForTransientProvider(ctx, "agent_non_provider", "permission denied") {
@@ -7569,7 +7570,7 @@ func TestProcessClaimedItemDoesNotTerminateLoopWhenMaxConsecutiveFailuresReached
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
-	if result.Status != "failed" || result.FailureKind != FailureRetryableTransient {
+	if result.Status != "failed" || result.FailureKind != runpipe.FailureRetryableTransient {
 		t.Fatalf("result = %#v, want retryable failed result", result)
 	}
 	loop, err := fixture.repos.Loops.GetByID(context.Background(), *claim.LoopID)
@@ -7605,11 +7606,11 @@ func TestRunPrepareWorktreeStepPersistsCreatedWorktreeBeforeManualIntervention(t
 	}
 	prNumber := int64(42)
 	loopTarget := "pr:42"
-	loop := storage.LoopRecord{ID: "loop_1", Seq: 1, ProjectID: project.ID, Type: "reviewer", TargetType: "pull_request", TargetID: &loopTarget, Repo: stringPtr("acme/looper"), PRNumber: &prNumber, Status: "running", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	loop := storage.LoopRecord{ID: "loop_1", Seq: 1, ProjectID: project.ID, Type: "reviewer", TargetType: "pull_request", TargetID: &loopTarget, Repo: runpipe.StringPtr("acme/looper"), PRNumber: &prNumber, Status: "running", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
 	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
-	run := storage.RunRecord{ID: "run_1", LoopID: "loop_1", Status: "running", CurrentStep: stringPtr(string(stepWorktree)), CheckpointJSON: stringPtr(mustMarshalJSON(reviewerCheckpoint{})), StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	run := storage.RunRecord{ID: "run_1", LoopID: "loop_1", Status: "running", CurrentStep: runpipe.StringPtr(string(stepWorktree)), CheckpointJSON: runpipe.StringPtr(runpipe.MustMarshalJSON(reviewerCheckpoint{})), StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
 	if err := fixture.repos.Runs.Upsert(context.Background(), run); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
@@ -7776,7 +7777,7 @@ func TestProcessNextFinalizesClaimedQueueItemOnSetupFailure(t *testing.T) {
 	if getErr != nil {
 		t.Fatalf("Queue.GetByID() error = %v", getErr)
 	}
-	if queue == nil || queue.Status != "queued" || queue.FinishedAt != nil || queue.LastErrorKind == nil || *queue.LastErrorKind != string(FailureNonRetryable) {
+	if queue == nil || queue.Status != "queued" || queue.FinishedAt != nil || queue.LastErrorKind == nil || *queue.LastErrorKind != string(runpipe.FailureNonRetryable) {
 		t.Fatalf("queue = %#v, want requeued queue item with non_retryable error kind", queue)
 	}
 	if queue.LastError == nil || !contains(*queue.LastError, "start run blocked") {
@@ -7806,14 +7807,14 @@ func TestProcessClaimedItemTreatsReviewerAgentSetupFailureAsRetryableTransient(t
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
-	if result.Status != "failed" || result.FailureKind != FailureRetryableTransient {
+	if result.Status != "failed" || result.FailureKind != runpipe.FailureRetryableTransient {
 		t.Fatalf("result = %#v, want retryable transient setup failure", result)
 	}
 	queue, err := fixture.repos.Queue.GetByID(context.Background(), claim.ID)
 	if err != nil {
 		t.Fatalf("Queue.GetByID() error = %v", err)
 	}
-	if queue == nil || queue.Status != "queued" || queue.LastErrorKind == nil || *queue.LastErrorKind != string(FailureRetryableTransient) {
+	if queue == nil || queue.Status != "queued" || queue.LastErrorKind == nil || *queue.LastErrorKind != string(runpipe.FailureRetryableTransient) {
 		t.Fatalf("queue = %#v, want queued retryable transient queue kind", queue)
 	}
 }
@@ -7857,7 +7858,7 @@ func TestProcessClaimedItemReturnsWhenCompleteRunFails(t *testing.T) {
 	if err == nil || !contains(err.Error(), "complete run blocked") {
 		t.Fatalf("ProcessClaimedItem() error = %v, want complete run blocked", err)
 	}
-	if result != (ProcessResult{}) {
+	if result != (runpipe.ProcessResult{}) {
 		t.Fatalf("ProcessClaimedItem() = %#v, want zero result on completeRun failure", result)
 	}
 	queue, getErr := fixture.repos.Queue.GetByID(context.Background(), claim.ID)
@@ -7933,7 +7934,7 @@ func TestProcessClaimedItemPreservesPausedLoopOnRetryableFailureAfterPause(t *te
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
-	if result.Status != "failed" || result.FailureKind != FailureRetryableTransient {
+	if result.Status != "failed" || result.FailureKind != runpipe.FailureRetryableTransient {
 		t.Fatalf("result = %#v, want retryable_transient failure", result)
 	}
 	queue, err := fixture.repos.Queue.GetByID(context.Background(), claim.ID)
@@ -7970,7 +7971,7 @@ func TestProcessClaimedItemClassifiesReviewerTimeoutWithDiagnostics(t *testing.T
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
-	if result.Status != "failed" || result.FailureKind != FailureRetryableTransient {
+	if result.Status != "failed" || result.FailureKind != runpipe.FailureRetryableTransient {
 		t.Fatalf("result = %#v, want retryable timeout failure", result)
 	}
 	for _, want := range []string{"timed out (max_runtime)", "configured max runtime 5400s", "idle timeout 600s", "last progress at 2026-04-11T12:45:00.000Z", "processed 900 files"} {
@@ -9552,15 +9553,15 @@ func seedFailedReviewerRecoveryLoop(t *testing.T, fixture *runnerFixture, seed f
 	if seed.FollowUpdates != nil {
 		metadataMap["followUpdates"] = *seed.FollowUpdates
 	}
-	metadata := mustMarshalJSON(metadataMap)
+	metadata := runpipe.MustMarshalJSON(metadataMap)
 	if err := fixture.repos.Loops.Upsert(ctx, storage.LoopRecord{ID: loopID, Seq: 165, ProjectID: "project_1", Type: "reviewer", TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber, Status: "failed", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
-	checkpoint := mustMarshalJSON(reviewerCheckpoint{ResumePolicy: seed.ResumePolicy, Detail: &checkpointDetail{State: "OPEN", HeadSHA: "abc123", ReviewRequests: []string{"octocat"}}})
-	if err := fixture.repos.Runs.Upsert(ctx, storage.RunRecord{ID: "run_recover_reviewer", LoopID: loopID, Status: "failed", CurrentStep: stringPtr(string(stepPublish)), CheckpointJSON: &checkpoint, Summary: &seed.ErrorMessage, ErrorMessage: &seed.ErrorMessage, StartedAt: nowISO, EndedAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+	checkpoint := runpipe.MustMarshalJSON(reviewerCheckpoint{ResumePolicy: seed.ResumePolicy, Detail: &checkpointDetail{State: "OPEN", HeadSHA: "abc123", ReviewRequests: []string{"octocat"}}})
+	if err := fixture.repos.Runs.Upsert(ctx, storage.RunRecord{ID: "run_recover_reviewer", LoopID: loopID, Status: "failed", CurrentStep: runpipe.StringPtr(string(stepPublish)), CheckpointJSON: &checkpoint, Summary: &seed.ErrorMessage, ErrorMessage: &seed.ErrorMessage, StartedAt: nowISO, EndedAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
-	if err := fixture.repos.Queue.Upsert(ctx, storage.QueueItemRecord{ID: queueID, ProjectID: stringPtr("project_1"), LoopID: &loopID, Type: "reviewer", TargetType: "pull_request", TargetID: targetID, Repo: &repo, PRNumber: &prNumber, DedupeKey: buildReviewerDedupeKey("project_1", loopID, repo, prNumber), Priority: storage.QueuePriorityReviewer, Status: "failed", AvailableAt: nowISO, Attempts: queueAttempts, MaxAttempts: queueMaxAttempts, FinishedAt: &nowISO, LastError: &seed.ErrorMessage, LastErrorKind: &seed.QueueErrorKind, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+	if err := fixture.repos.Queue.Upsert(ctx, storage.QueueItemRecord{ID: queueID, ProjectID: runpipe.StringPtr("project_1"), LoopID: &loopID, Type: "reviewer", TargetType: "pull_request", TargetID: targetID, Repo: &repo, PRNumber: &prNumber, DedupeKey: buildReviewerDedupeKey("project_1", loopID, repo, prNumber), Priority: storage.QueuePriorityReviewer, Status: "failed", AvailableAt: nowISO, Attempts: queueAttempts, MaxAttempts: queueMaxAttempts, FinishedAt: &nowISO, LastError: &seed.ErrorMessage, LastErrorKind: &seed.QueueErrorKind, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
 	return loopID, queueID
@@ -9832,7 +9833,7 @@ func (g *fakeGitHubGateway) CapturePullRequestSnapshot(_ context.Context, input 
 	if g.changeHeadOnSecondView && g.viewCalls >= 2 {
 		headSHA = "new-head"
 	}
-	return storage.PullRequestSnapshotRecord{ID: fmt.Sprintf("snapshot:%d:%s", input.PRNumber, input.CapturedAt), ProjectID: input.ProjectID, Repo: input.Repo, PRNumber: input.PRNumber, HeadSHA: headSHA, BaseSHA: stringPtr("base123"), Title: stringPtr("Review me"), Body: stringPtr("PR body"), Author: stringPtr(g.effectiveAuthor()), ChecksSummary: stringPtr("SUCCESS"), PayloadJSON: stringPtr(`{"diff":"diff --git a/a.ts b/a.ts"}`), CapturedAt: input.CapturedAt, CreatedAt: input.CapturedAt}, nil
+	return storage.PullRequestSnapshotRecord{ID: fmt.Sprintf("snapshot:%d:%s", input.PRNumber, input.CapturedAt), ProjectID: input.ProjectID, Repo: input.Repo, PRNumber: input.PRNumber, HeadSHA: headSHA, BaseSHA: runpipe.StringPtr("base123"), Title: runpipe.StringPtr("Review me"), Body: runpipe.StringPtr("PR body"), Author: runpipe.StringPtr(g.effectiveAuthor()), ChecksSummary: runpipe.StringPtr("SUCCESS"), PayloadJSON: runpipe.StringPtr(`{"diff":"diff --git a/a.ts b/a.ts"}`), CapturedAt: input.CapturedAt, CreatedAt: input.CapturedAt}, nil
 }
 
 func (g *fakeGitHubGateway) FindReviewMarker(_ context.Context, input VerifyReviewMarkerInput) (ReviewMarkerResult, error) {

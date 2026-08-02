@@ -17,6 +17,7 @@ import (
 
 	"github.com/MumuTW/looper/internal/domain"
 	gitinfra "github.com/MumuTW/looper/internal/infra/git"
+	"github.com/MumuTW/looper/internal/loops/runpipe"
 	looperdruntime "github.com/MumuTW/looper/internal/runtime"
 	"github.com/MumuTW/looper/internal/storage"
 	workerpkg "github.com/MumuTW/looper/internal/worker"
@@ -1353,7 +1354,7 @@ func TestHandlerLoopRetryDiscardRejectsCheckpointBranchMismatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ProcessClaimedQueueItem() error = %v", err)
 	}
-	if result == nil || result.Status != "failed" || result.FailureKind != workerpkg.FailureManualIntervention || !strings.Contains(result.Summary, "checkout identity mismatch") {
+	if result == nil || result.Status != "failed" || result.FailureKind != runpipe.FailureManualIntervention || !strings.Contains(result.Summary, "checkout identity mismatch") {
 		t.Fatalf("worker result = %#v, want manual-intervention identity refusal", result)
 	}
 	if len(agent.starts) != 0 {
@@ -1511,7 +1512,7 @@ func TestHandlerLoopRetryDiscardRejectsReplacedCheckpointID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ProcessClaimedQueueItem() error = %v", err)
 	}
-	if result == nil || result.FailureKind != workerpkg.FailureManualIntervention || !strings.Contains(result.Summary, "record has been replaced") {
+	if result == nil || result.FailureKind != runpipe.FailureManualIntervention || !strings.Contains(result.Summary, "record has been replaced") {
 		t.Fatalf("worker result = %#v, want replacement-ID manual intervention", result)
 	}
 	if len(agent.starts) != 0 {
