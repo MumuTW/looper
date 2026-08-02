@@ -362,7 +362,7 @@ func validateAuditorGatekeeperCompatibility(config Config, issues *[]ValidationI
 		if !roles.Auditor.Enabled || !gatekeeperTrustIsAuto(roles.Gatekeeper.Trust) {
 			continue
 		}
-		path := fmt.Sprintf("projects[%d]", i)
+		var path string
 		switch {
 		case project.Roles != nil && project.Roles.Gatekeeper != nil && project.Roles.Gatekeeper.Trust != nil && gatekeeperTrustIsAuto(*project.Roles.Gatekeeper.Trust):
 			path = fmt.Sprintf("projects[%d].roles.gatekeeper.trust", i)
