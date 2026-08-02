@@ -147,7 +147,7 @@ func TestAutoGatekeeperNeverMerges(t *testing.T) {
 func TestAggregatedCommitStatusFailsClosedForSharedHead(t *testing.T) {
 	state, description := aggregatedCommitStatus([]Report{
 		{Eligible: true, Reasons: []Reason{}},
-		{Eligible: false, Reasons: []Reason{{Code: ReasonHold, Subject: "looper:hold"}}},
+		{Eligible: false, Reasons: []Reason{{Code: ReasonHold, Subject: labels.HoldGlobal}}},
 	})
 	if state != "failure" {
 		t.Fatalf("state = %q, want failure when any open PR on the head is blocked", state)
