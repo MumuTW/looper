@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"errors"
 	"sort"
 
 	"github.com/MumuTW/looper/internal/config"
@@ -9,6 +10,7 @@ import (
 	"github.com/MumuTW/looper/internal/fixer"
 	"github.com/MumuTW/looper/internal/gatekeeper"
 	githubinfra "github.com/MumuTW/looper/internal/infra/github"
+	"github.com/MumuTW/looper/internal/loops/brownout"
 	"github.com/MumuTW/looper/internal/planner"
 	"github.com/MumuTW/looper/internal/reviewer"
 	"github.com/MumuTW/looper/internal/storage"
@@ -136,13 +138,27 @@ func coordinatorLane(input defaultSchedulerTickInput) discoveryLane {
 		Present:  input.Coordinator != nil,
 		Enabled:  func(projectID string) bool { return coordinatorEnabledForProject(input, projectID) },
 		Discover: func(ctx context.Context, projectID, repo string, snapshot *githubinfra.DiscoverySnapshot) ([]storage.QueueItemRecord, error) {
-			_, err := input.Coordinator.DiscoverIssues(ctx, coordinator.DiscoveryInput{ProjectID: projectID, Repo: repo, Snapshot: snapshot})
+			var triageAdmission func(func() error) error
+			if input.Config != nil && input.Config.Agent.Vendor != nil && input.WithAllowClaimForVendor != nil {
+				vendor := string(*input.Config.Agent.Vendor)
+				triageAdmission = func(fn func() error) error {
+					var fnErr error
+					gateErr := input.WithAllowClaimForVendor(vendor, func() { fnErr = fn() })
+					if errors.Is(gateErr, brownout.ErrOpen) {
+						// A provider brownout suppresses only the LLM decision. The
+						// coordinator runner has already completed its non-agent
+						// maintenance phases and will treat this as a no-op decision.
+						return nil
+					}
+					if gateErr != nil {
+						return gateErr
+					}
+					return fnErr
+				}
+			}
+			_, err := input.Coordinator.DiscoverIssues(ctx, coordinator.DiscoveryInput{ProjectID: projectID, Repo: repo, Snapshot: snapshot, TriageAdmission: triageAdmission})
 			return nil, err
 		},
-	}
-	if input.Config != nil && input.Config.Agent.Vendor != nil {
-		vendor := string(*input.Config.Agent.Vendor)
-		lane.Provider = func(string) string { return vendor }
 	}
 	return lane
 }

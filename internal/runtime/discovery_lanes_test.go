@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/MumuTW/looper/internal/config"
+	coordinatorrole "github.com/MumuTW/looper/internal/coordinator"
 	"github.com/MumuTW/looper/internal/gatekeeper"
 	"github.com/MumuTW/looper/internal/triager"
 )
@@ -184,9 +185,57 @@ func TestInternalDiscoveryLanesResolveAgentProviders(t *testing.T) {
 	if got := byName["triager"].Provider("project"); got != string(claude) {
 		t.Fatalf("triager provider = %q, want planner provider %q", got, claude)
 	}
-	if got := byName["coordinator"].Provider("project"); got != string(codex) {
-		t.Fatalf("coordinator provider = %q, want global provider %q", got, codex)
+	if byName["coordinator"].Provider != nil {
+		t.Fatal("coordinator lane should not gate the entire maintenance pass")
 	}
+}
+
+func TestCoordinatorLanePassesProviderAdmissionToTriageOnly(t *testing.T) {
+	t.Parallel()
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	codex := config.AgentVendorCodex
+	cfg.Agent.Vendor = &codex
+	var (
+		admittedProvider string
+		admissionCalls   int
+		triageCalls      int
+	)
+	lane := coordinatorLane(defaultSchedulerTickInput{
+		Config:      &cfg,
+		Coordinator: coordinatorLaneProbe{triageCalls: &triageCalls},
+		WithAllowClaimForVendor: func(provider string, fn func()) error {
+			admittedProvider = provider
+			admissionCalls++
+			fn()
+			return nil
+		},
+	})
+	if lane.Provider != nil {
+		t.Fatal("coordinator lane unexpectedly has an outer provider gate")
+	}
+	if _, err := lane.Discover(context.Background(), "project", "acme/looper", nil); err != nil {
+		t.Fatalf("Discover() error = %v", err)
+	}
+	if admittedProvider != string(codex) || admissionCalls != 1 || triageCalls != 1 {
+		t.Fatalf("provider=%q admissionCalls=%d triageCalls=%d, want %q, 1, 1", admittedProvider, admissionCalls, triageCalls, codex)
+	}
+}
+
+type coordinatorLaneProbe struct {
+	triageCalls *int
+}
+
+func (p coordinatorLaneProbe) DiscoverIssues(_ context.Context, input coordinatorrole.DiscoveryInput) (coordinatorrole.DiscoveryResult, error) {
+	if input.TriageAdmission == nil {
+		return coordinatorrole.DiscoveryResult{}, nil
+	}
+	return coordinatorrole.DiscoveryResult{}, input.TriageAdmission(func() error {
+		(*p.triageCalls)++
+		return nil
+	})
 }
 
 type budgetTriager struct {
