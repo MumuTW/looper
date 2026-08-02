@@ -733,7 +733,7 @@ func TestRunnerCycleDetectionRemovesOwnedLabelsAndKeepsForeignDispatchLabel(t *t
 	if got := countRemovedIssueOperations(fixture.github.removedLabels, 2, "triaged", "looper:dispatch:plan"); got != 1 {
 		t.Fatalf("issue 2 remove count = %d, want 1", got)
 	}
-	if got := countRemovedIssueOperations(fixture.github.removedLabels, 1, "dispatch/plan"); got != 0 {
+	if got := countRemovedIssueOperations(fixture.github.removedLabels, 1, labels.DispatchPlan); got != 0 {
 		t.Fatalf("foreign bare dispatch label removal count = %d, want 0", got)
 	}
 	if len(fixture.github.createdBodies) != 2 {
@@ -1054,13 +1054,13 @@ func TestRunnerAutonomousDispatchScansEligibleBacklogOutsideRecentIssues(t *test
 		cfg.Roles.Coordinator.Dispatch.AssignTo = "octocat"
 		cfg.Scheduler.MaxConcurrentRuns = 1
 	})
-	seedDispatchIssueWithLabels(fixture, 1, []string{"triaged", "dispatch/implement"})
-	seedDispatchIssueWithLabels(fixture, 200, []string{"triaged", "dispatch/implement"})
+	seedDispatchIssueWithLabels(fixture, 1, []string{"triaged", labels.DispatchImplement})
+	seedDispatchIssueWithLabels(fixture, 200, []string{"triaged", labels.DispatchImplement})
 	backlogIssue := fixture.github.issues[0]
 	recentIssue := fixture.github.issues[1]
 	fixture.github.issues = nil
 	fixture.github.listIssues = func(input githubinfra.ListOpenIssuesInput) []githubinfra.IssueSummary {
-		if containsAllLabels(input.Labels, "triaged", "dispatch/implement") &&
+		if containsAllLabels(input.Labels, "triaged", labels.DispatchImplement) &&
 			strings.Contains(input.Search, `-label:"`+labels.DefaultWorkerReadyTrigger+`"`) {
 			return []githubinfra.IssueSummary{backlogIssue}
 		}
@@ -1089,10 +1089,10 @@ func TestRunnerAutonomousDispatchDeduplicatesRecentAndBacklogCandidates(t *testi
 		cfg.Roles.Coordinator.Dispatch.AssignTo = "octocat"
 		cfg.Scheduler.MaxConcurrentRuns = 2
 	})
-	seedDispatchIssueWithLabels(fixture, 1, []string{"triaged", "dispatch/implement"})
+	seedDispatchIssueWithLabels(fixture, 1, []string{"triaged", labels.DispatchImplement})
 	fixture.github.listIssues = func(input githubinfra.ListOpenIssuesInput) []githubinfra.IssueSummary {
 		if len(input.Labels) == 0 ||
-			(containsAllLabels(input.Labels, "triaged", "dispatch/implement") &&
+			(containsAllLabels(input.Labels, "triaged", labels.DispatchImplement) &&
 				strings.Contains(input.Search, `-label:"`+labels.DefaultWorkerReadyTrigger+`"`)) {
 			return fixture.github.issues
 		}
@@ -1126,19 +1126,19 @@ func TestRunnerAutonomousDispatchRotatesPastBlockedBacklogPage(t *testing.T) {
 
 	backlog := make([]githubinfra.IssueSummary, 0, 101)
 	for issueNumber := int64(1); issueNumber <= 101; issueNumber++ {
-		seedDispatchIssueWithLabels(fixture, issueNumber, []string{"triaged", "dispatch/implement"})
-		backlog = append(backlog, githubinfra.IssueSummary{Number: issueNumber, Labels: []string{"triaged", "dispatch/implement"}})
+		seedDispatchIssueWithLabels(fixture, issueNumber, []string{"triaged", labels.DispatchImplement})
+		backlog = append(backlog, githubinfra.IssueSummary{Number: issueNumber, Labels: []string{"triaged", labels.DispatchImplement}})
 	}
 	// The first oldest page cannot dispatch this hour; the 101st row is the
 	// first eligible one on the next page.
 	for issueNumber := int64(1); issueNumber <= 100; issueNumber++ {
-		fixture.github.details[issueNumber] = githubinfra.IssueDetail{Number: issueNumber, Title: "Blocked", Author: "octo", CreatedAt: fixture.now.Format(time.RFC3339), Labels: []string{"triaged", "dispatch/implement"}, State: "open"}
+		fixture.github.details[issueNumber] = githubinfra.IssueDetail{Number: issueNumber, Title: "Blocked", Author: "octo", CreatedAt: fixture.now.Format(time.RFC3339), Labels: []string{"triaged", labels.DispatchImplement}, State: "open"}
 		fixture.github.timeline[issueNumber] = []map[string]any{{"event": "labeled", "created_at": fixture.now.Format(time.RFC3339), "label": map[string]any{"name": "triaged"}}}
 	}
 	fixture.github.issues = nil
 	var backlogLimits []int
 	fixture.github.listIssues = func(input githubinfra.ListOpenIssuesInput) []githubinfra.IssueSummary {
-		if !containsAllLabels(input.Labels, "triaged", "dispatch/implement") || !strings.Contains(input.Search, `-label:"`+labels.DefaultWorkerReadyTrigger+`"`) {
+		if !containsAllLabels(input.Labels, "triaged", labels.DispatchImplement) || !strings.Contains(input.Search, `-label:"`+labels.DefaultWorkerReadyTrigger+`"`) {
 			return nil
 		}
 		backlogLimits = append(backlogLimits, input.Limit)
@@ -1193,14 +1193,14 @@ func TestRunnerAutonomousDispatchRotatesWithinBacklogPage(t *testing.T) {
 	}
 
 	for issueNumber := int64(1); issueNumber <= 2; issueNumber++ {
-		seedDispatchIssueWithLabels(fixture, issueNumber, []string{"triaged", "dispatch/implement"})
+		seedDispatchIssueWithLabels(fixture, issueNumber, []string{"triaged", labels.DispatchImplement})
 	}
-	fixture.github.details[1] = githubinfra.IssueDetail{Number: 1, Title: "Blocked", Author: "octo", CreatedAt: fixture.now.Format(time.RFC3339), Labels: []string{"triaged", "dispatch/implement"}, State: "open"}
+	fixture.github.details[1] = githubinfra.IssueDetail{Number: 1, Title: "Blocked", Author: "octo", CreatedAt: fixture.now.Format(time.RFC3339), Labels: []string{"triaged", labels.DispatchImplement}, State: "open"}
 	fixture.github.timeline[1] = []map[string]any{{"event": "labeled", "created_at": fixture.now.Format(time.RFC3339), "label": map[string]any{"name": "triaged"}}}
 	backlog := append([]githubinfra.IssueSummary(nil), fixture.github.issues...)
 	fixture.github.issues = nil
 	fixture.github.listIssues = func(input githubinfra.ListOpenIssuesInput) []githubinfra.IssueSummary {
-		if containsAllLabels(input.Labels, "triaged", "dispatch/implement") &&
+		if containsAllLabels(input.Labels, "triaged", labels.DispatchImplement) &&
 			strings.Contains(input.Search, `-label:"`+labels.DefaultWorkerReadyTrigger+`"`) {
 			return backlog
 		}
@@ -1241,7 +1241,7 @@ func TestRunnerRoutedBacklogRecoversTriggeredWorkerWithoutTarget(t *testing.T) {
 		},
 		Lease: protocol.CoordinatorLease{HolderNodeID: "coord-1", FencingToken: 12, ExpiresAt: timePtr(fixture.now.Add(time.Minute))},
 	}
-	issueLabels := []string{"triaged", "dispatch/implement", labels.DefaultWorkerReadyTrigger}
+	issueLabels := []string{"triaged", labels.DispatchImplement, labels.DefaultWorkerReadyTrigger}
 	seedDispatchIssueWithLabels(fixture, 42, issueLabels)
 	detail := fixture.github.details[42]
 	detail.URL = "https://github.com/acme/looper/issues/42"
@@ -1249,7 +1249,7 @@ func TestRunnerRoutedBacklogRecoversTriggeredWorkerWithoutTarget(t *testing.T) {
 	backlogIssue := fixture.github.issues[0]
 	fixture.github.issues = nil
 	fixture.github.listIssues = func(input githubinfra.ListOpenIssuesInput) []githubinfra.IssueSummary {
-		if containsAllLabels(input.Labels, "triaged", "dispatch/implement", labels.DefaultWorkerReadyTrigger) {
+		if containsAllLabels(input.Labels, "triaged", labels.DispatchImplement, labels.DefaultWorkerReadyTrigger) {
 			return []githubinfra.IssueSummary{backlogIssue}
 		}
 		return nil
@@ -1281,13 +1281,13 @@ func TestRunnerBacklogHydrationMatchesAvailableDispatchCapacity(t *testing.T) {
 		cfg.Scheduler.MaxConcurrentRuns = 5
 	})
 	for issueNumber := int64(1); issueNumber <= 50; issueNumber++ {
-		seedDispatchIssueWithLabels(fixture, issueNumber, []string{"triaged", "dispatch/implement"})
+		seedDispatchIssueWithLabels(fixture, issueNumber, []string{"triaged", labels.DispatchImplement})
 	}
 	fixture.github.listIssues = func(input githubinfra.ListOpenIssuesInput) []githubinfra.IssueSummary {
 		if len(input.Labels) == 0 {
 			return nil
 		}
-		if containsAllLabels(input.Labels, "triaged", "dispatch/implement") {
+		if containsAllLabels(input.Labels, "triaged", labels.DispatchImplement) {
 			return fixture.github.issues
 		}
 		return nil
@@ -2292,6 +2292,37 @@ func TestRunnerAssignsReviewerAndTargetInRoutedModeWhenLocalAutoDiscoveryDisable
 	assertOrderedOps(t, fixture.github.ops, []string{"add-reviewers:reviewer", "add-pr:looper:target:blue"})
 }
 
+// TestRunnerAssignsReviewerAndTargetInRoutedModeWithCustomNamespace pins the
+// coordinator-to-reviewer contract for a custom namespace: a reviewer node
+// advertises its discovery trigger under the default looper: prefix, but the
+// routed project lives in the team.looper: namespace. Coordinator must remap
+// the advertised capability labels into the project namespace so a PR carrying
+// the effective team.looper:review trigger is recognized as assignment
+// authority and receives the reviewer request plus target label.
+func TestRunnerAssignsReviewerAndTargetInRoutedModeWithCustomNamespace(t *testing.T) {
+	t.Parallel()
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Network = config.NetworkConfig{Enrolled: true, NodeName: "coord", GitHubLogin: "coord"}
+		cfg.Projects = []config.ProjectRefConfig{{ID: coordinatorFixtureProjectID, Name: "Demo", RepoPath: "/tmp/demo", LabelNamespace: "team.looper:", Network: config.ProjectNetworkConfig{Mode: config.NetworkModeRouted}}}
+		cfg.Roles.Reviewer.Discovery.Triggers.Labels = []string{"looper:review"}
+	})
+	fixture.network.status = protocol.NodeStatusResponse{
+		Membership:  protocol.Membership{NodeID: "node-coord", NodeName: "coord"},
+		Memberships: []protocol.Membership{{NodeID: "node-reviewer", NodeName: "blue", GitHub: protocol.GitHubIdentity{Login: "reviewer", NumericID: 42}, Capabilities: protocol.NodeCapabilities{Roles: []string{"reviewer"}, RoutedProjects: 1, RoutedProjectIDs: []string{fixture.projectID}, ReviewerProjects: []protocol.ReviewerProjectCapability{{ProjectID: fixture.projectID, RequireReviewRequest: boolPtr(false), Labels: []string{"looper:review"}, LabelMode: string(config.LabelModeAll)}}}}},
+		Lease:       protocol.CoordinatorLease{HolderNodeID: "node-coord", FencingToken: 7},
+	}
+	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Labels: []string{"triaged"}}}
+	fixture.github.details[1] = githubinfra.IssueDetail{Number: 1, Title: "Bug", Author: "octo", Labels: []string{"triaged"}, CreatedAt: fixture.now.Add(-time.Hour).Format(time.RFC3339)}
+	fixture.github.linkedPullRequests[1] = []githubinfra.LinkedPullRequest{{Number: 91, State: "OPEN"}}
+	fixture.github.pullRequests[91] = githubinfra.PullRequestDetail{Number: 91, State: "OPEN", Author: "octo", Labels: []string{"team.looper:review"}}
+
+	if _, err := fixture.runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: fixture.projectID, Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	assertOrderedOps(t, fixture.github.ops, []string{"add-reviewers:reviewer", "add-pr:looper:target:blue"})
+}
+
 func TestRunnerAssignsDeterministicTargetForDuplicateReviewerIdentity(t *testing.T) {
 	t.Parallel()
 	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
@@ -2843,7 +2874,7 @@ func TestRunnerRoutedBacklogLeavesStaleHeartbeatSingleTargetUntouched(t *testing
 		},
 		Lease: protocol.CoordinatorLease{HolderNodeID: "coord-1", FencingToken: 12, ExpiresAt: timePtr(fixture.now.Add(time.Minute))},
 	}
-	issueLabels := []string{"triaged", "dispatch/implement", labels.DefaultWorkerReadyTrigger, protocol.TargetLabelForNode("worker-dead")}
+	issueLabels := []string{"triaged", labels.DispatchImplement, labels.DefaultWorkerReadyTrigger, protocol.TargetLabelForNode("worker-dead")}
 	seedDispatchIssueWithLabels(fixture, 77, issueLabels)
 	detail := fixture.github.details[77]
 	detail.URL = "https://github.com/acme/looper/issues/77"
@@ -2851,7 +2882,7 @@ func TestRunnerRoutedBacklogLeavesStaleHeartbeatSingleTargetUntouched(t *testing
 	backlogIssue := fixture.github.issues[0]
 	fixture.github.issues = nil
 	fixture.github.listIssues = func(input githubinfra.ListOpenIssuesInput) []githubinfra.IssueSummary {
-		if containsAllLabels(input.Labels, "triaged", "dispatch/implement", labels.DefaultWorkerReadyTrigger) {
+		if containsAllLabels(input.Labels, "triaged", labels.DispatchImplement, labels.DefaultWorkerReadyTrigger) {
 			return []githubinfra.IssueSummary{backlogIssue}
 		}
 		return nil

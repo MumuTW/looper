@@ -75,6 +75,59 @@ func TestEvaluatePullRequestPreservesUnrecognizedMergeabilityEvidence(t *testing
 	}
 }
 
+func TestEvaluatePullRequestUsesProjectHoldNamespace(t *testing.T) {
+	fixture := newGatekeeperFixture(t)
+	metadata := `{"labelNamespace":"team.looper:"}`
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = %#v, %v", project, err)
+	}
+	project.MetadataJSON = &metadata
+	if err := fixture.repos.Projects.Upsert(context.Background(), *project); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	fixture.github.detail.Labels = []string{"team.looper:hold"}
+
+	report, err := fixture.runner().EvaluatePullRequest(context.Background(), EvaluationInput{
+		ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, ExpectedHeadSHA: "head-1",
+	})
+	if err != nil {
+		t.Fatalf("EvaluatePullRequest() error = %v", err)
+	}
+	if report.Eligible || len(report.Reasons) != 1 || report.Reasons[0].Code != ReasonHold || report.Reasons[0].Subject != "team.looper:hold" {
+		t.Fatalf("report = %#v, want custom namespace hold block", report)
+	}
+	if len(report.Evidence.HoldLabels) != 1 || report.Evidence.HoldLabels[0] != "team.looper:hold" {
+		t.Fatalf("hold evidence = %#v, want custom namespace label", report.Evidence.HoldLabels)
+	}
+}
+
+func TestEvaluatePullRequestUsesConfiguredProjectHoldNamespace(t *testing.T) {
+	fixture := newGatekeeperFixture(t)
+	fixture.github.detail.Labels = []string{"team.looper:hold"}
+	runner := New(Options{
+		Repos:  fixture.repos,
+		GitHub: fixture.github,
+		Now:    func() time.Time { return fixture.now },
+		LabelNamespaceForProject: func(projectID string) (labels.Namespace, bool) {
+			if projectID != "project_1" {
+				return labels.Namespace{}, false
+			}
+			return labels.NewNamespace("team.looper:"), true
+		},
+	})
+
+	report, err := runner.EvaluatePullRequest(context.Background(), EvaluationInput{
+		ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, ExpectedHeadSHA: "head-1",
+	})
+	if err != nil {
+		t.Fatalf("EvaluatePullRequest() error = %v", err)
+	}
+	if report.Eligible || len(report.Reasons) != 1 || report.Reasons[0].Code != ReasonHold {
+		t.Fatalf("report = %#v, want configured namespace hold block", report)
+	}
+}
+
 func TestEvaluatePullRequestBlocksEachSafetyCondition(t *testing.T) {
 	tests := []struct {
 		name   string

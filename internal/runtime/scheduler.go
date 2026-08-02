@@ -29,6 +29,7 @@ import (
 	gitinfra "github.com/MumuTW/looper/internal/infra/git"
 	githubinfra "github.com/MumuTW/looper/internal/infra/github"
 	"github.com/MumuTW/looper/internal/infra/notify"
+	"github.com/MumuTW/looper/internal/labels"
 	"github.com/MumuTW/looper/internal/loops/runpipe"
 	networkclient "github.com/MumuTW/looper/internal/network/client"
 	"github.com/MumuTW/looper/internal/network/protocol"
@@ -2060,6 +2061,12 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			Repos:  repos,
 			GitHub: gatekeeperGitHubAdapter{Gateway: githubGateway, config: &cfg},
 			Now:    now,
+			LabelNamespaceForProject: func(projectID string) (labels.Namespace, bool) {
+				if _, ok := runtimeProjectBinding(cfg, projectID); !ok {
+					return labels.Namespace{}, false
+				}
+				return config.ProjectLabelNamespace(&cfg, projectID), true
+			},
 			TrustForProject: func(projectID string) config.GatekeeperTrustLevel {
 				return gatekeeperTrustForProject(cfg, projectID)
 			},

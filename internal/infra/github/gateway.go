@@ -4094,11 +4094,8 @@ func isLabelAlreadyExistsError(err error) bool {
 
 // labelPresentation resolves the color and description to create a label with.
 func labelPresentation(label string) labels.Definition {
-	normalized := labels.Normalize(label)
-	for _, definition := range labels.Standard() {
-		if labels.Normalize(definition.Name) == normalized {
-			return definition
-		}
+	if definition, ok := labels.DefinitionFor(label); ok {
+		return definition
 	}
 	return labels.Definition{Name: label, Color: "5319e7", Description: "Managed by looper"}
 }

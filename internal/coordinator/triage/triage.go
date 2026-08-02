@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/nexu-io/looper/internal/labels"
+	"github.com/MumuTW/looper/internal/labels"
 )
 
 const jsISOStringLayout = "2006-01-02T15:04:05.000Z"
@@ -71,6 +71,11 @@ type Config struct {
 	OutOfScopeLabel       string
 	UnclearLabel          string
 	ReTriageOnAuthorReply bool
+	Namespace             labels.Namespace
+	// ProjectClassificationLabels opts a custom namespace into the optional
+	// kind/area/complexity projection. The zero-value default namespace keeps
+	// the historical behavior for backwards compatibility.
+	ProjectClassificationLabels bool
 }
 
 type Input struct {
@@ -179,9 +184,13 @@ func BuildPrompt(input Input) string {
 	b.WriteString("\nAllowed complexity labels: ")
 	b.WriteString(strings.Join(AllowedComplexities(), ", "))
 	b.WriteString("\nAllowed dispatch labels: ")
-	b.WriteString(strings.Join(AllowedDispatches(), ", "))
+	b.WriteString(strings.Join(AllowedDispatchesFor(input.Config.Namespace), ", "))
+	namespace := input.Config.Namespace
+	if strings.TrimSpace(namespace.Prefix) == "" {
+		namespace = labels.DefaultNamespace()
+	}
 	b.WriteString("\nOutput schema:\n")
-	b.WriteString(fmt.Sprintf(`{"disposition":"valid|out-of-scope|unclear","comment":"string","labels":{"kind":["kind/..."],"area":["area/..."],"complexity":["complexity/..."],"dispatch":["%s|%s"]}}`, labels.DispatchPlan, labels.DispatchImplement))
+	b.WriteString(fmt.Sprintf(`{"disposition":"valid|out-of-scope|unclear","comment":"string","labels":{"kind":["kind/..."],"area":["area/..."],"complexity":["complexity/..."],"dispatch":["%s|%s"]}}`, namespace.DispatchPlan(), namespace.DispatchImplement()))
 	b.WriteString("\n\nIssue:\n")
 	b.WriteString(input.Issue.Title)
 	b.WriteString("\n\n")
@@ -232,7 +241,11 @@ func AllowedComplexities() []string {
 }
 
 func AllowedDispatches() []string {
-	return labels.DispatchLabels()
+	return AllowedDispatchesFor(labels.DefaultNamespace())
+}
+
+func AllowedDispatchesFor(namespace labels.Namespace) []string {
+	return namespace.DispatchLabels()
 }
 
 func parseDecision(raw string, cfg Config) (Decision, error) {
@@ -244,7 +257,16 @@ func parseDecision(raw string, cfg Config) (Decision, error) {
 	if comment == "" {
 		return Decision{}, fmt.Errorf("comment is required")
 	}
-	clear := append([]string{"kind/*", "area/*", "complexity/*", cfg.OutOfScopeLabel, cfg.UnclearLabel}, labels.DispatchLabels()...)
+	namespace := cfg.Namespace
+	if strings.TrimSpace(namespace.Prefix) == "" {
+		namespace = labels.DefaultNamespace()
+	}
+	classificationProjection := classificationProjectionEnabled(cfg, namespace)
+	clear := []string{cfg.OutOfScopeLabel, cfg.UnclearLabel}
+	if classificationProjection {
+		clear = append([]string{"kind/*", "area/*", "complexity/*"}, clear...)
+	}
+	clear = append(clear, namespace.DispatchLabels()...)
 	switch Disposition(strings.TrimSpace(output.Disposition)) {
 	case DispositionValid:
 		kind, err := requireExactlyOne(output.Labels.Kind, AllowedKinds())
@@ -259,11 +281,15 @@ func parseDecision(raw string, cfg Config) (Decision, error) {
 		if err != nil {
 			return Decision{}, err
 		}
-		dispatch, err := requireExactlyOne(output.Labels.Dispatch, AllowedDispatches())
+		dispatch, err := requireExactlyOne(output.Labels.Dispatch, AllowedDispatchesFor(namespace))
 		if err != nil {
 			return Decision{}, err
 		}
-		return Decision{Disposition: DispositionValid, ClearLabelPatterns: clear, ApplyLabels: []string{kind, area, complexity, dispatch, cfg.TriagedLabel}, CommentBody: comment, MarkTriaged: true}, nil
+		apply := []string{dispatch, cfg.TriagedLabel}
+		if classificationProjection {
+			apply = []string{kind, area, complexity, dispatch, cfg.TriagedLabel}
+		}
+		return Decision{Disposition: DispositionValid, ClearLabelPatterns: clear, ApplyLabels: apply, CommentBody: comment, MarkTriaged: true}, nil
 	case DispositionOutOfScope:
 		if hasAnyLabels(output.Labels) {
 			return Decision{}, fmt.Errorf("unexpected labels for out-of-scope disposition")
@@ -277,6 +303,13 @@ func parseDecision(raw string, cfg Config) (Decision, error) {
 	default:
 		return Decision{}, fmt.Errorf("unknown disposition")
 	}
+}
+
+func classificationProjectionEnabled(cfg Config, namespace labels.Namespace) bool {
+	if strings.TrimSpace(namespace.Prefix) == "" || labels.Normalize(namespace.Prefix) == labels.Prefix {
+		return true
+	}
+	return cfg.ProjectClassificationLabels
 }
 
 func requireExactlyOne(values []string, allowed []string) (string, error) {

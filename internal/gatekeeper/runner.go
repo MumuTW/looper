@@ -216,10 +216,15 @@ type GitHubGateway interface {
 const RequiredStatusContext = "Looper Gatekeeper"
 
 type Options struct {
-	Repos               *storage.Repositories
-	GitHub              GitHubGateway
-	Now                 func() time.Time
-	PolicyPermitsTarget func(projectID, repo, baseRefName string) bool
+	Repos  *storage.Repositories
+	GitHub GitHubGateway
+	Now    func() time.Time
+	// LabelNamespaceForProject resolves config-managed projects. API-managed
+	// projects fall back to their persisted catalog metadata in the runner.
+	// The boolean distinguishes an unconfigured project from an explicit
+	// default namespace so persisted metadata is not accidentally shadowed.
+	LabelNamespaceForProject func(projectID string) (labels.Namespace, bool)
+	PolicyPermitsTarget      func(projectID, repo, baseRefName string) bool
 	// TrustForProject reports a project's merge-authority level. Nil means every
 	// project stays at observe, which is also the configured default.
 	TrustForProject func(projectID string) config.GatekeeperTrustLevel
@@ -240,16 +245,17 @@ type Options struct {
 // Stateful: agent-free but not database-free — it persists Gate reports in
 // the local SQLite event log.
 type Runner struct {
-	repos                  *storage.Repositories
-	github                 GitHubGateway
-	now                    func() time.Time
-	policyPermitsTarget    func(projectID, repo, baseRefName string) bool
-	trustForProject        func(projectID string) config.GatekeeperTrustLevel
-	diffBudgetForProject   func(projectID string) config.GatekeeperDiffBudget
-	configuredTargetBranch func(projectID string) string
-	logWarn                func(msg string, fields map[string]any)
-	lastPublishedStatusMu  sync.Mutex
-	lastPublishedStatus    map[string]string
+	repos                    *storage.Repositories
+	github                   GitHubGateway
+	now                      func() time.Time
+	labelNamespaceForProject func(projectID string) (labels.Namespace, bool)
+	policyPermitsTarget      func(projectID, repo, baseRefName string) bool
+	trustForProject          func(projectID string) config.GatekeeperTrustLevel
+	diffBudgetForProject     func(projectID string) config.GatekeeperDiffBudget
+	configuredTargetBranch   func(projectID string) string
+	logWarn                  func(msg string, fields map[string]any)
+	lastPublishedStatusMu    sync.Mutex
+	lastPublishedStatus      map[string]string
 }
 
 func New(options Options) *Runner {
@@ -262,8 +268,10 @@ func New(options Options) *Runner {
 		policy = func(string, string, string) bool { return true }
 	}
 	return &Runner{
-		repos: options.Repos, github: options.GitHub, now: now, policyPermitsTarget: policy,
-		trustForProject: options.TrustForProject, diffBudgetForProject: options.DiffBudgetForProject,
+		repos: options.Repos, github: options.GitHub, now: now,
+		labelNamespaceForProject: options.LabelNamespaceForProject,
+		policyPermitsTarget:      policy,
+		trustForProject:          options.TrustForProject, diffBudgetForProject: options.DiffBudgetForProject,
 		configuredTargetBranch: options.ConfiguredTargetBranch,
 		logWarn:                options.LogWarn,
 	}
@@ -524,12 +532,13 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 	if detail.IsDraft {
 		report.Reasons = append(report.Reasons, Reason{Code: ReasonPullRequestDraft})
 	}
-	// Normalized, like the other hold gates: a Gate report that omits a hold
-	// spelled "Looper:Hold" would record the Pull Request as eligible while a
-	// human veto is in force.
-	if labels.Has(detail.Labels, labels.HoldGlobal) {
-		report.Evidence.HoldLabels = append(report.Evidence.HoldLabels, labels.HoldGlobal)
-		report.Reasons = append(report.Reasons, Reason{Code: ReasonHold, Subject: labels.HoldGlobal})
+	// Normalize the effective project namespace before evaluating the human
+	// veto. A custom namespace's hold is authoritative for that project; using
+	// the global default here would let an explicitly held PR appear eligible.
+	holdLabel := r.projectLabelNamespace(ctx, input.ProjectID).HoldGlobal()
+	if labels.Has(detail.Labels, holdLabel) {
+		report.Evidence.HoldLabels = append(report.Evidence.HoldLabels, holdLabel)
+		report.Reasons = append(report.Reasons, Reason{Code: ReasonHold, Subject: holdLabel})
 	}
 	report.Evidence.ProjectPolicyPermitsTarget = r.policyPermitsTarget(input.ProjectID, input.Repo, report.Evidence.BaseRefName)
 	if !report.Evidence.ProjectPolicyPermitsTarget {
@@ -807,6 +816,21 @@ func (r *Runner) projectCWD(ctx context.Context, projectID string) string {
 		return ""
 	}
 	return project.RepoPath
+}
+
+func (r *Runner) projectLabelNamespace(ctx context.Context, projectID string) labels.Namespace {
+	if r != nil && r.labelNamespaceForProject != nil {
+		if namespace, configured := r.labelNamespaceForProject(strings.TrimSpace(projectID)); configured {
+			return namespace
+		}
+	}
+	if r != nil && r.repos != nil && r.repos.Projects != nil {
+		project, err := r.repos.Projects.GetByID(ctx, strings.TrimSpace(projectID))
+		if err == nil && project != nil {
+			return config.ProjectLabelNamespaceForMetadata(nil, project.ID, project.MetadataJSON)
+		}
+	}
+	return labels.DefaultNamespace()
 }
 
 func (r *Runner) persistProviderBlock(ctx context.Context, report Report, code ReasonCode, subject string) (Report, error) {

@@ -4,7 +4,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/nexu-io/looper/internal/labels"
+	"github.com/MumuTW/looper/internal/labels"
 )
 
 func TestCriteriaFailureLabelsOnlyRemovesOwnedDispatchLabels(t *testing.T) {
