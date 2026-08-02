@@ -1987,9 +1987,6 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			TrustForProject: func(projectID string) config.GatekeeperTrustLevel {
 				return gatekeeperTrustForProject(cfg, projectID)
 			},
-			MergeStrategyForProject: func(projectID string) config.ReviewerAutoMergeStrategy {
-				return config.ProjectRoleConfigs(cfg, projectID).Reviewer.AutoMerge.Strategy
-			},
 			DiffBudgetForProject: func(projectID string) config.GatekeeperDiffBudget {
 				return gatekeeperDiffBudgetForProject(cfg, projectID)
 			},
@@ -2011,6 +2008,17 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 					configuredBase = strings.TrimSpace(*project.BaseBranch)
 				}
 				return strings.EqualFold(strings.TrimSpace(configuredBase), strings.TrimSpace(baseRefName))
+			},
+			ConfiguredTargetBranch: func(projectID string) string {
+				project, ok := runtimeProjectBinding(cfg, projectID)
+				if !ok {
+					return ""
+				}
+				configuredBase := cfg.Defaults.BaseBranch
+				if project.BaseBranch != nil && strings.TrimSpace(*project.BaseBranch) != "" {
+					configuredBase = strings.TrimSpace(*project.BaseBranch)
+				}
+				return strings.TrimSpace(configuredBase)
 			},
 		})
 	}

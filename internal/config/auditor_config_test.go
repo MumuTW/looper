@@ -29,6 +29,55 @@ func TestAuditorConfigRejectsNonPositiveEnabledWindow(t *testing.T) {
 	}
 }
 
+func TestAuditorRejectsGatekeeperAutoTrust(t *testing.T) {
+	t.Parallel()
+	var issues []ValidationIssue
+	validateAuditorGatekeeperCompatibility(Config{
+		Roles: RoleConfigs{
+			Auditor:    AuditorRoleConfig{Enabled: true, WindowMinutes: 60},
+			Gatekeeper: GatekeeperRoleConfig{Trust: GatekeeperTrustAuto},
+		},
+	}, &issues)
+	if len(issues) != 1 || issues[0].Path != "roles.auditor.enabled" {
+		t.Fatalf("issues = %#v, want global auditor/auto conflict", issues)
+	}
+}
+
+func TestAuditorRejectsProjectGatekeeperAutoOverride(t *testing.T) {
+	t.Parallel()
+	auto := GatekeeperTrustAuto
+	var issues []ValidationIssue
+	validateAuditorGatekeeperCompatibility(Config{
+		Roles: RoleConfigs{Auditor: AuditorRoleConfig{Enabled: true, WindowMinutes: 60}},
+		Projects: []ProjectRefConfig{{
+			ID: "demo",
+			Roles: &PartialRoleConfigs{
+				Gatekeeper: &PartialGatekeeperRoleConfig{Trust: &auto},
+				Auditor:    &PartialAuditorRoleConfig{Enabled: ptrBool(true)},
+			},
+		}},
+	}, &issues)
+	if len(issues) != 1 || issues[0].Path != "projects[0].roles.gatekeeper.trust" {
+		t.Fatalf("issues = %#v, want project gatekeeper/auto conflict", issues)
+	}
+}
+
+func ptrBool(v bool) *bool { return &v }
+
+func TestPostMergeDigestRejectsGatekeeperAutoTrust(t *testing.T) {
+	t.Parallel()
+	var issues []ValidationIssue
+	validatePostMergeDigestGatekeeperCompatibility(Config{
+		Roles: RoleConfigs{
+			Gatekeeper:  GatekeeperRoleConfig{Trust: GatekeeperTrustAuto},
+			Coordinator: CoordinatorRoleConfig{PostMergeDigest: &CoordinatorPostMergeDigestConfig{Enabled: true, Schedule: "08:00", Timezone: "UTC", MaxItems: 20}},
+		},
+	}, &issues)
+	if len(issues) != 1 || issues[0].Path != "roles.coordinator.postMergeDigest.enabled" {
+		t.Fatalf("issues = %#v, want global post-merge digest/auto conflict", issues)
+	}
+}
+
 func TestClonePartialRoleConfigsPreservesAuditorFields(t *testing.T) {
 	enabled, window := true, 20
 	original := &PartialRoleConfigs{Auditor: &PartialAuditorRoleConfig{Enabled: &enabled, WindowMinutes: &window}}

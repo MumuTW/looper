@@ -784,13 +784,11 @@ const (
 	// GatekeeperTrustAdvise additionally publishes the verdict and its reasons on
 	// the pull request, so a human can decide without redoing the judgement.
 	GatekeeperTrustAdvise GatekeeperTrustLevel = "advise"
-	// GatekeeperTrustAuto lets Gatekeeper merge what it judges eligible. The
-	// value is accepted and implemented: on the primary evaluation pass, after
-	// the Gate report is persisted, the runner re-evaluates the pull request
-	// against the observed head and calls MergePullRequest only if it is still
-	// eligible. Config validation rejects it only when combined with
-	// roles.reviewer.autoMerge.enabled, because two merge authorities racing on
-	// the same pull request is not a configuration anyone can reason about.
+	// GatekeeperTrustAuto publishes the required current-head status for GitHub
+	// branch protection on the pull request head SHA only. It never performs a
+	// merge itself: GitHub remains the merge authority. It does not publish
+	// status for GitHub native merge-queue merge-group SHAs; branch protection
+	// that requires Looper Gatekeeper on merge-group commits is unsupported.
 	GatekeeperTrustAuto GatekeeperTrustLevel = "auto"
 )
 

@@ -323,6 +323,20 @@ Configuration lives under `roles.reviewer.autoMerge.*`, with the usual `projects
 
 When auto-merge is enabled and the PR is in scope, Reviewer verifies every acceptance-criteria checkbox against the diff before it submits APPROVE. The approval body includes a per-criterion evidence section pointing at files and lines. If every criterion passes, Reviewer calls `gh pr merge --auto`; GitHub branch protection remains the authority for whether the PR actually merges.
 
+For current-head Codex-review enforcement, set `roles.gatekeeper.trust = "auto"`
+and require the `Looper Gatekeeper` status in the target branch's protection
+rule. Gatekeeper binds the status to the current commit: a push has no inherited
+success status, so GitHub and Mergify wait until Codex reviews that new head.
+
+**Caveats:** status publishes on the pull request head SHA only — not on GitHub
+native merge-queue merge-group commits. Branch protection must require
+`Looper Gatekeeper`; a failing optional status does not block merge. Do not
+enable `roles.auditor` on the same project while gatekeeper trust is `auto`;
+Auditor requires merge-outcome evidence that status-only auto does not emit
+(see [configuration](configuration.md#merge-gatekeeper-trust-level-rolescatekeepertrust)).
+Post-merge digest likewise only sees Coordinator merge-watch merges (and
+historical Gatekeeper merge-outcome rows) while `auto` is status-only.
+
 Comment markers used by this flow:
 
 - `<!-- looper:reviewer:criteria-fail -->` — Reviewer found at least one acceptance criterion without satisfying evidence in the diff and returned the linked Issue to re-Triage

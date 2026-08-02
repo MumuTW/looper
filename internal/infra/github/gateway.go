@@ -521,6 +521,18 @@ type PullRequestCommit struct {
 	CommitterKnown bool
 }
 
+// CommitStatusInput is a policy result attached to one immutable commit. GitHub
+// branch protection, not Looper's local event log, enforces this result before
+// a merge or merge-queue progression.
+type CommitStatusInput struct {
+	Repo        string
+	SHA         string
+	Context     string
+	State       string
+	Description string
+	CWD         string
+}
+
 type PullRequestCheckRunsInput struct {
 	Repo string
 	Ref  string
@@ -566,7 +578,10 @@ type VerifyReviewMarkerInput struct {
 	AllowedReviewEvents []string
 	AuthorLogin         string
 	AllowCleanComment   bool
-	CWD                 string
+	// SkipInlineComments skips the review-comments fetch when the caller only
+	// needs marker presence and outcome (Gatekeeper auto mode).
+	SkipInlineComments bool
+	CWD                string
 }
 
 type ReviewMarkerResult struct {
@@ -2080,6 +2095,35 @@ func (g *Gateway) MergePullRequest(ctx context.Context, input EnableAutoMergeInp
 	return err
 }
 
+// SetCommitStatus publishes a status for exactly one commit. A later push has a
+// different SHA and therefore cannot inherit this decision.
+func (g *Gateway) SetCommitStatus(ctx context.Context, input CommitStatusInput) error {
+	sha := strings.TrimSpace(input.SHA)
+	contextName := strings.TrimSpace(input.Context)
+	state := strings.ToLower(strings.TrimSpace(input.State))
+	if sha == "" {
+		return fmt.Errorf("commit status SHA is required")
+	}
+	if contextName == "" {
+		return fmt.Errorf("commit status context is required")
+	}
+	switch state {
+	case "error", "failure", "pending", "success":
+	default:
+		return fmt.Errorf("commit status state %q is invalid", input.State)
+	}
+	hostname, repo := splitRepoHostname(input.Repo)
+	args := []string{"api", fmt.Sprintf("repos/%s/statuses/%s", repo, encodeURIComponent(sha)), "--method", "POST", "-f", "state=" + state, "-f", "context=" + contextName}
+	if description := strings.TrimSpace(input.Description); description != "" {
+		args = append(args, "-f", "description="+description)
+	}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	_, err := g.runGh(ctx, input.CWD, "", args...)
+	return err
+}
+
 // MarkPullRequestReady takes a draft Pull Request out of draft.
 //
 // It is idempotent by re-reading rather than by pre-checking: a human clicking
@@ -2857,7 +2901,7 @@ func (g *Gateway) FindReviewMarker(ctx context.Context, input VerifyReviewMarker
 		return ReviewMarkerResult{}, err
 	}
 	marker := findAllowedReviewMarker(reviewsResult.Stdout, input.Marker, input.AllowedReviewEvents, input.AuthorLogin, input.AllowCleanComment)
-	if marker.Found && marker.ReviewID != "" {
+	if marker.Found && marker.ReviewID != "" && !input.SkipInlineComments {
 		comments, err := g.fetchReviewCommentBodies(ctx, input.Repo, input.PRNumber, marker.ReviewID, input.CWD)
 		if err != nil {
 			return ReviewMarkerResult{}, err

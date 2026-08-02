@@ -848,34 +848,39 @@ decides what it may do with that judgement.
 | --- | --- |
 | `observe` (default) | Gate report only. Nothing is published, nothing is merged. |
 | `advise` | Additionally publishes the verdict and every blocking reason on the pull request, so the decision costs one read instead of a re-investigation. The human still merges. |
-| `auto` | Gatekeeper merges what it judges eligible, after re-establishing that judgement immediately beforehand. |
+| `auto` | Requires a completed Looper/Codex review for the current head, then publishes the `Looper Gatekeeper` status for that exact **pull request head SHA**. GitHub branch protection consumes the status; Gatekeeper never calls merge itself. |
 
-### What `auto` does before merging
+`auto` has one required external authority: GitHub branch protection must require
+the `Looper Gatekeeper` status context on the target branch. The status is the
+enforcement point for Mergify's branch-protection queue injection on the PR head;
+the local Gate report remains audit evidence only. If protection does not
+require that context, Gatekeeper publishes a failing status and marks the PR
+ineligible — but an *unrequired* failing status cannot stop merge, so operators
+must add the required check before relying on `auto`.
 
-An eligible verdict is not a licence. Holds, reviews, threads, and project policy
-can all change without moving the head, so a Gate report is only ever a statement
-about the moment it was made.
+**Known limitations at `auto`:**
 
-At `auto`, Gatekeeper therefore **re-runs the complete evaluation** immediately
-before merging and proceeds only if it still passes against the same head. A
-cheaper head comparison would miss exactly the changes that invariant names. The
-merge itself passes `--match-head-commit`, so the forge refuses if anything was
-pushed in between — the decision cannot be applied to a commit it was not made
-about.
-
-Every attempt is recorded, refusals included, with the gates that blocked the
-confirming pass. The merge is immediate rather than handed to GitHub's
-auto-merge: auto-merge applies the decision later, by which time the evaluation
-behind it is stale.
-
-`auto` cannot be combined with `roles.reviewer.autoMerge.enabled`. Two merge
-authorities on one pull request is not a configuration anyone can reason about —
-whichever wins the race decides, and Reviewer's path checks a strictly narrower
-set of gates.
+- Status is keyed by commit SHA, not pull request. If two open pull requests share
+  the same head commit, discovery aggregates their verdicts before publishing
+  success — any blocked open PR on that head keeps the status non-successful.
+- Status is published on the pull request head only. GitHub's native merge queue
+  evaluates required checks on merge-group commits; `auto` does not publish
+  status for those SHAs and cannot satisfy branch protection bound to merge-group
+  heads. Use observe/advise, or require the status only on PR heads with a merge
+  path that does not depend on merge-group checks.
+- `roles.auditor` cannot be enabled on the same project scope while gatekeeper
+  trust is `auto`. Auditor still reads Gatekeeper `MergeOutcome` events that
+  status-only auto no longer emits; forge-observed merge evidence is not yet
+  implemented.
+- `roles.coordinator.postMergeDigest` still classifies merges from Coordinator
+  merge-watch events and historical Gatekeeper `MergeOutcome` rows. Status-only
+  `auto` does not emit new merge-outcome events, so Mergify or manual merges
+  without a linked Coordinator merge-watch are absent from the daily digest
+  until forge-observed merge evidence exists.
 
 ```toml
 [roles.gatekeeper]
-trust = "advise"
+trust = "auto"
 ```
 
 Project overrides use `projects[].roles.gatekeeper.trust`.
@@ -911,13 +916,11 @@ report is audit evidence rather than merge authority.
 
 ### Relationship to `roles.reviewer.autoMerge`
 
-These are two different merge stories, and today they coexist: Reviewer's
-auto-merge opts a PR into GitHub's native auto-merge on its own approval, while
-Gatekeeper only observes or advises. Reviewer's path checks a narrower set of
-conditions — notably **not** unresolved review threads or requested changes.
-[#116](https://github.com/MumuTW/looper/issues/116) consolidates both behind this
-ladder and retires `roles.reviewer.autoMerge`; until `auto` exists, Reviewer's
-setting remains the only way Looper merges anything.
+These are two different responsibilities. Reviewer can opt a PR into GitHub's
+native auto-merge, while `Gatekeeper = auto` supplies the externally enforced
+status that prevents GitHub or Mergify from completing a merge until the exact
+head has a completed Codex review and every other Gatekeeper condition passes.
+Reviewer approval alone is therefore insufficient once the status is required.
 
 ## Merge Gatekeeper diff budget (`roles.gatekeeper.diffBudget`)
 
@@ -925,10 +928,9 @@ The diff budget is an optional boolean change-size guard. When configured,
 Gatekeeper reads GitHub's provider-observed `changedFiles` and `deletions` for
 the exact pull-request head during evaluation and blocks the verdict when either
 count exceeds its configured bound. GitHub's provider metadata is the authority
-for the counts; the agent's output is not used. The gate runs on both the primary
-evaluation and the confirming pass before an `auto` merge, and it fails closed
-(blocking with `provider_state_unavailable`) when the enabled stats cannot be
-read.
+for the counts; the agent's output is not used. The gate runs during periodic
+Gatekeeper evaluation and fails closed (blocking with `provider_state_unavailable`)
+when the enabled stats cannot be read.
 
 | Path | Purpose | Default |
 | --- | --- | --- |
@@ -982,13 +984,9 @@ Reviewers should weigh these blind spots before relying on it:
   the head does not. The discovery fingerprint includes the base SHA so a
   rewritten merge base invalidates a reused verdict rather than serving a stale
   one for up to the skip window.
-- At the `auto` trust level the merge action binds only the pull-request head
-  (`gh pr merge --match-head-commit`); GitHub's merge API accepts no parameter
-  that atomically pins the base. The confirming pass revalidates the base
-  immediately before the merge, but if the base branch advances in the window
-  between that final read and the merge call itself, the merge can still proceed
-  against a new base whose recomputed diff exceeds the budget. That window is
-  narrow but not closed — it is a documented blind spot, not a guarantee.
+- At the `auto` trust level Gatekeeper publishes commit status only; it never
+  merges. The diff-budget gate still runs on each evaluation and fails closed when
+  the enabled stats cannot be read or the merge base advances between reads.
 
 ## Pipeline digest (`roles.escalator`)
 
