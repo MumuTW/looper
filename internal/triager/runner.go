@@ -275,8 +275,8 @@ func New(options Options) *Runner {
 	return &Runner{
 		repos: options.Repos, github: options.GitHub, llm: options.LLM,
 		planner: options.Planner, now: now, sourceLookback: sourceLookback, decisionLimit: decisionLimit,
-		awaitingCursor: map[string]awaitingRecheckCursor{},
-		pendingCursor:  map[string]string{},
+		awaitingCursor:   map[string]awaitingRecheckCursor{},
+		pendingCursor:    map[string]string{},
 		policyForProject: options.PolicyForProject,
 	}
 }
@@ -396,6 +396,11 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 	pending := pendingSourceStates(states)
 	repositoryVisibility := ""
 	if configuredAdmission && hasUnreportedSource(pending) {
+		if !reservePendingForgeRead(input.PendingForgeReadBudget, project.ID, &result) {
+			result.PendingSourcesDeferred += len(pending)
+			result.Skipped += len(pending)
+			return result, nil
+		}
 		settings, err := r.github.GetRepositorySettings(ctx, githubinfra.RepositorySettingsInput{Repo: input.Repo, CWD: project.RepoPath})
 		if err != nil {
 			return result, err
@@ -555,7 +560,7 @@ func (r *Runner) processSourceState(ctx context.Context, project storage.Project
 	}
 	report := state.report
 	if report == nil {
-		admissionDecision := admission.Decision{Outcome: admission.OutcomeLegacy, Preset: admission.PresetLegacy, Rule: "legacy-seven-condition-policy", Classify: true}
+		admissionDecision := admission.Decision{Outcome: admission.OutcomeLegacy, Preset: admission.PresetLegacy, Rule: "legacy-seven-condition-policy", Visibility: "unknown", Classify: true}
 		visibility := "unknown"
 		if configuredAdmission {
 			visibility = repositoryVisibility

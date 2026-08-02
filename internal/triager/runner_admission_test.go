@@ -34,6 +34,24 @@ func TestPersonalOwnerAutoAdmissionRoutesWithoutModel(t *testing.T) {
 	}
 }
 
+func TestLegacyAdmissionPersistsNormalizedUnknownVisibility(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	fixture.llm.responses = []string{eligibleDecisionJSON()}
+
+	result, err := fixture.runner().DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ReportsPersisted != 1 {
+		t.Fatalf("result = %#v, want one legacy report", result)
+	}
+	report := fixture.singleReport(t)
+	if report.Admission.Outcome != admission.OutcomeLegacy || report.Admission.Visibility != "unknown" {
+		t.Fatalf("legacy admission = %#v, want outcome legacy and unknown visibility", report.Admission)
+	}
+}
+
 func TestAssessAdmissionClassifiesButCannotAutoRoute(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

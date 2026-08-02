@@ -218,19 +218,19 @@ type fakeGitHub struct {
 	timelineRequests []int64
 	permissionCalls  int
 	viewRequests     []int64
-	detail        githubinfra.IssueDetail
-	details       map[int64]githubinfra.IssueDetail
-	viewSequence  []githubinfra.IssueDetail
-	viewCalls     int
-	timeline      []map[string]any
-	onTimeline    func()
-	listInput     githubinfra.ListOpenIssuesInput
-	listEmpty     bool
-	permission    string
-	comments      []githubinfra.IssueCommentInput
-	commentErr    error
-	settings      githubinfra.RepositorySettings
-	settingsCalls int
+	detail           githubinfra.IssueDetail
+	details          map[int64]githubinfra.IssueDetail
+	viewSequence     []githubinfra.IssueDetail
+	viewCalls        int
+	timeline         []map[string]any
+	onTimeline       func()
+	listInput        githubinfra.ListOpenIssuesInput
+	listEmpty        bool
+	permission       string
+	comments         []githubinfra.IssueCommentInput
+	commentErr       error
+	settings         githubinfra.RepositorySettings
+	settingsCalls    int
 }
 
 func (f *fakeGitHub) CreateIssueComment(_ context.Context, input githubinfra.IssueCommentInput) (githubinfra.IssueCommentResult, error) {

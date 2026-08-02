@@ -5,7 +5,11 @@ import (
 	"sync/atomic"
 )
 
-const pendingForgeReadsPerUsefulTurn = 2
+// A configured-admission source needs one repository-visibility read plus two
+// ViewIssue/timeline pairs before its v3 report can be persisted. Fair turns
+// therefore reserve room for five actual forge reads rather than assuming the
+// two-read legacy path.
+const pendingForgeReadsPerUsefulTurn = 5
 
 // PendingForgeReadBudget charges actual pending-state forge calls across one
 // scheduler tick. Optional per-project allowances keep a serial first project
