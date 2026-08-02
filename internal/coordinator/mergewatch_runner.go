@@ -413,7 +413,6 @@ func (r *Runner) mergeWatchSnapshot(ctx context.Context, repo, cwd string, issue
 	}
 	checks := summarizeRequiredChecks(requiredCheckRulesFor(protection), checkRuns, mergeableState.IsUnstable())
 	open := strings.EqualFold(detail.State, "open")
-	autoMergeOwnedByLooper := detail.AutoMerge != nil && strings.EqualFold(strings.TrimSpace(detail.AutoMerge.EnabledBy), strings.TrimSpace(currentLogin))
 	return mergewatch.PRSnapshot{
 		Repo:                   repo,
 		PRNumber:               prNumber,
