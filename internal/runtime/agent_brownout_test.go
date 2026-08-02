@@ -322,6 +322,12 @@ func TestAgentBrownoutIgnoresPreCooldownOutcomesAsProbes(t *testing.T) {
 	if got := rt.agentHealth.breaker(vendor).Snapshot().State; got != brownout.StateClosed {
 		t.Fatalf("probe outcome left state %s, want closed", got)
 	}
+	for i := 0; i < 3; i++ {
+		rt.activeExecutions.ReportAgentOutcome(agent.Outcome{Vendor: vendor, StartedAt: startedBefore, Status: "failed"})
+	}
+	if got := rt.agentHealth.breaker(vendor).Snapshot().State; got != brownout.StateClosed {
+		t.Fatalf("stale post-recovery outcome changed state to %s, want closed", got)
+	}
 }
 
 func TestAgentBrownoutReleasesProbeWhenSpawnLeaseEndsWithoutOutcome(t *testing.T) {

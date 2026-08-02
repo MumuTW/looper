@@ -561,6 +561,36 @@ func TestOutcomesOlderThanHalfOpenAreNotProbes(t *testing.T) {
 	}
 }
 
+func TestOutcomesOlderThanRecoveryEpochDoNotReopenClosedBreaker(t *testing.T) {
+	b, c, _ := newTestBreaker(t, testConfig())
+	admittedBeforeOpen := c.now()
+	b.Record(admittedBeforeOpen, false)
+	b.Record(admittedBeforeOpen, false)
+	b.Record(admittedBeforeOpen, false)
+	if err := b.Allow(); !errors.Is(err, ErrOpen) {
+		t.Fatalf("Allow() = %v, want open after initial failures", err)
+	}
+
+	c.add(10 * time.Minute)
+	probe, err := b.AllowAdmission()
+	if err != nil || !probe {
+		t.Fatalf("probe admission = (%t, %v), want probe", probe, err)
+	}
+	b.RecordAdmission(c.now(), true, true)
+	if got := b.Snapshot().State; got != StateClosed {
+		t.Fatalf("state after successful probe = %s, want closed", got)
+	}
+
+	// These executions were admitted before the recovery epoch. Their late
+	// failures must not immediately retrip the freshly recovered breaker.
+	for i := 0; i < 3; i++ {
+		b.Record(admittedBeforeOpen, false)
+	}
+	if got := b.Snapshot().State; got != StateClosed {
+		t.Fatalf("stale post-recovery outcomes changed state to %s, want closed", got)
+	}
+}
+
 func TestUnattributedOutcomesAreNotProbes(t *testing.T) {
 	b, c, _ := newTestBreaker(t, testConfig())
 	b.Record(c.now(), false)

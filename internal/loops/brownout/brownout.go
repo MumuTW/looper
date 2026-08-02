@@ -144,6 +144,10 @@ type Breaker struct {
 	// result decide recovery would close the gate without ever testing whether
 	// the provider recovered.
 	halfOpenAt time.Time
+	// recoveryEpochAt is the start of the current recovery round. Once a probe
+	// closes the breaker, ordinary outcomes admitted before this epoch are
+	// stale and must not reopen or dilute the fresh closed window.
+	recoveryEpochAt time.Time
 	// probeInFlight reserves half-open admissions before their outcomes arrive.
 	// Without a reservation every concurrent caller can observe half-open and
 	// spend a full scheduler batch against a provider that has not recovered.
@@ -278,6 +282,13 @@ func (b *Breaker) RecordAdmissionGeneration(startedAt time.Time, ok, probe bool,
 		b.mu.Unlock()
 		return
 	}
+	if b.state == StateClosed && !b.recoveryEpochAt.IsZero() && !startedAt.IsZero() && startedAt.Before(b.recoveryEpochAt) {
+		// This execution was admitted before the recovery round began. It may
+		// finish after a successful probe, but it is not evidence about the
+		// provider's fresh post-recovery health window.
+		b.mu.Unlock()
+		return
+	}
 	if b.state != StateHalfOpen && probe && generation != 0 {
 		// Another probe may already have closed this round. Do not let a
 		// late sibling outcome turn that completed recovery into a fresh
@@ -354,6 +365,7 @@ func (b *Breaker) SetConfig(cfg Config) {
 		b.cooldown = cfg.Cooldown
 		b.openUntil = time.Time{}
 		b.halfOpenAt = time.Time{}
+		b.recoveryEpochAt = time.Time{}
 		b.tripFailures = 0
 		b.tripTotal = 0
 		trips := b.trips
@@ -461,6 +473,7 @@ func (b *Breaker) refreshLocked() (Transition, bool) {
 		b.halfOpenGeneration++
 	}
 	b.halfOpenAt = now
+	b.recoveryEpochAt = now
 	// Drop the window that tripped the breaker. Keeping it would let stale
 	// failures re-trip the breaker on the first probe before any new outcome
 	// has been observed, which would make the cooldown unobservable.
