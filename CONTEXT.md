@@ -58,9 +58,10 @@ The per-project merge authority Merge Gatekeeper holds, defined at
 `config.GatekeeperTrustLevel` in `internal/config`. `observe` writes a Gate
 report and nothing else; `advise` additionally publishes the verdict and its
 reasons on the pull request so a human can act without redoing the judgement;
-`auto` would let Gatekeeper merge and is not implemented, so configuration
-rejects it rather than silently behaving as `advise`. A level is reached only by
-explicit operator promotion.
+`auto` publishes the required `Looper Gatekeeper` commit status for the current
+pull request head and never merges itself — GitHub branch protection (or
+Mergify queue injection of that protection) remains the merge authority. A level
+is reached only by explicit operator promotion.
 _Avoid_: mode, autonomy, permission.
 
 **Owned verdict comment**:

@@ -1767,6 +1767,34 @@ func TestGatewayFindReviewMarkerFetchesMatchedReviewComments(t *testing.T) {
 	}
 }
 
+func TestGatewayFindReviewMarkerSkipsInlineCommentsWhenRequested(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		switch strings.Join(options.Args, " ") {
+		case "api --paginate --slurp repos/acme/looper/pulls/42/reviews":
+			return shell.Result{Stdout: `[
+				{"id":202,"state":"COMMENTED","body":"<!-- looper:review id=abc head=def outcome=clean -->"}
+			]`}, nil
+		default:
+			t.Fatalf("unexpected gh args: %q", strings.Join(options.Args, " "))
+			return shell.Result{}, nil
+		}
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	marker, err := gateway.FindReviewMarker(context.Background(), VerifyReviewMarkerInput{
+		Repo: "acme/looper", PRNumber: 42, Marker: "looper:review id=abc head=def",
+		AllowedReviewEvents: []string{"COMMENT"}, SkipInlineComments: true,
+	})
+	if err != nil {
+		t.Fatalf("FindReviewMarker() error = %v", err)
+	}
+	if !marker.Found || marker.ReviewID != "202" || len(marker.InlineCommentBodies) != 0 {
+		t.Fatalf("FindReviewMarker() = %#v, want marker without inline comment fetch", marker)
+	}
+}
+
 func TestGatewayRemovePullRequestReactionReadsSlurpedPaginatedReactions(t *testing.T) {
 	t.Parallel()
 	runner := &fakeGHRunner{t: t}
@@ -2830,6 +2858,34 @@ func TestGatewayViewPullRequestMergeWatchReportsAuthor(t *testing.T) {
 	}
 }
 
+func TestGatewaySetCommitStatus(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		if args := strings.Join(options.Args, " "); args != "api repos/acme/looper/statuses/abc123 --method POST -f state=pending -f context=Looper Gatekeeper -f description=Waiting for Codex review of this commit" {
+			t.Fatalf("unexpected gh args: %q", args)
+		}
+		return shell.Result{}, nil
+	}
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	if err := gateway.SetCommitStatus(context.Background(), CommitStatusInput{Repo: "acme/looper", SHA: "abc123", Context: "Looper Gatekeeper", State: "pending", Description: "Waiting for Codex review of this commit"}); err != nil {
+		t.Fatalf("SetCommitStatus() error = %v", err)
+	}
+}
+
+func TestGatewaySetCommitStatusRejectsInvalidInput(t *testing.T) {
+	t.Parallel()
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: func(context.Context, shell.Options) (shell.Result, error) {
+		t.Fatal("unexpected gh call")
+		return shell.Result{}, nil
+	}})
+	if err := gateway.SetCommitStatus(context.Background(), CommitStatusInput{Repo: "acme/looper", Context: "Looper Gatekeeper", State: "success"}); err == nil {
+		t.Fatal("SetCommitStatus() error = nil, want missing SHA error")
+	}
+	if err := gateway.SetCommitStatus(context.Background(), CommitStatusInput{Repo: "acme/looper", SHA: "abc", Context: "Looper Gatekeeper", State: "unknown"}); err == nil {
+		t.Fatal("SetCommitStatus() error = nil, want invalid state error")
+	}
+}
 func TestGatewayCloseIssueRejectsUnknownStateReason(t *testing.T) {
 	t.Parallel()
 	runner := &fakeGHRunner{t: t}
