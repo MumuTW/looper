@@ -858,6 +858,16 @@ func (r *Runner) decide(ctx context.Context, project storage.ProjectRecord, repo
 	if err != nil {
 		return Decision{}, err
 	}
+	decision, err := decodeDecision(raw)
+	if err != nil {
+		return Decision{}, err
+	}
+	decision.Rationale = strings.TrimSpace(decision.Rationale)
+	decision.MissingInformation = compactStrings(decision.MissingInformation)
+	return decision, nil
+}
+
+func decodeDecision(raw string) (Decision, error) {
 	var decision Decision
 	decoder := json.NewDecoder(bytes.NewBufferString(strings.TrimSpace(raw)))
 	decoder.DisallowUnknownFields()
@@ -867,12 +877,18 @@ func (r *Runner) decide(ctx context.Context, project storage.ProjectRecord, repo
 	if err := decoder.Decode(&struct{}{}); err != io.EOF {
 		return Decision{}, fmt.Errorf("decode triage decision: trailing content")
 	}
-	decision.Rationale = strings.TrimSpace(decision.Rationale)
-	decision.MissingInformation = compactStrings(decision.MissingInformation)
 	return decision, nil
 }
 
-func validateDecision(decision Decision, policy LegacyPolicy) PolicyDecision {
+// ValidateDecisionOutput is the same strict decoder used by Runner.decide. The
+// executor calls it before reporting provider health so unknown fields and
+// trailing content cannot be counted as successful triage work.
+func ValidateDecisionOutput(raw string) bool {
+	_, err := decodeDecision(raw)
+	return err == nil
+}
+
+func validateDecision(decision Decision) PolicyDecision {
 	reasons := make([]string, 0, 7)
 	if !validClassification(decision.Classification) {
 		reasons = append(reasons, "unsupported_classification")
