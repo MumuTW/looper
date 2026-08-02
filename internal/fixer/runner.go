@@ -6262,29 +6262,7 @@ func (r *Runner) failQueueItemTerminal(ctx context.Context, queueItem storage.Qu
 }
 
 func (r *Runner) updateLoop(ctx context.Context, loop storage.LoopRecord, mutate func(*storage.LoopRecord)) (storage.LoopRecord, error) {
-	current, err := r.repos.Loops.GetByID(ctx, loop.ID)
-	if err != nil {
-		return storage.LoopRecord{}, err
-	}
-	if current != nil && current.Status == "terminated" {
-		return *current, nil
-	}
-	updated := loop
-	if current != nil {
-		updated = *current
-	}
-	metadataBefore := updated.MetadataJSON
-	mutate(&updated)
-	if derefString(metadataBefore) != derefString(updated.MetadataJSON) {
-		if _, err := loops.DecodeMetadataObjectForWrite(metadataBefore); err != nil {
-			return storage.LoopRecord{}, err
-		}
-	}
-	updated.UpdatedAt = eventlog.NextJavaScriptISOString(r.now(), updated.UpdatedAt)
-	if err := r.repos.Loops.Upsert(ctx, updated); err != nil {
-		return storage.LoopRecord{}, err
-	}
-	return updated, nil
+	return runpipe.UpdateLoop(ctx, r.repos, r.now, loop, runpipe.UpdateLoopOptions{GuardMetadata: true, MonotonicUpdatedAt: true}, mutate)
 }
 
 func (r *Runner) findFixerLoopByPR(ctx context.Context, projectID, repo string, prNumber int64) (*storage.LoopRecord, error) {

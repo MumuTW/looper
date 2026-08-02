@@ -3786,23 +3786,7 @@ func (r *Runner) failQueueItem(ctx context.Context, queueItem storage.QueueItemR
 }
 
 func (r *Runner) updateLoop(ctx context.Context, loop storage.LoopRecord, mutate func(*storage.LoopRecord)) (storage.LoopRecord, error) {
-	current, err := r.repos.Loops.GetByID(ctx, loop.ID)
-	if err != nil {
-		return storage.LoopRecord{}, err
-	}
-	if current != nil && current.Status == "terminated" {
-		return *current, nil
-	}
-	updated := loop
-	if current != nil {
-		updated = *current
-	}
-	mutate(&updated)
-	updated.UpdatedAt = r.nowISO()
-	if err := r.repos.Loops.Upsert(ctx, updated); err != nil {
-		return storage.LoopRecord{}, err
-	}
-	return updated, nil
+	return runpipe.UpdateLoop(ctx, r.repos, r.now, loop, runpipe.UpdateLoopOptions{}, mutate)
 }
 
 func (r *Runner) buildSuccessSummary(loop storage.LoopRecord, checkpoint workerCheckpoint) string {
