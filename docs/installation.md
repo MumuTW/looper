@@ -161,7 +161,7 @@ looper upgrade verify --bundle <directory>
 
 `upgrade verify` is offline and fail-closed on missing files, bad checksums, or manifest problems.
 
-Manual cutover after a clean preflight: replace the binaries from matching release artifacts. Download the newer `looper-<target>.tar.gz` and `looperd-<target>.tar.gz` release artifacts (or re-run the install script for the CLI), put them back on your `PATH`, and restart `looperd`. There is no self-upgrade, version check, rollback, or channel switching.
+Manual cutover after a clean preflight: replace the binaries from matching release artifacts. Download the newer `looper-<target>.tar.gz` and `looperd-<target>.tar.gz` release artifacts (or re-run the install script for the CLI), put them back on your `PATH`, and restart `looperd`. There is no one-command self-upgrade or channel switching; the rollback restore sequence below is the supported recovery path.
 
 ## Compatibility and version policy
 
@@ -254,6 +254,9 @@ snapshot from a v2 backup bundle (fail-closed if targets are still open):
 looper upgrade restore-preflight --bundle <directory>
 looper upgrade restore --bundle <directory> --confirm
 ```
+
+Both restore commands require `lsof` on `PATH` so Looper can prove that the
+config, SQLite database, and WAL/SHM sidecars are not open before replacement.
 
 Supported sequence:
 
