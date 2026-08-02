@@ -23,6 +23,19 @@ const (
 	PostMergeDigestSentEventType           = "coordinator.post_merge_digest.sent"
 )
 
+// CoordinatorPullRequestMerged is the durable payload for a merge-watch merge
+// observation. It carries the identity needed by downstream audit consumers
+// without requiring another forge read.
+type CoordinatorPullRequestMerged struct {
+	Version     int    `json:"version"`
+	ProjectID   string `json:"projectId"`
+	Repo        string `json:"repo"`
+	PRNumber    int64  `json:"prNumber"`
+	IssueNumber int64  `json:"issueNumber,omitempty"`
+	HeadSHA     string `json:"headSha"`
+	MergedAt    string `json:"mergedAt"`
+}
+
 type AppendInput struct {
 	ID               string
 	EventType        string

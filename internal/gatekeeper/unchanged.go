@@ -217,7 +217,14 @@ func skipUnchanged(previous Report, hasPrevious bool, fingerprint string, trust 
 	if reportAwaitsCheckState(previous) {
 		return Report{}, false
 	}
-
+	// At auto trust the merge route is applied only during an evaluation. A
+	// failed or cancelled check that is manually rerun to success turns the gate
+	// green without moving any field the list page can observe, so reusing the
+	// failed report would leave a now-eligible PR unqueued until maxSkipAge.
+	// Re-evaluate instead so the route is published promptly.
+	if trust == config.GatekeeperTrustAuto && reportHasFailedOrCancelledCheck(previous) {
+		return Report{}, false
+	}
 	if reportAwaitsConvergenceState(previous) {
 		// The durable Reviewer state can change merge eligibility without moving
 		// any field the forge list fingerprint observes. Re-evaluate when the
@@ -229,14 +236,6 @@ func skipUnchanged(previous Report, hasPrevious bool, fingerprint string, trust 
 		}
 	}
 	if reviewEvidenceRefreshRequired {
-		return Report{}, false
-	}
-	// At auto trust the merge route is applied only during an evaluation. A
-	// failed or cancelled check that is manually rerun to success turns the gate
-	// green without moving any field the list page can observe, so reusing the
-	// failed report would leave a now-eligible PR unqueued until maxSkipAge.
-	// Re-evaluate instead so the route is published promptly.
-	if trust == config.GatekeeperTrustAuto && reportHasFailedOrCancelledCheck(previous) {
 		return Report{}, false
 	}
 	evaluatedAt, err := time.Parse(time.RFC3339Nano, previous.EvaluatedAt)

@@ -96,6 +96,42 @@ func TestObservePostMergeFailureRecordsOneOptInDefaultBranchObservation(t *testi
 	}
 }
 
+func TestObservePostMergeFailureUsesCoordinatorMergeWatchEvidence(t *testing.T) {
+	ctx := context.Background()
+	workdir := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(workdir, "auditor.sqlite"), t.TempDir())
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.July, 31, 12, 0, 0, 0, time.UTC)
+	projectID, repo, head, base := "project_1", "acme/looper", "base-sha", "main"
+	nowISO := eventlog.FormatJavaScriptISOString(now)
+	metadata := `{"repo":"acme/looper"}`
+	project := storage.ProjectRecord{ID: projectID, Name: "Demo", RepoPath: workdir, BaseBranch: &base, MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
+	if err := repos.Projects.Upsert(ctx, project); err != nil {
+		t.Fatalf("Upsert project error = %v", err)
+	}
+	payload := eventlog.CoordinatorPullRequestMerged{Version: 1, ProjectID: projectID, Repo: repo, PRNumber: 42, HeadSHA: "pr-sha", MergedAt: now.Add(-2 * time.Minute).Format(time.RFC3339Nano)}
+	if err := eventlog.Append(ctx, repos, eventlog.AppendInput{EventType: eventlog.CoordinatorPullRequestMergedEventType, ProjectID: &projectID, Payload: payload, CreatedAt: now.Add(-time.Minute)}); err != nil {
+		t.Fatalf("Append coordinator merge event error = %v", err)
+	}
+	role := config.AuditorRoleConfig{Enabled: true, WindowMinutes: 60}
+	gateway := fakeAuditorGateway{head: head, checks: githubinfra.PullRequestCheckRuns{CheckRuns: []githubinfra.PullRequestCheckRun{{Name: "ci", Status: "completed", Conclusion: "failure"}}}}
+	if err := observePostMergeFailure(ctx, repos, gateway, project, repo, base, role, func() time.Time { return now }); err != nil {
+		t.Fatalf("observePostMergeFailure() error = %v", err)
+	}
+	entityType, entityID := "branch_head", repo+"@"+head
+	events, err := repos.Events.ListByEntity(ctx, entityType, entityID)
+	if err != nil || len(events) != 1 {
+		t.Fatalf("ListByEntity() = %#v, %v", events, err)
+	}
+	var observation auditor.FailureObservation
+	if err := json.Unmarshal([]byte(events[0].PayloadJSON), &observation); err != nil {
+		t.Fatal(err)
+	}
+	if len(observation.CandidatePRs) != 1 || observation.CandidatePRs[0] != 42 {
+		t.Fatalf("observation candidate PRs = %#v, want Mergify merge-watch PR", observation.CandidatePRs)
+	}
+}
+
 func TestObservePostMergeFailureSkipsDisabledProject(t *testing.T) {
 	ctx := context.Background()
 	coordinator := openMigratedCoordinator(t, filepath.Join(t.TempDir(), "auditor.sqlite"), t.TempDir())
