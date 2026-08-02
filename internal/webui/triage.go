@@ -284,7 +284,14 @@ func Classify(in Input) Board {
 
 	rows := make([]Row, 0, len(pullRequests)+len(standalone))
 	for key, snapshot := range pullRequests {
-		rows = append(rows, pullRequestRow(now, key, snapshot, reports[key], loopsByPR[key], queueByPR[key], itemsByPR[key], in.Links))
+		report := reportForSnapshot(reports[key], snapshot)
+		if reportHasReason(report, gatekeeper.ReasonPullRequestNotOpen) {
+			// Gatekeeper observed the PR closed after the last open snapshot.
+			// The report is newer authority than the stale snapshot, so do not
+			// resurrect the row until discovery captures a current open state.
+			continue
+		}
+		rows = append(rows, pullRequestRow(now, key, snapshot, report, loopsByPR[key], queueByPR[key], itemsByPR[key], in.Links))
 	}
 	for _, item := range standalone {
 		rows = append(rows, escalatorRow(now, item))
@@ -306,6 +313,37 @@ func Classify(in Input) Board {
 	}
 
 	return Board{GeneratedAt: now, Sections: sections, Notices: in.Notices}
+}
+
+// reportForSnapshot prevents a verdict about an older head from being applied
+// to the current snapshot. A mismatched report is retained as an explicit stale
+// evidence blocker; silently falling back to a clean snapshot would render an
+// unevaluated head as ready.
+func reportForSnapshot(report *gatekeeper.Report, snapshot storage.PullRequestSnapshotRecord) *gatekeeper.Report {
+	if report == nil {
+		return nil
+	}
+	observed, current := strings.TrimSpace(report.ObservedHeadSHA), strings.TrimSpace(snapshot.HeadSHA)
+	if observed == "" || current == "" || strings.EqualFold(observed, current) {
+		return report
+	}
+	stale := *report
+	stale.Status = gatekeeper.StatusBlocked
+	stale.Eligible = false
+	stale.Reasons = []gatekeeper.Reason{{Code: gatekeeper.ReasonHeadStale}}
+	return &stale
+}
+
+func reportHasReason(report *gatekeeper.Report, code gatekeeper.ReasonCode) bool {
+	if report == nil {
+		return false
+	}
+	for _, reason := range report.Reasons {
+		if reason.Code == code {
+			return true
+		}
+	}
+	return false
 }
 
 // sortRows puts the machine group in rebase-queue order — smallest diff first,
@@ -437,7 +475,7 @@ func pullRequestRow(now time.Time, key PRKey, snapshot storage.PullRequestSnapsh
 
 	working := false
 	for _, loop := range loops {
-		if domain.IsActiveLoopStatus(domain.LoopStatus(loop.Status)) {
+		if machineLoopStatus(loop.Status) {
 			working = true
 			changedAt = later(changedAt, parseTimestamp(loop.UpdatedAt))
 		}
@@ -590,6 +628,9 @@ func primaryBlocker(report *gatekeeper.Report, payload snapshotPayload, snapshot
 		if strings.EqualFold(derefString(snapshot.ReviewState), "CHANGES_REQUESTED") {
 			consider(Blocker{Code: "review_changes_requested", Label: "changes requested", rank: rankReviewDebt, owner: ownerContested})
 		}
+		if strings.EqualFold(derefString(snapshot.ReviewState), "REVIEW_REQUIRED") {
+			consider(Blocker{Code: string(gatekeeper.ReasonReviewRequired), Label: "needs review", rank: rankReviewMiss, owner: ownerHuman})
+		}
 		if checksPending(snapshot.ChecksSummary) {
 			consider(Blocker{Code: "required_check_pending", Label: "CI running", rank: rankCheckWait, owner: ownerMachine})
 		}
@@ -649,7 +690,11 @@ func gatekeeperBlocker(code gatekeeper.ReasonCode) (Blocker, bool) {
 	case gatekeeper.ReasonPullRequestDraft:
 		return Blocker{Code: string(code), Label: "draft", rank: rankDraft, owner: ownerMachine}, true
 	default:
-		return Blocker{}, false
+		label := strings.ReplaceAll(strings.TrimSpace(string(code)), "_", " ")
+		if label == "" {
+			label = "blocked"
+		}
+		return Blocker{Code: string(code), Label: label, rank: rankReviewMiss, owner: ownerContested}, true
 	}
 }
 
@@ -819,7 +864,7 @@ func checksFailing(summary *string) bool {
 	lower := strings.ToLower(derefString(summary))
 	return strings.Contains(lower, "failure") || strings.Contains(lower, "failed") ||
 		strings.Contains(lower, "error") || strings.Contains(lower, "cancel") ||
-		strings.Contains(lower, "timed_out")
+		strings.Contains(lower, "timed_out") || strings.Contains(lower, "action_required")
 }
 
 func checksPending(summary *string) bool {
@@ -851,15 +896,16 @@ func latestSnapshotPerPR(records []storage.PullRequestSnapshotRecord) map[PRKey]
 func openPullRequest(record storage.PullRequestSnapshotRecord) bool {
 	var parsed struct {
 		Detail struct {
-			State    string `json:"State"`
-			StateAlt string `json:"state"`
-			MergedAt string `json:"MergedAt"`
+			State       string `json:"State"`
+			StateAlt    string `json:"state"`
+			MergedAt    string `json:"MergedAt"`
+			MergedAtAlt string `json:"mergedAt"`
 		} `json:"detail"`
 	}
 	if record.PayloadJSON == nil || json.Unmarshal([]byte(*record.PayloadJSON), &parsed) != nil {
 		return true
 	}
-	if strings.TrimSpace(parsed.Detail.MergedAt) != "" {
+	if strings.TrimSpace(parsed.Detail.MergedAt) != "" || strings.TrimSpace(parsed.Detail.MergedAtAlt) != "" {
 		return false
 	}
 	state := parsed.Detail.State
@@ -929,7 +975,19 @@ func prLinks(pullRequests map[PRKey]storage.PullRequestSnapshotRecord, links esc
 
 func queueSettled(status string) bool {
 	switch status {
-	case "completed", "failed", "cancelled":
+	case "completed", "failed", "cancelled", "manual_intervention":
+		return true
+	default:
+		return false
+	}
+}
+
+// machineLoopStatus excludes lifecycle-active states that deliberately stop
+// automatic progress. A paused or human-held loop can still own a PR, but it
+// must not make the board claim that the machine is advancing it.
+func machineLoopStatus(status string) bool {
+	switch domain.LoopStatus(status) {
+	case domain.LoopStatusIdle, domain.LoopStatusQueued, domain.LoopStatusRunning, domain.LoopStatusWaiting:
 		return true
 	default:
 		return false

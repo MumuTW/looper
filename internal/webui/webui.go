@@ -95,6 +95,7 @@ type view struct {
 	Board          Board
 	Updated        string
 	RefreshSeconds int
+	RefreshEnabled bool
 	BoardPath      string
 	TriagePath     string
 	StaticPrefix   string
@@ -112,6 +113,7 @@ func renderPage(w http.ResponseWriter, r *http.Request, name string, load Loader
 		Board:          board,
 		Updated:        board.GeneratedAt.Local().Format("15:04:05"),
 		RefreshSeconds: int(RefreshInterval / time.Second),
+		RefreshEnabled: !strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("refresh")), "off"),
 		BoardPath:      boardPath,
 		TriagePath:     TriagePath,
 		StaticPrefix:   staticPrefix,

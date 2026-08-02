@@ -69,6 +69,10 @@ func TestHandlerRendersTriagePageOnAnEmptyStore(t *testing.T) {
 		"Stuck — needs decision",
 		"last updated",
 		"auto-refresh 10s",
+		`id="triage-status"`,
+		`role="status"`,
+		`href="/ui/triage?refresh=off"`,
+		"pause updates",
 		"Nothing is waiting on you.",
 		"Nothing has stopped moving.",
 	)
@@ -95,6 +99,7 @@ func TestHandlerRendersRowsAndMeta(t *testing.T) {
 	body := get(t, handler, TriagePath).Body.String()
 	assertContains(t, body,
 		`id="row-pr-proj-acme-widgets-42"`,
+		`id="link-pr-proj-acme-widgets-42"`,
 		`href="https://github.com/acme/widgets/pull/42"`,
 		`>#42<`,
 		"Change 42",
@@ -106,6 +111,20 @@ func TestHandlerRendersRowsAndMeta(t *testing.T) {
 		`title="1234 added, 56 removed"`,
 		`<span class="tile-count">1</span>`,
 	)
+}
+
+func TestHandlerCanPauseAndResumePolling(t *testing.T) {
+	t.Parallel()
+
+	handler := newTestHandler(nil)
+	paused := get(t, handler, TriagePath+"?refresh=off").Body.String()
+	if strings.Contains(paused, `hx-trigger="every`) {
+		t.Fatal("paused page must not install the polling trigger")
+	}
+	assertContains(t, paused, "auto-refresh paused", `href="/ui/triage?refresh=on"`, "resume updates")
+
+	resumed := get(t, handler, TriagePath+"?refresh=on").Body.String()
+	assertContains(t, resumed, `hx-trigger="every 10s"`, "auto-refresh 10s", "pause updates")
 }
 
 func TestHandlerRendersNotices(t *testing.T) {

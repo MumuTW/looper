@@ -36,8 +36,8 @@
   /* Chip fills stay near-white; the tint lives in the border and the label. */
   --chip-bg: #ffffff;
 
-  --sans: Helvetica, Arial, ui-sans-serif, system-ui, "Segoe UI", Roboto, sans-serif;
-  --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  --sans: helvetica, arial, ui-sans-serif, system-ui, "Segoe UI", roboto, sans-serif;
+  --mono: ui-monospace, "SF Mono", sfmono-regular, menlo, consolas, "Liberation Mono", monospace;
 
   --radius: 14px;
   --radius-sm: 9px;
@@ -265,6 +265,19 @@ a {
   font-size: 10.5px;
   letter-spacing: 0.03em;
   color: var(--ink-2);
+}
+
+.refresh-control {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  letter-spacing: 0.03em;
+  color: var(--ink-2);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.refresh-control:hover {
+  color: var(--ink);
 }
 
 .notices {

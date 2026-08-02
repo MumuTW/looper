@@ -31,7 +31,7 @@
   <div id="triage-board"
        class="board"
        hx-get="{{.BoardPath}}"
-       hx-trigger="every {{.RefreshSeconds}}s"
+       {{if .RefreshEnabled}}hx-trigger="every {{.RefreshSeconds}}s"{{end}}
        hx-swap="innerHTML transition:true">
 {{template "board.html" .}}
   </div>

@@ -325,7 +325,7 @@ func (c *Collector) collectEligibleAdvise(ctx context.Context, now time.Time, ac
 }
 
 func (c *Collector) collectStaleHeads(ctx context.Context, now time.Time, activeLoops map[string]storage.LoopRecord, snapshot *Snapshot) error {
-	records, err := c.repositories.PullRequestSnapshots.List(ctx)
+	records, err := c.repositories.PullRequestSnapshots.ListLatest(ctx)
 	if err != nil {
 		return fmt.Errorf("list pull request snapshots: %w", err)
 	}

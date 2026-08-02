@@ -14,7 +14,8 @@
           <li class="legend-item"><span class="dot dot-{{.Group.Slug}}" aria-hidden="true"></span>{{.Group.Title}}</li>
 {{- end}}
         </ul>
-        <p class="updated">last updated {{.Updated}} · auto-refresh {{.RefreshSeconds}}s</p>
+        <p class="updated" id="triage-status" role="status" aria-live="polite">last updated {{.Updated}} · {{if .RefreshEnabled}}auto-refresh {{.RefreshSeconds}}s{{else}}auto-refresh paused{{end}}</p>
+        <a class="refresh-control" href="{{.TriagePath}}?refresh={{if .RefreshEnabled}}off{{else}}on{{end}}">{{if .RefreshEnabled}}pause updates{{else}}resume updates{{end}}</a>
       </div>
 {{- if .Board.Notices}}
       <ul class="notices">
@@ -45,7 +46,7 @@
           <span class="dot dot-{{$section.Group.Slug}}" aria-hidden="true"></span>
           <span class="row-main">
 {{- if .Link}}
-            <a class="row-link" href="{{.Link}}" rel="noreferrer noopener" target="_blank"><span class="row-ref">{{.Ref}}</span><span class="row-title">{{.Title}}</span></a>
+            <a class="row-link" id="link-{{.Key}}" href="{{.Link}}" rel="noreferrer noopener" target="_blank"><span class="row-ref">{{.Ref}}</span><span class="row-title">{{.Title}}</span></a>
 {{- else}}
             <span class="row-link"><span class="row-ref">{{.Ref}}</span><span class="row-title">{{.Title}}</span></span>
 {{- end}}

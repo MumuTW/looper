@@ -861,6 +861,14 @@ func TestPullRequestLookupsStayScopedAndReturnLatestSnapshotPerProject(t *testin
 		t.Fatalf("PullRequestSnapshots.ListLatestByRepoAndPR() IDs = %v, want [second-new github-new]", got)
 	}
 
+	gotLatest, err := repos.PullRequestSnapshots.ListLatest(ctx)
+	if err != nil {
+		t.Fatalf("PullRequestSnapshots.ListLatest() error = %v", err)
+	}
+	if got := snapshotIDs(gotLatest); !reflect.DeepEqual(got, []string{"other-repo", "other-pr", "second-new", "github-new"}) {
+		t.Fatalf("PullRequestSnapshots.ListLatest() IDs = %v, want one newest row per project/repo/PR", got)
+	}
+
 	matchingRepo := "Acme/Looper"
 	matchingPR := prNumber
 	otherPR := int64(99)

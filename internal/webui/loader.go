@@ -91,7 +91,7 @@ func NewRepositoryLoader(repos *storage.Repositories, collector *escalator.Colle
 		}
 
 		if repos.PullRequestSnapshots != nil {
-			snapshots, err := repos.PullRequestSnapshots.List(ctx)
+			snapshots, err := repos.PullRequestSnapshots.ListLatest(ctx)
 			if err != nil {
 				input.Notices = append(input.Notices, "Pull request snapshots could not be read.")
 			} else {

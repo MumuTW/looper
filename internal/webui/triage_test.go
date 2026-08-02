@@ -456,6 +456,106 @@ func TestClassifyKeepsOnlyTheLatestOpenSnapshotPerPullRequest(t *testing.T) {
 	}
 }
 
+func TestClassifyMarksGateReportForOlderHeadAsStale(t *testing.T) {
+	t.Parallel()
+
+	current := snapshot(t, 1, payloadOptions{})
+	current.HeadSHA = "new-head"
+	older := report(1, true)
+	older.ObservedHeadSHA = "old-head"
+
+	board := Classify(Input{
+		Now:       testNow,
+		Snapshots: []storage.PullRequestSnapshotRecord{current},
+		Reports:   []gatekeeper.Report{older},
+		Links:     testLinker{},
+	})
+	row, group := rowFor(t, board, 1)
+	if row.Blocker.Code != string(gatekeeper.ReasonHeadStale) || row.Blocker.Label != "evidence refreshing" {
+		t.Fatalf("stale report blocker = %#v, want head_stale evidence", row.Blocker)
+	}
+	if group != GroupMachine {
+		t.Fatalf("stale report group = %v, want machine", group)
+	}
+}
+
+func TestClassifyDropsRowWhenGatekeeperSaysPullRequestIsClosed(t *testing.T) {
+	t.Parallel()
+
+	current := snapshot(t, 1, payloadOptions{})
+	closed := report(1, false, gatekeeper.ReasonPullRequestNotOpen)
+	closed.ObservedHeadSHA = current.HeadSHA
+
+	board := Classify(Input{
+		Now:       testNow,
+		Snapshots: []storage.PullRequestSnapshotRecord{current},
+		Reports:   []gatekeeper.Report{closed},
+		Links:     testLinker{},
+	})
+	if board.Total() != 0 {
+		t.Fatalf("board total = %d, want closed PR omitted", board.Total())
+	}
+}
+
+func TestClassifyUnknownGateReasonIsStillBlocking(t *testing.T) {
+	t.Parallel()
+
+	unknown := gatekeeper.ReasonCode("future_gate_reason")
+	board := Classify(Input{
+		Now:       testNow,
+		Snapshots: []storage.PullRequestSnapshotRecord{snapshot(t, 1, payloadOptions{})},
+		Reports:   []gatekeeper.Report{report(1, false, unknown)},
+		Links:     testLinker{},
+	})
+	row, _ := rowFor(t, board, 1)
+	if row.Blocker.Code != string(unknown) || row.Blocker.Label != "future gate reason" {
+		t.Fatalf("unknown blocker = %#v, want generic blocking label", row.Blocker)
+	}
+}
+
+func TestClassifyFallbackRecognizesReviewAndActionRequired(t *testing.T) {
+	t.Parallel()
+
+	reviewRequired := "REVIEW_REQUIRED"
+	actionRequired := "queued, action_required"
+	reviewSnapshot := snapshot(t, 1, payloadOptions{})
+	reviewSnapshot.ReviewState = &reviewRequired
+	checksSnapshot := snapshot(t, 2, payloadOptions{})
+	checksSnapshot.ChecksSummary = &actionRequired
+	board := Classify(Input{
+		Now: testNow,
+		Snapshots: []storage.PullRequestSnapshotRecord{
+			reviewSnapshot,
+			checksSnapshot,
+		},
+	})
+	if row, _ := rowFor(t, board, 1); row.Blocker.Code != string(gatekeeper.ReasonReviewRequired) {
+		t.Fatalf("review-required blocker = %#v, want required review", row.Blocker)
+	}
+	if row, _ := rowFor(t, board, 2); row.Blocker.Code != string(gatekeeper.ReasonCheckFailed) {
+		t.Fatalf("action-required blocker = %#v, want failed checks", row.Blocker)
+	}
+}
+
+func TestClassifyDoesNotCallPausedOrManualHeldWorkMachineActive(t *testing.T) {
+	t.Parallel()
+
+	paused := activeLoop(1)
+	paused.Status = string(domain.LoopStatusPaused)
+	manual := storage.QueueItemRecord{ProjectID: ptr("proj"), Repo: ptr("acme/widgets"), PRNumber: ptr(int64(1)), Status: "manual_intervention"}
+	board := Classify(Input{
+		Now:       testNow,
+		Snapshots: []storage.PullRequestSnapshotRecord{snapshot(t, 1, payloadOptions{})},
+		Loops:     []storage.LoopRecord{paused},
+		Queue:     []storage.QueueItemRecord{manual},
+		Links:     testLinker{},
+	})
+	_, group := rowFor(t, board, 1)
+	if group != GroupActionable {
+		t.Fatalf("paused/manual-held row group = %v, want actionable rather than machine", group)
+	}
+}
+
 func TestClassifyHighlightsOnlyStateThatMovedInsideTheRefreshWindow(t *testing.T) {
 	t.Parallel()
 

@@ -2132,6 +2132,33 @@ func (r *PullRequestSnapshotsRepository) List(ctx context.Context) ([]PullReques
 	return scanPullRequestSnapshots(rows)
 }
 
+// ListLatest returns one snapshot per project/repository/pull request. Snapshot
+// captures are append-only, and callers that render current state should not
+// materialize historical payloads (which may include a full diff) just to
+// discard them in memory.
+func (r *PullRequestSnapshotsRepository) ListLatest(ctx context.Context) ([]PullRequestSnapshotRecord, error) {
+	rows, err := r.q.QueryContext(ctx, `
+		WITH ranked AS (
+			SELECT id, ROW_NUMBER() OVER (
+				PARTITION BY project_id, lower(repo), pr_number
+				ORDER BY captured_at DESC, created_at DESC, id DESC
+			) AS row_number
+			FROM pull_request_snapshots
+		)
+		SELECT `+qualifiedColumns("snapshots", pullRequestSnapshotColumns)+`
+		FROM pull_request_snapshots snapshots
+		JOIN ranked ON ranked.id = snapshots.id
+		WHERE ranked.row_number = 1
+		ORDER BY snapshots.captured_at DESC, snapshots.created_at DESC, snapshots.id DESC
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("list latest pull request snapshots: %w", err)
+	}
+	defer rows.Close()
+
+	return scanPullRequestSnapshots(rows)
+}
+
 func (r *PullRequestSnapshotsRepository) ListLatestByRepoAndPR(ctx context.Context, repo string, prNumber int64) ([]PullRequestSnapshotRecord, error) {
 	rows, err := r.q.QueryContext(ctx, `
 		WITH ranked AS (
