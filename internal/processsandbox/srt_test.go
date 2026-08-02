@@ -15,10 +15,17 @@ import (
 )
 
 func TestRuntimePathsPutSealedNodeDirectoryFirstOnPATH(t *testing.T) {
-	paths := runtimePaths{command: "/runtime/srt", node: "/sealed/node", ripgrep: "/tools/rg", bwrap: "/tools/bwrap", socat: "/tools/socat"}
+	paths := runtimePaths{command: "/runtime/srt", moduleRoot: "/runtime/lib/node_modules", node: "/sealed/node", ripgrep: "/tools/rg", bwrap: "/tools/bwrap", socat: "/tools/socat"}
 	got := paths.executableDirectories()
 	if len(got) == 0 || got[0] != "/sealed" {
 		t.Fatalf("executableDirectories() = %#v, want sealed Node directory first", got)
+	}
+}
+
+func TestRuntimePathsAllowReadSealedModuleRoot(t *testing.T) {
+	paths := runtimePaths{command: "/runtime/bin/srt", moduleRoot: "/runtime/lib/node_modules"}
+	if got := paths.directories(); !contains(got, "/runtime/lib/node_modules") {
+		t.Fatalf("directories() = %#v, want sealed module root", got)
 	}
 }
 

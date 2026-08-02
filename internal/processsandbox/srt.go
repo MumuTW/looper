@@ -246,19 +246,23 @@ const (
 )
 
 type runtimePaths struct {
-	command string
-	node    string
-	ripgrep string
-	bwrap   string
-	socat   string
+	command    string
+	moduleRoot string
+	node       string
+	ripgrep    string
+	bwrap      string
+	socat      string
 }
 
 func (p runtimePaths) directories() []string {
-	result := make([]string, 0, 5)
+	result := make([]string, 0, 6)
 	for _, path := range []string{p.command, p.node, p.ripgrep, p.bwrap, p.socat} {
 		if path != "" {
 			result = append(result, filepath.Dir(path))
 		}
+	}
+	if p.moduleRoot != "" {
+		result = append(result, p.moduleRoot)
 	}
 	return compact(result)
 }
@@ -332,7 +336,7 @@ func installedRuntime(cwd string, prependPath []string) (runtimePaths, error) {
 		}
 		moduleRoot = parent
 	}
-	paths := runtimePaths{command: resolved}
+	paths := runtimePaths{command: resolved, moduleRoot: moduleRoot}
 	resolvedRoots := map[string]string{"srt": resolved}
 	required := []struct {
 		name   string
