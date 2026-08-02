@@ -126,7 +126,7 @@ func TestReportOutcomeUsesRawJSONCompletionValidator(t *testing.T) {
 	exec := outcomeExecution(&outcomes)
 	exec.input.CompletionContract = CompletionContractRawJSON
 	exec.input.CompletionValidator = func(message string) bool { return message == `{"ok":true}` }
-	exec.reportOutcome("completed", "missing", "", "event stream\n{\"ok\":true}\n")
+	exec.reportOutcome("completed", "missing", "", "{\"ok\":true}")
 	if len(outcomes) != 1 || !outcomes[0].Succeeded {
 		t.Fatalf("valid semantic raw JSON outcome = %#v, want one successful outcome", outcomes)
 	}

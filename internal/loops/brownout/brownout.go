@@ -71,6 +71,10 @@ type Config struct {
 type Transition struct {
 	From State
 	To   State
+	// Trips identifies the breaker trip that emitted this transition. It is
+	// carried into notification dedupe keys so a later outage is not mistaken
+	// for the same delivery as an earlier trip.
+	Trips int
 	// Failures and Total describe the window that produced the transition.
 	Failures int
 	Total    int
@@ -331,9 +335,10 @@ func (b *Breaker) SetConfig(cfg Config) {
 		b.halfOpenAt = time.Time{}
 		b.tripFailures = 0
 		b.tripTotal = 0
+		trips := b.trips
 		b.mu.Unlock()
 		if previousState != StateClosed {
-			b.emit(Transition{From: previousState, To: StateClosed, Reason: "disabled_override"})
+			b.emit(Transition{From: previousState, To: StateClosed, Trips: trips, Reason: "disabled_override"})
 		}
 		return
 	}
@@ -378,7 +383,7 @@ func (b *Breaker) SetConfig(cfg Config) {
 			b.probeInFlight = 0
 			b.outcomes = nil
 			b.halfOpenAt = time.Time{}
-			transition = Transition{From: StateHalfOpen, To: StateClosed, Reason: "probe_threshold_reduced"}
+			transition = Transition{From: StateHalfOpen, To: StateClosed, Trips: b.trips, Reason: "probe_threshold_reduced"}
 			changed = true
 		}
 	}
@@ -439,7 +444,7 @@ func (b *Breaker) refreshLocked() (Transition, bool) {
 	// failures re-trip the breaker on the first probe before any new outcome
 	// has been observed, which would make the cooldown unobservable.
 	b.outcomes = nil
-	return Transition{From: StateOpen, To: StateHalfOpen, Reason: "cooldown_elapsed"}, true
+	return Transition{From: StateOpen, To: StateHalfOpen, Trips: b.trips, Reason: "cooldown_elapsed"}, true
 }
 
 func (b *Breaker) evaluateLocked(now time.Time, startedAt time.Time, ok bool) (Transition, bool) {
@@ -466,7 +471,7 @@ func (b *Breaker) evaluateLocked(now time.Time, startedAt time.Time, ok bool) (T
 		b.probeSuccesses = 0
 		b.probeInFlight = 0
 		b.outcomes = nil
-		return Transition{From: StateHalfOpen, To: StateClosed, Reason: "probes_succeeded"}, true
+		return Transition{From: StateHalfOpen, To: StateClosed, Trips: b.trips, Reason: "probes_succeeded"}, true
 	case StateClosed:
 		failures, total := b.countLocked()
 		if failures < b.cfg.MinFailures || total == 0 {
@@ -497,7 +502,7 @@ func (b *Breaker) openLocked(now time.Time, reason string) Transition {
 	// The window is cleared on the way into open so the breaker measures the
 	// recovery, not the outage that is already accounted for.
 	b.outcomes = nil
-	return Transition{From: from, To: StateOpen, Failures: failures, Total: total, Cooldown: b.cooldown, Reason: reason}
+	return Transition{From: from, To: StateOpen, Trips: b.trips, Failures: failures, Total: total, Cooldown: b.cooldown, Reason: reason}
 }
 
 func (b *Breaker) nextCooldown() time.Duration {

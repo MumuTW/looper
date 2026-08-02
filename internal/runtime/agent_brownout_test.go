@@ -620,13 +620,26 @@ func TestAgentBrownoutResumeMessageDistinguishesDisabledOverride(t *testing.T) {
 
 func TestBrownoutNotificationProviderKeySerializesOverrideTail(t *testing.T) {
 	t.Parallel()
-	for _, suffix := range []string{".open", ".closed", ".disabled_override"} {
+	for _, suffix := range []string{".open", ".closed", ".disabled_override", ".open.2", ".closed.2", ".disabled_override.2"} {
 		if got := brownoutNotificationProviderKey("codex" + suffix); got != "codex" {
 			t.Fatalf("brownoutNotificationProviderKey(%q) = %q, want codex", suffix, got)
 		}
 	}
 	if got := brownoutNotificationProviderKey("codex.other"); got != "codex.other" {
 		t.Fatalf("brownoutNotificationProviderKey(non-transition) = %q, want unchanged suffix", got)
+	}
+}
+
+func TestBrownoutTransitionDedupeSuffixKeepsDistinctTrips(t *testing.T) {
+	t.Parallel()
+	if got := brownoutTransitionDedupeSuffix("codex.open", 1); got != "codex.open.1" {
+		t.Fatalf("trip one suffix = %q, want codex.open.1", got)
+	}
+	if got := brownoutTransitionDedupeSuffix("codex.open", 2); got != "codex.open.2" {
+		t.Fatalf("trip two suffix = %q, want codex.open.2", got)
+	}
+	if got := brownoutNotificationProviderKey("codex.open.2"); got != "codex" {
+		t.Fatalf("trip suffix provider key = %q, want codex", got)
 	}
 }
 

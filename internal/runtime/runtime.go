@@ -856,11 +856,18 @@ func (r *Runtime) onAgentBrownoutTransition(vendor string, transition brownout.T
 		r.notifyAgentBrownout("failure", fmt.Sprintf("Looper Paused: %s Agents Keep Failing", provider),
 			fmt.Sprintf("%d of %d recent agent runs failed", transition.Failures, transition.Total),
 			fmt.Sprintf("Looper stopped starting new %s work because its own %s agent runs keep failing. It will retry by itself in %s. Other healthy providers may continue; queued %s work resumes when recovery probes succeed.", provider, provider, transition.Cooldown.Round(time.Second), provider),
-			vendor+".open")
+			brownoutTransitionDedupeSuffix(vendor+".open", transition.Trips))
 	case brownout.StateClosed:
 		title, subtitle, body, dedupeSuffix := agentBrownoutResumeMessage(provider, transition.Reason)
-		r.notifyAgentBrownout("action_required", title, subtitle, body, vendor+dedupeSuffix)
+		r.notifyAgentBrownout("action_required", title, subtitle, body, brownoutTransitionDedupeSuffix(vendor+dedupeSuffix, transition.Trips))
 	}
+}
+
+func brownoutTransitionDedupeSuffix(vendorSuffix string, trips int) string {
+	if trips <= 0 {
+		return vendorSuffix
+	}
+	return fmt.Sprintf("%s.%d", vendorSuffix, trips)
 }
 
 // agentBrownoutResumeMessage keeps operator overrides distinct from breaker
@@ -954,8 +961,27 @@ func brownoutNotificationProviderKey(dedupeSuffix string) string {
 		if strings.HasSuffix(dedupeSuffix, suffix) {
 			return strings.TrimSuffix(dedupeSuffix, suffix)
 		}
+		marker := suffix + "."
+		if index := strings.LastIndex(dedupeSuffix, marker); index >= 0 {
+			trip := dedupeSuffix[index+len(marker):]
+			if trip != "" && allASCIIDigits(trip) {
+				return dedupeSuffix[:index]
+			}
+		}
 	}
 	return dedupeSuffix
+}
+
+func allASCIIDigits(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, r := range value {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // agentBrownoutNotificationTimeout bounds one best-effort transition alert. It

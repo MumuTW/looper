@@ -62,6 +62,9 @@ func TestTripsOnSustainedFailureRate(t *testing.T) {
 	if len(*transitions) != 1 || (*transitions)[0].To != StateOpen {
 		t.Fatalf("expected one open transition, got %+v", *transitions)
 	}
+	if (*transitions)[0].Trips != 1 {
+		t.Fatalf("open transition trip = %d, want 1", (*transitions)[0].Trips)
+	}
 	if (*transitions)[0].Reason != "failure_rate" {
 		t.Fatalf("unexpected trip reason: %q", (*transitions)[0].Reason)
 	}
