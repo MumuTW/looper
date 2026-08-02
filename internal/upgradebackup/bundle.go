@@ -136,9 +136,16 @@ func Create(ctx context.Context, input Input) (Result, error) {
 	if err != nil {
 		return Result{}, fmt.Errorf("create sqlite snapshot: %w", err)
 	}
-	bundle := filepath.Join(input.RootDir, "upgrade-"+strings.ReplaceAll(now().UTC().Format("20060102T150405.000Z"), ":", "-"))
+	bundlePrefix := "upgrade-" + strings.ReplaceAll(now().UTC().Format("20060102T150405.000Z"), ":", "-")
+	bundle := filepath.Join(input.RootDir, bundlePrefix)
 	if err := os.Mkdir(bundle, 0o700); err != nil {
-		return Result{}, fmt.Errorf("create backup bundle: %w", err)
+		if !os.IsExist(err) {
+			return Result{}, fmt.Errorf("create backup bundle: %w", err)
+		}
+		bundle, err = os.MkdirTemp(input.RootDir, bundlePrefix+"-")
+		if err != nil {
+			return Result{}, fmt.Errorf("create unique backup bundle: %w", err)
+		}
 	}
 	fail := func(err error) (Result, error) { _ = os.RemoveAll(bundle); return Result{}, err }
 	files := map[string]File{}

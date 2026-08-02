@@ -85,6 +85,35 @@ func TestCreatePinsConfigContentsAcrossSnapshotWindow(t *testing.T) {
 	}
 }
 
+func TestCreateUsesUniqueBundleWhenTimestampDirectoryAlreadyExists(t *testing.T) {
+	root := t.TempDir()
+	backupRoot := filepath.Join(root, "backups")
+	if err := os.MkdirAll(backupRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
+	prefix := "upgrade-" + strings.ReplaceAll(now.UTC().Format("20060102T150405.000Z"), ":", "-")
+	if err := os.Mkdir(filepath.Join(backupRoot, prefix), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	config := writeBundleFile(t, root, "config.toml", "[server]\n")
+	cli := writeBundleFile(t, root, "looper-bin", "cli")
+	daemon := writeBundleFile(t, root, "looperd-bin", "daemon")
+	result, err := Create(context.Background(), Input{
+		RootDir: backupRoot, ConfigPath: config, DatabasePath: filepath.Join(root, "looper.sqlite"),
+		CLIBinaryPath: cli, DaemonBinaryPath: daemon, Now: func() time.Time { return now },
+		Snapshot: func(context.Context) (string, error) {
+			return writeBundleFile(t, root, "snapshot.sqlite", "sqlite"), nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Directory == filepath.Join(backupRoot, prefix) || !strings.HasPrefix(filepath.Base(result.Directory), prefix+"-") {
+		t.Fatalf("bundle directory = %q, want unique %s-* directory", result.Directory, prefix)
+	}
+}
+
 func TestCreateRemovesPartialBundleOnCopyFailure(t *testing.T) {
 	root := t.TempDir()
 	snapshot := writeBundleFile(t, root, "snapshot.sqlite", "sqlite")
