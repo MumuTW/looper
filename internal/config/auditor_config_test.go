@@ -62,6 +62,26 @@ func TestAuditorRejectsProjectGatekeeperAutoOverride(t *testing.T) {
 	}
 }
 
+func TestAuditorRejectsProjectAuditorEnableAgainstGlobalAutoTrust(t *testing.T) {
+	t.Parallel()
+	auto := GatekeeperTrustAuto
+	enabled := true
+	var issues []ValidationIssue
+	validateAuditorGatekeeperCompatibility(Config{
+		Roles: RoleConfigs{
+			Auditor:    AuditorRoleConfig{Enabled: false, WindowMinutes: 60},
+			Gatekeeper: GatekeeperRoleConfig{Trust: auto},
+		},
+		Projects: []ProjectRefConfig{
+			{ID: "inherited"},
+			{ID: "audited", Roles: &PartialRoleConfigs{Auditor: &PartialAuditorRoleConfig{Enabled: &enabled}}},
+		},
+	}, &issues)
+	if len(issues) != 1 || issues[0].Path != "projects[1].roles.auditor.enabled" {
+		t.Fatalf("issues = %#v, want only explicit project auditor conflict", issues)
+	}
+}
+
 func ptrBool(v bool) *bool { return &v }
 
 func TestPostMergeDigestRejectsGatekeeperAutoTrust(t *testing.T) {
