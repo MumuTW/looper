@@ -241,7 +241,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 	if strings.TrimSpace(input.CWD) == "" {
 		input.CWD = r.projectCWD(ctx, input.ProjectID)
 	}
-	if err := r.reconcileLegacyVerdictComments(ctx, input.ProjectID, input.Repo, input.CWD); err != nil {
+	if err := r.ReconcileLegacyVerdictComments(ctx); err != nil {
 		return DiscoveryResult{}, err
 	}
 	listCtx := ctx

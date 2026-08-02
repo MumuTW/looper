@@ -269,6 +269,32 @@ func TestRunDefaultSchedulerTickSkipsCoordinatorWhenDisabled(t *testing.T) {
 	}
 }
 
+func TestRunDefaultSchedulerTickRetiresLegacyVerdictsForArchivedProjects(t *testing.T) {
+	t.Parallel()
+	workingDir := t.TempDir()
+	coordinator := openMigratedCoordinator(t, filepath.Join(workingDir, "scheduler-archived-gatekeeper.sqlite"), t.TempDir())
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 21, 8, 0, 0, 0, time.UTC)
+	nowISO := formatJavaScriptISOString(now)
+	baseBranch := "main"
+	metadata := `{"repo":"MumuTW/looper"}`
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{
+		ID: "archived", Name: "Archived", RepoPath: filepath.Join(workingDir, "repo"), BaseBranch: &baseBranch,
+		Archived: true, MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	gatekeeperRunner := &fakeGatekeeperScheduler{}
+	if err := runDefaultSchedulerTick(context.Background(), defaultSchedulerTickInput{
+		Repos: repos, Now: func() time.Time { return now }, Gatekeeper: gatekeeperRunner,
+	}); err != nil {
+		t.Fatalf("runDefaultSchedulerTick() error = %v", err)
+	}
+	if gatekeeperRunner.retirementCalls != 1 {
+		t.Fatalf("legacy retirement calls = %d, want one for archived project maintenance", gatekeeperRunner.retirementCalls)
+	}
+}
+
 func TestRunDefaultSchedulerTickSecondClaimPassDoesNotExceedAvailableSlots(t *testing.T) {
 	t.Parallel()
 

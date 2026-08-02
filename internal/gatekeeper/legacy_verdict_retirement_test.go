@@ -122,3 +122,37 @@ func TestDiscoverPullRequestsRetiresHistoricalAdviseOutsideOpenPage(t *testing.T
 		t.Fatalf("comment updates = %#v, want historical PR retirement outside page", fixture.github.updateCommentCalls)
 	}
 }
+
+func TestLegacyVerdictRetirementCompletionInvalidatesForNewerAdvice(t *testing.T) {
+	fixture := newGatekeeperFixture(t)
+	fixture.github.currentUserLogin = "looper-bot"
+	fixture.github.comments = []githubinfra.CommentInfo{{ID: 10, Author: "looper-bot", Body: legacyVerdictCommentMarker + "\nold advice"}}
+	appendReport := func(fingerprint string) {
+		report := Report{
+			Version: 2, Mode: "advise", ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42,
+			Status: StatusEligible, Eligible: true, EvaluatedAt: fixture.now.Format(time.RFC3339Nano), SourceFingerprint: fingerprint,
+		}
+		projectID, entityType, entityID := report.ProjectID, "pull_request", "acme/looper#42"
+		if err := eventlog.Append(context.Background(), fixture.repos, eventlog.AppendInput{
+			EventType: GateReportEventType, ProjectID: &projectID, EntityType: &entityType, EntityID: &entityID, Payload: report, CreatedAt: fixture.now,
+		}); err != nil {
+			t.Fatalf("append advise report: %v", err)
+		}
+	}
+	appendReport("fingerprint-one")
+	if err := fixture.runner().ReconcileLegacyVerdictComments(context.Background()); err != nil {
+		t.Fatalf("first reconciliation error = %v", err)
+	}
+	if len(fixture.github.updateCommentCalls) != 1 {
+		t.Fatalf("first retirement updates = %d, want one", len(fixture.github.updateCommentCalls))
+	}
+
+	fixture.github.comments[0].Body = legacyVerdictCommentMarker + "\nnew advice"
+	appendReport("fingerprint-two")
+	if err := fixture.runner().ReconcileLegacyVerdictComments(context.Background()); err != nil {
+		t.Fatalf("second reconciliation error = %v", err)
+	}
+	if len(fixture.github.updateCommentCalls) != 2 {
+		t.Fatalf("retirement updates = %d, want newer advice to invalidate stale completion", len(fixture.github.updateCommentCalls))
+	}
+}

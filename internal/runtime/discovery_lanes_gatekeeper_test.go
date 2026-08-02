@@ -38,7 +38,8 @@ func TestCodingDiscoveryLanesRegistersSourceBasedGatekeeper(t *testing.T) {
 }
 
 type fakeGatekeeperScheduler struct {
-	discoveryInput gatekeeper.DiscoveryInput
+	discoveryInput  gatekeeper.DiscoveryInput
+	retirementCalls int
 }
 
 func (f *fakeGatekeeperScheduler) DiscoverPullRequests(_ context.Context, input gatekeeper.DiscoveryInput) (gatekeeper.DiscoveryResult, error) {
@@ -48,4 +49,9 @@ func (f *fakeGatekeeperScheduler) DiscoverPullRequests(_ context.Context, input 
 
 func (*fakeGatekeeperScheduler) EvaluatePullRequest(context.Context, gatekeeper.EvaluationInput) (gatekeeper.Report, error) {
 	return gatekeeper.Report{}, nil
+}
+
+func (f *fakeGatekeeperScheduler) ReconcileLegacyVerdictComments(context.Context) error {
+	f.retirementCalls++
+	return nil
 }

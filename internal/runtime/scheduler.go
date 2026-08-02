@@ -108,6 +108,14 @@ type gatekeeperScheduler interface {
 	EvaluatePullRequest(context.Context, gatekeeper.EvaluationInput) (gatekeeper.Report, error)
 }
 
+// gatekeeperLegacyRetirementScheduler is optional so normal Gatekeeper
+// discovery tests and callers remain focused on open-PR evaluation. Production
+// runners use it as a migration-maintenance pass over archived as well as
+// active projects.
+type gatekeeperLegacyRetirementScheduler interface {
+	ReconcileLegacyVerdictComments(context.Context) error
+}
+
 type workerScheduler interface {
 	ProcessNext(context.Context, string) (*runpipe.ProcessResult, error)
 	ProcessClaimedQueueItem(context.Context, storage.QueueItemRecord) (*runpipe.ProcessResult, error)
@@ -2844,6 +2852,14 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 		appendErr(err)
 		retErr = errors.Join(errs...)
 		return retErr
+	}
+	if maintenance, ok := input.Gatekeeper.(gatekeeperLegacyRetirementScheduler); ok {
+		if err := admissionRefuseWork(input); err != nil {
+			return err
+		}
+		appendErr(runSchedulerLane(input, "gatekeeper legacy verdict retirement", "", "", func() error {
+			return maintenance.ReconcileLegacyVerdictComments(ctx)
+		}))
 	}
 	if !catalogCurrent {
 		return nil
