@@ -362,6 +362,10 @@ type AgentRunInput struct {
 	SnapshotVendor          string
 	SnapshotModel           *string
 	SnapshotReasoningEffort *config.ReasoningEffort
+	// CompletionContract selects the daemon-owned stdout contract used for
+	// agent-health success accounting. Thread-resolution classifiers emit raw
+	// JSON without the generic completion marker.
+	CompletionContract agent.CompletionContract
 }
 
 type AgentResult struct {
@@ -2457,6 +2461,7 @@ func (r *Runner) classifyReviewThreads(ctx context.Context, input stepInput, che
 		Metadata:       map[string]any{"loopType": "reviewer", "phase": "thread_resolution", "repo": input.Repo, "prNumber": input.PRNumber},
 		IdempotencyKey: idempotencyKey,
 		UseSnapshot:    useSnap, SnapshotVendor: snapVendor, SnapshotModel: snapModel, SnapshotReasoningEffort: snapReasoningEffort,
+		CompletionContract: agent.CompletionContractRawJSON,
 	})
 	if err != nil {
 		return nil, err

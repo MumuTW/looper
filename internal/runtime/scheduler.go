@@ -1154,6 +1154,7 @@ func (a reviewerAgentExecutorAdapter) Start(ctx context.Context, input reviewer.
 		SnapshotVendor:          input.SnapshotVendor,
 		SnapshotModel:           input.SnapshotModel,
 		SnapshotReasoningEffort: input.SnapshotReasoningEffort,
+		CompletionContract:      input.CompletionContract,
 	})
 	if err != nil {
 		proxyCleanup()
