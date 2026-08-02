@@ -130,7 +130,7 @@ func roleDiscoverers(input defaultSchedulerTickInput) map[string]discoveryLane {
 // coordinatorLane is built separately because coordination is not a coding
 // role: it has no agent, no discovery config, and is enabled per project.
 func coordinatorLane(input defaultSchedulerTickInput) discoveryLane {
-	return discoveryLane{
+	lane := discoveryLane{
 		Name:     "coordinator",
 		Priority: config.PriorityCoordinator,
 		Present:  input.Coordinator != nil,
@@ -140,6 +140,11 @@ func coordinatorLane(input defaultSchedulerTickInput) discoveryLane {
 			return nil, err
 		},
 	}
+	if input.Config != nil && input.Config.Agent.Vendor != nil {
+		vendor := string(*input.Config.Agent.Vendor)
+		lane.Provider = func(string) string { return vendor }
+	}
+	return lane
 }
 
 // triagerLane is an internal issue-source role. Its persisted report is the
@@ -163,7 +168,7 @@ func triagerLane(input defaultSchedulerTickInput) discoveryLane {
 	}); ok {
 		readBudget = factory.BeginPendingForgeReadTick(projectIDs)
 	}
-	return discoveryLane{
+	lane := discoveryLane{
 		Name:     "triager",
 		Priority: config.PriorityTriager,
 		Present:  input.Triager != nil,
@@ -187,6 +192,16 @@ func triagerLane(input defaultSchedulerTickInput) discoveryLane {
 			return result.QueueItems, err
 		},
 	}
+	if input.Config != nil {
+		lane.Provider = func(projectID string) string {
+			resolved, ok := config.ResolveAgent(*input.Config, projectID, config.CodingRolePlanner)
+			if !ok {
+				return ""
+			}
+			return string(resolved.Vendor)
+		}
+	}
+	return lane
 }
 
 // discoveryLanes builds the ordered lane list for one tick from registered

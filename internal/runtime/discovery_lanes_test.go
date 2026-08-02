@@ -165,6 +165,30 @@ func TestCodingDiscoveryLanesResolveProviderForProjectAdmission(t *testing.T) {
 	}
 }
 
+func TestInternalDiscoveryLanesResolveAgentProviders(t *testing.T) {
+	t.Parallel()
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	codex := config.AgentVendorCodex
+	claude := config.AgentVendorClaudeCode
+	cfg.Agent.Vendor = &codex
+	cfg.Roles.Planner.Agent = &config.RoleAgentConfig{Vendor: &claude}
+
+	lanes := discoveryLanes(defaultSchedulerTickInput{Config: &cfg})
+	byName := make(map[string]discoveryLane, len(lanes))
+	for _, lane := range lanes {
+		byName[lane.Name] = lane
+	}
+	if got := byName["triager"].Provider("project"); got != string(claude) {
+		t.Fatalf("triager provider = %q, want planner provider %q", got, claude)
+	}
+	if got := byName["coordinator"].Provider("project"); got != string(codex) {
+		t.Fatalf("coordinator provider = %q, want global provider %q", got, codex)
+	}
+}
+
 type budgetTriager struct {
 	mu       sync.Mutex
 	budgets  []int
