@@ -446,19 +446,10 @@ type fakeGatekeeperGitHub struct {
 	reviewMarkerCalls []githubinfra.VerifyReviewMarkerInput
 	statusCalls       []githubinfra.CommitStatusInput
 	statusErr         error
-	merges            []githubinfra.EnableAutoMergeInput
-	mergeErr          error
+	viewErr           error
 	// beforeView, when set, runs before each pull-request read, so a test can
 	// inject a state change between the first evaluation and a later one.
 	beforeView func(*fakeGatekeeperGitHub)
-}
-
-func (f *fakeGatekeeperGitHub) MergePullRequest(_ context.Context, input githubinfra.EnableAutoMergeInput) error {
-	if f.mergeErr != nil {
-		return f.mergeErr
-	}
-	f.merges = append(f.merges, input)
-	return nil
 }
 
 func (f *fakeGatekeeperGitHub) GetCurrentUserLoginForRepo(context.Context, string, string) (string, error) {
@@ -540,6 +531,9 @@ func (f *fakeGatekeeperGitHub) ViewPullRequestForGatekeeper(context.Context, git
 	f.perPullRequestCalls++
 	if f.beforeView != nil {
 		f.beforeView(f)
+	}
+	if f.viewErr != nil {
+		return githubinfra.PullRequestDetail{}, f.viewErr
 	}
 	return f.detail, nil
 }

@@ -207,7 +207,6 @@ type GitHubGateway interface {
 	DeleteIssueComment(context.Context, githubinfra.DeleteIssueCommentInput) error
 	FindReviewMarker(context.Context, githubinfra.VerifyReviewMarkerInput) (githubinfra.ReviewMarkerResult, error)
 	SetCommitStatus(context.Context, githubinfra.CommitStatusInput) error
-	MergePullRequest(context.Context, githubinfra.EnableAutoMergeInput) error
 }
 
 // RequiredStatusContext is the GitHub status context an operator adds to branch
@@ -223,8 +222,6 @@ type Options struct {
 	// TrustForProject reports a project's merge-authority level. Nil means every
 	// project stays at observe, which is also the configured default.
 	TrustForProject func(projectID string) config.GatekeeperTrustLevel
-	// MergeStrategyForProject selects the strategy used at the auto trust level.
-	MergeStrategyForProject func(projectID string) config.ReviewerAutoMergeStrategy
 	// DiffBudgetForProject returns the effective boolean change-size limits. Zero
 	// bounds are unlimited; nil means every project has no configured limit.
 	DiffBudgetForProject func(projectID string) config.GatekeeperDiffBudget
@@ -242,9 +239,8 @@ type Runner struct {
 	github                  GitHubGateway
 	now                     func() time.Time
 	policyPermitsTarget     func(projectID, repo, baseRefName string) bool
-	trustForProject         func(projectID string) config.GatekeeperTrustLevel
-	mergeStrategyForProject func(projectID string) config.ReviewerAutoMergeStrategy
-	diffBudgetForProject    func(projectID string) config.GatekeeperDiffBudget
+	trustForProject      func(projectID string) config.GatekeeperTrustLevel
+	diffBudgetForProject func(projectID string) config.GatekeeperDiffBudget
 	logWarn                 func(msg string, fields map[string]any)
 }
 
@@ -259,7 +255,7 @@ func New(options Options) *Runner {
 	}
 	return &Runner{
 		repos: options.Repos, github: options.GitHub, now: now, policyPermitsTarget: policy,
-		trustForProject: options.TrustForProject, mergeStrategyForProject: options.MergeStrategyForProject, diffBudgetForProject: options.DiffBudgetForProject,
+		trustForProject: options.TrustForProject, diffBudgetForProject: options.DiffBudgetForProject,
 		logWarn: options.LogWarn,
 	}
 }
@@ -535,7 +531,12 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 	if !*mergeability.Mergeable || mergeabilityState.HasConflict() {
 		report.Reasons = append(report.Reasons, Reason{Code: ReasonMergeConflict})
 	} else if mergeabilityState.IsAmbiguousPolicyState() {
-		report.Reasons = append(report.Reasons, Reason{Code: ReasonProviderStateAmbiguous, Subject: "mergeability:" + mergeabilityState.Raw()})
+		// GitHub reports "blocked" while required statuses (including this
+		// runner's own) are absent or pending. Treating that as a gate input in
+		// auto mode would publish error and keep mergeability blocked forever.
+		if r.trustFor(input.ProjectID) != config.GatekeeperTrustAuto || mergeabilityState != githubinfra.MergeabilityStateBlocked {
+			report.Reasons = append(report.Reasons, Reason{Code: ReasonProviderStateAmbiguous, Subject: "mergeability:" + mergeabilityState.Raw()})
+		}
 	} else if !mergeabilityState.IsClean() {
 		report.Reasons = append(report.Reasons, Reason{Code: ReasonMergeabilityNotClean, Subject: mergeabilityState.Raw()})
 	}
@@ -665,11 +666,17 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 		if markerErr != nil {
 			return r.persistProviderBlock(ctx, report, ReasonProviderStateUnavailable, "codex_review")
 		}
-		report.Evidence.CodexReviewOutcome = strings.ToLower(strings.TrimSpace(marker.Outcome))
-		if !marker.Found {
+		if marker.Found {
+			report.Evidence.CodexReviewOutcome = strings.ToLower(strings.TrimSpace(marker.Outcome))
+			if report.Evidence.CodexReviewOutcome == "blocking" || report.Evidence.CodexReviewOutcome == "actionable" {
+				report.Reasons = append(report.Reasons, Reason{Code: ReasonCodexReviewBlocked, Subject: report.Evidence.CodexReviewOutcome})
+			}
+		} else if report.Evidence.CodexReview != nil && report.Evidence.CodexReview.CurrentHeadValid && report.Evidence.CodexReview.Event == "COMMENT" {
+			// Markerless clean COMMENT policy records pr.review.posted with
+			// markerVerified=true but leaves no forge marker for FindReviewMarker.
+			report.Evidence.CodexReviewOutcome = "clean"
+		} else {
 			report.Reasons = append(report.Reasons, Reason{Code: ReasonCodexReviewRequired, Subject: "current_head"})
-		} else if report.Evidence.CodexReviewOutcome == "blocking" || report.Evidence.CodexReviewOutcome == "actionable" {
-			report.Reasons = append(report.Reasons, Reason{Code: ReasonCodexReviewBlocked, Subject: report.Evidence.CodexReviewOutcome})
 		}
 	}
 
@@ -697,18 +704,7 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 	if budgetEnabled && strings.TrimSpace(finalBase) != diffBudgetBaseSHA {
 		return r.persistProviderBlock(ctx, report, ReasonProviderStateAmbiguous, "diff_budget_base")
 	}
-	persisted, err := r.persist(ctx, report)
-	if err != nil {
-		return Report{}, err
-	}
-	// Merging is the last thing, and only on the primary pass: the confirming
-	// evaluation exists to serve this decision, not to make another one.
-	if !input.Confirming && persisted.Eligible && r.trustFor(persisted.ProjectID) == config.GatekeeperTrustAuto {
-		if err := r.confirmAndMerge(ctx, input, persisted); err != nil {
-			return persisted, err
-		}
-	}
-	return persisted, nil
+	return r.persist(ctx, report)
 }
 
 // observeReviewProvenance reads who reviewed this pull request and who refused
@@ -865,6 +861,28 @@ func (r *Runner) persist(ctx context.Context, report Report) (Report, error) {
 		action = decideVerdictAction(r.trustFor(report.ProjectID), previous, report)
 	}
 
+	statusSHA := strings.TrimSpace(report.ObservedHeadSHA)
+	if statusSHA == "" {
+		statusSHA = strings.TrimSpace(report.ExpectedHeadSHA)
+	}
+	if !confirming && r.trustFor(report.ProjectID) == config.GatekeeperTrustAuto && statusSHA != "" {
+		state, description := gatekeeperCommitStatus(report)
+		if err := r.github.SetCommitStatus(ctx, githubinfra.CommitStatusInput{
+			Repo: report.Repo, SHA: statusSHA, Context: RequiredStatusContext,
+			State: state, Description: description, CWD: r.projectCWD(ctx, report.ProjectID),
+		}); err != nil {
+			if r.logWarn != nil {
+				r.logWarn("gatekeeper: could not publish commit status", map[string]any{
+					"repo": report.Repo, "pr": report.PRNumber, "sha": statusSHA, "error": err.Error(),
+				})
+			}
+			// A failed publication must not be cacheable: the next tick must
+			// re-evaluate and retry rather than reuse a report while branch
+			// protection still sees a stale success.
+			report.SourceFingerprint = ""
+		}
+	}
+
 	entityType := "pull_request"
 	entityID := fmt.Sprintf("%s#%d", report.Repo, report.PRNumber)
 	projectID := report.ProjectID
@@ -881,15 +899,6 @@ func (r *Runner) persist(ctx context.Context, report Report) (Report, error) {
 		r.logWarn("gatekeeper: could not reconcile the verdict comment", map[string]any{
 			"repo": report.Repo, "pr": report.PRNumber, "action": string(action), "error": err.Error(),
 		})
-	}
-	if !confirming && r.trustFor(report.ProjectID) == config.GatekeeperTrustAuto && strings.TrimSpace(report.ObservedHeadSHA) != "" {
-		state, description := gatekeeperCommitStatus(report)
-		if err := r.github.SetCommitStatus(ctx, githubinfra.CommitStatusInput{
-			Repo: report.Repo, SHA: report.ObservedHeadSHA, Context: RequiredStatusContext,
-			State: state, Description: description, CWD: r.projectCWD(ctx, report.ProjectID),
-		}); err != nil {
-			return Report{}, fmt.Errorf("publish gatekeeper commit status: %w", err)
-		}
 	}
 	return report, nil
 }
