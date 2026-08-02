@@ -245,6 +245,103 @@ func TestCombinedLoopLogsStreamFallsBackToInlineOutput(t *testing.T) {
 	}
 }
 
+func TestSingleLoopLogsStreamReadsOnlyAppendedFileBytes(t *testing.T) {
+	fixture := newTestFixture(t)
+	seedRunRouteData(t, fixture.runtime)
+
+	logRoot := filepath.Join(fixture.config.Daemon.LogDir, "loops", "loop_1", "run_1")
+	if err := os.MkdirAll(logRoot, 0o755); err != nil {
+		t.Fatalf("MkdirAll(log root): %v", err)
+	}
+	stdoutPath := filepath.Join(logRoot, "exec_single.stdout.log")
+	history := strings.Repeat("history-line\n", 64)
+	if err := os.WriteFile(stdoutPath, []byte(history), 0o644); err != nil {
+		t.Fatalf("write stdout history: %v", err)
+	}
+
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+	output, err := json.Marshal(agentOutputPayload{Stdout: "history tail", StdoutLogPath: stdoutPath})
+	if err != nil {
+		t.Fatalf("marshal output: %v", err)
+	}
+	if err := fixture.runtime.Services().Repositories.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{
+		ID:         "exec_single",
+		ProjectID:  stringPtr("project_1"),
+		LoopID:     stringPtr("loop_1"),
+		RunID:      stringPtr("run_1"),
+		Vendor:     "codex",
+		Status:     "running",
+		StartedAt:  nowISO,
+		OutputJSON: stringPtr(string(output)),
+		CreatedAt:  nowISO,
+		UpdatedAt:  nowISO,
+	}); err != nil {
+		t.Fatalf("upsert execution: %v", err)
+	}
+
+	const appended = "new line\n"
+	var observationsMu sync.Mutex
+	incrementalBytes := 0
+	snapshotReady := make(chan struct{})
+	bytesReady := make(chan struct{})
+	snapshotSignaled, bytesSignaled := false, false
+	handler := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime})
+	handler.loopLogsFollowObserve = func(observation loopLogsFollowObservation) {
+		observationsMu.Lock()
+		defer observationsMu.Unlock()
+		switch observation.Kind {
+		case "snapshot_delivered":
+			if !snapshotSignaled {
+				close(snapshotReady)
+				snapshotSignaled = true
+			}
+		case "file_read":
+			incrementalBytes += observation.Bytes
+			if !bytesSignaled && incrementalBytes >= len(appended) {
+				close(bytesReady)
+				bytesSignaled = true
+			}
+		}
+	}
+	server := httptest.NewServer(handler)
+	defer server.Close()
+	response, err := http.Get(server.URL + "/api/v1/loops/loop_1/logs?follow=1")
+	if err != nil {
+		t.Fatalf("open single stream: %v", err)
+	}
+	defer response.Body.Close()
+
+	select {
+	case <-snapshotReady:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for single-stream snapshot")
+	}
+	appendFile(t, stdoutPath, appended)
+	select {
+	case <-bytesReady:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for single-stream appended bytes")
+	}
+	markRunSuccess(t, fixture, "run_1")
+
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatalf("read single stream: %v", err)
+	}
+	text := string(body)
+	if !strings.Contains(text, "event: snapshot") || !strings.Contains(text, "event: end") {
+		t.Fatalf("stream body = %q, want snapshot/end events", text)
+	}
+	if !strings.Contains(text, `"content":"new line\n"`) {
+		t.Fatalf("stream body = %q, want appended chunk", text)
+	}
+	observationsMu.Lock()
+	defer observationsMu.Unlock()
+	if incrementalBytes != len(appended) {
+		t.Fatalf("incremental file bytes = %d, want %d", incrementalBytes, len(appended))
+	}
+}
+
 func TestLoopLogsFileCursorKeepsInlineFallbackWhenPathIsMissing(t *testing.T) {
 	fixture := newTestFixture(t)
 	handler := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime})

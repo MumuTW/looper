@@ -174,6 +174,94 @@ func (h *Handler) newLoopLogsCombinedCursor(state loopLogsCombinedState) (loopLo
 	return loopLogsCombinedCursor{executionID: executionID, stdout: stdout, stderr: stderr}, nil
 }
 
+func (h *Handler) newLoopLogsSingleCursor(state loopLogsCombinedState, stderr bool) (loopLogsFileCursor, error) {
+	path, inline := singleLoopLogsOutput(state.output, stderr)
+	return h.newLoopLogsFileCursor(path, inline)
+}
+
+func singleLoopLogsOutput(output agentOutputPayload, stderr bool) (string, string) {
+	if stderr {
+		return output.StderrLogPath, output.Stderr
+	}
+	return output.StdoutLogPath, output.Stdout
+}
+
+func applyLoopLogsSingleSnapshot(response *loopLogsResponse, cursor loopLogsFileCursor, stderr bool) {
+	if response == nil || response.Agent == nil {
+		return
+	}
+	content := tailLogBytes(cursor.snapshotContent(), loopLogsFollowSnapshotBytes)
+	if stderr {
+		response.Agent.Stderr = content
+	} else {
+		response.Agent.Stdout = content
+	}
+}
+
+func (h *Handler) updateLoopLogsSingleCursor(w io.Writer, flusher http.Flusher, response loopLogsResponse, output agentOutputPayload, cursor *loopLogsFileCursor, stderr bool, executionID string) error {
+	if response.Agent == nil || cursor == nil {
+		return nil
+	}
+	path, inline := singleLoopLogsOutput(output, stderr)
+	validPath := strings.TrimSpace(path) != "" && isPathWithinDirectory(path, h.context.Config.Daemon.LogDir)
+	if cursor.path != "" && cursor.path != path {
+		known := cursor.lastInline
+		if err := h.emitLoopLogsSingleChunks(w, flusher, response, cursor, true); err != nil {
+			return err
+		}
+		if validPath {
+			next, err := h.newLoopLogsFileCursor(path, inline)
+			if err != nil {
+				return err
+			}
+			*cursor = next
+			return writeLoopLogsChunk(w, flusher, response, "", logContentAfterKnown(next.snapshotContent(), known))
+		}
+		*cursor = loopLogsFileCursor{lastInline: inline}
+		return writeLoopLogsChunk(w, flusher, response, "", appendedLogChunk(executionID, known, executionID, inline))
+	}
+	if cursor.path == "" && validPath {
+		known := cursor.lastInline
+		next, err := h.newLoopLogsFileCursor(path, inline)
+		if err != nil {
+			return err
+		}
+		*cursor = next
+		return writeLoopLogsChunk(w, flusher, response, "", logContentAfterKnown(next.snapshotContent(), known))
+	}
+	if cursor.path == "" {
+		chunk := appendedLogChunk(executionID, cursor.lastInline, executionID, inline)
+		cursor.lastInline = inline
+		return writeLoopLogsChunk(w, flusher, response, "", chunk)
+	}
+	cursor.lastInline = inline
+	return nil
+}
+
+func (h *Handler) emitLoopLogsSingleChunks(w io.Writer, flusher http.Flusher, response loopLogsResponse, cursor *loopLogsFileCursor, drain bool) error {
+	if cursor == nil {
+		return nil
+	}
+	for {
+		chunk, attempted, err := cursor.readNext(loopLogsFollowMaxChunkBytes)
+		if attempted {
+			h.observeLoopLogsFollow("file_read", len(chunk))
+		}
+		if err != nil {
+			return apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+		}
+		if chunk == "" {
+			return nil
+		}
+		if err := writeLoopLogsChunk(w, flusher, response, "", chunk); err != nil {
+			return errLoopLogsClientWrite
+		}
+		if !drain {
+			return nil
+		}
+	}
+}
+
 func (h *Handler) newLoopLogsFileCursor(path, inline string) (loopLogsFileCursor, error) {
 	cursor := loopLogsFileCursor{lastInline: inline}
 	if strings.TrimSpace(path) == "" || !isPathWithinDirectory(path, h.context.Config.Daemon.LogDir) {

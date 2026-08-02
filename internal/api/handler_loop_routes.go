@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -118,10 +119,18 @@ func (h *Handler) streamLoopLogs(w http.ResponseWriter, r *http.Request, request
 		return apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: "Streaming is not supported by this response writer"}
 	}
 
-	current, err := h.buildLoopLogsResponse(r.Context(), loop)
+	state, err := h.buildLoopLogsCombinedState(r.Context(), loop)
 	if err != nil {
 		return err
 	}
+	requestedStderr := stderr
+	streamStderr := requestedStderr || shouldDefaultLoopLogsStreamToStderr(state.response)
+	cursor, err := h.newLoopLogsSingleCursor(state, streamStderr)
+	if err != nil {
+		return err
+	}
+	current := state.response
+	applyLoopLogsSingleSnapshot(&current, cursor, streamStderr)
 
 	w.Header().Set(requestIDHeaderName, requestID)
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -131,12 +140,16 @@ func (h *Handler) streamLoopLogs(w http.ResponseWriter, r *http.Request, request
 	if err := writeSSEEvent(w, flusher, "snapshot", current); err != nil {
 		return nil
 	}
+	h.observeLoopLogsFollow("snapshot_delivered", 0)
 
 	observedRunID := ""
 	if current.Run != nil {
 		observedRunID = current.Run.RunID
 	}
-	previousExecutionID, previousContent := loopLogsStreamState(current, stderr)
+	executionID := ""
+	if current.Agent != nil {
+		executionID = current.Agent.ExecutionID
+	}
 	if shouldTerminateLoopLogsFollow(current, observedRunID) {
 		_ = writeSSEEvent(w, flusher, "end", map[string]string{"reason": "run_completed"})
 		return nil
@@ -152,39 +165,64 @@ func (h *Handler) streamLoopLogs(w http.ResponseWriter, r *http.Request, request
 		case <-ticker.C:
 		}
 
-		current, err = h.buildLoopLogsResponse(r.Context(), loop)
-		if err != nil {
-			_ = writeSSEEvent(w, flusher, "error", newLoopLogsFollowErrorEvent(err))
+		nextState, stateErr := h.buildLoopLogsCombinedState(r.Context(), loop)
+		if stateErr != nil {
+			_ = writeSSEEvent(w, flusher, "error", newLoopLogsFollowErrorEvent(stateErr))
 			return nil
 		}
-		if observedRunID == "" && current.Run != nil {
-			observedRunID = current.Run.RunID
+		next := nextState.response
+		if observedRunID == "" && next.Run != nil {
+			observedRunID = next.Run.RunID
 		}
-		if shouldTerminateLoopLogsFollowBeforeChunk(current, observedRunID) {
+		if shouldTerminateLoopLogsFollowBeforeChunk(next, observedRunID) {
 			_ = writeSSEEvent(w, flusher, "end", map[string]string{"reason": "run_completed"})
 			return nil
 		}
 
-		nextExecutionID, nextContent := loopLogsStreamState(current, stderr)
-		chunk := appendedLogChunk(previousExecutionID, previousContent, nextExecutionID, nextContent)
-		if chunk != "" {
-			event := loopLogsFollowChunkEvent{Content: chunk}
-			if current.Run != nil {
-				event.RunID = &current.Run.RunID
-				event.CurrentStep = current.Run.CurrentStep
+		nextExecutionID := ""
+		if next.Agent != nil {
+			nextExecutionID = next.Agent.ExecutionID
+		}
+		nextStreamStderr := requestedStderr || shouldDefaultLoopLogsStreamToStderr(next)
+		if nextExecutionID != executionID || nextStreamStderr != streamStderr {
+			if err := h.emitLoopLogsSingleChunks(w, flusher, current, &cursor, true); err != nil {
+				if errors.Is(err, errLoopLogsClientWrite) {
+					return nil
+				}
+				_ = writeSSEEvent(w, flusher, "error", newLoopLogsFollowErrorEvent(err))
+				return nil
 			}
-			if current.Agent != nil {
-				event.ExecutionID = &current.Agent.ExecutionID
-				event.Vendor = &current.Agent.Vendor
-				event.PID = current.Agent.PID
-				event.Status = &current.Agent.Status
+			nextCursor, cursorErr := h.newLoopLogsSingleCursor(nextState, nextStreamStderr)
+			if cursorErr != nil {
+				_ = writeSSEEvent(w, flusher, "error", newLoopLogsFollowErrorEvent(cursorErr))
+				return nil
 			}
-			if err := writeSSEEvent(w, flusher, "chunk", event); err != nil {
+			cursor = nextCursor
+			executionID = nextExecutionID
+			streamStderr = nextStreamStderr
+			if next.Agent != nil {
+				if err := writeLoopLogsChunk(w, flusher, next, "", cursor.snapshotContent()); err != nil {
+					return nil
+				}
+			}
+		} else {
+			if err := h.updateLoopLogsSingleCursor(w, flusher, next, nextState.output, &cursor, streamStderr, executionID); err != nil {
+				if errors.Is(err, errLoopLogsClientWrite) {
+					return nil
+				}
+				_ = writeSSEEvent(w, flusher, "error", newLoopLogsFollowErrorEvent(err))
+				return nil
+			}
+			if err := h.emitLoopLogsSingleChunks(w, flusher, next, &cursor, false); err != nil {
+				if errors.Is(err, errLoopLogsClientWrite) {
+					return nil
+				}
+				_ = writeSSEEvent(w, flusher, "error", newLoopLogsFollowErrorEvent(err))
 				return nil
 			}
 		}
+		current = next
 
-		previousExecutionID, previousContent = nextExecutionID, nextContent
 		if shouldTerminateLoopLogsFollow(current, observedRunID) {
 			_ = writeSSEEvent(w, flusher, "end", map[string]string{"reason": "run_completed"})
 			return nil
@@ -228,17 +266,6 @@ func writeSSEEvent(w io.Writer, flusher http.Flusher, event string, payload any)
 	}
 	flusher.Flush()
 	return nil
-}
-
-func loopLogsStreamState(resp loopLogsResponse, stderr bool) (string, string) {
-	if resp.Agent == nil {
-		return "", ""
-	}
-	content := resp.Agent.Stdout
-	if stderr || shouldDefaultLoopLogsStreamToStderr(resp) {
-		content = resp.Agent.Stderr
-	}
-	return resp.Agent.ExecutionID, content
 }
 
 func shouldDefaultLoopLogsStreamToStderr(resp loopLogsResponse) bool {
