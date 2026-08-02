@@ -48,7 +48,9 @@ jobs:
         with:
           # Pin both Node and its bundled npm. Floating sudo-npm was part of
           # the executable-substitution surface identified in #338.
-          node-version: "22.14.0"
+          # Keep the pinned Node 22 LTS on the latest reviewed security release;
+          # patch upgrades must remain explicit because the runtime is sealed.
+          node-version: "22.23.2"
           cache: pnpm
           cache-dependency-path: web/dashboard/pnpm-lock.yaml
 
