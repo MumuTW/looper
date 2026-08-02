@@ -669,7 +669,6 @@ func (r *EventsRepository) ListLatestByEntityTypeAndEventTypes(ctx context.Conte
 
 	return scanEventLogs(rows)
 }
-
 // ListFirstEventTimestampsByType returns, for each supplied entity ID that has
 // an event of eventType, the created_at of its earliest such event. Callers
 // need both the durable evidence and when it was first written, so one pass

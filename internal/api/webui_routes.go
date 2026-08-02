@@ -30,7 +30,7 @@ func (h *Handler) handleWebUIRoute(w http.ResponseWriter, r *http.Request) {
 	collector := looperdruntime.NewEscalatorCollector(cfg, repositories, h.now)
 	links := looperdruntime.NewEscalatorLinker(cfg)
 	webui.Handler(webui.Options{
-		Load: webui.NewRepositoryLoader(repositories, collector, links, h.now),
+		Load: h.webUICache.Wrap(webui.NewRepositoryLoader(repositories, collector, links, h.now)),
 		Now:  h.now,
 	}).ServeHTTP(w, r)
 }

@@ -42,6 +42,7 @@ import (
 	"github.com/MumuTW/looper/internal/triager"
 	"github.com/MumuTW/looper/internal/version"
 	"github.com/MumuTW/looper/internal/webhookforward"
+	"github.com/MumuTW/looper/internal/webui"
 	pkgapi "github.com/MumuTW/looper/pkg/api"
 )
 
@@ -159,6 +160,9 @@ type Handler struct {
 	recoverySummary  func() any
 	webhookForwarder webhookforward.Forwarder
 	bootstrap        *bootstrapCodes
+	// webUICache bounds what the /ui/ poll costs when several tabs are open:
+	// the page handler is rebuilt per request, so the cache has to live here.
+	webUICache *webui.LoadCache
 	// discardBeforeGitHook is test-only: invoked after discard preflight recheck
 	// and immediately before git reset/clean so tests can inject a requeue race
 	// that bypasses LockLoopRequeue (defense-in-depth for the pre-git recheck).
@@ -225,6 +229,7 @@ func NewHandler(context Context) *Handler {
 		recoverySummary:  recoverySummary,
 		webhookForwarder: forwarder,
 		bootstrap:        bootstrap,
+		webUICache:       webui.NewLoadCache(webui.RefreshInterval, now),
 	}
 }
 

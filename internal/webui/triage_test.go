@@ -543,3 +543,161 @@ func TestCompactCountAndRelativeAge(t *testing.T) {
 		}
 	}
 }
+
+// itemRows builds count standalone digest rows for one reason, oldest first,
+// which is the order Classify hands to the collapse pass.
+func itemRows(reason escalator.Reason, kind escalator.Kind, count int) []Row {
+	rows := make([]Row, 0, count)
+	for index := 0; index < count; index++ {
+		item := escalator.Item{
+			ID:         fmt.Sprintf("%s:proj:%d", reason, index),
+			Kind:       kind,
+			Reason:     reason,
+			Stage:      "triager",
+			Title:      fmt.Sprintf("Confirm triage for acme/widgets#%d", index),
+			Link:       testLinker{}.Issue("proj", "acme/widgets", int64(index)),
+			AgeSeconds: int64(3600 * (count - index)),
+		}
+		rows = append(rows, escalatorRow(testNow, item))
+	}
+	return rows
+}
+
+func TestCollapseRepeatsFoldsRunsOfOneReason(t *testing.T) {
+	t.Parallel()
+
+	prRow := func(number int64) Row {
+		row := pullRequestRow(testNow, newPRKey("proj", "acme/widgets", number), snapshot(t, number, payloadOptions{}), nil, nil, nil,
+			[]escalator.Item{{ID: fmt.Sprintf("triage_confirmation:proj:%d", number), Kind: escalator.KindStuck, Reason: escalator.ReasonTriageConfirmation, AgeSeconds: 3600}}, testLinker{})
+		return row
+	}
+
+	prRows := make([]Row, 0, 8)
+	for number := int64(1); number <= 8; number++ {
+		prRows = append(prRows, prRow(number))
+	}
+
+	mixed := append(itemRows(escalator.ReasonTriageConfirmation, escalator.KindStuck, 10), itemRows(escalator.ReasonCircuitBreaker, escalator.KindStuck, 7)...)
+	mixed = append(mixed, itemRows(escalator.ReasonQueueRetries, escalator.KindStuck, 2)...)
+
+	cases := []struct {
+		name string
+		rows []Row
+		// wantRows is the rendered row count after folding.
+		wantRows int
+		// wantSummaries maps a summary row title to the count it must report.
+		wantSummaries map[string]bool
+	}{
+		{
+			name:     "below the threshold nothing folds",
+			rows:     itemRows(escalator.ReasonTriageConfirmation, escalator.KindStuck, collapseMinimum-1),
+			wantRows: collapseMinimum - 1,
+		},
+		{
+			name:          "at the threshold exemplars plus one summary",
+			rows:          itemRows(escalator.ReasonTriageConfirmation, escalator.KindStuck, collapseMinimum),
+			wantRows:      collapseExemplars + 1,
+			wantSummaries: map[string]bool{fmt.Sprintf("…and %d more issues awaiting triage confirmation", collapseMinimum-collapseExemplars): true},
+		},
+		{
+			name:          "a long run reports every hidden row",
+			rows:          itemRows(escalator.ReasonTriageConfirmation, escalator.KindStuck, 170),
+			wantRows:      collapseExemplars + 1,
+			wantSummaries: map[string]bool{"…and 167 more issues awaiting triage confirmation": true},
+		},
+		{
+			name:     "each reason folds on its own count",
+			rows:     mixed,
+			wantRows: 2*(collapseExemplars+1) + 2,
+			wantSummaries: map[string]bool{
+				"…and 7 more issues awaiting triage confirmation":    true,
+				"…and 4 more items behind a tripped circuit breaker": true,
+			},
+		},
+		{
+			name:     "pull request rows never fold",
+			rows:     prRows,
+			wantRows: len(prRows),
+		},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := collapseRepeats(testCase.rows)
+			if len(got) != testCase.wantRows {
+				t.Fatalf("len(collapseRepeats()) = %d, want %d", len(got), testCase.wantRows)
+			}
+
+			summaries := map[string]bool{}
+			keys := map[string]bool{}
+			for _, row := range got {
+				if keys[row.Key] {
+					t.Fatalf("duplicate row key %q", row.Key)
+				}
+				keys[row.Key] = true
+				if !row.Summary {
+					continue
+				}
+				summaries[row.Title] = true
+				if row.Link != "" {
+					t.Fatalf("summary row link = %q, want none", row.Link)
+				}
+				if !row.ChangedAt.IsZero() || row.Changed {
+					t.Fatalf("summary row carries an exemplar's age: %#v", row)
+				}
+			}
+			if len(summaries) != len(testCase.wantSummaries) {
+				t.Fatalf("summary rows = %v, want %v", summaries, testCase.wantSummaries)
+			}
+			for want := range testCase.wantSummaries {
+				if !summaries[want] {
+					t.Fatalf("summary rows = %v, want %q", summaries, want)
+				}
+			}
+
+			// The exemplars are the oldest rows of their run, in input order.
+			for index, row := range testCase.rows[:min(collapseExemplars, len(testCase.rows))] {
+				if len(got) > index && got[index].Key != row.Key {
+					t.Fatalf("exemplar %d = %q, want %q", index, got[index].Key, row.Key)
+				}
+			}
+		})
+	}
+}
+
+func TestClassifyFoldsRepeatedStuckItemsButKeepsTheCount(t *testing.T) {
+	t.Parallel()
+
+	items := make([]escalator.Item, 0, 40)
+	for index := 0; index < 40; index++ {
+		items = append(items, escalator.Item{
+			ID:         fmt.Sprintf("triage_confirmation:proj:acme/widgets:%d", index),
+			Kind:       escalator.KindStuck,
+			Reason:     escalator.ReasonTriageConfirmation,
+			Stage:      "triager",
+			Title:      fmt.Sprintf("Confirm triage for acme/widgets#%d", index),
+			Link:       testLinker{}.Issue("proj", "acme/widgets", int64(index)),
+			AgeSeconds: int64(3600 * (40 - index)),
+		})
+	}
+
+	board := Classify(Input{Now: testNow, Links: testLinker{}, Escalator: escalator.Snapshot{Items: items}})
+
+	stuck := sectionFor(board, GroupStuck)
+	if len(stuck.Rows) != collapseExemplars+1 {
+		t.Fatalf("rendered stuck rows = %d, want %d", len(stuck.Rows), collapseExemplars+1)
+	}
+	if stuck.Count() != 40 {
+		t.Fatalf("stuck count = %d, want 40 (the tile counts what is stuck, not what is drawn)", stuck.Count())
+	}
+	summary := stuck.Rows[len(stuck.Rows)-1]
+	if !summary.Summary || summary.Title != "…and 37 more issues awaiting triage confirmation" {
+		t.Fatalf("last stuck row = %#v, want the summary row", summary)
+	}
+	// The exemplars are the longest-waiting items.
+	if stuck.Rows[0].Age < stuck.Rows[1].Age || stuck.Rows[1].Age < stuck.Rows[2].Age {
+		t.Fatalf("exemplars are not oldest-first: %v %v %v", stuck.Rows[0].Age, stuck.Rows[1].Age, stuck.Rows[2].Age)
+	}
+}

@@ -397,6 +397,27 @@ a.row-link:hover .row-title {
   white-space: nowrap;
 }
 
+/* A summary row stands in for a run of rows the board folded away. It is the
+ * same row, quieted: the accent dot drops to the muted ink, and the chip and
+ * meta columns are gone because they described one entry rather than the run. */
+.row-summary {
+  grid-template-columns: 7px minmax(0, 1fr);
+}
+
+.row-summary:hover {
+  background: transparent;
+}
+
+.row-summary-text {
+  display: block;
+  overflow: hidden;
+  font-size: 13px;
+  font-style: italic;
+  color: var(--ink-2);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* ---- chips -------------------------------------------------------------- */
 
 .chip {
@@ -545,6 +566,11 @@ a.row-link:hover .row-title {
     align-items: center;
     gap: 4px 12px;
     padding: 9px 14px;
+  }
+
+  .row-summary {
+    grid-template-columns: 7px minmax(0, 1fr);
+    grid-template-areas: "dot main";
   }
 
   .row .dot   { grid-area: dot; }

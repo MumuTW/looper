@@ -2,6 +2,7 @@ package webui
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -220,3 +221,40 @@ func TestOwnsMatchesOnlyTheUIMount(t *testing.T) {
 }
 
 func ptrInt64(value int64) *int64 { return &value }
+
+func TestHandlerRendersTheFoldedSummaryRow(t *testing.T) {
+	t.Parallel()
+
+	items := make([]escalator.Item, 0, 20)
+	for index := 0; index < 20; index++ {
+		items = append(items, escalator.Item{
+			ID:         fmt.Sprintf("triage_confirmation:proj:acme/widgets:%d", index),
+			Kind:       escalator.KindStuck,
+			Reason:     escalator.ReasonTriageConfirmation,
+			Stage:      "triager",
+			Title:      fmt.Sprintf("Confirm triage for acme/widgets#%d", index),
+			Link:       testLinker{}.Issue("proj", "acme/widgets", int64(index)),
+			AgeSeconds: int64(3600 * (20 - index)),
+		})
+	}
+
+	handler := newTestHandler(func(context.Context) Input {
+		return Input{Now: testNow, Links: testLinker{}, Escalator: escalator.Snapshot{Items: items}}
+	})
+
+	body := get(t, handler, TriagePath).Body.String()
+	assertContains(t, body,
+		`class="row row-summary"`,
+		`id="row-more-stuck-triage-confirmation"`,
+		`class="row-summary-text"`,
+		"and 17 more issues awaiting triage confirmation",
+		// The tile still counts every stuck item, not every drawn line.
+		`<span class="tile-count">20</span>`,
+	)
+	if strings.Count(body, `class="row row-summary"`) != 1 {
+		t.Fatalf("summary rows rendered = %d, want 1", strings.Count(body, `class="row row-summary"`))
+	}
+	if strings.Count(body, `id="row-item-`) != 3 {
+		t.Fatalf("exemplar rows rendered = %d, want 3", strings.Count(body, `id="row-item-`))
+	}
+}

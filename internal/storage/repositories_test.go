@@ -3248,3 +3248,50 @@ func TestRunsTouchHeartbeatOnlyMovesForward(t *testing.T) {
 		t.Fatalf("TouchHeartbeat disturbed other columns: %#v", run)
 	}
 }
+
+func TestEventsListLatestByEntityTypeAndEventTypesKeepsNewestPerEntity(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	ctx := context.Background()
+	repos := NewRepositories(coordinator.DB())
+
+	pullRequest := "pull_request"
+	issue := "github_issue"
+	first := "acme/widgets#1"
+	second := "acme/widgets#2"
+	other := "acme/widgets#9"
+	for _, event := range []EventLogRecord{
+		{ID: "gate_1_old", EventType: "pull_request.merge_gate.evaluated", EntityType: &pullRequest, EntityID: &first, PayloadJSON: `{"n":1}`, CreatedAt: "2026-04-11T12:00:00.000Z"},
+		{ID: "gate_1_new", EventType: "pull_request.merge_gate.evaluated", EntityType: &pullRequest, EntityID: &first, PayloadJSON: `{"n":2}`, CreatedAt: "2026-04-11T12:05:00.000Z"},
+		{ID: "gate_2_a", EventType: "pull_request.merge_gate.evaluated", EntityType: &pullRequest, EntityID: &second, PayloadJSON: `{"n":3}`, CreatedAt: "2026-04-11T12:07:00.000Z"},
+		// Same created_at as gate_2_a: the later id is the later insert.
+		{ID: "gate_2_b", EventType: "pull_request.merge_gate.evaluated", EntityType: &pullRequest, EntityID: &second, PayloadJSON: `{"n":4}`, CreatedAt: "2026-04-11T12:07:00.000Z"},
+		// Neither the other event type nor the other entity type may leak in.
+		{ID: "gate_1_other_type", EventType: "pull_request.snapshot.captured", EntityType: &pullRequest, EntityID: &first, PayloadJSON: `{"n":5}`, CreatedAt: "2026-04-11T12:09:00.000Z"},
+		{ID: "gate_issue", EventType: "pull_request.merge_gate.evaluated", EntityType: &issue, EntityID: &other, PayloadJSON: `{"n":6}`, CreatedAt: "2026-04-11T12:09:00.000Z"},
+	} {
+		if err := repos.Events.Append(ctx, event); err != nil {
+			t.Fatalf("Events.Append(%s) error = %v", event.ID, err)
+		}
+	}
+
+	latest, err := repos.Events.ListLatestByEntityTypeAndEventTypes(ctx, "pull_request", []string{"pull_request.merge_gate.evaluated"})
+	if err != nil {
+		t.Fatalf("Events.ListLatestByEntityTypeAndEventTypes() error = %v", err)
+	}
+	if len(latest) != 2 {
+		t.Fatalf("len(Events.ListLatestByEntityTypeAndEventTypes()) = %d, want 2: %#v", len(latest), latest)
+	}
+	if latest[0].ID != "gate_1_new" || latest[1].ID != "gate_2_b" {
+		t.Fatalf("Events.ListLatestByEntityTypeAndEventTypes() = [%s %s], want [gate_1_new gate_2_b]", latest[0].ID, latest[1].ID)
+	}
+
+	empty, err := repos.Events.ListLatestByEntityTypeAndEventTypes(ctx, "pull_request", nil)
+	if err != nil {
+		t.Fatalf("Events.ListLatestByEntityTypeAndEventTypes(no types) error = %v", err)
+	}
+	if len(empty) != 0 {
+		t.Fatalf("Events.ListLatestByEntityTypeAndEventTypes(no types) = %#v, want none", empty)
+	}
+}

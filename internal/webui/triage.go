@@ -159,7 +159,17 @@ type Row struct {
 	// what the row highlight animates.
 	Changed bool
 
+	// Summary marks the one muted row that stands in for a run of rows the
+	// board folded away. It carries a count and no link: there is nothing to
+	// open, because the point of the row is that these are not individually
+	// actionable from here.
+	Summary bool
+
 	group Group
+	// collapsible marks a row that is only ever one instance of a repeated
+	// digest reason — a standalone escalator item. A row backed by a pull
+	// request is never folded: it is a distinct thing an operator acts on.
+	collapsible bool
 	// sortSize is the rebase-queue key: smaller diffs merge first. Rows with no
 	// measurable diff sort after every sized row.
 	sortSize int
@@ -178,10 +188,14 @@ func (r Row) ThreadsLabel() string {
 type Section struct {
 	Group Group
 	Rows  []Row
+	// Folded is how many rows the section stopped rendering individually, net
+	// of the summary rows that replaced them. It exists so the count stays the
+	// number of things that are stuck, not the number of lines drawn.
+	Folded int
 }
 
 // Count is what the stat tile shows.
-func (s Section) Count() int { return len(s.Rows) }
+func (s Section) Count() int { return len(s.Rows) + s.Folded }
 
 // Board is a full render of the triage page.
 type Board struct {
@@ -285,6 +299,9 @@ func Classify(in Input) Board {
 			}
 		}
 		sortRows(group, section.Rows)
+		total := len(section.Rows)
+		section.Rows = collapseRepeats(section.Rows)
+		section.Folded = total - len(section.Rows)
 		sections = append(sections, section)
 	}
 
@@ -313,6 +330,101 @@ func sortRows(group Group, rows []Row) {
 		}
 		return left.Key < right.Key
 	})
+}
+
+// collapseExemplars is how many rows of one repeated digest reason stay
+// visible before the rest fold into a single summary row. Three is enough to
+// show that the entries differ only in which issue they name, and few enough
+// that no reason can push the section it shares off the screen.
+const collapseExemplars = 3
+
+// collapseMinimum is the run length at which folding starts. Below it the
+// summary row would replace about as many rows as it hides, which reads worse
+// than simply showing them.
+const collapseMinimum = 6
+
+// collapseRepeats folds runs of one repeated digest reason into exemplars plus
+// one summary row. It is a pure post-pass over an already-sorted slice: the
+// input order picks the exemplars, so the section's own sort — oldest first —
+// is what surfaces the longest-waiting entries.
+func collapseRepeats(rows []Row) []Row {
+	counts := map[string]int{}
+	for _, row := range rows {
+		if key, ok := collapseKey(row); ok {
+			counts[key]++
+		}
+	}
+
+	out := make([]Row, 0, len(rows))
+	seen := map[string]int{}
+	for _, row := range rows {
+		key, ok := collapseKey(row)
+		if !ok || counts[key] < collapseMinimum {
+			out = append(out, row)
+			continue
+		}
+		seen[key]++
+		switch {
+		case seen[key] <= collapseExemplars:
+			out = append(out, row)
+		case seen[key] == collapseExemplars+1:
+			out = append(out, summaryRow(row, counts[key]-collapseExemplars))
+		}
+	}
+	return out
+}
+
+// collapseKey names the run a row belongs to. Only standalone digest rows have
+// one; everything else is rendered on its own line.
+func collapseKey(row Row) (string, bool) {
+	if !row.collapsible || row.Summary {
+		return "", false
+	}
+	return row.Blocker.Code, true
+}
+
+// summaryRow stands in for the rows that were folded away. It keeps the group
+// and the blocker code — so the section still sorts and reads as one thing —
+// and drops the link, the age, and the meta columns, which described the
+// exemplar rather than the run.
+func summaryRow(exemplar Row, hidden int) Row {
+	return Row{
+		Key:     "more-" + exemplar.group.Slug() + "-" + slug(exemplar.Blocker.Code),
+		Title:   summaryTitle(exemplar.Blocker.Code, hidden),
+		Blocker: Blocker{Code: exemplar.Blocker.Code, Label: exemplar.Blocker.Label, Tone: exemplar.Blocker.Tone, rank: exemplar.Blocker.rank, owner: exemplar.Blocker.owner},
+		Summary: true,
+		group:   exemplar.group,
+	}
+}
+
+func summaryTitle(code string, hidden int) string {
+	return fmt.Sprintf("…and %d more %s", hidden, summaryPhrase(escalator.Reason(code)))
+}
+
+// summaryPhrase completes "…and N more ⟨phrase⟩" for a digest reason.
+func summaryPhrase(reason escalator.Reason) string {
+	switch reason {
+	case escalator.ReasonTriageConfirmation:
+		return "issues awaiting triage confirmation"
+	case escalator.ReasonPlannerEscalation:
+		return "items awaiting a decision"
+	case escalator.ReasonHITLQuestion:
+		return "items awaiting an answer"
+	case escalator.ReasonReviewStall:
+		return "pull requests with stalled reviews"
+	case escalator.ReasonEligibleAdvisePR:
+		return "pull requests awaiting a merge decision"
+	case escalator.ReasonCircuitBreaker:
+		return "items behind a tripped circuit breaker"
+	case escalator.ReasonQueueRetries:
+		return "items with retries exhausted"
+	case escalator.ReasonTriageNotRouted:
+		return "issues enrolled but never routed"
+	case escalator.ReasonStalePRHead:
+		return "pull requests with stale evidence"
+	default:
+		return "items: " + escalatorLabel(reason)
+	}
 }
 
 func pullRequestRow(now time.Time, key PRKey, snapshot storage.PullRequestSnapshotRecord, report *gatekeeper.Report, loops []storage.LoopRecord, queue []storage.QueueItemRecord, items []escalator.Item, links escalator.Linker) Row {
@@ -388,13 +500,14 @@ func escalatorRow(now time.Time, item escalator.Item) Row {
 	}
 	blocker := escalatorBlocker(item)
 	row := Row{
-		Key:       "item-" + slug(item.ID),
-		Ref:       escalatorRef(item),
-		Title:     item.Title,
-		Link:      item.Link,
-		Blocker:   blocker,
-		ChangedAt: now.Add(-time.Duration(item.AgeSeconds) * time.Second),
-		group:     group,
+		Key:         "item-" + slug(item.ID),
+		Ref:         escalatorRef(item),
+		Title:       item.Title,
+		Link:        item.Link,
+		Blocker:     blocker,
+		ChangedAt:   now.Add(-time.Duration(item.AgeSeconds) * time.Second),
+		group:       group,
+		collapsible: true,
 	}
 	row.Blocker.Tone = toneFor(row.Blocker, group)
 	applyAge(&row, now)

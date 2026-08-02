@@ -35,6 +35,12 @@
 {{- if .Rows}}
       <ul class="rows">
 {{- range .Rows}}
+{{- if .Summary}}
+        <li class="row row-summary" id="row-{{.Key}}">
+          <span class="dot" aria-hidden="true"></span>
+          <span class="row-main"><span class="row-summary-text">{{.Title}}</span></span>
+        </li>
+{{- else}}
         <li class="row{{if .Changed}} is-changed{{end}}" id="row-{{.Key}}">
           <span class="dot dot-{{$section.Group.Slug}}" aria-hidden="true"></span>
           <span class="row-main">
@@ -63,6 +69,7 @@
 {{- end}}
           </span>
         </li>
+{{- end}}
 {{- end}}
       </ul>
 {{- else}}
