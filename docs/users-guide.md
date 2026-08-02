@@ -45,9 +45,10 @@ Configured Grok arguments take precedence: `--permission-mode` can prompt or fai
 
 ## 1a. Local-only projects
 
-Looper currently runs local-only. Worker claims `looper:worker-ready` Issues
-assigned to the local GitHub user, Reviewer claims PRs with a review request for
-that user, and `looper:target:*` labels do nothing.
+Looper currently runs local-only. Local-only admission does not add a
+network-specific Worker label or assignee requirement; Worker discovery still
+uses the configured `roles.worker.triggers` policy. Reviewer discovery uses its
+configured review-request policy, and `looper:target:*` labels do nothing.
 
 Routed setup is not supported. Remove old `[network]` and
 `projects[].network` configuration before starting an upgraded daemon. Looper
@@ -71,8 +72,16 @@ following first:
 
 - stop all but one Node, so only a single daemon can claim work for that
   identity; or
-- assign each surviving Node a distinct GitHub identity and drain any in-flight
+- assign each surviving Node a distinct GitHub identity, disable
+  `roles.coordinator.enabled` on every Node except one, and drain any in-flight
   work that the old shared identity still owns.
+
+Before restarting an enrolled Node, revoke its old Network membership while the
+legacy `loopernet` service is still available: call `/v1/leave` for every Node,
+verify that the membership is gone, and retire the `loopernet` deployment when
+no Nodes remain. Then remove that Node's `~/.looper/network.json` (which contains
+the bearer `nodeToken`) before starting the local-only daemon. Do not carry a
+stale token or membership into the withdrawn surface.
 
 Only after that cutover is complete, remove the `[network]` and
 `projects[].network` sections and restart the remaining daemon(s).

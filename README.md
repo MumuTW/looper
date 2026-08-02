@@ -165,9 +165,11 @@ Looper is poll-driven by default: keep `looperd` running and forge credentials a
 
 ## Network operation
 
-Looper currently supports local-only projects. Worker claims `looper:worker-ready`
-Issues assigned to the local GitHub user, Reviewer claims review requests for the
-local GitHub user, and `looper:target:*` labels are ignored.
+Looper currently supports local-only projects. Local-only admission does not add
+a network-specific Worker label or assignee requirement; Worker discovery still
+uses the configured `roles.worker.triggers` policy (whose defaults are shown in
+the configuration guide). Reviewer discovery follows its configured review
+request policy, and `looper:target:*` labels are ignored.
 
 Routed multi-Node mode is withdrawn until Looper has one crash-safe producer for
 durable membership credentials. The old `[network]` and

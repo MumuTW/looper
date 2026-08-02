@@ -14,8 +14,11 @@ Keep the runtime directory (`~/.looper` by default, or the directory containing 
 
 ## Network mode
 
-Only local operation is supported. `looper:target:*` labels are ignored and the
-single-Node assignee/review-request behavior remains authoritative.
+Only local operation is supported. `looper:target:*` labels are ignored and
+local-only admission does not add a network-specific Worker label or assignee
+requirement. Worker discovery still applies the configured
+`roles.worker.triggers` policy; Reviewer discovery applies its configured
+review-request policy.
 
 The former `[network]` and `projects[].network` sections are rejected. They were
 removed because a user-authored enrollment flag or URL cannot prove that a
@@ -24,12 +27,13 @@ reintroduced only with one crash-safe enrollment producer and recovery contract.
 The Network ADRs document the withdrawn design and are not configuration guidance.
 
 Before removing those fields and restarting, an existing Routed installation that
-ran more than one Node under a shared GitHub identity must stop all but one Node
-(or assign each surviving Node a distinct identity and drain in-flight work)
-first. Otherwise every upgraded daemon treats the same projects as local-only,
-ignores `looper:target:*`, and the separate SQLite queues can run the same Issue
-or review concurrently. See the [user guide](users-guide.md#decommission-extra-nodes-before-the-local-only-cutover)
-for the full cutover steps.
+ran more than one Node under a shared GitHub identity must stop all but one Node,
+or assign distinct identities to surviving Worker/Reviewer Nodes while disabling
+`roles.coordinator.enabled` on every Node except one and draining in-flight work.
+Otherwise every upgraded daemon treats the same projects as local-only, ignores
+`looper:target:*`, and separate SQLite queues can run the same Issue or review
+concurrently. See the [user guide](users-guide.md#decommission-extra-nodes-before-the-local-only-cutover)
+for the full cutover steps, including Node credential revocation.
 
 ## Webhook delivery modes
 
