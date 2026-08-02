@@ -327,9 +327,12 @@ type fakeGatekeeperGitHub struct {
 	protection       githubinfra.BranchProtection
 	checks           githubinfra.PullRequestCheckRuns
 	threads          []githubinfra.ReviewThread
+	reviews          []githubinfra.ReviewSummary
+	reviewsErr       error
 	finalHeadSHA     string
 	finalBaseSHA     string
 	protectionErr    error
+	commentsErr      error
 	// perPullRequestCalls counts the forge round trips that only a full evaluation
 	// makes, so a test can prove a pull request was skipped rather than evaluated.
 	perPullRequestCalls int
@@ -367,7 +370,35 @@ func (f *fakeGatekeeperGitHub) GetCurrentUserLoginForRepo(context.Context, strin
 
 func (f *fakeGatekeeperGitHub) ListIssueComments(context.Context, githubinfra.ViewIssueInput) ([]githubinfra.CommentInfo, error) {
 	f.listCalls++
+	if f.commentsErr != nil {
+		return nil, f.commentsErr
+	}
 	return f.comments, nil
+}
+
+func (f *fakeGatekeeperGitHub) ListPullRequestReviews(context.Context, githubinfra.ViewPullRequestInput) ([]githubinfra.ReviewSummary, error) {
+	f.perPullRequestCalls++
+	return f.reviews, f.reviewsErr
+}
+
+// ListIssueCommentsContaining mirrors the gateway's projection: only comments
+// carrying one of the markers cross the boundary, so no test can accidentally
+// rely on the detector seeing the whole conversation.
+func (f *fakeGatekeeperGitHub) ListIssueCommentsContaining(_ context.Context, _ githubinfra.ViewIssueInput, markers []string) ([]githubinfra.CommentInfo, error) {
+	f.perPullRequestCalls++
+	if f.commentsErr != nil {
+		return nil, f.commentsErr
+	}
+	matched := make([]githubinfra.CommentInfo, 0)
+	for _, comment := range f.comments {
+		for _, marker := range markers {
+			if strings.Contains(comment.Body, marker) {
+				matched = append(matched, comment)
+				break
+			}
+		}
+	}
+	return matched, nil
 }
 
 func (f *fakeGatekeeperGitHub) CreateIssueComment(_ context.Context, input githubinfra.IssueCommentInput) (githubinfra.IssueCommentResult, error) {

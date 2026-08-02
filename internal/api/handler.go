@@ -29,6 +29,7 @@ import (
 	"github.com/MumuTW/looper/internal/domain"
 	"github.com/MumuTW/looper/internal/eventlog"
 	"github.com/MumuTW/looper/internal/fixer"
+	"github.com/MumuTW/looper/internal/gatekeeper"
 	githubinfra "github.com/MumuTW/looper/internal/infra/github"
 	"github.com/MumuTW/looper/internal/infra/shell"
 	"github.com/MumuTW/looper/internal/loops"
@@ -578,6 +579,21 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if strings.HasPrefix(path, apiBasePath+"/events/") {
 		payload, err := h.buildEntityEventsRouteResponse(r, path)
+		if err != nil {
+			var typed apiError
+			if !asAPIError(err, &typed) {
+				typed = internalServerError(err)
+			}
+			h.writeError(w, requestID, typed)
+			return
+		}
+
+		h.writeSuccess(w, requestID, payload)
+		return
+	}
+
+	if path == apiBasePath+"/gate-reports/unreviewed" {
+		payload, err := h.buildUnreviewedGateReportsResponse(r)
 		if err != nil {
 			var typed apiError
 			if !asAPIError(err, &typed) {
@@ -1897,6 +1913,10 @@ type pullRequestsListResponse struct {
 	Items []pullRequestResponse `json:"items"`
 }
 
+type unreviewedGateReportsResponse struct {
+	Items []gatekeeper.UnreviewedPullRequest `json:"items"`
+}
+
 type pullRequestResponse struct {
 	Repo                  string  `json:"repo"`
 	PRNumber              int64   `json:"prNumber"`
@@ -2534,6 +2554,29 @@ func (h *Handler) buildEntityEventsRouteResponse(r *http.Request, path string) (
 	}
 
 	return entityEventsResponse{EntityType: entityType, EntityID: entityID, Items: responseItems}, nil
+}
+
+// buildUnreviewedGateReportsResponse answers "which pull requests merged without
+// anyone reviewing them".
+//
+// Before this route the durable answer existed but was not reachable: the event
+// log route serves one entity at a time and requires the caller to already know
+// which pull request to ask about, which is the one thing an operator counting
+// unreviewed merges does not know. The enumeration itself is derived from the
+// Gate reports on read, so nothing new is stored to fall out of date.
+func (h *Handler) buildUnreviewedGateReportsResponse(r *http.Request) (unreviewedGateReportsResponse, error) {
+	services := h.context.Runtime.Services()
+	if services.Repositories == nil || services.Repositories.Events == nil {
+		return unreviewedGateReportsResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: "Events repository is not configured"}
+	}
+	if r.Method != http.MethodGet {
+		return unreviewedGateReportsResponse{}, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: fmt.Sprintf("Unsupported method for %s", apiBasePath+"/gate-reports/unreviewed")}
+	}
+	items, err := gatekeeper.ListUnreviewed(r.Context(), services.Repositories, r.URL.Query().Get("state"))
+	if err != nil {
+		return unreviewedGateReportsResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+	}
+	return unreviewedGateReportsResponse{Items: items}, nil
 }
 
 func (h *Handler) buildPullRequestsRouteResponse(r *http.Request) (pullRequestsListResponse, error) {
