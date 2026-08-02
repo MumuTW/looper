@@ -261,6 +261,29 @@ func TestHalfOpenAdmissionReservesProbeSlots(t *testing.T) {
 	}
 }
 
+func TestHalfOpenAdmissionReleaseReturnsProbeSlot(t *testing.T) {
+	b, c, _ := newTestBreaker(t, testConfig())
+	b.Record(c.now(), false)
+	b.Record(c.now(), false)
+	b.Record(c.now(), false)
+	c.add(10 * time.Minute)
+
+	probe, err := b.AllowAdmission()
+	if err != nil || !probe {
+		t.Fatalf("first half-open admission = (%t, %v), want probe", probe, err)
+	}
+	b.ReleaseProbe()
+
+	probe, err = b.AllowAdmission()
+	if err != nil || !probe {
+		t.Fatalf("admission after release = (%t, %v), want probe", probe, err)
+	}
+	b.RecordAdmission(c.now(), true, true)
+	if got := b.Snapshot().State; got != StateClosed {
+		t.Fatalf("state after replacement probe = %s, want closed", got)
+	}
+}
+
 func TestNonTokenAdmissionDoesNotConsumeProbeSlot(t *testing.T) {
 	cfg := testConfig()
 	cfg.ProbeSuccesses = 1

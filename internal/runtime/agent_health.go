@@ -151,6 +151,36 @@ func (r *agentHealthRegistry) AllowAdmission(vendor string) (bool, error) {
 	return breaker.AllowAdmission()
 }
 
+// ReleaseAdmission returns a half-open reservation whose spawn lease ended
+// before a terminal outcome. It is intentionally a no-op for a provider that
+// was removed during a config reload: that breaker is no longer an admission
+// authority, and the replacement bucket starts with no reservations.
+func (r *agentHealthRegistry) ReleaseAdmission(vendor string) {
+	if r == nil {
+		return
+	}
+	r.gateMu.Lock()
+	defer r.gateMu.Unlock()
+	r.releaseAdmissionLocked(vendor)
+}
+
+func (r *agentHealthRegistry) releaseAdmissionLocked(vendor string) {
+	key := strings.TrimSpace(vendor)
+	r.mu.Lock()
+	if r.configured {
+		if _, ok := r.configuredVendors[key]; !ok && (key == "" || key == defaultAgentHealthVendor) && len(r.configuredVendors) == 1 {
+			for active := range r.configuredVendors {
+				key = active
+			}
+		}
+	}
+	breaker := r.breakers[key]
+	r.mu.Unlock()
+	if breaker != nil {
+		breaker.ReleaseProbe()
+	}
+}
+
 // AllowAny admits work when at least one configured provider is healthy. A
 // single exhausted provider therefore cannot suspend independent providers;
 // provider-specific spawn admission still refuses work routed to the open one.
@@ -209,6 +239,9 @@ func (r *agentHealthRegistry) Record(vendor string, startedAt time.Time, ok, pro
 		configured := r.configured
 		r.mu.Unlock()
 		if configured {
+			if probe {
+				r.releaseAdmissionLocked(vendor)
+			}
 			r.gateMu.Unlock()
 			if r.onWarning != nil {
 				r.onWarning("agent outcome missing effective provider attribution; outcome ignored")
@@ -217,6 +250,9 @@ func (r *agentHealthRegistry) Record(vendor string, startedAt time.Time, ok, pro
 		}
 	}
 	if !r.vendorActive(vendor) {
+		if probe {
+			r.releaseAdmissionLocked(vendor)
+		}
 		r.gateMu.Unlock()
 		if r.onWarning != nil {
 			r.onWarning("agent outcome used a provider no longer configured; outcome ignored")

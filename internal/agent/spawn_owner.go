@@ -29,6 +29,11 @@ type SpawnMeta struct {
 	// BrownoutProbe is set by the daemon's provider-health admission when the
 	// spawn is allowed during a half-open recovery window.
 	BrownoutProbe bool
+	// BrownoutProbeRelease is an internal runtime hook for a probe that never
+	// reaches a terminal agent outcome. SpawnOwner invokes it when the lease is
+	// released before an outcome can be reported, such as cmd.Start failure or
+	// an operator kill.
+	BrownoutProbeRelease func()
 }
 
 // SoftKillFunc notifies a running agent execution of an external stop so status

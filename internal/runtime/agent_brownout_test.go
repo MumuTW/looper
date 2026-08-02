@@ -221,6 +221,42 @@ func TestAgentBrownoutIgnoresPreCooldownOutcomesAsProbes(t *testing.T) {
 	}
 }
 
+func TestAgentBrownoutReleasesProbeWhenSpawnLeaseEndsWithoutOutcome(t *testing.T) {
+	rt, clock := brownoutRuntime(t, func(cfg *config.AgentBrownoutConfig) {
+		cfg.MinFailures = 3
+		cfg.CooldownSeconds = 60
+		cfg.MaxCooldownSeconds = 120
+	})
+	vendor := "_default"
+	for i := 0; i < 3; i++ {
+		rt.activeExecutions.ReportAgentOutcome(agent.Outcome{Vendor: vendor, StartedAt: clock.now(), Status: "failed"})
+	}
+	if err := rt.agentHealth.Allow(vendor); !errors.Is(err, brownout.ErrOpen) {
+		t.Fatalf("breaker error = %v, want open", err)
+	}
+	clock.advance(time.Minute)
+
+	lease, err := rt.activeExecutions.AdmitSpawn(context.Background(), agent.SpawnMeta{
+		LoopID: "probe-loop", RunID: "probe-run", ExecutionID: "probe-first", Vendor: vendor,
+	})
+	if err != nil {
+		t.Fatalf("first half-open spawn = %v", err)
+	}
+	if probe, ok := lease.(interface{ BrownoutProbe() bool }); !ok || !probe.BrownoutProbe() {
+		t.Fatal("first half-open spawn did not carry a probe reservation")
+	}
+	// Simulate cmd.Start/sandbox failure: no terminal Outcome is reported.
+	lease.Release()
+
+	replacement, err := rt.activeExecutions.AdmitSpawn(context.Background(), agent.SpawnMeta{
+		LoopID: "probe-loop", RunID: "probe-run", ExecutionID: "probe-replacement", Vendor: vendor,
+	})
+	if err != nil {
+		t.Fatalf("replacement half-open spawn = %v, want released probe slot", err)
+	}
+	replacement.Release()
+}
+
 func TestWorktreeCleanupContinuesDuringAgentBrownout(t *testing.T) {
 	fixture := newWorktreeCleanupFixture(t)
 	for i := 0; i < fixture.config.Scheduler.AgentBrownout.MinFailures; i++ {

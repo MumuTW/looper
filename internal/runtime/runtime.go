@@ -747,6 +747,10 @@ func (r *Runtime) allowAgentSpawn(meta *agent.SpawnMeta) error {
 	}
 	probe, err := r.agentHealth.AllowAdmission(meta.Vendor)
 	meta.BrownoutProbe = probe
+	if err == nil && probe {
+		vendor := meta.Vendor
+		meta.BrownoutProbeRelease = func() { r.agentHealth.ReleaseAdmission(vendor) }
+	}
 	return err
 }
 

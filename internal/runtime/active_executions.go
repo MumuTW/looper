@@ -25,6 +25,9 @@ type ownedExecution struct {
 	// execution entry is published by BindHandle, so handle is non-nil; pending
 	// spawn windows stay in pending until they have a containment handle.
 	handle *processcontainment.Handle
+	// lease carries the brownout probe reservation that must be marked observed
+	// before the lease releases after a terminal outcome.
+	lease *spawnLease
 }
 
 // nonAgentTracked is one Supervisor-owned non-agent containment handle
@@ -208,6 +211,12 @@ func (r *ActiveExecutionRegistry) ReportAgentOutcome(outcome agent.Outcome) {
 	}
 	r.mu.Lock()
 	fn := r.onAgentOutcome
+	if fn != nil && outcome.BrownoutProbe {
+		key := activeExecutionKey(outcome.LoopID, outcome.RunID, outcome.ExecutionID)
+		if entry := r.executions[key]; entry != nil && entry.lease != nil {
+			entry.lease.markBrownoutObserved()
+		}
+	}
 	r.mu.Unlock()
 	if fn != nil {
 		fn(outcome)
@@ -222,11 +231,12 @@ type spawnLease struct {
 	ctx      context.Context
 	cancel   context.CancelCauseFunc
 
-	mu            sync.Mutex
-	released      bool
-	handle        *processcontainment.Handle
-	softKill      agent.SoftKillFunc
-	brownoutProbe bool
+	mu               sync.Mutex
+	released         bool
+	handle           *processcontainment.Handle
+	softKill         agent.SoftKillFunc
+	brownoutProbe    bool
+	brownoutObserved bool
 
 	// spawnDone is closed when the lease leaves pending (BindHandle or Release).
 	// BeginLoopStop/BeginShutdown wait on it so stop cannot return while a
@@ -271,6 +281,17 @@ func (l *spawnLease) BrownoutProbe() bool {
 		return false
 	}
 	return l.brownoutProbe
+}
+
+func (l *spawnLease) markBrownoutObserved() {
+	if l == nil {
+		return
+	}
+	l.mu.Lock()
+	if l.brownoutProbe {
+		l.brownoutObserved = true
+	}
+	l.mu.Unlock()
 }
 
 func (l *spawnLease) BindHandle(handle *processcontainment.Handle, softKill agent.SoftKillFunc) error {
@@ -319,6 +340,7 @@ func (l *spawnLease) BindHandle(handle *processcontainment.Handle, softKill agen
 		executionID: l.meta.ExecutionID,
 		handle:      handle,
 		softKill:    softKill,
+		lease:       l,
 	}
 	l.mu.Lock()
 	l.handle = handle
@@ -439,6 +461,7 @@ func (l *spawnLease) RebindHandle(handle *processcontainment.Handle, softKill ag
 			loopID:      l.meta.LoopID,
 			runID:       l.meta.RunID,
 			executionID: l.meta.ExecutionID,
+			lease:       l,
 		}
 		r.executions[key] = entry
 	}
@@ -514,8 +537,15 @@ func (l *spawnLease) Release() {
 		return
 	}
 	l.released = true
+	probeRelease := l.meta.BrownoutProbeRelease
+	if !l.brownoutProbe || l.brownoutObserved {
+		probeRelease = nil
+	}
 	l.mu.Unlock()
 	l.cancel(nil)
+	if probeRelease != nil {
+		probeRelease()
+	}
 	r := l.registry
 	if r == nil {
 		l.closeSpawnDone()
@@ -556,16 +586,27 @@ func (r *ActiveExecutionRegistry) AdmitSpawn(ctx context.Context, meta agent.Spa
 	closed := r.admissionClosed
 	stopping := meta.LoopID != "" && r.stoppingLoops[meta.LoopID] != nil
 	r.mu.Unlock()
+	releaseBrownoutProbe := func() {
+		if meta.BrownoutProbeRelease == nil {
+			return
+		}
+		release := meta.BrownoutProbeRelease
+		meta.BrownoutProbeRelease = nil
+		release()
+	}
 
 	if allow != nil {
 		if err := allow(&meta); err != nil {
+			releaseBrownoutProbe()
 			return nil, errors.Join(agent.ErrSpawnAdmissionClosed, err)
 		}
 	}
 	if closed {
+		releaseBrownoutProbe()
 		return nil, agent.ErrSpawnAdmissionClosed
 	}
 	if stopping {
+		releaseBrownoutProbe()
 		return nil, agent.ErrSpawnLoopStopping
 	}
 
@@ -573,10 +614,12 @@ func (r *ActiveExecutionRegistry) AdmitSpawn(ctx context.Context, meta agent.Spa
 	// Re-check under lock after allowSpawn (which may have raced with shutdown).
 	if r.admissionClosed {
 		r.mu.Unlock()
+		releaseBrownoutProbe()
 		return nil, agent.ErrSpawnAdmissionClosed
 	}
 	if meta.LoopID != "" && r.stoppingLoops[meta.LoopID] != nil {
 		r.mu.Unlock()
+		releaseBrownoutProbe()
 		return nil, agent.ErrSpawnLoopStopping
 	}
 	r.nextLeaseID++

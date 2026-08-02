@@ -251,6 +251,21 @@ func (b *Breaker) RecordAdmission(startedAt time.Time, ok, probe bool) {
 	}
 }
 
+// ReleaseProbe returns one half-open admission reservation that will not
+// produce a terminal outcome. A spawn can fail before cmd.Start or be killed
+// by the supervisor; neither path calls RecordAdmission, so keeping the slot
+// would leave the breaker permanently half-open when ProbeSuccesses is one.
+func (b *Breaker) ReleaseProbe() {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	if b.probeInFlight > 0 {
+		b.probeInFlight--
+	}
+	b.mu.Unlock()
+}
+
 // SetConfig republishes policy on config reload. It deliberately preserves
 // state: an operator who edits config while the gate is open must not thereby
 // resume the hammering it stopped. The one exception is disabling the gate,
