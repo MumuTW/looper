@@ -180,6 +180,18 @@ type stubSweepGit struct {
 	err   error
 }
 
+type mutatingSweepGit struct {
+	path   string
+	mutate func()
+}
+
+func (g mutatingSweepGit) WorktreeClean(_ context.Context, path string) (bool, error) {
+	if path == g.path && g.mutate != nil {
+		g.mutate()
+	}
+	return true, nil
+}
+
 func (s stubSweepGit) WorktreeClean(_ context.Context, path string) (bool, error) {
 	if s.err != nil {
 		return false, s.err
@@ -292,6 +304,102 @@ func TestRunDiskSweepRemovesCleanUnregisteredCheckout(t *testing.T) {
 	}
 }
 
+func TestRunDiskSweepRevalidatesRetentionAtRemovalBoundary(t *testing.T) {
+	root := t.TempDir()
+	path := writeUsableCheckout(t, filepath.Join(root, "looper-app-recreated"), old())
+	var removed []string
+	options := sweepOptions(DiskSweepRoot{ProjectID: "app", RepoPath: filepath.Join(t.TempDir(), "repo"), WorktreeRoot: root}, mutatingSweepGit{path: path, mutate: func() {
+		_ = os.Chtimes(path, sweepNow, sweepNow)
+	}}, &removed)
+	plan, err := RunDiskSweep(context.Background(), options)
+	if err != nil {
+		t.Fatalf("RunDiskSweep() error = %v", err)
+	}
+	if len(removed) != 0 {
+		t.Fatalf("removed = %v, want recreated path preserved", removed)
+	}
+	if action, reason := reasonFor(t, plan, path); action != ActionSkipped || reason != "within_retention" {
+		t.Fatalf("candidate = (%q, %q), want within_retention skip", action, reason)
+	}
+}
+
+func TestRunDiskSweepPreservesIndeterminateGitMetadata(t *testing.T) {
+	root := t.TempDir()
+	path := mkdirAt(t, filepath.Join(root, "looper-app-indeterminate"), old())
+	gitDir := filepath.Join(path, ".git")
+	if err := os.MkdirAll(filepath.Join(gitDir, "objects"), 0o755); err != nil {
+		t.Fatalf("MkdirAll objects: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(gitDir, "refs"), 0o755); err != nil {
+		t.Fatalf("MkdirAll refs: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(gitDir, "HEAD"), []byte("not-a-head\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile HEAD: %v", err)
+	}
+	if err := os.Symlink(t.TempDir(), filepath.Join(gitDir, "objects", "aa")); err != nil {
+		t.Fatalf("Symlink object entry: %v", err)
+	}
+	if err := os.Chtimes(path, old(), old()); err != nil {
+		t.Fatalf("Chtimes path: %v", err)
+	}
+	var removed []string
+	plan, err := RunDiskSweep(context.Background(), sweepOptions(DiskSweepRoot{ProjectID: "app", RepoPath: filepath.Join(t.TempDir(), "repo"), WorktreeRoot: root}, stubSweepGit{}, &removed))
+	if err != nil {
+		t.Fatalf("RunDiskSweep() error = %v", err)
+	}
+	if len(removed) != 0 {
+		t.Fatalf("removed = %v, want indeterminate metadata preserved", removed)
+	}
+	if action, reason := reasonFor(t, plan, path); action != ActionSkipped || reason != "git_metadata_indeterminate" {
+		t.Fatalf("candidate = (%q, %q), want indeterminate skip", action, reason)
+	}
+}
+
+func TestRunDiskSweepPreservesLinkedGitfile(t *testing.T) {
+	root := t.TempDir()
+	path := mkdirAt(t, filepath.Join(root, "looper-app-linked"), old())
+	if err := os.WriteFile(filepath.Join(path, ".git"), []byte("gitdir: "+filepath.Join(t.TempDir(), "missing-gitdir")+"\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile linked gitfile: %v", err)
+	}
+	if err := os.Chtimes(path, old(), old()); err != nil {
+		t.Fatalf("Chtimes path: %v", err)
+	}
+	var removed []string
+	plan, err := RunDiskSweep(context.Background(), sweepOptions(DiskSweepRoot{ProjectID: "app", RepoPath: filepath.Join(t.TempDir(), "repo"), WorktreeRoot: root}, stubSweepGit{}, &removed))
+	if err != nil {
+		t.Fatalf("RunDiskSweep() error = %v", err)
+	}
+	if len(removed) != 0 {
+		t.Fatalf("removed = %v, want linked metadata preserved", removed)
+	}
+	if action, reason := reasonFor(t, plan, path); action != ActionSkipped || reason != "linked_git_metadata" {
+		t.Fatalf("candidate = (%q, %q), want linked metadata skip", action, reason)
+	}
+}
+
+func TestRunDiskSweepUsesRecentFileRetention(t *testing.T) {
+	root := t.TempDir()
+	path := mkdirAt(t, filepath.Join(root, "looper-app-active"), old())
+	marker := filepath.Join(path, "agent-output.txt")
+	if err := os.WriteFile(marker, []byte("active\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile marker: %v", err)
+	}
+	if err := os.Chtimes(marker, sweepNow, sweepNow); err != nil {
+		t.Fatalf("Chtimes marker: %v", err)
+	}
+	var removed []string
+	plan, err := RunDiskSweep(context.Background(), sweepOptions(DiskSweepRoot{ProjectID: "app", RepoPath: filepath.Join(t.TempDir(), "repo"), WorktreeRoot: root}, stubSweepGit{}, &removed))
+	if err != nil {
+		t.Fatalf("RunDiskSweep() error = %v", err)
+	}
+	if len(removed) != 0 {
+		t.Fatalf("removed = %v, want recent content preserved", removed)
+	}
+	if action, reason := reasonFor(t, plan, path); action != ActionSkipped || reason != "within_retention" {
+		t.Fatalf("candidate = (%q, %q), want within_retention skip", action, reason)
+	}
+}
+
 // Losing the git view makes every live linked worktree look unregistered. The
 // root must fail closed rather than sweep blind.
 func TestRunDiskSweepSkipsRootWhenGitListFails(t *testing.T) {
@@ -368,6 +476,24 @@ func TestRunDiskSweepBudgetSpansRoots(t *testing.T) {
 		if filepath.Dir(path) != firstRoot {
 			t.Fatalf("budget leaked past the first root: removed %q", path)
 		}
+	}
+}
+
+func TestRunDiskSweepRotatesRootStart(t *testing.T) {
+	firstRoot := t.TempDir()
+	secondRoot := t.TempDir()
+	mkdirAt(t, filepath.Join(firstRoot, "first"), old())
+	second := mkdirAt(t, filepath.Join(secondRoot, "second"), old())
+	var removed []string
+	options := sweepOptions(DiskSweepRoot{ProjectID: "one", RepoPath: filepath.Join(t.TempDir(), "repo-one"), WorktreeRoot: firstRoot}, stubSweepGit{}, &removed)
+	options.Roots = append(options.Roots, DiskSweepRoot{ProjectID: "two", RepoPath: filepath.Join(t.TempDir(), "repo-two"), WorktreeRoot: secondRoot})
+	options.Budget = 1
+	options.RootStartIndex = 1
+	if _, err := RunDiskSweep(context.Background(), options); err != nil {
+		t.Fatalf("RunDiskSweep() error = %v", err)
+	}
+	if len(removed) != 1 || removed[0] != second {
+		t.Fatalf("removed = %v, want rotated second root %q", removed, second)
 	}
 }
 
@@ -554,5 +680,59 @@ func TestRunContainerSweepHonorsRetentionAndBudget(t *testing.T) {
 	}
 	if _, err := os.Stat(fresh); err != nil {
 		t.Fatalf("container inside the retention window was removed: %v", err)
+	}
+}
+
+func TestRunContainerSweepDoesNotSpendBudgetOnFailedRemoval(t *testing.T) {
+	sharedRoot := t.TempDir()
+	first := mkContainer(t, sharedRoot, "repo-first", old())
+	second := mkContainer(t, sharedRoot, "repo-second", old())
+	var attempts []string
+	options := containerOptions(sharedRoot, nil, stubSweepGit{}, &attempts)
+	options.Budget = 2
+	options.RemoveAll = func(path string) error {
+		attempts = append(attempts, path)
+		if path == first {
+			return errors.New("injected removal failure")
+		}
+		return os.RemoveAll(path)
+	}
+	plan, err := RunContainerSweep(context.Background(), options)
+	if err != nil {
+		t.Fatalf("RunContainerSweep() error = %v", err)
+	}
+	if len(attempts) != 2 || attempts[1] != second || plan.Summary.Removed != 1 || plan.Summary.Errors != 1 {
+		t.Fatalf("attempts = %v summary = %#v, want both attempts with one removal and one error", attempts, plan.Summary)
+	}
+}
+
+func TestRunContainerSweepDrainsOrphanedProjectInsideLiveContainer(t *testing.T) {
+	sharedRoot := t.TempDir()
+	container := filepath.Join(sharedRoot, "repo-live")
+	liveProject := filepath.Join(container, "project-live")
+	orphanProject := filepath.Join(container, "project-orphan")
+	mkdirAt(t, filepath.Join(liveProject, "checkout"), old())
+	mkdirAt(t, filepath.Join(orphanProject, "checkout"), old())
+	if err := os.Chtimes(liveProject, old(), old()); err != nil {
+		t.Fatalf("Chtimes live project: %v", err)
+	}
+	if err := os.Chtimes(orphanProject, old(), old()); err != nil {
+		t.Fatalf("Chtimes orphan project: %v", err)
+	}
+	if err := os.Chtimes(container, old(), old()); err != nil {
+		t.Fatalf("Chtimes container: %v", err)
+	}
+	var removed []string
+	options := containerOptions(sharedRoot, []string{"repo-live"}, stubSweepGit{}, &removed)
+	options.LiveProjectPaths = []string{liveProject}
+	plan, err := RunContainerSweep(context.Background(), options)
+	if err != nil {
+		t.Fatalf("RunContainerSweep() error = %v", err)
+	}
+	if len(removed) != 1 || removed[0] != orphanProject || plan.Summary.Removed != 1 {
+		t.Fatalf("removed = %v summary = %#v, want orphan project only", removed, plan.Summary)
+	}
+	if _, err := os.Stat(liveProject); err != nil {
+		t.Fatalf("live project was removed: %v", err)
 	}
 }

@@ -113,6 +113,34 @@ func LocalFixerWorktreeCheckoutUsable(path string) bool {
 	return linkedPrivateGitdirCommonUsable(gitdir)
 }
 
+// IsLinkedWorktree recognizes Git's gitdir-pointer form even when the private
+// or common metadata it names is temporarily unavailable. The pointer itself
+// is Git-administered state; destructive sweeps must preserve it rather than
+// interpreting a failed usability probe as proof of disposable debris.
+func IsLinkedWorktree(path string) bool {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return false
+	}
+	gitMeta := filepath.Join(path, ".git")
+	info, err := os.Lstat(gitMeta)
+	if err != nil || info.IsDir() {
+		return false
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		target, statErr := os.Stat(gitMeta)
+		if statErr != nil || target.IsDir() {
+			return false
+		}
+	}
+	data, err := os.ReadFile(gitMeta)
+	if err != nil {
+		return false
+	}
+	_, ok := parseGitdirPointer(path, data)
+	return ok
+}
+
 // HasMalformedLocalGitHEAD reports only syntactically malformed, readable HEAD
 // metadata. It deliberately does not classify absent or incomplete .git data:
 // callers must still let prepare/fetch errors distinguish a partial path from a
@@ -184,6 +212,86 @@ func LocalGitRepositoryMetadataUsable(dir string) bool {
 		return false
 	}
 	return true
+}
+
+// LocalGitMetadataIndeterminate reports whether local Git metadata exists but
+// could not be inspected safely. Sweep callers must fail closed for this case:
+// an I/O/permission error or a symlinked object entry can hide recoverable
+// objects and must not be treated as an empty repository.
+func LocalGitMetadataIndeterminate(path string) bool {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return false
+	}
+	gitMeta := filepath.Join(path, ".git")
+	info, err := os.Lstat(gitMeta)
+	if err != nil {
+		return false
+	}
+	if info.Mode().IsRegular() {
+		data, readErr := os.ReadFile(gitMeta)
+		if readErr != nil {
+			return !os.IsNotExist(readErr)
+		}
+		gitdir, ok := parseGitdirPointer(path, data)
+		if !ok {
+			return false
+		}
+		return localGitMetadataIndeterminate(gitdir)
+	}
+	if info.IsDir() {
+		return localGitMetadataIndeterminate(gitMeta)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		target, statErr := os.Stat(gitMeta)
+		if statErr != nil {
+			return !os.IsNotExist(statErr)
+		}
+		if target.IsDir() {
+			return localGitMetadataIndeterminate(gitMeta)
+		}
+	}
+	return false
+}
+
+func localGitMetadataIndeterminate(dir string) bool {
+	if _, err := os.Stat(filepath.Join(dir, "HEAD")); err != nil && !os.IsNotExist(err) {
+		return true
+	}
+	objects, err := os.Stat(filepath.Join(dir, "objects"))
+	if err != nil {
+		return !os.IsNotExist(err)
+	}
+	if !objects.IsDir() {
+		return false
+	}
+	if hasIndeterminateObjectEntries(filepath.Join(dir, "objects")) {
+		return true
+	}
+	refs, err := os.Stat(filepath.Join(dir, "refs"))
+	if err != nil {
+		return !os.IsNotExist(err)
+	}
+	if !refs.IsDir() {
+		return false
+	}
+	return false
+}
+
+func hasIndeterminateObjectEntries(root string) bool {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return !os.IsNotExist(err)
+	}
+	for _, entry := range entries {
+		if entry.Type()&os.ModeSymlink != 0 {
+			return true
+		}
+		if entry.IsDir() && hasIndeterminateObjectEntries(filepath.Join(root, entry.Name())) {
+			return true
+		}
+	}
+	return false
 }
 
 // localGitHEADUsable validates the local HEAD encoding without contacting Git

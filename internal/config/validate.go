@@ -1092,6 +1092,11 @@ func validateWorktreeCleanupConfig(config WorktreeCleanupConfig, path string, is
 	}
 	if config.RetentionDays < 0 {
 		*issues = append(*issues, ValidationIssue{Path: path + ".retentionDays", Message: "must be an integer >= 0"})
+	} else if config.RetentionDays > 106751 {
+		// time.Duration is nanoseconds; larger day counts overflow when the
+		// runtime computes the retention cutoff and would turn a long retention
+		// into an immediate-delete window.
+		*issues = append(*issues, ValidationIssue{Path: path + ".retentionDays", Message: "must not exceed 106751 days"})
 	}
 	if config.MaxPerTick < 1 {
 		*issues = append(*issues, ValidationIssue{Path: path + ".maxPerTick", Message: "must be a positive integer"})

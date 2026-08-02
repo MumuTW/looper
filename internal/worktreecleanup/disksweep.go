@@ -247,13 +247,16 @@ type ContainerSweepPlanInput struct {
 type ContainerSweepOptions struct {
 	SharedRoot         string
 	LiveContainerNames []string
-	RegisteredPaths    []string
-	Git                DiskSweepGit
-	Budget             int
-	RetentionCutoff    time.Time
-	DryRun             bool
-	ReadDir            func(string) ([]DiskEntry, error)
-	RemoveAll          func(string) error
+	// LiveProjectPaths protects archived and active project directories inside
+	// live containers while allowing orphaned project directories to drain.
+	LiveProjectPaths []string
+	RegisteredPaths  []string
+	Git              DiskSweepGit
+	Budget           int
+	RetentionCutoff  time.Time
+	DryRun           bool
+	ReadDir          func(string) ([]DiskEntry, error)
+	RemoveAll        func(string) error
 }
 
 // RunContainerSweep removes unreachable repo containers. A container is only
@@ -275,6 +278,8 @@ func RunContainerSweep(ctx context.Context, options ContainerSweepOptions) (Disk
 	if removeAll == nil {
 		removeAll = os.RemoveAll
 	}
+	options.ReadDir = readDir
+	options.RemoveAll = removeAll
 
 	entries, err := readDir(options.SharedRoot)
 	if err != nil {
@@ -297,8 +302,25 @@ func RunContainerSweep(ctx context.Context, options ContainerSweepOptions) (Disk
 		Scanned:      plan.Summary.Scanned,
 		Unregistered: plan.Summary.Unregistered,
 	}}
+	liveProjects := normalizedPathSet(options.LiveProjectPaths)
 	for _, candidate := range plan.Candidates {
 		if candidate.Action != DiskSweepActionRemove {
+			if candidate.Reason == "live_project_container" && len(options.LiveProjectPaths) > 0 {
+				releaseMutation := worktreesafety.AcquireManagedMutationLock(candidate.Path)
+				used := result.Summary.Removed
+				if options.DryRun {
+					used = result.Summary.WouldRemove
+				}
+				nested := sweepLiveContainerProjects(ctx, options, candidate.Path, liveProjects, registered, options.Budget-used)
+				releaseMutation()
+				result.Summary.Scanned += nested.Summary.Scanned
+				result.Summary.Unregistered += nested.Summary.Unregistered
+				result.Summary.WouldRemove += nested.Summary.WouldRemove
+				result.Summary.Removed += nested.Summary.Removed
+				result.Summary.Skipped += nested.Summary.Skipped
+				result.Summary.Errors += nested.Summary.Errors
+				result.Candidates = append(result.Candidates, nested.Candidates...)
+			}
 			result.Summary.Skipped++
 			result.Candidates = append(result.Candidates, candidate)
 			continue
@@ -306,8 +328,34 @@ func RunContainerSweep(ctx context.Context, options ContainerSweepOptions) (Disk
 		if ctx.Err() != nil {
 			return result, ctx.Err()
 		}
-		decided, ok := admitContainer(ctx, options.Git, readDir, registered, candidate)
+		releaseMutation := worktreesafety.AcquireManagedMutationLock(candidate.Path)
+		decided, eligible := revalidateContainerCandidate(candidate, options.RetentionCutoff)
+		if !eligible {
+			releaseMutation()
+			if decided.Action == "error" {
+				result.Summary.Errors++
+			} else {
+				result.Summary.Skipped++
+			}
+			result.Candidates = append(result.Candidates, decided)
+			continue
+		}
+		decided, ok := admitContainer(ctx, options.Git, readDir, registered, decided)
 		if !ok {
+			releaseMutation()
+			if decided.Action == "error" {
+				result.Summary.Errors++
+			} else {
+				result.Summary.Skipped++
+			}
+			result.Candidates = append(result.Candidates, decided)
+			continue
+		}
+		// Re-stat after the nested Git/ownership probes and immediately before
+		// RemoveAll; a replacement can appear during those probes.
+		decided, eligible = revalidateContainerCandidate(decided, options.RetentionCutoff)
+		if !eligible {
+			releaseMutation()
 			if decided.Action == "error" {
 				result.Summary.Errors++
 			} else {
@@ -325,13 +373,125 @@ func RunContainerSweep(ctx context.Context, options ContainerSweepOptions) (Disk
 				decided.Error = err.Error()
 				result.Summary.Errors++
 				result.Candidates = append(result.Candidates, decided)
+				releaseMutation()
 				continue
 			}
 			result.Summary.Removed++
 		}
 		result.Candidates = append(result.Candidates, decided)
+		releaseMutation()
 	}
 	return result, nil
+}
+
+func sweepLiveContainerProjects(ctx context.Context, options ContainerSweepOptions, containerPath string, liveProjects, registered map[string]bool, budget int) DiskSweepPlan {
+	plan := DiskSweepPlan{}
+	projects, err := options.ReadDir(containerPath)
+	if err != nil {
+		plan.Summary.Errors++
+		plan.Candidates = append(plan.Candidates, DiskCandidate{Path: containerPath, Action: "error", Reason: "read_container_failed", Error: err.Error()})
+		return plan
+	}
+	for _, project := range projects {
+		if ctx.Err() != nil {
+			return plan
+		}
+		if !project.IsDir {
+			continue
+		}
+		plan.Summary.Scanned++
+		if liveProjects[normalizeSweepPath(project.Path)] {
+			continue
+		}
+		plan.Summary.Unregistered++
+		freshProject, projectEligible := revalidateContainerCandidate(DiskCandidate{Path: project.Path}, options.RetentionCutoff)
+		if !projectEligible {
+			plan.Summary.Skipped++
+			plan.Candidates = append(plan.Candidates, freshProject)
+			continue
+		}
+		if budget <= 0 {
+			plan.Summary.Skipped++
+			plan.Candidates = append(plan.Candidates, DiskCandidate{Path: project.Path, Action: ActionSkipped, Reason: "budget_exhausted"})
+			continue
+		}
+		children, err := options.ReadDir(project.Path)
+		if err != nil {
+			plan.Summary.Errors++
+			plan.Candidates = append(plan.Candidates, DiskCandidate{Path: project.Path, Action: "error", Reason: "read_project_failed", Error: err.Error()})
+			continue
+		}
+		protected := false
+		for _, child := range children {
+			if !child.IsDir {
+				protected = true
+				break
+			}
+			freshChild, childEligible := revalidateContainerCandidate(DiskCandidate{Path: child.Path}, options.RetentionCutoff)
+			if registered[normalizeSweepPath(child.Path)] || !childEligible {
+				protected = true
+				break
+			}
+			decided, ok := admitRemoval(ctx, options.Git, freshChild)
+			if !ok {
+				protected = true
+				if decided.Action == "error" {
+					plan.Summary.Errors++
+				}
+				break
+			}
+		}
+		if protected {
+			plan.Summary.Skipped++
+			plan.Candidates = append(plan.Candidates, DiskCandidate{Path: project.Path, Action: ActionSkipped, Reason: "protected_project"})
+			continue
+		}
+		candidate := DiskCandidate{Path: project.Path, Action: DiskSweepActionRemove, Reason: "orphaned_project"}
+		plan.Summary.WouldRemove++
+		if options.DryRun {
+			budget--
+			plan.Candidates = append(plan.Candidates, candidate)
+			continue
+		}
+		if err := options.RemoveAll(project.Path); err != nil {
+			plan.Summary.Errors++
+			candidate.Action = "error"
+			candidate.Reason = "remove_failed"
+			candidate.Error = err.Error()
+			plan.Candidates = append(plan.Candidates, candidate)
+			continue
+		}
+		budget--
+		plan.Summary.Removed++
+		plan.Candidates = append(plan.Candidates, candidate)
+	}
+	return plan
+}
+
+func revalidateContainerCandidate(candidate DiskCandidate, cutoff time.Time) (DiskCandidate, bool) {
+	info, err := os.Stat(candidate.Path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			candidate.Action = ActionSkipped
+			candidate.Reason = "missing_at_removal"
+			return candidate, false
+		}
+		candidate.Action = "error"
+		candidate.Reason = "stat_failed"
+		candidate.Error = err.Error()
+		return candidate, false
+	}
+	if !info.IsDir() {
+		candidate.Action = ActionSkipped
+		candidate.Reason = "not_a_directory"
+		return candidate, false
+	}
+	if !latestPathModTime(candidate.Path, info.ModTime()).Before(cutoff) {
+		candidate.Action = ActionSkipped
+		candidate.Reason = "within_retention"
+		return candidate, false
+	}
+	return candidate, true
 }
 
 // admitContainer refuses the whole container if any checkout inside it is
@@ -389,6 +549,9 @@ type DiskSweepOptions struct {
 	RegisteredPaths []string
 	Git             DiskSweepGit
 	Budget          int
+	// RootStartIndex rotates the first root examined so a perpetually busy
+	// root cannot starve later roots when the shared removal budget is small.
+	RootStartIndex  int
 	RetentionCutoff time.Time
 	DryRun          bool
 	// GitTrackedPaths resolves `git worktree list` for one repo. A root whose
@@ -419,12 +582,18 @@ func RunDiskSweep(ctx context.Context, options DiskSweepOptions) (DiskSweepPlan,
 
 	result := DiskSweepPlan{}
 	budget := options.Budget
-	for _, root := range options.Roots {
+	rootCount := len(options.Roots)
+	if rootCount == 0 {
+		return result, nil
+	}
+	start := options.RootStartIndex % rootCount
+	if start < 0 {
+		start += rootCount
+	}
+	for offset := 0; offset < rootCount; offset++ {
+		root := options.Roots[(start+offset)%rootCount]
 		if ctx.Err() != nil {
 			return result, ctx.Err()
-		}
-		if budget <= 0 {
-			break
 		}
 		if strings.TrimSpace(root.WorktreeRoot) == "" {
 			continue
@@ -479,8 +648,32 @@ func RunDiskSweep(ctx context.Context, options DiskSweepOptions) (DiskSweepPlan,
 			if ctx.Err() != nil {
 				return result, ctx.Err()
 			}
-			decided, ok := admitRemoval(ctx, options.Git, candidate)
+			releaseMutation := worktreesafety.AcquireManagedMutationLock(worktreesafety.WorktreeMutationScope(root.WorktreeRoot))
+			decided, eligible := revalidateDiskCandidate(root, candidate, options.RetentionCutoff)
+			if !eligible {
+				releaseMutation()
+				if decided.Action == "error" {
+					result.Summary.Errors++
+				} else {
+					result.Summary.Skipped++
+				}
+				result.Candidates = append(result.Candidates, decided)
+				continue
+			}
+			decided, ok := admitRemoval(ctx, options.Git, decided)
 			if !ok {
+				releaseMutation()
+				if decided.Action == "error" {
+					result.Summary.Errors++
+				} else {
+					result.Summary.Skipped++
+				}
+				result.Candidates = append(result.Candidates, decided)
+				continue
+			}
+			decided, eligible = revalidateDiskCandidate(root, decided, options.RetentionCutoff)
+			if !eligible {
+				releaseMutation()
 				if decided.Action == "error" {
 					result.Summary.Errors++
 				} else {
@@ -499,17 +692,49 @@ func RunDiskSweep(ctx context.Context, options DiskSweepOptions) (DiskSweepPlan,
 					decided.Error = err.Error()
 					result.Summary.Errors++
 					result.Candidates = append(result.Candidates, decided)
+					budget++
+					releaseMutation()
 					continue
 				}
 				result.Summary.Removed++
 			}
 			result.Candidates = append(result.Candidates, decided)
-			if budget <= 0 {
-				break
-			}
+			releaseMutation()
 		}
 	}
 	return result, nil
+}
+
+func revalidateDiskCandidate(root DiskSweepRoot, candidate DiskCandidate, cutoff time.Time) (DiskCandidate, bool) {
+	if err := worktreesafety.Validate(worktreesafety.CheckInput{WorktreePath: candidate.Path, RepoPath: root.RepoPath, WorktreeRoot: root.WorktreeRoot}); err != nil {
+		candidate.Action = ActionSkipped
+		candidate.Reason = "unsafe_path"
+		candidate.Error = err.Error()
+		return candidate, false
+	}
+	info, err := os.Stat(candidate.Path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			candidate.Action = ActionSkipped
+			candidate.Reason = "missing_at_removal"
+			return candidate, false
+		}
+		candidate.Action = "error"
+		candidate.Reason = "stat_failed"
+		candidate.Error = err.Error()
+		return candidate, false
+	}
+	if !info.IsDir() {
+		candidate.Action = ActionSkipped
+		candidate.Reason = "not_a_directory"
+		return candidate, false
+	}
+	if !info.ModTime().Before(cutoff) {
+		candidate.Action = ActionSkipped
+		candidate.Reason = "within_retention"
+		return candidate, false
+	}
+	return candidate, true
 }
 
 // admitRemoval applies the two filesystem gates that must hold at delete time.
@@ -518,12 +743,22 @@ func RunDiskSweep(ctx context.Context, options DiskSweepOptions) (DiskSweepPlan,
 // cannot be holding committed work reachable from any repo we know, so age and
 // the registration gates are the whole test.
 func admitRemoval(ctx context.Context, git DiskSweepGit, candidate DiskCandidate) (DiskCandidate, bool) {
+	if worktreesafety.IsLinkedWorktree(candidate.Path) {
+		candidate.Action = ActionSkipped
+		candidate.Reason = "linked_git_metadata"
+		return candidate, false
+	}
 	// Usability is tested before ownership on purpose. A fixer owner token on a
 	// directory that is not a usable checkout protects nothing: there is no git
 	// state to recover, and the fixer itself treats such a worktree as
 	// recreatable (isMissingOrUnusableFixerWorktree). Checking the token first
 	// would strand every abandoned test fixture that stamped one, forever.
 	if !worktreesafety.LocalFixerWorktreeCheckoutUsable(candidate.Path) {
+		if worktreesafety.LocalGitMetadataIndeterminate(candidate.Path) {
+			candidate.Action = ActionSkipped
+			candidate.Reason = "git_metadata_indeterminate"
+			return candidate, false
+		}
 		return candidate, true
 	}
 	token, err := worktreesafety.ReadFixerOwnerToken(candidate.Path)
@@ -562,11 +797,47 @@ func readDirEntries(root string) ([]DiskEntry, error) {
 	for _, dirEntry := range dirEntries {
 		entry := DiskEntry{Path: filepath.Join(root, dirEntry.Name()), IsDir: dirEntry.IsDir()}
 		if info, err := dirEntry.Info(); err == nil {
-			entry.ModifiedAt = info.ModTime()
+			entry.ModifiedAt = latestPathModTime(entry.Path, info.ModTime())
 		}
 		entries = append(entries, entry)
 	}
 	return entries, nil
+}
+
+func latestPathModTime(path string, fallback time.Time) time.Time {
+	latest := fallback
+	err := filepath.WalkDir(path, func(current string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if current != path && entry.Name() == ".git" {
+			if entry.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		// Directory mtimes mostly record the creation of nested checkout
+		// scaffolding. User activity is represented by regular files (and
+		// symlinks, which are protected conservatively), so do not let a newly
+		// created empty .git/project directory defeat an old root's retention.
+		if current != path && !info.Mode().IsRegular() && info.Mode()&os.ModeSymlink == 0 {
+			return nil
+		}
+		if info.ModTime().After(latest) {
+			latest = info.ModTime()
+		}
+		return nil
+	})
+	if err != nil {
+		// An unreadable child is evidence that the directory may contain recent
+		// activity. Preserve it by treating the candidate as within retention.
+		return time.Now()
+	}
+	return latest
 }
 
 func normalizedPathSet(paths []string) map[string]bool {

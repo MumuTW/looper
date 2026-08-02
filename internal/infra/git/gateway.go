@@ -297,6 +297,12 @@ func (g *Gateway) CreateWorktree(ctx context.Context, input CreateWorktreeInput)
 	if restored != nil {
 		return *restored, nil
 	}
+	// Hold the repository-container fence from the physical worktree creation
+	// through AdoptPath. The disk sweep takes the same scope lock, so a checkout
+	// cannot be removed in the crash window between `git worktree add` and its
+	// durable worktrees row.
+	releaseMutation := worktreesafety.AcquireManagedMutationLock(worktreesafety.WorktreeMutationScope(input.WorktreeRoot))
+	defer releaseMutation()
 
 	if checkoutMode == CheckoutModeDetached {
 		startPoint, err := g.resolveDetachedStartPoint(ctx, input)
@@ -423,6 +429,13 @@ func (g *Gateway) DetectOriginRemote(ctx context.Context, repoPath string) (Orig
 
 func (g *Gateway) RestoreWorktree(ctx context.Context, input RestoreWorktreeInput) (*storage.WorktreeRecord, error) {
 	checkoutMode := normalizeCheckoutMode(input.CheckoutMode)
+	mutationRoot := input.WorktreeRoot
+	if strings.TrimSpace(mutationRoot) == "" {
+		mutationRoot = filepath.Dir(input.ExpectedWorktreePath)
+	}
+	releaseMutation := worktreesafety.AcquireManagedMutationLock(worktreesafety.WorktreeMutationScope(mutationRoot))
+	defer releaseMutation()
+	hasStoredIdentity := false
 
 	if g.repos != nil {
 		var stored *storage.WorktreeRecord
@@ -604,6 +617,12 @@ func (g *Gateway) CleanupWorktree(ctx context.Context, input CleanupWorktreeInpu
 	if err := worktreesafety.Validate(worktreesafety.CheckInput{WorktreePath: input.WorktreePath, RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot}); err != nil {
 		return err
 	}
+	mutationRoot := input.WorktreeRoot
+	if strings.TrimSpace(mutationRoot) == "" {
+		mutationRoot = filepath.Dir(input.WorktreePath)
+	}
+	releaseMutation := worktreesafety.AcquireManagedMutationLock(worktreesafety.WorktreeMutationScope(mutationRoot))
+	defer releaseMutation()
 
 	// Provenance check: refuse to remove a worktree that looper did not create.
 	// This prevents destructive cleanup of external (non-looper) worktrees that
