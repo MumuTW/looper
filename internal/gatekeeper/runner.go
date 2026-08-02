@@ -1019,6 +1019,16 @@ func (r *Runner) persist(ctx context.Context, report Report) (Report, error) {
 		if markerErr := r.appendGateReportAt(ctx, retry, entityType, entityID, r.now().Add(time.Millisecond)); markerErr != nil {
 			return report, fmt.Errorf("%w (persist routing retry marker: %v)", routingErr, markerErr)
 		}
+		// The routing projection failed, but the verdict comment lifecycle is
+		// independent of the label projection. An advise project must still
+		// publish or update its promised verdict, and an observe demotion must
+		// not leave the old advice visible indefinitely just because label
+		// permissions never recover.
+		if err := r.applyVerdict(ctx, action, report); err != nil && r.logWarn != nil {
+			r.logWarn("gatekeeper: could not reconcile the verdict comment", map[string]any{
+				"repo": report.Repo, "pr": report.PRNumber, "action": string(action), "error": err.Error(),
+			})
+		}
 		return report, routingErr
 	}
 	// The final report is appended strictly after the pending projection so
