@@ -6,8 +6,10 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/labels"
 	"github.com/MumuTW/looper/internal/loops"
 	"github.com/MumuTW/looper/internal/loops/runpipe"
 	"github.com/MumuTW/looper/internal/storage"
@@ -29,6 +31,19 @@ func (e assessmentFileExecution) Wait(context.Context) (AgentResult, error) {
 		return AgentResult{}, err
 	}
 	return AgentResult{Status: "completed", Summary: "assessment complete"}, nil
+}
+
+type escalatingPlannerAgentExecutor struct {
+	assessmentContent string
+	starts            []AgentRunInput
+}
+
+func (e *escalatingPlannerAgentExecutor) Start(_ context.Context, input AgentRunInput) (AgentExecution, error) {
+	e.starts = append(e.starts, input)
+	if phase, _ := input.Metadata["phase"].(string); phase == "suitability-assessment" {
+		return assessmentFileExecution{path: filepath.Join(input.WorkingDirectory, plannerAssessmentRelPath), content: e.assessmentContent}, nil
+	}
+	return fakeAgentExecution{result: AgentResult{Status: "completed", Summary: "wrote spec"}}, nil
 }
 
 func TestEvaluatePlannerEscalationCriteria(t *testing.T) {
@@ -150,5 +165,110 @@ func TestSuspendPlannerForHumanParksWithoutFailureOrRetry(t *testing.T) {
 	}
 	if persisted.Assessment == nil || persisted.Assessment.Evidence.DecisionRequest == "" {
 		t.Fatalf("checkpoint = %#v", persisted)
+	}
+}
+
+func TestProcessClaimedItemEscalationSuspendRespondResume(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	ctx := context.Background()
+	policyConfig := config.Config{Roles: config.RoleConfigs{Planner: config.PlannerRoleConfig{
+		AutoDiscovery: true,
+		Triggers: config.IssueRoleTriggersConfig{
+			Labels:                     []string{labels.DefaultPlanTrigger},
+			LabelMode:                  config.LabelModeAll,
+			RequireAssigneeCurrentUser: true,
+		},
+		Escalation: &config.PlannerEscalationConfig{PublicAPI: true},
+	}}}
+	assessmentJSON := `{"estimatedFiles":0,"estimatedPackages":0,"surfaces":["public_api"],"adrConflicts":[],"authorityDecisions":[],"evidence":["pkg/api"],"decisionRequest":"Choose API compatibility"}`
+	github := &fakeGitHubGateway{
+		issues:         []IssueSummary{{Number: 42, Title: "Plan this", Assignees: []string{"octocat"}, Labels: []string{labels.DefaultPlanTrigger}}},
+		issueDetail:    IssueDetail{Number: 42, Title: "Plan this", Body: "details", URL: "https://example/issues/42", Assignees: []string{"octocat"}, Labels: []string{labels.DefaultPlanTrigger}},
+		createPRResult: CreatePullRequestResult{Number: 101, URL: "https://example/pr/101"},
+	}
+	git := &fakeGitGateway{createResult: CreateWorktreeResult{ID: "worktree_1", WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "looper/planner/42-plan-this", BaseBranch: "main"}}
+	agent := &escalatingPlannerAgentExecutor{assessmentContent: assessmentJSON}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoPush: boolPtr(true), CustomInstructions: &policyConfig})
+
+	if _, err := runner.DiscoverIssues(ctx, DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	claim, err := fixture.repos.Queue.ClaimNextOfType(ctx, fixture.nowISO(), "planner-worker-1", "planner")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed item", claim, err)
+	}
+	first, err := runner.ProcessClaimedItem(ctx, *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem(first) error = %v", err)
+	}
+	if first.Status != "awaiting_human" {
+		t.Fatalf("first.Status = %q, want awaiting_human", first.Status)
+	}
+	if len(agent.starts) != 1 {
+		t.Fatalf("agent starts after suspend = %d, want 1 assessment call", len(agent.starts))
+	}
+	interruptedRun, err := fixture.repos.Runs.GetByID(ctx, first.RunID)
+	if err != nil || interruptedRun == nil {
+		t.Fatalf("Runs.GetByID(interrupted) = (%#v, %v)", interruptedRun, err)
+	}
+	var suspended plannerCheckpoint
+	if err := json.Unmarshal([]byte(*interruptedRun.CheckpointJSON), &suspended); err != nil {
+		t.Fatal(err)
+	}
+	if suspended.Assessment == nil || suspended.Assessment.Disposition != "awaiting_human" || len(suspended.Assessment.Fired) == 0 {
+		t.Fatalf("suspended checkpoint = %#v, want persisted escalation assessment", suspended.Assessment)
+	}
+
+	loop, err := fixture.repos.Loops.GetByID(ctx, first.LoopID)
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v)", loop, err)
+	}
+	ask, ok := loops.ReadHITLAsk(loop.MetadataJSON)
+	if !ok || ask.Status != "awaiting" {
+		t.Fatalf("HITL ask = %#v, want awaiting ask on loop metadata", ask)
+	}
+	ask.Answer = "authorize proceed"
+	ask.Status = "answered"
+	ask.AnsweredAt = fixture.nowISO()
+	metadata, err := loops.WriteHITLAsk(loop.MetadataJSON, ask)
+	if err != nil {
+		t.Fatalf("WriteHITLAsk() error = %v", err)
+	}
+	loop.MetadataJSON = &metadata
+	loop.Status = "running"
+	loop.NextRunAt = runpipe.StringPtr(fixture.nowISO())
+	loop.UpdatedAt = fixture.nowISO()
+	if err := fixture.repos.Loops.Upsert(ctx, *loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	if revived, err := fixture.repos.Queue.RequeueLatestCancelledByLoop(ctx, loop.ID, fixture.nowISO()); err != nil || revived != 1 {
+		t.Fatalf("Queue.RequeueLatestCancelledByLoop() = (%d, %v), want 1", revived, err)
+	}
+	fixture.advance(5 * time.Second)
+	resumeClaim, err := fixture.repos.Queue.ClaimNextOfType(ctx, fixture.nowISO(), "planner-worker-1", "planner")
+	if err != nil || resumeClaim == nil {
+		t.Fatalf("ClaimNextOfType(resume) = (%#v, %v), want claimed item", resumeClaim, err)
+	}
+	second, err := runner.ProcessClaimedItem(ctx, *resumeClaim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem(resume) error = %v", err)
+	}
+	if second.Status != "success" || second.PullRequestNumber != 101 {
+		t.Fatalf("second = %#v, want success with PR 101", second)
+	}
+	if len(agent.starts) != 2 {
+		t.Fatalf("agent starts after resume = %d, want assessment + write-spec", len(agent.starts))
+	}
+	resumedRun, err := fixture.repos.Runs.GetByID(ctx, second.RunID)
+	if err != nil || resumedRun == nil {
+		t.Fatalf("Runs.GetByID(resumed) = (%#v, %v)", resumedRun, err)
+	}
+	var resumed plannerCheckpoint
+	if err := json.Unmarshal([]byte(*resumedRun.CheckpointJSON), &resumed); err != nil {
+		t.Fatal(err)
+	}
+	if resumed.Assessment == nil || resumed.Assessment.Disposition != "authorized" || resumed.Assessment.HumanAnswer != "authorize proceed" {
+		t.Fatalf("resumed assessment = %#v, want authorized with human answer", resumed.Assessment)
 	}
 }
