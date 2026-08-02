@@ -3619,8 +3619,8 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 			err = input.AllowSnapshotClaimForVendor(vendor)
 		} else if providerScoped && input.AllowClaimForVendor != nil {
 			err = input.AllowClaimForVendor(vendor)
-		} else if input.AllowClaim != nil {
-			err = input.AllowClaim()
+		} else {
+			err = admissionRefuseClaim(input)
 		}
 		if err == nil {
 			return false, false
