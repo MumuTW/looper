@@ -183,7 +183,11 @@ func ResolveRunAgentSnapshotJSONForValidationGate(predecessorSnapshot *string, s
 			}
 		}
 	}
-	base, legacy, err := ResolveRunAgentSnapshotJSON(predecessorSnapshot, sticky, vendor, model, profileID, nil)
+	var effort *ReasoningEffort
+	if len(reasoningEffort) > 0 {
+		effort = reasoningEffort[0]
+	}
+	base, legacy, err := ResolveRunAgentSnapshotJSON(predecessorSnapshot, sticky, vendor, model, profileID, effort)
 	if err != nil {
 		return nil, false, false, err
 	}

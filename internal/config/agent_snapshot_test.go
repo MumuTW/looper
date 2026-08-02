@@ -375,7 +375,8 @@ func TestResolveRunAgentSnapshotJSONForValidationGate_NonStickyDelegates(t *test
 
 	// A fresh (non-sticky) create builds from current identity regardless of the
 	// gate flag; no predecessor to refresh.
-	got, refreshed, legacy, err := ResolveRunAgentSnapshotJSONForValidationGate(nil, false, true, true, string(AgentVendorCodex), strPtr("gpt-5"), "fast")
+	effort := ReasoningEffortHigh
+	got, refreshed, legacy, err := ResolveRunAgentSnapshotJSONForValidationGate(nil, false, true, true, string(AgentVendorCodex), strPtr("gpt-5"), "fast", &effort)
 	if err != nil {
 		t.Fatalf("ResolveRunAgentSnapshotJSONForValidationGate() error = %v", err)
 	}
@@ -391,6 +392,9 @@ func TestResolveRunAgentSnapshotJSONForValidationGate_NonStickyDelegates(t *test
 	}
 	if parsed.Vendor != string(AgentVendorCodex) || parsed.ProfileID != "fast" {
 		t.Fatalf("parsed = %#v, want current identity", parsed)
+	}
+	if parsed.ReasoningEffort == nil || *parsed.ReasoningEffort != effort {
+		t.Fatalf("parsed.ReasoningEffort = %v, want %q", parsed.ReasoningEffort, effort)
 	}
 }
 
