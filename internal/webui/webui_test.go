@@ -227,6 +227,8 @@ func TestOwnsMatchesOnlyTheUIMount(t *testing.T) {
 	cases := map[string]bool{
 		"/ui":                 true,
 		"/ui/triage":          true,
+		"/ui/../ui/triage":    true,
+		"/other/../ui/triage": true,
 		"/ui/static/app.css":  true,
 		"/uix":                false,
 		"/api/v1/status":      false,
@@ -235,6 +237,23 @@ func TestOwnsMatchesOnlyTheUIMount(t *testing.T) {
 	for path, want := range cases {
 		if got := Owns(path); got != want {
 			t.Errorf("Owns(%q) = %t, want %t", path, got, want)
+		}
+	}
+}
+
+func TestNormalizePathUsesOneRoutingRule(t *testing.T) {
+	t.Parallel()
+
+	cases := map[string]string{
+		"":                "/",
+		"/ui///triage/":   "/ui/triage",
+		"/ui/../triage":   "/triage",
+		"/other/../ui":    "/ui",
+		"/api/./v1//ping": "/api/v1/ping",
+	}
+	for input, want := range cases {
+		if got := NormalizePath(input); got != want {
+			t.Errorf("NormalizePath(%q) = %q, want %q", input, got, want)
 		}
 	}
 }

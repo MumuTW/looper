@@ -43,6 +43,13 @@ var staticFS embed.FS
 
 var templates = template.Must(template.New("webui").Funcs(templateFuncs()).ParseFS(templateFS, "templates/*.html"))
 
+// NormalizePath is the shared routing rule for the API dispatcher and this
+// handler. Cleaning before ownership checks keeps repeated slashes and dot
+// segments from making the two layers disagree about which surface owns a URL.
+func NormalizePath(requestPath string) string {
+	return path.Clean("/" + strings.TrimPrefix(requestPath, "/"))
+}
+
 // Options configure the /ui/ handler.
 type Options struct {
 	// Load produces one render's input. Required.
@@ -73,7 +80,7 @@ func Handler(options Options) http.Handler {
 
 		// Clean folds "/ui/" onto "/ui" so the bare mount point redirects to the
 		// page whether or not the caller typed the trailing slash.
-		requestPath := path.Clean("/" + strings.TrimPrefix(r.URL.Path, "/"))
+		requestPath := NormalizePath(r.URL.Path)
 		switch {
 		case requestPath == BasePath:
 			http.Redirect(w, r, TriagePath, http.StatusFound)
@@ -216,6 +223,7 @@ func setSecurityHeaders(w http.ResponseWriter) {
 
 // Owns reports whether a request path belongs to this UI.
 func Owns(requestPath string) bool {
+	requestPath = NormalizePath(requestPath)
 	return requestPath == BasePath || strings.HasPrefix(requestPath, BasePath+"/")
 }
 

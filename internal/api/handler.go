@@ -971,16 +971,8 @@ func isLoopbackRemoteAddr(remoteAddr string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
-func normalizePath(path string) string {
-	if path == "" {
-		return "/"
-	}
-
-	if len(path) == 1 {
-		return path
-	}
-
-	return strings.TrimRight(path, "/")
+func normalizePath(requestPath string) string {
+	return webui.NormalizePath(requestPath)
 }
 
 func (h *Handler) writeSuccess(w http.ResponseWriter, requestID string, data any) {
