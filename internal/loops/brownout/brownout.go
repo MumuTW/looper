@@ -178,7 +178,10 @@ func (b *Breaker) allowAdmission(reserveProbe bool) (bool, error) {
 		if limit <= 0 {
 			limit = 1
 		}
-		if b.probeInFlight >= limit {
+		// Completed successes are part of this recovery round too. Counting
+		// only in-flight calls would allow another batch after each success and
+		// exceed the configured ProbeSuccesses budget before the breaker closes.
+		if b.probeInFlight+b.probeSuccesses >= limit {
 			admissionErr = fmt.Errorf("%w: recovery probe capacity exhausted", ErrOpen)
 		} else {
 			b.probeInFlight++
