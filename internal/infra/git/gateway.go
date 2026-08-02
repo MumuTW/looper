@@ -1249,14 +1249,6 @@ func stagedGitlinkPaths(output string) []string {
 	return paths
 }
 
-func (g *Gateway) currentBranch(ctx context.Context, repoPath string) (string, error) {
-	result, err := g.runGitResult(ctx, repoPath, nil, "rev-parse", "--abbrev-ref", "HEAD")
-	if err != nil {
-		return "", err
-	}
-	return strings.TrimSpace(result.Stdout), nil
-}
-
 func (g *Gateway) Commit(ctx context.Context, input CommitInput) (CommitResult, error) {
 	if err := g.validateMutationWorktree(input.WorktreePath, input.RepoPath, input.WorktreeRoot); err != nil {
 		return CommitResult{}, err
@@ -1853,7 +1845,6 @@ func (g *Gateway) runGitResult(ctx context.Context, cwd string, env map[string]s
 		}
 	}
 }
-
 
 func (g *Gateway) runGitResultOnce(ctx context.Context, cwd string, env map[string]string, args ...string) (shell.Result, error) {
 	return g.runGitResultOnceWithStartGate(ctx, cwd, env, nil, args...)

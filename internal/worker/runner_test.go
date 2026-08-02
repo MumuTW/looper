@@ -1704,6 +1704,37 @@ func TestRunExecuteStepStopsBeforeReplacementWhenTimeoutProgressDrifts(t *testin
 	}
 }
 
+func TestVerifyTimeoutProgressBeforeReplacementFailsClosedForObservingCheckpoint(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	run := storage.RunRecord{ID: "run_timeout_observing", LoopID: "loop_worker_1", Status: "running", CurrentStep: runpipe.StringPtr(string(stepExecute)), StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Runs.Upsert(context.Background(), run); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
+	checkpoint := workerCheckpoint{Execution: &checkpointExecution{Status: "timeout_observing", ProgressBeforeTimeout: &worktreeProgress{HeadSHA: "head-before", Branch: "feature/test", ContentFingerprint: "content", ContentFingerprintVersion: worktreeFingerprintVersion, IndexFingerprint: "index"}}}
+	err = runner.verifyTimeoutProgressBeforeReplacement(context.Background(), *project, run.ID, workerInput{}, checkpointWorktree{}, &checkpoint)
+	var loopErr *runpipe.LoopError
+	if !errors.As(err, &loopErr) || loopErr.Kind != runpipe.FailureManualIntervention {
+		t.Fatalf("verifyTimeoutProgressBeforeReplacement() error = %v, want fail-closed manual intervention", err)
+	}
+	if checkpoint.Execution.ProgressSnapshotError == "" || checkpoint.ResumePolicy != loops.ResumePolicyManualIntervention {
+		t.Fatalf("checkpoint = %#v, want persisted containment gate", checkpoint)
+	}
+	storedRun, err := fixture.repos.Runs.GetByID(context.Background(), run.ID)
+	if err != nil || storedRun == nil {
+		t.Fatalf("Runs.GetByID() = (%#v, %v), want persisted run", storedRun, err)
+	}
+	storedCheckpoint, err := parseCheckpoint(storedRun.CheckpointJSON)
+	if err != nil || storedCheckpoint.Execution == nil || storedCheckpoint.Execution.Status != "timeout_observing" || storedCheckpoint.ResumePolicy != loops.ResumePolicyManualIntervention {
+		t.Fatalf("stored checkpoint = %#v, err=%v, want fail-closed observing state", storedCheckpoint, err)
+	}
+}
+
 func TestVerifyTimeoutProgressAfterTerminationRejectsDrift(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
