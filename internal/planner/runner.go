@@ -262,7 +262,7 @@ type AgentRunInput struct {
 	SnapshotModel           *string
 	SnapshotReasoningEffort *config.ReasoningEffort
 	CompletionContract      agent.CompletionContract
-	CompletionValidator     func() bool
+	CompletionValidator     func(string) bool
 }
 
 type AgentResult struct {

@@ -369,9 +369,11 @@ type RunInput struct {
 	// file-backed callers provide a semantic validator.
 	CompletionContract CompletionContract
 	// CompletionValidator is the daemon-owned caller validator for contracts
-	// whose authority is not the executor's stdout (for example planner's
-	// assessment file). It is evaluated only at terminal outcome reporting.
-	CompletionValidator func() bool
+	// whose authority is not the executor's generic syntax check (for example a
+	// planner assessment file or a coordinator decision schema). For stdout
+	// contracts it receives FinalMessage(stdout); file-backed callers may ignore
+	// the argument. It is evaluated only at terminal outcome reporting.
+	CompletionValidator func(string) bool
 	// BrownoutProbe is populated by the common spawn admission lease.
 	BrownoutProbe bool
 	// BrownoutProbeGeneration is copied from the common spawn admission lease.
@@ -1441,9 +1443,12 @@ func (x *execution) reportOutcome(status, parseStatus, completionPayload, stdout
 	}
 	succeeded := status == "completed"
 	if x.input.CompletionContract == CompletionContractFile {
-		succeeded = succeeded && x.input.CompletionValidator != nil && x.input.CompletionValidator()
+		succeeded = succeeded && x.input.CompletionValidator != nil && x.input.CompletionValidator("")
 	} else if x.input.CompletionContract == CompletionContractRawJSON {
 		succeeded = succeeded && validRawJSONObject(stdout)
+		if succeeded && x.input.CompletionValidator != nil {
+			succeeded = x.input.CompletionValidator(FinalMessage(stdout))
+		}
 	} else if x.input.CompletionContract == CompletionContractRawJSONEnvelope {
 		succeeded = succeeded && validRawJSONObjectEnvelope(stdout)
 	} else if x.input.CompletionContract == CompletionContractReviewerMarker {

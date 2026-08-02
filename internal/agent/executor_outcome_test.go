@@ -121,18 +121,35 @@ func TestReportOutcomeAcceptsRawJSONEnvelopeContract(t *testing.T) {
 	}
 }
 
+func TestReportOutcomeUsesRawJSONCompletionValidator(t *testing.T) {
+	outcomes := make([]Outcome, 0, 1)
+	exec := outcomeExecution(&outcomes)
+	exec.input.CompletionContract = CompletionContractRawJSON
+	exec.input.CompletionValidator = func(message string) bool { return message == `{"ok":true}` }
+	exec.reportOutcome("completed", "missing", "", "event stream\n{\"ok\":true}\n")
+	if len(outcomes) != 1 || !outcomes[0].Succeeded {
+		t.Fatalf("valid semantic raw JSON outcome = %#v, want one successful outcome", outcomes)
+	}
+
+	outcomes = outcomes[:0]
+	exec.reportOutcome("completed", "missing", "", "{\"ok\":false}")
+	if len(outcomes) != 1 || outcomes[0].Succeeded {
+		t.Fatalf("invalid semantic raw JSON outcome = %#v, want one failed outcome", outcomes)
+	}
+}
+
 func TestReportOutcomeUsesFileCompletionValidator(t *testing.T) {
 	outcomes := make([]Outcome, 0, 1)
 	exec := outcomeExecution(&outcomes)
 	exec.input.CompletionContract = CompletionContractFile
-	exec.input.CompletionValidator = func() bool { return true }
+	exec.input.CompletionValidator = func(string) bool { return true }
 	exec.reportOutcome("completed", "missing", "", "agent wrote assessment to file")
 	if len(outcomes) != 1 || !outcomes[0].Succeeded {
 		t.Fatalf("valid file-backed outcome = %#v, want one successful outcome", outcomes)
 	}
 
 	outcomes = outcomes[:0]
-	exec.input.CompletionValidator = func() bool { return false }
+	exec.input.CompletionValidator = func(string) bool { return false }
 	exec.reportOutcome("completed", "missing", "", "agent wrote malformed assessment")
 	if len(outcomes) != 1 || outcomes[0].Succeeded {
 		t.Fatalf("invalid file-backed outcome = %#v, want one failed outcome", outcomes)

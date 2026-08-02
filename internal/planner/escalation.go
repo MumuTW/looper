@@ -127,7 +127,7 @@ func (r *Runner) runAssessSuitabilityStep(ctx context.Context, input stepInput) 
 		Metadata:       map[string]any{"loopType": "planner", "phase": "suitability-assessment", "repo": issue.Repo, "issueNumber": issue.IssueNumber},
 		IdempotencyKey: fmt.Sprintf("planner-assessment:%s", input.Loop.ID), UseSnapshot: useSnap, SnapshotVendor: snapVendor, SnapshotModel: snapModel, SnapshotReasoningEffort: snapReasoningEffort,
 		CompletionContract: agent.CompletionContractFile,
-		CompletionValidator: func() bool {
+		CompletionValidator: func(string) bool {
 			return ValidateAssessmentFile(worktree.Path) == nil
 		},
 	})

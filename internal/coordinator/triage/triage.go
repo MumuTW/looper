@@ -130,6 +130,15 @@ func Decide(ctx context.Context, llm LLM, input Input) Decision {
 	return decision
 }
 
+// ValidateOutput checks the coordinator classifier's semantic output contract
+// without applying project-specific label names. The executor uses this as the
+// health-accounting authority so syntactically valid but unusable JSON cannot
+// dilute the provider failure signal before Decide parses it for a project.
+func ValidateOutput(raw string) bool {
+	_, err := parseDecision(raw, Config{})
+	return err == nil
+}
+
 func NoOpDecision() Decision {
 	return Decision{NoOp: true}
 }
