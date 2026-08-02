@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/MumuTW/looper/internal/loops/runpipe"
 	"github.com/MumuTW/looper/internal/reproducer"
 	"github.com/MumuTW/looper/internal/validation"
 )
@@ -56,8 +57,8 @@ func TestWorkerReproductionCapturePersistsAndDetectsTampering(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "integrity check failed") || !strings.Contains(err.Error(), "modified") {
 		t.Fatalf("verifyWorkerReproduction() after tamper = %v, want integrity failure", err)
 	}
-	if got := err.(*loopError).kind; got != FailureManualIntervention {
-		t.Fatalf("failure kind = %q, want %q", got, FailureManualIntervention)
+	if got := err.(*runpipe.LoopError).Kind; got != runpipe.FailureManualIntervention {
+		t.Fatalf("failure kind = %q, want %q", got, runpipe.FailureManualIntervention)
 	}
 }
 
@@ -157,8 +158,8 @@ func TestWorkerReproductionBaselineRejectsPassingTest(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "passed immediately") {
 		t.Fatalf("ensureWorkerReproductionBaseline() error = %v, want immediate-pass rejection", err)
 	}
-	if got := err.(*loopError).kind; got != FailureManualIntervention {
-		t.Fatalf("failure kind = %q, want %q", got, FailureManualIntervention)
+	if got := err.(*runpipe.LoopError).Kind; got != runpipe.FailureManualIntervention {
+		t.Fatalf("failure kind = %q, want %q", got, runpipe.FailureManualIntervention)
 	}
 	if checkpoint.ReproductionBaseline == nil || !checkpoint.ReproductionBaseline.Passed {
 		t.Fatalf("ReproductionBaseline = %#v, want persisted passing diagnostic", checkpoint.ReproductionBaseline)
@@ -176,8 +177,8 @@ func TestWorkerReproductionBaselineRejectsOperationalFailure(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "ordinary failing test result") {
 		t.Fatalf("ensureWorkerReproductionBaseline() error = %v, want operational-failure rejection", err)
 	}
-	if got := err.(*loopError).kind; got != FailureRetryableTransient {
-		t.Fatalf("failure kind = %q, want %q", got, FailureRetryableTransient)
+	if got := err.(*runpipe.LoopError).Kind; got != runpipe.FailureRetryableTransient {
+		t.Fatalf("failure kind = %q, want %q", got, runpipe.FailureRetryableTransient)
 	}
 }
 
@@ -246,8 +247,8 @@ func TestWorkerReproductionBaselineReuseOnlyFailsClosed(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "absent after Worker execution") {
 		t.Fatalf("ensureWorkerReproductionBaseline() error = %v, want fail-closed after execution", err)
 	}
-	if got := err.(*loopError).kind; got != FailureManualIntervention {
-		t.Fatalf("failure kind = %q, want %q", got, FailureManualIntervention)
+	if got := err.(*runpipe.LoopError).Kind; got != runpipe.FailureManualIntervention {
+		t.Fatalf("failure kind = %q, want %q", got, runpipe.FailureManualIntervention)
 	}
 	if called {
 		t.Fatal("ensureWorkerReproductionBaseline() ran the reproduction after execution instead of failing closed")
@@ -354,8 +355,8 @@ func TestWorkerReproductionBaselineRejectsDirtyWorktree(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "modified the worktree") {
 		t.Fatalf("ensureWorkerReproductionBaseline() error = %v, want dirty-worktree rejection", err)
 	}
-	if got := err.(*loopError).kind; got != FailureManualIntervention {
-		t.Fatalf("failure kind = %q, want %q", got, FailureManualIntervention)
+	if got := err.(*runpipe.LoopError).Kind; got != runpipe.FailureManualIntervention {
+		t.Fatalf("failure kind = %q, want %q", got, runpipe.FailureManualIntervention)
 	}
 	if checkpoint.ReproductionBaseline != nil {
 		t.Fatalf("ReproductionBaseline = %#v, want nil (no evidence accepted on dirty worktree)", checkpoint.ReproductionBaseline)

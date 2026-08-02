@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/MumuTW/looper/internal/loops/runpipe"
 	"github.com/MumuTW/looper/internal/reproducer"
 )
 
@@ -53,8 +54,8 @@ func TestFixerReproductionCapturePersistsAndDetectsTampering(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "integrity check failed") || !strings.Contains(err.Error(), "modified") {
 		t.Fatalf("verifyFixerReproduction() after tamper = %v, want integrity failure", err)
 	}
-	if got := err.(*loopError).kind; got != FailureManualIntervention {
-		t.Fatalf("failure kind = %q, want %q", got, FailureManualIntervention)
+	if got := err.(*runpipe.LoopError).Kind; got != runpipe.FailureManualIntervention {
+		t.Fatalf("failure kind = %q, want %q", got, runpipe.FailureManualIntervention)
 	}
 }
 

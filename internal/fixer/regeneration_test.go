@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/MumuTW/looper/internal/labels"
+	"github.com/MumuTW/looper/internal/loops/runpipe"
 	"github.com/MumuTW/looper/internal/storage"
 )
 
@@ -64,16 +65,16 @@ func setupRegenerationRecords(t *testing.T, fixture *runnerFixture) (storage.Loo
 	repo := "acme/looper"
 	prNumber := int64(42)
 	workerMetadata := `{"worker":{"issueRepo":"acme/looper","issueNumber":7,"issueUrl":"https://example.test/issues/7","title":"Original issue"}}`
-	worker := storage.LoopRecord{ID: "worker_origin", Seq: 1, ProjectID: "project_1", Type: "worker", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "completed", MetadataJSON: stringPtr(workerMetadata), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	worker := storage.LoopRecord{ID: "worker_origin", Seq: 1, ProjectID: "project_1", Type: "worker", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "completed", MetadataJSON: runpipe.StringPtr(workerMetadata), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
 	if err := fixture.repos.Loops.Upsert(ctx, worker); err != nil {
 		t.Fatalf("Loops.Upsert(worker) error = %v", err)
 	}
 	fixerMetadata := `{"sourceWorkerId":"worker_origin"}`
-	fixer := storage.LoopRecord{ID: "fixer_exhausted", Seq: 2, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: stringPtr(buildPullRequestTargetID(repo, prNumber)), Repo: &repo, PRNumber: &prNumber, Status: "paused", MetadataJSON: stringPtr(fixerMetadata), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	fixer := storage.LoopRecord{ID: "fixer_exhausted", Seq: 2, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: runpipe.StringPtr(buildPullRequestTargetID(repo, prNumber)), Repo: &repo, PRNumber: &prNumber, Status: "paused", MetadataJSON: runpipe.StringPtr(fixerMetadata), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
 	if err := fixture.repos.Loops.Upsert(ctx, fixer); err != nil {
 		t.Fatalf("Loops.Upsert(fixer) error = %v", err)
 	}
-	queue := storage.QueueItemRecord{ID: "queue_exhausted", ProjectID: stringPtr("project_1"), LoopID: stringPtr(fixer.ID), Type: "fixer", TargetType: "pull_request", TargetID: buildPullRequestTargetID(repo, prNumber), Repo: &repo, PRNumber: &prNumber, Status: "failed", Attempts: 3, MaxAttempts: 3, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	queue := storage.QueueItemRecord{ID: "queue_exhausted", ProjectID: runpipe.StringPtr("project_1"), LoopID: runpipe.StringPtr(fixer.ID), Type: "fixer", TargetType: "pull_request", TargetID: buildPullRequestTargetID(repo, prNumber), Repo: &repo, PRNumber: &prNumber, Status: "failed", Attempts: 3, MaxAttempts: 3, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
 	return fixer, queue
 }
 
@@ -100,7 +101,7 @@ func TestHandleTerminalExhaustionOrdersCommentCloseAndPlannerRoute(t *testing.T)
 	})
 	loop, queue := setupRegenerationRecords(t, fixture)
 	project, _ := fixture.repos.Projects.GetByID(context.Background(), "project_1")
-	failure := &loopError{message: "validation failed", kind: FailureRetryableTransient}
+	failure := &runpipe.LoopError{Message: "validation failed", Kind: runpipe.FailureRetryableTransient}
 	checkpoint := fixerCheckpoint{Detail: &checkpointDetail{HeadSHA: "head-42"}, FixItems: []FixItem{{ID: "thread-7", Summary: "fix root cause"}}}
 	updated, action, err := runner.applyTerminalRegeneration(context.Background(), *project, loop, queue, checkpoint, failure)
 	if err != nil {
@@ -144,7 +145,7 @@ func TestHandleTerminalExhaustionHonorsDeleteBranchPolicy(t *testing.T) {
 	})
 	loop, queue := setupRegenerationRecords(t, fixture)
 	project, _ := fixture.repos.Projects.GetByID(context.Background(), "project_1")
-	if _, action, err := runner.applyTerminalRegeneration(context.Background(), *project, loop, queue, fixerCheckpoint{}, &loopError{message: "failed", kind: FailureRetryableTransient}); err != nil || action != regenerationCompleted {
+	if _, action, err := runner.applyTerminalRegeneration(context.Background(), *project, loop, queue, fixerCheckpoint{}, &runpipe.LoopError{Message: "failed", Kind: runpipe.FailureRetryableTransient}); err != nil || action != regenerationCompleted {
 		t.Fatalf("applyTerminalRegeneration() = action %q err %v, want completed", action, err)
 	}
 	if len(gateway.closeCalls) != 1 || gateway.closeCalls[0].DeleteBranch {
@@ -169,7 +170,7 @@ func TestHandleTerminalExhaustionReplaysAfterRouteFailureWithoutDuplicateClose(t
 	})
 	loop, queue := setupRegenerationRecords(t, fixture)
 	project, _ := fixture.repos.Projects.GetByID(context.Background(), "project_1")
-	failure := &loopError{message: "agent failed", kind: FailureRetryableTransient}
+	failure := &runpipe.LoopError{Message: "agent failed", Kind: runpipe.FailureRetryableTransient}
 	checkpoint := fixerCheckpoint{Detail: &checkpointDetail{HeadSHA: "head-42"}}
 	if _, _, err := runner.applyTerminalRegeneration(context.Background(), *project, loop, queue, checkpoint, failure); err == nil {
 		t.Fatal("first applyTerminalRegeneration() error = nil, want route failure")
@@ -201,7 +202,7 @@ func TestHandleTerminalExhaustionEscalatesHumanCommitWithoutClosing(t *testing.T
 	runner := newRegenerationRunner(t, fixture, gateway, func(_ context.Context, _ RegenerateIssueInput) error { routes++; return nil })
 	loop, queue := setupRegenerationRecords(t, fixture)
 	project, _ := fixture.repos.Projects.GetByID(context.Background(), "project_1")
-	action, err := runner.handleTerminalExhaustion(context.Background(), *project, loop, queue, fixerCheckpoint{}, &loopError{message: "failed", kind: FailureRetryableTransient})
+	action, err := runner.handleTerminalExhaustion(context.Background(), *project, loop, queue, fixerCheckpoint{}, &runpipe.LoopError{Message: "failed", Kind: runpipe.FailureRetryableTransient})
 	if err != nil {
 		t.Fatalf("handleTerminalExhaustion() error = %v", err)
 	}

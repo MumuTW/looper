@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/MumuTW/looper/internal/loops"
+	"github.com/MumuTW/looper/internal/loops/runpipe"
 	"github.com/MumuTW/looper/internal/storage"
 )
 
@@ -34,10 +35,10 @@ func seedTerminalCleanupRun(t *testing.T, fixture *runnerFixture, runID, worktre
 		ResumePolicy: "advance_from_checkpoint",
 		Worktree:     &checkpointWorktree{Path: worktreePath, Branch: "feature/fix-42", PreparedAt: nowISO},
 	}
-	encoded := mustMarshalJSON(checkpoint)
+	encoded := runpipe.MustMarshalJSON(checkpoint)
 	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{
 		ID: runID, LoopID: loopID, Status: "completed",
-		CurrentStep: stringPtr(string(stepRecheck)), LastCompletedStep: stringPtr(string(stepRecheck)),
+		CurrentStep: runpipe.StringPtr(string(stepRecheck)), LastCompletedStep: runpipe.StringPtr(string(stepRecheck)),
 		CheckpointJSON: &encoded, StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO,
 	}); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
@@ -97,7 +98,7 @@ func TestTerminalCleanupSkipsCancelledRunOnQueuedLoopAfterHandback(t *testing.T)
 	}
 
 	runner.cleanupFixerWorktreeIfTerminal(context.Background(), storage.ProjectRecord{
-		ID: "project_1", RepoPath: t.TempDir(), BaseBranch: stringPtr("main"),
+		ID: "project_1", RepoPath: t.TempDir(), BaseBranch: runpipe.StringPtr("main"),
 	}, "run_cleanup_post_handback", &checkpoint)
 
 	if len(git.cleanupCalls) != 0 {
@@ -130,7 +131,7 @@ func TestTerminalCleanupSkipsSiblingHumanTakeoverOnSamePR(t *testing.T) {
 	}
 
 	runner.cleanupFixerWorktreeIfTerminal(context.Background(), storage.ProjectRecord{
-		ID: "project_1", RepoPath: t.TempDir(), BaseBranch: stringPtr("main"),
+		ID: "project_1", RepoPath: t.TempDir(), BaseBranch: runpipe.StringPtr("main"),
 	}, "run_cleanup_sibling", &checkpoint)
 
 	if len(git.cleanupCalls) != 0 {
@@ -149,7 +150,7 @@ func TestTerminalCleanupPersistsSuccessTimestamps(t *testing.T) {
 	checkpoint := seedTerminalCleanupRun(t, fixture, "run_cleanup_ok", filepath.Join(t.TempDir(), "wt-42"))
 
 	runner.cleanupFixerWorktreeIfTerminal(context.Background(), storage.ProjectRecord{
-		ID: "project_1", RepoPath: t.TempDir(), BaseBranch: stringPtr("main"),
+		ID: "project_1", RepoPath: t.TempDir(), BaseBranch: runpipe.StringPtr("main"),
 	}, "run_cleanup_ok", &checkpoint)
 
 	if len(git.cleanupCalls) != 1 {
@@ -181,7 +182,7 @@ func TestTerminalCleanupSkipsHumanTakeoverWorktree(t *testing.T) {
 	}
 
 	runner.cleanupFixerWorktreeIfTerminal(context.Background(), storage.ProjectRecord{
-		ID: "project_1", RepoPath: t.TempDir(), BaseBranch: stringPtr("main"),
+		ID: "project_1", RepoPath: t.TempDir(), BaseBranch: runpipe.StringPtr("main"),
 	}, "run_cleanup_human_takeover", &checkpoint)
 
 	if len(git.cleanupCalls) != 0 {
@@ -238,7 +239,7 @@ func TestTerminalCleanupPersistsAttemptBeforeWorktreeMutation(t *testing.T) {
 		}
 	}
 	runner.cleanupFixerWorktreeIfTerminal(context.Background(), storage.ProjectRecord{
-		ID: "project_1", RepoPath: t.TempDir(), BaseBranch: stringPtr("main"),
+		ID: "project_1", RepoPath: t.TempDir(), BaseBranch: runpipe.StringPtr("main"),
 	}, "run_cleanup_attempt_boundary", &checkpoint)
 
 	if len(git.cleanupCalls) != 1 {
@@ -254,7 +255,7 @@ func TestTerminalCleanupRecordsRefusedRemovalAsUnverified(t *testing.T) {
 	checkpoint := seedTerminalCleanupRun(t, fixture, "run_cleanup_failed", filepath.Join(t.TempDir(), "wt-43"))
 
 	runner.cleanupFixerWorktreeIfTerminal(context.Background(), storage.ProjectRecord{
-		ID: "project_1", RepoPath: t.TempDir(), BaseBranch: stringPtr("main"),
+		ID: "project_1", RepoPath: t.TempDir(), BaseBranch: runpipe.StringPtr("main"),
 	}, "run_cleanup_failed", &checkpoint)
 
 	attempted, cleaned := storedCleanupTimestamps(t, fixture, "run_cleanup_failed")
@@ -288,17 +289,17 @@ func TestTerminalCleanupPreservesConcurrentRunState(t *testing.T) {
 	}
 	concurrent := parseCheckpoint(stored.CheckpointJSON)
 	concurrent.ResumePolicy = loops.ResumePolicyRestartFromDiscover
-	rewritten := mustMarshalJSON(concurrent)
+	rewritten := runpipe.MustMarshalJSON(concurrent)
 	updated := *stored
 	updated.CheckpointJSON = &rewritten
 	updated.Status = "interrupted"
-	updated.CurrentStep = stringPtr(string(stepDiscoverPR))
+	updated.CurrentStep = runpipe.StringPtr(string(stepDiscoverPR))
 	if err := fixture.repos.Runs.Upsert(context.Background(), updated); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
 
 	runner.cleanupFixerWorktreeIfTerminal(context.Background(), storage.ProjectRecord{
-		ID: "project_1", RepoPath: t.TempDir(), BaseBranch: stringPtr("main"),
+		ID: "project_1", RepoPath: t.TempDir(), BaseBranch: runpipe.StringPtr("main"),
 	}, "run_cleanup_policy_race", &checkpoint)
 
 	after, err := fixture.repos.Runs.GetByID(context.Background(), "run_cleanup_policy_race")
@@ -327,7 +328,7 @@ func TestTerminalCleanupPreservesConcurrentRunState(t *testing.T) {
 
 // TestTerminalCleanupWithoutRunIDStaysInMemory covers the paths where no durable
 // run owns the cleanup: the timestamps still land on the in-memory checkpoint for
-// the returned ProcessResult, and nothing is written.
+// the returned runpipe.ProcessResult, and nothing is written.
 func TestTerminalCleanupWithoutRunIDStaysInMemory(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -338,7 +339,7 @@ func TestTerminalCleanupWithoutRunIDStaysInMemory(t *testing.T) {
 	}
 
 	runner.cleanupFixerWorktreeIfTerminal(context.Background(), storage.ProjectRecord{
-		ID: "project_1", RepoPath: t.TempDir(), BaseBranch: stringPtr("main"),
+		ID: "project_1", RepoPath: t.TempDir(), BaseBranch: runpipe.StringPtr("main"),
 	}, "", &checkpoint)
 
 	if checkpoint.Worktree.CleanedAt == "" {
@@ -366,7 +367,7 @@ func TestTerminalCleanupSurvivesLaterRetryPolicyWrite(t *testing.T) {
 	}
 
 	runner.cleanupFixerWorktreeIfTerminal(context.Background(), storage.ProjectRecord{
-		ID: "project_1", RepoPath: t.TempDir(), BaseBranch: stringPtr("main"),
+		ID: "project_1", RepoPath: t.TempDir(), BaseBranch: runpipe.StringPtr("main"),
 	}, "run_cleanup_then_retry", &checkpoint)
 
 	// ...and writes its policy change afterwards, from that stale read.
@@ -399,10 +400,10 @@ func TestTerminalCleanupRecordsRefusedRemovalAsSecondaryIssue(t *testing.T) {
 	checkpoint := seedTerminalCleanupRun(t, fixture, "run_cleanup_issue", filepath.Join(t.TempDir(), "wt-50"))
 
 	runner.cleanupFixerWorktreeIfTerminal(context.Background(), storage.ProjectRecord{
-		ID: "project_1", RepoPath: t.TempDir(), BaseBranch: stringPtr("main"),
+		ID: "project_1", RepoPath: t.TempDir(), BaseBranch: runpipe.StringPtr("main"),
 	}, "run_cleanup_issue", &checkpoint)
 
-	// In memory, for the returned ProcessResult.
+	// In memory, for the returned runpipe.ProcessResult.
 	if checkpoint.Outcome == nil || len(checkpoint.Outcome.SecondaryIssues) != 1 {
 		t.Fatalf("in-memory Outcome = %#v, want one secondary issue", checkpoint.Outcome)
 	}
@@ -452,7 +453,7 @@ func TestTerminalCleanupAppendsToExistingSecondaryIssues(t *testing.T) {
 	if err != nil || stored == nil {
 		t.Fatalf("Runs.GetByID() = (%#v, %v)", stored, err)
 	}
-	encoded := mustMarshalJSON(existing)
+	encoded := runpipe.MustMarshalJSON(existing)
 	updated := *stored
 	updated.CheckpointJSON = &encoded
 	if err := fixture.repos.Runs.Upsert(context.Background(), updated); err != nil {
@@ -460,7 +461,7 @@ func TestTerminalCleanupAppendsToExistingSecondaryIssues(t *testing.T) {
 	}
 
 	runner.cleanupFixerWorktreeIfTerminal(context.Background(), storage.ProjectRecord{
-		ID: "project_1", RepoPath: t.TempDir(), BaseBranch: stringPtr("main"),
+		ID: "project_1", RepoPath: t.TempDir(), BaseBranch: runpipe.StringPtr("main"),
 	}, "run_cleanup_append", &checkpoint)
 
 	after, err := fixture.repos.Runs.GetByID(context.Background(), "run_cleanup_append")

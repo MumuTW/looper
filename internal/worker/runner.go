@@ -30,6 +30,7 @@ import (
 	"github.com/MumuTW/looper/internal/lifecycle"
 	"github.com/MumuTW/looper/internal/loops"
 	"github.com/MumuTW/looper/internal/loops/failureclass"
+	"github.com/MumuTW/looper/internal/loops/runpipe"
 	"github.com/MumuTW/looper/internal/network/protocol"
 	"github.com/MumuTW/looper/internal/networkpolicy"
 	"github.com/MumuTW/looper/internal/processcontainment"
@@ -48,15 +49,9 @@ const (
 	stepValidate        = workflow.StepValidate
 	stepOpenPR          = workflow.StepOpenPR
 
-	FailureRetryableTransient   QueueFailureKind = "retryable_transient"
-	FailureRetryableAfterResume QueueFailureKind = "retryable_after_resume"
-	FailureNonRetryable         QueueFailureKind = "non_retryable"
-	FailureManualIntervention   QueueFailureKind = "manual_intervention"
-
 	defaultAgentTimeout     = time.Hour
 	defaultClaimTTL         = 10 * time.Minute
 	defaultRetryDelay       = 5 * time.Second
-	maxRetryDelay           = 300 * time.Second
 	defaultRetryMax         = 3
 	defaultIssueLimit       = 30
 	personalIssueQueryLimit = 100
@@ -79,8 +74,6 @@ var (
 // WorkerStep aliases the extracted workflow authority's step type; the
 // pipeline order and resume decisions live in internal/worker/workflow.
 type WorkerStep = workflow.Step
-
-type QueueFailureKind string
 
 type PullRequestSummary struct {
 	Number      int64
@@ -452,7 +445,7 @@ type RunCompletedInput struct {
 	Subtitle          string
 	Status            string
 	Summary           string
-	FailureKind       QueueFailureKind
+	FailureKind       runpipe.QueueFailureKind
 	PullRequestNumber int64
 	PullRequestURL    string
 }
@@ -590,16 +583,6 @@ type Runner struct {
 	hitlNotify                  HITLNotifyFunc
 	hitlAnswerTransport         string
 	hitlGitHub                  HITLGitHubSettings
-}
-
-type ProcessResult struct {
-	LoopID            string
-	RunID             string
-	QueueItemID       string
-	Status            string
-	Summary           string
-	FailureKind       QueueFailureKind
-	PullRequestNumber int64
 }
 
 type DiscoveryInput struct {
@@ -748,15 +731,6 @@ type stepInput struct {
 	Checkpoint workerCheckpoint
 }
 
-type loopError struct {
-	message string
-	kind    QueueFailureKind
-}
-
-type holdSkipError struct{ summary string }
-
-func (e *holdSkipError) Error() string { return e.summary }
-
 type loopUpsertResult struct {
 	record      storage.LoopRecord
 	created     bool
@@ -770,9 +744,9 @@ func validateCompletedExecutionCheckpoint(execution *checkpointExecution) error 
 	if execution.ParseStatus == "parsed" {
 		return nil
 	}
-	return &loopError{
-		message: invalidWorkerStructuredResultMessage(execution.ParseStatus),
-		kind:    FailureRetryableTransient,
+	return &runpipe.LoopError{
+		Message: invalidWorkerStructuredResultMessage(execution.ParseStatus),
+		Kind:    runpipe.FailureRetryableTransient,
 	}
 }
 
@@ -780,8 +754,8 @@ func invalidWorkerStructuredResultMessage(parseStatus string) string {
 	return fmt.Sprintf("Worker completed without a valid structured result (parse status: %s). See Looper logs for details.", firstNonEmpty(parseStatus, "missing"))
 }
 
-func reproductionFailure(err error) *loopError {
-	return &loopError{message: "Reproduction test integrity check failed: " + err.Error(), kind: FailureManualIntervention}
+func reproductionFailure(err error) *runpipe.LoopError {
+	return &runpipe.LoopError{Message: "Reproduction test integrity check failed: " + err.Error(), Kind: runpipe.FailureManualIntervention}
 }
 
 // captureWorkerReproduction records an optional manifest once the worktree is
@@ -932,12 +906,12 @@ func (r *Runner) ensureWorkerReproductionBaseline(ctx context.Context, checkpoin
 		checkpoint.ReproductionBaseline = nil
 	}
 	if scope == reproductionBaselineScopeReuseOnly {
-		return &loopError{message: "Reproduction baseline evidence is absent after Worker execution; refusing to manufacture red evidence from a possibly mutated worktree. Resume the run from the prepare step so the baseline is captured before the agent edits the checkout.", kind: FailureManualIntervention}
+		return &runpipe.LoopError{Message: "Reproduction baseline evidence is absent after Worker execution; refusing to manufacture red evidence from a possibly mutated worktree. Resume the run from the prepare step so the baseline is captured before the agent edits the checkout.", Kind: runpipe.FailureManualIntervention}
 	}
 	manifest := checkpoint.Work.Reproduction
 	result, err := r.runValidation(ctx, ValidationInput{CWD: worktreePath, Commands: []string{manifest.TestCommand}})
 	if err != nil {
-		return &loopError{message: fmt.Sprintf("Reproduction baseline verification failed: %v", err), kind: FailureRetryableTransient}
+		return &runpipe.LoopError{Message: fmt.Sprintf("Reproduction baseline verification failed: %v", err), Kind: runpipe.FailureRetryableTransient}
 	}
 	if strings.TrimSpace(result.HeadSHA) == "" && checkpoint.Worktree != nil {
 		// Worktree.HeadSHA is the immutable checkout head recorded by the
@@ -950,21 +924,21 @@ func (r *Runner) ensureWorkerReproductionBaseline(ctx context.Context, checkpoin
 	// the agent begins on side effects and reconcileWorkerGitState can fold
 	// them into a fallback commit as if the agent produced them.
 	if dirty, derr := r.workerReproductionBaselineWorktreeDirty(ctx, checkpoint.Worktree, worktreePath, repoPath, worktreeRoot); derr != nil {
-		return &loopError{message: fmt.Sprintf("Reproduction baseline worktree cleanliness check failed: %v", derr), kind: FailureRetryableTransient}
+		return &runpipe.LoopError{Message: fmt.Sprintf("Reproduction baseline worktree cleanliness check failed: %v", derr), Kind: runpipe.FailureRetryableTransient}
 	} else if dirty {
-		return &loopError{message: "Reproduction baseline verification failed: reproduction command modified the worktree; refusing to start Worker on uncommitted side effects", kind: FailureManualIntervention}
+		return &runpipe.LoopError{Message: "Reproduction baseline verification failed: reproduction command modified the worktree; refusing to start Worker on uncommitted side effects", Kind: runpipe.FailureManualIntervention}
 	}
 	checkpoint.ReproductionBaseline = &result
 	if result.Passed {
-		return &loopError{message: "Reproduction baseline verification failed: named test passed immediately; a reproduction must fail before Worker execution", kind: FailureManualIntervention}
+		return &runpipe.LoopError{Message: "Reproduction baseline verification failed: named test passed immediately; a reproduction must fail before Worker execution", Kind: runpipe.FailureManualIntervention}
 	}
 	if result.FailureCategory != validation.FailureNonZeroExit {
 		policy := validation.PolicyFor(result.FailureCategory)
-		kind := QueueFailureKind(policy.FailureKind)
+		kind := runpipe.QueueFailureKind(policy.FailureKind)
 		if kind == "" {
-			kind = FailureManualIntervention
+			kind = runpipe.FailureManualIntervention
 		}
-		return &loopError{message: fmt.Sprintf("Reproduction baseline verification failed: named test did not produce an ordinary failing test result (category %q, summary %q)", result.FailureCategory, result.Summary), kind: kind}
+		return &runpipe.LoopError{Message: fmt.Sprintf("Reproduction baseline verification failed: named test did not produce an ordinary failing test result (category %q, summary %q)", result.FailureCategory, result.Summary), Kind: kind}
 	}
 	return nil
 }
@@ -1037,7 +1011,7 @@ func (r *Runner) persistWorkerReproductionBaseline(ctx context.Context, input st
 		return nil
 	}
 	if err := r.persistCheckpoint(ctx, input.Run.ID, checkpoint); err != nil {
-		return &loopError{message: fmt.Sprintf("persist reproduction baseline checkpoint: %v", err), kind: FailureRetryableAfterResume}
+		return &runpipe.LoopError{Message: fmt.Sprintf("persist reproduction baseline checkpoint: %v", err), Kind: runpipe.FailureRetryableAfterResume}
 	}
 	return nil
 }
@@ -1107,8 +1081,6 @@ func checkpointExecutionFromAgentResult(result AgentResult) *checkpointExecution
 		ProgressSnapshotError: result.PreTimeoutError,
 	}
 }
-
-func (e *loopError) Error() string { return e.message }
 
 func New(options Options) *Runner {
 	now := options.Now
@@ -1458,7 +1430,7 @@ func (r *Runner) projectNetworkMode(projectID string) config.ProjectNetworkMode 
 	return config.ProjectNetworkModeOff
 }
 
-func (r *Runner) ProcessNext(ctx context.Context, claimedBy string) (*ProcessResult, error) {
+func (r *Runner) ProcessNext(ctx context.Context, claimedBy string) (*runpipe.ProcessResult, error) {
 	if r.repos == nil || r.repos.Queue == nil {
 		return nil, fmt.Errorf("worker runner is not configured")
 	}
@@ -1469,7 +1441,7 @@ func (r *Runner) ProcessNext(ctx context.Context, claimedBy string) (*ProcessRes
 	return r.ProcessClaimedQueueItem(ctx, *claimed)
 }
 
-func (r *Runner) ProcessClaimedQueueItem(ctx context.Context, queueItem storage.QueueItemRecord) (*ProcessResult, error) {
+func (r *Runner) ProcessClaimedQueueItem(ctx context.Context, queueItem storage.QueueItemRecord) (*runpipe.ProcessResult, error) {
 	result, err := r.ProcessClaimedItem(ctx, queueItem)
 	if err != nil {
 		if errors.Is(err, ErrSuccessfulClaimFinalization) {
@@ -1480,22 +1452,22 @@ func (r *Runner) ProcessClaimedQueueItem(ctx context.Context, queueItem storage.
 	return &result, nil
 }
 
-func (r *Runner) recoverClaimedItem(ctx context.Context, queueItem storage.QueueItemRecord, err error) (*ProcessResult, error) {
+func (r *Runner) recoverClaimedItem(ctx context.Context, queueItem storage.QueueItemRecord, err error) (*runpipe.ProcessResult, error) {
 	failure := r.classifyFailure(err)
-	failedQueue, failErr := r.failQueueItem(ctx, queueItem, failure.kind, failure.message)
+	failedQueue, failErr := r.failQueueItem(ctx, queueItem, failure.Kind, failure.Message)
 	if failErr != nil {
 		return nil, failErr
 	}
-	if err := r.reconcileRecoveredLoop(ctx, queueItem, failedQueue, failure.kind); err != nil {
+	if err := r.reconcileRecoveredLoop(ctx, queueItem, failedQueue, failure.Kind); err != nil {
 		return nil, err
 	}
-	if shouldNotifyCompletedRun(failure.kind, failedQueue) {
+	if shouldNotifyCompletedRun(failure.Kind, failedQueue) {
 		r.notifyRecoveredRunCompleted(ctx, queueItem, failure)
 	}
-	return &ProcessResult{LoopID: derefString(queueItem.LoopID), QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
+	return &runpipe.ProcessResult{LoopID: derefString(queueItem.LoopID), QueueItemID: queueItem.ID, Status: "failed", Summary: failure.Message, FailureKind: failure.Kind}, nil
 }
 
-func (r *Runner) reconcileRecoveredLoop(ctx context.Context, queueItem storage.QueueItemRecord, failedQueue *storage.QueueItemRecord, failureKind QueueFailureKind) error {
+func (r *Runner) reconcileRecoveredLoop(ctx context.Context, queueItem storage.QueueItemRecord, failedQueue *storage.QueueItemRecord, failureKind runpipe.QueueFailureKind) error {
 	if queueItem.LoopID == nil {
 		return nil
 	}
@@ -1511,12 +1483,12 @@ func (r *Runner) reconcileRecoveredLoop(ctx context.Context, queueItem storage.Q
 		return nil
 	}
 	_, err = r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
-		updated.LastRunAt = stringPtr(r.nowISO())
+		updated.LastRunAt = runpipe.StringPtr(r.nowISO())
 		if updated.Status == "paused" || updated.Status == "human_takeover" {
 			updated.NextRunAt = nil
 		} else if failedQueue != nil && failedQueue.Status == "queued" {
 			updated.Status = "queued"
-			updated.NextRunAt = stringPtr(failedQueue.AvailableAt)
+			updated.NextRunAt = runpipe.StringPtr(failedQueue.AvailableAt)
 		} else {
 			updated.Status = "paused"
 			stampWorkerFailedDiscoveryFingerprint(updated, queueItem)
@@ -1526,32 +1498,32 @@ func (r *Runner) reconcileRecoveredLoop(ctx context.Context, queueItem storage.Q
 	return err
 }
 
-func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.QueueItemRecord) (ProcessResult, error) {
+func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.QueueItemRecord) (runpipe.ProcessResult, error) {
 	if queueItem.Type != "worker" {
-		return ProcessResult{}, fmt.Errorf("unsupported queue item type: %s", queueItem.Type)
+		return runpipe.ProcessResult{}, fmt.Errorf("unsupported queue item type: %s", queueItem.Type)
 	}
 	if queueItem.LoopID == nil {
-		return ProcessResult{}, fmt.Errorf("worker queue item requires loopId")
+		return runpipe.ProcessResult{}, fmt.Errorf("worker queue item requires loopId")
 	}
 	loop, err := r.repos.Loops.GetByID(ctx, *queueItem.LoopID)
 	if err != nil {
-		return ProcessResult{}, err
+		return runpipe.ProcessResult{}, err
 	}
 	if loop == nil {
-		return ProcessResult{}, fmt.Errorf("loop not found: %s", *queueItem.LoopID)
+		return runpipe.ProcessResult{}, fmt.Errorf("loop not found: %s", *queueItem.LoopID)
 	}
 	project, err := r.repos.Projects.GetByID(ctx, loop.ProjectID)
 	if err != nil {
-		return ProcessResult{}, err
+		return runpipe.ProcessResult{}, err
 	}
 	if project == nil {
-		return ProcessResult{}, fmt.Errorf("project not found: %s", loop.ProjectID)
+		return runpipe.ProcessResult{}, fmt.Errorf("project not found: %s", loop.ProjectID)
 	}
 	if result, finalized, err := r.finalizePriorSuccessfulClaim(ctx, *loop, queueItem); err != nil || finalized {
 		return result, err
 	}
 	if err := r.revalidateRoutedWorkerClaim(ctx, *project, *loop, queueItem); err != nil {
-		return ProcessResult{}, err
+		return runpipe.ProcessResult{}, err
 	}
 	// A project removed from the runtime catalog (quarantined unstanced legacy
 	// row with empty defaults.validationCommands) has no resolved validation
@@ -1562,35 +1534,35 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	// running, which this check precedes). The project becomes runnable again
 	// once repaired via PATCH or once defaults.validationCommands is configured.
 	if !r.projectValidationPolicyKnown(project.ID) {
-		failure := &loopError{
-			message: fmt.Sprintf("project %s is quarantined without a validation policy; repair the project validation stance or configure defaults.validationCommands before retrying", project.ID),
-			kind:    FailureManualIntervention,
+		failure := &runpipe.LoopError{
+			Message: fmt.Sprintf("project %s is quarantined without a validation policy; repair the project validation stance or configure defaults.validationCommands before retrying", project.ID),
+			Kind:    runpipe.FailureManualIntervention,
 		}
-		failedQueue, err := r.failQueueItem(ctx, queueItem, failure.kind, failure.message)
+		failedQueue, err := r.failQueueItem(ctx, queueItem, failure.Kind, failure.Message)
 		if err != nil {
-			return ProcessResult{}, err
+			return runpipe.ProcessResult{}, err
 		}
 		if _, err := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
-			updated.LastRunAt = stringPtr(r.nowISO())
+			updated.LastRunAt = runpipe.StringPtr(r.nowISO())
 			updated.Status = "paused"
 			stampWorkerFailedDiscoveryFingerprint(updated, queueItem)
 			updated.NextRunAt = nil
 		}); err != nil {
-			return ProcessResult{}, err
+			return runpipe.ProcessResult{}, err
 		}
 		// This branch terminalizes a durable sticky retry before a run is
 		// created, so ProcessClaimedQueueItem sees a successful result and does
 		// not enter recoverClaimedItem. Preserve the same operator notification
 		// contract as every other manual-intervention failure after both durable
 		// queue and loop writes have committed.
-		if shouldNotifyCompletedRun(failure.kind, failedQueue) {
+		if shouldNotifyCompletedRun(failure.Kind, failedQueue) {
 			r.notifyRecoveredRunCompleted(ctx, queueItem, failure)
 		}
-		return ProcessResult{LoopID: loop.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
+		return runpipe.ProcessResult{LoopID: loop.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.Message, FailureKind: failure.Kind}, nil
 	}
 	resumedRun, err := r.createRunContext(ctx, *loop)
 	if err != nil {
-		return ProcessResult{}, err
+		return runpipe.ProcessResult{}, err
 	}
 	run := resumedRun.Run
 	checkpoint := resumedRun.Checkpoint
@@ -1602,10 +1574,10 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	if claimedLockKey != "" {
 		acquired, err := r.reacquireClaimedLock(ctx, claimedLockKey, queueItem.ID)
 		if err != nil {
-			return ProcessResult{}, err
+			return runpipe.ProcessResult{}, err
 		}
 		if !acquired {
-			return ProcessResult{}, &loopError{message: fmt.Sprintf("Worker lock is already held for %s", claimedLockKey), kind: FailureRetryableTransient}
+			return runpipe.ProcessResult{}, &runpipe.LoopError{Message: fmt.Sprintf("Worker lock is already held for %s", claimedLockKey), Kind: runpipe.FailureRetryableTransient}
 		}
 		acquiredClaimedLock = true
 	}
@@ -1635,7 +1607,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		}
 		if resumedRun.StartStep != stepPrepareWork {
 			if held, summary, err := r.workerHoldSummary(ctx, *project, *loop, queueItem, checkpoint); err != nil {
-				return ProcessResult{}, err
+				return runpipe.ProcessResult{}, err
 			} else if held {
 				return r.finishHeldWorkerQueueItem(ctx, *project, *loop, &run, queueItem, checkpoint, summary)
 			}
@@ -1643,10 +1615,10 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	}
 	if _, err := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
 		updated.Status = "running"
-		updated.LastRunAt = stringPtr(run.StartedAt)
+		updated.LastRunAt = runpipe.StringPtr(run.StartedAt)
 		updated.NextRunAt = nil
 	}); err != nil {
-		return ProcessResult{}, err
+		return runpipe.ProcessResult{}, err
 	}
 	if err := validateWorkerResumeCheckpoint(resumedRun.StartStep, checkpoint); err != nil {
 		failure := r.classifyFailureWithBoundary(err, failureclass.BoundaryCheckpoint)
@@ -1654,78 +1626,78 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		if latest.ResumePolicy == "" {
 			latest.ResumePolicy = "replay_step"
 		}
-		if _, err := r.completeRun(ctx, run, "failed", failure.message, failure.message, latest); err != nil {
-			return ProcessResult{}, err
+		if _, err := r.completeRun(ctx, run, "failed", failure.Message, failure.Message, latest); err != nil {
+			return runpipe.ProcessResult{}, err
 		}
-		failedQueue, err := r.failQueueItem(ctx, queueItem, failure.kind, failure.message)
+		failedQueue, err := r.failQueueItem(ctx, queueItem, failure.Kind, failure.Message)
 		if err != nil {
-			return ProcessResult{}, err
+			return runpipe.ProcessResult{}, err
 		}
-		if shouldNotifyCompletedRun(failure.kind, failedQueue) {
-			r.notifyRunCompleted(ctx, buildRunCompletedInput(*project, *loop, run, latest, "failed", failure.kind, failure.message))
+		if shouldNotifyCompletedRun(failure.Kind, failedQueue) {
+			r.notifyRunCompleted(ctx, buildRunCompletedInput(*project, *loop, run, latest, "failed", failure.Kind, failure.Message))
 		}
 		if _, err := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
-			updated.LastRunAt = stringPtr(r.nowISO())
+			updated.LastRunAt = runpipe.StringPtr(r.nowISO())
 			if updated.Status == "paused" || updated.Status == "human_takeover" {
 				updated.NextRunAt = nil
 			} else if failedQueue != nil && failedQueue.Status == "queued" {
 				updated.Status = "queued"
-				updated.NextRunAt = stringPtr(failedQueue.AvailableAt)
+				updated.NextRunAt = runpipe.StringPtr(failedQueue.AvailableAt)
 			} else {
 				updated.Status = "paused"
 				stampWorkerFailedDiscoveryFingerprint(updated, queueItem)
 				updated.NextRunAt = nil
 			}
 		}); err != nil {
-			return ProcessResult{}, err
+			return runpipe.ProcessResult{}, err
 		}
-		return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
+		return runpipe.ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.Message, FailureKind: failure.Kind}, nil
 	}
 
 	for _, step := range workflow.From(resumedRun.StartStep) {
 		run, err = r.persistStepStarted(ctx, run, step, checkpoint)
 		if err != nil {
-			return ProcessResult{}, err
+			return runpipe.ProcessResult{}, err
 		}
 		checkpoint, err = r.executeStep(ctx, step, stepInput{Project: *project, Loop: *loop, Run: run, QueueItem: queueItem, Checkpoint: checkpoint})
 		if awaiting, ok := asAwaitingHumanError(err); ok {
 			return r.suspendForHuman(ctx, stepInput{Project: *project, Loop: *loop, Run: run, QueueItem: queueItem, Checkpoint: checkpoint}, run, checkpoint, awaiting)
 		}
 		if err != nil {
-			var holdErr *holdSkipError
+			var holdErr *runpipe.HoldSkipError
 			if errors.As(err, &holdErr) {
-				return r.finishHeldWorkerQueueItem(ctx, *project, *loop, &run, queueItem, checkpoint, holdErr.summary)
+				return r.finishHeldWorkerQueueItem(ctx, *project, *loop, &run, queueItem, checkpoint, holdErr.Summary)
 			}
 			failure := r.classifyFailureWithBoundary(err, workerFailureBoundaryForStep(step))
 			latest := r.getLatestCheckpoint(ctx, run, checkpoint)
-			latest.ResumePolicy = loops.NormalizeResumePolicy(string(failure.kind), latest.ResumePolicy)
-			if _, err := r.completeRun(ctx, run, "failed", failure.message, failure.message, latest); err != nil {
-				return ProcessResult{}, err
+			latest.ResumePolicy = loops.NormalizeResumePolicy(string(failure.Kind), latest.ResumePolicy)
+			if _, err := r.completeRun(ctx, run, "failed", failure.Message, failure.Message, latest); err != nil {
+				return runpipe.ProcessResult{}, err
 			}
-			failedQueue, err := r.failQueueItem(ctx, queueItem, failure.kind, failure.message)
+			failedQueue, err := r.failQueueItem(ctx, queueItem, failure.Kind, failure.Message)
 			if err != nil {
-				return ProcessResult{}, err
+				return runpipe.ProcessResult{}, err
 			}
-			if shouldNotifyCompletedRun(failure.kind, failedQueue) {
-				r.notifyRunCompleted(ctx, buildRunCompletedInput(*project, *loop, run, latest, "failed", failure.kind, failure.message))
+			if shouldNotifyCompletedRun(failure.Kind, failedQueue) {
+				r.notifyRunCompleted(ctx, buildRunCompletedInput(*project, *loop, run, latest, "failed", failure.Kind, failure.Message))
 			}
 			if _, err := r.updateLoop(ctx, *loop, func(updated *storage.LoopRecord) {
-				updated.LastRunAt = stringPtr(r.nowISO())
+				updated.LastRunAt = runpipe.StringPtr(r.nowISO())
 				if updated.Status == "paused" || updated.Status == "human_takeover" {
 					updated.NextRunAt = nil
 				} else if failedQueue != nil && failedQueue.Status == "queued" {
 					updated.Status = "queued"
-					updated.NextRunAt = stringPtr(failedQueue.AvailableAt)
+					updated.NextRunAt = runpipe.StringPtr(failedQueue.AvailableAt)
 				} else {
 					updated.Status = "paused"
 					stampWorkerFailedDiscoveryFingerprint(updated, queueItem)
 					updated.NextRunAt = nil
 				}
 			}); err != nil {
-				return ProcessResult{}, err
+				return runpipe.ProcessResult{}, err
 			}
-			r.syncIssueClaim(ctx, stepInput{Project: *project, Loop: *loop, Run: run, QueueItem: queueItem}, &latest, issueClaimStatusForFailure(latest, failedQueue, failure.kind), failure.message)
-			return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.message, FailureKind: failure.kind}, nil
+			r.syncIssueClaim(ctx, stepInput{Project: *project, Loop: *loop, Run: run, QueueItem: queueItem}, &latest, issueClaimStatusForFailure(latest, failedQueue, failure.Kind), failure.Message)
+			return runpipe.ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: failure.Message, FailureKind: failure.Kind}, nil
 		}
 		if step == stepPrepareWork && checkpoint.SkipReason == "" {
 			claimedLockKey = checkpoint.ClaimedLockKey
@@ -1733,7 +1705,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		}
 		run, err = r.persistStepCompleted(ctx, run, step, checkpoint)
 		if err != nil {
-			return ProcessResult{}, err
+			return runpipe.ProcessResult{}, err
 		}
 		if checkpoint.SkipReason != "" {
 			break
@@ -1747,7 +1719,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	}
 	completedRun, err := r.finalizeSuccessfulClaim(ctx, run, queueItem, *loop, checkpoint, summary)
 	if err != nil {
-		return ProcessResult{}, err
+		return runpipe.ProcessResult{}, err
 	}
 	finalIssueClaimStatus := issueClaimStatusSuccess
 	if checkpoint.SkipReason != "" {
@@ -1755,7 +1727,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	}
 	r.syncIssueClaim(ctx, stepInput{Project: *project, Loop: *loop, Run: completedRun, QueueItem: queueItem}, &checkpoint, finalIssueClaimStatus, summary)
 	r.notifyRunCompleted(ctx, buildRunCompletedInput(*project, *loop, completedRun, checkpoint, statusForCheckpoint(checkpoint), "", summary))
-	return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: status, Summary: summary, PullRequestNumber: pullRequestNumber(checkpoint.PullRequest)}, nil
+	return runpipe.ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: status, Summary: summary, PullRequestNumber: pullRequestNumber(checkpoint.PullRequest)}, nil
 }
 
 func (r *Runner) revalidateRoutedWorkerClaim(ctx context.Context, project storage.ProjectRecord, loop storage.LoopRecord, queueItem storage.QueueItemRecord) error {
@@ -1780,7 +1752,7 @@ func (r *Runner) revalidateRoutedWorkerClaim(ctx context.Context, project storag
 	}
 	decision := networkpolicy.EvaluateWorker(policy.RoutedClaimPolicy, issue.Labels, issue.AssigneeUsers)
 	if !decision.Allowed {
-		return &loopError{message: fmt.Sprintf("Skipped routed worker claim for %s#%d: %s", repo, issueNumber, decision.Reason), kind: FailureManualIntervention}
+		return &runpipe.LoopError{Message: fmt.Sprintf("Skipped routed worker claim for %s#%d: %s", repo, issueNumber, decision.Reason), Kind: runpipe.FailureManualIntervention}
 	}
 	return nil
 }
@@ -1829,18 +1801,18 @@ func (r *Runner) reacquireClaimedLock(ctx context.Context, claimedLockKey string
 	return refreshed, nil
 }
 
-func (r *Runner) stopObsoleteResumedIssueRun(ctx context.Context, project storage.ProjectRecord, loop storage.LoopRecord, run storage.RunRecord, queueItem storage.QueueItemRecord, checkpoint *workerCheckpoint, claimedLockKey *string) (ProcessResult, bool, error) {
+func (r *Runner) stopObsoleteResumedIssueRun(ctx context.Context, project storage.ProjectRecord, loop storage.LoopRecord, run storage.RunRecord, queueItem storage.QueueItemRecord, checkpoint *workerCheckpoint, claimedLockKey *string) (runpipe.ProcessResult, bool, error) {
 	if checkpoint == nil || checkpoint.Work == nil || checkpoint.Work.ExecutionMode != "create-pr" || checkpoint.Work.IssueNumber <= 0 || r.github == nil {
-		return ProcessResult{}, false, nil
+		return runpipe.ProcessResult{}, false, nil
 	}
 	if err := r.validateWorkerIssueStillOpen(ctx, project.RepoPath, *checkpoint.Work); err == nil {
-		return ProcessResult{}, false, nil
+		return runpipe.ProcessResult{}, false, nil
 	} else if !isWorkerIssueTargetObsolete(err) {
-		return ProcessResult{}, false, nil
+		return runpipe.ProcessResult{}, false, nil
 	} else {
 		if checkpoint.ClaimedLockKey != "" {
 			if err := r.repos.Locks.Release(context.Background(), checkpoint.ClaimedLockKey); err != nil {
-				return ProcessResult{}, true, err
+				return runpipe.ProcessResult{}, true, err
 			}
 			checkpoint.ClaimedLockKey = ""
 		}
@@ -1852,11 +1824,11 @@ func (r *Runner) stopObsoleteResumedIssueRun(ctx context.Context, project storag
 		summary := r.buildSuccessSummary(loop, *checkpoint)
 		completedRun, err := r.finalizeSuccessfulClaim(ctx, run, queueItem, loop, *checkpoint, summary)
 		if err != nil {
-			return ProcessResult{}, true, err
+			return runpipe.ProcessResult{}, true, err
 		}
 		r.syncIssueClaim(ctx, stepInput{Project: project, Loop: loop, Run: completedRun, QueueItem: queueItem}, checkpoint, issueClaimStatusPaused, summary)
 		r.notifyRunCompleted(ctx, buildRunCompletedInput(project, loop, completedRun, *checkpoint, statusForCheckpoint(*checkpoint), "", summary))
-		return ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "skipped", Summary: summary}, true, nil
+		return runpipe.ProcessResult{LoopID: loop.ID, RunID: run.ID, QueueItemID: queueItem.ID, Status: "skipped", Summary: summary}, true, nil
 	}
 }
 
@@ -1873,8 +1845,8 @@ func (r *Runner) validateWorkerIssueStillOpen(ctx context.Context, cwd string, w
 }
 
 func isWorkerIssueTargetObsolete(err error) bool {
-	var loopErr *loopError
-	return errors.As(err, &loopErr) && loopErr.kind == FailureNonRetryable
+	var loopErr *runpipe.LoopError
+	return errors.As(err, &loopErr) && loopErr.Kind == runpipe.FailureNonRetryable
 }
 
 func (r *Runner) workerBranchAheadOfBase(ctx context.Context, project storage.ProjectRecord, work workerInput, worktree checkpointWorktree) (bool, error) {
@@ -1885,7 +1857,7 @@ func (r *Runner) workerBranchAheadOfBase(ctx context.Context, project storage.Pr
 	if r.github != nil && work.Repo != "" {
 		comparison, err := r.github.CompareBranches(ctx, CompareBranchesInput{Repo: work.Repo, BaseBranch: work.BaseBranch, HeadBranch: branch, CWD: project.RepoPath})
 		if err != nil {
-			return false, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+			return false, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
 		}
 		return comparison.AheadBy > 0, nil
 	}
@@ -1894,11 +1866,11 @@ func (r *Runner) workerBranchAheadOfBase(ctx context.Context, project storage.Pr
 	}
 	worktreeRoot, err := workerWorktreeRoot(project)
 	if err != nil {
-		return false, &loopError{message: err.Error(), kind: FailureRetryableTransient}
+		return false, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableTransient}
 	}
 	inspect, err := r.git.InspectHead(ctx, InspectHeadInput{RepoPath: project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, BaseRef: work.BaseBranch})
 	if err != nil {
-		return false, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+		return false, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
 	}
 	return len(inspect.NewCommitSHAs) > 0, nil
 }
@@ -1923,7 +1895,7 @@ func (r *Runner) runPrepareWorkStep(ctx context.Context, input stepInput) (worke
 	if held, summary, err := r.workerHoldSummaryForWork(ctx, input.Project, holdWork, retargetedToPullRequest); err != nil {
 		return checkpoint, err
 	} else if held {
-		return checkpoint, &holdSkipError{summary: summary}
+		return checkpoint, &runpipe.HoldSkipError{Summary: summary}
 	}
 	lockKey := derefString(input.QueueItem.LockKey)
 	if lockKey == "" {
@@ -1942,7 +1914,7 @@ func (r *Runner) runPrepareWorkStep(ctx context.Context, input stepInput) (worke
 		return checkpoint, err
 	}
 	if !acquired {
-		return checkpoint, &loopError{message: fmt.Sprintf("Worker lock is already held for %s", lockKey), kind: FailureRetryableTransient}
+		return checkpoint, &runpipe.LoopError{Message: fmt.Sprintf("Worker lock is already held for %s", lockKey), Kind: runpipe.FailureRetryableTransient}
 	}
 	policy := r.discoveryPolicyForProject(input.Project.ID)
 	if work.IssueNumber > 0 && r.github != nil && (!work.AutoDiscovered || policy.RequireAssigneeCurrentUser) {
@@ -1972,14 +1944,14 @@ func (r *Runner) selfAssignIssue(ctx context.Context, work workerInput, cwd stri
 	}
 	login, err := r.github.GetCurrentUserLogin(ctx, repo, cwd)
 	if err != nil {
-		return &loopError{message: fmt.Sprintf("Unable to resolve GitHub login for worker issue self-assignment on %s#%d: %v", repo, work.IssueNumber, err), kind: FailureRetryableAfterResume}
+		return &runpipe.LoopError{Message: fmt.Sprintf("Unable to resolve GitHub login for worker issue self-assignment on %s#%d: %v", repo, work.IssueNumber, err), Kind: runpipe.FailureRetryableAfterResume}
 	}
 	login = normalizeLogin(login)
 	if login == "" {
 		return nil
 	}
 	if err := r.github.AddIssueAssignees(ctx, IssueAssigneesInput{Repo: repo, IssueNumber: work.IssueNumber, Assignees: []string{login}, CWD: cwd}); err != nil {
-		return &loopError{message: fmt.Sprintf("Unable to assign issue %s#%d to %s: %v", repo, work.IssueNumber, login, err), kind: FailureRetryableAfterResume}
+		return &runpipe.LoopError{Message: fmt.Sprintf("Unable to assign issue %s#%d to %s: %v", repo, work.IssueNumber, login, err), Kind: runpipe.FailureRetryableAfterResume}
 	}
 	return nil
 }
@@ -2054,7 +2026,7 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (w
 			return checkpoint, err
 		}
 		if !prepared.Clean {
-			return checkpoint, &loopError{message: fmt.Sprintf("Worker worktree is dirty for branch %s", created.Branch), kind: FailureManualIntervention}
+			return checkpoint, &runpipe.LoopError{Message: fmt.Sprintf("Worker worktree is dirty for branch %s", created.Branch), Kind: runpipe.FailureManualIntervention}
 		}
 		if prepared.HeadSHA != "" {
 			created.HeadSHA = prepared.HeadSHA
@@ -2071,7 +2043,7 @@ func (r *Runner) runPrepareWorktreeStep(ctx context.Context, input stepInput) (w
 		// in a worktree the loop's durable state cannot account for.
 		return checkpoint, fmt.Errorf("record worktree metadata: %w", err)
 	}
-	if _, err := r.updateLoop(ctx, input.Loop, func(updated *storage.LoopRecord) { updated.MetadataJSON = stringPtr(metadataJSON) }); err != nil {
+	if _, err := r.updateLoop(ctx, input.Loop, func(updated *storage.LoopRecord) { updated.MetadataJSON = runpipe.StringPtr(metadataJSON) }); err != nil {
 		return checkpoint, fmt.Errorf("record worktree metadata: %w", err)
 	}
 	checkpoint.Worktree = &checkpointWorktree{ID: worktreeID, Path: created.WorktreePath, Branch: created.Branch, BaseBranch: baseBranch, HeadSHA: created.HeadSHA, CheckoutMode: "branch"}
@@ -2096,7 +2068,7 @@ func (r *Runner) ensureWorkerWorktreeUsable(ctx context.Context, input stepInput
 	}
 	worktreeRoot, rootErr := workerWorktreeRoot(input.Project)
 	if rootErr != nil {
-		return worktree, &loopError{message: rootErr.Error(), kind: FailureRetryableTransient}
+		return worktree, &runpipe.LoopError{Message: rootErr.Error(), Kind: runpipe.FailureRetryableTransient}
 	}
 	if err := worktreesafety.Validate(worktreesafety.CheckInput{WorktreePath: worktree.Path, RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot}); err != nil {
 		return worktree, staleWorkerWorktreeError(worktree, work, err.Error())
@@ -2113,7 +2085,7 @@ func (r *Runner) ensureWorkerWorktreeUsable(ctx context.Context, input stepInput
 			if errors.Is(gitErr, os.ErrNotExist) {
 				return worktree, staleWorkerWorktreeError(worktree, work, "path is not a usable git worktree")
 			}
-			return worktree, &loopError{message: fmt.Sprintf("Unable to inspect worker worktree git metadata at %s for branch %s: %v", worktree.Path, firstNonEmpty(worktree.Branch, work.Branch, "unknown"), gitErr), kind: FailureRetryableTransient}
+			return worktree, &runpipe.LoopError{Message: fmt.Sprintf("Unable to inspect worker worktree git metadata at %s for branch %s: %v", worktree.Path, firstNonEmpty(worktree.Branch, work.Branch, "unknown"), gitErr), Kind: runpipe.FailureRetryableTransient}
 		}
 		checkoutMode := strings.TrimSpace(worktree.CheckoutMode)
 		if checkoutMode == "" {
@@ -2128,7 +2100,7 @@ func (r *Runner) ensureWorkerWorktreeUsable(ctx context.Context, input stepInput
 			return worktree, staleWorkerWorktreeError(worktree, work, "checkpoint branch is not recorded")
 		}
 		if r.git == nil {
-			return worktree, &loopError{message: "Unable to verify worker worktree identity: git gateway is not configured", kind: FailureRetryableTransient}
+			return worktree, &runpipe.LoopError{Message: "Unable to verify worker worktree identity: git gateway is not configured", Kind: runpipe.FailureRetryableTransient}
 		}
 		if identityErr := r.git.VerifyWorktreeIdentity(ctx, VerifyWorktreeIdentityInput{
 			RepoPath:        input.Project.RepoPath,
@@ -2143,7 +2115,7 @@ func (r *Runner) ensureWorkerWorktreeUsable(ctx context.Context, input stepInput
 		return worktree, nil
 	}
 	if !errors.Is(err, os.ErrNotExist) {
-		return worktree, &loopError{message: fmt.Sprintf("Unable to inspect worker worktree path %s for branch %s: %v", worktree.Path, firstNonEmpty(worktree.Branch, work.Branch, "unknown"), err), kind: FailureRetryableTransient}
+		return worktree, &runpipe.LoopError{Message: fmt.Sprintf("Unable to inspect worker worktree path %s for branch %s: %v", worktree.Path, firstNonEmpty(worktree.Branch, work.Branch, "unknown"), err), Kind: runpipe.FailureRetryableTransient}
 	}
 	return worktree, staleWorkerWorktreeError(worktree, work, "path does not exist")
 }
@@ -2159,7 +2131,7 @@ func (r *Runner) verifyCheckpointWorktreeRecord(ctx context.Context, project sto
 	}
 	records, err := r.repos.Worktrees.ListByProject(ctx, project.ID)
 	if err != nil {
-		return &loopError{message: fmt.Sprintf("Unable to inspect worker worktree records: %v", err), kind: FailureRetryableTransient}
+		return &runpipe.LoopError{Message: fmt.Sprintf("Unable to inspect worker worktree records: %v", err), Kind: runpipe.FailureRetryableTransient}
 	}
 	for _, record := range records {
 		if record.CleanedAt != nil || record.Status == "cleaned" || record.Status == "retired" {
@@ -2183,7 +2155,7 @@ func workerWorktreeRoot(project storage.ProjectRecord) (string, error) {
 
 func staleWorkerWorktreeError(worktree checkpointWorktree, work workerInput, detail string) error {
 	branch := firstNonEmpty(worktree.Branch, work.Branch, "unknown")
-	return &loopError{message: fmt.Sprintf("Worker worktree path %s for branch %s is stale (%s). Run `git -C <repo> worktree list` to find or recreate the branch worktree, then resume the worker run.", worktree.Path, branch, detail), kind: FailureManualIntervention}
+	return &runpipe.LoopError{Message: fmt.Sprintf("Worker worktree path %s for branch %s is stale (%s). Run `git -C <repo> worktree list` to find or recreate the branch worktree, then resume the worker run.", worktree.Path, branch, detail), Kind: runpipe.FailureManualIntervention}
 }
 
 func (r *Runner) runPlanStep(input stepInput) (workerCheckpoint, error) {
@@ -2236,7 +2208,7 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 	}
 	worktreeRoot, err := workerWorktreeRoot(input.Project)
 	if err != nil {
-		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableTransient}
+		return checkpoint, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableTransient}
 	}
 	if err := captureWorkerReproduction(&checkpoint, worktree.Path); err != nil {
 		return checkpoint, err
@@ -2256,7 +2228,7 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 	// crash mid-agent cannot lose the negative observation on resume.
 	if !executionCompleted {
 		if err := r.persistCheckpoint(ctx, input.Run.ID, checkpoint); err != nil {
-			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+			return checkpoint, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
 		}
 	}
 	work = *checkpoint.Work
@@ -2341,7 +2313,7 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 		if held, summary, err := r.workerHoldSummaryForWork(ctx, input.Project, holdWork, retargetedToPullRequest); err != nil {
 			return checkpoint, err
 		} else if held {
-			return checkpoint, &holdSkipError{summary: summary}
+			return checkpoint, &runpipe.HoldSkipError{Summary: summary}
 		}
 		useSnap, snapVendor, snapModel := agentRunSnapshotFields(agentVendor, agentModel, useSnapshot)
 		var (
@@ -2406,25 +2378,25 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 				checkpoint.Execution.ProgressSnapshotError = result.PreTimeoutError
 				checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
 				if err := r.persistCheckpoint(ctx, input.Run.ID, checkpoint); err != nil {
-					return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+					return checkpoint, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
 				}
-				return checkpoint, &loopError{message: "Worker timeout progress snapshot failed: " + result.PreTimeoutError, kind: FailureManualIntervention}
+				return checkpoint, &runpipe.LoopError{Message: "Worker timeout progress snapshot failed: " + result.PreTimeoutError, Kind: runpipe.FailureManualIntervention}
 			}
 			checkpoint.ResumePolicy = "retry_from_timeout_context"
 			if err := r.persistCheckpoint(ctx, input.Run.ID, checkpoint); err != nil {
-				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+				return checkpoint, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
 			}
 			message := firstNonEmpty(result.Summary, result.Stderr, fmt.Sprintf("Worker agent %s", result.Status))
-			kind := FailureRetryableTransient
+			kind := runpipe.FailureRetryableTransient
 			if agent.IsAgentSetupFailureMessage(message) {
-				kind = FailureRetryableTransient
+				kind = runpipe.FailureRetryableTransient
 			}
-			return checkpoint, &loopError{message: message, kind: kind}
+			return checkpoint, &runpipe.LoopError{Message: message, Kind: kind}
 		}
 		if held, summary, err := r.workerHoldSummaryForWork(ctx, input.Project, holdWork, retargetedToPullRequest); err != nil {
 			return checkpoint, err
 		} else if held {
-			return checkpoint, &holdSkipError{summary: summary}
+			return checkpoint, &runpipe.HoldSkipError{Summary: summary}
 		}
 		// HITL (gated): the resumed turn completed without asking again, so the human
 		// answer that seeded it has been acted on. Flip it to "consumed" now — after
@@ -2448,7 +2420,7 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 	}
 	checkpoint.ensureLifecycle("worker", worktree.Branch, worktree.BaseBranch, work.ExecutionMode == "create-pr")
 	if err := r.persistCheckpoint(ctx, input.Run.ID, checkpoint); err != nil {
-		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+		return checkpoint, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
 	}
 	if _, err := r.reconcileWorkerGitState(ctx, &checkpoint, input.Project, work, worktree, input.Run); err != nil {
 		return checkpoint, err
@@ -2509,12 +2481,12 @@ func (r *Runner) reconcileWorkerGitState(ctx context.Context, checkpoint *worker
 	baseRef := firstNonEmpty(worktree.HeadSHA, worktree.BaseBranch)
 	worktreeRoot, rootErr := workerWorktreeRoot(project)
 	if rootErr != nil {
-		return false, &loopError{message: rootErr.Error(), kind: FailureRetryableTransient}
+		return false, &runpipe.LoopError{Message: rootErr.Error(), Kind: runpipe.FailureRetryableTransient}
 	}
 	inspect, err := r.git.InspectHead(ctx, InspectHeadInput{RepoPath: project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, BaseRef: baseRef})
 	if err != nil {
 		checkpoint.Lifecycle.LastError = err.Error()
-		return false, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+		return false, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
 	}
 	if !inspect.HasUncommittedChanges {
 		knownCommitCount := len(checkpoint.Lifecycle.CommitSHAs)
@@ -2532,23 +2504,23 @@ func (r *Runner) reconcileWorkerGitState(ctx context.Context, checkpoint *worker
 	if !r.allowAutoCommit {
 		message := fmt.Sprintf("Worker worktree has uncommitted changes before PR push for branch %s", firstNonEmpty(work.Branch, worktree.Branch))
 		checkpoint.Lifecycle.LastError = message
-		return false, &loopError{message: message, kind: FailureManualIntervention}
+		return false, &runpipe.LoopError{Message: message, Kind: runpipe.FailureManualIntervention}
 	}
 	agent, model := r.disclosureIdentity(run)
 	committed, err := r.git.Commit(ctx, CommitInput{RepoPath: project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, Message: buildWorkerFallbackCommitMessage(work), DisclosureAgent: agent, DisclosureModel: model})
 	if err != nil {
 		checkpoint.Lifecycle.LastError = err.Error()
-		return false, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+		return false, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
 	}
 	finalInspect, err := r.git.InspectHead(ctx, InspectHeadInput{RepoPath: project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, BaseRef: baseRef})
 	if err != nil {
 		checkpoint.Lifecycle.LastError = err.Error()
-		return false, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+		return false, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
 	}
 	if finalInspect.HasUncommittedChanges {
 		message := fmt.Sprintf("Worker fallback commit left uncommitted changes in branch %s", firstNonEmpty(work.Branch, worktree.Branch))
 		checkpoint.Lifecycle.LastError = message
-		return false, &loopError{message: message, kind: FailureManualIntervention}
+		return false, &runpipe.LoopError{Message: message, Kind: runpipe.FailureManualIntervention}
 	}
 	checkpoint.Lifecycle.CommitSHAs = appendUniqueStrings(checkpoint.Lifecycle.CommitSHAs, inspect.NewCommitSHAs...)
 	checkpoint.Lifecycle.CommitSHAs = appendUniqueStrings(checkpoint.Lifecycle.CommitSHAs, finalInspect.NewCommitSHAs...)
@@ -2582,7 +2554,7 @@ func (r *Runner) runValidateStep(ctx context.Context, input stepInput) (workerCh
 	}
 	worktreeRoot, err := workerWorktreeRoot(input.Project)
 	if err != nil {
-		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableTransient}
+		return checkpoint, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableTransient}
 	}
 	if err := captureWorkerReproduction(&checkpoint, worktree.Path); err != nil {
 		return checkpoint, err
@@ -2607,7 +2579,7 @@ func (r *Runner) runValidateStep(ctx context.Context, input stepInput) (workerCh
 	if !result.Passed {
 		failure := classifyValidationFailure(result)
 		checkpoint.ResumePolicy = failure.resumePolicy
-		return checkpoint, &loopError{message: failure.message, kind: failure.kind}
+		return checkpoint, &runpipe.LoopError{Message: failure.message, Kind: failure.kind}
 	}
 	reconciled, err := r.reconcileWorkerGitState(ctx, &checkpoint, input.Project, work, worktree, input.Run)
 	if err != nil {
@@ -2622,7 +2594,7 @@ func (r *Runner) runValidateStep(ctx context.Context, input stepInput) (workerCh
 		if !result.Passed {
 			failure := classifyValidationFailure(result)
 			checkpoint.ResumePolicy = failure.resumePolicy
-			return checkpoint, &loopError{message: failure.message, kind: failure.kind}
+			return checkpoint, &runpipe.LoopError{Message: failure.message, Kind: failure.kind}
 		}
 		if err := verifyWorkerReproduction(checkpoint, worktree.Path); err != nil {
 			return checkpoint, err
@@ -2637,7 +2609,7 @@ func (r *Runner) runValidateStep(ctx context.Context, input stepInput) (workerCh
 		}
 		if inspect.HasUncommittedChanges {
 			checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
-			return checkpoint, &loopError{message: "Validation keeps producing uncommitted changes after an extra reconcile pass", kind: FailureManualIntervention}
+			return checkpoint, &runpipe.LoopError{Message: "Validation keeps producing uncommitted changes after an extra reconcile pass", Kind: runpipe.FailureManualIntervention}
 		}
 	}
 	worktreeRoot, rootErr := workerWorktreeRoot(input.Project)
@@ -2650,7 +2622,7 @@ func (r *Runner) runValidateStep(ctx context.Context, input stepInput) (workerCh
 	}
 	if inspect.HasUncommittedChanges {
 		checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
-		return checkpoint, &loopError{message: "Validation left uncommitted changes after reconcile", kind: FailureManualIntervention}
+		return checkpoint, &runpipe.LoopError{Message: "Validation left uncommitted changes after reconcile", Kind: runpipe.FailureManualIntervention}
 	}
 	result.HeadSHA = inspect.HeadSHA
 	checkpoint.Validation = &result
@@ -2669,12 +2641,12 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 	if held, summary, err := r.workerHoldSummaryForWork(ctx, input.Project, holdWork, retargetedToPullRequest); err != nil {
 		return checkpoint, err
 	} else if held {
-		return checkpoint, &holdSkipError{summary: summary}
+		return checkpoint, &runpipe.HoldSkipError{Summary: summary}
 	}
 	if checkpoint.Validation != nil && !checkpoint.Validation.Passed {
 		failure := classifyValidationFailure(*checkpoint.Validation)
 		checkpoint.ResumePolicy = failure.resumePolicy
-		return checkpoint, &loopError{message: failure.message, kind: failure.kind}
+		return checkpoint, &runpipe.LoopError{Message: failure.message, Kind: failure.kind}
 	}
 	worktree, err := requireWorktree(checkpoint)
 	if err != nil {
@@ -2686,7 +2658,7 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 	}
 	worktreeRoot, err := workerWorktreeRoot(input.Project)
 	if err != nil {
-		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableTransient}
+		return checkpoint, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableTransient}
 	}
 	if err := captureWorkerReproduction(&checkpoint, worktree.Path); err != nil {
 		return checkpoint, err
@@ -2724,7 +2696,7 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 		if !result.Passed {
 			failure := classifyValidationFailure(result)
 			checkpoint.ResumePolicy = failure.resumePolicy
-			return checkpoint, &loopError{message: failure.message, kind: failure.kind}
+			return checkpoint, &runpipe.LoopError{Message: failure.message, Kind: failure.kind}
 		}
 		worktreeRoot, rootErr := workerWorktreeRoot(input.Project)
 		if rootErr != nil {
@@ -2736,7 +2708,7 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 		}
 		if inspect.HasUncommittedChanges {
 			checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
-			return checkpoint, &loopError{message: "Validation produced uncommitted changes immediately before publishing", kind: FailureManualIntervention}
+			return checkpoint, &runpipe.LoopError{Message: "Validation produced uncommitted changes immediately before publishing", Kind: runpipe.FailureManualIntervention}
 		}
 		result.HeadSHA = inspect.HeadSHA
 		checkpoint.Validation = &result
@@ -2764,25 +2736,25 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 		}
 	}
 	if err := r.persistCheckpoint(ctx, input.Run.ID, checkpoint); err != nil {
-		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+		return checkpoint, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
 	}
 	if work.ExecutionMode == "create-pr" && checkpoint.PullRequest == nil {
 		pr, branch, ok, err := r.lifecycleAgentCreatedPullRequest(ctx, input.Loop.ID, work.Repo, checkpoint.Lifecycle, worktree.Branch, work.BaseBranch, input.Project.RepoPath)
 		if err != nil {
-			var loopErr *loopError
+			var loopErr *runpipe.LoopError
 			if errors.As(err, &loopErr) {
 				if input.Loop.PRNumber != nil {
 					loopErr = nil
 				} else {
-					if loopErr.kind == FailureManualIntervention {
-						checkpoint.SkipReason = loopErr.message
+					if loopErr.Kind == runpipe.FailureManualIntervention {
+						checkpoint.SkipReason = loopErr.Message
 						checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
 					}
 					return checkpoint, loopErr
 				}
 			}
 			if err != nil && input.Loop.PRNumber == nil {
-				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+				return checkpoint, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
 			}
 		}
 		if ok {
@@ -2793,7 +2765,7 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 	if held, summary, err := r.workerHoldSummaryForWork(ctx, input.Project, holdWork, retargetedToPullRequest); err != nil {
 		return checkpoint, err
 	} else if held {
-		return checkpoint, &holdSkipError{summary: summary}
+		return checkpoint, &runpipe.HoldSkipError{Summary: summary}
 	}
 	if work.ExecutionMode == "create-pr" && (checkpoint.PullRequest != nil || input.Loop.PRNumber != nil) {
 		if checkpoint.PullRequest == nil {
@@ -2807,7 +2779,7 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 				message := fmt.Sprintf("Auto push disabled; manual PR opening required for worker %s", input.Loop.ID)
 				checkpoint.SkipReason = message
 				checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
-				return checkpoint, &loopError{message: message, kind: FailureManualIntervention}
+				return checkpoint, &runpipe.LoopError{Message: message, Kind: runpipe.FailureManualIntervention}
 			}
 			worktreeRoot, rootErr := workerWorktreeRoot(input.Project)
 			if rootErr != nil {
@@ -2822,7 +2794,7 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 				expectedRemoteHeadSHA = strings.TrimSpace(checkpoint.PullRequest.HeadSHA)
 			}
 			if err := r.git.Push(ctx, PushInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, Branch: publishBranch, LocalHeadSHA: validatedHeadSHA, ExpectedRemoteHeadSHA: expectedRemoteHeadSHA, ProtectedBranches: compactStrings([]string{work.BaseBranch})}); err != nil {
-				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+				return checkpoint, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
 			}
 			checkpoint.PullRequest.HeadSHA = validatedHeadSHA
 			pushedByFallback = true
@@ -2833,7 +2805,7 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 		if held, summary, err := r.workerHoldSummaryForWork(ctx, input.Project, holdWork, retargetedToPullRequest); err != nil {
 			return checkpoint, err
 		} else if held {
-			return checkpoint, &holdSkipError{summary: summary}
+			return checkpoint, &runpipe.HoldSkipError{Summary: summary}
 		}
 		if shouldPersistPullRequestReference(input.Loop, *checkpoint.PullRequest) {
 			if err := r.persistPullRequestReference(ctx, input.Loop, input.QueueItem, work.Repo, *checkpoint.PullRequest); err != nil {
@@ -2841,7 +2813,7 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 			}
 		}
 		if err := r.normalizePullRequestDisclosure(ctx, input.Run, work.Repo, checkpoint.PullRequest.Number, input.Project.RepoPath, checkpoint.Lifecycle != nil && checkpoint.Lifecycle.Actions.PR == lifecycle.ActionSourceAgent); err != nil {
-			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+			return checkpoint, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
 		}
 		checkpoint.ResumePolicy = "advance_from_checkpoint"
 		r.syncIssueClaim(ctx, input, &checkpoint, issueClaimStatusPRLinked, "")
@@ -2852,14 +2824,14 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 			message := fmt.Sprintf("Auto push disabled; manual PR opening required for worker %s", input.Loop.ID)
 			checkpoint.SkipReason = message
 			checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
-			return checkpoint, &loopError{message: message, kind: FailureManualIntervention}
+			return checkpoint, &runpipe.LoopError{Message: message, Kind: runpipe.FailureManualIntervention}
 		}
 		worktreeRoot, rootErr := workerWorktreeRoot(input.Project)
 		if rootErr != nil {
 			return checkpoint, rootErr
 		}
 		if err := r.git.Push(ctx, PushInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, Branch: firstNonEmpty(work.Branch, worktree.Branch), LocalHeadSHA: workerValidatedHeadSHA(checkpoint, validationCommands), ProtectedBranches: compactStrings([]string{work.BaseBranch})}); err != nil {
-			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+			return checkpoint, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
 		}
 		prURL := stringFromAnyDefault(parseJSONObject(input.Loop.MetadataJSON)["prUrl"])
 		checkpoint.PullRequest = &checkpointPullPR{Number: work.PRNumber, URL: prURL}
@@ -2867,11 +2839,11 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 		if held, summary, err := r.workerHoldSummaryForWork(ctx, input.Project, holdWork, retargetedToPullRequest); err != nil {
 			return checkpoint, err
 		} else if held {
-			return checkpoint, &holdSkipError{summary: summary}
+			return checkpoint, &runpipe.HoldSkipError{Summary: summary}
 		}
 		_ = r.renamePlannerSpecPullRequestAfterTakeover(ctx, work, input.Project.RepoPath)
 		if err := r.normalizePullRequestDisclosure(ctx, input.Run, work.Repo, work.PRNumber, input.Project.RepoPath, false); err != nil {
-			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+			return checkpoint, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
 		}
 		if len(work.Reviewers) > 0 && work.PRNumber > 0 && r.github != nil {
 			_ = r.github.AddPullRequestReviewers(ctx, PullRequestReviewersInput{Repo: work.Repo, PRNumber: work.PRNumber, Reviewers: append([]string(nil), work.Reviewers...), CWD: input.Project.RepoPath})
@@ -2889,13 +2861,13 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 		message := fmt.Sprintf("GitHub CLI unavailable; PR opening is manual for worker %s", input.Loop.ID)
 		checkpoint.SkipReason = message
 		checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
-		return checkpoint, &loopError{message: message, kind: FailureManualIntervention}
+		return checkpoint, &runpipe.LoopError{Message: message, Kind: runpipe.FailureManualIntervention}
 	}
 	if !r.allowAutoPush {
 		message := fmt.Sprintf("Auto push disabled; manual PR opening required for worker %s", input.Loop.ID)
 		checkpoint.SkipReason = message
 		checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
-		return checkpoint, &loopError{message: message, kind: FailureManualIntervention}
+		return checkpoint, &runpipe.LoopError{Message: message, Kind: runpipe.FailureManualIntervention}
 	}
 	aliases := buildWorkerBranchAliases(work, input.Loop.ID)
 	worktreeRoot, rootErr := workerWorktreeRoot(input.Project)
@@ -2907,7 +2879,7 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 			if shouldRestartWorkerFromDiscoverAfterPushFailure(err) {
 				checkpoint.ResumePolicy = loops.ResumePolicyRestartFromDiscover
 			}
-			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+			return checkpoint, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
 		}
 		checkpoint.PullRequest = &checkpointPullPR{Number: existing.Number, URL: existing.URL}
 		checkpoint.markLifecyclePushAndPR(firstNonEmpty(existing.HeadRefName, worktree.Branch), work.BaseBranch, existing.Number, existing.URL, true, true)
@@ -2915,11 +2887,11 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 		if held, summary, err := r.workerHoldSummaryForWork(ctx, input.Project, adoptedWork, true); err != nil {
 			return checkpoint, err
 		} else if held {
-			return checkpoint, &holdSkipError{summary: summary}
+			return checkpoint, &runpipe.HoldSkipError{Summary: summary}
 		}
 		_ = r.assignReviewersIfNeeded(ctx, work, existing.Number, input.Project.RepoPath)
 		if err := r.normalizePullRequestDisclosure(ctx, input.Run, work.Repo, existing.Number, input.Project.RepoPath, true); err != nil {
-			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+			return checkpoint, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
 		}
 		if err := r.persistPullRequestReference(ctx, input.Loop, input.QueueItem, work.Repo, checkpointPullPR{Number: existing.Number, URL: existing.URL}); err != nil {
 			return checkpoint, err
@@ -2932,13 +2904,13 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 		if shouldRestartWorkerFromDiscoverAfterPushFailure(err) {
 			checkpoint.ResumePolicy = loops.ResumePolicyRestartFromDiscover
 		}
-		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+		return checkpoint, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
 	}
 	checkpoint.markLifecyclePushAndPR(worktree.Branch, work.BaseBranch, 0, "", true, false)
 	if held, summary, err := r.workerHoldSummaryForWork(ctx, input.Project, holdWork, retargetedToPullRequest); err != nil {
 		return checkpoint, err
 	} else if held {
-		return checkpoint, &holdSkipError{summary: summary}
+		return checkpoint, &runpipe.HoldSkipError{Summary: summary}
 	}
 	ahead, err := r.workerBranchAheadOfBase(ctx, input.Project, work, worktree)
 	if err != nil {
@@ -2956,11 +2928,11 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 		} else if held {
 			checkpoint.PullRequest = &checkpointPullPR{Number: existing.Number, URL: existing.URL}
 			checkpoint.markLifecyclePushAndPR(firstNonEmpty(existing.HeadRefName, worktree.Branch), work.BaseBranch, existing.Number, existing.URL, true, true)
-			return checkpoint, &holdSkipError{summary: summary}
+			return checkpoint, &runpipe.HoldSkipError{Summary: summary}
 		}
 		_ = r.assignReviewersIfNeeded(ctx, work, existing.Number, input.Project.RepoPath)
 		if err := r.normalizePullRequestDisclosure(ctx, input.Run, work.Repo, existing.Number, input.Project.RepoPath, true); err != nil {
-			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+			return checkpoint, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
 		}
 		if err := r.persistPullRequestReference(ctx, input.Loop, input.QueueItem, work.Repo, checkpointPullPR{Number: existing.Number, URL: existing.URL}); err != nil {
 			return checkpoint, err
@@ -2978,10 +2950,10 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 		CWD:  input.Project.RepoPath, DisclosureAgent: disclosureAgent, DisclosureModel: disclosureModel,
 	})
 	if err != nil {
-		return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+		return checkpoint, &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
 	}
 	if created.Number <= 0 {
-		return checkpoint, &loopError{message: "Worker create-pr requires a pull request number", kind: FailureRetryableAfterResume}
+		return checkpoint, &runpipe.LoopError{Message: "Worker create-pr requires a pull request number", Kind: runpipe.FailureRetryableAfterResume}
 	}
 	pr := checkpointPullPR{Number: created.Number, URL: created.URL}
 	createdWork := workerWorkForPullRequest(work, PullRequestSummary{Number: created.Number, URL: created.URL, HeadRefName: worktree.Branch, BaseRefName: work.BaseBranch})
@@ -2990,7 +2962,7 @@ func (r *Runner) runOpenPRStep(ctx context.Context, input stepInput) (workerChec
 	} else if held {
 		checkpoint.PullRequest = &pr
 		checkpoint.markLifecyclePushAndPR(worktree.Branch, work.BaseBranch, created.Number, created.URL, true, false)
-		return checkpoint, &holdSkipError{summary: summary}
+		return checkpoint, &runpipe.HoldSkipError{Summary: summary}
 	}
 	_ = r.assignReviewersIfNeeded(ctx, work, created.Number, input.Project.RepoPath)
 	if err := r.persistPullRequestReference(ctx, input.Loop, input.QueueItem, work.Repo, pr); err != nil {
@@ -3083,28 +3055,28 @@ func workerWorkForPullRequest(work workerInput, pr PullRequestSummary) workerInp
 	return work
 }
 
-func (r *Runner) finishHeldWorkerQueueItem(ctx context.Context, project storage.ProjectRecord, loop storage.LoopRecord, run *storage.RunRecord, queueItem storage.QueueItemRecord, checkpoint workerCheckpoint, summary string) (ProcessResult, error) {
+func (r *Runner) finishHeldWorkerQueueItem(ctx context.Context, project storage.ProjectRecord, loop storage.LoopRecord, run *storage.RunRecord, queueItem storage.QueueItemRecord, checkpoint workerCheckpoint, summary string) (runpipe.ProcessResult, error) {
 	checkpoint.SkipReason = summary
 	checkpoint.ResumePolicy = loops.ResumePolicyAdvanceFromCheckpoint
 	if run != nil {
 		finishedAt := r.nowISO()
 		completed := completedRunRecord(*run, "success", summary, "", checkpoint, finishedAt)
 		if err := storage.FinalizeWorkerSuccess(ctx, r.db, storage.WorkerSuccessFinalizationInput{Run: completed, QueueItemID: queueItem.ID, LoopID: loop.ID, LoopStatus: "queued", FinishedAt: finishedAt}); err != nil {
-			return ProcessResult{}, err
+			return runpipe.ProcessResult{}, err
 		}
 	} else {
 		if err := r.repos.Queue.Complete(ctx, queueItem.ID, r.nowISO()); err != nil && !errors.Is(err, storage.ErrQueueItemNotActive) {
-			return ProcessResult{}, err
+			return runpipe.ProcessResult{}, err
 		}
 		if _, err := r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
 			updated.Status = "queued"
-			updated.LastRunAt = stringPtr(r.nowISO())
+			updated.LastRunAt = runpipe.StringPtr(r.nowISO())
 			updated.NextRunAt = nil
 		}); err != nil {
-			return ProcessResult{}, err
+			return runpipe.ProcessResult{}, err
 		}
 	}
-	result := ProcessResult{LoopID: loop.ID, QueueItemID: queueItem.ID, Status: "skipped", Summary: summary}
+	result := runpipe.ProcessResult{LoopID: loop.ID, QueueItemID: queueItem.ID, Status: "skipped", Summary: summary}
 	if run != nil {
 		result.RunID = run.ID
 	}
@@ -3141,13 +3113,13 @@ func (r *Runner) resolveWorkerInput(ctx context.Context, project storage.Project
 		work.IssueNumber = parseIssueNumberFromTargetID(derefString(loop.TargetID))
 	}
 	if work.Repo == "" {
-		return workerInput{}, &loopError{message: "worker.repo is required", kind: FailureNonRetryable}
+		return workerInput{}, &runpipe.LoopError{Message: "worker.repo is required", Kind: runpipe.FailureNonRetryable}
 	}
 	if work.BaseBranch == "" {
-		return workerInput{}, &loopError{message: "worker.baseBranch is required", kind: FailureNonRetryable}
+		return workerInput{}, &runpipe.LoopError{Message: "worker.baseBranch is required", Kind: runpipe.FailureNonRetryable}
 	}
 	if work.ExecutionMode == "create-pr" && work.Prompt == "" && work.SpecPath == "" && work.IssueNumber == 0 {
-		return workerInput{}, &loopError{message: "worker.prompt or worker.specPath is required", kind: FailureNonRetryable}
+		return workerInput{}, &runpipe.LoopError{Message: "worker.prompt or worker.specPath is required", Kind: runpipe.FailureNonRetryable}
 	}
 	if work.ExecutionMode == "create-pr" && work.IssueNumber > 0 && r.github != nil {
 		lookupRepo := issueLookupRepo(work)
@@ -3159,7 +3131,7 @@ func (r *Runner) resolveWorkerInput(ctx context.Context, project storage.Project
 		if networkpolicy.IsRouted(policy.RoutedClaimPolicy) {
 			decision := networkpolicy.EvaluateWorker(policy.RoutedClaimPolicy, issue.Labels, issue.AssigneeUsers)
 			if !decision.Allowed {
-				return workerInput{}, &loopError{message: fmt.Sprintf("Skipped routed worker claim for %s#%d: %s", lookupRepo, work.IssueNumber, decision.Reason), kind: FailureManualIntervention}
+				return workerInput{}, &runpipe.LoopError{Message: fmt.Sprintf("Skipped routed worker claim for %s#%d: %s", lookupRepo, work.IssueNumber, decision.Reason), Kind: runpipe.FailureManualIntervention}
 			}
 			work.RoutedClaimMatchMode = string(decision.MatchMode)
 		}
@@ -3174,7 +3146,7 @@ func (r *Runner) resolveWorkerInput(ctx context.Context, project storage.Project
 		repo := firstNonEmpty(derefString(loop.Repo), work.Repo)
 		prNumber := firstNonZero(derefInt64(loop.PRNumber), work.PRNumber)
 		if repo == "" || prNumber == 0 {
-			return workerInput{}, &loopError{message: "pull_request worker loop requires repo and prNumber", kind: FailureNonRetryable}
+			return workerInput{}, &runpipe.LoopError{Message: "pull_request worker loop requires repo and prNumber", Kind: runpipe.FailureNonRetryable}
 		}
 		detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: project.RepoPath})
 		if err != nil {
@@ -3195,7 +3167,7 @@ func (r *Runner) resolveWorkerInput(ctx context.Context, project storage.Project
 		// the prompt directly when no spec path is present. Stop for manual
 		// intervention only when neither is available.
 		if work.SpecPath == "" && strings.TrimSpace(work.Prompt) == "" {
-			return workerInput{}, &loopError{message: fmt.Sprintf("No explicit spec path or prompt found for %s#%d", repo, prNumber), kind: FailureManualIntervention}
+			return workerInput{}, &runpipe.LoopError{Message: fmt.Sprintf("No explicit spec path or prompt found for %s#%d", repo, prNumber), Kind: runpipe.FailureManualIntervention}
 		}
 	}
 	return work, nil
@@ -3259,8 +3231,8 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 		resumedCheckpoint = rewindCheckpointForExecuteRetry(checkpoint)
 	}
 	nowISO := r.nowISO()
-	encoded := mustMarshalJSON(workerCheckpoint{ResumePolicy: ternary(resumed, "advance_from_checkpoint", "replay_step"), Work: resumedCheckpoint.Work, ClaimedLockKey: resumedCheckpoint.ClaimedLockKey, Worktree: resumedCheckpoint.Worktree, Plan: resumedCheckpoint.Plan, Execution: resumedCheckpoint.Execution, Lifecycle: resumedCheckpoint.Lifecycle, ReproductionBaseline: resumedCheckpoint.ReproductionBaseline, Validation: resumedCheckpoint.Validation, PullRequest: resumedCheckpoint.PullRequest, SkipReason: resumedCheckpoint.SkipReason})
-	run := storage.RunRecord{ID: eventlog.NewEventID("run"), LoopID: loop.ID, Status: "running", CurrentStep: stringPtr(string(startStep)), LastCompletedStep: nil, CheckpointJSON: &encoded, StartedAt: nowISO, LastHeartbeatAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
+	encoded := runpipe.MustMarshalJSON(workerCheckpoint{ResumePolicy: ternary(resumed, "advance_from_checkpoint", "replay_step"), Work: resumedCheckpoint.Work, ClaimedLockKey: resumedCheckpoint.ClaimedLockKey, Worktree: resumedCheckpoint.Worktree, Plan: resumedCheckpoint.Plan, Execution: resumedCheckpoint.Execution, Lifecycle: resumedCheckpoint.Lifecycle, ReproductionBaseline: resumedCheckpoint.ReproductionBaseline, Validation: resumedCheckpoint.Validation, PullRequest: resumedCheckpoint.PullRequest, SkipReason: resumedCheckpoint.SkipReason})
+	run := storage.RunRecord{ID: eventlog.NewEventID("run"), LoopID: loop.ID, Status: "running", CurrentStep: runpipe.StringPtr(string(startStep)), LastCompletedStep: nil, CheckpointJSON: &encoded, StartedAt: nowISO, LastHeartbeatAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
 	// replaysAgentStep must reflect whether an agent process will actually
 	// run under the gate, not just whether the workflow reaches execute. A
 	// manual-hold resume (failed + manual_intervention policy) restarts at
@@ -3294,36 +3266,12 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 }
 
 func (r *Runner) persistStepStarted(ctx context.Context, run storage.RunRecord, step WorkerStep, checkpoint workerCheckpoint) (storage.RunRecord, error) {
-	updated := run
-	nowISO := r.nowISO()
-	updated.CurrentStep = stringPtr(string(step))
-	encoded := mustMarshalJSON(checkpoint)
-	updated.CheckpointJSON = &encoded
-	updated.LastHeartbeatAt = &nowISO
-	updated.UpdatedAt = nowISO
-	if err := r.repos.Runs.Upsert(ctx, updated); err != nil {
-		return storage.RunRecord{}, err
-	}
-	return updated, nil
+	return runpipe.PersistStepStarted(ctx, r.repos, r.nowISO(), run, string(step), checkpoint)
 }
 
 func (r *Runner) persistStepCompleted(ctx context.Context, run storage.RunRecord, step WorkerStep, checkpoint workerCheckpoint) (storage.RunRecord, error) {
-	updated := run
-	nowISO := r.nowISO()
-	if next := workflow.Next(step); next != "" {
-		updated.CurrentStep = stringPtr(string(next))
-	} else {
-		updated.CurrentStep = nil
-	}
-	updated.LastCompletedStep = stringPtr(string(step))
-	encoded := mustMarshalJSON(checkpoint)
-	updated.CheckpointJSON = &encoded
-	updated.LastHeartbeatAt = &nowISO
-	updated.UpdatedAt = nowISO
-	if err := r.repos.Runs.Upsert(ctx, updated); err != nil {
-		return storage.RunRecord{}, err
-	}
-	return updated, nil
+	next := workflow.Next(step)
+	return runpipe.PersistStepCompleted(ctx, r.repos, r.nowISO(), run, string(step), string(next), checkpoint)
 }
 
 func (r *Runner) persistCheckpoint(ctx context.Context, runID string, checkpoint workerCheckpoint) error {
@@ -3338,7 +3286,7 @@ func (r *Runner) persistCheckpoint(ctx context.Context, runID string, checkpoint
 		return fmt.Errorf("run not found: %s", runID)
 	}
 	nowISO := r.nowISO()
-	encoded := mustMarshalJSON(checkpoint)
+	encoded := runpipe.MustMarshalJSON(checkpoint)
 	run.CheckpointJSON = &encoded
 	run.LastHeartbeatAt = &nowISO
 	run.UpdatedAt = nowISO
@@ -3346,24 +3294,19 @@ func (r *Runner) persistCheckpoint(ctx context.Context, runID string, checkpoint
 }
 
 func (r *Runner) completeRun(ctx context.Context, run storage.RunRecord, status, summary, errorMessage string, checkpoint workerCheckpoint) (storage.RunRecord, error) {
-	endedAt := r.nowISO()
-	updated := completedRunRecord(run, status, summary, errorMessage, checkpoint, endedAt)
-	if err := r.repos.Runs.Upsert(ctx, updated); err != nil {
-		return storage.RunRecord{}, err
-	}
-	return updated, nil
+	return runpipe.CompleteRun(ctx, r.repos, r.nowISO(), run, status, summary, errorMessage, checkpoint)
 }
 
 func completedRunRecord(run storage.RunRecord, status, summary, errorMessage string, checkpoint workerCheckpoint, endedAt string) storage.RunRecord {
 	updated := run
 	updated.Status = status
 	if summary != "" {
-		updated.Summary = stringPtr(summary)
+		updated.Summary = runpipe.StringPtr(summary)
 	}
 	if errorMessage != "" {
-		updated.ErrorMessage = stringPtr(errorMessage)
+		updated.ErrorMessage = runpipe.StringPtr(errorMessage)
 	}
-	encoded := mustMarshalJSON(checkpoint)
+	encoded := runpipe.MustMarshalJSON(checkpoint)
 	updated.CheckpointJSON = &encoded
 	updated.EndedAt = &endedAt
 	updated.LastHeartbeatAt = &endedAt
@@ -3399,14 +3342,14 @@ func (r *Runner) finalizeSuccessfulClaim(ctx context.Context, run storage.RunRec
 	return completed, nil
 }
 
-func (r *Runner) finalizePriorSuccessfulClaim(ctx context.Context, loop storage.LoopRecord, queueItem storage.QueueItemRecord) (ProcessResult, bool, error) {
+func (r *Runner) finalizePriorSuccessfulClaim(ctx context.Context, loop storage.LoopRecord, queueItem storage.QueueItemRecord) (runpipe.ProcessResult, bool, error) {
 	latestRun, err := r.repos.Runs.GetLatestByLoopID(ctx, loop.ID)
 	if err != nil || latestRun == nil || !IsSuccessfulClaimFinalizationCandidate(*latestRun) || !CanFinalizeSuccessfulClaim(queueItem, *latestRun, loop.Status) {
-		return ProcessResult{}, false, err
+		return runpipe.ProcessResult{}, false, err
 	}
 	checkpoint, err := parseCheckpoint(latestRun.CheckpointJSON)
 	if err != nil {
-		return ProcessResult{}, false, err
+		return runpipe.ProcessResult{}, false, err
 	}
 	summary := derefString(latestRun.Summary)
 	if summary == "" {
@@ -3414,10 +3357,10 @@ func (r *Runner) finalizePriorSuccessfulClaim(ctx context.Context, loop storage.
 	}
 	completed, err := r.finalizeSuccessfulClaim(ctx, *latestRun, queueItem, loop, checkpoint, summary)
 	if err != nil {
-		return ProcessResult{}, true, err
+		return runpipe.ProcessResult{}, true, err
 	}
 	status := statusForCheckpoint(checkpoint)
-	return ProcessResult{LoopID: loop.ID, RunID: completed.ID, QueueItemID: queueItem.ID, Status: status, Summary: summary, PullRequestNumber: pullRequestNumber(checkpoint.PullRequest)}, true, nil
+	return runpipe.ProcessResult{LoopID: loop.ID, RunID: completed.ID, QueueItemID: queueItem.ID, Status: status, Summary: summary, PullRequestNumber: pullRequestNumber(checkpoint.PullRequest)}, true, nil
 }
 
 // CanFinalizeSuccessfulClaim prevents a later queue generation from being
@@ -3515,7 +3458,7 @@ func (r *Runner) runValidation(ctx context.Context, input ValidationInput) (Vali
 
 type validationFailure struct {
 	message      string
-	kind         QueueFailureKind
+	kind         runpipe.QueueFailureKind
 	resumePolicy string
 }
 
@@ -3524,7 +3467,7 @@ func classifyValidationFailure(result ValidationResult) validationFailure {
 		policy := validation.PolicyFor(result.FailureCategory)
 		return validationFailure{
 			message:      firstNonEmpty(strings.TrimSpace(result.Summary), "Validation failed"),
-			kind:         QueueFailureKind(policy.FailureKind),
+			kind:         runpipe.QueueFailureKind(policy.FailureKind),
 			resumePolicy: policy.ResumePolicy,
 		}
 	}
@@ -3532,18 +3475,18 @@ func classifyValidationFailure(result ValidationResult) validationFailure {
 	message := firstNonEmpty(strings.TrimSpace(result.Summary), "Validation failed")
 	summary := strings.ToLower(strings.TrimSpace(result.Summary))
 	if containsAnyValidationHint(summary, []string{"dirty worktree", "uncommitted changes", "merge conflict", "conflict markers", "ambiguous repo", "unsafe repo"}) {
-		return validationFailure{message: message, kind: FailureManualIntervention, resumePolicy: loops.ResumePolicyManualIntervention}
+		return validationFailure{message: message, kind: runpipe.FailureManualIntervention, resumePolicy: loops.ResumePolicyManualIntervention}
 	}
 	if containsAnyValidationHint(summary, []string{"stale checkpoint", "stale repo", "stale repo context", "stale worktree", "head changed", "base changed", "branch changed", "out of date", "no longer matches"}) {
-		return validationFailure{message: message, kind: FailureRetryableAfterResume, resumePolicy: loops.ResumePolicyRestartFromDiscover}
+		return validationFailure{message: message, kind: runpipe.FailureRetryableAfterResume, resumePolicy: loops.ResumePolicyRestartFromDiscover}
 	}
 	if strings.HasPrefix(result.Summary, "Validation timed out:") {
-		return validationFailure{message: message, kind: FailureRetryableTransient, resumePolicy: loops.ResumePolicyReplayStep}
+		return validationFailure{message: message, kind: runpipe.FailureRetryableTransient, resumePolicy: loops.ResumePolicyReplayStep}
 	}
 	if containsAnyValidationHint(summary, []string{"command not found", "executable file not found", "connection reset", "connection refused", "temporary failure", "service unavailable", "network is unreachable", "transport error"}) {
-		return validationFailure{message: message, kind: FailureRetryableTransient, resumePolicy: loops.ResumePolicyReplayStep}
+		return validationFailure{message: message, kind: runpipe.FailureRetryableTransient, resumePolicy: loops.ResumePolicyReplayStep}
 	}
-	return validationFailure{message: message, kind: FailureManualIntervention, resumePolicy: loops.ResumePolicyManualIntervention}
+	return validationFailure{message: message, kind: runpipe.FailureManualIntervention, resumePolicy: loops.ResumePolicyManualIntervention}
 }
 
 func containsAnyValidationHint(message string, hints []string) bool {
@@ -3578,7 +3521,7 @@ func (r *Runner) activeWorkerLoopClaimingPullRequest(ctx context.Context, curren
 	}
 	loopsList, err := r.repos.Loops.List(ctx)
 	if err != nil {
-		return "", &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
+		return "", &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
 	}
 	for _, loop := range loopsList {
 		if loop.ID == currentLoopID || loop.Type != "worker" {
@@ -3628,10 +3571,10 @@ func (r *Runner) persistPullRequestReference(ctx context.Context, loop storage.L
 	updatedQueue := queueItem
 	updatedQueue.TargetType = "pull_request"
 	updatedQueue.TargetID = targetID
-	updatedQueue.Repo = stringPtr(repo)
+	updatedQueue.Repo = runpipe.StringPtr(repo)
 	updatedQueue.PRNumber = int64Ptr(pr.Number)
 	if !strings.HasPrefix(derefString(queueItem.LockKey), "issue:") {
-		updatedQueue.LockKey = stringPtr(storage.PullRequestLockKey(derefString(queueItem.ProjectID), repo, pr.Number))
+		updatedQueue.LockKey = runpipe.StringPtr(storage.PullRequestLockKey(derefString(queueItem.ProjectID), repo, pr.Number))
 	}
 	projectID := derefString(queueItem.ProjectID)
 	if projectID != "" {
@@ -3659,11 +3602,11 @@ func (r *Runner) persistPullRequestReference(ctx context.Context, loop storage.L
 			return err
 		}
 		updatedLoop := *current
-		updatedLoop.Repo = stringPtr(repo)
+		updatedLoop.Repo = runpipe.StringPtr(repo)
 		updatedLoop.TargetType = "pull_request"
-		updatedLoop.TargetID = stringPtr(targetID)
+		updatedLoop.TargetID = runpipe.StringPtr(targetID)
 		updatedLoop.PRNumber = int64Ptr(pr.Number)
-		updatedLoop.MetadataJSON = stringPtr(metadataJSON)
+		updatedLoop.MetadataJSON = runpipe.StringPtr(metadataJSON)
 		updatedLoop.UpdatedAt = nowISO
 		if err := repos.Loops.AssertIssueClaimAdmission(ctx, updatedLoop, storage.LoopForcesIssueClaimAdmission(updatedLoop)); err != nil {
 			return err
@@ -3729,7 +3672,7 @@ func (r *Runner) ensureLoopForDiscoveredIssue(ctx context.Context, project stora
 			return loopUpsertResult{}, fmt.Errorf("cannot create worker loop: issue #%d has an active human_takeover loop (%s)", issue.Number, existing.ID)
 		}
 	}
-	metadataJSON := mustMarshalJSON(workerMeta)
+	metadataJSON := runpipe.MustMarshalJSON(workerMeta)
 	loop := storage.LoopRecord{ID: eventlog.NewEventID("loop"), ProjectID: project.ID, Type: "worker", TargetType: "issue", TargetID: &targetID, Repo: &repo, Status: "queued", MetadataJSON: &metadataJSON, NextRunAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
 	published, err := r.publishDiscoveredIssueLoop(ctx, loop)
 	if err != nil {
@@ -3780,7 +3723,7 @@ func (r *Runner) enqueueDiscoveredIssue(ctx context.Context, project storage.Pro
 	if issue.PersonalAssigneeAutoAssigned {
 		payloadMap["personalProjectAutoAssigned"] = true
 	}
-	payload := mustMarshalJSON(payloadMap)
+	payload := runpipe.MustMarshalJSON(payloadMap)
 	targetID := buildIssueTargetID(repo, issue.Number)
 	lockKey := storage.IssueLockKey(project.ID, repo, issue.Number)
 	projectID := project.ID
@@ -3802,7 +3745,7 @@ func (r *Runner) wakeSchedulerAfterEnqueue() {
 	}
 }
 
-func (r *Runner) failQueueItem(ctx context.Context, queueItem storage.QueueItemRecord, kind QueueFailureKind, message string) (*storage.QueueItemRecord, error) {
+func (r *Runner) failQueueItem(ctx context.Context, queueItem storage.QueueItemRecord, kind runpipe.QueueFailureKind, message string) (*storage.QueueItemRecord, error) {
 	// Recovery can be entered after ProcessClaimedItem has already committed
 	// the queue transition but failed while reconciling the loop. Treat a
 	// terminal row as the durable result instead of trying to resurrect it (or
@@ -3823,8 +3766,8 @@ func (r *Runner) failQueueItem(ctx context.Context, queueItem storage.QueueItemR
 	}
 	nextAttempts := queueItem.Attempts + 1
 	nowISO := r.nowISO()
-	if !shouldRetryQueueFailure(kind, nextAttempts, queueItem.MaxAttempts) {
-		if err := r.repos.Queue.Fail(ctx, storage.QueueFailInput{ID: queueItem.ID, Attempts: nextAttempts, FinishedAt: nowISO, ErrorMessage: optionalString(message), ErrorKind: string(kind), UpdatedAt: nowISO}); err != nil {
+	if !runpipe.ShouldRetryQueueFailure(kind, nextAttempts, queueItem.MaxAttempts) {
+		if err := r.repos.Queue.Fail(ctx, storage.QueueFailInput{ID: queueItem.ID, Attempts: nextAttempts, FinishedAt: nowISO, ErrorMessage: runpipe.OptionalString(message), ErrorKind: string(kind), UpdatedAt: nowISO}); err != nil {
 			if recovered, getErr := r.repos.Queue.GetByID(ctx, queueItem.ID); getErr == nil && recovered != nil && (recovered.Status == "manual_intervention" || recovered.Status == "completed" || recovered.Status == "failed") {
 				return recovered, nil
 			}
@@ -3832,8 +3775,8 @@ func (r *Runner) failQueueItem(ctx context.Context, queueItem storage.QueueItemR
 		}
 		return r.repos.Queue.GetByID(ctx, queueItem.ID)
 	}
-	retryAt := eventlog.FormatJavaScriptISOString(r.now().Add(backoffDelay(r.retryBaseDelay, cappedRetryDelayAttempt(nextAttempts, queueItem.MaxAttempts))))
-	if err := r.repos.Queue.MarkRetry(ctx, storage.QueueMarkRetryInput{ID: queueItem.ID, AvailableAt: retryAt, Attempts: nextAttempts, ErrorMessage: optionalString(message), ErrorKind: string(kind), UpdatedAt: nowISO}); err != nil {
+	retryAt := eventlog.FormatJavaScriptISOString(r.now().Add(runpipe.BackoffDelayLinear(r.retryBaseDelay, runpipe.CappedRetryDelayAttempt(nextAttempts, queueItem.MaxAttempts))))
+	if err := r.repos.Queue.MarkRetry(ctx, storage.QueueMarkRetryInput{ID: queueItem.ID, AvailableAt: retryAt, Attempts: nextAttempts, ErrorMessage: runpipe.OptionalString(message), ErrorKind: string(kind), UpdatedAt: nowISO}); err != nil {
 		if recovered, getErr := r.repos.Queue.GetByID(ctx, queueItem.ID); getErr == nil && recovered != nil && (recovered.Status == "manual_intervention" || recovered.Status == "completed" || recovered.Status == "failed") {
 			return recovered, nil
 		}
@@ -3997,7 +3940,7 @@ func (r *Runner) notifyRunCompleted(ctx context.Context, input RunCompletedInput
 	}
 }
 
-func (r *Runner) notifyRecoveredRunCompleted(ctx context.Context, queueItem storage.QueueItemRecord, failure *loopError) {
+func (r *Runner) notifyRecoveredRunCompleted(ctx context.Context, queueItem storage.QueueItemRecord, failure *runpipe.LoopError) {
 	if queueItem.LoopID == nil {
 		return
 	}
@@ -4021,8 +3964,8 @@ func (r *Runner) notifyRecoveredRunCompleted(ctx context.Context, queueItem stor
 		RunID:             runID,
 		Subtitle:          runNotificationSubtitle(*loop, checkpoint),
 		Status:            "failed",
-		Summary:           failure.message,
-		FailureKind:       failure.kind,
+		Summary:           failure.Message,
+		FailureKind:       failure.Kind,
 		PullRequestNumber: pullRequestNumber(checkpoint.PullRequest),
 		PullRequestURL:    pullRequestURL(checkpoint.PullRequest),
 	})
@@ -4035,7 +3978,7 @@ func runMatchesQueueAttempt(queueItem storage.QueueItemRecord, run storage.RunRe
 	return run.StartedAt >= *queueItem.ClaimedAt
 }
 
-func buildRunCompletedInput(project storage.ProjectRecord, loop storage.LoopRecord, run storage.RunRecord, checkpoint workerCheckpoint, status string, failureKind QueueFailureKind, summary string) RunCompletedInput {
+func buildRunCompletedInput(project storage.ProjectRecord, loop storage.LoopRecord, run storage.RunRecord, checkpoint workerCheckpoint, status string, failureKind runpipe.QueueFailureKind, summary string) RunCompletedInput {
 	return RunCompletedInput{
 		ProjectID:         project.ID,
 		LoopID:            loop.ID,
@@ -4059,8 +4002,8 @@ func runNotificationSubtitle(loop storage.LoopRecord, checkpoint workerCheckpoin
 	return loop.ID
 }
 
-func shouldNotifyCompletedRun(kind QueueFailureKind, failedQueue *storage.QueueItemRecord) bool {
-	if kind == FailureManualIntervention {
+func shouldNotifyCompletedRun(kind runpipe.QueueFailureKind, failedQueue *storage.QueueItemRecord) bool {
+	if kind == runpipe.FailureManualIntervention {
 		return true
 	}
 	return failedQueue != nil && failedQueue.Status != "queued" && failedQueue.Status != "cancelled"
@@ -4082,24 +4025,14 @@ func shouldNotifyCompletedRun(kind QueueFailureKind, failedQueue *storage.QueueI
 // inlined rather than shared with those copies, which name it
 // isQueueRetryEligible; only manual_intervention is excluded, because it has
 // left the automated lane and is waiting on a human.
-func shouldRetryQueueFailure(kind QueueFailureKind, nextAttempts, maxAttempts int64) bool {
-	if kind != FailureRetryableTransient && kind != FailureRetryableAfterResume && kind != FailureNonRetryable {
-		return false
-	}
-	if maxAttempts < 0 {
-		return kind != FailureNonRetryable
-	}
-	return maxAttempts > 0 && nextAttempts < maxAttempts
-}
-
-func issueClaimStatusForFailure(checkpoint workerCheckpoint, failedQueue *storage.QueueItemRecord, kind QueueFailureKind) string {
+func issueClaimStatusForFailure(checkpoint workerCheckpoint, failedQueue *storage.QueueItemRecord, kind runpipe.QueueFailureKind) string {
 	if failedQueue != nil && failedQueue.Status == "queued" {
 		if checkpoint.PullRequest != nil && strings.TrimSpace(checkpoint.PullRequest.URL) != "" {
 			return issueClaimStatusPRLinked
 		}
 		return issueClaimStatusRunning
 	}
-	if kind == FailureManualIntervention {
+	if kind == runpipe.FailureManualIntervention {
 		return issueClaimStatusPaused
 	}
 	return issueClaimStatusFailed
@@ -4135,22 +4068,22 @@ func (r *Runner) githubCLIAutoPROpeningAvailable(ctx context.Context, repo, cwd 
 	return r.githubCLIAvailable
 }
 
-func (r *Runner) classifyFailure(err error) *loopError {
+func (r *Runner) classifyFailure(err error) *runpipe.LoopError {
 	return r.classifyFailureWithBoundary(err, failureclass.BoundaryUnknown)
 }
 
-func (r *Runner) classifyFailureWithBoundary(err error, boundary failureclass.Boundary) *loopError {
-	var typed *loopError
+func (r *Runner) classifyFailureWithBoundary(err error, boundary failureclass.Boundary) *runpipe.LoopError {
+	var typed *runpipe.LoopError
 	if errors.As(err, &typed) {
 		return typed
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return &loopError{message: err.Error(), kind: FailureRetryableTransient}
+		return &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableTransient}
 	}
 	if githubinfra.IsTransientError(err) {
-		return &loopError{message: err.Error(), kind: FailureRetryableTransient}
+		return &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableTransient}
 	}
-	return &loopError{message: err.Error(), kind: workerFailureKind(failureclass.Classify(err, failureclass.Context{Runner: failureclass.RunnerWorker, Boundary: boundary}))}
+	return &runpipe.LoopError{Message: err.Error(), Kind: workerFailureKind(failureclass.Classify(err, failureclass.Context{Runner: failureclass.RunnerWorker, Boundary: boundary}))}
 }
 
 func workerFailureBoundaryForStep(step WorkerStep) failureclass.Boundary {
@@ -4168,16 +4101,16 @@ func workerFailureBoundaryForStep(step WorkerStep) failureclass.Boundary {
 	}
 }
 
-func workerFailureKind(kind failureclass.Kind) QueueFailureKind {
+func workerFailureKind(kind failureclass.Kind) runpipe.QueueFailureKind {
 	switch kind {
 	case failureclass.RetryableTransient:
-		return FailureRetryableTransient
+		return runpipe.FailureRetryableTransient
 	case failureclass.RetryableAfterResume:
-		return FailureRetryableAfterResume
+		return runpipe.FailureRetryableAfterResume
 	case failureclass.ManualIntervention:
-		return FailureManualIntervention
+		return runpipe.FailureManualIntervention
 	default:
-		return FailureNonRetryable
+		return runpipe.FailureNonRetryable
 	}
 }
 
@@ -4205,7 +4138,7 @@ func parseCheckpoint(value *string) (workerCheckpoint, error) {
 
 func requireWork(checkpoint workerCheckpoint) (workerInput, error) {
 	if checkpoint.Work == nil {
-		return workerInput{}, &loopError{message: "missing worker input checkpoint", kind: FailureRetryableTransient}
+		return workerInput{}, &runpipe.LoopError{Message: "missing worker input checkpoint", Kind: runpipe.FailureRetryableTransient}
 	}
 	return *checkpoint.Work, nil
 }
@@ -4246,7 +4179,7 @@ func rewindCheckpointForExecuteRetry(checkpoint workerCheckpoint) workerCheckpoi
 
 func requireWorktree(checkpoint workerCheckpoint) (checkpointWorktree, error) {
 	if checkpoint.Worktree == nil {
-		return checkpointWorktree{}, &loopError{message: "missing worker worktree checkpoint", kind: FailureRetryableTransient}
+		return checkpointWorktree{}, &runpipe.LoopError{Message: "missing worker worktree checkpoint", Kind: runpipe.FailureRetryableTransient}
 	}
 	return *checkpoint.Worktree, nil
 }
@@ -4400,7 +4333,7 @@ func (r *Runner) lifecycleAgentCreatedPullRequest(ctx context.Context, currentLo
 	migratedBranch := expectedBranch != "" && headBranch != "" && !strings.EqualFold(headBranch, expectedBranch)
 	reject := func(reason string) (checkpointPullPR, string, bool, error) {
 		message := fmt.Sprintf("Agent created PR #%d on branch %s but worker could not adopt it: %s", prNumber, firstNonEmpty(headBranch, agentBranch, "unknown"), reason)
-		return checkpointPullPR{}, "", false, &loopError{message: message, kind: FailureManualIntervention}
+		return checkpointPullPR{}, "", false, &runpipe.LoopError{Message: message, Kind: runpipe.FailureManualIntervention}
 	}
 	if !migratedBranch {
 		if prState := strings.TrimSpace(detail.State); prState != "" && !strings.EqualFold(prState, "open") {
@@ -4719,10 +4652,10 @@ func hydrateWorkerInputFromIssue(work workerInput, issue IssueDetail) workerInpu
 func validateWorkerIssueTarget(repo string, issueNumber int64, issue IssueDetail) error {
 	reference := formatIssueReference(repo, issueNumber)
 	if issue.IsPullRequest {
-		return &loopError{message: fmt.Sprintf("%s is a pull request, not an issue; worker issue targets must reference an open GitHub issue", reference), kind: FailureNonRetryable}
+		return &runpipe.LoopError{Message: fmt.Sprintf("%s is a pull request, not an issue; worker issue targets must reference an open GitHub issue", reference), Kind: runpipe.FailureNonRetryable}
 	}
 	if issue.State != "" && !strings.EqualFold(issue.State, "OPEN") {
-		return &loopError{message: fmt.Sprintf("%s is %s; worker issue targets must reference an open GitHub issue", reference, strings.ToLower(issue.State)), kind: FailureNonRetryable}
+		return &runpipe.LoopError{Message: fmt.Sprintf("%s is %s; worker issue targets must reference an open GitHub issue", reference, strings.ToLower(issue.State)), Kind: runpipe.FailureNonRetryable}
 	}
 	return nil
 }
@@ -4847,7 +4780,7 @@ func stampWorkerFailedDiscoveryFingerprint(updated *storage.LoopRecord, queueIte
 	if err != nil {
 		return
 	}
-	updated.MetadataJSON = stringPtr(merged)
+	updated.MetadataJSON = runpipe.StringPtr(merged)
 }
 
 func normalizeLogin(login string) string { return strings.ToLower(strings.TrimSpace(login)) }
@@ -5030,19 +4963,11 @@ func mergeWorkerMetadata(metadata map[string]any, work workerInput) map[string]a
 			workerMeta[key] = value
 		}
 	}
-	workJSON := parseJSONObject(stringPtr(mustMarshalJSON(work)))
+	workJSON := parseJSONObject(runpipe.StringPtr(runpipe.MustMarshalJSON(work)))
 	for key, value := range workJSON {
 		workerMeta[key] = value
 	}
 	return workerMeta
-}
-
-func mustMarshalJSON(value any) string {
-	encoded, err := json.Marshal(value)
-	if err != nil {
-		return "{}"
-	}
-	return string(encoded)
 }
 
 func slugify(value string) string {
@@ -5061,27 +4986,6 @@ func slugify(value string) string {
 		}
 	}
 	return strings.Trim(string(parts), "-")
-}
-
-func backoffDelay(base time.Duration, attempts int64) time.Duration {
-	if attempts <= 0 {
-		attempts = 1
-	}
-	delay := time.Duration(attempts) * base
-	if delay > maxRetryDelay {
-		return maxRetryDelay
-	}
-	return delay
-}
-
-func cappedRetryDelayAttempt(attempts, maxAttempts int64) int64 {
-	if attempts <= 0 {
-		return 1
-	}
-	if maxAttempts > 0 && attempts > maxAttempts {
-		return maxAttempts
-	}
-	return attempts
 }
 
 func compactStrings(values []string) []string {
@@ -5199,13 +5103,6 @@ func pullRequestNumber(pr *checkpointPullPR) int64 {
 	return pr.Number
 }
 
-func optionalString(value string) *string {
-	if value == "" {
-		return nil
-	}
-	return &value
-}
-
 func (r *Runner) agentSnapshotJSONForNewRun(previous *storage.RunRecord, sticky, requireToolNetworkDenial, replaysAgentStep bool) (*string, error) {
 	var previousSnapshot *string
 	if previous != nil {
@@ -5250,8 +5147,6 @@ func agentRunSnapshotFields(vendor string, model *string, useSnapshot bool) (boo
 	// distinct from unset and ParamsForRoleVendor can strip params --model/-m.
 	return true, vendor, model
 }
-
-func stringPtr(value string) *string { return &value }
 
 func cloneStringPtr(value *string) *string {
 	if value == nil {

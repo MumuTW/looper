@@ -5,6 +5,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/MumuTW/looper/internal/loops/runpipe"
 	"github.com/MumuTW/looper/internal/storage"
 )
 
@@ -26,8 +27,8 @@ func TestProcessClaimedQueueItemParksAtomicFinalizationFailureThenConvergesWitho
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
 	lastStep := string(stepOpenPR)
-	checkpointJSON := mustMarshalJSON(workerCheckpoint{PullRequest: &checkpointPullPR{Number: 42, URL: "https://example.test/acme/looper/pull/42"}})
-	run := storage.RunRecord{ID: "run_atomic_finalization", LoopID: loop.ID, Status: "running", LastCompletedStep: &lastStep, CheckpointJSON: &checkpointJSON, StartedAt: fixture.nowISO(), LastHeartbeatAt: stringPtr(fixture.nowISO()), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	checkpointJSON := runpipe.MustMarshalJSON(workerCheckpoint{PullRequest: &checkpointPullPR{Number: 42, URL: "https://example.test/acme/looper/pull/42"}})
+	run := storage.RunRecord{ID: "run_atomic_finalization", LoopID: loop.ID, Status: "running", LastCompletedStep: &lastStep, CheckpointJSON: &checkpointJSON, StartedAt: fixture.nowISO(), LastHeartbeatAt: runpipe.StringPtr(fixture.nowISO()), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
 	if err := fixture.repos.Runs.Upsert(ctx, run); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
@@ -67,10 +68,10 @@ func TestProcessClaimedQueueItemParksAtomicFinalizationFailureThenConvergesWitho
 }
 
 func TestSuccessfulClaimRecoveryRequiresFinalStepEvidence(t *testing.T) {
-	if IsSuccessfulClaimFinalizationCandidate(storage.RunRecord{Status: "success", LastCompletedStep: stringPtr(string(stepExecute))}) {
+	if IsSuccessfulClaimFinalizationCandidate(storage.RunRecord{Status: "success", LastCompletedStep: runpipe.StringPtr(string(stepExecute))}) {
 		t.Fatal("success before open-pr must not consume an active queue claim")
 	}
-	if !IsSuccessfulClaimFinalizationCandidate(storage.RunRecord{Status: "success", LastCompletedStep: stringPtr(string(stepOpenPR))}) {
+	if !IsSuccessfulClaimFinalizationCandidate(storage.RunRecord{Status: "success", LastCompletedStep: runpipe.StringPtr(string(stepOpenPR))}) {
 		t.Fatal("success after open-pr should be recoverable")
 	}
 }

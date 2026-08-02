@@ -5,6 +5,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/MumuTW/looper/internal/loops/runpipe"
 	"github.com/MumuTW/looper/internal/storage"
 )
 
@@ -53,7 +54,7 @@ func TestFailureStreakPauseEventRequiresDurablePausedLoop(t *testing.T) {
 		LoopID:    loop.ID,
 		Status:    "failed",
 		StartedAt: fixture.nowISO(),
-		EndedAt:   stringPtr(fixture.nowISO()),
+		EndedAt:   runpipe.StringPtr(fixture.nowISO()),
 		CreatedAt: fixture.nowISO(),
 		UpdatedAt: fixture.nowISO(),
 	}

@@ -10,8 +10,8 @@ import (
 	"time"
 
 	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/loops/runpipe"
 	"github.com/MumuTW/looper/internal/storage"
-	"github.com/MumuTW/looper/internal/worker"
 )
 
 func TestAdmitOperationRefusesWhenAdmissionClosed(t *testing.T) {
@@ -269,13 +269,13 @@ type ownershipProbeWorker struct {
 	onProcess func(storage.QueueItemRecord)
 }
 
-func (s *ownershipProbeWorker) ProcessNext(context.Context, string) (*worker.ProcessResult, error) {
+func (s *ownershipProbeWorker) ProcessNext(context.Context, string) (*runpipe.ProcessResult, error) {
 	return nil, nil
 }
 
-func (s *ownershipProbeWorker) ProcessClaimedQueueItem(_ context.Context, item storage.QueueItemRecord) (*worker.ProcessResult, error) {
+func (s *ownershipProbeWorker) ProcessClaimedQueueItem(_ context.Context, item storage.QueueItemRecord) (*runpipe.ProcessResult, error) {
 	if s.onProcess != nil {
 		s.onProcess(item)
 	}
-	return &worker.ProcessResult{}, nil
+	return &runpipe.ProcessResult{}, nil
 }

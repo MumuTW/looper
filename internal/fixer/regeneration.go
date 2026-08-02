@@ -11,6 +11,7 @@ import (
 	"github.com/MumuTW/looper/internal/eventlog"
 	githubinfra "github.com/MumuTW/looper/internal/infra/github"
 	"github.com/MumuTW/looper/internal/labels"
+	"github.com/MumuTW/looper/internal/loops/runpipe"
 	"github.com/MumuTW/looper/internal/storage"
 )
 
@@ -27,7 +28,7 @@ const (
 type regenerationHandoffError struct {
 	cause      error
 	checkpoint fixerCheckpoint
-	failure    *loopError
+	failure    *runpipe.LoopError
 }
 
 func (e *regenerationHandoffError) Error() string { return e.cause.Error() }
@@ -83,24 +84,24 @@ func parseRegenerationState(metadata map[string]any) (fixerRegenerationState, bo
 	return state, true
 }
 
-func regenerationFailureFromState(state fixerRegenerationState) *loopError {
-	kind := QueueFailureKind(strings.TrimSpace(state.FailureKind))
+func regenerationFailureFromState(state fixerRegenerationState) *runpipe.LoopError {
+	kind := runpipe.QueueFailureKind(strings.TrimSpace(state.FailureKind))
 	if kind == "" {
-		kind = FailureRetryableTransient
+		kind = runpipe.FailureRetryableTransient
 	}
 	message := strings.TrimSpace(state.FailureSummary)
 	if message == "" {
 		message = "fixer terminal regeneration replay"
 	}
-	return &loopError{message: message, kind: kind}
+	return &runpipe.LoopError{Message: message, Kind: kind}
 }
 
 // handleTerminalExhaustion owns the ordered close-and-regenerate policy.  It
 // is called only after the queue row is durably terminal.  A nil callback keeps
 // standalone/test runners on the historic behavior; the runtime wires the
 // explicit Planner authority callback.
-func (r *Runner) handleTerminalExhaustion(ctx context.Context, project storage.ProjectRecord, loop storage.LoopRecord, queueItem storage.QueueItemRecord, checkpoint fixerCheckpoint, failure *loopError) (regenerationAction, error) {
-	if r.onRegenerateIssue == nil || failure == nil || failure.kind == FailureManualIntervention {
+func (r *Runner) handleTerminalExhaustion(ctx context.Context, project storage.ProjectRecord, loop storage.LoopRecord, queueItem storage.QueueItemRecord, checkpoint fixerCheckpoint, failure *runpipe.LoopError) (regenerationAction, error) {
+	if r.onRegenerateIssue == nil || failure == nil || failure.Kind == runpipe.FailureManualIntervention {
 		return regenerationNone, nil
 	}
 	bridge, ok := r.github.(RegenerationGateway)
@@ -138,10 +139,10 @@ func (r *Runner) handleTerminalExhaustion(ctx context.Context, project storage.P
 		return regenerationEscalated, nil
 	}
 	if state.FailureSummary == "" {
-		state.FailureSummary = failure.message
+		state.FailureSummary = failure.Message
 	}
 	if state.FailureKind == "" {
-		state.FailureKind = string(failure.kind)
+		state.FailureKind = string(failure.Kind)
 	}
 	if state.Attempts == 0 && queueItem.Attempts != 0 {
 		state.Attempts = queueItem.Attempts
@@ -290,7 +291,7 @@ func (r *Runner) handleTerminalExhaustion(ctx context.Context, project storage.P
 	if err := r.onRegenerateIssue(ctx, RegenerateIssueInput{
 		ProjectID: project.ID, Repo: derefString(queueItem.Repo), IssueRepo: originRepo, IssueNumber: issue.Number,
 		IssueTitle: issue.Title, IssueBody: issue.Body, IssueURL: issue.URL, IssueLabels: append([]string(nil), issue.Labels...), IssueAssignees: append([]string(nil), issue.Assignees...),
-		FailureSummary: failure.message, FailureContext: failureContext, Attempts: queueItem.Attempts, MaxAttempts: queueItem.MaxAttempts, Authority: state.Authority,
+		FailureSummary: failure.Message, FailureContext: failureContext, Attempts: queueItem.Attempts, MaxAttempts: queueItem.MaxAttempts, Authority: state.Authority,
 	}); err != nil {
 		// If planner permanently rejects the routing (e.g., archived project, held lane),
 		// escalate to human intervention instead of retrying indefinitely.
@@ -437,22 +438,22 @@ func (r *Runner) regenerationOriginFromLoop(ctx context.Context, loop storage.Lo
 	return "", 0, nil
 }
 
-func regenerationFailureContext(loop storage.LoopRecord, queueItem storage.QueueItemRecord, checkpoint fixerCheckpoint, failure *loopError) string {
-	return fmt.Sprintf("attempts=%d/%d; failure=%s; kind=%s; headSha=%s; fixItemsFingerprint=%s; loop=%s; queueItem=%s", queueItem.Attempts, queueItem.MaxAttempts, strings.TrimSpace(failure.message), failure.kind, detailHeadSHA(checkpoint.Detail), hashFixItemsState(checkpoint.FixItems), loop.ID, queueItem.ID)
+func regenerationFailureContext(loop storage.LoopRecord, queueItem storage.QueueItemRecord, checkpoint fixerCheckpoint, failure *runpipe.LoopError) string {
+	return fmt.Sprintf("attempts=%d/%d; failure=%s; kind=%s; headSha=%s; fixItemsFingerprint=%s; loop=%s; queueItem=%s", queueItem.Attempts, queueItem.MaxAttempts, strings.TrimSpace(failure.Message), failure.Kind, detailHeadSHA(checkpoint.Detail), hashFixItemsState(checkpoint.FixItems), loop.ID, queueItem.ID)
 }
 
-func buildRegenerationComment(authority string, queueItem storage.QueueItemRecord, loop storage.LoopRecord, checkpoint fixerCheckpoint, failure *loopError, issueRepo string, issueNumber int64, issueURL string) string {
+func buildRegenerationComment(authority string, queueItem storage.QueueItemRecord, loop storage.LoopRecord, checkpoint fixerCheckpoint, failure *runpipe.LoopError, issueRepo string, issueNumber int64, issueURL string) string {
 	issueRef := ""
 	if strings.TrimSpace(issueURL) != "" {
 		issueRef = " (" + strings.TrimSpace(issueURL) + ")"
 	}
-	return fmt.Sprintf("%s authority=%s -->\n\nFixer exhausted its retry budget and will close this PR before returning the originating issue to Planner.\n\n- Attempts: %d/%d\n- Failure: %s\n- Failure kind: %s\n- Head fingerprint: `%s`\n- Fix-items fingerprint: `%s`\n- Originating issue: %s#%d%s\n- Loop: `%s`", regenerationCommentMarker, authority, queueItem.Attempts, queueItem.MaxAttempts, strings.TrimSpace(failure.message), failure.kind, detailHeadSHA(checkpoint.Detail), hashFixItemsState(checkpoint.FixItems), issueRepo, issueNumber, issueRef, loop.ID)
+	return fmt.Sprintf("%s authority=%s -->\n\nFixer exhausted its retry budget and will close this PR before returning the originating issue to Planner.\n\n- Attempts: %d/%d\n- Failure: %s\n- Failure kind: %s\n- Head fingerprint: `%s`\n- Fix-items fingerprint: `%s`\n- Originating issue: %s#%d%s\n- Loop: `%s`", regenerationCommentMarker, authority, queueItem.Attempts, queueItem.MaxAttempts, strings.TrimSpace(failure.Message), failure.Kind, detailHeadSHA(checkpoint.Detail), hashFixItemsState(checkpoint.FixItems), issueRepo, issueNumber, issueRef, loop.ID)
 }
 
 func (r *Runner) markRegeneratedLoopFailed(ctx context.Context, loop storage.LoopRecord) (storage.LoopRecord, error) {
 	return r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
 		updated.Status = "failed"
-		updated.LastRunAt = stringPtr(r.nowISO())
+		updated.LastRunAt = runpipe.StringPtr(r.nowISO())
 		updated.NextRunAt = nil
 	})
 }
@@ -503,7 +504,7 @@ func (r *Runner) requeueRegenerationHandoff(ctx context.Context, loop storage.Lo
 	if _, err := r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
 		if updated.Status != "terminated" && updated.Status != string(domain.LoopStatusHumanTakeover) {
 			updated.Status = "queued"
-			updated.NextRunAt = stringPtr(queuedAt)
+			updated.NextRunAt = runpipe.StringPtr(queuedAt)
 		}
 	}); err != nil {
 		return fmt.Errorf("queue fixer regeneration replay loop: %w", err)
@@ -514,7 +515,7 @@ func (r *Runner) requeueRegenerationHandoff(ctx context.Context, loop storage.Lo
 	return nil
 }
 
-func (r *Runner) applyTerminalRegeneration(ctx context.Context, project storage.ProjectRecord, loop storage.LoopRecord, queueItem storage.QueueItemRecord, checkpoint fixerCheckpoint, failure *loopError) (storage.LoopRecord, regenerationAction, error) {
+func (r *Runner) applyTerminalRegeneration(ctx context.Context, project storage.ProjectRecord, loop storage.LoopRecord, queueItem storage.QueueItemRecord, checkpoint fixerCheckpoint, failure *runpipe.LoopError) (storage.LoopRecord, regenerationAction, error) {
 	action, err := r.handleTerminalExhaustion(ctx, project, loop, queueItem, checkpoint, failure)
 	if err != nil {
 		if replayErr := r.requeueRegenerationHandoff(ctx, loop, queueItem); replayErr != nil {

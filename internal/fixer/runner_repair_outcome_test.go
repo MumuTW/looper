@@ -9,6 +9,7 @@ import (
 
 	"github.com/MumuTW/looper/internal/agent"
 	"github.com/MumuTW/looper/internal/loops/failureclass"
+	"github.com/MumuTW/looper/internal/loops/runpipe"
 	"github.com/MumuTW/looper/internal/storage"
 )
 
@@ -23,7 +24,7 @@ func TestFixerRepairTaskOutcomeUsesStructuredAuthority(t *testing.T) {
 		name        string
 		result      AgentResult
 		wantBlocked bool
-		wantKind    QueueFailureKind
+		wantKind    runpipe.QueueFailureKind
 		wantErr     string
 	}{
 		{
@@ -34,7 +35,7 @@ func TestFixerRepairTaskOutcomeUsesStructuredAuthority(t *testing.T) {
 			name:        "blocked outcome carries the declared kind",
 			result:      AgentResult{Status: "completed", CompletionPayload: `{"outcome":"blocked","failure_kind":"manual_intervention","summary":"needs a human"}`},
 			wantBlocked: true,
-			wantKind:    FailureManualIntervention,
+			wantKind:    runpipe.FailureManualIntervention,
 		},
 		{
 			name:    "no payload at all",
@@ -71,11 +72,11 @@ func TestFixerRepairTaskOutcomeUsesStructuredAuthority(t *testing.T) {
 			t.Parallel()
 			blocked, message, kind, err := fixerRepairTaskOutcome(testCase.result)
 			if testCase.wantErr != "" {
-				if err == nil || err.message != testCase.wantErr {
+				if err == nil || err.Message != testCase.wantErr {
 					t.Fatalf("err = %v, want %q", err, testCase.wantErr)
 				}
-				if err.kind != FailureRetryableTransient {
-					t.Fatalf("err.kind = %q, want retryable_transient", err.kind)
+				if err.Kind != runpipe.FailureRetryableTransient {
+					t.Fatalf("err.Kind = %q, want retryable_transient", err.Kind)
 				}
 				return
 			}
@@ -119,7 +120,7 @@ func TestFixerRepairTaskOutcomeFallsBackToTranscript(t *testing.T) {
 		if err != nil {
 			t.Fatalf("err = %v, want the JSONL-embedded marker to be translated", err)
 		}
-		if !blocked || kind != FailureRetryableAfterResume || message != "remote head moved" {
+		if !blocked || kind != runpipe.FailureRetryableAfterResume || message != "remote head moved" {
 			t.Fatalf("(blocked, kind, message) = (%v, %q, %q), want the declared block", blocked, kind, message)
 		}
 	})
@@ -250,7 +251,7 @@ func TestFixerPromptOffersOnlyHonoredFailureKinds(t *testing.T) {
 		}
 	}
 	// Still accepted so a reporting agent is not downgraded to a contract failure.
-	if kind, ok := parseFixerBlockedFailureKind("retryable_after_resume"); !ok || kind != FailureRetryableAfterResume {
+	if kind, ok := parseFixerBlockedFailureKind("retryable_after_resume"); !ok || kind != runpipe.FailureRetryableAfterResume {
 		t.Fatalf("parseFixerBlockedFailureKind(retryable_after_resume) = (%q, %v), want it still accepted", kind, ok)
 	}
 }
@@ -289,7 +290,7 @@ func TestRepairStepHoldsCheckpointFallbackRestrictionForOperator(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
-	if result.Status != "failed" || result.FailureKind != FailureManualIntervention {
+	if result.Status != "failed" || result.FailureKind != runpipe.FailureManualIntervention {
 		t.Fatalf("result = %#v, want failed manual_intervention for checkpoint fallback restriction refusal", result)
 	}
 	queue, err := fixture.repos.Queue.GetByID(context.Background(), claim.ID)

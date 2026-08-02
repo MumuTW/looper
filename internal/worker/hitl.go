@@ -10,6 +10,7 @@ import (
 
 	"github.com/MumuTW/looper/internal/labels"
 	"github.com/MumuTW/looper/internal/loops"
+	"github.com/MumuTW/looper/internal/loops/runpipe"
 	"github.com/MumuTW/looper/internal/storage"
 )
 
@@ -331,11 +332,11 @@ func (r *Runner) detectHumanAsk(ctx context.Context, input stepInput, worktreePa
 				confidence: "low", gateEvidence: protocol.evidence,
 			}, nil
 		}
-		kind := FailureRetryableAfterResume
+		kind := runpipe.FailureRetryableAfterResume
 		if errors.Is(err, loops.ErrUnsupportedHITLGateFile) {
-			kind = FailureManualIntervention
+			kind = runpipe.FailureManualIntervention
 		}
-		return nil, &loopError{message: fmt.Sprintf("HITL ask sentinel inspection failed for loop %s: %v", input.Loop.ID, err), kind: kind}
+		return nil, &runpipe.LoopError{Message: fmt.Sprintf("HITL ask sentinel inspection failed for loop %s: %v", input.Loop.ID, err), Kind: kind}
 	}
 	if ask == nil {
 		return nil, nil
@@ -379,15 +380,15 @@ func (r *Runner) latestAgentSession(ctx context.Context, loopID string) (string,
 // run is ended as failed (createRunContext resumes failed/interrupted runs;
 // a run left running would make the retried claim start a duplicate from
 // prepare-work while the stale run stays active) and the cause is surfaced.
-func (r *Runner) abortSuspension(ctx context.Context, run storage.RunRecord, checkpoint workerCheckpoint, cause error) (ProcessResult, error) {
+func (r *Runner) abortSuspension(ctx context.Context, run storage.RunRecord, checkpoint workerCheckpoint, cause error) (runpipe.ProcessResult, error) {
 	wrapped := fmt.Errorf("persist HITL ask before suspension: %w", cause)
 	if _, err := r.completeRun(ctx, run, "failed", "", wrapped.Error(), checkpoint); err != nil {
-		return ProcessResult{}, errors.Join(wrapped, err)
+		return runpipe.ProcessResult{}, errors.Join(wrapped, err)
 	}
-	return ProcessResult{}, wrapped
+	return runpipe.ProcessResult{}, wrapped
 }
 
-func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run storage.RunRecord, checkpoint workerCheckpoint, awaiting *awaitingHumanError) (ProcessResult, error) {
+func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run storage.RunRecord, checkpoint workerCheckpoint, awaiting *awaitingHumanError) (runpipe.ProcessResult, error) {
 	nowISO := r.nowISO()
 	ask := loops.HITLAsk{
 		Question:          awaiting.question,
@@ -446,12 +447,12 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 			updated.MetadataJSON = &meta
 		}
 		updated.Status = "awaiting_human"
-		updated.LastRunAt = stringPtr(nowISO)
+		updated.LastRunAt = runpipe.StringPtr(nowISO)
 		updated.NextRunAt = nil
 	})
 	unlockRequeue()
 	if updateErr != nil {
-		return ProcessResult{}, updateErr
+		return runpipe.ProcessResult{}, updateErr
 	}
 	if askWriteErr != nil {
 		return r.abortSuspension(ctx, run, checkpoint, askWriteErr)
@@ -465,11 +466,11 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 	}
 	reason := "worker suspended awaiting human decision"
 	if _, err := r.repos.Queue.CancelByLoop(ctx, input.Loop.ID, nowISO, &reason); err != nil {
-		return ProcessResult{}, err
+		return runpipe.ProcessResult{}, err
 	}
 	summary := "Awaiting human decision: " + awaiting.question
 	if _, err := r.completeRun(ctx, run, "interrupted", summary, "", checkpoint); err != nil {
-		return ProcessResult{}, err
+		return runpipe.ProcessResult{}, err
 	}
 	// A malformed gate is persisted and parked before any default-GitHub side
 	// effect. It may be surfaced on an existing PR, but this path is forbidden
@@ -540,7 +541,7 @@ func (r *Runner) suspendForHuman(ctx context.Context, input stepInput, run stora
 			})
 		}
 	}
-	return ProcessResult{LoopID: input.Loop.ID, RunID: run.ID, QueueItemID: input.QueueItem.ID, Status: "awaiting_human", Summary: summary}, nil
+	return runpipe.ProcessResult{LoopID: input.Loop.ID, RunID: run.ID, QueueItemID: input.QueueItem.ID, Status: "awaiting_human", Summary: summary}, nil
 }
 
 // hitlTransportGitHub reports whether the GitHub PR-comment ask transport is

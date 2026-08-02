@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	gitinfra "github.com/MumuTW/looper/internal/infra/git"
+	"github.com/MumuTW/looper/internal/loops/runpipe"
 	"github.com/MumuTW/looper/internal/storage"
 	"github.com/MumuTW/looper/internal/worktreesafety"
 )
@@ -67,7 +68,7 @@ func TestRunPrepareWorktreeStepRealGatewayRemoteHeadChangedPreservesFixerDirt(t 
 	runner := New(Options{Git: adapter})
 	metadata := fmt.Sprintf(`{"worktreeRoot":%q}`, worktreeRoot)
 	checkpoint, prepErr := runner.runPrepareWorktreeStep(context.Background(), stepInput{
-		Project:  storage.ProjectRecord{ID: projectID, RepoPath: repoPath, BaseBranch: stringPtr("main"), MetadataJSON: &metadata},
+		Project:  storage.ProjectRecord{ID: projectID, RepoPath: repoPath, BaseBranch: runpipe.StringPtr("main"), MetadataJSON: &metadata},
 		Repo:     "acme/looper",
 		PRNumber: prNumber,
 		Checkpoint: reviewerCheckpoint{
@@ -142,7 +143,7 @@ func TestRunPrepareWorktreeStepRealGatewayScrubsReservedReviewerScratch(t *testi
 	runner := New(Options{Git: adapter})
 	metadata := fmt.Sprintf(`{"worktreeRoot":%q}`, worktreeRoot)
 	checkpoint, prepErr := runner.runPrepareWorktreeStep(context.Background(), stepInput{
-		Project:  storage.ProjectRecord{ID: projectID, RepoPath: repoPath, BaseBranch: stringPtr("main"), MetadataJSON: &metadata},
+		Project:  storage.ProjectRecord{ID: projectID, RepoPath: repoPath, BaseBranch: runpipe.StringPtr("main"), MetadataJSON: &metadata},
 		Repo:     "acme/looper",
 		PRNumber: prNumber,
 		Checkpoint: reviewerCheckpoint{
@@ -194,7 +195,7 @@ func TestRunPrepareWorktreeStepRealGatewayKeepsOrdinaryUntrackedDirt(t *testing.
 	runner := New(Options{Git: adapter})
 	metadata := fmt.Sprintf(`{"worktreeRoot":%q}`, worktreeRoot)
 	_, prepErr := runner.runPrepareWorktreeStep(context.Background(), stepInput{
-		Project:  storage.ProjectRecord{ID: projectID, RepoPath: repoPath, BaseBranch: stringPtr("main"), MetadataJSON: &metadata},
+		Project:  storage.ProjectRecord{ID: projectID, RepoPath: repoPath, BaseBranch: runpipe.StringPtr("main"), MetadataJSON: &metadata},
 		Repo:     "acme/looper",
 		PRNumber: prNumber,
 		Checkpoint: reviewerCheckpoint{

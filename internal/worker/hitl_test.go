@@ -12,6 +12,7 @@ import (
 
 	"github.com/MumuTW/looper/internal/labels"
 	"github.com/MumuTW/looper/internal/loops"
+	"github.com/MumuTW/looper/internal/loops/runpipe"
 	"github.com/MumuTW/looper/internal/storage"
 )
 
@@ -178,7 +179,7 @@ func TestWorkerInboxAcknowledgementPreservesConcurrentMessageForNextTurn(t *test
 				t.Fatalf("Projects.GetByID() = (%#v, %v)", project, err)
 			}
 			worktreeRoot := t.TempDir()
-			project.MetadataJSON = stringPtr(fmt.Sprintf(`{"worktreeRoot":%q}`, worktreeRoot))
+			project.MetadataJSON = runpipe.StringPtr(fmt.Sprintf(`{"worktreeRoot":%q}`, worktreeRoot))
 			if err := fixture.repos.Projects.Upsert(ctx, *project); err != nil {
 				t.Fatalf("Projects.Upsert() = %v", err)
 			}
@@ -341,7 +342,7 @@ func TestSuspendForHumanTransitionsAndNotifies(t *testing.T) {
 	if err := fixture.repos.Queue.Upsert(ctx, *queueItem); err != nil {
 		t.Fatalf("Queue.Upsert error = %v", err)
 	}
-	run := storage.RunRecord{ID: "run_worker_1", LoopID: "loop_worker_1", Status: "running", CurrentStep: stringPtr("execute"), LastCompletedStep: stringPtr("plan"), StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
+	run := storage.RunRecord{ID: "run_worker_1", LoopID: "loop_worker_1", Status: "running", CurrentStep: runpipe.StringPtr("execute"), LastCompletedStep: runpipe.StringPtr("plan"), StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
 	if err := fixture.repos.Runs.Upsert(ctx, run); err != nil {
 		t.Fatalf("Runs.Upsert error = %v", err)
 	}
@@ -440,7 +441,7 @@ func TestSuspendForHumanDeliversAskToGitHub(t *testing.T) {
 	if err := fixture.repos.Queue.Upsert(ctx, *queueItem); err != nil {
 		t.Fatalf("Queue.Upsert error = %v", err)
 	}
-	run := storage.RunRecord{ID: "run_worker_1", LoopID: "loop_worker_1", Status: "running", CurrentStep: stringPtr("execute"), StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
+	run := storage.RunRecord{ID: "run_worker_1", LoopID: "loop_worker_1", Status: "running", CurrentStep: runpipe.StringPtr("execute"), StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
 	if err := fixture.repos.Runs.Upsert(ctx, run); err != nil {
 		t.Fatalf("Runs.Upsert error = %v", err)
 	}

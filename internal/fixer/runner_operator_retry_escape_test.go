@@ -8,6 +8,7 @@ import (
 
 	"github.com/MumuTW/looper/internal/fixer/workflow"
 	"github.com/MumuTW/looper/internal/loops"
+	"github.com/MumuTW/looper/internal/loops/runpipe"
 	"github.com/MumuTW/looper/internal/storage"
 )
 
@@ -44,10 +45,10 @@ func seedParkedRun(t *testing.T, fixture *runnerFixture, seed parkedRunSeed) str
 	}); err != nil {
 		t.Fatalf("Loops.Upsert(%s) error = %v", seed.loopID, err)
 	}
-	checkpointJSON := mustMarshalJSON(seed.checkpoint)
+	checkpointJSON := runpipe.MustMarshalJSON(seed.checkpoint)
 	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{
 		ID: seed.runID, LoopID: seed.loopID, Status: seed.runStatus,
-		CurrentStep: stringPtr(string(seed.currentStep)), LastCompletedStep: stringPtr(string(seed.lastStep)),
+		CurrentStep: runpipe.StringPtr(string(seed.currentStep)), LastCompletedStep: runpipe.StringPtr(string(seed.lastStep)),
 		CheckpointJSON: &checkpointJSON, StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO,
 	}); err != nil {
 		t.Fatalf("Runs.Upsert(%s) error = %v", seed.runID, err)
@@ -274,7 +275,7 @@ func TestProcessClaimedItemCheckpointsManualInterventionParkAtRepair(t *testing.
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
-	if result.FailureKind != FailureManualIntervention {
+	if result.FailureKind != runpipe.FailureManualIntervention {
 		t.Fatalf("result = %#v, want manual-intervention failure for the missing completion contract", result)
 	}
 	run, err := fixture.repos.Runs.GetByID(context.Background(), result.RunID)

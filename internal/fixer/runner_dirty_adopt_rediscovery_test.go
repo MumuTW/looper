@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/MumuTW/looper/internal/loops/runpipe"
 	"github.com/MumuTW/looper/internal/storage"
 )
 
@@ -64,7 +65,7 @@ func TestCreateRunContextPreservesOwnerTokenAcrossPrepareProbeRediscovery(t *tes
 	}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
-	checkpointJSON := mustMarshalJSON(fixerCheckpoint{
+	checkpointJSON := runpipe.MustMarshalJSON(fixerCheckpoint{
 		Detail:   &checkpointDetail{HeadSHA: f.headSHA, HeadRefName: f.branch, BaseRefName: "main", State: "OPEN"},
 		FixItems: []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", Summary: "please fix"}},
 		// Prepare probe failed after rewind: path + ownership kept, PreparedAt empty.
@@ -74,10 +75,10 @@ func TestCreateRunContextPreservesOwnerTokenAcrossPrepareProbeRediscovery(t *tes
 		ID:             "run_failed_prepare_probe",
 		LoopID:         "loop_fixer_prepare_rediscover_owner",
 		Status:         "failed",
-		CurrentStep:    stringPtr(string(stepPrepareWorktree)),
+		CurrentStep:    runpipe.StringPtr(string(stepPrepareWorktree)),
 		CheckpointJSON: &checkpointJSON,
-		Summary:        stringPtr("error: cannot run ssh: No such file or directory"),
-		ErrorMessage:   stringPtr("error: cannot run ssh: No such file or directory"),
+		Summary:        runpipe.StringPtr("error: cannot run ssh: No such file or directory"),
+		ErrorMessage:   runpipe.StringPtr("error: cannot run ssh: No such file or directory"),
 		StartedAt:      nowISO,
 		CreatedAt:      nowISO,
 		UpdatedAt:      nowISO,

@@ -22,6 +22,7 @@ import (
 	"github.com/MumuTW/looper/internal/labels"
 	"github.com/MumuTW/looper/internal/lifecycle"
 	"github.com/MumuTW/looper/internal/loops"
+	"github.com/MumuTW/looper/internal/loops/runpipe"
 	"github.com/MumuTW/looper/internal/storage"
 	"github.com/MumuTW/looper/internal/validation"
 )
@@ -63,25 +64,25 @@ func TestBuildFixerPromptOmitsMissingAgentRuntime(t *testing.T) {
 func TestShouldRetryQueueFailureRespectsMaxAttempts(t *testing.T) {
 	t.Parallel()
 
-	if !shouldRetryQueueFailure(FailureRetryableTransient, 5, -1) {
-		t.Fatal("shouldRetryQueueFailure() = false, want true for infinite retries")
+	if !runpipe.ShouldRetryQueueFailure(runpipe.FailureRetryableTransient, 5, -1) {
+		t.Fatal("runpipe.ShouldRetryQueueFailure() = false, want true for infinite retries")
 	}
-	if shouldRetryQueueFailure(FailureNonRetryable, 5, -1) {
-		t.Fatal("shouldRetryQueueFailure() = true, want false for infinite non_retryable retries")
+	if runpipe.ShouldRetryQueueFailure(runpipe.FailureNonRetryable, 5, -1) {
+		t.Fatal("runpipe.ShouldRetryQueueFailure() = true, want false for infinite non_retryable retries")
 	}
-	if !shouldRetryQueueFailure(FailureNonRetryable, 1, 3) {
-		t.Fatal("shouldRetryQueueFailure() = false, want true for bounded non_retryable retries")
+	if !runpipe.ShouldRetryQueueFailure(runpipe.FailureNonRetryable, 1, 3) {
+		t.Fatal("runpipe.ShouldRetryQueueFailure() = false, want true for bounded non_retryable retries")
 	}
-	if shouldRetryQueueFailure(FailureRetryableTransient, 3, 3) {
-		t.Fatal("shouldRetryQueueFailure() = true, want false once nextAttempts reaches maxAttempts")
+	if runpipe.ShouldRetryQueueFailure(runpipe.FailureRetryableTransient, 3, 3) {
+		t.Fatal("runpipe.ShouldRetryQueueFailure() = true, want false once nextAttempts reaches maxAttempts")
 	}
 }
 
 func TestBackoffDelayCapsInfiniteRetryOverflow(t *testing.T) {
 	t.Parallel()
 
-	if got := backoffDelay(defaultRetryDelay, 100); got != maxRetryDelay {
-		t.Fatalf("backoffDelay(infinite retry overflow) = %v, want %v", got, maxRetryDelay)
+	if got := runpipe.BackoffDelayExponential(defaultRetryDelay, 100); got != runpipe.MaxRetryDelay {
+		t.Fatalf("runpipe.BackoffDelayExponential(infinite retry overflow) = %v, want %v", got, runpipe.MaxRetryDelay)
 	}
 }
 
@@ -353,7 +354,7 @@ func TestQueueItemRequiresLabelAuthority(t *testing.T) {
 	if queueItemRequiresLabelAuthority(storage.QueueItemRecord{DedupeKey: "fixer:loop_manual"}) {
 		t.Fatal("manual fixer queue should not require auto-discovery label authority")
 	}
-	payload := mustMarshalJSON(map[string]any{"discoveryFingerprint": buildFixerDiscoveryFingerprint("acme/looper", 42, "head-1", "hash-1")})
+	payload := runpipe.MustMarshalJSON(map[string]any{"discoveryFingerprint": buildFixerDiscoveryFingerprint("acme/looper", 42, "head-1", "hash-1")})
 	if !queueItemRequiresLabelAuthority(storage.QueueItemRecord{DedupeKey: buildFixerDedupeKey("project_1", "loop_1", "acme/looper", 42, "head-1", "hash-1"), PayloadJSON: &payload}) {
 		t.Fatal("auto-discovery fixer queue should require label authority")
 	}
@@ -534,12 +535,12 @@ func TestDiscoverPullRequestPausesExistingLoopWhenLabelsNoLongerMatch(t *testing
 	repo := "acme/looper"
 	prNumber := int64(42)
 	nowISO := fixture.nowISO()
-	payloadJSON := mustMarshalJSON(map[string]any{"discoveryFingerprint": buildFixerDiscoveryFingerprint(repo, prNumber, "head-42", "hash-1")})
+	payloadJSON := runpipe.MustMarshalJSON(map[string]any{"discoveryFingerprint": buildFixerDiscoveryFingerprint(repo, prNumber, "head-42", "hash-1")})
 	loop := storage.LoopRecord{ID: "loop_label_gate", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "queued", NextRunAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
 	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
-	queue := storage.QueueItemRecord{ID: "queue_label_gate", ProjectID: stringPtr("project_1"), LoopID: &loop.ID, Type: "fixer", TargetType: "pull_request", TargetID: "pr:acme/looper:42", Repo: &repo, PRNumber: &prNumber, DedupeKey: "fixer:label-gate", Priority: storage.QueuePriorityFixer, Status: "queued", AvailableAt: nowISO, Attempts: 0, MaxAttempts: 3, PayloadJSON: &payloadJSON, CreatedAt: nowISO, UpdatedAt: nowISO}
+	queue := storage.QueueItemRecord{ID: "queue_label_gate", ProjectID: runpipe.StringPtr("project_1"), LoopID: &loop.ID, Type: "fixer", TargetType: "pull_request", TargetID: "pr:acme/looper:42", Repo: &repo, PRNumber: &prNumber, DedupeKey: "fixer:label-gate", Priority: storage.QueuePriorityFixer, Status: "queued", AvailableAt: nowISO, Attempts: 0, MaxAttempts: 3, PayloadJSON: &payloadJSON, CreatedAt: nowISO, UpdatedAt: nowISO}
 	if err := fixture.repos.Queue.Upsert(context.Background(), queue); err != nil {
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
@@ -590,7 +591,7 @@ func TestResumePausedLabelMismatchLoopClearsPendingRediscovery(t *testing.T) {
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
 
 	nowISO := fixture.nowISO()
-	metadata := mustMarshalJSON(map[string]any{
+	metadata := runpipe.MustMarshalJSON(map[string]any{
 		"pauseReason": labelMismatchPauseReason,
 		"pendingFixerRediscovery": map[string]any{
 			"headSha":             "head-42",
@@ -901,7 +902,7 @@ func TestDiscoverPullRequestsResumesPausedNoopResolveLoopWhenFixItemsChange(t *t
 	nowISO := fixture.nowISO()
 	loopTarget := buildPullRequestTargetID(repo, prNumber)
 	previousFixItem := FixItem{Type: "comment", ID: "c1", ThreadID: "t1", ThreadFingerprint: "c1@old"}
-	checkpointJSON := mustMarshalJSON(fixerCheckpoint{
+	checkpointJSON := runpipe.MustMarshalJSON(fixerCheckpoint{
 		ResumePolicy: loops.ResumePolicyManualIntervention,
 		Pause:        newCheckpointPause(checkpointPauseReasonNoopResolveNoNewCommits, true, "head-42", hashFixItemsState([]FixItem{previousFixItem}), []string{"t1"}),
 		Detail:       &checkpointDetail{State: "OPEN", HeadSHA: "head-42", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "old blocker"}}},
@@ -914,7 +915,7 @@ func TestDiscoverPullRequestsResumesPausedNoopResolveLoopWhenFixItemsChange(t *t
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
 	message := "manual hold recorded by structured pause reason"
-	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_paused_noop_resolve", LoopID: "loop_paused_noop_resolve", Status: "failed", CurrentStep: stringPtr(string(stepRecheck)), LastCompletedStep: stringPtr(string(stepResolveComments)), CheckpointJSON: &checkpointJSON, Summary: stringPtr(message), ErrorMessage: stringPtr(message), StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_paused_noop_resolve", LoopID: "loop_paused_noop_resolve", Status: "failed", CurrentStep: runpipe.StringPtr(string(stepRecheck)), LastCompletedStep: runpipe.StringPtr(string(stepResolveComments)), CheckpointJSON: &checkpointJSON, Summary: runpipe.StringPtr(message), ErrorMessage: runpipe.StringPtr(message), StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
 	github := &fakeGitHubGateway{
@@ -957,7 +958,7 @@ func TestDiscoverPullRequestsKeepsPausedNoopResolveLoopForSameFixItems(t *testin
 	nowISO := fixture.nowISO()
 	loopTarget := buildPullRequestTargetID(repo, prNumber)
 	fixItem := FixItem{Type: "comment", ID: "c1", ThreadID: "t1", ThreadFingerprint: "legacy:t1:c1", Summary: "same blocker"}
-	checkpointJSON := mustMarshalJSON(fixerCheckpoint{
+	checkpointJSON := runpipe.MustMarshalJSON(fixerCheckpoint{
 		ResumePolicy: loops.ResumePolicyManualIntervention,
 		Detail:       &checkpointDetail{State: "OPEN", HeadSHA: "head-42", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "same blocker"}}},
 		FixItems:     []FixItem{fixItem},
@@ -968,7 +969,7 @@ func TestDiscoverPullRequestsKeepsPausedNoopResolveLoopForSameFixItems(t *testin
 	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_paused_noop_same", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "paused", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
-	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_paused_noop_same", LoopID: "loop_paused_noop_same", Status: "failed", CurrentStep: stringPtr(string(stepRecheck)), LastCompletedStep: stringPtr(string(stepResolveComments)), CheckpointJSON: &checkpointJSON, Summary: stringPtr(noopResolveManualIntervention), ErrorMessage: stringPtr(noopResolveManualIntervention), StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_paused_noop_same", LoopID: "loop_paused_noop_same", Status: "failed", CurrentStep: runpipe.StringPtr(string(stepRecheck)), LastCompletedStep: runpipe.StringPtr(string(stepResolveComments)), CheckpointJSON: &checkpointJSON, Summary: runpipe.StringPtr(noopResolveManualIntervention), ErrorMessage: runpipe.StringPtr(noopResolveManualIntervention), StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
 	github := &fakeGitHubGateway{
@@ -1003,7 +1004,7 @@ func TestDiscoverPullRequestsKeepsPausedNoopResolveLoopWhenOnlyDeclinedThreadRem
 	activeFixItem := FixItem{Type: "comment", ID: "c1", ThreadID: "t1", ThreadFingerprint: "c1@active", Summary: "same blocker"}
 	declinedFixItem := FixItem{Type: "comment", ID: "c2", ThreadID: "t2", ThreadFingerprint: "c2@declined", Summary: "declined blocker"}
 	allFixItems := []FixItem{activeFixItem, declinedFixItem}
-	checkpointJSON := mustMarshalJSON(fixerCheckpoint{
+	checkpointJSON := runpipe.MustMarshalJSON(fixerCheckpoint{
 		ResumePolicy: loops.ResumePolicyManualIntervention,
 		Pause:        newCheckpointPause(checkpointPauseReasonNoopResolveNoNewCommits, true, "head-42", hashFixItemsState(allFixItems), []string{"t1"}),
 		Detail:       &checkpointDetail{State: "OPEN", HeadSHA: "head-42", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "threadFingerprint": "c1@active", "body": "same blocker"}, {"id": "c2", "threadId": "t2", "threadFingerprint": "c2@declined", "body": "declined blocker"}}},
@@ -1012,7 +1013,7 @@ func TestDiscoverPullRequestsKeepsPausedNoopResolveLoopWhenOnlyDeclinedThreadRem
 		Push:         &checkpointPush{Pushed: false, SkippedReason: "No new commits to push"},
 		Recheck:      &checkpointRecheck{RemainingFixItems: allFixItems},
 	})
-	metadataJSON := mustMarshalJSON(map[string]any{
+	metadataJSON := runpipe.MustMarshalJSON(map[string]any{
 		"declinedThreads": map[string]any{
 			buildDeclinedThreadFingerprint(declinedFixItem, "head-42"): map[string]any{"threadId": declinedFixItem.ThreadID},
 		},
@@ -1021,7 +1022,7 @@ func TestDiscoverPullRequestsKeepsPausedNoopResolveLoopWhenOnlyDeclinedThreadRem
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
 	message := "structured pause with declined-thread suppression"
-	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_paused_noop_declined", LoopID: "loop_paused_noop_declined", Status: "failed", CurrentStep: stringPtr(string(stepRecheck)), LastCompletedStep: stringPtr(string(stepResolveComments)), CheckpointJSON: &checkpointJSON, Summary: stringPtr(message), ErrorMessage: stringPtr(message), StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_paused_noop_declined", LoopID: "loop_paused_noop_declined", Status: "failed", CurrentStep: runpipe.StringPtr(string(stepRecheck)), LastCompletedStep: runpipe.StringPtr(string(stepResolveComments)), CheckpointJSON: &checkpointJSON, Summary: runpipe.StringPtr(message), ErrorMessage: runpipe.StringPtr(message), StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
 	github := &fakeGitHubGateway{
@@ -1054,7 +1055,7 @@ func TestDiscoverPullRequestsResumesPausedRiskyConflictLoopWhenFixItemsChange(t 
 	nowISO := fixture.nowISO()
 	loopTarget := buildPullRequestTargetID(repo, prNumber)
 	previousFixItem := FixItem{Type: "conflict", Files: []string{}}
-	checkpointJSON := mustMarshalJSON(fixerCheckpoint{
+	checkpointJSON := runpipe.MustMarshalJSON(fixerCheckpoint{
 		ResumePolicy: loops.ResumePolicyManualIntervention,
 		Pause:        newCheckpointPause(checkpointPauseReasonRiskyConflict, true, "head-42", hashFixItemsState([]FixItem{previousFixItem}), nil),
 		Detail:       &checkpointDetail{State: "OPEN", HeadSHA: "head-42", HasConflicts: true},
@@ -1065,7 +1066,7 @@ func TestDiscoverPullRequestsResumesPausedRiskyConflictLoopWhenFixItemsChange(t 
 	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_paused_risky_conflict", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "paused", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
-	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_paused_risky_conflict", LoopID: "loop_paused_risky_conflict", Status: "failed", CurrentStep: stringPtr(string(stepRepair)), LastCompletedStep: stringPtr(string(stepPrepareWorktree)), CheckpointJSON: &checkpointJSON, Summary: stringPtr(message), ErrorMessage: stringPtr(message), StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_paused_risky_conflict", LoopID: "loop_paused_risky_conflict", Status: "failed", CurrentStep: runpipe.StringPtr(string(stepRepair)), LastCompletedStep: runpipe.StringPtr(string(stepPrepareWorktree)), CheckpointJSON: &checkpointJSON, Summary: runpipe.StringPtr(message), ErrorMessage: runpipe.StringPtr(message), StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
 	github := &fakeGitHubGateway{
@@ -1102,12 +1103,12 @@ func TestDiscoverPullRequestsKeepsPausedRiskyConflictLoopForSameConflict(t *test
 	nowISO := fixture.nowISO()
 	loopTarget := buildPullRequestTargetID(repo, prNumber)
 	fixItem := FixItem{Type: "conflict", Files: []string{}}
-	checkpointJSON := mustMarshalJSON(fixerCheckpoint{ResumePolicy: loops.ResumePolicyManualIntervention, Detail: &checkpointDetail{State: "OPEN", HeadSHA: "head-42", HasConflicts: true}, FixItems: []FixItem{fixItem}, FixItemsHash: hashFixItemsState([]FixItem{fixItem})})
+	checkpointJSON := runpipe.MustMarshalJSON(fixerCheckpoint{ResumePolicy: loops.ResumePolicyManualIntervention, Detail: &checkpointDetail{State: "OPEN", HeadSHA: "head-42", HasConflicts: true}, FixItems: []FixItem{fixItem}, FixItemsHash: hashFixItemsState([]FixItem{fixItem})})
 	message := "Skipped acme/looper#42 because risky conflict fixes require manual intervention"
 	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_paused_risky_same", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "paused", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
-	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_paused_risky_same", LoopID: "loop_paused_risky_same", Status: "failed", CurrentStep: stringPtr(string(stepRepair)), LastCompletedStep: stringPtr(string(stepPrepareWorktree)), CheckpointJSON: &checkpointJSON, Summary: stringPtr(message), ErrorMessage: stringPtr(message), StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_paused_risky_same", LoopID: "loop_paused_risky_same", Status: "failed", CurrentStep: runpipe.StringPtr(string(stepRepair)), LastCompletedStep: runpipe.StringPtr(string(stepPrepareWorktree)), CheckpointJSON: &checkpointJSON, Summary: runpipe.StringPtr(message), ErrorMessage: runpipe.StringPtr(message), StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
 	github := &fakeGitHubGateway{listOpen: []PullRequestSummary{{Number: prNumber, State: "OPEN", HeadSHA: "head-42"}}, viewResponses: []PullRequestDetail{{Number: prNumber, State: "OPEN", HeadSHA: "head-42", HasConflicts: true}}}
@@ -1136,12 +1137,12 @@ func TestDiscoverPullRequestsKeepsOtherManualInterventionPausedOnNewSignal(t *te
 	prNumber := int64(42)
 	nowISO := fixture.nowISO()
 	loopTarget := buildPullRequestTargetID(repo, prNumber)
-	checkpointJSON := mustMarshalJSON(fixerCheckpoint{ResumePolicy: loops.ResumePolicyManualIntervention, Pause: newCheckpointPause(checkpointPauseReasonAutoPushDisabled, false, "", "", nil), Detail: &checkpointDetail{State: "OPEN", HeadSHA: "old-head"}})
+	checkpointJSON := runpipe.MustMarshalJSON(fixerCheckpoint{ResumePolicy: loops.ResumePolicyManualIntervention, Pause: newCheckpointPause(checkpointPauseReasonAutoPushDisabled, false, "", "", nil), Detail: &checkpointDetail{State: "OPEN", HeadSHA: "old-head"}})
 	message := "human must inspect push state"
 	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_paused_auto_push", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "paused", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
-	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_paused_auto_push", LoopID: "loop_paused_auto_push", Status: "failed", CurrentStep: stringPtr(string(stepPush)), LastCompletedStep: stringPtr(string(stepValidate)), CheckpointJSON: &checkpointJSON, Summary: stringPtr(message), ErrorMessage: stringPtr(message), StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_paused_auto_push", LoopID: "loop_paused_auto_push", Status: "failed", CurrentStep: runpipe.StringPtr(string(stepPush)), LastCompletedStep: runpipe.StringPtr(string(stepValidate)), CheckpointJSON: &checkpointJSON, Summary: runpipe.StringPtr(message), ErrorMessage: runpipe.StringPtr(message), StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
 	github := &fakeGitHubGateway{listOpen: []PullRequestSummary{{Number: prNumber, State: "OPEN", HeadSHA: "new-head"}}, viewResponses: []PullRequestDetail{{Number: prNumber, State: "OPEN", HeadSHA: "new-head", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "new blocker"}}}}}
@@ -1165,7 +1166,7 @@ func TestClassifyFixerPauseUsesStructuredReason(t *testing.T) {
 		FixItems: []FixItem{fixItem},
 	}
 	message := "totally unrelated human message"
-	run := &storage.RunRecord{Status: "failed", CurrentStep: stringPtr(string(stepRecheck)), Summary: &message, ErrorMessage: &message}
+	run := &storage.RunRecord{Status: "failed", CurrentStep: runpipe.StringPtr(string(stepRecheck)), Summary: &message, ErrorMessage: &message}
 
 	pause, ok := classifyFixerPause(run, checkpoint, nil)
 	if !ok {
@@ -1189,7 +1190,7 @@ func TestClassifyFixerPauseFallsBackToLegacyNoopMessage(t *testing.T) {
 		FixItemsHash: hashFixItemsState([]FixItem{fixItem}),
 		Recheck:      &checkpointRecheck{RemainingFixItems: []FixItem{fixItem}},
 	}
-	run := &storage.RunRecord{Status: "failed", CurrentStep: stringPtr(string(stepRecheck)), ErrorMessage: stringPtr(noopResolveManualIntervention)}
+	run := &storage.RunRecord{Status: "failed", CurrentStep: runpipe.StringPtr(string(stepRecheck)), ErrorMessage: runpipe.StringPtr(noopResolveManualIntervention)}
 
 	pause, ok := classifyFixerPause(run, checkpoint, nil)
 	if !ok {
@@ -1211,7 +1212,7 @@ func TestClassifyFixerPauseUsesLegacyFixItemsHashWhenFixItemsMissing(t *testing.
 		FixItemsHash: "legacy-fix-items-hash",
 		Recheck:      &checkpointRecheck{RemainingFixItems: []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1"}}},
 	}
-	run := &storage.RunRecord{Status: "failed", CurrentStep: stringPtr(string(stepRecheck)), ErrorMessage: stringPtr(noopResolveManualIntervention)}
+	run := &storage.RunRecord{Status: "failed", CurrentStep: runpipe.StringPtr(string(stepRecheck)), ErrorMessage: runpipe.StringPtr(noopResolveManualIntervention)}
 
 	pause, ok := classifyFixerPause(run, checkpoint, nil)
 	if !ok {
@@ -1233,7 +1234,7 @@ func TestClassifyFixerPauseFallsBackToLegacyRiskyConflictErrorMessage(t *testing
 	}
 	summary := "generic manual hold"
 	errorMessage := "Skipped acme/looper#42 because risky conflict fixes require manual intervention"
-	run := &storage.RunRecord{Status: "failed", CurrentStep: stringPtr(string(stepRepair)), Summary: &summary, ErrorMessage: &errorMessage}
+	run := &storage.RunRecord{Status: "failed", CurrentStep: runpipe.StringPtr(string(stepRepair)), Summary: &summary, ErrorMessage: &errorMessage}
 
 	pause, ok := classifyFixerPause(run, checkpoint, nil)
 	if !ok {
@@ -1261,9 +1262,9 @@ func TestRunRecheckStepRecordsPauseWithLiveHead(t *testing.T) {
 	if err == nil {
 		t.Fatal("runRecheckStep() error = nil, want manual intervention hold")
 	}
-	loopErr, ok := err.(*loopError)
-	if !ok || loopErr.kind != FailureManualIntervention {
-		t.Fatalf("runRecheckStep() error = %#v, want manual_intervention loopError", err)
+	loopErr, ok := err.(*runpipe.LoopError)
+	if !ok || loopErr.Kind != runpipe.FailureManualIntervention {
+		t.Fatalf("runRecheckStep() error = %#v, want manual_intervention runpipe.LoopError", err)
 	}
 	if updated.Pause == nil || updated.Pause.HeadSHA != "new-head" {
 		t.Fatalf("Pause = %#v, want live recheck head recorded", updated.Pause)
@@ -1336,7 +1337,7 @@ func TestEnqueueKeepsPendingManualFixerQueueUnchanged(t *testing.T) {
 	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
-	manual := storage.QueueItemRecord{ID: "queue_manual", ProjectID: stringPtr("project_1"), LoopID: &loopID, Type: "fixer", TargetType: "pull_request", TargetID: buildPullRequestTargetID(repo, prNumber), Repo: &repo, PRNumber: &prNumber, DedupeKey: "fixer:loop_manual", Priority: storage.QueuePriorityFixer, Status: "queued", AvailableAt: nowISO, Attempts: 0, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}
+	manual := storage.QueueItemRecord{ID: "queue_manual", ProjectID: runpipe.StringPtr("project_1"), LoopID: &loopID, Type: "fixer", TargetType: "pull_request", TargetID: buildPullRequestTargetID(repo, prNumber), Repo: &repo, PRNumber: &prNumber, DedupeKey: "fixer:loop_manual", Priority: storage.QueuePriorityFixer, Status: "queued", AvailableAt: nowISO, Attempts: 0, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}
 	if err := fixture.repos.Queue.Upsert(context.Background(), manual); err != nil {
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
@@ -1464,7 +1465,7 @@ func TestProcessClaimedItemDoesNotResolveCommentsWhenRepairProducesNoCommits(t *
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
-	if result.Status != "failed" || result.FailureKind != FailureRetryableAfterResume {
+	if result.Status != "failed" || result.FailureKind != runpipe.FailureRetryableAfterResume {
 		t.Fatalf("result = %#v, want failed retryable-after-resume completion", result)
 	}
 	if len(git.commitCalls) != 0 || len(git.pushCalls) != 0 || len(github.resolveCalls) != 0 {
@@ -1494,7 +1495,7 @@ func TestProcessClaimedItemDoesNotResolveCommentsWhenRepairProducesNoCommits(t *
 	if err != nil {
 		t.Fatalf("Queue.GetByID() error = %v", err)
 	}
-	if queue == nil || queue.Status != "queued" || queue.LastErrorKind == nil || *queue.LastErrorKind != string(FailureRetryableAfterResume) {
+	if queue == nil || queue.Status != "queued" || queue.LastErrorKind == nil || *queue.LastErrorKind != string(runpipe.FailureRetryableAfterResume) {
 		t.Fatalf("queue = %#v, want queued retryable queue item", queue)
 	}
 	loop, err := fixture.repos.Loops.GetByID(context.Background(), result.LoopID)
@@ -1573,7 +1574,7 @@ func TestDiscoverPullRequestsSkipsDeclinedThreadWhenFingerprintMatches(t *testin
 	detail := PullRequestDetail{Number: prNumber, State: "OPEN", HeadSHA: "same-head", HeadRefName: "feature/fix-79", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix", "threadFingerprint": "thread-hash-1"}}}
 	fixItems := collectFixItems(detail)
 	declinedFingerprint := buildDeclinedThreadFingerprint(fixItems[0], detail.HeadSHA)
-	metadata := mustMarshalJSON(map[string]any{"declinedThreads": map[string]any{declinedFingerprint: map[string]any{"recordedAt": nowISO, "threadId": "t1", "reason": "already fixed"}}})
+	metadata := runpipe.MustMarshalJSON(map[string]any{"declinedThreads": map[string]any{declinedFingerprint: map[string]any{"recordedAt": nowISO, "threadId": "t1", "reason": "already fixed"}}})
 	loopTarget := buildPullRequestTargetID(repo, prNumber)
 	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_declined_same_fp", Seq: 92, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "completed", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
@@ -1599,7 +1600,7 @@ func TestDiscoverPullRequestsRequeuesDeclinedThreadWhenHeadChanges(t *testing.T)
 	oldDetail := PullRequestDetail{Number: prNumber, State: "OPEN", HeadSHA: "old-head", HeadRefName: "feature/fix-80", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix", "threadFingerprint": "thread-hash-1"}}}
 	oldFixItems := collectFixItems(oldDetail)
 	declinedFingerprint := buildDeclinedThreadFingerprint(oldFixItems[0], oldDetail.HeadSHA)
-	metadata := mustMarshalJSON(map[string]any{"declinedThreads": map[string]any{declinedFingerprint: map[string]any{"recordedAt": nowISO, "threadId": "t1", "reason": "already fixed"}}})
+	metadata := runpipe.MustMarshalJSON(map[string]any{"declinedThreads": map[string]any{declinedFingerprint: map[string]any{"recordedAt": nowISO, "threadId": "t1", "reason": "already fixed"}}})
 	loopTarget := buildPullRequestTargetID(repo, prNumber)
 	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_declined_changed_head", Seq: 93, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "completed", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
@@ -1627,7 +1628,7 @@ func TestDiscoverPullRequestsKeepsPausedZeroProgressLoopWhenOnlySuppressedDeclin
 	detail := PullRequestDetail{Number: prNumber, State: "OPEN", HeadSHA: "same-head", HeadRefName: "feature/fix-80", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix", "threadFingerprint": "thread-hash-1"}, {"id": "c2", "threadId": "t2", "body": "please fix too", "threadFingerprint": "thread-hash-2"}}}
 	allFixItems := collectFixItems(detail)
 	declinedFingerprint := buildDeclinedThreadFingerprint(allFixItems[0], detail.HeadSHA)
-	metadata := mustMarshalJSON(map[string]any{
+	metadata := runpipe.MustMarshalJSON(map[string]any{
 		"pauseReason": zeroProgressPauseReason,
 		"fixerZeroProgress": map[string]any{
 			"headSha":           detail.HeadSHA,
@@ -1718,7 +1719,7 @@ func TestDiscoverPullRequestsDefersRepeatedNoopResolveRediscoveryBeforeCooldown(
 	comment := map[string]any{"id": "c1", "threadId": "t1", "body": "please fix"}
 	detail := PullRequestDetail{Number: prNumber, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{comment}}
 	fixItemsStateHash := hashFixItemsState(collectFixItems(detail))
-	metadata := mustMarshalJSON(map[string]any{"lastNoopResolveHeadSha": detail.HeadSHA, "lastNoopResolveStateHash": fixItemsStateHash, "lastNoopResolveAt": nowISO})
+	metadata := runpipe.MustMarshalJSON(map[string]any{"lastNoopResolveHeadSha": detail.HeadSHA, "lastNoopResolveStateHash": fixItemsStateHash, "lastNoopResolveAt": nowISO})
 	loopTarget := buildPullRequestTargetID(repo, prNumber)
 	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_fixer_noop", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "failed", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
@@ -1793,7 +1794,7 @@ func TestDiscoverPullRequestsRequeuesNoopResolveLoopWhenStateChanges(t *testing.
 			prNumber := int64(42)
 			nowISO := fixture.nowISO()
 			baseline := PullRequestDetail{Number: prNumber, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}}
-			metadata := mustMarshalJSON(map[string]any{"lastNoopResolveHeadSha": baseline.HeadSHA, "lastNoopResolveStateHash": hashFixItemsState(collectFixItems(baseline)), "lastNoopResolveAt": nowISO})
+			metadata := runpipe.MustMarshalJSON(map[string]any{"lastNoopResolveHeadSha": baseline.HeadSHA, "lastNoopResolveStateHash": hashFixItemsState(collectFixItems(baseline)), "lastNoopResolveAt": nowISO})
 			loopTarget := buildPullRequestTargetID(repo, prNumber)
 			if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_fixer_noop", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "failed", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 				t.Fatalf("Loops.Upsert() error = %v", err)
@@ -1849,7 +1850,7 @@ func TestDiscoverPullRequestsRequeuesNoopResolveLoopWhenRecoverableEvidenceExist
 func TestDecideRediscoveryAfterNoopResolveEnqueuesWhenThreadSetChangesEvenIfHashMatches(t *testing.T) {
 	t.Parallel()
 
-	loopMeta := mustMarshalJSON(map[string]any{"fixerFollowup": map[string]any{"reason": "missing_evidence", "headSha": "head-1", "fixItemsStateHash": "same-hash", "unresolvedThreadIds": []string{"t1"}, "attemptsForFingerprint": 2, "lastAttemptAt": "2026-04-11T12:00:00.000Z", "nextEligibleAt": "2026-04-11T12:05:00.000Z"}})
+	loopMeta := runpipe.MustMarshalJSON(map[string]any{"fixerFollowup": map[string]any{"reason": "missing_evidence", "headSha": "head-1", "fixItemsStateHash": "same-hash", "unresolvedThreadIds": []string{"t1"}, "attemptsForFingerprint": 2, "lastAttemptAt": "2026-04-11T12:00:00.000Z", "nextEligibleAt": "2026-04-11T12:05:00.000Z"}})
 	decision := decideRediscoveryAfterNoopResolve(storage.LoopRecord{ID: "loop_1", MetadataJSON: &loopMeta, UpdatedAt: "2026-04-11T12:00:00.000Z"}, "head-1", "same-hash", "same-hash", []FixItem{{Type: "comment", ID: "c2", ThreadID: "t2", ThreadFingerprint: "latest=c2|updated=2026-04-11T12:01:00Z|count=1"}}, []string{"t2"}, time.Date(2026, time.April, 11, 12, 1, 0, 0, time.UTC))
 	if decision.Action != rediscoveryActionEnqueue {
 		t.Fatalf("decision = %#v, want enqueue on thread-set change", decision)
@@ -1859,7 +1860,7 @@ func TestDecideRediscoveryAfterNoopResolveEnqueuesWhenThreadSetChangesEvenIfHash
 func TestDecideRediscoveryAfterNoopResolveEnqueuesAfterCooldownExpires(t *testing.T) {
 	t.Parallel()
 
-	loopMeta := mustMarshalJSON(map[string]any{"fixerFollowup": map[string]any{"reason": "missing_evidence", "headSha": "head-1", "fixItemsStateHash": "same-hash", "unresolvedThreadIds": []string{"t1"}, "attemptsForFingerprint": 1, "lastAttemptAt": "2026-04-11T12:00:00.000Z", "nextEligibleAt": "2026-04-11T12:01:00.000Z"}})
+	loopMeta := runpipe.MustMarshalJSON(map[string]any{"fixerFollowup": map[string]any{"reason": "missing_evidence", "headSha": "head-1", "fixItemsStateHash": "same-hash", "unresolvedThreadIds": []string{"t1"}, "attemptsForFingerprint": 1, "lastAttemptAt": "2026-04-11T12:00:00.000Z", "nextEligibleAt": "2026-04-11T12:01:00.000Z"}})
 	decision := decideRediscoveryAfterNoopResolve(storage.LoopRecord{ID: "loop_1", MetadataJSON: &loopMeta, UpdatedAt: "2026-04-11T12:00:00.000Z"}, "head-1", "same-hash", "same-hash", []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", ThreadFingerprint: "latest=c1|updated=2026-04-11T12:00:00Z|count=1"}}, []string{"t1"}, time.Date(2026, time.April, 11, 12, 2, 0, 0, time.UTC))
 	if decision.Action != rediscoveryActionEnqueue {
 		t.Fatalf("decision = %#v, want enqueue after cooldown expiry", decision)
@@ -1869,7 +1870,7 @@ func TestDecideRediscoveryAfterNoopResolveEnqueuesAfterCooldownExpires(t *testin
 func TestDecideRediscoveryAfterNoopResolveDefersLegacyMetadataDuringCooldown(t *testing.T) {
 	t.Parallel()
 
-	loopMeta := mustMarshalJSON(map[string]any{"lastNoopResolveHeadSha": "head-1", "lastNoopResolveFixItemsHash": "legacy-hash", "lastNoopResolveAt": "2026-04-11T12:00:00.000Z"})
+	loopMeta := runpipe.MustMarshalJSON(map[string]any{"lastNoopResolveHeadSha": "head-1", "lastNoopResolveFixItemsHash": "legacy-hash", "lastNoopResolveAt": "2026-04-11T12:00:00.000Z"})
 	decision := decideRediscoveryAfterNoopResolve(storage.LoopRecord{ID: "loop_1", MetadataJSON: &loopMeta, UpdatedAt: "2026-04-11T12:00:00.000Z"}, "head-1", "legacy-hash", "same-hash", []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", ThreadFingerprint: "latest=c1|updated=2026-04-11T12:00:00Z|count=1"}}, []string{"t1"}, time.Date(2026, time.April, 11, 12, 0, 30, 0, time.UTC))
 	if decision.Action != rediscoveryActionDefer {
 		t.Fatalf("decision = %#v, want defer for legacy metadata during cooldown", decision)
@@ -1890,7 +1891,7 @@ func TestDiscoverPullRequestsPreservesPendingRediscoveryForMidRunReviewComment(t
 	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
-	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_fixer_midrun_comment", LoopID: loopID, Status: "running", CurrentStep: stringPtr(string(stepClaimPR)), LastCompletedStep: stringPtr(string(stepDiscoverPR)), StartedAt: nowISO, LastHeartbeatAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_fixer_midrun_comment", LoopID: loopID, Status: "running", CurrentStep: runpipe.StringPtr(string(stepClaimPR)), LastCompletedStep: runpipe.StringPtr(string(stepDiscoverPR)), StartedAt: nowISO, LastHeartbeatAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
 	lockKey := fmt.Sprintf("pr:%s:%d", repo, prNumber)
@@ -1966,7 +1967,7 @@ func TestSchedulePendingRediscoveryAfterRunPreservesPausedHardHold(t *testing.T)
 	nowISO := fixture.nowISO()
 	loopTarget := buildPullRequestTargetID(repo, prNumber)
 	projectID := "project_1"
-	metadata := mustMarshalJSON(map[string]any{"pendingFixerRediscovery": map[string]any{"headSha": "head-84", "fixItemsStateHash": "state-84", "unresolvedThreadIds": []string{"t1"}, "recordedAt": nowISO}})
+	metadata := runpipe.MustMarshalJSON(map[string]any{"pendingFixerRediscovery": map[string]any{"headSha": "head-84", "fixItemsStateHash": "state-84", "unresolvedThreadIds": []string{"t1"}, "recordedAt": nowISO}})
 	loop := storage.LoopRecord{ID: "loop_paused_pending_rediscovery", Seq: 98, ProjectID: projectID, Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "paused", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
 	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
@@ -2015,7 +2016,7 @@ func TestSchedulePendingRediscoveryAfterRunChargesRoundBudget(t *testing.T) {
 	loopTarget := buildPullRequestTargetID(repo, prNumber)
 	nowISO := fixture.nowISO()
 	projectID := "project_1"
-	metadata := mustMarshalJSON(map[string]any{
+	metadata := runpipe.MustMarshalJSON(map[string]any{
 		"fixerRoundBudget":        map[string]any{"rounds": 2, "lastHeadSha": "head-prev", "firstRoundAt": nowISO, "recordedAt": nowISO},
 		"pendingFixerRediscovery": map[string]any{"headSha": "head-moved", "fixItemsStateHash": "state-moved", "unresolvedThreadIds": []string{"t1"}, "recordedAt": nowISO},
 	})
@@ -2067,7 +2068,7 @@ func TestSchedulePendingRediscoveryAfterRunChargesWithinBudget(t *testing.T) {
 	loopTarget := buildPullRequestTargetID(repo, prNumber)
 	nowISO := fixture.nowISO()
 	projectID := "project_1"
-	metadata := mustMarshalJSON(map[string]any{
+	metadata := runpipe.MustMarshalJSON(map[string]any{
 		"fixerRoundBudget":        map[string]any{"rounds": 1, "lastHeadSha": "head-prev", "firstRoundAt": nowISO, "recordedAt": nowISO},
 		"pendingFixerRediscovery": map[string]any{"headSha": "head-moved", "fixItemsStateHash": "state-moved", "unresolvedThreadIds": []string{"t1"}, "recordedAt": nowISO},
 	})
@@ -2116,7 +2117,7 @@ func TestDiscoverPullRequestsPreservesPendingRediscoveryForMidRunCIFailure(t *te
 	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
-	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_fixer_midrun_ci", LoopID: loopID, Status: "running", CurrentStep: stringPtr(string(stepRepair)), LastCompletedStep: stringPtr(string(stepCollectFixes)), StartedAt: nowISO, LastHeartbeatAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_fixer_midrun_ci", LoopID: loopID, Status: "running", CurrentStep: runpipe.StringPtr(string(stepRepair)), LastCompletedStep: runpipe.StringPtr(string(stepCollectFixes)), StartedAt: nowISO, LastHeartbeatAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
 	lockKey := fmt.Sprintf("pr:%s:%d", repo, prNumber)
@@ -2182,12 +2183,12 @@ func TestDiscoverPullRequestsLeavesPendingRediscoveryUnchangedForDuplicateSignal
 	loopID := "loop_fixer_midrun_duplicate"
 	projectID := "project_1"
 	detail := PullRequestDetail{Number: prNumber, State: "OPEN", HeadSHA: "head-83", HeadRefName: "feature/fix-83", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}, {"id": "c2", "threadId": "t2", "body": "also fix this"}}}
-	pendingMeta := mustMarshalJSON(map[string]any{"pendingFixerRediscovery": map[string]any{"headSha": detail.HeadSHA, "fixItemsStateHash": hashFixItemsState(collectFixItems(detail)), "unresolvedThreadIds": []string{"t1", "t2"}, "recordedAt": nowISO}})
+	pendingMeta := runpipe.MustMarshalJSON(map[string]any{"pendingFixerRediscovery": map[string]any{"headSha": detail.HeadSHA, "fixItemsStateHash": hashFixItemsState(collectFixItems(detail)), "unresolvedThreadIds": []string{"t1", "t2"}, "recordedAt": nowISO}})
 	loop := storage.LoopRecord{ID: loopID, Seq: 97, ProjectID: projectID, Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "running", MetadataJSON: &pendingMeta, CreatedAt: nowISO, UpdatedAt: nowISO}
 	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
-	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_fixer_midrun_duplicate", LoopID: loopID, Status: "running", CurrentStep: stringPtr(string(stepValidate)), LastCompletedStep: stringPtr(string(stepCollectFixes)), StartedAt: nowISO, LastHeartbeatAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_fixer_midrun_duplicate", LoopID: loopID, Status: "running", CurrentStep: runpipe.StringPtr(string(stepValidate)), LastCompletedStep: runpipe.StringPtr(string(stepCollectFixes)), StartedAt: nowISO, LastHeartbeatAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
 	lockKey := fmt.Sprintf("pr:%s:%d", repo, prNumber)
@@ -2248,7 +2249,7 @@ func TestDiscoverPullRequestsPreservesPendingRediscoveryForRunningAutomaticLoopW
 	if err := fixture.repos.Loops.Upsert(context.Background(), manualLoop); err != nil {
 		t.Fatalf("Loops.Upsert() manual error = %v", err)
 	}
-	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_fixer_midrun_automatic", LoopID: automaticLoopID, Status: "running", CurrentStep: stringPtr(string(stepRepair)), LastCompletedStep: stringPtr(string(stepCollectFixes)), StartedAt: nowISO, LastHeartbeatAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_fixer_midrun_automatic", LoopID: automaticLoopID, Status: "running", CurrentStep: runpipe.StringPtr(string(stepRepair)), LastCompletedStep: runpipe.StringPtr(string(stepCollectFixes)), StartedAt: nowISO, LastHeartbeatAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
 	lockKey := fmt.Sprintf("pr:%s:%d", repo, prNumber)
@@ -2306,7 +2307,7 @@ func TestDiscoverPullRequestsSkipsAutoQueueWhileManualSingleShotRunHoldsLock(t *
 	if err := fixture.repos.Loops.Upsert(context.Background(), manualLoop); err != nil {
 		t.Fatalf("Loops.Upsert() manual error = %v", err)
 	}
-	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_manual_single_shot_running", LoopID: manualLoopID, Status: "running", CurrentStep: stringPtr(string(stepRepair)), LastCompletedStep: stringPtr(string(stepCollectFixes)), StartedAt: nowISO, LastHeartbeatAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_manual_single_shot_running", LoopID: manualLoopID, Status: "running", CurrentStep: runpipe.StringPtr(string(stepRepair)), LastCompletedStep: runpipe.StringPtr(string(stepCollectFixes)), StartedAt: nowISO, LastHeartbeatAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
 	lockKey := fmt.Sprintf("pr:%s:%d", repo, prNumber)
@@ -2350,7 +2351,7 @@ func TestDiscoverPullRequestsRecoversLegacyNoopLoopWithoutOpenPRListing(t *testi
 	legacyAt := eventlog.FormatJavaScriptISOString(fixture.now().Add(-10 * time.Minute))
 	comment := map[string]any{"id": "c1", "threadId": "t1", "body": "please fix"}
 	detail := PullRequestDetail{Number: prNumber, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{comment}}
-	metadata := mustMarshalJSON(map[string]any{"lastNoopResolveHeadSha": "head-1", "lastNoopResolveStateHash": hashFixItemsState(collectFixItems(detail)), "lastNoopResolveAt": legacyAt})
+	metadata := runpipe.MustMarshalJSON(map[string]any{"lastNoopResolveHeadSha": "head-1", "lastNoopResolveStateHash": hashFixItemsState(collectFixItems(detail)), "lastNoopResolveAt": legacyAt})
 	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_fixer_legacy_recovery", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "failed", MetadataJSON: &metadata, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
@@ -2400,7 +2401,7 @@ func TestDiscoverPullRequestsRecoversLegacyNoopLoopAfterCooldownWhenPRListingMis
 	legacyAt := fixture.nowISO()
 	comment := map[string]any{"id": "c1", "threadId": "t1", "body": "please fix"}
 	detail := PullRequestDetail{Number: prNumber, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{comment}}
-	metadata := mustMarshalJSON(map[string]any{"lastNoopResolveHeadSha": "head-1", "lastNoopResolveStateHash": hashFixItemsState(collectFixItems(detail)), "lastNoopResolveAt": legacyAt})
+	metadata := runpipe.MustMarshalJSON(map[string]any{"lastNoopResolveHeadSha": "head-1", "lastNoopResolveStateHash": hashFixItemsState(collectFixItems(detail)), "lastNoopResolveAt": legacyAt})
 	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_fixer_legacy_cooldown", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "failed", MetadataJSON: &metadata, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
@@ -2437,7 +2438,7 @@ func TestDiscoverPullRequestsRecoversManualForeignLegacyNoopLoop(t *testing.T) {
 	legacyAt := fixture.nowISO()
 	comment := map[string]any{"id": "c1", "threadId": "t1", "body": "please fix"}
 	detail := PullRequestDetail{Number: prNumber, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Author: "human", Comments: []map[string]any{comment}}
-	metadata := mustMarshalJSON(map[string]any{"manual": true, "followUpdates": true, "lastNoopResolveHeadSha": "head-1", "lastNoopResolveStateHash": hashFixItemsState(collectFixItems(detail)), "lastNoopResolveAt": legacyAt})
+	metadata := runpipe.MustMarshalJSON(map[string]any{"manual": true, "followUpdates": true, "lastNoopResolveHeadSha": "head-1", "lastNoopResolveStateHash": hashFixItemsState(collectFixItems(detail)), "lastNoopResolveAt": legacyAt})
 	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_fixer_manual_legacy", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "failed", MetadataJSON: &metadata, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
@@ -2470,7 +2471,7 @@ func TestDiscoverPullRequestsRecoversAutomaticLegacyNoopLoopAfterManualSingleSho
 	legacyAt := eventlog.FormatJavaScriptISOString(fixture.now().Add(-10 * time.Minute))
 	comment := map[string]any{"id": "c1", "threadId": "t1", "body": "please fix"}
 	detail := PullRequestDetail{Number: prNumber, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{comment}}
-	automaticMetadata := mustMarshalJSON(map[string]any{"lastNoopResolveHeadSha": "head-1", "lastNoopResolveStateHash": hashFixItemsState(collectFixItems(detail)), "lastNoopResolveAt": legacyAt})
+	automaticMetadata := runpipe.MustMarshalJSON(map[string]any{"lastNoopResolveHeadSha": "head-1", "lastNoopResolveStateHash": hashFixItemsState(collectFixItems(detail)), "lastNoopResolveAt": legacyAt})
 	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_fixer_legacy_after_manual", Seq: 2, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "failed", MetadataJSON: &automaticMetadata, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
 		t.Fatalf("Loops.Upsert() automatic error = %v", err)
 	}
@@ -2577,7 +2578,7 @@ func TestDiscoverPullRequestsDoesNotRecoverLegacyNoopLoopWhenFixerHoldAppliedLiv
 	legacyAt := eventlog.FormatJavaScriptISOString(fixture.now().Add(-10 * time.Minute))
 	comment := map[string]any{"id": "c1", "threadId": "t1", "body": "please fix"}
 	detail := PullRequestDetail{Number: prNumber, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Labels: []string{labels.HoldFixer}, Comments: []map[string]any{comment}}
-	metadata := mustMarshalJSON(map[string]any{"lastNoopResolveHeadSha": "head-1", "lastNoopResolveStateHash": hashFixItemsState(collectFixItems(detail)), "lastNoopResolveAt": legacyAt})
+	metadata := runpipe.MustMarshalJSON(map[string]any{"lastNoopResolveHeadSha": "head-1", "lastNoopResolveStateHash": hashFixItemsState(collectFixItems(detail)), "lastNoopResolveAt": legacyAt})
 	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_fixer_legacy_hold", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "failed", MetadataJSON: &metadata, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
@@ -2610,7 +2611,7 @@ func TestDiscoverPullRequestsRecoversManualLegacyNoopLoopWhenFixerHoldAppliedLiv
 	legacyAt := eventlog.FormatJavaScriptISOString(fixture.now().Add(-10 * time.Minute))
 	comment := map[string]any{"id": "c1", "threadId": "t1", "body": "please fix"}
 	detail := PullRequestDetail{Number: prNumber, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Labels: []string{labels.HoldFixer}, Comments: []map[string]any{comment}}
-	metadata := mustMarshalJSON(map[string]any{"manual": true, "followUpdates": true, "lastNoopResolveHeadSha": "head-1", "lastNoopResolveStateHash": hashFixItemsState(collectFixItems(detail)), "lastNoopResolveAt": legacyAt})
+	metadata := runpipe.MustMarshalJSON(map[string]any{"manual": true, "followUpdates": true, "lastNoopResolveHeadSha": "head-1", "lastNoopResolveStateHash": hashFixItemsState(collectFixItems(detail)), "lastNoopResolveAt": legacyAt})
 	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_fixer_manual_legacy_hold", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "failed", MetadataJSON: &metadata, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
@@ -2712,7 +2713,7 @@ func TestSchedulePendingRediscoveryAfterRunSkipsDisabledManualLoop(t *testing.T)
 	nowISO := fixture.nowISO()
 	loopTarget := buildPullRequestTargetID(repo, prNumber)
 	projectID := "project_1"
-	metadata := mustMarshalJSON(map[string]any{"manual": true, "followUpdates": false, "pendingFixerRediscovery": map[string]any{"headSha": "head-84", "fixItemsStateHash": "state-84", "unresolvedThreadIds": []string{"t1"}, "recordedAt": nowISO}})
+	metadata := runpipe.MustMarshalJSON(map[string]any{"manual": true, "followUpdates": false, "pendingFixerRediscovery": map[string]any{"headSha": "head-84", "fixItemsStateHash": "state-84", "unresolvedThreadIds": []string{"t1"}, "recordedAt": nowISO}})
 	loop := storage.LoopRecord{ID: "loop_manual_pending_disabled", Seq: 98, ProjectID: projectID, Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "completed", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
 	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
@@ -2745,7 +2746,7 @@ func TestDiscoverPullRequestsRecoversManualLegacyNoopLoopDespiteLabelMismatch(t 
 	legacyAt := fixture.nowISO()
 	comment := map[string]any{"id": "c1", "threadId": "t1", "body": "please fix"}
 	detail := PullRequestDetail{Number: prNumber, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Author: "human", Comments: []map[string]any{comment}}
-	metadata := mustMarshalJSON(map[string]any{"manual": true, "followUpdates": true, "lastNoopResolveHeadSha": "head-1", "lastNoopResolveStateHash": hashFixItemsState(collectFixItems(detail)), "lastNoopResolveAt": legacyAt})
+	metadata := runpipe.MustMarshalJSON(map[string]any{"manual": true, "followUpdates": true, "lastNoopResolveHeadSha": "head-1", "lastNoopResolveStateHash": hashFixItemsState(collectFixItems(detail)), "lastNoopResolveAt": legacyAt})
 	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_fixer_manual_legacy_labels", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "failed", MetadataJSON: &metadata, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
@@ -2771,7 +2772,7 @@ func TestDiscoverPullRequestsRecoversManualLegacyNoopDraftLoopDespiteDraftPolicy
 	legacyAt := fixture.nowISO()
 	comment := map[string]any{"id": "c1", "threadId": "t1", "body": "please fix"}
 	detail := PullRequestDetail{Number: prNumber, State: "OPEN", IsDraft: true, HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Author: "human", Comments: []map[string]any{comment}}
-	metadata := mustMarshalJSON(map[string]any{"manual": true, "followUpdates": true, "lastNoopResolveHeadSha": "head-1", "lastNoopResolveStateHash": hashFixItemsState(collectFixItems(detail)), "lastNoopResolveAt": legacyAt})
+	metadata := runpipe.MustMarshalJSON(map[string]any{"manual": true, "followUpdates": true, "lastNoopResolveHeadSha": "head-1", "lastNoopResolveStateHash": hashFixItemsState(collectFixItems(detail)), "lastNoopResolveAt": legacyAt})
 	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_fixer_manual_legacy_draft", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "failed", MetadataJSON: &metadata, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
@@ -2795,7 +2796,7 @@ func TestDiscoverPullRequestsRecoverySkipsLegacyNoopLoopWhenPRLocked(t *testing.
 	prNumber := int64(42)
 	loopTarget := buildPullRequestTargetID(repo, prNumber)
 	detail := PullRequestDetail{Number: prNumber, State: "OPEN", HeadSHA: "head-1", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-1", Comments: []map[string]any{{"id": "c1", "threadId": "t1", "body": "please fix"}}}
-	metadata := mustMarshalJSON(map[string]any{"lastNoopResolveHeadSha": "head-1", "lastNoopResolveStateHash": hashFixItemsState(collectFixItems(detail)), "lastNoopResolveAt": fixture.nowISO()})
+	metadata := runpipe.MustMarshalJSON(map[string]any{"lastNoopResolveHeadSha": "head-1", "lastNoopResolveStateHash": hashFixItemsState(collectFixItems(detail)), "lastNoopResolveAt": fixture.nowISO()})
 	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_fixer_legacy_locked", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "failed", MetadataJSON: &metadata, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
@@ -2827,7 +2828,7 @@ func TestDiscoverPullRequestsRecoveryClearsLegacyNoopMetadataWhenFingerprintChan
 	repo := "acme/looper"
 	prNumber := int64(42)
 	loopTarget := buildPullRequestTargetID(repo, prNumber)
-	metadata := mustMarshalJSON(map[string]any{"lastNoopResolveHeadSha": "old-head", "lastNoopResolveStateHash": "old-hash", "lastNoopResolveAt": fixture.nowISO()})
+	metadata := runpipe.MustMarshalJSON(map[string]any{"lastNoopResolveHeadSha": "old-head", "lastNoopResolveStateHash": "old-hash", "lastNoopResolveAt": fixture.nowISO()})
 	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_fixer_legacy_changed", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "failed", MetadataJSON: &metadata, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
@@ -2861,7 +2862,7 @@ func TestDiscoverPullRequestsRecoveryClearsLegacyNoopMetadataWhenFingerprintChan
 func TestDecideRediscoveryAfterNoopResolveEnqueuesWhenTerminalStateGetsNewSignal(t *testing.T) {
 	t.Parallel()
 
-	loopMeta := mustMarshalJSON(map[string]any{"fixerFollowup": map[string]any{"reason": "manual_intervention", "headSha": "head-1", "fixItemsStateHash": "same-hash", "unresolvedThreadIds": []string{"t1"}, "attemptsForFingerprint": 6, "lastAttemptAt": "2026-04-11T12:00:00.000Z", "terminal": true}})
+	loopMeta := runpipe.MustMarshalJSON(map[string]any{"fixerFollowup": map[string]any{"reason": "manual_intervention", "headSha": "head-1", "fixItemsStateHash": "same-hash", "unresolvedThreadIds": []string{"t1"}, "attemptsForFingerprint": 6, "lastAttemptAt": "2026-04-11T12:00:00.000Z", "terminal": true}})
 	decision := decideRediscoveryAfterNoopResolve(storage.LoopRecord{ID: "loop_1", MetadataJSON: &loopMeta, UpdatedAt: "2026-04-11T12:00:00.000Z"}, "head-2", "same-hash", "same-hash", []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", ThreadFingerprint: "latest=c1|updated=2026-04-11T12:00:00Z|count=1"}}, []string{"t1"}, time.Date(2026, time.April, 11, 12, 1, 0, 0, time.UTC))
 	if decision.Action != rediscoveryActionEnqueue {
 		t.Fatalf("decision = %#v, want enqueue on new signal despite terminal prior state", decision)
@@ -2871,7 +2872,7 @@ func TestDecideRediscoveryAfterNoopResolveEnqueuesWhenTerminalStateGetsNewSignal
 func TestDecideRediscoveryAfterNoopResolveIgnoresMismatchedThreadFingerprintEvidence(t *testing.T) {
 	t.Parallel()
 
-	loopMeta := mustMarshalJSON(map[string]any{"fixerFollowup": map[string]any{"reason": "missing_evidence", "headSha": "head-1", "fixItemsStateHash": "same-hash", "unresolvedThreadIds": []string{"t1"}, "attemptsForFingerprint": 1, "lastAttemptAt": "2026-04-11T12:00:00.000Z", "nextEligibleAt": "2026-04-11T12:05:00.000Z"}, "fixEvidenceStoreV2": map[string]any{"version": 2, "threads": map[string]any{"t1": []map[string]any{{"threadId": "t1", "threadFingerprint": "latest=old-comment|updated=2026-04-11T11:59:00Z|count=1", "evidenceHeadSHA": "head-1", "validationHeadSHA": "head-1", "commitSHA": "head-1", "producedNewCommits": true, "resolveState": "pending"}}}}})
+	loopMeta := runpipe.MustMarshalJSON(map[string]any{"fixerFollowup": map[string]any{"reason": "missing_evidence", "headSha": "head-1", "fixItemsStateHash": "same-hash", "unresolvedThreadIds": []string{"t1"}, "attemptsForFingerprint": 1, "lastAttemptAt": "2026-04-11T12:00:00.000Z", "nextEligibleAt": "2026-04-11T12:05:00.000Z"}, "fixEvidenceStoreV2": map[string]any{"version": 2, "threads": map[string]any{"t1": []map[string]any{{"threadId": "t1", "threadFingerprint": "latest=old-comment|updated=2026-04-11T11:59:00Z|count=1", "evidenceHeadSHA": "head-1", "validationHeadSHA": "head-1", "commitSHA": "head-1", "producedNewCommits": true, "resolveState": "pending"}}}}})
 	decision := decideRediscoveryAfterNoopResolve(storage.LoopRecord{ID: "loop_1", MetadataJSON: &loopMeta, UpdatedAt: "2026-04-11T12:00:00.000Z"}, "head-1", "same-hash", "same-hash", []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", ThreadFingerprint: "latest=c1|updated=2026-04-11T12:00:00Z|count=1"}}, []string{"t1"}, time.Date(2026, time.April, 11, 12, 1, 0, 0, time.UTC))
 	if decision.Action != rediscoveryActionDefer {
 		t.Fatalf("decision = %#v, want defer when only mismatched thread evidence exists", decision)
@@ -2884,7 +2885,7 @@ func TestDecideRediscoveryAfterNoopResolveIgnoresMismatchedThreadFingerprintEvid
 func TestDecideRediscoveryAfterNoopResolveDefersMissingConfirmationDuringCooldown(t *testing.T) {
 	t.Parallel()
 
-	loopMeta := mustMarshalJSON(map[string]any{"fixerFollowup": map[string]any{"reason": "missing_confirmation", "headSha": "head-1", "fixItemsStateHash": "same-hash", "unresolvedThreadIds": []string{"t1"}, "attemptsForFingerprint": 1, "lastAttemptAt": "2026-04-11T12:00:00.000Z", "nextEligibleAt": "2026-04-11T12:05:00.000Z"}, "fixEvidenceStoreV2": map[string]any{"version": 2, "threads": map[string]any{"t1": []map[string]any{{"threadId": "t1", "threadFingerprint": "latest=c1|updated=2026-04-11T12:00:00Z|count=1", "evidenceHeadSHA": "head-1", "validationHeadSHA": "head-1", "commitSHA": "head-1", "producedNewCommits": true, "resolveState": "skipped_no_confirmation"}}}}})
+	loopMeta := runpipe.MustMarshalJSON(map[string]any{"fixerFollowup": map[string]any{"reason": "missing_confirmation", "headSha": "head-1", "fixItemsStateHash": "same-hash", "unresolvedThreadIds": []string{"t1"}, "attemptsForFingerprint": 1, "lastAttemptAt": "2026-04-11T12:00:00.000Z", "nextEligibleAt": "2026-04-11T12:05:00.000Z"}, "fixEvidenceStoreV2": map[string]any{"version": 2, "threads": map[string]any{"t1": []map[string]any{{"threadId": "t1", "threadFingerprint": "latest=c1|updated=2026-04-11T12:00:00Z|count=1", "evidenceHeadSHA": "head-1", "validationHeadSHA": "head-1", "commitSHA": "head-1", "producedNewCommits": true, "resolveState": "skipped_no_confirmation"}}}}})
 	decision := decideRediscoveryAfterNoopResolve(storage.LoopRecord{ID: "loop_1", MetadataJSON: &loopMeta, UpdatedAt: "2026-04-11T12:00:00.000Z"}, "head-1", "same-hash", "same-hash", []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", ThreadFingerprint: "latest=c1|updated=2026-04-11T12:00:00Z|count=1"}}, []string{"t1"}, time.Date(2026, time.April, 11, 12, 1, 0, 0, time.UTC))
 	if decision.Action != rediscoveryActionDefer {
 		t.Fatalf("decision = %#v, want defer for missing confirmation during cooldown", decision)
@@ -2902,7 +2903,7 @@ func TestDiscoverPullRequestsClearsFollowupStateWhenNoUnresolvedCommentsRemain(t
 	prNumber := int64(42)
 	nowISO := fixture.nowISO()
 	loopTarget := buildPullRequestTargetID(repo, prNumber)
-	metadata := mustMarshalJSON(map[string]any{"fixerFollowup": map[string]any{"reason": "missing_evidence", "headSha": "head-1", "fixItemsStateHash": "same-hash", "unresolvedThreadIds": []string{"t1"}, "attemptsForFingerprint": 1, "lastAttemptAt": nowISO, "nextEligibleAt": eventlog.FormatJavaScriptISOString(fixture.now().Add(time.Minute))}, "lastNoopResolveHeadSha": "head-1", "lastNoopResolveStateHash": "same-hash", "lastNoopResolveAt": nowISO})
+	metadata := runpipe.MustMarshalJSON(map[string]any{"fixerFollowup": map[string]any{"reason": "missing_evidence", "headSha": "head-1", "fixItemsStateHash": "same-hash", "unresolvedThreadIds": []string{"t1"}, "attemptsForFingerprint": 1, "lastAttemptAt": nowISO, "nextEligibleAt": eventlog.FormatJavaScriptISOString(fixture.now().Add(time.Minute))}, "lastNoopResolveHeadSha": "head-1", "lastNoopResolveStateHash": "same-hash", "lastNoopResolveAt": nowISO})
 	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_fixer_noop", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "completed", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
@@ -2952,7 +2953,7 @@ func TestDiscoverPullRequestsKeepsQueuedAttemptsForNonCommentFixItemsWithoutThre
 	prNumber := int64(42)
 	nowISO := fixture.nowISO()
 	loopTarget := buildPullRequestTargetID(repo, prNumber)
-	metadata := mustMarshalJSON(map[string]any{"fixerFollowup": map[string]any{"reason": "missing_evidence", "headSha": "head-1", "fixItemsStateHash": "same-hash", "unresolvedThreadIds": []string{"t1"}, "attemptsForFingerprint": 2, "lastAttemptAt": nowISO, "nextEligibleAt": eventlog.FormatJavaScriptISOString(fixture.now().Add(time.Minute))}})
+	metadata := runpipe.MustMarshalJSON(map[string]any{"fixerFollowup": map[string]any{"reason": "missing_evidence", "headSha": "head-1", "fixItemsStateHash": "same-hash", "unresolvedThreadIds": []string{"t1"}, "attemptsForFingerprint": 2, "lastAttemptAt": nowISO, "nextEligibleAt": eventlog.FormatJavaScriptISOString(fixture.now().Add(time.Minute))}})
 	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_fixer_checks", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "queued", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
@@ -4298,12 +4299,12 @@ func TestProcessClaimedItemSkipsPRsNotOwnedByCurrentUser(t *testing.T) {
 	repo := "acme/looper"
 	prNumber := int64(42)
 	nowISO := fixture.nowISO()
-	metadata := mustMarshalJSON(map[string]any{"fixerFailureStreak": failureStreakState{FixItemsStateHash: "items-1", Step: string(stepRepair), ConsecutiveCount: 2, RecordedAt: nowISO}})
+	metadata := runpipe.MustMarshalJSON(map[string]any{"fixerFailureStreak": failureStreakState{FixItemsStateHash: "items-1", Step: string(stepRepair), ConsecutiveCount: 2, RecordedAt: nowISO}})
 	loop := storage.LoopRecord{ID: "loop_foreign", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "queued", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
 	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
-	queue := storage.QueueItemRecord{ID: "queue_foreign", ProjectID: stringPtr("project_1"), LoopID: &loop.ID, Type: "fixer", TargetType: "pull_request", TargetID: "pr:acme/looper:42", Repo: &repo, PRNumber: &prNumber, DedupeKey: "fixer:foreign", Priority: storage.QueuePriorityFixer, Status: "running", AvailableAt: nowISO, Attempts: 1, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}
+	queue := storage.QueueItemRecord{ID: "queue_foreign", ProjectID: runpipe.StringPtr("project_1"), LoopID: &loop.ID, Type: "fixer", TargetType: "pull_request", TargetID: "pr:acme/looper:42", Repo: &repo, PRNumber: &prNumber, DedupeKey: "fixer:foreign", Priority: storage.QueuePriorityFixer, Status: "running", AvailableAt: nowISO, Attempts: 1, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}
 	if err := fixture.repos.Queue.Upsert(context.Background(), queue); err != nil {
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
@@ -4349,11 +4350,11 @@ func TestProcessClaimedItemFailsClosedForQuarantinedProject(t *testing.T) {
 	repo := "acme/looper"
 	prNumber := int64(42)
 	nowISO := fixture.nowISO()
-	loop := storage.LoopRecord{ID: "loop_quarantined", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: stringPtr("pr:acme/looper:42"), Repo: &repo, PRNumber: &prNumber, Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}
+	loop := storage.LoopRecord{ID: "loop_quarantined", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: runpipe.StringPtr("pr:acme/looper:42"), Repo: &repo, PRNumber: &prNumber, Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}
 	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
-	queue := storage.QueueItemRecord{ID: "queue_quarantined", ProjectID: stringPtr("project_1"), LoopID: &loop.ID, Type: "fixer", TargetType: "pull_request", TargetID: "pr:acme/looper:42", Repo: &repo, PRNumber: &prNumber, DedupeKey: "fixer:quarantined", Priority: storage.QueuePriorityFixer, Status: "running", AvailableAt: nowISO, Attempts: 0, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}
+	queue := storage.QueueItemRecord{ID: "queue_quarantined", ProjectID: runpipe.StringPtr("project_1"), LoopID: &loop.ID, Type: "fixer", TargetType: "pull_request", TargetID: "pr:acme/looper:42", Repo: &repo, PRNumber: &prNumber, DedupeKey: "fixer:quarantined", Priority: storage.QueuePriorityFixer, Status: "running", AvailableAt: nowISO, Attempts: 0, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}
 	if err := fixture.repos.Queue.Upsert(context.Background(), queue); err != nil {
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
@@ -4362,7 +4363,7 @@ func TestProcessClaimedItemFailsClosedForQuarantinedProject(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ProcessClaimedQueueItem() error = %v", err)
 	}
-	if result.Status != "failed" || result.FailureKind != FailureManualIntervention {
+	if result.Status != "failed" || result.FailureKind != runpipe.FailureManualIntervention {
 		t.Fatalf("result = %#v, want failed/manual_intervention fail-closed", result)
 	}
 	if len(agent.starts) != 0 {
@@ -4448,7 +4449,7 @@ func TestProcessClaimedQueueItemReconcilesQuarantineAfterContextCancellation(t *
 	if err != nil {
 		t.Fatalf("ProcessClaimedQueueItem() error = %v", err)
 	}
-	if result == nil || result.Status != "failed" || result.FailureKind != FailureManualIntervention {
+	if result == nil || result.Status != "failed" || result.FailureKind != runpipe.FailureManualIntervention {
 		t.Fatalf("result = %#v, want failed/manual_intervention", result)
 	}
 	if ctx.Err() != context.Canceled {
@@ -4499,7 +4500,7 @@ func TestProcessClaimedItemAllowsManualFixerRunForForeignPR(t *testing.T) {
 	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
-	queue := storage.QueueItemRecord{ID: "queue_manual_foreign", ProjectID: stringPtr("project_1"), LoopID: &loop.ID, Type: "fixer", TargetType: "pull_request", TargetID: "pr:acme/looper:42", Repo: &repo, PRNumber: &prNumber, DedupeKey: "fixer:manual-foreign", Priority: storage.QueuePriorityFixer, Status: "running", AvailableAt: nowISO, Attempts: 1, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}
+	queue := storage.QueueItemRecord{ID: "queue_manual_foreign", ProjectID: runpipe.StringPtr("project_1"), LoopID: &loop.ID, Type: "fixer", TargetType: "pull_request", TargetID: "pr:acme/looper:42", Repo: &repo, PRNumber: &prNumber, DedupeKey: "fixer:manual-foreign", Priority: storage.QueuePriorityFixer, Status: "running", AvailableAt: nowISO, Attempts: 1, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}
 	if err := fixture.repos.Queue.Upsert(context.Background(), queue); err != nil {
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
@@ -4545,7 +4546,7 @@ func TestProcessClaimedItemAllowsRecoveredManualFixerRunForForeignPR(t *testing.
 	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
-	queue := storage.QueueItemRecord{ID: "queue_manual_foreign_recovered", ProjectID: stringPtr("project_1"), LoopID: &loop.ID, Type: "fixer", TargetType: "pull_request", TargetID: "pr:acme/looper:42", Repo: &repo, PRNumber: &prNumber, DedupeKey: "fixer:manual-foreign-recovered", Priority: storage.QueuePriorityFixer, Status: "running", AvailableAt: nowISO, Attempts: 1, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}
+	queue := storage.QueueItemRecord{ID: "queue_manual_foreign_recovered", ProjectID: runpipe.StringPtr("project_1"), LoopID: &loop.ID, Type: "fixer", TargetType: "pull_request", TargetID: "pr:acme/looper:42", Repo: &repo, PRNumber: &prNumber, DedupeKey: "fixer:manual-foreign-recovered", Priority: storage.QueuePriorityFixer, Status: "running", AvailableAt: nowISO, Attempts: 1, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}
 	if err := fixture.repos.Queue.Upsert(context.Background(), queue); err != nil {
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
@@ -4587,12 +4588,12 @@ func TestProcessClaimedItemAllowsRecoveredManualFixerRunDespiteRuntimeLabelMisma
 	prNumber := int64(42)
 	nowISO := fixture.nowISO()
 	metadata := `{"manual":true}`
-	payloadJSON := mustMarshalJSON(map[string]any{"discoveryFingerprint": buildFixerDiscoveryFingerprint(repo, prNumber, "head-1", "hash-1")})
+	payloadJSON := runpipe.MustMarshalJSON(map[string]any{"discoveryFingerprint": buildFixerDiscoveryFingerprint(repo, prNumber, "head-1", "hash-1")})
 	loop := storage.LoopRecord{ID: "loop_manual_runtime_label_bypass", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "failed", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}
 	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
-	queue := storage.QueueItemRecord{ID: "queue_manual_runtime_label_bypass", ProjectID: stringPtr("project_1"), LoopID: &loop.ID, Type: "fixer", TargetType: "pull_request", TargetID: "pr:acme/looper:42", Repo: &repo, PRNumber: &prNumber, DedupeKey: buildFixerDedupeKey("project_1", loop.ID, repo, prNumber, "head-1", "hash-1"), Priority: storage.QueuePriorityFixer, Status: "running", AvailableAt: nowISO, Attempts: 1, MaxAttempts: 3, PayloadJSON: &payloadJSON, CreatedAt: nowISO, UpdatedAt: nowISO}
+	queue := storage.QueueItemRecord{ID: "queue_manual_runtime_label_bypass", ProjectID: runpipe.StringPtr("project_1"), LoopID: &loop.ID, Type: "fixer", TargetType: "pull_request", TargetID: "pr:acme/looper:42", Repo: &repo, PRNumber: &prNumber, DedupeKey: buildFixerDedupeKey("project_1", loop.ID, repo, prNumber, "head-1", "hash-1"), Priority: storage.QueuePriorityFixer, Status: "running", AvailableAt: nowISO, Attempts: 1, MaxAttempts: 3, PayloadJSON: &payloadJSON, CreatedAt: nowISO, UpdatedAt: nowISO}
 	if err := fixture.repos.Queue.Upsert(context.Background(), queue); err != nil {
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
@@ -4618,12 +4619,12 @@ func TestProcessClaimedItemPausesWhenLabelsNoLongerMatchAtRuntime(t *testing.T) 
 	repo := "acme/looper"
 	prNumber := int64(42)
 	nowISO := fixture.nowISO()
-	payloadJSON := mustMarshalJSON(map[string]any{"discoveryFingerprint": buildFixerDiscoveryFingerprint(repo, prNumber, "head-1", "hash-1")})
+	payloadJSON := runpipe.MustMarshalJSON(map[string]any{"discoveryFingerprint": buildFixerDiscoveryFingerprint(repo, prNumber, "head-1", "hash-1")})
 	loop := storage.LoopRecord{ID: "loop_runtime_label_gate", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}
 	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
-	queue := storage.QueueItemRecord{ID: "queue_runtime_label_gate", ProjectID: stringPtr("project_1"), LoopID: &loop.ID, Type: "fixer", TargetType: "pull_request", TargetID: "pr:acme/looper:42", Repo: &repo, PRNumber: &prNumber, DedupeKey: buildFixerDedupeKey("project_1", loop.ID, repo, prNumber, "head-1", "hash-1"), Priority: storage.QueuePriorityFixer, Status: "running", AvailableAt: nowISO, Attempts: 1, MaxAttempts: 3, PayloadJSON: &payloadJSON, CreatedAt: nowISO, UpdatedAt: nowISO}
+	queue := storage.QueueItemRecord{ID: "queue_runtime_label_gate", ProjectID: runpipe.StringPtr("project_1"), LoopID: &loop.ID, Type: "fixer", TargetType: "pull_request", TargetID: "pr:acme/looper:42", Repo: &repo, PRNumber: &prNumber, DedupeKey: buildFixerDedupeKey("project_1", loop.ID, repo, prNumber, "head-1", "hash-1"), Priority: storage.QueuePriorityFixer, Status: "running", AvailableAt: nowISO, Attempts: 1, MaxAttempts: 3, PayloadJSON: &payloadJSON, CreatedAt: nowISO, UpdatedAt: nowISO}
 	if err := fixture.repos.Queue.Upsert(context.Background(), queue); err != nil {
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
@@ -4662,16 +4663,16 @@ func TestRunDiscoverPRStepLabelMismatchFinalizerPausesLoop(t *testing.T) {
 	repo := "acme/looper"
 	prNumber := int64(42)
 	nowISO := fixture.nowISO()
-	loopMetadata := mustMarshalJSON(map[string]any{"fixerFailureStreak": failureStreakState{FixItemsStateHash: "items-1", Step: string(stepRepair), ConsecutiveCount: 2, RecordedAt: nowISO}})
+	loopMetadata := runpipe.MustMarshalJSON(map[string]any{"fixerFailureStreak": failureStreakState{FixItemsStateHash: "items-1", Step: string(stepRepair), ConsecutiveCount: 2, RecordedAt: nowISO}})
 	loop := storage.LoopRecord{ID: "loop_discover_step_label_mismatch", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", Repo: &repo, PRNumber: &prNumber, Status: "running", MetadataJSON: &loopMetadata, CreatedAt: nowISO, UpdatedAt: nowISO}
 	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
-	run := storage.RunRecord{ID: "run_discover_step_label_mismatch", LoopID: loop.ID, Status: "running", CurrentStep: stringPtr(string(stepDiscoverPR)), StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
+	run := storage.RunRecord{ID: "run_discover_step_label_mismatch", LoopID: loop.ID, Status: "running", CurrentStep: runpipe.StringPtr(string(stepDiscoverPR)), StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
 	if err := fixture.repos.Runs.Upsert(context.Background(), run); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
-	queue := storage.QueueItemRecord{ID: "queue_discover_step_label_mismatch", ProjectID: stringPtr("project_1"), LoopID: &loop.ID, Type: "fixer", TargetType: "pull_request", TargetID: "pr:acme/looper:42", Repo: &repo, PRNumber: &prNumber, DedupeKey: "fixer:discover-step-label-mismatch", Priority: storage.QueuePriorityFixer, Status: "running", AvailableAt: nowISO, Attempts: 1, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}
+	queue := storage.QueueItemRecord{ID: "queue_discover_step_label_mismatch", ProjectID: runpipe.StringPtr("project_1"), LoopID: &loop.ID, Type: "fixer", TargetType: "pull_request", TargetID: "pr:acme/looper:42", Repo: &repo, PRNumber: &prNumber, DedupeKey: "fixer:discover-step-label-mismatch", Priority: storage.QueuePriorityFixer, Status: "running", AvailableAt: nowISO, Attempts: 1, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}
 	if err := fixture.repos.Queue.Upsert(context.Background(), queue); err != nil {
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
@@ -4750,7 +4751,7 @@ func TestProcessClaimedItemMarksRunFailedWhenOwnershipCheckErrorsBeforeStart(t *
 	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
-	queue := storage.QueueItemRecord{ID: "queue_ownership_error", ProjectID: stringPtr("project_1"), LoopID: &loop.ID, Type: "fixer", TargetType: "pull_request", TargetID: "pr:acme/looper:42", Repo: &repo, PRNumber: &prNumber, DedupeKey: "fixer:ownership-error", Priority: storage.QueuePriorityFixer, Status: "running", AvailableAt: nowISO, Attempts: 1, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}
+	queue := storage.QueueItemRecord{ID: "queue_ownership_error", ProjectID: runpipe.StringPtr("project_1"), LoopID: &loop.ID, Type: "fixer", TargetType: "pull_request", TargetID: "pr:acme/looper:42", Repo: &repo, PRNumber: &prNumber, DedupeKey: "fixer:ownership-error", Priority: storage.QueuePriorityFixer, Status: "running", AvailableAt: nowISO, Attempts: 1, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}
 	if err := fixture.repos.Queue.Upsert(context.Background(), queue); err != nil {
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
@@ -4818,7 +4819,7 @@ func TestCreateRunContextRefreshesUnsupportedSnapshotWhenValidationGateEnabled(t
 		Logger:         fixture.logger,
 		Now:            fixture.now,
 		AgentRuntime:   string(config.AgentVendorCodex),
-		AgentModel:     stringPtr("gpt-5"),
+		AgentModel:     runpipe.StringPtr("gpt-5"),
 		AgentProfileID: "fast",
 		ValidationCommandsByProject: map[string][]string{
 			"project_1": {"go test ./..."},
@@ -4827,12 +4828,12 @@ func TestCreateRunContextRefreshesUnsupportedSnapshotWhenValidationGateEnabled(t
 	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_unsupported_snapshot", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
-	checkpointJSON := mustMarshalJSON(fixerCheckpoint{ResumePolicy: "retry_from_timeout_context"})
+	checkpointJSON := runpipe.MustMarshalJSON(fixerCheckpoint{ResumePolicy: "retry_from_timeout_context"})
 	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{
 		ID:                "run_failed_unsupported_snapshot",
 		LoopID:            "loop_unsupported_snapshot",
 		Status:            "failed",
-		CurrentStep:       stringPtr(string(stepDiscoverPR)),
+		CurrentStep:       runpipe.StringPtr(string(stepDiscoverPR)),
 		CheckpointJSON:    &checkpointJSON,
 		AgentSnapshotJSON: &predecessorSnapshot,
 		StartedAt:         nowISO,
@@ -4903,7 +4904,7 @@ func TestCreateRunContextPreservesAuthorSnapshotWhenResumingAfterRepair(t *testi
 		Logger:         fixture.logger,
 		Now:            fixture.now,
 		AgentRuntime:   string(config.AgentVendorCodex),
-		AgentModel:     stringPtr("gpt-5"),
+		AgentModel:     runpipe.StringPtr("gpt-5"),
 		AgentProfileID: "fast",
 		ValidationCommandsByProject: map[string][]string{
 			"project_1": {"go test ./..."},
@@ -4914,13 +4915,13 @@ func TestCreateRunContextPreservesAuthorSnapshotWhenResumingAfterRepair(t *testi
 	}
 	// No worktree checkpoint → shouldResumeFromPrepare is false; advance past
 	// repair to reconcile-commits without replaying the agent step.
-	checkpointJSON := mustMarshalJSON(fixerCheckpoint{ResumePolicy: "advance_from_checkpoint", Repair: &checkpointRepair{CompletedAt: nowISO}})
+	checkpointJSON := runpipe.MustMarshalJSON(fixerCheckpoint{ResumePolicy: "advance_from_checkpoint", Repair: &checkpointRepair{CompletedAt: nowISO}})
 	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{
 		ID:                "run_failed_after_repair",
 		LoopID:            "loop_preserved_snapshot",
 		Status:            "failed",
-		CurrentStep:       stringPtr(string(stepValidate)),
-		LastCompletedStep: stringPtr(string(stepRepair)),
+		CurrentStep:       runpipe.StringPtr(string(stepValidate)),
+		LastCompletedStep: runpipe.StringPtr(string(stepRepair)),
 		CheckpointJSON:    &checkpointJSON,
 		AgentSnapshotJSON: &predecessorSnapshot,
 		StartedAt:         nowISO,
@@ -4970,8 +4971,8 @@ func TestCreateRunContextTreatsLegacyMarkerlessRunAsRetryable(t *testing.T) {
 	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
-	checkpointJSON := mustMarshalJSON(fixerCheckpoint{ResumePolicy: "replay_step"})
-	active := storage.RunRecord{ID: "run_legacy_markerless", LoopID: loop.ID, Status: "running", CurrentStep: stringPtr(string(stepDiscoverPR)), CheckpointJSON: &checkpointJSON, StartedAt: oldISO, LastHeartbeatAt: &oldISO, CreatedAt: oldISO, UpdatedAt: oldISO}
+	checkpointJSON := runpipe.MustMarshalJSON(fixerCheckpoint{ResumePolicy: "replay_step"})
+	active := storage.RunRecord{ID: "run_legacy_markerless", LoopID: loop.ID, Status: "running", CurrentStep: runpipe.StringPtr(string(stepDiscoverPR)), CheckpointJSON: &checkpointJSON, StartedAt: oldISO, LastHeartbeatAt: &oldISO, CreatedAt: oldISO, UpdatedAt: oldISO}
 	if err := fixture.repos.Runs.Upsert(context.Background(), active); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
@@ -4980,9 +4981,9 @@ func TestCreateRunContextTreatsLegacyMarkerlessRunAsRetryable(t *testing.T) {
 	if err == nil {
 		t.Fatal("createRunContext() error = nil, want retryable legacy markerless error")
 	}
-	var loopErr *loopError
-	if !errors.As(err, &loopErr) || loopErr.kind != FailureRetryableTransient {
-		t.Fatalf("createRunContext() error = %#v, want retryable transient loopError", err)
+	var loopErr *runpipe.LoopError
+	if !errors.As(err, &loopErr) || loopErr.Kind != runpipe.FailureRetryableTransient {
+		t.Fatalf("createRunContext() error = %#v, want retryable transient runpipe.LoopError", err)
 	}
 	preservedRun, err := fixture.repos.Runs.GetByID(context.Background(), active.ID)
 	if err != nil || preservedRun == nil {
@@ -5005,8 +5006,8 @@ func TestCreateRunContextInterruptsLegacyMarkerlessRunAfterGrace(t *testing.T) {
 	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
-	checkpointJSON := mustMarshalJSON(fixerCheckpoint{ResumePolicy: "replay_step"})
-	orphan := storage.RunRecord{ID: "run_stale_legacy_markerless", LoopID: loop.ID, Status: "running", CurrentStep: stringPtr(string(stepDiscoverPR)), CheckpointJSON: &checkpointJSON, StartedAt: staleISO, LastHeartbeatAt: &staleISO, CreatedAt: staleISO, UpdatedAt: staleISO}
+	checkpointJSON := runpipe.MustMarshalJSON(fixerCheckpoint{ResumePolicy: "replay_step"})
+	orphan := storage.RunRecord{ID: "run_stale_legacy_markerless", LoopID: loop.ID, Status: "running", CurrentStep: runpipe.StringPtr(string(stepDiscoverPR)), CheckpointJSON: &checkpointJSON, StartedAt: staleISO, LastHeartbeatAt: &staleISO, CreatedAt: staleISO, UpdatedAt: staleISO}
 	if err := fixture.repos.Runs.Upsert(context.Background(), orphan); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
@@ -5038,8 +5039,8 @@ func TestCreateRunContextTreatsFreshMarkerlessRunAsRetryable(t *testing.T) {
 	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
-	checkpointJSON := mustMarshalJSON(fixerCheckpoint{ResumePolicy: "replay_step"})
-	active := storage.RunRecord{ID: "run_fresh_markerless", LoopID: loop.ID, Status: "running", CurrentStep: stringPtr(string(stepDiscoverPR)), CheckpointJSON: &checkpointJSON, StartedAt: nowISO, LastHeartbeatAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
+	checkpointJSON := runpipe.MustMarshalJSON(fixerCheckpoint{ResumePolicy: "replay_step"})
+	active := storage.RunRecord{ID: "run_fresh_markerless", LoopID: loop.ID, Status: "running", CurrentStep: runpipe.StringPtr(string(stepDiscoverPR)), CheckpointJSON: &checkpointJSON, StartedAt: nowISO, LastHeartbeatAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
 	if err := fixture.repos.Runs.Upsert(context.Background(), active); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
@@ -5048,9 +5049,9 @@ func TestCreateRunContextTreatsFreshMarkerlessRunAsRetryable(t *testing.T) {
 	if err == nil {
 		t.Fatal("createRunContext() error = nil, want retryable fresh-run error")
 	}
-	var loopErr *loopError
-	if !errors.As(err, &loopErr) || loopErr.kind != FailureRetryableTransient {
-		t.Fatalf("createRunContext() error = %#v, want retryable transient loopError", err)
+	var loopErr *runpipe.LoopError
+	if !errors.As(err, &loopErr) || loopErr.Kind != runpipe.FailureRetryableTransient {
+		t.Fatalf("createRunContext() error = %#v, want retryable transient runpipe.LoopError", err)
 	}
 }
 
@@ -5066,7 +5067,7 @@ func TestCreateRunContextTreatsRunningAgentExecutionAsRetryable(t *testing.T) {
 	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
-	orphan := storage.RunRecord{ID: "run_active_agent_execution", LoopID: loop.ID, Status: "running", CurrentStep: stringPtr(string(stepDiscoverPR)), StartedAt: oldISO, LastHeartbeatAt: &oldISO, CreatedAt: oldISO, UpdatedAt: oldISO}
+	orphan := storage.RunRecord{ID: "run_active_agent_execution", LoopID: loop.ID, Status: "running", CurrentStep: runpipe.StringPtr(string(stepDiscoverPR)), StartedAt: oldISO, LastHeartbeatAt: &oldISO, CreatedAt: oldISO, UpdatedAt: oldISO}
 	if err := fixture.repos.Runs.Upsert(context.Background(), orphan); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
@@ -5080,9 +5081,9 @@ func TestCreateRunContextTreatsRunningAgentExecutionAsRetryable(t *testing.T) {
 	if err == nil {
 		t.Fatal("createRunContext() error = nil, want retryable active-run error")
 	}
-	var loopErr *loopError
-	if !errors.As(err, &loopErr) || loopErr.kind != FailureRetryableTransient {
-		t.Fatalf("createRunContext() error = %#v, want retryable transient loopError", err)
+	var loopErr *runpipe.LoopError
+	if !errors.As(err, &loopErr) || loopErr.Kind != runpipe.FailureRetryableTransient {
+		t.Fatalf("createRunContext() error = %#v, want retryable transient runpipe.LoopError", err)
 	}
 	activeRun, err := fixture.repos.Runs.GetByID(context.Background(), orphan.ID)
 	if err != nil || activeRun == nil {
@@ -5105,8 +5106,8 @@ func TestCreateRunContextTreatsFreshPreStartRunAsRetryable(t *testing.T) {
 	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
-	checkpointJSON := mustMarshalJSON(fixerCheckpoint{ResumePolicy: "replay_step", RunPreStartAt: nowISO, RunPreStartRunID: "run_fresh_prestart"})
-	preStartRun := storage.RunRecord{ID: "run_fresh_prestart", LoopID: loop.ID, Status: "running", CurrentStep: stringPtr(string(stepDiscoverPR)), CheckpointJSON: &checkpointJSON, StartedAt: oldISO, LastHeartbeatAt: &oldISO, CreatedAt: oldISO, UpdatedAt: oldISO}
+	checkpointJSON := runpipe.MustMarshalJSON(fixerCheckpoint{ResumePolicy: "replay_step", RunPreStartAt: nowISO, RunPreStartRunID: "run_fresh_prestart"})
+	preStartRun := storage.RunRecord{ID: "run_fresh_prestart", LoopID: loop.ID, Status: "running", CurrentStep: runpipe.StringPtr(string(stepDiscoverPR)), CheckpointJSON: &checkpointJSON, StartedAt: oldISO, LastHeartbeatAt: &oldISO, CreatedAt: oldISO, UpdatedAt: oldISO}
 	if err := fixture.repos.Runs.Upsert(context.Background(), preStartRun); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
@@ -5115,9 +5116,9 @@ func TestCreateRunContextTreatsFreshPreStartRunAsRetryable(t *testing.T) {
 	if err == nil {
 		t.Fatal("createRunContext() error = nil, want retryable pre-start error")
 	}
-	var loopErr *loopError
-	if !errors.As(err, &loopErr) || loopErr.kind != FailureRetryableTransient {
-		t.Fatalf("createRunContext() error = %#v, want retryable transient loopError", err)
+	var loopErr *runpipe.LoopError
+	if !errors.As(err, &loopErr) || loopErr.Kind != runpipe.FailureRetryableTransient {
+		t.Fatalf("createRunContext() error = %#v, want retryable transient runpipe.LoopError", err)
 	}
 	activeRun, err := fixture.repos.Runs.GetByID(context.Background(), preStartRun.ID)
 	if err != nil || activeRun == nil {
@@ -5140,8 +5141,8 @@ func TestCreateRunContextInterruptsStalePreStartRun(t *testing.T) {
 	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
-	checkpointJSON := mustMarshalJSON(fixerCheckpoint{ResumePolicy: "replay_step", RunPreStartAt: stalePreStartAt, RunPreStartRunID: "run_stale_prestart"})
-	orphan := storage.RunRecord{ID: "run_stale_prestart", LoopID: loop.ID, Status: "running", CurrentStep: stringPtr(string(stepDiscoverPR)), CheckpointJSON: &checkpointJSON, StartedAt: stalePreStartAt, LastHeartbeatAt: &stalePreStartAt, CreatedAt: stalePreStartAt, UpdatedAt: stalePreStartAt}
+	checkpointJSON := runpipe.MustMarshalJSON(fixerCheckpoint{ResumePolicy: "replay_step", RunPreStartAt: stalePreStartAt, RunPreStartRunID: "run_stale_prestart"})
+	orphan := storage.RunRecord{ID: "run_stale_prestart", LoopID: loop.ID, Status: "running", CurrentStep: runpipe.StringPtr(string(stepDiscoverPR)), CheckpointJSON: &checkpointJSON, StartedAt: stalePreStartAt, LastHeartbeatAt: &stalePreStartAt, CreatedAt: stalePreStartAt, UpdatedAt: stalePreStartAt}
 	if err := fixture.repos.Runs.Upsert(context.Background(), orphan); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
@@ -5174,7 +5175,7 @@ func TestCreateRunContextTreatsOlderActiveAgentExecutionAsRetryable(t *testing.T
 	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
-	orphan := storage.RunRecord{ID: "run_older_active_agent_execution", LoopID: loop.ID, Status: "running", CurrentStep: stringPtr(string(stepDiscoverPR)), StartedAt: activeStartedAt, LastHeartbeatAt: &activeStartedAt, CreatedAt: activeStartedAt, UpdatedAt: activeStartedAt}
+	orphan := storage.RunRecord{ID: "run_older_active_agent_execution", LoopID: loop.ID, Status: "running", CurrentStep: runpipe.StringPtr(string(stepDiscoverPR)), StartedAt: activeStartedAt, LastHeartbeatAt: &activeStartedAt, CreatedAt: activeStartedAt, UpdatedAt: activeStartedAt}
 	if err := fixture.repos.Runs.Upsert(context.Background(), orphan); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
@@ -5192,9 +5193,9 @@ func TestCreateRunContextTreatsOlderActiveAgentExecutionAsRetryable(t *testing.T
 	if err == nil {
 		t.Fatal("createRunContext() error = nil, want retryable active-run error")
 	}
-	var loopErr *loopError
-	if !errors.As(err, &loopErr) || loopErr.kind != FailureRetryableTransient {
-		t.Fatalf("createRunContext() error = %#v, want retryable transient loopError", err)
+	var loopErr *runpipe.LoopError
+	if !errors.As(err, &loopErr) || loopErr.Kind != runpipe.FailureRetryableTransient {
+		t.Fatalf("createRunContext() error = %#v, want retryable transient runpipe.LoopError", err)
 	}
 	activeRun, err := fixture.repos.Runs.GetByID(context.Background(), orphan.ID)
 	if err != nil || activeRun == nil {
@@ -5217,7 +5218,7 @@ func TestCreateRunContextTreatsMarkerlessRunWithTerminalAgentExecutionAsRetryabl
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
 	oldISO := fixture.current.Add(-2 * time.Minute).UTC().Format(time.RFC3339Nano)
-	active := storage.RunRecord{ID: "run_terminal_agent_execution", LoopID: loop.ID, Status: "running", CurrentStep: stringPtr(string(stepDiscoverPR)), StartedAt: oldISO, LastHeartbeatAt: &oldISO, CreatedAt: oldISO, UpdatedAt: oldISO}
+	active := storage.RunRecord{ID: "run_terminal_agent_execution", LoopID: loop.ID, Status: "running", CurrentStep: runpipe.StringPtr(string(stepDiscoverPR)), StartedAt: oldISO, LastHeartbeatAt: &oldISO, CreatedAt: oldISO, UpdatedAt: oldISO}
 	if err := fixture.repos.Runs.Upsert(context.Background(), active); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
@@ -5232,9 +5233,9 @@ func TestCreateRunContextTreatsMarkerlessRunWithTerminalAgentExecutionAsRetryabl
 	if err == nil {
 		t.Fatal("createRunContext() error = nil, want retryable markerless active-run error")
 	}
-	var loopErr *loopError
-	if !errors.As(err, &loopErr) || loopErr.kind != FailureRetryableTransient {
-		t.Fatalf("createRunContext() error = %#v, want retryable transient loopError", err)
+	var loopErr *runpipe.LoopError
+	if !errors.As(err, &loopErr) || loopErr.Kind != runpipe.FailureRetryableTransient {
+		t.Fatalf("createRunContext() error = %#v, want retryable transient runpipe.LoopError", err)
 	}
 	preservedRun, err := fixture.repos.Runs.GetByID(context.Background(), active.ID)
 	if err != nil || preservedRun == nil {
@@ -5256,7 +5257,7 @@ func TestProcessClaimedQueueItemRequeuesWhenActiveRunHasAgentExecution(t *testin
 	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_active_agent_execution_queue", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
-	activeRun := storage.RunRecord{ID: "run_active_agent_execution_queue", LoopID: "loop_active_agent_execution_queue", Status: "running", CurrentStep: stringPtr(string(stepDiscoverPR)), StartedAt: nowISO, LastHeartbeatAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
+	activeRun := storage.RunRecord{ID: "run_active_agent_execution_queue", LoopID: "loop_active_agent_execution_queue", Status: "running", CurrentStep: runpipe.StringPtr(string(stepDiscoverPR)), StartedAt: nowISO, LastHeartbeatAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
 	if err := fixture.repos.Runs.Upsert(context.Background(), activeRun); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
@@ -5279,14 +5280,14 @@ func TestProcessClaimedQueueItemRequeuesWhenActiveRunHasAgentExecution(t *testin
 	if err != nil {
 		t.Fatalf("ProcessClaimedQueueItem() error = %v", err)
 	}
-	if result == nil || result.Status != "failed" || result.FailureKind != FailureRetryableTransient || !contains(result.Summary, "already has a running fixer run") {
+	if result == nil || result.Status != "failed" || result.FailureKind != runpipe.FailureRetryableTransient || !contains(result.Summary, "already has a running fixer run") {
 		t.Fatalf("result = %#v, want retryable_transient active-run recovery", result)
 	}
 	queue, err := fixture.repos.Queue.GetByID(context.Background(), claim.ID)
 	if err != nil {
 		t.Fatalf("Queue.GetByID() error = %v", err)
 	}
-	if queue == nil || queue.Status != "queued" || queue.Attempts != 0 || queue.LastErrorKind == nil || *queue.LastErrorKind != string(FailureRetryableTransient) {
+	if queue == nil || queue.Status != "queued" || queue.Attempts != 0 || queue.LastErrorKind == nil || *queue.LastErrorKind != string(runpipe.FailureRetryableTransient) {
 		t.Fatalf("queue = %#v, want requeued retryable_transient active-run failure without consuming attempts", queue)
 	}
 	loop, err := fixture.repos.Loops.GetByID(context.Background(), loopID)
@@ -5317,8 +5318,8 @@ func TestProcessClaimedQueueItemRequeuesLegacyMarkerlessRunWithoutConsumingAttem
 	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_legacy_markerless_queue", Seq: 1, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
-	checkpointJSON := mustMarshalJSON(fixerCheckpoint{ResumePolicy: "replay_step"})
-	activeRun := storage.RunRecord{ID: "run_legacy_markerless_queue", LoopID: "loop_legacy_markerless_queue", Status: "running", CurrentStep: stringPtr(string(stepDiscoverPR)), CheckpointJSON: &checkpointJSON, StartedAt: oldISO, LastHeartbeatAt: &oldISO, CreatedAt: oldISO, UpdatedAt: oldISO}
+	checkpointJSON := runpipe.MustMarshalJSON(fixerCheckpoint{ResumePolicy: "replay_step"})
+	activeRun := storage.RunRecord{ID: "run_legacy_markerless_queue", LoopID: "loop_legacy_markerless_queue", Status: "running", CurrentStep: runpipe.StringPtr(string(stepDiscoverPR)), CheckpointJSON: &checkpointJSON, StartedAt: oldISO, LastHeartbeatAt: &oldISO, CreatedAt: oldISO, UpdatedAt: oldISO}
 	if err := fixture.repos.Runs.Upsert(context.Background(), activeRun); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
@@ -5337,14 +5338,14 @@ func TestProcessClaimedQueueItemRequeuesLegacyMarkerlessRunWithoutConsumingAttem
 	if err != nil {
 		t.Fatalf("ProcessClaimedQueueItem() error = %v", err)
 	}
-	if result == nil || result.Status != "failed" || result.FailureKind != FailureRetryableTransient || !contains(result.Summary, "markerless running fixer run") {
+	if result == nil || result.Status != "failed" || result.FailureKind != runpipe.FailureRetryableTransient || !contains(result.Summary, "markerless running fixer run") {
 		t.Fatalf("result = %#v, want retryable_transient markerless active-run recovery", result)
 	}
 	queue, err := fixture.repos.Queue.GetByID(context.Background(), claim.ID)
 	if err != nil {
 		t.Fatalf("Queue.GetByID() error = %v", err)
 	}
-	if queue == nil || queue.Status != "queued" || queue.Attempts != 1 || queue.LastErrorKind == nil || *queue.LastErrorKind != string(FailureRetryableTransient) {
+	if queue == nil || queue.Status != "queued" || queue.Attempts != 1 || queue.LastErrorKind == nil || *queue.LastErrorKind != string(runpipe.FailureRetryableTransient) {
 		t.Fatalf("queue = %#v, want requeued markerless active-run failure without consuming attempts", queue)
 	}
 	preservedRun, err := fixture.repos.Runs.GetByID(context.Background(), activeRun.ID)
@@ -5368,7 +5369,7 @@ func TestCreateRunContextPreservesMarkerlessRunDespiteStartedEvent(t *testing.T)
 	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
-	startedRun := storage.RunRecord{ID: "run_started", LoopID: loop.ID, Status: "running", CurrentStep: stringPtr(string(stepDiscoverPR)), StartedAt: oldISO, LastHeartbeatAt: &oldISO, CreatedAt: oldISO, UpdatedAt: oldISO}
+	startedRun := storage.RunRecord{ID: "run_started", LoopID: loop.ID, Status: "running", CurrentStep: runpipe.StringPtr(string(stepDiscoverPR)), StartedAt: oldISO, LastHeartbeatAt: &oldISO, CreatedAt: oldISO, UpdatedAt: oldISO}
 	if err := fixture.repos.Runs.Upsert(context.Background(), startedRun); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
@@ -5382,9 +5383,9 @@ func TestCreateRunContextPreservesMarkerlessRunDespiteStartedEvent(t *testing.T)
 	if err == nil {
 		t.Fatal("createRunContext() error = nil, want retryable markerless active-run error")
 	}
-	var loopErr *loopError
-	if !errors.As(err, &loopErr) || loopErr.kind != FailureRetryableTransient {
-		t.Fatalf("createRunContext() error = %#v, want retryable transient loopError", err)
+	var loopErr *runpipe.LoopError
+	if !errors.As(err, &loopErr) || loopErr.Kind != runpipe.FailureRetryableTransient {
+		t.Fatalf("createRunContext() error = %#v, want retryable transient runpipe.LoopError", err)
 	}
 	preserved, err := fixture.repos.Runs.GetByID(context.Background(), startedRun.ID)
 	if err != nil || preserved == nil {
@@ -5407,8 +5408,8 @@ func TestCreateRunContextTreatsDurablyStartedRunAsRetryableWhenEventMissing(t *t
 	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
-	checkpointJSON := mustMarshalJSON(fixerCheckpoint{ResumePolicy: "replay_step", RunStartedAt: nowISO, RunStartedRunID: "run_started_missing_event"})
-	startedRun := storage.RunRecord{ID: "run_started_missing_event", LoopID: loop.ID, Status: "running", CurrentStep: stringPtr(string(stepDiscoverPR)), CheckpointJSON: &checkpointJSON, StartedAt: oldISO, LastHeartbeatAt: &oldISO, CreatedAt: oldISO, UpdatedAt: oldISO}
+	checkpointJSON := runpipe.MustMarshalJSON(fixerCheckpoint{ResumePolicy: "replay_step", RunStartedAt: nowISO, RunStartedRunID: "run_started_missing_event"})
+	startedRun := storage.RunRecord{ID: "run_started_missing_event", LoopID: loop.ID, Status: "running", CurrentStep: runpipe.StringPtr(string(stepDiscoverPR)), CheckpointJSON: &checkpointJSON, StartedAt: oldISO, LastHeartbeatAt: &oldISO, CreatedAt: oldISO, UpdatedAt: oldISO}
 	if err := fixture.repos.Runs.Upsert(context.Background(), startedRun); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
@@ -5417,9 +5418,9 @@ func TestCreateRunContextTreatsDurablyStartedRunAsRetryableWhenEventMissing(t *t
 	if err == nil {
 		t.Fatal("createRunContext() error = nil, want retryable started-run error")
 	}
-	var loopErr *loopError
-	if !errors.As(err, &loopErr) || loopErr.kind != FailureRetryableTransient {
-		t.Fatalf("createRunContext() error = %#v, want retryable transient loopError", err)
+	var loopErr *runpipe.LoopError
+	if !errors.As(err, &loopErr) || loopErr.Kind != runpipe.FailureRetryableTransient {
+		t.Fatalf("createRunContext() error = %#v, want retryable transient runpipe.LoopError", err)
 	}
 	activeRun, err := fixture.repos.Runs.GetByID(context.Background(), startedRun.ID)
 	if err != nil || activeRun == nil {
@@ -5449,8 +5450,8 @@ func TestCreateRunContextTreatsLegacyStartedRunAsRetryable(t *testing.T) {
 	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
-	checkpointJSON := mustMarshalJSON(fixerCheckpoint{ResumePolicy: "replay_step", RunStartedAt: nowISO})
-	startedRun := storage.RunRecord{ID: "run_legacy_started", LoopID: loop.ID, Status: "running", CurrentStep: stringPtr(string(stepDiscoverPR)), CheckpointJSON: &checkpointJSON, StartedAt: oldISO, LastHeartbeatAt: &oldISO, CreatedAt: oldISO, UpdatedAt: oldISO}
+	checkpointJSON := runpipe.MustMarshalJSON(fixerCheckpoint{ResumePolicy: "replay_step", RunStartedAt: nowISO})
+	startedRun := storage.RunRecord{ID: "run_legacy_started", LoopID: loop.ID, Status: "running", CurrentStep: runpipe.StringPtr(string(stepDiscoverPR)), CheckpointJSON: &checkpointJSON, StartedAt: oldISO, LastHeartbeatAt: &oldISO, CreatedAt: oldISO, UpdatedAt: oldISO}
 	if err := fixture.repos.Runs.Upsert(context.Background(), startedRun); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
@@ -5459,9 +5460,9 @@ func TestCreateRunContextTreatsLegacyStartedRunAsRetryable(t *testing.T) {
 	if err == nil {
 		t.Fatal("createRunContext() error = nil, want retryable legacy started-run error")
 	}
-	var loopErr *loopError
-	if !errors.As(err, &loopErr) || loopErr.kind != FailureRetryableTransient {
-		t.Fatalf("createRunContext() error = %#v, want retryable transient loopError", err)
+	var loopErr *runpipe.LoopError
+	if !errors.As(err, &loopErr) || loopErr.Kind != runpipe.FailureRetryableTransient {
+		t.Fatalf("createRunContext() error = %#v, want retryable transient runpipe.LoopError", err)
 	}
 }
 
@@ -5478,8 +5479,8 @@ func TestCreateRunContextInterruptsLegacyStaleStartedMarker(t *testing.T) {
 	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
-	checkpointJSON := mustMarshalJSON(fixerCheckpoint{ResumePolicy: "advance_from_checkpoint", RunStartedAt: staleStartedAt})
-	orphan := storage.RunRecord{ID: "run_legacy_stale_started", LoopID: loop.ID, Status: "running", CurrentStep: stringPtr(string(stepDiscoverPR)), CheckpointJSON: &checkpointJSON, StartedAt: createdAt, LastHeartbeatAt: &createdAt, CreatedAt: createdAt, UpdatedAt: createdAt}
+	checkpointJSON := runpipe.MustMarshalJSON(fixerCheckpoint{ResumePolicy: "advance_from_checkpoint", RunStartedAt: staleStartedAt})
+	orphan := storage.RunRecord{ID: "run_legacy_stale_started", LoopID: loop.ID, Status: "running", CurrentStep: runpipe.StringPtr(string(stepDiscoverPR)), CheckpointJSON: &checkpointJSON, StartedAt: createdAt, LastHeartbeatAt: &createdAt, CreatedAt: createdAt, UpdatedAt: createdAt}
 	if err := fixture.repos.Runs.Upsert(context.Background(), orphan); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
@@ -5512,8 +5513,8 @@ func TestCreateRunContextInterruptsResumedRunWithStaleStartMarker(t *testing.T) 
 	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
-	checkpointJSON := mustMarshalJSON(fixerCheckpoint{ResumePolicy: "advance_from_checkpoint", RunStartedAt: staleStartedAt, RunStartedRunID: "previous_run"})
-	orphan := storage.RunRecord{ID: "run_stale_started_marker", LoopID: loop.ID, Status: "running", CurrentStep: stringPtr(string(stepDiscoverPR)), CheckpointJSON: &checkpointJSON, StartedAt: staleStartedAt, LastHeartbeatAt: &staleStartedAt, CreatedAt: staleStartedAt, UpdatedAt: staleStartedAt}
+	checkpointJSON := runpipe.MustMarshalJSON(fixerCheckpoint{ResumePolicy: "advance_from_checkpoint", RunStartedAt: staleStartedAt, RunStartedRunID: "previous_run"})
+	orphan := storage.RunRecord{ID: "run_stale_started_marker", LoopID: loop.ID, Status: "running", CurrentStep: runpipe.StringPtr(string(stepDiscoverPR)), CheckpointJSON: &checkpointJSON, StartedAt: staleStartedAt, LastHeartbeatAt: &staleStartedAt, CreatedAt: staleStartedAt, UpdatedAt: staleStartedAt}
 	if err := fixture.repos.Runs.Upsert(context.Background(), orphan); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
@@ -5600,7 +5601,7 @@ func TestProcessClaimedItemParksCompletedRepairWhenStructuredResultMissing(t *te
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
-	if result.Status != "failed" || result.FailureKind != FailureManualIntervention || !contains(result.Summary, "structured result") || !contains(result.Summary, "worktree preserved") {
+	if result.Status != "failed" || result.FailureKind != runpipe.FailureManualIntervention || !contains(result.Summary, "structured result") || !contains(result.Summary, "worktree preserved") {
 		t.Fatalf("result = %#v, want parked missing-result contract failure", result)
 	}
 	if validationCalls != 0 {
@@ -5619,7 +5620,7 @@ func TestProcessClaimedItemParksCompletedRepairWhenStructuredResultMissing(t *te
 	if err != nil {
 		t.Fatalf("Queue.GetByID() error = %v", err)
 	}
-	if queue == nil || queue.Status != "manual_intervention" || queue.LastErrorKind == nil || *queue.LastErrorKind != string(FailureManualIntervention) {
+	if queue == nil || queue.Status != "manual_intervention" || queue.LastErrorKind == nil || *queue.LastErrorKind != string(runpipe.FailureManualIntervention) {
 		t.Fatalf("queue = %#v, want parked manual_intervention item", queue)
 	}
 	loop, err := fixture.repos.Loops.GetByID(context.Background(), result.LoopID)
@@ -5696,7 +5697,7 @@ func TestProcessClaimedItemBypassesBreakerForManualInterventionCompletionFailure
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
-	if result.Status != "failed" || result.FailureKind != FailureManualIntervention {
+	if result.Status != "failed" || result.FailureKind != runpipe.FailureManualIntervention {
 		t.Fatalf("result = %#v, want parked manual_intervention failure", result)
 	}
 	if len(git.cleanupCalls) != 0 {
@@ -5780,8 +5781,8 @@ func TestValidateFixerResumeCheckpointRejectsNilRepairForDownstreamSteps(t *test
 	checkpoint := fixerCheckpoint{Worktree: &checkpointWorktree{Path: "/tmp/wt", Branch: "feature/fix-42", PreparedAt: "now"}}
 	for _, step := range []FixerStep{stepReconcileCommits, stepValidate, stepPush, stepResolveComments, stepRecheck} {
 		err := validateFixerResumeCheckpoint(step, checkpoint)
-		var loopErr *loopError
-		if !errors.As(err, &loopErr) || loopErr.kind != FailureManualIntervention {
+		var loopErr *runpipe.LoopError
+		if !errors.As(err, &loopErr) || loopErr.Kind != runpipe.FailureManualIntervention {
 			t.Fatalf("validateFixerResumeCheckpoint(%s) = %v, want manual_intervention for nil repair", step, err)
 		}
 		if !contains(err.Error(), "missing the completed repair record") {
@@ -5826,14 +5827,14 @@ func TestOperatorRetryEscapeReachesDiscoverAfterReplacementClaim(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
-	checkpointJSON := mustMarshalJSON(fixerCheckpoint{
+	checkpointJSON := runpipe.MustMarshalJSON(fixerCheckpoint{
 		ResumePolicy: loops.ResumePolicyManualIntervention,
 		Worktree:     &checkpointWorktree{Path: filepath.Join(t.TempDir(), "wt-46"), Branch: "feature/fix-46", PreparedAt: nowISO},
 		Repair:       &checkpointRepair{Summary: "missing result at resolve", ParseStatus: "", CompletedAt: nowISO},
 	})
 	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{
 		ID: "run_parked_lifecycle", LoopID: loopID, Status: "failed",
-		CurrentStep: stringPtr(string(stepResolveComments)), LastCompletedStep: stringPtr(string(stepPush)),
+		CurrentStep: runpipe.StringPtr(string(stepResolveComments)), LastCompletedStep: runpipe.StringPtr(string(stepPush)),
 		CheckpointJSON: &checkpointJSON, StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO,
 	}); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
@@ -5912,7 +5913,7 @@ func TestProcessClaimedItemPersistsCheckpointWhenRepairReturnsNonCompleted(t *te
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
-	if result.Status != "failed" || result.FailureKind != FailureRetryableTransient || !contains(result.Summary, "server_error") {
+	if result.Status != "failed" || result.FailureKind != runpipe.FailureRetryableTransient || !contains(result.Summary, "server_error") {
 		t.Fatalf("result = %#v, want retryable failed result with upstream error", result)
 	}
 	run, err := fixture.repos.Runs.GetByID(context.Background(), result.RunID)
@@ -5955,14 +5956,14 @@ func TestProcessClaimedItemTreatsAgentSetupFailureAsRetryableTransient(t *testin
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
-	if result.Status != "failed" || result.FailureKind != FailureRetryableTransient || !contains(result.Summary, "requires a newer version") {
+	if result.Status != "failed" || result.FailureKind != runpipe.FailureRetryableTransient || !contains(result.Summary, "requires a newer version") {
 		t.Fatalf("result = %#v, want retryable_transient with real agent error", result)
 	}
 	queue, err := fixture.repos.Queue.GetByID(context.Background(), claim.ID)
 	if err != nil {
 		t.Fatalf("Queue.GetByID() error = %v", err)
 	}
-	if queue == nil || queue.Status != "queued" || queue.LastErrorKind == nil || *queue.LastErrorKind != string(FailureRetryableTransient) {
+	if queue == nil || queue.Status != "queued" || queue.LastErrorKind == nil || *queue.LastErrorKind != string(runpipe.FailureRetryableTransient) {
 		t.Fatalf("queue = %#v, want queued retryable_transient failure", queue)
 	}
 	loop, err := fixture.repos.Loops.GetByID(context.Background(), result.LoopID)
@@ -5992,12 +5993,12 @@ func TestRunRepairStepFailsResumedCompletedCheckpointWithoutParsedResult(t *test
 	if checkpoint.Repair == nil {
 		t.Fatal("checkpoint.Repair = nil, want checkpoint preserved")
 	}
-	var loopErr *loopError
+	var loopErr *runpipe.LoopError
 	if !errors.As(err, &loopErr) {
-		t.Fatalf("error = %T, want *loopError", err)
+		t.Fatalf("error = %T, want *runpipe.LoopError", err)
 	}
-	if loopErr.kind != FailureManualIntervention {
-		t.Fatalf("loopErr.kind = %v, want %v", loopErr.kind, FailureManualIntervention)
+	if loopErr.Kind != runpipe.FailureManualIntervention {
+		t.Fatalf("loopErr.Kind = %v, want %v", loopErr.Kind, runpipe.FailureManualIntervention)
 	}
 	if !contains(err.Error(), "structured result") || !contains(err.Error(), "automatic retry paused") || !contains(err.Error(), "server_error") {
 		t.Fatalf("error = %q, want missing-contract recovery guidance and agent summary", err.Error())
@@ -6028,7 +6029,7 @@ func TestCreateRunContextPreservesPostRepairCheckpointWhenParseStatusIsInvalid(t
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
-	checkpointJSON := mustMarshalJSON(fixerCheckpoint{
+	checkpointJSON := runpipe.MustMarshalJSON(fixerCheckpoint{
 		ClaimedLockKey: "pr:acme/looper:42",
 		FixItems:       []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1"}},
 		Worktree:       &checkpointWorktree{Path: filepath.Join(t.TempDir(), "wt-42"), Branch: "feature/fix-42", HeadSHA: "head-1", BaseHeadSHA: "base-1", PreparedAt: nowISO},
@@ -6045,8 +6046,8 @@ func TestCreateRunContextPreservesPostRepairCheckpointWhenParseStatusIsInvalid(t
 		ID:                "run_failed_after_recheck",
 		LoopID:            "loop_fixer_rewind_invalid_repair",
 		Status:            "failed",
-		CurrentStep:       stringPtr(string(stepRecheck)),
-		LastCompletedStep: stringPtr(string(stepResolveComments)),
+		CurrentStep:       runpipe.StringPtr(string(stepRecheck)),
+		LastCompletedStep: runpipe.StringPtr(string(stepResolveComments)),
 		CheckpointJSON:    &checkpointJSON,
 		StartedAt:         nowISO,
 		CreatedAt:         nowISO,
@@ -6109,7 +6110,7 @@ func TestCreateRunContextRestartsFromDiscoverForRediscoverableCheckpoint(t *test
 	}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
-	checkpointJSON := mustMarshalJSON(fixerCheckpoint{
+	checkpointJSON := runpipe.MustMarshalJSON(fixerCheckpoint{
 		ResumePolicy: loops.ResumePolicyManualIntervention,
 		Pause:        newCheckpointPause(checkpointPauseReasonNoopResolveNoNewCommits, true, "head-1", hashFixItemsState([]FixItem{{Type: "comment", ID: "c1", ThreadID: "t1"}}), []string{"t1"}),
 		Detail: &checkpointDetail{
@@ -6131,8 +6132,8 @@ func TestCreateRunContextRestartsFromDiscoverForRediscoverableCheckpoint(t *test
 		ID:                "run_manual_intervention",
 		LoopID:            "loop_fixer_manual_restart",
 		Status:            "failed",
-		CurrentStep:       stringPtr(string(stepRecheck)),
-		LastCompletedStep: stringPtr(string(stepResolveComments)),
+		CurrentStep:       runpipe.StringPtr(string(stepRecheck)),
+		LastCompletedStep: runpipe.StringPtr(string(stepResolveComments)),
 		CheckpointJSON:    &checkpointJSON,
 		Summary:           &manualReason,
 		ErrorMessage:      &manualReason,
@@ -6191,7 +6192,7 @@ func TestProcessClaimedQueueItemParksResumedMissingResultCheckpoint(t *testing.T
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, Logger: fixture.logger, Now: fixture.now})
-	checkpointJSON := mustMarshalJSON(fixerCheckpoint{
+	checkpointJSON := runpipe.MustMarshalJSON(fixerCheckpoint{
 		Worktree: &checkpointWorktree{
 			Path:   filepath.Join(t.TempDir(), "wt-42"),
 			Branch: "feature/fix-42",
@@ -6205,7 +6206,7 @@ func TestProcessClaimedQueueItemParksResumedMissingResultCheckpoint(t *testing.T
 		ID:                "run_failed_after_repair",
 		LoopID:            "loop_fixer_resume_parse_status",
 		Status:            "failed",
-		LastCompletedStep: stringPtr(string(stepRepair)),
+		LastCompletedStep: runpipe.StringPtr(string(stepRepair)),
 		CheckpointJSON:    &checkpointJSON,
 		StartedAt:         nowISO,
 		CreatedAt:         nowISO,
@@ -6247,7 +6248,7 @@ func TestProcessClaimedQueueItemParksResumedMissingResultCheckpoint(t *testing.T
 	if err != nil {
 		t.Fatalf("ProcessClaimedQueueItem() error = %v", err)
 	}
-	if result == nil || result.Status != "failed" || result.FailureKind != FailureManualIntervention {
+	if result == nil || result.Status != "failed" || result.FailureKind != runpipe.FailureManualIntervention {
 		t.Fatalf("result = %#v, want parked manual_intervention result", result)
 	}
 
@@ -6255,7 +6256,7 @@ func TestProcessClaimedQueueItemParksResumedMissingResultCheckpoint(t *testing.T
 	if err != nil {
 		t.Fatalf("Queue.GetByID() error = %v", err)
 	}
-	if queue == nil || queue.Status != "manual_intervention" || queue.LastErrorKind == nil || *queue.LastErrorKind != string(FailureManualIntervention) || queue.FinishedAt == nil {
+	if queue == nil || queue.Status != "manual_intervention" || queue.LastErrorKind == nil || *queue.LastErrorKind != string(runpipe.FailureManualIntervention) || queue.FinishedAt == nil {
 		t.Fatalf("queue = %#v, want manual_intervention queue item without another repair attempt", queue)
 	}
 
@@ -6313,7 +6314,7 @@ func TestProcessClaimedItemRestartsFromDiscoverAfterRemoteHeadChangeAtPush(t *te
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem(first) error = %v", err)
 	}
-	if first.Status != "failed" || first.FailureKind != FailureRetryableAfterResume || !contains(first.Summary, "remote head changed") {
+	if first.Status != "failed" || first.FailureKind != runpipe.FailureRetryableAfterResume || !contains(first.Summary, "remote head changed") {
 		t.Fatalf("first result = %#v, want retryable remote-head failure", first)
 	}
 	if len(agent.starts) != 1 {
@@ -6371,7 +6372,7 @@ func TestProcessClaimedItemResumeReacquiresPullRequestLock(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem(first) error = %v", err)
 	}
-	if first.Status != "failed" || first.FailureKind != FailureRetryableTransient {
+	if first.Status != "failed" || first.FailureKind != runpipe.FailureRetryableTransient {
 		t.Fatalf("first = %#v, want retryable-transient validation failure", first)
 	}
 	fixture.advance(5 * time.Second)
@@ -6390,7 +6391,7 @@ func TestProcessClaimedItemResumeReacquiresPullRequestLock(t *testing.T) {
 	if err == nil || !contains(err.Error(), lockKey) {
 		t.Fatalf("ProcessClaimedItem(retry) error = %v, want lock reacquire failure", err)
 	}
-	if result != (ProcessResult{}) {
+	if result != (runpipe.ProcessResult{}) {
 		t.Fatalf("result = %#v, want zero result on resume lock failure", result)
 	}
 	if validationCalls != 1 {
@@ -6411,7 +6412,7 @@ func TestProcessNextSetupFailureMarksQueueFailed(t *testing.T) {
 	projectID := "project_1"
 	prNumber := int64(99)
 	nowISO := fixture.nowISO()
-	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_missing_fixer", ProjectID: &projectID, Type: "fixer", TargetType: "pull_request", TargetID: "pr:acme/looper:99", Repo: stringPtr("acme/looper"), PRNumber: &prNumber, DedupeKey: "fixer:acme/looper:99:test", Priority: 1, Status: "queued", AvailableAt: nowISO, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_missing_fixer", ProjectID: &projectID, Type: "fixer", TargetType: "pull_request", TargetID: "pr:acme/looper:99", Repo: runpipe.StringPtr("acme/looper"), PRNumber: &prNumber, DedupeKey: "fixer:acme/looper:99:test", Priority: 1, Status: "queued", AvailableAt: nowISO, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
@@ -6420,14 +6421,14 @@ func TestProcessNextSetupFailureMarksQueueFailed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ProcessNext() error = %v", err)
 	}
-	if result == nil || result.Status != "failed" || result.FailureKind != FailureNonRetryable || !contains(result.Summary, "requires loopId") {
+	if result == nil || result.Status != "failed" || result.FailureKind != runpipe.FailureNonRetryable || !contains(result.Summary, "requires loopId") {
 		t.Fatalf("result = %#v, want non-retryable missing-loopId failure", result)
 	}
 	queue, err := fixture.repos.Queue.GetByID(context.Background(), "queue_missing_fixer")
 	if err != nil {
 		t.Fatalf("Queue.GetByID() error = %v", err)
 	}
-	if queue == nil || queue.Status != "queued" || queue.LastErrorKind == nil || *queue.LastErrorKind != string(FailureNonRetryable) || queue.FinishedAt != nil {
+	if queue == nil || queue.Status != "queued" || queue.LastErrorKind == nil || *queue.LastErrorKind != string(runpipe.FailureNonRetryable) || queue.FinishedAt != nil {
 		t.Fatalf("queue = %#v, want requeued non_retryable item", queue)
 	}
 }
@@ -6438,28 +6439,28 @@ func TestRecoverClaimedItemReconcilesRunningLoopState(t *testing.T) {
 	nowISO := fixture.nowISO()
 	prNumber := int64(42)
 	loopTarget := "pr:acme/looper:42"
-	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_fixer_running", Seq: 2, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: stringPtr("acme/looper"), PRNumber: &prNumber, Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_fixer_running", Seq: 2, ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: runpipe.StringPtr("acme/looper"), PRNumber: &prNumber, Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
 	projectID := "project_1"
 	loopID := "loop_fixer_running"
-	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_fixer_running", ProjectID: &projectID, LoopID: &loopID, Type: "fixer", TargetType: "pull_request", TargetID: loopTarget, Repo: stringPtr("acme/looper"), PRNumber: &prNumber, DedupeKey: "fixer:acme/looper:42:test", Priority: 1, Status: "running", AvailableAt: nowISO, Attempts: 0, MaxAttempts: 1, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_fixer_running", ProjectID: &projectID, LoopID: &loopID, Type: "fixer", TargetType: "pull_request", TargetID: loopTarget, Repo: runpipe.StringPtr("acme/looper"), PRNumber: &prNumber, DedupeKey: "fixer:acme/looper:42:test", Priority: 1, Status: "running", AvailableAt: nowISO, Attempts: 0, MaxAttempts: 1, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
 
-	result, err := runner.recoverClaimedItem(context.Background(), storage.QueueItemRecord{ID: "queue_fixer_running", ProjectID: &projectID, LoopID: &loopID, Type: "fixer", TargetType: "pull_request", TargetID: loopTarget, Repo: stringPtr("acme/looper"), PRNumber: &prNumber, DedupeKey: "fixer:acme/looper:42:test", Priority: 1, Status: "running", AvailableAt: nowISO, Attempts: 0, MaxAttempts: 1, CreatedAt: nowISO, UpdatedAt: nowISO}, fmt.Errorf("persist step failed"))
+	result, err := runner.recoverClaimedItem(context.Background(), storage.QueueItemRecord{ID: "queue_fixer_running", ProjectID: &projectID, LoopID: &loopID, Type: "fixer", TargetType: "pull_request", TargetID: loopTarget, Repo: runpipe.StringPtr("acme/looper"), PRNumber: &prNumber, DedupeKey: "fixer:acme/looper:42:test", Priority: 1, Status: "running", AvailableAt: nowISO, Attempts: 0, MaxAttempts: 1, CreatedAt: nowISO, UpdatedAt: nowISO}, fmt.Errorf("persist step failed"))
 	if err != nil {
 		t.Fatalf("recoverClaimedItem() error = %v", err)
 	}
-	if result == nil || result.Status != "failed" || result.FailureKind != FailureNonRetryable {
+	if result == nil || result.Status != "failed" || result.FailureKind != runpipe.FailureNonRetryable {
 		t.Fatalf("result = %#v, want failed non-retryable recovery", result)
 	}
 	queue, err := fixture.repos.Queue.GetByID(context.Background(), "queue_fixer_running")
 	if err != nil {
 		t.Fatalf("Queue.GetByID() error = %v", err)
 	}
-	if queue == nil || queue.Status != "manual_intervention" || queue.LastErrorKind == nil || *queue.LastErrorKind != string(FailureNonRetryable) || queue.FinishedAt == nil {
+	if queue == nil || queue.Status != "manual_intervention" || queue.LastErrorKind == nil || *queue.LastErrorKind != string(runpipe.FailureNonRetryable) || queue.FinishedAt == nil {
 		t.Fatalf("queue = %#v, want parked non_retryable recovery item", queue)
 	}
 	loop, err := fixture.repos.Loops.GetByID(context.Background(), loopID)
@@ -6505,7 +6506,7 @@ func TestProcessClaimedItemAutoPushDisabledSkipsManualIntervention(t *testing.T)
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
-	if result.Status != "failed" || result.FailureKind != FailureManualIntervention || !contains(result.Summary, "Auto push disabled") {
+	if result.Status != "failed" || result.FailureKind != runpipe.FailureManualIntervention || !contains(result.Summary, "Auto push disabled") {
 		t.Fatalf("result = %#v, want manual-intervention auto-push summary", result)
 	}
 	if len(git.pushCalls) != 0 {
@@ -6515,7 +6516,7 @@ func TestProcessClaimedItemAutoPushDisabledSkipsManualIntervention(t *testing.T)
 	if err != nil {
 		t.Fatalf("Queue.GetByID() error = %v", err)
 	}
-	if queue == nil || queue.Status != "manual_intervention" || queue.LastErrorKind == nil || *queue.LastErrorKind != string(FailureManualIntervention) || queue.FinishedAt == nil {
+	if queue == nil || queue.Status != "manual_intervention" || queue.LastErrorKind == nil || *queue.LastErrorKind != string(runpipe.FailureManualIntervention) || queue.FinishedAt == nil {
 		t.Fatalf("queue = %#v, want parked manual_intervention item", queue)
 	}
 	run, err := fixture.repos.Runs.GetByID(context.Background(), result.RunID)
@@ -6578,12 +6579,12 @@ func TestRunRepairStepRequiresManualInterventionForRiskyConflictWhenDisabled(t *
 	if err == nil {
 		t.Fatal("runRepairStep() error = nil, want manual intervention")
 	}
-	var loopErr *loopError
+	var loopErr *runpipe.LoopError
 	if !errors.As(err, &loopErr) {
-		t.Fatalf("error = %T, want *loopError", err)
+		t.Fatalf("error = %T, want *runpipe.LoopError", err)
 	}
-	if loopErr.kind != FailureManualIntervention {
-		t.Fatalf("loopErr.kind = %v, want %v", loopErr.kind, FailureManualIntervention)
+	if loopErr.Kind != runpipe.FailureManualIntervention {
+		t.Fatalf("loopErr.Kind = %v, want %v", loopErr.Kind, runpipe.FailureManualIntervention)
 	}
 	if checkpoint.ResumePolicy != "manual_intervention" {
 		t.Fatalf("checkpoint.ResumePolicy = %q, want manual_intervention", checkpoint.ResumePolicy)
@@ -6620,7 +6621,7 @@ func TestRunRepairStepSkipsWhenFixerHoldAppliedBeforeAgentStart(t *testing.T) {
 			FixItemsHash: "hash-1",
 		},
 	})
-	var holdErr *holdSkipError
+	var holdErr *runpipe.HoldSkipError
 	if !errors.As(err, &holdErr) {
 		t.Fatalf("runRepairStep() error = %v, want hold skip", err)
 	}
@@ -6689,12 +6690,12 @@ func TestReconcileCommitsRequiresManualInterventionWhenAutoCommitDisabledAndDirt
 	if err == nil {
 		t.Fatal("reconcileCommits() error = nil, want manual intervention")
 	}
-	var loopErr *loopError
+	var loopErr *runpipe.LoopError
 	if !errors.As(err, &loopErr) {
-		t.Fatalf("error = %T, want *loopError", err)
+		t.Fatalf("error = %T, want *runpipe.LoopError", err)
 	}
-	if loopErr.kind != FailureManualIntervention {
-		t.Fatalf("loopErr.kind = %v, want %v", loopErr.kind, FailureManualIntervention)
+	if loopErr.Kind != runpipe.FailureManualIntervention {
+		t.Fatalf("loopErr.Kind = %v, want %v", loopErr.Kind, runpipe.FailureManualIntervention)
 	}
 	if checkpoint.ResumePolicy != "manual_intervention" {
 		t.Fatalf("checkpoint.ResumePolicy = %q, want manual_intervention", checkpoint.ResumePolicy)
@@ -7471,7 +7472,7 @@ func TestClearFixerFollowupMetadataPreservesZeroProgressPauseReason(t *testing.T
 	repo := "acme/looper"
 	prNumber := int64(81)
 	loopTarget := buildPullRequestTargetID(repo, prNumber)
-	metadata := mustMarshalJSON(map[string]any{
+	metadata := runpipe.MustMarshalJSON(map[string]any{
 		"fixerFollowup":            map[string]any{"reason": "missing_evidence"},
 		"lastNoopResolveHeadSha":   "head-1",
 		"lastNoopResolveStateHash": "same-hash",
@@ -7575,7 +7576,7 @@ func TestProcessClaimedItemPausesAfterConsecutiveFailureStreak(t *testing.T) {
 	if _, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
 		t.Fatalf("DiscoverPullRequests() error = %v", err)
 	}
-	var result ProcessResult
+	var result runpipe.ProcessResult
 	for attempt := 1; attempt <= maxConsecutiveFixerFailures; attempt++ {
 		claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "fixer-worker-1", "fixer")
 		if err != nil || claim == nil {
@@ -7585,7 +7586,7 @@ func TestProcessClaimedItemPausesAfterConsecutiveFailureStreak(t *testing.T) {
 		if err != nil {
 			t.Fatalf("attempt %d ProcessClaimedItem() error = %v", attempt, err)
 		}
-		if result.Status != "failed" || result.FailureKind != FailureRetryableTransient {
+		if result.Status != "failed" || result.FailureKind != runpipe.FailureRetryableTransient {
 			t.Fatalf("attempt %d result = %#v, want retryable failed result", attempt, result)
 		}
 		queue, err := fixture.repos.Queue.GetByID(context.Background(), result.QueueItemID)
@@ -7658,7 +7659,7 @@ func TestProcessClaimedItemPausesAfterCustomConsecutiveFailureThreshold(t *testi
 	if err != nil {
 		t.Fatalf("ProcessClaimedItem() error = %v", err)
 	}
-	if result.Status != "failed" || result.FailureKind != FailureRetryableTransient {
+	if result.Status != "failed" || result.FailureKind != runpipe.FailureRetryableTransient {
 		t.Fatalf("result = %#v, want retryable failed result", result)
 	}
 	queue, err := fixture.repos.Queue.GetByID(context.Background(), result.QueueItemID)
@@ -7852,7 +7853,7 @@ func TestEnsureLoopForPullRequestResumesFailureStreakLoopOnHeadChange(t *testing
 	loopTarget := buildPullRequestTargetID(repo, prNumber)
 	baseItems := []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", ThreadFingerprint: "thread-fingerprint-1"}}
 	baseStateHash := hashFixItemsState(baseItems)
-	metadata := mustMarshalJSON(map[string]any{
+	metadata := runpipe.MustMarshalJSON(map[string]any{
 		"pauseReason": failureStreakPauseReason,
 		"fixerFailureStreak": failureStreakState{
 			LastHeadSHA:       "head-1",
@@ -7900,7 +7901,7 @@ func TestEnsureLoopForPullRequestResumesFailureStreakLoopOnStateChange(t *testin
 	loopTarget := buildPullRequestTargetID(repo, prNumber)
 	baseItems := []FixItem{{Type: "comment", ID: "c1", ThreadID: "t1", ThreadFingerprint: "thread-fingerprint-1"}}
 	baseStateHash := hashFixItemsState(baseItems)
-	metadata := mustMarshalJSON(map[string]any{
+	metadata := runpipe.MustMarshalJSON(map[string]any{
 		"pauseReason": failureStreakPauseReason,
 		"fixerFailureStreak": failureStreakState{
 			LastHeadSHA:       "head-1",
@@ -8337,7 +8338,7 @@ func TestRunPushStepAdoptsAgentLifecyclePushEvidence(t *testing.T) {
 	loopMetadata := `{}`
 	loopTarget := buildPullRequestTargetID("acme/looper", 42)
 	prNumber := int64(42)
-	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_1", ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: stringPtr("acme/looper"), PRNumber: &prNumber, Status: "running", MetadataJSON: &loopMetadata, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_1", ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: runpipe.StringPtr("acme/looper"), PRNumber: &prNumber, Status: "running", MetadataJSON: &loopMetadata, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
 	github := &fakeGitHubGateway{viewResponses: []PullRequestDetail{{Number: 42, State: "OPEN", HeadSHA: "agent-head", HeadRefName: "feature/fix-42", BaseRefName: "main", BaseSHA: "base-head"}}}
@@ -8385,7 +8386,7 @@ func TestRunPushStepRecordsPushEvidenceBeforePostPushHold(t *testing.T) {
 	loopMetadata := `{}`
 	loopTarget := buildPullRequestTargetID("acme/looper", 42)
 	prNumber := int64(42)
-	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_post_push_hold", ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: stringPtr("acme/looper"), PRNumber: &prNumber, Status: "running", MetadataJSON: &loopMetadata, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_post_push_hold", ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: runpipe.StringPtr("acme/looper"), PRNumber: &prNumber, Status: "running", MetadataJSON: &loopMetadata, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
 	run := storage.RunRecord{ID: "run_post_push_hold", LoopID: "loop_post_push_hold", Status: "running", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
@@ -8411,7 +8412,7 @@ func TestRunPushStepRecordsPushEvidenceBeforePostPushHold(t *testing.T) {
 
 	updated, err := runner.runPushStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()}, Loop: storage.LoopRecord{ID: "loop_post_push_hold", MetadataJSON: &loopMetadata}, Run: run, Repo: "acme/looper", PRNumber: 42, Checkpoint: checkpoint})
 
-	var holdErr *holdSkipError
+	var holdErr *runpipe.HoldSkipError
 	if !errors.As(err, &holdErr) {
 		t.Fatalf("runPushStep() error = %v, want hold skip", err)
 	}
@@ -8442,7 +8443,7 @@ func TestRunPushStepRevalidatesHeadThatChangedAfterValidation(t *testing.T) {
 	loopMetadata := `{}`
 	loopTarget := buildPullRequestTargetID("acme/looper", 42)
 	prNumber := int64(42)
-	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_revalidate_push", ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: stringPtr("acme/looper"), PRNumber: &prNumber, Status: "running", MetadataJSON: &loopMetadata, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_revalidate_push", ProjectID: "project_1", Type: "fixer", TargetType: "pull_request", TargetID: &loopTarget, Repo: runpipe.StringPtr("acme/looper"), PRNumber: &prNumber, Status: "running", MetadataJSON: &loopMetadata, CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
 	run := storage.RunRecord{ID: "run_revalidate_push", LoopID: "loop_revalidate_push", Status: "running", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}

@@ -9,14 +9,15 @@ import (
 	"github.com/MumuTW/looper/internal/config"
 	"github.com/MumuTW/looper/internal/fixer/failurepolicy"
 	"github.com/MumuTW/looper/internal/loops/failureclass"
+	"github.com/MumuTW/looper/internal/loops/runpipe"
 )
 
 func TestClassifyFailureRetriesContextCancellation(t *testing.T) {
 	runner := &Runner{}
 	for _, err := range []error{context.Canceled, context.DeadlineExceeded} {
 		got := runner.classifyFailure(err)
-		if got.kind != FailureRetryableTransient {
-			t.Fatalf("classifyFailure(%v) kind = %s, want %s", err, got.kind, FailureRetryableTransient)
+		if got.Kind != runpipe.FailureRetryableTransient {
+			t.Fatalf("classifyFailure(%v) kind = %s, want %s", err, got.Kind, runpipe.FailureRetryableTransient)
 		}
 	}
 }
@@ -24,32 +25,32 @@ func TestClassifyFailureRetriesContextCancellation(t *testing.T) {
 func TestClassifyFailureDoesNotRetryUnknownExternalLookingMessage(t *testing.T) {
 	runner := &Runner{}
 	got := runner.classifyFailure(errors.New("git push failed: connection reset by peer"))
-	if got.kind != FailureNonRetryable {
-		t.Fatalf("classifyFailure() kind = %s, want %s", got.kind, FailureNonRetryable)
+	if got.Kind != runpipe.FailureNonRetryable {
+		t.Fatalf("classifyFailure() kind = %s, want %s", got.Kind, runpipe.FailureNonRetryable)
 	}
 }
 
 func TestClassifyFailureRetriesBoundaryExternalTransport(t *testing.T) {
 	runner := &Runner{}
 	got := runner.classifyFailure(failureclass.WithBoundary(errors.New("git push failed: connection reset by peer"), failureclass.BoundaryGitRemote))
-	if got.kind != FailureRetryableTransient {
-		t.Fatalf("classifyFailure() kind = %s, want %s", got.kind, FailureRetryableTransient)
+	if got.Kind != runpipe.FailureRetryableTransient {
+		t.Fatalf("classifyFailure() kind = %s, want %s", got.Kind, runpipe.FailureRetryableTransient)
 	}
 }
 
 func TestClassifyFailureRetriesInvalidProjectRepoPath(t *testing.T) {
 	runner := &Runner{}
 	got := runner.classifyFailureWithBoundary(errors.New("git worktree list --porcelain: fatal: not a git repository (or any of the parent directories): .git"), failureclass.BoundaryGitRemote)
-	if got.kind != FailureRetryableTransient {
-		t.Fatalf("classifyFailure() kind = %s, want %s", got.kind, FailureRetryableTransient)
+	if got.Kind != runpipe.FailureRetryableTransient {
+		t.Fatalf("classifyFailure() kind = %s, want %s", got.Kind, runpipe.FailureRetryableTransient)
 	}
 }
 
 func TestClassifyFailureRetriesMissingProjectRepoDirectory(t *testing.T) {
 	runner := &Runner{}
 	got := runner.classifyFailureWithBoundary(errors.New("start command: chdir /tmp/missing-repo: no such file or directory"), failureclass.BoundaryGitRemote)
-	if got.kind != FailureRetryableTransient {
-		t.Fatalf("classifyFailure() kind = %s, want %s", got.kind, FailureRetryableTransient)
+	if got.Kind != runpipe.FailureRetryableTransient {
+		t.Fatalf("classifyFailure() kind = %s, want %s", got.Kind, runpipe.FailureRetryableTransient)
 	}
 }
 
@@ -73,7 +74,7 @@ func TestClassifyFailureHoldsUnsupportedToolNetworkVendorForOperator(t *testing.
 		t.Fatal("agent Start() error = nil, want fail-closed refusal")
 	}
 	got := runner.classifyFailureWithBoundary(err, failurepolicy.BoundaryForStep(string(stepRepair)))
-	if got.kind != FailureManualIntervention {
-		t.Fatalf("classifyFailure() kind = %s, want %s", got.kind, FailureManualIntervention)
+	if got.Kind != runpipe.FailureManualIntervention {
+		t.Fatalf("classifyFailure() kind = %s, want %s", got.Kind, runpipe.FailureManualIntervention)
 	}
 }

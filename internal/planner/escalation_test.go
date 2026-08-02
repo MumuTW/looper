@@ -9,6 +9,7 @@ import (
 
 	"github.com/MumuTW/looper/internal/config"
 	"github.com/MumuTW/looper/internal/loops"
+	"github.com/MumuTW/looper/internal/loops/runpipe"
 	"github.com/MumuTW/looper/internal/storage"
 )
 
@@ -114,7 +115,7 @@ func TestSuspendPlannerForHumanParksWithoutFailureOrRetry(t *testing.T) {
 	if err := fixture.repos.Loops.Upsert(ctx, loop); err != nil {
 		t.Fatal(err)
 	}
-	run := storage.RunRecord{ID: "run_assessment", LoopID: loopID, Status: "running", CurrentStep: stringPtr(string(stepAssessSuitability)), StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
+	run := storage.RunRecord{ID: "run_assessment", LoopID: loopID, Status: "running", CurrentStep: runpipe.StringPtr(string(stepAssessSuitability)), StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}
 	if err := fixture.repos.Runs.Upsert(ctx, run); err != nil {
 		t.Fatal(err)
 	}

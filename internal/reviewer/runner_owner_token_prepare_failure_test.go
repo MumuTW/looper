@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	gitinfra "github.com/MumuTW/looper/internal/infra/git"
+	"github.com/MumuTW/looper/internal/loops/runpipe"
 	"github.com/MumuTW/looper/internal/storage"
 	"github.com/MumuTW/looper/internal/worktreesafety"
 )
@@ -46,7 +47,7 @@ func TestProcessClaimedItemRemoteHeadChangedPreservesFixerDirtAndToken(t *testin
 	projectMeta := fmt.Sprintf(`{"worktreeRoot":%q}`, wtRoot)
 	if err := fixture.repos.Projects.Upsert(ctx, storage.ProjectRecord{
 		ID: projectID, Name: "Looper", RepoPath: filepath.Join(t.TempDir(), "repo"),
-		BaseBranch: stringPtr("main"), MetadataJSON: &projectMeta, CreatedAt: nowISO, UpdatedAt: nowISO,
+		BaseBranch: runpipe.StringPtr("main"), MetadataJSON: &projectMeta, CreatedAt: nowISO, UpdatedAt: nowISO,
 	}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
@@ -57,7 +58,7 @@ func TestProcessClaimedItemRemoteHeadChangedPreservesFixerDirtAndToken(t *testin
 	}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
-	checkpointJSON := mustMarshalJSON(reviewerCheckpoint{
+	checkpointJSON := runpipe.MustMarshalJSON(reviewerCheckpoint{
 		Detail:   &checkpointDetail{Title: "Review me", State: "OPEN", HeadSHA: "abc123", BaseRefName: "main", ReviewRequests: []string{"octocat"}},
 		Snapshot: &checkpointSnapshot{HeadSHA: "abc123"},
 		Worktree: &checkpointWorktree{Path: wtPath, Branch: "pr-42-head", BaseBranch: "main", PreparedAt: nowISO},
@@ -69,7 +70,7 @@ func TestProcessClaimedItemRemoteHeadChangedPreservesFixerDirtAndToken(t *testin
 	})
 	if err := fixture.repos.Runs.Upsert(ctx, storage.RunRecord{
 		ID: "run_failed_thread_res_remote_head", LoopID: loopID, Status: "failed",
-		CurrentStep: stringPtr(string(stepThreadResolution)), LastCompletedStep: stringPtr(string(stepWorktree)),
+		CurrentStep: runpipe.StringPtr(string(stepThreadResolution)), LastCompletedStep: runpipe.StringPtr(string(stepWorktree)),
 		CheckpointJSON: &checkpointJSON, StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO,
 	}); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
@@ -154,7 +155,7 @@ func TestProcessClaimedItemTerminalPrepareErrorPreservesFixerDirtAndToken(t *tes
 	projectMeta := fmt.Sprintf(`{"worktreeRoot":%q}`, wtRoot)
 	if err := fixture.repos.Projects.Upsert(ctx, storage.ProjectRecord{
 		ID: projectID, Name: "Looper", RepoPath: filepath.Join(t.TempDir(), "repo"),
-		BaseBranch: stringPtr("main"), MetadataJSON: &projectMeta, CreatedAt: nowISO, UpdatedAt: nowISO,
+		BaseBranch: runpipe.StringPtr("main"), MetadataJSON: &projectMeta, CreatedAt: nowISO, UpdatedAt: nowISO,
 	}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
@@ -165,7 +166,7 @@ func TestProcessClaimedItemTerminalPrepareErrorPreservesFixerDirtAndToken(t *tes
 	}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
-	checkpointJSON := mustMarshalJSON(reviewerCheckpoint{
+	checkpointJSON := runpipe.MustMarshalJSON(reviewerCheckpoint{
 		Detail:         &checkpointDetail{Title: "Review me", State: "OPEN", HeadSHA: "abc123", BaseRefName: "main", ReviewRequests: []string{"octocat"}},
 		Snapshot:       &checkpointSnapshot{HeadSHA: "abc123"},
 		Worktree:       &checkpointWorktree{Path: wtPath, Branch: "pr-42-head", BaseBranch: "main", PreparedAt: nowISO},
@@ -174,7 +175,7 @@ func TestProcessClaimedItemTerminalPrepareErrorPreservesFixerDirtAndToken(t *tes
 	})
 	if err := fixture.repos.Runs.Upsert(ctx, storage.RunRecord{
 		ID: "run_failed_thread_res_prepare_err", LoopID: loopID, Status: "failed",
-		CurrentStep: stringPtr(string(stepThreadResolution)), LastCompletedStep: stringPtr(string(stepWorktree)),
+		CurrentStep: runpipe.StringPtr(string(stepThreadResolution)), LastCompletedStep: runpipe.StringPtr(string(stepWorktree)),
 		CheckpointJSON: &checkpointJSON, StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO,
 	}); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
@@ -232,7 +233,7 @@ func TestCleanupReviewerWorktreeIfTerminalSkipsUnpreparedAndFixerOwned(t *testin
 	}
 	git := &fakeGitGateway{}
 	runner := New(Options{Git: git})
-	project := storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir(), BaseBranch: stringPtr("main")}
+	project := storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir(), BaseBranch: runpipe.StringPtr("main")}
 
 	// Unprepared path: never cleanup (prepare may not have inspected dirt).
 	checkpoint := &reviewerCheckpoint{
