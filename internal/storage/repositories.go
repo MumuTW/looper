@@ -3233,6 +3233,25 @@ func (r *QueueRepository) ClaimNextNonLongTermRetryAmongTypeSetsForProjectsWithS
 	`, extraArgs)
 }
 
+// PeekNextNonLongTermRetryAmongTypeSetsForProjectsWithSnapshotVendor returns
+// the highest-priority eligible item for a provider lane without changing its
+// durable status. Scheduler admission uses this read-only view to compare
+// candidates across provider lanes before choosing which lane to claim.
+func (r *QueueRepository) PeekNextNonLongTermRetryAmongTypeSetsForProjectsWithSnapshotVendor(ctx context.Context, nowISO string, unrestrictedTypes, stickySnapshotTypes []string, stickySnapshotVendor string, excludeStickySnapshots bool, projectScopedTypes, projectIDs []string) (*QueueItemRecord, error) {
+	typePred, typeArgs := queueClaimTypePredicateWithSnapshotVendor(unrestrictedTypes, stickySnapshotTypes, stickySnapshotVendor, excludeStickySnapshots)
+	if typePred == "" {
+		return nil, nil
+	}
+	projectPred, projectArgs := queueClaimProjectPredicate(projectScopedTypes, projectIDs)
+	extraArgs := append([]any{QueueLongTermRetryAttemptThreshold}, typeArgs...)
+	extraArgs = append(extraArgs, projectArgs...)
+	return r.peekNextMatching(ctx, nowISO, `
+		AND NOT (`+longTermRetryPredicateParam+`)
+		`+typePred+`
+		`+projectPred+`
+	`, extraArgs)
+}
+
 // ClaimNextLongTermRetryAmongTypeSets is the long-term-retry counterpart of
 // ClaimNextNonLongTermRetryAmongTypeSets.
 func (r *QueueRepository) ClaimNextLongTermRetryAmongTypeSets(ctx context.Context, nowISO, claimedBy string, unrestrictedTypes, stickySnapshotTypes []string) (*QueueItemRecord, error) {
@@ -3256,6 +3275,23 @@ func (r *QueueRepository) ClaimNextLongTermRetryAmongTypeSetsForProjectsWithSnap
 	extraArgs := append([]any{QueueLongTermRetryAttemptThreshold}, typeArgs...)
 	extraArgs = append(extraArgs, projectArgs...)
 	return r.claimNextMatching(ctx, nowISO, claimedBy, `
+		AND (`+longTermRetryPredicateParam+`)
+		`+typePred+`
+		`+projectPred+`
+	`, extraArgs)
+}
+
+// PeekNextLongTermRetryAmongTypeSetsForProjectsWithSnapshotVendor is the
+// long-term-retry counterpart of the non-mutating provider-aware peek.
+func (r *QueueRepository) PeekNextLongTermRetryAmongTypeSetsForProjectsWithSnapshotVendor(ctx context.Context, nowISO string, unrestrictedTypes, stickySnapshotTypes []string, stickySnapshotVendor string, excludeStickySnapshots bool, projectScopedTypes, projectIDs []string) (*QueueItemRecord, error) {
+	typePred, typeArgs := queueClaimTypePredicateWithSnapshotVendor(unrestrictedTypes, stickySnapshotTypes, stickySnapshotVendor, excludeStickySnapshots)
+	if typePred == "" {
+		return nil, nil
+	}
+	projectPred, projectArgs := queueClaimProjectPredicate(projectScopedTypes, projectIDs)
+	extraArgs := append([]any{QueueLongTermRetryAttemptThreshold}, typeArgs...)
+	extraArgs = append(extraArgs, projectArgs...)
+	return r.peekNextMatching(ctx, nowISO, `
 		AND (`+longTermRetryPredicateParam+`)
 		`+typePred+`
 		`+projectPred+`
@@ -3430,6 +3466,22 @@ func (r *QueueRepository) claimNextMatching(ctx context.Context, nowISO, claimed
 		return nil, fmt.Errorf("claim next queue item: %w", err)
 	}
 
+	return &record, nil
+}
+
+func (r *QueueRepository) peekNextMatching(ctx context.Context, nowISO, extraPredicate string, extraArgs []any) (*QueueItemRecord, error) {
+	row := r.q.QueryRowContext(ctx, `
+		`+scheduledQueueBaseQuery+extraPredicate+scheduledQueueOrderBy+`
+		LIMIT 1
+	`, append([]any{nowISO}, extraArgs...)...)
+
+	record, err := scanQueueItem(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("peek next queue item: %w", err)
+	}
 	return &record, nil
 }
 

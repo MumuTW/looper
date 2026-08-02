@@ -3241,6 +3241,33 @@ func (c *schedulerClaimLaneCursor) start(groupCount int) int {
 	return start
 }
 
+type schedulerLaneCandidate struct {
+	index    int
+	item     *storage.QueueItemRecord
+	priority int64
+	order    int
+}
+
+// schedulerLaneCandidateBefore mirrors scheduledQueueOrderBy for candidates
+// discovered in different provider lanes. The lane order is the final
+// tie-breaker so equal-priority work still gets the persistent round-robin
+// fairness provided by schedulerClaimLaneCursor.
+func schedulerLaneCandidateBefore(a, b schedulerLaneCandidate) bool {
+	if a.priority != b.priority {
+		return a.priority < b.priority
+	}
+	if a.item.AvailableAt != b.item.AvailableAt {
+		return a.item.AvailableAt < b.item.AvailableAt
+	}
+	if a.item.CreatedAt != b.item.CreatedAt {
+		return a.item.CreatedAt < b.item.CreatedAt
+	}
+	if a.order != b.order {
+		return a.order < b.order
+	}
+	return a.item.ID < b.item.ID
+}
+
 func (s *schedulerClaimStats) record(claimedCount, availableSlots int) {
 	s.claimedCount += claimedCount
 	s.availableSlots = availableSlots
@@ -3661,14 +3688,16 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 		claimSkip
 		claimStop
 	)
-	claimOne := func(vendor string, providerScoped, snapshotScoped, lifecycleOnly bool, claimFn func(context.Context, string, string) (*storage.QueueItemRecord, error)) (result int, claimErr error) {
+	claimOne := func(vendor string, providerScoped, snapshotScoped, lifecycleOnly, admissionChecked bool, claimFn func(context.Context, string, string) (*storage.QueueItemRecord, error)) (result int, claimErr error) {
 		if err := ctx.Err(); err != nil {
 			return claimStop, nil
 		}
-		if skip, stop := admitClaim(vendor, providerScoped, snapshotScoped, lifecycleOnly); skip {
-			return claimSkip, nil
-		} else if stop {
-			return claimStop, nil
+		if !admissionChecked {
+			if skip, stop := admitClaim(vendor, providerScoped, snapshotScoped, lifecycleOnly); skip {
+				return claimSkip, nil
+			} else if stop {
+				return claimStop, nil
+			}
 		}
 		var deferredHardPersist error
 		execute := func() (int, error) {
@@ -3810,50 +3839,94 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 	stopClaiming := false
 	var claimFailure error
 	claimLanes := func(longTerm bool) {
-		// A provider group can contain several role types. Draining that group
-		// before looking at its siblings lets a lower-priority role consume every
-		// slot and starve a higher-priority item assigned to another provider.
-		// Round-robin is the claim-level fairness authority: each admitted group
-		// gets one durable candidate per round, while the repository still orders
-		// candidates within that group by priority.
+		// Peek each provider lane before claiming so priority remains global even
+		// when roles are assigned to different providers. A round-robin pass alone
+		// only prevents one lane from draining its backlog; it can still let a
+		// lower-priority worker consume the last slot ahead of a reviewer lane.
 		active := make([]bool, len(providerTypeSets))
 		remaining := len(providerTypeSets)
 		for i := range active {
 			active[i] = true
 		}
 		for remaining > 0 && !stopClaiming && len(queueItems) < availableSlots {
-			progressed := false
+			if err := ctx.Err(); err != nil {
+				// A cancellation after an earlier durable claim must stop further
+				// peeks/claims but still dispatch the already-owned queue items.
+				stopClaiming = true
+				return
+			}
+			candidates := make([]schedulerLaneCandidate, 0, remaining)
 			for offset := range providerTypeSets {
 				index := (laneStart + offset) % len(providerTypeSets)
 				typeSet := providerTypeSets[index]
-				if !active[index] || stopClaiming || len(queueItems) >= availableSlots {
+				if !active[index] || stopClaiming {
 					continue
 				}
-				result, err := claimOne(typeSet.vendor, typeSet.providerScoped, typeSet.snapshotScoped, typeSet.lifecycleOnly, func(ctx context.Context, nowISO, claimedBy string) (*storage.QueueItemRecord, error) {
-					if longTerm {
-						return input.Repos.Queue.ClaimNextLongTermRetryAmongTypeSetsForProjectsWithSnapshotVendor(ctx, nowISO, claimedBy, typeSet.unrestricted, typeSet.stickyOnly, typeSet.vendor, typeSet.excludeStickySnapshots, projectScopedTypes, runnableProjectIDs)
-					}
-					return input.Repos.Queue.ClaimNextNonLongTermRetryAmongTypeSetsForProjectsWithSnapshotVendor(ctx, nowISO, claimedBy, typeSet.unrestricted, typeSet.stickyOnly, typeSet.vendor, typeSet.excludeStickySnapshots, projectScopedTypes, runnableProjectIDs)
-				})
+				if skip, stop := admitClaim(typeSet.vendor, typeSet.providerScoped, typeSet.snapshotScoped, typeSet.lifecycleOnly); skip {
+					// Do not include an open provider in the global priority
+					// comparison; healthy sibling lanes remain eligible.
+					active[index] = false
+					remaining--
+					continue
+				} else if stop {
+					stopClaiming = true
+					break
+				}
+				var item *storage.QueueItemRecord
+				var err error
+				if longTerm {
+					item, err = input.Repos.Queue.PeekNextLongTermRetryAmongTypeSetsForProjectsWithSnapshotVendor(ctx, nowISO, typeSet.unrestricted, typeSet.stickyOnly, typeSet.vendor, typeSet.excludeStickySnapshots, projectScopedTypes, runnableProjectIDs)
+				} else {
+					item, err = input.Repos.Queue.PeekNextNonLongTermRetryAmongTypeSetsForProjectsWithSnapshotVendor(ctx, nowISO, typeSet.unrestricted, typeSet.stickyOnly, typeSet.vendor, typeSet.excludeStickySnapshots, projectScopedTypes, runnableProjectIDs)
+				}
 				if err != nil {
+					if ctx.Err() != nil {
+						stopClaiming = true
+						break
+					}
 					claimFailure = err
 					stopClaiming = true
 					break
 				}
-				switch result {
-				case claimContinue:
-					progressed = true
-				case claimEmpty, claimSkip:
-					// No more candidates or an open provider removes this group
-					// from the current phase; healthy siblings continue.
+				if item == nil {
 					active[index] = false
 					remaining--
-				case claimStop:
-					stopClaiming = true
+					continue
+				}
+				candidates = append(candidates, schedulerLaneCandidate{index: index, item: item, priority: item.Priority, order: offset})
+			}
+			if stopClaiming || len(candidates) == 0 {
+				return
+			}
+			winner := candidates[0]
+			for _, candidate := range candidates[1:] {
+				if schedulerLaneCandidateBefore(candidate, winner) {
+					winner = candidate
 				}
 			}
-			if !progressed && !stopClaiming {
+			typeSet := providerTypeSets[winner.index]
+			result, err := claimOne(typeSet.vendor, typeSet.providerScoped, typeSet.snapshotScoped, typeSet.lifecycleOnly, true, func(ctx context.Context, nowISO, claimedBy string) (*storage.QueueItemRecord, error) {
+				if longTerm {
+					return input.Repos.Queue.ClaimNextLongTermRetryAmongTypeSetsForProjectsWithSnapshotVendor(ctx, nowISO, claimedBy, typeSet.unrestricted, typeSet.stickyOnly, typeSet.vendor, typeSet.excludeStickySnapshots, projectScopedTypes, runnableProjectIDs)
+				}
+				return input.Repos.Queue.ClaimNextNonLongTermRetryAmongTypeSetsForProjectsWithSnapshotVendor(ctx, nowISO, claimedBy, typeSet.unrestricted, typeSet.stickyOnly, typeSet.vendor, typeSet.excludeStickySnapshots, projectScopedTypes, runnableProjectIDs)
+			})
+			if err != nil {
+				claimFailure = err
+				stopClaiming = true
 				return
+			}
+			switch result {
+			case claimContinue:
+				// Re-peek every active lane after each claim. This preserves the
+				// repository's priority/availability ordering for the next slot.
+			case claimEmpty, claimSkip:
+				// The candidate disappeared or this provider is open. Exclude the
+				// lane for this phase and let healthy siblings proceed.
+				active[winner.index] = false
+				remaining--
+			case claimStop:
+				stopClaiming = true
 			}
 		}
 	}

@@ -915,7 +915,7 @@ func TestClaimAndRunScheduledQueueItemsGatesEachProviderLane(t *testing.T) {
 	}
 }
 
-func TestClaimAndRunScheduledQueueItemsRoundRobinsProviderLanes(t *testing.T) {
+func TestClaimAndRunScheduledQueueItemsSelectsGlobalHighestPriorityAcrossProviderLanes(t *testing.T) {
 	t.Parallel()
 
 	workingDir := t.TempDir()
@@ -947,25 +947,15 @@ func TestClaimAndRunScheduledQueueItemsRoundRobinsProviderLanes(t *testing.T) {
 		}
 	}
 
-	claimed, err := claimAndRunScheduledQueueItems(context.Background(), 2, defaultSchedulerTickInput{
+	claimed, err := claimAndRunScheduledQueueItems(context.Background(), 1, defaultSchedulerTickInput{
 		Repos: repos, Config: &cfg, Now: func() time.Time { return now }, AsyncRunner: immediateSchedulerRunner{},
 		Planner: &stubPlannerScheduler{}, Reviewer: &stubReviewerScheduler{}, Worker: &stubWorkerScheduler{},
 	})
 	if err != nil {
 		t.Fatalf("claimAndRunScheduledQueueItems() error = %v", err)
 	}
-	if len(claimed) != 2 {
-		t.Fatalf("claimed = %#v, want two items", claimed)
-	}
-	claimedIDs := map[string]bool{}
-	for _, item := range claimed {
-		claimedIDs[item.ID] = true
-	}
-	if !claimedIDs[reviewer.ID] {
-		t.Fatalf("claimed = %#v, want the higher-priority reviewer lane represented", claimed)
-	}
-	if claimedIDs[workerOne.ID] == claimedIDs[workerTwo.ID] {
-		t.Fatalf("claimed = %#v, want exactly one of the two lower-priority workers", claimed)
+	if len(claimed) != 1 || claimed[0].ID != reviewer.ID {
+		t.Fatalf("claimed = %#v, want the higher-priority reviewer before either worker", claimed)
 	}
 }
 
@@ -990,7 +980,9 @@ func TestClaimAndRunScheduledQueueItemsRotatesProviderLaneAcrossPasses(t *testin
 	cfg.Projects = []config.ProjectRefConfig{{ID: "looper", Validation: &config.ProjectValidationConfig{OptOut: true}}}
 	worker := schedulerTestQueueItem("worker_cursor", "worker", nowISO)
 	reviewer := schedulerTestQueueItem("reviewer_cursor", "reviewer", nowISO)
-	reviewer.Priority = storage.QueuePriorityReviewer
+	// Equal priorities exercise the persistent lane cursor's fairness tie-break
+	// without weakening the global priority ordering tested above.
+	reviewer.Priority = worker.Priority
 	for _, item := range []storage.QueueItemRecord{worker, reviewer} {
 		if err := repos.Queue.Upsert(context.Background(), item); err != nil {
 			t.Fatalf("Queue.Upsert(%s) error = %v", item.ID, err)
