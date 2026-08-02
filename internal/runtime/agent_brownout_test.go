@@ -409,6 +409,30 @@ func TestAgentHealthPromotesRetainedBreakerWhenVendorReturns(t *testing.T) {
 	}
 }
 
+func TestAgentHealthRecordsInFlightOutcomeAfterVendorRemoval(t *testing.T) {
+	rt, _ := brownoutRuntime(t, func(cfg *config.AgentBrownoutConfig) {
+		cfg.MinFailures = 3
+	})
+	codex := config.AgentVendorCodex
+	configured := rt.Config()
+	configured.Agent.Vendor = &codex
+	rt.publishCatalogConsumers(configured)
+	for i := 0; i < 2; i++ {
+		rt.activeExecutions.ReportAgentOutcome(agent.Outcome{Vendor: string(codex), Status: "failed"})
+	}
+	removed := configured
+	removed.Agent.Vendor = nil
+	rt.publishCatalogConsumers(removed)
+
+	// This run was admitted before reload and completes after its provider was
+	// removed. Its failure still belongs to the retained breaker that owns the
+	// sticky retry identity.
+	rt.activeExecutions.ReportAgentOutcome(agent.Outcome{Vendor: string(codex), Status: "failed"})
+	if err := rt.agentHealth.AllowSnapshot(string(codex)); !errors.Is(err, brownout.ErrOpen) {
+		t.Fatalf("retained Codex breaker = %v, want open after in-flight failure", err)
+	}
+}
+
 func TestWorktreeCleanupContinuesDuringAgentBrownout(t *testing.T) {
 	fixture := newWorktreeCleanupFixture(t)
 	for i := 0; i < fixture.config.Scheduler.AgentBrownout.MinFailures; i++ {

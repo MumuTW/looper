@@ -366,22 +366,42 @@ func (r *agentHealthRegistry) Record(vendor string, startedAt time.Time, ok, pro
 			return
 		}
 	}
-	if !stickySnapshot && !r.vendorActive(vendor) {
-		if probe {
-			r.releaseAdmissionLocked(vendor, generation)
-		}
-		r.gateMu.Unlock()
-		if r.onWarning != nil {
-			r.onWarning("agent outcome used a provider no longer configured; outcome ignored")
-		}
-		return
-	}
 	r.mu.Lock()
 	var breaker *brownout.Breaker
 	if stickySnapshot {
 		breaker = r.ensureSnapshotBreakerLocked(vendor)
+	} else if r.configured {
+		key := strings.TrimSpace(vendor)
+		if _, active := r.configuredVendors[key]; active {
+			breaker = r.ensureBreakerLocked(vendor)
+		} else {
+			// An ordinary execution may outlive a config reload. Once its vendor
+			// leaves live configuration, ensureConfiguredVendorsLocked retains the
+			// same breaker for sticky snapshot retries; its terminal outcome must
+			// land in that retained bucket instead of being discarded. Unknown
+			// vendors remain fail-closed below.
+			breaker = r.stickyBreakers[key]
+			if breaker == nil {
+				r.mu.Unlock()
+				if probe {
+					r.releaseAdmissionLocked(vendor, generation)
+				}
+				r.gateMu.Unlock()
+				if r.onWarning != nil {
+					r.onWarning("agent outcome used a provider no longer configured; outcome ignored")
+				}
+				return
+			}
+		}
 	} else {
-		breaker = r.ensureBreakerLocked(vendor)
+		// With no live providers, keep an already-retained vendor in its
+		// sticky bucket. Only legacy/default metadata without a retained bucket
+		// creates the fallback breaker.
+		if retained := r.stickyBreakers[strings.TrimSpace(vendor)]; retained != nil {
+			breaker = retained
+		} else {
+			breaker = r.ensureBreakerLocked(vendor)
+		}
 	}
 	r.mu.Unlock()
 	// Legacy/default outcomes may carry a timestamp but no spawn token. Let the
@@ -432,17 +452,6 @@ func (r *agentHealthRegistry) snapshotBreakers() []*brownout.Breaker {
 	}
 	r.mu.Unlock()
 	return breakers
-}
-
-func (r *agentHealthRegistry) vendorActive(vendor string) bool {
-	key := strings.TrimSpace(vendor)
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if !r.configured {
-		return true
-	}
-	_, ok := r.configuredVendors[key]
-	return ok
 }
 
 // admissionBreaker resolves legacy empty/default spawn metadata only when the
