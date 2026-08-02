@@ -82,6 +82,7 @@ type configRolesResponse struct {
 	Fixer       config.FixerRoleConfig             `json:"fixer"`
 	Worker      config.WorkerRoleConfig            `json:"worker"`
 	Coordinator config.CoordinatorRoleConfig       `json:"coordinator"`
+	Escalator   config.EscalatorRoleConfig         `json:"escalator"`
 }
 
 type configServerResponse struct {
@@ -112,6 +113,7 @@ type configDaemonResponse struct {
 	WorkingDirectory       string                       `json:"workingDirectory"`
 	Environment            map[string]string            `json:"environment"`
 	WorktreeCleanup        config.WorktreeCleanupConfig `json:"worktreeCleanup"`
+	ResourceGuard          config.ResourceGuardConfig   `json:"resourceGuard"`
 }
 
 type configPackageResponse struct {
@@ -160,6 +162,7 @@ func (h *Handler) buildConfigResponse() configResponse {
 			WorkingDirectory:       cfg.Daemon.WorkingDirectory,
 			Environment:            map[string]string{},
 			WorktreeCleanup:        cfg.Daemon.WorktreeCleanup,
+			ResourceGuard:          cfg.Daemon.ResourceGuard,
 		},
 		Package: configPackageResponse{
 			Distribution:               cfg.Package.Distribution,
@@ -177,6 +180,7 @@ func (h *Handler) buildConfigResponse() configResponse {
 			Fixer:       cfg.Roles.Fixer,
 			Worker:      cfg.Roles.Worker,
 			Coordinator: cfg.Roles.Coordinator,
+			Escalator:   cfg.Roles.Escalator,
 		},
 		Providers: append([]config.ProviderConfig{}, cfg.Providers...),
 		Projects:  config.RedactProjectSecrets(cfg.Projects),

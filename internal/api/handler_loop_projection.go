@@ -2,10 +2,12 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 
 	"github.com/MumuTW/looper/internal/fixer"
+	"github.com/MumuTW/looper/internal/reviewer/convergence"
 	"github.com/MumuTW/looper/internal/storage"
 	pkgapi "github.com/MumuTW/looper/pkg/api"
 )
@@ -136,11 +138,51 @@ func serializeLoop(loop storage.LoopRecord) loopResponse {
 		Status:       loop.Status,
 		ConfigJSON:   loop.ConfigJSON,
 		MetadataJSON: loop.MetadataJSON,
+		Convergence:  parseReviewerConvergenceProjection(loop.MetadataJSON),
 		LastRunAt:    loop.LastRunAt,
 		NextRunAt:    loop.NextRunAt,
 		CreatedAt:    loop.CreatedAt,
 		UpdatedAt:    loop.UpdatedAt,
 	}
+}
+
+// parseReviewerConvergenceProjection reads only the typed convergence object
+// already persisted by Reviewer. Invalid or legacy metadata is omitted from
+// the projection rather than making an otherwise readable loop unavailable.
+func parseReviewerConvergenceProjection(metadataJSON *string) *reviewerConvergenceProjection {
+	metadata := parseJSONObject(metadataJSON)
+	raw, ok := metadata["convergence"]
+	if !ok || raw == nil {
+		return nil
+	}
+	encoded, err := json.Marshal(raw)
+	if err != nil {
+		return nil
+	}
+	var projection reviewerConvergenceProjection
+	if err := json.Unmarshal(encoded, &projection); err != nil {
+		return nil
+	}
+	// A valid policy alone is not enough: json.Unmarshal accepts malformed
+	// state (negative counters, unknown item statuses/severities, empty IDs)
+	// and unknown action/reason/status values. Validate the full record so the
+	// API and dashboard never surface nonsensical convergence progress.
+	if err := projection.Policy.Validate(); err != nil {
+		return nil
+	}
+	if err := projection.State.Validate(); err != nil {
+		return nil
+	}
+	if !projection.Action.Valid() {
+		return nil
+	}
+	if !projection.Reason.Valid() {
+		return nil
+	}
+	if !convergence.ValidStatus(projection.Status) {
+		return nil
+	}
+	return &projection
 }
 
 // serializeLoopWithDiagnostics loads latest queue/run and attaches attempt/error fields.
