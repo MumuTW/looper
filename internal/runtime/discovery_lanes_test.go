@@ -142,6 +142,29 @@ func TestDiscoveryLanesOrderFromCanonicalRegistryPriority(t *testing.T) {
 	t.Fatal("worker discovery lane missing")
 }
 
+func TestCodingDiscoveryLanesResolveProviderForProjectAdmission(t *testing.T) {
+	t.Parallel()
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	codex := config.AgentVendorCodex
+	claude := config.AgentVendorClaudeCode
+	cfg.Agent.Vendor = &codex
+	cfg.Roles.Worker.Agent = &config.RoleAgentConfig{Vendor: &claude}
+
+	byName := make(map[string]discoveryLane)
+	for _, lane := range discoveryLanes(defaultSchedulerTickInput{Config: &cfg}) {
+		byName[lane.Name] = lane
+	}
+	if got := byName[config.CodingRolePlanner].Provider("project"); got != string(codex) {
+		t.Fatalf("planner provider = %q, want %q", got, codex)
+	}
+	if got := byName[config.CodingRoleWorker].Provider("project"); got != string(claude) {
+		t.Fatalf("worker provider = %q, want %q", got, claude)
+	}
+}
+
 type budgetTriager struct {
 	mu       sync.Mutex
 	budgets  []int

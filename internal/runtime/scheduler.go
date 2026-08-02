@@ -2971,7 +2971,13 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 				}
 				continue
 			}
-			if err := admissionRefuseWork(input); err != nil {
+			if err, providerScoped := admissionRefuseDiscoveryLane(input, lane, project.ID); err != nil {
+				if providerScoped && errors.Is(err, brownout.ErrOpen) {
+					if input.Logger != nil {
+						input.Logger.Debug("scheduler skipped discovery lane: provider brownout", map[string]any{"lane": lane.Name, "projectId": project.ID, "provider": lane.Provider(project.ID), "error": err.Error()})
+					}
+					continue
+				}
 				admissionClosed = true
 				break
 			}
@@ -3084,6 +3090,15 @@ func admissionRefuseWork(input defaultSchedulerTickInput) error {
 		return nil
 	}
 	return input.AllowClaim()
+}
+
+func admissionRefuseDiscoveryLane(input defaultSchedulerTickInput, lane discoveryLane, projectID string) (error, bool) {
+	if lane.Provider != nil && input.AllowClaimForVendor != nil {
+		if provider := lane.Provider(projectID); provider != "" {
+			return input.AllowClaimForVendor(provider), true
+		}
+	}
+	return admissionRefuseWork(input), false
 }
 
 func discoveryEnabled(value *bool) bool {

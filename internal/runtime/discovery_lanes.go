@@ -35,6 +35,11 @@ type discoveryLane struct {
 	// worth telling the operator about.
 	Present bool
 
+	// Provider resolves the effective provider for this coding lane and
+	// project. A non-empty value selects provider-scoped admission so an open
+	// sibling breaker does not authorize discovery for this lane.
+	Provider func(projectID string) string
+
 	// Enabled is evaluated per project, because coordinator admission is
 	// per-project while the other roles use a single daemon-wide flag.
 	Enabled func(projectID string) bool
@@ -215,6 +220,16 @@ func discoveryLanes(input defaultSchedulerTickInput) []discoveryLane {
 		lane.Name = name
 		lane.Priority = role.Priority
 		lane.LogWhenDisabled = true
+		roleName := name
+		if input.Config != nil {
+			lane.Provider = func(projectID string) string {
+				resolved, ok := config.ResolveAgent(*input.Config, projectID, roleName)
+				if !ok {
+					return ""
+				}
+				return string(resolved.Vendor)
+			}
+		}
 		lanes = append(lanes, lane)
 	}
 
