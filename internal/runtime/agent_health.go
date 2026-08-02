@@ -52,6 +52,15 @@ func newAgentHealthRegistry(cfg brownout.Config, daemonCfg config.Config, now fu
 func (r *agentHealthRegistry) ensureConfiguredVendorsLocked(cfg config.Config) {
 	configured := false
 	activeVendors := make(map[string]struct{})
+	// Coordinator triage is daemon-owned and uses the global agent directly,
+	// even when every coding role overrides that vendor through a role/profile
+	// binding. It is therefore an active provider for spawn admission too.
+	if cfg.Agent.Vendor != nil && strings.TrimSpace(string(*cfg.Agent.Vendor)) != "" {
+		configured = true
+		vendor := string(*cfg.Agent.Vendor)
+		activeVendors[vendor] = struct{}{}
+		r.ensureBreakerLocked(vendor)
+	}
 	for _, role := range []string{config.CodingRolePlanner, config.CodingRoleWorker, config.CodingRoleReviewer, config.CodingRoleFixer} {
 		if resolved, ok := config.ResolveAgent(cfg, "", role); ok {
 			configured = true

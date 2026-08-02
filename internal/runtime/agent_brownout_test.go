@@ -128,6 +128,31 @@ func TestAgentBrownoutIsolatedByEffectiveVendor(t *testing.T) {
 	}
 }
 
+func TestAgentHealthRegistersGlobalCoordinatorProvider(t *testing.T) {
+	rt, _ := brownoutRuntime(t, nil)
+	codex := config.AgentVendorCodex
+	claude := config.AgentVendorClaudeCode
+	next := rt.Config()
+	next.Agent.Vendor = &codex
+	roleAgent := &config.RoleAgentConfig{Vendor: &claude}
+	next.Roles.Planner.Agent = roleAgent
+	next.Roles.Worker.Agent = roleAgent
+	next.Roles.Reviewer.Agent = roleAgent
+	next.Roles.Fixer.Agent = roleAgent
+	rt.publishCatalogConsumers(next)
+
+	if err := rt.agentHealth.Allow(string(codex)); err != nil {
+		t.Fatalf("global coordinator provider admission = %v, want registered provider", err)
+	}
+	lease, err := rt.activeExecutions.AdmitSpawn(context.Background(), agent.SpawnMeta{
+		LoopID: "coordinator-loop", RunID: "coordinator-run", ExecutionID: "coordinator-exec", Vendor: string(codex),
+	})
+	if err != nil {
+		t.Fatalf("coordinator global-provider spawn = %v, want admitted", err)
+	}
+	lease.Release()
+}
+
 func TestAgentBrownoutGateCoversClaimCriticalSection(t *testing.T) {
 	rt, clock := brownoutRuntime(t, func(cfg *config.AgentBrownoutConfig) {
 		cfg.MinFailures = 3
