@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -443,6 +444,23 @@ func TestRoutingLabelFailureDoesNotLoseDurableReport(t *testing.T) {
 	}
 	if !hasReason(retryMarker, ReasonRoutingProjectionFailed) {
 		t.Fatalf("retry marker = %#v, want a routing-projection failure reason", retryMarker)
+	}
+}
+
+func TestRoutingLabelFailureStillReconcilesVerdictComment(t *testing.T) {
+	fixture := newGatekeeperFixture(t)
+	fixture.github.labelErr = errors.New("label permission denied")
+	runner := routingRunner(fixture, config.GatekeeperTrustAdvise)
+	if _, err := runner.EvaluatePullRequest(context.Background(), EvaluationInput{
+		ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, ExpectedHeadSHA: "head-1",
+	}); err == nil {
+		t.Fatal("EvaluatePullRequest() succeeded despite label projection failure")
+	}
+	// The routing projection failed, but the verdict comment lifecycle is
+	// independent of the label projection: an advise project must still publish
+	// its promised verdict.
+	if len(fixture.github.createdBodies) != 1 || !strings.Contains(fixture.github.createdBodies[0], VerdictCommentMarker) {
+		t.Fatalf("verdict comments after routing failure = %#v, want one owned verdict", fixture.github.createdBodies)
 	}
 }
 

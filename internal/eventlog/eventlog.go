@@ -36,6 +36,26 @@ type CoordinatorPullRequestMerged struct {
 	MergedAt    string `json:"mergedAt"`
 }
 
+// CoordinatorRoutedMergeWatchEventType records that a routed pull request (one
+// carrying the Mergify auto-merge route label) is under merge-watch
+// independent of issue discovery. The open-issue loop loses a routed merge the
+// moment its body closes the tracked issue, so this registry keeps the PR
+// number durable until the merge (or a non-merge close) is observed.
+const CoordinatorRoutedMergeWatchEventType = "coordinator.routed_merge_watch"
+
+// CoordinatorRoutedMergeWatch is the durable payload for one routed-PR
+// merge-watch registration. Settled marks a terminal observation (merged and
+// recorded, closed without merge, or handed to a competing human-owned native
+// auto-merge route); the reader keeps the newest record per entity.
+type CoordinatorRoutedMergeWatch struct {
+	Version   int    `json:"version"`
+	ProjectID string `json:"projectId"`
+	Repo      string `json:"repo"`
+	PRNumber  int64  `json:"prNumber"`
+	HeadSHA   string `json:"headSha"`
+	Settled   bool   `json:"settled,omitempty"`
+}
+
 type AppendInput struct {
 	ID               string
 	EventType        string
