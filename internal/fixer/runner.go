@@ -351,10 +351,11 @@ type IssueLabelsInput struct {
 }
 
 type ClosePullRequestInput struct {
-	Repo         string
-	PRNumber     int64
-	DeleteBranch bool
-	CWD          string
+	Repo            string
+	PRNumber        int64
+	DeleteBranch    bool
+	ExpectedHeadSHA string
+	CWD             string
 }
 
 type PullRequestCommit struct {

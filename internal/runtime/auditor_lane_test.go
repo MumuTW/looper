@@ -72,7 +72,7 @@ func TestObservePostMergeFailureRecordsOneOptInDefaultBranchObservation(t *testi
 		t.Fatalf("Append baseline error = %v", err)
 	}
 	role := config.AuditorRoleConfig{Enabled: true, WindowMinutes: 60}
-	gateway := fakeAuditorGateway{head: head, checks: githubinfra.PullRequestCheckRuns{CheckRuns: []githubinfra.PullRequestCheckRun{{ID: 99, Name: "ci", Status: "completed", Conclusion: "failure", CheckSuiteID: 7654}}}, annotations: map[int64][]githubinfra.CheckRunAnnotation{99: {{Path: "internal/runtime/auditor.go", Level: "failure"}}}}
+	gateway := &fakeAuditorGateway{head: head, checks: githubinfra.PullRequestCheckRuns{CheckRuns: []githubinfra.PullRequestCheckRun{{ID: 99, Name: "ci", Status: "completed", Conclusion: "failure", CheckSuiteID: 7654}}}, annotations: map[int64][]githubinfra.CheckRunAnnotation{99: {{Path: "internal/runtime/auditor.go", Level: "failure"}}}}
 	if err := observePostMergeFailure(ctx, repos, gateway, project, repo, base, role, func() time.Time { return now }); err != nil {
 		t.Fatalf("observePostMergeFailure() error = %v", err)
 	}

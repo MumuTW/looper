@@ -67,6 +67,10 @@ var (
 	// from an idempotent ordinary close. Callers that regenerate failed PRs must
 	// abort rather than create a replacement for work that already landed.
 	ErrPullRequestAlreadyMerged = errors.New("pull request already merged")
+	// ErrPullRequestHeadChanged means a destructive close was attempted with a
+	// stale head snapshot. Callers should leave the PR open and re-evaluate its
+	// current provenance before retrying.
+	ErrPullRequestHeadChanged = errors.New("pull request head changed before close")
 )
 
 // Diagnostic / snapshot reason codes for diff capture and anchor authority.
@@ -486,10 +490,11 @@ type CloseIssueInput struct {
 }
 
 type ClosePullRequestInput struct {
-	Repo         string
-	PRNumber     int64
-	DeleteBranch bool
-	CWD          string
+	Repo            string
+	PRNumber        int64
+	DeleteBranch    bool
+	ExpectedHeadSHA string
+	CWD             string
 }
 
 type EnableAutoMergeInput struct {
@@ -2279,6 +2284,15 @@ func (g *Gateway) ClosePullRequest(ctx context.Context, input ClosePullRequestIn
 	}
 	if state == "merged" {
 		return ErrPullRequestAlreadyMerged
+	}
+	if expected := strings.TrimSpace(input.ExpectedHeadSHA); expected != "" {
+		observed, err := g.GetPullRequestHeadSHA(ctx, ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
+		if err != nil {
+			return fmt.Errorf("revalidate pull request head before close: %w", err)
+		}
+		if observed == "" || !strings.EqualFold(observed, expected) {
+			return fmt.Errorf("%w: expected %s, observed %s", ErrPullRequestHeadChanged, expected, observed)
+		}
 	}
 	args := []string{"pr", "close", strconv.FormatInt(input.PRNumber, 10), "--repo", input.Repo}
 	if input.DeleteBranch {

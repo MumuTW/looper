@@ -154,7 +154,7 @@ func TestRoundBudgetSeedsFirstFixerPushAndIgnoresHumanHead(t *testing.T) {
 	fixerHead := *updated.MetadataJSON
 	fixerMetadata := parseJSONObject(&fixerHead)
 	fixerMetadata["lastFixHeadSha"] = "head-fixer"
-	encoded := mustMarshalJSON(fixerMetadata)
+	encoded := runpipe.MustMarshalJSON(fixerMetadata)
 	updated.MetadataJSON = &encoded
 	updated, parked, err = runner.chargeFixerRound(context.Background(), updated, "head-fixer")
 	if err != nil || parked {

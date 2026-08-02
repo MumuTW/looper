@@ -338,7 +338,7 @@ func (r *Runner) handleTerminalExhaustion(ctx context.Context, project storage.P
 		deleteBranch = branchOwned && r.deleteBranchOnRegeneration(project.ID)
 	}
 	if !state.Closed {
-		if err := bridge.ClosePullRequest(ctx, ClosePullRequestInput{Repo: derefString(queueItem.Repo), PRNumber: derefInt64(queueItem.PRNumber), DeleteBranch: deleteBranch, CWD: project.RepoPath}); err != nil {
+		if err := bridge.ClosePullRequest(ctx, ClosePullRequestInput{Repo: derefString(queueItem.Repo), PRNumber: derefInt64(queueItem.PRNumber), DeleteBranch: deleteBranch, ExpectedHeadSHA: pr.HeadSHA, CWD: project.RepoPath}); err != nil {
 			if errors.Is(err, githubinfra.ErrPullRequestAlreadyMerged) {
 				return r.persistRegenerationAbort(ctx, current, state, "pull request was merged concurrently; regeneration aborted")
 			}
@@ -488,7 +488,7 @@ func (r *Runner) RegenerateConflict(ctx context.Context, input ConflictRegenerat
 		deleteBranch = branchOwned && r.deleteBranchOnRegeneration(project.ID)
 	}
 	if !strings.EqualFold(strings.TrimSpace(pr.State), "closed") && !strings.EqualFold(strings.TrimSpace(pr.State), "merged") {
-		if err := bridge.ClosePullRequest(ctx, ClosePullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, DeleteBranch: deleteBranch, CWD: input.CWD}); err != nil {
+		if err := bridge.ClosePullRequest(ctx, ClosePullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, DeleteBranch: deleteBranch, ExpectedHeadSHA: pr.HeadSHA, CWD: input.CWD}); err != nil {
 			if errors.Is(err, githubinfra.ErrPullRequestAlreadyMerged) {
 				return ConflictRegenerationResult{Completed: true}, nil
 			}

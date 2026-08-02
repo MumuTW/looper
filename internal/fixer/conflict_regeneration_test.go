@@ -41,6 +41,9 @@ func TestRegenerateConflictOrdersCommentCloseAndPlannerRoute(t *testing.T) {
 	if len(gateway.closeCalls) != 1 || !gateway.closeCalls[0].DeleteBranch {
 		t.Fatalf("close calls = %#v, want one Looper branch deletion", gateway.closeCalls)
 	}
+	if got := gateway.closeCalls[0].ExpectedHeadSHA; got != "head-42" {
+		t.Fatalf("close expected head = %q, want head-42", got)
+	}
 	if len(gateway.fakeGitHubGateway.createIssueComments) != 2 {
 		t.Fatalf("comments = %d, want pending and completed markers", len(gateway.fakeGitHubGateway.createIssueComments))
 	}

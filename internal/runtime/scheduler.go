@@ -1264,7 +1264,7 @@ func (a fixerGitHubAdapter) ClosePullRequest(ctx context.Context, input fixer.Cl
 	if err != nil {
 		return err
 	}
-	return a.gateway.ClosePullRequest(ctx, githubinfra.ClosePullRequestInput{Repo: repo, PRNumber: input.PRNumber, DeleteBranch: input.DeleteBranch, CWD: input.CWD})
+	return a.gateway.ClosePullRequest(ctx, githubinfra.ClosePullRequestInput{Repo: repo, PRNumber: input.PRNumber, DeleteBranch: input.DeleteBranch, ExpectedHeadSHA: input.ExpectedHeadSHA, CWD: input.CWD})
 }
 
 func (a fixerGitHubAdapter) AddIssueLabels(ctx context.Context, input fixer.IssueLabelsInput) error {

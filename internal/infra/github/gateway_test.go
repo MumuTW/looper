@@ -2929,6 +2929,16 @@ func TestGatewayClosePullRequestIsIdempotent(t *testing.T) {
 			return shell.Result{Stdout: "OPEN\n"}, nil
 		case "pr close 45 --repo acme/looper --delete-branch":
 			return shell.Result{Stdout: ""}, nil
+		case "pr view 46 --repo acme/looper --json state --jq .state":
+			return shell.Result{Stdout: "OPEN\n"}, nil
+		case "pr view 46 --repo acme/looper --json headRefOid":
+			return shell.Result{Stdout: `{"headRefOid":"head-46"}`}, nil
+		case "pr close 46 --repo acme/looper":
+			return shell.Result{Stdout: ""}, nil
+		case "pr view 47 --repo acme/looper --json state --jq .state":
+			return shell.Result{Stdout: "OPEN\n"}, nil
+		case "pr view 47 --repo acme/looper --json headRefOid":
+			return shell.Result{Stdout: `{"headRefOid":"moved-head"}`}, nil
 		default:
 			t.Fatalf("unexpected gh args: %q", args)
 			return shell.Result{}, nil
@@ -2947,6 +2957,12 @@ func TestGatewayClosePullRequestIsIdempotent(t *testing.T) {
 	}
 	if err := gateway.ClosePullRequest(context.Background(), ClosePullRequestInput{Repo: "acme/looper", PRNumber: 45, DeleteBranch: true}); err != nil {
 		t.Fatalf("ClosePullRequest(delete branch) error = %v", err)
+	}
+	if err := gateway.ClosePullRequest(context.Background(), ClosePullRequestInput{Repo: "acme/looper", PRNumber: 46, ExpectedHeadSHA: "head-46"}); err != nil {
+		t.Fatalf("ClosePullRequest(expected head) error = %v", err)
+	}
+	if err := gateway.ClosePullRequest(context.Background(), ClosePullRequestInput{Repo: "acme/looper", PRNumber: 47, ExpectedHeadSHA: "original-head"}); !errors.Is(err, ErrPullRequestHeadChanged) {
+		t.Fatalf("ClosePullRequest(stale expected head) error = %v, want ErrPullRequestHeadChanged", err)
 	}
 	if err := gateway.ClosePullRequest(context.Background(), ClosePullRequestInput{Repo: "acme/looper", PRNumber: 45, DeleteBranch: true}); err != nil {
 		t.Fatalf("ClosePullRequest(delete branch) error = %v", err)
