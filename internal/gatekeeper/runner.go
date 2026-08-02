@@ -66,6 +66,7 @@ const (
 	ReasonGatekeeperCheckRequired  ReasonCode = "gatekeeper_check_not_required"
 	ReasonProjectPolicyDenied      ReasonCode = "project_policy_denied"
 	ReasonHold                     ReasonCode = "hold"
+	ReasonDoNotMerge               ReasonCode = "do_not_merge"
 	ReasonDiffBudgetExceeded       ReasonCode = "diff_budget_exceeded"
 	ReasonProviderStateUnavailable ReasonCode = "provider_state_unavailable"
 	ReasonProviderStateAmbiguous   ReasonCode = "provider_state_ambiguous"
@@ -124,6 +125,7 @@ type Evidence struct {
 	CodexReview                  *CodexReviewEvidence         `json:"codexReview,omitempty"`
 	UnresolvedReviewThreadIDs    []string                     `json:"unresolvedReviewThreadIds"`
 	HoldLabels                   []string                     `json:"holdLabels"`
+	DoNotMergeVeto               bool                         `json:"doNotMergeVeto,omitempty"`
 	DiffBudget                   *DiffBudgetEvidence          `json:"diffBudget,omitempty"`
 	ReviewerConvergence          *ReviewerConvergenceEvidence `json:"reviewerConvergence,omitempty"`
 	ProjectPolicyPermitsTarget   bool                         `json:"projectPolicyPermitsTarget"`
@@ -467,6 +469,19 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 	if labels.Has(detail.Labels, labels.HoldGlobal) {
 		report.Evidence.HoldLabels = append(report.Evidence.HoldLabels, labels.HoldGlobal)
 		report.Reasons = append(report.Reasons, Reason{Code: ReasonHold, Subject: labels.HoldGlobal})
+	}
+	// The do-not-merge veto is a human authority exactly like the holds: it is
+	// read-only, and labels.Has matches separator variants, so a maintainer
+	// spelling "DO NOT MERGE" or "do_not_merge" still blocks the route. It is
+	// recorded on the evidence so the routing revalidation can detect a veto
+	// applied after this evaluation but before the label projection. Because
+	// the reason makes the report ineligible, routing takes its removal-only
+	// path and strips the needs-human-review escalation too: a veto overrides
+	// all automation, and the next clean evaluation re-applies the escalation
+	// if it is still warranted.
+	if labels.Has(detail.Labels, labels.DoNotMerge) {
+		report.Evidence.DoNotMergeVeto = true
+		report.Reasons = append(report.Reasons, Reason{Code: ReasonDoNotMerge, Subject: labels.DoNotMerge})
 	}
 	report.Evidence.ProjectPolicyPermitsTarget = r.policyPermitsTarget(input.ProjectID, input.Repo, report.Evidence.BaseRefName)
 	if !report.Evidence.ProjectPolicyPermitsTarget {
