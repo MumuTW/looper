@@ -274,8 +274,6 @@ func validateCoreConfig(config Config, issues *[]ValidationIssue) {
 	validateGatekeeperRoleConfig(config.Roles.Gatekeeper, "roles.gatekeeper", config.Roles.Reviewer.AutoMerge.Enabled, issues)
 	validateGatekeeperReviewEventCompatibility(config, issues)
 	validateAuditorRoleConfig(config.Roles.Auditor, "roles.auditor", issues)
-	validateAuditorGatekeeperCompatibility(config, issues)
-	validatePostMergeDigestGatekeeperCompatibility(config, issues)
 	validateDeployerRoleConfig(config.Roles.Deployer, "roles.deployer", issues)
 	validateEscalatorRoleConfig(config.Roles.Escalator, "roles.escalator", issues)
 	for i, project := range config.Projects {
@@ -699,6 +697,12 @@ func validateGatekeeperRoleConfig(gatekeeper GatekeeperRoleConfig, path string, 
 	}
 	if gatekeeper.RequiredReviewChangedLines < 0 {
 		*issues = append(*issues, ValidationIssue{Path: path + ".requiredReviewChangedLines", Message: "must be zero (to disable the threshold) or a positive integer"})
+	}
+	if gatekeeperTrustIsAuto(gatekeeper.Trust) && reviewerAutoMerge {
+		*issues = append(*issues, ValidationIssue{
+			Path:    path + ".trust",
+			Message: "cannot be auto while Reviewer native auto-merge is enabled; choose one merge authority",
+		})
 	}
 }
 

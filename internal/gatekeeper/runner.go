@@ -792,6 +792,30 @@ func (r *Runner) departedFromOpenSet(
 // forge's pull-request list cannot expose. A trust, policy, or diff-budget
 // bound change must not leave a previously published auto-merge label in place
 // merely because the pull request itself is unchanged.
+// sourceFingerprintForProject includes the local authority inputs that the
+// forge's pull-request list cannot expose. A trust, policy, or diff-budget
+// bound change must not leave a previously published auto-merge label in place
+// merely because the pull request itself is unchanged.
+func (r *Runner) sourceFingerprintForProjectWithContract(pullRequest githubinfra.PullRequestSummary, projectID, repo, contractFingerprint string) string {
+	budget := r.diffBudget(projectID)
+	budgetEnabled := budget.MaxChangedFiles > 0 || budget.MaxDeletions > 0
+	base := sourceFingerprint(pullRequest, budgetEnabled)
+	permitsTarget := r.policyPermitsTarget(projectID, repo, pullRequest.BaseRefName)
+	return strings.Join([]string{
+		base,
+		string(r.trustFor(projectID)),
+		fmt.Sprintf("%t", permitsTarget),
+		fmt.Sprintf("%d", budget.MaxChangedFiles),
+		fmt.Sprintf("%d", budget.MaxDeletions),
+		r.configuredTarget(projectID),
+		strings.TrimSpace(contractFingerprint),
+	}, "\x1f")
+}
+
+// sourceFingerprintForProject includes the local authority inputs that the
+// forge's pull-request list cannot expose. A trust, budget, or policy change
+// must not leave a previously published auto-merge label in place merely
+// because the pull request itself is unchanged.
 func (r *Runner) sourceFingerprintForProject(pullRequest githubinfra.PullRequestSummary, projectID, repo string) string {
 	diffBudget := r.diffBudget(projectID)
 	budgetEnabled := diffBudget.MaxChangedFiles > 0 || diffBudget.MaxDeletions > 0

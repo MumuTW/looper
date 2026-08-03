@@ -425,7 +425,7 @@ func routedGatekeeperRoute(ctx context.Context, repos *storage.Repositories, pro
 		if err := json.Unmarshal([]byte(record.PayloadJSON), &report); err != nil {
 			continue
 		}
-		if strings.TrimSpace(report.ProjectID) != strings.TrimSpace(projectID) || strings.TrimSpace(report.Repo) != strings.TrimSpace(repo) || report.PRNumber != prNumber {
+		if report.ProjectID != projectID || strings.TrimSpace(report.Repo) != strings.TrimSpace(repo) || report.PRNumber != prNumber {
 			continue
 		}
 		if !strings.EqualFold(strings.TrimSpace(report.Mode), "auto") || !report.Eligible {
@@ -475,10 +475,10 @@ func (r *Runner) recordPostMergeEvent(ctx context.Context, projectID, repo strin
 		mergedAt = r.now().UTC().Format(time.RFC3339Nano)
 	}
 	payload := eventlog.CoordinatorPullRequestMerged{
-		Version: 1, ProjectID: strings.TrimSpace(projectID), Repo: strings.TrimSpace(repo),
+		Version: 1, ProjectID: projectID, Repo: strings.TrimSpace(repo),
 		PRNumber: snapshot.PRNumber, IssueNumber: issueNumber, HeadSHA: strings.TrimSpace(snapshot.HeadSHA), MergedAt: mergedAt,
 	}
-	if payload.ProjectID == "" || payload.Repo == "" || payload.PRNumber <= 0 || payload.HeadSHA == "" {
+	if strings.TrimSpace(payload.ProjectID) == "" || payload.Repo == "" || payload.PRNumber <= 0 || payload.HeadSHA == "" {
 		return fmt.Errorf("post-merge observation is missing pull-request identity")
 	}
 	if err := eventlog.Append(ctx, r.repos, eventlog.AppendInput{

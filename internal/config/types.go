@@ -867,11 +867,9 @@ const (
 	// GatekeeperTrustAdvise additionally publishes the verdict and its reasons on
 	// the pull request, so a human can decide without redoing the judgement.
 	GatekeeperTrustAdvise GatekeeperTrustLevel = "advise"
-	// GatekeeperTrustAuto publishes the required current-head status for GitHub
-	// branch protection on the pull request head SHA only. It never performs a
-	// merge itself: GitHub remains the merge authority. It does not publish
-	// status for GitHub native merge-queue merge-group SHAs; branch protection
-	// that requires Looper Gatekeeper on merge-group commits is unsupported.
+	// GatekeeperTrustAuto publishes the auto-merge route label after a fresh
+	// Gatekeeper evaluation. Mergify/GitHub remain the merge authorities; the
+	// daemon never performs a merge itself.
 	GatekeeperTrustAuto GatekeeperTrustLevel = "auto"
 )
 
