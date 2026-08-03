@@ -90,9 +90,6 @@ func (h *Handler) createUpgradeBackup(ctx context.Context) (upgradebackup.Result
 	if err != nil {
 		return upgradebackup.Result{}, err
 	}
-	if len(raw) == 0 {
-		return upgradebackup.Result{}, fmt.Errorf("refusing upgrade backup: config file at %s is empty", configPath)
-	}
 	if strings.TrimSpace(metadata.Revision) != "" {
 		if got := config.ConfigFileRevision(raw, true); got != metadata.Revision {
 			return upgradebackup.Result{}, fmt.Errorf("refusing upgrade backup: on-disk config revision %q does not match applied revision %q", got, metadata.Revision)

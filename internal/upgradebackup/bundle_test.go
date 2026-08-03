@@ -159,6 +159,30 @@ func TestVerifyAcceptsCreatedBundleAndRejectsChangedLayoutOrContent(t *testing.T
 	}
 }
 
+func TestCreateAcceptsEmptyConfigContents(t *testing.T) {
+	root := t.TempDir()
+	configPath := filepath.Join(root, "config.toml")
+	cli := writeBundleFile(t, root, "looper-bin", "cli")
+	daemon := writeBundleFile(t, root, "looperd-bin", "daemon")
+	result, err := Create(context.Background(), Input{
+		RootDir: filepath.Join(root, "backups"), ConfigPath: configPath, ConfigContents: []byte{},
+		DatabasePath: filepath.Join(root, "looper.sqlite"), CLIBinaryPath: cli, DaemonBinaryPath: daemon,
+		Snapshot: func(context.Context) (string, error) {
+			return writeBundleFile(t, root, "snapshot.sqlite", "sqlite"), nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	info, err := os.Stat(filepath.Join(result.Directory, "config.toml"))
+	if err != nil {
+		t.Fatalf("stat empty config artifact: %v", err)
+	}
+	if info.Size() != 0 {
+		t.Fatalf("empty config artifact size = %d, want 0", info.Size())
+	}
+}
+
 func TestRestoreSourceRejectsLegacyManifest(t *testing.T) {
 	if _, err := RestoreSource(Manifest{Version: LegacyManifestVersion}); err == nil {
 		t.Fatal("RestoreSource() error = nil for v1 manifest")
