@@ -333,6 +333,69 @@ func TestRecoverCleansCommittedRestoreWithoutRollingItBack(t *testing.T) {
 	assertNoRestoreArtifacts(t, filepath.Dir(fixture.databasePath))
 }
 
+func TestRestorePreservesCommittedArtifactsWhenTargetDriftsBeforeCleanup(t *testing.T) {
+	fixture := newRestoreFixture(t, true)
+	journalPath := JournalPath(fixture.databasePath)
+	drifted := false
+	operations := fileOperations{rename: func(sourcePath, targetPath string) error {
+		if targetPath == journalPath && strings.Contains(filepath.Base(sourcePath), ".looper-restore-journal-write-") {
+			encoded, err := os.ReadFile(sourcePath)
+			if err != nil {
+				t.Fatalf("read pending journal update: %v", err)
+			}
+			var journal restoreJournal
+			if err := json.Unmarshal(encoded, &journal); err != nil {
+				t.Fatalf("decode pending journal update: %v", err)
+			}
+			if journal.Phase == phaseCommitted {
+				if err := os.Rename(sourcePath, targetPath); err != nil {
+					t.Fatalf("publish committed journal: %v", err)
+				}
+				// Simulate an external writer changing the live target after the
+				// committed phase is durable but before cleanup starts.
+				writeTestFile(t, fixture.databasePath, "external database", 0o660)
+				drifted = true
+				return nil
+			}
+		}
+		return os.Rename(sourcePath, targetPath)
+	}}
+
+	err := restore(fixture.bundleDirectory, fixture.source, operations)
+	if err == nil {
+		t.Fatal("restore() error = nil, want committed-target drift failure")
+	}
+	if !strings.Contains(err.Error(), "cleanup is unsafe") {
+		t.Fatalf("restore() error = %v, want cleanup safety failure", err)
+	}
+	if !drifted {
+		t.Fatal("committed target drift was not injected")
+	}
+	assertFileContents(t, fixture.databasePath, "external database")
+	assertFileContents(t, fixture.configPath, "new config")
+	if _, err := os.Lstat(journalPath); err != nil {
+		t.Fatalf("journal after committed-target drift: %v", err)
+	}
+	var journal restoreJournal
+	encoded, err := os.ReadFile(journalPath)
+	if err != nil {
+		t.Fatalf("read preserved journal: %v", err)
+	}
+	if err := json.Unmarshal(encoded, &journal); err != nil {
+		t.Fatalf("decode preserved journal: %v", err)
+	}
+	if journal.Phase != phaseCommitted {
+		t.Fatalf("preserved journal phase = %q, want %q", journal.Phase, phaseCommitted)
+	}
+	for _, entry := range journal.Entries {
+		if entry.Name == entryDatabase || entry.Name == entryConfig {
+			if _, err := os.Lstat(entry.UndoPath); err != nil {
+				t.Fatalf("preserved undo %s: %v", entry.Name, err)
+			}
+		}
+	}
+}
+
 func assertJournalArtifactsBesideTargets(t *testing.T, journal restoreJournal) {
 	t.Helper()
 	if len(journal.Entries) != 4 {

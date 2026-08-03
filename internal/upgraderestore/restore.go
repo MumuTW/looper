@@ -379,6 +379,13 @@ func restore(bundleDirectory string, source upgradebackup.Source, operations fil
 		return fail(err)
 	}
 
+	// The committed journal and undo files are the last recovery boundary. A
+	// concurrent writer may have removed or rewritten a restored target after
+	// the phase became durable; preserve the journal and undo files instead of
+	// reporting success after deleting the only rollback copy.
+	if err := confirmCommittedTargetsIntact(journal); err != nil {
+		return fmt.Errorf("restore committed but cleanup is unsafe; run Recover(%q): %w", journalPath, err)
+	}
 	if err := cleanupArtifactsAndJournal(journalPath, journal); err != nil {
 		return fmt.Errorf("restore committed but cleanup is incomplete; run Recover(%q): %w", journalPath, err)
 	}
