@@ -9,6 +9,7 @@ import (
 
 	"github.com/MumuTW/looper/internal/config"
 	"github.com/MumuTW/looper/internal/loops/brownout"
+	"github.com/MumuTW/looper/internal/storage"
 )
 
 const defaultAgentHealthVendor = "_default"
@@ -204,6 +205,52 @@ func (r *agentHealthRegistry) WithSnapshot(vendor string, fn func()) error {
 	r.mu.Unlock()
 	if err := breaker.Allow(); err != nil {
 		return err
+	}
+	if fn != nil {
+		fn()
+	}
+	return nil
+}
+
+// WithLanes holds the shared provider-health gate while an atomic scheduler
+// claim selects from multiple already-admitted lanes. Checking all lane
+// breakers under one gate prevents a transition from interleaving between the
+// global queue selection and its durable UPDATE.
+func (r *agentHealthRegistry) WithLanes(lanes []storage.QueueClaimLane, fn func()) error {
+	if r == nil {
+		if fn != nil {
+			fn()
+		}
+		return nil
+	}
+	r.gateMu.Lock()
+	defer r.gateMu.Unlock()
+	seen := make(map[string]struct{}, len(lanes))
+	for _, lane := range lanes {
+		key := strings.TrimSpace(lane.Vendor)
+		if lane.Snapshot {
+			key = strings.TrimSpace(lane.StickySnapshotVendor)
+		}
+		identity := fmt.Sprintf("%t\x00%s", lane.Snapshot, key)
+		if _, ok := seen[identity]; ok {
+			continue
+		}
+		seen[identity] = struct{}{}
+		var breaker *brownout.Breaker
+		var err error
+		if lane.Snapshot {
+			r.mu.Lock()
+			breaker = r.ensureSnapshotBreakerLocked(key)
+			r.mu.Unlock()
+		} else {
+			breaker, err = r.admissionBreaker(key)
+		}
+		if err != nil {
+			return err
+		}
+		if err := breaker.Allow(); err != nil {
+			return err
+		}
 	}
 	if fn != nil {
 		fn()

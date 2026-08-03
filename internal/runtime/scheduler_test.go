@@ -948,15 +948,24 @@ func TestClaimAndRunScheduledQueueItemsSelectsGlobalHighestPriorityAcrossProvide
 		}
 	}
 
+	atomicLaneCalls := 0
 	claimed, err := claimAndRunScheduledQueueItems(context.Background(), 1, defaultSchedulerTickInput{
 		Repos: repos, Config: &cfg, Now: func() time.Time { return now }, AsyncRunner: immediateSchedulerRunner{},
 		Planner: &stubPlannerScheduler{}, Reviewer: &stubReviewerScheduler{}, Worker: &stubWorkerScheduler{},
+		WithAllowClaimLanes: func(_ []storage.QueueClaimLane, fn func()) error {
+			atomicLaneCalls++
+			fn()
+			return nil
+		},
 	})
 	if err != nil {
 		t.Fatalf("claimAndRunScheduledQueueItems() error = %v", err)
 	}
 	if len(claimed) != 1 || claimed[0].ID != reviewer.ID {
 		t.Fatalf("claimed = %#v, want the higher-priority reviewer before either worker", claimed)
+	}
+	if atomicLaneCalls == 0 {
+		t.Fatal("atomic lane admission was not used for the provider-priority claim")
 	}
 }
 

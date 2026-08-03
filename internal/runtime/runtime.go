@@ -1101,6 +1101,22 @@ func (r *Runtime) WithAllowSnapshotAgentClaimForVendor(vendor string, fn func())
 	return brownoutErr
 }
 
+// WithAllowAgentClaimLanes holds lifecycle admission and every provider gate
+// represented by an atomic multi-lane queue claim. The callback must not spawn
+// an agent or consult provider health; the shared health gate is non-reentrant.
+func (r *Runtime) WithAllowAgentClaimLanes(lanes []storage.QueueClaimLane, fn func()) error {
+	if r == nil || r.admission == nil {
+		return ErrAdmissionStopping
+	}
+	var brownoutErr error
+	if err := r.admission.WithAllowWork(func() {
+		brownoutErr = r.agentHealth.WithLanes(lanes, fn)
+	}); err != nil {
+		return err
+	}
+	return brownoutErr
+}
+
 // MarkDegraded sticks admission until process restart and cancels work-producing
 // contexts (scheduler, recovery, cleanup) so new discovery/claims/cleanup that
 // already passed AllowClaim cannot complete after the transition. Unlike
@@ -1484,7 +1500,7 @@ func (r *Runtime) start(ctx context.Context) error {
 		}, r.TriggerSchedulerClaim, r.now, r.reconcileLiveStaleRunningRuns, r.AllowClaim, r.WithAllowAgentClaim, schedulerProviderGate{
 			lifecycle:     r.AllowLifecycleWork,
 			lifecycleWith: r.WithAllowLifecycleWork,
-			allow:         r.AllowClaimForVendor, with: r.WithAllowAgentClaimForVendor,
+			allow:         r.AllowClaimForVendor, with: r.WithAllowAgentClaimForVendor, withLanes: r.WithAllowAgentClaimLanes,
 			snapshotAllow: r.AllowSnapshotClaimForVendor, snapshotWith: r.WithAllowSnapshotAgentClaimForVendor,
 		})
 		if !r.customSchedulerTick {

@@ -349,6 +349,21 @@ type QueueItemRecord struct {
 	UpdatedAt     string
 }
 
+// QueueClaimLane describes one admitted scheduler lane for an atomic queue
+// selection. The scheduler supplies the same type/project predicates used by
+// ordinary claims; storage owns the final union ordering and UPDATE.
+type QueueClaimLane struct {
+	Vendor                 string
+	UnrestrictedTypes      []string
+	StickySnapshotTypes    []string
+	StickySnapshotVendor   string
+	Snapshot               bool
+	ExcludeStickySnapshots bool
+	ProjectScopedTypes     []string
+	ProjectIDs             []string
+	StickyOnlyProjectIDs   []string
+}
+
 type QueueStats struct {
 	TotalQueued                      int64
 	EligibleQueued                   int64
@@ -3299,6 +3314,47 @@ func (r *QueueRepository) PeekNextLongTermRetryAmongTypeSetsForProjectsWithSnaps
 		`+typePred+`
 		`+projectPred+`
 	`, extraArgs)
+}
+
+// ClaimNextAcrossLanes atomically selects and claims the highest-priority
+// eligible item from the union of admitted lanes. A single UPDATE ...
+// RETURNING statement makes the queue ordering and mutation one durable
+// operation, so a producer inserting a higher-priority item between per-lane
+// peeks cannot leave the scheduler committed to a stale winner.
+func (r *QueueRepository) ClaimNextAcrossLanes(ctx context.Context, nowISO, claimedBy string, lanes []QueueClaimLane, longTerm bool) (*QueueItemRecord, error) {
+	if len(lanes) == 0 {
+		return nil, nil
+	}
+	clauses := make([]string, 0, len(lanes))
+	args := make([]any, 0, len(lanes)*4)
+	for _, lane := range lanes {
+		typePred, typeArgs := queueClaimTypePredicateWithSnapshotVendor(
+			lane.UnrestrictedTypes,
+			lane.StickySnapshotTypes,
+			lane.StickySnapshotVendor,
+			lane.ExcludeStickySnapshots,
+		)
+		if typePred == "" {
+			continue
+		}
+		projectPred, projectArgs := queueClaimProjectPredicate(lane.ProjectScopedTypes, lane.ProjectIDs, lane.StickyOnlyProjectIDs)
+		clause := strings.TrimSpace(strings.TrimPrefix(typePred, "AND"))
+		if projectPred != "" {
+			clause += " AND " + strings.TrimSpace(strings.TrimPrefix(projectPred, "AND"))
+		}
+		clauses = append(clauses, "("+clause+")")
+		args = append(args, typeArgs...)
+		args = append(args, projectArgs...)
+	}
+	if len(clauses) == 0 {
+		return nil, nil
+	}
+	retryPredicate := "AND NOT (" + longTermRetryPredicateParam + ")"
+	if longTerm {
+		retryPredicate = "AND (" + longTermRetryPredicateParam + ")"
+	}
+	args = append([]any{QueueLongTermRetryAttemptThreshold}, args...)
+	return r.claimNextMatching(ctx, nowISO, claimedBy, retryPredicate+" AND ("+strings.Join(clauses, " OR ")+")", args)
 }
 
 func queueTypeInClause(types []string) (placeholders string, args []any) {

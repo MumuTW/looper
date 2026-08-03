@@ -174,6 +174,7 @@ type defaultSchedulerTickInput struct {
 	// legacy/unit-test scheduler inputs ungated.
 	AllowClaimForVendor     func(string) error
 	WithAllowClaimForVendor func(string, func()) error
+	WithAllowClaimLanes     func([]storage.QueueClaimLane, func()) error
 	// AllowSnapshotClaimForVendor and its critical-section counterpart apply to
 	// sticky retries whose persisted run snapshot is the execution authority.
 	AllowSnapshotClaimForVendor     func(string) error
@@ -1922,6 +1923,7 @@ type schedulerProviderGate struct {
 	lifecycleWith func(func()) error
 	allow         func(string) error
 	with          func(string, func()) error
+	withLanes     func([]storage.QueueClaimLane, func()) error
 	snapshotAllow func(string) error
 	snapshotWith  func(string, func()) error
 }
@@ -1943,6 +1945,7 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *
 	var withAllowLifecycleWork func(func()) error
 	var allowClaimForVendor func(string) error
 	var withAllowClaimForVendor func(string, func()) error
+	var withAllowClaimLanes func([]storage.QueueClaimLane, func()) error
 	var allowSnapshotClaimForVendor func(string) error
 	var withAllowSnapshotClaimForVendor func(string, func()) error
 	if len(providerGates) > 0 {
@@ -1950,6 +1953,7 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *
 		withAllowLifecycleWork = providerGates[0].lifecycleWith
 		allowClaimForVendor = providerGates[0].allow
 		withAllowClaimForVendor = providerGates[0].with
+		withAllowClaimLanes = providerGates[0].withLanes
 		allowSnapshotClaimForVendor = providerGates[0].snapshotAllow
 		withAllowSnapshotClaimForVendor = providerGates[0].snapshotWith
 	}
@@ -2022,6 +2026,7 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *
 		input.WithAllowClaim = withAllowClaim
 		input.AllowClaimForVendor = allowClaimForVendor
 		input.WithAllowClaimForVendor = withAllowClaimForVendor
+		input.WithAllowClaimLanes = withAllowClaimLanes
 		input.AllowSnapshotClaimForVendor = allowSnapshotClaimForVendor
 		input.WithAllowSnapshotClaimForVendor = withAllowSnapshotClaimForVendor
 		// Wire Supervisor operation leases for claim ownership span (#579).
@@ -2044,6 +2049,7 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *
 				stopped.WithAllowClaim = withAllowClaim
 				stopped.AllowClaimForVendor = allowClaimForVendor
 				stopped.WithAllowClaimForVendor = withAllowClaimForVendor
+				stopped.WithAllowClaimLanes = withAllowClaimLanes
 				stopped.AllowSnapshotClaimForVendor = allowSnapshotClaimForVendor
 				stopped.WithAllowSnapshotClaimForVendor = withAllowSnapshotClaimForVendor
 				if services.ActiveExecutions != nil {
@@ -2062,6 +2068,7 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *
 			latest.WithAllowClaim = withAllowClaim
 			latest.AllowClaimForVendor = allowClaimForVendor
 			latest.WithAllowClaimForVendor = withAllowClaimForVendor
+			latest.WithAllowClaimLanes = withAllowClaimLanes
 			latest.AllowSnapshotClaimForVendor = allowSnapshotClaimForVendor
 			latest.WithAllowSnapshotClaimForVendor = withAllowSnapshotClaimForVendor
 			if services.ActiveExecutions != nil {
@@ -3718,7 +3725,7 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 		claimSkip
 		claimStop
 	)
-	claimOne := func(vendor string, providerScoped, snapshotScoped, lifecycleOnly, admissionChecked bool, claimFn func(context.Context, string, string) (*storage.QueueItemRecord, error)) (result int, claimErr error) {
+	claimOne := func(vendor string, providerScoped, snapshotScoped, lifecycleOnly, admissionChecked bool, claimLanes []storage.QueueClaimLane, claimFn func(context.Context, string, string) (*storage.QueueItemRecord, error)) (result int, claimErr error) {
 		if err := ctx.Err(); err != nil {
 			return claimStop, nil
 		}
@@ -3833,6 +3840,10 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 			gateErr = input.WithAllowLifecycleWork(func() {
 				executeResult, executeErr = execute()
 			})
+		} else if len(claimLanes) > 0 && input.WithAllowClaimLanes != nil {
+			gateErr = input.WithAllowClaimLanes(claimLanes, func() {
+				executeResult, executeErr = execute()
+			})
 		} else if input.WithAllowClaim == nil && !(providerScoped && ((snapshotScoped && input.WithAllowSnapshotClaimForVendor != nil) || input.WithAllowClaimForVendor != nil)) {
 			return executeAndReport()
 		} else if snapshotScoped && input.WithAllowSnapshotClaimForVendor != nil {
@@ -3853,7 +3864,7 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 			deferredHardPersist = nil
 		}
 		if gateErr != nil {
-			if providerScoped && errors.Is(gateErr, brownout.ErrOpen) {
+			if (providerScoped || len(claimLanes) > 0) && errors.Is(gateErr, brownout.ErrOpen) {
 				return claimSkip, nil
 			}
 			return claimStop, nil
@@ -3869,6 +3880,76 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 	stopClaiming := false
 	var claimFailure error
 	claimLanes := func(longTerm bool) {
+		atomicAcrossLanes := input.WithAllowClaimLanes != nil
+		for _, typeSet := range providerTypeSets {
+			if !typeSet.providerScoped && !typeSet.snapshotScoped {
+				atomicAcrossLanes = false
+				break
+			}
+		}
+		if atomicAcrossLanes {
+			active := make([]bool, len(providerTypeSets))
+			for i := range active {
+				active[i] = true
+			}
+			for len(queueItems) < availableSlots {
+				if err := ctx.Err(); err != nil {
+					stopClaiming = true
+					return
+				}
+				lanes := make([]storage.QueueClaimLane, 0, len(providerTypeSets))
+				for offset := range providerTypeSets {
+					index := (laneStart + offset) % len(providerTypeSets)
+					typeSet := providerTypeSets[index]
+					if !active[index] {
+						continue
+					}
+					if skip, stop := admitClaim(typeSet.vendor, typeSet.providerScoped, typeSet.snapshotScoped, typeSet.lifecycleOnly); skip {
+						active[index] = false
+						continue
+					} else if stop {
+						stopClaiming = true
+						return
+					}
+					lanes = append(lanes, storage.QueueClaimLane{
+						Vendor:                 typeSet.vendor,
+						UnrestrictedTypes:      append([]string(nil), typeSet.unrestricted...),
+						StickySnapshotTypes:    append([]string(nil), typeSet.stickyOnly...),
+						StickySnapshotVendor:   typeSet.vendor,
+						Snapshot:               typeSet.snapshotScoped,
+						ExcludeStickySnapshots: typeSet.excludeStickySnapshots,
+						ProjectScopedTypes:     projectScopedTypes,
+						ProjectIDs:             runnableProjectIDs,
+						StickyOnlyProjectIDs:   stickyOnlyProjectIDs,
+					})
+				}
+				if stopClaiming || len(lanes) == 0 {
+					return
+				}
+				result, err := claimOne("", false, false, false, true, lanes, func(ctx context.Context, nowISO, claimedBy string) (*storage.QueueItemRecord, error) {
+					return input.Repos.Queue.ClaimNextAcrossLanes(ctx, nowISO, claimedBy, lanes, longTerm)
+				})
+				if err != nil {
+					claimFailure = err
+					stopClaiming = true
+					return
+				}
+				switch result {
+				case claimContinue:
+					// Rebuild the admitted lane union for every slot. The SQL UPDATE
+					// chooses the winner after all producers' writes are visible.
+				case claimEmpty:
+					return
+				case claimSkip:
+					// A provider changed state between point admission and the
+					// atomic claim. Recheck lanes on the next pass.
+				case claimStop:
+					stopClaiming = true
+					return
+				}
+			}
+			return
+		}
 		// Peek each provider lane before claiming so priority remains global even
 		// when roles are assigned to different providers. A round-robin pass alone
 		// only prevents one lane from draining its backlog; it can still let a
@@ -3935,7 +4016,7 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 				}
 			}
 			typeSet := providerTypeSets[winner.index]
-			result, err := claimOne(typeSet.vendor, typeSet.providerScoped, typeSet.snapshotScoped, typeSet.lifecycleOnly, true, func(ctx context.Context, nowISO, claimedBy string) (*storage.QueueItemRecord, error) {
+			result, err := claimOne(typeSet.vendor, typeSet.providerScoped, typeSet.snapshotScoped, typeSet.lifecycleOnly, true, nil, func(ctx context.Context, nowISO, claimedBy string) (*storage.QueueItemRecord, error) {
 				if longTerm {
 					return input.Repos.Queue.ClaimNextLongTermRetryAmongTypeSetsForProjectsWithSnapshotVendor(ctx, nowISO, claimedBy, typeSet.unrestricted, typeSet.stickyOnly, typeSet.vendor, typeSet.excludeStickySnapshots, projectScopedTypes, runnableProjectIDs, stickyOnlyProjectIDs)
 				}

@@ -84,6 +84,21 @@ func TestRepeatedAgentFailuresCloseClaimAdmission(t *testing.T) {
 	}
 }
 
+func TestWithAllowAgentClaimLanesRefusesOpenProvider(t *testing.T) {
+	rt, clock := brownoutRuntime(t, nil)
+	failAgent(rt, clock, 3)
+	called := false
+	err := rt.WithAllowAgentClaimLanes([]storage.QueueClaimLane{{Vendor: ""}}, func() {
+		called = true
+	})
+	if !errors.Is(err, brownout.ErrOpen) {
+		t.Fatalf("WithAllowAgentClaimLanes() = %v, want brownout.ErrOpen", err)
+	}
+	if called {
+		t.Fatal("atomic claim callback ran while the provider breaker was open")
+	}
+}
+
 func TestSchedulerClaimPumpUsesLifecycleAdmissionDuringBrownout(t *testing.T) {
 	rt, clock := brownoutRuntime(t, nil)
 	rt.services.Repositories = &storage.Repositories{}
