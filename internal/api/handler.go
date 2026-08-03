@@ -18,13 +18,17 @@ import (
 	"strings"
 	"time"
 
+	"github.com/MumuTW/looper/internal/agentdiscovery"
 	"github.com/MumuTW/looper/internal/config"
 	"github.com/MumuTW/looper/internal/daemonbinary"
 	"github.com/MumuTW/looper/internal/domain"
 	"github.com/MumuTW/looper/internal/eventlog"
 	"github.com/MumuTW/looper/internal/fixer"
+	"github.com/MumuTW/looper/internal/gatekeeper"
 	"github.com/MumuTW/looper/internal/loops"
+	"github.com/MumuTW/looper/internal/postmergedigest"
 	"github.com/MumuTW/looper/internal/projects"
+	"github.com/MumuTW/looper/internal/reviewer/convergence"
 	looperdruntime "github.com/MumuTW/looper/internal/runtime"
 	"github.com/MumuTW/looper/internal/storage"
 	"github.com/MumuTW/looper/internal/webhookforward"
@@ -4059,4 +4063,20 @@ func looperdArtifactName(target string) *string {
 
 	value := "looperd-" + target
 	return &value
+}
+
+func issueCollisionError(issueNumber int64, loopID, loopType string) apiError {
+	return apiError{
+		code:    pkgapi.ErrorCodeLoopConflict,
+		status:  http.StatusConflict,
+		message: fmt.Sprintf("Issue #%d is occupied by active %s loop %s", issueNumber, loopType, loopID),
+		details: map[string]any{"occupiedBy": map[string]any{"loopId": loopID, "loopType": loopType}},
+	}
+}
+
+func mapIssueClaimAdmissionError(err error) error {
+	if conflict, ok := storage.IsIssueClaimConflictError(err); ok {
+		return issueCollisionError(conflict.IssueNumber, conflict.LoopID, conflict.LoopType)
+	}
+	return err
 }

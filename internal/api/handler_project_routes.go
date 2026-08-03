@@ -226,7 +226,6 @@ func (h *Handler) buildCreateProjectResponse(r *http.Request, service projectSer
 		IDSource:     idSource,
 		WorktreeRoot: normalizeOptionalString(body.WorktreeRoot),
 		Repo:         normalizeOptionalString(body.Repo),
-		Provider:     normalizeOptionalString(body.Provider),
 		Validation:   cloneProjectValidation(body.Validation),
 		SnapshotMode: snapshotMode,
 	})
