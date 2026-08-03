@@ -19,10 +19,6 @@ type Service struct {
 	Now   func() time.Time
 }
 
-// ErrLoopNotFound lets transport adapters map a missing durable loop without
-// parsing an error string emitted by the lifecycle service.
-var ErrLoopNotFound = errors.New("loop not found")
-
 // ErrInvalidLoopStatusTransition lets transport adapters map a deterministic
 // lifecycle transition rejection (for example pausing a loop in a terminal
 // state) as a client-side conflict instead of an internal error.
