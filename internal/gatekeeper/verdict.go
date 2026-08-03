@@ -28,8 +28,9 @@ const retiredVerdictBody = VerdictCommentMarker + "\n" +
 type verdictAction string
 
 const (
-	// verdictActionNone is the steady state: nothing needs to change, so
-	// Gatekeeper performs no forge reads or writes at all.
+	// verdictActionNone is the steady state for the owned comment. Routing-label
+	// reconciliation is separate and still runs each published evaluation so an
+	// external label edit cannot silently disable or enable the merge queue.
 	verdictActionNone verdictAction = "none"
 	// verdictActionPublish creates or updates the owned comment.
 	verdictActionPublish verdictAction = "publish"
@@ -61,15 +62,18 @@ func decideVerdictAction(trust config.GatekeeperTrustLevel, previous *Report, ne
 }
 
 // previousPublished reports whether a stored report was written at a level that
-// publishes. Reports predating the trust ladder carry the historical mode and
-// never published.
+// publishes. A routing-projection retry marker is also treated as published:
+// it is emitted only after the underlying report was persisted and the owned
+// label/comment projection failed, so the next evaluation must keep retiring or
+// retrying that projection even if the current trust level is observe.
+// Reports predating the trust ladder carry the historical mode and never
+// published.
 func previousPublished(report Report) bool {
 	switch config.GatekeeperTrustLevel(strings.TrimSpace(report.Mode)) {
 	case config.GatekeeperTrustAdvise, config.GatekeeperTrustAuto:
 		return true
-	default:
-		return false
 	}
+	return hasReasonCode(report.Reasons, ReasonRoutingProjectionFailed)
 }
 
 // reasonExplanations turn a reason code into something a human can act on. The
@@ -95,6 +99,7 @@ var reasonExplanations = map[ReasonCode]string{
 	ReasonDiffBudgetExceeded:       "the pull request exceeds the configured diff budget",
 	ReasonProviderStateUnavailable: "the forge did not return the state needed to judge this",
 	ReasonProviderStateAmbiguous:   "the forge returned ambiguous state for this",
+	ReasonRoutingProjectionFailed:  "the merge-route label could not be reconciled; Looper will retry",
 }
 
 // BuildVerdictComment renders a report as the comment published at advise.

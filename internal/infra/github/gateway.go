@@ -3,6 +3,7 @@ package github
 import (
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,6 +23,7 @@ import (
 	"github.com/MumuTW/looper/internal/labels"
 	"github.com/MumuTW/looper/internal/outboundguard"
 	"github.com/MumuTW/looper/internal/storage"
+	"gopkg.in/yaml.v3"
 )
 
 const javaScriptISOStringLayout = "2006-01-02T15:04:05.000Z"
@@ -613,6 +615,13 @@ type PullRequestLabelsInput struct {
 	PRNumber int64
 	Labels   []string
 	CWD      string
+}
+
+// ValidateMergifyRoutingInput identifies the repository configuration whose
+// queue contract Gatekeeper relies on when it publishes the auto-merge label.
+type ValidateMergifyRoutingInput struct {
+	Repo string
+	CWD  string
 }
 
 type PullRequestReviewersInput struct {
@@ -2247,6 +2256,75 @@ func (g *Gateway) GetPullRequestHeadAndBaseSHA(ctx context.Context, input ViewPu
 		return "", "", err
 	}
 	return asString(row["headRefOid"]), asString(row["baseRefOid"]), nil
+}
+
+// ValidateMergifyRouting checks the repository-owned Mergify contract before
+// Gatekeeper publishes an auto-merge label. The repository file is the
+// authority for how that label is consumed; Gatekeeper fails closed when the
+// file is absent or misses the vetoes protecting manual queue entries.
+func (g *Gateway) ValidateMergifyRouting(ctx context.Context, input ValidateMergifyRoutingInput) error {
+	hostname, repo := splitRepoHostname(input.Repo)
+	args := []string{"api", fmt.Sprintf("repos/%s/contents/.mergify.yml", repo), "--jq", ".content", "-H", "Accept: application/vnd.github+json"}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGh(ctx, input.CWD, "", args...)
+	if err != nil {
+		return fmt.Errorf("read .mergify.yml: %w", err)
+	}
+	encoded := strings.Map(func(r rune) rune {
+		switch r {
+		case ' ', '\t', '\r', '\n':
+			return -1
+		default:
+			return r
+		}
+	}, result.Stdout)
+	content, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return fmt.Errorf("decode .mergify.yml: %w", err)
+	}
+	var contract struct {
+		QueueRules []struct {
+			QueueConditions []string `yaml:"queue_conditions"`
+		} `yaml:"queue_rules"`
+		MergeProtections []struct {
+			Name string `yaml:"name"`
+		} `yaml:"merge_protections"`
+		MergeProtectionsSettings struct {
+			AutoMergeConditions []string `yaml:"auto_merge_conditions"`
+		} `yaml:"merge_protections_settings"`
+	}
+	if err := yaml.Unmarshal(content, &contract); err != nil {
+		return fmt.Errorf("parse .mergify.yml: %w", err)
+	}
+	if len(contract.QueueRules) == 0 {
+		return fmt.Errorf(".mergify.yml has no queue_rules")
+	}
+	for index, rule := range contract.QueueRules {
+		for _, condition := range []string{"label != " + labels.NeedsHumanReview, "label != " + labels.DoNotMerge} {
+			if !hasMergifyCondition(rule.QueueConditions, condition) {
+				return fmt.Errorf(".mergify.yml queue_rules[%d] queue_conditions missing %q", index, condition)
+			}
+		}
+	}
+	if len(contract.MergeProtections) == 0 {
+		return fmt.Errorf(".mergify.yml has no merge_protections; auto_merge_conditions require at least one active merge-protection rule")
+	}
+	if !hasMergifyCondition(contract.MergeProtectionsSettings.AutoMergeConditions, "label = "+labels.AutoMerge) {
+		return fmt.Errorf(".mergify.yml has no auto-merge label contract")
+	}
+	return nil
+}
+
+func hasMergifyCondition(conditions []string, expected string) bool {
+	want := strings.Join(strings.Fields(expected), " ")
+	for _, condition := range conditions {
+		if strings.Join(strings.Fields(condition), " ") == want {
+			return true
+		}
+	}
+	return false
 }
 
 func (g *Gateway) ResolveReviewThread(ctx context.Context, input ResolveReviewThreadInput) error {

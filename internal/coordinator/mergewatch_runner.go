@@ -2,6 +2,7 @@ package coordinator
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"regexp"
@@ -16,6 +17,7 @@ import (
 	"github.com/MumuTW/looper/internal/eventlog"
 	githubinfra "github.com/MumuTW/looper/internal/infra/github"
 	"github.com/MumuTW/looper/internal/labels"
+	"github.com/MumuTW/looper/internal/storage"
 )
 
 var mergeWatchPRURLPattern = regexp.MustCompile(`/pull/(\d+)(?:/|$)`)
@@ -84,6 +86,11 @@ func (r *Runner) applyMergeWatchLocked(ctx context.Context, projectID, repo, cwd
 	}
 	action := mergewatch.Classify(snapshot, markerState(marker), mergewatch.RetryBudget{Now: r.now().UTC(), TransientRetries: roles.Coordinator.MergeWatch.TransientRetries, MaxIndeterminateDuration: maxIndeterminateDuration})
 	baseMarker := mergeWatchBaseMarker(marker, snapshot, roles.Coordinator.MergeWatch.TransientRetries)
+	// Retire the watch whenever native auto-merge is owned by someone other
+	// than Looper. A human-owned native route competes with the Mergify label
+	// route, and if the human-owned route wins the merge, recording it as
+	// Looper merge evidence would let the Auditor attribute a regression — and
+	// eventually propose a revert — to a merge Looper did not perform.
 	if action.Kind != mergewatch.ActionTransientError && (!snapshot.HasLooperLabel || (snapshot.AutoMergeEnabled && !snapshot.AutoMergeOwnedByLooper)) {
 		return false, r.deleteMergeWatchComment(ctx, repo, cwd, marker)
 	}
@@ -144,10 +151,157 @@ func (r *Runner) applyMergeWatchLocked(ctx context.Context, projectID, repo, cwd
 	}
 }
 
+// applyRoutedMergeWatch observes merges of routed pull requests independently
+// of issue discovery. When Mergify merges a normal PR whose body closes its
+// tracked issue, GitHub closes that issue as part of the merge, so the
+// open-issue merge-watch loop (which loads only ListOpenIssues) never reaches
+// the merged PR on the next tick; PRs without a Coordinator-tracked issue are
+// missed for the same reason. This pass keeps a durable registry of routed PRs
+// (those carrying the Mergify auto-merge route label) and records merge
+// evidence for any whose terminal state is a merge.
+func (r *Runner) applyRoutedMergeWatch(ctx context.Context, projectID, repo, cwd string) error {
+	if r.github == nil || r.repos == nil || r.repos.Events == nil {
+		return nil
+	}
+	currentLogin, err := r.github.GetCurrentUserLoginForRepo(ctx, repo, cwd)
+	if err != nil {
+		return err
+	}
+	open, err := r.github.ListOpenPullRequests(ctx, githubinfra.ListOpenPullRequestsInput{Repo: repo, CWD: cwd, Limit: 100})
+	if err != nil {
+		return err
+	}
+	openNumbers := make(map[int64]struct{}, len(open))
+	for _, summary := range open {
+		openNumbers[summary.Number] = struct{}{}
+	}
+	// Register every routed open PR that is not yet registered. Registration is
+	// idempotent per entity, so repeated ticks do not grow the registry. A PR
+	// is routed only when it carries both the Mergify auto-merge label and a
+	// Looper-owned label, mirroring resolveWatchedPR; a generic human-added
+	// auto-merge label must not register a PR whose merge would then be
+	// attributed to Looper.
+	for _, summary := range open {
+		if !labels.Has(summary.Labels, labels.AutoMerge) || !labels.AnyLooperOwned(summary.Labels) {
+			continue
+		}
+		if _, registered, err := routedMergeWatchRecord(ctx, r.repos, projectID, repo, summary.Number); err != nil {
+			return err
+		} else if registered {
+			continue
+		}
+		if err := r.upsertRoutedMergeWatch(ctx, projectID, repo, summary.Number, summary.HeadSHA, false); err != nil {
+			return err
+		}
+	}
+	// Settle registrations whose PR left the open list: the terminal state is
+	// either merged (record evidence) or closed without merge (just settle).
+	registrations, err := listRoutedMergeWatches(ctx, r.repos, projectID, repo)
+	if err != nil {
+		return err
+	}
+	for prNumber, headSHA := range registrations {
+		if _, stillOpen := openNumbers[prNumber]; stillOpen {
+			continue
+		}
+		detail, err := r.github.ViewPullRequestMergeWatch(ctx, githubinfra.ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: cwd})
+		if err != nil {
+			if isTransientMergeWatchError(err) {
+				continue
+			}
+			return err
+		}
+		merged := strings.TrimSpace(detail.MergedAt) != "" || strings.EqualFold(strings.TrimSpace(detail.State), "merged")
+		if merged {
+			// A human-owned native auto-merge that won must not be recorded as
+			// Looper merge evidence: the Auditor would otherwise attribute the
+			// merge to Looper. Settle the registration without evidence, the
+			// same guard applyMergeWatchLocked applies to the issue-lane watch.
+			humanOwned := detail.AutoMerge != nil && !strings.EqualFold(strings.TrimSpace(detail.AutoMerge.EnabledBy), strings.TrimSpace(currentLogin))
+			if !humanOwned {
+				if err := r.recordPostMergeEvent(ctx, projectID, repo, 0, mergewatch.PRSnapshot{
+					Repo: repo, PRNumber: prNumber, HeadSHA: firstNonEmpty(detail.HeadSHA, headSHA),
+					MergedAt: detail.MergedAt, Merged: true,
+				}); err != nil {
+					return err
+				}
+			}
+		}
+		if err := r.upsertRoutedMergeWatch(ctx, projectID, repo, prNumber, headSHA, true); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// upsertRoutedMergeWatch writes a routed-PR merge-watch registration. Settled
+// is the terminal observation marker; the reader keeps the newest record per
+// entity.
+func (r *Runner) upsertRoutedMergeWatch(ctx context.Context, projectID, repo string, prNumber int64, headSHA string, settled bool) error {
+	entityType, entityID := "pull_request", fmt.Sprintf("%s#%d", repo, prNumber)
+	payload := eventlog.CoordinatorRoutedMergeWatch{
+		Version: 1, ProjectID: projectID, Repo: repo, PRNumber: prNumber, HeadSHA: headSHA, Settled: settled,
+	}
+	projectIDPtr := projectID
+	if err := eventlog.Append(ctx, r.repos, eventlog.AppendInput{
+		EventType: eventlog.CoordinatorRoutedMergeWatchEventType, ProjectID: &projectIDPtr,
+		EntityType: &entityType, EntityID: &entityID, Payload: payload, CreatedAt: r.now(),
+	}); err != nil {
+		return fmt.Errorf("record routed merge watch: %w", err)
+	}
+	return nil
+}
+
+// routedMergeWatchRecord reports the newest registration for one routed PR and
+// whether it exists. A settled registration is still "registered" so a re-merge
+// cannot re-register the same entity.
+func routedMergeWatchRecord(ctx context.Context, repos *storage.Repositories, projectID, repo string, prNumber int64) (eventlog.CoordinatorRoutedMergeWatch, bool, error) {
+	registrations, err := listRoutedMergeWatches(ctx, repos, projectID, repo)
+	if err != nil {
+		return eventlog.CoordinatorRoutedMergeWatch{}, false, err
+	}
+	for registeredNumber, headSHA := range registrations {
+		if registeredNumber == prNumber {
+			return eventlog.CoordinatorRoutedMergeWatch{ProjectID: projectID, Repo: repo, PRNumber: prNumber, HeadSHA: headSHA, Settled: true}, true, nil
+		}
+	}
+	return eventlog.CoordinatorRoutedMergeWatch{}, false, nil
+}
+
+// listRoutedMergeWatches reads the newest non-settled registration per routed
+// PR for a project and repo. Records arrive oldest first, so a later
+// registration for the same entity overwrites an earlier one, mirroring
+// latestGateReports.
+func listRoutedMergeWatches(ctx context.Context, repos *storage.Repositories, projectID, repo string) (map[int64]string, error) {
+	records, err := repos.Events.ListByProjectAndEntityType(ctx, projectID, "pull_request")
+	if err != nil {
+		return nil, err
+	}
+	registrations := make(map[int64]string)
+	for _, record := range records {
+		if record.EventType != eventlog.CoordinatorRoutedMergeWatchEventType || record.EntityID == nil {
+			continue
+		}
+		var registration eventlog.CoordinatorRoutedMergeWatch
+		if err := json.Unmarshal([]byte(record.PayloadJSON), &registration); err != nil {
+			continue
+		}
+		if registration.Settled {
+			delete(registrations, registration.PRNumber)
+			continue
+		}
+		registrations[registration.PRNumber] = registration.HeadSHA
+	}
+	return registrations, nil
+}
+
 // recordPostMergeEvent turns the merge-watch observation into durable local
 // evidence before the forge marker is removed. The event is idempotent by
-// pull-request entity so repeated polling cannot inflate a daily digest.
+// pull-request entity so repeated polling cannot create duplicate candidates.
 func (r *Runner) recordPostMergeEvent(ctx context.Context, projectID, repo string, issueNumber int64, snapshot mergewatch.PRSnapshot) error {
+	if r.repos == nil || r.repos.Events == nil {
+		return fmt.Errorf("post-merge event repository is not configured")
+	}
 	entityType := "pull_request"
 	entityID := fmt.Sprintf("%s#%d", repo, snapshot.PRNumber)
 	existing, err := r.repos.Events.ListByEntity(ctx, entityType, entityID)
@@ -159,32 +313,24 @@ func (r *Runner) recordPostMergeEvent(ctx context.Context, projectID, repo strin
 			return nil
 		}
 	}
-	payload := map[string]any{
-		"repo":        repo,
-		"prNumber":    snapshot.PRNumber,
-		"issueNumber": issueNumber,
-		"headSha":     snapshot.HeadSHA,
-	}
 	mergedAt := strings.TrimSpace(snapshot.MergedAt)
 	if mergedAt == "" {
 		mergedAt = r.now().UTC().Format(time.RFC3339Nano)
 	}
-	payload["mergedAt"] = mergedAt
+	payload := eventlog.CoordinatorPullRequestMerged{
+		Version: 1, ProjectID: strings.TrimSpace(projectID), Repo: strings.TrimSpace(repo),
+		PRNumber: snapshot.PRNumber, IssueNumber: issueNumber, HeadSHA: strings.TrimSpace(snapshot.HeadSHA), MergedAt: mergedAt,
+	}
+	if payload.ProjectID == "" || payload.Repo == "" || payload.PRNumber <= 0 || payload.HeadSHA == "" {
+		return fmt.Errorf("post-merge observation is missing pull-request identity")
+	}
 	if err := eventlog.Append(ctx, r.repos, eventlog.AppendInput{
-		EventType: eventlog.CoordinatorPullRequestMergedEventType,
-		ProjectID: nilIfBlank(projectID), EntityType: &entityType, EntityID: &entityID,
-		Payload: payload, CreatedAt: r.now(),
+		EventType: eventlog.CoordinatorPullRequestMergedEventType, ProjectID: &payload.ProjectID,
+		EntityType: &entityType, EntityID: &entityID, Payload: payload, CreatedAt: r.now(),
 	}); err != nil {
 		return fmt.Errorf("record post-merge event: %w", err)
 	}
 	return nil
-}
-
-func nilIfBlank(value string) *string {
-	if strings.TrimSpace(value) == "" {
-		return nil
-	}
-	return &value
 }
 
 func (r *Runner) resolveWatchedPR(ctx context.Context, repo, cwd string, issue loadedIssue, marker *mergeWatchComment, currentLogin string) (int64, bool, error) {
@@ -205,7 +351,9 @@ func (r *Runner) resolveWatchedPR(ctx context.Context, repo, cwd string, issue l
 		if err != nil {
 			continue
 		}
-		if detail.AutoMerge == nil || !strings.EqualFold(strings.TrimSpace(detail.AutoMerge.EnabledBy), strings.TrimSpace(currentLogin)) || !labels.AnyLooperOwned(detail.Labels) || !prLinksIssue(repo, issue.detail.Number, detail.Body) {
+		autoMergeOwnedByLooper := detail.AutoMerge != nil && strings.EqualFold(strings.TrimSpace(detail.AutoMerge.EnabledBy), strings.TrimSpace(currentLogin))
+		mergifyRouteEnabled := labels.Has(detail.Labels, labels.AutoMerge)
+		if (!autoMergeOwnedByLooper && !mergifyRouteEnabled) || !labels.AnyLooperOwned(detail.Labels) || !prLinksIssue(repo, issue.detail.Number, detail.Body) {
 			continue
 		}
 		eligible = append(eligible, prNumber)
@@ -227,10 +375,30 @@ func (r *Runner) mergeWatchSnapshot(ctx context.Context, repo, cwd string, issue
 		}
 		return mergewatch.PRSnapshot{}, nil, err
 	}
+	// Short-circuit on the authoritative merged state before the check-runs and
+	// branch-protection reads. The forge merge timestamp is the authority; a
+	// transient error on a later read must not convert a known merge into a
+	// TemporaryError — Classify handles that before Merged, and exhausting the
+	// retry budget would remove the watch marker without recording Auditor
+	// merge evidence. The merged snapshot carries enough identity for
+	// recordPostMergeEvent without the check summary.
+	autoMergeOwnedByLooper := detail.AutoMerge != nil && strings.EqualFold(strings.TrimSpace(detail.AutoMerge.EnabledBy), strings.TrimSpace(currentLogin))
+	if strings.TrimSpace(detail.MergedAt) != "" || strings.EqualFold(strings.TrimSpace(detail.State), "merged") {
+		return mergewatch.PRSnapshot{
+			Repo: repo, PRNumber: prNumber, IssueNumber: issueNumber,
+			HeadSHA: detail.HeadSHA, MergedAt: detail.MergedAt, Merged: true,
+			AutoMergeEnabled:       detail.AutoMerge != nil,
+			AutoMergeOwnedByLooper: autoMergeOwnedByLooper,
+			AutoMergeRouteEnabled:  autoMergeOwnedByLooper || labels.Has(detail.Labels, labels.AutoMerge),
+			HasLooperLabel:         labels.AnyLooperOwned(detail.Labels),
+			Mergeable:              detail.Mergeable,
+			MergeableState:         detail.MergeableState,
+		}, nil, nil
+	}
 	checkRuns, err := r.github.ListPullRequestCheckRuns(ctx, githubinfra.PullRequestCheckRunsInput{Repo: repo, Ref: detail.HeadSHA, CWD: cwd})
 	if err != nil {
 		if isTransientMergeWatchError(err) {
-			return mergewatch.PRSnapshot{Repo: repo, PRNumber: prNumber, IssueNumber: issueNumber, HeadSHA: detail.HeadSHA, MergedAt: detail.MergedAt, AutoMergeEnabled: detail.AutoMerge != nil, AutoMergeOwnedByLooper: detail.AutoMerge != nil && strings.EqualFold(detail.AutoMerge.EnabledBy, currentLogin), Mergeable: detail.Mergeable, MergeableState: detail.MergeableState}, &mergewatch.TemporaryError{SuggestedDelay: time.Minute}, nil
+			return mergewatch.PRSnapshot{Repo: repo, PRNumber: prNumber, IssueNumber: issueNumber, HeadSHA: detail.HeadSHA, MergedAt: detail.MergedAt, AutoMergeEnabled: detail.AutoMerge != nil, AutoMergeOwnedByLooper: autoMergeOwnedByLooper, AutoMergeRouteEnabled: autoMergeOwnedByLooper || labels.Has(detail.Labels, labels.AutoMerge), Mergeable: detail.Mergeable, MergeableState: detail.MergeableState}, &mergewatch.TemporaryError{SuggestedDelay: time.Minute}, nil
 		}
 		return mergewatch.PRSnapshot{}, nil, err
 	}
@@ -253,7 +421,8 @@ func (r *Runner) mergeWatchSnapshot(ctx context.Context, repo, cwd string, issue
 		Merged:                 detail.MergedAt != "" || strings.EqualFold(detail.State, "merged"),
 		Open:                   open,
 		AutoMergeEnabled:       detail.AutoMerge != nil,
-		AutoMergeOwnedByLooper: detail.AutoMerge != nil && strings.EqualFold(strings.TrimSpace(detail.AutoMerge.EnabledBy), strings.TrimSpace(currentLogin)),
+		AutoMergeOwnedByLooper: autoMergeOwnedByLooper,
+		AutoMergeRouteEnabled:  autoMergeOwnedByLooper || labels.Has(detail.Labels, labels.AutoMerge),
 		HasLooperLabel:         labels.AnyLooperOwned(detail.Labels),
 		Mergeable:              detail.Mergeable,
 		MergeableState:         mergeableState,
@@ -409,6 +578,7 @@ func failedCheckRunConclusion(conclusion string) bool {
 }
 
 func mergeWatchPartialSnapshot(repo string, issueNumber, prNumber int64, detail githubinfra.PullRequestDetail, currentLogin string) mergewatch.PRSnapshot {
+	autoMergeOwnedByLooper := detail.AutoMerge != nil && strings.EqualFold(strings.TrimSpace(detail.AutoMerge.EnabledBy), strings.TrimSpace(currentLogin))
 	return mergewatch.PRSnapshot{
 		Repo:                   repo,
 		PRNumber:               prNumber,
@@ -417,7 +587,8 @@ func mergeWatchPartialSnapshot(repo string, issueNumber, prNumber int64, detail 
 		MergedAt:               detail.MergedAt,
 		Open:                   strings.EqualFold(detail.State, "open"),
 		AutoMergeEnabled:       detail.AutoMerge != nil,
-		AutoMergeOwnedByLooper: detail.AutoMerge != nil && strings.EqualFold(strings.TrimSpace(detail.AutoMerge.EnabledBy), strings.TrimSpace(currentLogin)),
+		AutoMergeOwnedByLooper: autoMergeOwnedByLooper,
+		AutoMergeRouteEnabled:  autoMergeOwnedByLooper || labels.Has(detail.Labels, labels.AutoMerge),
 		HasLooperLabel:         labels.AnyLooperOwned(detail.Labels),
 		Mergeable:              detail.Mergeable,
 		MergeableState:         detail.MergeableState,

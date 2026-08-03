@@ -21,6 +21,36 @@ const (
 	PostMergeDigestSentEventType           = "coordinator.post_merge_digest.sent"
 )
 
+// CoordinatorPullRequestMerged is the durable payload for a merge-watch merge
+// observation. It carries the identity needed by downstream audit consumers
+// without requiring another forge read.
+type CoordinatorPullRequestMerged struct {
+	Version     int    `json:"version"`
+	ProjectID   string `json:"projectId"`
+	Repo        string `json:"repo"`
+	PRNumber    int64  `json:"prNumber"`
+	IssueNumber int64  `json:"issueNumber,omitempty"`
+	HeadSHA     string `json:"headSha"`
+	MergedAt    string `json:"mergedAt"`
+}
+
+// CoordinatorRoutedMergeWatchEventType records that a routed pull request
+// carrying the Mergify auto-merge route label is under merge-watch
+// independently of issue discovery.
+const CoordinatorRoutedMergeWatchEventType = "coordinator.routed_merge_watch"
+
+// CoordinatorRoutedMergeWatch is the durable payload for one routed-PR
+// merge-watch registration. Settled marks a terminal observation; readers keep
+// the newest record per entity.
+type CoordinatorRoutedMergeWatch struct {
+	Version   int    `json:"version"`
+	ProjectID string `json:"projectId"`
+	Repo      string `json:"repo"`
+	PRNumber  int64  `json:"prNumber"`
+	HeadSHA   string `json:"headSha"`
+	Settled   bool   `json:"settled,omitempty"`
+}
+
 type AppendInput struct {
 	ID               string
 	EventType        string

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/MumuTW/looper/internal/config"
 	githubinfra "github.com/MumuTW/looper/internal/infra/github"
 	"github.com/MumuTW/looper/internal/storage"
 )
@@ -65,14 +66,17 @@ func sourceFingerprint(pullRequest githubinfra.PullRequestSummary, budgetEnabled
 // missing check appearing changes the gate while every field the list page can
 // see stays identical, so detecting it promptly requires re-evaluating.
 //
-// Failed and cancelled checks are deliberately absent, and measurement is why. On
-// a live daemon 18 of 19 open pull requests carried required_check_failed at any
-// moment, so treating it as volatile made almost nothing skippable and cost most
-// of this optimisation's value. Unlike a pending check, a failed one does not fix
-// itself: it changes on a re-run, and a re-run that accompanies a push moves the
-// head SHA and is caught by the fingerprint anyway. The only missed case is a
-// manual re-run with no push, which the maxSkipAge ceiling bounds — a cheap price
-// on an observe-only report.
+// Failed and cancelled checks are deliberately absent here, and measurement is
+// why. On a live daemon 18 of 19 open pull requests carried required_check_failed
+// at any moment, so treating it as volatile made almost nothing skippable and
+// cost most of this optimisation's value. Unlike a pending check, a failed one
+// does not fix itself: it changes on a re-run, and a re-run that accompanies a
+// push moves the head SHA and is caught by the fingerprint anyway. The only
+// missed case is a manual re-run with no push, which the maxSkipAge ceiling
+// bounds on an observe-only report. Auto trust adds the opposite trade: it must
+// publish a route promptly when a manual re-run flips the gate, so
+// skipUnchanged re-evaluates failed or cancelled reports there instead of
+// waiting for the ceiling.
 var checkReasonCodes = map[ReasonCode]struct{}{
 	ReasonCheckMissing: {},
 	ReasonCheckPending: {},
@@ -84,6 +88,8 @@ var checkReasonCodes = map[ReasonCode]struct{}{
 // leaves Evidence.CodexReview.CurrentHeadValid false, so checking the evidence
 // alone would miss that case and checking the reason alone would miss a
 // provider-blocked report. Both signals are authoritative.
+var _ = reportAwaitsCurrentHeadReview
+
 func reportAwaitsCurrentHeadReview(report Report) bool {
 	if report.Evidence.CodexReview != nil && !report.Evidence.CodexReview.CurrentHeadValid {
 		return true
@@ -155,7 +161,9 @@ func latestGateReports(ctx context.Context, repos *storage.Repositories, project
 // it recorded a fingerprint, the fingerprint still matches, the gate is not
 // waiting on check or convergence state, the convergence blocker (if any) has
 // not advanced, the gate is not waiting on a review event that has since
-// appeared, and the report is younger than maxSkipAge.
+// appeared, and the report is younger than maxSkipAge. At auto trust, reports
+// carrying a failed required check are also re-evaluated so a manual rerun can
+// publish a newly eligible route without waiting for maxSkipAge.
 //
 // currentConvergenceRevision is the newest persisted convergence revision for
 // this pull request, read locally by the discovery lane. A blocked convergence
@@ -169,7 +177,7 @@ func latestGateReports(ctx context.Context, repos *storage.Repositories, project
 // has not appeared, the PR is skipped because re-evaluating would reach the same
 // conclusion without the event and would pay forge round trips every tick; when
 // it has appeared, the PR is re-evaluated so the new evidence is observed.
-func skipUnchanged(previous Report, hasPrevious bool, fingerprint string, now time.Time, currentConvergenceRevision string, reviewEvidenceAppeared bool) (Report, bool) {
+func skipUnchanged(previous Report, hasPrevious bool, fingerprint string, trust config.GatekeeperTrustLevel, now time.Time, currentConvergenceRevision string, reviewEvidenceAppeared bool) (Report, bool) {
 	if !hasPrevious || strings.TrimSpace(previous.SourceFingerprint) == "" {
 		return Report{}, false
 	}
@@ -177,6 +185,14 @@ func skipUnchanged(previous Report, hasPrevious bool, fingerprint string, now ti
 		return Report{}, false
 	}
 	if reportAwaitsCheckState(previous) {
+		return Report{}, false
+	}
+	// At auto trust the merge route is applied only during an evaluation. A
+	// failed or cancelled check that is manually rerun to success turns the gate
+	// green without moving any field the list page can observe, so reusing the
+	// failed report would leave a now-eligible PR unqueued until maxSkipAge.
+	// Re-evaluate instead so the route is published promptly.
+	if trust == config.GatekeeperTrustAuto && reportHasFailedOrCancelledCheck(previous) {
 		return Report{}, false
 	}
 	if reportAwaitsConvergenceState(previous) {
@@ -200,6 +216,15 @@ func skipUnchanged(previous Report, hasPrevious bool, fingerprint string, now ti
 		return Report{}, false
 	}
 	return previous, true
+}
+
+func reportHasFailedOrCancelledCheck(report Report) bool {
+	for _, reason := range report.Reasons {
+		if reason.Code == ReasonCheckFailed || reason.Code == ReasonCheckCancelled {
+			return true
+		}
+	}
+	return false
 }
 
 // previousConvergenceRevision is the convergence revision recorded on a prior
