@@ -1359,9 +1359,17 @@ func (g *Gateway) ListIssueCommentsContaining(ctx context.Context, input ViewIss
 	return extractCommentInfos(rows), nil
 }
 
+// issueTimelineProjection keeps issue timeline reads independent of the size of
+// the discussion. Cross-referenced events embed the full source issue or pull
+// request body, so one busy issue can exceed the shell capture cap and erase
+// the whole timeline. gh applies this projection to each page before anything
+// crosses that boundary, keeping only the fields the coordinator and triager
+// consume: event kind, timestamp, event id, and the label for label events.
+const issueTimelineProjection = `.[] | {id, event, created_at, label: (.label | if . then {name} else null end)}`
+
 func (g *Gateway) ListIssueTimeline(ctx context.Context, input IssueTimelineInput) ([]map[string]any, error) {
 	hostname, repo := splitRepoHostname(input.Repo)
-	args := []string{"api", "--paginate", "--slurp", fmt.Sprintf("repos/%s/issues/%d/timeline", repo, input.IssueNumber), "-H", "Accept: application/vnd.github+json"}
+	args := []string{"api", "--paginate", fmt.Sprintf("repos/%s/issues/%d/timeline", repo, input.IssueNumber), "-H", "Accept: application/vnd.github+json", "--jq", issueTimelineProjection}
 	if hostname != "" {
 		args = append(args, "--hostname", hostname)
 	}
@@ -1369,7 +1377,7 @@ func (g *Gateway) ListIssueTimeline(ctx context.Context, input IssueTimelineInpu
 	if err != nil {
 		return nil, err
 	}
-	return decodeJSONArrayOrPages(result.Stdout)
+	return decodeJSONObjects(result.Stdout)
 }
 
 func (g *Gateway) ListIssueReactions(ctx context.Context, input IssueReactionInput) ([]IssueReaction, error) {

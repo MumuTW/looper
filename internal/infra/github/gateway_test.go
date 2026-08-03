@@ -2316,10 +2316,11 @@ func TestGatewayListIssueTimelineScopesAPIToHostname(t *testing.T) {
 	runner := &fakeGHRunner{t: t}
 	runner.respond = func(options shell.Options) (shell.Result, error) {
 		args := strings.Join(options.Args, " ")
-		if args != "api --paginate --slurp repos/acme/looper/issues/8/timeline -H Accept: application/vnd.github+json --hostname github.example.com" {
+		want := "api --paginate repos/acme/looper/issues/8/timeline -H Accept: application/vnd.github+json --jq " + issueTimelineProjection + " --hostname github.example.com"
+		if args != want {
 			t.Fatalf("unexpected gh args: %q", args)
 		}
-		return shell.Result{Stdout: `[[{"id":1,"event":"closed"}]]`}, nil
+		return shell.Result{Stdout: `{"id":1,"event":"closed","created_at":"2026-05-14T12:00:00Z","label":null}`}, nil
 	}
 	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
 	rows, err := gateway.ListIssueTimeline(context.Background(), IssueTimelineInput{Repo: "github.example.com/acme/looper", IssueNumber: 8})
@@ -2328,6 +2329,38 @@ func TestGatewayListIssueTimelineScopesAPIToHostname(t *testing.T) {
 	}
 	if len(rows) != 1 || asInt64(rows[0]["id"]) != 1 || asString(rows[0]["event"]) != "closed" {
 		t.Fatalf("ListIssueTimeline() = %#v, want parsed enterprise timeline", rows)
+	}
+}
+
+// TestGatewayListIssueTimelineDecodesProjectedPages covers the decode side of
+// the capture-cap contract: gh emits the projected events as a stream of
+// objects across pages, and the gateway must hand the coordinator and triager
+// exactly the consumed fields — event kind, timestamp, id, and label name.
+func TestGatewayListIssueTimelineDecodesProjectedPages(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		return shell.Result{Stdout: `{"id":1,"event":"labeled","created_at":"2026-05-14T12:00:00Z","label":{"name":"looper:triaged"}}
+{"id":2,"event":"reopened","created_at":"2026-05-15T09:30:00Z","label":null}
+{"id":3,"event":"cross-referenced","created_at":"2026-05-16T10:00:00Z","label":null}`}, nil
+	}
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	rows, err := gateway.ListIssueTimeline(context.Background(), IssueTimelineInput{Repo: "acme/looper", IssueNumber: 8})
+	if err != nil {
+		t.Fatalf("ListIssueTimeline() error = %v", err)
+	}
+	if len(rows) != 3 {
+		t.Fatalf("ListIssueTimeline() len = %d, want every projected event", len(rows))
+	}
+	label, _ := rows[0]["label"].(map[string]any)
+	if label == nil || asString(label["name"]) != "looper:triaged" {
+		t.Fatalf("ListIssueTimeline()[0].label = %#v, want the label event's name", rows[0]["label"])
+	}
+	if rows[1]["label"] != nil {
+		t.Fatalf("ListIssueTimeline()[1].label = %#v, want null for events without a label", rows[1]["label"])
+	}
+	if asInt64(rows[2]["id"]) != 3 || asString(rows[2]["event"]) != "cross-referenced" || asString(rows[2]["created_at"]) != "2026-05-16T10:00:00Z" {
+		t.Fatalf("ListIssueTimeline()[2] = %#v, want the projected cross-reference event", rows[2])
 	}
 }
 

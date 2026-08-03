@@ -272,9 +272,9 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 	}
 	loaded := make([]loadedIssue, 0, len(issues))
 	for _, summary := range issues {
-		issue, err := r.loadIssue(ctx, input.Repo, project.RepoPath, summary)
-		if err != nil {
-			return DiscoveryResult{}, err
+		issue, ok := r.loadIssueIsolated(ctx, input.Repo, project.RepoPath, summary)
+		if !ok {
+			continue
 		}
 		loaded = append(loaded, issue)
 	}
@@ -288,9 +288,9 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 			return DiscoveryResult{}, err
 		}
 		for _, summary := range backlog {
-			issue, err := r.loadIssue(ctx, input.Repo, project.RepoPath, summary)
-			if err != nil {
-				return DiscoveryResult{}, err
+			issue, ok := r.loadIssueIsolated(ctx, input.Repo, project.RepoPath, summary)
+			if !ok {
+				continue
 			}
 			loaded = append(loaded, issue)
 		}
@@ -1815,6 +1815,23 @@ func (r *Runner) removeIssueLabels(ctx context.Context, repo, cwd string, issueN
 		return nil
 	}
 	return r.github.RemoveIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: repo, IssueNumber: issueNumber, Labels: labels, CWD: cwd})
+}
+
+// loadIssueIsolated loads one issue for discovery, skipping it on failure
+// instead of aborting the tick. Discovery repeats every tick and the issue
+// stays open until it is handled, so one unloadable issue — a timeline too
+// large for the gh capture buffer, a transient forge error — defers only
+// itself. Returning the error would suspend triage and dispatch for every
+// other issue in the repo for as long as that one issue keeps failing.
+func (r *Runner) loadIssueIsolated(ctx context.Context, repo, cwd string, summary githubinfra.IssueSummary) (loadedIssue, bool) {
+	issue, err := r.loadIssue(ctx, repo, cwd, summary)
+	if err != nil {
+		if r.logger != nil {
+			r.logger.Warn("coordinator discovery skipped issue after load failure", map[string]any{"repo": repo, "issueNumber": summary.Number, "error": err.Error()})
+		}
+		return loadedIssue{}, false
+	}
+	return issue, true
 }
 
 func (r *Runner) loadIssue(ctx context.Context, repo, cwd string, summary githubinfra.IssueSummary) (loadedIssue, error) {
