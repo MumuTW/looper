@@ -2728,7 +2728,7 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 				BackfillIssues(context.Context, coordinatorrole.BackfillInput) (coordinatorrole.BackfillResult, error)
 			})
 			if !ok {
-				return coordinatorrole.BackfillResult{}, fmt.Errorf("coordinator is not configured")
+				return coordinatorrole.BackfillResult{}, fmt.Errorf("%w: coordinator is not configured", coordinatorrole.ErrBackfillUnavailable)
 			}
 			return backfillRunner.BackfillIssues(ctx, input)
 		},

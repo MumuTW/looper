@@ -44,7 +44,7 @@ func TestBackfillRouteWiresExplicitSelectionAndReturnsResult(t *testing.T) {
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
-	if got.ProjectID != "demo" || got.Repo != "acme/looper" || len(got.IssueNumbers) != 1 || got.IssueNumbers[0] != 42 || got.LabelFilter != "Backfill" {
+	if got.ProjectID != "demo" || got.Repo != "acme/looper" || len(got.IssueNumbers) != 1 || got.IssueNumbers[0] != 42 || got.LabelFilter != "Backfill" || !got.SkipTriaged {
 		t.Fatalf("callback input = %#v", got)
 	}
 	var envelope struct {
@@ -58,6 +58,38 @@ func TestBackfillRouteWiresExplicitSelectionAndReturnsResult(t *testing.T) {
 	}
 	if !envelope.OK || envelope.Data.Triaged != 1 {
 		t.Fatalf("response = %#v", envelope)
+	}
+}
+
+func TestBackfillRouteMapsUnavailableBackendToServiceUnavailable(t *testing.T) {
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	h := NewHandler(Context{Config: cfg, BackfillIssues: func(context.Context, coordinatorrole.BackfillInput) (coordinatorrole.BackfillResult, error) {
+		return coordinatorrole.BackfillResult{}, coordinatorrole.ErrBackfillUnavailable
+	}})
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/api/v1/backfill", strings.NewReader(`{"projectId":"demo","repo":"acme/looper","issueNumbers":[42]}`)))
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d body=%s; want service unavailable", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestBackfillRouteAllowsExplicitTriagedProcessing(t *testing.T) {
+	cfg, err := config.DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	var got coordinatorrole.BackfillInput
+	h := NewHandler(Context{Config: cfg, BackfillIssues: func(_ context.Context, input coordinatorrole.BackfillInput) (coordinatorrole.BackfillResult, error) {
+		got = input
+		return coordinatorrole.BackfillResult{}, nil
+	}})
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/api/v1/backfill", strings.NewReader(`{"projectId":"demo","repo":"acme/looper","issueNumbers":[42],"skipTriaged":false}`)))
+	if recorder.Code != http.StatusOK || got.SkipTriaged {
+		t.Fatalf("status=%d input=%#v body=%s; want explicit skipTriaged=false", recorder.Code, got, recorder.Body.String())
 	}
 }
 

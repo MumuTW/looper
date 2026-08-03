@@ -3,6 +3,7 @@ package coordinator
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"net/url"
@@ -36,6 +37,12 @@ const mergeWatchCommentMarkerPrefix = "<!-- looper:coordinator:merge-watch"
 const noEligibleNodeStatus = "no-eligible-node"
 const backlogPageSize = 100
 const backlogPageCount = 2
+
+// ErrBackfillUnavailable marks an operational/configuration failure that
+// should be surfaced as HTTP 503 rather than mistaken for invalid input.
+var ErrBackfillUnavailable = errors.New("coordinator backfill is unavailable")
+
+var errCoordinatorProjectNotFound = errors.New("coordinator project not found")
 
 type backlogLane struct {
 	dispatchLabel string
@@ -91,7 +98,7 @@ func (r *Runner) BackfillIssues(ctx context.Context, input BackfillInput) (Backf
 		return result, err
 	}
 	if r.github == nil || r.repos == nil || r.repos.Projects == nil {
-		return result, fmt.Errorf("repositories not configured")
+		return result, fmt.Errorf("%w: repositories not configured", ErrBackfillUnavailable)
 	}
 	input.Repo = strings.TrimSpace(input.Repo)
 	if input.Repo == "" {
@@ -112,6 +119,9 @@ func (r *Runner) BackfillIssues(ctx context.Context, input BackfillInput) (Backf
 
 	project, roleCfg, err := r.projectConfig(ctx, input.ProjectID)
 	if err != nil {
+		if !errors.Is(err, errCoordinatorProjectNotFound) {
+			return result, fmt.Errorf("%w: %v", ErrBackfillUnavailable, err)
+		}
 		return result, err
 	}
 	if project.Archived || !roleCfg.Enabled {
@@ -153,7 +163,7 @@ func (r *Runner) BackfillIssues(ctx context.Context, input BackfillInput) (Backf
 			Repo: input.Repo, CWD: project.RepoPath, Limit: input.MaxCount, Label: labelFilter,
 		})
 		if listErr != nil {
-			return result, listErr
+			return result, fmt.Errorf("%w: list open issues: %v", ErrBackfillUnavailable, listErr)
 		}
 		candidates = issues
 	}
@@ -189,6 +199,12 @@ func (r *Runner) BackfillIssues(ctx context.Context, input BackfillInput) (Backf
 			unlock()
 			continue
 		}
+		if loaded.detail.IsPullRequest {
+			result.Skipped++
+			result.SkipReasons["pull_request"]++
+			unlock()
+			continue
+		}
 
 		if labelFilter != "" && !labels.Has(loaded.issue.Labels, labelFilter) {
 			result.Skipped++
@@ -197,7 +213,7 @@ func (r *Runner) BackfillIssues(ctx context.Context, input BackfillInput) (Backf
 			continue
 		}
 
-		if !input.ForceRetriage && labels.Has(loaded.issue.Labels, triageCfg.TriagedLabel) {
+		if input.SkipTriaged && !input.ForceRetriage && labels.Has(loaded.issue.Labels, triageCfg.TriagedLabel) {
 			result.Skipped++
 			result.SkipReasons["already_triaged"]++
 			unlock()
@@ -240,6 +256,33 @@ func (r *Runner) BackfillIssues(ctx context.Context, input BackfillInput) (Backf
 			unlock()
 			continue
 		}
+
+		// The LLM/inspection phase can take long enough for an operator to add
+		// the global hold. Re-read the authoritative issue state under the same
+		// per-issue lock immediately before any mutation and abandon the stale
+		// decision when the veto appeared.
+		fresh, err := r.loadIssue(ctx, input.Repo, project.RepoPath, loaded.summary)
+		if err != nil {
+			unlock()
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return result, ctxErr
+			}
+			result.FailedIssues[issueNumber] = err.Error()
+			continue
+		}
+		if fresh.detail.IsPullRequest {
+			result.Skipped++
+			result.SkipReasons["pull_request"]++
+			unlock()
+			continue
+		}
+		if labels.Has(fresh.issue.Labels, labels.HoldGlobal) {
+			result.Skipped++
+			result.SkipReasons["hold"]++
+			unlock()
+			continue
+		}
+		loaded = fresh
 
 		if err := r.applyDecision(ctx, input.Repo, project.RepoPath, loaded.issue, triageCfg, analysisStartedAt, decision); err != nil {
 			unlock()
@@ -581,7 +624,7 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 		if !mightNeedCoordinatorAction(loadedIssue.summary, triageCfg) {
 			continue
 		}
-		unlock := r.lockIssue(input.ProjectID, input.Repo, loadedIssue.issue.Number)
+		unlock := r.lockIssue(input.ProjectID, input.Repo, loadedIssue.summary.Number)
 		// Re-read under the same per-project/issue lock used by the explicit
 		// backfill lane. The batch hydration above is only a candidate snapshot;
 		// the locked read is what prevents a stale periodic tick from issuing a
@@ -2270,7 +2313,7 @@ func (r *Runner) projectConfig(ctx context.Context, projectID string) (*storage.
 		return nil, config.CoordinatorRoleConfig{}, err
 	}
 	if project == nil {
-		return nil, config.CoordinatorRoleConfig{}, fmt.Errorf("project %q not found", projectID)
+		return nil, config.CoordinatorRoleConfig{}, fmt.Errorf("%w: %s", errCoordinatorProjectNotFound, projectID)
 	}
 	if r.config == nil {
 		return nil, config.CoordinatorRoleConfig{}, fmt.Errorf("coordinator config is not configured")

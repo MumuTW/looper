@@ -156,15 +156,17 @@ func TestBackfillIssuesForceRetriageReTriages(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BackfillIssues error: %v", err)
 	}
-	// ForceRetriage means ShouldTriage check is bypassed in decide(),
-	// but the LLM stub returns NoOp for issues with "triaged" label,
-	// so the issue is still counted as skipped via NoOp.
-	if result.Skipped == 0 && result.Triaged == 0 {
-		t.Fatalf("expected some processing; skipped=%d triaged=%d", result.Skipped, result.Triaged)
+	// ForceRetriage bypasses the already-triaged gate in BackfillIssues;
+	// decideBackfill has no eligibility gate of its own.
+	if result.SkipReasons["already_triaged"] != 0 {
+		t.Fatalf("result = %#v, want no already_triaged skip under ForceRetriage", result)
+	}
+	if result.Considered != 1 {
+		t.Fatalf("considered = %d, want 1", result.Considered)
 	}
 }
 
-func TestBackfillIssuesMissingDetailReportsFailure(t *testing.T) {
+func TestBackfillIssuesMissingDetailDoesNotFail(t *testing.T) {
 	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
 		cfg.Roles.Coordinator.Enabled = true
 		cfg.Roles.Coordinator.BackfillEnabled = true
@@ -174,7 +176,7 @@ func TestBackfillIssuesMissingDetailReportsFailure(t *testing.T) {
 		Number: 1, Title: "Bug", Author: "looper",
 		CreatedAt: fixture.now.Add(-48 * time.Hour).Format(time.RFC3339),
 	}
-	// details[2] is missing → ViewIssue returns zero value, issue is still processed
+	// details[2] is missing → ViewIssue returns zero value without an error.
 
 	result, err := fixture.runner.BackfillIssues(context.Background(), BackfillInput{
 		ProjectID:   fixture.projectID,
@@ -185,9 +187,10 @@ func TestBackfillIssuesMissingDetailReportsFailure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BackfillIssues error: %v", err)
 	}
-	// Issue 2 has no detail but stub returns zero value (no error), so it proceeds.
-	if result.Considered < 1 {
-		t.Fatalf("expected at least 1 considered, got %d", result.Considered)
+	// Issue 2 has no detail but the stub returns a zero value without an error;
+	// the invalid timestamp is a recorded skip, not a provider failure.
+	if result.Considered != 2 || result.SkipReasons["invalid_created_at"] != 1 || len(result.FailedIssues) != 0 {
+		t.Fatalf("result = %#v, want one invalid-created-at skip and no failures", result)
 	}
 }
 

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -16,7 +17,7 @@ type backfillRequest struct {
 	LabelFilter   string  `json:"labelFilter,omitempty"`
 	MaxAgeDays    int     `json:"maxAgeDays,omitempty"`
 	MaxCount      int     `json:"maxCount,omitempty"`
-	SkipTriaged   bool    `json:"skipTriaged,omitempty"`
+	SkipTriaged   *bool   `json:"skipTriaged,omitempty"`
 	ForceRetriage bool    `json:"forceRetriage,omitempty"`
 	Confirm       bool    `json:"confirm"`
 }
@@ -61,6 +62,10 @@ func (h *Handler) buildBackfillResponse(r *http.Request) (coordinatorrole.Backfi
 			return coordinatorrole.BackfillResult{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "confirm=true is required for broad or force-retriage backfill"}
 		}
 	}
+	skipTriaged := true
+	if body.SkipTriaged != nil {
+		skipTriaged = *body.SkipTriaged
+	}
 	result, err := h.context.BackfillIssues(r.Context(), coordinatorrole.BackfillInput{
 		ProjectID:     body.ProjectID,
 		Repo:          body.Repo,
@@ -68,10 +73,13 @@ func (h *Handler) buildBackfillResponse(r *http.Request) (coordinatorrole.Backfi
 		LabelFilter:   body.LabelFilter,
 		MaxAgeDays:    body.MaxAgeDays,
 		MaxCount:      body.MaxCount,
-		SkipTriaged:   body.SkipTriaged,
+		SkipTriaged:   skipTriaged,
 		ForceRetriage: body.ForceRetriage,
 	})
 	if err != nil {
+		if errors.Is(err, coordinatorrole.ErrBackfillUnavailable) {
+			return coordinatorrole.BackfillResult{}, apiError{code: pkgapi.ErrorCodeServiceUnavailable, status: http.StatusServiceUnavailable, message: err.Error()}
+		}
 		return coordinatorrole.BackfillResult{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: err.Error()}
 	}
 	return result, nil

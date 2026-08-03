@@ -256,11 +256,20 @@ type Runtime struct {
 func (r *Runtime) BackfillIssues(ctx context.Context, input coordinatorrole.BackfillInput) (coordinatorrole.BackfillResult, error) {
 	r.mu.RLock()
 	backfill := r.backfillIssues
+	activeExecutions := r.activeExecutions
 	r.mu.RUnlock()
 	if backfill == nil {
-		return coordinatorrole.BackfillResult{}, fmt.Errorf("coordinator backfill is unavailable")
+		return coordinatorrole.BackfillResult{}, coordinatorrole.ErrBackfillUnavailable
 	}
-	return backfill(ctx, input)
+	if activeExecutions == nil {
+		return backfill(ctx, input)
+	}
+	operation, err := activeExecutions.AdmitBackground(ctx, BackgroundOperationMeta{Name: "coordinator-backfill"})
+	if err != nil {
+		return coordinatorrole.BackfillResult{}, fmt.Errorf("%w: %v", coordinatorrole.ErrBackfillUnavailable, err)
+	}
+	defer operation.Release()
+	return backfill(operation.Context(), input)
 }
 
 const reviewerRecoveryLoginTimeout = 3 * time.Second
