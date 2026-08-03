@@ -141,6 +141,39 @@ func IsLinkedWorktree(path string) bool {
 	return ok
 }
 
+// IsStandaloneGitRepository reports whether path has ordinary repository
+// metadata in a .git directory. Unlike a linked worktree's gitdir pointer, the
+// directory may contain commits and objects that are not reachable elsewhere;
+// cleanup must preserve it even when `git status` reports clean.
+func IsStandaloneGitRepository(path string) bool {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return false
+	}
+	gitMeta := filepath.Join(path, ".git")
+	info, err := os.Lstat(gitMeta)
+	if err != nil {
+		return false
+	}
+	if info.IsDir() {
+		return true
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		target, statErr := os.Stat(gitMeta)
+		return statErr == nil && target.IsDir()
+	}
+	return false
+}
+
+// IsUsableStandaloneGitRepository reports whether path is an ordinary checkout
+// whose local Git metadata is complete enough for status checks. Incomplete
+// metadata follows the existing recovery/indeterminate policy instead of being
+// classified as a standalone repository solely because a .git directory is
+// present.
+func IsUsableStandaloneGitRepository(path string) bool {
+	return IsStandaloneGitRepository(path) && LocalFixerWorktreeCheckoutUsable(path)
+}
+
 // HasMalformedLocalGitHEAD reports only syntactically malformed, readable HEAD
 // metadata. It deliberately does not classify absent or incomplete .git data:
 // callers must still let prepare/fetch errors distinguish a partial path from a

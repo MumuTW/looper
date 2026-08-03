@@ -440,6 +440,10 @@ func sweepLiveContainerProjects(ctx context.Context, options ContainerSweepOptio
 				}
 				break
 			}
+			if worktreesafety.IsUsableStandaloneGitRepository(freshChild.Path) {
+				protected = true
+				break
+			}
 		}
 		if protected {
 			plan.Summary.Skipped++
@@ -531,6 +535,11 @@ func admitContainer(ctx context.Context, git DiskSweepGit, readDir func(string) 
 				container.Action = leaf.Action
 				container.Reason = leaf.Reason + "_inside"
 				container.Error = leaf.Error
+				return container, false
+			}
+			if worktreesafety.IsUsableStandaloneGitRepository(checkout.Path) {
+				container.Action = ActionSkipped
+				container.Reason = "standalone_git_repository_inside"
 				return container, false
 			}
 		}
@@ -724,6 +733,14 @@ func RunDiskSweep(ctx context.Context, options DiskSweepOptions) (DiskSweepPlan,
 					result.Summary.Skipped++
 				}
 				result.Candidates = append(result.Candidates, decided)
+				continue
+			}
+			if worktreesafety.IsUsableStandaloneGitRepository(decided.Path) {
+				decided.Action = ActionSkipped
+				decided.Reason = "standalone_git_repository"
+				result.Summary.Skipped++
+				result.Candidates = append(result.Candidates, decided)
+				releaseMutation()
 				continue
 			}
 

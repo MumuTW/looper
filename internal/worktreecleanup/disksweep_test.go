@@ -375,18 +375,25 @@ func TestRunDiskSweepPreservesDirtyUnregisteredCheckout(t *testing.T) {
 	}
 }
 
-func TestRunDiskSweepRemovesCleanUnregisteredCheckout(t *testing.T) {
+func TestRunDiskSweepPreservesCleanStandaloneRepository(t *testing.T) {
 	worktreeRoot := t.TempDir()
 	clean := writeUsableCheckout(t, filepath.Join(worktreeRoot, "looper-app-clean"), old())
 
 	var removed []string
-	if _, err := RunDiskSweep(context.Background(), sweepOptions(
+	plan, err := RunDiskSweep(context.Background(), sweepOptions(
 		DiskSweepRoot{ProjectID: "app", RepoPath: filepath.Join(t.TempDir(), "repo"), WorktreeRoot: worktreeRoot},
-		stubSweepGit{clean: map[string]bool{clean: true}}, &removed)); err != nil {
+		stubSweepGit{clean: map[string]bool{clean: true}}, &removed))
+	if err != nil {
 		t.Fatalf("RunDiskSweep() error = %v", err)
 	}
-	if len(removed) != 1 || removed[0] != clean {
-		t.Fatalf("removed = %v, want [%s]", removed, clean)
+	if len(removed) != 0 {
+		t.Fatalf("removed = %v, want none for standalone repository", removed)
+	}
+	if action, reason := reasonFor(t, plan, clean); action != ActionSkipped || reason != "standalone_git_repository" {
+		t.Fatalf("candidate = (%q, %q), want standalone_git_repository skip", action, reason)
+	}
+	if _, err := os.Stat(clean); err != nil {
+		t.Fatalf("standalone repository was removed: %v", err)
 	}
 }
 
