@@ -289,11 +289,15 @@ func RunContainerSweep(ctx context.Context, options ContainerSweepOptions) (Disk
 		return DiskSweepPlan{}, err
 	}
 
+	planBudget := options.Budget
+	if planBudget > 0 {
+		planBudget = len(entries)
+	}
 	plan := PlanContainerSweep(ContainerSweepPlanInput{
 		SharedRoot:         options.SharedRoot,
 		Entries:            entries,
 		LiveContainerNames: options.LiveContainerNames,
-		Budget:             options.Budget,
+		Budget:             planBudget,
 		RetentionCutoff:    options.RetentionCutoff,
 	})
 
@@ -302,17 +306,22 @@ func RunContainerSweep(ctx context.Context, options ContainerSweepOptions) (Disk
 		Scanned:      plan.Summary.Scanned,
 		Unregistered: plan.Summary.Unregistered,
 	}}
+	budget := options.Budget
 	liveProjects := normalizedPathSet(options.LiveProjectPaths)
 	for _, candidate := range plan.Candidates {
 		if candidate.Action != DiskSweepActionRemove {
 			if candidate.Reason == "live_project_container" && len(options.LiveProjectPaths) > 0 {
 				releaseMutation := worktreesafety.AcquireManagedMutationLock(candidate.Path)
-				used := result.Summary.Removed
-				if options.DryRun {
-					used = result.Summary.WouldRemove
-				}
-				nested := sweepLiveContainerProjects(ctx, options, candidate.Path, liveProjects, registered, options.Budget-used)
+				nested := sweepLiveContainerProjects(ctx, options, candidate.Path, liveProjects, registered, budget)
 				releaseMutation()
+				used := nested.Summary.Removed
+				if options.DryRun {
+					used = nested.Summary.WouldRemove
+				}
+				budget -= used
+				if budget < 0 {
+					budget = 0
+				}
 				result.Summary.Scanned += nested.Summary.Scanned
 				result.Summary.Unregistered += nested.Summary.Unregistered
 				result.Summary.WouldRemove += nested.Summary.WouldRemove
@@ -321,6 +330,13 @@ func RunContainerSweep(ctx context.Context, options ContainerSweepOptions) (Disk
 				result.Summary.Errors += nested.Summary.Errors
 				result.Candidates = append(result.Candidates, nested.Candidates...)
 			}
+			result.Summary.Skipped++
+			result.Candidates = append(result.Candidates, candidate)
+			continue
+		}
+		if budget <= 0 {
+			candidate.Action = ActionSkipped
+			candidate.Reason = "budget_exhausted"
 			result.Summary.Skipped++
 			result.Candidates = append(result.Candidates, candidate)
 			continue
@@ -378,6 +394,7 @@ func RunContainerSweep(ctx context.Context, options ContainerSweepOptions) (Disk
 			}
 			result.Summary.Removed++
 		}
+		budget--
 		result.Candidates = append(result.Candidates, decided)
 		releaseMutation()
 	}
@@ -684,12 +701,16 @@ func RunDiskSweep(ctx context.Context, options DiskSweepOptions) (DiskSweepPlan,
 			continue
 		}
 
+		planBudget := budget
+		if planBudget > 0 {
+			planBudget = len(entries)
+		}
 		plan := PlanDiskSweep(DiskSweepPlanInput{
 			Root:            root,
 			Entries:         entries,
 			RegisteredPaths: options.RegisteredPaths,
 			GitTrackedPaths: tracked,
-			Budget:          budget,
+			Budget:          planBudget,
 			RetentionCutoff: options.RetentionCutoff,
 		})
 		result.Summary.Scanned += plan.Summary.Scanned
@@ -697,6 +718,13 @@ func RunDiskSweep(ctx context.Context, options DiskSweepOptions) (DiskSweepPlan,
 
 		for _, candidate := range plan.Candidates {
 			if candidate.Action != DiskSweepActionRemove {
+				result.Summary.Skipped++
+				result.Candidates = append(result.Candidates, candidate)
+				continue
+			}
+			if budget <= 0 {
+				candidate.Action = ActionSkipped
+				candidate.Reason = "budget_exhausted"
 				result.Summary.Skipped++
 				result.Candidates = append(result.Candidates, candidate)
 				continue

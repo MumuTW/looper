@@ -662,6 +662,29 @@ func TestRunDiskSweepRotatesRootStart(t *testing.T) {
 	}
 }
 
+func TestRunDiskSweepContinuesAfterProtectedBudgetPrefix(t *testing.T) {
+	worktreeRoot := t.TempDir()
+	dirty := writeUsableCheckout(t, filepath.Join(worktreeRoot, "looper-app-a-dirty"), old())
+	debris := mkdirAt(t, filepath.Join(worktreeRoot, "looper-app-z-debris"), old())
+	var removed []string
+	options := sweepOptions(DiskSweepRoot{ProjectID: "app", RepoPath: filepath.Join(t.TempDir(), "repo"), WorktreeRoot: worktreeRoot}, stubSweepGit{clean: map[string]bool{dirty: false}}, &removed)
+	options.Budget = 1
+
+	plan, err := RunDiskSweep(context.Background(), options)
+	if err != nil {
+		t.Fatalf("RunDiskSweep() error = %v", err)
+	}
+	if len(removed) != 1 || removed[0] != debris {
+		t.Fatalf("removed = %v, want protected prefix skipped and later debris removed", removed)
+	}
+	if action, reason := reasonFor(t, plan, dirty); action != ActionSkipped || reason != "dirty_worktree" {
+		t.Fatalf("dirty prefix = (%q, %q), want dirty_worktree skip", action, reason)
+	}
+	if plan.Summary.Removed != 1 {
+		t.Fatalf("removed count = %d, want 1", plan.Summary.Removed)
+	}
+}
+
 func TestRunDiskSweepRequiresGitListing(t *testing.T) {
 	if _, err := RunDiskSweep(context.Background(), DiskSweepOptions{Git: stubSweepGit{}}); err == nil {
 		t.Fatal("RunDiskSweep() error = nil, want an error when git listing is unavailable")
@@ -977,6 +1000,34 @@ func TestRunContainerSweepDoesNotSpendBudgetOnFailedRemoval(t *testing.T) {
 	}
 	if len(attempts) != 2 || attempts[1] != second || plan.Summary.Removed != 1 || plan.Summary.Errors != 1 {
 		t.Fatalf("attempts = %v summary = %#v, want both attempts with one removal and one error", attempts, plan.Summary)
+	}
+}
+
+func TestRunContainerSweepContinuesAfterProtectedBudgetPrefix(t *testing.T) {
+	sharedRoot := t.TempDir()
+	dirtyContainer := mkContainer(t, sharedRoot, "repo-a-dirty", old())
+	dirty := filepath.Join(dirtyContainer, "project_1", "worker-worktree")
+	writeUsableCheckout(t, dirty, old())
+	if err := os.Chtimes(dirtyContainer, old(), old()); err != nil {
+		t.Fatalf("Chtimes(dirtyContainer) error = %v", err)
+	}
+	cleanContainer := mkContainer(t, sharedRoot, "repo-z-clean", old())
+
+	var removed []string
+	options := containerOptions(sharedRoot, nil, stubSweepGit{clean: map[string]bool{dirty: false}}, &removed)
+	options.Budget = 1
+	plan, err := RunContainerSweep(context.Background(), options)
+	if err != nil {
+		t.Fatalf("RunContainerSweep() error = %v", err)
+	}
+	if len(removed) != 1 || removed[0] != cleanContainer {
+		t.Fatalf("removed = %v, want protected prefix skipped and later container removed", removed)
+	}
+	if plan.Summary.Removed != 1 {
+		t.Fatalf("removed count = %d, want 1", plan.Summary.Removed)
+	}
+	if _, err := os.Stat(dirtyContainer); err != nil {
+		t.Fatalf("dirty container was removed: %v", err)
 	}
 }
 
