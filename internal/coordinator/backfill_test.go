@@ -2,17 +2,21 @@ package coordinator
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/nexu-io/looper/internal/config"
-	githubinfra "github.com/nexu-io/looper/internal/infra/github"
+	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/coordinator/triage"
+	githubinfra "github.com/MumuTW/looper/internal/infra/github"
+	"github.com/MumuTW/looper/internal/labels"
 )
 
 func TestBackfillIssuesTriagesSelfAuthoredUntriagedIssue(t *testing.T) {
 	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
 		cfg.Roles.Coordinator.Enabled = true
+		cfg.Roles.Coordinator.BackfillEnabled = true
 	})
 	issues := []githubinfra.IssueSummary{{Number: 1, Labels: nil}}
 	fixture.github.issues = issues
@@ -22,9 +26,9 @@ func TestBackfillIssuesTriagesSelfAuthoredUntriagedIssue(t *testing.T) {
 	}
 
 	result, err := fixture.runner.BackfillIssues(context.Background(), BackfillInput{
-		ProjectID:    fixture.projectID,
-		Repo:         "acme/looper",
-		SkipTriaged:  true,
+		ProjectID:   fixture.projectID,
+		Repo:        "acme/looper",
+		SkipTriaged: true,
 	})
 
 	if err != nil {
@@ -41,12 +45,13 @@ func TestBackfillIssuesTriagesSelfAuthoredUntriagedIssue(t *testing.T) {
 func TestBackfillIssuesSkipsAlreadyTriagedIssue(t *testing.T) {
 	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
 		cfg.Roles.Coordinator.Enabled = true
+		cfg.Roles.Coordinator.BackfillEnabled = true
 	})
 	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Labels: []string{"triaged"}}}
 	fixture.github.details[1] = githubinfra.IssueDetail{
 		Number: 1, Title: "Bug", Author: "looper",
 		CreatedAt: fixture.now.Add(-48 * time.Hour).Format(time.RFC3339),
-		Labels: []string{"triaged"},
+		Labels:    []string{"triaged"},
 	}
 
 	result, err := fixture.runner.BackfillIssues(context.Background(), BackfillInput{
@@ -69,6 +74,7 @@ func TestBackfillIssuesSkipsAlreadyTriagedIssue(t *testing.T) {
 func TestBackfillIssuesBoundedByMaxCount(t *testing.T) {
 	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
 		cfg.Roles.Coordinator.Enabled = true
+		cfg.Roles.Coordinator.BackfillEnabled = true
 	})
 	fixture.github.issues = []githubinfra.IssueSummary{
 		{Number: 1}, {Number: 2}, {Number: 3}, {Number: 4}, {Number: 5},
@@ -98,6 +104,7 @@ func TestBackfillIssuesBoundedByMaxCount(t *testing.T) {
 func TestBackfillIssuesFiltersByIssueNumbers(t *testing.T) {
 	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
 		cfg.Roles.Coordinator.Enabled = true
+		cfg.Roles.Coordinator.BackfillEnabled = true
 	})
 	fixture.github.issues = []githubinfra.IssueSummary{
 		{Number: 1}, {Number: 2}, {Number: 3},
@@ -122,20 +129,21 @@ func TestBackfillIssuesFiltersByIssueNumbers(t *testing.T) {
 	if result.Triaged != 2 {
 		t.Fatalf("triaged = %d, want 2", result.Triaged)
 	}
-	if result.SkipReasons["not_in_selection"] != 1 {
-		t.Fatalf("not_in_selection skips = %d, want 1", result.SkipReasons["not_in_selection"])
+	if result.Considered != 2 {
+		t.Fatalf("considered = %d, want 2 (explicit numbers are fetched directly)", result.Considered)
 	}
 }
 
 func TestBackfillIssuesForceRetriageReTriages(t *testing.T) {
 	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
 		cfg.Roles.Coordinator.Enabled = true
+		cfg.Roles.Coordinator.BackfillEnabled = true
 	})
 	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1, Labels: []string{"triaged"}}}
 	fixture.github.details[1] = githubinfra.IssueDetail{
 		Number: 1, Title: "Bug", Author: "looper",
 		CreatedAt: fixture.now.Add(-48 * time.Hour).Format(time.RFC3339),
-		Labels: []string{"triaged"},
+		Labels:    []string{"triaged"},
 	}
 
 	result, err := fixture.runner.BackfillIssues(context.Background(), BackfillInput{
@@ -159,6 +167,7 @@ func TestBackfillIssuesForceRetriageReTriages(t *testing.T) {
 func TestBackfillIssuesMissingDetailReportsFailure(t *testing.T) {
 	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
 		cfg.Roles.Coordinator.Enabled = true
+		cfg.Roles.Coordinator.BackfillEnabled = true
 	})
 	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1}, {Number: 2}}
 	fixture.github.details[1] = githubinfra.IssueDetail{
@@ -179,6 +188,73 @@ func TestBackfillIssuesMissingDetailReportsFailure(t *testing.T) {
 	// Issue 2 has no detail but stub returns zero value (no error), so it proceeds.
 	if result.Considered < 1 {
 		t.Fatalf("expected at least 1 considered, got %d", result.Considered)
+	}
+}
+
+func TestBackfillIssuesRequiresExplicitProjectOptIn(t *testing.T) {
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
+		cfg.Roles.Coordinator.Enabled = true
+	})
+	_, err := fixture.runner.BackfillIssues(context.Background(), BackfillInput{ProjectID: fixture.projectID, Repo: "acme/looper"})
+	if err == nil || !strings.Contains(err.Error(), "backfill is disabled") {
+		t.Fatalf("BackfillIssues() error = %v, want disabled opt-in error", err)
+	}
+}
+
+func TestBackfillIssuesAppliesAgeHoldAndNormalizedLabelGates(t *testing.T) {
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Roles.Coordinator.BackfillEnabled = true
+	})
+	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1}, {Number: 2}, {Number: 3}}
+	fixture.github.details[1] = githubinfra.IssueDetail{Number: 1, Title: "old", CreatedAt: fixture.now.Add(-40 * 24 * time.Hour).Format(time.RFC3339), Labels: []string{"Backfill"}}
+	fixture.github.details[2] = githubinfra.IssueDetail{Number: 2, Title: "held", CreatedAt: fixture.now.Add(-24 * time.Hour).Format(time.RFC3339), Labels: []string{" BACKFILL ", " " + strings.ToUpper(labels.HoldGlobal) + " "}}
+	fixture.github.details[3] = githubinfra.IssueDetail{Number: 3, Title: "fresh", CreatedAt: fixture.now.Add(-24 * time.Hour).Format(time.RFC3339), Labels: []string{"BACKFILL"}}
+
+	result, err := fixture.runner.BackfillIssues(context.Background(), BackfillInput{ProjectID: fixture.projectID, Repo: "acme/looper", LabelFilter: " backfill ", MaxAgeDays: 30})
+	if err != nil {
+		t.Fatalf("BackfillIssues() error = %v", err)
+	}
+	if result.Triaged != 1 || result.SkipReasons["too_old"] != 1 || result.SkipReasons["hold"] != 1 {
+		t.Fatalf("result = %#v, want one triage plus age/hold skips", result)
+	}
+}
+
+type failingBackfillLLM struct{}
+
+func (failingBackfillLLM) Complete(context.Context, triage.Request) (string, error) {
+	return "", errors.New("provider unavailable")
+}
+
+func TestBackfillIssuesReportsLLMFailureAndCountsAttempt(t *testing.T) {
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Roles.Coordinator.BackfillEnabled = true
+	})
+	fixture.runner.triageLLM = failingBackfillLLM{}
+	fixture.github.issues = []githubinfra.IssueSummary{{Number: 1}, {Number: 2}}
+	for number := int64(1); number <= 2; number++ {
+		fixture.github.details[number] = githubinfra.IssueDetail{Number: number, Title: "Bug", CreatedAt: fixture.now.Add(-24 * time.Hour).Format(time.RFC3339)}
+	}
+	result, err := fixture.runner.BackfillIssues(context.Background(), BackfillInput{ProjectID: fixture.projectID, Repo: "acme/looper", MaxCount: 1})
+	if err != nil {
+		t.Fatalf("BackfillIssues() error = %v", err)
+	}
+	if result.Considered != 1 || len(result.FailedIssues) != 1 || result.Triaged != 0 {
+		t.Fatalf("result = %#v, want one failed bounded attempt", result)
+	}
+}
+
+func TestBackfillIssuesHonorsCancellationBeforeListing(t *testing.T) {
+	fixture := newCoordinatorFixture(t, func(cfg *config.Config) {
+		cfg.Roles.Coordinator.Enabled = true
+		cfg.Roles.Coordinator.BackfillEnabled = true
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := fixture.runner.BackfillIssues(ctx, BackfillInput{ProjectID: fixture.projectID, Repo: "acme/looper"})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("BackfillIssues() error = %v, want context.Canceled", err)
 	}
 }
 

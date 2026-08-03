@@ -19,6 +19,7 @@ import (
 
 	"github.com/MumuTW/looper/internal/bootstrap"
 	"github.com/MumuTW/looper/internal/config"
+	coordinatorrole "github.com/MumuTW/looper/internal/coordinator"
 	"github.com/MumuTW/looper/internal/domain"
 	gitinfra "github.com/MumuTW/looper/internal/infra/git"
 	githubinfra "github.com/MumuTW/looper/internal/infra/github"
@@ -182,6 +183,7 @@ type Runtime struct {
 	runSchedulerTick       RunSchedulerTickFunc
 	defaultSchedulerTick   RunSchedulerTickFunc
 	defaultSchedulerClaim  RunSchedulerTickFunc
+	backfillIssues         func(context.Context, coordinatorrole.BackfillInput) (coordinatorrole.BackfillResult, error)
 	customSchedulerTick    bool
 	customSchedulerClaim   bool
 	customWebhookForwarder bool
@@ -245,6 +247,20 @@ type Runtime struct {
 	// storageRetained is true when Stop skipped coordinator.Close after a
 	// drain failure so undrained ownership is not closed under SQLite.
 	storageRetained bool
+}
+
+// BackfillIssues is the runtime-owned entry point for the explicitly enabled
+// historical intake lane. The callback comes from the current scheduler
+// snapshot, so a config reload changes policy without leaving the API bound to
+// a stale Coordinator runner.
+func (r *Runtime) BackfillIssues(ctx context.Context, input coordinatorrole.BackfillInput) (coordinatorrole.BackfillResult, error) {
+	r.mu.RLock()
+	backfill := r.backfillIssues
+	r.mu.RUnlock()
+	if backfill == nil {
+		return coordinatorrole.BackfillResult{}, fmt.Errorf("coordinator backfill is unavailable")
+	}
+	return backfill(ctx, input)
 }
 
 const reviewerRecoveryLoginTimeout = 3 * time.Second
@@ -1077,6 +1093,7 @@ func (r *Runtime) start(ctx context.Context) error {
 			defer r.mu.RUnlock()
 			return r.schedulerTasks
 		}, r.TriggerSchedulerClaim, r.now, r.reconcileLiveStaleRunningRuns, r.AllowClaim, r.WithAllowClaim, r.hostAdmission)
+		r.backfillIssues = handlers.backfill
 		if !r.customSchedulerTick {
 			r.defaultSchedulerTick = handlers.tick
 			if !r.customWebhookForwarder {

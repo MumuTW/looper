@@ -1535,7 +1535,8 @@ func newCoordinatorFixture(t *testing.T, configure ...func(*config.Config)) coor
 	}
 	repos := storage.NewRepositories(coord.DB())
 	projectID := coordinatorFixtureProjectID
-	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Demo", RepoPath: t.TempDir(), CreatedAt: now.Format(time.RFC3339), UpdatedAt: now.Format(time.RFC3339)}); err != nil {
+	metadata := `{"repo":"acme/looper"}`
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Demo", RepoPath: t.TempDir(), MetadataJSON: &metadata, CreatedAt: now.Format(time.RFC3339), UpdatedAt: now.Format(time.RFC3339)}); err != nil {
 		t.Fatalf("Projects.Upsert() error = %v", err)
 	}
 	cfg, err := config.DefaultConfig(t.TempDir())
