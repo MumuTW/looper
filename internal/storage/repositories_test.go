@@ -890,6 +890,44 @@ func TestPullRequestLookupsStayScopedAndReturnLatestSnapshotPerProject(t *testin
 	}
 }
 
+func TestPullRequestSnapshotsLatestTieUsesInsertionOrder(t *testing.T) {
+	t.Parallel()
+
+	coordinator := openMigratedCoordinatorForRepositories(t)
+	ctx := context.Background()
+	repos := NewRepositories(coordinator.DB())
+	const projectID = "snapshot-tie-project"
+	const repo = "acme/looper"
+	const prNumber int64 = 42
+	const tieAt = "2026-07-13T09:00:00.000Z"
+	if err := repos.Projects.Upsert(ctx, ProjectRecord{ID: projectID, Name: projectID, RepoPath: "/tmp/" + projectID, CreatedAt: tieAt, UpdatedAt: tieAt}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	// The later insert deliberately sorts earlier by ID. Timestamp-only and
+	// random-ID tie breakers would return the stale first observation.
+	for _, snapshot := range []PullRequestSnapshotRecord{
+		{ID: "z-first", ProjectID: projectID, Repo: repo, PRNumber: prNumber, HeadSHA: "old-head", CapturedAt: tieAt, CreatedAt: tieAt},
+		{ID: "a-second", ProjectID: projectID, Repo: repo, PRNumber: prNumber, HeadSHA: "new-head", CapturedAt: tieAt, CreatedAt: tieAt},
+	} {
+		if err := repos.PullRequestSnapshots.Upsert(ctx, snapshot); err != nil {
+			t.Fatalf("PullRequestSnapshots.Upsert(%q) error = %v", snapshot.ID, err)
+		}
+	}
+
+	latest, err := repos.PullRequestSnapshots.ListLatest(ctx)
+	if err != nil || len(latest) != 1 || latest[0].ID != "a-second" {
+		t.Fatalf("ListLatest() = %#v err=%v, want the later a-second observation", latest, err)
+	}
+	byRepo, err := repos.PullRequestSnapshots.ListLatestByRepoAndPR(ctx, repo, prNumber)
+	if err != nil || len(byRepo) != 1 || byRepo[0].ID != "a-second" {
+		t.Fatalf("ListLatestByRepoAndPR() = %#v err=%v, want the later a-second observation", byRepo, err)
+	}
+	byProject, err := repos.PullRequestSnapshots.GetLatestByProject(ctx, projectID, repo, prNumber)
+	if err != nil || byProject == nil || byProject.ID != "a-second" {
+		t.Fatalf("GetLatestByProject() = %#v err=%v, want the later a-second observation", byProject, err)
+	}
+}
+
 func snapshotIDs(records []PullRequestSnapshotRecord) []string {
 	ids := make([]string, 0, len(records))
 	for _, record := range records {

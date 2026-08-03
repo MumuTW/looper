@@ -2142,7 +2142,9 @@ func (r *PullRequestSnapshotsRepository) ListLatest(ctx context.Context) ([]Pull
 		WITH ranked AS (
 			SELECT id, ROW_NUMBER() OVER (
 				PARTITION BY project_id, lower(repo), pr_number
-				ORDER BY captured_at DESC, created_at DESC, id DESC
+				-- IDs are random; rowid preserves insertion order when both
+				-- millisecond timestamps tie.
+				ORDER BY captured_at DESC, created_at DESC, rowid DESC
 			) AS row_number
 			FROM pull_request_snapshots
 		)
@@ -2150,7 +2152,7 @@ func (r *PullRequestSnapshotsRepository) ListLatest(ctx context.Context) ([]Pull
 		FROM pull_request_snapshots snapshots
 		JOIN ranked ON ranked.id = snapshots.id
 		WHERE ranked.row_number = 1
-		ORDER BY snapshots.captured_at DESC, snapshots.created_at DESC, snapshots.id DESC
+		ORDER BY snapshots.captured_at DESC, snapshots.created_at DESC, snapshots.rowid DESC
 	`)
 	if err != nil {
 		return nil, fmt.Errorf("list latest pull request snapshots: %w", err)
@@ -2165,7 +2167,7 @@ func (r *PullRequestSnapshotsRepository) ListLatestByRepoAndPR(ctx context.Conte
 		WITH ranked AS (
 			SELECT id, ROW_NUMBER() OVER (
 				PARTITION BY project_id
-				ORDER BY captured_at DESC, created_at DESC, id DESC
+				ORDER BY captured_at DESC, created_at DESC, rowid DESC
 			) AS row_number
 			FROM pull_request_snapshots
 			WHERE repo = ? COLLATE NOCASE AND pr_number = ?
@@ -2174,7 +2176,7 @@ func (r *PullRequestSnapshotsRepository) ListLatestByRepoAndPR(ctx context.Conte
 		FROM pull_request_snapshots snapshots
 		JOIN ranked ON ranked.id = snapshots.id
 		WHERE ranked.row_number = 1
-		ORDER BY snapshots.captured_at DESC, snapshots.created_at DESC, snapshots.id DESC
+		ORDER BY snapshots.captured_at DESC, snapshots.created_at DESC, snapshots.rowid DESC
 	`, repo, prNumber)
 	if err != nil {
 		return nil, fmt.Errorf("list latest pull request snapshots by repository and pull request: %w", err)
@@ -2202,7 +2204,7 @@ func (r *PullRequestSnapshotsRepository) GetLatest(ctx context.Context, repo str
 }
 
 func (r *PullRequestSnapshotsRepository) GetLatestByProject(ctx context.Context, projectID, repo string, prNumber int64) (*PullRequestSnapshotRecord, error) {
-	row := r.q.QueryRowContext(ctx, `SELECT `+pullRequestSnapshotColumns+` FROM pull_request_snapshots WHERE project_id = ? AND repo = ? COLLATE NOCASE AND pr_number = ? ORDER BY captured_at DESC, created_at DESC LIMIT 1`, projectID, repo, prNumber)
+	row := r.q.QueryRowContext(ctx, `SELECT `+pullRequestSnapshotColumns+` FROM pull_request_snapshots WHERE project_id = ? AND repo = ? COLLATE NOCASE AND pr_number = ? ORDER BY captured_at DESC, created_at DESC, rowid DESC LIMIT 1`, projectID, repo, prNumber)
 	record, err := scanPullRequestSnapshot(row)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {

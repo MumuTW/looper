@@ -298,6 +298,8 @@ func Classify(in Input) Board {
 	queueByPR := indexQueue(in.Queue)
 	pullRequestLinks := prLinks(pullRequests, in.Links)
 	pullRequestLinkFallback := uniqueLinkFallback(pullRequestLinks)
+	terminalPRLinks := terminalPullRequestLinks(terminalPRs, in.Links)
+	terminalPRLinkFallback := uniqueLinkFallback(terminalPRLinks)
 	loopLinkFallback := uniqueLoopLinkFallback(loopLinks)
 
 	// Escalator items reach a row through the link the collector already wrote
@@ -310,10 +312,21 @@ func Classify(in Input) Board {
 			identity := linkIdentity{ProjectID: item.ProjectID, Link: link}
 			if candidate, ok := pullRequestLinks[identity]; ok {
 				key, matched = candidate, true
+			} else if _, terminal := terminalPRLinks[identity]; terminal {
+				// A digest item can outlive the open snapshot during forge or
+				// loop cleanup. The terminal snapshot is the durable authority;
+				// do not resurrect that PR as a standalone actionable/stuck row.
+				continue
 			} else if item.ProjectID == "" {
 				key, matched = pullRequestLinkFallback[link]
+				if _, terminal := terminalPRLinkFallback[link]; terminal {
+					continue
+				}
 			} else if loop, ok := loopLinks[identity]; ok && loop.Repo != nil && loop.PRNumber != nil {
 				candidate := newPRKey(loop.ProjectID, *loop.Repo, *loop.PRNumber)
+				if _, terminal := terminalPRs[candidate]; terminal {
+					continue
+				}
 				if _, known := pullRequests[candidate]; known {
 					key, matched = candidate, true
 				}
@@ -321,6 +334,9 @@ func Classify(in Input) Board {
 			if !matched && item.ProjectID == "" {
 				if loop, ok := loopLinkFallback[link]; ok && loop.Repo != nil && loop.PRNumber != nil {
 					candidate := newPRKey(loop.ProjectID, *loop.Repo, *loop.PRNumber)
+					if _, terminal := terminalPRs[candidate]; terminal {
+						continue
+					}
 					if _, known := pullRequests[candidate]; known {
 						key, matched = candidate, true
 					}
@@ -1253,6 +1269,19 @@ func prLinks(pullRequests map[PRKey]storage.PullRequestSnapshotRecord, links esc
 	}
 	for key, snapshot := range pullRequests {
 		if link := strings.TrimSpace(links.PullRequest(key.ProjectID, snapshot.Repo, key.Number)); link != "" {
+			out[linkIdentity{ProjectID: key.ProjectID, Link: link}] = key
+		}
+	}
+	return out
+}
+
+func terminalPullRequestLinks(terminalPRs map[PRKey]struct{}, links escalator.Linker) map[linkIdentity]PRKey {
+	out := make(map[linkIdentity]PRKey, len(terminalPRs))
+	if links == nil {
+		return out
+	}
+	for key := range terminalPRs {
+		if link := strings.TrimSpace(links.PullRequest(key.ProjectID, key.Repo, key.Number)); link != "" {
 			out[linkIdentity{ProjectID: key.ProjectID, Link: link}] = key
 		}
 	}

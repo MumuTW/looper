@@ -667,6 +667,26 @@ func TestClassifyDoesNotResurrectTerminalSnapshotDuringLoopCleanup(t *testing.T)
 	}
 }
 
+func TestClassifyDropsEscalatorItemsForTerminalPullRequest(t *testing.T) {
+	t.Parallel()
+
+	closed := snapshot(t, 8, payloadOptions{state: "MERGED"})
+	loop := activeLoop(8)
+	board := Classify(Input{
+		Now:       testNow,
+		Snapshots: []storage.PullRequestSnapshotRecord{closed},
+		Loops:     []storage.LoopRecord{loop},
+		Links:     testLinker{},
+		Escalator: escalator.Snapshot{Items: []escalator.Item{
+			{ID: "eligible-advise:proj:acme/widgets:8", ProjectID: "proj", Kind: escalator.KindWaiting, Reason: escalator.ReasonEligibleAdvisePR, Link: testLinker{}.PullRequest("proj", "acme/widgets", 8)},
+			{ID: "circuit-breaker:proj:loop-8", ProjectID: "proj", Kind: escalator.KindStuck, Reason: escalator.ReasonCircuitBreaker, Link: testLinker{}.Loop("proj", 8)},
+		}},
+	})
+	if board.Total() != 0 {
+		t.Fatalf("terminal PR with stale escalator items total = %d, want 0", board.Total())
+	}
+}
+
 func TestClassifyDisambiguatesCollidingProjectSlugs(t *testing.T) {
 	t.Parallel()
 
