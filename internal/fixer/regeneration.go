@@ -17,6 +17,7 @@ import (
 )
 
 const regenerationCommentMarker = "<!-- looper:fixer-regenerate-v1"
+const contextWithheldEventType = "fixer.escalation.context_withheld"
 
 type regenerationAction string
 
@@ -369,19 +370,27 @@ func (r *Runner) persistRegenerationEscalation(ctx context.Context, loop storage
 	if !ok {
 		return fmt.Errorf("human escalation gateway is unavailable")
 	}
+	contextWithheld := false
 	if !state.Commented {
-		comments, err := bridge.ListIssueComments(ctx, ViewIssueInput{Repo: repo, IssueNumber: prNumber, CWD: cwd})
+		var err error
+		contextWithheld, err = r.hasContextWithheldEvent(ctx, loop.ID)
 		if err != nil {
-			return fmt.Errorf("inspect human escalation comments: %w", err)
+			return fmt.Errorf("inspect withheld-context escalation evidence: %w", err)
 		}
-		for _, comment := range comments {
-			if strings.Contains(comment.Body, regenerationCommentMarker) && strings.Contains(comment.Body, "authority="+state.Authority) && strings.Contains(comment.Body, "outcome=escalated") {
-				state.CommentID, state.Commented = comment.ID, true
-				break
+		if !contextWithheld {
+			comments, err := bridge.ListIssueComments(ctx, ViewIssueInput{Repo: repo, IssueNumber: prNumber, CWD: cwd})
+			if err != nil {
+				return fmt.Errorf("inspect human escalation comments: %w", err)
+			}
+			for _, comment := range comments {
+				if strings.Contains(comment.Body, regenerationCommentMarker) && strings.Contains(comment.Body, "authority="+state.Authority) && strings.Contains(comment.Body, "outcome=escalated") {
+					state.CommentID, state.Commented = comment.ID, true
+					break
+				}
 			}
 		}
 	}
-	if !state.Commented {
+	if !state.Commented && !contextWithheld {
 		comment, err := r.github.CreateIssueComment(ctx, IssueCommentInput{Repo: repo, IssueNumber: prNumber, Body: body, CWD: cwd, DisclosureAgent: r.agentRuntime, DisclosureModel: derefString(r.agentModel)})
 		switch {
 		case err == nil:
@@ -433,16 +442,74 @@ func (r *Runner) escalateWithoutFailureContext(ctx context.Context, loop storage
 		return state, fmt.Errorf("post withheld-context escalation comment: %w", err)
 	}
 	r.logWarn("fixer escalation comment withheld by content safety gate", map[string]any{"loopId": loop.ID, "repo": repo, "prNumber": prNumber, "error": err.Error()})
-	eventID := ""
-	if strings.TrimSpace(loop.ID) != "" {
-		eventID = "fixer.escalation.context_withheld:" + strings.TrimSpace(loop.ID)
+	// The event is both the audit evidence for the withheld context and the
+	// durable marker that settles the comment step. A deterministic loop-scoped
+	// primary key makes replay and concurrent recovery idempotent even when the
+	// metadata checkpoint after this append fails. If the event cannot be
+	// recorded, do not advance to the label: the next retry must not infer that
+	// the comment step was settled without durable evidence.
+	if err := r.appendContextWithheldEvent(ctx, loop, repo, prNumber, reason); err != nil {
+		return state, err
 	}
-	// The event is an audit observation of a durable content-gate outcome, not
-	// an attempt counter. A deterministic loop-scoped primary key makes replay
-	// and concurrent recovery idempotent even when the metadata checkpoint after
-	// this append fails.
-	r.appendEvent(ctx, eventInput{id: eventID, eventType: "fixer.escalation.context_withheld", projectID: loop.ProjectID, loopID: loop.ID, entityType: "loop", entityID: loop.ID, payload: map[string]any{"repo": repo, "prNumber": prNumber, "reason": reason}})
 	return state, nil
+}
+
+func contextWithheldEventID(loopID string) string {
+	loopID = strings.TrimSpace(loopID)
+	if loopID == "" {
+		return ""
+	}
+	return contextWithheldEventType + ":" + loopID
+}
+
+func (r *Runner) hasContextWithheldEvent(ctx context.Context, loopID string) (bool, error) {
+	eventID := contextWithheldEventID(loopID)
+	if eventID == "" || r.repos == nil || r.repos.Events == nil {
+		return false, nil
+	}
+	events, err := r.repos.Events.ListByEntityAndEventTypes(ctx, "loop", strings.TrimSpace(loopID), []string{contextWithheldEventType})
+	if err != nil {
+		return false, err
+	}
+	for _, event := range events {
+		if event.ID == eventID {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (r *Runner) appendContextWithheldEvent(ctx context.Context, loop storage.LoopRecord, repo string, prNumber int64, reason string) error {
+	eventID := contextWithheldEventID(loop.ID)
+	if eventID == "" || r.repos == nil || r.repos.Events == nil {
+		return nil
+	}
+	err := eventlog.Append(ctx, r.repos, eventlog.AppendInput{
+		ID:         eventID,
+		EventType:  contextWithheldEventType,
+		ProjectID:  runpipe.OptionalString(loop.ProjectID),
+		LoopID:     runpipe.OptionalString(loop.ID),
+		EntityType: runpipe.OptionalString("loop"),
+		EntityID:   runpipe.OptionalString(loop.ID),
+		ActorType:  runpipe.OptionalString("system"),
+		ActorID:    runpipe.OptionalString("fixer-loop"),
+		Payload:    map[string]any{"repo": repo, "prNumber": prNumber, "reason": reason},
+		CreatedAt:  r.now(),
+	})
+	if err == nil {
+		return nil
+	}
+	// A concurrent replay may have inserted the deterministic record first.
+	// Verify that case rather than treating the unique-key collision as a
+	// failed escalation; all other append failures remain retryable.
+	recorded, lookupErr := r.hasContextWithheldEvent(ctx, loop.ID)
+	if lookupErr == nil && recorded {
+		return nil
+	}
+	if lookupErr != nil {
+		return fmt.Errorf("record withheld-context escalation evidence: %w (verify existing evidence: %v)", err, lookupErr)
+	}
+	return fmt.Errorf("record withheld-context escalation evidence: %w", err)
 }
 
 func (r *Runner) persistRegenerationAbort(ctx context.Context, loop storage.LoopRecord, state fixerRegenerationState, reason string) (regenerationAction, error) {

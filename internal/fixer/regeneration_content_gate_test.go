@@ -178,6 +178,9 @@ func TestHandleTerminalExhaustionEscalationDeduplicatesContextWithheldEventAcros
 	if got := withheldEvents(); got != 1 {
 		t.Fatalf("context_withheld events after first attempt = %d, want exactly one", got)
 	}
+	if got := len(gateway.createIssueComments); got != 2 {
+		t.Fatalf("comment attempts after first attempt = %d, want the rejected original plus rejected fallback", got)
+	}
 	updated, err := fixture.repos.Loops.GetByID(ctx, loop.ID)
 	if err != nil || updated == nil {
 		t.Fatalf("Loops.GetByID() error = %v", err)
@@ -188,8 +191,8 @@ func TestHandleTerminalExhaustionEscalationDeduplicatesContextWithheldEventAcros
 	}
 
 	// Replay: the label service recovers, both comment bodies are still rejected.
-	// The deterministic event ID keeps the audit history deduplicated across
-	// the replay without adding another durable regeneration-state field.
+	// The deterministic event ID is both the durable audit marker and the
+	// settled-comment authority, so replay must not resubmit either body.
 	gateway.prLabelErr = nil
 	gateway.commentErrs = []error{contentGateRejection(), contentGateRejection()}
 	action, err := runner.handleTerminalExhaustion(ctx, *project, loop, queue, fixerCheckpoint{}, failure)
@@ -202,11 +205,14 @@ func TestHandleTerminalExhaustionEscalationDeduplicatesContextWithheldEventAcros
 	if got := withheldEvents(); got != 1 {
 		t.Fatalf("context_withheld events after replay = %d, want still one (deduplicated across replay)", got)
 	}
+	if got := len(gateway.createIssueComments); got != 2 {
+		t.Fatalf("comment attempts after replay = %d, want no duplicate attempts after withheld step was settled", got)
+	}
 	events, err := fixture.repos.Events.ListByEntityAndEventTypes(ctx, "loop", loop.ID, []string{"fixer.escalation.context_withheld"})
 	if err != nil {
 		t.Fatalf("Events.ListByEntityAndEventTypes() error = %v", err)
 	}
-	if events[0].ID != "fixer.escalation.context_withheld:"+loop.ID {
+	if events[0].ID != contextWithheldEventID(loop.ID) {
 		t.Fatalf("context_withheld event ID = %q, want deterministic loop-scoped ID", events[0].ID)
 	}
 }

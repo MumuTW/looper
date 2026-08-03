@@ -129,15 +129,23 @@ func unsafeText(text string, highEntropyExemptions []string) string {
 		if gitObjectIDRE.MatchString(token) || uuidRE.MatchString(token) {
 			continue
 		}
-		// A NAME=value candidate is judged by its value: the NAME's character
-		// classes and letters otherwise inflate an innocuous value past the
-		// bar (fixItemsFingerprint=<sha1> is looper's own identifier format),
+		// A NAME=value candidate is judged by its value: the NAME's letters
+		// otherwise inflate an innocuous value past the bar
+		// (fixItemsFingerprint=<sha1> is looper's own identifier format),
 		// and an exempt value stays exempt with or without a NAME= prefix.
 		if value, isAssignment := assignmentValue(token); isAssignment {
 			if value == "" || gitObjectIDRE.MatchString(value) || uuidRE.MatchString(value) {
 				continue
 			}
-			token = value
+			// Keep the assignment separator as structural evidence without
+			// reintroducing the NAME's character distribution into the entropy
+			// calculation. A two-class value with high entropy (for example a
+			// mixed-case fixture blob) is still credential-shaped when it is
+			// published as NAME=value.
+			if characterClassCount(value) >= 2 && shannonEntropy(value) >= highEntropyThreshold {
+				return "contains a high-entropy credential-shaped token"
+			}
+			continue
 		}
 		if characterClassCount(token) >= 3 && shannonEntropy(token) >= highEntropyThreshold {
 			return "contains a high-entropy credential-shaped token"
