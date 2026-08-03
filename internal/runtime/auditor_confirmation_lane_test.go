@@ -16,9 +16,10 @@ import (
 )
 
 type confirmationAuditorGateway struct {
-	head       string
-	checks     githubinfra.PullRequestCheckRuns
-	rerequests []int64
+	annotations map[int64][]githubinfra.CheckRunAnnotation
+	head        string
+	checks      githubinfra.PullRequestCheckRuns
+	rerequests  []int64
 }
 
 func (g *confirmationAuditorGateway) GetBranchHeadSHA(context.Context, githubinfra.BranchHeadInput) (string, error) {
@@ -34,13 +35,13 @@ func (g *confirmationAuditorGateway) RerequestCheckSuite(_ context.Context, inpu
 	return nil
 }
 
-func (g *confirmationAuditorGateway) ListCheckRunAnnotations(context.Context, githubinfra.CheckRunAnnotationsInput) ([]githubinfra.CheckRunAnnotation, error) {
-	return nil, nil
+func (g *confirmationAuditorGateway) ListCheckRunAnnotations(_ context.Context, input githubinfra.CheckRunAnnotationsInput) ([]githubinfra.CheckRunAnnotation, error) {
+	return g.annotations[input.CheckRunID], nil
 }
 
 func TestProgressAuditorConfirmationRerequestsOnceThenRecordsMatchingFailure(t *testing.T) {
 	ctx, repos, project, repo, head, now := auditorConfirmationFixture(t, []int64{7654})
-	gateway := &confirmationAuditorGateway{head: head}
+	gateway := &confirmationAuditorGateway{head: head, annotations: map[int64][]githubinfra.CheckRunAnnotation{99: {{Path: "internal/runtime/auditor.go", Level: "failure"}}}}
 	role := config.AuditorRoleConfig{Enabled: true, WindowMinutes: 60}
 
 	if err := progressAuditorConfirmation(ctx, repos, gateway, project, repo, "main", role, func() time.Time { return now }); err != nil {
@@ -56,7 +57,7 @@ func TestProgressAuditorConfirmationRerequestsOnceThenRecordsMatchingFailure(t *
 		t.Fatalf("rerequest events = %#v, %v", events, err)
 	}
 
-	gateway.checks = githubinfra.PullRequestCheckRuns{CheckRuns: []githubinfra.PullRequestCheckRun{{Name: "ci", Status: "completed", Conclusion: "failure", CheckSuiteID: 7654, StartedAt: eventlog.FormatJavaScriptISOString(now)}}}
+	gateway.checks = githubinfra.PullRequestCheckRuns{CheckRuns: []githubinfra.PullRequestCheckRun{{ID: 99, Name: "ci", Status: "completed", Conclusion: "failure", CheckSuiteID: 7654, StartedAt: eventlog.FormatJavaScriptISOString(now)}}}
 	if err := progressAuditorConfirmation(ctx, repos, gateway, project, repo, "main", role, func() time.Time { return now }); err != nil {
 		t.Fatalf("second progressAuditorConfirmation() error = %v", err)
 	}
@@ -81,12 +82,12 @@ func TestProgressAuditorConfirmationRerequestsOnceThenRecordsMatchingFailure(t *
 
 func TestProgressAuditorConfirmationRecordsFlakeWithoutRerequestingAgain(t *testing.T) {
 	ctx, repos, project, repo, head, now := auditorConfirmationFixture(t, []int64{7654})
-	gateway := &confirmationAuditorGateway{head: head}
+	gateway := &confirmationAuditorGateway{head: head, annotations: map[int64][]githubinfra.CheckRunAnnotation{99: {{Path: "internal/runtime/auditor.go", Level: "failure"}}}}
 	role := config.AuditorRoleConfig{Enabled: true, WindowMinutes: 60}
 	if err := progressAuditorConfirmation(ctx, repos, gateway, project, repo, "main", role, func() time.Time { return now }); err != nil {
 		t.Fatal(err)
 	}
-	gateway.checks = githubinfra.PullRequestCheckRuns{CheckRuns: []githubinfra.PullRequestCheckRun{{Name: "ci", Status: "completed", Conclusion: "success", CheckSuiteID: 7654, StartedAt: eventlog.FormatJavaScriptISOString(now)}}}
+	gateway.checks = githubinfra.PullRequestCheckRuns{CheckRuns: []githubinfra.PullRequestCheckRun{{ID: 99, Name: "ci", Status: "completed", Conclusion: "success", CheckSuiteID: 7654, StartedAt: eventlog.FormatJavaScriptISOString(now)}}}
 	if err := progressAuditorConfirmation(ctx, repos, gateway, project, repo, "main", role, func() time.Time { return now }); err != nil {
 		t.Fatal(err)
 	}
@@ -100,15 +101,15 @@ func TestProgressAuditorConfirmationRecordsFlakeWithoutRerequestingAgain(t *test
 func TestProgressAuditorConfirmationMarksUniquePathOverlapAsRevertProposal(t *testing.T) {
 	ctx, repos, project, repo, head, now := auditorConfirmationFixture(t, []int64{7654})
 	projectID := project.ID
-	if err := eventlog.Append(ctx, repos, eventlog.AppendInput{EventType: gatekeeper.MergeOutcomeEventType, ProjectID: &projectID, Payload: gatekeeper.MergeOutcome{Version: 1, ProjectID: projectID, Repo: repo, PRNumber: 42, HeadSHA: "merged-pr-head", Merged: true, TouchedFiles: []string{"internal/runtime/auditor.go"}}, CreatedAt: now.Add(-time.Minute)}); err != nil {
+	if err := eventlog.Append(ctx, repos, eventlog.AppendInput{EventType: gatekeeper.MergeOutcomeEventType, ProjectID: &projectID, Payload: gatekeeper.MergeOutcome{Version: 1, ProjectID: projectID, Repo: repo, PRNumber: 42, HeadSHA: "merged-pr-head", Merged: true, TouchedFiles: []string{"internal/runtime/auditor.go"}, TouchedFilesAvailable: true}, CreatedAt: now.Add(-time.Minute)}); err != nil {
 		t.Fatal(err)
 	}
-	gateway := &confirmationAuditorGateway{head: head}
+	gateway := &confirmationAuditorGateway{head: head, annotations: map[int64][]githubinfra.CheckRunAnnotation{99: {{Path: "internal/runtime/auditor.go", Level: "failure"}}}}
 	role := config.AuditorRoleConfig{Enabled: true, WindowMinutes: 60}
 	if err := progressAuditorConfirmation(ctx, repos, gateway, project, repo, "main", role, func() time.Time { return now }); err != nil {
 		t.Fatal(err)
 	}
-	gateway.checks = githubinfra.PullRequestCheckRuns{CheckRuns: []githubinfra.PullRequestCheckRun{{Name: "ci", Status: "completed", Conclusion: "failure", CheckSuiteID: 7654, StartedAt: eventlog.FormatJavaScriptISOString(now)}}}
+	gateway.checks = githubinfra.PullRequestCheckRuns{CheckRuns: []githubinfra.PullRequestCheckRun{{ID: 99, Name: "ci", Status: "completed", Conclusion: "failure", CheckSuiteID: 7654, StartedAt: eventlog.FormatJavaScriptISOString(now)}}}
 	if err := progressAuditorConfirmation(ctx, repos, gateway, project, repo, "main", role, func() time.Time { return now }); err != nil {
 		t.Fatal(err)
 	}
@@ -141,6 +142,14 @@ func TestCompletedAuditorRerunWaitsForAResultNewerThanRequest(t *testing.T) {
 	}
 }
 
+func TestAuditorObservedRerunIgnoresRunStartedBeforeObservation(t *testing.T) {
+	observedAt := time.Date(2026, time.July, 31, 12, 0, 0, 0, time.UTC)
+	checks := githubinfra.PullRequestCheckRuns{CheckRuns: []githubinfra.PullRequestCheckRun{{CheckSuiteID: 7654, StartedAt: eventlog.FormatJavaScriptISOString(observedAt.Add(-time.Second)), CompletedAt: eventlog.FormatJavaScriptISOString(observedAt.Add(time.Second))}}}
+	if when, ok := auditorObservedRerun(checks, 7654, observedAt); ok || !when.IsZero() {
+		t.Fatalf("auditorObservedRerun() = (%v, %v), want no rerun for pre-observation run", when, ok)
+	}
+}
+
 func auditorConfirmationFixture(t *testing.T, suiteIDs []int64) (context.Context, *storage.Repositories, storage.ProjectRecord, string, string, time.Time) {
 	t.Helper()
 	ctx := context.Background()
@@ -156,7 +165,10 @@ func auditorConfirmationFixture(t *testing.T, suiteIDs []int64) (context.Context
 		t.Fatal(err)
 	}
 	entityType, entityID, eventID := "branch_head", repo+"@"+head, "observation_1"
-	if err := eventlog.Append(ctx, repos, eventlog.AppendInput{ID: eventID, EventType: auditor.ObservedFailureEventType, ProjectID: &projectID, EntityType: &entityType, EntityID: &entityID, Payload: auditor.FailureObservation{Version: 3, ProjectID: projectID, Repo: repo, HeadSHA: head, FailedChecks: []string{"ci"}, FailingPaths: []string{"internal/runtime/auditor.go"}, CheckSuiteIDs: suiteIDs, ObservedAt: nowISO}, CreatedAt: now}); err != nil {
+	if err := eventlog.Append(ctx, repos, eventlog.AppendInput{EventType: auditor.BaselineEventType, ProjectID: &projectID, EntityType: &entityType, EntityID: &entityID, Payload: auditor.BaselineObservation{Version: 1, ProjectID: projectID, Repo: repo, HeadSHA: head, ObservedAt: eventlog.FormatJavaScriptISOString(now.Add(-time.Minute))}, CreatedAt: now.Add(-time.Minute)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := eventlog.Append(ctx, repos, eventlog.AppendInput{ID: eventID, EventType: auditor.ObservedFailureEventType, ProjectID: &projectID, EntityType: &entityType, EntityID: &entityID, Payload: auditor.FailureObservation{Version: 4, ProjectID: projectID, Repo: repo, HeadSHA: head, FailedChecks: []string{"ci"}, FailingPaths: []string{"internal/runtime/auditor.go"}, FailingPathEvidenceComplete: true, BaselineKnown: true, CandidatePRs: []int64{42}, CheckSuiteIDs: suiteIDs, ObservedAt: nowISO}, CreatedAt: now}); err != nil {
 		t.Fatal(err)
 	}
 	return ctx, repos, project, repo, head, now

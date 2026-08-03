@@ -2,6 +2,7 @@ package github
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
@@ -783,8 +784,44 @@ func TestPullRequestDetailReadsNativeClosingIssueAndMergeCommit(t *testing.T) {
 			"repository": map[string]any{"name": "looper", "owner": map[string]any{"login": "acme"}},
 		}},
 	}, nil, nil)
-	if detail.MergeCommitSHA != "merge-commit-1" || len(detail.ClosingIssues) != 1 || detail.ClosingIssues[0].Number != 118 || detail.ClosingIssues[0].Repo != "acme/looper" {
+	if detail.MergeCommitSHA != "merge-commit-1" || len(detail.ClosingIssues) != 1 || detail.ClosingIssues[0].Number != 118 || detail.ClosingIssues[0].Repo != "example.test/acme/looper" {
 		t.Fatalf("pullRequestDetailFromViewRow() = %#v, want native merge and closing-issue identity", detail)
+	}
+}
+
+func TestViewPullRequestForGatekeeperRetriesWithoutOptionalClosingIssues(t *testing.T) {
+	t.Parallel()
+	runner := &fakeGHRunner{t: t}
+	call := 0
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		call++
+		args := strings.Join(options.Args, " ")
+		if call == 1 {
+			if !strings.Contains(args, "closingIssuesReferences") {
+				t.Fatalf("first gatekeeper view args = %q, want optional provenance field", args)
+			}
+			return shell.Result{}, errors.New("unknown field closingIssuesReferences")
+		}
+		if strings.Contains(args, "closingIssuesReferences") {
+			t.Fatalf("fallback gatekeeper view args = %q, want optional provenance field omitted", args)
+		}
+		return shell.Result{Stdout: `{"number":42,"state":"OPEN","headRefOid":"head-1"}`}, nil
+	}
+
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	detail, err := gateway.ViewPullRequestForGatekeeper(context.Background(), ViewPullRequestInput{Repo: "acme/looper", PRNumber: 42})
+	if err != nil || detail.Number != 42 || detail.HeadSHA != "head-1" || call != 2 {
+		t.Fatalf("ViewPullRequestForGatekeeper() = %#v, %v; calls=%d, want fallback success", detail, err, call)
+	}
+}
+
+func TestIssueReferenceUsesLowerCamelJSON(t *testing.T) {
+	raw, err := json.Marshal(IssueReference{Number: 118, Repo: "acme/looper", URL: "https://github.com/acme/looper/issues/118"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(raw); got != `{"number":118,"repo":"acme/looper","url":"https://github.com/acme/looper/issues/118"}` {
+		t.Fatalf("IssueReference JSON = %s", got)
 	}
 }
 
@@ -804,7 +841,6 @@ func TestViewPullRequestMergeWatchReadsDefaultBranchMergeCommit(t *testing.T) {
 		t.Fatalf("ViewPullRequestMergeWatch() = %#v, %v", detail, err)
 	}
 }
-
 
 func TestRerequestCheckSuiteUsesExplicitSuiteIdentityAndHostname(t *testing.T) {
 	t.Parallel()

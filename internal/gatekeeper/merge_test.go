@@ -75,8 +75,57 @@ func TestAutoMergesAnEligiblePullRequest(t *testing.T) {
 		t.Fatalf("merge head = %q", fixture.github.merges[0].HeadSHA)
 	}
 	outcomes := mergeOutcomes(t, fixture.repos)
-	if len(outcomes) != 1 || !outcomes[0].Merged || outcomes[0].MergeCommitSHA != "merge-commit-1" || outcomes[0].SourceIssue == nil || outcomes[0].SourceIssue.Number != 118 || len(outcomes[0].TouchedFiles) != 1 || outcomes[0].TouchedFiles[0] != "internal/runtime/auditor.go" {
+	if len(outcomes) != 1 || !outcomes[0].Merged || !outcomes[0].TouchedFilesAvailable || outcomes[0].MergeCommitSHA != "merge-commit-1" || outcomes[0].SourceIssue == nil || outcomes[0].SourceIssue.Number != 118 || len(outcomes[0].TouchedFiles) != 1 || outcomes[0].TouchedFiles[0] != "internal/runtime/auditor.go" {
 		t.Fatalf("outcomes = %+v", outcomes)
+	}
+}
+
+func TestAutoDoesNotRecordQueuedMergeAsCompleted(t *testing.T) {
+	t.Parallel()
+	fixture := newGatekeeperFixture(t)
+	fixture.github.mergeable.MergedAt = ""
+	runner := autoRunner(t, fixture)
+	if _, err := runner.EvaluatePullRequest(context.Background(), EvaluationInput{ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, ExpectedHeadSHA: "head-1"}); err != nil {
+		t.Fatal(err)
+	}
+	outcomes := mergeOutcomes(t, fixture.repos)
+	if len(outcomes) != 1 || outcomes[0].Merged || outcomes[0].Reason != refusalMergePending {
+		t.Fatalf("outcomes = %#v, want incomplete merge refusal", outcomes)
+	}
+}
+
+func TestAutoLeavesRebaseMergeCommitUnavailable(t *testing.T) {
+	t.Parallel()
+	fixture := newGatekeeperFixture(t)
+	fixture.github.mergeable.MergeCommitSHA = "rebased-final-commit"
+	runner := autoRunner(t, fixture)
+	runner.mergeStrategyForProject = func(string) config.ReviewerAutoMergeStrategy { return config.ReviewerAutoMergeStrategyRebase }
+	if _, err := runner.EvaluatePullRequest(context.Background(), EvaluationInput{ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, ExpectedHeadSHA: "head-1"}); err != nil {
+		t.Fatal(err)
+	}
+	outcomes := mergeOutcomes(t, fixture.repos)
+	if len(outcomes) != 1 || !outcomes[0].Merged || outcomes[0].MergeCommitSHA != "" {
+		t.Fatalf("outcomes = %#v, want merged rebase without single-commit revert authority", outcomes)
+	}
+}
+
+func TestAutoBindsSourceIssueFromPostMergeRead(t *testing.T) {
+	t.Parallel()
+	fixture := newGatekeeperFixture(t)
+	fixture.github.detail.ClosingIssues = []githubinfra.IssueReference{{Number: 1, Repo: "acme/looper"}}
+	views := 0
+	fixture.github.beforeView = func(github *fakeGatekeeperGitHub) {
+		views++
+		if views >= 3 {
+			github.detail.ClosingIssues = []githubinfra.IssueReference{{Number: 2, Repo: "acme/looper"}}
+		}
+	}
+	if _, err := autoRunner(t, fixture).EvaluatePullRequest(context.Background(), EvaluationInput{ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, ExpectedHeadSHA: "head-1"}); err != nil {
+		t.Fatal(err)
+	}
+	outcomes := mergeOutcomes(t, fixture.repos)
+	if len(outcomes) != 1 || outcomes[0].SourceIssue == nil || outcomes[0].SourceIssue.Number != 2 {
+		t.Fatalf("outcomes = %#v, want post-merge source issue #2", outcomes)
 	}
 }
 
@@ -104,7 +153,7 @@ func TestAutoRecordsSuccessfulMergeWhenFileEvidenceIsUnavailable(t *testing.T) {
 		t.Fatalf("EvaluatePullRequest() error = %v, want merged outcome retained", err)
 	}
 	outcomes := mergeOutcomes(t, fixture.repos)
-	if len(outcomes) != 1 || !outcomes[0].Merged || len(outcomes[0].TouchedFiles) != 0 {
+	if len(outcomes) != 1 || !outcomes[0].Merged || outcomes[0].TouchedFilesAvailable || len(outcomes[0].TouchedFiles) != 0 {
 		t.Fatalf("outcomes = %#v, want merged outcome without optional file evidence", outcomes)
 	}
 }

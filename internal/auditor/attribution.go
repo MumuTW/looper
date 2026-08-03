@@ -30,15 +30,18 @@ type MergeCandidate struct {
 	SourceIssue            *githubinfra.IssueReference
 	MergedAt               time.Time
 	TouchedFiles           []string
+	TouchedFilesAvailable  bool
 	IntroducedReproduction bool
 }
 
 // FailureEvidence contains only observed failure facts collected before an
 // auditor considers any action.
 type FailureEvidence struct {
-	ObservedAt               time.Time
-	FailingPaths             []string
-	ExistedBeforeAuditWindow bool
+	ObservedAt                  time.Time
+	FailingPaths                []string
+	ExistedBeforeAuditWindow    bool
+	BaselineKnown               bool
+	FailingPathEvidenceComplete bool
 }
 
 type Attribution struct {
@@ -60,6 +63,20 @@ type RankedCandidate struct {
 func Attribute(failure FailureEvidence, candidates []MergeCandidate) Attribution {
 	if failure.ExistedBeforeAuditWindow {
 		return Attribution{Confidence: ConfidenceNone, Reason: "failure_precedes_audit_window"}
+	}
+	if !failure.BaselineKnown {
+		return Attribution{Confidence: ConfidenceNone, Reason: "clean_baseline_unavailable"}
+	}
+	if !failure.FailingPathEvidenceComplete {
+		return Attribution{Confidence: ConfidenceNone, Reason: "failure_path_evidence_incomplete"}
+	}
+	for _, candidate := range candidates {
+		if candidate.MergedAt.After(failure.ObservedAt) {
+			continue
+		}
+		if !candidate.TouchedFilesAvailable {
+			return Attribution{Confidence: ConfidenceNone, Reason: "merge_file_evidence_incomplete"}
+		}
 	}
 	ranked := make([]RankedCandidate, 0, len(candidates))
 	for _, candidate := range candidates {

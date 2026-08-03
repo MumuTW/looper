@@ -61,29 +61,46 @@ func progressAuditorConfirmation(ctx context.Context, repos *storage.Repositorie
 	if len(observation.CheckSuiteIDs) == 0 {
 		return appendAuditorConfirmation(ctx, repos, project.ID, entityType, entityID, observationEvent.ID, headSHA, auditor.ConfirmationResult{Outcome: auditor.ConfirmationInconclusive}, auditor.Decision{Action: auditor.ActionEscalate, Reason: "missing_failed_check_suite_identity"}, now())
 	}
+	checks, err := gateway.ListPullRequestCheckRuns(ctx, githubinfra.PullRequestCheckRunsInput{Repo: repo, Ref: headSHA, CWD: project.RepoPath})
+	if err != nil {
+		return fmt.Errorf("auditor read rerequested check suites: %w", err)
+	}
+	observedAt, observedAtErr := time.Parse(time.RFC3339Nano, observation.ObservedAt)
+	if observedAtErr != nil {
+		return fmt.Errorf("parse auditor observation timestamp: %w", observedAtErr)
+	}
 	for _, suiteID := range observation.CheckSuiteIDs {
 		if _, exists := requests[suiteID]; exists {
 			continue
+		}
+		if requestedAt, ok := auditorObservedRerun(checks, suiteID, observedAt); ok {
+			if err := appendAuditorRerunRequest(ctx, repos, project.ID, entityType, entityID, observationEvent.ID, repo, headSHA, suiteID, requestedAt, observation.FailedChecks, observation.FailingPaths); err != nil {
+				return err
+			}
+			return nil
 		}
 		requestedAt := now().UTC()
 		if err := gateway.RerequestCheckSuite(ctx, githubinfra.RerequestCheckSuiteInput{Repo: repo, CheckSuiteID: suiteID, CWD: project.RepoPath}); err != nil {
 			return fmt.Errorf("auditor rerequest check suite %d: %w", suiteID, err)
 		}
-		if err := appendAuditorRerunRequest(ctx, repos, project.ID, entityType, entityID, observationEvent.ID, repo, headSHA, suiteID, requestedAt); err != nil {
+		if err := appendAuditorRerunRequest(ctx, repos, project.ID, entityType, entityID, observationEvent.ID, repo, headSHA, suiteID, requestedAt, observation.FailedChecks, observation.FailingPaths); err != nil {
 			return err
 		}
 		return nil
 	}
 
-	checks, err := gateway.ListPullRequestCheckRuns(ctx, githubinfra.PullRequestCheckRunsInput{Repo: repo, Ref: headSHA, CWD: project.RepoPath})
-	if err != nil {
-		return fmt.Errorf("auditor read rerequested check suites: %w", err)
-	}
 	rerunCompleted, rerunFailedChecks := completedAuditorRerun(checks, observation.CheckSuiteIDs, requests)
 	if !rerunCompleted {
+		if auditorRerunTimedOut(requests, now(), time.Duration(role.WindowMinutes)*time.Minute) {
+			return appendAuditorConfirmation(ctx, repos, project.ID, entityType, entityID, observationEvent.ID, headSHA, auditor.ConfirmationResult{Outcome: auditor.ConfirmationInconclusive}, auditor.Decision{Action: auditor.ActionEscalate, Reason: "rerun_timeout"}, now())
+		}
 		return nil
 	}
-	confirmation := auditor.ConfirmFailure(auditor.ConfirmationInput{InitialFailedChecks: observation.FailedChecks, RerunCompleted: true, RerunFailedChecks: rerunFailedChecks})
+	rerunPaths, rerunPathsComplete := failedAuditorRerunPaths(ctx, gateway, repo, project.RepoPath, checks, requests)
+	if !observation.FailingPathEvidenceComplete || !rerunPathsComplete {
+		return appendAuditorConfirmation(ctx, repos, project.ID, entityType, entityID, observationEvent.ID, headSHA, auditor.ConfirmationResult{Outcome: auditor.ConfirmationInconclusive}, auditor.Decision{Action: auditor.ActionEscalate, Reason: "failure_path_evidence_incomplete"}, now())
+	}
+	confirmation := auditor.ConfirmFailure(auditor.ConfirmationInput{InitialFailedChecks: observation.FailedChecks, InitialFailedPaths: observation.FailingPaths, RerunCompleted: true, RerunFailedChecks: rerunFailedChecks, RerunFailedPaths: rerunPaths})
 	decision, err := auditorConfirmationDecision(ctx, repos.Events, project.ID, repo, observation, confirmation, role.WindowMinutes)
 	if err != nil {
 		return err
@@ -151,8 +168,14 @@ func completedAuditorRerun(checks githubinfra.PullRequestCheckRuns, suiteIDs []i
 			continue
 		}
 		requestedAt, requested := requests[check.CheckSuiteID]
-		if !requested || !checkRunStartedAfter(check, requestedAt) {
+		if !requested {
 			continue
+		}
+		if !checkRunStartedAfter(check, requestedAt) {
+			if strings.EqualFold(strings.TrimSpace(check.Status), "completed") {
+				continue
+			}
+			return false, nil
 		}
 		if !strings.EqualFold(strings.TrimSpace(check.Status), "completed") {
 			return false, nil
@@ -160,6 +183,11 @@ func completedAuditorRerun(checks githubinfra.PullRequestCheckRuns, suiteIDs []i
 		seen[check.CheckSuiteID] = true
 		if isFailedCheckState(check.Status, check.Conclusion) {
 			failed[strings.TrimSpace(check.Name)] = struct{}{}
+		}
+	}
+	for _, status := range checks.Statuses {
+		if strings.EqualFold(strings.TrimSpace(status.State), "failure") || strings.EqualFold(strings.TrimSpace(status.State), "error") {
+			return false, nil
 		}
 	}
 	for suiteID := range wanted {
@@ -175,6 +203,52 @@ func completedAuditorRerun(checks githubinfra.PullRequestCheckRuns, suiteIDs []i
 	}
 	sort.Strings(result)
 	return true, result
+}
+
+func auditorObservedRerun(checks githubinfra.PullRequestCheckRuns, suiteID int64, observedAt time.Time) (time.Time, bool) {
+	var latest time.Time
+	for _, check := range checks.CheckRuns {
+		if check.CheckSuiteID != suiteID {
+			continue
+		}
+		if startedAt, err := time.Parse(time.RFC3339Nano, check.StartedAt); err == nil {
+			if !startedAt.Before(observedAt) && startedAt.After(latest) {
+				latest = startedAt
+			}
+			continue
+		}
+		// Some provider projections omit StartedAt. In that case completion is
+		// the only post-observation evidence available; never use a completion
+		// timestamp when a pre-observation start is known.
+		if completedAt, err := time.Parse(time.RFC3339Nano, check.CompletedAt); err == nil && !completedAt.Before(observedAt) && completedAt.After(latest) {
+			latest = completedAt
+		}
+	}
+	return latest, !latest.IsZero()
+}
+
+func auditorRerunTimedOut(requests map[int64]time.Time, now time.Time, timeout time.Duration) bool {
+	if len(requests) == 0 || timeout <= 0 {
+		return false
+	}
+	for _, requestedAt := range requests {
+		if now.Sub(requestedAt) < timeout {
+			return false
+		}
+	}
+	return true
+}
+
+func failedAuditorRerunPaths(ctx context.Context, gateway auditorGateway, repo, cwd string, checks githubinfra.PullRequestCheckRuns, requests map[int64]time.Time) ([]string, bool) {
+	filtered := checks
+	filtered.CheckRuns = make([]githubinfra.PullRequestCheckRun, 0, len(checks.CheckRuns))
+	for _, check := range checks.CheckRuns {
+		requestedAt, ok := requests[check.CheckSuiteID]
+		if ok && checkRunStartedAfter(check, requestedAt) {
+			filtered.CheckRuns = append(filtered.CheckRuns, check)
+		}
+	}
+	return failedAuditorCheckPaths(ctx, gateway, repo, cwd, filtered)
 }
 
 func checkRunStartedAfter(check githubinfra.PullRequestCheckRun, requestedAt time.Time) bool {
@@ -204,19 +278,28 @@ func auditorConfirmationDecision(ctx context.Context, events *storage.EventsRepo
 		return auditor.Decision{}, err
 	}
 	projectCandidates := make([]auditor.MergeCandidate, 0, len(candidates))
+	observedCandidates := make(map[int64]struct{}, len(observation.CandidatePRs))
+	for _, prNumber := range observation.CandidatePRs {
+		if prNumber > 0 {
+			observedCandidates[prNumber] = struct{}{}
+		}
+	}
 	for _, candidate := range candidates {
 		if candidate.ProjectID == projectID && strings.EqualFold(candidate.Repo, repo) {
+			if _, observed := observedCandidates[candidate.PRNumber]; !observed {
+				continue
+			}
 			projectCandidates = append(projectCandidates, candidate)
 		}
 	}
-	attribution := auditor.Attribute(auditor.FailureEvidence{ObservedAt: observedAt, FailingPaths: observation.FailingPaths}, projectCandidates)
+	attribution := auditor.Attribute(auditor.FailureEvidence{ObservedAt: observedAt, FailingPaths: observation.FailingPaths, BaselineKnown: observation.BaselineKnown, FailingPathEvidenceComplete: observation.FailingPathEvidenceComplete}, projectCandidates)
 	return auditor.Decide(confirmation, attribution), nil
 }
 
-func appendAuditorRerunRequest(ctx context.Context, repos *storage.Repositories, projectID, entityType, entityID, observationEventID, repo, headSHA string, suiteID int64, requestedAt time.Time) error {
+func appendAuditorRerunRequest(ctx context.Context, repos *storage.Repositories, projectID, entityType, entityID, observationEventID, repo, headSHA string, suiteID int64, requestedAt time.Time, initialFailedChecks, initialFailedPaths []string) error {
 	return eventlog.Append(ctx, repos, eventlog.AppendInput{
 		EventType: auditor.RerunRequestedEventType, ProjectID: &projectID, EntityType: &entityType, EntityID: &entityID, CausationID: &observationEventID,
-		Payload: auditor.RerunRequest{Version: 1, ObservationEventID: observationEventID, Repo: repo, HeadSHA: headSHA, CheckSuiteID: suiteID, RequestedAt: eventlog.FormatJavaScriptISOString(requestedAt)}, CreatedAt: requestedAt,
+		Payload: auditor.RerunRequest{Version: 1, ObservationEventID: observationEventID, Repo: repo, HeadSHA: headSHA, CheckSuiteID: suiteID, InitialFailedChecks: append([]string(nil), initialFailedChecks...), InitialFailedPaths: append([]string(nil), initialFailedPaths...), RequestedAt: eventlog.FormatJavaScriptISOString(requestedAt)}, CreatedAt: requestedAt,
 	})
 }
 

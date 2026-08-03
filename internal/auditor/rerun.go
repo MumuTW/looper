@@ -11,12 +11,14 @@ const RerunRequestedEventType = "post_merge_audit.rerun_requested"
 const ConfirmationEventType = "post_merge_audit.confirmation"
 
 type RerunRequest struct {
-	Version            int    `json:"version"`
-	ObservationEventID string `json:"observationEventId"`
-	Repo               string `json:"repo"`
-	HeadSHA            string `json:"headSha"`
-	CheckSuiteID       int64  `json:"checkSuiteId"`
-	RequestedAt        string `json:"requestedAt"`
+	Version             int      `json:"version"`
+	ObservationEventID  string   `json:"observationEventId"`
+	Repo                string   `json:"repo"`
+	HeadSHA             string   `json:"headSha"`
+	CheckSuiteID        int64    `json:"checkSuiteId"`
+	InitialFailedChecks []string `json:"initialFailedChecks,omitempty"`
+	InitialFailedPaths  []string `json:"initialFailedPaths,omitempty"`
+	RequestedAt         string   `json:"requestedAt"`
 }
 
 type ConfirmationRecord struct {

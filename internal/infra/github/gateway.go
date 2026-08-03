@@ -188,9 +188,9 @@ type PullRequestDiffStats struct {
 // IssueReference is GitHub's explicit pull-request-to-issue relationship.
 // It is deliberately not derived from PR title or body text.
 type IssueReference struct {
-	Number int64
-	Repo   string
-	URL    string
+	Number int64  `json:"number"`
+	Repo   string `json:"repo"`
+	URL    string `json:"url"`
 }
 type PullRequestAutoMerge struct {
 	EnabledBy   string
@@ -221,7 +221,8 @@ type PullRequestStatus struct {
 }
 
 type CheckRunAnnotation struct {
-	Path string
+	Path  string
+	Level string
 }
 
 type CommentInfo struct {
@@ -1816,7 +1817,14 @@ func (g *Gateway) ViewPullRequestForReviewer(ctx context.Context, input ViewPull
 func (g *Gateway) ViewPullRequestForGatekeeper(ctx context.Context, input ViewPullRequestInput) (PullRequestDetail, error) {
 	// Gate decisions must bypass the per-tick discovery snapshot: this method
 	// is the fresh provider read that binds a report to the current head.
-	return g.viewPullRequestWithFields(ctx, input, prViewGatekeeperJSONFields, false, false)
+	detail, err := g.viewPullRequestWithFields(ctx, input, prViewGatekeeperJSONFields, false, false)
+	if err == nil {
+		return detail, nil
+	}
+	// closingIssuesReferences is provenance enrichment, not merge authority.
+	// Older GitHub Enterprise APIs may reject the optional field; retry the
+	// authoritative gate read without it rather than blocking every evaluation.
+	return g.viewPullRequestWithFields(ctx, input, withoutJSONField(prViewGatekeeperJSONFields, "closingIssuesReferences"), false, false)
 }
 
 func (g *Gateway) viewPullRequestWithFields(ctx context.Context, input ViewPullRequestInput, fields []string, includeReviewThreads bool, includeIssueComments bool) (PullRequestDetail, error) {
@@ -1955,7 +1963,8 @@ func extractIssueReferences(value any) []IssueReference {
 	for _, issue := range toObjectSlice(value) {
 		owner := nestedString(issue, "repository", "owner", "login")
 		name := nestedString(issue, "repository", "name")
-		repo := strings.Trim(strings.TrimSpace(owner)+"/"+strings.TrimSpace(name), "/")
+		nameWithOwner := strings.Trim(strings.TrimSpace(owner)+"/"+strings.TrimSpace(name), "/")
+		repo := hostQualifiedRepo(nameWithOwner, asString(issue["url"]))
 		if number := asInt64(issue["number"]); number > 0 && repo != "" {
 			references = append(references, IssueReference{Number: number, Repo: repo, URL: asString(issue["url"])})
 		}
@@ -2039,7 +2048,7 @@ func (g *Gateway) ListCheckRunAnnotations(ctx context.Context, input CheckRunAnn
 	annotations := make([]CheckRunAnnotation, 0, len(rows))
 	for _, row := range rows {
 		if path := strings.TrimSpace(asString(row["path"])); path != "" {
-			annotations = append(annotations, CheckRunAnnotation{Path: path})
+			annotations = append(annotations, CheckRunAnnotation{Path: path, Level: strings.ToLower(strings.TrimSpace(asString(row["level"])))})
 		}
 	}
 	return annotations, nil

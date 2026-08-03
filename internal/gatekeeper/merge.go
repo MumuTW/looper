@@ -19,6 +19,11 @@ type MergeOutcome struct {
 	// after a successful merge. Auditor may use it as attribution evidence; it
 	// is not merge authority and therefore a read failure never undoes a merge.
 	TouchedFiles []string `json:"touchedFiles,omitempty"`
+	// TouchedFilesAvailable records whether TouchedFiles was read successfully.
+	// An empty list is otherwise ambiguous: a pull request with no files is not
+	// expected, but a failed optional read must not look like authoritative
+	// evidence that the merge touched nothing.
+	TouchedFilesAvailable bool `json:"touchedFilesAvailable"`
 	// MergeCommitSHA is the default-branch commit GitHub created for the merge.
 	// It is distinct from the PR head for squash/rebase merges and is the only
 	// commit an Auditor may later revert.
@@ -40,6 +45,7 @@ const (
 	refusalHeadMoved     = "head_moved_between_evaluations"
 	refusalNoLongerClean = "gates_no_longer_pass"
 	refusalMergeFailed   = "forge_refused_the_merge"
+	refusalMergePending  = "merge_not_completed"
 )
 
 // confirmAndMerge re-runs the full evaluation and merges only if it still passes
@@ -85,11 +91,11 @@ func (r *Runner) confirmAndMerge(ctx context.Context, input EvaluationInput, rep
 	if outcome.Reason != "" {
 		return r.persistMergeOutcome(ctx, outcome)
 	}
-	outcome.SourceIssue = sameRepositorySourceIssue(confirmation.Evidence.ClosingIssues, report.Repo)
+	strategy := r.mergeStrategy(report.ProjectID)
 
 	if err := r.github.MergePullRequest(ctx, githubinfra.EnableAutoMergeInput{
 		Repo: report.Repo, PRNumber: report.PRNumber,
-		Strategy: r.mergeStrategy(report.ProjectID), HeadSHA: outcome.HeadSHA,
+		Strategy: strategy, HeadSHA: outcome.HeadSHA,
 		CWD: r.projectCWD(ctx, report.ProjectID),
 	}); err != nil {
 		// The forge has its own view — branch protection, a race with another
@@ -106,14 +112,27 @@ func (r *Runner) confirmAndMerge(ctx context.Context, input EvaluationInput, rep
 		return nil
 	}
 
-	outcome.Merged = true
 	mergedDetail, detailErr := r.github.ViewPullRequestMergeWatch(ctx, githubinfra.ViewPullRequestInput{Repo: report.Repo, PRNumber: report.PRNumber, CWD: r.projectCWD(ctx, report.ProjectID)})
-	if detailErr != nil {
-		if r.logWarn != nil {
-			r.logWarn("gatekeeper: could not capture merged commit identity", map[string]any{"repo": report.Repo, "pr": report.PRNumber, "error": detailErr.Error()})
+	if detailErr != nil || strings.TrimSpace(mergedDetail.MergedAt) == "" {
+		outcome.Reason = refusalMergePending
+		if detailErr != nil && r.logWarn != nil {
+			r.logWarn("gatekeeper: merge request accepted but completion was not observable", map[string]any{"repo": report.Repo, "pr": report.PRNumber, "error": detailErr.Error()})
 		}
-	} else {
+		if recordErr := r.persistMergeOutcome(ctx, outcome); recordErr != nil {
+			return recordErr
+		}
+		return nil
+	}
+	outcome.Merged = true
+	if strategy != config.ReviewerAutoMergeStrategyRebase {
 		outcome.MergeCommitSHA = strings.TrimSpace(mergedDetail.MergeCommitSHA)
+	}
+	// Read the closing relationship after completion. The merge-watch response
+	// is the authority that proves the merge; this second read only enriches the
+	// durable outcome and is safe to leave empty when the optional relationship
+	// is unavailable on an Enterprise API.
+	if sourceDetail, sourceErr := r.github.ViewPullRequestForGatekeeper(ctx, githubinfra.ViewPullRequestInput{Repo: report.Repo, PRNumber: report.PRNumber, CWD: r.projectCWD(ctx, report.ProjectID)}); sourceErr == nil && strings.TrimSpace(sourceDetail.HeadSHA) == outcome.HeadSHA {
+		outcome.SourceIssue = sameRepositorySourceIssue(sourceDetail.ClosingIssues, report.Repo)
 	}
 	files, filesErr := r.github.ListPullRequestFiles(ctx, githubinfra.ViewPullRequestInput{Repo: report.Repo, PRNumber: report.PRNumber, CWD: r.projectCWD(ctx, report.ProjectID)})
 	if filesErr != nil {
@@ -122,6 +141,7 @@ func (r *Runner) confirmAndMerge(ctx context.Context, input EvaluationInput, rep
 		}
 	} else {
 		outcome.TouchedFiles = files
+		outcome.TouchedFilesAvailable = true
 	}
 	return r.persistMergeOutcome(ctx, outcome)
 }
