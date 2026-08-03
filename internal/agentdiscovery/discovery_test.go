@@ -62,6 +62,10 @@ func TestHermesSuggestionNeverOverridesExplicitAgentAuthority(t *testing.T) {
 	}{
 		{name: "global vendor", configure: func(cfg *config.Config) { cfg.Agent.Vendor = &vendor }},
 		{name: "global model", configure: func(cfg *config.Config) { cfg.Agent.Model = &model }},
+		{name: "global reasoning effort", configure: func(cfg *config.Config) {
+			effort := config.ReasoningEffortHigh
+			cfg.Agent.ReasoningEffort = &effort
+		}},
 		{name: "global params", configure: func(cfg *config.Config) { cfg.Agent.Params = map[string]any{"args": []any{"--provider", "openrouter"}} }},
 		{name: "global env", configure: func(cfg *config.Config) { cfg.Agent.Env = map[string]string{"OPENAI_API_KEY": "secret"} }},
 		{name: "profile", configure: func(cfg *config.Config) {

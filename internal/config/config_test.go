@@ -90,6 +90,15 @@ reasoningEffort = " LoW "
 	assertResolvedEffort(CodingRolePlanner, ReasoningEffortHigh)
 	assertResolvedEffort(CodingRoleReviewer, ReasoningEffortVeryHigh)
 	assertResolvedEffort(CodingRoleFixer, ReasoningEffortLow)
+	if loaded.Config.Agent.ReasoningEffort == nil || *loaded.Config.Agent.ReasoningEffort != ReasoningEffortHigh {
+		t.Fatalf("global normalized effort = %v, want %q", loaded.Config.Agent.ReasoningEffort, ReasoningEffortHigh)
+	}
+	if got := loaded.Config.Agent.Profiles["performance"].ReasoningEffort; got == nil || *got != ReasoningEffortVeryHigh {
+		t.Fatalf("profile normalized effort = %v, want %q", got, ReasoningEffortVeryHigh)
+	}
+	if got := loaded.Config.Roles.Coding["fixer"].Agent.ReasoningEffort; got == nil || *got != ReasoningEffortLow {
+		t.Fatalf("role normalized effort = %v, want %q", got, ReasoningEffortLow)
+	}
 }
 
 func TestLoadFileAcceptsIgnoredDeprecatedPackageAutoUpgradeEnabledAcrossFormats(t *testing.T) {

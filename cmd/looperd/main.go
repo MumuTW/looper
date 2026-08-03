@@ -524,10 +524,13 @@ func takeoverLoop(ctx context.Context, services looperdruntime.Services, loopID,
 		if run != nil && run.AgentSnapshotJSON != nil && strings.TrimSpace(*run.AgentSnapshotJSON) != "" {
 			snapshot, err := config.ParseAgentSnapshot(*run.AgentSnapshotJSON)
 			if err != nil {
-				releaseLocks()
-				return result, fmt.Errorf("parse agent run snapshot before takeover: %w", err)
+				// Snapshot effort is optional handback metadata. A malformed
+				// snapshot must not strand an operator with a live session: the
+				// captured execution identity is still sufficient to park the loop.
+				result.ReasoningEffort = nil
+			} else {
+				result.ReasoningEffort = snapshot.ReasoningEffort
 			}
-			result.ReasoningEffort = snapshot.ReasoningEffort
 		}
 	}
 	// Establish the durable takeover fence before cancelling an agent. A stopped

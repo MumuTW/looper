@@ -608,8 +608,7 @@ func mergeAgentConfig(config *AgentConfig, partial PartialAgentConfig) {
 		config.Model = stringPtr(*partial.Model)
 	}
 	if partial.ReasoningEffort != nil {
-		effort := *partial.ReasoningEffort
-		config.ReasoningEffort = &effort
+		config.ReasoningEffort = normalizeReasoningEffortPtr(partial.ReasoningEffort)
 	}
 
 	if partial.Profiles != nil {
@@ -651,8 +650,7 @@ func mergeAgentProfiles(base map[string]AgentBindingConfig, override map[string]
 			existing.Model = stringPtr(*binding.Model)
 		}
 		if binding.ReasoningEffort != nil {
-			effort := *binding.ReasoningEffort
-			existing.ReasoningEffort = &effort
+			existing.ReasoningEffort = normalizeReasoningEffortPtr(binding.ReasoningEffort)
 		}
 		merged[id] = existing
 	}
@@ -696,8 +694,7 @@ func mergeRoleAgentConfig(config **RoleAgentConfig, partial *RoleAgentConfig) {
 		(*config).Model = stringPtr(*partial.Model)
 	}
 	if partial.ReasoningEffort != nil {
-		effort := *partial.ReasoningEffort
-		(*config).ReasoningEffort = &effort
+		(*config).ReasoningEffort = normalizeReasoningEffortPtr(partial.ReasoningEffort)
 	}
 	if isEmptyRoleAgentConfig(*config) {
 		*config = nil
@@ -763,6 +760,18 @@ func cloneReasoningEffortPtr(effort *ReasoningEffort) *ReasoningEffort {
 	}
 	cloned := *effort
 	return &cloned
+}
+
+func normalizeReasoningEffortPtr(effort *ReasoningEffort) *ReasoningEffort {
+	if effort == nil {
+		return nil
+	}
+	if canonical, ok := ParseReasoningEffort(string(*effort)); ok {
+		return &canonical
+	}
+	// Preserve invalid values so validation can report the authored path rather
+	// than silently dropping a configuration error during normalization.
+	return cloneReasoningEffortPtr(effort)
 }
 
 func mergeAgentTimeoutConfig(config *AgentTimeoutConfig, partial PartialAgentTimeoutConfig) {

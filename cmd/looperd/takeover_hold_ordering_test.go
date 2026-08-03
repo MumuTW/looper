@@ -104,6 +104,25 @@ func TestTakeoverLoopReturnsPersistedReasoningEffort(t *testing.T) {
 	}
 }
 
+func TestTakeoverLoopSurvivesMalformedReasoningSnapshot(t *testing.T) {
+	ctx := context.Background()
+	f := newTakeoverFixture(t)
+	malformed := `{"vendor":"codex","reasoningEffort":`
+	// Run snapshots are insert-only in production; mutate the fixture row
+	// directly to exercise recovery from a legacy/corrupt persisted payload.
+	if _, err := f.services.Coordinator.DB().ExecContext(ctx, "UPDATE runs SET agent_snapshot_json = ? WHERE id = ?", malformed, "run_1"); err != nil {
+		t.Fatalf("malformed snapshot fixture update error = %v", err)
+	}
+
+	result, err := takeoverLoop(ctx, f.services, f.loopID, "Taken over by test", func() time.Time { return f.now }, func(int, syscall.Signal) error { return nil }, nil)
+	if err != nil {
+		t.Fatalf("takeoverLoop() error = %v, want malformed optional snapshot to degrade gracefully", err)
+	}
+	if result.ReasoningEffort != nil {
+		t.Fatalf("ReasoningEffort = %v, want omitted for malformed snapshot", result.ReasoningEffort)
+	}
+}
+
 func TestTakeoverLoopCorrelatesReasoningEffortWithSelectedExecutionRun(t *testing.T) {
 	ctx := context.Background()
 	f := newTakeoverFixture(t)
