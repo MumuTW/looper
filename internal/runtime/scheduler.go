@@ -2075,6 +2075,9 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			DiffBudgetForProject: func(projectID string) config.GatekeeperDiffBudget {
 				return gatekeeperDiffBudgetForProject(cfg, projectID)
 			},
+			RequiredReviewChangedLinesForProject: func(projectID string) int {
+				return gatekeeperRequiredReviewChangedLinesForProject(cfg, projectID)
+			},
 			LogWarn: func(msg string, fields map[string]any) {
 				if logger != nil {
 					logger.Warn(msg, fields)

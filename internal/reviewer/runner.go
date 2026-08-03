@@ -233,6 +233,7 @@ type ReviewMarkerResult struct {
 	Outcome             string
 	Event               ReviewEvent
 	AuthorLogin         string
+	ReviewID            string
 	Body                string
 	InlineCommentBodies []string
 }
@@ -2676,6 +2677,12 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 	}
 	r.appendReviewerAgentEvent(ctx, input, reviewerAgentTerminalEvent(result), "review", executionID, reviewerAgentResultPayload(result, r.now().Sub(agentStartedAt)))
 	r.logInfo("reviewer agent completed", map[string]any{"projectId": input.Project.ID, "loopId": input.Loop.ID, "runId": input.Run.ID, "repo": input.Repo, "prNumber": input.PRNumber, "phase": "review", "executionId": executionID, "status": result.Status, "timeoutType": result.TimeoutType, "elapsedSeconds": elapsedSeconds(result, r.now().Sub(agentStartedAt)), "parseStatus": result.ParseStatus})
+	if refusal, ok := reviewCapacityRefusal(result); ok {
+		if evidenceErr := r.appendReviewEvidence(ctx, input, "pr.review.refused", map[string]any{"repo": input.Repo, "prNumber": input.PRNumber, "headSha": checkpoint.Snapshot.HeadSHA, "reason": refusal.reason, "message": refusal.message, "executionId": executionID}); evidenceErr != nil {
+			return checkpoint, &runpipe.LoopError{Message: fmt.Sprintf("record review refusal evidence: %v", evidenceErr), Kind: runpipe.FailureRetryableTransient}
+		}
+		return checkpoint, &runpipe.LoopError{Message: refusal.message, Kind: runpipe.FailureRetryableTransient}
+	}
 	if result.Status != "completed" {
 		if reason, ok := r.detectHeadChangeRequired(ctx, input, checkpoint); ok {
 			return markReviewerRunStale(checkpoint, reason), nil
@@ -2804,7 +2811,7 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 		if criteriaResult, err := r.maybePublishCriteriaAnchoredCleanReview(ctx, input, checkpoint, pending, detail); err != nil {
 			return checkpoint, err
 		} else if criteriaResult != nil {
-			if err := r.recordPublishedReviewAndConvergence(ctx, input, pending, criteriaResult.reviewEvent, detail, !criteriaResult.recordOnly); err != nil {
+			if err := r.recordPublishedReviewProgress(ctx, input, pending, criteriaResult.reviewEvent, criteriaResult.marker, !criteriaResult.recordOnly); err != nil {
 				return checkpoint, err
 			}
 			return checkpoint, nil
@@ -2830,7 +2837,7 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 			if err := r.applyVerifiedReviewSideEffects(ctx, input, checkpoint, detail, found); err != nil {
 				return checkpoint, err
 			}
-			if err := r.recordPublishedReviewAndConvergence(ctx, input, pending, pendingReviewEvent(pending), detail, true); err != nil {
+			if err := r.recordPublishedReviewProgress(ctx, input, pending, pendingReviewEvent(pending), found, true); err != nil {
 				return checkpoint, err
 			}
 			return checkpoint, nil
@@ -2838,13 +2845,7 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 		if err := r.applyCleanNoopReviewSideEffects(ctx, input, checkpoint, detail); err != nil {
 			return checkpoint, err
 		}
-		// The COMMENT clean-noop path is the configured clean signal: the prompt
-		// tells the agent not to submit a structured review, and the runner
-		// reconciles the +1 reaction after validating that no marker was required
-		// for this policy. Recording markerVerified=true publishes evidence
-		// Gatekeeper accepts and marks the head as published so discovery does not
-		// re-run the same markerless path indefinitely.
-		if err := r.recordPublishedReviewAndConvergence(ctx, input, pending, ReviewEventComment, detail, true); err != nil {
+		if err := r.recordPublishedReviewProgress(ctx, input, pending, ReviewEventComment, ReviewMarkerResult{}, true); err != nil {
 			return checkpoint, err
 		}
 		return checkpoint, nil
@@ -2952,7 +2953,7 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 	if err := r.applyVerifiedReviewSideEffects(ctx, input, checkpoint, detail, markerResult); err != nil {
 		return checkpoint, err
 	}
-	if err := r.recordPublishedReviewAndConvergence(ctx, input, pending, pendingReviewEvent(pending), detail, true); err != nil {
+	if err := r.recordPublishedReviewProgress(ctx, input, pending, pendingReviewEvent(pending), markerResult, true); err != nil {
 		return checkpoint, err
 	}
 	return checkpoint, nil
@@ -3745,6 +3746,36 @@ func reviewCompletionOutcome(result AgentResult) string {
 	return outcome
 }
 
+type reviewRefusal struct {
+	reason  string
+	message string
+}
+
+// reviewCapacityRefusal accepts only the reviewer's documented structured
+// failure result. A prose rate-limit notice is not evidence: it can be stale,
+// quoted, or emitted by an unrelated tool, so it remains an ordinary retryable
+// failure rather than being misrecorded as a review refusal.
+func reviewCapacityRefusal(result AgentResult) (reviewRefusal, bool) {
+	raw := result.Stdout
+	if strings.TrimSpace(result.Stderr) != "" {
+		raw += "\n" + result.Stderr
+	}
+	payloads := agent.CompletionMarkerPayloads(raw)
+	if len(payloads) == 0 {
+		return reviewRefusal{}, false
+	}
+	var parsed struct {
+		Type    string `json:"type"`
+		Summary string `json:"summary"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal([]byte(payloads[0]), &parsed); err != nil || !strings.EqualFold(strings.TrimSpace(parsed.Type), "rate_limit") {
+		return reviewRefusal{}, false
+	}
+	message := firstNonEmpty(strings.TrimSpace(parsed.Message), strings.TrimSpace(parsed.Summary), "Reviewer capacity is rate limited")
+	return reviewRefusal{reason: "rate_limit", message: message}, true
+}
+
 func cleanApprovedReviewMarker(found ReviewMarkerResult) bool {
 	return found.Found && found.Event == ReviewEventApprove && strings.EqualFold(strings.TrimSpace(found.Outcome), "clean") && len(found.InlineCommentBodies) == 0
 }
@@ -3871,23 +3902,22 @@ func isValidBlockingReviewEvent(value string) bool {
 	}
 }
 
-func (r *Runner) recordPublishedReviewProgress(ctx context.Context, input stepInput, pending pendingReviewCheckpoint, reviewEvent ReviewEvent, markerVerified bool) error {
-	// The pr.review.posted event is the sole authority Gatekeeper accepts for
-	// the current-head review gate, so it must be durable before the head is
-	// marked as published. Appending first and propagating the error ensures
-	// that a failed write leaves lastPublishedHeadSha unset: the next run
-	// retries the publish step, which finds the already-posted review marker
-	// and re-emits the event rather than silently stranding the head.
-	if err := r.appendEventChecked(ctx, eventInput{eventType: "pr.review.posted", projectID: input.Project.ID, loopID: input.Loop.ID, runID: input.Run.ID, entityType: "pull_request", entityID: fmt.Sprintf("%s#%d", input.Repo, input.PRNumber), payload: map[string]any{"repo": input.Repo, "prNumber": input.PRNumber, "event": string(reviewEvent), "headSha": pending.HeadSHA, "markerVerified": markerVerified}}); err != nil {
+func (r *Runner) recordPublishedReviewProgress(ctx context.Context, input stepInput, pending pendingReviewCheckpoint, reviewEvent ReviewEvent, marker ReviewMarkerResult, markerVerified bool) error {
+	// The pr.review.posted event is the authority Gatekeeper uses for the
+	// current-head review projection. It is written before advancing the loop
+	// checkpoint so a failed local append leaves the publish step retryable.
+	if err := r.appendEventChecked(ctx, eventInput{
+		eventType: "pr.review.posted", projectID: input.Project.ID, loopID: input.Loop.ID, runID: input.Run.ID,
+		entityType: "pull_request", entityID: fmt.Sprintf("%s#%d", input.Repo, input.PRNumber),
+		payload: map[string]any{"repo": input.Repo, "prNumber": input.PRNumber, "event": string(reviewEvent), "headSha": pending.HeadSHA, "markerVerified": markerVerified},
+	}); err != nil {
 		return fmt.Errorf("record published review progress: append pr.review.posted: %w", err)
 	}
-	// A markerless event (markerVerified=false) records that the Reviewer
-	// processed the head without publishing a verified clean signal. Gatekeeper
-	// rejects it, so lastPublishedHeadSha must not be set: otherwise discovery
-	// would skip the unchanged head and the head would be stranded. The COMMENT
-	// clean-noop path now records markerVerified=true because the runner has
-	// validated the configured clean signal (+1 reaction), so it sets
-	// lastPublishedHeadSha and the head is not re-run indefinitely.
+	if markerVerified && marker.Found {
+		if err := r.appendReviewEvidence(ctx, input, "pr.review.completed", map[string]any{"repo": input.Repo, "prNumber": input.PRNumber, "headSha": pending.HeadSHA, "outcome": marker.Outcome, "event": string(marker.Event), "reviewerLogin": marker.AuthorLogin, "reviewId": marker.ReviewID}); err != nil {
+			return fmt.Errorf("record completed review evidence: %w", err)
+		}
+	}
 	metadata := map[string]any{"lastReviewEvent": string(reviewEvent), "lastReviewSummary": pending.Summary, "lastPublishedAt": r.nowISO()}
 	if markerVerified {
 		metadata["lastPublishedHeadSha"] = pending.HeadSHA
@@ -3911,6 +3941,54 @@ func (r *Runner) recordPublishedReviewProgress(ctx context.Context, input stepIn
 		return fmt.Errorf("record published review progress: %w", mergeErr)
 	}
 	return nil
+}
+
+// appendReviewEvidence is intentionally a durable event write rather than a
+// best-effort activity log. If it fails, the reviewer does not advance its
+// publish checkpoint; a retry re-verifies the same GitHub marker instead of
+// making an externally published review disappear from the audit trail.
+func (r *Runner) appendReviewEvidence(ctx context.Context, input stepInput, eventType string, payload map[string]any) error {
+	if r.repos == nil || r.repos.Events == nil {
+		return fmt.Errorf("review evidence event repository is not configured")
+	}
+	headSHA, _ := payload["headSha"].(string)
+	reviewID, _ := payload["reviewId"].(string)
+	reason, _ := payload["reason"].(string)
+	eventID := stableReviewEvidenceID(eventType, input.Repo, input.PRNumber, headSHA, reviewID, reason)
+	entityID := fmt.Sprintf("%s#%d", input.Repo, input.PRNumber)
+	existing, err := r.repos.Events.ListByEntityAndEventTypes(ctx, "pull_request", entityID, []string{eventType})
+	if err != nil {
+		return err
+	}
+	for _, event := range existing {
+		if event.ID == eventID {
+			return nil
+		}
+	}
+	err = eventlog.Append(ctx, r.repos, eventlog.AppendInput{
+		ID: eventID, EventType: eventType, ProjectID: runpipe.OptionalString(input.Project.ID), LoopID: runpipe.OptionalString(input.Loop.ID), RunID: runpipe.OptionalString(input.Run.ID),
+		EntityType: runpipe.OptionalString("pull_request"), EntityID: runpipe.OptionalString(fmt.Sprintf("%s#%d", input.Repo, input.PRNumber)),
+		ActorType: runpipe.OptionalString("system"), ActorID: runpipe.OptionalString("reviewer-loop"), ActorDisplayName: runpipe.OptionalString("reviewer-loop"),
+		Payload: payload, CreatedAt: r.now(),
+	})
+	if err == nil {
+		return nil
+	}
+	// A concurrent retry may have inserted the deterministic row first.
+	if events, lookupErr := r.repos.Events.ListByEntityAndEventTypes(ctx, "pull_request", entityID, []string{eventType}); lookupErr == nil {
+		for _, event := range events {
+			if event.ID == eventID {
+				return nil
+			}
+		}
+	}
+	return err
+}
+
+func stableReviewEvidenceID(eventType, repo string, prNumber int64, headSHA, reviewID, reason string) string {
+	identity := fmt.Sprintf("%s\x00%s\x00%d\x00%s\x00%s\x00%s", eventType, strings.TrimSpace(repo), prNumber, strings.TrimSpace(headSHA), strings.TrimSpace(reviewID), strings.TrimSpace(reason))
+	digest := sha256.Sum256([]byte(identity))
+	return fmt.Sprintf("%s:%x", eventType, digest[:])
 }
 
 type eventInput struct {

@@ -272,6 +272,7 @@ func validateCoreConfig(config Config, issues *[]ValidationIssue) {
 	validateHITLConfig(config.HITL, issues)
 	validateTriagerRoleConfig(config.Roles.Triager, "roles.triager", issues)
 	validateGatekeeperRoleConfig(config.Roles.Gatekeeper, "roles.gatekeeper", config.Roles.Reviewer.AutoMerge.Enabled, issues)
+	validateGatekeeperReviewEventCompatibility(config, issues)
 	validateAuditorRoleConfig(config.Roles.Auditor, "roles.auditor", issues)
 	validateAuditorGatekeeperCompatibility(config, issues)
 	validatePostMergeDigestGatekeeperCompatibility(config, issues)
@@ -304,21 +305,17 @@ func validateCoreConfig(config Config, issues *[]ValidationIssue) {
 		validateAuditorRoleConfig(role, fmt.Sprintf("projects[%d].roles.auditor", i), issues)
 	}
 	for i, project := range config.Projects {
-		if project.Roles == nil || project.Roles.Gatekeeper == nil || (project.Roles.Gatekeeper.Trust == nil && project.Roles.Gatekeeper.DiffBudget == nil) {
+		if project.Roles == nil || project.Roles.Gatekeeper == nil {
 			continue
 		}
+		roles := ProjectRoleConfigs(config, project.ID)
 		reviewerAutoMerge := config.Roles.Reviewer.AutoMerge.Enabled
 		if project.Roles.Reviewer != nil && project.Roles.Reviewer.AutoMerge != nil && project.Roles.Reviewer.AutoMerge.Enabled != nil {
 			reviewerAutoMerge = *project.Roles.Reviewer.AutoMerge.Enabled
 		}
-		if project.Roles.Gatekeeper.Trust != nil {
-			validateGatekeeperRoleConfig(
-				GatekeeperRoleConfig{Trust: *project.Roles.Gatekeeper.Trust},
-				fmt.Sprintf("projects[%d].roles.gatekeeper", i), reviewerAutoMerge, issues)
-		}
-		validatePartialGatekeeperDiffBudget(
-			project.Roles.Gatekeeper.DiffBudget,
-			fmt.Sprintf("projects[%d].roles.gatekeeper.diffBudget", i), issues)
+		validateGatekeeperRoleConfig(
+			roles.Gatekeeper,
+			fmt.Sprintf("projects[%d].roles.gatekeeper", i), reviewerAutoMerge, issues)
 	}
 	validateIntakeConfig(config, issues)
 	validateDaemonConfig(config.Daemon, issues)
@@ -386,6 +383,38 @@ func validateAuditorRoleConfig(auditor AuditorRoleConfig, path string, issues *[
 
 func gatekeeperTrustIsAuto(trust GatekeeperTrustLevel) bool {
 	return GatekeeperTrustLevel(strings.ToLower(strings.TrimSpace(string(trust)))) == GatekeeperTrustAuto
+}
+
+const gatekeeperAutoCleanCommentConflictMessage = "requires a verified current-head review marker; set roles.reviewer.behavior.reviewEvents.clean to APPROVE or use gatekeeper trust observe/advise"
+
+func validateGatekeeperReviewEventCompatibility(config Config, issues *[]ValidationIssue) {
+	if gatekeeperTrustIsAuto(config.Roles.Gatekeeper.Trust) && config.Roles.Reviewer.Behavior.ReviewEvents.Clean == ReviewerReviewEventComment {
+		*issues = append(*issues, ValidationIssue{Path: "roles.reviewer.behavior.reviewEvents.clean", Message: gatekeeperAutoCleanCommentConflictMessage})
+	}
+	for i, project := range config.Projects {
+		if project.Roles == nil {
+			continue
+		}
+		projectGatekeeperOverride := project.Roles.Gatekeeper != nil && project.Roles.Gatekeeper.Trust != nil
+		projectReviewerCleanOverride := project.Roles.Reviewer != nil && project.Roles.Reviewer.Behavior != nil && project.Roles.Reviewer.Behavior.ReviewEvents != nil && project.Roles.Reviewer.Behavior.ReviewEvents.Clean != nil
+		if !projectGatekeeperOverride && !projectReviewerCleanOverride {
+			continue
+		}
+		roles := ProjectRoleConfigs(config, project.ID)
+		if !gatekeeperTrustIsAuto(roles.Gatekeeper.Trust) || roles.Reviewer.Behavior.ReviewEvents.Clean != ReviewerReviewEventComment {
+			continue
+		}
+		path := fmt.Sprintf("projects[%d].roles.reviewer.behavior.reviewEvents.clean", i)
+		if !projectReviewerCleanOverride {
+			path = "roles.reviewer.behavior.reviewEvents.clean"
+		}
+		if projectReviewerCleanOverride {
+			path = fmt.Sprintf("projects[%d].roles.reviewer.behavior.reviewEvents.clean", i)
+		} else if projectGatekeeperOverride {
+			path = fmt.Sprintf("projects[%d].roles.gatekeeper.trust", i)
+		}
+		*issues = append(*issues, ValidationIssue{Path: path, Message: gatekeeperAutoCleanCommentConflictMessage})
+	}
 }
 
 const auditorGatekeeperAutoConflictMessage = "requires Gatekeeper merge-outcome events or forge-observed merges; gatekeeper trust auto publishes commit status only and does not emit merge outcomes — disable auditor or use gatekeeper trust observe/advise until forge-observed merge evidence is implemented"
@@ -667,7 +696,7 @@ func validateGatekeeperRoleConfig(gatekeeper GatekeeperRoleConfig, path string, 
 		})
 	}
 	if gatekeeper.RequiredReviewChangedLines < 0 {
-		*issues = append(*issues, ValidationIssue{Path: path + ".requiredReviewChangedLines", Message: "must be zero (use the default) or a positive integer"})
+		*issues = append(*issues, ValidationIssue{Path: path + ".requiredReviewChangedLines", Message: "must be zero (to disable the threshold) or a positive integer"})
 	}
 }
 

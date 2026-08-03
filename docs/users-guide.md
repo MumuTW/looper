@@ -337,9 +337,20 @@ For current-head Codex-review enforcement, set `roles.gatekeeper.trust = "auto"`
 and require the `Looper Gatekeeper` status in the target branch's protection
 rule. Gatekeeper binds the status to the current commit: a push has no inherited
 success status, so GitHub and Mergify wait until Codex reviews that new head.
-By default this applies at 200 changed lines (additions plus deletions); set
-`roles.gatekeeper.requiredReviewChangedLines` or the project override to make
-the throughput-versus-review-capacity policy explicit.
+
+**Caveats:** status publishes on the pull request head SHA only — not on GitHub
+native merge-queue merge-group commits. Branch protection must require
+`Looper Gatekeeper`; a failing optional status does not block merge. Do not
+enable `roles.auditor` on the same project while gatekeeper trust is `auto`;
+Auditor requires merge-outcome evidence that status-only auto does not emit
+(see [configuration](configuration.md#merge-gatekeeper-trust-level-rolescatekeepertrust)).
+Post-merge digest likewise only sees Coordinator merge-watch merges (and
+historical Gatekeeper merge-outcome rows) while `auto` is status-only.
+
+Review capacity defaults to 200 changed lines (additions plus deletions). Set
+`roles.gatekeeper.requiredReviewChangedLines` or the project override to tune
+it; an explicit `0` disables that requirement. Smaller changes still block on
+an explicit blocking review marker, but do not wait for a clean review.
 
 Comment markers used by this flow:
 

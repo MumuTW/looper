@@ -128,6 +128,7 @@ type PullRequestSummary struct {
 	URL                string
 	State              string
 	UpdatedAt          string
+	MergedAt           string
 	IsDraft            bool
 	ReviewDecision     string
 	Labels             []string
@@ -141,6 +142,8 @@ type PullRequestSummary struct {
 	ReviewRequests     []string
 	ReviewRequestUsers []GitHubUser
 	Reviews            []map[string]any
+	Additions          int
+	Deletions          int
 }
 
 type PullRequestDetail struct {
@@ -159,6 +162,8 @@ type PullRequestDetail struct {
 	BaseRefName        string
 	HeadSHA            string
 	BaseSHA            string
+	Additions          int
+	Deletions          int
 	Author             string
 	AuthorAssociation  string
 	CommentCount       int
@@ -704,6 +709,12 @@ type ListOpenPullRequestsInput struct {
 	Timeout     time.Duration
 }
 
+type ListMergedPullRequestsInput struct {
+	Repo  string
+	CWD   string
+	Limit int
+}
+
 type ListReviewRequestedPullRequestsInput struct {
 	Repo     string
 	CWD      string
@@ -862,6 +873,31 @@ func (g *Gateway) ListOpenPullRequests(ctx context.Context, input ListOpenPullRe
 		return snapshot.listOpenPullRequests(ctx, input)
 	}
 	return g.listOpenPullRequestsRaw(ctx, input)
+}
+
+// ListMergedPullRequests returns the newest merged pull requests so Gatekeeper
+// can make the post-merge review backlog observable. It is not used as merge
+// authority; branch protection already decided the merge.
+func (g *Gateway) ListMergedPullRequests(ctx context.Context, input ListMergedPullRequestsInput) ([]PullRequestSummary, error) {
+	fields := []string{"number", "url", "state", "mergedAt", "headRefOid", "additions", "deletions"}
+	args := []string{"pr", "list", "--repo", input.Repo, "--state", "merged", "--limit", fmt.Sprintf("%d", defaultLimit(input.Limit)), "--json", strings.Join(fields, ",")}
+	result, err := g.runGh(ctx, input.CWD, "", args...)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := decodeJSONArray(result.Stdout)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]PullRequestSummary, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, PullRequestSummary{
+			Number: asInt64(row["number"]), URL: asString(row["url"]), State: asString(row["state"]),
+			MergedAt: asString(row["mergedAt"]), HeadSHA: asString(row["headRefOid"]),
+			Additions: int(asInt64(row["additions"])), Deletions: int(asInt64(row["deletions"])),
+		})
+	}
+	return out, nil
 }
 
 func (g *Gateway) ListReviewRequestedPullRequests(ctx context.Context, input ListReviewRequestedPullRequestsInput) ([]PullRequestSummary, error) {
@@ -1924,6 +1960,8 @@ func pullRequestDetailFromViewRow(row map[string]any, threads []map[string]any, 
 		BaseRefName:        asString(row["baseRefName"]),
 		HeadSHA:            asString(row["headRefOid"]),
 		BaseSHA:            asString(row["baseRefOid"]),
+		Additions:          int(asInt64(row["additions"])),
+		Deletions:          int(asInt64(row["deletions"])),
 		Author:             extractAuthor(row["author"]),
 		AuthorAssociation:  asString(row["authorAssociation"]),
 		CommentCount:       len(issueComments),
@@ -2006,6 +2044,8 @@ func (g *Gateway) ViewPullRequestMergeWatch(ctx context.Context, input ViewPullR
 		BaseRefName:    nestedString(row, "base", "ref"),
 		HeadSHA:        nestedString(row, "head", "sha"),
 		BaseSHA:        nestedString(row, "base", "sha"),
+		Additions:      int(asInt64(row["additions"])),
+		Deletions:      int(asInt64(row["deletions"])),
 		DiffStats:      pullRequestDiffStatsFromRow(row),
 		Mergeable:      boolPtrFromValue(row["mergeable"]),
 		MergeableState: ParseMergeabilityState(firstNonEmpty(asString(row["mergeable_state"]), asString(row["mergeStateStatus"]))),

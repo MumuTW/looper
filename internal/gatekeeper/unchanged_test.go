@@ -58,6 +58,40 @@ func TestDiscoverPullRequestsSkipsUnchangedPullRequests(t *testing.T) {
 	}
 }
 
+// A small auto-trust change may legitimately pass without a clean review, but a
+// later verified Reviewer event must still invalidate that cached success so a
+// newly blocking review is observed instead of being hidden until maxSkipAge.
+func TestDiscoverPullRequestsReevaluatesSmallAutoChangeAfterReviewEvent(t *testing.T) {
+	fixture := newGatekeeperFixtureWithoutReview(t)
+	fixture.github.openPullRequests = []githubinfra.PullRequestSummary{openPullRequestFixture()}
+	fixture.github.detail.Additions = 1
+	fixture.github.reviewMarker = githubinfra.ReviewMarkerResult{}
+	runner := fixture.autoRunner()
+
+	first, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("first DiscoverPullRequests() error = %v", err)
+	}
+	if first.Evaluated != 1 || !first.Reports[0].Eligible {
+		t.Fatalf("first discovery = %#v, want eligible below-threshold report", first)
+	}
+	second, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("second DiscoverPullRequests() error = %v", err)
+	}
+	if second.Evaluated != 0 || second.Skipped != 1 {
+		t.Fatalf("second discovery = %#v, want unchanged report skipped", second)
+	}
+	seedReviewerReviewEvent(t, fixture, "head-1", "REQUEST_CHANGES", "reviewer-loop", 1)
+	third, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("third DiscoverPullRequests() error = %v", err)
+	}
+	if third.Evaluated != 1 || third.Skipped != 0 {
+		t.Fatalf("third discovery = %#v, want re-evaluation after review event", third)
+	}
+}
+
 // Anything the list page can observe changing must force a fresh evaluation.
 func TestDiscoverPullRequestsReevaluatesWhenTheListPageChanges(t *testing.T) {
 	for _, testCase := range []struct {

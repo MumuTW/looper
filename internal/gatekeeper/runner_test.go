@@ -347,15 +347,15 @@ func newGatekeeperFixtureWithReview(t *testing.T, seedReview bool) *gatekeeperFi
 		repos: repos,
 		now:   now,
 		github: &fakeGatekeeperGitHub{
-			detail:    githubinfra.PullRequestDetail{Number: 42, State: "OPEN", HeadSHA: "head-1", BaseRefName: "main", ReviewDecision: "APPROVED"},
-			mergeable: githubinfra.PullRequestDetail{Number: 42, HeadSHA: "head-1", Mergeable: &mergeable, MergeableState: "clean"},
+			detail:    githubinfra.PullRequestDetail{Number: 42, State: "OPEN", HeadSHA: "head-1", BaseRefName: "main", BaseSHA: "base-1", ReviewDecision: "APPROVED"},
+			mergeable: githubinfra.PullRequestDetail{Number: 42, HeadSHA: "head-1", BaseSHA: "base-1", Mergeable: &mergeable, MergeableState: "clean"},
 			protection: githubinfra.BranchProtection{
 				Enabled: true, HasRequiredChecks: true, RequiredChecks: []string{"ci", RequiredStatusContext},
 				RequiredCheckRules: []githubinfra.RequiredCheckRule{{Context: "ci", AppID: 15368}},
 				HasRequiredReviews: true, RequiredApprovingReviewCount: 1,
 			},
 			checks:       githubinfra.PullRequestCheckRuns{TotalCount: 1, CheckRuns: []githubinfra.PullRequestCheckRun{{Name: "ci", Status: "completed", Conclusion: "success", AppID: 15368}}},
-			finalHeadSHA: "head-1",
+			finalHeadSHA: "head-1", finalBaseSHA: "base-1",
 			reviewMarker: githubinfra.ReviewMarkerResult{Found: true, Outcome: "clean", Event: "APPROVE", AuthorLogin: "looper-bot"},
 		},
 		policyPermits: true,
@@ -386,8 +386,13 @@ func (f *gatekeeperFixture) autoRunner() *Runner {
 	})
 }
 
+func (f *gatekeeperFixture) requireReviewBySize() {
+	f.github.detail.Additions = DefaultRequiredReviewChangedLines
+}
+
 func TestAutoGatekeeperRequiresCurrentHeadCodexReviewAndPublishesPendingStatus(t *testing.T) {
 	fixture := newGatekeeperFixture(t)
+	fixture.requireReviewBySize()
 	fixture.github.reviewMarker = githubinfra.ReviewMarkerResult{}
 	fixture.github.protection.RequiredChecks = []string{"ci", RequiredStatusContext}
 	fixture.github.protection.RequiredCheckRules = append(fixture.github.protection.RequiredCheckRules, githubinfra.RequiredCheckRule{Context: RequiredStatusContext})
@@ -410,6 +415,7 @@ func TestAutoGatekeeperRequiresCurrentHeadCodexReviewAndPublishesPendingStatus(t
 
 func TestAutoGatekeeperAcceptsCleanCurrentHeadCodexReview(t *testing.T) {
 	fixture := newGatekeeperFixture(t)
+	fixture.requireReviewBySize()
 	fixture.github.protection.RequiredChecks = []string{"ci", RequiredStatusContext}
 	fixture.github.protection.RequiredCheckRules = append(fixture.github.protection.RequiredCheckRules, githubinfra.RequiredCheckRule{Context: RequiredStatusContext})
 	fixture.github.reviewMarker = githubinfra.ReviewMarkerResult{Found: true, Outcome: "clean", Event: "APPROVE", AuthorLogin: "looper-bot"}
@@ -426,6 +432,99 @@ func TestAutoGatekeeperAcceptsCleanCurrentHeadCodexReview(t *testing.T) {
 	}
 }
 
+func TestAutoGatekeeperAllowsSmallChangeWithoutCleanReview(t *testing.T) {
+	fixture := newGatekeeperFixtureWithoutReview(t)
+	fixture.github.detail.Additions = DefaultRequiredReviewChangedLines - 1
+	fixture.github.reviewMarker = githubinfra.ReviewMarkerResult{}
+	fixture.github.protection.RequiredChecks = []string{"ci", RequiredStatusContext}
+	fixture.github.protection.RequiredCheckRules = append(fixture.github.protection.RequiredCheckRules, githubinfra.RequiredCheckRule{Context: RequiredStatusContext})
+
+	report, err := fixture.autoRunner().EvaluatePullRequest(context.Background(), EvaluationInput{ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, ExpectedHeadSHA: "head-1"})
+	if err != nil {
+		t.Fatalf("EvaluatePullRequest() error = %v", err)
+	}
+	if !report.Eligible || report.Evidence.ReviewRequiredByPolicy || report.Evidence.ChangedLines != DefaultRequiredReviewChangedLines-1 {
+		t.Fatalf("report = %#v, want eligible below threshold", report)
+	}
+	if len(fixture.github.reviewMarkerCalls) != 1 {
+		t.Fatalf("review marker calls = %#v, want one blocking-marker check", fixture.github.reviewMarkerCalls)
+	}
+	if got := fixture.github.statusCalls; len(got) != 1 || got[0].State != "success" {
+		t.Fatalf("status calls = %#v, want success", got)
+	}
+}
+
+func TestAutoGatekeeperBlocksBlockingReviewBelowThreshold(t *testing.T) {
+	fixture := newGatekeeperFixtureWithoutReview(t)
+	fixture.github.detail.Additions = DefaultRequiredReviewChangedLines - 1
+	fixture.github.reviewMarker = githubinfra.ReviewMarkerResult{Found: true, Outcome: "blocking", Event: "REQUEST_CHANGES", AuthorLogin: "looper-bot"}
+	fixture.github.protection.RequiredChecks = []string{"ci", RequiredStatusContext}
+	fixture.github.protection.RequiredCheckRules = append(fixture.github.protection.RequiredCheckRules, githubinfra.RequiredCheckRule{Context: RequiredStatusContext})
+
+	report, err := fixture.autoRunner().EvaluatePullRequest(context.Background(), EvaluationInput{ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, ExpectedHeadSHA: "head-1"})
+	if err != nil {
+		t.Fatalf("EvaluatePullRequest() error = %v", err)
+	}
+	if report.Eligible || !hasReason(report, ReasonCodexReviewBlocked) || report.Evidence.ReviewRequiredByPolicy {
+		t.Fatalf("report = %#v, want blocking marker to veto below-threshold change", report)
+	}
+}
+
+func TestAutoGatekeeperExplicitZeroDisablesReviewThreshold(t *testing.T) {
+	fixture := newGatekeeperFixtureWithoutReview(t)
+	fixture.github.detail.Additions = DefaultRequiredReviewChangedLines + 100
+	fixture.github.reviewMarker = githubinfra.ReviewMarkerResult{}
+	fixture.github.protection.RequiredChecks = []string{"ci", RequiredStatusContext}
+	fixture.github.protection.RequiredCheckRules = append(fixture.github.protection.RequiredCheckRules, githubinfra.RequiredCheckRule{Context: RequiredStatusContext})
+	runner := New(Options{
+		Repos: fixture.repos, GitHub: fixture.github, Now: func() time.Time { return fixture.now },
+		PolicyPermitsTarget:                  func(string, string, string) bool { return fixture.policyPermits },
+		TrustForProject:                      func(string) config.GatekeeperTrustLevel { return config.GatekeeperTrustAuto },
+		RequiredReviewChangedLinesForProject: func(string) int { return 0 },
+	})
+
+	report, err := runner.EvaluatePullRequest(context.Background(), EvaluationInput{ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, ExpectedHeadSHA: "head-1"})
+	if err != nil {
+		t.Fatalf("EvaluatePullRequest() error = %v", err)
+	}
+	if !report.Eligible || report.Evidence.ReviewRequiredByPolicy || hasReason(report, ReasonCodexReviewMissing) {
+		t.Fatalf("report = %#v, want explicit zero to disable review requirement", report)
+	}
+}
+
+func TestAutoGatekeeperRecordsUnreviewedMergedPullRequestOnce(t *testing.T) {
+	fixture := newGatekeeperFixture(t)
+	fixture.github.openPullRequests = nil
+	fixture.github.mergedPullRequests = []githubinfra.PullRequestSummary{{
+		Number: 91, HeadSHA: "merged-head", MergedAt: "2026-07-30T12:00:00Z", Additions: 180, Deletions: 40,
+	}}
+	fixture.github.reviewMarker = githubinfra.ReviewMarkerResult{}
+	runner := fixture.autoRunner()
+
+	first, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("first DiscoverPullRequests() error = %v", err)
+	}
+	if first.UnreviewedMerged != 1 {
+		t.Fatalf("first discovery = %#v, want one unreviewed merged PR", first)
+	}
+	events, err := fixture.repos.Events.ListByEntity(context.Background(), "pull_request", "acme/looper#91")
+	if err != nil {
+		t.Fatalf("Events.ListByEntity() error = %v", err)
+	}
+	if len(events) != 1 || events[0].EventType != "pr.review.unreviewed" || !strings.Contains(events[0].PayloadJSON, `"changedLines":220`) {
+		t.Fatalf("events = %#v, want one durable unreviewed event", events)
+	}
+	markerCalls := len(fixture.github.reviewMarkerCalls)
+	second, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("second DiscoverPullRequests() error = %v", err)
+	}
+	if second.UnreviewedMerged != 0 || len(fixture.github.reviewMarkerCalls) != markerCalls {
+		t.Fatalf("second discovery = %#v, marker calls=%d, want no duplicate lookup", second, len(fixture.github.reviewMarkerCalls))
+	}
+}
+
 func TestAutoGatekeeperRejectsStaleOrBlockingCodexReview(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -438,6 +537,7 @@ func TestAutoGatekeeperRejectsStaleOrBlockingCodexReview(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			fixture := newGatekeeperFixture(t)
+			fixture.requireReviewBySize()
 			fixture.github.protection.RequiredChecks = []string{"ci", RequiredStatusContext}
 			fixture.github.protection.RequiredCheckRules = append(fixture.github.protection.RequiredCheckRules, githubinfra.RequiredCheckRule{Context: RequiredStatusContext})
 			fixture.github.reviewMarker = tc.marker
@@ -457,6 +557,7 @@ func TestAutoGatekeeperRejectsStaleOrBlockingCodexReview(t *testing.T) {
 
 func TestAutoGatekeeperRefusesToReportSuccessWithoutProtectedContext(t *testing.T) {
 	fixture := newGatekeeperFixture(t)
+	fixture.requireReviewBySize()
 	fixture.github.protection.RequiredChecks = []string{"ci"}
 	fixture.github.protection.RequiredCheckRules = []githubinfra.RequiredCheckRule{{Context: "ci", AppID: 15368}}
 	fixture.github.reviewMarker = githubinfra.ReviewMarkerResult{Found: true, Outcome: "clean", Event: "APPROVE", AuthorLogin: "looper-bot"}
@@ -474,18 +575,19 @@ func TestAutoGatekeeperRefusesToReportSuccessWithoutProtectedContext(t *testing.
 }
 
 type fakeGatekeeperGitHub struct {
-	openPullRequests []githubinfra.PullRequestSummary
-	detail           githubinfra.PullRequestDetail
-	mergeable        githubinfra.PullRequestDetail
-	protection       githubinfra.BranchProtection
-	checks           githubinfra.PullRequestCheckRuns
-	threads          []githubinfra.ReviewThread
-	reviews          []githubinfra.ReviewSummary
-	reviewsErr       error
-	finalHeadSHA     string
-	finalBaseSHA     string
-	protectionErr    error
-	commentsErr      error
+	openPullRequests   []githubinfra.PullRequestSummary
+	mergedPullRequests []githubinfra.PullRequestSummary
+	detail             githubinfra.PullRequestDetail
+	mergeable          githubinfra.PullRequestDetail
+	protection         githubinfra.BranchProtection
+	checks             githubinfra.PullRequestCheckRuns
+	threads            []githubinfra.ReviewThread
+	reviews            []githubinfra.ReviewSummary
+	reviewsErr         error
+	finalHeadSHA       string
+	finalBaseSHA       string
+	protectionErr      error
+	commentsErr        error
 	// perPullRequestCalls counts the forge round trips that only a full evaluation
 	// makes, so a test can prove a pull request was skipped rather than evaluated.
 	perPullRequestCalls int
@@ -504,6 +606,7 @@ type fakeGatekeeperGitHub struct {
 	statusCalls           []githubinfra.CommitStatusInput
 	statusErr             error
 	viewErr               error
+	mergedPullRequestsErr error
 	listReviewThreadsHook func(*fakeGatekeeperGitHub) error
 	// beforeView, when set, runs before each pull-request read, so a test can
 	// inject a state change between the first evaluation and a later one.
@@ -584,6 +687,9 @@ func (f *fakeGatekeeperGitHub) UpdateIssueComment(_ context.Context, input githu
 
 func (f *fakeGatekeeperGitHub) ListOpenPullRequests(context.Context, githubinfra.ListOpenPullRequestsInput) ([]githubinfra.PullRequestSummary, error) {
 	return f.openPullRequests, nil
+}
+func (f *fakeGatekeeperGitHub) ListMergedPullRequests(context.Context, githubinfra.ListMergedPullRequestsInput) ([]githubinfra.PullRequestSummary, error) {
+	return f.mergedPullRequests, f.mergedPullRequestsErr
 }
 func (f *fakeGatekeeperGitHub) ViewPullRequestForGatekeeper(context.Context, githubinfra.ViewPullRequestInput) (githubinfra.PullRequestDetail, error) {
 	f.perPullRequestCalls++

@@ -915,38 +915,63 @@ decides what it may do with that judgement.
 | --- | --- |
 | `observe` (default) | Gate report only. Nothing is published, nothing is merged. |
 | `advise` | Additionally publishes the verdict and every blocking reason on the pull request, so the decision costs one read instead of a re-investigation. The human still merges. |
-| `auto` | Requires a completed Looper/Codex review for the current head when the changed-line threshold is met, then publishes the `Looper Gatekeeper` status for that exact SHA. GitHub branch protection consumes the status; Gatekeeper never calls merge itself. |
+| `auto` | Requires a completed Looper/Codex review for the current head, then publishes the `Looper Gatekeeper` status for that exact **pull request head SHA**. GitHub branch protection consumes the status; Gatekeeper never calls merge itself. |
 
 `auto` has one required external authority: GitHub branch protection must require
 the `Looper Gatekeeper` status context on the target branch. The status is the
-enforcement point for both direct merges and Mergify's branch-protection queue
-injection; the local Gate report remains audit evidence only. If protection does
-not require that context, Gatekeeper publishes a failing status rather than
-claiming the PR is eligible.
+enforcement point for Mergify's branch-protection queue injection on the PR head;
+the local Gate report remains audit evidence only. If protection does not
+require that context, Gatekeeper publishes a failing status and marks the PR
+ineligible — but an *unrequired* failing status cannot stop merge, so operators
+must add the required check before relying on `auto`.
+
+**Known limitations at `auto`:**
+
+- Status is keyed by commit SHA, not pull request. If two open pull requests share
+  the same head commit, discovery aggregates their verdicts before publishing
+  success — any blocked open PR on that head keeps the status non-successful.
+- Status is published on the pull request head only. GitHub's native merge queue
+  evaluates required checks on merge-group commits; `auto` does not publish
+  status for those SHAs and cannot satisfy branch protection bound to merge-group
+  heads. Use observe/advise, or require the status only on PR heads with a merge
+  path that does not depend on merge-group checks.
+- `roles.auditor` cannot be enabled on the same project scope while gatekeeper
+  trust is `auto`. Auditor still reads Gatekeeper `MergeOutcome` events that
+  status-only auto no longer emits; forge-observed merge evidence is not yet
+  implemented.
+- `roles.coordinator.postMergeDigest` still classifies merges from Coordinator
+  merge-watch events and historical Gatekeeper `MergeOutcome` rows. Status-only
+  `auto` does not emit new merge-outcome events, so Mergify or manual merges
+  without a linked Coordinator merge-watch are absent from the daily digest
+  until forge-observed merge evidence exists.
 
 ```toml
 [roles.gatekeeper]
 trust = "auto"
-# additions + deletions; 0 also means this deliberate default
+# additions + deletions; omitted uses the normalized default of 200
 requiredReviewChangedLines = 200
 ```
 
-`requiredReviewChangedLines` is additions plus deletions. Its default is `200`,
-and a project can override it under
-`projects[].roles.gatekeeper.requiredReviewChangedLines`. A change at or above
-the effective threshold remains `pending` until the authenticated reviewer has
-posted its marker for the current SHA; below it, the Gatekeeper status still
-checks every other merge condition but does not consume scarce review capacity.
+`requiredReviewChangedLines` is the additions-plus-deletions threshold for the
+current pull request head. When the field is omitted, configuration normalizes
+it to `200`; an explicit global or project value of `0` disables the capacity
+requirement for that scope. A change at or above the effective threshold
+requires a verified current-head Reviewer marker. Below the threshold, Gatekeeper
+still checks all other merge conditions and still inspects blocking review
+markers, but it does not require a clean review to proceed. The counts and
+threshold are persisted as Gate evidence, and the provider's pull-request
+statistics plus merge-base SHA are the authority for the verdict.
 
-Reviewer writes `pr.review.completed` evidence only after it has re-read and
-verified the GitHub marker. A structured reviewer result with
-`type = "rate_limit"` writes `pr.review.refused` instead; prose mentioning a
-rate limit is deliberately not evidence. Gatekeeper scans one bounded page of
-recent merged PRs and writes `pr.review.unreviewed` for above-threshold commits
-that lack either record. These are durable `pull_request` events, visible via
-the existing `/api/v1/events` and `/api/v1/events/pull_request/{repo%23number}`
-routes; the periodic digest proposed in #117 can consume the same event stream
-without another status store.
+Project overrides use `projects[].roles.gatekeeper.trust` and
+`projects[].roles.gatekeeper.requiredReviewChangedLines`.
+
+Reviewer writes `pr.review.completed` only after it re-reads and verifies the
+GitHub marker. A structured `type = "rate_limit"` completion writes
+`pr.review.refused`; prose mentioning a rate limit is not evidence. Gatekeeper's
+bounded recent-merged-PR scan writes `pr.review.unreviewed` for merged pull
+requests at or above the threshold with no completed/refused evidence. These
+events describe merged **pull requests**, not commits, and remain queryable
+through the existing event API.
 
 ### The owned comment and its lifecycle
 
@@ -984,6 +1009,105 @@ native auto-merge, while `Gatekeeper = auto` supplies the externally enforced
 status that prevents GitHub or Mergify from completing a merge until the exact
 head has a completed Codex review and every other Gatekeeper condition passes.
 Reviewer approval alone is therefore insufficient once the status is required.
+
+## Merge Gatekeeper diff budget (`roles.gatekeeper.diffBudget`)
+
+The diff budget is an optional boolean change-size guard. When configured,
+Gatekeeper reads GitHub's provider-observed `changedFiles` and `deletions` for
+the exact pull-request head during evaluation and blocks the verdict when either
+count exceeds its configured bound. GitHub's provider metadata is the authority
+for the counts; the agent's output is not used. The gate runs during periodic
+Gatekeeper evaluation and fails closed (blocking with `provider_state_unavailable`)
+when the enabled stats cannot be read.
+
+| Path | Purpose | Default |
+| --- | --- | --- |
+| `roles.gatekeeper.diffBudget.maxChangedFiles` | Maximum number of changed files | `0` (unlimited) |
+| `roles.gatekeeper.diffBudget.maxDeletions` | Maximum number of deleted lines | `0` (unlimited) |
+
+A bound of `0` means **unlimited**: that dimension is not enforced. The two
+bounds are independent, so configuring only one leaves the other unlimited — for
+example, setting only `maxDeletions` still lets a very large purely-additive diff
+pass. Negative values are rejected at startup. The gate is boolean per bound, not
+a score: it records the observed counts and configured limits as evidence and
+does not model review effort or risk.
+
+```toml
+[roles.gatekeeper.diffBudget]
+maxChangedFiles = 20
+maxDeletions = 500
+```
+
+### Project overrides
+
+Project overrides use `projects[].roles.gatekeeper.diffBudget` and are
+**partial**: each bound is optional, and only the bounds present override the
+global value. A project that sets only `maxDeletions` keeps the global
+`maxChangedFiles`, and vice versa. Project IDs are matched exactly, the same as
+every other project lookup, so two IDs differing only by case or surrounding
+whitespace are distinct projects with distinct budgets.
+
+```toml
+[[projects]]
+id = "looper"
+repoPath = "/path/to/looper"
+
+[projects.roles.gatekeeper.diffBudget]
+maxDeletions = 100   # overrides the global bound; maxChangedFiles is inherited
+```
+
+### What this gate does not catch
+
+A cheap, deterministic, provider-authoritative guard is deliberately narrow.
+Reviewers should weigh these blind spots before relying on it:
+
+- Only changed-file count and deletion count are bounded. There is no
+  `maxAdditions` or total-line bound, so a massive purely-additive diff passes
+  whenever `maxDeletions` is the only configured bound.
+- Counts are whole-PR totals from GitHub, computed against the current merge
+  base. There is no per-file or per-path budget, so one very large file passes
+  whenever the file count is under limit, and generated or vendored files are not
+  excluded.
+- The counts move when the base branch is force-pushed or rewritten even though
+  the head does not. The discovery fingerprint includes the base SHA so a
+  rewritten merge base invalidates a reused verdict rather than serving a stale
+  one for up to the skip window.
+- At the `auto` trust level Gatekeeper publishes commit status only; it never
+  merges. The diff-budget gate still runs on each evaluation and fails closed when
+  the enabled stats cannot be read or the merge base advances between reads.
+
+## Pipeline digest (`roles.escalator`)
+
+Escalator is an agent-free, global Role that periodically derives one attention
+digest from durable loop, queue, Triage, Gatekeeper, and pull-request snapshot
+state. It uses the existing notification gateway; it does not start an agent,
+claim work, change forge state, or add another delivery transport.
+
+```toml
+[roles.escalator]
+enabled = true
+cadenceSeconds = 3600
+retryAttemptThreshold = 2
+unroutedAfterSeconds = 3600
+staleHeadAfterSeconds = 86400
+maxItems = 500
+```
+
+| Path | Purpose | Default |
+| --- | --- | --- |
+| `roles.escalator.enabled` | Enables the global digest | `false` |
+| `roles.escalator.cadenceSeconds` | Minimum interval between successful census attempts | `3600` |
+| `roles.escalator.retryAttemptThreshold` | Queue attempts at which an item is reported as repeatedly retrying | `2` |
+| `roles.escalator.unroutedAfterSeconds` | Age before an enrolled/unprojected Triage source is stuck | `3600` |
+| `roles.escalator.staleHeadAfterSeconds` | Age before current-head evidence is stale | `86400` |
+| `roles.escalator.maxItems` | Hard bound on one durable delta baseline | `500` |
+
+The role is global-only: `projects[].roles.escalator` is rejected because one
+digest intentionally aggregates all active projects. An unchanged digest is
+suppressed, an empty digest advances the baseline without sending a content-free
+notification, and a failed census retries on the next scheduler tick. A daemon
+restart may run an immediate census; durable delta comparison still prevents an
+unchanged notification.
 
 ## Deploy on merge (`roles.deployer`)
 

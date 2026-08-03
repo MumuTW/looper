@@ -874,7 +874,8 @@ type GatekeeperRoleConfig struct {
 	Trust      GatekeeperTrustLevel  `json:"trust,omitempty"`
 	DiffBudget *GatekeeperDiffBudget `json:"diffBudget,omitempty"`
 	// RequiredReviewChangedLines is the smallest additions+deletions total that
-	// triggers a review-capacity gate. Zero (the default) disables the gate.
+	// triggers a review-capacity gate. The normalized default is 200; an explicit
+	// zero disables the threshold.
 	RequiredReviewChangedLines int `json:"requiredReviewChangedLines,omitempty"`
 }
 

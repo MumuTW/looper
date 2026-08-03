@@ -57,6 +57,70 @@ func TestGatekeeperReviewThresholdAcceptsDefaultAndRejectsNegative(t *testing.T)
 	}
 }
 
+func TestGatekeeperReviewThresholdDefaultAndExplicitZeroScopes(t *testing.T) {
+	t.Parallel()
+	cfg, err := DefaultConfig(t.TempDir())
+	if err != nil {
+		t.Fatalf("DefaultConfig() error = %v", err)
+	}
+	if got := cfg.Roles.Gatekeeper.RequiredReviewChangedLines; got != 200 {
+		t.Fatalf("global threshold = %d, want normalized default 200", got)
+	}
+	zero := 0
+	mergeConfig(&cfg, PartialConfig{Roles: &PartialRoleConfigs{Gatekeeper: &PartialGatekeeperRoleConfig{RequiredReviewChangedLines: &zero}}})
+	if got := cfg.Roles.Gatekeeper.RequiredReviewChangedLines; got != 0 {
+		t.Fatalf("explicit global zero = %d, want threshold disabled", got)
+	}
+	cfg.Roles.Gatekeeper.RequiredReviewChangedLines = 200
+	cfg.Projects = []ProjectRefConfig{{ID: "demo", Roles: &PartialRoleConfigs{Gatekeeper: &PartialGatekeeperRoleConfig{RequiredReviewChangedLines: &zero}}}}
+	if got := ProjectRoleConfigs(cfg, "demo").Gatekeeper.RequiredReviewChangedLines; got != 0 {
+		t.Fatalf("explicit project zero = %d, want project threshold disabled", got)
+	}
+}
+
+func TestGatekeeperAutoRejectsMarkerlessCommentCleanPolicy(t *testing.T) {
+	t.Parallel()
+	clean := ReviewerReviewEventComment
+	cfg := Config{Roles: RoleConfigs{
+		Gatekeeper: GatekeeperRoleConfig{Trust: GatekeeperTrustAuto},
+		Reviewer:   ReviewerRoleConfig{Behavior: ReviewerConfig{ReviewEvents: ReviewerReviewEventsConfig{Clean: clean}}},
+	}}
+	var issues []ValidationIssue
+	validateGatekeeperReviewEventCompatibility(cfg, &issues)
+	if len(issues) != 1 || issues[0].Path != "roles.reviewer.behavior.reviewEvents.clean" {
+		t.Fatalf("issues = %+v, want one global clean-event conflict", issues)
+	}
+}
+
+func TestGatekeeperProjectAutoRejectsInheritedMarkerlessCommentCleanPolicy(t *testing.T) {
+	t.Parallel()
+	clean := ReviewerReviewEventComment
+	auto := GatekeeperTrustAuto
+	cfg := Config{
+		Roles:    RoleConfigs{Reviewer: ReviewerRoleConfig{Behavior: ReviewerConfig{ReviewEvents: ReviewerReviewEventsConfig{Clean: clean}}}},
+		Projects: []ProjectRefConfig{{ID: "demo", Roles: &PartialRoleConfigs{Gatekeeper: &PartialGatekeeperRoleConfig{Trust: &auto}}}},
+	}
+	var issues []ValidationIssue
+	validateGatekeeperReviewEventCompatibility(cfg, &issues)
+	if len(issues) != 1 || issues[0].Path != "projects[0].roles.gatekeeper.trust" {
+		t.Fatalf("issues = %+v, want one project trust conflict", issues)
+	}
+}
+
+func TestGatekeeperRejectsNegativeProjectReviewThreshold(t *testing.T) {
+	t.Parallel()
+	negative := -1
+	cfg := Config{Projects: []ProjectRefConfig{{ID: "demo", Roles: &PartialRoleConfigs{Gatekeeper: &PartialGatekeeperRoleConfig{RequiredReviewChangedLines: &negative}}}}}
+	var issues []ValidationIssue
+	validateCoreConfig(cfg, &issues)
+	for _, issue := range issues {
+		if issue.Path == "projects[0].roles.gatekeeper.requiredReviewChangedLines" {
+			return
+		}
+	}
+	t.Fatalf("issues = %+v, want negative project threshold rejected", issues)
+}
+
 func TestGatekeeperTrustRejectsUnknownLevel(t *testing.T) {
 	t.Parallel()
 
