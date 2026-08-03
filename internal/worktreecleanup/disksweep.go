@@ -340,7 +340,7 @@ func RunContainerSweep(ctx context.Context, options ContainerSweepOptions) (Disk
 			result.Candidates = append(result.Candidates, decided)
 			continue
 		}
-		decided, ok := admitContainer(ctx, options.Git, readDir, registered, decided)
+		decided, ok := admitContainer(ctx, options.Git, readDir, registered, decided, options.RetentionCutoff)
 		if !ok {
 			releaseMutation()
 			if decided.Action == "error" {
@@ -502,7 +502,7 @@ func revalidateContainerCandidate(candidate DiskCandidate, cutoff time.Time) (Di
 // registered, fixer-owned, or a usable checkout with uncommitted work. One
 // protected leaf protects its container: partial removal would leave a
 // half-deleted tree that no later pass can reason about.
-func admitContainer(ctx context.Context, git DiskSweepGit, readDir func(string) ([]DiskEntry, error), registered map[string]bool, container DiskCandidate) (DiskCandidate, bool) {
+func admitContainer(ctx context.Context, git DiskSweepGit, readDir func(string) ([]DiskEntry, error), registered map[string]bool, container DiskCandidate, cutoff time.Time) (DiskCandidate, bool) {
 	projects, err := readDir(container.Path)
 	if err != nil {
 		container.Action = "error"
@@ -525,19 +525,26 @@ func admitContainer(ctx context.Context, git DiskSweepGit, readDir func(string) 
 			if !checkout.IsDir {
 				continue
 			}
-			if registered[normalizeSweepPath(checkout.Path)] {
+			freshCheckout, checkoutEligible := revalidateContainerCandidate(DiskCandidate{Path: checkout.Path}, cutoff)
+			if !checkoutEligible {
+				container.Action = freshCheckout.Action
+				container.Reason = freshCheckout.Reason + "_inside"
+				container.Error = freshCheckout.Error
+				return container, false
+			}
+			if registered[normalizeSweepPath(freshCheckout.Path)] {
 				container.Action = ActionSkipped
 				container.Reason = "registered_checkout_inside"
 				return container, false
 			}
-			leaf, ok := admitRemoval(ctx, git, DiskCandidate{Path: checkout.Path})
+			leaf, ok := admitRemoval(ctx, git, freshCheckout)
 			if !ok {
 				container.Action = leaf.Action
 				container.Reason = leaf.Reason + "_inside"
 				container.Error = leaf.Error
 				return container, false
 			}
-			if worktreesafety.IsUsableStandaloneGitRepository(checkout.Path) {
+			if worktreesafety.IsUsableStandaloneGitRepository(freshCheckout.Path) {
 				container.Action = ActionSkipped
 				container.Reason = "standalone_git_repository_inside"
 				return container, false
