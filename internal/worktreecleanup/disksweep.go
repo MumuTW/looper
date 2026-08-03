@@ -906,6 +906,18 @@ func admitRemoval(ctx context.Context, git DiskSweepGit, candidate DiskCandidate
 			candidate.Reason = "git_metadata_indeterminate"
 			return candidate, false
 		}
+		safe, err := worktreesafety.SafeToRemoveUnusableWorktreePath(candidate.Path)
+		if err != nil {
+			candidate.Action = "error"
+			candidate.Reason = "unusable_path_scan_failed"
+			candidate.Error = err.Error()
+			return candidate, false
+		}
+		if !safe {
+			candidate.Action = ActionSkipped
+			candidate.Reason = "populated_unusable_worktree"
+			return candidate, false
+		}
 		return candidate, true
 	}
 	token, err := worktreesafety.ReadFixerOwnerToken(candidate.Path)

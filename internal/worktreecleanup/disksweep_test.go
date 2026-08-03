@@ -491,6 +491,35 @@ func TestRunDiskSweepPreservesIndeterminateGitMetadata(t *testing.T) {
 	}
 }
 
+func TestRunDiskSweepPreservesPopulatedUnusableWorktree(t *testing.T) {
+	root := t.TempDir()
+	path := mkdirAt(t, filepath.Join(root, "looper-app-interrupted"), old())
+	if err := os.WriteFile(filepath.Join(path, ".git"), []byte("not-a-gitdir-pointer\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(.git) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(path, "agent-output.txt"), []byte("keep interrupted work\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(agent output) error = %v", err)
+	}
+	if err := os.Chtimes(path, old(), old()); err != nil {
+		t.Fatalf("Chtimes(path) error = %v", err)
+	}
+
+	var removed []string
+	plan, err := RunDiskSweep(context.Background(), sweepOptions(DiskSweepRoot{ProjectID: "app", RepoPath: filepath.Join(t.TempDir(), "repo"), WorktreeRoot: root}, stubSweepGit{}, &removed))
+	if err != nil {
+		t.Fatalf("RunDiskSweep() error = %v", err)
+	}
+	if len(removed) != 0 {
+		t.Fatalf("removed = %v, want populated unusable path preserved", removed)
+	}
+	if action, reason := reasonFor(t, plan, path); action != ActionSkipped || reason != "populated_unusable_worktree" {
+		t.Fatalf("candidate = (%q, %q), want populated_unusable_worktree skip", action, reason)
+	}
+	if _, err := os.Stat(filepath.Join(path, "agent-output.txt")); err != nil {
+		t.Fatalf("interrupted agent output was removed: %v", err)
+	}
+}
+
 func TestRunDiskSweepPreservesLinkedGitfile(t *testing.T) {
 	root := t.TempDir()
 	path := mkdirAt(t, filepath.Join(root, "looper-app-linked"), old())

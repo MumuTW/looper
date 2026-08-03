@@ -422,6 +422,36 @@ func linkedPrivateGitdirCommonUsable(gitdir string) bool {
 // holds content after CleanupWorktree and must not be recreated over.
 var ErrUnusableFixerWorktreePreserved = errors.New("unusable fixer worktree path preserved")
 
+// SafeToRemoveUnusableWorktreePath applies the non-mutating form of the
+// unusable-path cleanup policy. Empty directories and directories containing
+// only unusable local Git metadata are disposable; any other populated path
+// may contain interrupted agent work and must be preserved. Directory read
+// errors are returned so callers can fail closed.
+func SafeToRemoveUnusableWorktreePath(path string) (bool, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return true, nil
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return true, nil
+		}
+		return false, err
+	}
+	if !info.IsDir() {
+		return false, nil
+	}
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return false, err
+	}
+	if len(entries) == 0 {
+		return true, nil
+	}
+	return onlyUnusableLocalGitMetadata(path, entries), nil
+}
+
 // ClearUnusableFixerWorktreePath handles filesystem leftovers after CleanupWorktree
 // on a missing/unusable checkout. Git's `worktree remove --force` only removes
 // registered worktrees; unregistered directories are left intact, which then
