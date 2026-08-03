@@ -1,7 +1,9 @@
 package worker
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -1790,9 +1792,22 @@ func TestPreservesWorktreeProgressRequiresContentAndCommitEvidence(t *testing.T)
 			after: worktreeProgress{HeadSHA: "committed-head", Branch: "feature/test", ContentFingerprint: "before-content", ContentFingerprintVersion: worktreeFingerprintVersion, HeadDescendsFromCompare: true},
 			want:  true,
 		},
+		{
+			name:  "accepts staged-index-only content committed by descendant",
+			after: worktreeProgress{HeadSHA: "committed-head", Branch: "feature/test", ContentFingerprint: "staged-content", ContentFingerprintVersion: worktreeFingerprintVersion, IndexFingerprint: "before-index", WorktreeMatchesHead: true, HeadDescendsFromCompare: true},
+			want:  true,
+		},
+		{
+			name:  "rejects mixed staged and unstaged content committed by descendant",
+			after: worktreeProgress{HeadSHA: "committed-head", Branch: "feature/test", ContentFingerprint: "staged-content", ContentFingerprintVersion: worktreeFingerprintVersion, IndexFingerprint: "before-index", HeadDescendsFromCompare: true},
+			want:  false,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			progress := before
+			if tc.name == "accepts staged-index-only content committed by descendant" {
+				progress.WorktreeMatchesHead = true
+			}
 			if tc.name == "rejects an unchanged legacy status-only checkpoint after upgrade" {
 				progress.ContentFingerprint = ""
 				progress.ContentFingerprintVersion = ""
@@ -1823,6 +1838,30 @@ func TestPreservesWorktreeProgressRequiresCleanHeadEvidence(t *testing.T) {
 				t.Fatalf("preservesWorktreeProgress() = %t, want %t", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestWorktreeProgressJSONPreservesNonUTF8Paths(t *testing.T) {
+	t.Parallel()
+	rawPath := string([]byte{'d', 0xff, 'r'})
+	before := worktreeProgress{
+		HeadSHA: "head", Branch: "feature/test", ChangedFiles: []string{rawPath}, ChangedFileCount: 1,
+		ChangedFileBytes: [][]byte{[]byte(rawPath)}, ContentFingerprint: "content", ContentFingerprintVersion: worktreeFingerprintVersion,
+		IndexFingerprint: "index", DiffFingerprint: "diff",
+	}
+	encoded, err := json.Marshal(before)
+	if err != nil {
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
+	var after worktreeProgress
+	if err := json.Unmarshal(encoded, &after); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	if len(after.ChangedFileBytes) != 1 || !bytes.Equal(after.ChangedFileBytes[0], []byte(rawPath)) {
+		t.Fatalf("ChangedFileBytes = %#v, want lossless non-UTF-8 path", after.ChangedFileBytes)
+	}
+	if !sameWorktreeProgress(before, after) {
+		t.Fatalf("sameWorktreeProgress() = false after JSON round trip: before=%#v after=%#v", before, after)
 	}
 }
 

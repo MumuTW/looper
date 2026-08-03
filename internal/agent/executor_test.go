@@ -1760,6 +1760,25 @@ func TestExecutorObservesTimeoutOnlyAfterProcessGroupTermination(t *testing.T) {
 	}
 }
 
+func TestExecutorTimeoutObservationUsesConfiguredBudget(t *testing.T) {
+	t.Parallel()
+	const budget = 25 * time.Millisecond
+	x := &execution{input: RunInput{
+		TimeoutObservationBudget: budget,
+		OnBeforeTimeout: func(ctx context.Context, _ TimeoutObservation) error {
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	}}
+	started := time.Now()
+	if got := x.observeBeforeTimeout("max_runtime"); got == "" {
+		t.Fatal("observeBeforeTimeout() error = empty, want configured deadline error")
+	}
+	if elapsed := time.Since(started); elapsed < budget || elapsed > time.Second {
+		t.Fatalf("observation elapsed = %s, want approximately configured budget %s", elapsed, budget)
+	}
+}
+
 func TestExecutorReportsTimeoutWhenDeadlineWinsBeforeTermination(t *testing.T) {
 	t.Parallel()
 

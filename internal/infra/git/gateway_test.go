@@ -240,6 +240,9 @@ func TestGatewayInspectHeadRecordsExactRenamePathsAndDetachedBranch(t *testing.T
 	if got := inspect.StagedFiles; len(got) != 1 || got[0] != "after name.txt" {
 		t.Fatalf("InspectHead().StagedFiles = %#v, want exact rename destination", got)
 	}
+	if got := inspect.RenameSourceFiles; len(got) != 1 || got[0] != "before name.txt" {
+		t.Fatalf("InspectHead().RenameSourceFiles = %#v, want exact rename source", got)
+	}
 	if strings.Contains(inspect.ChangedFiles[0], " -> ") {
 		t.Fatalf("InspectHead().ChangedFiles = %#v, must not contain formatted rename text", inspect.ChangedFiles)
 	}
@@ -353,6 +356,25 @@ func TestGatewayInspectHeadContentFingerprintPreservesWhitespacePaths(t *testing
 	}
 	if first.ContentFingerprint == second.ContentFingerprint {
 		t.Fatalf("content fingerprint ignored content change in whitespace path: first=%q second=%q", first.ContentFingerprint, second.ContentFingerprint)
+	}
+}
+
+func TestGatewayInspectHeadDetectsStagedIndexOnlyWorktreeBytes(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	fixture := newFixture(t)
+	fixture.createMainOnlyRepo(t)
+	gateway := fixture.gateway()
+	indexFile := filepath.Join(fixture.rootDir, "staged-index-content")
+	writeFile(t, indexFile, "staged but not checked out\n")
+	indexObject := stringsTrimSpace(runGit(t, fixture.repoPath, "hash-object", "-w", indexFile))
+	runGit(t, fixture.repoPath, "update-index", "--cacheinfo", "100644,"+indexObject+",README.md")
+	inspect, err := gateway.InspectHead(ctx, InspectHeadInput{WorktreePath: fixture.repoPath})
+	if err != nil {
+		t.Fatalf("InspectHead() error = %v", err)
+	}
+	if !inspect.WorktreeMatchesHead {
+		t.Fatal("InspectHead().WorktreeMatchesHead = false, want true for staged index-only edit with old HEAD bytes")
 	}
 }
 

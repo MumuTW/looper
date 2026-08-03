@@ -3,6 +3,7 @@ package git
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha1"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -106,6 +107,9 @@ type InspectHeadResult struct {
 	// StagedFiles lists paths with non-space index status (including renames
 	// as the destination path only).
 	StagedFiles []string
+	// RenameSourceFiles lists the source path for each rename/copy status entry.
+	// It is kept separately so ChangedFiles remains the destination-path API.
+	RenameSourceFiles []string
 	// UntrackedFiles lists paths with ?? status.
 	UntrackedFiles []string
 	// DiffFingerprint fingerprints porcelain status codes and paths only (not
@@ -114,7 +118,11 @@ type InspectHeadResult struct {
 	ContentFingerprint        string
 	ContentFingerprintVersion string
 	IndexFingerprint          string
-	HeadDescendsFromCompare   bool
+	// WorktreeMatchesHead is true when the working-tree bytes still equal HEAD
+	// for the observed checkout. It distinguishes a staged-index-only change
+	// from a mixed staged/unstaged edit during a clean descendant transition.
+	WorktreeMatchesHead     bool
+	HeadDescendsFromCompare bool
 }
 
 type VerifyWorktreeIdentityInput struct {
@@ -129,7 +137,7 @@ type VerifyWorktreeIdentityInput struct {
 // WorktreeFingerprintVersion is persisted alongside timeout evidence. A daemon
 // upgrade must never compare a new content/index digest with an older algorithm
 // and silently authorize a replacement agent on incompatible evidence.
-const WorktreeFingerprintVersion = "v3"
+const WorktreeFingerprintVersion = "v4"
 
 type CommitInput struct {
 	RepoPath     string
@@ -875,7 +883,7 @@ func (g *Gateway) InspectHead(ctx context.Context, input InspectHeadInput) (Insp
 		}
 	}
 
-	statusResult, err := g.runGitResult(ctx, input.WorktreePath, nil, "status", "--porcelain", "--untracked-files=all", "--ignored=no")
+	statusResult, err := g.runGitResult(ctx, input.WorktreePath, nil, "status", "--porcelain", "-z", "--untracked-files=all", "--ignored=no")
 	if err != nil {
 		return InspectHeadResult{}, err
 	}
@@ -890,9 +898,13 @@ func (g *Gateway) InspectHead(ctx context.Context, input InspectHeadInput) (Insp
 	changedFiles := make([]string, 0, len(status))
 	stagedFiles := make([]string, 0)
 	untrackedFiles := make([]string, 0)
+	renameSourceFiles := make([]string, 0)
 	fingerprintParts := make([]string, 0, len(status))
 	for _, entry := range status {
 		changedFiles = append(changedFiles, entry.Path)
+		if entry.OriginalPath != "" {
+			renameSourceFiles = append(renameSourceFiles, entry.OriginalPath)
+		}
 		part := entry.Code + "\t" + entry.Path
 		if entry.OriginalPath != "" {
 			part += "\t" + entry.OriginalPath
@@ -916,15 +928,31 @@ func (g *Gateway) InspectHead(ctx context.Context, input InspectHeadInput) (Insp
 	contentPaths := make([]string, 0, len(status)+len(input.ContentPaths))
 	for _, entry := range status {
 		contentPaths = append(contentPaths, entry.Path)
+		if entry.OriginalPath != "" {
+			contentPaths = append(contentPaths, entry.OriginalPath)
+		}
 	}
 	contentPaths = append(contentPaths, input.ContentPaths...)
 	contentFingerprint, err := g.contentFingerprint(ctx, input.WorktreePath, contentPaths)
 	if err != nil {
 		return InspectHeadResult{}, err
 	}
-	indexFingerprint, err := g.indexFingerprint(ctx, input.WorktreePath, contentPaths)
-	if err != nil {
-		return InspectHeadResult{}, err
+	indexFingerprint := emptyIndexFingerprint()
+	if len(contentPaths) > 0 {
+		indexFingerprint, err = g.indexFingerprint(ctx, input.WorktreePath, contentPaths)
+		if err != nil {
+			return InspectHeadResult{}, err
+		}
+	}
+	worktreeMatchesHead := true
+	if len(status) > 0 {
+		worktreeMatchesHead, err = g.worktreeMatchesHead(ctx, input.WorktreePath, contentPaths)
+		if err != nil {
+			return InspectHeadResult{}, err
+		}
+		if len(untrackedFiles) > 0 {
+			worktreeMatchesHead = false
+		}
 	}
 
 	headDescendsFromCompare := false
@@ -943,12 +971,130 @@ func (g *Gateway) InspectHead(ctx context.Context, input InspectHeadInput) (Insp
 		ChangedFiles:              changedFiles,
 		StagedFiles:               stagedFiles,
 		UntrackedFiles:            untrackedFiles,
+		RenameSourceFiles:         renameSourceFiles,
 		DiffFingerprint:           diffFingerprint,
 		ContentFingerprint:        contentFingerprint,
 		ContentFingerprintVersion: WorktreeFingerprintVersion,
 		IndexFingerprint:          indexFingerprint,
+		WorktreeMatchesHead:       worktreeMatchesHead,
 		HeadDescendsFromCompare:   headDescendsFromCompare,
 	}, nil
+}
+
+func (g *Gateway) worktreeMatchesHead(ctx context.Context, worktreePath string, paths []string) (bool, error) {
+	unique := make(map[string]struct{}, len(paths))
+	for _, path := range paths {
+		if path == "" {
+			continue
+		}
+		if !filepath.IsLocal(path) {
+			return false, fmt.Errorf("unsafe worktree HEAD path %q", path)
+		}
+		unique[path] = struct{}{}
+	}
+	sortedPaths := make([]string, 0, len(unique))
+	for path := range unique {
+		sortedPaths = append(sortedPaths, path)
+	}
+	sort.Strings(sortedPaths)
+	if len(sortedPaths) == 0 {
+		return true, nil
+	}
+
+	// Read the HEAD tree once in bounded literal-pathspec batches. `git diff
+	// HEAD` includes staged changes, which cannot distinguish a staged-index-only
+	// edit whose working bytes still equal the old HEAD. Comparing Git blob IDs
+	// against the working bytes gives that distinction without one Git process
+	// per file.
+	tree := make(map[string]struct {
+		mode string
+		sha  string
+	})
+	const maxPathspecBytes = 16 * 1024
+	for start := 0; start < len(sortedPaths); {
+		end := start
+		bytesUsed := 0
+		for end < len(sortedPaths) {
+			pathBytes := len(sortedPaths[end]) + 1
+			if end > start && bytesUsed+pathBytes > maxPathspecBytes {
+				break
+			}
+			bytesUsed += pathBytes
+			end++
+		}
+		args := []string{"ls-tree", "-r", "-z", "--full-tree", "HEAD", "--"}
+		for _, path := range sortedPaths[start:end] {
+			args = append(args, ":(literal)"+path)
+		}
+		result, err := g.runGitResult(ctx, worktreePath, nil, args...)
+		if err != nil {
+			return false, err
+		}
+		if err := rejectTruncatedGitStdout(result, "ls-tree HEAD"); err != nil {
+			return false, err
+		}
+		for _, record := range strings.Split(result.Stdout, "\x00") {
+			separator := strings.IndexByte(record, '\t')
+			if separator < 0 {
+				continue
+			}
+			metadata := strings.Fields(record[:separator])
+			if len(metadata) < 3 {
+				continue
+			}
+			tree[record[separator+1:]] = struct {
+				mode string
+				sha  string
+			}{mode: metadata[0], sha: metadata[2]}
+		}
+		start = end
+	}
+
+	for _, path := range sortedPaths {
+		entry, inHead := tree[path]
+		info, err := os.Lstat(filepath.Join(worktreePath, path))
+		if errors.Is(err, os.ErrNotExist) {
+			if inHead {
+				return false, nil
+			}
+			continue
+		}
+		if err != nil {
+			return false, err
+		}
+		if !inHead {
+			return false, nil
+		}
+		if entry.mode == "160000" {
+			// A submodule checkout is a separate repository boundary. Its
+			// contents are handled by the submodule fingerprint; do not claim
+			// that its superproject gitlink is HEAD-identical here.
+			return false, nil
+		}
+		if !info.Mode().IsRegular() && info.Mode()&os.ModeSymlink == 0 {
+			return false, nil
+		}
+		var data []byte
+		if info.Mode()&os.ModeSymlink != 0 {
+			target, err := os.Readlink(filepath.Join(worktreePath, path))
+			if err != nil {
+				return false, err
+			}
+			data = []byte(target)
+		} else {
+			data, err = os.ReadFile(filepath.Join(worktreePath, path))
+			if err != nil {
+				return false, err
+			}
+		}
+		blob := sha1.New()
+		_, _ = fmt.Fprintf(blob, "blob %d\x00", len(data))
+		_, _ = blob.Write(data)
+		if hex.EncodeToString(blob.Sum(nil)) != entry.sha {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 // VerifyWorktreeIdentity compares the checkpoint's branch authority with the
@@ -1126,6 +1272,13 @@ func (g *Gateway) contentFingerprint(ctx context.Context, worktreePath string, p
 			continue
 		}
 		if info.IsDir() {
+			gitlink, err := g.isGitlinkPath(ctx, worktreePath, path)
+			if err != nil {
+				return "", fmt.Errorf("inspect directory content path %q: %w", path, err)
+			}
+			if !gitlink {
+				return "", fmt.Errorf("worktree content path %q is a directory but not a staged gitlink", path)
+			}
 			submoduleFingerprint, err := g.submoduleContentFingerprint(ctx, filepath.Join(worktreePath, path))
 			if err != nil {
 				return "", fmt.Errorf("fingerprint submodule %q: %w", path, err)
@@ -1166,24 +1319,67 @@ func (g *Gateway) contentFingerprint(ctx context.Context, worktreePath string, p
 	return fmt.Sprintf("%x", fingerprint.Sum(nil)), nil
 }
 
+// isGitlinkPath distinguishes a real submodule checkout from an ordinary
+// directory. Recursing into every directory is unsafe: an untracked directory
+// can contain the enclosing repository or an uninitialized submodule can have
+// no usable Git index at all. Only mode 160000 in the superproject index grants
+// permission to recurse.
+func (g *Gateway) isGitlinkPath(ctx context.Context, worktreePath, path string) (bool, error) {
+	result, err := g.runGitResult(ctx, worktreePath, nil, "ls-files", "--stage", "-z", "--", ":(literal)"+path)
+	if err != nil {
+		return false, err
+	}
+	if err := rejectTruncatedGitStdout(result, "ls-files --stage"); err != nil {
+		return false, err
+	}
+	for _, record := range strings.Split(result.Stdout, "\x00") {
+		separator := strings.IndexByte(record, '\t')
+		if separator < 0 || record[separator+1:] != path {
+			continue
+		}
+		metadata := strings.Fields(record[:separator])
+		return len(metadata) > 0 && metadata[0] == "160000", nil
+	}
+	return false, nil
+}
+
 func (g *Gateway) isAncestor(ctx context.Context, repoPath, ancestor, descendant string) (bool, error) {
 	result, err := g.runGitResult(ctx, repoPath, nil, "merge-base", "--is-ancestor", ancestor, descendant)
+	if err != nil {
+		// `--is-ancestor` legitimately exits 1 for a non-descendant. The
+		// shell wrapper returns that exit as a CommandExecutionError, so
+		// classify only that explicit result as false; a start/cancel/transport
+		// error with a zero or unknown result must remain fail-closed.
+		var commandErr *shell.CommandExecutionError
+		if errors.As(err, &commandErr) && commandErr.Result.ExitCode == 1 {
+			return false, nil
+		}
+		return false, fmt.Errorf("git merge-base --is-ancestor %s %s: %w", ancestor, descendant, err)
+	}
 	if result.ExitCode == 0 {
 		return true, nil
 	}
 	if result.ExitCode == 1 {
 		return false, nil
 	}
-	return false, fmt.Errorf("git merge-base --is-ancestor %s %s: %w", ancestor, descendant, err)
+	return false, fmt.Errorf("git merge-base --is-ancestor %s %s exited with unexpected status %d", ancestor, descendant, result.ExitCode)
+}
+
+func emptyIndexFingerprint() string {
+	h := sha256.New()
+	_, _ = h.Write([]byte(WorktreeFingerprintVersion))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte("empty-index"))
+	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
 // indexFingerprint records the staged blob, mode, stage, and exact path for
 // every tracked path participating in a timeout observation. Working-tree bytes
 // alone cannot detect an MM transition where the index is replaced while the
 // checkout contents stay unchanged. Gitlink entries are followed into the
-// submodule so an index-only edit inside a dirty submodule is evidence too. Gitlink entries are followed into the
 // submodule so an index-only edit inside a dirty submodule is evidence too.
 func (g *Gateway) indexFingerprint(ctx context.Context, worktreePath string, paths []string) (string, error) {
+	allPaths := paths == nil
 	unique := make(map[string]struct{}, len(paths))
 	for _, path := range paths {
 		if path == "" {
@@ -1199,20 +1395,73 @@ func (g *Gateway) indexFingerprint(ctx context.Context, worktreePath string, pat
 		sortedPaths = append(sortedPaths, path)
 	}
 	sort.Strings(sortedPaths)
-	args := []string{"ls-files", "--stage", "-z", "--"}
-	args = append(args, sortedPaths...)
-	result, err := g.runGitResult(ctx, worktreePath, nil, args...)
-	if err != nil {
-		return "", err
+	if !allPaths && len(sortedPaths) == 0 {
+		return emptyIndexFingerprint(), nil
 	}
-	if err := rejectTruncatedGitStdout(result, "ls-files --stage"); err != nil {
-		return "", err
+
+	// Keep pathspecs literal and bounded. A large rename/dirty set must not
+	// turn into an argv-sized Git failure; chunking also avoids a full-index
+	// capture for ordinary timeout evidence. Recursive submodule calls pass nil
+	// deliberately and use one complete index capture.
+	recordSet := make(map[string]struct{})
+	readRecords := func(result shell.Result) {
+		for _, record := range strings.Split(result.Stdout, "\x00") {
+			if record != "" {
+				recordSet[record] = struct{}{}
+			}
+		}
 	}
+	if allPaths {
+		result, err := g.runGitResult(ctx, worktreePath, nil, "ls-files", "--stage", "-z")
+		if err != nil {
+			return "", err
+		}
+		if err := rejectTruncatedGitStdout(result, "ls-files --stage"); err != nil {
+			return "", err
+		}
+		readRecords(result)
+	} else {
+		const maxPathspecBytes = 16 * 1024
+		for start := 0; start < len(sortedPaths); {
+			end := start
+			bytesUsed := 0
+			for end < len(sortedPaths) {
+				pathBytes := len(sortedPaths[end]) + 1
+				if end > start && bytesUsed+pathBytes > maxPathspecBytes {
+					break
+				}
+				bytesUsed += pathBytes
+				end++
+			}
+			args := []string{"ls-files", "--stage", "-z", "--"}
+			for _, path := range sortedPaths[start:end] {
+				args = append(args, ":(literal)"+path)
+			}
+			result, err := g.runGitResult(ctx, worktreePath, nil, args...)
+			if err != nil {
+				return "", err
+			}
+			if err := rejectTruncatedGitStdout(result, "ls-files --stage"); err != nil {
+				return "", err
+			}
+			readRecords(result)
+			start = end
+		}
+	}
+	records := make([]string, 0, len(recordSet))
+	for record := range recordSet {
+		records = append(records, record)
+	}
+	sort.Strings(records)
 	fingerprint := sha256.New()
 	_, _ = fingerprint.Write([]byte(WorktreeFingerprintVersion))
 	_, _ = fingerprint.Write([]byte{0})
-	_, _ = fingerprint.Write([]byte(result.Stdout))
-	for _, path := range stagedGitlinkPaths(result.Stdout) {
+	for _, record := range records {
+		_, _ = fingerprint.Write([]byte(record))
+		_, _ = fingerprint.Write([]byte{0})
+	}
+	allRecords := strings.Join(records, "\x00")
+	for _, path := range stagedGitlinkPaths(allRecords) {
 		if !filepath.IsLocal(path) {
 			return "", fmt.Errorf("unsafe submodule index path %q", path)
 		}
@@ -1766,7 +2015,7 @@ type statusEntry struct {
 }
 
 func (g *Gateway) readStatus(ctx context.Context, repoPath string) ([]statusEntry, error) {
-	result, err := g.runGitResult(ctx, repoPath, nil, "status", "--porcelain", "--untracked-files=all", "--ignored=no")
+	result, err := g.runGitResult(ctx, repoPath, nil, "status", "--porcelain", "-z", "--untracked-files=all", "--ignored=no")
 	if err != nil {
 		return nil, err
 	}
@@ -1782,6 +2031,9 @@ func parseStatusResult(result shell.Result) ([]statusEntry, error) {
 	if result.StdoutTruncated {
 		return nil, fmt.Errorf("git status output exceeded capture limit")
 	}
+	if strings.IndexByte(result.Stdout, 0) >= 0 {
+		return parseNULStatusResult(result.Stdout), nil
+	}
 	entries := []statusEntry{}
 	for _, line := range strings.Split(result.Stdout, "\n") {
 		line = strings.TrimRight(line, "\r")
@@ -1794,12 +2046,12 @@ func parseStatusResult(result shell.Result) ([]statusEntry, error) {
 		if line[:2] == "!!" {
 			continue
 		}
-		code, path := line[:2], strings.TrimSpace(line[3:])
+		code, path := line[:2], line[3:]
 		originalPath := ""
 		// Renames/copies: "R  old -> new" — keep the destination path only.
 		if idx := strings.Index(path, " -> "); idx >= 0 {
-			originalPath = strings.TrimSpace(path[:idx])
-			path = strings.TrimSpace(path[idx+4:])
+			originalPath = path[:idx]
+			path = path[idx+4:]
 		}
 		// Quoted paths from git for special characters.
 		if len(path) >= 2 && path[0] == '"' && path[len(path)-1] == '"' {
@@ -1815,6 +2067,40 @@ func parseStatusResult(result shell.Result) ([]statusEntry, error) {
 		entries = append(entries, statusEntry{Code: code, Path: path, OriginalPath: originalPath})
 	}
 	return entries, nil
+}
+
+// parseNULStatusResult consumes porcelain-v1 -z records. Git emits rename and
+// copy entries as destination\x00source, so no quoting or whitespace trimming is
+// involved; the returned Go strings retain the exact byte sequence from Git.
+func parseNULStatusResult(output string) []statusEntry {
+	parts := strings.Split(output, "\x00")
+	entries := make([]statusEntry, 0, len(parts))
+	for i := 0; i < len(parts); i++ {
+		record := parts[i]
+		if len(record) < 3 {
+			continue
+		}
+		code := record[:2]
+		if code == "!!" {
+			if (code[0] == 'R' || code[0] == 'C') && i+1 < len(parts) {
+				i++
+			}
+			continue
+		}
+		path := record[3:]
+		originalPath := ""
+		if code[0] == 'R' || code[0] == 'C' {
+			if i+1 < len(parts) {
+				originalPath = parts[i+1]
+				i++
+			}
+		}
+		if code == "??" && isArtifactExcludedUntrackedPath(path) {
+			continue
+		}
+		entries = append(entries, statusEntry{Code: code, Path: path, OriginalPath: originalPath})
+	}
+	return entries
 }
 
 func (g *Gateway) runGit(ctx context.Context, cwd string, env map[string]string, args ...string) error {

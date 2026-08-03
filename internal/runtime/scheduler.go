@@ -1738,7 +1738,7 @@ func (a workerGitAdapter) InspectHead(ctx context.Context, input worker.InspectH
 	if err != nil {
 		return worker.InspectHeadResult{}, err
 	}
-	return worker.InspectHeadResult{HeadSHA: result.HeadSHA, Branch: result.Branch, NewCommitSHAs: result.NewCommitSHAs, HasUncommittedChanges: result.HasUncommittedChanges, ChangedFiles: result.ChangedFiles, StagedFiles: result.StagedFiles, UntrackedFiles: result.UntrackedFiles, DiffFingerprint: result.DiffFingerprint, ContentFingerprint: result.ContentFingerprint, ContentFingerprintVersion: result.ContentFingerprintVersion, IndexFingerprint: result.IndexFingerprint, HeadDescendsFromCompare: result.HeadDescendsFromCompare}, nil
+	return worker.InspectHeadResult{HeadSHA: result.HeadSHA, Branch: result.Branch, NewCommitSHAs: result.NewCommitSHAs, HasUncommittedChanges: result.HasUncommittedChanges, ChangedFiles: result.ChangedFiles, StagedFiles: result.StagedFiles, UntrackedFiles: result.UntrackedFiles, RenameSourceFiles: result.RenameSourceFiles, DiffFingerprint: result.DiffFingerprint, ContentFingerprint: result.ContentFingerprint, ContentFingerprintVersion: result.ContentFingerprintVersion, IndexFingerprint: result.IndexFingerprint, WorktreeMatchesHead: result.WorktreeMatchesHead, HeadDescendsFromCompare: result.HeadDescendsFromCompare}, nil
 }
 
 func (a workerGitAdapter) VerifyWorktreeIdentity(ctx context.Context, input worker.VerifyWorktreeIdentityInput) error {
@@ -1779,7 +1779,8 @@ func (a workerAgentExecutorAdapter) Start(ctx context.Context, input worker.Agen
 		ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID,
 		Prompt: input.Prompt, NativeResumePrompt: input.NativeResumePrompt, NativeSessionID: input.NativeSessionID,
 		WorkingDirectory: input.WorkingDirectory, Timeout: input.Timeout, HeartbeatTimeout: input.HeartbeatTimeout,
-		Metadata: input.Metadata, IdempotencyKey: input.IdempotencyKey,
+		TimeoutObservationBudget: input.TimeoutObservationBudget,
+		Metadata:                 input.Metadata, IdempotencyKey: input.IdempotencyKey,
 		RestrictToolNetwork: input.RestrictToolNetwork,
 		OnBeforeTimeout:     input.OnBeforeTimeout,
 		UseSnapshot:         input.UseSnapshot, SnapshotVendor: input.SnapshotVendor, SnapshotModel: input.SnapshotModel,

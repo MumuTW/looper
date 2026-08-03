@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha1"
 	"database/sql"
@@ -58,7 +59,7 @@ const (
 	// Keep in lockstep with internal/infra/git.WorktreeFingerprintVersion; this
 	// package owns the persisted checkpoint comparison without importing the
 	// concrete gateway implementation.
-	worktreeFingerprintVersion = "v3"
+	worktreeFingerprintVersion = "v4"
 	personalIssueQueryLimit    = 100
 
 	workerBranchSlugMaxLength        = 30
@@ -324,10 +325,12 @@ type InspectHeadResult struct {
 	ChangedFiles              []string
 	StagedFiles               []string
 	UntrackedFiles            []string
+	RenameSourceFiles         []string
 	DiffFingerprint           string
 	ContentFingerprint        string
 	ContentFingerprintVersion string
 	IndexFingerprint          string
+	WorktreeMatchesHead       bool
 	HeadDescendsFromCompare   bool
 }
 
@@ -361,20 +364,21 @@ type GitGateway interface {
 }
 
 type AgentRunInput struct {
-	ExecutionID         string
-	ProjectID           string
-	LoopID              string
-	RunID               string
-	Prompt              string
-	NativeResumePrompt  string
-	NativeSessionID     string
-	WorkingDirectory    string
-	Timeout             time.Duration
-	HeartbeatTimeout    time.Duration
-	Metadata            map[string]any
-	IdempotencyKey      string
-	RestrictToolNetwork bool
-	OnBeforeTimeout     func(context.Context, agent.TimeoutObservation) error
+	ExecutionID              string
+	ProjectID                string
+	LoopID                   string
+	RunID                    string
+	Prompt                   string
+	NativeResumePrompt       string
+	NativeSessionID          string
+	WorkingDirectory         string
+	Timeout                  time.Duration
+	HeartbeatTimeout         time.Duration
+	TimeoutObservationBudget time.Duration
+	Metadata                 map[string]any
+	IdempotencyKey           string
+	RestrictToolNetwork      bool
+	OnBeforeTimeout          func(context.Context, agent.TimeoutObservation) error
 	// UseSnapshot + SnapshotVendor/Model override the executor config for this
 	// start when the run has a durable agent snapshot (execution authority).
 	UseSnapshot    bool
@@ -475,10 +479,13 @@ type Options struct {
 	Now                             func() time.Time
 	AgentTimeout                    time.Duration
 	AgentIdleTimeout                time.Duration
-	ClaimTTL                        time.Duration
-	ValidationCommands              []string
-	ValidationCommandsByProject     map[string][]string
-	ValidationRunner                ValidationRunner
+	// TimeoutObservationBudget bounds the Git evidence callback after an agent
+	// timeout. Zero uses the executor's conservative default.
+	TimeoutObservationBudget    time.Duration
+	ClaimTTL                    time.Duration
+	ValidationCommands          []string
+	ValidationCommandsByProject map[string][]string
+	ValidationRunner            ValidationRunner
 	// ContainmentTracker registers validation shell handles with the Execution
 	// Supervisor for shutdown drain / retain-storage (#577). Nil in tests or
 	// when the runner is not daemon-owned.
@@ -567,6 +574,7 @@ type Runner struct {
 	now                         func() time.Time
 	agentTimeout                time.Duration
 	agentIdleTimeout            time.Duration
+	timeoutObservationBudget    time.Duration
 	claimTTL                    time.Duration
 	validationCommands          []string
 	validationCommandsByProject map[string][]string
@@ -707,19 +715,28 @@ type checkpointExecution struct {
 // content. It is captured immediately before an executor timeout terminates
 // the process group, so a retry can prove what it inherited.
 type worktreeProgress struct {
-	HeadSHA                   string   `json:"headSha,omitempty"`
-	WorktreeID                string   `json:"worktreeId,omitempty"`
-	Branch                    string   `json:"branch,omitempty"`
-	ChangedFiles              []string `json:"changedFiles,omitempty"`
-	ChangedFileCount          int      `json:"changedFileCount"`
-	StagedFiles               []string `json:"stagedFiles,omitempty"`
-	StagedFileCount           int      `json:"stagedFileCount"`
-	UntrackedFiles            []string `json:"untrackedFiles,omitempty"`
-	UntrackedFileCount        int      `json:"untrackedFileCount"`
+	HeadSHA            string   `json:"headSha,omitempty"`
+	WorktreeID         string   `json:"worktreeId,omitempty"`
+	Branch             string   `json:"branch,omitempty"`
+	ChangedFiles       []string `json:"changedFiles,omitempty"`
+	ChangedFileCount   int      `json:"changedFileCount"`
+	StagedFiles        []string `json:"stagedFiles,omitempty"`
+	StagedFileCount    int      `json:"stagedFileCount"`
+	UntrackedFiles     []string `json:"untrackedFiles,omitempty"`
+	UntrackedFileCount int      `json:"untrackedFileCount"`
+	RenameSourceFiles  []string `json:"renameSourceFiles,omitempty"`
+	// The string path fields are kept for human-facing diagnostics. The byte
+	// fields are the lossless comparison authority: encoding/json base64-encodes
+	// []byte so Git paths that are not valid UTF-8 survive checkpoint round trips.
+	ChangedFileBytes          [][]byte `json:"changedFileBytes,omitempty"`
+	StagedFileBytes           [][]byte `json:"stagedFileBytes,omitempty"`
+	UntrackedFileBytes        [][]byte `json:"untrackedFileBytes,omitempty"`
+	RenameSourceFileBytes     [][]byte `json:"renameSourceFileBytes,omitempty"`
 	DiffFingerprint           string   `json:"diffFingerprint,omitempty"`
 	ContentFingerprint        string   `json:"contentFingerprint,omitempty"`
 	ContentFingerprintVersion string   `json:"contentFingerprintVersion,omitempty"`
 	IndexFingerprint          string   `json:"indexFingerprint,omitempty"`
+	WorktreeMatchesHead       bool     `json:"worktreeMatchesHead"`
 	HeadDescendsFromCompare   bool     `json:"-"`
 	TimeoutType               string   `json:"timeoutType,omitempty"`
 	LastProgressAt            string   `json:"lastProgressAt,omitempty"`
@@ -1111,6 +1128,7 @@ func New(options Options) *Runner {
 	if agentIdleTimeout <= 0 {
 		agentIdleTimeout = 15 * time.Minute
 	}
+	timeoutObservationBudget := options.TimeoutObservationBudget
 	claimTTL := options.ClaimTTL
 	if claimTTL <= 0 {
 		claimTTL = defaultClaimTTL
@@ -1149,6 +1167,7 @@ func New(options Options) *Runner {
 		now:                         now,
 		agentTimeout:                agentTimeout,
 		agentIdleTimeout:            agentIdleTimeout,
+		timeoutObservationBudget:    timeoutObservationBudget,
 		claimTTL:                    claimTTL,
 		validationCommands:          append([]string(nil), options.ValidationCommands...),
 		validationCommandsByProject: cloneValidationCommandsByProject(options.ValidationCommandsByProject),
@@ -2357,10 +2376,26 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 			progressMu         sync.Mutex
 		)
 		onBeforeTimeout := func(timeoutCtx context.Context, observation agent.TimeoutObservation) error {
+			// Persist the intent before touching Git. A daemon crash during status,
+			// content, or index capture must leave a durable fail-closed marker;
+			// otherwise recovery cannot distinguish an untouched timeout from an
+			// observation that was interrupted halfway through.
+			progressMu.Lock()
+			checkpoint.Execution = &checkpointExecution{Status: "timeout_observing", ProgressSnapshotError: "worker timeout observation in progress"}
+			checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
+			if err := r.persistCheckpoint(timeoutCtx, input.Run.ID, checkpoint); err != nil {
+				progressMu.Unlock()
+				return fmt.Errorf("persist worker timeout observation intent: %w", err)
+			}
+			progressMu.Unlock()
+
 			progress, progressErr := r.captureWorktreeProgress(timeoutCtx, input.Project, work, worktree, observation, nil)
 			progressMu.Lock()
 			defer progressMu.Unlock()
 			if progressErr != nil {
+				if timeoutCtx.Err() != nil {
+					return timeoutCtx.Err()
+				}
 				checkpoint.Execution = &checkpointExecution{Status: "timeout_observing", ProgressSnapshotError: progressErr.Error()}
 				checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
 				if persistErr := r.persistCheckpoint(timeoutCtx, input.Run.ID, checkpoint); persistErr != nil {
@@ -2379,7 +2414,7 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 		execution, err := r.agentExecutor.Start(ctx, AgentRunInput{
 			ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID,
 			Prompt: prompt, NativeResumePrompt: nativeResumePrompt, NativeSessionID: nativeSessionID,
-			WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout,
+			WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout, TimeoutObservationBudget: r.timeoutObservationBudget,
 			Metadata: metadata, IdempotencyKey: fmt.Sprintf("worker:%s", input.Loop.ID),
 			RestrictToolNetwork: len(validationCommands) > 0,
 			OnBeforeTimeout:     onBeforeTimeout,
@@ -2491,6 +2526,7 @@ func (r *Runner) captureWorktreeProgress(ctx context.Context, project storage.Pr
 	compareHeadSHA := ""
 	if compare != nil {
 		contentPaths = append(contentPaths, compare.ChangedFiles...)
+		contentPaths = append(contentPaths, compare.RenameSourceFiles...)
 		compareHeadSHA = compare.HeadSHA
 	}
 	inspect, err := r.git.InspectHead(ctx, InspectHeadInput{RepoPath: project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, BaseRef: firstNonEmpty(worktree.HeadSHA, worktree.BaseBranch, work.BaseBranch), ContentPaths: contentPaths, CompareHeadSHA: compareHeadSHA})
@@ -2498,21 +2534,27 @@ func (r *Runner) captureWorktreeProgress(ctx context.Context, project storage.Pr
 		return worktreeProgress{}, err
 	}
 	return worktreeProgress{
-		HeadSHA:            inspect.HeadSHA,
-		WorktreeID:         worktree.ID,
-		Branch:             inspect.Branch,
-		ChangedFiles:       boundPathList(inspect.ChangedFiles, worktreeProgressPathCap),
-		ChangedFileCount:   len(inspect.ChangedFiles),
-		StagedFiles:        boundPathList(inspect.StagedFiles, worktreeProgressPathCap),
-		StagedFileCount:    len(inspect.StagedFiles),
-		UntrackedFiles:     boundPathList(inspect.UntrackedFiles, worktreeProgressPathCap),
-		UntrackedFileCount: len(inspect.UntrackedFiles),
-		DiffFingerprint:    inspect.DiffFingerprint, ContentFingerprint: inspect.ContentFingerprint,
+		HeadSHA:               inspect.HeadSHA,
+		WorktreeID:            worktree.ID,
+		Branch:                inspect.Branch,
+		ChangedFiles:          boundPathList(inspect.ChangedFiles, worktreeProgressPathCap),
+		ChangedFileCount:      len(inspect.ChangedFiles),
+		StagedFiles:           boundPathList(inspect.StagedFiles, worktreeProgressPathCap),
+		StagedFileCount:       len(inspect.StagedFiles),
+		UntrackedFiles:        boundPathList(inspect.UntrackedFiles, worktreeProgressPathCap),
+		UntrackedFileCount:    len(inspect.UntrackedFiles),
+		RenameSourceFiles:     boundPathList(inspect.RenameSourceFiles, worktreeProgressPathCap),
+		ChangedFileBytes:      pathByteList(boundPathList(inspect.ChangedFiles, worktreeProgressPathCap)),
+		StagedFileBytes:       pathByteList(boundPathList(inspect.StagedFiles, worktreeProgressPathCap)),
+		UntrackedFileBytes:    pathByteList(boundPathList(inspect.UntrackedFiles, worktreeProgressPathCap)),
+		RenameSourceFileBytes: pathByteList(boundPathList(inspect.RenameSourceFiles, worktreeProgressPathCap)),
+		DiffFingerprint:       inspect.DiffFingerprint, ContentFingerprint: inspect.ContentFingerprint,
 		ContentFingerprintVersion: firstNonEmpty(inspect.ContentFingerprintVersion, worktreeFingerprintVersion),
 		IndexFingerprint:          inspect.IndexFingerprint, HeadDescendsFromCompare: inspect.HeadDescendsFromCompare,
-		TimeoutType:    observation.TimeoutType,
-		LastProgressAt: observation.LastProgressAt,
-		CapturedAt:     eventlog.FormatJavaScriptISOString(r.now().UTC()),
+		WorktreeMatchesHead: inspect.WorktreeMatchesHead,
+		TimeoutType:         observation.TimeoutType,
+		LastProgressAt:      observation.LastProgressAt,
+		CapturedAt:          eventlog.FormatJavaScriptISOString(r.now().UTC()),
 	}, nil
 }
 
@@ -2525,6 +2567,17 @@ func boundPathList(paths []string, capN int) []string {
 		return append([]string(nil), paths...)
 	}
 	return append([]string(nil), paths[:capN]...)
+}
+
+func pathByteList(paths []string) [][]byte {
+	if len(paths) == 0 {
+		return nil
+	}
+	result := make([][]byte, len(paths))
+	for i, path := range paths {
+		result[i] = append([]byte(nil), []byte(path)...)
+	}
+	return result
 }
 
 func (r *Runner) verifyTimeoutProgressAfterTermination(ctx context.Context, project storage.ProjectRecord, work workerInput, worktree checkpointWorktree, before worktreeProgress) error {
@@ -2569,7 +2622,22 @@ func (r *Runner) verifyTimeoutProgressBeforeReplacement(ctx context.Context, pro
 }
 
 func sameWorktreeProgress(before, after worktreeProgress) bool {
-	return before.HeadSHA == after.HeadSHA && before.Branch == after.Branch && before.DiffFingerprint == after.DiffFingerprint && before.ContentFingerprintVersion == after.ContentFingerprintVersion && before.ContentFingerprint != "" && before.ContentFingerprint == after.ContentFingerprint && before.IndexFingerprint == after.IndexFingerprint && equalStringSlices(before.ChangedFiles, after.ChangedFiles) && equalStringSlices(before.StagedFiles, after.StagedFiles) && equalStringSlices(before.UntrackedFiles, after.UntrackedFiles)
+	return before.HeadSHA == after.HeadSHA && before.Branch == after.Branch && before.DiffFingerprint == after.DiffFingerprint && before.ContentFingerprintVersion == after.ContentFingerprintVersion && before.ContentFingerprint != "" && before.ContentFingerprint == after.ContentFingerprint && before.IndexFingerprint == after.IndexFingerprint && equalPathEvidence(before.ChangedFiles, before.ChangedFileBytes, after.ChangedFiles, after.ChangedFileBytes) && equalPathEvidence(before.StagedFiles, before.StagedFileBytes, after.StagedFiles, after.StagedFileBytes) && equalPathEvidence(before.UntrackedFiles, before.UntrackedFileBytes, after.UntrackedFiles, after.UntrackedFileBytes) && equalPathEvidence(before.RenameSourceFiles, before.RenameSourceFileBytes, after.RenameSourceFiles, after.RenameSourceFileBytes)
+}
+
+func equalPathEvidence(left []string, leftBytes [][]byte, right []string, rightBytes [][]byte) bool {
+	if len(leftBytes) == len(left) && len(rightBytes) == len(right) && (len(leftBytes) > 0 || len(rightBytes) > 0) {
+		if len(leftBytes) != len(rightBytes) {
+			return false
+		}
+		for i := range leftBytes {
+			if !bytes.Equal(leftBytes[i], rightBytes[i]) {
+				return false
+			}
+		}
+		return true
+	}
+	return equalStringSlices(left, right)
 }
 
 func preservesWorktreeProgress(before, after worktreeProgress) bool {
@@ -2585,7 +2653,7 @@ func preservesWorktreeProgress(before, after worktreeProgress) bool {
 		}
 		// A clean timeout snapshot may have been committed before retry. Accept
 		// only a descendant of the recorded head on the same branch.
-		return before.ContentFingerprintVersion == worktreeFingerprintVersion && after.ContentFingerprintVersion == worktreeFingerprintVersion && before.ContentFingerprint != "" && after.ContentFingerprint != "" && after.HeadDescendsFromCompare
+		return before.ContentFingerprintVersion == worktreeFingerprintVersion && after.ContentFingerprintVersion == worktreeFingerprintVersion && before.ContentFingerprint != "" && after.ContentFingerprint != "" && before.Branch == after.Branch && after.HeadDescendsFromCompare
 	}
 	// Checkpoints written before the versioned content/index evidence existed
 	// cannot prove that predecessor edits survived. Stop for operator review
@@ -2596,7 +2664,19 @@ func preservesWorktreeProgress(before, after worktreeProgress) bool {
 	if sameWorktreeProgress(before, after) {
 		return true
 	}
-	return before.HeadSHA != "" && after.HeadSHA != "" && before.HeadSHA != after.HeadSHA && before.Branch == after.Branch && after.ChangedFileCount == 0 && after.HeadDescendsFromCompare && after.ContentFingerprintVersion == worktreeFingerprintVersion && before.ContentFingerprint == after.ContentFingerprint
+	if before.HeadSHA == "" || after.HeadSHA == "" || before.HeadSHA == after.HeadSHA || before.Branch != after.Branch || after.ChangedFileCount != 0 || !after.HeadDescendsFromCompare || after.ContentFingerprintVersion != worktreeFingerprintVersion {
+		return false
+	}
+	if before.ContentFingerprint == after.ContentFingerprint {
+		return true
+	}
+	// A staged-index-only snapshot can have old HEAD bytes in the worktree and
+	// newer staged bytes in the index. A descendant commit legitimately turns
+	// that into a clean checkout, so compare the recorded index evidence rather
+	// than rejecting the valid transition as a content mismatch. Mixed
+	// staged/unstaged edits remain fail-closed because WorktreeMatchesHead is
+	// false for them.
+	return before.WorktreeMatchesHead && before.IndexFingerprint != "" && before.IndexFingerprint == after.IndexFingerprint
 }
 
 func equalStringSlices(left, right []string) bool {

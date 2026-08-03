@@ -158,11 +158,17 @@ type RunInput struct {
 	HeartbeatTimeout   time.Duration
 	GracefulShutdown   time.Duration
 	MaxOutputBytes     int
-	Metadata           map[string]any
-	IdempotencyKey     string
-	Env                map[string]string
-	// OnBeforeTimeout runs synchronously before this execution signals its
-	// process group for an idle or max-runtime timeout. It is for daemon-owned
+	// TimeoutObservationBudget bounds the daemon-owned observation callback
+	// that runs after a timeout process group is contained. A zero value keeps
+	// the conservative default; callers that need a larger Git observation
+	// window must set it explicitly rather than relying on a hidden constant.
+	TimeoutObservationBudget time.Duration
+	Metadata                 map[string]any
+	IdempotencyKey           string
+	Env                      map[string]string
+	// OnBeforeTimeout runs synchronously after an idle or max-runtime timeout
+	// terminates this execution's process group and that group is confirmed dead,
+	// and before terminal timeout persistence. It is for daemon-owned
 	// durability observations, never for business policy or process control.
 	// Its error is reported in Result but cannot prevent termination.
 	OnBeforeTimeout func(context.Context, TimeoutObservation) error
@@ -1198,7 +1204,11 @@ func (x *execution) observeBeforeTimeout(timeoutType string) string {
 	if callback == nil {
 		return ""
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	budget := x.input.TimeoutObservationBudget
+	if budget <= 0 {
+		budget = 5 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
 	if err := callback(ctx, TimeoutObservation{TimeoutType: timeoutType, LastProgressAt: x.lastProgressAtISO()}); err != nil {
 		return err.Error()
@@ -1532,7 +1542,13 @@ func (x *execution) runCheckpointFallback(ctx context.Context, nativeError strin
 		cancel()
 	}
 	if timedOut {
-		preTimeoutError = x.observeBeforeTimeout(timeoutType)
+		// A native-resume fallback has a fresh containment handle. Do not let
+		// its timeout snapshot race descendants that survived the leader exit.
+		if err := x.ensureConfirmedDeadBeforeTerminal(); err != nil {
+			preTimeoutError = err.Error()
+		} else {
+			preTimeoutError = x.observeBeforeTimeout(timeoutType)
+		}
 	}
 	stdout := x.stdoutString()
 	stderr := x.stderrString()
