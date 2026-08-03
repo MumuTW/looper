@@ -322,8 +322,6 @@ func RunContainerSweep(ctx context.Context, options ContainerSweepOptions) (Disk
 				if budget < 0 {
 					budget = 0
 				}
-				result.Summary.Scanned += nested.Summary.Scanned
-				result.Summary.Unregistered += nested.Summary.Unregistered
 				result.Summary.WouldRemove += nested.Summary.WouldRemove
 				result.Summary.Removed += nested.Summary.Removed
 				result.Summary.Skipped += nested.Summary.Skipped

@@ -929,6 +929,33 @@ func TestRunContainerSweepProtectsDeepLiveProjectAncestors(t *testing.T) {
 	}
 }
 
+func TestRunContainerSweepKeepsNestedProjectCountsOutOfContainerCounters(t *testing.T) {
+	sharedRoot := t.TempDir()
+	container := filepath.Join(sharedRoot, "repo-live")
+	liveRoot := filepath.Join(container, "project-live")
+	mkdirAt(t, filepath.Join(liveRoot, "worker-worktree"), old())
+	orphan := mkdirAt(t, filepath.Join(container, "project-orphan", "worker-worktree"), old())
+	for _, path := range []string{filepath.Join(container, "project-live"), filepath.Join(container, "project-orphan"), container} {
+		if err := os.Chtimes(path, old(), old()); err != nil {
+			t.Fatalf("Chtimes(%q) error = %v", path, err)
+		}
+	}
+
+	var removed []string
+	options := containerOptions(sharedRoot, []string{"repo-live"}, stubSweepGit{}, &removed)
+	options.LiveProjectPaths = []string{liveRoot}
+	plan, err := RunContainerSweep(context.Background(), options)
+	if err != nil {
+		t.Fatalf("RunContainerSweep() error = %v", err)
+	}
+	if len(removed) != 1 || removed[0] != filepath.Dir(orphan) {
+		t.Fatalf("removed = %v, want orphan project only", removed)
+	}
+	if plan.Summary.Scanned != 1 || plan.Summary.Unregistered != 0 {
+		t.Fatalf("summary = %#v, want top-level container counts only", plan.Summary)
+	}
+}
+
 func TestRunContainerSweepPreservesContainerWithRegisteredCheckout(t *testing.T) {
 	sharedRoot := t.TempDir()
 	container := filepath.Join(sharedRoot, "repo-dead")
