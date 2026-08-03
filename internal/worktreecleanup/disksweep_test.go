@@ -129,6 +129,38 @@ func TestPlanDiskSweepGates(t *testing.T) {
 	}
 }
 
+func TestPlanDiskSweepMatchesGitPathThroughSymlinkedRoot(t *testing.T) {
+	realRoot := filepath.Join(t.TempDir(), "real-worktrees")
+	if err := os.MkdirAll(realRoot, 0o755); err != nil {
+		t.Fatalf("MkdirAll(realRoot) error = %v", err)
+	}
+	symlinkRoot := filepath.Join(t.TempDir(), "worktrees-link")
+	if err := os.Symlink(realRoot, symlinkRoot); err != nil {
+		t.Skipf("Symlink() unsupported: %v", err)
+	}
+	checkout := mkdirAt(t, filepath.Join(realRoot, "looper-app-live"), old())
+
+	plan := PlanDiskSweep(DiskSweepPlanInput{
+		Root: DiskSweepRoot{
+			ProjectID:    "app",
+			RepoPath:     filepath.Join(t.TempDir(), "repo"),
+			WorktreeRoot: symlinkRoot,
+		},
+		Entries: []DiskEntry{{
+			Path:       filepath.Join(symlinkRoot, filepath.Base(checkout)),
+			IsDir:      true,
+			ModifiedAt: old(),
+		}},
+		GitTrackedPaths: []string{checkout},
+		Budget:          1,
+		RetentionCutoff: sweepCutoff(),
+	})
+
+	if action, reason := reasonFor(t, plan, filepath.Join(symlinkRoot, filepath.Base(checkout))); action != ActionSkipped || reason != "git_tracked" {
+		t.Fatalf("candidate = (%q, %q), want symlink-resolved git_tracked skip", action, reason)
+	}
+}
+
 // A bounded budget must spend itself on the longest-dead debris, not on
 // whatever order the filesystem returned. Without this an operator draining a
 // large backlog would keep retiring recently-abandoned directories while the

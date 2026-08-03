@@ -895,5 +895,5 @@ func normalizedPathSet(paths []string) map[string]bool {
 }
 
 func normalizeSweepPath(path string) string {
-	return filepath.Clean(strings.TrimSpace(path))
+	return worktreesafety.NormalizePath(strings.TrimSpace(path))
 }
