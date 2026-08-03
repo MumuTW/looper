@@ -678,6 +678,29 @@ func TestBrownoutTransitionDedupeSuffixKeepsDistinctTrips(t *testing.T) {
 	}
 }
 
+func TestBrownoutNotificationDedupeKeyScopesDaemonIncident(t *testing.T) {
+	t.Parallel()
+	first := brownoutNotificationDedupeKey("daemon-a", "codex.open.1")
+	second := brownoutNotificationDedupeKey("daemon-b", "codex.open.1")
+	if first == second {
+		t.Fatalf("restart incidents reused dedupe key %q", first)
+	}
+	if first != "runtime.agentBrownout.daemon-a.codex.open.1" {
+		t.Fatalf("dedupe key = %q, want daemon-scoped transition key", first)
+	}
+}
+
+func TestBrownoutIncidentIDRotatesPerRuntime(t *testing.T) {
+	first, _ := brownoutRuntime(t, nil)
+	second, _ := brownoutRuntime(t, nil)
+	if first.brownoutIncidentID == "" || second.brownoutIncidentID == "" {
+		t.Fatal("brownout incident ID must be initialized for every runtime")
+	}
+	if first.brownoutIncidentID == second.brownoutIncidentID {
+		t.Fatalf("runtime restart reused brownout incident ID %q", first.brownoutIncidentID)
+	}
+}
+
 type recordingLogger struct {
 	mu      sync.Mutex
 	entries []loggedEntry

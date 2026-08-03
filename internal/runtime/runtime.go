@@ -194,19 +194,24 @@ type Runtime struct {
 	shutdownTimeout        time.Duration
 	deferRecovery          bool
 
-	mu                          sync.RWMutex
-	startedAt                   *time.Time
-	recovery                    RecoverySummary
-	stopped                     bool
-	services                    Services
-	startErr                    error
-	startOnce                   sync.Once
-	shutdownOnce                sync.Once
-	shutdownCh                  chan struct{}
-	notificationCtx             context.Context
-	notificationCancel          context.CancelFunc
-	notificationWG              sync.WaitGroup
-	notificationsStopping       bool
+	mu                    sync.RWMutex
+	startedAt             *time.Time
+	recovery              RecoverySummary
+	stopped               bool
+	services              Services
+	startErr              error
+	startOnce             sync.Once
+	shutdownOnce          sync.Once
+	shutdownCh            chan struct{}
+	notificationCtx       context.Context
+	notificationCancel    context.CancelFunc
+	notificationWG        sync.WaitGroup
+	notificationsStopping bool
+	// brownoutIncidentID scopes notification dedupe keys to this daemon
+	// lifetime. Breaker trip counters restart at zero after a process restart,
+	// so a provider.open.1 key must not collide with the previous daemon's
+	// incident.
+	brownoutIncidentID          string
 	brownoutNotificationTails   map[string]chan struct{}
 	schedulerStop               chan struct{}
 	schedulerDone               chan struct{}
@@ -348,6 +353,7 @@ func New(options Options) *Runtime {
 		shutdownCh:                  make(chan struct{}),
 		notificationCtx:             notificationCtx,
 		notificationCancel:          notificationCancel,
+		brownoutIncidentID:          newDaemonID(),
 		brownoutNotificationTails:   make(map[string]chan struct{}),
 		activeExecutions:            NewActiveExecutionRegistry(),
 		projectCatalog:              projectCatalog,
@@ -896,6 +902,12 @@ func (r *Runtime) notifyAgentBrownout(level, title, subtitle, body, dedupeSuffix
 		r.mu.Unlock()
 		return
 	}
+	if strings.TrimSpace(r.brownoutIncidentID) == "" {
+		// Tests and narrowly constructed runtimes may bypass New. Preserve the
+		// same per-runtime scope in that case without falling back to a shared key.
+		r.brownoutIncidentID = newDaemonID()
+	}
+	brownoutIncidentID := r.brownoutIncidentID
 	r.notificationWG.Add(1)
 	notificationCtx := r.notificationCtx
 	providerKey := brownoutNotificationProviderKey(dedupeSuffix)
@@ -945,7 +957,7 @@ func (r *Runtime) notifyAgentBrownout(level, title, subtitle, body, dedupeSuffix
 			Body:       body,
 			EntityType: "agent_brownout",
 			EntityID:   "looperd-agent-brownout",
-			DedupeKey:  fmt.Sprintf("runtime.agentBrownout.%s", dedupeSuffix),
+			DedupeKey:  brownoutNotificationDedupeKey(brownoutIncidentID, dedupeSuffix),
 		}
 		ctx, cancel := context.WithTimeout(notificationCtx, agentBrownoutNotificationTimeout)
 		defer cancel()
@@ -957,6 +969,14 @@ func (r *Runtime) notifyAgentBrownout(level, title, subtitle, body, dedupeSuffix
 			Now:           r.now,
 		}).Notify(ctx, payload)
 	}()
+}
+
+func brownoutNotificationDedupeKey(incidentID, dedupeSuffix string) string {
+	incidentID = strings.TrimSpace(incidentID)
+	if incidentID == "" {
+		incidentID = "unknown"
+	}
+	return fmt.Sprintf("runtime.agentBrownout.%s.%s", incidentID, dedupeSuffix)
 }
 
 func brownoutNotificationProviderKey(dedupeSuffix string) string {
