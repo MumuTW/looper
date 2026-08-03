@@ -472,6 +472,9 @@ func TestGatewayInspectHeadPreservesDirtySubmoduleCommitTransition(t *testing.T)
 	runGit(t, submoduleSource, "commit", "-m", "init nested")
 	runGit(t, fixture.repoPath, "-c", "protocol.file.allow=always", "submodule", "add", submoduleSource, "modules/nested-commit")
 	runGit(t, fixture.repoPath, "commit", "-am", "add nested module")
+	// The cloned submodule has its own Git identity; do not rely on the
+	// developer or CI runner's global config for the nested progress commit.
+	configureRepo(t, filepath.Join(fixture.repoPath, "modules", "nested-commit"))
 
 	nestedPath := filepath.Join(fixture.repoPath, "modules", "nested-commit", "nested.txt")
 	writeFile(t, nestedPath, "committed progress\n")
