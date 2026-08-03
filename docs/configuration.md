@@ -691,6 +691,8 @@ Semantics:
 
 Planner is special: only `looper:hold` blocks planner. There is no planner-specific hold label.
 
+For a project with `projects[].labelNamespace` set (see [Project label namespace](#project-label-namespace)), the hold labels use that namespace instead: with `labelNamespace = "client.looper:"`, the effective labels are `client.looper:hold`, `client.looper:hold:worker`, `client.looper:hold:fixer`, and `client.looper:hold:reviewer`. The default-namespace `looper:hold*` labels do not apply to such projects, and a custom namespace never matches the default namespace's ownership checks.
+
 Manual CLI/API create-time hold validation is best-effort only when the local project repo path or configured `gh` path needed for remote inspection is unavailable. If those are present but `gh` inspection itself fails, create-time validation fails.
 
 Coordinator example:

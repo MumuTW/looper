@@ -2633,7 +2633,7 @@ func (r *Runner) runReviewStep(ctx context.Context, input stepInput) (reviewerCh
 		return checkpoint, &runpipe.LoopError{Message: fmt.Sprintf("Failed to refresh pull request before starting reviewer agent: %v", err), Kind: runpipe.FailureRetryableAfterResume}
 	} else {
 		checkpoint.Detail.Labels = cloneStrings(freshDetail.Labels)
-		if domain.IsAutomaticLoopHeld(domain.LoopTypeReviewer, isManualReviewerLoop(input.Loop), freshDetail.Labels) {
+		if domain.IsAutomaticLoopHeldForNamespace(domain.LoopTypeReviewer, isManualReviewerLoop(input.Loop), freshDetail.Labels, config.ProjectLabelNamespaceForMetadata(r.projectRoleConfig, input.Project.ID, input.Project.MetadataJSON)) {
 			return checkpoint, &runpipe.HoldSkipError{Summary: fmt.Sprintf("Reviewer stopped because %s#%d is currently held", input.Repo, input.PRNumber)}
 		}
 	}
