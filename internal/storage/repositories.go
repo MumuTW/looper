@@ -3207,9 +3207,10 @@ func (r *QueueRepository) ClaimNextNonLongTermRetryAmongTypeSets(ctx context.Con
 
 // ClaimNextNonLongTermRetryAmongTypeSetsForProjects additionally restricts
 // projectScopedTypes to queue items whose project_id is in projectIDs. Other
-// queue types remain eligible.
-func (r *QueueRepository) ClaimNextNonLongTermRetryAmongTypeSetsForProjects(ctx context.Context, nowISO, claimedBy string, unrestrictedTypes, stickySnapshotTypes, projectScopedTypes, projectIDs []string) (*QueueItemRecord, error) {
-	return r.ClaimNextNonLongTermRetryAmongTypeSetsForProjectsWithSnapshotVendor(ctx, nowISO, claimedBy, unrestrictedTypes, stickySnapshotTypes, "", false, projectScopedTypes, projectIDs)
+// queue types remain eligible. An optional stickyOnlyProjectIDs argument admits
+// only durable sticky-snapshot retries for quarantined projects in that list.
+func (r *QueueRepository) ClaimNextNonLongTermRetryAmongTypeSetsForProjects(ctx context.Context, nowISO, claimedBy string, unrestrictedTypes, stickySnapshotTypes, projectScopedTypes, projectIDs []string, stickyOnlyProjectIDs ...[]string) (*QueueItemRecord, error) {
+	return r.ClaimNextNonLongTermRetryAmongTypeSetsForProjectsWithSnapshotVendor(ctx, nowISO, claimedBy, unrestrictedTypes, stickySnapshotTypes, "", false, projectScopedTypes, projectIDs, stickyOnlyProjectIDs...)
 }
 
 // ClaimNextNonLongTermRetryAmongTypeSetsForProjectsWithSnapshotVendor is the
@@ -3218,12 +3219,12 @@ func (r *QueueRepository) ClaimNextNonLongTermRetryAmongTypeSetsForProjects(ctx 
 // not carry a durable agent snapshot. stickySnapshotTypes then match only the
 // supplied snapshot vendor, so a live role provider cannot claim a retry that
 // will restore a different vendor at spawn.
-func (r *QueueRepository) ClaimNextNonLongTermRetryAmongTypeSetsForProjectsWithSnapshotVendor(ctx context.Context, nowISO, claimedBy string, unrestrictedTypes, stickySnapshotTypes []string, stickySnapshotVendor string, excludeStickySnapshots bool, projectScopedTypes, projectIDs []string) (*QueueItemRecord, error) {
+func (r *QueueRepository) ClaimNextNonLongTermRetryAmongTypeSetsForProjectsWithSnapshotVendor(ctx context.Context, nowISO, claimedBy string, unrestrictedTypes, stickySnapshotTypes []string, stickySnapshotVendor string, excludeStickySnapshots bool, projectScopedTypes, projectIDs []string, stickyOnlyProjectIDs ...[]string) (*QueueItemRecord, error) {
 	typePred, typeArgs := queueClaimTypePredicateWithSnapshotVendor(unrestrictedTypes, stickySnapshotTypes, stickySnapshotVendor, excludeStickySnapshots)
 	if typePred == "" {
 		return nil, nil
 	}
-	projectPred, projectArgs := queueClaimProjectPredicate(projectScopedTypes, projectIDs)
+	projectPred, projectArgs := queueClaimProjectPredicate(projectScopedTypes, projectIDs, stickyOnlyProjectIDs...)
 	extraArgs := append([]any{QueueLongTermRetryAttemptThreshold}, typeArgs...)
 	extraArgs = append(extraArgs, projectArgs...)
 	return r.claimNextMatching(ctx, nowISO, claimedBy, `
@@ -3236,13 +3237,14 @@ func (r *QueueRepository) ClaimNextNonLongTermRetryAmongTypeSetsForProjectsWithS
 // PeekNextNonLongTermRetryAmongTypeSetsForProjectsWithSnapshotVendor returns
 // the highest-priority eligible item for a provider lane without changing its
 // durable status. Scheduler admission uses this read-only view to compare
-// candidates across provider lanes before choosing which lane to claim.
-func (r *QueueRepository) PeekNextNonLongTermRetryAmongTypeSetsForProjectsWithSnapshotVendor(ctx context.Context, nowISO string, unrestrictedTypes, stickySnapshotTypes []string, stickySnapshotVendor string, excludeStickySnapshots bool, projectScopedTypes, projectIDs []string) (*QueueItemRecord, error) {
+// candidates across provider lanes before choosing which lane to claim. The
+// optional stickyOnlyProjectIDs scope mirrors the claim predicate.
+func (r *QueueRepository) PeekNextNonLongTermRetryAmongTypeSetsForProjectsWithSnapshotVendor(ctx context.Context, nowISO string, unrestrictedTypes, stickySnapshotTypes []string, stickySnapshotVendor string, excludeStickySnapshots bool, projectScopedTypes, projectIDs []string, stickyOnlyProjectIDs ...[]string) (*QueueItemRecord, error) {
 	typePred, typeArgs := queueClaimTypePredicateWithSnapshotVendor(unrestrictedTypes, stickySnapshotTypes, stickySnapshotVendor, excludeStickySnapshots)
 	if typePred == "" {
 		return nil, nil
 	}
-	projectPred, projectArgs := queueClaimProjectPredicate(projectScopedTypes, projectIDs)
+	projectPred, projectArgs := queueClaimProjectPredicate(projectScopedTypes, projectIDs, stickyOnlyProjectIDs...)
 	extraArgs := append([]any{QueueLongTermRetryAttemptThreshold}, typeArgs...)
 	extraArgs = append(extraArgs, projectArgs...)
 	return r.peekNextMatching(ctx, nowISO, `
@@ -3259,19 +3261,20 @@ func (r *QueueRepository) ClaimNextLongTermRetryAmongTypeSets(ctx context.Contex
 }
 
 // ClaimNextLongTermRetryAmongTypeSetsForProjects is the long-term-retry
-// counterpart of ClaimNextNonLongTermRetryAmongTypeSetsForProjects.
-func (r *QueueRepository) ClaimNextLongTermRetryAmongTypeSetsForProjects(ctx context.Context, nowISO, claimedBy string, unrestrictedTypes, stickySnapshotTypes, projectScopedTypes, projectIDs []string) (*QueueItemRecord, error) {
-	return r.ClaimNextLongTermRetryAmongTypeSetsForProjectsWithSnapshotVendor(ctx, nowISO, claimedBy, unrestrictedTypes, stickySnapshotTypes, "", false, projectScopedTypes, projectIDs)
+// counterpart of ClaimNextNonLongTermRetryAmongTypeSetsForProjects, including
+// its optional stickyOnlyProjectIDs scope.
+func (r *QueueRepository) ClaimNextLongTermRetryAmongTypeSetsForProjects(ctx context.Context, nowISO, claimedBy string, unrestrictedTypes, stickySnapshotTypes, projectScopedTypes, projectIDs []string, stickyOnlyProjectIDs ...[]string) (*QueueItemRecord, error) {
+	return r.ClaimNextLongTermRetryAmongTypeSetsForProjectsWithSnapshotVendor(ctx, nowISO, claimedBy, unrestrictedTypes, stickySnapshotTypes, "", false, projectScopedTypes, projectIDs, stickyOnlyProjectIDs...)
 }
 
 // ClaimNextLongTermRetryAmongTypeSetsForProjectsWithSnapshotVendor is the
 // long-term-retry counterpart of the provider-aware non-long-term claim.
-func (r *QueueRepository) ClaimNextLongTermRetryAmongTypeSetsForProjectsWithSnapshotVendor(ctx context.Context, nowISO, claimedBy string, unrestrictedTypes, stickySnapshotTypes []string, stickySnapshotVendor string, excludeStickySnapshots bool, projectScopedTypes, projectIDs []string) (*QueueItemRecord, error) {
+func (r *QueueRepository) ClaimNextLongTermRetryAmongTypeSetsForProjectsWithSnapshotVendor(ctx context.Context, nowISO, claimedBy string, unrestrictedTypes, stickySnapshotTypes []string, stickySnapshotVendor string, excludeStickySnapshots bool, projectScopedTypes, projectIDs []string, stickyOnlyProjectIDs ...[]string) (*QueueItemRecord, error) {
 	typePred, typeArgs := queueClaimTypePredicateWithSnapshotVendor(unrestrictedTypes, stickySnapshotTypes, stickySnapshotVendor, excludeStickySnapshots)
 	if typePred == "" {
 		return nil, nil
 	}
-	projectPred, projectArgs := queueClaimProjectPredicate(projectScopedTypes, projectIDs)
+	projectPred, projectArgs := queueClaimProjectPredicate(projectScopedTypes, projectIDs, stickyOnlyProjectIDs...)
 	extraArgs := append([]any{QueueLongTermRetryAttemptThreshold}, typeArgs...)
 	extraArgs = append(extraArgs, projectArgs...)
 	return r.claimNextMatching(ctx, nowISO, claimedBy, `
@@ -3283,12 +3286,12 @@ func (r *QueueRepository) ClaimNextLongTermRetryAmongTypeSetsForProjectsWithSnap
 
 // PeekNextLongTermRetryAmongTypeSetsForProjectsWithSnapshotVendor is the
 // long-term-retry counterpart of the non-mutating provider-aware peek.
-func (r *QueueRepository) PeekNextLongTermRetryAmongTypeSetsForProjectsWithSnapshotVendor(ctx context.Context, nowISO string, unrestrictedTypes, stickySnapshotTypes []string, stickySnapshotVendor string, excludeStickySnapshots bool, projectScopedTypes, projectIDs []string) (*QueueItemRecord, error) {
+func (r *QueueRepository) PeekNextLongTermRetryAmongTypeSetsForProjectsWithSnapshotVendor(ctx context.Context, nowISO string, unrestrictedTypes, stickySnapshotTypes []string, stickySnapshotVendor string, excludeStickySnapshots bool, projectScopedTypes, projectIDs []string, stickyOnlyProjectIDs ...[]string) (*QueueItemRecord, error) {
 	typePred, typeArgs := queueClaimTypePredicateWithSnapshotVendor(unrestrictedTypes, stickySnapshotTypes, stickySnapshotVendor, excludeStickySnapshots)
 	if typePred == "" {
 		return nil, nil
 	}
-	projectPred, projectArgs := queueClaimProjectPredicate(projectScopedTypes, projectIDs)
+	projectPred, projectArgs := queueClaimProjectPredicate(projectScopedTypes, projectIDs, stickyOnlyProjectIDs...)
 	extraArgs := append([]any{QueueLongTermRetryAttemptThreshold}, typeArgs...)
 	extraArgs = append(extraArgs, projectArgs...)
 	return r.peekNextMatching(ctx, nowISO, `
@@ -3407,21 +3410,37 @@ func (r *QueueRepository) ListQueuedSnapshotVendors(ctx context.Context, types [
 	return vendors, nil
 }
 
-func queueClaimProjectPredicate(projectScopedTypes, projectIDs []string) (predicate string, args []any) {
+func queueClaimProjectPredicate(projectScopedTypes, projectIDs []string, stickyOnlyProjectIDs ...[]string) (predicate string, args []any) {
 	if len(projectScopedTypes) == 0 {
 		return "", nil
 	}
 	typePlaceholders, typeArgs := queueTypeInClause(projectScopedTypes)
 	args = append(args, typeArgs...)
-	if len(projectIDs) == 0 {
+	var stickyOnly []string
+	if len(stickyOnlyProjectIDs) > 0 {
+		stickyOnly = stickyOnlyProjectIDs[0]
+	}
+	if len(projectIDs) == 0 && len(stickyOnly) == 0 {
 		return "AND qi.type NOT IN (" + typePlaceholders + ")", args
 	}
-	projectPlaceholders := make([]string, 0, len(projectIDs))
-	for _, projectID := range projectIDs {
-		projectPlaceholders = append(projectPlaceholders, "?")
-		args = append(args, projectID)
+	scopeClauses := make([]string, 0, 2)
+	if len(projectIDs) > 0 {
+		projectPlaceholders := make([]string, 0, len(projectIDs))
+		for _, projectID := range projectIDs {
+			projectPlaceholders = append(projectPlaceholders, "?")
+			args = append(args, projectID)
+		}
+		scopeClauses = append(scopeClauses, "qi.project_id IN ("+strings.Join(projectPlaceholders, ", ")+")")
 	}
-	return "AND (qi.type NOT IN (" + typePlaceholders + ") OR qi.project_id IN (" + strings.Join(projectPlaceholders, ", ") + "))", args
+	if len(stickyOnly) > 0 {
+		stickyPlaceholders := make([]string, 0, len(stickyOnly))
+		for _, projectID := range stickyOnly {
+			stickyPlaceholders = append(stickyPlaceholders, "?")
+			args = append(args, projectID)
+		}
+		scopeClauses = append(scopeClauses, "(qi.project_id IN ("+strings.Join(stickyPlaceholders, ", ")+") AND "+stickySnapshotQueuePredicate("")+")")
+	}
+	return "AND (qi.type NOT IN (" + typePlaceholders + ") OR " + strings.Join(scopeClauses, " OR ") + ")", args
 }
 
 func (r *QueueRepository) claimNextMatching(ctx context.Context, nowISO, claimedBy, extraPredicate string, extraArgs []any) (*QueueItemRecord, error) {

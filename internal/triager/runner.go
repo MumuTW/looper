@@ -431,7 +431,7 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 			result.Skipped++
 			continue
 		}
-		if err := r.processSourceState(ctx, *project, input.Repo, state, input.DecisionBudget, input.PendingForgeReadBudget, input.DecisionAdmission, &result); err != nil {
+		if err := r.processSourceState(ctx, *project, input.Repo, state, repositoryVisibility, input.DecisionBudget, input.PendingForgeReadBudget, input.DecisionAdmission, &result); err != nil {
 			if errors.Is(err, errPendingForgeReadBudgetExhausted) {
 				result.PendingSourcesDeferred++
 				result.Skipped++
@@ -539,7 +539,7 @@ func pendingSourceStates(states map[string]*sourceState) []*sourceState {
 	return pending
 }
 
-func (r *Runner) processSourceState(ctx context.Context, project storage.ProjectRecord, repo string, state *sourceState, decisionBudget *DecisionBudget, readBudget *PendingForgeReadBudget, decisionAdmission func() (bool, error), result *DiscoveryResult) error {
+func (r *Runner) processSourceState(ctx context.Context, project storage.ProjectRecord, repo string, state *sourceState, repositoryVisibility string, decisionBudget *DecisionBudget, readBudget *PendingForgeReadBudget, decisionAdmission func() (bool, error), result *DiscoveryResult) error {
 	enrollment := state.enrollment
 	if !reservePendingForgeRead(readBudget, project.ID, result) {
 		return errPendingForgeReadBudgetExhausted
@@ -576,22 +576,30 @@ func (r *Runner) processSourceState(ctx context.Context, project storage.Project
 				Visibility: visibility, Held: domain.IsAutoLaneHeldForNamespace(domain.LoopTypePlanner, detail.Labels, namespace),
 			})
 		}
-		if decisionAdmission != nil {
-			admitted, err := decisionAdmission()
+		var decision Decision
+		if admissionDecision.Outcome == admission.OutcomeLegacy || admissionDecision.Classify {
+			// Only model classification consumes the shared tick budget. Deterministic
+			// auto/ignore decisions cannot starve another project's assessment.
+			if result.DecisionsAttempted >= r.decisionLimit {
+				return nil
+			}
+			if decisionAdmission != nil {
+				admitted, err := decisionAdmission()
+				if err != nil {
+					return err
+				}
+				if !admitted {
+					return nil
+				}
+			}
+			if !decisionBudget.Reserve() {
+				return nil
+			}
+			result.DecisionsAttempted++
+			decision, err = r.decide(ctx, project, repo, detail)
 			if err != nil {
 				return err
 			}
-			if !admitted {
-				return nil
-			}
-		}
-		if !decisionBudget.Reserve() {
-			return nil
-		}
-		result.DecisionsAttempted++
-		decision, err := r.decide(ctx, project, repo, detail)
-		if err != nil {
-			return err
 		}
 		if !reservePendingForgeRead(readBudget, project.ID, result) {
 			return errPendingForgeReadBudgetExhausted
@@ -888,7 +896,7 @@ func ValidateDecisionOutput(raw string) bool {
 	return err == nil
 }
 
-func validateDecision(decision Decision) PolicyDecision {
+func validateDecision(decision Decision, policy LegacyPolicy) PolicyDecision {
 	reasons := make([]string, 0, 7)
 	if !validClassification(decision.Classification) {
 		reasons = append(reasons, "unsupported_classification")

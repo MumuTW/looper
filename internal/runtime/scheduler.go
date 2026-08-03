@@ -3865,7 +3865,7 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 	if err != nil {
 		return queueItems, dispatchOwnedQueueClaims(ctx, owned, input, err)
 	}
-	projectScopedTypes, runnableProjectIDs, _ := codingClaimProjectScope(input.Config, quarantinedIDs)
+	projectScopedTypes, runnableProjectIDs, stickyOnlyProjectIDs := codingClaimProjectScope(input.Config, quarantinedIDs)
 	stopClaiming := false
 	var claimFailure error
 	claimLanes := func(longTerm bool) {
@@ -3905,9 +3905,9 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 				var item *storage.QueueItemRecord
 				var err error
 				if longTerm {
-					item, err = input.Repos.Queue.PeekNextLongTermRetryAmongTypeSetsForProjectsWithSnapshotVendor(ctx, nowISO, typeSet.unrestricted, typeSet.stickyOnly, typeSet.vendor, typeSet.excludeStickySnapshots, projectScopedTypes, runnableProjectIDs)
+					item, err = input.Repos.Queue.PeekNextLongTermRetryAmongTypeSetsForProjectsWithSnapshotVendor(ctx, nowISO, typeSet.unrestricted, typeSet.stickyOnly, typeSet.vendor, typeSet.excludeStickySnapshots, projectScopedTypes, runnableProjectIDs, stickyOnlyProjectIDs)
 				} else {
-					item, err = input.Repos.Queue.PeekNextNonLongTermRetryAmongTypeSetsForProjectsWithSnapshotVendor(ctx, nowISO, typeSet.unrestricted, typeSet.stickyOnly, typeSet.vendor, typeSet.excludeStickySnapshots, projectScopedTypes, runnableProjectIDs)
+					item, err = input.Repos.Queue.PeekNextNonLongTermRetryAmongTypeSetsForProjectsWithSnapshotVendor(ctx, nowISO, typeSet.unrestricted, typeSet.stickyOnly, typeSet.vendor, typeSet.excludeStickySnapshots, projectScopedTypes, runnableProjectIDs, stickyOnlyProjectIDs)
 				}
 				if err != nil {
 					if ctx.Err() != nil {
@@ -3937,9 +3937,9 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 			typeSet := providerTypeSets[winner.index]
 			result, err := claimOne(typeSet.vendor, typeSet.providerScoped, typeSet.snapshotScoped, typeSet.lifecycleOnly, true, func(ctx context.Context, nowISO, claimedBy string) (*storage.QueueItemRecord, error) {
 				if longTerm {
-					return input.Repos.Queue.ClaimNextLongTermRetryAmongTypeSetsForProjectsWithSnapshotVendor(ctx, nowISO, claimedBy, typeSet.unrestricted, typeSet.stickyOnly, typeSet.vendor, typeSet.excludeStickySnapshots, projectScopedTypes, runnableProjectIDs)
+					return input.Repos.Queue.ClaimNextLongTermRetryAmongTypeSetsForProjectsWithSnapshotVendor(ctx, nowISO, claimedBy, typeSet.unrestricted, typeSet.stickyOnly, typeSet.vendor, typeSet.excludeStickySnapshots, projectScopedTypes, runnableProjectIDs, stickyOnlyProjectIDs)
 				}
-				return input.Repos.Queue.ClaimNextNonLongTermRetryAmongTypeSetsForProjectsWithSnapshotVendor(ctx, nowISO, claimedBy, typeSet.unrestricted, typeSet.stickyOnly, typeSet.vendor, typeSet.excludeStickySnapshots, projectScopedTypes, runnableProjectIDs)
+				return input.Repos.Queue.ClaimNextNonLongTermRetryAmongTypeSetsForProjectsWithSnapshotVendor(ctx, nowISO, claimedBy, typeSet.unrestricted, typeSet.stickyOnly, typeSet.vendor, typeSet.excludeStickySnapshots, projectScopedTypes, runnableProjectIDs, stickyOnlyProjectIDs)
 			})
 			if err != nil {
 				claimFailure = err

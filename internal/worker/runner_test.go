@@ -4355,14 +4355,14 @@ func TestProcessClaimedQueueItemRequeuesProviderBrownoutWithoutAttempt(t *testin
 	if err != nil {
 		t.Fatalf("ProcessClaimedQueueItem() error = %v", err)
 	}
-	if result == nil || result.Status != "failed" || result.FailureKind != FailureRetryableTransient {
+	if result == nil || result.Status != "failed" || result.FailureKind != runpipe.FailureRetryableTransient {
 		t.Fatalf("result = %#v, want retryable recovered failed result", result)
 	}
 	queue, err := fixture.repos.Queue.GetByID(context.Background(), claim.ID)
 	if err != nil {
 		t.Fatalf("Queue.GetByID() error = %v", err)
 	}
-	if queue == nil || queue.Status != "queued" || queue.Attempts != claim.Attempts || queue.FinishedAt != nil || queue.LastErrorKind == nil || *queue.LastErrorKind != string(FailureRetryableTransient) {
+	if queue == nil || queue.Status != "queued" || queue.Attempts != claim.Attempts || queue.FinishedAt != nil || queue.LastErrorKind == nil || *queue.LastErrorKind != string(runpipe.FailureRetryableTransient) {
 		t.Fatalf("queue = %#v, want retryable queued item with attempts=%d and no terminal timestamp", queue, claim.Attempts)
 	}
 	loop, err := fixture.repos.Loops.GetByID(context.Background(), result.LoopID)
@@ -4677,12 +4677,12 @@ func TestRecoverClaimedItemRequeuesProviderBrownoutWithoutAttempt(t *testing.T) 
 	nowISO := fixture.nowISO()
 	loopTarget := "project:project_1"
 	loopID := "loop_worker_brownout_requeue"
-	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 3, ProjectID: "project_1", Type: "worker", TargetType: "project", TargetID: &loopTarget, Repo: stringPtr("acme/looper"), Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 3, ProjectID: "project_1", Type: "worker", TargetType: "project", TargetID: &loopTarget, Repo: runpipe.StringPtr("acme/looper"), Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Loops.Upsert() error = %v", err)
 	}
 	projectID := "project_1"
 	payload := `{"title":"Brownout retry","prompt":"Do the thing","repo":"acme/looper","baseBranch":"main"}`
-	queue := storage.QueueItemRecord{ID: "queue_worker_brownout_requeue", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: loopTarget, Repo: stringPtr("acme/looper"), DedupeKey: "worker:loop_worker_brownout_requeue", Priority: 1, Status: "running", AvailableAt: nowISO, Attempts: 2, MaxAttempts: 3, PayloadJSON: &payload, CreatedAt: nowISO, UpdatedAt: nowISO}
+	queue := storage.QueueItemRecord{ID: "queue_worker_brownout_requeue", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: loopTarget, Repo: runpipe.StringPtr("acme/looper"), DedupeKey: "worker:loop_worker_brownout_requeue", Priority: 1, Status: "running", AvailableAt: nowISO, Attempts: 2, MaxAttempts: 3, PayloadJSON: &payload, CreatedAt: nowISO, UpdatedAt: nowISO}
 	if err := fixture.repos.Queue.Upsert(context.Background(), queue); err != nil {
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
