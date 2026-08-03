@@ -410,7 +410,8 @@ func (r *Runtime) runWorktreeDiskSweep(ctx context.Context, repos *storage.Repos
 		return status
 	}
 	roots := make([]worktreecleanup.DiskSweepRoot, 0, len(projects))
-	seenRoots := make(map[string]bool, len(projects))
+	rootIndexes := make(map[string]int, len(projects))
+	repoPathsByRoot := make(map[string][]string, len(projects))
 	// Container names cover archived projects too. Archiving retires records
 	// but deliberately leaves checkouts on disk, so an archived project's
 	// container is still reachable state, not debris.
@@ -430,6 +431,11 @@ func (r *Runtime) runWorktreeDiskSweep(ctx context.Context, repos *storage.Repos
 			status.LastError = rootErr.Error()
 			continue
 		}
+		rootKey := worktreesafety.NormalizePath(root)
+		repoPathsByRoot[rootKey] = appendUniqueWorktreeRepoPath(repoPathsByRoot[rootKey], project.RepoPath)
+		if index, ok := rootIndexes[rootKey]; ok {
+			roots[index].RepoPaths = append([]string(nil), repoPathsByRoot[rootKey]...)
+		}
 		// A project may carry an explicit worktreeRoot that does not follow the
 		// repo-hash layout. If it still lives under the shared root, its own
 		// first segment is the container to protect — the hash name alone would
@@ -443,15 +449,20 @@ func (r *Runtime) runWorktreeDiskSweep(ctx context.Context, repos *storage.Repos
 		if project.Archived {
 			continue
 		}
-		if seenRoots[root] {
+		if _, ok := rootIndexes[rootKey]; ok {
 			continue
 		}
-		seenRoots[root] = true
+		repoPaths := append([]string(nil), repoPathsByRoot[rootKey]...)
+		if len(repoPaths) == 0 {
+			continue
+		}
 		roots = append(roots, worktreecleanup.DiskSweepRoot{
 			ProjectID:    project.ID,
-			RepoPath:     project.RepoPath,
+			RepoPath:     repoPaths[0],
+			RepoPaths:    repoPaths,
 			WorktreeRoot: root,
 		})
+		rootIndexes[rootKey] = len(roots) - 1
 	}
 	roots, overlapErrs := rejectOverlappingDiskSweepRoots(roots)
 	if len(overlapErrs) > 0 {
@@ -941,6 +952,20 @@ func worktreeInList(items []gitinfra.WorktreeListEntry, path string) bool {
 
 func normalizeRuntimePath(path string) string {
 	return strings.TrimRight(strings.TrimSpace(path), string(os.PathSeparator))
+}
+
+func appendUniqueWorktreeRepoPath(paths []string, path string) []string {
+	trimmed := strings.TrimSpace(path)
+	if trimmed == "" {
+		return paths
+	}
+	identity := worktreesafety.NormalizePath(trimmed)
+	for _, existing := range paths {
+		if worktreesafety.NormalizePath(existing) == identity {
+			return paths
+		}
+	}
+	return append(paths, trimmed)
 }
 
 func worktreeCleanupCandidateActive(ctx context.Context, repos *storage.Repositories, candidate storage.WorktreeRecord) (bool, error) {

@@ -329,6 +329,49 @@ func TestRunDiskSweepRechecksGitOwnershipBeforeRemoval(t *testing.T) {
 	}
 }
 
+func TestRunDiskSweepUnionsGitAuthorityForSharedRoot(t *testing.T) {
+	worktreeRoot := t.TempDir()
+	first := mkdirAt(t, filepath.Join(worktreeRoot, "looper-app-first"), old())
+	second := mkdirAt(t, filepath.Join(worktreeRoot, "looper-app-second"), old())
+	repoA := filepath.Join(t.TempDir(), "repo-a")
+	repoB := filepath.Join(t.TempDir(), "repo-b")
+
+	var removed []string
+	options := sweepOptions(DiskSweepRoot{
+		ProjectID:    "app-a",
+		RepoPath:     repoA,
+		RepoPaths:    []string{repoA, repoB},
+		WorktreeRoot: worktreeRoot,
+	}, stubSweepGit{}, &removed)
+	listCalls := map[string]int{}
+	options.GitTrackedPaths = func(_ context.Context, repoPath string) ([]string, error) {
+		listCalls[repoPath]++
+		if listCalls[repoPath] == 1 {
+			return nil, nil
+		}
+		if repoPath == repoA {
+			return []string{first}, nil
+		}
+		return []string{second}, nil
+	}
+
+	plan, err := RunDiskSweep(context.Background(), options)
+	if err != nil {
+		t.Fatalf("RunDiskSweep() error = %v", err)
+	}
+	if len(removed) != 0 {
+		t.Fatalf("removed = %v, want both shared-root checkouts preserved", removed)
+	}
+	for _, path := range []string{first, second} {
+		if action, reason := reasonFor(t, plan, path); action != ActionSkipped || reason != "git_tracked_at_removal" {
+			t.Fatalf("candidate %q = (%q, %q), want git_tracked_at_removal skip", path, action, reason)
+		}
+	}
+	if listCalls[repoA] != 3 || listCalls[repoB] != 3 {
+		t.Fatalf("GitTrackedPaths calls = %#v, want three per shared repo", listCalls)
+	}
+}
+
 func TestRunDiskSweepRemovesUnusableDebris(t *testing.T) {
 	worktreeRoot := t.TempDir()
 	debris := mkdirAt(t, filepath.Join(worktreeRoot, "looper-app-dead"), old())

@@ -31,8 +31,12 @@ const DiskSweepActionRemove = "would_remove"
 
 // DiskSweepRoot is one project's managed worktree root.
 type DiskSweepRoot struct {
-	ProjectID    string
-	RepoPath     string
+	ProjectID string
+	RepoPath  string
+	// RepoPaths contains every project repository that shares this root. The
+	// singular RepoPath remains the primary compatibility value for callers
+	// that configure one project; Git authority is the union of all paths.
+	RepoPaths    []string
 	WorktreeRoot string
 }
 
@@ -112,11 +116,7 @@ func PlanDiskSweep(input DiskSweepPlanInput) DiskSweepPlan {
 			plan.appendSkip(candidate)
 			continue
 		}
-		if err := worktreesafety.Validate(worktreesafety.CheckInput{
-			WorktreePath: entry.Path,
-			RepoPath:     input.Root.RepoPath,
-			WorktreeRoot: input.Root.WorktreeRoot,
-		}); err != nil {
+		if err := validateDiskSweepPath(input.Root, entry.Path); err != nil {
 			candidate.Reason = "unsafe_path"
 			candidate.Error = err.Error()
 			plan.appendSkip(candidate)
@@ -644,6 +644,16 @@ func RunDiskSweep(ctx context.Context, options DiskSweepOptions) (DiskSweepPlan,
 		if strings.TrimSpace(root.WorktreeRoot) == "" {
 			continue
 		}
+		if len(diskSweepRepoPaths(root)) == 0 {
+			result.Summary.Errors++
+			result.Candidates = append(result.Candidates, DiskCandidate{
+				ProjectID: root.ProjectID,
+				Path:      root.WorktreeRoot,
+				Action:    ActionSkipped,
+				Reason:    "repo_path_required",
+			})
+			continue
+		}
 		entries, err := readDir(root.WorktreeRoot)
 		if err != nil {
 			if os.IsNotExist(err) {
@@ -659,7 +669,7 @@ func RunDiskSweep(ctx context.Context, options DiskSweepOptions) (DiskSweepPlan,
 			})
 			continue
 		}
-		tracked, err := options.GitTrackedPaths(ctx, root.RepoPath)
+		tracked, err := diskSweepTrackedPaths(ctx, options.GitTrackedPaths, root)
 		if err != nil {
 			// Without the git view every unregistered directory looks like
 			// debris, including live linked worktrees. Fail the root closed.
@@ -735,7 +745,7 @@ func RunDiskSweep(ctx context.Context, options DiskSweepOptions) (DiskSweepPlan,
 				releaseMutation()
 				continue
 			}
-			tracked, err := options.GitTrackedPaths(ctx, root.RepoPath)
+			tracked, err := diskSweepTrackedPaths(ctx, options.GitTrackedPaths, root)
 			if err != nil {
 				decided.Action = "error"
 				decided.Reason = "git_list_refresh_failed"
@@ -796,7 +806,7 @@ func RunDiskSweep(ctx context.Context, options DiskSweepOptions) (DiskSweepPlan,
 }
 
 func revalidateDiskCandidate(root DiskSweepRoot, candidate DiskCandidate, cutoff time.Time, inspectContents bool) (DiskCandidate, bool) {
-	if err := worktreesafety.Validate(worktreesafety.CheckInput{WorktreePath: candidate.Path, RepoPath: root.RepoPath, WorktreeRoot: root.WorktreeRoot}); err != nil {
+	if err := validateDiskSweepPath(root, candidate.Path); err != nil {
 		candidate.Action = ActionSkipped
 		candidate.Reason = "unsafe_path"
 		candidate.Error = err.Error()
@@ -829,6 +839,49 @@ func revalidateDiskCandidate(root DiskSweepRoot, candidate DiskCandidate, cutoff
 		return candidate, false
 	}
 	return candidate, true
+}
+
+func validateDiskSweepPath(root DiskSweepRoot, path string) error {
+	repoPaths := diskSweepRepoPaths(root)
+	if len(repoPaths) == 0 {
+		return worktreesafety.Validate(worktreesafety.CheckInput{WorktreePath: path, WorktreeRoot: root.WorktreeRoot})
+	}
+	for _, repoPath := range repoPaths {
+		if err := worktreesafety.Validate(worktreesafety.CheckInput{WorktreePath: path, RepoPath: repoPath, WorktreeRoot: root.WorktreeRoot}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func diskSweepRepoPaths(root DiskSweepRoot) []string {
+	paths := make([]string, 0, len(root.RepoPaths)+1)
+	seen := make(map[string]bool, len(root.RepoPaths)+1)
+	for _, path := range append([]string{root.RepoPath}, root.RepoPaths...) {
+		trimmed := strings.TrimSpace(path)
+		if trimmed == "" {
+			continue
+		}
+		key := normalizeSweepPath(trimmed)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		paths = append(paths, trimmed)
+	}
+	return paths
+}
+
+func diskSweepTrackedPaths(ctx context.Context, list func(context.Context, string) ([]string, error), root DiskSweepRoot) ([]string, error) {
+	paths := make([]string, 0)
+	for _, repoPath := range diskSweepRepoPaths(root) {
+		tracked, err := list(ctx, repoPath)
+		if err != nil {
+			return nil, err
+		}
+		paths = append(paths, tracked...)
+	}
+	return paths, nil
 }
 
 // admitRemoval applies the two filesystem gates that must hold at delete time.
