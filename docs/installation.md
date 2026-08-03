@@ -226,10 +226,12 @@ looper upgrade verify-start --release-root <dir> --release <id> --bundle <ROLLBA
 ```
 
 `verify-start` must succeed before declaring cutover success. It checks build
-identity, the release pointer, admission readiness, storage health, and
-quarantine debt. It does **not** fail merely because the restarted daemon has
-already claimed queued work (drain leaves the queue intact). `package.autoUpgradeEnabled`
-is not a supported managed upgrade path (legacy decode only).
+identity, the release pointer, held admission (`draining`), storage health,
+zero `scheduler.activeRuns`/`scheduler.runningItems`, and quarantine debt. A
+held cutover must therefore leave both scheduler counts at zero; the queue is
+preserved for the unheld restart rather than claimed during verification.
+`package.autoUpgradeEnabled` is not a supported managed upgrade path (legacy
+decode only).
 
 Supported service layouts must launch `looperd` through the activated
 `release-root/current` pointer. `looperd service install` rewrites a binary

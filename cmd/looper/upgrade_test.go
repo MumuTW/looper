@@ -137,10 +137,23 @@ func TestUpgradePostStartRequiresVerifyHoldAdmission(t *testing.T) {
 		t.Fatalf("upgradePostStartBlocks() with draining admission = %v, want no blocks", blocks)
 	}
 
+	report.StartedEvent = false
+	if blocks := upgradePostStartBlocks(report); len(blocks) != 0 {
+		t.Fatalf("upgradePostStartBlocks() with held startup and no durable event = %v, want no blocks", blocks)
+	}
+
+	report.StartedEvent = true
 	report.Status.Service.AdmissionState = "ready"
 	blocks := upgradePostStartBlocks(report)
 	if len(blocks) != 1 || blocks[0] != "daemon admission is not draining under verify hold" {
 		t.Fatalf("upgradePostStartBlocks() with ready admission = %v, want verify-hold block", blocks)
+	}
+
+	report.Status.Service.AdmissionState = "draining"
+	report.Status.Scheduler.ActiveRuns = 1
+	blocks = upgradePostStartBlocks(report)
+	if len(blocks) != 1 || blocks[0] != "scheduler still owns active work after cutover" {
+		t.Fatalf("upgradePostStartBlocks() with active scheduler work = %v, want scheduler blocker", blocks)
 	}
 }
 

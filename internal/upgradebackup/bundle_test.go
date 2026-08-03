@@ -85,6 +85,54 @@ func TestCreatePinsConfigContentsAcrossSnapshotWindow(t *testing.T) {
 	}
 }
 
+func TestCreatePinsBinaryContentsAcrossSnapshotWindow(t *testing.T) {
+	// Regression for cutover races: the release-root/current path may switch
+	// while the SQLite snapshot is in progress, but the bundle must retain the
+	// executable images verified before the snapshot began.
+	root := t.TempDir()
+	config := writeBundleFile(t, root, "config.toml", "[server]\n")
+	cli := writeBundleFile(t, root, "looper-bin", "candidate-cli")
+	daemon := writeBundleFile(t, root, "looperd-bin", "candidate-daemon")
+	pinnedCLI := []byte("verified-cli")
+	pinnedDaemon := []byte("verified-daemon")
+	result, err := Create(context.Background(), Input{
+		RootDir:              filepath.Join(root, "backups"),
+		ConfigPath:           config,
+		DatabasePath:         filepath.Join(root, "looper.sqlite"),
+		CLIBinaryPath:        cli,
+		CLIBinaryContents:    pinnedCLI,
+		DaemonBinaryPath:     daemon,
+		DaemonBinaryContents: pinnedDaemon,
+		Snapshot: func(context.Context) (string, error) {
+			if err := os.WriteFile(cli, []byte("new-cli-after-check"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(daemon, []byte("new-daemon-after-check"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			return writeBundleFile(t, root, "snapshot.sqlite", "sqlite"), nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name string
+		want []byte
+	}{
+		{name: "looper", want: pinnedCLI},
+		{name: "looperd", want: pinnedDaemon},
+	} {
+		got, err := os.ReadFile(filepath.Join(result.Directory, test.name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got) != string(test.want) {
+			t.Fatalf("bundle %s = %q, want pinned %q", test.name, got, test.want)
+		}
+	}
+}
+
 func TestCreateUsesUniqueBundleWhenTimestampDirectoryAlreadyExists(t *testing.T) {
 	root := t.TempDir()
 	backupRoot := filepath.Join(root, "backups")

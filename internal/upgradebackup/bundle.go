@@ -42,12 +42,17 @@ type Input struct {
 	// ConfigContents, when non-nil, is written into the bundle as the config
 	// artifact instead of copying ConfigPath. Used when the daemon runs from
 	// defaults/env with no on-disk config file.
-	ConfigContents   []byte
-	DatabasePath     string
-	CLIBinaryPath    string
-	DaemonBinaryPath string
-	Now              func() time.Time
-	Snapshot         func(context.Context) (string, error)
+	ConfigContents []byte
+	DatabasePath   string
+	CLIBinaryPath  string
+	// CLIBinaryContents, when non-nil, is the already-pinned executable image
+	// to place in the bundle. Source metadata still records CLIBinaryPath.
+	CLIBinaryContents []byte
+	DaemonBinaryPath  string
+	// DaemonBinaryContents has the same snapshot-window guarantee for looperd.
+	DaemonBinaryContents []byte
+	Now                  func() time.Time
+	Snapshot             func(context.Context) (string, error)
 }
 
 type File struct {
@@ -169,9 +174,19 @@ func Create(ctx context.Context, input Input) (Result, error) {
 			return fail(err)
 		}
 	}
-	for _, item := range []struct{ source, name string }{{cliBinaryPath, "looper"}, {daemonBinaryPath, "looperd"}} {
-		if err := copyAndRecord(item.source, filepath.Join(bundle, item.name), files, item.name); err != nil {
-			return fail(err)
+	for _, item := range []struct {
+		source   string
+		name     string
+		contents []byte
+	}{{cliBinaryPath, "looper", input.CLIBinaryContents}, {daemonBinaryPath, "looperd", input.DaemonBinaryContents}} {
+		var copyErr error
+		if item.contents != nil {
+			copyErr = writeAndRecordMode(item.contents, filepath.Join(bundle, item.name), files, item.name, 0o700)
+		} else {
+			copyErr = copyAndRecord(item.source, filepath.Join(bundle, item.name), files, item.name)
+		}
+		if copyErr != nil {
+			return fail(copyErr)
 		}
 	}
 	// Restore requires absolute source paths. Materialized-only configs leave
@@ -256,7 +271,11 @@ func record(path string, files map[string]File, name string) error {
 }
 
 func writeAndRecord(contents []byte, destination string, files map[string]File, name string) error {
-	if err := os.WriteFile(destination, contents, 0o600); err != nil {
+	return writeAndRecordMode(contents, destination, files, name, 0o600)
+}
+
+func writeAndRecordMode(contents []byte, destination string, files map[string]File, name string, mode os.FileMode) error {
+	if err := os.WriteFile(destination, contents, mode); err != nil {
 		return fmt.Errorf("write %s: %w", name, err)
 	}
 	return record(destination, files, name)

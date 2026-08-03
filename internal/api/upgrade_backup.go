@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -45,9 +46,11 @@ func (h *Handler) createUpgradeBackup(ctx context.Context) (upgradebackup.Result
 	if err := requireExecutableFile(cliPath, "CLI binary"); err != nil {
 		return upgradebackup.Result{}, err
 	}
-	if err := requireMatchingCLIBuild(ctx, cliPath); err != nil {
+	cliPin, cleanupCLIPin, err := pinExecutableContents(cliPath, "CLI binary")
+	if err != nil {
 		return upgradebackup.Result{}, err
 	}
+	defer cleanupCLIPin()
 	services := h.context.Runtime.Services()
 	if services.Coordinator == nil {
 		return upgradebackup.Result{}, fmt.Errorf("storage coordinator is unavailable")
@@ -69,13 +72,29 @@ func (h *Handler) createUpgradeBackup(ctx context.Context) (upgradebackup.Result
 	if err := requireExecutableFile(daemonPath, "daemon binary"); err != nil {
 		return upgradebackup.Result{}, err
 	}
+	daemonPin, cleanupDaemonPin, err := pinExecutableContents(daemonPath, "daemon binary")
+	if err != nil {
+		return upgradebackup.Result{}, err
+	}
+	defer cleanupDaemonPin()
+	// Build identity checks now execute against the bytes that Create will
+	// record, rather than re-resolving a release-root/current symlink after the
+	// SQLite snapshot.
+	if err := requireMatchingCLIBuild(ctx, cliPin.path); err != nil {
+		return upgradebackup.Result{}, err
+	}
+	if err := requirePinnedDaemonImage(h, daemonPin.path); err != nil {
+		return upgradebackup.Result{}, err
+	}
 	input := upgradebackup.Input{
-		RootDir:          *cfg.Storage.BackupDir,
-		DatabasePath:     databasePath,
-		CLIBinaryPath:    cliPath,
-		DaemonBinaryPath: daemonPath,
-		Now:              h.now,
-		Snapshot:         services.Coordinator.Backup,
+		RootDir:              *cfg.Storage.BackupDir,
+		DatabasePath:         databasePath,
+		CLIBinaryPath:        cliPath,
+		CLIBinaryContents:    cliPin.contents,
+		DaemonBinaryPath:     daemonPath,
+		DaemonBinaryContents: daemonPin.contents,
+		Now:                  h.now,
+		Snapshot:             services.Coordinator.Backup,
 	}
 	if !metadata.FilePresent {
 		// Refuse to materialize effective config: env/CLI overrides (including
@@ -98,6 +117,99 @@ func (h *Handler) createUpgradeBackup(ctx context.Context) (upgradebackup.Result
 	input.ConfigPath = configPath
 	input.ConfigContents = raw
 	return upgradebackup.Create(ctx, input)
+}
+
+type pinnedExecutable struct {
+	path     string
+	contents []byte
+}
+
+// pinExecutableContents opens the resolved file once and copies those bytes to
+// a private executable. The temp path is used only for identity probes; the
+// bytes are passed to upgradebackup.Create so release-root/current retargeting
+// during the SQLite snapshot cannot change the bundle's evidence.
+func pinExecutableContents(path, label string) (pinnedExecutable, func(), error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return pinnedExecutable{}, func() {}, fmt.Errorf("pin %s: %w", label, err)
+	}
+	info, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		return pinnedExecutable{}, func() {}, fmt.Errorf("stat pinned %s: %w", label, err)
+	}
+	if info.IsDir() {
+		_ = file.Close()
+		return pinnedExecutable{}, func() {}, fmt.Errorf("pin %s: path is a directory", label)
+	}
+	contents, err := io.ReadAll(file)
+	closeErr := file.Close()
+	if err != nil {
+		return pinnedExecutable{}, func() {}, fmt.Errorf("read pinned %s: %w", label, err)
+	}
+	if closeErr != nil {
+		return pinnedExecutable{}, func() {}, fmt.Errorf("close pinned %s: %w", label, closeErr)
+	}
+	if len(contents) == 0 {
+		return pinnedExecutable{}, func() {}, fmt.Errorf("pin %s: file is empty", label)
+	}
+	temp, err := os.CreateTemp("", "looper-upgrade-pin-*")
+	if err != nil {
+		return pinnedExecutable{}, func() {}, fmt.Errorf("create pinned %s: %w", label, err)
+	}
+	tempPath := temp.Name()
+	cleanup := func() { _ = os.Remove(tempPath) }
+	if err := temp.Chmod(info.Mode().Perm()); err != nil {
+		_ = temp.Close()
+		cleanup()
+		return pinnedExecutable{}, func() {}, fmt.Errorf("chmod pinned %s: %w", label, err)
+	}
+	if _, err := temp.Write(contents); err != nil {
+		_ = temp.Close()
+		cleanup()
+		return pinnedExecutable{}, func() {}, fmt.Errorf("write pinned %s: %w", label, err)
+	}
+	if err := temp.Sync(); err != nil {
+		_ = temp.Close()
+		cleanup()
+		return pinnedExecutable{}, func() {}, fmt.Errorf("sync pinned %s: %w", label, err)
+	}
+	if err := temp.Close(); err != nil {
+		cleanup()
+		return pinnedExecutable{}, func() {}, fmt.Errorf("close pinned %s: %w", label, err)
+	}
+	return pinnedExecutable{path: tempPath, contents: contents}, cleanup, nil
+}
+
+func requirePinnedDaemonImage(h *Handler, pinnedPath string) error {
+	expected := ""
+	if h != nil && h.context.DaemonBinaryStatus != nil {
+		status := h.context.DaemonBinaryStatus()
+		if !status.Known {
+			return fmt.Errorf("refusing upgrade backup: daemon binary identity is unknown")
+		}
+		expected = status.RunningSHA256
+	} else if identity, err := daemonbinary.Self(); err == nil {
+		expected = identity.SHA256
+	}
+	if expected == "" {
+		return nil
+	}
+	pinned, err := daemonbinary.Capture(pinnedPath)
+	if err != nil {
+		return fmt.Errorf("refusing upgrade backup: cannot fingerprint pinned daemon binary: %w", err)
+	}
+	if pinned.SHA256 != expected {
+		return fmt.Errorf("refusing upgrade backup: daemon binary changed while being pinned (running image %s, pinned image %s)", shortDigest(expected), shortDigest(pinned.SHA256))
+	}
+	return nil
+}
+
+func shortDigest(digest string) string {
+	if len(digest) <= 12 {
+		return digest
+	}
+	return digest[:12]
 }
 
 // pinConfigPathAndBytes freezes the restore destination and the bytes together.

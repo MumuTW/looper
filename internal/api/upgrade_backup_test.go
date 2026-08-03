@@ -1,6 +1,10 @@
 package api
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
 
 func TestFilesystemDatabasePathNormalizesFileURI(t *testing.T) {
 	t.Parallel()
@@ -27,5 +31,35 @@ func TestFilesystemDatabasePathAcceptsPlainPath(t *testing.T) {
 	}
 	if got != "/tmp/looper.sqlite" {
 		t.Fatalf("got %q", got)
+	}
+}
+
+func TestPinExecutableContentsFreezesSource(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "current", "looper")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("verified-image"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	pinned, cleanup, err := pinExecutableContents(path, "CLI binary")
+	if err != nil {
+		t.Fatalf("pinExecutableContents() error = %v", err)
+	}
+	defer cleanup()
+	if err := os.WriteFile(path, []byte("candidate-after-pin"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if string(pinned.contents) != "verified-image" {
+		t.Fatalf("pinned contents = %q, want verified image", pinned.contents)
+	}
+	got, err := os.ReadFile(pinned.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "verified-image" {
+		t.Fatalf("pinned file = %q, want verified image", got)
 	}
 }

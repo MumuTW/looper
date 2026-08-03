@@ -1424,6 +1424,12 @@ func (r *Runtime) start(ctx context.Context) error {
 	resourcesPublished = true
 
 	if r.deferRecovery {
+		// The supervised daemon calls CompleteStartup after its API is assembled.
+		// Do not start heartbeat/lease work before that hold selects draining.
+		if r.networkManager != nil && !upgradeVerifyHoldEnabled() {
+			_ = r.networkManager.Start(context.Background())
+		}
+
 		started = true
 		return nil
 	}
@@ -1462,6 +1468,43 @@ func (r *Runtime) CompleteStartup(ctx context.Context) error {
 			r.startupReadyErr = err
 			return
 		}
+		upgradeHold := upgradeVerifyHoldEnabled()
+		if upgradeHold {
+			// Select the held admission before any startup recovery. Recovery
+			// reconciles durable runs/queues and writes events; those mutations must
+			// wait until the operator has verified the candidate and restarts it
+			// without LOOPER_UPGRADE_VERIFY_HOLD.
+			if err := r.admission.BeginVerifyHold("upgrade-verify-hold"); err != nil {
+				r.startupReadyErr = err
+				if r.logger != nil {
+					r.logger.Error("looperd upgrade verify hold failed", map[string]any{"error": err.Error()})
+				}
+				return
+			}
+			// Still exercise the local webhook startup gate so a candidate that
+			// cannot bind its configured tunnel fails under hold. Validation does
+			// not reconcile GitHub hooks or publish delivery state.
+			if r.webhook != nil {
+				if err := r.webhook.ValidateStartup(); err != nil {
+					r.startupReadyErr = err
+					return
+				}
+			}
+			r.mu.Lock()
+			// CompleteStartup succeeded as a lifecycle operation, but recovery is
+			// intentionally still the empty pre-recovery projection under hold.
+			r.recovery = createEmptyRecoverySummary()
+			r.ownershipAcquired = true
+			r.mu.Unlock()
+			if r.logger != nil {
+				r.logger.Info("looperd upgrade verify hold active", map[string]any{
+					"env":    "LOOPER_UPGRADE_VERIFY_HOLD=1",
+					"action": "run verify-start then restart without this env",
+					"note":   "startup recovery, network/webhook reconcile, scheduler, and discovery deferred until unheld restart",
+				})
+			}
+			return
+		}
 		recoverySummary, err := r.runRecoveryPipeline(ctx, repositories, githubGateway, *startedAt)
 		if err != nil {
 			r.startupReadyErr = err
@@ -1476,37 +1519,6 @@ func (r *Runtime) CompleteStartup(ctx context.Context) error {
 		r.recovery = recoverySummary
 		r.ownershipAcquired = true
 		r.mu.Unlock()
-		upgradeHold := strings.TrimSpace(os.Getenv("LOOPER_UPGRADE_VERIFY_HOLD")) == "1"
-		// Cutover verify-hold must select draining before any work-producing
-		// reconcile. Still exercise network/webhook *startup gates* so a
-		// candidate that cannot boot those components fails under hold rather
-		// than only after the unheld restart — without running Reconcile.
-		if upgradeHold {
-			if err := r.admission.BeginVerifyHold("upgrade-verify-hold"); err != nil {
-				r.startupReadyErr = err
-				if r.logger != nil {
-					r.logger.Error("looperd upgrade verify hold failed", map[string]any{"error": err.Error()})
-				}
-				return
-			}
-			// Do not Start network (heartbeats / lease mutations) or webhook
-			// Reconcile under hold — those are not undone by local DB restore.
-			// Only fail-closed validate local tooling so misconfig surfaces here.
-			if r.webhook != nil {
-				if err := r.webhook.ValidateStartup(); err != nil {
-					r.startupReadyErr = err
-					return
-				}
-			}
-			if r.logger != nil {
-				r.logger.Info("looperd upgrade verify hold active", map[string]any{
-					"env":    "LOOPER_UPGRADE_VERIFY_HOLD=1",
-					"action": "run verify-start then restart without this env",
-					"note":   "network/webhook reconcile, scheduler, and discovery deferred until unheld restart",
-				})
-			}
-			return
-		}
 
 		if r.networkManager != nil {
 			if err := r.networkManager.Start(ctx); err != nil {
@@ -1560,9 +1572,7 @@ func (r *Runtime) CompleteStartup(ctx context.Context) error {
 		// admission remains ready (startDeferredReviewerRecovery rechecks under
 		// the shutdown race where BeginShutdown may have already missed a nil
 		// recoveryCancel between MarkReady and registration).
-		if !upgradeHold {
-			r.startDeferredReviewerRecovery(githubGateway)
-		}
+		r.startDeferredReviewerRecovery(githubGateway)
 		// startSchedulerLoop already fired an immediate full tick while admission
 		// was still starting (gate no-op). Wake full + claim pumps now that
 		// admission is ready so discovery/HITL do not wait a full poll interval.
@@ -1589,6 +1599,10 @@ func (r *Runtime) CompleteStartup(ctx context.Context) error {
 		r.Stop("runtime startup failed: " + r.startupReadyErr.Error())
 	}
 	return r.startupReadyErr
+}
+
+func upgradeVerifyHoldEnabled() bool {
+	return strings.TrimSpace(os.Getenv("LOOPER_UPGRADE_VERIFY_HOLD")) == "1"
 }
 
 func (r *Runtime) validateCoordinatorDependencyGates(ctx context.Context, repositories *storage.Repositories, githubGateway *githubinfra.Gateway) error {

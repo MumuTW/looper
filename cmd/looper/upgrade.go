@@ -237,10 +237,12 @@ type upgradeBackupResult struct {
 }
 
 type upgradeDrainSnapshot struct {
-	LiveExecutions    int `json:"liveExecutions"`
-	PendingSpawns     int `json:"pendingSpawns"`
-	BoundOperations   int `json:"boundOperations"`
-	PendingOperations int `json:"pendingOperations"`
+	LiveExecutions      int `json:"liveExecutions"`
+	PendingSpawns       int `json:"pendingSpawns"`
+	BoundOperations     int `json:"boundOperations"`
+	PendingOperations   int `json:"pendingOperations"`
+	NonAgentHandles     int `json:"nonAgentHandles"`
+	WorkProducersActive int `json:"workProducersActive"`
 }
 
 type upgradeDrainResult struct {
@@ -274,7 +276,7 @@ func runUpgradeDrain(ctx context.Context, global []string, deadline time.Duratio
 			if err := writeVersionJSON(stdout, result); err != nil {
 				return err
 			}
-			return fmt.Errorf("upgrade drain deadline reached with %d live executions, %d pending spawns, %d bound operations, and %d pending operations", result.Snapshot.LiveExecutions, result.Snapshot.PendingSpawns, result.Snapshot.BoundOperations, result.Snapshot.PendingOperations)
+			return fmt.Errorf("upgrade drain deadline reached with %d live executions, %d pending spawns, %d bound operations, %d pending operations, %d non-agent handles, and %d active work producers", result.Snapshot.LiveExecutions, result.Snapshot.PendingSpawns, result.Snapshot.BoundOperations, result.Snapshot.PendingOperations, result.Snapshot.NonAgentHandles, result.Snapshot.WorkProducersActive)
 		case <-ticker.C:
 			result, err = requestJSON[upgradeDrainResult](drainCtx, cfg, "GET", "/api/v1/upgrade/drain", nil)
 			if err != nil {
@@ -485,7 +487,12 @@ func upgradePostStartBlocks(report upgradePostStartReport) []string {
 	if report.Status.Service.Recovery.Outstanding.QuarantinedActiveExecutions > 0 || report.Status.Service.Recovery.Outstanding.QuarantinedRunningRuns > 0 {
 		blocks = append(blocks, "daemon has outstanding quarantine debt")
 	}
-	if !report.StartedEvent {
+	// Verify-hold deliberately defers appendStartedEvent with the rest of
+	// startup recovery so the candidate cannot mutate the rollback database.
+	// The held admission plus StartedAt/health checks are the live startup
+	// authority for this phase; the durable event is emitted on the unheld
+	// restart.
+	if !report.StartedEvent && report.Status.Service.AdmissionState != "draining" {
 		blocks = append(blocks, "daemon startup recovery event is unavailable")
 	}
 	return blocks
