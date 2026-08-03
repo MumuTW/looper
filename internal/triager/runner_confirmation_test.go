@@ -82,8 +82,8 @@ func TestDiscoverIssuesRequiresReportSpecificConfirmationToken(t *testing.T) {
 		t.Fatalf("first DiscoverIssues() = (%#v, %v)", first, err)
 	}
 	report := fixture.singleReport(t)
-	if report.Version != 2 || report.ConfirmationToken == "" {
-		t.Fatalf("report version/token = %d/%q, want v2 report-specific token", report.Version, report.ConfirmationToken)
+	if report.Version != 3 || report.ConfirmationToken == "" {
+		t.Fatalf("report version/token = %d/%q, want v3 report-specific token", report.Version, report.ConfirmationToken)
 	}
 	fixture.github.listEmpty = true
 	fixture.github.detail.Comments = []githubinfra.CommentInfo{{
