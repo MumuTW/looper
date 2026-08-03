@@ -35,6 +35,10 @@ var (
 	highEntropyCandidateRE = regexp.MustCompile(`[A-Za-z0-9_+/=-]{24,}`)
 	gitObjectIDRE          = regexp.MustCompile(`(?i)^[0-9a-f]{40}$|^[0-9a-f]{64}$`)
 	uuidRE                 = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+	// assignmentNameRE recognizes the NAME part of a NAME=value candidate token
+	// so the value can be evaluated separately. Base64 '=' padding does not
+	// qualify: its prefix contains non-identifier characters.
+	assignmentNameRE = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 )
 
 // sensitiveEnvNameKeywords are long, high-confidence segments only. Matched as
@@ -125,11 +129,33 @@ func unsafeText(text string, highEntropyExemptions []string) string {
 		if gitObjectIDRE.MatchString(token) || uuidRE.MatchString(token) {
 			continue
 		}
+		// A NAME=value candidate is judged by its value: the NAME's character
+		// classes and letters otherwise inflate an innocuous value past the
+		// bar (fixItemsFingerprint=<sha1> is looper's own identifier format),
+		// and an exempt value stays exempt with or without a NAME= prefix.
+		if value, isAssignment := assignmentValue(token); isAssignment {
+			if value == "" || gitObjectIDRE.MatchString(value) || uuidRE.MatchString(value) {
+				continue
+			}
+			token = value
+		}
 		if characterClassCount(token) >= 3 && shannonEntropy(token) >= highEntropyThreshold {
 			return "contains a high-entropy credential-shaped token"
 		}
 	}
 	return ""
+}
+
+// assignmentValue splits a NAME=value-shaped candidate token, reporting the
+// value separately so the entropy check judges the secret-shaped part alone.
+// ok is false for tokens that are not identifier assignments — including
+// base64 blobs whose '=' is padding rather than an assignment separator.
+func assignmentValue(token string) (string, bool) {
+	separator := strings.IndexByte(token, '=')
+	if separator <= 0 || !assignmentNameRE.MatchString(token[:separator]) {
+		return "", false
+	}
+	return token[separator+1:], true
 }
 
 // isSensitiveAssignment reports high-confidence env-style credential lines such

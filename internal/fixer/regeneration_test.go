@@ -23,6 +23,21 @@ type regenerationFakeGateway struct {
 	removeIssueLabelCalls []IssueLabelsInput
 	removeIssueLabelErr   error
 	prLabelErr            error
+	// commentErrs are consumed one per CreateIssueComment call (nil entry =
+	// success) before falling through to the embedded gateway.
+	commentErrs []error
+}
+
+func (f *regenerationFakeGateway) CreateIssueComment(ctx context.Context, input IssueCommentInput) (IssueCommentResult, error) {
+	if len(f.commentErrs) > 0 {
+		err := f.commentErrs[0]
+		f.commentErrs = f.commentErrs[1:]
+		if err != nil {
+			f.createIssueComments = append(f.createIssueComments, input)
+			return IssueCommentResult{}, err
+		}
+	}
+	return f.fakeGitHubGateway.CreateIssueComment(ctx, input)
 }
 
 func (f *regenerationFakeGateway) ViewIssue(context.Context, ViewIssueInput) (IssueDetail, error) {

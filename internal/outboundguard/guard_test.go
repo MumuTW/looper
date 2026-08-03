@@ -13,6 +13,7 @@ func TestValidateRejectsUnsafeOutboundContentWithoutEchoingIt(t *testing.T) {
 		want string
 	}{
 		{name: "entropy", text: "The process returned q8Kz1Wm9P2vR7xL4nB6cD0fH3jS5uY+/ unexpectedly.", want: "high-entropy"},
+		{name: "high-entropy assignment value", text: "FIXTURE_BLOB=q8Kz1Wm9P2vR7xL4nB6cD0fH3jS5uY+/", want: "high-entropy"},
 		{name: "api key assignment", text: "OPENAI_API_KEY=sk-sensitive", want: "credential-shaped"},
 		{name: "token assignment", text: "TOKEN=short", want: "credential-shaped"},
 		{name: "trailing token", text: "SERVICE_TOKEN=secret-value", want: "credential-shaped"},
@@ -66,6 +67,10 @@ func TestValidateAllowsCommonPublicationIdentifiers(t *testing.T) {
 		"Repository URL https://git.example/org/repo and contact ops@example.com.",
 		"Docs: https://example.com/auth?passwordless=true for the login flow.",
 		"Docs: https://example.com/oauth?token_type=bearer&expires_in=3600",
+		// Looper's own durable identifier formats: NAME=<git object id / uuid>.
+		// The NAME prefix must not push an exempt value over the entropy bar.
+		"attempts=5/5; kind=retryable_transient; headSha=0d4f441944a796ffb78d19841bb8acb9059f3b78; fixItemsFingerprint=8d2e47c6dbb3ccd63d347654d9d6872880dbbab1; loop=loop_d52f84a778114ab2d2b66ed291366a95; queueItem=queue_2169b0d8982a33eddeec756c8c29678d",
+		"correlationId=019f5693-81ce-4893-8df5-89db82778ac7",
 		"-----BEGIN CERTIFICATE-----\nMIIBkTCB+wIJAKH\n-----END CERTIFICATE-----",
 	} {
 		if err := Validate(Field{Name: "body", Text: text}); err != nil {
