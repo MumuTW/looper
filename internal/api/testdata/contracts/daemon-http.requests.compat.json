@@ -98,7 +98,7 @@
           "content-type": "application/json"
         },
         "body": {
-          "repo": "nexu-io/looper"
+          "repo": "MumuTW/looper"
         }
       }
     },

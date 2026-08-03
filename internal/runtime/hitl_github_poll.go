@@ -2,6 +2,8 @@ package runtime
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -172,6 +174,12 @@ func pollGitHubHITLAnswersOnce(ctx contextType, loops []githubHITLAwaitingLoop, 
 			continue
 		}
 		if err := deps.deliverAnswer(ctx, loop.ID, answer); err != nil {
+			if errors.Is(err, errHITLAnswerNotApplied) {
+				// A concurrent lifecycle transition won the durable gate. Keep
+				// the remote answer visible for the next pass; it was not
+				// delivered and must not clear the awaiting label.
+				continue
+			}
 			if deps.logWarn != nil {
 				deps.logWarn("hitl github poll: deliver answer failed", map[string]any{"loopId": loop.ID, "error": err.Error()})
 			}
@@ -241,47 +249,48 @@ func enqueueHumanMessageToLoop(ctx context.Context, repos *storage.Repositories,
 	return err
 }
 
-func deliverHITLAnswerToLoop(ctx context.Context, repos *storage.Repositories, nowISO, loopID, answer string) error {
+// errHITLAnswerNotApplied is a stale/no-op remote answer. It is deliberately
+// distinct from a delivery failure so pollers can avoid transport side effects
+// such as clearing an awaiting label or marking a Feishu card resolved.
+var errHITLAnswerNotApplied = errors.New("HITL answer was not applied")
+
+func deliverHITLAnswerToLoop(ctx context.Context, db *sql.DB, repos *storage.Repositories, nowISO, loopID, answer string) error {
+	if db == nil {
+		return fmt.Errorf("HITL answer delivery database is not configured")
+	}
+	if repos == nil || repos.Loops == nil {
+		return fmt.Errorf("HITL answer delivery repositories are not configured")
+	}
 	// Same requeue + target exclusion as free-text enqueue / API discard+retry.
 	unlock := LockLoopRequeue(loopID)
 	defer unlock()
 
 	loop, err := repos.Loops.GetByID(ctx, loopID)
-	if err != nil || loop == nil {
+	if err != nil {
 		return err
 	}
-	if loop.Status != "awaiting_human" {
-		return nil
+	if loop == nil || loop.Status != "awaiting_human" {
+		return errHITLAnswerNotApplied
 	}
 	unlockTarget := LockLoopTarget(LoopTargetGuardKeyFromRecord(*loop))
 	defer unlockTarget()
-	ask, ok := loops.ReadHITLAsk(loop.MetadataJSON)
-	if !ok {
-		return nil
-	}
-	// GitHub answers are admitted only after author allowlist/repository-write
-	// checks above. That authenticated answer is the authority to consume the
-	// exact staged malformed gate identity; changed evidence remains parked.
-	if err := loops.ConsumeHITLGateEvidence(ask.GateEvidence); err != nil {
-		return fmt.Errorf("consume malformed HITL gate evidence: %w", err)
-	}
-	ask.Answer = answer
-	ask.Status = "answered"
-	ask.AnsweredAt = nowISO
-	meta, werr := loops.WriteHITLAsk(loop.MetadataJSON, ask)
-	if werr != nil {
-		return werr
-	}
-	updated := *loop
-	updated.MetadataJSON = &meta
-	updated.Status = "running"
-	updated.NextRunAt = &nowISO
-	updated.UpdatedAt = nowISO
-	if err := repos.Loops.Upsert(ctx, updated); err != nil {
+	result, err := storage.WithTransactionValue(ctx, db, nil, func(tx *sql.Tx) (loops.HITLAnswerResult, error) {
+		return loops.RecordHITLAnswer(ctx, storage.NewRepositories(tx), loops.HITLAnswerInput{
+			LoopID:              loopID,
+			Answer:              answer,
+			NowISO:              nowISO,
+			RequireExistingAsk:  true,
+			Resume:              true,
+			ConsumeGateEvidence: true,
+		})
+	})
+	if err != nil {
 		return err
 	}
-	_, err = repos.Queue.RequeueLatestCancelledByLoop(ctx, loopID, nowISO)
-	return err
+	if !result.Applied {
+		return errHITLAnswerNotApplied
+	}
+	return nil
 }
 
 // runGitHubHITLPoll runs one answer-poll pass for a project's awaiting_human
@@ -346,7 +355,7 @@ func runGitHubHITLPoll(ctx context.Context, input defaultSchedulerTickInput, pro
 			return out, nil
 		},
 		deliverAnswer: func(ctx contextType, loopID, answer string) error {
-			return deliverHITLAnswerToLoop(ctx, input.Repos, nowISO, loopID, answer)
+			return deliverHITLAnswerToLoop(ctx, input.DB, input.Repos, nowISO, loopID, answer)
 		},
 		clearAwaiting: func(ctx contextType, repo string, pr int64, cwd string) {
 			_ = gw.RemovePullRequestLabels(ctx, githubinfra.PullRequestLabelsInput{Repo: repo, PRNumber: pr, Labels: []string{awaitingLabel}, CWD: cwd})

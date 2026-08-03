@@ -525,7 +525,7 @@ func captureCoreRouteResponses(t *testing.T, out map[string]capturedResponse) {
 			updateProject: func(context.Context, string, projects.UpdateInput) (storage.ProjectRecord, error) {
 				nowISO := fixture.now.UTC().Format(javaScriptISOString)
 				baseBranch := "main"
-				metadataJSON := `{"repo":"nexu-io/looper","worktreeRoot":null,"source":"api"}`
+				metadataJSON := `{"repo":"MumuTW/looper","worktreeRoot":null,"source":"api"}`
 				return storage.ProjectRecord{ID: "project_1", Name: "Looper", RepoPath: "/tmp/looper", BaseBranch: &baseBranch, MetadataJSON: &metadataJSON, CreatedAt: nowISO, UpdatedAt: nowISO}, nil
 			},
 		},
