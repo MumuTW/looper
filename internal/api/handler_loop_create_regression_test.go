@@ -8,18 +8,32 @@ import (
 
 func TestForcedManualWorkerMetadataInitializesNestedOverride(t *testing.T) {
 	tests := []struct {
-		name string
-		in   *string
+		name    string
+		in      *string
+		wantErr bool
 	}{
 		{name: "nil", in: nil},
 		{name: "empty object", in: stringPtr("{}")},
 		{name: "missing worker", in: stringPtr(`{"source":"manual"}`)},
 		{name: "non-object worker", in: stringPtr(`{"worker":"legacy","source":"manual"}`)},
 		{name: "auto discovered worker", in: stringPtr(`{"worker":{"autoDiscovered":true},"source":"manual"}`)},
+		{name: "malformed metadata", in: stringPtr(`{"worker":`), wantErr: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := forcedManualWorkerMetadataJSONCompat(tt.in)
+			got, err := forcedManualWorkerMetadataJSONCompat(tt.in)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("forcedManualWorkerMetadataJSONCompat() error = nil, want malformed metadata error")
+				}
+				if got != nil {
+					t.Fatalf("forcedManualWorkerMetadataJSONCompat() value = %q, want nil on error", *got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("forcedManualWorkerMetadataJSONCompat() error = %v", err)
+			}
 			if got == nil {
 				t.Fatal("forcedManualWorkerMetadataJSONCompat() returned nil")
 			}

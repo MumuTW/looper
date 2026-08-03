@@ -15,6 +15,7 @@ import (
 	"github.com/MumuTW/looper/internal/eventlog"
 	githubinfra "github.com/MumuTW/looper/internal/infra/github"
 	"github.com/MumuTW/looper/internal/infra/shell"
+	"github.com/MumuTW/looper/internal/loops"
 	"github.com/MumuTW/looper/internal/storage"
 	pkgapi "github.com/MumuTW/looper/pkg/api"
 )
@@ -943,7 +944,10 @@ func forcedManualWorkerQueuePayloadJSONCompat(payloadJSON *string) *string {
 }
 
 func forceManualWorkerLoopStateCompat(ctx context.Context, repos *storage.Repositories, loop storage.LoopRecord, nowISO string) (storage.LoopRecord, error) {
-	metadataJSON := forcedManualWorkerMetadataJSONCompat(loop.MetadataJSON)
+	metadataJSON, err := forcedManualWorkerMetadataJSONCompat(loop.MetadataJSON)
+	if err != nil {
+		return storage.LoopRecord{}, err
+	}
 	if !stringPtrEqual(metadataJSON, loop.MetadataJSON) {
 		loop.MetadataJSON = metadataJSON
 		loop.UpdatedAt = nowISO
@@ -997,8 +1001,11 @@ func issueWorkerMetadataJSON(metadataJSON *string, target domain.LoopTarget, for
 	return &text, nil
 }
 
-func forcedManualWorkerMetadataJSONCompat(metadataJSON *string) *string {
-	metadata := parseJSONObject(metadataJSON)
+func forcedManualWorkerMetadataJSONCompat(metadataJSON *string) (*string, error) {
+	metadata, err := loops.DecodeMetadataObjectForWrite(metadataJSON)
+	if err != nil {
+		return nil, err
+	}
 	worker, _ := metadata["worker"].(map[string]any)
 	if worker == nil {
 		worker = map[string]any{}
@@ -1008,10 +1015,10 @@ func forcedManualWorkerMetadataJSONCompat(metadataJSON *string) *string {
 	metadata["worker"] = worker
 	encoded, err := json.Marshal(metadata)
 	if err != nil {
-		return metadataJSON
+		return nil, err
 	}
 	text := string(encoded)
-	return &text
+	return &text, nil
 }
 
 func forcedManualWorkerCheckpointJSONCompat(checkpointJSON *string) *string {

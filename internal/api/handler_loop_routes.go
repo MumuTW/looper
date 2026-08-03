@@ -224,6 +224,18 @@ func (h *Handler) streamLoopLogs(w http.ResponseWriter, r *http.Request, request
 		current = next
 
 		if shouldTerminateLoopLogsFollow(current, observedRunID) {
+			// The non-draining poll above may discover that the selected log file
+			// disappeared after the run became terminal. That clears cursor.path
+			// and intentionally discards pendingInline, so reconcile the same
+			// terminal snapshot once more before ending; otherwise the newer
+			// durable inline output is lost with the stream.
+			if err := h.updateLoopLogsSingleCursor(w, flusher, current, nextState.output, &cursor, streamStderr, executionID); err != nil {
+				if errors.Is(err, errLoopLogsClientWrite) {
+					return nil
+				}
+				_ = writeSSEEvent(w, flusher, "error", newLoopLogsFollowErrorEvent(err))
+				return nil
+			}
 			// Drain any remaining file bytes before ending. A burst exceeding
 			// loopLogsFollowMaxChunkBytes between polls leaves more than one
 			// chunk unread; the non-draining emit above only delivers one, and

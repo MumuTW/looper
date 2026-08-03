@@ -748,6 +748,54 @@ func TestLoopLogsSingleCursorPreservesInlineBaselineWhenFileDisappears(t *testin
 	}
 }
 
+func TestLoopLogsSingleCursorReconcilesInlineFallbackBeforeTerminalEnd(t *testing.T) {
+	fixture := newTestFixture(t)
+	handler := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime})
+	logDir := filepath.Join(fixture.config.Daemon.LogDir, "loops")
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	path := filepath.Join(logDir, "terminal_inline_transition.log")
+	if err := os.WriteFile(path, []byte("file line\n"), 0o644); err != nil {
+		t.Fatalf("write log: %v", err)
+	}
+	cursor, err := handler.newLoopLogsFileCursor(path, "file line\n")
+	if err != nil {
+		t.Fatalf("new cursor: %v", err)
+	}
+	response := loopLogsResponse{
+		Run:   &loopLogsRunResponse{RunID: "run_terminal", Status: "success"},
+		Agent: &loopLogsAgentPayload{ExecutionID: "exec_terminal", Vendor: "codex", Status: "success"},
+	}
+	output := agentOutputPayload{Stdout: "file line\ninline terminal\n", StdoutLogPath: path}
+	first := httptest.NewRecorder()
+	if err := handler.updateLoopLogsSingleCursor(first, first, response, output, &cursor, false, "exec_terminal"); err != nil {
+		t.Fatalf("stage terminal inline output: %v", err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("remove log: %v", err)
+	}
+	if err := handler.emitLoopLogsSingleChunks(first, first, response, &cursor, false); err != nil {
+		t.Fatalf("observe disappeared terminal log: %v", err)
+	}
+	if !shouldTerminateLoopLogsFollow(response, "run_terminal") {
+		t.Fatal("terminal response was not terminal")
+	}
+
+	// This second reconciliation is the terminal branch's final opportunity to
+	// emit inline output after the first non-draining read cleared cursor.path.
+	second := httptest.NewRecorder()
+	if err := handler.updateLoopLogsSingleCursor(second, second, response, output, &cursor, false, "exec_terminal"); err != nil {
+		t.Fatalf("reconcile terminal inline output: %v", err)
+	}
+	if err := handler.emitLoopLogsSingleChunks(second, second, response, &cursor, true); err != nil {
+		t.Fatalf("drain terminal inline output: %v", err)
+	}
+	if !strings.Contains(second.Body.String(), "inline terminal") {
+		t.Fatalf("terminal fallback body = %q, want inline terminal output before end", second.Body.String())
+	}
+}
+
 // TestSingleLoopLogsStreamDrainsRemainingBytesBeforeEnding verifies that when
 // a run becomes terminal while the file cursor has more than one chunk unread,
 // the stream drains all remaining bytes before sending the end event.

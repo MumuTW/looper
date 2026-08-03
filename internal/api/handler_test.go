@@ -6437,6 +6437,39 @@ func TestHandlerWorkersCreateForceClearsAutoDiscoveredPayloadWhenReusingIssueWor
 	}
 }
 
+func TestHandlerWorkersCreateForceRejectsMalformedReusableMetadata(t *testing.T) {
+	fixture := newTestFixture(t)
+	seedWorkerPlannerArtifactsData(t, fixture.runtime, fixture.now)
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+	projectID := "project_1"
+	loopID := "loop_malformed_reusable_worker"
+	targetID := "issue:acme/looper:77"
+	repo := "acme/looper"
+	malformedMetadata := `{"worker":`
+	if err := fixture.runtime.Services().Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{
+		ID: loopID, Seq: 1, ProjectID: projectID, Type: "worker", TargetType: "issue", TargetID: &targetID,
+		Repo: &repo, Status: "idle", MetadataJSON: &malformedMetadata, CreatedAt: nowISO, UpdatedAt: nowISO,
+	}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/workers", bytes.NewReader([]byte(`{"projectId":"project_1","repo":"acme/looper","issueNumber":77,"baseBranch":"main","force":true}`)))
+	req.Header.Set("content-type", "application/json")
+	recorder := httptest.NewRecorder()
+	NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime, Now: func() time.Time { return fixture.now.Add(time.Minute) }}).ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500; body=%s", recorder.Code, recorder.Body.String())
+	}
+	stored, err := fixture.runtime.Services().Repositories.Loops.GetByID(context.Background(), loopID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if stored == nil || stored.MetadataJSON == nil || *stored.MetadataJSON != malformedMetadata {
+		t.Fatalf("stored metadata = %#v, want malformed value preserved for diagnosis", stored)
+	}
+}
+
 func TestHandlerWorkersCreateForceRejectsRunningReusableIssueWorker(t *testing.T) {
 	fixture := newTestFixture(t)
 	seedWorkerPlannerArtifactsData(t, fixture.runtime, fixture.now)
