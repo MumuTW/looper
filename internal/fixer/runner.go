@@ -7374,6 +7374,7 @@ func (r *Runner) runValidation(ctx context.Context, input ValidationInput) (Vali
 }
 
 type eventInput struct {
+	id         string
 	eventType  string
 	projectID  string
 	loopID     string
@@ -7387,7 +7388,7 @@ func (r *Runner) appendEvent(ctx context.Context, input eventInput) {
 	if r.repos == nil || r.repos.Events == nil {
 		return
 	}
-	_ = eventlog.Append(ctx, r.repos, eventlog.AppendInput{EventType: input.eventType, ProjectID: runpipe.OptionalString(input.projectID), LoopID: runpipe.OptionalString(input.loopID), RunID: runpipe.OptionalString(input.runID), EntityType: runpipe.OptionalString(input.entityType), EntityID: runpipe.OptionalString(input.entityID), ActorType: runpipe.OptionalString("system"), ActorID: runpipe.OptionalString("fixer-loop"), ActorDisplayName: runpipe.OptionalString("fixer-loop"), Payload: input.payload, CreatedAt: r.now()})
+	_ = eventlog.Append(ctx, r.repos, eventlog.AppendInput{ID: input.id, EventType: input.eventType, ProjectID: runpipe.OptionalString(input.projectID), LoopID: runpipe.OptionalString(input.loopID), RunID: runpipe.OptionalString(input.runID), EntityType: runpipe.OptionalString(input.entityType), EntityID: runpipe.OptionalString(input.entityID), ActorType: runpipe.OptionalString("system"), ActorID: runpipe.OptionalString("fixer-loop"), ActorDisplayName: runpipe.OptionalString("fixer-loop"), Payload: input.payload, CreatedAt: r.now()})
 }
 
 func (r *Runner) hasActivePRLock(ctx context.Context, projectID, repo string, prNumber int64) bool {

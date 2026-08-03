@@ -146,8 +146,8 @@ func TestHandleTerminalExhaustionEscalationRetriesNonGateFallbackFailure(t *test
 // the subsequent label mutation fails, the handoff is requeued with Commented
 // and Escalated still false. Without deduplication every replay would re-enter
 // escalateWithoutFailureContext and append another fixer.escalation.context_withheld
-// event. The durable ContextWithheld flag, checkpointed alongside Commented,
-// ensures only the first rejection records the event.
+// event. The event-log primary key, derived from the loop ID, ensures only the
+// first rejection records the event even when the metadata checkpoint is lost.
 func TestHandleTerminalExhaustionEscalationDeduplicatesContextWithheldEventAcrossReplay(t *testing.T) {
 	fixture := newRunnerFixture(t)
 	gateway := &regenerationFakeGateway{
@@ -183,12 +183,13 @@ func TestHandleTerminalExhaustionEscalationDeduplicatesContextWithheldEventAcros
 		t.Fatalf("Loops.GetByID() error = %v", err)
 	}
 	state, ok := parseRegenerationState(parseJSONObject(updated.MetadataJSON))
-	if !ok || !state.ContextWithheld || state.Escalated {
-		t.Fatalf("regeneration state after first attempt = %#v, want ContextWithheld checkpointed and Escalated still false", state)
+	if !ok || state.Escalated {
+		t.Fatalf("regeneration state after first attempt = %#v, want escalation still incomplete", state)
 	}
 
 	// Replay: the label service recovers, both comment bodies are still rejected.
-	// The ContextWithheld flag is durable, so the event must not be appended again.
+	// The deterministic event ID keeps the audit history deduplicated across
+	// the replay without adding another durable regeneration-state field.
 	gateway.prLabelErr = nil
 	gateway.commentErrs = []error{contentGateRejection(), contentGateRejection()}
 	action, err := runner.handleTerminalExhaustion(ctx, *project, loop, queue, fixerCheckpoint{}, failure)
@@ -200,5 +201,12 @@ func TestHandleTerminalExhaustionEscalationDeduplicatesContextWithheldEventAcros
 	}
 	if got := withheldEvents(); got != 1 {
 		t.Fatalf("context_withheld events after replay = %d, want still one (deduplicated across replay)", got)
+	}
+	events, err := fixture.repos.Events.ListByEntityAndEventTypes(ctx, "loop", loop.ID, []string{"fixer.escalation.context_withheld"})
+	if err != nil {
+		t.Fatalf("Events.ListByEntityAndEventTypes() error = %v", err)
+	}
+	if events[0].ID != "fixer.escalation.context_withheld:"+loop.ID {
+		t.Fatalf("context_withheld event ID = %q, want deterministic loop-scoped ID", events[0].ID)
 	}
 }
