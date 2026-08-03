@@ -102,6 +102,48 @@ func TestTargetBuildIdentityRejectsIncompleteJSON(t *testing.T) {
 	}
 }
 
+func TestUpgradePostStartRequiresVerifyHoldAdmission(t *testing.T) {
+	identity := completeUpgradeIdentity("candidate")
+	startedAt := "2026-08-03T12:00:00Z"
+	report := upgradePostStartReport{
+		ExpectedBuild:   identity,
+		ExpectedRelease: "candidate-release",
+		DaemonBuild:     identity,
+		CurrentRelease:  "candidate-release",
+		StartedEvent:    true,
+		Status: upgradeStatus{
+			Service: struct {
+				Healthy        bool                  `json:"healthy"`
+				Version        string                `json:"version"`
+				AdmissionState string                `json:"admissionState"`
+				StartedAt      *string               `json:"startedAt"`
+				Build          version.BuildMetadata `json:"build"`
+				Recovery       struct {
+					Outstanding struct {
+						QuarantinedActiveExecutions int `json:"quarantinedActiveExecutions"`
+						QuarantinedRunningRuns      int `json:"quarantinedRunningRuns"`
+					} `json:"outstanding"`
+				} `json:"recovery"`
+			}{Healthy: true, Version: identity.Version, AdmissionState: "draining", StartedAt: &startedAt, Build: identity.Metadata},
+			Storage: struct {
+				SchemaVersion     string   `json:"schemaVersion"`
+				PendingMigrations []string `json:"pendingMigrations"`
+				Healthy           bool     `json:"healthy"`
+			}{Healthy: true},
+		},
+	}
+
+	if blocks := upgradePostStartBlocks(report); len(blocks) != 0 {
+		t.Fatalf("upgradePostStartBlocks() with draining admission = %v, want no blocks", blocks)
+	}
+
+	report.Status.Service.AdmissionState = "ready"
+	blocks := upgradePostStartBlocks(report)
+	if len(blocks) != 1 || blocks[0] != "daemon admission is not draining under verify hold" {
+		t.Fatalf("upgradePostStartBlocks() with ready admission = %v, want verify-hold block", blocks)
+	}
+}
+
 func completeUpgradeIdentity(commit string) version.Info {
 	ts := "2026-07-31T12:00:00Z"
 	dirty := false

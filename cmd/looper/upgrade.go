@@ -464,8 +464,8 @@ func upgradePostStartBlocks(report upgradePostStartReport) []string {
 	if !report.Status.Service.Healthy {
 		blocks = append(blocks, "daemon service is unhealthy")
 	}
-	if report.Status.Service.AdmissionState != "ready" {
-		blocks = append(blocks, "daemon admission is not ready")
+	if report.Status.Service.AdmissionState != "draining" {
+		blocks = append(blocks, "daemon admission is not draining under verify hold")
 	}
 	if report.Status.Service.StartedAt == nil || strings.TrimSpace(*report.Status.Service.StartedAt) == "" {
 		blocks = append(blocks, "daemon startup time is unavailable")
