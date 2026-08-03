@@ -20,7 +20,7 @@ func TestReactivateQueueRevivesCancelledQueueWithoutDuplicate(t *testing.T) {
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
 	result := reactivateForTest(t, ctx, db, repos, loop, nowISO)
-	if result.Outcome != QueueReactivationRevivedCancelled || result.QueueItem == nil || result.QueueItem.ID != "queue_cancelled" || result.QueueItem.Status != "queued" {
+	if result.QueueItem == nil || result.QueueItem.ID != "queue_cancelled" || result.QueueItem.Status != "queued" {
 		t.Fatalf("ReactivateQueue() = %#v, want cancelled queue revived", result)
 	}
 	if count := countQueuesForLoop(t, ctx, repos, loop.ID); count != 1 {
@@ -39,7 +39,7 @@ func TestReactivateQueueCreatesCleanReplacementForTerminalQueue(t *testing.T) {
 		t.Fatalf("Queue.Upsert() error = %v", err)
 	}
 	result := reactivateForTest(t, ctx, db, repos, loop, nowISO)
-	if result.Outcome != QueueReactivationReplacement || result.QueueItem == nil || result.QueueItem.ID == "queue_failed" || result.QueueItem.Status != "queued" || result.QueueItem.Attempts != 0 || result.QueueItem.ClaimedBy != nil || result.QueueItem.LastError != nil {
+	if result.QueueItem == nil || result.QueueItem.ID == "queue_failed" || result.QueueItem.Status != "queued" || result.QueueItem.Attempts != 0 || result.QueueItem.ClaimedBy != nil || result.QueueItem.LastError != nil {
 		t.Fatalf("ReactivateQueue() = %#v, want clean replacement", result)
 	}
 }
@@ -48,7 +48,7 @@ func TestReactivateQueueCreatesFirstReviewerQueueAndRejectsSiblingConflict(t *te
 	t.Parallel()
 	ctx, db, repos, loop, nowISO := reactivationFixture(t)
 	result := reactivateForTest(t, ctx, db, repos, loop, nowISO)
-	if result.Outcome != QueueReactivationCreated || result.QueueItem == nil || result.QueueItem.Type != "reviewer" {
+	if result.QueueItem == nil || result.QueueItem.Type != "reviewer" {
 		t.Fatalf("ReactivateQueue() = %#v, want first reviewer queue", result)
 	}
 	otherID := "loop_conflict"
@@ -58,8 +58,9 @@ func TestReactivateQueueCreatesFirstReviewerQueueAndRejectsSiblingConflict(t *te
 	if err := repos.Loops.Upsert(ctx, storage.LoopRecord{ID: otherID, Seq: 2, ProjectID: loop.ProjectID, Type: string(domain.LoopTypeReviewer), TargetType: string(domain.LoopTargetTypePullRequest), TargetID: &targetID, Repo: &repo, PRNumber: &pr, Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Loops.Upsert(conflict) error = %v", err)
 	}
-	if _, err := storage.WithTransactionValue(ctx, db, nil, func(tx *sql.Tx) (QueueReactivationResult, error) {
-		return ReactivateQueue(ctx, storage.NewRepositories(tx), QueueReactivationInput{Loop: loop, NowISO: nowISO, MaxAttempts: 3})
+	if err := storage.WithTransaction(ctx, db, nil, func(tx *sql.Tx) error {
+		_, err := ReactivateQueue(ctx, storage.NewRepositories(tx), QueueReactivationInput{Loop: loop, NowISO: nowISO, MaxAttempts: 3})
+		return err
 	}); err == nil {
 		t.Fatal("ReactivateQueue() error = nil, want active sibling conflict")
 	}

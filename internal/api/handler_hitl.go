@@ -84,7 +84,7 @@ func (h *Handler) handbackLoop(ctx context.Context, r *http.Request, loopID stri
 
 	services := h.context.Runtime.Services()
 	nowISO := eventlog.FormatJavaScriptISOString(h.now().UTC())
-	_, err := storage.WithTransactionValue(ctx, services.Coordinator.DB(), nil, func(tx *sql.Tx) (loops.HandbackPreparationResult, error) {
+	err := storage.WithTransaction(ctx, services.Coordinator.DB(), nil, func(tx *sql.Tx) error {
 		return loops.PrepareHandback(ctx, storage.NewRepositories(tx), loops.HandbackPreparationInput{LoopID: loopID, NowISO: nowISO})
 	})
 	if err != nil {
@@ -150,37 +150,42 @@ func (h *Handler) deliverHumanAnswer(ctx context.Context, loopID string, rawAnsw
 
 	services := h.context.Runtime.Services()
 	nowISO := eventlog.FormatJavaScriptISOString(h.now().UTC())
-	_, err := storage.WithTransactionValue(ctx, services.Coordinator.DB(), nil, func(tx *sql.Tx) (storage.LoopRecord, error) {
-		repos := storage.NewRepositories(tx)
-		loop, err := repos.Loops.GetByID(ctx, loopID)
-		if err != nil {
-			return storage.LoopRecord{}, err
-		}
-		if loop == nil {
-			return storage.LoopRecord{}, apiError{code: pkgapi.ErrorCodeLoopNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Loop not found: %s", loopID)}
-		}
-		if loop.Status != string(domain.LoopStatusAwaitingHuman) {
-			return storage.LoopRecord{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Loop %s is not awaiting a human (status: %s)", loopID, loop.Status)}
-		}
-		ask, _ := loops.ReadHITLAsk(loop.MetadataJSON)
-		if err := loops.ConsumeHITLGateEvidence(ask.GateEvidence); err != nil {
-			return storage.LoopRecord{}, fmt.Errorf("consume malformed HITL gate evidence: %w", err)
-		}
-		ask.Answer = answer
-		ask.Status = "answered"
-		ask.AnsweredAt = nowISO
-		metadataJSON, err := loops.WriteHITLAsk(loop.MetadataJSON, ask)
-		if err != nil {
-			return storage.LoopRecord{}, err
-		}
-		updated := *loop
-		updated.MetadataJSON = stringPtrOrNil(metadataJSON)
-		updated.UpdatedAt = nowISO
-		if err := repos.Loops.Upsert(ctx, updated); err != nil {
-			return storage.LoopRecord{}, err
-		}
-		return updated, nil
-	})
+	var err error
+	func() {
+		unlock := loops.LockLoopRequeue(loopID)
+		defer unlock()
+		_, err = storage.WithTransactionValue(ctx, services.Coordinator.DB(), nil, func(tx *sql.Tx) (storage.LoopRecord, error) {
+			repos := storage.NewRepositories(tx)
+			loop, err := repos.Loops.GetByID(ctx, loopID)
+			if err != nil {
+				return storage.LoopRecord{}, err
+			}
+			if loop == nil {
+				return storage.LoopRecord{}, apiError{code: pkgapi.ErrorCodeLoopNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Loop not found: %s", loopID)}
+			}
+			if loop.Status != string(domain.LoopStatusAwaitingHuman) {
+				return storage.LoopRecord{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Loop %s is not awaiting a human (status: %s)", loopID, loop.Status)}
+			}
+			ask, _ := loops.ReadHITLAsk(loop.MetadataJSON)
+			if err := loops.ConsumeHITLGateEvidence(ask.GateEvidence); err != nil {
+				return storage.LoopRecord{}, fmt.Errorf("consume malformed HITL gate evidence: %w", err)
+			}
+			ask.Answer = answer
+			ask.Status = "answered"
+			ask.AnsweredAt = nowISO
+			metadataJSON, err := loops.WriteHITLAsk(loop.MetadataJSON, ask)
+			if err != nil {
+				return storage.LoopRecord{}, err
+			}
+			updated := *loop
+			updated.MetadataJSON = stringPtrOrNil(metadataJSON)
+			updated.UpdatedAt = nowISO
+			if err := repos.Loops.Upsert(ctx, updated); err != nil {
+				return storage.LoopRecord{}, err
+			}
+			return updated, nil
+		})
+	}()
 	if err != nil {
 		var typed apiError
 		if asAPIError(err, &typed) {

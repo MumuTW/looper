@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/MumuTW/looper/internal/config"
 	"github.com/MumuTW/looper/internal/loops"
@@ -126,6 +127,47 @@ func TestHandlerRespondResumesAwaitingHumanLoop(t *testing.T) {
 	}
 	if !queued {
 		t.Fatalf("expected a queued queue item for the resumed loop; items=%#v", items)
+	}
+}
+
+func TestHandlerRespondSharesRequeueLock(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	ctx := context.Background()
+	nowISO := "2026-04-11T12:00:00.000Z"
+	projectID, loopID, targetID := "project_hitl_lock", "loop_hitl_lock", "project_hitl_lock"
+	metadata := `{"hitl":{"question":"Continue?","status":"awaiting"}}`
+	if err := services.Repositories.Projects.Upsert(ctx, storage.ProjectRecord{ID: projectID, Name: "Looper", RepoPath: "/tmp/repos/looper", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := services.Repositories.Loops.Upsert(ctx, storage.LoopRecord{ID: loopID, Seq: 73, ProjectID: projectID, Type: "worker", TargetType: "project", TargetID: &targetID, Status: "awaiting_human", MetadataJSON: &metadata, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	if err := services.Repositories.Queue.Upsert(ctx, storage.QueueItemRecord{ID: "queue_hitl_lock", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "project", TargetID: targetID, DedupeKey: "worker:hitl-lock", Priority: storage.QueuePriorityWorker, Status: "cancelled", AvailableAt: nowISO, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+
+	unlock := loops.LockLoopRequeue(loopID)
+	done := make(chan error, 1)
+	go func() {
+		_, err := h.deliverHumanAnswer(ctx, loopID, "yes")
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		unlock()
+		t.Fatalf("deliverHumanAnswer completed while requeue lock held: %v", err)
+	case <-time.After(150 * time.Millisecond):
+	}
+	unlock()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("deliverHumanAnswer after unlock error = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("deliverHumanAnswer did not complete after requeue lock release")
 	}
 }
 

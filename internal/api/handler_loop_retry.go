@@ -269,6 +269,12 @@ func (h *Handler) retryLoop(ctx context.Context, r *http.Request, loopID string,
 				return retryResult{}, mapLoopReactivationError(queueErr, loop.ID)
 			}
 			queueRecord = built
+			if builtOK {
+				// The API response contract has always exposed UUID queue IDs;
+				// the shared loop helper uses an internal event ID for other
+				// callers, so retain the API's UUID authority at this boundary.
+				queueRecord.ID = generateRequestID()
+			}
 			ok = builtOK
 		}
 		if !ok {
