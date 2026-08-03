@@ -146,11 +146,11 @@ func runUpgrade(ctx context.Context, global, operands []string, stdout interface
 		return runUpgradeActivateRelease(ctx, root, releaseID, stdout)
 	}
 	if operands[0] == "verify-start" {
-		root, releaseID, err := parseUpgradeActivateReleaseArgs(operands[1:])
+		root, releaseID, bundle, err := parseUpgradeVerifyStartArgs(operands[1:])
 		if err != nil {
 			return err
 		}
-		return runUpgradeVerifyStart(ctx, global, root, releaseID, stdout)
+		return runUpgradeVerifyStart(ctx, global, root, releaseID, bundle, stdout)
 	}
 	if operands[0] != "preflight" {
 		return badUsage("upgrade requires activate-release, backup, drain, preflight, stage-release, verify, or verify-start")
@@ -392,7 +392,10 @@ func runUpgradeActivateRelease(ctx context.Context, root, releaseID string, stdo
 	return writeVersionJSON(stdout, result)
 }
 
-func runUpgradeVerifyStart(ctx context.Context, global []string, root, releaseID string, stdout interface{ Write([]byte) (int, error) }) error {
+func runUpgradeVerifyStart(ctx context.Context, global []string, root, releaseID, bundleDirectory string, stdout interface{ Write([]byte) (int, error) }) error {
+	if _, err := upgradebackup.Verify(bundleDirectory); err != nil {
+		return fmt.Errorf("verify rollback bundle: %w", err)
+	}
 	staged, err := upgraderelease.Verify(root, releaseID)
 	if err != nil {
 		return err
@@ -551,6 +554,14 @@ func parseUpgradeActivateReleaseArgs(args []string) (string, string, error) {
 		return "", "", err
 	}
 	return values["--release-root"], values["--release"], nil
+}
+
+func parseUpgradeVerifyStartArgs(args []string) (string, string, string, error) {
+	values, err := parseUpgradeNamedArgs(args, "verify-start", []string{"--release-root", "--release", "--bundle"})
+	if err != nil {
+		return "", "", "", err
+	}
+	return values["--release-root"], values["--release"], values["--bundle"], nil
 }
 
 func parseUpgradeNamedArgs(args []string, command string, names []string) (map[string]string, error) {

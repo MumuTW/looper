@@ -144,6 +144,23 @@ func TestUpgradePostStartRequiresVerifyHoldAdmission(t *testing.T) {
 	}
 }
 
+func TestParseUpgradeVerifyStartArgsRequiresBundle(t *testing.T) {
+	root, release, bundle, err := parseUpgradeVerifyStartArgs([]string{
+		"--release-root", "/srv/looper",
+		"--release", "candidate-release",
+		"--bundle", "/srv/backups/rollback",
+	})
+	if err != nil {
+		t.Fatalf("parseUpgradeVerifyStartArgs() error = %v", err)
+	}
+	if root != "/srv/looper" || release != "candidate-release" || bundle != "/srv/backups/rollback" {
+		t.Fatalf("parseUpgradeVerifyStartArgs() = (%q, %q, %q)", root, release, bundle)
+	}
+	if _, _, _, err := parseUpgradeVerifyStartArgs([]string{"--release-root", "/srv/looper", "--release", "candidate-release"}); err == nil {
+		t.Fatal("parseUpgradeVerifyStartArgs() without bundle error = nil")
+	}
+}
+
 func completeUpgradeIdentity(commit string) version.Info {
 	ts := "2026-07-31T12:00:00Z"
 	dirty := false
