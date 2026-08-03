@@ -2789,22 +2789,93 @@ func (r *Runner) reobserveContinuationBeforeReplacement(ctx context.Context, pro
 		}
 		return &runpipe.LoopError{Message: message, Kind: runpipe.FailureManualIntervention}
 	}
+	preserved := preservesWorktreeProgress(*baseline, current)
+	if !preserved && continuation.Outcome == "preserved" && continuation.BeforeTimeout != nil {
+		// The first replacement is allowed to add work after the daemon has
+		// already proven the predecessor snapshot survived. Keep that original
+		// proof, then require complete lossless path evidence and a stable HEAD
+		// before accepting additive edits on the same checkout. Aggregate content
+		// fingerprints necessarily change when a replacement writes more files.
+		preserved = preservesWorktreeProgress(*continuation.BeforeTimeout, *baseline) &&
+			current.HeadSHA == baseline.HeadSHA && current.Branch == baseline.Branch &&
+			current.ContentFingerprintVersion == worktreeFingerprintVersion && current.ContentFingerprint != "" &&
+			retainsPathEvidence(*baseline, current)
+	}
 	continuation.AfterRestart = &current
-	if !preservesWorktreeProgress(*baseline, current) {
+	if !preserved {
 		if checkpoint.Execution == nil {
 			checkpoint.Execution = &checkpointExecution{RunID: runID, Status: "failed"}
 		}
 		checkpoint.Execution.ProgressSnapshotError = "worker continuation progress changed before replacement; operator action is required before retry"
 		continuation.Outcome = "changed"
 		checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
+	} else {
+		// A previous drift outcome is historical once a fresh observation proves
+		// the checkout safe again; leave the next retry eligible instead of
+		// returning the same manual-intervention error forever.
+		continuation.Outcome = "preserved"
+		if checkpoint.Execution != nil {
+			checkpoint.Execution.ProgressSnapshotError = ""
+		}
+		checkpoint.ResumePolicy = "retry_from_timeout_context"
 	}
 	if err := r.persistCheckpoint(ctx, runID, *checkpoint); err != nil {
 		return &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
 	}
-	if continuation.Outcome == "changed" {
+	if !preserved {
 		return &runpipe.LoopError{Message: checkpoint.Execution.ProgressSnapshotError, Kind: runpipe.FailureManualIntervention}
 	}
 	return nil
+}
+
+// retainsPathEvidence proves that an additive replacement did not drop any
+// predecessor path. The initial before/after check remains the content and
+// index authority; this relation only handles later same-HEAD edits, where a
+// new aggregate fingerprint is expected and path bytes are the available
+// lossless evidence.
+func retainsPathEvidence(before, after worktreeProgress) bool {
+	if before.ChangedFileCount != len(before.ChangedFileBytes) || before.StagedFileCount != len(before.StagedFileBytes) || before.UntrackedFileCount != len(before.UntrackedFileBytes) {
+		return false
+	}
+	if before.ChangedFileCount != len(before.ChangedFiles) || before.StagedFileCount != len(before.StagedFiles) || before.UntrackedFileCount != len(before.UntrackedFiles) {
+		return false
+	}
+	if before.RenameSourceFiles != nil && len(before.RenameSourceFileBytes) != len(before.RenameSourceFiles) {
+		return false
+	}
+	currentPaths := make(map[string]struct{}, len(after.ChangedFiles)+len(after.StagedFiles)+len(after.UntrackedFiles)+len(after.RenameSourceFiles))
+	add := func(paths [][]byte) {
+		for _, path := range paths {
+			currentPaths[string(path)] = struct{}{}
+		}
+	}
+	add(after.ChangedFileBytes)
+	add(after.StagedFileBytes)
+	add(after.UntrackedFileBytes)
+	add(after.RenameSourceFileBytes)
+	for _, path := range after.ChangedFiles {
+		currentPaths[path] = struct{}{}
+	}
+	for _, path := range after.StagedFiles {
+		currentPaths[path] = struct{}{}
+	}
+	for _, path := range after.UntrackedFiles {
+		currentPaths[path] = struct{}{}
+	}
+	for _, path := range after.RenameSourceFiles {
+		currentPaths[path] = struct{}{}
+	}
+	beforePaths := make([][]byte, 0, len(before.ChangedFileBytes)+len(before.StagedFileBytes)+len(before.UntrackedFileBytes)+len(before.RenameSourceFileBytes))
+	beforePaths = append(beforePaths, before.ChangedFileBytes...)
+	beforePaths = append(beforePaths, before.StagedFileBytes...)
+	beforePaths = append(beforePaths, before.UntrackedFileBytes...)
+	beforePaths = append(beforePaths, before.RenameSourceFileBytes...)
+	for _, path := range beforePaths {
+		if _, ok := currentPaths[string(path)]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 func sameWorktreeProgress(before, after worktreeProgress) bool {

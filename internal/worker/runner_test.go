@@ -1849,15 +1849,50 @@ func TestVerifyTimeoutProgressBeforeReplacementReobservesAfterFailedRetry(t *tes
 	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, Logger: fixture.logger, Now: fixture.now})
 	baseline := &worktreeProgress{HeadSHA: "head", WorktreeID: "wt_1", Branch: "feature/test", ChangedFiles: []string{"tracked.go"}, ChangedFileCount: 1, DiffFingerprint: "status", ContentFingerprint: "content", ContentFingerprintVersion: worktreeFingerprintVersion, IndexFingerprint: "index"}
 	checkpoint := workerCheckpoint{
-		Execution:    &checkpointExecution{RunID: run.ID, ExecutionID: "agent_failed", Status: "failed"},
-		Continuation: &checkpointContinuation{PredecessorRunID: "run_timeout", PredecessorExecutionID: "agent_timeout", Mode: "native_resume", Outcome: "preserved", AfterRestart: baseline},
+		Execution:    &checkpointExecution{RunID: run.ID, ExecutionID: "agent_failed", Status: "failed", ProgressSnapshotError: "previous drift"},
+		Continuation: &checkpointContinuation{PredecessorRunID: "run_timeout", PredecessorExecutionID: "agent_timeout", Mode: "native_resume", Outcome: "changed", AfterRestart: baseline},
 	}
 	worktree := checkpointWorktree{ID: "wt_1", Path: filepath.Join(t.TempDir(), "worktree"), Branch: "feature/test", BaseBranch: "main"}
 	if err := runner.verifyTimeoutProgressBeforeReplacement(context.Background(), *project, run.ID, workerInput{BaseBranch: "main"}, worktree, &checkpoint); err != nil {
 		t.Fatalf("verifyTimeoutProgressBeforeReplacement() error = %v, want fresh preserved observation", err)
 	}
-	if len(git.inspectCalls) != 1 || checkpoint.Continuation.AfterRestart == nil || checkpoint.Continuation.Outcome != "preserved" {
-		t.Fatalf("inspectCalls=%d continuation=%#v, want refreshed preserved evidence", len(git.inspectCalls), checkpoint.Continuation)
+	if len(git.inspectCalls) != 1 || checkpoint.Continuation.AfterRestart == nil || checkpoint.Continuation.Outcome != "preserved" || checkpoint.Execution.ProgressSnapshotError != "" || checkpoint.ResumePolicy != "retry_from_timeout_context" {
+		t.Fatalf("inspectCalls=%d checkpoint=%#v, want refreshed preserved evidence and reset outcome", len(git.inspectCalls), checkpoint)
+	}
+}
+
+func TestVerifyTimeoutProgressBeforeReplacementAcceptsFailedReplacementEdits(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	run := storage.RunRecord{ID: "run_retry_after_edit", LoopID: "loop_worker_1", Status: "running", CurrentStep: runpipe.StringPtr(string(stepExecute)), StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Runs.Upsert(context.Background(), run); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	baseline := &worktreeProgress{
+		HeadSHA: "head", WorktreeID: "wt_1", Branch: "feature/test", ChangedFiles: []string{"tracked.go"}, ChangedFileBytes: [][]byte{[]byte("tracked.go")}, ChangedFileCount: 1,
+		DiffFingerprint: "status", ContentFingerprint: "content", ContentFingerprintVersion: worktreeFingerprintVersion, IndexFingerprint: "index",
+	}
+	git := &fakeGitGateway{inspectResult: InspectHeadResult{
+		HeadSHA: "head", Branch: "feature/test", ChangedFiles: []string{"tracked.go", "replacement.go"}, DiffFingerprint: "replacement-status", ContentFingerprint: "replacement-content", ContentFingerprintVersion: worktreeFingerprintVersion, IndexFingerprint: "replacement-index",
+	}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, Logger: fixture.logger, Now: fixture.now})
+	checkpoint := workerCheckpoint{
+		Execution: &checkpointExecution{RunID: run.ID, ExecutionID: "agent_failed", Status: "failed"},
+		Continuation: &checkpointContinuation{
+			PredecessorRunID: "run_timeout", PredecessorExecutionID: "agent_timeout", Mode: "checkpoint_same_worktree", Outcome: "preserved",
+			BeforeTimeout: baseline, AfterRestart: baseline,
+		},
+	}
+	worktree := checkpointWorktree{ID: "wt_1", Path: filepath.Join(t.TempDir(), "worktree"), Branch: "feature/test", BaseBranch: "main"}
+	if err := runner.verifyTimeoutProgressBeforeReplacement(context.Background(), *project, run.ID, workerInput{BaseBranch: "main"}, worktree, &checkpoint); err != nil {
+		t.Fatalf("verifyTimeoutProgressBeforeReplacement() error = %v, want additive replacement edits accepted", err)
+	}
+	if checkpoint.Continuation == nil || checkpoint.Continuation.Outcome != "preserved" || checkpoint.Continuation.AfterRestart == nil || len(checkpoint.Continuation.AfterRestart.ChangedFiles) != 2 {
+		t.Fatalf("checkpoint.Continuation = %#v, want updated preserved evidence", checkpoint.Continuation)
 	}
 }
 
