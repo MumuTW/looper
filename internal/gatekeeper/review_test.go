@@ -248,7 +248,7 @@ func TestDiscoverPullRequestsReevaluatesAfterCodexReviewProviderBlock(t *testing
 	// Seed a provider-block report matching the shape EvaluatePullRequest now
 	// produces when the codex_review read fails: the provider reason plus an
 	// invalid CodexReview placeholder (CurrentHeadValid=false).
-	fingerprint := runner.sourceFingerprintForProject(pr, "project_1", "acme/looper")
+	fingerprint := runner.sourceFingerprintForProjectWithContract(pr, "project_1", "acme/looper", "")
 	seedGateReport(t, fixture, Report{
 		Version: reportVersion, Status: StatusBlocked, ProjectID: "project_1",
 		Repo: "acme/looper", PRNumber: 42, ObservedHeadSHA: "head-1",

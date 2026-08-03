@@ -11,6 +11,7 @@ import (
 	"github.com/MumuTW/looper/internal/config"
 	"github.com/MumuTW/looper/internal/eventlog"
 	githubinfra "github.com/MumuTW/looper/internal/infra/github"
+	"github.com/MumuTW/looper/internal/labels"
 	"github.com/MumuTW/looper/internal/storage"
 )
 
@@ -20,6 +21,23 @@ import (
 // empty fingerprint makes the report immediately retryable, and the reason
 // keeps the reconcile pass idempotent across ticks.
 const ReasonRouteRevoked ReasonCode = "route_revoked"
+
+const (
+	outOfPageRouteReconcileInterval = 5 * time.Minute
+	maxOutOfPageRouteChecksPerTick  = 20
+)
+
+// reportRouteEstablished is the durable-route predicate used by out-of-page
+// reconciliation. Legacy reports predate RouteEstablished, so an eligible
+// auto-trust report without a projection-failure marker is treated as the
+// historical equivalent; current reports carry an explicit pointer and a
+// blocked/retry report therefore cannot be mistaken for an active route.
+func reportRouteEstablished(report Report) bool {
+	if report.RouteEstablished != nil {
+		return *report.RouteEstablished
+	}
+	return config.GatekeeperTrustLevel(strings.TrimSpace(report.Mode)) == config.GatekeeperTrustAuto && report.Eligible && !hasReasonCode(report.Reasons, ReasonRoutingProjectionFailed)
+}
 
 // reconcileRoutedReportsOutsideDiscoveryPage reconciles previously published
 // routes whose pull requests are absent from the bounded discovery page.
@@ -39,14 +57,32 @@ func (r *Runner) reconcileRoutedReportsOutsideDiscoveryPage(ctx context.Context,
 		return nil
 	}
 	var errs []error
+	checks := 0
 	for entityID, previous := range previousReports {
 		if _, inPage := pageEntityIDs[entityID]; inPage {
 			continue
 		}
-		if !previousPublished(previous) {
+		if !reportRouteEstablished(previous) {
 			continue
 		}
 		if hasReasonCode(previous.Reasons, ReasonRouteRevoked) {
+			continue
+		}
+		if checks >= maxOutOfPageRouteChecksPerTick {
+			break
+		}
+		if !r.allowOutOfPageRouteCheck(input.ProjectID + "\x1f" + entityID) {
+			continue
+		}
+		checks++
+		if strings.TrimSpace(previous.Repo) != strings.TrimSpace(input.Repo) {
+			if err := r.retireRoutingLabelsForReport(ctx, previous); err != nil {
+				errs = append(errs, fmt.Errorf("revoke route for repository change %s: %w", entityID, err))
+				continue
+			}
+			if err := r.markRouteRevoked(ctx, previous); err != nil {
+				errs = append(errs, fmt.Errorf("mark repository-changed route %s revoked: %w", entityID, err))
+			}
 			continue
 		}
 		// One forge read distinguishes merged from closed from still-open. The
@@ -72,20 +108,30 @@ func (r *Runner) reconcileRoutedReportsOutsideDiscoveryPage(ctx context.Context,
 		case mergedAt != "":
 			// A routed pull request that merged is durable evidence the Auditor
 			// needs: record the merge outcome before retiring the route.
-			if err := r.recordMergeEvidence(ctx, previous); err != nil {
+			if err := r.recordMergeEvidence(ctx, previous, mergedAt); err != nil {
 				errs = append(errs, fmt.Errorf("record merge evidence %s: %w", entityID, err))
 				continue
 			}
-			if err := r.retireRoutingLabelsForReport(ctx, previous); err != nil {
+			if err := r.clearRoutingLabelsForReport(ctx, previous); err != nil {
 				errs = append(errs, fmt.Errorf("retire merged route %s: %w", entityID, err))
 				continue
 			}
 		case state == "CLOSED":
-			if err := r.retireRoutingLabelsForReport(ctx, previous); err != nil {
+			if err := r.clearRoutingLabelsForReport(ctx, previous); err != nil {
 				errs = append(errs, fmt.Errorf("retire closed route %s: %w", entityID, err))
 				continue
 			}
 		default:
+			if liveHead := strings.TrimSpace(detail.HeadSHA); liveHead != "" && liveHead != strings.TrimSpace(previous.ObservedHeadSHA) && liveHead != strings.TrimSpace(previous.ExpectedHeadSHA) {
+				if err := r.retireRoutingLabelsForReport(ctx, previous); err != nil {
+					errs = append(errs, fmt.Errorf("retire head-drifted route %s: %w", entityID, err))
+					continue
+				}
+				if err := r.markRouteRevoked(ctx, previous); err != nil {
+					errs = append(errs, fmt.Errorf("mark head-drifted route %s revoked: %w", entityID, err))
+				}
+				continue
+			}
 			// Still open outside the page. Retire the route only when the current
 			// routing inputs no longer permit it (observe demotion or policy
 			// denial); a route under inputs that still permit it is not stale and
@@ -107,6 +153,23 @@ func (r *Runner) reconcileRoutedReportsOutsideDiscoveryPage(ctx context.Context,
 		}
 	}
 	return errors.Join(errs...)
+}
+
+func (r *Runner) allowOutOfPageRouteCheck(key string) bool {
+	if r == nil {
+		return false
+	}
+	now := r.now().UTC()
+	r.outOfPageRouteMu.Lock()
+	defer r.outOfPageRouteMu.Unlock()
+	if r.outOfPageRouteChecks == nil {
+		r.outOfPageRouteChecks = make(map[string]time.Time)
+	}
+	if last, ok := r.outOfPageRouteChecks[key]; ok && now.Before(last.Add(outOfPageRouteReconcileInterval)) {
+		return false
+	}
+	r.outOfPageRouteChecks[key] = now
+	return true
 }
 
 // routingInputsStillPermit reports whether the routing inputs that published a
@@ -140,6 +203,20 @@ func (r *Runner) retireRoutingLabelsForReport(ctx context.Context, report Report
 	return r.applyRoutingLabelPlan(ctx, report, routingLabelPlan{needsHumanReview: true})
 }
 
+func (r *Runner) clearRoutingLabelsForReport(ctx context.Context, report Report) error {
+	input := githubinfra.PullRequestLabelsInput{Repo: report.Repo, PRNumber: report.PRNumber, CWD: r.projectCWD(ctx, report.ProjectID)}
+	// Terminal PRs cannot be queued, but clear both labels so a closed route
+	// does not trigger external human-review automation. Keep auto-merge last
+	// for deterministic audit logs shared with the historical cleanup order.
+	if err := r.github.RemovePullRequestLabels(ctx, githubinfra.PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD, Labels: []string{labels.NeedsHumanReview}}); err != nil {
+		return fmt.Errorf("remove stale %s label: %w", labels.NeedsHumanReview, err)
+	}
+	if err := r.github.RemovePullRequestLabels(ctx, githubinfra.PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD, Labels: []string{labels.AutoMerge}}); err != nil {
+		return fmt.Errorf("remove stale %s label: %w", labels.AutoMerge, err)
+	}
+	return nil
+}
+
 // recordMergeEvidence preserves durable merge evidence for the Auditor when a
 // previously routed pull request merged through the Mergify route. The Auditor
 // derives candidates exclusively from MergeOutcomeEventType events, so a merge
@@ -148,7 +225,7 @@ func (r *Runner) retireRoutingLabelsForReport(ctx context.Context, report Report
 // The emission is idempotent per entity and head: the reconcile pass can re-read
 // the same merged pull request across ticks when a label retirement fails in
 // between, and a duplicate event would project duplicate Auditor candidates.
-func (r *Runner) recordMergeEvidence(ctx context.Context, report Report) error {
+func (r *Runner) recordMergeEvidence(ctx context.Context, report Report, mergedAt string) error {
 	projectID := report.ProjectID
 	entityType := "pull_request"
 	entityID := fmt.Sprintf("%s#%d", report.Repo, report.PRNumber)
@@ -164,11 +241,15 @@ func (r *Runner) recordMergeEvidence(ctx context.Context, report Report) error {
 	} else if already {
 		return nil
 	}
+	mergedAt = strings.TrimSpace(mergedAt)
+	if mergedAt == "" {
+		mergedAt = r.now().UTC().Format(time.RFC3339Nano)
+	}
 	return eventlog.Append(ctx, r.repos, eventlog.AppendInput{
 		EventType: MergeOutcomeEventType, ProjectID: &projectID, EntityType: &entityType, EntityID: &entityID,
 		Payload: MergeOutcome{
 			Version: 1, ProjectID: report.ProjectID, Repo: report.Repo, PRNumber: report.PRNumber,
-			HeadSHA: headSHA, Merged: true, AttemptedAt: r.now().UTC().Format("2006-01-02T15:04:05.000Z07:00"),
+			HeadSHA: headSHA, Merged: true, AttemptedAt: mergedAt,
 		},
 		CreatedAt: r.now(),
 	})
@@ -211,6 +292,7 @@ func (r *Runner) markRouteRevoked(ctx context.Context, report Report) error {
 	revoked.Reasons = append(revoked.Reasons, Reason{Code: ReasonRouteRevoked})
 	sortReasons(revoked.Reasons)
 	revoked.Eligible = false
+	revoked.RouteEstablished = boolPointer(false)
 	revoked.Status = StatusBlocked
 	revoked.EvaluatedAt = r.now().UTC().Format("2006-01-02T15:04:05.000Z07:00")
 	entityType, entityID := "pull_request", fmt.Sprintf("%s#%d", report.Repo, report.PRNumber)
@@ -241,8 +323,14 @@ func (r *Runner) RevokeProjectRoutes(ctx context.Context, projectID string) erro
 		if hasReasonCode(report.Reasons, ReasonRouteRevoked) {
 			continue
 		}
-		if err := r.retireRoutingLabelsForReport(ctx, report); err != nil {
-			errs = append(errs, fmt.Errorf("revoke route %s: %w", entityID, err))
+		if reportRouteEstablished(report) {
+			if err := r.retireRoutingLabelsForReport(ctx, report); err != nil {
+				errs = append(errs, fmt.Errorf("revoke route %s: %w", entityID, err))
+				continue
+			}
+		}
+		if err := r.applyVerdict(ctx, verdictActionRetire, report); err != nil {
+			errs = append(errs, fmt.Errorf("retire verdict %s: %w", entityID, err))
 			continue
 		}
 		if err := r.markRouteRevoked(ctx, report); err != nil {

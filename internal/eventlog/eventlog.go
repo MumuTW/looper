@@ -51,6 +51,7 @@ const CoordinatorRoutedMergeWatchEventType = "coordinator.routed_merge_watch"
 // auto-merge route); the reader keeps the newest record per entity.
 type CoordinatorRoutedMergeWatch struct {
 	Version   int    `json:"version"`
+	Revision  int64  `json:"revision,omitempty"`
 	ProjectID string `json:"projectId"`
 	Repo      string `json:"repo"`
 	PRNumber  int64  `json:"prNumber"`

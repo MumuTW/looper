@@ -111,16 +111,6 @@ func reportAwaitsCheckState(report Report) bool {
 	return false
 }
 
-// reportAwaitsConvergenceState reports whether the durable Reviewer state can
-// change merge eligibility without changing the forge list fingerprint. A
-// blocked convergence report must be re-read until its floor-qualified items
-// are closed or deferred; otherwise unchanged discovery could retain a stale
-// blocker after the Reviewer makes progress.
-func reportAwaitsConvergenceState(report Report) bool {
-	evidence := report.Evidence.ReviewerConvergence
-	return evidence != nil && reviewerConvergenceBlocks(*evidence)
-}
-
 // latestGateReports returns the most recent gate report per pull request for one
 // project, keyed by the report's entity id (`repo#number`).
 //
@@ -195,15 +185,13 @@ func skipUnchanged(previous Report, hasPrevious bool, fingerprint string, trust 
 	if trust == config.GatekeeperTrustAuto && reportHasFailedOrCancelledCheck(previous) {
 		return Report{}, false
 	}
-	if reportAwaitsConvergenceState(previous) {
-		// The durable Reviewer state can change merge eligibility without moving
-		// any field the forge list fingerprint observes. Re-evaluate when the
-		// convergence revision has advanced (the Reviewer recorded progress, or
-		// its loop was superseded); otherwise the persisted blocker is still
-		// valid and the report can be reused without re-polling the forge.
-		if previousConvergenceRevision(previous) != currentConvergenceRevision {
-			return Report{}, false
-		}
+	// Reviewer convergence can advance from a clean state to a newly persisted
+	// blocker without changing any forge list field. Compare revisions for every
+	// reusable report, not only reports that were already blocked: an eligible
+	// auto route must be retired as soon as local convergence records progress.
+	// A matching empty revision means no convergence state exists on either side.
+	if previousConvergenceRevision(previous) != currentConvergenceRevision {
+		return Report{}, false
 	}
 	if reportAwaitsCurrentHeadReview(previous) && reviewEvidenceAppeared {
 		return Report{}, false

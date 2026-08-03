@@ -328,11 +328,11 @@ func TestRoutingLabelsRemoveStaleRouteWhenReviewerConvergenceAdvancesBeforeProje
 	if mutateErr != nil {
 		t.Fatalf("mutate Reviewer convergence state: %v", mutateErr)
 	}
-	if len(fixture.github.labelAdds) != 1 {
-		t.Fatalf("routing label adds across a Reviewer convergence race = %#v, want only initial route", fixture.github.labelAdds)
+	if len(fixture.github.labelAdds) != 2 || !slices.Equal(fixture.github.labelAdds[1].Labels, []string{labels.NeedsHumanReview}) {
+		t.Fatalf("routing label adds across a Reviewer convergence race = %#v, want initial route plus durable veto", fixture.github.labelAdds)
 	}
-	if len(fixture.github.labelRemoves) != 3 || !slices.Equal(fixture.github.labelRemoves[1].Labels, []string{labels.AutoMerge}) || !slices.Equal(fixture.github.labelRemoves[2].Labels, []string{labels.NeedsHumanReview}) {
-		t.Fatalf("routing label cleanup across a Reviewer convergence race = %#v, want both stale routes removed", fixture.github.labelRemoves)
+	if len(fixture.github.labelRemoves) != 2 || !slices.Equal(fixture.github.labelRemoves[1].Labels, []string{labels.AutoMerge}) {
+		t.Fatalf("routing label cleanup across a Reviewer convergence race = %#v, want queue route removed while veto remains", fixture.github.labelRemoves)
 	}
 }
 

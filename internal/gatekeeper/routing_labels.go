@@ -68,7 +68,7 @@ func (r *Runner) reconcileRoutingLabels(ctx context.Context, report Report, prev
 			// route before returning. Leaving auto-merge in place while the
 			// contract is invalid is the fail-open state this validation is
 			// intended to prevent.
-			return fmt.Errorf("validate Mergify routing contract: %w", r.retireRoutingLabels(ctx, report, err))
+			return fmt.Errorf("validate Mergify routing contract: %w", r.retireRoutingLabels(ctx, report, previous, err))
 		}
 	}
 	// Read the PR state after the configuration check so this authority read is
@@ -80,7 +80,7 @@ func (r *Runner) reconcileRoutingLabels(ctx context.Context, report Report, prev
 	// labels before returning; removal is fail-safe and the next evaluation
 	// re-applies the route if the pull request is eligible again.
 	if err := r.revalidateRoutingState(ctx, report, expectedHead); err != nil {
-		return r.retireRoutingLabels(ctx, report, err)
+		return r.retireRoutingLabels(ctx, report, previous, err)
 	}
 
 	// Review threads are Gatekeeper-owned policy input, not part of the
@@ -91,7 +91,7 @@ func (r *Runner) reconcileRoutingLabels(ctx context.Context, report Report, prev
 	// retired rather than left authorizing a queue.
 	if plan.autoMerge {
 		if err := r.revalidateUnresolvedReviewThreads(ctx, report); err != nil {
-			return r.retireRoutingLabels(ctx, report, err)
+			return r.retireRoutingLabels(ctx, report, previous, err)
 		}
 	}
 	// Reviewer convergence is local durable policy input, not part of the forge
@@ -103,7 +103,7 @@ func (r *Runner) reconcileRoutingLabels(ctx context.Context, report Report, prev
 			// A convergence change invalidates the route authority. Retire both
 			// labels before retrying so a previously published auto-merge label
 			// cannot keep queueing a pull request while the local evidence is stale.
-			return r.retireRoutingLabels(ctx, report, err)
+			return r.retireRoutingLabels(ctx, report, previous, err)
 		}
 	}
 	// The final head (and, when applicable, merge-base) read must happen after
@@ -123,20 +123,20 @@ func (r *Runner) reconcileRoutingLabels(ctx context.Context, report Report, prev
 		var err error
 		currentHead, currentBase, err = r.github.GetPullRequestHeadAndBaseSHA(ctx, viewInput)
 		if err != nil {
-			return r.retireRoutingLabels(ctx, report, fmt.Errorf("revalidate head and diff-budget base before routing labels: %w", err))
+			return r.retireRoutingLabels(ctx, report, previous, fmt.Errorf("revalidate head and diff-budget base before routing labels: %w", err))
 		}
 		if strings.TrimSpace(currentBase) != expectedBase {
-			return r.retireRoutingLabels(ctx, report, fmt.Errorf("skip routing labels because diff-budget base moved from %s to %s", expectedBase, strings.TrimSpace(currentBase)))
+			return r.retireRoutingLabels(ctx, report, previous, fmt.Errorf("skip routing labels because diff-budget base moved from %s to %s", expectedBase, strings.TrimSpace(currentBase)))
 		}
 	} else {
 		var err error
 		currentHead, err = r.github.GetPullRequestHeadSHA(ctx, viewInput)
 		if err != nil {
-			return r.retireRoutingLabels(ctx, report, fmt.Errorf("revalidate head before routing labels: %w", err))
+			return r.retireRoutingLabels(ctx, report, previous, fmt.Errorf("revalidate head before routing labels: %w", err))
 		}
 	}
 	if strings.TrimSpace(currentHead) != expectedHead {
-		return r.retireRoutingLabels(ctx, report, fmt.Errorf("skip routing labels because pull request head moved from %s to %s", expectedHead, strings.TrimSpace(currentHead)))
+		return r.retireRoutingLabels(ctx, report, previous, fmt.Errorf("skip routing labels because pull request head moved from %s to %s", expectedHead, strings.TrimSpace(currentHead)))
 	}
 	return r.applyRoutingLabelPlan(ctx, report, plan)
 }
@@ -237,14 +237,21 @@ func (r *Runner) revalidateRoutingState(ctx context.Context, report Report, expe
 	return nil
 }
 
-// retireRoutingLabels removes both routing labels before returning err. A
-// revalidation failure means the evidence the route was published on is no
-// longer current, and leaving auto-merge in place would let Mergify keep the
-// pull request queued on stale authority. Removal is fail-safe (it can never
-// authorize a merge); the next evaluation re-applies the route if the pull
-// request is eligible again.
-func (r *Runner) retireRoutingLabels(ctx context.Context, report Report, err error) error {
-	cleanupErr := r.applyRoutingLabelPlan(ctx, report, routingLabelPlan{})
+// retireRoutingLabels removes the queue trigger before returning err. When the
+// PR was already routed, it leaves needs-human-review as a durable queue veto;
+// a Mergify queue entry must not survive a failed revalidation with no veto.
+// A first projection with no prior route remains removal-only.
+func (r *Runner) retireRoutingLabels(ctx context.Context, report Report, previous *Report, err error) error {
+	// A revalidation failure happens after an eligible report has crossed the
+	// queue boundary. Removing auto-merge alone does not dequeue an entry that
+	// Mergify already accepted, so keep the durable human-review veto while the
+	// route is still potentially open. Terminal/out-of-page cleanup calls the
+	// removal-only helper instead.
+	plan := routingLabelPlan{}
+	if r.trustFor(report.ProjectID) == config.GatekeeperTrustAuto && previous != nil && reportRouteEstablished(*previous) {
+		plan.needsHumanReview = true
+	}
+	cleanupErr := r.applyRoutingLabelPlan(ctx, report, plan)
 	if cleanupErr != nil {
 		return fmt.Errorf("%w (remove stale routing labels: %v)", err, cleanupErr)
 	}
@@ -293,6 +300,17 @@ func (r *Runner) applyRoutingLabelPlan(ctx context.Context, report Report, plan 
 
 func reportNeedsHumanReview(previous *Report, report Report) bool {
 	hasRepeatedReviewChanges := previous != nil && hasReasonCode(previous.Reasons, ReasonReviewChangesRequested) && hasReasonCode(report.Reasons, ReasonReviewChangesRequested)
+	if previous != nil && reportRouteEstablished(*previous) {
+		// These blockers can arrive after Mergify accepted the queue entry. Keep
+		// the explicit veto until a fresh eligible evaluation replaces it; merely
+		// removing auto-merge does not dequeue an already accepted PR.
+		for _, reason := range report.Reasons {
+			switch reason.Code {
+			case ReasonHold, ReasonUnresolvedReviewThread, ReasonReviewerConvergence, ReasonHeadStale:
+				return true
+			}
+		}
+	}
 	for _, reason := range report.Reasons {
 		switch string(reason.Code) {
 		case protectedPathTouchedReason, string(ReasonDiffBudgetExceeded):

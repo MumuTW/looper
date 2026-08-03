@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/MumuTW/looper/internal/config"
@@ -152,6 +153,12 @@ type Report struct {
 	// produced. The next tick compares it to decide whether re-evaluating would
 	// reach the same conclusion.
 	SourceFingerprint string `json:"sourceFingerprint,omitempty"`
+	// RouteEstablished records that the successful persist path completed the
+	// auto-merge label projection. Eligibility alone is not route authority:
+	// advise reports are eligible without entering Mergify, and a projection
+	// failure can leave a stale label uncertain. A pointer keeps legacy reports
+	// (which predate this field) distinguishable from an explicit false.
+	RouteEstablished *bool `json:"routeEstablished,omitempty"`
 }
 
 type EvaluationInput struct {
@@ -214,6 +221,10 @@ type GitHubGateway interface {
 	ValidateMergifyRouting(context.Context, githubinfra.ValidateMergifyRoutingInput) error
 }
 
+type mergifyContractFingerprinter interface {
+	MergifyRoutingContractFingerprint(context.Context, githubinfra.ValidateMergifyRoutingInput) (string, error)
+}
+
 type Options struct {
 	Repos               *storage.Repositories
 	GitHub              GitHubGateway
@@ -231,6 +242,8 @@ type Options struct {
 	LogWarn                func(msg string, fields map[string]any)
 }
 
+func boolPointer(value bool) *bool { return &value }
+
 // Runner is the Merge Gatekeeper: a reactive, agent-free policy Role that
 // re-fetches current Pull Request state and writes an observe-only Gate
 // report. It never reviews code, repairs a Pull Request, resolves comments,
@@ -246,6 +259,8 @@ type Runner struct {
 	diffBudgetForProject   func(projectID string) config.GatekeeperDiffBudget
 	configuredTargetBranch func(projectID string) string
 	logWarn                func(msg string, fields map[string]any)
+	outOfPageRouteMu       sync.Mutex
+	outOfPageRouteChecks   map[string]time.Time
 }
 
 func New(options Options) *Runner {
@@ -263,6 +278,7 @@ func New(options Options) *Runner {
 		diffBudgetForProject:   options.DiffBudgetForProject,
 		configuredTargetBranch: options.ConfiguredTargetBranch,
 		logWarn:                options.LogWarn,
+		outOfPageRouteChecks:   make(map[string]time.Time),
 	}
 }
 
@@ -304,10 +320,11 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
+	contractFingerprint := r.mergifyContractFingerprint(ctx, input)
 	result := DiscoveryResult{Reports: make([]Report, 0, len(pullRequests))}
 	var evaluationErrs []error
 	for _, pullRequest := range pullRequests {
-		fingerprint := r.sourceFingerprintForProject(pullRequest, input.ProjectID, input.Repo)
+		fingerprint := r.sourceFingerprintForProjectWithContract(pullRequest, input.ProjectID, input.Repo, contractFingerprint)
 		entityID := fmt.Sprintf("%s#%d", input.Repo, pullRequest.Number)
 		previous, hasPrevious := previousReports[entityID]
 		// Review evidence is durable local state rather than a list-page field.
@@ -426,7 +443,7 @@ func (r *Runner) departedFromOpenSet(
 // forge's pull-request list cannot expose. A trust, policy, or diff-budget
 // bound change must not leave a previously published auto-merge label in place
 // merely because the pull request itself is unchanged.
-func (r *Runner) sourceFingerprintForProject(pullRequest githubinfra.PullRequestSummary, projectID, repo string) string {
+func (r *Runner) sourceFingerprintForProjectWithContract(pullRequest githubinfra.PullRequestSummary, projectID, repo, contractFingerprint string) string {
 	budget := r.diffBudget(projectID)
 	budgetEnabled := budget.MaxChangedFiles > 0 || budget.MaxDeletions > 0
 	base := sourceFingerprint(pullRequest, budgetEnabled)
@@ -438,7 +455,26 @@ func (r *Runner) sourceFingerprintForProject(pullRequest githubinfra.PullRequest
 		fmt.Sprintf("%d", budget.MaxChangedFiles),
 		fmt.Sprintf("%d", budget.MaxDeletions),
 		r.configuredTarget(projectID),
+		strings.TrimSpace(contractFingerprint),
 	}, "\x1f")
+}
+
+func (r *Runner) mergifyContractFingerprint(ctx context.Context, input DiscoveryInput) string {
+	if r == nil || r.trustFor(input.ProjectID) != config.GatekeeperTrustAuto {
+		return ""
+	}
+	fingerprinter, ok := r.github.(mergifyContractFingerprinter)
+	if !ok {
+		return "contract-fingerprint-unavailable"
+	}
+	fingerprint, err := fingerprinter.MergifyRoutingContractFingerprint(ctx, githubinfra.ValidateMergifyRoutingInput{Repo: input.Repo, CWD: input.CWD})
+	if err != nil {
+		if r.logWarn != nil {
+			r.logWarn("gatekeeper: could not fingerprint Mergify routing contract", map[string]any{"repo": input.Repo, "error": err.Error()})
+		}
+		return "contract-fingerprint-unavailable"
+	}
+	return strings.TrimSpace(fingerprint)
 }
 
 func (r *Runner) configuredTarget(projectID string) string {
@@ -832,6 +868,10 @@ func (r *Runner) persist(ctx context.Context, report Report) (Report, error) {
 	// comment lifecycle below, so a path that built a report without it would
 	// silently strand an owned comment.
 	report.Mode = string(r.trustFor(report.ProjectID))
+	// Until the final projection succeeds this report is not route authority.
+	// The pending/retry records therefore never make a coordinator watch believe
+	// that a label was actually applied.
+	report.RouteEstablished = boolPointer(false)
 
 	// Decide what the owned comment needs before this report replaces the previous
 	// one in the log, and while no forge call has been made.
@@ -892,6 +932,9 @@ func (r *Runner) persist(ctx context.Context, report Report) (Report, error) {
 			})
 		}
 		return report, routingErr
+	}
+	if r.trustFor(report.ProjectID) == config.GatekeeperTrustAuto && report.Eligible {
+		report.RouteEstablished = boolPointer(true)
 	}
 	// The final report is appended strictly after the pending projection so
 	// latestGateReports (which keeps the newest record for an entity) always

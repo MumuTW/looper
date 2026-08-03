@@ -844,7 +844,7 @@ decides what it may do with that judgement.
 | --- | --- |
 | `observe` (default) | Gate report only. Nothing is published, nothing is merged. |
 | `advise` | Publishes the verdict and reconciles the human-review route. Escalations receive `needs-human-review`; eligible PRs do not receive the queue-activating `auto-merge` label, so a human still decides whether to queue them. |
-| `auto` | Uses the same routing labels without a daemon-side merge call. Mergify's serialized queue rechecks branch protection and performs the merge. |
+| `auto` | Uses the same routing labels without a daemon-side merge call. Mergify's serialized queue rechecks branch protection and performs the merge; no separate Looper Gatekeeper status check is required. |
 
 ### How `auto` reaches the merge queue
 
