@@ -911,10 +911,6 @@ func (r *Runner) persist(ctx context.Context, report Report) (Report, error) {
 	return report, nil
 }
 
-func (r *Runner) appendGateReport(ctx context.Context, report Report, entityType, entityID string) error {
-	return r.appendGateReportAt(ctx, report, entityType, entityID, r.now())
-}
-
 func (r *Runner) appendGateReportAt(ctx context.Context, report Report, entityType, entityID string, createdAt time.Time) error {
 	projectID := report.ProjectID
 	return eventlog.Append(ctx, r.repos, eventlog.AppendInput{
