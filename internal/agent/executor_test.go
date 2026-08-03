@@ -812,6 +812,50 @@ func TestExecutorResumesPersistedNativeSession(t *testing.T) {
 	}
 }
 
+func TestExecutorResultReflectsCapturedSessionPromotion(t *testing.T) {
+	coordinator := openAgentCoordinator(t)
+	repos := storage.NewRepositories(coordinator.DB())
+	now := time.Date(2026, time.April, 20, 12, 0, 0, 0, time.UTC)
+	nowISO := now.Format("2006-01-02T15:04:05.000Z")
+	if err := repos.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: "project_1", Name: "Project", RepoPath: t.TempDir(), CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	if err := repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_1", Seq: 1, ProjectID: "project_1", Type: "worker", TargetType: "issue", Status: "running", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	scriptPath := filepath.Join(t.TempDir(), "mock-codex")
+	script := "#!/bin/sh\nprintf '%s\\n' 'session_id: captured-session'\nprintf '%s\\n' '__LOOPER_RESULT__={\"summary\":\"captured\"}'\n"
+	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("WriteFile(scriptPath) error = %v", err)
+	}
+	executor := New(ExecutorOptions{
+		Config:            ExecutorConfig{Vendor: config.AgentVendorCodex, Params: map[string]any{"command": scriptPath}, NativeResumeEnabled: true},
+		Repos:             repos,
+		Now:               advancingNow(now, 10*time.Millisecond),
+		ParamsOwnerVendor: codexOwner(),
+	})
+
+	handle, err := executor.Start(context.Background(), RunInput{ExecutionID: "agent_captured", LoopID: "loop_1", WorkingDirectory: t.TempDir(), Prompt: "continue work", Timeout: 5 * time.Second})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	result, err := handle.Wait(context.Background())
+	if err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	if result.Status != "completed" || result.NativeResumeMode != "checkpoint_restart" || result.NativeResumeStatus != "captured" {
+		t.Fatalf("result = %#v, want checkpoint_restart/captured terminal metadata", result)
+	}
+	record, err := repos.AgentExecutions.GetByID(context.Background(), "agent_captured")
+	if err != nil {
+		t.Fatalf("AgentExecutions.GetByID() error = %v", err)
+	}
+	if record == nil || record.NativeResumeStatus == nil || *record.NativeResumeStatus != "captured" {
+		t.Fatalf("agent execution record = %#v, want captured native session status", record)
+	}
+}
+
 func TestExecutorFallsBackAfterFailedNativeResumeAttempt(t *testing.T) {
 
 	coordinator := openAgentCoordinator(t)

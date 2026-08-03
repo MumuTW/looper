@@ -1173,6 +1173,10 @@ func (x *execution) run(ctx context.Context) {
 	}
 
 	persistErr := x.persistFinal(status, result, errorMessage, endedAtISO)
+	// persistFinal may promote a session id extracted from terminal output from
+	// unavailable to captured. Refresh the returned metadata after that durable
+	// normalization so Worker checkpoints never lag the AgentExecution record.
+	_, result.NativeResumeMode, result.NativeResumeStatus, _ = x.nativeResumeSnapshot()
 	if hard := x.classifyPersistError(persistErr); hard != nil {
 		x.reportHardPersistFailure(hard)
 		persistErr = errors.Join(ErrExecutionPersistence, fmt.Errorf("persist terminal agent execution: %w", hard))
@@ -1923,6 +1927,18 @@ func (x *execution) persistFinal(status string, result Result, errorMessage, end
 	if nativeSessionID != "" && (nativeResumeStatus == "" || nativeResumeStatus == "unavailable") {
 		nativeResumeStatus = "captured"
 	}
+	// Keep the in-memory authority in sync with the terminal record. The result
+	// is refreshed by run() after persistFinal returns, including when the
+	// session id was discovered only while assembling the terminal payload.
+	x.mu.Lock()
+	if !x.input.Assessment {
+		if nativeSessionID != "" {
+			x.nativeSessionID = nativeSessionID
+		}
+		x.nativeResumeStatus = nativeResumeStatus
+		x.nativeResumeError = nativeResumeError
+	}
+	x.mu.Unlock()
 	cfg := x.executor.effectiveConfig(x.input)
 	record := storage.AgentExecutionRecord{
 		ID:                 x.executionID,

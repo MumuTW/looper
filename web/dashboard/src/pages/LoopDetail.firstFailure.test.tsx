@@ -207,6 +207,28 @@ describe("LoopDetail timeout continuation", () => {
     });
     expect(screen.queryByText("awaiting retry")).toBeNull();
   });
+
+  it("keeps persisted continuation evidence visible after the loop closes", async () => {
+    renderLoopDetail(
+      loopFixture({
+        status: "completed",
+        continuation: {
+          predecessorRunId: "run_timeout",
+          predecessorExecutionId: "agent_timeout",
+          mode: "native_resume",
+          outcome: "preserved",
+          beforeTimeout: { headSha: "before-head", changedFileCount: 1, stagedFileCount: 0, untrackedFileCount: 0 },
+          afterRestart: { headSha: "before-head", changedFileCount: 1, stagedFileCount: 0, untrackedFileCount: 0 },
+        },
+      }),
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText("Timeout continuation")).toBeTruthy();
+    });
+    expect(screen.getByText("native_resume")).toBeTruthy();
+    expect(screen.getByText("preserved")).toBeTruthy();
+  });
 });
 
 describe("LoopDetail secondary issues row", () => {

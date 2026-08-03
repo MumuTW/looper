@@ -1150,6 +1150,23 @@ func (c *workerCheckpoint) recordContinuationResumeMode(result AgentResult) {
 	c.Continuation.Mode = result.NativeResumeMode
 }
 
+func workerContinuationPrompt(continuation *checkpointContinuation) string {
+	if continuation == nil || continuation.BeforeTimeout == nil || continuation.AfterRestart == nil {
+		return ""
+	}
+	return fmt.Sprintf(`CONTINUATION CONTEXT:
+This is a retry in the same recorded worktree, not a fresh task. The predecessor run was %s and its agent execution was %s. The daemon classified the handoff as %s. Before timeout: HEAD %s with changed/staged/untracked counts %d/%d/%d. Immediately before this replacement: HEAD %s with counts %d/%d/%d.
+Inspect the existing worktree and continue its changes. Do not reset, clean, checkout over, recreate, or discard the existing worktree.`,
+		firstNonEmpty(continuation.PredecessorRunID, "unknown"),
+		firstNonEmpty(continuation.PredecessorExecutionID, "unknown"),
+		firstNonEmpty(continuation.Outcome, "unknown"),
+		firstNonEmpty(continuation.BeforeTimeout.HeadSHA, "unknown"),
+		continuation.BeforeTimeout.ChangedFileCount, continuation.BeforeTimeout.StagedFileCount, continuation.BeforeTimeout.UntrackedFileCount,
+		firstNonEmpty(continuation.AfterRestart.HeadSHA, "unknown"),
+		continuation.AfterRestart.ChangedFileCount, continuation.AfterRestart.StagedFileCount, continuation.AfterRestart.UntrackedFileCount,
+	)
+}
+
 func New(options Options) *Runner {
 	now := options.Now
 	if now == nil {
@@ -2359,6 +2376,10 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 		if len(validationCommands) > 0 {
 			prompt += validationGatedLocalOnlyPrompt
 		}
+		continuationPrompt := workerContinuationPrompt(checkpoint.Continuation)
+		if continuationPrompt != "" {
+			prompt += "\n\n" + continuationPrompt
+		}
 		if work.Reproduction != nil {
 			prompt += "\n\n" + work.Reproduction.PromptInstruction()
 		}
@@ -2407,6 +2428,9 @@ func (r *Runner) runExecuteStep(ctx context.Context, input stepInput) (workerChe
 					nativeSessionID = r.latestNativeSessionID(ctx, input.Loop.ID, agentVendor)
 				}
 			}
+		}
+		if continuationPrompt != "" && nativeResumePrompt != "" {
+			nativeResumePrompt += "\n\n" + continuationPrompt
 		}
 		executionID := eventlog.NewEventID("agent")
 		metadata := map[string]any{"loopType": "worker", "title": work.Title, "repo": work.Repo, "baseBranch": work.BaseBranch}
@@ -2671,6 +2695,9 @@ func (r *Runner) verifyTimeoutProgressAfterTermination(ctx context.Context, proj
 
 func (r *Runner) verifyTimeoutProgressBeforeReplacement(ctx context.Context, project storage.ProjectRecord, runID string, work workerInput, worktree checkpointWorktree, checkpoint *workerCheckpoint) error {
 	if checkpoint.Execution == nil {
+		if checkpoint.Continuation != nil && checkpoint.Continuation.AfterRestart != nil {
+			return r.reobserveContinuationBeforeReplacement(ctx, project, runID, work, worktree, checkpoint)
+		}
 		return nil
 	}
 	if checkpoint.Execution.Status == "timeout_observing" {
@@ -2686,6 +2713,12 @@ func (r *Runner) verifyTimeoutProgressBeforeReplacement(ctx context.Context, pro
 		return &runpipe.LoopError{Message: checkpoint.Execution.ProgressSnapshotError, Kind: runpipe.FailureManualIntervention}
 	}
 	if checkpoint.Execution.Status != "timeout" {
+		if checkpoint.Continuation != nil && checkpoint.Continuation.AfterRestart != nil {
+			return r.reobserveContinuationBeforeReplacement(ctx, project, runID, work, worktree, checkpoint)
+		}
+		return nil
+	}
+	if checkpoint.Execution.ProgressBeforeTimeout == nil {
 		return nil
 	}
 	before := checkpoint.Execution.ProgressBeforeTimeout
@@ -2734,6 +2767,44 @@ func (r *Runner) verifyTimeoutProgressBeforeReplacement(ctx context.Context, pro
 		return nil
 	}
 	return &runpipe.LoopError{Message: checkpoint.Execution.ProgressSnapshotError, Kind: runpipe.FailureManualIntervention}
+}
+
+func (r *Runner) reobserveContinuationBeforeReplacement(ctx context.Context, project storage.ProjectRecord, runID string, work workerInput, worktree checkpointWorktree, checkpoint *workerCheckpoint) error {
+	continuation := checkpoint.Continuation
+	if continuation == nil || continuation.AfterRestart == nil {
+		return nil
+	}
+	baseline := continuation.AfterRestart
+	current, err := r.captureWorktreeProgress(ctx, project, work, worktree, agent.TimeoutObservation{}, baseline)
+	if err != nil {
+		message := fmt.Sprintf("worker continuation progress verification before retry failed: %v", err)
+		if checkpoint.Execution == nil {
+			checkpoint.Execution = &checkpointExecution{RunID: runID, Status: "failed"}
+		}
+		checkpoint.Execution.ProgressSnapshotError = message
+		continuation.Outcome = "observation failed"
+		checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
+		if persistErr := r.persistCheckpoint(ctx, runID, *checkpoint); persistErr != nil {
+			return &runpipe.LoopError{Message: persistErr.Error(), Kind: runpipe.FailureRetryableAfterResume}
+		}
+		return &runpipe.LoopError{Message: message, Kind: runpipe.FailureManualIntervention}
+	}
+	continuation.AfterRestart = &current
+	if !preservesWorktreeProgress(*baseline, current) {
+		if checkpoint.Execution == nil {
+			checkpoint.Execution = &checkpointExecution{RunID: runID, Status: "failed"}
+		}
+		checkpoint.Execution.ProgressSnapshotError = "worker continuation progress changed before replacement; operator action is required before retry"
+		continuation.Outcome = "changed"
+		checkpoint.ResumePolicy = loops.ResumePolicyManualIntervention
+	}
+	if err := r.persistCheckpoint(ctx, runID, *checkpoint); err != nil {
+		return &runpipe.LoopError{Message: err.Error(), Kind: runpipe.FailureRetryableAfterResume}
+	}
+	if continuation.Outcome == "changed" {
+		return &runpipe.LoopError{Message: checkpoint.Execution.ProgressSnapshotError, Kind: runpipe.FailureManualIntervention}
+	}
+	return nil
 }
 
 func sameWorktreeProgress(before, after worktreeProgress) bool {
@@ -4556,7 +4627,7 @@ func shouldReplayExecuteOnResume(status string, failedStep WorkerStep, checkpoin
 		return false
 	}
 	switch failedStep {
-	case stepValidate, stepOpenPR:
+	case stepExecute, stepValidate, stepOpenPR:
 	default:
 		return false
 	}

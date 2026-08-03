@@ -1977,7 +1977,8 @@ type loopResponse struct {
 	LastFailureReason *string `json:"lastFailureReason,omitempty"`
 	// Outcome is the latest run's derived outcome, so a loop view shows what that
 	// run actually accomplished rather than only that it failed.
-	Outcome *fixer.FixerRunOutcome `json:"outcome,omitempty"`
+	Outcome      *fixer.FixerRunOutcome `json:"outcome,omitempty"`
+	Continuation *activeRunContinuation `json:"continuation,omitempty"`
 }
 
 type reviewerConvergenceProjection struct {
@@ -7043,6 +7044,7 @@ func (h *Handler) serializeLoopWithDiagnostics(ctx context.Context, loop storage
 		latestRun = run
 	}
 	decorateLoopDiagnostics(&view, latestQueue, latestRun)
+	view.Continuation = buildActiveRunContinuation(latestRun)
 	return view, nil
 }
 

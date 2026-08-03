@@ -395,6 +395,8 @@ export type Loop = {
   convergence?: ReviewerConvergence | null;
   /** Latest run's derived outcome, when that run was a fixer run. */
   outcome?: FixerRunOutcome | null;
+  /** Redacted timeout-continuation evidence from the latest run, including closed loops. */
+  continuation?: ActiveRunContinuation | null;
 };
 
 export type LoopsList = {

@@ -539,6 +539,10 @@ export function LoopDetailPage() {
       (r) => r.loopId === data.id || r.seq === data.seq,
     );
   }, [activeRunItems, data]);
+  // The loop detail response carries the latest run's redacted continuation
+  // evidence even after the run closes; fall back to the shared active-run
+  // projection while a retry is still live.
+  const continuation = data?.continuation ?? activeRun?.continuation;
   const hasActiveRun = Boolean(activeRun);
 
   const onMutated = useCallback(async () => {
@@ -582,38 +586,38 @@ export function LoopDetailPage() {
         </Card>
       ) : null}
 
-      {activeRun?.continuation ? (
+      {continuation ? (
         <Card title="Timeout continuation">
           <dl className="m-0 columns-1 gap-x-6 md:columns-2">
-            <Kv label="Mode" value={activeRun.continuation.mode ?? "—"} />
+            <Kv label="Mode" value={continuation.mode ?? "—"} />
             <Kv
               label="Outcome"
               value={
-                activeRun.continuation.outcome ??
-                (activeRun.continuation.mode === "timeout_observed"
+                continuation.outcome ??
+                (continuation.mode === "timeout_observed"
                   ? "awaiting retry"
                   : "observation failed")
               }
             />
             <Kv
               label="Predecessor run"
-              value={activeRun.continuation.predecessorRunId ?? "—"}
+              value={continuation.predecessorRunId ?? "—"}
             />
             <Kv
               label="Predecessor exec"
-              value={activeRun.continuation.predecessorExecutionId ?? "—"}
+              value={continuation.predecessorExecutionId ?? "—"}
             />
             <Kv
               label="Before timeout"
-              value={formatTimeoutProgress(activeRun.continuation.beforeTimeout)}
+              value={formatTimeoutProgress(continuation.beforeTimeout)}
             />
             <Kv
               label="Before retry"
-              value={formatTimeoutProgress(activeRun.continuation.afterRestart)}
+              value={formatTimeoutProgress(continuation.afterRestart)}
             />
             <Kv
               label="Last progress"
-              value={formatTs(activeRun.continuation.beforeTimeout?.lastProgressAt)}
+              value={formatTs(continuation.beforeTimeout?.lastProgressAt)}
             />
           </dl>
         </Card>
