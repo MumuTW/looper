@@ -223,6 +223,14 @@ func (w *webhookRuntime) ValidateStartup() error {
 	if wModeNeedsGHForward(cfg) && !isLoopbackHost(cfg.Server.Host) {
 		return fmt.Errorf("webhook forwarders require a loopback server.host, got %q", cfg.Server.Host)
 	}
+	if wModeNeedsTunnel(cfg) && len(configuredWebhookReposForMode(cfg, config.WebhookModeTunnel)) > 0 {
+		// Keep the listener open during verify-hold. Binding and immediately
+		// closing would leave a TOCTOU window before the unheld restart, while
+		// starting the listener does not perform GitHub hook reconciliation.
+		if err := w.ensureTunnelServer(); err != nil {
+			return fmt.Errorf("webhook tunnel listener failed: %w", err)
+		}
+	}
 	return nil
 }
 
