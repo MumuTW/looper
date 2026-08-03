@@ -73,6 +73,13 @@ func ParseAgentSnapshot(raw string) (AgentSnapshot, error) {
 	if err := json.Unmarshal([]byte(trimmed), &snapshot); err != nil {
 		return AgentSnapshot{}, fmt.Errorf("parse agent snapshot: %w", err)
 	}
+	if snapshot.ReasoningEffort != nil {
+		canonical, ok := ParseReasoningEffort(string(*snapshot.ReasoningEffort))
+		if !ok {
+			return AgentSnapshot{}, fmt.Errorf("invalid reasoning effort %q in agent snapshot", *snapshot.ReasoningEffort)
+		}
+		snapshot.ReasoningEffort = &canonical
+	}
 	return snapshot, nil
 }
 

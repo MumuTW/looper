@@ -2368,10 +2368,11 @@ func resolveCodexArgs(cfg ExecutorConfig, args []string, prompt string) []string
 }
 
 // appendReasoningEffortFlag appends `-c model_reasoning_effort=<value>` when the
-// operator configured an explicit effort level. "none" strips any inherited
-// effort by passing the zero-value key.
+// operator configured a Codex-supported effort level. "none" is a Looper
+// overlay sentinel that suppresses an inherited setting; it is not a value
+// accepted by the Codex CLI, so it must never be forwarded as a literal.
 func appendReasoningEffortFlag(args []string, effort *config.ReasoningEffort) []string {
-	if effort == nil {
+	if effort == nil || *effort == config.ReasoningEffortNone {
 		return args
 	}
 	flag := []string{"-c", fmt.Sprintf("model_reasoning_effort=%s", string(*effort))}

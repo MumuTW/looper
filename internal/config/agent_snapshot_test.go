@@ -33,6 +33,26 @@ func TestAgentSnapshotMarshalRoundTrip(t *testing.T) {
 	}
 }
 
+func TestParseAgentSnapshotCanonicalizesReasoningEffort(t *testing.T) {
+	t.Parallel()
+
+	got, err := ParseAgentSnapshot(`{"vendor":"codex","reasoningEffort":" HIGH "}`)
+	if err != nil {
+		t.Fatalf("ParseAgentSnapshot() error = %v", err)
+	}
+	if got.ReasoningEffort == nil || *got.ReasoningEffort != ReasoningEffortHigh {
+		t.Fatalf("ReasoningEffort = %v, want %q", got.ReasoningEffort, ReasoningEffortHigh)
+	}
+}
+
+func TestParseAgentSnapshotRejectsInvalidReasoningEffort(t *testing.T) {
+	t.Parallel()
+
+	if _, err := ParseAgentSnapshot(`{"vendor":"codex","reasoningEffort":"max"}`); err == nil {
+		t.Fatal("ParseAgentSnapshot() error = nil, want invalid reasoning effort")
+	}
+}
+
 func TestAgentSnapshotFromResolvedAndIdentity(t *testing.T) {
 	t.Parallel()
 

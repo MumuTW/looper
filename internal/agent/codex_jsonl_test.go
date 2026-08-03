@@ -112,15 +112,10 @@ func TestResolveCodexArgs_ReasoningEffortNone(t *testing.T) {
 	effort := config.ReasoningEffortNone
 	base.ReasoningEffort = &effort
 	got := resolveCodexArgs(base, []string{}, "do it")
-	found := false
-	for i, arg := range got {
-		if arg == "-c" && i+1 < len(got) && got[i+1] == "model_reasoning_effort=none" {
-			found = true
-			break
+	for _, arg := range got {
+		if strings.HasPrefix(arg, "model_reasoning_effort=") {
+			t.Fatalf("resolveCodexArgs() = %v, should not forward the none sentinel", got)
 		}
-	}
-	if !found {
-		t.Fatalf("resolveCodexArgs() = %v, want -c model_reasoning_effort=none", got)
 	}
 }
 
