@@ -184,11 +184,16 @@ func TestWorktreeCleanupPassRespectsRetentionAndOrphanPolicy(t *testing.T) {
 		t.Fatalf("first cleanup path = %q, want old referenced path %q", git.cleanupCalls[0].WorktreePath, oldReferenced.WorktreePath)
 	}
 	events := fixture.events(t)
-	if !containsWorktreeCleanupEventPayload(events, "worktree.cleanup.skipped", "within retention window") {
-		t.Fatalf("events = %#v, want retention skip", events)
+	// Plan-level skips are aggregated into the completed event, not written as
+	// one durable worktree.cleanup.skipped row per unchanged candidate.
+	if containsWorktreeCleanupEvent(events, "worktree.cleanup.skipped") {
+		t.Fatalf("events = %#v, want no per-candidate skip events for plan-level skips", events)
 	}
-	if !containsWorktreeCleanupEventPayload(events, "worktree.cleanup.skipped", "orphan worktree and includeOrphans=false") {
-		t.Fatalf("events = %#v, want orphan policy skip", events)
+	if !containsWorktreeCleanupEventPayload(events, "worktree.cleanup.completed", "within retention window") {
+		t.Fatalf("events = %#v, want retention skip aggregated into completed payload", events)
+	}
+	if !containsWorktreeCleanupEventPayload(events, "worktree.cleanup.completed", "orphan worktree and includeOrphans=false") {
+		t.Fatalf("events = %#v, want orphan policy skip aggregated into completed payload", events)
 	}
 
 	fixture.config.Daemon.WorktreeCleanup.RetentionDays = 0

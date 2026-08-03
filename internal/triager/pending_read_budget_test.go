@@ -6,6 +6,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MumuTW/looper/internal/triager/admission"
+
 	githubinfra "github.com/MumuTW/looper/internal/infra/github"
 )
 
@@ -18,23 +20,23 @@ func TestPendingForgeReadBudgetIsTickWideAndRotatesProjectTurns(t *testing.T) {
 	}
 
 	first := runner.BeginPendingForgeReadTick(projects)
-	for i := 0; i < 6; i++ {
-		for call := 0; call < 2; call++ {
+	for i := 0; i < 2; i++ {
+		for call := 0; call < 6; call++ {
 			if !first.Reserve(projects[i]) {
 				t.Fatalf("first tick project %d call %d was denied", i, call)
 			}
 		}
 	}
-	if first.Reserve(projects[6]) {
-		t.Fatal("seventh project reserved past the shared 12-call tick cap")
+	if first.Reserve(projects[2]) {
+		t.Fatal("third project reserved past the shared 12-call tick cap")
 	}
 	if got := first.Remaining(); got != 0 {
 		t.Fatalf("first.Remaining() = %d, want 0", got)
 	}
 
 	second := runner.BeginPendingForgeReadTick(projects)
-	for call := 0; call < 2; call++ {
-		if !second.Reserve(projects[6]) {
+	for call := 0; call < 6; call++ {
+		if !second.Reserve(projects[2]) {
 			t.Fatalf("second tick rotating project call %d was denied", call)
 		}
 	}
@@ -71,6 +73,28 @@ func TestDiscoverIssuesChargesActualPendingForgeCalls(t *testing.T) {
 	}
 	if len(fixture.planner.inputs) != 6 {
 		t.Fatalf("planner calls = %d, want 6 sources completed before exact-call budget exhausted", len(fixture.planner.inputs))
+	}
+}
+
+func TestConfiguredAdmissionHasEnoughReadsForOneSourceTurn(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	fixture.runnerPolicy = ProjectPolicy{Admission: admission.Policy{Preset: admission.PresetPersonal, Classify: true}}
+	fixture.github.detail.AuthorAssociation = "OWNER"
+	runner := fixture.runner()
+	budget := NewPendingForgeReadBudget(pendingForgeReadsPerUsefulTurn + 1)
+
+	result, err := runner.DiscoverIssues(context.Background(), DiscoveryInput{
+		ProjectID: "project_1", Repo: "acme/looper", PendingForgeReadBudget: budget,
+	})
+	if err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	if result.Routed != 1 || result.ReportsPersisted != 1 || result.PendingSourcesDeferred != 0 {
+		t.Fatalf("result = %#v, want one configured source turn to complete", result)
+	}
+	if result.PendingForgeReads != pendingForgeReadsPerUsefulTurn {
+		t.Fatalf("pending forge reads = %d, want %d", result.PendingForgeReads, pendingForgeReadsPerUsefulTurn)
 	}
 }
 

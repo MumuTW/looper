@@ -1372,6 +1372,45 @@ func TestValidatedLifecyclePullRequestTreatsLookupErrorAsNonAdoptable(t *testing
 	}
 }
 
+func TestProcessClaimedItemDiscoverReleasesClaimedLockWhenPersistCompletedFails(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	issue := IssueSummary{Number: 42, Title: "Plan this", Assignees: []string{"octocat"}, Labels: []string{labels.DefaultPlanTrigger}}
+	github := &fakeGitHubGateway{issues: []IssueSummary{issue}, issueDetail: IssueDetail{Number: 42, Title: "Plan this", Body: "details", URL: "https://example/issues/42", Assignees: []string{"octocat"}, Labels: []string{labels.DefaultPlanTrigger}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "wrote spec"}}}, Logger: fixture.logger, Now: fixture.now, AllowAutoPush: boolPtr(true)})
+
+	if _, err := runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "planner-worker-1", "planner")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed item", claim, err)
+	}
+	if _, err := fixture.coordinator.DB().ExecContext(context.Background(), `
+		CREATE TRIGGER runs_fail_discover_complete
+		BEFORE UPDATE ON runs
+		FOR EACH ROW
+		WHEN NEW.last_completed_step = '`+string(stepDiscoverIssues)+`'
+		BEGIN
+			SELECT RAISE(FAIL, 'forced persist completed failure');
+		END;
+	`); err != nil {
+		t.Fatalf("create trigger error = %v", err)
+	}
+	_, err = runner.ProcessClaimedItem(context.Background(), *claim)
+	if err == nil || !strings.Contains(err.Error(), "forced persist completed failure") {
+		t.Fatalf("ProcessClaimedItem() error = %v, want forced persist completed failure", err)
+	}
+	lockKey := storage.IssueLockKey("project_1", "acme/looper", issue.Number)
+	lock, err := fixture.repos.Locks.Get(context.Background(), lockKey)
+	if err != nil {
+		t.Fatalf("Locks.Get() error = %v", err)
+	}
+	if lock != nil {
+		t.Fatalf("lock = %#v, want discover lock released after PersistCompleted failure", lock)
+	}
+}
+
 func TestProcessClaimedItemResumeReleasesClaimedLockWhenSetupFails(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

@@ -500,6 +500,38 @@ requireAssigneeCurrentUser = false
 profile = "fast"
 ```
 
+## Triager admission policy
+
+The internal Triager separates deterministic admission from model classification. `roles.triager.preset` is project-overridable and defaults to `legacy`, which preserves the original model-first seven-condition gate exactly. Opting into a relationship preset makes forge facts—not Issue prose—the admission authority.
+
+| Preset | Owner | Member/collaborator | Past contributor | Unaffiliated |
+| --- | --- | --- | --- | --- |
+| `personal` | `auto` | `assess` | `assess` | `assess` |
+| `maintained-oss` | `auto` | `auto` | `assess` | `assess` |
+| `company` | `auto` | `assess` | `assess` | `assess` |
+| `contributing` | `assess` | `assess` | `assess` | `assess` |
+
+- `auto` writes a Triage Report and routes directly to Planner without a classification model call.
+- `assess` runs classification when `classify = true`, writes the result, and waits for the report-specific `/plan <token>` confirmation. Classification describes the work but cannot authorize routing.
+- `ignore` writes the admission decision and retires that source without a model call.
+- Bot authors default to `ignore`; `looper:hold` always produces `ignore` for configured presets. Neither can be overridden to `auto`.
+- `contributing` can never auto-route, including through a tier override.
+- If the forge cannot report repository visibility, a would-be `auto` result degrades to `assess` rather than guessing.
+
+Tier overrides use `owner`, `member`, `past-contributor`, `unaffiliated`, or `bot` keys:
+
+```toml
+[roles.triager]
+preset = "company"
+classify = true
+
+[roles.triager.authorTiers]
+member = "auto"
+unaffiliated = "ignore"
+```
+
+The historic gate remains configurable under `roles.triager.legacy`: `autoRouteConfidence` (`0.8`), `maxAutoRouteRisk` (`low`), `requireInScope`, `requireNoMissingInformation`, `requirePlanner`, and `requireRationale` (all `true`). These fields apply only to `legacy`; an omitted Triager section therefore behaves exactly as before.
+
 ## Coordinator config reference
 
 Coordinator is the proactive, stateless issue-intake role. It owns both Triage and Dispatch. Triage writes `triaged` plus the coordinator-owned label namespace. Dispatch consumes `triaged` + `dispatch/*` and derives the actual trigger label from Planner or Worker config instead of redeclaring those labels.
