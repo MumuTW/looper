@@ -6921,6 +6921,10 @@ func (f *fakeGitHubGateway) ViewPullRequest(_ context.Context, input ViewPullReq
 	return result, nil
 }
 
+func (f *fakeGitHubGateway) ViewPullRequestForDiscovery(ctx context.Context, input ViewPullRequestInput) (PullRequestDetail, error) {
+	return f.ViewPullRequest(ctx, input)
+}
+
 func (f *fakeGitHubGateway) ListReviewThreads(_ context.Context, _ ListReviewThreadsInput) ([]ReviewThread, error) {
 	if f.threads != nil {
 		return append([]ReviewThread(nil), f.threads...), nil

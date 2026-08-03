@@ -9748,6 +9748,10 @@ func (g *fakeGitHubGateway) ViewPullRequest(context.Context, ViewPullRequestInpu
 	return PullRequestDetail{Number: 42, Title: "Review me", Body: body, State: state, IsDraft: g.viewDraft, ReviewDecision: reviewDecision, Labels: append([]string(nil), g.labels...), HeadSHA: headSHA, BaseSHA: "base123", HeadRefName: "feature/review-me", BaseRefName: "main", Author: g.effectiveAuthor(), ReviewRequests: reviewRequests, ReviewRequestUsers: users, HasConflicts: g.hasConflicts, ChecksSummary: "SUCCESS", Diff: diff, Comments: cloneCommentMaps(comments), IssueComments: cloneCommentMaps(g.issueComments), Reviews: cloneCommentMaps(g.reviews)}, nil
 }
 
+func (g *fakeGitHubGateway) ViewPullRequestForDiscovery(ctx context.Context, input ViewPullRequestInput) (PullRequestDetail, error) {
+	return g.ViewPullRequest(ctx, input)
+}
+
 func (g *fakeGitHubGateway) ViewIssue(_ context.Context, input githubinfra.ViewIssueInput) (githubinfra.IssueDetail, error) {
 	if g.issueDetailErr != nil {
 		return githubinfra.IssueDetail{}, g.issueDetailErr

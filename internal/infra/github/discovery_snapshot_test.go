@@ -382,3 +382,64 @@ func TestDiscoverySnapshotDiscoveryCacheTTLZeroDisablesGatewayCache(t *testing.T
 func reviewRequestedSearchResponse(number int, sha string) string {
 	return fmt.Sprintf(`{"data":{"search":{"nodes":[{"number":%d,"title":"Review me","url":"https://example.test/pull/%d","state":"OPEN","updatedAt":"2026-06-05T10:00:00Z","isDraft":false,"reviewDecision":"REVIEW_REQUIRED","labels":{"nodes":[{"name":"ready"}]},"headRefName":"feature","baseRefName":"main","headRefOid":%q,"baseRefOid":"base","mergeStateStatus":"CLEAN","author":{"login":"contributor"},"reviews":{"nodes":[]}}]}}}`, number, number, sha)
 }
+
+func TestDiscoverySnapshotMetadataTierOmitsRollupAndCachesSeparately(t *testing.T) {
+	t.Parallel()
+
+	metadataCalls := 0
+	fullCalls := 0
+	gateway := New(Options{GHRun: func(_ context.Context, options shell.Options) (shell.Result, error) {
+		cmd := strings.Join(options.Args, " ")
+		switch {
+		case strings.Contains(cmd, "pr view 5") && strings.Contains(cmd, "statusCheckRollup"):
+			fullCalls++
+			return shell.Result{Stdout: `{"number":5,"title":"PR 5","body":"body","url":"https://example.com/pulls/5","state":"OPEN","labels":[{"name":"looper:fixer"}],"headRefName":"feature","baseRefName":"main","headRefOid":"sha-5","baseRefOid":"base-5","author":{"login":"octo"},"reviewRequests":[],"statusCheckRollup":[{"conclusion":"FAILURE"}]}`}, nil
+		case strings.Contains(cmd, "pr view 5"):
+			metadataCalls++
+			if strings.Contains(cmd, "statusCheckRollup") || strings.Contains(cmd, "reviews") {
+				t.Fatalf("metadata tier pr view args = %q, want no statusCheckRollup/reviews", cmd)
+			}
+			return shell.Result{Stdout: `{"number":5,"title":"PR 5","body":"body","url":"https://example.com/pulls/5","state":"OPEN","labels":[{"name":"looper:fixer"}],"headRefName":"feature","baseRefName":"main","headRefOid":"sha-5","baseRefOid":"base-5","author":{"login":"octo"},"reviewRequests":[]}`}, nil
+		case strings.Contains(cmd, "reviewThreads"):
+			return shell.Result{Stdout: `{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`}, nil
+		case strings.HasPrefix(cmd, "api --paginate repos/acme/looper/issues/5/comments"):
+			return shell.Result{Stdout: `[]`}, nil
+		default:
+			return shell.Result{}, errors.New("unexpected command: " + cmd)
+		}
+	}})
+
+	ctx := ContextWithDiscoverySnapshot(context.Background(), NewDiscoverySnapshot(gateway, NewDiscoveryTickState(), DiscoverySnapshotOptions{PullRequestLimit: 100}))
+
+	// Metadata tier: thin view, no rollup.
+	md, err := gateway.ViewPullRequestForDiscovery(ctx, ViewPullRequestInput{Repo: "acme/looper", PRNumber: 5, CWD: "/repo"})
+	if err != nil {
+		t.Fatalf("ViewPullRequestForDiscovery error = %v", err)
+	}
+	if md.Number != 5 || len(md.Checks) != 0 {
+		t.Fatalf("metadata detail = %+v, want number 5 and zero checks", md)
+	}
+	if metadataCalls != 1 {
+		t.Fatalf("metadata pr view calls = %d, want 1", metadataCalls)
+	}
+
+	// Full tier must not reuse the metadata cache entry: it re-fetches with rollup.
+	full, err := gateway.ViewPullRequest(ctx, ViewPullRequestInput{Repo: "acme/looper", PRNumber: 5, CWD: "/repo"})
+	if err != nil {
+		t.Fatalf("ViewPullRequest error = %v", err)
+	}
+	if len(full.Checks) != 1 {
+		t.Fatalf("full detail checks = %d, want 1 rollup entry", len(full.Checks))
+	}
+	if fullCalls != 1 {
+		t.Fatalf("full pr view calls = %d, want 1", fullCalls)
+	}
+
+	// Second metadata call hits the metadata cache (no extra gh call).
+	if _, err := gateway.ViewPullRequestForDiscovery(ctx, ViewPullRequestInput{Repo: "acme/looper", PRNumber: 5, CWD: "/repo"}); err != nil {
+		t.Fatalf("ViewPullRequestForDiscovery(second) error = %v", err)
+	}
+	if metadataCalls != 1 {
+		t.Fatalf("metadata pr view calls after cache hit = %d, want still 1", metadataCalls)
+	}
+}
