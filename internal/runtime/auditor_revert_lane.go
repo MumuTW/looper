@@ -8,9 +8,11 @@ import (
 	"time"
 
 	"github.com/MumuTW/looper/internal/auditor"
+	"github.com/MumuTW/looper/internal/config"
 	"github.com/MumuTW/looper/internal/eventlog"
 	gitinfra "github.com/MumuTW/looper/internal/infra/git"
 	githubinfra "github.com/MumuTW/looper/internal/infra/github"
+	"github.com/MumuTW/looper/internal/labels"
 	"github.com/MumuTW/looper/internal/storage"
 )
 
@@ -25,6 +27,7 @@ type auditorRevertGitHub interface {
 	GetBranchHeadSHA(context.Context, githubinfra.BranchHeadInput) (string, error)
 	ListOpenPullRequests(context.Context, githubinfra.ListOpenPullRequestsInput) ([]githubinfra.PullRequestSummary, error)
 	CreatePullRequest(context.Context, githubinfra.CreatePullRequestInput) (githubinfra.CreatePullRequestResult, error)
+	AddPullRequestLabels(context.Context, githubinfra.PullRequestLabelsInput) error
 	ReopenIssue(context.Context, githubinfra.ReopenIssueInput) error
 }
 
@@ -77,14 +80,14 @@ func progressAuditorRevertProposal(ctx context.Context, repos *storage.Repositor
 		if err != nil {
 			return fmt.Errorf("auditor create proposal worktree: %w", err)
 		}
-		inspect, err := git.InspectHead(ctx, gitinfra.InspectHeadInput{RepoPath: project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.WorktreePath, BaseRef: baseBranch})
+		inspect, err := git.InspectHead(ctx, gitinfra.InspectHeadInput{RepoPath: project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.WorktreePath, BaseRef: "origin/" + baseBranch})
 		if err != nil {
 			return fmt.Errorf("auditor inspect proposal branch: %w", err)
 		}
 		if inspect.HasUncommittedChanges {
 			return fmt.Errorf("auditor proposal worktree is unexpectedly dirty")
 		}
-		commitSHA := inspect.HeadSHA
+		var commitSHA string
 		switch len(inspect.NewCommitSHAs) {
 		case 0:
 			result, err := git.RevertCommit(ctx, gitinfra.RevertCommitInput{RepoPath: project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.WorktreePath, CommitSHA: confirmation.Candidate.MergeCommitSHA})
@@ -93,8 +96,10 @@ func progressAuditorRevertProposal(ctx context.Context, repos *storage.Repositor
 			}
 			commitSHA = result.CommitSHA
 		case 1:
-			// A prior attempt already committed the deterministic inverse. Resume
-			// at push/create instead of reverting the revert.
+			// A commit-count signal is infrastructure evidence, not authority that
+			// this branch still reverses the frozen merge. Without a tree-level
+			// comparison, fail closed rather than pushing arbitrary branch state.
+			return fmt.Errorf("auditor proposal branch contains an unverified existing revert commit")
 		default:
 			return fmt.Errorf("auditor proposal branch has %d commits beyond %s", len(inspect.NewCommitSHAs), baseBranch)
 		}
@@ -106,6 +111,12 @@ func progressAuditorRevertProposal(ctx context.Context, repos *storage.Repositor
 			return fmt.Errorf("auditor create draft revert pull request: %w", err)
 		}
 		proposal = created
+	}
+	if proposal.Number <= 0 {
+		return fmt.Errorf("auditor revert proposal has no pull request number for hold label")
+	}
+	if err := github.AddPullRequestLabels(ctx, githubinfra.PullRequestLabelsInput{Repo: repo, PRNumber: proposal.Number, Labels: []string{labels.HoldAuditorRevert}, CWD: project.RepoPath}); err != nil {
+		return fmt.Errorf("auditor hold revert proposal from auto-merge: %w", err)
 	}
 	if err := github.ReopenIssue(ctx, githubinfra.ReopenIssueInput{Repo: confirmation.Candidate.SourceIssueRepo, IssueNumber: confirmation.Candidate.SourceIssueNumber, CWD: project.RepoPath}); err != nil {
 		return fmt.Errorf("auditor reopen source issue: %w", err)
@@ -127,7 +138,8 @@ func latestRevertConfirmation(events []storage.EventLogRecord, headSHA string) (
 			continue
 		}
 		candidate := confirmation.Candidate
-		if candidate.PRNumber <= 0 || strings.TrimSpace(candidate.MergeCommitSHA) == "" || candidate.SourceIssueNumber <= 0 || strings.TrimSpace(candidate.SourceIssueRepo) == "" {
+		mergeStrategy := strings.ToLower(strings.TrimSpace(candidate.MergeStrategy))
+		if candidate.PRNumber <= 0 || strings.TrimSpace(candidate.MergeCommitSHA) == "" || (mergeStrategy != string(config.ReviewerAutoMergeStrategySquash) && mergeStrategy != string(config.ReviewerAutoMergeStrategyMerge)) || candidate.SourceIssueNumber <= 0 || strings.TrimSpace(candidate.SourceIssueRepo) == "" {
 			return storage.EventLogRecord{}, auditor.ConfirmationRecord{}, false, fmt.Errorf("auditor confirmation event %s lacks proposal provenance", event.ID)
 		}
 		return event, confirmation, true, nil
@@ -176,6 +188,6 @@ func auditorRevertBody(confirmationEventID string, confirmation auditor.Confirma
 func appendAuditorRevertProposal(ctx context.Context, repos *storage.Repositories, projectID, entityType, entityID, confirmationEventID, repo, headSHA, branch string, proposal githubinfra.CreatePullRequestResult, candidate *auditor.ConfirmedCandidate, proposedAt time.Time) error {
 	return eventlog.Append(ctx, repos, eventlog.AppendInput{
 		EventType: auditor.RevertProposalEventType, ProjectID: &projectID, EntityType: &entityType, EntityID: &entityID, CausationID: &confirmationEventID,
-		Payload: auditor.RevertProposal{Version: 1, ConfirmationEventID: confirmationEventID, Repo: repo, HeadSHA: headSHA, MergeCommitSHA: candidate.MergeCommitSHA, SourceIssueNumber: candidate.SourceIssueNumber, Branch: branch, PRNumber: proposal.Number, PRURL: proposal.URL, ProposedAt: eventlog.FormatJavaScriptISOString(proposedAt)}, CreatedAt: proposedAt,
+		Payload: auditor.RevertProposal{Version: 1, ConfirmationEventID: confirmationEventID, Repo: repo, HeadSHA: headSHA, MergeCommitSHA: candidate.MergeCommitSHA, MergeStrategy: candidate.MergeStrategy, SourceIssueNumber: candidate.SourceIssueNumber, Branch: branch, PRNumber: proposal.Number, PRURL: proposal.URL, ProposedAt: eventlog.FormatJavaScriptISOString(proposedAt)}, CreatedAt: proposedAt,
 	})
 }

@@ -17,11 +17,13 @@ const (
 // ConfirmationInput compares the failed checks observed on the default branch
 // with one completed re-run on the same audited ref.
 type ConfirmationInput struct {
-	InitialFailedChecks []string
-	InitialFailedPaths  []string
-	RerunCompleted      bool
-	RerunFailedChecks   []string
-	RerunFailedPaths    []string
+	InitialFailedChecks       []string
+	InitialFailedPaths        []string
+	InitialFailedPathsByCheck map[string][]string
+	RerunCompleted            bool
+	RerunFailedChecks         []string
+	RerunFailedPaths          []string
+	RerunFailedPathsByCheck   map[string][]string
 }
 
 type ConfirmationResult struct {

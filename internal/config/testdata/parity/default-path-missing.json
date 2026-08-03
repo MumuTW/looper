@@ -161,6 +161,7 @@
       "intake": {},
       "roles": {
         "auditor": {
+          "allowRevertProposals": false,
           "enabled": false,
           "windowMinutes": 60
         },

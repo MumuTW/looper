@@ -78,6 +78,9 @@ const (
 	HoldWorker   = "looper:hold:worker"
 	HoldFixer    = "looper:hold:fixer"
 	HoldReviewer = "looper:hold:reviewer"
+	// HoldAuditorRevert is applied to generated revert proposals and remains a
+	// durable Gatekeeper veto even after a human promotes the draft to ready.
+	HoldAuditorRevert = "looper:hold:auditor-revert"
 )
 
 // DoNotMerge is the widely-used community label that is not in Looper's
@@ -128,6 +131,7 @@ func Standard() []Definition {
 		{Name: HoldWorker, Color: "b60205", Description: "Pause automatic worker work"},
 		{Name: HoldFixer, Color: "b60205", Description: "Pause automatic fixer work"},
 		{Name: HoldReviewer, Color: "b60205", Description: "Pause automatic reviewer work"},
+		{Name: HoldAuditorRevert, Color: "b60205", Description: "Keep automated auditor revert proposals out of auto-merge"},
 	}
 }
 

@@ -16,14 +16,15 @@ const ConfirmationEventType = "post_merge_audit.confirmation"
 const RevertProposalEventType = "post_merge_audit.revert_proposed"
 
 type RerunRequest struct {
-	Version             int      `json:"version"`
-	ObservationEventID  string   `json:"observationEventId"`
-	Repo                string   `json:"repo"`
-	HeadSHA             string   `json:"headSha"`
-	CheckSuiteID        int64    `json:"checkSuiteId"`
-	InitialFailedChecks []string `json:"initialFailedChecks,omitempty"`
-	InitialFailedPaths  []string `json:"initialFailedPaths,omitempty"`
-	RequestedAt         string   `json:"requestedAt"`
+	Version                   int                 `json:"version"`
+	ObservationEventID        string              `json:"observationEventId"`
+	Repo                      string              `json:"repo"`
+	HeadSHA                   string              `json:"headSha"`
+	CheckSuiteID              int64               `json:"checkSuiteId"`
+	InitialFailedChecks       []string            `json:"initialFailedChecks,omitempty"`
+	InitialFailedPaths        []string            `json:"initialFailedPaths,omitempty"`
+	InitialFailedPathsByCheck map[string][]string `json:"initialFailedPathsByCheck,omitempty"`
+	RequestedAt               string              `json:"requestedAt"`
 }
 
 type ConfirmationRecord struct {
@@ -43,6 +44,7 @@ type ConfirmationRecord struct {
 type ConfirmedCandidate struct {
 	PRNumber          int64  `json:"prNumber"`
 	MergeCommitSHA    string `json:"mergeCommitSha"`
+	MergeStrategy     string `json:"mergeStrategy"`
 	SourceIssueNumber int64  `json:"sourceIssueNumber"`
 	SourceIssueRepo   string `json:"sourceIssueRepo"`
 }
@@ -53,6 +55,7 @@ type RevertProposal struct {
 	Repo                string `json:"repo"`
 	HeadSHA             string `json:"headSha"`
 	MergeCommitSHA      string `json:"mergeCommitSha"`
+	MergeStrategy       string `json:"mergeStrategy"`
 	SourceIssueNumber   int64  `json:"sourceIssueNumber"`
 	Branch              string `json:"branch"`
 	PRNumber            int64  `json:"prNumber"`

@@ -27,6 +27,7 @@ type MergeCandidate struct {
 	PRNumber               int64
 	HeadSHA                string
 	MergeCommitSHA         string
+	MergeStrategy          string
 	SourceIssue            *githubinfra.IssueReference
 	MergedAt               time.Time
 	TouchedFiles           []string

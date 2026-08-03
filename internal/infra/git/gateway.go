@@ -138,6 +138,18 @@ type RevertCommitInput struct {
 
 var commitSHAPattern = regexp.MustCompile(`^[0-9a-fA-F]{7,64}$`)
 
+func revertCommitArgs(parentLine string) []string {
+	fields := strings.Fields(parentLine)
+	args := []string{"revert", "--no-edit"}
+	if len(fields) > 2 {
+		args = append(args, "-m", "1")
+	}
+	if len(fields) > 0 {
+		args = append(args, fields[0])
+	}
+	return args
+}
+
 type CleanupWorktreeInput struct {
 	ProjectID         string
 	RepoPath          string
@@ -1049,7 +1061,14 @@ func (g *Gateway) RevertCommit(ctx context.Context, input RevertCommitInput) (Co
 	if !commitSHAPattern.MatchString(commitSHA) {
 		return CommitResult{}, fmt.Errorf("revert commit requires a commit SHA")
 	}
-	if err := g.runGit(ctx, input.WorktreePath, nil, "revert", "--no-edit", commitSHA); err != nil {
+	parents, err := g.runGitResult(ctx, input.WorktreePath, nil, "rev-list", "--parents", "-n", "1", commitSHA)
+	if err != nil {
+		return CommitResult{}, err
+	}
+	// A merge commit needs the default-branch parent selected explicitly;
+	// otherwise git refuses before creating the inverse commit.
+	revertArgs := revertCommitArgs(strings.TrimSpace(parents.Stdout))
+	if err := g.runGit(ctx, input.WorktreePath, nil, revertArgs...); err != nil {
 		_ = g.runGit(ctx, input.WorktreePath, nil, "revert", "--abort")
 		return CommitResult{}, err
 	}

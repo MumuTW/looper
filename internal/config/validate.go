@@ -298,6 +298,9 @@ func validateCoreConfig(config Config, issues *[]ValidationIssue) {
 		if project.Roles.Auditor.WindowMinutes != nil {
 			role.WindowMinutes = *project.Roles.Auditor.WindowMinutes
 		}
+		if project.Roles.Auditor.AllowRevertProposals != nil {
+			role.AllowRevertProposals = *project.Roles.Auditor.AllowRevertProposals
+		}
 		validateAuditorRoleConfig(role, fmt.Sprintf("projects[%d].roles.auditor", i), issues)
 	}
 	for i, project := range config.Projects {

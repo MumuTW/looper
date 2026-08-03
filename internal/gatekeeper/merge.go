@@ -15,6 +15,9 @@ type MergeOutcome struct {
 	// HeadSHA is the commit the decision was made about and, on success, the
 	// commit that was merged.
 	HeadSHA string `json:"headSha"`
+	// MergeStrategy records the configured forge strategy so Auditor can reject
+	// a rebase tip as incomplete revert provenance.
+	MergeStrategy string `json:"mergeStrategy,omitempty"`
 	// TouchedFiles is GitHub's authoritative pull-request file list captured
 	// after a successful merge. Auditor may use it as attribution evidence; it
 	// is not merge authority and therefore a read failure never undoes a merge.
@@ -92,6 +95,7 @@ func (r *Runner) confirmAndMerge(ctx context.Context, input EvaluationInput, rep
 		return r.persistMergeOutcome(ctx, outcome)
 	}
 	strategy := r.mergeStrategy(report.ProjectID)
+	outcome.MergeStrategy = string(strategy)
 
 	if err := r.github.MergePullRequest(ctx, githubinfra.EnableAutoMergeInput{
 		Repo: report.Repo, PRNumber: report.PRNumber,
@@ -141,7 +145,13 @@ func (r *Runner) confirmAndMerge(ctx context.Context, input EvaluationInput, rep
 		}
 	} else {
 		outcome.TouchedFiles = files
-		outcome.TouchedFilesAvailable = true
+		if mergedDetail.DiffStats != nil && mergedDetail.DiffStats.ChangedFiles > len(files) {
+			if r.logWarn != nil {
+				r.logWarn("gatekeeper: pull request file evidence is truncated", map[string]any{"repo": report.Repo, "pr": report.PRNumber, "returned": len(files), "changedFiles": mergedDetail.DiffStats.ChangedFiles})
+			}
+		} else {
+			outcome.TouchedFilesAvailable = true
+		}
 	}
 	return r.persistMergeOutcome(ctx, outcome)
 }

@@ -102,7 +102,7 @@ func TestProgressAuditorConfirmationMarksUniquePathOverlapAsRevertProposal(t *te
 	ctx, repos, project, repo, head, now := auditorConfirmationFixture(t, []int64{7654})
 	projectID := project.ID
 	sourceIssue := &githubinfra.IssueReference{Number: 118, Repo: repo}
-	if err := eventlog.Append(ctx, repos, eventlog.AppendInput{EventType: gatekeeper.MergeOutcomeEventType, ProjectID: &projectID, Payload: gatekeeper.MergeOutcome{Version: 1, ProjectID: projectID, Repo: repo, PRNumber: 42, HeadSHA: "merged-pr-head", MergeCommitSHA: "merge-commit-1", SourceIssue: sourceIssue, Merged: true, TouchedFiles: []string{"internal/runtime/auditor.go"}, TouchedFilesAvailable: true}, CreatedAt: now.Add(-time.Minute)}); err != nil {
+	if err := eventlog.Append(ctx, repos, eventlog.AppendInput{EventType: gatekeeper.MergeOutcomeEventType, ProjectID: &projectID, Payload: gatekeeper.MergeOutcome{Version: 1, ProjectID: projectID, Repo: repo, PRNumber: 42, HeadSHA: "merged-pr-head", MergeCommitSHA: "merge-commit-1", MergeStrategy: "squash", SourceIssue: sourceIssue, Merged: true, TouchedFiles: []string{"internal/runtime/auditor.go"}, TouchedFilesAvailable: true}, CreatedAt: now.Add(-time.Minute)}); err != nil {
 		t.Fatal(err)
 	}
 	gateway := &confirmationAuditorGateway{head: head, annotations: map[int64][]githubinfra.CheckRunAnnotation{99: {{Path: "internal/runtime/auditor.go", Level: "failure"}}}}
@@ -122,9 +122,9 @@ func TestProgressAuditorConfirmationMarksUniquePathOverlapAsRevertProposal(t *te
 }
 
 func TestAuditorConfirmationEscalatesWhenCandidateLacksRevertProvenance(t *testing.T) {
-	observation := auditor.FailureObservation{ObservedAt: "2026-07-31T12:00:00.000Z", FailingPaths: []string{"a.go"}}
-	confirmation := auditor.ConfirmationResult{Outcome: auditor.ConfirmationConfirmed}
-	events := []storage.EventLogRecord{{EventType: gatekeeper.MergeOutcomeEventType, PayloadJSON: `{"projectId":"project_1","repo":"acme/looper","prNumber":42,"headSha":"head","merged":true,"touchedFiles":["a.go"]}`, CreatedAt: "2026-07-31T11:59:00.000Z"}}
+	observation := auditor.FailureObservation{ObservedAt: "2026-07-31T12:00:00.000Z", FailingPaths: []string{"a.go"}, FailingPathsByCheck: map[string][]string{"ci": {"a.go"}}, BaselineKnown: true, FailingPathEvidenceComplete: true, CandidatePRs: []int64{42}}
+	confirmation := auditor.ConfirmationResult{Outcome: auditor.ConfirmationConfirmed, ConfirmedChecks: []string{"ci"}}
+	events := []storage.EventLogRecord{{EventType: gatekeeper.MergeOutcomeEventType, PayloadJSON: `{"projectId":"project_1","repo":"acme/looper","prNumber":42,"headSha":"head","mergeStrategy":"squash","merged":true,"touchedFiles":["a.go"],"touchedFilesAvailable":true}`, CreatedAt: "2026-07-31T11:59:00.000Z"}}
 	coordinator := openMigratedCoordinator(t, filepath.Join(t.TempDir(), "auditor.sqlite"), t.TempDir())
 	repos := storage.NewRepositories(coordinator.DB())
 	for _, event := range events {
@@ -135,6 +135,34 @@ func TestAuditorConfirmationEscalatesWhenCandidateLacksRevertProvenance(t *testi
 	decision, err := auditorConfirmationDecision(context.Background(), repos.Events, "project_1", "acme/looper", observation, confirmation, 60)
 	if err != nil || decision.Action != auditor.ActionEscalate || decision.Reason != "missing_merge_commit_provenance" {
 		t.Fatalf("auditorConfirmationDecision() = %#v, %v", decision, err)
+	}
+}
+
+func TestAuditorConfirmationRejectsRebaseCandidate(t *testing.T) {
+	observation := auditor.FailureObservation{
+		ObservedAt:                  "2026-07-31T12:00:00.000Z",
+		FailingPaths:                []string{"a.go"},
+		FailingPathsByCheck:         map[string][]string{"ci": {"a.go"}},
+		BaselineKnown:               true,
+		FailingPathEvidenceComplete: true,
+		CandidatePRs:                []int64{42},
+	}
+	confirmation := auditor.ConfirmationResult{Outcome: auditor.ConfirmationConfirmed, ConfirmedChecks: []string{"ci"}}
+	events := []storage.EventLogRecord{{
+		EventType:   gatekeeper.MergeOutcomeEventType,
+		PayloadJSON: `{"projectId":"project_1","repo":"acme/looper","prNumber":42,"headSha":"head","mergeCommitSha":"tip","mergeStrategy":"rebase","merged":true,"touchedFiles":["a.go"],"touchedFilesAvailable":true,"sourceIssue":{"number":118,"repo":"acme/looper"}}`,
+		CreatedAt:   "2026-07-31T11:59:00.000Z",
+	}}
+	coordinator := openMigratedCoordinator(t, filepath.Join(t.TempDir(), "auditor.sqlite"), t.TempDir())
+	repos := storage.NewRepositories(coordinator.DB())
+	for _, event := range events {
+		if err := repos.Events.Append(context.Background(), event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	decision, err := auditorConfirmationDecision(context.Background(), repos.Events, "project_1", "acme/looper", observation, confirmation, 60)
+	if err != nil || decision.Action != auditor.ActionEscalate || decision.Reason != "rebase_merge_not_revertable" {
+		t.Fatalf("auditorConfirmationDecision() = %#v, %v; want explicit rebase refusal", decision, err)
 	}
 }
 
@@ -183,10 +211,10 @@ func auditorConfirmationFixture(t *testing.T, suiteIDs []int64) (context.Context
 		t.Fatal(err)
 	}
 	entityType, entityID, eventID := "branch_head", repo+"@"+head, "observation_1"
-	if err := eventlog.Append(ctx, repos, eventlog.AppendInput{EventType: auditor.BaselineEventType, ProjectID: &projectID, EntityType: &entityType, EntityID: &entityID, Payload: auditor.BaselineObservation{Version: 1, ProjectID: projectID, Repo: repo, HeadSHA: head, ObservedAt: eventlog.FormatJavaScriptISOString(now.Add(-time.Minute))}, CreatedAt: now.Add(-time.Minute)}); err != nil {
+	if err := eventlog.Append(ctx, repos, eventlog.AppendInput{EventType: auditor.BaselineEventType, ProjectID: &projectID, EntityType: &entityType, EntityID: &entityID, Payload: auditor.BaselineObservation{Version: 1, ProjectID: projectID, Repo: repo, HeadSHA: head, ObservedAt: eventlog.FormatJavaScriptISOString(now.Add(-2 * time.Minute))}, CreatedAt: now.Add(-2 * time.Minute)}); err != nil {
 		t.Fatal(err)
 	}
-	if err := eventlog.Append(ctx, repos, eventlog.AppendInput{ID: eventID, EventType: auditor.ObservedFailureEventType, ProjectID: &projectID, EntityType: &entityType, EntityID: &entityID, Payload: auditor.FailureObservation{Version: 4, ProjectID: projectID, Repo: repo, HeadSHA: head, FailedChecks: []string{"ci"}, FailingPaths: []string{"internal/runtime/auditor.go"}, FailingPathEvidenceComplete: true, BaselineKnown: true, CandidatePRs: []int64{42}, CheckSuiteIDs: suiteIDs, ObservedAt: nowISO}, CreatedAt: now}); err != nil {
+	if err := eventlog.Append(ctx, repos, eventlog.AppendInput{ID: eventID, EventType: auditor.ObservedFailureEventType, ProjectID: &projectID, EntityType: &entityType, EntityID: &entityID, Payload: auditor.FailureObservation{Version: 5, ProjectID: projectID, Repo: repo, HeadSHA: head, FailedChecks: []string{"ci"}, FailingPaths: []string{"internal/runtime/auditor.go"}, FailingPathsByCheck: map[string][]string{"ci": {"internal/runtime/auditor.go"}}, FailingPathEvidenceComplete: true, BaselineKnown: true, CandidatePRs: []int64{42}, CheckSuiteIDs: suiteIDs, ObservedAt: nowISO}, CreatedAt: now}); err != nil {
 		t.Fatal(err)
 	}
 	return ctx, repos, project, repo, head, now

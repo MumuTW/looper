@@ -15,6 +15,10 @@ type FailureObservation struct {
 	HeadSHA      string   `json:"headSha"`
 	FailedChecks []string `json:"failedChecks"`
 	FailingPaths []string `json:"failingPaths"`
+	// FailingPathsByCheck keeps attribution evidence tied to the provider check
+	// that emitted it; an aggregate list alone cannot exclude paths from a
+	// check that later flakes away.
+	FailingPathsByCheck map[string][]string `json:"failingPathsByCheck,omitempty"`
 	// FailingPathEvidenceComplete is false when one or more failed check
 	// annotation reads failed; partial paths cannot authorize attribution.
 	FailingPathEvidenceComplete bool    `json:"failingPathEvidenceComplete"`

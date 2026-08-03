@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -78,6 +79,15 @@ func TestGatewayRevertCommitCreatesOneInverseCommitInManagedWorktree(t *testing.
 	}
 	if got := readFile(t, filepath.Join(worktree.WorktreePath, "README.md")); got != "hello\n" {
 		t.Fatalf("README after revert = %q, want original content", got)
+	}
+}
+
+func TestRevertCommitArgsSelectMainlineForMergeCommit(t *testing.T) {
+	if got := revertCommitArgs("deadbeef\n"); !slices.Equal(got, []string{"revert", "--no-edit", "deadbeef"}) {
+		t.Fatalf("revertCommitArgs(single) = %#v", got)
+	}
+	if got := revertCommitArgs("deadbeef parent-one parent-two\n"); !slices.Equal(got, []string{"revert", "--no-edit", "-m", "1", "deadbeef"}) {
+		t.Fatalf("revertCommitArgs(merge) = %#v", got)
 	}
 }
 

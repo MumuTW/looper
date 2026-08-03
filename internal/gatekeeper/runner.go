@@ -535,6 +535,10 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 		report.Evidence.HoldLabels = append(report.Evidence.HoldLabels, labels.HoldGlobal)
 		report.Reasons = append(report.Reasons, Reason{Code: ReasonHold, Subject: labels.HoldGlobal})
 	}
+	if labels.Has(detail.Labels, labels.HoldAuditorRevert) {
+		report.Evidence.HoldLabels = append(report.Evidence.HoldLabels, labels.HoldAuditorRevert)
+		report.Reasons = append(report.Reasons, Reason{Code: ReasonHold, Subject: labels.HoldAuditorRevert})
+	}
 	report.Evidence.ProjectPolicyPermitsTarget = r.policyPermitsTarget(input.ProjectID, input.Repo, report.Evidence.BaseRefName)
 	if !report.Evidence.ProjectPolicyPermitsTarget {
 		report.Reasons = append(report.Reasons, Reason{Code: ReasonProjectPolicyDenied})

@@ -866,10 +866,12 @@ type GatekeeperDiffBudget struct {
 
 // AuditorRoleConfig configures the opt-in Post-merge Auditor. It remains
 // disabled by default because watching default-branch checks changes operator
-// workload even though the Auditor never merges or pushes a revert itself.
+// workload. Revert proposals are a separate, default-disabled mutation opt-in:
+// observing failures must never silently gain authority to push or reopen.
 type AuditorRoleConfig struct {
-	Enabled       bool `json:"enabled"`
-	WindowMinutes int  `json:"windowMinutes"`
+	Enabled              bool `json:"enabled"`
+	WindowMinutes        int  `json:"windowMinutes"`
+	AllowRevertProposals bool `json:"allowRevertProposals"`
 }
 
 type ProjectRefConfig struct {
@@ -1528,8 +1530,9 @@ type PartialEscalatorRoleConfig struct {
 }
 
 type PartialAuditorRoleConfig struct {
-	Enabled       *bool `json:"enabled,omitempty"`
-	WindowMinutes *int  `json:"windowMinutes,omitempty"`
+	Enabled              *bool `json:"enabled,omitempty"`
+	WindowMinutes        *int  `json:"windowMinutes,omitempty"`
+	AllowRevertProposals *bool `json:"allowRevertProposals,omitempty"`
 }
 
 type PartialRoleConfigs struct {

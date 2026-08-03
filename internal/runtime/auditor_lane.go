@@ -11,6 +11,7 @@ import (
 	"github.com/MumuTW/looper/internal/auditor"
 	"github.com/MumuTW/looper/internal/config"
 	"github.com/MumuTW/looper/internal/eventlog"
+	"github.com/MumuTW/looper/internal/gatekeeper"
 	githubinfra "github.com/MumuTW/looper/internal/infra/github"
 	"github.com/MumuTW/looper/internal/storage"
 )
@@ -39,6 +40,9 @@ func runAuditorLane(ctx context.Context, input defaultSchedulerTickInput, projec
 	}
 	if err := progressAuditorConfirmation(ctx, input.Repos, input.GitHubGateway, project, repo, baseBranch, role, input.Now); err != nil {
 		return err
+	}
+	if !role.AllowRevertProposals {
+		return nil
 	}
 	return progressAuditorRevertProposal(ctx, input.Repos, input.GitGateway, input.GitHubGateway, project, repo, baseBranch, input.Now)
 }
@@ -108,20 +112,30 @@ func observePostMergeFailure(ctx context.Context, repos *storage.Repositories, g
 			return nil
 		}
 	}
-	failingPaths, pathEvidenceComplete := failedAuditorCheckPaths(ctx, gateway, repo, project.RepoPath, checks)
-	baselineKnown := auditorHasCleanBaseline(mergeEvents, project.ID, repo, since)
+	failingPaths, failingPathsByCheck, pathEvidenceComplete := failedAuditorCheckPathEvidence(ctx, gateway, repo, project.RepoPath, checks)
+	baselineKnown := auditorHasCleanBaselineBeforeMerge(mergeEvents, project.ID, repo, since)
 	projectID := project.ID
 	return eventlog.Append(ctx, repos, eventlog.AppendInput{
 		EventType: auditor.ObservedFailureEventType, ProjectID: &projectID, EntityType: &entityType, EntityID: &entityID,
-		Payload: auditor.FailureObservation{Version: 4, ProjectID: project.ID, Repo: repo, HeadSHA: headSHA, FailedChecks: failureEvidence.Names, FailingPaths: failingPaths, FailingPathEvidenceComplete: pathEvidenceComplete, CheckSuiteIDs: failureEvidence.SuiteIDs, CandidatePRs: candidatePRs, BaselineKnown: baselineKnown, ObservedAt: eventlog.FormatJavaScriptISOString(observedAt)}, CreatedAt: observedAt,
+		Payload: auditor.FailureObservation{Version: 5, ProjectID: project.ID, Repo: repo, HeadSHA: headSHA, FailedChecks: failureEvidence.Names, FailingPaths: failingPaths, FailingPathsByCheck: failingPathsByCheck, FailingPathEvidenceComplete: pathEvidenceComplete, CheckSuiteIDs: failureEvidence.SuiteIDs, CandidatePRs: candidatePRs, BaselineKnown: baselineKnown, ObservedAt: eventlog.FormatJavaScriptISOString(observedAt)}, CreatedAt: observedAt,
 	})
 }
 
-func failedAuditorCheckPaths(ctx context.Context, gateway auditorGateway, repo, cwd string, checks githubinfra.PullRequestCheckRuns) ([]string, bool) {
+func failedAuditorCheckPathEvidence(ctx context.Context, gateway auditorGateway, repo, cwd string, checks githubinfra.PullRequestCheckRuns) ([]string, map[string][]string, bool) {
 	paths := make(map[string]struct{})
-	complete := true
+	pathsByCheck := make(map[string]map[string]struct{})
+	complete := checks.TotalCount <= len(checks.CheckRuns) && checks.StatusesTotalCount <= len(checks.Statuses)
 	for _, check := range checks.CheckRuns {
-		if check.ID <= 0 || !isFailedCheckState(check.Status, check.Conclusion) {
+		if !isFailedCheckState(check.Status, check.Conclusion) {
+			continue
+		}
+		if check.ID <= 0 {
+			complete = false
+			continue
+		}
+		checkName := strings.TrimSpace(check.Name)
+		if checkName == "" {
+			complete = false
 			continue
 		}
 		annotations, err := gateway.ListCheckRunAnnotations(ctx, githubinfra.CheckRunAnnotationsInput{Repo: repo, CheckRunID: check.ID, CWD: cwd})
@@ -135,6 +149,10 @@ func failedAuditorCheckPaths(ctx context.Context, gateway auditorGateway, repo, 
 			}
 			if path := strings.TrimSpace(annotation.Path); path != "" {
 				paths[path] = struct{}{}
+				if pathsByCheck[checkName] == nil {
+					pathsByCheck[checkName] = make(map[string]struct{})
+				}
+				pathsByCheck[checkName][path] = struct{}{}
 			}
 		}
 	}
@@ -143,7 +161,16 @@ func failedAuditorCheckPaths(ctx context.Context, gateway auditorGateway, repo, 
 		result = append(result, path)
 	}
 	sort.Strings(result)
-	return result, complete
+	byCheck := make(map[string][]string, len(pathsByCheck))
+	for checkName, checkPaths := range pathsByCheck {
+		values := make([]string, 0, len(checkPaths))
+		for path := range checkPaths {
+			values = append(values, path)
+		}
+		sort.Strings(values)
+		byCheck[checkName] = values
+	}
+	return result, byCheck, complete
 }
 
 func recordAuditorBaseline(ctx context.Context, repos *storage.Repositories, project storage.ProjectRecord, repo, headSHA string, observedAt time.Time) error {
@@ -164,9 +191,26 @@ func recordAuditorBaseline(ctx context.Context, repos *storage.Repositories, pro
 	})
 }
 
-func auditorHasCleanBaseline(events []storage.EventLogRecord, projectID, repo, since string) bool {
+func auditorHasCleanBaselineBeforeMerge(events []storage.EventLogRecord, projectID, repo, since string) bool {
 	sinceTime, err := time.Parse(time.RFC3339Nano, since)
 	if err != nil {
+		return false
+	}
+	var earliestMerge time.Time
+	for _, event := range events {
+		if event.EventType != gatekeeper.MergeOutcomeEventType {
+			continue
+		}
+		var outcome gatekeeper.MergeOutcome
+		if json.Unmarshal([]byte(event.PayloadJSON), &outcome) != nil || !outcome.Merged || outcome.ProjectID != projectID || !strings.EqualFold(outcome.Repo, repo) {
+			continue
+		}
+		createdAt, parseErr := time.Parse(time.RFC3339Nano, event.CreatedAt)
+		if parseErr == nil && (earliestMerge.IsZero() || createdAt.Before(earliestMerge)) {
+			earliestMerge = createdAt
+		}
+	}
+	if earliestMerge.IsZero() {
 		return false
 	}
 	for _, event := range events {
@@ -178,7 +222,7 @@ func auditorHasCleanBaseline(events []storage.EventLogRecord, projectID, repo, s
 			continue
 		}
 		createdAt, parseErr := time.Parse(time.RFC3339Nano, event.CreatedAt)
-		if parseErr == nil && !createdAt.Before(sinceTime) {
+		if parseErr == nil && !createdAt.Before(sinceTime) && createdAt.Before(earliestMerge) {
 			return true
 		}
 	}

@@ -74,7 +74,7 @@ func progressAuditorConfirmation(ctx context.Context, repos *storage.Repositorie
 			continue
 		}
 		if requestedAt, ok := auditorObservedRerun(checks, suiteID, observedAt); ok {
-			if err := appendAuditorRerunRequest(ctx, repos, project.ID, entityType, entityID, observationEvent.ID, repo, headSHA, suiteID, requestedAt, observation.FailedChecks, observation.FailingPaths); err != nil {
+			if err := appendAuditorRerunRequest(ctx, repos, project.ID, entityType, entityID, observationEvent.ID, repo, headSHA, suiteID, requestedAt, observation.FailedChecks, observation.FailingPaths, observation.FailingPathsByCheck); err != nil {
 				return err
 			}
 			return nil
@@ -83,7 +83,7 @@ func progressAuditorConfirmation(ctx context.Context, repos *storage.Repositorie
 		if err := gateway.RerequestCheckSuite(ctx, githubinfra.RerequestCheckSuiteInput{Repo: repo, CheckSuiteID: suiteID, CWD: project.RepoPath}); err != nil {
 			return fmt.Errorf("auditor rerequest check suite %d: %w", suiteID, err)
 		}
-		if err := appendAuditorRerunRequest(ctx, repos, project.ID, entityType, entityID, observationEvent.ID, repo, headSHA, suiteID, requestedAt, observation.FailedChecks, observation.FailingPaths); err != nil {
+		if err := appendAuditorRerunRequest(ctx, repos, project.ID, entityType, entityID, observationEvent.ID, repo, headSHA, suiteID, requestedAt, observation.FailedChecks, observation.FailingPaths, observation.FailingPathsByCheck); err != nil {
 			return err
 		}
 		return nil
@@ -96,11 +96,11 @@ func progressAuditorConfirmation(ctx context.Context, repos *storage.Repositorie
 		}
 		return nil
 	}
-	rerunPaths, rerunPathsComplete := failedAuditorRerunPaths(ctx, gateway, repo, project.RepoPath, checks, requests)
+	rerunPaths, rerunPathsByCheck, rerunPathsComplete := failedAuditorRerunPathEvidence(ctx, gateway, repo, project.RepoPath, checks, requests)
 	if !observation.FailingPathEvidenceComplete || !rerunPathsComplete {
 		return appendAuditorConfirmation(ctx, repos, project.ID, entityType, entityID, observationEvent.ID, headSHA, auditor.ConfirmationResult{Outcome: auditor.ConfirmationInconclusive}, auditor.Decision{Action: auditor.ActionEscalate, Reason: "failure_path_evidence_incomplete"}, now())
 	}
-	confirmation := auditor.ConfirmFailure(auditor.ConfirmationInput{InitialFailedChecks: observation.FailedChecks, InitialFailedPaths: observation.FailingPaths, RerunCompleted: true, RerunFailedChecks: rerunFailedChecks, RerunFailedPaths: rerunPaths})
+	confirmation := auditor.ConfirmFailure(auditor.ConfirmationInput{InitialFailedChecks: observation.FailedChecks, InitialFailedPaths: observation.FailingPaths, InitialFailedPathsByCheck: observation.FailingPathsByCheck, RerunCompleted: true, RerunFailedChecks: rerunFailedChecks, RerunFailedPaths: rerunPaths, RerunFailedPathsByCheck: rerunPathsByCheck})
 	decision, err := auditorConfirmationDecision(ctx, repos.Events, project.ID, repo, observation, confirmation, role.WindowMinutes)
 	if err != nil {
 		return err
@@ -239,7 +239,7 @@ func auditorRerunTimedOut(requests map[int64]time.Time, now time.Time, timeout t
 	return true
 }
 
-func failedAuditorRerunPaths(ctx context.Context, gateway auditorGateway, repo, cwd string, checks githubinfra.PullRequestCheckRuns, requests map[int64]time.Time) ([]string, bool) {
+func failedAuditorRerunPathEvidence(ctx context.Context, gateway auditorGateway, repo, cwd string, checks githubinfra.PullRequestCheckRuns, requests map[int64]time.Time) ([]string, map[string][]string, bool) {
 	filtered := checks
 	filtered.CheckRuns = make([]githubinfra.PullRequestCheckRun, 0, len(checks.CheckRuns))
 	for _, check := range checks.CheckRuns {
@@ -248,7 +248,11 @@ func failedAuditorRerunPaths(ctx context.Context, gateway auditorGateway, repo, 
 			filtered.CheckRuns = append(filtered.CheckRuns, check)
 		}
 	}
-	return failedAuditorCheckPaths(ctx, gateway, repo, cwd, filtered)
+	paths, pathsByCheck, complete := failedAuditorCheckPathEvidence(ctx, gateway, repo, cwd, filtered)
+	if checks.TotalCount > len(checks.CheckRuns) || checks.StatusesTotalCount > len(checks.Statuses) {
+		complete = false
+	}
+	return paths, pathsByCheck, complete
 }
 
 func checkRunStartedAfter(check githubinfra.PullRequestCheckRun, requestedAt time.Time) bool {
@@ -292,12 +296,26 @@ func auditorConfirmationDecision(ctx context.Context, events *storage.EventsRepo
 			projectCandidates = append(projectCandidates, candidate)
 		}
 	}
-	attribution := auditor.Attribute(auditor.FailureEvidence{ObservedAt: observedAt, FailingPaths: observation.FailingPaths, BaselineKnown: observation.BaselineKnown, FailingPathEvidenceComplete: observation.FailingPathEvidenceComplete}, projectCandidates)
+	failingPaths := auditorPathsForChecks(observation.FailingPathsByCheck, confirmation.ConfirmedChecks)
+	if len(observation.FailingPathsByCheck) == 0 && len(observation.FailingPaths) > 0 {
+		return auditor.Decision{Action: auditor.ActionEscalate, Reason: "failure_path_evidence_incomplete"}, nil
+	}
+	attribution := auditor.Attribute(auditor.FailureEvidence{ObservedAt: observedAt, FailingPaths: failingPaths, BaselineKnown: observation.BaselineKnown, FailingPathEvidenceComplete: observation.FailingPathEvidenceComplete}, projectCandidates)
 	decision := auditor.Decide(confirmation, attribution)
 	if decision.Action != auditor.ActionProposeRevert || decision.Candidate == nil {
 		return decision, nil
 	}
 	candidate := decision.Candidate
+	mergeStrategy := strings.ToLower(strings.TrimSpace(candidate.MergeStrategy))
+	if mergeStrategy == "" {
+		return auditor.Decision{Action: auditor.ActionEscalate, Reason: "missing_merge_strategy_provenance"}, nil
+	}
+	if mergeStrategy == string(config.ReviewerAutoMergeStrategyRebase) {
+		return auditor.Decision{Action: auditor.ActionEscalate, Reason: "rebase_merge_not_revertable"}, nil
+	}
+	if mergeStrategy != string(config.ReviewerAutoMergeStrategySquash) && mergeStrategy != string(config.ReviewerAutoMergeStrategyMerge) {
+		return auditor.Decision{Action: auditor.ActionEscalate, Reason: "unsupported_merge_strategy"}, nil
+	}
 	if strings.TrimSpace(candidate.MergeCommitSHA) == "" {
 		return auditor.Decision{Action: auditor.ActionEscalate, Reason: "missing_merge_commit_provenance"}, nil
 	}
@@ -307,10 +325,46 @@ func auditorConfirmationDecision(ctx context.Context, events *storage.EventsRepo
 	return decision, nil
 }
 
-func appendAuditorRerunRequest(ctx context.Context, repos *storage.Repositories, projectID, entityType, entityID, observationEventID, repo, headSHA string, suiteID int64, requestedAt time.Time, initialFailedChecks, initialFailedPaths []string) error {
+func cloneAuditorPathMap(paths map[string][]string) map[string][]string {
+	if len(paths) == 0 {
+		return nil
+	}
+	clone := make(map[string][]string, len(paths))
+	for check, values := range paths {
+		clone[check] = append([]string(nil), values...)
+	}
+	return clone
+}
+
+func auditorPathsForChecks(pathsByCheck map[string][]string, checks []string) []string {
+	if len(pathsByCheck) == 0 || len(checks) == 0 {
+		return nil
+	}
+	set := make(map[string]struct{})
+	for _, check := range checks {
+		for name, paths := range pathsByCheck {
+			if !strings.EqualFold(strings.TrimSpace(name), strings.TrimSpace(check)) {
+				continue
+			}
+			for _, path := range paths {
+				if path = strings.TrimSpace(path); path != "" {
+					set[path] = struct{}{}
+				}
+			}
+		}
+	}
+	result := make([]string, 0, len(set))
+	for path := range set {
+		result = append(result, path)
+	}
+	sort.Strings(result)
+	return result
+}
+
+func appendAuditorRerunRequest(ctx context.Context, repos *storage.Repositories, projectID, entityType, entityID, observationEventID, repo, headSHA string, suiteID int64, requestedAt time.Time, initialFailedChecks, initialFailedPaths []string, initialFailedPathsByCheck map[string][]string) error {
 	return eventlog.Append(ctx, repos, eventlog.AppendInput{
 		EventType: auditor.RerunRequestedEventType, ProjectID: &projectID, EntityType: &entityType, EntityID: &entityID, CausationID: &observationEventID,
-		Payload: auditor.RerunRequest{Version: 1, ObservationEventID: observationEventID, Repo: repo, HeadSHA: headSHA, CheckSuiteID: suiteID, InitialFailedChecks: append([]string(nil), initialFailedChecks...), InitialFailedPaths: append([]string(nil), initialFailedPaths...), RequestedAt: eventlog.FormatJavaScriptISOString(requestedAt)}, CreatedAt: requestedAt,
+		Payload: auditor.RerunRequest{Version: 1, ObservationEventID: observationEventID, Repo: repo, HeadSHA: headSHA, CheckSuiteID: suiteID, InitialFailedChecks: append([]string(nil), initialFailedChecks...), InitialFailedPaths: append([]string(nil), initialFailedPaths...), InitialFailedPathsByCheck: cloneAuditorPathMap(initialFailedPathsByCheck), RequestedAt: eventlog.FormatJavaScriptISOString(requestedAt)}, CreatedAt: requestedAt,
 	})
 }
 
@@ -326,5 +380,5 @@ func confirmedAuditorCandidate(decision auditor.Decision) *auditor.ConfirmedCand
 	if decision.Action != auditor.ActionProposeRevert || decision.Candidate == nil || decision.Candidate.SourceIssue == nil {
 		return nil
 	}
-	return &auditor.ConfirmedCandidate{PRNumber: decision.Candidate.PRNumber, MergeCommitSHA: decision.Candidate.MergeCommitSHA, SourceIssueNumber: decision.Candidate.SourceIssue.Number, SourceIssueRepo: decision.Candidate.SourceIssue.Repo}
+	return &auditor.ConfirmedCandidate{PRNumber: decision.Candidate.PRNumber, MergeCommitSHA: decision.Candidate.MergeCommitSHA, MergeStrategy: decision.Candidate.MergeStrategy, SourceIssueNumber: decision.Candidate.SourceIssue.Number, SourceIssueRepo: decision.Candidate.SourceIssue.Repo}
 }
