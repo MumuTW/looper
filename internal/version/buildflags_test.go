@@ -110,7 +110,7 @@ func TestLDFlagsMatchesVersionVariables(t *testing.T) {
 func TestModulePathMigration(t *testing.T) {
 	const (
 		modulePath       = "github.com/MumuTW/looper"
-		legacyModulePath = "github.com/MumuTW/looper"
+		legacyModulePath = "github.com/nexu-io/looper"
 	)
 
 	root := repoRoot(t)
@@ -182,9 +182,9 @@ func TestTrackedModulePathScanIgnoresUntrackedWorktrees(t *testing.T) {
 	t.Parallel()
 	root := initModulePathTestRepo(t)
 	writeModulePathTestFile(t, root, "tracked.go", "package tracked\n", true)
-	writeModulePathTestFile(t, root, filepath.Join(".worktrees", "stale", "legacy.go"), "package stale\nimport _ \"github.com/MumuTW/looper/internal/version\"\n", false)
+	writeModulePathTestFile(t, root, filepath.Join(".worktrees", "stale", "legacy.go"), "package stale\nimport _ \"github.com/nexu-io/looper/internal/version\"\n", false)
 
-	legacyImports, err := trackedLegacyModuleImports(root, "github.com/MumuTW/looper")
+	legacyImports, err := trackedLegacyModuleImports(root, "github.com/nexu-io/looper")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -196,9 +196,9 @@ func TestTrackedModulePathScanIgnoresUntrackedWorktrees(t *testing.T) {
 func TestTrackedModulePathScanFindsTrackedLegacyImport(t *testing.T) {
 	t.Parallel()
 	root := initModulePathTestRepo(t)
-	writeModulePathTestFile(t, root, "tracked.go", "package tracked\nimport _ \"github.com/MumuTW/looper/internal/version\"\n", true)
+	writeModulePathTestFile(t, root, "tracked.go", "package tracked\nimport _ \"github.com/nexu-io/looper/internal/version\"\n", true)
 
-	legacyImports, err := trackedLegacyModuleImports(root, "github.com/MumuTW/looper")
+	legacyImports, err := trackedLegacyModuleImports(root, "github.com/nexu-io/looper")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -211,12 +211,12 @@ func TestTrackedModulePathScanSkipsUnstagedDeletedFiles(t *testing.T) {
 	t.Parallel()
 	root := initModulePathTestRepo(t)
 	writeModulePathTestFile(t, root, "tracked.go", "package tracked\n", true)
-	writeModulePathTestFile(t, root, "deleted.go", "package deleted\nimport _ \"github.com/MumuTW/looper/internal/version\"\n", true)
+	writeModulePathTestFile(t, root, "deleted.go", "package deleted\nimport _ \"github.com/nexu-io/looper/internal/version\"\n", true)
 	if err := os.Remove(filepath.Join(root, "deleted.go")); err != nil {
 		t.Fatalf("remove deleted.go: %v", err)
 	}
 
-	legacyImports, err := trackedLegacyModuleImports(root, "github.com/MumuTW/looper")
+	legacyImports, err := trackedLegacyModuleImports(root, "github.com/nexu-io/looper")
 	if err != nil {
 		t.Fatal(err)
 	}
