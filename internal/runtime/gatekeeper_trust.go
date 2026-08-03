@@ -33,16 +33,33 @@ func gatekeeperTrustForProject(cfg config.Config, projectID string) config.Gatek
 	return config.GatekeeperTrustLevel(strings.ToLower(strings.TrimSpace(string(trust))))
 }
 
-func gatekeeperRequiredReviewChangedLinesForProject(cfg config.Config, projectID string) int {
-	threshold := cfg.Roles.Gatekeeper.RequiredReviewChangedLines
+// gatekeeperDiffBudgetForProject resolves only the small project override used
+// by the Gatekeeper lane, avoiding a full ProjectRoleConfigs registry clone on
+// every pull request.
+//
+// Project IDs are matched by exact equality, matching runtimeProjectBinding and
+// config.ProjectRoleConfigs: a case-insensitive or trimmed comparison can select
+// the wrong project's budget when two configured IDs differ only by case or
+// surrounding whitespace, letting Gatekeeper apply limits that belong to another
+// project.
+func gatekeeperDiffBudgetForProject(cfg config.Config, projectID string) config.GatekeeperDiffBudget {
+	var budget config.GatekeeperDiffBudget
+	if cfg.Roles.Gatekeeper.DiffBudget != nil {
+		budget = *cfg.Roles.Gatekeeper.DiffBudget
+	}
 	for _, project := range cfg.Projects {
-		if !strings.EqualFold(strings.TrimSpace(project.ID), strings.TrimSpace(projectID)) {
+		if project.ID != projectID {
 			continue
 		}
-		if project.Roles != nil && project.Roles.Gatekeeper != nil && project.Roles.Gatekeeper.RequiredReviewChangedLines != nil {
-			threshold = *project.Roles.Gatekeeper.RequiredReviewChangedLines
+		if project.Roles != nil && project.Roles.Gatekeeper != nil && project.Roles.Gatekeeper.DiffBudget != nil {
+			if project.Roles.Gatekeeper.DiffBudget.MaxChangedFiles != nil {
+				budget.MaxChangedFiles = *project.Roles.Gatekeeper.DiffBudget.MaxChangedFiles
+			}
+			if project.Roles.Gatekeeper.DiffBudget.MaxDeletions != nil {
+				budget.MaxDeletions = *project.Roles.Gatekeeper.DiffBudget.MaxDeletions
+			}
 		}
 		break
 	}
-	return threshold
+	return budget
 }

@@ -292,7 +292,7 @@ func (a reviewerIntegrationGatewayAdapter) FindReviewMarker(ctx context.Context,
 	if err != nil {
 		return ReviewMarkerResult{}, err
 	}
-	return ReviewMarkerResult{Found: found.Found, Outcome: found.Outcome, Event: ReviewEvent(found.Event), AuthorLogin: found.AuthorLogin, ReviewID: found.ReviewID, Body: found.Body, InlineCommentBodies: append([]string(nil), found.InlineCommentBodies...)}, nil
+	return ReviewMarkerResult{Found: found.Found, Outcome: found.Outcome, Event: ReviewEvent(found.Event), AuthorLogin: found.AuthorLogin, Body: found.Body, InlineCommentBodies: append([]string(nil), found.InlineCommentBodies...)}, nil
 }
 
 func (a reviewerIntegrationGatewayAdapter) CreateIssueComment(ctx context.Context, input IssueCommentInput) (IssueCommentResult, error) {

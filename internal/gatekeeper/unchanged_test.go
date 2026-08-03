@@ -5,9 +5,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nexu-io/looper/internal/config"
-	githubinfra "github.com/nexu-io/looper/internal/infra/github"
-	"github.com/nexu-io/looper/internal/labels"
+	"github.com/MumuTW/looper/internal/config"
+	githubinfra "github.com/MumuTW/looper/internal/infra/github"
+	"github.com/MumuTW/looper/internal/labels"
 )
 
 func openPullRequestFixture() githubinfra.PullRequestSummary {
@@ -87,37 +87,6 @@ func TestDiscoverPullRequestsReevaluatesWhenTheListPageChanges(t *testing.T) {
 					testCase.name, second.Evaluated, second.Skipped)
 			}
 		})
-	}
-}
-
-func TestDiscoverPullRequestsReevaluatesWhenReviewThresholdChanges(t *testing.T) {
-	fixture := newGatekeeperFixture(t)
-	fixture.github.openPullRequests = []githubinfra.PullRequestSummary{openPullRequestFixture()}
-	threshold := DefaultRequiredReviewChangedLines
-	runner := New(Options{
-		Repos: fixture.repos, GitHub: fixture.github, Now: func() time.Time { return fixture.now },
-		PolicyPermitsTarget: func(string, string, string) bool { return fixture.policyPermits },
-		TrustForProject:     func(string) config.GatekeeperTrustLevel { return config.GatekeeperTrustAuto },
-		RequiredReviewChangedLinesForProject: func(string) int {
-			return threshold
-		},
-	})
-	discoverWithRunner := func() DiscoveryResult {
-		result, err := runner.DiscoverPullRequests(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
-		if err != nil {
-			t.Fatalf("DiscoverPullRequests() error = %v", err)
-		}
-		return result
-	}
-
-	first := discoverWithRunner()
-	if first.Evaluated != 1 || first.Skipped != 0 {
-		t.Fatalf("first tick = %d evaluated / %d skipped, want 1 / 0", first.Evaluated, first.Skipped)
-	}
-	threshold = DefaultRequiredReviewChangedLines - 1
-	second := discoverWithRunner()
-	if second.Evaluated != 1 || second.Skipped != 0 {
-		t.Fatalf("after threshold reload = %d evaluated / %d skipped, want 1 / 0", second.Evaluated, second.Skipped)
 	}
 }
 
