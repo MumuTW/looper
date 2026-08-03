@@ -295,6 +295,144 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	requestHandler.serveHTTP(w, r)
 }
 
+// exactRoute is one entry in the exact-path routing table.
+type exactRoute struct {
+	path    string
+	method  string // Empty string means any method; handler validates internally.
+	handler func(h *Handler, r *http.Request) (any, error)
+}
+
+// prefixRoute is one entry in the prefix-path routing table, checked in order
+// after exact routes fail. Order matters: /runs/active/ must precede /runs/.
+type prefixRoute struct {
+	prefix  string
+	handler func(h *Handler, w http.ResponseWriter, r *http.Request, path, requestID string)
+}
+
+var exactRoutes = []exactRoute{
+	{apiBasePath + "/healthz", http.MethodGet, func(h *Handler, r *http.Request) (any, error) {
+		return h.buildHealthResponse(r.Context())
+	}},
+	{apiBasePath + "/status", http.MethodGet, func(h *Handler, r *http.Request) (any, error) {
+		return h.buildStatusResponse(r.Context())
+	}},
+	{apiBasePath + "/version", http.MethodGet, func(h *Handler, r *http.Request) (any, error) {
+		return h.buildVersionResponse(), nil
+	}},
+	{apiBasePath + "/agent/providers/discovery", http.MethodGet, func(h *Handler, r *http.Request) (any, error) {
+		if h.context.DiscoverAgentProviders == nil {
+			return nil, apiError{code: pkgapi.ErrorCodeServiceUnavailable, status: http.StatusServiceUnavailable, message: "Agent provider discovery is unavailable"}
+		}
+		report, err := h.context.DiscoverAgentProviders(r.Context(), h.context.Config)
+		if err != nil {
+			return nil, err
+		}
+		report.ConfigRevision = h.buildConfigMetadata().Revision
+		return report, nil
+	}},
+	{apiBasePath + "/webhook/status", http.MethodGet, func(h *Handler, r *http.Request) (any, error) {
+		return h.buildWebhookStatusResponse(), nil
+	}},
+	{apiBasePath + "/post-merge-digest", http.MethodGet, func(h *Handler, r *http.Request) (any, error) {
+		return h.buildPostMergeDigestResponse(r.Context())
+	}},
+	{apiBasePath + "/events", "", func(h *Handler, r *http.Request) (any, error) {
+		return h.buildEventsRouteResponse(r)
+	}},
+	{apiBasePath + "/pull-requests", "", func(h *Handler, r *http.Request) (any, error) {
+		return h.buildPullRequestsRouteResponse(r)
+	}},
+	{apiBasePath + "/projects", "", func(h *Handler, r *http.Request) (any, error) {
+		return h.buildProjectsRouteResponse(r)
+	}},
+	{apiBasePath + "/loops", "", func(h *Handler, r *http.Request) (any, error) {
+		return h.buildLoopsRouteResponse(r)
+	}},
+	{apiBasePath + "/workers", "", func(h *Handler, r *http.Request) (any, error) {
+		return h.buildWorkersCreateResponse(r)
+	}},
+	{apiBasePath + "/planners", "", func(h *Handler, r *http.Request) (any, error) {
+		return h.buildPlannersCreateResponse(r)
+	}},
+	{apiBasePath + "/runs", "", func(h *Handler, r *http.Request) (any, error) {
+		return h.buildRunsRouteResponse(r)
+	}},
+	{apiBasePath + "/runs/active", "", func(h *Handler, r *http.Request) (any, error) {
+		return h.buildActiveRunsResponse(r)
+	}},
+	{apiBasePath + "/gatekeeper/agreements", "", func(h *Handler, r *http.Request) (any, error) {
+		return h.buildGatekeeperAgreementsRouteResponse(r)
+	}},
+	{apiBasePath + "/gatekeeper/verdicts", "", func(h *Handler, r *http.Request) (any, error) {
+		return h.buildGatekeeperVerdictsRouteResponse(r)
+	}},
+	{apiBasePath + "/upgrade/backup", http.MethodPost, func(h *Handler, r *http.Request) (any, error) {
+		return h.createUpgradeBackup(r.Context())
+	}},
+	{apiBasePath + "/upgrade/drain", "", func(h *Handler, r *http.Request) (any, error) {
+		if r.Method != http.MethodGet && r.Method != http.MethodPost {
+			return nil, apiError{code: "method_not_allowed", status: http.StatusMethodNotAllowed, message: "Unsupported method for /api/v1/upgrade/drain"}
+		}
+		return h.upgradeDrainStatus(r.Method == http.MethodPost)
+	}},
+}
+
+var prefixRoutes = []prefixRoute{
+	{apiBasePath + "/loops/", func(h *Handler, w http.ResponseWriter, r *http.Request, path, requestID string) {
+		if isFollowLoopLogsRequest(r, path) {
+			if err := h.streamLoopLogsRoute(w, r, path, requestID); err != nil {
+				var typed apiError
+				if !asAPIError(err, &typed) {
+					typed = internalServerError(err)
+				}
+				h.writeError(w, requestID, typed)
+			}
+			return
+		}
+		h.dispatchRoute(w, requestID, func() (any, error) {
+			return h.buildLoopRouteResponse(r, path)
+		})
+	}},
+	{apiBasePath + "/projects/", func(h *Handler, w http.ResponseWriter, r *http.Request, path, requestID string) {
+		h.dispatchRoute(w, requestID, func() (any, error) {
+			return h.buildProjectRouteResponse(r, path)
+		})
+	}},
+	{apiBasePath + "/events/", func(h *Handler, w http.ResponseWriter, r *http.Request, path, requestID string) {
+		h.dispatchRoute(w, requestID, func() (any, error) {
+			return h.buildEntityEventsRouteResponse(r, path)
+		})
+	}},
+	{apiBasePath + "/pull-requests/", func(h *Handler, w http.ResponseWriter, r *http.Request, path, requestID string) {
+		h.dispatchRoute(w, requestID, func() (any, error) {
+			return h.buildPullRequestRouteResponse(r, path)
+		})
+	}},
+	{apiBasePath + "/runs/active/", func(h *Handler, w http.ResponseWriter, r *http.Request, path, requestID string) {
+		h.dispatchRoute(w, requestID, func() (any, error) {
+			return h.buildActiveRunRouteResponse(r, path)
+		})
+	}},
+	{apiBasePath + "/runs/", func(h *Handler, w http.ResponseWriter, r *http.Request, path, requestID string) {
+		h.dispatchRoute(w, requestID, func() (any, error) {
+			return h.buildRunRouteResponse(r, path)
+		})
+	}},
+}
+
+func (h *Handler) dispatchRoute(w http.ResponseWriter, requestID string, handler func() (any, error)) {
+	payload, err := handler()
+	if err != nil {
+		var typed apiError
+		if !asAPIError(err, &typed) {
+			typed = internalServerError(err)
+		}
+		h.writeError(w, requestID, typed)
+		return
+	}
+	h.writeSuccess(w, requestID, payload)
+}
+
 func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	path := normalizePath(r.URL.Path)
 	requestID := strings.TrimSpace(r.Header.Get(requestIDHeaderName))
@@ -329,6 +467,7 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Special-cased handlers that cannot use the generic route path.
 	// The hypermedia UI answers in HTML, so it is dispatched before the JSON
 	// route table — but only after the same authorization every JSON read runs.
 	if isWebUIPath(path) {
@@ -355,292 +494,26 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		h.writeJSON(w, http.StatusAccepted, pkgapi.Success(requestID, payload))
 		return
-	case apiBasePath + "/healthz":
-		if !assertMethod(r.Method, http.MethodGet, path, w, requestID, h.writeError) {
-			return
-		}
-
-		payload, err := h.buildHealthResponse(r.Context())
-		if err != nil {
-			h.writeError(w, requestID, internalServerError(err))
-			return
-		}
-
-		h.writeSuccess(w, requestID, payload)
-		return
-	case apiBasePath + "/status":
-		if !assertMethod(r.Method, http.MethodGet, path, w, requestID, h.writeError) {
-			return
-		}
-
-		payload, err := h.buildStatusResponse(r.Context())
-		if err != nil {
-			h.writeError(w, requestID, internalServerError(err))
-			return
-		}
-
-		h.writeSuccess(w, requestID, payload)
-		return
-	case apiBasePath + "/version":
-		if !assertMethod(r.Method, http.MethodGet, path, w, requestID, h.writeError) {
-			return
-		}
-
-		h.writeSuccess(w, requestID, h.buildVersionResponse())
-		return
-	case apiBasePath + "/upgrade/backup":
-		if !assertMethod(r.Method, http.MethodPost, path, w, requestID, h.writeError) {
-			return
-		}
-		result, err := h.createUpgradeBackup(r.Context())
-		if err != nil {
-			h.writeError(w, requestID, internalServerError(err))
-			return
-		}
-		h.writeSuccess(w, requestID, result)
-		return
-	case apiBasePath + "/upgrade/drain":
-		if r.Method != http.MethodGet && r.Method != http.MethodPost {
-			h.writeError(w, requestID, apiError{code: "method_not_allowed", status: http.StatusMethodNotAllowed, message: "Unsupported method for /api/v1/upgrade/drain"})
-			return
-		}
-		result, err := h.upgradeDrainStatus(r.Method == http.MethodPost)
-		if err != nil {
-			var typed apiError
-			if !asAPIError(err, &typed) {
-				typed = internalServerError(err)
-			}
-			h.writeError(w, requestID, typed)
-			return
-		}
-		h.writeSuccess(w, requestID, result)
-		return
 	case apiBasePath + "/config":
 		h.handleConfigRoute(w, r, requestID)
 		return
-	case apiBasePath + "/agent/providers/discovery":
-		if !assertMethod(r.Method, http.MethodGet, path, w, requestID, h.writeError) {
-			return
-		}
-		if h.context.DiscoverAgentProviders == nil {
-			h.writeError(w, requestID, apiError{code: pkgapi.ErrorCodeServiceUnavailable, status: http.StatusServiceUnavailable, message: "Agent provider discovery is unavailable"})
-			return
-		}
-		report, err := h.context.DiscoverAgentProviders(r.Context(), h.context.Config)
-		if err != nil {
-			h.writeError(w, requestID, internalServerError(err))
-			return
-		}
-		report.ConfigRevision = h.buildConfigMetadata().Revision
-		h.writeSuccess(w, requestID, report)
-		return
-	case apiBasePath + "/webhook/status":
-		if !assertMethod(r.Method, http.MethodGet, path, w, requestID, h.writeError) {
-			return
-		}
+	}
 
-		h.writeSuccess(w, requestID, h.buildWebhookStatusResponse())
-		return
-	case apiBasePath + "/events":
-		payload, err := h.buildEventsRouteResponse(r)
-		if err != nil {
-			var typed apiError
-			if !asAPIError(err, &typed) {
-				typed = internalServerError(err)
-			}
-			h.writeError(w, requestID, typed)
+	for _, route := range exactRoutes {
+		if path != route.path {
+			continue
+		}
+		if route.method != "" && !assertMethod(r.Method, route.method, path, w, requestID, h.writeError) {
 			return
 		}
-
-		h.writeSuccess(w, requestID, payload)
-		return
-	case apiBasePath + "/post-merge-digest":
-		if !assertMethod(r.Method, http.MethodGet, path, w, requestID, h.writeError) {
-			return
-		}
-		payload, err := h.buildPostMergeDigestResponse(r.Context())
-		if err != nil {
-			h.writeError(w, requestID, internalServerError(err))
-			return
-		}
-		h.writeSuccess(w, requestID, payload)
-		return
-	case apiBasePath + "/gatekeeper/agreements":
-		payload, err := h.buildGatekeeperAgreementsRouteResponse(r)
-		if err != nil {
-			var typed apiError
-			if !asAPIError(err, &typed) {
-				typed = internalServerError(err)
-			}
-			h.writeError(w, requestID, typed)
-			return
-		}
-
-		h.writeSuccess(w, requestID, payload)
-		return
-	case apiBasePath + "/gatekeeper/verdicts":
-		payload, err := h.buildGatekeeperVerdictsRouteResponse(r)
-		if err != nil {
-			var typed apiError
-			if !asAPIError(err, &typed) {
-				typed = internalServerError(err)
-			}
-			h.writeError(w, requestID, typed)
-			return
-		}
-
-		h.writeSuccess(w, requestID, payload)
-		return
-	case apiBasePath + "/pull-requests":
-		payload, err := h.buildPullRequestsRouteResponse(r)
-		if err != nil {
-			var typed apiError
-			if !asAPIError(err, &typed) {
-				typed = internalServerError(err)
-			}
-			h.writeError(w, requestID, typed)
-			return
-		}
-
-		h.writeSuccess(w, requestID, payload)
-		return
-	case apiBasePath + "/projects":
-		payload, err := h.buildProjectsRouteResponse(r)
-		if err != nil {
-			var typed apiError
-			if !asAPIError(err, &typed) {
-				typed = internalServerError(err)
-			}
-			h.writeError(w, requestID, typed)
-			return
-		}
-
-		h.writeSuccess(w, requestID, payload)
-		return
-	case apiBasePath + "/loops":
-		payload, err := h.buildLoopsRouteResponse(r)
-		if err != nil {
-			var typed apiError
-			if !asAPIError(err, &typed) {
-				typed = internalServerError(err)
-			}
-			h.writeError(w, requestID, typed)
-			return
-		}
-
-		h.writeSuccess(w, requestID, payload)
-		return
-	case apiBasePath + "/workers":
-		payload, err := h.buildWorkersCreateResponse(r)
-		if err != nil {
-			var typed apiError
-			if !asAPIError(err, &typed) {
-				typed = internalServerError(err)
-			}
-			h.writeError(w, requestID, typed)
-			return
-		}
-
-		h.writeSuccess(w, requestID, payload)
-		return
-	case apiBasePath + "/planners":
-		payload, err := h.buildPlannersCreateResponse(r)
-		if err != nil {
-			var typed apiError
-			if !asAPIError(err, &typed) {
-				typed = internalServerError(err)
-			}
-			h.writeError(w, requestID, typed)
-			return
-		}
-
-		h.writeSuccess(w, requestID, payload)
-		return
-	case apiBasePath + "/runs":
-		payload, err := h.buildRunsRouteResponse(r)
-		if err != nil {
-			var typed apiError
-			if !asAPIError(err, &typed) {
-				typed = internalServerError(err)
-			}
-			h.writeError(w, requestID, typed)
-			return
-		}
-
-		h.writeSuccess(w, requestID, payload)
-		return
-	case apiBasePath + "/runs/active":
-		payload, err := h.buildActiveRunsResponse(r)
-		if err != nil {
-			var typed apiError
-			if !asAPIError(err, &typed) {
-				typed = internalServerError(err)
-			}
-			h.writeError(w, requestID, typed)
-			return
-		}
-
-		h.writeSuccess(w, requestID, payload)
+		h.dispatchRoute(w, requestID, func() (any, error) {
+			return route.handler(h, r)
+		})
 		return
 	}
 
 	if path == apiBasePath+"/hitl/feishu" {
 		h.handleFeishuCardActionRoute(w, r, requestID)
-		return
-	}
-
-	if strings.HasPrefix(path, apiBasePath+"/loops/") {
-		if isFollowLoopLogsRequest(r, path) {
-			if err := h.streamLoopLogsRoute(w, r, path, requestID); err != nil {
-				var typed apiError
-				if !asAPIError(err, &typed) {
-					typed = internalServerError(err)
-				}
-				h.writeError(w, requestID, typed)
-			}
-			return
-		}
-		payload, err := h.buildLoopRouteResponse(r, path)
-		if err != nil {
-			var typed apiError
-			if !asAPIError(err, &typed) {
-				typed = internalServerError(err)
-			}
-			h.writeError(w, requestID, typed)
-			return
-		}
-
-		h.writeSuccess(w, requestID, payload)
-		return
-	}
-
-	if strings.HasPrefix(path, apiBasePath+"/projects/") {
-		payload, err := h.buildProjectRouteResponse(r, path)
-		if err != nil {
-			var typed apiError
-			if !asAPIError(err, &typed) {
-				typed = internalServerError(err)
-			}
-			h.writeError(w, requestID, typed)
-			return
-		}
-
-		h.writeSuccess(w, requestID, payload)
-		return
-	}
-
-	if strings.HasPrefix(path, apiBasePath+"/events/") {
-		payload, err := h.buildEntityEventsRouteResponse(r, path)
-		if err != nil {
-			var typed apiError
-			if !asAPIError(err, &typed) {
-				typed = internalServerError(err)
-			}
-			h.writeError(w, requestID, typed)
-			return
-		}
-
-		h.writeSuccess(w, requestID, payload)
 		return
 	}
 
@@ -654,54 +527,15 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			h.writeError(w, requestID, typed)
 			return
 		}
-
 		h.writeSuccess(w, requestID, payload)
 		return
 	}
 
-	if strings.HasPrefix(path, apiBasePath+"/pull-requests/") {
-		payload, err := h.buildPullRequestRouteResponse(r, path)
-		if err != nil {
-			var typed apiError
-			if !asAPIError(err, &typed) {
-				typed = internalServerError(err)
-			}
-			h.writeError(w, requestID, typed)
+	for _, route := range prefixRoutes {
+		if strings.HasPrefix(path, route.prefix) {
+			route.handler(h, w, r, path, requestID)
 			return
 		}
-
-		h.writeSuccess(w, requestID, payload)
-		return
-	}
-
-	if strings.HasPrefix(path, apiBasePath+"/runs/active/") {
-		payload, err := h.buildActiveRunRouteResponse(r, path)
-		if err != nil {
-			var typed apiError
-			if !asAPIError(err, &typed) {
-				typed = internalServerError(err)
-			}
-			h.writeError(w, requestID, typed)
-			return
-		}
-
-		h.writeSuccess(w, requestID, payload)
-		return
-	}
-
-	if strings.HasPrefix(path, apiBasePath+"/runs/") {
-		payload, err := h.buildRunRouteResponse(r, path)
-		if err != nil {
-			var typed apiError
-			if !asAPIError(err, &typed) {
-				typed = internalServerError(err)
-			}
-			h.writeError(w, requestID, typed)
-			return
-		}
-
-		h.writeSuccess(w, requestID, payload)
-		return
 	}
 
 	h.writeError(w, requestID, apiError{
@@ -710,7 +544,6 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		message: fmt.Sprintf("Unknown route: %s", path),
 	})
 }
-
 func (h *Handler) buildWebhookForwardResponse(r *http.Request) (webhookforward.ForwardResult, error) {
 	if r.Method != http.MethodPost {
 		return webhookforward.ForwardResult{}, apiError{code: pkgapi.ErrorCodeMethodNotAllowed, status: http.StatusMethodNotAllowed, message: "Unsupported method for /webhook/forward"}
