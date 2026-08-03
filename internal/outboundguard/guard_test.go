@@ -16,6 +16,7 @@ func TestValidateRejectsUnsafeOutboundContentWithoutEchoingIt(t *testing.T) {
 		{name: "high-entropy assignment value", text: "FIXTURE_BLOB=q8Kz1Wm9P2vR7xL4nB6cD0fH3jS5uY+/", want: "high-entropy"},
 		{name: "high-entropy mixed-case assignment", text: "FIXTURE_BLOB=AbCdEfGhIjKlMnOpQrStUvWxYzAbCdEf", want: "high-entropy"},
 		{name: "high-entropy one-class assignment", text: "FIXTURE_BLOB=abcdefghijklmnopqrstuvwxyzabcdef", want: "high-entropy"},
+		{name: "high-entropy hexadecimal assignment", text: "FIXTURE_BLOB=0123456789abcdef0123456789abcdef", want: "high-entropy"},
 		// The '=' here is base64 padding, not an assignment separator: the
 		// identifier-shaped prefix must not split the token and let the value
 		// escape the entropy bar as "=" or "".

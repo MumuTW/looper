@@ -142,6 +142,100 @@ func TestHandleTerminalExhaustionEscalationRetriesNonGateFallbackFailure(t *test
 	}
 }
 
+// TestHandleTerminalExhaustionRegenerationSurvivesContentGateRejection covers
+// the normal close-and-regenerate path: a rejected detailed comment must get
+// one daemon-composed retry, then continue through the durable close and
+// Planner handoff checkpoints when that retry is accepted.
+func TestHandleTerminalExhaustionRegenerationSurvivesContentGateRejection(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	gateway := &regenerationFakeGateway{
+		fakeGitHubGateway: &fakeGitHubGateway{currentUser: "looper", viewResponses: []PullRequestDetail{{Number: 42, State: "OPEN", HeadRefName: "looper/fix-42", HeadSHA: "head-42"}}},
+		issue:             IssueDetail{Number: 7, Title: "Original issue", URL: "https://example.test/issues/7", State: "OPEN"},
+		commits:           []PullRequestCommit{{AuthorLogin: "looper", CommitterLogin: "looper"}},
+		commentErrs:       []error{contentGateRejection()},
+	}
+	routed := false
+	runner := newRegenerationRunner(t, fixture, gateway, func(_ context.Context, _ RegenerateIssueInput) error {
+		routed = true
+		return nil
+	})
+	loop, queue := setupRegenerationRecords(t, fixture)
+	project, _ := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	failure := &runpipe.LoopError{Message: "validation failed with secret-shaped context", Kind: runpipe.FailureRetryableTransient}
+
+	action, err := runner.handleTerminalExhaustion(context.Background(), *project, loop, queue, fixerCheckpoint{}, failure)
+	if err != nil {
+		t.Fatalf("handleTerminalExhaustion() error = %v, want close-and-regenerate to continue after the rejected comment", err)
+	}
+	if action != regenerationCompleted {
+		t.Fatalf("action = %q, want completed after fallback comment", action)
+	}
+	if !routed {
+		t.Fatal("Planner route was not called after the fallback comment")
+	}
+	if len(gateway.createIssueComments) != 2 {
+		t.Fatalf("comment attempts = %d, want the rejected original plus the fallback", len(gateway.createIssueComments))
+	}
+	fallback := gateway.createIssueComments[1].Body
+	if !strings.Contains(fallback, regenerationCommentMarker) || !strings.Contains(fallback, "Failure context withheld") {
+		t.Fatalf("fallback body = %q, want the authority marker and withheld-context notice", fallback)
+	}
+	if strings.Contains(fallback, failure.Message) {
+		t.Fatalf("fallback body = %q, must not echo rejected failure context", fallback)
+	}
+	if len(gateway.closeCalls) != 1 {
+		t.Fatalf("close calls = %d, want one close after the fallback", len(gateway.closeCalls))
+	}
+
+	updated, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil || updated == nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	state, ok := parseRegenerationState(parseJSONObject(updated.MetadataJSON))
+	if !ok || !state.Commented || !state.Closed || !state.Routed {
+		t.Fatalf("regeneration state = %#v, want commented, closed, and routed", state)
+	}
+}
+
+// TestHandleTerminalExhaustionRegenerationCompletesWhenFallbackAlsoRejected
+// keeps a second content-gate rejection from turning the optional comment into
+// a lifecycle blocker. Close and Planner routing remain the durable authority.
+func TestHandleTerminalExhaustionRegenerationCompletesWhenFallbackAlsoRejected(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	gateway := &regenerationFakeGateway{
+		fakeGitHubGateway: &fakeGitHubGateway{currentUser: "looper", viewResponses: []PullRequestDetail{{Number: 42, State: "OPEN", HeadRefName: "looper/fix-42", HeadSHA: "head-42"}}},
+		issue:             IssueDetail{Number: 7, State: "OPEN"},
+		commits:           []PullRequestCommit{{AuthorLogin: "looper", CommitterLogin: "looper"}},
+		commentErrs:       []error{contentGateRejection(), contentGateRejection()},
+	}
+	runner := newRegenerationRunner(t, fixture, gateway, func(_ context.Context, _ RegenerateIssueInput) error { return nil })
+	loop, queue := setupRegenerationRecords(t, fixture)
+	project, _ := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+
+	action, err := runner.handleTerminalExhaustion(context.Background(), *project, loop, queue, fixerCheckpoint{}, &runpipe.LoopError{Message: "failed", Kind: runpipe.FailureRetryableTransient})
+	if err != nil {
+		t.Fatalf("handleTerminalExhaustion() error = %v, want lifecycle completion after both comment bodies are rejected", err)
+	}
+	if action != regenerationCompleted {
+		t.Fatalf("action = %q, want completed with the comment omitted", action)
+	}
+	if len(gateway.createIssueComments) != 2 {
+		t.Fatalf("comment attempts = %d, want the rejected original plus the rejected fallback", len(gateway.createIssueComments))
+	}
+	if len(gateway.closeCalls) != 1 {
+		t.Fatalf("close calls = %d, want one close after the rejected fallback", len(gateway.closeCalls))
+	}
+
+	updated, err := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err != nil || updated == nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	state, ok := parseRegenerationState(parseJSONObject(updated.MetadataJSON))
+	if !ok || !state.Commented || !state.Closed || !state.Routed {
+		t.Fatalf("regeneration state = %#v, want settled comment, closed, and routed checkpoints", state)
+	}
+}
+
 // TestHandleTerminalExhaustionEscalationDeduplicatesContextWithheldEventAcrossReplay
 // covers the unbounded-growth defect: when both comment bodies are rejected and
 // the subsequent label mutation fails, the handoff is requeued with Commented

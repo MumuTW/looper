@@ -129,20 +129,21 @@ func unsafeText(text string, highEntropyExemptions []string) string {
 		if gitObjectIDRE.MatchString(token) || uuidRE.MatchString(token) {
 			continue
 		}
-		// A NAME=value candidate is judged by its value: the NAME's letters
-		// otherwise inflate an innocuous value past the bar
-		// (fixItemsFingerprint=<sha1> is looper's own identifier format),
-		// and an exempt value stays exempt with or without a NAME= prefix.
+		// A NAME=value candidate with a Git object ID or UUID value is exempt;
+		// those are Looper's own durable identifier formats (for example,
+		// fixItemsFingerprint=<sha1>). Non-exempt assignments retain their
+		// NAME=value structure for the entropy check so long hexadecimal values
+		// cannot evade the bar by being judged as the value alone.
 		if value, isAssignment := assignmentValue(token); isAssignment {
 			if value == "" || gitObjectIDRE.MatchString(value) || uuidRE.MatchString(value) {
 				continue
 			}
-			// Keep the assignment separator as structural evidence without
-			// reintroducing the NAME's character distribution into the entropy
-			// calculation. Any high-entropy value with assignment structure is
-			// credential-shaped when it is published as NAME=value, including
-			// one-class values such as lowercase fixture blobs.
-			if characterClassCount(value) >= 1 && shannonEntropy(value) >= highEntropyThreshold {
+			// Preserve the assignment structure for non-exempt values. The
+			// separator/name is evidence that a high-entropy token is being
+			// published as a credential-shaped assignment; judging only the
+			// value lets long hexadecimal credentials fall below the entropy
+			// threshold even though the full assignment is secret-shaped.
+			if characterClassCount(token) >= 3 && shannonEntropy(token) >= highEntropyThreshold {
 				return "contains a high-entropy credential-shaped token"
 			}
 			continue

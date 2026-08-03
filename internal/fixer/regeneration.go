@@ -257,10 +257,38 @@ func (r *Runner) handleTerminalExhaustion(ctx context.Context, project storage.P
 			DisclosureModel: derefString(r.agentModel),
 		})
 		if err != nil {
-			return regenerationNone, fmt.Errorf("comment exhausted fixer PR: %w", err)
+			if !outboundguard.IsRejection(err) {
+				return regenerationNone, fmt.Errorf("comment exhausted fixer PR: %w", err)
+			}
+			// The original body includes durable failure context and can be
+			// deterministically rejected by the outbound gate. Retry once with
+			// daemon-composed metadata only; a transport/forge error remains
+			// retryable, while a second gate rejection settles the optional
+			// comment step so close-and-regenerate can still make progress.
+			fallback := buildRegenerationCommentWithoutFailureContext(state.Authority, queueItem, current, checkpoint, originRepo, originNumber, issue.URL)
+			fallbackComment, fallbackErr := r.github.CreateIssueComment(ctx, IssueCommentInput{
+				Repo:            derefString(queueItem.Repo),
+				IssueNumber:     derefInt64(queueItem.PRNumber),
+				Body:            fallback,
+				CWD:             project.RepoPath,
+				DisclosureAgent: r.agentRuntime,
+				DisclosureModel: derefString(r.agentModel),
+			})
+			if fallbackErr != nil {
+				if !outboundguard.IsRejection(fallbackErr) {
+					return regenerationNone, fmt.Errorf("comment exhausted fixer PR fallback: %w", fallbackErr)
+				}
+				r.logWarn("fixer regeneration comment withheld by content safety gate", map[string]any{"loopId": current.ID, "repo": derefString(queueItem.Repo), "prNumber": queueItem.PRNumber, "error": fallbackErr.Error()})
+				// Commented means the optional publication step is settled; the
+				// durable close/route checkpoints remain the lifecycle authority.
+				state.Commented = true
+			} else {
+				state.CommentID, state.Commented = fallbackComment.ID, true
+			}
+		} else {
+			state.CommentID = comment.ID
+			state.Commented = true
 		}
-		state.CommentID = comment.ID
-		state.Commented = true
 		updated, err := r.mergeLoopMetadata(ctx, current, map[string]any{"fixerRegeneration": state})
 		if err != nil {
 			return regenerationNone, err
@@ -585,6 +613,18 @@ func buildRegenerationComment(authority string, queueItem storage.QueueItemRecor
 		issueRef = " (" + strings.TrimSpace(issueURL) + ")"
 	}
 	return fmt.Sprintf("%s authority=%s -->\n\nFixer exhausted its retry budget and will close this PR before returning the originating issue to Planner.\n\n- Attempts: %d/%d\n- Failure: %s\n- Failure kind: %s\n- Head fingerprint: `%s`\n- Fix-items fingerprint: `%s`\n- Originating issue: %s#%d%s\n- Loop: `%s`", regenerationCommentMarker, authority, queueItem.Attempts, queueItem.MaxAttempts, strings.TrimSpace(failure.Message), failure.Kind, detailHeadSHA(checkpoint.Detail), hashFixItemsState(checkpoint.FixItems), issueRepo, issueNumber, issueRef, loop.ID)
+}
+
+// buildRegenerationCommentWithoutFailureContext keeps the normal close-and-
+// regenerate path useful when the original body is rejected by the outbound
+// safety gate. It carries only daemon-composed fingerprints and routing
+// identity; the durable failure context remains in loop metadata.
+func buildRegenerationCommentWithoutFailureContext(authority string, queueItem storage.QueueItemRecord, loop storage.LoopRecord, checkpoint fixerCheckpoint, issueRepo string, issueNumber int64, issueURL string) string {
+	issueRef := ""
+	if strings.TrimSpace(issueURL) != "" {
+		issueRef = fmt.Sprintf(" (%s)", strings.TrimSpace(issueURL))
+	}
+	return fmt.Sprintf("%s authority=%s -->\n\nFixer exhausted its retry budget and will close this PR before returning the originating issue to Planner.\n\n- Attempts: %d/%d\n- Failure context withheld: the outbound content safety gate rejected the detailed body; inspect the loop's local metadata for the recorded failure.\n- Head fingerprint: `%s`\n- Fix-items fingerprint: `%s`\n- Originating issue: %s#%d%s\n- Loop: `%s`", regenerationCommentMarker, authority, queueItem.Attempts, queueItem.MaxAttempts, detailHeadSHA(checkpoint.Detail), hashFixItemsState(checkpoint.FixItems), issueRepo, issueNumber, issueRef, loop.ID)
 }
 
 func (r *Runner) markRegeneratedLoopFailed(ctx context.Context, loop storage.LoopRecord) (storage.LoopRecord, error) {
