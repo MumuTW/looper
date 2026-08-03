@@ -247,19 +247,6 @@ type parsedArgs struct {
 // Value consumption matches config.parseCLIArgs: `--flag=value` inline, else
 // the next argument unless it starts with `--`. The two parsers must agree,
 // because a value this one skips is a value LoadFile still reads.
-
-// verbOwnsFlags reports verbs whose dash arguments are owned by the verb
-// parser rather than the global flag set. splitGlobalFlags must leave those
-// flags in Operands so the verb-specific parser can accept them.
-func verbOwnsFlags(verb string) bool {
-	switch verb {
-	case "review", "retry", "version", "--version", "upgrade":
-		return true
-	default:
-		return false
-	}
-}
-
 func splitGlobalFlags(args []string) (parsedArgs, error) {
 	parsed := parsedArgs{}
 
@@ -296,9 +283,7 @@ func splitGlobalFlags(args []string) (parsedArgs, error) {
 			parsed.Verb = arg
 			continue
 		}
-		// review/retry/version/upgrade own flags after the verb; splitGlobalFlags
-		// must not reject them before the verb-specific parser runs.
-		if strings.HasPrefix(arg, "-") && arg != "-" && !verbOwnsFlags(parsed.Verb) {
+		if strings.HasPrefix(arg, "-") && arg != "-" && parsed.Verb != "review" && parsed.Verb != "retry" && parsed.Verb != "version" && parsed.Verb != "--version" && parsed.Verb != "provider" {
 			return parsedArgs{}, fmt.Errorf("unknown flag %q", name)
 		}
 		if parsed.Verb == "" {
@@ -1629,20 +1614,10 @@ Usage:
   looper version --json        Print the complete local build identity
   looper version --check-daemon
                                Compare local and running-daemon build identity
-  looper upgrade preflight --target-looper <path> --target-looperd <path> [--json]
+  looper upgrade preflight --target-looper <path> --target-looperd <path>
                                Report upgrade compatibility without changing the daemon
-  looper upgrade backup        Create a daemon-owned rollback bundle
-  looper upgrade verify --bundle <dir>
-                               Verify a rollback bundle offline (fail-closed)
-  looper upgrade drain --deadline <duration>
-                               Close admission and wait for in-flight supervisor work
-  looper upgrade stage-release --release-root <dir> --target-looper <path> --target-looperd <path>
-  looper upgrade activate-release --release-root <dir> --release <id>
-  looper upgrade verify-start --release-root <dir> --release <id> --bundle <dir>
-                               Post-start cutover verify (requires held admission + rollback bundle)
-  looper upgrade restore-preflight --bundle <dir>
-  looper upgrade restore --bundle <dir> --confirm
-                               Matching rollback restore after failed cutover
+  looper upgrade backup / verify / drain / stage-release / activate-release / verify-start
+                               Controlled cutover steps (see docs/installation.md)
 
 Global flags, accepted before or after the verb:
   --config <path>              Config file to load

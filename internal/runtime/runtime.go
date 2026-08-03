@@ -208,6 +208,7 @@ type Runtime struct {
 	schedulerClaimWake          chan struct{}
 	schedulerCancel             context.CancelFunc
 	schedulerTasks              *schedulerTaskTracker
+	hostAdmission               *hostAdmissionGate
 	worktreeCleanupStop         chan struct{}
 	worktreeCleanupDone         chan struct{}
 	worktreeCleanupWake         chan struct{}
