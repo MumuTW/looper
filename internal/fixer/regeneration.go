@@ -53,20 +53,21 @@ func (e *RegenerationPermanentRejectionError) Error() string {
 // field is written after its remote action, so a crash can replay only the
 // missing suffix of comment -> close -> Planner route.
 type fixerRegenerationState struct {
-	Authority      string `json:"authority,omitempty"`
-	IssueRepo      string `json:"issueRepo,omitempty"`
-	IssueNumber    int64  `json:"issueNumber,omitempty"`
-	CommentID      int64  `json:"commentId,omitempty"`
-	Commented      bool   `json:"commented,omitempty"`
-	Closed         bool   `json:"closed,omitempty"`
-	Routed         bool   `json:"routed,omitempty"`
-	Escalated      bool   `json:"escalated,omitempty"`
-	EscalationWhy  string `json:"escalationWhy,omitempty"`
-	FailureSummary string `json:"failureSummary,omitempty"`
-	FailureKind    string `json:"failureKind,omitempty"`
-	Attempts       int64  `json:"attempts,omitempty"`
-	MaxAttempts    int64  `json:"maxAttempts,omitempty"`
-	FailureContext string `json:"failureContext,omitempty"`
+	Authority       string `json:"authority,omitempty"`
+	IssueRepo       string `json:"issueRepo,omitempty"`
+	IssueNumber     int64  `json:"issueNumber,omitempty"`
+	CommentID       int64  `json:"commentId,omitempty"`
+	Commented       bool   `json:"commented,omitempty"`
+	Closed          bool   `json:"closed,omitempty"`
+	Routed          bool   `json:"routed,omitempty"`
+	Escalated       bool   `json:"escalated,omitempty"`
+	EscalationWhy   string `json:"escalationWhy,omitempty"`
+	ContextWithheld bool   `json:"contextWithheld,omitempty"`
+	FailureSummary  string `json:"failureSummary,omitempty"`
+	FailureKind     string `json:"failureKind,omitempty"`
+	Attempts        int64  `json:"attempts,omitempty"`
+	MaxAttempts     int64  `json:"maxAttempts,omitempty"`
+	FailureContext  string `json:"failureContext,omitempty"`
 }
 
 func parseRegenerationState(metadata map[string]any) (fixerRegenerationState, bool) {
@@ -422,6 +423,12 @@ func (r *Runner) persistRegenerationEscalation(ctx context.Context, loop storage
 // lands: a content rejection defers the explanation, never the escalation
 // itself. Any other failure (forge outage, transport error) is returned so the
 // run is retried instead of silently dropping the comment.
+//
+// The context-withheld event is gated on the durable ContextWithheld flag so a
+// replay that re-enters this branch (the downstream label mutation or final
+// metadata checkpoint failed, leaving Commented/Escalated false) cannot append
+// the same event on every attempt — the flag is checkpointed by the caller
+// alongside Commented, so only the first rejection records it.
 func (r *Runner) escalateWithoutFailureContext(ctx context.Context, loop storage.LoopRecord, state fixerRegenerationState, prNumber int64, repo, cwd, reason string) (fixerRegenerationState, error) {
 	fallback := fmt.Sprintf("%s\n\nFixer stopped automatic close-and-regenerate because: %s\nThe PR remains open for human review.\n\nFailure context withheld: the outbound content safety gate rejected it. Inspect the loop's local metadata for the recorded failure details.", regenerationCommentMarker+" authority="+state.Authority+" outcome=escalated -->", reason)
 	comment, err := r.github.CreateIssueComment(ctx, IssueCommentInput{Repo: repo, IssueNumber: prNumber, Body: fallback, CWD: cwd, DisclosureAgent: r.agentRuntime, DisclosureModel: derefString(r.agentModel)})
@@ -432,8 +439,11 @@ func (r *Runner) escalateWithoutFailureContext(ctx context.Context, loop storage
 	if !outboundguard.IsRejection(err) {
 		return state, fmt.Errorf("post withheld-context escalation comment: %w", err)
 	}
-	r.logWarn("fixer escalation comment withheld by content safety gate", map[string]any{"loopId": loop.ID, "repo": repo, "prNumber": prNumber, "error": err.Error()})
-	r.appendEvent(ctx, eventInput{eventType: "fixer.escalation.context_withheld", projectID: loop.ProjectID, loopID: loop.ID, entityType: "loop", entityID: loop.ID, payload: map[string]any{"repo": repo, "prNumber": prNumber, "reason": reason}})
+	if !state.ContextWithheld {
+		r.logWarn("fixer escalation comment withheld by content safety gate", map[string]any{"loopId": loop.ID, "repo": repo, "prNumber": prNumber, "error": err.Error()})
+		r.appendEvent(ctx, eventInput{eventType: "fixer.escalation.context_withheld", projectID: loop.ProjectID, loopID: loop.ID, entityType: "loop", entityID: loop.ID, payload: map[string]any{"repo": repo, "prNumber": prNumber, "reason": reason}})
+		state.ContextWithheld = true
+	}
 	return state, nil
 }
 

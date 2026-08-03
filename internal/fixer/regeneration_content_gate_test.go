@@ -140,3 +140,65 @@ func TestHandleTerminalExhaustionEscalationRetriesNonGateFallbackFailure(t *test
 		t.Fatalf("regeneration state = %#v, want the loop left un-escalated for retry", state)
 	}
 }
+
+// TestHandleTerminalExhaustionEscalationDeduplicatesContextWithheldEventAcrossReplay
+// covers the unbounded-growth defect: when both comment bodies are rejected and
+// the subsequent label mutation fails, the handoff is requeued with Commented
+// and Escalated still false. Without deduplication every replay would re-enter
+// escalateWithoutFailureContext and append another fixer.escalation.context_withheld
+// event. The durable ContextWithheld flag, checkpointed alongside Commented,
+// ensures only the first rejection records the event.
+func TestHandleTerminalExhaustionEscalationDeduplicatesContextWithheldEventAcrossReplay(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	gateway := &regenerationFakeGateway{
+		fakeGitHubGateway: &fakeGitHubGateway{currentUser: "looper", viewResponses: []PullRequestDetail{{Number: 42, State: "OPEN", HeadRefName: "looper/fix-42", HeadSHA: "head-42"}}},
+		issue:             IssueDetail{Number: 7, State: "OPEN"},
+		commits:           []PullRequestCommit{{AuthorLogin: "alice", CommitterLogin: "alice"}},
+		commentErrs:       []error{contentGateRejection(), contentGateRejection()},
+		prLabelErr:        errors.New("label service outage"),
+	}
+	runner := newRegenerationRunner(t, fixture, gateway, func(_ context.Context, _ RegenerateIssueInput) error { return nil })
+	loop, queue := setupRegenerationRecords(t, fixture)
+	project, _ := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	failure := &runpipe.LoopError{Message: "failed", Kind: runpipe.FailureRetryableTransient}
+	ctx := context.Background()
+
+	// First attempt: both comment bodies are rejected, then the label mutation
+	// fails, so the escalation does not complete and the handoff is requeued.
+	if _, err := runner.handleTerminalExhaustion(ctx, *project, loop, queue, fixerCheckpoint{}, failure); err == nil {
+		t.Fatalf("first handleTerminalExhaustion() error = nil, want the label outage propagated for requeue")
+	}
+	withheldEvents := func() int {
+		events, err := fixture.repos.Events.ListByEntityAndEventTypes(ctx, "loop", loop.ID, []string{"fixer.escalation.context_withheld"})
+		if err != nil {
+			t.Fatalf("Events.ListByEntityAndEventTypes() error = %v", err)
+		}
+		return len(events)
+	}
+	if got := withheldEvents(); got != 1 {
+		t.Fatalf("context_withheld events after first attempt = %d, want exactly one", got)
+	}
+	updated, err := fixture.repos.Loops.GetByID(ctx, loop.ID)
+	if err != nil || updated == nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	state, ok := parseRegenerationState(parseJSONObject(updated.MetadataJSON))
+	if !ok || !state.ContextWithheld || state.Escalated {
+		t.Fatalf("regeneration state after first attempt = %#v, want ContextWithheld checkpointed and Escalated still false", state)
+	}
+
+	// Replay: the label service recovers, both comment bodies are still rejected.
+	// The ContextWithheld flag is durable, so the event must not be appended again.
+	gateway.prLabelErr = nil
+	gateway.commentErrs = []error{contentGateRejection(), contentGateRejection()}
+	action, err := runner.handleTerminalExhaustion(ctx, *project, loop, queue, fixerCheckpoint{}, failure)
+	if err != nil {
+		t.Fatalf("second handleTerminalExhaustion() error = %v, want the escalation to complete on replay", err)
+	}
+	if action != regenerationEscalated {
+		t.Fatalf("action = %q, want escalation completed on replay", action)
+	}
+	if got := withheldEvents(); got != 1 {
+		t.Fatalf("context_withheld events after replay = %d, want still one (deduplicated across replay)", got)
+	}
+}
