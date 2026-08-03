@@ -46,6 +46,17 @@ func TestGatekeeperTrustAcceptsAuto(t *testing.T) {
 	}
 }
 
+func TestGatekeeperTrustRejectsAutoWithReviewerNativeAutoMerge(t *testing.T) {
+	t.Parallel()
+	issues := gatekeeperIssues(Config{Roles: RoleConfigs{
+		Gatekeeper: GatekeeperRoleConfig{Trust: GatekeeperTrustAuto},
+		Reviewer:   ReviewerRoleConfig{AutoMerge: ReviewerAutoMergeConfig{Enabled: true}},
+	}})
+	if len(issues) != 1 || issues[0].Path != "roles.gatekeeper.trust" {
+		t.Fatalf("issues = %+v, want one merge-authority conflict", issues)
+	}
+}
+
 func TestGatekeeperTrustRejectsUnknownLevel(t *testing.T) {
 	t.Parallel()
 
@@ -56,7 +67,7 @@ func TestGatekeeperTrustRejectsUnknownLevel(t *testing.T) {
 	}
 }
 
-func TestGatekeeperTrustAcceptsProjectAutoOverride(t *testing.T) {
+func TestGatekeeperTrustRejectsProjectAutoOverrideWithReviewerAutoMerge(t *testing.T) {
 	t.Parallel()
 	auto := GatekeeperTrustAuto
 	cfg := Config{
@@ -70,10 +81,17 @@ func TestGatekeeperTrustAcceptsProjectAutoOverride(t *testing.T) {
 	var issues []ValidationIssue
 	validateCoreConfig(cfg, &issues)
 
+	if len(issues) == 0 {
+		t.Fatal("project auto override with Reviewer native auto-merge was accepted")
+	}
+	found := false
 	for _, issue := range issues {
 		if issue.Path == "projects[0].roles.gatekeeper.trust" {
-			t.Fatalf("project auto override was rejected: %+v", issues)
+			found = true
 		}
+	}
+	if !found {
+		t.Fatalf("issues = %+v, want project merge-authority conflict", issues)
 	}
 }
 

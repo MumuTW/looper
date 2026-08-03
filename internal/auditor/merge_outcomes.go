@@ -36,8 +36,17 @@ func CandidatesFromMergeOutcomes(events []storage.EventLogRecord) ([]MergeCandid
 				return nil, fmt.Errorf("decode coordinator merge event %s: %w", event.ID, err)
 			}
 			projectID, repo, prNumber, headSHA, mergedAtText = outcome.ProjectID, outcome.Repo, outcome.PRNumber, outcome.HeadSHA, outcome.MergedAt
+			if strings.TrimSpace(projectID) == "" && event.ProjectID != nil {
+				// Legacy coordinator payloads stored the project only on the
+				// EventLog row. Preserve that exact key for project-scoped
+				// attribution; only the emptiness check is trimmed.
+				projectID = *event.ProjectID
+			}
 		default:
 			continue
+		}
+		if strings.TrimSpace(projectID) == "" && event.ProjectID != nil {
+			projectID = *event.ProjectID
 		}
 		if strings.TrimSpace(projectID) == "" || strings.TrimSpace(repo) == "" || prNumber <= 0 || strings.TrimSpace(headSHA) == "" {
 			return nil, fmt.Errorf("merge event %s is missing merged pull request identity", event.ID)
@@ -53,7 +62,7 @@ func CandidatesFromMergeOutcomes(events []storage.EventLogRecord) ([]MergeCandid
 				return nil, fmt.Errorf("parse merge event %s timestamp: %w", event.ID, err)
 			}
 		}
-		candidates = append(candidates, MergeCandidate{ProjectID: strings.TrimSpace(projectID), Repo: strings.TrimSpace(repo), PRNumber: prNumber, HeadSHA: strings.TrimSpace(headSHA), MergedAt: mergedAt.UTC()})
+		candidates = append(candidates, MergeCandidate{ProjectID: projectID, Repo: strings.TrimSpace(repo), PRNumber: prNumber, HeadSHA: strings.TrimSpace(headSHA), MergedAt: mergedAt.UTC()})
 	}
 	return candidates, nil
 }

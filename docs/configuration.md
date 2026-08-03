@@ -929,8 +929,8 @@ The diff budget is an optional boolean change-size guard. When configured,
 Gatekeeper reads GitHub's provider-observed `changedFiles` and `deletions` for
 the exact pull-request head during evaluation and blocks the verdict when either
 count exceeds its configured bound. GitHub's provider metadata is the authority
-for the counts; the agent's output is not used. The gate runs on both the primary
-evaluation and the confirming pass before an `auto` merge, and it fails closed
+for the counts; the agent's output is not used. The gate runs during the
+evaluation immediately before the `auto-merge` route label is published, and it fails closed
 (blocking with `provider_state_unavailable`) when the enabled stats cannot be
 read.
 
@@ -986,13 +986,12 @@ Reviewers should weigh these blind spots before relying on it:
   the head does not. The discovery fingerprint includes the base SHA so a
   rewritten merge base invalidates a reused verdict rather than serving a stale
   one for up to the skip window.
-- At the `auto` trust level the merge action binds only the pull-request head
-  (`gh pr merge --match-head-commit`); GitHub's merge API accepts no parameter
-  that atomically pins the base. The confirming pass revalidates the base
-  immediately before the merge, but if the base branch advances in the window
-  between that final read and the merge call itself, the merge can still proceed
-  against a new base whose recomputed diff exceeds the budget. That window is
-  narrow but not closed — it is a documented blind spot, not a guarantee.
+- At the `auto` trust level Gatekeeper publishes only the route label; Mergify
+  performs the eventual merge from its serialized queue. The base branch can
+  advance after Gatekeeper's evaluation and before Mergify evaluates the queued
+  item, so the final merge may use a recomputed diff that exceeds the observed
+  budget. Mergify's queue and branch-protection checks remain the merge
+  authority; the Gatekeeper route is evidence, not an atomic merge guarantee.
 
 ## Pipeline digest (`roles.escalator`)
 

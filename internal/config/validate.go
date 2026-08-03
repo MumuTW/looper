@@ -270,8 +270,6 @@ func validateCoreConfig(config Config, issues *[]ValidationIssue) {
 	validateTriagerRoleConfig(config.Roles.Triager, "roles.triager", issues)
 	validateGatekeeperRoleConfig(config.Roles.Gatekeeper, "roles.gatekeeper", config.Roles.Reviewer.AutoMerge.Enabled, issues)
 	validateAuditorRoleConfig(config.Roles.Auditor, "roles.auditor", issues)
-	validateAuditorGatekeeperCompatibility(config, issues)
-	validatePostMergeDigestGatekeeperCompatibility(config, issues)
 	validateDeployerRoleConfig(config.Roles.Deployer, "roles.deployer", issues)
 	validateEscalatorRoleConfig(config.Roles.Escalator, "roles.escalator", issues)
 	for i, project := range config.Projects {
@@ -383,73 +381,6 @@ func validateAuditorRoleConfig(auditor AuditorRoleConfig, path string, issues *[
 
 func gatekeeperTrustIsAuto(trust GatekeeperTrustLevel) bool {
 	return GatekeeperTrustLevel(strings.ToLower(strings.TrimSpace(string(trust)))) == GatekeeperTrustAuto
-}
-
-const auditorGatekeeperAutoConflictMessage = "requires Gatekeeper merge-outcome events or forge-observed merges; gatekeeper trust auto publishes commit status only and does not emit merge outcomes — disable auditor or use gatekeeper trust observe/advise until forge-observed merge evidence is implemented"
-
-// validateAuditorGatekeeperCompatibility rejects auditor enabled together with
-// gatekeeper auto on the same effective project scope. Auto trust is
-// status-only; Auditor still reads MergeOutcome events Gatekeeper no longer
-// emits.
-func validateAuditorGatekeeperCompatibility(config Config, issues *[]ValidationIssue) {
-	if config.Roles.Auditor.Enabled && gatekeeperTrustIsAuto(config.Roles.Gatekeeper.Trust) {
-		*issues = append(*issues, ValidationIssue{
-			Path:    "roles.auditor.enabled",
-			Message: auditorGatekeeperAutoConflictMessage,
-		})
-	}
-	for i, project := range config.Projects {
-		roles := ProjectRoleConfigs(config, project.ID)
-		if !roles.Auditor.Enabled || !gatekeeperTrustIsAuto(roles.Gatekeeper.Trust) {
-			continue
-		}
-		var path string
-		switch {
-		case project.Roles != nil && project.Roles.Gatekeeper != nil && project.Roles.Gatekeeper.Trust != nil && gatekeeperTrustIsAuto(*project.Roles.Gatekeeper.Trust):
-			path = fmt.Sprintf("projects[%d].roles.gatekeeper.trust", i)
-		case project.Roles != nil && project.Roles.Auditor != nil && project.Roles.Auditor.Enabled != nil && *project.Roles.Auditor.Enabled:
-			path = fmt.Sprintf("projects[%d].roles.auditor.enabled", i)
-		case gatekeeperTrustIsAuto(config.Roles.Gatekeeper.Trust):
-			path = "roles.gatekeeper.trust"
-		default:
-			path = fmt.Sprintf("projects[%d].roles.auditor.enabled", i)
-		}
-		*issues = append(*issues, ValidationIssue{Path: path, Message: auditorGatekeeperAutoConflictMessage})
-	}
-}
-
-const postMergeDigestGatekeeperAutoConflictMessage = "requires merge-outcome events that gatekeeper trust auto no longer emits; disable post-merge digest or use gatekeeper trust observe/advise until forge-observed merge evidence is implemented"
-
-func postMergeDigestEnabled(digest *CoordinatorPostMergeDigestConfig) bool {
-	return digest != nil && digest.Enabled
-}
-
-// validatePostMergeDigestGatekeeperCompatibility rejects post-merge digest enabled
-// together with gatekeeper auto on the same effective project scope. Auto trust
-// is status-only and does not emit merge-outcome events the digest still reads.
-func validatePostMergeDigestGatekeeperCompatibility(config Config, issues *[]ValidationIssue) {
-	if postMergeDigestEnabled(config.Roles.Coordinator.PostMergeDigest) && gatekeeperTrustIsAuto(config.Roles.Gatekeeper.Trust) {
-		*issues = append(*issues, ValidationIssue{
-			Path:    "roles.coordinator.postMergeDigest.enabled",
-			Message: postMergeDigestGatekeeperAutoConflictMessage,
-		})
-	}
-	for i, project := range config.Projects {
-		roles := ProjectRoleConfigs(config, project.ID)
-		if !postMergeDigestEnabled(roles.Coordinator.PostMergeDigest) || !gatekeeperTrustIsAuto(roles.Gatekeeper.Trust) {
-			continue
-		}
-		var path string
-		switch {
-		case project.Roles != nil && project.Roles.Gatekeeper != nil && project.Roles.Gatekeeper.Trust != nil && gatekeeperTrustIsAuto(*project.Roles.Gatekeeper.Trust):
-			path = fmt.Sprintf("projects[%d].roles.gatekeeper.trust", i)
-		case gatekeeperTrustIsAuto(config.Roles.Gatekeeper.Trust):
-			path = "roles.gatekeeper.trust"
-		default:
-			path = "roles.coordinator.postMergeDigest.enabled"
-		}
-		*issues = append(*issues, ValidationIssue{Path: path, Message: postMergeDigestGatekeeperAutoConflictMessage})
-	}
 }
 
 func validateServerConfig(server ServerConfig, issues *[]ValidationIssue) {
@@ -652,6 +583,12 @@ func validateGatekeeperRoleConfig(gatekeeper GatekeeperRoleConfig, path string, 
 		*issues = append(*issues, ValidationIssue{
 			Path:    path + ".trust",
 			Message: fmt.Sprintf("must be one of: %s, %s, %s", GatekeeperTrustObserve, GatekeeperTrustAdvise, GatekeeperTrustAuto),
+		})
+	}
+	if gatekeeperTrustIsAuto(gatekeeper.Trust) && reviewerAutoMerge {
+		*issues = append(*issues, ValidationIssue{
+			Path:    path + ".trust",
+			Message: "cannot be auto while Reviewer native auto-merge is enabled; choose one merge authority",
 		})
 	}
 }

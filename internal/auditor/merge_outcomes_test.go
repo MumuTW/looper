@@ -46,6 +46,32 @@ func TestCandidatesFromMergeOutcomesUsesCoordinatorMergeWatchTimestamp(t *testin
 	}
 }
 
+func TestCandidatesFromMergeOutcomesFallsBackToEventProjectForLegacyCoordinatorPayload(t *testing.T) {
+	payload := `{"repo":"acme/looper","prNumber":42,"headSha":"abc","mergedAt":"2026-07-31T09:58:00Z"}`
+	projectID := " project with padding "
+	candidates, err := CandidatesFromMergeOutcomes([]storage.EventLogRecord{{
+		ID: "legacy-coordinator", EventType: eventlog.CoordinatorPullRequestMergedEventType,
+		ProjectID: &projectID, PayloadJSON: payload, CreatedAt: "2026-07-31T10:02:00.000Z",
+	}})
+	if err != nil || len(candidates) != 1 {
+		t.Fatalf("CandidatesFromMergeOutcomes() = %#v, %v", candidates, err)
+	}
+	if candidates[0].ProjectID != projectID {
+		t.Fatalf("candidate project ID = %q, want exact event project %q", candidates[0].ProjectID, projectID)
+	}
+}
+
+func TestCandidatesFromMergeOutcomesFallsBackToEventCreatedAtForMalformedCoordinatorTimestamp(t *testing.T) {
+	payload := `{"projectId":"project_1","repo":"acme/looper","prNumber":42,"headSha":"abc","mergedAt":"not-a-timestamp"}`
+	candidates, err := CandidatesFromMergeOutcomes([]storage.EventLogRecord{{
+		ID: "malformed-coordinator-time", EventType: eventlog.CoordinatorPullRequestMergedEventType,
+		PayloadJSON: payload, CreatedAt: "2026-07-31T10:02:00.000Z",
+	}})
+	if err != nil || len(candidates) != 1 || candidates[0].MergedAt.Format("2006-01-02T15:04:05.000Z") != "2026-07-31T10:02:00.000Z" {
+		t.Fatalf("CandidatesFromMergeOutcomes() = %#v, %v, want event CreatedAt fallback", candidates, err)
+	}
+}
+
 func TestCandidatesFromMergeOutcomesRejectsMalformedSuccessfulEvidence(t *testing.T) {
 	_, err := CandidatesFromMergeOutcomes([]storage.EventLogRecord{{ID: "broken", EventType: gatekeeper.MergeOutcomeEventType, PayloadJSON: `{`, CreatedAt: "2026-07-31T10:00:00.000Z"}})
 	if err == nil {

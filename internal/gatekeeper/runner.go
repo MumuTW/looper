@@ -439,10 +439,10 @@ func (r *Runner) departedFromOpenSet(
 	return departed
 }
 
-// sourceFingerprintForProject includes the local authority inputs that the
-// forge's pull-request list cannot expose. A trust, policy, or diff-budget
-// bound change must not leave a previously published auto-merge label in place
-// merely because the pull request itself is unchanged.
+// sourceFingerprintForProjectWithContract includes the local authority inputs
+// that the forge's pull-request list cannot expose. A trust, policy,
+// diff-budget, or Mergify-contract change must not leave a previously published
+// auto-merge label in place merely because the pull request itself is unchanged.
 func (r *Runner) sourceFingerprintForProjectWithContract(pullRequest githubinfra.PullRequestSummary, projectID, repo, contractFingerprint string) string {
 	budget := r.diffBudget(projectID)
 	budgetEnabled := budget.MaxChangedFiles > 0 || budget.MaxDeletions > 0
