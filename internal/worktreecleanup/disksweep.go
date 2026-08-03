@@ -400,7 +400,7 @@ func sweepLiveContainerProjects(ctx context.Context, options ContainerSweepOptio
 			continue
 		}
 		plan.Summary.Scanned++
-		if liveProjects[normalizeSweepPath(project.Path)] {
+		if liveProjects[normalizeSweepPath(project.Path)] || liveProjectAncestor(project.Path, liveProjects) {
 			continue
 		}
 		plan.Summary.Unregistered++
@@ -470,6 +470,24 @@ func sweepLiveContainerProjects(ctx context.Context, options ContainerSweepOptio
 		plan.Candidates = append(plan.Candidates, candidate)
 	}
 	return plan
+}
+
+func liveProjectAncestor(path string, liveProjects map[string]bool) bool {
+	normalized := normalizeSweepPath(path)
+	for livePath := range liveProjects {
+		if pathContains(normalized, livePath) {
+			return true
+		}
+	}
+	return false
+}
+
+func pathContains(parent, child string) bool {
+	rel, err := filepath.Rel(normalizeSweepPath(parent), normalizeSweepPath(child))
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return false
+	}
+	return true
 }
 
 func revalidateContainerCandidate(candidate DiskCandidate, cutoff time.Time) (DiskCandidate, bool) {

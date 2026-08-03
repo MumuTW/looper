@@ -808,6 +808,32 @@ func TestRunContainerSweepPreservesContainerWithRegularFiles(t *testing.T) {
 	}
 }
 
+func TestRunContainerSweepProtectsDeepLiveProjectAncestors(t *testing.T) {
+	sharedRoot := t.TempDir()
+	container := filepath.Join(sharedRoot, "repo-live")
+	liveRoot := filepath.Join(container, "team", "project")
+	checkout := mkdirAt(t, filepath.Join(liveRoot, "worker-worktree"), old())
+	for _, path := range []string{filepath.Join(container, "team"), container} {
+		if err := os.Chtimes(path, old(), old()); err != nil {
+			t.Fatalf("Chtimes(%q) error = %v", path, err)
+		}
+	}
+
+	var removed []string
+	options := containerOptions(sharedRoot, []string{"repo-live"}, stubSweepGit{}, &removed)
+	options.LiveProjectPaths = []string{liveRoot}
+	plan, err := RunContainerSweep(context.Background(), options)
+	if err != nil {
+		t.Fatalf("RunContainerSweep() error = %v", err)
+	}
+	if len(removed) != 0 || plan.Summary.Removed != 0 {
+		t.Fatalf("removed = %v summary = %#v, want deep live root preserved", removed, plan.Summary)
+	}
+	if _, err := os.Stat(checkout); err != nil {
+		t.Fatalf("deep live checkout was removed: %v", err)
+	}
+}
+
 func TestRunContainerSweepPreservesContainerWithRegisteredCheckout(t *testing.T) {
 	sharedRoot := t.TempDir()
 	container := filepath.Join(sharedRoot, "repo-dead")
