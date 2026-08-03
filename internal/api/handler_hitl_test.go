@@ -537,3 +537,119 @@ func TestHandlerRespondRequiresAnswer(t *testing.T) {
 		t.Fatalf("status = %d, want 400 for empty answer; body=%s", recorder.Code, recorder.Body.String())
 	}
 }
+
+// TestDeliverHumanAnswerRejectsWhenStorageNotConfigured verifies the HITL
+// answer handler fails closed with "Storage is not configured" instead of
+// panicking when the coordinator or repositories are nil.
+func TestDeliverHumanAnswerRejectsWhenStorageNotConfigured(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{
+		Config:  cfg,
+		Runtime: fixedRuntimeState{services: looperdruntime.Services{}},
+	})
+	_, err := h.deliverHumanAnswer(context.Background(), "loop_any", "continue")
+	if err == nil {
+		t.Fatal("deliverHumanAnswer() error = nil, want storage-not-configured rejection")
+	}
+	var typed apiError
+	if !asAPIError(err, &typed) || typed.status != http.StatusInternalServerError {
+		t.Fatalf("error = %v, want 500 storage-not-configured apiError", err)
+	}
+	if !strings.Contains(typed.message, "Storage is not configured") {
+		t.Fatalf("error message = %q, want 'Storage is not configured'", typed.message)
+	}
+	// The runtime must still be stoppable after the nil-services call.
+	_ = rt
+}
+
+// TestHandbackLoopRejectsWhenStorageNotConfigured verifies the handback
+// handler fails closed with "Storage is not configured" instead of panicking
+// when the coordinator or repositories are nil.
+func TestHandbackLoopRejectsWhenStorageNotConfigured(t *testing.T) {
+	_, cfg := startTestRuntime(t)
+	h := NewHandler(Context{
+		Config:  cfg,
+		Runtime: fixedRuntimeState{services: looperdruntime.Services{}},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/loops/1/handback", strings.NewReader(`{}`))
+	_, err := h.handbackLoop(context.Background(), req, "loop_any")
+	if err == nil {
+		t.Fatal("handbackLoop() error = nil, want storage-not-configured rejection")
+	}
+	var typed apiError
+	if !asAPIError(err, &typed) || typed.status != http.StatusInternalServerError {
+		t.Fatalf("error = %v, want 500 storage-not-configured apiError", err)
+	}
+	if !strings.Contains(typed.message, "Storage is not configured") {
+		t.Fatalf("error message = %q, want 'Storage is not configured'", typed.message)
+	}
+}
+
+// TestDeliverHumanAnswerRejectsMalformedHITLMetadata verifies that an
+// awaiting_human loop with no readable HITL ask metadata is rejected instead
+// of silently writing a zero-valued ask that loses the question, correlation
+// fields, and gate evidence.
+func TestDeliverHumanAnswerRejectsMalformedHITLMetadata(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	h := NewHandler(Context{Config: cfg, Runtime: rt})
+	services := rt.Services()
+	nowISO := "2026-04-11T12:00:00.000Z"
+	projectID := "project_hitl_malformed"
+	loopID := "loop_hitl_malformed"
+	targetID := projectID
+
+	if err := services.Repositories.Projects.Upsert(context.Background(), storage.ProjectRecord{ID: projectID, Name: "Looper", RepoPath: "/tmp/repos/looper", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Projects.Upsert() error = %v", err)
+	}
+	// awaiting_human but with no HITL metadata — ReadHITLAsk returns false.
+	if err := services.Repositories.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 95, ProjectID: projectID, Type: "worker", TargetType: "project", TargetID: &targetID, Status: "awaiting_human", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+
+	_, err := h.deliverHumanAnswer(context.Background(), loopID, "continue")
+	if err == nil {
+		t.Fatal("deliverHumanAnswer() error = nil, want rejection for missing HITL ask")
+	}
+	var typed apiError
+	if !asAPIError(err, &typed) || typed.status != http.StatusBadRequest {
+		t.Fatalf("error = %v, want 400 apiError for unreadable HITL metadata", err)
+	}
+	if !strings.Contains(typed.message, "HITL ask metadata") {
+		t.Fatalf("error message = %q, want 'HITL ask metadata'", typed.message)
+	}
+	// The loop must stay awaiting_human — no answer was written.
+	loop, err := services.Repositories.Loops.GetByID(context.Background(), loopID)
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = %#v, %v", loop, err)
+	}
+	if loop.Status != "awaiting_human" {
+		t.Fatalf("loop.Status = %q, want unchanged awaiting_human", loop.Status)
+	}
+}
+
+// TestHandlerFeishuThreadReplyReportsLoopNoLongerExists verifies the 404
+// reason is distinct from the 400 "not awaiting a human" reason so the two
+// outcomes stay separable in logs.
+func TestHandlerFeishuThreadReplyReportsLoopNoLongerExists(t *testing.T) {
+	rt, cfg := startTestRuntime(t)
+	cfg.HITL.Enabled = true
+	t.Setenv("LOOPER_TEST_FEISHU_VTOKEN_404", "verify-tok-123")
+	cfg.Notifications.Webhook.VerificationTokenEnv = "LOOPER_TEST_FEISHU_VTOKEN_404"
+	h := NewHandler(Context{Config: cfg, Runtime: runtimeWithConfig(rt, cfg)})
+	services := rt.Services()
+	// Thread mapping points to a loop that does not exist.
+	if err := services.Repositories.FeishuThreads.Upsert(context.Background(), "om_root_ghost", "loop_ghost_404", "oc_group", "2026-04-11T12:00:00.000Z"); err != nil {
+		t.Fatalf("FeishuThreads.Upsert() error = %v", err)
+	}
+
+	body := `{"schema":"2.0","header":{"event_type":"im.message.receive_v1","token":"verify-tok-123"},"event":{"message":{"message_id":"om_reply","root_id":"om_root_ghost","chat_id":"oc_group","message_type":"text","content":"{\"text\":\"reply\"}"},"sender":{"sender_type":"user","sender_id":{"open_id":"ou_user"}}}}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/hitl/feishu", strings.NewReader(body))
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "loop no longer exists") {
+		t.Fatalf("body = %s, want 'loop no longer exists' reason for 404", recorder.Body.String())
+	}
+}

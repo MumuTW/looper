@@ -25,11 +25,12 @@ type loopLogsCombinedState struct {
 }
 
 type loopLogsFileCursor struct {
-	path       string
-	offset     int64
-	fileInfo   os.FileInfo
-	lastInline string
-	snapshot   string
+	path          string
+	offset        int64
+	fileInfo      os.FileInfo
+	lastInline    string
+	pendingInline string
+	snapshot      string
 }
 
 type loopLogsCombinedCursor struct {
@@ -234,7 +235,11 @@ func (h *Handler) updateLoopLogsSingleCursor(w io.Writer, flusher http.Flusher, 
 		cursor.lastInline = inline
 		return writeLoopLogsChunk(w, flusher, response, "", chunk)
 	}
-	cursor.lastInline = inline
+	// Defer the inline baseline advance until the next file read succeeds. If
+	// the file disappears before readNext opens it, the old lastInline stays as
+	// the fallback baseline so the inline delta on the next poll captures the
+	// output added during the file-to-inline transition instead of skipping it.
+	cursor.pendingInline = inline
 	return nil
 }
 
@@ -272,10 +277,21 @@ func (h *Handler) newLoopLogsFileCursor(path, inline string) (loopLogsFileCursor
 		return loopLogsFileCursor{}, err
 	}
 	if found {
+		// readLoopLogsSnapshot records the file's full size as the offset even
+		// when the snapshot ends with an incomplete UTF-8 rune. Back the offset
+		// up to the last complete rune boundary — the same rule readNext applies
+		// — so the remaining continuation bytes arrive as part of the full rune
+		// on the next poll instead of being consumed as a lead-byte fragment
+		// that decodes to replacement characters.
+		raw := []byte(content)
+		if cut := utf8ChunkBoundary(raw, len(raw)); cut < len(raw) {
+			offset -= int64(len(raw) - cut)
+			raw = raw[:cut]
+		}
 		cursor.path = path
 		cursor.offset = offset
 		cursor.fileInfo = info
-		cursor.snapshot = content
+		cursor.snapshot = string(raw)
 	}
 	return cursor, nil
 }
@@ -354,7 +370,12 @@ func (h *Handler) updateLoopLogsCombinedCursor(w io.Writer, flusher http.Flusher
 				return errLoopLogsClientWrite
 			}
 		} else {
-			update.cursor.lastInline = update.inline
+			// Defer the inline baseline advance until the next file read
+			// succeeds, matching updateLoopLogsSingleCursor. If the file
+			// disappears before readNext opens it, the old lastInline stays as
+			// the fallback baseline so the inline delta captures the transition
+			// output instead of skipping it.
+			update.cursor.pendingInline = update.inline
 		}
 	}
 	return nil
@@ -436,16 +457,25 @@ func (cursor *loopLogsFileCursor) readNext(maxBytes int) (string, bool, error) {
 	if errors.Is(err, os.ErrNotExist) {
 		// A disappeared file must not suppress the durable inline fallback.
 		// The next state refresh will either reopen a replacement or resume
-		// incremental inline delivery.
+		// incremental inline delivery. Discard the pending inline without
+		// committing it so the old lastInline remains the fallback baseline
+		// and the inline delta on the next poll captures transition output.
 		cursor.path = ""
 		cursor.offset = 0
 		cursor.fileInfo = nil
+		cursor.pendingInline = ""
 		return "", true, nil
 	}
 	if err != nil {
 		return "", true, err
 	}
 	defer file.Close()
+	// The file is readable, so the inline baseline can safely advance to the
+	// value staged by updateLoopLogsSingleCursor / updateLoopLogsCombinedCursor.
+	if cursor.pendingInline != "" {
+		cursor.lastInline = cursor.pendingInline
+		cursor.pendingInline = ""
+	}
 	info, err := file.Stat()
 	if err != nil {
 		return "", true, err

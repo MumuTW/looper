@@ -623,3 +623,245 @@ func assertCombinedLogStreamBody(t *testing.T, tab int, body []byte, stdoutAppen
 		t.Fatalf("tab %d stderr bytes = %d, want %d", tab, stderr.Len(), len(stderrAppend))
 	}
 }
+
+// TestLoopLogsFileCursorBacksOffsetUpToLastCompleteRuneOnInit verifies that
+// when a single-stream follower connects while the log file ends with an
+// incomplete UTF-8 rune, the initial cursor backs its offset up to the last
+// complete rune so the remaining continuation bytes arrive as part of the full
+// rune on the next poll instead of decoding to replacement characters.
+func TestLoopLogsFileCursorBacksOffsetUpToLastCompleteRuneOnInit(t *testing.T) {
+	fixture := newTestFixture(t)
+	handler := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime})
+	logDir := filepath.Join(fixture.config.Daemon.LogDir, "loops")
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	path := filepath.Join(logDir, "partial_rune.log")
+	// "hello" followed by the first 2 bytes of a 3-byte rune 界 (E7 95 8C).
+	if err := os.WriteFile(path, append([]byte("hello"), 0xe7, 0x95), 0o644); err != nil {
+		t.Fatalf("write partial rune file: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	cursor, err := handler.newLoopLogsFileCursor(path, "")
+	if err != nil {
+		t.Fatalf("new cursor: %v", err)
+	}
+	if cursor.path == "" {
+		t.Fatal("cursor path is empty, want file-backed cursor")
+	}
+	// The offset must be backed up past the incomplete rune (2 bytes).
+	if cursor.offset != info.Size()-2 {
+		t.Fatalf("cursor offset = %d, want %d (file size %d minus 2 incomplete bytes)", cursor.offset, info.Size()-2, info.Size())
+	}
+	if cursor.snapshot != "hello" {
+		t.Fatalf("cursor snapshot = %q, want %q (incomplete rune trimmed)", cursor.snapshot, "hello")
+	}
+	// Append the final continuation byte and verify readNext delivers the
+	// complete rune rather than a replacement character.
+	if err := os.WriteFile(path, append([]byte("hello"), 0xe7, 0x95, 0x8c), 0o644); err != nil {
+		t.Fatalf("write completed rune file: %v", err)
+	}
+	chunk, _, err := cursor.readNext(loopLogsFollowMaxChunkBytes)
+	if err != nil {
+		t.Fatalf("readNext: %v", err)
+	}
+	if chunk != "界" || !utf8.ValidString(chunk) {
+		t.Fatalf("chunk = %q valid=%t, want complete rune 界", chunk, utf8.ValidString(chunk))
+	}
+}
+
+// TestLoopLogsSingleCursorPreservesInlineBaselineWhenFileDisappears verifies
+// that the inline fallback baseline is not advanced until the file read
+// succeeds. When the file disappears between staging the inline baseline and
+// the next readNext, the old baseline stays so the inline delta captures the
+// output added during the file-to-inline transition.
+func TestLoopLogsSingleCursorPreservesInlineBaselineWhenFileDisappears(t *testing.T) {
+	fixture := newTestFixture(t)
+	handler := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime})
+	logDir := filepath.Join(fixture.config.Daemon.LogDir, "loops")
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	path := filepath.Join(logDir, "inline_transition.log")
+	if err := os.WriteFile(path, []byte("file line\n"), 0o644); err != nil {
+		t.Fatalf("write log: %v", err)
+	}
+	cursor, err := handler.newLoopLogsFileCursor(path, "file line\n")
+	if err != nil {
+		t.Fatalf("new cursor: %v", err)
+	}
+	if cursor.path == "" {
+		t.Fatal("cursor path is empty, want file-backed cursor")
+	}
+	response := loopLogsResponse{Agent: &loopLogsAgentPayload{ExecutionID: "exec_t", Vendor: "codex", Status: "running"}}
+	recorder := httptest.NewRecorder()
+
+	// Stage a new inline baseline while the file is still present. The old
+	// code would advance cursor.lastInline immediately; the fix stages it as
+	// pendingInline until the next successful file read.
+	output := agentOutputPayload{Stdout: "file line\ninline more\n", StdoutLogPath: path}
+	if err := handler.updateLoopLogsSingleCursor(recorder, recorder, response, output, &cursor, false, "exec_t"); err != nil {
+		t.Fatalf("update cursor (file present): %v", err)
+	}
+	if cursor.lastInline != "file line\n" {
+		t.Fatalf("lastInline = %q, want old baseline preserved until file read succeeds", cursor.lastInline)
+	}
+	if cursor.pendingInline != "file line\ninline more\n" {
+		t.Fatalf("pendingInline = %q, want staged new inline", cursor.pendingInline)
+	}
+
+	// File disappears before readNext opens it.
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("remove log: %v", err)
+	}
+	if err := handler.emitLoopLogsSingleChunks(recorder, recorder, response, &cursor, false); err != nil {
+		t.Fatalf("emit chunks (file gone): %v", err)
+	}
+	if cursor.path != "" {
+		t.Fatalf("cursor path = %q, want empty after file disappeared", cursor.path)
+	}
+	// pendingInline must be discarded without committing so the old baseline
+	// stays as the fallback for the inline delta.
+	if cursor.pendingInline != "" {
+		t.Fatalf("pendingInline = %q, want empty after file disappeared", cursor.pendingInline)
+	}
+	if cursor.lastInline != "file line\n" {
+		t.Fatalf("lastInline = %q, want old baseline preserved after file disappeared", cursor.lastInline)
+	}
+
+	// Next poll: inline fallback should emit the delta from the old baseline,
+	// capturing the output added during the transition.
+	recorder2 := httptest.NewRecorder()
+	output2 := agentOutputPayload{Stdout: "file line\ninline more\neven more\n"}
+	if err := handler.updateLoopLogsSingleCursor(recorder2, recorder2, response, output2, &cursor, false, "exec_t"); err != nil {
+		t.Fatalf("update cursor (inline fallback): %v", err)
+	}
+	body := recorder2.Body.String()
+	if !strings.Contains(body, "inline more") {
+		t.Fatalf("inline fallback body = %q, want delta including 'inline more' from transition", body)
+	}
+	if !strings.Contains(body, "even more") {
+		t.Fatalf("inline fallback body = %q, want delta including 'even more'", body)
+	}
+}
+
+// TestSingleLoopLogsStreamDrainsRemainingBytesBeforeEnding verifies that when
+// a run becomes terminal while the file cursor has more than one chunk unread,
+// the stream drains all remaining bytes before sending the end event.
+func TestSingleLoopLogsStreamDrainsRemainingBytesBeforeEnding(t *testing.T) {
+	fixture := newTestFixture(t)
+	seedRunRouteData(t, fixture.runtime)
+
+	logRoot := filepath.Join(fixture.config.Daemon.LogDir, "loops", "loop_1", "run_1")
+	if err := os.MkdirAll(logRoot, 0o755); err != nil {
+		t.Fatalf("MkdirAll(log root): %v", err)
+	}
+	stdoutPath := filepath.Join(logRoot, "exec_drain.stdout.log")
+	history := strings.Repeat("history-line\n", 64)
+	if err := os.WriteFile(stdoutPath, []byte(history), 0o644); err != nil {
+		t.Fatalf("write stdout history: %v", err)
+	}
+
+	nowISO := fixture.now.UTC().Format(javaScriptISOString)
+	output, err := json.Marshal(agentOutputPayload{Stdout: "history tail", StdoutLogPath: stdoutPath})
+	if err != nil {
+		t.Fatalf("marshal output: %v", err)
+	}
+	if err := fixture.runtime.Services().Repositories.AgentExecutions.Upsert(context.Background(), storage.AgentExecutionRecord{
+		ID:         "exec_drain",
+		ProjectID:  stringPtr("project_1"),
+		LoopID:     stringPtr("loop_1"),
+		RunID:      stringPtr("run_1"),
+		Vendor:     "codex",
+		Status:     "running",
+		StartedAt:  nowISO,
+		OutputJSON: stringPtr(string(output)),
+		CreatedAt:  nowISO,
+		UpdatedAt:  nowISO,
+	}); err != nil {
+		t.Fatalf("upsert execution: %v", err)
+	}
+
+	// Append more than loopLogsFollowMaxChunkBytes so the terminal drain must
+	// emit at least two chunks to deliver everything.
+	appended := strings.Repeat("x", loopLogsFollowMaxChunkBytes*2+37)
+	var observationsMu sync.Mutex
+	incrementalBytes := 0
+	snapshotReady := make(chan struct{})
+	bytesReady := make(chan struct{})
+	snapshotSignaled, bytesSignaled := false, false
+	handler := NewHandler(Context{Config: fixture.config, Runtime: fixture.runtime})
+	handler.loopLogsFollowObserve = func(observation loopLogsFollowObservation) {
+		observationsMu.Lock()
+		defer observationsMu.Unlock()
+		switch observation.Kind {
+		case "snapshot_delivered":
+			if !snapshotSignaled {
+				close(snapshotReady)
+				snapshotSignaled = true
+			}
+		case "file_read":
+			incrementalBytes += observation.Bytes
+			if !bytesSignaled && incrementalBytes >= len(appended) {
+				close(bytesReady)
+				bytesSignaled = true
+			}
+		}
+	}
+	server := httptest.NewServer(handler)
+	defer server.Close()
+	response, err := http.Get(server.URL + "/api/v1/loops/loop_1/logs?follow=1")
+	if err != nil {
+		t.Fatalf("open single stream: %v", err)
+	}
+	defer response.Body.Close()
+
+	select {
+	case <-snapshotReady:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for single-stream snapshot")
+	}
+	appendFile(t, stdoutPath, appended)
+	// Wait for the file reads to pick up the appended bytes.
+	select {
+	case <-bytesReady:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for single-stream appended bytes")
+	}
+	// Mark the run terminal — the stream must drain remaining bytes before end.
+	markRunSuccess(t, fixture, "run_1")
+
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatalf("read single stream: %v", err)
+	}
+	text := string(body)
+	if !strings.Contains(text, "event: end") {
+		t.Fatalf("stream body missing end event")
+	}
+	// Reassemble all chunk content and verify the full appended burst was
+	// delivered, not just the first chunk.
+	var joined strings.Builder
+	for _, event := range strings.Split(text, "\n\n") {
+		if !strings.HasPrefix(event, "event: chunk\n") {
+			continue
+		}
+		data := strings.TrimPrefix(strings.SplitN(event, "\n", 2)[1], "data: ")
+		var chunk loopLogsFollowChunkEvent
+		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			t.Fatalf("decode chunk: %v", err)
+		}
+		joined.WriteString(chunk.Content)
+	}
+	if !strings.Contains(joined.String(), appended) {
+		t.Fatalf("joined chunks missing the full appended burst; got %d bytes, want to contain %d", joined.Len(), len(appended))
+	}
+	observationsMu.Lock()
+	defer observationsMu.Unlock()
+	if incrementalBytes < len(appended) {
+		t.Fatalf("incremental file bytes = %d, want >= %d (drain must deliver all terminal bytes)", incrementalBytes, len(appended))
+	}
+}

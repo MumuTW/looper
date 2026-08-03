@@ -85,6 +85,9 @@ func (h *Handler) handbackLoop(ctx context.Context, r *http.Request, loopID stri
 	}
 
 	services := h.context.Runtime.Services()
+	if services.Repositories == nil || services.Coordinator == nil {
+		return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: "Storage is not configured"}
+	}
 	nowISO := eventlog.FormatJavaScriptISOString(h.now().UTC())
 	_, err := storage.WithTransactionValue(ctx, services.Coordinator.DB(), nil, func(tx *sql.Tx) (struct{}, error) {
 		repos := storage.NewRepositories(tx)
@@ -180,49 +183,60 @@ func (h *Handler) deliverHumanAnswer(ctx context.Context, loopID string, rawAnsw
 		return loopResponse{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: "respond requires a non-empty answer"}
 	}
 
+	services := h.context.Runtime.Services()
+	if services.Repositories == nil || services.Coordinator == nil {
+		return loopResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: "Storage is not configured"}
+	}
+	nowISO := eventlog.FormatJavaScriptISOString(h.now().UTC())
 	// Serialize the answer transaction with worker-side post-park correlation
 	// writes. Both paths read-modify-write the same HITL metadata; without this
 	// guard a worker can persist a stale awaiting ask after the human answer has
-	// already been committed.
-	unlockRequeue := loops.LockLoopRequeue(loopID)
-	services := h.context.Runtime.Services()
-	nowISO := eventlog.FormatJavaScriptISOString(h.now().UTC())
-	_, err := storage.WithTransactionValue(ctx, services.Coordinator.DB(), nil, func(tx *sql.Tx) (storage.LoopRecord, error) {
-		repos := storage.NewRepositories(tx)
-		loop, err := repos.Loops.GetByID(ctx, loopID)
-		if err != nil {
-			return storage.LoopRecord{}, err
-		}
-		if loop == nil {
-			return storage.LoopRecord{}, apiError{code: pkgapi.ErrorCodeLoopNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Loop not found: %s", loopID)}
-		}
-		if loop.Status != string(domain.LoopStatusAwaitingHuman) {
-			return storage.LoopRecord{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Loop %s is not awaiting a human (status: %s)", loopID, loop.Status)}
-		}
-		ask, _ := loops.ReadHITLAsk(loop.MetadataJSON)
-		// The authenticated response is the authority to discard a malformed
-		// gate, but only when the staged filesystem identity still matches the
-		// bounded evidence persisted with this ask. A replacement leaves the
-		// loop parked and is never removed by daemon privilege.
-		if err := loops.ConsumeHITLGateEvidence(ask.GateEvidence); err != nil {
-			return storage.LoopRecord{}, fmt.Errorf("consume malformed HITL gate evidence: %w", err)
-		}
-		ask.Answer = answer
-		ask.Status = "answered"
-		ask.AnsweredAt = nowISO
-		metadataJSON, err := loops.WriteHITLAsk(loop.MetadataJSON, ask)
-		if err != nil {
-			return storage.LoopRecord{}, err
-		}
-		updated := *loop
-		updated.MetadataJSON = stringPtrOrNil(metadataJSON)
-		updated.UpdatedAt = nowISO
-		if err := repos.Loops.Upsert(ctx, updated); err != nil {
-			return storage.LoopRecord{}, err
-		}
-		return updated, nil
-	})
-	unlockRequeue()
+	// already been committed. The lock is released via defer inside an inline
+	// function so a panic in the transaction still releases it, and the release
+	// completes before mutateLoopStatus below (which re-enters the requeue path
+	// and must not nest the same per-loop guard).
+	_, err := func() (storage.LoopRecord, error) {
+		unlockRequeue := loops.LockLoopRequeue(loopID)
+		defer unlockRequeue()
+		return storage.WithTransactionValue(ctx, services.Coordinator.DB(), nil, func(tx *sql.Tx) (storage.LoopRecord, error) {
+			repos := storage.NewRepositories(tx)
+			loop, err := repos.Loops.GetByID(ctx, loopID)
+			if err != nil {
+				return storage.LoopRecord{}, err
+			}
+			if loop == nil {
+				return storage.LoopRecord{}, apiError{code: pkgapi.ErrorCodeLoopNotFound, status: http.StatusNotFound, message: fmt.Sprintf("Loop not found: %s", loopID)}
+			}
+			if loop.Status != string(domain.LoopStatusAwaitingHuman) {
+				return storage.LoopRecord{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Loop %s is not awaiting a human (status: %s)", loopID, loop.Status)}
+			}
+			ask, ok := loops.ReadHITLAsk(loop.MetadataJSON)
+			if !ok {
+				return storage.LoopRecord{}, apiError{code: pkgapi.ErrorCodeValidationFailed, status: http.StatusBadRequest, message: fmt.Sprintf("Loop %s has no readable HITL ask metadata", loopID)}
+			}
+			// The authenticated response is the authority to discard a malformed
+			// gate, but only when the staged filesystem identity still matches the
+			// bounded evidence persisted with this ask. A replacement leaves the
+			// loop parked and is never removed by daemon privilege.
+			if err := loops.ConsumeHITLGateEvidence(ask.GateEvidence); err != nil {
+				return storage.LoopRecord{}, fmt.Errorf("consume malformed HITL gate evidence: %w", err)
+			}
+			ask.Answer = answer
+			ask.Status = "answered"
+			ask.AnsweredAt = nowISO
+			metadataJSON, err := loops.WriteHITLAsk(loop.MetadataJSON, ask)
+			if err != nil {
+				return storage.LoopRecord{}, err
+			}
+			updated := *loop
+			updated.MetadataJSON = stringPtrOrNil(metadataJSON)
+			updated.UpdatedAt = nowISO
+			if err := repos.Loops.Upsert(ctx, updated); err != nil {
+				return storage.LoopRecord{}, err
+			}
+			return updated, nil
+		})
+	}()
 	if err != nil {
 		var typed apiError
 		if asAPIError(err, &typed) {
@@ -443,14 +457,20 @@ func (h *Handler) handleFeishuThreadReply(w http.ResponseWriter, r *http.Request
 		h.writeSuccess(w, requestID, map[string]any{"delivered": false, "reason": "no loop for thread"})
 		return
 	}
-	// deliverHumanAnswer only accepts an awaiting_human loop, so this naturally
-	// drops the bot's own thread posts, replies after the loop resumed, and any
-	// duplicate Feishu retries.
+	// Bot posts are already rejected by the sender_type gate above.
+	// deliverHumanAnswer accepts only an awaiting_human loop, so this drops
+	// replies after the loop resumed and duplicate Feishu retries.
 	if _, err := h.deliverHumanAnswer(r.Context(), loopID, answer); err != nil {
 		var typed apiError
-		if asAPIError(err, &typed) && (typed.status == http.StatusBadRequest || typed.status == http.StatusNotFound) {
-			h.writeSuccess(w, requestID, map[string]any{"loopId": loopID, "delivered": false, "reason": "loop not awaiting a human"})
-			return
+		if asAPIError(err, &typed) {
+			switch typed.status {
+			case http.StatusBadRequest:
+				h.writeSuccess(w, requestID, map[string]any{"loopId": loopID, "delivered": false, "reason": "loop not awaiting a human"})
+				return
+			case http.StatusNotFound:
+				h.writeSuccess(w, requestID, map[string]any{"loopId": loopID, "delivered": false, "reason": "loop no longer exists"})
+				return
+			}
 		}
 		if !asAPIError(err, &typed) {
 			typed = internalServerError(err)

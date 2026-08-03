@@ -224,6 +224,18 @@ func (h *Handler) streamLoopLogs(w http.ResponseWriter, r *http.Request, request
 		current = next
 
 		if shouldTerminateLoopLogsFollow(current, observedRunID) {
+			// Drain any remaining file bytes before ending. A burst exceeding
+			// loopLogsFollowMaxChunkBytes between polls leaves more than one
+			// chunk unread; the non-draining emit above only delivers one, and
+			// without a drain here the terminal end event would close the stream
+			// and silently omit the rest.
+			if err := h.emitLoopLogsSingleChunks(w, flusher, current, &cursor, true); err != nil {
+				if errors.Is(err, errLoopLogsClientWrite) {
+					return nil
+				}
+				_ = writeSSEEvent(w, flusher, "error", newLoopLogsFollowErrorEvent(err))
+				return nil
+			}
 			_ = writeSSEEvent(w, flusher, "end", map[string]string{"reason": "run_completed"})
 			return nil
 		}
