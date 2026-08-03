@@ -236,6 +236,78 @@ func TestHandleTerminalExhaustionRegenerationCompletesWhenFallbackAlsoRejected(t
 	}
 }
 
+// TestHandleTerminalExhaustionRegenerationWithheldEventSurvivesCommentCheckpointFailure
+// covers the replay window where both normal regeneration bodies are rejected
+// and the metadata checkpoint fails after the durable omission evidence was
+// appended. The event's primary key must suppress both bodies on replay, then
+// promote the omitted publication to the normal Commented checkpoint.
+func TestHandleTerminalExhaustionRegenerationWithheldEventSurvivesCommentCheckpointFailure(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	gateway := &regenerationFakeGateway{
+		fakeGitHubGateway: &fakeGitHubGateway{currentUser: "looper", viewResponses: []PullRequestDetail{{Number: 42, State: "OPEN", HeadRefName: "looper/fix-42", HeadSHA: "head-42"}}},
+		issue:             IssueDetail{Number: 7, Title: "Original issue", URL: "https://example.test/issues/7", State: "OPEN"},
+		commits:           []PullRequestCommit{{AuthorLogin: "looper", CommitterLogin: "looper"}},
+		commentErrs:       []error{contentGateRejection(), contentGateRejection()},
+	}
+	runner := newRegenerationRunner(t, fixture, gateway, func(_ context.Context, _ RegenerateIssueInput) error { return nil })
+	loop, queue := setupRegenerationRecords(t, fixture)
+	project, _ := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	ctx := context.Background()
+
+	// Fail only the Commented=true metadata checkpoint. The event append is a
+	// separate durable insert and must remain visible to the replay.
+	_, err := fixture.coordinator.DB().ExecContext(ctx, `
+		CREATE TRIGGER fixer_regeneration_comment_checkpoint_failure
+		BEFORE UPDATE OF metadata_json ON loops
+		WHEN OLD.id = 'fixer_exhausted' AND instr(NEW.metadata_json, '"commented":true') > 0
+		BEGIN SELECT RAISE(FAIL, 'injected regeneration comment checkpoint failure'); END;
+	`)
+	if err != nil {
+		t.Fatalf("create checkpoint failure trigger: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = fixture.coordinator.DB().ExecContext(context.Background(), `DROP TRIGGER IF EXISTS fixer_regeneration_comment_checkpoint_failure`)
+	})
+
+	if action, err := runner.handleTerminalExhaustion(ctx, *project, loop, queue, fixerCheckpoint{}, &runpipe.LoopError{Message: "failed", Kind: runpipe.FailureRetryableTransient}); err == nil || action != regenerationNone {
+		t.Fatalf("first handleTerminalExhaustion() = action %q err %v, want checkpoint failure", action, err)
+	}
+	events, err := fixture.repos.Events.ListByEntityAndEventTypes(ctx, "loop", loop.ID, []string{regenerationCommentWithheldEventType})
+	if err != nil || len(events) != 1 {
+		t.Fatalf("withheld regeneration events = %#v err=%v, want exactly one durable marker", events, err)
+	}
+	if got := len(gateway.createIssueComments); got != 2 {
+		t.Fatalf("first comment attempts = %d, want rejected detailed and fallback bodies", got)
+	}
+	if got := len(gateway.closeCalls); got != 0 {
+		t.Fatalf("close calls after checkpoint failure = %d, want no lifecycle suffix before replay", got)
+	}
+
+	if _, err := fixture.coordinator.DB().ExecContext(ctx, `DROP TRIGGER IF EXISTS fixer_regeneration_comment_checkpoint_failure`); err != nil {
+		t.Fatalf("drop checkpoint failure trigger: %v", err)
+	}
+	gateway.commentErrs = nil
+	action, err := runner.handleTerminalExhaustion(ctx, *project, loop, queue, fixerCheckpoint{}, &runpipe.LoopError{Message: "failed", Kind: runpipe.FailureRetryableTransient})
+	if err != nil || action != regenerationCompleted {
+		t.Fatalf("replay handleTerminalExhaustion() = action %q err %v, want completed", action, err)
+	}
+	if got := len(gateway.createIssueComments); got != 2 {
+		t.Fatalf("replay comment attempts = %d, want no duplicate rejected bodies", got)
+	}
+	events, err = fixture.repos.Events.ListByEntityAndEventTypes(ctx, "loop", loop.ID, []string{regenerationCommentWithheldEventType})
+	if err != nil || len(events) != 1 {
+		t.Fatalf("withheld regeneration events after replay = %#v err=%v, want one durable marker", events, err)
+	}
+	durable, err := fixture.repos.Loops.GetByID(ctx, loop.ID)
+	if err != nil || durable == nil {
+		t.Fatalf("Loops.GetByID() after replay = %#v err=%v", durable, err)
+	}
+	state, ok := parseRegenerationState(parseJSONObject(durable.MetadataJSON))
+	if !ok || !state.Commented || !state.Closed || !state.Routed {
+		t.Fatalf("regeneration state after replay = %#v, want Commented/Closed/Routed", state)
+	}
+}
+
 // TestHandleTerminalExhaustionEscalationDeduplicatesContextWithheldEventAcrossReplay
 // covers the unbounded-growth defect: when both comment bodies are rejected and
 // the subsequent label mutation fails, the handoff is requeued with Commented
@@ -303,6 +375,14 @@ func TestHandleTerminalExhaustionEscalationDeduplicatesContextWithheldEventAcros
 	}
 	if got := len(gateway.createIssueComments); got != 2 {
 		t.Fatalf("comment attempts after replay = %d, want no duplicate attempts after withheld step was settled", got)
+	}
+	durableReplay, err := fixture.repos.Loops.GetByID(ctx, loop.ID)
+	if err != nil || durableReplay == nil {
+		t.Fatalf("Loops.GetByID() after replay = %#v err=%v", durableReplay, err)
+	}
+	replayState, ok := parseRegenerationState(parseJSONObject(durableReplay.MetadataJSON))
+	if !ok || !replayState.Commented {
+		t.Fatalf("regeneration state after replay = %#v, want Commented=true promoted from durable evidence", replayState)
 	}
 	events, err := fixture.repos.Events.ListByEntityAndEventTypes(ctx, "loop", loop.ID, []string{"fixer.escalation.context_withheld"})
 	if err != nil {

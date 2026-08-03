@@ -18,7 +18,10 @@ import (
 )
 
 const regenerationCommentMarker = "<!-- looper:fixer-regenerate-v1"
-const contextWithheldEventType = "fixer.escalation.context_withheld"
+const (
+	contextWithheldEventType             = "fixer.escalation.context_withheld"
+	regenerationCommentWithheldEventType = "fixer.regeneration.comment_withheld"
+)
 
 type regenerationAction string
 
@@ -234,15 +237,26 @@ func (r *Runner) handleTerminalExhaustion(ctx context.Context, project storage.P
 	}
 
 	if !state.Commented {
-		comments, err := bridge.ListIssueComments(ctx, ViewIssueInput{Repo: derefString(queueItem.Repo), IssueNumber: derefInt64(queueItem.PRNumber), CWD: project.RepoPath})
+		commentWithheld, err := r.hasRegenerationCommentWithheldEvent(ctx, current.ID, derefString(queueItem.Repo), derefInt64(queueItem.PRNumber), state.Authority)
 		if err != nil {
-			return regenerationNone, fmt.Errorf("inspect exhausted fixer PR comments: %w", err)
+			return regenerationNone, fmt.Errorf("inspect withheld regeneration comment evidence: %w", err)
 		}
-		for _, comment := range comments {
-			if strings.Contains(comment.Body, regenerationCommentMarker) && strings.Contains(comment.Body, "authority="+state.Authority) {
-				state.CommentID = comment.ID
-				state.Commented = true
-				break
+		if commentWithheld {
+			// The deterministic event is the durable authority for an omitted
+			// optional publication. Promote it to the ordinary checkpoint so a
+			// replay cannot submit the rejected bodies again.
+			state.Commented = true
+		} else {
+			comments, err := bridge.ListIssueComments(ctx, ViewIssueInput{Repo: derefString(queueItem.Repo), IssueNumber: derefInt64(queueItem.PRNumber), CWD: project.RepoPath})
+			if err != nil {
+				return regenerationNone, fmt.Errorf("inspect exhausted fixer PR comments: %w", err)
+			}
+			for _, comment := range comments {
+				if strings.Contains(comment.Body, regenerationCommentMarker) && strings.Contains(comment.Body, "authority="+state.Authority) {
+					state.CommentID = comment.ID
+					state.Commented = true
+					break
+				}
 			}
 		}
 	}
@@ -279,6 +293,9 @@ func (r *Runner) handleTerminalExhaustion(ctx context.Context, project storage.P
 					return regenerationNone, fmt.Errorf("comment exhausted fixer PR fallback: %w", fallbackErr)
 				}
 				r.logWarn("fixer regeneration comment withheld by content safety gate", map[string]any{"loopId": current.ID, "repo": derefString(queueItem.Repo), "prNumber": queueItem.PRNumber, "error": fallbackErr.Error()})
+				if err := r.appendRegenerationCommentWithheldEvent(ctx, current, derefString(queueItem.Repo), derefInt64(queueItem.PRNumber), state.Authority); err != nil {
+					return regenerationNone, err
+				}
 				// Commented means the optional publication step is settled; the
 				// durable close/route checkpoints remain the lifecycle authority.
 				state.Commented = true
@@ -405,6 +422,13 @@ func (r *Runner) persistRegenerationEscalation(ctx context.Context, loop storage
 		contextWithheld, err = r.hasContextWithheldEvent(ctx, loop.ID, repo, prNumber, reason)
 		if err != nil {
 			return fmt.Errorf("inspect withheld-context escalation evidence: %w", err)
+		}
+		if contextWithheld {
+			// The durable event is the settled-comment authority when the
+			// explanation was omitted. Persist the ordinary checkpoint as soon as
+			// replay observes that evidence so later retries do not need to infer
+			// publication state from the event log again.
+			state.Commented = true
 		}
 		if !contextWithheld {
 			comments, err := bridge.ListIssueComments(ctx, ViewIssueInput{Repo: repo, IssueNumber: prNumber, CWD: cwd})
@@ -563,6 +587,78 @@ func (r *Runner) appendContextWithheldEvent(ctx context.Context, loop storage.Lo
 		return fmt.Errorf("record withheld-context escalation evidence: %w (verify existing evidence: %v)", err, lookupErr)
 	}
 	return fmt.Errorf("record withheld-context escalation evidence: %w", err)
+}
+
+func regenerationCommentWithheldEventID(loopID, repo string, prNumber int64, authority string) string {
+	loopID = strings.TrimSpace(loopID)
+	if loopID == "" {
+		return ""
+	}
+	identity := fmt.Sprintf("%s\x00%s\x00%d\x00%s", loopID, strings.TrimSpace(repo), prNumber, strings.TrimSpace(authority))
+	digest := sha256.Sum256([]byte(identity))
+	return fmt.Sprintf("%s:%s:%x", regenerationCommentWithheldEventType, loopID, digest[:])
+}
+
+func regenerationCommentWithheldEventMatches(event storage.EventLogRecord, repo string, prNumber int64, authority string) bool {
+	var payload struct {
+		Repo      string `json:"repo"`
+		PRNumber  int64  `json:"prNumber"`
+		Authority string `json:"authority"`
+	}
+	if err := json.Unmarshal([]byte(event.PayloadJSON), &payload); err != nil {
+		return false
+	}
+	return strings.TrimSpace(payload.Repo) == strings.TrimSpace(repo) && payload.PRNumber == prNumber && strings.TrimSpace(payload.Authority) == strings.TrimSpace(authority)
+}
+
+func (r *Runner) hasRegenerationCommentWithheldEvent(ctx context.Context, loopID, repo string, prNumber int64, authority string) (bool, error) {
+	eventID := regenerationCommentWithheldEventID(loopID, repo, prNumber, authority)
+	if eventID == "" || r.repos == nil || r.repos.Events == nil {
+		return false, nil
+	}
+	events, err := r.repos.Events.ListByEntityAndEventTypes(ctx, "loop", strings.TrimSpace(loopID), []string{regenerationCommentWithheldEventType})
+	if err != nil {
+		return false, err
+	}
+	for _, event := range events {
+		if event.ID == eventID && regenerationCommentWithheldEventMatches(event, repo, prNumber, authority) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (r *Runner) appendRegenerationCommentWithheldEvent(ctx context.Context, loop storage.LoopRecord, repo string, prNumber int64, authority string) error {
+	eventID := regenerationCommentWithheldEventID(loop.ID, repo, prNumber, authority)
+	if eventID == "" || r.repos == nil || r.repos.Events == nil {
+		return nil
+	}
+	err := eventlog.Append(ctx, r.repos, eventlog.AppendInput{
+		ID:         eventID,
+		EventType:  regenerationCommentWithheldEventType,
+		ProjectID:  runpipe.OptionalString(loop.ProjectID),
+		LoopID:     runpipe.OptionalString(loop.ID),
+		EntityType: runpipe.OptionalString("loop"),
+		EntityID:   runpipe.OptionalString(loop.ID),
+		ActorType:  runpipe.OptionalString("system"),
+		ActorID:    runpipe.OptionalString("fixer-loop"),
+		Payload:    map[string]any{"repo": strings.TrimSpace(repo), "prNumber": prNumber, "authority": strings.TrimSpace(authority)},
+		CreatedAt:  r.now(),
+	})
+	if err == nil {
+		return nil
+	}
+	// The event ID is a durable uniqueness key. A concurrent replay may have
+	// inserted the same evidence first; accept that exact record and retry any
+	// other storage failure instead of treating the optional comment as settled.
+	recorded, lookupErr := r.hasRegenerationCommentWithheldEvent(ctx, loop.ID, repo, prNumber, authority)
+	if lookupErr == nil && recorded {
+		return nil
+	}
+	if lookupErr != nil {
+		return fmt.Errorf("record withheld regeneration comment evidence: %w (verify existing evidence: %v)", err, lookupErr)
+	}
+	return fmt.Errorf("record withheld regeneration comment evidence: %w", err)
 }
 
 func (r *Runner) persistRegenerationAbort(ctx context.Context, loop storage.LoopRecord, state fixerRegenerationState, reason string) (regenerationAction, error) {
