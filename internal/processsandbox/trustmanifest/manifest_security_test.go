@@ -81,9 +81,9 @@ func TestScriptInterpreterResolvesEnvAndChainedShebangs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resolved, ok, err := scriptInterpreterBytes(envScript, raw, []string{root})
+	resolved, _, ok, err := resolveScriptInterpreter(envScript, raw, []string{root})
 	if err != nil || !ok || resolved != resolvedChain {
-		t.Fatalf("scriptInterpreterBytes() = (%q, %v, %v), want chain path", resolved, ok, err)
+		t.Fatalf("resolveScriptInterpreter() = (%q, %v, %v), want chain path", resolved, ok, err)
 	}
 
 	collector := closureCollector{
@@ -106,9 +106,52 @@ func TestScriptInterpreterResolvesEnvAndChainedShebangs(t *testing.T) {
 
 func TestScriptInterpreterRejectsRelativeDirectShebang(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "script")
-	resolved, ok, err := scriptInterpreterBytes(path, []byte("#!node\n"), nil)
+	resolved, _, ok, err := resolveScriptInterpreter(path, []byte("#!node\n"), nil)
 	if err == nil || ok || !strings.Contains(err.Error(), "non-absolute direct interpreter") {
-		t.Fatalf("scriptInterpreterBytes() = (%q, %v, %v), want direct relative rejection", resolved, ok, err)
+		t.Fatalf("resolveScriptInterpreter() = (%q, %v, %v), want direct relative rejection", resolved, ok, err)
+	}
+}
+
+func TestScriptInterpreterRejectsNonCanonicalEnvPath(t *testing.T) {
+	root := t.TempDir()
+	envPath := filepath.Join(root, "env")
+	if err := os.WriteFile(envPath, []byte("env\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	nodePath := filepath.Join(root, "node")
+	if err := os.WriteFile(nodePath, []byte("node\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	resolved, _, ok, err := resolveScriptInterpreter(filepath.Join(root, "script"), []byte("#!"+envPath+" node\n"), []string{root})
+	if err == nil || ok || !strings.Contains(err.Error(), "unsupported env interpreter path") {
+		t.Fatalf("resolveScriptInterpreter(non-canonical env) = (%q, %v, %v), want path rejection", resolved, ok, err)
+	}
+}
+
+func TestResolveScriptInterpreterReturnsCanonicalEnvClosure(t *testing.T) {
+	root := t.TempDir()
+	nodePath := filepath.Join(root, "node")
+	if err := os.WriteFile(nodePath, []byte("node\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	envPath := "/usr/bin/env"
+	if _, err := os.Stat(envPath); err != nil {
+		t.Skip("canonical env is unavailable")
+	}
+	resolved, env, ok, err := resolveScriptInterpreter(filepath.Join(root, "script"), []byte("#!/usr/bin/env node\n"), []string{root})
+	if err != nil || !ok {
+		t.Fatalf("resolveScriptInterpreter() = (%q, %q, %v, %v), want canonical env resolution", resolved, env, ok, err)
+	}
+	wantNode, err := filepath.EvalSymlinks(nodePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantEnv, err := filepath.EvalSymlinks(envPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved != wantNode || env != wantEnv {
+		t.Fatalf("resolveScriptInterpreter() = (%q, %q), want (%q, %q)", resolved, env, wantNode, wantEnv)
 	}
 }
 
@@ -168,6 +211,43 @@ func TestParseLDDOutputRejectsUnresolvedRelativeCandidates(t *testing.T) {
 	}
 	if got, err := parseLDDOutput("statically linked\n"); err != nil || len(got) != 0 {
 		t.Fatalf("parseLDDOutput(static) = (%#v, %v), want empty closure", got, err)
+	}
+}
+
+func TestParseResolverCredentialRequiresUnprivilegedIdentity(t *testing.T) {
+	if credential, ok := parseResolverCredential(0, "501", "20"); !ok || credential.Uid != 501 || credential.Gid != 20 {
+		t.Fatalf("parseResolverCredential(valid) = (%#v, %t), want uid/gid 501/20", credential, ok)
+	}
+	for _, test := range []struct {
+		name string
+		uid  string
+		gid  string
+	}{
+		{name: "missing", uid: "", gid: ""},
+		{name: "root uid", uid: "0", gid: "20"},
+		{name: "root gid", uid: "501", gid: "0"},
+		{name: "malformed", uid: "daemon", gid: "20"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if credential, ok := parseResolverCredential(0, test.uid, test.gid); ok || credential != nil {
+				t.Fatalf("parseResolverCredential(%q,%q) = (%#v, %t), want no credential", test.uid, test.gid, credential, ok)
+			}
+		})
+	}
+	if credential, ok := parseResolverCredential(1000, "501", "20"); ok || credential != nil {
+		t.Fatalf("parseResolverCredential(non-root) = (%#v, %t), want no credential", credential, ok)
+	}
+}
+
+func TestRequireUnprivilegedResolverFailsClosedForRoot(t *testing.T) {
+	if err := requireUnprivilegedResolver(0, false); err == nil || !strings.Contains(err.Error(), "refusing to execute ELF interpreter as root") {
+		t.Fatalf("requireUnprivilegedResolver(root, false) = %v, want root refusal", err)
+	}
+	if err := requireUnprivilegedResolver(0, true); err != nil {
+		t.Fatalf("requireUnprivilegedResolver(root, true) = %v, want nil", err)
+	}
+	if err := requireUnprivilegedResolver(1000, false); err != nil {
+		t.Fatalf("requireUnprivilegedResolver(non-root, false) = %v, want nil", err)
 	}
 }
 

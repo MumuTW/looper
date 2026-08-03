@@ -569,12 +569,17 @@ func (c *closureCollector) addPackageTree(root, runtimePath string) error {
 			if info.Mode().Perm()&0o111 == 0 {
 				return nil
 			}
-			interpreter, ok, err := scriptInterpreterBytes(path, raw, c.interpreterPaths)
+			interpreter, envInterpreter, ok, err := resolveScriptInterpreter(path, raw, c.interpreterPaths)
 			if err != nil {
 				return err
 			}
 			if !ok {
 				return nil
+			}
+			if envInterpreter != "" {
+				if err := c.addInterpreterClosure(envInterpreter); err != nil {
+					return err
+				}
 			}
 			return c.addInterpreterClosure(interpreter)
 		default:
@@ -600,7 +605,7 @@ func (c *closureCollector) addExecutable(path string, runtimeScript bool) error 
 		}
 		return c.addMachOClosure(path)
 	}
-	interpreter, ok, err := scriptInterpreterBytes(path, raw, c.interpreterPaths)
+	interpreter, envInterpreter, ok, err := resolveScriptInterpreter(path, raw, c.interpreterPaths)
 	if err != nil {
 		return err
 	}
@@ -613,6 +618,11 @@ func (c *closureCollector) addExecutable(path string, runtimeScript bool) error 
 	}
 	if err := c.addContent(path, kind, raw); err != nil {
 		return err
+	}
+	if envInterpreter != "" {
+		if err := c.addInterpreterClosure(envInterpreter); err != nil {
+			return err
+		}
 	}
 	return c.addInterpreterClosure(interpreter)
 }
@@ -661,12 +671,17 @@ func (c *closureCollector) addInterpreterClosure(path string) error {
 	if isMachOBytes(raw) {
 		return c.addMachOClosure(path)
 	}
-	next, ok, err := scriptInterpreterBytes(path, raw, c.interpreterPaths)
+	next, envInterpreter, ok, err := resolveScriptInterpreter(path, raw, c.interpreterPaths)
 	if err != nil {
 		return err
 	}
 	if !ok {
 		return nil
+	}
+	if envInterpreter != "" {
+		if err := c.addInterpreterClosure(envInterpreter); err != nil {
+			return err
+		}
 	}
 	return c.addInterpreterClosure(next)
 }
@@ -1036,29 +1051,43 @@ func resolveMachOLibraryFrom(binaryPath, executablePath, library string, rpaths 
 	return "", fmt.Errorf("resolve Mach-O dependency %s for %s: file not found", library, binaryPath)
 }
 
-func scriptInterpreterBytes(path string, raw []byte, searchPaths []string) (string, bool, error) {
+func resolveScriptInterpreter(path string, raw []byte, searchPaths []string) (string, string, bool, error) {
 	line, _, _ := bytes.Cut(raw, []byte{'\n'})
 	if !bytes.HasPrefix(line, []byte("#!")) {
-		return "", false, nil
+		return "", "", false, nil
 	}
 	fields := strings.Fields(strings.TrimSpace(string(bytes.TrimPrefix(line, []byte("#!")))))
 	if len(fields) == 0 {
-		return "", false, fmt.Errorf("script %s has no absolute interpreter", path)
+		return "", "", false, fmt.Errorf("script %s has no absolute interpreter", path)
 	}
 	interpreter := fields[0]
+	envInterpreter := ""
 	if filepath.Base(interpreter) == "env" {
-		if len(fields) != 2 || strings.HasPrefix(fields[1], "-") {
-			return "", false, fmt.Errorf("script %s uses unsupported env interpreter form", path)
+		if !canonicalEnvInterpreter(interpreter) {
+			return "", "", false, fmt.Errorf("script %s uses unsupported env interpreter path %q", path, interpreter)
 		}
+		if len(fields) != 2 || strings.HasPrefix(fields[1], "-") {
+			return "", "", false, fmt.Errorf("script %s uses unsupported env interpreter form", path)
+		}
+		resolvedEnv, err := resolveExecutablePath(interpreter, nil)
+		if err != nil {
+			return "", "", false, fmt.Errorf("resolve env interpreter: %w", err)
+		}
+		envInterpreter = resolvedEnv
 		interpreter = fields[1]
 	} else if !filepath.IsAbs(interpreter) {
-		return "", false, fmt.Errorf("script %s has a non-absolute direct interpreter %q", path, interpreter)
+		return "", "", false, fmt.Errorf("script %s has a non-absolute direct interpreter %q", path, interpreter)
 	}
 	resolved, err := resolveExecutablePath(interpreter, searchPaths)
 	if err != nil {
-		return "", false, fmt.Errorf("resolve script interpreter: %w", err)
+		return "", "", false, fmt.Errorf("resolve script interpreter: %w", err)
 	}
-	return resolved, true, nil
+	return resolved, envInterpreter, true, nil
+}
+
+func canonicalEnvInterpreter(path string) bool {
+	path = filepath.Clean(strings.TrimSpace(path))
+	return path == "/usr/bin/env" || path == "/bin/env"
 }
 
 func resolveExecutablePath(path string, searchPaths []string) (string, error) {
@@ -1110,12 +1139,16 @@ func lddDependencies(path string) ([]string, error) {
 	// Invoke the exact PT_INTERP loader with its non-executing --list mode. This
 	// avoids /usr/bin/ldd's shell wrapper and its RTLDLIST probe loop, while
 	// matching the loader the kernel will use for this binary.
+	credential, credentialOK := resolverCredential()
+	if err := requireUnprivilegedResolver(os.Geteuid(), credentialOK); err != nil {
+		return nil, err
+	}
 	command := exec.CommandContext(ctx, interpreter, "--list", path)
 	// Resolve the closure under the same no-loader-override assumption rather
 	// than inheriting a daemon LD_LIBRARY_PATH or LD_PRELOAD into the authority
 	// calculation.
 	command.Env = []string{"PATH=/usr/bin:/bin", "LC_ALL=C"}
-	if credential, ok := resolverCredential(); ok {
+	if credentialOK {
 		command.SysProcAttr = &syscall.SysProcAttr{Credential: credential}
 	}
 	var stderr bytes.Buffer
@@ -1134,13 +1167,24 @@ func lddDependencies(path string) ([]string, error) {
 	return parseLDDOutput(string(output))
 }
 
+func requireUnprivilegedResolver(euid int, credentialOK bool) error {
+	if euid == 0 && !credentialOK {
+		return fmt.Errorf("refusing to execute ELF interpreter as root: set SUDO_UID/SUDO_GID to the unprivileged daemon identity")
+	}
+	return nil
+}
+
 func resolverCredential() (*syscall.Credential, bool) {
-	if os.Geteuid() != 0 {
+	return parseResolverCredential(os.Geteuid(), os.Getenv("SUDO_UID"), os.Getenv("SUDO_GID"))
+}
+
+func parseResolverCredential(euid int, uidText, gidText string) (*syscall.Credential, bool) {
+	if euid != 0 {
 		return nil, false
 	}
-	uid, uidErr := strconv.ParseUint(strings.TrimSpace(os.Getenv("SUDO_UID")), 10, 32)
-	gid, gidErr := strconv.ParseUint(strings.TrimSpace(os.Getenv("SUDO_GID")), 10, 32)
-	if uidErr != nil || gidErr != nil {
+	uid, uidErr := strconv.ParseUint(strings.TrimSpace(uidText), 10, 32)
+	gid, gidErr := strconv.ParseUint(strings.TrimSpace(gidText), 10, 32)
+	if uidErr != nil || gidErr != nil || uid == 0 || gid == 0 {
 		// A root-only installer may not have an intended daemon identity in its
 		// environment. Do not guess an unrelated account; the direct loader
 		// resolver only reads metadata and Verify still runs as the daemon user.
