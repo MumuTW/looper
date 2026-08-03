@@ -389,6 +389,9 @@ func TestNonTokenAdmissionDoesNotConsumeProbeSlot(t *testing.T) {
 	if _, err := b.AllowAdmission(); !errors.Is(err, ErrOpen) {
 		t.Fatalf("second token admission = %v, want probe-capacity refusal", err)
 	}
+	if err := b.Allow(); !errors.Is(err, ErrOpen) {
+		t.Fatalf("non-token admission after probe reservation = %v, want probe-capacity refusal", err)
+	}
 	b.RecordAdmission(c.now(), true, true)
 	if got := b.Snapshot().State; got != StateClosed {
 		t.Fatalf("state after reserved probe = %s, want closed", got)

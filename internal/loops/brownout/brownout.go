@@ -214,7 +214,7 @@ func (b *Breaker) allowAdmission(reserveProbe bool) (bool, uint64, error) {
 	probe := false
 	generation := uint64(0)
 	var admissionErr error
-	if reserveProbe && state == StateHalfOpen {
+	if state == StateHalfOpen {
 		generation = b.halfOpenGeneration
 		limit := b.cfg.ProbeSuccesses
 		if limit <= 0 {
@@ -225,7 +225,7 @@ func (b *Breaker) allowAdmission(reserveProbe bool) (bool, uint64, error) {
 		// exceed the configured ProbeSuccesses budget before the breaker closes.
 		if b.probeInFlight+b.probeSuccesses >= limit {
 			admissionErr = fmt.Errorf("%w: recovery probe capacity exhausted", ErrOpen)
-		} else {
+		} else if reserveProbe {
 			b.probeInFlight++
 			probe = true
 		}

@@ -1010,7 +1010,7 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			r.appendEvent(ctx, eventInput{eventType: "loop.step.failed", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"message": failure.Message, "failureKind": string(failure.Kind), "currentStep": derefString(run.CurrentStep)}})
 			r.appendEvent(ctx, eventInput{eventType: "run.failed", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"summary": failure.Message, "failureKind": string(failure.Kind)}})
 			var failedQueue *storage.QueueItemRecord
-			if errors.Is(err, agent.ErrProviderBrownout) {
+			if errors.Is(stepErr, agent.ErrProviderBrownout) {
 				failedQueue, err = r.requeueClaimedItemWithoutAttempt(ctx, queueItem, failure.Kind, failure.Message)
 			} else {
 				failedQueue, err = r.failQueueItem(ctx, queueItem, failure.Kind, failure.Message)
@@ -1300,6 +1300,8 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 			Prompt: prompt, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout,
 			Metadata: metadata, IdempotencyKey: fmt.Sprintf("planner:%s", input.Loop.ID),
 			UseSnapshot: useSnap, SnapshotVendor: snapVendor, SnapshotModel: snapModel, SnapshotReasoningEffort: snapReasoningEffort,
+			CompletionContract:  agent.CompletionContractPlannerMarker,
+			CompletionValidator: validatePlannerCompletionPayload,
 		})
 		if err != nil {
 			return checkpoint, err
@@ -1387,6 +1389,18 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 	checkpoint.WriteSpec.GitReconciled = true
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	return checkpoint, nil
+}
+
+// validatePlannerCompletionPayload is the Planner caller's completion
+// authority. A marker is optional for the single-worker handoff, but when an
+// agent supplies workGraph the same validator used before persistence must
+// reject malformed graphs before the health gate records provider success.
+func validatePlannerCompletionPayload(payload string) bool {
+	if strings.TrimSpace(payload) == "" {
+		return true
+	}
+	_, err := workgraph.ParseResult([]byte(payload))
+	return err == nil
 }
 
 func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (plannerCheckpoint, error) {

@@ -952,6 +952,9 @@ func TestClaimAndRunScheduledQueueItemsSelectsGlobalHighestPriorityAcrossProvide
 	claimed, err := claimAndRunScheduledQueueItems(context.Background(), 1, defaultSchedulerTickInput{
 		Repos: repos, Config: &cfg, Now: func() time.Time { return now }, AsyncRunner: immediateSchedulerRunner{},
 		Planner: &stubPlannerScheduler{}, Reviewer: &stubReviewerScheduler{}, Worker: &stubWorkerScheduler{},
+		// A normal daemon also carries an agent-free Snapshotter lifecycle lane;
+		// that lane must not disable atomic provider selection for coding work.
+		Snapshotter: stubSnapshotScheduler{},
 		WithAllowClaimLanes: func(_ []storage.QueueClaimLane, fn func()) error {
 			atomicLaneCalls++
 			fn()

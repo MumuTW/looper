@@ -33,8 +33,9 @@ type agentHealthRegistry struct {
 	breakers          map[string]*brownout.Breaker
 	// stickyBreakers retain health state for vendors referenced by a sticky
 	// retry after live configuration removes them. They are never included in
-	// AllowAny or aggregate status, so an obsolete vendor cannot bypass the
-	// active-provider brownout gate.
+	// AllowAny or the active-provider aggregate, so an obsolete vendor cannot
+	// bypass the active-provider brownout gate. Non-closed sticky breakers are
+	// still exposed as provider details for operator visibility.
 	stickyBreakers map[string]*brownout.Breaker
 }
 
@@ -531,40 +532,67 @@ func (r *agentHealthRegistry) Snapshot() brownout.Summary {
 	defer r.gateMu.Unlock()
 	summary := brownout.Summary{State: brownout.StateClosed}
 	r.mu.Lock()
-	keys := make([]string, 0, len(r.breakers))
+	activeKeys := make([]string, 0, len(r.breakers))
 	for key := range r.breakers {
-		keys = append(keys, key)
+		activeKeys = append(activeKeys, key)
 	}
-	sort.Strings(keys)
-	entries := make([]struct {
+	stickyKeys := make([]string, 0, len(r.stickyBreakers))
+	for key := range r.stickyBreakers {
+		stickyKeys = append(stickyKeys, key)
+	}
+	sort.Strings(activeKeys)
+	sort.Strings(stickyKeys)
+	type statusEntry struct {
 		provider string
 		breaker  *brownout.Breaker
-	}, 0, len(keys))
-	for _, key := range keys {
-		entries = append(entries, struct {
-			provider string
-			breaker  *brownout.Breaker
-		}{provider: key, breaker: r.breakers[key]})
+		sticky   bool
+	}
+	entries := make([]statusEntry, 0, len(activeKeys)+len(stickyKeys))
+	activeProviders := make(map[string]struct{}, len(activeKeys))
+	for _, key := range activeKeys {
+		activeProviders[key] = struct{}{}
+		entries = append(entries, statusEntry{provider: key, breaker: r.breakers[key]})
+	}
+	for _, key := range stickyKeys {
+		// A vendor normally lives in exactly one map, but do not duplicate a
+		// status row if a config transition is observed while the registry is
+		// being extended in the future.
+		if _, active := activeProviders[key]; active {
+			continue
+		}
+		entries = append(entries, statusEntry{provider: key, breaker: r.stickyBreakers[key], sticky: true})
 	}
 	r.mu.Unlock()
-	allOpen := len(entries) > 0
+	activeCount := len(activeKeys)
+	allOpen := activeCount > 0
 	hasHalfOpen := false
 	hasClosed := false
-	hasNonClosed := false
+	activeHasNonClosed := false
+	hasStatusProviders := false
 	providerSummaries := make([]brownout.ProviderSummary, 0, len(entries))
 	for _, entry := range entries {
 		current := entry.breaker.Snapshot()
-		summary.Failures += current.Failures
-		summary.Total += current.Total
-		summary.Trips += current.Trips
 		provider := brownout.ProviderSummary{Provider: entry.provider, State: current.State, Failures: current.Failures, Total: current.Total, Trips: current.Trips}
 		if current.OpenUntil != nil {
 			openUntil := *current.OpenUntil
 			provider.OpenUntil = &openUntil
 		}
+		if entry.sticky {
+			// Sticky snapshots still need an operator-visible row, but they are
+			// not part of the active-provider AllowAny aggregate.
+			if current.State != brownout.StateClosed {
+				providerSummaries = append(providerSummaries, provider)
+				hasStatusProviders = true
+			}
+			continue
+		}
+		summary.Failures += current.Failures
+		summary.Total += current.Total
+		summary.Trips += current.Trips
 		providerSummaries = append(providerSummaries, provider)
 		if current.State == brownout.StateOpen {
-			hasNonClosed = true
+			activeHasNonClosed = true
+			hasStatusProviders = true
 			if current.OpenUntil != nil && (summary.OpenUntil == nil || current.OpenUntil.Before(*summary.OpenUntil)) {
 				until := *current.OpenUntil
 				summary.OpenUntil = &until
@@ -575,7 +603,7 @@ func (r *agentHealthRegistry) Snapshot() brownout.Summary {
 		allOpen = false
 		switch current.State {
 		case brownout.StateHalfOpen:
-			hasNonClosed = true
+			activeHasNonClosed = true
 			hasHalfOpen = true
 			summary.Cooldown = maxDuration(summary.Cooldown, current.Cooldown)
 		case brownout.StateClosed:
@@ -595,9 +623,9 @@ func (r *agentHealthRegistry) Snapshot() brownout.Summary {
 		summary.State = brownout.StateClosed
 		summary.OpenUntil = nil
 	}
-	if hasNonClosed {
+	if hasStatusProviders {
 		summary.Providers = providerSummaries
-		summary.Partial = hasClosed
+		summary.Partial = activeHasNonClosed && hasClosed
 	}
 	return summary
 }

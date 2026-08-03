@@ -504,6 +504,59 @@ func TestAgentHealthRecordsInFlightOutcomeAfterVendorRemoval(t *testing.T) {
 	}
 }
 
+func TestAgentHealthSnapshotExposesNonClosedStickyProvider(t *testing.T) {
+	rt, _ := brownoutRuntime(t, func(cfg *config.AgentBrownoutConfig) {
+		cfg.MinFailures = 3
+	})
+	codex := config.AgentVendorCodex
+	claude := config.AgentVendorClaudeCode
+	configured := rt.Config()
+	configured.Agent.Vendor = &codex
+	configured.Roles.Worker.Agent = &config.RoleAgentConfig{Vendor: &claude}
+	rt.publishCatalogConsumers(configured)
+	for i := 0; i < 3; i++ {
+		rt.activeExecutions.ReportAgentOutcome(agent.Outcome{Vendor: string(codex), Status: "failed"})
+	}
+	removed := configured
+	removed.Agent.Vendor = nil
+	rt.publishCatalogConsumers(removed)
+
+	summary := rt.AgentHealth()
+	if summary.State != brownout.StateClosed || summary.Partial {
+		t.Fatalf("AgentHealth() = %#v, want active aggregate closed and non-partial", summary)
+	}
+	var sticky *brownout.ProviderSummary
+	for i := range summary.Providers {
+		if summary.Providers[i].Provider == string(codex) {
+			sticky = &summary.Providers[i]
+			break
+		}
+	}
+	if sticky == nil || sticky.State != brownout.StateOpen {
+		t.Fatalf("provider summaries = %#v, want non-closed sticky Codex provider", summary.Providers)
+	}
+}
+
+func TestAgentBrownoutClaimAdmissionSkipsExhaustedHalfOpenProbe(t *testing.T) {
+	rt, clock := brownoutRuntime(t, func(cfg *config.AgentBrownoutConfig) {
+		cfg.MinFailures = 3
+		cfg.ProbeSuccesses = 1
+	})
+	vendor := "_default"
+	failAgent(rt, clock, 3)
+	clock.advance(10 * time.Minute)
+	lease, err := rt.activeExecutions.AdmitSpawn(context.Background(), agent.SpawnMeta{
+		LoopID: "probe-loop", RunID: "probe-run", ExecutionID: "probe-exec", Vendor: vendor,
+	})
+	if err != nil {
+		t.Fatalf("half-open probe spawn = %v", err)
+	}
+	defer lease.Release()
+	if err := rt.AllowClaimForVendor(vendor); !errors.Is(err, brownout.ErrOpen) {
+		t.Fatalf("claim admission with exhausted probe lane = %v, want brownout.ErrOpen", err)
+	}
+}
+
 func TestWorktreeCleanupContinuesDuringAgentBrownout(t *testing.T) {
 	fixture := newWorktreeCleanupFixture(t)
 	for i := 0; i < fixture.config.Scheduler.AgentBrownout.MinFailures; i++ {

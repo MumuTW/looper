@@ -1179,6 +1179,7 @@ func (a reviewerAgentExecutorAdapter) Start(ctx context.Context, input reviewer.
 		SnapshotModel:           input.SnapshotModel,
 		SnapshotReasoningEffort: input.SnapshotReasoningEffort,
 		CompletionContract:      input.CompletionContract,
+		CompletionValidator:     input.CompletionValidator,
 	})
 	if err != nil {
 		proxyCleanup()
@@ -3880,15 +3881,19 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 	stopClaiming := false
 	var claimFailure error
 	claimLanes := func(longTerm bool) {
-		atomicAcrossLanes := input.WithAllowClaimLanes != nil
+		// Agent-free lifecycle work (currently fresh snapshot captures) has its
+		// own admission boundary. Keep it out of the provider union so its
+		// unscoped lane cannot force ordinary coding claims back to peek-then-claim
+		// and lose the global priority/atomicity guarantee.
+		atomicTypeSets := make([]providerClaimTypeSet, 0, len(providerTypeSets))
 		for _, typeSet := range providerTypeSets {
-			if !typeSet.providerScoped && !typeSet.snapshotScoped {
-				atomicAcrossLanes = false
-				break
+			if !typeSet.lifecycleOnly {
+				atomicTypeSets = append(atomicTypeSets, typeSet)
 			}
 		}
+		atomicAcrossLanes := input.WithAllowClaimLanes != nil && len(atomicTypeSets) > 0
 		if atomicAcrossLanes {
-			active := make([]bool, len(providerTypeSets))
+			active := make([]bool, len(atomicTypeSets))
 			for i := range active {
 				active[i] = true
 			}
@@ -3897,10 +3902,10 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 					stopClaiming = true
 					return
 				}
-				lanes := make([]storage.QueueClaimLane, 0, len(providerTypeSets))
-				for offset := range providerTypeSets {
-					index := (laneStart + offset) % len(providerTypeSets)
-					typeSet := providerTypeSets[index]
+				lanes := make([]storage.QueueClaimLane, 0, len(atomicTypeSets))
+				for offset := range atomicTypeSets {
+					index := (laneStart + offset) % len(atomicTypeSets)
+					typeSet := atomicTypeSets[index]
 					if !active[index] {
 						continue
 					}
@@ -3946,6 +3951,39 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 				case claimStop:
 					stopClaiming = true
 					return
+				}
+			}
+			if !stopClaiming && len(queueItems) < availableSlots {
+				for _, typeSet := range providerTypeSets {
+					if !typeSet.lifecycleOnly {
+						continue
+					}
+					for len(queueItems) < availableSlots {
+						result, err := claimOne("", false, false, true, false, nil, func(ctx context.Context, nowISO, claimedBy string) (*storage.QueueItemRecord, error) {
+							if longTerm {
+								return input.Repos.Queue.ClaimNextLongTermRetryAmongTypeSets(ctx, nowISO, claimedBy, typeSet.unrestricted, typeSet.stickyOnly)
+							}
+							return input.Repos.Queue.ClaimNextNonLongTermRetryAmongTypeSets(ctx, nowISO, claimedBy, typeSet.unrestricted, typeSet.stickyOnly)
+						})
+						if err != nil {
+							claimFailure = err
+							stopClaiming = true
+							break
+						}
+						switch result {
+						case claimContinue:
+						case claimEmpty:
+							break
+						case claimSkip, claimStop:
+							stopClaiming = true
+						}
+						if result != claimContinue || stopClaiming {
+							break
+						}
+					}
+					if stopClaiming {
+						break
+					}
 				}
 			}
 			return

@@ -121,6 +121,46 @@ func TestReportOutcomeAcceptsRawJSONEnvelopeContract(t *testing.T) {
 	}
 }
 
+func TestReportOutcomeUsesRawJSONEnvelopeCompletionValidator(t *testing.T) {
+	outcomes := make([]Outcome, 0, 1)
+	exec := outcomeExecution(&outcomes)
+	exec.input.CompletionContract = CompletionContractRawJSONEnvelope
+	exec.input.CompletionValidator = func(message string) bool { return message == `{"decisions":[]}` }
+	exec.reportOutcome("completed", "missing", "", "{\"decisions\":[]}")
+	if len(outcomes) != 1 || !outcomes[0].Succeeded {
+		t.Fatalf("valid semantic raw JSON envelope outcome = %#v, want one successful outcome", outcomes)
+	}
+
+	outcomes = outcomes[:0]
+	exec.reportOutcome("completed", "missing", "", "{\"decisions\":\"invalid\"}")
+	if len(outcomes) != 1 || outcomes[0].Succeeded {
+		t.Fatalf("invalid semantic raw JSON envelope outcome = %#v, want one failed outcome", outcomes)
+	}
+}
+
+func TestReportOutcomeUsesOptionalPlannerMarkerContract(t *testing.T) {
+	outcomes := make([]Outcome, 0, 1)
+	exec := outcomeExecution(&outcomes)
+	exec.input.CompletionContract = CompletionContractPlannerMarker
+	exec.input.CompletionValidator = func(payload string) bool { return payload == "" || payload == `{"summary":"done"}` }
+	exec.reportOutcome("completed", "missing", "", "")
+	if len(outcomes) != 1 || !outcomes[0].Succeeded {
+		t.Fatalf("missing Planner marker outcome = %#v, want one successful outcome", outcomes)
+	}
+
+	outcomes = outcomes[:0]
+	exec.reportOutcome("completed", "parsed", `{"summary":"done"}`, "")
+	if len(outcomes) != 1 || !outcomes[0].Succeeded {
+		t.Fatalf("valid Planner marker outcome = %#v, want one successful outcome", outcomes)
+	}
+
+	outcomes = outcomes[:0]
+	exec.reportOutcome("completed", "invalid_json", "", "")
+	if len(outcomes) != 1 || outcomes[0].Succeeded {
+		t.Fatalf("malformed Planner marker outcome = %#v, want one failed outcome", outcomes)
+	}
+}
+
 func TestReportOutcomeUsesRawJSONCompletionValidator(t *testing.T) {
 	outcomes := make([]Outcome, 0, 1)
 	exec := outcomeExecution(&outcomes)

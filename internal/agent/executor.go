@@ -388,7 +388,11 @@ const (
 	CompletionContractRawJSONEnvelope CompletionContract = "raw_json_envelope"
 	CompletionContractReviewerMarker  CompletionContract = "reviewer_marker"
 	CompletionContractFixerMarker     CompletionContract = "fixer_marker"
-	CompletionContractFile            CompletionContract = "file"
+	// CompletionContractPlannerMarker matches Planner's optional completion
+	// marker. Planner can advance from a successful agent result without a
+	// marker, while a present marker is still validated by the Planner caller.
+	CompletionContractPlannerMarker CompletionContract = "planner_marker"
+	CompletionContractFile          CompletionContract = "file"
 )
 
 // TimeoutObservation identifies the timeout that is about to terminate an
@@ -1451,10 +1455,22 @@ func (x *execution) reportOutcome(status, parseStatus, completionPayload, stdout
 		}
 	} else if x.input.CompletionContract == CompletionContractRawJSONEnvelope {
 		succeeded = succeeded && validRawJSONObjectEnvelope(stdout)
+		if succeeded && x.input.CompletionValidator != nil {
+			succeeded = x.input.CompletionValidator(FinalMessage(stdout))
+		}
 	} else if x.input.CompletionContract == CompletionContractReviewerMarker {
 		succeeded = succeeded && parseStatus == "parsed" && validReviewerMarkerOutcome(completionPayload)
 	} else if x.input.CompletionContract == CompletionContractFixerMarker {
 		succeeded = succeeded && parseStatus == "parsed" && validFixerMarkerOutcome(completionPayload)
+	} else if x.input.CompletionContract == CompletionContractPlannerMarker {
+		// Planner's runner treats the marker as optional. A malformed marker is
+		// still a failed completion, while a caller validator owns the optional
+		// workGraph schema when a marker is present (or receives an empty payload
+		// when the marker is absent).
+		succeeded = succeeded && (parseStatus == "missing" || (parseStatus == "parsed" && validMarkerOutcome(completionPayload)))
+		if succeeded && x.input.CompletionValidator != nil {
+			succeeded = x.input.CompletionValidator(completionPayload)
+		}
 	} else {
 		succeeded = succeeded && parseStatus == "parsed" && validMarkerOutcome(completionPayload)
 	}

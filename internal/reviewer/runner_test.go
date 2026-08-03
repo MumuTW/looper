@@ -9339,6 +9339,9 @@ func TestRunThreadResolutionStepIgnoresProviderWordsInSuccessfulSummaryJSON(t *t
 	if len(agent.starts) != 1 || agent.starts[0].CompletionContract != agentpkg.CompletionContractRawJSONEnvelope {
 		t.Fatalf("agent starts = %#v, want raw JSON completion contract", agent.starts)
 	}
+	if agent.starts[0].CompletionValidator == nil || !agent.starts[0].CompletionValidator(jsonOutput) || agent.starts[0].CompletionValidator(`{"decisions":"invalid"}`) {
+		t.Fatal("thread-resolution completion validator does not match resolution.ParseOutput")
+	}
 	if len(github.addThreadReplyCalls) != 1 || !strings.Contains(github.addThreadReplyCalls[0].Body, "service unavailable") {
 		t.Fatalf("addThreadReplyCalls = %#v, want evidence comment", github.addThreadReplyCalls)
 	}
