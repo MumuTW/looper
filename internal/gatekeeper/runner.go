@@ -472,7 +472,7 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 		Reasons: []Reason{}, Evidence: Evidence{
 			RequiredChecks: []string{}, Checks: []CheckEvidence{}, UnresolvedReviewThreadIDs: []string{}, HoldLabels: []string{},
 			ReviewProvenance: ReviewProvenance{Reviewers: []ReviewerObservation{}, Refusals: []ReviewRefusal{}},
-			ClosingIssues: []githubinfra.IssueReference{},
+			ClosingIssues:    []githubinfra.IssueReference{},
 		},
 		EvaluatedAt:       r.now().UTC().Format(time.RFC3339Nano),
 		SourceFingerprint: input.SourceFingerprint,

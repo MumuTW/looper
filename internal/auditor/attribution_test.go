@@ -7,9 +7,9 @@ import (
 
 func TestAttributeUsesObservedSignalsAndRanksCandidates(t *testing.T) {
 	now := time.Date(2026, time.July, 31, 10, 0, 0, 0, time.UTC)
-	result := Attribute(FailureEvidence{ObservedAt: now, FailingPaths: []string{"internal/api/routes.go"}}, []MergeCandidate{
-		{PRNumber: 10, MergedAt: now.Add(-2 * time.Minute), TouchedFiles: []string{"internal/api/routes.go"}},
-		{PRNumber: 11, MergedAt: now.Add(-time.Minute), TouchedFiles: []string{"README.md"}},
+	result := Attribute(FailureEvidence{ObservedAt: now, FailingPaths: []string{"internal/api/routes.go"}, BaselineKnown: true, FailingPathEvidenceComplete: true}, []MergeCandidate{
+		{PRNumber: 10, MergedAt: now.Add(-2 * time.Minute), TouchedFiles: []string{"internal/api/routes.go"}, TouchedFilesAvailable: true},
+		{PRNumber: 11, MergedAt: now.Add(-time.Minute), TouchedFiles: []string{"README.md"}, TouchedFilesAvailable: true},
 	})
 	if result.Confidence != ConfidenceHigh || result.Candidate == nil || result.Candidate.PRNumber != 10 {
 		t.Fatalf("Attribute() = %#v, want high confidence PR 10", result)
@@ -21,9 +21,9 @@ func TestAttributeUsesObservedSignalsAndRanksCandidates(t *testing.T) {
 
 func TestAttributeEscalatesTieAndPreexistingFailure(t *testing.T) {
 	now := time.Date(2026, time.July, 31, 10, 0, 0, 0, time.UTC)
-	tied := Attribute(FailureEvidence{ObservedAt: now, FailingPaths: []string{"a.go"}}, []MergeCandidate{
-		{PRNumber: 10, MergedAt: now.Add(-2 * time.Minute), TouchedFiles: []string{"a.go"}},
-		{PRNumber: 11, MergedAt: now.Add(-time.Minute), TouchedFiles: []string{"a.go"}},
+	tied := Attribute(FailureEvidence{ObservedAt: now, FailingPaths: []string{"a.go"}, BaselineKnown: true, FailingPathEvidenceComplete: true}, []MergeCandidate{
+		{PRNumber: 10, MergedAt: now.Add(-2 * time.Minute), TouchedFiles: []string{"a.go"}, TouchedFilesAvailable: true},
+		{PRNumber: 11, MergedAt: now.Add(-time.Minute), TouchedFiles: []string{"a.go"}, TouchedFilesAvailable: true},
 	})
 	if tied.Confidence != ConfidenceLow || tied.Reason != "multiple_candidates_have_equal_evidence" {
 		t.Fatalf("tied attribution = %#v, want low-confidence escalation", tied)
@@ -31,5 +31,16 @@ func TestAttributeEscalatesTieAndPreexistingFailure(t *testing.T) {
 	preexisting := Attribute(FailureEvidence{ObservedAt: now, ExistedBeforeAuditWindow: true}, []MergeCandidate{{PRNumber: 12, MergedAt: now.Add(-time.Minute)}})
 	if preexisting.Confidence != ConfidenceNone || preexisting.Candidate != nil || preexisting.Reason != "failure_precedes_audit_window" {
 		t.Fatalf("preexisting attribution = %#v, want no attribution", preexisting)
+	}
+}
+
+func TestAttributeFailsClosedWhenAnyCandidateLacksFileEvidence(t *testing.T) {
+	now := time.Date(2026, time.July, 31, 10, 0, 0, 0, time.UTC)
+	result := Attribute(FailureEvidence{ObservedAt: now, FailingPaths: []string{"a.go"}, BaselineKnown: true, FailingPathEvidenceComplete: true}, []MergeCandidate{
+		{PRNumber: 10, MergedAt: now.Add(-2 * time.Minute), TouchedFiles: []string{"a.go"}, TouchedFilesAvailable: true},
+		{PRNumber: 11, MergedAt: now.Add(-time.Minute), TouchedFilesAvailable: false},
+	})
+	if result.Confidence != ConfidenceNone || result.Candidate != nil || result.Reason != "merge_file_evidence_incomplete" {
+		t.Fatalf("Attribute() = %#v, want fail-closed missing file evidence", result)
 	}
 }

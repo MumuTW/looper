@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -69,7 +70,7 @@ func observePostMergeFailure(ctx context.Context, repos *storage.Repositories, g
 	}
 	failureEvidence := failedAuditorCheckEvidence(checks)
 	if len(failureEvidence.Names) == 0 {
-		return nil
+		return recordAuditorBaseline(ctx, repos, project, repo, headSHA, observedAt)
 	}
 	since := eventlog.FormatJavaScriptISOString(observedAt.Add(-time.Duration(role.WindowMinutes) * time.Minute))
 	mergeEvents, err := events.ListSince(ctx, since)
@@ -94,7 +95,6 @@ func observePostMergeFailure(ctx context.Context, repos *storage.Repositories, g
 		candidatePRs = append(candidatePRs, prNumber)
 	}
 	sort.Slice(candidatePRs, func(i, j int) bool { return candidatePRs[i] < candidatePRs[j] })
-	failingPaths := failedAuditorCheckPaths(ctx, gateway, repo, project.RepoPath, checks)
 	entityType, entityID := "branch_head", repo+"@"+headSHA
 	existing, err := events.ListByEntity(ctx, entityType, entityID)
 	if err != nil {
@@ -105,24 +105,31 @@ func observePostMergeFailure(ctx context.Context, repos *storage.Repositories, g
 			return nil
 		}
 	}
+	failingPaths, pathEvidenceComplete := failedAuditorCheckPaths(ctx, gateway, repo, project.RepoPath, checks)
+	baselineKnown := auditorHasCleanBaseline(mergeEvents, project.ID, repo, since)
 	projectID := project.ID
 	return eventlog.Append(ctx, repos, eventlog.AppendInput{
 		EventType: auditor.ObservedFailureEventType, ProjectID: &projectID, EntityType: &entityType, EntityID: &entityID,
-		Payload: auditor.FailureObservation{Version: 3, ProjectID: project.ID, Repo: repo, HeadSHA: headSHA, FailedChecks: failureEvidence.Names, FailingPaths: failingPaths, CheckSuiteIDs: failureEvidence.SuiteIDs, CandidatePRs: candidatePRs, ObservedAt: eventlog.FormatJavaScriptISOString(observedAt)}, CreatedAt: observedAt,
+		Payload: auditor.FailureObservation{Version: 4, ProjectID: project.ID, Repo: repo, HeadSHA: headSHA, FailedChecks: failureEvidence.Names, FailingPaths: failingPaths, FailingPathEvidenceComplete: pathEvidenceComplete, CheckSuiteIDs: failureEvidence.SuiteIDs, CandidatePRs: candidatePRs, BaselineKnown: baselineKnown, ObservedAt: eventlog.FormatJavaScriptISOString(observedAt)}, CreatedAt: observedAt,
 	})
 }
 
-func failedAuditorCheckPaths(ctx context.Context, gateway auditorGateway, repo, cwd string, checks githubinfra.PullRequestCheckRuns) []string {
+func failedAuditorCheckPaths(ctx context.Context, gateway auditorGateway, repo, cwd string, checks githubinfra.PullRequestCheckRuns) ([]string, bool) {
 	paths := make(map[string]struct{})
+	complete := true
 	for _, check := range checks.CheckRuns {
 		if check.ID <= 0 || !isFailedCheckState(check.Status, check.Conclusion) {
 			continue
 		}
 		annotations, err := gateway.ListCheckRunAnnotations(ctx, githubinfra.CheckRunAnnotationsInput{Repo: repo, CheckRunID: check.ID, CWD: cwd})
 		if err != nil {
+			complete = false
 			continue
 		}
 		for _, annotation := range annotations {
+			if !strings.EqualFold(strings.TrimSpace(annotation.Level), "failure") {
+				continue
+			}
 			if path := strings.TrimSpace(annotation.Path); path != "" {
 				paths[path] = struct{}{}
 			}
@@ -133,7 +140,46 @@ func failedAuditorCheckPaths(ctx context.Context, gateway auditorGateway, repo, 
 		result = append(result, path)
 	}
 	sort.Strings(result)
-	return result
+	return result, complete
+}
+
+func recordAuditorBaseline(ctx context.Context, repos *storage.Repositories, project storage.ProjectRecord, repo, headSHA string, observedAt time.Time) error {
+	entityType, entityID := "branch_head", repo+"@"+headSHA
+	existing, err := repos.Events.ListByEntity(ctx, entityType, entityID)
+	if err != nil {
+		return err
+	}
+	for _, event := range existing {
+		if event.EventType == auditor.BaselineEventType {
+			return nil
+		}
+	}
+	projectID := project.ID
+	return eventlog.Append(ctx, repos, eventlog.AppendInput{
+		EventType: auditor.BaselineEventType, ProjectID: &projectID, EntityType: &entityType, EntityID: &entityID,
+		Payload: auditor.BaselineObservation{Version: 1, ProjectID: project.ID, Repo: repo, HeadSHA: headSHA, ObservedAt: eventlog.FormatJavaScriptISOString(observedAt)}, CreatedAt: observedAt,
+	})
+}
+
+func auditorHasCleanBaseline(events []storage.EventLogRecord, projectID, repo, since string) bool {
+	sinceTime, err := time.Parse(time.RFC3339Nano, since)
+	if err != nil {
+		return false
+	}
+	for _, event := range events {
+		if event.EventType != auditor.BaselineEventType || event.ProjectID == nil || *event.ProjectID != projectID {
+			continue
+		}
+		var baseline auditor.BaselineObservation
+		if json.Unmarshal([]byte(event.PayloadJSON), &baseline) != nil || !strings.EqualFold(baseline.Repo, repo) {
+			continue
+		}
+		createdAt, parseErr := time.Parse(time.RFC3339Nano, event.CreatedAt)
+		if parseErr == nil && !createdAt.Before(sinceTime) {
+			return true
+		}
+	}
+	return false
 }
 
 func auditorRoleForProject(cfg config.Config, projectID string) config.AuditorRoleConfig {

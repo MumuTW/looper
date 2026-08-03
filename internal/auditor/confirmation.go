@@ -18,8 +18,10 @@ const (
 // with one completed re-run on the same audited ref.
 type ConfirmationInput struct {
 	InitialFailedChecks []string
+	InitialFailedPaths  []string
 	RerunCompleted      bool
 	RerunFailedChecks   []string
+	RerunFailedPaths    []string
 }
 
 type ConfirmationResult struct {
@@ -39,6 +41,12 @@ func ConfirmFailure(input ConfirmationInput) ConfirmationResult {
 	if len(rerun) == 0 {
 		return ConfirmationResult{Outcome: ConfirmationSuspectedFlake}
 	}
+	initialPathCount, rerunPathCount := len(input.InitialFailedPaths), len(input.RerunFailedPaths)
+	if (initialPathCount == 0) != (rerunPathCount == 0) || (initialPathCount > 0 && !hasPathOverlap(input.InitialFailedPaths, input.RerunFailedPaths)) {
+		// A missing path signature on either side is not proof that the same
+		// failure returned. Keep this conservative even when check names match.
+		return ConfirmationResult{Outcome: ConfirmationDifferentFailure}
+	}
 	confirmed := make([]string, 0)
 	for check := range rerun {
 		if _, exists := initial[check]; exists {
@@ -50,6 +58,21 @@ func ConfirmFailure(input ConfirmationInput) ConfirmationResult {
 	}
 	sort.Strings(confirmed)
 	return ConfirmationResult{Outcome: ConfirmationConfirmed, ConfirmedChecks: confirmed}
+}
+
+func hasPathOverlap(left, right []string) bool {
+	set := make(map[string]struct{}, len(left))
+	for _, value := range left {
+		if normalized := strings.TrimSpace(value); normalized != "" {
+			set[normalized] = struct{}{}
+		}
+	}
+	for _, value := range right {
+		if _, ok := set[strings.TrimSpace(value)]; ok && strings.TrimSpace(value) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func normalizedSet(checks []string) map[string]struct{} {
