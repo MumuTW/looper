@@ -295,7 +295,7 @@ func newGatekeeperFixtureWithReview(t *testing.T, seedReview bool) *gatekeeperFi
 		now:   now,
 		github: &fakeGatekeeperGitHub{
 			detail:    githubinfra.PullRequestDetail{Number: 42, State: "OPEN", HeadSHA: "head-1", BaseRefName: "main", ReviewDecision: "APPROVED"},
-			mergeable: githubinfra.PullRequestDetail{Number: 42, HeadSHA: "head-1", Mergeable: &mergeable, MergeableState: "clean", MergedAt: nowISO, MergeCommitSHA: "merge-commit-1"},
+			mergeable: githubinfra.PullRequestDetail{Number: 42, HeadSHA: "head-1", Mergeable: &mergeable, MergeableState: "clean"},
 			protection: githubinfra.BranchProtection{
 				Enabled: true, HasRequiredChecks: true, RequiredChecks: []string{"ci", RequiredStatusContext},
 				RequiredCheckRules: []githubinfra.RequiredCheckRule{{Context: "ci", AppID: 15368}},
@@ -437,13 +437,21 @@ type fakeGatekeeperGitHub struct {
 	// makes, so a test can prove a pull request was skipped rather than evaluated.
 	perPullRequestCalls int
 
-	currentLogin string
-	commentErr   error
-	deletedIDs   []int64
-	merges       []githubinfra.EnableAutoMergeInput
-	mergeErr     error
-	files        []string
-	filesErr     error
+	currentLogin          string
+	commentErr            error
+	deletedIDs            []int64
+	listCalls             int
+	loginCalls            int
+	comments              []githubinfra.CommentInfo
+	createdBodies         []string
+	updatedBodies         []string
+	reviewMarker          githubinfra.ReviewMarkerResult
+	reviewMarkerErr       error
+	reviewMarkerCalls     []githubinfra.VerifyReviewMarkerInput
+	statusCalls           []githubinfra.CommitStatusInput
+	statusErr             error
+	viewErr               error
+	listReviewThreadsHook func(*fakeGatekeeperGitHub) error
 	// beforeView, when set, runs before each pull-request read, so a test can
 	// inject a state change between the first evaluation and a later one.
 	beforeView func(*fakeGatekeeperGitHub)
@@ -564,10 +572,6 @@ func (f *fakeGatekeeperGitHub) FindReviewMarker(_ context.Context, input githubi
 func (f *fakeGatekeeperGitHub) SetCommitStatus(_ context.Context, input githubinfra.CommitStatusInput) error {
 	f.statusCalls = append(f.statusCalls, input)
 	return f.statusErr
-}
-
-func (f *fakeGatekeeperGitHub) ListPullRequestFiles(context.Context, githubinfra.ViewPullRequestInput) ([]string, error) {
-	return f.files, f.filesErr
 }
 
 func reasonCodes(reasons []Reason) []ReasonCode {
