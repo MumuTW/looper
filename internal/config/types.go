@@ -775,6 +775,8 @@ type RoleConfigs struct {
 	Fixer       FixerRoleConfig       `json:"fixer"`
 	Worker      WorkerRoleConfig      `json:"worker"`
 	Coordinator CoordinatorRoleConfig `json:"coordinator"`
+	Gatekeeper  GatekeeperRoleConfig  `json:"gatekeeper"`
+	Auditor     AuditorRoleConfig     `json:"auditor"`
 	Deployer    DeployerRoleConfig    `json:"deployer"`
 	Escalator   EscalatorRoleConfig   `json:"escalator"`
 }
@@ -844,6 +846,66 @@ type DeployerRoleConfig struct {
 	// Environment is added to the deploy command's environment. Values, not names:
 	// a deploy usually needs credentials the daemon itself has no use for.
 	Environment map[string]string `json:"environment,omitempty"`
+}
+
+// GatekeeperTrustLevel is how much merge authority Merge Gatekeeper holds for a
+// project. It is a ladder, not a switch: a level is reached by explicit operator
+// promotion and never promotes itself.
+type GatekeeperTrustLevel string
+
+const (
+	// GatekeeperTrustObserve writes a Gate report and nothing else. The default
+	// for every project.
+	GatekeeperTrustObserve GatekeeperTrustLevel = "observe"
+	// GatekeeperTrustAdvise additionally publishes the verdict and its reasons on
+	// the pull request, so a human can decide without redoing the judgement.
+	GatekeeperTrustAdvise GatekeeperTrustLevel = "advise"
+	// GatekeeperTrustAuto publishes the required current-head status for GitHub
+	// branch protection on the pull request head SHA only. It never performs a
+	// merge itself: GitHub remains the merge authority. It does not publish
+	// status for GitHub native merge-queue merge-group SHAs; branch protection
+	// that requires Looper Gatekeeper on merge-group commits is unsupported.
+	GatekeeperTrustAuto GatekeeperTrustLevel = "auto"
+)
+
+// GatekeeperRoleConfig configures the agent-free Merge Gatekeeper.
+type GatekeeperRoleConfig struct {
+	// Trust is the merge authority level. Empty defaults to observe.
+	Trust      GatekeeperTrustLevel  `json:"trust,omitempty"`
+	DiffBudget *GatekeeperDiffBudget `json:"diffBudget,omitempty"`
+}
+
+// GatekeeperDiffBudget is a boolean change-size gate. A zero bound is
+// unlimited; non-zero bounds are enforced independently. The two bounds are
+// independent: configuring only maxDeletions leaves changedFiles unlimited, so a
+// very large addition concentrated in a few files can still pass.
+//
+// Remaining blind spots reviewers should weigh before relying on this gate:
+//
+//   - Only changed-file count and deletion count are bounded. There is no
+//     maxAdditions or total-line bound, so a massive purely-additive diff passes
+//     whenever maxDeletions is the only configured bound.
+//   - Counts are whole-PR totals from GitHub, computed against the current merge
+//     base. There is no per-file or per-path budget, so one very large file
+//     passes whenever the file count is under limit, and generated or vendored
+//     files are not excluded.
+//   - The gate is boolean per bound, not a score. It reports observed counts and
+//     configured limits as evidence; it does not model review effort or risk.
+//
+// What it still does not catch is the price of a cheap, deterministic,
+// provider-authoritative guard; a heuristic or inferred diff layer would be less
+// authoritative and is deliberately not built here.
+type GatekeeperDiffBudget struct {
+	MaxChangedFiles int `json:"maxChangedFiles"`
+	MaxDeletions    int `json:"maxDeletions"`
+}
+
+// AuditorRoleConfig configures the opt-in Post-merge Auditor. It remains
+// disabled by default because watching default-branch checks changes operator
+// workload even though the Auditor never merges or pushes a revert itself.
+type AuditorRoleConfig struct {
+	Enabled       bool `json:"enabled"`
+	WindowMinutes int  `json:"windowMinutes"`
 }
 
 type ProjectRefConfig struct {
@@ -1473,12 +1535,28 @@ type PartialDeployerRoleConfig struct {
 	Environment    *map[string]string `json:"environment,omitempty"`
 }
 
-// DeprecatedGatekeeperRoleConfig is parse-only compatibility for configurations
-// written while Gatekeeper advise was available. The rollback deliberately
-// ignores it, so an upgrade boots in observe-only mode and operators can remove
-// the stale setting without disabling strict decoding for other role fields.
-type DeprecatedGatekeeperRoleConfig struct {
-	Trust *string `json:"trust,omitempty"`
+type PartialGatekeeperRoleConfig struct {
+	Trust      *GatekeeperTrustLevel        `json:"trust,omitempty"`
+	DiffBudget *PartialGatekeeperDiffBudget `json:"diffBudget,omitempty"`
+}
+
+type PartialGatekeeperDiffBudget struct {
+	MaxChangedFiles *int `json:"maxChangedFiles,omitempty"`
+	MaxDeletions    *int `json:"maxDeletions,omitempty"`
+}
+
+type PartialEscalatorRoleConfig struct {
+	Enabled               *bool  `json:"enabled,omitempty"`
+	CadenceSeconds        *int   `json:"cadenceSeconds,omitempty"`
+	RetryAttemptThreshold *int64 `json:"retryAttemptThreshold,omitempty"`
+	UnroutedAfterSeconds  *int   `json:"unroutedAfterSeconds,omitempty"`
+	StaleHeadAfterSeconds *int   `json:"staleHeadAfterSeconds,omitempty"`
+	MaxItems              *int   `json:"maxItems,omitempty"`
+}
+
+type PartialAuditorRoleConfig struct {
+	Enabled       *bool `json:"enabled,omitempty"`
+	WindowMinutes *int  `json:"windowMinutes,omitempty"`
 }
 
 type PartialRoleConfigs struct {
@@ -1494,10 +1572,10 @@ type PartialRoleConfigs struct {
 	Fixer       *PartialFixerRoleConfig            `json:"fixer,omitempty"`
 	Worker      *PartialWorkerRoleConfig           `json:"worker,omitempty"`
 	Coordinator *PartialCoordinatorRoleConfig      `json:"coordinator,omitempty"`
-	// Gatekeeper is deprecated parse-only compatibility; it has no runtime
-	// authority and is not projected into RoleConfigs.
-	Gatekeeper *DeprecatedGatekeeperRoleConfig `json:"gatekeeper,omitempty"`
-	Deployer   *PartialDeployerRoleConfig      `json:"deployer,omitempty"`
+	Gatekeeper  *PartialGatekeeperRoleConfig       `json:"gatekeeper,omitempty"`
+	Auditor     *PartialAuditorRoleConfig          `json:"auditor,omitempty"`
+	Deployer    *PartialDeployerRoleConfig         `json:"deployer,omitempty"`
+	Escalator   *PartialEscalatorRoleConfig        `json:"escalator,omitempty"`
 	// Deprecated: sweeper was retired and is ignored when present in older configs.
 	Sweeper *map[string]any `json:"sweeper,omitempty"`
 }

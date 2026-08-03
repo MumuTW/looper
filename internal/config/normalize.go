@@ -21,9 +21,6 @@ func Normalize(cwd string, partials ...PartialConfig) (Config, error) {
 		if issues := validateProjectCodingRoleSections(partial); len(issues) > 0 {
 			return Config{}, &ConfigValidationError{Issues: issues}
 		}
-		if issues := validateDeprecatedGatekeeperTrust(partial); len(issues) > 0 {
-			return Config{}, &ConfigValidationError{Issues: issues}
-		}
 		normalized := normalizeLayerPartial(clonePartialConfig(partial))
 		mergeConfig(&config, normalized)
 		normalizedLayers = append(normalizedLayers, normalized)
@@ -61,43 +58,6 @@ func Normalize(cwd string, partials ...PartialConfig) (Config, error) {
 	}
 
 	return config, nil
-}
-
-// validateDeprecatedGatekeeperTrust keeps the parse-only compatibility field
-// strict about the values that were historically loadable.  The field has no
-// runtime authority, but silently accepting "auto" would make an unsupported
-// merge authority look like a valid configuration and then fall back to
-// observe-only behavior.
-func validateDeprecatedGatekeeperTrust(partial PartialConfig) []ValidationIssue {
-	issues := make([]ValidationIssue, 0)
-	validate := func(value *string, path string) {
-		if value == nil {
-			return
-		}
-		switch strings.ToLower(strings.TrimSpace(*value)) {
-		case "", "observe", "advise":
-		default:
-			issues = append(issues, ValidationIssue{Path: path, Message: "must be one of: observe, advise"})
-		}
-	}
-	if partial.Roles != nil {
-		validateDeprecatedGatekeeperRoleTrust(partial.Roles.Gatekeeper, "roles.gatekeeper.trust", validate)
-	}
-	if partial.Projects != nil {
-		for index, project := range *partial.Projects {
-			if project.Roles != nil {
-				validateDeprecatedGatekeeperRoleTrust(project.Roles.Gatekeeper, fmt.Sprintf("projects[%d].roles.gatekeeper.trust", index), validate)
-			}
-		}
-	}
-	return issues
-}
-
-func validateDeprecatedGatekeeperRoleTrust(role *DeprecatedGatekeeperRoleConfig, path string, validate func(*string, string)) {
-	if role == nil {
-		return
-	}
-	validate(role.Trust, path)
 }
 
 // validateProjectCodingRoleSections rejects roles.coding.* under a project:
@@ -1324,6 +1284,59 @@ func mergeRoleConfigs(config *RoleConfigs, partial PartialRoleConfigs) {
 	if partial.Deployer != nil {
 		mergeDeployerRoleConfig(&config.Deployer, *partial.Deployer)
 	}
+	if partial.Auditor != nil {
+		if partial.Auditor.Enabled != nil {
+			config.Auditor.Enabled = *partial.Auditor.Enabled
+		}
+		if partial.Auditor.WindowMinutes != nil {
+			config.Auditor.WindowMinutes = *partial.Auditor.WindowMinutes
+		}
+	}
+	if partial.Gatekeeper != nil {
+		if partial.Gatekeeper.Trust != nil {
+			config.Gatekeeper.Trust = GatekeeperTrustLevel(strings.TrimSpace(string(*partial.Gatekeeper.Trust)))
+		}
+		if partial.Gatekeeper.DiffBudget != nil {
+			budget := config.Gatekeeper.DiffBudget
+			if budget == nil {
+				budget = &GatekeeperDiffBudget{}
+			} else {
+				cloned := *budget
+				budget = &cloned
+			}
+			if partial.Gatekeeper.DiffBudget.MaxChangedFiles != nil {
+				budget.MaxChangedFiles = *partial.Gatekeeper.DiffBudget.MaxChangedFiles
+			}
+			if partial.Gatekeeper.DiffBudget.MaxDeletions != nil {
+				budget.MaxDeletions = *partial.Gatekeeper.DiffBudget.MaxDeletions
+			}
+			config.Gatekeeper.DiffBudget = budget
+		}
+	}
+	if partial.Escalator != nil {
+		mergeEscalatorRoleConfig(&config.Escalator, *partial.Escalator)
+	}
+}
+
+func mergeEscalatorRoleConfig(config *EscalatorRoleConfig, partial PartialEscalatorRoleConfig) {
+	if partial.Enabled != nil {
+		config.Enabled = *partial.Enabled
+	}
+	if partial.CadenceSeconds != nil {
+		config.CadenceSeconds = *partial.CadenceSeconds
+	}
+	if partial.RetryAttemptThreshold != nil {
+		config.RetryAttemptThreshold = *partial.RetryAttemptThreshold
+	}
+	if partial.UnroutedAfterSeconds != nil {
+		config.UnroutedAfterSeconds = *partial.UnroutedAfterSeconds
+	}
+	if partial.StaleHeadAfterSeconds != nil {
+		config.StaleHeadAfterSeconds = *partial.StaleHeadAfterSeconds
+	}
+	if partial.MaxItems != nil {
+		config.MaxItems = *partial.MaxItems
+	}
 }
 
 func mergeTriagerRoleConfig(config *TriagerRoleConfig, partial PartialTriagerRoleConfig) {
@@ -2199,6 +2212,57 @@ func clonePartialRoleConfigs(configs *PartialRoleConfigs) *PartialRoleConfigs {
 			deployerRole.Environment = &environment
 		}
 		cloned.Deployer = &deployerRole
+	}
+	if configs.Gatekeeper != nil {
+		gatekeeper := *configs.Gatekeeper
+		if configs.Gatekeeper.Trust != nil {
+			trust := *configs.Gatekeeper.Trust
+			gatekeeper.Trust = &trust
+		}
+		if configs.Gatekeeper.DiffBudget != nil {
+			gatekeeper.DiffBudget = clonePartialGatekeeperDiffBudget(configs.Gatekeeper.DiffBudget)
+		}
+		cloned.Gatekeeper = &gatekeeper
+	}
+	if configs.Auditor != nil {
+		auditor := *configs.Auditor
+		if configs.Auditor.Enabled != nil {
+			enabled := *configs.Auditor.Enabled
+			auditor.Enabled = &enabled
+		}
+		if configs.Auditor.WindowMinutes != nil {
+			window := *configs.Auditor.WindowMinutes
+			auditor.WindowMinutes = &window
+		}
+		cloned.Auditor = &auditor
+	}
+	if configs.Escalator != nil {
+		escalator := *configs.Escalator
+		if configs.Escalator.Enabled != nil {
+			value := *configs.Escalator.Enabled
+			escalator.Enabled = &value
+		}
+		if configs.Escalator.CadenceSeconds != nil {
+			value := *configs.Escalator.CadenceSeconds
+			escalator.CadenceSeconds = &value
+		}
+		if configs.Escalator.RetryAttemptThreshold != nil {
+			value := *configs.Escalator.RetryAttemptThreshold
+			escalator.RetryAttemptThreshold = &value
+		}
+		if configs.Escalator.UnroutedAfterSeconds != nil {
+			value := *configs.Escalator.UnroutedAfterSeconds
+			escalator.UnroutedAfterSeconds = &value
+		}
+		if configs.Escalator.StaleHeadAfterSeconds != nil {
+			value := *configs.Escalator.StaleHeadAfterSeconds
+			escalator.StaleHeadAfterSeconds = &value
+		}
+		if configs.Escalator.MaxItems != nil {
+			value := *configs.Escalator.MaxItems
+			escalator.MaxItems = &value
+		}
+		cloned.Escalator = &escalator
 	}
 	if configs.Coordinator != nil {
 		coordinator := *configs.Coordinator

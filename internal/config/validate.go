@@ -263,6 +263,10 @@ func validateCoreConfig(config Config, issues *[]ValidationIssue) {
 	validateAgentConfig(config, issues)
 	validateLoggingAndNotificationConfig(config, issues)
 	validateHITLConfig(config.HITL, issues)
+	validateGatekeeperRoleConfig(config.Roles.Gatekeeper, "roles.gatekeeper", config.Roles.Reviewer.AutoMerge.Enabled, issues)
+	validateAuditorRoleConfig(config.Roles.Auditor, "roles.auditor", issues)
+	validateAuditorGatekeeperCompatibility(config, issues)
+	validatePostMergeDigestGatekeeperCompatibility(config, issues)
 	validateDeployerRoleConfig(config.Roles.Deployer, "roles.deployer", issues)
 	validateEscalatorRoleConfig(config.Roles.Escalator, "roles.escalator", issues)
 	for i, project := range config.Projects {
@@ -277,6 +281,36 @@ func validateCoreConfig(config Config, issues *[]ValidationIssue) {
 		role := config.Roles.Deployer
 		MergeDeployerRoleConfig(&role, *project.Roles.Deployer)
 		validateDeployerRoleConfig(role, fmt.Sprintf("projects[%d].roles.deployer", i), issues)
+	}
+	for i, project := range config.Projects {
+		if project.Roles == nil || project.Roles.Auditor == nil {
+			continue
+		}
+		role := config.Roles.Auditor
+		if project.Roles.Auditor.Enabled != nil {
+			role.Enabled = *project.Roles.Auditor.Enabled
+		}
+		if project.Roles.Auditor.WindowMinutes != nil {
+			role.WindowMinutes = *project.Roles.Auditor.WindowMinutes
+		}
+		validateAuditorRoleConfig(role, fmt.Sprintf("projects[%d].roles.auditor", i), issues)
+	}
+	for i, project := range config.Projects {
+		if project.Roles == nil || project.Roles.Gatekeeper == nil || (project.Roles.Gatekeeper.Trust == nil && project.Roles.Gatekeeper.DiffBudget == nil) {
+			continue
+		}
+		reviewerAutoMerge := config.Roles.Reviewer.AutoMerge.Enabled
+		if project.Roles.Reviewer != nil && project.Roles.Reviewer.AutoMerge != nil && project.Roles.Reviewer.AutoMerge.Enabled != nil {
+			reviewerAutoMerge = *project.Roles.Reviewer.AutoMerge.Enabled
+		}
+		if project.Roles.Gatekeeper.Trust != nil {
+			validateGatekeeperRoleConfig(
+				GatekeeperRoleConfig{Trust: *project.Roles.Gatekeeper.Trust},
+				fmt.Sprintf("projects[%d].roles.gatekeeper", i), reviewerAutoMerge, issues)
+		}
+		validatePartialGatekeeperDiffBudget(
+			project.Roles.Gatekeeper.DiffBudget,
+			fmt.Sprintf("projects[%d].roles.gatekeeper.diffBudget", i), issues)
 	}
 	validateIntakeConfig(config, issues)
 	validateDaemonConfig(config.Daemon, issues)
@@ -596,6 +630,8 @@ func validateIntakeConfig(config Config, issues *[]ValidationIssue) {
 	*issues = append(*issues, ValidationIssue{Path: "intake.telegram.defaultProjectId", Message: fmt.Sprintf("must name a configured project; %q is not in projects[]", defaultProject)})
 }
 
+// validateGatekeeperRoleConfig rejects unknown Gatekeeper trust levels.
+//
 // validateDeployerRoleConfig fails startup rather than at deploy time. A project
 // configured to deploy but unable to is otherwise only discovered on the first
 // merge, which is the worst moment to learn it.
@@ -611,6 +647,43 @@ func validateDeployerRoleConfig(deployerRole DeployerRoleConfig, path string, is
 	}
 	validateEnvironmentNames(deployerRole.Environment, path+".environment", issues)
 }
+
+func validateGatekeeperRoleConfig(gatekeeper GatekeeperRoleConfig, path string, reviewerAutoMerge bool, issues *[]ValidationIssue) {
+	validateGatekeeperDiffBudget(gatekeeper.DiffBudget, path+".diffBudget", issues)
+	switch GatekeeperTrustLevel(strings.ToLower(strings.TrimSpace(string(gatekeeper.Trust)))) {
+	case "", GatekeeperTrustObserve, GatekeeperTrustAdvise, GatekeeperTrustAuto:
+	default:
+		*issues = append(*issues, ValidationIssue{
+			Path:    path + ".trust",
+			Message: fmt.Sprintf("must be one of: %s, %s, %s", GatekeeperTrustObserve, GatekeeperTrustAdvise, GatekeeperTrustAuto),
+		})
+	}
+}
+
+func validateGatekeeperDiffBudget(budget *GatekeeperDiffBudget, path string, issues *[]ValidationIssue) {
+	if budget == nil {
+		return
+	}
+	if budget.MaxChangedFiles < 0 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".maxChangedFiles", Message: "must be zero or a positive integer"})
+	}
+	if budget.MaxDeletions < 0 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".maxDeletions", Message: "must be zero or a positive integer"})
+	}
+}
+
+func validatePartialGatekeeperDiffBudget(budget *PartialGatekeeperDiffBudget, path string, issues *[]ValidationIssue) {
+	if budget == nil {
+		return
+	}
+	if budget.MaxChangedFiles != nil && *budget.MaxChangedFiles < 0 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".maxChangedFiles", Message: "must be zero or a positive integer"})
+	}
+	if budget.MaxDeletions != nil && *budget.MaxDeletions < 0 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".maxDeletions", Message: "must be zero or a positive integer"})
+	}
+}
+
 func validateHITLConfig(hitl HITLConfig, issues *[]ValidationIssue) {
 	switch strings.ToLower(strings.TrimSpace(hitl.AnswerTransport)) {
 	case "", "github", "respond":

@@ -10,9 +10,10 @@ import (
 	"testing"
 	"time"
 
-	githubinfra "github.com/nexu-io/looper/internal/infra/github"
-	"github.com/nexu-io/looper/internal/labels"
-	"github.com/nexu-io/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/config"
+	githubinfra "github.com/MumuTW/looper/internal/infra/github"
+	"github.com/MumuTW/looper/internal/labels"
+	"github.com/MumuTW/looper/internal/storage"
 )
 
 func TestEvaluatePullRequestPersistsEligibleReportBoundToHead(t *testing.T) {
@@ -29,7 +30,7 @@ func TestEvaluatePullRequestPersistsEligibleReportBoundToHead(t *testing.T) {
 	if !report.Eligible || report.Status != StatusEligible || len(report.Reasons) != 0 {
 		t.Fatalf("report = %#v, want eligible without reasons", report)
 	}
-	if report.ObservedHeadSHA != "head-1" || !report.RequiresFreshRevalidation || report.Mode != ModeObserveOnly {
+	if report.ObservedHeadSHA != "head-1" || !report.RequiresFreshRevalidation || report.Mode != string(config.GatekeeperTrustObserve) {
 		t.Fatalf("report binding = %#v, want observe-only head-bound report", report)
 	}
 
@@ -420,24 +421,112 @@ func TestAutoGatekeeperRefusesToReportSuccessWithoutProtectedContext(t *testing.
 }
 
 type fakeGatekeeperGitHub struct {
-	openPullRequests   []githubinfra.PullRequestSummary
-	detail             githubinfra.PullRequestDetail
-	mergeable          githubinfra.PullRequestDetail
-	protection         githubinfra.BranchProtection
-	checks             githubinfra.PullRequestCheckRuns
-	threads            []githubinfra.ReviewThread
-	finalHeadSHA       string
-	protectionErr      error
-	currentUserLogin   string
-	currentUserErr     error
-	comments           []githubinfra.CommentInfo
-	commentsErr        error
-	commentsCalls      int
-	updateCommentCalls []githubinfra.UpdateIssueCommentInput
-	updateCommentErr   error
+	openPullRequests []githubinfra.PullRequestSummary
+	detail           githubinfra.PullRequestDetail
+	mergeable        githubinfra.PullRequestDetail
+	protection       githubinfra.BranchProtection
+	checks           githubinfra.PullRequestCheckRuns
+	threads          []githubinfra.ReviewThread
+	reviews          []githubinfra.ReviewSummary
+	reviewsErr       error
+	finalHeadSHA     string
+	finalBaseSHA     string
+	protectionErr    error
+	commentsErr      error
 	// perPullRequestCalls counts the forge round trips that only a full evaluation
 	// makes, so a test can prove a pull request was skipped rather than evaluated.
 	perPullRequestCalls int
+
+	currentLogin          string
+	commentErr            error
+	deletedIDs            []int64
+	listCalls             int
+	loginCalls            int
+	comments              []githubinfra.CommentInfo
+	createdBodies         []string
+	updatedBodies         []string
+	reviewMarker          githubinfra.ReviewMarkerResult
+	reviewMarkerErr       error
+	reviewMarkerCalls     []githubinfra.VerifyReviewMarkerInput
+	statusCalls           []githubinfra.CommitStatusInput
+	statusErr             error
+	viewErr               error
+	listReviewThreadsHook func(*fakeGatekeeperGitHub) error
+	// beforeView, when set, runs before each pull-request read, so a test can
+	// inject a state change between the first evaluation and a later one.
+	beforeView func(*fakeGatekeeperGitHub)
+}
+
+func (f *fakeGatekeeperGitHub) GetCurrentUserLoginForRepo(context.Context, string, string) (string, error) {
+	f.loginCalls++
+	if f.currentLogin == "" {
+		return "looper-bot", nil
+	}
+	return f.currentLogin, nil
+}
+
+func (f *fakeGatekeeperGitHub) ListIssueComments(context.Context, githubinfra.ViewIssueInput) ([]githubinfra.CommentInfo, error) {
+	f.listCalls++
+	if f.commentsErr != nil {
+		return nil, f.commentsErr
+	}
+	return f.comments, nil
+}
+
+func (f *fakeGatekeeperGitHub) ListPullRequestReviews(context.Context, githubinfra.ViewPullRequestInput) ([]githubinfra.ReviewSummary, error) {
+	f.perPullRequestCalls++
+	return f.reviews, f.reviewsErr
+}
+
+// ListIssueCommentsContaining mirrors the gateway's projection: only comments
+// carrying one of the markers cross the boundary, so no test can accidentally
+// rely on the detector seeing the whole conversation.
+func (f *fakeGatekeeperGitHub) ListIssueCommentsContaining(_ context.Context, _ githubinfra.ViewIssueInput, markers []string) ([]githubinfra.CommentInfo, error) {
+	f.perPullRequestCalls++
+	if f.commentsErr != nil {
+		return nil, f.commentsErr
+	}
+	matched := make([]githubinfra.CommentInfo, 0)
+	for _, comment := range f.comments {
+		for _, marker := range markers {
+			if strings.Contains(comment.Body, marker) {
+				matched = append(matched, comment)
+				break
+			}
+		}
+	}
+	return matched, nil
+}
+
+func (f *fakeGatekeeperGitHub) CreateIssueComment(_ context.Context, input githubinfra.IssueCommentInput) (githubinfra.IssueCommentResult, error) {
+	if f.commentErr != nil {
+		return githubinfra.IssueCommentResult{}, f.commentErr
+	}
+	f.createdBodies = append(f.createdBodies, input.Body)
+	f.comments = append(f.comments, githubinfra.CommentInfo{ID: int64(900 + len(f.comments)), Author: "looper-bot", Body: input.Body})
+	return githubinfra.IssueCommentResult{ID: int64(900 + len(f.comments))}, nil
+}
+
+func (f *fakeGatekeeperGitHub) DeleteIssueComment(_ context.Context, input githubinfra.DeleteIssueCommentInput) error {
+	f.deletedIDs = append(f.deletedIDs, input.CommentID)
+	kept := f.comments[:0]
+	for _, comment := range f.comments {
+		if comment.ID != input.CommentID {
+			kept = append(kept, comment)
+		}
+	}
+	f.comments = kept
+	return nil
+}
+
+func (f *fakeGatekeeperGitHub) UpdateIssueComment(_ context.Context, input githubinfra.UpdateIssueCommentInput) error {
+	f.updatedBodies = append(f.updatedBodies, input.Body)
+	for i := range f.comments {
+		if f.comments[i].ID == input.CommentID {
+			f.comments[i].Body = input.Body
+		}
+	}
+	return nil
 }
 
 func (f *fakeGatekeeperGitHub) ListOpenPullRequests(context.Context, githubinfra.ListOpenPullRequestsInput) ([]githubinfra.PullRequestSummary, error) {
@@ -483,34 +572,6 @@ func (f *fakeGatekeeperGitHub) FindReviewMarker(_ context.Context, input githubi
 func (f *fakeGatekeeperGitHub) SetCommitStatus(_ context.Context, input githubinfra.CommitStatusInput) error {
 	f.statusCalls = append(f.statusCalls, input)
 	return f.statusErr
-}
-
-func (f *fakeGatekeeperGitHub) GetCurrentUserLoginForRepo(context.Context, string, string) (string, error) {
-	if f.currentUserErr != nil {
-		return "", f.currentUserErr
-	}
-	return f.currentUserLogin, nil
-}
-
-func (f *fakeGatekeeperGitHub) ListIssueComments(context.Context, githubinfra.ViewIssueInput) ([]githubinfra.CommentInfo, error) {
-	f.commentsCalls++
-	if f.commentsErr != nil {
-		return nil, f.commentsErr
-	}
-	return append([]githubinfra.CommentInfo(nil), f.comments...), nil
-}
-
-func (f *fakeGatekeeperGitHub) UpdateIssueComment(_ context.Context, input githubinfra.UpdateIssueCommentInput) error {
-	if f.updateCommentErr != nil {
-		return f.updateCommentErr
-	}
-	f.updateCommentCalls = append(f.updateCommentCalls, input)
-	for i := range f.comments {
-		if f.comments[i].ID == input.CommentID {
-			f.comments[i].Body = input.Body
-		}
-	}
-	return nil
 }
 
 func reasonCodes(reasons []Reason) []ReasonCode {

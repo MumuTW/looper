@@ -8,9 +8,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nexu-io/looper/internal/eventlog"
-	githubinfra "github.com/nexu-io/looper/internal/infra/github"
-	"github.com/nexu-io/looper/internal/storage"
+	"github.com/MumuTW/looper/internal/eventlog"
+	githubinfra "github.com/MumuTW/looper/internal/infra/github"
+	"github.com/MumuTW/looper/internal/storage"
 )
 
 func TestDiscoverPullRequestsRetiresLegacyAdviseVerdictEvenWhenEvaluationIsSkipped(t *testing.T) {

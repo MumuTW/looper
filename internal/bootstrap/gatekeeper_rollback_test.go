@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/nexu-io/looper/internal/config"
+	"github.com/MumuTW/looper/internal/config"
 )
 
 func TestBootstrapStartsWithWithdrawnGatekeeperTrustConfiguration(t *testing.T) {

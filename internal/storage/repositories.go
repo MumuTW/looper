@@ -596,10 +596,21 @@ func (r *EventsRepository) ListSince(ctx context.Context, sinceISO string) ([]Ev
 	return scanEventLogs(rows)
 }
 
-// LatestByLogicalProjectAndEventTypeAndPayloadMode returns the newest event
-// for each logical project, using project_id when it is still linked and the
-// report payload's projectId after a project row has been deleted. The grouped
-// query keeps orphaned migration state cheap on steady-state scheduler ticks.
+func (r *EventsRepository) ListByEntity(ctx context.Context, entityType, entityID string) ([]EventLogRecord, error) {
+	rows, err := r.q.QueryContext(ctx, `SELECT `+eventLogColumns+` FROM event_logs WHERE entity_type = ? AND entity_id = ? ORDER BY created_at ASC`, entityType, entityID)
+	if err != nil {
+		return nil, fmt.Errorf("list event logs by entity: %w", err)
+	}
+	defer rows.Close()
+
+	return scanEventLogs(rows)
+}
+
+// LatestByLogicalProjectAndEventTypeAndPayloadMode returns the newest event per
+// logical project for an event type and payload mode. The logical project is
+// the project_id column when present, or the projectId extracted from the
+// payload JSON for events whose project row was deleted (SQLite sets project_id
+// to NULL in that case).
 func (r *EventsRepository) LatestByLogicalProjectAndEventTypeAndPayloadMode(ctx context.Context, eventType, mode string) (map[string]EventLogRecord, error) {
 	rows, err := r.q.QueryContext(ctx, `
 		SELECT e.*
@@ -678,7 +689,7 @@ func (r *EventsRepository) LatestByEntityAndEventType(ctx context.Context, entit
 }
 
 // ListProjectIDsByEventType lists project IDs that have at least one event of
-// eventType.  It includes archived or deleted-from-catalog projects whose
+// eventType. It includes archived or deleted-from-catalog projects whose
 // historical reports still require migration maintenance.
 func (r *EventsRepository) ListProjectIDsByEventType(ctx context.Context, eventType string) ([]string, error) {
 	rows, err := r.q.QueryContext(ctx, `
@@ -707,10 +718,25 @@ func (r *EventsRepository) ListProjectIDsByEventType(ctx context.Context, eventT
 	return ids, nil
 }
 
-func (r *EventsRepository) ListByEntity(ctx context.Context, entityType, entityID string) ([]EventLogRecord, error) {
-	rows, err := r.q.QueryContext(ctx, `SELECT `+eventLogColumns+` FROM event_logs WHERE entity_type = ? AND entity_id = ? ORDER BY created_at ASC`, entityType, entityID)
+// ListByProjectOrPayloadProjectAndEntityTypeAppendOrder reads all events for a
+// logical project (project_id column OR projectId in payload JSON) in rowid
+// append order, so callers can reconstruct the lifecycle even after a project
+// row was deleted and project_id was set to NULL.
+func (r *EventsRepository) ListByProjectOrPayloadProjectAndEntityTypeAppendOrder(ctx context.Context, projectID, entityType string) ([]EventLogRecord, error) {
+	rows, err := r.q.QueryContext(ctx, `
+		SELECT * FROM event_logs
+		WHERE entity_type = ?
+		  AND (
+			project_id = ?
+			OR (
+				project_id IS NULL
+				AND CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.projectId') ELSE NULL END = ?
+			)
+		  )
+		ORDER BY rowid ASC
+	`, entityType, projectID, projectID)
 	if err != nil {
-		return nil, fmt.Errorf("list event logs by entity: %w", err)
+		return nil, fmt.Errorf("list event logs by logical project and entity type in append order: %w", err)
 	}
 	defer rows.Close()
 
@@ -868,29 +894,114 @@ func (r *EventsRepository) ListByProjectAndEntityType(ctx context.Context, proje
 	return scanEventLogs(rows)
 }
 
-// ListByProjectOrPayloadProjectAndEntityTypeAppendOrder returns linked and
-// orphaned events for one logical project in SQLite append order. It is only
-// used after the caller has found a stale migration watermark, so deleted
-// projects do not reload their entire history on every tick.
-func (r *EventsRepository) ListByProjectOrPayloadProjectAndEntityTypeAppendOrder(ctx context.Context, projectID, entityType string) ([]EventLogRecord, error) {
-	rows, err := r.q.QueryContext(ctx, `
-		SELECT * FROM event_logs
-		WHERE entity_type = ?
-		  AND (
-			project_id = ?
-			OR (
-				project_id IS NULL
-				AND CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.projectId') ELSE NULL END = ?
-			)
-		  )
-		ORDER BY rowid ASC
-	`, entityType, projectID, projectID)
-	if err != nil {
-		return nil, fmt.Errorf("list event logs by logical project and entity type in append order: %w", err)
+// ListTriageSourceStates returns lifecycle state for the requested source
+// keys. The JSON payload key is the source identity authority; the expression
+// index only makes that authority directly addressable.
+func (r *EventsRepository) ListTriageSourceStates(ctx context.Context, projectID string, sourceKeys []string) ([]TriageSourceStateRecord, error) {
+	if len(sourceKeys) == 0 {
+		return []TriageSourceStateRecord{}, nil
 	}
-	defer rows.Close()
+	records := make([]TriageSourceStateRecord, 0, len(sourceKeys))
+	for _, chunk := range chunkStrings(sourceKeys, sqliteMaxVariables-1) {
+		args := make([]any, 0, len(chunk)+1)
+		args = append(args, projectID)
+		for _, sourceKey := range chunk {
+			args = append(args, sourceKey)
+		}
+		rows, err := r.q.QueryContext(ctx, `
+			SELECT `+triageSourceKeySQL+` AS source_key,
+				MIN(CASE WHEN event_type = 'triage.enrolled' THEN payload_json END),
+				MIN(CASE WHEN event_type = 'triage.report' THEN payload_json END),
+				MAX(event_type = 'triage.routed'),
+				MAX(event_type = 'triage.retired')
+			FROM event_logs INDEXED BY idx_event_logs_triage_source_key
+			WHERE project_id = ? AND `+triageLifecyclePredicateSQL+`
+				AND `+triageSourceKeySQL+` IN (`+sqlPlaceholders(len(chunk))+`)
+			GROUP BY source_key
+		`, args...)
+		if err != nil {
+			return nil, fmt.Errorf("list triage source states: %w", err)
+		}
+		chunkRecords, err := scanTriageSourceStates(rows)
+		if err != nil {
+			return nil, err
+		}
+		records = append(records, chunkRecords...)
+	}
+	return records, nil
+}
 
-	return scanEventLogs(rows)
+// ListTriageSourceStateWindow returns at most limit source lifecycles, rotating
+// after afterSourceKey and wrapping once. Terminal sources intentionally count
+// against the window: asking SQL to skip unbounded terminal history until it
+// found limit pending rows would leave each tick's database work unbounded.
+func (r *EventsRepository) ListTriageSourceStateWindow(ctx context.Context, projectID, afterSourceKey string, limit int) ([]TriageSourceStateRecord, error) {
+	if limit <= 0 {
+		return []TriageSourceStateRecord{}, nil
+	}
+	records, err := r.listTriageSourceStateRange(ctx, projectID, afterSourceKey, ">", limit)
+	if err != nil {
+		return nil, err
+	}
+	if afterSourceKey == "" || len(records) == limit {
+		return records, nil
+	}
+	wrapped, err := r.listTriageSourceStateRange(ctx, projectID, afterSourceKey, "<=", limit-len(records))
+	if err != nil {
+		return nil, err
+	}
+	return append(records, wrapped...), nil
+}
+
+func (r *EventsRepository) listTriageSourceStateRange(ctx context.Context, projectID, cursor, comparison string, limit int) ([]TriageSourceStateRecord, error) {
+	if comparison != ">" && comparison != "<=" {
+		return nil, fmt.Errorf("unsupported triage source cursor comparison %q", comparison)
+	}
+	rows, err := r.q.QueryContext(ctx, `
+		SELECT `+triageSourceKeySQL+` AS source_key,
+			MIN(CASE WHEN event_type = 'triage.enrolled' THEN payload_json END),
+			MIN(CASE WHEN event_type = 'triage.report' THEN payload_json END),
+			MAX(event_type = 'triage.routed'),
+			MAX(event_type = 'triage.retired')
+		FROM event_logs INDEXED BY idx_event_logs_triage_source_key
+		WHERE project_id = ? AND `+triageLifecyclePredicateSQL+`
+			AND `+triageSourceKeySQL+` `+comparison+` ?
+		GROUP BY source_key
+		ORDER BY source_key
+		LIMIT ?
+	`, projectID, cursor, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list triage source state window: %w", err)
+	}
+	return scanTriageSourceStates(rows)
+}
+
+func scanTriageSourceStates(rows *sql.Rows) ([]TriageSourceStateRecord, error) {
+	defer rows.Close()
+	records := []TriageSourceStateRecord{}
+	for rows.Next() {
+		var record TriageSourceStateRecord
+		var enrollmentJSON, reportJSON sql.NullString
+		var projected, retired int
+		if err := rows.Scan(&record.SourceKey, &enrollmentJSON, &reportJSON, &projected, &retired); err != nil {
+			return nil, fmt.Errorf("scan triage source state: %w", err)
+		}
+		if enrollmentJSON.Valid {
+			value := enrollmentJSON.String
+			record.EnrollmentJSON = &value
+		}
+		if reportJSON.Valid {
+			value := reportJSON.String
+			record.ReportJSON = &value
+		}
+		record.Projected = projected != 0
+		record.Retired = retired != 0
+		records = append(records, record)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate triage source states: %w", err)
+	}
+	return records, nil
 }
 
 type ProjectsRepository struct{ q sqliteQuerier }
