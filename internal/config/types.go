@@ -1543,9 +1543,9 @@ type PartialDeployerRoleConfig struct {
 }
 
 type PartialGatekeeperRoleConfig struct {
-	Trust      *GatekeeperTrustLevel        `json:"trust,omitempty"`
-	DiffBudget *PartialGatekeeperDiffBudget `json:"diffBudget,omitempty"`
-	RequiredReviewChangedLines *int `json:"requiredReviewChangedLines,omitempty"`
+	Trust                      *GatekeeperTrustLevel        `json:"trust,omitempty"`
+	DiffBudget                 *PartialGatekeeperDiffBudget `json:"diffBudget,omitempty"`
+	RequiredReviewChangedLines *int                         `json:"requiredReviewChangedLines,omitempty"`
 }
 
 type PartialGatekeeperDiffBudget struct {
