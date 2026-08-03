@@ -3,6 +3,7 @@ package runtime
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -126,6 +127,7 @@ type schedulerAsyncRunner interface {
 }
 
 type defaultSchedulerTickInput struct {
+	DB    *sql.DB
 	Repos *storage.Repositories
 	// CapturedProjects is the project-table snapshot already validated by the
 	// catalog pass immediately before an independent claim pass. Keeping it on
@@ -2539,7 +2541,12 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 		if githubGateway != nil {
 			snapshotter = githubGateway
 		}
+		var db *sql.DB
+		if services.Coordinator != nil {
+			db = services.Coordinator.DB()
+		}
 		return defaultSchedulerTickInput{
+			DB:                   db,
 			Repos:                services.Repositories,
 			GitHubGateway:        githubGateway,
 			GitGateway:           gitGateway,

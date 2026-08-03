@@ -18,6 +18,13 @@ type HITLAnswerInput struct {
 	Answer             string
 	NowISO             string
 	RequireExistingAsk bool
+	// Resume makes answer recording own the awaiting_human -> running
+	// transition and requeue in the same transaction. The HTTP endpoint keeps
+	// this false because it still owns its established lifecycle transition.
+	Resume bool
+	// ConsumeGateEvidence lets the runtime poll lane consume the exact staged
+	// malformed-gate identity only when the answer is applied.
+	ConsumeGateEvidence bool
 }
 
 type HITLAnswerResult struct {
@@ -25,11 +32,16 @@ type HITLAnswerResult struct {
 	Applied bool
 }
 
-// RecordHITLAnswer is transaction-local. It owns only the durable answer
-// metadata update; its caller owns delivery-specific scheduling and locks.
+// RecordHITLAnswer is transaction-local. It owns the durable answer metadata
+// update and, when requested, the runtime poll lane's lifecycle transition and
+// queue reactivation so an interruption cannot leave an answered ask parked in
+// awaiting_human.
 func RecordHITLAnswer(ctx context.Context, repos *storage.Repositories, input HITLAnswerInput) (HITLAnswerResult, error) {
 	if repos == nil || repos.Loops == nil {
 		return HITLAnswerResult{}, fmt.Errorf("HITL answer recording is not configured")
+	}
+	if input.Resume && repos.Queue == nil {
+		return HITLAnswerResult{}, fmt.Errorf("HITL answer resumption is not configured")
 	}
 	if strings.TrimSpace(input.LoopID) == "" || strings.TrimSpace(input.NowISO) == "" {
 		return HITLAnswerResult{}, fmt.Errorf("HITL answer recording requires loop id and time")
@@ -49,6 +61,13 @@ func RecordHITLAnswer(ctx context.Context, repos *storage.Repositories, input HI
 	if input.RequireExistingAsk && !present {
 		return result, nil
 	}
+	if input.ConsumeGateEvidence {
+		// The authenticated transport answer is the authority to consume the
+		// exact staged malformed-gate identity; changed evidence remains parked.
+		if err := ConsumeHITLGateEvidence(ask.GateEvidence); err != nil {
+			return HITLAnswerResult{}, fmt.Errorf("consume malformed HITL gate evidence: %w", err)
+		}
+	}
 	ask.Answer = input.Answer
 	ask.Status = "answered"
 	ask.AnsweredAt = input.NowISO
@@ -59,8 +78,17 @@ func RecordHITLAnswer(ctx context.Context, repos *storage.Repositories, input HI
 	updated := *loop
 	updated.MetadataJSON = &metadata
 	updated.UpdatedAt = input.NowISO
+	if input.Resume {
+		updated.Status = string(domain.LoopStatusRunning)
+		updated.NextRunAt = &input.NowISO
+	}
 	if err := repos.Loops.Upsert(ctx, updated); err != nil {
 		return HITLAnswerResult{}, err
+	}
+	if input.Resume {
+		if _, err := repos.Queue.RequeueLatestCancelledByLoop(ctx, input.LoopID, input.NowISO); err != nil {
+			return HITLAnswerResult{}, err
+		}
 	}
 	return HITLAnswerResult{Loop: updated, Applied: true}, nil
 }

@@ -13,7 +13,7 @@ const (
 	Marker          = "<!-- looper:stamp v=1 -->"
 	RepoURL         = "https://github.com/mumutw/looper"
 	CurrentRepoURL  = "https://github.com/MumuTW/looper"
-	UpstreamRepoURL = "https://github.com/MumuTW/looper"
+	UpstreamRepoURL = "https://github.com/nexu-io/looper"
 	LegacyRepoURL   = "https://github.com/powerformer/looper"
 	RepoLinkHTML    = `<a href="` + RepoURL + `">Looper</a>`
 	Slogan          = "An autonomous AI dev team for your GitHub repos."
