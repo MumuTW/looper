@@ -777,6 +777,21 @@ func TestBuildActiveRunContinuationPrefersNewestTimeoutEvidenceAfterRetry(t *tes
 	}
 }
 
+func TestBuildActiveRunContinuationReportsObservationError(t *testing.T) {
+	checkpoint := `{"execution":{"runId":"run_timeout","executionId":"agent_timeout","status":"timeout","progressSnapshotError":"git status unavailable"}}`
+	continuation := buildActiveRunContinuation(&storage.RunRecord{CheckpointJSON: &checkpoint})
+	if continuation == nil {
+		t.Fatal("buildActiveRunContinuation() = nil, want failed-observation projection")
+	}
+	assertEqual(t, continuation.PredecessorRunID, "run_timeout")
+	assertEqual(t, continuation.PredecessorExecutionID, "agent_timeout")
+	assertEqual(t, continuation.Mode, "timeout_observed")
+	assertEqual(t, continuation.Outcome, "observation failed")
+	if continuation.BeforeTimeout != nil || continuation.AfterRestart != nil {
+		t.Fatalf("continuation = %#v, want no partial progress snapshot", continuation)
+	}
+}
+
 // Successful completeRun summaries must not populate lastFailureReason when there
 // is no queue error (queued/running loops and ps --all completed rows).
 func TestHandlerActiveRunsDoesNotUseSuccessSummaryAsFailureReason(t *testing.T) {

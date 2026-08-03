@@ -784,6 +784,31 @@ func TestRunPrepareWorktreeStepRefusesCheckpointOutsideWorktreeRoot(t *testing.T
 	}
 }
 
+func TestRunPrepareWorktreeStepRecoversCleanedNonTimeoutReplay(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	worktreeRoot := filepath.Join(t.TempDir(), "worktrees")
+	missingPath := filepath.Join(worktreeRoot, "cleaned")
+	metadata := fmt.Sprintf(`{"worktreeRoot":%q}`, worktreeRoot)
+	git := &fakeGitGateway{createResult: CreateWorktreeResult{WorktreePath: filepath.Join(worktreeRoot, "replacement"), Branch: "feature/replay", BaseBranch: "main", WorktreeID: "worktree_replay"}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, Logger: fixture.logger, Now: fixture.now})
+	checkpoint, err := runner.runPrepareWorktreeStep(context.Background(), stepInput{
+		Project: storage.ProjectRecord{ID: "project_1", RepoPath: filepath.Join(t.TempDir(), "repo"), MetadataJSON: &metadata},
+		Loop:    storage.LoopRecord{ID: "loop_worker_1"},
+		Checkpoint: workerCheckpoint{
+			ResumePolicy: loops.ResumePolicyReplayStep,
+			Work:         &workerInput{Repo: "acme/looper", Branch: "feature/replay", BaseBranch: "main"},
+			Worktree:     &checkpointWorktree{Path: missingPath, Branch: "feature/replay", BaseBranch: "main"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("runPrepareWorktreeStep() error = %v, want cleaned non-timeout recovery", err)
+	}
+	if len(git.createCalls) != 1 || checkpoint.Worktree == nil || checkpoint.Worktree.Path == missingPath {
+		t.Fatalf("createCalls=%#v checkpoint.Worktree=%#v, want replacement worktree", git.createCalls, checkpoint.Worktree)
+	}
+}
+
 func TestProcessClaimedItemCompletesCreatePRFlow(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)

@@ -4015,9 +4015,18 @@ func buildActiveRunContinuation(run *storage.RunRecord) *activeRunContinuation {
 	if execution, ok := readOptionalObject(checkpoint, "execution"); ok {
 		if progressBeforeTimeout, ok := readOptionalObject(execution, "progressBeforeTimeout"); ok {
 			return &activeRunContinuation{
+				PredecessorRunID:       derefString(readObjectString(execution, "runId")),
 				PredecessorExecutionID: derefString(readObjectString(execution, "executionId")),
 				Mode:                   "timeout_observed",
 				BeforeTimeout:          buildActiveRunProgress(progressBeforeTimeout),
+			}
+		}
+		if progressError := derefString(readObjectString(execution, "progressSnapshotError")); progressError != "" {
+			return &activeRunContinuation{
+				PredecessorRunID:       derefString(readObjectString(execution, "runId")),
+				PredecessorExecutionID: derefString(readObjectString(execution, "executionId")),
+				Mode:                   "timeout_observed",
+				Outcome:                "observation failed",
 			}
 		}
 	}
