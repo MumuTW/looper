@@ -155,12 +155,16 @@
             "diskSweep": {
               "scanned": 0,
               "unregistered": 0,
+              "wouldRemove": 0,
               "removed": 0,
               "skipped": 0,
               "failed": 0,
               "containersScanned": 0,
               "containersUnreachable": 0,
-              "containersRemoved": 0
+              "containersWouldRemove": 0,
+              "containersRemoved": 0,
+              "containersSkipped": 0,
+              "containersFailed": 0
             }
           },
           "resourceGuard": {

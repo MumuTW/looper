@@ -449,6 +449,15 @@ func SafeToRemoveUnusableWorktreePath(path string) (bool, error) {
 	if len(entries) == 0 {
 		return true, nil
 	}
+	// The disk sweep is more conservative than fixer path recovery: an
+	// ordinary corrupt repository may still contain the only copy of local
+	// commits, so object-bearing `.git` directories are not disposable debris.
+	gitMeta := filepath.Join(path, ".git")
+	if len(entries) == 1 && entries[0].Name() == ".git" {
+		if info, statErr := os.Stat(gitMeta); statErr == nil && info.IsDir() && localGitRepositoryContainsObjects(gitMeta) {
+			return false, nil
+		}
+	}
 	return onlyUnusableLocalGitMetadata(path, entries), nil
 }
 
@@ -504,4 +513,29 @@ func onlyUnusableLocalGitMetadata(path string, entries []os.DirEntry) bool {
 		return false
 	}
 	return !LocalFixerWorktreeCheckoutUsable(path)
+}
+
+// localGitRepositoryContainsObjects reports conservatively whether a Git
+// repository's object database contains data. A regular loose/pack file or a
+// symlink is enough to preserve the repository; unreadable object metadata is
+// also treated as present because deleting it would destroy state we cannot
+// inspect.
+func localGitRepositoryContainsObjects(gitDir string) bool {
+	return objectEntriesContainData(filepath.Join(gitDir, "objects"))
+}
+
+func objectEntriesContainData(root string) bool {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return !os.IsNotExist(err)
+	}
+	for _, entry := range entries {
+		if entry.Type()&os.ModeSymlink != 0 || entry.Type().IsRegular() {
+			return true
+		}
+		if entry.IsDir() && objectEntriesContainData(filepath.Join(root, entry.Name())) {
+			return true
+		}
+	}
+	return false
 }

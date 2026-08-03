@@ -31,12 +31,13 @@ var hotEditablePaths = map[string]struct{}{
 	// The cleanup loop rereads these each iteration and a reload wakes it, so
 	// none of them replace a process-owned resource. Only the leaves are hot;
 	// the daemon.worktreeCleanup object itself stays restart-bound.
-	"daemon.worktreeCleanup.enabled":        {},
-	"daemon.worktreeCleanup.interval":       {},
-	"daemon.worktreeCleanup.retentionDays":  {},
-	"daemon.worktreeCleanup.maxPerTick":     {},
-	"daemon.worktreeCleanup.includeOrphans": {},
-	"daemon.worktreeCleanup.dryRun":         {},
+	"daemon.worktreeCleanup.enabled":             {},
+	"daemon.worktreeCleanup.interval":            {},
+	"daemon.worktreeCleanup.retentionDays":       {},
+	"daemon.worktreeCleanup.maxPerTick":          {},
+	"daemon.worktreeCleanup.maxDiskSweepPerTick": {},
+	"daemon.worktreeCleanup.includeOrphans":      {},
+	"daemon.worktreeCleanup.dryRun":              {},
 
 	// The host admission gate re-evaluates the cached sample against the live
 	// thresholds on every claim tick, so an operator can disable or relax a

@@ -43,12 +43,16 @@ type WorktreeCleanupStatus struct {
 type WorktreeDiskSweepStatus struct {
 	Scanned               int    `json:"scanned"`
 	Unregistered          int    `json:"unregistered"`
+	WouldRemove           int    `json:"wouldRemove"`
 	Removed               int    `json:"removed"`
 	Skipped               int    `json:"skipped"`
 	Failed                int    `json:"failed"`
 	ContainersScanned     int    `json:"containersScanned"`
 	ContainersUnreachable int    `json:"containersUnreachable"`
+	ContainersWouldRemove int    `json:"containersWouldRemove"`
 	ContainersRemoved     int    `json:"containersRemoved"`
+	ContainersSkipped     int    `json:"containersSkipped"`
+	ContainersFailed      int    `json:"containersFailed"`
 	LastError             string `json:"lastError,omitempty"`
 }
 
@@ -374,12 +378,16 @@ func worktreeCleanupCompletedPayload(summary WorktreeCleanupStatus, skipReasons 
 		"diskSweep": map[string]any{
 			"scanned":               summary.DiskSweep.Scanned,
 			"unregistered":          summary.DiskSweep.Unregistered,
+			"wouldRemove":           summary.DiskSweep.WouldRemove,
 			"removed":               summary.DiskSweep.Removed,
 			"skipped":               summary.DiskSweep.Skipped,
 			"failed":                summary.DiskSweep.Failed,
 			"containersScanned":     summary.DiskSweep.ContainersScanned,
 			"containersUnreachable": summary.DiskSweep.ContainersUnreachable,
+			"containersWouldRemove": summary.DiskSweep.ContainersWouldRemove,
 			"containersRemoved":     summary.DiskSweep.ContainersRemoved,
+			"containersSkipped":     summary.DiskSweep.ContainersSkipped,
+			"containersFailed":      summary.DiskSweep.ContainersFailed,
 		},
 	}
 	if len(skipReasons) > 0 {
@@ -414,8 +422,13 @@ func (r *Runtime) runWorktreeDiskSweep(ctx context.Context, repos *storage.Repos
 		return status
 	}
 	roots := make([]worktreecleanup.DiskSweepRoot, 0, len(projects))
+	allRoots := make([]worktreecleanup.DiskSweepRoot, 0, len(projects))
 	rootIndexes := make(map[string]int, len(projects))
 	repoPathsByRoot := make(map[string][]string, len(projects))
+	managedRepoPaths := make([]string, 0, len(projects))
+	for _, project := range projects {
+		managedRepoPaths = appendUniqueWorktreeRepoPath(managedRepoPaths, project.RepoPath)
+	}
 	// Container names cover archived projects too. Archiving retires records
 	// but deliberately leaves checkouts on disk, so an archived project's
 	// container is still reachable state, not debris.
@@ -430,7 +443,12 @@ func (r *Runtime) runWorktreeDiskSweep(ctx context.Context, repos *storage.Repos
 			status.LastError = rootErr.Error()
 			continue
 		}
-		if rootErr := validateDiskSweepRoot(root, project.RepoPath, sharedRoot, sharedRootErr); rootErr != nil {
+		allRoots = append(allRoots, worktreecleanup.DiskSweepRoot{
+			ProjectID:    project.ID,
+			RepoPath:     project.RepoPath,
+			WorktreeRoot: root,
+		})
+		if rootErr := validateDiskSweepRoot(root, managedRepoPaths, sharedRoot, sharedRootErr); rootErr != nil {
 			status.Failed++
 			status.LastError = rootErr.Error()
 			continue
@@ -468,15 +486,17 @@ func (r *Runtime) runWorktreeDiskSweep(ctx context.Context, repos *storage.Repos
 		})
 		rootIndexes[rootKey] = len(roots) - 1
 	}
-	roots, overlapErrs := rejectOverlappingDiskSweepRoots(roots)
+	roots, overlapErrs := rejectOverlappingDiskSweepRoots(roots, allRoots)
 	if len(overlapErrs) > 0 {
 		status.Failed += len(overlapErrs)
 		status.LastError = overlapErrs[len(overlapErrs)-1].Error()
 	}
 	registered, err := repos.Worktrees.ListAllPaths(ctx)
 	if err != nil {
-		status.Failed = 1
-		status.LastError = err.Error()
+		status.Failed++
+		if status.LastError == "" {
+			status.LastError = err.Error()
+		}
 		return status
 	}
 
@@ -512,26 +532,36 @@ func (r *Runtime) runWorktreeDiskSweep(ctx context.Context, repos *storage.Repos
 			LiveContainerNames: liveContainers,
 			LiveProjectPaths:   liveProjectPaths,
 			RegisteredPaths:    registered,
-			Git:                gitGateway,
-			Budget:             available,
-			RetentionCutoff:    retentionCutoff,
-			DryRun:             cfg.Daemon.WorktreeCleanup.DryRun,
+			IsRegisteredPath: func(ctx context.Context, path string) (bool, error) {
+				record, err := repos.Worktrees.GetByPath(ctx, path)
+				return record != nil, err
+			},
+			Git:             gitGateway,
+			Budget:          available,
+			RetentionCutoff: retentionCutoff,
+			DryRun:          cfg.Daemon.WorktreeCleanup.DryRun,
 		})
 		status.ContainersScanned = containers.Summary.Scanned
 		status.ContainersUnreachable = containers.Summary.Unregistered
 		orphanProjectsRemoved := 0
-		if !cfg.Daemon.WorktreeCleanup.DryRun {
-			for _, candidate := range containers.Candidates {
-				if candidate.Action == worktreecleanup.DiskSweepActionRemove && candidate.Reason == "orphaned_project" {
+		orphanProjectsWouldRemove := 0
+		for _, candidate := range containers.Candidates {
+			if candidate.Action == worktreecleanup.DiskSweepActionRemove && candidate.Reason == "orphaned_project" {
+				orphanProjectsWouldRemove++
+				if !cfg.Daemon.WorktreeCleanup.DryRun {
 					orphanProjectsRemoved++
 				}
 			}
 		}
 		status.ContainersRemoved = containers.Summary.Removed - orphanProjectsRemoved
+		status.ContainersWouldRemove = containers.Summary.WouldRemove - orphanProjectsWouldRemove
+		status.ContainersSkipped = containers.Summary.Skipped
+		status.ContainersFailed = containers.Summary.Errors
 		status.Removed += orphanProjectsRemoved
 		status.Skipped += containers.Summary.Skipped
 		status.Failed += containers.Summary.Errors
 		if containerErr != nil {
+			status.ContainersFailed++
 			status.Failed++
 			status.LastError = containerErr.Error()
 		}
@@ -579,6 +609,7 @@ func (r *Runtime) runWorktreeDiskSweep(ctx context.Context, repos *storage.Repos
 		})
 		status.Scanned += plan.Summary.Scanned
 		status.Unregistered += plan.Summary.Unregistered
+		status.WouldRemove += plan.Summary.WouldRemove
 		status.Removed += plan.Summary.Removed
 		status.Skipped += plan.Summary.Skipped
 		status.Failed += plan.Summary.Errors
@@ -873,27 +904,33 @@ func worktreeRetentionCutoff(now time.Time, retentionDays int) (time.Time, error
 	return now.Add(-time.Duration(retentionDays) * 24 * time.Hour), nil
 }
 
-func validateDiskSweepRoot(root, repoPath, sharedRoot string, sharedRootErr error) error {
+func validateDiskSweepRoot(root string, managedRepoPaths []string, sharedRoot string, sharedRootErr error) error {
 	if sharedRootErr != nil {
 		return fmt.Errorf("shared worktree root unavailable: %w", sharedRootErr)
 	}
-	root = filepath.Clean(strings.TrimSpace(root))
-	repoPath = filepath.Clean(strings.TrimSpace(repoPath))
+	root = strings.TrimSpace(root)
 	if root == "" {
 		return fmt.Errorf("worktree sweep root is empty")
 	}
-	if root == repoPath || pathContains(root, repoPath) {
-		return fmt.Errorf("worktree sweep root %q is a broad ancestor of repository %q", root, repoPath)
+	rootIdentity := worktreesafety.NormalizePath(root)
+	for _, managedRepoPath := range managedRepoPaths {
+		managedRepoPath = strings.TrimSpace(managedRepoPath)
+		if managedRepoPath == "" {
+			continue
+		}
+		if rootIdentity == worktreesafety.NormalizePath(managedRepoPath) || pathContains(rootIdentity, managedRepoPath) {
+			return fmt.Errorf("worktree sweep root %q is a broad ancestor of repository %q", root, managedRepoPath)
+		}
 	}
-	if root == filepath.Dir(root) || root == string(filepath.Separator) || root == filepath.Clean(os.TempDir()) {
+	if rootIdentity == filepath.Dir(rootIdentity) || rootIdentity == string(filepath.Separator) || rootIdentity == worktreesafety.NormalizePath(os.TempDir()) {
 		return fmt.Errorf("worktree sweep root %q is not dedicated", root)
 	}
-	if home, err := os.UserHomeDir(); err == nil && root == filepath.Clean(home) {
+	if home, err := os.UserHomeDir(); err == nil && rootIdentity == worktreesafety.NormalizePath(home) {
 		return fmt.Errorf("worktree sweep root %q is not dedicated", root)
 	}
 	if sharedRootErr == nil {
-		sharedRoot = filepath.Clean(strings.TrimSpace(sharedRoot))
-		if root == sharedRoot {
+		sharedRoot = strings.TrimSpace(sharedRoot)
+		if rootIdentity == worktreesafety.NormalizePath(sharedRoot) {
 			return fmt.Errorf("worktree sweep root %q is the shared root", root)
 		}
 	}
@@ -901,23 +938,39 @@ func validateDiskSweepRoot(root, repoPath, sharedRoot string, sharedRootErr erro
 }
 
 func pathContains(parent, child string) bool {
-	rel, err := filepath.Rel(filepath.Clean(parent), filepath.Clean(child))
+	rel, err := filepath.Rel(worktreesafety.NormalizePath(parent), worktreesafety.NormalizePath(child))
 	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
 		return false
 	}
 	return true
 }
 
-func rejectOverlappingDiskSweepRoots(roots []worktreecleanup.DiskSweepRoot) ([]worktreecleanup.DiskSweepRoot, []error) {
+func rejectOverlappingDiskSweepRoots(roots []worktreecleanup.DiskSweepRoot, protected ...[]worktreecleanup.DiskSweepRoot) ([]worktreecleanup.DiskSweepRoot, []error) {
 	invalid := make(map[int]bool)
 	errs := []error{}
+	scope := roots
+	if len(protected) > 0 {
+		scope = protected[0]
+	}
+	seenPairs := make(map[string]bool)
 	for i := 0; i < len(roots); i++ {
-		for j := i + 1; j < len(roots); j++ {
-			if !pathContains(roots[i].WorktreeRoot, roots[j].WorktreeRoot) && !pathContains(roots[j].WorktreeRoot, roots[i].WorktreeRoot) {
+		for _, other := range scope {
+			if worktreesafety.NormalizePath(roots[i].WorktreeRoot) == worktreesafety.NormalizePath(other.WorktreeRoot) {
 				continue
 			}
-			invalid[i], invalid[j] = true, true
-			errs = append(errs, fmt.Errorf("overlapping worktree sweep roots %q and %q", roots[i].WorktreeRoot, roots[j].WorktreeRoot))
+			if !pathContains(roots[i].WorktreeRoot, other.WorktreeRoot) && !pathContains(other.WorktreeRoot, roots[i].WorktreeRoot) {
+				continue
+			}
+			invalid[i] = true
+			left, right := worktreesafety.NormalizePath(roots[i].WorktreeRoot), worktreesafety.NormalizePath(other.WorktreeRoot)
+			if left > right {
+				left, right = right, left
+			}
+			pair := left + "\x00" + right
+			if !seenPairs[pair] {
+				seenPairs[pair] = true
+				errs = append(errs, fmt.Errorf("overlapping worktree sweep roots %q and %q", roots[i].WorktreeRoot, other.WorktreeRoot))
+			}
 		}
 	}
 	if len(invalid) == 0 {
@@ -934,7 +987,7 @@ func rejectOverlappingDiskSweepRoots(roots []worktreecleanup.DiskSweepRoot) ([]w
 
 // containerNameUnder returns the first path segment of root beneath sharedRoot.
 func containerNameUnder(sharedRoot, root string) (string, bool) {
-	rel, err := filepath.Rel(filepath.Clean(sharedRoot), filepath.Clean(root))
+	rel, err := filepath.Rel(worktreesafety.NormalizePath(sharedRoot), worktreesafety.NormalizePath(root))
 	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
 		return "", false
 	}

@@ -251,6 +251,9 @@ type ContainerSweepOptions struct {
 	// live containers while allowing orphaned project directories to drain.
 	LiveProjectPaths []string
 	RegisteredPaths  []string
+	// IsRegisteredPath refreshes the worktrees table at the final nested-project
+	// boundary. RegisteredPaths is only the planning snapshot.
+	IsRegisteredPath func(context.Context, string) (bool, error)
 	Git              DiskSweepGit
 	Budget           int
 	RetentionCutoff  time.Time
@@ -311,9 +314,7 @@ func RunContainerSweep(ctx context.Context, options ContainerSweepOptions) (Disk
 	for _, candidate := range plan.Candidates {
 		if candidate.Action != DiskSweepActionRemove {
 			if candidate.Reason == "live_project_container" && len(options.LiveProjectPaths) > 0 {
-				releaseMutation := worktreesafety.AcquireManagedMutationLock(candidate.Path)
 				nested := sweepLiveContainerProjects(ctx, options, candidate.Path, liveProjects, registered, budget)
-				releaseMutation()
 				used := nested.Summary.Removed
 				if options.DryRun {
 					used = nested.Summary.WouldRemove
@@ -376,6 +377,14 @@ func RunContainerSweep(ctx context.Context, options ContainerSweepOptions) (Disk
 				result.Summary.Skipped++
 			}
 			result.Candidates = append(result.Candidates, decided)
+			continue
+		}
+		if err := ctx.Err(); err != nil {
+			decided.Action = ActionSkipped
+			decided.Reason = "context_canceled"
+			result.Summary.Skipped++
+			result.Candidates = append(result.Candidates, decided)
+			releaseMutation()
 			continue
 		}
 
@@ -465,11 +474,31 @@ func sweepLiveContainerProjects(ctx context.Context, options ContainerSweepOptio
 			plan.Candidates = append(plan.Candidates, DiskCandidate{Path: project.Path, Action: ActionSkipped, Reason: "protected_project"})
 			continue
 		}
-		candidate := DiskCandidate{Path: project.Path, Action: DiskSweepActionRemove, Reason: "orphaned_project"}
+		releaseMutation := worktreesafety.AcquireManagedMutationLock(worktreesafety.WorktreeMutationScope(project.Path))
+		candidate, finalEligible := revalidateOrphanProject(ctx, options, project.Path, registered)
+		if !finalEligible {
+			releaseMutation()
+			if candidate.Action == "error" {
+				plan.Summary.Errors++
+			} else {
+				plan.Summary.Skipped++
+			}
+			plan.Candidates = append(plan.Candidates, candidate)
+			continue
+		}
+		if err := ctx.Err(); err != nil {
+			releaseMutation()
+			candidate.Action = ActionSkipped
+			candidate.Reason = "context_canceled"
+			plan.Summary.Skipped++
+			plan.Candidates = append(plan.Candidates, candidate)
+			continue
+		}
 		plan.Summary.WouldRemove++
 		if options.DryRun {
 			budget--
 			plan.Candidates = append(plan.Candidates, candidate)
+			releaseMutation()
 			continue
 		}
 		if err := options.RemoveAll(project.Path); err != nil {
@@ -478,13 +507,78 @@ func sweepLiveContainerProjects(ctx context.Context, options ContainerSweepOptio
 			candidate.Reason = "remove_failed"
 			candidate.Error = err.Error()
 			plan.Candidates = append(plan.Candidates, candidate)
+			releaseMutation()
 			continue
 		}
 		budget--
 		plan.Summary.Removed++
 		plan.Candidates = append(plan.Candidates, candidate)
+		releaseMutation()
 	}
 	return plan
+}
+
+// revalidateOrphanProject repeats the project and child admission checks while
+// the managed project scope is held. The initial ReadDir is only a planning
+// snapshot; an external creator can add a checkout or regular file before the
+// final RemoveAll, so the deletion boundary must inspect the complete current
+// child set again.
+func revalidateOrphanProject(ctx context.Context, options ContainerSweepOptions, projectPath string, registered map[string]bool) (DiskCandidate, bool) {
+	candidate := DiskCandidate{Path: projectPath, Action: DiskSweepActionRemove, Reason: "orphaned_project"}
+	var eligible bool
+	candidate, eligible = revalidateContainerCandidate(candidate, options.RetentionCutoff)
+	if !eligible {
+		return candidate, false
+	}
+	children, err := options.ReadDir(projectPath)
+	if err != nil {
+		candidate.Action = "error"
+		candidate.Reason = "read_project_at_removal_failed"
+		candidate.Error = err.Error()
+		return candidate, false
+	}
+	for _, child := range children {
+		if !child.IsDir {
+			candidate.Action = ActionSkipped
+			candidate.Reason = "non_directory_inside"
+			return candidate, false
+		}
+		freshChild, childEligible := revalidateContainerCandidate(DiskCandidate{Path: child.Path}, options.RetentionCutoff)
+		if !childEligible {
+			candidate.Action = ActionSkipped
+			candidate.Reason = freshChild.Reason + "_inside"
+			candidate.Error = freshChild.Error
+			return candidate, false
+		}
+		registeredNow := registered[normalizeSweepPath(freshChild.Path)]
+		if options.IsRegisteredPath != nil {
+			registeredNow, err = options.IsRegisteredPath(ctx, freshChild.Path)
+			if err != nil {
+				candidate.Action = "error"
+				candidate.Reason = "registered_path_refresh_failed_inside"
+				candidate.Error = err.Error()
+				return candidate, false
+			}
+		}
+		if registeredNow {
+			candidate.Action = ActionSkipped
+			candidate.Reason = "registered_checkout_inside"
+			return candidate, false
+		}
+		decided, childAdmitted := admitRemoval(ctx, options.Git, freshChild)
+		if !childAdmitted {
+			candidate.Action = decided.Action
+			candidate.Reason = decided.Reason + "_inside"
+			candidate.Error = decided.Error
+			return candidate, false
+		}
+		if worktreesafety.IsUsableStandaloneGitRepository(freshChild.Path) {
+			candidate.Action = ActionSkipped
+			candidate.Reason = "standalone_git_repository_inside"
+			return candidate, false
+		}
+	}
+	return candidate, true
 }
 
 func liveProjectAncestor(path string, liveProjects map[string]bool) bool {
@@ -753,6 +847,14 @@ func RunDiskSweep(ctx context.Context, options DiskSweepOptions) (DiskSweepPlan,
 				result.Candidates = append(result.Candidates, decided)
 				continue
 			}
+			if err := ctx.Err(); err != nil {
+				decided.Action = ActionSkipped
+				decided.Reason = "context_canceled"
+				result.Summary.Skipped++
+				result.Candidates = append(result.Candidates, decided)
+				releaseMutation()
+				continue
+			}
 			registered, err := options.IsRegisteredPath(ctx, decided.Path)
 			if err != nil {
 				decided.Action = "error"
@@ -803,6 +905,14 @@ func RunDiskSweep(ctx context.Context, options DiskSweepOptions) (DiskSweepPlan,
 			if worktreesafety.IsUsableStandaloneGitRepository(decided.Path) {
 				decided.Action = ActionSkipped
 				decided.Reason = "standalone_git_repository"
+				result.Summary.Skipped++
+				result.Candidates = append(result.Candidates, decided)
+				releaseMutation()
+				continue
+			}
+			if err := ctx.Err(); err != nil {
+				decided.Action = ActionSkipped
+				decided.Reason = "context_canceled"
 				result.Summary.Skipped++
 				result.Candidates = append(result.Candidates, decided)
 				releaseMutation()

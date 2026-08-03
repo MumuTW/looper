@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/MumuTW/looper/internal/config"
+	"github.com/MumuTW/looper/internal/worktreecleanup"
 )
 
 // mkDebris creates a directory under the fixture's worktree root that no
@@ -123,8 +124,37 @@ func TestWorktreeCleanupPassDiskSweepHonorsDryRun(t *testing.T) {
 	if summary.DiskSweep.Unregistered != 1 || summary.DiskSweep.Removed != 0 {
 		t.Fatalf("diskSweep = %#v, want unregistered reported and nothing removed", summary.DiskSweep)
 	}
+	if summary.DiskSweep.WouldRemove != 1 {
+		t.Fatalf("diskSweep.wouldRemove = %d, want 1", summary.DiskSweep.WouldRemove)
+	}
 	if _, err := os.Stat(debris); err != nil {
 		t.Fatalf("dry run removed %q: %v", debris, err)
+	}
+}
+
+func TestValidateDiskSweepRootChecksAllRepositoriesAndSymlinkAliases(t *testing.T) {
+	repoA := filepath.Join(t.TempDir(), "repo-a")
+	repoB := filepath.Join(t.TempDir(), "repo-b")
+	if err := os.MkdirAll(repoB, 0o755); err != nil {
+		t.Fatalf("MkdirAll(repoB) error = %v", err)
+	}
+	alias := filepath.Join(t.TempDir(), "root-alias")
+	if err := os.Symlink(repoB, alias); err != nil {
+		t.Skipf("Symlink() unsupported: %v", err)
+	}
+	if err := validateDiskSweepRoot(alias, []string{repoA, repoB}, filepath.Join(t.TempDir(), "shared"), nil); err == nil {
+		t.Fatal("validateDiskSweepRoot() = nil for a symlink alias of another repository")
+	}
+}
+
+func TestRejectOverlappingDiskSweepRootsIncludesArchivedRoots(t *testing.T) {
+	active := filepath.Join(t.TempDir(), "container", "active")
+	archived := filepath.Join(active, "archived")
+	activeRoot := worktreecleanup.DiskSweepRoot{ProjectID: "active", WorktreeRoot: active}
+	archivedRoot := worktreecleanup.DiskSweepRoot{ProjectID: "archived", WorktreeRoot: archived}
+	filtered, errs := rejectOverlappingDiskSweepRoots([]worktreecleanup.DiskSweepRoot{activeRoot}, []worktreecleanup.DiskSweepRoot{activeRoot, archivedRoot})
+	if len(filtered) != 0 || len(errs) != 1 {
+		t.Fatalf("filtered=%#v errs=%v, want active root rejected by archived descendant", filtered, errs)
 	}
 }
 

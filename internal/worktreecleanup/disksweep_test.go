@@ -208,8 +208,9 @@ func TestPlanDiskSweepCountsUnregisteredBeyondBudget(t *testing.T) {
 }
 
 type stubSweepGit struct {
-	clean map[string]bool
-	err   error
+	clean  map[string]bool
+	err    error
+	cancel context.CancelFunc
 }
 
 type mutatingSweepGit struct {
@@ -225,10 +226,32 @@ func (g mutatingSweepGit) WorktreeClean(_ context.Context, path string) (bool, e
 }
 
 func (s stubSweepGit) WorktreeClean(_ context.Context, path string) (bool, error) {
+	if s.cancel != nil {
+		s.cancel()
+	}
 	if s.err != nil {
 		return false, s.err
 	}
 	return s.clean[path], nil
+}
+
+func TestRunDiskSweepChecksCancellationBeforeRemoval(t *testing.T) {
+	root := t.TempDir()
+	path := writeUsableCheckout(t, filepath.Join(root, "looper-app-canceled"), old())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var removed []string
+	options := sweepOptions(DiskSweepRoot{ProjectID: "app", RepoPath: filepath.Join(t.TempDir(), "repo"), WorktreeRoot: root}, stubSweepGit{clean: map[string]bool{path: true}, cancel: cancel}, &removed)
+	plan, err := RunDiskSweep(ctx, options)
+	if err != nil {
+		t.Fatalf("RunDiskSweep() error = %v", err)
+	}
+	if len(removed) != 0 {
+		t.Fatalf("removed = %v, want cancellation to prevent removal", removed)
+	}
+	if action, reason := reasonFor(t, plan, path); action != ActionSkipped || reason != "context_canceled" {
+		t.Fatalf("candidate = (%q, %q), want context_canceled skip", action, reason)
+	}
 }
 
 func mkdirAt(t *testing.T, path string, modified time.Time) string {
@@ -488,6 +511,39 @@ func TestRunDiskSweepPreservesIndeterminateGitMetadata(t *testing.T) {
 	}
 	if action, reason := reasonFor(t, plan, path); action != ActionSkipped || reason != "git_metadata_indeterminate" {
 		t.Fatalf("candidate = (%q, %q), want indeterminate skip", action, reason)
+	}
+}
+
+func TestRunDiskSweepPreservesCorruptRepositoryWithObjects(t *testing.T) {
+	root := t.TempDir()
+	path := mkdirAt(t, filepath.Join(root, "looper-app-corrupt-with-objects"), old())
+	gitDir := filepath.Join(path, ".git")
+	if err := os.MkdirAll(filepath.Join(gitDir, "objects", "aa"), 0o755); err != nil {
+		t.Fatalf("MkdirAll objects: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(gitDir, "refs"), 0o755); err != nil {
+		t.Fatalf("MkdirAll refs: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(gitDir, "HEAD"), []byte("not-a-head\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile HEAD: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(gitDir, "objects", "aa", "0123456789012345678901234567890123456789"), []byte("object\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile loose object: %v", err)
+	}
+	if err := os.Chtimes(path, old(), old()); err != nil {
+		t.Fatalf("Chtimes path: %v", err)
+	}
+
+	var removed []string
+	plan, err := RunDiskSweep(context.Background(), sweepOptions(DiskSweepRoot{ProjectID: "app", RepoPath: filepath.Join(t.TempDir(), "repo"), WorktreeRoot: root}, stubSweepGit{}, &removed))
+	if err != nil {
+		t.Fatalf("RunDiskSweep() error = %v", err)
+	}
+	if len(removed) != 0 {
+		t.Fatalf("removed = %v, want corrupt repository objects preserved", removed)
+	}
+	if action, reason := reasonFor(t, plan, path); action != ActionSkipped || reason != "populated_unusable_worktree" {
+		t.Fatalf("candidate = (%q, %q), want populated_unusable_worktree skip", action, reason)
 	}
 }
 
@@ -1086,5 +1142,57 @@ func TestRunContainerSweepDrainsOrphanedProjectInsideLiveContainer(t *testing.T)
 	}
 	if _, err := os.Stat(liveProject); err != nil {
 		t.Fatalf("live project was removed: %v", err)
+	}
+}
+
+func TestRunContainerSweepRevalidatesOrphanProjectBeforeRemoval(t *testing.T) {
+	sharedRoot := t.TempDir()
+	container := filepath.Join(sharedRoot, "repo-live")
+	liveProject := filepath.Join(container, "project-live")
+	orphanProject := filepath.Join(container, "project-orphan")
+	mkdirAt(t, filepath.Join(liveProject, "checkout"), old())
+	mkdirAt(t, filepath.Join(orphanProject, "checkout"), old())
+	for _, path := range []string{liveProject, orphanProject, container} {
+		if err := os.Chtimes(path, old(), old()); err != nil {
+			t.Fatalf("Chtimes(%s): %v", path, err)
+		}
+	}
+
+	var removed []string
+	options := containerOptions(sharedRoot, []string{"repo-live"}, stubSweepGit{}, &removed)
+	options.LiveProjectPaths = []string{liveProject}
+	projectReads := 0
+	options.ReadDir = func(path string) ([]DiskEntry, error) {
+		entries, err := readDirEntries(path)
+		if err != nil {
+			return nil, err
+		}
+		if path == orphanProject {
+			projectReads++
+			if projectReads == 1 {
+				marker := filepath.Join(orphanProject, "external-file.txt")
+				if err := os.WriteFile(marker, []byte("created after planning\n"), 0o644); err != nil {
+					t.Fatalf("WriteFile(%s): %v", marker, err)
+				}
+				if err := os.Chtimes(marker, old(), old()); err != nil {
+					t.Fatalf("Chtimes(%s): %v", marker, err)
+				}
+				if err := os.Chtimes(orphanProject, old(), old()); err != nil {
+					t.Fatalf("Chtimes(%s): %v", orphanProject, err)
+				}
+			}
+		}
+		return entries, nil
+	}
+
+	plan, err := RunContainerSweep(context.Background(), options)
+	if err != nil {
+		t.Fatalf("RunContainerSweep() error = %v", err)
+	}
+	if len(removed) != 0 {
+		t.Fatalf("removed = %v, want orphan project preserved after final revalidation", removed)
+	}
+	if action, reason := reasonFor(t, plan, orphanProject); action != ActionSkipped || reason != "non_directory_inside" {
+		t.Fatalf("orphan project = (%q, %q), want non_directory_inside skip", action, reason)
 	}
 }

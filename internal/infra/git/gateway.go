@@ -297,39 +297,37 @@ func (g *Gateway) CreateWorktree(ctx context.Context, input CreateWorktreeInput)
 	if restored != nil {
 		return *restored, nil
 	}
-	// Hold the repository-container fence from the physical worktree creation
-	// through AdoptPath. The disk sweep takes the same scope lock, so a checkout
-	// cannot be removed in the crash window between `git worktree add` and its
-	// durable worktrees row.
-	releaseMutation := worktreesafety.AcquireManagedMutationLock(worktreesafety.WorktreeMutationScope(input.WorktreeRoot))
-	defer releaseMutation()
-
+	var addArgs []string
 	if checkoutMode == CheckoutModeDetached {
 		startPoint, err := g.resolveDetachedStartPoint(ctx, input)
 		if err != nil {
 			return storage.WorktreeRecord{}, err
 		}
-		if err := g.runGit(ctx, input.RepoPath, nil, "worktree", "add", "--force", "--detach", worktreePath, startPoint); err != nil {
-			return storage.WorktreeRecord{}, err
-		}
+		addArgs = []string{"worktree", "add", "--force", "--detach", worktreePath, startPoint}
 	} else {
 		branchExists, err := g.branchExists(ctx, input.RepoPath, input.Branch)
 		if err != nil {
 			return storage.WorktreeRecord{}, err
 		}
-		args := []string{"worktree", "add", "--force"}
+		addArgs = []string{"worktree", "add", "--force"}
 		if branchExists {
-			args = append(args, worktreePath, input.Branch)
+			addArgs = append(addArgs, worktreePath, input.Branch)
 		} else {
 			startPoint, err := g.resolveAttachedStartPoint(ctx, input.RepoPath, input.Branch, input.BaseBranch)
 			if err != nil {
 				return storage.WorktreeRecord{}, err
 			}
-			args = append(args, "-b", input.Branch, worktreePath, startPoint)
+			addArgs = append(addArgs, "-b", input.Branch, worktreePath, startPoint)
 		}
-		if err := g.runGit(ctx, input.RepoPath, nil, args...); err != nil {
-			return storage.WorktreeRecord{}, err
-		}
+	}
+	// Hold the repository-container fence only from the physical worktree
+	// creation through AdoptPath. Remote ref resolution and branch discovery
+	// above may fetch or wait on a slow remote, and must not block sibling
+	// creates or disk-sweep mutations that are unrelated to filesystem changes.
+	releaseMutation := worktreesafety.AcquireManagedMutationLock(worktreesafety.WorktreeMutationScope(input.WorktreeRoot))
+	defer releaseMutation()
+	if err := g.runGit(ctx, input.RepoPath, nil, addArgs...); err != nil {
+		return storage.WorktreeRecord{}, err
 	}
 
 	// Protect agent-authored git commands (agents run their own `git add -A`
