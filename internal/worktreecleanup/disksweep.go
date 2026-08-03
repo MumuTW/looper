@@ -512,7 +512,9 @@ func admitContainer(ctx context.Context, git DiskSweepGit, readDir func(string) 
 	}
 	for _, project := range projects {
 		if !project.IsDir {
-			continue
+			container.Action = ActionSkipped
+			container.Reason = "non_directory_inside"
+			return container, false
 		}
 		checkouts, err := readDir(project.Path)
 		if err != nil {
@@ -523,7 +525,9 @@ func admitContainer(ctx context.Context, git DiskSweepGit, readDir func(string) 
 		}
 		for _, checkout := range checkouts {
 			if !checkout.IsDir {
-				continue
+				container.Action = ActionSkipped
+				container.Reason = "non_directory_inside"
+				return container, false
 			}
 			freshCheckout, checkoutEligible := revalidateContainerCandidate(DiskCandidate{Path: checkout.Path}, cutoff)
 			if !checkoutEligible {

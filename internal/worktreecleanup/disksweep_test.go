@@ -753,6 +753,61 @@ func TestRunContainerSweepPreservesContainerWithRecentCheckout(t *testing.T) {
 	}
 }
 
+func TestRunContainerSweepPreservesContainerWithRegularFiles(t *testing.T) {
+	tests := []struct {
+		name       string
+		fileWithin func(string) string
+	}{
+		{
+			name: "container root",
+			fileWithin: func(container string) string {
+				return filepath.Join(container, "notes.txt")
+			},
+		},
+		{
+			name: "project directory",
+			fileWithin: func(container string) string {
+				return filepath.Join(container, "project_1", "notes.txt")
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			sharedRoot := t.TempDir()
+			container := filepath.Join(sharedRoot, "repo-dead")
+			file := test.fileWithin(container)
+			if err := os.MkdirAll(filepath.Dir(file), 0o755); err != nil {
+				t.Fatalf("MkdirAll() error = %v", err)
+			}
+			if err := os.WriteFile(file, []byte("keep me\n"), 0o644); err != nil {
+				t.Fatalf("WriteFile() error = %v", err)
+			}
+			if err := os.Chtimes(file, old(), old()); err != nil {
+				t.Fatalf("Chtimes(file) error = %v", err)
+			}
+			if err := os.Chtimes(container, old(), old()); err != nil {
+				t.Fatalf("Chtimes(container) error = %v", err)
+			}
+
+			var removed []string
+			plan, err := RunContainerSweep(context.Background(), containerOptions(sharedRoot, nil, stubSweepGit{}, &removed))
+			if err != nil {
+				t.Fatalf("RunContainerSweep() error = %v", err)
+			}
+			if len(removed) != 0 {
+				t.Fatalf("removed = %v, want none for unexamined regular file", removed)
+			}
+			if action, reason := reasonFor(t, plan, container); action != ActionSkipped || reason != "non_directory_inside" {
+				t.Fatalf("container = (%q, %q), want non_directory_inside skip", action, reason)
+			}
+			if _, err := os.Stat(file); err != nil {
+				t.Fatalf("protected regular file was removed: %v", err)
+			}
+		})
+	}
+}
+
 func TestRunContainerSweepPreservesContainerWithRegisteredCheckout(t *testing.T) {
 	sharedRoot := t.TempDir()
 	container := filepath.Join(sharedRoot, "repo-dead")
