@@ -154,7 +154,7 @@ func TestWorktreeCleanupRecordHelpersHoldAdmission(t *testing.T) {
 		t.Fatalf("recordWorktreeCleanupSkip() = %#v, want skipped admission degraded", skip)
 	}
 	failure := fixture.runtime.recordWorktreeCleanupFailure(context.Background(), fixture.repos, worktree, errors.New("git list failed"))
-	if failure.status != "skipped" || !strings.Contains(failure.message, "degraded") {
+	if failure.status != "skipped" || !strings.Contains(failure.Message, "degraded") {
 		t.Fatalf("recordWorktreeCleanupFailure() = %#v, want skipped admission degraded", failure)
 	}
 

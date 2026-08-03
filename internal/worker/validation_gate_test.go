@@ -84,7 +84,7 @@ func TestRunValidationBlocksOnNonZeroExit(t *testing.T) {
 		t.Fatalf("runValidation() summary = %q, want the failing command named", result.Summary)
 	}
 	failure := classifyValidationFailure(result)
-	if failure.kind == "" {
+	if failure.Kind == "" {
 		t.Fatalf("classifyValidationFailure() = %#v, want a failure kind", failure)
 	}
 }
@@ -148,7 +148,7 @@ func TestRunValidationBoundsCommandRuntime(t *testing.T) {
 		t.Fatalf("runValidation() result = %#v, want bounded timeout failure", result)
 	}
 	failure := classifyValidationFailure(result)
-	if failure.kind != runpipe.FailureRetryableTransient {
+	if failure.Kind != runpipe.FailureRetryableTransient {
 		t.Fatalf("classifyValidationFailure() = %#v, want retryable timeout", failure)
 	}
 }
@@ -157,7 +157,7 @@ func TestClassifyValidationFailureParksDeterministicFailures(t *testing.T) {
 	t.Parallel()
 
 	failure := classifyValidationFailure(ValidationResult{Passed: false, Summary: "go test failed", Output: "assertion mismatch"})
-	if failure.kind != runpipe.FailureManualIntervention || failure.resumePolicy != "manual_intervention" {
+	if failure.Kind != runpipe.FailureManualIntervention || failure.resumePolicy != "manual_intervention" {
 		t.Fatalf("classifyValidationFailure() = %#v, want manual intervention", failure)
 	}
 }
@@ -166,7 +166,7 @@ func TestClassifyValidationFailureDoesNotInferTimeoutFromTestOutput(t *testing.T
 	t.Parallel()
 
 	failure := classifyValidationFailure(ValidationResult{Passed: false, Summary: "go test failed", Output: "--- FAIL: TestTimeoutPolicy"})
-	if failure.kind != runpipe.FailureManualIntervention || failure.resumePolicy != "manual_intervention" {
+	if failure.Kind != runpipe.FailureManualIntervention || failure.resumePolicy != "manual_intervention" {
 		t.Fatalf("classifyValidationFailure() = %#v, want deterministic failure parked", failure)
 	}
 }

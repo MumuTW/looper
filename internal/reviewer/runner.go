@@ -1408,9 +1408,9 @@ func (r *Runner) finalizeClaimSetupFailure(ctx context.Context, queueItem storag
 	var failedQueue *storage.QueueItemRecord
 	var err error
 	if errors.Is(cause, agent.ErrProviderBrownout) {
-		failedQueue, err = r.requeueClaimedItemWithoutAttempt(ctx, queueItem, failure.kind, failure.message)
+		failedQueue, err = r.requeueClaimedItemWithoutAttempt(ctx, queueItem, failure.Kind, failure.Message)
 	} else {
-		failedQueue, err = r.failQueueItem(ctx, queueItem, failure.kind, failure.message)
+		failedQueue, err = r.failQueueItem(ctx, queueItem, failure.Kind, failure.Message)
 	}
 	if err != nil {
 		return err
@@ -1598,9 +1598,9 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			var failedQueue *storage.QueueItemRecord
 			var queueErr error
 			if errors.Is(err, agent.ErrProviderBrownout) {
-				failedQueue, queueErr = r.requeueClaimedItemWithoutAttempt(ctx, queueItem, failure.kind, failure.message)
+				failedQueue, queueErr = r.requeueClaimedItemWithoutAttempt(ctx, queueItem, failure.Kind, failure.Message)
 			} else {
-				failedQueue, queueErr = r.failQueueItem(ctx, queueItem, failure.kind, failure.message)
+				failedQueue, queueErr = r.failQueueItem(ctx, queueItem, failure.Kind, failure.Message)
 			}
 			if queueErr != nil {
 				return runpipe.ProcessResult{}, queueErr
@@ -4631,7 +4631,7 @@ func (r *Runner) failQueueItem(ctx context.Context, queueItem storage.QueueItemR
 // requeueClaimedItemWithoutAttempt returns a claim refused by provider
 // brownout to queued without charging an attempt: no agent run reached the
 // executor after the durable claim.
-func (r *Runner) requeueClaimedItemWithoutAttempt(ctx context.Context, queueItem storage.QueueItemRecord, kind QueueFailureKind, message string) (*storage.QueueItemRecord, error) {
+func (r *Runner) requeueClaimedItemWithoutAttempt(ctx context.Context, queueItem storage.QueueItemRecord, kind runpipe.QueueFailureKind, message string) (*storage.QueueItemRecord, error) {
 	nowISO := r.nowISO()
 	delay := backoffDelay(r.retryBaseDelay, cappedRetryDelayAttempt(queueItem.Attempts+1, queueItem.MaxAttempts), r.retryMaxDelayForProject(derefString(queueItem.ProjectID)))
 	retryAt := eventlog.FormatJavaScriptISOString(r.now().Add(delay))
@@ -6588,6 +6588,13 @@ func derefString(value *string) string {
 		return ""
 	}
 	return *value
+}
+
+func optionalString(value string) *string {
+	if value == "" {
+		return nil
+	}
+	return &value
 }
 
 func derefInt64(value *int64) int64 {

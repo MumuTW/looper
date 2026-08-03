@@ -54,6 +54,7 @@ const (
 	defaultAgentTimeout = time.Hour
 	defaultClaimTTL     = 10 * time.Minute
 	defaultRetryDelay   = 5 * time.Second
+	maxRetryDelay       = 300 * time.Second
 	defaultRetryMax     = 3
 	defaultIssueLimit   = 30
 	// Keep in lockstep with internal/infra/git.WorktreeFingerprintVersion; this
@@ -1555,9 +1556,9 @@ func (r *Runner) recoverClaimedItem(ctx context.Context, queueItem storage.Queue
 	var failedQueue *storage.QueueItemRecord
 	var failErr error
 	if errors.Is(err, agent.ErrProviderBrownout) {
-		failedQueue, failErr = r.requeueClaimedItemWithoutAttempt(ctx, queueItem, failure.kind, failure.message)
+		failedQueue, failErr = r.requeueClaimedItemWithoutAttempt(ctx, queueItem, failure.Kind, failure.Message)
 	} else {
-		failedQueue, failErr = r.failQueueItem(ctx, queueItem, failure.kind, failure.message)
+		failedQueue, failErr = r.failQueueItem(ctx, queueItem, failure.Kind, failure.Message)
 	}
 	if failErr != nil {
 		return nil, failErr
@@ -1795,9 +1796,9 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 			}
 			var failedQueue *storage.QueueItemRecord
 			if errors.Is(err, agent.ErrProviderBrownout) {
-				failedQueue, err = r.requeueClaimedItemWithoutAttempt(ctx, queueItem, failure.kind, failure.message)
+				failedQueue, err = r.requeueClaimedItemWithoutAttempt(ctx, queueItem, failure.Kind, failure.Message)
 			} else {
-				failedQueue, err = r.failQueueItem(ctx, queueItem, failure.kind, failure.message)
+				failedQueue, err = r.failQueueItem(ctx, queueItem, failure.Kind, failure.Message)
 			}
 			if err != nil {
 				return runpipe.ProcessResult{}, err
@@ -4355,13 +4356,44 @@ func (r *Runner) failQueueItem(ctx context.Context, queueItem storage.QueueItemR
 // requeueClaimedItemWithoutAttempt returns a claim refused by provider
 // brownout to queued without charging an attempt: no agent run reached the
 // executor after the durable claim.
-func (r *Runner) requeueClaimedItemWithoutAttempt(ctx context.Context, queueItem storage.QueueItemRecord, kind QueueFailureKind, message string) (*storage.QueueItemRecord, error) {
+func (r *Runner) requeueClaimedItemWithoutAttempt(ctx context.Context, queueItem storage.QueueItemRecord, kind runpipe.QueueFailureKind, message string) (*storage.QueueItemRecord, error) {
 	nowISO := r.nowISO()
 	retryAt := eventlog.FormatJavaScriptISOString(r.now().Add(backoffDelay(r.retryBaseDelay, cappedRetryDelayAttempt(queueItem.Attempts+1, queueItem.MaxAttempts))))
 	if err := r.repos.Queue.MarkRetry(ctx, storage.QueueMarkRetryInput{ID: queueItem.ID, AvailableAt: retryAt, Attempts: queueItem.Attempts, ErrorMessage: optionalString(message), ErrorKind: string(kind), UpdatedAt: nowISO}); err != nil {
 		return nil, err
 	}
 	return r.repos.Queue.GetByID(ctx, queueItem.ID)
+}
+
+func backoffDelay(base time.Duration, attempts int64) time.Duration {
+	delay := base
+	for i := int64(1); i < attempts; i++ {
+		if delay >= maxRetryDelay || delay > maxRetryDelay/2 {
+			return maxRetryDelay
+		}
+		delay *= 2
+	}
+	if delay > maxRetryDelay {
+		return maxRetryDelay
+	}
+	return delay
+}
+
+func cappedRetryDelayAttempt(attempts, maxAttempts int64) int64 {
+	if attempts <= 0 {
+		return 1
+	}
+	if maxAttempts > 0 && attempts > maxAttempts {
+		return maxAttempts
+	}
+	return attempts
+}
+
+func optionalString(value string) *string {
+	if value == "" {
+		return nil
+	}
+	return &value
 }
 
 func (r *Runner) updateLoop(ctx context.Context, loop storage.LoopRecord, mutate func(*storage.LoopRecord)) (storage.LoopRecord, error) {

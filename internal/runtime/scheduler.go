@@ -128,14 +128,21 @@ type schedulerAsyncRunner interface {
 }
 
 type defaultSchedulerTickInput struct {
-	Repos             *storage.Repositories
-	GitHubGateway     *githubinfra.Gateway
-	GitGateway        *gitinfra.Gateway
-	Logger            bootstrap.Logger
-	Now               func() time.Time
-	MaxConcurrentRuns int
-	ClaimMu           *sync.Mutex
-	ClaimBoundary     *sync.RWMutex
+	Repos *storage.Repositories
+	// CapturedProjects is the project-table snapshot already validated by the
+	// catalog pass immediately before an independent claim pass. Keeping it on
+	// the claim input lets the quarantine scope reuse that read instead of
+	// scanning Projects.List a second time on every tick. The explicit boolean
+	// distinguishes a captured empty table from an input that has no snapshot.
+	CapturedProjects      []storage.ProjectRecord
+	CapturedProjectsReady bool
+	GitHubGateway         *githubinfra.Gateway
+	GitGateway            *gitinfra.Gateway
+	Logger                bootstrap.Logger
+	Now                   func() time.Time
+	MaxConcurrentRuns     int
+	ClaimMu               *sync.Mutex
+	ClaimBoundary         *sync.RWMutex
 	// ClaimLaneCursor preserves provider-group rotation across independent
 	// claim-pump passes. Nil keeps direct/unit-test inputs deterministic.
 	ClaimLaneCursor *schedulerClaimLaneCursor
@@ -143,6 +150,14 @@ type defaultSchedulerTickInput struct {
 	// AllowClaim, when set, is the admission projection for all work-producing
 	// durable ClaimNext* activity. Nil means ungated (tests).
 	AllowClaim func() error
+	// HostAdmission, when set, reports whether the host can carry more work.
+	// Nil means ungated (tests, and any platform whose signals are unreadable).
+	HostAdmission func() *hostresources.Decision
+	// HostAdmissionLog, when set, reports whether a hold decision should be
+	// logged now (and records it so a repeated hold on the same sample is
+	// logged once). Nil means log every hold, preserving the test behavior of
+	// an ungated admission closure.
+	HostAdmissionLog func(*hostresources.Decision) bool
 	// AllowLifecycleWork admits scheduler phases that do not consume an agent
 	// call (HITL, deploy, stale reconciliation, and agent-free discovery). The
 	// daemon wires this separately so provider brownout does not stall them.
@@ -1946,6 +1961,7 @@ func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *
 	claimLaneCursor := &schedulerClaimLaneCursor{}
 	notificationGateways := newSchedulerNotificationGatewayFactory()
 	coordinatorState := coordinatorrole.NewRuntimeState()
+	var hostGate *hostAdmissionGate
 	escalatorCadence := &schedulerEscalatorCadence{}
 	initialConfig := source.Snapshot()
 	if logger != nil {
@@ -3104,6 +3120,20 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 	return retErr
 }
 
+func runEscalatorIfDue(ctx context.Context, input defaultSchedulerTickInput, runAt time.Time) error {
+	if input.Escalator == nil || input.EscalatorCadence == nil || input.Config == nil || !input.Config.Roles.Escalator.Enabled {
+		return nil
+	}
+	cadence := time.Duration(input.Config.Roles.Escalator.CadenceSeconds) * time.Second
+	runAt = runAt.UTC()
+	if !input.EscalatorCadence.start(runAt, cadence) {
+		return nil
+	}
+	_, err := input.Escalator.Run(ctx)
+	input.EscalatorCadence.finish(runAt, err == nil)
+	return err
+}
+
 // admissionRefuseWork rechecks lifecycle admission mid-tick. Nil gates mean
 // ungated (tests). Provider-specific discovery uses its own point-in-time gate;
 // durable claims use admissionRefuseClaim below.
@@ -3835,7 +3865,7 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 	if err != nil {
 		return queueItems, dispatchOwnedQueueClaims(ctx, owned, input, err)
 	}
-	projectScopedTypes, runnableProjectIDs, stickyOnlyProjectIDs := codingClaimProjectScope(input.Config, quarantinedIDs)
+	projectScopedTypes, runnableProjectIDs, _ := codingClaimProjectScope(input.Config, quarantinedIDs)
 	stopClaiming := false
 	var claimFailure error
 	claimLanes := func(longTerm bool) {
