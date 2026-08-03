@@ -695,7 +695,7 @@ func RunDiskSweep(ctx context.Context, options DiskSweepOptions) (DiskSweepPlan,
 				return result, ctx.Err()
 			}
 			releaseMutation := worktreesafety.AcquireManagedMutationLock(worktreesafety.WorktreeMutationScope(root.WorktreeRoot))
-			decided, eligible := revalidateDiskCandidate(root, candidate, options.RetentionCutoff)
+			decided, eligible := revalidateDiskCandidate(root, candidate, options.RetentionCutoff, false)
 			if !eligible {
 				releaseMutation()
 				if decided.Action == "error" {
@@ -753,7 +753,7 @@ func RunDiskSweep(ctx context.Context, options DiskSweepOptions) (DiskSweepPlan,
 				releaseMutation()
 				continue
 			}
-			decided, eligible = revalidateDiskCandidate(root, decided, options.RetentionCutoff)
+			decided, eligible = revalidateDiskCandidate(root, decided, options.RetentionCutoff, true)
 			if !eligible {
 				releaseMutation()
 				if decided.Action == "error" {
@@ -795,7 +795,7 @@ func RunDiskSweep(ctx context.Context, options DiskSweepOptions) (DiskSweepPlan,
 	return result, nil
 }
 
-func revalidateDiskCandidate(root DiskSweepRoot, candidate DiskCandidate, cutoff time.Time) (DiskCandidate, bool) {
+func revalidateDiskCandidate(root DiskSweepRoot, candidate DiskCandidate, cutoff time.Time, inspectContents bool) (DiskCandidate, bool) {
 	if err := worktreesafety.Validate(worktreesafety.CheckInput{WorktreePath: candidate.Path, RepoPath: root.RepoPath, WorktreeRoot: root.WorktreeRoot}); err != nil {
 		candidate.Action = ActionSkipped
 		candidate.Reason = "unsafe_path"
@@ -819,7 +819,11 @@ func revalidateDiskCandidate(root DiskSweepRoot, candidate DiskCandidate, cutoff
 		candidate.Reason = "not_a_directory"
 		return candidate, false
 	}
-	if !info.ModTime().Before(cutoff) {
+	modifiedAt := info.ModTime()
+	if inspectContents {
+		modifiedAt = latestPathModTime(candidate.Path, modifiedAt)
+	}
+	if !modifiedAt.Before(cutoff) {
 		candidate.Action = ActionSkipped
 		candidate.Reason = "within_retention"
 		return candidate, false
@@ -887,7 +891,11 @@ func readDirEntries(root string) ([]DiskEntry, error) {
 	for _, dirEntry := range dirEntries {
 		entry := DiskEntry{Path: filepath.Join(root, dirEntry.Name()), IsDir: dirEntry.IsDir()}
 		if info, err := dirEntry.Info(); err == nil {
-			entry.ModifiedAt = latestPathModTime(entry.Path, info.ModTime())
+			// Recursive content activity is checked only after this entry passes
+			// ownership/Git/admission gates and reaches the delete boundary.
+			// Walking every live/registered entry here turns a cleanup tick into
+			// an O(total checkout contents) scan even when nothing is eligible.
+			entry.ModifiedAt = info.ModTime()
 		}
 		entries = append(entries, entry)
 	}
