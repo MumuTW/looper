@@ -33,6 +33,8 @@ import (
 	githubinfra "github.com/MumuTW/looper/internal/infra/github"
 	"github.com/MumuTW/looper/internal/infra/shell"
 	"github.com/MumuTW/looper/internal/loops"
+	networkclient "github.com/MumuTW/looper/internal/network/client"
+	"github.com/MumuTW/looper/internal/postmergedigest"
 	"github.com/MumuTW/looper/internal/projects"
 	"github.com/MumuTW/looper/internal/reviewer/convergence"
 	looperdruntime "github.com/MumuTW/looper/internal/runtime"
@@ -1625,6 +1627,25 @@ func (h *Handler) buildWorktreeCleanupStatusResponse() any {
 		DryRun:     h.context.Config.Daemon.WorktreeCleanup.DryRun,
 		LastStatus: "idle",
 	}
+}
+
+func (h *Handler) buildResourceGuardStatusResponse() any {
+	if runtimeWithGuard, ok := any(h.context.Runtime).(interface {
+		HostAdmissionStatus() looperdruntime.HostAdmissionStatus
+	}); ok {
+		return runtimeWithGuard.HostAdmissionStatus()
+	}
+	return looperdruntime.HostAdmissionStatus{
+		Enabled: h.context.Config.Daemon.ResourceGuard.Enabled,
+		Admit:   true,
+	}
+}
+
+func (h *Handler) buildNetworkStatusResponse() any {
+	if runtimeWithNetwork, ok := any(h.context.Runtime).(interface{ NetworkStatus() networkclient.Status }); ok {
+		return runtimeWithNetwork.NetworkStatus()
+	}
+	return nil
 }
 
 type storageState struct {
