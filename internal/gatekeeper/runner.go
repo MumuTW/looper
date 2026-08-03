@@ -126,7 +126,6 @@ type Evidence struct {
 	FinalObservedHeadSHA         string                       `json:"finalObservedHeadSha,omitempty"`
 	CodexReviewOutcome           string                       `json:"codexReviewOutcome,omitempty"`
 	ReviewProvenance             ReviewProvenance             `json:"reviewProvenance,omitempty"`
-	ClosingIssues                []githubinfra.IssueReference `json:"closingIssues,omitempty"`
 }
 
 type Report struct {
@@ -201,7 +200,6 @@ type GitHubGateway interface {
 	// merge base (the diff budget) can detect a base advance that the head
 	// revalidation alone cannot.
 	GetPullRequestHeadAndBaseSHA(context.Context, githubinfra.ViewPullRequestInput) (string, string, error)
-	ListPullRequestFiles(context.Context, githubinfra.ViewPullRequestInput) ([]string, error)
 	ListIssueComments(context.Context, githubinfra.ViewIssueInput) ([]githubinfra.CommentInfo, error)
 	ListIssueCommentsContaining(context.Context, githubinfra.ViewIssueInput, []string) ([]githubinfra.CommentInfo, error)
 	CreateIssueComment(context.Context, githubinfra.IssueCommentInput) (githubinfra.IssueCommentResult, error)
@@ -472,7 +470,6 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 		Reasons: []Reason{}, Evidence: Evidence{
 			RequiredChecks: []string{}, Checks: []CheckEvidence{}, UnresolvedReviewThreadIDs: []string{}, HoldLabels: []string{},
 			ReviewProvenance: ReviewProvenance{Reviewers: []ReviewerObservation{}, Refusals: []ReviewRefusal{}},
-			ClosingIssues:    []githubinfra.IssueReference{},
 		},
 		EvaluatedAt:       r.now().UTC().Format(time.RFC3339Nano),
 		SourceFingerprint: input.SourceFingerprint,
@@ -482,7 +479,6 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 	if err != nil {
 		return r.persistProviderBlock(ctx, report, ReasonProviderStateUnavailable, "pull_request")
 	}
-	report.Evidence.ClosingIssues = append([]githubinfra.IssueReference(nil), detail.ClosingIssues...)
 	report.ObservedHeadSHA = strings.TrimSpace(detail.HeadSHA)
 	report.Evidence.PullRequestState = strings.ToUpper(strings.TrimSpace(detail.State))
 	report.Evidence.Draft = detail.IsDraft
@@ -534,10 +530,6 @@ func (r *Runner) EvaluatePullRequest(ctx context.Context, input EvaluationInput)
 	if labels.Has(detail.Labels, labels.HoldGlobal) {
 		report.Evidence.HoldLabels = append(report.Evidence.HoldLabels, labels.HoldGlobal)
 		report.Reasons = append(report.Reasons, Reason{Code: ReasonHold, Subject: labels.HoldGlobal})
-	}
-	if labels.Has(detail.Labels, labels.HoldAuditorRevert) {
-		report.Evidence.HoldLabels = append(report.Evidence.HoldLabels, labels.HoldAuditorRevert)
-		report.Reasons = append(report.Reasons, Reason{Code: ReasonHold, Subject: labels.HoldAuditorRevert})
 	}
 	report.Evidence.ProjectPolicyPermitsTarget = r.policyPermitsTarget(input.ProjectID, input.Repo, report.Evidence.BaseRefName)
 	if !report.Evidence.ProjectPolicyPermitsTarget {
