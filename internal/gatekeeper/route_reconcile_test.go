@@ -67,13 +67,13 @@ func TestReconcileRecordsMergeEvidenceForOutOfPageMergedRoute(t *testing.T) {
 		t.Fatalf("merge outcome = %#v, want merged head-1 for PR 42", outcomes[0])
 	}
 
-	// The merged route must be retired: auto-merge removed, durable queue veto
-	// applied, and the route marked revoked so the pass is idempotent.
+	// The merged route must be retired without a terminal human-review label,
+	// and the route marked revoked so the pass is idempotent.
 	if !slices.Equal(fixture.github.labelRemoves[len(fixture.github.labelRemoves)-1].Labels, []string{labels.AutoMerge}) {
 		t.Fatalf("last label removal = %#v, want stale auto-merge route retired", fixture.github.labelRemoves)
 	}
-	if !slices.Equal(fixture.github.labelAdds[len(fixture.github.labelAdds)-1].Labels, []string{labels.NeedsHumanReview}) {
-		t.Fatalf("last label add = %#v, want durable needs-human-review veto", fixture.github.labelAdds)
+	if len(fixture.github.labelAdds) != 1 || !slices.Equal(fixture.github.labelAdds[0].Labels, []string{labels.AutoMerge}) {
+		t.Fatalf("label adds = %#v, want no terminal needs-human-review label", fixture.github.labelAdds)
 	}
 
 	// A second tick must not re-read the merged route (idempotency): no label

@@ -3,7 +3,9 @@ package github
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -659,6 +661,35 @@ type PullRequestLabelsInput struct {
 type ValidateMergifyRoutingInput struct {
 	Repo string
 	CWD  string
+}
+
+// MergifyRoutingContractFingerprint returns a stable digest of the repository's
+// queue contract. Gatekeeper includes it in its discovery fingerprint so a
+// default-branch edit invalidates an otherwise unchanged auto route.
+func (g *Gateway) MergifyRoutingContractFingerprint(ctx context.Context, input ValidateMergifyRoutingInput) (string, error) {
+	hostname, repo := splitRepoHostname(input.Repo)
+	args := []string{"api", fmt.Sprintf("repos/%s/contents/.mergify.yml", repo), "--jq", ".content", "-H", "Accept: application/vnd.github+json"}
+	if hostname != "" {
+		args = append(args, "--hostname", hostname)
+	}
+	result, err := g.runGh(ctx, input.CWD, "", args...)
+	if err != nil {
+		return "", fmt.Errorf("read .mergify.yml: %w", err)
+	}
+	encoded := strings.Map(func(r rune) rune {
+		switch r {
+		case ' ', '\t', '\r', '\n':
+			return -1
+		default:
+			return r
+		}
+	}, result.Stdout)
+	content, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return "", fmt.Errorf("decode .mergify.yml: %w", err)
+	}
+	digest := sha256.Sum256(content)
+	return hex.EncodeToString(digest[:]), nil
 }
 
 type PullRequestReviewersInput struct {

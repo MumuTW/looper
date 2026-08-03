@@ -2,12 +2,35 @@ package github
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"strings"
 	"testing"
 
 	"github.com/MumuTW/looper/internal/infra/shell"
 )
+
+func TestMergifyRoutingContractFingerprintTracksRepositoryContent(t *testing.T) {
+	t.Parallel()
+	content := []byte("queue_rules:\n  - name: default\n")
+	runner := &fakeGHRunner{t: t}
+	runner.respond = func(options shell.Options) (shell.Result, error) {
+		if got := strings.Join(options.Args, " "); got != "api repos/acme/looper/contents/.mergify.yml --jq .content -H Accept: application/vnd.github+json" {
+			t.Fatalf("gh args = %q", got)
+		}
+		return shell.Result{Stdout: base64.StdEncoding.EncodeToString(content)}, nil
+	}
+	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
+	got, err := gateway.MergifyRoutingContractFingerprint(context.Background(), ValidateMergifyRoutingInput{Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("MergifyRoutingContractFingerprint() error = %v", err)
+	}
+	wantDigest := sha256.Sum256(content)
+	if got != hex.EncodeToString(wantDigest[:]) {
+		t.Fatalf("fingerprint = %q, want sha256 %q", got, hex.EncodeToString(wantDigest[:]))
+	}
+}
 
 func TestValidateMergifyRoutingRequiresQueueVetoes(t *testing.T) {
 	t.Parallel()

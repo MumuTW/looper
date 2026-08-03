@@ -3,10 +3,13 @@ package coordinator
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
+	"time"
 
 	"github.com/MumuTW/looper/internal/coordinator/mergewatch"
 	"github.com/MumuTW/looper/internal/eventlog"
+	"github.com/MumuTW/looper/internal/gatekeeper"
 	githubinfra "github.com/MumuTW/looper/internal/infra/github"
 	"github.com/MumuTW/looper/internal/labels"
 )
@@ -171,6 +174,7 @@ func TestApplyMergeWatchRetiresHumanOwnedNativeAutoMergeWithoutEvidence(t *testi
 func TestApplyRoutedMergeWatchRecordsMergeEvidenceOutsideIssueDiscovery(t *testing.T) {
 	fixture := newCoordinatorFixture(t)
 	cwd := t.TempDir()
+	seedCoordinatorGatekeeperRoute(t, fixture, 42, "head-42")
 	// A routed PR (carrying the Mergify auto-merge label) with no tracked issue
 	// and no Coordinator-tracked issue linkage. It merges and closes, and the
 	// routed registry must record the merge as Auditor evidence even though
@@ -207,6 +211,7 @@ func TestApplyRoutedMergeWatchRecordsMergeEvidenceOutsideIssueDiscovery(t *testi
 func TestApplyRoutedMergeWatchSettlesHumanOwnedMergeWithoutEvidence(t *testing.T) {
 	fixture := newCoordinatorFixture(t)
 	cwd := t.TempDir()
+	seedCoordinatorGatekeeperRoute(t, fixture, 42, "head-42")
 	fixture.github.currentLogin = "looper"
 	fixture.github.prDetails[42] = githubinfra.PullRequestDetail{
 		Number: 42, State: "OPEN", HeadSHA: "head-42", BaseRefName: "main",
@@ -233,5 +238,25 @@ func TestApplyRoutedMergeWatchSettlesHumanOwnedMergeWithoutEvidence(t *testing.T
 		if event.EventType == eventlog.CoordinatorPullRequestMergedEventType {
 			t.Fatalf("human-owned routed merge recorded as Looper merge evidence: %#v", event)
 		}
+	}
+}
+
+func seedCoordinatorGatekeeperRoute(t *testing.T, fixture coordinatorFixture, prNumber int64, headSHA string) {
+	t.Helper()
+	projectID := fixture.projectID
+	entityType := "pull_request"
+	entityID := "acme/looper#" + fmt.Sprint(prNumber)
+	routeEstablished := true
+	report := gatekeeper.Report{
+		Version: 2, Mode: "auto", Status: gatekeeper.StatusEligible, Eligible: true,
+		ProjectID: projectID, Repo: "acme/looper", PRNumber: prNumber,
+		ObservedHeadSHA: headSHA, RouteEstablished: &routeEstablished,
+		Evidence: gatekeeper.Evidence{FinalObservedHeadSHA: headSHA},
+	}
+	if err := eventlog.Append(context.Background(), fixture.runner.repos, eventlog.AppendInput{
+		EventType: gatekeeper.GateReportEventType, ProjectID: &projectID,
+		EntityType: &entityType, EntityID: &entityID, Payload: report, CreatedAt: fixture.now.Add(-time.Second),
+	}); err != nil {
+		t.Fatalf("seed Gatekeeper route: %v", err)
 	}
 }

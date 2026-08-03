@@ -44,7 +44,14 @@ func CandidatesFromMergeOutcomes(events []storage.EventLogRecord) ([]MergeCandid
 		}
 		mergedAt, err := time.Parse(time.RFC3339Nano, mergedAtText)
 		if err != nil {
-			return nil, fmt.Errorf("parse merge event %s timestamp: %w", event.ID, err)
+			// Forge payloads are the preferred merge-time authority, but old or
+			// malformed coordinator records must not poison the entire candidate
+			// projection. The append timestamp is daemon-owned and therefore a
+			// reliable lower-precision fallback for that one event.
+			mergedAt, err = time.Parse(time.RFC3339Nano, event.CreatedAt)
+			if err != nil {
+				return nil, fmt.Errorf("parse merge event %s timestamp: %w", event.ID, err)
+			}
 		}
 		// Version 1 did not persist the availability bit. A legacy event that
 		// already carries a non-empty file list can be safely enriched from its

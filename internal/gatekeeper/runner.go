@@ -164,6 +164,12 @@ type Report struct {
 	// produced. The next tick compares it to decide whether re-evaluating would
 	// reach the same conclusion.
 	SourceFingerprint string `json:"sourceFingerprint,omitempty"`
+	// RouteEstablished records that the successful persist path completed the
+	// auto-merge label projection. Eligibility alone is not route authority:
+	// advise reports are eligible without entering Mergify, and a projection
+	// failure can leave a stale label uncertain. A pointer keeps legacy reports
+	// (which predate this field) distinguishable from an explicit false.
+	RouteEstablished *bool `json:"routeEstablished,omitempty"`
 }
 
 type EvaluationInput struct {
@@ -270,7 +276,10 @@ type Options struct {
 	ConfiguredTargetBranch func(projectID string) string
 	LogWarn                func(msg string, fields map[string]any)
 	LogWarn                 func(msg string, fields map[string]any)
+	LogWarn              func(msg string, fields map[string]any)
 }
+
+func boolPointer(value bool) *bool { return &value }
 
 // Runner is the Merge Gatekeeper: a reactive, agent-free policy Role that
 // re-fetches current Pull Request state and writes an observe-only Gate
@@ -298,7 +307,10 @@ type Runner struct {
 	labelNamespaceForProject func(projectID string) (labels.Namespace, bool)
 	policyPermitsTarget      func(projectID, repo, baseRefName string) bool
 	trustForProject          func(projectID string) config.GatekeeperTrustLevel
+	diffBudgetForProject     func(projectID string) config.GatekeeperDiffBudget
 	logWarn                  func(msg string, fields map[string]any)
+	outOfPageRouteMu         sync.Mutex
+	outOfPageRouteChecks     map[string]time.Time
 }
 
 // reviewEvidenceLookup is kept as a narrow seam around the local event-log
@@ -328,7 +340,9 @@ func New(options Options) *Runner {
 		labelNamespaceForProject: options.LabelNamespaceForProject,
 		policyPermitsTarget:      policy,
 		trustForProject:          options.TrustForProject,
+		diffBudgetForProject:     options.DiffBudgetForProject,
 		logWarn:                  options.LogWarn,
+		outOfPageRouteChecks:     make(map[string]time.Time),
 	}
 }
 
@@ -372,6 +386,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 	}
 	ctx = withDeferCommitStatus(ctx)
 	trust := r.trustFor(input.ProjectID)
+	contractFingerprint := r.mergifyContractFingerprint(ctx, input)
 	result := DiscoveryResult{Reports: make([]Report, 0, len(pullRequests))}
 	// Deferred commit statuses must still publish on abort: a blocked report that
 	// was already evaluated this tick is durable in result.Reports, and leaving
@@ -385,7 +400,7 @@ func (r *Runner) DiscoverPullRequests(ctx context.Context, input DiscoveryInput)
 	var evaluationErrs []error
 	stillOpen := make(map[string]struct{}, len(pullRequests))
 	for _, pullRequest := range pullRequests {
-		fingerprint := r.sourceFingerprintForProject(pullRequest, input.ProjectID, input.Repo)
+		fingerprint := r.sourceFingerprintForProjectWithContract(pullRequest, input.ProjectID, input.Repo, contractFingerprint)
 		entityID := fmt.Sprintf("%s#%d", input.Repo, pullRequest.Number)
 		stillOpen[entityID] = struct{}{}
 		previous, hasPrevious := previousReports[entityID]
@@ -708,6 +723,9 @@ func (r *Runner) departedFromOpenSet(
 		departed = departed[:maxReconciledDepartures]
 	}
 	return departed
+}
+
+
 // maxReconciledDepartures bounds how many departed pull requests one tick gives
 // a final report. A burst — a release day that merges sixty pull requests, a
 // project whose discovery scope was just narrowed — must not turn one tick into
@@ -771,9 +789,9 @@ func (r *Runner) departedFromOpenSet(
 }
 
 // sourceFingerprintForProject includes the local authority inputs that the
-// forge's pull-request list cannot expose. A trust, budget, or policy change
-// must not leave a previously published auto-merge label in place merely
-// because the pull request itself is unchanged.
+// forge's pull-request list cannot expose. A trust, policy, or diff-budget
+// bound change must not leave a previously published auto-merge label in place
+// merely because the pull request itself is unchanged.
 func (r *Runner) sourceFingerprintForProject(pullRequest githubinfra.PullRequestSummary, projectID, repo string) string {
 	diffBudget := r.diffBudget(projectID)
 	budgetEnabled := diffBudget.MaxChangedFiles > 0 || diffBudget.MaxDeletions > 0
@@ -1248,6 +1266,13 @@ func (r *Runner) configuredTarget(projectID string) string {
 	return strings.TrimSpace(r.configuredTargetBranch(projectID))
 }
 
+func (r *Runner) configuredTarget(projectID string) string {
+	if r == nil || r.configuredTargetBranch == nil {
+		return ""
+	}
+	return strings.TrimSpace(r.configuredTargetBranch(projectID))
+}
+
 func diffBudgetExceededSubject(stats githubinfra.PullRequestDiffStats, budget config.GatekeeperDiffBudget) string {
 	parts := make([]string, 0, 2)
 	if budget.MaxChangedFiles > 0 && stats.ChangedFiles > budget.MaxChangedFiles {
@@ -1484,6 +1509,10 @@ func (r *Runner) persist(ctx context.Context, report Report) (Report, error) {
 	// comment lifecycle below, so a path that built a report without it would
 	// silently strand an owned comment.
 	report.Mode = string(r.trustFor(report.ProjectID))
+	// Until the final projection succeeds this report is not route authority.
+	// The pending/retry records therefore never make a coordinator watch believe
+	// that a label was actually applied.
+	report.RouteEstablished = boolPointer(false)
 
 	// Decide what the owned comment needs before this report replaces the previous
 	// one in the log, and while no forge call has been made.
@@ -1557,6 +1586,9 @@ func (r *Runner) persist(ctx context.Context, report Report) (Report, error) {
 			})
 		}
 		return report, routingErr
+	}
+	if r.trustFor(report.ProjectID) == config.GatekeeperTrustAuto && report.Eligible {
+		report.RouteEstablished = boolPointer(true)
 	}
 	// The final report is appended strictly after the pending projection so
 	// latestGateReports (which keeps the newest record for an entity) always

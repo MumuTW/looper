@@ -30,11 +30,11 @@ func TestSourceFingerprintIncludesExactDiffBudgetBounds(t *testing.T) {
 			return config.GatekeeperDiffBudget{MaxChangedFiles: 20, MaxDeletions: 100}
 		},
 	})
-	first := runner.sourceFingerprintForProject(pullRequest, "project_1", "acme/looper")
+	first := runner.sourceFingerprintForProjectWithContract(pullRequest, "project_1", "acme/looper", "")
 	runner.diffBudgetForProject = func(string) config.GatekeeperDiffBudget {
 		return config.GatekeeperDiffBudget{MaxChangedFiles: 4, MaxDeletions: 100}
 	}
-	second := runner.sourceFingerprintForProject(pullRequest, "project_1", "acme/looper")
+	second := runner.sourceFingerprintForProjectWithContract(pullRequest, "project_1", "acme/looper", "")
 	if first == second {
 		t.Fatalf("fingerprint unchanged after tightening diff budget: %q", first)
 	}
