@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/MumuTW/looper/internal/eventlog"
 	"github.com/MumuTW/looper/internal/labels"
 	"github.com/MumuTW/looper/internal/loops/runpipe"
 	"github.com/MumuTW/looper/internal/outboundguard"
@@ -146,8 +147,9 @@ func TestHandleTerminalExhaustionEscalationRetriesNonGateFallbackFailure(t *test
 // the subsequent label mutation fails, the handoff is requeued with Commented
 // and Escalated still false. Without deduplication every replay would re-enter
 // escalateWithoutFailureContext and append another fixer.escalation.context_withheld
-// event. The event-log primary key, derived from the loop ID, ensures only the
-// first rejection records the event even when the metadata checkpoint is lost.
+// event. The event-log primary key, derived from the loop and escalation
+// identity, ensures only the first rejection for that exact target records the
+// event even when the metadata checkpoint is lost.
 func TestHandleTerminalExhaustionEscalationDeduplicatesContextWithheldEventAcrossReplay(t *testing.T) {
 	fixture := newRunnerFixture(t)
 	gateway := &regenerationFakeGateway{
@@ -212,7 +214,65 @@ func TestHandleTerminalExhaustionEscalationDeduplicatesContextWithheldEventAcros
 	if err != nil {
 		t.Fatalf("Events.ListByEntityAndEventTypes() error = %v", err)
 	}
-	if events[0].ID != contextWithheldEventID(loop.ID) {
-		t.Fatalf("context_withheld event ID = %q, want deterministic loop-scoped ID", events[0].ID)
+	wantEventID := contextWithheldEventID(loop.ID, "acme/looper", 42, "pull request contains a human-authored commit")
+	if events[0].ID != wantEventID {
+		t.Fatalf("context_withheld event ID = %q, want deterministic escalation-scoped ID %q", events[0].ID, wantEventID)
+	}
+}
+
+func TestHandleTerminalExhaustionIgnoresStaleContextWithheldEvent(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	gateway := &regenerationFakeGateway{
+		fakeGitHubGateway: &fakeGitHubGateway{currentUser: "looper", viewResponses: []PullRequestDetail{{Number: 42, State: "OPEN", HeadRefName: "looper/fix-42"}}},
+		issue:             IssueDetail{Number: 7, State: "OPEN"},
+		commits:           []PullRequestCommit{{AuthorLogin: "alice", CommitterLogin: "alice"}},
+		commentErrs:       []error{contentGateRejection(), contentGateRejection()},
+	}
+	runner := newRegenerationRunner(t, fixture, gateway, func(_ context.Context, _ RegenerateIssueInput) error { return nil })
+	loop, queue := setupRegenerationRecords(t, fixture)
+	ctx := context.Background()
+
+	// This legacy marker belongs to a different escalation target and reason.
+	// Matching only its loop-scoped ID would suppress the current escalation's
+	// comment attempts after the target or reason changed during replay.
+	if err := eventlog.Append(ctx, fixture.repos, eventlog.AppendInput{
+		ID:         legacyContextWithheldEventID(loop.ID),
+		EventType:  contextWithheldEventType,
+		ProjectID:  runpipe.OptionalString(loop.ProjectID),
+		LoopID:     runpipe.OptionalString(loop.ID),
+		EntityType: runpipe.OptionalString("loop"),
+		EntityID:   runpipe.OptionalString(loop.ID),
+		Payload:    map[string]any{"repo": "stale/looper", "prNumber": int64(41), "reason": "stale escalation reason"},
+		CreatedAt:  fixture.now(),
+	}); err != nil {
+		t.Fatalf("append stale context-withheld event: %v", err)
+	}
+
+	project, _ := fixture.repos.Projects.GetByID(ctx, "project_1")
+	action, err := runner.handleTerminalExhaustion(ctx, *project, loop, queue, fixerCheckpoint{}, &runpipe.LoopError{Message: "failed", Kind: runpipe.FailureRetryableTransient})
+	if err != nil {
+		t.Fatalf("handleTerminalExhaustion() error = %v", err)
+	}
+	if action != regenerationEscalated {
+		t.Fatalf("action = %q, want escalation completed", action)
+	}
+	if got := len(gateway.createIssueComments); got != 2 {
+		t.Fatalf("comment attempts = %d, want the current original plus fallback despite stale evidence", got)
+	}
+
+	events, err := fixture.repos.Events.ListByEntityAndEventTypes(ctx, "loop", loop.ID, []string{contextWithheldEventType})
+	if err != nil {
+		t.Fatalf("list context-withheld events: %v", err)
+	}
+	wantEventID := contextWithheldEventID(loop.ID, "acme/looper", 42, "pull request contains a human-authored commit")
+	foundCurrent := false
+	for _, event := range events {
+		if event.ID == wantEventID {
+			foundCurrent = true
+			break
+		}
+	}
+	if !foundCurrent {
+		t.Fatalf("context-withheld events = %#v, want a new event scoped to the current target and reason", events)
 	}
 }

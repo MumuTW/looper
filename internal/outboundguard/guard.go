@@ -139,10 +139,10 @@ func unsafeText(text string, highEntropyExemptions []string) string {
 			}
 			// Keep the assignment separator as structural evidence without
 			// reintroducing the NAME's character distribution into the entropy
-			// calculation. A two-class value with high entropy (for example a
-			// mixed-case fixture blob) is still credential-shaped when it is
-			// published as NAME=value.
-			if characterClassCount(value) >= 2 && shannonEntropy(value) >= highEntropyThreshold {
+			// calculation. Any high-entropy value with assignment structure is
+			// credential-shaped when it is published as NAME=value, including
+			// one-class values such as lowercase fixture blobs.
+			if characterClassCount(value) >= 1 && shannonEntropy(value) >= highEntropyThreshold {
 				return "contains a high-entropy credential-shaped token"
 			}
 			continue

@@ -2,6 +2,7 @@ package fixer
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -373,7 +374,7 @@ func (r *Runner) persistRegenerationEscalation(ctx context.Context, loop storage
 	contextWithheld := false
 	if !state.Commented {
 		var err error
-		contextWithheld, err = r.hasContextWithheldEvent(ctx, loop.ID)
+		contextWithheld, err = r.hasContextWithheldEvent(ctx, loop.ID, repo, prNumber, reason)
 		if err != nil {
 			return fmt.Errorf("inspect withheld-context escalation evidence: %w", err)
 		}
@@ -443,9 +444,10 @@ func (r *Runner) escalateWithoutFailureContext(ctx context.Context, loop storage
 	}
 	r.logWarn("fixer escalation comment withheld by content safety gate", map[string]any{"loopId": loop.ID, "repo": repo, "prNumber": prNumber, "error": err.Error()})
 	// The event is both the audit evidence for the withheld context and the
-	// durable marker that settles the comment step. A deterministic loop-scoped
-	// primary key makes replay and concurrent recovery idempotent even when the
-	// metadata checkpoint after this append fails. If the event cannot be
+	// durable marker that settles this exact escalation comment step. A
+	// deterministic target-scoped primary key makes replay and concurrent
+	// recovery idempotent even when the metadata checkpoint after this append
+	// fails. If the event cannot be
 	// recorded, do not advance to the label: the next retry must not infer that
 	// the comment step was settled without durable evidence.
 	if err := r.appendContextWithheldEvent(ctx, loop, repo, prNumber, reason); err != nil {
@@ -454,7 +456,17 @@ func (r *Runner) escalateWithoutFailureContext(ctx context.Context, loop storage
 	return state, nil
 }
 
-func contextWithheldEventID(loopID string) string {
+func contextWithheldEventID(loopID, repo string, prNumber int64, reason string) string {
+	loopID = strings.TrimSpace(loopID)
+	if loopID == "" {
+		return ""
+	}
+	identity := fmt.Sprintf("%s\x00%s\x00%d\x00%s", loopID, strings.TrimSpace(repo), prNumber, strings.TrimSpace(reason))
+	digest := sha256.Sum256([]byte(identity))
+	return fmt.Sprintf("%s:%s:%x", contextWithheldEventType, loopID, digest[:])
+}
+
+func legacyContextWithheldEventID(loopID string) string {
 	loopID = strings.TrimSpace(loopID)
 	if loopID == "" {
 		return ""
@@ -462,8 +474,20 @@ func contextWithheldEventID(loopID string) string {
 	return contextWithheldEventType + ":" + loopID
 }
 
-func (r *Runner) hasContextWithheldEvent(ctx context.Context, loopID string) (bool, error) {
-	eventID := contextWithheldEventID(loopID)
+func contextWithheldEventMatches(event storage.EventLogRecord, repo string, prNumber int64, reason string) bool {
+	var payload struct {
+		Repo     string `json:"repo"`
+		PRNumber int64  `json:"prNumber"`
+		Reason   string `json:"reason"`
+	}
+	if err := json.Unmarshal([]byte(event.PayloadJSON), &payload); err != nil {
+		return false
+	}
+	return strings.TrimSpace(payload.Repo) == strings.TrimSpace(repo) && payload.PRNumber == prNumber && strings.TrimSpace(payload.Reason) == strings.TrimSpace(reason)
+}
+
+func (r *Runner) hasContextWithheldEvent(ctx context.Context, loopID, repo string, prNumber int64, reason string) (bool, error) {
+	eventID := contextWithheldEventID(loopID, repo, prNumber, reason)
 	if eventID == "" || r.repos == nil || r.repos.Events == nil {
 		return false, nil
 	}
@@ -471,8 +495,9 @@ func (r *Runner) hasContextWithheldEvent(ctx context.Context, loopID string) (bo
 	if err != nil {
 		return false, err
 	}
+	legacyEventID := legacyContextWithheldEventID(loopID)
 	for _, event := range events {
-		if event.ID == eventID {
+		if (event.ID == eventID || event.ID == legacyEventID) && contextWithheldEventMatches(event, repo, prNumber, reason) {
 			return true, nil
 		}
 	}
@@ -480,7 +505,7 @@ func (r *Runner) hasContextWithheldEvent(ctx context.Context, loopID string) (bo
 }
 
 func (r *Runner) appendContextWithheldEvent(ctx context.Context, loop storage.LoopRecord, repo string, prNumber int64, reason string) error {
-	eventID := contextWithheldEventID(loop.ID)
+	eventID := contextWithheldEventID(loop.ID, repo, prNumber, reason)
 	if eventID == "" || r.repos == nil || r.repos.Events == nil {
 		return nil
 	}
@@ -493,7 +518,7 @@ func (r *Runner) appendContextWithheldEvent(ctx context.Context, loop storage.Lo
 		EntityID:   runpipe.OptionalString(loop.ID),
 		ActorType:  runpipe.OptionalString("system"),
 		ActorID:    runpipe.OptionalString("fixer-loop"),
-		Payload:    map[string]any{"repo": repo, "prNumber": prNumber, "reason": reason},
+		Payload:    map[string]any{"repo": strings.TrimSpace(repo), "prNumber": prNumber, "reason": strings.TrimSpace(reason)},
 		CreatedAt:  r.now(),
 	})
 	if err == nil {
@@ -502,7 +527,7 @@ func (r *Runner) appendContextWithheldEvent(ctx context.Context, loop storage.Lo
 	// A concurrent replay may have inserted the deterministic record first.
 	// Verify that case rather than treating the unique-key collision as a
 	// failed escalation; all other append failures remain retryable.
-	recorded, lookupErr := r.hasContextWithheldEvent(ctx, loop.ID)
+	recorded, lookupErr := r.hasContextWithheldEvent(ctx, loop.ID, repo, prNumber, reason)
 	if lookupErr == nil && recorded {
 		return nil
 	}
