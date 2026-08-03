@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os/exec"
 	"slices"
 	"strings"
 	"testing"
@@ -2382,6 +2383,87 @@ func TestGatewayListIssueTimelineDecodesProjectedPages(t *testing.T) {
 	prMarker, _ := sourceIssue["pull_request"].(map[string]any)
 	if prMarker == nil || asInt64(prMarker["number"]) != 42 {
 		t.Fatalf("ListIssueTimeline()[2].source.issue.pull_request = %#v, want the PR marker that distinguishes a PR from a plain issue", sourceIssue["pull_request"])
+	}
+}
+
+// TestIssueTimelineProjectionFiltersRawCrossReferencePage pins the jq filter
+// itself rather than a hand-written projection: it runs the real jq binary on
+// a raw GitHub-shaped timeline page — full cross-reference bodies included —
+// and asserts the projected output keeps the linked-PR identity while dropping
+// the bodies. The fake-runner decode tests feed the gateway the projected
+// shape directly, so they cannot catch a future edit that deletes `source`
+// from issueTimelineProjection; exercising the filter end to end is what
+// catches it.
+func TestIssueTimelineProjectionFiltersRawCrossReferencePage(t *testing.T) {
+	t.Parallel()
+	jqPath, err := exec.LookPath("jq")
+	if err != nil {
+		t.Skipf("jq is not available: %v", err)
+	}
+	const bodyMarker = "LOOPER-PROJECTION-BODY-MARKER"
+	rawPage := `[
+		{
+			"id": 11,
+			"event": "labeled",
+			"created_at": "2026-05-14T12:00:00Z",
+			"actor": {"login": "octo", "id": 1},
+			"label": {"name": "triaged", "color": "ededed"}
+		},
+		{
+			"id": 12,
+			"event": "cross-referenced",
+			"created_at": "2026-05-16T10:00:00Z",
+			"actor": {"login": "octo", "id": 1},
+			"source": {
+				"type": "issue",
+				"issue": {
+					"number": 42,
+					"title": "Linked PR",
+					"body": "` + bodyMarker + ` a very large discussion body that must not cross the capture boundary",
+					"html_url": "https://github.com/acme/looper/pull/42",
+					"url": "https://api.github.com/repos/acme/looper/issues/42",
+					"user": {"login": "octo"},
+					"pull_request": {
+						"number": 42,
+						"html_url": "https://github.com/acme/looper/pull/42",
+						"url": "https://api.github.com/repos/acme/looper/pulls/42",
+						"diff_url": "https://github.com/acme/looper/pull/42.diff"
+					}
+				}
+			}
+		}
+	]`
+	cmd := exec.Command(jqPath, "-c", issueTimelineProjection)
+	cmd.Stdin = strings.NewReader(rawPage)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("jq %q failed: %v; output=%s", issueTimelineProjection, err, out)
+	}
+	projected := string(out)
+	if strings.Contains(projected, bodyMarker) {
+		t.Fatalf("projected output = %q, want the cross-reference body dropped", projected)
+	}
+	rows, err := decodeJSONObjects(projected)
+	if err != nil {
+		t.Fatalf("decodeJSONObjects(projected) error = %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("projected rows = %d, want both events; output=%s", len(rows), projected)
+	}
+	label, _ := rows[0]["label"].(map[string]any)
+	if label == nil || asString(label["name"]) != "triaged" {
+		t.Fatalf("projected labeled event = %#v, want the label name retained", rows[0])
+	}
+	source, _ := rows[1]["source"].(map[string]any)
+	if source == nil {
+		t.Fatalf("projected cross-reference event = %#v, want the source retained", rows[1])
+	}
+	sourceIssue, _ := source["issue"].(map[string]any)
+	if sourceIssue == nil || asInt64(sourceIssue["number"]) != 42 || asString(sourceIssue["html_url"]) != "https://github.com/acme/looper/pull/42" {
+		t.Fatalf("projected source.issue = %#v, want the linked PR identity retained", source["issue"])
+	}
+	if _, hasPullRequestMarker := sourceIssue["pull_request"].(map[string]any); !hasPullRequestMarker {
+		t.Fatalf("projected source.issue.pull_request = %#v, want the PR marker retained so linked-PR discovery can tell PRs from issues", sourceIssue["pull_request"])
 	}
 }
 
