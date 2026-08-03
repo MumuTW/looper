@@ -392,7 +392,11 @@ func (r *Runner) persistRegenerationEscalation(ctx context.Context, loop storage
 			// rejection — there is no agent session here to rewrite it. Complete
 			// the escalation with a context-free fallback instead; the full
 			// context stays in local loop metadata.
-			state = r.escalateWithoutFailureContext(ctx, loop, state, prNumber, repo, cwd, reason)
+			updated, fallbackErr := r.escalateWithoutFailureContext(ctx, loop, state, prNumber, repo, cwd, reason)
+			if fallbackErr != nil {
+				return fmt.Errorf("comment human escalation: %w", fallbackErr)
+			}
+			state = updated
 		default:
 			return fmt.Errorf("comment human escalation: %w", err)
 		}
@@ -413,21 +417,24 @@ func (r *Runner) persistRegenerationEscalation(ctx context.Context, loop storage
 // escalateWithoutFailureContext completes a human escalation after the content
 // safety gate rejected the recorded failure context. The fallback body is built
 // from daemon-composed text only, so it cannot inherit the rejected content,
-// and it keeps the authority marker a replay deduplicates on. If even the
-// fallback is rejected, the comment is omitted and the needs-human label still
+// and it keeps the authority marker a replay deduplicates on. If the fallback
+// is rejected too, the comment is omitted and the needs-human label still
 // lands: a content rejection defers the explanation, never the escalation
-// itself. Returning the error instead would retry a deterministic rejection
-// forever, because the body is rebuilt from durable loop metadata.
-func (r *Runner) escalateWithoutFailureContext(ctx context.Context, loop storage.LoopRecord, state fixerRegenerationState, prNumber int64, repo, cwd, reason string) fixerRegenerationState {
+// itself. Any other failure (forge outage, transport error) is returned so the
+// run is retried instead of silently dropping the comment.
+func (r *Runner) escalateWithoutFailureContext(ctx context.Context, loop storage.LoopRecord, state fixerRegenerationState, prNumber int64, repo, cwd, reason string) (fixerRegenerationState, error) {
 	fallback := fmt.Sprintf("%s\n\nFixer stopped automatic close-and-regenerate because: %s\nThe PR remains open for human review.\n\nFailure context withheld: the outbound content safety gate rejected it. Inspect the loop's local metadata for the recorded failure details.", regenerationCommentMarker+" authority="+state.Authority+" outcome=escalated -->", reason)
 	comment, err := r.github.CreateIssueComment(ctx, IssueCommentInput{Repo: repo, IssueNumber: prNumber, Body: fallback, CWD: cwd, DisclosureAgent: r.agentRuntime, DisclosureModel: derefString(r.agentModel)})
 	if err == nil {
 		state.CommentID, state.Commented = comment.ID, true
-		return state
+		return state, nil
+	}
+	if !outboundguard.IsRejection(err) {
+		return state, fmt.Errorf("post withheld-context escalation comment: %w", err)
 	}
 	r.logWarn("fixer escalation comment withheld by content safety gate", map[string]any{"loopId": loop.ID, "repo": repo, "prNumber": prNumber, "error": err.Error()})
 	r.appendEvent(ctx, eventInput{eventType: "fixer.escalation.context_withheld", projectID: loop.ProjectID, loopID: loop.ID, entityType: "loop", entityID: loop.ID, payload: map[string]any{"repo": repo, "prNumber": prNumber, "reason": reason}})
-	return state
+	return state, nil
 }
 
 func (r *Runner) persistRegenerationAbort(ctx context.Context, loop storage.LoopRecord, state fixerRegenerationState, reason string) (regenerationAction, error) {

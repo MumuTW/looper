@@ -2,6 +2,7 @@ package fixer
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -87,6 +88,9 @@ func TestHandleTerminalExhaustionEscalationCompletesWhenFallbackAlsoRejected(t *
 	if action != regenerationEscalated {
 		t.Fatalf("action = %q, want escalation completed with the comment omitted", action)
 	}
+	if len(gateway.createIssueComments) != 2 {
+		t.Fatalf("comment attempts = %d, want the rejected original plus the rejected fallback", len(gateway.createIssueComments))
+	}
 	if len(gateway.addLabelCalls) != 1 || gateway.addLabelCalls[0].Labels[0] != labels.NeedsHuman {
 		t.Fatalf("PR labels = %#v, want needs-human applied even without a comment", gateway.addLabelCalls)
 	}
@@ -98,5 +102,41 @@ func TestHandleTerminalExhaustionEscalationCompletesWhenFallbackAlsoRejected(t *
 	state, ok := parseRegenerationState(parseJSONObject(updated.MetadataJSON))
 	if !ok || !state.Escalated || state.Commented {
 		t.Fatalf("regeneration state = %#v, want escalated without a comment", state)
+	}
+}
+
+// TestHandleTerminalExhaustionEscalationRetriesNonGateFallbackFailure covers
+// the boundary between the two fallback failures: only a content-gate
+// rejection of the fallback body completes the escalation without a comment.
+// A forge outage or transport error on the fallback comment is transient and
+// must propagate so the run is retried with the comment still pending —
+// swallowing it would permanently drop the explanation for a loop that could
+// otherwise have published it.
+func TestHandleTerminalExhaustionEscalationRetriesNonGateFallbackFailure(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	gateway := &regenerationFakeGateway{
+		fakeGitHubGateway: &fakeGitHubGateway{currentUser: "looper", viewResponses: []PullRequestDetail{{Number: 42, State: "OPEN", HeadRefName: "looper/fix-42", HeadSHA: "head-42"}}},
+		issue:             IssueDetail{Number: 7, State: "OPEN"},
+		commits:           []PullRequestCommit{{AuthorLogin: "alice", CommitterLogin: "alice"}},
+		commentErrs:       []error{contentGateRejection(), errors.New("connection refused")},
+	}
+	runner := newRegenerationRunner(t, fixture, gateway, func(_ context.Context, _ RegenerateIssueInput) error { return nil })
+	loop, queue := setupRegenerationRecords(t, fixture)
+	project, _ := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+
+	action, err := runner.handleTerminalExhaustion(context.Background(), *project, loop, queue, fixerCheckpoint{}, &runpipe.LoopError{Message: "failed", Kind: runpipe.FailureRetryableTransient})
+	if err == nil {
+		t.Fatalf("handleTerminalExhaustion() action = %q, want the transport failure on the fallback comment propagated for retry", action)
+	}
+	if len(gateway.addLabelCalls) != 0 {
+		t.Fatalf("PR labels = %#v, want no escalation side effects before the comment is settled", gateway.addLabelCalls)
+	}
+
+	updated, err2 := fixture.repos.Loops.GetByID(context.Background(), loop.ID)
+	if err2 != nil || updated == nil {
+		t.Fatalf("Loops.GetByID() error = %v", err2)
+	}
+	if state, ok := parseRegenerationState(parseJSONObject(updated.MetadataJSON)); ok && state.Escalated {
+		t.Fatalf("regeneration state = %#v, want the loop left un-escalated for retry", state)
 	}
 }

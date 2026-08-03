@@ -14,6 +14,10 @@ func TestValidateRejectsUnsafeOutboundContentWithoutEchoingIt(t *testing.T) {
 	}{
 		{name: "entropy", text: "The process returned q8Kz1Wm9P2vR7xL4nB6cD0fH3jS5uY+/ unexpectedly.", want: "high-entropy"},
 		{name: "high-entropy assignment value", text: "FIXTURE_BLOB=q8Kz1Wm9P2vR7xL4nB6cD0fH3jS5uY+/", want: "high-entropy"},
+		// The '=' here is base64 padding, not an assignment separator: the
+		// identifier-shaped prefix must not split the token and let the value
+		// escape the entropy bar as "=" or "".
+		{name: "padded base64 token", text: "The process returned Zm9vYmFyYmFyYmF6cXV4MTIzNDU2Nzg5MA== unexpectedly.", want: "high-entropy"},
 		{name: "api key assignment", text: "OPENAI_API_KEY=sk-sensitive", want: "credential-shaped"},
 		{name: "token assignment", text: "TOKEN=short", want: "credential-shaped"},
 		{name: "trailing token", text: "SERVICE_TOKEN=secret-value", want: "credential-shaped"},

@@ -148,14 +148,24 @@ func unsafeText(text string, highEntropyExemptions []string) string {
 
 // assignmentValue splits a NAME=value-shaped candidate token, reporting the
 // value separately so the entropy check judges the secret-shaped part alone.
-// ok is false for tokens that are not identifier assignments — including
-// base64 blobs whose '=' is padding rather than an assignment separator.
+// ok is false for tokens that are not identifier assignments, so anything
+// ambiguous stays judged as a whole:
+//   - the '=' is base64 padding rather than an assignment separator — an
+//     identifier-shaped base64 blob like Zm9v...== would otherwise split into
+//     a value of "=" or "" that can never trip the entropy bar, letting a
+//     padded base64 credential bypass detection;
+//   - a trailing '=' with nothing after it, which is padding or a malformed
+//     assignment with no value to judge.
 func assignmentValue(token string) (string, bool) {
 	separator := strings.IndexByte(token, '=')
 	if separator <= 0 || !assignmentNameRE.MatchString(token[:separator]) {
 		return "", false
 	}
-	return token[separator+1:], true
+	value := token[separator+1:]
+	if value == "" || value[0] == '=' {
+		return "", false
+	}
+	return value, true
 }
 
 // isSensitiveAssignment reports high-confidence env-style credential lines such
