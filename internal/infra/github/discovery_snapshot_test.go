@@ -388,11 +388,13 @@ func TestDiscoverySnapshotMetadataTierOmitsRollupAndCachesSeparately(t *testing.
 
 	metadataCalls := 0
 	fullCalls := 0
+	fullPhase := false
 	gateway := New(Options{GHRun: func(_ context.Context, options shell.Options) (shell.Result, error) {
 		cmd := strings.Join(options.Args, " ")
 		switch {
 		case strings.Contains(cmd, "pr view 5") && strings.Contains(cmd, "statusCheckRollup"):
 			fullCalls++
+			fullPhase = true
 			return shell.Result{Stdout: `{"number":5,"title":"PR 5","body":"body","url":"https://example.com/pulls/5","state":"OPEN","labels":[{"name":"looper:fixer"}],"headRefName":"feature","baseRefName":"main","headRefOid":"sha-5","baseRefOid":"base-5","author":{"login":"octo"},"reviewRequests":[],"statusCheckRollup":[{"conclusion":"FAILURE"}]}`}, nil
 		case strings.Contains(cmd, "pr view 5"):
 			metadataCalls++
@@ -401,8 +403,18 @@ func TestDiscoverySnapshotMetadataTierOmitsRollupAndCachesSeparately(t *testing.
 			}
 			return shell.Result{Stdout: `{"number":5,"title":"PR 5","body":"body","url":"https://example.com/pulls/5","state":"OPEN","labels":[{"name":"looper:fixer"}],"headRefName":"feature","baseRefName":"main","headRefOid":"sha-5","baseRefOid":"base-5","author":{"login":"octo"},"reviewRequests":[]}`}, nil
 		case strings.Contains(cmd, "reviewThreads"):
+			// Review threads are full-tier-only. If the metadata path ever
+			// requests them, the thin-view contract is broken and the test
+			// must fail rather than silently succeed.
+			if !fullPhase {
+				return shell.Result{}, errors.New("reviewThreads requested during metadata phase")
+			}
 			return shell.Result{Stdout: `{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`}, nil
 		case strings.HasPrefix(cmd, "api --paginate repos/acme/looper/issues/5/comments"):
+			// Issue comments are full-tier-only, same contract as above.
+			if !fullPhase {
+				return shell.Result{}, errors.New("issue comments requested during metadata phase")
+			}
 			return shell.Result{Stdout: `[]`}, nil
 		default:
 			return shell.Result{}, errors.New("unexpected command: " + cmd)

@@ -1199,7 +1199,8 @@ func (a fixerGitHubAdapter) ViewPullRequest(ctx context.Context, input fixer.Vie
 // statusCheckRollup, no reviews, no review threads, no issue comments.
 // Fixer discovery paths that need failing-check evidence must keep using
 // ViewPullRequest (full tier); this method is only for callers that
-// inspect IsDraft/Author/ReviewRequests/Labels/State/Body.
+// inspect State/IsDraft/Labels/HeadSHA/HeadRefName/BaseRefName/BaseSHA/
+// ReviewDecision/HasConflicts/Author.
 func (a fixerGitHubAdapter) ViewPullRequestForDiscovery(ctx context.Context, input fixer.ViewPullRequestInput) (fixer.PullRequestDetail, error) {
 	repo, err := reviewThreadRepo(a.config, input.Repo, input.CWD)
 	if err != nil {
