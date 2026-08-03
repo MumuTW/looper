@@ -753,7 +753,9 @@ func (r *Runner) requeueRegenerationHandoff(ctx context.Context, loop storage.Lo
 		requeued = affected > 0
 	case "running":
 		message := "fixer regeneration handoff requires replay"
-		err = r.repos.Queue.MarkRetryIfRunning(ctx, storage.QueueMarkRetryInput{ID: queueItem.ID, AvailableAt: queuedAt, Attempts: queueItem.Attempts, ErrorMessage: &message, ErrorKind: "fixer_regeneration", UpdatedAt: r.nowISO()})
+		// Queue rows accept the shared runpipe failure kinds only; this replay is
+		// transient work and must remain claimable after the handoff error.
+		err = r.repos.Queue.MarkRetryIfRunning(ctx, storage.QueueMarkRetryInput{ID: queueItem.ID, AvailableAt: queuedAt, Attempts: queueItem.Attempts, ErrorMessage: &message, ErrorKind: string(runpipe.FailureRetryableTransient), UpdatedAt: r.nowISO()})
 		if err == nil {
 			if persisted, getErr := r.repos.Queue.GetByID(ctx, queueItem.ID); getErr != nil {
 				err = getErr

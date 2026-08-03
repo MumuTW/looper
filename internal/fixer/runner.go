@@ -2488,6 +2488,9 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 				return runpipe.ProcessResult{}, replayErr
 			}
 			if action == regenerationCompleted || action == regenerationEscalated {
+				if err := r.completeRegenerationReplayClaim(ctx, *loop, queueItem, *project); err != nil {
+					return runpipe.ProcessResult{}, err
+				}
 				return runpipe.ProcessResult{LoopID: loop.ID, QueueItemID: queueItem.ID, Status: "failed", Summary: replayFailure.Message, FailureKind: replayFailure.Kind}, nil
 			}
 		}
@@ -2937,6 +2940,33 @@ func pendingFixerRediscoveryHandoffInFlight(loop storage.LoopRecord, queueItem s
 		return false
 	}
 	return queueItem.DedupeKey == buildFixerDedupeKey(loop.ProjectID, loop.ID, *queueItem.Repo, *queueItem.PRNumber, pending.HeadSHA, pending.FixItemsStateHash)
+}
+
+// completeRegenerationReplayClaim closes the queue claim after a durable
+// terminal-regeneration suffix has replayed successfully. The ordinary fixer
+// runner owns this transition for normal runs, but the replay fast path returns
+// before reaching that lifecycle code; leaving the claimed row running would
+// make every daemon restart replay the already-completed handoff.
+func (r *Runner) completeRegenerationReplayClaim(ctx context.Context, loop storage.LoopRecord, queueItem storage.QueueItemRecord, project storage.ProjectRecord) error {
+	if r.repos == nil || r.repos.Queue == nil {
+		return fmt.Errorf("fixer queue repository is not configured")
+	}
+	if err := r.repos.Queue.Complete(ctx, queueItem.ID, r.nowISO()); err != nil && !errors.Is(err, storage.ErrQueueItemNotActive) {
+		return err
+	}
+	if r.repos.Runs == nil {
+		return nil
+	}
+	runs, err := r.repos.Runs.ListByLoop(ctx, loop.ID)
+	if err != nil {
+		return err
+	}
+	if len(runs) == 0 {
+		return nil
+	}
+	checkpoint := parseCheckpoint(runs[0].CheckpointJSON)
+	r.cleanupFixerWorktreeIfTerminal(context.Background(), project, runs[0].ID, &checkpoint)
+	return nil
 }
 
 func statusForSkip(skipReason string) string {

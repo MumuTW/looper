@@ -138,6 +138,14 @@ func unsafeText(text string, highEntropyExemptions []string) string {
 			if value == "" || gitObjectIDRE.MatchString(value) || uuidRE.MatchString(value) {
 				continue
 			}
+			// A secret value can be high-entropy even when it uses only one
+			// character class (for example a long alphabetic token). Check the
+			// value on its own before using the assignment structure as extra
+			// evidence; otherwise the NAME= prefix can make the result depend on
+			// how many classes happen to occur in the variable name.
+			if shannonEntropy(value) >= highEntropyThreshold {
+				return "contains a high-entropy credential-shaped token"
+			}
 			// Preserve the assignment structure for non-exempt values. The
 			// separator/name is evidence that a high-entropy token is being
 			// published as a credential-shaped assignment; judging only the
