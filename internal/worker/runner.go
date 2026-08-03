@@ -4649,7 +4649,14 @@ func executeStepAlreadyCompleted(checkpoint workerCheckpoint) bool {
 }
 
 func rewindCheckpointForExecuteRetry(checkpoint workerCheckpoint) workerCheckpoint {
-	if checkpoint.Execution == nil || (checkpoint.Execution.Status != "timeout" && checkpoint.Execution.Status != "timeout_observing") {
+	// Keep timeout_observing durable through the execute replay decision. A
+	// daemon can crash after the observation intent is persisted but before the
+	// executor returns; clearing that marker would let the replacement bypass
+	// verifyTimeoutProgressBeforeReplacement's fail-closed containment gate.
+	execution := checkpoint.Execution
+	preserveTimeoutObservation := execution != nil && execution.Status == "timeout_observing"
+	preserveTimeout := execution != nil && execution.Status == "timeout" && execution.ProgressBeforeTimeout != nil
+	if !preserveTimeoutObservation && !preserveTimeout {
 		checkpoint.Execution = nil
 	}
 	checkpoint.Validation = nil

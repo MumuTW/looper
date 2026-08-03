@@ -3014,6 +3014,51 @@ func TestCreateRunContextReplaysExecuteWhenExecuteCheckpointIsInvalid(t *testing
 	}
 }
 
+func TestCreateRunContextPreservesTimeoutObservationOnExecuteReplay(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Logger: fixture.logger, Now: fixture.now})
+	checkpointJSON := runpipe.MustMarshalJSON(workerCheckpoint{
+		Work:     &workerInput{Title: "Worker task"},
+		Worktree: &checkpointWorktree{ID: "wt_1", Path: filepath.Join(t.TempDir(), "wt"), Branch: "feature/test"},
+		Plan:     &checkpointPlan{Summary: "plan"},
+		Execution: &checkpointExecution{
+			Status:                "timeout_observing",
+			ExecutionID:           "agent_1",
+			ProgressSnapshotError: "worker timeout observation in progress",
+		},
+		ResumePolicy: "retry_from_timeout_context",
+	})
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{
+		ID:                "run_interrupted_during_timeout_observation",
+		LoopID:            "loop_worker_1",
+		Status:            "interrupted",
+		CurrentStep:       runpipe.StringPtr(string(stepExecute)),
+		LastCompletedStep: runpipe.StringPtr(string(stepPlan)),
+		CheckpointJSON:    &checkpointJSON,
+		StartedAt:         fixture.nowISO(),
+		CreatedAt:         fixture.nowISO(),
+		UpdatedAt:         fixture.nowISO(),
+	}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_1")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want worker loop", loop, err)
+	}
+	resumed, err := runner.createRunContext(context.Background(), *loop)
+	if err != nil {
+		t.Fatalf("createRunContext() error = %v", err)
+	}
+	if !resumed.Resumed || resumed.StartStep != stepExecute {
+		t.Fatalf("resumed = %#v, want execute replay for timeout observation", resumed)
+	}
+	if resumed.Checkpoint.Execution == nil || resumed.Checkpoint.Execution.Status != "timeout_observing" {
+		t.Fatalf("Execution = %#v, want timeout_observing marker preserved", resumed.Checkpoint.Execution)
+	}
+}
+
 func TestProcessClaimedQueueItemResumeValidationFailureUpdatesLoopState(t *testing.T) {
 	t.Parallel()
 
