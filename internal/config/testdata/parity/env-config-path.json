@@ -390,6 +390,19 @@
             "labelMode": "all",
             "requireAssigneeCurrentUser": true
           }
+        },
+        "triager": {
+          "preset": "legacy",
+          "classify": true,
+          "authorTiers": {},
+          "legacy": {
+            "autoRouteConfidence": 0.8,
+            "maxAutoRouteRisk": "low",
+            "requireInScope": true,
+            "requireNoMissingInformation": true,
+            "requirePlanner": true,
+            "requireRationale": true
+          }
         }
       },
       "projects": [

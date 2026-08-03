@@ -102,8 +102,8 @@ There is no current-directory inference and no `--project` flag: the stripped CL
 ### Overview
 
 1. Create a clear GitHub issue
-2. Triager persists a structured report and routes high-confidence, low-risk work directly to Planner
-3. If the report is risky, uncertain, or missing information, Triager comments on the issue with what it needs and the exact `/plan <confirmation token>` command for that report; a collaborator with write access replies with it. Anything typed after the command is passed to Planner as a clarification that supersedes the issue body
+2. Triager applies the configured admission policy, persists its explainable decision, and routes admitted work or classifies work needing assessment
+3. When admission requires assessment—or the legacy report is risky, uncertain, or incomplete—Triager comments with the exact `/plan <confirmation token>` command; a collaborator with write access replies with it. Anything typed after the command is passed to Planner as a clarification that supersedes the issue body
 4. Planner creates a spec PR
 5. Let `reviewer` review the spec PR
 6. Let `fixer` address review comments until the review is clean
@@ -206,9 +206,9 @@ This creates a `planner` loop targeting that issue. `projectId` is required — 
 
 ### Triager route
 
-For a GitHub project with Planner auto-discovery enabled and Coordinator disabled, new and reopened issues enter the internal Triager without a routing label. Each poll searches GitHub's recently updated Issues in updated-event order, with a lookback of at least five minutes, so enabling the role does not sweep the historical open backlog. Triager checks project support, source-event freshness, open-issue state, existing holds, and its persisted idempotency key, then records `triage.enrolled` before calling the LLM. That enrollment remains retryable after the lookback if the agent is unavailable. At most one new triage decision starts per scheduler tick across Projects. Triager revalidates the target after the decision and persists classification, scope, risk, confidence, missing information, recommended next role, rationale, and the policy outcome as a `triage.report` event.
+For a GitHub project with Planner auto-discovery enabled and Coordinator disabled, new and reopened issues enter the internal Triager without a routing label. Each poll searches GitHub's recently updated Issues in updated-event order, with a lookback of at least five minutes, so enabling the role does not sweep the historical open backlog. Triager records `triage.enrolled`, then applies `roles.triager` to forge-owned facts: author association, repository visibility, bot type, and the global hold. The resulting `triage.report` records the outcome, author tier, preset, visibility, and exact deciding rule. Replays reuse that durable decision.
 
-Only an in-scope, low-risk decision with confidence of at least `0.8`, no missing information, and `planner` as the recommended next role is projected directly into Planner's durable queue. Other reports remain `await_human_confirmation` and do not start Planner. A repository collaborator with `write`, `maintain`, or `admin` permission can confirm the persisted report by posting a later comment whose complete body is `/plan`; Looper records a `triage.confirmed` event before routing that report. A successful Planner projection is acknowledged by `triage.routed`, so a crash or route failure replays the report without repeating the LLM decision. The comment is a human confirmation, not a routing label.
+With the default `legacy` preset, behavior is unchanged: only an in-scope, low-risk decision with confidence of at least `0.8`, no missing information, and `planner` as the recommended next role routes automatically. Relationship presets instead produce `auto`, `assess`, or `ignore`: `auto` routes without a model call, `assess` optionally classifies and waits for a human, and `ignore` records and stops. A repository collaborator with `write`, `maintain`, or `admin` permission confirms an awaiting report with its exact `/plan <confirmation token>` command. Looper records `triage.confirmed` before routing and `triage.routed` after Planner accepts the projection, so replay does not repeat admission or classification.
 
 ### Label-based auto-discovery conditions
 

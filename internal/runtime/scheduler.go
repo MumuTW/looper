@@ -106,6 +106,21 @@ type fixerScheduler interface {
 type gatekeeperScheduler interface {
 	DiscoverPullRequests(context.Context, gatekeeper.DiscoveryInput) (gatekeeper.DiscoveryResult, error)
 	EvaluatePullRequest(context.Context, gatekeeper.EvaluationInput) (gatekeeper.Report, error)
+	RevokeProjectRoutes(context.Context, string) error
+}
+
+// revokeRoutes retires every published routing label for a project that left
+// discovery. It is best-effort: a failed revocation is logged and the next
+// tick retries, but it must never fail the whole scheduler tick.
+func revokeRoutes(ctx context.Context, input defaultSchedulerTickInput, projectID string) {
+	if input.Gatekeeper == nil {
+		return
+	}
+	if err := input.Gatekeeper.RevokeProjectRoutes(ctx, projectID); err != nil {
+		if input.Logger != nil {
+			input.Logger.Warn("scheduler could not revoke routing labels for project that left discovery", map[string]any{"projectId": projectID, "error": err.Error()})
+		}
+	}
 }
 
 type workerScheduler interface {
@@ -2250,6 +2265,9 @@ func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath stri
 			),
 			Now:            now,
 			SourceLookback: time.Duration(maxInt(300, 2*cfg.Scheduler.PollIntervalSeconds)) * time.Second,
+			PolicyForProject: func(projectID string) triager.ProjectPolicy {
+				return triagerProjectPolicy(cfg, projectID)
+			},
 		})
 	}
 
@@ -2819,6 +2837,10 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 			break
 		}
 		if project.Archived {
+			// A project that left discovery must not keep routing labels that
+			// authorize Mergify: no later evaluation would remove a persistent
+			// auto-merge label after the operator disabled all processing.
+			revokeRoutes(ctx, input, project.ID)
 			continue
 		}
 		repo, inCatalog := schedulerProjectRepo(input, project)
@@ -2826,6 +2848,7 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 			if input.Logger != nil {
 				input.Logger.Debug("scheduler skipped project missing from captured catalog", map[string]any{"projectId": project.ID})
 			}
+			revokeRoutes(ctx, input, project.ID)
 			continue
 		}
 		snapshot := projectSnapshot(project.ID)

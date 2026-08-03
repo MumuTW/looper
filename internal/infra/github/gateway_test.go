@@ -57,7 +57,7 @@ func TestGatewayListsSnapshotsAndReviewsThroughGH(t *testing.T) {
 		case strings.HasPrefix(args, "issue list"):
 			return shell.Result{Stdout: `[{"number":8,"title":"Fix gateway","body":"Issue body","url":"https://example.test/issues/8","state":"OPEN","updatedAt":"2026-05-02T12:00:00Z","author":{"login":"octocat"},"assignees":[{"login":"reviewer"}],"labels":[{"name":"phase-1"},{"name":"gateway"}]}]`}, nil
 		case args == "api repos/acme/looper/issues/8":
-			return shell.Result{Stdout: `{"number":8,"title":"Fix gateway","body":"Issue body","html_url":"https://example.test/issues/8","state":"open","state_reason":"completed","updated_at":"2026-05-03T12:00:00Z","user":{"login":"octocat"},"author_association":"COLLABORATOR","assignees":[{"login":"reviewer"}],"labels":[{"name":"phase-1"},{"name":"gateway"}]}`}, nil
+			return shell.Result{Stdout: `{"number":8,"title":"Fix gateway","body":"Issue body","html_url":"https://example.test/issues/8","state":"open","state_reason":"completed","updated_at":"2026-05-03T12:00:00Z","user":{"login":"octocat","type":"User"},"author_association":"COLLABORATOR","assignees":[{"login":"reviewer"}],"labels":[{"name":"phase-1"},{"name":"gateway"}]}`}, nil
 		case args == "api --paginate --slurp repos/acme/looper/issues/8/dependencies/blocked_by -H Accept: application/vnd.github+json":
 			return shell.Result{Stdout: `[[{"id":12,"number":12,"title":"blocked by","url":"https://api.example.test/issues/12","html_url":"https://example.test/issues/12","repository_url":"https://api.example.test/repos/acme/looper","state":"open","state_reason":"","repository":{"name":"looper","full_name":"acme/looper","url":"https://api.example.test/repos/acme/looper","html_url":"https://example.test/acme/looper"}}]]`}, nil
 		case args == "api --paginate --slurp repos/acme/looper/issues/8/dependencies/blocking -H Accept: application/vnd.github+json":
@@ -244,6 +244,9 @@ func TestGatewayListsSnapshotsAndReviewsThroughGH(t *testing.T) {
 	}
 	if issueDetail.AuthorAssociation != "COLLABORATOR" {
 		t.Fatalf("issueDetail.AuthorAssociation = %q, want COLLABORATOR", issueDetail.AuthorAssociation)
+	}
+	if issueDetail.AuthorType != "User" {
+		t.Fatalf("issueDetail.AuthorType = %q, want User", issueDetail.AuthorType)
 	}
 	if issueDetail.UpdatedAt != "2026-05-03T12:00:00Z" {
 		t.Fatalf("issueDetail.UpdatedAt = %q, want parsed updated timestamp", issueDetail.UpdatedAt)
@@ -619,7 +622,7 @@ func TestGetRepositorySettings(t *testing.T) {
 		if args != "api repos/acme/looper" {
 			t.Fatalf("unexpected gh args: %q", args)
 		}
-		return shell.Result{Stdout: `{"allow_squash_merge":true,"allow_merge_commit":false,"allow_rebase_merge":true,"allow_auto_merge":true}`}, nil
+		return shell.Result{Stdout: `{"allow_squash_merge":true,"allow_merge_commit":false,"allow_rebase_merge":true,"allow_auto_merge":true,"visibility":"private"}`}, nil
 	}
 
 	gateway := New(Options{GHPath: "gh", CWD: t.TempDir(), GHRun: runner.run})
@@ -627,7 +630,7 @@ func TestGetRepositorySettings(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetRepositorySettings() error = %v", err)
 	}
-	if !settings.AllowSquashMerge || settings.AllowMergeCommit || !settings.AllowRebaseMerge || !settings.AllowAutoMerge {
+	if !settings.AllowSquashMerge || settings.AllowMergeCommit || !settings.AllowRebaseMerge || !settings.AllowAutoMerge || settings.Visibility != "private" {
 		t.Fatalf("GetRepositorySettings() = %#v, want decoded repo settings", settings)
 	}
 }
