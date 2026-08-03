@@ -2811,7 +2811,7 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 		if criteriaResult, err := r.maybePublishCriteriaAnchoredCleanReview(ctx, input, checkpoint, pending, detail); err != nil {
 			return checkpoint, err
 		} else if criteriaResult != nil {
-			if err := r.recordPublishedReviewProgress(ctx, input, pending, criteriaResult.reviewEvent, criteriaResult.marker, !criteriaResult.recordOnly); err != nil {
+			if err := r.recordPublishedReviewAndConvergence(ctx, input, pending, criteriaResult.reviewEvent, detail, criteriaResult.marker, !criteriaResult.recordOnly); err != nil {
 				return checkpoint, err
 			}
 			return checkpoint, nil
@@ -2837,7 +2837,7 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 			if err := r.applyVerifiedReviewSideEffects(ctx, input, checkpoint, detail, found); err != nil {
 				return checkpoint, err
 			}
-			if err := r.recordPublishedReviewProgress(ctx, input, pending, pendingReviewEvent(pending), found, true); err != nil {
+			if err := r.recordPublishedReviewAndConvergence(ctx, input, pending, pendingReviewEvent(pending), detail, found, true); err != nil {
 				return checkpoint, err
 			}
 			return checkpoint, nil
@@ -2845,7 +2845,7 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 		if err := r.applyCleanNoopReviewSideEffects(ctx, input, checkpoint, detail); err != nil {
 			return checkpoint, err
 		}
-		if err := r.recordPublishedReviewProgress(ctx, input, pending, ReviewEventComment, ReviewMarkerResult{}, true); err != nil {
+		if err := r.recordPublishedReviewAndConvergence(ctx, input, pending, ReviewEventComment, detail, ReviewMarkerResult{}, true); err != nil {
 			return checkpoint, err
 		}
 		return checkpoint, nil
@@ -2953,7 +2953,7 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (reviewerC
 	if err := r.applyVerifiedReviewSideEffects(ctx, input, checkpoint, detail, markerResult); err != nil {
 		return checkpoint, err
 	}
-	if err := r.recordPublishedReviewProgress(ctx, input, pending, pendingReviewEvent(pending), markerResult, true); err != nil {
+	if err := r.recordPublishedReviewAndConvergence(ctx, input, pending, pendingReviewEvent(pending), detail, markerResult, true); err != nil {
 		return checkpoint, err
 	}
 	return checkpoint, nil

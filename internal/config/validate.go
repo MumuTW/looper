@@ -712,18 +712,6 @@ func validateGatekeeperDiffBudget(budget *GatekeeperDiffBudget, path string, iss
 	}
 }
 
-func validatePartialGatekeeperDiffBudget(budget *PartialGatekeeperDiffBudget, path string, issues *[]ValidationIssue) {
-	if budget == nil {
-		return
-	}
-	if budget.MaxChangedFiles != nil && *budget.MaxChangedFiles < 0 {
-		*issues = append(*issues, ValidationIssue{Path: path + ".maxChangedFiles", Message: "must be zero or a positive integer"})
-	}
-	if budget.MaxDeletions != nil && *budget.MaxDeletions < 0 {
-		*issues = append(*issues, ValidationIssue{Path: path + ".maxDeletions", Message: "must be zero or a positive integer"})
-	}
-}
-
 func validateHITLConfig(hitl HITLConfig, issues *[]ValidationIssue) {
 	switch strings.ToLower(strings.TrimSpace(hitl.AnswerTransport)) {
 	case "", "github", "respond":
