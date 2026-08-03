@@ -256,6 +256,11 @@ func (r *Runtime) runWorktreeCleanupPass(ctx context.Context, repos *storage.Rep
 		// closed — leave only the in-memory summary for status surfaces.
 		return summary
 	}
+	// Plan-level skip reasons are aggregated into the terminal completed event
+	// instead of one durable event per candidate: the skips are stable no-op
+	// states that Plan re-derives every pass, so per-candidate rows recorded
+	// repetition, not change.
+	skipReasons := map[string]int{}
 	for _, decision := range plan.Decisions {
 		if ctx.Err() != nil {
 			summary.LastError = ctx.Err().Error()
@@ -269,16 +274,7 @@ func (r *Runtime) runWorktreeCleanupPass(ctx context.Context, repos *storage.Rep
 				summary.LastStatus = "completed"
 			}
 			_ = r.WithAllowClaim(func() {
-				_ = r.appendWorktreeCleanupEvent(ctx, repos, "worktree.cleanup.completed", nil, map[string]any{
-					"status":      summary.LastStatus,
-					"scanned":     summary.Scanned,
-					"candidates":  summary.Candidates,
-					"cleaned":     summary.Cleaned,
-					"skipped":     summary.Skipped,
-					"failed":      summary.Failed,
-					"lastError":   summary.LastError,
-					"completedAt": derefString(summary.LastCompletedAt),
-				})
+				_ = r.appendWorktreeCleanupEvent(ctx, repos, "worktree.cleanup.completed", nil, worktreeCleanupCompletedPayload(summary, skipReasons))
 			})
 			return summary
 		}
@@ -297,14 +293,7 @@ func (r *Runtime) runWorktreeCleanupPass(ctx context.Context, repos *storage.Rep
 			return summary
 		}
 		if decision.Action != worktreecleanup.ActionWouldClean {
-			if err := r.recordWorktreeCleanupPlanSkip(ctx, repos, decision.Worktree, decision.Reason); err != nil {
-				// Admission closed between the loop recheck and the skip record —
-				// stop without durable skip/completed events after closure.
-				summary.LastError = err.Error()
-				summary.LastCompletedAt = stringPtr(formatJavaScriptISOString(r.now().UTC()))
-				summary.LastStatus = "completed"
-				return summary
-			}
+			skipReasons[decision.Reason]++
 			summary.Skipped++
 			continue
 		}
@@ -329,18 +318,29 @@ func (r *Runtime) runWorktreeCleanupPass(ctx context.Context, repos *storage.Rep
 	// Terminal completed is a durable cleanup mutation: hold admission so a
 	// concurrent MarkDegraded/cancel cannot append after closure.
 	_ = r.WithAllowClaim(func() {
-		_ = r.appendWorktreeCleanupEvent(ctx, repos, "worktree.cleanup.completed", nil, map[string]any{
-			"status":      summary.LastStatus,
-			"scanned":     summary.Scanned,
-			"candidates":  summary.Candidates,
-			"cleaned":     summary.Cleaned,
-			"skipped":     summary.Skipped,
-			"failed":      summary.Failed,
-			"lastError":   summary.LastError,
-			"completedAt": derefString(summary.LastCompletedAt),
-		})
+		_ = r.appendWorktreeCleanupEvent(ctx, repos, "worktree.cleanup.completed", nil, worktreeCleanupCompletedPayload(summary, skipReasons))
 	})
 	return summary
+}
+
+// worktreeCleanupCompletedPayload builds the terminal pass event. skipReasons
+// is included only when non-empty: it carries the plan-level skip breakdown
+// that used to be written as one durable event per unchanged candidate.
+func worktreeCleanupCompletedPayload(summary WorktreeCleanupStatus, skipReasons map[string]int) map[string]any {
+	payload := map[string]any{
+		"status":      summary.LastStatus,
+		"scanned":     summary.Scanned,
+		"candidates":  summary.Candidates,
+		"cleaned":     summary.Cleaned,
+		"skipped":     summary.Skipped,
+		"failed":      summary.Failed,
+		"lastError":   summary.LastError,
+		"completedAt": derefString(summary.LastCompletedAt),
+	}
+	if len(skipReasons) > 0 {
+		payload["skipReasons"] = skipReasons
+	}
+	return payload
 }
 
 type worktreeCleanupCandidateResult struct {
@@ -415,17 +415,6 @@ func (r *Runtime) cleanupWorktreeCandidate(ctx context.Context, repos *storage.R
 		return r.recordWorktreeCleanupSkip(ctx, repos, candidate, "dirty_git_status")
 	}
 	return r.cleanWorktreeCandidate(ctx, repos, gitGateway, cfg, *project, candidate, worktreeRoot, "clean")
-}
-
-// recordWorktreeCleanupPlanSkip writes a durable skip event only while admission
-// still allows claims. Hold WithAllowClaim across the append so MarkDegraded
-// cannot close admission between a point-in-time AllowClaim and the event write.
-// Returns the admission error when closed so callers stop without counting a
-// skip that was never recorded.
-func (r *Runtime) recordWorktreeCleanupPlanSkip(ctx context.Context, repos *storage.Repositories, candidate storage.WorktreeRecord, reason string) error {
-	return r.WithAllowClaim(func() {
-		_ = r.appendWorktreeCleanupEvent(ctx, repos, "worktree.cleanup.skipped", &candidate, map[string]any{"reason": reason})
-	})
 }
 
 func (r *Runtime) cleanWorktreeCandidate(ctx context.Context, repos *storage.Repositories, gitGateway worktreeCleanupGit, cfg config.Config, project storage.ProjectRecord, candidate storage.WorktreeRecord, worktreeRoot, reason string) worktreeCleanupCandidateResult {
