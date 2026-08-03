@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -80,7 +81,7 @@ func (h *Handler) createUpgradeBackup(ctx context.Context) (upgradebackup.Result
 	// Build identity checks now execute against the bytes that Create will
 	// record, rather than re-resolving a release-root/current symlink after the
 	// SQLite snapshot.
-	if err := requireMatchingCLIBuild(ctx, cliPin.path); err != nil {
+	if err := requireMatchingCLIBuild(ctx, cliPath, cliPin.contents); err != nil {
 		return upgradebackup.Result{}, err
 	}
 	if err := requirePinnedDaemonImage(h, daemonPin.path); err != nil {
@@ -125,9 +126,9 @@ type pinnedExecutable struct {
 }
 
 // pinExecutableContents opens the resolved file once and copies those bytes to
-// a private executable. The temp path is used only for identity probes; the
-// bytes are passed to upgradebackup.Create so release-root/current retargeting
-// during the SQLite snapshot cannot change the bundle's evidence.
+// a private executable. The private copy gives later checks a stable image;
+// the bytes are passed to upgradebackup.Create so release-root/current
+// retargeting during the SQLite snapshot cannot change the bundle's evidence.
 func pinExecutableContents(path, label string) (pinnedExecutable, func(), error) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -311,11 +312,29 @@ func requireExecutableFile(path, label string) error {
 
 // requireMatchingCLIBuild ensures tools.looperPath is the matching pair for the
 // running daemon (version.Current). A mismatched CLI would produce a rollback
-// bundle that cannot restore the live build.
-func requireMatchingCLIBuild(ctx context.Context, cliPath string) error {
+// bundle that cannot restore the live build. The identity probe intentionally
+// executes the configured CLI path rather than the temporary pin: the pin is
+// only a byte snapshot and the system temporary directory may be mounted
+// noexec. Comparing the source bytes before and after the probe proves that
+// the executed image is the same image that will be recorded in the bundle.
+func requireMatchingCLIBuild(ctx context.Context, cliPath string, pinnedContents []byte) error {
+	before, err := os.ReadFile(cliPath)
+	if err != nil {
+		return fmt.Errorf("refusing upgrade backup: cannot read CLI bytes at %s: %w", cliPath, err)
+	}
+	if !bytes.Equal(before, pinnedContents) {
+		return fmt.Errorf("refusing upgrade backup: CLI changed while being pinned at %s", cliPath)
+	}
 	cli, err := readCLIBuildIdentity(ctx, cliPath)
 	if err != nil {
 		return fmt.Errorf("refusing upgrade backup: cannot read CLI build identity at %s: %w", cliPath, err)
+	}
+	after, err := os.ReadFile(cliPath)
+	if err != nil {
+		return fmt.Errorf("refusing upgrade backup: cannot reread CLI bytes at %s: %w", cliPath, err)
+	}
+	if !bytes.Equal(after, pinnedContents) {
+		return fmt.Errorf("refusing upgrade backup: CLI changed during build identity probe at %s", cliPath)
 	}
 	daemon := version.Current()
 	if !cli.SameBuild(daemon) {

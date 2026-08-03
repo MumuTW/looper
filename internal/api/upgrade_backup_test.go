@@ -1,9 +1,13 @@
 package api
 
 import (
+	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/MumuTW/looper/internal/version"
 )
 
 func TestFilesystemDatabasePathNormalizesFileURI(t *testing.T) {
@@ -20,6 +24,38 @@ func TestFilesystemDatabasePathNormalizesFileURI(t *testing.T) {
 	}
 	if _, err := filesystemDatabasePath("file:memdb1?mode=memory&cache=shared"); err == nil {
 		t.Fatal("filesystemDatabasePath(memory URI) error = nil")
+	}
+}
+
+func TestRequireMatchingCLIBuildProbesSourceWhenPinIsNotExecutable(t *testing.T) {
+	originalVersion, originalSource, originalChannel, originalAPI := version.Value, version.VersionSource, version.Channel, version.APIVersion
+	originalSHA, originalTimestamp, originalDirty := version.GitCommitSHA, version.BuildTimestamp, version.BuildDirty
+	t.Cleanup(func() {
+		version.Value, version.VersionSource, version.Channel, version.APIVersion = originalVersion, originalSource, originalChannel, originalAPI
+		version.GitCommitSHA, version.BuildTimestamp, version.BuildDirty = originalSHA, originalTimestamp, originalDirty
+	})
+	version.Value = "0.0.0-test"
+	version.VersionSource = "test"
+	version.Channel = "test"
+	version.APIVersion = "v1"
+	version.GitCommitSHA = "commit"
+	version.BuildTimestamp = "timestamp"
+	version.BuildDirty = "false"
+	identity := version.Current()
+	payload, err := json.Marshal(identity)
+	if err != nil {
+		t.Fatalf("json.Marshal(identity) error = %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "looper")
+	script := "#!/bin/sh\nprintf '%s\\n' '" + string(payload) + "'\n"
+	if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
+		t.Fatalf("write CLI probe: %v", err)
+	}
+	if err := requireMatchingCLIBuild(context.Background(), path, []byte(script)); err != nil {
+		t.Fatalf("requireMatchingCLIBuild() error = %v", err)
+	}
+	if err := requireMatchingCLIBuild(context.Background(), path, []byte("different image")); err == nil {
+		t.Fatal("requireMatchingCLIBuild() error = nil for mismatched pinned bytes")
 	}
 }
 
