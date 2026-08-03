@@ -271,10 +271,14 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 		workerMode:   workerRole.Discovery.LabelMode,
 	}
 	loaded := make([]loadedIssue, 0, len(issues))
+	loadFailures := 0
+	var lastLoadErr error
 	for _, summary := range issues {
-		issue, err := r.loadIssue(ctx, input.Repo, project.RepoPath, summary)
+		issue, err := r.loadIssueIsolated(ctx, input.Repo, project.RepoPath, summary)
 		if err != nil {
-			return DiscoveryResult{}, err
+			loadFailures++
+			lastLoadErr = err
+			continue
 		}
 		loaded = append(loaded, issue)
 	}
@@ -288,12 +292,25 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 			return DiscoveryResult{}, err
 		}
 		for _, summary := range backlog {
-			issue, err := r.loadIssue(ctx, input.Repo, project.RepoPath, summary)
+			issue, err := r.loadIssueIsolated(ctx, input.Repo, project.RepoPath, summary)
 			if err != nil {
-				return DiscoveryResult{}, err
+				loadFailures++
+				lastLoadErr = err
+				continue
 			}
 			loaded = append(loaded, issue)
 		}
+	}
+	// A single issue-local load failure is isolated above so the rest of the
+	// repo keeps triaging. But when every attempted load failed, the lane
+	// produced nothing and ListOpenIssues already succeeded — the per-issue
+	// reads are failing for a repo-wide reason (a forge outage, a command
+	// incompatibility). Returning Ticked:true here would mask that from the
+	// scheduler as a healthy tick that simply had no work, so surface the
+	// failure instead. Other lanes still run: the scheduler records this
+	// error without aborting their ticks.
+	if len(loaded) == 0 && loadFailures > 0 {
+		return DiscoveryResult{}, fmt.Errorf("coordinator discovery could not load any issue for %s: %w", input.Repo, lastLoadErr)
 	}
 
 	// Personal project auto-assignment: if project is opted in and an issue
@@ -1822,6 +1839,26 @@ func (r *Runner) removeIssueLabels(ctx context.Context, repo, cwd string, issueN
 		return nil
 	}
 	return r.github.RemoveIssueLabels(ctx, githubinfra.IssueLabelsInput{Repo: repo, IssueNumber: issueNumber, Labels: labels, CWD: cwd})
+}
+
+// loadIssueIsolated loads one issue for discovery, isolating a per-issue
+// failure to that issue instead of aborting the tick. Discovery repeats every
+// tick and the issue stays open until it is handled, so one unloadable issue —
+// a timeline too large for the gh capture buffer, a transient forge error —
+// defers only itself. The error is returned so the caller can distinguish a
+// single issue-local failure (skip, keep triaging the rest) from a systemic
+// one where every issue failed and the lane produced nothing: surfacing the
+// latter as an error keeps the scheduler from reading a Ticked:true tick that
+// loaded no issues as a healthy lane.
+func (r *Runner) loadIssueIsolated(ctx context.Context, repo, cwd string, summary githubinfra.IssueSummary) (loadedIssue, error) {
+	issue, err := r.loadIssue(ctx, repo, cwd, summary)
+	if err != nil {
+		if r.logger != nil {
+			r.logger.Warn("coordinator discovery skipped issue after load failure", map[string]any{"repo": repo, "issueNumber": summary.Number, "error": err.Error()})
+		}
+		return loadedIssue{}, err
+	}
+	return issue, nil
 }
 
 func (r *Runner) loadIssue(ctx context.Context, repo, cwd string, summary githubinfra.IssueSummary) (loadedIssue, error) {
