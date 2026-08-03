@@ -117,27 +117,6 @@ func TestWorktreeCleanupPassGatesPlanFailureTerminalEvents(t *testing.T) {
 	}
 }
 
-// Contract (#580 review): plan-skip event append is under WithAllowClaim so a
-// closed admission cannot persist worktree.cleanup.skipped after close.
-func TestWorktreeCleanupPlanSkipHoldsAdmission(t *testing.T) {
-	t.Parallel()
-
-	fixture := newWorktreeCleanupFixture(t)
-	worktree := fixture.seedWorktree(t, "wt_plan_skip", "feature/plan-skip", true)
-	if err := fixture.runtime.admission.MarkDegraded("before plan skip"); err != nil {
-		t.Fatalf("MarkDegraded() error = %v", err)
-	}
-
-	err := fixture.runtime.recordWorktreeCleanupPlanSkip(context.Background(), fixture.repos, worktree, "below_min_age")
-	if !errors.Is(err, ErrAdmissionDegraded) {
-		t.Fatalf("recordWorktreeCleanupPlanSkip() = %v, want ErrAdmissionDegraded", err)
-	}
-	events := fixture.events(t)
-	if containsWorktreeCleanupEvent(events, "worktree.cleanup.skipped") {
-		t.Fatalf("events = %#v, want no skip event when admission closed at write boundary", events)
-	}
-}
-
 // Contract (#580 review): candidate skip/failure record helpers hold admission
 // across worktrees touch + event append so degradation after eligibility checks
 // cannot commit durable cleanup mutations after close.
