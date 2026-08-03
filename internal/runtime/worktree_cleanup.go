@@ -557,6 +557,10 @@ func (r *Runtime) runWorktreeDiskSweep(ctx context.Context, repos *storage.Repos
 				}
 				return paths, nil
 			},
+			IsRegisteredPath: func(ctx context.Context, path string) (bool, error) {
+				record, err := repos.Worktrees.GetByPath(ctx, path)
+				return record != nil, err
+			},
 		})
 		status.Scanned += plan.Summary.Scanned
 		status.Unregistered += plan.Summary.Unregistered

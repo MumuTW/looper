@@ -231,15 +231,69 @@ func writeUsableCheckout(t *testing.T, path string, modified time.Time) string {
 
 func sweepOptions(root DiskSweepRoot, git DiskSweepGit, removed *[]string) DiskSweepOptions {
 	return DiskSweepOptions{
-		Roots:           []DiskSweepRoot{root},
-		Git:             git,
-		Budget:          100,
-		RetentionCutoff: sweepCutoff(),
-		GitTrackedPaths: func(context.Context, string) ([]string, error) { return nil, nil },
+		Roots:            []DiskSweepRoot{root},
+		Git:              git,
+		Budget:           100,
+		RetentionCutoff:  sweepCutoff(),
+		GitTrackedPaths:  func(context.Context, string) ([]string, error) { return nil, nil },
+		IsRegisteredPath: func(context.Context, string) (bool, error) { return false, nil },
 		RemoveAll: func(path string) error {
 			*removed = append(*removed, path)
 			return os.RemoveAll(path)
 		},
+	}
+}
+
+func TestRunDiskSweepRechecksRegisteredOwnershipBeforeRemoval(t *testing.T) {
+	worktreeRoot := t.TempDir()
+	path := mkdirAt(t, filepath.Join(worktreeRoot, "looper-app-adopted"), old())
+	var removed []string
+	options := sweepOptions(DiskSweepRoot{ProjectID: "app", RepoPath: filepath.Join(t.TempDir(), "repo"), WorktreeRoot: worktreeRoot}, stubSweepGit{}, &removed)
+	options.IsRegisteredPath = func(_ context.Context, candidate string) (bool, error) {
+		return candidate == path, nil
+	}
+
+	plan, err := RunDiskSweep(context.Background(), options)
+	if err != nil {
+		t.Fatalf("RunDiskSweep() error = %v", err)
+	}
+	if len(removed) != 0 {
+		t.Fatalf("removed = %v, want none after delete-time ownership claim", removed)
+	}
+	if action, reason := reasonFor(t, plan, path); action != ActionSkipped || reason != "registered_at_removal" {
+		t.Fatalf("candidate = (%q, %q), want registered_at_removal skip", action, reason)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("claimed checkout was removed: %v", err)
+	}
+}
+
+func TestRunDiskSweepRechecksGitOwnershipBeforeRemoval(t *testing.T) {
+	worktreeRoot := t.TempDir()
+	path := mkdirAt(t, filepath.Join(worktreeRoot, "looper-app-linked"), old())
+	var removed []string
+	options := sweepOptions(DiskSweepRoot{ProjectID: "app", RepoPath: filepath.Join(t.TempDir(), "repo"), WorktreeRoot: worktreeRoot}, stubSweepGit{}, &removed)
+	gitListCalls := 0
+	options.GitTrackedPaths = func(_ context.Context, _ string) ([]string, error) {
+		gitListCalls++
+		if gitListCalls == 1 {
+			return nil, nil
+		}
+		return []string{path}, nil
+	}
+
+	plan, err := RunDiskSweep(context.Background(), options)
+	if err != nil {
+		t.Fatalf("RunDiskSweep() error = %v", err)
+	}
+	if len(removed) != 0 {
+		t.Fatalf("removed = %v, want none after delete-time Git claim", removed)
+	}
+	if action, reason := reasonFor(t, plan, path); action != ActionSkipped || reason != "git_tracked_at_removal" {
+		t.Fatalf("candidate = (%q, %q), want git_tracked_at_removal skip", action, reason)
+	}
+	if gitListCalls != 2 {
+		t.Fatalf("GitTrackedPaths calls = %d, want planning and delete-time refresh", gitListCalls)
 	}
 }
 

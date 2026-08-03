@@ -557,6 +557,11 @@ type DiskSweepOptions struct {
 	// GitTrackedPaths resolves `git worktree list` for one repo. A root whose
 	// repo cannot be listed is skipped entirely rather than swept blind.
 	GitTrackedPaths func(context.Context, string) ([]string, error)
+	// IsRegisteredPath rechecks the authoritative worktrees table for one path
+	// while the mutation scope is held. The initial RegisteredPaths snapshot is
+	// only a planning hint; deletion is unsafe without this final authority
+	// query because a creator can adopt a checkout after planning completes.
+	IsRegisteredPath func(context.Context, string) (bool, error)
 	// ReadDir defaults to os.ReadDir semantics; injected for tests.
 	ReadDir func(string) ([]DiskEntry, error)
 	// RemoveAll defaults to os.RemoveAll; injected for tests.
@@ -570,6 +575,9 @@ func RunDiskSweep(ctx context.Context, options DiskSweepOptions) (DiskSweepPlan,
 	}
 	if options.GitTrackedPaths == nil {
 		return DiskSweepPlan{}, fmt.Errorf("git worktree listing is required")
+	}
+	if options.IsRegisteredPath == nil {
+		return DiskSweepPlan{}, fmt.Errorf("registered path authority is required")
 	}
 	readDir := options.ReadDir
 	if readDir == nil {
@@ -669,6 +677,42 @@ func RunDiskSweep(ctx context.Context, options DiskSweepOptions) (DiskSweepPlan,
 					result.Summary.Skipped++
 				}
 				result.Candidates = append(result.Candidates, decided)
+				continue
+			}
+			registered, err := options.IsRegisteredPath(ctx, decided.Path)
+			if err != nil {
+				decided.Action = "error"
+				decided.Reason = "registered_path_refresh_failed"
+				decided.Error = err.Error()
+				result.Summary.Errors++
+				result.Candidates = append(result.Candidates, decided)
+				releaseMutation()
+				continue
+			}
+			if registered {
+				decided.Action = ActionSkipped
+				decided.Reason = "registered_at_removal"
+				result.Summary.Skipped++
+				result.Candidates = append(result.Candidates, decided)
+				releaseMutation()
+				continue
+			}
+			tracked, err := options.GitTrackedPaths(ctx, root.RepoPath)
+			if err != nil {
+				decided.Action = "error"
+				decided.Reason = "git_list_refresh_failed"
+				decided.Error = err.Error()
+				result.Summary.Errors++
+				result.Candidates = append(result.Candidates, decided)
+				releaseMutation()
+				continue
+			}
+			if normalizedPathSet(tracked)[normalizeSweepPath(decided.Path)] {
+				decided.Action = ActionSkipped
+				decided.Reason = "git_tracked_at_removal"
+				result.Summary.Skipped++
+				result.Candidates = append(result.Candidates, decided)
+				releaseMutation()
 				continue
 			}
 			decided, eligible = revalidateDiskCandidate(root, decided, options.RetentionCutoff)
