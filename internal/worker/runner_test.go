@@ -1658,6 +1658,12 @@ func TestRunExecuteStepPersistsProgressBeforeTimeoutTermination(t *testing.T) {
 	if progress.HeadSHA != "after-head" || progress.WorktreeID != "worktree_27" || progress.Branch != "looper/issue-27" || progress.TimeoutType != "idle" || progress.DiffFingerprint != "status-only-sha" || progress.ChangedFileCount != 3 || progress.StagedFileCount != 1 || progress.UntrackedFileCount != 1 {
 		t.Fatalf("progress = %#v, want captured timeout state", progress)
 	}
+	if checkpoint.Execution.RunID != run.ID || checkpoint.Execution.ExecutionID == "" {
+		t.Fatalf("checkpoint.Execution IDs = %#v, want timeout run and execution IDs", checkpoint.Execution)
+	}
+	if checkpoint.Continuation == nil || checkpoint.Continuation.PredecessorRunID != run.ID || checkpoint.Continuation.PredecessorExecutionID != checkpoint.Execution.ExecutionID || checkpoint.Continuation.Mode != "timeout_observed" || checkpoint.Continuation.BeforeTimeout == nil {
+		t.Fatalf("checkpoint.Continuation = %#v, want durable timeout evidence", checkpoint.Continuation)
+	}
 	if got := progress.StagedFiles; len(got) != 1 || got[0] != "staged.go" {
 		t.Fatalf("progress.StagedFiles = %#v, want [staged.go]", got)
 	}
@@ -1728,6 +1734,44 @@ func TestRunExecuteStepStopsBeforeReplacementWhenTimeoutProgressDrifts(t *testin
 	}
 	if checkpoint.Execution == nil || checkpoint.Execution.ProgressSnapshotError == "" || checkpoint.ResumePolicy != loops.ResumePolicyManualIntervention {
 		t.Fatalf("checkpoint = %#v, want persisted drift evidence and manual intervention", checkpoint)
+	}
+	if checkpoint.Continuation == nil || checkpoint.Continuation.Mode != "checkpoint_same_worktree" || checkpoint.Continuation.Outcome != "changed" || checkpoint.Continuation.AfterRestart == nil {
+		t.Fatalf("checkpoint.Continuation = %#v, want changed retry evidence", checkpoint.Continuation)
+	}
+}
+
+func TestVerifyTimeoutProgressBeforeReplacementPersistsPreservedEvidence(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	run := storage.RunRecord{ID: "run_timeout_retry", LoopID: "loop_worker_1", Status: "running", CurrentStep: runpipe.StringPtr(string(stepExecute)), StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Runs.Upsert(context.Background(), run); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	progress := InspectHeadResult{
+		HeadSHA: "head-before", Branch: "feature/test", ChangedFiles: []string{"tracked.go"}, StagedFiles: []string{"tracked.go"},
+		DiffFingerprint: "status", ContentFingerprint: "content", ContentFingerprintVersion: worktreeFingerprintVersion, IndexFingerprint: "index",
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: &fakeGitGateway{inspectResult: progress}, Logger: fixture.logger, Now: fixture.now})
+	before := &worktreeProgress{HeadSHA: "head-before", WorktreeID: "wt_1", Branch: "feature/test", ChangedFiles: []string{"tracked.go"}, ChangedFileCount: 1, StagedFiles: []string{"tracked.go"}, StagedFileCount: 1, DiffFingerprint: "status", ContentFingerprint: "content", ContentFingerprintVersion: worktreeFingerprintVersion, IndexFingerprint: "index"}
+	checkpoint := workerCheckpoint{Execution: &checkpointExecution{RunID: "run_timeout", ExecutionID: "agent_timeout", Status: "timeout", ProgressBeforeTimeout: before}}
+	worktree := checkpointWorktree{ID: "wt_1", Path: filepath.Join(t.TempDir(), "worktree"), Branch: "feature/test", BaseBranch: "main"}
+	if err := runner.verifyTimeoutProgressBeforeReplacement(context.Background(), *project, run.ID, workerInput{BaseBranch: "main"}, worktree, &checkpoint); err != nil {
+		t.Fatalf("verifyTimeoutProgressBeforeReplacement() error = %v, want preserved retry", err)
+	}
+	if checkpoint.Continuation == nil || checkpoint.Continuation.PredecessorRunID != "run_timeout" || checkpoint.Continuation.PredecessorExecutionID != "agent_timeout" || checkpoint.Continuation.Mode != "checkpoint_same_worktree" || checkpoint.Continuation.Outcome != "preserved" || checkpoint.Continuation.AfterRestart == nil {
+		t.Fatalf("checkpoint.Continuation = %#v, want preserved before/after evidence", checkpoint.Continuation)
+	}
+	storedRun, err := fixture.repos.Runs.GetByID(context.Background(), run.ID)
+	if err != nil || storedRun == nil {
+		t.Fatalf("Runs.GetByID() = (%#v, %v), want stored run", storedRun, err)
+	}
+	storedCheckpoint, err := parseCheckpoint(storedRun.CheckpointJSON)
+	if err != nil || storedCheckpoint.Continuation == nil || storedCheckpoint.Continuation.Outcome != "preserved" || storedCheckpoint.Continuation.AfterRestart == nil {
+		t.Fatalf("stored checkpoint = %#v, err=%v, want persisted preserved evidence", storedCheckpoint, err)
 	}
 }
 

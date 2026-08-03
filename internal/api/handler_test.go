@@ -792,6 +792,30 @@ func TestBuildActiveRunContinuationReportsObservationError(t *testing.T) {
 	}
 }
 
+func TestBuildActiveRunContinuationPrefersObservationErrorOverPartialSnapshot(t *testing.T) {
+	checkpoint := `{"execution":{"runId":"run_timeout","executionId":"agent_timeout","status":"timeout","progressSnapshotError":"worktree changed after termination","progressBeforeTimeout":{"headSha":"before-head","diffFingerprint":"before-status"}}}`
+	continuation := buildActiveRunContinuation(&storage.RunRecord{CheckpointJSON: &checkpoint})
+	if continuation == nil {
+		t.Fatal("buildActiveRunContinuation() = nil, want failed-observation projection")
+	}
+	assertEqual(t, continuation.Outcome, "observation failed")
+	if continuation.BeforeTimeout != nil || continuation.AfterRestart != nil {
+		t.Fatalf("continuation = %#v, want error to suppress partial snapshot", continuation)
+	}
+}
+
+func TestBuildActiveRunContinuationProjectsWorkerRetryOutcome(t *testing.T) {
+	checkpoint := `{"execution":{"status":"completed","runId":"run_retry","executionId":"agent_retry"},"continuation":{"predecessorRunId":"run_timeout","predecessorExecutionId":"agent_timeout","mode":"checkpoint_same_worktree","outcome":"preserved","beforeTimeout":{"headSha":"before-head","diffFingerprint":"before-status"},"afterRestart":{"headSha":"before-head","diffFingerprint":"before-status"}}}`
+	continuation := buildActiveRunContinuation(&storage.RunRecord{CheckpointJSON: &checkpoint})
+	if continuation == nil || continuation.BeforeTimeout == nil || continuation.AfterRestart == nil {
+		t.Fatalf("buildActiveRunContinuation() = %#v, want persisted retry comparison", continuation)
+	}
+	assertEqual(t, continuation.PredecessorRunID, "run_timeout")
+	assertEqual(t, continuation.PredecessorExecutionID, "agent_timeout")
+	assertEqual(t, continuation.Mode, "checkpoint_same_worktree")
+	assertEqual(t, continuation.Outcome, "preserved")
+}
+
 // Successful completeRun summaries must not populate lastFailureReason when there
 // is no queue error (queued/running loops and ps --all completed rows).
 func TestHandlerActiveRunsDoesNotUseSuccessSummaryAsFailureReason(t *testing.T) {
