@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -124,6 +125,23 @@ func TestWorktreeCleanupPassDiskSweepHonorsDryRun(t *testing.T) {
 	}
 	if _, err := os.Stat(debris); err != nil {
 		t.Fatalf("dry run removed %q: %v", debris, err)
+	}
+}
+
+func TestWorktreeCleanupPassPropagatesDiskSweepFailure(t *testing.T) {
+	fixture := newWorktreeCleanupFixture(t)
+	fixture.config.Daemon.WorktreeCleanup.RetentionDays = 7
+	listErr := errors.New("git worktree listing failed")
+	summary := fixture.runtime.runWorktreeCleanupPass(context.Background(), fixture.repos, &fakeWorktreeCleanupGit{listErr: listErr}, fixture.config)
+
+	if summary.DiskSweep.Failed == 0 {
+		t.Fatalf("diskSweep = %#v, want a disk-sweep failure", summary.DiskSweep)
+	}
+	if summary.Failed != summary.DiskSweep.Failed || summary.LastStatus != "failed" {
+		t.Fatalf("summary = %#v, want top-level failure propagation", summary)
+	}
+	if !strings.Contains(summary.LastError, listErr.Error()) {
+		t.Fatalf("lastError = %q, want %q", summary.LastError, listErr.Error())
 	}
 }
 

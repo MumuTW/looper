@@ -337,6 +337,10 @@ func (r *Runtime) runWorktreeCleanupPass(ctx context.Context, repos *storage.Rep
 	// deliberate: the record pass runs first so a path it cleans this tick is
 	// already gone (or already row-tracked) when the sweep enumerates.
 	summary.DiskSweep = r.runWorktreeDiskSweep(ctx, repos, gitGateway, cfg)
+	summary.Failed += summary.DiskSweep.Failed
+	if summary.LastError == "" {
+		summary.LastError = summary.DiskSweep.LastError
+	}
 
 	summary.LastCompletedAt = stringPtr(formatJavaScriptISOString(r.now().UTC()))
 	if summary.Failed > 0 {

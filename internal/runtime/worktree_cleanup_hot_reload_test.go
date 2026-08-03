@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"os/exec"
 	"testing"
 	"time"
 
@@ -17,6 +18,12 @@ func TestWorktreeCleanupLoopGatesEachPassOnLiveEnabledFlag(t *testing.T) {
 	fixture := newWorktreeCleanupFixture(t)
 	rt := fixture.runtime
 	rt.services = Services{Repositories: fixture.repos}
+	// The cleanup pass now surfaces disk-sweep Git errors in LastStatus. Give
+	// this loop-gating test a valid repository so it observes the scheduling
+	// contract rather than failing on the fixture's intentionally empty repo.
+	if output, err := exec.Command("git", "init", "--quiet", fixture.project.RepoPath).CombinedOutput(); err != nil {
+		t.Fatalf("git init %s: %v (%s)", fixture.project.RepoPath, err, output)
+	}
 	setWorktreeCleanupEnabled(rt, false)
 
 	rt.startWorktreeCleanupLoop()

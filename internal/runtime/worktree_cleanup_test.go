@@ -419,12 +419,16 @@ func (f worktreeCleanupFixture) events(t *testing.T) []storage.EventLogRecord {
 
 type fakeWorktreeCleanupGit struct {
 	listed       map[string][]gitinfra.WorktreeListEntry
+	listErr      error
 	clean        map[string]bool
 	cleanupCalls []gitinfra.CleanupWorktreeInput
 	onCleanup    func(gitinfra.CleanupWorktreeInput) error
 }
 
 func (f *fakeWorktreeCleanupGit) ListWorktrees(_ context.Context, repoPath string) ([]gitinfra.WorktreeListEntry, error) {
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
 	return append([]gitinfra.WorktreeListEntry{}, f.listed[repoPath]...), nil
 }
 
