@@ -589,6 +589,19 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 		if uniqueErr := assertUniqueActiveLoopCompat(existing, "", projectID, domain.LoopTypeWorker, target, domain.LoopStatusQueued); uniqueErr != nil {
 			return storage.LoopRecord{}, uniqueErr
 		}
+		candidate := storage.LoopRecord{
+			ProjectID:    projectID,
+			Type:         string(domain.LoopTypeWorker),
+			TargetType:   targetType,
+			TargetID:     &targetID,
+			Repo:         repo,
+			PRNumber:     effectivePRNumber,
+			Status:       string(domain.LoopStatusQueued),
+			MetadataJSON: &metadataJSON,
+		}
+		if err := assertIssueClaimAdmission(r.Context(), repos, candidate, derefBool(body.Force)); err != nil {
+			return storage.LoopRecord{}, err
+		}
 
 		seq, seqErr := repos.Loops.AllocateSeq(r.Context())
 		if seqErr != nil {
@@ -699,6 +712,9 @@ func (h *Handler) buildWorkersCreateResponse(r *http.Request) (workerCreateRespo
 
 func (h *Handler) validateManualHoldBypassForLoopTarget(ctx context.Context, projectID string, loopType domain.LoopType, target domain.LoopTarget, force bool) error {
 	if force || (loopType != domain.LoopTypePlanner && loopType != domain.LoopTypeWorker && loopType != domain.LoopTypeReviewer && loopType != domain.LoopTypeFixer) {
+		return nil
+	}
+	if target.TargetType != domain.LoopTargetTypeIssue && target.TargetType != domain.LoopTargetTypePullRequest {
 		return nil
 	}
 	services := h.context.Runtime.Services()
@@ -1177,6 +1193,17 @@ func (h *Handler) buildPlannersCreateResponse(r *http.Request) (plannerCreateRes
 		if uniqueErr := assertUniqueActiveLoopCompat(existing, "", projectID, domain.LoopTypePlanner, target, domain.LoopStatusRunning); uniqueErr != nil {
 			return storage.LoopRecord{}, uniqueErr
 		}
+		plannerCandidate := storage.LoopRecord{
+			ProjectID:  projectID,
+			Type:       string(domain.LoopTypePlanner),
+			TargetType: string(domain.LoopTargetTypeIssue),
+			TargetID:   &targetID,
+			Repo:       repo,
+			Status:     string(domain.LoopStatusRunning),
+		}
+		if err := assertIssueClaimAdmission(r.Context(), repos, plannerCandidate, derefBool(body.Force)); err != nil {
+			return storage.LoopRecord{}, err
+		}
 
 		record := storage.LoopRecord{
 			ID:           generateRequestID(),
@@ -1194,7 +1221,7 @@ func (h *Handler) buildPlannersCreateResponse(r *http.Request) (plannerCreateRes
 			CreatedAt:    nowISO,
 			UpdatedAt:    nowISO,
 		}
-		if upsertErr := repos.Loops.Upsert(r.Context(), record); upsertErr != nil {
+		if upsertErr := upsertLoopAfterIssueClaimAdmission(r.Context(), repos.Loops, record, derefBool(body.Force)); upsertErr != nil {
 			return storage.LoopRecord{}, upsertErr
 		}
 

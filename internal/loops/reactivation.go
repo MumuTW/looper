@@ -17,7 +17,6 @@ import (
 // them to their own transport errors; the authority remains the loop and queue
 // records passed to ReactivateQueue, not the HTTP handler.
 var (
-	ErrLoopNotFound             = errors.New("loop not found")
 	ErrActiveLoopConflict       = errors.New("active loop conflict")
 	ErrInvalidQueueTarget       = errors.New("invalid queue target")
 	ErrReactivationUnconfigured = errors.New("queue reactivation is not configured")

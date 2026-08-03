@@ -427,6 +427,18 @@ func (h *Handler) buildResourceGuardStatusResponse() any {
 	}
 }
 
+func (h *Handler) buildResourceGuardStatusResponse() any {
+	if runtimeWithGuard, ok := any(h.context.Runtime).(interface {
+		HostAdmissionStatus() looperdruntime.HostAdmissionStatus
+	}); ok {
+		return runtimeWithGuard.HostAdmissionStatus()
+	}
+	return looperdruntime.HostAdmissionStatus{
+		Enabled: h.context.Config.Daemon.ResourceGuard.Enabled,
+		Admit:   true,
+	}
+}
+
 type storageState struct {
 	OK                  bool
 	LatestAvailableID   string

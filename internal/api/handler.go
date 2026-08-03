@@ -4412,3 +4412,96 @@ func looperdArtifactName(target string) *string {
 	value := "looperd-" + target
 	return &value
 }
+
+func issueCollisionError(issueNumber int64, loopID, loopType string) apiError {
+	return apiError{
+		code:    pkgapi.ErrorCodeLoopConflict,
+		status:  http.StatusConflict,
+		message: fmt.Sprintf("Issue #%d is occupied by active %s loop %s", issueNumber, loopType, loopID),
+		details: map[string]any{"occupiedBy": map[string]any{"loopId": loopID, "loopType": loopType}},
+	}
+}
+
+func mapIssueClaimAdmissionError(err error) error {
+	if conflict, ok := storage.IsIssueClaimConflictError(err); ok {
+		return issueCollisionError(conflict.IssueNumber, conflict.LoopID, conflict.LoopType)
+	}
+	return err
+}
+
+// parseReviewerConvergenceProjection reads only the typed convergence object
+// already persisted by Reviewer. Invalid or legacy metadata is omitted from
+// the projection rather than making an otherwise readable loop unavailable.
+func parseReviewerConvergenceProjection(metadataJSON *string) *reviewerConvergenceProjection {
+	metadata := parseJSONObject(metadataJSON)
+	raw, ok := metadata["convergence"]
+	if !ok || raw == nil {
+		return nil
+	}
+	encoded, err := json.Marshal(raw)
+	if err != nil {
+		return nil
+	}
+	var projection reviewerConvergenceProjection
+	if err := json.Unmarshal(encoded, &projection); err != nil {
+		return nil
+	}
+	if err := projection.Policy.Validate(); err != nil {
+		return nil
+	}
+	if err := projection.State.Validate(); err != nil {
+		return nil
+	}
+	if !projection.Action.Valid() {
+		return nil
+	}
+	if !projection.Reason.Valid() {
+		return nil
+	}
+	if !convergence.ValidStatus(projection.Status) {
+		return nil
+	}
+	return &projection
+}
+
+func assertIssueClaimAdmission(ctx context.Context, repos *storage.Repositories, candidate storage.LoopRecord, force bool) error {
+	err := repos.Loops.AssertIssueClaimAdmission(ctx, candidate, force)
+	if conflict, ok := storage.IsIssueClaimConflictError(err); ok {
+		return issueCollisionError(conflict.IssueNumber, conflict.LoopID, conflict.LoopType)
+	}
+	return err
+}
+
+func upsertLoopAfterIssueClaimAdmission(ctx context.Context, loops *storage.LoopsRepository, record storage.LoopRecord, force bool) error {
+	var err error
+	if force {
+		err = loops.UpsertForcingIssueClaimAdmission(ctx, record)
+	} else {
+		err = loops.Upsert(ctx, record)
+	}
+	return mapIssueClaimAdmissionError(err)
+}
+
+func issueWorkerMetadataJSON(metadataJSON *string, target domain.LoopTarget, force bool) (*string, error) {
+	metadata := parseJSONObject(metadataJSON)
+	if metadata == nil {
+		metadata = map[string]any{}
+	}
+	worker, _ := metadata["worker"].(map[string]any)
+	if worker == nil {
+		worker = map[string]any{}
+	}
+	delete(worker, "issueClaimOverride")
+	if force {
+		worker["issueClaimOverride"] = true
+	}
+	worker["repo"] = target.Repo
+	worker["issueNumber"] = target.IssueNumber
+	metadata["worker"] = worker
+	encoded, err := json.Marshal(metadata)
+	if err != nil {
+		return nil, err
+	}
+	text := string(encoded)
+	return &text, nil
+}
