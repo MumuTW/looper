@@ -746,6 +746,16 @@ func (s *Service) UpdateProject(ctx context.Context, identifier string, input Up
 			return storage.ProjectRecord{}, ProjectValidationError{Message: err.Error()}
 		}
 	}
+	// A legacy inert record that gains repository metadata leaves the repair
+	// exception, so it must carry an effective stance immediately —
+	// independently of whether a coding agent is currently configured.
+	// Otherwise enabling Worker or Fixer later turns the stored row into a
+	// startup failure with no running PATCH API left to repair it.
+	if IsLegacyInertProject(*project) && metadataString(metadata, "repo") != "" {
+		if _, hasValidation := metadata["validation"]; !hasValidation && len(config.ResolveValidationCommands(s.currentConfig())) == 0 {
+			return storage.ProjectRecord{}, ProjectValidationError{Message: "adding repository metadata requires validation commands or optOut=true in the same request while defaults.validationCommands is empty"}
+		}
+	}
 
 	var repo *string
 	if value := metadataString(metadata, "repo"); value != "" {
