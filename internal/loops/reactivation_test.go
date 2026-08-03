@@ -61,8 +61,9 @@ func TestReactivateQueueCreatesFirstReviewerQueueAndRejectsSiblingConflict(t *te
 	if err := repos.Loops.Upsert(ctx, storage.LoopRecord{ID: otherID, Seq: 2, ProjectID: loop.ProjectID, Type: string(domain.LoopTypeReviewer), TargetType: string(domain.LoopTargetTypePullRequest), TargetID: &targetID, Repo: &repo, PRNumber: &pr, Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("Loops.Upsert(conflict) error = %v", err)
 	}
-	if _, err := storage.WithTransactionValue(ctx, db, nil, func(tx *sql.Tx) (QueueReactivationResult, error) {
-		return ReactivateQueue(ctx, storage.NewRepositories(tx), QueueReactivationInput{Loop: loop, NowISO: nowISO, MaxAttempts: 3})
+	if err := storage.WithTransaction(ctx, db, nil, func(tx *sql.Tx) error {
+		_, err := ReactivateQueue(ctx, storage.NewRepositories(tx), QueueReactivationInput{Loop: loop, NowISO: nowISO, MaxAttempts: 3})
+		return err
 	}); err == nil {
 		t.Fatal("ReactivateQueue() error = nil, want active sibling conflict")
 	}

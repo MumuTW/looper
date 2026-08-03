@@ -89,7 +89,7 @@ func (h *Handler) handbackLoop(ctx context.Context, r *http.Request, loopID stri
 		return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: "Storage is not configured"}
 	}
 	nowISO := eventlog.FormatJavaScriptISOString(h.now().UTC())
-	_, err := storage.WithTransactionValue(ctx, services.Coordinator.DB(), nil, func(tx *sql.Tx) (loops.HandbackPreparationResult, error) {
+	err := storage.WithTransaction(ctx, services.Coordinator.DB(), nil, func(tx *sql.Tx) error {
 		return loops.PrepareHandback(ctx, storage.NewRepositories(tx), loops.HandbackPreparationInput{LoopID: loopID, NowISO: nowISO})
 	})
 	if err != nil {

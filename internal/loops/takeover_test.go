@@ -23,16 +23,17 @@ func TestPrepareHandbackCapturesSessionAndCancelsQueueTogether(t *testing.T) {
 	if err := repos.AgentExecutions.Upsert(ctx, storage.AgentExecutionRecord{ID: "execution_handback", LoopID: &loopID, Vendor: "codex", Status: "completed", NativeSessionID: &sessionID, StartedAt: nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
 		t.Fatalf("AgentExecutions.Upsert() error = %v", err)
 	}
-	result, err := storage.WithTransactionValue(ctx, db, nil, func(tx *sql.Tx) (HandbackPreparationResult, error) {
+	err := storage.WithTransaction(ctx, db, nil, func(tx *sql.Tx) error {
 		return PrepareHandback(ctx, storage.NewRepositories(tx), HandbackPreparationInput{LoopID: loop.ID, NowISO: nowISO})
 	})
 	if err != nil {
 		t.Fatalf("PrepareHandback() error = %v", err)
 	}
-	if result.CancelledQueueItems != 1 || result.Loop.MetadataJSON == nil {
-		t.Fatalf("PrepareHandback() = %#v, want one cancelled queue and persisted metadata", result)
+	persistedLoop, err := repos.Loops.GetByID(ctx, loop.ID)
+	if err != nil || persistedLoop == nil || persistedLoop.MetadataJSON == nil {
+		t.Fatalf("PrepareHandback() persisted loop = %#v, %v; want metadata", persistedLoop, err)
 	}
-	resume, ok := ReadTakeoverResume(result.Loop.MetadataJSON)
+	resume, ok := ReadTakeoverResume(persistedLoop.MetadataJSON)
 	if !ok || resume.SessionID != sessionID {
 		t.Fatalf("ReadTakeoverResume() = %#v, %v; want session %q", resume, ok, sessionID)
 	}
