@@ -108,23 +108,26 @@ type CodexReviewEvidence struct {
 }
 
 type Evidence struct {
-	PullRequestState             string               `json:"pullRequestState,omitempty"`
-	ClosedAt                     string               `json:"closedAt,omitempty"`
-	MergedAt                     string               `json:"mergedAt,omitempty"`
-	Draft                        bool                 `json:"draft"`
-	BaseRefName                  string               `json:"baseRefName,omitempty"`
-	Mergeable                    *bool                `json:"mergeable,omitempty"`
-	MergeableState               string               `json:"mergeableState,omitempty"`
-	RequiredChecks               []string             `json:"requiredChecks"`
-	Checks                       []CheckEvidence      `json:"checks"`
-	RequiredApprovingReviewCount int                  `json:"requiredApprovingReviewCount"`
-	ReviewDecision               string               `json:"reviewDecision,omitempty"`
-	CodexReview                  *CodexReviewEvidence `json:"codexReview,omitempty"`
-	UnresolvedReviewThreadIDs    []string             `json:"unresolvedReviewThreadIds"`
-	HoldLabels                   []string             `json:"holdLabels"`
-	DiffBudget                   *DiffBudgetEvidence  `json:"diffBudget,omitempty"`
-	ProjectPolicyPermitsTarget   bool                 `json:"projectPolicyPermitsTarget"`
-	FinalObservedHeadSHA         string               `json:"finalObservedHeadSha,omitempty"`
+	PullRequestState             string                       `json:"pullRequestState,omitempty"`
+	ClosedAt                     string                       `json:"closedAt,omitempty"`
+	MergedAt                     string                       `json:"mergedAt,omitempty"`
+	Draft                        bool                         `json:"draft"`
+	BaseRefName                  string                       `json:"baseRefName,omitempty"`
+	Mergeable                    *bool                        `json:"mergeable,omitempty"`
+	MergeableState               string                       `json:"mergeableState,omitempty"`
+	RequiredChecks               []string                     `json:"requiredChecks"`
+	Checks                       []CheckEvidence              `json:"checks"`
+	RequiredApprovingReviewCount int                          `json:"requiredApprovingReviewCount"`
+	ReviewDecision               string                       `json:"reviewDecision,omitempty"`
+	CodexReview                  *CodexReviewEvidence         `json:"codexReview,omitempty"`
+	UnresolvedReviewThreadIDs    []string                     `json:"unresolvedReviewThreadIds"`
+	HoldLabels                   []string                     `json:"holdLabels"`
+	DiffBudget                   *DiffBudgetEvidence          `json:"diffBudget,omitempty"`
+	ReviewerConvergence          *ReviewerConvergenceEvidence `json:"reviewerConvergence,omitempty"`
+	ProjectPolicyPermitsTarget   bool                         `json:"projectPolicyPermitsTarget"`
+	FinalObservedHeadSHA         string                       `json:"finalObservedHeadSha,omitempty"`
+	CodexReviewOutcome           string                       `json:"codexReviewOutcome,omitempty"`
+	ReviewProvenance             ReviewProvenance             `json:"reviewProvenance,omitempty"`
 }
 
 type Report struct {
@@ -1008,7 +1011,7 @@ func (r *Runner) tryPublishAggregatedCommitStatus(ctx context.Context, report Re
 }
 
 func (r *Runner) openReportsForHeadSHA(ctx context.Context, projectID, repo, sha string, current Report) ([]Report, error) {
-	previousReports, err := latestGateReports(ctx, r.repos, projectID)
+	previousReports, err := latestGateReports(ctx, r.repos, projectID, 0)
 	if err != nil {
 		return nil, err
 	}

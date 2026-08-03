@@ -98,6 +98,36 @@ func NewRepositories(q sqliteQuerier) *Repositories {
 	}
 }
 
+// PlannerWorkGraphRecord binds one Planner decomposition to its source issue.
+// The planner's structured output is the authority for its content; storage
+// owns only durable state transitions and queue idempotency.
+type PlannerWorkGraphRecord struct {
+	ID                string
+	ProjectID         string
+	ParentRepo        string
+	ParentIssueNumber int64
+	PlannerLoopID     string
+	BaseBranch        string
+	Status            string
+	ReplanReason      *string
+	CreatedAt         string
+	UpdatedAt         string
+}
+
+type PlannerWorkGraphNodeRecord struct {
+	GraphID                string
+	NodeKey                string
+	Goal                   string
+	AcceptanceCriteriaJSON string
+	ExpectedPRScope        string
+	WorkerLoopID           string
+	Branch                 string
+	State                  string
+	BlockedReason          *string
+	CreatedAt              string
+	UpdatedAt              string
+}
+
 // WithTransaction runs a repository operation against one SQLite transaction.
 // Event-log projections that must be observed together (for example a Gate
 // report and its terminal agreement) use this boundary so a partial append
@@ -557,7 +587,7 @@ func (r *EventsRepository) List(ctx context.Context, limit int64) ([]EventLogRec
 		limit = 100
 	}
 
-	rows, err := r.q.QueryContext(ctx, `SELECT `+eventLogColumns+` FROM event_logs ORDER BY created_at DESC, rowid DESC LIMIT ?`, limit)
+	rows, err := r.q.QueryContext(ctx, `SELECT `+eventLogColumns+` FROM event_logs ORDER BY created_at DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, fmt.Errorf("list event logs: %w", err)
 	}
@@ -580,7 +610,7 @@ func (r *EventsRepository) ListAll(ctx context.Context) ([]EventLogRecord, error
 }
 
 func (r *EventsRepository) ListSince(ctx context.Context, sinceISO string) ([]EventLogRecord, error) {
-	rows, err := r.q.QueryContext(ctx, `SELECT `+eventLogColumns+` FROM event_logs WHERE created_at >= ? ORDER BY created_at DESC, rowid DESC`, sinceISO)
+	rows, err := r.q.QueryContext(ctx, `SELECT `+eventLogColumns+` FROM event_logs WHERE created_at >= ? ORDER BY created_at DESC`, sinceISO)
 	if err != nil {
 		return nil, fmt.Errorf("list event logs since: %w", err)
 	}
@@ -590,7 +620,7 @@ func (r *EventsRepository) ListSince(ctx context.Context, sinceISO string) ([]Ev
 }
 
 func (r *EventsRepository) ListByEntity(ctx context.Context, entityType, entityID string) ([]EventLogRecord, error) {
-	rows, err := r.q.QueryContext(ctx, `SELECT `+eventLogColumns+` FROM event_logs WHERE entity_type = ? AND entity_id = ? ORDER BY created_at ASC, rowid ASC`, entityType, entityID)
+	rows, err := r.q.QueryContext(ctx, `SELECT `+eventLogColumns+` FROM event_logs WHERE entity_type = ? AND entity_id = ? ORDER BY created_at ASC`, entityType, entityID)
 	if err != nil {
 		return nil, fmt.Errorf("list event logs by entity: %w", err)
 	}
@@ -611,7 +641,7 @@ func (r *EventsRepository) ListByEntityAndEventTypes(ctx context.Context, entity
 	for _, eventType := range eventTypes {
 		args = append(args, eventType)
 	}
-	rows, err := r.q.QueryContext(ctx, `SELECT `+eventLogColumns+` FROM event_logs WHERE entity_type = ? AND entity_id = ? AND event_type IN (`+sqlPlaceholders(len(eventTypes))+`) ORDER BY created_at ASC, rowid ASC`, args...)
+	rows, err := r.q.QueryContext(ctx, `SELECT `+eventLogColumns+` FROM event_logs WHERE entity_type = ? AND entity_id = ? AND event_type IN (`+sqlPlaceholders(len(eventTypes))+`) ORDER BY created_at ASC, id ASC`, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list event logs by entity and event types: %w", err)
 	}
@@ -706,7 +736,7 @@ func (r *EventsRepository) ListByEntityTypeAndEventTypes(ctx context.Context, en
 	for _, eventType := range eventTypes {
 		args = append(args, eventType)
 	}
-	rows, err := r.q.QueryContext(ctx, `SELECT `+eventLogColumns+` FROM event_logs WHERE entity_type = ? AND event_type IN (`+sqlPlaceholders(len(eventTypes))+`) ORDER BY created_at ASC, rowid ASC`, args...)
+	rows, err := r.q.QueryContext(ctx, `SELECT `+eventLogColumns+` FROM event_logs WHERE entity_type = ? AND event_type IN (`+sqlPlaceholders(len(eventTypes))+`) ORDER BY created_at ASC, id ASC`, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list event logs by entity type and event types: %w", err)
 	}
@@ -814,7 +844,7 @@ func (r *EventsRepository) ListFirstEventTimestampsByType(ctx context.Context, e
 }
 
 func (r *EventsRepository) ListByProjectAndEntityType(ctx context.Context, projectID, entityType string) ([]EventLogRecord, error) {
-	rows, err := r.q.QueryContext(ctx, `SELECT `+eventLogColumns+` FROM event_logs WHERE project_id = ? AND entity_type = ? ORDER BY created_at ASC, rowid ASC`, projectID, entityType)
+	rows, err := r.q.QueryContext(ctx, `SELECT `+eventLogColumns+` FROM event_logs WHERE project_id = ? AND entity_type = ? ORDER BY created_at ASC, id ASC`, projectID, entityType)
 	if err != nil {
 		return nil, fmt.Errorf("list event logs by project and entity type: %w", err)
 	}
